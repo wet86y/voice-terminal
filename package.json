@@ -1,0 +1,20 @@
+{
+  "name": "voice-terminal",
+  "version": "0.1.0",
+  "private": true,
+  "description": "本地模块化实时语音终端 v0.1",
+  "type": "module",
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @voice-terminal/web",
+    "build": "npm run build --workspace @voice-terminal/web",
+    "typecheck": "npm run typecheck --workspace @voice-terminal/web",
+    "test": "npm run test --workspace @voice-terminal/web",
+    "preview": "npm run preview --workspace @voice-terminal/web"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

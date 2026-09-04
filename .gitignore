@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.vite/
+*.local
+.env
+.env.*
+!.env.example
+
+# Runtime output
+logs/
+*.log
+
+# IDE / OS files
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.DS_Store
+Thumbs.db
