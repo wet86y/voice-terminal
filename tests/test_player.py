@@ -26,6 +26,22 @@ class PcmPlayerTests(unittest.TestCase):
         self.assertEqual(bytes(third_output), b"\x05\x00\x00\x00")
         self.assertEqual(player.buffered_ms, 0)
 
+    def test_progress_counts_enqueued_and_callback_consumed_audio(self) -> None:
+        player = PcmPlayer(sample_rate=1000, channels=1, output_device=None)
+        player.allow("turn_1")
+        player.enqueue("turn_1", b"\x01\x00" * 1000)
+
+        before = player.progress("turn_1")
+        self.assertEqual(before["enqueued_ms"], 1000)
+        self.assertEqual(before["played_ms"], 0)
+        self.assertEqual(before["buffered_ms"], 1000)
+
+        player._callback(bytearray(1000), 500, None, None)
+        after = player.progress("turn_1")
+        self.assertEqual(after["enqueued_ms"], 1000)
+        self.assertEqual(after["played_ms"], 500)
+        self.assertEqual(after["buffered_ms"], 500)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -58,6 +58,23 @@ const currentLatencyRows = computed(() =>
   })),
 )
 
+const contextSpeechEmotion = computed(() => {
+  const message = [...terminal.llmContext].reverse().find((item) => item.role === 'user')
+  if (!message) return null
+  try {
+    const packageValue = JSON.parse(message.content) as { speech_emotion?: unknown }
+    if (!packageValue || typeof packageValue.speech_emotion !== 'object' || packageValue.speech_emotion === null) return null
+    return packageValue.speech_emotion as {
+      status?: string
+      source?: string
+      model_loaded?: boolean
+      segments?: Array<{ emotion?: string; language?: string; events?: string[] }>
+    }
+  } catch {
+    return null
+  }
+})
+
 const serviceRows = computed(() => [
   { key: 'audio', label: 'Audio', value: terminal.services.audio },
   { key: 'kws', label: 'KWS', value: terminal.services.kws },
@@ -211,10 +228,12 @@ function statusClass(status: string) {
           <p><strong>Paraformer 草稿：</strong>{{ terminal.current.paraformer_final || terminal.current.partial_text || '—' }}</p>
           <p><strong>最终校稿：</strong>{{ terminal.current.refined_text || '—' }}</p>
           <p v-for="(analysis, name) in terminal.current.analysis" :key="name">
-            {{ name }} · {{ analysis.status }} {{ analysis.error || '' }}
+            {{ name }} · {{ analysis.status }} {{ analysis.model ? '· ' + analysis.model : '' }}
+            {{ analysis.model_loaded === true ? '· 已加载' : '' }} {{ analysis.error || '' }}
             <span v-if="analysis.probability != null">结束概率 {{ Math.round(analysis.probability * 100) }}%</span>
           </p>
           <ul><li v-for="(segment, index) in terminal.current.segments" :key="index">{{ segment.text }}</li></ul>
+          <p v-if="terminal.current.audio_cues?.length"><strong>SenseVoice 语音情绪：</strong>已进入最终请求的 speech_emotion</p>
           <p v-for="(cue, index) in terminal.current.audio_cues" :key="index">
             {{ cue.start_ms }}–{{ cue.end_ms }} ms · {{ cue.language }} · {{ cue.emotion }} · {{ cue.events.join(', ') }}
           </p>
@@ -246,9 +265,11 @@ function statusClass(status: string) {
           </div>
           <div class="response-divider"><span>TTS QUEUE</span><i></i><span>{{ displayText(terminal.current.tts_status) }}</span></div>
           <div class="response-block tts-block">
-            <span class="box-label">{{ displayText(terminal.current.tts_status) }} / AUDIO BUFFER</span>
+            <span class="box-label">{{ displayText(terminal.current.tts_status) }} / AUDIO PLAYBACK</span>
             <p>{{ displayText(terminal.current.tts_text) }}</p>
-            <div class="buffer-meta"><span>后端缓冲</span><strong>{{ formatMs(terminal.current.audio_buffer_ms) }}</strong></div>
+            <div class="buffer-meta"><span>已返回音频</span><strong>{{ formatMs(terminal.current.tts_returned_ms) }}</strong></div>
+            <div class="buffer-meta"><span>已实际播放</span><strong>{{ formatMs(terminal.current.tts_played_ms) }}</strong></div>
+            <div class="buffer-meta"><span>待播放总时长</span><strong>{{ formatMs(terminal.current.tts_remaining_ms ?? terminal.current.audio_buffer_ms) }}</strong></div>
           </div>
         </div>
       </article>
@@ -318,6 +339,15 @@ function statusClass(status: string) {
           </div>
         </div>
         <div v-else class="empty-state context-empty">等待下一轮 LLM 请求…</div>
+        <div v-if="contextSpeechEmotion" class="context-speech-emotion">
+          <span>FINAL VOICE CUES</span>
+          <strong>{{ contextSpeechEmotion.status || 'UNAVAILABLE' }}</strong>
+          <span>{{ contextSpeechEmotion.source || '—' }}</span>
+          <span v-if="contextSpeechEmotion.model_loaded === true">模型已加载</span>
+          <span v-if="contextSpeechEmotion.segments?.length">
+            {{ contextSpeechEmotion.segments.map((segment) => segment.emotion || 'unknown').join(' / ') }}
+          </span>
+        </div>
         <p class="context-note">这里展示本轮请求实际使用的 system、历史 user/assistant 消息和当前 user 消息；不是前端自行拼接的摘要。</p>
       </article>
     </section>

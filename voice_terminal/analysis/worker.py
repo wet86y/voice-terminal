@@ -11,10 +11,24 @@ from .protocol import decode_request
 class AnalysisLane:
     """No backlog: cancellation does not release the slot of a running native call."""
 
-    def __init__(self, model: Callable | None = None, error: str | None = None) -> None:
-        self.model, self.error = model, error
+    def __init__(
+        self,
+        model: Callable | None = None,
+        error: str | None = None,
+        *,
+        model_name: str | None = None,
+    ) -> None:
+        self.model, self.error, self.model_name = model, error, model_name
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="speech-analysis")
         self.active: asyncio.Future | None = None
+
+    def health_payload(self) -> dict:
+        return {
+            "status": "READY" if self.model else "DEGRADED",
+            "model": self.model_name,
+            "model_loaded": self.model is not None,
+            "error": self.error,
+        }
 
     async def run(self, pcm: bytes) -> dict:
         if self.model is None:
@@ -44,8 +58,7 @@ def create_analysis_app(lanes: dict[str, AnalysisLane]):
 
     @app.get("/health")
     async def health():
-        return {name: {"status": "READY" if lane.model else "DEGRADED", "error": lane.error}
-                for name, lane in lanes.items()}
+        return {name: lane.health_payload() for name, lane in lanes.items()}
 
     # FastAPI must resolve this annotation in the module namespace.
     globals()["WebSocket"] = WebSocket

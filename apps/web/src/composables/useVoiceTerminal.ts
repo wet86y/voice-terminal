@@ -56,6 +56,9 @@ function createEmptyCurrentTurn(): CurrentTurnSnapshot {
     tts_text: '',
     tts_status: '',
     audio_buffer_ms: null,
+    tts_returned_ms: 0,
+    tts_played_ms: 0,
+    tts_remaining_ms: 0,
     v02: false, input_revision: 0, generation_id: 0, committed: false,
     agent_phase: 'IDLE', paraformer_final: '', refined_text: '',
     segments: [], prediction: {}, tools: [], audio_cues: [], analysis: {},
@@ -173,6 +176,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     const ttsText = readString(snapshot, 'tts_text')
     const ttsStatus = readString(snapshot, 'tts_status')
     const audioBufferMs = snapshot.audio_buffer_ms
+    const ttsReturnedMs = snapshot.tts_returned_ms
+    const ttsPlayedMs = snapshot.tts_played_ms
+    const ttsRemainingMs = snapshot.tts_remaining_ms
 
     if (partialText !== null) current.partial_text = partialText
     if (finalText !== null) current.final_text = finalText
@@ -181,6 +187,15 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (ttsStatus !== null) current.tts_status = ttsStatus
     if (audioBufferMs === null || (typeof audioBufferMs === 'number' && Number.isFinite(audioBufferMs))) {
       current.audio_buffer_ms = audioBufferMs as number | null
+    }
+    for (const [key, value] of [
+      ['tts_returned_ms', ttsReturnedMs],
+      ['tts_played_ms', ttsPlayedMs],
+      ['tts_remaining_ms', ttsRemainingMs],
+    ] as const) {
+      if (value === null || (typeof value === 'number' && Number.isFinite(value))) {
+        current[key] = value as number | null
+      }
     }
   }
 
@@ -306,6 +321,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         if (acceptsCurrentTurn(message.turn_id)) {
           current.final_text = ''; current.assistant_text = ''; current.tts_text = ''
           current.audio_buffer_ms = 0; current.tts_status = 'IDLE'
+          current.tts_returned_ms = 0; current.tts_played_ms = 0; current.tts_remaining_ms = 0
         }
         break
       case 'runtime.snapshot':
@@ -339,14 +355,27 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         applyLlmContext(payload, message.turn_id)
         break
       case 'tts.status':
+      case 'tts.progress':
         if (acceptsCurrentTurn(message.turn_id)) {
           const waitingText = readString(payload, 'waiting_text')
           const status = readString(payload, 'status')
           const bufferMs = payload.audio_buffer_ms
+          const returnedMs = payload.audio_returned_ms
+          const playedMs = payload.audio_played_ms
+          const remainingMs = payload.audio_remaining_ms
           if (waitingText !== null) current.tts_text = waitingText
           if (status !== null) current.tts_status = status
           if (bufferMs === null || (typeof bufferMs === 'number' && Number.isFinite(bufferMs))) {
             current.audio_buffer_ms = bufferMs as number | null
+          }
+          if (returnedMs === null || (typeof returnedMs === 'number' && Number.isFinite(returnedMs))) {
+            current.tts_returned_ms = returnedMs as number | null
+          }
+          if (playedMs === null || (typeof playedMs === 'number' && Number.isFinite(playedMs))) {
+            current.tts_played_ms = playedMs as number | null
+          }
+          if (remainingMs === null || (typeof remainingMs === 'number' && Number.isFinite(remainingMs))) {
+            current.tts_remaining_ms = remainingMs as number | null
           }
         }
         break

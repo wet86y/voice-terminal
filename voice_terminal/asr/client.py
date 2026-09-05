@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -13,7 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 class AsrWorkerError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str = "ASR_WORKER_UNAVAILABLE") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 ResultCallback = Callable[[dict[str, Any]], Awaitable[None]]
@@ -26,6 +29,7 @@ class AsrWorkerClient:
         self._socket: Any = None
         self._receive_task: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
+        self._health_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._sent_count_by_turn: dict[str, int] = {}
         self._sent_bytes_by_turn: dict[str, int] = {}
         self._last_log_at_by_turn: dict[str, float] = {}
@@ -52,6 +56,8 @@ class AsrWorkerClient:
         socket = self._socket
         if socket is None:
             return
+        cancelled = False
+        disconnected = False
         try:
             async for raw in socket:
                 if isinstance(raw, bytes):
@@ -60,6 +66,50 @@ class AsrWorkerClient:
                     message = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(message, dict) and message.get("type") == "health":
+                    request_id = message.get("request_id")
+                    waiter = self._health_waiters.get(request_id) if isinstance(request_id, str) else None
+                    # A pre-v0.2 Worker did not echo a request ID.  Accept
+                    # that response only when there is exactly one pending
+                    # health check; normal requests always require a match.
+                    if waiter is None and request_id is None and len(self._health_waiters) == 1:
+                        waiter = next(iter(self._health_waiters.values()))
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(message)
+                    else:
+                        logger.warning("asr.client.unmatched_health_response request_id=%s", request_id)
+                        if self._health_waiters:
+                            # A response for a different request cannot be
+                            # safely associated with any readiness check.
+                            # Fail pending checks explicitly instead of
+                            # turning a protocol violation into a timeout.
+                            self._fail_health_waiters(
+                                AsrWorkerError(
+                                    "ASR Worker health 响应 request_id 不匹配",
+                                    code="ASR_WORKER_PROTOCOL_ERROR",
+                                )
+                            )
+                    continue
+                if isinstance(message, dict) and message.get("type") == "error":
+                    request_id = message.get("request_id")
+                    waiter = self._health_waiters.get(request_id) if isinstance(request_id, str) else None
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(message)
+                        continue
+                    if self._health_waiters:
+                        # A health-related error must be associated with the
+                        # request that is waiting for it.  Treat an unrelated
+                        # or missing ID as a protocol failure immediately;
+                        # otherwise readiness would be reported only after a
+                        # timeout and the transport error could be mistaken
+                        # for a slow model.
+                        self._fail_health_waiters(
+                            AsrWorkerError(
+                                "ASR Worker error 响应 request_id 不匹配",
+                                code="ASR_WORKER_PROTOCOL_ERROR",
+                            )
+                        )
+                        continue
                 if self.on_result is not None and isinstance(message, dict):
                     logger.info(
                         "asr.client.received type=%s turn_id=%s text_len=%d text=%r",
@@ -77,22 +127,47 @@ class AsrWorkerClient:
                         # a transport disconnect or tear down the ASR socket.
                         logger.exception("asr.client.result_callback_failed")
         except asyncio.CancelledError:
+            cancelled = True
             raise
         except Exception as exc:
+            disconnected = True
             logger.exception("asr.client.receive_failed")
+            self._fail_health_waiters(AsrWorkerError(f"ASR Worker 连接断开：{exc}", code="ASR_WORKER_DISCONNECTED"))
             if self.on_result is not None:
                 await self.on_result({"type": "error", "code": "ASR_WORKER_DISCONNECTED", "message": str(exc)})
         finally:
             if self._socket is socket:
                 self._socket = None
+                if not cancelled and not disconnected:
+                    # A clean remote close still invalidates an established
+                    # Worker connection.  Do not leave a health Future waiting
+                    # until its timeout, and surface the same recoverable
+                    # event as an exceptional close.
+                    error = AsrWorkerError("ASR Worker 连接已关闭", code="ASR_WORKER_DISCONNECTED")
+                    self._fail_health_waiters(error)
+                    if self.on_result is not None:
+                        await self.on_result({"type": "error", "code": error.code, "message": str(error)})
             logger.info("asr.client.disconnected url=%s", self.url)
+
+    def _fail_health_waiters(self, error: BaseException) -> None:
+        for waiter in tuple(self._health_waiters.values()):
+            if not waiter.done():
+                waiter.set_exception(error)
 
     async def _send(self, payload: dict[str, Any]) -> None:
         socket = self._socket
         if socket is None:
-            raise AsrWorkerError("ASR Worker 尚未连接")
-        async with self._send_lock:
-            await socket.send(json.dumps(payload, ensure_ascii=False))
+            raise AsrWorkerError("ASR Worker 尚未连接", code="ASR_WORKER_UNAVAILABLE")
+        try:
+            async with self._send_lock:
+                await socket.send(json.dumps(payload, ensure_ascii=False))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A failed write means the established Worker connection is no
+            # longer usable.  Preserve a stable service code for the
+            # controller while the receive loop reports the same transition.
+            raise AsrWorkerError(f"ASR Worker 发送失败：{exc}", code="ASR_WORKER_DISCONNECTED") from exc
         logger.debug(
             "asr.client.sent type=%s turn_id=%s bytes=%d final=%s",
             payload.get("type"),
@@ -128,14 +203,52 @@ class AsrWorkerClient:
         )
         self._last_log_at_by_turn.pop(turn_id, None)
 
-    async def health(self) -> bool:
+    async def health(self, timeout_s: float = 2.0) -> dict[str, Any]:
+        """Perform an application-level readiness check.
+
+        Opening a WebSocket only proves that something is listening on the
+        configured endpoint.  The Worker must echo this request after its
+        model has loaded before callers may mark ASR READY.
+        """
+
+        if self._socket is None:
+            raise AsrWorkerError("ASR Worker 尚未连接")
+        request_id = uuid.uuid4().hex
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._health_waiters[request_id] = waiter
         try:
-            await self._send({"type": "health"})
-            return True
-        except AsrWorkerError:
-            return False
+            try:
+                await self._send({"type": "health", "request_id": request_id})
+                response = await asyncio.wait_for(waiter, timeout=max(0.05, float(timeout_s)))
+            except asyncio.TimeoutError as exc:
+                raise AsrWorkerError(f"ASR Worker health 超时（{timeout_s:g}s）", code="ASR_WORKER_TIMEOUT") from exc
+            except asyncio.CancelledError:
+                raise
+            except AsrWorkerError:
+                raise
+            except Exception as exc:
+                raise AsrWorkerError(f"ASR Worker health 失败：{exc}", code="ASR_WORKER_PROTOCOL_ERROR") from exc
+        finally:
+            self._health_waiters.pop(request_id, None)
+            if not waiter.done():
+                waiter.cancel()
+
+        if response.get("type") == "error":
+            raise AsrWorkerError(
+                str(response.get("message") or "ASR Worker health 失败"),
+                code=str(response.get("code") or "ASR_WORKER_NOT_READY"),
+            )
+        if response.get("status") != "READY":
+            status = response.get("status", "UNKNOWN")
+            raise AsrWorkerError(f"ASR Worker 未就绪：{status}", code="ASR_WORKER_NOT_READY")
+        if response.get("model_loaded") is not True:
+            code = "ASR_WORKER_PROTOCOL_ERROR" if "model_loaded" not in response else "ASR_WORKER_NOT_READY"
+            raise AsrWorkerError("ASR Worker health 缺少有效的 model_loaded", code=code)
+        return response
 
     async def close(self) -> None:
+        self._fail_health_waiters(AsrWorkerError("ASR Worker 客户端已关闭", code="ASR_WORKER_DISCONNECTED"))
         task, self._receive_task = self._receive_task, None
         if task is not None:
             task.cancel()
@@ -143,4 +256,5 @@ class AsrWorkerClient:
         socket, self._socket = self._socket, None
         if socket is not None:
             await socket.close()
+        self._health_waiters.clear()
         logger.info("asr.client.closed url=%s", self.url)

@@ -249,12 +249,42 @@ ERROR
     "provider": "minimax",
     "status": "STREAMING",
     "waiting_text": "今天的更新主要集中在启动速度和插件稳定性。",
-    "audio_buffer_ms": 60
+    "audio_buffer_ms": 60,
+    "audio_returned_ms": 820,
+    "audio_played_ms": 760,
+    "audio_remaining_ms": 60
   }
 }
 ```
 
 `audio_buffer_ms` 必须由后端测量或维护，前端只显示。
+
+### `tts.progress`
+
+v0.2 在 TTS 任务运行期间按后端播放器进度推送监控信息。`audio_returned_ms` 是 MiniMax 已返回的 PCM 总时长，`audio_played_ms` 是 Windows 音频回调已经消费的时长，`audio_remaining_ms` 是前两者之差，代表当前轮全部已返回但尚未播放的音频。它包括播放器队列以及已经返回、仍等待进入播放器的 PCM；前端不得只用某一个文本片段推导剩余时间。
+
+```json
+{
+  "type": "tts.progress",
+  "seq": 7,
+  "timestamp": "2026-09-05T12:30:04.200Z",
+  "turn_id": "turn_000021",
+  "payload": {
+    "provider": "minimax",
+    "status": "WAITING_PLAYBACK",
+    "waiting_text": "下一句已经准备好。",
+    "audio_buffer_ms": 1800,
+    "audio_returned_ms": 6120,
+    "audio_played_ms": 4320,
+    "audio_remaining_ms": 1800,
+    "pacing_enabled": true,
+    "lead_ms": 2000,
+    "trigger": "lead_window"
+  }
+}
+```
+
+当 `audio_remaining_ms <= lead_ms` 时，后端可以释放下一段已经生成且以标点结束的文本。`trigger` 仅用于诊断；尚未发生的播放时长使用 `0` 表示当前尚未返回音频，延迟指标仍按既有规则使用 `null`。
 
 ### `latency.snapshot`
 
@@ -365,7 +395,8 @@ ERROR
 - 新一轮开始时，所有当前轮事件使用同一个新 `turn_id`；上一轮迟到事件必须可以被前端安全丢弃。
 - `transcript.partial` 发送当前完整 partial 文本，`assistant.delta` 才是需要由前端顺序拼接的文本增量。
 - `llm.context` 发送本轮请求实际使用的完整 messages；前端只展示，不重新拼接或修改。
-- `tts.status.audio_buffer_ms` 和 `latency.snapshot.payload.values` 都是后端测量/维护的只读结果，不应要求浏览器回传开始时间或音频时间戳。
+- 最终 `llm.context` 的当前 user 消息是一个 JSON 包，包含 `final_text`、`provisional_transcript`、兼容字段 `audio_cues` 和明确标识来源的 `speech_emotion`。`speech_emotion.status=READY` 且 `source=SenseVoiceSmall` 表示结束后的 SenseVoice 精修结果已经进入最终 LLM 请求；`UNAVAILABLE` 或 `paraformer_fallback` 时不得推断情绪。
+- `tts.status` / `tts.progress` 中的音频时长和 `latency.snapshot.payload.values` 都是后端测量/维护的只读结果，不应要求浏览器回传开始时间或音频时间戳。
 - `turn.completed` 应包含完整 transcript、response 和最终 latency；这是前端写入历史的唯一事件。
 - 发生不可恢复错误时发送 `error`，并在状态已改变时同步发送 `session.state`；不要依赖浏览器自行推断 `ERROR`。
 - `seq` 只在当前 WebSocket 连接内递增；重连后可以从 0 重新开始，前端会重置该连接的去重游标。
@@ -375,7 +406,7 @@ ERROR
 
 现行 Envelope、subscribe/session.start/session.stop 和 v0.1 事件保持兼容。
 启用 `v02.enabled` 后，轮次事件增加 `input_revision`、`generation_id` 和 `workspace`。
-`workspace` 包含当前分段、预测摘要、只读工具状态、Paraformer 草稿、最终文本、分段语音线索及分析服务降级原因；不含 PCM、密钥或模型思考过程。
+`workspace` 包含当前分段、预测摘要、只读工具状态、Paraformer 草稿、最终文本、分段语音线索及分析服务降级原因；分析状态在可用时还会标明模型名和 `model_loaded`；不含 PCM、密钥或模型思考过程。
 
 | 新事件 | 含义 |
 | --- | --- |
@@ -390,7 +421,7 @@ ERROR
 | agent.prediction.requested | 预测快照已发出；携带 input_revision、generation_id 和快照摘要 |
 | agent.prediction.discarded | 预测结果未采用；reason 说明 revision/generation 过期、轮次结束、输入封口、超时或无效返回 |
 | transcript.refined | 最终采用 text、source=sensevoice/paraformer |
-| speech.emotion | segments，每段 start_ms/end_ms/language/emotion/events/raw_tags |
+| speech.emotion | status/source/model_loaded 以及 segments，每段 start_ms/end_ms/language/emotion/events/raw_tags |
 | turn.committed | 本次 generation 最终输入封定；与历史提交不同 |
 
 `transcript.final` 始终为最终采用文本。预测不发送 assistant.delta。`turn.completed` 仍是唯一新增历史记录事件；订阅快照额外提供 `recent_turns`，用于刷新恢复已有历史。
@@ -403,6 +434,116 @@ ERROR
 
 ## Analysis Worker 内部接口
 
-默认 `ws://127.0.0.1:8767/analysis`。每连接一次请求。JSON 包含 operation（endpoint/refine）、request_id、turn_id、generation_id、pcm_base64（16 kHz/mono/int16，最多 62 秒）。结果回显身份、result、elapsed_ms；失败返回 error。health 操作及 HTTP `/health` 分别报告 endpoint/refine READY/DEGRADED。
+默认 `ws://127.0.0.1:8767/analysis`。每连接一次请求。JSON 包含 operation（endpoint/refine）、request_id、turn_id、generation_id、pcm_base64（16 kHz/mono/int16，最多 62 秒）。结果回显身份、result、elapsed_ms；失败返回 error。health 操作及 HTTP `/health` 分别报告 endpoint/refine READY/DEGRADED，并带有 `model` 和 `model_loaded`，用于确认对应模型是否实际加载。
+
+当前 v0.2 示例配置的 health 结果应类似：
+
+```json
+{
+  "endpoint": {
+    "status": "READY",
+    "model": "smart-turn-v3.2-cpu.onnx",
+    "model_loaded": true,
+    "error": null
+  },
+  "refine": {
+    "status": "READY",
+    "model": "SenseVoiceSmall",
+    "model_loaded": true,
+    "error": null
+  }
+}
+```
 
 每模型独立单执行槽，无等待队列；忙碌返回错误，由主服务降级。取消请求不提前释放尚未结束的原生推理槽。
+
+## ASR Worker 内部 WebSocket 接口（v0.2 阶段 4）
+
+ASR Worker 使用最终配置中的 `asr.worker_url`，默认地址为 `ws://127.0.0.1:8766/asr`。这是 Voice Server、回放工具和启动探针之间的内部接口，浏览器不会直接连接它。Worker 在 Paraformer 模型加载完成后才开始监听 WebSocket；端口可连接不等于服务已经 READY。
+
+### 应用层 health
+
+新的客户端必须发送带唯一请求 ID 的 JSON：
+
+```json
+{
+  "type": "health",
+  "request_id": "health-uuid"
+}
+```
+
+模型已加载时，Worker 回显同一个请求 ID：
+
+```json
+{
+  "type": "health",
+  "request_id": "health-uuid",
+  "status": "READY",
+  "model_loaded": true
+}
+```
+
+`status` 不是 `READY` 或 `model_loaded` 为 `false` 时，客户端必须将服务标记为未就绪，不得把发送成功当作健康检查成功。health 响应由 `AsrWorkerClient` 的等待 Future 消费，不会进入 `asr.partial` / `asr.final` 回调。超时、已建立连接后断开和无法匹配的请求 ID 分别报告 `ASR_WORKER_TIMEOUT`、`ASR_WORKER_DISCONNECTED` 和 `ASR_WORKER_PROTOCOL_ERROR`。为兼容旧 Worker，没有 `request_id` 的响应只在当前连接只有一个等待 health 请求时接受；新代码和新测试始终带 ID。
+
+启动脚本和回放脚本共用不含密钥的探针：
+
+```powershell
+python -m voice_terminal.asr.probe --url ws://127.0.0.1:8766/asr --timeout 2
+```
+
+探针只输出地址、状态、`model_loaded`、错误类别和耗时，并以退出码 0 表示 READY。
+
+### 音频和结果消息
+
+音频块仍使用 16 kHz、单声道、int16 PCM 的 Base64：
+
+```json
+{
+  "type": "audio.chunk",
+  "turn_id": "turn_000021/asr/1",
+  "pcm_base64": "...",
+  "is_final": false
+}
+```
+
+结束当前 ASR 子段时发送：
+
+```json
+{
+  "type": "audio.chunk",
+  "turn_id": "turn_000021/asr/1",
+  "pcm_base64": "",
+  "is_final": true
+}
+```
+
+Worker 必须对这个 final 块返回一次明确的 `asr.final`，即使最终文本为空：
+
+```json
+{
+  "type": "asr.final",
+  "turn_id": "turn_000021/asr/1",
+  "text": ""
+}
+```
+
+`turn.finish` 用于释放 Worker 端当前轮缓存：
+
+```json
+{
+  "type": "turn.finish",
+  "turn_id": "turn_000021/asr/1"
+}
+```
+
+普通非 final 推理可以返回 `asr.partial`。协议错误、输入错误和推理失败使用 `type=error`，并尽量回显 `turn_id`；health 请求的协议错误还应回显 `request_id`。错误码含义如下：
+
+| 错误码 | 含义 |
+| --- | --- |
+| `ASR_WORKER_NOT_READY` | 连接存在但模型未就绪 |
+| `ASR_WORKER_TIMEOUT` | health 或等待响应超时 |
+| `ASR_WORKER_DISCONNECTED` | 已建立的 Worker 连接中断 |
+| `ASR_WORKER_PROTOCOL_ERROR` | 消息格式或响应 ID 无法匹配 |
+| `ASR_INFERENCE_FAILED` | 模型推理或输入处理失败 |
+
+Voice Server 只有在连接后完成 health 才发布 ASR `READY`。停止监听会关闭客户端连接；下一次 `session.start` 自动重连并再次 health。活跃轮次发生断线时，当前轮的 ASR、端点、精修、预测、工具和回答任务全部失效，未完成交换和 PCM 不得进入历史或播放器，并发布可恢复的 `ASR_WORKER_DISCONNECTED`。旧前端只消费 Voice Server 的公开 Envelope，忽略本节的内部消息即可。

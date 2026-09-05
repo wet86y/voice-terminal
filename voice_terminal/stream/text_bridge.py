@@ -43,10 +43,24 @@ class TextBridge:
         return value
 
     def _break_index(self, limit: int) -> int | None:
-        candidates = [index + 1 for index, char in enumerate(self._buffer[:limit]) if char in self.preferred_breaks]
+        # ``min_chars`` is a lower bound for normal streaming chunks.  The old
+        # implementation considered a break at position 1–7 as soon as the
+        # *whole* buffer reached eight characters, which emitted fragments such
+        # as ``好的，`` despite ``min_chars=8``.  Those tiny frames are both
+        # unnatural for TTS and unnecessarily increase the provider message
+        # burst.  A short tail is still allowed through ``finish()``.
+        candidates = [
+            index + 1
+            for index, char in enumerate(self._buffer[:limit])
+            if char in self.preferred_breaks and index + 1 >= self.min_chars
+        ]
         if candidates:
             return max(candidates)
-        whitespace = [index + 1 for index, char in enumerate(self._buffer[:limit]) if char.isspace()]
+        whitespace = [
+            index + 1
+            for index, char in enumerate(self._buffer[:limit])
+            if char.isspace() and index + 1 >= self.min_chars
+        ]
         return max(whitespace) if whitespace else None
 
     def feed(self, text_delta: str) -> list[str]:

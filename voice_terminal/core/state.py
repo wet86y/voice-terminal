@@ -40,6 +40,9 @@ class RuntimeState:
             "tts_text": "",
             "tts_status": "IDLE",
             "audio_buffer_ms": 0,
+            "tts_returned_ms": 0,
+            "tts_played_ms": 0,
+            "tts_remaining_ms": 0,
             "turn_id": None,
             "v02": False,
         }
@@ -92,6 +95,9 @@ class RuntimeState:
             tts_text="",
             tts_status="IDLE",
             audio_buffer_ms=0,
+            tts_returned_ms=0,
+            tts_played_ms=0,
+            tts_remaining_ms=0,
         )
         for key in ("input_revision", "generation_id", "committed", "agent_phase", "paraformer_final", "refined_text", "segments", "prediction", "tools", "audio_cues", "analysis"):
             self.current.pop(key, None)

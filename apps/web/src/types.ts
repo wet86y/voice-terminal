@@ -44,13 +44,16 @@ export interface CurrentTurnSnapshot {
   prediction?: { decision?: string; intent?: string; status?: string; error?: string }
   tools?: Array<{ name?: string; status?: string; reused?: boolean; error?: string; overlap_ms?: number; wait_ms?: number; selected_at_ms?: number; execution_start_ms?: number | null; finished_at_ms?: number; execution_ms?: number }>
   audio_cues?: Array<{ start_ms: number; end_ms: number; emotion: string; language: string; events: string[] }>
-  analysis?: Record<string, { status?: string; error?: string; probability?: number; fallback?: string }>
+  analysis?: Record<string, { status?: string; error?: string; probability?: number; fallback?: string; model?: string; model_loaded?: boolean }>
   partial_text: string
   final_text: string
   assistant_text: string
   tts_text: string
   tts_status: string
   audio_buffer_ms: number | null
+  tts_returned_ms: number | null
+  tts_played_ms: number | null
+  tts_remaining_ms: number | null
 }
 
 export interface LatencyValues {
@@ -113,6 +116,12 @@ export interface TtsStatusPayload {
   status: string
   waiting_text: string
   audio_buffer_ms: number | null
+  audio_returned_ms?: number | null
+  audio_played_ms?: number | null
+  audio_remaining_ms?: number | null
+  pacing_enabled?: boolean
+  lead_ms?: number
+  trigger?: string | null
 }
 
 export interface LatencySnapshotPayload {
@@ -144,7 +153,7 @@ export type ServerMessageType =
   | 'transcript.final'
   | 'assistant.delta'
   | 'llm.context'
-  | 'tts.status'
+  | 'tts.status' | 'tts.progress'
   | 'latency.snapshot'
   | 'turn.completed'
   | 'error'

@@ -26,6 +26,9 @@ class MiniMaxTtsSession:
         self._error: Exception | None = None
         self._finish_requested = False
         self._send_lock = asyncio.Lock()
+        self._audio_chunks_received = 0
+        self._audio_bytes_received = 0
+        self._last_event: str | None = None
 
     async def start(self) -> None:
         try:
@@ -118,8 +121,17 @@ class MiniMaxTtsSession:
         cancelled = False
         try:
             while self._socket is not None:
-                parsed = self._parse(await asyncio.wait_for(self._socket.recv(), self.client.timeout_seconds))
+                parsed = self._parse(await asyncio.wait_for(self._socket.recv(), self.client.receive_timeout_seconds))
                 event = parsed.get("event")
+                self._last_event = event if isinstance(event, str) else None
+                # Keep protocol diagnostics without recording returned text or
+                # PCM.  Audio responses are logged separately with counters.
+                if event != "task_continued":
+                    logger.debug(
+                        "minimax.receive_event event=%s is_final=%s",
+                        event,
+                        parsed.get("is_final"),
+                    )
                 if event == "task_failed":
                     self._error = MiniMaxTtsError(self._error_message(parsed))
                     logger.error("minimax.task_failed message=%s", self._error)
@@ -130,6 +142,8 @@ class MiniMaxTtsSession:
                         pcm = self._decode_audio(data["audio"])
                         audio_chunks += 1
                         audio_bytes += len(pcm)
+                        self._audio_chunks_received = audio_chunks
+                        self._audio_bytes_received = audio_bytes
                         logger.debug(
                             "minimax.audio_chunk encoding=hex count=%d bytes=%d total_bytes=%d",
                             audio_chunks,
@@ -171,6 +185,12 @@ class MiniMaxTtsSession:
     async def send_text(self, text: str) -> None:
         if not self._started or self._socket is None:
             raise MiniMaxTtsError("MiniMax TTS 任务尚未 started")
+        if self._receiver is not None and self._receiver.done():
+            if self._error is not None:
+                raise self._error
+            raise MiniMaxTtsError(
+                f"MiniMax TTS 任务已结束（最后事件：{self._last_event or 'unknown'}）"
+            )
         async with self._send_lock:
             await self._socket.send(json.dumps({"event": "task_continue", "text": text}, ensure_ascii=False))
         logger.info("minimax.task_continue chars=%d text=%r", len(text), text[:120])
@@ -178,9 +198,26 @@ class MiniMaxTtsSession:
     async def finish(self) -> None:
         if self._socket is None:
             return
+        # Set this before the network write.  A gateway may close the socket
+        # while the task_finish frame is in flight; the receiver can then
+        # preserve already delivered PCM instead of reporting a false turn
+        # failure.
+        self._finish_requested = True
         async with self._send_lock:
-            self._finish_requested = True
-            await self._socket.send(json.dumps({"event": "task_finish"}))
+            try:
+                await self._socket.send(json.dumps({"event": "task_finish"}))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if "ConnectionClosed" in type(exc).__name__ and self._audio_chunks_received:
+                    logger.warning(
+                        "minimax.finish_closed_after_audio chunks=%d bytes=%d error=%s",
+                        self._audio_chunks_received,
+                        self._audio_bytes_received,
+                        exc,
+                    )
+                    return
+                raise
         logger.info("minimax.task_finish_sent")
 
     async def audio_chunks(self):
@@ -224,6 +261,11 @@ class MiniMaxTtsClient:
         self.sample_rate = sample_rate
         self.voice_id = voice_id
         self.timeout_seconds = timeout_ms / 1000
+        # ``timeout_ms`` is kept as the connection/task-start timeout.  The
+        # service documents a 120-second idle window after the last result;
+        # using the shorter startup timeout for every audio recv could cut a
+        # valid long response during a temporary synthesis pause.
+        self.receive_timeout_seconds = max(120.0, self.timeout_seconds)
 
     @property
     def ws_url(self) -> str:

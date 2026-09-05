@@ -174,14 +174,26 @@ describe('useVoiceTerminal', () => {
       waiting_text: '今天晴朗。',
       audio_buffer_ms: 64,
     }))
+    socket.push(envelope('tts.progress', 8, 'turn_000001', {
+      provider: 'minimax',
+      status: 'WAITING_PLAYBACK',
+      waiting_text: '下一句。',
+      audio_buffer_ms: 1900,
+      audio_returned_ms: 6120,
+      audio_played_ms: 4220,
+      audio_remaining_ms: 1900,
+    }))
 
     expect(terminal.current.partial_text).toBe('')
     expect(terminal.current.final_text).toBe('帮我看看天气')
     expect(terminal.current.assistant_text).toBe('今天晴朗。')
-    expect(terminal.current.tts_text).toBe('今天晴朗。')
-    expect(terminal.current.tts_status).toBe('STREAMING')
-    expect(terminal.current.audio_buffer_ms).toBe(64)
-    expect(terminal.lastSequence.value).toBe(7)
+    expect(terminal.current.tts_text).toBe('下一句。')
+    expect(terminal.current.tts_status).toBe('WAITING_PLAYBACK')
+    expect(terminal.current.audio_buffer_ms).toBe(1900)
+    expect(terminal.current.tts_returned_ms).toBe(6120)
+    expect(terminal.current.tts_played_ms).toBe(4220)
+    expect(terminal.current.tts_remaining_ms).toBe(1900)
+    expect(terminal.lastSequence.value).toBe(8)
   })
 
   it('展示后端实际发送给 LLM 的完整上下文', () => {

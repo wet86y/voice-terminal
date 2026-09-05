@@ -100,10 +100,12 @@ class VoiceRuntime:
         self.asr = AsrWorkerClient(self.config.asr.worker_url)
         try:
             await self.asr.connect()
+            await self.asr.health()
             if self.vad is not None:
                 self.state.set_service("asr", "READY")
         except Exception as exc:
-            self._record_error("asr", str(exc))
+            code = getattr(exc, "code", "ASR_WORKER_UNAVAILABLE")
+            self._record_error("asr", f"{code}: {exc}")
 
         deepseek_key = self.config.api_key(self.config.llm.api_key_env)
         if deepseek_key:

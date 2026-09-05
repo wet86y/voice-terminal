@@ -901,6 +901,25 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+.context-speech-emotion {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 1px solid #d9dedb;
+  border-radius: 10px;
+  color: #555861;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.context-speech-emotion span:first-child {
+  color: #1e2421;
+  font-weight: 730;
+  letter-spacing: .08em;
+}
+
 .context-note {
   margin-top: 16px;
   color: #999ba2;

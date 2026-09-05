@@ -6,7 +6,7 @@
 
 ```text
 Voice Server: ws://127.0.0.1:8765/ws
-ASR Worker:   ws://127.0.0.1:8766/asr
+ASR Worker:   ws://127.0.0.1:8766/asr（以 `asr.worker_url` 最终配置为准）
 ```
 
 当前运行配置默认关闭唤醒词（`wake.enabled: false`），点击 `session.start` 后直接创建语音 turn 并进入 VAD / ASR。KWS 原始关键词仍保留，重新设置 `wake.enabled: true` 后才会启用 `hei claw`：
@@ -82,7 +82,7 @@ logs/asr-worker.err.log
 
 ## 实时链路
 
-唤醒模式开启时，麦克风 PCM 先进入 2 秒环形缓冲，再由 sherpa-onnx 等待 `hei claw`；KWS 触发后暂停 KWS。当前默认的手动模式不运行 KWS，`session.start` 直接创建 turn。两种模式都使用 250 ms 最小有效语音和 700 ms 结束静音，ASR Worker 返回 partial/final；final 文本进入 DeepSeek，文本桥接器按标点和等待时间分段，MiniMax 音频块进入独立 PCM 播放队列。
+唤醒模式开启时，麦克风 PCM 先进入 2 秒环形缓冲，再由 sherpa-onnx 等待 `hei claw`；KWS 触发后暂停 KWS。当前默认的手动模式不运行 KWS，`session.start` 直接创建 turn。两种模式都使用 250 ms 最小有效语音和 700 ms 结束静音，ASR Worker 返回 partial/final；final 文本进入 DeepSeek，文本桥接器按标点和等待时间分段，MiniMax 音频块进入独立 PCM 播放队列。v0.2 示例配置还会按整个待播放 PCM 的剩余时长调度 TTS：剩余不超过 2000 ms 时释放下一段完整文本。
 
 每一轮都有唯一 `turn_id`。取消或打断时会取消 LLM、关闭 TTS、清空播放器，并丢弃旧 turn 的迟到文本和音频。
 # v0.2 可选分析和 Agent
@@ -102,11 +102,52 @@ python -m voice_terminal.analysis.model_setup --offline
 .\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe -Config config/v0.2.yaml
 ```
 
-启动脚本按配置启动 Analysis Worker，健康检查失败时主服务仍可降级启动；不会结束已经存在的 Worker。`-NoAnalysis` 使用外部运行的分析服务。模型目录仍为 `D:\模型\voice-terminal`，analysis 下分别保存 smart-turn 和 sensevoice，manifest.json 保存固定 revision 和 SHA-256。启动不下载模型。
+启动脚本按最终配置解析 ASR Worker 的完整 WebSocket 地址（host、port、path），使用应用层 health 确认 Paraformer 已加载；不再使用固定端口的 TCP 可连接作为 READY。已有且 READY 的 Worker 会复用；health 未通过但端口被占用时脚本会停止并报告原因，不会误杀其他进程。`-NoWorker` 仍会先检查外部 Worker 的 health，`-NoAnalysis` 使用外部运行的分析服务。脚本只终止自己启动的子进程，日志写入 `logs/`。
+
+ASR readiness 探针可单独运行：
+
+```powershell
+python -m voice_terminal.asr.probe --url ws://127.0.0.1:8766/asr --timeout 2
+```
+
+探针发送带 `request_id` 的 health 请求，只输出 READY/错误类别、`model_loaded` 和耗时，不输出密钥或音频。Voice Server 连接成功后也会执行同一应用层检查；模型未就绪、health 超时、协议错误和已有连接断开分别映射到可恢复的 `ASR_WORKER_NOT_READY`、`ASR_WORKER_TIMEOUT`、`ASR_WORKER_PROTOCOL_ERROR` 和 `ASR_WORKER_DISCONNECTED`。停止监听再启动时会重新连接并 health。
+
+Analysis Worker 的 health 可用于确认两个小模型是否实际加载：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8767/health | ConvertTo-Json -Depth 5
+```
+
+在 v0.2 配置下，`refine.model` 应为 `SenseVoiceSmall`，并且 `refine.status=READY`、`refine.model_loaded=true`。SenseVoiceSmall 同一个模型同时提供最终文字、语言、情绪和声音事件标签；项目没有另外拉取一个独立的“情绪 1”模型。结束后这些分段标签会以 `speech_emotion.segments`（兼容保留 `audio_cues`）进入最终 LLM user 消息；流式预测阶段没有这项信息是正常的，因为精修要等本轮结束后才执行。
+
+用于真实进程间回放（内存播放器，不代表物理扬声器）的脚本：
+
+```powershell
+.\scripts\replay-v02.ps1 `
+  -Python D:\DevTools\Python312\python.exe `
+  -Config config\v0.2.yaml `
+  -Audio logs\evaluation\audio\query-first12.wav,logs\evaluation\audio\query-second8.wav `
+  -Output logs\evaluation\replay-worker-query.json
+```
+
+该脚本从配置读取 ASR/Analysis 地址，先检查应用层 health；缺少服务时只启动本次回放需要的 Worker，结束时只关闭自己记录的 PID。`-NoWorker` 和 `-NoAnalysis` 可用于验证外部服务和 Analysis 降级。回放报告只保存协议状态、事件、时间线和计数，不保存 API Key 或原始 PCM。
+
+长音频离线夹具可使用：
+
+```powershell
+python scripts\create-long-eval-audio.py
+python -m voice_terminal.analysis.evaluate `
+  --manifest logs\evaluation\long-stage4-manifest.json `
+  --url ws://127.0.0.1:8767/analysis `
+  --output logs\evaluation\sensevoice-long-stage4-matrix.json `
+  --allow-over-max
+```
+
+`--allow-over-max` 只允许离线检查 60–62 秒输入，不改变运行时 `max_turn_ms=60000`；音频夹具和报告均在 Git 忽略目录中。
 
 Smart Turn 使用 onnxruntime CPU；SenseVoice 使用 FunASR CPU，tokenizer 从模型字节加载，支持 Windows 中文目录。默认 v0.2 精修预算 3000 ms，超过预算使用 Paraformer，原生计算结束后槽位才可复用。
 
-新能力开关位于 v02：enabled、smart_turn、sensevoice、predictions、tools。默认文件根为 docs，`allowed_roots` 可增加显式目录；API 工具名为 files_search / files_read_text，对应内部 files.search / files.read_text。没有 shell 或写操作。
+新能力开关位于 v02：enabled、smart_turn、sensevoice、predictions、tools、tts_pacing 和 tts_lead_ms。`tts_pacing` 在 `config/v0.2.yaml` 中打开时，第一段文本立即进入 MiniMax，后续文本只有在当前轮全部待播放音频剩余不超过 `tts_lead_ms` 时才发送。默认文件根为 docs，`allowed_roots` 可增加显式目录；API 工具名为 files_search / files_read_text，对应内部 files.search / files.read_text。没有 shell 或写操作。
 
 可重复的合成中文回放（不是自然麦克风验收）：
 

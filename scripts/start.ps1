@@ -13,43 +13,57 @@ Push-Location $RepoRoot
 $worker = $null
 $analysisWorker = $null
 try {
-  $analysisConfig = & $Python -c "import json,sys; from pathlib import Path; from voice_terminal.config import load_config; from urllib.parse import urlparse; c=load_config(Path('config/default.yaml'),Path(sys.argv[1])); u=urlparse(c.v02.analysis_url); print(json.dumps({'enabled':c.v02.enabled and (c.v02.smart_turn or c.v02.sensevoice),'health':'http://'+u.netloc+'/health'}))" $Config
+  $serviceConfig = & $Python -c "import json,sys; from pathlib import Path; from voice_terminal.config import load_config; from urllib.parse import urlparse; c=load_config(Path('config/default.yaml'),Path(sys.argv[1])); a=urlparse(c.v02.analysis_url); w=urlparse(c.asr.worker_url); print(json.dumps({'analysis_enabled':c.v02.enabled and (c.v02.smart_turn or c.v02.sensevoice),'analysis_health':'http://'+a.netloc+'/health','asr_url':c.asr.worker_url,'asr_host':w.hostname,'asr_port':w.port}))" $Config
   if ($LASTEXITCODE -ne 0) { throw "无法读取启动配置" }
-  $analysisConfig = $analysisConfig | ConvertFrom-Json
-  if ($analysisConfig.enabled -and -not $NoAnalysis) {
+  $serviceConfig = $serviceConfig | ConvertFrom-Json
+  if ($serviceConfig.analysis_enabled -and -not $NoAnalysis) {
     $existingAnalysis = $null
-    try { $existingAnalysis = Invoke-RestMethod -Uri $analysisConfig.health -TimeoutSec 2 } catch { }
+    try { $existingAnalysis = Invoke-RestMethod -Uri $serviceConfig.analysis_health -TimeoutSec 2 } catch { }
     if (-not $existingAnalysis) {
       $analysisWorker = Start-Process -FilePath $Python -ArgumentList @("-m", "apps.server.analysis_worker", "--config", $Config) -WorkingDirectory $RepoRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $LogDir "analysis-worker.out.log") -RedirectStandardError (Join-Path $LogDir "analysis-worker.err.log") -PassThru
       for ($attempt = 0; $attempt -lt 180; $attempt++) {
         if ($analysisWorker.HasExited) { break }
         try {
-          $existingAnalysis = Invoke-RestMethod -Uri $analysisConfig.health -TimeoutSec 1
+          $existingAnalysis = Invoke-RestMethod -Uri $serviceConfig.analysis_health -TimeoutSec 1
           break
         } catch { Start-Sleep -Seconds 1 }
       }
     }
-    if (-not $existingAnalysis) { Write-Warning "Analysis Worker 不可用，Voice Server 将使用 VAD / Paraformer 降级。" }
+    $analysisReady = $existingAnalysis -and $existingAnalysis.endpoint.status -eq "READY" -and $existingAnalysis.refine.status -eq "READY"
+    if (-not $analysisReady) { Write-Warning "Analysis Worker 不可用或模型未 READY，Voice Server 将使用 VAD / Paraformer 降级。" }
   }
-  if (-not $NoWorker) {
-    $workerOut = Join-Path $LogDir "asr-worker.out.log"
-    $workerErr = Join-Path $LogDir "asr-worker.err.log"
+  $workerOut = Join-Path $LogDir "asr-worker.out.log"
+  $workerErr = Join-Path $LogDir "asr-worker.err.log"
+  $probeOutput = & $Python -m voice_terminal.asr.probe --url $serviceConfig.asr_url --timeout 2 2>&1
+  $probeExit = $LASTEXITCODE
+  if ($probeExit -eq 0) {
+    Write-Host "ASR Worker 已就绪：$serviceConfig.asr_url"
+  } elseif ($NoWorker) {
+    throw "指定了 -NoWorker，但 ASR Worker 未通过应用层 health：$serviceConfig.asr_url`n$probeOutput"
+  } else {
+    $portInUse = $false
+    if ($serviceConfig.asr_host -and $serviceConfig.asr_port) {
+      try {
+        $portInUse = (Test-NetConnection -ComputerName $serviceConfig.asr_host -Port ([int]$serviceConfig.asr_port) -WarningAction SilentlyContinue -InformationLevel Quiet)
+      } catch { $portInUse = $false }
+    }
+    if ($portInUse) {
+      throw "ASR Worker 地址已有服务但应用层 health 未 READY：$serviceConfig.asr_url`n$probeOutput"
+    }
     $worker = Start-Process -FilePath $Python -ArgumentList @("-m", "apps.server.asr_worker", "--config", $Config) -WorkingDirectory $RepoRoot -WindowStyle Hidden -RedirectStandardOutput $workerOut -RedirectStandardError $workerErr -PassThru
     $ready = $false
     for ($attempt = 0; $attempt -lt 120; $attempt++) {
       Start-Sleep -Milliseconds 500
       if ($worker.HasExited) { break }
-      try {
-        $client = [System.Net.Sockets.TcpClient]::new()
-        $client.Connect("127.0.0.1", 8766)
-        $client.Close()
+      $probeOutput = & $Python -m voice_terminal.asr.probe --url $serviceConfig.asr_url --timeout 2 2>&1
+      if ($LASTEXITCODE -eq 0) {
         $ready = $true
         break
-      } catch { }
+      }
     }
     if (-not $ready) {
       $details = if (Test-Path -LiteralPath $workerErr) { Get-Content -Raw -LiteralPath $workerErr } else { "无 ASR Worker 日志" }
-      throw "ASR Worker 未能在 60 秒内启动。`n$details"
+      throw "ASR Worker 未能通过应用层 health（60 秒）：$serviceConfig.asr_url`n探针：$probeOutput`n$details"
     }
   }
 

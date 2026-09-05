@@ -65,6 +65,12 @@ class AsrWorkerEngine:
         return max(1, int(self.sample_rate * middle_chunks * 60 / 1000))
 
     @property
+    def model_loaded(self) -> bool:
+        """Whether the real recognizer has completed loading."""
+
+        return self._model is not None
+
+    @property
     def chunk_stride_bytes(self) -> int:
         # The Worker accepts mono signed 16-bit PCM.
         return self.chunk_stride_samples * 2
@@ -212,9 +218,34 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                     raise ValueError("消息必须是 JSON 对象")
                 message_type = message.get("type")
                 if message_type == "health":
-                    engine.load()
-                    await websocket.send(json.dumps({"type": "health", "status": "READY"}))
-                    logger.info("asr.worker.health_reply")
+                    request_id = message.get("request_id")
+                    if request_id is not None and not isinstance(request_id, str):
+                        raise ValueError("health request_id 必须是字符串")
+                    try:
+                        engine.load()
+                        response = {
+                            "type": "health",
+                            "status": "READY",
+                            "model_loaded": engine.model_loaded,
+                        }
+                    except Exception as exc:
+                        # Keep the connection available long enough for the
+                        # caller to receive a classified readiness failure.
+                        response = {
+                            "type": "health",
+                            "status": "ERROR",
+                            "model_loaded": False,
+                            "error": str(exc),
+                        }
+                    if isinstance(request_id, str):
+                        response["request_id"] = request_id
+                    await websocket.send(json.dumps(response, ensure_ascii=False))
+                    logger.info(
+                        "asr.worker.health_reply request_id=%s status=%s model_loaded=%s",
+                        request_id,
+                        response["status"],
+                        response["model_loaded"],
+                    )
                     continue
                 if message_type == "turn.finish":
                     turn_id = message.get("turn_id")
@@ -252,19 +283,19 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                         inference.text[:120],
                     )
             except Exception as exc:
+                message_type = message.get("type") if isinstance(message, dict) else None
                 turn_id = message.get("turn_id") if isinstance(message, dict) else None
                 logger.exception("asr.worker.message_failed turn_id=%s", turn_id)
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "type": "error",
-                            "code": "ASR_INFERENCE_FAILED",
-                            "message": str(exc),
-                            "turn_id": turn_id if isinstance(turn_id, str) else None,
-                        },
-                        ensure_ascii=False,
-                    )
-                )
+                code = "ASR_PROTOCOL_ERROR" if not isinstance(message, dict) or message_type in {"health", "audio.chunk", "turn.finish"} else "ASR_INFERENCE_FAILED"
+                error_payload = {
+                    "type": "error",
+                    "code": code,
+                    "message": str(exc),
+                    "turn_id": turn_id if isinstance(turn_id, str) else None,
+                }
+                if isinstance(message, dict) and isinstance(message.get("request_id"), str):
+                    error_payload["request_id"] = message["request_id"]
+                await websocket.send(json.dumps(error_payload, ensure_ascii=False))
     finally:
         for turn_id in owned_turns:
             engine._clear_turn(turn_id)

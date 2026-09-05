@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+import logging
 import time
 
 from .turn_controller import TurnController
@@ -19,6 +20,8 @@ from ..core.state import TerminalState
 from ..kws.keywords import strip_wake_prefix
 from ..stream.text_bridge import TextBridge
 
+logger = logging.getLogger(__name__)
+
 
 class RealtimeController(TurnController):
     """v0.2 orchestration; v0.1 stays available through the feature switch."""
@@ -27,6 +30,7 @@ class RealtimeController(TurnController):
         super().__init__(**kwargs)
         self.options = options
         self.analysis = analysis or AnalysisClient(options.analysis_url)
+        self.analysis_health: dict = {}
         self.registry = SpeculativeTools(FileTools(options.allowed_roots))
         self.agent = AgentRuntime(self.llm, self.registry, tools_enabled=options.tools)
         self.workspace: TurnWorkspace | None = None
@@ -81,24 +85,93 @@ class RealtimeController(TurnController):
         if self.options.smart_turn or self.options.sensevoice:
             try:
                 health = await self.analysis.health()
+                self.analysis_health = health if isinstance(health, dict) else {}
                 status = "READY" if all(health.get(k, {}).get("status") == "READY" for k, enabled in
                                         (("endpoint", self.options.smart_turn), ("refine", self.options.sensevoice)) if enabled) else "DEGRADED"
-            except Exception:
+            except Exception as exc:
+                self.analysis_health = {
+                    "endpoint": {"status": "DEGRADED", "error": str(exc) or "health unavailable"},
+                    "refine": {"status": "DEGRADED", "error": str(exc) or "health unavailable"},
+                }
                 status = "DEGRADED"
         else:
+            self.analysis_health = {}
             status = "DISABLED"
         self.state.services["analysis"] = status
         await self._state_event(TerminalState.IDLE, listening=False)
+
+    def _analysis_meta(self, name: str, *, status: str) -> dict:
+        """Return safe model metadata for the current-turn diagnostics."""
+
+        value = self.analysis_health.get(name, {})
+        meta = {"status": status}
+        if isinstance(value, dict):
+            for key in ("model", "model_loaded"):
+                if key in value and value[key] is not None:
+                    meta[key] = value[key]
+            if status != "READY" and value.get("error"):
+                meta["error"] = str(value["error"])
+        return meta
 
     async def start_listening(self) -> None:
         # Analysis is optional and never becomes a mandatory start prerequisite.
         status = self.state.services.pop("analysis", "DISABLED")
         try:
+            if not await self._ensure_asr_ready():
+                return
             await super().start_listening()
         finally:
             self.state.services["analysis"] = status
         if self.state.listening and (self._asr_sender is None or self._asr_sender.done()):
             self._asr_sender = asyncio.create_task(self._send_asr_loop())
+
+    async def _ensure_asr_ready(self) -> bool:
+        """Reconnect and perform an application-level ASR readiness check."""
+
+        if self.asr is None:
+            self.state.services["asr"] = "ERROR"
+            await self._error("ASR_WORKER_UNAVAILABLE", "ASR Worker 客户端未初始化。", recoverable=True)
+            await self._state_event(TerminalState.IDLE, listening=False)
+            return False
+        try:
+            if not self.asr.connected:
+                await self.asr.connect()
+            health = getattr(self.asr, "health", None)
+            if health is not None:
+                await health()
+            self.state.services["asr"] = "READY"
+            return True
+        except Exception as exc:
+            code = getattr(exc, "code", "ASR_WORKER_NOT_READY")
+            self.state.services["asr"] = "ERROR"
+            await self._error(str(code), str(exc), recoverable=True)
+            await self._state_event(TerminalState.IDLE, listening=False)
+            return False
+
+    async def _handle_asr_disconnect(self) -> None:
+        """Stop capture after a transport loss and leave a restartable state."""
+
+        self.state.services["asr"] = "ERROR"
+        self.state.listening = False
+        sender = self._asr_sender
+        if sender is not None and sender is not asyncio.current_task() and not sender.done():
+            sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+        self._asr_sender = None
+        while True:
+            try:
+                self._asr_queue.get_nowait()
+                self._asr_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        if self.capture is not None:
+            try:
+                await self.capture.stop()
+            except Exception:
+                # The transport failure is the actionable error; a concurrent
+                # capture shutdown failure must not hide it.
+                pass
+            self.state.services["audio"] = "READY"
 
     def _queue_asr(self, item) -> None:
         # No awaited network writes on the capture path. Overflow is a visible
@@ -118,8 +191,15 @@ class RealtimeController(TurnController):
                 raise
             except Exception as exc:
                 await self._cancel_turn()
-                await self._error("ASR_SEND_FAILED", str(exc), recoverable=True)
+                code = getattr(exc, "code", None)
+                if not isinstance(code, str):
+                    code = "ASR_WORKER_DISCONNECTED" if "ConnectionClosed" in type(exc).__name__ else "ASR_SEND_FAILED"
+                if code == "ASR_WORKER_DISCONNECTED":
+                    await self._handle_asr_disconnect()
+                await self._error(code, str(exc), recoverable=True)
                 await self._state_event(TerminalState.IDLE, listening=self.state.listening)
+                if code == "ASR_WORKER_DISCONNECTED":
+                    return
             finally:
                 self._asr_queue.task_done()
 
@@ -247,6 +327,9 @@ class RealtimeController(TurnController):
         self._sub_finals.clear()
         self._new_sub(bytes(ws.audio.pcm))
         self._start_scheduler()
+        for name, details in self.analysis_health.items():
+            if isinstance(details, dict):
+                ws.analysis[name] = dict(details)
         if self.player:
             self.player.block()
         await self._detail("turn.started")
@@ -280,7 +363,10 @@ class RealtimeController(TurnController):
         self._turn_cancel = asyncio.Event()
         self._active_input = True
         ws.timings = {k: v for k, v in ws.timings.items() if k in {"first_segment", "first_prediction", "asr_first_text"}}
-        self.state.current.update(final_text="", assistant_text="", tts_text="", tts_status="IDLE", audio_buffer_ms=0)
+        self.state.current.update(
+            final_text="", assistant_text="", tts_text="", tts_status="IDLE",
+            audio_buffer_ms=0, tts_returned_ms=0, tts_played_ms=0, tts_remaining_ms=0,
+        )
         # New ASR cache for the resumed subsegment; earlier final callbacks still
         # update their own part and cannot overwrite the resumed part.
         seed = b"".join(f.pcm for f in self._recent if f.end_sample > (self._resume_started or frame.start_sample))
@@ -339,13 +425,15 @@ class RealtimeController(TurnController):
                 raise ValueError("incomplete refinement")
             if self._valid(token):
                 ws.timings["sensevoice_refine_ms"] = reply["elapsed_ms"]
-                ws.analysis["refine"] = {"status": "READY"}
+                ws.analysis["refine"] = self._analysis_meta("refine", status="READY")
             return result
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             if self._valid(token):
-                ws.analysis["refine"] = {"status": "DEGRADED", "error": str(exc) or "timeout", "fallback": "paraformer"}
+                details = self._analysis_meta("refine", status="DEGRADED")
+                details.update({"error": str(exc) or "timeout", "fallback": "paraformer"})
+                ws.analysis["refine"] = details
             return None
 
     async def _complete(self, ws, token, sub_id, refinement) -> None:
@@ -362,6 +450,18 @@ class RealtimeController(TurnController):
             if self.wake_enabled:
                 ws.final_text = strip_wake_prefix(ws.final_text, self.wake_keyword)
             ws.audio_cues = result.get("segments", []) if result else []
+            refine_meta = ws.analysis.get("refine", {}) if isinstance(ws.analysis, dict) else {}
+            refine_ready = isinstance(refine_meta, dict) and refine_meta.get("status") == "READY"
+            speech_emotion = {
+                "status": "READY" if refine_ready else "UNAVAILABLE",
+                "source": (
+                    refine_meta.get("model") or "SenseVoiceSmall"
+                    if refine_ready else "paraformer_fallback"
+                ),
+                "segments": list(ws.audio_cues),
+            }
+            if isinstance(refine_meta, dict) and "model_loaded" in refine_meta:
+                speech_emotion["model_loaded"] = bool(refine_meta["model_loaded"])
             valid_samples = self._speech_samples + (max(0, self._last_frame.end_sample - self._speech_start_sample) if self._speech_start_sample is not None else 0)
             if valid_samples < self.vad_min_speech_ms * 16:
                 ws.final_text = ""
@@ -369,7 +469,7 @@ class RealtimeController(TurnController):
             ws.timings["commit"] = time.monotonic()
             self.state.current.update(final_text=ws.final_text, partial_text="")
             await self._detail("transcript.refined", text=ws.final_text, source="sensevoice" if result is not None else "paraformer")
-            await self._detail("speech.emotion", segments=ws.audio_cues)
+            await self._detail("speech.emotion", **speech_emotion)
             await self._detail("transcript.final", text=ws.final_text)
             await self._detail("turn.committed")
             if not ws.final_text:
@@ -391,7 +491,10 @@ class RealtimeController(TurnController):
         if message.get("type") == "error":
             if sub_id is None or sub_id in self._sub_parts:
                 await self._cancel_turn()
-                await self._error("ASR_WORKER_ERROR", str(message.get("message")), recoverable=True)
+                code = str(message.get("code") or "ASR_WORKER_ERROR")
+                if code == "ASR_WORKER_DISCONNECTED":
+                    await self._handle_asr_disconnect()
+                await self._error(code, str(message.get("message")), recoverable=True)
                 await self._state_event(TerminalState.IDLE, listening=self.state.listening)
             return
         if sub_id not in self._sub_parts or not isinstance(text, str) or self.workspace is None:
@@ -558,41 +661,266 @@ class RealtimeController(TurnController):
         bridge = TextBridge(**self.bridge_options)
         session = None
         reader = None
+        sender_task = None
+        progress_task = None
         parts = []
+        tts_failed: Exception | None = None
+        tts_disabled = False
         playback_key = ws.playback_key
+        pacing_enabled = bool(self.options.tts_pacing and self.player is not None)
+        lead_ms = max(1, self.options.tts_lead_ms)
+        # The queue keeps the LLM consumer independent from the playback
+        # clock, while still putting a hard bound on text waiting for TTS.
+        pending_segments: deque[str] = deque()
+        pending_signal = asyncio.Event()
+        audio_signal = asyncio.Event()
+        progress_stop = asyncio.Event()
+        pending_limit = 32
+        producer_done = False
+        audio_returned_bytes = 0
+        progress_lock = asyncio.Lock()
+        last_progress: tuple[int, int, int, int] | None = None
+        last_progress_at = 0.0
+        audio_bytes_per_second = (
+            self.player.sample_rate * self.player.channels * 2
+            if self.player is not None else 32000 * 2
+        )
         if self.player:
             self.player.allow(playback_key)
 
-        async def read_audio():
-            async for pcm in session.audio_chunks():
-                if not self._valid(token) or not ws.committed:
+        def playback_progress() -> dict[str, int | bool | str | None]:
+            returned_ms = int(audio_returned_bytes * 1000 / audio_bytes_per_second)
+            if self.player is None:
+                played_ms = 0
+                queued_ms = 0
+                started = False
+            else:
+                current = self.player.progress(playback_key)
+                played_ms = int(current["played_ms"])
+                queued_ms = int(current["buffered_ms"])
+                started = bool(current["started"])
+            return {
+                "returned_ms": returned_ms,
+                "played_ms": played_ms,
+                "remaining_ms": max(0, returned_ms - played_ms),
+                "queued_ms": queued_ms,
+                "started": started,
+            }
+
+        async def emit_progress(*, status: str | None = None, waiting_text: str | None = None,
+                                trigger: str | None = None, force: bool = False) -> None:
+            nonlocal last_progress, last_progress_at
+            if not self._valid(token) or not ws.committed:
+                return
+            async with progress_lock:
+                snapshot = playback_progress()
+                now = time.monotonic()
+                signature = (
+                    int(snapshot["returned_ms"]), int(snapshot["played_ms"]),
+                    int(snapshot["remaining_ms"]), int(snapshot["queued_ms"]),
+                )
+                # Audio callbacks can arrive dozens of times per second.  A
+                # half-second diagnostic cadence is enough for the console
+                # and WebUI while keeping the event bus and log bounded.
+                if not force and (now - last_progress_at < 0.5 or signature == last_progress):
                     return
-                ws.timings.setdefault("first_audio", time.monotonic())
-                if self.player:
-                    while self.player.buffered_ms > 2000:
-                        await asyncio.sleep(.02)
-                        if not self._valid(token):
-                            return
-                    self.player.enqueue(playback_key, pcm)
-                    self.state.current["audio_buffer_ms"] = self.player.buffered_ms
-                self.state.current["tts_status"] = "STREAMING"
-                await self._detail("tts.status", provider="minimax", status="STREAMING", waiting_text=self.state.current["tts_text"], audio_buffer_ms=self.state.current["audio_buffer_ms"])
-                await self._latency(ws)
+                last_progress = signature
+                last_progress_at = now
+                current_status = status or self.state.current.get("tts_status") or "IDLE"
+                if waiting_text is not None:
+                    self.state.current["tts_text"] = waiting_text
+                self.state.current.update(
+                    tts_returned_ms=int(snapshot["returned_ms"]),
+                    tts_played_ms=int(snapshot["played_ms"]),
+                    tts_remaining_ms=int(snapshot["remaining_ms"]),
+                    audio_buffer_ms=int(snapshot["queued_ms"]),
+                )
+                logger.info(
+                    "controller.tts_progress turn_id=%s status=%s returned_ms=%d played_ms=%d remaining_ms=%d queued_ms=%d trigger=%s",
+                    ws.turn_id,
+                    current_status,
+                    int(snapshot["returned_ms"]),
+                    int(snapshot["played_ms"]),
+                    int(snapshot["remaining_ms"]),
+                    int(snapshot["queued_ms"]),
+                    trigger or "monitor",
+                )
+                await self._detail(
+                    "tts.progress",
+                    provider="minimax",
+                    status=current_status,
+                    waiting_text=waiting_text if waiting_text is not None else self.state.current.get("tts_text", ""),
+                    audio_buffer_ms=int(snapshot["queued_ms"]),
+                    audio_returned_ms=int(snapshot["returned_ms"]),
+                    audio_played_ms=int(snapshot["played_ms"]),
+                    audio_remaining_ms=int(snapshot["remaining_ms"]),
+                    pacing_enabled=pacing_enabled,
+                    lead_ms=lead_ms,
+                    trigger=trigger,
+                )
+
+        async def read_audio(active_session):
+            nonlocal audio_returned_bytes
+
+            try:
+                async for pcm in active_session.audio_chunks():
+                    if not self._valid(token) or not ws.committed:
+                        return
+                    audio_returned_bytes += len(pcm)
+                    audio_signal.set()
+                    ws.timings.setdefault("first_audio", time.monotonic())
+                    if self.player:
+                        # Keep the native player bounded.  Audio held by the
+                        # provider queue is still included in
+                        # ``audio_remaining_ms`` through audio_returned_bytes.
+                        while self.player.buffered_ms > 2000:
+                            await asyncio.sleep(.02)
+                            if not self._valid(token):
+                                return
+                        self.player.enqueue(playback_key, pcm)
+                    self.state.current["tts_status"] = "STREAMING"
+                    await emit_progress(status="STREAMING", trigger="audio_received")
+                    await self._latency(ws)
+            finally:
+                # Wake a sender waiting for the first PCM even when the
+                # provider ends or fails without returning audio.
+                audio_signal.set()
+
+        async def monitor_progress() -> None:
+            try:
+                while True:
+                    try:
+                        await asyncio.wait_for(progress_stop.wait(), .2)
+                    except asyncio.TimeoutError:
+                        pass
+                    if progress_stop.is_set() or not self._valid(token) or not ws.committed:
+                        return
+                    await emit_progress()
+            except asyncio.CancelledError:
+                raise
+
+        async def reader_exception() -> Exception | None:
+            if reader is None or not reader.done() or reader.cancelled():
+                return None
+            return reader.exception()
+
+        async def wait_for_audio(before_bytes: int) -> None:
+            if not pacing_enabled:
+                return
+            deadline = asyncio.get_running_loop().time() + 15.0
+            while audio_returned_bytes <= before_bytes:
+                if not self._valid(token) or tts_disabled:
+                    return
+                receiver_error = await reader_exception()
+                if receiver_error is not None:
+                    raise receiver_error
+                audio_signal.clear()
+                if audio_returned_bytes > before_bytes:
+                    break
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("TTS 文本发送后未收到音频")
+                try:
+                    await asyncio.wait_for(audio_signal.wait(), remaining)
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError("TTS 文本发送后未收到音频") from exc
+            await emit_progress(status="STREAMING", trigger="audio_available")
+
+        async def wait_for_playback_window() -> None:
+            if not pacing_enabled:
+                return
+            deadline = asyncio.get_running_loop().time() + 600.0
+            while self._valid(token) and not tts_disabled:
+                snapshot = playback_progress()
+                if int(snapshot["remaining_ms"]) <= lead_ms:
+                    return
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("TTS 播放进度长时间没有下降")
+                await emit_progress(status="WAITING_PLAYBACK", trigger="lead_window")
+                await asyncio.sleep(.05)
+
+        async def next_segment() -> str | None:
+            while not pending_segments and not producer_done and not tts_disabled and self._valid(token):
+                pending_signal.clear()
+                if pending_segments or producer_done or tts_disabled:
+                    continue
+                await pending_signal.wait()
+            if not pending_segments:
+                return None
+            segment = pending_segments.popleft()
+            # Wake a producer waiting on the bounded queue.
+            pending_signal.set()
+            return segment
+
+        async def tts_sender() -> None:
+            nonlocal session, reader, progress_task, tts_failed, tts_disabled
+            sent_any = False
+            try:
+                while True:
+                    segment = await next_segment()
+                    if segment is None:
+                        return
+                    if not self._valid(token):
+                        return
+                    if session is None:
+                        session = self.tts.session()
+                        await session.start()
+                        reader = asyncio.create_task(read_audio(session), name=f"tts-audio-{ws.turn_id}")
+                        progress_task = asyncio.create_task(monitor_progress(), name=f"tts-progress-{ws.turn_id}")
+                    if sent_any:
+                        await wait_for_playback_window()
+                    receiver_error = await reader_exception()
+                    if receiver_error is not None:
+                        raise receiver_error
+                    before_bytes = audio_returned_bytes
+                    ws.timings.setdefault("first_tts_text", time.monotonic())
+                    self.state.current["tts_text"] = segment
+                    await session.send_text(segment)
+                    await emit_progress(
+                        status="QUEUED",
+                        waiting_text=segment,
+                        trigger="first_segment" if not sent_any else "remaining_below_lead",
+                        force=True,
+                    )
+                    sent_any = True
+                    # Do not send every ready segment while the first one is
+                    # still being synthesized.  One audio return reopens the
+                    # playback-window check and prevents a fast LLM from
+                    # flooding task_continue frames.
+                    await wait_for_audio(before_bytes)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                tts_failed = exc
+                tts_disabled = True
+                pending_segments.clear()
+                pending_signal.set()
+                progress_stop.set()
+                logger.warning("controller.tts_degraded turn_id=%s error=%s", ws.turn_id, exc)
 
         async def send(segments):
-            nonlocal session, reader
-            if not segments or self.tts is None or not self._valid(token):
+            nonlocal sender_task
+            if not segments or self.tts is None or tts_disabled or not self._valid(token):
                 return
-            if session is None:
-                session = self.tts.session()
-                await session.start()
-                reader = asyncio.create_task(read_audio())
+            if sender_task is None:
+                sender_task = asyncio.create_task(tts_sender(), name=f"tts-sender-{ws.turn_id}")
             for segment in segments:
-                if not self._valid(token):
+                if not segment or not segment.strip():
+                    continue
+                while len(pending_segments) >= pending_limit and not tts_disabled and self._valid(token):
+                    pending_signal.clear()
+                    if len(pending_segments) < pending_limit:
+                        continue
+                    await pending_signal.wait()
+                if tts_disabled or not self._valid(token):
                     return
-                ws.timings.setdefault("first_tts_text", time.monotonic())
-                self.state.current["tts_text"] = segment
-                await session.send_text(segment)
+                pending_segments.append(segment)
+                pending_signal.set()
+
+        async def finish_send_queue() -> None:
+            nonlocal producer_done
+            producer_done = True
+            pending_signal.set()
 
         async def tool_event(payload):
             if self._valid(token):
@@ -600,8 +928,26 @@ class RealtimeController(TurnController):
 
         try:
             ws.timings["llm_request"] = time.monotonic()
+            refine_meta = ws.analysis.get("refine", {}) if isinstance(ws.analysis, dict) else {}
+            refine_ready = isinstance(refine_meta, dict) and refine_meta.get("status") == "READY"
+            speech_emotion = {
+                "status": "READY" if refine_ready else "UNAVAILABLE",
+                "source": (
+                    refine_meta.get("model") or "SenseVoiceSmall"
+                    if refine_ready else "paraformer_fallback"
+                ),
+                "segments": list(ws.audio_cues),
+            }
+            if isinstance(refine_meta, dict) and "model_loaded" in refine_meta:
+                speech_emotion["model_loaded"] = bool(refine_meta["model_loaded"])
             package = {"final_text": ws.final_text, "provisional_transcript": ws.paraformer_final,
-                       "audio_cues": ws.audio_cues, "final": True}
+                       "audio_cues": ws.audio_cues, "speech_emotion": speech_emotion, "final": True}
+            request_messages = self.agent.answer_messages(list(self.history.messages), package)
+            await self._detail(
+                "llm.context",
+                messages=request_messages,
+                message_count=len(request_messages),
+            )
             async for delta in self.agent.answer(list(self.history.messages), package, ws.turn_id, tool_event):
                 if not self._valid(token) or not ws.committed:
                     return ""
@@ -616,13 +962,78 @@ class RealtimeController(TurnController):
                 await self._latency(ws)
             ws.staged_response = "".join(parts).strip()
             await send(bridge.finish())
+            await finish_send_queue()
+            if sender_task is not None:
+                await sender_task
             if session:
-                await session.finish()
-                await asyncio.wait_for(reader, 60)
+                try:
+                    await session.finish()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    tts_failed = tts_failed or exc
+                    tts_disabled = True
+                    logger.warning("controller.tts_finish_degraded turn_id=%s error=%s", ws.turn_id, exc)
+                if reader is not None:
+                    # MiniMax documents a 120-second receive idle window.  A
+                    # fixed 60-second answer deadline could cut a legitimate
+                    # long response; scale the wait with the text while
+                    # retaining a finite upper bound for cleanup.
+                    answer_timeout = min(600.0, max(120.0, 30.0 + len(ws.staged_response) * 0.25))
+                    # Once the sender/receiver has reported a transport
+                    # failure there is no reason to wait through the full
+                    # provider idle window.  Give already queued PCM a short
+                    # grace period, then finish with a visible DEGRADED
+                    # status.  A healthy session still gets the full dynamic
+                    # deadline above so long answers are not clipped.
+                    reader_timeout = min(answer_timeout, 15.0) if tts_failed is not None else answer_timeout
+                    try:
+                        await asyncio.wait_for(reader, reader_timeout)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        tts_failed = tts_failed or exc
+                        tts_disabled = True
+                        logger.warning("controller.tts_receive_degraded turn_id=%s error=%s", ws.turn_id, exc)
             if self.player:
-                await self.player.wait_until_empty(timeout_seconds=60)
+                playback_timeout = min(600.0, max(120.0, 30.0 + len(ws.staged_response) * 0.25 + self.player.buffered_ms / 1000))
+                try:
+                    await self.player.wait_until_empty(timeout_seconds=playback_timeout)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    tts_failed = tts_failed or exc
+                    tts_disabled = True
+                    logger.warning("controller.playback_degraded turn_id=%s error=%s", ws.turn_id, exc)
+            if session:
+                if tts_failed is not None and self._valid(token):
+                    self.state.current["tts_status"] = "DEGRADED"
+                elif self._valid(token):
+                    self.state.current["tts_status"] = "FINISHED"
+                await emit_progress(
+                    status=self.state.current.get("tts_status"),
+                    trigger="playback_finished",
+                    force=True,
+                )
+            if tts_failed is not None and self._valid(token):
+                self.state.current["tts_status"] = "DEGRADED"
+                await self._detail(
+                    "tts.status",
+                    provider="minimax",
+                    status="DEGRADED",
+                    waiting_text="",
+                    audio_buffer_ms=self.player.buffered_ms if self.player else 0,
+                    error=str(tts_failed),
+                )
             return ws.staged_response
         finally:
+            progress_stop.set()
+            if progress_task and not progress_task.done():
+                progress_task.cancel()
+                await asyncio.gather(progress_task, return_exceptions=True)
+            if sender_task and not sender_task.done():
+                sender_task.cancel()
+                await asyncio.gather(sender_task, return_exceptions=True)
             if reader and not reader.done():
                 reader.cancel()
                 self._track(reader)
@@ -676,7 +1087,14 @@ class RealtimeController(TurnController):
         await self._latency(ws, complete=True)
         latency = self.state.latency["values"]
         self.history.append_record(turn_id=ws.turn_id, transcript=ws.final_text, response=response, latency=latency)
-        self.state.current.update(tts_status="FINISHED", audio_buffer_ms=0)
+        # Preserve a provider/playback degradation that was reported while
+        # the textual answer was still completed.  Replacing it with
+        # FINISHED would make the WebUI hide the reason the tail was not
+        # spoken, even though the turn itself was committed successfully.
+        if self.state.current.get("tts_status") == "DEGRADED":
+            self.state.current["audio_buffer_ms"] = 0
+        else:
+            self.state.current.update(tts_status="FINISHED", audio_buffer_ms=0)
         await self._detail("turn.completed", transcript=ws.final_text, response=response, completed_at=utc_now_iso(), latency=latency)
         await self._cancel_turn()
         await self._state_event(TerminalState.IDLE, listening=self.state.listening)

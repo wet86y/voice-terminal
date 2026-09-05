@@ -38,6 +38,8 @@ class PcmPlayer:
         self._active_turn: str | None = None
         self._started_for_turn: str | None = None
         self._buffered_bytes = 0
+        self._enqueued_bytes = 0
+        self._played_bytes = 0
         self._allowed_key: str | None = None
         self._gated = False
 
@@ -68,6 +70,63 @@ class PcmPlayer:
         return int(buffered_bytes * 1000 / bytes_per_second) if bytes_per_second else 0
 
     @property
+    def enqueued_ms(self) -> int:
+        """Total PCM accepted for the active playback key, in milliseconds."""
+
+        bytes_per_second = self.sample_rate * self.channels * 2
+        with self._queue_lock:
+            value = self._enqueued_bytes
+        return int(value * 1000 / bytes_per_second) if bytes_per_second else 0
+
+    @property
+    def played_ms(self) -> int:
+        """PCM consumed by the PortAudio callback for the active key."""
+
+        bytes_per_second = self.sample_rate * self.channels * 2
+        with self._queue_lock:
+            value = self._played_bytes
+        return int(value * 1000 / bytes_per_second) if bytes_per_second else 0
+
+    def progress(self, key: str | None = None) -> dict[str, int | bool | str | None]:
+        """Return a thread-safe snapshot of the active playback queue.
+
+        ``buffered_ms`` is the audio still held by the player.  ``played_ms``
+        is based on bytes copied by the audio callback, which is the closest
+        local signal to the Windows output device without adding another
+        playback backend.  A key mismatch returns an empty snapshot so a
+        previous turn cannot be mistaken for the current one.
+        """
+
+        bytes_per_second = self.sample_rate * self.channels * 2
+        with self._queue_lock:
+            active = self._active_turn
+            if key is not None and active != key:
+                return {
+                    "key": active,
+                    "enqueued_ms": 0,
+                    "played_ms": 0,
+                    "buffered_ms": 0,
+                    "started": False,
+                }
+            enqueued = self._enqueued_bytes
+            played = self._played_bytes
+            buffered = self._buffered_bytes
+            started = self._started_for_turn == active and active is not None
+        if not bytes_per_second:
+            enqueued_ms = played_ms = buffered_ms = 0
+        else:
+            enqueued_ms = int(enqueued * 1000 / bytes_per_second)
+            played_ms = int(played * 1000 / bytes_per_second)
+            buffered_ms = int(buffered * 1000 / bytes_per_second)
+        return {
+            "key": active,
+            "enqueued_ms": enqueued_ms,
+            "played_ms": played_ms,
+            "buffered_ms": buffered_ms,
+            "started": started,
+        }
+
+    @property
     def running(self) -> bool:
         return self._stream is not None
 
@@ -86,6 +145,7 @@ class PcmPlayer:
                 offset += take
                 remaining -= take
                 self._buffered_bytes = max(0, self._buffered_bytes - take)
+                self._played_bytes += take
                 if take < len(chunk):
                     # Preserve exact PCM order for the next callback.
                     self._chunks.appendleft(chunk[take:])
@@ -138,6 +198,7 @@ class PcmPlayer:
                 self._started_for_turn = None
             self._chunks.append(bytes(pcm))
             self._buffered_bytes += len(pcm)
+            self._enqueued_bytes += len(pcm)
         logger.debug("audio.player_enqueue turn_id=%s bytes=%d buffered_ms=%d", turn_id, len(pcm), self.buffered_ms)
 
     def clear(self, turn_id: str | None = None) -> None:
@@ -150,14 +211,16 @@ class PcmPlayer:
     def _clear_unlocked(self) -> None:
         self._chunks.clear()
         self._buffered_bytes = 0
+        self._enqueued_bytes = 0
+        self._played_bytes = 0
         self._active_turn = None
         self._started_for_turn = None
 
     async def wait_until_empty(self, timeout_seconds: float = 10.0) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
-        while self._buffered_bytes > 0 and asyncio.get_running_loop().time() < deadline:
+        while self.buffered_ms > 0 and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.02)
-        if self._buffered_bytes > 0:
+        if self.buffered_ms > 0:
             raise TimeoutError("PCM playback did not drain before its deadline")
 
     def stop(self) -> None:

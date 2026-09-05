@@ -43,8 +43,11 @@ async def evaluate(args):
         if rate != 16000:
             factor = gcd(rate, 16000)
             audio = resample_poly(audio, 16000 // factor, rate // factor)
-        if len(audio) > 60 * 16000:
-            rows.append({"name": item["name"], "error": "fixture exceeds 60 seconds"})
+        duration_s = len(audio) / 16000
+        limit_s = 62.0 if args.allow_over_max else 60.0
+        if duration_s > limit_s:
+            rows.append({"name": item["name"], "duration_s": duration_s,
+                         "error": f"fixture exceeds {limit_s:g} seconds"})
             continue
         pcm = (np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes()
         turn = f"eval-{index}"
@@ -56,13 +59,22 @@ async def evaluate(args):
         result = await client.analyze("refine", pcm, turn, 0, 60000)
         endpoint = await client.analyze("endpoint", pcm[-256000:] + bytes(700 * 32), turn, 0, 5000)
         peak_rss = max(peak_rss, process.memory_info().rss)
-        row = {"name": item["name"], "source": item.get("source", "user-supplied"), "duration_s": len(audio) / 16000,
+        segments = result["result"].get("segments", [])
+        ranges = [(int(part.get("start_ms", -1)), int(part.get("end_ms", -1))) for part in segments]
+        bounded = all(0 <= start < end <= round(duration_s * 1000) and end - start <= 30000
+                      for start, end in ranges)
+        ordered = bounded and all(index == 0 or start >= ranges[index - 1][1]
+                                  for index, (start, end) in enumerate(ranges))
+        row = {"name": item["name"], "source": item.get("source", "user-supplied"), "duration_s": duration_s,
                "paraformer": draft, "refined": result["result"]["text"], "reference": item["reference"],
                "paraformer_cer": cer(item["reference"], draft), "sensevoice_cer": cer(item["reference"], result["result"]["text"]),
                "asr_compute_ms": asr_ms, "sensevoice_ms": result["elapsed_ms"],
                "refine_exceeds_default_budget": result["elapsed_ms"] > 3000,
                "endpoint_probability": endpoint["result"]["probability"], "smart_turn_ms": endpoint["elapsed_ms"],
-               "segments": result["result"]["segments"]}
+               "segments": segments, "segment_ordered": ordered, "segments_bounded": bounded,
+               "max_segment_ms": max((end - start for start, end in ranges), default=0),
+               "min_segment_ms": min((end - start for start, end in ranges), default=0),
+               "fallback": False}
         rows.append(row)
         print(json.dumps(row, ensure_ascii=False), flush=True)
     report = {"kind": "offline audio replay, not microphone acceptance", "device": engine.device,
@@ -77,6 +89,8 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("logs/evaluation/report.json"))
     parser.add_argument("--model-dir", type=Path, default=Path(r"D:\模型\voice-terminal"))
     parser.add_argument("--url", default="ws://127.0.0.1:8767/analysis")
+    parser.add_argument("--allow-over-max", action="store_true",
+                        help="仅离线分段验证时允许处理 60-62 秒输入；运行时仍限制为 60 秒")
     asyncio.run(evaluate(parser.parse_args()))
 
 

@@ -20,6 +20,11 @@ class V02Options:
     min_segment_chars: int = 6
     max_segment_chars: int = 20
     max_turn_ms: int = 60000
+    # Keep only a short amount of already returned speech ahead of the
+    # Windows player.  The v0.2 sample config opts in explicitly; the
+    # dataclass default keeps older callers on the immediate-send behavior.
+    tts_pacing: bool = False
+    tts_lead_ms: int = 2000
     allowed_roots: tuple[Path, ...] = field(default_factory=lambda: (Path(__file__).resolve().parents[2] / "docs",))
 
     @classmethod
@@ -32,12 +37,12 @@ class V02Options:
             if not isinstance(roots, list) or not all(isinstance(p, str) for p in roots):
                 raise ValueError("v02.allowed_roots must be a list of paths")
             values["allowed_roots"] = tuple((root / p).resolve() for p in roots)
-        for key in ("enabled", "smart_turn", "sensevoice", "predictions", "tools"):
+        for key in ("enabled", "smart_turn", "sensevoice", "predictions", "tools", "tts_pacing"):
             if key in values and not isinstance(values[key], bool):
                 raise ValueError(f"v02.{key} must be boolean")
         result = cls(**values)
         for key in ("candidate_ms", "recheck_ms", "smart_timeout_ms", "hard_silence_ms", "refine_timeout_ms",
-                    "prediction_interval_ms", "min_segment_chars", "max_segment_chars", "max_turn_ms"):
+                    "prediction_interval_ms", "min_segment_chars", "max_segment_chars", "max_turn_ms", "tts_lead_ms"):
             value = getattr(result, key)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"v02.{key} must be a positive integer")

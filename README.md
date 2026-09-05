@@ -1,6 +1,6 @@
 # Voice Terminal
 
-当前基线已包含 Windows 语音后端与 Vue 控制台。v0.2 的目标、分阶段实现及验收边界见 [v0.2 规范](docs/v0.2-spec.md)；下一批补验任务见 [v0.2 后续实施交接](docs/v0.2-next-steps.md)。新能力通过独立配置开关启用，真实设备验收前不自动替换现有链路。
+当前基线已包含 Windows 语音后端与 Vue 控制台。v0.2 的目标、分阶段实现及验收边界见 [v0.2 规范](docs/v0.2-spec.md)；阶段 4 的 Worker 与长音频记录见 [验证记录](docs/v0.2-validation.md)，后续自然语音和设备验收入口见 [后续实施交接](docs/v0.2-next-steps.md)。阶段 4 的代码和真实服务回放已完成记录，v0.2 仍通过独立配置开关启用，真实设备验收前不自动替换现有链路。
 
 本仓库是本地模块化实时语音终端的前端控制台。前端不采集音频、不运行模型，也不计算延迟；它通过本地 WebSocket 连接 Voice Server，发起持续监听并展示后端状态、转录、LLM 回复和链路指标。
 
@@ -10,7 +10,8 @@
 - 页面只有一个主要操作按钮：`开始说话`。
 - 点击后启动后端持续监听，按钮变为 `停止监听`。
 - 麦克风、扬声器、VAD、Paraformer、LLM、TTS 和播放器均由后端负责；KWS 作为可选模块保留，当前默认关闭。
-- 当前轮展示 partial/final 转录、LLM 流式回答、TTS 状态和后端音频缓冲。
+- 当前轮展示 partial/final 转录、LLM 流式回答、TTS 状态，以及 MiniMax 已返回、已播放和待播放的音频时长。
+- v0.2 的理解与精修详情会显示 SenseVoiceSmall 的加载状态、语音情绪分段；07 / LLM CONTEXT 的最终 user 包会明确显示 `speech_emotion` 是否已进入请求。
 - 当前轮展示完整后端延迟，历史保留最近 10 轮。
 - 没有演示模式、实时模式、前端假数据、前端计时器或本地 fallback。
 
@@ -23,7 +24,7 @@
 - Vue 组件挂载后自动建立一次 WebSocket 连接，并自动发送 `subscribe`。
 - 只有收到后端允许启动的状态后，`开始说话` 才会启用。
 - 点击按钮只发送 `session.start` 或 `session.stop`；按钮和页面状态不会乐观更新，必须等待 `session.state` 或 `runtime.snapshot`。
-- 所有 partial/final 转录、LLM 增量、TTS 状态、音频缓冲和延迟值都直接渲染服务端事件。
+- 所有 partial/final 转录、LLM 增量、TTS 状态、音频进度和延迟值都直接渲染服务端事件。
 - 消息按当前连接内的 `seq` 去重，并按 `turn_id` 隔离当前轮；已完成记录才会进入最近 10 轮历史。
 - 连接断开或后端报告错误时只显示真实错误并禁用启动操作，不生成 fallback 数据，也不在后台重连。
 
@@ -86,6 +87,19 @@ VOICE_LOG_LEVEL=DEBUG
 
 具体后端模块、模型来源、环境排查和中断语义见 [docs/backend-setup.md](docs/backend-setup.md)。
 
+阶段 4 的 ASR Worker readiness 探针和真实进程回放：
+
+```powershell
+python -m voice_terminal.asr.probe --url ws://127.0.0.1:8766/asr --timeout 2
+.\scripts\replay-v02.ps1 `
+  -Python D:\DevTools\Python312\python.exe `
+  -Config config\v0.2.yaml `
+  -Audio logs\evaluation\audio\query-first12.wav,logs\evaluation\audio\query-second8.wav `
+  -Output logs\evaluation\replay-worker-query.json
+```
+
+回放使用真实 ASR/Analysis Worker、内存播放器和现有云端 provider；报告只证明进程间链路，不等同于真人麦克风或物理扬声器验收。长音频夹具和 `--allow-over-max` 的离线用法见 [后端安装与联调](docs/backend-setup.md)。
+
 ## 启动前端
 
 ```powershell
@@ -136,6 +150,9 @@ voice-terminal/
 ├── scripts/                       # setup / doctor / start
 ├── docs/
 │   ├── v0.1-spec.md               # v0.1 方案边界
+│   ├── v0.2-spec.md               # v0.2 目标与运行语义
+│   ├── v0.2-validation.md         # 分阶段验证证据
+│   ├── v0.2-next-steps.md         # 后续实施与暂停点
 │   └── websocket-protocol.md      # WebSocket 协议
 ├── package.json                   # npm workspace 入口
 └── README.md
@@ -173,6 +190,7 @@ transcript.final
 assistant.delta
 llm.context
 tts.status
+tts.progress
 latency.snapshot
 turn.completed
 error

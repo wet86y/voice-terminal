@@ -50,6 +50,24 @@ class FakeAsr:
         pass
 
 
+class HealthAsr(FakeAsr):
+    def __init__(self, *, connected: bool = False, error: Exception | None = None) -> None:
+        self.connected = connected
+        self.error = error
+        self.connect_calls = 0
+        self.health_calls = 0
+
+    async def connect(self):
+        self.connect_calls += 1
+        self.connected = True
+
+    async def health(self):
+        self.health_calls += 1
+        if self.error is not None:
+            raise self.error
+        return {"type": "health", "status": "READY", "model_loaded": True}
+
+
 class FakeProvider:
     def __init__(self):
         self.requests = []
@@ -62,6 +80,69 @@ class FakeProvider:
         yield {"type": "finish", "reason": "stop"}
 
 
+class FailingTtsSession:
+    async def start(self):
+        return None
+
+    async def send_text(self, _text):
+        raise RuntimeError("synthetic TTS transport close")
+
+    async def finish(self):
+        raise RuntimeError("synthetic TTS transport close")
+
+    async def audio_chunks(self):
+        if False:
+            yield b""
+
+    async def close(self):
+        return None
+
+
+class FailingTts:
+    def session(self):
+        return FailingTtsSession()
+
+
+class PacingTtsSession:
+    def __init__(self, player):
+        self.player = player
+        self.sent = []
+        self.audio = asyncio.Queue()
+        self.finished = False
+
+    async def start(self):
+        return None
+
+    async def send_text(self, text):
+        self.sent.append(text)
+        # Each synthetic sentence is three seconds long.  The controller
+        # must wait until the aggregate unplayed audio reaches the two-second
+        # lead window before sending the next sentence.
+        await self.audio.put(b"\x01\x00" * (32000 * 3))
+
+    async def finish(self):
+        self.finished = True
+        await self.audio.put(None)
+
+    async def audio_chunks(self):
+        while True:
+            item = await self.audio.get()
+            if item is None:
+                return
+            yield item
+
+    async def close(self):
+        return None
+
+
+class PacingTts:
+    def __init__(self, player):
+        self.session_instance = PacingTtsSession(player)
+
+    def session(self):
+        return self.session_instance
+
+
 class FakeAnalysis:
     async def analyze(self, operation, pcm, turn, generation, timeout):
         if operation == "endpoint":
@@ -70,9 +151,11 @@ class FakeAnalysis:
 
 
 def controller(**changes):
+    asr_obj = changes.pop("asr_obj", FakeAsr())
+    analysis_obj = changes.pop("analysis_obj", FakeAnalysis())
     options = replace(V02Options(enabled=True), **changes)
-    return RealtimeController(options=options, analysis=FakeAnalysis(), state=RuntimeState(), bus=EventBus(),
-                              history=InMemoryHistory(), capture=None, kws=None, vad=FakeVad(), asr=FakeAsr(),
+    return RealtimeController(options=options, analysis=analysis_obj, state=RuntimeState(), bus=EventBus(),
+                              history=InMemoryHistory(), capture=None, kws=None, vad=FakeVad(), asr=asr_obj,
                               llm=FakeProvider(), tts=None, player=PcmPlayer(sample_rate=32000, channels=1, output_device=None),
                               wake_enabled=False, wake_keyword="hei claw", wake_preroll_ms=1200,
                               vad_min_speech_ms=250, vad_end_silence_ms=700, max_turn_ms=15000,
@@ -157,8 +240,34 @@ class PrimitiveTests(unittest.TestCase):
         self.assertEqual(result["emotion"], "ANGRY")
         self.assertEqual(parse_transcript("<|OTHER|>text")["emotion"], "unknown")
         self.assertEqual(bounded_segments([[0, 60000]], 60000), [(0, 30000), (30000, 60000)])
+        self.assertEqual(bounded_segments([[0, 30010]], 30010), [(0, 15005), (15005, 30010)])
+        self.assertEqual(bounded_segments([[0, 45000]], 45000), [(0, 22500), (22500, 45000)])
+        for start, end in bounded_segments([[0, 59800]], 59800):
+            self.assertGreater(end - start, 10000)
+            self.assertLessEqual(end - start, 30000)
         with self.assertRaises(ValueError):
             bounded_segments([[0, 10000], [9000, 11000]], 12000)
+
+    def test_long_audio_matrix_has_bounded_ordered_segments(self):
+        cases = {
+            29800: [(0, 29800)],
+            30000: [(0, 30000)],
+            30010: [(0, 15005), (15005, 30010)],
+            45000: [(0, 22500), (22500, 45000)],
+            59800: [(0, 29900), (29900, 59800)],
+            60000: [(0, 30000), (30000, 60000)],
+            60800: [(0, 20267), (20267, 40534), (40534, 60800)],
+            61000: [(0, 20334), (20334, 40668), (40668, 61000)],
+        }
+        for duration, expected in cases.items():
+            actual = bounded_segments([[0, duration]], duration)
+            self.assertEqual(actual, expected)
+            self.assertTrue(all(0 < end - start <= 30000 for start, end in actual))
+            self.assertTrue(all(actual[i][1] <= actual[i + 1][0] for i in range(len(actual) - 1)))
+
+        # Ranges are clipped before splitting and short adjacent speech is
+        # merged only when the resulting span stays within 15 seconds.
+        self.assertEqual(bounded_segments([[-500, 4000], [5000, 12000]], 12000), [(0, 12000)])
 
     def test_tool_delta_assembly(self):
         a = ToolCallAssembler()
@@ -183,8 +292,96 @@ class PrimitiveTests(unittest.TestCase):
         self.assertEqual(output, b"44")
         self.assertTrue(p.block())
 
+    def test_tts_pacing_options_are_configurable(self):
+        options = V02Options.from_mapping({"tts_pacing": True, "tts_lead_ms": 2000}, Path.cwd())
+        self.assertTrue(options.tts_pacing)
+        self.assertEqual(options.tts_lead_ms, 2000)
+
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tts_transport_failure_does_not_truncate_completed_llm_text(self):
+        c = controller()
+        c.tts = FailingTts()
+        try:
+            frame = await begin(c)
+            ws = c.workspace
+            ws.final_text = "查询文档"
+            ws.paraformer_final = ws.final_text
+            ws.committed = True
+            response = await c._answer(ws, ws.token)
+            self.assertEqual(response, "已理解。")
+            self.assertEqual(ws.staged_response, "已理解。")
+            self.assertEqual(c.state.current["tts_status"], "DEGRADED")
+        finally:
+            await c.close()
+
+    async def test_tts_sender_uses_total_remaining_audio_lead_window(self):
+        c = controller(tts_pacing=True, tts_lead_ms=2000)
+        c.tts = PacingTts(c.player)
+
+        async def answer(*_args, **_kwargs):
+            yield "第一段回答内容很长。"
+            yield "第二段回答内容很长。"
+
+        c.agent.answer = answer
+        try:
+            frame = await begin(c)
+            ws = c.workspace
+            ws.final_text = "查询文档"
+            ws.paraformer_final = ws.final_text
+            ws.committed = True
+            task = asyncio.create_task(c._answer(ws, ws.token))
+
+            async def wait_for_sent(count):
+                for _ in range(100):
+                    if len(c.tts.session_instance.sent) >= count:
+                        return
+                    await asyncio.sleep(.01)
+                self.fail(f"expected {count} TTS segments, got {c.tts.session_instance.sent!r}")
+
+            async def wait_for_buffer_at_least(value):
+                for _ in range(100):
+                    if c.player.buffered_ms >= value:
+                        return
+                    await asyncio.sleep(.01)
+                self.fail(f"expected at least {value}ms queued, got {c.player.buffered_ms}ms")
+
+            async def wait_for_remaining_at_least(value):
+                for _ in range(100):
+                    if c.state.current["tts_remaining_ms"] >= value:
+                        return
+                    await asyncio.sleep(.01)
+                self.fail(
+                    "expected at least "
+                    f"{value}ms reported remaining audio, got "
+                    f"{c.state.current['tts_remaining_ms']}ms"
+                )
+
+            await wait_for_sent(1)
+            await wait_for_buffer_at_least(3000)
+            await wait_for_remaining_at_least(2000)
+            self.assertEqual(c.tts.session_instance.sent, ["第一段回答内容很长。"])
+            self.assertEqual(c.player.buffered_ms, 3000)
+            self.assertGreater(c.state.current["tts_remaining_ms"], 2000)
+
+            # Consume 1.1 seconds from the aggregate queue.  The next text is
+            # released only after the total remaining audio crosses 2 seconds.
+            c.player._callback(bytearray(32000 * 2 * 1100 // 1000), 32000 * 1100 // 1000, None, None)
+            await wait_for_sent(2)
+            await wait_for_buffer_at_least(4900)
+            self.assertEqual(c.tts.session_instance.sent, ["第一段回答内容很长。", "第二段回答内容很长。"])
+
+            # Drain both synthetic sentences so _answer can finish cleanly.
+            remaining = c.player.buffered_ms
+            c.player._callback(bytearray(32000 * 2 * remaining // 1000 + 2), 32000 * remaining // 1000 + 1, None, None)
+            await asyncio.wait_for(task, 2)
+            self.assertTrue(c.tts.session_instance.finished)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await c.close()
+
     async def test_scheduler_coalesces_and_final_can_cancel(self):
         gate = asyncio.Event()
         calls = []
@@ -214,6 +411,26 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         gate.set()
         await asyncio.shield(lane.active)
         lane.close()
+
+    def test_analysis_health_reports_model_identity_and_loaded_state(self):
+        ready = AnalysisLane(lambda _pcm: {}, model_name="SenseVoiceSmall")
+        failed = AnalysisLane(error="model load failed", model_name="SenseVoiceSmall")
+        try:
+            self.assertEqual(ready.health_payload(), {
+                "status": "READY",
+                "model": "SenseVoiceSmall",
+                "model_loaded": True,
+                "error": None,
+            })
+            self.assertEqual(failed.health_payload(), {
+                "status": "DEGRADED",
+                "model": "SenseVoiceSmall",
+                "model_loaded": False,
+                "error": "model load failed",
+            })
+        finally:
+            ready.close()
+            failed.close()
 
     async def test_monitor_backpressure_never_blocks(self):
         bus = EventBus()
@@ -276,7 +493,11 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             request = c.llm.requests[-1]
             user = [m for m in request if m["role"] == "user"]
             self.assertEqual(len(user), 1)
-            self.assertEqual(json.loads(user[0]["content"])["audio_cues"][0]["emotion"], "ANGRY")
+            package = json.loads(user[0]["content"])
+            self.assertEqual(package["audio_cues"][0]["emotion"], "ANGRY")
+            self.assertEqual(package["speech_emotion"]["status"], "READY")
+            self.assertEqual(package["speech_emotion"]["source"], "SenseVoiceSmall")
+            self.assertEqual(package["speech_emotion"]["segments"][0]["emotion"], "ANGRY")
         finally:
             await c.close()
 
@@ -417,6 +638,68 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(c.workspace.audio.start_sample, 32000)
             self.assertEqual(bytes(c.workspace.audio.pcm), continuation.pcm)
         finally:
+            await c.close()
+
+    async def test_sixty_second_limit_closes_and_restarts_after_continuation(self):
+        c = controller(max_turn_ms=60000)
+        stream = None
+        try:
+            frame = await begin(c)
+            turn = c.workspace.turn_id
+            stream = c.bus.subscribe()
+            first_event = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)
+            c._speech_start_sample = 0
+            c.vad.activity = VadActivity(True, False, False)
+            # Keep the sample stream contiguous while jumping the captured
+            # timestamp to the 60-second runtime limit.
+            long_frame = AudioFrame(b"11" * 944000, 16000, frame.captured_at + 60.0)
+            await c.handle_frame(long_frame)
+            self.assertTrue(c.workspace.hard_closed)
+            events = [await asyncio.wait_for(first_event, 1), await asyncio.wait_for(anext(stream), 1)]
+            finalizing = next(item for item in events if item.type == "turn.finalizing")
+            self.assertEqual(finalizing.payload["reason"], "max_duration")
+            continuation = AudioFrame(b"22" * 4800, 960000, frame.captured_at + 60.3)
+            await c.handle_frame(continuation)
+            self.assertNotEqual(c.workspace.turn_id, turn)
+            self.assertEqual(c.workspace.audio.start_sample, 960000)
+            self.assertEqual(bytes(c.workspace.audio.pcm), continuation.pcm)
+        finally:
+            if stream is not None:
+                await stream.aclose()
+            await c.close()
+
+    async def test_asr_disconnect_is_recoverable_and_restart_health_is_required(self):
+        asr = HealthAsr(connected=True)
+        c = controller(asr_obj=asr)
+        stream = None
+        try:
+            await begin(c)
+            stream = c.bus.subscribe()
+            next_event = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)
+            await c._on_asr_result({
+                "type": "error",
+                "code": "ASR_WORKER_DISCONNECTED",
+                "message": "socket closed",
+            })
+            first = await asyncio.wait_for(next_event, 1)
+            self.assertEqual(first.type, "error")
+            self.assertEqual(first.payload["code"], "ASR_WORKER_DISCONNECTED")
+            self.assertTrue(first.payload["recoverable"])
+            self.assertIsNone(c.workspace)
+            self.assertEqual(c.state.services["asr"], "ERROR")
+            self.assertFalse(c.state.listening)
+            self.assertEqual(c._asr_queue.qsize(), 0)
+
+            asr.connected = False
+            self.assertTrue(await c._ensure_asr_ready())
+            self.assertEqual(asr.connect_calls, 1)
+            self.assertEqual(asr.health_calls, 1)
+            self.assertEqual(c.state.services["asr"], "READY")
+        finally:
+            if stream is not None:
+                await stream.aclose()
             await c.close()
 
     async def test_actual_playback_boundary_forces_new_turn(self):
