@@ -20,10 +20,11 @@ class MiniMaxTtsSession:
         self.client = client
         self._socket: Any = None
         self._receiver: asyncio.Task[None] | None = None
-        self._audio: asyncio.Queue[bytes | object] = asyncio.Queue()
+        self._audio: asyncio.Queue[bytes | object] = asyncio.Queue(maxsize=64)
         self._finished = asyncio.Event()
         self._started = False
         self._error: Exception | None = None
+        self._finish_requested = False
         self._send_lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -46,14 +47,20 @@ class MiniMaxTtsSession:
                     url,
                     additional_headers=headers,
                     open_timeout=5,
+                    close_timeout=1,
                     ping_interval=20,
+                    # PCM backpressure can pause socket reads for longer than
+                    # a pong deadline. Receive inactivity is bounded separately.
+                    ping_timeout=None,
                 )
             except TypeError:
                 self._socket = await websockets.connect(
                     url,
                     extra_headers=headers,
                     open_timeout=5,
+                    close_timeout=1,
                     ping_interval=20,
+                    ping_timeout=None,
                 )
             await self._socket.send(json.dumps(self.client.start_payload(), ensure_ascii=False))
             logger.debug("minimax.task_start_sent")
@@ -108,9 +115,10 @@ class MiniMaxTtsSession:
     async def _receive_loop(self) -> None:
         audio_chunks = 0
         audio_bytes = 0
+        cancelled = False
         try:
             while self._socket is not None:
-                parsed = self._parse(await self._socket.recv())
+                parsed = self._parse(await asyncio.wait_for(self._socket.recv(), self.client.timeout_seconds))
                 event = parsed.get("event")
                 if event == "task_failed":
                     self._error = MiniMaxTtsError(self._error_message(parsed))
@@ -137,12 +145,26 @@ class MiniMaxTtsSession:
                     if event == "task_finished":
                         break
         except asyncio.CancelledError:
+            cancelled = True
             raise
         except Exception as exc:
-            self._error = MiniMaxTtsError(f"MiniMax TTS 接收失败：{exc}")
-            logger.exception("minimax.receive_failed")
+            # Some gateways close the connection without a WebSocket close
+            # frame immediately after delivering all audio for a finished
+            # task.  If task_finish was sent and at least one PCM packet was
+            # received, preserve the completed audio and surface a warning;
+            # a timeout, pre-finish close, or zero-audio close remains an
+            # actual TTS failure.
+            is_connection_close = "ConnectionClosed" in type(exc).__name__
+            if self._finish_requested and audio_chunks and is_connection_close:
+                logger.warning("minimax.receive_closed_after_audio chunks=%d bytes=%d error=%s", audio_chunks, audio_bytes, exc)
+            else:
+                self._error = MiniMaxTtsError(f"MiniMax TTS 接收失败：{exc}")
+                logger.exception("minimax.receive_failed")
         finally:
             self._finished.set()
+            if cancelled:
+                while not self._audio.empty():
+                    self._audio.get_nowait()
             await self._audio.put(_AUDIO_END)
             logger.info("minimax.receive_done audio_chunks=%d audio_bytes=%d", audio_chunks, audio_bytes)
 
@@ -157,6 +179,7 @@ class MiniMaxTtsSession:
         if self._socket is None:
             return
         async with self._send_lock:
+            self._finish_requested = True
             await self._socket.send(json.dumps({"event": "task_finish"}))
         logger.info("minimax.task_finish_sent")
 

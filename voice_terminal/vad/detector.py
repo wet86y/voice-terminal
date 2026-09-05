@@ -17,15 +17,19 @@ class VadActivity:
     is_speech: bool
     speech_started: bool
     speech_ended: bool
+    speech_end_sample: int | None = None
+    speech_start_sample: int | None = None
 
 
 class FsmnVadDetector:
     """Thin adapter around FunASR's streaming FSMN-VAD model."""
 
-    def __init__(self, *, model_dir: Path, device: str = "cpu", sample_rate: int = 16000) -> None:
+    def __init__(self, *, model_dir: Path, device: str = "cpu", sample_rate: int = 16000,
+                 end_silence_ms: int | None = None) -> None:
         self.model_dir = model_dir
         self.device = device
         self.sample_rate = sample_rate
+        self.end_silence_ms = end_silence_ms
         self._cache: dict[str, Any] = {}
         self._active = False
         # AudioCapture emits 20 ms blocks, while the FSMN-VAD frontend needs
@@ -34,6 +38,7 @@ class FsmnVadDetector:
         # FunASR cache carry the remainder between calls.
         self._model_chunk_ms = 200
         self._feed_count = 0
+        self._samples = 0
         try:
             import numpy as np  # type: ignore
             from funasr import AutoModel  # type: ignore
@@ -55,6 +60,7 @@ class FsmnVadDetector:
         self._cache = {}
         self._active = False
         self._feed_count = 0
+        self._samples = 0
 
     @staticmethod
     def _segments(result: Any) -> list[Any]:
@@ -73,6 +79,7 @@ class FsmnVadDetector:
             pcm = pcm[:-1]
         audio = self._np.frombuffer(pcm, dtype=self._np.int16).astype(self._np.float32) / 32768.0
         self._feed_count += 1
+        self._samples = getattr(self, "_samples", 0) + len(pcm) // 2
         input_rms = float(self._np.sqrt(self._np.mean(audio * audio))) if audio.size else 0.0
         input_peak = float(self._np.max(self._np.abs(audio))) if audio.size else 0.0
         try:
@@ -82,6 +89,8 @@ class FsmnVadDetector:
                 is_final=is_final,
                 chunk_size=self._model_chunk_ms,
                 is_streaming_input=True,
+                **({"max_end_silence_time": self.end_silence_ms}
+                   if getattr(self, "end_silence_ms", None) is not None else {}),
             )
         except Exception as exc:
             raise VadError(f"FSMN-VAD 推理失败：{exc}") from exc
@@ -133,4 +142,8 @@ class FsmnVadDetector:
             is_speech=open_segment,
             speech_started=speech_started,
             speech_ended=speech_ended,
+            speech_end_sample=max((int(s[1] * getattr(self, "sample_rate", 16000) / 1000) for s in segments
+                                   if isinstance(s, (list, tuple)) and len(s) >= 2 and isinstance(s[1], (int, float)) and s[1] >= 0), default=None),
+            speech_start_sample=min((int(s[0] * getattr(self, "sample_rate", 16000) / 1000) for s in segments
+                                     if isinstance(s, (list, tuple)) and len(s) >= 2 and isinstance(s[0], (int, float)) and s[0] >= 0), default=None),
         )

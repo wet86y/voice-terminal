@@ -197,6 +197,7 @@ class AsrWorkerEngine:
 
 
 async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None:
+    owned_turns: set[str] = set()
     peer = getattr(websocket, "remote_address", None)
     logger.info("asr.worker.connection_open peer=%s", peer)
     try:
@@ -219,11 +220,13 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                     turn_id = message.get("turn_id")
                     if isinstance(turn_id, str):
                         engine._clear_turn(turn_id)
+                        owned_turns.discard(turn_id)
                         logger.info("asr.worker.turn_finish turn_id=%s", turn_id)
                     continue
                 if message_type != "audio.chunk":
                     raise ValueError(f"不支持的 ASR 消息类型：{message_type}")
                 chunk = decode_audio_chunk(message)
+                owned_turns.add(chunk.turn_id)
                 logger.debug(
                     "asr.worker.audio_chunk turn_id=%s bytes=%d final=%s",
                     chunk.turn_id,
@@ -231,6 +234,8 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                     chunk.is_final,
                 )
                 inference = await engine.infer(chunk.turn_id, chunk.pcm, chunk.is_final)
+                if chunk.is_final:
+                    owned_turns.discard(chunk.turn_id)
                 # A final message is a protocol acknowledgement even when the
                 # recognizer has no text.  Otherwise the Voice Server waits
                 # until its timeout and cannot decide whether to continue.
@@ -261,4 +266,6 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                     )
                 )
     finally:
+        for turn_id in owned_turns:
+            engine._clear_turn(turn_id)
         logger.info("asr.worker.connection_closed peer=%s", peer)

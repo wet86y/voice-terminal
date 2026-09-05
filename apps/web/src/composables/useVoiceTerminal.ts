@@ -56,6 +56,9 @@ function createEmptyCurrentTurn(): CurrentTurnSnapshot {
     tts_text: '',
     tts_status: '',
     audio_buffer_ms: null,
+    v02: false, input_revision: 0, generation_id: 0, committed: false,
+    agent_phase: 'IDLE', paraformer_final: '', refined_text: '',
+    segments: [], prediction: {}, tools: [], audio_cues: [], analysis: {},
   }
 }
 
@@ -70,6 +73,8 @@ function createEmptyLatency(): LatencyValues {
     first_audio_to_playback_ms: null,
     speech_end_to_playback_ms: null,
     turn_total_ms: null,
+    first_segment_ms: null, first_prediction_ms: null, smart_turn_ms: null,
+    sensevoice_refine_ms: null, commit_to_final_llm_ms: null,
   }
 }
 
@@ -80,6 +85,7 @@ function createOfflineStatuses(): ServiceStatuses {
     asr: 'OFFLINE',
     llm: 'OFFLINE',
     tts: 'OFFLINE',
+    analysis: 'DISABLED',
   }
 }
 
@@ -160,6 +166,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
   function applyCurrentSnapshot(snapshot: unknown) {
     if (!isRecord(snapshot)) return
+    applyWorkspace(snapshot)
     const partialText = readString(snapshot, 'partial_text')
     const finalText = readString(snapshot, 'final_text')
     const assistantText = readString(snapshot, 'assistant_text')
@@ -175,6 +182,23 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (audioBufferMs === null || (typeof audioBufferMs === 'number' && Number.isFinite(audioBufferMs))) {
       current.audio_buffer_ms = audioBufferMs as number | null
     }
+  }
+
+  function applyWorkspace(snapshot: Record<string, unknown>) {
+    for (const key of ['input_revision', 'generation_id'] as const) {
+      if (typeof snapshot[key] === 'number') current[key] = snapshot[key]
+    }
+    for (const key of ['v02', 'committed'] as const) {
+      if (typeof snapshot[key] === 'boolean') current[key] = snapshot[key]
+    }
+    for (const key of ['agent_phase', 'paraformer_final', 'refined_text'] as const) {
+      if (typeof snapshot[key] === 'string') current[key] = snapshot[key]
+    }
+    if (Array.isArray(snapshot.segments)) current.segments = snapshot.segments as NonNullable<CurrentTurnSnapshot['segments']>
+    if (Array.isArray(snapshot.tools)) current.tools = snapshot.tools as NonNullable<CurrentTurnSnapshot['tools']>
+    if (Array.isArray(snapshot.audio_cues)) current.audio_cues = snapshot.audio_cues as NonNullable<CurrentTurnSnapshot['audio_cues']>
+    if (isRecord(snapshot.prediction)) current.prediction = snapshot.prediction
+    if (isRecord(snapshot.analysis)) current.analysis = snapshot.analysis as NonNullable<CurrentTurnSnapshot['analysis']>
   }
 
   function applyLatencySnapshot(payload: LatencySnapshotPayload) {
@@ -201,9 +225,14 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (typeof payload.listening === 'boolean') listening.value = payload.listening
     if (typeof payload.can_start === 'boolean') canStart.value = payload.can_start
     applyServices(payload.services)
-    if (turnId) adoptTurn(turnId)
+    const snapshotTurnId = isRecord(payload.current) ? readString(payload.current, 'turn_id') : null
+    if (turnId || snapshotTurnId) adoptTurn(turnId || snapshotTurnId)
     applyCurrentSnapshot(payload.current)
     if (payload.latency) applyLatencySnapshot(payload.latency)
+    if (Array.isArray(payload.recent_turns)) {
+      recentTurns.value = payload.recent_turns.filter(item => isRecord(item) && typeof item.turn_id === 'string')
+        .slice(0, MAX_RECENT_TURNS).map(item => ({ ...item, latency: copyLatencyValues(item.latency) }))
+    }
   }
 
   function applySessionState(payload: SessionStatePayload, turnId: string | null) {
@@ -263,8 +292,22 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     lastSequence.value = message.seq
     lastServerTimestamp.value = message.timestamp
     const payload = isRecord(message.payload) ? message.payload : {}
+    if (message.type === 'turn.started') adoptTurn(message.turn_id)
+    if (message.turn_id === currentTurnId.value && typeof payload.generation_id === 'number') {
+      if (payload.generation_id < (current.generation_id ?? 0)) return
+      if (typeof payload.input_revision === 'number' && payload.generation_id === current.generation_id
+        && payload.input_revision < (current.input_revision ?? 0)) return
+      current.generation_id = payload.generation_id
+      if (isRecord(payload.workspace)) { current.v02 = true; applyWorkspace(payload.workspace) }
+    }
 
     switch (message.type) {
+      case 'turn.resumed':
+        if (acceptsCurrentTurn(message.turn_id)) {
+          current.final_text = ''; current.assistant_text = ''; current.tts_text = ''
+          current.audio_buffer_ms = 0; current.tts_status = 'IDLE'
+        }
+        break
       case 'runtime.snapshot':
         applyRuntimeSnapshot(payload as unknown as RuntimeSnapshotPayload, message.turn_id)
         break

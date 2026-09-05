@@ -371,3 +371,38 @@ ERROR
 - `seq` 只在当前 WebSocket 连接内递增；重连后可以从 0 重新开始，前端会重置该连接的去重游标。
 
 协议消费方不应把前端控制台当作音频管线：浏览器不授予麦克风权限、不上传 PCM，也不承担 KWS、VAD、ASR、LLM、TTS、播放或延迟测量。
+# v0.2 增量扩展
+
+现行 Envelope、subscribe/session.start/session.stop 和 v0.1 事件保持兼容。
+启用 `v02.enabled` 后，轮次事件增加 `input_revision`、`generation_id` 和 `workspace`。
+`workspace` 包含当前分段、预测摘要、只读工具状态、Paraformer 草稿、最终文本、分段语音线索及分析服务降级原因；不含 PCM、密钥或模型思考过程。
+
+| 新事件 | 含义 |
+| --- | --- |
+| turn.started | 新用户轮次，前端采用新的 turn_id |
+| turn.endpoint_candidate | VAD 候选，携带 audio_end_sample |
+| turn.semantic_state | Smart Turn probability 或降级原因 |
+| turn.finalizing | 接受结束，reason 为 smart_turn/hard_silence/vad_end/max_duration |
+| turn.resumed | 播放前续说，同 turn_id、新 generation；清空旧回答和 TTS 展示 |
+| transcript.segment | text 累计快照、new_segment、corrected、segments |
+| agent.prediction | LISTEN/ACT/READY、简短 intent 或预测错误 |
+| agent.tool | name、RUNNING/DONE/FAILED、speculative/reused、等待和重叠时间 |
+| agent.prediction.requested | 预测快照已发出；携带 input_revision、generation_id 和快照摘要 |
+| agent.prediction.discarded | 预测结果未采用；reason 说明 revision/generation 过期、轮次结束、输入封口、超时或无效返回 |
+| transcript.refined | 最终采用 text、source=sensevoice/paraformer |
+| speech.emotion | segments，每段 start_ms/end_ms/language/emotion/events/raw_tags |
+| turn.committed | 本次 generation 最终输入封定；与历史提交不同 |
+
+`transcript.final` 始终为最终采用文本。预测不发送 assistant.delta。`turn.completed` 仍是唯一新增历史记录事件；订阅快照额外提供 `recent_turns`，用于刷新恢复已有历史。
+
+前端先按连接 seq 去重，再按 turn_id 隔离；同轮丢弃低 generation，同 generation 丢弃低 input_revision。`runtime.snapshot.current.turn_id` 支持重新订阅时恢复当前轮。旧客户端可忽略扩展字段。
+
+新增后端延迟：first_segment_ms、first_prediction_request_ms、first_prediction_ms、smart_turn_ms、sensevoice_refine_ms、commit_to_final_llm_ms。v0.2 中 llm_first_token_ms 从最终请求开始计算，speech_end_confirmation_ms 从 VAD 音频结束边界计算；null 表示未测得。工具事件可以包含 selected_at_ms、execution_start_ms、finished_at_ms、execution_ms、wait_ms 和 overlap_ms；它们来自单调时钟的实际时间线。overlap_ms 是预取执行与最终选择之前的实际交集，不是反事实加速承诺。
+
+慢订阅者积压超过 256 事件后断开 WebSocket（1013）；音频主链不等待浏览器。
+
+## Analysis Worker 内部接口
+
+默认 `ws://127.0.0.1:8767/analysis`。每连接一次请求。JSON 包含 operation（endpoint/refine）、request_id、turn_id、generation_id、pcm_base64（16 kHz/mono/int16，最多 62 秒）。结果回显身份、result、elapsed_ms；失败返回 error。health 操作及 HTTP `/health` 分别报告 endpoint/refine READY/DEGRADED。
+
+每模型独立单执行槽，无等待队列；忙碌返回错误，由主服务降级。取消请求不提前释放尚未结束的原生推理槽。

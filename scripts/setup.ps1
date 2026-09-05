@@ -2,12 +2,15 @@ param(
   [string]$Python = "python",
   [string]$ModelDir = "D:\模型\voice-terminal",
   [switch]$Offline,
-  [switch]$SkipInstall
+  [switch]$SkipInstall,
+  [switch]$Analysis,
+  [switch]$NoDownloadProxy
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Requirements = Join-Path $RepoRoot "apps\server\requirements.txt"
+if ($Analysis) { $Requirements = Join-Path $RepoRoot "apps\server\requirements-analysis.txt" }
 $env:PYTHONPATH = if ($env:PYTHONPATH) { "$RepoRoot;$env:PYTHONPATH" } else { $RepoRoot }
 
 function Invoke-Python {
@@ -47,3 +50,10 @@ if ($Offline) {
 }
 
 Write-Host "Setup complete. Next: .\scripts\doctor.ps1 -Python `"$Python`"" -ForegroundColor Green
+
+if ($Analysis) {
+  $analysisArgs = @("-m", "voice_terminal.analysis.model_setup", "--model-dir", $ModelDir)
+  if ($Offline) { $analysisArgs += "--offline" }
+  if ($NoDownloadProxy) { $analysisArgs += "--no-proxy" }
+  Invoke-Python @analysisArgs
+}

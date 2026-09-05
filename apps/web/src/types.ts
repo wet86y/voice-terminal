@@ -22,6 +22,7 @@ export type ServiceStatus =
   | (string & {})
 
 export interface ServiceStatuses {
+  analysis?: ServiceStatus
   audio: ServiceStatus
   kws: ServiceStatus
   asr: ServiceStatus
@@ -30,6 +31,20 @@ export interface ServiceStatuses {
 }
 
 export interface CurrentTurnSnapshot {
+  turn_id?: string | null
+  v02?: boolean
+  input_revision?: number
+  generation_id?: number
+  prediction_revision?: number | null
+  committed?: boolean
+  agent_phase?: string
+  paraformer_final?: string
+  refined_text?: string
+  segments?: Array<{ text: string }>
+  prediction?: { decision?: string; intent?: string; status?: string; error?: string }
+  tools?: Array<{ name?: string; status?: string; reused?: boolean; error?: string; overlap_ms?: number; wait_ms?: number; selected_at_ms?: number; execution_start_ms?: number | null; finished_at_ms?: number; execution_ms?: number }>
+  audio_cues?: Array<{ start_ms: number; end_ms: number; emotion: string; language: string; events: string[] }>
+  analysis?: Record<string, { status?: string; error?: string; probability?: number; fallback?: string }>
   partial_text: string
   final_text: string
   assistant_text: string
@@ -39,6 +54,12 @@ export interface CurrentTurnSnapshot {
 }
 
 export interface LatencyValues {
+  first_segment_ms?: number | null
+  first_prediction_request_ms?: number | null
+  first_prediction_ms?: number | null
+  smart_turn_ms?: number | null
+  sensevoice_refine_ms?: number | null
+  commit_to_final_llm_ms?: number | null
   wake_detection_ms: number | null
   asr_first_text_ms: number | null
   speech_end_confirmation_ms: number | null
@@ -51,6 +72,7 @@ export interface LatencyValues {
 }
 
 export interface RuntimeSnapshotPayload {
+  recent_turns?: TurnRecord[]
   state: TerminalState
   listening: boolean
   can_start: boolean
@@ -112,6 +134,10 @@ export interface ServerErrorPayload {
 }
 
 export type ServerMessageType =
+  | 'turn.started' | 'turn.resumed' | 'turn.finalizing' | 'turn.committed'
+  | 'turn.endpoint_candidate' | 'turn.semantic_state' | 'transcript.segment'
+  | 'transcript.refined' | 'speech.emotion' | 'agent.prediction' | 'agent.tool'
+  | 'agent.prediction.requested' | 'agent.prediction.discarded'
   | 'runtime.snapshot'
   | 'session.state'
   | 'transcript.partial'

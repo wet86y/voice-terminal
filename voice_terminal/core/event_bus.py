@@ -17,7 +17,15 @@ class EventBus:
         async with self._lock:
             subscribers = tuple(self._subscribers)
         for queue in subscribers:
-            await queue.put(value)
+            if queue.full():
+                # A stalled monitoring client must never stall microphone input.
+                async with self._lock:
+                    self._subscribers.discard(queue)
+                while not queue.empty():
+                    queue.get_nowait()
+                queue.put_nowait(None)
+            else:
+                queue.put_nowait(value)
 
     async def subscribe(self) -> AsyncIterator[VoiceEvent]:
         queue: asyncio.Queue[VoiceEvent] = asyncio.Queue(maxsize=256)
@@ -25,7 +33,10 @@ class EventBus:
             self._subscribers.add(queue)
         try:
             while True:
-                yield await queue.get()
+                value = await queue.get()
+                if value is None:
+                    raise RuntimeError("monitor subscriber fell behind; reconnect for a snapshot")
+                yield value
         finally:
             async with self._lock:
                 self._subscribers.discard(queue)

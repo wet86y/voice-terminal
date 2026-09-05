@@ -1035,3 +1035,7 @@ h2 {
     line-height: 1.4;
   }
 }
+/* Backend-provided v0.2 diagnostics; bounded within the transcript panel. */
+.analysis-details { margin-top: 16px; padding: 14px; border: 1px solid #d9dedb; border-radius: 10px; max-height: 360px; overflow: auto; overflow-wrap: anywhere; }
+.analysis-details summary { cursor: pointer; font-weight: 600; }
+.analysis-details p, .analysis-details li { font-size: 13px; line-height: 1.6; }

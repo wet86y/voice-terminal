@@ -1,6 +1,17 @@
 model_dir: "D:\\模型\\voice-terminal"
 debug_audio_capture: false
 
+# Enable after model installation and real-device acceptance. Independent rollback switches.
+v02:
+  enabled: false
+  smart_turn: false
+  sensevoice: false
+  predictions: false
+  tools: false
+  analysis_url: ws://127.0.0.1:8767/analysis
+  max_turn_ms: 60000
+  allowed_roots: [docs]
+
 audio:
   input_device: "麦克风阵列 (适用于数字麦克风的英特尔® 智音技术)"
   output_device: "扬声器 (Realtek(R) Audio)"

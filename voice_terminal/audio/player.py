@@ -38,6 +38,27 @@ class PcmPlayer:
         self._active_turn: str | None = None
         self._started_for_turn: str | None = None
         self._buffered_bytes = 0
+        self._allowed_key: str | None = None
+        self._gated = False
+
+    def allow(self, key: str) -> None:
+        with self._queue_lock:
+            self._clear_unlocked()
+            self._gated = True
+            self._allowed_key = key
+
+    def block(self) -> bool:
+        """Atomically close playback and report whether any audio already played."""
+        with self._queue_lock:
+            played = self._started_for_turn is not None
+            self._gated = True
+            self._allowed_key = None
+            self._clear_unlocked()
+            return played
+
+    def has_started(self, key: str) -> bool:
+        with self._queue_lock:
+            return self._started_for_turn == key
 
     @property
     def buffered_ms(self) -> int:
@@ -109,6 +130,8 @@ class PcmPlayer:
         if not pcm:
             return
         with self._queue_lock:
+            if self._gated and turn_id != self._allowed_key:
+                return
             if self._active_turn != turn_id:
                 self._clear_unlocked()
                 self._active_turn = turn_id
@@ -134,6 +157,8 @@ class PcmPlayer:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while self._buffered_bytes > 0 and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.02)
+        if self._buffered_bytes > 0:
+            raise TimeoutError("PCM playback did not drain before its deadline")
 
     def stop(self) -> None:
         self.clear()

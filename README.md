@@ -1,4 +1,6 @@
-# Voice Terminal v0.1
+# Voice Terminal
+
+当前基线已包含 Windows 语音后端与 Vue 控制台。v0.2 的目标、分阶段实现及验收边界见 [v0.2 规范](docs/v0.2-spec.md)；下一批补验任务见 [v0.2 后续实施交接](docs/v0.2-next-steps.md)。新能力通过独立配置开关启用，真实设备验收前不自动替换现有链路。
 
 本仓库是本地模块化实时语音终端的前端控制台。前端不采集音频、不运行模型，也不计算延迟；它通过本地 WebSocket 连接 Voice Server，发起持续监听并展示后端状态、转录、LLM 回复和链路指标。
 
@@ -180,4 +182,4 @@ error
 
 ## 后续工作
 
-下一步实现独立的 Windows Voice Server 和 ASR Worker，并严格按照协议文档推送状态与指标。后端应能够脱离浏览器运行，网页只是查看和控制入口。
+Windows Voice Server 和 ASR Worker 已实现。v0.2 已提供可选的端点判断、最终精修、多轮预测和只读工具预取；当前阶段验证结果与待验收项见 [验证记录](docs/v0.2-validation.md)。网页继续只是查看和控制入口。

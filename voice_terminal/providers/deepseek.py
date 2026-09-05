@@ -38,12 +38,20 @@ class DeepSeekClient:
             payload["thinking"] = {"type": "disabled"}
         return payload
 
-    async def stream_chat(
+    async def stream_chat(self, messages, *, cancel_event=None) -> AsyncIterator[str]:
+        async for item in self.stream_events(messages, cancel_event=cancel_event):
+            if item["type"] == "content":
+                yield item["text"]
+
+    async def stream_events(
         self,
         messages: Sequence[Mapping[str, str]],
         *,
         cancel_event: Any = None,
-    ) -> AsyncIterator[str]:
+        tools: list[dict] | None = None,
+        json_mode: bool = False,
+        tool_choice: str | None = None,
+    ) -> AsyncIterator[dict]:
         if not self.api_key:
             raise DeepSeekError("未配置 DEEPSEEK_API_KEY")
         try:
@@ -65,13 +73,21 @@ class DeepSeekClient:
         )
         delta_count = 0
         response_chars = 0
+        payload = self._request_payload(messages)
+        if tools:
+            payload["tools"] = tools
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        finished = False
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream(
                     "POST",
                     f"{self.base_url}/chat/completions",
                     headers=headers,
-                    json=self._request_payload(messages),
+                    json=payload,
                 ) as response:
                     logger.info("deepseek.response_status status=%d", response.status_code)
                     if response.status_code >= 400:
@@ -85,6 +101,8 @@ class DeepSeekClient:
                             continue
                         data = line[5:].strip()
                         if data == "[DONE]":
+                            if not finished:
+                                raise DeepSeekError("LLM stream ended without finish reason")
                             return
                         try:
                             parsed = json.loads(data)
@@ -94,6 +112,9 @@ class DeepSeekClient:
                         if not isinstance(choices, list) or not choices:
                             continue
                         delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                        if isinstance(delta, dict):
+                            for call in delta.get("tool_calls") or []:
+                                yield {"type": "tool_delta", "call": call}
                         text = delta.get("content") if isinstance(delta, dict) else None
                         if isinstance(text, str) and text:
                             delta_count += 1
@@ -104,7 +125,15 @@ class DeepSeekClient:
                                 response_chars,
                                 text[:120],
                             )
-                            yield text
+                            yield {"type": "content", "text": text}
+                        reason = choices[0].get("finish_reason")
+                        if reason is not None:
+                            if reason not in {"stop", "tool_calls"}:
+                                raise DeepSeekError(f"LLM incomplete response: {reason}")
+                            finished = True
+                            yield {"type": "finish", "reason": reason}
+                    if not finished:
+                        raise DeepSeekError("LLM stream disconnected before completion")
             logger.info("deepseek.request_done deltas=%d response_chars=%d", delta_count, response_chars)
         except DeepSeekError:
             raise

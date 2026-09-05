@@ -71,6 +71,16 @@ def run_checks(config_path: Path, *, online: bool = False, model_dir: Path | Non
 
     model_errors = validate_models(config.model_dir)
     checks.append(_check("models", not model_errors, "ready" if not model_errors else "; ".join(model_errors)))
+    if config.v02.enabled:
+        from .analysis.model_setup import validate
+        analysis_errors = validate(config.model_dir)
+        checks.append(_check("models:analysis", not analysis_errors, "; ".join(analysis_errors) or "pinned assets verified", warning=True))
+        for module in ("onnxruntime", "transformers"):
+            try:
+                __import__(module)
+                checks.append(_check(f"python:{module}", True, "installed"))
+            except ImportError:
+                checks.append(_check(f"python:{module}", False, "missing; analysis will degrade", warning=True))
     if config.wake.enabled:
         try:
             validate_keywords_file(config.kws_keywords_file, config.wake.keyword_label)

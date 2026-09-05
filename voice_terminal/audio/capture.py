@@ -7,6 +7,7 @@ from typing import Any
 
 from .devices import resolve_device
 from .ring_buffer import PcmRingBuffer
+from ..controller.turn_workspace import AudioFrame
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,8 @@ class AudioCapture:
         self.channels = channels
         self.block_ms = block_ms
         self.input_device = input_device
-        self.queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
+        self.queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=64)
+        self._sample_position = 0
         self.ring_buffer = PcmRingBuffer(sample_rate * channels * 2 * ring_buffer_ms // 1000)
         self._stream: Any = None
         self._running = False
@@ -57,6 +59,8 @@ class AudioCapture:
                 logger.warning("audio.capture_callback_status status=%s", self.last_error)
                 self._last_status = self.last_error
         chunk = bytes(indata)
+        frame = AudioFrame(chunk, self._sample_position, time.monotonic())
+        self._sample_position += len(chunk) // 2
         self._blocks_captured += 1
         self._bytes_captured += len(chunk)
         self.ring_buffer.append(chunk)
@@ -80,7 +84,7 @@ class AudioCapture:
                 except asyncio.QueueEmpty:
                     pass
             try:
-                self.queue.put_nowait(chunk)
+                self.queue.put_nowait(frame)
             except asyncio.QueueFull:
                 pass
 
@@ -140,6 +144,9 @@ class AudioCapture:
         )
 
     async def read(self) -> bytes:
+        return (await self.queue.get()).pcm
+
+    async def read_frame(self) -> AudioFrame:
         return await self.queue.get()
 
     def preroll(self, milliseconds: int) -> bytes:

@@ -75,6 +75,39 @@ function openTerminal() {
 }
 
 describe('useVoiceTerminal', () => {
+  it('恢复 v0.2 快照和历史，忽略旧 generation 的回答', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push(envelope('runtime.snapshot', 1, null, {
+      state: 'THINKING', listening: true, can_start: false,
+      services: { analysis: 'READY' },
+      current: { turn_id: 't1', v02: true, generation_id: 3, input_revision: 4,
+        final_text: '最新校稿', assistant_text: '', prediction: { decision: 'READY', intent: '读取文档' } },
+      recent_turns: [{ turn_id: 'old', transcript: '旧问题', response: '旧回答', completed_at: '', latency: {} }],
+    }))
+    expect(terminal.currentTurnId.value).toBe('t1')
+    expect(terminal.recentTurns.value).toHaveLength(1)
+    expect(terminal.current.prediction?.intent).toBe('读取文档')
+    socket.push(envelope('assistant.delta', 2, 't1', { generation_id: 2, text_delta: '过时回答' }))
+    expect(terminal.current.assistant_text).toBe('')
+    socket.push(envelope('assistant.delta', 3, 't1', { generation_id: 3, text_delta: '当前回答' }))
+    expect(terminal.current.assistant_text).toBe('当前回答')
+  })
+
+  it('同轮续说清理正文并接受新快照，旧工具状态不能覆盖', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push(envelope('turn.started', 1, 't2', { generation_id: 0, workspace: { generation_id: 0 } }))
+    socket.push(envelope('assistant.delta', 2, 't2', { generation_id: 1, text_delta: '撤销内容' }))
+    socket.push(envelope('turn.resumed', 3, 't2', {
+      generation_id: 2, workspace: { generation_id: 2, input_revision: 5, tools: [] },
+    }))
+    socket.push(envelope('agent.tool', 4, 't2', {
+      generation_id: 1, workspace: { tools: [{ name: 'files_search', status: 'DONE' }] },
+    }))
+    expect(terminal.current.assistant_text).toBe('')
+    expect(terminal.current.tools).toEqual([])
+    expect(terminal.currentTurnId.value).toBe('t2')
+  })
+
   it('自动订阅，并且只通过 session 命令控制后端监听', () => {
     const { socket, terminal } = openTerminal()
 

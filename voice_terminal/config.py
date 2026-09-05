@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .env import load_env_file
+from .controller.options import V02Options
 
 
 def _string(value: Any, default: str) -> str:
@@ -132,6 +133,7 @@ class AsrWorkerConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
+    v02: V02Options = field(default_factory=V02Options)
     model_dir: Path = Path(r"D:\模型\voice-terminal")
     debug_audio_capture: bool = False
     audio: AudioConfig = field(default_factory=AudioConfig)
@@ -216,6 +218,7 @@ class AppConfig:
             chunk_size = (0, 10, 5)
 
         return cls(
+            v02=V02Options.from_mapping(data.get("v02", {}), root),
             model_dir=model_dir,
             debug_audio_capture=_bool(
                 data.get("debug_audio_capture"),

@@ -85,3 +85,35 @@ logs/asr-worker.err.log
 唤醒模式开启时，麦克风 PCM 先进入 2 秒环形缓冲，再由 sherpa-onnx 等待 `hei claw`；KWS 触发后暂停 KWS。当前默认的手动模式不运行 KWS，`session.start` 直接创建 turn。两种模式都使用 250 ms 最小有效语音和 700 ms 结束静音，ASR Worker 返回 partial/final；final 文本进入 DeepSeek，文本桥接器按标点和等待时间分段，MiniMax 音频块进入独立 PCM 播放队列。
 
 每一轮都有唯一 `turn_id`。取消或打断时会取消 LLM、关闭 TTS、清空播放器，并丢弃旧 turn 的迟到文本和音频。
+# v0.2 可选分析和 Agent
+
+现有默认配置保留 v0.1。安装新依赖与固定 revision 的模型：
+
+```powershell
+.\scripts\setup.ps1 -Python D:\DevTools\Python312\python.exe -Analysis
+# 仅当下载代理过慢时，对下载进程关闭代理；不会改系统代理。
+python -m voice_terminal.analysis.model_setup --no-proxy
+python -m voice_terminal.analysis.model_setup --offline
+```
+
+启用完整 v0.2（docs 为文件工具唯一默认允许根）：
+
+```powershell
+.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe -Config config/v0.2.yaml
+```
+
+启动脚本按配置启动 Analysis Worker，健康检查失败时主服务仍可降级启动；不会结束已经存在的 Worker。`-NoAnalysis` 使用外部运行的分析服务。模型目录仍为 `D:\模型\voice-terminal`，analysis 下分别保存 smart-turn 和 sensevoice，manifest.json 保存固定 revision 和 SHA-256。启动不下载模型。
+
+Smart Turn 使用 onnxruntime CPU；SenseVoice 使用 FunASR CPU，tokenizer 从模型字节加载，支持 Windows 中文目录。默认 v0.2 精修预算 3000 ms，超过预算使用 Paraformer，原生计算结束后槽位才可复用。
+
+新能力开关位于 v02：enabled、smart_turn、sensevoice、predictions、tools。默认文件根为 docs，`allowed_roots` 可增加显式目录；API 工具名为 files_search / files_read_text，对应内部 files.search / files.read_text。没有 shell 或写操作。
+
+可重复的合成中文回放（不是自然麦克风验收）：
+
+```powershell
+.\scripts\create-eval-audio.ps1
+python -m apps.server.analysis_worker --config config/v0.2.yaml
+python -m voice_terminal.analysis.evaluate --manifest logs/evaluation/audio/manifest.json
+```
+
+录音、报告保存在 Git 忽略的 logs/evaluation；该脚本使用本机合成语音，不记录用户麦克风。报告区分计算耗时与真实讲话到播放延迟。

@@ -24,7 +24,7 @@ class InMemoryHistory:
         self.records: list[TurnRecord] = []
         self._system_message = {
             "role": "system",
-            "content": "你是本地实时语音终端的中文助手。回答简洁、直接，优先给出可执行的信息；不要输出工具调用格式。",
+            "content": "你是本地实时语音终端的中文助手。回答简洁、直接，优先给出可执行的信息；工具调用通过工具接口进行，不要在面向用户的正文中输出或朗读工具参数。",
         }
         self.messages: list[dict[str, str]] = [dict(self._system_message)]
 

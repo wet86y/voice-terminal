@@ -1,0 +1,9 @@
+# Opt-in configuration: pass --config config/v0.2.yaml to server/worker.
+v02:
+  enabled: true
+  smart_turn: true
+  sensevoice: true
+  predictions: true
+  tools: true
+  max_turn_ms: 60000
+  allowed_roots: [docs]

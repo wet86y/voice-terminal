@@ -11,6 +11,7 @@ from ..audio.player import AudioPlayerError, PcmPlayer
 from ..asr.client import AsrWorkerClient
 from ..config import AppConfig
 from ..controller.turn_controller import TurnController
+from ..controller.realtime_controller import RealtimeController
 from ..core.event_bus import EventBus
 from ..core.events import VoiceEvent, event
 from ..core.state import RuntimeState, TerminalState
@@ -91,6 +92,7 @@ class VoiceRuntime:
                 model_dir=self.config.vad_model_dir,
                 device="cpu",
                 sample_rate=self.config.audio.sample_rate,
+                end_silence_ms=300 if self.config.v02.enabled else None,
             )
         except Exception as exc:
             self._record_error("asr", str(exc))
@@ -143,7 +145,12 @@ class VoiceRuntime:
         else:
             self._record_error("tts", f"未配置 {self.config.tts.api_key_env}")
 
-        self.controller = TurnController(
+        if self.config.v02.enabled and (self.config.audio.sample_rate != 16000 or self.config.audio.channels != 1 or self.config.audio.sample_format != "int16"):
+            raise ValueError("v0.2 requires 16 kHz mono int16 capture")
+        controller_class = RealtimeController if self.config.v02.enabled else TurnController
+        extra = {"options": self.config.v02} if self.config.v02.enabled else {}
+        self.controller = controller_class(
+            **extra,
             state=self.state,
             bus=self.bus,
             history=self.history,
@@ -168,7 +175,9 @@ class VoiceRuntime:
         await self.controller.initialize()
 
     def snapshot(self) -> VoiceEvent:
-        return snapshot_event(self.state)
+        value = snapshot_event(self.state)
+        value.payload["recent_turns"] = [record.to_payload() for record in self.history.records]
+        return value
 
     async def start_listening(self) -> None:
         if self.controller is None:
@@ -264,6 +273,10 @@ async def _forward_events(websocket: Any, subscription: Any, sequencer: Protocol
     except asyncio.CancelledError:
         raise
     except Exception:
+        try:
+            await websocket.close(code=1013)
+        except Exception:
+            pass
         return
 
 

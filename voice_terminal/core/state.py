@@ -40,6 +40,8 @@ class RuntimeState:
             "tts_text": "",
             "tts_status": "IDLE",
             "audio_buffer_ms": 0,
+            "turn_id": None,
+            "v02": False,
         }
     )
     latency: dict[str, Any] = field(
@@ -91,6 +93,8 @@ class RuntimeState:
             tts_status="IDLE",
             audio_buffer_ms=0,
         )
+        for key in ("input_revision", "generation_id", "committed", "agent_phase", "paraformer_final", "refined_text", "segments", "prediction", "tools", "audio_cues", "analysis"):
+            self.current.pop(key, None)
         self.latency = {
             "complete": False,
             "values": {key: None for key in self.latency["values"]},

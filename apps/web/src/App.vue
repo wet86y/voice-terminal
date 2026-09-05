@@ -20,6 +20,11 @@ const stateLabels: Record<string, string> = {
 }
 
 const latencyDefinitions: Array<{ key: keyof LatencyValues; label: string }> = [
+  { key: 'first_segment_ms', label: '首个稳定语义段' },
+  { key: 'first_prediction_ms', label: '首次意图预测' },
+  { key: 'smart_turn_ms', label: 'Smart Turn 推理' },
+  { key: 'sensevoice_refine_ms', label: '最终精修' },
+  { key: 'commit_to_final_llm_ms', label: '最终请求调度' },
   { key: 'wake_detection_ms', label: '唤醒检测' },
   { key: 'asr_first_text_ms', label: 'ASR 首次出字' },
   { key: 'speech_end_confirmation_ms', label: '讲话结束确认' },
@@ -59,10 +64,11 @@ const serviceRows = computed(() => [
   { key: 'asr', label: 'ASR Worker', value: terminal.services.asr },
   { key: 'llm', label: 'LLM', value: terminal.services.llm },
   { key: 'tts', label: 'TTS / Player', value: terminal.services.tts },
+  { key: 'analysis', label: 'Speech Analysis', value: terminal.services.analysis ?? 'DISABLED' },
 ])
 
-function formatMs(value: number | null) {
-  return value === null ? '—' : `${value} ms`
+function formatMs(value: number | null | undefined) {
+  return value == null ? '—' : `${Math.round(value)} ms`
 }
 
 function displayText(value: string | null | undefined) {
@@ -78,7 +84,7 @@ function statusClass(status: string) {
   <main class="app-shell">
     <header class="topbar">
       <div class="brand-block">
-        <div class="eyebrow"><span class="signal-dot"></span> LOCAL VOICE RUNTIME / V0.1</div>
+        <div class="eyebrow"><span class="signal-dot"></span> LOCAL VOICE RUNTIME</div>
         <h1>Voice Terminal</h1>
         <p>后端驱动的实时语音控制台。</p>
       </div>
@@ -198,6 +204,25 @@ function statusClass(status: string) {
             <p>{{ displayText(terminal.current.final_text) }}</p>
           </div>
         </div>
+
+        <details v-if="terminal.current.v02" class="analysis-details">
+          <summary>理解与精修 · {{ terminal.current.agent_phase }} · {{ terminal.current.prediction?.decision || '等待' }}</summary>
+          <p>{{ terminal.current.prediction?.intent || terminal.current.prediction?.error || '等待稳定语义段' }}</p>
+          <p><strong>Paraformer 草稿：</strong>{{ terminal.current.paraformer_final || terminal.current.partial_text || '—' }}</p>
+          <p><strong>最终校稿：</strong>{{ terminal.current.refined_text || '—' }}</p>
+          <p v-for="(analysis, name) in terminal.current.analysis" :key="name">
+            {{ name }} · {{ analysis.status }} {{ analysis.error || '' }}
+            <span v-if="analysis.probability != null">结束概率 {{ Math.round(analysis.probability * 100) }}%</span>
+          </p>
+          <ul><li v-for="(segment, index) in terminal.current.segments" :key="index">{{ segment.text }}</li></ul>
+          <p v-for="(cue, index) in terminal.current.audio_cues" :key="index">
+            {{ cue.start_ms }}–{{ cue.end_ms }} ms · {{ cue.language }} · {{ cue.emotion }} · {{ cue.events.join(', ') }}
+          </p>
+          <small v-if="terminal.current.audio_cues?.length">语音线索由模型自动分析，仅作辅助。</small>
+          <p v-for="(tool, index) in terminal.current.tools" :key="index">
+            {{ tool.name }} · {{ tool.status }} {{ tool.reused ? '已复用' : '' }} {{ tool.error || '' }}
+          </p>
+        </details>
 
         <div class="metric-footer">
           <span>当前轮</span><strong>{{ currentTurnLabel }}</strong>
