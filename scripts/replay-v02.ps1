@@ -18,7 +18,7 @@ Push-Location $RepoRoot
 $owned = @()
 
 function Get-ConfigInfo {
-  $json = & $Python -c "import json,sys; from pathlib import Path; from voice_terminal.config import load_config; from urllib.parse import urlparse; root=Path.cwd(); c=load_config(root/'config/default.yaml',Path(sys.argv[1])); a=urlparse(c.v02.analysis_url); print(json.dumps({'asr_url':c.asr.worker_url,'analysis_url':c.v02.analysis_url,'analysis_health':'http://'+a.netloc+'/health','analysis_enabled':c.v02.enabled and (c.v02.smart_turn or c.v02.sensevoice)}))" $Config
+  $json = & $Python -c "import json,sys; from pathlib import Path; from voice_terminal.config import load_config; from urllib.parse import urlparse; root=Path.cwd(); c=load_config(root/'config/default.yaml',Path(sys.argv[1])); a=urlparse(c.v02.analysis_url); print(json.dumps({'asr_url':c.asr.worker_url,'analysis_url':c.v02.analysis_url,'analysis_health':'http://'+a.netloc+'/health','analysis_enabled':c.v02.enabled and (c.v02.smart_turn or c.v02.sensevoice),'analysis_smart_turn':c.v02.enabled and c.v02.smart_turn,'analysis_sensevoice':c.v02.enabled and c.v02.sensevoice}))" $Config
   if ($LASTEXITCODE -ne 0) { throw "无法读取回放配置：$Config" }
   return ($json | ConvertFrom-Json)
 }
@@ -33,10 +33,12 @@ function Invoke-AsrProbe([string]$Url) {
   return [pscustomobject]@{ Ready = ($LASTEXITCODE -eq 0); Output = ($value -join "`n") }
 }
 
-function Test-AnalysisReady([string]$Url) {
+function Test-AnalysisReady([string]$Url, $Requirements) {
   try {
     $value = Invoke-RestMethod -Uri $Url -TimeoutSec 2
-    return ($value.endpoint.status -eq "READY" -and $value.refine.status -eq "READY")
+    if ($Requirements.analysis_smart_turn -and $value.endpoint.status -ne "READY") { return $false }
+    if ($Requirements.analysis_sensevoice -and $value.refine.status -ne "READY") { return $false }
+    return $true
   } catch {
     return $false
   }
@@ -60,7 +62,7 @@ try {
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $outputPath) | Out-Null
 
   if (-not $NoAnalysis -and $info.analysis_enabled) {
-    if (-not (Test-AnalysisReady $info.analysis_health)) {
+    if (-not (Test-AnalysisReady $info.analysis_health $info)) {
       $analysisOut = Join-Path $LogDir "analysis-worker-replay.out.log"
       $analysisErr = Join-Path $LogDir "analysis-worker-replay.err.log"
       $process = Start-Process -FilePath $Python -ArgumentList @("-m", "apps.server.analysis_worker", "--config", $configPath) -WorkingDirectory $RepoRoot -WindowStyle Hidden -RedirectStandardOutput $analysisOut -RedirectStandardError $analysisErr -PassThru
@@ -68,7 +70,7 @@ try {
       $analysisReady = $false
       for ($attempt = 0; $attempt -lt $ReadyTimeoutSec; $attempt++) {
         if ($process.HasExited) { break }
-        if (Test-AnalysisReady $info.analysis_health) { $analysisReady = $true; break }
+        if (Test-AnalysisReady $info.analysis_health $info) { $analysisReady = $true; break }
         Start-Sleep -Seconds 1
       }
       if (-not $analysisReady) {

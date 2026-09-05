@@ -1,4 +1,4 @@
-# Opt-in configuration: pass --config config/v0.2.yaml to server/worker.
+# Current v0.2 runtime configuration: pass --config config/v0.2.yaml to server/worker.
 v02:
   enabled: true
   smart_turn: true

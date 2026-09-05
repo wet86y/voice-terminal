@@ -99,9 +99,10 @@ function parseServerMessage(raw: unknown): ServerMessage | null {
     const parsed: unknown = JSON.parse(raw)
     if (!isRecord(parsed)) return null
     if (typeof parsed.type !== 'string') return null
-    if (typeof parsed.seq !== 'number' || !Number.isFinite(parsed.seq)) return null
+    if (typeof parsed.seq !== 'number' || !Number.isInteger(parsed.seq) || !Number.isFinite(parsed.seq)) return null
     if (typeof parsed.timestamp !== 'string') return null
     if (parsed.turn_id !== null && typeof parsed.turn_id !== 'string') return null
+    if (!isRecord(parsed.payload)) return null
     return parsed as unknown as ServerMessage
   } catch {
     return null
@@ -153,6 +154,14 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     Object.assign(current, createEmptyCurrentTurn())
     Object.assign(currentLatency, createEmptyLatency())
     currentLatencyComplete.value = false
+  }
+
+  function resetConnectionData() {
+    currentTurnId.value = null
+    resetCurrentTurn()
+    llmContext.value = []
+    llmContextTurnId.value = null
+    lastServerTimestamp.value = null
   }
 
   function adoptTurn(turnId: string | null) {
@@ -240,8 +249,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (typeof payload.listening === 'boolean') listening.value = payload.listening
     if (typeof payload.can_start === 'boolean') canStart.value = payload.can_start
     applyServices(payload.services)
+    const hasCurrentTurnId = isRecord(payload.current)
+      && Object.prototype.hasOwnProperty.call(payload.current, 'turn_id')
     const snapshotTurnId = isRecord(payload.current) ? readString(payload.current, 'turn_id') : null
     if (turnId || snapshotTurnId) adoptTurn(turnId || snapshotTurnId)
+    else if (hasCurrentTurnId && currentTurnId.value !== null) resetConnectionData()
     applyCurrentSnapshot(payload.current)
     if (payload.latency) applyLatencySnapshot(payload.latency)
     if (Array.isArray(payload.recent_turns)) {
@@ -414,8 +426,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   function connect() {
     if (connection.value === 'connecting' || connection.value === 'connected') return
 
+    resetConnectionData()
     connection.value = 'connecting'
     connectionError.value = ''
+    state.value = 'STARTING'
+    listening.value = false
     canStart.value = false
     lastSequence.value = null
 
@@ -442,6 +457,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         connection.value = 'offline'
         canStart.value = false
         listening.value = false
+        state.value = 'STARTING'
+        resetConnectionData()
         Object.assign(services, createOfflineStatuses())
         if (!connectionError.value) connectionError.value = 'Voice Server 连接已关闭。'
       }
@@ -464,7 +481,10 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     socket.value = null
     activeSocket?.close()
     connection.value = 'offline'
+    state.value = 'STARTING'
+    listening.value = false
     canStart.value = false
+    resetConnectionData()
   }
 
   return {

@@ -47,9 +47,13 @@ class VoiceRuntime:
         self.tts: MiniMaxTtsClient | None = None
         self.player: PcmPlayer | None = None
         self.controller: TurnController | None = None
+        self._session_lock = asyncio.Lock()
 
-    def _record_error(self, service: str, message: str) -> None:
-        self.state.set_service(service, "ERROR")
+    def _record_error(self, service: str, message: str, *, status_service: str | None = None) -> None:
+        # Keep the public service map compatible while preserving the actual
+        # failing component in startup diagnostics (for example, VAD failure
+        # makes the ASR chain unavailable but is not an ASR model failure).
+        self.state.set_service(status_service or service, "ERROR")
         self.startup_errors.append(f"{service}: {message}")
         logger.error("%s", self.startup_errors[-1])
 
@@ -95,7 +99,7 @@ class VoiceRuntime:
                 end_silence_ms=300 if self.config.v02.enabled else None,
             )
         except Exception as exc:
-            self._record_error("asr", str(exc))
+            self._record_error("vad", str(exc), status_service="asr")
 
         self.asr = AsrWorkerClient(self.config.asr.worker_url)
         try:
@@ -182,14 +186,16 @@ class VoiceRuntime:
         return value
 
     async def start_listening(self) -> None:
-        if self.controller is None:
-            await self.bus.publish(event("error", code="RUNTIME_NOT_INITIALIZED", message="Voice Runtime 尚未初始化。", recoverable=False))
-            return
-        await self.controller.start_listening()
+        async with self._session_lock:
+            if self.controller is None:
+                await self.bus.publish(event("error", code="RUNTIME_NOT_INITIALIZED", message="Voice Runtime 尚未初始化。", recoverable=False))
+                return
+            await self.controller.start_listening()
 
     async def stop_listening(self) -> None:
-        if self.controller is not None:
-            await self.controller.stop_listening()
+        async with self._session_lock:
+            if self.controller is not None:
+                await self.controller.stop_listening()
 
     async def close(self) -> None:
         if self.controller is not None:
@@ -210,8 +216,11 @@ class VoiceRuntime:
 def _valid_command(message: Any) -> tuple[str, dict[str, Any]] | None:
     if not isinstance(message, dict) or message.get("type") != "command":
         return None
+    request_id = message.get("request_id")
     command = message.get("command")
     payload = message.get("payload")
+    if not isinstance(request_id, str) or not request_id.strip():
+        return None
     if not isinstance(command, str) or not isinstance(payload, dict):
         return None
     return command, payload

@@ -290,4 +290,51 @@ describe('useVoiceTerminal', () => {
     expect(terminal.canStart.value).toBe(false)
     expect(terminal.services.asr).toBe('OFFLINE')
   })
+
+  it('重连时清理旧轮状态，并按空当前轮快照恢复', () => {
+    const { socket, terminal } = openTerminal()
+
+    socket.push(envelope('session.state', 1, 'old-turn', {
+      state: 'THINKING', listening: true, can_start: false,
+    }))
+    socket.push(envelope('transcript.final', 2, 'old-turn', { text: '旧问题' }))
+    socket.push(envelope('assistant.delta', 3, 'old-turn', { text_delta: '旧回答' }))
+    expect(terminal.current.final_text).toBe('旧问题')
+    expect(terminal.current.assistant_text).toBe('旧回答')
+
+    socket.close()
+    expect(terminal.currentTurnId.value).toBe(null)
+    expect(terminal.current.final_text).toBe('')
+    expect(terminal.current.assistant_text).toBe('')
+
+    terminal.connect()
+    socket.open()
+    socket.push(envelope('runtime.snapshot', 1, null, {
+      state: 'IDLE', listening: false, can_start: true,
+      services: { audio: 'READY', kws: 'DISABLED', asr: 'READY', llm: 'READY', tts: 'READY' },
+      current: { turn_id: null, partial_text: '', final_text: '', assistant_text: '', tts_text: '', tts_status: 'IDLE', audio_buffer_ms: 0 },
+      recent_turns: [],
+    }))
+
+    expect(terminal.currentTurnId.value).toBe(null)
+    expect(terminal.current.final_text).toBe('')
+    expect(terminal.current.assistant_text).toBe('')
+    expect(terminal.canStart.value).toBe(true)
+  })
+
+  it('拒绝非整数序号和非对象 payload 的协议消息', () => {
+    const { socket, terminal } = openTerminal()
+
+    socket.onmessage?.({ data: JSON.stringify({
+      type: 'runtime.snapshot', seq: 1.5, timestamp: '2026-09-04T08:30:00.000Z',
+      turn_id: null, payload: {},
+    }) })
+    expect(terminal.connectionError.value).toBe('收到无法解析的后端消息。')
+
+    socket.onmessage?.({ data: JSON.stringify({
+      type: 'runtime.snapshot', seq: 1, timestamp: '2026-09-04T08:30:00.000Z',
+      turn_id: null, payload: [],
+    }) })
+    expect(terminal.connectionError.value).toBe('收到无法解析的后端消息。')
+  })
 })

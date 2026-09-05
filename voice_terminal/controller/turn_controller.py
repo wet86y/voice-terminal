@@ -275,14 +275,34 @@ class TurnController:
         assert self.capture is not None
         logger.info("controller.audio_loop started")
         while self.state.listening and not self._closed:
-            chunk = await self.capture.read()
             try:
+                chunk = await self.capture.read()
                 await self._handle_audio(chunk)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.exception("controller.audio_loop_failed")
+                # A failed ASR/VAD/audio operation must not leave the old
+                # turn active while the loop keeps feeding the same broken
+                # dependency.  Release the turn and stop this session so a
+                # later session.start can establish a fresh transport.
+                await self._cancel_turn()
+                self.state.listening = False
+                try:
+                    await self.capture.stop()
+                except Exception:
+                    logger.exception("controller.audio_loop_stop_capture_failed")
+                if self.asr is not None:
+                    try:
+                        await self.asr.close()
+                    except Exception:
+                        logger.exception("controller.audio_loop_close_asr_failed")
+                self.state.set_service("audio", "READY" if self.capture is not None else "ERROR")
+                self.state.set_service("kws", "READY" if self.wake_enabled and self.kws is not None else "DISABLED")
+                self.state.set_service("asr", "READY" if self.asr is not None and self.vad is not None else "ERROR")
                 await self._error("AUDIO_PIPELINE_FAILED", str(exc), recoverable=True)
+                await self._state_event(TerminalState.IDLE, listening=False)
+                break
         logger.info("controller.audio_loop stopped")
 
     async def _handle_audio(self, chunk: bytes) -> None:
@@ -512,6 +532,12 @@ class TurnController:
                     self._asr_latest_text.get(turn_id, "")[:120],
                 )
                 await self._error("ASR_FINAL_TIMEOUT", "ASR 未在 5 秒内返回最终结果。", recoverable=True, turn_id=turn_id)
+                # The timeout is recoverable, but the finalized turn still
+                # owns the controller until it is explicitly invalidated.
+                # Leaving it in FINALIZING makes the next session feed a
+                # dead turn and prevents normal restart.
+                await self._cancel_turn()
+                await self._state_event(TerminalState.IDLE, listening=self.state.listening)
                 return
             if not self.turns.is_current(turn_id):
                 return

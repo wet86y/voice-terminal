@@ -15,6 +15,7 @@ from voice_terminal.analysis.sensevoice import parse_transcript, bounded_segment
 from voice_terminal.agent.runtime import AgentRuntime, ToolCallAssembler, SpokenContentGuard
 from voice_terminal.agent.tool_registry import FileTools
 from voice_terminal.agent.speculative_tools import SpeculativeTools
+from voice_terminal.asr.protocol import AudioChunk
 from voice_terminal.audio.player import PcmPlayer
 from voice_terminal.controller.options import V02Options
 from voice_terminal.controller.turn_workspace import AudioFrame, CurrentTurnAudioBuffer
@@ -555,6 +556,29 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await c.close()
 
+    async def test_resume_drops_old_generation_tool_state_and_cache(self):
+        c = controller()
+        try:
+            frame = await begin(c)
+            ws = c.workspace
+            old_entry, _ = await c.registry.select(
+                ws.turn_id,
+                "files_search",
+                {"query": "v0.2"},
+                valid=lambda: c._prediction_valid(ws, ws.token, ws.input_revision),
+            )
+            ws.tools = [{"name": "files_search", "status": "DONE", "speculative": True}]
+            await c._resume(frame)
+
+            await asyncio.sleep(0)
+            self.assertTrue(old_entry.task.cancelled() or old_entry.task.done())
+            self.assertFalse(any(key[0] == ws.turn_id for key in c.registry.entries))
+            self.assertEqual(ws.tools, [])
+            self.assertEqual(ws.paraformer_final, "")
+            self.assertNotIn("endpoint", ws.analysis)
+        finally:
+            await c.close()
+
     async def test_endpoint_late_complete_ignored_after_speech_version_changes(self):
         c = controller(smart_turn=True)
         gate = asyncio.Event()
@@ -701,6 +725,47 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             if stream is not None:
                 await stream.aclose()
             await c.close()
+
+    async def test_asr_send_failure_stops_capture_and_sender(self):
+        class FailingAsr(FakeAsr):
+            async def send_audio(self, _chunk):
+                raise RuntimeError("synthetic ASR send failure")
+
+        asr = FailingAsr()
+        c = controller(asr_obj=asr)
+        c.state.listening = True
+        sub_id = "turn/asr/1"
+        c._sub_parts[sub_id] = ""
+        c._sub_finals[sub_id] = asyncio.Event()
+        c._asr_queue.put_nowait(AudioChunk(sub_id, b"11"))
+        sender = asyncio.create_task(c._send_asr_loop())
+        c._asr_sender = sender
+
+        await asyncio.wait_for(sender, 1)
+
+        self.assertFalse(c.state.listening)
+        self.assertEqual(c.state.services["asr"], "ERROR")
+        self.assertEqual(c._asr_queue.qsize(), 0)
+        await c.close()
+
+    async def test_audio_read_failure_returns_v02_controller_to_idle(self):
+        class FailingCapture:
+            async def read_frame(self):
+                raise RuntimeError("synthetic capture failure")
+
+            async def stop(self):
+                return None
+
+        c = controller()
+        c.capture = FailingCapture()
+        c.state.listening = True
+
+        await c._listen_loop()
+
+        self.assertFalse(c.state.listening)
+        self.assertEqual(c.state.state.value, "IDLE")
+        self.assertEqual(c.state.services["asr"], "READY")
+        await c.close()
 
     async def test_actual_playback_boundary_forces_new_turn(self):
         c = controller()

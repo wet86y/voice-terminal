@@ -1,7 +1,8 @@
 model_dir: "D:\\模型\\voice-terminal"
 debug_audio_capture: false
 
-# Enable after model installation and real-device acceptance. Independent rollback switches.
+# v0.2 is the current development path. Keep the default runtime on v0.1
+# until natural-speech and real-device acceptance justify switching this gate.
 v02:
   enabled: false
   smart_turn: false

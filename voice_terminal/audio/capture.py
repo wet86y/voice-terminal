@@ -52,6 +52,21 @@ class AudioCapture:
     def running(self) -> bool:
         return self._running
 
+    def _clear_pending_frames(self) -> None:
+        """Drop frames captured by the session that has just ended.
+
+        The PortAudio callback can enqueue a few frames while ``stop()`` is
+        closing the stream.  Keeping them would make the next
+        ``session.start`` consume audio from the previous session before the
+        new microphone stream has produced a frame.
+        """
+
+        while True:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
     def _on_audio(self, indata: Any, _frames: int, _time: Any, status: Any) -> None:
         if status:
             self.last_error = str(status)
@@ -96,6 +111,7 @@ class AudioCapture:
         try:
             import sounddevice as sd  # type: ignore
 
+            self._clear_pending_frames()
             device = resolve_device(self.input_device, input_device=True)
             self.last_error = None
             self._blocks_captured = 0
@@ -135,6 +151,7 @@ class AudioCapture:
                 stream.stop()
             finally:
                 stream.close()
+        self._clear_pending_frames()
         logger.info(
             "audio.capture_stopped blocks=%d bytes=%d dropped=%d last_error=%s",
             self._blocks_captured,

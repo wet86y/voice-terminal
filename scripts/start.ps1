@@ -13,7 +13,7 @@ Push-Location $RepoRoot
 $worker = $null
 $analysisWorker = $null
 try {
-  $serviceConfig = & $Python -c "import json,sys; from pathlib import Path; from voice_terminal.config import load_config; from urllib.parse import urlparse; c=load_config(Path('config/default.yaml'),Path(sys.argv[1])); a=urlparse(c.v02.analysis_url); w=urlparse(c.asr.worker_url); print(json.dumps({'analysis_enabled':c.v02.enabled and (c.v02.smart_turn or c.v02.sensevoice),'analysis_health':'http://'+a.netloc+'/health','asr_url':c.asr.worker_url,'asr_host':w.hostname,'asr_port':w.port}))" $Config
+  $serviceConfig = & $Python -c "import json,sys; from pathlib import Path; from voice_terminal.config import load_config; from urllib.parse import urlparse; c=load_config(Path('config/default.yaml'),Path(sys.argv[1])); a=urlparse(c.v02.analysis_url); w=urlparse(c.asr.worker_url); print(json.dumps({'analysis_enabled':c.v02.enabled and (c.v02.smart_turn or c.v02.sensevoice),'analysis_smart_turn':c.v02.enabled and c.v02.smart_turn,'analysis_sensevoice':c.v02.enabled and c.v02.sensevoice,'analysis_health':'http://'+a.netloc+'/health','asr_url':c.asr.worker_url,'asr_host':w.hostname,'asr_port':w.port}))" $Config
   if ($LASTEXITCODE -ne 0) { throw "无法读取启动配置" }
   $serviceConfig = $serviceConfig | ConvertFrom-Json
   if ($serviceConfig.analysis_enabled -and -not $NoAnalysis) {
@@ -29,7 +29,10 @@ try {
         } catch { Start-Sleep -Seconds 1 }
       }
     }
-    $analysisReady = $existingAnalysis -and $existingAnalysis.endpoint.status -eq "READY" -and $existingAnalysis.refine.status -eq "READY"
+    $analysisReady = $true
+    if (-not $existingAnalysis) { $analysisReady = $false }
+    if ($analysisReady -and $serviceConfig.analysis_smart_turn -and $existingAnalysis.endpoint.status -ne "READY") { $analysisReady = $false }
+    if ($analysisReady -and $serviceConfig.analysis_sensevoice -and $existingAnalysis.refine.status -ne "READY") { $analysisReady = $false }
     if (-not $analysisReady) { Write-Warning "Analysis Worker 不可用或模型未 READY，Voice Server 将使用 VAD / Paraformer 降级。" }
   }
   $workerOut = Join-Path $LogDir "asr-worker.out.log"

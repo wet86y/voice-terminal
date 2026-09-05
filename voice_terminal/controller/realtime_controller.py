@@ -153,6 +153,11 @@ class RealtimeController(TurnController):
 
         self.state.services["asr"] = "ERROR"
         self.state.listening = False
+        listen_task = self._listen_task
+        if listen_task is not None and listen_task is not asyncio.current_task() and not listen_task.done():
+            listen_task.cancel()
+            await asyncio.gather(listen_task, return_exceptions=True)
+        self._listen_task = None
         sender = self._asr_sender
         if sender is not None and sender is not asyncio.current_task() and not sender.done():
             sender.cancel()
@@ -172,6 +177,7 @@ class RealtimeController(TurnController):
                 # capture shutdown failure must not hide it.
                 pass
             self.state.services["audio"] = "READY"
+        self.state.services["kws"] = "READY" if self.wake_enabled and self.kws is not None else "DISABLED"
 
     def _queue_asr(self, item) -> None:
         # No awaited network writes on the capture path. Overflow is a visible
@@ -194,26 +200,53 @@ class RealtimeController(TurnController):
                 code = getattr(exc, "code", None)
                 if not isinstance(code, str):
                     code = "ASR_WORKER_DISCONNECTED" if "ConnectionClosed" in type(exc).__name__ else "ASR_SEND_FAILED"
-                if code == "ASR_WORKER_DISCONNECTED":
-                    await self._handle_asr_disconnect()
+                # Any failed write leaves the sender's transport unusable.
+                # Keep the recovery path identical for protocol disconnects
+                # and other send failures so the capture loop cannot continue
+                # feeding a dead ASR connection.
+                await self._handle_asr_disconnect()
                 await self._error(code, str(exc), recoverable=True)
-                await self._state_event(TerminalState.IDLE, listening=self.state.listening)
-                if code == "ASR_WORKER_DISCONNECTED":
-                    return
+                await self._state_event(TerminalState.IDLE, listening=False)
+                return
             finally:
                 self._asr_queue.task_done()
 
     async def _listen_loop(self) -> None:
         while self.state.listening and not self._closed:
-            frame = await self.capture.read_frame()
             try:
+                frame = await self.capture.read_frame()
                 await self.handle_frame(frame)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 await self._cancel_turn()
+                self.state.listening = False
+                try:
+                    await self.capture.stop()
+                except Exception:
+                    logger.exception("controller.v02_audio_loop_stop_capture_failed")
+                sender = self._asr_sender
+                if sender is not None and sender is not asyncio.current_task() and not sender.done():
+                    sender.cancel()
+                    await asyncio.gather(sender, return_exceptions=True)
+                self._asr_sender = None
+                while True:
+                    try:
+                        self._asr_queue.get_nowait()
+                        self._asr_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        break
+                if self.asr is not None:
+                    try:
+                        await self.asr.close()
+                    except Exception:
+                        logger.exception("controller.v02_audio_loop_close_asr_failed")
+                self.state.services["audio"] = "READY" if self.capture is not None else "ERROR"
+                self.state.services["kws"] = "READY" if self.wake_enabled and self.kws is not None else "DISABLED"
+                self.state.services["asr"] = "READY" if self.asr is not None and self.vad is not None else "ERROR"
                 await self._error("AUDIO_PIPELINE_FAILED", str(exc), recoverable=True)
-                await self._state_event(TerminalState.IDLE, listening=self.state.listening)
+                await self._state_event(TerminalState.IDLE, listening=False)
+                break
 
     async def handle_frame(self, frame: AudioFrame) -> None:
         if self._last_frame and frame.start_sample != self._last_frame.end_sample:
@@ -360,6 +393,18 @@ class RealtimeController(TurnController):
         ws = self.workspace
         ws.resume()  # Invalidate before cancelling or awaiting any operation.
         self._stop_generation()
+        # A continuation is a new generation of the same turn.  Tool cache
+        # entries and visible tool states from the interrupted generation must
+        # not be reused or reported as if they belonged to the new input.
+        self.registry.cancel_turn(ws.turn_id)
+        self.registry.begin_turn(ws.turn_id)
+        ws.tools.clear()
+        ws.paraformer_final = ""
+        ws.analysis = {
+            name: dict(details)
+            for name, details in self.analysis_health.items()
+            if isinstance(details, dict)
+        }
         self._turn_cancel = asyncio.Event()
         self._active_input = True
         ws.timings = {k: v for k, v in ws.timings.items() if k in {"first_segment", "first_prediction", "asr_first_text"}}

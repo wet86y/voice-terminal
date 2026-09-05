@@ -1,6 +1,6 @@
-# Voice Terminal v0.1 WebSocket 协议
+# Voice Terminal WebSocket 协议
 
-本文档是前端与 Voice Server 之间的冻结协议。前端只负责发送会话命令和展示服务端数据，不采集音频、不运行模型、不计算延迟。
+本文档是当前前端与 Voice Server 之间的公开协议，包含 v0.1 稳定基线事件和当前主路径 v0.2 扩展。前端只负责发送会话命令和展示服务端数据，不采集音频、不运行模型、不计算延迟。内部 ASR/Analysis Worker 接口在文档末尾单独定义。
 
 ## 连接
 
@@ -47,12 +47,12 @@ ws://127.0.0.1:8765/ws
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `type` | string | 消息类型 |
-| `seq` | number | 当前连接内单调递增，从 0 或 1 开始均可，但不能重复 |
+| `seq` | integer | 当前连接内从 1 开始单调递增；不能重复或回退 |
 | `timestamp` | ISO-8601 string | 后端产生消息的时间，仅用于展示和调试 |
 | `turn_id` | string/null | 当前轮 ID；运行时级消息为 `null` |
 | `payload` | object | 当前消息的结构化内容 |
 
-前端以 `seq` 去重和丢弃乱序消息。`timestamp` 不能用于前端延迟计算。
+前端以 `seq` 去重和丢弃乱序消息。`timestamp` 不能用于前端延迟计算。服务端当前实现从 1 开始编号，重连后每个连接重新编号。
 
 ## 客户端命令
 
@@ -76,6 +76,8 @@ ws://127.0.0.1:8765/ws
 | `session.stop` | 用户点击 `停止监听` | 停止后端持续监听，并按后端策略取消当前回答/播放 |
 
 `request_id` 由前端生成，仅用于后端确认和日志关联，不参与延迟计算。
+
+服务端会拒绝缺少 `request_id`、空白 `request_id`、非字符串 command 或非对象 payload 的命令，并返回 `INVALID_COMMAND`。多个客户端共享同一个 VoiceRuntime，`session.start` 和 `session.stop` 按到达顺序串行执行。
 
 `subscribe` 示例：
 
@@ -381,7 +383,7 @@ v0.2 在 TTS 任务运行期间按后端播放器进度推送监控信息。`aud
 1. 收到消息后先校验 `type`、`seq`、`timestamp` 和 `turn_id`。
 2. `seq` 小于或等于最近处理序号的消息直接丢弃。
 3. 当前轮消息必须匹配当前 `turn_id`；旧轮次迟到消息不得覆盖当前页面。
-4. 新的 `session.state` 携带不同 `turn_id` 时，前端清空当前轮文本和当前轮指标，但不删除历史。
+4. 新的 `session.state` 携带不同 `turn_id` 时，前端清空当前轮文本和当前轮指标，但不删除历史；显式的空当前轮快照也会清理旧 turn。
 5. `turn.completed` 是历史记录的唯一写入口，历史最多保存 10 轮。
 6. `null` 指标显示为 `—`，不得使用前端默认值补全。
 7. 所有页面状态、文本、服务状态和延迟都以服务端数据为准。
@@ -399,7 +401,7 @@ v0.2 在 TTS 任务运行期间按后端播放器进度推送监控信息。`aud
 - `tts.status` / `tts.progress` 中的音频时长和 `latency.snapshot.payload.values` 都是后端测量/维护的只读结果，不应要求浏览器回传开始时间或音频时间戳。
 - `turn.completed` 应包含完整 transcript、response 和最终 latency；这是前端写入历史的唯一事件。
 - 发生不可恢复错误时发送 `error`，并在状态已改变时同步发送 `session.state`；不要依赖浏览器自行推断 `ERROR`。
-- `seq` 只在当前 WebSocket 连接内递增；重连后可以从 0 重新开始，前端会重置该连接的去重游标。
+- `seq` 只在当前 WebSocket 连接内递增；重连后从 1 重新开始，前端会重置该连接的去重游标。
 
 协议消费方不应把前端控制台当作音频管线：浏览器不授予麦克风权限、不上传 PCM，也不承担 KWS、VAD、ASR、LLM、TTS、播放或延迟测量。
 # v0.2 增量扩展
@@ -457,7 +459,7 @@ v0.2 在 TTS 任务运行期间按后端播放器进度推送监控信息。`aud
 
 每模型独立单执行槽，无等待队列；忙碌返回错误，由主服务降级。取消请求不提前释放尚未结束的原生推理槽。
 
-## ASR Worker 内部 WebSocket 接口（v0.2 阶段 4）
+## ASR Worker 内部 WebSocket 接口
 
 ASR Worker 使用最终配置中的 `asr.worker_url`，默认地址为 `ws://127.0.0.1:8766/asr`。这是 Voice Server、回放工具和启动探针之间的内部接口，浏览器不会直接连接它。Worker 在 Paraformer 模型加载完成后才开始监听 WebSocket；端口可连接不等于服务已经 READY。
 
