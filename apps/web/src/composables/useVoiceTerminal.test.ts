@@ -151,6 +151,34 @@ describe('useVoiceTerminal', () => {
     expect(terminal.lastSequence.value).toBe(7)
   })
 
+  it('展示后端实际发送给 LLM 的完整上下文', () => {
+    const { socket, terminal } = openTerminal()
+    const turnId = 'turn_context_000001'
+
+    socket.push(envelope('session.state', 1, turnId, {
+      state: 'THINKING',
+      listening: true,
+      can_start: false,
+    }))
+    socket.push(envelope('llm.context', 2, turnId, {
+      message_count: 4,
+      messages: [
+        { role: 'system', content: '你是中文助手。' },
+        { role: 'user', content: '第一句话' },
+        { role: 'assistant', content: '第一句回答' },
+        { role: 'user', content: '第二句话' },
+      ],
+    }))
+
+    expect(terminal.llmContextTurnId.value).toBe(turnId)
+    expect(terminal.llmContext.value).toEqual([
+      { role: 'system', content: '你是中文助手。' },
+      { role: 'user', content: '第一句话' },
+      { role: 'assistant', content: '第一句回答' },
+      { role: 'user', content: '第二句话' },
+    ])
+  })
+
   it('原样保存后端 latency，并把完成轮次限制为最近 10 轮', () => {
     const { socket, terminal } = openTerminal()
     const firstTurn = 'turn_000001'

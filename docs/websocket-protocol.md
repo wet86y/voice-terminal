@@ -213,6 +213,28 @@ ERROR
 }
 ```
 
+### `llm.context`
+
+在发起 DeepSeek 请求前推送本轮实际使用的完整 messages。该事件用于本地调试和 WebUI 展示，内容与发给 LLM 的请求上下文一致；前端不得自行根据历史记录重新拼接。
+
+```json
+{
+  "type": "llm.context",
+  "seq": 6,
+  "timestamp": "2026-09-04T08:30:03.450Z",
+  "turn_id": "turn_000021",
+  "payload": {
+    "message_count": 4,
+    "messages": [
+      {"role": "system", "content": "你是本地实时语音终端的中文助手。"},
+      {"role": "user", "content": "第一句话"},
+      {"role": "assistant", "content": "第一句回答"},
+      {"role": "user", "content": "第二句话"}
+    ]
+  }
+}
+```
+
 ### `tts.status`
 
 推送 TTS 等待文本、TTS 状态和播放器音频缓冲。
@@ -342,6 +364,7 @@ ERROR
 - `subscribe` 是连接建立后的初始化命令；后端应返回可直接渲染的 `runtime.snapshot`，不要要求浏览器补默认服务状态。
 - 新一轮开始时，所有当前轮事件使用同一个新 `turn_id`；上一轮迟到事件必须可以被前端安全丢弃。
 - `transcript.partial` 发送当前完整 partial 文本，`assistant.delta` 才是需要由前端顺序拼接的文本增量。
+- `llm.context` 发送本轮请求实际使用的完整 messages；前端只展示，不重新拼接或修改。
 - `tts.status.audio_buffer_ms` 和 `latency.snapshot.payload.values` 都是后端测量/维护的只读结果，不应要求浏览器回传开始时间或音频时间戳。
 - `turn.completed` 应包含完整 transcript、response 和最终 latency；这是前端写入历史的唯一事件。
 - 发生不可恢复错误时发送 `error`，并在状态已改变时同步发送 `session.state`；不要依赖浏览器自行推断 `ERROR`。

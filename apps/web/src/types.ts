@@ -76,6 +76,16 @@ export interface AssistantDeltaPayload {
   text_delta: string
 }
 
+export interface LlmContextMessage {
+  role: string
+  content: string
+}
+
+export interface LlmContextPayload {
+  messages: LlmContextMessage[]
+  message_count: number
+}
+
 export interface TtsStatusPayload {
   provider: string
   status: string
@@ -107,6 +117,7 @@ export type ServerMessageType =
   | 'transcript.partial'
   | 'transcript.final'
   | 'assistant.delta'
+  | 'llm.context'
   | 'tts.status'
   | 'latency.snapshot'
   | 'turn.completed'

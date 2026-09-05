@@ -3,6 +3,7 @@ import type {
   CommandName,
   ConnectionState,
   CurrentTurnSnapshot,
+  LlmContextMessage,
   LatencySnapshotPayload,
   LatencyValues,
   RuntimeSnapshotPayload,
@@ -124,6 +125,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const currentLatencyComplete = ref(false)
   const services = reactive<ServiceStatuses>(createOfflineStatuses())
   const recentTurns = ref<TurnRecord[]>([])
+  const llmContext = ref<LlmContextMessage[]>([])
+  const llmContextTurnId = ref<string | null>(null)
   const lastServerTimestamp = ref<string | null>(null)
   const lastSequence = ref<number | null>(null)
 
@@ -235,6 +238,20 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     }
   }
 
+  function applyLlmContext(payload: unknown, turnId: string | null) {
+    if (!acceptsCurrentTurn(turnId)) return
+    if (!isRecord(payload) || !Array.isArray(payload.messages)) return
+
+    const messages: LlmContextMessage[] = []
+    for (const item of payload.messages) {
+      if (!isRecord(item)) continue
+      if (typeof item.role !== 'string' || typeof item.content !== 'string') continue
+      messages.push({ role: item.role, content: item.content })
+    }
+    llmContext.value = messages
+    llmContextTurnId.value = turnId
+  }
+
   function handleMessage(raw: unknown) {
     const message = parseServerMessage(raw)
     if (!message) {
@@ -274,6 +291,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
           const textDelta = readString(payload, 'text_delta')
           if (textDelta !== null) current.assistant_text += textDelta
         }
+        break
+      case 'llm.context':
+        applyLlmContext(payload, message.turn_id)
         break
       case 'tts.status':
         if (acceptsCurrentTurn(message.turn_id)) {
@@ -388,6 +408,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     currentLatencyComplete,
     services,
     recentTurns,
+    llmContext,
+    llmContextTurnId,
     lastServerTimestamp,
     lastSequence,
     webSocketUrl,

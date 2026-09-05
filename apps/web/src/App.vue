@@ -10,7 +10,7 @@ onBeforeUnmount(() => terminal.dispose())
 
 const stateLabels: Record<string, string> = {
   STARTING: '启动中',
-  IDLE: '等待唤醒',
+  IDLE: '待机',
   LISTENING: '正在听',
   FINALIZING: '确认结束',
   THINKING: '等待回答',
@@ -141,7 +141,7 @@ function statusClass(status: string) {
             <span class="live-copy-label">CURRENT TURN</span>
             <strong>{{ currentTurnLabel }}</strong>
           </div>
-          <p>{{ terminal.listening ? '后端正在持续监听，KWS / VAD / ASR 由服务端处理。' : '点击下方按钮启动后端持续监听。' }}</p>
+          <p>{{ terminal.listening ? '后端正在持续监听，VAD / ASR 由服务端处理；开始监听后会直接进入当前语音轮。' : '点击下方按钮启动后端持续监听。' }}</p>
         </div>
 
         <button
@@ -275,6 +275,25 @@ function statusClass(status: string) {
           </div>
         </div>
         <div v-else class="empty-state">等待后端完成第一轮对话…</div>
+      </article>
+
+      <article class="panel context-panel">
+        <div class="panel-heading compact-heading">
+          <div>
+            <span class="section-index">07 / LLM CONTEXT</span>
+            <h2>实际发送给模型的上下文</h2>
+          </div>
+          <span class="context-meta">{{ terminal.llmContextTurnId || '等待 LLM 请求' }}</span>
+        </div>
+
+        <div v-if="terminal.llmContext.length" class="context-list">
+          <div v-for="(message, index) in terminal.llmContext" :key="`${terminal.llmContextTurnId}-${index}`" class="context-row">
+            <span class="context-role">{{ message.role }}</span>
+            <p>{{ message.content }}</p>
+          </div>
+        </div>
+        <div v-else class="empty-state context-empty">等待下一轮 LLM 请求…</div>
+        <p class="context-note">这里展示本轮请求实际使用的 system、历史 user/assistant 消息和当前 user 消息；不是前端自行拼接的摘要。</p>
       </article>
     </section>
 

@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class VadError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class VadActivity:
+    is_speech: bool
+    speech_started: bool
+    speech_ended: bool
+
+
+class FsmnVadDetector:
+    """Thin adapter around FunASR's streaming FSMN-VAD model."""
+
+    def __init__(self, *, model_dir: Path, device: str = "cpu", sample_rate: int = 16000) -> None:
+        self.model_dir = model_dir
+        self.device = device
+        self.sample_rate = sample_rate
+        self._cache: dict[str, Any] = {}
+        self._active = False
+        # AudioCapture emits 20 ms blocks, while the FSMN-VAD frontend needs
+        # a larger streaming window to produce aligned feature frames.  Keep
+        # the model window independent from the capture block size and let the
+        # FunASR cache carry the remainder between calls.
+        self._model_chunk_ms = 200
+        self._feed_count = 0
+        try:
+            import numpy as np  # type: ignore
+            from funasr import AutoModel  # type: ignore
+        except ImportError as exc:
+            raise VadError("缺少 numpy/funasr，请先运行 scripts\\setup.ps1。") from exc
+
+        self._np = np
+        try:
+            self._model = AutoModel(
+                model=str(model_dir),
+                device=device,
+                disable_update=True,
+                disable_pbar=True,
+            )
+        except Exception as exc:
+            raise VadError(f"FSMN-VAD 模型初始化失败：{exc}") from exc
+
+    def reset(self) -> None:
+        self._cache = {}
+        self._active = False
+        self._feed_count = 0
+
+    @staticmethod
+    def _segments(result: Any) -> list[Any]:
+        if not isinstance(result, list):
+            return []
+        segments: list[Any] = []
+        for item in result:
+            if isinstance(item, dict):
+                value = item.get("value")
+                if isinstance(value, list):
+                    segments.extend(value)
+        return segments
+
+    def feed(self, pcm: bytes, *, is_final: bool = False) -> VadActivity:
+        if len(pcm) % 2:
+            pcm = pcm[:-1]
+        audio = self._np.frombuffer(pcm, dtype=self._np.int16).astype(self._np.float32) / 32768.0
+        self._feed_count += 1
+        input_rms = float(self._np.sqrt(self._np.mean(audio * audio))) if audio.size else 0.0
+        input_peak = float(self._np.max(self._np.abs(audio))) if audio.size else 0.0
+        try:
+            result = self._model.generate(
+                input=audio,
+                cache=self._cache,
+                is_final=is_final,
+                chunk_size=self._model_chunk_ms,
+                is_streaming_input=True,
+            )
+        except Exception as exc:
+            raise VadError(f"FSMN-VAD 推理失败：{exc}") from exc
+
+        segments = self._segments(result)
+        has_open_segment = any(
+            isinstance(segment, (list, tuple))
+            and len(segment) >= 2
+            and segment[1] in (-1, None)
+            for segment in segments
+        )
+        has_closed_segment = any(
+            isinstance(segment, (list, tuple))
+            and len(segment) >= 2
+            and segment[1] not in (-1, None)
+            for segment in segments
+        )
+        was_active = self._active
+        # In FunASR streaming mode an empty ``value`` means "no new VAD
+        # event".  It must not clear the active speech state.  A start event
+        # opens the segment; an end event or explicit finalization closes it.
+        speech_started = (has_open_segment or has_closed_segment) and not was_active
+        speech_ended = (
+            (has_closed_segment or is_final)
+            and not has_open_segment
+            and (was_active or has_closed_segment)
+        )
+        if has_open_segment and not has_closed_segment:
+            self._active = True
+        elif has_closed_segment or is_final:
+            self._active = False
+        open_segment = self._active
+        if self._feed_count == 1 or self._feed_count % 50 == 0 or segments or speech_started or speech_ended or is_final:
+            logger.info(
+                "vad.progress feed=%d pcm_bytes=%d rms=%.5f peak=%.5f final=%s segments=%s open=%s closed=%s started=%s ended=%s cache_keys=%s",
+                self._feed_count,
+                len(pcm),
+                input_rms,
+                input_peak,
+                is_final,
+                segments,
+                open_segment,
+                has_closed_segment,
+                speech_started,
+                speech_ended,
+                sorted(self._cache.keys()),
+            )
+        return VadActivity(
+            is_speech=open_segment,
+            speech_started=speech_started,
+            speech_ended=speech_ended,
+        )

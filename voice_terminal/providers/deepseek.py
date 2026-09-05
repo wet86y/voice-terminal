@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import AsyncIterator, Mapping, Sequence
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class DeepSeekError(RuntimeError):
+    pass
+
+
+class DeepSeekClient:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        api_key: str,
+        timeout_ms: int = 15000,
+        thinking: str = "disabled",
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.timeout_ms = timeout_ms
+        self.thinking = thinking
+
+    def _request_payload(self, messages: Sequence[Mapping[str, str]]) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [dict(message) for message in messages],
+            "stream": True,
+        }
+        if self.thinking == "disabled":
+            payload["thinking"] = {"type": "disabled"}
+        return payload
+
+    async def stream_chat(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        cancel_event: Any = None,
+    ) -> AsyncIterator[str]:
+        if not self.api_key:
+            raise DeepSeekError("未配置 DEEPSEEK_API_KEY")
+        try:
+            import httpx  # type: ignore
+        except ImportError as exc:
+            raise DeepSeekError("缺少 httpx，请先运行 scripts\\setup.ps1。") from exc
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        timeout = httpx.Timeout(self.timeout_ms / 1000, connect=min(5, self.timeout_ms / 1000))
+        logger.info(
+            "deepseek.request_start model=%s messages=%d timeout_ms=%d",
+            self.model,
+            len(messages),
+            self.timeout_ms,
+        )
+        delta_count = 0
+        response_chars = 0
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=self._request_payload(messages),
+                ) as response:
+                    logger.info("deepseek.response_status status=%d", response.status_code)
+                    if response.status_code >= 400:
+                        body = (await response.aread()).decode("utf-8", errors="replace")
+                        logger.error("deepseek.http_error status=%d body=%r", response.status_code, body[:500])
+                        raise DeepSeekError(f"DeepSeek HTTP {response.status_code}: {body[:500]}")
+                    async for line in response.aiter_lines():
+                        if cancel_event is not None and cancel_event.is_set():
+                            return
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            return
+                        try:
+                            parsed = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = parsed.get("choices") if isinstance(parsed, dict) else None
+                        if not isinstance(choices, list) or not choices:
+                            continue
+                        delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                        text = delta.get("content") if isinstance(delta, dict) else None
+                        if isinstance(text, str) and text:
+                            delta_count += 1
+                            response_chars += len(text)
+                            logger.debug(
+                                "deepseek.delta count=%d response_chars=%d text=%r",
+                                delta_count,
+                                response_chars,
+                                text[:120],
+                            )
+                            yield text
+            logger.info("deepseek.request_done deltas=%d response_chars=%d", delta_count, response_chars)
+        except DeepSeekError:
+            raise
+        except Exception as exc:
+            logger.exception("deepseek.request_failed")
+            raise DeepSeekError(f"DeepSeek 请求失败：{exc}") from exc
+
+    async def check(self) -> None:
+        if not self.api_key:
+            raise DeepSeekError("未配置 DEEPSEEK_API_KEY")
+        try:
+            import httpx  # type: ignore
+            timeout = httpx.Timeout(self.timeout_ms / 1000, connect=min(5, self.timeout_ms / 1000))
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(
+                    f"{self.base_url}/models",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                if response.status_code >= 400:
+                    raise DeepSeekError(f"DeepSeek 鉴权检查失败：HTTP {response.status_code}")
+                logger.info("deepseek.check_ok status=%d", response.status_code)
+        except DeepSeekError:
+            raise
+        except Exception as exc:
+            logger.exception("deepseek.check_failed")
+            raise DeepSeekError(f"DeepSeek 鉴权检查失败：{exc}") from exc

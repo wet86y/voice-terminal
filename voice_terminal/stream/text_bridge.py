@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+import time
+
+
+class TextBridge:
+    """Turn LLM deltas into short, speakable text segments."""
+
+    def __init__(
+        self,
+        *,
+        min_chars: int = 8,
+        max_chars: int = 36,
+        max_wait_ms: int = 350,
+        preferred_breaks: str = "。！？；，、",
+        clock=time.monotonic,
+    ) -> None:
+        if min_chars <= 0 or max_chars < min_chars or max_wait_ms <= 0:
+            raise ValueError("文本桥接参数无效")
+        self.min_chars = min_chars
+        self.max_chars = max_chars
+        self.max_wait_ms = max_wait_ms
+        self.preferred_breaks = preferred_breaks
+        self._clock = clock
+        self._buffer = ""
+        self._started_at: float | None = None
+
+    @property
+    def buffer(self) -> str:
+        return self._buffer
+
+    def reset(self) -> None:
+        self._buffer = ""
+        self._started_at = None
+
+    def _flush_at(self, index: int) -> str:
+        value = self._buffer[:index].strip()
+        self._buffer = self._buffer[index:]
+        if self._buffer.strip():
+            self._started_at = self._clock()
+        else:
+            self._started_at = None
+        return value
+
+    def _break_index(self, limit: int) -> int | None:
+        candidates = [index + 1 for index, char in enumerate(self._buffer[:limit]) if char in self.preferred_breaks]
+        if candidates:
+            return max(candidates)
+        whitespace = [index + 1 for index, char in enumerate(self._buffer[:limit]) if char.isspace()]
+        return max(whitespace) if whitespace else None
+
+    def feed(self, text_delta: str) -> list[str]:
+        if not text_delta:
+            return []
+        if self._started_at is None:
+            self._started_at = self._clock()
+        self._buffer += text_delta
+        result: list[str] = []
+
+        while len(self._buffer) >= self.min_chars:
+            break_index = self._break_index(self.max_chars)
+            if break_index is not None:
+                result.append(self._flush_at(break_index))
+                continue
+            if len(self._buffer) >= self.max_chars:
+                result.append(self._flush_at(self.max_chars))
+                continue
+            break
+
+        elapsed_ms = ((self._clock() - self._started_at) * 1000) if self._started_at is not None else 0
+        if self._buffer and elapsed_ms >= self.max_wait_ms and len(self._buffer) >= self.min_chars:
+            result.append(self._flush_at(len(self._buffer)))
+        return [item for item in result if item]
+
+    def finish(self) -> list[str]:
+        if not self._buffer.strip():
+            self.reset()
+            return []
+        value = self._buffer.strip()
+        self.reset()
+        return [value]

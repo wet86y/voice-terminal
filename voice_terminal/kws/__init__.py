@@ -1,0 +1,1 @@
+"""Keyword spotting adapters."""

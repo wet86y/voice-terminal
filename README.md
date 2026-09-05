@@ -7,7 +7,7 @@
 - 页面加载后自动连接 `ws://127.0.0.1:8765/ws`。
 - 页面只有一个主要操作按钮：`开始说话`。
 - 点击后启动后端持续监听，按钮变为 `停止监听`。
-- 麦克风、扬声器、KWS、VAD、Paraformer、LLM、TTS 和播放器均由后端负责。
+- 麦克风、扬声器、VAD、Paraformer、LLM、TTS 和播放器均由后端负责；KWS 作为可选模块保留，当前默认关闭。
 - 当前轮展示 partial/final 转录、LLM 流式回答、TTS 状态和后端音频缓冲。
 - 当前轮展示完整后端延迟，历史保留最近 10 轮。
 - 没有演示模式、实时模式、前端假数据、前端计时器或本地 fallback。
@@ -40,6 +40,49 @@ Voice Server 接入前端时，至少需要满足以下顺序和约束：
 7. 不可恢复故障应发送 `error`，必要时同时发送 `session.state`（`ERROR`）；前端不会替后端切换状态。
 
 完整的字段定义、时序和错误处理见 [docs/websocket-protocol.md](docs/websocket-protocol.md)。
+
+## Windows Voice Server
+
+后端实现位于 `voice_terminal/` 和 `apps/server/`，由 Windows 原生 Python 3.12 运行。真实模型缓存固定为 `D:\模型\voice-terminal`。当前默认 `wake.enabled=false`，点击 `开始说话` 后直接进入 VAD / ASR 语音轮，不再等待 `hei claw`；KWS 模型和关键词配置仍保留，改为 `true` 即可恢复唤醒模式。后端负责麦克风、VAD、ASR Worker、DeepSeek、MiniMax TTS 和 PCM 播放，浏览器仍然只是控制和监控入口。
+
+首次安装（建议显式使用本机 Python 3.12）：
+
+```powershell
+.\scripts\setup.ps1 -Python D:\DevTools\Python312\python.exe
+```
+
+首次配置密钥（推荐写入仓库根目录 `.env.local`，该文件已被 Git 忽略，后端会自动加载）：
+
+```powershell
+@"
+DEEPSEEK_API_KEY=你的_DeepSeek_Key
+MINIMAX_API_KEY=你的_MiniMax_中国区_Token_Plan_Key
+MINIMAX_API_HOST=https://api.minimaxi.com
+VOICE_WAKE_ENABLED=false
+VOICE_LOG_LEVEL=DEBUG
+"@ | Set-Content -Encoding utf8 .env.local
+
+# 也可只在当前 PowerShell 会话中临时设置；进程环境变量优先级更高
+# $env:DEEPSEEK_API_KEY = "..."
+# $env:MINIMAX_API_KEY = "..."
+.\scripts\doctor.ps1 -Python D:\DevTools\Python312\python.exe -Online
+```
+
+启动 ASR Worker 和 Voice Server：
+
+```powershell
+.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe
+```
+
+模型下载是幂等的，失败下载会使用 `.part` 文件，不会把未完成文件当成模型。离线检查只验证本地缓存：
+
+```powershell
+.\scripts\setup.ps1 -Python D:\DevTools\Python312\python.exe -Offline
+```
+
+运行期间的详细日志写入 `logs\voice-server.log` 和 `logs\asr-worker.log`；设置 `VOICE_LOG_LEVEL=DEBUG` 后会额外记录音频进度、VAD、ASR、LLM、TTS 和 turn 生命周期，不会写入 API Key 或原始 PCM。
+
+具体后端模块、模型来源、环境排查和中断语义见 [docs/backend-setup.md](docs/backend-setup.md)。
 
 ## 启动前端
 
@@ -79,12 +122,16 @@ VITE_VOICE_WS_URL=ws://127.0.0.1:8765/ws
 ```text
 voice-terminal/
 ├── apps/
-│   └── web/                       # Vue 控制台
-│       └── src/
-│           ├── App.vue            # 页面布局与只读展示
-│           ├── types.ts           # 前后端协议类型
-│           └── composables/
-│               └── useVoiceTerminal.ts
+│   ├── web/                       # Vue 控制台
+│   │   └── src/
+│   │       ├── App.vue            # 页面布局与只读展示
+│   │       ├── types.ts           # 前后端协议类型
+│   │       └── composables/
+│   │           └── useVoiceTerminal.ts
+│   └── server/                   # Voice Server / ASR Worker 入口
+├── voice_terminal/                # 后端运行时和 provider
+├── config/                        # 默认配置和本地配置示例
+├── scripts/                       # setup / doctor / start
 ├── docs/
 │   ├── v0.1-spec.md               # v0.1 方案边界
 │   └── websocket-protocol.md      # WebSocket 协议
@@ -122,6 +169,7 @@ session.state
 transcript.partial
 transcript.final
 assistant.delta
+llm.context
 tts.status
 latency.snapshot
 turn.completed

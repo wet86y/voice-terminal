@@ -1,0 +1,21 @@
+# Copy this file to config/local.yaml and adjust only local, non-secret settings.
+# API keys belong in .env.local or the process environment.
+
+audio:
+  input_device: "麦克风阵列 (适用于数字麦克风的英特尔® 智音技术)"
+  output_device: "扬声器 (Realtek(R) Audio)"
+
+wake:
+  enabled: false
+  keyword: "hei claw"
+  threshold: 0.25
+
+asr:
+  device: auto
+
+llm:
+  model: deepseek-v4-flash
+
+tts:
+  model: speech-2.8-hd
+  output_format: pcm

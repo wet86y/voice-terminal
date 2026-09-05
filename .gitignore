@@ -6,6 +6,16 @@ dist/
 .env.*
 !.env.example
 
+# Python runtime
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+config/local.yaml
+*.part
+
 # Runtime output
 logs/
 *.log

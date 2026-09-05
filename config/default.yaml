@@ -1,0 +1,71 @@
+model_dir: "D:\\模型\\voice-terminal"
+debug_audio_capture: false
+
+audio:
+  input_device: "麦克风阵列 (适用于数字麦克风的英特尔® 智音技术)"
+  output_device: "扬声器 (Realtek(R) Audio)"
+  sample_rate: 16000
+  channels: 1
+  sample_format: int16
+  block_ms: 20
+  ring_buffer_ms: 2000
+  wake_preroll_ms: 1200
+
+wake:
+  enabled: false
+  provider: sherpa_kws
+  keyword: "hei claw"
+  keyword_label: "HEI_CLAW"
+  threshold: 0.25
+  keywords_score: 1.0
+  num_trailing_blanks: 1
+  device: cpu
+
+vad:
+  model: fsmn-vad
+  min_speech_ms: 250
+  end_silence_ms: 700
+  max_turn_ms: 15000
+
+asr:
+  provider: funasr
+  model: paraformer-zh-streaming
+  device: auto
+  worker_url: ws://127.0.0.1:8766/asr
+  chunk_size: [0, 10, 5]
+  encoder_chunk_look_back: 4
+  decoder_chunk_look_back: 1
+
+llm:
+  provider: deepseek
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  api_key_env: DEEPSEEK_API_KEY
+  stream: true
+  thinking: disabled
+  timeout_ms: 15000
+
+tts:
+  provider: minimax
+  base_url: https://api.minimaxi.com
+  websocket_path: /ws/v1/t2a_v2
+  model: speech-2.8-hd
+  api_key_env: MINIMAX_API_KEY
+  output_format: pcm
+  sample_rate: 32000
+  voice_id: female-shaonv
+  timeout_ms: 15000
+
+text_bridge:
+  min_chars: 8
+  max_chars: 36
+  max_wait_ms: 350
+  preferred_breaks: "。！？；，、"
+
+server:
+  host: 127.0.0.1
+  port: 8765
+
+asr_worker:
+  host: 127.0.0.1
+  port: 8766

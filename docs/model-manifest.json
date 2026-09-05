@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "model_dir": "D:\\模型\\voice-terminal",
+  "required_models": [
+    {
+      "name": "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20",
+      "kind": "kws",
+      "source": "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
+      "relative_path": "kws/sherpa-onnx-kws-zipformer-zh-en-3M",
+      "status": "not_downloaded"
+    },
+    {
+      "name": "paraformer-zh-streaming",
+      "kind": "asr",
+      "source": "ModelScope alias: paraformer-zh-streaming",
+      "relative_path": "funasr/paraformer-zh-streaming",
+      "status": "not_downloaded"
+    },
+    {
+      "name": "fsmn-vad",
+      "kind": "vad",
+      "source": "ModelScope alias: fsmn-vad",
+      "relative_path": "funasr/fsmn-vad",
+      "status": "not_downloaded"
+    }
+  ]
+}

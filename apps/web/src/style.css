@@ -290,6 +290,11 @@ h1 {
   padding: 24px 26px 26px;
 }
 
+.context-panel {
+  grid-column: span 12;
+  padding: 24px 26px 26px;
+}
+
 .panel-heading {
   display: flex;
   align-items: flex-start;
@@ -854,6 +859,59 @@ h2 {
   font-weight: 730;
 }
 
+.context-meta {
+  max-width: 280px;
+  overflow: hidden;
+  color: #8b8d94;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-list {
+  max-height: 360px;
+  margin-top: 26px;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+}
+
+.context-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 16px;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.context-role {
+  color: var(--accent);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 730;
+  text-transform: uppercase;
+}
+
+.context-row p {
+  min-width: 0;
+  color: #555861;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.context-note {
+  margin-top: 16px;
+  color: #999ba2;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.context-empty {
+  padding-bottom: 28px;
+}
+
 .empty-state {
   padding: 62px 0;
   color: #9a9ca3;
@@ -908,7 +966,8 @@ h2 {
   .transcript-panel,
   .response-panel,
   .latency-panel,
-  .history-panel {
+  .history-panel,
+  .context-panel {
     grid-column: span 12;
   }
 
@@ -940,7 +999,8 @@ h2 {
   .transcript-panel,
   .response-panel,
   .latency-panel,
-  .history-panel {
+  .history-panel,
+  .context-panel {
     padding: 19px;
   }
 
