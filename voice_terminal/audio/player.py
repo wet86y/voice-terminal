@@ -222,6 +222,9 @@ class PcmPlayer:
             await asyncio.sleep(0.02)
         if self.buffered_ms > 0:
             raise TimeoutError("PCM playback did not drain before its deadline")
+        with self._queue_lock:
+            key, enqueued, played = self._active_turn, self._enqueued_bytes, self._played_bytes
+        logger.info("audio.player_drained key=%s enqueued_bytes=%d played_bytes=%d", key, enqueued, played)
 
     def stop(self) -> None:
         self.clear()

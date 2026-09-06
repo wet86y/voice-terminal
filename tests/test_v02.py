@@ -27,6 +27,8 @@ from voice_terminal.core.event_bus import EventBus
 from voice_terminal.core.events import event
 from voice_terminal.server.history import InMemoryHistory
 from voice_terminal.vad.detector import VadActivity
+from voice_terminal.providers.minimax_tts import MiniMaxTtsSession
+from types import SimpleNamespace
 
 
 class FakeVad:
@@ -300,6 +302,153 @@ class PrimitiveTests(unittest.TestCase):
 
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_releases_spilled_pcm_and_next_turn_rejects_old_audio(self):
+        c = controller(tts_pacing=True)
+        session = MiniMaxTtsSession(SimpleNamespace(receive_timeout_seconds=120))
+
+        async def start():
+            pass
+
+        async def send(_text):
+            session._store_audio(b"\x01\x00" * (5 * 1024 * 1024))
+
+        session.start, session.send_text = start, send
+        c.tts = SimpleNamespace(session=lambda: session)
+        task = None
+        try:
+            await begin(c)
+            ws = c.workspace
+            ws.final_text = ws.paraformer_final = "测试停止"
+            ws.committed = True
+            task = c._completion_task = asyncio.create_task(c._answer(ws, ws.token))
+            for _ in range(100):
+                if c.player.buffered_ms > 0:
+                    break
+                await asyncio.sleep(.01)
+            cache = session._audio
+            self.assertTrue(cache._rolled)
+            c.player._callback(bytearray(1280), 640, None, None)
+            await c.stop_listening()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 1)
+            self.assertTrue(cache.closed)
+            self.assertEqual(c.player.buffered_ms, 0)
+            await begin(c)
+            c.player.allow(c.workspace.playback_key)
+            c.player.enqueue(ws.playback_key, b"\x01\x00" * 1024)
+            self.assertEqual(c.player.buffered_ms, 0)
+        finally:
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await c.close()
+
+    async def test_network_spool_is_counted_before_player_consumes_it(self):
+        c = controller(tts_pacing=True, tts_lead_ms=2000)
+        network = asyncio.Queue()
+        sent = []
+
+        class Socket:
+            async def recv(self):
+                return json.dumps(await network.get())
+
+            async def close(self):
+                pass
+
+        session = MiniMaxTtsSession(SimpleNamespace(receive_timeout_seconds=1))
+        session._socket = Socket()
+
+        async def start():
+            session._receiver = asyncio.create_task(session._receive_loop())
+
+        async def send(text):
+            sent.append(text)
+            # A fast provider returns eight seconds in small packets while
+            # the player only accepts about two seconds. The hidden six
+            # seconds must prevent the next text from being sent.
+            for _ in range(250):
+                network.put_nowait({"data": {"audio": (b"\x01\x00" * 1024).hex()}})
+            network.put_nowait({"event": "task_continued", "is_final": True})
+
+        async def finish():
+            network.put_nowait({"event": "task_finished"})
+
+        session.start, session.send_text, session.finish = start, send, finish
+        c.tts = SimpleNamespace(session=lambda: session)
+
+        async def answer(*_args):
+            yield "第一段回答内容很长。"
+            yield "第二段回答内容很长。"
+
+        c.agent.answer = answer
+        task = None
+        try:
+            await begin(c)
+            ws = c.workspace
+            ws.final_text = ws.paraformer_final = "测试长语音"
+            ws.committed = True
+            task = asyncio.create_task(c._answer(ws, ws.token))
+            for _ in range(200):
+                if c.state.current["tts_returned_ms"] == 8000:
+                    break
+                await asyncio.sleep(.01)
+            self.assertEqual(c.state.current["tts_returned_ms"], 8000)
+            self.assertLess(c.player.buffered_ms, 2100)
+            self.assertEqual(len(sent), 1)
+            # Drain on an accelerated device clock, checking pacing before
+            # the second sentence is released.
+            while not task.done():
+                c.player._callback(bytearray(64000), 32000, None, None)
+                await asyncio.sleep(.025)
+                if c.player.played_ms < 6000:
+                    self.assertEqual(len(sent), 1)
+            await task
+            self.assertEqual(len(sent), 2)
+            self.assertEqual(c.player.played_ms, 16000)
+            self.assertEqual(c.state.current["tts_status"], "FINISHED")
+            self.assertTrue(session.server_finished)
+        finally:
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await c.close()
+
+    async def test_transport_failure_drains_twenty_seconds_of_cached_audio(self):
+        c = controller()
+        session = MiniMaxTtsSession(SimpleNamespace())
+
+        async def start():
+            pass
+
+        async def send(_text):
+            session._store_audio(b"\x01\x00" * (32000 * 20))
+            session._error = RuntimeError("synthetic close with cached PCM")
+            session._finished.set()
+            session._audio_available.set()
+            raise session._error
+
+        session.start, session.send_text = start, send
+        c.tts = SimpleNamespace(session=lambda: session)
+        task = None
+        try:
+            await begin(c)
+            ws = c.workspace
+            ws.final_text = ws.paraformer_final = "测试长语音"
+            ws.committed = True
+            task = asyncio.create_task(c._answer(ws, ws.token))
+            # Real-time consumption exercises the former 15-second failure
+            # deadline, without network or physical audio dependencies.
+            while not task.done():
+                c.player._callback(bytearray(6400), 3200, None, None)
+                await asyncio.sleep(.1)
+            self.assertEqual(await task, "已理解。")
+            self.assertEqual(c.player.played_ms, 20000)
+            self.assertEqual(c.state.current["tts_status"], "DEGRADED")
+        finally:
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await c.close()
+
     async def test_tts_transport_failure_does_not_truncate_completed_llm_text(self):
         c = controller()
         c.tts = FailingTts()

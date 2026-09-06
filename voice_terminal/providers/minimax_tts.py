@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -12,15 +13,21 @@ class MiniMaxTtsError(RuntimeError):
     pass
 
 
-_AUDIO_END = object()
-
-
 class MiniMaxTtsSession:
     def __init__(self, client: "MiniMaxTtsClient") -> None:
         self.client = client
         self._socket: Any = None
         self._receiver: asyncio.Task[None] | None = None
-        self._audio: asyncio.Queue[bytes | object] = asyncio.Queue(maxsize=64)
+        # One event-loop owns the file and its independent read/write offsets.
+        # Receiving never waits for playback; long answers spill to disk.
+        self._audio = None
+        self._read_offset = 0
+        self._cache_peak_bytes = 0
+        self._audio_available = asyncio.Event()
+        self._closed = False
+        self._server_finished = False
+        self._completed_segments = 0
+        self._segment_available = asyncio.Event()
         self._finished = asyncio.Event()
         self._started = False
         self._error: Exception | None = None
@@ -29,6 +36,50 @@ class MiniMaxTtsSession:
         self._audio_chunks_received = 0
         self._audio_bytes_received = 0
         self._last_event: str | None = None
+
+    @property
+    def received_bytes(self) -> int:
+        return self._audio_bytes_received
+
+    @property
+    def server_finished(self) -> bool:
+        return self._server_finished
+
+    @property
+    def receive_finished(self) -> bool:
+        return self._finished.is_set()
+
+    @property
+    def completed_segments(self) -> int:
+        return self._completed_segments
+
+    async def wait_for_segment(self, previous_count: int) -> None:
+        """Wait for this text's is_final, never infer it from another PCM chunk."""
+        while self.completed_segments <= previous_count:
+            if self._error is not None:
+                raise self._error
+            if self.receive_finished or self._closed:
+                raise MiniMaxTtsError("MiniMax TTS 未确认当前文本分段完成")
+            self._segment_available.clear()
+            await asyncio.wait_for(self._segment_available.wait(), self.client.receive_timeout_seconds)
+
+    def _store_audio(self, pcm: bytes) -> None:
+        try:
+            if self._audio is None:
+                self._audio = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+            self._audio.seek(self._audio_bytes_received)
+            if self._audio.write(pcm) != len(pcm):
+                raise OSError("short PCM cache write")
+        except Exception as exc:
+            raise MiniMaxTtsError(f"MiniMax 音频缓存写入失败：{exc}") from exc
+        self._audio_bytes_received += len(pcm)
+        self._cache_peak_bytes = max(self._cache_peak_bytes, self.received_bytes - self._read_offset)
+        self._audio_available.set()
+
+    def _release_audio(self) -> None:
+        if self._audio is not None:
+            self._audio.close()
+            self._audio = None
 
     async def start(self) -> None:
         try:
@@ -118,7 +169,6 @@ class MiniMaxTtsSession:
     async def _receive_loop(self) -> None:
         audio_chunks = 0
         audio_bytes = 0
-        cancelled = False
         try:
             while self._socket is not None:
                 parsed = self._parse(await asyncio.wait_for(self._socket.recv(), self.client.receive_timeout_seconds))
@@ -140,47 +190,41 @@ class MiniMaxTtsSession:
                 if isinstance(data, dict) and isinstance(data.get("audio"), str) and data["audio"]:
                     try:
                         pcm = self._decode_audio(data["audio"])
+                        self._store_audio(pcm)
                         audio_chunks += 1
                         audio_bytes += len(pcm)
                         self._audio_chunks_received = audio_chunks
-                        self._audio_bytes_received = audio_bytes
                         logger.debug(
                             "minimax.audio_chunk encoding=hex count=%d bytes=%d total_bytes=%d",
                             audio_chunks,
                             len(pcm),
                             audio_bytes,
                         )
-                        await self._audio.put(pcm)
                     except Exception as exc:
-                        self._error = MiniMaxTtsError(f"MiniMax 音频解码失败：{exc}")
-                        logger.exception("minimax.audio_decode_failed")
+                        self._error = exc
+                        logger.exception("minimax.audio_buffer_failed")
                         break
-                if event == "task_finished" or parsed.get("is_final") is True:
-                    if event == "task_finished":
-                        break
+                if parsed.get("is_final") is True:
+                    self._completed_segments += 1
+                    self._segment_available.set()
+                    logger.debug("minimax.segment_finished count=%d", self.completed_segments)
+                if event == "task_finished":
+                    self._server_finished = True
+                    break
         except asyncio.CancelledError:
-            cancelled = True
+            self._error = MiniMaxTtsError("MiniMax TTS 接收已取消，未确认任务完成")
             raise
         except Exception as exc:
-            # Some gateways close the connection without a WebSocket close
-            # frame immediately after delivering all audio for a finished
-            # task.  If task_finish was sent and at least one PCM packet was
-            # received, preserve the completed audio and surface a warning;
-            # a timeout, pre-finish close, or zero-audio close remains an
-            # actual TTS failure.
-            is_connection_close = "ConnectionClosed" in type(exc).__name__
-            if self._finish_requested and audio_chunks and is_connection_close:
-                logger.warning("minimax.receive_closed_after_audio chunks=%d bytes=%d error=%s", audio_chunks, audio_bytes, exc)
-            else:
-                self._error = MiniMaxTtsError(f"MiniMax TTS 接收失败：{exc}")
-                logger.exception("minimax.receive_failed")
+            self._error = MiniMaxTtsError(f"MiniMax TTS 接收失败（未收到 task_finished）：{exc}")
+            logger.exception("minimax.receive_failed")
         finally:
             self._finished.set()
-            if cancelled:
-                while not self._audio.empty():
-                    self._audio.get_nowait()
-            await self._audio.put(_AUDIO_END)
-            logger.info("minimax.receive_done audio_chunks=%d audio_bytes=%d", audio_chunks, audio_bytes)
+            self._audio_available.set()
+            self._segment_available.set()
+            logger.info(
+                "minimax.receive_done audio_chunks=%d audio_bytes=%d server_finished=%s cache_peak_bytes=%d error=%s",
+                audio_chunks, audio_bytes, self.server_finished, self._cache_peak_bytes, self._error,
+            )
 
     async def send_text(self, text: str) -> None:
         if not self._started or self._socket is None:
@@ -196,48 +240,59 @@ class MiniMaxTtsSession:
         logger.info("minimax.task_continue chars=%d text=%r", len(text), text[:120])
 
     async def finish(self) -> None:
+        if self.server_finished:
+            return
+        if self._error is not None:
+            raise self._error
         if self._socket is None:
             return
-        # Set this before the network write.  A gateway may close the socket
-        # while the task_finish frame is in flight; the receiver can then
-        # preserve already delivered PCM instead of reporting a false turn
-        # failure.
         self._finish_requested = True
         async with self._send_lock:
-            try:
-                await self._socket.send(json.dumps({"event": "task_finish"}))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if "ConnectionClosed" in type(exc).__name__ and self._audio_chunks_received:
-                    logger.warning(
-                        "minimax.finish_closed_after_audio chunks=%d bytes=%d error=%s",
-                        self._audio_chunks_received,
-                        self._audio_bytes_received,
-                        exc,
-                    )
-                    return
-                raise
+            await self._socket.send(json.dumps({"event": "task_finish"}))
         logger.info("minimax.task_finish_sent")
 
     async def audio_chunks(self):
-        while True:
-            item = await self._audio.get()
-            if item is _AUDIO_END:
-                if self._error:
-                    raise self._error
-                return
-            yield item  # type: ignore[misc]
+        try:
+            while not self._closed:
+                if self._read_offset < self.received_bytes:
+                    try:
+                        self._audio.seek(self._read_offset)
+                        pcm = self._audio.read(min(2048, self.received_bytes - self._read_offset))
+                        if not pcm:
+                            raise OSError("unexpected end of PCM cache")
+                    except Exception as exc:
+                        raise MiniMaxTtsError(f"MiniMax 音频缓存读取失败：{exc}") from exc
+                    self._read_offset += len(pcm)
+                    yield pcm
+                elif self.receive_finished:
+                    if self._error:
+                        raise self._error
+                    if not self.server_finished:
+                        raise MiniMaxTtsError("MiniMax TTS 未收到 task_finished")
+                    return
+                else:
+                    self._audio_available.clear()
+                    await self._audio_available.wait()
+        finally:
+            if self.receive_finished or self._closed:
+                self._release_audio()
 
     async def close(self) -> None:
+        self._closed = True
         receiver, self._receiver = self._receiver, None
-        if receiver is not None:
-            receiver.cancel()
-            await asyncio.gather(receiver, return_exceptions=True)
         socket, self._socket = self._socket, None
-        if socket is not None:
-            await socket.close()
-        logger.info("minimax.closed")
+        try:
+            if receiver is not None:
+                receiver.cancel()
+                await asyncio.gather(receiver, return_exceptions=True)
+            if socket is not None:
+                await socket.close()
+        finally:
+            self._finished.set()
+            self._audio_available.set()
+            self._segment_available.set()
+            self._release_audio()
+            logger.info("minimax.closed received_bytes=%d consumed_bytes=%d", self.received_bytes, self._read_offset)
 
 
 class MiniMaxTtsClient:

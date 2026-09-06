@@ -734,7 +734,10 @@ class RealtimeController(TurnController):
             self.player.allow(playback_key)
 
         def playback_progress() -> dict[str, int | bool | str | None]:
-            returned_ms = int(audio_returned_bytes * 1000 / audio_bytes_per_second)
+            # The provider may have received far more than the player has
+            # consumed from audio_chunks(). Include its entire PCM spool.
+            received_bytes = max(audio_returned_bytes, getattr(session, "received_bytes", 0))
+            returned_ms = int(received_bytes * 1000 / audio_bytes_per_second)
             if self.player is None:
                 played_ms = 0
                 queued_ms = 0
@@ -816,8 +819,8 @@ class RealtimeController(TurnController):
                     ws.timings.setdefault("first_audio", time.monotonic())
                     if self.player:
                         # Keep the native player bounded.  Audio held by the
-                        # provider queue is still included in
-                        # ``audio_remaining_ms`` through audio_returned_bytes.
+                        # provider spool is included in audio_remaining_ms
+                        # through the session's network receive counter.
                         while self.player.buffered_ms > 2000:
                             await asyncio.sleep(.02)
                             if not self._valid(token):
@@ -918,6 +921,7 @@ class RealtimeController(TurnController):
                     if receiver_error is not None:
                         raise receiver_error
                     before_bytes = audio_returned_bytes
+                    before_segments = getattr(session, "completed_segments", 0)
                     ws.timings.setdefault("first_tts_text", time.monotonic())
                     self.state.current["tts_text"] = segment
                     await session.send_text(segment)
@@ -928,11 +932,14 @@ class RealtimeController(TurnController):
                         force=True,
                     )
                     sent_any = True
-                    # Do not send every ready segment while the first one is
-                    # still being synthesized.  One audio return reopens the
-                    # playback-window check and prevents a fast LLM from
-                    # flooding task_continue frames.
-                    await wait_for_audio(before_bytes)
+                    # A PCM chunk can belong to earlier text. Wait for the
+                    # current segment's final response before evaluating the
+                    # total playback backlog and releasing another segment.
+                    wait_for_segment = getattr(session, "wait_for_segment", None)
+                    if pacing_enabled and wait_for_segment is not None:
+                        await wait_for_segment(before_segments)
+                    else:
+                        await wait_for_audio(before_bytes)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1020,20 +1027,22 @@ class RealtimeController(TurnController):
                     tts_disabled = True
                     logger.warning("controller.tts_finish_degraded turn_id=%s error=%s", ws.turn_id, exc)
                 if reader is not None:
-                    # MiniMax documents a 120-second receive idle window.  A
-                    # fixed 60-second answer deadline could cut a legitimate
-                    # long response; scale the wait with the text while
-                    # retaining a finite upper bound for cleanup.
-                    answer_timeout = min(600.0, max(120.0, 30.0 + len(ws.staged_response) * 0.25))
-                    # Once the sender/receiver has reported a transport
-                    # failure there is no reason to wait through the full
-                    # provider idle window.  Give already queued PCM a short
-                    # grace period, then finish with a visible DEGRADED
-                    # status.  A healthy session still gets the full dynamic
-                    # deadline above so long answers are not clipped.
-                    reader_timeout = min(answer_timeout, 15.0) if tts_failed is not None else answer_timeout
                     try:
-                        await asyncio.wait_for(reader, reader_timeout)
+                        # Bound stalls, not the duration of a long answer.
+                        # Even after a send failure all cached PCM must drain.
+                        reader_progress_marker = None
+                        deadline = asyncio.get_running_loop().time() + 120.0
+                        while not reader.done():
+                            snapshot = playback_progress()
+                            progress = (snapshot["returned_ms"], snapshot["played_ms"])
+                            now = asyncio.get_running_loop().time()
+                            if progress != reader_progress_marker:
+                                reader_progress_marker = progress
+                                deadline = now + max(120.0, float(snapshot["remaining_ms"]) / 1000 + 30.0)
+                            if now >= deadline:
+                                raise TimeoutError("TTS 接收或播放长时间没有进展")
+                            await asyncio.wait({reader}, timeout=.2)
+                        await reader
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -1041,7 +1050,7 @@ class RealtimeController(TurnController):
                         tts_disabled = True
                         logger.warning("controller.tts_receive_degraded turn_id=%s error=%s", ws.turn_id, exc)
             if self.player:
-                playback_timeout = min(600.0, max(120.0, 30.0 + len(ws.staged_response) * 0.25 + self.player.buffered_ms / 1000))
+                playback_timeout = max(120.0, 30.0 + self.player.buffered_ms / 1000)
                 try:
                     await self.player.wait_until_empty(timeout_seconds=playback_timeout)
                 except asyncio.CancelledError:
@@ -1079,11 +1088,12 @@ class RealtimeController(TurnController):
             if sender_task and not sender_task.done():
                 sender_task.cancel()
                 await asyncio.gather(sender_task, return_exceptions=True)
-            if reader and not reader.done():
-                reader.cancel()
-                self._track(reader)
+            if reader:
+                if not reader.done():
+                    reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
             if session:
-                self._track(asyncio.create_task(session.close()))
+                await session.close()
 
     def _on_playback_started(self, key: str) -> None:
         ws = self.workspace

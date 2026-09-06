@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import patch
 import unittest
+from types import SimpleNamespace
 
 import voice_terminal.controller.turn_controller as turn_controller_module
 from voice_terminal.audio.capture import AudioCapture
+from voice_terminal.audio.player import PcmPlayer
+from voice_terminal.providers.minimax_tts import MiniMaxTtsSession
 from voice_terminal.controller.turn_controller import TurnController
 from voice_terminal.core.event_bus import EventBus
 from voice_terminal.core.state import RuntimeState, TerminalState
@@ -91,6 +94,47 @@ def make_controller(*, capture: FakeCapture | None, asr: FakeAsr, vad: FakeVad) 
 
 
 class TurnControllerRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tts_failure_preserves_full_text_and_drains_long_audio(self):
+        c = make_controller(capture=None, asr=FakeAsr(), vad=FakeVad())
+        c._loop = asyncio.get_running_loop()
+        c.player = PcmPlayer(sample_rate=32000, channels=1, output_device=None)
+        session = MiniMaxTtsSession(SimpleNamespace())
+
+        async def stream_chat(*_args, **_kwargs):
+            yield "第一段回答内容很长。"
+            yield "第二段仍然应当完整保留。"
+
+        async def start():
+            pass
+
+        async def send(_text):
+            session._store_audio(b"\x01\x00" * (32000 * 20))
+            session._error = RuntimeError("synthetic close")
+            session._finished.set()
+            raise session._error
+
+        session.start, session.send_text = start, send
+        c.llm = SimpleNamespace(stream_chat=stream_chat)
+        c.tts = SimpleNamespace(session=lambda: session)
+        deadlines = []
+
+        async def drain(timeout_seconds=10):
+            deadlines.append(timeout_seconds)
+            self.assertGreaterEqual(timeout_seconds, c.player.buffered_ms / 1000 + 30)
+            c.player._callback(bytearray(32000 * 20 * 2), 32000 * 20, None, None)
+
+        c.player.wait_until_empty = drain
+        try:
+            await c._begin_turn(initial_speech=True)
+            response = await c._run_llm_and_tts(c.turns.current, "测试")
+            self.assertEqual(response, "第一段回答内容很长。第二段仍然应当完整保留。")
+            self.assertEqual(c.player.played_ms, 20000)
+            self.assertEqual(c.state.current["tts_status"], "DEGRADED")
+            self.assertTrue(deadlines)
+            self.assertIsNone(session._audio)
+        finally:
+            await c.close()
+
     async def test_asr_final_timeout_releases_turn_and_returns_to_idle(self) -> None:
         asr = FakeAsr()
         controller = make_controller(capture=None, asr=asr, vad=FakeVad())

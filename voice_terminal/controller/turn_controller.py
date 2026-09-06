@@ -605,6 +605,7 @@ class TurnController:
         bridge = TextBridge(**self.bridge_options)
         tts_session: MiniMaxTtsSession | None = None
         tts_reader: asyncio.Task[None] | None = None
+        tts_failed: Exception | None = None
 
         async def consume_audio(session: MiniMaxTtsSession) -> None:
             audio_chunks = 0
@@ -646,33 +647,39 @@ class TurnController:
                     await self._state_event(TerminalState.SPEAKING, listening=True, turn_id=turn_id)
 
         async def send_segments(segments: list[str]) -> None:
-            nonlocal tts_session, tts_reader
-            if not segments or self.tts is None:
+            nonlocal tts_session, tts_reader, tts_failed
+            if not segments or self.tts is None or tts_failed is not None:
                 return
-            if tts_session is None:
-                logger.info("controller.tts_start turn_id=%s", turn_id)
-                tts_session = self.tts.session()
-                await tts_session.start()
-                self._tts_session = tts_session
-                tts_reader = asyncio.create_task(consume_audio(tts_session), name=f"tts-audio-{turn_id}")
-            for segment in segments:
-                if not self.turns.is_current(turn_id):
-                    return
-                logger.info("controller.tts_segment turn_id=%s chars=%d text=%r", turn_id, len(segment), segment[:120])
-                self.state.current["tts_text"] = segment
-                self._metrics[turn_id].first_tts_text_at = self._metrics[turn_id].first_tts_text_at or time.monotonic()
-                await tts_session.send_text(segment)
-                await self._publish_latency(turn_id)
-                await self._publish(
-                    event(
-                        "tts.status",
-                        turn_id,
-                        provider="minimax",
-                        status="QUEUED",
-                        waiting_text=segment,
-                        audio_buffer_ms=self.player.buffered_ms if self.player else 0,
+            try:
+                if tts_session is None:
+                    logger.info("controller.tts_start turn_id=%s", turn_id)
+                    tts_session = self.tts.session()
+                    await tts_session.start()
+                    self._tts_session = tts_session
+                    tts_reader = asyncio.create_task(consume_audio(tts_session), name=f"tts-audio-{turn_id}")
+                for segment in segments:
+                    if not self.turns.is_current(turn_id):
+                        return
+                    logger.info("controller.tts_segment turn_id=%s chars=%d text=%r", turn_id, len(segment), segment[:120])
+                    self.state.current["tts_text"] = segment
+                    self._metrics[turn_id].first_tts_text_at = self._metrics[turn_id].first_tts_text_at or time.monotonic()
+                    await tts_session.send_text(segment)
+                    await self._publish_latency(turn_id)
+                    await self._publish(
+                        event(
+                            "tts.status",
+                            turn_id,
+                            provider="minimax",
+                            status="QUEUED",
+                            waiting_text=segment,
+                            audio_buffer_ms=self.player.buffered_ms if self.player else 0,
+                        )
                     )
-                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                tts_failed = exc
+                logger.warning("controller.tts_degraded turn_id=%s error=%s", turn_id, exc)
 
         try:
             async for delta in self.llm.stream_chat(request_messages, cancel_event=self._turn_cancel):
@@ -707,25 +714,42 @@ class TurnController:
                     len(response),
                 )
             if tts_session is not None:
-                logger.info("controller.tts_finish turn_id=%s", turn_id)
-                await tts_session.finish()
+                try:
+                    await tts_session.finish()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    tts_failed = tts_failed or exc
                 if tts_reader is not None:
-                    await tts_reader
+                    try:
+                        await tts_reader
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        tts_failed = tts_failed or exc
                 if self.player is not None and self.turns.is_current(turn_id):
-                    await self.player.wait_until_empty()
-                    self.state.current["audio_buffer_ms"] = self.player.buffered_ms
-                    self.state.current["tts_status"] = "FINISHED"
-                    await self._publish(
-                        event(
-                            "tts.status",
-                            turn_id,
-                            provider="minimax",
-                            status="FINISHED",
-                            waiting_text="",
-                            audio_buffer_ms=self.player.buffered_ms,
+                    try:
+                        await self.player.wait_until_empty(
+                            timeout_seconds=max(120.0, self.player.buffered_ms / 1000 + 30.0)
                         )
-                    )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        tts_failed = tts_failed or exc
+            if self.tts is not None and self.turns.is_current(turn_id):
+                self.state.current["audio_buffer_ms"] = self.player.buffered_ms if self.player else 0
+                status = "DEGRADED" if tts_failed else "FINISHED"
+                self.state.current["tts_status"] = status
+                await self._publish(event(
+                    "tts.status", turn_id, provider="minimax", status=status,
+                    waiting_text="", audio_buffer_ms=self.state.current["audio_buffer_ms"],
+                    error=str(tts_failed) if tts_failed else None,
+                ))
         finally:
+            if tts_reader is not None:
+                if not tts_reader.done():
+                    tts_reader.cancel()
+                await asyncio.gather(tts_reader, return_exceptions=True)
             if tts_session is not None:
                 await tts_session.close()
             if self._tts_session is tts_session:
