@@ -19,7 +19,9 @@ from ..core.events import VoiceEvent, event
 from ..core.state import RuntimeState, TerminalState
 from ..kws.detector import KwsDetector, KwsError
 from ..providers.deepseek import DeepSeekClient
+from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
+from ..agent.tool_registry import WebSearchTools
 from ..server.history import InMemoryHistory
 from ..vad.detector import FsmnVadDetector, VadError
 from .snapshot import ProtocolSequencer, snapshot_event
@@ -47,6 +49,7 @@ class VoiceRuntime:
         self.asr: AsrWorkerClient | None = None
         self.llm: DeepSeekClient | None = None
         self.tts: MiniMaxTtsClient | None = None
+        self.search_tools: WebSearchTools | None = None
         self.player: PcmPlayer | None = None
         self.audio_processor: AudioPreprocessor | None = None
         self.controller: TurnController | None = None
@@ -59,6 +62,12 @@ class VoiceRuntime:
         self.state.set_service(status_service or service, "ERROR")
         self.startup_errors.append(f"{service}: {message}")
         logger.error("%s", self.startup_errors[-1])
+
+    def _disable_optional_search(self, reason: str) -> None:
+        safe_reason = " ".join(str(reason or "搜索服务不可用").split())[:240]
+        self.state.set_service("web_search", "DISABLED")
+        self.startup_errors.append(f"web_search: disabled: {safe_reason or '搜索服务不可用'}")
+        logger.warning("%s", self.startup_errors[-1])
 
     async def initialize(self) -> None:
         loop = asyncio.get_running_loop()
@@ -152,6 +161,24 @@ class VoiceRuntime:
             self._record_error("llm", f"未配置 {self.config.llm.api_key_env}")
 
         minimax_key = self.config.api_key(self.config.tts.api_key_env)
+        if self.config.v02.enabled and self.config.v02.tools and self.config.v02.web_search:
+            if not minimax_key:
+                self._disable_optional_search(f"未配置 {self.config.tts.api_key_env}")
+            else:
+                try:
+                    self.search_tools = WebSearchTools(MiniMaxSearchClient(
+                        base_url=self.config.tts.base_url,
+                        api_key=minimax_key,
+                        # Search runs inside the existing five-second tool
+                        # guard; keep the provider request bounded similarly.
+                        timeout_ms=5000,
+                    ))
+                    self.state.set_service("web_search", "READY")
+                except Exception as exc:
+                    self._disable_optional_search(str(exc))
+        else:
+            self.state.set_service("web_search", "DISABLED")
+
         if minimax_key:
             self.tts = MiniMaxTtsClient(
                 base_url=self.config.tts.base_url,
@@ -194,7 +221,8 @@ class VoiceRuntime:
         if self.config.v02.enabled and (self.config.audio.sample_rate != 16000 or self.config.audio.channels != 1 or self.config.audio.sample_format != "int16"):
             raise ValueError("v0.2 requires 16 kHz mono int16 capture")
         controller_class = RealtimeController if self.config.v02.enabled else TurnController
-        extra = {"options": self.config.v02} if self.config.v02.enabled else {}
+        extra = ({"options": self.config.v02, "search": self.search_tools}
+                 if self.config.v02.enabled else {})
         self.controller = controller_class(
             **extra,
             state=self.state,

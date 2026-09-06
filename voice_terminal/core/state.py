@@ -30,6 +30,7 @@ class RuntimeState:
             "asr": "OFFLINE",
             "llm": "OFFLINE",
             "tts": "OFFLINE",
+            "web_search": "OFFLINE",
         }
     )
     current: dict[str, Any] = field(

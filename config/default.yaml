@@ -9,6 +9,7 @@ v02:
   sensevoice: false
   predictions: false
   tools: false
+  web_search: false
   analysis_url: ws://127.0.0.1:8767/analysis
   max_turn_ms: 60000
   allowed_roots: [docs]

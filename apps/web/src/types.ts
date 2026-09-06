@@ -48,6 +48,7 @@ export type ServiceStatus =
 
 export interface ServiceStatuses {
   analysis?: ServiceStatus
+  web_search?: ServiceStatus
   audio: ServiceStatus
   kws: ServiceStatus
   asr: ServiceStatus
@@ -67,7 +68,7 @@ export interface CurrentTurnSnapshot {
   refined_text?: string
   segments?: Array<{ text: string }>
   prediction?: { decision?: string; intent?: string; status?: string; error?: string }
-  tools?: Array<{ name?: string; status?: string; reused?: boolean; error?: string; overlap_ms?: number; wait_ms?: number; selected_at_ms?: number; execution_start_ms?: number | null; finished_at_ms?: number; execution_ms?: number }>
+  tools?: Array<{ name?: string; status?: string; reused?: boolean; disabled?: boolean; service_status?: string; error?: string; overlap_ms?: number; wait_ms?: number; selected_at_ms?: number; execution_start_ms?: number | null; finished_at_ms?: number; execution_ms?: number }>
   audio_cues?: Array<{ start_ms: number; end_ms: number; emotion: string; language: string; events: string[] }>
   analysis?: Record<string, { status?: string; error?: string; probability?: number; fallback?: string; model?: string; model_loaded?: boolean }>
   partial_text: string

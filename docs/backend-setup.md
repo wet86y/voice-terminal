@@ -165,11 +165,16 @@ python -m voice_terminal.analysis.evaluate `
 
 ## v0.2 配置和工具边界
 
-v0.2 开关位于 `v02`：`enabled`、`smart_turn`、`sensevoice`、`predictions`、`tools` 和 `tts_local_buffer_ms`。TTS 传输与调度位于顶层 `tts.transport` 和 `tts.scheduling`：示例使用 Bidi + direct，短文本持续进入服务端句子缓冲；旧 WebSocket 仍可通过 `v02.tts_pacing` 与 `v02.tts_lead_ms` 使用可复用的 2 秒播放窗口策略。`audio.processing_enabled` 启用 AEC/降噪，并在处理后的 10 ms 帧上使用 `webrtcvad-wheels==2.0.14` 做近端语音确认；缺少任一依赖或初始化失败时状态会显示 `DEGRADED`，受保护自动插话保持关闭。`aec-audio-processing==1.0.1` 的 Windows wheel 暴露的 `has_voice()` 不能作为此确认信号使用，因此不要删除独立 WebRTC VAD 依赖。
+v0.2 开关位于 `v02`：`enabled`、`smart_turn`、`sensevoice`、`predictions`、`tools`、`web_search` 和 `tts_local_buffer_ms`。`web_search` 只有在 `tools=true` 且自身为 `true` 时才会尝试暴露；`tools=false` 会关闭全部工具，`web_search=false` 则只保留文件工具。TTS 传输与调度位于顶层 `tts.transport` 和 `tts.scheduling`：示例使用 Bidi + direct，短文本持续进入服务端句子缓冲；旧 WebSocket 仍可通过 `v02.tts_pacing` 与 `v02.tts_lead_ms` 使用可复用的 2 秒播放窗口策略。`audio.processing_enabled` 启用 AEC/降噪，并在处理后的 10 ms 帧上使用 `webrtcvad-wheels==2.0.14` 做近端语音确认；缺少任一依赖或初始化失败时状态会显示 `DEGRADED`，受保护自动插话保持关闭。`aec-audio-processing==1.0.1` 的 Windows wheel 暴露的 `has_voice()` 不能作为此确认信号使用，因此不要删除独立 WebRTC VAD 依赖。
 
 播放器本地 PCM 队列（`tts_local_buffer_ms`）和旧文本播放窗口（`tts_lead_ms`）是两个独立设置。Bidi 音频接收还会使用可配置的落盘暂存上限，示例为每个活动 generation 64 MiB。
 
 文件工具默认只允许 `docs`：`files_search` 和 `files_read_text`。它们没有 shell、写操作或外部账号访问；`allowed_roots` 只能通过显式配置增加目录。
+
+启用 `config/v0.2.yaml` 中的 `v02.web_search: true` 后，语音 Agent 还会获得 MiniMax Token Plan 的 `web_search(query)`。搜索客户端复用 `tts.base_url`、`tts.api_key_env`（默认即 `MINIMAX_API_KEY`）以及 `MINIMAX_API_HOST` 覆盖逻辑，不新增独立密钥配置；MiniMax Token Plan key 与普通按量 API key 不是同一类资源，key 还必须与区域 host 匹配。缺少 key、host 配置异常或明确鉴权失败时，服务状态会变为 `DISABLED`，搜索 schema 会从后续请求移除，但不会阻止语音会话启动；普通超时和临时 5xx 只让本次工具调用失败。
+非临时的非法响应会将搜索服务标记为 `ERROR` 并移除后续 schema；重启服务后会重新按配置初始化。
+
+`web_search` 只返回有界的搜索摘要和相关搜索建议，不抓取网页全文、不打开链接，也不执行摘要或页面中的指令。搜索结果会作为不可信数据提供给 DeepSeek，最终语音回答不会朗读搜索过程、原始 JSON、工具参数或协议内容。预测预取可能在用户完成讲话前发起搜索，因此启用该开关即表示相关查询会发送到 MiniMax。默认诊断和自动化测试不会发起付费搜索；真实联网 smoke test 需要单独显式执行。
 
 ## 前端启动
 

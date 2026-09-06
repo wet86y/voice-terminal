@@ -5,6 +5,7 @@ v02:
   sensevoice: true
   predictions: true
   tools: true
+  web_search: true
   max_turn_ms: 60000
   tts_local_buffer_ms: 2000
   allowed_roots: [docs]

@@ -13,7 +13,7 @@ from .options import V02Options
 from ..analysis.client import AnalysisClient
 from ..agent.runtime import AgentRuntime
 from ..agent.speculative_tools import SpeculativeTools, ToolSelectionInvalid
-from ..agent.tool_registry import FileTools
+from ..agent.tool_registry import FileTools, WebSearchTools
 from ..asr.protocol import AudioChunk
 from ..core.events import event, utc_now_iso
 from ..core.state import TerminalState
@@ -29,12 +29,18 @@ logger = logging.getLogger(__name__)
 class RealtimeController(TurnController):
     """v0.2 orchestration; v0.1 stays available through the feature switch."""
 
-    def __init__(self, *, options: V02Options, analysis=None, **kwargs) -> None:
+    def __init__(self, *, options: V02Options, analysis=None, search: WebSearchTools | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.options = options
         self.analysis = analysis or AnalysisClient(options.analysis_url)
         self.analysis_health: dict = {}
-        self.registry = SpeculativeTools(FileTools(options.allowed_roots))
+        self.registry = SpeculativeTools(
+            FileTools(options.allowed_roots),
+            search=search,
+            on_status=self._on_tool_status,
+        )
+        if "web_search" in self.state.services and (search is None or not search.available):
+            self.state.set_service("web_search", "DISABLED")
         self.agent = AgentRuntime(self.llm, self.registry, tools_enabled=options.tools)
         self.workspace: TurnWorkspace | None = None
         self.segmenter = TranscriptSegmenter(options.min_segment_chars, options.max_segment_chars)
@@ -74,6 +80,16 @@ class RealtimeController(TurnController):
 
     def _prediction_valid(self, ws: TurnWorkspace, token: tuple[str, int], revision: int) -> bool:
         return self._valid(token) and ws.input_revision == revision and self._active_input
+
+    def _on_tool_status(self, name: str, status: str, reason: str) -> None:
+        if name == "web_search" and "web_search" in self.state.services:
+            # This hook can run in the bounded worker thread.  It only updates
+            # the small in-memory status map; event publication stays on the
+            # event-loop path in _tool_event.
+            self.state.set_service("web_search", status)
+            if status != "READY":
+                safe_reason = " ".join(str(reason or "搜索服务不可用").split())[:200]
+                logger.warning("web_search.status status=%s reason=%s", status, safe_reason)
 
     async def _detail(self, type_: str, **payload) -> None:
         ws = self.workspace
@@ -784,23 +800,35 @@ class RealtimeController(TurnController):
                                   workspace=ws.snapshot() if current else None, **payload))
 
     async def _prefetched(self, ws, token, revision, name, entry):
+        error = ""
         try:
             await asyncio.shield(entry.task)
             status = "DONE"
         except asyncio.CancelledError:
             return
-        except Exception:
+        except Exception as exc:
             status = "FAILED"
+            error = str(exc)
         if self._valid(token) and ws.input_revision == revision and self._active_input:
             finished = entry.finished_at or time.monotonic()
             execution_started = entry.execution_started_at or entry.started_at
-            await self._tool_event(ws, {
+            payload = {
                 "name": name, "status": status, "speculative": True,
                 "selected_at_ms": max(0, round((entry.started_at - ws.started_at) * 1000)),
                 "execution_start_ms": max(0, round((execution_started - ws.started_at) * 1000)),
                 "finished_at_ms": max(0, round((finished - ws.started_at) * 1000)),
                 "execution_ms": max(0, round((finished - execution_started) * 1000)),
-            }, token=token, revision=revision)
+            }
+            if status == "FAILED":
+                # Keep this diagnostic bounded and never include a provider
+                # response or credential in the visible workspace state.
+                payload["error"] = error[:300]
+                service_status = self.registry.service_status(name)
+                if service_status == "DISABLED":
+                    payload["disabled"] = True
+                elif service_status == "ERROR":
+                    payload["service_status"] = "ERROR"
+            await self._tool_event(ws, payload, token=token, revision=revision)
 
     async def _tool_event(self, ws, payload, *, token=None, revision=None):
         if self.workspace is not ws:
@@ -809,6 +837,20 @@ class RealtimeController(TurnController):
             return False
         if revision is not None and ws.input_revision != revision:
             return False
+        search_status = payload.get("service_status")
+        search_status_changed = (
+            payload.get("name") == "web_search"
+            and (payload.get("disabled") or search_status == "ERROR")
+            and "web_search" in self.state.services
+        )
+        if search_status_changed:
+            # Search is optional: an auth/host mismatch disables only this
+            # capability and must not make the voice session unstartable.  A
+            # non-transient malformed response is retained as ERROR instead.
+            self.state.set_service("web_search", "DISABLED" if payload.get("disabled") else "ERROR")
+            snapshot = self.state.snapshot()
+            snapshot["recent_turns"] = [record.to_payload() for record in self.history.records]
+            await self._publish(event("runtime.snapshot", None, **snapshot))
         ws.tools = (ws.tools + [payload])[-32:]
         await self._detail("agent.tool", **payload)
         return True

@@ -114,7 +114,8 @@ ws://127.0.0.1:8765/ws
       "kws": "RUNNING",
       "asr": "READY",
       "llm": "READY",
-      "tts": "CONNECTED"
+      "tts": "CONNECTED",
+      "web_search": "DISABLED"
     },
     "current": {
       "partial_text": "",
@@ -133,7 +134,7 @@ ws://127.0.0.1:8765/ws
 - `state`：后端真实状态。
 - `listening`：后端持续监听是否已启动。
 - `can_start`：后端是否允许启动监听。
-- `services`：各服务的真实状态。
+- `services`：各服务的真实状态。`web_search` 是可选能力，值为 `READY`、`DISABLED` 或 `ERROR` 时都不改变语音主链的 `can_start` 判定。
 - `current`：当前轮已经产生的文本和播放器状态。
 
 ### `session.state`
@@ -477,7 +478,7 @@ v0.2 在 TTS 任务运行期间按后端播放器进度推送监控信息。`aud
 | turn.resumed | 播放前续说，同 turn_id、新 generation；清空旧回答和 TTS 展示 |
 | transcript.segment | text 累计快照、new_segment、corrected、segments |
 | agent.prediction | LISTEN/ACT/READY、简短 intent 或预测错误 |
-| agent.tool | name、RUNNING/DONE/FAILED、speculative/reused、等待和重叠时间 |
+| agent.tool | name、RUNNING/DONE/FAILED、speculative/reused、等待和重叠时间；可选 `disabled` / `service_status` 用于搜索降级诊断 |
 | agent.prediction.requested | 预测快照已发出；携带 input_revision、generation_id 和快照摘要 |
 | agent.prediction.discarded | 预测结果未采用；reason 说明 revision/generation 过期、轮次结束、输入封口、超时或无效返回 |
 | transcript.refined | 最终采用 text、source=sensevoice/paraformer |

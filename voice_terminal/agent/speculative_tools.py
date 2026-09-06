@@ -7,7 +7,7 @@ import json
 import time
 from collections.abc import Callable
 
-from .tool_registry import FileTools
+from .tool_registry import FileTools, WebSearchTools
 
 
 @dataclass
@@ -26,8 +26,13 @@ class ToolSelectionInvalid(RuntimeError):
 
 
 class SpeculativeTools:
-    def __init__(self, files: FileTools) -> None:
+    def __init__(self, files: FileTools, search: WebSearchTools | None = None,
+                 on_disabled: Callable[[str, str], None] | None = None,
+                 on_status: Callable[[str, str, str], None] | None = None) -> None:
         self.files = files
+        self.search = search
+        self.on_disabled = on_disabled
+        self.on_status = on_status
         self.entries: dict[tuple, ToolTask] = {}
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="readonly-tool")
         self.slots = asyncio.Semaphore(2)
@@ -40,12 +45,62 @@ class SpeculativeTools:
         self.managed = True
         self.active_turn = turn_id
 
-    async def _execute(self, name: str, arguments: dict, mark_started: Callable[[float], None]) -> dict:
+    def _backend(self, name: str):
+        if name == "web_search":
+            return self.search
+        return self.files
+
+    def schemas(self) -> list[dict]:
+        schemas = self.files.schemas()
+        if self.search is not None:
+            schemas.extend(self.search.schemas())
+        return schemas
+
+    def is_available(self, name: str) -> bool:
+        backend = self._backend(name)
+        return backend is not None and getattr(backend, "available", True)
+
+    def service_status(self, name: str) -> str:
+        backend = self._backend(name)
+        if backend is None:
+            return "DISABLED"
+        return getattr(backend, "service_status", "READY" if self.is_available(name) else "DISABLED")
+
+    def _notify_status(self, name: str, reason: str) -> None:
+        status = self.service_status(name)
+        if self.on_status is not None:
+            self.on_status(name, status, reason)
+        elif status == "DISABLED" and self.on_disabled is not None:
+            self.on_disabled(name, reason)
+
+    def disable(self, name: str, reason: str) -> None:
+        backend = self._backend(name)
+        if backend is not None and hasattr(backend, "disable"):
+            backend.disable(reason)
+            self._notify_status(name, reason)
+
+    def mark_error(self, name: str, reason: str) -> None:
+        backend = self._backend(name)
+        if backend is not None and hasattr(backend, "mark_error"):
+            backend.mark_error(reason)
+            self._notify_status(name, reason)
+
+    async def _execute(self, backend, name: str, arguments: dict, mark_started: Callable[[float], None]) -> dict:
         await self.slots.acquire()
-        def run_file_operation():
+        def run_tool_operation():
             mark_started(time.monotonic())
-            return self.files.execute(name, arguments)
-        future = asyncio.get_running_loop().run_in_executor(self.executor, run_file_operation)
+            try:
+                return backend.execute(name, arguments)
+            except Exception as exc:
+                if getattr(exc, "disable_search", False):
+                    # The backend also records its disabled state.  Going
+                    # through the registry hook makes service diagnostics
+                    # update even if the visible turn is canceled meanwhile.
+                    self.disable(name, str(exc))
+                elif getattr(exc, "service_status", None) == "ERROR":
+                    self.mark_error(name, str(exc))
+                raise
+        future = asyncio.get_running_loop().run_in_executor(self.executor, run_tool_operation)
         future.add_done_callback(lambda f: (self.slots.release(), f.exception() if not f.cancelled() else None))
         return await asyncio.shield(future)
 
@@ -60,7 +115,10 @@ class SpeculativeTools:
 
         if self.closed:
             raise RuntimeError("tool runtime closed")
-        name, arguments = await asyncio.to_thread(self.files.normalize, name, arguments)
+        backend = self._backend(name)
+        if backend is None or not getattr(backend, "available", True):
+            raise ToolSelectionInvalid("tool unavailable")
+        name, arguments = await asyncio.to_thread(backend.normalize, name, arguments)
         if self.closed or (self.managed and self.active_turn != turn_id):
             raise RuntimeError("tool turn invalidated")
         check_valid()
@@ -71,7 +129,7 @@ class SpeculativeTools:
                 check_valid()
                 return entry, True
             if not entry.task.cancelled() and entry.task.exception() is None:
-                fresh = await asyncio.to_thread(self.files.fresh, name, entry.task.result())
+                fresh = await asyncio.to_thread(backend.fresh, name, entry.task.result())
                 if self.closed or (self.managed and self.active_turn != turn_id):
                     raise RuntimeError("tool turn invalidated")
                 check_valid()
@@ -86,7 +144,7 @@ class SpeculativeTools:
         entry_ref: list[ToolTask] = []
         async def run():
             async with asyncio.timeout(5):
-                return await self._execute(name, arguments, lambda when: setattr(entry_ref[0], "execution_started_at", when))
+                return await self._execute(backend, name, arguments, lambda when: setattr(entry_ref[0], "execution_started_at", when))
         check_valid()
         selected_at = time.monotonic()
         entry = ToolTask(asyncio.create_task(run()), selected_at)

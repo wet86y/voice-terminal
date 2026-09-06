@@ -43,7 +43,7 @@
 - `load_config()` 以 `default.yaml` 为基础，按顺序深度合并传入 local YAML；当前仓库没有 `config/local.yaml`，因此运行时使用默认配置或启动参数指定的配置文件。
 - `.env.local` 只补充未存在的进程变量；已有进程环境变量优先。`VOICE_SERVER_HOST/PORT`、`ASR_WORKER_HOST/PORT/URL`、`VOICE_MODEL_DIR` 和 `MINIMAX_API_HOST` 的覆盖路径与代码一致。
 - Voice Server、ASR Worker、回放脚本和 readiness probe 使用同一份 `asr.worker_url`。启动脚本不会再固定探测 `127.0.0.1:8766`。
-- `v02.enabled`、`smart_turn`、`sensevoice`、`predictions`、`tools` 仍是独立开关。启动/回放 readiness 现在只要求已经启用的 Analysis lane 为 READY；禁用的 lane 不会阻塞启动。`config/default.yaml` 中 v0.2 仍关闭，`config/v0.2.yaml` 才显式开启。
+- `v02.enabled`、`smart_turn`、`sensevoice`、`predictions`、`tools`、`web_search` 仍是独立开关；`web_search` 只有在 `tools=true` 时才额外暴露，并复用已有 MiniMax TTS key/host。启动/回放 readiness 现在只要求已经启用的 Analysis lane 为 READY；可选搜索缺少配置或鉴权失败时只标记 `DISABLED`，不会阻塞启动。`config/default.yaml` 中 v0.2 和搜索仍关闭，`config/v0.2.yaml` 才显式开启。
 - WebSocket Envelope、`request_id`、整数 seq、对象 payload、服务端延迟和 `turn.completed` 唯一历史入口与 `docs/websocket-protocol.md`、`apps/web/src/types.ts` 对齐。本轮没有新增 Envelope 字段，也没有改变旧客户端可忽略的 v0.2 扩展。
 
 ## 问题分级和修复状态

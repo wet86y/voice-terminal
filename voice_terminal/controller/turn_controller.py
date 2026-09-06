@@ -232,11 +232,12 @@ class TurnController:
         if self.state.listening:
             logger.info("controller.start_ignored reason=already_listening")
             return
+        required_services = ("audio", "kws", "asr", "llm", "tts")
         missing = [
             name
-            for name, status in self.state.services.items()
-            if status not in {"READY", "RUNNING", "STREAMING", "CONNECTED"}
-            and not (name == "kws" and status == "DISABLED")
+            for name in required_services
+            if self.state.services.get(name) not in {"READY", "RUNNING", "STREAMING", "CONNECTED"}
+            and not (name == "kws" and self.state.services.get(name) == "DISABLED")
         ]
         if missing:
             logger.error("controller.start_blocked missing_services=%s", missing)

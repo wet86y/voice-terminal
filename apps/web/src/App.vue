@@ -82,6 +82,7 @@ const serviceRows = computed(() => [
   { key: 'asr', label: 'ASR Worker', value: terminal.services.asr },
   { key: 'llm', label: 'LLM', value: terminal.services.llm },
   { key: 'tts', label: 'TTS / Player', value: terminal.services.tts },
+  { key: 'web_search', label: 'Web Search', value: terminal.services.web_search ?? 'DISABLED' },
   { key: 'analysis', label: 'Speech Analysis', value: terminal.services.analysis ?? 'DISABLED' },
 ])
 

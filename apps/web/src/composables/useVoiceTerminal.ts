@@ -99,6 +99,7 @@ function createOfflineStatuses(): ServiceStatuses {
     asr: 'OFFLINE',
     llm: 'OFFLINE',
     tts: 'OFFLINE',
+    web_search: 'DISABLED',
     analysis: 'DISABLED',
   }
 }

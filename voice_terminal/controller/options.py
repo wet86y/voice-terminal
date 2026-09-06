@@ -9,6 +9,7 @@ class V02Options:
     sensevoice: bool = False
     predictions: bool = False
     tools: bool = False
+    web_search: bool = False
     analysis_url: str = "ws://127.0.0.1:8767/analysis"
     threshold: float = 0.5
     candidate_ms: int = 700
@@ -40,7 +41,7 @@ class V02Options:
             if not isinstance(roots, list) or not all(isinstance(p, str) for p in roots):
                 raise ValueError("v02.allowed_roots must be a list of paths")
             values["allowed_roots"] = tuple((root / p).resolve() for p in roots)
-        for key in ("enabled", "smart_turn", "sensevoice", "predictions", "tools", "tts_pacing"):
+        for key in ("enabled", "smart_turn", "sensevoice", "predictions", "tools", "web_search", "tts_pacing"):
             if key in values and not isinstance(values[key], bool):
                 raise ValueError(f"v02.{key} must be boolean")
         result = cls(**values)
