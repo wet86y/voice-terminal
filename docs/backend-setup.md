@@ -62,7 +62,7 @@ VOICE_WAKE_ENABLED
 VITE_VOICE_WS_URL（前端）
 ```
 
-DeepSeek 默认使用 `https://api.deepseek.com` 的流式接口并关闭 thinking。MiniMax 默认使用中国区 T2A WebSocket、`speech-2.8-hd` 和 32 kHz PCM；播放器只接受 PCM，不会静默把 MP3 当成 PCM。
+DeepSeek 默认使用 `https://api.deepseek.com` 的流式接口并关闭 thinking。v0.1 使用传统 MiniMax T2A WebSocket；`config/v0.2.yaml` 显式选择 `/ws/v1/t2a_v2_bidi`、`direct` 调度、`speech-2.8-hd` 和 32 kHz 单声道 PCM。播放器只接受 PCM，不会静默把 MP3 当成 PCM。
 
 ## 音频设备
 
@@ -165,7 +165,9 @@ python -m voice_terminal.analysis.evaluate `
 
 ## v0.2 配置和工具边界
 
-v0.2 开关位于 `v02`：`enabled`、`smart_turn`、`sensevoice`、`predictions`、`tools`、`tts_pacing` 和 `tts_lead_ms`。示例配置的 TTS pacing 第一段立即发送，后续段只在当前轮待播放 PCM 不超过 `tts_lead_ms` 时发送。
+v0.2 开关位于 `v02`：`enabled`、`smart_turn`、`sensevoice`、`predictions`、`tools` 和 `tts_local_buffer_ms`。TTS 传输与调度位于顶层 `tts.transport` 和 `tts.scheduling`：示例使用 Bidi + direct，短文本持续进入服务端句子缓冲；旧 WebSocket 仍可通过 `v02.tts_pacing` 与 `v02.tts_lead_ms` 使用可复用的 2 秒播放窗口策略。`audio.processing_enabled` 启用 AEC/降噪，并在处理后的 10 ms 帧上使用 `webrtcvad-wheels==2.0.14` 做近端语音确认；缺少任一依赖或初始化失败时状态会显示 `DEGRADED`，受保护自动插话保持关闭。`aec-audio-processing==1.0.1` 的 Windows wheel 暴露的 `has_voice()` 不能作为此确认信号使用，因此不要删除独立 WebRTC VAD 依赖。
+
+播放器本地 PCM 队列（`tts_local_buffer_ms`）和旧文本播放窗口（`tts_lead_ms`）是两个独立设置。Bidi 音频接收还会使用可配置的落盘暂存上限，示例为每个活动 generation 64 MiB。
 
 文件工具默认只允许 `docs`：`files_search` 和 `files_read_text`。它们没有 shell、写操作或外部账号访问；`allowed_roots` 只能通过显式配置增加目录。
 

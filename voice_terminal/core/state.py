@@ -42,9 +42,18 @@ class RuntimeState:
             "audio_buffer_ms": 0,
             "tts_returned_ms": 0,
             "tts_played_ms": 0,
+            "tts_output_estimated_ms": 0,
             "tts_remaining_ms": 0,
             "turn_id": None,
             "v02": False,
+            # Runtime capabilities are kept in the snapshot so a reconnecting
+            # client can explain why protected barge-in is unavailable and
+            # which TTS scheduling path is active.
+            "audio_processing_status": "DISABLED",
+            "audio_processing_error": "",
+            "tts_transport": "websocket",
+            "tts_scheduling": "auto",
+            "delivery": {},
         }
     )
     latency: dict[str, Any] = field(
@@ -97,9 +106,11 @@ class RuntimeState:
             audio_buffer_ms=0,
             tts_returned_ms=0,
             tts_played_ms=0,
+            tts_output_estimated_ms=0,
             tts_remaining_ms=0,
+            delivery={},
         )
-        for key in ("input_revision", "generation_id", "committed", "agent_phase", "paraformer_final", "refined_text", "segments", "prediction", "tools", "audio_cues", "analysis"):
+        for key in ("input_revision", "generation_id", "committed", "agent_phase", "paraformer_final", "refined_text", "segments", "prediction", "tools", "audio_cues", "analysis", "tts_segments"):
             self.current.pop(key, None)
         self.latency = {
             "complete": False,

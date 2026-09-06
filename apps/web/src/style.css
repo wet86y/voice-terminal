@@ -1058,3 +1058,16 @@ h2 {
 .analysis-details { margin-top: 16px; padding: 14px; border: 1px solid #d9dedb; border-radius: 10px; max-height: 360px; overflow: auto; overflow-wrap: anywhere; }
 .analysis-details summary { cursor: pointer; font-weight: 600; }
 .analysis-details p, .analysis-details li { font-size: 13px; line-height: 1.6; }
+
+.delivery-card { margin-top: 14px; padding: 12px 14px; border: 1px solid #d9dedb; border-radius: 10px; background: rgba(247, 249, 247, .8); overflow-wrap: anywhere; }
+.delivery-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 11px; letter-spacing: .12em; color: #65716d; }
+.delivery-heading strong { letter-spacing: 0; color: #1f302a; font-size: 12px; }
+.delivery-card p { margin: 7px 0 0; font-size: 12px; line-height: 1.5; color: #43504a; }
+.delivery-card small { display: block; margin-top: 8px; color: #7a8580; }
+.history-delivery { display: inline-block; margin-top: 6px; padding: 2px 7px; border-radius: 999px; background: #edf1ef; color: #43504a; font-size: 11px; }
+.history-delivery.interrupted, .history-delivery.partial { background: #fff1d6; color: #805b14; }
+.history-delivery.unknown { background: #eceef0; color: #626970; }
+.history-delivery.none, .history-delivery.failed { background: #fde8e7; color: #9a3e3a; }
+.history-heard, .history-uncertain { margin: 5px 0 0; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.history-heard { color: #3e6b58; }
+.history-uncertain { color: #936718; }

@@ -11,6 +11,7 @@ import type {
   ServiceStatuses,
   SessionStatePayload,
   TerminalState,
+  TurnDelivery,
   TtsStatusPayload,
   TurnCompletedPayload,
   TurnRecord,
@@ -48,6 +49,10 @@ function readString(payload: Record<string, unknown>, key: string): string | nul
   return typeof payload[key] === 'string' ? payload[key] as string : null
 }
 
+function readDelivery(value: unknown): TurnDelivery | undefined {
+  return isRecord(value) ? value as TurnDelivery : undefined
+}
+
 function createEmptyCurrentTurn(): CurrentTurnSnapshot {
   return {
     partial_text: '',
@@ -58,7 +63,13 @@ function createEmptyCurrentTurn(): CurrentTurnSnapshot {
     audio_buffer_ms: null,
     tts_returned_ms: 0,
     tts_played_ms: 0,
+    tts_output_estimated_ms: 0,
     tts_remaining_ms: 0,
+    delivery: {},
+    audio_processing_status: 'DISABLED',
+    audio_processing_error: '',
+    tts_transport: 'websocket',
+    tts_scheduling: 'auto',
     v02: false, input_revision: 0, generation_id: 0, committed: false,
     agent_phase: 'IDLE', paraformer_final: '', refined_text: '',
     segments: [], prediction: {}, tools: [], audio_cues: [], analysis: {},
@@ -187,7 +198,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     const audioBufferMs = snapshot.audio_buffer_ms
     const ttsReturnedMs = snapshot.tts_returned_ms
     const ttsPlayedMs = snapshot.tts_played_ms
+    const ttsOutputEstimatedMs = snapshot.tts_output_estimated_ms
     const ttsRemainingMs = snapshot.tts_remaining_ms
+    const delivery = readDelivery(snapshot.delivery)
 
     if (partialText !== null) current.partial_text = partialText
     if (finalText !== null) current.final_text = finalText
@@ -200,11 +213,16 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     for (const [key, value] of [
       ['tts_returned_ms', ttsReturnedMs],
       ['tts_played_ms', ttsPlayedMs],
+      ['tts_output_estimated_ms', ttsOutputEstimatedMs],
       ['tts_remaining_ms', ttsRemainingMs],
     ] as const) {
       if (value === null || (typeof value === 'number' && Number.isFinite(value))) {
         current[key] = value as number | null
       }
+    }
+    if (delivery !== undefined) current.delivery = delivery
+    for (const key of ['audio_processing_status', 'audio_processing_error', 'tts_transport', 'tts_scheduling'] as const) {
+      if (typeof snapshot[key] === 'string') current[key] = snapshot[key] as string
     }
   }
 
@@ -258,7 +276,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (payload.latency) applyLatencySnapshot(payload.latency)
     if (Array.isArray(payload.recent_turns)) {
       recentTurns.value = payload.recent_turns.filter(item => isRecord(item) && typeof item.turn_id === 'string')
-        .slice(0, MAX_RECENT_TURNS).map(item => ({ ...item, latency: copyLatencyValues(item.latency) }))
+        .slice(0, MAX_RECENT_TURNS).map(item => ({
+          ...item,
+          latency: copyLatencyValues(item.latency),
+          delivery: readDelivery(item.delivery),
+        }))
     }
   }
 
@@ -274,12 +296,15 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     const transcript = typeof payload.transcript === 'string' ? payload.transcript : current.final_text
     const response = typeof payload.response === 'string' ? payload.response : current.assistant_text
     const completedAt = typeof payload.completed_at === 'string' ? payload.completed_at : ''
+    const delivery = readDelivery(payload.delivery)
     const record: TurnRecord = {
       turn_id: turnId,
       transcript,
       response,
       completed_at: completedAt,
       latency: copyLatencyValues(payload.latency),
+      status: typeof payload.status === 'string' ? payload.status : delivery?.termination,
+      delivery,
     }
 
     recentTurns.value = [record, ...recentTurns.value.filter((item) => item.turn_id !== turnId)]
@@ -289,6 +314,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       currentTurnId.value = turnId
       current.final_text = transcript
       current.assistant_text = response
+      if (delivery !== undefined) current.delivery = delivery
       Object.assign(currentLatency, record.latency)
       currentLatencyComplete.value = true
     }
@@ -333,7 +359,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         if (acceptsCurrentTurn(message.turn_id)) {
           current.final_text = ''; current.assistant_text = ''; current.tts_text = ''
           current.audio_buffer_ms = 0; current.tts_status = 'IDLE'
-          current.tts_returned_ms = 0; current.tts_played_ms = 0; current.tts_remaining_ms = 0
+          current.tts_returned_ms = 0; current.tts_played_ms = 0
+          current.tts_output_estimated_ms = 0; current.tts_remaining_ms = 0
+          current.delivery = {}
         }
         break
       case 'runtime.snapshot':
@@ -374,6 +402,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
           const bufferMs = payload.audio_buffer_ms
           const returnedMs = payload.audio_returned_ms
           const playedMs = payload.audio_played_ms
+          const outputEstimatedMs = payload.audio_output_estimated_ms
           const remainingMs = payload.audio_remaining_ms
           if (waitingText !== null) current.tts_text = waitingText
           if (status !== null) current.tts_status = status
@@ -385,6 +414,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
           }
           if (playedMs === null || (typeof playedMs === 'number' && Number.isFinite(playedMs))) {
             current.tts_played_ms = playedMs as number | null
+          }
+          if (outputEstimatedMs === null || (typeof outputEstimatedMs === 'number' && Number.isFinite(outputEstimatedMs))) {
+            current.tts_output_estimated_ms = outputEstimatedMs as number | null
           }
           if (remainingMs === null || (typeof remainingMs === 'number' && Number.isFinite(remainingMs))) {
             current.tts_remaining_ms = remainingMs as number | null
@@ -398,6 +430,13 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         break
       case 'turn.completed':
         applyCompletedTurn(payload as unknown as TurnCompletedPayload, message.turn_id)
+        break
+      case 'turn.interrupted':
+        if (acceptsCurrentTurn(message.turn_id)) {
+          const delivery = readDelivery(payload.delivery)
+          if (delivery !== undefined) current.delivery = delivery
+          state.value = 'INTERRUPTING'
+        }
         break
       case 'error': {
         const messageText = readString(payload, 'message')

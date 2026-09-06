@@ -52,6 +52,15 @@ class AudioConfig:
     block_ms: int = 20
     ring_buffer_ms: int = 2000
     wake_preroll_ms: int = 1200
+    processing_enabled: bool = False
+    processing_required: bool = False
+    echo_cancellation: bool = True
+    noise_suppression: bool = True
+    automatic_gain_control: bool = False
+    # Conservative device-output tail used when PortAudio does not expose a
+    # trustworthy DAC timestamp.  v0.1 keeps the historical zero default;
+    # v0.2 can set a measured/estimated value explicitly.
+    device_latency_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -103,12 +112,37 @@ class TtsConfig:
     provider: str = "minimax"
     base_url: str = "https://api.minimaxi.com"
     websocket_path: str = "/ws/v1/t2a_v2"
+    transport: str = "websocket"
+    scheduling: str = "auto"
     model: str = "speech-2.8-hd"
     api_key_env: str = "MINIMAX_API_KEY"
     output_format: str = "pcm"
     sample_rate: int = 32000
     voice_id: str = "female-shaonv"
     timeout_ms: int = 15000
+    subtitle_enable: bool = False
+    subtitle_type: str = "word_streaming"
+    audio_cache_max_bytes: int = 64 * 1024 * 1024
+    cancel_timeout_ms: int = 2000
+    keepalive_seconds: int = 30
+
+    def __post_init__(self) -> None:
+        if self.transport not in {"websocket", "websocket_bidi"}:
+            raise ValueError("tts.transport must be websocket or websocket_bidi")
+        if self.scheduling not in {"auto", "direct", "playback_window"}:
+            raise ValueError("tts.scheduling must be auto, direct, or playback_window")
+        if self.transport == "websocket_bidi" and self.scheduling == "playback_window":
+            raise ValueError("Bidi TTS cannot use playback_window scheduling")
+        if self.subtitle_type not in {"sentence", "word", "word_streaming"}:
+            raise ValueError("tts.subtitle_type is invalid")
+        if self.audio_cache_max_bytes <= 0 or self.cancel_timeout_ms <= 0 or self.keepalive_seconds <= 0:
+            raise ValueError("tts cache, cancel timeout, and keepalive values must be positive")
+
+    @property
+    def effective_scheduling(self) -> str:
+        if self.transport == "websocket_bidi" and self.scheduling == "auto":
+            return "direct"
+        return self.scheduling
 
 
 @dataclass(frozen=True)
@@ -233,6 +267,12 @@ class AppConfig:
                 block_ms=int(_number(audio.get("block_ms"), 20)),
                 ring_buffer_ms=int(_number(audio.get("ring_buffer_ms"), 2000)),
                 wake_preroll_ms=int(_number(audio.get("wake_preroll_ms"), 1200)),
+                processing_enabled=_bool(audio.get("processing_enabled"), False),
+                processing_required=_bool(audio.get("processing_required"), False),
+                echo_cancellation=_bool(audio.get("echo_cancellation"), True),
+                noise_suppression=_bool(audio.get("noise_suppression"), True),
+                automatic_gain_control=_bool(audio.get("automatic_gain_control"), False),
+                device_latency_ms=max(0, int(_number(audio.get("device_latency_ms"), 0))),
             ),
             wake=WakeConfig(
                 enabled=_env_bool("VOICE_WAKE_ENABLED", _bool(wake.get("enabled"), False)),
@@ -274,12 +314,19 @@ class AppConfig:
                 provider=_string(tts.get("provider"), "minimax"),
                 base_url=os.environ.get("MINIMAX_API_HOST", "").strip() or _string(tts.get("base_url"), "https://api.minimaxi.com"),
                 websocket_path=_string(tts.get("websocket_path"), "/ws/v1/t2a_v2"),
+                transport=_string(tts.get("transport"), "websocket"),
+                scheduling=_string(tts.get("scheduling"), "auto"),
                 model=_string(tts.get("model"), "speech-2.8-hd"),
                 api_key_env=_string(tts.get("api_key_env"), "MINIMAX_API_KEY"),
                 output_format=_string(tts.get("output_format"), "pcm"),
                 sample_rate=int(_number(tts.get("sample_rate"), 32000)),
                 voice_id=_string(tts.get("voice_id"), "female-shaonv"),
                 timeout_ms=int(_number(tts.get("timeout_ms"), 15000)),
+                subtitle_enable=_bool(tts.get("subtitle_enable"), False),
+                subtitle_type=_string(tts.get("subtitle_type"), "word_streaming"),
+                audio_cache_max_bytes=int(_number(tts.get("audio_cache_max_bytes"), 64 * 1024 * 1024)),
+                cancel_timeout_ms=int(_number(tts.get("cancel_timeout_ms"), 2000)),
+                keepalive_seconds=int(_number(tts.get("keepalive_seconds"), 30)),
             ),
             text_bridge=TextBridgeConfig(
                 min_chars=int(_number(bridge.get("min_chars"), 8)),

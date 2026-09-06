@@ -12,6 +12,31 @@ export const TERMINAL_STATES = [
 export type TerminalState = (typeof TERMINAL_STATES)[number]
 export type ConnectionState = 'offline' | 'connecting' | 'connected'
 
+export type DeliveryStatus = 'full' | 'partial' | 'none' | 'unknown' | (string & {})
+export type TurnTermination = 'completed' | 'interrupted' | 'failed' | 'stopped' | (string & {})
+
+export interface TurnDelivery {
+  /** How much of the generated response reached the local output path. */
+  status?: DeliveryStatus
+  /** Why the turn ended.  This is separate from ``status``. */
+  termination?: TurnTermination
+  heard_text?: string
+  uncertain_text?: string
+  unheard_text?: string
+  played_ms?: number | null
+  callback_played_ms?: number | null
+  output_tail_estimated_ms?: number | null
+  speech_onset_ms?: number | null
+  interrupt_confirmed_ms?: number | null
+  speech_onset_to_confirm_ms?: number | null
+  confirm_to_stop_ms?: number | null
+  playback_stop_ms?: number | null
+  cancel_confirmed_ms?: number | null
+  precision?: string
+  playback_precision?: string
+  reason?: string
+}
+
 export type ServiceStatus =
   | 'OFFLINE'
   | 'STARTING'
@@ -53,7 +78,14 @@ export interface CurrentTurnSnapshot {
   audio_buffer_ms: number | null
   tts_returned_ms: number | null
   tts_played_ms: number | null
+  /** Conservative device output estimate; callback consumption stays above. */
+  tts_output_estimated_ms: number | null
   tts_remaining_ms: number | null
+  delivery?: TurnDelivery
+  audio_processing_status?: string
+  audio_processing_error?: string
+  tts_transport?: string
+  tts_scheduling?: string
 }
 
 export interface LatencyValues {
@@ -118,6 +150,7 @@ export interface TtsStatusPayload {
   audio_buffer_ms: number | null
   audio_returned_ms?: number | null
   audio_played_ms?: number | null
+  audio_output_estimated_ms?: number | null
   audio_remaining_ms?: number | null
   pacing_enabled?: boolean
   lead_ms?: number
@@ -133,7 +166,9 @@ export interface TurnCompletedPayload {
   transcript: string
   response: string
   completed_at: string
-  latency: LatencyValues
+  latency?: LatencyValues
+  status?: TurnTermination
+  delivery?: TurnDelivery
 }
 
 export interface ServerErrorPayload {
@@ -155,6 +190,7 @@ export type ServerMessageType =
   | 'llm.context'
   | 'tts.status' | 'tts.progress'
   | 'latency.snapshot'
+  | 'turn.interrupted'
   | 'turn.completed'
   | 'error'
 
@@ -183,4 +219,6 @@ export interface TurnRecord {
   response: string
   completed_at: string
   latency: LatencyValues
+  status?: TurnTermination
+  delivery?: TurnDelivery
 }

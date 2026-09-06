@@ -258,6 +258,34 @@ describe('useVoiceTerminal', () => {
     expect(terminal.currentLatency.turn_total_ms).toBe(100)
   })
 
+  it('保存中断轮次的传达范围，并处理即时 turn.interrupted 状态', () => {
+    const { socket, terminal } = openTerminal()
+    const turnId = 'turn_interrupted_000001'
+    const delivery = {
+      status: 'partial', termination: 'interrupted',
+      heard_text: '前半句。', uncertain_text: '正在说的词', unheard_text: '后半句。',
+      played_ms: 912, precision: 'provider',
+    }
+
+    socket.push(envelope('session.state', 1, turnId, {
+      state: 'SPEAKING', listening: true, can_start: false,
+    }))
+    socket.push(envelope('assistant.delta', 2, turnId, { text_delta: '前半句。正在说的词后半句。' }))
+    socket.push(envelope('turn.interrupted', 3, turnId, {
+      response: '前半句。正在说的词后半句。', delivery,
+    }))
+    expect(terminal.state.value).toBe('INTERRUPTING')
+    expect(terminal.current.delivery).toEqual(delivery)
+
+    socket.push(envelope('turn.completed', 4, turnId, {
+      transcript: '查询资料', response: '前半句。正在说的词后半句。',
+      completed_at: '2026-09-04T08:32:00.000Z', latency: createLatency(),
+      status: 'interrupted', delivery,
+    }))
+    expect(terminal.recentTurns.value[0].status).toBe('interrupted')
+    expect(terminal.recentTurns.value[0].delivery?.heard_text).toBe('前半句。')
+  })
+
   it('后端错误和连接关闭时禁用开始按钮，不生成本地替代数据', () => {
     const { socket, terminal } = openTerminal()
 

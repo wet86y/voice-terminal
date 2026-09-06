@@ -254,6 +254,7 @@ ERROR
     "audio_buffer_ms": 60,
     "audio_returned_ms": 820,
     "audio_played_ms": 760,
+    "audio_output_estimated_ms": 700,
     "audio_remaining_ms": 60
   }
 }
@@ -261,9 +262,13 @@ ERROR
 
 `audio_buffer_ms` 必须由后端测量或维护，前端只显示。
 
+`current` 还可以包含 `tts_transport`、`tts_scheduling`、
+`audio_processing_status`、`audio_processing_error` 和当前轮 `delivery`。
+`audio_processing_status=DEGRADED/ERROR` 时，后端不会把受保护的自动插话宣称为可用；用户仍可使用显式停止。
+
 ### `tts.progress`
 
-v0.2 在 TTS 任务运行期间按后端播放器进度推送监控信息。`audio_returned_ms` 是 MiniMax 已返回的 PCM 总时长，`audio_played_ms` 是 Windows 音频回调已经消费的时长，`audio_remaining_ms` 是前两者之差，代表当前轮全部已返回但尚未播放的音频。它包括播放器队列以及已经返回、仍等待进入播放器的 PCM；前端不得只用某一个文本片段推导剩余时间。
+v0.2 在 TTS 任务运行期间按后端播放器进度推送监控信息。`audio_returned_ms` 是 MiniMax 已返回的 PCM 总时长，`audio_played_ms` 是 Windows 音频回调已经消费的时长，`audio_output_estimated_ms` 是考虑设备输出尾部后的保守设备位置估计，`audio_remaining_ms` 按该设备位置计算。这样保留了原回调计数的语义，同时避免在设备仍有输出尾部时过早释放旧播放窗口。它包括播放器队列以及已经返回、仍等待进入播放器的 PCM；前端不得只用某一个文本片段推导剩余时间。
 
 ```json
 {
@@ -278,7 +283,8 @@ v0.2 在 TTS 任务运行期间按后端播放器进度推送监控信息。`aud
     "audio_buffer_ms": 1800,
     "audio_returned_ms": 6120,
     "audio_played_ms": 4320,
-    "audio_remaining_ms": 1800,
+    "audio_output_estimated_ms": 4120,
+    "audio_remaining_ms": 2000,
     "pacing_enabled": true,
     "lead_ms": 2000,
     "trigger": "lead_window"
@@ -360,6 +366,57 @@ v0.2 在 TTS 任务运行期间按后端播放器进度推送监控信息。`aud
 }
 ```
 
+`turn.completed` 表示一轮已经终止，而不代表一定完整播放。中断或失败时仍由这个事件作为前端历史的唯一写入口，`status` 表示终止原因，`delivery.status` 表示实际传达程度：
+`full`、`partial`、`none` 或 `unknown`。
+
+```json
+{
+  "type": "turn.completed",
+  "seq": 8,
+  "timestamp": "2026-09-04T08:30:05.120Z",
+  "turn_id": "turn_000021",
+  "payload": {
+    "transcript": "帮我查资料",
+    "response": "第一句已经说完。第二句还没有播放。",
+    "completed_at": "2026-09-04T08:30:05.120Z",
+    "status": "interrupted",
+    "latency": {},
+    "delivery": {
+      "status": "partial",
+      "termination": "interrupted",
+      "heard_text": "第一句已经说完。",
+      "uncertain_text": "",
+      "unheard_text": "第二句还没有播放。",
+      "played_ms": 912,
+      "precision": "provider"
+    }
+  }
+}
+```
+
+### `turn.interrupted`
+
+这是自动插话确认后的即时状态事件，不写历史；随后必须发送带同一 `turn_id` 的 `turn.completed`。旧轮的 `turn.completed` 在新轮 `turn.started` 之前发送。
+
+```json
+{
+  "type": "turn.interrupted",
+  "seq": 7,
+  "timestamp": "2026-09-04T08:30:05.100Z",
+  "turn_id": "turn_000021",
+  "payload": {
+    "delivery": {
+      "status": "partial",
+      "termination": "interrupted",
+      "heard_text": "第一句已经说完。",
+      "uncertain_text": "正在播放的词",
+      "unheard_text": "第二句还没有播放。",
+      "precision": "uncertain"
+    }
+  }
+}
+```
+
 ### `error`
 
 推送后端错误。严重错误应同时通过 `session.state` 推送 `ERROR`。
@@ -385,6 +442,7 @@ v0.2 在 TTS 任务运行期间按后端播放器进度推送监控信息。`aud
 3. 当前轮消息必须匹配当前 `turn_id`；旧轮次迟到消息不得覆盖当前页面。
 4. 新的 `session.state` 携带不同 `turn_id` 时，前端清空当前轮文本和当前轮指标，但不删除历史；显式的空当前轮快照也会清理旧 turn。
 5. `turn.completed` 是历史记录的唯一写入口，历史最多保存 10 轮。
+   事件中的 `response` 是生成原文；下一轮 LLM 历史只使用 `delivery.heard_text`，并附带服务端的中断说明。
 6. `null` 指标显示为 `—`，不得使用前端默认值补全。
 7. 所有页面状态、文本、服务状态和延迟都以服务端数据为准。
 8. 前端禁止使用本地计时器或本地时间差计算语音链路延迟。

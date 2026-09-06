@@ -19,6 +19,9 @@ from ..core.events import event, utc_now_iso
 from ..core.state import TerminalState
 from ..kws.keywords import strip_wake_prefix
 from ..stream.text_bridge import TextBridge
+from ..tts.alignment import DeliveryResolver
+from ..tts.scheduling import DirectStreamingPolicy, PlaybackProgress, PlaybackWindowPolicy
+from ..tts.text_merger import BidiTextMerger
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +199,7 @@ class RealtimeController(TurnController):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await self._cancel_turn()
+                await self._cancel_turn(reason="failed", record=False)
                 code = getattr(exc, "code", None)
                 if not isinstance(code, str):
                     code = "ASR_WORKER_DISCONNECTED" if "ConnectionClosed" in type(exc).__name__ else "ASR_SEND_FAILED"
@@ -219,7 +222,7 @@ class RealtimeController(TurnController):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await self._cancel_turn()
+                await self._cancel_turn(reason="failed", record=False)
                 self.state.listening = False
                 try:
                     await self.capture.stop()
@@ -249,6 +252,13 @@ class RealtimeController(TurnController):
                 break
 
     async def handle_frame(self, frame: AudioFrame) -> None:
+        processed = (
+            await asyncio.to_thread(self._process_audio, frame.pcm)
+            if self.audio_processor is not None and self.audio_processor.enabled
+            else frame.pcm
+        )
+        if processed != frame.pcm:
+            frame = AudioFrame(processed, frame.start_sample, frame.captured_at)
         if self._last_frame and frame.start_sample != self._last_frame.end_sample:
             self._recent.clear()
             if self.workspace:
@@ -298,20 +308,72 @@ class RealtimeController(TurnController):
         if not self._active_input:
             if activity.speech_started:
                 self._resume_started = self._vad_origin + (activity.speech_start_sample or 0)
+            near_voice = self._near_voice_activity()
+            protected_available = self._barge_in_protected_available()
+            decision = self.barge_in_gate.feed(
+                activity,
+                now=frame.captured_at,
+                near_voice=near_voice,
+                protected_available=protected_available,
+            )
+            if activity.speech_started or decision.confirmed:
+                logger.info(
+                    "controller.barge_in_gate turn_id=%s vad_speech=%s near_voice=%s protected=%s "
+                    "candidate=%s confirmed=%s duration_ms=%d reason=%s",
+                    ws.turn_id,
+                    bool(activity.is_speech),
+                    near_voice,
+                    protected_available,
+                    decision.candidate,
+                    decision.confirmed,
+                    decision.duration_ms,
+                    decision.reason,
+                )
             valid_resume = self._resume_started is not None and (
                 (frame.end_sample if activity.is_speech else self._speech_end_sample or self._resume_started) - self._resume_started
             ) >= self.vad_min_speech_ms * 16
+            if valid_resume and self._resume_started is not None and not decision.confirmed:
+                speech_started_at = frame.captured_at - max(0, frame.end_sample - self._resume_started) / 16000
+                self.barge_in_gate.prime(speech_started_at)
+                decision = self.barge_in_gate.feed(
+                    activity,
+                    now=frame.captured_at,
+                    near_voice=near_voice,
+                    protected_available=protected_available,
+                )
             if valid_resume:
-                played = self.player.block() if self.player else ws.playback_started
-                if played or ws.playback_started or ws.hard_closed or frame.captured_at - ws.started_at >= self.options.max_turn_ms / 1000:
+                # A user continuation before the first output sample is the
+                # existing same-turn revision path.  It must remain usable
+                # when AEC is degraded because there is no assistant audio to
+                # confuse the microphone.  Once output has started, only the
+                # protected gate may interrupt it; a hard-closed turn is the
+                # one deterministic exception used to start the next turn.
+                has_started = ws.playback_started or bool(
+                    self.player is not None
+                    and getattr(self.player, "has_started", lambda _key: False)(ws.playback_key)
+                )
+                hard_boundary = ws.hard_closed or frame.captured_at - ws.started_at >= self.options.max_turn_ms / 1000
+                if not has_started and not hard_boundary:
+                    await self._resume(frame)
+                elif decision.confirmed or hard_boundary:
+                    # Invalidate the old generation before publishing the
+                    # interruption state so a concurrent LLM delta cannot
+                    # enqueue stale TTS between the snapshot and cancellation.
+                    self.turns.invalidate()
+                    snapshot = self._stop_playback_snapshot(ws.playback_key)
                     split = self._resume_started if ws.hard_closed else None
-                    await self._cancel_turn()
+                    await self._state_event(TerminalState.INTERRUPTING, listening=True, turn_id=ws.turn_id)
+                    await self._record_interruption(
+                        ws.turn_id,
+                        snapshot,
+                        speech_onset_at=self.barge_in_gate.candidate_started_at,
+                        interrupt_confirmed_at=frame.captured_at,
+                    )
+                    await self._cancel_turn(reason="interrupted", snapshot=snapshot)
                     if split is not None:
                         self._recent = deque(AudioFrame(f.pcm[max(0, split - f.start_sample) * 2:], max(split, f.start_sample), f.captured_at)
                                              for f in self._recent if f.end_sample > split)
                     await self._new_turn(frame)
-                else:
-                    await self._resume(frame)
                 self._resume_started = None
             elif activity.speech_ended:
                 self._resume_started = None
@@ -354,6 +416,7 @@ class RealtimeController(TurnController):
             ws.started_at = frame.captured_at - max(0, frame.end_sample - self._speech_start_sample) / 16000
         self.segmenter = TranscriptSegmenter(self.options.min_segment_chars, self.options.max_segment_chars)
         self._active_input = True
+        self.barge_in_gate.reset()
         self._last_candidate = 0
         self._turn_cancel = asyncio.Event()
         self._sub_parts.clear()
@@ -378,21 +441,66 @@ class RealtimeController(TurnController):
     def _start_scheduler(self) -> None:
         self.scheduler = PredictionScheduler(self._predict, self.options.prediction_interval_ms)
 
-    def _stop_generation(self) -> None:
+    def _stop_generation(self) -> list[asyncio.Task]:
+        stopped: list[asyncio.Task] = []
         if self.scheduler:
-            self._track(self.scheduler.stop())
+            task = self.scheduler.stop()
+            if task is not None:
+                stopped.append(task)
+                self._track(task)
         for task in (self._completion_task, self._refine_task, self._endpoint_task):
             if task and task is not asyncio.current_task() and not task.done():
                 task.cancel()
+                stopped.append(task)
                 self._track(task)
         self._completion_task = self._refine_task = self._endpoint_task = None
         if self._turn_cancel:
             self._turn_cancel.set()
+        return stopped
+
+    def _schedule_active_bidi_cancel(self) -> None:
+        """Put a superseded same-turn Bidi generation behind the cancel barrier.
+
+        A pre-playback continuation cancels the v0.2 answer task directly so
+        ASR can keep consuming the revised utterance.  The task's ``finally``
+        block intentionally keeps a healthy persistent Bidi socket open, so
+        cancelling the Python task alone is insufficient: the provider could
+        still synthesize the old generation while the revised answer starts.
+        Schedule the same cancel barrier used by a confirmed interruption;
+        the next TTS sender waits for it before sending new text.
+        """
+
+        session = self._tts_session
+        cancel = getattr(session, "cancel", None) if session is not None else None
+        if session is None or not getattr(session, "bidi", False) or cancel is None:
+            return
+        if bool(getattr(session, "generation_finished", False)) and not bool(
+            getattr(session, "generation_active", True)
+        ):
+            return
+        if self._tts_cancel_task is None or self._tts_cancel_task.done():
+            self._tts_cancel_task = asyncio.create_task(
+                self._cancel_bidi_in_background(session, cancel),
+                name="tts-cancel-resume",
+            )
 
     async def _resume(self, frame: AudioFrame) -> None:
         ws = self.workspace
+        # A same-turn continuation cancels the frozen answer before the first
+        # output sample is heard.  There may still be PCM queued between the
+        # provider reader and PortAudio, so close that generation's playback
+        # gate atomically; otherwise the superseded answer could start while
+        # the revised input is being recognized.
+        self._stop_playback_snapshot(ws.playback_key)
         ws.resume()  # Invalidate before cancelling or awaiting any operation.
-        self._stop_generation()
+        self._schedule_active_bidi_cancel()
+        # A same-turn revision owns a fresh generation.  Do not let provider
+        # subtitle spans or local sentence boundaries from the superseded
+        # generation affect its delivery settlement.
+        self._delivery_resolvers[ws.turn_id] = DeliveryResolver()
+        stopped = self._stop_generation()
+        if stopped:
+            await asyncio.gather(*stopped, return_exceptions=True)
         # A continuation is a new generation of the same turn.  Tool cache
         # entries and visible tool states from the interrupted generation must
         # not be reused or reported as if they belonged to the new input.
@@ -410,8 +518,11 @@ class RealtimeController(TurnController):
         ws.timings = {k: v for k, v in ws.timings.items() if k in {"first_segment", "first_prediction", "asr_first_text"}}
         self.state.current.update(
             final_text="", assistant_text="", tts_text="", tts_status="IDLE",
-            audio_buffer_ms=0, tts_returned_ms=0, tts_played_ms=0, tts_remaining_ms=0,
+            audio_buffer_ms=0, tts_returned_ms=0, tts_played_ms=0,
+            tts_output_estimated_ms=0, tts_remaining_ms=0,
+            delivery={},
         )
+        self.barge_in_gate.reset()
         # New ASR cache for the resumed subsegment; earlier final callbacks still
         # update their own part and cannot overwrite the resumed part.
         seed = b"".join(f.pcm for f in self._recent if f.end_sample > (self._resume_started or frame.start_sample))
@@ -535,7 +646,7 @@ class RealtimeController(TurnController):
         sub_id, text = message.get("turn_id"), message.get("text")
         if message.get("type") == "error":
             if sub_id is None or sub_id in self._sub_parts:
-                await self._cancel_turn()
+                await self._cancel_turn(reason="failed", record=False)
                 code = str(message.get("code") or "ASR_WORKER_ERROR")
                 if code == "ASR_WORKER_DISCONNECTED":
                     await self._handle_asr_disconnect()
@@ -703,7 +814,8 @@ class RealtimeController(TurnController):
         return True
 
     async def _answer(self, ws, token) -> str:
-        bridge = TextBridge(**self.bridge_options)
+        transport = getattr(self.tts, "transport", "websocket") if self.tts is not None else "websocket"
+        bridge = BidiTextMerger(max_chars=128, max_wait_ms=30) if transport == "websocket_bidi" else TextBridge(**self.bridge_options)
         session = None
         reader = None
         sender_task = None
@@ -712,8 +824,19 @@ class RealtimeController(TurnController):
         tts_failed: Exception | None = None
         tts_disabled = False
         playback_key = ws.playback_key
-        pacing_enabled = bool(self.options.tts_pacing and self.player is not None)
-        lead_ms = max(1, self.options.tts_lead_ms)
+        configured_scheduling = getattr(
+            self.tts,
+            "effective_scheduling",
+            getattr(self.tts, "scheduling", "auto") if self.tts is not None else "auto",
+        )
+        if transport == "websocket_bidi" or configured_scheduling == "direct":
+            scheduling_policy = DirectStreamingPolicy()
+        elif configured_scheduling == "playback_window" or self.options.tts_pacing:
+            scheduling_policy = PlaybackWindowPolicy(max(1, self.options.tts_lead_ms))
+        else:
+            scheduling_policy = DirectStreamingPolicy()
+        pacing_enabled = isinstance(scheduling_policy, PlaybackWindowPolicy) and self.player is not None
+        lead_ms = scheduling_policy.lead_ms
         # The queue keeps the LLM consumer independent from the playback
         # clock, while still putting a hard bound on text waiting for TTS.
         pending_segments: deque[str] = deque()
@@ -724,8 +847,11 @@ class RealtimeController(TurnController):
         producer_done = False
         audio_returned_bytes = 0
         progress_lock = asyncio.Lock()
-        last_progress: tuple[int, int, int, int] | None = None
+        last_progress: tuple[int, int, int, int, int] | None = None
         last_progress_at = 0.0
+        resolver = self._delivery_resolvers.setdefault(ws.turn_id, DeliveryResolver())
+        completed_markers = 0
+        alignment_cursor = 0
         audio_bytes_per_second = (
             self.player.sample_rate * self.player.channels * 2
             if self.player is not None else 32000 * 2
@@ -740,17 +866,25 @@ class RealtimeController(TurnController):
             returned_ms = int(received_bytes * 1000 / audio_bytes_per_second)
             if self.player is None:
                 played_ms = 0
+                output_estimated_ms = 0
                 queued_ms = 0
                 started = False
             else:
                 current = self.player.progress(playback_key)
                 played_ms = int(current["played_ms"])
+                output_estimated_ms = int(
+                    current.get("output_estimated_ms", current["played_ms"]) or 0
+                )
                 queued_ms = int(current["buffered_ms"])
                 started = bool(current["started"])
             return {
                 "returned_ms": returned_ms,
                 "played_ms": played_ms,
-                "remaining_ms": max(0, returned_ms - played_ms),
+                # Keep callback consumption visible as ``played_ms`` while
+                # using the conservative device position for scheduling and
+                # remaining-audio calculations.
+                "output_estimated_ms": output_estimated_ms,
+                "remaining_ms": max(0, returned_ms - output_estimated_ms),
                 "queued_ms": queued_ms,
                 "started": started,
             }
@@ -765,6 +899,7 @@ class RealtimeController(TurnController):
                 now = time.monotonic()
                 signature = (
                     int(snapshot["returned_ms"]), int(snapshot["played_ms"]),
+                    int(snapshot["output_estimated_ms"]),
                     int(snapshot["remaining_ms"]), int(snapshot["queued_ms"]),
                 )
                 # Audio callbacks can arrive dozens of times per second.  A
@@ -780,6 +915,7 @@ class RealtimeController(TurnController):
                 self.state.current.update(
                     tts_returned_ms=int(snapshot["returned_ms"]),
                     tts_played_ms=int(snapshot["played_ms"]),
+                    tts_output_estimated_ms=int(snapshot["output_estimated_ms"]),
                     tts_remaining_ms=int(snapshot["remaining_ms"]),
                     audio_buffer_ms=int(snapshot["queued_ms"]),
                 )
@@ -801,6 +937,7 @@ class RealtimeController(TurnController):
                     audio_buffer_ms=int(snapshot["queued_ms"]),
                     audio_returned_ms=int(snapshot["returned_ms"]),
                     audio_played_ms=int(snapshot["played_ms"]),
+                    audio_output_estimated_ms=int(snapshot["output_estimated_ms"]),
                     audio_remaining_ms=int(snapshot["remaining_ms"]),
                     pacing_enabled=pacing_enabled,
                     lead_ms=lead_ms,
@@ -808,7 +945,7 @@ class RealtimeController(TurnController):
                 )
 
         async def read_audio(active_session):
-            nonlocal audio_returned_bytes
+            nonlocal audio_returned_bytes, completed_markers, alignment_cursor
 
             try:
                 async for pcm in active_session.audio_chunks():
@@ -821,11 +958,28 @@ class RealtimeController(TurnController):
                         # Keep the native player bounded.  Audio held by the
                         # provider spool is included in audio_remaining_ms
                         # through the session's network receive counter.
-                        while self.player.buffered_ms > 2000:
+                        while self.player.buffered_ms > max(1, self.options.tts_local_buffer_ms):
                             await asyncio.sleep(.02)
                             if not self._valid(token):
                                 return
                         self.player.enqueue(playback_key, pcm)
+                    # Bidi sentence/request boundaries do not include the
+                    # sentence text, so they cannot safely close a local
+                    # client chunk.  Do not equate a task_continue frame with
+                    # a server sentence; wait for a provider subtitle span.
+                    current_markers = (
+                        int(getattr(active_session, "completed_segments", 0))
+                        if not getattr(active_session, "bidi", False)
+                        else 0
+                    )
+                    while completed_markers < current_markers:
+                        completed_markers += 1
+                        resolver.mark_boundary(int(playback_progress()["returned_ms"]))
+                    nonlocal_alignment = getattr(active_session, "alignment_events", ())
+                    for alignment in nonlocal_alignment[alignment_cursor:]:
+                        if alignment is not None:
+                            resolver.add_provider_alignment(alignment)
+                    alignment_cursor = len(nonlocal_alignment)
                     self.state.current["tts_status"] = "STREAMING"
                     await emit_progress(status="STREAMING", trigger="audio_received")
                     await self._latency(ws)
@@ -852,40 +1006,31 @@ class RealtimeController(TurnController):
                 return None
             return reader.exception()
 
+        def reader_failure() -> Exception | None:
+            if reader is None or not reader.done() or reader.cancelled():
+                return None
+            return reader.exception()
+
         async def wait_for_audio(before_bytes: int) -> None:
             if not pacing_enabled:
                 return
-            deadline = asyncio.get_running_loop().time() + 15.0
-            while audio_returned_bytes <= before_bytes:
-                if not self._valid(token) or tts_disabled:
-                    return
-                receiver_error = await reader_exception()
-                if receiver_error is not None:
-                    raise receiver_error
-                audio_signal.clear()
-                if audio_returned_bytes > before_bytes:
-                    break
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise TimeoutError("TTS 文本发送后未收到音频")
-                try:
-                    await asyncio.wait_for(audio_signal.wait(), remaining)
-                except asyncio.TimeoutError as exc:
-                    raise TimeoutError("TTS 文本发送后未收到音频") from exc
+            await scheduling_policy.wait_for_audio(
+                before_bytes,
+                lambda: audio_returned_bytes,
+                lambda: self._valid(token) and not tts_disabled,
+                audio_signal,
+                failure=reader_failure,
+            )
             await emit_progress(status="STREAMING", trigger="audio_available")
 
         async def wait_for_playback_window() -> None:
             if not pacing_enabled:
                 return
-            deadline = asyncio.get_running_loop().time() + 600.0
-            while self._valid(token) and not tts_disabled:
-                snapshot = playback_progress()
-                if int(snapshot["remaining_ms"]) <= lead_ms:
-                    return
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise TimeoutError("TTS 播放进度长时间没有下降")
-                await emit_progress(status="WAITING_PLAYBACK", trigger="lead_window")
-                await asyncio.sleep(.05)
+            await scheduling_policy.wait_before_send(
+                lambda: PlaybackProgress.from_mapping(playback_progress()),
+                lambda: self._valid(token) and not tts_disabled,
+                lambda snapshot: emit_progress(status="WAITING_PLAYBACK", trigger="lead_window"),
+            )
 
         async def next_segment() -> str | None:
             while not pending_segments and not producer_done and not tts_disabled and self._valid(token):
@@ -911,8 +1056,10 @@ class RealtimeController(TurnController):
                     if not self._valid(token):
                         return
                     if session is None:
+                        await self._await_tts_cancel_barrier()
                         session = self.tts.session()
                         await session.start()
+                        self._tts_session = session
                         reader = asyncio.create_task(read_audio(session), name=f"tts-audio-{ws.turn_id}")
                         progress_task = asyncio.create_task(monitor_progress(), name=f"tts-progress-{ws.turn_id}")
                     if sent_any:
@@ -924,6 +1071,7 @@ class RealtimeController(TurnController):
                     before_segments = getattr(session, "completed_segments", 0)
                     ws.timings.setdefault("first_tts_text", time.monotonic())
                     self.state.current["tts_text"] = segment
+                    resolver.add_text(segment, int(playback_progress()["returned_ms"]))
                     await session.send_text(segment)
                     await emit_progress(
                         status="QUEUED",
@@ -1009,7 +1157,9 @@ class RealtimeController(TurnController):
                 ws.timings.setdefault("first_token", time.monotonic())
                 parts.append(delta)
                 self.state.current["assistant_text"] = "".join(parts)
+                ws.staged_response = "".join(parts).strip()
                 await self._detail("assistant.delta", text_delta=delta)
+                await send(bridge.flush_due(now=time.monotonic()))
                 await send(bridge.feed(delta))
                 await self._latency(ws)
             ws.staged_response = "".join(parts).strip()
@@ -1019,7 +1169,11 @@ class RealtimeController(TurnController):
                 await sender_task
             if session:
                 try:
-                    await session.finish()
+                    flush = getattr(session, "flush", None)
+                    if flush is not None and getattr(session, "bidi", False):
+                        await flush()
+                    elif not getattr(session, "bidi", False):
+                        await session.finish()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -1043,6 +1197,17 @@ class RealtimeController(TurnController):
                                 raise TimeoutError("TTS 接收或播放长时间没有进展")
                             await asyncio.wait({reader}, timeout=.2)
                         await reader
+                        alignment_events = getattr(session, "alignment_events", ())
+                        for alignment in alignment_events[alignment_cursor:]:
+                            if alignment is not None:
+                                resolver.add_provider_alignment(alignment)
+                        alignment_cursor = len(alignment_events)
+                        # A Bidi flush may have no usable subtitle or sentence
+                        # boundary.  Finish local fallback spans at the last
+                        # returned PCM position; never infer word timing from
+                        # text length.
+                        if getattr(session, "generation_finished", False) and self.player is not None:
+                            resolver.complete_pending(int(playback_progress()["returned_ms"]))
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -1052,7 +1217,7 @@ class RealtimeController(TurnController):
             if self.player:
                 playback_timeout = max(120.0, 30.0 + self.player.buffered_ms / 1000)
                 try:
-                    await self.player.wait_until_empty(timeout_seconds=playback_timeout)
+                    await self.player.wait_until_output_complete(timeout_seconds=playback_timeout)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -1092,8 +1257,10 @@ class RealtimeController(TurnController):
                 if not reader.done():
                     reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
-            if session:
+            if session and not (getattr(session, "reusable", False) and tts_failed is None):
                 await session.close()
+            if self._tts_session is session:
+                self._tts_session = session if getattr(session, "reusable", False) and tts_failed is None else None
 
     def _on_playback_started(self, key: str) -> None:
         ws = self.workspace
@@ -1136,12 +1303,55 @@ class RealtimeController(TurnController):
     async def _finish_v2(self, ws, response):
         if self.workspace is not ws:
             return
-        if response:
-            self.history.append_exchange(ws.final_text, response)
+        delivery = {
+            "status": "full" if response else "none",
+            "termination": "completed",
+            "heard_text": response,
+            "uncertain_text": "",
+            "unheard_text": "",
+            "precision": "complete",
+        }
+        if self.player is not None:
+            progress_reader = getattr(self.player, "progress", None)
+            if callable(progress_reader):
+                progress = progress_reader(ws.playback_key)
+                delivery["played_ms"] = int(progress.get("output_estimated_ms", progress.get("played_ms", 0)) or 0)
+                delivery["callback_played_ms"] = int(progress.get("played_ms", 0) or 0)
+                delivery["output_tail_estimated_ms"] = max(
+                    0,
+                    delivery["callback_played_ms"] - delivery["played_ms"],
+                )
+                delivery["playback_precision"] = "device_time" if progress.get("device_output_time") is not None else "callback"
+        if self.state.current.get("tts_status") == "DEGRADED":
+            snapshot = self._stop_playback_snapshot(ws.playback_key)
+            resolver = self._delivery_resolvers.get(ws.turn_id)
+            if resolver is not None:
+                delivery = resolver.resolve(snapshot or {"started": False}, response)
+            else:
+                delivery = {
+                    "status": "unknown",
+                    "heard_text": "",
+                    "uncertain_text": response,
+                    "unheard_text": "",
+                    "precision": "unknown",
+                    "played_ms": snapshot.output_estimated_ms if snapshot else 0,
+                }
+            delivery["termination"] = "failed"
+            self._add_playback_delivery_fields(delivery, snapshot)
+        ws.delivery = delivery
+        self.state.current["delivery"] = dict(delivery)
+        if ws.final_text:
+            self.history.append_exchange(ws.final_text, delivery.get("heard_text", ""), delivery=delivery)
         ws.timings["completed"] = time.monotonic()
         await self._latency(ws, complete=True)
         latency = self.state.latency["values"]
-        self.history.append_record(turn_id=ws.turn_id, transcript=ws.final_text, response=response, latency=latency)
+        self.history.append_record(
+            turn_id=ws.turn_id,
+            transcript=ws.final_text,
+            response=response,
+            latency=latency,
+            delivery=delivery,
+        )
         # Preserve a provider/playback degradation that was reported while
         # the textual answer was still completed.  Replacing it with
         # FINISHED would make the WebUI hide the reason the tail was not
@@ -1150,17 +1360,80 @@ class RealtimeController(TurnController):
             self.state.current["audio_buffer_ms"] = 0
         else:
             self.state.current.update(tts_status="FINISHED", audio_buffer_ms=0)
-        await self._detail("turn.completed", transcript=ws.final_text, response=response, completed_at=utc_now_iso(), latency=latency)
-        await self._cancel_turn()
+        self._interrupted_turns.add(ws.turn_id)
+        await self._detail(
+            "turn.completed",
+            transcript=ws.final_text,
+            response=response,
+            completed_at=utc_now_iso(),
+            latency=latency,
+            status=delivery.get("termination", "completed"),
+            delivery=delivery,
+        )
+        await self._cancel_turn(reason="completed")
         await self._state_event(TerminalState.IDLE, listening=self.state.listening)
 
-    async def _cancel_turn(self) -> None:
-        ws, self.workspace = self.workspace, None
+    async def _cancel_turn(
+        self,
+        *,
+        reason: str = "stopped",
+        snapshot=None,
+        record: bool = True,
+    ) -> None:
+        ws = self.workspace
+        if record and ws is not None and reason != "interrupted" and ws.turn_id not in self._interrupted_turns:
+            if snapshot is None and self.player:
+                snapshot = self._stop_playback_snapshot(ws.playback_key)
+            await self._record_interruption(
+                ws.turn_id,
+                snapshot,
+                termination=reason,
+                publish_interrupted=False,
+            )
+        self.workspace = None
         self.turns.invalidate()
         self._active_input = False
-        self._stop_generation()
-        if self.player:
-            self.player.block()
+        self.barge_in_gate.reset()
+        if self.player and snapshot is None:
+            # Gate and snapshot the old playback before sending a network
+            # cancellation.  A late audio callback then has no route into the
+            # next generation.
+            self._stop_playback_snapshot(ws.playback_key if ws else None)
+        active_tts = self._tts_session
+        keep_tts_session = False
+        if active_tts is not None:
+            cancel = getattr(active_tts, "cancel", None)
+            if reason == "completed" and getattr(active_tts, "generation_finished", False):
+                # Normal Bidi completion already crossed task_flushed.  Keep
+                # the connection idle for the next turn; do not turn the
+                # normal finish into a second task_cancel.
+                keep_tts_session = True
+            elif getattr(active_tts, "bidi", False) and cancel is not None:
+                idle_generation = bool(getattr(active_tts, "generation_finished", False)) and not bool(
+                    getattr(active_tts, "generation_active", True)
+                )
+                if idle_generation:
+                    keep_tts_session = True
+                elif self._tts_cancel_task is None or self._tts_cancel_task.done():
+                    self._tts_cancel_task = asyncio.create_task(
+                        self._cancel_bidi_in_background(active_tts, cancel),
+                        name=f"tts-cancel-{ws.turn_id if ws else 'idle'}",
+                    )
+                    keep_tts_session = True
+                else:
+                    keep_tts_session = True
+            elif cancel is not None:
+                try:
+                    keep_tts_session = bool(await asyncio.wait_for(cancel(timeout_seconds=2.0), 2.0))
+                except Exception:
+                    logger.warning("controller.v02_tts_cancel_degraded turn_id=%s", ws.turn_id if ws else None, exc_info=True)
+        stopped = self._stop_generation()
+        if stopped:
+            await asyncio.gather(*stopped, return_exceptions=True)
+        if active_tts is not None and not (keep_tts_session and getattr(active_tts, "reusable", False)):
+            await active_tts.close()
+        if self._tts_session is active_tts:
+            self._tts_session = active_tts if keep_tts_session and getattr(active_tts, "reusable", False) else None
         if ws:
             self.registry.cancel_turn(ws.turn_id)
         for sub_id in self._sub_parts:

@@ -933,6 +933,41 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await c.close()
 
+    async def test_protected_near_voice_interrupts_before_max_turn_boundary(self):
+        c = controller(max_turn_ms=60000)
+
+        class NearVoiceProcessor:
+            enabled = True
+            status = "READY"
+            error = None
+            last_voice_activity = True
+            protected_interruption_available = True
+
+            def process(self, pcm):
+                return pcm
+
+            def reset(self):
+                return None
+
+        c.audio_processor = NearVoiceProcessor()
+        try:
+            frame = await begin(c)
+            old = c.workspace.turn_id
+            await c._freeze("test", frame)
+            c.workspace.committed = True
+            c.player.allow(c.workspace.playback_key)
+            c.player.enqueue(c.workspace.playback_key, b"11")
+            c.player._callback(bytearray(2), 1, None, None)
+            c._resume_started = 16000
+            c.vad.activity = VadActivity(True, False, False)
+
+            # Keep the sample timestamp well before max_turn_ms so a new turn
+            # can only be caused by the protected near-end voice gate.
+            await c.handle_frame(AudioFrame(b"22" * 4800, 16000, frame.captured_at + .3))
+            self.assertNotEqual(c.workspace.turn_id, old)
+        finally:
+            await c.close()
+
     async def test_post_freeze_silence_does_not_overflow_workspace_audio(self):
         c = controller()
         try:

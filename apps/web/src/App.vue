@@ -77,6 +77,7 @@ const contextSpeechEmotion = computed(() => {
 
 const serviceRows = computed(() => [
   { key: 'audio', label: 'Audio', value: terminal.services.audio },
+  { key: 'audio_processing', label: 'AEC / NS', value: terminal.current.audio_processing_status || 'DISABLED' },
   { key: 'kws', label: 'KWS', value: terminal.services.kws },
   { key: 'asr', label: 'ASR Worker', value: terminal.services.asr },
   { key: 'llm', label: 'LLM', value: terminal.services.llm },
@@ -94,6 +95,25 @@ function displayText(value: string | null | undefined) {
 
 function statusClass(status: string) {
   return status.toLowerCase().replace(/\s+/g, '-')
+}
+
+function deliveryStatusLabel(delivery: { status?: string; termination?: string } | undefined) {
+  if (!delivery) return '播放信息不可用'
+  const status: Record<string, string> = {
+    full: '已完整传达',
+    partial: '已传达前缀',
+    none: '未传达',
+    unknown: '传达边界未知',
+  }
+  const termination: Record<string, string> = {
+    interrupted: '被插话打断',
+    failed: 'TTS 失败',
+    stopped: '手动停止',
+    completed: '正常结束',
+  }
+  const state = status[delivery.status || ''] || delivery.status || '播放信息不可用'
+  const reason = termination[delivery.termination || '']
+  return reason ? `${state} · ${reason}` : state
 }
 </script>
 
@@ -269,7 +289,18 @@ function statusClass(status: string) {
             <p>{{ displayText(terminal.current.tts_text) }}</p>
             <div class="buffer-meta"><span>已返回音频</span><strong>{{ formatMs(terminal.current.tts_returned_ms) }}</strong></div>
             <div class="buffer-meta"><span>已实际播放</span><strong>{{ formatMs(terminal.current.tts_played_ms) }}</strong></div>
+            <div class="buffer-meta"><span>设备输出估计</span><strong>{{ formatMs(terminal.current.tts_output_estimated_ms) }}</strong></div>
             <div class="buffer-meta"><span>待播放总时长</span><strong>{{ formatMs(terminal.current.tts_remaining_ms ?? terminal.current.audio_buffer_ms) }}</strong></div>
+          </div>
+          <div v-if="terminal.current.delivery && (terminal.current.delivery.status || terminal.current.delivery.termination)" class="delivery-card">
+            <div class="delivery-heading"><span>DELIVERY</span><strong>{{ deliveryStatusLabel(terminal.current.delivery) }}</strong></div>
+            <p><b>已传达：</b>{{ displayText(terminal.current.delivery.heard_text) }}</p>
+             <p v-if="terminal.current.delivery.uncertain_text"><b>边界不确定：</b>{{ terminal.current.delivery.uncertain_text }}</p>
+             <p v-if="terminal.current.delivery.unheard_text"><b>未传达：</b>{{ terminal.current.delivery.unheard_text }}</p>
+             <p v-if="terminal.current.delivery.speech_onset_to_confirm_ms != null"><b>语音起点 → 确认：</b>{{ formatMs(terminal.current.delivery.speech_onset_to_confirm_ms) }}</p>
+             <p v-if="terminal.current.delivery.confirm_to_stop_ms != null"><b>确认到停播：</b>{{ formatMs(terminal.current.delivery.confirm_to_stop_ms) }}</p>
+             <p v-if="terminal.current.delivery.output_tail_estimated_ms != null"><b>设备尾部估计：</b>{{ formatMs(terminal.current.delivery.output_tail_estimated_ms) }}</p>
+             <small v-if="terminal.current.delivery.precision">定位精度：{{ terminal.current.delivery.precision }}</small>
           </div>
         </div>
       </article>
@@ -312,6 +343,9 @@ function statusClass(status: string) {
             <div class="history-copy">
               <p class="history-transcript">{{ displayText(turn.transcript) }}</p>
               <p class="history-response">{{ displayText(turn.response) }}</p>
+              <span class="history-delivery" :class="statusClass(turn.delivery?.status || 'unknown')">{{ deliveryStatusLabel(turn.delivery) }}</span>
+              <p v-if="turn.delivery?.heard_text" class="history-heard">已传达：{{ turn.delivery.heard_text }}</p>
+              <p v-if="turn.delivery?.uncertain_text" class="history-uncertain">不确定：{{ turn.delivery.uncertain_text }}</p>
               <span class="history-time">{{ displayText(turn.completed_at) }}</span>
             </div>
             <div class="history-metrics">

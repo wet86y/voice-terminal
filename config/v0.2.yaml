@@ -6,11 +6,18 @@ v02:
   predictions: true
   tools: true
   max_turn_ms: 60000
-  # Keep the complete returned audio queue at most two seconds ahead of
-  # playback before releasing the next text batch to MiniMax.
-  tts_pacing: true
-  tts_lead_ms: 2000
+  tts_local_buffer_ms: 2000
   allowed_roots: [docs]
+
+tts:
+  transport: websocket_bidi
+  websocket_path: /ws/v1/t2a_v2_bidi
+  scheduling: direct
+  subtitle_enable: true
+  subtitle_type: word_streaming
+  audio_cache_max_bytes: 67108864
+  cancel_timeout_ms: 2000
+  keepalive_seconds: 30
 
 # Keep streaming TTS sentence-oriented.  Commas and enumeration pauses remain
 # in the text but do not create a burst of tiny task_continue frames.
@@ -21,3 +28,10 @@ text_bridge:
 # when an external speaker or headset is connected after the service starts.
 audio:
   output_device: null
+  processing_enabled: true
+  processing_required: false
+  echo_cancellation: true
+  noise_suppression: true
+  automatic_gain_control: false
+  # Conservative device tail when PortAudio has no usable DAC timestamp.
+  device_latency_ms: 60

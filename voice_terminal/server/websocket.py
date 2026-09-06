@@ -8,10 +8,12 @@ from typing import Any
 from ..audio.capture import AudioCapture
 from ..audio.devices import AudioDeviceError
 from ..audio.player import AudioPlayerError, PcmPlayer
+from ..audio.processing import AudioPreprocessor
 from ..asr.client import AsrWorkerClient
 from ..config import AppConfig
 from ..controller.turn_controller import TurnController
 from ..controller.realtime_controller import RealtimeController
+from ..vad.barge_in import BargeInGate
 from ..core.event_bus import EventBus
 from ..core.events import VoiceEvent, event
 from ..core.state import RuntimeState, TerminalState
@@ -46,6 +48,7 @@ class VoiceRuntime:
         self.llm: DeepSeekClient | None = None
         self.tts: MiniMaxTtsClient | None = None
         self.player: PcmPlayer | None = None
+        self.audio_processor: AudioPreprocessor | None = None
         self.controller: TurnController | None = None
         self._session_lock = asyncio.Lock()
 
@@ -71,6 +74,30 @@ class VoiceRuntime:
             self.state.set_service("audio", "READY")
         except Exception as exc:
             self._record_error("audio", str(exc))
+
+        try:
+            self.audio_processor = AudioPreprocessor(
+                sample_rate=self.config.audio.sample_rate,
+                channels=self.config.audio.channels,
+                reverse_sample_rate=self.config.tts.sample_rate,
+                enabled=self.config.audio.processing_enabled,
+                required=self.config.audio.processing_required,
+                enable_aec=self.config.audio.echo_cancellation,
+                enable_ns=self.config.audio.noise_suppression,
+                enable_agc=self.config.audio.automatic_gain_control,
+            )
+            if self.audio_processor.enabled and self.audio_processor.status in {"ERROR", "DEGRADED"}:
+                logger.warning("audio.processing_status status=%s error=%s", self.audio_processor.status, self.audio_processor.error)
+            self.state.current.update(
+                audio_processing_status=self.audio_processor.status,
+                audio_processing_error=self.audio_processor.error or "",
+            )
+        except Exception as exc:
+            self._record_error("audio_processing", str(exc), status_service="audio")
+            self.state.current.update(
+                audio_processing_status="ERROR",
+                audio_processing_error=str(exc),
+            )
 
         if self.config.wake.enabled:
             try:
@@ -135,6 +162,17 @@ class VoiceRuntime:
                 sample_rate=self.config.tts.sample_rate,
                 voice_id=self.config.tts.voice_id,
                 timeout_ms=self.config.tts.timeout_ms,
+                transport=self.config.tts.transport,
+                scheduling=self.config.tts.scheduling,
+                subtitle_enable=self.config.tts.subtitle_enable,
+                subtitle_type=self.config.tts.subtitle_type,
+                audio_cache_max_bytes=self.config.tts.audio_cache_max_bytes,
+                cancel_timeout_ms=self.config.tts.cancel_timeout_ms,
+                keepalive_seconds=self.config.tts.keepalive_seconds,
+            )
+            self.state.current.update(
+                tts_transport=self.config.tts.transport,
+                tts_scheduling=self.config.tts.effective_scheduling,
             )
             try:
                 if self.config.tts.output_format.lower() != "pcm":
@@ -143,6 +181,8 @@ class VoiceRuntime:
                     sample_rate=self.config.tts.sample_rate,
                     channels=1,
                     output_device=self.config.audio.output_device,
+                    device_latency_ms=self.config.audio.device_latency_ms,
+                    on_audio_rendered=(self.audio_processor.push_reverse if self.audio_processor else None),
                 )
                 self.player.start()
                 self.state.set_service("tts", "READY")
@@ -177,6 +217,8 @@ class VoiceRuntime:
             bridge_max_chars=self.config.text_bridge.max_chars,
             bridge_max_wait_ms=self.config.text_bridge.max_wait_ms,
             bridge_breaks=self.config.text_bridge.preferred_breaks,
+            audio_processor=self.audio_processor,
+            barge_in_gate=BargeInGate(min_speech_ms=max(250, self.config.vad.min_speech_ms), enabled=True),
         )
         await self.controller.initialize()
 
@@ -200,6 +242,10 @@ class VoiceRuntime:
     async def close(self) -> None:
         if self.controller is not None:
             await self.controller.close()
+        if self.tts is not None:
+            await self.tts.close()
+        if self.audio_processor is not None:
+            self.audio_processor.close()
 
     def health_payload(self) -> dict[str, Any]:
         return {

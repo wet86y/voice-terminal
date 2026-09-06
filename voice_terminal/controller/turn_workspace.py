@@ -71,6 +71,11 @@ class TurnWorkspace:
     tools: list[dict] = field(default_factory=list)
     agent_phase: str = "IDLE"
     analysis: dict = field(default_factory=dict)
+    # TTS delivery bookkeeping is kept separate from the generated response.
+    # A response can be fully generated while only a prefix reached the user.
+    tts_segments: list[dict] = field(default_factory=list)
+    delivery: dict = field(default_factory=dict)
+    interruption_recorded: bool = False
     timings: dict[str, float] = field(default_factory=dict)
 
     @property
@@ -98,6 +103,9 @@ class TurnWorkspace:
         self.prediction.clear()
         self.prediction_revision = None
         self.agent_phase = "IDLE"
+        self.tts_segments.clear()
+        self.delivery.clear()
+        self.interruption_recorded = False
 
     def snapshot(self) -> dict:
         return {
@@ -108,4 +116,6 @@ class TurnWorkspace:
             "prediction_revision": self.prediction_revision,
             "tools": list(self.tools), "audio_cues": list(self.audio_cues),
             "analysis": dict(self.analysis),
+            "tts_segments": [dict(item) for item in self.tts_segments],
+            "delivery": dict(self.delivery),
         }

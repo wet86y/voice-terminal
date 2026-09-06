@@ -25,6 +25,9 @@ class V02Options:
     # dataclass default keeps older callers on the immediate-send behavior.
     tts_pacing: bool = False
     tts_lead_ms: int = 2000
+    # This is the native PCM queue cap, distinct from the legacy text pacing
+    # window.  Bidi uses direct text streaming but still needs a bounded player.
+    tts_local_buffer_ms: int = 2000
     allowed_roots: tuple[Path, ...] = field(default_factory=lambda: (Path(__file__).resolve().parents[2] / "docs",))
 
     @classmethod
@@ -42,7 +45,8 @@ class V02Options:
                 raise ValueError(f"v02.{key} must be boolean")
         result = cls(**values)
         for key in ("candidate_ms", "recheck_ms", "smart_timeout_ms", "hard_silence_ms", "refine_timeout_ms",
-                    "prediction_interval_ms", "min_segment_chars", "max_segment_chars", "max_turn_ms", "tts_lead_ms"):
+                    "prediction_interval_ms", "min_segment_chars", "max_segment_chars", "max_turn_ms", "tts_lead_ms",
+                    "tts_local_buffer_ms"):
             value = getattr(result, key)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"v02.{key} must be a positive integer")

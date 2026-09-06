@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import logging
 import tempfile
@@ -16,6 +17,7 @@ class MiniMaxTtsError(RuntimeError):
 class MiniMaxTtsSession:
     def __init__(self, client: "MiniMaxTtsClient") -> None:
         self.client = client
+        self.bidi = getattr(client, "transport", "websocket") == "websocket_bidi"
         self._socket: Any = None
         self._receiver: asyncio.Task[None] | None = None
         # One event-loop owns the file and its independent read/write offsets.
@@ -24,7 +26,13 @@ class MiniMaxTtsSession:
         self._read_offset = 0
         self._cache_peak_bytes = 0
         self._audio_available = asyncio.Event()
+        # A Bidi connection stays alive across generations.  ``_generation_done``
+        # marks the end of the current task (flush/cancel), while the receive
+        # task itself continues to accept the next task_continue frame.
+        self._generation_done = asyncio.Event()
+        self._generation_active = False
         self._closed = False
+        self._connection_dead = False
         self._server_finished = False
         self._completed_segments = 0
         self._segment_available = asyncio.Event()
@@ -36,6 +44,53 @@ class MiniMaxTtsSession:
         self._audio_chunks_received = 0
         self._audio_bytes_received = 0
         self._last_event: str | None = None
+        self._cancel_confirmed = asyncio.Event()
+        self._cancel_requested = False
+        self._flush_confirmed = asyncio.Event()
+        self._sentence_available = asyncio.Event()
+        self._sentence_count = 0
+        # MiniMax subtitle timestamps are relative to each server sentence.
+        # Keep the sentence epoch and the PCM origin captured at
+        # ``sentence_start`` so alignment consumers can place words on the
+        # task-global playback clock.
+        self._sentence_index = 0
+        self._sentence_audio_base_ms = 0
+        self._alignment_events: deque[dict[str, Any]] = deque(maxlen=512)
+        self._cache_max_bytes = int(getattr(client, "audio_cache_max_bytes", 64 * 1024 * 1024))
+        self.connection_id: int | None = None
+        self._retry_attempts: dict[str, int] = {}
+        self._retry_deadlines: dict[str, float] = {}
+        self._sent_texts: deque[str] = deque(maxlen=256)
+        self._backpressure_idle = asyncio.Event()
+        self._backpressure_idle.set()
+        self._retry_cancel = asyncio.Event()
+
+    @property
+    def reusable(self) -> bool:
+        """Whether the wire connection can be retained for another turn."""
+
+        return (
+            self.bidi
+            and not self._closed
+            and not self._connection_dead
+            and self._socket is not None
+            and self._error is None
+            and (self._receiver is None or not self._receiver.done())
+        )
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def generation_finished(self) -> bool:
+        return self._generation_done.is_set()
+
+    @property
+    def generation_active(self) -> bool:
+        """Whether the retained Bidi connection currently has live text."""
+
+        return self._generation_active
 
     @property
     def received_bytes(self) -> int:
@@ -53,6 +108,20 @@ class MiniMaxTtsSession:
     def completed_segments(self) -> int:
         return self._completed_segments
 
+    @property
+    def completed_sentences(self) -> int:
+        return self._sentence_count
+
+    @property
+    def alignment_events(self) -> tuple[dict[str, Any], ...]:
+        """Normalized copies of subtitle/timing payloads received from TTS."""
+
+        return tuple(self._alignment_events)
+
+    def _received_audio_ms(self) -> int:
+        bytes_per_second = max(1, int(self.client.sample_rate) * 2)
+        return int(round(self._audio_bytes_received * 1000 / bytes_per_second))
+
     async def wait_for_segment(self, previous_count: int) -> None:
         """Wait for this text's is_final, never infer it from another PCM chunk."""
         while self.completed_segments <= previous_count:
@@ -64,6 +133,10 @@ class MiniMaxTtsSession:
             await asyncio.wait_for(self._segment_available.wait(), self.client.receive_timeout_seconds)
 
     def _store_audio(self, pcm: bytes) -> None:
+        if self.received_bytes + len(pcm) > self._cache_max_bytes:
+            raise MiniMaxTtsError(
+                f"MiniMax 音频缓存超过上限（{self._cache_max_bytes} bytes）"
+            )
         try:
             if self._audio is None:
                 self._audio = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
@@ -82,7 +155,28 @@ class MiniMaxTtsSession:
             self._audio = None
 
     async def start(self) -> None:
+        # ``session()`` returns the same object for Bidi.  A previous flush or
+        # cancel ended only its generation, so starting the next one must not
+        # send a second task_start or create a second receiver task.
+        if (
+            self.bidi
+            and self._started
+            and self._socket is not None
+            and not self._closed
+            and not self._connection_dead
+            and (self._receiver is None or not self._receiver.done())
+        ):
+            if self._generation_done.is_set():
+                self._reset_generation()
+            return
         try:
+            self._closed = False
+            self._connection_dead = False
+            # A manually closed session may be started again by a caller that
+            # owns the object directly.  Drop stale task-local audio/events
+            # before creating the replacement connection.
+            if self._started or self._finished.is_set() or self._error is not None:
+                self._reset_generation()
             import websockets  # type: ignore
         except ImportError as exc:
             raise MiniMaxTtsError("缺少 websockets，请先运行 scripts\\setup.ps1。") from exc
@@ -102,7 +196,7 @@ class MiniMaxTtsSession:
                     additional_headers=headers,
                     open_timeout=5,
                     close_timeout=1,
-                    ping_interval=20,
+                    ping_interval=max(1, int(getattr(self.client, "keepalive_seconds", 30))),
                     # PCM backpressure can pause socket reads for longer than
                     # a pong deadline. Receive inactivity is bounded separately.
                     ping_timeout=None,
@@ -113,9 +207,25 @@ class MiniMaxTtsSession:
                     extra_headers=headers,
                     open_timeout=5,
                     close_timeout=1,
-                    ping_interval=20,
+                    ping_interval=max(1, int(getattr(self.client, "keepalive_seconds", 30))),
                     ping_timeout=None,
                 )
+            if self.bidi:
+                # The Bidi endpoint announces the connection before it
+                # accepts the task configuration.  Waiting for this frame
+                # prevents task_start from racing the server handshake and
+                # makes an out-of-order response an explicit protocol error.
+                connected = self._parse(
+                    await asyncio.wait_for(self._socket.recv(), self.client.timeout_seconds)
+                )
+                connected_event = connected.get("event")
+                if connected_event == "task_failed":
+                    raise MiniMaxTtsError(self._error_message(connected))
+                if connected_event != "connected_success":
+                    raise MiniMaxTtsError(
+                        f"MiniMax Bidi 连接握手异常：期望 connected_success，收到 {connected_event or 'unknown'}"
+                    )
+                logger.debug("minimax.connected_success connect_id=%s", connected.get("connect_id"))
             await self._socket.send(json.dumps(self.client.start_payload(), ensure_ascii=False))
             logger.debug("minimax.task_start_sent")
             while True:
@@ -126,6 +236,9 @@ class MiniMaxTtsSession:
                     raise MiniMaxTtsError(self._error_message(parsed))
                 if event == "task_started":
                     self._started = True
+                    self.connection_id = self.client._next_connection_id()
+                    self._generation_done.clear()
+                    self._generation_active = False
                     logger.info("minimax.task_started")
                     break
             self._receiver = asyncio.create_task(self._receive_loop(), name="minimax-tts-receive")
@@ -151,8 +264,25 @@ class MiniMaxTtsSession:
     def _error_message(message: dict[str, Any]) -> str:
         base = message.get("base_resp")
         if isinstance(base, dict):
-            return str(base.get("status_msg") or base.get("status_code") or "未知错误")
-        return "未知错误"
+            code = base.get("status_code") or base.get("code")
+            message_text = base.get("status_msg") or base.get("message")
+            if message_text and code:
+                return f"{message_text} ({code})"
+            return str(message_text or code or "未知错误")
+        code = message.get("status_code") or message.get("code")
+        message_text = message.get("status_msg") or message.get("message") or message.get("error")
+        if message_text and code:
+            return f"{message_text} ({code})"
+        return str(message_text or code or "未知错误")
+
+    @staticmethod
+    def _error_code(message: dict[str, Any]) -> str | None:
+        base = message.get("base_resp")
+        if isinstance(base, dict):
+            value = base.get("status_code") or base.get("code")
+            return str(value) if value is not None else None
+        value = message.get("status_code") or message.get("code")
+        return str(value) if value is not None else None
 
     @staticmethod
     def _decode_audio(audio: str) -> bytes:
@@ -183,11 +313,63 @@ class MiniMaxTtsSession:
                         parsed.get("is_final"),
                     )
                 if event == "task_failed":
+                    code = self._error_code(parsed)
+                    rejected_text = self._rejected_text(parsed)
+                    if self.bidi and code == "2205" and rejected_text:
+                        try:
+                            await self._retry_rejected_text(rejected_text)
+                            continue
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            self._error = MiniMaxTtsError(f"MiniMax 2205 重试失败：{exc}")
+                            logger.error("minimax.backpressure_retry_failed message=%s", self._error)
+                            break
+                    if self.bidi and code == "2205":
+                        self._error = MiniMaxTtsError(
+                            "MiniMax 2205 未关联被拒绝文本，已终止当前 generation"
+                        )
+                        logger.error("minimax.backpressure_retry_unassociated")
+                        break
                     self._error = MiniMaxTtsError(self._error_message(parsed))
-                    logger.error("minimax.task_failed message=%s", self._error)
+                    logger.error("minimax.task_failed code=%s message=%s", code, self._error)
                     break
+                cancel_confirmation = event == "task_canceled"
+                if event == "task_canceled":
+                    self._cancel_requested = False
+                    self._generation_active = False
+                    self._cancel_confirmed.set()
+                    self._generation_done.set()
+                    self._server_finished = False
+                    self._audio_available.set()
+                    logger.info("minimax.task_canceled")
+                elif event == "task_flushed":
+                    self._flush_confirmed.set()
+                    self._generation_active = False
+                    self._generation_done.set()
+                    self._audio_available.set()
+                    logger.info("minimax.task_flushed")
+                elif event == "sentence_start" and self._generation_active and not self._cancel_requested:
+                    self._sentence_index += 1
+                    self._sentence_audio_base_ms = self._received_audio_ms()
+                    logger.debug(
+                        "minimax.sentence_start index=%d audio_base_ms=%d",
+                        self._sentence_index,
+                        self._sentence_audio_base_ms,
+                    )
+                elif event == "sentence_end" and self._generation_active and not self._cancel_requested:
+                    self._sentence_count += 1
+                    self._sentence_available.set()
+                if (not self.bidi or self._generation_active) and not self._cancel_requested and not cancel_confirmation:
+                    alignment = self._extract_alignment(parsed)
+                    if alignment is not None:
+                        alignment["connection_id"] = self.connection_id
+                        alignment["sentence_index"] = self._sentence_index
+                        alignment["audio_base_ms"] = self._sentence_audio_base_ms
+                        alignment["audio_returned_ms"] = self._received_audio_ms()
+                        self._alignment_events.append(alignment)
                 data = parsed.get("data")
-                if isinstance(data, dict) and isinstance(data.get("audio"), str) and data["audio"]:
+                if (not self.bidi or self._generation_active) and not self._cancel_requested and not cancel_confirmation and isinstance(data, dict) and isinstance(data.get("audio"), str) and data["audio"]:
                     try:
                         pcm = self._decode_audio(data["audio"])
                         self._store_audio(pcm)
@@ -205,11 +387,13 @@ class MiniMaxTtsSession:
                         logger.exception("minimax.audio_buffer_failed")
                         break
                 if parsed.get("is_final") is True:
-                    self._completed_segments += 1
-                    self._segment_available.set()
-                    logger.debug("minimax.segment_finished count=%d", self.completed_segments)
+                    if (not self.bidi or self._generation_active) and not self._cancel_requested and not cancel_confirmation:
+                        self._completed_segments += 1
+                        self._segment_available.set()
+                        logger.debug("minimax.segment_finished count=%d", self.completed_segments)
                 if event == "task_finished":
                     self._server_finished = True
+                    self._generation_done.set()
                     break
         except asyncio.CancelledError:
             self._error = MiniMaxTtsError("MiniMax TTS 接收已取消，未确认任务完成")
@@ -218,6 +402,9 @@ class MiniMaxTtsSession:
             self._error = MiniMaxTtsError(f"MiniMax TTS 接收失败（未收到 task_finished）：{exc}")
             logger.exception("minimax.receive_failed")
         finally:
+            if self.bidi and not self._closed:
+                self._connection_dead = True
+            self._backpressure_idle.set()
             self._finished.set()
             self._audio_available.set()
             self._segment_available.set()
@@ -229,6 +416,20 @@ class MiniMaxTtsSession:
     async def send_text(self, text: str) -> None:
         if not self._started or self._socket is None:
             raise MiniMaxTtsError("MiniMax TTS 任务尚未 started")
+        await self._backpressure_idle.wait()
+        if self._cancel_requested:
+            try:
+                await asyncio.wait_for(
+                    self._cancel_confirmed.wait(),
+                    float(getattr(self.client, "cancel_timeout_seconds", 2.0)),
+                )
+            except asyncio.TimeoutError as exc:
+                raise MiniMaxTtsError("等待上一轮 Bidi 取消确认超时") from exc
+        if self._generation_done.is_set():
+            if not self.bidi:
+                raise MiniMaxTtsError("MiniMax TTS 任务已结束")
+            self._reset_generation()
+        self._generation_active = True
         if self._receiver is not None and self._receiver.done():
             if self._error is not None:
                 raise self._error
@@ -236,8 +437,93 @@ class MiniMaxTtsSession:
                 f"MiniMax TTS 任务已结束（最后事件：{self._last_event or 'unknown'}）"
             )
         async with self._send_lock:
+            self._sent_texts.append(text)
             await self._socket.send(json.dumps({"event": "task_continue", "text": text}, ensure_ascii=False))
         logger.info("minimax.task_continue chars=%d text=%r", len(text), text[:120])
+
+    async def flush(self) -> None:
+        """Flush pending Bidi text while keeping the session open."""
+
+        if not self.bidi:
+            await self.finish()
+            return
+        if self._socket is None or not self._started:
+            return
+        await self._backpressure_idle.wait()
+        self._flush_confirmed.clear()
+        async with self._send_lock:
+            await self._socket.send(json.dumps({"event": "task_flush"}))
+        logger.info("minimax.task_flush_sent")
+        if self._receiver is not None:
+            deadline = asyncio.get_running_loop().time() + float(
+                getattr(self.client, "receive_timeout_seconds", 120.0)
+            )
+            while not self._flush_confirmed.is_set():
+                if self._error is not None:
+                    raise self._error
+                if self._receiver.done():
+                    raise MiniMaxTtsError(
+                        "MiniMax Bidi 接收任务已结束，未确认 task_flushed"
+                    )
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise MiniMaxTtsError("MiniMax Bidi 未确认 task_flushed")
+                try:
+                    await asyncio.wait_for(
+                        self._flush_confirmed.wait(), min(0.2, remaining)
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+    async def cancel(self, *, timeout_seconds: float | None = None) -> bool:
+        """Cancel synthesis without closing a Bidi session.
+
+        Audio already delivered by MiniMax remains in the local spool; the
+        controller's generation gate is responsible for dropping it.
+        """
+
+        if not self.bidi or self._socket is None or not self._started:
+            return False
+        if self._cancel_requested:
+            try:
+                await self._wait_for_cancel_confirmation(timeout_seconds)
+                return True
+            except asyncio.TimeoutError as exc:
+                raise MiniMaxTtsError("MiniMax Bidi 未在超时内确认 task_canceled") from exc
+        self._cancel_confirmed.clear()
+        self._cancel_requested = True
+        self._retry_cancel.set()
+        async with self._send_lock:
+            await self._socket.send(json.dumps({"event": "task_cancel"}))
+        timeout = timeout_seconds or float(getattr(self.client, "cancel_timeout_seconds", 2.0))
+        if self._receiver is None:
+            return True
+        try:
+            await self._wait_for_cancel_confirmation(timeout)
+            return True
+        except asyncio.TimeoutError as exc:
+            raise MiniMaxTtsError("MiniMax Bidi 未在超时内确认 task_canceled") from exc
+
+    async def _wait_for_cancel_confirmation(self, timeout: float | None = None) -> None:
+        deadline = asyncio.get_running_loop().time() + float(
+            timeout if timeout is not None else getattr(self.client, "cancel_timeout_seconds", 2.0)
+        )
+        while not self._cancel_confirmed.is_set():
+            if self._error is not None:
+                raise self._error
+            if self._receiver is not None and self._receiver.done():
+                raise MiniMaxTtsError(
+                    "MiniMax Bidi 接收任务已结束，未确认 task_canceled"
+                )
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            try:
+                await asyncio.wait_for(
+                    self._cancel_confirmed.wait(), min(0.2, remaining)
+                )
+            except asyncio.TimeoutError:
+                continue
 
     async def finish(self) -> None:
         if self.server_finished:
@@ -264,6 +550,10 @@ class MiniMaxTtsSession:
                         raise MiniMaxTtsError(f"MiniMax 音频缓存读取失败：{exc}") from exc
                     self._read_offset += len(pcm)
                     yield pcm
+                elif self.bidi and self.generation_finished:
+                    if self._error:
+                        raise self._error
+                    return
                 elif self.receive_finished:
                     if self._error:
                         raise self._error
@@ -279,6 +569,8 @@ class MiniMaxTtsSession:
 
     async def close(self) -> None:
         self._closed = True
+        self._connection_dead = True
+        self._retry_cancel.set()
         receiver, self._receiver = self._receiver, None
         socket, self._socket = self._socket, None
         try:
@@ -294,6 +586,132 @@ class MiniMaxTtsSession:
             self._release_audio()
             logger.info("minimax.closed received_bytes=%d consumed_bytes=%d", self.received_bytes, self._read_offset)
 
+    def _reset_generation(self) -> None:
+        """Reset task-local state while retaining the Bidi socket/receiver."""
+
+        if not self.bidi:
+            return
+        self._release_audio()
+        self._read_offset = 0
+        self._cache_peak_bytes = 0
+        self._audio_available.clear()
+        self._server_finished = False
+        self._completed_segments = 0
+        self._segment_available.clear()
+        self._finished.clear()
+        self._error = None
+        self._finish_requested = False
+        self._audio_chunks_received = 0
+        self._audio_bytes_received = 0
+        self._last_event = None
+        self._cancel_confirmed.clear()
+        self._cancel_requested = False
+        self._retry_cancel.clear()
+        self._flush_confirmed.clear()
+        self._sentence_available.clear()
+        self._sentence_count = 0
+        self._sentence_index = 0
+        self._sentence_audio_base_ms = 0
+        self._alignment_events.clear()
+        self._retry_attempts.clear()
+        self._retry_deadlines.clear()
+        self._sent_texts.clear()
+        self._backpressure_idle.set()
+        self._generation_done.clear()
+        self._generation_active = False
+
+    @staticmethod
+    def _rejected_text(message: dict[str, Any]) -> str | None:
+        # A generic ``text`` field is commonly the human-readable error
+        # message, not the task_continue payload that the service refused.
+        # Retrying it would violate the no-guessing rule and could duplicate
+        # an already accepted sentence.  Only explicitly named rejected
+        # fields establish a safe association.
+        for key in ("rejected_text", "failed_text"):
+            value = message.get(key)
+            if isinstance(value, str) and value:
+                return value
+        data = message.get("data")
+        if isinstance(data, dict):
+            for key in ("rejected_text", "failed_text"):
+                value = data.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        return None
+
+    async def _retry_rejected_text(self, text: str) -> None:
+        """Retry only a text explicitly named by a 2205 response.
+
+        The provider does not expose a portable client-side message ID.  A
+        response without the rejected text is therefore fatal and is handled
+        by ``_receive_loop`` without guessing which accepted text to repeat.
+        """
+
+        occurrences = sum(item == text for item in self._sent_texts)
+        if occurrences == 0:
+            raise MiniMaxTtsError("2205 响应未关联到当前 generation 已发送的文本")
+        if occurrences != 1:
+            raise MiniMaxTtsError(
+                "2205 响应无法唯一关联到当前 generation 的被拒绝文本"
+            )
+        attempt = self._retry_attempts.get(text, 0)
+        loop = asyncio.get_running_loop()
+        deadline = self._retry_deadlines.setdefault(text, loop.time() + 10.0)
+        self._backpressure_idle.clear()
+        try:
+            while True:
+                if self._cancel_requested or self._closed:
+                    return
+                delay = min(1.0, 0.1 * (2 ** attempt))
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise MiniMaxTtsError("2205 重试预算已耗尽")
+                sleep_task = asyncio.create_task(asyncio.sleep(min(delay, remaining)))
+                cancel_task = asyncio.create_task(self._retry_cancel.wait())
+                try:
+                    done, _pending = await asyncio.wait(
+                        {sleep_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if cancel_task in done:
+                        return
+                finally:
+                    for task in (sleep_task, cancel_task):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(sleep_task, cancel_task, return_exceptions=True)
+                if self._cancel_requested or self._closed:
+                    return
+                async with self._send_lock:
+                    self._sent_texts.append(text)
+                    await self._socket.send(json.dumps({"event": "task_continue", "text": text}, ensure_ascii=False))
+                self._retry_attempts[text] = attempt + 1
+                logger.info("minimax.task_continue_retry code=2205 attempt=%d chars=%d", attempt + 1, len(text))
+                return
+        finally:
+            self._backpressure_idle.set()
+
+    @staticmethod
+    def _extract_alignment(message: dict[str, Any]) -> dict[str, Any] | None:
+        """Find provider subtitle data without coupling the controller to wire names.
+
+        The Bidi documentation advertises word_streaming subtitles, while
+        deployments have returned the payload under slightly different keys.
+        Keep the raw object and let the alignment layer validate its shape.
+        """
+
+        for key in ("subtitle", "subtitles", "alignment", "timestamps", "word_timestamps", "sentence"):
+            value = message.get(key)
+            if value is not None:
+                return {"source": key, "value": value, "event": message.get("event")}
+        data = message.get("data")
+        if isinstance(data, dict):
+            for key in ("subtitle", "subtitles", "alignment", "timestamps", "word_timestamps"):
+                value = data.get(key)
+                if value is not None:
+                    return {"source": key, "value": value, "event": message.get("event")}
+        return None
+
 
 class MiniMaxTtsClient:
     def __init__(
@@ -307,20 +725,56 @@ class MiniMaxTtsClient:
         sample_rate: int = 32000,
         voice_id: str = "female-shaonv",
         timeout_ms: int = 15000,
+        transport: str = "websocket",
+        scheduling: str = "auto",
+        subtitle_enable: bool = False,
+        subtitle_type: str = "word_streaming",
+        audio_cache_max_bytes: int = 64 * 1024 * 1024,
+        cancel_timeout_ms: int = 2000,
+        keepalive_seconds: int = 30,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        if transport not in {"websocket", "websocket_bidi"}:
+            raise ValueError("tts.transport must be websocket or websocket_bidi")
+        if scheduling not in {"auto", "direct", "playback_window"}:
+            raise ValueError("tts.scheduling must be auto, direct, or playback_window")
+        if transport == "websocket_bidi" and scheduling == "playback_window":
+            raise ValueError("Bidi TTS cannot use playback_window scheduling")
+        if audio_cache_max_bytes <= 0 or cancel_timeout_ms <= 0 or keepalive_seconds <= 0:
+            raise ValueError("TTS cache, cancel timeout, and keepalive values must be positive")
+        self.transport = transport
+        self.scheduling = scheduling
+        if transport == "websocket_bidi" and websocket_path.rstrip("/") == "/ws/v1/t2a_v2":
+            websocket_path = "/ws/v1/t2a_v2_bidi"
         self.websocket_path = websocket_path
         self.model = model
         self.api_key = api_key
         self.output_format = output_format
         self.sample_rate = sample_rate
         self.voice_id = voice_id
+        self.subtitle_enable = subtitle_enable
+        self.subtitle_type = subtitle_type
+        self.audio_cache_max_bytes = audio_cache_max_bytes
+        self.cancel_timeout_seconds = cancel_timeout_ms / 1000
+        self.keepalive_seconds = keepalive_seconds
         self.timeout_seconds = timeout_ms / 1000
         # ``timeout_ms`` is kept as the connection/task-start timeout.  The
         # service documents a 120-second idle window after the last result;
         # using the shorter startup timeout for every audio recv could cut a
         # valid long response during a temporary synthesis pause.
         self.receive_timeout_seconds = max(120.0, self.timeout_seconds)
+        self._bidi_session: MiniMaxTtsSession | None = None
+        self._connection_sequence = 0
+
+    def _next_connection_id(self) -> int:
+        self._connection_sequence += 1
+        return self._connection_sequence
+
+    @property
+    def effective_scheduling(self) -> str:
+        if self.transport == "websocket_bidi" and self.scheduling == "auto":
+            return "direct"
+        return self.scheduling
 
     @property
     def ws_url(self) -> str:
@@ -332,7 +786,7 @@ class MiniMaxTtsClient:
         return f"{base}{self.websocket_path}"
 
     def start_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "event": "task_start",
             "model": self.model,
             "language_boost": "Chinese",
@@ -349,13 +803,34 @@ class MiniMaxTtsClient:
                 "channel": 1,
             },
         }
+        if self.transport == "websocket_bidi" or self.subtitle_enable:
+            payload["subtitle_enable"] = bool(self.subtitle_enable)
+            payload["subtitle_type"] = self.subtitle_type
+        return payload
 
     def session(self) -> MiniMaxTtsSession:
         if not self.api_key:
             raise MiniMaxTtsError("未配置 MINIMAX_API_KEY")
         if self.output_format.lower() != "pcm":
             raise MiniMaxTtsError("当前原生播放器只接受 PCM，未启用 MP3 自动回退。")
+        if self.transport == "websocket_bidi":
+            if (
+                self._bidi_session is None
+                or self._bidi_session.closed
+                or self._bidi_session._connection_dead
+                or self._bidi_session._error is not None
+                or (self._bidi_session._started and self._bidi_session._socket is None)
+            ):
+                self._bidi_session = MiniMaxTtsSession(self)
+            return self._bidi_session
         return MiniMaxTtsSession(self)
+
+    async def close(self) -> None:
+        """Close a retained Bidi connection during runtime shutdown."""
+
+        if self._bidi_session is not None:
+            await self._bidi_session.close()
+            self._bidi_session = None
 
     async def check(self) -> None:
         if not self.api_key:

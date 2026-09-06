@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from dataclasses import dataclass
 import logging
 import threading
+import time
 from typing import Any, Callable
 
 from .devices import resolve_device
@@ -15,6 +17,39 @@ class AudioPlayerError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class PlaybackSnapshot:
+    """Immutable playback state captured before a generation is stopped."""
+
+    key: str | None
+    enqueued_ms: int
+    played_ms: int
+    buffered_ms: int
+    output_estimated_ms: int
+    started: bool
+    captured_at: float
+    precision: str = "callback"
+    device_output_time: float | None = None
+
+    @property
+    def remaining_ms(self) -> int:
+        return max(0, self.enqueued_ms - self.output_estimated_ms)
+
+    def to_dict(self) -> dict[str, int | bool | str | None]:
+        return {
+            "key": self.key,
+            "enqueued_ms": self.enqueued_ms,
+            "played_ms": self.played_ms,
+            "buffered_ms": self.buffered_ms,
+            "output_estimated_ms": self.output_estimated_ms,
+            "remaining_ms": self.remaining_ms,
+            "started": self.started,
+            "captured_at": self.captured_at,
+            "precision": self.precision,
+            "device_output_time": self.device_output_time,
+        }
+
+
 class PcmPlayer:
     def __init__(
         self,
@@ -23,11 +58,15 @@ class PcmPlayer:
         channels: int,
         output_device: str | int | None,
         on_playback_started: Callable[[str], None] | None = None,
+        device_latency_ms: int = 0,
+        on_audio_rendered: Callable[[bytes], None] | None = None,
     ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
         self.output_device = output_device
         self.on_playback_started = on_playback_started
+        self.on_audio_rendered = on_audio_rendered
+        self.device_latency_ms = max(0, int(device_latency_ms))
         # The callback can consume only part of a TTS chunk.  A queue.Queue
         # cannot put that remainder at the front, so using it directly would
         # reorder audio as ``chunk-1 prefix, chunk-2, chunk-1 remainder``.
@@ -40,23 +79,49 @@ class PcmPlayer:
         self._buffered_bytes = 0
         self._enqueued_bytes = 0
         self._played_bytes = 0
+        self._last_callback_played_bytes = 0
         self._allowed_key: str | None = None
         self._gated = False
+        self._last_callback_at: float | None = None
+        self._last_device_output_time: float | None = None
+        self._render_points: deque[tuple[float, int]] = deque(maxlen=256)
+        self._last_stop_snapshot: PlaybackSnapshot | None = None
 
     def allow(self, key: str) -> None:
         with self._queue_lock:
+            self._render_points.clear()
             self._clear_unlocked()
             self._gated = True
             self._allowed_key = key
 
     def block(self) -> bool:
         """Atomically close playback and report whether any audio already played."""
+        snapshot = self.stop_and_snapshot()
+        return snapshot.started
+
+    def stop_and_snapshot(self, key: str | None = None) -> PlaybackSnapshot:
+        """Stop one generation and return its state before clearing the queue.
+
+        The check and clear happen under the same lock, so a late provider
+        callback cannot enqueue audio between the snapshot and the gate.
+        """
+
         with self._queue_lock:
-            played = self._started_for_turn is not None
+            if key is not None and self._active_turn not in (None, key):
+                snapshot = self._empty_snapshot_unlocked(key)
+                self._last_stop_snapshot = snapshot
+                return snapshot
+            snapshot = self._snapshot_unlocked()
             self._gated = True
             self._allowed_key = None
             self._clear_unlocked()
-            return played
+            self._last_stop_snapshot = snapshot
+            return snapshot
+
+    @property
+    def last_stop_snapshot(self) -> PlaybackSnapshot | None:
+        with self._queue_lock:
+            return self._last_stop_snapshot
 
     def has_started(self, key: str) -> bool:
         with self._queue_lock:
@@ -107,11 +172,15 @@ class PcmPlayer:
                     "played_ms": 0,
                     "buffered_ms": 0,
                     "started": False,
+                    "output_estimated_ms": 0,
+                    "device_output_time": None,
                 }
             enqueued = self._enqueued_bytes
             played = self._played_bytes
             buffered = self._buffered_bytes
             started = self._started_for_turn == active and active is not None
+            output_estimated = self._output_estimated_bytes_unlocked(played)
+            device_output_time = self._last_device_output_time
         if not bytes_per_second:
             enqueued_ms = played_ms = buffered_ms = 0
         else:
@@ -124,7 +193,78 @@ class PcmPlayer:
             "played_ms": played_ms,
             "buffered_ms": buffered_ms,
             "started": started,
+            "output_estimated_ms": int(output_estimated * 1000 / bytes_per_second) if bytes_per_second else 0,
+            "device_output_time": device_output_time,
         }
+
+    def _output_estimated_bytes_unlocked(self, played: int) -> int:
+        if not self.device_latency_ms or self._last_callback_at is None:
+            return played
+        # Callback consumption means that bytes have been submitted to the
+        # device, not that they have reached the listener.  Keep a conservative
+        # lag for the configured hardware tail and let wall-clock time drain
+        # it even after the PCM queue becomes empty.
+        bytes_per_ms = self.sample_rate * self.channels * 2 / 1000
+        # Each callback submits a new buffer, so while callbacks continue the
+        # device position trails the latest submitted position by the full
+        # configured latency.  Once callbacks stop, wall-clock time advances
+        # that position toward the submitted end.  Keeping the anchor at the
+        # latest callback avoids subtracting ``latency - callback_interval``
+        # and overstating what has reached the device on every callback.
+        elapsed_ms = max(0.0, (time.monotonic() - self._last_callback_at) * 1000)
+        submitted = self._last_callback_played_bytes or played
+        output = submitted - self.device_latency_ms * bytes_per_ms + elapsed_ms * bytes_per_ms
+        return max(0, min(self._enqueued_bytes, int(output)))
+
+    def _empty_snapshot_unlocked(self, key: str | None) -> PlaybackSnapshot:
+        return PlaybackSnapshot(key, 0, 0, 0, 0, False, time.monotonic(), "unknown", None)
+
+    def _snapshot_unlocked(self) -> PlaybackSnapshot:
+        bps = self.sample_rate * self.channels * 2
+        if not bps:
+            return self._empty_snapshot_unlocked(self._active_turn)
+        output = self._output_estimated_bytes_unlocked(self._played_bytes)
+        return PlaybackSnapshot(
+            key=self._active_turn,
+            enqueued_ms=int(self._enqueued_bytes * 1000 / bps),
+            played_ms=int(self._played_bytes * 1000 / bps),
+            buffered_ms=int(self._buffered_bytes * 1000 / bps),
+            output_estimated_ms=int(output * 1000 / bps),
+            started=self._started_for_turn == self._active_turn and self._active_turn is not None,
+            captured_at=time.monotonic(),
+            precision="device_time" if self._last_device_output_time is not None else "callback",
+            device_output_time=self._last_device_output_time,
+        )
+
+    def output_position_at(self, captured_at: float) -> int | None:
+        """Estimate the callback-consumed position at a monotonic timestamp."""
+
+        with self._queue_lock:
+            if not self._render_points:
+                return None
+            points = list(self._render_points)
+            latency_ms = self.device_latency_ms
+            bytes_per_ms = self.sample_rate * self.channels * 2 / 1000
+
+        def device_position(value: float, reference_time: float) -> int:
+            if not latency_ms or bytes_per_ms <= 0:
+                return max(0, int(value * 1000 / (self.sample_rate * self.channels * 2)))
+            elapsed_ms = max(0.0, (captured_at - reference_time) * 1000)
+            remaining_latency_ms = max(0.0, latency_ms - elapsed_ms)
+            value = max(0.0, value - remaining_latency_ms * bytes_per_ms)
+            return max(0, int(value * 1000 / (self.sample_rate * self.channels * 2)))
+
+        if captured_at <= points[0][0]:
+            return device_position(points[0][1], points[0][0])
+        if captured_at >= points[-1][0]:
+            return device_position(points[-1][1], points[-1][0])
+        for (left_time, left_bytes), (right_time, right_bytes) in zip(points, points[1:]):
+            if left_time <= captured_at <= right_time:
+                span = right_time - left_time
+                ratio = (captured_at - left_time) / span if span > 0 else 1.0
+                value = left_bytes + (right_bytes - left_bytes) * ratio
+                return device_position(value, left_time)
+        return None
 
     @property
     def running(self) -> bool:
@@ -138,6 +278,10 @@ class PcmPlayer:
         playback_turn: str | None = None
 
         with self._queue_lock:
+            callback_at = time.monotonic()
+            device_time = getattr(_time, "outputBufferDacTime", None)
+            if isinstance(device_time, (int, float)):
+                self._last_device_output_time = float(device_time)
             while remaining > 0 and self._chunks:
                 chunk = self._chunks.popleft()
                 take = min(remaining, len(chunk))
@@ -154,7 +298,27 @@ class PcmPlayer:
             if offset > 0 and self._active_turn and self._started_for_turn != self._active_turn:
                 self._started_for_turn = self._active_turn
                 playback_turn = self._active_turn
+            if offset > 0:
+                # Keep the wall-clock anchor at the last non-silent buffer
+                # submitted to the device.  PortAudio continues invoking the
+                # callback during an underrun; moving this anchor on every
+                # silent callback would make the estimated hardware tail
+                # stop advancing and ``wait_until_output_complete`` could
+                # wait forever after the PCM queue became empty.
+                self._last_callback_at = callback_at
+                self._render_points.append((callback_at, self._played_bytes))
+            self._last_callback_played_bytes = self._played_bytes
 
+        if self.on_audio_rendered and len(target) > 0:
+            # The callback receives the complete buffer submitted to the
+            # device, including zero-filled underrun samples.  AEC needs
+            # those real silence positions to keep its reverse stream aligned
+            # with the microphone clock; feeding only non-zero PCM would
+            # compress time whenever the player underruns.
+            try:
+                self.on_audio_rendered(bytes(target))
+            except Exception:
+                logger.exception("audio.player_render_reference_failed")
         if playback_turn and self.on_playback_started:
             self.on_playback_started(playback_turn)
 
@@ -193,9 +357,16 @@ class PcmPlayer:
             if self._gated and turn_id != self._allowed_key:
                 return
             if self._active_turn != turn_id:
+                self._render_points.clear()
                 self._clear_unlocked()
                 self._active_turn = turn_id
                 self._started_for_turn = None
+            if not self._render_points:
+                # Establish a zero-output anchor before the first PortAudio
+                # callback.  An interruption can begin after enqueue but
+                # before the callback runs; mapping that onset to the first
+                # non-zero render point would overstate the heard prefix.
+                self._render_points.append((time.monotonic(), self._played_bytes))
             self._chunks.append(bytes(pcm))
             self._buffered_bytes += len(pcm)
             self._enqueued_bytes += len(pcm)
@@ -213,8 +384,11 @@ class PcmPlayer:
         self._buffered_bytes = 0
         self._enqueued_bytes = 0
         self._played_bytes = 0
+        self._last_callback_played_bytes = 0
         self._active_turn = None
         self._started_for_turn = None
+        self._last_callback_at = None
+        self._last_device_output_time = None
 
     async def wait_until_empty(self, timeout_seconds: float = 10.0) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
@@ -225,6 +399,24 @@ class PcmPlayer:
         with self._queue_lock:
             key, enqueued, played = self._active_turn, self._enqueued_bytes, self._played_bytes
         logger.info("audio.player_drained key=%s enqueued_bytes=%d played_bytes=%d", key, enqueued, played)
+
+    async def wait_until_output_complete(self, timeout_seconds: float = 10.0) -> None:
+        """Wait for callback data and configured device tail to be output."""
+        # Keep ``wait_until_empty`` as the compatibility seam used by older
+        # providers/tests, then account for the hardware tail when one is
+        # configured.  The queue becoming empty alone is still not treated as
+        # the device having finished.
+        await self.wait_until_empty(timeout_seconds)
+        if not self.device_latency_ms:
+            return
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            with self._queue_lock:
+                remaining = self._enqueued_bytes - self._output_estimated_bytes_unlocked(self._played_bytes)
+            if remaining <= 0:
+                return
+            await asyncio.sleep(0.02)
+        raise TimeoutError("PCM playback did not reach the estimated device output position")
 
     def stop(self) -> None:
         self.clear()

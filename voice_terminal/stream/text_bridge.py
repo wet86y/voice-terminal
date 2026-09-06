@@ -93,3 +93,19 @@ class TextBridge:
         value = self._buffer.strip()
         self.reset()
         return [value]
+
+    def flush_due(self, *, now: float | None = None) -> list[str]:
+        """Flush a normal-sized buffer once its time window has elapsed.
+
+        The controller calls this before feeding each new LLM delta.  Keeping
+        the method on the legacy bridge lets the Bidi and legacy paths share
+        the same stream boundary without changing the old minimum-size rule:
+        a short tail remains buffered until ``finish()``.
+        """
+
+        if not self._buffer or self._started_at is None or len(self._buffer) < self.min_chars:
+            return []
+        current = self._clock() if now is None else now
+        if (current - self._started_at) * 1000 < self.max_wait_ms:
+            return []
+        return [self._flush_at(len(self._buffer))]

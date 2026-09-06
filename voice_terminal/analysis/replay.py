@@ -66,7 +66,13 @@ async def run(args):
                                api_key=config.api_key(config.llm.api_key_env), thinking="disabled")
     tts = MiniMaxTtsClient(base_url=config.tts.base_url, websocket_path=config.tts.websocket_path,
                            model=config.tts.model, api_key=config.api_key(config.tts.api_key_env),
-                           sample_rate=config.tts.sample_rate, voice_id=config.tts.voice_id)
+                           output_format=config.tts.output_format, sample_rate=config.tts.sample_rate,
+                           voice_id=config.tts.voice_id, timeout_ms=config.tts.timeout_ms,
+                           transport=config.tts.transport, scheduling=config.tts.scheduling,
+                           subtitle_enable=config.tts.subtitle_enable, subtitle_type=config.tts.subtitle_type,
+                           audio_cache_max_bytes=config.tts.audio_cache_max_bytes,
+                           cancel_timeout_ms=config.tts.cancel_timeout_ms,
+                           keepalive_seconds=config.tts.keepalive_seconds)
     player = PcmPlayer(sample_rate=config.tts.sample_rate, channels=1, output_device=None)
     c = RealtimeController(options=config.v02, state=RuntimeState(), bus=EventBus(), history=InMemoryHistory(),
                             capture=None, kws=None, vad=vad, asr=asr, llm=provider, tts=tts, player=player,

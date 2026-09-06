@@ -2,7 +2,7 @@
 
 Voice Terminal 是一个运行在 Windows 上的本地实时语音终端。浏览器只负责控制和展示，麦克风、VAD、ASR、LLM、TTS、播放器和延迟测量都由本地 Voice Server 负责。
 
-当前状态（2026-09-05）：v0.1 是稳定运行基线，v0.2 是当前主开发和验收路径；运行时仍通过独立配置启用，默认配置暂保留 v0.1 作为发布闸门。代码、逻辑和协议审计已经完成。当前自动化基线为 Python 76 项、前端 9 项，类型检查、构建、编译检查和差异检查均通过。真实 Worker 回放已经完成，真实麦克风、耳机/扬声器和自然语音统计仍需单独验收。
+当前状态（2026-09-06）：v0.1 是稳定运行基线，v0.2 是当前主开发和验收路径；运行时仍通过独立配置启用，默认配置暂保留 v0.1 作为发布闸门。Bidi TTS、可复用播放窗口、AEC/降噪状态、受保护真人插话门控、原子播放快照和已传达历史已经接入。当前自动化基线为 Python 120 项、前端 10 项，类型检查、构建、编译检查和差异检查均通过。当前账号的 MiniMax Bidi 已完成连接、词字幕字段、句子时间基准、取消屏障和同连接续用 smoke test；真实麦克风、耳机/扬声器和自然语音统计仍需单独验收。
 
 ## 能力边界
 
@@ -24,7 +24,7 @@ Voice Terminal 是一个运行在 Windows 上的本地实时语音终端。浏�
 
 默认配置使用手动开始模式：`wake.enabled=false`，点击 `session.start` 后直接进入 VAD/ASR。KWS 仍然支持 `hei claw`，但需要显式打开。浏览器不调用 `getUserMedia`，不上传 PCM，不运行模型，也不根据时间戳自行计算延迟。
 
-v0.1 提供稳定的单轮语音对话链路：VAD/ASR → LLM → 文本桥接 → TTS → PCM 播放。v0.2 在此基础上增加 Smart Turn、SenseVoice 结束后精修、语音情绪上下文、持续讲话期间的预测和只读文件工具预取、generation/revision 隔离以及 TTS 播放进度调度。
+v0.1 提供稳定的单轮语音对话链路：VAD/ASR → LLM → 文本桥接 → TTS → PCM 播放。v0.2 在此基础上增加 Smart Turn、SenseVoice 结束后精修、语音情绪上下文、持续讲话期间的预测和只读文件工具预取、generation/revision 隔离、Bidi TTS、受保护真人插话和按实际传达前缀结算的历史。
 
 ## 快速开始
 
@@ -86,7 +86,7 @@ npm run dev
 
 ASR Worker 地址统一来自最终的 `asr.worker_url`，或 `ASR_WORKER_URL`/`ASR_WORKER_HOST`/`ASR_WORKER_PORT` 覆盖。Voice Server、ASR readiness probe 和 v0.2 回放脚本都使用这个最终地址。Analysis 地址来自 `v02.analysis_url`。
 
-`config/default.yaml` 中 `v02.enabled=false`。启用 v0.2 不会自动改变默认配置；只有显式使用 `config/v0.2.yaml` 或其他启用 v0.2 的配置时，RealtimeController、Analysis、预测、工具和 TTS pacing 才会生效。
+`config/default.yaml` 中 `v02.enabled=false`。启用 v0.2 不会自动改变默认配置；只有显式使用 `config/v0.2.yaml` 或其他启用 v0.2 的配置时，RealtimeController、Analysis、预测、工具、Bidi TTS 和受保护插话才会生效。
 
 ## 运行检查和回放
 
@@ -118,11 +118,11 @@ Invoke-RestMethod http://127.0.0.1:8767/health | ConvertTo-Json -Depth 5
 
 完整当前证据见 [项目审计报告](docs/project-audit.md) 和 [当前验证记录](docs/v0.2-validation.md)。主要结论：
 
-- Python 76 项测试通过，前端 9 项测试通过。
+- Python 120 项测试通过，前端 10 项测试通过。
 - `npm run typecheck`、`npm run build`、Python compileall 和 `git diff --check` 通过。
 - 本机 ASR Worker health 为 READY，真实回放产生 partial/final，Analysis 两路可用。
-- v0.2 的轮次、generation、revision、工具预取、TTS pacing、断连恢复、重连清理和慢订阅者边界已有确定性回归。
-- v0.2 仍未通过真实设备和自然语音统计验收，因此默认配置暂保持 v0.1。
+- v0.2 的轮次、generation、revision、工具预取、Bidi/旧 TTS 调度、播放快照、受保护插话、传达历史、断连恢复、重连清理和慢订阅者边界已有确定性回归。
+- v0.2 已通过真实 MiniMax Bidi 的短文本 smoke test，但仍未完成完整多轮、真实设备和自然语音统计验收，因此默认配置暂保持 v0.1。
 
 运行自动化检查：
 
@@ -151,7 +151,9 @@ docs/
 ├── v0.2-spec.md           当前主实时链路能力和约束
 ├── v0.2-validation.md     当前验证结果、证据和限制
 ├── project-audit.md       最近一轮代码、逻辑和协议审计
-└── v0.2-next-steps.md     后续自然语音、设备和发布目标
+├── v0.2-next-steps.md     后续自然语音、设备和发布目标
+├── tts-scheduling.md      可复用 TTS 播放窗口与 Bidi direct 策略
+└── voice-interruption-bidi-execution.md  本次实施清单和验收记录
 ```
 
 ## 后续目标
@@ -160,7 +162,7 @@ docs/
 
 1. 准备至少 20 条有人工核对文本的自然语音，分别测量 v0.1/v0.2 的 CER、误结束率、结束至首音 p50/p95、回退率和资源峰值。
 2. 在耳机和扬声器条件下验证播放前续说、播放中断、多轮连续使用、停止和重启；内存播放器时间不能替代真实设备时间。
-3. 在稳定的第三方服务窗口复测 MiniMax 部分音频、close frame、限流和 TTS pacing，区分 provider 问题与本地调度问题。
+3. 在稳定的第三方服务窗口复测 MiniMax Bidi 的字幕字段、时间单位、flush/cancel 顺序、2205 重试和连续多轮；区分 provider 问题与本地调度问题。
 4. 只有当旧轮数据不泄漏、自然语音没有明显退步、真实设备路径稳定且 provider 限制可接受时，才评估是否把 v0.2 切换为默认运行配置。
 
-明确不在当前路线中的能力包括 AEC、自动插话、长期记忆、RAG、外部账号操作、shell 工具和文件写操作。
+明确不在当前路线中的能力包括声纹注册、本地强制对齐模型、HTTP TTS 迁移、长期记忆、RAG、外部账号操作、shell 工具和文件写操作。

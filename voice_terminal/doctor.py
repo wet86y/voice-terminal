@@ -150,6 +150,13 @@ async def _online_checks(config) -> list[Check]:
             sample_rate=config.tts.sample_rate,
             voice_id=config.tts.voice_id,
             timeout_ms=config.tts.timeout_ms,
+            transport=config.tts.transport,
+            scheduling=config.tts.scheduling,
+            subtitle_enable=config.tts.subtitle_enable,
+            subtitle_type=config.tts.subtitle_type,
+            audio_cache_max_bytes=config.tts.audio_cache_max_bytes,
+            cancel_timeout_ms=config.tts.cancel_timeout_ms,
+            keepalive_seconds=config.tts.keepalive_seconds,
         )
         await client.check()
         checks.append(_check("online:minimax", True, f"{client.ws_url}; model={config.tts.model}"))
