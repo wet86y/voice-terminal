@@ -174,7 +174,7 @@ v0.2 开关位于 `v02`：`enabled`、`smart_turn`、`sensevoice`、`predictions
 启用 `config/v0.2.yaml` 中的 `v02.web_search: true` 后，语音 Agent 还会获得 MiniMax Token Plan 的 `web_search(query)`。搜索客户端复用 `tts.base_url`、`tts.api_key_env`（默认即 `MINIMAX_API_KEY`）以及 `MINIMAX_API_HOST` 覆盖逻辑，不新增独立密钥配置；MiniMax Token Plan key 与普通按量 API key 不是同一类资源，key 还必须与区域 host 匹配。缺少 key、host 配置异常或明确鉴权失败时，服务状态会变为 `DISABLED`，搜索 schema 会从后续请求移除，但不会阻止语音会话启动；普通超时和临时 5xx 只让本次工具调用失败。
 非临时的非法响应会将搜索服务标记为 `ERROR` 并移除后续 schema；重启服务后会重新按配置初始化。
 
-`web_search` 只返回有界的搜索摘要和相关搜索建议，不抓取网页全文、不打开链接，也不执行摘要或页面中的指令。搜索结果会作为不可信数据提供给 DeepSeek，最终语音回答不会朗读搜索过程、原始 JSON、工具参数或协议内容。预测预取可能在用户完成讲话前发起搜索，因此启用该开关即表示相关查询会发送到 MiniMax。默认诊断和自动化测试不会发起付费搜索；真实联网 smoke test 需要单独显式执行。
+`web_search` 只返回有界的搜索摘要和相关搜索建议，不抓取网页全文、不打开链接，也不执行摘要或页面中的指令。V0.3 中网络搜索在只读工具线程池中后台预取，不占用 Agent 事件循环；多个只读调用可以并行，搜索结果完成后再由 Agent 续接依赖该结果的模型请求。搜索结果会作为不可信数据提供给 DeepSeek，最终语音回答不会朗读搜索过程、原始 JSON、工具参数或协议内容。预测预取可能在用户完成讲话前发起搜索，因此启用该开关即表示相关查询会发送到 MiniMax。默认诊断和自动化测试不会发起付费搜索；真实联网 smoke test 需要单独显式执行。
 
 ## 前端启动
 

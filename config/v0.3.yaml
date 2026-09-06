@@ -44,6 +44,7 @@ v03:
   aggressive_interval_ms: 400
   silence_ms: 5500
   max_requests_per_step: 5
+  # Provider-facing JSON messages character limit; this is not a token limit.
   max_context_chars: 64000
   trace_limit: 200
   output_limit: 32

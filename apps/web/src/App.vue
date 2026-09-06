@@ -90,6 +90,10 @@ function formatMs(value: number | null | undefined) {
   return value == null ? '—' : `${Math.round(value)} ms`
 }
 
+function formatCount(value: number | null | undefined) {
+  return value == null ? '—' : Math.round(value).toLocaleString('zh-CN')
+}
+
 function displayText(value: string | null | undefined) {
   return value?.trim() || '—'
 }
@@ -146,6 +150,8 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
         <span>动作 {{ terminal.agentEpisode.current_action || '—' }}</span>
         <span>模型请求 {{ terminal.agentEpisode.request_count || 0 }}</span>
         <span>最大并发 {{ terminal.agentEpisode.max_request_concurrency ?? '—' }}</span>
+        <span>上下文 {{ formatCount(terminal.agentEpisode.context_chars) }} / {{ formatCount(terminal.agentEpisode.context_limit_chars) }} 字符</span>
+        <span>约 {{ formatCount(terminal.agentEpisode.context_token_estimate) }} token · {{ terminal.agentEpisode.context_usage_percent == null ? '—' : `${terminal.agentEpisode.context_usage_percent.toFixed(1)}%` }}</span>
       </div>
       <p v-if="terminal.speechProgress">语音输出：{{ terminal.speechProgress.waiting_text || terminal.speechProgress.event }}</p>
       <p v-if="terminal.agentEpisode.context_limited" class="agent-limit" role="status">

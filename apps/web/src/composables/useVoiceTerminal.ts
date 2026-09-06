@@ -183,7 +183,13 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       || (value.agent_state !== undefined && typeof value.agent_state !== 'string')
       || (value.decision_mode !== undefined && typeof value.decision_mode !== 'string')
       || (value.user_speaking !== undefined && value.user_speaking !== null && typeof value.user_speaking !== 'boolean')
-      || (value.request_count !== undefined && !isNonNegativeInteger(value.request_count))) return
+      || (value.request_count !== undefined && !isNonNegativeInteger(value.request_count))
+      || (value.context_chars !== undefined && !isNonNegativeInteger(value.context_chars))
+      || (value.context_limit_chars !== undefined && !isNonNegativeInteger(value.context_limit_chars))
+      || (value.context_token_estimate !== undefined && !isNonNegativeInteger(value.context_token_estimate))
+      || (value.context_usage_percent !== undefined
+        && (typeof value.context_usage_percent !== 'number' || !Number.isFinite(value.context_usage_percent)
+          || value.context_usage_percent < 0))) return
     const previous = agentEpisode.value
     if (!authoritative && typeof value.episode_id === 'string' && retiredEpisodes.has(value.episode_id)) return
     if (!authoritative && previous?.episode_id === value.episode_id && value.context_version < previous.context_version) return
@@ -389,6 +395,12 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
   function applyLlmContext(payload: unknown, turnId: string | null) {
     if (!isRecord(payload) || !Array.isArray(payload.messages)) return
+    for (const key of ['context_chars', 'context_limit_chars', 'context_token_estimate'] as const) {
+      if (payload[key] !== undefined && !isNonNegativeInteger(payload[key])) return
+    }
+    if (payload.context_usage_percent !== undefined
+      && (typeof payload.context_usage_percent !== 'number' || !Number.isFinite(payload.context_usage_percent)
+        || payload.context_usage_percent < 0)) return
     if (typeof payload.episode_id === 'string') {
       if (payload.episode_id !== agentEpisode.value?.episode_id) return
       if (payload.agent_step_id !== agentEpisode.value?.agent_step_id) return

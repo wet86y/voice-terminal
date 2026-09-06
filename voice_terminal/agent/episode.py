@@ -91,6 +91,13 @@ class AgentDecisionScheduler:
 
 
 class AgentEpisodeRuntime:
+    # Tool adapters already bound the provider response, but a search can
+    # still contain several thousand characters of snippets and links.  Keep
+    # the model-facing protocol bounded without changing the cached result or
+    # the trace payload used for diagnostics.
+    CONTEXT_TOOL_RESULT_CHARS = 12000
+    CONTEXT_ASSISTANT_CONTENT_CHARS = 4000
+
     def __init__(self, provider, registry, output, emit, *, options=None, tools_enabled=True):
         self.provider, self.registry, self.output, self.emit = provider, registry, output, emit
         self.options = options or V03Options()
@@ -133,6 +140,11 @@ class AgentEpisodeRuntime:
         self._trace_seq = 0
         self.context_limited = False
         self.context_limit_reason = None
+        self.context_chars = 0
+        self.context_token_estimate = 0
+        self.context_usage_percent = 0.0
+        self._background_tools: set[asyncio.Task] = set()
+        self._prefetch_batches: dict[tuple, dict] = {}
 
     def snapshot(self, *, include_history=True):
         value = {"episode_id": self.episode_id, "agent_step_id": self.agent_step_id,
@@ -142,7 +154,11 @@ class AgentEpisodeRuntime:
                 "max_request_concurrency": self.max_request_concurrency,
                 "playback_state": self.output.status}
         value.update(context_limited=self.context_limited,
-                    context_limit_reason=self.context_limit_reason)
+                    context_limit_reason=self.context_limit_reason,
+                    context_chars=self.context_chars,
+                    context_limit_chars=self.options.max_context_chars,
+                    context_token_estimate=self.context_token_estimate,
+                    context_usage_percent=round(self.context_usage_percent, 1))
         if include_history:
             value.update(trace=list(self.trace), outputs=list(self.outputs))
         return value
@@ -176,6 +192,78 @@ class AgentEpisodeRuntime:
             visible.extend(group["messages"])
         self.protocol = visible
 
+    @classmethod
+    def _compact_tool_result(cls, content):
+        if not isinstance(content, str) or len(content) <= cls.CONTEXT_TOOL_RESULT_CHARS:
+            return content
+        try:
+            value = json.loads(content)
+        except (TypeError, ValueError):
+            return content[:cls.CONTEXT_TOOL_RESULT_CHARS] + "…[truncated]"
+        if not isinstance(value, dict):
+            return json.dumps({"truncated": True, "preview": str(value)[:4000]}, ensure_ascii=False)
+        compact = {}
+        if isinstance(value.get("organic"), list):
+            items = []
+            for item in value["organic"][:6]:
+                if not isinstance(item, dict):
+                    continue
+                row = {}
+                for key in ("title", "link", "date"):
+                    if isinstance(item.get(key), (str, int, float, bool)):
+                        row[key] = str(item[key])[:512 if key != "date" else 64]
+                if isinstance(item.get("snippet"), str):
+                    row["snippet"] = item["snippet"][:900]
+                if row:
+                    items.append(row)
+            compact["organic"] = items
+            if len(value["organic"]) > len(items):
+                compact["organic_truncated"] = len(value["organic"]) - len(items)
+        if isinstance(value.get("related_searches"), list):
+            related = []
+            for item in value["related_searches"][:6]:
+                if isinstance(item, dict):
+                    query = item.get("query") or item.get("title")
+                else:
+                    query = item
+                if isinstance(query, (str, int, float, bool)):
+                    related.append({"query": str(query)[:256]})
+            compact["related_searches"] = related
+            if len(value["related_searches"]) > len(related):
+                compact["related_truncated"] = len(value["related_searches"]) - len(related)
+        if "text" in value:
+            text = value.get("text")
+            if isinstance(text, str):
+                compact["text"] = text[:9000]
+                if len(text) > 9000:
+                    compact["text_truncated"] = True
+        for key in ("path", "version", "files", "truncated", "error", "disabled", "service_status"):
+            if key in value and key not in compact:
+                item = value[key]
+                if isinstance(item, (str, int, float, bool, list, dict)):
+                    compact[key] = item
+        compact["context_truncated"] = True
+        result = json.dumps(compact, ensure_ascii=False)
+        if len(result) <= cls.CONTEXT_TOOL_RESULT_CHARS:
+            return result
+        # Preserve valid JSON even for an unexpected tool payload.
+        return json.dumps({"context_truncated": True, "preview": result[:4000]}, ensure_ascii=False)
+
+    @classmethod
+    def _project_protocol_message(cls, message):
+        if not isinstance(message, dict):
+            return message
+        projected = dict(message)
+        if projected.get("role") == "tool":
+            projected["content"] = cls._compact_tool_result(projected.get("content"))
+        elif isinstance(projected.get("content"), str) and len(projected["content"]) > cls.CONTEXT_ASSISTANT_CONTENT_CHARS:
+            projected["content"] = projected["content"][:cls.CONTEXT_ASSISTANT_CONTENT_CHARS] + "…[truncated]"
+        return projected
+
+    @classmethod
+    def _project_protocol(cls, messages):
+        return [cls._project_protocol_message(message) for message in messages]
+
     def _record_exchange(self, messages, identity, *, speculative=False):
         self._exchanges.append({
             "messages": list(messages),
@@ -186,6 +274,97 @@ class AgentEpisodeRuntime:
             "speculative": bool(speculative),
         })
         self._refresh_protocol()
+
+    @staticmethod
+    def _estimate_tokens(serialized: str) -> int:
+        """Give the UI a deliberately rough token estimate.
+
+        The local guard is character based because provider tokenizers differ.
+        ASCII text is usually several characters per token while CJK text is
+        often close to one character per token, so this estimate is only an
+        explanatory display value and is never used for admission control.
+        """
+        ascii_chars = sum(char.isascii() for char in serialized)
+        other_chars = len(serialized) - ascii_chars
+        return max(0, round(ascii_chars / 4 + other_chars * 1.1))
+
+    def _update_context_metrics(self, messages) -> str:
+        serialized = json.dumps(messages, ensure_ascii=False)
+        self.context_chars = len(serialized)
+        self.context_token_estimate = self._estimate_tokens(serialized)
+        self.context_usage_percent = (
+            self.context_chars * 100 / self.options.max_context_chars
+            if self.options.max_context_chars else 0.0
+        )
+        return serialized
+
+    @staticmethod
+    def _compact_audio_cues(value):
+        if not isinstance(value, list):
+            return []
+        cues = []
+        for cue in value[:96]:
+            if not isinstance(cue, dict):
+                continue
+            compact = {}
+            for key in ("text", "start", "end", "emotion", "score", "label", "type"):
+                item = cue.get(key)
+                if isinstance(item, str):
+                    compact[key] = item[:160]
+                elif isinstance(item, (int, float, bool)):
+                    compact[key] = item
+            if compact:
+                cues.append(compact)
+        if len(value) > len(cues):
+            cues.append({"truncated": True, "total": len(value)})
+        return cues
+
+    def _context_inputs(self):
+        result = {}
+        for turn_id, value in self.inputs.items():
+            if not isinstance(value, dict):
+                continue
+            item = {}
+            for key in ("text", "provisional_transcript", "final", "input_revision", "generation_id"):
+                if key in value:
+                    item[key] = value[key]
+            cues = self._compact_audio_cues(value.get("audio_cues"))
+            if cues:
+                item["audio_cues"] = cues
+            analysis = value.get("analysis")
+            if isinstance(analysis, dict):
+                compact_analysis = {}
+                for lane in ("endpoint", "refine"):
+                    details = analysis.get(lane)
+                    if not isinstance(details, dict):
+                        continue
+                    compact_analysis[lane] = {
+                        key: details[key]
+                        for key in ("status", "model", "model_loaded", "fallback", "probability", "error")
+                        if isinstance(details.get(key), (str, int, float, bool))
+                    }
+                if compact_analysis:
+                    item["analysis"] = compact_analysis
+            result[turn_id] = item
+        return result
+
+    def _context_outputs(self):
+        result = []
+        for output in list(self.outputs)[-8:]:
+            delivery = output.get("delivery") if isinstance(output, dict) else None
+            item = {
+                key: output.get(key)
+                for key in ("speech_id", "episode_id", "turn_id", "status", "generation_id")
+                if isinstance(output, dict) and key in output
+            }
+            if isinstance(delivery, dict):
+                item["delivery"] = {
+                    key: value[:4000] if isinstance(value, str) else value
+                    for key, value in delivery.items()
+                    if key in {"status", "termination", "precision", "heard_text", "uncertain_text", "unheard_text"}
+                }
+            result.append(item)
+        return result
 
     async def ensure_episode(self, *, turn_id=None, text=None, **payload):
         """Create the Episode/input association without scheduling a request.
@@ -208,6 +387,9 @@ class AgentEpisodeRuntime:
         self.protocol.clear()
         self._intent_version = 0
         self.context_version = 0
+        self.context_chars = 0
+        self.context_token_estimate = 0
+        self.context_usage_percent = 0.0
         self.registry.begin_turn(self.episode_id)
         if turn_id:
             self.last_turn_id = turn_id
@@ -305,6 +487,91 @@ class AgentEpisodeRuntime:
         if self.episode_id and self.user_speaking is False and not self.output.active:
             await self.observe("SILENCE_TIMEOUT")
 
+    def _tool_error_result(self, name, exc):
+        result = {"error": str(exc)[:300]}
+        service_status = self.registry.service_status(name)
+        if service_status == "DISABLED":
+            result["disabled"] = True
+        elif service_status == "ERROR":
+            result["service_status"] = "ERROR"
+        return result
+
+    def _prefetch_tool(self, identity, call, entry, name):
+        """Run a read-only tool during speech without holding the Agent step.
+
+        A new search runs cache-first so the current Agent request can return
+        immediately.  Once the original call's identity is still valid, its
+        complete call/result group is admitted to the protocol and a silent
+        Episode is woken for continuation.  Identity checks keep a late
+        speculative result out of a changed intent.
+        """
+        batch = self._prefetch_batches.setdefault(identity, {
+            "expected": None,
+            "calls": [],
+            "completed": [],
+            "finishing": False,
+            "speculative": self.user_speaking is not False,
+        })
+        batch["calls"].append(call)
+
+        async def wait_for_result():
+            try:
+                try:
+                    result = await asyncio.shield(entry.task)
+                except Exception as exc:
+                    result = self._tool_error_result(name, exc)
+                if not self.valid(identity):
+                    batch["completed"].append((call, None, True))
+                    await self.log("TOOL_RESULT_DISCARDED", identity=identity, name=name,
+                                   based_on_context_version=identity[2])
+                    await self._finish_prefetch_batch(identity)
+                    return
+                batch["completed"].append((call, result, False))
+                await self._finish_prefetch_batch(identity)
+            except asyncio.CancelledError:
+                raise
+
+        task = asyncio.create_task(wait_for_result(), name=f"agent-prefetch-{name}")
+        self._background_tools.add(task)
+        task.add_done_callback(self._background_tools.discard)
+
+    async def _finish_prefetch_batch(self, identity):
+        batch = self._prefetch_batches.get(identity)
+        if not batch or batch["finishing"] or batch["expected"] is None:
+            return
+        if len(batch["completed"]) < batch["expected"]:
+            return
+        batch["finishing"] = True
+        self._prefetch_batches.pop(identity, None)
+        discarded = any(item[2] for item in batch["completed"])
+        if discarded or not self.valid(identity):
+            for call, _result, was_discarded in batch["completed"]:
+                if not was_discarded:
+                    await self.log("TOOL_RESULT_DISCARDED", identity=identity,
+                                   name=call["function"]["name"],
+                                   based_on_context_version=identity[2])
+            return
+        results = {call["id"]: result for call, result, _ in batch["completed"]}
+        exchange = [{"role": "assistant", "content": None,
+                     "tool_calls": list(batch["calls"])}]
+        for call in batch["calls"]:
+            exchange.append({"role": "tool", "tool_call_id": call["id"],
+                             "content": json.dumps(results[call["id"]], ensure_ascii=False)})
+        # Every call in the batch was explicitly selected by the same valid
+        # model identity.  Admit the complete group atomically so one fast
+        # search cannot invalidate a slower sibling from the same request.
+        speculative = batch["speculative"]
+        self.context_version += 1
+        self.output.invalidate("stale")
+        self._record_exchange(exchange, identity, speculative=speculative)
+        for call in batch["calls"]:
+            result = results[call["id"]]
+            await self.log("TOOL_COMPLETED", identity=identity,
+                           name=call["function"]["name"], failed="error" in result,
+                           speculative=speculative)
+        if self.user_speaking is False and not self.closed:
+            self._wake("TOOL_COMPLETED")
+
     async def _run(self):
         try:
             while not self.closed:
@@ -347,15 +614,18 @@ class AgentEpisodeRuntime:
             pass
 
     def messages(self, kinds):
-        snapshot = {"inputs": self.inputs, "events": sorted(kinds),
+        snapshot = {"inputs": self._context_inputs(), "events": sorted(kinds),
                     "user_speaking": self.user_speaking,
-                    "speech_outputs": [o for o in self.outputs if o.get("episode_id") == self.episode_id],
+                    "speech_outputs": [o for o in self._context_outputs()
+                                       if o.get("episode_id", self.episode_id) == self.episode_id],
                     "context_version": self.context_version}
         # Keep complete historical exchanges before the newest input snapshot;
         # this prevents an old speculative result from appearing to answer a
         # newer intent merely because it was appended later in the list.
-        return ([{"role": "system", "content": PROMPT}, *self.protocol,
-                 {"role": "user", "content": json.dumps(snapshot, ensure_ascii=False)}])
+        messages = ([{"role": "system", "content": PROMPT}, *self._project_protocol(self.protocol),
+                     {"role": "user", "content": json.dumps(snapshot, ensure_ascii=False)}])
+        self._update_context_metrics(messages)
+        return messages
 
     async def _step(self, identity, kinds):
         source_turn_id = self._identity_turns.get(identity, self.last_turn_id)
@@ -364,11 +634,14 @@ class AgentEpisodeRuntime:
             if not self.valid(identity):
                 await self.log("STALE_ACTION_DROPPED")
                 return
-            if len(json.dumps(messages, ensure_ascii=False)) > self.options.max_context_chars:
+            self._update_context_metrics(messages)
+            if self.context_chars > self.options.max_context_chars:
                 self.context_limited = True
                 self.context_limit_reason = "context_limit"
                 self.current_action = "wait_for_input"
                 await self.log("CONTEXT_LIMIT", limit=self.options.max_context_chars,
+                               context_chars=self.context_chars,
+                               estimated_tokens=self.context_token_estimate,
                                reason="stop_and_restart_required")
                 return
             schemas = control_schemas() + (self.registry.schemas() if self.tools_enabled else [])
@@ -376,6 +649,10 @@ class AgentEpisodeRuntime:
             self.request_started_at = time.monotonic()
             await self.log("AGENT_INVOKED", events=sorted(kinds))
             await self.emit("llm.context", {"messages": messages, "message_count": len(messages),
+                                           "context_chars": self.context_chars,
+                                           "context_limit_chars": self.options.max_context_chars,
+                                           "context_token_estimate": self.context_token_estimate,
+                                           "context_usage_percent": round(self.context_usage_percent, 1),
                                            "episode_id": identity[0], "agent_step_id": identity[1],
                                            "context_version": identity[2]})
             assembler, parser = ToolCallAssembler(), SpeechArgumentStream()
@@ -481,40 +758,66 @@ class AgentEpisodeRuntime:
             exchange_identity = identity
             speculative = self.user_speaking is not False
             self.state = "EXECUTING_TOOL"
-            for call in calls:
+
+            async def execute_tool(call):
                 function = call["function"]
                 name, arguments = function["name"], json.loads(function["arguments"])
+                entry = None
                 try:
                     if not self.tools_enabled or self.registry.effect(name) != "READ_ONLY":
                         raise ValueError("tool not permitted")
-                    entry, reused = await self.registry.select(identity[0], name, arguments, valid=lambda: self.valid(identity))
+                    entry, reused = await self.registry.select(
+                        identity[0], name, arguments, valid=lambda: self.valid(identity))
                     if not entry.origin:
                         entry.origin = {"episode_id": identity[0], "agent_step_id": identity[1],
                                         "context_version": identity[2], "tool_name": name, "arguments": arguments,
                                         "speculative": self.user_speaking is not False}
                     await self.log("TOOL_STARTED", name=name, arguments=arguments,
                                    reused=reused, speculative=entry.origin["speculative"])
+                    # A new network search is always safe to prefetch.  File
+                    # reads remain part of the current tool exchange so their
+                    # contents are available immediately to that continuation.
+                    if name == "web_search" and (self.user_speaking is not False or not entry.task.done()):
+                        self._prefetch_tool(identity, call, entry, name)
+                        return {"call": call, "prefetched": True}
                     result = await asyncio.shield(entry.task)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    result = {"error": str(exc)[:300]}
-                    service_status = self.registry.service_status(name)
-                    if service_status == "DISABLED":
-                        result["disabled"] = True
-                    elif service_status == "ERROR":
-                        result["service_status"] = "ERROR"
+                    result = self._tool_error_result(name, exc)
                 if not self.valid(identity):
-                    await self.log("TOOL_RESULT_DISCARDED", name=name, based_on_context_version=identity[2])
-                    return
-                await self.log("TOOL_COMPLETED", name=name, failed="error" in result)
-                exchange.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
+                    await self.log("TOOL_RESULT_DISCARDED", identity=identity, name=name,
+                                   based_on_context_version=identity[2])
+                    return {"call": call, "discarded": True}
+                await self.log("TOOL_COMPLETED", name=name, failed="error" in result,
+                               speculative=speculative)
+                return {"call": call, "result": result}
+
+            outcomes = await asyncio.gather(*(execute_tool(call) for call in calls))
+            if any(outcome.get("prefetched") for outcome in outcomes):
+                self.current_action = "wait_for_input"
+                prefetched = [outcome for outcome in outcomes if outcome.get("prefetched")]
+                batch = self._prefetch_batches.get(identity)
+                if batch:
+                    batch["expected"] = len(prefetched)
+                await self.log("TOOL_PREFETCHED", identity=identity,
+                               names=[item["call"]["function"]["name"] for item in prefetched])
+                await self._finish_prefetch_batch(identity)
+                await self.log("WAIT", reason="tool_prefetch")
+                return
+            if any(outcome.get("discarded") for outcome in outcomes):
+                return
+            for outcome in outcomes:
+                call = outcome["call"]
+                result = outcome["result"]
+                exchange.append({"role": "tool", "tool_call_id": call["id"],
+                                 "content": json.dumps(result, ensure_ascii=False)})
             self.context_version += 1
             self.output.invalidate("stale")
             identity = self.identity()
             self._identity_turns[identity] = source_turn_id
             self._record_exchange(exchange, exchange_identity, speculative=speculative)
-            messages.extend(exchange)
+            messages.extend(self._project_protocol(exchange))
             self.state = "INVOKING"
         await self.log("WAIT", reason="request_budget")
 
@@ -564,6 +867,14 @@ class AgentEpisodeRuntime:
         self.output.invalidate(reason)
         if self.active_request and self.active_request is not asyncio.current_task() and not self.active_request.done():
             self.active_request.cancel()
+        background = list(self._background_tools)
+        for task in background:
+            if not task.done():
+                task.cancel()
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
+        self._background_tools.clear()
+        self._prefetch_batches.clear()
         if old:
             self.registry.cancel_turn(old)
         if self.silence_task:
@@ -579,6 +890,9 @@ class AgentEpisodeRuntime:
         self.protocol.clear()
         self.context_limited = False
         self.context_limit_reason = None
+        self.context_chars = 0
+        self.context_token_estimate = 0
+        self.context_usage_percent = 0.0
         self.state = "IDLE"
         await self.emit("agent.episode", self.snapshot(include_history=False))
 

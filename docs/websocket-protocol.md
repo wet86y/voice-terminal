@@ -228,6 +228,13 @@ ERROR
   "turn_id": "turn_000021",
   "payload": {
     "message_count": 4,
+    "context_chars": 1832,
+    "context_limit_chars": 64000,
+    "context_token_estimate": 712,
+    "context_usage_percent": 2.9,
+    "episode_id": "episode_abc",
+    "agent_step_id": "step_004",
+    "context_version": 7,
     "messages": [
       {"role": "system", "content": "你是本地实时语音终端的中文助手。"},
       {"role": "user", "content": "第一句话"},
@@ -237,6 +244,13 @@ ERROR
   }
 }
 ```
+
+V0.3 的 `context_chars` 是发送给 provider 的 `messages` 经过
+`json.dumps(..., ensure_ascii=False)` 后的 Python 字符数；`context_limit_chars`
+默认是 64,000，不能直接当作 token 数。`context_token_estimate` 是面向界面的粗略估算，
+只用于说明，不参与准入判断。输入文本和约束会完整保留，音频线索、已传达输出和工具结果
+在模型请求中使用有界投影；网络搜索缓存和诊断记录仍保存原始结果，搜索工具结果的模型投影
+最多约 12,000 字符。`llm.context` 是发送前固定的请求快照，后续工具完成不会反向修改已经展示的事件。
 
 ### `tts.status`
 
@@ -518,6 +532,10 @@ V0.3 保留同一 Envelope、连接内 `seq` 和 `turn_id`。配置 `v03.enabled
     "request_count": 3,
     "max_request_concurrency": 1,
     "playback_state": "IDLE",
+    "context_chars": 1832,
+    "context_limit_chars": 64000,
+    "context_token_estimate": 712,
+    "context_usage_percent": 2.9,
     "context_limited": false,
     "context_limit_reason": null
   }
@@ -528,7 +546,12 @@ Episode 结束时 `episode_id`、`agent_step_id` 和 `current_action` 可以为 
 
 ### `agent.trace`
 
-Trace 是有界诊断记录，包含 `trace_seq`、`kind`、`episode_id`、`agent_step_id`、`context_version`、来源 `turn_id` 和必要的安全字段。旧输出的完成/取消 Trace 使用旧输出自己的身份，即使当前 Episode 已经改变。常见 `kind` 包括 `EPISODE_STARTED`、`AGENT_INVOKED`、`WAIT`、`SPEAK_ACCEPTED`、`SPEAK_BLOCKED`、`STALE_ACTION_DROPPED`、`TOOL_STARTED`、`TOOL_COMPLETED`、`TOOL_RESULT_DISCARDED`、`TTS_COMPLETED`、`TTS_INTERRUPTED`、`TTS_FAILED` 和 `CONTEXT_LIMIT`。
+Trace 是有界诊断记录，包含 `trace_seq`、`kind`、`episode_id`、`agent_step_id`、`context_version`、来源 `turn_id` 和必要的安全字段。旧输出的完成/取消 Trace 使用旧输出自己的身份，即使当前 Episode 已经改变。常见 `kind` 包括 `EPISODE_STARTED`、`AGENT_INVOKED`、`WAIT`、`SPEAK_ACCEPTED`、`SPEAK_BLOCKED`、`STALE_ACTION_DROPPED`、`TOOL_STARTED`、`TOOL_PREFETCHED`、`TOOL_COMPLETED`、`TOOL_RESULT_DISCARDED`、`TTS_COMPLETED`、`TTS_INTERRUPTED`、`TTS_FAILED` 和 `CONTEXT_LIMIT`。
+
+`TOOL_PREFETCHED` 表示只读网络搜索已经转入后台，当前 Agent 请求已经释放；它不是最终回答，
+也不保证结果一定会进入后续上下文。后台完成时仍校验原 Episode、Step 和 Context 身份，
+意图变化就记录 `TOOL_RESULT_DISCARDED`。身份有效时记录完整的调用—结果组，并由一次
+`TOOL_COMPLETED` 事件唤醒续接；续接依赖搜索结果，所以模型生成仍在结果完成后继续。
 
 ### `speech.progress` 与 `speech.completed`
 
@@ -571,7 +594,7 @@ Trace 是有界诊断记录，包含 `trace_seq`、`kind`、`episode_id`、`agen
 
 ### 快照和 LLM 调试上下文
 
-`runtime.snapshot.agent` 提供 Episode 紧凑状态及有界 `trace`/`outputs`，`recent_turns` 继续由服务端历史提供。`llm.context` 的 V0.3 payload 携带 `episode_id`、`agent_step_id` 和发送前固定的 `messages`；消息可以包含原生 `tool_calls`、`tool_call_id` 和 `content=null`，前端不得假设所有消息都是字符串正文。回放报告默认会移除完整 messages 和工具正文。
+`runtime.snapshot.agent` 提供 Episode 紧凑状态及有界 `trace`/`outputs`，`recent_turns` 继续由服务端历史提供。快照中的 `context_chars`、`context_limit_chars`、`context_token_estimate` 和 `context_usage_percent` 与最近一次实际请求同步；Episode 尚未发出请求时这些值可以为零。`llm.context` 的 V0.3 payload 携带 `episode_id`、`agent_step_id` 和发送前固定的 `messages`；消息可以包含原生 `tool_calls`、`tool_call_id` 和 `content=null`，前端不得假设所有消息都是字符串正文。回放报告默认会移除完整 messages 和工具正文。
 
 V0.3 Agent 的工具协议不把工具结果无条件追加到公共列表：speculative 交换按完整调用—结果组保存，实质意图变化后从最新请求排除，只有重新选择并通过新鲜度校验才复用。`turn.completed` 仍是输入历史的唯一写入口，payload 额外包含 `episode_id`、`details` 和 `delivery`；语音输出使用 `speech.completed` 独立关联该 Turn。
 

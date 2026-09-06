@@ -332,6 +332,146 @@ class EpisodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(m["role"] == "tool" and '"files"' in m["content"] for m in r.protocol))
         self.assertTrue(any(p.get("kind") == "TOOL_RESULT_DISCARDED" for k, p in self.events))
 
+    async def test_readonly_tools_run_in_parallel(self):
+        provider = Provider([[call("files_search", {"query": "a"}),
+                              call("files_search", {"query": "b"}, 1)]])
+        r = self.make(provider)
+        active = maximum = 0
+        both_started = asyncio.Event()
+        original = r.registry._execute
+
+        async def delayed(backend, name, arguments, mark_started):
+            nonlocal active, maximum
+            mark_started(time.monotonic())
+            active += 1
+            maximum = max(maximum, active)
+            if active >= 2:
+                both_started.set()
+            await asyncio.wait_for(both_started.wait(), 1)
+            await asyncio.sleep(.03)
+            active -= 1
+            return await original(backend, name, arguments, lambda _when: None)
+
+        r.registry._execute = delayed
+        await r.observe("USER_INPUT_FINALIZED", turn_id="parallel", text="查两个文件")
+        await asyncio.wait_for(both_started.wait(), 1)
+        await idle(r)
+        self.assertEqual(maximum, 2)
+
+    async def test_web_search_prefetch_does_not_hold_agent_step(self):
+        class Search:
+            available = True
+            service_status = "READY"
+
+            def schemas(self):
+                return [{"type": "function", "function": {"name": "web_search",
+                         "parameters": {"type": "object", "properties": {"query": {"type": "string"}},
+                                         "required": ["query"], "additionalProperties": False}}}]
+
+            def normalize(self, name, arguments):
+                return name, {"query": arguments["query"].strip()}
+
+            def execute(self, name, arguments):
+                return {"organic": [], "related_searches": []}
+
+            def fresh(self, name, result):
+                return True
+
+        self.registry.search = Search()
+        provider = Provider([[call("web_search", {"query": "最新消息"})],
+                            [call("wait_for_input", {})]])
+        r = self.make(provider)
+        started, release = asyncio.Event(), asyncio.Event()
+        original = r.registry._execute
+
+        async def delayed(*args):
+            started.set()
+            await release.wait()
+            return await original(*args)
+
+        r.registry._execute = delayed
+        await r.speech_activity(True)
+        await r.observe("USER_INPUT_FINALIZED", turn_id="search", text="先查一下，等我说完")
+        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.sleep(.01)
+        self.assertIsNone(r.active_request)
+        self.assertEqual(r.request_count, 1)
+        self.assertTrue(any(p.get("kind") == "TOOL_PREFETCHED" for k, p in self.events))
+        release.set()
+        for _ in range(100):
+            if not r._background_tools:
+                break
+            await asyncio.sleep(.002)
+        self.assertFalse(r._background_tools)
+
+    async def test_web_search_prefetch_releases_silent_step_and_continues_with_result(self):
+        class Search:
+            available = True
+            service_status = "READY"
+
+            def schemas(self):
+                return [{"type": "function", "function": {"name": "web_search",
+                         "parameters": {"type": "object", "properties": {"query": {"type": "string"}},
+                                         "required": ["query"], "additionalProperties": False}}}]
+
+            def normalize(self, name, arguments):
+                return name, {"query": arguments["query"].strip()}
+
+            def execute(self, name, arguments):
+                return {"organic": [{"title": "cached result", "link": "https://example.test",
+                                      "snippet": "result is available"}], "related_searches": []}
+
+            def fresh(self, name, result):
+                return True
+
+        self.registry.search = Search()
+        provider = Provider([[call("web_search", {"query": "最新消息"}),
+                              call("web_search", {"query": "天气"}, 1)],
+                            [call("speak", {"text": "搜索完成。"})]])
+        r = self.make(provider)
+        started, release = asyncio.Event(), asyncio.Event()
+        original = r.registry._execute
+
+        async def delayed(*args):
+            started.set()
+            await release.wait()
+            return await original(*args)
+
+        r.registry._execute = delayed
+        await r.speech_activity(False)
+        await r.observe("USER_INPUT_FINALIZED", turn_id="search", text="搜索并回答")
+        await asyncio.wait_for(started.wait(), 1)
+        for _ in range(100):
+            if r.active_request is None:
+                break
+            await asyncio.sleep(.002)
+        self.assertIsNone(r.active_request)
+        self.assertEqual(r.request_count, 1)
+        release.set()
+        for _ in range(200):
+            if len(provider.messages) >= 2 and not r._background_tools:
+                break
+            await asyncio.sleep(.002)
+        await idle(r)
+        self.assertGreaterEqual(len(provider.messages), 2)
+        tool_messages = [m for m in provider.messages[-1] if m["role"] == "tool"]
+        self.assertEqual(len(tool_messages), 2)
+        self.assertTrue(all("cached result" in m["content"] for m in tool_messages))
+        self.assertEqual("搜索完成。", "".join(r.output.texts))
+
+    async def test_large_tool_result_is_bounded_in_model_context(self):
+        r = self.make()
+        raw = {"organic": [{"title": "t" * 256, "link": "https://example.test/" + "a" * 100,
+                             "snippet": "s" * 2000, "date": "2026"} for _ in range(10)],
+               "related_searches": [{"query": "q" * 256} for _ in range(8)]}
+        r.episode_id, r.agent_step_id, r.context_version = "ep", "step", 1
+        r.protocol = [{"role": "assistant", "content": None, "tool_calls": [call("web_search", {"query": "x"})["call"]]},
+                      {"role": "tool", "tool_call_id": "call_0", "content": json.dumps(raw, ensure_ascii=False)}]
+        messages = r.messages(set())
+        serialized = json.dumps(messages, ensure_ascii=False)
+        self.assertLess(len(serialized), 20000)
+        self.assertIn("context_truncated", serialized)
+
 
 def make_controller(provider):
     player = PcmPlayer(sample_rate=32000, channels=1, output_device=None)

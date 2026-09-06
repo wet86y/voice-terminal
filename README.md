@@ -2,7 +2,7 @@
 
 Voice Terminal 是一个运行在 Windows 上的本地实时语音终端。浏览器只负责控制和展示，麦克风、VAD、ASR、LLM、TTS、播放器和延迟测量都由本地 Voice Server 负责。
 
-当前状态（2026-09-06）：V0.3 Agent Runtime 已完成软件实现、正确性修复和自动化验收，仍通过独立配置启用；默认配置与 v0.1/v0.2 路径保持不变。V0.3 在现有双流式 TTS、Bidi 取消屏障、受保护真人插话、播放快照和传达历史上增加跨 Turn Episode、合法等待、原生 `speak` 门控、只读工具缓存和有界诊断。当前自动化为 Python 156 项、前端 13 项，类型检查、构建、编译检查和差异检查通过。真实设备耳机/扬声器与至少 20 条自然语音的验收材料已经准备，但仍待真人执行；真实服务复验若缺少凭据或服务不可用会单独记录为未完成证据。
+当前状态（2026-09-06）：V0.3 Agent Runtime 已完成软件实现、正确性修复和自动化验收，仍通过独立配置启用；默认配置与 v0.1/v0.2 路径保持不变。V0.3 在现有双流式 TTS、Bidi 取消屏障、受保护真人插话、播放快照和传达历史上增加跨 Turn Episode、合法等待、原生 `speak` 门控、只读工具缓存和有界诊断。当前自动化为 Python 160 项、前端 13 项，类型检查、构建、编译检查和差异检查通过。真实设备耳机/扬声器与至少 20 条自然语音的验收材料已经准备，但仍待真人执行；真实服务复验若缺少凭据或服务不可用会单独记录为未完成证据。
 
 ## 能力边界
 
@@ -24,7 +24,7 @@ Voice Terminal 是一个运行在 Windows 上的本地实时语音终端。浏�
 
 默认配置使用手动开始模式：`wake.enabled=false`，点击 `session.start` 后直接进入 VAD/ASR。KWS 仍然支持 `hei claw`，但需要显式打开。浏览器不调用 `getUserMedia`，不上传 PCM，不运行模型，也不根据时间戳自行计算延迟。
 
-v0.1 提供稳定的单轮语音对话链路：VAD/ASR → LLM → 文本桥接 → TTS → PCM 播放。v0.2 在此基础上增加 Smart Turn、SenseVoice 结束后精修、语音情绪上下文、持续讲话期间的预测和只读文件工具预取、generation/revision 隔离、Bidi TTS、受保护真人插话和按实际传达前缀结算的历史。V0.3 使用独立 `AgentEpisodeRuntime`：一个 Episode 可以接收多段输入并选择 `wait_for_input`，只有原生 `speak(text)` 可以进入 TTS；缓存结果必须由最新决策重新选中才会进入上下文。
+v0.1 提供稳定的单轮语音对话链路：VAD/ASR → LLM → 文本桥接 → TTS → PCM 播放。v0.2 在此基础上增加 Smart Turn、SenseVoice 结束后精修、语音情绪上下文、持续讲话期间的预测和只读文件工具预取、generation/revision 隔离、Bidi TTS、受保护真人插话和按实际传达前缀结算的历史。V0.3 使用独立 `AgentEpisodeRuntime`：一个 Episode 可以接收多段输入并选择 `wait_for_input`，只有原生 `speak(text)` 可以进入 TTS；缓存结果必须由仍然有效的当前决策明确选中才会进入上下文。文件和搜索只读调用并行执行；`web_search` 在后台预取，用户可以继续讲话，搜索完成后再由 Agent 续接。依赖搜索结果的回答仍需等待结果完成，这是数据依赖，不是阻塞事件循环。
 
 ## 快速开始
 
@@ -137,12 +137,14 @@ python -m voice_terminal.analysis.replay `
 
 完整当前证据见 [项目审计报告](docs/project-audit.md)、[V0.3 验证记录](docs/v0.3-validation.md) 和 [V0.3 规格](docs/v0.3-spec.md)。主要结论：
 
-- Python 156 项测试通过，前端 13 项测试通过。
+- Python 160 项测试通过，前端 13 项测试通过。
 - `npm run typecheck`、`npm run build`、Python compileall 和 `git diff --check` 通过。
 - 本机 ASR Worker health 为 READY，真实回放产生 partial/final，Analysis 两路可用。
 - v0.2 的轮次、generation、revision、工具预取、Bidi/旧 TTS 调度、播放快照、受保护插话、传达历史、断连恢复、重连清理和慢订阅者边界已有确定性回归。
 - v0.2 已通过真实 MiniMax Bidi 的短文本 smoke test，但仍未完成完整多轮、真实设备和自然语音统计验收，因此默认配置暂保持 v0.1。
-- V0.3 专项覆盖等待、精修语义、工具缓存准入、single-flight、Speak 参数流、播放竞态、历史归属和资源清理；软件验收已完成，真实设备与自然语音仍待执行。
+- V0.3 专项覆盖等待、精修语义、工具缓存准入、只读工具并行与网络搜索后台预取、single-flight、Speak 参数流、播放竞态、历史归属和资源清理；软件验收已完成，真实设备与自然语音仍待执行。
+
+V0.3 上下文上限说明：`config/v0.3.yaml` 的 `v03.max_context_chars: 64000` 是发送给模型的 JSON `messages` 字符数上限，不是 64,000 token。控制台的 AGENT EPISODE 面板显示本次请求的实际字符数、上限、粗略 token 估算和百分比；粗略估算只用于阅读。输入约束会保留，音频元数据、已传达输出和工具结果在模型上下文中采用有界投影；搜索缓存的完整结果不会无条件堆入新意图。
 
 运行自动化检查：
 

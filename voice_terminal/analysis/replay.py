@@ -46,6 +46,7 @@ def _v03_summary(events, controller, *, timed_out=False):
         "tools": {
             "started": trace_counts.get("TOOL_STARTED", 0),
             "completed": trace_counts.get("TOOL_COMPLETED", 0),
+            "prefetched": trace_counts.get("TOOL_PREFETCHED", 0),
             "reused": sum(1 for item in traces if item.get("kind") == "TOOL_STARTED" and item.get("reused")),
             "discarded": trace_counts.get("TOOL_RESULT_DISCARDED", 0),
         },

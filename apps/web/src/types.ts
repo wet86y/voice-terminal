@@ -146,6 +146,10 @@ export interface LlmContextMessage {
 export interface LlmContextPayload {
   messages: LlmContextMessage[]
   message_count: number
+  context_chars?: number
+  context_limit_chars?: number
+  context_token_estimate?: number
+  context_usage_percent?: number
   episode_id?: string
   agent_step_id?: string
   context_version?: number
@@ -270,6 +274,10 @@ export interface AgentEpisodeSnapshot {
   context_version: number
   context_limited?: boolean
   context_limit_reason?: string | null
+  context_chars?: number
+  context_limit_chars?: number
+  context_token_estimate?: number
+  context_usage_percent?: number
   agent_state: string
   decision_mode: string
   user_speaking: boolean | null
