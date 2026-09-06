@@ -14,6 +14,8 @@ class TurnRecord:
     completed_at: str
     latency: dict[str, int | float | None]
     delivery: dict[str, Any] = field(default_factory=dict)
+    episode_id: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -88,12 +90,16 @@ class InMemoryHistory:
         response: str,
         latency: dict[str, int | float | None],
         delivery: dict[str, Any] | None = None,
+        episode_id: str | None = None,
+        details: dict[str, Any] | None = None,
     ) -> TurnRecord:
         record = TurnRecord(
             turn_id=turn_id,
             transcript=transcript,
             response=response,
             completed_at=utc_now_iso(),
+            episode_id=episode_id,
+            details=dict(details or {}),
             latency=dict(latency),
             delivery=dict(delivery or {}),
         )

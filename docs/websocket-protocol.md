@@ -493,6 +493,92 @@ v0.2 在 TTS 任务运行期间按后端播放器进度推送监控信息。`aud
 
 慢订阅者积压超过 256 事件后断开 WebSocket（1013）；音频主链不等待浏览器。
 
+## V0.3 Agent Episode 扩展
+
+V0.3 保留同一 Envelope、连接内 `seq` 和 `turn_id`。配置 `v03.enabled=true` 时，服务端额外发送 Agent、语音输出和完整快照事件；旧客户端可以忽略未知事件和新增字段。`turn_id` 仍表示输入 Turn，Agent 和输出身份必须从 payload 读取，不能把 Episode ID 当作播放键。
+
+### `agent.episode`
+
+这是当前 Agent 状态的紧凑快照。它只接受当前 Episode/Step 的更新；旧 Trace 仍可以单独显示。
+
+```json
+{
+  "type": "agent.episode",
+  "seq": 20,
+  "timestamp": "2026-09-06T08:30:03.500Z",
+  "turn_id": "turn_000021",
+  "payload": {
+    "episode_id": "episode_abc",
+    "agent_step_id": "step_004",
+    "context_version": 7,
+    "agent_state": "WAITING_EVENT",
+    "decision_mode": "balanced",
+    "user_speaking": false,
+    "current_action": "wait_for_input",
+    "request_count": 3,
+    "max_request_concurrency": 1,
+    "playback_state": "IDLE",
+    "context_limited": false,
+    "context_limit_reason": null
+  }
+}
+```
+
+Episode 结束时 `episode_id`、`agent_step_id` 和 `current_action` 可以为 `null`；这不会删除已经保存的 Trace、Turn 或 Speech 历史。达到上下文上限时 `context_limited=true`，Trace 会包含 `CONTEXT_LIMIT`，客户端应显示停止并重新开始，而不是把它当作普通失败。
+
+### `agent.trace`
+
+Trace 是有界诊断记录，包含 `trace_seq`、`kind`、`episode_id`、`agent_step_id`、`context_version`、来源 `turn_id` 和必要的安全字段。旧输出的完成/取消 Trace 使用旧输出自己的身份，即使当前 Episode 已经改变。常见 `kind` 包括 `EPISODE_STARTED`、`AGENT_INVOKED`、`WAIT`、`SPEAK_ACCEPTED`、`SPEAK_BLOCKED`、`STALE_ACTION_DROPPED`、`TOOL_STARTED`、`TOOL_COMPLETED`、`TOOL_RESULT_DISCARDED`、`TTS_COMPLETED`、`TTS_INTERRUPTED`、`TTS_FAILED` 和 `CONTEXT_LIMIT`。
+
+### `speech.progress` 与 `speech.completed`
+
+每个 Speak 都有独立 `speech_id`、来源 `episode_id`/`agent_step_id`、`context_version`、来源 `turn_id` 和输出 `generation_id`。progress 可以在首 PCM 前出现；完成事件只结算一次。
+
+```json
+{
+  "type": "speech.completed",
+  "seq": 28,
+  "timestamp": "2026-09-06T08:30:05.000Z",
+  "turn_id": "turn_000021",
+  "payload": {
+    "speech_id": "speech_xyz",
+    "episode_id": "episode_abc",
+    "agent_step_id": "step_004",
+    "context_version": 7,
+    "turn_id": "turn_000021",
+    "generation_id": 2,
+    "text": "这里是已经授权的语音前缀。",
+    "status": "interrupted",
+    "delivery": {
+      "status": "partial",
+      "termination": "interrupted",
+      "heard_text": "这里是已经授权的",
+      "uncertain_text": "语音前缀",
+      "unheard_text": "。",
+      "precision": "provider"
+    },
+    "latency": {
+      "llm_request_to_first_tts_text_ms": 210,
+      "tts_text_to_first_audio_ms": 120,
+      "first_audio_to_playback_ms": 60,
+      "input_end_to_playback_ms": 410
+    }
+  }
+}
+```
+
+`status` 可以是 `completed`、`interrupted`、`stale`、`stopped` 或 `failed`。`input_end_to_playback_ms` 只有后端同时拥有可信输入结束和播放器首播时间时才填写，否则为 `null`；前端不能从 Envelope 时间戳推算。
+
+### 快照和 LLM 调试上下文
+
+`runtime.snapshot.agent` 提供 Episode 紧凑状态及有界 `trace`/`outputs`，`recent_turns` 继续由服务端历史提供。`llm.context` 的 V0.3 payload 携带 `episode_id`、`agent_step_id` 和发送前固定的 `messages`；消息可以包含原生 `tool_calls`、`tool_call_id` 和 `content=null`，前端不得假设所有消息都是字符串正文。回放报告默认会移除完整 messages 和工具正文。
+
+V0.3 Agent 的工具协议不把工具结果无条件追加到公共列表：speculative 交换按完整调用—结果组保存，实质意图变化后从最新请求排除，只有重新选择并通过新鲜度校验才复用。`turn.completed` 仍是输入历史的唯一写入口，payload 额外包含 `episode_id`、`details` 和 `delivery`；语音输出使用 `speech.completed` 独立关联该 Turn。
+
+### 客户端过滤规则
+
+前端按 `seq` 去重，然后分别按 Turn、Episode/Step/Context 和 Speech 身份过滤。旧 Episode Trace 可以留在历史列表；旧 `speech.progress` 不能覆盖当前输出，完成后再次到达的同一 Speech progress 必须丢弃。Episode 结束或 stop/start 时清除“正在播放”摘要，但保留有界输出记录。所有新增数值字段须为非负整数或明确的 `null`；非法形状只丢弃该事件，不改变当前状态。
+
 ## Analysis Worker 内部接口
 
 默认 `ws://127.0.0.1:8767/analysis`。每连接一次请求。JSON 包含 operation（endpoint/refine）、request_id、turn_id、generation_id、pcm_base64（16 kHz/mono/int16，最多 62 秒）。结果回显身份、result、elapsed_ms；失败返回 error。health 操作及 HTTP `/health` 分别报告 endpoint/refine READY/DEGRADED，并带有 `model` 和 `model_loaded`，用于确认对应模型是否实际加载。

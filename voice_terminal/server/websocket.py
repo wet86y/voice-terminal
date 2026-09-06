@@ -13,6 +13,7 @@ from ..asr.client import AsrWorkerClient
 from ..config import AppConfig
 from ..controller.turn_controller import TurnController
 from ..controller.realtime_controller import RealtimeController
+from ..controller.episode_controller import EpisodeController
 from ..vad.barge_in import BargeInGate
 from ..core.event_bus import EventBus
 from ..core.events import VoiceEvent, event
@@ -220,9 +221,13 @@ class VoiceRuntime:
 
         if self.config.v02.enabled and (self.config.audio.sample_rate != 16000 or self.config.audio.channels != 1 or self.config.audio.sample_format != "int16"):
             raise ValueError("v0.2 requires 16 kHz mono int16 capture")
-        controller_class = RealtimeController if self.config.v02.enabled else TurnController
+        if self.config.v03.enabled and not self.config.v02.enabled:
+            raise ValueError("v03 requires v02 audio capabilities")
+        controller_class = EpisodeController if self.config.v03.enabled else (RealtimeController if self.config.v02.enabled else TurnController)
         extra = ({"options": self.config.v02, "search": self.search_tools}
                  if self.config.v02.enabled else {})
+        if self.config.v03.enabled:
+            extra["agent_options"] = self.config.v03
         self.controller = controller_class(
             **extra,
             state=self.state,

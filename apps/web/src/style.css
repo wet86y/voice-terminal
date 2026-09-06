@@ -1071,3 +1071,16 @@ h2 {
 .history-heard, .history-uncertain { margin: 5px 0 0; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
 .history-heard { color: #3e6b58; }
 .history-uncertain { color: #936718; }
+
+.agent-panel { margin-block: 20px; padding: 24px; }
+.agent-facts { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-block: 16px; }
+.agent-facts code, .agent-output small, .history-id small { overflow-wrap: anywhere; }
+.history-id small { display: block; margin-top: 8px; }
+.agent-trace { margin-block: 20px; }
+.agent-trace-list { max-height: 360px; overflow: auto; }
+.agent-trace-row, .agent-output { padding: 12px 0; border-bottom: 1px solid #dbe2ec; }
+.agent-trace-row small { margin-left: 12px; opacity: .65; }
+.agent-panel pre, .history-copy pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
+.agent-limit, .agent-wait { margin: 12px 0; padding: 10px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.agent-limit { background: #fff1d6; color: #805b14; }
+.agent-wait { background: #eef4f0; color: #3e6b58; }

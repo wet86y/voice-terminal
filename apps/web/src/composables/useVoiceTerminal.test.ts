@@ -366,3 +366,73 @@ describe('useVoiceTerminal', () => {
     expect(terminal.connectionError.value).toBe('收到无法解析的后端消息。')
   })
 })
+
+
+describe('v0.3 episode protocol', () => {
+  const episode = (id: string | null, version: number, step = 'step') => ({
+    episode_id: id, agent_step_id: step, context_version: version, agent_state: 'WAITING_EVENT',
+    decision_mode: 'balanced', user_speaking: false, trace: [], outputs: [],
+  })
+
+  it('restores independent episode, trace and outputs on reconnect', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push(envelope('runtime.snapshot', 1, null, {
+      state: 'IDLE', listening: true, can_start: false, services: {}, current: { turn_id: 'input-2' },
+      agent: { ...episode('ep', 4), trace: [{ trace_seq: 1, kind: 'WAIT', episode_id: 'ep', turn_id: 'input-1' }],
+        outputs: [{ speech_id: 's', episode_id: 'ep', turn_id: 'input-1', text: '已经说过', status: 'completed' }] },
+      recent_turns: [{ turn_id: 'input-1', episode_id: 'ep', transcript: '第一段', response: '', latency: {} }],
+    }))
+    expect(terminal.agentEpisode.value?.episode_id).toBe('ep')
+    expect(terminal.agentTrace.value).toHaveLength(1)
+    expect(terminal.speechOutputs.value).toHaveLength(1)
+    expect(terminal.recentTurns.value[0].episode_id).toBe('ep')
+    expect(terminal.currentTurnId.value).toBe('input-2')
+  })
+
+  it('keeps stale trace visible without overwriting current agent or input generation', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push(envelope('turn.started', 1, 'input', { generation_id: 9 }))
+    socket.push(envelope('agent.episode', 2, null, episode('ep', 4, 'new')))
+    socket.push(envelope('agent.episode', 3, null, episode('ep', 3, 'old')))
+    socket.push(envelope('agent.trace', 4, 'old-input', {
+      trace_seq: 2, kind: 'STALE_ACTION_DROPPED', episode_id: 'ep', agent_step_id: 'old', context_version: 3,
+    }))
+    socket.push(envelope('speech.progress', 5, 'input', {
+      episode_id: 'ep', context_version: 4, speech_id: 's', generation_id: 1, event: 'tts.progress',
+    }))
+    expect(terminal.agentEpisode.value?.agent_step_id).toBe('new')
+    expect(terminal.agentTrace.value[0].kind).toBe('STALE_ACTION_DROPPED')
+    expect(terminal.current.generation_id).toBe(9)
+    expect(terminal.speechProgress.value?.speech_id).toBe('s')
+    socket.push(envelope('speech.completed', 6, 'input', { speech_id: 's', episode_id: 'ep', status: 'interrupted' }))
+    socket.push(envelope('speech.progress', 7, 'input', { speech_id: 's', episode_id: 'ep', context_version: 4 }))
+    expect(terminal.speechProgress.value).toBeNull()
+    socket.push(envelope('speech.progress', 8, 'input', {
+      speech_id: 'old', episode_id: 'ep', agent_step_id: 'old', context_version: 4,
+    }))
+    expect(terminal.speechProgress.value).toBeNull()
+  })
+
+  it('does not resurrect a finished episode and accepts native tool context', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push(envelope('agent.episode', 1, null, episode('old', 4)))
+    socket.push(envelope('agent.episode', 2, null, episode(null, 4)))
+    socket.push(envelope('agent.episode', 3, null, episode('new', 1)))
+    socket.push(envelope('agent.episode', 4, null, episode('old', 5)))
+    expect(terminal.agentEpisode.value?.episode_id).toBe('new')
+    socket.push(envelope('llm.context', 5, 'earlier-turn', {
+      episode_id: 'new', agent_step_id: 'step', messages: [
+        { role: 'assistant', content: null, tool_calls: [{ id: 'tool', function: { name: 'wait_for_input', arguments: '{}' } }] },
+        { role: 'tool', content: '{"status":"completed"}', tool_call_id: 'tool' },
+      ],
+    }))
+    expect(terminal.llmContext.value[0].tool_calls).toHaveLength(1)
+    expect(terminal.llmContext.value[1].tool_call_id).toBe('tool')
+    socket.push(envelope('speech.progress', 6, null, {
+      speech_id: 'new-speech', episode_id: 'new', agent_step_id: 'step', context_version: 1,
+    }))
+    expect(terminal.speechProgress.value?.speech_id).toBe('new-speech')
+    socket.push(envelope('agent.episode', 7, null, episode(null, 0)))
+    expect(terminal.speechProgress.value).toBeNull()
+  })
+})

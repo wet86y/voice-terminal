@@ -23,6 +23,7 @@ SERVICE_READY_STATES = {"READY", "RUNNING", "STREAMING", "CONNECTED"}
 class RuntimeState:
     state: TerminalState = TerminalState.STARTING
     listening: bool = False
+    agent: dict[str, Any] = field(default_factory=dict)
     services: dict[str, str] = field(
         default_factory=lambda: {
             "audio": "OFFLINE",
@@ -120,6 +121,7 @@ class RuntimeState:
 
     def snapshot(self) -> dict[str, Any]:
         return {
+            "agent": dict(self.agent),
             "state": self.state.value,
             "listening": self.listening,
             "can_start": self.can_start,

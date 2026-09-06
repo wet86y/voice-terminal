@@ -2,7 +2,7 @@
 
 Voice Terminal 是一个运行在 Windows 上的本地实时语音终端。浏览器只负责控制和展示，麦克风、VAD、ASR、LLM、TTS、播放器和延迟测量都由本地 Voice Server 负责。
 
-当前状态（2026-09-06）：v0.1 是稳定运行基线，v0.2 是当前主开发和验收路径；运行时仍通过独立配置启用，默认配置暂保留 v0.1 作为发布闸门。Bidi TTS、可复用播放窗口、AEC/降噪状态、受保护真人插话门控、原子播放快照和已传达历史已经接入。当前自动化基线为 Python 120 项、前端 10 项，类型检查、构建、编译检查和差异检查均通过。当前账号的 MiniMax Bidi 已完成连接、词字幕字段、句子时间基准、取消屏障和同连接续用 smoke test；真实麦克风、耳机/扬声器和自然语音统计仍需单独验收。
+当前状态（2026-09-06）：V0.3 Agent Runtime 已完成软件实现、正确性修复和自动化验收，仍通过独立配置启用；默认配置与 v0.1/v0.2 路径保持不变。V0.3 在现有双流式 TTS、Bidi 取消屏障、受保护真人插话、播放快照和传达历史上增加跨 Turn Episode、合法等待、原生 `speak` 门控、只读工具缓存和有界诊断。当前自动化为 Python 156 项、前端 13 项，类型检查、构建、编译检查和差异检查通过。真实设备耳机/扬声器与至少 20 条自然语音的验收材料已经准备，但仍待真人执行；真实服务复验若缺少凭据或服务不可用会单独记录为未完成证据。
 
 ## 能力边界
 
@@ -24,7 +24,7 @@ Voice Terminal 是一个运行在 Windows 上的本地实时语音终端。浏�
 
 默认配置使用手动开始模式：`wake.enabled=false`，点击 `session.start` 后直接进入 VAD/ASR。KWS 仍然支持 `hei claw`，但需要显式打开。浏览器不调用 `getUserMedia`，不上传 PCM，不运行模型，也不根据时间戳自行计算延迟。
 
-v0.1 提供稳定的单轮语音对话链路：VAD/ASR → LLM → 文本桥接 → TTS → PCM 播放。v0.2 在此基础上增加 Smart Turn、SenseVoice 结束后精修、语音情绪上下文、持续讲话期间的预测和只读文件工具预取、generation/revision 隔离、Bidi TTS、受保护真人插话和按实际传达前缀结算的历史。
+v0.1 提供稳定的单轮语音对话链路：VAD/ASR → LLM → 文本桥接 → TTS → PCM 播放。v0.2 在此基础上增加 Smart Turn、SenseVoice 结束后精修、语音情绪上下文、持续讲话期间的预测和只读文件工具预取、generation/revision 隔离、Bidi TTS、受保护真人插话和按实际传达前缀结算的历史。V0.3 使用独立 `AgentEpisodeRuntime`：一个 Episode 可以接收多段输入并选择 `wait_for_input`，只有原生 `speak(text)` 可以进入 TTS；缓存结果必须由最新决策重新选中才会进入上下文。
 
 ## 快速开始
 
@@ -65,6 +65,14 @@ VOICE_WAKE_ENABLED=false
 .\scripts\setup.ps1 -Python D:\DevTools\Python312\python.exe -Analysis
 .\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe -Config config\v0.2.yaml
 ```
+
+启动 V0.3 Agent Runtime（仍需要 v0.2 的音频能力和 Analysis Worker）：
+
+```powershell
+.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe -Config config\v0.3.yaml
+```
+
+回退时停止服务并改用 `config\v0.2.yaml` 或默认配置；配置文件不会改变仓库默认版本。
 
 另开终端启动前端：
 
@@ -112,17 +120,29 @@ Invoke-RestMethod http://127.0.0.1:8767/health | ConvertTo-Json -Depth 5
   -Output logs\evaluation\audit-replay.json
 ```
 
+使用同一工具检查 V0.3 Agent 摘要、上下文限制和输出结算：
+
+```powershell
+python -m voice_terminal.analysis.replay `
+  logs\evaluation\audio\query-first12.wav `
+  --config config\v0.3.yaml --asr-mode in-process `
+  --output logs\evaluation\v03-replay.json
+```
+
+明确要求回答的短文本双流式对比和等待语义复验见 [V0.3 验证记录](docs/v0.3-validation.md)。
+
 回放报告只记录协议状态、事件计数、延迟和音频进度等摘要；`logs/` 已被 Git 忽略。长音频夹具和离线分段命令见 [后端安装与联调](docs/backend-setup.md)。
 
 ## 验证结果
 
-完整当前证据见 [项目审计报告](docs/project-audit.md) 和 [当前验证记录](docs/v0.2-validation.md)。主要结论：
+完整当前证据见 [项目审计报告](docs/project-audit.md)、[V0.3 验证记录](docs/v0.3-validation.md) 和 [V0.3 规格](docs/v0.3-spec.md)。主要结论：
 
-- Python 120 项测试通过，前端 10 项测试通过。
+- Python 156 项测试通过，前端 13 项测试通过。
 - `npm run typecheck`、`npm run build`、Python compileall 和 `git diff --check` 通过。
 - 本机 ASR Worker health 为 READY，真实回放产生 partial/final，Analysis 两路可用。
 - v0.2 的轮次、generation、revision、工具预取、Bidi/旧 TTS 调度、播放快照、受保护插话、传达历史、断连恢复、重连清理和慢订阅者边界已有确定性回归。
 - v0.2 已通过真实 MiniMax Bidi 的短文本 smoke test，但仍未完成完整多轮、真实设备和自然语音统计验收，因此默认配置暂保持 v0.1。
+- V0.3 专项覆盖等待、精修语义、工具缓存准入、single-flight、Speak 参数流、播放竞态、历史归属和资源清理；软件验收已完成，真实设备与自然语音仍待执行。
 
 运行自动化检查：
 
@@ -139,7 +159,7 @@ git diff --check
 
 前后端统一使用 WebSocket Envelope。客户端命令必须包含非空 `request_id`；服务端事件的 `seq` 是当前连接内递增的整数；`payload` 必须是对象。前端先按 seq 去重，再按 `turn_id`、v0.2 的 `generation_id` 和 `input_revision` 丢弃过期事件。`turn.completed` 是历史记录的唯一写入口，前端不自行拼接历史或计算延迟。
 
-完整定义见 [WebSocket 协议](docs/websocket-protocol.md)。稳定 v0.1 行为见 [v0.1 规范](docs/v0.1-spec.md)，v0.2 能力边界见 [v0.2 规范](docs/v0.2-spec.md)。
+完整定义见 [WebSocket 协议](docs/websocket-protocol.md)。稳定 v0.1 行为见 [v0.1 规范](docs/v0.1-spec.md)，v0.2 能力边界见 [v0.2 规范](docs/v0.2-spec.md)，V0.3 行为见 [V0.3 规格](docs/v0.3-spec.md)。
 
 ## 文档索引
 
@@ -150,6 +170,9 @@ docs/
 ├── v0.1-spec.md           默认 v0.1 链路边界和验收条件
 ├── v0.2-spec.md           当前主实时链路能力和约束
 ├── v0.2-validation.md     当前验证结果、证据和限制
+├── v0.3-spec.md            Episode、Agent、工具和输出契约
+├── v0.3-validation.md      本轮修复、自动化和真实服务证据
+├── v0.3-device-acceptance.md  真人设备场景与自然语音记录模板
 ├── project-audit.md       最近一轮代码、逻辑和协议审计
 ├── v0.2-next-steps.md     后续自然语音、设备和发布目标
 ├── tts-scheduling.md      可复用 TTS 播放窗口与 Bidi direct 策略
@@ -163,6 +186,6 @@ docs/
 1. 准备至少 20 条有人工核对文本的自然语音，分别测量 v0.1/v0.2 的 CER、误结束率、结束至首音 p50/p95、回退率和资源峰值。
 2. 在耳机和扬声器条件下验证播放前续说、播放中断、多轮连续使用、停止和重启；内存播放器时间不能替代真实设备时间。
 3. 在稳定的第三方服务窗口复测 MiniMax Bidi 的字幕字段、时间单位、flush/cancel 顺序、2205 重试和连续多轮；区分 provider 问题与本地调度问题。
-4. 只有当旧轮数据不泄漏、自然语音没有明显退步、真实设备路径稳定且 provider 限制可接受时，才评估是否把 v0.2 切换为默认运行配置。
+4. 只有当 V0.3 的真实设备、自然语音和 provider 稳定性证据补齐后，才评估是否切换默认运行版本；本提交不改变默认配置。
 
 明确不在当前路线中的能力包括声纹注册、本地强制对齐模型、HTTP TTS 迁移、长期记忆、RAG、外部账号操作、shell 工具和文件写操作。

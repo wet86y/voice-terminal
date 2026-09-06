@@ -1,5 +1,8 @@
 import { computed, reactive, ref, shallowRef } from 'vue'
 import type {
+  AgentEpisodeSnapshot,
+  AgentTrace,
+  SpeechOutputRecord,
   CommandName,
   ConnectionState,
   CurrentTurnSnapshot,
@@ -39,6 +42,26 @@ export interface UseVoiceTerminalOptions {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && Number.isFinite(value) && value >= 0
+}
+
+function isAgentTrace(value: unknown): value is AgentTrace {
+  return isRecord(value) && isNonNegativeInteger(value.trace_seq)
+    && typeof value.kind === 'string'
+    && (value.episode_id === null || typeof value.episode_id === 'string')
+    && (value.context_version === undefined || isNonNegativeInteger(value.context_version))
+}
+
+function isSpeechOutput(value: unknown): value is SpeechOutputRecord {
+  return isRecord(value) && typeof value.speech_id === 'string' && value.speech_id.length > 0
+    && (value.episode_id === undefined || value.episode_id === null || typeof value.episode_id === 'string')
+    && (value.agent_step_id === undefined || value.agent_step_id === null || typeof value.agent_step_id === 'string')
+    && (value.context_version === undefined || isNonNegativeInteger(value.context_version))
+    && (value.generation_id === undefined || isNonNegativeInteger(value.generation_id))
+    && (value.status === undefined || typeof value.status === 'string')
 }
 
 function isTerminalState(value: unknown): value is TerminalState {
@@ -147,6 +170,41 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const currentLatencyComplete = ref(false)
   const services = reactive<ServiceStatuses>(createOfflineStatuses())
   const recentTurns = ref<TurnRecord[]>([])
+  const agentEpisode = ref<AgentEpisodeSnapshot | null>(null)
+  const agentTrace = ref<AgentTrace[]>([])
+  const speechOutputs = ref<SpeechOutputRecord[]>([])
+  const speechProgress = ref<Record<string, unknown> | null>(null)
+  const retiredEpisodes = new Set<string>()
+
+  function applyAgent(value: unknown, authoritative = false) {
+    if (!isRecord(value) || !(value.episode_id === null || typeof value.episode_id === 'string')
+      || !isNonNegativeInteger(value.context_version)
+      || (value.agent_step_id !== undefined && value.agent_step_id !== null && typeof value.agent_step_id !== 'string')
+      || (value.agent_state !== undefined && typeof value.agent_state !== 'string')
+      || (value.decision_mode !== undefined && typeof value.decision_mode !== 'string')
+      || (value.user_speaking !== undefined && value.user_speaking !== null && typeof value.user_speaking !== 'boolean')
+      || (value.request_count !== undefined && !isNonNegativeInteger(value.request_count))) return
+    const previous = agentEpisode.value
+    if (!authoritative && typeof value.episode_id === 'string' && retiredEpisodes.has(value.episode_id)) return
+    if (!authoritative && previous?.episode_id === value.episode_id && value.context_version < previous.context_version) return
+    if (previous?.episode_id && previous.episode_id !== value.episode_id) {
+      retiredEpisodes.add(previous.episode_id)
+      speechProgress.value = null
+    }
+    if (value.episode_id === null) speechProgress.value = null
+    if (retiredEpisodes.size > 64) retiredEpisodes.delete(retiredEpisodes.values().next().value!)
+    agentEpisode.value = value as unknown as AgentEpisodeSnapshot
+    if (Array.isArray(value.trace)) agentTrace.value = value.trace.filter(isAgentTrace).slice(-200)
+    if (Array.isArray(value.outputs)) speechOutputs.value = value.outputs.filter(isSpeechOutput).slice(-32)
+  }
+
+  function applyAgentTrace(value: Record<string, unknown>) {
+    if (!isAgentTrace(value)) return
+    if (!agentTrace.value.some(item => item.trace_seq === value.trace_seq && item.episode_id === value.episode_id)) {
+      agentTrace.value = [...agentTrace.value, value as unknown as AgentTrace].slice(-200)
+    }
+  }
+
   const llmContext = ref<LlmContextMessage[]>([])
   const llmContextTurnId = ref<string | null>(null)
   const lastServerTimestamp = ref<string | null>(null)
@@ -170,6 +228,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
   function resetConnectionData() {
     currentTurnId.value = null
+    agentEpisode.value = null
+    agentTrace.value = []
+    speechOutputs.value = []
+    speechProgress.value = null
+    retiredEpisodes.clear()
     resetCurrentTurn()
     llmContext.value = []
     llmContextTurnId.value = null
@@ -274,6 +337,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (turnId || snapshotTurnId) adoptTurn(turnId || snapshotTurnId)
     else if (hasCurrentTurnId && currentTurnId.value !== null) resetConnectionData()
     applyCurrentSnapshot(payload.current)
+    if (payload.agent) applyAgent(payload.agent, true)
     if (payload.latency) applyLatencySnapshot(payload.latency)
     if (Array.isArray(payload.recent_turns)) {
       recentTurns.value = payload.recent_turns.filter(item => isRecord(item) && typeof item.turn_id === 'string')
@@ -300,6 +364,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     const delivery = readDelivery(payload.delivery)
     const record: TurnRecord = {
       turn_id: turnId,
+      episode_id: payload.episode_id,
+      details: payload.details,
       transcript,
       response,
       completed_at: completedAt,
@@ -322,14 +388,23 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function applyLlmContext(payload: unknown, turnId: string | null) {
-    if (!acceptsCurrentTurn(turnId)) return
     if (!isRecord(payload) || !Array.isArray(payload.messages)) return
+    if (typeof payload.episode_id === 'string') {
+      if (payload.episode_id !== agentEpisode.value?.episode_id) return
+      if (payload.agent_step_id !== agentEpisode.value?.agent_step_id) return
+      if (payload.context_version !== undefined
+        && (!isNonNegativeInteger(payload.context_version)
+          || payload.context_version < (agentEpisode.value?.context_version ?? 0))) return
+    } else if (!acceptsCurrentTurn(turnId)) return
 
     const messages: LlmContextMessage[] = []
     for (const item of payload.messages) {
       if (!isRecord(item)) continue
-      if (typeof item.role !== 'string' || typeof item.content !== 'string') continue
-      messages.push({ role: item.role, content: item.content })
+      if (typeof item.role !== 'string' || !(typeof item.content === 'string' || item.content === null)) continue
+      messages.push({ role: item.role, content: typeof item.content === 'string' ? item.content : '',
+        ...(Array.isArray(item.tool_calls) ? { tool_calls: item.tool_calls } : {}),
+        ...(typeof item.tool_call_id === 'string' ? { tool_call_id: item.tool_call_id } : {}),
+      })
     }
     llmContext.value = messages
     llmContextTurnId.value = turnId
@@ -346,6 +421,28 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     lastSequence.value = message.seq
     lastServerTimestamp.value = message.timestamp
     const payload = isRecord(message.payload) ? message.payload : {}
+    // Agent/output generations are independent of the currently displayed input turn.
+    if (message.type === 'agent.episode') { applyAgent(payload); return }
+    if (message.type === 'agent.trace') { applyAgentTrace(payload); return }
+    if (message.type === 'speech.completed') {
+      if (isSpeechOutput(payload)) {
+        speechOutputs.value = [...speechOutputs.value.filter(item => item.speech_id !== payload.speech_id), payload].slice(-32)
+        if (speechProgress.value?.speech_id === payload.speech_id) speechProgress.value = null
+      }
+      return
+    }
+    if (message.type === 'speech.progress') {
+      const currentAgent = agentEpisode.value
+      const stepMatches = payload.agent_step_id === undefined
+        || payload.agent_step_id === currentAgent?.agent_step_id
+      if (typeof payload.speech_id === 'string' && typeof payload.episode_id === 'string'
+        && isNonNegativeInteger(payload.context_version)
+        && payload.episode_id === currentAgent?.episode_id
+        && payload.context_version === currentAgent?.context_version
+        && stepMatches
+        && !speechOutputs.value.some(item => item.speech_id === payload.speech_id)) speechProgress.value = payload
+      return
+    }
     if (message.type === 'turn.started') adoptTurn(message.turn_id)
     if (message.turn_id === currentTurnId.value && typeof payload.generation_id === 'number') {
       if (payload.generation_id < (current.generation_id ?? 0)) return
@@ -540,6 +637,10 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     currentLatencyComplete,
     services,
     recentTurns,
+    agentEpisode,
+    agentTrace,
+    speechOutputs,
+    speechProgress,
     llmContext,
     llmContextTurnId,
     lastServerTimestamp,

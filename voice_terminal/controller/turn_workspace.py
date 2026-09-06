@@ -52,6 +52,10 @@ class CurrentTurnAudioBuffer:
 @dataclass
 class TurnWorkspace:
     turn_id: str
+    # Episode ownership is captured when this audio turn first enters the
+    # agent.  Cleanup must use this stable value even if the runtime has
+    # already ended the Episode.
+    episode_id: str | None = None
     started_at: float = field(default_factory=time.monotonic)
     input_revision: int = 0
     generation_id: int = 0
@@ -109,7 +113,7 @@ class TurnWorkspace:
 
     def snapshot(self) -> dict:
         return {
-            "input_revision": self.input_revision, "generation_id": self.generation_id,
+            "episode_id": self.episode_id, "input_revision": self.input_revision, "generation_id": self.generation_id,
             "committed": self.committed, "agent_phase": self.agent_phase,
             "paraformer_final": self.paraformer_final, "refined_text": self.final_text,
             "segments": list(self.segments), "prediction": dict(self.prediction),

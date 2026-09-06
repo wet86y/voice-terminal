@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import time
 from collections.abc import Callable
 
-from .tool_registry import FileTools, WebSearchTools
+from .tool_registry import FileTools, WebSearchTools, TOOL_EFFECTS
 
 
 @dataclass
@@ -19,6 +19,7 @@ class ToolTask:
     started_at: float
     execution_started_at: float | None = None
     finished_at: float | None = None
+    origin: dict = field(default_factory=dict)
 
 
 class ToolSelectionInvalid(RuntimeError):
@@ -49,6 +50,9 @@ class SpeculativeTools:
         if name == "web_search":
             return self.search
         return self.files
+
+    def effect(self, name: str) -> str | None:
+        return TOOL_EFFECTS.get(name) if name in {s["function"]["name"] for s in self.schemas()} else None
 
     def schemas(self) -> list[dict]:
         schemas = self.files.schemas()

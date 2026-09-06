@@ -103,11 +103,13 @@ export interface LatencyValues {
   llm_request_to_first_tts_text_ms: number | null
   tts_text_to_first_audio_ms: number | null
   first_audio_to_playback_ms: number | null
+  input_end_to_playback_ms?: number | null
   speech_end_to_playback_ms: number | null
   turn_total_ms: number | null
 }
 
 export interface RuntimeSnapshotPayload {
+  agent?: AgentEpisodeSnapshot
   recent_turns?: TurnRecord[]
   state: TerminalState
   listening: boolean
@@ -137,11 +139,16 @@ export interface AssistantDeltaPayload {
 export interface LlmContextMessage {
   role: string
   content: string
+  tool_calls?: unknown[]
+  tool_call_id?: string
 }
 
 export interface LlmContextPayload {
   messages: LlmContextMessage[]
   message_count: number
+  episode_id?: string
+  agent_step_id?: string
+  context_version?: number
 }
 
 export interface TtsStatusPayload {
@@ -164,6 +171,8 @@ export interface LatencySnapshotPayload {
 }
 
 export interface TurnCompletedPayload {
+  episode_id?: string | null
+  details?: Record<string, unknown>
   transcript: string
   response: string
   completed_at: string
@@ -179,6 +188,7 @@ export interface ServerErrorPayload {
 }
 
 export type ServerMessageType =
+  | 'agent.episode' | 'agent.trace' | 'speech.progress' | 'speech.completed'
   | 'turn.started' | 'turn.resumed' | 'turn.finalizing' | 'turn.committed'
   | 'turn.endpoint_candidate' | 'turn.semantic_state' | 'transcript.segment'
   | 'transcript.refined' | 'speech.emotion' | 'agent.prediction' | 'agent.tool'
@@ -215,6 +225,8 @@ export interface CommandMessage {
 }
 
 export interface TurnRecord {
+  episode_id?: string | null
+  details?: Record<string, unknown>
   turn_id: string
   transcript: string
   response: string
@@ -222,4 +234,49 @@ export interface TurnRecord {
   latency: LatencyValues
   status?: TurnTermination
   delivery?: TurnDelivery
+}
+
+export interface AgentTrace {
+  trace_seq: number
+  kind: string
+  episode_id: string | null
+  agent_step_id?: string | null
+  context_version?: number
+  turn_id?: string | null
+  text?: string
+  reason?: string
+  name?: string
+  status?: string
+  speech_id?: string
+  [key: string]: unknown
+}
+
+export interface SpeechOutputRecord {
+  speech_id: string
+  episode_id: string
+  agent_step_id: string
+  context_version: number
+  turn_id: string
+  generation_id: number
+  text: string
+  status: string
+  delivery?: TurnDelivery
+  latency?: Partial<LatencyValues>
+}
+
+export interface AgentEpisodeSnapshot {
+  episode_id: string | null
+  agent_step_id?: string | null
+  context_version: number
+  context_limited?: boolean
+  context_limit_reason?: string | null
+  agent_state: string
+  decision_mode: string
+  user_speaking: boolean | null
+  current_action?: string | null
+  request_count?: number
+  max_request_concurrency?: number
+  playback_state?: string
+  trace?: AgentTrace[]
+  outputs?: SpeechOutputRecord[]
 }

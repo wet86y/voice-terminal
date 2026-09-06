@@ -3,12 +3,21 @@ from __future__ import annotations
 import os
 import hashlib
 import time
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from voice_terminal.providers.minimax_search import MiniMaxSearchClient, MiniMaxSearchError
 
 TEXT_SUFFIXES = {".txt", ".md", ".json", ".yaml", ".yml", ".csv", ".tsv", ".py", ".ts", ".js", ".vue", ".css", ".html", ".toml", ".rst"}
+
+
+class ToolEffect(StrEnum):
+    READ_ONLY = "READ_ONLY"
+    SIDE_EFFECT = "SIDE_EFFECT"
+
+
+TOOL_EFFECTS = {name: ToolEffect.READ_ONLY for name in ("files_search", "files_read_text", "web_search")}
 
 
 class FileTools:

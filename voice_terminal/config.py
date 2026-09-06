@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 from .env import load_env_file
 from .controller.options import V02Options
+from .agent.options import V03Options
 
 
 def _string(value: Any, default: str) -> str:
@@ -168,6 +169,7 @@ class AsrWorkerConfig:
 @dataclass(frozen=True)
 class AppConfig:
     v02: V02Options = field(default_factory=V02Options)
+    v03: V03Options = field(default_factory=V03Options)
     model_dir: Path = Path(r"D:\模型\voice-terminal")
     debug_audio_capture: bool = False
     audio: AudioConfig = field(default_factory=AudioConfig)
@@ -179,6 +181,10 @@ class AppConfig:
     text_bridge: TextBridgeConfig = field(default_factory=TextBridgeConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     asr_worker: AsrWorkerConfig = field(default_factory=AsrWorkerConfig)
+
+    def __post_init__(self):
+        if self.v03.enabled and not self.v02.enabled:
+            raise ValueError("v03 requires v02 audio capabilities")
 
     @property
     def kws_dir(self) -> Path:
@@ -253,6 +259,7 @@ class AppConfig:
 
         return cls(
             v02=V02Options.from_mapping(data.get("v02", {}), root),
+            v03=V03Options.from_mapping(data.get("v03", {})),
             model_dir=model_dir,
             debug_audio_capture=_bool(
                 data.get("debug_audio_capture"),
