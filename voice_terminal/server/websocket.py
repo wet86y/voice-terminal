@@ -229,7 +229,6 @@ class SessionRuntime:
             raise ValueError("session runtime requires 16 kHz mono int16 capture")
         self.controller = EpisodeController(
             options=self.config.smart_turn, search=self.search_tools, agent_options=self.config.agent,
-            **extra,
             state=self.state,
             bus=self.bus,
             history=self.history,
