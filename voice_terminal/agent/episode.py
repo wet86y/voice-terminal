@@ -9,7 +9,7 @@ import time
 import unicodedata
 from uuid import uuid4
 
-from .options import V03Options
+from .options import AgentOptions
 from .runtime import ToolCallAssembler
 from .speech_stream import SpeechArgumentStream
 
@@ -107,7 +107,7 @@ class AgentEpisodeRuntime:
 
     def __init__(self, provider, registry, output, emit, *, options=None, tools_enabled=True):
         self.provider, self.registry, self.output, self.emit = provider, registry, output, emit
-        self.options = options or V03Options()
+        self.options = options or AgentOptions()
         self.tools_enabled = tools_enabled
         self.scheduler = AgentDecisionScheduler(self.options)
         self.episode_id = None

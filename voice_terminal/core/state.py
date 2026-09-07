@@ -47,7 +47,7 @@ class RuntimeState:
             "tts_output_estimated_ms": 0,
             "tts_remaining_ms": 0,
             "turn_id": None,
-            "v02": False,
+            "input_runtime": True,
             # Runtime capabilities are kept in the snapshot so a reconnecting
             # client can explain why protected barge-in is unavailable and
             # which TTS scheduling path is active.

@@ -58,7 +58,7 @@ export interface ServiceStatuses {
 
 export interface CurrentTurnSnapshot {
   turn_id?: string | null
-  v02?: boolean
+  input_runtime?: boolean
   input_revision?: number
   generation_id?: number
   prediction_revision?: number | null
@@ -193,21 +193,10 @@ export interface ServerErrorPayload {
 }
 
 export type ServerMessageType =
-  | 'agent.episode' | 'agent.trace' | 'speech.text_delta' | 'speech.progress' | 'speech.completed'
-  | 'turn.started' | 'turn.resumed' | 'turn.finalizing' | 'turn.committed'
-  | 'turn.endpoint_candidate' | 'turn.semantic_state' | 'transcript.segment'
-  | 'transcript.refined' | 'speech.emotion' | 'agent.prediction' | 'agent.tool'
-  | 'agent.prediction.requested' | 'agent.prediction.discarded'
-  | 'runtime.snapshot'
-  | 'session.state'
-  | 'transcript.partial'
-  | 'transcript.final'
-  | 'assistant.delta'
-  | 'llm.context'
-  | 'tts.status' | 'tts.progress'
-  | 'latency.snapshot'
-  | 'turn.interrupted'
-  | 'turn.completed'
+  | 'runtime.snapshot' | 'session.state' | 'metrics.snapshot'
+  | 'input.started' | 'input.updated' | 'input.finalized' | 'input.completed'
+  | 'agent.state' | 'agent.trace' | 'context.snapshot' | 'tool.state'
+  | 'speech.started' | 'speech.delta' | 'speech.progress' | 'speech.completed'
   | 'error'
 
 export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset'
@@ -216,11 +205,19 @@ export interface MessageEnvelope<TType extends string = string, TPayload = unkno
   type: TType
   seq: number
   timestamp: string
-  turn_id: string | null
+  session_id: string
+  input_id?: string | null
+  episode_id?: string | null
+  decision_id?: string | null
+  speech_id?: string | null
+  /** @deprecated Not emitted by the V1 server; only tolerated by test fixtures. */
+  turn_id?: string | null
   payload: TPayload
 }
 
-export type ServerMessage = MessageEnvelope<ServerMessageType, unknown>
+// The composable projects V1 messages into display stores; `turn_id` is not
+// part of the wire schema and exists only in that local projection.
+export type ServerMessage = MessageEnvelope<string, unknown> & { turn_id: string | null }
 
 export interface CommandMessage {
   type: 'command'

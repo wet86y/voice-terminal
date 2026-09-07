@@ -93,7 +93,7 @@ function createEmptyCurrentTurn(): CurrentTurnSnapshot {
     audio_processing_error: '',
     tts_transport: 'websocket',
     tts_scheduling: 'auto',
-    v02: false, input_revision: 0, generation_id: 0, committed: false,
+    input_runtime: true, input_revision: 0, generation_id: 0, committed: false,
     agent_phase: 'IDLE', paraformer_final: '', refined_text: '',
     segments: [], prediction: {}, tools: [], audio_cues: [], analysis: {},
   }
@@ -136,9 +136,22 @@ function parseServerMessage(raw: unknown): ServerMessage | null {
     if (typeof parsed.type !== 'string') return null
     if (typeof parsed.seq !== 'number' || !Number.isInteger(parsed.seq) || !Number.isFinite(parsed.seq)) return null
     if (typeof parsed.timestamp !== 'string') return null
-    if (parsed.turn_id !== null && typeof parsed.turn_id !== 'string') return null
+    if (typeof parsed.session_id !== 'string' || !parsed.session_id) return null
+    for (const key of ['input_id', 'episode_id', 'decision_id', 'speech_id']) {
+      if (parsed[key] !== undefined && parsed[key] !== null && typeof parsed[key] !== 'string') return null
+    }
     if (!isRecord(parsed.payload)) return null
-    return parsed as unknown as ServerMessage
+    // The UI has deliberately stable presentation stores. This local mapping
+    // is not protocol compatibility: it consumes only the V1 vocabulary.
+    const typeMap: Record<string, string> = {
+      'input.started': 'turn.started', 'input.updated': 'transcript.partial',
+      'input.finalized': 'transcript.final', 'input.completed': 'turn.completed',
+      'agent.state': 'agent.episode', 'context.snapshot': 'llm.context',
+      'tool.state': 'agent.tool', 'speech.delta': 'speech.text_delta',
+      'speech.progress': 'tts.progress', 'metrics.snapshot': 'latency.snapshot',
+    }
+    return { ...parsed, type: typeMap[parsed.type] ?? parsed.type,
+      turn_id: parsed.input_id ?? null } as unknown as ServerMessage
   } catch {
     return null
   }
@@ -310,7 +323,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     for (const key of ['input_revision', 'generation_id'] as const) {
       if (typeof snapshot[key] === 'number') current[key] = snapshot[key]
     }
-    for (const key of ['v02', 'committed'] as const) {
+    for (const key of ['input_runtime', 'committed'] as const) {
       if (typeof snapshot[key] === 'boolean') current[key] = snapshot[key]
     }
     for (const key of ['agent_phase', 'paraformer_final', 'refined_text'] as const) {
@@ -494,7 +507,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       if (typeof payload.input_revision === 'number' && payload.generation_id === current.generation_id
         && payload.input_revision < (current.input_revision ?? 0)) return
       current.generation_id = payload.generation_id
-      if (isRecord(payload.workspace)) { current.v02 = true; applyWorkspace(payload.workspace) }
+      if (isRecord(payload.workspace)) { current.input_runtime = true; applyWorkspace(payload.workspace) }
     }
 
     switch (message.type) {

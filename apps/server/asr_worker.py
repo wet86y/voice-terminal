@@ -54,7 +54,7 @@ async def run(config_path: Path | None = None) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Voice Terminal v0.1 ASR Worker")
+    parser = argparse.ArgumentParser(description="Voice Terminal ASR Worker")
     parser.add_argument("--config", type=Path, default=None)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]

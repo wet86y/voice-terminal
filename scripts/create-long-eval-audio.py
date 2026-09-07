@@ -1,4 +1,4 @@
-"""Create ignored, deterministic long-audio fixtures for v0.2 analysis checks."""
+"""Create ignored, deterministic long-audio fixtures for analysis checks."""
 
 from __future__ import annotations
 

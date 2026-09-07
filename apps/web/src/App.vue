@@ -303,7 +303,7 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
           </div>
         </div>
 
-        <details v-if="terminal.current.v02" class="analysis-details">
+        <details v-if="terminal.current.input_runtime" class="analysis-details">
           <summary>理解与精修 · {{ terminal.current.agent_phase }} · {{ terminal.current.prediction?.decision || '等待' }}</summary>
           <p>{{ terminal.current.prediction?.intent || terminal.current.prediction?.error || '等待稳定语义段' }}</p>
           <p><strong>Paraformer 草稿：</strong>{{ terminal.current.paraformer_final || terminal.current.partial_text || '—' }}</p>

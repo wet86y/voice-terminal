@@ -1,195 +1,23 @@
 # Voice Terminal
 
-Voice Terminal 是一个运行在 Windows 上的本地实时语音终端。浏览器只负责控制和展示，麦克风、VAD、ASR、LLM、TTS、播放器和延迟测量都由本地 Voice Server 负责。
+Voice Terminal 是 Windows 本机实时语音会话终端。浏览器只负责控制与可视化；音频采集、VAD、ASR、Smart Turn、SenseVoice、Agent、工具、TTS、播放和延迟均由 Voice Server 负责。
 
-当前状态（2026-09-07）：V0.3 Agent Runtime 已完成软件实现、正确性修复和自动化验收，仍通过独立配置启用；默认配置与 v0.1/v0.2 路径保持不变。V0.3 在现有双流式 TTS、Bidi 取消屏障、受保护真人插话、播放快照和传达历史上增加跨 Turn Episode、合法等待、原生 `speak` 门控、只读工具缓存和有界诊断。当前自动化为 Python 170 项、前端 14 项；类型检查、构建、Python 编译检查和差异检查通过。真实设备耳机/扬声器与至少 20 条自然语音的验收材料已经准备，但仍待真人执行；真实服务复验若缺少凭据或服务不可用会单独记录为未完成证据。
+## 当前运行模型
 
-## 能力边界
+系统只有一条运行链：`SessionRuntime` 协调输入、会话账本、Agent 决策、只读工具和语音输出。用户输入拥有 `input_id`，跨输入 Agent 会话拥有 `episode_id`，每次模型决策拥有 `decision_id`，每次授权语音拥有 `speech_id`。
 
-```text
-浏览器 Vue 控制台
-        │ WebSocket
-        ▼
-本机 Voice Server
-  ├─ Audio Capture / PCM Player
-  ├─ KWS（可选）/ FSMN-VAD
-  ├─ TurnController 或 RealtimeController
-  ├─ ASR Worker 客户端
-  ├─ DeepSeek 客户端
-  └─ MiniMax TTS 客户端
-        │ WebSocket
-        ├──────── ASR Worker（Paraformer Streaming）
-  └──────── Analysis Worker（Smart Turn / SenseVoice，按配置启用）
-```
+只有 native `speak` 工具的正文可以进入 TTS。会话上下文来自唯一的传达感知账本：最终用户输入、用户实际听到的语音前缀、被打断说明与当前决策选中的工具来源块。重置会清空账本；系统不保存跨会话长期记忆。
 
-默认配置使用手动开始模式：`wake.enabled=false`，点击 `session.start` 后直接进入 VAD/ASR。KWS 仍然支持 `hei claw`，但需要显式打开。浏览器不调用 `getUserMedia`，不上传 PCM，不运行模型，也不根据时间戳自行计算延迟。
-
-v0.1 提供稳定的单轮语音对话链路：VAD/ASR → LLM → 文本桥接 → TTS → PCM 播放。v0.2 在此基础上增加 Smart Turn、SenseVoice 结束后精修、语音情绪上下文、持续讲话期间的预测和只读文件工具预取、generation/revision 隔离、Bidi TTS、受保护真人插话和按实际传达前缀结算的历史。V0.3 使用独立 `AgentEpisodeRuntime`：一个 Episode 可以接收多段输入并选择 `wait_for_input`，只有原生 `speak(text)` 可以进入 TTS；缓存结果必须由仍然有效的当前决策明确选中才会进入上下文。文件和搜索只读调用并行执行；`web_search` 在后台预取，用户可以继续讲话，搜索完成后再由 Agent 续接。依赖搜索结果的回答仍需等待结果完成，这是数据依赖，不是阻塞事件循环。
-
-## 快速开始
-
-环境要求：Windows、Python 3.12、Node.js/npm，以及项目配置所需的模型和 API Key。模型默认放在 `D:\模型\voice-terminal`，真实模型不会进入 Git。
-
-安装后端依赖和模型：
-
-```powershell
-.\scripts\setup.ps1 -Python D:\DevTools\Python312\python.exe
-```
-
-在仓库根目录创建 `.env.local`（该文件已被 Git 忽略）：
-
-```powershell
-@"
-DEEPSEEK_API_KEY=你的_DeepSeek_Key
-MINIMAX_API_KEY=你的_MiniMax_Token
-MINIMAX_API_HOST=https://api.minimaxi.com
-VOICE_WAKE_ENABLED=false
-"@ | Set-Content -Encoding utf8 .env.local
-```
-
-检查本机环境：
-
-```powershell
-.\scripts\doctor.ps1 -Python D:\DevTools\Python312\python.exe
-```
-
-启动默认 v0.1 后端：
-
-```powershell
-.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe
-```
-
-启动 v0.2 示例配置（需要 Analysis Worker 模型）：
+## 启动
 
 ```powershell
 .\scripts\setup.ps1 -Python D:\DevTools\Python312\python.exe -Analysis
-.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe -Config config\v0.2.yaml
-```
-
-启动 V0.3 Agent Runtime（仍需要 v0.2 的音频能力和 Analysis Worker）：
-
-```powershell
-.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe -Config config\v0.3.yaml
-```
-
-回退时停止服务并改用 `config\v0.2.yaml` 或默认配置；配置文件不会改变仓库默认版本。
-
-另开终端启动前端：
-
-```powershell
-npm install
+.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe
 npm run dev
 ```
 
-浏览器打开 Vite 输出的本地地址，默认通常是 `http://127.0.0.1:5173/`。前端 WebSocket 地址可通过 `.env.local` 中的 `VITE_VOICE_WS_URL` 修改。
+在根目录的已忽略 `.env.local` 中配置 `DEEPSEEK_API_KEY`、`MINIMAX_API_KEY` 和可选的 `MINIMAX_API_HOST`。浏览器默认连接 `ws://127.0.0.1:8765/ws`，不请求麦克风权限、不上传 PCM、不自行计算延迟。
 
-## 配置规则
+真实耳机/扬声器、自然语音统计与第三方服务稳定性仍是独立发布门槛，不能由 fake provider 或内存播放器代替。
 
-配置按以下顺序生效：
-
-1. `config/default.yaml` 提供基础值。
-2. 启动参数指定的 YAML（例如 `config/v0.2.yaml`）按对象递归覆盖基础值。
-3. `.env.local` 只补充没有出现在进程环境中的变量。
-4. 已存在的进程环境变量优先于 `.env.local`，特定环境变量还会覆盖 YAML 中对应字段。
-
-ASR Worker 地址统一来自最终的 `asr.worker_url`，或 `ASR_WORKER_URL`/`ASR_WORKER_HOST`/`ASR_WORKER_PORT` 覆盖。Voice Server、ASR readiness probe 和 v0.2 回放脚本都使用这个最终地址。Analysis 地址来自 `v02.analysis_url`。
-
-`config/default.yaml` 中 `v02.enabled=false`。启用 v0.2 不会自动改变默认配置；只有显式使用 `config/v0.2.yaml` 或其他启用 v0.2 的配置时，RealtimeController、Analysis、预测、工具、Bidi TTS 和受保护插话才会生效。
-
-## 运行检查和回放
-
-查看 ASR Worker 应用层 readiness：
-
-```powershell
-python -m voice_terminal.asr.probe --url ws://127.0.0.1:8766/asr --timeout 2
-```
-
-查看 Analysis Worker readiness：
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8767/health | ConvertTo-Json -Depth 5
-```
-
-使用已有录音进行 v0.2 进程间回放。回放使用内存播放器，不能代表物理扬声器：
-
-```powershell
-.\scripts\replay-v02.ps1 `
-  -Python D:\DevTools\Python312\python.exe `
-  -Config config\v0.2.yaml `
-  -Audio logs\evaluation\audio\query-first12.wav `
-  -Output logs\evaluation\audit-replay.json
-```
-
-使用同一工具检查 V0.3 Agent 摘要、上下文限制和输出结算：
-
-```powershell
-python -m voice_terminal.analysis.replay `
-  logs\evaluation\audio\query-first12.wav `
-  --config config\v0.3.yaml --asr-mode in-process `
-  --output logs\evaluation\v03-replay.json
-```
-
-明确要求回答的短文本双流式对比和等待语义复验见 [V0.3 验证记录](docs/v0.3-validation.md)。
-
-回放报告只记录协议状态、事件计数、延迟和音频进度等摘要；`logs/` 已被 Git 忽略。长音频夹具和离线分段命令见 [后端安装与联调](docs/backend-setup.md)。
-
-## 验证结果
-
-完整当前证据见 [项目审计报告](docs/project-audit.md)、[V0.3 验证记录](docs/v0.3-validation.md) 和 [V0.3 规格](docs/v0.3-spec.md)。主要结论：
-
-- Python 170 项测试通过，前端 14 项测试通过。
-- `npm run typecheck`、`npm run build`、Python compileall 和 `git diff --check` 通过。
-- 本机 ASR Worker health 为 READY，真实回放产生 partial/final，Analysis 两路可用。
-- v0.2 的轮次、generation、revision、工具预取、Bidi/旧 TTS 调度、播放快照、受保护插话、传达历史、断连恢复、重连清理和慢订阅者边界已有确定性回归。
-- v0.2 已通过真实 MiniMax Bidi 的短文本 smoke test，但仍未完成完整多轮、真实设备和自然语音统计验收，因此默认配置暂保持 v0.1。
-- V0.3 专项覆盖等待、精修语义、工具缓存准入、只读工具并行与网络搜索后台预取、single-flight、Speak 参数流、播放竞态、历史归属和资源清理；软件验收已完成，真实设备与自然语音仍待执行。
-
-V0.3 上下文预算说明：`config/v0.3.yaml` 的 `v03.max_context_tokens: 524288` 是模型输入的本地 token 估算预算。运行时以 `o200k_base` 估算包含 messages、工具 schema 和请求结构的有效载荷；它不是 DeepSeek 官方 tokenizer 的精确读数。预算超出时，运行时先缩短工具结果、再按完整工具调用—结果组和旧输入的顺序压缩本次请求投影，当前输入会保留，正常多轮对话不会因此锁死。AGENT EPISODE 面板同时显示 token 估算、预算百分比和 JSON 字符数调试值。
-
-V0.3 的语音正文只来自已授权的原生 `speak` 工具。`speak` 可传可选情绪（`calm`、`happy`、`sad`、`angry`、`fearful`、`disgusted`、`surprised`）。为避免 MiniMax Bidi 在 `task_flush` 或 `task_canceled` 后确认结束却不再返回 PCM，独立输出完成或取消后会关闭该 Bidi 会话；下一次输出用带当前情绪的全新会话。控制台右上角的“重置会话”会取消当前输入和播放、创建干净 Episode，同时保留历史 Turn、Trace 与传达记录。
-
-运行自动化检查：
-
-```powershell
-python -m pytest -q
-npm run typecheck
-npm run test
-npm run build
-python -m compileall -q voice_terminal apps tests
-git diff --check
-```
-
-## 协议和前端约定
-
-前后端统一使用 WebSocket Envelope。客户端命令必须包含非空 `request_id`；服务端事件的 `seq` 是当前连接内递增的整数；`payload` 必须是对象。前端先按 seq 去重，再按 `turn_id`、v0.2 的 `generation_id` 和 `input_revision` 丢弃过期事件。`turn.completed` 是历史记录的唯一写入口，前端不自行拼接历史或计算延迟。
-
-完整定义见 [WebSocket 协议](docs/websocket-protocol.md)。稳定 v0.1 行为见 [v0.1 规范](docs/v0.1-spec.md)，v0.2 能力边界见 [v0.2 规范](docs/v0.2-spec.md)，V0.3 行为见 [V0.3 规格](docs/v0.3-spec.md)。
-
-## 文档索引
-
-```text
-docs/
-├── backend-setup.md       Windows 后端安装、启动、health 和回放
-├── websocket-protocol.md  Voice Server 与 Vue 控制台协议
-├── v0.1-spec.md           默认 v0.1 链路边界和验收条件
-├── v0.2-spec.md           当前主实时链路能力和约束
-├── v0.2-validation.md     当前验证结果、证据和限制
-├── v0.3-spec.md            Episode、Agent、工具和输出契约
-├── v0.3-validation.md      本轮修复、自动化和真实服务证据
-├── v0.3-device-acceptance.md  真人设备场景与自然语音记录模板
-├── project-audit.md       最近一轮代码、逻辑和协议审计
-├── v0.2-next-steps.md     后续自然语音、设备和发布目标
-├── tts-scheduling.md      可复用 TTS 播放窗口与 Bidi direct 策略
-└── voice-interruption-bidi-execution.md  本次实施清单和验收记录
-```
-
-## 后续目标
-
-后续工作按验收依赖推进：
-
-1. 准备至少 20 条有人工核对文本的自然语音，分别测量 v0.1/v0.2 的 CER、误结束率、结束至首音 p50/p95、回退率和资源峰值。
-2. 在耳机和扬声器条件下验证播放前续说、播放中断、多轮连续使用、停止和重启；内存播放器时间不能替代真实设备时间。
-3. 在稳定的第三方服务窗口复测 MiniMax Bidi 的字幕字段、时间单位、flush/cancel 顺序、2205 重试和连续多轮；区分 provider 问题与本地调度问题。
-4. 只有当 V0.3 的真实设备、自然语音和 provider 稳定性证据补齐后，才评估是否切换默认运行版本；本提交不改变默认配置。
-
-明确不在当前路线中的能力包括声纹注册、本地强制对齐模型、HTTP TTS 迁移、长期记忆、RAG、外部账号操作、shell 工具和文件写操作。
+详见：[架构与组件契约](docs/architecture.md)、[WebSocket V1 协议](docs/websocket-protocol.md)、[上下文与工具规范](docs/context-and-tools.md)、[运行与质量门槛](docs/operations-and-quality.md)。

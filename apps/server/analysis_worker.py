@@ -20,9 +20,9 @@ def main():
     configure_logging(root / "logs/analysis-worker.log")
     lanes = {}
     for name, enabled, model_name, factory in (
-        ("endpoint", config.v02.smart_turn, "smart-turn-v3.2-cpu.onnx",
+        ("endpoint", config.smart_turn.smart_turn, "smart-turn-v3.2-cpu.onnx",
          lambda: SmartTurn(config.model_dir / "analysis/smart-turn")),
-        ("refine", config.v02.sensevoice, "SenseVoiceSmall",
+        ("refine", config.smart_turn.sensevoice, "SenseVoiceSmall",
          lambda: SenseVoice(config.model_dir / "analysis/sensevoice", config.vad_model_dir)),
     ):
         try:
@@ -31,7 +31,7 @@ def main():
         except Exception as exc:
             logging.exception("analysis.load_failed operation=%s", name)
             lanes[name] = AnalysisLane(error=str(exc), model_name=model_name)
-    address = urlparse(config.v02.analysis_url)
+    address = urlparse(config.smart_turn.analysis_url)
     uvicorn.run(create_analysis_app(lanes), host=address.hostname or "127.0.0.1", port=address.port or 8767,
                 ws_max_size=3 * 1024 * 1024)
 

@@ -16,7 +16,7 @@ class AudioProcessingError(RuntimeError):
 class AudioPreprocessor:
     """Optional WebRTC-style near-end processing for VAD and ASR.
 
-    The dependency is imported lazily so v0.1 and deterministic tests remain
+    The dependency is imported lazily so deterministic tests remain
     usable on machines without the native wheel.  When protection is required,
     callers must check ``available`` before enabling automatic barge-in.
     """

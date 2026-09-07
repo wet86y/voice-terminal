@@ -36,6 +36,13 @@ class EpisodeController(RealtimeController):
         # retain their own source identity and must remain history-only.
         if kind == "agent.episode":
             self.state.agent = dict(payload)
+        elif kind == "speech.completed":
+            # The session ledger is the only durable conversational memory.
+            # A speech record enters it only after the player reports what the
+            # user actually heard.
+            self.history.commit_delivery(str(payload.get("speech_id") or ""), str(payload.get("text") or ""),
+                                         payload.get("delivery") if isinstance(payload.get("delivery"), dict) else None,
+                                         termination=str(payload.get("status") or "completed"))
         await self._publish(VoiceEvent(kind, payload.get("turn_id") or self.episode.last_turn_id, payload))
 
     async def start_listening(self):
@@ -166,6 +173,8 @@ class EpisodeController(RealtimeController):
         delivery = {"status": "none", "termination": "completed", "heard_text": "",
                     "uncertain_text": "", "unheard_text": "", "precision": "complete"}
         if ws.turn_id not in self._input_history_committed:
+            self.history.commit_input(ws.turn_id, ws.final_text, details={"segments": list(ws.segments),
+                                      "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis)})
             record = self.history.append_record(turn_id=ws.turn_id, transcript=ws.final_text, response="",
                                                  latency={}, delivery=delivery,
                                                  episode_id=ws.episode_id,
@@ -185,6 +194,7 @@ class EpisodeController(RealtimeController):
         ws = self.workspace
         if record and ws and ws.turn_id not in self._input_history_committed:
             await self._ensure_workspace_episode(ws)
+            self.history.commit_input(ws.turn_id, ws.final_text or ws.raw_partial)
             record = self.history.append_record(
                 turn_id=ws.turn_id, transcript=ws.final_text or ws.raw_partial,
                 response="", latency={},

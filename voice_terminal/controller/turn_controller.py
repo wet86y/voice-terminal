@@ -200,7 +200,7 @@ class TurnController:
 
     async def initialize(self) -> None:
         self._loop = asyncio.get_running_loop()
-        # VoiceRuntime records initialization failures before constructing the
+        # SessionRuntime records initialization failures before constructing the
         # controller (notably a required AEC processor or a failed output
         # stream).  Do not turn those errors back into READY merely because a
         # dependency object exists; start_listening must remain blocked until
@@ -513,7 +513,7 @@ class TurnController:
         self._delivery_resolvers[turn_id] = DeliveryResolver()
         self.state.current["turn_id"] = turn_id
         # ``stop_and_snapshot`` closes the player gate for an interrupted or
-        # manually stopped generation.  Re-open it for every new v0.1 turn so
+        # manually stopped generation. Re-open it for every new input so
         # a later response is not silently discarded after an interruption.
         if self.player is not None:
             self.player.allow(turn_id)

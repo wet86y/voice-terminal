@@ -69,7 +69,7 @@ class AsrWorkerClient:
                 if isinstance(message, dict) and message.get("type") == "health":
                     request_id = message.get("request_id")
                     waiter = self._health_waiters.get(request_id) if isinstance(request_id, str) else None
-                    # A pre-v0.2 Worker did not echo a request ID.  Accept
+                    # Older workers did not echo a request ID. Accept
                     # that response only when there is exactly one pending
                     # health check; normal requests always require a match.
                     if waiter is None and request_id is None and len(self._health_waiters) == 1:

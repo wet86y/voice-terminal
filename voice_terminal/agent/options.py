@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class V03Options:
+class AgentOptions:
     enabled: bool = False
     decision_mode: str = "balanced"
     balanced_interval_ms: int = 800
@@ -16,15 +16,15 @@ class V03Options:
     @classmethod
     def from_mapping(cls, data):
         if not isinstance(data, dict):
-            raise ValueError("v03 must be an object")
+            raise ValueError("agent must be an object")
         result = cls(**data)
         if type(result.enabled) is not bool:
-            raise ValueError("v03.enabled must be boolean")
+            raise ValueError("agent.enabled must be boolean")
         if result.decision_mode not in {"conservative", "balanced", "aggressive"}:
-            raise ValueError("invalid v03.decision_mode")
+            raise ValueError("invalid agent.decision_mode")
         for name in cls.__dataclass_fields__:
             if name in {"enabled", "decision_mode"}:
                 continue
             if type(getattr(result, name)) is not int or getattr(result, name) <= 0:
-                raise ValueError(f"v03.{name} must be a positive integer")
+                raise ValueError(f"agent.{name} must be a positive integer")
         return result

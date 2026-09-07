@@ -1,4 +1,4 @@
-# Installed separately so v0.1 remains usable without analysis assets.
+# Installed separately when local analysis assets are required.
 -r requirements.txt
 onnxruntime==1.24.3
 transformers==5.16.1

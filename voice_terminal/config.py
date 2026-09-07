@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .env import load_env_file
-from .controller.options import V02Options
-from .agent.options import V03Options
+from .controller.options import InputOptions
+from .agent.options import AgentOptions
 
 
 def _string(value: Any, default: str) -> str:
@@ -59,8 +59,7 @@ class AudioConfig:
     noise_suppression: bool = True
     automatic_gain_control: bool = False
     # Conservative device-output tail used when PortAudio does not expose a
-    # trustworthy DAC timestamp.  v0.1 keeps the historical zero default;
-    # v0.2 can set a measured/estimated value explicitly.
+    # trustworthy DAC timestamp. Keep a conservative, explicit fallback.
     device_latency_ms: int = 0
 
 
@@ -174,9 +173,17 @@ class AsrWorkerConfig:
 
 
 @dataclass(frozen=True)
+class ToolConfig:
+    enabled: bool = True
+    web_search: bool = True
+    allowed_roots: tuple[str, ...] = ("docs",)
+
+
+@dataclass(frozen=True)
 class AppConfig:
-    v02: V02Options = field(default_factory=V02Options)
-    v03: V03Options = field(default_factory=V03Options)
+    smart_turn: InputOptions = field(default_factory=InputOptions)
+    agent: AgentOptions = field(default_factory=AgentOptions)
+    tools: ToolConfig = field(default_factory=ToolConfig)
     model_dir: Path = Path(r"D:\模型\voice-terminal")
     debug_audio_capture: bool = False
     audio: AudioConfig = field(default_factory=AudioConfig)
@@ -188,10 +195,6 @@ class AppConfig:
     text_bridge: TextBridgeConfig = field(default_factory=TextBridgeConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     asr_worker: AsrWorkerConfig = field(default_factory=AsrWorkerConfig)
-
-    def __post_init__(self):
-        if self.v03.enabled and not self.v02.enabled:
-            raise ValueError("v03 requires v02 audio capabilities")
 
     @property
     def kws_dir(self) -> Path:
@@ -264,9 +267,21 @@ class AppConfig:
         else:
             chunk_size = (0, 10, 5)
 
+        smart_turn_data = dict(_section(data, "smart_turn"))
+        tool_data = _section(data, "tools")
+        smart_turn_data.update({
+            "enabled": True,
+            "tools": _bool(tool_data.get("enabled"), True),
+            "web_search": _bool(tool_data.get("web_search"), True),
+            "allowed_roots": tool_data.get("allowed_roots", ["docs"]),
+        })
         return cls(
-            v02=V02Options.from_mapping(data.get("v02", {}), root),
-            v03=V03Options.from_mapping(data.get("v03", {})),
+            smart_turn=InputOptions.from_mapping(smart_turn_data, root),
+            agent=AgentOptions.from_mapping(_section(data, "agent")),
+            tools=ToolConfig(enabled=_bool(tool_data.get("enabled"), True),
+                             web_search=_bool(tool_data.get("web_search"), True),
+                             allowed_roots=tuple(item for item in tool_data.get("allowed_roots", ["docs"])
+                                                 if isinstance(item, str) and item.strip()) or ("docs",)),
             model_dir=model_dir,
             debug_audio_capture=_bool(
                 data.get("debug_audio_capture"),

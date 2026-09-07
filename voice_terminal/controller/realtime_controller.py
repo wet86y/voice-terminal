@@ -10,7 +10,7 @@ from .speech_pipeline import SpeechPipeline
 from .turn_workspace import AudioFrame, CurrentTurnAudioBuffer, TurnWorkspace
 from .transcript_segmenter import TranscriptSegmenter
 from .agent_scheduler import PredictionScheduler
-from .options import V02Options
+from .options import InputOptions
 from ..analysis.client import AnalysisClient
 from ..agent.runtime import AgentRuntime
 from ..agent.speculative_tools import SpeculativeTools, ToolSelectionInvalid
@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 
 
 class RealtimeController(SpeechPipeline, TurnController):
-    """v0.2 orchestration; v0.1 stays available through the feature switch."""
+    """Realtime input orchestration used by the session runtime."""
 
-    def __init__(self, *, options: V02Options, analysis=None, search: WebSearchTools | None = None, **kwargs) -> None:
+    def __init__(self, *, options: InputOptions, analysis=None, search: WebSearchTools | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.options = options
         self.analysis = analysis or AnalysisClient(options.analysis_url)
@@ -93,7 +93,7 @@ class RealtimeController(SpeechPipeline, TurnController):
         ws = self.workspace
         if ws is None:
             return
-        self.state.current.update(ws.snapshot(), turn_id=ws.turn_id, v02=True)
+        self.state.current.update(ws.snapshot(), turn_id=ws.turn_id, input_runtime=True)
         await self._publish(event(type_, ws.turn_id, input_revision=ws.input_revision,
                                   generation_id=ws.generation_id, workspace=ws.snapshot(), **payload))
 
@@ -241,7 +241,7 @@ class RealtimeController(SpeechPipeline, TurnController):
                 try:
                     await self.capture.stop()
                 except Exception:
-                    logger.exception("controller.v02_audio_loop_stop_capture_failed")
+                    logger.exception("controller.input_audio_loop_stop_capture_failed")
                 sender = self._asr_sender
                 if sender is not None and sender is not asyncio.current_task() and not sender.done():
                     sender.cancel()
@@ -257,7 +257,7 @@ class RealtimeController(SpeechPipeline, TurnController):
                     try:
                         await self.asr.close()
                     except Exception:
-                        logger.exception("controller.v02_audio_loop_close_asr_failed")
+                        logger.exception("controller.input_audio_loop_close_asr_failed")
                 self.state.services["audio"] = "READY" if self.capture is not None else "ERROR"
                 self.state.services["kws"] = "READY" if self.wake_enabled and self.kws is not None else "DISABLED"
                 self.state.services["asr"] = "READY" if self.asr is not None and self.vad is not None else "ERROR"
@@ -478,7 +478,7 @@ class RealtimeController(SpeechPipeline, TurnController):
     def _schedule_active_bidi_cancel(self) -> None:
         """Put a superseded same-turn Bidi generation behind the cancel barrier.
 
-        A pre-playback continuation cancels the v0.2 answer task directly so
+        A pre-playback continuation cancels the active answer task directly so
         ASR can keep consuming the revised utterance.  The task's ``finally``
         block intentionally keeps a healthy persistent Bidi socket open, so
         cancelling the Python task alone is insufficient: the provider could
@@ -797,7 +797,7 @@ class RealtimeController(SpeechPipeline, TurnController):
     async def _prediction_event(self, ws: TurnWorkspace, type_: str, token: tuple[str, int], revision: int, **payload) -> None:
         current = self.workspace is ws and ws.token == token and ws.input_revision == revision
         if current:
-            self.state.current.update(ws.snapshot(), turn_id=ws.turn_id, v02=True)
+            self.state.current.update(ws.snapshot(), turn_id=ws.turn_id, input_runtime=True)
         await self._publish(event(type_, ws.turn_id, input_revision=revision, generation_id=token[1],
                                   workspace=ws.snapshot() if current else None, **payload))
 
@@ -1052,7 +1052,7 @@ class RealtimeController(SpeechPipeline, TurnController):
                 try:
                     keep_tts_session = bool(await asyncio.wait_for(cancel(timeout_seconds=2.0), 2.0))
                 except Exception:
-                    logger.warning("controller.v02_tts_cancel_degraded turn_id=%s", ws.turn_id if ws else None, exc_info=True)
+                    logger.warning("controller.tts_cancel_degraded turn_id=%s", ws.turn_id if ws else None, exc_info=True)
         stopped = self._stop_generation()
         if stopped:
             await asyncio.gather(*stopped, return_exceptions=True)

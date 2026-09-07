@@ -1,17 +1,16 @@
 model_dir: "D:\\模型\\voice-terminal"
 debug_audio_capture: false
 
-# v0.2 is the current development path. Keep the default runtime on v0.1
-# until natural-speech and real-device acceptance justify switching this gate.
-v02:
-  enabled: false
-  smart_turn: false
-  sensevoice: false
-  predictions: false
-  tools: false
-  web_search: false
+# The only runtime: audio input refinement is independently configurable.
+smart_turn:
+  smart_turn: true
+  sensevoice: true
+  predictions: true
   analysis_url: ws://127.0.0.1:8767/analysis
   max_turn_ms: 60000
+tools:
+  enabled: true
+  web_search: true
   allowed_roots: [docs]
 
 audio:
@@ -62,6 +61,16 @@ tts:
   provider: minimax
   base_url: https://api.minimaxi.com
   websocket_path: /ws/v1/t2a_v2
+  transport: websocket_bidi
+  scheduling: direct
+  subtitle_enable: true
+  subtitle_type: word_streaming
+  audio_cache_max_bytes: 67108864
+  cancel_timeout_ms: 2000
+  keepalive_seconds: 30
+  emotion_mode: agent
+  default_emotion: calm
+  emotion_transport: voice_setting
   model: speech-2.8-hd
   api_key_env: MINIMAX_API_KEY
   output_format: pcm
@@ -73,7 +82,7 @@ text_bridge:
   min_chars: 8
   max_chars: 36
   max_wait_ms: 350
-  preferred_breaks: "。！？；，、"
+  preferred_breaks: "。！？；"
 
 server:
   host: 127.0.0.1
@@ -82,3 +91,14 @@ server:
 asr_worker:
   host: 127.0.0.1
   port: 8766
+
+agent:
+  enabled: true
+  decision_mode: balanced
+  balanced_interval_ms: 800
+  aggressive_interval_ms: 400
+  silence_ms: 5500
+  max_requests_per_step: 5
+  max_context_tokens: 524288
+  trace_limit: 200
+  output_limit: 32

@@ -47,8 +47,8 @@ class MiniMaxTtsAudioTests(unittest.TestCase):
         self.assertEqual(client.applied_emotion, "calm")
         self.assertNotIn("emotion", client.start_payload("happy")["voice_setting"])
 
-    def test_v03_emotion_configuration_is_loaded(self) -> None:
-        config = load_config(Path("config/default.yaml"), Path("config/v0.3.yaml"))
+    def test_agent_emotion_configuration_is_loaded(self) -> None:
+        config = load_config(Path("config/default.yaml"))
         self.assertEqual(config.tts.emotion_mode, "agent")
         self.assertEqual(config.tts.default_emotion, "calm")
         self.assertEqual(config.tts.emotion_transport, "voice_setting")

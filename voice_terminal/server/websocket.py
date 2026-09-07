@@ -11,8 +11,6 @@ from ..audio.player import AudioPlayerError, PcmPlayer
 from ..audio.processing import AudioPreprocessor
 from ..asr.client import AsrWorkerClient
 from ..config import AppConfig
-from ..controller.turn_controller import TurnController
-from ..controller.realtime_controller import RealtimeController
 from ..controller.episode_controller import EpisodeController
 from ..vad.barge_in import BargeInGate
 from ..core.event_bus import EventBus
@@ -23,7 +21,8 @@ from ..providers.deepseek import DeepSeekClient
 from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
 from ..agent.tool_registry import WebSearchTools
-from ..server.history import InMemoryHistory
+from ..session.contracts import new_id
+from .session_ledger import SessionLedgerFacade
 from ..vad.detector import FsmnVadDetector, VadError
 from .snapshot import ProtocolSequencer, snapshot_event
 
@@ -37,12 +36,15 @@ except ImportError:  # pragma: no cover - exercised by doctor/setup, not unit te
     WebSocketDisconnect = Exception  # type: ignore[assignment,misc]
 
 
-class VoiceRuntime:
+class SessionRuntime:
+    """The sole production runtime: a session orchestrating input, agent and speech."""
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.state = RuntimeState()
         self.bus = EventBus()
-        self.history = InMemoryHistory(limit=10)
+        # EpisodeController still owns the proven realtime audio mechanics;
+        # session history is now supplied by this one ledger facade.
+        self.history = SessionLedgerFacade(limit=10)
         self.startup_errors: list[str] = []
         self.capture: AudioCapture | None = None
         self.kws: KwsDetector | None = None
@@ -53,7 +55,8 @@ class VoiceRuntime:
         self.search_tools: WebSearchTools | None = None
         self.player: PcmPlayer | None = None
         self.audio_processor: AudioPreprocessor | None = None
-        self.controller: TurnController | None = None
+        self.controller: EpisodeController | None = None
+        self.session_id = new_id("session")
         self._session_lock = asyncio.Lock()
 
     def _record_error(self, service: str, message: str, *, status_service: str | None = None) -> None:
@@ -133,7 +136,7 @@ class VoiceRuntime:
                 model_dir=self.config.vad_model_dir,
                 device="cpu",
                 sample_rate=self.config.audio.sample_rate,
-                end_silence_ms=300 if self.config.v02.enabled else None,
+                end_silence_ms=300 if self.config.smart_turn.enabled else None,
             )
         except Exception as exc:
             self._record_error("vad", str(exc), status_service="asr")
@@ -162,7 +165,7 @@ class VoiceRuntime:
             self._record_error("llm", f"未配置 {self.config.llm.api_key_env}")
 
         minimax_key = self.config.api_key(self.config.tts.api_key_env)
-        if self.config.v02.enabled and self.config.v02.tools and self.config.v02.web_search:
+        if self.config.tools.enabled and self.config.tools.web_search:
             if not minimax_key:
                 self._disable_optional_search(f"未配置 {self.config.tts.api_key_env}")
             else:
@@ -222,16 +225,10 @@ class VoiceRuntime:
         else:
             self._record_error("tts", f"未配置 {self.config.tts.api_key_env}")
 
-        if self.config.v02.enabled and (self.config.audio.sample_rate != 16000 or self.config.audio.channels != 1 or self.config.audio.sample_format != "int16"):
-            raise ValueError("v0.2 requires 16 kHz mono int16 capture")
-        if self.config.v03.enabled and not self.config.v02.enabled:
-            raise ValueError("v03 requires v02 audio capabilities")
-        controller_class = EpisodeController if self.config.v03.enabled else (RealtimeController if self.config.v02.enabled else TurnController)
-        extra = ({"options": self.config.v02, "search": self.search_tools}
-                 if self.config.v02.enabled else {})
-        if self.config.v03.enabled:
-            extra["agent_options"] = self.config.v03
-        self.controller = controller_class(
+        if self.config.audio.sample_rate != 16000 or self.config.audio.channels != 1 or self.config.audio.sample_format != "int16":
+            raise ValueError("session runtime requires 16 kHz mono int16 capture")
+        self.controller = EpisodeController(
+            options=self.config.smart_turn, search=self.search_tools, agent_options=self.config.agent,
             **extra,
             state=self.state,
             bus=self.bus,
@@ -260,7 +257,7 @@ class VoiceRuntime:
 
     def snapshot(self) -> VoiceEvent:
         value = snapshot_event(self.state)
-        value.payload["recent_turns"] = [record.to_payload() for record in self.history.records]
+        value.payload["ledger"] = [record.to_payload() for record in self.history.records]
         return value
 
     async def start_listening(self) -> None:
@@ -279,6 +276,7 @@ class VoiceRuntime:
         async with self._session_lock:
             if self.controller is not None and hasattr(self.controller, "reset_session"):
                 await self.controller.reset_session()
+            self.session_id = new_id("session")
 
     async def close(self) -> None:
         if self.controller is not None:
@@ -313,7 +311,7 @@ def _valid_command(message: Any) -> tuple[str, dict[str, Any]] | None:
     return command, payload
 
 
-def create_app(runtime: VoiceRuntime, *, lifespan: Any = None) -> Any:
+def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
     if FastAPI is None:
         raise RuntimeError("缺少 fastapi，请先运行 scripts\\setup.ps1。")
 
@@ -327,7 +325,7 @@ def create_app(runtime: VoiceRuntime, *, lifespan: Any = None) -> Any:
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
         logger.info("websocket.connected peer=%s", websocket.client)
-        sequencer = ProtocolSequencer()
+        sequencer = ProtocolSequencer(lambda: runtime.session_id)
         subscription = runtime.bus.subscribe()
         event_task = asyncio.create_task(_forward_events(websocket, subscription, sequencer), name="websocket-events")
         # Let the forwarding task register its queue before a fast
@@ -368,6 +366,8 @@ def create_app(runtime: VoiceRuntime, *, lifespan: Any = None) -> Any:
 async def _forward_events(websocket: Any, subscription: Any, sequencer: ProtocolSequencer) -> None:
     try:
         async for value in subscription:
+            if not sequencer.public(value):
+                continue
             if value.type == "speech.completed":
                 payload = value.payload if isinstance(value.payload, dict) else {}
                 delivery = payload.get("delivery") if isinstance(payload.get("delivery"), dict) else {}
