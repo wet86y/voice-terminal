@@ -5,7 +5,6 @@ debug_audio_capture: false
 smart_turn:
   smart_turn: true
   sensevoice: true
-  predictions: true
   analysis_url: ws://127.0.0.1:8767/analysis
   max_turn_ms: 60000
 tools:
@@ -56,7 +55,8 @@ llm:
   model: deepseek-v4-flash
   api_key_env: DEEPSEEK_API_KEY
   stream: true
-  thinking: disabled
+  thinking: enabled
+  reasoning_effort: low
   timeout_ms: 15000
 
 tts:
@@ -73,6 +73,7 @@ tts:
   emotion_mode: agent
   default_emotion: calm
   emotion_transport: voice_setting
+  session_reuse: true
   model: speech-2.8-hd
   api_key_env: MINIMAX_API_KEY
   output_format: pcm
@@ -100,7 +101,11 @@ agent:
   balanced_interval_ms: 800
   aggressive_interval_ms: 400
   silence_ms: 5500
+  response_check_ms: 6000
   max_requests_per_step: 5
   max_context_tokens: 524288
   trace_limit: 200
   output_limit: 32
+
+speech:
+  prefill_enabled: true

@@ -107,4 +107,4 @@ class SpeechOutput:
     text: str
     status: str
     delivery: DeliveryReport
-
+    kind: str = "formal"

@@ -17,7 +17,7 @@ import type {
   TurnDelivery,
   TtsStatusPayload,
   TurnCompletedPayload,
-  TurnRecord,
+  InputRecord,
 } from '../types'
 import { TERMINAL_STATES } from '../types'
 
@@ -95,7 +95,7 @@ function createEmptyCurrentTurn(): CurrentTurnSnapshot {
     tts_scheduling: 'auto',
     input_runtime: true, input_revision: 0, generation_id: 0, committed: false,
     agent_phase: 'IDLE', paraformer_final: '', refined_text: '',
-    segments: [], prediction: {}, tools: [], audio_cues: [], analysis: {},
+    segments: [], tools: [], audio_cues: [], analysis: {},
   }
 }
 
@@ -110,7 +110,7 @@ function createEmptyLatency(): LatencyValues {
     first_audio_to_playback_ms: null,
     speech_end_to_playback_ms: null,
     turn_total_ms: null,
-    first_segment_ms: null, first_prediction_ms: null, smart_turn_ms: null,
+    first_segment_ms: null, smart_turn_ms: null,
     sensevoice_refine_ms: null, commit_to_final_llm_ms: null,
   }
 }
@@ -141,17 +141,7 @@ function parseServerMessage(raw: unknown): ServerMessage | null {
       if (parsed[key] !== undefined && parsed[key] !== null && typeof parsed[key] !== 'string') return null
     }
     if (!isRecord(parsed.payload)) return null
-    // The UI has deliberately stable presentation stores. This local mapping
-    // is not protocol compatibility: it consumes only the V1 vocabulary.
-    const typeMap: Record<string, string> = {
-      'input.started': 'turn.started', 'input.updated': 'transcript.partial',
-      'input.finalized': 'transcript.final', 'input.completed': 'turn.completed',
-      'agent.state': 'agent.episode', 'context.snapshot': 'llm.context',
-      'tool.state': 'agent.tool', 'speech.delta': 'speech.text_delta',
-      'speech.progress': 'tts.progress', 'metrics.snapshot': 'latency.snapshot',
-    }
-    return { ...parsed, type: typeMap[parsed.type] ?? parsed.type,
-      turn_id: parsed.input_id ?? null } as unknown as ServerMessage
+    return parsed as unknown as ServerMessage
   } catch {
     return null
   }
@@ -182,12 +172,14 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const currentLatency = reactive<LatencyValues>(createEmptyLatency())
   const currentLatencyComplete = ref(false)
   const services = reactive<ServiceStatuses>(createOfflineStatuses())
-  const recentTurns = ref<TurnRecord[]>([])
+  const recentTurns = ref<InputRecord[]>([])
   const agentEpisode = ref<AgentEpisodeSnapshot | null>(null)
   const agentTrace = ref<AgentTrace[]>([])
   const speechOutputs = ref<SpeechOutputRecord[]>([])
   const activeSpeech = ref<SpeechOutputRecord | null>(null)
   const speechProgress = ref<Record<string, unknown> | null>(null)
+  const prefill = ref<{ status?: string, text?: string } | null>(null)
+  const reasoning = ref('')
   const retiredEpisodes = new Set<string>()
 
   function applyAgent(value: unknown, authoritative = false) {
@@ -218,6 +210,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     agentEpisode.value = value as unknown as AgentEpisodeSnapshot
     if (Array.isArray(value.trace)) agentTrace.value = value.trace.filter(isAgentTrace).slice(-200)
     if (Array.isArray(value.outputs)) speechOutputs.value = value.outputs.filter(isSpeechOutput).slice(-32)
+    prefill.value = isRecord(value.pending_prefill) ? value.pending_prefill as { status?: string, text?: string } : null
+    if (isRecord(value.reasoning) && typeof value.reasoning.text === 'string') reasoning.value = value.reasoning.text
     if (isSpeechOutput(value.active_speech)) activeSpeech.value = value.active_speech
     else if (value.episode_id === null) activeSpeech.value = null
     else if (value.active_speech === null && Array.isArray(value.outputs)) {
@@ -332,7 +326,6 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (Array.isArray(snapshot.segments)) current.segments = snapshot.segments as NonNullable<CurrentTurnSnapshot['segments']>
     if (Array.isArray(snapshot.tools)) current.tools = snapshot.tools as NonNullable<CurrentTurnSnapshot['tools']>
     if (Array.isArray(snapshot.audio_cues)) current.audio_cues = snapshot.audio_cues as NonNullable<CurrentTurnSnapshot['audio_cues']>
-    if (isRecord(snapshot.prediction)) current.prediction = snapshot.prediction
     if (isRecord(snapshot.analysis)) current.analysis = snapshot.analysis as NonNullable<CurrentTurnSnapshot['analysis']>
   }
 
@@ -361,15 +354,15 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (typeof payload.can_start === 'boolean') canStart.value = payload.can_start
     applyServices(payload.services)
     const hasCurrentTurnId = isRecord(payload.current)
-      && Object.prototype.hasOwnProperty.call(payload.current, 'turn_id')
-    const snapshotTurnId = isRecord(payload.current) ? readString(payload.current, 'turn_id') : null
+      && Object.prototype.hasOwnProperty.call(payload.current, 'input_id')
+    const snapshotTurnId = isRecord(payload.current) ? readString(payload.current, 'input_id') : null
     if (turnId || snapshotTurnId) adoptTurn(turnId || snapshotTurnId)
     else if (hasCurrentTurnId && currentTurnId.value !== null) resetConnectionData()
     applyCurrentSnapshot(payload.current)
     if (payload.agent) applyAgent(payload.agent, true)
     if (payload.latency) applyLatencySnapshot(payload.latency)
-    if (Array.isArray(payload.recent_turns)) {
-      recentTurns.value = payload.recent_turns.filter(item => isRecord(item) && typeof item.turn_id === 'string')
+    if (Array.isArray(payload.recent_inputs)) {
+      recentTurns.value = (payload.recent_inputs.filter(item => isRecord(item) && typeof item.input_id === 'string') as InputRecord[])
         .slice(0, MAX_RECENT_TURNS).map(item => ({
           ...item,
           latency: copyLatencyValues(item.latency),
@@ -391,8 +384,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     const response = typeof payload.response === 'string' ? payload.response : current.assistant_text
     const completedAt = typeof payload.completed_at === 'string' ? payload.completed_at : ''
     const delivery = readDelivery(payload.delivery)
-    const record: TurnRecord = {
-      turn_id: turnId,
+    const record: InputRecord = {
+      input_id: turnId,
       episode_id: payload.episode_id,
       details: payload.details,
       transcript,
@@ -403,7 +396,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       delivery,
     }
 
-    recentTurns.value = [record, ...recentTurns.value.filter((item) => item.turn_id !== turnId)]
+    recentTurns.value = [record, ...recentTurns.value.filter((item) => item.input_id !== turnId)]
       .slice(0, MAX_RECENT_TURNS)
 
     if (currentTurnId.value === null || currentTurnId.value === turnId) {
@@ -457,8 +450,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     lastServerTimestamp.value = message.timestamp
     const payload = isRecord(message.payload) ? message.payload : {}
     // Agent/output generations are independent of the currently displayed input turn.
-    if (message.type === 'agent.episode') { applyAgent(payload); return }
+    if (message.type === 'agent.state') { applyAgent(payload); return }
     if (message.type === 'agent.trace') { applyAgentTrace(payload); return }
+    if (message.type === 'agent.prefill') { prefill.value = isRecord(payload.prefill) ? payload.prefill as { status?: string, text?: string } : null; return }
+    if (message.type === 'agent.reasoning') { if (typeof payload.text === 'string') reasoning.value = payload.text; return }
+    if (message.type === 'speech.queued') return
     if (message.type === 'speech.completed') {
       if (isSpeechOutput(payload)) {
         speechOutputs.value = [...speechOutputs.value.filter(item => item.speech_id !== payload.speech_id), payload].slice(-32)
@@ -467,7 +463,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       }
       return
     }
-    if (message.type === 'speech.text_delta') {
+    if (message.type === 'speech.delta') {
       const currentAgent = agentEpisode.value
       const textDelta = readString(payload, 'text_delta')
       if (textDelta !== null && typeof payload.speech_id === 'string'
@@ -480,7 +476,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
             episode_id: payload.episode_id as string,
             agent_step_id: payload.agent_step_id as string,
             context_version: payload.context_version as number,
-            turn_id: typeof payload.turn_id === 'string' ? payload.turn_id : message.turn_id || '',
+            input_id: typeof payload.input_id === 'string' ? payload.input_id : message.input_id || '',
             generation_id: typeof payload.generation_id === 'number' ? payload.generation_id : 0,
             text: '', status: 'streaming',
           }
@@ -501,8 +497,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         && !speechOutputs.value.some(item => item.speech_id === payload.speech_id)) speechProgress.value = payload
       return
     }
-    if (message.type === 'turn.started') adoptTurn(message.turn_id)
-    if (message.turn_id === currentTurnId.value && typeof payload.generation_id === 'number') {
+    if (message.type === 'input.started') adoptTurn(message.input_id ?? null)
+    if (message.input_id === currentTurnId.value && typeof payload.generation_id === 'number') {
       if (payload.generation_id < (current.generation_id ?? 0)) return
       if (typeof payload.input_revision === 'number' && payload.generation_id === current.generation_id
         && payload.input_revision < (current.input_revision ?? 0)) return
@@ -511,29 +507,20 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     }
 
     switch (message.type) {
-      case 'turn.resumed':
-        if (acceptsCurrentTurn(message.turn_id)) {
-          current.final_text = ''; current.assistant_text = ''; current.tts_text = ''
-          current.audio_buffer_ms = 0; current.tts_status = 'IDLE'
-          current.tts_returned_ms = 0; current.tts_played_ms = 0
-          current.tts_output_estimated_ms = 0; current.tts_remaining_ms = 0
-          current.delivery = {}
-        }
-        break
       case 'runtime.snapshot':
-        applyRuntimeSnapshot(payload as unknown as RuntimeSnapshotPayload, message.turn_id)
+        applyRuntimeSnapshot(payload as unknown as RuntimeSnapshotPayload, message.input_id ?? null)
         break
       case 'session.state':
-        applySessionState(payload as unknown as SessionStatePayload, message.turn_id)
+        applySessionState(payload as unknown as SessionStatePayload, message.input_id ?? null)
         break
-      case 'transcript.partial':
-        if (acceptsCurrentTurn(message.turn_id)) {
+      case 'input.updated':
+        if (acceptsCurrentTurn(message.input_id ?? null)) {
           const text = readString(payload, 'text')
           if (text !== null) current.partial_text = text
         }
         break
-      case 'transcript.final':
-        if (acceptsCurrentTurn(message.turn_id)) {
+      case 'input.finalized':
+        if (acceptsCurrentTurn(message.input_id ?? null)) {
           const text = readString(payload, 'text')
           if (text !== null) {
             current.final_text = text
@@ -541,18 +528,17 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
           }
         }
         break
-      case 'assistant.delta':
-        if (acceptsCurrentTurn(message.turn_id)) {
+      case 'speech.delta':
+        if (acceptsCurrentTurn(message.input_id ?? null)) {
           const textDelta = readString(payload, 'text_delta')
           if (textDelta !== null) current.assistant_text += textDelta
         }
         break
-      case 'llm.context':
-        applyLlmContext(payload, message.turn_id)
+      case 'context.snapshot':
+        applyLlmContext(payload, message.input_id ?? null)
         break
-      case 'tts.status':
-      case 'tts.progress':
-        if (acceptsCurrentTurn(message.turn_id)) {
+      case 'speech.progress':
+        if (acceptsCurrentTurn(message.input_id ?? null)) {
           const waitingText = readString(payload, 'waiting_text')
           const status = readString(payload, 'status')
           const bufferMs = payload.audio_buffer_ms
@@ -579,20 +565,13 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
           }
         }
         break
-      case 'latency.snapshot':
-        if (acceptsCurrentTurn(message.turn_id)) {
+      case 'metrics.snapshot':
+        if (acceptsCurrentTurn(message.input_id ?? null)) {
           applyLatencySnapshot(payload as unknown as LatencySnapshotPayload)
         }
         break
-      case 'turn.completed':
-        applyCompletedTurn(payload as unknown as TurnCompletedPayload, message.turn_id)
-        break
-      case 'turn.interrupted':
-        if (acceptsCurrentTurn(message.turn_id)) {
-          const delivery = readDelivery(payload.delivery)
-          if (delivery !== undefined) current.delivery = delivery
-          state.value = 'INTERRUPTING'
-        }
+      case 'input.completed':
+        applyCompletedTurn(payload as unknown as TurnCompletedPayload, message.input_id ?? null)
         break
       case 'error': {
         const messageText = readString(payload, 'message')
@@ -710,6 +689,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     speechOutputs,
     activeSpeech,
     speechProgress,
+    prefill,
+    reasoning,
     llmContext,
     llmContextTurnId,
     lastServerTimestamp,

@@ -22,7 +22,7 @@ from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
 from ..agent.tool_registry import WebSearchTools
 from ..session.contracts import new_id
-from .session_ledger import SessionLedgerFacade
+from ..session.ledger import SessionLedger
 from ..vad.detector import FsmnVadDetector, VadError
 from .snapshot import ProtocolSequencer, snapshot_event
 
@@ -42,9 +42,7 @@ class SessionRuntime:
         self.config = config
         self.state = RuntimeState()
         self.bus = EventBus()
-        # EpisodeController still owns the proven realtime audio mechanics;
-        # session history is now supplied by this one ledger facade.
-        self.history = SessionLedgerFacade(limit=10)
+        self.history = SessionLedger(limit=10)
         self.startup_errors: list[str] = []
         self.capture: AudioCapture | None = None
         self.kws: KwsDetector | None = None
@@ -159,6 +157,7 @@ class SessionRuntime:
                 api_key=deepseek_key,
                 timeout_ms=self.config.llm.timeout_ms,
                 thinking=self.config.llm.thinking,
+                reasoning_effort=self.config.llm.reasoning_effort,
             )
             self.state.set_service("llm", "READY")
         else:
@@ -203,6 +202,7 @@ class SessionRuntime:
                 emotion_mode=self.config.tts.emotion_mode,
                 default_emotion=self.config.tts.default_emotion,
                 emotion_transport=self.config.tts.emotion_transport,
+                session_reuse=self.config.tts.session_reuse,
             )
             self.state.current.update(
                 tts_transport=self.config.tts.transport,
@@ -229,6 +229,7 @@ class SessionRuntime:
             raise ValueError("session runtime requires 16 kHz mono int16 capture")
         self.controller = EpisodeController(
             options=self.config.smart_turn, search=self.search_tools, agent_options=self.config.agent,
+            prefill_enabled=self.config.speech.prefill_enabled,
             state=self.state,
             bus=self.bus,
             history=self.history,
@@ -256,7 +257,7 @@ class SessionRuntime:
 
     def snapshot(self) -> VoiceEvent:
         value = snapshot_event(self.state)
-        value.payload["ledger"] = [record.to_payload() for record in self.history.records]
+        value.payload["recent_inputs"] = [record.to_payload() for record in self.history.records]
         return value
 
     async def start_listening(self) -> None:
@@ -314,7 +315,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
     if FastAPI is None:
         raise RuntimeError("缺少 fastapi，请先运行 scripts\\setup.ps1。")
 
-    app = FastAPI(title="Voice Terminal Server", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Voice Terminal Server", version="0.4.0", lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -370,10 +371,10 @@ async def _forward_events(websocket: Any, subscription: Any, sequencer: Protocol
             if value.type == "speech.completed":
                 payload = value.payload if isinstance(value.payload, dict) else {}
                 delivery = payload.get("delivery") if isinstance(payload.get("delivery"), dict) else {}
-                logger.info("websocket.speech_completed turn_id=%s speech_id=%s status=%s delivery=%s",
-                            value.turn_id, payload.get("speech_id"), payload.get("status"), delivery.get("status"))
+                logger.info("websocket.speech_completed input_id=%s speech_id=%s status=%s delivery=%s",
+                            payload.get("input_id") or value.turn_id, payload.get("speech_id"), payload.get("status"), delivery.get("status"))
             else:
-                logger.debug("websocket.event type=%s turn_id=%s", value.type, value.turn_id)
+                logger.debug("websocket.event type=%s input_id=%s", value.type, value.payload.get("input_id") or value.turn_id)
             await websocket.send_json(sequencer.envelope(value))
     except asyncio.CancelledError:
         raise

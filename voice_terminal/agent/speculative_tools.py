@@ -23,7 +23,7 @@ class ToolTask:
 
 
 class ToolSelectionInvalid(RuntimeError):
-    """The prediction that requested a tool became obsolete while selecting it."""
+    """The active Agent decision became obsolete while selecting a tool."""
 
 
 class SpeculativeTools:

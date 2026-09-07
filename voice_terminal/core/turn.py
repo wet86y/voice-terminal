@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 
-class TurnManager:
+class InputManager:
     def __init__(self) -> None:
         self._counter = 0
         self._current: str | None = None
@@ -15,7 +15,7 @@ class TurnManager:
     def begin(self) -> str:
         self._counter += 1
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._current = f"turn_{stamp}_{self._counter:06d}"
+        self._current = f"input_{stamp}_{self._counter:06d}"
         return self._current
 
     def invalidate(self) -> str | None:

@@ -765,6 +765,7 @@ class MiniMaxTtsClient:
         emotion_mode: str = "agent",
         default_emotion: str = "calm",
         emotion_transport: str = "voice_setting",
+        session_reuse: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         if transport not in {"websocket", "websocket_bidi"}:
@@ -797,6 +798,7 @@ class MiniMaxTtsClient:
         self.emotion_mode = emotion_mode
         self.default_emotion = self.normalize_emotion(default_emotion)
         self.emotion_transport = emotion_transport
+        self.session_reuse = bool(session_reuse)
         self.emotion_enabled = emotion_mode == "agent" and emotion_transport == "voice_setting"
         self.emotion_status = "requested" if self.emotion_enabled else "disabled"
         self.emotion_error: str | None = None
@@ -895,7 +897,7 @@ class MiniMaxTtsClient:
             raise MiniMaxTtsError("未配置 MINIMAX_API_KEY")
         if self.output_format.lower() != "pcm":
             raise MiniMaxTtsError("当前原生播放器只接受 PCM，未启用 MP3 自动回退。")
-        if self.transport == "websocket_bidi":
+        if self.transport == "websocket_bidi" and self.session_reuse:
             if (
                 self._bidi_session is None
                 or self._bidi_session.closed

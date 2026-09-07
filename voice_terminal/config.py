@@ -103,7 +103,8 @@ class LlmConfig:
     model: str = "deepseek-v4-flash"
     api_key_env: str = "DEEPSEEK_API_KEY"
     stream: bool = True
-    thinking: str = "disabled"
+    thinking: str = "enabled"
+    reasoning_effort: str = "low"
     timeout_ms: int = 15000
 
 
@@ -128,6 +129,7 @@ class TtsConfig:
     emotion_mode: str = "agent"
     default_emotion: str = "calm"
     emotion_transport: str = "voice_setting"
+    session_reuse: bool = True
 
     def __post_init__(self) -> None:
         if self.transport not in {"websocket", "websocket_bidi"}:
@@ -150,6 +152,11 @@ class TtsConfig:
         if self.transport == "websocket_bidi" and self.scheduling == "auto":
             return "direct"
         return self.scheduling
+
+
+@dataclass(frozen=True)
+class SpeechConfig:
+    prefill_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -192,6 +199,7 @@ class AppConfig:
     asr: AsrConfig = field(default_factory=AsrConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
+    speech: SpeechConfig = field(default_factory=SpeechConfig)
     text_bridge: TextBridgeConfig = field(default_factory=TextBridgeConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     asr_worker: AsrWorkerConfig = field(default_factory=AsrWorkerConfig)
@@ -239,6 +247,7 @@ class AppConfig:
         asr = _section(data, "asr")
         llm = _section(data, "llm")
         tts = _section(data, "tts")
+        speech = _section(data, "speech")
         bridge = _section(data, "text_bridge")
         server = _section(data, "server")
         worker = _section(data, "asr_worker")
@@ -336,7 +345,8 @@ class AppConfig:
                 model=_string(llm.get("model"), "deepseek-v4-flash"),
                 api_key_env=_string(llm.get("api_key_env"), "DEEPSEEK_API_KEY"),
                 stream=_bool(llm.get("stream"), True),
-                thinking=_string(llm.get("thinking"), "disabled"),
+                thinking=_string(llm.get("thinking"), "enabled"),
+                reasoning_effort=_string(llm.get("reasoning_effort"), "low"),
                 timeout_ms=int(_number(llm.get("timeout_ms"), 15000)),
             ),
             tts=TtsConfig(
@@ -359,7 +369,9 @@ class AppConfig:
                 emotion_mode=_string(tts.get("emotion_mode"), "agent"),
                 default_emotion=_string(tts.get("default_emotion"), "calm"),
                 emotion_transport=_string(tts.get("emotion_transport"), "voice_setting"),
+                session_reuse=_bool(tts.get("session_reuse"), True),
             ),
+            speech=SpeechConfig(prefill_enabled=_bool(speech.get("prefill_enabled"), True)),
             text_bridge=TextBridgeConfig(
                 min_chars=int(_number(bridge.get("min_chars"), 8)),
                 max_chars=int(_number(bridge.get("max_chars"), 36)),

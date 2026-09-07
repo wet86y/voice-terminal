@@ -5,15 +5,13 @@ from collections import deque
 import logging
 import time
 
-from .turn_controller import TurnController
+from .turn_controller import InputController
 from .speech_pipeline import SpeechPipeline
 from .turn_workspace import AudioFrame, CurrentTurnAudioBuffer, TurnWorkspace
 from .transcript_segmenter import TranscriptSegmenter
-from .agent_scheduler import PredictionScheduler
 from .options import InputOptions
 from ..analysis.client import AnalysisClient
-from ..agent.runtime import AgentRuntime
-from ..agent.speculative_tools import SpeculativeTools, ToolSelectionInvalid
+from ..agent.speculative_tools import SpeculativeTools
 from ..agent.tool_registry import FileTools, WebSearchTools
 from ..asr.protocol import AudioChunk
 from ..core.events import event, utc_now_iso
@@ -24,7 +22,7 @@ from ..tts.alignment import DeliveryResolver
 logger = logging.getLogger(__name__)
 
 
-class RealtimeController(SpeechPipeline, TurnController):
+class RealtimeController(SpeechPipeline, InputController):
     """Realtime input orchestration used by the session runtime."""
 
     def __init__(self, *, options: InputOptions, analysis=None, search: WebSearchTools | None = None, **kwargs) -> None:
@@ -39,10 +37,8 @@ class RealtimeController(SpeechPipeline, TurnController):
         )
         if "web_search" in self.state.services and (search is None or not search.available):
             self.state.set_service("web_search", "DISABLED")
-        self.agent = AgentRuntime(self.llm, self.registry, tools_enabled=options.tools)
         self.workspace: TurnWorkspace | None = None
         self.segmenter = TranscriptSegmenter(options.min_segment_chars, options.max_segment_chars)
-        self.scheduler: PredictionScheduler | None = None
         self._endpoint_task: asyncio.Task | None = None
         self._refine_task: asyncio.Task | None = None
         self._background: set[asyncio.Task] = set()
@@ -75,9 +71,6 @@ class RealtimeController(SpeechPipeline, TurnController):
 
     def _valid(self, token: tuple[str, int]) -> bool:
         return self.workspace is not None and self.workspace.token == token and self.turns.is_current(token[0])
-
-    def _prediction_valid(self, ws: TurnWorkspace, token: tuple[str, int], revision: int) -> bool:
-        return self._valid(token) and ws.input_revision == revision and self._active_input
 
     def _on_tool_status(self, name: str, status: str, reason: str) -> None:
         if name == "web_search" and "web_search" in self.state.services:
@@ -439,7 +432,6 @@ class RealtimeController(SpeechPipeline, TurnController):
         self._sub_parts.clear()
         self._sub_finals.clear()
         self._new_sub(bytes(ws.audio.pcm))
-        self._start_scheduler()
         for name, details in self.analysis_health.items():
             if isinstance(details, dict):
                 ws.analysis[name] = dict(details)
@@ -455,16 +447,8 @@ class RealtimeController(SpeechPipeline, TurnController):
         self._sub_finals[self._sub_id] = asyncio.Event()
         self._queue_asr(AudioChunk(self._sub_id, pcm))
 
-    def _start_scheduler(self) -> None:
-        self.scheduler = PredictionScheduler(self._predict, self.options.prediction_interval_ms)
-
     def _stop_generation(self) -> list[asyncio.Task]:
         stopped: list[asyncio.Task] = []
-        if self.scheduler:
-            task = self.scheduler.stop()
-            if task is not None:
-                stopped.append(task)
-                self._track(task)
         for task in (self._completion_task, self._refine_task, self._endpoint_task):
             if task and task is not asyncio.current_task() and not task.done():
                 task.cancel()
@@ -475,32 +459,6 @@ class RealtimeController(SpeechPipeline, TurnController):
             self._turn_cancel.set()
         return stopped
 
-    def _schedule_active_bidi_cancel(self) -> None:
-        """Put a superseded same-turn Bidi generation behind the cancel barrier.
-
-        A pre-playback continuation cancels the active answer task directly so
-        ASR can keep consuming the revised utterance.  The task's ``finally``
-        block intentionally keeps a healthy persistent Bidi socket open, so
-        cancelling the Python task alone is insufficient: the provider could
-        still synthesize the old generation while the revised answer starts.
-        Schedule the same cancel barrier used by a confirmed interruption;
-        the next TTS sender waits for it before sending new text.
-        """
-
-        session = self._tts_session
-        cancel = getattr(session, "cancel", None) if session is not None else None
-        if session is None or not getattr(session, "bidi", False) or cancel is None:
-            return
-        if bool(getattr(session, "generation_finished", False)) and not bool(
-            getattr(session, "generation_active", True)
-        ):
-            return
-        if self._tts_cancel_task is None or self._tts_cancel_task.done():
-            self._tts_cancel_task = asyncio.create_task(
-                self._cancel_bidi_in_background(session, cancel),
-                name="tts-cancel-resume",
-            )
-
     async def _resume(self, frame: AudioFrame) -> None:
         ws = self.workspace
         # A same-turn continuation cancels the frozen answer before the first
@@ -510,11 +468,6 @@ class RealtimeController(SpeechPipeline, TurnController):
         # the revised input is being recognized.
         self._stop_playback_snapshot(ws.playback_key)
         ws.resume()  # Invalidate before cancelling or awaiting any operation.
-        self._schedule_active_bidi_cancel()
-        # A same-turn revision owns a fresh generation.  Do not let provider
-        # subtitle spans or local sentence boundaries from the superseded
-        # generation affect its delivery settlement.
-        self._delivery_resolvers[ws.turn_id] = DeliveryResolver()
         stopped = self._stop_generation()
         if stopped:
             await asyncio.gather(*stopped, return_exceptions=True)
@@ -531,7 +484,7 @@ class RealtimeController(SpeechPipeline, TurnController):
         }
         self._turn_cancel = asyncio.Event()
         self._active_input = True
-        ws.timings = {k: v for k, v in ws.timings.items() if k in {"first_segment", "first_prediction", "asr_first_text"}}
+        ws.timings = {k: v for k, v in ws.timings.items() if k in {"first_segment", "asr_first_text"}}
         self.state.current.update(
             final_text="", assistant_text="", tts_text="", tts_status="IDLE",
             audio_buffer_ms=0, tts_returned_ms=0, tts_played_ms=0,
@@ -543,7 +496,6 @@ class RealtimeController(SpeechPipeline, TurnController):
         # update their own part and cannot overwrite the resumed part.
         seed = b"".join(f.pcm for f in self._recent if f.end_sample > (self._resume_started or frame.start_sample))
         self._new_sub(seed)
-        self._start_scheduler()
         await self._detail("turn.resumed")
         await self._state_event(TerminalState.LISTENING, listening=True, turn_id=ws.turn_id)
 
@@ -575,8 +527,6 @@ class RealtimeController(SpeechPipeline, TurnController):
         token = ws.freeze()
         if ws.hard_closed and self._speech_start_sample is not None:
             self._resume_started = frame.end_sample
-        if self.scheduler:
-            self._track(self.scheduler.stop())
         self._queue_asr(AudioChunk(self._sub_id, b"", is_final=True))
         ws.timings["endpoint_accepted"] = time.monotonic()
         if "last_speech" not in ws.timings:
@@ -695,198 +645,6 @@ class RealtimeController(SpeechPipeline, TurnController):
         ws.segments = [{"text": s} for s in result["segments"]]
         ws.timings.setdefault("first_segment", time.monotonic())
         await self._detail("transcript.segment", **result)
-        if self.options.predictions and self.scheduler:
-            self.scheduler.submit({"turn_id": ws.turn_id, "generation_id": ws.generation_id,
-                                   "input_revision": ws.input_revision, "text": text,
-                                   "new_segment": result["new_segment"], "final": False,
-                                   "tools": list(ws.tools)})
-
-    async def _predict(self, snapshot: dict) -> None:
-        ws = self.workspace
-        token = (snapshot["turn_id"], snapshot["generation_id"])
-        revision = snapshot["input_revision"]
-        if ws is None or not self._prediction_valid(ws, token, revision):
-            return
-        request_started = time.monotonic()
-        ws.timings.setdefault("first_prediction_request", request_started)
-        await self._prediction_event(ws, "agent.prediction.requested", token, revision,
-                                     text=snapshot.get("text", ""), new_segment=snapshot.get("new_segment", ""))
-        ws.agent_phase = "PREDICTING"
-        try:
-            result = await self.agent.predict(list(self.history.messages), snapshot)
-            returned_at = time.monotonic()
-            ws.timings["prediction_returned"] = returned_at
-            if not self._prediction_valid(ws, token, revision):
-                self._clear_prediction_if_current(ws, revision)
-                await self._prediction_event(ws, "agent.prediction.discarded", token, revision,
-                                             reason=self._prediction_drop_reason(ws, token, revision))
-                return
-            ws.prediction = result
-            ws.prediction_revision = revision
-            ws.timings.setdefault("first_prediction", returned_at)
-            ws.agent_phase = "IDLE"
-            await self._detail("agent.prediction", **result)
-            if result["decision"] == "ACT" and self.options.tools:
-                for index, call in enumerate(result["tools"]):
-                    if not self._prediction_valid(ws, token, revision):
-                        self._clear_prediction_if_current(ws, revision)
-                        await self._prediction_event(ws, "agent.prediction.discarded", token, revision,
-                                                     reason=self._prediction_drop_reason(ws, token, revision), stage="tools", index=index)
-                        return
-                    try:
-                        entry, reused = await self.registry.select(
-                            ws.turn_id, call["name"], call["arguments"],
-                            valid=lambda: self._prediction_valid(ws, token, revision),
-                        )
-                        # select() performs its final check immediately before
-                        # creating a new task.  Check once more before emitting
-                        # state; there is no await between this check and task
-                        # creation below.
-                        if not self._prediction_valid(ws, token, revision):
-                            self._clear_prediction_if_current(ws, revision)
-                            await self._prediction_event(ws, "agent.prediction.discarded", token, revision,
-                                                         reason=self._prediction_drop_reason(ws, token, revision), stage="tool_selected", index=index)
-                            return
-                        ws.agent_phase = "PREFETCHING"
-                        published = await self._tool_event(
-                            ws, {"name": call["name"], "status": "RUNNING", "speculative": True, "reused": reused,
-                                 "selected_at_ms": max(0, round((entry.started_at - ws.started_at) * 1000)),
-                                 "execution_start_ms": (max(0, round((entry.execution_started_at - ws.started_at) * 1000))
-                                                         if entry.execution_started_at is not None else None)},
-                            token=token, revision=revision,
-                        )
-                        if not published or not self._prediction_valid(ws, token, revision):
-                            self._clear_prediction_if_current(ws, revision)
-                            if not self._prediction_valid(ws, token, revision):
-                                await self._prediction_event(ws, "agent.prediction.discarded", token, revision,
-                                                             reason=self._prediction_drop_reason(ws, token, revision), stage="tool_event", index=index)
-                            return
-                        self._track(asyncio.create_task(self._prefetched(ws, token, snapshot["input_revision"], call["name"], entry)))
-                    except ToolSelectionInvalid:
-                        self._clear_prediction_if_current(ws, revision)
-                        await self._prediction_event(ws, "agent.prediction.discarded", token, revision,
-                                                     reason=self._prediction_drop_reason(ws, token, revision), stage="tool_select", index=index)
-                        return
-                    except (ValueError, KeyError, OSError) as exc:
-                        await self._tool_event(ws, {"status": "FAILED", "error": str(exc)}, token=token, revision=revision)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            if self._prediction_valid(ws, token, revision):
-                ws.agent_phase = "IDLE"
-                ws.prediction = {"status": "DEGRADED", "error": str(exc) or "timeout"}
-                await self._detail("agent.prediction", **ws.prediction)
-
-    def _prediction_drop_reason(self, ws: TurnWorkspace, token: tuple[str, int], revision: int) -> str:
-        if self.workspace is not ws or not self.turns.is_current(token[0]):
-            return "turn_ended"
-        if ws.generation_id != token[1]:
-            return "generation_expired"
-        if ws.input_revision != revision:
-            return "revision_expired"
-        if not self._active_input:
-            return "input_frozen"
-        return "invalidated"
-
-    @staticmethod
-    def _clear_prediction_if_current(ws: TurnWorkspace, revision: int) -> None:
-        if ws.prediction_revision == revision:
-            ws.prediction = {}
-            ws.prediction_revision = None
-
-    async def _prediction_event(self, ws: TurnWorkspace, type_: str, token: tuple[str, int], revision: int, **payload) -> None:
-        current = self.workspace is ws and ws.token == token and ws.input_revision == revision
-        if current:
-            self.state.current.update(ws.snapshot(), turn_id=ws.turn_id, input_runtime=True)
-        await self._publish(event(type_, ws.turn_id, input_revision=revision, generation_id=token[1],
-                                  workspace=ws.snapshot() if current else None, **payload))
-
-    async def _prefetched(self, ws, token, revision, name, entry):
-        error = ""
-        try:
-            await asyncio.shield(entry.task)
-            status = "DONE"
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            status = "FAILED"
-            error = str(exc)
-        if self._valid(token) and ws.input_revision == revision and self._active_input:
-            finished = entry.finished_at or time.monotonic()
-            execution_started = entry.execution_started_at or entry.started_at
-            payload = {
-                "name": name, "status": status, "speculative": True,
-                "selected_at_ms": max(0, round((entry.started_at - ws.started_at) * 1000)),
-                "execution_start_ms": max(0, round((execution_started - ws.started_at) * 1000)),
-                "finished_at_ms": max(0, round((finished - ws.started_at) * 1000)),
-                "execution_ms": max(0, round((finished - execution_started) * 1000)),
-            }
-            if status == "FAILED":
-                # Keep this diagnostic bounded and never include a provider
-                # response or credential in the visible workspace state.
-                payload["error"] = error[:300]
-                service_status = self.registry.service_status(name)
-                if service_status == "DISABLED":
-                    payload["disabled"] = True
-                elif service_status == "ERROR":
-                    payload["service_status"] = "ERROR"
-            await self._tool_event(ws, payload, token=token, revision=revision)
-
-    async def _tool_event(self, ws, payload, *, token=None, revision=None):
-        if self.workspace is not ws:
-            return False
-        if token is not None and ws.token != token:
-            return False
-        if revision is not None and ws.input_revision != revision:
-            return False
-        search_status = payload.get("service_status")
-        search_status_changed = (
-            payload.get("name") == "web_search"
-            and (payload.get("disabled") or search_status == "ERROR")
-            and "web_search" in self.state.services
-        )
-        if search_status_changed:
-            # Search is optional: an auth/host mismatch disables only this
-            # capability and must not make the voice session unstartable.  A
-            # non-transient malformed response is retained as ERROR instead.
-            self.state.set_service("web_search", "DISABLED" if payload.get("disabled") else "ERROR")
-            snapshot = self.state.snapshot()
-            snapshot["recent_turns"] = [record.to_payload() for record in self.history.records]
-            await self._publish(event("runtime.snapshot", None, **snapshot))
-        ws.tools = (ws.tools + [payload])[-32:]
-        await self._detail("agent.tool", **payload)
-        return True
-
-    async def _answer(self, ws, token) -> str:
-        async def tool_event(payload):
-            if self._valid(token):
-                await self._tool_event(ws, payload, token=token)
-
-        async def deltas():
-            ws.timings["llm_request"] = time.monotonic()
-            refine_meta = ws.analysis.get("refine", {}) if isinstance(ws.analysis, dict) else {}
-            refine_ready = isinstance(refine_meta, dict) and refine_meta.get("status") == "READY"
-            speech_emotion = {
-                "status": "READY" if refine_ready else "UNAVAILABLE",
-                "source": (
-                    refine_meta.get("model") or "SenseVoiceSmall"
-                    if refine_ready else "paraformer_fallback"
-                ),
-                "segments": list(ws.audio_cues),
-            }
-            if isinstance(refine_meta, dict) and "model_loaded" in refine_meta:
-                speech_emotion["model_loaded"] = bool(refine_meta["model_loaded"])
-            package = {"final_text": ws.final_text, "provisional_transcript": ws.paraformer_final,
-                       "audio_cues": ws.audio_cues, "speech_emotion": speech_emotion, "final": True}
-            request_messages = self.agent.answer_messages(list(self.history.messages), package)
-            await self._detail(
-                "llm.context",
-                messages=request_messages,
-                message_count=len(request_messages),
-            )
-            async for delta in self.agent.answer(list(self.history.messages), package, ws.turn_id, tool_event):
-                yield delta
-        return await self._play_stream(ws, token, deltas())
 
     def _on_playback_started(self, key: str) -> None:
         ws = self.workspace
@@ -918,8 +676,6 @@ class RealtimeController(SpeechPipeline, TurnController):
             "first_audio_to_playback_ms": delta("playback", "first_audio"),
             "speech_end_to_playback_ms": delta("playback", "last_speech"), "turn_total_ms": delta("completed", "start"),
             "first_segment_ms": delta("first_segment", "start"),
-            "first_prediction_request_ms": delta("first_prediction_request", "start"),
-            "first_prediction_ms": delta("first_prediction", "start"),
             "smart_turn_ms": t.get("smart_turn_ms"), "sensevoice_refine_ms": t.get("sensevoice_refine_ms"),
             "commit_to_final_llm_ms": delta("llm_request", "commit"),
         }

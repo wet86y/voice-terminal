@@ -8,6 +8,7 @@ class AgentOptions:
     balanced_interval_ms: int = 800
     aggressive_interval_ms: int = 400
     silence_ms: int = 5500
+    response_check_ms: int = 6000
     max_requests_per_step: int = 5
     max_context_tokens: int = 524288
     trace_limit: int = 200

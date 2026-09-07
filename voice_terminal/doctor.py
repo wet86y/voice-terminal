@@ -132,6 +132,7 @@ async def _online_checks(config) -> list[Check]:
             api_key=config.api_key(config.llm.api_key_env),
             timeout_ms=config.llm.timeout_ms,
             thinking=config.llm.thinking,
+            reasoning_effort=config.llm.reasoning_effort,
         )
         await client.check()
         checks.append(_check("online:deepseek", True, f"{config.llm.base_url}; model={config.llm.model}"))

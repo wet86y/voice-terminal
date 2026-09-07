@@ -21,12 +21,16 @@ class DeepSeekClient:
         api_key: str,
         timeout_ms: int = 15000,
         thinking: str = "disabled",
+        reasoning_effort: str = "low",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout_ms = timeout_ms
         self.thinking = thinking
+        if reasoning_effort not in {"low", "high", "max"}:
+            raise ValueError("reasoning_effort must be low, high, or max")
+        self.reasoning_effort = reasoning_effort
 
     def _request_payload(self, messages: Sequence[Mapping[str, str]]) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -35,8 +39,9 @@ class DeepSeekClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if self.thinking == "disabled":
-            payload["thinking"] = {"type": "disabled"}
+        payload["thinking"] = {"type": "enabled" if self.thinking != "disabled" else "disabled"}
+        if self.thinking != "disabled":
+            payload["reasoning_effort"] = self.reasoning_effort
         return payload
 
     async def stream_chat(self, messages, *, cancel_event=None) -> AsyncIterator[str]:
@@ -119,6 +124,9 @@ class DeepSeekClient:
                         if isinstance(delta, dict):
                             for call in delta.get("tool_calls") or []:
                                 yield {"type": "tool_delta", "call": call}
+                        reasoning = delta.get("reasoning_content") if isinstance(delta, dict) else None
+                        if isinstance(reasoning, str) and reasoning:
+                            yield {"type": "reasoning", "text": reasoning}
                         text = delta.get("content") if isinstance(delta, dict) else None
                         if isinstance(text, str) and text:
                             delta_count += 1

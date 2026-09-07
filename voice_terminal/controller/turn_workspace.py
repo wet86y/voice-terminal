@@ -70,8 +70,6 @@ class TurnWorkspace:
     audio_cues: list[dict] = field(default_factory=list)
     audio: CurrentTurnAudioBuffer = field(default_factory=CurrentTurnAudioBuffer)
     segments: list[dict] = field(default_factory=list)
-    prediction: dict = field(default_factory=dict)
-    prediction_revision: int | None = None
     tools: list[dict] = field(default_factory=list)
     agent_phase: str = "IDLE"
     analysis: dict = field(default_factory=dict)
@@ -104,8 +102,6 @@ class TurnWorkspace:
         self.staged_response = ""
         self.final_text = ""
         self.audio_cues.clear()
-        self.prediction.clear()
-        self.prediction_revision = None
         self.agent_phase = "IDLE"
         self.tts_segments.clear()
         self.delivery.clear()
@@ -116,8 +112,7 @@ class TurnWorkspace:
             "episode_id": self.episode_id, "input_revision": self.input_revision, "generation_id": self.generation_id,
             "committed": self.committed, "agent_phase": self.agent_phase,
             "paraformer_final": self.paraformer_final, "refined_text": self.final_text,
-            "segments": list(self.segments), "prediction": dict(self.prediction),
-            "prediction_revision": self.prediction_revision,
+            "segments": list(self.segments),
             "tools": list(self.tools), "audio_cues": list(self.audio_cues),
             "analysis": dict(self.analysis),
             "tts_segments": [dict(item) for item in self.tts_segments],

@@ -9,7 +9,7 @@ import unittest
 
 from voice_terminal.audio.player import PcmPlayer
 from voice_terminal.audio.processing import AudioPreprocessor
-from voice_terminal.controller.turn_controller import TurnController
+from voice_terminal.controller.turn_controller import InputController
 from voice_terminal.providers.minimax_tts import MiniMaxTtsClient
 from voice_terminal.tts.alignment import DeliveryResolver, parse_alignment
 from voice_terminal.tts.scheduling import DirectStreamingPolicy, PlaybackProgress, PlaybackWindowPolicy, TtsGenerationScheduler
@@ -305,7 +305,7 @@ class PlayerAndProcessingTests(unittest.TestCase):
         player.allow("turn")
         player.enqueue("turn", b"\x01\x00")
 
-        controller = object.__new__(TurnController)
+        controller = object.__new__(InputController)
         controller.player = player
         controller.audio_processor = SimpleNamespace(
             enabled=True,

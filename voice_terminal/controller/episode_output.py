@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from uuid import uuid4
 
 from .speech_pipeline import SpeechPipeline
@@ -15,11 +16,12 @@ logger = logging.getLogger(__name__)
 
 
 class SpeechHandle:
-    def __init__(self, owner, identity, turn_id, generation, emotion):
+    def __init__(self, owner, identity, turn_id, generation, emotion, *, kind="formal"):
         self.owner, self.identity, self.turn_id = owner, identity, turn_id
         self.speech_id = uuid4().hex
         self.emotion_requested = emotion
         self.emotion_applied = emotion
+        self.kind = kind
         self.queue = asyncio.Queue(maxsize=32)
         self.workspace = TurnWorkspace(turn_id, generation_id=generation, committed=True)
         self.reason = None
@@ -28,6 +30,8 @@ class SpeechHandle:
         self.task = None
         self.finished = False
         self.overlap_start_ms = None
+        self.queued_at = time.monotonic()
+        self.started = asyncio.Event()
 
     async def _put(self, value):
         if self.reason or self.task.done():
@@ -63,7 +67,13 @@ class SpeechHandle:
 
 
 class EpisodeSpeechOutput(SpeechPipeline):
-    """Independent output transaction sharing the existing audio pipeline."""
+    """A serial speech queue sharing the existing audio pipeline.
+
+    A handle is created as soon as the Agent authorises speech, while a single
+    worker starts the actual TTS/player transaction in FIFO order.  This keeps
+    Agent intent durable during a prefill without allowing concurrent player
+    access.
+    """
     def __init__(self, controller):
         self.controller = controller
         self.tts, self.player = controller.tts, controller.player
@@ -72,6 +82,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
         self._delivery_resolvers = {}
         self._tts_session = None
         self.handle = None
+        self._pending = deque()
+        self._worker = None
         self.generation = 0
         self.tasks = set()
         self.runtime = None
@@ -93,10 +105,18 @@ class EpisodeSpeechOutput(SpeechPipeline):
         if not h or h.task.done():
             return None
         return {"speech_id": h.speech_id, "episode_id": h.identity[0], "agent_step_id": h.identity[1],
-                "context_version": h.identity[2], "turn_id": h.turn_id,
+                "context_version": h.identity[2], "input_id": h.turn_id,
                 "generation_id": h.workspace.generation_id, "text": h.text,
-                "status": self.status, "emotion_requested": h.emotion_requested,
+                "status": self.status, "kind": h.kind, "emotion_requested": h.emotion_requested,
                 "emotion_applied": h.emotion_applied}
+
+    @property
+    def queue_snapshot(self):
+        return [{"speech_id": item.speech_id, "kind": item.kind, "text": item.text,
+                 "episode_id": item.identity[0], "agent_step_id": item.identity[1],
+                 "context_version": item.identity[2], "input_id": item.turn_id,
+                 "status": "QUEUED"}
+                for item in self._pending if not item.reason and not item.task.done()]
 
     def _valid(self, token):
         h, r = self.handle, self.runtime
@@ -122,7 +142,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
             return
         await self.runtime.emit("speech.text_delta", {
             "speech_id": h.speech_id, "episode_id": h.identity[0], "agent_step_id": h.identity[1],
-            "context_version": h.identity[2], "turn_id": h.turn_id,
+            "context_version": h.identity[2], "input_id": h.turn_id,
             "generation_id": h.workspace.generation_id, "text_delta": text,
             "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
         })
@@ -142,43 +162,67 @@ class EpisodeSpeechOutput(SpeechPipeline):
                                                speech_id=h.speech_id)
                 self.loop.call_soon_threadsafe(lambda: self.controller._track(asyncio.create_task(publish())))
 
-    async def begin(self, identity, turn_id, *, emotion="calm"):
-        if self.active:
-            raise ValueError("speech output busy")
-        if self.tasks:
-            await asyncio.gather(*list(self.tasks), return_exceptions=True)
+    async def begin(self, identity, turn_id, *, emotion="calm", kind="formal"):
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during cleanup")
         self.generation += 1
         self.loop = asyncio.get_running_loop()
-        prepare = getattr(self.tts, "prepare_emotion", None)
-        if prepare is not None:
-            emotion = await prepare(emotion)
-        h = SpeechHandle(self, identity, turn_id, self.generation, emotion)
-        self.handle = h
-        self.state.clear_current()
-        self._delivery_resolvers = {turn_id: DeliveryResolver()}
-        h.task = asyncio.create_task(self._run(h), name=f"speech-{h.speech_id}")
+        h = SpeechHandle(self, identity, turn_id, self.generation, emotion, kind=kind)
+        h.task = asyncio.create_task(self._wait_then_run(h), name=f"speech-{h.speech_id}")
         self.tasks.add(h.task)
         h.task.add_done_callback(self.tasks.discard)
-        # Ensure the transaction's finally block is installed before exposing
-        # a cancellable handle to observations on another task.
+        self._pending.append(h)
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._drain(), name="speech-queue")
+        await self.runtime.emit("speech.queued", {"speech_id": h.speech_id, "episode_id": identity[0],
+                                 "agent_step_id": identity[1], "context_version": identity[2],
+                                 "input_id": turn_id, "kind": kind, "text": h.text, "status": "QUEUED"})
         await asyncio.sleep(0)
         return h
 
+    async def _drain(self):
+        while self._pending:
+            h = self._pending.popleft()
+            if h.reason or h.task.done():
+                continue
+            self.handle = h
+            self.state.clear_current()
+            prepare = getattr(self.tts, "prepare_emotion", None)
+            if prepare is not None:
+                h.emotion_applied = await prepare(h.emotion_requested)
+            self._delivery_resolvers[h.speech_id] = DeliveryResolver()
+            h.started.set()
+            await asyncio.gather(h.task, return_exceptions=True)
+            if self.handle is h:
+                self.handle = None
+
+    async def _wait_then_run(self, h):
+        await h.started.wait()
+        await self._run(h)
+
+    async def enqueue_text(self, identity, turn_id, text, *, emotion="calm", kind="prefill"):
+        h = await self.begin(identity, turn_id, emotion=emotion, kind=kind)
+        await h.feed(text)
+        await h.finish()
+        return h
+
     def invalidate(self, reason):
-        h = self.handle
-        if not h or h.task.done() or h.reason:
-            return
-        h.reason = reason
-        logger.info(
+        items = ([self.handle] if self.handle else []) + list(self._pending)
+        for h in items:
+            if not h or h.task.done() or h.reason:
+                continue
+            h.reason = reason
+            if h is not self.handle:
+                h.task.cancel()
+                continue
+            logger.info(
             "episode.speech_invalidated speech_id=%s episode_id=%s step=%s context_version=%s reason=%s playback_started=%s",
             h.speech_id, h.identity[0], h.identity[1], h.identity[2], reason,
             h.workspace.playback_started,
-        )
-        if self.player:
-            h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
-        h.task.cancel()
+            )
+            if self.player:
+                h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
+            h.task.cancel()
 
     async def _run(self, h):
         # Record completion even if cancellation occurs before the first delta.
@@ -210,7 +254,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
                     h.speech_id,
                     h.turn_id,
                 )
-                self._delivery_resolvers[h.turn_id] = DeliveryResolver()
+                self._delivery_resolvers[h.speech_id] = DeliveryResolver()
                 self.state.clear_current()
 
                 async def replay():
@@ -256,7 +300,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
                     self._tts_session = None
             if h.snapshot is None and self.player:
                 h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
-            delivery = self._delivery_resolvers[h.turn_id].resolve(
+            delivery = self._delivery_resolvers[h.speech_id].resolve(
                 h.snapshot or {"started": False}, h.text, overlap_start_ms=h.overlap_start_ms)
             delivery["termination"] = h.reason or "completed"
             if h.snapshot:
@@ -269,17 +313,20 @@ class EpisodeSpeechOutput(SpeechPipeline):
             def elapsed(a, b):
                 return round((timings[b] - timings[a]) * 1000) if a in timings and b in timings else None
             record = {"speech_id": h.speech_id, "episode_id": h.identity[0], "agent_step_id": h.identity[1],
-                      "context_version": h.identity[2], "turn_id": h.turn_id,
-                      "generation_id": h.workspace.generation_id, "text": h.text,
+                       "context_version": h.identity[2], "input_id": h.turn_id,
+                       "generation_id": h.workspace.generation_id, "text": h.text,
+                       "kind": h.kind, "queued_at": h.queued_at,
                       "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
                       "emotion_transport": getattr(self.tts, "emotion_transport", "voice_setting"),
                       "emotion_status": getattr(self.tts, "emotion_status", "applied"),
                       "status": h.reason or "completed", "delivery": delivery,
-                      "latency": {"llm_first_token_ms": elapsed("llm_request", "first_token"),
-                                  "llm_request_to_first_tts_text_ms": elapsed("llm_request", "first_tts_text"),
-                                  "tts_text_to_first_audio_ms": elapsed("first_tts_text", "first_audio"),
-                                  "first_audio_to_playback_ms": elapsed("first_audio", "playback"),
-                                  "input_end_to_playback_ms": input_to_playback}}
+                       "latency": {"llm_first_token_ms": elapsed("llm_request", "first_token"),
+                                   "llm_request_to_first_tts_text_ms": elapsed("llm_request", "first_tts_text"),
+                                   "tts_text_to_first_audio_ms": elapsed("first_tts_text", "first_audio"),
+                                   "first_audio_to_playback_ms": elapsed("first_audio", "playback"),
+                                   "input_end_to_playback_ms": input_to_playback,
+                                   "queue_to_playback_ms": round((timings["playback"] - h.queued_at) * 1000)
+                                   if "playback" in timings else None}}
             logger.info(
                 "episode.speech_final speech_id=%s episode_id=%s step=%s context_version=%s turn_id=%s status=%s delivery=%s tts_text_sent=%s tts_audio_bytes=%s playback_started=%s",
                 h.speech_id, h.identity[0], h.identity[1], h.identity[2], h.turn_id,

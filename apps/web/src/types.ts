@@ -57,17 +57,15 @@ export interface ServiceStatuses {
 }
 
 export interface CurrentTurnSnapshot {
-  turn_id?: string | null
+  input_id?: string | null
   input_runtime?: boolean
   input_revision?: number
   generation_id?: number
-  prediction_revision?: number | null
   committed?: boolean
   agent_phase?: string
   paraformer_final?: string
   refined_text?: string
   segments?: Array<{ text: string }>
-  prediction?: { decision?: string; intent?: string; status?: string; error?: string }
   tools?: Array<{ name?: string; status?: string; reused?: boolean; disabled?: boolean; service_status?: string; error?: string; overlap_ms?: number; wait_ms?: number; selected_at_ms?: number; execution_start_ms?: number | null; finished_at_ms?: number; execution_ms?: number }>
   audio_cues?: Array<{ start_ms: number; end_ms: number; emotion: string; language: string; events: string[] }>
   analysis?: Record<string, { status?: string; error?: string; probability?: number; fallback?: string; model?: string; model_loaded?: boolean }>
@@ -91,8 +89,6 @@ export interface CurrentTurnSnapshot {
 
 export interface LatencyValues {
   first_segment_ms?: number | null
-  first_prediction_request_ms?: number | null
-  first_prediction_ms?: number | null
   smart_turn_ms?: number | null
   sensevoice_refine_ms?: number | null
   commit_to_final_llm_ms?: number | null
@@ -110,7 +106,7 @@ export interface LatencyValues {
 
 export interface RuntimeSnapshotPayload {
   agent?: AgentEpisodeSnapshot
-  recent_turns?: TurnRecord[]
+  recent_inputs?: InputRecord[]
   state: TerminalState
   listening: boolean
   can_start: boolean
@@ -195,8 +191,8 @@ export interface ServerErrorPayload {
 export type ServerMessageType =
   | 'runtime.snapshot' | 'session.state' | 'metrics.snapshot'
   | 'input.started' | 'input.updated' | 'input.finalized' | 'input.completed'
-  | 'agent.state' | 'agent.trace' | 'context.snapshot' | 'tool.state'
-  | 'speech.started' | 'speech.delta' | 'speech.progress' | 'speech.completed'
+  | 'agent.state' | 'agent.trace' | 'agent.prefill' | 'agent.reasoning' | 'context.snapshot' | 'tool.state'
+  | 'speech.queued' | 'speech.started' | 'speech.delta' | 'speech.progress' | 'speech.completed'
   | 'error'
 
 export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset'
@@ -210,14 +206,10 @@ export interface MessageEnvelope<TType extends string = string, TPayload = unkno
   episode_id?: string | null
   decision_id?: string | null
   speech_id?: string | null
-  /** @deprecated Not emitted by the V1 server; only tolerated by test fixtures. */
-  turn_id?: string | null
   payload: TPayload
 }
 
-// The composable projects V1 messages into display stores; `turn_id` is not
-// part of the wire schema and exists only in that local projection.
-export type ServerMessage = MessageEnvelope<string, unknown> & { turn_id: string | null }
+export type ServerMessage = MessageEnvelope<string, unknown>
 
 export interface CommandMessage {
   type: 'command'
@@ -226,10 +218,10 @@ export interface CommandMessage {
   payload: Record<string, unknown>
 }
 
-export interface TurnRecord {
+export interface InputRecord {
   episode_id?: string | null
   details?: Record<string, unknown>
-  turn_id: string
+  input_id: string
   transcript: string
   response: string
   completed_at: string
@@ -244,7 +236,7 @@ export interface AgentTrace {
   episode_id: string | null
   agent_step_id?: string | null
   context_version?: number
-  turn_id?: string | null
+  input_id?: string | null
   text?: string
   reason?: string
   name?: string
@@ -258,7 +250,7 @@ export interface SpeechOutputRecord {
   episode_id: string
   agent_step_id: string
   context_version: number
-  turn_id: string
+  input_id: string
   generation_id: number
   text: string
   status: string
@@ -268,6 +260,7 @@ export interface SpeechOutputRecord {
   emotion_applied?: string
   emotion_transport?: string
   emotion_status?: string
+  kind?: 'prefill' | 'formal'
 }
 
 export interface AgentEpisodeSnapshot {
@@ -291,6 +284,9 @@ export interface AgentEpisodeSnapshot {
   context_compacted?: boolean
   context_compaction?: Record<string, unknown>
   active_speech?: SpeechOutputRecord | null
+  pending_prefill?: Record<string, unknown> | null
+  speech_queue?: SpeechOutputRecord[]
+  reasoning?: { text?: string } | null
   trace?: AgentTrace[]
   outputs?: SpeechOutputRecord[]
 }

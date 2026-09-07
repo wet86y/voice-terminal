@@ -7,7 +7,6 @@ class InputOptions:
     enabled: bool = False
     smart_turn: bool = False
     sensevoice: bool = False
-    predictions: bool = False
     tools: bool = False
     web_search: bool = False
     analysis_url: str = "ws://127.0.0.1:8767/analysis"
@@ -17,7 +16,6 @@ class InputOptions:
     smart_timeout_ms: int = 500
     hard_silence_ms: int = 1800
     refine_timeout_ms: int = 3000
-    prediction_interval_ms: int = 800
     min_segment_chars: int = 6
     max_segment_chars: int = 20
     max_turn_ms: int = 60000
@@ -40,12 +38,12 @@ class InputOptions:
             if not isinstance(roots, list) or not all(isinstance(p, str) for p in roots):
                 raise ValueError("tools.allowed_roots must be a list of paths")
             values["allowed_roots"] = tuple((root / p).resolve() for p in roots)
-        for key in ("enabled", "smart_turn", "sensevoice", "predictions", "tools", "web_search", "tts_pacing"):
+        for key in ("enabled", "smart_turn", "sensevoice", "tools", "web_search", "tts_pacing"):
             if key in values and not isinstance(values[key], bool):
                 raise ValueError(f"smart_turn.{key} must be boolean")
         result = cls(**values)
         for key in ("candidate_ms", "recheck_ms", "smart_timeout_ms", "hard_silence_ms", "refine_timeout_ms",
-                    "prediction_interval_ms", "min_segment_chars", "max_segment_chars", "max_turn_ms", "tts_lead_ms",
+                    "min_segment_chars", "max_segment_chars", "max_turn_ms", "tts_lead_ms",
                     "tts_local_buffer_ms"):
             value = getattr(result, key)
             if type(value) is not int or value <= 0:

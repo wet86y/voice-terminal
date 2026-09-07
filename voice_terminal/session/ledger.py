@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .contracts import DeliveryReport, ToolExchange
+from ..core.events import utc_now_iso
 
 
 @dataclass
@@ -14,13 +15,32 @@ class SessionLedgerEntry:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class InputRecord:
+    """The V0.4 UI projection for one finalized user input.
+
+    Context entries and UI records deliberately share this ledger instead of
+    being maintained by a legacy facade with a second history implementation.
+    """
+
+    input_id: str
+    transcript: str
+    completed_at: str = field(default_factory=utc_now_iso)
+    episode_id: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+    delivery: dict[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class SessionLedger:
     """One source of model context and the user-visible session history."""
 
     def __init__(self, *, limit: int = 10) -> None:
         self.limit = limit
         self.entries: list[SessionLedgerEntry] = []
-        self.records: list[dict[str, Any]] = []
+        self.records: list[InputRecord] = []
 
     def reset(self) -> None:
         self.entries.clear()
@@ -61,8 +81,15 @@ class SessionLedger:
             messages.append({"role": "user", "content": current_input})
         return messages
 
-    def append_record(self, record: dict[str, Any]) -> None:
-        input_id = record.get("input_id")
-        self.records = [item for item in self.records if item.get("input_id") != input_id]
-        self.records.insert(0, record)
+    def append_record(self, record: dict[str, Any]) -> InputRecord:
+        item = InputRecord(
+            input_id=str(record["input_id"]),
+            transcript=str(record.get("transcript") or ""),
+            episode_id=record.get("episode_id") if isinstance(record.get("episode_id"), str) else None,
+            details=dict(record.get("details") or {}),
+            delivery=dict(record.get("delivery") or {}),
+        )
+        self.records = [existing for existing in self.records if existing.input_id != item.input_id]
+        self.records.insert(0, item)
         del self.records[self.limit:]
+        return item

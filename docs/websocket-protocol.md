@@ -24,9 +24,11 @@
 | --- | --- |
 | `runtime.snapshot`、`session.state`、`metrics.snapshot` | 权威会话与服务状态、后端延迟 |
 | `input.started`、`input.updated`、`input.finalized`、`input.completed` | 用户输入生命周期 |
-| `agent.state`、`agent.trace`、`context.snapshot` | Agent 状态、有限诊断、实际模型请求 |
+| `agent.state`、`agent.trace`、`agent.prefill`、`agent.reasoning`、`context.snapshot` | Agent 状态、预填充/本地推理调试、有限诊断、实际模型请求 |
 | `tool.state` | 只读工具执行、完成或失效 |
-| `speech.started`、`speech.delta`、`speech.progress`、`speech.completed` | 已授权语音输出与传达结算 |
+| `speech.queued`、`speech.started`、`speech.delta`、`speech.progress`、`speech.completed` | 已授权语音输出、队列与传达结算 |
 | `error` | 可恢复或不可恢复错误 |
 
-不存在 `turn.*`、`assistant.delta`、`tts.*`、`llm.context` 或预测专属的公共事件。
+`speech.queued`、`speech.started`、`speech.progress` 和 `speech.completed` 都带 `kind: prefill | formal`；只有实际播放的文本才可能出现在 DeliveryReport。`agent.prefill` 展示候选的 `EMPTY`、`PREPARED`、`CANCELLED`、`QUEUED`、`PLAYED` 或 `STALE` 状态。`agent.reasoning` 仅限受控本地调试环境。
+
+不存在 `turn.*`、`assistant.delta`、`tts.*`、`llm.context`、预测专属事件或旧客户端事件映射。V1 即 V0.4 的唯一公开契约，旧客户端和旧配置不受支持。
