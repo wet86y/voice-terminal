@@ -24,4 +24,4 @@ npm run dev
 
 真实耳机/扬声器、自然语音统计与第三方服务稳定性仍是独立发布门槛，不能由 fake provider 或内存播放器代替。
 
-详见：[架构与组件契约](docs/architecture.md)、[WebSocket V0.5 协议](docs/websocket-protocol.md)、[上下文与工具规范](docs/context-and-tools.md)、[运行与质量门槛](docs/operations-and-quality.md)。
+详见：[架构与组件契约](docs/architecture.md)、[WebSocket V0.5 协议](docs/websocket-protocol.md)、[上下文与工具规范](docs/context-and-tools.md)、[V0.5 可靠性审计](docs/v05-reliability-audit.md)、[运行与质量门槛](docs/operations-and-quality.md)。

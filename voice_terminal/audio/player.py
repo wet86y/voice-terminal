@@ -86,6 +86,29 @@ class PcmPlayer:
         self._last_device_output_time: float | None = None
         self._render_points: deque[tuple[float, int]] = deque(maxlen=256)
         self._last_stop_snapshot: PlaybackSnapshot | None = None
+        self._resolved_device: str | int | None = None
+        self._last_callback_status: str | None = None
+        self._first_rendered_at: float | None = None
+        self._first_rendered_key: str | None = None
+
+    @property
+    def diagnostics(self) -> dict[str, int | float | str | None]:
+        """Playback facts that distinguish provider PCM from device submission."""
+
+        with self._queue_lock:
+            bytes_per_second = self.sample_rate * self.channels * 2
+            buffered_ms = int(self._buffered_bytes * 1000 / bytes_per_second) if bytes_per_second else 0
+            return {
+                "configured_device": self.output_device,
+                "resolved_device": self._resolved_device,
+                "sample_rate": self.sample_rate,
+                "channels": self.channels,
+                "active_key": self._active_turn,
+                "first_rendered_key": self._first_rendered_key,
+                "first_rendered_at": self._first_rendered_at,
+                "callback_status": self._last_callback_status,
+                "buffered_ms": buffered_ms,
+            }
 
     def allow(self, key: str) -> None:
         with self._queue_lock:
@@ -276,6 +299,14 @@ class PcmPlayer:
         remaining = len(target)
         offset = 0
         playback_turn: str | None = None
+        first_rendered_turn: str | None = None
+
+        if _status:
+            status_text = str(_status)
+            with self._queue_lock:
+                if status_text != self._last_callback_status:
+                    self._last_callback_status = status_text
+                    logger.warning("audio.player_callback_status status=%s", status_text)
 
         with self._queue_lock:
             callback_at = time.monotonic()
@@ -298,6 +329,10 @@ class PcmPlayer:
             if offset > 0 and self._active_turn and self._started_for_turn != self._active_turn:
                 self._started_for_turn = self._active_turn
                 playback_turn = self._active_turn
+            if offset > 0 and self._active_turn and self._first_rendered_key != self._active_turn:
+                self._first_rendered_key = self._active_turn
+                self._first_rendered_at = callback_at
+                first_rendered_turn = self._active_turn
             if offset > 0:
                 # Keep the wall-clock anchor at the last non-silent buffer
                 # submitted to the device.  PortAudio continues invoking the
@@ -321,6 +356,14 @@ class PcmPlayer:
                 logger.exception("audio.player_render_reference_failed")
         if playback_turn and self.on_playback_started:
             self.on_playback_started(playback_turn)
+        if first_rendered_turn:
+            logger.info(
+                "audio.player_first_pcm_submitted key=%s resolved_device=%s sample_rate=%d channels=%d",
+                first_rendered_turn,
+                self._resolved_device,
+                self.sample_rate,
+                self.channels,
+            )
 
     def start(self) -> None:
         if self._stream is not None:
@@ -329,6 +372,7 @@ class PcmPlayer:
             import sounddevice as sd  # type: ignore
 
             device = resolve_device(self.output_device, input_device=False)
+            self._resolved_device = device
             self._stream = sd.RawOutputStream(
                 samplerate=self.sample_rate,
                 channels=self.channels,

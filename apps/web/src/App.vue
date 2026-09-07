@@ -362,6 +362,18 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
             <div class="buffer-meta"><span>已实际播放</span><strong>{{ formatMs(terminal.current.tts_played_ms) }}</strong></div>
             <div class="buffer-meta"><span>设备输出估计</span><strong>{{ formatMs(terminal.current.tts_output_estimated_ms) }}</strong></div>
             <div class="buffer-meta"><span>待播放总时长</span><strong>{{ formatMs(terminal.current.tts_remaining_ms ?? terminal.current.audio_buffer_ms) }}</strong></div>
+            <small v-if="terminal.current.playback_diagnostics?.resolved_device != null">
+              输出端点：{{ terminal.current.playback_diagnostics.resolved_device }} ·
+              {{ terminal.current.playback_diagnostics.sample_rate }} Hz ·
+              首次 PCM {{ terminal.current.playback_diagnostics.first_rendered_at != null ? '已提交到 PortAudio' : '尚未提交' }}
+            </small>
+            <small v-if="terminal.current.playback_diagnostics?.callback_status" class="agent-limit">
+              播放器回调：{{ terminal.current.playback_diagnostics.callback_status }}
+            </small>
+            <small v-if="terminal.current.capture_diagnostics?.reason" class="agent-limit">
+              输入已安全恢复：{{ terminal.current.capture_diagnostics.reason }}
+              · 已丢弃 {{ terminal.current.capture_diagnostics.dropped_chunks ?? 0 }} 个采集块
+            </small>
           </div>
           <div v-if="terminal.current.delivery && (terminal.current.delivery.status || terminal.current.delivery.termination)" class="delivery-card">
             <div class="delivery-heading"><span>DELIVERY</span><strong>{{ deliveryStatusLabel(terminal.current.delivery) }}</strong></div>

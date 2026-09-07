@@ -219,6 +219,7 @@ class SessionRuntime:
                     on_audio_rendered=(self.audio_processor.push_reverse if self.audio_processor else None),
                 )
                 self.player.start()
+                self.state.current["playback_diagnostics"] = self.player.diagnostics
                 self.state.set_service("tts", "READY")
             except Exception as exc:
                 self._record_error("tts", str(exc))

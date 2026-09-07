@@ -56,6 +56,28 @@ export interface ServiceStatuses {
   tts: ServiceStatus
 }
 
+export interface CaptureDiagnostics {
+  reason?: string
+  expected_start_sample?: number | null
+  actual_start_sample?: number | null
+  dropped_chunks?: number | null
+  asr_queue_depth?: number | null
+  last_drop_at?: number | null
+  last_error?: string | null
+}
+
+export interface PlaybackDiagnostics {
+  configured_device?: string | number | null
+  resolved_device?: string | number | null
+  sample_rate?: number
+  channels?: number
+  active_key?: string | null
+  first_rendered_key?: string | null
+  first_rendered_at?: number | null
+  callback_status?: string | null
+  buffered_ms?: number
+}
+
 export interface CurrentTurnSnapshot {
   turn_id?: string | null
   input_runtime?: boolean
@@ -82,6 +104,8 @@ export interface CurrentTurnSnapshot {
   delivery?: TurnDelivery
   audio_processing_status?: string
   audio_processing_error?: string
+  capture_diagnostics?: CaptureDiagnostics
+  playback_diagnostics?: PlaybackDiagnostics
   tts_transport?: string
   tts_scheduling?: string
 }

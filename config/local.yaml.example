@@ -4,6 +4,14 @@
 audio:
   input_device: "麦克风阵列 (适用于数字麦克风的英特尔® 智音技术)"
   output_device: "扬声器 (Realtek(R) Audio)"
+  # Enable only after scripts/setup.ps1 has installed and verified both AEC
+  # dependencies.  When disabled or degraded, speaker playback remains safe
+  # but can only be stopped explicitly; automatic barge-in is not permitted.
+  processing_enabled: false
+  processing_required: false
+  echo_cancellation: true
+  noise_suppression: true
+  device_latency_ms: 0
 
 wake:
   enabled: false

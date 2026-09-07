@@ -45,12 +45,33 @@ class AudioCapture:
         self._blocks_captured = 0
         self._bytes_captured = 0
         self._dropped_chunks = 0
+        self._last_drop_at: float | None = None
+        self._last_queue_depth = 0
         self._last_status = ""
         self._last_report_at = 0.0
 
     @property
     def running(self) -> bool:
         return self._running
+
+    @property
+    def diagnostics(self) -> dict[str, int | float | str | None]:
+        """A small, thread-safe-enough capture health projection.
+
+        The PortAudio callback is the only writer for these counters.  They
+        are deliberately diagnostic data, not a second transport protocol:
+        the sample indexes on :class:`AudioFrame` remain the authority used by
+        the controller to reject a discontinuous turn.
+        """
+
+        return {
+            "blocks": self._blocks_captured,
+            "bytes": self._bytes_captured,
+            "queue_depth": self._last_queue_depth,
+            "dropped_chunks": self._dropped_chunks,
+            "last_drop_at": self._last_drop_at,
+            "last_error": self.last_error,
+        }
 
     def _clear_pending_frames(self) -> None:
         """Drop frames captured by the session that has just ended.
@@ -94,14 +115,28 @@ class AudioCapture:
         def enqueue() -> None:
             if self.queue.full():
                 self._dropped_chunks += 1
+                self._last_drop_at = time.monotonic()
                 try:
                     self.queue.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
+                logger.warning(
+                    "audio.capture_queue_overflow dropped=%d queue_capacity=%d next_start_sample=%d",
+                    self._dropped_chunks,
+                    self.queue.maxsize,
+                    frame.start_sample,
+                )
             try:
                 self.queue.put_nowait(frame)
             except asyncio.QueueFull:
-                pass
+                # ``full`` can only race with another loop callback.  Keep
+                # the loss visible; silently pretending this frame arrived
+                # used to turn the controller's later continuity check into
+                # an unexplained fatal session shutdown.
+                self._dropped_chunks += 1
+                self._last_drop_at = time.monotonic()
+                logger.warning("audio.capture_queue_enqueue_failed dropped=%d", self._dropped_chunks)
+            self._last_queue_depth = self.queue.qsize()
 
         self.loop.call_soon_threadsafe(enqueue)
 
@@ -117,6 +152,8 @@ class AudioCapture:
             self._blocks_captured = 0
             self._bytes_captured = 0
             self._dropped_chunks = 0
+            self._last_drop_at = None
+            self._last_queue_depth = 0
             self._last_status = ""
             self._last_report_at = 0.0
             logger.info(

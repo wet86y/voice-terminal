@@ -23,6 +23,15 @@ audio:
   block_ms: 20
   ring_buffer_ms: 2000
   wake_preroll_ms: 1200
+  # Speaker playback is safe even without the optional AEC wheel: automatic
+  # barge-in is then disabled after the first output callback rather than
+  # falling back to raw microphone VAD and cancelling the assistant by echo.
+  processing_enabled: false
+  processing_required: false
+  echo_cancellation: true
+  noise_suppression: true
+  automatic_gain_control: false
+  device_latency_ms: 0
 
 wake:
   enabled: false

@@ -150,6 +150,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
         if h and key == h.workspace.playback_key:
             h.workspace.playback_started = True
             h.workspace.timings.setdefault("playback", time.monotonic())
+            if self.player is not None:
+                self.controller.state.current["playback_diagnostics"] = self.player.diagnostics
             if self.loop and not self.loop.is_closed():
                 async def publish():
                     if self.handle is h and not h.reason:

@@ -56,6 +56,9 @@ class RealtimeController(SpeechPipeline, InputController):
         self._sub_finals: dict[str, asyncio.Event] = {}
         self._asr_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         self._asr_sender: asyncio.Task | None = None
+        self._asr_recovery_task: asyncio.Task | None = None
+        self._asr_queue_overflow = False
+        self._asr_queue_overflow_at: float | None = None
         self._last_frame: AudioFrame | None = None
         self._resume_started: int | None = None
         self._vad_epoch = 0
@@ -160,7 +163,7 @@ class RealtimeController(SpeechPipeline, InputController):
             return False
 
     async def _handle_asr_disconnect(self) -> None:
-        """Stop capture after a transport loss and leave a restartable state."""
+        """Quiesce a broken input transport and schedule one safe reconnect."""
 
         self.state.services["asr"] = "ERROR"
         self.state.listening = False
@@ -189,11 +192,63 @@ class RealtimeController(SpeechPipeline, InputController):
                 pass
             self.state.services["audio"] = "READY"
         self.state.services["kws"] = "READY" if self.wake_enabled and self.kws is not None else "DISABLED"
+        if (not self._closed and
+                (self._asr_recovery_task is None or self._asr_recovery_task.done())):
+            self._asr_recovery_task = asyncio.create_task(
+                self._recover_asr_session(),
+                name="asr-session-recovery",
+            )
+            self._track(self._asr_recovery_task)
+
+    async def _recover_asr_session(self) -> None:
+        """Attempt one delayed restart after a transient ASR worker loss.
+
+        The failed sender has already been detached before this task is
+        created.  Retrying after a short delay keeps the normal readiness
+        handshake as the sole authority and avoids a reconnect storm when the
+        worker is genuinely down; a failed retry leaves the visible runtime in
+        a restartable idle/error state for the user.
+        """
+
+        try:
+            await asyncio.sleep(0.5)
+            if self._closed or self.state.listening:
+                return
+            logger.info("controller.asr_recovery_attempt")
+            await self.start_listening()
+            if self.state.listening:
+                logger.info("controller.asr_recovery_succeeded")
+            else:
+                logger.warning("controller.asr_recovery_not_ready")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("controller.asr_recovery_failed")
 
     def _queue_asr(self, item) -> None:
-        # No awaited network writes on the capture path. Overflow is a visible
-        # failure, never a silent PCM drop or an unbounded queue.
-        self._asr_queue.put_nowait(item)
+        # No awaited network writes on the capture path.  A full queue means
+        # ASR can no longer be given a contiguous input stream.  Do not throw
+        # from this helper: that used to stop the entire microphone session.
+        # The next capture frame performs a controlled resynchronisation.
+        try:
+            self._asr_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            self._asr_queue_overflow = True
+            self._asr_queue_overflow_at = time.monotonic()
+            logger.warning(
+                "controller.asr_queue_overflow queue_capacity=%d item_type=%s turn_id=%s",
+                self._asr_queue.maxsize,
+                type(item).__name__,
+                getattr(item, "turn_id", item),
+            )
+
+    def _drain_asr_queue(self) -> None:
+        while True:
+            try:
+                self._asr_queue.get_nowait()
+                self._asr_queue.task_done()
+            except asyncio.QueueEmpty:
+                return
 
     async def _send_asr_loop(self) -> None:
         while True:
@@ -222,14 +277,94 @@ class RealtimeController(SpeechPipeline, InputController):
             finally:
                 self._asr_queue.task_done()
 
+    async def _recover_input_continuity(
+        self,
+        frame: AudioFrame,
+        *,
+        reason: str,
+        expected_start_sample: int | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Discard only an unverifiable input transaction and keep listening.
+
+        PCM must never be joined across a capture or ASR backpressure hole.
+        The old path correctly rejected the corrupt turn but escalated it to a
+        terminal input-loop failure.  Output ownership deliberately remains
+        separate: abandoning an input cannot silence an already authorised
+        speech transaction.
+        """
+
+        ws = self.workspace
+        capture_diagnostics = getattr(self.capture, "diagnostics", {}) if self.capture is not None else {}
+        detail = {
+            "reason": reason,
+            "expected_start_sample": expected_start_sample,
+            "actual_start_sample": frame.start_sample,
+            "dropped_chunks": capture_diagnostics.get("dropped_chunks"),
+            "asr_queue_depth": self._asr_queue.qsize(),
+        }
+        if error is not None:
+            # A per-frame controller exception is just as unsafe to append to
+            # the in-flight ASR segment as a physical sample gap.  Preserve
+            # its class/message for diagnosis, but never turn it into a
+            # user-visible stop request or silently lose the cause.
+            detail["error_type"] = type(error).__name__
+            detail["error"] = str(error)[:300]
+        logger.warning(
+            "controller.input_continuity_recovered reason=%s turn_id=%s expected_start_sample=%s "
+            "actual_start_sample=%s asr_queue_depth=%d",
+            reason,
+            ws.turn_id if ws else None,
+            expected_start_sample,
+            frame.start_sample,
+            self._asr_queue.qsize(),
+        )
+        self._drain_asr_queue()
+        self._asr_queue_overflow = False
+        self._asr_queue_overflow_at = None
+        if ws is not None:
+            await self._cancel_turn(reason="capture_gap", record=True)
+        self._recent.clear()
+        self._last_frame = frame
+        self._vad_origin = frame.start_sample
+        self._speech_start_sample = None
+        self._speech_end_sample = None
+        self._speech_samples = 0
+        self._resume_started = None
+        self.barge_in_gate.reset()
+        self._vad_epoch += 1
+        if self.vad is not None:
+            await asyncio.to_thread(self.vad.reset)
+        self._reset_vad_pending = False
+        self.state.current.update(capture_diagnostics=detail)
+        error_code = "AUDIO_CAPTURE_GAP" if error is None else "AUDIO_INPUT_FRAME_FAILED"
+        error_message = (
+            "音频采集出现缺口，已放弃当前未完成输入并继续监听。"
+            if error is None
+            else "音频帧处理异常，已放弃当前未完成输入并继续监听。"
+        )
+        await self._error(
+            error_code,
+            error_message,
+            recoverable=True,
+            turn_id=ws.turn_id if ws else None,
+        )
+        await self._state_event(TerminalState.LISTENING, listening=True)
+
     async def _listen_loop(self) -> None:
         while self.state.listening and not self._closed:
             try:
                 frame = await self.capture.read_frame()
-                await self.handle_frame(frame)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                # Failure to read the physical capture source means there is
+                # no trustworthy next frame and the session must be settled.
+                # Keep this separate from below: a controller/VAD/ASR queue
+                # exception while handling an otherwise valid frame is
+                # recoverable and must not make TTS end the user's listening
+                # session.
+                logger.exception("controller.input_capture_read_failed")
                 await self._cancel_turn(reason="failed", record=False)
                 self.state.listening = False
                 try:
@@ -258,8 +393,62 @@ class RealtimeController(SpeechPipeline, InputController):
                 await self._error("AUDIO_PIPELINE_FAILED", str(exc), recoverable=True)
                 await self._state_event(TerminalState.IDLE, listening=False)
                 break
+            try:
+                await self.handle_frame(frame)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "controller.input_frame_failed reason=frame_processing_error start_sample=%s",
+                    frame.start_sample,
+                )
+                try:
+                    await self._recover_input_continuity(
+                        frame,
+                        reason="frame_processing_error",
+                        expected_start_sample=self._last_frame.end_sample if self._last_frame else None,
+                        error=exc,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Do not hide the original error, and do not spin a
+                    # broken listener indefinitely.  This is now the only
+                    # path where frame-level recovery itself failed.
+                    logger.exception("controller.input_frame_recovery_failed")
+                    await self._cancel_turn(reason="failed", record=False)
+                    self.state.listening = False
+                    try:
+                        await self.capture.stop()
+                    except Exception:
+                        logger.exception("controller.input_frame_recovery_stop_capture_failed")
+                    if self.asr is not None:
+                        try:
+                            await self.asr.close()
+                        except Exception:
+                            logger.exception("controller.input_frame_recovery_close_asr_failed")
+                    self.state.services["audio"] = "READY" if self.capture is not None else "ERROR"
+                    self.state.services["asr"] = "READY" if self.asr is not None and self.vad is not None else "ERROR"
+                    await self._error("AUDIO_PIPELINE_FAILED", "音频帧恢复失败，请重新开始监听。", recoverable=True)
+                    await self._state_event(TerminalState.IDLE, listening=False)
+                    break
 
     async def handle_frame(self, frame: AudioFrame) -> None:
+        expected_start_sample = self._last_frame.end_sample if self._last_frame else None
+        if self._asr_queue_overflow:
+            await self._recover_input_continuity(
+                frame,
+                reason="asr_queue_overflow",
+                expected_start_sample=expected_start_sample,
+            )
+            return
+        if expected_start_sample is not None and frame.start_sample != expected_start_sample:
+            await self._recover_input_continuity(
+                frame,
+                reason="capture_gap",
+                expected_start_sample=expected_start_sample,
+            )
+            return
         processed = (
             await asyncio.to_thread(self._process_audio, frame.pcm)
             if self.audio_processor is not None and self.audio_processor.enabled
@@ -267,10 +456,6 @@ class RealtimeController(SpeechPipeline, InputController):
         )
         if processed != frame.pcm:
             frame = AudioFrame(processed, frame.start_sample, frame.captured_at)
-        if self._last_frame and frame.start_sample != self._last_frame.end_sample:
-            self._recent.clear()
-            if self.workspace:
-                raise ValueError("audio capture gap; current turn discarded")
         self._last_frame = frame
         self._recent.append(frame)
         while self._recent and frame.end_sample - self._recent[0].start_sample > max(1200, self.wake_preroll_ms) * 16:
@@ -293,6 +478,20 @@ class RealtimeController(SpeechPipeline, InputController):
                 self._speech_samples += max(0, self._speech_end_sample - self._speech_start_sample)
                 self._speech_start_sample = None
 
+        # Preserve contiguous PCM for an existing turn *before* protected
+        # barge-in may deliberately return ``None`` below.  Previously, a
+        # speaker/AEC-rejected frame was omitted from ``ws.audio`` while
+        # ``_last_frame`` correctly advanced.  When TTS completed and the
+        # next frame was accepted, CurrentTurnAudioBuffer quite rightly saw
+        # a one-block hole and raised ``audio capture gap``.  The rejected
+        # frame remains excluded from user-turn semantics; this only keeps
+        # the bounded source buffer sample-contiguous.
+        workspace_before_activity = self.workspace
+        if workspace_before_activity is not None:
+            workspace_before_activity.audio.append(frame)
+            if self._active_input:
+                self._queue_asr(AudioChunk(self._sub_id, frame.pcm))
+
         activity = await self._observe_activity(activity, frame)
         if activity is None:
             return
@@ -306,12 +505,11 @@ class RealtimeController(SpeechPipeline, InputController):
                 return
             await self._new_turn(frame)
             ws = self.workspace
-        else:
-            # Keep sample continuity in the bounded turn cache while a
-            # frozen generation is awaiting refinement/answer.  The closed
-            # ASR subsegment receives no more audio; a later pre-playback
-            # resume can therefore append its first frame after the preserved
-            # silence without being mistaken for a capture gap.
+        elif ws is not workspace_before_activity:
+            # ``_observe_activity`` can await Agent work which finalizes an
+            # old turn or resumes/replaces it.  A replacement workspace did
+            # not exist at the continuity append above, so give it the frame
+            # exactly once after returning from that await boundary.
             ws.audio.append(frame)
             if self._active_input:
                 self._queue_asr(AudioChunk(self._sub_id, frame.pcm))
@@ -835,6 +1033,11 @@ class RealtimeController(SpeechPipeline, InputController):
         self._reset_vad_pending = True
 
     async def stop_listening(self) -> None:
+        recovery = self._asr_recovery_task
+        if recovery is not None and recovery is not asyncio.current_task() and not recovery.done():
+            recovery.cancel()
+            await asyncio.gather(recovery, return_exceptions=True)
+        self._asr_recovery_task = None
         await super().stop_listening()
         if self._asr_sender:
             self._asr_sender.cancel()
@@ -843,6 +1046,8 @@ class RealtimeController(SpeechPipeline, InputController):
         while not self._asr_queue.empty():
             self._asr_queue.get_nowait()
             self._asr_queue.task_done()
+        self._asr_queue_overflow = False
+        self._asr_queue_overflow_at = None
         self._recent.clear()
         self._last_frame = None
 

@@ -57,4 +57,15 @@ describe('V0.5 session protocol', () => {
     expect(terminal.activeSpeech.value?.text).toBe('已授权输出')
     expect(terminal.speechOutputs.value[0].delivery?.heard_text).toBe('已授权输出')
   })
+
+  it('keeps a recoverable capture gap diagnostic without changing server listening state', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('runtime.snapshot', 1, { state: 'LISTENING', listening: true, can_start: true,
+      services: { audio: 'RUNNING', kws: 'DISABLED', asr: 'RUNNING', llm: 'READY', tts: 'READY' },
+      current: { capture_diagnostics: { reason: 'capture_gap', dropped_chunks: 2 } } })
+
+    expect(terminal.listening.value).toBe(true)
+    expect(terminal.current.capture_diagnostics?.reason).toBe('capture_gap')
+    expect(terminal.current.capture_diagnostics?.dropped_chunks).toBe(2)
+  })
 })

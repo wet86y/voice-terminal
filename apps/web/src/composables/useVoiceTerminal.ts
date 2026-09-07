@@ -90,6 +90,8 @@ function createEmptyCurrentTurn(): CurrentTurnSnapshot {
     delivery: {},
     audio_processing_status: 'DISABLED',
     audio_processing_error: '',
+    capture_diagnostics: {},
+    playback_diagnostics: {},
     tts_transport: 'websocket',
     tts_scheduling: 'auto',
     input_runtime: true, epoch: 0, committed: false,
@@ -307,6 +309,12 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       }
     }
     if (delivery !== undefined) current.delivery = delivery
+    if (isRecord(snapshot.capture_diagnostics)) {
+      current.capture_diagnostics = snapshot.capture_diagnostics as CurrentTurnSnapshot['capture_diagnostics']
+    }
+    if (isRecord(snapshot.playback_diagnostics)) {
+      current.playback_diagnostics = snapshot.playback_diagnostics as CurrentTurnSnapshot['playback_diagnostics']
+    }
     for (const key of ['audio_processing_status', 'audio_processing_error', 'tts_transport', 'tts_scheduling'] as const) {
       if (typeof snapshot[key] === 'string') current[key] = snapshot[key] as string
     }
