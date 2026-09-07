@@ -15,7 +15,9 @@ tools:
 
 audio:
   input_device: "麦克风阵列 (适用于数字麦克风的英特尔® 智音技术)"
-  output_device: "扬声器 (Realtek(R) Audio)"
+  # Let Windows select the active default device. This avoids pinning an MME
+  # endpoint that may advertise support but fail when PortAudio opens it.
+  output_device: null
   sample_rate: 16000
   channels: 1
   sample_format: int16
