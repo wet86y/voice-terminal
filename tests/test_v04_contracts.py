@@ -102,3 +102,32 @@ def test_speech_queue_serializes_prefill_and_formal_without_busy_rejection() -> 
         assert [kind for kind, _payload in events].count("speech.queued") == 2
 
     asyncio.run(scenario())
+
+
+def test_targeted_prefill_cancellation_does_not_cancel_later_formal_speech() -> None:
+    async def scenario() -> None:
+        events = []
+
+        async def emit(kind, payload):
+            events.append((kind, payload))
+
+        runtime = SimpleNamespace(gate=lambda _identity: None, emit=emit)
+        controller = SimpleNamespace(tts=None, player=None, options=SimpleNamespace(), bridge_options=SimpleNamespace())
+        output = EpisodeSpeechOutput(controller)
+        output.runtime = runtime
+
+        blocker = asyncio.create_task(asyncio.Event().wait())
+        output._worker = blocker  # Keep both items queued for a deterministic scope check.
+        identity = ("episode", "decision", 1)
+        prefill = await output.enqueue_text(identity, "input", "我看一下。", kind="prefill")
+        formal = await output.enqueue_text(identity, "input", "正式回答。", kind="formal")
+        output.cancel(prefill.speech_id, "cleared")
+        await asyncio.gather(prefill.task, return_exceptions=True)
+        assert prefill.reason == "cleared"
+        assert formal.reason is None
+        assert not formal.task.cancelled()
+        output.cancel(formal.speech_id, "stopped")
+        blocker.cancel()
+        await asyncio.gather(formal.task, blocker, return_exceptions=True)
+
+    asyncio.run(scenario())

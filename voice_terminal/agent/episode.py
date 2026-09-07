@@ -483,10 +483,16 @@ class AgentEpisodeRuntime:
         return {"status": "accepted", "action": state}
 
     async def clear_prefill(self, *, reason="cleared"):
-        if self.pending_prefill is None:
+        candidate = self.pending_prefill
+        if candidate is None:
             return {"status": "completed", "action": "empty"}
-        self.pending_prefill["status"] = "CANCELLED" if reason == "cleared" else "STALE"
-        self.pending_prefill["updated_at"] = time.time()
+        speech_id = candidate.get("speech_id")
+        if isinstance(speech_id, str):
+            cancel = getattr(self.output, "cancel", None)
+            if callable(cancel):
+                cancel(speech_id, reason)
+        candidate["status"] = "CANCELLED" if reason == "cleared" else "STALE"
+        candidate["updated_at"] = time.time()
         await self._publish_prefill(reason)
         self.pending_prefill = None
         return {"status": "completed", "action": reason}

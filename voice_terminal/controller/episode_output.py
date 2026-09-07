@@ -224,6 +224,26 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
             h.task.cancel()
 
+    def cancel(self, speech_id, reason="cancelled"):
+        """Cancel exactly one queued or active speech item.
+
+        ``clear_prefill`` uses this after a candidate has already become a
+        SpeechItem.  Cancelling by ID prevents an explicit prefill withdrawal
+        from invalidating a later formal response in the same FIFO queue.
+        """
+        if not isinstance(speech_id, str) or not speech_id:
+            return False
+        items = ([self.handle] if self.handle else []) + list(self._pending)
+        for h in items:
+            if h is None or h.speech_id != speech_id or h.task.done() or h.reason:
+                continue
+            h.reason = reason
+            if h is self.handle and self.player:
+                h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
+            h.task.cancel()
+            return True
+        return False
+
     async def _run(self, h):
         # Record completion even if cancellation occurs before the first delta.
         try:
