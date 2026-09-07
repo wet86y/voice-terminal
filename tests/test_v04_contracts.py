@@ -63,8 +63,8 @@ def test_session_ledger_is_the_only_context_and_input_history_store() -> None:
     ledger.commit_input("input_a", "查询天气")
     ledger.commit_delivery("speech_a", "我来查看。", DeliveryReport(
         status="full", termination="completed", heard_text="我来查看。"))
-    record = ledger.append_record({"input_id": "input_a", "transcript": "查询天气", "episode_id": "episode_a"})
-    assert record.input_id == "input_a"
+    record = ledger.append_record({"turn_id": "turn_a", "transcript": "查询天气", "conversation_id": "conversation_a"})
+    assert record.turn_id == "turn_a"
     assert ledger.context_messages("")[-2:] == [
         {"role": "user", "content": "查询天气"},
         {"role": "assistant", "content": "我来查看。"},

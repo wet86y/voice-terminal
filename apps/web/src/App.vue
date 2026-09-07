@@ -146,11 +146,11 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
     <section v-if="terminal.agentEpisode" class="agent-panel panel">
       <div class="panel-heading"><h2>AGENT EPISODE</h2><span>{{ terminal.agentEpisode.decision_mode }}</span></div>
       <div class="agent-facts">
-        <span>Episode <code>{{ terminal.agentEpisode.episode_id || '等待新任务' }}</code></span>
-        <span>Agent <b>{{ terminal.agentEpisode.agent_state }}</b></span>
+        <span>Conversation <code>{{ terminal.agentEpisode.conversation_id || '等待新任务' }}</code></span>
+        <span>Agent <b>{{ terminal.agentEpisode.agent_busy ? 'BUSY' : 'IDLE' }}</b></span>
         <span>播放 <b>{{ terminal.agentEpisode.playback_state }}</b></span>
-        <span>Step <code>{{ terminal.agentEpisode.agent_step_id || '—' }}</code></span>
-        <span>Context {{ terminal.agentEpisode.context_version }}</span>
+        <span>Trace <code>{{ terminal.agentEpisode.trace_id || '—' }}</code></span>
+        <span>Epoch {{ terminal.agentEpisode.epoch }}</span>
         <span>用户讲话 {{ terminal.agentEpisode.user_speaking === null ? '未知' : terminal.agentEpisode.user_speaking ? '是' : '否' }}</span>
         <span>动作 {{ terminal.agentEpisode.current_action || '—' }}</span>
         <span>模型请求 {{ terminal.agentEpisode.request_count || 0 }}</span>
@@ -169,9 +169,9 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
       <details class="agent-trace" open>
         <summary>AGENT TRACE · {{ terminal.agentTrace.length }}</summary>
         <div class="agent-trace-list">
-          <div v-for="entry in [...terminal.agentTrace].reverse()" :key="`${entry.episode_id}-${entry.trace_seq}`" class="agent-trace-row">
+          <div v-for="entry in [...terminal.agentTrace].reverse()" :key="`${entry.conversation_id}-${entry.trace_seq}`" class="agent-trace-row">
             <span>#{{ entry.trace_seq }} · {{ entry.kind }}</span>
-            <small>{{ entry.input_id || '—' }} · v{{ entry.context_version }}</small>
+            <small>{{ entry.turn_id || '—' }} · epoch {{ entry.epoch }}</small>
             <p>{{ entry.text || entry.reason || entry.name || entry.status || '' }}</p>
             <details><summary>事件详情</summary><pre>{{ JSON.stringify(entry, null, 2) }}</pre></details>
           </div>
@@ -180,7 +180,7 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
       <details v-if="terminal.speechOutputs.length" open>
         <summary>语音输出与实际传达</summary>
           <div v-for="output in [...terminal.speechOutputs].reverse()" :key="output.speech_id" class="agent-output">
-            <small>{{ output.input_id }} · {{ output.speech_id }} · {{ output.status }}</small>
+            <small>{{ output.turn_id }} · {{ output.speech_id }} · {{ output.status }}</small>
           <small>表达情绪：{{ output.emotion_requested || 'calm' }} → {{ output.emotion_applied || 'calm' }} · {{ output.emotion_status || '未报告' }}</small>
           <p>{{ output.text }}</p>
           <p>已传达：{{ output.delivery?.heard_text || '无' }}</p>
@@ -409,13 +409,13 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
         </div>
 
         <div v-if="terminal.recentTurns.length" class="history-list">
-          <div v-for="turn in terminal.recentTurns" :key="turn.input_id" class="history-row">
-            <div class="history-id">{{ turn.input_id }}<small v-if="turn.episode_id">Episode {{ turn.episode_id }}</small></div>
+          <div v-for="turn in terminal.recentTurns" :key="turn.turn_id" class="history-row">
+            <div class="history-id">{{ turn.turn_id }}<small v-if="turn.conversation_id">Conversation {{ turn.conversation_id }}</small></div>
             <div class="history-copy">
               <p class="history-transcript">{{ displayText(turn.transcript) }}</p>
-              <p class="history-response">{{ turn.episode_id && !turn.response ? '输入已保存；语音输出单独结算' : displayText(turn.response) }}</p>
+              <p class="history-response">{{ turn.conversation_id && !turn.response ? '输入已保存；语音输出单独结算' : displayText(turn.response) }}</p>
               <details v-if="turn.details"><summary>分段、精修与情绪</summary><pre>{{ JSON.stringify(turn.details, null, 2) }}</pre></details>
-              <div v-for="output in terminal.speechOutputs.filter(item => item.input_id === turn.input_id)" :key="output.speech_id">
+              <div v-for="output in terminal.speechOutputs.filter(item => item.turn_id === turn.turn_id)" :key="output.speech_id">
                 <p>{{ output.text }} · {{ output.status }}</p>
                 <p>已传达：{{ output.delivery?.heard_text || '无' }}</p>
               </div>

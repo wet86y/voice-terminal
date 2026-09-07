@@ -13,7 +13,7 @@ class FakeSocket implements VoiceSocket {
   open() { this.readyState = 1; this.onopen?.() }
   push(type: string, seq: number, payload: Record<string, unknown> = {}, ids: Record<string, string> = {}) {
     this.onmessage?.({ data: JSON.stringify({ type, seq, timestamp: '2026-09-07T10:00:00.000Z',
-      session_id: 'session_a', ...ids, payload }) })
+      conversation_id: 'conversation_a', ...ids, payload }) })
   }
 }
 
@@ -24,7 +24,7 @@ function openTerminal() {
   return { socket, terminal }
 }
 
-describe('V1 session protocol', () => {
+describe('V0.5 session protocol', () => {
   it('subscribes and applies a server-owned session snapshot', () => {
     const { socket, terminal } = openTerminal()
     expect(JSON.parse(socket.sent[0]).command).toBe('subscribe')
@@ -37,10 +37,10 @@ describe('V1 session protocol', () => {
 
   it('uses input identity for text and ignores an older sequence', () => {
     const { socket, terminal } = openTerminal()
-    socket.push('input.started', 1, {}, { input_id: 'input_a' })
-    socket.push('input.updated', 2, { text: '第一段' }, { input_id: 'input_a' })
-    socket.push('input.updated', 1, { text: '过期文本' }, { input_id: 'input_a' })
-    socket.push('input.finalized', 3, { text: '最终输入' }, { input_id: 'input_a' })
+    socket.push('input.started', 1, {}, { turn_id: 'input_a' })
+    socket.push('input.updated', 2, { text: '第一段' }, { turn_id: 'input_a' })
+    socket.push('input.updated', 1, { text: '过期文本' }, { turn_id: 'input_a' })
+    socket.push('input.finalized', 3, { text: '最终输入' }, { turn_id: 'input_a' })
     expect(terminal.currentTurnId.value).toBe('input_a')
     expect(terminal.current.partial_text).toBe('')
     expect(terminal.current.final_text).toBe('最终输入')
@@ -50,10 +50,10 @@ describe('V1 session protocol', () => {
     const { socket, terminal } = openTerminal()
     socket.push('agent.state', 1, { episode_id: 'episode_a', agent_step_id: 'decision_a', context_version: 1, agent_state: 'INVOKING' })
     socket.push('speech.delta', 2, { speech_id: 'speech_a', episode_id: 'episode_a', agent_step_id: 'decision_a',
-      context_version: 1, text_delta: '已授权输出' }, { input_id: 'input_a', episode_id: 'episode_a', decision_id: 'decision_a', speech_id: 'speech_a' })
+      context_version: 1, text_delta: '已授权输出' }, { turn_id: 'input_a', speech_id: 'speech_a' })
     socket.push('speech.completed', 3, { speech_id: 'speech_a', episode_id: 'episode_a', agent_step_id: 'decision_a',
       context_version: 1, text: '已授权输出', status: 'completed', delivery: { status: 'full', heard_text: '已授权输出' } },
-      { input_id: 'input_a', episode_id: 'episode_a', decision_id: 'decision_a', speech_id: 'speech_a' })
+      { turn_id: 'input_a', speech_id: 'speech_a' })
     expect(terminal.activeSpeech.value?.text).toBe('已授权输出')
     expect(terminal.speechOutputs.value[0].delivery?.heard_text).toBe('已授权输出')
   })

@@ -46,7 +46,7 @@ class RuntimeState:
             "tts_played_ms": 0,
             "tts_output_estimated_ms": 0,
             "tts_remaining_ms": 0,
-            "input_id": None,
+            "turn_id": None,
             "input_runtime": True,
             # Runtime capabilities are kept in the snapshot so a reconnecting
             # client can explain why protected barge-in is unavailable and
@@ -112,7 +112,7 @@ class RuntimeState:
             tts_remaining_ms=0,
             delivery={},
         )
-        for key in ("input_revision", "generation_id", "committed", "agent_phase", "paraformer_final", "refined_text", "segments", "tools", "audio_cues", "analysis", "tts_segments"):
+        for key in ("turn_id", "epoch", "phase", "committed", "agent_phase", "paraformer_final", "refined_text", "segments", "tools", "audio_cues", "analysis", "tts_segments"):
             self.current.pop(key, None)
         self.latency = {
             "complete": False,

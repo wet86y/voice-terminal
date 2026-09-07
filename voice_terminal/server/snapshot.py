@@ -25,32 +25,26 @@ class ProtocolSequencer:
                "input.finalized", "input.completed", "agent.state", "agent.trace", "context.snapshot",
                "tool.state", "agent.prefill", "agent.reasoning", "speech.queued", "speech.started", "speech.delta", "speech.progress", "speech.completed", "error"}
 
-    def __init__(self, session_id: str | Callable[[], str]) -> None:
+    def __init__(self, conversation_id: str | Callable[[], str]) -> None:
         self._seq = 0
-        self._session_id = session_id
+        self._conversation_id = conversation_id
 
     @property
-    def session_id(self) -> str:
-        return self._session_id() if callable(self._session_id) else self._session_id
+    def conversation_id(self) -> str:
+        return self._conversation_id() if callable(self._conversation_id) else self._conversation_id
 
     def envelope(self, event: VoiceEvent) -> dict[str, Any]:
         self._seq += 1
         payload = dict(event.payload)
         public_type = self._EVENTS.get(event.type, event.type)
-        # `turn_id` was an overloaded legacy identity. It is an input identity
-        # at the public boundary; the more specific IDs remain in payload.
         if event.turn_id:
-            payload.setdefault("input_id", event.turn_id)
-        if "agent_step_id" in payload:
-            payload.setdefault("decision_id", payload["agent_step_id"])
+            payload.setdefault("turn_id", event.turn_id)
         return {
             "type": public_type,
             "seq": self._seq,
             "timestamp": event.timestamp or utc_now_iso(),
-            "session_id": self.session_id,
-            "input_id": payload.get("input_id"),
-            "episode_id": payload.get("episode_id"),
-            "decision_id": payload.get("decision_id"),
+            "conversation_id": self.conversation_id,
+            "turn_id": payload.get("turn_id"),
             "speech_id": payload.get("speech_id"),
             "payload": payload,
         }

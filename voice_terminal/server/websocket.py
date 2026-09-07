@@ -21,8 +21,8 @@ from ..providers.deepseek import DeepSeekClient
 from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
 from ..agent.tool_registry import WebSearchTools
-from ..session.contracts import new_id
 from ..session.ledger import SessionLedger
+from ..session.runtime import ConversationRuntime
 from ..vad.detector import FsmnVadDetector, VadError
 from .snapshot import ProtocolSequencer, snapshot_event
 
@@ -54,7 +54,7 @@ class SessionRuntime:
         self.player: PcmPlayer | None = None
         self.audio_processor: AudioPreprocessor | None = None
         self.controller: EpisodeController | None = None
-        self.session_id = new_id("session")
+        self.conversation = ConversationRuntime()
         self._session_lock = asyncio.Lock()
 
     def _record_error(self, service: str, message: str, *, status_service: str | None = None) -> None:
@@ -252,6 +252,7 @@ class SessionRuntime:
             bridge_breaks=self.config.text_bridge.preferred_breaks,
             audio_processor=self.audio_processor,
             barge_in_gate=BargeInGate(min_speech_ms=max(250, self.config.vad.min_speech_ms), enabled=True),
+            conversation=self.conversation,
         )
         await self.controller.initialize()
 
@@ -276,7 +277,8 @@ class SessionRuntime:
         async with self._session_lock:
             if self.controller is not None and hasattr(self.controller, "reset_session"):
                 await self.controller.reset_session()
-            self.session_id = new_id("session")
+            self.history.reset()
+            self.conversation.reset()
 
     async def close(self) -> None:
         if self.controller is not None:
@@ -315,7 +317,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
     if FastAPI is None:
         raise RuntimeError("缺少 fastapi，请先运行 scripts\\setup.ps1。")
 
-    app = FastAPI(title="Voice Terminal Server", version="0.4.0", lifespan=lifespan)
+    app = FastAPI(title="Voice Terminal Server", version="0.5.0", lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -325,7 +327,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
         logger.info("websocket.connected peer=%s", websocket.client)
-        sequencer = ProtocolSequencer(lambda: runtime.session_id)
+        sequencer = ProtocolSequencer(lambda: runtime.conversation.conversation_id)
         subscription = runtime.bus.subscribe()
         event_task = asyncio.create_task(_forward_events(websocket, subscription, sequencer), name="websocket-events")
         # Let the forwarding task register its queue before a fast

@@ -57,10 +57,9 @@ export interface ServiceStatuses {
 }
 
 export interface CurrentTurnSnapshot {
-  input_id?: string | null
+  turn_id?: string | null
   input_runtime?: boolean
-  input_revision?: number
-  generation_id?: number
+  epoch?: number
   committed?: boolean
   agent_phase?: string
   paraformer_final?: string
@@ -147,9 +146,8 @@ export interface LlmContextPayload {
   context_token_estimate?: number
   provider_prompt_tokens?: number | null
   context_usage_percent?: number
-  episode_id?: string
-  agent_step_id?: string
-  context_version?: number
+  conversation_id?: string
+  epoch?: number
 }
 
 export interface TtsStatusPayload {
@@ -172,7 +170,7 @@ export interface LatencySnapshotPayload {
 }
 
 export interface TurnCompletedPayload {
-  episode_id?: string | null
+  conversation_id?: string | null
   details?: Record<string, unknown>
   transcript: string
   response: string
@@ -201,10 +199,8 @@ export interface MessageEnvelope<TType extends string = string, TPayload = unkno
   type: TType
   seq: number
   timestamp: string
-  session_id: string
-  input_id?: string | null
-  episode_id?: string | null
-  decision_id?: string | null
+  conversation_id: string
+  turn_id?: string | null
   speech_id?: string | null
   payload: TPayload
 }
@@ -219,9 +215,9 @@ export interface CommandMessage {
 }
 
 export interface InputRecord {
-  episode_id?: string | null
+  conversation_id?: string | null
   details?: Record<string, unknown>
-  input_id: string
+  turn_id: string
   transcript: string
   response: string
   completed_at: string
@@ -233,10 +229,10 @@ export interface InputRecord {
 export interface AgentTrace {
   trace_seq: number
   kind: string
-  episode_id: string | null
-  agent_step_id?: string | null
-  context_version?: number
-  input_id?: string | null
+  conversation_id: string | null
+  trace_id?: string | null
+  epoch?: number
+  turn_id?: string | null
   text?: string
   reason?: string
   name?: string
@@ -247,11 +243,10 @@ export interface AgentTrace {
 
 export interface SpeechOutputRecord {
   speech_id: string
-  episode_id: string
-  agent_step_id: string
-  context_version: number
-  input_id: string
-  generation_id: number
+  conversation_id: string
+  trace_id?: string
+  turn_id: string
+  epoch: number
   text: string
   status: string
   delivery?: TurnDelivery
@@ -264,9 +259,9 @@ export interface SpeechOutputRecord {
 }
 
 export interface AgentEpisodeSnapshot {
-  episode_id: string | null
-  agent_step_id?: string | null
-  context_version: number
+  conversation_id: string | null
+  trace_id?: string | null
+  epoch: number
   context_limited?: boolean
   context_limit_reason?: string | null
   context_chars?: number
@@ -274,7 +269,7 @@ export interface AgentEpisodeSnapshot {
   context_token_estimate?: number
   provider_prompt_tokens?: number | null
   context_usage_percent?: number
-  agent_state: string
+  agent_busy: boolean
   decision_mode: string
   user_speaking: boolean | null
   current_action?: string | null

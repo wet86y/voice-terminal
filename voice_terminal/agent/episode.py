@@ -12,6 +12,8 @@ from uuid import uuid4
 from .options import AgentOptions
 from .tool_calls import ToolCallAssembler
 from .speech_stream import SpeechArgumentStream
+from ..session.context import CurrentInput, LLMContextProjector
+from ..session.runtime import ConversationRuntime, EpochReason
 
 
 logger = logging.getLogger(__name__)
@@ -110,11 +112,15 @@ class AgentEpisodeRuntime:
     CONTEXT_TOOL_RESULT_CHARS = 4096
     CONTEXT_ASSISTANT_CONTENT_CHARS = 4000
 
-    def __init__(self, provider, registry, output, emit, *, options=None, tools_enabled=True, prefill_enabled=True):
+    def __init__(self, provider, registry, output, emit, *, conversation: ConversationRuntime, ledger,
+                 options=None, tools_enabled=True, prefill_enabled=True):
         self.provider, self.registry, self.output, self.emit = provider, registry, output, emit
         self.options = options or AgentOptions()
         self.tools_enabled = tools_enabled
         self.prefill_enabled = prefill_enabled
+        self.conversation = conversation
+        self.ledger = ledger
+        self.context_projector = LLMContextProjector()
         self.scheduler = AgentDecisionScheduler(self.options)
         self.episode_id = None
         self.agent_step_id = None
@@ -166,8 +172,8 @@ class AgentEpisodeRuntime:
         self._prefetch_batches: dict[tuple, dict] = {}
 
     def snapshot(self, *, include_history=True):
-        value = {"episode_id": self.episode_id, "agent_step_id": self.agent_step_id,
-                "context_version": self.context_version, "agent_state": self.state,
+        value = {"conversation_id": self.episode_id, "trace_id": self.agent_step_id,
+                "epoch": self.context_version, "agent_busy": self.state not in {"IDLE", "WAITING_EVENT"},
                 "decision_mode": self.options.decision_mode, "user_speaking": self.user_speaking,
                 "current_action": self.current_action, "request_count": self.request_count,
                 "max_request_concurrency": self.max_request_concurrency,
@@ -194,8 +200,8 @@ class AgentEpisodeRuntime:
         self._trace_seq += 1
         source = identity or self.identity()
         source_turn_id = self._identity_turns.get(source, self.last_turn_id)
-        item = {"trace_seq": self._trace_seq, "kind": kind, "episode_id": source[0],
-                "agent_step_id": source[1], "context_version": source[2],
+        item = {"trace_seq": self._trace_seq, "kind": kind, "conversation_id": source[0],
+                "trace_id": source[1], "epoch": source[2],
                 "turn_id": source_turn_id if turn_id is None else turn_id,
                 "at": time.time(), **payload}
         self.trace.append(item)
@@ -227,7 +233,15 @@ class AgentEpisodeRuntime:
         return self.episode_id, self.agent_step_id, self.context_version
 
     def valid(self, identity):
-        return not self.closed and self.episode_id is not None and identity == self.identity()
+        # decision IDs are trace correlation only.  A task is current solely
+        # when its source turn and epoch still name the live semantic world.
+        turn_id = self._identity_turns.get(identity)
+        return (not self.closed and self.episode_id is not None and turn_id is not None
+                and self.conversation.is_current(turn_id, identity[2]))
+
+    def advance_epoch(self, reason: EpochReason) -> int:
+        self.context_version = self.conversation.advance_epoch(reason)
+        return self.context_version
 
     def _refresh_protocol(self):
         visible: list[dict] = []
@@ -288,6 +302,18 @@ class AgentEpisodeRuntime:
             return message
         projected = dict(message)
         if projected.get("role") == "tool":
+            content = projected.get("content")
+            try:
+                value = json.loads(content) if isinstance(content, str) else None
+            except (TypeError, ValueError):
+                value = None
+            if isinstance(value, dict):
+                # Tool-call pairing is provider protocol, not a licence to
+                # reveal the runtime objects that authorised it to the model.
+                for key in ("conversation_id", "turn_id", "speech_id", "epoch", "episode_id",
+                            "decision_id", "agent_step_id", "context_version", "generation_id", "input_revision"):
+                    value.pop(key, None)
+                projected["content"] = json.dumps(value, ensure_ascii=False)
             projected["content"] = cls._compact_tool_result(projected.get("content"))
         elif isinstance(projected.get("content"), str) and len(projected["content"]) > cls.CONTEXT_ASSISTANT_CONTENT_CHARS:
             projected["content"] = projected["content"][:cls.CONTEXT_ASSISTANT_CONTENT_CHARS] + "…[truncated]"
@@ -415,13 +441,13 @@ class AgentEpisodeRuntime:
             return self.episode_id
         if not text or not text.strip():
             return None
-        self.episode_id = uuid4().hex
+        self.episode_id = self.conversation.conversation_id
         self.state = "WAITING_EVENT"
         self.inputs.clear()
         self._exchanges.clear()
         self.protocol.clear()
         self._intent_version = 0
-        self.context_version = 0
+        self.context_version = self.conversation.epoch
         self.context_chars = 0
         self.context_token_estimate = 0
         self.context_usage_percent = 0.0
@@ -443,7 +469,7 @@ class AgentEpisodeRuntime:
         return None
 
     async def _begin_output(self, identity, input_id, emotion):
-        """Authorise one V0.4 speech item through the unified queue."""
+        """Authorise one V0.5 speech item through the unified queue."""
         return await self.output.begin(identity, input_id, emotion=emotion)
 
     def _wake(self, kind):
@@ -576,7 +602,7 @@ class AgentEpisodeRuntime:
                         oldest = next(iter(self.input_finished_at))
                         self.input_finished_at.pop(oldest, None)
         if changed:
-            self.context_version += 1
+            self.advance_epoch(EpochReason.INPUT_REFINED if kind == "USER_INPUT_REFINED" else EpochReason.INPUT_FINALIZED)
             self._intent_version += 1
             self._refresh_protocol()
             self.output.invalidate("stale")
@@ -602,7 +628,7 @@ class AgentEpisodeRuntime:
             self.silence_task = None
         if speaking is True or speaking is None:
             # Onset invalidates actions even before ASR has produced a word.
-            self.context_version += 1
+            self.advance_epoch(EpochReason.USER_INTERRUPTED)
             self.output.invalidate("interrupted" if speaking else "input_unavailable")
             if self.pending_prefill:
                 await self.clear_prefill(reason="stale")
@@ -693,7 +719,7 @@ class AgentEpisodeRuntime:
         # model identity.  Admit the complete group atomically so one fast
         # search cannot invalidate a slower sibling from the same request.
         speculative = batch["speculative"]
-        self.context_version += 1
+        self.advance_epoch(EpochReason.TOOL_RESULT_ACCEPTED)
         self.output.invalidate("stale")
         self._record_exchange(exchange, identity, speculative=speculative)
         for call in batch["calls"]:
@@ -794,16 +820,17 @@ class AgentEpisodeRuntime:
             return projected, changes
 
     def messages(self, kinds):
-        snapshot = {"inputs": self._context_inputs(), "events": sorted(kinds),
-                    "user_speaking": self.user_speaking,
-                    "speech_outputs": [o for o in self._context_outputs()
-                                       if o.get("episode_id", self.episode_id) == self.episode_id],
-                    "context_version": self.context_version}
-        # Keep complete historical exchanges before the newest input snapshot;
-        # this prevents an old speculative result from appearing to answer a
-        # newer intent merely because it was appended later in the list.
-        messages = ([{"role": "system", "content": PROMPT}, *self._project_protocol(self.protocol),
-                     {"role": "user", "content": json.dumps(snapshot, ensure_ascii=False)}])
+        current = self.inputs.get(self.last_turn_id or "", {})
+        semantic = CurrentInput(
+            text=str(current.get("refined_text") or current.get("text") or ""),
+            finalized=bool(current.get("final")), user_speaking=self.user_speaking,
+            recent_events=tuple(sorted(kinds)),
+        )
+        # Ledger is the conversation source of truth.  Retained complete tool
+        # exchanges are request-local protocol continuations only.
+        messages = ([{"role": "system", "content": PROMPT},
+                     *self.context_projector.project(self.ledger, semantic),
+                     *self._project_protocol(self.protocol)])
         self._update_context_metrics(messages)
         return messages
 
@@ -832,8 +859,7 @@ class AgentEpisodeRuntime:
                                            "context_token_estimate": self.context_token_estimate,
                                            "provider_prompt_tokens": self.provider_prompt_tokens,
                                            "context_usage_percent": round(self.context_usage_percent, 1),
-                                           "episode_id": identity[0], "agent_step_id": identity[1],
-                                           "context_version": identity[2]})
+                                           "conversation_id": identity[0], "epoch": identity[2]})
             assembler, parser = ToolCallAssembler(), SpeechArgumentStream()
             speech_index = None
             argument_cursor = 0
@@ -859,8 +885,8 @@ class AgentEpisodeRuntime:
                             reasoning.append(item["text"])
                             if sum(map(len, reasoning)) > 65536:
                                 raise ValueError("assistant reasoning too large")
-                            self.last_reasoning = {"episode_id": identity[0], "agent_step_id": identity[1],
-                                                   "context_version": identity[2], "text": "".join(reasoning)}
+                            self.last_reasoning = {"conversation_id": identity[0], "epoch": identity[2],
+                                                   "text": "".join(reasoning)}
                             await self.emit("agent.reasoning", dict(self.last_reasoning))
                         elif item["type"] == "usage":
                             usage = item.get("usage") or {}
@@ -1047,7 +1073,7 @@ class AgentEpisodeRuntime:
                 result = outcome["result"]
                 exchange.append({"role": "tool", "tool_call_id": call["id"],
                                  "content": json.dumps(result, ensure_ascii=False)})
-            self.context_version += 1
+            self.advance_epoch(EpochReason.TOOL_RESULT_ACCEPTED)
             self.output.invalidate("stale")
             identity = self.identity()
             self._identity_turns[identity] = source_turn_id

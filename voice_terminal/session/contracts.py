@@ -93,9 +93,7 @@ class ToolExchange:
 
     def context_payload(self) -> dict[str, Any]:
         return {"source": self.source, "tool": self.name, "arguments": self.arguments,
-                "executed_at": self.executed_at, "episode_id": self.episode_id,
-                "decision_id": self.decision_id, "context_version": self.context_version,
-                "result": self.result}
+                "executed_at": self.executed_at, "result": self.result}
 
 
 @dataclass(frozen=True)

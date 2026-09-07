@@ -16,14 +16,14 @@ logger = logging.getLogger(__name__)
 
 
 class SpeechHandle:
-    def __init__(self, owner, identity, turn_id, generation, emotion, *, kind="formal"):
+    def __init__(self, owner, identity, turn_id, _queue_order, emotion, *, kind="formal"):
         self.owner, self.identity, self.turn_id = owner, identity, turn_id
         self.speech_id = uuid4().hex
         self.emotion_requested = emotion
         self.emotion_applied = emotion
         self.kind = kind
         self.queue = asyncio.Queue(maxsize=32)
-        self.workspace = TurnWorkspace(turn_id, generation_id=generation, committed=True)
+        self.workspace = TurnWorkspace(turn_id, epoch=identity[2], phase="FINALIZING", committed=True)
         self.reason = None
         self.snapshot = None
         self.text = ""
@@ -104,26 +104,23 @@ class EpisodeSpeechOutput(SpeechPipeline):
         h = self.handle
         if not h or h.task.done():
             return None
-        return {"speech_id": h.speech_id, "episode_id": h.identity[0], "agent_step_id": h.identity[1],
-                "context_version": h.identity[2], "input_id": h.turn_id,
-                "generation_id": h.workspace.generation_id, "text": h.text,
+        return {"speech_id": h.speech_id, "conversation_id": h.identity[0], "trace_id": h.identity[1],
+                "turn_id": h.turn_id, "epoch": h.workspace.epoch, "text": h.text,
                 "status": self.status, "kind": h.kind, "emotion_requested": h.emotion_requested,
                 "emotion_applied": h.emotion_applied}
 
     @property
     def queue_snapshot(self):
         return [{"speech_id": item.speech_id, "kind": item.kind, "text": item.text,
-                 "episode_id": item.identity[0], "agent_step_id": item.identity[1],
-                 "context_version": item.identity[2], "input_id": item.turn_id,
+                 "conversation_id": item.identity[0], "trace_id": item.identity[1],
+                 "turn_id": item.turn_id, "epoch": item.workspace.epoch,
                  "status": "QUEUED"}
                 for item in self._pending if not item.reason and not item.task.done()]
 
     def _valid(self, token):
         h, r = self.handle, self.runtime
         return bool(h and h.workspace.token == token and not h.reason and r and not r.closed
-                    and r.episode_id == h.identity[0] and r.agent_step_id == h.identity[1]
-                    and r.context_version == h.identity[2]
-                    and r.user_speaking is False)
+                    and r.valid(h.identity) and r.user_speaking is False)
 
     async def _await_tts_cancel_barrier(self):
         # begin() has already joined cleanup of the preceding transaction.
@@ -133,17 +130,15 @@ class EpisodeSpeechOutput(SpeechPipeline):
         h = self.handle
         if h:
             await self.runtime.emit("speech.progress", {
-                "speech_id": h.speech_id, "episode_id": h.identity[0], "agent_step_id": h.identity[1],
-                "context_version": h.identity[2], "turn_id": h.turn_id,
-                "generation_id": h.workspace.generation_id, "event": kind, **payload})
+                "speech_id": h.speech_id, "conversation_id": h.identity[0], "turn_id": h.turn_id,
+                "epoch": h.workspace.epoch, "event": kind, **payload})
 
     async def _text_delta(self, h, text):
         if not text:
             return
         await self.runtime.emit("speech.text_delta", {
-            "speech_id": h.speech_id, "episode_id": h.identity[0], "agent_step_id": h.identity[1],
-            "context_version": h.identity[2], "input_id": h.turn_id,
-            "generation_id": h.workspace.generation_id, "text_delta": text,
+            "speech_id": h.speech_id, "conversation_id": h.identity[0], "turn_id": h.turn_id,
+            "epoch": h.workspace.epoch, "text_delta": text,
             "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
         })
 
@@ -174,9 +169,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
         self._pending.append(h)
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain(), name="speech-queue")
-        await self.runtime.emit("speech.queued", {"speech_id": h.speech_id, "episode_id": identity[0],
-                                 "agent_step_id": identity[1], "context_version": identity[2],
-                                 "input_id": turn_id, "kind": kind, "text": h.text, "status": "QUEUED"})
+        await self.runtime.emit("speech.queued", {"speech_id": h.speech_id, "conversation_id": identity[0],
+                                 "turn_id": turn_id, "epoch": identity[2], "kind": kind, "text": h.text, "status": "QUEUED"})
         await asyncio.sleep(0)
         return h
 
@@ -332,9 +326,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 input_to_playback = max(0, round((timings["playback"] - input_finished_at) * 1000))
             def elapsed(a, b):
                 return round((timings[b] - timings[a]) * 1000) if a in timings and b in timings else None
-            record = {"speech_id": h.speech_id, "episode_id": h.identity[0], "agent_step_id": h.identity[1],
-                       "context_version": h.identity[2], "input_id": h.turn_id,
-                       "generation_id": h.workspace.generation_id, "text": h.text,
+            record = {"speech_id": h.speech_id, "conversation_id": h.identity[0], "trace_id": h.identity[1],
+                       "turn_id": h.turn_id, "epoch": h.workspace.epoch, "text": h.text,
                        "kind": h.kind, "queued_at": h.queued_at,
                       "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
                       "emotion_transport": getattr(self.tts, "emotion_transport", "voice_setting"),

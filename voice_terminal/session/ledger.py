@@ -17,16 +17,16 @@ class SessionLedgerEntry:
 
 @dataclass
 class InputRecord:
-    """The V0.4 UI projection for one finalized user input.
+    """The V0.5 UI projection for one finalized user turn.
 
     Context entries and UI records deliberately share this ledger instead of
     being maintained by a legacy facade with a second history implementation.
     """
 
-    input_id: str
+    turn_id: str
     transcript: str
     completed_at: str = field(default_factory=utc_now_iso)
-    episode_id: str | None = None
+    conversation_id: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
     delivery: dict[str, Any] = field(default_factory=dict)
 
@@ -46,9 +46,9 @@ class SessionLedger:
         self.entries.clear()
         self.records.clear()
 
-    def commit_input(self, input_id: str, text: str, *, details: dict[str, Any] | None = None) -> None:
+    def commit_input(self, turn_id: str, text: str, *, details: dict[str, Any] | None = None) -> None:
         if text.strip():
-            self.entries.append(SessionLedgerEntry("input", text, {"input_id": input_id, **(details or {})}))
+            self.entries.append(SessionLedgerEntry("input", text, {"turn_id": turn_id, **(details or {})}))
 
     def commit_delivery(self, speech_id: str, text: str, delivery: DeliveryReport) -> None:
         # The model must never treat text that never reached the user as shared knowledge.
@@ -62,6 +62,10 @@ class SessionLedger:
 
     def commit_tool(self, exchange: ToolExchange) -> None:
         self.entries.append(SessionLedgerEntry("tool", exchange.context_payload()))
+
+    def commit_semantic_event(self, kind: str, content: dict[str, Any] | None = None) -> None:
+        """Persist only conversation-meaningful events, never runtime diagnostics."""
+        self.entries.append(SessionLedgerEntry("event", {"kind": kind, **(content or {})}))
 
     def context_messages(self, current_input: str) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = [{"role": "system", "content": (
@@ -77,19 +81,21 @@ class SessionLedger:
                 messages.append({"role": "system", "content": "上一段语音被打断：" + json.dumps(entry.content, ensure_ascii=False)})
             elif entry.kind == "tool":
                 messages.append({"role": "system", "content": "工具来源：" + json.dumps(entry.content, ensure_ascii=False)})
+            elif entry.kind == "event":
+                messages.append({"role": "system", "content": "会话事件：" + json.dumps(entry.content, ensure_ascii=False)})
         if current_input.strip():
             messages.append({"role": "user", "content": current_input})
         return messages
 
     def append_record(self, record: dict[str, Any]) -> InputRecord:
         item = InputRecord(
-            input_id=str(record["input_id"]),
+            turn_id=str(record["turn_id"]),
             transcript=str(record.get("transcript") or ""),
-            episode_id=record.get("episode_id") if isinstance(record.get("episode_id"), str) else None,
+            conversation_id=record.get("conversation_id") if isinstance(record.get("conversation_id"), str) else None,
             details=dict(record.get("details") or {}),
             delivery=dict(record.get("delivery") or {}),
         )
-        self.records = [existing for existing in self.records if existing.input_id != item.input_id]
+        self.records = [existing for existing in self.records if existing.turn_id != item.turn_id]
         self.records.insert(0, item)
         del self.records[self.limit:]
         return item

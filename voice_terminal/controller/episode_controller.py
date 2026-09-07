@@ -27,6 +27,7 @@ class EpisodeController(RealtimeController):
 
     def _make_episode(self):
         runtime = AgentEpisodeRuntime(self.llm, self.registry, self.output, self._agent_event,
+                                      conversation=self.conversation, ledger=self.history,
                                       options=self.agent_options, tools_enabled=self.options.tools,
                                       prefill_enabled=self.prefill_enabled)
         self.output.runtime = runtime
@@ -69,9 +70,9 @@ class EpisodeController(RealtimeController):
         if kind == "transcript.segment":
             await self.episode.observe("USER_SEGMENT_UPDATED", turn_id=ws.turn_id,
                                        text="".join(s["text"] for s in ws.segments),
-                                       input_revision=ws.input_revision, generation_id=ws.generation_id)
+                                       epoch=ws.epoch)
         elif kind == "turn.endpoint_candidate":
-            key = (ws.turn_id, ws.input_revision, ws.speech_version)
+            key = (ws.turn_id, ws.epoch)
             if key != self._endpoint_context:
                 self._endpoint_context = key
                 await self.episode.observe("ENDPOINT_CANDIDATE", turn_id=ws.turn_id)
@@ -86,7 +87,7 @@ class EpisodeController(RealtimeController):
             h = self.output.handle
             progress = self.player.progress(h.workspace.playback_key) if self.player else {}
             evidence = {"identity": h.identity, "turn_id": h.turn_id, "speech_id": h.speech_id,
-                        "generation_id": h.workspace.generation_id, "vad_speech": bool(activity.is_speech),
+                        "epoch": h.workspace.epoch, "vad_speech": bool(activity.is_speech),
                         "near_voice": self._near_voice_activity(),
                         "protected_available": self._barge_in_protected_available(),
                         "duration_ms": decision.duration_ms, "reason": decision.reason,
@@ -131,8 +132,7 @@ class EpisodeController(RealtimeController):
             await self.episode.observe("USER_INPUT_FINALIZED", turn_id=ws.turn_id,
                                        text=ws.paraformer_final or ws.final_text,
                                        provisional_transcript=ws.paraformer_final, audio_cues=list(ws.audio_cues),
-                                       analysis=dict(ws.analysis), generation_id=ws.generation_id,
-                                       input_revision=ws.input_revision,
+                                       analysis=dict(ws.analysis), epoch=ws.epoch,
                                        input_finished_at=ws.timings.get("commit"))
             ws.episode_id = self.episode.episode_id
             if ws.episode_id:
@@ -174,15 +174,15 @@ class EpisodeController(RealtimeController):
         if ws.turn_id not in self._input_history_committed:
             self.history.commit_input(ws.turn_id, ws.final_text, details={"segments": list(ws.segments),
                                       "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis)})
-            record = self.history.append_record({"input_id": ws.turn_id, "transcript": ws.final_text,
-                                                 "delivery": delivery, "episode_id": ws.episode_id,
+            record = self.history.append_record({"turn_id": ws.turn_id, "transcript": ws.final_text,
+                                                 "delivery": delivery, "conversation_id": ws.episode_id,
                                                  "details": {"segments": list(ws.segments), "provisional_transcript": ws.paraformer_final,
                                                              "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis)}})
             self._input_history_committed.add(ws.turn_id)
         else:
-            record = next((item for item in self.history.records if item.input_id == ws.turn_id), None)
+            record = next((item for item in self.history.records if item.turn_id == ws.turn_id), None)
         await self._detail("turn.completed", transcript=ws.final_text, response="", latency={},
-                           delivery=delivery, status="completed", episode_id=ws.episode_id,
+                           delivery=delivery, status="completed", conversation_id=ws.episode_id,
                            completed_at=utc_now_iso(), details=record.details if record else {})
         await self._cancel_turn(reason="completed", record=False)
         await self._state_event(TerminalState.IDLE, listening=self.state.listening)
@@ -194,13 +194,13 @@ class EpisodeController(RealtimeController):
             await self._ensure_workspace_episode(ws)
             self.history.commit_input(ws.turn_id, ws.final_text or ws.raw_partial)
             record = self.history.append_record({
-                "input_id": ws.turn_id, "transcript": ws.final_text or ws.raw_partial,
+                "turn_id": ws.turn_id, "transcript": ws.final_text or ws.raw_partial,
                 "delivery": {"termination": reason, "status": "none"},
-                "episode_id": ws.episode_id,
+                "conversation_id": ws.episode_id,
             })
             self._input_history_committed.add(ws.turn_id)
             await self._detail("turn.completed", **{k: v for k, v in record.to_payload().items()
-                                                     if k != "input_id"})
+                                                     if k != "turn_id"})
         self.workspace = None
         self.turns.invalidate()
         self._active_input = False

@@ -52,14 +52,13 @@ class CurrentTurnAudioBuffer:
 @dataclass
 class TurnWorkspace:
     turn_id: str
+    epoch: int = 0
+    phase: str = "CAPTURING"
     # Episode ownership is captured when this audio turn first enters the
     # agent.  Cleanup must use this stable value even if the runtime has
     # already ended the Episode.
     episode_id: str | None = None
     started_at: float = field(default_factory=time.monotonic)
-    input_revision: int = 0
-    generation_id: int = 0
-    speech_version: int = 0
     committed: bool = False
     playback_started: bool = False
     hard_closed: bool = False
@@ -82,22 +81,21 @@ class TurnWorkspace:
 
     @property
     def token(self) -> tuple[str, int]:
-        return self.turn_id, self.generation_id
+        return self.turn_id, self.epoch
 
     @property
     def playback_key(self) -> str:
-        return f"{self.turn_id}:{self.generation_id}"
+        return f"{self.turn_id}:{self.epoch}"
 
     def freeze(self) -> tuple[str, int]:
-        self.generation_id += 1
         self.committed = False
+        self.phase = "FINALIZING"
         self.agent_phase = "FINAL"
         return self.token
 
-    def resume(self) -> None:
-        self.generation_id += 1
-        self.input_revision += 1
-        self.speech_version += 1
+    def resume(self, epoch: int) -> None:
+        self.epoch = epoch
+        self.phase = "CAPTURING"
         self.committed = False
         self.staged_response = ""
         self.final_text = ""
@@ -109,7 +107,7 @@ class TurnWorkspace:
 
     def snapshot(self) -> dict:
         return {
-            "episode_id": self.episode_id, "input_revision": self.input_revision, "generation_id": self.generation_id,
+            "conversation_id": self.episode_id, "turn_id": self.turn_id, "epoch": self.epoch, "phase": self.phase,
             "committed": self.committed, "agent_phase": self.agent_phase,
             "paraformer_final": self.paraformer_final, "refined_text": self.final_text,
             "segments": list(self.segments),

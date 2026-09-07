@@ -18,6 +18,7 @@ from ..core.events import event, utc_now_iso
 from ..core.state import TerminalState
 from ..kws.keywords import strip_wake_prefix
 from ..tts.alignment import DeliveryResolver
+from ..session.runtime import EpochReason
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class RealtimeController(SpeechPipeline, InputController):
     """Realtime input orchestration used by the session runtime."""
 
     def __init__(self, *, options: InputOptions, analysis=None, search: WebSearchTools | None = None, **kwargs) -> None:
+        self.conversation = kwargs.pop("conversation")
         super().__init__(**kwargs)
         self.options = options
         self.analysis = analysis or AnalysisClient(options.analysis_url)
@@ -70,7 +72,7 @@ class RealtimeController(SpeechPipeline, InputController):
         task.add_done_callback(done)
 
     def _valid(self, token: tuple[str, int]) -> bool:
-        return self.workspace is not None and self.workspace.token == token and self.turns.is_current(token[0])
+        return self.workspace is not None and self.workspace.token == token and self.conversation.is_current(*token)
 
     def _on_tool_status(self, name: str, status: str, reason: str) -> None:
         if name == "web_search" and "web_search" in self.state.services:
@@ -87,8 +89,7 @@ class RealtimeController(SpeechPipeline, InputController):
         if ws is None:
             return
         self.state.current.update(ws.snapshot(), turn_id=ws.turn_id, input_runtime=True)
-        await self._publish(event(type_, ws.turn_id, input_revision=ws.input_revision,
-                                  generation_id=ws.generation_id, workspace=ws.snapshot(), **payload))
+        await self._publish(event(type_, ws.turn_id, epoch=ws.epoch, workspace=ws.snapshot(), **payload))
 
     async def initialize(self) -> None:
         await super().initialize()
@@ -390,7 +391,7 @@ class RealtimeController(SpeechPipeline, InputController):
             return
 
         if activity.speech_started:
-            ws.speech_version += 1
+            ws.epoch = self.conversation.advance_epoch(EpochReason.USER_INTERRUPTED)
             self._last_candidate = 0
             if self._endpoint_task:
                 self._endpoint_task.cancel()
@@ -417,7 +418,8 @@ class RealtimeController(SpeechPipeline, InputController):
     async def _new_turn(self, frame: AudioFrame) -> None:
         turn_id = self.turns.begin()
         self.state.clear_current()
-        self.workspace = ws = TurnWorkspace(turn_id, started_at=frame.captured_at)
+        token = self.conversation.begin_turn(turn_id)
+        self.workspace = ws = TurnWorkspace(turn_id, epoch=token.epoch, started_at=frame.captured_at)
         self._begin_tool_scope(turn_id)
         ws.audio = CurrentTurnAudioBuffer(min(62000, self.options.max_turn_ms + max(1200, self.wake_preroll_ms)) * 16)
         for previous in self._recent:
@@ -467,7 +469,7 @@ class RealtimeController(SpeechPipeline, InputController):
         # gate atomically; otherwise the superseded answer could start while
         # the revised input is being recognized.
         self._stop_playback_snapshot(ws.playback_key)
-        ws.resume()  # Invalidate before cancelling or awaiting any operation.
+        ws.resume(self.conversation.advance_epoch(EpochReason.USER_RESUMED))
         stopped = self._stop_generation()
         if stopped:
             await asyncio.gather(*stopped, return_exceptions=True)
@@ -500,11 +502,11 @@ class RealtimeController(SpeechPipeline, InputController):
         await self._state_event(TerminalState.LISTENING, listening=True, turn_id=ws.turn_id)
 
     async def _endpoint(self, ws: TurnWorkspace, frame: AudioFrame) -> None:
-        version, token = ws.speech_version, ws.token
+        token = ws.token
         await self._detail("turn.endpoint_candidate", audio_end_sample=frame.end_sample)
         try:
             reply = await self.analysis.analyze("endpoint", ws.audio.tail(), *token, self.options.smart_timeout_ms)
-            if not self._valid(token) or ws.speech_version != version or not self._active_input:
+            if not self._valid(token) or not self._active_input:
                 return
             result = reply["result"]
             ws.analysis["endpoint"] = {**result, "status": "READY"}
@@ -524,6 +526,7 @@ class RealtimeController(SpeechPipeline, InputController):
             return
         ws = self.workspace
         self._active_input = False
+        ws.epoch = self.conversation.advance_epoch(EpochReason.INPUT_FINALIZED)
         token = ws.freeze()
         if ws.hard_closed and self._speech_start_sample is not None:
             self._resume_started = frame.end_sample
@@ -641,7 +644,6 @@ class RealtimeController(SpeechPipeline, InputController):
         result = self.segmenter.feed(text, pause=pause)
         if result is None or ws is None:
             return
-        ws.input_revision += 1
         ws.segments = [{"text": s} for s in result["segments"]]
         ws.timings.setdefault("first_segment", time.monotonic())
         await self._detail("transcript.segment", **result)
