@@ -3,9 +3,11 @@ from __future__ import annotations
 import unittest
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import patch
 from types import SimpleNamespace
 
+from voice_terminal.config import load_config
 from voice_terminal.providers.minimax_tts import MiniMaxTtsError, MiniMaxTtsSession, MiniMaxTtsClient
 
 
@@ -26,6 +28,30 @@ class MiniMaxTtsAudioTests(unittest.TestCase):
             timeout_ms=15000,
         )
         self.assertGreaterEqual(client.receive_timeout_seconds, 120)
+
+    def test_start_payload_includes_selected_agent_emotion(self) -> None:
+        client = MiniMaxTtsClient(
+            base_url="https://example.invalid", websocket_path="/ws", model="speech-2.8-hd",
+            api_key="test", transport="websocket_bidi", default_emotion="calm",
+        )
+        self.assertEqual(client.start_payload("happy")["voice_setting"]["emotion"], "happy")
+        self.assertEqual(client.start_payload("not-valid")["voice_setting"]["emotion"], "calm")
+
+    def test_emotion_transport_rejection_disables_extension_and_keeps_neutral_payload(self) -> None:
+        client = MiniMaxTtsClient(
+            base_url="https://example.invalid", websocket_path="/ws", model="speech-2.8-hd",
+            api_key="test", transport="websocket_bidi",
+        )
+        client.disable_emotion_transport("unknown voice_setting.emotion")
+        self.assertEqual(client.emotion_status, "unsupported")
+        self.assertEqual(client.applied_emotion, "calm")
+        self.assertNotIn("emotion", client.start_payload("happy")["voice_setting"])
+
+    def test_v03_emotion_configuration_is_loaded(self) -> None:
+        config = load_config(Path("config/default.yaml"), Path("config/v0.3.yaml"))
+        self.assertEqual(config.tts.emotion_mode, "agent")
+        self.assertEqual(config.tts.default_emotion, "calm")
+        self.assertEqual(config.tts.emotion_transport, "voice_setting")
 
 
 class MiniMaxTtsProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -187,3 +213,53 @@ class MiniMaxTtsProtocolTests(unittest.IsolatedAsyncioTestCase):
         session._error = MiniMaxTtsError("receiver failed")
         with self.assertRaisesRegex(MiniMaxTtsError, "receiver failed"):
             await session.send_text("你好")
+
+    async def test_confirmed_cancel_makes_bidi_connection_non_reusable(self) -> None:
+        """A cancelled Bidi task must not be used for a later speak call."""
+        session = MiniMaxTtsSession(SimpleNamespace(
+            receive_timeout_seconds=1, transport="websocket_bidi", sample_rate=32000,
+        ))
+
+        class Socket:
+            calls = 0
+
+            async def recv(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return json.dumps({"event": "task_canceled"})
+                raise RuntimeError("synthetic transport close")
+
+            async def close(self):
+                pass
+
+        session._socket = Socket()
+        await session._receive_loop()
+        self.assertTrue(session.generation_finished)
+        self.assertTrue(session._connection_dead)
+        self.assertFalse(session.reusable)
+        await session.close()
+
+    async def test_confirmed_flush_makes_bidi_connection_non_reusable(self) -> None:
+        """Each flushed voice output gets an isolated next Bidi session."""
+        session = MiniMaxTtsSession(SimpleNamespace(
+            receive_timeout_seconds=1, transport="websocket_bidi", sample_rate=32000,
+        ))
+
+        class Socket:
+            calls = 0
+
+            async def recv(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return json.dumps({"event": "task_flushed"})
+                raise RuntimeError("synthetic transport close")
+
+            async def close(self):
+                pass
+
+        session._socket = Socket()
+        await session._receive_loop()
+        self.assertTrue(session.generation_finished)
+        self.assertTrue(session._connection_dead)
+        self.assertFalse(session.reusable)
+        await session.close()

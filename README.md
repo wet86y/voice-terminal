@@ -2,7 +2,7 @@
 
 Voice Terminal 是一个运行在 Windows 上的本地实时语音终端。浏览器只负责控制和展示，麦克风、VAD、ASR、LLM、TTS、播放器和延迟测量都由本地 Voice Server 负责。
 
-当前状态（2026-09-06）：V0.3 Agent Runtime 已完成软件实现、正确性修复和自动化验收，仍通过独立配置启用；默认配置与 v0.1/v0.2 路径保持不变。V0.3 在现有双流式 TTS、Bidi 取消屏障、受保护真人插话、播放快照和传达历史上增加跨 Turn Episode、合法等待、原生 `speak` 门控、只读工具缓存和有界诊断。当前自动化为 Python 160 项、前端 13 项，类型检查、构建、编译检查和差异检查通过。真实设备耳机/扬声器与至少 20 条自然语音的验收材料已经准备，但仍待真人执行；真实服务复验若缺少凭据或服务不可用会单独记录为未完成证据。
+当前状态（2026-09-07）：V0.3 Agent Runtime 已完成软件实现、正确性修复和自动化验收，仍通过独立配置启用；默认配置与 v0.1/v0.2 路径保持不变。V0.3 在现有双流式 TTS、Bidi 取消屏障、受保护真人插话、播放快照和传达历史上增加跨 Turn Episode、合法等待、原生 `speak` 门控、只读工具缓存和有界诊断。当前自动化为 Python 170 项、前端 14 项；类型检查、构建、Python 编译检查和差异检查通过。真实设备耳机/扬声器与至少 20 条自然语音的验收材料已经准备，但仍待真人执行；真实服务复验若缺少凭据或服务不可用会单独记录为未完成证据。
 
 ## 能力边界
 
@@ -137,14 +137,16 @@ python -m voice_terminal.analysis.replay `
 
 完整当前证据见 [项目审计报告](docs/project-audit.md)、[V0.3 验证记录](docs/v0.3-validation.md) 和 [V0.3 规格](docs/v0.3-spec.md)。主要结论：
 
-- Python 160 项测试通过，前端 13 项测试通过。
+- Python 170 项测试通过，前端 14 项测试通过。
 - `npm run typecheck`、`npm run build`、Python compileall 和 `git diff --check` 通过。
 - 本机 ASR Worker health 为 READY，真实回放产生 partial/final，Analysis 两路可用。
 - v0.2 的轮次、generation、revision、工具预取、Bidi/旧 TTS 调度、播放快照、受保护插话、传达历史、断连恢复、重连清理和慢订阅者边界已有确定性回归。
 - v0.2 已通过真实 MiniMax Bidi 的短文本 smoke test，但仍未完成完整多轮、真实设备和自然语音统计验收，因此默认配置暂保持 v0.1。
 - V0.3 专项覆盖等待、精修语义、工具缓存准入、只读工具并行与网络搜索后台预取、single-flight、Speak 参数流、播放竞态、历史归属和资源清理；软件验收已完成，真实设备与自然语音仍待执行。
 
-V0.3 上下文上限说明：`config/v0.3.yaml` 的 `v03.max_context_chars: 64000` 是发送给模型的 JSON `messages` 字符数上限，不是 64,000 token。控制台的 AGENT EPISODE 面板显示本次请求的实际字符数、上限、粗略 token 估算和百分比；粗略估算只用于阅读。输入约束会保留，音频元数据、已传达输出和工具结果在模型上下文中采用有界投影；搜索缓存的完整结果不会无条件堆入新意图。
+V0.3 上下文预算说明：`config/v0.3.yaml` 的 `v03.max_context_tokens: 524288` 是模型输入的本地 token 估算预算。运行时以 `o200k_base` 估算包含 messages、工具 schema 和请求结构的有效载荷；它不是 DeepSeek 官方 tokenizer 的精确读数。预算超出时，运行时先缩短工具结果、再按完整工具调用—结果组和旧输入的顺序压缩本次请求投影，当前输入会保留，正常多轮对话不会因此锁死。AGENT EPISODE 面板同时显示 token 估算、预算百分比和 JSON 字符数调试值。
+
+V0.3 的语音正文只来自已授权的原生 `speak` 工具。`speak` 可传可选情绪（`calm`、`happy`、`sad`、`angry`、`fearful`、`disgusted`、`surprised`）。为避免 MiniMax Bidi 在 `task_flush` 或 `task_canceled` 后确认结束却不再返回 PCM，独立输出完成或取消后会关闭该 Bidi 会话；下一次输出用带当前情绪的全新会话。控制台右上角的“重置会话”会取消当前输入和播放、创建干净 Episode，同时保留历史 Turn、Trace 与传达记录。
 
 运行自动化检查：
 

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from .realtime_controller import RealtimeController
 from .episode_output import EpisodeSpeechOutput
 from ..agent.episode import AgentEpisodeRuntime
 from ..core.events import VoiceEvent, utc_now_iso
 from ..core.state import TerminalState
+
+
+logger = logging.getLogger(__name__)
 
 
 class EpisodeController(RealtimeController):
@@ -16,6 +20,7 @@ class EpisodeController(RealtimeController):
         self.output = EpisodeSpeechOutput(self)
         self.episode = self._make_episode()
         self._endpoint_context = None
+        self._barge_trace_state = None
         self.episode_history: dict[str, str] = {}
         self._input_history_committed: set[str] = set()
 
@@ -72,15 +77,45 @@ class EpisodeController(RealtimeController):
             decision = self.barge_in_gate.feed(activity, now=frame.captured_at,
                                                near_voice=self._near_voice_activity(),
                                                protected_available=self._barge_in_protected_available())
+            h = self.output.handle
+            progress = self.player.progress(h.workspace.playback_key) if self.player else {}
+            evidence = {"identity": h.identity, "turn_id": h.turn_id, "speech_id": h.speech_id,
+                        "generation_id": h.workspace.generation_id, "vad_speech": bool(activity.is_speech),
+                        "near_voice": self._near_voice_activity(),
+                        "protected_available": self._barge_in_protected_available(),
+                        "duration_ms": decision.duration_ms, "reason": decision.reason,
+                        "played_ms": progress.get("played_ms"), "remaining_ms": progress.get("remaining_ms")}
+            marker = (decision.candidate, decision.confirmed, decision.reason)
+            previous = self._barge_trace_state
+            if decision.confirmed and marker != previous:
+                await self.episode.log("BARGE_IN_CONFIRMED", **evidence)
+                logger.info("episode.barge_in kind=confirmed speech_id=%s vad_speech=%s near_voice=%s protected_available=%s duration_ms=%s reason=%s played_ms=%s remaining_ms=%s",
+                            h.speech_id, evidence["vad_speech"], evidence["near_voice"], evidence["protected_available"],
+                            evidence["duration_ms"], evidence["reason"], evidence["played_ms"], evidence["remaining_ms"])
+            elif decision.candidate and not (previous and previous[0]):
+                await self.episode.log("BARGE_IN_CANDIDATE_STARTED", **evidence)
+                logger.info("episode.barge_in kind=candidate_started speech_id=%s vad_speech=%s near_voice=%s protected_available=%s duration_ms=%s reason=%s",
+                            h.speech_id, evidence["vad_speech"], evidence["near_voice"], evidence["protected_available"],
+                            evidence["duration_ms"], evidence["reason"])
+            elif not decision.candidate and previous and previous[0]:
+                await self.episode.log("BARGE_IN_CANDIDATE_CLEARED", **evidence)
+                logger.info("episode.barge_in kind=candidate_cleared speech_id=%s duration_ms=%s reason=%s",
+                            h.speech_id, evidence["duration_ms"], evidence["reason"])
+            elif bool(activity.is_speech) and decision.reason in {"not_near_voice", "protected_audio_unavailable"} and marker != previous:
+                await self.episode.log("BARGE_IN_REJECTED", **evidence)
+                logger.info("episode.barge_in kind=rejected speech_id=%s vad_speech=%s near_voice=%s protected_available=%s duration_ms=%s reason=%s",
+                            h.speech_id, evidence["vad_speech"], evidence["near_voice"], evidence["protected_available"],
+                            evidence["duration_ms"], evidence["reason"])
+            self._barge_trace_state = marker
             if not decision.confirmed:
                 # Keep microphone/VAD running; echo/noise must not create a user turn.
                 return None
-            h = self.output.handle
             if self.player:
                 progress = self.player.progress(h.workspace.playback_key)
                 h.overlap_start_ms = max(0, int(progress.get("output_estimated_ms", 0)) - decision.duration_ms)
             await self.episode.speech_activity(True)
             self.barge_in_gate.reset()
+            self._barge_trace_state = None
         else:
             await self.episode.speech_activity(bool(activity.is_speech))
         return activity
@@ -202,6 +237,22 @@ class EpisodeController(RealtimeController):
         if not self.episode.closed:
             await self.episode.stop()
         await super().stop_listening()
+
+    async def reset_session(self):
+        """End the active Agent task while keeping microphone listening alive."""
+        if self.workspace is not None:
+            await self._cancel_turn(reason="reset", record=True)
+        if not self.episode.closed:
+            await self.episode.end("reset")
+        self._endpoint_context = None
+        self.barge_in_gate.reset()
+        if self.vad is not None:
+            self.vad.reset()
+        if self.audio_processor is not None:
+            self.audio_processor.reset()
+        self.state.clear_current()
+        self.state.agent = {}
+        await self._state_event(TerminalState.IDLE, listening=self.state.listening)
 
     async def close(self):
         if self.workspace is not None:

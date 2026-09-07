@@ -126,6 +126,9 @@ class TtsConfig:
     audio_cache_max_bytes: int = 64 * 1024 * 1024
     cancel_timeout_ms: int = 2000
     keepalive_seconds: int = 30
+    emotion_mode: str = "agent"
+    default_emotion: str = "calm"
+    emotion_transport: str = "voice_setting"
 
     def __post_init__(self) -> None:
         if self.transport not in {"websocket", "websocket_bidi"}:
@@ -138,6 +141,10 @@ class TtsConfig:
             raise ValueError("tts.subtitle_type is invalid")
         if self.audio_cache_max_bytes <= 0 or self.cancel_timeout_ms <= 0 or self.keepalive_seconds <= 0:
             raise ValueError("tts cache, cancel timeout, and keepalive values must be positive")
+        if self.emotion_mode not in {"off", "agent"}:
+            raise ValueError("tts.emotion_mode must be off or agent")
+        if self.emotion_transport not in {"voice_setting"}:
+            raise ValueError("tts.emotion_transport is invalid")
 
     @property
     def effective_scheduling(self) -> str:
@@ -334,6 +341,9 @@ class AppConfig:
                 audio_cache_max_bytes=int(_number(tts.get("audio_cache_max_bytes"), 64 * 1024 * 1024)),
                 cancel_timeout_ms=int(_number(tts.get("cancel_timeout_ms"), 2000)),
                 keepalive_seconds=int(_number(tts.get("keepalive_seconds"), 30)),
+                emotion_mode=_string(tts.get("emotion_mode"), "agent"),
+                default_emotion=_string(tts.get("default_emotion"), "calm"),
+                emotion_transport=_string(tts.get("emotion_transport"), "voice_setting"),
             ),
             text_bridge=TextBridgeConfig(
                 min_chars=int(_number(bridge.get("min_chars"), 8)),

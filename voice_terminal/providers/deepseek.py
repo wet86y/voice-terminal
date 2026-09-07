@@ -33,6 +33,7 @@ class DeepSeekClient:
             "model": self.model,
             "messages": [dict(message) for message in messages],
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if self.thinking == "disabled":
             payload["thinking"] = {"type": "disabled"}
@@ -108,6 +109,9 @@ class DeepSeekClient:
                             parsed = json.loads(data)
                         except json.JSONDecodeError:
                             continue
+                        usage = parsed.get("usage") if isinstance(parsed, dict) else None
+                        if isinstance(usage, dict):
+                            yield {"type": "usage", "usage": usage}
                         choices = parsed.get("choices") if isinstance(parsed, dict) else None
                         if not isinstance(choices, list) or not choices:
                             continue

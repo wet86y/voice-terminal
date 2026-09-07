@@ -197,6 +197,9 @@ class VoiceRuntime:
                 audio_cache_max_bytes=self.config.tts.audio_cache_max_bytes,
                 cancel_timeout_ms=self.config.tts.cancel_timeout_ms,
                 keepalive_seconds=self.config.tts.keepalive_seconds,
+                emotion_mode=self.config.tts.emotion_mode,
+                default_emotion=self.config.tts.default_emotion,
+                emotion_transport=self.config.tts.emotion_transport,
             )
             self.state.current.update(
                 tts_transport=self.config.tts.transport,
@@ -272,6 +275,11 @@ class VoiceRuntime:
             if self.controller is not None:
                 await self.controller.stop_listening()
 
+    async def reset_session(self) -> None:
+        async with self._session_lock:
+            if self.controller is not None and hasattr(self.controller, "reset_session"):
+                await self.controller.reset_session()
+
     async def close(self) -> None:
         if self.controller is not None:
             await self.controller.close()
@@ -341,6 +349,8 @@ def create_app(runtime: VoiceRuntime, *, lifespan: Any = None) -> Any:
                     await runtime.start_listening()
                 elif command == "session.stop":
                     await runtime.stop_listening()
+                elif command == "session.reset":
+                    await runtime.reset_session()
                 else:
                     await _send_error(websocket, sequencer, "UNKNOWN_COMMAND", f"不支持的命令：{command}", None, True)
         except WebSocketDisconnect:
@@ -358,7 +368,13 @@ def create_app(runtime: VoiceRuntime, *, lifespan: Any = None) -> Any:
 async def _forward_events(websocket: Any, subscription: Any, sequencer: ProtocolSequencer) -> None:
     try:
         async for value in subscription:
-            logger.debug("websocket.event type=%s turn_id=%s", value.type, value.turn_id)
+            if value.type == "speech.completed":
+                payload = value.payload if isinstance(value.payload, dict) else {}
+                delivery = payload.get("delivery") if isinstance(payload.get("delivery"), dict) else {}
+                logger.info("websocket.speech_completed turn_id=%s speech_id=%s status=%s delivery=%s",
+                            value.turn_id, payload.get("speech_id"), payload.get("status"), delivery.get("status"))
+            else:
+                logger.debug("websocket.event type=%s turn_id=%s", value.type, value.turn_id)
             await websocket.send_json(sequencer.envelope(value))
     except asyncio.CancelledError:
         raise

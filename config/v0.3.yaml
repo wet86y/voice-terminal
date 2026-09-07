@@ -19,6 +19,9 @@ tts:
   audio_cache_max_bytes: 67108864
   cancel_timeout_ms: 2000
   keepalive_seconds: 30
+  emotion_mode: agent
+  default_emotion: calm
+  emotion_transport: voice_setting
 
 # Keep streaming TTS sentence-oriented.  Commas and enumeration pauses remain
 # in the text but do not create a burst of tiny task_continue frames.
@@ -44,7 +47,7 @@ v03:
   aggressive_interval_ms: 400
   silence_ms: 5500
   max_requests_per_step: 5
-  # Provider-facing JSON messages character limit; this is not a token limit.
-  max_context_chars: 64000
+  # Estimated model-input token budget. This leaves headroom in the provider window.
+  max_context_tokens: 524288
   trace_limit: 200
   output_limit: 32

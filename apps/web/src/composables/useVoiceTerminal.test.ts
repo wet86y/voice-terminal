@@ -435,4 +435,35 @@ describe('v0.3 episode protocol', () => {
     socket.push(envelope('agent.episode', 7, null, episode(null, 0)))
     expect(terminal.speechProgress.value).toBeNull()
   })
+
+  it('renders only authorized v0.3 speech text and reset clears live state without deleting audit history', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push(envelope('agent.episode', 1, null, episode('ep', 2, 'step-2')))
+    socket.push(envelope('assistant.delta', 2, 'input', { text_delta: '普通 content，不能当朗读正文' }))
+    socket.push(envelope('speech.text_delta', 3, 'input', {
+      speech_id: 'speech-2', episode_id: 'ep', agent_step_id: 'step-2', context_version: 2,
+      turn_id: 'input', generation_id: 7, text_delta: '已授权的第一段',
+      emotion_requested: 'happy', emotion_applied: 'happy',
+    }))
+    socket.push(envelope('speech.text_delta', 4, 'input', {
+      speech_id: 'speech-2', episode_id: 'ep', agent_step_id: 'step-2', context_version: 2,
+      turn_id: 'input', generation_id: 7, text_delta: '语音文本。',
+    }))
+    expect(terminal.activeSpeech.value?.text).toBe('已授权的第一段语音文本。')
+    // Legacy content remains a debug field; the response panel selects
+    // activeSpeech, so it cannot impersonate the authorized voice text.
+    expect(terminal.current.assistant_text).toBe('普通 content，不能当朗读正文')
+    socket.push(envelope('agent.trace', 5, 'input', {
+      trace_seq: 1, kind: 'SPEAK_ACCEPTED', episode_id: 'ep', agent_step_id: 'step-2', context_version: 2,
+    }))
+    expect(terminal.resetSession()).toBe(true)
+    expect(JSON.parse(socket.sent.at(-1) || '{}')).toMatchObject({ command: 'session.reset' })
+    expect(terminal.activeSpeech.value).toBeNull()
+    expect(terminal.agentTrace.value).toHaveLength(1)
+    socket.push(envelope('speech.text_delta', 6, 'input', {
+      speech_id: 'old-speech', episode_id: 'old', agent_step_id: 'old-step', context_version: 1,
+      turn_id: 'input', generation_id: 1, text_delta: '过期文本',
+    }))
+    expect(terminal.activeSpeech.value).toBeNull()
+  })
 })

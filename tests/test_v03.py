@@ -119,6 +119,19 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(parser.feed('后续文字。"}'), '后续文字。')
         self.assertEqual(parser.finish(), '可以提前开始播放。后续文字。')
 
+    def test_emotion_before_text_is_decoded_with_streamed_text(self):
+        parser = SpeechArgumentStream()
+        self.assertEqual(parser.feed('{"emotion":"happy","text":"开心'), '开心')
+        self.assertEqual(parser.feed('地说。"}'), '地说。')
+        self.assertEqual(parser.emotion, "happy")
+        self.assertEqual(parser.finish(), "开心地说。")
+
+    def test_invalid_or_late_nondefault_emotion_is_rejected(self):
+        for raw in ('{"emotion":"whisper","text":"x"}', '{"text":"x","emotion":"happy"}'):
+            parser = SpeechArgumentStream()
+            with self.assertRaises(ValueError):
+                parser.feed(raw)
+
 
 class EpisodeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -278,17 +291,27 @@ class EpisodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.output.started)
         self.assertTrue(any(p.get("reason") == "request_budget" for k, p in self.events))
 
-    async def test_context_limit_does_not_send_request_or_drop_constraints(self):
-        r = self.make(max_context_chars=20)
+    async def test_context_budget_compacts_but_keeps_running(self):
+        r = self.make(max_context_tokens=20)
         await r.observe("USER_INPUT_FINALIZED", turn_id="t", text="等我叫你再回答")
         await idle(r)
-        self.assertEqual(r.request_count, 0)
+        self.assertEqual(r.request_count, 1)
         self.assertEqual(r.inputs["t"]["text"], "等我叫你再回答")
-        self.assertTrue(r.context_limited)
-        await r.observe("USER_INPUT_FINALIZED", turn_id="later", text="新输入不应继续扩大 Agent 上下文")
+        self.assertTrue(r.context_compacted)
+        await r.observe("USER_INPUT_FINALIZED", turn_id="later", text="新输入仍会进入 Agent 上下文")
         await idle(r)
-        self.assertNotIn("later", r.inputs)
-        self.assertEqual(r.request_count, 0)
+        self.assertIn("later", r.inputs)
+        self.assertEqual(r.request_count, 2)
+
+    async def test_provider_prompt_usage_is_observed_separately_from_estimate(self):
+        r = self.make(Provider([[{"type": "usage", "usage": {"prompt_tokens": 321}},
+                                 call("wait_for_input", {})]]))
+        await r.observe("USER_INPUT_FINALIZED", turn_id="t", text="记录 usage")
+        await idle(r)
+        self.assertEqual(r.provider_prompt_tokens, 321)
+        self.assertGreater(r.context_token_estimate, 0)
+        self.assertTrue(any(p.get("kind") == "LLM_USAGE" and p.get("prompt_tokens") == 321
+                            for _kind, p in self.events))
 
     async def test_finish_cancels_inflight_request(self):
         provider = Provider()
@@ -471,6 +494,11 @@ class EpisodeTests(unittest.IsolatedAsyncioTestCase):
         serialized = json.dumps(messages, ensure_ascii=False)
         self.assertLess(len(serialized), 20000)
         self.assertIn("context_truncated", serialized)
+        tool = next(item for item in messages if item["role"] == "tool")
+        compacted = json.loads(tool["content"])
+        self.assertLessEqual(len(tool["content"]), r.CONTEXT_TOOL_RESULT_CHARS)
+        self.assertLessEqual(len(compacted["organic"]), 2)
+        self.assertNotIn("related_searches", compacted)
 
 
 def make_controller(provider):
@@ -488,6 +516,69 @@ def make_controller(provider):
 
 
 class IntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_zero_pcm_is_retried_once_on_a_fresh_tts_session(self):
+        c = make_controller(Provider())
+
+        class EmptyThenAudioSession:
+            def __init__(self, produce_audio):
+                self.produce_audio = produce_audio
+                self.audio = asyncio.Queue()
+
+            async def start(self):
+                pass
+
+            async def send_text(self, _text):
+                if self.produce_audio:
+                    await self.audio.put(b"\x01\x00" * 4096)
+
+            async def finish(self):
+                await self.audio.put(None)
+
+            async def audio_chunks(self):
+                while True:
+                    value = await self.audio.get()
+                    if value is None:
+                        return
+                    yield value
+
+            async def close(self):
+                pass
+
+        sessions = []
+
+        class FlakyTts:
+            transport = "websocket"
+
+            def session(self):
+                session = EmptyThenAudioSession(produce_audio=bool(sessions))
+                sessions.append(session)
+                return session
+
+        c.output.tts = FlakyTts()
+        draining = True
+
+        async def drain_player():
+            while draining:
+                c.player._callback(bytearray(1280), 640, None, None)
+                await asyncio.sleep(.002)
+
+        drain = asyncio.create_task(drain_player())
+        try:
+            r = c.episode
+            r.episode_id, r.agent_step_id, r.context_version, r.user_speaking = "ep", "step", 1, False
+            output = await c.output.begin(r.identity(), "t")
+            await output.feed("这一次应该在空 PCM 后重试并播放。")
+            await output.finish()
+            await asyncio.wait_for(output.task, 2)
+            self.assertEqual(len(sessions), 2)
+            self.assertEqual(r.outputs[-1]["status"], "completed")
+            self.assertNotEqual(r.outputs[-1]["delivery"]["status"], "none")
+            self.assertTrue(any(item["kind"] == "TTS_EMPTY_AUDIO" for item in r.trace))
+        finally:
+            draining = False
+            await drain
+            await c.close()
+
     async def test_bidi_next_output_waits_for_cancel_barrier(self):
         cancel_started, release = asyncio.Event(), asyncio.Event()
         c = make_controller(Provider())
@@ -655,6 +746,23 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(records[0].episode_id, c.episode_history[ws.turn_id])
             await c._cancel_turn(reason="stopped")
             self.assertEqual(len([record for record in c.history.records if record.turn_id == ws.turn_id]), 1)
+        finally:
+            await c.close()
+
+    async def test_reset_keeps_completed_history_but_starts_a_clean_episode(self):
+        c = make_controller(Provider())
+        try:
+            await c.episode.observe("USER_INPUT_FINALIZED", turn_id="old", text="旧任务")
+            await idle(c.episode)
+            old_episode = c.episode.episode_id
+            self.assertIsNotNone(old_episode)
+            await c.reset_session()
+            self.assertIsNone(c.episode.episode_id)
+            self.assertTrue(c.state.listening)
+            await c.episode.observe("USER_INPUT_FINALIZED", turn_id="new", text="新任务")
+            await idle(c.episode)
+            self.assertNotEqual(c.episode.episode_id, old_episode)
+            self.assertEqual(list(c.episode.inputs), ["new"])
         finally:
             await c.close()
 

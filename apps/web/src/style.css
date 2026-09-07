@@ -134,6 +134,20 @@ h1 {
   gap: 9px;
 }
 
+.reset-button {
+  border: 1px solid rgba(180, 80, 49, 0.34);
+  border-radius: 999px;
+  padding: 10px 13px;
+  background: rgba(255, 244, 238, 0.72);
+  color: #a14a32;
+  font-size: 12px;
+  letter-spacing: 0.05em;
+}
+
+.reset-button:not(:disabled):hover {
+  background: #f9ded2;
+}
+
 .connection-chip,
 .service-pill,
 .history-count {

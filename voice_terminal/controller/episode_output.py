@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from uuid import uuid4
 
@@ -10,10 +11,15 @@ from ..core.state import RuntimeState
 from ..tts.alignment import DeliveryResolver
 
 
+logger = logging.getLogger(__name__)
+
+
 class SpeechHandle:
-    def __init__(self, owner, identity, turn_id, generation):
+    def __init__(self, owner, identity, turn_id, generation, emotion):
         self.owner, self.identity, self.turn_id = owner, identity, turn_id
         self.speech_id = uuid4().hex
+        self.emotion_requested = emotion
+        self.emotion_applied = emotion
         self.queue = asyncio.Queue(maxsize=32)
         self.workspace = TurnWorkspace(turn_id, generation_id=generation, committed=True)
         self.reason = None
@@ -38,7 +44,10 @@ class SpeechHandle:
             await asyncio.gather(put, return_exceptions=True)
 
     async def feed(self, text):
+        if self.reason or self.task.done():
+            raise ValueError("speech output closed")
         self.text += text
+        await self.owner._text_delta(self, text)
         await self._put(text)
 
     async def finish(self):
@@ -78,6 +87,17 @@ class EpisodeSpeechOutput(SpeechPipeline):
             return "IDLE"
         return "SPEAKING" if self.handle.workspace.playback_started else "SPEAK_REQUESTED"
 
+    @property
+    def active_snapshot(self):
+        h = self.handle
+        if not h or h.task.done():
+            return None
+        return {"speech_id": h.speech_id, "episode_id": h.identity[0], "agent_step_id": h.identity[1],
+                "context_version": h.identity[2], "turn_id": h.turn_id,
+                "generation_id": h.workspace.generation_id, "text": h.text,
+                "status": self.status, "emotion_requested": h.emotion_requested,
+                "emotion_applied": h.emotion_applied}
+
     def _valid(self, token):
         h, r = self.handle, self.runtime
         return bool(h and h.workspace.token == token and not h.reason and r and not r.closed
@@ -97,6 +117,16 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 "context_version": h.identity[2], "turn_id": h.turn_id,
                 "generation_id": h.workspace.generation_id, "event": kind, **payload})
 
+    async def _text_delta(self, h, text):
+        if not text:
+            return
+        await self.runtime.emit("speech.text_delta", {
+            "speech_id": h.speech_id, "episode_id": h.identity[0], "agent_step_id": h.identity[1],
+            "context_version": h.identity[2], "turn_id": h.turn_id,
+            "generation_id": h.workspace.generation_id, "text_delta": text,
+            "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
+        })
+
     async def _latency(self, ws):
         return
 
@@ -112,7 +142,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
                                                speech_id=h.speech_id)
                 self.loop.call_soon_threadsafe(lambda: self.controller._track(asyncio.create_task(publish())))
 
-    async def begin(self, identity, turn_id):
+    async def begin(self, identity, turn_id, *, emotion="calm"):
         if self.active:
             raise ValueError("speech output busy")
         if self.tasks:
@@ -121,7 +151,10 @@ class EpisodeSpeechOutput(SpeechPipeline):
             raise ValueError("speech authorization expired during cleanup")
         self.generation += 1
         self.loop = asyncio.get_running_loop()
-        h = SpeechHandle(self, identity, turn_id, self.generation)
+        prepare = getattr(self.tts, "prepare_emotion", None)
+        if prepare is not None:
+            emotion = await prepare(emotion)
+        h = SpeechHandle(self, identity, turn_id, self.generation, emotion)
         self.handle = h
         self.state.clear_current()
         self._delivery_resolvers = {turn_id: DeliveryResolver()}
@@ -138,6 +171,11 @@ class EpisodeSpeechOutput(SpeechPipeline):
         if not h or h.task.done() or h.reason:
             return
         h.reason = reason
+        logger.info(
+            "episode.speech_invalidated speech_id=%s episode_id=%s step=%s context_version=%s reason=%s playback_started=%s",
+            h.speech_id, h.identity[0], h.identity[1], h.identity[2], reason,
+            h.workspace.playback_started,
+        )
         if self.player:
             h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
         h.task.cancel()
@@ -150,6 +188,48 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 return
             h.workspace.timings["llm_request"] = self.runtime.request_started_at or time.monotonic()
             await self._play_stream(h.workspace, h.workspace.token, h.stream())
+            # A zero-PCM Bidi transaction cannot have delivered any text, so
+            # one replay is safe and avoids making the user repeat a request
+            # after a cancelled/non-reusable MiniMax session.  Never retry
+            # once any PCM was returned: that could duplicate audible speech.
+            if (
+                h.text
+                and h.workspace.timings.get("tts_text_sent")
+                and h.workspace.timings.get("tts_audio_bytes", 0) == 0
+                and self._valid(h.workspace.token)
+            ):
+                await self.runtime.log(
+                    "TTS_EMPTY_AUDIO",
+                    identity=h.identity,
+                    turn_id=h.turn_id,
+                    speech_id=h.speech_id,
+                    attempt=1,
+                )
+                logger.warning(
+                    "episode.speech_retry_empty_audio speech_id=%s turn_id=%s",
+                    h.speech_id,
+                    h.turn_id,
+                )
+                self._delivery_resolvers[h.turn_id] = DeliveryResolver()
+                self.state.clear_current()
+
+                async def replay():
+                    yield h.text
+
+                await self._play_stream(h.workspace, h.workspace.token, replay())
+                if h.workspace.timings.get("tts_text_sent") and h.workspace.timings.get("tts_audio_bytes", 0) == 0:
+                    await self.runtime.log(
+                        "TTS_EMPTY_AUDIO_RETRY_FAILED",
+                        identity=h.identity,
+                        turn_id=h.turn_id,
+                        speech_id=h.speech_id,
+                        attempt=2,
+                    )
+            if getattr(self.tts, "emotion_status", None) == "unsupported":
+                h.emotion_applied = getattr(self.tts, "applied_emotion", "calm")
+                await self.runtime.log("TTS_EMOTION_UNSUPPORTED", identity=h.identity, turn_id=h.turn_id,
+                                       speech_id=h.speech_id,
+                                       error=getattr(self.tts, "emotion_error", None))
             if self.state.current.get("tts_status") == "DEGRADED" or self.tts is None or self.player is None:
                 h.reason = "failed"
         except asyncio.CancelledError:
@@ -165,6 +245,11 @@ class EpisodeSpeechOutput(SpeechPipeline):
                     cancel = getattr(session, "cancel", None)
                     if cancel:
                         await asyncio.wait_for(cancel(timeout_seconds=2.0), 2.5)
+                    # A successfully cancelled MiniMax Bidi generation is
+                    # intentionally not reusable.  Closing it here prevents
+                    # a detached socket from being retained by the client.
+                    if not getattr(session, "reusable", False):
+                        await session.close()
                 except Exception:
                     await session.close()
                 finally:
@@ -186,12 +271,21 @@ class EpisodeSpeechOutput(SpeechPipeline):
             record = {"speech_id": h.speech_id, "episode_id": h.identity[0], "agent_step_id": h.identity[1],
                       "context_version": h.identity[2], "turn_id": h.turn_id,
                       "generation_id": h.workspace.generation_id, "text": h.text,
+                      "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
+                      "emotion_transport": getattr(self.tts, "emotion_transport", "voice_setting"),
+                      "emotion_status": getattr(self.tts, "emotion_status", "applied"),
                       "status": h.reason or "completed", "delivery": delivery,
                       "latency": {"llm_first_token_ms": elapsed("llm_request", "first_token"),
                                   "llm_request_to_first_tts_text_ms": elapsed("llm_request", "first_tts_text"),
                                   "tts_text_to_first_audio_ms": elapsed("first_tts_text", "first_audio"),
                                   "first_audio_to_playback_ms": elapsed("first_audio", "playback"),
                                   "input_end_to_playback_ms": input_to_playback}}
+            logger.info(
+                "episode.speech_final speech_id=%s episode_id=%s step=%s context_version=%s turn_id=%s status=%s delivery=%s tts_text_sent=%s tts_audio_bytes=%s playback_started=%s",
+                h.speech_id, h.identity[0], h.identity[1], h.identity[2], h.turn_id,
+                record["status"], delivery.get("status"), timings.get("tts_text_sent"),
+                timings.get("tts_audio_bytes"), h.workspace.playback_started,
+            )
             if self.handle is h:
                 self.handle = None
             await self.runtime.output_completed(record)

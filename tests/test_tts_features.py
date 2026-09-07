@@ -520,7 +520,7 @@ class BidiLifecycleTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await session.close()
 
-    async def test_flush_cancel_and_late_audio_barrier_keep_one_connection(self) -> None:
+    async def test_flush_marks_connection_non_reusable_and_drops_late_audio(self) -> None:
         client = MiniMaxTtsClient(
             base_url="https://example.invalid",
             websocket_path="/ws/v1/t2a_v2",
@@ -559,24 +559,12 @@ class BidiLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await events.put({"event": "task_flushed"})
             await flush_task
             self.assertTrue(session.generation_finished)
+            self.assertFalse(session.reusable)
             # Audio after task_flushed is stale until the next task_continue.
             await events.put({"event": "data", "data": {"audio": "0100"}})
             await asyncio.sleep(0)
             self.assertEqual(session.received_bytes, 0)
-
-            await session.send_text("第二轮")
-            await events.put({"event": "task_canceled", "data": {"audio": "0100"}})
-            await session.cancel()
-            self.assertEqual(session.received_bytes, 0)
-            # Events that were already in flight after the confirmation must
-            # not create a sentence epoch for the next generation.
-            await events.put({"event": "sentence_start"})
-            await events.put({"event": "sentence_end"})
-            await asyncio.sleep(0)
-            self.assertEqual(session.completed_sentences, 0)
-            self.assertEqual([item["event"] for item in socket.sent], [
-                "task_continue", "task_flush", "task_continue", "task_cancel",
-            ])
+            self.assertEqual([item["event"] for item in socket.sent], ["task_continue", "task_flush"])
         finally:
             await session.close()
 

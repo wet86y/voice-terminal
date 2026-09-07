@@ -58,7 +58,7 @@ class MiniMaxSearchClientTests(unittest.TestCase):
         FakeHttpClient.response = FakeResponse(200, {
             "base_resp": {"status_code": 0},
             "organic": [{"title": "Title", "link": "https://example.test", "snippet": "Summary", "date": "2026-09-06"}],
-            "related_searches": [{"query": "related"}],
+            "related_searches": [],
         })
 
         with patch("httpx.Client", return_value=FakeHttpClient()):
@@ -71,7 +71,7 @@ class MiniMaxSearchClientTests(unittest.TestCase):
                 "snippet": "Summary",
                 "date": "2026-09-06",
             }],
-            "related_searches": [{"query": "related"}],
+            "related_searches": [],
         })
         url, kwargs = FakeHttpClient.calls[0]
         self.assertEqual(url, "https://api.minimaxi.com/v1/coding_plan/search")
@@ -93,13 +93,12 @@ class MiniMaxSearchClientTests(unittest.TestCase):
         with patch("httpx.Client", return_value=FakeHttpClient()):
             result = self.client.search("bounded")
 
-        self.assertEqual(len(result["organic"]), 10)
-        self.assertEqual(len(result["related_searches"]), 8)
-        self.assertEqual(len(result["organic"][0]["title"]), 256)
-        self.assertEqual(len(result["organic"][0]["link"]), 2048)
-        self.assertEqual(len(result["organic"][0]["snippet"]), 2000)
+        self.assertEqual(len(result["organic"]), 2)
+        self.assertEqual(result["related_searches"], [])
+        self.assertEqual(len(result["organic"][0]["title"]), 160)
+        self.assertEqual(len(result["organic"][0]["link"]), 512)
+        self.assertEqual(len(result["organic"][0]["snippet"]), 1200)
         self.assertEqual(len(result["organic"][0]["date"]), 64)
-        self.assertEqual(len(result["related_searches"][0]["query"]), 256)
 
     def test_invalid_query_and_response_are_rejected(self):
         with self.assertRaises(ValueError):

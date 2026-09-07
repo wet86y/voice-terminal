@@ -173,6 +173,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const agentEpisode = ref<AgentEpisodeSnapshot | null>(null)
   const agentTrace = ref<AgentTrace[]>([])
   const speechOutputs = ref<SpeechOutputRecord[]>([])
+  const activeSpeech = ref<SpeechOutputRecord | null>(null)
   const speechProgress = ref<Record<string, unknown> | null>(null)
   const retiredEpisodes = new Set<string>()
 
@@ -185,8 +186,10 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       || (value.user_speaking !== undefined && value.user_speaking !== null && typeof value.user_speaking !== 'boolean')
       || (value.request_count !== undefined && !isNonNegativeInteger(value.request_count))
       || (value.context_chars !== undefined && !isNonNegativeInteger(value.context_chars))
-      || (value.context_limit_chars !== undefined && !isNonNegativeInteger(value.context_limit_chars))
+      || (value.context_limit_tokens !== undefined && !isNonNegativeInteger(value.context_limit_tokens))
       || (value.context_token_estimate !== undefined && !isNonNegativeInteger(value.context_token_estimate))
+      || (value.provider_prompt_tokens !== undefined && value.provider_prompt_tokens !== null
+        && !isNonNegativeInteger(value.provider_prompt_tokens))
       || (value.context_usage_percent !== undefined
         && (typeof value.context_usage_percent !== 'number' || !Number.isFinite(value.context_usage_percent)
           || value.context_usage_percent < 0))) return
@@ -202,6 +205,12 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     agentEpisode.value = value as unknown as AgentEpisodeSnapshot
     if (Array.isArray(value.trace)) agentTrace.value = value.trace.filter(isAgentTrace).slice(-200)
     if (Array.isArray(value.outputs)) speechOutputs.value = value.outputs.filter(isSpeechOutput).slice(-32)
+    if (isSpeechOutput(value.active_speech)) activeSpeech.value = value.active_speech
+    else if (value.episode_id === null) activeSpeech.value = null
+    else if (value.active_speech === null && Array.isArray(value.outputs)) {
+      activeSpeech.value = [...speechOutputs.value].reverse()
+        .find(output => output.episode_id === value.episode_id) ?? null
+    }
   }
 
   function applyAgentTrace(value: Record<string, unknown>) {
@@ -237,6 +246,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     agentEpisode.value = null
     agentTrace.value = []
     speechOutputs.value = []
+    activeSpeech.value = null
     speechProgress.value = null
     retiredEpisodes.clear()
     resetCurrentTurn()
@@ -395,7 +405,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
   function applyLlmContext(payload: unknown, turnId: string | null) {
     if (!isRecord(payload) || !Array.isArray(payload.messages)) return
-    for (const key of ['context_chars', 'context_limit_chars', 'context_token_estimate'] as const) {
+    for (const key of ['context_chars', 'context_limit_tokens', 'context_token_estimate'] as const) {
       if (payload[key] !== undefined && !isNonNegativeInteger(payload[key])) return
     }
     if (payload.context_usage_percent !== undefined
@@ -440,6 +450,29 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       if (isSpeechOutput(payload)) {
         speechOutputs.value = [...speechOutputs.value.filter(item => item.speech_id !== payload.speech_id), payload].slice(-32)
         if (speechProgress.value?.speech_id === payload.speech_id) speechProgress.value = null
+        if (activeSpeech.value?.speech_id === payload.speech_id) activeSpeech.value = payload
+      }
+      return
+    }
+    if (message.type === 'speech.text_delta') {
+      const currentAgent = agentEpisode.value
+      const textDelta = readString(payload, 'text_delta')
+      if (textDelta !== null && typeof payload.speech_id === 'string'
+        && payload.episode_id === currentAgent?.episode_id
+        && payload.agent_step_id === currentAgent?.agent_step_id
+        && payload.context_version === currentAgent?.context_version) {
+        if (activeSpeech.value?.speech_id !== payload.speech_id) {
+          activeSpeech.value = {
+            speech_id: payload.speech_id,
+            episode_id: payload.episode_id as string,
+            agent_step_id: payload.agent_step_id as string,
+            context_version: payload.context_version as number,
+            turn_id: typeof payload.turn_id === 'string' ? payload.turn_id : message.turn_id || '',
+            generation_id: typeof payload.generation_id === 'number' ? payload.generation_id : 0,
+            text: '', status: 'streaming',
+          }
+        }
+        if (activeSpeech.value) activeSpeech.value = { ...activeSpeech.value, text: activeSpeech.value.text + textDelta }
       }
       return
     }
@@ -625,6 +658,16 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     return sendCommand('session.start')
   }
 
+  function resetSession() {
+    if (connection.value !== 'connected') return false
+    resetCurrentTurn()
+    activeSpeech.value = null
+    speechProgress.value = null
+    llmContext.value = []
+    llmContextTurnId.value = null
+    return sendCommand('session.reset')
+  }
+
   function dispose() {
     const activeSocket = socket.value
     socket.value = null
@@ -652,6 +695,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     agentEpisode,
     agentTrace,
     speechOutputs,
+    activeSpeech,
     speechProgress,
     llmContext,
     llmContextTurnId,
@@ -660,6 +704,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     webSocketUrl,
     connect,
     toggleListening,
+    resetSession,
     dispose,
   }
 }

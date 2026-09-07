@@ -9,7 +9,7 @@ class V03Options:
     aggressive_interval_ms: int = 400
     silence_ms: int = 5500
     max_requests_per_step: int = 5
-    max_context_chars: int = 64000
+    max_context_tokens: int = 524288
     trace_limit: int = 200
     output_limit: int = 32
 

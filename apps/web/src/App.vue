@@ -51,6 +51,9 @@ const currentTurnLabel = computed(() => terminal.currentTurnId ?? '—')
 const transcriptPreview = computed(
   () => terminal.current.final_text || terminal.current.partial_text || '等待后端语音事件…',
 )
+const responsePreview = computed(
+  () => terminal.activeSpeech?.text || terminal.current.assistant_text,
+)
 const currentLatencyRows = computed(() =>
   latencyDefinitions.map((definition) => ({
     ...definition,
@@ -132,6 +135,9 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
       </div>
 
       <div class="top-actions">
+        <button class="reset-button" type="button" :disabled="terminal.connection !== 'connected'" @click="terminal.resetSession()">
+          重置会话
+        </button>
         <span class="connection-chip" :class="connectionClass">
           <span class="chip-dot"></span>{{ systemLabel }}
         </span>
@@ -150,12 +156,13 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
         <span>动作 {{ terminal.agentEpisode.current_action || '—' }}</span>
         <span>模型请求 {{ terminal.agentEpisode.request_count || 0 }}</span>
         <span>最大并发 {{ terminal.agentEpisode.max_request_concurrency ?? '—' }}</span>
-        <span>上下文 {{ formatCount(terminal.agentEpisode.context_chars) }} / {{ formatCount(terminal.agentEpisode.context_limit_chars) }} 字符</span>
-        <span>约 {{ formatCount(terminal.agentEpisode.context_token_estimate) }} token · {{ terminal.agentEpisode.context_usage_percent == null ? '—' : `${terminal.agentEpisode.context_usage_percent.toFixed(1)}%` }}</span>
+        <span>请求 JSON {{ formatCount(terminal.agentEpisode.context_chars) }} 字符</span>
+        <span>估算 {{ formatCount(terminal.agentEpisode.context_token_estimate) }} / {{ formatCount(terminal.agentEpisode.context_limit_tokens) }} token · {{ terminal.agentEpisode.context_usage_percent == null ? '—' : `${terminal.agentEpisode.context_usage_percent.toFixed(1)}%` }}</span>
+        <span>最近 provider prompt {{ terminal.agentEpisode.provider_prompt_tokens == null ? '未提供' : `${formatCount(terminal.agentEpisode.provider_prompt_tokens)} token` }}</span>
       </div>
       <p v-if="terminal.speechProgress">语音输出：{{ terminal.speechProgress.waiting_text || terminal.speechProgress.event }}</p>
-      <p v-if="terminal.agentEpisode.context_limited" class="agent-limit" role="status">
-        当前 Episode 已达到上下文上限，已保留历史输入；请停止并重新开始后继续。
+      <p v-if="terminal.agentEpisode.context_compacted" class="agent-limit" role="status">
+        本次请求已按预算压缩旧上下文；当前输入仍会保留并继续处理。
       </p>
       <p v-else-if="terminal.agentEpisode.current_action === 'wait_for_input'" class="agent-wait" role="status">
         Agent 正在等待新的输入。
@@ -173,8 +180,9 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
       </details>
       <details v-if="terminal.speechOutputs.length" open>
         <summary>语音输出与实际传达</summary>
-        <div v-for="output in [...terminal.speechOutputs].reverse()" :key="output.speech_id" class="agent-output">
-          <small>{{ output.turn_id }} · {{ output.speech_id }} · {{ output.status }}</small>
+          <div v-for="output in [...terminal.speechOutputs].reverse()" :key="output.speech_id" class="agent-output">
+            <small>{{ output.turn_id }} · {{ output.speech_id }} · {{ output.status }}</small>
+          <small>表达情绪：{{ output.emotion_requested || 'calm' }} → {{ output.emotion_applied || 'calm' }} · {{ output.emotion_status || '未报告' }}</small>
           <p>{{ output.text }}</p>
           <p>已传达：{{ output.delivery?.heard_text || '无' }}</p>
           <p v-if="output.delivery?.uncertain_text">边界不确定：{{ output.delivery.uncertain_text }}</p>
@@ -334,7 +342,10 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
         <div class="response-column" aria-live="polite">
           <div class="response-block">
             <span class="box-label">ASSISTANT RESPONSE</span>
-            <p>{{ displayText(terminal.current.assistant_text) }}</p>
+            <p>{{ displayText(responsePreview) }}</p>
+            <small v-if="terminal.activeSpeech">
+              表达情绪：{{ terminal.activeSpeech.emotion_requested || 'calm' }} → {{ terminal.activeSpeech.emotion_applied || 'calm' }}
+            </small>
           </div>
           <div class="response-divider"><span>TTS QUEUE</span><i></i><span>{{ displayText(terminal.current.tts_status) }}</span></div>
           <div class="response-block tts-block">

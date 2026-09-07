@@ -83,6 +83,7 @@ class SpeechPipeline:
         pending_limit = 32
         producer_done = False
         audio_returned_bytes = 0
+        tts_text_sent = False
         progress_lock = asyncio.Lock()
         last_progress: tuple[int, int, int, int, int] | None = None
         last_progress_at = 0.0
@@ -283,7 +284,7 @@ class SpeechPipeline:
             return segment
 
         async def tts_sender() -> None:
-            nonlocal session, reader, progress_task, tts_failed, tts_disabled
+            nonlocal session, reader, progress_task, tts_failed, tts_disabled, tts_text_sent
             sent_any = False
             try:
                 while True:
@@ -298,7 +299,19 @@ class SpeechPipeline:
                             return
                         session = self.tts.session()
                         self._tts_session = session
-                        await session.start()
+                        try:
+                            await session.start()
+                        except Exception as exc:
+                            # The optional MiniMax Bidi emotion extension is
+                            # verified on task_start.  A rejection closes that
+                            # connection and retries the still-unsent first
+                            # segment with the neutral provider payload.
+                            if not getattr(exc, "emotion_unsupported", False) or not self._valid(token):
+                                raise
+                            await self._detail("tts.emotion_unsupported", status="FALLBACK_CALM")
+                            session = self.tts.session()
+                            self._tts_session = session
+                            await session.start()
                         reader = asyncio.create_task(read_audio(session), name=f"tts-audio-{ws.turn_id}")
                         progress_task = asyncio.create_task(monitor_progress(), name=f"tts-progress-{ws.turn_id}")
                     if sent_any:
@@ -314,6 +327,7 @@ class SpeechPipeline:
                     self.state.current["tts_text"] = segment
                     resolver.add_text(segment, int(playback_progress()["returned_ms"]))
                     await session.send_text(segment)
+                    tts_text_sent = True
                     await emit_progress(
                         status="QUEUED",
                         waiting_text=segment,
@@ -434,6 +448,23 @@ class SpeechPipeline:
                         tts_failed = tts_failed or exc
                         tts_disabled = True
                         logger.warning("controller.tts_receive_degraded turn_id=%s error=%s", ws.turn_id, exc)
+            # ``task_flushed`` only confirms that the Bidi server has ended
+            # this generation.  It is not evidence that the server produced
+            # usable PCM.  Calling that a completed speech made the UI show
+            # a fully answered request while the user heard nothing.  Record
+            # the transport fact before final status/delivery resolution so
+            # the transaction can be retried once by EpisodeSpeechOutput.
+            ws.timings["tts_audio_bytes"] = audio_returned_bytes
+            ws.timings["tts_text_sent"] = int(tts_text_sent)
+            if session and tts_text_sent and audio_returned_bytes == 0 and tts_failed is None:
+                tts_failed = RuntimeError("MiniMax TTS 已确认结束但未返回 PCM")
+                tts_disabled = True
+                logger.error(
+                    "controller.tts_empty_audio turn_id=%s transport=%s generation_finished=%s",
+                    ws.turn_id,
+                    transport,
+                    getattr(session, "generation_finished", False),
+                )
             if self.player:
                 playback_timeout = max(120.0, 30.0 + self.player.buffered_ms / 1000)
                 try:

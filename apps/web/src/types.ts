@@ -147,8 +147,9 @@ export interface LlmContextPayload {
   messages: LlmContextMessage[]
   message_count: number
   context_chars?: number
-  context_limit_chars?: number
+  context_limit_tokens?: number
   context_token_estimate?: number
+  provider_prompt_tokens?: number | null
   context_usage_percent?: number
   episode_id?: string
   agent_step_id?: string
@@ -192,7 +193,7 @@ export interface ServerErrorPayload {
 }
 
 export type ServerMessageType =
-  | 'agent.episode' | 'agent.trace' | 'speech.progress' | 'speech.completed'
+  | 'agent.episode' | 'agent.trace' | 'speech.text_delta' | 'speech.progress' | 'speech.completed'
   | 'turn.started' | 'turn.resumed' | 'turn.finalizing' | 'turn.committed'
   | 'turn.endpoint_candidate' | 'turn.semantic_state' | 'transcript.segment'
   | 'transcript.refined' | 'speech.emotion' | 'agent.prediction' | 'agent.tool'
@@ -209,7 +210,7 @@ export type ServerMessageType =
   | 'turn.completed'
   | 'error'
 
-export type CommandName = 'subscribe' | 'session.start' | 'session.stop'
+export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset'
 
 export interface MessageEnvelope<TType extends string = string, TPayload = unknown> {
   type: TType
@@ -266,6 +267,10 @@ export interface SpeechOutputRecord {
   status: string
   delivery?: TurnDelivery
   latency?: Partial<LatencyValues>
+  emotion_requested?: string
+  emotion_applied?: string
+  emotion_transport?: string
+  emotion_status?: string
 }
 
 export interface AgentEpisodeSnapshot {
@@ -275,8 +280,9 @@ export interface AgentEpisodeSnapshot {
   context_limited?: boolean
   context_limit_reason?: string | null
   context_chars?: number
-  context_limit_chars?: number
+  context_limit_tokens?: number
   context_token_estimate?: number
+  provider_prompt_tokens?: number | null
   context_usage_percent?: number
   agent_state: string
   decision_mode: string
@@ -285,6 +291,9 @@ export interface AgentEpisodeSnapshot {
   request_count?: number
   max_request_concurrency?: number
   playback_state?: string
+  context_compacted?: boolean
+  context_compaction?: Record<string, unknown>
+  active_speech?: SpeechOutputRecord | null
   trace?: AgentTrace[]
   outputs?: SpeechOutputRecord[]
 }

@@ -14,9 +14,16 @@ class MiniMaxTtsError(RuntimeError):
     pass
 
 
+class MiniMaxEmotionUnsupported(MiniMaxTtsError):
+    """The Bidi endpoint rejected the optional voice-setting extension."""
+
+    emotion_unsupported = True
+
+
 class MiniMaxTtsSession:
-    def __init__(self, client: "MiniMaxTtsClient") -> None:
+    def __init__(self, client: "MiniMaxTtsClient", *, emotion: str | None = None) -> None:
         self.client = client
+        self.emotion = emotion
         self.bidi = getattr(client, "transport", "websocket") == "websocket_bidi"
         self._socket: Any = None
         self._receiver: asyncio.Task[None] | None = None
@@ -226,14 +233,21 @@ class MiniMaxTtsSession:
                         f"MiniMax Bidi 连接握手异常：期望 connected_success，收到 {connected_event or 'unknown'}"
                     )
                 logger.debug("minimax.connected_success connect_id=%s", connected.get("connect_id"))
-            await self._socket.send(json.dumps(self.client.start_payload(), ensure_ascii=False))
+            await self._socket.send(json.dumps(self.client.start_payload(self.emotion), ensure_ascii=False))
             logger.debug("minimax.task_start_sent")
             while True:
                 message = await asyncio.wait_for(self._socket.recv(), self.client.timeout_seconds)
                 parsed = self._parse(message)
                 event = parsed.get("event")
                 if event == "task_failed":
-                    raise MiniMaxTtsError(self._error_message(parsed))
+                    message = self._error_message(parsed)
+                    if self.client.emotion_enabled:
+                        # The WebSocket public examples do not document this
+                        # optional HTTP/MCP field.  Retry this output without
+                        # it rather than leaving a rejected session retained.
+                        self.client.disable_emotion_transport(message)
+                        raise MiniMaxEmotionUnsupported(message)
+                    raise MiniMaxTtsError(message)
                 if event == "task_started":
                     self._started = True
                     self.connection_id = self.client._next_connection_id()
@@ -341,14 +355,30 @@ class MiniMaxTtsSession:
                     self._cancel_confirmed.set()
                     self._generation_done.set()
                     self._server_finished = False
+                    # MiniMax has acknowledged the cancellation, but the
+                    # Bidi endpoint does not guarantee that a cancelled
+                    # task can accept another independent generation on the
+                    # same socket.  Reusing it produced the observable
+                    # failure mode ``task_flushed`` with zero PCM.  Treat a
+                    # confirmed cancellation as a connection boundary: the
+                    # owner closes this session and the next speak opens a
+                    # fresh Bidi connection.
+                    self._connection_dead = True
                     self._audio_available.set()
-                    logger.info("minimax.task_canceled")
+                    logger.info("minimax.task_canceled reusable=False")
                 elif event == "task_flushed":
                     self._flush_confirmed.set()
                     self._generation_active = False
                     self._generation_done.set()
+                    # A flush ends an independently authorised speech
+                    # transaction.  Production traces show that this Bidi
+                    # endpoint may acknowledge a following task_continue
+                    # yet return zero PCM.  Do not carry an idle socket into
+                    # the next speak: SpeechPipeline closes it after this
+                    # generation and MiniMaxTtsClient opens a fresh one.
+                    self._connection_dead = True
                     self._audio_available.set()
-                    logger.info("minimax.task_flushed")
+                    logger.info("minimax.task_flushed reusable=False")
                 elif event == "sentence_start" and self._generation_active and not self._cancel_requested:
                     self._sentence_index += 1
                     self._sentence_audio_base_ms = self._received_audio_ms()
@@ -732,6 +762,9 @@ class MiniMaxTtsClient:
         audio_cache_max_bytes: int = 64 * 1024 * 1024,
         cancel_timeout_ms: int = 2000,
         keepalive_seconds: int = 30,
+        emotion_mode: str = "agent",
+        default_emotion: str = "calm",
+        emotion_transport: str = "voice_setting",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         if transport not in {"websocket", "websocket_bidi"}:
@@ -742,6 +775,10 @@ class MiniMaxTtsClient:
             raise ValueError("Bidi TTS cannot use playback_window scheduling")
         if audio_cache_max_bytes <= 0 or cancel_timeout_ms <= 0 or keepalive_seconds <= 0:
             raise ValueError("TTS cache, cancel timeout, and keepalive values must be positive")
+        if emotion_mode not in {"off", "agent"}:
+            raise ValueError("tts.emotion_mode must be off or agent")
+        if emotion_transport != "voice_setting":
+            raise ValueError("tts.emotion_transport must be voice_setting")
         self.transport = transport
         self.scheduling = scheduling
         if transport == "websocket_bidi" and websocket_path.rstrip("/") == "/ws/v1/t2a_v2":
@@ -757,6 +794,13 @@ class MiniMaxTtsClient:
         self.audio_cache_max_bytes = audio_cache_max_bytes
         self.cancel_timeout_seconds = cancel_timeout_ms / 1000
         self.keepalive_seconds = keepalive_seconds
+        self.emotion_mode = emotion_mode
+        self.default_emotion = self.normalize_emotion(default_emotion)
+        self.emotion_transport = emotion_transport
+        self.emotion_enabled = emotion_mode == "agent" and emotion_transport == "voice_setting"
+        self.emotion_status = "requested" if self.emotion_enabled else "disabled"
+        self.emotion_error: str | None = None
+        self._active_emotion = self.default_emotion
         self.timeout_seconds = timeout_ms / 1000
         # ``timeout_ms`` is kept as the connection/task-start timeout.  The
         # service documents a 120-second idle window after the last result;
@@ -785,7 +829,12 @@ class MiniMaxTtsClient:
             base = "ws://" + base[len("http://") :]
         return f"{base}{self.websocket_path}"
 
-    def start_payload(self) -> dict[str, Any]:
+    @staticmethod
+    def normalize_emotion(value: str | None) -> str:
+        allowed = {"calm", "happy", "sad", "angry", "fearful", "disgusted", "surprised"}
+        return value if isinstance(value, str) and value in allowed else "calm"
+
+    def start_payload(self, emotion: str | None = None) -> dict[str, Any]:
         payload = {
             "event": "task_start",
             "model": self.model,
@@ -803,10 +852,43 @@ class MiniMaxTtsClient:
                 "channel": 1,
             },
         }
+        selected = self.normalize_emotion(emotion or self._active_emotion)
+        if self.emotion_enabled:
+            payload["voice_setting"]["emotion"] = selected
         if self.transport == "websocket_bidi" or self.subtitle_enable:
             payload["subtitle_enable"] = bool(self.subtitle_enable)
             payload["subtitle_type"] = self.subtitle_type
         return payload
+
+    async def prepare_emotion(self, emotion: str | None) -> str:
+        """Select a voice setting before a Bidi task starts.
+
+        ``task_start`` owns MiniMax's voice settings, so a retained Bidi
+        connection can only be reused when the selected emotion is unchanged.
+        Callers invoke this between output transactions, after their cancel
+        barrier has joined the preceding task.
+        """
+        selected = self.normalize_emotion(emotion)
+        if self.emotion_mode != "agent":
+            selected = self.default_emotion
+        if self.transport == "websocket_bidi" and self._bidi_session is not None and selected != self._active_emotion:
+            await self._bidi_session.close()
+            self._bidi_session = None
+        self._active_emotion = selected
+        return selected
+
+    def disable_emotion_transport(self, error: str) -> None:
+        """Make later Bidi sessions neutral after a server-side rejection."""
+
+        self.emotion_enabled = False
+        self.emotion_status = "unsupported"
+        self.emotion_error = error[:300]
+        self._active_emotion = self.default_emotion
+        logger.warning("minimax.emotion_unsupported error=%s", self.emotion_error)
+
+    @property
+    def applied_emotion(self) -> str:
+        return self._active_emotion if self.emotion_enabled else self.default_emotion
 
     def session(self) -> MiniMaxTtsSession:
         if not self.api_key:
@@ -821,9 +903,9 @@ class MiniMaxTtsClient:
                 or self._bidi_session._error is not None
                 or (self._bidi_session._started and self._bidi_session._socket is None)
             ):
-                self._bidi_session = MiniMaxTtsSession(self)
+                self._bidi_session = MiniMaxTtsSession(self, emotion=self._active_emotion)
             return self._bidi_session
-        return MiniMaxTtsSession(self)
+        return MiniMaxTtsSession(self, emotion=self._active_emotion)
 
     async def close(self) -> None:
         """Close a retained Bidi connection during runtime shutdown."""
