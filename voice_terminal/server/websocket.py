@@ -56,6 +56,7 @@ class SessionRuntime:
         self.controller: EpisodeController | None = None
         self.conversation = ConversationRuntime()
         self._session_lock = asyncio.Lock()
+        self.build_info: dict[str, Any] = {}
 
     def _record_error(self, service: str, message: str, *, status_service: str | None = None) -> None:
         # Keep the public service map compatible while preserving the actual
@@ -298,6 +299,7 @@ class SessionRuntime:
             "startup_errors": list(self.startup_errors),
             "wake_enabled": self.config.wake.enabled,
             "wake_keyword": self.config.wake.keyword,
+            "runtime": dict(self.build_info),
         }
 
 

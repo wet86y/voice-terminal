@@ -19,7 +19,9 @@ class ProtocolSequencer:
         "agent.episode": "agent.state", "llm.context": "context.snapshot",
         "agent.tool": "tool.state", "speech.text_delta": "speech.delta",
         "tts.status": "speech.progress", "tts.progress": "speech.progress",
-        "latency.snapshot": "metrics.snapshot",
+        "tts.prewarm": "speech.progress",
+        "speech.replaced": "speech.progress", "speech.replace_failed": "speech.progress",
+        "latency.snapshot": "metrics.snapshot", "turn.latency": "metrics.snapshot",
     }
     _PUBLIC = {"runtime.snapshot", "session.state", "metrics.snapshot", "input.started", "input.updated",
                "input.finalized", "input.completed", "agent.state", "agent.trace", "context.snapshot",

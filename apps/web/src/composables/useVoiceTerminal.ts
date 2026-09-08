@@ -96,6 +96,7 @@ function createEmptyCurrentTurn(): CurrentTurnSnapshot {
     tts_scheduling: 'auto',
     input_runtime: true, epoch: 0, committed: false,
     agent_phase: 'IDLE', paraformer_final: '', refined_text: '',
+    refinement_available: false, tts_prewarm_started: false, tts_prewarm_status: 'NOT_REQUESTED',
     segments: [], tools: [], audio_cues: [], analysis: {},
   }
 }
@@ -113,6 +114,12 @@ function createEmptyLatency(): LatencyValues {
     turn_total_ms: null,
     first_segment_ms: null, smart_turn_ms: null,
     sensevoice_refine_ms: null, commit_to_final_llm_ms: null,
+    asr_final_to_commit_ms: null, refine_duration_ms: null,
+    refine_to_redecision_ms: null, agent_request_to_speak_ms: null,
+    tts_prewarm_requested_ms: null, tts_prewarm_ready_ms: null,
+    tts_checkout_ms: null, tts_cold_start_ms: null,
+    speech_end_to_first_pcm_ms: null, first_pcm_to_player_submit_ms: null,
+    replacement_count: null,
   }
 }
 
@@ -327,8 +334,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     for (const key of ['input_runtime', 'committed'] as const) {
       if (typeof snapshot[key] === 'boolean') current[key] = snapshot[key]
     }
-    for (const key of ['agent_phase', 'paraformer_final', 'refined_text'] as const) {
+    for (const key of ['agent_phase', 'paraformer_final', 'refined_text', 'tts_prewarm_status'] as const) {
       if (typeof snapshot[key] === 'string') current[key] = snapshot[key]
+    }
+    for (const key of ['refinement_available', 'tts_prewarm_started'] as const) {
+      if (typeof snapshot[key] === 'boolean') current[key] = snapshot[key]
     }
     if (Array.isArray(snapshot.segments)) current.segments = snapshot.segments as NonNullable<CurrentTurnSnapshot['segments']>
     if (Array.isArray(snapshot.tools)) current.tools = snapshot.tools as NonNullable<CurrentTurnSnapshot['tools']>
@@ -337,14 +347,20 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function applyLatencySnapshot(payload: LatencySnapshotPayload) {
-    if (!isRecord(payload.values)) return
+    const values: Record<string, unknown> | null = isRecord(payload.values)
+      ? payload.values as Record<string, unknown>
+      : isRecord((payload as unknown as Record<string, unknown>).latency)
+        ? (payload as unknown as Record<string, unknown>).latency as Record<string, unknown>
+        : null
+    if (!values) return
     for (const key of Object.keys(currentLatency) as Array<keyof LatencyValues>) {
-      const value = payload.values[key]
+      const value = values[key]
       if (value === null || (typeof value === 'number' && Number.isFinite(value))) {
         currentLatency[key] = value as number | null
       }
     }
     currentLatencyComplete.value = payload.complete === true
+      || isRecord((payload as unknown as Record<string, unknown>).latency)
   }
 
   function applyServices(nextServices: unknown) {
@@ -496,7 +512,6 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         && payload.conversation_id === currentAgent?.conversation_id
         && payload.epoch === currentAgent?.epoch
         && !speechOutputs.value.some(item => item.speech_id === payload.speech_id)) speechProgress.value = payload
-      return
     }
     if (message.type === 'input.started') adoptTurn(message.turn_id ?? null)
     if (message.turn_id === currentTurnId.value && typeof payload.epoch === 'number') {
@@ -522,8 +537,13 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         if (acceptsCurrentTurn(message.turn_id ?? null)) {
           const text = readString(payload, 'text')
           if (text !== null) {
-            current.final_text = text
-            current.partial_text = ''
+            if (readString(payload, 'source') === 'sensevoice') {
+              current.refined_text = text
+              current.refinement_available = true
+            } else {
+              current.final_text = text
+              current.partial_text = ''
+            }
           }
         }
         break
@@ -538,6 +558,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         break
       case 'speech.progress':
         if (acceptsCurrentTurn(message.turn_id ?? null)) {
+          const progressEvent = readString(payload, 'event')
           const waitingText = readString(payload, 'waiting_text')
           const status = readString(payload, 'status')
           const bufferMs = payload.audio_buffer_ms
@@ -545,8 +566,12 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
           const playedMs = payload.audio_played_ms
           const outputEstimatedMs = payload.audio_output_estimated_ms
           const remainingMs = payload.audio_remaining_ms
-          if (waitingText !== null) current.tts_text = waitingText
-          if (status !== null) current.tts_status = status
+          if (progressEvent === 'tts.prewarm') {
+            if (status !== null) current.tts_prewarm_status = status
+          } else {
+            if (waitingText !== null) current.tts_text = waitingText
+            if (status !== null) current.tts_status = status
+          }
           if (bufferMs === null || (typeof bufferMs === 'number' && Number.isFinite(bufferMs))) {
             current.audio_buffer_ms = bufferMs as number | null
           }

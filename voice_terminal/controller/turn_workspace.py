@@ -64,6 +64,10 @@ class TurnWorkspace:
     hard_closed: bool = False
     raw_partial: str = ""
     paraformer_final: str = ""
+    # The fast Paraformer final is the first-class commit.  SenseVoice may
+    # arrive later and is retained separately as supplemental evidence.
+    refined_text: str = ""
+    refinement_available: bool = False
     final_text: str = ""
     staged_response: str = ""
     audio_cues: list[dict] = field(default_factory=list)
@@ -78,6 +82,8 @@ class TurnWorkspace:
     delivery: dict = field(default_factory=dict)
     interruption_recorded: bool = False
     timings: dict[str, float] = field(default_factory=dict)
+    tts_prewarm_started: bool = False
+    tts_prewarm_status: str = "NOT_REQUESTED"
 
     @property
     def token(self) -> tuple[str, int]:
@@ -109,7 +115,10 @@ class TurnWorkspace:
         return {
             "conversation_id": self.episode_id, "turn_id": self.turn_id, "epoch": self.epoch, "phase": self.phase,
             "committed": self.committed, "agent_phase": self.agent_phase,
-            "paraformer_final": self.paraformer_final, "refined_text": self.final_text,
+            "paraformer_final": self.paraformer_final, "refined_text": self.refined_text,
+            "refinement_available": self.refinement_available,
+            "tts_prewarm_started": self.tts_prewarm_started,
+            "tts_prewarm_status": self.tts_prewarm_status,
             "segments": list(self.segments),
             "tools": list(self.tools), "audio_cues": list(self.audio_cues),
             "analysis": dict(self.analysis),

@@ -86,6 +86,9 @@ export interface CurrentTurnSnapshot {
   agent_phase?: string
   paraformer_final?: string
   refined_text?: string
+  refinement_available?: boolean
+  tts_prewarm_started?: boolean
+  tts_prewarm_status?: string
   segments?: Array<{ text: string }>
   tools?: Array<{ name?: string; status?: string; reused?: boolean; disabled?: boolean; service_status?: string; error?: string; overlap_ms?: number; wait_ms?: number; selected_at_ms?: number; execution_start_ms?: number | null; finished_at_ms?: number; execution_ms?: number }>
   audio_cues?: Array<{ start_ms: number; end_ms: number; emotion: string; language: string; events: string[] }>
@@ -115,6 +118,17 @@ export interface LatencyValues {
   smart_turn_ms?: number | null
   sensevoice_refine_ms?: number | null
   commit_to_final_llm_ms?: number | null
+  asr_final_to_commit_ms?: number | null
+  refine_duration_ms?: number | null
+  refine_to_redecision_ms?: number | null
+  agent_request_to_speak_ms?: number | null
+  tts_prewarm_requested_ms?: number | null
+  tts_prewarm_ready_ms?: number | null
+  tts_checkout_ms?: number | null
+  tts_cold_start_ms?: number | null
+  speech_end_to_first_pcm_ms?: number | null
+  first_pcm_to_player_submit_ms?: number | null
+  replacement_count?: number | null
   wake_detection_ms: number | null
   asr_first_text_ms: number | null
   speech_end_confirmation_ms: number | null
@@ -125,6 +139,20 @@ export interface LatencyValues {
   input_end_to_playback_ms?: number | null
   speech_end_to_playback_ms: number | null
   turn_total_ms: number | null
+}
+
+export interface TurnLatencyValues extends LatencyValues {
+  turn_id?: string | null
+  input_id?: string | null
+  speech_id?: string | null
+  asr_final_ms?: number | null
+  finalized_ms?: number | null
+  speak_requested_ms?: number | null
+  tts_first_audio_ms?: number | null
+  player_first_pcm_submitted_ms?: number | null
+  refinement_ms?: number | null
+  prewarm_status?: string | null
+  prewarm_used?: boolean
 }
 
 export interface RuntimeSnapshotPayload {
@@ -199,7 +227,7 @@ export interface TurnCompletedPayload {
   transcript: string
   response: string
   completed_at: string
-  latency?: LatencyValues
+  latency?: TurnLatencyValues
   status?: TurnTermination
   delivery?: TurnDelivery
 }
@@ -275,6 +303,7 @@ export interface SpeechOutputRecord {
   status: string
   delivery?: TurnDelivery
   latency?: Partial<LatencyValues>
+  turn_latency?: Partial<TurnLatencyValues>
   emotion_requested?: string
   emotion_applied?: string
   emotion_transport?: string

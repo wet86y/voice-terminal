@@ -43,6 +43,10 @@ class RealtimeController(SpeechPipeline, InputController):
         self.segmenter = TranscriptSegmenter(options.min_segment_chars, options.max_segment_chars)
         self._endpoint_task: asyncio.Task | None = None
         self._refine_task: asyncio.Task | None = None
+        self._tts_prewarm_tasks: dict[str, asyncio.Task] = {}
+        # Keep input timing dictionaries after the audio workspace is retired;
+        # EpisodeSpeechOutput settles the independently owned response later.
+        self._turn_timings: dict[str, dict] = {}
         self._background: set[asyncio.Task] = set()
         self._recent: deque[AudioFrame] = deque()
         self._vad_origin: int | None = None
@@ -76,6 +80,105 @@ class RealtimeController(SpeechPipeline, InputController):
 
     def _valid(self, token: tuple[str, int]) -> bool:
         return self.workspace is not None and self.workspace.token == token and self.conversation.is_current(*token)
+
+    async def _refinement_completed(self, ws: TurnWorkspace, result: dict) -> None:
+        """Hook for the Episode controller's late semantic refinement path."""
+
+    async def _publish_tts_prewarm(self, ws: TurnWorkspace, status: str, **payload) -> None:
+        logger.info(
+            "controller.tts_prewarm turn_id=%s status=%s requested_at=%s ready_at=%s",
+            ws.turn_id,
+            status,
+            ws.timings.get("tts_prewarm_requested"),
+            ws.timings.get("tts_prewarm_ready"),
+        )
+        if self.workspace is ws:
+            await self._detail("tts.prewarm", event="tts.prewarm", status=status, **payload)
+        else:
+            await self._publish(event("tts.prewarm", ws.turn_id, epoch=ws.epoch,
+                                       event="tts.prewarm", status=status,
+                                       workspace=ws.snapshot(), **payload))
+
+    async def _run_tts_prewarm(self, ws: TurnWorkspace) -> None:
+        try:
+            await self._publish_tts_prewarm(ws, "REQUESTED")
+            prewarm = getattr(self.tts, "prewarm", None) if self.tts is not None else None
+            if not callable(prewarm):
+                ws.tts_prewarm_status = "DISABLED"
+                ws.timings["tts_prewarm_status"] = ws.tts_prewarm_status
+                await self._publish_tts_prewarm(ws, ws.tts_prewarm_status, reason="unsupported")
+                return
+            result = await prewarm()
+            if isinstance(result, dict) and result.get("status") == "READY":
+                ws.timings["tts_prewarm_ready"] = time.monotonic()
+                ws.tts_prewarm_status = "READY"
+                ws.timings["tts_prewarm_status"] = ws.tts_prewarm_status
+                await self._publish_tts_prewarm(ws, "READY")
+            else:
+                ws.tts_prewarm_status = "FALLBACK"
+                ws.timings["tts_prewarm_status"] = ws.tts_prewarm_status
+                ws.timings["tts_prewarm_fallback"] = True
+                await self._publish_tts_prewarm(ws, "FALLBACK", reason=(result or {}).get("reason") if isinstance(result, dict) else None)
+        except asyncio.CancelledError:
+            ws.tts_prewarm_status = "CANCELLED"
+            ws.timings["tts_prewarm_status"] = ws.tts_prewarm_status
+            raise
+        except Exception as exc:
+            ws.tts_prewarm_status = "FAILED"
+            ws.timings["tts_prewarm_status"] = ws.tts_prewarm_status
+            ws.timings["tts_prewarm_fallback"] = True
+            logger.info("controller.tts_prewarm_failed turn_id=%s error=%s", ws.turn_id, str(exc)[:300])
+            await self._publish_tts_prewarm(ws, "FAILED", error=str(exc)[:300])
+        finally:
+            current = self._tts_prewarm_tasks.get(ws.turn_id)
+            if current is asyncio.current_task():
+                self._tts_prewarm_tasks.pop(ws.turn_id, None)
+
+    def _start_tts_prewarm(self, ws: TurnWorkspace) -> None:
+        if ws.tts_prewarm_started:
+            return
+        ws.tts_prewarm_started = True
+        ws.timings.setdefault("tts_prewarm_requested", time.monotonic())
+        if self.tts is None or getattr(self.tts, "transport", None) != "websocket_bidi":
+            ws.tts_prewarm_status = "DISABLED"
+            ws.timings["tts_prewarm_status"] = ws.tts_prewarm_status
+            return
+        ws.tts_prewarm_status = "REQUESTED"
+        task = asyncio.create_task(self._run_tts_prewarm(ws), name=f"tts-prewarm-{ws.turn_id}")
+        self._tts_prewarm_tasks[ws.turn_id] = task
+        self._track(task)
+
+    async def _cancel_tts_prewarm(self, turn_id: str | None = None) -> None:
+        tasks = []
+        for key, task in list(self._tts_prewarm_tasks.items()):
+            if turn_id is not None and key != turn_id:
+                continue
+            self._tts_prewarm_tasks.pop(key, None)
+            if not task.done():
+                task.cancel()
+            tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # A ready warm session is no longer represented by a running task.
+        # If no speech transaction has checked it out, dispose of it on turn
+        # cancellation so an abandoned turn cannot hold a socket forever.
+        output = getattr(self, "output", None)
+        output_has_pending = bool(
+            output is not None
+            and (getattr(output, "active", False) or getattr(output, "_pending", None))
+        )
+        if not output_has_pending and self._tts_session_for_controller() is None and self.tts is not None:
+            session = getattr(self.tts, "_bidi_session", None)
+            if session is not None and getattr(session, "_prewarmed", False):
+                close = getattr(self.tts, "close", None)
+                if callable(close):
+                    await close()
+
+    def _tts_session_for_controller(self):
+        """Return an output-owned session without assuming the controller type."""
+
+        output = getattr(self, "output", None)
+        return getattr(output, "_tts_session", None) if output is not None else getattr(self, "_tts_session", None)
 
     def _on_tool_status(self, name: str, status: str, reason: str) -> None:
         if name == "web_search" and "web_search" in self.state.services:
@@ -618,6 +721,10 @@ class RealtimeController(SpeechPipeline, InputController):
         self.state.clear_current()
         token = self.conversation.begin_turn(turn_id)
         self.workspace = ws = TurnWorkspace(turn_id, epoch=token.epoch, started_at=frame.captured_at)
+        ws.timings["turn_started"] = ws.started_at
+        self._turn_timings[turn_id] = ws.timings
+        if len(self._turn_timings) > 64:
+            self._turn_timings.pop(next(iter(self._turn_timings)), None)
         self._begin_tool_scope(turn_id)
         ws.audio = CurrentTurnAudioBuffer(min(62000, self.options.max_turn_ms + max(1200, self.wake_preroll_ms)) * 16)
         for previous in self._recent:
@@ -677,6 +784,8 @@ class RealtimeController(SpeechPipeline, InputController):
         self._reset_tool_scope(ws.turn_id)
         ws.tools.clear()
         ws.paraformer_final = ""
+        ws.refined_text = ""
+        ws.refinement_available = False
         ws.analysis = {
             name: dict(details)
             for name, details in self.analysis_health.items()
@@ -684,7 +793,10 @@ class RealtimeController(SpeechPipeline, InputController):
         }
         self._turn_cancel = asyncio.Event()
         self._active_input = True
-        ws.timings = {k: v for k, v in ws.timings.items() if k in {"first_segment", "asr_first_text"}}
+        keep_timings = {"turn_started", "first_segment", "asr_first_text"}
+        keep_timings.update(k for k in ws.timings if k.startswith("tts_prewarm"))
+        ws.timings = {k: v for k, v in ws.timings.items() if k in keep_timings}
+        self._turn_timings[ws.turn_id] = ws.timings
         self.state.current.update(
             final_text="", assistant_text="", tts_text="", tts_status="IDLE",
             audio_buffer_ms=0, tts_returned_ms=0, tts_played_ms=0,
@@ -743,20 +855,34 @@ class RealtimeController(SpeechPipeline, InputController):
     async def _refine(self, ws, token, audio):
         try:
             reply = await self.analysis.analyze("refine", audio, *token, self.options.refine_timeout_ms)
-            result = reply["result"]
+            result = dict(reply["result"])
             if not result.get("complete") or not isinstance(result.get("text"), str):
                 raise ValueError("incomplete refinement")
-            if self._valid(token):
-                ws.timings["sensevoice_refine_ms"] = reply["elapsed_ms"]
-                ws.analysis["refine"] = self._analysis_meta("refine", status="READY")
+            refined_text = result["text"].strip()
+            if self.wake_enabled:
+                refined_text = strip_wake_prefix(refined_text, self.wake_keyword)
+            result["text"] = refined_text
+            # SenseVoice is a supplemental result.  Keep it attached to the
+            # same workspace even after the fast Paraformer commit has
+            # retired that workspace from the live input controller.
+            ws.refined_text = refined_text
+            ws.refinement_available = True
+            ws.audio_cues = list(result.get("segments") or [])
+            ws.timings["sensevoice_refine_ms"] = reply.get("elapsed_ms")
+            ws.timings["refinement_completed"] = time.monotonic()
+            ws.analysis["refine"] = self._analysis_meta("refine", status="READY")
+            # A fast refinement can technically beat the ASR final callback.
+            # Store it now, but only notify the Agent after the primary input
+            # has crossed the formal commit boundary.
+            if ws.committed:
+                await self._refinement_completed(ws, result)
             return result
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if self._valid(token):
-                details = self._analysis_meta("refine", status="DEGRADED")
-                details.update({"error": str(exc) or "timeout", "fallback": "paraformer"})
-                ws.analysis["refine"] = details
+            details = self._analysis_meta("refine", status="DEGRADED")
+            details.update({"error": str(exc) or "timeout", "fallback": "paraformer"})
+            ws.analysis["refine"] = details
             return None
 
     async def _complete(self, ws, token, sub_id, refinement) -> None:
@@ -765,14 +891,20 @@ class RealtimeController(SpeechPipeline, InputController):
                 await asyncio.wait_for(self._sub_finals[sub_id].wait(), 5)
             except asyncio.TimeoutError:
                 await self._error("ASR_FINAL_TIMEOUT", "ASR final 超时，采用当前累计草稿。", recoverable=True, turn_id=ws.turn_id)
-            result = await refinement if refinement else None
             if not self._valid(token):
                 return
             ws.paraformer_final = "".join(self._sub_parts.values()).strip()
-            ws.final_text = result["text"] if result is not None else ws.paraformer_final
+            # Paraformer is the first-class finalized input.  SenseVoice may
+            # still be running and must not delay the Agent decision.
+            ws.final_text = ws.paraformer_final
             if self.wake_enabled:
                 ws.final_text = strip_wake_prefix(ws.final_text, self.wake_keyword)
-            ws.audio_cues = result.get("segments", []) if result else []
+            # If SenseVoice happened to finish first, retain its supplemental
+            # fields; otherwise these remain the empty defaults until the
+            # background refinement task completes.
+            if not ws.refinement_available:
+                ws.refined_text = ""
+                ws.audio_cues = []
             refine_meta = ws.analysis.get("refine", {}) if isinstance(ws.analysis, dict) else {}
             refine_ready = isinstance(refine_meta, dict) and refine_meta.get("status") == "READY"
             speech_emotion = {
@@ -790,11 +922,17 @@ class RealtimeController(SpeechPipeline, InputController):
                 ws.final_text = ""
             ws.committed = True
             ws.timings["commit"] = time.monotonic()
+            if "asr_final" in ws.timings:
+                ws.timings["asr_final_to_commit_ms"] = round((ws.timings["commit"] - ws.timings["asr_final"]) * 1000)
             self.state.current.update(final_text=ws.final_text, partial_text="")
-            await self._detail("transcript.refined", text=ws.final_text, source="sensevoice" if result is not None else "paraformer")
+            await self._detail("transcript.final", text=ws.final_text, source="paraformer")
             await self._detail("speech.emotion", **speech_emotion)
-            await self._detail("transcript.final", text=ws.final_text)
             await self._detail("turn.committed")
+            # EpisodeController retires the audio workspace as soon as the
+            # primary input is committed.  Detach the refinement task first
+            # so that normal turn cleanup does not cancel this late result.
+            if self._refine_task is refinement:
+                self._refine_task = None
             if await self._input_committed(ws, token):
                 return
             if not ws.final_text:
@@ -826,10 +964,16 @@ class RealtimeController(SpeechPipeline, InputController):
             return
         self._sub_parts[sub_id] = text or self._sub_parts[sub_id]
         ws = self.workspace
-        if text:
+        if text and text.strip():
             ws.timings.setdefault("asr_first_text", time.monotonic())
+            # The first non-empty local ASR result is the earliest reliable
+            # signal that this turn may need an answer.  Start the Bidi
+            # handshake in the background; it must never sit on the ASR/VAD
+            # capture path or wait for endpoint/final/LLM work.
+            self._start_tts_prewarm(ws)
         ws.raw_partial = "".join(self._sub_parts.values())
         if message.get("type") == "asr.final":
+            ws.timings.setdefault("asr_final", time.monotonic())
             self._sub_finals[sub_id].set()
         if self._active_input:
             self.state.current["partial_text"] = ws.raw_partial
@@ -870,6 +1014,7 @@ class RealtimeController(SpeechPipeline, InputController):
         values = {
             "wake_detection_ms": None, "asr_first_text_ms": delta("asr_first_text", "start"),
             "speech_end_confirmation_ms": delta("endpoint_accepted", "last_speech"),
+            "asr_final_to_commit_ms": delta("commit", "asr_final"),
             "llm_first_token_ms": delta("first_token", "llm_request"),
             "llm_request_to_first_tts_text_ms": delta("first_tts_text", "llm_request"),
             "tts_text_to_first_audio_ms": delta("first_audio", "first_tts_text"),
@@ -878,6 +1023,17 @@ class RealtimeController(SpeechPipeline, InputController):
             "first_segment_ms": delta("first_segment", "start"),
             "smart_turn_ms": t.get("smart_turn_ms"), "sensevoice_refine_ms": t.get("sensevoice_refine_ms"),
             "commit_to_final_llm_ms": delta("llm_request", "commit"),
+            "refine_duration_ms": t.get("sensevoice_refine_ms"),
+            "refine_to_redecision_ms": delta("refinement_redecision_started", "refinement_completed"),
+            "agent_request_to_speak_ms": delta("speak_requested", "llm_request"),
+            "tts_prewarm_requested_ms": delta("tts_prewarm_requested", "start"),
+            "tts_prewarm_ready_ms": delta("tts_prewarm_ready", "tts_prewarm_requested"),
+            "tts_checkout_ms": delta("tts_prewarm_checkout", "tts_prewarm_requested"),
+            "tts_cold_start_ms": delta("tts_session_ready", "tts_session_start")
+            if not t.get("tts_prewarm_used") else None,
+            "speech_end_to_first_pcm_ms": delta("first_pcm_submitted", "last_speech"),
+            "first_pcm_to_player_submit_ms": delta("first_pcm_submitted", "first_audio"),
+            "replacement_count": int(t.get("replacement_count", 0) or 0),
         }
         self.state.latency = {"complete": complete, "values": values}
         await self._detail("latency.snapshot", complete=complete, values=values)
@@ -981,7 +1137,7 @@ class RealtimeController(SpeechPipeline, InputController):
             # cancellation.  A late audio callback then has no route into the
             # next generation.
             self._stop_playback_snapshot(ws.playback_key if ws else None)
-        active_tts = self._tts_session
+        active_tts = getattr(self, "_tts_session", None)
         keep_tts_session = False
         if active_tts is not None:
             cancel = getattr(active_tts, "cancel", None)
@@ -1014,7 +1170,7 @@ class RealtimeController(SpeechPipeline, InputController):
             await asyncio.gather(*stopped, return_exceptions=True)
         if active_tts is not None and not (keep_tts_session and getattr(active_tts, "reusable", False)):
             await active_tts.close()
-        if self._tts_session is active_tts:
+        if getattr(self, "_tts_session", None) is active_tts:
             self._tts_session = active_tts if keep_tts_session and getattr(active_tts, "reusable", False) else None
         if ws:
             self._cancel_tool_scope(ws.turn_id)

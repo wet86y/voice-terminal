@@ -81,7 +81,7 @@ class WakeConfig:
 class VadConfig:
     model: str = "fsmn-vad"
     min_speech_ms: int = 250
-    end_silence_ms: int = 700
+    end_silence_ms: int = 300
     max_turn_ms: int = 15000
 
 
@@ -327,7 +327,7 @@ class AppConfig:
             vad=VadConfig(
                 model=_string(vad.get("model"), "fsmn-vad"),
                 min_speech_ms=int(_number(vad.get("min_speech_ms"), 250)),
-                end_silence_ms=int(_number(vad.get("end_silence_ms"), 700)),
+                end_silence_ms=int(_number(vad.get("end_silence_ms"), 300)),
                 max_turn_ms=int(_number(vad.get("max_turn_ms"), 15000)),
             ),
             asr=AsrConfig(

@@ -11,10 +11,10 @@ class InputOptions:
     web_search: bool = False
     analysis_url: str = "ws://127.0.0.1:8767/analysis"
     threshold: float = 0.5
-    candidate_ms: int = 700
-    recheck_ms: int = 400
-    smart_timeout_ms: int = 500
-    hard_silence_ms: int = 1800
+    candidate_ms: int = 500
+    recheck_ms: int = 200
+    smart_timeout_ms: int = 300
+    hard_silence_ms: int = 1400
     refine_timeout_ms: int = 3000
     min_segment_chars: int = 6
     max_segment_chars: int = 20

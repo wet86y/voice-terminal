@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from .realtime_controller import RealtimeController
 from .episode_output import EpisodeSpeechOutput
 from ..agent.episode import AgentEpisodeRuntime
-from ..core.events import VoiceEvent, utc_now_iso
+from ..core.events import VoiceEvent, event, utc_now_iso
 from ..core.state import TerminalState
+from ..session.contracts import DeliveryReport
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +26,9 @@ class EpisodeController(RealtimeController):
         self._barge_trace_state = None
         self.episode_history: dict[str, str] = {}
         self._input_history_committed: set[str] = set()
+        self._refinement_events: set[str] = set()
+        self._committed_workspaces: dict[str, object] = {}
+        self._settled_turns: set[str] = set()
 
     def _make_episode(self):
         runtime = AgentEpisodeRuntime(self.llm, self.registry, self.output, self._agent_event,
@@ -43,10 +48,49 @@ class EpisodeController(RealtimeController):
             # The session ledger is the only durable conversational memory.
             # A speech record enters it only after the player reports what the
             # user actually heard.
-            self.history.commit_delivery(str(payload.get("speech_id") or ""), str(payload.get("text") or ""),
-                                         payload.get("delivery") if isinstance(payload.get("delivery"), dict) else None,
-                                         termination=str(payload.get("status") or "completed"))
+            delivery = DeliveryReport.from_payload(
+                payload.get("delivery") if isinstance(payload.get("delivery"), dict) else None,
+                termination=str(payload.get("status") or "completed"),
+            )
+            self.history.commit_delivery(str(payload.get("speech_id") or ""), str(payload.get("text") or ""), delivery)
+            if payload.get("kind") != "prefill":
+                await self._settle_committed_turn(
+                    str(payload.get("turn_id") or ""),
+                    outcome=str(payload.get("status") or "completed"),
+                    speech_id=str(payload.get("speech_id") or "") or None,
+                    latency=payload.get("latency") if isinstance(payload.get("latency"), dict) else None,
+                )
+        elif kind == "turn.latency":
+            latency = payload.get("latency")
+            update = getattr(self.history, "update_turn_latency", None)
+            if callable(update) and isinstance(latency, dict):
+                update(str(payload.get("turn_id") or ""), latency)
+            if isinstance(latency, dict):
+                current_values = dict(self.state.latency.get("values") or {})
+                for key, value in latency.items():
+                    if key in current_values and (value is None or isinstance(value, (int, float))):
+                        current_values[key] = value
+                self.state.latency = {"complete": True, "values": current_values}
+        elif kind == "agent.turn_settled":
+            await self._settle_committed_turn(
+                str(payload.get("turn_id") or ""),
+                outcome=str(payload.get("outcome") or "completed"),
+            )
         await self._publish(VoiceEvent(kind, payload.get("input_id") or payload.get("turn_id") or self.episode.last_turn_id, payload))
+        # ``_finish_v2`` retires the input workspace immediately after the
+        # finalized event, while the Agent request is deliberately still
+        # running.  Releasing prewarm merely because ``workspace is None``
+        # therefore races the first formal speak and turns the warm path into
+        # a cold start.  A session is idle only after the Agent has settled,
+        # its watchdog is gone, and no speech/prefill transaction owns it.
+        output_has_pending = bool(self.output.active or getattr(self.output, "_pending", None))
+        if (kind == "agent.episode" and self.workspace is None
+                and payload.get("agent_busy") is False
+                and not payload.get("response_check_active")
+                and not output_has_pending):
+            turn_id = payload.get("turn_id") or self.episode.last_turn_id
+            if isinstance(turn_id, str):
+                await self._cancel_tts_prewarm(turn_id)
 
     async def start_listening(self):
         if self.episode.closed:
@@ -137,17 +181,212 @@ class EpisodeController(RealtimeController):
             ws.episode_id = self.episode.episode_id
             if ws.episode_id:
                 self.episode_history[ws.turn_id] = ws.episode_id
-            if not self._valid(token):
-                return True
-            if ws.paraformer_final and ws.paraformer_final != ws.final_text:
-                await self.episode.observe("USER_INPUT_REFINED", turn_id=ws.turn_id, text=ws.final_text,
-                                           audio_cues=list(ws.audio_cues), analysis=dict(ws.analysis),
-                                           input_finished_at=ws.timings.get("commit"))
-                ws.episode_id = self.episode.episode_id
-                if ws.episode_id:
-                    self.episode_history[ws.turn_id] = ws.episode_id
-        await self._finish_v2(ws, "")
+            # Refinement that completed just before ASR final is applied only
+            # after the primary input is marked final.  A late refinement
+            # arriving afterwards uses the same hook below.
+            if ws.refinement_available and ws.refined_text:
+                await self._refinement_completed(ws, {
+                    "text": ws.refined_text,
+                    "segments": list(ws.audio_cues),
+                })
+        # Finalized input is not a completed dialogue turn.  Retire only the
+        # capture workspace so ASR resources are released while Agent/TTS and
+        # late SenseVoice refinement retain the same turn correlation.
+        await self._commit_input_workspace(ws)
+        if not ws.final_text:
+            await self._settle_committed_turn(ws.turn_id, outcome="empty_input")
+        await self._retire_committed_input(ws)
         return True
+
+    async def _commit_input_workspace(self, ws):
+        """Persist the primary transcript once, without publishing a terminal state."""
+
+        await self._ensure_workspace_episode(ws)
+        if ws.turn_id in self._input_history_committed:
+            return next((item for item in self.history.records if item.turn_id == ws.turn_id), None)
+        self.history.commit_input(ws.turn_id, ws.final_text, details={
+            "segments": list(ws.segments), "audio_cues": list(ws.audio_cues),
+            "analysis": dict(ws.analysis), "refined_text": ws.refined_text,
+            "refinement_available": ws.refinement_available,
+        })
+        record = self.history.append_record({
+            "turn_id": ws.turn_id, "transcript": ws.final_text,
+            "delivery": {"status": "pending", "termination": "pending"},
+            "conversation_id": ws.episode_id,
+            "details": {"segments": list(ws.segments), "provisional_transcript": ws.paraformer_final,
+                        "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis),
+                        "refined_text": ws.refined_text,
+                        "refinement_available": ws.refinement_available},
+        })
+        self._input_history_committed.add(ws.turn_id)
+        self._committed_workspaces[ws.turn_id] = ws
+        if len(self._committed_workspaces) > 64:
+            self._committed_workspaces.pop(next(iter(self._committed_workspaces)), None)
+        return record
+
+    async def _retire_committed_input(self, ws):
+        """Release capture-only state after commit without cancelling output work."""
+
+        if self.workspace is not ws:
+            return
+        self.workspace = None
+        self._active_input = False
+        if self._completion_task is asyncio.current_task():
+            self._completion_task = None
+        self._endpoint_task = None
+        for sub_id in self._sub_parts:
+            try:
+                self._queue_asr(sub_id)
+            except asyncio.QueueFull:
+                pass
+        self._sub_parts.clear()
+        self._sub_finals.clear()
+        self._resume_started = None
+        self._speech_samples = 0
+        self._speech_start_sample = self._speech_end_sample = None
+        self._vad_origin = None
+        self._vad_epoch += 1
+        self._reset_vad_pending = True
+
+    async def _settle_committed_turn(self, turn_id, *, outcome, speech_id=None, latency=None):
+        """Emit one terminal record for a committed turn after its true outcome."""
+
+        if not turn_id or turn_id in self._settled_turns:
+            return
+        ws = self._committed_workspaces.get(turn_id)
+        if ws is None:
+            return
+        self._settled_turns.add(turn_id)
+        record = next((item for item in self.history.records if item.turn_id == turn_id), None)
+        # Formal speech owns its measured latency and emits it immediately
+        # after speech.completed.  Control-only/empty-input paths have no
+        # SpeechHandle, so settlement itself produces their single final
+        # latency snapshot.
+        if latency is None:
+            ws.timings.setdefault("completed", time.monotonic())
+            timings = ws.timings
+
+            def elapsed(end, start):
+                left = timings.get(end)
+                right = ws.started_at if start == "start" else timings.get(start)
+                return max(0, round((left - right) * 1000)) if left is not None and right is not None else None
+
+            latency = {
+                "wake_detection_ms": None,
+                "asr_first_text_ms": elapsed("asr_first_text", "start"),
+                "speech_end_confirmation_ms": elapsed("endpoint_accepted", "last_speech"),
+                "asr_final_to_commit_ms": elapsed("commit", "asr_final"),
+                "llm_first_token_ms": elapsed("first_token", "llm_request"),
+                "llm_request_to_first_tts_text_ms": elapsed("first_tts_text", "llm_request"),
+                "tts_text_to_first_audio_ms": elapsed("first_audio", "first_tts_text"),
+                "first_audio_to_playback_ms": elapsed("playback", "first_audio"),
+                "speech_end_to_playback_ms": elapsed("playback", "last_speech"),
+                "turn_total_ms": elapsed("completed", "start"),
+                "first_segment_ms": elapsed("first_segment", "start"),
+                "smart_turn_ms": timings.get("smart_turn_ms"),
+                "sensevoice_refine_ms": timings.get("sensevoice_refine_ms"),
+                "refine_duration_ms": timings.get("sensevoice_refine_ms"),
+                "refine_to_redecision_ms": elapsed("refinement_redecision_started", "refinement_completed"),
+                "agent_request_to_speak_ms": elapsed("speak_requested", "llm_request"),
+                "tts_prewarm_requested_ms": elapsed("tts_prewarm_requested", "start"),
+                "tts_prewarm_ready_ms": elapsed("tts_prewarm_ready", "tts_prewarm_requested"),
+                "tts_checkout_ms": elapsed("tts_prewarm_checkout", "tts_prewarm_requested"),
+                "tts_cold_start_ms": elapsed("tts_session_ready", "tts_session_start")
+                if not timings.get("tts_prewarm_used") else None,
+                "speech_end_to_first_pcm_ms": elapsed("first_pcm_submitted", "last_speech"),
+                "first_pcm_to_player_submit_ms": elapsed("first_pcm_submitted", "first_audio"),
+                "replacement_count": int(timings.get("replacement_count", 0) or 0),
+            }
+            self.state.latency = {"complete": True, "values": dict(latency)}
+            turn_latency = {
+                "turn_id": turn_id,
+                "input_id": turn_id,
+                "speech_id": None,
+                "asr_first_text_ms": latency.get("asr_first_text_ms"),
+                "speech_end_confirmation_ms": latency.get("speech_end_confirmation_ms"),
+                "asr_final_ms": None,
+                "finalized_ms": None,
+                "llm_first_token_ms": latency.get("llm_first_token_ms"),
+                "speak_requested_ms": None,
+                "tts_first_audio_ms": None,
+                "player_first_pcm_submitted_ms": None,
+                "refinement_ms": ws.timings.get("sensevoice_refine_ms"),
+                "prewarm_status": getattr(ws, "tts_prewarm_status", None),
+                "replacement_count": int(ws.timings.get("replacement_count", 0) or 0),
+            }
+            await self._publish(event("turn.latency", turn_id, input_id=turn_id,
+                                      speech_id=None, turn=turn_latency, latency=latency))
+        if record is not None:
+            record.delivery = {"status": outcome, "termination": outcome}
+            if isinstance(latency, dict):
+                record.details["latency"] = dict(latency)
+        await self._publish(VoiceEvent("turn.completed", turn_id, {
+            "turn_id": turn_id, "input_id": turn_id, "speech_id": speech_id,
+            "transcript": ws.final_text, "status": outcome,
+            "conversation_id": ws.episode_id, "completed_at": utc_now_iso(),
+            "details": record.details if record else {},
+        }))
+        self._committed_workspaces.pop(turn_id, None)
+        if self.conversation.current_turn_id == turn_id and self.workspace is None and not self.output.active:
+            await self._state_event(TerminalState.IDLE, listening=self.state.listening)
+        await self._cancel_tts_prewarm(turn_id)
+
+    async def _refinement_completed(self, ws, result: dict) -> None:
+        """Attach SenseVoice evidence to one finalized turn and wake Agent once."""
+
+        text = str(result.get("text") or "").strip()
+        if not text:
+            return
+        if self.wake_enabled:
+            from ..kws.keywords import strip_wake_prefix
+            text = strip_wake_prefix(text, self.wake_keyword)
+        ws.refined_text = text
+        ws.refinement_available = True
+        segments = list(result.get("segments") or [])
+        if segments:
+            ws.audio_cues = segments
+        ws.timings.setdefault("refinement_completed", time.monotonic())
+
+        if ws.turn_id not in self._refinement_events:
+            self._refinement_events.add(ws.turn_id)
+            if len(self._refinement_events) > 128:
+                self._refinement_events = set(list(self._refinement_events)[-64:])
+            payload = {
+                "text": text,
+                "source": "sensevoice",
+                "workspace": ws.snapshot(),
+            }
+            if self.workspace is ws:
+                await self._detail("transcript.refined", text=text, source="sensevoice")
+                await self._detail("speech.emotion", status="READY", source="SenseVoiceSmall",
+                                    segments=segments)
+            else:
+                await self._publish(event("transcript.refined", ws.turn_id, epoch=ws.epoch, **payload))
+                await self._publish(event("speech.emotion", ws.turn_id, epoch=ws.epoch,
+                                           status="READY", source="SenseVoiceSmall", segments=segments,
+                                           workspace=ws.snapshot()))
+
+        # Do not let a refinement that wins the race with finalization start a
+        # provisional Agent decision.  The final observer below will call this
+        # hook again once the input record is finalized.
+        source = self.episode.inputs.get(ws.turn_id, {}) if self.episode.episode_id else {}
+        if not source.get("final"):
+            return
+        updater = getattr(self.history, "update_input_refinement", None)
+        if callable(updater):
+            updater(ws.turn_id, text, details={"audio_cues": segments, "analysis": dict(ws.analysis)})
+        if self.episode.closed or self.episode.episode_id is None:
+            return
+        if self.conversation.current_turn_id != ws.turn_id:
+            # Keep the late evidence in the ledger, but never wake a newer
+            # user turn with an old refinement.
+            return
+        await self.episode.observe("USER_INPUT_REFINED", turn_id=ws.turn_id, text=text,
+                                    audio_cues=segments, analysis=dict(ws.analysis),
+                                    input_finished_at=ws.timings.get("commit"), epoch=ws.epoch)
+        ws.episode_id = self.episode.episode_id
+        if ws.episode_id:
+            self.episode_history[ws.turn_id] = ws.episode_id
 
     async def _ensure_workspace_episode(self, ws):
         if ws.episode_id:
@@ -173,15 +412,59 @@ class EpisodeController(RealtimeController):
                     "uncertain_text": "", "unheard_text": "", "precision": "complete"}
         if ws.turn_id not in self._input_history_committed:
             self.history.commit_input(ws.turn_id, ws.final_text, details={"segments": list(ws.segments),
-                                      "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis)})
+                                      "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis),
+                                      "refined_text": ws.refined_text,
+                                      "refinement_available": ws.refinement_available})
             record = self.history.append_record({"turn_id": ws.turn_id, "transcript": ws.final_text,
                                                  "delivery": delivery, "conversation_id": ws.episode_id,
                                                  "details": {"segments": list(ws.segments), "provisional_transcript": ws.paraformer_final,
-                                                             "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis)}})
+                                                             "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis),
+                                                             "refined_text": ws.refined_text,
+                                                             "refinement_available": ws.refinement_available}})
             self._input_history_committed.add(ws.turn_id)
         else:
             record = next((item for item in self.history.records if item.turn_id == ws.turn_id), None)
-        await self._detail("turn.completed", transcript=ws.final_text, response="", latency={},
+        # A turn without an output still needs a terminal timestamp.  If a
+        # speech transaction is later created, EpisodeSpeechOutput replaces
+        # this provisional value with the actual output-settlement time.
+        ws.timings.setdefault("completed", time.monotonic())
+        await self._latency(ws, complete=True)
+        latency = dict(self.state.latency.get("values") or {})
+        def since_turn(key):
+            return round((ws.timings[key] - ws.timings["turn_started"]) * 1000) \
+                if key in ws.timings and "turn_started" in ws.timings else None
+
+        def elapsed(start, end):
+            return round((ws.timings[end] - ws.timings[start]) * 1000) \
+                if start in ws.timings and end in ws.timings else None
+
+        turn_latency = {
+            "turn_id": ws.turn_id,
+            "input_id": ws.turn_id,
+            "speech_id": None,
+            "asr_first_text_ms": since_turn("asr_first_text"),
+            "speech_end_confirmation_ms": elapsed("last_speech", "endpoint_accepted"),
+            "asr_final_ms": since_turn("asr_final"),
+            "finalized_ms": since_turn("commit"),
+            "llm_first_token_ms": since_turn("first_token"),
+            "speak_requested_ms": since_turn("speak_requested"),
+            "tts_first_audio_ms": since_turn("first_audio"),
+            "player_first_pcm_submitted_ms": since_turn("first_pcm_submitted"),
+            "refinement_ms": ws.timings.get("sensevoice_refine_ms"),
+            "prewarm_status": ws.tts_prewarm_status,
+            "prewarm_used": bool(ws.timings.get("tts_prewarm_used")),
+            "replacement_count": int(ws.timings.get("replacement_count", 0) or 0),
+        }
+        latency.update({"turn_id": ws.turn_id, "input_id": ws.turn_id,
+                        "speech_id": None, "prewarm_status": ws.tts_prewarm_status,
+                        "replacement_count": int(ws.timings.get("replacement_count", 0) or 0)})
+        if record is not None:
+            record.details["latency"] = dict(latency)
+            record.details["turn_latency"] = dict(turn_latency)
+        await self._publish(event("turn.latency", ws.turn_id,
+                                  turn_id=ws.turn_id, input_id=ws.turn_id,
+                                  speech_id=None, turn=turn_latency, latency=latency))
+        await self._detail("turn.completed", transcript=ws.final_text, response="", latency=latency,
                            delivery=delivery, status="completed", conversation_id=ws.episode_id,
                            completed_at=utc_now_iso(), details=record.details if record else {})
         await self._cancel_turn(reason="completed", record=False)
@@ -190,6 +473,8 @@ class EpisodeController(RealtimeController):
     async def _cancel_turn(self, *, reason="stopped", snapshot=None, record=True):
         # Input cleanup never blocks/cancels the independently owned output.
         ws = self.workspace
+        if reason != "completed":
+            await self._cancel_tts_prewarm(ws.turn_id if ws else None)
         if record and ws and ws.turn_id not in self._input_history_committed:
             await self._ensure_workspace_episode(ws)
             self.history.commit_input(ws.turn_id, ws.final_text or ws.raw_partial)
@@ -243,6 +528,10 @@ class EpisodeController(RealtimeController):
             await self._cancel_turn(reason="stopped", record=True)
         if not self.episode.closed:
             await self.episode.stop()
+        await self._cancel_tts_prewarm()
+        close_tts = getattr(self.tts, "close", None)
+        if callable(close_tts):
+            await close_tts()
         await super().stop_listening()
 
     async def reset_session(self):
@@ -251,6 +540,11 @@ class EpisodeController(RealtimeController):
             await self._cancel_turn(reason="reset", record=True)
         if not self.episode.closed:
             await self.episode.end("reset")
+        await self.output.close()
+        await self._cancel_tts_prewarm()
+        close_tts = getattr(self.tts, "close", None)
+        if callable(close_tts):
+            await close_tts()
         self._endpoint_context = None
         self.barge_in_gate.reset()
         if self.vad is not None:
@@ -266,4 +560,8 @@ class EpisodeController(RealtimeController):
             await self._cancel_turn(reason="stopped", record=True)
         if not self.episode.closed:
             await self.episode.stop()
+        await self._cancel_tts_prewarm()
+        close_tts = getattr(self.tts, "close", None)
+        if callable(close_tts):
+            await close_tts()
         await super().close()

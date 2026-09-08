@@ -71,6 +71,10 @@ class MiniMaxTtsSession:
         self._backpressure_idle = asyncio.Event()
         self._backpressure_idle.set()
         self._retry_cancel = asyncio.Event()
+        self._start_lock = asyncio.Lock()
+        self._prewarmed = False
+        self._prewarm_inflight = False
+        self._prewarm_ready = asyncio.Event()
 
     @property
     def reusable(self) -> bool:
@@ -162,6 +166,14 @@ class MiniMaxTtsSession:
             self._audio = None
 
     async def start(self) -> None:
+        # Prewarm and the first real text can race on the same retained
+        # session.  Serialize the handshake so task_start is sent exactly
+        # once and the caller either checks out a ready socket or waits for
+        # the in-flight cold start to finish.
+        async with self._start_lock:
+            await self._start()
+
+    async def _start(self) -> None:
         # ``session()`` returns the same object for Bidi.  A previous flush or
         # cancel ended only its generation, so starting the next one must not
         # send a second task_start or create a second receiver task.
@@ -600,6 +612,7 @@ class MiniMaxTtsSession:
     async def close(self) -> None:
         self._closed = True
         self._connection_dead = True
+        self._prewarmed = False
         self._retry_cancel.set()
         receiver, self._receiver = self._receiver, None
         socket, self._socket = self._socket, None
@@ -874,7 +887,16 @@ class MiniMaxTtsClient:
         if self.emotion_mode != "agent":
             selected = self.default_emotion
         if self.transport == "websocket_bidi" and self._bidi_session is not None and selected != self._active_emotion:
-            await self._bidi_session.close()
+            session = self._bidi_session
+            # A prewarm may still be in the handshake.  Wait for the session
+            # start lock before closing it so a mismatched-emotion checkout
+            # cannot race a socket assignment and leak the new connection.
+            start_lock = getattr(session, "_start_lock", None)
+            if start_lock is not None:
+                async with start_lock:
+                    await session.close()
+            else:
+                await session.close()
             self._bidi_session = None
         self._active_emotion = selected
         return selected
@@ -908,6 +930,76 @@ class MiniMaxTtsClient:
                 self._bidi_session = MiniMaxTtsSession(self, emotion=self._active_emotion)
             return self._bidi_session
         return MiniMaxTtsSession(self, emotion=self._active_emotion)
+
+    async def prewarm(self, emotion: str | None = None) -> dict[str, Any]:
+        """Open an idle Bidi task_start session without sending any text.
+
+        The returned session is deliberately only a checkout candidate.  It
+        has not synthesized audio and becomes consumed as soon as the first
+        real speech transaction claims it.  Non-Bidi transports report a
+        disabled result so the controller can keep the same asynchronous
+        trigger without changing their cold-start behavior.
+        """
+
+        if self.transport != "websocket_bidi" or not self.session_reuse:
+            return {"status": "DISABLED", "reason": "bidi_session_reuse_unavailable"}
+        selected = self.normalize_emotion(emotion or self.default_emotion)
+        await self.prepare_emotion(selected)
+        session = self.session()
+        # Emotion is part of task_start, so a concurrent Agent decision may
+        # have selected a different voice between prepare_emotion() and
+        # session().  Never label that connection as a calm warm candidate;
+        # the real output path will create a correctly configured cold one.
+        if session.emotion != selected:
+            if session is self._bidi_session and not session.generation_active:
+                await session.close()
+                self._bidi_session = None
+            return {"status": "FALLBACK", "reason": "emotion_changed"}
+        if session.generation_active:
+            return {"status": "FALLBACK", "reason": "session_busy"}
+        session._prewarm_inflight = True
+        session._prewarm_ready.clear()
+        try:
+            await session.start()
+            if (session is not self._bidi_session or session.emotion != self._active_emotion
+                    or not session.reusable):
+                await session.close()
+                if session is self._bidi_session:
+                    self._bidi_session = None
+                return {"status": "FALLBACK", "reason": "session_not_reusable"}
+            session._prewarmed = True
+            logger.info("minimax.prewarm_ready connection_id=%s emotion=%s", session.connection_id, selected)
+            return {"status": "READY", "connection_id": session.connection_id}
+        except asyncio.CancelledError:
+            await session.close()
+            if session is self._bidi_session:
+                self._bidi_session = None
+            raise
+        except MiniMaxEmotionUnsupported as exc:
+            # ``start`` has already closed the rejected socket and disabled
+            # the optional emotion extension.  A future real speak will use
+            # the normal neutral cold-start fallback.
+            logger.info("minimax.prewarm_emotion_fallback error=%s", str(exc)[:300])
+            return {"status": "FALLBACK", "reason": "emotion_unsupported"}
+        except Exception as exc:
+            logger.info("minimax.prewarm_failed error=%s", str(exc)[:300])
+            return {"status": "FALLBACK", "reason": str(exc)[:300]}
+        finally:
+            session._prewarm_inflight = False
+            session._prewarm_ready.set()
+
+    def checkout_prewarm(self, session: MiniMaxTtsSession) -> bool:
+        """Claim a ready warm session exactly once for real speech."""
+
+        if (
+            session is self._bidi_session
+            and getattr(session, "_prewarmed", False)
+            and session.emotion == self._active_emotion
+            and session.reusable
+        ):
+            session._prewarmed = False
+            return True
+        return False
 
     async def close(self) -> None:
         """Close a retained Bidi connection during runtime shutdown."""

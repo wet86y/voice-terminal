@@ -50,14 +50,71 @@ class SessionLedger:
         if text.strip():
             self.entries.append(SessionLedgerEntry("input", text, {"turn_id": turn_id, **(details or {})}))
 
+    def has_input(self, turn_id: str) -> bool:
+        """Whether this finalized turn is already represented in model history.
+
+        Turn identity, rather than transcript text, is the only safe way to
+        decide this: users can legitimately repeat the same sentence in two
+        adjacent turns.
+        """
+
+        return any(entry.kind == "input" and entry.metadata.get("turn_id") == turn_id
+                   for entry in self.entries)
+
+    def input_refinement(self, turn_id: str) -> str:
+        """Return the supplemental refinement already durable for one turn."""
+
+        for entry in reversed(self.entries):
+            if entry.kind == "input" and entry.metadata.get("turn_id") == turn_id:
+                value = entry.metadata.get("refined_text")
+                return value.strip() if isinstance(value, str) else ""
+        return ""
+
+    def update_input_refinement(self, turn_id: str, refined_text: str, *, details: dict[str, Any] | None = None) -> None:
+        """Attach late ASR refinement to an existing input without duplicating it.
+
+        The initial Paraformer transcript remains the durable user message.  A
+        refinement is supplemental evidence for later context projections and
+        for the active Agent turn, not a second user message.
+        """
+
+        value = str(refined_text or "").strip()
+        if not value:
+            return
+        for entry in reversed(self.entries):
+            if entry.kind != "input" or entry.metadata.get("turn_id") != turn_id:
+                continue
+            entry.metadata["refined_text"] = value
+            if details:
+                entry.metadata.update(details)
+            break
+        for record in self.records:
+            if record.turn_id != turn_id:
+                continue
+            record.details["refined_text"] = value
+            if details:
+                record.details.update(details)
+            break
+
+    def update_turn_latency(self, turn_id: str, latency: dict[str, Any]) -> None:
+        """Attach the settled speech timing snapshot to the input record."""
+
+        if not turn_id or not isinstance(latency, dict):
+            return
+        for record in self.records:
+            if record.turn_id == turn_id:
+                record.details["latency"] = dict(latency)
+                break
+
     def commit_delivery(self, speech_id: str, text: str, delivery: DeliveryReport) -> None:
         # The model must never treat text that never reached the user as shared knowledge.
         if delivery.heard_text.strip():
             self.entries.append(SessionLedgerEntry("speech", delivery.heard_text, {"speech_id": speech_id}))
-        if delivery.termination == "interrupted":
+        if delivery.termination in {"interrupted", "replaced"}:
             self.entries.append(SessionLedgerEntry("delivery_notice", {
                 "heard": delivery.heard_text, "uncertain": delivery.uncertain_text,
                 "unheard": delivery.unheard_text, "precision": delivery.precision,
+                "termination": delivery.termination,
             }))
 
     def commit_tool(self, exchange: ToolExchange) -> None:
@@ -75,6 +132,12 @@ class SessionLedger:
         for entry in self.entries:
             if entry.kind == "input":
                 messages.append({"role": "user", "content": entry.content})
+                refined = entry.metadata.get("refined_text")
+                if isinstance(refined, str) and refined.strip():
+                    messages.append({
+                        "role": "system",
+                        "content": "该用户语音输入的后续精修补充为：" + refined.strip(),
+                    })
             elif entry.kind == "speech":
                 messages.append({"role": "assistant", "content": entry.content})
             elif entry.kind == "delivery_notice":

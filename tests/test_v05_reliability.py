@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 import unittest
 
 from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.audio.player import PcmPlayer
 from voice_terminal.controller.realtime_controller import RealtimeController
+from voice_terminal.controller.episode_controller import EpisodeController
 from voice_terminal.controller.turn_workspace import AudioFrame, CurrentTurnAudioBuffer
 from voice_terminal.core.state import RuntimeState, TerminalState
+from voice_terminal.session.ledger import SessionLedger
+from voice_terminal.session.runtime import ConversationRuntime
 
 
 class FormalSpeechGateTests(unittest.TestCase):
@@ -184,3 +188,42 @@ class PlaybackDiagnosticsTests(unittest.TestCase):
         submitted = player.diagnostics
         self.assertEqual(submitted["first_rendered_key"], "speech-1")
         self.assertIsInstance(submitted["first_rendered_at"], float)
+
+
+class TurnSettlementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_settlement_emits_one_terminal_turn_event(self) -> None:
+        controller = object.__new__(EpisodeController)
+        controller._settled_turns = set()
+        controller._committed_workspaces = {
+            "turn_a": SimpleNamespace(turn_id="turn_a", final_text="已定稿", episode_id="conversation_a",
+                                      started_at=time.monotonic(), timings={}, tts_prewarm_status="DISABLED"),
+        }
+        controller._turn_timings = {}
+        controller.history = SessionLedger()
+        record = controller.history.append_record({"turn_id": "turn_a", "transcript": "已定稿"})
+        controller.workspace = None
+        controller.output = SimpleNamespace(active=False)
+        controller.conversation = ConversationRuntime()
+        controller.conversation.begin_turn("turn_a")
+        controller.state = RuntimeState()
+        controller.state.listening = True
+        events = []
+
+        async def publish(item):
+            events.append(item)
+
+        async def state_event(state, *, listening=None, turn_id=None):
+            controller.state.terminal = state
+
+        async def cancel_prewarm(_turn_id):
+            return None
+
+        controller._publish = publish
+        controller._state_event = state_event
+        controller._cancel_tts_prewarm = cancel_prewarm
+
+        await controller._settle_committed_turn("turn_a", outcome="completed", speech_id="speech_a")
+        await controller._settle_committed_turn("turn_a", outcome="completed", speech_id="speech_a")
+
+        assert [item.type for item in events] == ["turn.latency", "turn.completed"]
+        assert record.delivery == {"status": "completed", "termination": "completed"}

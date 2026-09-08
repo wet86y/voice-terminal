@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$Python = "python",
   [string]$Config = "config/local.yaml",
   [switch]$NoWorker,
@@ -12,10 +12,35 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Push-Location $RepoRoot
 $worker = $null
 $analysisWorker = $null
+
+function Get-ListeningProcessDetails([int]$Port) {
+  $listenerProcessIds = @(
+    Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
+      Select-Object -ExpandProperty OwningProcess -Unique
+  )
+  foreach ($listenerProcessId in $listenerProcessIds) {
+    $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $listenerProcessId" -ErrorAction SilentlyContinue
+    if ($processInfo) {
+      [PSCustomObject]@{
+        Id = $listenerProcessId
+        CommandLine = $processInfo.CommandLine
+        CreationDate = $processInfo.CreationDate
+      }
+    } else {
+      [PSCustomObject]@{ Id = $listenerProcessId; CommandLine = "unknown"; CreationDate = "unknown" }
+    }
+  }
+}
+
 try {
-  $serviceConfig = & $Python -c "import json,sys; from pathlib import Path; from voice_terminal.config import load_config; from urllib.parse import urlparse; c=load_config(Path('config/default.yaml'),Path(sys.argv[1])); a=urlparse(c.smart_turn.analysis_url); w=urlparse(c.asr.worker_url); print(json.dumps({'analysis_enabled':c.smart_turn.smart_turn or c.smart_turn.sensevoice,'analysis_smart_turn':c.smart_turn.smart_turn,'analysis_sensevoice':c.smart_turn.sensevoice,'analysis_health':'http://'+a.netloc+'/health','asr_url':c.asr.worker_url,'asr_host':w.hostname,'asr_port':w.port}))" $Config
+  $serviceConfig = & $Python -c "import json,sys; from pathlib import Path; from voice_terminal.config import load_config; from urllib.parse import urlparse; c=load_config(Path('config/default.yaml'),Path(sys.argv[1]) if Path(sys.argv[1]).is_file() else None); a=urlparse(c.smart_turn.analysis_url); w=urlparse(c.asr.worker_url); print(json.dumps({'analysis_enabled':c.smart_turn.smart_turn or c.smart_turn.sensevoice,'analysis_smart_turn':c.smart_turn.smart_turn,'analysis_sensevoice':c.smart_turn.sensevoice,'analysis_health':'http://'+a.netloc+'/health','asr_url':c.asr.worker_url,'asr_host':w.hostname,'asr_port':w.port,'server_host':c.server.host,'server_port':c.server.port}))" $Config
   if ($LASTEXITCODE -ne 0) { throw "无法读取启动配置" }
   $serviceConfig = $serviceConfig | ConvertFrom-Json
+  $existingServer = @(Get-ListeningProcessDetails ([int]$serviceConfig.server_port))
+  if ($existingServer.Count -gt 0) {
+    $details = $existingServer | ForEach-Object { "PID=$($_.Id) started=$($_.CreationDate) command=$($_.CommandLine)" }
+    throw "Voice Server 端口 $($serviceConfig.server_port) 已有监听进程。为防止前端连接旧后端，启动已中止。`n$($details -join [Environment]::NewLine)"
+  }
   if ($serviceConfig.analysis_enabled -and -not $NoAnalysis) {
     $existingAnalysis = $null
     try { $existingAnalysis = Invoke-RestMethod -Uri $serviceConfig.analysis_health -TimeoutSec 2 } catch { }

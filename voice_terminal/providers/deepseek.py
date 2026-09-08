@@ -32,7 +32,13 @@ class DeepSeekClient:
             raise ValueError("reasoning_effort must be low, high, or max")
         self.reasoning_effort = reasoning_effort
 
-    def _request_payload(self, messages: Sequence[Mapping[str, str]]) -> dict[str, Any]:
+    def _request_payload(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        tools: list[dict] | None = None,
+        tool_choice: str | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [dict(message) for message in messages],
@@ -42,6 +48,22 @@ class DeepSeekClient:
         payload["thinking"] = {"type": "enabled" if self.thinking != "disabled" else "disabled"}
         if self.thinking != "disabled":
             payload["reasoning_effort"] = self.reasoning_effort
+        if tools:
+            payload["tools"] = tools
+            # DeepSeek accepts native tool declarations together with thinking,
+            # but the currently deployed thinking endpoint rejects an explicit
+            # tool_choice (including "required").  Tool priority is enforced
+            # by the Agent prompt and local tool gate, not by an incompatible
+            # transport parameter.  Keep the optional argument for non-thinking
+            # callers that use this client directly.
+            if tool_choice is not None and self.thinking == "disabled":
+                payload["tool_choice"] = tool_choice
+            elif tool_choice is not None:
+                logger.warning(
+                    "deepseek.tool_choice_omitted_for_thinking requested=%s model=%s",
+                    tool_choice,
+                    self.model,
+                )
         return payload
 
     async def stream_chat(self, messages, *, cancel_event=None) -> AsyncIterator[str]:
@@ -79,11 +101,7 @@ class DeepSeekClient:
         )
         delta_count = 0
         response_chars = 0
-        payload = self._request_payload(messages)
-        if tools:
-            payload["tools"] = tools
-            if tool_choice is not None:
-                payload["tool_choice"] = tool_choice
+        payload = self._request_payload(messages, tools=tools, tool_choice=tool_choice)
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         finished = False

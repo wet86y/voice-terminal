@@ -56,6 +56,9 @@ class RuntimeState:
             "tts_transport": "websocket",
             "tts_scheduling": "auto",
             "delivery": {},
+            "refinement_available": False,
+            "tts_prewarm_started": False,
+            "tts_prewarm_status": "NOT_REQUESTED",
         }
     )
     latency: dict[str, Any] = field(
@@ -70,7 +73,22 @@ class RuntimeState:
                 "tts_text_to_first_audio_ms": None,
                 "first_audio_to_playback_ms": None,
                 "speech_end_to_playback_ms": None,
+                "asr_final_to_commit_ms": None,
+                "refine_duration_ms": None,
+                "refine_to_redecision_ms": None,
+                "agent_request_to_speak_ms": None,
+                "tts_prewarm_requested_ms": None,
+                "tts_prewarm_ready_ms": None,
+                "tts_checkout_ms": None,
+                "tts_cold_start_ms": None,
+                "speech_end_to_first_pcm_ms": None,
+                "first_pcm_to_player_submit_ms": None,
+                "replacement_count": 0,
                 "turn_total_ms": None,
+                "first_segment_ms": None,
+                "smart_turn_ms": None,
+                "sensevoice_refine_ms": None,
+                "commit_to_final_llm_ms": None,
             },
         }
     )
@@ -112,8 +130,9 @@ class RuntimeState:
             tts_remaining_ms=0,
             delivery={},
         )
-        for key in ("turn_id", "epoch", "phase", "committed", "agent_phase", "paraformer_final", "refined_text", "segments", "tools", "audio_cues", "analysis", "tts_segments"):
+        for key in ("turn_id", "epoch", "phase", "committed", "agent_phase", "paraformer_final", "refined_text", "refinement_available", "segments", "tools", "audio_cues", "analysis", "tts_segments"):
             self.current.pop(key, None)
+        self.current.update(tts_prewarm_started=False, tts_prewarm_status="NOT_REQUESTED")
         self.latency = {
             "complete": False,
             "values": {key: None for key in self.latency["values"]},

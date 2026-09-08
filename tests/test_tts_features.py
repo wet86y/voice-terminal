@@ -462,6 +462,48 @@ class BidiLifecycleTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await session.close()
 
+    async def test_prewarm_only_performs_handshake_and_is_checked_out_once(self) -> None:
+        client = MiniMaxTtsClient(
+            base_url="https://example.invalid",
+            websocket_path="/ws/v1/t2a_v2_bidi",
+            model="speech-2.8-hd",
+            api_key="test",
+            transport="websocket_bidi",
+        )
+        events: asyncio.Queue[dict] = asyncio.Queue()
+        await events.put({"event": "connected_success"})
+        await events.put({"event": "task_started"})
+
+        class Socket:
+            def __init__(self) -> None:
+                self.sent: list[dict] = []
+
+            async def send(self, payload: str) -> None:
+                self.sent.append(json.loads(payload))
+
+            async def recv(self) -> str:
+                return json.dumps(await events.get())
+
+            async def close(self) -> None:
+                return None
+
+        socket = Socket()
+
+        async def connect(*_args, **_kwargs):
+            return socket
+
+        try:
+            with patch("websockets.connect", new=connect):
+                result = await client.prewarm()
+            session = client.session()
+            self.assertEqual(result["status"], "READY")
+            self.assertEqual([item["event"] for item in socket.sent], ["task_start"])
+            self.assertTrue(client.checkout_prewarm(session))
+            self.assertFalse(client.checkout_prewarm(session))
+            self.assertFalse(session._prewarmed)
+        finally:
+            await client.close()
+
     async def test_bidi_alignment_events_carry_sentence_pcm_origin(self) -> None:
         client = MiniMaxTtsClient(
             base_url="https://example.invalid",

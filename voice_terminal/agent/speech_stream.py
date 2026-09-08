@@ -3,11 +3,12 @@ from __future__ import annotations
 
 
 class SpeechArgumentStream:
-    """Decode ``text`` and optional ``emotion`` without rescanning input.
+    """Decode native ``speak`` arguments without rescanning input.
 
-    New calls should put ``emotion`` before ``text`` so the Bidi session gets
-    its task-level voice setting before the first text frame.  A legacy call
-    without an emotion field streams with the confirmed ``calm`` default.
+    New calls should put ``emotion`` and the optional ``replace_current`` flag
+    before ``text`` so the output transaction is known before its first text
+    frame.  A legacy call without either field streams with the confirmed
+    ``calm``/``False`` defaults.
     """
 
     _HEX = set("0123456789abcdefABCDEF")
@@ -24,6 +25,7 @@ class SpeechArgumentStream:
         # already a confirmed calm default rather than a reason to buffer old
         # tool calls until the closing brace.
         self.emotion: str | None = "calm"
+        self.replace_current = False
         self._cursor = 0
         self._phase = "start"
         self._string_kind: str | None = None
@@ -34,6 +36,8 @@ class SpeechArgumentStream:
         self._unicode_digits = ""
         self._pending_high: int | None = None
         self._pending_text = ""
+        self._boolean_expected = ""
+        self._boolean_buffer = ""
 
     @staticmethod
     def _space(char: str) -> bool:
@@ -44,7 +48,9 @@ class SpeechArgumentStream:
         return self.emotion is not None
 
     def _append_value_char(self, char: str) -> None:
-        if self._key == "text":
+        if self._string_kind == "key":
+            self._string_buffer.append(char)
+        elif self._key == "text":
             if self.emotion_ready:
                 self.emitted += char
             else:
@@ -63,8 +69,8 @@ class SpeechArgumentStream:
     def _close_string(self) -> None:
         if self._string_kind == "key":
             key = "".join(self._string_buffer)
-            if key not in {"text", "emotion"} or key in self._seen:
-                raise ValueError("speak accepts only text and emotion once")
+            if key not in {"text", "emotion", "replace_current"} or key in self._seen:
+                raise ValueError("speak accepts only text, emotion, and replace_current once")
             self._key = key
             self._phase = "after_key"
         else:
@@ -78,6 +84,8 @@ class SpeechArgumentStream:
                 if self._pending_text:
                     self.emitted += self._pending_text
                     self._pending_text = ""
+            elif self._key == "replace_current":
+                raise ValueError("replace_current must be a JSON boolean")
             self._seen.add(self._key or "")
             self._phase = "after_value"
         self._string_kind = None
@@ -157,6 +165,34 @@ class SpeechArgumentStream:
             return
         raise ValueError("invalid speak argument state")
 
+    def _begin_boolean(self, char: str) -> None:
+        if self._key != "replace_current" or char not in {"t", "f"}:
+            raise ValueError("replace_current must be a JSON boolean")
+        self._boolean_expected = "true" if char == "t" else "false"
+        self._boolean_buffer = char
+        self._phase = "boolean"
+
+    def _consume_boolean(self, char: str) -> None:
+        if len(self._boolean_buffer) >= len(self._boolean_expected):
+            raise ValueError("trailing characters after replace_current")
+        expected = self._boolean_expected[len(self._boolean_buffer)]
+        if char != expected:
+            raise ValueError("replace_current must be a JSON boolean")
+        self._boolean_buffer += char
+        if len(self._boolean_buffer) < len(self._boolean_expected):
+            return
+        value = self._boolean_buffer == "true"
+        # A true replacement flag arriving after text has already been sent
+        # cannot be made atomic.  Fail the tool call instead of speaking a
+        # prefix on the wrong transaction.  The prompt/schema put this field
+        # before text; ordinary calls remain fully incremental.
+        if value and self.emitted:
+            self.replace_current = True
+            raise ValueError("replace_current must precede streamed text")
+        self.replace_current = value
+        self._seen.add("replace_current")
+        self._phase = "after_value"
+
     def _consume(self) -> None:
         while self._cursor < len(self.raw):
             char = self.raw[self._cursor]
@@ -184,9 +220,13 @@ class SpeechArgumentStream:
             if phase == "before_value":
                 if self._space(char):
                     self._cursor += 1; continue
-                if char != '"':
-                    raise ValueError("speak values must be strings")
-                self._open_string("value"); self._cursor += 1; continue
+                if char == '"':
+                    self._open_string("value"); self._cursor += 1; continue
+                if self._key == "replace_current":
+                    self._begin_boolean(char); self._cursor += 1; continue
+                raise ValueError("speak values must be strings")
+            if phase == "boolean":
+                self._consume_boolean(char); self._cursor += 1; continue
             if phase == "after_value":
                 if self._space(char):
                     self._cursor += 1; continue

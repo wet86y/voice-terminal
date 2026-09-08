@@ -24,13 +24,24 @@ const latencyDefinitions: Array<{ key: keyof LatencyValues; label: string }> = [
   { key: 'smart_turn_ms', label: 'Smart Turn 推理' },
   { key: 'sensevoice_refine_ms', label: '最终精修' },
   { key: 'commit_to_final_llm_ms', label: '最终请求调度' },
+  { key: 'asr_final_to_commit_ms', label: 'ASR final → 提交' },
   { key: 'wake_detection_ms', label: '唤醒检测' },
   { key: 'asr_first_text_ms', label: 'ASR 首次出字' },
   { key: 'speech_end_confirmation_ms', label: '讲话结束确认' },
   { key: 'llm_first_token_ms', label: 'LLM 首 token' },
+  { key: 'agent_request_to_speak_ms', label: 'Agent 请求 → speak' },
   { key: 'llm_request_to_first_tts_text_ms', label: '首段文本进入 TTS' },
   { key: 'tts_text_to_first_audio_ms', label: 'TTS 首音频' },
+  { key: 'tts_prewarm_requested_ms', label: 'TTS 预热触发' },
+  { key: 'tts_prewarm_ready_ms', label: 'TTS 预热就绪' },
+  { key: 'tts_checkout_ms', label: 'TTS 预热 checkout' },
+  { key: 'tts_cold_start_ms', label: 'TTS 冷启动' },
+  { key: 'speech_end_to_first_pcm_ms', label: '说完 → 首个 PCM' },
+  { key: 'first_pcm_to_player_submit_ms', label: '首音频 → 首 PCM 提交' },
   { key: 'first_audio_to_playback_ms', label: '首音频到播放器' },
+  { key: 'refine_duration_ms', label: '精修耗时' },
+  { key: 'refine_to_redecision_ms', label: '精修 → 再决策' },
+  { key: 'replacement_count', label: '语音替换次数' },
   { key: 'speech_end_to_playback_ms', label: '用户说完 → AI 开口' },
   { key: 'turn_total_ms', label: '本轮总时长' },
 ]
@@ -306,7 +317,8 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
           <summary>理解与精修 · {{ terminal.current.agent_phase }}</summary>
           <p>Paraformer 主文本与 SenseVoice 补充证据会在当前 Episode 内直接供 Agent 判断。</p>
           <p><strong>Paraformer 草稿：</strong>{{ terminal.current.paraformer_final || terminal.current.partial_text || '—' }}</p>
-          <p><strong>最终校稿：</strong>{{ terminal.current.refined_text || '—' }}</p>
+          <p><strong>SenseVoice 精修：</strong>{{ terminal.current.refined_text || '等待精修（不阻塞首轮回答）' }}</p>
+          <p><strong>精修状态：</strong>{{ terminal.current.refinement_available ? '已返回' : '未返回 / 使用 Paraformer' }}</p>
           <p v-for="(analysis, name) in terminal.current.analysis" :key="name">
             {{ name }} · {{ analysis.status }} {{ analysis.model ? '· ' + analysis.model : '' }}
             {{ analysis.model_loaded === true ? '· 已加载' : '' }} {{ analysis.error || '' }}
@@ -349,6 +361,10 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
           <div v-if="terminal.prefill" class="response-block">
             <span class="box-label">PENDING PREFILL / {{ terminal.prefill.status || 'PREPARED' }}</span>
             <p>{{ displayText(terminal.prefill.text) }}</p>
+          </div>
+          <div v-if="terminal.current.tts_prewarm_started" class="response-block">
+            <span class="box-label">TTS PREWARM / {{ terminal.current.tts_prewarm_status || 'REQUESTED' }}</span>
+            <p>首次本地 ASR 出字后并行建立 MiniMax Bidi 连接。</p>
           </div>
           <details v-if="terminal.reasoning" class="response-block">
             <summary class="box-label">LOCAL REASONING DEBUG</summary>

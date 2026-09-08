@@ -31,6 +31,34 @@ def test_context_projection_excludes_runtime_identity_and_keeps_semantics() -> N
     assert "查上海天气" in rendered and "改成明天" in rendered
 
 
+def test_context_projection_does_not_duplicate_committed_current_turn() -> None:
+    ledger = SessionLedger()
+    ledger.commit_input("turn_a", "CURRENT_INPUT_SENTINEL", details={"refined_text": "精修文本"})
+    messages = LLMContextProjector().project(ledger, CurrentInput(
+        text="CURRENT_INPUT_SENTINEL",
+        primary_transcript="CURRENT_INPUT_SENTINEL",
+        refined_transcript="精修文本",
+        refinement_available=True,
+        finalized=True,
+        turn_id="turn_a",
+    ))
+    rendered = "\n".join(str(message["content"]) for message in messages)
+    assert rendered.count("CURRENT_INPUT_SENTINEL") == 1
+    assert rendered.count("精修文本") == 1
+
+
+def test_context_projection_keeps_identical_text_for_a_new_turn() -> None:
+    ledger = SessionLedger()
+    ledger.commit_input("turn_a", "重复文本")
+    messages = LLMContextProjector().project(ledger, CurrentInput(
+        text="重复文本", primary_transcript="重复文本", finalized=True, turn_id="turn_b",
+    ))
+    assert [message for message in messages if message.get("role") == "user"] == [
+        {"role": "user", "content": "重复文本"},
+        {"role": "user", "content": "重复文本"},
+    ]
+
+
 def test_request_local_tool_projection_strips_runtime_ids() -> None:
     message = AgentEpisodeRuntime._project_protocol_message({
         "role": "tool", "tool_call_id": "call_1",

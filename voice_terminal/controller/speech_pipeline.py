@@ -90,6 +90,12 @@ class SpeechPipeline:
         resolver = self._delivery_resolvers.setdefault(ws.turn_id, DeliveryResolver())
         completed_markers = 0
         alignment_cursor = 0
+        timing_owner = getattr(self, "controller", self)
+
+        def sync_turn_timings() -> None:
+            shared = getattr(timing_owner, "_turn_timings", {}).get(ws.turn_id)
+            if isinstance(shared, dict):
+                ws.timings.update(shared)
         audio_bytes_per_second = (
             self.player.sample_rate * self.player.channels * 2
             if self.player is not None else 32000 * 2
@@ -297,11 +303,53 @@ class SpeechPipeline:
                         await self._await_tts_cancel_barrier()
                         if not self._valid(token):
                             return
+                        sync_turn_timings()
                         session = self.tts.session()
                         self._tts_session = session
+                        checkout = getattr(self.tts, "checkout_prewarm", None)
+                        warm = bool(checkout(session)) if callable(checkout) else False
+                        warm_connection_id = getattr(session, "connection_id", None) if warm else None
+                        ws.timings.setdefault("tts_session_start", time.monotonic())
                         try:
                             await session.start()
+                            if warm and getattr(session, "connection_id", None) != warm_connection_id:
+                                # The retained socket disappeared between
+                                # checkout and start(), so this transaction
+                                # transparently became a cold connection.
+                                warm = False
+                            prewarm_ready = getattr(session, "_prewarm_ready", None)
+                            if (not warm and getattr(session, "_prewarm_inflight", False)
+                                    and prewarm_ready is not None):
+                                await prewarm_ready.wait()
+                                if callable(checkout):
+                                    warm = bool(checkout(session))
+                            if not getattr(session, "reusable", True):
+                                # A failed/cancelled prewarm may have closed
+                                # the shared candidate while this sender was
+                                # waiting for it.  Fall back to a fresh cold
+                                # session rather than sending text to a dead
+                                # socket.
+                                session = self.tts.session()
+                                self._tts_session = session
+                                ws.timings["tts_session_start"] = time.monotonic()
+                                await session.start()
+                                warm = False
+                            ws.timings.setdefault("tts_session_ready", time.monotonic())
+                            # If the prewarm task was still finishing when we
+                            # inspected the session, claim it after the
+                            # serialized start returns.  This keeps a racing
+                            # first speak on the warm path without sending a
+                            # second task_start.
+                            if not warm and callable(checkout):
+                                warm = bool(checkout(session))
+                            if warm:
+                                ws.timings.setdefault("tts_prewarm_checkout", time.monotonic())
+                                ws.timings["tts_prewarm_used"] = True
+                            elif ws.timings.get("tts_prewarm_requested"):
+                                ws.timings["tts_prewarm_fallback"] = True
                         except Exception as exc:
+                            warm = False
+                            ws.timings["tts_prewarm_fallback"] = bool(ws.timings.get("tts_prewarm_requested"))
                             # The optional MiniMax Bidi emotion extension is
                             # verified on task_start.  A rejection closes that
                             # connection and retries the still-unsent first
@@ -311,7 +359,10 @@ class SpeechPipeline:
                             await self._detail("tts.emotion_unsupported", status="FALLBACK_CALM")
                             session = self.tts.session()
                             self._tts_session = session
+                            ws.timings["tts_session_start"] = time.monotonic()
                             await session.start()
+                            ws.timings["tts_session_ready"] = time.monotonic()
+                            sync_turn_timings()
                         reader = asyncio.create_task(read_audio(session), name=f"tts-audio-{ws.turn_id}")
                         progress_task = asyncio.create_task(monitor_progress(), name=f"tts-progress-{ws.turn_id}")
                     if sent_any:
