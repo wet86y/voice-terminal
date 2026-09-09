@@ -34,6 +34,13 @@ def test_v06_envelope_stream_and_final_validation():
         bad = SpeechDecisionEnvelopeStream(); bad.feed('{"speak":{"state":"wait","text":"不允许"},"actions":[]}'); bad.finish()
 
 
+def test_v06_envelope_exposes_only_a_display_preview_before_final_validation():
+    parser = SpeechDecisionEnvelopeStream()
+    assert parser.feed('{"speak":{"state":"speak","text":"流式') == "流式"
+    assert parser.feed('预览"},"actions":[]}') == "预览"
+    assert parser.finish().speak.text == "流式预览"
+
+
 def test_sentence_ids_stay_stable_and_unmapped_refinement_is_retained():
     store = SentenceStore(min_chars=2, max_chars=20)
     first = store.feed("你好，世界。", now=1)
@@ -54,6 +61,7 @@ def test_scheduler_defaults_and_removed_prediction_configuration():
 def test_debug_events_are_public_protocol_events():
     sequencer = ProtocolSequencer("session_a")
     assert sequencer.public(event("agent.reasoning", "input_a"))
+    assert sequencer.public(event("speak.preview", "input_a"))
     assert sequencer.public(event("speech.queued", "input_a"))
 
 
@@ -125,5 +133,9 @@ def test_runtime_uses_json_mode_and_promotes_only_valid_envelope():
         identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"; runtime._identity_turns[identity] = "turn"
         await runtime._step(identity, {"USER_INPUT_FINALIZED"})
         assert seen == {"json_mode": True, "text": "好的", "finished": True}
+        assert any(kind == "speak.preview" and payload.get("text") == "好的" and payload.get("committed") is False
+                   for kind, payload in events)
+        assert any(kind == "speak.preview" and payload.get("status") == "committed"
+                   for kind, payload in events)
         assert any(p.get("kind") == "SPEAK_ACCEPTED" for k, p in events if k == "agent.trace")
     asyncio.run(scenario())

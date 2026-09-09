@@ -686,10 +686,88 @@ h2 {
   background: #eeece6;
 }
 
-.tts-block {
-  min-height: 147px;
+.llm-output-block {
+  min-height: 164px;
+  padding: 0;
+  overflow: hidden;
+}
+
+.llm-output-section {
+  min-height: 116px;
+  padding: 16px 17px;
+}
+
+.llm-output-section > span {
+  display: block;
+  color: #9a9ba0;
+  font-size: 9px;
+  font-weight: 760;
+  letter-spacing: 0.14em;
+}
+
+.llm-output-section pre {
+  max-height: 92px;
+  margin: 12px 0 0;
+  overflow: auto;
+  color: #5a5d66;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.speak-queue-block {
+  min-height: 136px;
   border: 1px solid rgba(227, 111, 76, 0.19);
   background: rgba(241, 194, 173, 0.16);
+}
+
+.speak-queue-block.speak-speaking {
+  border-color: rgba(109, 184, 130, 0.38);
+  background: rgba(130, 197, 148, 0.12);
+}
+
+.speak-queue-block.speak-suspended {
+  border-color: rgba(214, 158, 80, 0.36);
+  background: rgba(242, 206, 135, 0.14);
+}
+
+.speak-queue-block.speak-empty {
+  border-color: rgba(95, 98, 108, 0.16);
+  background: rgba(95, 98, 108, 0.06);
+}
+
+.speak-queue-block small {
+  display: block;
+  margin-top: 10px;
+  color: #7a7d85;
+  font-size: 10px;
+}
+
+.streaming-indicator {
+  display: block;
+  width: fit-content;
+  margin-top: 10px;
+  color: #bd624a;
+  font-size: 9px;
+  font-weight: 760;
+  letter-spacing: 0.08em;
+}
+
+.streaming-indicator::after {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: speak-stream-pulse 0.9s ease-in-out infinite alternate;
+}
+
+@keyframes speak-stream-pulse {
+  from { opacity: 0.28; transform: scale(0.75); }
+  to { opacity: 1; transform: scale(1); }
 }
 
 .response-divider {
@@ -708,6 +786,17 @@ h2 {
   height: 1px;
   background: var(--line);
 }
+
+.response-divider strong {
+  color: #757881;
+  font-size: 10px;
+  font-weight: 760;
+  letter-spacing: 0.1em;
+}
+
+.response-divider .speak-speaking { color: #5b9d70; }
+.response-divider .speak-suspended { color: #b47c39; }
+.response-divider .speak-queued { color: #bd624a; }
 
 .buffer-meta {
   display: flex;

@@ -55,7 +55,7 @@ class SpeechDecisionEnvelopeStream:
         self._emitted_length = 0
 
     @staticmethod
-    def _quoted_value(raw: str, key: str) -> str | None:
+    def _quoted_value(raw: str, key: str, *, allow_partial: bool = False) -> str | None:
         marker = f'"{key}"'
         pos = raw.find(marker)
         if pos < 0:
@@ -81,6 +81,18 @@ class SpeechDecisionEnvelopeStream:
                     return None
             else:
                 body.append(char)
+        if not allow_partial:
+            return None
+        # The JSON string is still open.  Decode its longest complete prefix
+        # so a trailing escape or incomplete \\uXXXX sequence is held until a
+        # later network delta completes it.  This value is presentation-only;
+        # finish() remains the sole authority for a speech transaction.
+        raw_body = "".join(body)
+        for end in range(len(raw_body), -1, -1):
+            try:
+                return json.loads('"' + raw_body[:end] + '"')
+            except json.JSONDecodeError:
+                continue
         return None
 
     def feed(self, delta: str) -> str:
@@ -96,7 +108,7 @@ class SpeechDecisionEnvelopeStream:
             self.state = state
         if self.state != "speak":
             return ""
-        text = self._quoted_value(self.raw, "text")
+        text = self._quoted_value(self.raw, "text", allow_partial=True)
         if text is None or len(text) <= self._emitted_length:
             return ""
         value = text[self._emitted_length:]

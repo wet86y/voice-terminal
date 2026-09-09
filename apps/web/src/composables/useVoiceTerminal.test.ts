@@ -58,6 +58,16 @@ describe('V0.6 session protocol', () => {
     expect(terminal.speechOutputs.value[0].delivery?.heard_text).toBe('已授权输出')
   })
 
+  it('shows a speak preview while the JSON decision is still uncommitted', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('agent.state', 1, { conversation_id: 'conversation_a', request_id: 'decision_a', agent_busy: true })
+    socket.push('speak.preview', 2, { conversation_id: 'conversation_a', request_id: 'decision_a',
+      state: 'speak', text: '正在生成的候选文本', text_delta: '正在生成的候选文本', committed: false })
+    expect(terminal.speakPreview.value?.text).toBe('正在生成的候选文本')
+    socket.push('speak.preview', 3, { conversation_id: 'conversation_a', request_id: 'decision_a', status: 'committed' })
+    expect(terminal.speakPreview.value).toBeNull()
+  })
+
   it('keeps a recoverable capture gap diagnostic without changing server listening state', () => {
     const { socket, terminal } = openTerminal()
     socket.push('runtime.snapshot', 1, { state: 'LISTENING', listening: true, can_start: true,

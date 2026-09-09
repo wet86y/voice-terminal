@@ -61,9 +61,22 @@ const currentTurnLabel = computed(() => terminal.currentTurnId ?? '—')
 const transcriptPreview = computed(
   () => terminal.current.final_text || terminal.current.partial_text || '等待后端语音事件…',
 )
-const responsePreview = computed(
-  () => terminal.activeSpeech?.text || terminal.current.assistant_text,
+const speakSnapshot = computed(() => terminal.agentEpisode?.speak_snapshot)
+const speakPreview = computed(() => terminal.speakPreview)
+const speakQueueStatus = computed(() => speakSnapshot.value?.queue_status || 'empty')
+const speakQueueText = computed(() =>
+  speakPreview.value?.text
+  || speakSnapshot.value?.text
+  || terminal.agentEpisode?.speech_queue?.[0]?.text
+  || terminal.activeSpeech?.text
+  || '',
 )
+const speakQueueStatusLabel = computed(() => ({
+  empty: '无内容',
+  queued: '排队中',
+  suspended: '已挂起',
+  speaking: '讲话中',
+}[speakQueueStatus.value] || speakQueueStatus.value.toUpperCase()))
 const currentLatencyRows = computed(() =>
   latencyDefinitions.map((definition) => ({
     ...definition,
@@ -351,45 +364,20 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
         </div>
 
         <div class="response-column" aria-live="polite">
-          <div class="response-block">
-            <span class="box-label">ASSISTANT RESPONSE</span>
-            <p>{{ displayText(responsePreview) }}</p>
-            <small v-if="terminal.activeSpeech">
-              表达情绪：{{ terminal.activeSpeech.emotion_requested || 'calm' }} → {{ terminal.activeSpeech.emotion_applied || 'calm' }}
-            </small>
+          <div class="response-block llm-output-block">
+            <span class="box-label">LLM THINKING</span>
+            <div class="llm-output-section">
+              <span>THINKING</span>
+              <pre>{{ terminal.reasoning || '等待模型推理…' }}</pre>
+            </div>
           </div>
-          <div v-if="terminal.agentEpisode?.speech_queue?.length" class="response-block">
-            <span class="box-label">PENDING SPEAK TEXT</span>
-            <p>{{ displayText(terminal.agentEpisode.speech_queue[0]?.text) }}</p>
-          </div>
-          <div v-if="terminal.current.tts_prewarm_started" class="response-block">
-            <span class="box-label">TTS PREWARM / {{ terminal.current.tts_prewarm_status || 'REQUESTED' }}</span>
-            <p>首次本地 ASR 出字后并行建立 MiniMax Bidi 连接。</p>
-          </div>
-          <details v-if="terminal.reasoning" class="response-block">
-            <summary class="box-label">LOCAL REASONING DEBUG</summary>
-            <pre>{{ terminal.reasoning }}</pre>
-          </details>
-          <div class="response-divider"><span>TTS QUEUE</span><i></i><span>{{ displayText(terminal.current.tts_status) }}</span></div>
-          <div class="response-block tts-block">
-            <span class="box-label">{{ displayText(terminal.current.tts_status) }} / AUDIO PLAYBACK</span>
-            <p>{{ displayText(terminal.current.tts_text) }}</p>
-            <div class="buffer-meta"><span>已返回音频</span><strong>{{ formatMs(terminal.current.tts_returned_ms) }}</strong></div>
-            <div class="buffer-meta"><span>已实际播放</span><strong>{{ formatMs(terminal.current.tts_played_ms) }}</strong></div>
-            <div class="buffer-meta"><span>设备输出估计</span><strong>{{ formatMs(terminal.current.tts_output_estimated_ms) }}</strong></div>
-            <div class="buffer-meta"><span>待播放总时长</span><strong>{{ formatMs(terminal.current.tts_remaining_ms ?? terminal.current.audio_buffer_ms) }}</strong></div>
-            <small v-if="terminal.current.playback_diagnostics?.resolved_device != null">
-              输出端点：{{ terminal.current.playback_diagnostics.resolved_device }} ·
-              {{ terminal.current.playback_diagnostics.sample_rate }} Hz ·
-              首次 PCM {{ terminal.current.playback_diagnostics.first_rendered_at != null ? '已提交到 PortAudio' : '尚未提交' }}
-            </small>
-            <small v-if="terminal.current.playback_diagnostics?.callback_status" class="agent-limit">
-              播放器回调：{{ terminal.current.playback_diagnostics.callback_status }}
-            </small>
-            <small v-if="terminal.current.capture_diagnostics?.reason" class="agent-limit">
-              输入已安全恢复：{{ terminal.current.capture_diagnostics.reason }}
-              · 已丢弃 {{ terminal.current.capture_diagnostics.dropped_chunks ?? 0 }} 个采集块
-            </small>
+          <div class="response-divider"><span>SPEAK QUEUE</span><i></i><strong :class="`speak-${speakQueueStatus}`">{{ speakQueueStatusLabel }}</strong></div>
+          <div class="response-block speak-queue-block" :class="`speak-${speakQueueStatus}`">
+            <span class="box-label">{{ speakQueueStatusLabel }} / TEXT TRANSACTION</span>
+            <span v-if="speakPreview" class="streaming-indicator">正在流式生成 · 尚未提交队列</span>
+            <p>{{ displayText(speakQueueText) }}</p>
+            <small>队列仅保存文本；端点确认后才启动 TTS。</small>
+            <small v-if="terminal.activeSpeech">表达情绪：{{ terminal.activeSpeech.emotion_requested || 'calm' }} → {{ terminal.activeSpeech.emotion_applied || 'calm' }}</small>
           </div>
           <div v-if="terminal.current.delivery && (terminal.current.delivery.status || terminal.current.delivery.termination)" class="delivery-card">
             <div class="delivery-heading"><span>DELIVERY</span><strong>{{ deliveryStatusLabel(terminal.current.delivery) }}</strong></div>

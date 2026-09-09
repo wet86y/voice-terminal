@@ -987,14 +987,36 @@ class AgentEpisodeRuntime:
                         content_chars += len(item["text"])
                         if content_chars > 32768:
                             raise EnvelopeError("decision content too large")
-                        provisional += parser.feed(item["text"])
+                        text_delta = parser.feed(item["text"])
+                        if text_delta:
+                            provisional += text_delta
+                            # Preview is deliberately display-only.  A
+                            # malformed final JSON response must never be
+                            # promoted to the text queue or TTS from here.
+                            await self.emit("speak.preview", {
+                                "conversation_id": identity[0],
+                                "request_id": identity[1],
+                                "turn_id": source_turn_id,
+                                "state": "speak",
+                                "text_delta": text_delta,
+                                "text": provisional,
+                                "committed": False,
+                            })
             if not finished:
                 raise EnvelopeError("model stream missing finish")
             envelope = parser.finish()
             # A streaming parser is allowed to see text before a later final
             # error; only this method promotes it to a real speech handle.
             await self._apply_decision_v06(identity, source_turn_id, envelope)
+            await self.emit("speak.preview", {
+                "conversation_id": identity[0], "request_id": identity[1],
+                "turn_id": source_turn_id, "status": "committed",
+            })
         except (EnvelopeError, ValueError, json.JSONDecodeError) as exc:
+            await self.emit("speak.preview", {
+                "conversation_id": identity[0], "request_id": identity[1],
+                "turn_id": source_turn_id, "status": "discarded",
+            })
             await self.log("SPEAK_ENVELOPE_INVALID", identity=identity, turn_id=source_turn_id,
                            error=str(exc)[:300], provisional_chars=len(provisional))
             await self._queue_recovery("SPEAK_ENVELOPE_INVALID", str(exc)[:300],

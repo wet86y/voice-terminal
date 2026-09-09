@@ -239,7 +239,7 @@ export interface ServerErrorPayload {
 export type ServerMessageType =
   | 'runtime.snapshot' | 'session.state' | 'metrics.snapshot'
   | 'input.started' | 'input.updated' | 'input.finalized' | 'input.completed'
-  | 'agent.state' | 'agent.trace' | 'agent.reasoning' | 'context.snapshot' | 'tool.state'
+  | 'agent.state' | 'agent.trace' | 'agent.reasoning' | 'context.snapshot' | 'tool.state' | 'speak.preview'
   | 'speech.queued' | 'speech.started' | 'speech.delta' | 'speech.progress' | 'speech.completed'
   | 'error'
 
@@ -308,6 +308,17 @@ export interface SpeechOutputRecord {
   emotion_transport?: string
   emotion_status?: string
   kind?: 'formal'
+}
+
+export interface SpeakPreview {
+  conversation_id: string
+  request_id: string
+  turn_id?: string | null
+  state?: 'speak'
+  text?: string
+  text_delta?: string
+  committed?: boolean
+  status?: 'committed' | 'discarded'
 }
 
 export interface AgentEpisodeSnapshot {

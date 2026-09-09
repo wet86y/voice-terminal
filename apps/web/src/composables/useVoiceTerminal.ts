@@ -2,6 +2,7 @@ import { computed, reactive, ref, shallowRef } from 'vue'
 import type {
   AgentEpisodeSnapshot,
   AgentTrace,
+  SpeakPreview,
   SpeechOutputRecord,
   CommandName,
   ConnectionState,
@@ -186,6 +187,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const activeSpeech = ref<SpeechOutputRecord | null>(null)
   const speechProgress = ref<Record<string, unknown> | null>(null)
   const reasoning = ref('')
+  const speakPreview = ref<SpeakPreview | null>(null)
   const retiredEpisodes = new Set<string>()
 
   function applyAgent(value: unknown, authoritative = false) {
@@ -207,8 +209,12 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (previous?.conversation_id && previous.conversation_id !== value.conversation_id) {
       retiredEpisodes.add(previous.conversation_id)
       speechProgress.value = null
+      speakPreview.value = null
     }
-    if (value.conversation_id === null) speechProgress.value = null
+    if (value.conversation_id === null) {
+      speechProgress.value = null
+      speakPreview.value = null
+    }
     if (retiredEpisodes.size > 64) retiredEpisodes.delete(retiredEpisodes.values().next().value!)
     agentEpisode.value = value as unknown as AgentEpisodeSnapshot
     if (Array.isArray(value.trace)) agentTrace.value = value.trace.filter(isAgentTrace).slice(-200)
@@ -219,6 +225,30 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     else if (value.active_speech === null && Array.isArray(value.outputs)) {
       activeSpeech.value = [...speechOutputs.value].reverse()
         .find(output => output.conversation_id === value.conversation_id) ?? null
+    }
+  }
+
+  function applySpeakPreview(value: Record<string, unknown>) {
+    const conversationId = readString(value, 'conversation_id')
+    const requestId = readString(value, 'request_id')
+    if (!conversationId || !requestId) return
+    if (conversationId !== agentEpisode.value?.conversation_id) return
+    const status = readString(value, 'status')
+    if (status === 'committed' || status === 'discarded') {
+      if (speakPreview.value?.request_id === requestId) speakPreview.value = null
+      return
+    }
+    const text = readString(value, 'text')
+    const textDelta = readString(value, 'text_delta')
+    if (readString(value, 'state') !== 'speak' || (text === null && textDelta === null)) return
+    speakPreview.value = {
+      conversation_id: conversationId,
+      request_id: requestId,
+      turn_id: readString(value, 'turn_id'),
+      state: 'speak',
+      text: text ?? `${speakPreview.value?.request_id === requestId ? speakPreview.value.text || '' : ''}${textDelta || ''}`,
+      text_delta: textDelta || undefined,
+      committed: false,
     }
   }
 
@@ -463,6 +493,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (message.type === 'agent.state') { applyAgent(payload); return }
     if (message.type === 'agent.trace') { applyAgentTrace(payload); return }
     if (message.type === 'agent.reasoning') { if (typeof payload.text === 'string') reasoning.value = payload.text; return }
+    if (message.type === 'speak.preview') { applySpeakPreview(payload); return }
     if (message.type === 'speech.queued') return
     if (message.type === 'speech.completed') {
       if (isSpeechOutput(payload)) {
@@ -697,6 +728,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     activeSpeech,
     speechProgress,
     reasoning,
+    speakPreview,
     llmContext,
     llmContextTurnId,
     lastServerTimestamp,
