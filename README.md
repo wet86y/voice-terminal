@@ -6,7 +6,7 @@ Voice Terminal 是 Windows 本机实时语音会话终端。浏览器只负责�
 
 系统只有一条统一运行链：`SessionRuntime → EpisodeController → ConversationScheduler + SpeechQueue`。核心关联字段为 `conversation_id`、`turn_id`、`request_id`、`speech_id` 和 `output_generation`；它们只用于追踪。普通事件不会因为文本修订或工具晚到而失效，只有停止监听、用户反打断、会话重置和播放中 `speak(text)` 才会关闭显式取消作用域。
 
-普通 LLM 请求只由 400ms 调度 tick 放行，异常协议恢复和播放中 `speak(text)` 走独立即时通道；全程最多一条 LLM 请求在飞。Agent 每轮以 DeepSeek JSON mode 返回必填的 `{"speak":{"state":"speak|cancel|wait"},"actions":[]}` 信封，不传递 provider native tools。讲话期间队列只保存文本，不预生成或保存 PCM，端点确认后才启动 TTS。会话上下文来自唯一的传达感知账本和 `LLMContextProjector`：最终用户输入、实际听到的语音前缀、被打断说明与不可信工具来源块。
+普通 LLM 请求只由 400ms 调度 tick 放行，异常协议恢复和播放中 `speak(text)` 走独立即时通道；全程最多一条 LLM 请求在飞。Agent 每轮以 DeepSeek JSON mode 返回必填的 `{"speak":{"state":"speak|cancel|wait"},"actions":[]}` 信封，不传递 provider native tools。`speak.state/text/emotion` 通过前端参数校验后，文本增量即可进入文本语音队列；完整 JSON 与 `actions` 仍需最终校验。后续协议或工具错误不会撤销已经入队的文本，而是触发即时恢复请求。讲话期间队列只保存文本，不预生成或保存 PCM，端点确认后才启动 TTS。会话上下文来自唯一的传达感知账本和 `LLMContextProjector`：最终用户输入、实际听到的语音前缀、被打断说明与不可信工具来源块。
 
 所有 Agent 请求固定启用 DeepSeek thinking、`reasoning_effort: low` 与 `response_format=json_object`。推理原文只经本地调试 Web UI 的 `agent.reasoning` 事件显示，不写服务端日志、Agent trace、DeliveryReport 或持久会话历史。V0.6 是破坏性主线：不读取旧 prediction 配置，不映射原生 `tool_calls` / `speak(queue|modify)` 或旧 WebSocket 事件。
 

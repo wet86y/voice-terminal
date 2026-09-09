@@ -483,6 +483,11 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 if getattr(self.controller, "workspace", None) is not None else timings.get("tts_prewarm_status"),
                 "prewarm_used": bool(timings.get("tts_prewarm_used")),
                 "replacement_count": int(timings.get("replacement_count", 0) or 0),
+                "llm_request_to_first_speech_text_ms": timings.get("llm_request_to_first_speech_text_ms"),
+                "first_speech_text_to_json_finish_ms": timings.get("first_speech_text_to_json_finish_ms"),
+                "speech_started_before_envelope_commit": bool(timings.get("speech_started_before_envelope_commit")),
+                "partial_speech_protocol_error": bool(timings.get("partial_speech_protocol_error")),
+                "partial_speech_tool_recovery": bool(timings.get("partial_speech_tool_recovery")),
             }
             # The input workspace may already be retired when playback ends.
             # Start from the controller's finalized-turn snapshot so the
@@ -509,6 +514,14 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 "tts_cold_start_ms": elapsed("tts_session_start", "tts_session_ready")
                 if not timings.get("tts_prewarm_used") else None,
                 "replacement_count": int(timings.get("replacement_count", 0) or 0),
+                "llm_request_to_first_speech_text_ms": timings.get("llm_request_to_first_speech_text_ms"),
+                "llm_request_to_speak_queued_ms": (
+                    elapsed("llm_request", "speak_queued") if "speak_queued" in timings else None
+                ),
+                "first_speech_text_to_json_finish_ms": timings.get("first_speech_text_to_json_finish_ms"),
+                "speech_started_before_envelope_commit": bool(timings.get("speech_started_before_envelope_commit")),
+                "partial_speech_protocol_error": bool(timings.get("partial_speech_protocol_error")),
+                "partial_speech_tool_recovery": bool(timings.get("partial_speech_tool_recovery")),
                 "turn_total_ms": since_turn("completed"),
             })
             record = {"speech_id": h.speech_id, "conversation_id": h.identity[0],

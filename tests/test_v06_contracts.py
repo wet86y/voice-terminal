@@ -41,6 +41,16 @@ def test_v06_envelope_exposes_only_a_display_preview_before_final_validation():
     assert parser.finish().speak.text == "流式预览"
 
 
+def test_v06_prefix_is_safe_before_full_envelope_and_validates_emotion():
+    parser = SpeechDecisionEnvelopeStream()
+    assert parser.feed('{"speak":{"state":"speak","emotion":"calm","text":"首段') == "首段"
+    prefix = parser.speak_prefix()
+    assert prefix is not None and prefix.state == "speak" and prefix.emotion == "calm"
+    with pytest.raises(EnvelopeError, match="invalid speak emotion"):
+        bad = SpeechDecisionEnvelopeStream()
+        bad.feed('{"speak":{"state":"speak","emotion":"unknown","text":"x"}')
+
+
 def test_sentence_ids_stay_stable_and_unmapped_refinement_is_retained():
     store = SentenceStore(min_chars=2, max_chars=20)
     first = store.feed("你好，世界。", now=1)
@@ -138,4 +148,59 @@ def test_runtime_uses_json_mode_and_promotes_only_valid_envelope():
         assert any(kind == "speak.preview" and payload.get("status") == "committed"
                    for kind, payload in events)
         assert any(p.get("kind") == "SPEAK_ACCEPTED" for k, p in events if k == "agent.trace")
+    asyncio.run(scenario())
+
+
+def test_runtime_streams_text_before_finish_and_keeps_it_on_bad_actions():
+    async def scenario():
+        seen = {"feeds": [], "finishes": 0, "recoveries": []}
+
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"先到'}
+                    await asyncio.sleep(0)
+                    yield {"type": "content", "text": '的回答"},"actions":[{"name":"bad"}]}' }
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Handle:
+            speech_id = "speech_partial"
+            async def feed(self, value): seen["feeds"].append(value)
+            async def finish(self): seen["finishes"] += 1
+
+        class Output:
+            status = "IDLE"
+            speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+            async def begin(self, *_args, **_kwargs):
+                seen["queued_before_finish"] = True
+                return Handle()
+
+        events = []
+        async def emit(kind, payload): events.append((kind, payload))
+        conversation = ConversationRuntime(); conversation.begin_turn("turn")
+        runtime = AgentEpisodeRuntime(Provider(), Registry(), Output(), emit,
+                                      conversation=conversation, ledger=SessionLedger())
+        runtime.episode_id = conversation.conversation_id
+        runtime.last_turn_id = "turn"
+        runtime.inputs = {"turn": {"text": "你好", "final": True}}
+        identity = (runtime.episode_id, "request")
+        runtime.agent_step_id = "request"
+        runtime._identity_turns[identity] = "turn"
+
+        async def recovery(code, message, **kwargs):
+            seen["recoveries"].append(code)
+        runtime._queue_recovery = recovery
+
+        await runtime._step(identity, {"USER_INPUT_FINALIZED"})
+        assert seen["queued_before_finish"] is True
+        assert seen["feeds"] == ["先到", "的回答"]
+        assert seen["finishes"] == 1
+        assert seen["recoveries"] == ["TOOL_PROTOCOL_ERROR"]
+        assert any(kind == "agent.trace" and payload.get("kind") == "TOOL_PROTOCOL_ERROR"
+                   for kind, payload in events)
     asyncio.run(scenario())

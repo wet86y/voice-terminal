@@ -886,6 +886,14 @@ class AgentEpisodeRuntime:
                 await self.log("ACTION_COMPLETED", identity=identity, turn_id=turn_id,
                                name=name, failed="error" in result)
             except (ProtocolError, ValueError) as exc:
+                candidates = ([getattr(self.output, "handle", None)]
+                              + list(getattr(self.output, "_pending", [])))
+                for candidate in candidates:
+                    if candidate is not None and candidate.turn_id == turn_id:
+                        workspace = getattr(candidate, "workspace", None)
+                        if workspace is not None and isinstance(getattr(workspace, "timings", None), dict):
+                            workspace.timings["partial_speech_tool_recovery"] = True
+                        break
                 await self.log("TOOL_PROTOCOL_ERROR", identity=identity, turn_id=turn_id,
                                error=str(exc)[:300])
                 await self._queue_recovery("TOOL_PROTOCOL_ERROR", str(exc)[:300],
@@ -967,6 +975,47 @@ class AgentEpisodeRuntime:
         content_chars = 0
         finished = False
         provisional = ""
+        speech_handle = None
+        speech_handle_finished = False
+        replacement_intercepted = False
+        first_speech_text_at = None
+
+        async def finish_streamed_speech() -> None:
+            nonlocal speech_handle_finished
+            if speech_handle is not None and not speech_handle_finished:
+                await speech_handle.finish()
+                speech_handle_finished = True
+
+        async def queue_streamed_speech(decision) -> None:
+            nonlocal speech_handle, first_speech_text_at, replacement_intercepted
+            if speech_handle is not None or replacement_intercepted:
+                return
+            snapshot = getattr(self.output, "speak_snapshot", {})
+            queue_status = snapshot.get("queue_status", "empty") if isinstance(snapshot, dict) else "empty"
+            if queue_status == "speaking":
+                self.output.cancel_all("llm_replace")
+                await self.log("SPEAK_REPLACEMENT_INTERCEPTED", identity=identity,
+                               turn_id=source_turn_id, speech_id=snapshot.get("speech_id"))
+                await self._queue_recovery(
+                    "SPEAK_REPLACEMENT_RECOVERY",
+                    "播放中的语音需要改口；旧语音已按交付边界结算。请基于当前上下文和 delivery 重新输出完整 V0.6 JSON。",
+                    identity=identity, turn_id=source_turn_id,
+                    delivery_feedback=getattr(self.output, "last_delivery", None),
+                )
+                replacement_intercepted = True
+                return
+            replace = queue_status in {"queued", "suspended"}
+            speech_handle = (await self.output.replace_current(identity, source_turn_id, emotion=decision.emotion)
+                             if replace else await self.output.begin(identity, source_turn_id, emotion=decision.emotion))
+            first_speech_text_at = time.monotonic()
+            workspace = getattr(speech_handle, "workspace", None)
+            if workspace is not None and isinstance(getattr(workspace, "timings", None), dict):
+                workspace.timings["speak_queued"] = first_speech_text_at
+                workspace.timings["first_speech_text"] = first_speech_text_at
+                workspace.timings["speech_started_before_envelope_commit"] = True
+            await self.log("SPEAK_ACCEPTED", identity=identity, turn_id=source_turn_id,
+                           speech_id=speech_handle.speech_id, replaced=replace, partial=True)
+
         try:
             async with aclosing(self.provider.stream_events(messages, json_mode=True)) as stream:
                 async for item in stream:
@@ -990,9 +1039,14 @@ class AgentEpisodeRuntime:
                         text_delta = parser.feed(item["text"])
                         if text_delta:
                             provisional += text_delta
-                            # Preview is deliberately display-only.  A
-                            # malformed final JSON response must never be
-                            # promoted to the text queue or TTS from here.
+                            prefix = parser.speak_prefix()
+                            if prefix is not None and prefix.state == "speak":
+                                await queue_streamed_speech(prefix)
+                                if speech_handle is not None:
+                                    await speech_handle.feed(text_delta)
+                            # Keep this event as a model-stream diagnostic for
+                            # existing clients.  The actual queue truth is
+                            # speech.queued/speech.delta.
                             await self.emit("speak.preview", {
                                 "conversation_id": identity[0],
                                 "request_id": identity[1],
@@ -1005,23 +1059,61 @@ class AgentEpisodeRuntime:
             if not finished:
                 raise EnvelopeError("model stream missing finish")
             envelope = parser.finish()
-            # A streaming parser is allowed to see text before a later final
-            # error; only this method promotes it to a real speech handle.
-            await self._apply_decision_v06(identity, source_turn_id, envelope)
+            if speech_handle is not None:
+                await finish_streamed_speech()
+                await self.log("SPEAK_STATE_CHANGED", identity=identity, turn_id=source_turn_id,
+                               state=envelope.speak.state,
+                               queue_status=getattr(self.output, "speak_snapshot", {}).get("queue_status", "queued"),
+                               action_count=len(envelope.actions))
+                if envelope.actions:
+                    task = asyncio.create_task(self._execute_actions_v06(identity, source_turn_id, envelope.actions),
+                                               name="agent-actions-v06")
+                    self._background_tools.add(task)
+                    task.add_done_callback(self._background_tools.discard)
+            elif not replacement_intercepted:
+                await self._apply_decision_v06(identity, source_turn_id, envelope)
             await self.emit("speak.preview", {
                 "conversation_id": identity[0], "request_id": identity[1],
                 "turn_id": source_turn_id, "status": "committed",
             })
         except (EnvelopeError, ValueError, json.JSONDecodeError) as exc:
-            await self.emit("speak.preview", {
-                "conversation_id": identity[0], "request_id": identity[1],
-                "turn_id": source_turn_id, "status": "discarded",
-            })
-            await self.log("SPEAK_ENVELOPE_INVALID", identity=identity, turn_id=source_turn_id,
-                           error=str(exc)[:300], provisional_chars=len(provisional))
-            await self._queue_recovery("SPEAK_ENVELOPE_INVALID", str(exc)[:300],
-                                       identity=identity, turn_id=source_turn_id)
+            if speech_handle is not None:
+                try:
+                    await finish_streamed_speech()
+                except Exception:
+                    pass
+            error_text = str(exc)[:300]
+            recovery_code = ("TOOL_PROTOCOL_ERROR"
+                             if any(marker in error_text for marker in ("action", "tool"))
+                             else "SPEAK_ENVELOPE_INVALID")
+            await self.log(recovery_code, identity=identity, turn_id=source_turn_id,
+                           error=error_text, provisional_chars=len(provisional),
+                           partial_speech=speech_handle is not None)
+            if speech_handle is not None:
+                workspace = getattr(speech_handle, "workspace", None)
+                if workspace is not None and isinstance(getattr(workspace, "timings", None), dict):
+                    workspace.timings["partial_speech_protocol_error"] = True
+            if not replacement_intercepted:
+                await self._queue_recovery(recovery_code, error_text,
+                                           identity=identity, turn_id=source_turn_id)
         finally:
+            if speech_handle is not None and not speech_handle_finished:
+                try:
+                    await finish_streamed_speech()
+                except Exception:
+                    pass
+            if first_speech_text_at is not None:
+                workspace = getattr(speech_handle, "workspace", None)
+                if workspace is not None and isinstance(getattr(workspace, "timings", None), dict):
+                    finish_at = time.monotonic()
+                    workspace.timings["first_speech_text_to_json_finish_ms"] = round(
+                        (finish_at - first_speech_text_at) * 1000
+                    )
+                    request_at = workspace.timings.get("llm_request")
+                    if request_at is not None:
+                        workspace.timings["llm_request_to_first_speech_text_ms"] = round(
+                            (first_speech_text_at - request_at) * 1000
+                        )
             self.last_llm_completed_at = time.monotonic()
 
     async def output_completed(self, record):

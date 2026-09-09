@@ -5,7 +5,7 @@ V0.6 以 JSON 响应信封取代 DeepSeek 原生工具调用，但不移除已�
 | 业务能力 | 唯一 owner | 自动化证据 |
 | --- | --- | --- |
 | 400ms 单飞调度与事件合并 | `AgentEpisodeRuntime + AgentDecisionScheduler` | 调度、退避、恢复测试 |
-| 必填语音决策 | `SpeechDecisionEnvelopeStream` | JSON 分片、字段顺序、非法信封测试 |
+| 必填语音决策 | `SpeechDecisionEnvelopeStream` | JSON 分片、前端参数半校验、完整信封与非法动作测试 |
 | 文本候选与挂起 | `EpisodeSpeechOutput` | `empty/queued/suspended/speaking` 状态测试 |
 | TTS 隔离与零 PCM | `EpisodeSpeechOutput + MiniMaxTtsSession` | flush、cancel、新建会话、一次重试 |
 | 播放中改口 | 恢复信号 + `DeliveryResolver` | 交付边界、一次恢复、用户反打断测试 |
@@ -17,6 +17,7 @@ V0.6 以 JSON 响应信封取代 DeepSeek 原生工具调用，但不移除已�
 - 用户讲话时，语音候选只保存文本；端点确认前绝不启动 TTS 或持有 PCM。
 - 正常 ASR final、SenseVoice 精修和动作完成不会取消在飞 LLM；只有 stop、barge-in、reset、传输清理和播放中实质改口会显式取消。
 - `cancel` 挂起但不删除待播文本；`wait` 完全不改变事务；讲话中只有 `speak(text)` 可以请求受控替换。
+- `speak` 的合法 state/emotion/text 前缀可以在完整 JSON 结束前进入文本队列；后续 JSON 或工具错误保留已入队文本，并通过即时恢复请求纠正协议。
 - DeepSeek thinking 请求使用 `response_format=json_object`，不传递 provider native tools；工具资料仅经本地 `actions` 和不可信账本来源块进入下一请求。
 
 真实设备仍须完成连续五轮、SenseVoice 修正、动作后回复、播放中改口、耳机/扬声器插话和停止监听验收。

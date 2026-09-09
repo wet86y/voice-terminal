@@ -40,12 +40,12 @@ class DecisionEnvelope:
 
 
 class SpeechDecisionEnvelopeStream:
-    """Collect JSON-mode content while safely exposing a provisional text body.
+    """Collect JSON-mode content with a staged validation boundary.
 
-    A caller may display/retain the returned text deltas in a private candidate
-    buffer.  It must not create a speech transaction until :meth:`finish`
-    succeeds.  This retains the useful streaming transfer path without a bad
-    final JSON object leaking to TTS.
+    ``feed`` still exposes only text belonging to a locally valid ``speak``
+    prefix.  The caller may now commit those deltas to the text-only speech
+    queue immediately; :meth:`finish` remains authoritative for the complete
+    envelope and its actions.
     """
 
     def __init__(self, *, limit: int = 32768) -> None:
@@ -106,6 +106,9 @@ class SpeechDecisionEnvelopeStream:
             if state not in SPEAK_STATES:
                 raise EnvelopeError("invalid speak state")
             self.state = state
+        emotion = self._quoted_value(self.raw, "emotion")
+        if emotion is not None and emotion not in EMOTIONS:
+            raise EnvelopeError("invalid speak emotion")
         if self.state != "speak":
             return ""
         text = self._quoted_value(self.raw, "text", allow_partial=True)
@@ -114,6 +117,27 @@ class SpeechDecisionEnvelopeStream:
         value = text[self._emitted_length:]
         self._emitted_length = len(text)
         return value
+
+    def speak_prefix(self) -> SpeechDecision | None:
+        """Return the currently safe speak prefix, if one exists.
+
+        This is intentionally weaker than ``finish``: it does not inspect the
+        top-level envelope or actions.  It only authorizes a text transaction
+        after the state/emotion are known to be valid and a non-empty text
+        prefix has arrived.
+        """
+        state = self.state
+        if state is None:
+            return None
+        emotion = self._quoted_value(self.raw, "emotion") or "calm"
+        if emotion not in EMOTIONS:
+            raise EnvelopeError("invalid speak emotion")
+        if state != "speak":
+            return SpeechDecision(state, emotion, "")
+        text = self._quoted_value(self.raw, "text", allow_partial=True)
+        if not isinstance(text, str) or not text.strip():
+            return None
+        return SpeechDecision(state, emotion, text)
 
     @staticmethod
     def _action(value: Any) -> Action:

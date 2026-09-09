@@ -27,6 +27,6 @@
 | `speech.queued`、`speech.started`、`speech.delta`、`speech.progress`、`speech.completed` | 已授权语音输出、队列与传达结算 |
 | `error` | 可恢复或不可恢复错误 |
 
-`speech.queued`、`speech.progress` 和 `speech.completed` 只描述文本 speak 事务；用户讲话期间队列不启动 TTS，不生成 PCM。只有实际播放的文本才可能出现在 DeliveryReport。`agent.reasoning` 仅限受控本地调试环境。
+`speech.queued`、`speech.delta`、`speech.progress` 和 `speech.completed` 是文本进入语音事务后的真实状态；它们不等待完整 JSON 信封提交。用户讲话期间队列不启动 TTS，不生成 PCM。只有实际播放的文本才可能出现在 DeliveryReport。`speak.preview`（如启用）仅是模型流调试观察，不是队列提交或撤销状态；后续 JSON/工具错误不会撤销已入队文本，而会通过 `error`/`agent.trace` 和即时恢复请求报告。`agent.reasoning` 仅限受控本地调试环境。
 
 不存在 native `tool_calls`、`tool_call_id`、`speak(queue|modify)`、`session_id`、`input_id`、`episode_id`、`decision_id`、`generation_id`、`input_revision`、`context_version` 或 V0.4/V0.5 客户端映射。V0.6 是同步破坏性升级，旧客户端不受支持。
