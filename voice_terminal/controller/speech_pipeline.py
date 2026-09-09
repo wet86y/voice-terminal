@@ -50,7 +50,33 @@ async def buffered_stream(source, bridge):
 
 class SpeechPipeline:
     """Shared Bidi/legacy streaming sink; the host owns authorization and state."""
-    async def _play_stream(self, ws, token, deltas) -> str:
+
+    def _delivery_resolver_for(self, ws, *, speech_id: str | None = None) -> DeliveryResolver:
+        """Return the delivery accumulator for one output transaction.
+
+        A user turn can legitimately contain several speech transactions when
+        the LLM replaces a provisional answer.  Their subtitle/audio spans
+        must therefore never share a turn-scoped accumulator.
+        """
+
+        resolver_key = speech_id or ws.turn_id
+        return self._delivery_resolvers.setdefault(resolver_key, DeliveryResolver())
+
+    def _new_tts_session(self, ws, *, fresh=False):
+        """Factory hook for transaction-owned output implementations."""
+        try:
+            return self.tts.session(fresh=fresh)
+        except TypeError:
+            return self.tts.session()
+
+    def _bind_tts_session(self, ws, session):
+        self._tts_session = session
+
+    def _release_tts_session(self, ws, session, *, retain):
+        if self._tts_session is session:
+            self._tts_session = session if retain else None
+
+    async def _play_stream(self, ws, token, deltas, *, speech_id: str | None = None) -> str:
         transport = getattr(self.tts, "transport", "websocket") if self.tts is not None else "websocket"
         bridge = BidiTextMerger(max_chars=128, max_wait_ms=30) if transport == "websocket_bidi" else TextBridge(**self.bridge_options)
         session = None
@@ -87,7 +113,13 @@ class SpeechPipeline:
         progress_lock = asyncio.Lock()
         last_progress: tuple[int, int, int, int, int] | None = None
         last_progress_at = 0.0
-        resolver = self._delivery_resolvers.setdefault(ws.turn_id, DeliveryResolver())
+        # Delivery is a speech-transaction fact, not a turn fact.  Multiple
+        # LLM decisions may replace each other inside the same user turn; a
+        # turn-keyed resolver both mixes their subtitle boundaries and leaves
+        # the speech-keyed finalizer empty (reported as delivery=unknown).
+        # Keep the turn key solely as a compatibility fallback for callers
+        # outside EpisodeSpeechOutput which have no speech ID.
+        resolver = self._delivery_resolver_for(ws, speech_id=speech_id)
         completed_markers = 0
         alignment_cursor = 0
         timing_owner = getattr(self, "controller", self)
@@ -304,10 +336,14 @@ class SpeechPipeline:
                         if not self._valid(token):
                             return
                         sync_turn_timings()
-                        session = self.tts.session()
-                        self._tts_session = session
+                        session = self._new_tts_session(ws)
+                        self._bind_tts_session(ws, session)
                         checkout = getattr(self.tts, "checkout_prewarm", None)
                         warm = bool(checkout(session)) if callable(checkout) else False
+                        checkout_reason = getattr(
+                            self.tts, "last_prewarm_checkout_reason",
+                            "not_available" if not callable(checkout) else "not_prewarmed",
+                        )
                         warm_connection_id = getattr(session, "connection_id", None) if warm else None
                         ws.timings.setdefault("tts_session_start", time.monotonic())
                         try:
@@ -329,12 +365,15 @@ class SpeechPipeline:
                                 # waiting for it.  Fall back to a fresh cold
                                 # session rather than sending text to a dead
                                 # socket.
-                                session = self.tts.session()
-                                self._tts_session = session
+                                session = self._new_tts_session(ws, fresh=True)
+                                self._bind_tts_session(ws, session)
                                 ws.timings["tts_session_start"] = time.monotonic()
                                 await session.start()
                                 warm = False
                             ws.timings.setdefault("tts_session_ready", time.monotonic())
+                            if ws.timings.get("replacement_detected"):
+                                ws.timings.setdefault("new_tts_started", time.monotonic())
+                                await self._detail("new_tts_started", status="STARTED")
                             # If the prewarm task was still finishing when we
                             # inspected the session, claim it after the
                             # serialized start returns.  This keeps a racing
@@ -342,6 +381,17 @@ class SpeechPipeline:
                             # second task_start.
                             if not warm and callable(checkout):
                                 warm = bool(checkout(session))
+                            checkout_reason = getattr(
+                                self.tts, "last_prewarm_checkout_reason",
+                                "not_available" if not callable(checkout) else "not_prewarmed",
+                            )
+                            ws.timings["prewarm_checkout_result"] = "hit" if warm else "miss"
+                            ws.timings["prewarm_checkout_reason"] = checkout_reason
+                            await self._detail(
+                                "prewarm_checkout_result",
+                                result="hit" if warm else "miss",
+                                reason=checkout_reason,
+                            )
                             if warm:
                                 ws.timings.setdefault("tts_prewarm_checkout", time.monotonic())
                                 ws.timings["tts_prewarm_used"] = True
@@ -357,8 +407,8 @@ class SpeechPipeline:
                             if not getattr(exc, "emotion_unsupported", False) or not self._valid(token):
                                 raise
                             await self._detail("tts.emotion_unsupported", status="FALLBACK_CALM")
-                            session = self.tts.session()
-                            self._tts_session = session
+                            session = self._new_tts_session(ws, fresh=True)
+                            self._bind_tts_session(ws, session)
                             ws.timings["tts_session_start"] = time.monotonic()
                             await session.start()
                             ws.timings["tts_session_ready"] = time.monotonic()
@@ -560,7 +610,17 @@ class SpeechPipeline:
                 if not reader.done():
                     reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
-            if session and not (getattr(session, "reusable", False) and tts_failed is None):
+            # Isolated replacement sessions are valid for their one active
+            # transaction, but never become an implicit reusable session.
+            retain_session = bool(
+                getattr(session, "reusable", False)
+                and tts_failed is None
+                and not getattr(session, "_isolated_transaction", False)
+            )
+            if session and not retain_session:
                 await session.close()
-            if self._tts_session is session:
-                self._tts_session = session if getattr(session, "reusable", False) and tts_failed is None else None
+            self._release_tts_session(
+                ws,
+                session,
+                retain=retain_session,
+            )

@@ -166,6 +166,35 @@ class PlaybackDiagnosticsTests(unittest.TestCase):
 
 
 class TurnSettlementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_agent_snapshot_does_not_cancel_unsettled_tts_prewarm(self) -> None:
+        """A stale idle snapshot must not tear down a prewarm needed by dispatch."""
+
+        controller = object.__new__(EpisodeController)
+        controller.state = RuntimeState()
+        controller.workspace = None
+        controller.output = SimpleNamespace(active=False)
+        controller.episode = SimpleNamespace(last_turn_id="turn_a")
+        cancelled = []
+        published = []
+
+        async def publish(item):
+            published.append(item)
+
+        async def cancel_prewarm(turn_id=None):
+            cancelled.append(turn_id)
+
+        controller._publish = publish
+        controller._cancel_tts_prewarm = cancel_prewarm
+
+        await controller._agent_event("agent.episode", {
+            "turn_id": "turn_a",
+            "agent_busy": False,
+        })
+
+        self.assertEqual(cancelled, [])
+        self.assertEqual(controller.state.agent["turn_id"], "turn_a")
+        self.assertEqual([item.type for item in published], ["agent.episode"])
+
     async def test_only_settlement_emits_one_terminal_turn_event(self) -> None:
         controller = object.__new__(EpisodeController)
         controller._settled_turns = set()

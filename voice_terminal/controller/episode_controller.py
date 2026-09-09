@@ -74,15 +74,14 @@ class EpisodeController(RealtimeController):
                 outcome=str(payload.get("outcome") or "completed"),
             )
         await self._publish(VoiceEvent(kind, payload.get("input_id") or payload.get("turn_id") or self.episode.last_turn_id, payload))
-        # A session is idle only after the Agent has settled and no speech
-        # transaction owns the output path.
-        output_has_pending = bool(self.output.active or getattr(self.output, "_pending", None))
-        if (kind == "agent.episode" and self.workspace is None
-                and payload.get("agent_busy") is False
-                and not output_has_pending):
-            turn_id = payload.get("turn_id") or self.episode.last_turn_id
-            if isinstance(turn_id, str):
-                await self._cancel_tts_prewarm(turn_id)
+        # Do not infer turn settlement from a snapshot which happens to say
+        # ``agent_busy=False``.  There is a hand-off window between input
+        # retirement and LLM dispatch where that snapshot is stale, while the
+        # Bidi TTS prewarm is still connecting.  Cancelling it here closes the
+        # warm socket immediately before the first speak can check it out and
+        # turns the critical path back into a cold start.  The authoritative
+        # terminal paths (speech.completed / agent.turn_settled, cancellation,
+        # reset, and close) all dispose the prewarm explicitly.
 
     async def start_listening(self):
         if self.episode.closed:

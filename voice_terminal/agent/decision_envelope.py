@@ -13,6 +13,11 @@ from typing import Any
 
 
 EMOTIONS = {"calm", "happy", "sad", "angry", "fearful", "disgusted", "surprised"}
+# A small compatibility set for ordinary stylistic labels emitted by the
+# model.  These values do not change speech content and have an unambiguous
+# safe provider fallback, so treating them as a fatal envelope error only
+# creates an avoidable recovery round-trip.
+EMOTION_ALIASES = {"friendly": "calm"}
 SPEAK_STATES = {"speak", "cancel", "wait"}
 
 
@@ -53,6 +58,7 @@ class SpeechDecisionEnvelopeStream:
         self.limit = limit
         self.state: str | None = None
         self._emitted_length = 0
+        self.emotion_normalizations: list[dict[str, str]] = []
 
     @staticmethod
     def _quoted_value(raw: str, key: str, *, allow_partial: bool = False) -> str | None:
@@ -95,6 +101,20 @@ class SpeechDecisionEnvelopeStream:
                 continue
         return None
 
+    def _emotion(self, value: str | None) -> str | None:
+        """Validate an emotion and safely normalize known benign aliases."""
+
+        if value is None:
+            return None
+        if value in EMOTIONS:
+            return value
+        mapped = EMOTION_ALIASES.get(value.casefold())
+        if mapped is None:
+            raise EnvelopeError("invalid speak emotion")
+        if not any(item["provided"] == value for item in self.emotion_normalizations):
+            self.emotion_normalizations.append({"provided": value, "applied": mapped})
+        return mapped
+
     def feed(self, delta: str) -> str:
         if not isinstance(delta, str):
             raise EnvelopeError("response content delta must be text")
@@ -106,9 +126,7 @@ class SpeechDecisionEnvelopeStream:
             if state not in SPEAK_STATES:
                 raise EnvelopeError("invalid speak state")
             self.state = state
-        emotion = self._quoted_value(self.raw, "emotion")
-        if emotion is not None and emotion not in EMOTIONS:
-            raise EnvelopeError("invalid speak emotion")
+        self._emotion(self._quoted_value(self.raw, "emotion"))
         if self.state != "speak":
             return ""
         text = self._quoted_value(self.raw, "text", allow_partial=True)
@@ -129,9 +147,7 @@ class SpeechDecisionEnvelopeStream:
         state = self.state
         if state is None:
             return None
-        emotion = self._quoted_value(self.raw, "emotion") or "calm"
-        if emotion not in EMOTIONS:
-            raise EnvelopeError("invalid speak emotion")
+        emotion = self._emotion(self._quoted_value(self.raw, "emotion")) or "calm"
         if state != "speak":
             return SpeechDecision(state, emotion, "")
         text = self._quoted_value(self.raw, "text", allow_partial=True)
@@ -161,9 +177,12 @@ class SpeechDecisionEnvelopeStream:
         state = speak.get("state")
         if state not in SPEAK_STATES:
             raise EnvelopeError("invalid or missing speak state")
-        emotion = speak.get("emotion", "calm")
-        if emotion not in EMOTIONS:
+        raw_emotion = speak.get("emotion", "calm")
+        if not isinstance(raw_emotion, str):
             raise EnvelopeError("invalid speak emotion")
+        emotion = self._emotion(raw_emotion)
+        if emotion is None:  # Defensive; a complete speak object always has a default above.
+            emotion = "calm"
         has_text = "text" in speak
         text = speak.get("text", "")
         if not isinstance(text, str):

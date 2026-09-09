@@ -4,12 +4,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from voice_terminal.agent.decision_envelope import EnvelopeError, SpeechDecisionEnvelopeStream
+import voice_terminal.agent.episode as episode_module
+from voice_terminal.agent.decision_envelope import (
+    DecisionEnvelope,
+    EnvelopeError,
+    SpeechDecision,
+    SpeechDecisionEnvelopeStream,
+)
 from voice_terminal.agent.episode import AgentDecisionScheduler, AgentEpisodeRuntime
 from voice_terminal.agent.options import AgentOptions
 from voice_terminal.agent.sentences import SentenceStore, map_refinement
 from voice_terminal.config import AppConfig, load_config
 from voice_terminal.controller.episode_output import EpisodeSpeechOutput
+from voice_terminal.controller.speech_pipeline import SpeechPipeline
 from voice_terminal.core.events import event
 from voice_terminal.providers.deepseek import DeepSeekClient
 from voice_terminal.server.snapshot import ProtocolSequencer
@@ -51,6 +58,38 @@ def test_v06_prefix_is_safe_before_full_envelope_and_validates_emotion():
         bad.feed('{"speak":{"state":"speak","emotion":"unknown","text":"x"}')
 
 
+def test_friendly_emotion_is_safely_normalized_and_remains_observable():
+    parser = SpeechDecisionEnvelopeStream()
+    assert parser.feed('{"speak":{"state":"speak","emotion":"friendly","text":"你好"') == "你好"
+    prefix = parser.speak_prefix()
+    assert prefix is not None and prefix.emotion == "calm"
+    parser.feed('},"actions":[]}')
+    assert parser.finish().speak.emotion == "calm"
+    assert parser.emotion_normalizations == [{"provided": "friendly", "applied": "calm"}]
+
+
+def test_minor_emotion_repair_is_declared_on_the_next_llm_poll():
+    class Registry:
+        def begin_turn(self, _): pass
+        def action_definitions(self): return []
+
+    async def emit(*_): pass
+
+    runtime = AgentEpisodeRuntime(None, Registry(), SimpleNamespace(active=False, status="IDLE"), emit,
+                                  conversation=ConversationRuntime(), ledger=SessionLedger())
+    runtime.last_turn_id = "turn_a"
+    runtime.inputs["turn_a"] = {"text": "你好", "final": True}
+    runtime.minor_protocol_feedback.append({
+        "field": "speak.emotion", "provided": "friendly", "applied": "calm",
+    })
+
+    messages = runtime.messages({"USER_INPUT_FINALIZED"})
+
+    assert any("轻度协议偏差" in message["content"] and "friendly" in message["content"]
+               for message in messages)
+    assert not runtime.minor_protocol_feedback
+
+
 def test_sentence_ids_stay_stable_and_unmapped_refinement_is_retained():
     store = SentenceStore(min_chars=2, max_chars=20)
     first = store.feed("你好，世界。", now=1)
@@ -68,11 +107,55 @@ def test_scheduler_defaults_and_removed_prediction_configuration():
         AppConfig.from_mapping({"smart_turn": {"predictions": True}})
 
 
+def test_first_token_estimate_uses_fallback_while_tokenizer_warms_in_background(monkeypatch):
+    """A cold tokenizer cache must never block the realtime event loop."""
+
+    async def scenario():
+        calls = []
+        monkeypatch.setattr(episode_module, "_O200K_ENCODING", None)
+        monkeypatch.setattr(episode_module, "_O200K_STATE", "uninitialized")
+        monkeypatch.setattr(episode_module, "_load_o200k_encoding", lambda: calls.append("loaded"))
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        async def emit(*_): pass
+
+        runtime = AgentEpisodeRuntime(None, Registry(), SimpleNamespace(active=False, status="IDLE"), emit,
+                                      conversation=ConversationRuntime(), ledger=SessionLedger())
+        await runtime.ensure_episode(turn_id="turn_a", text="你好")
+
+        # The exact encoder is intentionally unavailable until its worker has
+        # finished; estimating still returns immediately and deterministically.
+        assert runtime._estimate_tokens("中文 hello") == episode_module._fallback_token_estimate("中文 hello")
+        await runtime._tokenizer_prewarm_task
+        assert calls == ["loaded"]
+
+    asyncio.run(scenario())
+
+
 def test_debug_events_are_public_protocol_events():
     sequencer = ProtocolSequencer("session_a")
     assert sequencer.public(event("agent.reasoning", "input_a"))
     assert sequencer.public(event("speak.preview", "input_a"))
     assert sequencer.public(event("speech.queued", "input_a"))
+
+
+def test_replacement_delivery_alignment_is_scoped_to_each_speech_id():
+    """A replacement must not lose old playback boundaries to the turn key."""
+
+    pipeline = object.__new__(SpeechPipeline)
+    pipeline._delivery_resolvers = {}
+    workspace = SimpleNamespace(turn_id="turn_a")
+
+    old = pipeline._delivery_resolver_for(workspace, speech_id="speech_old")
+    new = pipeline._delivery_resolver_for(workspace, speech_id="speech_new")
+
+    assert old is pipeline._delivery_resolvers["speech_old"]
+    assert new is pipeline._delivery_resolvers["speech_new"]
+    assert old is not new
+    assert "turn_a" not in pipeline._delivery_resolvers
 
 
 def test_refinement_is_supplemental_and_never_changes_cancellation_scope():
@@ -203,4 +286,268 @@ def test_runtime_streams_text_before_finish_and_keeps_it_on_bad_actions():
         assert seen["recoveries"] == ["TOOL_PROTOCOL_ERROR"]
         assert any(kind == "agent.trace" and payload.get("kind") == "TOOL_PROTOCOL_ERROR"
                    for kind, payload in events)
+    asyncio.run(scenario())
+
+
+def test_complete_playing_speak_replaces_directly_without_llm_recovery():
+    async def scenario():
+        seen = {"replace": [], "feeds": [], "recoveries": []}
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Handle:
+            speech_id = "new_speech"
+            async def feed(self, text): seen["feeds"].append(text)
+            async def finish(self): seen["finished"] = True
+
+        class Output:
+            active = True
+            status = "SPEAKING"
+            speak_snapshot = {"queue_status": "speaking", "speech_id": "old_speech"}
+            async def replace_current(self, *_args, **kwargs):
+                seen["replace"].append(kwargs)
+                return Handle()
+            def cancel_all(self, reason): seen.setdefault("cancel", []).append(reason)
+
+        async def emit(*_): pass
+        conversation = ConversationRuntime(); conversation.begin_turn("turn")
+        runtime = AgentEpisodeRuntime(None, Registry(), Output(), emit,
+                                      conversation=conversation, ledger=SessionLedger())
+        runtime.episode_id = conversation.conversation_id
+        identity = (runtime.episode_id, "request")
+        runtime._queue_recovery = lambda *args, **kwargs: seen["recoveries"].append(args[0])
+        envelope = DecisionEnvelope(SpeechDecision("speak", "calm", "新的完整播报"), ())
+        await runtime._apply_decision_v06(identity, "turn", envelope)
+        assert seen["replace"] == [{"emotion": "calm"}]
+        assert seen["feeds"] == ["新的完整播报"] and seen["finished"]
+        assert not seen["recoveries"]
+        assert "cancel" not in seen
+    asyncio.run(scenario())
+
+
+def test_stream_prefix_replaces_playing_speak_and_only_feeds_new_handle():
+    async def scenario():
+        seen = {"replace": 0, "feeds": [], "recoveries": []}
+
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","emotion":"calm","text":"新'}
+                    await asyncio.sleep(0)
+                    yield {"type": "content", "text": '内容"},"actions":[]}'}
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Handle:
+            speech_id = "new_speech"
+            async def feed(self, text): seen["feeds"].append(text)
+            async def finish(self): seen["finished"] = True
+
+        class Output:
+            active = True
+            status = "SPEAKING"
+            speak_snapshot = {"queue_status": "speaking", "speech_id": "old_speech"}
+            async def replace_current(self, *_args, **_kwargs):
+                seen["replace"] += 1
+                return Handle()
+
+        async def emit(*_): pass
+        conversation = ConversationRuntime(); conversation.begin_turn("turn")
+        runtime = AgentEpisodeRuntime(Provider(), Registry(), Output(), emit,
+                                      conversation=conversation, ledger=SessionLedger())
+        runtime.episode_id = conversation.conversation_id
+        runtime.last_turn_id = "turn"
+        runtime.inputs = {"turn": {"text": "你好", "final": True}}
+        identity = (runtime.episode_id, "request")
+        runtime.agent_step_id = "request"
+        runtime._identity_turns[identity] = "turn"
+
+        async def recovery(*args, **_kwargs): seen["recoveries"].append(args[0])
+        runtime._queue_recovery = recovery
+        await runtime._step(identity, {"USER_INPUT_FINALIZED"})
+        assert seen["replace"] == 1
+        assert seen["feeds"] == ["新", "内容"] and seen["finished"]
+        assert not seen["recoveries"]
+    asyncio.run(scenario())
+
+
+def test_streamed_prefix_divergence_replaces_with_complete_accumulated_text():
+    async def scenario():
+        seen = {"replace": 0, "feeds": []}
+
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"已有改'}
+                    yield {"type": "content", "text": '正"},"actions":[]}' }
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Handle:
+            speech_id = "replacement"
+            async def feed(self, value): seen["feeds"].append(value)
+            async def finish(self): pass
+
+        class Output:
+            status = "SPEAKING"
+            speak_snapshot = {"queue_status": "speaking", "speech_id": "old", "output_generation": 3,
+                              "text": "已有播报"}
+            async def replace_current(self, *_args, **_kwargs):
+                seen["replace"] += 1
+                return Handle()
+
+        async def emit(*_args): pass
+        conversation = ConversationRuntime(); conversation.begin_turn("turn")
+        runtime = AgentEpisodeRuntime(Provider(), Registry(), Output(), emit,
+                                      conversation=conversation, ledger=SessionLedger())
+        runtime.episode_id = conversation.conversation_id; runtime.last_turn_id = "turn"
+        runtime.inputs = {"turn": {"text": "你好", "final": True}}
+        identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"
+        runtime._identity_turns[identity] = "turn"
+        await runtime._step(identity, {"USER_INPUT_REFINED"})
+        assert seen["replace"] == 1 and seen["feeds"] == ["已有改", "正"]
+    asyncio.run(scenario())
+
+
+def test_streamed_full_text_prefix_queues_only_suffix_without_replacement():
+    async def scenario():
+        seen = {"replace": 0, "suffixes": [], "feeds": []}
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"已有播报'}
+                    yield {"type": "content", "text": '，新增句子"},"actions":[]}' }
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+        class Handle:
+            speech_id = "successor"
+            async def feed(self, value): seen["feeds"].append(value)
+            async def finish(self): seen["finished"] = True
+        class Output:
+            status = "SPEAKING"
+            speak_snapshot = {"queue_status": "speaking", "speech_id": "old", "output_generation": 7,
+                              "text": "已有播报"}
+            async def replace_current(self, *_args, **_kwargs):
+                seen["replace"] += 1; return Handle()
+            async def append_successor(self, *_args, suffix, **_kwargs):
+                seen["suffixes"].append(suffix); return Handle()
+        events = []
+        async def emit(kind, payload): events.append((kind, payload))
+        conversation = ConversationRuntime(); conversation.begin_turn("turn")
+        runtime = AgentEpisodeRuntime(Provider(), Registry(), Output(), emit,
+                                      conversation=conversation, ledger=SessionLedger())
+        runtime.episode_id = conversation.conversation_id; runtime.last_turn_id = "turn"
+        runtime.inputs = {"turn": {"text": "你好", "final": True}}
+        identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"
+        runtime._identity_turns[identity] = "turn"
+        await runtime._step(identity, {"USER_INPUT_REFINED"})
+        assert seen["replace"] == 0 and seen["suffixes"] == ["，新增句子"]
+        assert seen["feeds"] == [] and seen["finished"]
+        assert any(kind == "speech.append_waiting_prefix" for kind, _ in events)
+    asyncio.run(scenario())
+
+
+def test_speak_cancel_stops_playing_output_instead_of_ignoring_it():
+    async def scenario():
+        seen = []
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Output:
+            active = True
+            status = "SPEAKING"
+            speak_snapshot = {"queue_status": "speaking", "speech_id": "old_speech"}
+            def cancel_all(self, reason): seen.append(reason)
+
+        async def emit(*_): pass
+        conversation = ConversationRuntime(); conversation.begin_turn("turn")
+        runtime = AgentEpisodeRuntime(None, Registry(), Output(), emit,
+                                      conversation=conversation, ledger=SessionLedger())
+        runtime.episode_id = conversation.conversation_id
+        await runtime._apply_decision_v06((runtime.episode_id, "request"), "turn",
+                                          DecisionEnvelope(SpeechDecision("cancel"), ()))
+        assert seen == ["cancelled"]
+        assert runtime.current_action == "wait"
+    asyncio.run(scenario())
+
+
+def test_replacement_starts_before_slow_old_cleanup_finishes():
+    async def scenario():
+        starts, old_cleanup = [], asyncio.Event()
+
+        async def emit(*_args): pass
+        runtime = SimpleNamespace(gate=lambda _: None, emit=emit, user_speaking=False, closed=False)
+        player = SimpleNamespace(stop_and_snapshot=lambda _key: {"started": True})
+        controller = SimpleNamespace(
+            tts=None, player=player, options=SimpleNamespace(), bridge_options=SimpleNamespace(),
+            _turn_timings={}, _track=lambda task: task,
+        )
+        output = EpisodeSpeechOutput(controller); output.runtime = runtime
+
+        async def slow_run(handle):
+            starts.append(handle.speech_id)
+            try:
+                async for _ in handle.stream():
+                    pass
+            except asyncio.CancelledError:
+                await asyncio.sleep(.20)  # provider cancel / socket close analogue
+                old_cleanup.set()
+
+        output._run = slow_run
+        old = await output.begin(("episode", "request"), "turn")
+        await asyncio.sleep(0)
+        old.workspace.playback_started = True
+        new = await output.replace_current(("episode", "request"), "turn")
+        await asyncio.sleep(.03)
+        assert new.speech_id in starts
+        assert not old_cleanup.is_set()
+        # The old provider reader can still be in its slow cleanup, but any
+        # PCM arriving from it is rejected by the generation/token gate.
+        assert not output._valid(old.workspace.token)
+        assert output._valid(new.workspace.token)
+        await new.finish()
+        await old_cleanup.wait()
+        await new.task
+    asyncio.run(scenario())
+
+
+def test_barge_cancel_tolerates_legacy_single_field_identity():
+    """A diagnostic correlation gap must not become input_frame_failed."""
+    async def scenario():
+        async def emit(*_args): pass
+        runtime = SimpleNamespace(gate=lambda _: None, emit=emit, user_speaking=False, closed=False)
+        player = SimpleNamespace(stop_and_snapshot=lambda _key: {"started": True})
+        controller = SimpleNamespace(
+            tts=None, player=player, options=SimpleNamespace(), bridge_options=SimpleNamespace(),
+            _turn_timings={}, _track=lambda task: task,
+        )
+        output = EpisodeSpeechOutput(controller); output.runtime = runtime
+        blocked = asyncio.Event()
+
+        async def fake_run(_handle):
+            await blocked.wait()
+
+        output._run = fake_run
+        handle = await output.begin(("legacy_conversation_only",), "turn")
+        handle.workspace.playback_started = True
+        output.cancel_all("interrupted")
+        await asyncio.sleep(0)
+        assert handle.identity == ("legacy_conversation_only", None)
+        assert handle.reason == "interrupted"
+        assert handle.task.done() and handle.task.cancelled()
     asyncio.run(scenario())

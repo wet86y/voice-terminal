@@ -75,6 +75,7 @@ class MiniMaxTtsSession:
         self._prewarmed = False
         self._prewarm_inflight = False
         self._prewarm_ready = asyncio.Event()
+        self._isolated_transaction = False
 
     @property
     def reusable(self) -> bool:
@@ -823,6 +824,7 @@ class MiniMaxTtsClient:
         # valid long response during a temporary synthesis pause.
         self.receive_timeout_seconds = max(120.0, self.timeout_seconds)
         self._bidi_session: MiniMaxTtsSession | None = None
+        self.last_prewarm_checkout_reason = "not_requested"
         self._connection_sequence = 0
 
     def _next_connection_id(self) -> int:
@@ -875,7 +877,7 @@ class MiniMaxTtsClient:
             payload["subtitle_type"] = self.subtitle_type
         return payload
 
-    async def prepare_emotion(self, emotion: str | None) -> str:
+    async def prepare_emotion(self, emotion: str | None, *, detach_active: bool = False) -> str:
         """Select a voice setting before a Bidi task starts.
 
         ``task_start`` owns MiniMax's voice settings, so a retained Bidi
@@ -886,7 +888,13 @@ class MiniMaxTtsClient:
         selected = self.normalize_emotion(emotion)
         if self.emotion_mode != "agent":
             selected = self.default_emotion
-        if self.transport == "websocket_bidi" and self._bidi_session is not None and selected != self._active_emotion:
+        if self.transport == "websocket_bidi" and self._bidi_session is not None and detach_active:
+            # The output owner has already transferred cancellation ownership
+            # to a retired generation.  Detach its reusable pointer instead
+            # of awaiting its socket close on the replacement's critical
+            # path; that old handle will close it in background cleanup.
+            self._bidi_session = None
+        elif self.transport == "websocket_bidi" and self._bidi_session is not None and selected != self._active_emotion:
             session = self._bidi_session
             # A prewarm may still be in the handshake.  Wait for the session
             # start lock before closing it so a mismatched-emotion checkout
@@ -914,11 +922,18 @@ class MiniMaxTtsClient:
     def applied_emotion(self) -> str:
         return self._active_emotion if self.emotion_enabled else self.default_emotion
 
-    def session(self) -> MiniMaxTtsSession:
+    def session(self, *, fresh: bool = False) -> MiniMaxTtsSession:
         if not self.api_key:
             raise MiniMaxTtsError("未配置 MINIMAX_API_KEY")
         if self.output_format.lower() != "pcm":
             raise MiniMaxTtsError("当前原生播放器只接受 PCM，未启用 MP3 自动回退。")
+        # A replacement must receive a socket that is not still draining a
+        # cancel/flush of the previous generation.  Do not publish this
+        # isolated transaction as the reusable idle session.
+        if fresh:
+            isolated = MiniMaxTtsSession(self, emotion=self._active_emotion)
+            isolated._isolated_transaction = True
+            return isolated
         if self.transport == "websocket_bidi" and self.session_reuse:
             if (
                 self._bidi_session is None
@@ -990,15 +1005,26 @@ class MiniMaxTtsClient:
 
     def checkout_prewarm(self, session: MiniMaxTtsSession) -> bool:
         """Claim a ready warm session exactly once for real speech."""
-
-        if (
-            session is self._bidi_session
-            and getattr(session, "_prewarmed", False)
-            and session.emotion == self._active_emotion
-            and session.reusable
-        ):
+        if session is not self._bidi_session:
+            self.last_prewarm_checkout_reason = "stale_generation"
+            return False
+        if not getattr(session, "_prewarmed", False):
+            self.last_prewarm_checkout_reason = "not_prewarmed"
+            return False
+        if session.emotion != self._active_emotion:
+            self.last_prewarm_checkout_reason = "emotion_changed"
+            return False
+        if not session.reusable or session.closed or session._connection_dead:
+            self.last_prewarm_checkout_reason = "session_closed"
+            return False
+        if session.generation_active:
+            self.last_prewarm_checkout_reason = "session_busy"
+            return False
+        if session is self._bidi_session:
             session._prewarmed = False
+            self.last_prewarm_checkout_reason = "hit"
             return True
+        self.last_prewarm_checkout_reason = "unknown"
         return False
 
     async def close(self) -> None:

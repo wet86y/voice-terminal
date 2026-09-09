@@ -15,9 +15,25 @@ from ..tts.alignment import DeliveryResolver
 logger = logging.getLogger(__name__)
 
 
+def _identity_pair(identity):
+    """Return stable correlation fields without trusting diagnostic input.
+
+    Older live runtimes occasionally supplied ``(conversation_id,)`` while
+    winding down a request.  Correlation must be best-effort: a missing trace
+    ID may reduce diagnostics, but must never make barge-in fail inside the
+    audio-frame loop.
+    """
+    if isinstance(identity, (tuple, list)):
+        return (
+            identity[0] if len(identity) > 0 else None,
+            identity[1] if len(identity) > 1 else None,
+        )
+    return identity, None
+
+
 class SpeechHandle:
     def __init__(self, owner, identity, turn_id, _queue_order, emotion, *, kind="formal"):
-        self.owner, self.identity, self.turn_id = owner, identity, turn_id
+        self.owner, self.identity, self.turn_id = owner, _identity_pair(identity), turn_id
         self.speech_id = uuid4().hex
         self.emotion_requested = emotion
         self.emotion_applied = emotion
@@ -31,6 +47,11 @@ class SpeechHandle:
         self.text = ""
         self.task = None
         self.finished = False
+        # A replacement must never borrow the socket that is still flushing
+        # the superseded transaction.  The pipeline binds the concrete
+        # session to this handle, not to the output singleton.
+        self.tts_session = None
+        self.force_fresh_tts_session = False
         self.overlap_start_ms = None
         self.queued_at = time.monotonic()
         self.started = asyncio.Event()
@@ -71,11 +92,12 @@ class SpeechHandle:
 
 
 class EpisodeSpeechOutput(SpeechPipeline):
-    """A serial speech queue sharing the existing audio pipeline.
+    """Generation-owned output transactions sharing the audio pipeline.
 
-    A handle is created as soon as the Agent authorises speech, while a single
-    worker starts the actual TTS/player transaction in FIFO order.  A held
-    handle owns only text until endpointing grants playback permission.
+    A superseded transaction is locally stopped synchronously, while its
+    provider cancellation is allowed to finish in its own task.  This makes a
+    new LLM decision eligible for TTS immediately instead of serialising it
+    behind the previous MiniMax cancel/close barrier.
     """
     def __init__(self, controller):
         self.controller = controller
@@ -86,7 +108,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
         self._tts_session = None
         self.handle = None
         self._pending = deque()
-        self._worker = None
+        self._handles_by_token = {}
         self.generation = 0
         self.tasks = set()
         self.runtime = None
@@ -131,8 +153,52 @@ class EpisodeSpeechOutput(SpeechPipeline):
         return bool(h and h.workspace.token == token and not h.reason and r and not r.closed)
 
     async def _await_tts_cancel_barrier(self):
-        # begin() has already joined cleanup of the preceding transaction.
+        # Provider cancellation belongs to the old handle's background
+        # cleanup.  A new generation is deliberately never gated on it.
         return
+
+    def _handle_for_workspace(self, ws):
+        return self._handles_by_token.get(ws.token)
+
+    def _new_tts_session(self, ws, *, fresh=False):
+        """Create and bind a provider session to this output transaction."""
+        h = self._handle_for_workspace(ws)
+        fresh = bool(fresh or (h and h.force_fresh_tts_session))
+        try:
+            session = self.tts.session(fresh=fresh)
+        except TypeError:  # Non-MiniMax/test providers retain the old API.
+            session = self.tts.session()
+        if h is not None:
+            h.tts_session = session
+        if h is self.handle:
+            self._tts_session = session  # compatibility for controller prewarm state
+        return session
+
+    def _bind_tts_session(self, ws, session):
+        h = self._handle_for_workspace(ws)
+        if h is not None:
+            h.tts_session = session
+        if h is self.handle:
+            self._tts_session = session
+
+    def _release_tts_session(self, ws, session, *, retain):
+        # A stale generation must never clear or retain the new generation's
+        # session pointer after its reader finally exits.
+        h = self._handle_for_workspace(ws)
+        if h is self.handle and self._tts_session is session:
+            self._tts_session = session if retain else None
+
+    async def _emit_handle_progress(self, h, event, **payload):
+        if self.runtime is None:
+            return
+        await self.runtime.emit("speech.progress", {
+            "speech_id": h.speech_id,
+            "conversation_id": h.identity[0],
+            "turn_id": h.turn_id,
+            "output_generation": h.workspace.generation,
+            "event": event,
+            **payload,
+        })
 
     async def _detail(self, kind, **payload):
         h = self.handle
@@ -177,7 +243,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
                                                speech_id=h.speech_id)
                 self.loop.call_soon_threadsafe(lambda: self.controller._track(asyncio.create_task(publish())))
 
-    async def begin(self, identity, turn_id, *, emotion="calm", kind="formal"):
+    async def begin(self, identity, turn_id, *, emotion="calm", kind="formal",
+                    _generation_advanced=False, _fresh_session=False, _defer_activation=False):
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during cleanup")
         # Keep at most one latest text candidate behind the active playback.
@@ -186,10 +253,13 @@ class EpisodeSpeechOutput(SpeechPipeline):
             if pending is not self.handle and not pending.reason and not pending.task.done():
                 pending.reason = "superseded"
                 pending.task.cancel()
-        self.generation += 1
+        if not _generation_advanced:
+            self.generation += 1
         self.loop = asyncio.get_running_loop()
         h = SpeechHandle(self, identity, turn_id, self.generation, emotion, kind=kind)
-        if getattr(self.runtime, "user_speaking", False) is False:
+        h.force_fresh_tts_session = _fresh_session
+        self._handles_by_token[h.workspace.token] = h
+        if getattr(self.runtime, "user_speaking", False) is False and not _defer_activation:
             h.playback_ready.set()
             h.state = "READY"
         else:
@@ -201,15 +271,61 @@ class EpisodeSpeechOutput(SpeechPipeline):
             h.workspace.timings.update(source_timings)
         h.task = asyncio.create_task(self._wait_then_run(h), name=f"speech-{h.speech_id}")
         self.tasks.add(h.task)
-        h.task.add_done_callback(self.tasks.discard)
-        self._pending.append(h)
-        if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(self._drain(), name="speech-queue")
-        await self.runtime.emit("speech.queued", {"speech_id": h.speech_id, "conversation_id": identity[0],
+        def forget_finished(task, handle=h):
+            self.tasks.discard(task)
+            # A held/superseded task can be cancelled before it ever enters
+            # _run() (and therefore before _run's final cleanup executes).
+            if self.handle is not handle:
+                self._handles_by_token.pop(handle.workspace.token, None)
+        h.task.add_done_callback(forget_finished)
+        if h.playback_ready.is_set():
+            await self._activate(h)
+        else:
+            self._pending.append(h)
+        await self.runtime.emit("speech.queued", {"speech_id": h.speech_id, "conversation_id": h.identity[0],
                                  "turn_id": turn_id, "output_generation": h.workspace.generation,
                                  "kind": kind, "text": h.text, "status": h.state})
         await asyncio.sleep(0)
         return h
+
+    async def append_successor(self, identity, turn_id, *, baseline_speech_id, baseline_generation,
+                               suffix, emotion="calm"):
+        """Queue a verified suffix without withdrawing the audible speech.
+
+        A completed MiniMax Bidi generation cannot safely accept another
+        ``task_continue`` through the old worker.  Keep the public operation
+        at the output boundary so callers never need to know that detail: the
+        successor waits behind the active playback, synthesises only ``suffix``
+        and therefore never repeats the already accepted prefix.  A future
+        same-session continuation can replace this implementation without
+        changing the agent reconciliation contract.
+        """
+        if not suffix:
+            return None
+        active = self.handle
+        same_active = bool(
+            active and not active.reason and not active.task.done()
+            and active.speech_id == baseline_speech_id
+            and active.workspace.generation == baseline_generation
+        )
+        handle = await self.begin(
+            identity, turn_id, emotion=(active.emotion_requested if same_active else emotion),
+            kind="append", _defer_activation=same_active,
+        )
+        await handle.feed(suffix)
+        event = "speech.appended" if same_active else "speech.append_successor"
+        await self.runtime.emit(event, {
+            "speech_id": active.speech_id if same_active else handle.speech_id,
+            "successor_speech_id": handle.speech_id,
+            "conversation_id": handle.identity[0], "turn_id": turn_id,
+            "output_generation": handle.workspace.generation,
+            "baseline_speech_id": baseline_speech_id,
+            "baseline_generation": baseline_generation,
+            "baseline_chars": len(active.text) if same_active else 0, "appended_chars": len(suffix),
+            "cumulative_chars": (len(active.text) + len(suffix)) if same_active else len(suffix),
+            "provider_generation": handle.workspace.generation,
+        })
+        return handle
 
     async def replace_current(self, identity, turn_id, *, emotion="calm"):
         """Replace all output based on the current decision in one tool call.
@@ -221,6 +337,10 @@ class EpisodeSpeechOutput(SpeechPipeline):
 
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during replacement")
+        # Advance the transaction generation before closing the old PCM gate.
+        # Late audio/progress from the old token will fail ``_valid`` even if
+        # its socket has not finished its provider-side cancellation.
+        self.generation += 1
         old = self.handle
         old_candidate = (
             old if old and not old.task.done() and not old.reason else
@@ -230,39 +350,69 @@ class EpisodeSpeechOutput(SpeechPipeline):
         self.last_replacement = {
             "old_speech_id": old_speech_id,
             "new_speech_id": None,
+            "old_generation": old_candidate.workspace.generation if old_candidate else None,
+            "new_generation": self.generation,
+            "reason": "replaced",
         }
         source_timings = getattr(self.controller, "_turn_timings", {}).get(turn_id)
         if old_candidate is not None and isinstance(source_timings, dict):
             source_timings["replacement_count"] = int(source_timings.get("replacement_count", 0) or 0) + 1
+        if old_candidate is not None:
+            old_candidate.workspace.timings["replacement_detected"] = time.monotonic()
+            await self._emit_handle_progress(old_candidate, "replacement_detected",
+                                             reason="replaced", new_generation=self.generation)
         self.cancel_all("replaced")
-        if old_speech_id:
+        handle = await self.begin(identity, turn_id, emotion=emotion, kind="formal",
+                                  _generation_advanced=True, _fresh_session=True)
+        self.last_replacement["new_speech_id"] = handle.speech_id
+        handle.workspace.timings["replacement_detected"] = time.monotonic()
+        if old_candidate is not None:
             await self.runtime.emit("speech.replaced", {
+                # Keep the old ``speech_id`` correlation field compatible;
+                # consumers that understand replacement can use both IDs.
                 "speech_id": old_speech_id,
-                "conversation_id": identity[0],
+                "old_speech_id": old_speech_id,
+                "new_speech_id": handle.speech_id,
+                "conversation_id": handle.identity[0],
                 "turn_id": turn_id,
-                "output_generation": old_candidate.workspace.generation if old_candidate else self.generation,
+                "old_generation": old_candidate.workspace.generation,
+                "new_generation": handle.workspace.generation,
+                "output_generation": handle.workspace.generation,
+                "reason": "replaced",
                 "event": "speech.replaced",
                 "status": "replaced",
             })
-        handle = await self.begin(identity, turn_id, emotion=emotion, kind="formal")
-        self.last_replacement["new_speech_id"] = handle.speech_id
         return handle
 
-    async def _drain(self):
-        while self._pending:
-            h = self._pending.popleft()
-            if h.reason or h.task.done():
-                continue
-            self.handle = h
-            self.state.clear_current()
-            prepare = getattr(self.tts, "prepare_emotion", None)
-            if prepare is not None:
+    async def _activate(self, h):
+        """Give one generation immediate ownership of TTS/player state."""
+        if h.reason or h.task.done():
+            return
+        try:
+            self._pending.remove(h)
+        except ValueError:
+            pass
+        self.handle = h
+        self.state.clear_current()
+        prepare = getattr(self.tts, "prepare_emotion", None)
+        if prepare is not None:
+            try:
+                h.emotion_applied = await prepare(
+                    h.emotion_requested,
+                    detach_active=h.force_fresh_tts_session,
+                )
+            except TypeError:  # third-party/test providers use the old hook
                 h.emotion_applied = await prepare(h.emotion_requested)
-            self._delivery_resolvers[h.speech_id] = DeliveryResolver()
-            h.started.set()
-            await asyncio.gather(h.task, return_exceptions=True)
-            if self.handle is h:
+        # A barge-in/reset may have cancelled this handle while an emotion
+        # provider yielded.  Do not revive its TTS permission afterwards.
+        if h.reason or h.task.done():
+            was_active = self.handle is h
+            if was_active:
                 self.handle = None
+            self._handles_by_token.pop(h.workspace.token, None)
+            return
+        self._delivery_resolvers[h.speech_id] = DeliveryResolver()
+        h.started.set()
 
     async def _wait_then_run(self, h):
         await h.started.wait()
@@ -281,6 +431,10 @@ class EpisodeSpeechOutput(SpeechPipeline):
             if h and not h.reason and not h.task.done():
                 h.state = "READY"
                 h.playback_ready.set()
+                if h is not self.handle:
+                    # Held candidates have no provider state yet; activation
+                    # is immediate and does not wait for a retired task.
+                    self.loop.create_task(self._activate(h), name=f"speech-activate-{h.speech_id}")
                 return h.speech_id
         return None
 
@@ -296,7 +450,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
 
     @property
     def speak_snapshot(self):
-        h = self.handle or next((item for item in self._pending if not item.reason and not item.task.done()), None)
+        h = (self.handle if self.handle and not self.handle.reason and not self.handle.task.done() else None)
+        h = h or next((item for item in self._pending if not item.reason and not item.task.done()), None)
         if h is None:
             return {"queue_status": "empty", "text_only_queue": True}
         if h.workspace.playback_started:
@@ -306,7 +461,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
         else:
             status = "queued"
         value = {"queue_status": status, "text_only_queue": True, "text": h.text,
-                 "speech_id": h.speech_id, "emotion": h.emotion_requested}
+                 "speech_id": h.speech_id, "output_generation": h.workspace.generation,
+                 "emotion": h.emotion_requested}
         if status == "speaking" and self.last_delivery:
             value["delivery"] = dict(self.last_delivery)
         return value
@@ -329,6 +485,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
             if not h or h.task.done() or h.reason:
                 continue
             h.reason = reason
+            h.workspace.timings.setdefault("preemption_requested", time.monotonic())
             if h is not self.handle:
                 h.task.cancel()
                 continue
@@ -339,6 +496,13 @@ class EpisodeSpeechOutput(SpeechPipeline):
             )
             if self.player:
                 h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
+            h.workspace.timings["local_playback_stopped"] = time.monotonic()
+            if self.loop and not self.loop.is_closed():
+                self.loop.call_soon_threadsafe(
+                    lambda h=h, reason=reason: self.controller._track(asyncio.create_task(
+                        self._emit_handle_progress(h, "local_playback_stopped", reason=reason)
+                    ))
+                )
             h.task.cancel()
 
     def cancel(self, speech_id, reason="cancelled"):
@@ -354,8 +518,16 @@ class EpisodeSpeechOutput(SpeechPipeline):
             if h is None or h.speech_id != speech_id or h.task.done() or h.reason:
                 continue
             h.reason = reason
-            if h is self.handle and self.player:
-                h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
+            if h is self.handle:
+                if self.player:
+                    h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
+                h.workspace.timings["local_playback_stopped"] = time.monotonic()
+                if self.loop and not self.loop.is_closed():
+                    self.loop.call_soon_threadsafe(
+                        lambda h=h, reason=reason: self.controller._track(asyncio.create_task(
+                            self._emit_handle_progress(h, "local_playback_stopped", reason=reason)
+                        ))
+                    )
             h.task.cancel()
             return True
         return False
@@ -370,7 +542,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
             if isinstance(source_timings, dict):
                 h.workspace.timings.update(source_timings)
             h.workspace.timings["llm_request"] = self.runtime.request_started_at or time.monotonic()
-            await self._play_stream(h.workspace, h.workspace.token, h.stream())
+            await self._play_stream(h.workspace, h.workspace.token, h.stream(), speech_id=h.speech_id)
             # A zero-PCM Bidi transaction cannot have delivered any text, so
             # one replay is safe and avoids making the user repeat a request
             # after a cancelled/non-reusable MiniMax session.  Never retry
@@ -399,7 +571,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 async def replay():
                     yield h.text
 
-                await self._play_stream(h.workspace, h.workspace.token, replay())
+                await self._play_stream(h.workspace, h.workspace.token, replay(), speech_id=h.speech_id)
                 if h.workspace.timings.get("tts_text_sent") and h.workspace.timings.get("tts_audio_bytes", 0) == 0:
                     await self.runtime.log(
                         "TTS_EMPTY_AUDIO_RETRY_FAILED",
@@ -422,7 +594,29 @@ class EpisodeSpeechOutput(SpeechPipeline):
             await self.runtime.log("SPEECH_ERROR", identity=h.identity, turn_id=h.turn_id,
                                    speech_id=h.speech_id, error=str(exc)[:300])
         finally:
-            session = self._tts_session
+            # The provider generation and local PCM are now drained, but a
+            # refined ASR decision often arrives immediately afterwards.
+            # Retain the logical speech briefly so a verified suffix can wait
+            # behind this handle instead of becoming a replacement.  This is
+            # internal bookkeeping only: the listener never waits for silence
+            # before hearing already available audio.
+            if not h.reason and self.handle is h:
+                opened_at = time.monotonic()
+                h.workspace.timings["append_window_opened"] = opened_at
+                await self._emit_handle_progress(h, "append_window_opened", wait_ms=1000)
+                try:
+                    await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    h.reason = h.reason or "stopped"
+                finally:
+                    h.workspace.timings["append_window_wait_ms"] = round(
+                        (time.monotonic() - opened_at) * 1000
+                    )
+                    await self._emit_handle_progress(h, "append_window_expired",
+                                                     wait_ms=h.workspace.timings["append_window_wait_ms"])
+            # Session ownership is transaction-scoped.  At this point
+            # ``self._tts_session`` may already belong to a replacement.
+            session = h.tts_session
             if session is not None and h.reason:
                 try:
                     cancel = getattr(session, "cancel", None)
@@ -436,7 +630,10 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 except Exception:
                     await session.close()
                 finally:
-                    self._tts_session = None
+                    h.workspace.timings["old_provider_cancelled"] = time.monotonic()
+                    await self._emit_handle_progress(h, "old_provider_cancelled", reason=h.reason)
+                    if self.handle is h and self._tts_session is session:
+                        self._tts_session = None
             if h.snapshot is None and self.player:
                 h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
             delivery = self._delivery_resolvers[h.speech_id].resolve(
@@ -548,10 +745,17 @@ class EpisodeSpeechOutput(SpeechPipeline):
             )
             if self.handle is h:
                 self.handle = None
+            self._handles_by_token.pop(h.workspace.token, None)
             source_timings = getattr(self.controller, "_turn_timings", {}).get(h.turn_id)
             if isinstance(source_timings, dict):
                 source_timings.update(h.workspace.timings)
             await self.runtime.output_completed(record)
+            # A verified same-prefix extension is intentionally held while
+            # this generation drains.  Activate it only after the old player
+            # key has been settled, so its normal ``allow`` call cannot clear
+            # audible PCM from the preceding response.
+            if was_active and not h.reason:
+                self.release_held()
 
     async def close(self):
         self.cancel_all("stopped")
