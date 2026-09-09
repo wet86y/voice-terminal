@@ -1,21 +1,20 @@
 from voice_terminal.session.context import CurrentInput, LLMContextProjector
 from voice_terminal.session.contracts import ToolExchange
 from voice_terminal.session.ledger import SessionLedger
-from voice_terminal.session.runtime import ConversationRuntime, EpochReason
-from voice_terminal.agent.episode import AgentEpisodeRuntime
+from voice_terminal.session.runtime import ConversationRuntime
 
 
-def test_epoch_invalidates_old_turn_and_reset_changes_conversation() -> None:
+def test_explicit_scope_changes_only_on_turn_or_cancel_and_reset_changes_conversation() -> None:
     runtime = ConversationRuntime()
     original = runtime.conversation_id
-    runtime.begin_turn("turn_a")
-    assert runtime.is_current("turn_a", 0)
-    runtime.advance_epoch(EpochReason.USER_RESUMED)
-    assert not runtime.is_current("turn_a", 0)
-    assert runtime.is_current("turn_a", 1)
+    first = runtime.begin_turn("turn_a")
+    assert runtime.is_scope_current(first.scope_id, "turn_a")
+    cancelled = runtime.cancel(turn_id="turn_a", reason="barge_in")
+    assert cancelled.scope_id != first.scope_id
+    assert runtime.is_scope_current(cancelled.scope_id, "turn_a")
     runtime.reset()
     assert runtime.conversation_id != original
-    assert not runtime.is_current("turn_a", 1)
+    assert not runtime.is_scope_current(cancelled.scope_id, "turn_a")
 
 
 def test_context_projection_excludes_runtime_identity_and_keeps_semantics() -> None:
@@ -57,13 +56,3 @@ def test_context_projection_keeps_identical_text_for_a_new_turn() -> None:
         {"role": "user", "content": "重复文本"},
         {"role": "user", "content": "重复文本"},
     ]
-
-
-def test_request_local_tool_projection_strips_runtime_ids() -> None:
-    message = AgentEpisodeRuntime._project_protocol_message({
-        "role": "tool", "tool_call_id": "call_1",
-        "content": '{"status":"accepted","speech_id":"speech_secret","epoch":9,"turn_id":"turn_secret"}',
-    })
-    assert "speech_secret" not in message["content"]
-    assert "turn_secret" not in message["content"]
-    assert '"accepted"' in message["content"]

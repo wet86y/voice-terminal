@@ -31,13 +31,36 @@ class DeepSeekClient:
         if reasoning_effort not in {"low", "high", "max"}:
             raise ValueError("reasoning_effort must be low, high, or max")
         self.reasoning_effort = reasoning_effort
+        self._client = None
+
+    async def _http_client(self):
+        if self._client is None:
+            try:
+                import httpx  # type: ignore
+            except ImportError as exc:
+                raise DeepSeekError("缺少 httpx，请先运行 scripts\\setup.ps1。") from exc
+            timeout = httpx.Timeout(self.timeout_ms / 1000, connect=min(5, self.timeout_ms / 1000))
+            self._client = httpx.AsyncClient(timeout=timeout)
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def prewarm(self) -> None:
+        """Warm DNS/TCP/TLS/auth transport only; never starts inference."""
+        if not self.api_key:
+            return
+        client = await self._http_client()
+        response = await client.get(f"{self.base_url}/models", headers={"Authorization": f"Bearer {self.api_key}"})
+        if response.status_code >= 400:
+            raise DeepSeekError(f"DeepSeek 预热失败：HTTP {response.status_code}")
+        logger.info("deepseek.prewarm_ok status=%d", response.status_code)
 
     def _request_payload(
         self,
         messages: Sequence[Mapping[str, str]],
-        *,
-        tools: list[dict] | None = None,
-        tool_choice: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -48,22 +71,6 @@ class DeepSeekClient:
         payload["thinking"] = {"type": "enabled" if self.thinking != "disabled" else "disabled"}
         if self.thinking != "disabled":
             payload["reasoning_effort"] = self.reasoning_effort
-        if tools:
-            payload["tools"] = tools
-            # DeepSeek accepts native tool declarations together with thinking,
-            # but the currently deployed thinking endpoint rejects an explicit
-            # tool_choice (including "required").  Tool priority is enforced
-            # by the Agent prompt and local tool gate, not by an incompatible
-            # transport parameter.  Keep the optional argument for non-thinking
-            # callers that use this client directly.
-            if tool_choice is not None and self.thinking == "disabled":
-                payload["tool_choice"] = tool_choice
-            elif tool_choice is not None:
-                logger.warning(
-                    "deepseek.tool_choice_omitted_for_thinking requested=%s model=%s",
-                    tool_choice,
-                    self.model,
-                )
         return payload
 
     async def stream_chat(self, messages, *, cancel_event=None) -> AsyncIterator[str]:
@@ -76,9 +83,7 @@ class DeepSeekClient:
         messages: Sequence[Mapping[str, str]],
         *,
         cancel_event: Any = None,
-        tools: list[dict] | None = None,
         json_mode: bool = False,
-        tool_choice: str | None = None,
     ) -> AsyncIterator[dict]:
         if not self.api_key:
             raise DeepSeekError("未配置 DEEPSEEK_API_KEY")
@@ -101,24 +106,24 @@ class DeepSeekClient:
         )
         delta_count = 0
         response_chars = 0
-        payload = self._request_payload(messages, tools=tools, tool_choice=tool_choice)
+        payload = self._request_payload(messages)
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         finished = False
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream(
+            client = await self._http_client()
+            async with client.stream(
                     "POST",
                     f"{self.base_url}/chat/completions",
                     headers=headers,
                     json=payload,
-                ) as response:
-                    logger.info("deepseek.response_status status=%d", response.status_code)
-                    if response.status_code >= 400:
-                        body = (await response.aread()).decode("utf-8", errors="replace")
-                        logger.error("deepseek.http_error status=%d body=%r", response.status_code, body[:500])
-                        raise DeepSeekError(f"DeepSeek HTTP {response.status_code}: {body[:500]}")
-                    async for line in response.aiter_lines():
+            ) as response:
+                logger.info("deepseek.response_status status=%d", response.status_code)
+                if response.status_code >= 400:
+                    body = (await response.aread()).decode("utf-8", errors="replace")
+                    logger.error("deepseek.http_error status=%d body=%r", response.status_code, body[:500])
+                    raise DeepSeekError(f"DeepSeek HTTP {response.status_code}: {body[:500]}")
+                async for line in response.aiter_lines():
                         if cancel_event is not None and cancel_event.is_set():
                             return
                         if not line.startswith("data:"):
@@ -139,9 +144,6 @@ class DeepSeekClient:
                         if not isinstance(choices, list) or not choices:
                             continue
                         delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
-                        if isinstance(delta, dict):
-                            for call in delta.get("tool_calls") or []:
-                                yield {"type": "tool_delta", "call": call}
                         reasoning = delta.get("reasoning_content") if isinstance(delta, dict) else None
                         if isinstance(reasoning, str) and reasoning:
                             yield {"type": "reasoning", "text": reasoning}
@@ -158,12 +160,12 @@ class DeepSeekClient:
                             yield {"type": "content", "text": text}
                         reason = choices[0].get("finish_reason")
                         if reason is not None:
-                            if reason not in {"stop", "tool_calls"}:
+                            if reason != "stop":
                                 raise DeepSeekError(f"LLM incomplete response: {reason}")
                             finished = True
                             yield {"type": "finish", "reason": reason}
-                    if not finished:
-                        raise DeepSeekError("LLM stream disconnected before completion")
+                if not finished:
+                    raise DeepSeekError("LLM stream disconnected before completion")
             logger.info("deepseek.request_done deltas=%d response_chars=%d", delta_count, response_chars)
         except DeepSeekError:
             raise
@@ -176,15 +178,11 @@ class DeepSeekClient:
             raise DeepSeekError("未配置 DEEPSEEK_API_KEY")
         try:
             import httpx  # type: ignore
-            timeout = httpx.Timeout(self.timeout_ms / 1000, connect=min(5, self.timeout_ms / 1000))
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.get(
-                    f"{self.base_url}/models",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                )
-                if response.status_code >= 400:
-                    raise DeepSeekError(f"DeepSeek 鉴权检查失败：HTTP {response.status_code}")
-                logger.info("deepseek.check_ok status=%d", response.status_code)
+            response = await (await self._http_client()).get(
+                f"{self.base_url}/models", headers={"Authorization": f"Bearer {self.api_key}"})
+            if response.status_code >= 400:
+                raise DeepSeekError(f"DeepSeek 鉴权检查失败：HTTP {response.status_code}")
+            logger.info("deepseek.check_ok status=%d", response.status_code)
         except DeepSeekError:
             raise
         except Exception as exc:

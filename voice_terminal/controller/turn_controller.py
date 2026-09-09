@@ -19,7 +19,7 @@ from ..vad.detector import FsmnVadDetector
 
 
 class InputController:
-    """V0.5 shared device/input lifecycle, without an answer pipeline."""
+    """V0.6 shared device/input lifecycle, without an answer pipeline."""
 
     def __init__(self, *, state: RuntimeState, bus: EventBus, history: Any,
                  capture: AudioCapture | None, kws: KwsDetector | None,
@@ -185,7 +185,7 @@ class InputController:
         return self.audio_processor.last_voice_activity if self.audio_processor.last_voice_activity is not None else False
 
     async def _record_interruption(self, *args: Any, **kwargs: Any) -> None:
-        # EpisodeSpeechOutput is the only V0.5 delivery settlement owner.
+        # EpisodeSpeechOutput is the only V0.6 delivery settlement owner.
         return
 
     async def _error(self, code: str, message: str, *, recoverable: bool,

@@ -237,7 +237,7 @@ class DeliveryResolver:
         # backwards jump is observed, retaining the raw values as if they
         # shared one clock would falsely classify a later sentence as already
         # heard.  Keep those spans in arrival order and mark the affected
-        # epoch untrusted; the resolver can still expose the text as
+        # timestamp segment untrusted; the resolver can still expose the text as
         # uncertain without inventing an offset.
         self._provider_last_raw_start_ms: int | None = None
         self._provider_timebase_reset = False
@@ -287,7 +287,7 @@ class DeliveryResolver:
         spans = parse_alignment(raw_value, sentence_index=sentence_index)
         # A sentence index without its PCM origin can identify duplicate
         # snapshots but cannot place them on the task clock.  The first
-        # sentence is safe at origin zero; later unanchored epochs remain
+        # sentence is safe at origin zero; later unanchored segments remain
         # explicitly uncertain.
         anchored = base_value is not None or sentence_index in (None, 0)
         for span in spans:
@@ -332,7 +332,7 @@ class DeliveryResolver:
             )
             if anchored and sentence_index is None and existing_index is None:
                 # Preserve the conservative behavior for legacy providers
-                # whose raw timestamp clock may reset without an epoch marker.
+                # whose raw timestamp clock may reset without a segment marker.
                 if (
                     self._provider_last_raw_start_ms is not None
                     and span.start_ms < self._provider_last_raw_start_ms

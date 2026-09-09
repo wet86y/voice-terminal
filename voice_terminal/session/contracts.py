@@ -86,9 +86,11 @@ class ToolExchange:
     arguments: dict[str, Any]
     result: Any
     executed_at: str
-    episode_id: str
-    decision_id: str
-    context_version: int
+    conversation_id: str
+    request_id: str = ""
+    # Kept only for deserializing older ledger entries.  It is not injected
+    # into model context and never participates in semantic validity.
+    legacy_generation: int | None = None
     source: str = "external_untrusted"
 
     def context_payload(self) -> dict[str, Any]:

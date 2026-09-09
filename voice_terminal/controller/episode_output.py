@@ -23,7 +23,9 @@ class SpeechHandle:
         self.emotion_applied = emotion
         self.kind = kind
         self.queue = asyncio.Queue(maxsize=32)
-        self.workspace = TurnWorkspace(turn_id, epoch=identity[2], phase="FINALIZING", committed=True)
+        self.output_generation = owner.generation
+        self.workspace = TurnWorkspace(turn_id, generation=self.output_generation,
+                                       phase="FINALIZING", committed=True)
         self.reason = None
         self.snapshot = None
         self.text = ""
@@ -32,6 +34,8 @@ class SpeechHandle:
         self.overlap_start_ms = None
         self.queued_at = time.monotonic()
         self.started = asyncio.Event()
+        self.playback_ready = asyncio.Event()
+        self.state = "CREATING"
 
     async def _put(self, value):
         if self.reason or self.task.done():
@@ -70,9 +74,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
     """A serial speech queue sharing the existing audio pipeline.
 
     A handle is created as soon as the Agent authorises speech, while a single
-    worker starts the actual TTS/player transaction in FIFO order.  This keeps
-    Agent intent durable during a prefill without allowing concurrent player
-    access.
+    worker starts the actual TTS/player transaction in FIFO order.  A held
+    handle owns only text until endpointing grants playback permission.
     """
     def __init__(self, controller):
         self.controller = controller
@@ -89,6 +92,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
         self.runtime = None
         self.loop = None
         self.last_replacement = {}
+        self.last_delivery = None
 
     @property
     def active(self):
@@ -98,6 +102,10 @@ class EpisodeSpeechOutput(SpeechPipeline):
     def status(self):
         if not self.active:
             return "IDLE"
+        if self.handle and self.handle.state == "SUSPENDED":
+            return "SUSPENDED"
+        if self.handle and self.handle.state == "HELD":
+            return "HELD"
         return "SPEAKING" if self.handle.workspace.playback_started else "SPEAK_REQUESTED"
 
     @property
@@ -106,22 +114,21 @@ class EpisodeSpeechOutput(SpeechPipeline):
         if not h or h.task.done():
             return None
         return {"speech_id": h.speech_id, "conversation_id": h.identity[0], "trace_id": h.identity[1],
-                "turn_id": h.turn_id, "epoch": h.workspace.epoch, "text": h.text,
-                "status": self.status, "kind": h.kind, "emotion_requested": h.emotion_requested,
+                "turn_id": h.turn_id, "output_generation": h.workspace.generation, "text": h.text,
+                "status": self.status, "kind": h.kind, "speech_state": h.state, "emotion_requested": h.emotion_requested,
                 "emotion_applied": h.emotion_applied}
 
     @property
     def queue_snapshot(self):
         return [{"speech_id": item.speech_id, "kind": item.kind, "text": item.text,
                  "conversation_id": item.identity[0], "trace_id": item.identity[1],
-                 "turn_id": item.turn_id, "epoch": item.workspace.epoch,
+                 "turn_id": item.turn_id, "output_generation": item.workspace.generation,
                  "status": "QUEUED"}
                 for item in self._pending if not item.reason and not item.task.done()]
 
     def _valid(self, token):
         h, r = self.handle, self.runtime
-        return bool(h and h.workspace.token == token and not h.reason and r and not r.closed
-                    and r.valid(h.identity) and r.user_speaking is False)
+        return bool(h and h.workspace.token == token and not h.reason and r and not r.closed)
 
     async def _await_tts_cancel_barrier(self):
         # begin() has already joined cleanup of the preceding transaction.
@@ -132,14 +139,14 @@ class EpisodeSpeechOutput(SpeechPipeline):
         if h:
             await self.runtime.emit("speech.progress", {
                 "speech_id": h.speech_id, "conversation_id": h.identity[0], "turn_id": h.turn_id,
-                "epoch": h.workspace.epoch, "event": kind, **payload})
+                "output_generation": h.workspace.generation, "event": kind, **payload})
 
     async def _text_delta(self, h, text):
         if not text:
             return
         await self.runtime.emit("speech.text_delta", {
             "speech_id": h.speech_id, "conversation_id": h.identity[0], "turn_id": h.turn_id,
-            "epoch": h.workspace.epoch, "text_delta": text,
+            "output_generation": h.workspace.generation, "text_delta": text,
             "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
         })
 
@@ -168,18 +175,25 @@ class EpisodeSpeechOutput(SpeechPipeline):
                     if self.handle is h and not h.reason:
                         await self.runtime.log("TTS_STARTED", identity=h.identity, turn_id=h.turn_id,
                                                speech_id=h.speech_id)
-                        started = getattr(self.runtime, "output_started", None)
-                        if h.kind == "prefill" and callable(started):
-                            await started({"speech_id": h.speech_id, "turn_id": h.turn_id,
-                                           "kind": h.kind, "status": "playing"})
                 self.loop.call_soon_threadsafe(lambda: self.controller._track(asyncio.create_task(publish())))
 
     async def begin(self, identity, turn_id, *, emotion="calm", kind="formal"):
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during cleanup")
+        # Keep at most one latest text candidate behind the active playback.
+        # The queue stores text handles only; it never owns provider PCM.
+        for pending in list(self._pending):
+            if pending is not self.handle and not pending.reason and not pending.task.done():
+                pending.reason = "superseded"
+                pending.task.cancel()
         self.generation += 1
         self.loop = asyncio.get_running_loop()
         h = SpeechHandle(self, identity, turn_id, self.generation, emotion, kind=kind)
+        if getattr(self.runtime, "user_speaking", False) is False:
+            h.playback_ready.set()
+            h.state = "READY"
+        else:
+            h.state = "HELD"
         source_timings = getattr(self.controller, "_turn_timings", {}).get(turn_id)
         if isinstance(source_timings, dict):
             source_timings.setdefault("llm_request", getattr(self.runtime, "request_started_at", None) or time.monotonic())
@@ -192,7 +206,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain(), name="speech-queue")
         await self.runtime.emit("speech.queued", {"speech_id": h.speech_id, "conversation_id": identity[0],
-                                 "turn_id": turn_id, "epoch": identity[2], "kind": kind, "text": h.text, "status": "QUEUED"})
+                                 "turn_id": turn_id, "output_generation": h.workspace.generation,
+                                 "kind": kind, "text": h.text, "status": h.state})
         await asyncio.sleep(0)
         return h
 
@@ -219,13 +234,13 @@ class EpisodeSpeechOutput(SpeechPipeline):
         source_timings = getattr(self.controller, "_turn_timings", {}).get(turn_id)
         if old_candidate is not None and isinstance(source_timings, dict):
             source_timings["replacement_count"] = int(source_timings.get("replacement_count", 0) or 0) + 1
-        self.invalidate("replaced")
+        self.cancel_all("replaced")
         if old_speech_id:
             await self.runtime.emit("speech.replaced", {
                 "speech_id": old_speech_id,
                 "conversation_id": identity[0],
                 "turn_id": turn_id,
-                "epoch": identity[2],
+                "output_generation": old_candidate.workspace.generation if old_candidate else self.generation,
                 "event": "speech.replaced",
                 "status": "replaced",
             })
@@ -251,15 +266,64 @@ class EpisodeSpeechOutput(SpeechPipeline):
 
     async def _wait_then_run(self, h):
         await h.started.wait()
+        # The pending speak queue owns text only.  Do not start TTS or retain
+        # PCM while the user is still speaking; endpointing grants permission
+        # to start the normal streaming TTS transaction.
+        await h.playback_ready.wait()
         await self._run(h)
 
-    async def enqueue_text(self, identity, turn_id, text, *, emotion="calm", kind="prefill"):
+    def release_held(self):
+        """Grant playback to the latest candidate after local endpointing."""
+        candidates = ([self.handle] if self.handle else []) + list(self._pending)
+        for h in candidates:
+            if h and h.state == "SUSPENDED":
+                continue
+            if h and not h.reason and not h.task.done():
+                h.state = "READY"
+                h.playback_ready.set()
+                return h.speech_id
+        return None
+
+    def suspend_pending(self):
+        """Keep the latest unplayed text but remove its TTS permission."""
+        candidates = ([self.handle] if self.handle else []) + list(self._pending)
+        for h in candidates:
+            if h and not h.reason and not h.task.done() and not h.workspace.playback_started:
+                h.state = "SUSPENDED"
+                h.playback_ready.clear()
+                return h.speech_id
+        return None
+
+    @property
+    def speak_snapshot(self):
+        h = self.handle or next((item for item in self._pending if not item.reason and not item.task.done()), None)
+        if h is None:
+            return {"queue_status": "empty", "text_only_queue": True}
+        if h.workspace.playback_started:
+            status = "speaking"
+        elif h.state == "SUSPENDED":
+            status = "suspended"
+        else:
+            status = "queued"
+        value = {"queue_status": status, "text_only_queue": True, "text": h.text,
+                 "speech_id": h.speech_id, "emotion": h.emotion_requested}
+        if status == "speaking" and self.last_delivery:
+            value["delivery"] = dict(self.last_delivery)
+        return value
+
+    async def enqueue_text(self, identity, turn_id, text, *, emotion="calm", kind="formal"):
         h = await self.begin(identity, turn_id, emotion=emotion, kind=kind)
         await h.feed(text)
         await h.finish()
         return h
 
-    def invalidate(self, reason):
+    def cancel_all(self, reason):
+        """Explicitly cancel the current output scope.
+
+        This is deliberately not a semantic invalidation hook: transcript
+        revisions and tool results never call it.  Only stop/barged-in/
+        replacement/transport cleanup paths may cancel output.
+        """
         items = ([self.handle] if self.handle else []) + list(self._pending)
         for h in items:
             if not h or h.task.done() or h.reason:
@@ -269,8 +333,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 h.task.cancel()
                 continue
             logger.info(
-            "episode.speech_invalidated speech_id=%s episode_id=%s step=%s context_version=%s reason=%s playback_started=%s",
-            h.speech_id, h.identity[0], h.identity[1], h.identity[2], reason,
+                "episode.speech_cancelled speech_id=%s episode_id=%s step=%s request_seq=%s reason=%s playback_started=%s",
+                h.speech_id, h.identity[0], h.identity[1], h.workspace.generation, reason,
             h.workspace.playback_started,
             )
             if self.player:
@@ -280,9 +344,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
     def cancel(self, speech_id, reason="cancelled"):
         """Cancel exactly one queued or active speech item.
 
-        ``clear_prefill`` uses this after a candidate has already become a
-        SpeechItem.  Cancelling by ID prevents an explicit prefill withdrawal
-        from invalidating a later formal response in the same FIFO queue.
+        Cancelling by ID prevents withdrawal of an old queued candidate from
+        invalidating a later response in the same FIFO queue.
         """
         if not isinstance(speech_id, str) or not speech_id:
             return False
@@ -301,7 +364,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
         # Record completion even if cancellation occurs before the first delta.
         try:
             if not self._valid(h.workspace.token):
-                h.reason = h.reason or "stale"
+                h.reason = h.reason or "scope_closed"
                 return
             source_timings = getattr(self.controller, "_turn_timings", {}).get(h.turn_id)
             if isinstance(source_timings, dict):
@@ -379,6 +442,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
             delivery = self._delivery_resolvers[h.speech_id].resolve(
                 h.snapshot or {"started": False}, h.text, overlap_start_ms=h.overlap_start_ms)
             delivery["termination"] = h.reason or "completed"
+            self.last_delivery = dict(delivery)
             if h.snapshot:
                 self.controller._add_playback_delivery_fields(delivery, h.snapshot)
             source_timings = getattr(self.controller, "_turn_timings", {}).get(h.turn_id)
@@ -447,12 +511,13 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 "replacement_count": int(timings.get("replacement_count", 0) or 0),
                 "turn_total_ms": since_turn("completed"),
             })
-            record = {"speech_id": h.speech_id, "conversation_id": h.identity[0], "trace_id": h.identity[1],
-                       # Keep the semantic names used by AgentEpisodeRuntime
-                       # alongside the public compatibility aliases above.
+            record = {"speech_id": h.speech_id, "conversation_id": h.identity[0],
+                       "request_id": h.identity[1], "trace_id": h.identity[1],
+                       # Compatibility aliases are correlation-only; no
+                       # semantic version participates in delivery.
                        "episode_id": h.identity[0], "agent_step_id": h.identity[1],
-                       "context_version": h.identity[2], "input_id": h.turn_id,
-                       "turn_id": h.turn_id, "epoch": h.workspace.epoch, "text": h.text,
+                       "input_id": h.turn_id,
+                       "turn_id": h.turn_id, "output_generation": h.workspace.generation, "text": h.text,
                        "kind": h.kind, "queued_at": h.queued_at,
                       "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
                       "emotion_transport": getattr(self.tts, "emotion_transport", "voice_setting"),
@@ -463,8 +528,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
                                      "queue_to_playback_ms": round((timings["playback"] - h.queued_at) * 1000)
                                      if "playback" in timings else None}}
             logger.info(
-                "episode.speech_final speech_id=%s episode_id=%s step=%s context_version=%s turn_id=%s status=%s delivery=%s tts_text_sent=%s tts_audio_bytes=%s playback_started=%s",
-                h.speech_id, h.identity[0], h.identity[1], h.identity[2], h.turn_id,
+                "episode.speech_final speech_id=%s conversation_id=%s request_id=%s turn_id=%s status=%s delivery=%s tts_text_sent=%s tts_audio_bytes=%s playback_started=%s",
+                h.speech_id, h.identity[0], h.identity[1], h.turn_id,
                 record["status"], delivery.get("status"), timings.get("tts_text_sent"),
                 timings.get("tts_audio_bytes"), h.workspace.playback_started,
             )
@@ -476,7 +541,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
             await self.runtime.output_completed(record)
 
     async def close(self):
-        self.invalidate("stopped")
+        self.cancel_all("stopped")
         if self.tasks:
             await asyncio.gather(*list(self.tasks), return_exceptions=True)
         if self._tts_session:

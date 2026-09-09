@@ -112,15 +112,6 @@ asr_worker:
 
 agent:
   enabled: true
-  decision_mode: balanced
-  balanced_interval_ms: 800
-  aggressive_interval_ms: 400
-  silence_ms: 5500
-  response_check_ms: 1500
-  max_requests_per_step: 5
   max_context_tokens: 524288
   trace_limit: 200
   output_limit: 32
-
-speech:
-  prefill_enabled: true

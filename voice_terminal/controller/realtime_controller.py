@@ -11,14 +11,13 @@ from .turn_workspace import AudioFrame, CurrentTurnAudioBuffer, TurnWorkspace
 from .transcript_segmenter import TranscriptSegmenter
 from .options import InputOptions
 from ..analysis.client import AnalysisClient
-from ..agent.speculative_tools import SpeculativeTools
+from ..agent.speculative_tools import ActionRunner
 from ..agent.tool_registry import FileTools, WebSearchTools
 from ..asr.protocol import AudioChunk
 from ..core.events import event, utc_now_iso
 from ..core.state import TerminalState
 from ..kws.keywords import strip_wake_prefix
 from ..tts.alignment import DeliveryResolver
-from ..session.runtime import EpochReason
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +31,7 @@ class RealtimeController(SpeechPipeline, InputController):
         self.options = options
         self.analysis = analysis or AnalysisClient(options.analysis_url)
         self.analysis_health: dict = {}
-        self.registry = SpeculativeTools(
+        self.registry = ActionRunner(
             FileTools(options.allowed_roots),
             search=search,
             on_status=self._on_tool_status,
@@ -65,7 +64,7 @@ class RealtimeController(SpeechPipeline, InputController):
         self._asr_queue_overflow_at: float | None = None
         self._last_frame: AudioFrame | None = None
         self._resume_started: int | None = None
-        self._vad_epoch = 0
+        self._vad_generation = 0
         self._reset_vad_pending = False
 
     def _track(self, task: asyncio.Task | None) -> None:
@@ -79,7 +78,10 @@ class RealtimeController(SpeechPipeline, InputController):
         task.add_done_callback(done)
 
     def _valid(self, token: tuple[str, int]) -> bool:
-        return self.workspace is not None and self.workspace.token == token and self.conversation.is_current(*token)
+        # Token validity is now an explicit workspace cancellation boundary.
+        # ASR finalization and SenseVoice refinement do not invalidate the
+        # active turn; resume/stop replaces the workspace generation.
+        return self.workspace is not None and self.workspace.token == token
 
     async def _refinement_completed(self, ws: TurnWorkspace, result: dict) -> None:
         """Hook for the Episode controller's late semantic refinement path."""
@@ -95,7 +97,7 @@ class RealtimeController(SpeechPipeline, InputController):
         if self.workspace is ws:
             await self._detail("tts.prewarm", event="tts.prewarm", status=status, **payload)
         else:
-            await self._publish(event("tts.prewarm", ws.turn_id, epoch=ws.epoch,
+            await self._publish(event("tts.prewarm", ws.turn_id, output_generation=ws.generation,
                                        event="tts.prewarm", status=status,
                                        workspace=ws.snapshot(), **payload))
 
@@ -195,7 +197,8 @@ class RealtimeController(SpeechPipeline, InputController):
         if ws is None:
             return
         self.state.current.update(ws.snapshot(), turn_id=ws.turn_id, input_runtime=True)
-        await self._publish(event(type_, ws.turn_id, epoch=ws.epoch, workspace=ws.snapshot(), **payload))
+        await self._publish(event(type_, ws.turn_id, output_generation=ws.generation,
+                                  workspace=ws.snapshot(), **payload))
 
     async def initialize(self) -> None:
         await super().initialize()
@@ -397,6 +400,8 @@ class RealtimeController(SpeechPipeline, InputController):
         speech transaction.
         """
 
+        if not hasattr(self, "_vad_generation"):
+            self._vad_generation = 0
         ws = self.workspace
         capture_diagnostics = getattr(self.capture, "diagnostics", {}) if self.capture is not None else {}
         detail = {
@@ -435,7 +440,7 @@ class RealtimeController(SpeechPipeline, InputController):
         self._speech_samples = 0
         self._resume_started = None
         self.barge_in_gate.reset()
-        self._vad_epoch += 1
+        self._vad_generation += 1
         if self.vad is not None:
             await asyncio.to_thread(self.vad.reset)
         self._reset_vad_pending = False
@@ -537,6 +542,8 @@ class RealtimeController(SpeechPipeline, InputController):
                     break
 
     async def handle_frame(self, frame: AudioFrame) -> None:
+        if not hasattr(self, "_vad_generation"):
+            self._vad_generation = 0
         expected_start_sample = self._last_frame.end_sample if self._last_frame else None
         if self._asr_queue_overflow:
             await self._recover_input_continuity(
@@ -568,9 +575,9 @@ class RealtimeController(SpeechPipeline, InputController):
         if self._reset_vad_pending:
             await asyncio.to_thread(self.vad.reset)
             self._reset_vad_pending = False
-        epoch = self._vad_epoch
+        generation = self._vad_generation
         activity = await asyncio.to_thread(self.vad.feed, frame.pcm)
-        if epoch != self._vad_epoch:
+        if generation != self._vad_generation:
             return  # Turn was cancelled while native VAD was running.
         if activity.speech_started:
             self._speech_start_sample = self._vad_origin + (activity.speech_start_sample or 0)
@@ -692,7 +699,6 @@ class RealtimeController(SpeechPipeline, InputController):
             return
 
         if activity.speech_started:
-            ws.epoch = self.conversation.advance_epoch(EpochReason.USER_INTERRUPTED)
             self._last_candidate = 0
             if self._endpoint_task:
                 self._endpoint_task.cancel()
@@ -719,8 +725,8 @@ class RealtimeController(SpeechPipeline, InputController):
     async def _new_turn(self, frame: AudioFrame) -> None:
         turn_id = self.turns.begin()
         self.state.clear_current()
-        token = self.conversation.begin_turn(turn_id)
-        self.workspace = ws = TurnWorkspace(turn_id, epoch=token.epoch, started_at=frame.captured_at)
+        self.conversation.begin_turn(turn_id)
+        self.workspace = ws = TurnWorkspace(turn_id, started_at=frame.captured_at)
         ws.timings["turn_started"] = ws.started_at
         self._turn_timings[turn_id] = ws.timings
         if len(self._turn_timings) > 64:
@@ -774,7 +780,7 @@ class RealtimeController(SpeechPipeline, InputController):
         # gate atomically; otherwise the superseded answer could start while
         # the revised input is being recognized.
         self._stop_playback_snapshot(ws.playback_key)
-        ws.resume(self.conversation.advance_epoch(EpochReason.USER_RESUMED))
+        ws.resume()
         stopped = self._stop_generation()
         if stopped:
             await asyncio.gather(*stopped, return_exceptions=True)
@@ -836,7 +842,6 @@ class RealtimeController(SpeechPipeline, InputController):
             return
         ws = self.workspace
         self._active_input = False
-        ws.epoch = self.conversation.advance_epoch(EpochReason.INPUT_FINALIZED)
         token = ws.freeze()
         if ws.hard_closed and self._speech_start_sample is not None:
             self._resume_started = frame.end_sample
@@ -986,7 +991,7 @@ class RealtimeController(SpeechPipeline, InputController):
         result = self.segmenter.feed(text, pause=pause)
         if result is None or ws is None:
             return
-        ws.segments = [{"text": s} for s in result["segments"]]
+        ws.segments = list(result.get("sentences") or [{"text": s} for s in result["segments"]])
         ws.timings.setdefault("first_segment", time.monotonic())
         await self._detail("transcript.segment", **result)
 
@@ -1185,7 +1190,7 @@ class RealtimeController(SpeechPipeline, InputController):
         self._speech_samples = 0
         self._speech_start_sample = self._speech_end_sample = None
         self._vad_origin = None
-        self._vad_epoch += 1
+        self._vad_generation += 1
         self._reset_vad_pending = True
 
     async def stop_listening(self) -> None:

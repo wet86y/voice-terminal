@@ -52,14 +52,13 @@ function isAgentTrace(value: unknown): value is AgentTrace {
   return isRecord(value) && isNonNegativeInteger(value.trace_seq)
     && typeof value.kind === 'string'
     && (value.conversation_id === null || typeof value.conversation_id === 'string')
-    && (value.epoch === undefined || isNonNegativeInteger(value.epoch))
 }
 
 function isSpeechOutput(value: unknown): value is SpeechOutputRecord {
   return isRecord(value) && typeof value.speech_id === 'string' && value.speech_id.length > 0
     && (value.conversation_id === undefined || value.conversation_id === null || typeof value.conversation_id === 'string')
     && (value.trace_id === undefined || value.trace_id === null || typeof value.trace_id === 'string')
-    && (value.epoch === undefined || isNonNegativeInteger(value.epoch))
+    && (value.output_generation === undefined || isNonNegativeInteger(value.output_generation))
     && (value.status === undefined || typeof value.status === 'string')
 }
 
@@ -94,7 +93,7 @@ function createEmptyCurrentTurn(): CurrentTurnSnapshot {
     playback_diagnostics: {},
     tts_transport: 'websocket',
     tts_scheduling: 'auto',
-    input_runtime: true, epoch: 0, committed: false,
+    input_runtime: true, output_generation: 0, committed: false,
     agent_phase: 'IDLE', paraformer_final: '', refined_text: '',
     refinement_available: false, tts_prewarm_started: false, tts_prewarm_status: 'NOT_REQUESTED',
     segments: [], tools: [], audio_cues: [], analysis: {},
@@ -186,16 +185,13 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const speechOutputs = ref<SpeechOutputRecord[]>([])
   const activeSpeech = ref<SpeechOutputRecord | null>(null)
   const speechProgress = ref<Record<string, unknown> | null>(null)
-  const prefill = ref<{ status?: string, text?: string } | null>(null)
   const reasoning = ref('')
   const retiredEpisodes = new Set<string>()
 
   function applyAgent(value: unknown, authoritative = false) {
     if (!isRecord(value) || !(value.conversation_id === null || typeof value.conversation_id === 'string')
-      || !isNonNegativeInteger(value.epoch)
       || (value.trace_id !== undefined && value.trace_id !== null && typeof value.trace_id !== 'string')
       || (value.agent_busy !== undefined && typeof value.agent_busy !== 'boolean')
-      || (value.decision_mode !== undefined && typeof value.decision_mode !== 'string')
       || (value.user_speaking !== undefined && value.user_speaking !== null && typeof value.user_speaking !== 'boolean')
       || (value.request_count !== undefined && !isNonNegativeInteger(value.request_count))
       || (value.context_chars !== undefined && !isNonNegativeInteger(value.context_chars))
@@ -208,7 +204,6 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
           || value.context_usage_percent < 0))) return
     const previous = agentEpisode.value
     if (!authoritative && typeof value.conversation_id === 'string' && retiredEpisodes.has(value.conversation_id)) return
-    if (!authoritative && previous?.conversation_id === value.conversation_id && value.epoch < previous.epoch) return
     if (previous?.conversation_id && previous.conversation_id !== value.conversation_id) {
       retiredEpisodes.add(previous.conversation_id)
       speechProgress.value = null
@@ -218,7 +213,6 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     agentEpisode.value = value as unknown as AgentEpisodeSnapshot
     if (Array.isArray(value.trace)) agentTrace.value = value.trace.filter(isAgentTrace).slice(-200)
     if (Array.isArray(value.outputs)) speechOutputs.value = value.outputs.filter(isSpeechOutput).slice(-32)
-    prefill.value = isRecord(value.pending_prefill) ? value.pending_prefill as { status?: string, text?: string } : null
     if (isRecord(value.reasoning) && typeof value.reasoning.text === 'string') reasoning.value = value.reasoning.text
     if (isSpeechOutput(value.active_speech)) activeSpeech.value = value.active_speech
     else if (value.conversation_id === null) activeSpeech.value = null
@@ -328,7 +322,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function applyWorkspace(snapshot: Record<string, unknown>) {
-    for (const key of ['epoch'] as const) {
+    for (const key of ['output_generation'] as const) {
       if (typeof snapshot[key] === 'number') current[key] = snapshot[key]
     }
     for (const key of ['input_runtime', 'committed'] as const) {
@@ -442,19 +436,13 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         || payload.context_usage_percent < 0)) return
     if (typeof payload.conversation_id === 'string') {
       if (payload.conversation_id !== agentEpisode.value?.conversation_id) return
-      if (payload.epoch !== undefined
-        && (!isNonNegativeInteger(payload.epoch)
-          || payload.epoch < (agentEpisode.value?.epoch ?? 0))) return
     } else if (!acceptsCurrentTurn(turnId)) return
 
     const messages: LlmContextMessage[] = []
     for (const item of payload.messages) {
       if (!isRecord(item)) continue
       if (typeof item.role !== 'string' || !(typeof item.content === 'string' || item.content === null)) continue
-      messages.push({ role: item.role, content: typeof item.content === 'string' ? item.content : '',
-        ...(Array.isArray(item.tool_calls) ? { tool_calls: item.tool_calls } : {}),
-        ...(typeof item.tool_call_id === 'string' ? { tool_call_id: item.tool_call_id } : {}),
-      })
+      messages.push({ role: item.role, content: typeof item.content === 'string' ? item.content : '' })
     }
     llmContext.value = messages
     llmContextTurnId.value = turnId
@@ -474,7 +462,6 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     // Agent/output generations are independent of the currently displayed input turn.
     if (message.type === 'agent.state') { applyAgent(payload); return }
     if (message.type === 'agent.trace') { applyAgentTrace(payload); return }
-    if (message.type === 'agent.prefill') { prefill.value = isRecord(payload.prefill) ? payload.prefill as { status?: string, text?: string } : null; return }
     if (message.type === 'agent.reasoning') { if (typeof payload.text === 'string') reasoning.value = payload.text; return }
     if (message.type === 'speech.queued') return
     if (message.type === 'speech.completed') {
@@ -489,14 +476,13 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       const currentAgent = agentEpisode.value
       const textDelta = readString(payload, 'text_delta')
       if (textDelta !== null && typeof payload.speech_id === 'string'
-        && payload.conversation_id === currentAgent?.conversation_id
-        && payload.epoch === currentAgent?.epoch) {
+        && payload.conversation_id === currentAgent?.conversation_id) {
         if (activeSpeech.value?.speech_id !== payload.speech_id) {
           activeSpeech.value = {
             speech_id: payload.speech_id,
             conversation_id: payload.conversation_id as string,
             trace_id: typeof payload.trace_id === 'string' ? payload.trace_id : undefined,
-            epoch: payload.epoch as number,
+            output_generation: isNonNegativeInteger(payload.output_generation) ? payload.output_generation : undefined,
             turn_id: typeof payload.turn_id === 'string' ? payload.turn_id : message.turn_id || '',
             text: '', status: 'streaming',
           }
@@ -508,16 +494,13 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (message.type === 'speech.progress') {
       const currentAgent = agentEpisode.value
       if (typeof payload.speech_id === 'string' && typeof payload.conversation_id === 'string'
-        && isNonNegativeInteger(payload.epoch)
         && payload.conversation_id === currentAgent?.conversation_id
-        && payload.epoch === currentAgent?.epoch
         && !speechOutputs.value.some(item => item.speech_id === payload.speech_id)) speechProgress.value = payload
     }
     if (message.type === 'input.started') adoptTurn(message.turn_id ?? null)
-    if (message.turn_id === currentTurnId.value && typeof payload.epoch === 'number') {
-      if (payload.epoch < (current.epoch ?? 0)) return
-      current.epoch = payload.epoch
-      if (isRecord(payload.workspace)) { current.input_runtime = true; applyWorkspace(payload.workspace) }
+    if (message.turn_id === currentTurnId.value && isRecord(payload.workspace)) {
+      current.input_runtime = true
+      applyWorkspace(payload.workspace)
     }
 
     switch (message.type) {
@@ -713,7 +696,6 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     speechOutputs,
     activeSpeech,
     speechProgress,
-    prefill,
     reasoning,
     llmContext,
     llmContextTurnId,

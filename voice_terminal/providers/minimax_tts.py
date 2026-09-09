@@ -57,7 +57,7 @@ class MiniMaxTtsSession:
         self._sentence_available = asyncio.Event()
         self._sentence_count = 0
         # MiniMax subtitle timestamps are relative to each server sentence.
-        # Keep the sentence epoch and the PCM origin captured at
+        # Keep the sentence timebase and the PCM origin captured at
         # ``sentence_start`` so alignment consumers can place words on the
         # task-global playback clock.
         self._sentence_index = 0

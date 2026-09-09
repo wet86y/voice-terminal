@@ -52,7 +52,10 @@ class CurrentTurnAudioBuffer:
 @dataclass
 class TurnWorkspace:
     turn_id: str
-    epoch: int = 0
+    # Explicit cancellation/output generation.  This changes only when a
+    # turn is explicitly stopped or resumed; it is never used to judge ASR,
+    # refinement, or tool data as semantically old.
+    generation: int = 0
     phase: str = "CAPTURING"
     # Episode ownership is captured when this audio turn first enters the
     # agent.  Cleanup must use this stable value even if the runtime has
@@ -87,11 +90,11 @@ class TurnWorkspace:
 
     @property
     def token(self) -> tuple[str, int]:
-        return self.turn_id, self.epoch
+        return self.turn_id, self.generation
 
     @property
     def playback_key(self) -> str:
-        return f"{self.turn_id}:{self.epoch}"
+        return f"{self.turn_id}:{self.generation}"
 
     def freeze(self) -> tuple[str, int]:
         self.committed = False
@@ -99,8 +102,8 @@ class TurnWorkspace:
         self.agent_phase = "FINAL"
         return self.token
 
-    def resume(self, epoch: int) -> None:
-        self.epoch = epoch
+    def resume(self) -> None:
+        self.generation += 1
         self.phase = "CAPTURING"
         self.committed = False
         self.staged_response = ""
@@ -113,7 +116,8 @@ class TurnWorkspace:
 
     def snapshot(self) -> dict:
         return {
-            "conversation_id": self.episode_id, "turn_id": self.turn_id, "epoch": self.epoch, "phase": self.phase,
+            "conversation_id": self.episode_id, "turn_id": self.turn_id, "output_generation": self.generation,
+            "phase": self.phase,
             "committed": self.committed, "agent_phase": self.agent_phase,
             "paraformer_final": self.paraformer_final, "refined_text": self.refined_text,
             "refinement_available": self.refinement_available,

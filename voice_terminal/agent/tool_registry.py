@@ -126,14 +126,19 @@ class FileTools:
         except (OSError, ValueError, KeyError):
             return False
 
-    def schemas(self) -> list[dict]:
+    def action_definitions(self) -> list[dict]:
         roots = ", ".join(map(str, self.roots))
-        return [{"type": "function", "function": {"name": name, "description": description,
-                 "parameters": {"type": "object", "properties": {key: {"type": "string"}},
-                                "required": [key], "additionalProperties": False}}}
-                for name, key, description in (
-                    ("files_search", "query", f"Search filenames containing query in allowed roots: {roots}. Read only."),
-                    ("files_read_text", "path", "Read up to 16 KB of UTF-8 text from an allowed path. Read only."))]
+        return [{"name": name, "description": description,
+                 "parameters": {"type": "object", "properties": {key: properties},
+                                "required": [key], "additionalProperties": False}}
+                for name, key, description, properties in (
+                    ("files_search", "query",
+                     f"Read-only filename search in allowed roots: {roots}. Use a nonempty filename fragment, not a path.",
+                     {"type": "string", "minLength": 1, "maxLength": 256,
+                      "description": "Nonempty filename fragment, maximum 256 characters."}),
+                    ("files_read_text", "path",
+                     "Read-only UTF-8 text read from an allowed path; returns at most 16 KB and rejects binary files.",
+                     {"type": "string", "description": "Relative or allowed absolute path returned by files_search."}))]
 
 
 class WebSearchTools:
@@ -211,12 +216,10 @@ class WebSearchTools:
             and time.monotonic() - fetched_at <= self.MAX_RESULT_AGE_SECONDS
         )
 
-    def schemas(self) -> list[dict]:
+    def action_definitions(self) -> list[dict]:
         if not self.available:
             return []
         return [{
-            "type": "function",
-            "function": {
                 "name": "web_search",
                 "description": (
                     "Search the live web for current external information. "
@@ -229,7 +232,6 @@ class WebSearchTools:
                     "required": ["query"],
                     "additionalProperties": False,
                 },
-            },
         }]
 
     def disable(self, reason: str) -> None:

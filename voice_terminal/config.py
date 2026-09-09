@@ -155,11 +155,6 @@ class TtsConfig:
 
 
 @dataclass(frozen=True)
-class SpeechConfig:
-    prefill_enabled: bool = True
-
-
-@dataclass(frozen=True)
 class TextBridgeConfig:
     min_chars: int = 8
     max_chars: int = 36
@@ -199,7 +194,6 @@ class AppConfig:
     asr: AsrConfig = field(default_factory=AsrConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
-    speech: SpeechConfig = field(default_factory=SpeechConfig)
     text_bridge: TextBridgeConfig = field(default_factory=TextBridgeConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     asr_worker: AsrWorkerConfig = field(default_factory=AsrWorkerConfig)
@@ -247,7 +241,6 @@ class AppConfig:
         asr = _section(data, "asr")
         llm = _section(data, "llm")
         tts = _section(data, "tts")
-        speech = _section(data, "speech")
         bridge = _section(data, "text_bridge")
         server = _section(data, "server")
         worker = _section(data, "asr_worker")
@@ -371,7 +364,6 @@ class AppConfig:
                 emotion_transport=_string(tts.get("emotion_transport"), "voice_setting"),
                 session_reuse=_bool(tts.get("session_reuse"), True),
             ),
-            speech=SpeechConfig(prefill_enabled=_bool(speech.get("prefill_enabled"), True)),
             text_bridge=TextBridgeConfig(
                 min_chars=int(_number(bridge.get("min_chars"), 8)),
                 max_chars=int(_number(bridge.get("max_chars"), 36)),

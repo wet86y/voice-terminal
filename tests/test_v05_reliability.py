@@ -15,31 +15,6 @@ from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
 
 
-class FormalSpeechGateTests(unittest.TestCase):
-    def test_formal_speech_requires_the_source_input_to_be_final(self) -> None:
-        runtime = object.__new__(AgentEpisodeRuntime)
-        identity = ("conversation", "step", 7)
-        runtime.valid = lambda value: value == identity
-        runtime._identity_turns = {identity: "turn"}
-        runtime.inputs = {"turn": {"text": "未定稿", "final": False}}
-        runtime.user_speaking = False
-
-        self.assertEqual(runtime.gate(identity), "input_not_final")
-
-        runtime.inputs["turn"]["final"] = True
-        self.assertIsNone(runtime.gate(identity))
-
-    def test_formal_speech_keeps_existing_user_activity_gate_after_final(self) -> None:
-        runtime = object.__new__(AgentEpisodeRuntime)
-        identity = ("conversation", "step", 7)
-        runtime.valid = lambda value: value == identity
-        runtime._identity_turns = {identity: "turn"}
-        runtime.inputs = {"turn": {"text": "已定稿", "final": True}}
-        runtime.user_speaking = True
-
-        self.assertEqual(runtime.gate(identity), "user_speaking")
-
-
 class InputContinuityRecoveryTests(unittest.IsolatedAsyncioTestCase):
     def _controller(self) -> RealtimeController:
         controller = object.__new__(RealtimeController)
@@ -55,7 +30,7 @@ class InputContinuityRecoveryTests(unittest.IsolatedAsyncioTestCase):
         controller._speech_end_sample = 10
         controller._speech_samples = 10
         controller._resume_started = 0
-        controller._vad_epoch = 3
+        controller._vad_generation = 3
         controller._reset_vad_pending = True
         controller.barge_in_gate = SimpleNamespace(reset=lambda: None)
         controller.vad = SimpleNamespace(reset=lambda: None)
@@ -141,7 +116,7 @@ class InputContinuityRecoveryTests(unittest.IsolatedAsyncioTestCase):
         controller.wake_preroll_ms = 0
         controller._vad_origin = None
         controller._reset_vad_pending = False
-        controller._vad_epoch = 0
+        controller._vad_generation = 0
         controller._speech_start_sample = None
         controller._speech_end_sample = None
         controller._speech_samples = 0

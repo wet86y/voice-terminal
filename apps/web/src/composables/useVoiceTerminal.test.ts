@@ -24,7 +24,7 @@ function openTerminal() {
   return { socket, terminal }
 }
 
-describe('V0.5 session protocol', () => {
+describe('V0.6 session protocol', () => {
   it('subscribes and applies a server-owned session snapshot', () => {
     const { socket, terminal } = openTerminal()
     expect(JSON.parse(socket.sent[0]).command).toBe('subscribe')
@@ -48,11 +48,11 @@ describe('V0.5 session protocol', () => {
 
   it('renders only authorized speech deltas and complete delivery', () => {
     const { socket, terminal } = openTerminal()
-    socket.push('agent.state', 1, { episode_id: 'episode_a', agent_step_id: 'decision_a', context_version: 1, agent_state: 'INVOKING' })
-    socket.push('speech.delta', 2, { speech_id: 'speech_a', episode_id: 'episode_a', agent_step_id: 'decision_a',
-      context_version: 1, text_delta: '已授权输出' }, { turn_id: 'input_a', speech_id: 'speech_a' })
-    socket.push('speech.completed', 3, { speech_id: 'speech_a', episode_id: 'episode_a', agent_step_id: 'decision_a',
-      context_version: 1, text: '已授权输出', status: 'completed', delivery: { status: 'full', heard_text: '已授权输出' } },
+    socket.push('agent.state', 1, { conversation_id: 'episode_a', request_id: 'decision_a', agent_busy: true })
+    socket.push('speech.delta', 2, { speech_id: 'speech_a', conversation_id: 'episode_a', request_id: 'decision_a',
+      text_delta: '已授权输出' }, { turn_id: 'input_a', speech_id: 'speech_a' })
+    socket.push('speech.completed', 3, { speech_id: 'speech_a', conversation_id: 'episode_a', request_id: 'decision_a',
+      text: '已授权输出', status: 'completed', delivery: { status: 'full', heard_text: '已授权输出' } },
       { turn_id: 'input_a', speech_id: 'speech_a' })
     expect(terminal.activeSpeech.value?.text).toBe('已授权输出')
     expect(terminal.speechOutputs.value[0].delivery?.heard_text).toBe('已授权输出')

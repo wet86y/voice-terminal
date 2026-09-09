@@ -4,12 +4,12 @@
 
 | 组件 | 输入 | 输出 | 唯一职责 |
 | --- | --- | --- | --- |
-| Conversation runtime | 生命周期事件 | `conversation_id`、`turn_id`、`epoch` | 唯一身份与异步有效性 authority |
+| Conversation runtime | 生命周期事件 | `conversation_id`、`turn_id`、取消作用域 | 生命周期与显式取消 authority |
 | Input pipeline | PCM、VAD、ASR、分析结果 | `TurnWorkspace` | 维护当前轮次、阶段、Paraformer 主文本与 SenseVoice 补充证据 |
 | Session ledger | 最终输入、传达报告、选中的工具交换 | 实际模型 messages、历史投影 | 唯一上下文事实源 |
-| Agent runtime | 账本投影、最新输入、环境事件 | `AgentDecision` | LOW 推理下选择 prefill/speak/wait/finish/tool |
-| Tool runtime | 工具调用与决策身份 | `ToolExchange` | 只读执行、缓存与来源标记 |
-| Speech runtime | 已授权 prefill/speak、TTS、播放器 | `SpeechItem`、`DeliveryReport` | FIFO 播放、取消与传达结算 |
-| Protocol projection | 内部事件 | V0.5 Envelope | 唯一网络协议边界 |
+| Agent runtime | 账本投影、句子流、环境事件 | V0.6 JSON `speak` 决策 | 400ms 单飞调度、信封校验与异常恢复 |
+| Action runtime | 本地 `actions` 请求 | `ToolExchange` | 只读执行、缓存与来源标记 |
+| Speech runtime | 文本 speak 队列、TTS、播放器 | `SpeechItem`、`DeliveryReport` | `empty/queued/suspended/speaking`、单待播文本、取消与传达结算 |
+| Protocol projection | 内部事件 | V0.6 Envelope | 唯一网络协议边界 |
 
-输入中断只能使当前语音输出失效；它不能直接写播放器状态。Speech Queue 中未开始的项目不会写入 heard_text。所有可晚返回的操作只在其 `turn_id + epoch` 仍是当前世界时提交；播放器额外确认 `speech_id`。决策 ID 只用于追踪，不能决定结果是否有效。等待结束当前决策，而不结束连续对话。
+输入中断只能通过显式取消作用域停止当前语音；普通定稿、精修和工具结果不会取消在飞请求。Speech Queue 中未开始的项目不会写入 heard_text，只保存文本。`request_id`、`speech_id` 和 `output_generation` 只用于追踪与播放器代际校验，不参与语义判旧。等待结束当前决策，而不结束连续对话。

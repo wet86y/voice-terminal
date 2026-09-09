@@ -23,10 +23,20 @@ class ToolTask:
 
 
 class ToolSelectionInvalid(RuntimeError):
-    """The active Agent decision became obsolete while selecting a tool."""
+    """A tool cannot be selected because its backend is unavailable.
+
+    This is no longer used as a semantic-version/stale filter.  A backend
+    becoming unavailable is an ordinary tool execution result; only explicit
+    turn/session cancellation closes a task.
+    """
 
 
-class SpeculativeTools:
+class ActionRunner:
+    """Bounded executor for V0.6 model-selected read-only actions.
+
+    Despite retaining cache reuse, actions are never a provider-native tool
+    protocol and never make a semantic prediction about a future user turn.
+    """
     def __init__(self, files: FileTools, search: WebSearchTools | None = None,
                  on_disabled: Callable[[str, str], None] | None = None,
                  on_status: Callable[[str, str, str], None] | None = None) -> None:
@@ -52,12 +62,12 @@ class SpeculativeTools:
         return self.files
 
     def effect(self, name: str) -> str | None:
-        return TOOL_EFFECTS.get(name) if name in {s["function"]["name"] for s in self.schemas()} else None
+        return TOOL_EFFECTS.get(name) if name in {s["name"] for s in self.action_definitions()} else None
 
-    def schemas(self) -> list[dict]:
-        schemas = self.files.schemas()
+    def action_definitions(self) -> list[dict]:
+        schemas = self.files.action_definitions()
         if self.search is not None:
-            schemas.extend(self.search.schemas())
+            schemas.extend(self.search.action_definitions())
         return schemas
 
     def is_available(self, name: str) -> bool:
@@ -110,13 +120,9 @@ class SpeculativeTools:
 
     async def select(self, turn_id: str, name: str, arguments: dict, *, valid: Callable[[], bool] | None = None) -> tuple[ToolTask, bool]:
         async with self.lock:
-            return await self._select(turn_id, name, arguments, valid=valid)
+            return await self._select(turn_id, name, arguments)
 
-    async def _select(self, turn_id: str, name: str, arguments: dict, *, valid: Callable[[], bool] | None = None) -> tuple[ToolTask, bool]:
-        def check_valid() -> None:
-            if valid is not None and not valid():
-                raise ToolSelectionInvalid("tool selection invalidated")
-
+    async def _select(self, turn_id: str, name: str, arguments: dict) -> tuple[ToolTask, bool]:
         if self.closed:
             raise RuntimeError("tool runtime closed")
         backend = self._backend(name)
@@ -125,18 +131,15 @@ class SpeculativeTools:
         name, arguments = await asyncio.to_thread(backend.normalize, name, arguments)
         if self.closed or (self.managed and self.active_turn != turn_id):
             raise RuntimeError("tool turn invalidated")
-        check_valid()
         key = (turn_id, name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
         entry = self.entries.get(key)
         if entry is not None:
             if not entry.task.done():
-                check_valid()
                 return entry, True
             if not entry.task.cancelled() and entry.task.exception() is None:
                 fresh = await asyncio.to_thread(backend.fresh, name, entry.task.result())
                 if self.closed or (self.managed and self.active_turn != turn_id):
                     raise RuntimeError("tool turn invalidated")
-                check_valid()
                 if fresh:
                     return entry, True
         # Bound both logical backlog and retained result memory.
@@ -149,7 +152,6 @@ class SpeculativeTools:
         async def run():
             async with asyncio.timeout(5):
                 return await self._execute(backend, name, arguments, lambda when: setattr(entry_ref[0], "execution_started_at", when))
-        check_valid()
         selected_at = time.monotonic()
         entry = ToolTask(asyncio.create_task(run()), selected_at)
         entry_ref.append(entry)

@@ -20,8 +20,6 @@ class CurrentInput:
     primary_transcript: str = ""
     refined_transcript: str = ""
     refinement_available: bool = False
-    prefill_text: str = ""
-    prefill_status: str = "none"
     # Internal correlation only.  It is deliberately never rendered into a
     # model-facing message, but lets the projector avoid duplicating a turn
     # that the controller has already committed to the ledger.
@@ -46,17 +44,11 @@ class LLMContextProjector:
         if current.finalized:
             facts.append("当前用户输入已经最终确认。")
         elif current.user_speaking is True:
-            facts.append("用户当前仍在讲话；不要调用 speak。")
+            facts.append("用户当前仍在讲话；可在 V0.6 信封中使用 speak(text) 建立文本候选，但系统只会在本地确认用户结束讲话后才启动 TTS。")
         durable_refinement = ledger.input_refinement(current.turn_id) if committed else ""
         if current.refinement_available and refined and durable_refinement != refined:
             facts.append("SenseVoice 已返回补充精修文本：" + refined)
-            facts.append("精修文本是补充证据，不是开始首轮回答的前置条件；如已播放内容确实与精修语义冲突，可用 speak(replace_current=true) 替换。")
-        if current.prefill_status != "none":
-            candidate = current.prefill_text.strip()
-            if candidate:
-                facts.append(f"当前预测性 prefill 状态为 {current.prefill_status}，候选内容为：{candidate}")
-            else:
-                facts.append(f"当前预测性 prefill 状态为 {current.prefill_status}。")
+            facts.append("精修文本是补充证据，不是开始首轮回答的前置条件；如已播放内容确实与精修语义冲突，可用 speak(text) 请求受控替换。")
         if current.recent_events:
             facts.append("最近语义事件：" + "、".join(current.recent_events))
         if facts:

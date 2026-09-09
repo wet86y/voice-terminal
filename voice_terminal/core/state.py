@@ -130,7 +130,7 @@ class RuntimeState:
             tts_remaining_ms=0,
             delivery={},
         )
-        for key in ("turn_id", "epoch", "phase", "committed", "agent_phase", "paraformer_final", "refined_text", "refinement_available", "segments", "tools", "audio_cues", "analysis", "tts_segments"):
+        for key in ("turn_id", "output_generation", "phase", "committed", "agent_phase", "paraformer_final", "refined_text", "refinement_available", "segments", "tools", "audio_cues", "analysis", "tts_segments"):
             self.current.pop(key, None)
         self.current.update(tts_prewarm_started=False, tts_prewarm_status="NOT_REQUESTED")
         self.latency = {

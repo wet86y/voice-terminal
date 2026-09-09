@@ -2,8 +2,8 @@
 
 from .contracts import DeliveryReport, InputTurn, SessionIdentity, SpeechOutput, ToolExchange
 from .ledger import SessionLedger
-from .runtime import ConversationRuntime, EpochReason, ValidityToken
+from .runtime import CancellationScope, ConversationRuntime
 from .context import CurrentInput, LLMContextProjector
 
-__all__ = ["ConversationRuntime", "CurrentInput", "DeliveryReport", "EpochReason", "InputTurn",
-           "LLMContextProjector", "SessionIdentity", "SessionLedger", "SpeechOutput", "ToolExchange", "ValidityToken"]
+__all__ = ["CancellationScope", "ConversationRuntime", "CurrentInput", "DeliveryReport", "InputTurn",
+           "LLMContextProjector", "SessionIdentity", "SessionLedger", "SpeechOutput", "ToolExchange"]

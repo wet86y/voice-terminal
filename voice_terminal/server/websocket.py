@@ -231,7 +231,6 @@ class SessionRuntime:
             raise ValueError("session runtime requires 16 kHz mono int16 capture")
         self.controller = EpisodeController(
             options=self.config.smart_turn, search=self.search_tools, agent_options=self.config.agent,
-            prefill_enabled=self.config.speech.prefill_enabled,
             state=self.state,
             bus=self.bus,
             history=self.history,
@@ -287,6 +286,8 @@ class SessionRuntime:
             await self.controller.close()
         if self.tts is not None:
             await self.tts.close()
+        if self.llm is not None:
+            await self.llm.close()
         if self.audio_processor is not None:
             self.audio_processor.close()
 
@@ -320,7 +321,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
     if FastAPI is None:
         raise RuntimeError("缺少 fastapi，请先运行 scripts\\setup.ps1。")
 
-    app = FastAPI(title="Voice Terminal Server", version="0.5.0", lifespan=lifespan)
+    app = FastAPI(title="Voice Terminal Server", version="0.6.0", lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:

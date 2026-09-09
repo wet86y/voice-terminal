@@ -81,7 +81,7 @@ export interface PlaybackDiagnostics {
 export interface CurrentTurnSnapshot {
   turn_id?: string | null
   input_runtime?: boolean
-  epoch?: number
+  output_generation?: number
   committed?: boolean
   agent_phase?: string
   paraformer_final?: string
@@ -186,8 +186,6 @@ export interface AssistantDeltaPayload {
 export interface LlmContextMessage {
   role: string
   content: string
-  tool_calls?: unknown[]
-  tool_call_id?: string
 }
 
 export interface LlmContextPayload {
@@ -199,7 +197,7 @@ export interface LlmContextPayload {
   provider_prompt_tokens?: number | null
   context_usage_percent?: number
   conversation_id?: string
-  epoch?: number
+  request_id?: string
 }
 
 export interface TtsStatusPayload {
@@ -241,7 +239,7 @@ export interface ServerErrorPayload {
 export type ServerMessageType =
   | 'runtime.snapshot' | 'session.state' | 'metrics.snapshot'
   | 'input.started' | 'input.updated' | 'input.finalized' | 'input.completed'
-  | 'agent.state' | 'agent.trace' | 'agent.prefill' | 'agent.reasoning' | 'context.snapshot' | 'tool.state'
+  | 'agent.state' | 'agent.trace' | 'agent.reasoning' | 'context.snapshot' | 'tool.state'
   | 'speech.queued' | 'speech.started' | 'speech.delta' | 'speech.progress' | 'speech.completed'
   | 'error'
 
@@ -283,7 +281,7 @@ export interface AgentTrace {
   kind: string
   conversation_id: string | null
   trace_id?: string | null
-  epoch?: number
+  request_id?: string | null
   turn_id?: string | null
   text?: string
   reason?: string
@@ -298,7 +296,8 @@ export interface SpeechOutputRecord {
   conversation_id: string
   trace_id?: string
   turn_id: string
-  epoch: number
+  request_id?: string
+  output_generation?: number
   text: string
   status: string
   delivery?: TurnDelivery
@@ -308,13 +307,13 @@ export interface SpeechOutputRecord {
   emotion_applied?: string
   emotion_transport?: string
   emotion_status?: string
-  kind?: 'prefill' | 'formal'
+  kind?: 'formal'
 }
 
 export interface AgentEpisodeSnapshot {
   conversation_id: string | null
   trace_id?: string | null
-  epoch: number
+  request_id?: string | null
   context_limited?: boolean
   context_limit_reason?: string | null
   context_chars?: number
@@ -323,7 +322,6 @@ export interface AgentEpisodeSnapshot {
   provider_prompt_tokens?: number | null
   context_usage_percent?: number
   agent_busy: boolean
-  decision_mode: string
   user_speaking: boolean | null
   current_action?: string | null
   request_count?: number
@@ -332,8 +330,9 @@ export interface AgentEpisodeSnapshot {
   context_compacted?: boolean
   context_compaction?: Record<string, unknown>
   active_speech?: SpeechOutputRecord | null
-  pending_prefill?: Record<string, unknown> | null
+  recovery_pending?: number
   speech_queue?: SpeechOutputRecord[]
+  speak_snapshot?: { queue_status?: 'empty' | 'queued' | 'suspended' | 'speaking' | string; text?: string; text_only_queue?: boolean }
   reasoning?: { text?: string } | null
   trace?: AgentTrace[]
   outputs?: SpeechOutputRecord[]

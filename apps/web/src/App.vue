@@ -155,13 +155,13 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
     </header>
 
     <section v-if="terminal.agentEpisode" class="agent-panel panel">
-      <div class="panel-heading"><h2>AGENT EPISODE</h2><span>{{ terminal.agentEpisode.decision_mode }}</span></div>
+      <div class="panel-heading"><h2>AGENT EPISODE</h2><span>400MS SCHEDULER</span></div>
       <div class="agent-facts">
         <span>Conversation <code>{{ terminal.agentEpisode.conversation_id || '等待新任务' }}</code></span>
         <span>Agent <b>{{ terminal.agentEpisode.agent_busy ? 'BUSY' : 'IDLE' }}</b></span>
         <span>播放 <b>{{ terminal.agentEpisode.playback_state }}</b></span>
         <span>Trace <code>{{ terminal.agentEpisode.trace_id || '—' }}</code></span>
-        <span>Epoch {{ terminal.agentEpisode.epoch }}</span>
+        <span>恢复队列 {{ terminal.agentEpisode.recovery_pending || 0 }}</span>
         <span>用户讲话 {{ terminal.agentEpisode.user_speaking === null ? '未知' : terminal.agentEpisode.user_speaking ? '是' : '否' }}</span>
         <span>动作 {{ terminal.agentEpisode.current_action || '—' }}</span>
         <span>模型请求 {{ terminal.agentEpisode.request_count || 0 }}</span>
@@ -174,7 +174,7 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
       <p v-if="terminal.agentEpisode.context_compacted" class="agent-limit" role="status">
         本次请求已按预算压缩旧上下文；当前输入仍会保留并继续处理。
       </p>
-      <p v-else-if="terminal.agentEpisode.current_action === 'wait_for_input'" class="agent-wait" role="status">
+      <p v-else-if="terminal.agentEpisode.current_action === 'wait'" class="agent-wait" role="status">
         Agent 正在等待新的输入。
       </p>
       <details class="agent-trace" open>
@@ -182,7 +182,7 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
         <div class="agent-trace-list">
           <div v-for="entry in [...terminal.agentTrace].reverse()" :key="`${entry.conversation_id}-${entry.trace_seq}`" class="agent-trace-row">
             <span>#{{ entry.trace_seq }} · {{ entry.kind }}</span>
-            <small>{{ entry.turn_id || '—' }} · epoch {{ entry.epoch }}</small>
+            <small>{{ entry.turn_id || '—' }} · request {{ entry.request_id || entry.trace_id || '—' }}</small>
             <p>{{ entry.text || entry.reason || entry.name || entry.status || '' }}</p>
             <details><summary>事件详情</summary><pre>{{ JSON.stringify(entry, null, 2) }}</pre></details>
           </div>
@@ -358,9 +358,9 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
               表达情绪：{{ terminal.activeSpeech.emotion_requested || 'calm' }} → {{ terminal.activeSpeech.emotion_applied || 'calm' }}
             </small>
           </div>
-          <div v-if="terminal.prefill" class="response-block">
-            <span class="box-label">PENDING PREFILL / {{ terminal.prefill.status || 'PREPARED' }}</span>
-            <p>{{ displayText(terminal.prefill.text) }}</p>
+          <div v-if="terminal.agentEpisode?.speech_queue?.length" class="response-block">
+            <span class="box-label">PENDING SPEAK TEXT</span>
+            <p>{{ displayText(terminal.agentEpisode.speech_queue[0]?.text) }}</p>
           </div>
           <div v-if="terminal.current.tts_prewarm_started" class="response-block">
             <span class="box-label">TTS PREWARM / {{ terminal.current.tts_prewarm_status || 'REQUESTED' }}</span>
@@ -473,8 +473,7 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
         <div v-if="terminal.llmContext.length" class="context-list">
           <div v-for="(message, index) in terminal.llmContext" :key="`${terminal.llmContextTurnId}-${index}`" class="context-row">
             <span class="context-role">{{ message.role }}</span>
-            <p>{{ message.content }}
-{{ message.tool_calls ? JSON.stringify(message.tool_calls, null, 2) : '' }}</p>
+            <p>{{ message.content }}</p>
           </div>
         </div>
         <div v-else class="empty-state context-empty">等待下一轮 LLM 请求…</div>

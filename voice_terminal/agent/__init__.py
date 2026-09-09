@@ -1,1 +1,1 @@
-"""V0.5 conversation-scoped Agent decisions and read-only tools."""
+"""V0.6 conversation-scoped JSON decisions and read-only actions."""

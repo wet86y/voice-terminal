@@ -16,10 +16,9 @@ logger = logging.getLogger(__name__)
 
 
 class EpisodeController(RealtimeController):
-    def __init__(self, *, agent_options, prefill_enabled=True, **kwargs):
+    def __init__(self, *, agent_options, **kwargs):
         super().__init__(**kwargs)
         self.agent_options = agent_options
-        self.prefill_enabled = prefill_enabled
         self.output = EpisodeSpeechOutput(self)
         self.episode = self._make_episode()
         self._endpoint_context = None
@@ -33,8 +32,7 @@ class EpisodeController(RealtimeController):
     def _make_episode(self):
         runtime = AgentEpisodeRuntime(self.llm, self.registry, self.output, self._agent_event,
                                       conversation=self.conversation, ledger=self.history,
-                                      options=self.agent_options, tools_enabled=self.options.tools,
-                                      prefill_enabled=self.prefill_enabled)
+                                      options=self.agent_options, tools_enabled=self.options.tools)
         self.output.runtime = runtime
         return runtime
 
@@ -53,13 +51,12 @@ class EpisodeController(RealtimeController):
                 termination=str(payload.get("status") or "completed"),
             )
             self.history.commit_delivery(str(payload.get("speech_id") or ""), str(payload.get("text") or ""), delivery)
-            if payload.get("kind") != "prefill":
-                await self._settle_committed_turn(
-                    str(payload.get("turn_id") or ""),
-                    outcome=str(payload.get("status") or "completed"),
-                    speech_id=str(payload.get("speech_id") or "") or None,
-                    latency=payload.get("latency") if isinstance(payload.get("latency"), dict) else None,
-                )
+            await self._settle_committed_turn(
+                str(payload.get("turn_id") or ""),
+                outcome=str(payload.get("status") or "completed"),
+                speech_id=str(payload.get("speech_id") or "") or None,
+                latency=payload.get("latency") if isinstance(payload.get("latency"), dict) else None,
+            )
         elif kind == "turn.latency":
             latency = payload.get("latency")
             update = getattr(self.history, "update_turn_latency", None)
@@ -77,16 +74,11 @@ class EpisodeController(RealtimeController):
                 outcome=str(payload.get("outcome") or "completed"),
             )
         await self._publish(VoiceEvent(kind, payload.get("input_id") or payload.get("turn_id") or self.episode.last_turn_id, payload))
-        # ``_finish_v2`` retires the input workspace immediately after the
-        # finalized event, while the Agent request is deliberately still
-        # running.  Releasing prewarm merely because ``workspace is None``
-        # therefore races the first formal speak and turns the warm path into
-        # a cold start.  A session is idle only after the Agent has settled,
-        # its watchdog is gone, and no speech/prefill transaction owns it.
+        # A session is idle only after the Agent has settled and no speech
+        # transaction owns the output path.
         output_has_pending = bool(self.output.active or getattr(self.output, "_pending", None))
         if (kind == "agent.episode" and self.workspace is None
                 and payload.get("agent_busy") is False
-                and not payload.get("response_check_active")
                 and not output_has_pending):
             turn_id = payload.get("turn_id") or self.episode.last_turn_id
             if isinstance(turn_id, str):
@@ -95,6 +87,19 @@ class EpisodeController(RealtimeController):
     async def start_listening(self):
         if self.episode.closed:
             self.episode = self._make_episode()
+        # Warm the shared DeepSeek transport on session activation.  This is
+        # only a lightweight /models request (DNS/TCP/TLS/auth connection
+        # reuse); it never starts model inference or consumes a scheduler
+        # slot.  A slow/unavailable prewarm must not block microphone start.
+        prewarm = getattr(self.llm, "prewarm", None)
+        if callable(prewarm):
+            try:
+                await asyncio.wait_for(prewarm(), timeout=2.0)
+                await self.episode.log("LLM_PREWARM_READY")
+            except asyncio.TimeoutError:
+                await self.episode.log("LLM_PREWARM_FALLBACK", reason="timeout")
+            except Exception as exc:
+                await self.episode.log("LLM_PREWARM_FALLBACK", reason=str(exc)[:200])
         await super().start_listening()
 
     def _begin_tool_scope(self, turn_id):
@@ -114,9 +119,10 @@ class EpisodeController(RealtimeController):
         if kind == "transcript.segment":
             await self.episode.observe("USER_SEGMENT_UPDATED", turn_id=ws.turn_id,
                                        text="".join(s["text"] for s in ws.segments),
-                                       epoch=ws.epoch)
+                                       output_generation=ws.generation, sentences=list(ws.segments),
+                                       sentence_ids=list(payload.get("changed_ids") or []))
         elif kind == "turn.endpoint_candidate":
-            key = (ws.turn_id, ws.epoch)
+            key = (ws.turn_id, ws.generation)
             if key != self._endpoint_context:
                 self._endpoint_context = key
                 await self.episode.observe("ENDPOINT_CANDIDATE", turn_id=ws.turn_id)
@@ -131,7 +137,7 @@ class EpisodeController(RealtimeController):
             h = self.output.handle
             progress = self.player.progress(h.workspace.playback_key) if self.player else {}
             evidence = {"identity": h.identity, "turn_id": h.turn_id, "speech_id": h.speech_id,
-                        "epoch": h.workspace.epoch, "vad_speech": bool(activity.is_speech),
+                        "output_generation": h.workspace.generation, "vad_speech": bool(activity.is_speech),
                         "near_voice": self._near_voice_activity(),
                         "protected_available": self._barge_in_protected_available(),
                         "duration_ms": decision.duration_ms, "reason": decision.reason,
@@ -176,7 +182,7 @@ class EpisodeController(RealtimeController):
             await self.episode.observe("USER_INPUT_FINALIZED", turn_id=ws.turn_id,
                                        text=ws.paraformer_final or ws.final_text,
                                        provisional_transcript=ws.paraformer_final, audio_cues=list(ws.audio_cues),
-                                       analysis=dict(ws.analysis), epoch=ws.epoch,
+                                       analysis=dict(ws.analysis), output_generation=ws.generation,
                                        input_finished_at=ws.timings.get("commit"))
             ws.episode_id = self.episode.episode_id
             if ws.episode_id:
@@ -245,7 +251,7 @@ class EpisodeController(RealtimeController):
         self._speech_samples = 0
         self._speech_start_sample = self._speech_end_sample = None
         self._vad_origin = None
-        self._vad_epoch += 1
+        self._vad_generation += 1
         self._reset_vad_pending = True
 
     async def _settle_committed_turn(self, turn_id, *, outcome, speech_id=None, latency=None):
@@ -361,8 +367,8 @@ class EpisodeController(RealtimeController):
                 await self._detail("speech.emotion", status="READY", source="SenseVoiceSmall",
                                     segments=segments)
             else:
-                await self._publish(event("transcript.refined", ws.turn_id, epoch=ws.epoch, **payload))
-                await self._publish(event("speech.emotion", ws.turn_id, epoch=ws.epoch,
+                await self._publish(event("transcript.refined", ws.turn_id, output_generation=ws.generation, **payload))
+                await self._publish(event("speech.emotion", ws.turn_id, output_generation=ws.generation,
                                            status="READY", source="SenseVoiceSmall", segments=segments,
                                            workspace=ws.snapshot()))
 
@@ -377,13 +383,13 @@ class EpisodeController(RealtimeController):
             updater(ws.turn_id, text, details={"audio_cues": segments, "analysis": dict(ws.analysis)})
         if self.episode.closed or self.episode.episode_id is None:
             return
-        if self.conversation.current_turn_id != ws.turn_id:
-            # Keep the late evidence in the ledger, but never wake a newer
-            # user turn with an old refinement.
-            return
+        # A late refinement remains an ordinary scheduler event even when a
+        # newer capture turn is already active.  It is attached to its own
+        # sentence/turn record; no semantic-version check may discard it.
         await self.episode.observe("USER_INPUT_REFINED", turn_id=ws.turn_id, text=text,
                                     audio_cues=segments, analysis=dict(ws.analysis),
-                                    input_finished_at=ws.timings.get("commit"), epoch=ws.epoch)
+                                    input_finished_at=ws.timings.get("commit"), output_generation=ws.generation,
+                                    sentences=list(ws.segments))
         ws.episode_id = self.episode.episode_id
         if ws.episode_id:
             self.episode_history[ws.turn_id] = ws.episode_id
@@ -489,6 +495,8 @@ class EpisodeController(RealtimeController):
         self.workspace = None
         self.turns.invalidate()
         self._active_input = False
+        if reason != "completed":
+            self.episode.cancel_active_request(reason)
         stopped = self._stop_generation()
         if stopped:
             await asyncio.gather(*stopped, return_exceptions=True)
@@ -503,7 +511,7 @@ class EpisodeController(RealtimeController):
         self._speech_samples = 0
         self._speech_start_sample = self._speech_end_sample = None
         self._vad_origin = None
-        self._vad_epoch += 1
+        self._vad_generation += 1
         self._reset_vad_pending = True
 
     def _on_playback_started(self, key):
@@ -511,7 +519,7 @@ class EpisodeController(RealtimeController):
 
     async def _handle_asr_disconnect(self):
         await self.episode.speech_activity(None)
-        self.output.invalidate("input_unavailable")
+        self.output.cancel_all("input_unavailable")
         await super()._handle_asr_disconnect()
 
     async def _error(self, code, message, *, recoverable, turn_id=None):
