@@ -12,7 +12,16 @@ from voice_terminal.providers.deepseek import DeepSeekClient
 from voice_terminal.providers.deepseek import DeepSeekError
 from voice_terminal.providers.deepseek import DeepSeekResponseTerminalError
 from voice_terminal.session.ledger import SessionLedger
+from voice_terminal.session.context_frames import ContextFrame, ContextLane
 from voice_terminal.session.runtime import ConversationRuntime
+
+
+def history(role: str, content: str) -> dict[str, str]:
+    return ContextFrame.make(ContextLane.HISTORY, role, content)
+
+
+def static(content: str) -> dict[str, str]:
+    return ContextFrame.make(ContextLane.STATIC_INSTRUCTIONS, "system", content)
 
 
 def test_decision_schema_keeps_wire_shape_and_reserves_thinking_action():
@@ -56,7 +65,7 @@ def test_responses_payload_separates_instructions_and_enables_strict_schema():
     )
     schema = decision_schema([], allow_thinking=False)
     payload = client._responses_payload(
-        [{"role": "system", "content": "rules"}, {"role": "user", "content": "hello"}],
+        [static("rules"), history("user", "hello")],
         model=client.model, schema=schema, schema_name="voice_decision_v06",
         reasoning_effort="none", max_output_tokens=512,
     )
@@ -101,7 +110,7 @@ def test_responses_stream_normalizes_content_usage_and_terminal():
         )
         client._client = Http()
         events = [item async for item in client.stream_events(
-            [{"role": "user", "content": "hello"}], schema=decision_schema([]),
+            [history("user", "hello")], schema=decision_schema([]),
         )]
         assert [item["type"] for item in events] == ["content", "content", "usage", "finish"]
         assert events[-2]["usage"]["prompt_tokens"] == 12
@@ -136,7 +145,7 @@ def test_responses_failed_terminal_never_yields_finish():
         client._client = Http()
         try:
             _ = [item async for item in client.stream_events(
-                [{"role": "user", "content": "hello"}], schema=decision_schema([]),
+                [history("user", "hello")], schema=decision_schema([]),
             )]
         except DeepSeekError as exc:
             assert "response.failed" in str(exc)
@@ -176,7 +185,7 @@ def test_responses_done_text_repairs_missing_delta_suffix_before_finish():
         )
         client._client = Http()
         events = [item async for item in client.stream_events(
-            [{"role": "user", "content": "hello"}], schema=decision_schema([]),
+            [history("user", "hello")], schema=decision_schema([]),
         )]
         assert "".join(item["text"] for item in events if item["type"] == "content") == full
         assert events[-1] == {"type": "finish", "reason": "completed"}
@@ -211,7 +220,7 @@ def test_responses_incomplete_preserves_machine_readable_reason():
         client._client = Http()
         try:
             _ = [item async for item in client.stream_events(
-                [{"role": "user", "content": "hello"}], schema=decision_schema([]),
+                [history("user", "hello")], schema=decision_schema([]),
             )]
         except DeepSeekResponseTerminalError as exc:
             assert exc.terminal_kind == "response.incomplete"
@@ -394,7 +403,7 @@ def test_shadow_chain_validates_without_touching_output_or_ledger():
 
         runtime = _runtime(Provider())
         before = list(runtime.ledger.records)
-        await runtime._run_shadow_chain(({"role": "user", "content": "hello"},), "turn-a")
+        await runtime._run_shadow_chain((history("user", "hello"),), "turn-a")
         assert list(runtime.ledger.records) == before
         assert runtime.output.status == "IDLE"
         assert runtime.shadow_results[-1]["valid"] is True

@@ -26,4 +26,6 @@ npm run dev
 
 真实耳机/扬声器、自然语音统计与第三方服务稳定性仍是独立发布门槛，不能由 fake provider 或内存播放器代替。
 
-详见：[架构与组件契约](docs/architecture.md)、[WebSocket V0.6 协议](docs/websocket-protocol.md)、[上下文与工具规范](docs/context-and-tools.md)、[V0.6 可靠性审计](docs/v06-reliability-audit.md)、[运行与质量门槛](docs/operations-and-quality.md)。
+上下文字段的准入、缓存命中诊断与官方 DeepSeek 验收说明见[LLM 上下文缓存契约](docs/llm-context-cache-contract.md)；Web UI 会显示 provider 输入与缓存命中指标。
+
+详见：[架构与组件契约](docs/architecture.md)、[WebSocket V0.6 协议](docs/websocket-protocol.md)、[上下文与工具规范](docs/context-and-tools.md)、[LLM 上下文缓存契约](docs/llm-context-cache-contract.md)、[V0.6 可靠性审计](docs/v06-reliability-audit.md)、[运行与质量门槛](docs/operations-and-quality.md)。

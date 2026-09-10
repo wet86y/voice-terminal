@@ -182,6 +182,10 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
         <span>请求 JSON {{ formatCount(terminal.agentEpisode.context_chars) }} 字符</span>
         <span>估算 {{ formatCount(terminal.agentEpisode.context_token_estimate) }} / {{ formatCount(terminal.agentEpisode.context_limit_tokens) }} token · {{ terminal.agentEpisode.context_usage_percent == null ? '—' : `${terminal.agentEpisode.context_usage_percent.toFixed(1)}%` }}</span>
         <span>最近 provider prompt {{ terminal.agentEpisode.provider_prompt_tokens == null ? '未提供' : `${formatCount(terminal.agentEpisode.provider_prompt_tokens)} token` }}</span>
+        <span>Provider 输入 {{ terminal.agentEpisode.provider_input_tokens == null ? '未提供' : `${formatCount(terminal.agentEpisode.provider_input_tokens)} token` }}</span>
+        <span>缓存命中 {{ terminal.agentEpisode.provider_cached_tokens == null ? '未提供' : `${formatCount(terminal.agentEpisode.provider_cached_tokens)} token` }}</span>
+        <span>缓存未命中 {{ terminal.agentEpisode.provider_cache_miss_tokens == null ? '未提供' : `${formatCount(terminal.agentEpisode.provider_cache_miss_tokens)} token` }}</span>
+        <span>缓存命中率 {{ terminal.agentEpisode.provider_cache_hit_ratio == null ? '未提供' : `${(terminal.agentEpisode.provider_cache_hit_ratio * 100).toFixed(1)}%` }}</span>
       </div>
       <p v-if="terminal.speechProgress">语音输出：{{ terminal.speechProgress.waiting_text || terminal.speechProgress.event }}</p>
       <p v-if="terminal.agentEpisode.context_compacted" class="agent-limit" role="status">

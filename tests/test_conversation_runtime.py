@@ -2,6 +2,7 @@ from voice_terminal.session.context import CurrentInput, LLMContextProjector
 from voice_terminal.session.contracts import ToolExchange
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
+from voice_terminal.session.context_frames import ContextLane
 
 
 def test_explicit_scope_changes_only_on_turn_or_cancel_and_reset_changes_conversation() -> None:
@@ -53,6 +54,6 @@ def test_context_projection_keeps_identical_text_for_a_new_turn() -> None:
         text="重复文本", primary_transcript="重复文本", finalized=True, turn_id="turn_b",
     ))
     assert [message for message in messages if message.get("role") == "user"] == [
-        {"role": "user", "content": "重复文本"},
-        {"role": "user", "content": "重复文本"},
+        {"role": "user", "content": "重复文本", "context_lane": ContextLane.HISTORY},
+        {"role": "user", "content": "重复文本", "context_lane": ContextLane.REQUEST_TAIL},
     ]

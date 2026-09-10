@@ -22,6 +22,12 @@ git diff --check
 停止/重置、真实 ASR/Analysis/LLM/TTS 链路，以及结束至实际首音的 p50/p95。
 内存播放器结果不能替代这些证据。
 
+## LLM 上下文缓存质量门槛
+
+新增任何模型字段前，必须先完成[缓存契约的字段准入表](llm-context-cache-contract.md#标准字段准入表)，明确语义 owner、lane、持久化、schema 与 UI 影响。涉及 provider payload、上下文、schema 或动作目录的改动必须运行缓存 placement/digest 单测和完整 Python 回归。
+
+官方 DeepSeek 直连验收要连续记录多轮 `input_tokens`、`cached_tokens` 与 hit ratio，确认命中会随 append-only 历史增长；中转端点的结果单独记录。若端点未报告 cache usage，状态为不可观测，不得写成或口头解释为“零命中”。
+
 ## 语音运行排障
 
 当用户报告“播放后监听退出”或 `audio capture gap` 时，先按以下顺序判断，

@@ -90,6 +90,35 @@ def test_minor_emotion_repair_is_declared_on_the_next_llm_poll():
     assert not runtime.minor_protocol_feedback
 
 
+def test_model_context_keeps_speech_semantics_but_drops_scheduler_diagnostics():
+    class Registry:
+        def begin_turn(self, _): pass
+        def action_definitions(self): return []
+
+    async def emit(*_): pass
+
+    output = SimpleNamespace(speak_snapshot={
+        "queue_status": "speaking", "text_only_queue": True,
+        "text": "已经播出的开头", "speech_id": "local_speech_id",
+        "output_generation": 7, "emotion": "calm",
+        "delivery": {"heard_text": "已经播出"},
+    })
+    runtime = AgentEpisodeRuntime(None, Registry(), output, emit,
+                                  conversation=ConversationRuntime(), ledger=SessionLedger())
+    runtime.last_turn_id = "turn_a"
+    runtime.inputs["turn_a"] = {"text": "继续说", "final": False, "sentences": [{"sentence_id": 1}]}
+    runtime.event_inbox.append({"event_id": "internal_uuid", "occurred_at": 1})
+
+    messages = runtime.messages({"USER_SEGMENT_UPDATED"})
+    rendered = "\n".join(message["content"] for message in messages)
+    assert "当前轮运行状态" in rendered
+    assert "已经播出的开头" in rendered and "已经播出" in rendered
+    assert "local_speech_id" not in rendered
+    assert "output_generation" not in rendered
+    assert "internal_uuid" not in rendered
+    assert "input_waiting_ms" not in rendered
+
+
 def test_sentence_ids_stay_stable_and_unmapped_refinement_is_retained():
     store = SentenceStore(min_chars=2, max_chars=20)
     first = store.feed("你好，世界。", now=1)

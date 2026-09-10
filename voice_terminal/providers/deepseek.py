@@ -5,6 +5,8 @@ import logging
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
+from ..session.context_frames import ContextFrame, ContextLane
+
 logger = logging.getLogger(__name__)
 
 
@@ -131,7 +133,10 @@ class DeepSeekClient:
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [dict(message) for message in messages],
+            "messages": [
+                {"role": str(message.get("role") or "user"), "content": str(message.get("content") or "")}
+                for message in messages
+            ],
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -143,6 +148,28 @@ class DeepSeekClient:
         return payload
 
     @staticmethod
+    def _normalize_usage(usage: Mapping[str, Any]) -> dict[str, Any]:
+        """Normalize official Responses and legacy relay cache accounting."""
+
+        normalized = dict(usage)
+        if isinstance(usage.get("input_tokens"), int):
+            normalized["prompt_tokens"] = usage["input_tokens"]
+        if isinstance(usage.get("output_tokens"), int):
+            normalized["completion_tokens"] = usage["output_tokens"]
+        details = usage.get("input_tokens_details")
+        cached = details.get("cached_tokens") if isinstance(details, Mapping) else None
+        if not isinstance(cached, int):
+            cached = usage.get("prompt_cache_hit_tokens")
+        if isinstance(cached, int):
+            normalized["cached_tokens"] = cached
+        missed = usage.get("prompt_cache_miss_tokens")
+        if isinstance(missed, int):
+            normalized["cache_miss_tokens"] = missed
+        elif isinstance(normalized.get("prompt_tokens"), int) and isinstance(cached, int):
+            normalized["cache_miss_tokens"] = max(0, normalized["prompt_tokens"] - cached)
+        return normalized
+
+    @staticmethod
     def _responses_payload(
         messages: Sequence[Mapping[str, str]], *, model: str, schema: Mapping[str, Any],
         schema_name: str, reasoning_effort: str, max_output_tokens: int,
@@ -152,11 +179,16 @@ class DeepSeekClient:
         for message in messages:
             role = str(message.get("role") or "user")
             content = str(message.get("content") or "")
-            if role == "system":
+            lane = ContextFrame.lane_of(dict(message))
+            if lane == ContextLane.STATIC_INSTRUCTIONS:
+                if role != "system":
+                    raise ValueError("static instructions must use the system role")
                 instructions.append(content)
                 continue
+            if lane not in {ContextLane.HISTORY, ContextLane.REQUEST_TAIL}:
+                raise ValueError("unsupported model context lane")
             input_items.append({
-                "role": "assistant" if role == "assistant" else "user",
+                "role": role,
                 "content": [{"type": "input_text", "text": content}],
             })
         compatibility = (
@@ -258,7 +290,7 @@ class DeepSeekClient:
                             continue
                         usage = parsed.get("usage") if isinstance(parsed, dict) else None
                         if isinstance(usage, dict):
-                            yield {"type": "usage", "usage": usage}
+                            yield {"type": "usage", "usage": self._normalize_usage(usage)}
                         choices = parsed.get("choices") if isinstance(parsed, dict) else None
                         if not isinstance(choices, list) or not choices:
                             continue
@@ -394,12 +426,7 @@ class DeepSeekClient:
                                 )
                         usage = result.get("usage") if isinstance(result, dict) else None
                         if isinstance(usage, dict):
-                            normalized = dict(usage)
-                            if isinstance(usage.get("input_tokens"), int):
-                                normalized["prompt_tokens"] = usage["input_tokens"]
-                            if isinstance(usage.get("output_tokens"), int):
-                                normalized["completion_tokens"] = usage["output_tokens"]
-                            yield {"type": "usage", "usage": normalized}
+                            yield {"type": "usage", "usage": self._normalize_usage(usage)}
                         terminal = True
                         yield {"type": "finish", "reason": "completed"}
                         return

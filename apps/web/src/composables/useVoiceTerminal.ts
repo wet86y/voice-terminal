@@ -201,6 +201,15 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       || (value.context_token_estimate !== undefined && !isNonNegativeInteger(value.context_token_estimate))
       || (value.provider_prompt_tokens !== undefined && value.provider_prompt_tokens !== null
         && !isNonNegativeInteger(value.provider_prompt_tokens))
+      || (value.provider_input_tokens !== undefined && value.provider_input_tokens !== null
+        && !isNonNegativeInteger(value.provider_input_tokens))
+      || (value.provider_cached_tokens !== undefined && value.provider_cached_tokens !== null
+        && !isNonNegativeInteger(value.provider_cached_tokens))
+      || (value.provider_cache_miss_tokens !== undefined && value.provider_cache_miss_tokens !== null
+        && !isNonNegativeInteger(value.provider_cache_miss_tokens))
+      || (value.provider_cache_hit_ratio !== undefined && value.provider_cache_hit_ratio !== null
+        && (typeof value.provider_cache_hit_ratio !== 'number' || !Number.isFinite(value.provider_cache_hit_ratio)
+          || value.provider_cache_hit_ratio < 0 || value.provider_cache_hit_ratio > 1))
       || (value.context_usage_percent !== undefined
         && (typeof value.context_usage_percent !== 'number' || !Number.isFinite(value.context_usage_percent)
           || value.context_usage_percent < 0))) return

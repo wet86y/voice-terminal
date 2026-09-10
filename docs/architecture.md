@@ -24,11 +24,11 @@ DeepSeek 的 `deepseek-flash`，读取 `DEEPSEEK_API_KEY`；调试 OpenCode Go �
 
 | 组件 | 输入 | 输出 | 唯一职责 |
 | --- | --- | --- | --- |
-| Conversation runtime | 生命周期事件 | `conversation_id`、`turn_id`、取消作用域 | 生命周期与显式取消 authority |
+| Conversation runtime | 生命周期事件 | `conversation_id`、`turn_id`、取消作用域、日期 epoch | 生命周期、显式取消 authority 与稳定日期基准 |
 | Input pipeline | PCM、VAD、ASR、分析结果 | `TurnWorkspace` | 维护当前轮次、阶段、Paraformer 主文本与 SenseVoice 补充证据 |
-| Session ledger | 最终输入、传达报告、选中的工具交换 | 实际模型 messages、历史投影 | 唯一上下文事实源 |
-| LLM provider boundary | 同一份语义 messages、运行时 action schema | 统一 `content/reasoning/usage/finish` 事件 | Responses 投影、strict Schema、终止状态归一化；保留冻结 Chat 回退 adapter |
-| Agent runtime | 账本投影、句子流、环境事件 | V0.6 JSON `speak` 决策 | 400ms 单飞调度、信封校验与异常恢复 |
+| Session ledger | 最终输入、传达报告、选中的工具交换 | append-only 可缓存 HISTORY | 唯一持久上下文事实源 |
+| LLM provider boundary | 带 `ContextLane` 的 frames、冻结 schema | 统一 `content/reasoning/usage/finish` 事件 | 缓存稳定投影、lane 校验、usage cache 指标归一化、strict Schema；保留冻结 Chat 回退 adapter |
+| Agent runtime | 账本投影、当前运行态 | V0.6 JSON `speak` 决策 | 400ms 单飞调度、构建 request tail、不改写历史、信封校验与异常恢复 |
 | Action runtime | 本地 `actions` 请求 | `ToolExchange` | 只读执行、缓存与来源标记 |
 | Speech runtime | 文本 speak 队列、TTS、播放器 | `SpeechItem`、`DeliveryReport` | `empty/queued/suspended/speaking`、严格前缀追加、实质分歧抢占、取消与传达结算 |
 | Protocol projection | 内部事件 | V0.6 Envelope | 唯一网络协议边界 |

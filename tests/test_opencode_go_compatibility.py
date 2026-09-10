@@ -7,6 +7,7 @@ from voice_terminal.agent.decision_envelope import SpeechDecisionEnvelopeStream
 from voice_terminal.agent.decision_schema import decision_schema
 from voice_terminal.config import AppConfig, LlmConfig
 from voice_terminal.providers.deepseek import DeepSeekClient
+from voice_terminal.session.context_frames import ContextFrame, ContextLane
 from voice_terminal.server.websocket import SessionRuntime
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
@@ -72,7 +73,7 @@ def test_opencode_go_headers_are_session_bound_and_do_not_change_payload_protoco
     assert headers["x-opencode-session"] == "conversation_a"
     assert headers["Accept"] == "text/event-stream"
     assert client._responses_payload(
-        [{"role": "user", "content": "hello"}],
+        [ContextFrame.make(ContextLane.HISTORY, "user", "hello")],
         model=client.model,
         schema=decision_schema([]),
         schema_name="voice_decision_v06",
@@ -133,7 +134,7 @@ def test_opencode_go_responses_sse_maps_to_existing_decision_envelope():
         )
         client._client = Http()
         events = [item async for item in client.stream_events(
-            [{"role": "user", "content": "hello"}],
+            [ContextFrame.make(ContextLane.HISTORY, "user", "hello")],
             schema=decision_schema([]),
         )]
 

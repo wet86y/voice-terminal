@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import logging
 
 from .contracts import new_id
@@ -24,6 +25,42 @@ class ConversationRuntime:
         self.conversation_id = new_id("conversation")
         self.current_turn_id: str | None = None
         self._scope_id = new_id("scope")
+        self._calendar_baseline = self._calendar_text()
+        self._calendar_baseline_day = self._calendar_date()
+        self._calendar_day = self._calendar_baseline_day
+
+    @staticmethod
+    def _now():
+        return datetime.now().astimezone()
+
+    @classmethod
+    def _calendar_date(cls) -> str:
+        return cls._now().strftime("%Y-%m-%d")
+
+    @classmethod
+    def _calendar_text(cls) -> str:
+        now = cls._now()
+        weekdays = "一二三四五六日"
+        offset = now.strftime("%z")
+        offset = f"UTC{offset[:3]}:{offset[3:]}" if len(offset) == 5 else "本地时区"
+        return f"会话日期基准：{now:%Y-%m-%d}，星期{weekdays[now.weekday()]}，{offset}。"
+
+    @property
+    def calendar_baseline(self) -> str:
+        return self._calendar_baseline
+
+    def calendar_epoch_if_changed(self) -> str | None:
+        """Return a tail-only date correction after local midnight."""
+
+        day = self._calendar_date()
+        # The epoch is a current-request fact, not a one-shot event.  Once a
+        # session crosses midnight every later request must still be able to
+        # interpret its stable, original date baseline correctly.
+        if day != self._calendar_day:
+            self._calendar_day = day
+        if day == self._calendar_baseline_day:
+            return None
+        return self._calendar_text().replace("会话日期基准", "当前日期 epoch")
 
     @property
     def scope_id(self) -> str:
@@ -49,3 +86,6 @@ class ConversationRuntime:
         self._scope_id = new_id("scope")
         self.conversation_id = new_id("conversation")
         self.current_turn_id = None
+        self._calendar_baseline = self._calendar_text()
+        self._calendar_baseline_day = self._calendar_date()
+        self._calendar_day = self._calendar_baseline_day

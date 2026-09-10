@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
+import json
 from typing import Any
 
 from .ledger import SessionLedger
+from .context_frames import ContextFrame, ContextLane
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,48 @@ class CurrentInput:
 class LLMContextProjector:
     """Expose semantic facts only; runtime IDs and playback state never cross."""
 
+    @staticmethod
+    def current_session_time() -> str:
+        """Render wall-clock time as a conversational fact, never an epoch value.
+
+        The Agent needs a human-interpretable time for requests such as
+        "今天几点" or "明天", whereas request timing, scheduler timestamps and
+        provider latency are operational data.  Keep those two concerns apart.
+        ``astimezone`` deliberately uses the host's configured local zone: the
+        voice terminal and its user therefore share the same calendar day.
+        """
+
+        now = datetime.now().astimezone()
+        weekdays = "一二三四五六日"
+        offset = now.strftime("%z")
+        offset = f"UTC{offset[:3]}:{offset[3:]}" if len(offset) == 5 else "本地时区"
+        zone = now.tzname() or "本地时区"
+        return (
+            f"当前会话时间：{now:%Y年%m月%d日 %H:%M:%S}，"
+            f"星期{weekdays[now.weekday()]}，{zone}（{offset}）。"
+        )
+
+    @staticmethod
+    def runtime_tail(*, current: CurrentInput, speak_state: dict[str, Any], calendar_epoch: str | None = None) -> str:
+        """Create the only volatile model context block for one request."""
+
+        now = datetime.now().astimezone()
+        payload: dict[str, Any] = {
+            "runtime": {
+                "clock": {"local_time": now.strftime("%H:%M:%S"), "precision": "second"},
+                "speak": speak_state,
+            }
+        }
+        if calendar_epoch:
+            payload["runtime"]["calendar_epoch"] = calendar_epoch
+        if current.finalized:
+            payload["runtime"]["input_status"] = "finalized"
+        elif current.user_speaking is True:
+            payload["runtime"]["input_status"] = "speaking"
+        if current.refinement_available and current.refined_transcript.strip():
+            payload["runtime"]["refinement"] = current.refined_transcript.strip()
+        return "当前轮运行状态：" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
     def project(self, ledger: SessionLedger, current: CurrentInput) -> list[dict[str, Any]]:
         primary = (current.primary_transcript or current.text or "").strip()
         refined = (current.refined_transcript or "").strip()
@@ -39,18 +84,7 @@ class LLMContextProjector:
         # second time here.  Identity is required: text de-duplication would
         # incorrectly erase a user who repeats an earlier utterance.
         if primary and not committed:
-            messages.append({"role": "user", "content": primary})
-        facts: list[str] = []
-        if current.finalized:
-            facts.append("当前用户输入已经最终确认。")
-        elif current.user_speaking is True:
-            facts.append("用户当前仍在讲话；可在 V0.6 信封中使用 speak(text) 建立文本候选，但系统只会在本地确认用户结束讲话后才启动 TTS。")
-        durable_refinement = ledger.input_refinement(current.turn_id) if committed else ""
-        if current.refinement_available and refined and durable_refinement != refined:
-            facts.append("SenseVoice 已返回补充精修文本：" + refined)
-            facts.append("精修文本是补充证据，不是开始首轮回答的前置条件；如已播放内容确实与精修语义冲突，可用 speak(text) 请求受控替换。")
-        if current.recent_events:
-            facts.append("最近语义事件：" + "、".join(current.recent_events))
-        if facts:
-            messages.append({"role": "system", "content": "\n".join(facts)})
+            # An uncommitted ASR candidate is current-request material. Once
+            # finalized it enters the ledger and becomes an append-only frame.
+            messages.append(ContextFrame.make(ContextLane.REQUEST_TAIL, "user", primary))
         return messages

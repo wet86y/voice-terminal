@@ -195,6 +195,10 @@ export interface LlmContextPayload {
   context_limit_tokens?: number
   context_token_estimate?: number
   provider_prompt_tokens?: number | null
+  provider_input_tokens?: number | null
+  provider_cached_tokens?: number | null
+  provider_cache_miss_tokens?: number | null
+  provider_cache_hit_ratio?: number | null
   context_usage_percent?: number
   conversation_id?: string
   request_id?: string
@@ -331,6 +335,13 @@ export interface AgentEpisodeSnapshot {
   context_limit_tokens?: number
   context_token_estimate?: number
   provider_prompt_tokens?: number | null
+  provider_input_tokens?: number | null
+  provider_cached_tokens?: number | null
+  provider_cache_miss_tokens?: number | null
+  provider_cache_hit_ratio?: number | null
+  static_context_digest?: string | null
+  history_context_digest?: string | null
+  schema_digest?: string | null
   context_usage_percent?: number
   agent_busy: boolean
   user_speaking: boolean | null
