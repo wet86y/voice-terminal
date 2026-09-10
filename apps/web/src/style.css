@@ -44,6 +44,10 @@ button:disabled {
   cursor: not-allowed;
 }
 
+.reasoning-mode { display: grid; gap: 3px; color: var(--muted); font-size: 11px; }
+.reasoning-mode select { border: 1px solid var(--line); border-radius: 6px; background: var(--paper); padding: 5px 8px; color: var(--ink); }
+.reasoning-mode small { font-size: 9px; }
+
 .app-shell {
   width: min(1480px, calc(100% - 56px));
   margin: 0 auto;

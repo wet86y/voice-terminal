@@ -19,6 +19,7 @@ import type {
   TtsStatusPayload,
   TurnCompletedPayload,
   InputRecord,
+  ReasoningMode,
 } from '../types'
 import { TERMINAL_STATES } from '../types'
 
@@ -175,6 +176,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const state = ref<TerminalState>('STARTING')
   const listening = ref(false)
   const canStart = ref(false)
+  const reasoningMode = ref<ReasoningMode>('balanced')
   const currentTurnId = ref<string | null>(null)
   const current = reactive<CurrentTurnSnapshot>(createEmptyCurrentTurn())
   const currentLatency = reactive<LatencyValues>(createEmptyLatency())
@@ -408,6 +410,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (isTerminalState(payload.state)) state.value = payload.state
     if (typeof payload.listening === 'boolean') listening.value = payload.listening
     if (typeof payload.can_start === 'boolean') canStart.value = payload.can_start
+    if (payload.reasoning_mode === 'fast' || payload.reasoning_mode === 'balanced' || payload.reasoning_mode === 'deep') reasoningMode.value = payload.reasoning_mode
     applyServices(payload.services)
     const hasCurrentTurnId = isRecord(payload.current)
       && Object.prototype.hasOwnProperty.call(payload.current, 'turn_id')
@@ -707,6 +710,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     return sendCommand('session.reset')
   }
 
+  function setReasoningMode(mode: ReasoningMode) {
+    reasoningMode.value = mode
+    return sendCommand('session.reasoning_mode', { mode })
+  }
+
   function dispose() {
     const activeSocket = socket.value
     socket.value = null
@@ -725,6 +733,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     state,
     listening,
     canStart,
+    reasoningMode,
     currentTurnId,
     current,
     currentLatency,
@@ -746,6 +755,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     connect,
     toggleListening,
     resetSession,
+    setReasoningMode,
     dispose,
   }
 }

@@ -103,6 +103,7 @@ class LlmConfig:
     model: str = "deepseek-flash"
     api_key_env: str = "DEEPSEEK_API_KEY"
     stream: bool = True
+    reasoning_mode: str = "balanced"
     thinking: str = "enabled"
     reasoning_effort: str = "low"
     timeout_ms: int = 15000
@@ -122,6 +123,8 @@ class LlmConfig:
             raise ValueError("llm.transport must be chat_completions or responses")
         if self.thinking not in {"disabled", "enabled"}:
             raise ValueError("llm.thinking must be disabled or enabled")
+        if self.reasoning_mode not in {"fast", "balanced", "deep"}:
+            raise ValueError("llm.reasoning_mode must be fast, balanced, or deep")
         if self.reasoning_effort not in {"low", "high", "max"}:
             raise ValueError("llm.reasoning_effort must be low, high, or max")
         if self.max_output_tokens <= 0 or self.timeout_ms <= 0:
@@ -396,6 +399,7 @@ class AppConfig:
                 model=llm_model,
                 api_key_env=llm_api_key_env,
                 stream=_bool(llm.get("stream"), True),
+                reasoning_mode=_string(llm.get("reasoning_mode"), "balanced"),
                 thinking=_string(llm.get("thinking"), "enabled"),
                 reasoning_effort=_string(llm.get("reasoning_effort"), "low"),
                 timeout_ms=int(_number(llm.get("timeout_ms"), 15000)),

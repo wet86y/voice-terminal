@@ -8,4 +8,10 @@
 
 允许按意图调用受限目录文件工具与联网搜索。工具完成结果统一作为事件进入下一次 400ms 普通调度；新输入、精修和工具晚到不会让在飞请求失效。只有停止监听、会话重置等显式取消才会清理工具任务。
 
-action definitions、由其构建的 strict schema、`request_thinking` 可见性和动作目录在 Agent episode 开始时冻结。工具中途不可用不会修改 schema/catalog，而是作为 `REQUEST_TAIL` 的 availability；本地权限、参数和错误恢复仍是最终权威。`request_thinking` 是预留的本地控制 action，不是业务工具，不产生 `ToolExchange`。
+action definitions、由其构建的 strict schema、`request_thinking` 可见性和动作目录在 Agent episode 开始时冻结。工具中途不可用不会修改 schema/catalog，而是作为 `REQUEST_TAIL` 的 availability；本地权限、参数和错误恢复仍是最终权威。`request_thinking` 是本地控制 action，不是业务工具，不产生 `ToolExchange`。
+
+## 思考模式与工具等待
+
+会话模式为 `fast`、`balanced`、`deep`，默认 `balanced`。快速模式不暴露思考 action，基础请求为 `effort=none`；深度模式基础请求为 `effort=low`，同样不暴露 action。仅均衡模式向严格 schema 暴露 `request_thinking`，其唯一合法形状为 `{"name":"request_thinking","arguments":{"request":true}}`。`request` 是 schema 兼容的固定确认字段，不是模型可选择的 provider 参数；本地固定将它解释为一次 `effort=low` 的续请求。
+
+请求思考必须同时维护非空 `speak` 转换。没有业务工具时，系统立即安排 low 续请求；有业务工具时，先启动工具并最多等待 2 秒。工具提前完成可释放续请求；2 秒届满后工具仍在后台运行，续请求仅获得 pending 状态而不得把未返回资料当成事实。工具完成或最终超时只发布 `TOOL_COMPLETED`，随后进入既有 400ms 普通调度队列。用户开口、停止监听或 session reset 优先于 thinking wait，并立即使等待及其待发续请求失效。

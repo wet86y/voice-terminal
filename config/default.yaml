@@ -73,6 +73,7 @@ llm:
   # Active test lane. The frozen chat_completions adapter remains available
   # only as an explicit rollback and is not called during normal operation.
   transport: responses
+  reasoning_mode: balanced
   thinking: enabled
   reasoning_effort: low
   timeout_ms: 15000

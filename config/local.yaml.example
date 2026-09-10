@@ -30,6 +30,7 @@ llm:
   # $env:VOICE_LLM_PROVIDER = "opencode_go"
   # Active test transport. chat_completions is the hidden rollback value.
   transport: responses
+  reasoning_mode: balanced
   # Keep disabled during the pure protocol migration baseline.
   thinking: disabled
   shadow_enabled: false

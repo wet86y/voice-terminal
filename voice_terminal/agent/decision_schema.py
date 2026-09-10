@@ -48,7 +48,9 @@ def decision_schema(action_definitions: Iterable[dict[str, Any]], *, allow_think
         raise ValueError(f"{THINKING_ACTION} is reserved for the local Agent control plane")
     if allow_thinking:
         names.append(THINKING_ACTION)
-        argument_properties["effort"] = {"type": "string"}
+        # Strict Responses implementations reject an empty object.  This is a
+        # local control-plane acknowledgement, not a provider effort choice.
+        argument_properties["request"] = {"type": "boolean"}
 
     # JSON Schema requires a non-empty enum.  With no actions available, an
     # impossible sentinel plus maxItems=0 keeps the public envelope stable.
@@ -63,6 +65,8 @@ def decision_schema(action_definitions: Iterable[dict[str, Any]], *, allow_think
                 "type": "object",
                 "additionalProperties": False,
                 "properties": argument_properties,
+                # Responses providers require required to match properties.
+                # Irrelevant merged fields are normalized away locally.
                 "required": list(argument_properties),
             },
         },

@@ -161,6 +161,7 @@ export interface RuntimeSnapshotPayload {
   state: TerminalState
   listening: boolean
   can_start: boolean
+  reasoning_mode?: ReasoningMode
   services: ServiceStatuses
   current: CurrentTurnSnapshot
   latency?: {
@@ -247,7 +248,8 @@ export type ServerMessageType =
   | 'speech.queued' | 'speech.started' | 'speech.delta' | 'speech.progress' | 'speech.completed'
   | 'error'
 
-export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset'
+export type ReasoningMode = 'fast' | 'balanced' | 'deep'
+export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset' | 'session.reasoning_mode'
 
 export interface MessageEnvelope<TType extends string = string, TPayload = unknown> {
   type: TType

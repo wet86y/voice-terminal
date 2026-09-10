@@ -158,6 +158,16 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
       </div>
 
       <div class="top-actions">
+        <label class="reasoning-mode">
+          <span>思考模式</span>
+          <select :value="terminal.reasoningMode" :disabled="terminal.connection !== 'connected'"
+            @change="terminal.setReasoningMode(($event.target as HTMLSelectElement).value as 'fast' | 'balanced' | 'deep')">
+            <option value="fast">快速</option>
+            <option value="balanced">均衡</option>
+            <option value="deep">深度</option>
+          </select>
+          <small>下一次输入生效</small>
+        </label>
         <button class="reset-button" type="button" :disabled="terminal.connection !== 'connected'" @click="terminal.resetSession()">
           重置会话
         </button>

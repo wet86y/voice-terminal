@@ -30,11 +30,20 @@ class EpisodeController(RealtimeController):
         self._settled_turns: set[str] = set()
 
     def _make_episode(self):
+        mode = getattr(self, "reasoning_mode", "balanced")
         runtime = AgentEpisodeRuntime(self.llm, self.registry, self.output, self._agent_event,
                                       conversation=self.conversation, ledger=self.history,
-                                      options=self.agent_options, tools_enabled=self.options.tools)
+                                      options=self.agent_options, tools_enabled=self.options.tools,
+                                      reasoning_mode=mode)
         self.output.runtime = runtime
         return runtime
+
+    def set_reasoning_mode(self, mode: str) -> None:
+        self.reasoning_mode = mode
+        # Before the first user input there is no frozen schema yet, so make
+        # the staged selection effective immediately without touching work.
+        if self.episode.episode_id is None and not self.episode.closed:
+            self.episode = self._make_episode()
 
     async def _agent_event(self, kind, payload):
         # Only an authoritative Episode snapshot may replace the compact

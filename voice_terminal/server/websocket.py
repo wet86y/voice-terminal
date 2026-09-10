@@ -57,6 +57,7 @@ class SessionRuntime:
         self.conversation = ConversationRuntime()
         self._session_lock = asyncio.Lock()
         self.build_info: dict[str, Any] = {}
+        self.reasoning_mode = config.llm.reasoning_mode
 
     def _record_error(self, service: str, message: str, *, status_service: str | None = None) -> None:
         # Keep the public service map compatible while preserving the actual
@@ -266,12 +267,24 @@ class SessionRuntime:
             barge_in_gate=BargeInGate(min_speech_ms=max(250, self.config.vad.min_speech_ms), enabled=True),
             conversation=self.conversation,
         )
+        self.controller.set_reasoning_mode(self.reasoning_mode)
         await self.controller.initialize()
 
     def snapshot(self) -> VoiceEvent:
         value = snapshot_event(self.state)
         value.payload["recent_inputs"] = [record.to_payload() for record in self.history.records]
+        value.payload["reasoning_mode"] = self.reasoning_mode
         return value
+
+    async def set_reasoning_mode(self, mode: str) -> bool:
+        if mode not in {"fast", "balanced", "deep"}:
+            return False
+        async with self._session_lock:
+            self.reasoning_mode = mode
+            if self.controller is not None:
+                self.controller.set_reasoning_mode(mode)
+            await self.bus.publish(self.snapshot())
+        return True
 
     async def start_listening(self) -> None:
         async with self._session_lock:
@@ -291,6 +304,9 @@ class SessionRuntime:
                 await self.controller.reset_session()
             self.history.reset()
             self.conversation.reset()
+            self.reasoning_mode = getattr(getattr(self, "config", None), "llm", None).reasoning_mode if getattr(getattr(self, "config", None), "llm", None) else "balanced"
+            if self.controller is not None:
+                self.controller.set_reasoning_mode(self.reasoning_mode)
             if self.llm is not None:
                 self.llm.set_session_id(self.conversation.conversation_id)
 
@@ -368,6 +384,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
                     await runtime.stop_listening()
                 elif command == "session.reset":
                     await runtime.reset_session()
+                elif command == "session.reasoning_mode":
+                    mode = _payload.get("mode")
+                    if not isinstance(mode, str) or not await runtime.set_reasoning_mode(mode):
+                        await _send_error(websocket, sequencer, "INVALID_REASONING_MODE", "思考模式必须是 fast、balanced 或 deep。", None, True)
                 else:
                     await _send_error(websocket, sequencer, "UNKNOWN_COMMAND", f"不支持的命令：{command}", None, True)
         except WebSocketDisconnect:

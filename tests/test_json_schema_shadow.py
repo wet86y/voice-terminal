@@ -39,7 +39,7 @@ def test_decision_schema_keeps_wire_shape_and_reserves_thinking_action():
     item = schema["properties"]["actions"]["items"]
     assert item["required"] == ["name", "arguments"]
     assert item["properties"]["name"]["enum"] == ["web_search", THINKING_ACTION]
-    assert item["properties"]["arguments"]["properties"]["effort"] == {"type": "string"}
+    assert item["properties"]["arguments"]["properties"]["request"] == {"type": "boolean"}
 
 
 def test_responses_control_text_compatibility_is_explicit_not_global():
@@ -422,7 +422,7 @@ def test_thinking_and_business_actions_release_one_barrier_after_tools():
 
         async def execute(_identity, _turn_id, actions, *, wake=True):
             assert [action.name for action in actions] == ["web_search"]
-            assert wake is False
+            assert wake is True
             await released.wait()
             return True
 
@@ -431,7 +431,7 @@ def test_thinking_and_business_actions_release_one_barrier_after_tools():
         envelope = DecisionEnvelope(
             SpeechDecision("speak", "calm", "让我想一想。"),
             (
-                Action(THINKING_ACTION, {"effort": "low"}),
+                Action(THINKING_ACTION, {"request": True}),
                 Action("web_search", {"query": "current weather"}),
             ),
         )
