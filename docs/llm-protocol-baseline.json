@@ -1,0 +1,23 @@
+{
+  "baseline_commit": "0be85f9",
+  "captured_at": "2026-09-10",
+  "effective_runtime": {
+    "provider": "deepseek",
+    "model": "deepseek-v4-flash",
+    "transport": "chat_completions",
+    "response_format": "json_object",
+    "thinking": "disabled"
+  },
+  "git_blob_ids": {
+    "voice_terminal/providers/deepseek.py": "b3419caf35836dbe2889f7cd5041cde54610416c",
+    "voice_terminal/agent/episode.py": "acc7b40caee3568594c7b6f839c834cd4a1418a0",
+    "voice_terminal/agent/decision_envelope.py": "224d68952cbdba07cd261eb9c2519da076ead004",
+    "config/default.yaml": "3e9639483c36a32e6e47fdeeacd16e6dfb29c6a9"
+  },
+  "contract_test": {
+    "command": "python -m pytest -q tests/test_v06_contracts.py tests/test_conversation_runtime.py tests/test_whitespace_recovery_reproduction.py tests/test_session_ledger.py",
+    "result": "29 passed",
+    "duration_seconds": 0.59
+  },
+  "contains_secrets": false
+}

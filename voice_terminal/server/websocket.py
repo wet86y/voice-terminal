@@ -159,6 +159,13 @@ class SessionRuntime:
                 timeout_ms=self.config.llm.timeout_ms,
                 thinking=self.config.llm.thinking,
                 reasoning_effort=self.config.llm.reasoning_effort,
+                transport=self.config.llm.transport,
+                max_output_tokens=self.config.llm.max_output_tokens,
+                shadow_enabled=self.config.llm.shadow_enabled,
+                shadow_sample_rate=self.config.llm.shadow_sample_rate,
+                shadow_thinking_enabled=self.config.llm.shadow_thinking_enabled,
+                thinking_action_enabled=self.config.llm.thinking_action_enabled,
+                protocol_recovery_limit=self.config.llm.protocol_recovery_limit,
             )
             self.state.set_service("llm", "READY")
         else:

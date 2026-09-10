@@ -106,6 +106,27 @@ class LlmConfig:
     thinking: str = "enabled"
     reasoning_effort: str = "low"
     timeout_ms: int = 15000
+    transport: str = "chat_completions"
+    max_output_tokens: int = 512
+    shadow_enabled: bool = False
+    shadow_sample_rate: float = 1.0
+    shadow_thinking_enabled: bool = False
+    thinking_action_enabled: bool = False
+    protocol_recovery_limit: int = 1
+
+    def __post_init__(self) -> None:
+        if self.transport not in {"chat_completions", "responses"}:
+            raise ValueError("llm.transport must be chat_completions or responses")
+        if self.thinking not in {"disabled", "enabled"}:
+            raise ValueError("llm.thinking must be disabled or enabled")
+        if self.reasoning_effort not in {"low", "high", "max"}:
+            raise ValueError("llm.reasoning_effort must be low, high, or max")
+        if self.max_output_tokens <= 0 or self.timeout_ms <= 0:
+            raise ValueError("llm token and timeout limits must be positive")
+        if not 0 <= self.shadow_sample_rate <= 1:
+            raise ValueError("llm.shadow_sample_rate must be between zero and one")
+        if self.protocol_recovery_limit < 0:
+            raise ValueError("llm.protocol_recovery_limit cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -341,6 +362,13 @@ class AppConfig:
                 thinking=_string(llm.get("thinking"), "enabled"),
                 reasoning_effort=_string(llm.get("reasoning_effort"), "low"),
                 timeout_ms=int(_number(llm.get("timeout_ms"), 15000)),
+                transport=_string(llm.get("transport"), "chat_completions"),
+                max_output_tokens=int(_number(llm.get("max_output_tokens"), 512)),
+                shadow_enabled=_bool(llm.get("shadow_enabled"), False),
+                shadow_sample_rate=float(_number(llm.get("shadow_sample_rate"), 1.0)),
+                shadow_thinking_enabled=_bool(llm.get("shadow_thinking_enabled"), False),
+                thinking_action_enabled=_bool(llm.get("thinking_action_enabled"), False),
+                protocol_recovery_limit=max(0, int(_number(llm.get("protocol_recovery_limit"), 1))),
             ),
             tts=TtsConfig(
                 provider=_string(tts.get("provider"), "minimax"),

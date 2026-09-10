@@ -22,6 +22,13 @@ class DeepSeekClient:
         timeout_ms: int = 15000,
         thinking: str = "disabled",
         reasoning_effort: str = "low",
+        transport: str = "chat_completions",
+        max_output_tokens: int = 512,
+        shadow_enabled: bool = False,
+        shadow_sample_rate: float = 1.0,
+        shadow_thinking_enabled: bool = False,
+        thinking_action_enabled: bool = False,
+        protocol_recovery_limit: int = 1,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -31,6 +38,20 @@ class DeepSeekClient:
         if reasoning_effort not in {"low", "high", "max"}:
             raise ValueError("reasoning_effort must be low, high, or max")
         self.reasoning_effort = reasoning_effort
+        if transport not in {"chat_completions", "responses"}:
+            raise ValueError("transport must be chat_completions or responses")
+        if max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be positive")
+        if not 0 <= shadow_sample_rate <= 1:
+            raise ValueError("shadow_sample_rate must be between zero and one")
+        self.transport = transport
+        self.max_output_tokens = max_output_tokens
+        self.shadow_enabled = shadow_enabled
+        self.shadow_sample_rate = shadow_sample_rate
+        self.shadow_thinking_enabled = shadow_thinking_enabled
+        self.thinking_action_enabled = thinking_action_enabled
+        self.protocol_recovery_limit = max(0, protocol_recovery_limit)
+        self.supports_decision_schema = True
         self._client = None
 
     async def _http_client(self):
@@ -61,6 +82,8 @@ class DeepSeekClient:
     def _request_payload(
         self,
         messages: Sequence[Mapping[str, str]],
+        *,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -68,10 +91,48 @@ class DeepSeekClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        payload["thinking"] = {"type": "enabled" if self.thinking != "disabled" else "disabled"}
-        if self.thinking != "disabled":
-            payload["reasoning_effort"] = self.reasoning_effort
+        effective_effort = reasoning_effort or self.reasoning_effort
+        thinking_enabled = reasoning_effort is not None or self.thinking != "disabled"
+        payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
+        if thinking_enabled:
+            payload["reasoning_effort"] = effective_effort
         return payload
+
+    @staticmethod
+    def _responses_payload(
+        messages: Sequence[Mapping[str, str]], *, model: str, schema: Mapping[str, Any],
+        schema_name: str, reasoning_effort: str, max_output_tokens: int,
+    ) -> dict[str, Any]:
+        instructions: list[str] = []
+        input_items: list[dict[str, Any]] = []
+        for message in messages:
+            role = str(message.get("role") or "user")
+            content = str(message.get("content") or "")
+            if role == "system":
+                instructions.append(content)
+                continue
+            input_items.append({
+                "role": "assistant" if role == "assistant" else "user",
+                "content": [{"type": "input_text", "text": content}],
+            })
+        compatibility = (
+            "Provider schema compatibility: every declared property is required. "
+            "For wait/cancel set speak.text to the empty string. "
+            "For action arguments, set fields irrelevant to that action to empty/neutral values; "
+            "the local runtime will retain only that action's declared fields."
+        )
+        return {
+            "model": model,
+            "instructions": "\n\n".join([*instructions, compatibility]),
+            "input": input_items,
+            "reasoning": {"effort": reasoning_effort},
+            "text": {"format": {
+                "type": "json_schema", "name": schema_name,
+                "strict": True, "schema": dict(schema),
+            }},
+            "stream": True,
+            "max_output_tokens": max_output_tokens,
+        }
 
     async def stream_chat(self, messages, *, cancel_event=None) -> AsyncIterator[str]:
         async for item in self.stream_events(messages, cancel_event=cancel_event):
@@ -84,6 +145,10 @@ class DeepSeekClient:
         *,
         cancel_event: Any = None,
         json_mode: bool = False,
+        transport: str | None = None,
+        schema: Mapping[str, Any] | None = None,
+        schema_name: str = "voice_decision_v06",
+        reasoning_effort: str | None = None,
     ) -> AsyncIterator[dict]:
         if not self.api_key:
             raise DeepSeekError("未配置 DEEPSEEK_API_KEY")
@@ -91,6 +156,20 @@ class DeepSeekClient:
             import httpx  # type: ignore
         except ImportError as exc:
             raise DeepSeekError("缺少 httpx，请先运行 scripts\\setup.ps1。") from exc
+
+        selected_transport = transport or self.transport
+        if selected_transport == "responses":
+            if schema is None:
+                raise DeepSeekError("Responses transport requires a decision JSON Schema")
+            async for item in self._stream_responses(
+                messages, schema=schema, schema_name=schema_name,
+                reasoning_effort=reasoning_effort or (self.reasoning_effort if self.thinking != "disabled" else "none"),
+                cancel_event=cancel_event,
+            ):
+                yield item
+            return
+        if selected_transport != "chat_completions":
+            raise DeepSeekError(f"unsupported DeepSeek transport: {selected_transport}")
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -106,7 +185,7 @@ class DeepSeekClient:
         )
         delta_count = 0
         response_chars = 0
-        payload = self._request_payload(messages)
+        payload = self._request_payload(messages, reasoning_effort=reasoning_effort)
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         finished = False
@@ -172,6 +251,89 @@ class DeepSeekClient:
         except Exception as exc:
             logger.exception("deepseek.request_failed")
             raise DeepSeekError(f"DeepSeek 请求失败：{exc}") from exc
+
+    async def _stream_responses(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        schema: Mapping[str, Any],
+        schema_name: str,
+        reasoning_effort: str,
+        cancel_event: Any = None,
+    ) -> AsyncIterator[dict]:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        payload = self._responses_payload(
+            messages, model=self.model, schema=schema, schema_name=schema_name,
+            reasoning_effort=reasoning_effort, max_output_tokens=self.max_output_tokens,
+        )
+        terminal = False
+        try:
+            client = await self._http_client()
+            async with client.stream(
+                "POST", f"{self.base_url}/responses", headers=headers, json=payload,
+            ) as response:
+                logger.info(
+                    "deepseek.responses_status status=%d effort=%s",
+                    response.status_code, reasoning_effort,
+                )
+                if response.status_code >= 400:
+                    body = (await response.aread()).decode("utf-8", errors="replace")
+                    raise DeepSeekError(f"DeepSeek Responses HTTP {response.status_code}: {body[:500]}")
+                async for line in response.aiter_lines():
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    kind = event.get("type")
+                    if kind == "response.output_text.delta":
+                        delta = event.get("delta")
+                        if isinstance(delta, str) and delta:
+                            yield {"type": "content", "text": delta}
+                    elif kind == "response.reasoning_text.delta":
+                        delta = event.get("delta")
+                        if isinstance(delta, str) and delta:
+                            yield {"type": "reasoning", "text": delta}
+                    elif kind == "response.completed":
+                        result = event.get("response")
+                        status = result.get("status") if isinstance(result, dict) else None
+                        if status not in {None, "completed"}:
+                            raise DeepSeekError(f"Responses completed with invalid status: {status}")
+                        usage = result.get("usage") if isinstance(result, dict) else None
+                        if isinstance(usage, dict):
+                            normalized = dict(usage)
+                            if isinstance(usage.get("input_tokens"), int):
+                                normalized["prompt_tokens"] = usage["input_tokens"]
+                            if isinstance(usage.get("output_tokens"), int):
+                                normalized["completion_tokens"] = usage["output_tokens"]
+                            yield {"type": "usage", "usage": normalized}
+                        terminal = True
+                        yield {"type": "finish", "reason": "completed"}
+                        return
+                    elif kind in {"response.incomplete", "response.failed"}:
+                        result = event.get("response")
+                        status = result.get("status") if isinstance(result, dict) else None
+                        error = result.get("error") if isinstance(result, dict) else None
+                        raise DeepSeekError(f"Responses terminal failure: {kind}/{status}: {str(error)[:300]}")
+            if not terminal:
+                raise DeepSeekError("Responses stream disconnected before response.completed")
+        except DeepSeekError:
+            raise
+        except Exception as exc:
+            logger.exception("deepseek.responses_failed")
+            raise DeepSeekError(f"DeepSeek Responses 请求失败：{exc}") from exc
 
     async def check(self) -> None:
         if not self.api_key:

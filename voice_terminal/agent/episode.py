@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from contextlib import aclosing
+import hashlib
 import json
 import logging
+import random
 import time
 import unicodedata
 from threading import Lock
@@ -13,6 +15,7 @@ from dataclasses import dataclass
 
 from .options import AgentOptions
 from .decision_envelope import Action, DecisionEnvelope, EnvelopeError, SpeechDecisionEnvelopeStream
+from .decision_schema import THINKING_ACTION, decision_schema
 from .sentences import map_refinement
 from ..session.context import CurrentInput, LLMContextProjector
 from ..session.runtime import ConversationRuntime
@@ -217,6 +220,13 @@ class AgentEpisodeRuntime:
         self.provider_prompt_tokens = None
         self._background_tools: set[asyncio.Task] = set()
         self._tokenizer_prewarm_task: asyncio.Task | None = None
+        self._shadow_tasks: set[asyncio.Task] = set()
+        self._shadow_by_turn: dict[str, set[asyncio.Task]] = {}
+        self.shadow_results: deque[dict] = deque(maxlen=200)
+        self._thinking_lease_turn: str | None = None
+        self._thinking_prefix_by_turn: dict[str, str] = {}
+        self._thinking_barrier_generation = 0
+        self._recovery_attempts_by_turn: dict[str, int] = {}
 
     def snapshot(self, *, include_history=True):
         value = {"conversation_id": self.episode_id, "trace_id": self.agent_step_id,
@@ -230,7 +240,9 @@ class AgentEpisodeRuntime:
                  "speech_queue": getattr(self.output, "queue_snapshot", []),
                  "speak_snapshot": getattr(self.output, "speak_snapshot", {"queue_status": "empty", "text_only_queue": True}),
                  "recovery_pending": len(self.recovery_queue),
-                 "reasoning": self.last_reasoning}
+                 "reasoning": self.last_reasoning,
+                 "shadow": self._shadow_summary(),
+                 "thinking_lease_turn": self._thinking_lease_turn}
         value.update(context_limited=self.context_limited,
                     context_limit_reason=self.context_limit_reason,
                     context_compacted=self.context_compacted,
@@ -274,8 +286,11 @@ class AgentEpisodeRuntime:
             "SCHEDULER_EVENT_ENQUEUED", "SCHEDULER_TICK", "SCHEDULER_TIMER_RESET",
             "SENTENCE_CREATED", "SENTENCE_REVISED", "SPEAK_STATE_CHANGED",
             "ACTION_STARTED", "ACTION_COMPLETED", "SPEAK_ENVELOPE_INVALID", "EMOTION_NORMALIZED",
+            "LLM_EMPTY_OUTPUT",
             "SPEAK_REPLACEMENT_INTERCEPTED",
             "OUTPUT_CANCELLED", "OUTPUT_REPLACED",
+            "LLM_RECOVERY_EXHAUSTED", "THINKING_REQUESTED", "THINKING_BARRIER_READY",
+            "THINKING_BARRIER_STALE", "THINKING_PREFIX_DIVERGED",
         }:
             logger.info(
                 "agent.trace kind=%s episode_id=%s request_id=%s turn=%s events=%s reason=%s status=%s speech_id=%s",
@@ -290,6 +305,17 @@ class AgentEpisodeRuntime:
 
     def identity(self):
         return self.episode_id, self.agent_step_id
+
+    def _shadow_summary(self) -> dict:
+        rows = list(self.shadow_results)
+        return {
+            "enabled": bool(getattr(self.provider, "shadow_enabled", False)),
+            "samples": len(rows),
+            "valid": sum(bool(row.get("valid")) for row in rows),
+            "errors": sum(not bool(row.get("valid")) for row in rows),
+            "thinking_requests": sum(int(row.get("thinking_requests") or 0) for row in rows),
+            "last": dict(rows[-1]) if rows else None,
+        }
 
     def scope_active(self, identity):
         # Request identities are correlation only.  Input finalization,
@@ -443,6 +469,9 @@ class AgentEpisodeRuntime:
         self.context_compaction = {}
         self.provider_prompt_tokens = None
         self.minor_protocol_feedback.clear()
+        self._thinking_lease_turn = None
+        self._thinking_prefix_by_turn.clear()
+        self._recovery_attempts_by_turn.clear()
         self._start_tokenizer_prewarm()
         self.registry.begin_turn(self.episode_id)
         if turn_id and text and text.strip():
@@ -522,10 +551,19 @@ class AgentEpisodeRuntime:
         a single signal for a single failure, while a later failed recovery
         creates a new signal and is therefore reported again.
         """
+        source_turn = turn_id or (self._identity_turns.get(identity) if identity else self.last_turn_id)
+        if getattr(self.provider, "transport", "chat_completions") == "responses":
+            limit = int(getattr(self.provider, "protocol_recovery_limit", 1))
+            attempts = self._recovery_attempts_by_turn.get(source_turn or "", 0)
+            if attempts >= limit:
+                await self.log("LLM_RECOVERY_EXHAUSTED", identity=identity, turn_id=source_turn,
+                               code=str(code), attempts=attempts, limit=limit)
+                return None
+            self._recovery_attempts_by_turn[source_turn or ""] = attempts + 1
         signal = RecoverySignal(
             code=str(code), message=str(message)[:500],
             source_request_id=identity[1] if identity else self.agent_step_id,
-            source_turn_id=turn_id or (self._identity_turns.get(identity) if identity else self.last_turn_id),
+            source_turn_id=source_turn,
             delivery_feedback=delivery_feedback if isinstance(delivery_feedback, dict) else None,
         )
         if self.active_recovery is not None:
@@ -611,6 +649,15 @@ class AgentEpisodeRuntime:
             self.last_turn_id = turn_id
             await self.log(kind, **({"text": text} if text is not None else {}), **payload)
             return
+        if (turn_id and self.last_turn_id and turn_id != self.last_turn_id
+                and kind in {"USER_SEGMENT_UPDATED", "USER_INPUT_FINALIZED", "USER_INPUT_REFINED"}):
+            old_turn = self.last_turn_id
+            self._thinking_barrier_generation += 1
+            self._thinking_lease_turn = None
+            self._thinking_prefix_by_turn.pop(old_turn, None)
+            for old_shadow in tuple(self._shadow_by_turn.get(old_turn, ())):
+                if not old_shadow.done():
+                    old_shadow.cancel()
         if turn_id:
             self.last_turn_id = turn_id
         changed = False
@@ -761,6 +808,10 @@ class AgentEpisodeRuntime:
                     self.state = "INVOKING"
                     identity = self.identity()
                     source_turn_id = self.last_turn_id
+                    reasoning_effort = None
+                    if "THINKING_READY" in kinds and self._thinking_lease_turn == source_turn_id:
+                        reasoning_effort = "low"
+                        self._thinking_lease_turn = None
                     self._identity_turns[identity] = source_turn_id
                     self.active_request_kinds = set(kinds)
                     self.active_recovery = recovery_signal
@@ -771,7 +822,9 @@ class AgentEpisodeRuntime:
                         await self.log("LLM_RECOVERY_STARTED", identity=identity,
                                        error_id=recovery_signal.error_id, code=recovery_signal.code)
                     self.active_request = asyncio.create_task(
-                        self._step(identity, kinds, recovery=recovery, recovery_signal=recovery_signal)
+                        self._step(identity, kinds, recovery=recovery,
+                                   recovery_signal=recovery_signal,
+                                   reasoning_effort=reasoning_effort)
                     )
                     self.active_request_count += 1
                     self.max_request_concurrency = max(self.max_request_concurrency, self.active_request_count)
@@ -916,11 +969,24 @@ class AgentEpisodeRuntime:
                            "此次请遵守该字段约束，不需要为它重复回答："
                            + json.dumps(repairs, ensure_ascii=False),
             })
-        catalog = self._tool_catalog(self.registry.action_definitions() if self.tools_enabled and hasattr(self.registry, "action_definitions") else [])
+        definitions = self.registry.action_definitions() if self.tools_enabled and hasattr(self.registry, "action_definitions") else []
+        catalog = self._tool_catalog(definitions)
+        if bool(getattr(self.provider, "thinking_action_enabled", False)):
+            catalog.append({
+                "name": THINKING_ACTION,
+                "description": (
+                    "Request one low-effort reasoning pass on the next 400 ms scheduler tick. "
+                    "Use speak(text) now for a natural transition; the next complete speak text "
+                    "must retain that exact prefix. This is a local control action, not a business tool."
+                ),
+                "parameters": {"effort": {"type": "string", "enum": ["low"]}},
+                "required": ["effort"],
+            })
         if catalog:
             messages.append({
                 "role": "system",
-                "content": "当前可用只读动作目录（只允许写入 actions）：" + json.dumps(catalog, ensure_ascii=False),
+                "content": "当前动作目录（业务动作只读，本地控制动作不执行外部操作；只允许写入 actions）："
+                           + json.dumps(catalog, ensure_ascii=False),
             })
         if recovery_signal is not None:
             feedback = {
@@ -929,7 +995,11 @@ class AgentEpisodeRuntime:
                 "message": recovery_signal.message,
                 "source_request_id": recovery_signal.source_request_id,
                 "delivery_feedback": recovery_signal.delivery_feedback,
-                "instruction": "立即纠正本次协议/工具错误；本轮仍必须调用且只调用一次 speak。",
+                "instruction": (
+                    "立即纠正本次协议/动作错误。失败内容未加入会话历史。"
+                    "最终必须是一个 JSON 对象且恰好包含 speak、actions 两个顶层字段；"
+                    "speak 是字段而不是工具调用。第一个非空白字符必须是 {，最后一个必须是 }。"
+                ),
             }
             messages.append({
                 "role": "system",
@@ -938,7 +1008,183 @@ class AgentEpisodeRuntime:
         self._update_context_metrics(messages)
         return messages
 
-    async def _execute_actions_v06(self, identity, turn_id, actions: tuple[Action, ...]):
+    def _decision_schema(self, *, shadow: bool = False) -> dict:
+        definitions = (
+            self.registry.action_definitions()
+            if self.tools_enabled and hasattr(self.registry, "action_definitions") else []
+        )
+        allow_thinking = bool(
+            getattr(self.provider, "shadow_thinking_enabled" if shadow else "thinking_action_enabled", False)
+        )
+        return decision_schema(definitions, allow_thinking=allow_thinking)
+
+    def _normalize_schema_envelope(self, envelope: DecisionEnvelope) -> DecisionEnvelope:
+        """Remove strict-schema filler fields without weakening local validation."""
+
+        definitions = (
+            self.registry.action_definitions()
+            if self.tools_enabled and hasattr(self.registry, "action_definitions") else []
+        )
+        allowed: dict[str, set[str]] = {}
+        for definition in definitions:
+            if not isinstance(definition, dict) or not isinstance(definition.get("name"), str):
+                continue
+            parameters = definition.get("parameters")
+            properties = parameters.get("properties") if isinstance(parameters, dict) else None
+            allowed[definition["name"]] = set(properties) if isinstance(properties, dict) else set()
+        normalized: list[Action] = []
+        for action in envelope.actions:
+            keys = {"effort"} if action.name == THINKING_ACTION else allowed.get(action.name)
+            if keys is None:
+                normalized.append(action)
+                continue
+            normalized.append(Action(action.name, {
+                key: value for key, value in action.arguments.items()
+                if key in keys
+            }))
+        return DecisionEnvelope(envelope.speak, tuple(normalized))
+
+    def _provider_stream(self, messages, *, reasoning_effort=None, shadow=False):
+        if getattr(self.provider, "supports_decision_schema", False):
+            return self.provider.stream_events(
+                messages,
+                json_mode=True,
+                transport="responses" if shadow else None,
+                schema=self._decision_schema(shadow=shadow),
+                reasoning_effort=reasoning_effort,
+            )
+        return self.provider.stream_events(messages, json_mode=True)
+
+    def _launch_shadow(self, messages, turn_id: str | None, request_id: str | None) -> None:
+        if not turn_id or not bool(getattr(self.provider, "shadow_enabled", False)):
+            return
+        if getattr(self.provider, "transport", "chat_completions") == "responses" and not bool(
+            getattr(self.provider, "shadow_thinking_enabled", False)
+        ):
+            return
+        if random.random() > float(getattr(self.provider, "shadow_sample_rate", 1.0)):
+            return
+        frozen = tuple({"role": str(item.get("role") or "user"),
+                        "content": str(item.get("content") or "")} for item in messages)
+        fingerprint = hashlib.sha256(
+            json.dumps(frozen, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        task = asyncio.create_task(
+            self._run_shadow_chain(frozen, turn_id, request_id=request_id, context_fingerprint=fingerprint),
+            name=f"llm-shadow-{turn_id}",
+        )
+        self._shadow_by_turn.setdefault(turn_id, set()).add(task)
+        self._shadow_tasks.add(task)
+        task.add_done_callback(self._shadow_tasks.discard)
+
+    async def _run_shadow_chain(self, messages, turn_id: str, *, request_id: str | None = None,
+                                context_fingerprint: str | None = None) -> None:
+        """Evaluate Responses/json_schema without touching user-visible state."""
+
+        effort = "none"
+        thinking_requests = 0
+        started = time.monotonic()
+        transient_messages = list(messages)
+        try:
+            while self.episode_id and self.last_turn_id == turn_id and not self.closed:
+                request_started = time.monotonic()
+                parser = SpeechDecisionEnvelopeStream(allow_empty_control_text=True)
+                content_chars = 0
+                first_non_whitespace_at = None
+                finished = False
+                usage: dict = {}
+                async with aclosing(self._provider_stream(
+                    transient_messages, reasoning_effort=effort, shadow=True,
+                )) as stream:
+                    async for item in stream:
+                        if item.get("type") == "content":
+                            text = item.get("text")
+                            if isinstance(text, str):
+                                content_chars += len(text)
+                                if text.strip() and first_non_whitespace_at is None:
+                                    first_non_whitespace_at = time.monotonic()
+                                parser.feed(text)
+                        elif item.get("type") == "usage" and isinstance(item.get("usage"), dict):
+                            usage = dict(item["usage"])
+                        elif item.get("type") == "finish":
+                            finished = True
+                if not finished:
+                    raise EnvelopeError("shadow model stream missing finish")
+                envelope = self._normalize_schema_envelope(parser.finish())
+                thinking = [action for action in envelope.actions if action.name == THINKING_ACTION]
+                business = [action for action in envelope.actions if action.name != THINKING_ACTION]
+                if thinking:
+                    if len(thinking) != 1 or thinking[0].arguments != {"effort": "low"}:
+                        raise EnvelopeError("invalid shadow request_thinking action")
+                    thinking_requests += 1
+                row = {
+                    "valid": True,
+                    "source_request_id": request_id,
+                    "turn_id": turn_id,
+                    "context_fingerprint": context_fingerprint,
+                    "transport": "responses",
+                    "effort": effort,
+                    "state": envelope.speak.state,
+                    "action_names": [action.name for action in envelope.actions],
+                    "content_chars": content_chars,
+                    "first_non_whitespace_ms": (
+                        round((first_non_whitespace_at - request_started) * 1000)
+                        if first_non_whitespace_at is not None else None
+                    ),
+                    "terminal_ms": round((time.monotonic() - request_started) * 1000),
+                    "chain_elapsed_ms": round((time.monotonic() - started) * 1000),
+                    "thinking_requests": thinking_requests,
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "completion_tokens": usage.get("completion_tokens"),
+                    "barrier": "unresolved_business_actions" if thinking and business else None,
+                }
+                self.shadow_results.append(row)
+                logger.info("agent.shadow_result %s", json.dumps(row, ensure_ascii=False, sort_keys=True))
+                if not thinking or not bool(getattr(self.provider, "shadow_thinking_enabled", False)) or business:
+                    return
+                # Raw output remains transient and is needed only to teach the
+                # next shadow request which exact speech prefix it must retain.
+                transient_messages.append({"role": "assistant", "content": parser.raw})
+                transient_messages.append({
+                    "role": "system",
+                    "content": (
+                        "本地已接受 request_thinking；这是下一次且仅下一次 low 思考请求。"
+                        "继续遵守当前完整播报文本的严格前缀规则。"
+                    ),
+                })
+                effort = "low"
+                await asyncio.sleep(self.options.scheduler_tick_ms / 1000)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            message = str(exc).lower()
+            error_code = (
+                "empty_output" if "empty" in message or "expecting value" in message
+                else "schema_or_envelope" if isinstance(exc, (EnvelopeError, ValueError))
+                else "transport"
+            )
+            row = {
+                "valid": False,
+                "source_request_id": request_id,
+                "turn_id": turn_id,
+                "context_fingerprint": context_fingerprint,
+                "transport": "responses",
+                "effort": effort,
+                "error_type": type(exc).__name__,
+                "error_code": error_code,
+                "latency_ms": round((time.monotonic() - started) * 1000),
+                "thinking_requests": thinking_requests,
+            }
+            self.shadow_results.append(row)
+            logger.warning("agent.shadow_result %s", json.dumps(row, ensure_ascii=False, sort_keys=True))
+        finally:
+            tasks = self._shadow_by_turn.get(turn_id)
+            if tasks is not None:
+                tasks.discard(asyncio.current_task())
+                if not tasks:
+                    self._shadow_by_turn.pop(turn_id, None)
+
+    async def _execute_actions_v06(self, identity, turn_id, actions: tuple[Action, ...], *, wake=True):
         """Run model-selected read-only actions and enqueue their results only."""
         for action in actions:
             name, arguments = action.name, action.arguments
@@ -972,9 +1218,52 @@ class AgentEpisodeRuntime:
                                error=str(exc)[:300])
                 await self._queue_recovery("TOOL_PROTOCOL_ERROR", str(exc)[:300],
                                            identity=identity, turn_id=turn_id)
-                return
-        if actions:
+                return False
+        if actions and wake:
             self._wake("TOOL_COMPLETED")
+        return True
+
+    def _track_background_tool(self, task: asyncio.Task) -> None:
+        self._background_tools.add(task)
+        task.add_done_callback(self._background_tools.discard)
+
+    async def _thinking_barrier(self, identity, turn_id, actions: tuple[Action, ...], generation: int) -> None:
+        ok = await self._execute_actions_v06(identity, turn_id, actions, wake=False) if actions else True
+        if not ok:
+            return
+        if generation != self._thinking_barrier_generation or self.last_turn_id != turn_id or not self.episode_id:
+            await self.log("THINKING_BARRIER_STALE", identity=identity, turn_id=turn_id)
+            return
+        self._thinking_lease_turn = turn_id
+        await self.log("THINKING_BARRIER_READY", identity=identity, turn_id=turn_id,
+                       business_action_count=len(actions))
+        self._wake("THINKING_READY")
+
+    async def _dispatch_actions_v06(self, identity, turn_id, envelope: DecisionEnvelope) -> None:
+        actions = envelope.actions
+        thinking = tuple(action for action in actions if action.name == THINKING_ACTION)
+        business = tuple(action for action in actions if action.name != THINKING_ACTION)
+        if not thinking:
+            if business:
+                self._track_background_tool(asyncio.create_task(
+                    self._execute_actions_v06(identity, turn_id, business), name="agent-actions-v06",
+                ))
+            return
+        if not bool(getattr(self.provider, "thinking_action_enabled", False)):
+            raise ProtocolError("action request_thinking is not enabled")
+        if len(thinking) != 1 or thinking[0].arguments != {"effort": "low"}:
+            raise ProtocolError("action request_thinking requires exactly arguments.effort=low")
+        if envelope.speak.state != "speak" or not envelope.speak.text.strip():
+            raise ProtocolError("action request_thinking requires a nonempty speak transition")
+        self._thinking_prefix_by_turn[turn_id] = envelope.speak.text
+        self._thinking_barrier_generation += 1
+        generation = self._thinking_barrier_generation
+        await self.log("THINKING_REQUESTED", identity=identity, turn_id=turn_id,
+                       business_action_count=len(business), generation=generation)
+        self._track_background_tool(asyncio.create_task(
+            self._thinking_barrier(identity, turn_id, business, generation),
+            name=f"thinking-barrier-{turn_id}",
+        ))
 
     async def _apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope):
         """Commit one fully validated V0.6 decision to the local transaction."""
@@ -1045,13 +1334,8 @@ class AgentEpisodeRuntime:
             self.current_action = "speak"
             await self.log("SPEAK_ACCEPTED", identity=identity, turn_id=turn_id,
                            speech_id=handle.speech_id, replaced=replace)
-        if envelope.actions:
-            task = asyncio.create_task(self._execute_actions_v06(identity, turn_id, envelope.actions),
-                                       name="agent-actions-v06")
-            self._background_tools.add(task)
-            task.add_done_callback(self._background_tools.discard)
-
-    async def _step(self, identity, kinds, *, recovery=False, recovery_signal=None):
+    async def _step(self, identity, kinds, *, recovery=False, recovery_signal=None,
+                    reasoning_effort=None):
         """The V0.6 content-envelope request path (no native provider tools)."""
         source_turn_id = self._identity_turns.get(identity, self.last_turn_id)
         messages = self.messages(kinds, recovery_signal=recovery_signal)
@@ -1069,7 +1353,11 @@ class AgentEpisodeRuntime:
                                          "context_limit_tokens": self.options.max_context_tokens,
                                          "context_token_estimate": self.context_token_estimate,
                                          "conversation_id": identity[0], "request_id": identity[1]})
-        parser = SpeechDecisionEnvelopeStream()
+        if not recovery:
+            self._launch_shadow(messages, source_turn_id, identity[1])
+        parser = SpeechDecisionEnvelopeStream(
+            allow_empty_control_text=getattr(self.provider, "transport", "chat_completions") == "responses"
+        )
         reasoning: list[str] = []
         content_chars = 0
         finished = False
@@ -1142,7 +1430,7 @@ class AgentEpisodeRuntime:
             return False
 
         try:
-            async with aclosing(self.provider.stream_events(messages, json_mode=True)) as stream:
+            async with aclosing(self._provider_stream(messages, reasoning_effort=reasoning_effort)) as stream:
                 async for item in stream:
                     if self.closed or not self.episode_id:
                         return
@@ -1194,6 +1482,16 @@ class AgentEpisodeRuntime:
             if not finished:
                 raise EnvelopeError("model stream missing finish")
             envelope = parser.finish()
+            if getattr(self.provider, "transport", "chat_completions") == "responses":
+                envelope = self._normalize_schema_envelope(envelope)
+            if reasoning_effort == "low" and source_turn_id:
+                expected_prefix = self._thinking_prefix_by_turn.pop(source_turn_id, "")
+                if (expected_prefix and envelope.speak.state == "speak"
+                        and not envelope.speak.text.startswith(expected_prefix)):
+                    await self.log("THINKING_PREFIX_DIVERGED", identity=identity,
+                                   turn_id=source_turn_id,
+                                   expected_chars=len(expected_prefix),
+                                   received_chars=len(envelope.speak.text))
             await self._record_emotion_normalizations(parser, identity=identity, turn_id=source_turn_id)
             if speech_handle is not None:
                 await finish_streamed_speech()
@@ -1201,13 +1499,9 @@ class AgentEpisodeRuntime:
                                state=envelope.speak.state,
                                queue_status=getattr(self.output, "speak_snapshot", {}).get("queue_status", "queued"),
                                action_count=len(envelope.actions))
-                if envelope.actions:
-                    task = asyncio.create_task(self._execute_actions_v06(identity, source_turn_id, envelope.actions),
-                                               name="agent-actions-v06")
-                    self._background_tools.add(task)
-                    task.add_done_callback(self._background_tools.discard)
             else:
                 await self._apply_decision_v06(identity, source_turn_id, envelope)
+            await self._dispatch_actions_v06(identity, source_turn_id, envelope)
             await self.emit("speak.preview", {
                 "conversation_id": identity[0], "request_id": identity[1],
                 "turn_id": source_turn_id, "status": "committed",
@@ -1219,9 +1513,17 @@ class AgentEpisodeRuntime:
                 except Exception:
                     pass
             error_text = str(exc)[:300]
-            recovery_code = ("TOOL_PROTOCOL_ERROR"
-                             if any(marker in error_text for marker in ("action", "tool"))
-                             else "SPEAK_ENVELOPE_INVALID")
+            recovery_code = (
+                "LLM_EMPTY_OUTPUT" if not parser.raw.strip()
+                else "TOOL_PROTOCOL_ERROR" if any(marker in error_text for marker in ("action", "tool"))
+                else "SPEAK_ENVELOPE_INVALID"
+            )
+            if recovery_code == "LLM_EMPTY_OUTPUT":
+                # Preserve the frozen V0.6 aggregate while exposing the new,
+                # actionable empty-output classification.
+                await self.log("SPEAK_ENVELOPE_INVALID", identity=identity,
+                               turn_id=source_turn_id, error=error_text,
+                               classification="LLM_EMPTY_OUTPUT", legacy_alias=True)
             await self.log(recovery_code, identity=identity, turn_id=source_turn_id,
                            error=error_text, provisional_chars=len(provisional),
                            partial_speech=speech_handle is not None)
@@ -1304,6 +1606,14 @@ class AgentEpisodeRuntime:
         if background:
             await asyncio.gather(*background, return_exceptions=True)
         self._background_tools.clear()
+        shadow = list(self._shadow_tasks)
+        for task in shadow:
+            if not task.done():
+                task.cancel()
+        if shadow:
+            await asyncio.gather(*shadow, return_exceptions=True)
+        self._shadow_tasks.clear()
+        self._shadow_by_turn.clear()
         if old:
             self.registry.cancel_turn(old)
         self.pending.clear()
@@ -1320,6 +1630,9 @@ class AgentEpisodeRuntime:
         self.context_compacted = False
         self.context_compaction = {}
         self.provider_prompt_tokens = None
+        self._thinking_lease_turn = None
+        self._thinking_prefix_by_turn.clear()
+        self._recovery_attempts_by_turn.clear()
         self.state = "IDLE"
         await self.emit("agent.episode", self.snapshot(include_history=False))
 

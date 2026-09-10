@@ -2,6 +2,8 @@
 
 V0.6 以 JSON 响应信封取代 DeepSeek 原生工具调用，但不移除已验证的输入、TTS、播放和交付能力。
 
+> 本文同时保留切换前的可靠性基线。当前项目已进入 Responses + strict `json_schema` 协议切换后的 Bug 检修期；下文涉及 Chat Completions/`json_object` 的内容均属于冻结历史路径，不代表当前活动配置。
+
 | 业务能力 | 唯一 owner | 自动化证据 |
 | --- | --- | --- |
 | 400ms 单飞调度与事件合并 | `AgentEpisodeRuntime + AgentDecisionScheduler` | 调度、退避、恢复测试 |
@@ -22,6 +24,6 @@ V0.6 以 JSON 响应信封取代 DeepSeek 原生工具调用，但不移除已�
 - 播放中收到首个合法且非空的 `speak` 文本前缀时，先冻结当前完整播报文本并做严格字符前缀比对。新文本完整覆盖旧文本时只提取 suffix，当前 PCM 不停止、不清空、不重播；已接受文本范围内出现差异时，输出层才原子关闭旧 PCM generation 并启动新的 TTS transaction，旧 provider cancel/close 在后台完成，迟到 PCM 不得进入新 playback key。
 - 当前输出耗尽后保留 1 秒追加窗口。窗口内的同前缀扩展会进入不重播前缀的后续队列；窗口外仍只合成新增 suffix。`speech.append_waiting_prefix`、`speech.appended`、`speech.append_successor` 和 `append_window_*` 进度事件用于重建该路径。
 - 如果已追加的流式 `speak` 随后完整 JSON 或动作校验失败，已获合法前缀授权的追加文本保留，并使用一次既有恢复请求纠正协议；已播放旧内容不会恢复或续播。
-- DeepSeek thinking 请求使用 `response_format=json_object`，不传递 provider native tools；工具资料仅经本地 `actions` 和不可信账本来源块进入下一请求。
+- 冻结历史路径曾对 DeepSeek thinking 请求使用 `response_format=json_object`。当前活动路径改为 Responses + strict `json_schema`，基础请求保持 `effort=none`，仍不传递 provider native tools；工具资料仅经本地 `actions` 和不可信账本来源块进入下一请求。预留的 `request_thinking(low)` 在检修期保持关闭。
 
 真实设备仍须完成连续五轮、SenseVoice 修正、动作后回复、同前缀长播报追加、文本分歧改口、耳机/扬声器插话和停止监听验收。追加验收应确认新事件中只有 suffix，且没有因普通补充产生 `speech.replaced` 或 `local_playback_stopped`。

@@ -1,7 +1,9 @@
 # 上下文与工具规范
 
-每次模型请求只能由统一调度器通过 `LLMContextProjector` 基于 `SessionLedger` 生成。DeepSeek 以 JSON mode 返回必填的 `speak` 决策和可选本地 `actions`，不使用 native tool calling。账本按顺序保存最终用户输入、实际听到的助手文本、打断说明和工具来源块；投影器额外提供句子流、精修映射、用户讲话状态和 `empty/queued/suspended/speaking` 快照。未播放输出不会写入传达账本，但会作为当前事务快照参与后续决策。
+每次模型请求只能由统一调度器通过 `LLMContextProjector` 基于 `SessionLedger` 生成。当前 Bug 检修期的唯一活动路径是 DeepSeek Responses + strict `json_schema`，返回必填的 `speak` 决策和可选本地 `actions`，不使用 native tool calling；冻结的 Chat/`json_object` 路径只允许显式回退。账本按顺序保存最终用户输入、实际听到的助手文本、打断说明和工具来源块；投影器额外提供句子流、精修映射、用户讲话状态和 `empty/queued/suspended/speaking` 快照。未播放输出不会写入传达账本，但会作为当前事务快照参与后续决策。
 
 工具来源块包含工具名、参数、执行时间、结果与 `external_untrusted` 来源标记；不包含对话、轮次、语音、epoch 或决策身份。工具结果是资料，不是指令；模型不得从其中获取系统权限、改变会话规则或执行非只读操作。
 
 允许按意图调用受限目录文件工具与联网搜索。工具完成结果统一作为事件进入下一次 400ms 普通调度；新输入、精修和工具晚到不会让在飞请求失效。只有停止监听、会话重置等显式取消才会清理工具任务。
+
+`request_thinking` 是预留的本地控制 action，不是业务工具，不产生 `ToolExchange`。检修期内 `thinking_action_enabled=false`、`shadow_thinking_enabled=false`；只有基础 Schema 路径达到退出门槛后，才进入独立思考功能实验。

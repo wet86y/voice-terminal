@@ -53,9 +53,10 @@ class SpeechDecisionEnvelopeStream:
     envelope and its actions.
     """
 
-    def __init__(self, *, limit: int = 32768) -> None:
+    def __init__(self, *, limit: int = 32768, allow_empty_control_text: bool = False) -> None:
         self.raw = ""
         self.limit = limit
+        self.allow_empty_control_text = allow_empty_control_text
         self.state: str | None = None
         self._emitted_length = 0
         self.emotion_normalizations: list[dict[str, str]] = []
@@ -189,7 +190,7 @@ class SpeechDecisionEnvelopeStream:
             raise EnvelopeError("speak text must be a string")
         if state == "speak" and not text.strip():
             raise EnvelopeError("speak requires nonempty text")
-        if state != "speak" and has_text:
+        if state != "speak" and has_text and not (self.allow_empty_control_text and text == ""):
             raise EnvelopeError("cancel/wait cannot contain text")
         actions = value.get("actions")
         if not isinstance(actions, list) or len(actions) > 8:

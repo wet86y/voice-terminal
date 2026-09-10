@@ -1,0 +1,42 @@
+{
+  "probe": "responses-schema-capabilities",
+  "model": "deepseek-v4-flash",
+  "date": "2026-09-10",
+  "generated_content_retained": false,
+  "tts_or_tools_started": false,
+  "rows": [
+    {
+      "case": "production_no_actions",
+      "http_status": 200,
+      "terminal_status": "completed",
+      "accepted": true,
+      "local_envelope_valid": true,
+      "latency_ms": 460.4
+    },
+    {
+      "case": "production_tools",
+      "http_status": 200,
+      "terminal_status": "completed",
+      "accepted": true,
+      "local_envelope_valid": true,
+      "latency_ms": 1582.3
+    },
+    {
+      "case": "production_tools_and_thinking",
+      "http_status": 200,
+      "terminal_status": "completed",
+      "accepted": true,
+      "local_envelope_valid": true,
+      "latency_ms": 845.5
+    },
+    {
+      "case": "diagnostic_discriminated_union",
+      "http_status": 400,
+      "terminal_status": null,
+      "accepted": false,
+      "local_envelope_valid": false,
+      "error_code": "schema_rejected",
+      "latency_ms": 121.5
+    }
+  ]
+}

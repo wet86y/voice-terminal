@@ -1,6 +1,8 @@
 # 运行与质量门槛
 
-默认 `config/default.yaml` 即为唯一生产运行线。`smart_turn`、`agent` 与 `tools` 是能力配置，不是版本开关。文件工具默认仅限 `docs`；不包含 Shell、写文件、外部账号操作、RAG 或长期记忆。
+> **当前状态：协议切换后的 Bug 检修期。** 默认活动 LLM 路径已经切换为 DeepSeek Responses + strict `json_schema`；冻结的 Chat/`json_object` adapter 只作为显式整体回退入口。检修期不启用普通影子双跑或 `request_thinking`，也不把当前默认配置视为已经完成生产验收。
+
+默认 `config/default.yaml` 是当前唯一活动运行线。`smart_turn`、`agent` 与 `tools` 是能力配置，不是版本开关。文件工具默认仅限 `docs`；不包含 Shell、写文件、外部账号操作、RAG 或长期记忆。
 
 默认 `audio.output_device: null`，由 Windows 选择当前活跃默认输出设备。这样可避免固定的 MME 端点在 PortAudio 实际打开 32 kHz PCM 流时失败，也能自然适应耳机和外接音箱切换。只有部署环境需要强制固定设备时，才在被忽略的 `config/local.yaml` 中设置 `audio.output_device`；修改后应先以真实输出流验证，而不只依赖设备能力查询。
 
