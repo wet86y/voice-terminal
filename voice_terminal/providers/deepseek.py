@@ -34,6 +34,9 @@ class DeepSeekClient:
         base_url: str,
         model: str,
         api_key: str,
+        provider: str = "deepseek",
+        api_key_env: str = "DEEPSEEK_API_KEY",
+        session_id: str | None = None,
         timeout_ms: int = 15000,
         thinking: str = "disabled",
         reasoning_effort: str = "low",
@@ -46,9 +49,15 @@ class DeepSeekClient:
         protocol_recovery_limit: int = 1,
         transport_retry_limit: int = 2,
     ) -> None:
+        if provider not in {"deepseek", "opencode_go"}:
+            raise ValueError("provider must be deepseek or opencode_go")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
+        self.provider = provider
+        self.api_key_env = api_key_env
+        self.session_id = session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
+        self.user_agent = "voice-terminal-backend/0.6" if provider == "opencode_go" else None
         self.timeout_ms = timeout_ms
         self.thinking = thinking
         if reasoning_effort not in {"low", "high", "max"}:
@@ -71,6 +80,24 @@ class DeepSeekClient:
         self.supports_decision_schema = True
         self._client = None
 
+    def set_session_id(self, session_id: str | None) -> None:
+        """Bind subsequent provider requests to the current conversation."""
+        value = session_id.strip() if isinstance(session_id, str) else ""
+        self.session_id = value or None
+
+    def _request_headers(self, *, streaming: bool = False) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        if self.user_agent:
+            headers["User-Agent"] = self.user_agent
+        if self.session_id:
+            headers["x-opencode-session"] = self.session_id
+        if streaming:
+            headers.update({
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            })
+        return headers
+
     async def _http_client(self):
         if self._client is None:
             try:
@@ -91,7 +118,7 @@ class DeepSeekClient:
         if not self.api_key:
             return
         client = await self._http_client()
-        response = await client.get(f"{self.base_url}/models", headers={"Authorization": f"Bearer {self.api_key}"})
+        response = await client.get(f"{self.base_url}/models", headers=self._request_headers())
         if response.status_code >= 400:
             raise DeepSeekError(f"DeepSeek 预热失败：HTTP {response.status_code}")
         logger.info("deepseek.prewarm_ok status=%d", response.status_code)
@@ -168,7 +195,7 @@ class DeepSeekClient:
         reasoning_effort: str | None = None,
     ) -> AsyncIterator[dict]:
         if not self.api_key:
-            raise DeepSeekError("未配置 DEEPSEEK_API_KEY")
+            raise DeepSeekError(f"未配置 {self.api_key_env}")
         try:
             import httpx  # type: ignore
         except ImportError as exc:
@@ -188,11 +215,7 @@ class DeepSeekClient:
         if selected_transport != "chat_completions":
             raise DeepSeekError(f"unsupported DeepSeek transport: {selected_transport}")
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
+        headers = self._request_headers(streaming=True)
         timeout = httpx.Timeout(self.timeout_ms / 1000, connect=min(5, self.timeout_ms / 1000))
         logger.info(
             "deepseek.request_start model=%s messages=%d timeout_ms=%d",
@@ -278,11 +301,7 @@ class DeepSeekClient:
         reasoning_effort: str,
         cancel_event: Any = None,
     ) -> AsyncIterator[dict]:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
+        headers = self._request_headers(streaming=True)
         payload = self._responses_payload(
             messages, model=self.model, schema=schema, schema_name=schema_name,
             reasoning_effort=reasoning_effort, max_output_tokens=self.max_output_tokens,
@@ -408,11 +427,11 @@ class DeepSeekClient:
 
     async def check(self) -> None:
         if not self.api_key:
-            raise DeepSeekError("未配置 DEEPSEEK_API_KEY")
+            raise DeepSeekError(f"未配置 {self.api_key_env}")
         try:
             import httpx  # type: ignore
             response = await (await self._http_client()).get(
-                f"{self.base_url}/models", headers={"Authorization": f"Bearer {self.api_key}"})
+                f"{self.base_url}/models", headers=self._request_headers())
             if response.status_code >= 400:
                 raise DeepSeekError(f"DeepSeek 鉴权检查失败：HTTP {response.status_code}")
             logger.info("deepseek.check_ok status=%d", response.status_code)

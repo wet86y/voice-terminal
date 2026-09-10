@@ -22,7 +22,7 @@ LLM transport 由 `llm.transport` 原子选择。当前测试期唯一活动路�
 npm run dev
 ```
 
-在根目录的已忽略 `.env.local` 中配置 `DEEPSEEK_API_KEY`、`MINIMAX_API_KEY` 和可选的 `MINIMAX_API_HOST`。浏览器默认连接 `ws://127.0.0.1:8765/ws`，不请求麦克风权限、不上传 PCM、不自行计算延迟。
+在根目录的已忽略 `.env.local` 中配置 `DEEPSEEK_API_KEY`、`OPENCODE_GO_API_KEY`、`MINIMAX_API_KEY` 和可选的 `MINIMAX_API_HOST`。真实测试对话默认使用官方 DeepSeek；调试时可临时运行 `./scripts/start.ps1 -LlmProvider opencode_go` 切到 OpenCode Go，脚本结束后不会保留覆盖。浏览器默认连接 `ws://127.0.0.1:8765/ws`，不请求麦克风权限、不上传 PCM、不自行计算延迟。
 
 真实耳机/扬声器、自然语音统计与第三方服务稳定性仍是独立发布门槛，不能由 fake provider 或内存播放器代替。
 

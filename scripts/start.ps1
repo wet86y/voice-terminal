@@ -1,6 +1,8 @@
 ﻿param(
   [string]$Python = "python",
   [string]$Config = "config/local.yaml",
+  [ValidateSet("deepseek", "opencode_go")]
+  [string]$LlmProvider = "",
   [switch]$NoWorker,
   [switch]$NoAnalysis
 )
@@ -12,6 +14,13 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Push-Location $RepoRoot
 $worker = $null
 $analysisWorker = $null
+$previousLlmProvider = $env:VOICE_LLM_PROVIDER
+$llmProviderOverridden = $false
+if ($LlmProvider) {
+  $env:VOICE_LLM_PROVIDER = $LlmProvider
+  $llmProviderOverridden = $true
+  Write-Host "LLM provider override: $LlmProvider"
+}
 
 function Get-ListeningProcessDetails([int]$Port) {
   $listenerProcessIds = @(
@@ -98,6 +107,13 @@ try {
   & $Python -m apps.server.main --config $Config
   exit $LASTEXITCODE
 } finally {
+  if ($llmProviderOverridden) {
+    if ($null -eq $previousLlmProvider) {
+      Remove-Item Env:VOICE_LLM_PROVIDER -ErrorAction SilentlyContinue
+    } else {
+      $env:VOICE_LLM_PROVIDER = $previousLlmProvider
+    }
+  }
   if ($analysisWorker -and -not $analysisWorker.HasExited) {
     Stop-Process -Id $analysisWorker.Id -Force -ErrorAction SilentlyContinue
   }

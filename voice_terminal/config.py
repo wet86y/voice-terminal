@@ -100,7 +100,7 @@ class AsrConfig:
 class LlmConfig:
     provider: str = "deepseek"
     base_url: str = "https://api.deepseek.com"
-    model: str = "deepseek-v4-flash"
+    model: str = "deepseek-flash"
     api_key_env: str = "DEEPSEEK_API_KEY"
     stream: bool = True
     thinking: str = "enabled"
@@ -116,6 +116,8 @@ class LlmConfig:
     transport_retry_limit: int = 2
 
     def __post_init__(self) -> None:
+        if self.provider not in {"deepseek", "opencode_go"}:
+            raise ValueError("llm.provider must be deepseek or opencode_go")
         if self.transport not in {"chat_completions", "responses"}:
             raise ValueError("llm.transport must be chat_completions or responses")
         if self.thinking not in {"disabled", "enabled"}:
@@ -269,6 +271,38 @@ class AppConfig:
         server = _section(data, "server")
         worker = _section(data, "asr_worker")
 
+        configured_llm_provider = _string(llm.get("provider"), "deepseek")
+        llm_provider_override = os.environ.get("VOICE_LLM_PROVIDER", "").strip()
+        llm_provider = llm_provider_override or configured_llm_provider
+        profile_defaults = {
+            "deepseek": {
+                "base_url": "https://api.deepseek.com",
+                "model": "deepseek-flash",
+                "api_key_env": "DEEPSEEK_API_KEY",
+            },
+            "opencode_go": {
+                "base_url": "https://opencode.ai/zen/go/v1",
+                "model": "deepseek-flash",
+                "api_key_env": "OPENCODE_GO_API_KEY",
+            },
+        }.get(llm_provider, {})
+        if llm_provider_override:
+            llm_base_url_default = str(profile_defaults.get("base_url", ""))
+            llm_model_default = str(profile_defaults.get("model", ""))
+            llm_api_key_env_default = str(profile_defaults.get("api_key_env", ""))
+        else:
+            llm_base_url_default = str(profile_defaults.get("base_url", "https://api.deepseek.com"))
+            llm_model_default = str(profile_defaults.get("model", "deepseek-flash"))
+            llm_api_key_env_default = str(profile_defaults.get("api_key_env", "DEEPSEEK_API_KEY"))
+        if llm_provider_override:
+            llm_base_url = _string(os.environ.get("VOICE_LLM_BASE_URL"), llm_base_url_default)
+            llm_model = _string(os.environ.get("VOICE_LLM_MODEL"), llm_model_default)
+            llm_api_key_env = _string(os.environ.get("VOICE_LLM_API_KEY_ENV"), llm_api_key_env_default)
+        else:
+            llm_base_url = _string(llm.get("base_url"), llm_base_url_default)
+            llm_model = _string(llm.get("model"), llm_model_default)
+            llm_api_key_env = _string(llm.get("api_key_env"), llm_api_key_env_default)
+
         worker_host = os.environ.get("ASR_WORKER_HOST", "").strip() or _string(worker.get("host"), "127.0.0.1")
         worker_port = int(os.environ.get("ASR_WORKER_PORT", "").strip() or _number(worker.get("port"), 8766))
         configured_worker_url = os.environ.get("ASR_WORKER_URL", "").strip()
@@ -357,10 +391,10 @@ class AppConfig:
                 decoder_chunk_look_back=int(_number(asr.get("decoder_chunk_look_back"), 1)),
             ),
             llm=LlmConfig(
-                provider=_string(llm.get("provider"), "deepseek"),
-                base_url=_string(llm.get("base_url"), "https://api.deepseek.com"),
-                model=_string(llm.get("model"), "deepseek-v4-flash"),
-                api_key_env=_string(llm.get("api_key_env"), "DEEPSEEK_API_KEY"),
+                provider=llm_provider,
+                base_url=llm_base_url,
+                model=llm_model,
+                api_key_env=llm_api_key_env,
                 stream=_bool(llm.get("stream"), True),
                 thinking=_string(llm.get("thinking"), "enabled"),
                 reasoning_effort=_string(llm.get("reasoning_effort"), "low"),

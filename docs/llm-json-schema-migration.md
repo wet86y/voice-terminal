@@ -1,5 +1,31 @@
 # LLM JSON Schema migration runbook
 
+## LLM provider profiles
+
+The default real-conversation backend is the official DeepSeek endpoint using
+the public model ID `deepseek-flash`, `https://api.deepseek.com`, and the local
+secret `DEEPSEEK_API_KEY`. The existing Responses/strict JSON Schema request
+path and the V0.6 WebSocket protocol are unchanged.
+
+Use OpenCode Go for debugging without editing YAML:
+
+```powershell
+./scripts/start.ps1 -LlmProvider opencode_go
+```
+
+The debug profile uses `https://opencode.ai/zen/go/v1`, the same public model
+ID `deepseek-flash`, and `OPENCODE_GO_API_KEY`. For direct Python commands,
+set `$env:VOICE_LLM_PROVIDER = "opencode_go"` before starting the process.
+
+OpenCode Go requires a client-owned User-Agent and a stable
+`x-opencode-session` header. The runtime binds that header to the current
+`conversation_id`; `session.reset` creates a new upstream session identity.
+The header is provider metadata only and is not added to public event payloads.
+
+The compatibility switch is `llm.provider`, with the process-level
+`VOICE_LLM_PROVIDER` override taking precedence. Provider fallback is explicit
+rather than automatic, so one user turn is never sent to both backends.
+
 ## Current status: post-switch bug-repair period
 
 The protocol switch is active in the test environment: every normal LLM

@@ -130,14 +130,17 @@ async def _online_checks(config) -> list[Check]:
             base_url=config.llm.base_url,
             model=config.llm.model,
             api_key=config.api_key(config.llm.api_key_env),
+            provider=config.llm.provider,
+            api_key_env=config.llm.api_key_env,
+            session_id="doctor-check" if config.llm.provider == "opencode_go" else None,
             timeout_ms=config.llm.timeout_ms,
             thinking=config.llm.thinking,
             reasoning_effort=config.llm.reasoning_effort,
         )
         await client.check()
-        checks.append(_check("online:deepseek", True, f"{config.llm.base_url}; model={config.llm.model}"))
+        checks.append(_check(f"online:{config.llm.provider}", True, f"{config.llm.base_url}; model={config.llm.model}"))
     except Exception as exc:
-        checks.append(_check("online:deepseek", False, str(exc)))
+        checks.append(_check(f"online:{config.llm.provider}", False, str(exc)))
 
     try:
         from .providers.minimax_tts import MiniMaxTtsClient

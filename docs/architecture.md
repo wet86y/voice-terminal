@@ -4,6 +4,24 @@
 
 `SessionRuntime` 是唯一装配入口。它协调但不实现输入、Agent 或语音细节。
 
+## LLM provider profiles
+
+LLM provider 只影响上游模型的连接目标，不改变 `SessionRuntime`、Responses/strict
+JSON Schema 路径、Agent 决策信封或 V0.6 WebSocket 协议。真实对话默认使用官方
+DeepSeek 的 `deepseek-flash`，读取 `DEEPSEEK_API_KEY`；调试 OpenCode Go 时可在启动
+命令中显式切换：
+
+```powershell
+.\scripts\start.ps1 -LlmProvider opencode_go
+```
+
+该调试 profile 使用 `https://opencode.ai/zen/go/v1`、`deepseek-flash` 和
+`OPENCODE_GO_API_KEY`。也可以通过 `VOICE_LLM_PROVIDER=opencode_go` 临时覆盖当前
+进程的 provider；未指定覆盖时，配置文件中的 `provider: deepseek` 保持真实测试默认值。
+两种 profile 都复用同一套 Responses 解析、strict schema 校验、重试与协议恢复逻辑，
+不启用自动 provider fallback。切回官方路径只需移除覆盖变量，或显式使用
+`-LlmProvider deepseek`。
+
 | 组件 | 输入 | 输出 | 唯一职责 |
 | --- | --- | --- | --- |
 | Conversation runtime | 生命周期事件 | `conversation_id`、`turn_id`、取消作用域 | 生命周期与显式取消 authority |

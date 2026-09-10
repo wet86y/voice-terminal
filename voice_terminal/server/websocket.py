@@ -150,12 +150,15 @@ class SessionRuntime:
             code = getattr(exc, "code", "ASR_WORKER_UNAVAILABLE")
             self._record_error("asr", f"{code}: {exc}")
 
-        deepseek_key = self.config.api_key(self.config.llm.api_key_env)
-        if deepseek_key:
+        llm_key = self.config.api_key(self.config.llm.api_key_env)
+        if llm_key:
             self.llm = DeepSeekClient(
                 base_url=self.config.llm.base_url,
                 model=self.config.llm.model,
-                api_key=deepseek_key,
+                api_key=llm_key,
+                provider=self.config.llm.provider,
+                api_key_env=self.config.llm.api_key_env,
+                session_id=self.conversation.conversation_id,
                 timeout_ms=self.config.llm.timeout_ms,
                 thinking=self.config.llm.thinking,
                 reasoning_effort=self.config.llm.reasoning_effort,
@@ -288,6 +291,8 @@ class SessionRuntime:
                 await self.controller.reset_session()
             self.history.reset()
             self.conversation.reset()
+            if self.llm is not None:
+                self.llm.set_session_id(self.conversation.conversation_id)
 
     async def close(self) -> None:
         if self.controller is not None:

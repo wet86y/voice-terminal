@@ -22,7 +22,12 @@ asr:
   device: auto
 
 llm:
-  model: deepseek-v4-flash
+  provider: deepseek
+  base_url: https://api.deepseek.com
+  model: deepseek-flash
+  api_key_env: DEEPSEEK_API_KEY
+  # Debug-only switch without editing this file:
+  # $env:VOICE_LLM_PROVIDER = "opencode_go"
   # Active test transport. chat_completions is the hidden rollback value.
   transport: responses
   # Keep disabled during the pure protocol migration baseline.
