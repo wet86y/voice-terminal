@@ -58,6 +58,40 @@ def test_responses_control_text_compatibility_is_explicit_not_global():
     assert responses.finish().speak == SpeechDecision("wait", "calm", "")
 
 
+def test_new_input_preempts_speculative_recovery_tts():
+    async def scenario():
+        cancelled = []
+
+        class Output:
+            def cancel_all(self, reason):
+                cancelled.append(reason)
+
+        async def emit(*_args):
+            return None
+
+        runtime = AgentEpisodeRuntime(
+            None,
+            SimpleNamespace(),
+            Output(),
+            emit,
+            conversation=ConversationRuntime(),
+            ledger=SessionLedger(),
+        )
+        runtime.active_recovery = object()
+        runtime.recovery_queue.append(object())
+        request = asyncio.create_task(asyncio.sleep(60))
+        runtime.active_request = request
+
+        runtime._supersede_recovery("USER_INPUT_REFINED")
+
+        await asyncio.gather(request, return_exceptions=True)
+        assert cancelled == ["superseded_recovery"]
+        assert not runtime.recovery_queue
+        assert request.cancelled()
+
+    asyncio.run(scenario())
+
+
 def test_responses_payload_separates_instructions_and_enables_strict_schema():
     client = DeepSeekClient(
         base_url="https://example.invalid", model="deepseek-v4-flash", api_key="key",

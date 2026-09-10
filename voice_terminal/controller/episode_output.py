@@ -115,6 +115,11 @@ class EpisodeSpeechOutput(SpeechPipeline):
         self.loop = None
         self.last_replacement = {}
         self.last_delivery = None
+        # The most recently settled output is diagnostic/reconciliation state,
+        # never an active continuation target.  Agent requests may use a full
+        # delivery from the preceding turn as a last-resort duplicate guard,
+        # but it must not leak back into ``speak_snapshot`` as current speech.
+        self.last_completed_speech = None
 
     @property
     def active(self):
@@ -462,9 +467,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
             status = "queued"
         value = {"queue_status": status, "text_only_queue": True, "text": h.text,
                  "speech_id": h.speech_id, "output_generation": h.workspace.generation,
+                 "conversation_id": h.identity[0], "turn_id": h.turn_id,
                  "emotion": h.emotion_requested}
-        if status == "speaking" and self.last_delivery:
-            value["delivery"] = dict(self.last_delivery)
         return value
 
     async def enqueue_text(self, identity, turn_id, text, *, emotion="calm", kind="formal"):
@@ -737,6 +741,17 @@ class EpisodeSpeechOutput(SpeechPipeline):
                         "latency": {**settled_latency,
                                      "queue_to_playback_ms": round((timings["playback"] - h.queued_at) * 1000)
                                      if "playback" in timings else None}}
+            self.last_completed_speech = {
+                "speech_id": h.speech_id,
+                "conversation_id": h.identity[0],
+                "turn_id": h.turn_id,
+                "output_generation": h.workspace.generation,
+                "text": h.text,
+                "heard_text": str(delivery.get("heard_text") or ""),
+                "delivery_status": delivery.get("status"),
+                "termination": delivery.get("termination"),
+                "status": record["status"],
+            }
             logger.info(
                 "episode.speech_final speech_id=%s conversation_id=%s request_id=%s turn_id=%s status=%s delivery=%s tts_text_sent=%s tts_audio_bytes=%s playback_started=%s",
                 h.speech_id, h.identity[0], h.identity[1], h.turn_id,

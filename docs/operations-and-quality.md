@@ -37,6 +37,7 @@ git diff --check
 2. 查 `controller.input_frame_failed`、`controller.input_capture_read_failed` 与 `AUDIO_*` 事件。前者是可恢复帧处理故障；后者才表示无法继续读取麦克风。
 3. 对照 `audio.player_first_pcm_submitted`、`audio.player_drained` 和对应的 `speech_id`。播放阶段不能自动成为 `session.stop` 的理由。
 4. 查 WebSocket 命令日志；只有明确的 `command=session.stop` 才能归因为用户停止。恢复性错误、ASR 重连和输出结算必须保持与用户停止不同的状态投影。
+5. 查 `agent.speak_context`：新轮应为 `owner_scope=none|previous_turn` 且 `continuation_allowed=False`；只有同轮活动 handle 才允许 `current_turn/True`。若紧随其后出现 `CROSS_TURN_SPEECH_PREFIX_STRIPPED`，说明模型返回了累计旧前缀，但本地已在 TTS 前安全剥离。日志中的 `baseline_chars/new_chars/suffix_chars` 可用于核对，不需要记录会话正文。
 
 受保护插话拒绝的麦克风帧仍必须写入当前轮的有界 PCM 缓存，以避免下一帧
 被误判为逻辑缺口；详见[V0.6 可靠性审计](v06-reliability-audit.md)。

@@ -20,6 +20,7 @@ from voice_terminal.controller.speech_pipeline import SpeechPipeline
 from voice_terminal.core.events import event
 from voice_terminal.providers.deepseek import DeepSeekClient
 from voice_terminal.server.snapshot import ProtocolSequencer
+from voice_terminal.session.contracts import DeliveryReport
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
 
@@ -441,10 +442,257 @@ def test_streamed_prefix_divergence_replaces_with_complete_accumulated_text():
                                       conversation=conversation, ledger=SessionLedger())
         runtime.episode_id = conversation.conversation_id; runtime.last_turn_id = "turn"
         runtime.inputs = {"turn": {"text": "你好", "final": True}}
+        Output.speak_snapshot.update(conversation_id=runtime.episode_id, turn_id="turn")
         identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"
         runtime._identity_turns[identity] = "turn"
         await runtime._step(identity, {"USER_INPUT_REFINED"})
         assert seen["replace"] == 1 and seen["feeds"] == ["已有改", "正"]
+    asyncio.run(scenario())
+
+
+def test_model_speak_state_separates_knowledge_from_continuation_authority():
+    snapshot = {
+        "queue_status": "speaking", "conversation_id": "conversation",
+        "turn_id": "old_turn", "text": "上一轮仍在播放", "speech_id": "speech",
+    }
+    previous = AgentEpisodeRuntime._model_speak_state(
+        snapshot, conversation_id="conversation", turn_id="new_turn",
+    )
+    assert previous == {
+        "state": "speaking", "owner_scope": "previous_turn",
+        "continuation_allowed": False, "observed_text": "上一轮仍在播放",
+    }
+    current = AgentEpisodeRuntime._model_speak_state(
+        snapshot, conversation_id="conversation", turn_id="old_turn",
+    )
+    assert current == {
+        "state": "speaking", "owner_scope": "current_turn",
+        "continuation_allowed": True, "target_text": "上一轮仍在播放",
+    }
+    assert AgentEpisodeRuntime._model_speak_state(
+        {"queue_status": "empty"}, conversation_id="conversation", turn_id="new_turn",
+    ) == {"state": "empty", "owner_scope": "none", "continuation_allowed": False}
+
+
+def test_speak_snapshot_never_attaches_delivery_from_a_different_handle():
+    output = object.__new__(EpisodeSpeechOutput)
+    output._pending = []
+    output.last_delivery = {"heard_text": "旧语音", "speech_id": "old_speech"}
+    output.handle = SimpleNamespace(
+        reason=None,
+        task=SimpleNamespace(done=lambda: False),
+        workspace=SimpleNamespace(playback_started=True, generation=2),
+        state="READY",
+        text="新语音",
+        speech_id="new_speech",
+        identity=("conversation", "request"),
+        turn_id="new_turn",
+        emotion_requested="calm",
+    )
+
+    snapshot = output.speak_snapshot
+
+    assert snapshot["conversation_id"] == "conversation"
+    assert snapshot["turn_id"] == "new_turn"
+    assert snapshot["text"] == "新语音"
+    assert "delivery" not in snapshot
+
+
+def test_completed_prefix_guard_is_conversation_scoped_and_requires_full_delivery():
+    output = SimpleNamespace(last_completed_speech={
+        "speech_id": "old", "conversation_id": "other_conversation",
+        "turn_id": "old_turn", "output_generation": 1,
+        "heard_text": "已经播放", "delivery_status": "full", "status": "completed",
+    })
+    runtime = AgentEpisodeRuntime(
+        None, SimpleNamespace(), output, lambda *_args: None,
+        conversation=ConversationRuntime(), ledger=SessionLedger(),
+    )
+
+    assert runtime._completed_speech_guard(("conversation", "request"), "new_turn") is None
+    output.last_completed_speech["conversation_id"] = "conversation"
+    output.last_completed_speech["delivery_status"] = "partial"
+    assert runtime._completed_speech_guard(("conversation", "request"), "new_turn") is None
+    output.last_completed_speech["delivery_status"] = "full"
+    assert runtime._completed_speech_guard(("conversation", "request"), "new_turn")["text"] == "已经播放"
+
+
+def test_active_previous_turn_prefix_is_replaced_with_suffix_not_appended():
+    async def scenario():
+        seen = {"feeds": [], "replace": 0, "append": 0}
+
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"上一轮正在播放。'}
+                    yield {"type": "content", "text": '这是当前轮的新回答。"},"actions":[]}' }
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Handle:
+            speech_id = "replacement"
+            async def feed(self, value): seen["feeds"].append(value)
+            async def finish(self): seen["finished"] = True
+
+        class Output:
+            status = "SPEAKING"
+            last_completed_speech = None
+            speak_snapshot = None
+            async def replace_current(self, *_args, **_kwargs):
+                seen["replace"] += 1
+                return Handle()
+            async def append_successor(self, *_args, **_kwargs):
+                seen["append"] += 1
+                return Handle()
+
+        events = []
+        async def emit(kind, payload): events.append((kind, payload))
+        conversation = ConversationRuntime(); conversation.begin_turn("new_turn")
+        Output.speak_snapshot = {
+            "queue_status": "speaking", "conversation_id": conversation.conversation_id,
+            "turn_id": "old_turn", "speech_id": "old_speech", "output_generation": 1,
+            "text": "上一轮正在播放。",
+        }
+        runtime = AgentEpisodeRuntime(Provider(), Registry(), Output(), emit,
+                                      conversation=conversation, ledger=SessionLedger())
+        runtime.episode_id = conversation.conversation_id; runtime.last_turn_id = "new_turn"
+        runtime.inputs = {"new_turn": {"text": "继续", "final": True}}
+        identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"
+        runtime._identity_turns[identity] = "new_turn"
+
+        await runtime._step(identity, {"USER_INPUT_FINALIZED"})
+
+        assert seen["replace"] == 1 and seen["append"] == 0
+        assert seen["feeds"] == ["这是当前轮的新回答。"] and seen["finished"]
+        traces = [payload for kind, payload in events if kind == "agent.trace"]
+        stripped = next(item for item in traces
+                        if item["kind"] == "CROSS_TURN_SPEECH_PREFIX_STRIPPED")
+        assert stripped["baseline_source"] == "active_previous_guard"
+
+    asyncio.run(scenario())
+
+
+def test_streamed_cross_turn_completed_prefix_is_stripped_before_tts():
+    async def scenario():
+        seen = {"feeds": [], "append": 0}
+
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"能听到，你说吧，我在。'}
+                    yield {"type": "content", "text": '我自己起名字的话，就叫小听吧。"},"actions":[]}' }
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Handle:
+            speech_id = "new_speech"
+            async def feed(self, value): seen["feeds"].append(value)
+            async def finish(self): seen["finished"] = True
+
+        class Output:
+            status = "IDLE"
+            speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+            last_completed_speech = None
+            async def begin(self, *_args, **_kwargs): return Handle()
+            async def append_successor(self, *_args, **_kwargs):
+                seen["append"] += 1
+                return Handle()
+
+        events = []
+        async def emit(kind, payload): events.append((kind, payload))
+        conversation = ConversationRuntime(); conversation.begin_turn("new_turn")
+        output = Output()
+        output.last_completed_speech = {
+            "speech_id": "old_speech", "conversation_id": conversation.conversation_id,
+            "turn_id": "old_turn", "output_generation": 1,
+            "text": "能听到，你说吧，我在。", "heard_text": "能听到，你说吧，我在。",
+            "delivery_status": "full", "termination": "completed", "status": "completed",
+        }
+        ledger = SessionLedger(); ledger.commit_input("old_turn", "能听到吗")
+        ledger.commit_delivery(
+            "old_speech", "能听到，你说吧，我在。",
+            DeliveryReport(
+                status="full", termination="completed", heard_text="能听到，你说吧，我在。",
+            ),
+        )
+        runtime = AgentEpisodeRuntime(Provider(), Registry(), output, emit,
+                                      conversation=conversation, ledger=ledger)
+        runtime.episode_id = conversation.conversation_id; runtime.last_turn_id = "new_turn"
+        runtime.inputs = {"new_turn": {"text": "给自己起个名字", "final": True}}
+        identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"
+        runtime._identity_turns[identity] = "new_turn"
+
+        await runtime._step(identity, {"USER_INPUT_FINALIZED"})
+
+        assert seen["feeds"] == ["我自己起名字的话，就叫小听吧。"]
+        assert seen["append"] == 0 and seen["finished"]
+        traces = [payload for kind, payload in events if kind == "agent.trace"]
+        assert any(item["kind"] == "CROSS_TURN_SPEECH_PREFIX_STRIPPED" for item in traces)
+        context = runtime.messages({"USER_INPUT_FINALIZED"})
+        assert any(item["role"] == "assistant" and item["content"] == "能听到，你说吧，我在。"
+                   for item in context)
+        runtime_tail = next(item["content"] for item in context
+                            if item.get("context_lane") == "request_tail" and "当前轮运行状态" in item["content"])
+        assert '"state":"empty"' in runtime_tail
+        assert '"continuation_allowed":false' in runtime_tail
+        assert "target_text" not in runtime_tail
+
+    asyncio.run(scenario())
+
+
+def test_exact_previous_completed_text_remains_a_valid_explicit_replay():
+    async def scenario():
+        seen = []
+
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"请再说一遍。"},"actions":[]}' }
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Handle:
+            speech_id = "replay"
+            async def feed(self, value): seen.append(value)
+            async def finish(self): pass
+
+        class Output:
+            status = "IDLE"
+            speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+            last_completed_speech = None
+            async def begin(self, *_args, **_kwargs): return Handle()
+
+        async def emit(*_args): pass
+        conversation = ConversationRuntime(); conversation.begin_turn("new_turn")
+        output = Output()
+        output.last_completed_speech = {
+            "speech_id": "old", "conversation_id": conversation.conversation_id,
+            "turn_id": "old_turn", "output_generation": 1, "text": "请再说一遍。",
+            "heard_text": "请再说一遍。", "delivery_status": "full",
+            "termination": "completed", "status": "completed",
+        }
+        runtime = AgentEpisodeRuntime(Provider(), Registry(), output, emit,
+                                      conversation=conversation, ledger=SessionLedger())
+        runtime.episode_id = conversation.conversation_id; runtime.last_turn_id = "new_turn"
+        runtime.inputs = {"new_turn": {"text": "再说一遍", "final": True}}
+        identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"
+        runtime._identity_turns[identity] = "new_turn"
+
+        await runtime._step(identity, {"USER_INPUT_FINALIZED"})
+        assert seen == ["请再说一遍。"]
+
     asyncio.run(scenario())
 
 
@@ -480,6 +728,7 @@ def test_streamed_full_text_prefix_queues_only_suffix_without_replacement():
                                       conversation=conversation, ledger=SessionLedger())
         runtime.episode_id = conversation.conversation_id; runtime.last_turn_id = "turn"
         runtime.inputs = {"turn": {"text": "你好", "final": True}}
+        Output.speak_snapshot.update(conversation_id=runtime.episode_id, turn_id="turn")
         identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"
         runtime._identity_turns[identity] = "turn"
         await runtime._step(identity, {"USER_INPUT_REFINED"})
