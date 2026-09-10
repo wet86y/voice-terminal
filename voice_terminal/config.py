@@ -113,6 +113,7 @@ class LlmConfig:
     shadow_thinking_enabled: bool = False
     thinking_action_enabled: bool = False
     protocol_recovery_limit: int = 1
+    transport_retry_limit: int = 2
 
     def __post_init__(self) -> None:
         if self.transport not in {"chat_completions", "responses"}:
@@ -127,6 +128,8 @@ class LlmConfig:
             raise ValueError("llm.shadow_sample_rate must be between zero and one")
         if self.protocol_recovery_limit < 0:
             raise ValueError("llm.protocol_recovery_limit cannot be negative")
+        if self.transport_retry_limit < 0:
+            raise ValueError("llm.transport_retry_limit cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -369,6 +372,7 @@ class AppConfig:
                 shadow_thinking_enabled=_bool(llm.get("shadow_thinking_enabled"), False),
                 thinking_action_enabled=_bool(llm.get("thinking_action_enabled"), False),
                 protocol_recovery_limit=max(0, int(_number(llm.get("protocol_recovery_limit"), 1))),
+                transport_retry_limit=max(0, int(_number(llm.get("transport_retry_limit"), 2))),
             ),
             tts=TtsConfig(
                 provider=_string(tts.get("provider"), "minimax"),

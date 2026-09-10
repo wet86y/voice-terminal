@@ -25,6 +25,22 @@ It stores normalized metadata in the bounded Agent snapshot and server log:
 validity, state, action names, character counts, latency, usage and error
 classification. Model output and reasoning text remain transient.
 
+Protocol recovery is deliberately small and event-driven. A Responses decision
+may use one immediate correction for blank output, an invalid envelope/action,
+or `response.incomplete` caused by `max_output_tokens`. The immediate request
+receives a short error-specific system instruction. If that correction also
+fails, the runtime publishes a deterministic recoverable error, settles a
+finalized turn with no active speech, and returns to `WAITING_EVENT`. Recovery
+exhaustion never inserts another scheduler event: only a later user,
+refinement, endpoint, or tool event may re-enter the ordinary 400 ms lane, at
+which point the deferred problem code is supplied once. This prevents a 2.5 Hz
+"slow storm" while keeping continuous conversation available.
+
+`response.incomplete/content_filter`, `response.failed`, and a stream missing
+its terminal event are provider/policy failures rather than model-format
+errors. They do not consume the protocol correction budget or ask the model to
+repair itself. Transient HTTP retries use a separate bounded budget.
+
 The 2026-09-10 live capability probe accepted the three production shapes
 (`no_actions`, `tools`, and `tools_and_thinking`) with HTTP 200/completed. The
 provider requires every declared object property in `required` and still

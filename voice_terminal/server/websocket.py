@@ -166,6 +166,7 @@ class SessionRuntime:
                 shadow_thinking_enabled=self.config.llm.shadow_thinking_enabled,
                 thinking_action_enabled=self.config.llm.thinking_action_enabled,
                 protocol_recovery_limit=self.config.llm.protocol_recovery_limit,
+                transport_retry_limit=self.config.llm.transport_retry_limit,
             )
             self.state.set_service("llm", "READY")
         else:

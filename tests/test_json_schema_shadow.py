@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 from voice_terminal.agent.decision_envelope import Action, DecisionEnvelope, SpeechDecision
@@ -9,6 +10,7 @@ from voice_terminal.agent.decision_schema import THINKING_ACTION, decision_schem
 from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.providers.deepseek import DeepSeekClient
 from voice_terminal.providers.deepseek import DeepSeekError
+from voice_terminal.providers.deepseek import DeepSeekResponseTerminalError
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
 
@@ -140,6 +142,197 @@ def test_responses_failed_terminal_never_yields_finish():
             assert "response.failed" in str(exc)
         else:
             raise AssertionError("failed Responses terminal must raise")
+
+    asyncio.run(scenario())
+
+
+def test_responses_done_text_repairs_missing_delta_suffix_before_finish():
+    async def scenario():
+        full = '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}'
+        prefix = full[:24]
+
+        class Response:
+            status_code = 200
+
+            async def aiter_lines(self):
+                yield 'data: ' + json.dumps({"type": "response.output_text.delta", "delta": prefix})
+                yield 'data: ' + json.dumps({"type": "response.output_text.done", "text": full})
+                yield 'data: {"type":"response.completed","response":{"status":"completed"}}'
+
+        class Context:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Http:
+            def stream(self, *_args, **_kwargs):
+                return Context()
+
+        client = DeepSeekClient(
+            base_url="https://example.invalid", model="model", api_key="key",
+            transport="responses", thinking="disabled",
+        )
+        client._client = Http()
+        events = [item async for item in client.stream_events(
+            [{"role": "user", "content": "hello"}], schema=decision_schema([]),
+        )]
+        assert "".join(item["text"] for item in events if item["type"] == "content") == full
+        assert events[-1] == {"type": "finish", "reason": "completed"}
+
+    asyncio.run(scenario())
+
+
+def test_responses_incomplete_preserves_machine_readable_reason():
+    async def scenario():
+        class Response:
+            status_code = 200
+
+            async def aiter_lines(self):
+                yield ('data: {"type":"response.incomplete","response":{"status":"incomplete",'
+                       '"incomplete_details":{"reason":"max_output_tokens"}}}')
+
+        class Context:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Http:
+            def stream(self, *_args, **_kwargs):
+                return Context()
+
+        client = DeepSeekClient(
+            base_url="https://example.invalid", model="model", api_key="key",
+            transport="responses", thinking="disabled",
+        )
+        client._client = Http()
+        try:
+            _ = [item async for item in client.stream_events(
+                [{"role": "user", "content": "hello"}], schema=decision_schema([]),
+            )]
+        except DeepSeekResponseTerminalError as exc:
+            assert exc.terminal_kind == "response.incomplete"
+            assert exc.reason == "max_output_tokens"
+        else:
+            raise AssertionError("incomplete terminal must remain distinguishable")
+
+    asyncio.run(scenario())
+
+
+def test_runtime_gives_max_output_incomplete_the_single_protocol_recovery():
+    async def scenario():
+        class Provider:
+            supports_decision_schema = True
+            transport = "responses"
+            thinking_action_enabled = False
+            protocol_recovery_limit = 1
+
+            def stream_events(self, _messages, **_kwargs):
+                async def stream():
+                    raise DeepSeekResponseTerminalError(
+                        "response.incomplete", status="incomplete",
+                        reason="max_output_tokens",
+                    )
+                    yield  # pragma: no cover
+
+                return stream()
+
+        runtime = _runtime(Provider())
+        runtime.inputs["turn-a"] = {"text": "hello", "final": True}
+        identity = (runtime.episode_id, "request-a")
+        runtime._identity_turns[identity] = "turn-a"
+        # Exercise _step in isolation; the scheduler behavior is covered by
+        # test_whitespace_recovery_reproduction.py.
+        runtime.runner = asyncio.create_task(asyncio.Event().wait())
+        outcome = await runtime._step(identity, {"USER_INPUT_FINALIZED"})
+        assert outcome == "recovery_queued"
+        assert len(runtime.recovery_queue) == 1
+        assert runtime.recovery_queue[0].code == "RESPONSES_INCOMPLETE"
+        runtime.runner.cancel()
+        await asyncio.gather(runtime.runner, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_runtime_does_not_ask_model_to_correct_content_filter():
+    async def scenario():
+        class Provider:
+            supports_decision_schema = True
+            transport = "responses"
+            thinking_action_enabled = False
+            protocol_recovery_limit = 1
+
+            def stream_events(self, _messages, **_kwargs):
+                async def stream():
+                    raise DeepSeekResponseTerminalError(
+                        "response.incomplete", status="incomplete",
+                        reason="content_filter",
+                    )
+                    yield  # pragma: no cover
+
+                return stream()
+
+        runtime = _runtime(Provider())
+        emitted = []
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+
+        runtime.emit = emit
+        runtime.inputs["turn-a"] = {"text": "hello", "final": True}
+        identity = (runtime.episode_id, "request-a")
+        runtime._identity_turns[identity] = "turn-a"
+        outcome = await runtime._step(identity, {"USER_INPUT_FINALIZED"})
+        assert outcome == "terminal_failure"
+        assert not runtime.recovery_queue
+        assert any(kind == "error" and payload.get("code") == "LLM_OUTPUT_FILTERED"
+                   for kind, payload in emitted)
+
+    asyncio.run(scenario())
+
+
+def test_transport_retry_exhaustion_waits_for_an_external_event():
+    async def scenario():
+        class Provider:
+            supports_decision_schema = False
+            transport = "responses"
+            transport_retry_limit = 0
+
+            def __init__(self):
+                self.calls = 0
+
+            def stream_events(self, _messages, **_kwargs):
+                async def stream():
+                    self.calls += 1
+                    raise DeepSeekError("DeepSeek Responses HTTP 503: unavailable")
+                    yield  # pragma: no cover
+
+                return stream()
+
+        provider = Provider()
+        runtime = _runtime(provider)
+        emitted = []
+        unavailable = asyncio.Event()
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+            if kind == "error" and payload.get("code") == "LLM_PROVIDER_UNAVAILABLE":
+                unavailable.set()
+
+        runtime.emit = emit
+        runtime.inputs["turn-a"] = {"text": "hello", "final": True}
+        runtime._wake("USER_INPUT_FINALIZED")
+        await asyncio.wait_for(unavailable.wait(), timeout=1.0)
+        await asyncio.sleep(0.05)
+        assert provider.calls == 1
+        assert not runtime.pending and not runtime.recovery_queue
+        assert any(kind == "agent.turn_settled" and payload.get("outcome") == "provider_unavailable"
+                   for kind, payload in emitted)
+        runtime.runner.cancel()
+        await asyncio.gather(runtime.runner, return_exceptions=True)
 
     asyncio.run(scenario())
 

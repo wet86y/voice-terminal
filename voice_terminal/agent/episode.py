@@ -61,10 +61,9 @@ def _load_o200k_encoding() -> None:
 class RecoverySignal:
     """One model-correctable protocol failure.
 
-    A signal is consumed exactly once by the immediate recovery lane.  If the
-    recovery request fails again it creates a new signal, which is how a
-    persistently misbehaving model keeps receiving actionable feedback without
-    duplicating one parser error several times.
+    A signal is consumed exactly once by the immediate recovery lane.  A
+    failed recovery returns to the ordinary event-driven scheduler; it must
+    never keep waking the model by itself.
     """
 
     code: str
@@ -189,6 +188,7 @@ class AgentEpisodeRuntime:
         self.last_reasoning = None
         self.delay_task = None
         self.recovery_queue: deque[RecoverySignal] = deque()
+        self.deferred_recovery_feedback: deque[RecoverySignal] = deque(maxlen=4)
         self.minor_protocol_feedback: deque[dict[str, str]] = deque(maxlen=8)
         self.active_recovery: RecoverySignal | None = None
         self.last_llm_completed_at: float | None = None
@@ -227,6 +227,7 @@ class AgentEpisodeRuntime:
         self._thinking_prefix_by_turn: dict[str, str] = {}
         self._thinking_barrier_generation = 0
         self._recovery_attempts_by_turn: dict[str, int] = {}
+        self._transport_retry_attempts_by_turn: dict[str, int] = {}
 
     def snapshot(self, *, include_history=True):
         value = {"conversation_id": self.episode_id, "trace_id": self.agent_step_id,
@@ -287,15 +288,20 @@ class AgentEpisodeRuntime:
             "SENTENCE_CREATED", "SENTENCE_REVISED", "SPEAK_STATE_CHANGED",
             "ACTION_STARTED", "ACTION_COMPLETED", "SPEAK_ENVELOPE_INVALID", "EMOTION_NORMALIZED",
             "LLM_EMPTY_OUTPUT",
+            "RESPONSES_INCOMPLETE", "LLM_OUTPUT_FILTERED", "LLM_PROVIDER_UNAVAILABLE",
             "SPEAK_REPLACEMENT_INTERCEPTED",
             "OUTPUT_CANCELLED", "OUTPUT_REPLACED",
-            "LLM_RECOVERY_EXHAUSTED", "THINKING_REQUESTED", "THINKING_BARRIER_READY",
+            "LLM_RECOVERY_EXHAUSTED", "LLM_TRANSPORT_RETRY_EXHAUSTED",
+            "THINKING_REQUESTED", "THINKING_BARRIER_READY",
             "THINKING_BARRIER_STALE", "THINKING_PREFIX_DIVERGED",
         }:
             logger.info(
-                "agent.trace kind=%s episode_id=%s request_id=%s turn=%s events=%s reason=%s status=%s speech_id=%s",
+                "agent.trace kind=%s episode_id=%s request_id=%s turn=%s events=%s reason=%s "
+                "status=%s speech_id=%s code=%s attempts=%s limit=%s terminal=%s",
                 kind, source[0], source[1], item["turn_id"],
                 payload.get("events"), payload.get("reason"), payload.get("status"), payload.get("speech_id"),
+                payload.get("code"), payload.get("attempts"), payload.get("limit"),
+                payload.get("terminal_kind"),
             )
         await self.emit("agent.trace", item)
         # A late output transaction may still need a trace after its Episode
@@ -469,9 +475,11 @@ class AgentEpisodeRuntime:
         self.context_compaction = {}
         self.provider_prompt_tokens = None
         self.minor_protocol_feedback.clear()
+        self.deferred_recovery_feedback.clear()
         self._thinking_lease_turn = None
         self._thinking_prefix_by_turn.clear()
         self._recovery_attempts_by_turn.clear()
+        self._transport_retry_attempts_by_turn.clear()
         self._start_tokenizer_prewarm()
         self.registry.begin_turn(self.episode_id)
         if turn_id and text and text.strip():
@@ -547,25 +555,41 @@ class AgentEpisodeRuntime:
         """Queue one immediate, model-correctable protocol recovery.
 
         This method is intentionally the only bypass of the ordinary 400 ms
-        gate.  Deduplication is scoped to one provider response: callers pass
-        a single signal for a single failure, while a later failed recovery
-        creates a new signal and is therefore reported again.
+        gate.  Once the turn-scoped budget is exhausted, the failure is
+        reported locally and retained for the next *externally woken* ordinary
+        request.  Exhaustion itself never schedules another provider call.
         """
         source_turn = turn_id or (self._identity_turns.get(identity) if identity else self.last_turn_id)
-        if getattr(self.provider, "transport", "chat_completions") == "responses":
-            limit = int(getattr(self.provider, "protocol_recovery_limit", 1))
-            attempts = self._recovery_attempts_by_turn.get(source_turn or "", 0)
-            if attempts >= limit:
-                await self.log("LLM_RECOVERY_EXHAUSTED", identity=identity, turn_id=source_turn,
-                               code=str(code), attempts=attempts, limit=limit)
-                return None
-            self._recovery_attempts_by_turn[source_turn or ""] = attempts + 1
         signal = RecoverySignal(
             code=str(code), message=str(message)[:500],
             source_request_id=identity[1] if identity else self.agent_step_id,
             source_turn_id=source_turn,
             delivery_feedback=delivery_feedback if isinstance(delivery_feedback, dict) else None,
         )
+        if getattr(self.provider, "transport", "chat_completions") == "responses":
+            limit = int(getattr(self.provider, "protocol_recovery_limit", 1))
+            attempts = self._recovery_attempts_by_turn.get(source_turn or "", 0)
+            if attempts >= limit:
+                await self.log("LLM_RECOVERY_EXHAUSTED", identity=identity, turn_id=source_turn,
+                               code=str(code), attempts=attempts, limit=limit)
+                self.deferred_recovery_feedback.append(signal)
+                await self.emit("error", {
+                    "conversation_id": identity[0] if identity else self.episode_id,
+                    "request_id": identity[1] if identity else self.agent_step_id,
+                    "turn_id": source_turn,
+                    "input_id": source_turn,
+                    "code": "LLM_PROTOCOL_RECOVERY_EXHAUSTED",
+                    "message": "模型连续返回无效格式，本轮未能生成回复；你可以继续说话。",
+                    "recoverable": True,
+                    "problem_code": str(code),
+                    "retry_after_event": True,
+                })
+                latest = self.inputs.get(source_turn or "", {})
+                if latest.get("final") and not self.output.active:
+                    await self._emit_turn_settled(identity or self.identity(), source_turn,
+                                                  "protocol_recovery_exhausted")
+                return None
+            self._recovery_attempts_by_turn[source_turn or ""] = attempts + 1
         if self.active_recovery is not None:
             await self.log("LLM_RECOVERY_FAILED", identity=identity,
                            turn_id=signal.source_turn_id,
@@ -580,6 +604,40 @@ class AgentEpisodeRuntime:
         if self.runner is None or self.runner.done():
             self.runner = asyncio.create_task(self._run(), name="agent-episode")
         return signal
+
+    @staticmethod
+    def _recovery_instruction(code: str, *, deferred: bool = False) -> str:
+        """Return a short deterministic instruction for a known model error."""
+
+        prefix = (
+            "上一次即时纠正仍未通过，本次已回到普通事件调度。不要延续或解释错误；"
+            "请根据当前最新输入重新生成。"
+            if deferred else
+            "失败输出未写入会话历史。这是本用户轮次唯一一次即时自动纠正。"
+        )
+        templates = {
+            "LLM_EMPTY_OUTPUT": (
+                "上一次输出为空白。只输出一个完整 JSON 对象，顶层只能有 speak 和 actions；"
+                "首个非空白字符必须是 {，末个必须是 }。需要等待也必须输出完整的 "
+                "speak.state=wait，不能用空白代替。"
+            ),
+            "SPEAK_ENVELOPE_INVALID": (
+                "上一次输出未通过语音信封校验。只输出完整 JSON，顶层只能有 speak 和 actions。"
+                "state=speak 时 text 必须非空；state=wait 或 cancel 时 text 必须为空字符串。"
+                "不要输出 JSON 外文本。"
+            ),
+            "TOOL_PROTOCOL_ERROR": (
+                "上一次 actions 不符合当前动作目录，失败动作未执行。actions 只能使用当前目录中的"
+                "名称和精确参数；不需要动作时输出 actions:[]。同时输出完整 speak 字段，"
+                "不要输出 JSON 外文本。"
+            ),
+            "RESPONSES_INCOMPLETE": (
+                "上一次输出因长度上限未完成，截断内容未提交。请缩短内容并输出一个完整 JSON 对象；"
+                "顶层只能有 speak 和 actions，不要输出 JSON 外文本。"
+            ),
+        }
+        instruction = templates.get(code, templates["SPEAK_ENVELOPE_INVALID"])
+        return prefix + instruction + "重新处理最后一条用户输入。"
 
     async def _record_emotion_normalizations(self, parser, *, identity, turn_id) -> None:
         """Make benign model protocol repairs visible to the next LLM poll."""
@@ -829,10 +887,16 @@ class AgentEpisodeRuntime:
                     self.active_request_count += 1
                     self.max_request_concurrency = max(self.max_request_concurrency, self.active_request_count)
                     try:
-                        await self.active_request
+                        step_outcome = await self.active_request
                         if recovery and recovery_signal is not None:
-                            await self.log("LLM_RECOVERY_COMPLETED", identity=identity,
-                                           error_id=recovery_signal.error_id)
+                            await self.log(
+                                "LLM_RECOVERY_COMPLETED" if step_outcome == "completed"
+                                else "LLM_RECOVERY_FAILED",
+                                identity=identity, error_id=recovery_signal.error_id,
+                                outcome=step_outcome or "cancelled",
+                            )
+                        if step_outcome == "completed":
+                            self._transport_retry_attempts_by_turn.pop(source_turn_id or "", None)
                         self.backoff_step = 0
                         self.backoff_until = 0.0
                     except asyncio.CancelledError:
@@ -841,20 +905,44 @@ class AgentEpisodeRuntime:
                     except Exception as exc:
                         await self.log("AGENT_ERROR", error=str(exc)[:300])
                         text_error = str(exc)
-                        if any(marker in text_error for marker in ("429", "HTTP 5", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504")):
-                            waits = (0.8, 1.6, 3.2, 8.0)
-                            self.backoff_step = min(self.backoff_step + 1, len(waits))
-                            wait_seconds = waits[self.backoff_step - 1]
-                            self.backoff_until = time.monotonic() + wait_seconds
-                            await self.log("LLM_BACKOFF", seconds=wait_seconds, step=self.backoff_step)
-                            self.pending.add("LLM_RETRY")
-                            if self.queue.empty():
-                                self.queue.put_nowait(True)
+                        retryable = any(marker in text_error for marker in (
+                            "429", "HTTP 5", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504",
+                        ))
+                        if retryable:
+                            retry_key = source_turn_id or ""
+                            attempts = self._transport_retry_attempts_by_turn.get(retry_key, 0)
+                            limit = int(getattr(self.provider, "transport_retry_limit", 2))
+                            if attempts >= limit:
+                                await self.log("LLM_TRANSPORT_RETRY_EXHAUSTED", identity=identity,
+                                               turn_id=source_turn_id, attempts=attempts, limit=limit)
+                                await self.emit("error", {
+                                    "conversation_id": identity[0], "request_id": identity[1],
+                                    "turn_id": source_turn_id, "input_id": source_turn_id,
+                                    "code": "LLM_PROVIDER_UNAVAILABLE",
+                                    "message": "模型服务暂时不可用，本轮未完成；请稍后继续。",
+                                    "recoverable": True, "retry_after_event": True,
+                                })
+                                latest = self.inputs.get(source_turn_id or "", {})
+                                if latest.get("final") and not self.output.active:
+                                    await self._emit_turn_settled(identity, source_turn_id,
+                                                                  "provider_unavailable")
+                                self.backoff_step = 0
+                                self.backoff_until = 0.0
+                            else:
+                                self._transport_retry_attempts_by_turn[retry_key] = attempts + 1
+                                waits = (0.8, 1.6, 3.2, 8.0)
+                                self.backoff_step = min(attempts + 1, len(waits))
+                                wait_seconds = waits[self.backoff_step - 1]
+                                self.backoff_until = time.monotonic() + wait_seconds
+                                await self.log("LLM_BACKOFF", seconds=wait_seconds, step=self.backoff_step)
+                                self.pending.add("LLM_RETRY")
+                                if self.queue.empty():
+                                    self.queue.put_nowait(True)
                         else:
                             self.backoff_step = 0
                             self.backoff_until = 0.0
                         latest = self.inputs.get(source_turn_id or "", {})
-                        if latest.get("final") and not self.output.active:
+                        if latest.get("final") and not self.output.active and not retryable:
                             await self._emit_turn_settled(identity, source_turn_id, "agent_error")
                     finally:
                         self.active_request_count = max(0, self.active_request_count - 1)
@@ -992,18 +1080,26 @@ class AgentEpisodeRuntime:
             feedback = {
                 "error_id": recovery_signal.error_id,
                 "code": recovery_signal.code,
-                "message": recovery_signal.message,
                 "source_request_id": recovery_signal.source_request_id,
-                "delivery_feedback": recovery_signal.delivery_feedback,
-                "instruction": (
-                    "立即纠正本次协议/动作错误。失败内容未加入会话历史。"
-                    "最终必须是一个 JSON 对象且恰好包含 speak、actions 两个顶层字段；"
-                    "speak 是字段而不是工具调用。第一个非空白字符必须是 {，最后一个必须是 }。"
-                ),
+                "instruction": self._recovery_instruction(recovery_signal.code),
             }
             messages.append({
                 "role": "system",
                 "content": "即时恢复反馈：" + json.dumps(feedback, ensure_ascii=False),
+            })
+        elif self.deferred_recovery_feedback:
+            # Recovery exhaustion does not wake the model.  The latest failure
+            # is supplied only when a real user/tool/refinement event later
+            # reaches the ordinary 400 ms scheduler.
+            deferred = self.deferred_recovery_feedback[-1]
+            self.deferred_recovery_feedback.clear()
+            messages.append({
+                "role": "system",
+                "content": "上一轮恢复问题：" + json.dumps({
+                    "code": deferred.code,
+                    "source_request_id": deferred.source_request_id,
+                    "instruction": self._recovery_instruction(deferred.code, deferred=True),
+                }, ensure_ascii=False),
             })
         self._update_context_metrics(messages)
         return messages
@@ -1506,6 +1602,7 @@ class AgentEpisodeRuntime:
                 "conversation_id": identity[0], "request_id": identity[1],
                 "turn_id": source_turn_id, "status": "committed",
             })
+            return "completed"
         except (EnvelopeError, ValueError, json.JSONDecodeError) as exc:
             if speech_handle is not None:
                 try:
@@ -1538,8 +1635,61 @@ class AgentEpisodeRuntime:
                 cancel = getattr(self.output, "cancel", None)
                 if callable(cancel):
                     cancel(getattr(speech_handle, "speech_id", None), "cancelled")
-            await self._queue_recovery(recovery_code, error_text,
-                                       identity=identity, turn_id=source_turn_id)
+            queued = await self._queue_recovery(recovery_code, error_text,
+                                                identity=identity, turn_id=source_turn_id)
+            return "recovery_queued" if queued is not None else "recovery_exhausted"
+        except Exception as exc:
+            terminal_kind = getattr(exc, "terminal_kind", None)
+            if terminal_kind is None:
+                raise
+            reason = getattr(exc, "reason", None)
+            if speech_handle is not None:
+                try:
+                    await finish_streamed_speech()
+                except Exception:
+                    pass
+                cancel = getattr(self.output, "cancel", None)
+                if callable(cancel):
+                    cancel(getattr(speech_handle, "speech_id", None), "cancelled")
+            if terminal_kind == "response.incomplete" and reason == "max_output_tokens":
+                await self.log("RESPONSES_INCOMPLETE", identity=identity,
+                               turn_id=source_turn_id, reason=reason,
+                               partial_speech=speech_handle is not None)
+                queued = await self._queue_recovery(
+                    "RESPONSES_INCOMPLETE", "max_output_tokens",
+                    identity=identity, turn_id=source_turn_id,
+                )
+                return "recovery_queued" if queued is not None else "recovery_exhausted"
+            if terminal_kind == "response.completed" and reason == "stream_final_mismatch":
+                await self.log("SPEAK_ENVELOPE_INVALID", identity=identity,
+                               turn_id=source_turn_id,
+                               classification="stream_final_mismatch",
+                               partial_speech=speech_handle is not None)
+                queued = await self._queue_recovery(
+                    "SPEAK_ENVELOPE_INVALID", "stream_final_mismatch",
+                    identity=identity, turn_id=source_turn_id,
+                )
+                return "recovery_queued" if queued is not None else "recovery_exhausted"
+
+            filtered = terminal_kind == "response.incomplete" and reason == "content_filter"
+            code = "LLM_OUTPUT_FILTERED" if filtered else "LLM_PROVIDER_UNAVAILABLE"
+            message = (
+                "本轮内容无法生成；请换一种说法。" if filtered else
+                "模型服务暂时不可用，本轮未完成；请稍后继续。"
+            )
+            await self.log(code, identity=identity, turn_id=source_turn_id,
+                           terminal_kind=terminal_kind, reason=reason)
+            await self.emit("error", {
+                "conversation_id": identity[0], "request_id": identity[1],
+                "turn_id": source_turn_id, "input_id": source_turn_id,
+                "code": code, "message": message, "recoverable": True,
+                "retry_after_event": True,
+            })
+            latest = self.inputs.get(source_turn_id or "", {})
+            if latest.get("final") and not self.output.active:
+                await self._emit_turn_settled(identity, source_turn_id,
+                                              "output_filtered" if filtered else "provider_unavailable")
+            return "terminal_failure"
         finally:
             if speech_handle is not None and not speech_handle_finished:
                 try:
@@ -1633,6 +1783,8 @@ class AgentEpisodeRuntime:
         self._thinking_lease_turn = None
         self._thinking_prefix_by_turn.clear()
         self._recovery_attempts_by_turn.clear()
+        self._transport_retry_attempts_by_turn.clear()
+        self.deferred_recovery_feedback.clear()
         self.state = "IDLE"
         await self.emit("agent.episode", self.snapshot(include_history=False))
 

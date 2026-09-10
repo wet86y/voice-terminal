@@ -85,6 +85,8 @@ llm:
   # Experimental control action; intentionally independent from transport.
   thinking_action_enabled: false
   protocol_recovery_limit: 1
+  # Transient HTTP failures are a separate, bounded retry lane.
+  transport_retry_limit: 2
 
 tts:
   provider: minimax

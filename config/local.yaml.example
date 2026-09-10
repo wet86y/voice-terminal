@@ -31,6 +31,8 @@ llm:
   shadow_sample_rate: 1.0
   shadow_thinking_enabled: false
   thinking_action_enabled: false
+  protocol_recovery_limit: 1
+  transport_retry_limit: 2
 
 tts:
   model: speech-2.8-hd

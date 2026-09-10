@@ -12,6 +12,21 @@ class DeepSeekError(RuntimeError):
     pass
 
 
+class DeepSeekResponseTerminalError(DeepSeekError):
+    """Structured non-success terminal from the Responses stream."""
+
+    def __init__(self, kind: str, *, status: str | None = None,
+                 reason: str | None = None, error_code: str | None = None) -> None:
+        self.terminal_kind = kind
+        self.status = status
+        self.reason = reason
+        self.error_code = error_code
+        super().__init__(
+            f"Responses terminal failure: {kind}/{status or 'unknown'}"
+            f" reason={reason or 'unknown'} code={error_code or 'unknown'}"
+        )
+
+
 class DeepSeekClient:
     def __init__(
         self,
@@ -29,6 +44,7 @@ class DeepSeekClient:
         shadow_thinking_enabled: bool = False,
         thinking_action_enabled: bool = False,
         protocol_recovery_limit: int = 1,
+        transport_retry_limit: int = 2,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -51,6 +67,7 @@ class DeepSeekClient:
         self.shadow_thinking_enabled = shadow_thinking_enabled
         self.thinking_action_enabled = thinking_action_enabled
         self.protocol_recovery_limit = max(0, protocol_recovery_limit)
+        self.transport_retry_limit = max(0, transport_retry_limit)
         self.supports_decision_schema = True
         self._client = None
 
@@ -271,6 +288,29 @@ class DeepSeekClient:
             reasoning_effort=reasoning_effort, max_output_tokens=self.max_output_tokens,
         )
         terminal = False
+        streamed_parts: list[str] = []
+        completed_text: str | None = None
+
+        def response_text(result: Any) -> str | None:
+            if not isinstance(result, dict):
+                return None
+            parts: list[str] = []
+            found = False
+            output = result.get("output")
+            if not isinstance(output, list):
+                return None
+            for item in output:
+                content = item.get("content") if isinstance(item, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if not isinstance(part, dict) or part.get("type") != "output_text":
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        found = True
+                        parts.append(text)
+            return "".join(parts) if found else None
         try:
             client = await self._http_client()
             async with client.stream(
@@ -301,7 +341,12 @@ class DeepSeekClient:
                     if kind == "response.output_text.delta":
                         delta = event.get("delta")
                         if isinstance(delta, str) and delta:
+                            streamed_parts.append(delta)
                             yield {"type": "content", "text": delta}
+                    elif kind == "response.output_text.done":
+                        text = event.get("text")
+                        if isinstance(text, str):
+                            completed_text = text
                     elif kind == "response.reasoning_text.delta":
                         delta = event.get("delta")
                         if isinstance(delta, str) and delta:
@@ -310,7 +355,24 @@ class DeepSeekClient:
                         result = event.get("response")
                         status = result.get("status") if isinstance(result, dict) else None
                         if status not in {None, "completed"}:
-                            raise DeepSeekError(f"Responses completed with invalid status: {status}")
+                            raise DeepSeekResponseTerminalError(
+                                "response.completed", status=str(status),
+                                reason="invalid_completed_status",
+                            )
+                        authoritative = completed_text
+                        if authoritative is None:
+                            authoritative = response_text(result)
+                        streamed = "".join(streamed_parts)
+                        if authoritative is not None and authoritative != streamed:
+                            if authoritative.startswith(streamed):
+                                suffix = authoritative[len(streamed):]
+                                if suffix:
+                                    yield {"type": "content", "text": suffix}
+                            else:
+                                raise DeepSeekResponseTerminalError(
+                                    "response.completed", status="completed",
+                                    reason="stream_final_mismatch",
+                                )
                         usage = result.get("usage") if isinstance(result, dict) else None
                         if isinstance(usage, dict):
                             normalized = dict(usage)
@@ -326,9 +388,18 @@ class DeepSeekClient:
                         result = event.get("response")
                         status = result.get("status") if isinstance(result, dict) else None
                         error = result.get("error") if isinstance(result, dict) else None
-                        raise DeepSeekError(f"Responses terminal failure: {kind}/{status}: {str(error)[:300]}")
+                        details = result.get("incomplete_details") if isinstance(result, dict) else None
+                        reason = details.get("reason") if isinstance(details, dict) else None
+                        error_code = error.get("code") if isinstance(error, dict) else None
+                        raise DeepSeekResponseTerminalError(
+                            str(kind), status=str(status) if status is not None else None,
+                            reason=str(reason) if reason is not None else None,
+                            error_code=str(error_code) if error_code is not None else None,
+                        )
             if not terminal:
-                raise DeepSeekError("Responses stream disconnected before response.completed")
+                raise DeepSeekResponseTerminalError(
+                    "stream_disconnected", reason="missing_terminal_event",
+                )
         except DeepSeekError:
             raise
         except Exception as exc:
