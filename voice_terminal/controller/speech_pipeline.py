@@ -76,6 +76,10 @@ class SpeechPipeline:
         if self._tts_session is session:
             self._tts_session = session if retain else None
 
+    async def _wait_for_playback_permission(self, ws, token):
+        """Hook for output owners that defer pre-playback TTS."""
+        return
+
     async def _play_stream(self, ws, token, deltas, *, speech_id: str | None = None) -> str:
         transport = getattr(self.tts, "transport", "websocket") if self.tts is not None else "websocket"
         bridge = BidiTextMerger(max_chars=128, max_wait_ms=30) if transport == "websocket_bidi" else TextBridge(**self.bridge_options)
@@ -132,6 +136,9 @@ class SpeechPipeline:
             self.player.sample_rate * self.player.channels * 2
             if self.player is not None else 32000 * 2
         )
+        await self._wait_for_playback_permission(ws, token)
+        if not self._valid(token) or not ws.committed:
+            return ""
         if self.player:
             self.player.allow(playback_key)
 
@@ -223,8 +230,24 @@ class SpeechPipeline:
         async def read_audio(active_session):
             nonlocal audio_returned_bytes, completed_markers, alignment_cursor
 
+            audio_iterator = None
             try:
-                async for pcm in active_session.audio_chunks():
+                audio_iterator = active_session.audio_chunks().__aiter__()
+                while True:
+                    # Gate before pulling the next provider chunk. This keeps
+                    # a held pre-playback transaction from accumulating an
+                    # unbounded application-side PCM buffer.
+                    await self._wait_for_playback_permission(ws, token)
+                    if not self._valid(token) or not ws.committed:
+                        return
+                    try:
+                        pcm = await audio_iterator.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    # The user may have become active while the provider
+                    # yielded this chunk. Re-check before admitting it to the
+                    # local player.
+                    await self._wait_for_playback_permission(ws, token)
                     if not self._valid(token) or not ws.committed:
                         return
                     audio_returned_bytes += len(pcm)
@@ -260,6 +283,9 @@ class SpeechPipeline:
                     await emit_progress(status="STREAMING", trigger="audio_received")
                     await self._latency(ws)
             finally:
+                close = getattr(audio_iterator, "aclose", None) if audio_iterator is not None else None
+                if close is not None:
+                    await close()
                 # Wake a sender waiting for the first PCM even when the
                 # provider ends or fails without returning audio.
                 audio_signal.set()
@@ -331,9 +357,13 @@ class SpeechPipeline:
                         return
                     if not self._valid(token):
                         return
+                    await self._wait_for_playback_permission(ws, token)
+                    if not self._valid(token) or not ws.committed:
+                        return
                     if session is None:
                         await self._await_tts_cancel_barrier()
-                        if not self._valid(token):
+                        await self._wait_for_playback_permission(ws, token)
+                        if not self._valid(token) or not ws.committed:
                             return
                         sync_turn_timings()
                         session = self._new_tts_session(ws)
@@ -347,6 +377,9 @@ class SpeechPipeline:
                         warm_connection_id = getattr(session, "connection_id", None) if warm else None
                         ws.timings.setdefault("tts_session_start", time.monotonic())
                         try:
+                            await self._wait_for_playback_permission(ws, token)
+                            if not self._valid(token) or not ws.committed:
+                                return
                             await session.start()
                             if warm and getattr(session, "connection_id", None) != warm_connection_id:
                                 # The retained socket disappeared between
@@ -365,9 +398,15 @@ class SpeechPipeline:
                                 # waiting for it.  Fall back to a fresh cold
                                 # session rather than sending text to a dead
                                 # socket.
+                                await self._wait_for_playback_permission(ws, token)
+                                if not self._valid(token) or not ws.committed:
+                                    return
                                 session = self._new_tts_session(ws, fresh=True)
                                 self._bind_tts_session(ws, session)
                                 ws.timings["tts_session_start"] = time.monotonic()
+                                await self._wait_for_playback_permission(ws, token)
+                                if not self._valid(token) or not ws.committed:
+                                    return
                                 await session.start()
                                 warm = False
                             ws.timings.setdefault("tts_session_ready", time.monotonic())
@@ -407,17 +446,32 @@ class SpeechPipeline:
                             if not getattr(exc, "emotion_unsupported", False) or not self._valid(token):
                                 raise
                             await self._detail("tts.emotion_unsupported", status="FALLBACK_CALM")
+                            await self._wait_for_playback_permission(ws, token)
+                            if not self._valid(token) or not ws.committed:
+                                return
                             session = self._new_tts_session(ws, fresh=True)
                             self._bind_tts_session(ws, session)
                             ws.timings["tts_session_start"] = time.monotonic()
+                            await self._wait_for_playback_permission(ws, token)
+                            if not self._valid(token) or not ws.committed:
+                                return
                             await session.start()
                             ws.timings["tts_session_ready"] = time.monotonic()
                             sync_turn_timings()
+                        await self._wait_for_playback_permission(ws, token)
+                        if not self._valid(token) or not ws.committed:
+                            return
                         reader = asyncio.create_task(read_audio(session), name=f"tts-audio-{ws.turn_id}")
                         progress_task = asyncio.create_task(monitor_progress(), name=f"tts-progress-{ws.turn_id}")
                     if sent_any:
+                        await self._wait_for_playback_permission(ws, token)
+                        if not self._valid(token) or not ws.committed:
+                            return
                         await wait_for_playback_window()
                     if not self._valid(token):
+                        return
+                    await self._wait_for_playback_permission(ws, token)
+                    if not self._valid(token) or not ws.committed:
                         return
                     receiver_error = await reader_exception()
                     if receiver_error is not None:

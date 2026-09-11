@@ -113,6 +113,9 @@ class EpisodeSpeechOutput(SpeechPipeline):
         self.tasks = set()
         self.runtime = None
         self.loop = None
+        self._playback_hold = False
+        self._playback_release = asyncio.Event()
+        self._playback_release.set()
         self.last_replacement = {}
         self.last_delivery = None
         # The most recently settled output is diagnostic/reconciliation state,
@@ -136,6 +139,12 @@ class EpisodeSpeechOutput(SpeechPipeline):
         return "SPEAKING" if self.handle.workspace.playback_started else "SPEAK_REQUESTED"
 
     @property
+    def playback_hold_active(self) -> bool:
+        """Whether pre-playback output is currently held by user speech."""
+
+        return self._playback_hold
+
+    @property
     def active_snapshot(self):
         h = self.handle
         if not h or h.task.done():
@@ -156,6 +165,74 @@ class EpisodeSpeechOutput(SpeechPipeline):
     def _valid(self, token):
         h, r = self.handle, self.runtime
         return bool(h and h.workspace.token == token and not h.reason and r and not r.closed)
+
+    async def _wait_for_playback_permission(self, ws, token):
+        """Wait while user speech owns the pre-playback output boundary."""
+        while self._valid(token):
+            h = self._handle_for_workspace(ws)
+            if h is None or h.workspace.playback_started or not self._playback_hold:
+                return
+            await self._playback_release.wait()
+
+    def _unplayed_candidate(self):
+        candidates = ([self.handle] if self.handle else []) + list(self._pending)
+        for h in candidates:
+            task = getattr(h, "task", None) if h else None
+            task_done = task.done() if task is not None else False
+            if (h and h.state != "SUSPENDED" and not h.reason and not task_done
+                    and not h.workspace.playback_started):
+                return h
+        return None
+
+    def _schedule_output_event(self, h, trace_kind, event, **payload):
+        """Publish hold diagnostics without blocking the audio frame path."""
+        loop = self.loop
+        if loop is None or loop.is_closed() or self.runtime is None:
+            return
+
+        async def publish():
+            log = getattr(self.runtime, "log", None)
+            if callable(log):
+                await log(trace_kind, identity=h.identity, turn_id=h.turn_id,
+                          speech_id=h.speech_id, **payload)
+            await self._emit_handle_progress(h, event, **payload)
+
+        task = loop.create_task(publish(), name=f"speech-{event}-{h.speech_id}")
+        track = getattr(self.controller, "_track", None)
+        if callable(track):
+            track(task)
+
+    def hold_unplayed(self) -> str | None:
+        """Hold all output that has not crossed the real playback boundary."""
+        self._playback_hold = True
+        self._playback_release.clear()
+        h = self._unplayed_candidate()
+        if h is None:
+            return None
+
+        if self.player is not None:
+            hold = getattr(self.player, "hold", None)
+            if callable(hold) and not hold(h.workspace.playback_key):
+                has_started = getattr(self.player, "has_started", None)
+                if callable(has_started) and has_started(h.workspace.playback_key):
+                    # The player won the race and has already crossed the
+                    # playback boundary. The caller will use the confirmed
+                    # barge-in path on the next activity frame.
+                    self._playback_hold = False
+                    self._playback_release.set()
+                    return None
+
+        h.state = "HELD"
+        h.playback_ready.clear()
+        if "playback_hold_started" not in h.workspace.timings:
+            started_at = time.monotonic()
+            h.workspace.timings["playback_hold_started"] = started_at
+            self._schedule_output_event(
+                h, "TTS_HELD", "tts_hold_started",
+                reason="user_speaking_pre_playback",
+                hold_started_at=started_at,
+            )
+        return h.speech_id
 
     async def _await_tts_cancel_barrier(self):
         # Provider cancellation belongs to the old handle's background
@@ -264,7 +341,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
         h = SpeechHandle(self, identity, turn_id, self.generation, emotion, kind=kind)
         h.force_fresh_tts_session = _fresh_session
         self._handles_by_token[h.workspace.token] = h
-        if getattr(self.runtime, "user_speaking", False) is False and not _defer_activation:
+        if (getattr(self.runtime, "user_speaking", False) is False
+                and not self._playback_hold and not _defer_activation):
             h.playback_ready.set()
             h.state = "READY"
         else:
@@ -283,10 +361,13 @@ class EpisodeSpeechOutput(SpeechPipeline):
             if self.handle is not handle:
                 self._handles_by_token.pop(handle.workspace.token, None)
         h.task.add_done_callback(forget_finished)
+        # Register the candidate before awaiting emotion preparation.  User
+        # speech can arrive during that await; keeping the handle visible lets
+        # ``hold_unplayed`` mark it HELD instead of only setting the global
+        # gate and leaving the handle READY.
+        self._pending.append(h)
         if h.playback_ready.is_set():
             await self._activate(h)
-        else:
-            self._pending.append(h)
         await self.runtime.emit("speech.queued", {"speech_id": h.speech_id, "conversation_id": h.identity[0],
                                  "turn_id": turn_id, "output_generation": h.workspace.generation,
                                  "kind": kind, "text": h.text, "status": h.state})
@@ -429,11 +510,27 @@ class EpisodeSpeechOutput(SpeechPipeline):
 
     def release_held(self):
         """Grant playback to the latest candidate after local endpointing."""
+        was_held = self._playback_hold
+        self._playback_hold = False
+        self._playback_release.set()
         candidates = ([self.handle] if self.handle else []) + list(self._pending)
         for h in candidates:
             if h and h.state == "SUSPENDED":
                 continue
-            if h and not h.reason and not h.task.done():
+            if (h and not h.reason and not h.task.done()
+                    and not h.workspace.playback_started):
+                resume = getattr(self.player, "resume", None) if self.player is not None else None
+                if callable(resume) and (was_held or "playback_hold_started" in h.workspace.timings):
+                    resume(h.workspace.playback_key)
+                hold_started = h.workspace.timings.get("playback_hold_started")
+                if hold_started is not None and "playback_hold_released" not in h.workspace.timings:
+                    released_at = time.monotonic()
+                    h.workspace.timings.setdefault("playback_hold_released", released_at)
+                    self._schedule_output_event(
+                        h, "TTS_RELEASED", "tts_hold_released",
+                        reason="user_speech_ended",
+                        hold_ms=round((released_at - hold_started) * 1000),
+                    )
                 h.state = "READY"
                 h.playback_ready.set()
                 if h is not self.handle:
@@ -484,7 +581,28 @@ class EpisodeSpeechOutput(SpeechPipeline):
         revisions and tool results never call it.  Only stop/barged-in/
         replacement/transport cleanup paths may cancel output.
         """
+        # A transport/lifecycle failure must not leave the permission event
+        # closed after all handles have been cancelled. ``replaced`` and
+        # confirmed ``interrupted`` deliberately retain the hold while the
+        # user may still be speaking, so a successor remains deferred until
+        # the normal speech-ended callback releases it.
+        lifecycle_cancel = reason in {
+            "input_unavailable", "stopped", "reset", "failed", "fatal_error", "scope_closed",
+        }
+        if lifecycle_cancel:
+            self._playback_hold = False
+            self._playback_release.set()
         items = ([self.handle] if self.handle else []) + list(self._pending)
+        if lifecycle_cancel:
+            # ``hold_unplayed`` may have armed a pending handle before it was
+            # ever activated.  Such a handle is not the active player owner,
+            # so the normal active snapshot branch below cannot clear its
+            # player hold.  Resume those keys explicitly during teardown.
+            resume = getattr(self.player, "resume", None) if self.player is not None else None
+            if callable(resume):
+                for h in items:
+                    if h is not None:
+                        resume(h.workspace.playback_key)
         for h in items:
             if not h or h.task.done() or h.reason:
                 continue
@@ -773,10 +891,12 @@ class EpisodeSpeechOutput(SpeechPipeline):
             # this generation drains.  Activate it only after the old player
             # key has been settled, so its normal ``allow`` call cannot clear
             # audible PCM from the preceding response.
-            if was_active and not h.reason:
+            if was_active and not h.reason and not self._playback_hold:
                 self.release_held()
 
     async def close(self):
+        self._playback_hold = False
+        self._playback_release.set()
         self.cancel_all("stopped")
         if self.tasks:
             await asyncio.gather(*list(self.tasks), return_exceptions=True)

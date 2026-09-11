@@ -18,9 +18,9 @@ V0.6 以 JSON 响应信封取代 DeepSeek 原生工具调用，但不移除已�
 
 ## 发布边界
 
-- 用户讲话时，语音候选只保存文本；端点确认前绝不启动 TTS 或持有 PCM。
-- 正常 ASR final、SenseVoice 精修和动作完成不会取消在飞 LLM；只有 stop、barge-in、reset、传输清理和播放中实质改口会显式取消。
-- `cancel` 立即停止待播或正在播放的输出；`wait` 完全不改变事务。讲话中 `speak(text)` 仍只保存文本，不启动 TTS。
+- 用户在 `playback_started=false` 阶段讲话时，语音候选进入 `HELD`；保留文本和 handle，不取消在飞 LLM。TTS session 即使已经建立，也不得继续发送文本、拉取新的 provider PCM 或让播放器消费队列；已经进入播放器的未播放 PCM 保留在队列中并由 player hold 阻止消费。
+- 普通语音活动、ASR segment/final、SenseVoice 精修和动作完成不会取消在飞 LLM；这些用户信息继续进入 pending mailbox，由默认 400ms scheduler tick 合并处理。只有确认 barge-in、stop、reset、输入不可用、传输清理和播放中实质改口会显式取消。
+- `cancel` 立即停止待播或正在播放的输出并清理 hold；`wait` 完全不改变事务。`SPEECH_ENDED` 释放最新的 `HELD` 候选并恢复原有文本事务，不重新调用 LLM 或重复发送整段文本。
 - 播放中收到首个合法且非空的 `speak` 文本前缀时，先按 `conversation_id + turn_id` 检查 speech 所有权。同轮新文本完整覆盖旧文本时只提取 suffix，当前 PCM 不停止、不清空、不重播；跨轮活动文本只作为 `observed_text`，不得调用 `append_successor`。已接受的同轮文本范围内出现差异时，输出层才原子关闭旧 PCM generation 并启动新的 TTS transaction，旧 provider cancel/close 在后台完成，迟到 PCM 不得进入新 playback key。
 - 当前输出耗尽后保留 1 秒追加窗口。窗口内的同前缀扩展会进入不重播前缀的后续队列；窗口外仍只合成新增 suffix。`speech.append_waiting_prefix`、`speech.appended`、`speech.append_successor` 和 `append_window_*` 进度事件用于重建该路径。
 - 如果已追加的流式 `speak` 随后完整 JSON 或动作校验失败，已获合法前缀授权的追加文本保留，并使用一次既有恢复请求纠正协议；已播放旧内容不会恢复或续播。

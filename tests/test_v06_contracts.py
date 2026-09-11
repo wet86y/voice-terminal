@@ -15,7 +15,7 @@ from voice_terminal.agent.episode import AgentDecisionScheduler, AgentEpisodeRun
 from voice_terminal.agent.options import AgentOptions
 from voice_terminal.agent.sentences import SentenceStore, map_refinement
 from voice_terminal.config import AppConfig, load_config
-from voice_terminal.controller.episode_output import EpisodeSpeechOutput
+from voice_terminal.controller.episode_output import EpisodeSpeechOutput, SpeechHandle
 from voice_terminal.controller.speech_pipeline import SpeechPipeline
 from voice_terminal.core.events import event
 from voice_terminal.providers.deepseek import DeepSeekClient
@@ -137,6 +137,110 @@ def test_scheduler_defaults_and_removed_prediction_configuration():
         AppConfig.from_mapping({"smart_turn": {"predictions": True}})
 
 
+def test_passive_speech_activity_keeps_llm_and_thinking_state_alive():
+    async def scenario():
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Output:
+            def __init__(self):
+                self.held = 0
+                self.released = 0
+                self.cancelled = []
+                self.status = "IDLE"
+                self.active_snapshot = None
+                self.queue_snapshot = []
+                self.speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+
+            def hold_unplayed(self):
+                self.held += 1
+
+            def release_held(self):
+                self.released += 1
+
+            def cancel_all(self, reason):
+                self.cancelled.append(reason)
+
+        async def emit(*_args): pass
+
+        conversation = ConversationRuntime()
+        conversation.begin_turn("turn_a")
+        output = Output()
+        runtime = AgentEpisodeRuntime(
+            None, Registry(), output, emit,
+            conversation=conversation, ledger=SessionLedger(),
+        )
+        runtime.episode_id = conversation.conversation_id
+        runtime.last_turn_id = "turn_a"
+        runtime.current_action = "speak"
+        runtime._thinking_barrier_generation = 7
+        runtime._wake = lambda _kind: None
+        request = asyncio.create_task(asyncio.sleep(60))
+        runtime.active_request = request
+        try:
+            await runtime.speech_activity(True)
+            assert runtime.user_speaking is True
+            assert output.held == 1
+            assert output.cancelled == []
+            assert not request.cancelled()
+            assert runtime.current_action == "speak"
+            assert runtime._thinking_barrier_generation == 7
+
+            await runtime.speech_activity(False)
+            assert runtime.user_speaking is False
+            assert output.released == 1
+            assert not request.cancelled()
+        finally:
+            if runtime.voice_activation_task and not runtime.voice_activation_task.done():
+                runtime.voice_activation_task.cancel()
+                await asyncio.gather(runtime.voice_activation_task, return_exceptions=True)
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_explicit_barge_in_cancels_after_passive_onset_even_if_state_is_unchanged():
+    async def scenario():
+        class Output:
+            def __init__(self):
+                self.cancelled = []
+                self.status = "IDLE"
+                self.active_snapshot = None
+                self.queue_snapshot = []
+                self.speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+
+            def hold_unplayed(self): pass
+            def cancel_all(self, reason): self.cancelled.append(reason)
+
+        async def emit(*_args): pass
+
+        output = Output()
+        runtime = AgentEpisodeRuntime(
+            None, SimpleNamespace(), output, emit,
+            conversation=ConversationRuntime(), ledger=SessionLedger(),
+        )
+        runtime._wake = lambda _kind: None
+        await runtime.speech_activity(True)
+        request = asyncio.create_task(asyncio.sleep(60))
+        runtime.active_request = request
+        try:
+            await runtime.speech_activity(True, interrupt_reason="user_interrupted")
+            await asyncio.sleep(0)
+            assert request.cancelled()
+            assert output.cancelled == ["interrupted"]
+        finally:
+            if not request.done():
+                request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+            if runtime.voice_activation_task and not runtime.voice_activation_task.done():
+                runtime.voice_activation_task.cancel()
+                await asyncio.gather(runtime.voice_activation_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_first_token_estimate_uses_fallback_while_tokenizer_warms_in_background(monkeypatch):
     """A cold tokenizer cache must never block the realtime event loop."""
 
@@ -223,6 +327,252 @@ def test_held_text_and_suspend_do_not_start_tts_before_release():
         handle.state = "HELD"; output.release_held()
         await handle.task
         assert ran.is_set()
+    asyncio.run(scenario())
+
+
+def test_user_speech_hold_preserves_unplayed_handle_and_releases_it_after_end():
+    async def scenario():
+        class Player:
+            def __init__(self):
+                self.held = []
+                self.resumed = []
+
+            def hold(self, key):
+                self.held.append(key)
+                return True
+
+            def resume(self, key):
+                self.resumed.append(key)
+                return True
+
+        async def emit(*_args): pass
+        async def log(*_args, **_kwargs): pass
+
+        player = Player()
+        runtime = SimpleNamespace(
+            gate=lambda _identity: None,
+            emit=emit,
+            log=log,
+            user_speaking=True,
+            closed=False,
+            request_started_at=None,
+        )
+        controller = SimpleNamespace(
+            tts=None,
+            player=player,
+            options=SimpleNamespace(),
+            bridge_options=SimpleNamespace(),
+            _turn_timings={},
+            _track=lambda task: task,
+        )
+        output = EpisodeSpeechOutput(controller)
+        output.runtime = runtime
+        started = asyncio.Event()
+
+        async def fake_run(handle):
+            started.set()
+            async for _ in handle.stream():
+                pass
+
+        output._run = fake_run
+        handle = await output.begin(("episode", "request"), "turn")
+        assert handle.state == "HELD"
+        assert output.hold_unplayed() == handle.speech_id
+        await handle.feed("暂缓播放")
+        await handle.finish()
+        await asyncio.sleep(0)
+        assert not started.is_set()
+
+        output.release_held()
+        await handle.task
+        assert started.is_set()
+        assert player.held == [handle.workspace.playback_key]
+        assert player.resumed == [handle.workspace.playback_key]
+        assert "playback_hold_started" in handle.workspace.timings
+        assert "playback_hold_released" in handle.workspace.timings
+
+    asyncio.run(scenario())
+
+
+def test_lifecycle_cancel_clears_preplayback_hold_and_player_key():
+    async def scenario():
+        class Player:
+            def __init__(self):
+                self.held = []
+                self.resumed = []
+
+            def hold(self, key):
+                self.held.append(key)
+                return True
+
+            def resume(self, key):
+                self.resumed.append(key)
+                return True
+
+        async def emit(*_args): pass
+        async def log(*_args, **_kwargs): pass
+
+        player = Player()
+        runtime = SimpleNamespace(
+            gate=lambda _identity: None,
+            emit=emit,
+            log=log,
+            user_speaking=True,
+            closed=False,
+            request_started_at=None,
+        )
+        controller = SimpleNamespace(
+            tts=None,
+            player=player,
+            options=SimpleNamespace(),
+            bridge_options=SimpleNamespace(),
+            _turn_timings={},
+            _track=lambda task: task,
+        )
+        output = EpisodeSpeechOutput(controller)
+        output.runtime = runtime
+        handle = await output.begin(("episode", "request"), "turn")
+        assert output.hold_unplayed() == handle.speech_id
+        assert output.playback_hold_active
+
+        output.cancel_all("input_unavailable")
+        await asyncio.gather(handle.task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert not output.playback_hold_active
+        assert output._playback_release.is_set()
+        assert player.resumed == [handle.workspace.playback_key]
+
+    asyncio.run(scenario())
+
+
+def test_tts_session_started_before_first_pcm_waits_for_user_release():
+    async def scenario():
+        class Session:
+            bidi = False
+            reusable = True
+            generation_finished = True
+            received_bytes = 0
+
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.start_release = asyncio.Event()
+                self.audio_requested = asyncio.Event()
+                self.sent = []
+
+            async def start(self):
+                self.started.set()
+                await self.start_release.wait()
+
+            async def send_text(self, text):
+                self.sent.append(text)
+
+            async def audio_chunks(self):
+                self.audio_requested.set()
+                yield b"\x01\x00"
+
+            async def finish(self):
+                return
+
+            async def close(self):
+                return
+
+        class Tts:
+            transport = "websocket"
+            effective_scheduling = "direct"
+
+            def __init__(self):
+                self.session_instance = Session()
+
+            def session(self, fresh=False):
+                return self.session_instance
+
+        class Player:
+            sample_rate = 1000
+            channels = 1
+            buffered_ms = 0
+
+            def __init__(self):
+                self.held = []
+                self.resumed = []
+                self.enqueued = []
+
+            def allow(self, key): pass
+
+            def hold(self, key):
+                self.held.append(key)
+                return True
+
+            def resume(self, key):
+                self.resumed.append(key)
+                return True
+
+            def enqueue(self, key, pcm):
+                self.enqueued.append((key, pcm))
+
+            def progress(self, key):
+                return {
+                    "key": key, "enqueued_ms": 0, "played_ms": 0,
+                    "buffered_ms": 0, "started": False,
+                    "output_estimated_ms": 0, "device_output_time": None,
+                }
+
+            async def wait_until_output_complete(self, timeout_seconds=10):
+                return
+
+        async def emit(*_args): pass
+        async def log(*_args, **_kwargs): pass
+
+        tts = Tts()
+        player = Player()
+        runtime = SimpleNamespace(
+            gate=lambda _identity: None,
+            emit=emit,
+            log=log,
+            user_speaking=False,
+            closed=False,
+            request_started_at=None,
+        )
+        controller = SimpleNamespace(
+            tts=tts,
+            player=player,
+            options=SimpleNamespace(tts_pacing=False, tts_lead_ms=1, tts_local_buffer_ms=1),
+            bridge_options={},
+            _turn_timings={},
+            _track=lambda task: task,
+        )
+        output = EpisodeSpeechOutput(controller)
+        output.runtime = runtime
+        output.loop = asyncio.get_running_loop()
+        handle = SpeechHandle(output, ("episode", "request"), "turn", 0, "calm")
+        handle.task = asyncio.current_task()
+        output.handle = handle
+        output._handles_by_token[handle.workspace.token] = handle
+
+        async def deltas():
+            yield "测试"
+            yield None
+
+        running = asyncio.create_task(
+            output._play_stream(handle.workspace, handle.workspace.token, deltas(), speech_id=handle.speech_id)
+        )
+        await tts.session_instance.started.wait()
+        runtime.user_speaking = True
+        assert output.hold_unplayed() == handle.speech_id
+        tts.session_instance.start_release.set()
+        await asyncio.sleep(0)
+        assert tts.session_instance.sent == []
+        assert not tts.session_instance.audio_requested.is_set()
+
+        runtime.user_speaking = False
+        output.release_held()
+        await running
+        await asyncio.sleep(0)
+        assert tts.session_instance.sent == ["测试"]
+        assert tts.session_instance.audio_requested.is_set()
+        assert player.enqueued == [(handle.workspace.playback_key, b"\x01\x00")]
+        assert player.held == [handle.workspace.playback_key]
+        assert player.resumed == [handle.workspace.playback_key]
+
     asyncio.run(scenario())
 
 
