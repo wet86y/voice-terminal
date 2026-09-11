@@ -37,6 +37,23 @@ active request 与 scheduler 状态。
 停止/重置、真实 ASR/Analysis/LLM/TTS 链路，以及结束至实际首音的 p50/p95。
 内存播放器结果不能替代这些证据。
 
+## 完整服务启动验收
+
+`scripts/start.ps1` 是本机整套服务的默认入口：它依次准备 Analysis Worker、ASR Worker、
+Web 前端和 Voice Server。默认启动不能只依据 `8765/health` 声明成功；浏览器控制台是产品
+运行面的一部分，必须纳入同一验收。
+
+脚本启动 Web 前端时固定使用 `npm run dev`，并在继续前要求
+`http://127.0.0.1:5173/` 在 30 秒内返回 2xx/3xx HTTP 响应。5173 已有监听进程、Vite
+提前退出或页面不可达均必须使启动失败，且错误中应包含
+`logs/web-dev-current.out.log` 和 `logs/web-dev-current.err.log` 的诊断内容；不得复用
+未知或可能陈旧的开发服务器后仍宣称服务完整可用。
+
+一次“完整服务已重启”的运行验收至少要同时确认：5173 页面可访问、8765 的 `/health`
+可访问、8766 和 8767 正在监听，且 `/health.services` 中每个启用服务均为 `READY`。
+`-NoWeb` 仅用于刻意的后端单独调试；带该开关的运行不得标记为完整 Web 语音终端。
+`npm run dev` 仍可用于独立前端开发，但不能代替上述完整启动验收。
+
 ## LLM 上下文缓存质量门槛
 
 新增任何模型字段前，必须先完成[缓存契约的字段准入表](llm-context-cache-contract.md#标准字段准入表)，明确语义 owner、lane、持久化、schema 与 UI 影响。涉及 provider payload、上下文、schema 或动作目录的改动必须运行缓存 placement/digest 单测和完整 Python 回归。
