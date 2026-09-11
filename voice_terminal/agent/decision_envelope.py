@@ -44,6 +44,238 @@ class DecisionEnvelope:
     actions: tuple[Action, ...]
 
 
+@dataclass(frozen=True)
+class CompatibleDecisionEnvelope:
+    """A validated envelope plus the exact bounded repairs applied to it."""
+
+    envelope: DecisionEnvelope
+    repairs: tuple[str, ...]
+
+
+def _unwrap_single_json_fence(raw: str) -> str | None:
+    stripped = raw.strip()
+    if not stripped.startswith("```") or not stripped.endswith("```"):
+        return None
+    first_line_end = stripped.find("\n")
+    if first_line_end < 0:
+        return None
+    header = stripped[:first_line_end].strip().casefold()
+    if header not in {"```", "```json"}:
+        return None
+    body = stripped[first_line_end + 1:-3].strip()
+    if not body or "```" in body:
+        return None
+    return body
+
+
+def _remove_json_trailing_commas(raw: str) -> str | None:
+    """Remove commas followed only by whitespace and a container close."""
+
+    output: list[str] = []
+    in_string = escaped = False
+    changed = False
+    for index, char in enumerate(raw):
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            continue
+        if char == ",":
+            following = index + 1
+            while following < len(raw) and raw[following].isspace():
+                following += 1
+            if following < len(raw) and raw[following] in "}]":
+                changed = True
+                continue
+        output.append(char)
+    return "".join(output) if changed else None
+
+
+def _escape_json_string_controls(raw: str) -> str | None:
+    """Escape JSON-forbidden literal control characters inside strings."""
+
+    replacements = {"\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    output: list[str] = []
+    in_string = escaped = False
+    changed = False
+    for char in raw:
+        if in_string:
+            if escaped:
+                output.append(char)
+                escaped = False
+                continue
+            if char == "\\":
+                output.append(char)
+                escaped = True
+                continue
+            if char == '"':
+                output.append(char)
+                in_string = False
+                continue
+            if ord(char) < 0x20:
+                output.append(replacements.get(char, f"\\u{ord(char):04x}"))
+                changed = True
+                continue
+            output.append(char)
+            continue
+        output.append(char)
+        if char == '"':
+            in_string = True
+    return "".join(output) if changed else None
+
+
+def _default_missing_actions(raw: str) -> str | None:
+    """Interpret one complete top-level speak object as having no actions."""
+
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or set(value) != {"speak"} or not isinstance(value.get("speak"), dict):
+        return None
+    return json.dumps({"speak": value["speak"], "actions": []}, ensure_ascii=False, separators=(",", ":"))
+
+
+def _default_empty_emotion(raw: str) -> str | None:
+    """Map an empty emotion slot to the existing neutral local default."""
+
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or set(value) != {"speak", "actions"}:
+        return None
+    speak = value.get("speak")
+    if not isinstance(speak, dict) or set(speak) != {"state", "emotion", "text"} or speak.get("emotion") != "":
+        return None
+    repaired = dict(value)
+    repaired["speak"] = {**speak, "emotion": "calm"}
+    return json.dumps(repaired, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_compatible_decision_envelope(
+    raw: str, *, allow_empty_control_text: bool = False,
+) -> CompatibleDecisionEnvelope:
+    """Apply only bounded repairs and then enforce the full envelope contract.
+
+    The whole repaired value must pass :class:`SpeechDecisionEnvelopeStream`.
+    This function never extracts a brace range, wraps prose, completes a
+    truncated container, inserts an ambiguous delimiter, or infers an action.
+    """
+
+    if not isinstance(raw, str):
+        raise EnvelopeError("decision response must be text")
+    queue: list[tuple[str, tuple[str, ...]]] = [(raw, ())]
+    seen = {raw}
+    transforms = (
+        ("utf8_bom", lambda value: value[1:] if value.startswith("\ufeff") else None),
+        ("single_json_fence", _unwrap_single_json_fence),
+        ("trailing_comma", _remove_json_trailing_commas),
+        ("string_control_escape", _escape_json_string_controls),
+        ("missing_actions", _default_missing_actions),
+        ("empty_emotion", _default_empty_emotion),
+    )
+    while queue:
+        candidate, repairs = queue.pop(0)
+        parser = SpeechDecisionEnvelopeStream(allow_empty_control_text=allow_empty_control_text)
+        try:
+            parser.feed(candidate)
+            return CompatibleDecisionEnvelope(parser.finish(), repairs)
+        except EnvelopeError:
+            pass
+        for name, transform in transforms:
+            if name in repairs:
+                continue
+            repaired = transform(candidate)
+            if repaired is None or repaired == candidate or repaired in seen:
+                continue
+            seen.add(repaired)
+            queue.append((repaired, (*repairs, name)))
+    raise EnvelopeError("decision JSON is not safely recoverable")
+
+
+def json_structure_fingerprint(raw: str) -> dict[str, Any]:
+    """Describe malformed decision JSON without retaining generated text.
+
+    The fingerprint is intentionally limited to syntax and container shape so
+    production diagnostics can distinguish prose, fences and truncated JSON
+    without logging user-visible model content.
+    """
+
+    value = raw if isinstance(raw, str) else ""
+    stripped = value.strip()
+
+    def char_class(char: str) -> str:
+        if not char:
+            return "empty"
+        return {
+            "{": "object_open", "}": "object_close",
+            "[": "array_open", "]": "array_close",
+            '"': "quote", "`": "backtick",
+        }.get(char, "alpha" if char.isalpha() else "digit" if char.isdigit() else "other")
+
+    braces = brackets = 0
+    in_string = escaped = False
+    for char in stripped:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            braces += 1
+        elif char == "}":
+            braces -= 1
+        elif char == "[":
+            brackets += 1
+        elif char == "]":
+            brackets -= 1
+
+    result: dict[str, Any] = {
+        "json_first": char_class(stripped[:1]),
+        "json_last": char_class(stripped[-1:]),
+        "json_fenced": stripped.startswith("```") or stripped.endswith("```"),
+        "json_brace_balance": braces,
+        "json_bracket_balance": brackets,
+        "json_string_open": in_string,
+    }
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        result["json_syntax_valid"] = False
+        if isinstance(exc, json.JSONDecodeError):
+            content_end = len(value.rstrip())
+            result.update(
+                json_error_kind=exc.msg,
+                json_error_pos=exc.pos,
+                json_error_at_end=exc.pos >= max(0, content_end - 1),
+            )
+        return result
+
+    result["json_syntax_valid"] = True
+    result["json_top_type"] = type(decoded).__name__
+    if isinstance(decoded, dict):
+        result.update(
+            json_has_speak="speak" in decoded,
+            json_has_actions="actions" in decoded,
+            json_top_key_count=len(decoded),
+        )
+    return result
+
+
 class SpeechDecisionEnvelopeStream:
     """Collect JSON-mode content with a staged validation boundary.
 
@@ -127,7 +359,12 @@ class SpeechDecisionEnvelopeStream:
             if state not in SPEAK_STATES:
                 raise EnvelopeError("invalid speak state")
             self.state = state
-        self._emotion(self._quoted_value(self.raw, "emotion"))
+        stream_emotion = self._quoted_value(self.raw, "emotion")
+        # Empty emotion has an unambiguous neutral compatibility repair, but
+        # finish() remains strict and rejects it unless the compatibility
+        # parser rewrites the complete envelope.
+        if stream_emotion != "":
+            self._emotion(stream_emotion)
         if self.state != "speak":
             return ""
         text = self._quoted_value(self.raw, "text", allow_partial=True)
@@ -148,7 +385,8 @@ class SpeechDecisionEnvelopeStream:
         state = self.state
         if state is None:
             return None
-        emotion = self._emotion(self._quoted_value(self.raw, "emotion")) or "calm"
+        raw_emotion = self._quoted_value(self.raw, "emotion")
+        emotion = "calm" if raw_emotion == "" else self._emotion(raw_emotion) or "calm"
         if state != "speak":
             return SpeechDecision(state, emotion, "")
         text = self._quoted_value(self.raw, "text", allow_partial=True)

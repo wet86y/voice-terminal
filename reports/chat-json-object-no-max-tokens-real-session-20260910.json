@@ -1,0 +1,389 @@
+{
+  "probe": "chat-json-object-real-session-control",
+  "model": "deepseek-v4-flash",
+  "transport": "DeepSeek Chat Completions + response_format=json_object + thinking disabled + terminal-aware whitespace-tolerant SSE collector",
+  "case_count": 8,
+  "max_tokens": null,
+  "generated_content_retained": false,
+  "tts_or_pcm_started": false,
+  "rows": [
+    {
+      "case": "greeting",
+      "session_turn": 1,
+      "expected_state": "speak",
+      "input_chars": 3,
+      "history_turn_count": 0,
+      "http_status": 200,
+      "finish_reason": "stop",
+      "provider_error": null,
+      "latency_ms": {
+        "headers": 370.9,
+        "first_sse": 371.1,
+        "first_output_delta": 371.1,
+        "first_non_whitespace": 557.2,
+        "terminal": 763.8
+      },
+      "stream": {
+        "event_counts": {
+          "chunk": 33
+        },
+        "output_delta_count": 33,
+        "blank_output_delta_count": 2,
+        "leading_whitespace_chars": 0,
+        "content_chars": 81
+      },
+      "validation": {
+        "valid": true,
+        "state": "speak",
+        "emotion": "calm",
+        "text_chars": 14,
+        "action_count": 0
+      },
+      "structural_shape": {
+        "top_level_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "actions_is_list": true
+      }
+    },
+    {
+      "case": "name_request",
+      "session_turn": 2,
+      "expected_state": "speak",
+      "input_chars": 9,
+      "history_turn_count": 1,
+      "http_status": 200,
+      "finish_reason": "stop",
+      "provider_error": null,
+      "latency_ms": {
+        "headers": 143.2,
+        "first_sse": 148.3,
+        "first_output_delta": 148.3,
+        "first_non_whitespace": 532.1,
+        "terminal": 807.9
+      },
+      "stream": {
+        "event_counts": {
+          "chunk": 36
+        },
+        "output_delta_count": 36,
+        "blank_output_delta_count": 2,
+        "leading_whitespace_chars": 0,
+        "content_chars": 84
+      },
+      "validation": {
+        "valid": true,
+        "state": "speak",
+        "emotion": "calm",
+        "text_chars": 17,
+        "action_count": 0
+      },
+      "structural_shape": {
+        "top_level_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "actions_is_list": true
+      }
+    },
+    {
+      "case": "name_explanation_followup",
+      "session_turn": 3,
+      "expected_state": "speak",
+      "input_chars": 15,
+      "history_turn_count": 2,
+      "http_status": 200,
+      "finish_reason": "stop",
+      "provider_error": null,
+      "latency_ms": {
+        "headers": 139.8,
+        "first_sse": 144.2,
+        "first_output_delta": 144.2,
+        "first_non_whitespace": 744.8,
+        "terminal": 1064.0
+      },
+      "stream": {
+        "event_counts": {
+          "chunk": 41
+        },
+        "output_delta_count": 41,
+        "blank_output_delta_count": 2,
+        "leading_whitespace_chars": 0,
+        "content_chars": 93
+      },
+      "validation": {
+        "valid": true,
+        "state": "speak",
+        "emotion": "calm",
+        "text_chars": 26,
+        "action_count": 0
+      },
+      "structural_shape": {
+        "top_level_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "actions_is_list": true
+      }
+    },
+    {
+      "case": "joke_request",
+      "session_turn": 4,
+      "expected_state": "speak",
+      "input_chars": 14,
+      "history_turn_count": 3,
+      "http_status": 200,
+      "finish_reason": "stop",
+      "provider_error": null,
+      "latency_ms": {
+        "headers": 133.6,
+        "first_sse": 133.7,
+        "first_output_delta": 133.7,
+        "first_non_whitespace": 447.8,
+        "terminal": 886.9
+      },
+      "stream": {
+        "event_counts": {
+          "chunk": 58
+        },
+        "output_delta_count": 58,
+        "blank_output_delta_count": 6,
+        "leading_whitespace_chars": 0,
+        "content_chars": 121
+      },
+      "validation": {
+        "valid": true,
+        "state": "speak",
+        "emotion": "happy",
+        "text_chars": 53,
+        "action_count": 0
+      },
+      "structural_shape": {
+        "top_level_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "actions_is_list": true
+      }
+    },
+    {
+      "case": "joke_feedback",
+      "session_turn": 6,
+      "expected_state": "speak",
+      "input_chars": 35,
+      "history_turn_count": 5,
+      "http_status": 200,
+      "finish_reason": "stop",
+      "provider_error": null,
+      "latency_ms": {
+        "headers": 130.6,
+        "first_sse": 130.8,
+        "first_output_delta": 130.8,
+        "first_non_whitespace": 263.6,
+        "terminal": 502.3
+      },
+      "stream": {
+        "event_counts": {
+          "chunk": 37
+        },
+        "output_delta_count": 37,
+        "blank_output_delta_count": 2,
+        "leading_whitespace_chars": 0,
+        "content_chars": 83
+      },
+      "validation": {
+        "valid": true,
+        "state": "speak",
+        "emotion": "calm",
+        "text_chars": 16,
+        "action_count": 0
+      },
+      "structural_shape": {
+        "top_level_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "actions_is_list": true
+      }
+    },
+    {
+      "case": "no_reply_complaint",
+      "session_turn": 7,
+      "expected_state": "speak",
+      "input_chars": 13,
+      "history_turn_count": 6,
+      "http_status": 200,
+      "finish_reason": "stop",
+      "provider_error": null,
+      "latency_ms": {
+        "headers": 131.8,
+        "first_sse": 132.5,
+        "first_output_delta": 132.5,
+        "first_non_whitespace": 515.3,
+        "terminal": 856.6
+      },
+      "stream": {
+        "event_counts": {
+          "chunk": 42
+        },
+        "output_delta_count": 42,
+        "blank_output_delta_count": 2,
+        "leading_whitespace_chars": 0,
+        "content_chars": 89
+      },
+      "validation": {
+        "valid": true,
+        "state": "speak",
+        "emotion": "calm",
+        "text_chars": 22,
+        "action_count": 0
+      },
+      "structural_shape": {
+        "top_level_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "actions_is_list": true
+      }
+    },
+    {
+      "case": "technical_no_reply_question",
+      "session_turn": 11,
+      "expected_state": "speak",
+      "input_chars": 28,
+      "history_turn_count": 10,
+      "http_status": 200,
+      "finish_reason": "stop",
+      "provider_error": null,
+      "latency_ms": {
+        "headers": 153.9,
+        "first_sse": 154.7,
+        "first_output_delta": 154.7,
+        "first_non_whitespace": 439.1,
+        "terminal": 879.7
+      },
+      "stream": {
+        "event_counts": {
+          "chunk": 44
+        },
+        "output_delta_count": 44,
+        "blank_output_delta_count": 2,
+        "leading_whitespace_chars": 0,
+        "content_chars": 101
+      },
+      "validation": {
+        "valid": true,
+        "state": "speak",
+        "emotion": "calm",
+        "text_chars": 34,
+        "action_count": 0
+      },
+      "structural_shape": {
+        "top_level_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "actions_is_list": true
+      }
+    },
+    {
+      "case": "final_hello",
+      "session_turn": 14,
+      "expected_state": "speak",
+      "input_chars": 1,
+      "history_turn_count": 13,
+      "http_status": 200,
+      "finish_reason": "stop",
+      "provider_error": null,
+      "latency_ms": {
+        "headers": 137.8,
+        "first_sse": 138.0,
+        "first_output_delta": 138.0,
+        "first_non_whitespace": 504.8,
+        "terminal": 939.7
+      },
+      "stream": {
+        "event_counts": {
+          "chunk": 43
+        },
+        "output_delta_count": 43,
+        "blank_output_delta_count": 2,
+        "leading_whitespace_chars": 0,
+        "content_chars": 92
+      },
+      "validation": {
+        "valid": true,
+        "state": "speak",
+        "emotion": "calm",
+        "text_chars": 25,
+        "action_count": 0
+      },
+      "structural_shape": {
+        "top_level_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "actions_is_list": true
+      }
+    }
+  ],
+  "summary": {
+    "samples": 8,
+    "http_200": 8,
+    "completed_stop": 8,
+    "local_envelope_valid": 8,
+    "state_matches_expected": 8,
+    "blank_only_streams": 0,
+    "leading_whitespace_observed": 0,
+    "first_non_whitespace_ms": {
+      "median": 510.0,
+      "max": 744.8
+    },
+    "terminal_ms": {
+      "median": 868.2,
+      "max": 1064.0
+    },
+    "errors": {}
+  }
+}

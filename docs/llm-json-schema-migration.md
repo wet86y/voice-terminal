@@ -28,6 +28,12 @@ rather than automatic, so one user turn is never sent to both backends.
 
 ## Current status: post-switch bug-repair period
 
+The active P1 reliability issue is tracked in
+[`known-issues/llm-invalid-json-responses.md`](known-issues/llm-invalid-json-responses.md).
+It distinguishes the current non-empty invalid Responses content from the
+historical Chat Completions whitespace storm and records the live-session
+failure rate, recovery gaps, and diagnostic acceptance criteria.
+
 The protocol switch is active in the test environment: every normal LLM
 decision uses Responses/strict JSON Schema with base reasoning effort `none`.
 Chat/JSON Object is frozen and hidden as rollback-only code. Ordinary shadow

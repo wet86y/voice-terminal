@@ -598,6 +598,10 @@ class EpisodeSpeechOutput(SpeechPipeline):
             await self.runtime.log("SPEECH_ERROR", identity=h.identity, turn_id=h.turn_id,
                                    speech_id=h.speech_id, error=str(exc)[:300])
         finally:
+            # Preserve ownership before settlement clears ``self.handle``.
+            # A same-prefix successor may be released only when this handle
+            # was still the active generation at the cleanup boundary.
+            was_active = self.handle is h
             # The provider generation and local PCM are now drained, but a
             # refined ASR decision often arrives immediately afterwards.
             # Retain the logical speech briefly so a verified suffix can wait

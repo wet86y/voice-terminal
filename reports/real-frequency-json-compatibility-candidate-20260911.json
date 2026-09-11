@@ -1,0 +1,5782 @@
+{
+  "probe": "real-frequency-json-replay",
+  "source": {
+    "log": "logs/voice-server.log",
+    "pid": 6720,
+    "dispatches": 147,
+    "turns": 39,
+    "asr_final_turns": 38,
+    "completed_full_speeches_reconstructed": 8,
+    "event_counts": {
+      "USER_INPUT_REFINED": 27,
+      "EXCEPTION_RECOVERY": 26,
+      "SPEAK_ENVELOPE_INVALID": 26,
+      "SPEECH_ENDED": 60,
+      "USER_SEGMENT_UPDATED": 66,
+      "USER_INPUT_FINALIZED": 38,
+      "ENDPOINT_CANDIDATE": 16,
+      "VOICE_ACTIVE": 3,
+      "SPEECH_STARTED": 6
+    },
+    "selected_dispatches": 95,
+    "source_duration_seconds": 480.988
+  },
+  "execution": {
+    "speed": 20.0,
+    "wall_seconds": 26.516,
+    "request_start_cadence": "exact source LLM_DISPATCHED offsets divided by speed",
+    "original_cancellations_replayed": false,
+    "all_probe_calls_allowed_to_finish": true,
+    "tts_or_pcm_started": false,
+    "generated_content_retained": false,
+    "raw_user_or_assistant_content_retained": false,
+    "context_reconstruction": "real ASR partial/final text + full completed TTS text + request events/playback state; late refinement text and partial-delivery heard boundary unavailable in source log"
+  },
+  "model": "deepseek-flash",
+  "schema_digest": "3d3239e0be88db55",
+  "summary": {
+    "requests": 95,
+    "completed": 95,
+    "strict_valid": 76,
+    "malformed_completed": 19,
+    "malformed_completed_rate": 0.2,
+    "safely_recoverable": 16,
+    "content_classes": {
+      "prose_likely_complete": 14,
+      "other": 2,
+      "valid_json": 2,
+      "container_incomplete": 1
+    },
+    "repair_sets": {
+      "plain_text_speak": 14,
+      "none": 3,
+      "missing_actions": 2
+    },
+    "by_input_stage": {
+      "finalized": {
+        "requests": 15,
+        "completed": 15,
+        "strict_valid": 10,
+        "safely_recoverable": 4
+      },
+      "recovery": {
+        "requests": 16,
+        "completed": 16,
+        "strict_valid": 15,
+        "safely_recoverable": 1
+      },
+      "refined": {
+        "requests": 14,
+        "completed": 14,
+        "strict_valid": 13,
+        "safely_recoverable": 1
+      },
+      "speculative": {
+        "requests": 50,
+        "completed": 50,
+        "strict_valid": 38,
+        "safely_recoverable": 10
+      }
+    },
+    "latency_ms": {
+      "n": 95,
+      "median": 1429.5,
+      "p95": 2480.9,
+      "max": 2965.8
+    },
+    "provider_errors": {}
+  },
+  "rows": [
+    {
+      "source_request_id": "d11080642838459d886df6f813b13b29",
+      "turn_id": "input_20260910_230349_000022",
+      "source_offset_ms": 0,
+      "input_stage": "refined",
+      "events": [
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "297438a1ab0fefe8",
+      "message_count": 3,
+      "current_input_chars": 0,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1267.9,
+      "raw_chars": 66,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "92be25a1e238611f",
+      "usage": {
+        "prompt_tokens": 1190,
+        "completion_tokens": 23,
+        "total_tokens": 1213,
+        "cached_tokens": 896,
+        "cache_miss_tokens": 294
+      }
+    },
+    {
+      "source_request_id": "41823e2b20c7432886ac9c0df9c20866",
+      "turn_id": "input_20260910_230349_000022",
+      "source_offset_ms": 893,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "6826a63832d50231",
+      "message_count": 4,
+      "current_input_chars": 0,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1256.8,
+      "raw_chars": 66,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "92be25a1e238611f",
+      "usage": {
+        "prompt_tokens": 1232,
+        "completion_tokens": 23,
+        "total_tokens": 1255,
+        "cached_tokens": 1024,
+        "cache_miss_tokens": 208
+      }
+    },
+    {
+      "source_request_id": "89034c419fc04185b86d54cb89149d4c",
+      "turn_id": "input_20260910_230404_000023",
+      "source_offset_ms": 2351,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "dc4897f4f5c9f183",
+      "message_count": 4,
+      "current_input_chars": 12,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1173.9,
+      "raw_chars": 66,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "92be25a1e238611f",
+      "usage": {
+        "prompt_tokens": 1198,
+        "completion_tokens": 23,
+        "total_tokens": 1221,
+        "cached_tokens": 896,
+        "cache_miss_tokens": 302
+      }
+    },
+    {
+      "source_request_id": "fc2f6a7b1cd14813aee6326653787228",
+      "turn_id": "input_20260910_230404_000023",
+      "source_offset_ms": 5658,
+      "input_stage": "speculative",
+      "events": [
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "892d3d05f2040656",
+      "message_count": 4,
+      "current_input_chars": 32,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1007.3,
+      "raw_chars": 66,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "92be25a1e238611f",
+      "usage": {
+        "prompt_tokens": 1217,
+        "completion_tokens": 23,
+        "total_tokens": 1240,
+        "cached_tokens": 1024,
+        "cache_miss_tokens": 193
+      }
+    },
+    {
+      "source_request_id": "4628964d5f774cd0a3babbb70c715c41",
+      "turn_id": "input_20260910_230404_000023",
+      "source_offset_ms": 6509,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "c86355cebb4b6c0a",
+      "message_count": 5,
+      "current_input_chars": 36,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1429.5,
+      "raw_chars": 140,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 65,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "64a24cc526f8dbe1",
+      "usage": {
+        "prompt_tokens": 1263,
+        "completion_tokens": 70,
+        "total_tokens": 1333,
+        "cached_tokens": 1024,
+        "cache_miss_tokens": 239
+      }
+    },
+    {
+      "source_request_id": "43e5fc8b8abe4286a37ee37d1849d700",
+      "turn_id": "input_20260910_230404_000023",
+      "source_offset_ms": 8347,
+      "input_stage": "speculative",
+      "events": [
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "2f1dda8ebadfe3f2",
+      "message_count": 4,
+      "current_input_chars": 45,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1394.9,
+      "raw_chars": 147,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 80,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "49a23a255149e5d9",
+      "usage": {
+        "prompt_tokens": 1220,
+        "completion_tokens": 68,
+        "total_tokens": 1288,
+        "cached_tokens": 1024,
+        "cache_miss_tokens": 196
+      }
+    },
+    {
+      "source_request_id": "9e9ffee5654f4aafac545dab076a4f23",
+      "turn_id": "input_20260910_230404_000023",
+      "source_offset_ms": 10948,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "2df2cc5ae99aba7d",
+      "message_count": 4,
+      "current_input_chars": 57,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1093.8,
+      "raw_chars": 110,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 43,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "dd8c2ab0a65116d3",
+      "usage": {
+        "prompt_tokens": 1231,
+        "completion_tokens": 52,
+        "total_tokens": 1283,
+        "cached_tokens": 1024,
+        "cache_miss_tokens": 207
+      }
+    },
+    {
+      "source_request_id": "af8790337fea4331b7e2985b16c92e1e",
+      "turn_id": "input_20260910_230404_000023",
+      "source_offset_ms": 13549,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "ecc034993903001b",
+      "message_count": 4,
+      "current_input_chars": 69,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1286.3,
+      "raw_chars": 130,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 63,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "42d185aecbb489de",
+      "usage": {
+        "prompt_tokens": 1239,
+        "completion_tokens": 66,
+        "total_tokens": 1305,
+        "cached_tokens": 1024,
+        "cache_miss_tokens": 215
+      }
+    },
+    {
+      "source_request_id": "23ece0202bbd41819c5193f9a675aa96",
+      "turn_id": "input_20260910_230404_000023",
+      "source_offset_ms": 14569,
+      "input_stage": "finalized",
+      "events": [
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "7c77068662190b6b",
+      "message_count": 4,
+      "current_input_chars": 70,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1362.0,
+      "raw_chars": 177,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 110,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "06d40b697e7a2c11",
+      "usage": {
+        "prompt_tokens": 1246,
+        "completion_tokens": 95,
+        "total_tokens": 1341,
+        "cached_tokens": 1024,
+        "cache_miss_tokens": 222
+      }
+    },
+    {
+      "source_request_id": "4f7b2d5e5a064fe7888c02e09a20db0e",
+      "turn_id": "input_20260910_230421_000024",
+      "source_offset_ms": 16820,
+      "input_stage": "refined",
+      "events": [
+        "ENDPOINT_CANDIDATE",
+        "SPEECH_ENDED",
+        "USER_INPUT_REFINED",
+        "VOICE_ACTIVE"
+      ],
+      "effort": "none",
+      "context_digest": "3b49db5fbe0b30cb",
+      "message_count": 5,
+      "current_input_chars": 1,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1149.6,
+      "raw_chars": 120,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 53,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "dc8ed288a8d9c8d3",
+      "usage": {
+        "prompt_tokens": 1241,
+        "completion_tokens": 59,
+        "total_tokens": 1300,
+        "cached_tokens": 1024,
+        "cache_miss_tokens": 217
+      }
+    },
+    {
+      "source_request_id": "f3a218ab22ab470a9c1a840f899d2868",
+      "turn_id": "input_20260910_230421_000024",
+      "source_offset_ms": 21155,
+      "input_stage": "finalized",
+      "events": [
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "598bfaffdace31e2",
+      "message_count": 5,
+      "current_input_chars": 5,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1673.7,
+      "raw_chars": 127,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 60,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "c54589be417d54b0",
+      "usage": {
+        "prompt_tokens": 1251,
+        "completion_tokens": 60,
+        "total_tokens": 1311,
+        "cached_tokens": 1024,
+        "cache_miss_tokens": 227
+      }
+    },
+    {
+      "source_request_id": "bfa1823febcf4df680b693b0049f070b",
+      "turn_id": "input_20260910_230421_000024",
+      "source_offset_ms": 22192,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "0bac44d44790d6f0",
+      "message_count": 6,
+      "current_input_chars": 5,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 928.2,
+      "raw_chars": 116,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 49,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "f25981de8218e3ed",
+      "usage": {
+        "prompt_tokens": 1293,
+        "completion_tokens": 58,
+        "total_tokens": 1351,
+        "cached_tokens": 1152,
+        "cache_miss_tokens": 141
+      }
+    },
+    {
+      "source_request_id": "f120f7580f174552ad504f36418d7dd2",
+      "turn_id": "input_20260910_230421_000024",
+      "source_offset_ms": 23118,
+      "input_stage": "refined",
+      "events": [
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "d7fbe4fed316d5e9",
+      "message_count": 5,
+      "current_input_chars": 5,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1333.8,
+      "raw_chars": 130,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 61,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "0c8c6a3bfe123801",
+      "usage": {
+        "prompt_tokens": 1262,
+        "completion_tokens": 63,
+        "total_tokens": 1325,
+        "cached_tokens": 1024,
+        "cache_miss_tokens": 238
+      }
+    },
+    {
+      "source_request_id": "30b3ec90b5aa4b6fb01b808b17ae9c56",
+      "turn_id": "input_20260910_230432_000025",
+      "source_offset_ms": 27971,
+      "input_stage": "finalized",
+      "events": [
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "1213f88deccea56d",
+      "message_count": 7,
+      "current_input_chars": 4,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1645.6,
+      "raw_chars": 144,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 77,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "814f50a1fba35231",
+      "usage": {
+        "prompt_tokens": 1261,
+        "completion_tokens": 70,
+        "total_tokens": 1331,
+        "cached_tokens": 1024,
+        "cache_miss_tokens": 237
+      }
+    },
+    {
+      "source_request_id": "e06384ba012a41aa950dd4fa30fc0783",
+      "turn_id": "input_20260910_230503_000026",
+      "source_offset_ms": 61644,
+      "input_stage": "speculative",
+      "events": [
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "112c8924ffbdab63",
+      "message_count": 9,
+      "current_input_chars": 23,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1040.1,
+      "raw_chars": 74,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "c7ac6c60c24a9e63",
+      "usage": {
+        "prompt_tokens": 1363,
+        "completion_tokens": 28,
+        "total_tokens": 1391,
+        "cached_tokens": 1152,
+        "cache_miss_tokens": 211
+      }
+    },
+    {
+      "source_request_id": "59fb8c5b77f4458d95935cc730907525",
+      "turn_id": "input_20260910_230503_000026",
+      "source_offset_ms": 64826,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "18a5316e0ac56aca",
+      "message_count": 9,
+      "current_input_chars": 35,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1398.6,
+      "raw_chars": 170,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 103,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "81f657e8ddbd6f97",
+      "usage": {
+        "prompt_tokens": 1363,
+        "completion_tokens": 88,
+        "total_tokens": 1451,
+        "cached_tokens": 1152,
+        "cache_miss_tokens": 211
+      }
+    },
+    {
+      "source_request_id": "5fefac289e314b52908c69b9dde8c234",
+      "turn_id": "input_20260910_230503_000026",
+      "source_offset_ms": 66817,
+      "input_stage": "finalized",
+      "events": [
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "74c1871775c1692f",
+      "message_count": 9,
+      "current_input_chars": 40,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1662.0,
+      "raw_chars": 218,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 149,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "0b1f24374ade2b0b",
+      "usage": {
+        "prompt_tokens": 1373,
+        "completion_tokens": 116,
+        "total_tokens": 1489,
+        "cached_tokens": 1152,
+        "cache_miss_tokens": 221
+      }
+    },
+    {
+      "source_request_id": "2f012f65464f4b8fa57837894e1a4d45",
+      "turn_id": "input_20260910_230503_000026",
+      "source_offset_ms": 68192,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "78a48634714a4a61",
+      "message_count": 10,
+      "current_input_chars": 40,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1701.5,
+      "raw_chars": 215,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 140,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "6ea61060f992ac85",
+      "usage": {
+        "prompt_tokens": 1415,
+        "completion_tokens": 117,
+        "total_tokens": 1532,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 135
+      }
+    },
+    {
+      "source_request_id": "879b16bfa8d343dd9cfe4f6ff78f3b03",
+      "turn_id": "input_20260910_230503_000026",
+      "source_offset_ms": 69623,
+      "input_stage": "refined",
+      "events": [
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "88264ecf2c08dc5f",
+      "message_count": 9,
+      "current_input_chars": 40,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1932.6,
+      "raw_chars": 157,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 90,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "c0e0d59defcd3c79",
+      "usage": {
+        "prompt_tokens": 1439,
+        "completion_tokens": 82,
+        "total_tokens": 1521,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 159
+      }
+    },
+    {
+      "source_request_id": "48577f71372f46c3922fc28aba6b6bff",
+      "turn_id": "input_20260910_230535_000027",
+      "source_offset_ms": 93407,
+      "input_stage": "speculative",
+      "events": [
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "5d7c3259239d83d8",
+      "message_count": 11,
+      "current_input_chars": 21,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1556.0,
+      "raw_chars": 111,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 44,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "64b13232f20ac268",
+      "usage": {
+        "prompt_tokens": 1447,
+        "completion_tokens": 54,
+        "total_tokens": 1501,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 167
+      }
+    },
+    {
+      "source_request_id": "55ebfa1e8eee4c458aba619c5463d7ba",
+      "turn_id": "input_20260910_230535_000027",
+      "source_offset_ms": 95230,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "d3032da598275e65",
+      "message_count": 11,
+      "current_input_chars": 27,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1643.0,
+      "raw_chars": 124,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 57,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "10a0044f00df0c9d",
+      "usage": {
+        "prompt_tokens": 1448,
+        "completion_tokens": 63,
+        "total_tokens": 1511,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 168
+      }
+    },
+    {
+      "source_request_id": "d566def813c74c6b9f93936d8cb15bcd",
+      "turn_id": "input_20260910_230535_000027",
+      "source_offset_ms": 95990,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "c18020aa15418e1f",
+      "message_count": 12,
+      "current_input_chars": 28,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1071.2,
+      "raw_chars": 89,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 22,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "84cf014d688efe27",
+      "usage": {
+        "prompt_tokens": 1508,
+        "completion_tokens": 37,
+        "total_tokens": 1545,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 228
+      }
+    },
+    {
+      "source_request_id": "2eac86fe49544e049ef1f11a73c46d2d",
+      "turn_id": "input_20260910_230535_000027",
+      "source_offset_ms": 98592,
+      "input_stage": "finalized",
+      "events": [
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "22af94886f35d618",
+      "message_count": 11,
+      "current_input_chars": 30,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1452.6,
+      "raw_chars": 53,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "cf76961bf22cefa7",
+      "usage": {
+        "prompt_tokens": 1453,
+        "completion_tokens": 36,
+        "total_tokens": 1489,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 173
+      }
+    },
+    {
+      "source_request_id": "501e5edd26014117979bb3d56a37c270",
+      "turn_id": "input_20260910_230535_000027",
+      "source_offset_ms": 100174,
+      "input_stage": "refined",
+      "events": [
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "22af94886f35d618",
+      "message_count": 11,
+      "current_input_chars": 30,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1128.7,
+      "raw_chars": 131,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 64,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "97e50ce19bcee569",
+      "usage": {
+        "prompt_tokens": 1453,
+        "completion_tokens": 63,
+        "total_tokens": 1516,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 173
+      }
+    },
+    {
+      "source_request_id": "42d8f8b3f5d84a67b0b69dc688cc89fd",
+      "turn_id": "input_20260910_230558_000028",
+      "source_offset_ms": 115587,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "2df34c1013d0c588",
+      "message_count": 13,
+      "current_input_chars": 9,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 799.6,
+      "raw_chars": 87,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 12,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "763a28fe0796ce10",
+      "usage": {
+        "prompt_tokens": 1488,
+        "completion_tokens": 38,
+        "total_tokens": 1526,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 208
+      }
+    },
+    {
+      "source_request_id": "72c33bab5c7b4d16a145f6d8824bfdfc",
+      "turn_id": "input_20260910_230558_000028",
+      "source_offset_ms": 116262,
+      "input_stage": "finalized",
+      "events": [
+        "ENDPOINT_CANDIDATE",
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "3ed67026db77d517",
+      "message_count": 13,
+      "current_input_chars": 11,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1157.7,
+      "raw_chars": 91,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 16,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "aba1a56cea9c7999",
+      "usage": {
+        "prompt_tokens": 1496,
+        "completion_tokens": 42,
+        "total_tokens": 1538,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 216
+      }
+    },
+    {
+      "source_request_id": "66772927400543ff9b38641038b65207",
+      "turn_id": "input_20260910_230558_000028",
+      "source_offset_ms": 117040,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "a5373470ee326eaf",
+      "message_count": 14,
+      "current_input_chars": 11,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1132.9,
+      "raw_chars": 84,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 9,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "534685e2b78aa688",
+      "usage": {
+        "prompt_tokens": 1538,
+        "completion_tokens": 36,
+        "total_tokens": 1574,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 258
+      }
+    },
+    {
+      "source_request_id": "c0f391ce15c343439d6b3e07b8ac2eeb",
+      "turn_id": "input_20260910_230558_000028",
+      "source_offset_ms": 117961,
+      "input_stage": "refined",
+      "events": [
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "2ebad5d0a6f51c52",
+      "message_count": 13,
+      "current_input_chars": 11,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1176.3,
+      "raw_chars": 95,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 28,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "2acc8059775e6182",
+      "usage": {
+        "prompt_tokens": 1516,
+        "completion_tokens": 46,
+        "total_tokens": 1562,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 236
+      }
+    },
+    {
+      "source_request_id": "ff04d8c3bc3f4f259b10c6a0f4a6aa34",
+      "turn_id": "input_20260910_230604_000029",
+      "source_offset_ms": 122828,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "62924affce1b0c49",
+      "message_count": 14,
+      "current_input_chars": 7,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1623.4,
+      "raw_chars": 66,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "92be25a1e238611f",
+      "usage": {
+        "prompt_tokens": 1494,
+        "completion_tokens": 23,
+        "total_tokens": 1517,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 214
+      }
+    },
+    {
+      "source_request_id": "f883209b233e443086a6baa5b3c815a6",
+      "turn_id": "input_20260910_230604_000029",
+      "source_offset_ms": 123322,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "112b1b340d0c3893",
+      "message_count": 15,
+      "current_input_chars": 7,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 986.1,
+      "raw_chars": 88,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 13,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "c741e08f4aecfa14",
+      "usage": {
+        "prompt_tokens": 1536,
+        "completion_tokens": 40,
+        "total_tokens": 1576,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 256
+      }
+    },
+    {
+      "source_request_id": "f3e60c19c99a4f05bcee04284ee9ebb5",
+      "turn_id": "input_20260910_230604_000029",
+      "source_offset_ms": 126627,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "e449085572a0adc4",
+      "message_count": 14,
+      "current_input_chars": 14,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1695.2,
+      "raw_chars": 66,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "92be25a1e238611f",
+      "usage": {
+        "prompt_tokens": 1497,
+        "completion_tokens": 23,
+        "total_tokens": 1520,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 217
+      }
+    },
+    {
+      "source_request_id": "e304545f576b4a29aa2ad81976cfd223",
+      "turn_id": "input_20260910_230604_000029",
+      "source_offset_ms": 131427,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "7d6bb49d7f1efaf1",
+      "message_count": 14,
+      "current_input_chars": 31,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 924.1,
+      "raw_chars": 40,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "ab0ce2032d426891",
+      "usage": {
+        "prompt_tokens": 1508,
+        "completion_tokens": 29,
+        "total_tokens": 1537,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 228
+      }
+    },
+    {
+      "source_request_id": "df86e830a1ee4d98ac8a4c59b8957bed",
+      "turn_id": "input_20260910_230604_000029",
+      "source_offset_ms": 135453,
+      "input_stage": "speculative",
+      "events": [
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "39a026ebb70dfe0f",
+      "message_count": 14,
+      "current_input_chars": 51,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 961.0,
+      "raw_chars": 74,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "c7ac6c60c24a9e63",
+      "usage": {
+        "prompt_tokens": 1527,
+        "completion_tokens": 28,
+        "total_tokens": 1555,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 247
+      }
+    },
+    {
+      "source_request_id": "ce79f062f84d42a181cca6570313d23f",
+      "turn_id": "input_20260910_230604_000029",
+      "source_offset_ms": 136691,
+      "input_stage": "finalized",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "84df0993725f4330",
+      "message_count": 14,
+      "current_input_chars": 53,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1225.7,
+      "raw_chars": 98,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 23,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "070600eb0354187a",
+      "usage": {
+        "prompt_tokens": 1527,
+        "completion_tokens": 45,
+        "total_tokens": 1572,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 247
+      }
+    },
+    {
+      "source_request_id": "946979d51739441b8d01dadc196ab05c",
+      "turn_id": "input_20260910_230623_000030",
+      "source_offset_ms": 140789,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "c5932dcae10111b3",
+      "message_count": 15,
+      "current_input_chars": 10,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1087.8,
+      "raw_chars": 51,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "663c4c8b81348d2f",
+      "usage": {
+        "prompt_tokens": 1527,
+        "completion_tokens": 35,
+        "total_tokens": 1562,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 247
+      }
+    },
+    {
+      "source_request_id": "0d62774a720c4d4e964e048099dd553d",
+      "turn_id": "input_20260910_230623_000030",
+      "source_offset_ms": 145589,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "cb0d6253a7fee7de",
+      "message_count": 15,
+      "current_input_chars": 26,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1342.3,
+      "raw_chars": 11,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "151a6f28ad3fe909",
+      "usage": {
+        "prompt_tokens": 1536,
+        "completion_tokens": 8,
+        "total_tokens": 1544,
+        "cached_tokens": 1280,
+        "cache_miss_tokens": 256
+      }
+    },
+    {
+      "source_request_id": "f51e02eda7854a64aa3d1e55e242b132",
+      "turn_id": "input_20260910_230623_000030",
+      "source_offset_ms": 146778,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "b337142f64640f4b",
+      "message_count": 16,
+      "current_input_chars": 28,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1778.4,
+      "raw_chars": 174,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 107,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "9b64a598826ba4fd",
+      "usage": {
+        "prompt_tokens": 1585,
+        "completion_tokens": 95,
+        "total_tokens": 1680,
+        "cached_tokens": 1408,
+        "cache_miss_tokens": 177
+      }
+    },
+    {
+      "source_request_id": "83591ee2700c4d939792c2c74afb426b",
+      "turn_id": "input_20260910_230623_000030",
+      "source_offset_ms": 147721,
+      "input_stage": "refined",
+      "events": [
+        "USER_INPUT_FINALIZED",
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "71de31d7b7ea7f37",
+      "message_count": 15,
+      "current_input_chars": 28,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1192.4,
+      "raw_chars": 165,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 98,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "8abe92e4b51b29d6",
+      "usage": {
+        "prompt_tokens": 1555,
+        "completion_tokens": 93,
+        "total_tokens": 1648,
+        "cached_tokens": 1408,
+        "cache_miss_tokens": 147
+      }
+    },
+    {
+      "source_request_id": "06e867562a5c423facae70d4ad6e2b3e",
+      "turn_id": "input_20260910_230646_000031",
+      "source_offset_ms": 163788,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "c0f213301366f281",
+      "message_count": 16,
+      "current_input_chars": 8,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1249.4,
+      "raw_chars": 94,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "a3eeb46a0c593c44",
+      "usage": {
+        "prompt_tokens": 1544,
+        "completion_tokens": 62,
+        "total_tokens": 1606,
+        "cached_tokens": 1408,
+        "cache_miss_tokens": 136
+      }
+    },
+    {
+      "source_request_id": "f8d50ce621154046ab622263e329b595",
+      "turn_id": "input_20260910_230646_000031",
+      "source_offset_ms": 165103,
+      "input_stage": "refined",
+      "events": [
+        "ENDPOINT_CANDIDATE",
+        "USER_INPUT_FINALIZED",
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "bcf2bcffc7568d79",
+      "message_count": 16,
+      "current_input_chars": 9,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1299.9,
+      "raw_chars": 192,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 125,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "d85f81de02aba11d",
+      "usage": {
+        "prompt_tokens": 1644,
+        "completion_tokens": 108,
+        "total_tokens": 1752,
+        "cached_tokens": 1408,
+        "cache_miss_tokens": 236
+      }
+    },
+    {
+      "source_request_id": "e981d0fef9904ea480d1e7ea1ba8741f",
+      "turn_id": "input_20260910_230719_000032",
+      "source_offset_ms": 196668,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "62f58bacfab9791f",
+      "message_count": 18,
+      "current_input_chars": 9,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1509.9,
+      "raw_chars": 159,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 92,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "e7aa44a218b30423",
+      "usage": {
+        "prompt_tokens": 1638,
+        "completion_tokens": 91,
+        "total_tokens": 1729,
+        "cached_tokens": 1408,
+        "cache_miss_tokens": 230
+      }
+    },
+    {
+      "source_request_id": "ed52ac5823094b66b9c463377bfd0d2d",
+      "turn_id": "input_20260910_230719_000032",
+      "source_offset_ms": 202468,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "122c930760f72cf5",
+      "message_count": 18,
+      "current_input_chars": 25,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1335.8,
+      "raw_chars": 101,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "eaadfc3ea906d441",
+      "usage": {
+        "prompt_tokens": 1646,
+        "completion_tokens": 67,
+        "total_tokens": 1713,
+        "cached_tokens": 1408,
+        "cache_miss_tokens": 238
+      }
+    },
+    {
+      "source_request_id": "3df709a228954cd3bbda8ecbb33d5c3a",
+      "turn_id": "input_20260910_230719_000032",
+      "source_offset_ms": 205623,
+      "input_stage": "speculative",
+      "events": [
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "87f275eeb47b982a",
+      "message_count": 18,
+      "current_input_chars": 45,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2102.8,
+      "raw_chars": 99,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "7d8e8a9c1fb2c584",
+      "usage": {
+        "prompt_tokens": 1664,
+        "completion_tokens": 71,
+        "total_tokens": 1735,
+        "cached_tokens": 1408,
+        "cache_miss_tokens": 256
+      }
+    },
+    {
+      "source_request_id": "2e92e436345f40fdb94a3dd490fd82db",
+      "turn_id": "input_20260910_230719_000032",
+      "source_offset_ms": 206598,
+      "input_stage": "finalized",
+      "events": [
+        "SPEECH_ENDED",
+        "SPEECH_STARTED",
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "7fc89527443e1d42",
+      "message_count": 18,
+      "current_input_chars": 46,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1702.5,
+      "raw_chars": 187,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "89bdbbb37819f276",
+      "usage": {
+        "prompt_tokens": 1664,
+        "completion_tokens": 124,
+        "total_tokens": 1788,
+        "cached_tokens": 1408,
+        "cache_miss_tokens": 256
+      }
+    },
+    {
+      "source_request_id": "3d37c17be2254dd3b2408fb5e4330bbb",
+      "turn_id": "input_20260910_230719_000032",
+      "source_offset_ms": 207765,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "ee187c592ac3b4c7",
+      "message_count": 19,
+      "current_input_chars": 46,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1744.4,
+      "raw_chars": 202,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 127,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "32695d8f2f411bfe",
+      "usage": {
+        "prompt_tokens": 1706,
+        "completion_tokens": 114,
+        "total_tokens": 1820,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 170
+      }
+    },
+    {
+      "source_request_id": "061e563172c541ad9f6bda1a0d49d72c",
+      "turn_id": "input_20260910_230719_000032",
+      "source_offset_ms": 208900,
+      "input_stage": "refined",
+      "events": [
+        "USER_INPUT_REFINED",
+        "VOICE_ACTIVE"
+      ],
+      "effort": "none",
+      "context_digest": "4e2f6e5ca9ac2d68",
+      "message_count": 18,
+      "current_input_chars": 46,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1353.0,
+      "raw_chars": 132,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "3921ec802fa9578e",
+      "usage": {
+        "prompt_tokens": 1667,
+        "completion_tokens": 91,
+        "total_tokens": 1758,
+        "cached_tokens": 1408,
+        "cache_miss_tokens": 259
+      }
+    },
+    {
+      "source_request_id": "6229a9773e234f11bc57296b62f2c9bd",
+      "turn_id": "input_20260910_230732_000033",
+      "source_offset_ms": 209298,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "SPEECH_STARTED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "a1383023c17420ba",
+      "message_count": 19,
+      "current_input_chars": 9,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 859.4,
+      "raw_chars": 74,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "c7ac6c60c24a9e63",
+      "usage": {
+        "prompt_tokens": 1673,
+        "completion_tokens": 28,
+        "total_tokens": 1701,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 137
+      }
+    },
+    {
+      "source_request_id": "d3475fd0933a4449b1b6365edb8bd6fc",
+      "turn_id": "input_20260910_230732_000033",
+      "source_offset_ms": 212692,
+      "input_stage": "speculative",
+      "events": [
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "463ab19422a241e6",
+      "message_count": 19,
+      "current_input_chars": 30,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1017.4,
+      "raw_chars": 66,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "92be25a1e238611f",
+      "usage": {
+        "prompt_tokens": 1686,
+        "completion_tokens": 23,
+        "total_tokens": 1709,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 150
+      }
+    },
+    {
+      "source_request_id": "e96a3ebde6d1461fa9ac0b27e8c9bf41",
+      "turn_id": "input_20260910_230732_000033",
+      "source_offset_ms": 213677,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "df32a5317b1a214a",
+      "message_count": 20,
+      "current_input_chars": 34,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 988.1,
+      "raw_chars": 74,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "c7ac6c60c24a9e63",
+      "usage": {
+        "prompt_tokens": 1731,
+        "completion_tokens": 28,
+        "total_tokens": 1759,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 195
+      }
+    },
+    {
+      "source_request_id": "17a1a2f8708948468c11dfd9a7d14171",
+      "turn_id": "input_20260910_230732_000033",
+      "source_offset_ms": 214190,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "SPEECH_STARTED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "e1d6b7041f034252",
+      "message_count": 19,
+      "current_input_chars": 37,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1314.8,
+      "raw_chars": 66,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "92be25a1e238611f",
+      "usage": {
+        "prompt_tokens": 1691,
+        "completion_tokens": 23,
+        "total_tokens": 1714,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 155
+      }
+    },
+    {
+      "source_request_id": "f848c8129fc44e669f7536801ea3b4ea",
+      "turn_id": "input_20260910_230732_000033",
+      "source_offset_ms": 217587,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "ee8561fed8e4c297",
+      "message_count": 19,
+      "current_input_chars": 54,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1532.1,
+      "raw_chars": 166,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 99,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "6dda24e642d69424",
+      "usage": {
+        "prompt_tokens": 1693,
+        "completion_tokens": 86,
+        "total_tokens": 1779,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 157
+      }
+    },
+    {
+      "source_request_id": "62dc4d8594a944668e51e284fa29d504",
+      "turn_id": "input_20260910_230732_000033",
+      "source_offset_ms": 218792,
+      "input_stage": "finalized",
+      "events": [
+        "ENDPOINT_CANDIDATE",
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "c8256ef4109308e6",
+      "message_count": 19,
+      "current_input_chars": 55,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1719.9,
+      "raw_chars": 156,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "018c5922c5b75861",
+      "usage": {
+        "prompt_tokens": 1700,
+        "completion_tokens": 106,
+        "total_tokens": 1806,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 164
+      }
+    },
+    {
+      "source_request_id": "48c363d34ff34b48a8dd59b93c206d23",
+      "turn_id": "input_20260910_230732_000033",
+      "source_offset_ms": 220504,
+      "input_stage": "refined",
+      "events": [
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "3e1cc76c70071573",
+      "message_count": 19,
+      "current_input_chars": 55,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1627.7,
+      "raw_chars": 252,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 185,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "5366d326afedb1cd",
+      "usage": {
+        "prompt_tokens": 1800,
+        "completion_tokens": 147,
+        "total_tokens": 1947,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 264
+      }
+    },
+    {
+      "source_request_id": "765e13ee868a4d5bb2bdf532c76a8aac",
+      "turn_id": "input_20260910_230819_000034",
+      "source_offset_ms": 256389,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "070258a3247ffd92",
+      "message_count": 20,
+      "current_input_chars": 17,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1787.5,
+      "raw_chars": 206,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 139,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "20cc1604833bd1d3",
+      "usage": {
+        "prompt_tokens": 1704,
+        "completion_tokens": 114,
+        "total_tokens": 1818,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 168
+      }
+    },
+    {
+      "source_request_id": "6dd27426dfe84b8eb6c2422750442821",
+      "turn_id": "input_20260910_230819_000034",
+      "source_offset_ms": 257302,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "442dde780f927c2b",
+      "message_count": 21,
+      "current_input_chars": 17,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1904.1,
+      "raw_chars": 178,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 111,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "f04b43f978989cb0",
+      "usage": {
+        "prompt_tokens": 1753,
+        "completion_tokens": 95,
+        "total_tokens": 1848,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 217
+      }
+    },
+    {
+      "source_request_id": "6bfe186ecf6e4d3299a2704833831e00",
+      "turn_id": "input_20260910_230819_000034",
+      "source_offset_ms": 257879,
+      "input_stage": "refined",
+      "events": [
+        "ENDPOINT_CANDIDATE",
+        "USER_INPUT_FINALIZED",
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "f9149f64e900ac3d",
+      "message_count": 20,
+      "current_input_chars": 17,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1586.7,
+      "raw_chars": 188,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 121,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "f9522d3f600e728d",
+      "usage": {
+        "prompt_tokens": 1711,
+        "completion_tokens": 102,
+        "total_tokens": 1813,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 175
+      }
+    },
+    {
+      "source_request_id": "d8da0af667fe4b068a9cc7556b3f629c",
+      "turn_id": "input_20260910_230834_000035",
+      "source_offset_ms": 271017,
+      "input_stage": "finalized",
+      "events": [
+        "ENDPOINT_CANDIDATE",
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "3cb3de57e905187e",
+      "message_count": 21,
+      "current_input_chars": 5,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1748.2,
+      "raw_chars": 203,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 136,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "77a1d38a60b80a21",
+      "usage": {
+        "prompt_tokens": 1715,
+        "completion_tokens": 109,
+        "total_tokens": 1824,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 179
+      }
+    },
+    {
+      "source_request_id": "98beeaff4ee04c3c8a339ecb72133698",
+      "turn_id": "input_20260910_230859_000036",
+      "source_offset_ms": 295949,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "565ccc268bc0b9dc",
+      "message_count": 22,
+      "current_input_chars": 8,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1915.3,
+      "raw_chars": 202,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 135,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "e5346b9741b69a3f",
+      "usage": {
+        "prompt_tokens": 1715,
+        "completion_tokens": 111,
+        "total_tokens": 1826,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 179
+      }
+    },
+    {
+      "source_request_id": "e33e0d346eff47b093492d368efd0e6a",
+      "turn_id": "input_20260910_230859_000036",
+      "source_offset_ms": 298753,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "06cb94bbe766fc16",
+      "message_count": 22,
+      "current_input_chars": 23,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1597.9,
+      "raw_chars": 127,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "bb82e7f5f102019e",
+      "usage": {
+        "prompt_tokens": 1721,
+        "completion_tokens": 85,
+        "total_tokens": 1806,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 185
+      }
+    },
+    {
+      "source_request_id": "b579d1710ff04032acf2f84f924b3c2d",
+      "turn_id": "input_20260910_230859_000036",
+      "source_offset_ms": 301546,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "829795430939a905",
+      "message_count": 22,
+      "current_input_chars": 38,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1335.2,
+      "raw_chars": 105,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 38,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "493038d37118d512",
+      "usage": {
+        "prompt_tokens": 1728,
+        "completion_tokens": 48,
+        "total_tokens": 1776,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 192
+      }
+    },
+    {
+      "source_request_id": "c2df354237a4407c871804458bee3f14",
+      "turn_id": "input_20260910_230859_000036",
+      "source_offset_ms": 305350,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "d9110a6a3ef4c96f",
+      "message_count": 22,
+      "current_input_chars": 50,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1909.9,
+      "raw_chars": 258,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 191,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "2ab7b17c5efde62b",
+      "usage": {
+        "prompt_tokens": 1734,
+        "completion_tokens": 147,
+        "total_tokens": 1881,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 198
+      }
+    },
+    {
+      "source_request_id": "6288d851e0534b14a6c78effb7bf06f4",
+      "turn_id": "input_20260910_230859_000036",
+      "source_offset_ms": 309347,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "7ab9adad6e25180d",
+      "message_count": 22,
+      "current_input_chars": 69,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1072.5,
+      "raw_chars": 99,
+      "content_class": "other",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": null,
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "a0130fd28d8c1b87",
+      "usage": {
+        "prompt_tokens": 1742,
+        "completion_tokens": 41,
+        "total_tokens": 1783,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 206
+      }
+    },
+    {
+      "source_request_id": "41c4fc6db5e346ab8364236168224cc0",
+      "turn_id": "input_20260910_230859_000036",
+      "source_offset_ms": 313185,
+      "input_stage": "speculative",
+      "events": [
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "250aaf4e892749a1",
+      "message_count": 22,
+      "current_input_chars": 89,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1028.7,
+      "raw_chars": 66,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "92be25a1e238611f",
+      "usage": {
+        "prompt_tokens": 1762,
+        "completion_tokens": 23,
+        "total_tokens": 1785,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 226
+      }
+    },
+    {
+      "source_request_id": "ed615e06716b4f22ad76843ef03eb4aa",
+      "turn_id": "input_20260910_230859_000036",
+      "source_offset_ms": 315345,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "8fc7269cad580ceb",
+      "message_count": 22,
+      "current_input_chars": 102,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1727.5,
+      "raw_chars": 176,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "d495dbb20004252f",
+      "usage": {
+        "prompt_tokens": 1763,
+        "completion_tokens": 125,
+        "total_tokens": 1888,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 227
+      }
+    },
+    {
+      "source_request_id": "f672869a792c4373b8b94f16831dc49c",
+      "turn_id": "input_20260910_230859_000036",
+      "source_offset_ms": 316766,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "846ddd71f3225d7b",
+      "message_count": 23,
+      "current_input_chars": 103,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2598.5,
+      "raw_chars": 243,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 176,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "3b3fa6f1584dcf37",
+      "usage": {
+        "prompt_tokens": 1813,
+        "completion_tokens": 143,
+        "total_tokens": 1956,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 149
+      }
+    },
+    {
+      "source_request_id": "e6ef7b915b514c9cab132b4ed97e8285",
+      "turn_id": "input_20260910_230859_000036",
+      "source_offset_ms": 318149,
+      "input_stage": "finalized",
+      "events": [
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "b84cf7eddabeb050",
+      "message_count": 22,
+      "current_input_chars": 103,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1216.7,
+      "raw_chars": 259,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 192,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "3eb1b57cb335457f",
+      "usage": {
+        "prompt_tokens": 1861,
+        "completion_tokens": 153,
+        "total_tokens": 2014,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 197
+      }
+    },
+    {
+      "source_request_id": "2ec82e41cc3142dab1c911cbd64251e9",
+      "turn_id": "input_20260910_230947_000037",
+      "source_offset_ms": 343269,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "4366a4fd1aebef75",
+      "message_count": 23,
+      "current_input_chars": 6,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2407.5,
+      "raw_chars": 301,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 232,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "84e7a25db7a976eb",
+      "usage": {
+        "prompt_tokens": 1769,
+        "completion_tokens": 179,
+        "total_tokens": 1948,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 233
+      }
+    },
+    {
+      "source_request_id": "3d7672beb5464dafa1a9ed3d1d2d2207",
+      "turn_id": "input_20260910_230947_000037",
+      "source_offset_ms": 346669,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "4850e9269987f096",
+      "message_count": 23,
+      "current_input_chars": 19,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 839.1,
+      "raw_chars": 88,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 13,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "55d6d404e1bdf7d8",
+      "usage": {
+        "prompt_tokens": 1777,
+        "completion_tokens": 39,
+        "total_tokens": 1816,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 241
+      }
+    },
+    {
+      "source_request_id": "ee201543046f4d84b42dccda9f610a0c",
+      "turn_id": "input_20260910_230947_000037",
+      "source_offset_ms": 349067,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "d49211210052737e",
+      "message_count": 23,
+      "current_input_chars": 30,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 727.0,
+      "raw_chars": 74,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "c7ac6c60c24a9e63",
+      "usage": {
+        "prompt_tokens": 1783,
+        "completion_tokens": 28,
+        "total_tokens": 1811,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 247
+      }
+    },
+    {
+      "source_request_id": "474d0e4c8e3a46f8970974dc70f3aa94",
+      "turn_id": "input_20260910_230947_000037",
+      "source_offset_ms": 352069,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "c8b45c1f24815a7e",
+      "message_count": 23,
+      "current_input_chars": 2,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 894.8,
+      "raw_chars": 66,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "wait",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "wait",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 0,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "92be25a1e238611f",
+      "usage": {
+        "prompt_tokens": 1792,
+        "completion_tokens": 23,
+        "total_tokens": 1815,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 256
+      }
+    },
+    {
+      "source_request_id": "55d50d472b2741ea907da076bacc6906",
+      "turn_id": "input_20260910_230947_000037",
+      "source_offset_ms": 353001,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "3e44b5a52a686e1f",
+      "message_count": 24,
+      "current_input_chars": 3,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1659.3,
+      "raw_chars": 151,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 84,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "181b6a294f90df20",
+      "usage": {
+        "prompt_tokens": 1834,
+        "completion_tokens": 80,
+        "total_tokens": 1914,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 170
+      }
+    },
+    {
+      "source_request_id": "b07be8577a034f8db71c1c9517d0f11b",
+      "turn_id": "input_20260910_230947_000037",
+      "source_offset_ms": 353379,
+      "input_stage": "finalized",
+      "events": [
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "430f005bec4afd4e",
+      "message_count": 23,
+      "current_input_chars": 3,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1743.6,
+      "raw_chars": 271,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 203,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "5123c2db4185ae6d",
+      "usage": {
+        "prompt_tokens": 1774,
+        "completion_tokens": 165,
+        "total_tokens": 1939,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 238
+      }
+    },
+    {
+      "source_request_id": "b9fa4b6f08c044308edc0366e475aec9",
+      "turn_id": "input_20260910_230947_000037",
+      "source_offset_ms": 355263,
+      "input_stage": "refined",
+      "events": [
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "430f005bec4afd4e",
+      "message_count": 23,
+      "current_input_chars": 3,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2031.8,
+      "raw_chars": 273,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 206,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "feafea63d7e9a665",
+      "usage": {
+        "prompt_tokens": 1774,
+        "completion_tokens": 151,
+        "total_tokens": 1925,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 238
+      }
+    },
+    {
+      "source_request_id": "8683e1e1c88a4d9ab69ef8386b423a7a",
+      "turn_id": "input_20260910_231002_000038",
+      "source_offset_ms": 358345,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "11d2b36fae6bddcf",
+      "message_count": 24,
+      "current_input_chars": 7,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1560.9,
+      "raw_chars": 143,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "496accda9aef3cd1",
+      "usage": {
+        "prompt_tokens": 1772,
+        "completion_tokens": 100,
+        "total_tokens": 1872,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 236
+      }
+    },
+    {
+      "source_request_id": "fc96bf65a4194a229c05f6e4df53548b",
+      "turn_id": "input_20260910_231002_000038",
+      "source_offset_ms": 360547,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "d156148649558db8",
+      "message_count": 24,
+      "current_input_chars": 14,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1855.4,
+      "raw_chars": 237,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 170,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "bbebd18a5f0d9b1c",
+      "usage": {
+        "prompt_tokens": 1776,
+        "completion_tokens": 135,
+        "total_tokens": 1911,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 240
+      }
+    },
+    {
+      "source_request_id": "1b499df43acd48c9868f4ae568b262e6",
+      "turn_id": "input_20260910_231002_000038",
+      "source_offset_ms": 363349,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "422fa2c2029e792a",
+      "message_count": 24,
+      "current_input_chars": 24,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1332.6,
+      "raw_chars": 189,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 122,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "f808bdc35f90aa62",
+      "usage": {
+        "prompt_tokens": 1781,
+        "completion_tokens": 106,
+        "total_tokens": 1887,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 245
+      }
+    },
+    {
+      "source_request_id": "049f9a8a4ce24f3a9739be7886d105e6",
+      "turn_id": "input_20260910_231002_000038",
+      "source_offset_ms": 367948,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "baedaec61ebb87ba",
+      "message_count": 24,
+      "current_input_chars": 39,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1439.0,
+      "raw_chars": 189,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 122,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "a97d0956400f471e",
+      "usage": {
+        "prompt_tokens": 1793,
+        "completion_tokens": 108,
+        "total_tokens": 1901,
+        "cached_tokens": 1536,
+        "cache_miss_tokens": 257
+      }
+    },
+    {
+      "source_request_id": "6e5059a703ca41d3aae92771607c9a5c",
+      "turn_id": "input_20260910_231002_000038",
+      "source_offset_ms": 370151,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "7073746f092e2c5a",
+      "message_count": 24,
+      "current_input_chars": 49,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2325.8,
+      "raw_chars": 185,
+      "content_class": "prose_likely_complete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "plain_text_speak"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "other",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "eb0fe70ddabfe727",
+      "usage": {
+        "prompt_tokens": 1798,
+        "completion_tokens": 123,
+        "total_tokens": 1921,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 134
+      }
+    },
+    {
+      "source_request_id": "29519391ea6941f591f170bc1f48447e",
+      "turn_id": "input_20260910_231002_000038",
+      "source_offset_ms": 373948,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "eef78829cc5a80d5",
+      "message_count": 24,
+      "current_input_chars": 68,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1661.6,
+      "raw_chars": 222,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 155,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "b868d151946dd8eb",
+      "usage": {
+        "prompt_tokens": 1807,
+        "completion_tokens": 117,
+        "total_tokens": 1924,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 143
+      }
+    },
+    {
+      "source_request_id": "3f76e63b2ecc4613a0b78a7e0eee63ec",
+      "turn_id": "input_20260910_231002_000038",
+      "source_offset_ms": 376743,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "6e56bf0a126860d7",
+      "message_count": 24,
+      "current_input_chars": 81,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1288.7,
+      "raw_chars": 126,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 59,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "f898428dce108341",
+      "usage": {
+        "prompt_tokens": 1812,
+        "completion_tokens": 57,
+        "total_tokens": 1869,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 148
+      }
+    },
+    {
+      "source_request_id": "287e8cfe99184af0843a06a7a49bdad1",
+      "turn_id": "input_20260910_231002_000038",
+      "source_offset_ms": 381748,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "dd681fe6406022c7",
+      "message_count": 24,
+      "current_input_chars": 95,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1652.4,
+      "raw_chars": 221,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 154,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "37f63bf104d89e3d",
+      "usage": {
+        "prompt_tokens": 1819,
+        "completion_tokens": 123,
+        "total_tokens": 1942,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 155
+      }
+    },
+    {
+      "source_request_id": "b6052220dca1496ab0d2fe41bf3d2093",
+      "turn_id": "input_20260910_231002_000038",
+      "source_offset_ms": 383547,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "521657e509d42b37",
+      "message_count": 24,
+      "current_input_chars": 101,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2664.4,
+      "raw_chars": 399,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 332,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "6000956fa6324088",
+      "usage": {
+        "prompt_tokens": 1823,
+        "completion_tokens": 240,
+        "total_tokens": 2063,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 159
+      }
+    },
+    {
+      "source_request_id": "f8d47057ea6149fd832af844910d4db7",
+      "turn_id": "input_20260910_231002_000038",
+      "source_offset_ms": 385140,
+      "input_stage": "finalized",
+      "events": [
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "44041993c46fa0b6",
+      "message_count": 24,
+      "current_input_chars": 104,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2480.9,
+      "raw_chars": 407,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 336,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "98e4b97faa32e086",
+      "usage": {
+        "prompt_tokens": 1833,
+        "completion_tokens": 237,
+        "total_tokens": 2070,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 169
+      }
+    },
+    {
+      "source_request_id": "28daf514114343de92382f9a156808a3",
+      "turn_id": "input_20260910_231002_000038",
+      "source_offset_ms": 386995,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "014917cea6cf5cb4",
+      "message_count": 25,
+      "current_input_chars": 104,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1592.0,
+      "raw_chars": 210,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "angry",
+        "text_type": "str",
+        "text_chars": 142,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "35ef3b85c5fd15e5",
+      "usage": {
+        "prompt_tokens": 1875,
+        "completion_tokens": 116,
+        "total_tokens": 1991,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 211
+      }
+    },
+    {
+      "source_request_id": "0f6b111fcdf1426db4460e565fef798d",
+      "turn_id": "input_20260910_231045_000039",
+      "source_offset_ms": 401710,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "d06fe7133e0cb35c",
+      "message_count": 25,
+      "current_input_chars": 9,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1327.2,
+      "raw_chars": 246,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 179,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "ba329162e64e2b22",
+      "usage": {
+        "prompt_tokens": 1835,
+        "completion_tokens": 140,
+        "total_tokens": 1975,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 171
+      }
+    },
+    {
+      "source_request_id": "1ec6243ede90443784dab5da345f7373",
+      "turn_id": "input_20260910_231045_000039",
+      "source_offset_ms": 402706,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "0940afd90d7df53d",
+      "message_count": 26,
+      "current_input_chars": 11,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2641.9,
+      "raw_chars": 313,
+      "content_class": "valid_json",
+      "strict_valid": false,
+      "strict_error": "decision envelope must contain exactly speak and actions",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "missing_actions"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": false,
+        "json_top_key_count": 1
+      },
+      "contract_shape": {
+        "top_keys": [
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 259,
+        "actions_type": null,
+        "action_count": null
+      },
+      "content_sha256_16": "3d37bd1484676da2",
+      "usage": {
+        "prompt_tokens": 1886,
+        "completion_tokens": 193,
+        "total_tokens": 2079,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 222
+      }
+    },
+    {
+      "source_request_id": "925f54a6275744ae90e6c5f59d455938",
+      "turn_id": "input_20260910_231045_000039",
+      "source_offset_ms": 403097,
+      "input_stage": "refined",
+      "events": [
+        "ENDPOINT_CANDIDATE",
+        "USER_INPUT_FINALIZED",
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "33f9fd5ffba44ea1",
+      "message_count": 25,
+      "current_input_chars": 11,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2471.8,
+      "raw_chars": 373,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "surprised",
+        "text_type": "str",
+        "text_chars": 301,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "877b11b94260e1ca",
+      "usage": {
+        "prompt_tokens": 1844,
+        "completion_tokens": 228,
+        "total_tokens": 2072,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 180
+      }
+    },
+    {
+      "source_request_id": "60b3c97db9e2405db02c2004006cc34c",
+      "turn_id": "input_20260910_231101_000040",
+      "source_offset_ms": 417539,
+      "input_stage": "finalized",
+      "events": [
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "f9f37e6a6bea9ebd",
+      "message_count": 26,
+      "current_input_chars": 5,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1068.9,
+      "raw_chars": 81,
+      "content_class": "other",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": null,
+      "fingerprint": {
+        "json_first": "alpha",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Expecting value",
+        "json_error_pos": 0,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "ac7e3973a2b54621",
+      "usage": {
+        "prompt_tokens": 1848,
+        "completion_tokens": 31,
+        "total_tokens": 1879,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 184
+      }
+    },
+    {
+      "source_request_id": "5562e91a95174ef293aa4b8f5860ba74",
+      "turn_id": "input_20260910_231130_000041",
+      "source_offset_ms": 448419,
+      "input_stage": "speculative",
+      "events": [
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "af22ed144a439228",
+      "message_count": 27,
+      "current_input_chars": 23,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1630.7,
+      "raw_chars": 218,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 143,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "ad56da31ed937894",
+      "usage": {
+        "prompt_tokens": 1860,
+        "completion_tokens": 123,
+        "total_tokens": 1983,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 196
+      }
+    },
+    {
+      "source_request_id": "b1ab165e56c94bf1be43a9cecc8295e8",
+      "turn_id": "input_20260910_231130_000041",
+      "source_offset_ms": 449725,
+      "input_stage": "recovery",
+      "events": [
+        "EXCEPTION_RECOVERY",
+        "SPEAK_ENVELOPE_INVALID"
+      ],
+      "effort": "none",
+      "context_digest": "9af888274e2fc7ae",
+      "message_count": 28,
+      "current_input_chars": 32,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1223.6,
+      "raw_chars": 145,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 78,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "fa61f4acf53a4744",
+      "usage": {
+        "prompt_tokens": 1907,
+        "completion_tokens": 75,
+        "total_tokens": 1982,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 243
+      }
+    },
+    {
+      "source_request_id": "5c30aa55039b45ec97ee84fa5fa3a520",
+      "turn_id": "input_20260910_231130_000041",
+      "source_offset_ms": 451127,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "79d5085678ce7a7b",
+      "message_count": 27,
+      "current_input_chars": 37,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1412.9,
+      "raw_chars": 218,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 151,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "d7f61c5c283ade16",
+      "usage": {
+        "prompt_tokens": 1920,
+        "completion_tokens": 119,
+        "total_tokens": 2039,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 256
+      }
+    },
+    {
+      "source_request_id": "711377038e4b4559bc299ad21e751e98",
+      "turn_id": "input_20260910_231130_000041",
+      "source_offset_ms": 454823,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "a903f1ad53cd8bb7",
+      "message_count": 27,
+      "current_input_chars": 54,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2530.5,
+      "raw_chars": 377,
+      "content_class": "container_incomplete",
+      "strict_valid": false,
+      "strict_error": "incomplete or invalid decision JSON",
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": null,
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": -1,
+        "json_bracket_balance": -1,
+        "json_string_open": false,
+        "json_syntax_valid": false,
+        "json_error_kind": "Extra data",
+        "json_error_pos": 375,
+        "json_error_at_end": false
+      },
+      "contract_shape": null,
+      "content_sha256_16": "2b735137bff78347",
+      "usage": {
+        "prompt_tokens": 1872,
+        "completion_tokens": 230,
+        "total_tokens": 2102,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 208
+      }
+    },
+    {
+      "source_request_id": "bfd51e4fb7dc4586bfba861ce8e96a04",
+      "turn_id": "input_20260910_231130_000041",
+      "source_offset_ms": 456570,
+      "input_stage": "finalized",
+      "events": [
+        "ENDPOINT_CANDIDATE",
+        "USER_INPUT_FINALIZED"
+      ],
+      "effort": "none",
+      "context_digest": "5d66768e395027a2",
+      "message_count": 27,
+      "current_input_chars": 56,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2965.8,
+      "raw_chars": 375,
+      "content_class": "valid_json",
+      "strict_valid": false,
+      "strict_error": "decision envelope must contain exactly speak and actions",
+      "compatibility_valid": true,
+      "compatibility_repairs": [
+        "missing_actions"
+      ],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": false,
+        "json_top_key_count": 1
+      },
+      "contract_shape": {
+        "top_keys": [
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 317,
+        "actions_type": null,
+        "action_count": null
+      },
+      "content_sha256_16": "a79d2024d69cc574",
+      "usage": {
+        "prompt_tokens": 1880,
+        "completion_tokens": 224,
+        "total_tokens": 2104,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 216
+      }
+    },
+    {
+      "source_request_id": "cc11fb4215bc48089f41fee1e9855840",
+      "turn_id": "input_20260910_231130_000041",
+      "source_offset_ms": 459049,
+      "input_stage": "refined",
+      "events": [
+        "USER_INPUT_REFINED"
+      ],
+      "effort": "none",
+      "context_digest": "ecda83684923fcac",
+      "message_count": 27,
+      "current_input_chars": 56,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 1728.6,
+      "raw_chars": 333,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 264,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "5546553286fbcb8d",
+      "usage": {
+        "prompt_tokens": 2062,
+        "completion_tokens": 206,
+        "total_tokens": 2268,
+        "cached_tokens": 1792,
+        "cache_miss_tokens": 270
+      }
+    },
+    {
+      "source_request_id": "ac9ee60dcda94543b9d9d146ca4a039e",
+      "turn_id": "input_20260910_231202_000042",
+      "source_offset_ms": 480988,
+      "input_stage": "speculative",
+      "events": [
+        "SPEECH_ENDED",
+        "USER_SEGMENT_UPDATED"
+      ],
+      "effort": "none",
+      "context_digest": "ec6312ea28d0b82d",
+      "message_count": 28,
+      "current_input_chars": 9,
+      "terminal": true,
+      "provider_error": null,
+      "latency_ms": 2466.8,
+      "raw_chars": 217,
+      "content_class": "valid_json",
+      "strict_valid": true,
+      "strict_error": null,
+      "compatibility_valid": false,
+      "compatibility_repairs": [],
+      "state": "speak",
+      "fingerprint": {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": false,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": false,
+        "json_syntax_valid": true,
+        "json_top_type": "dict",
+        "json_has_speak": true,
+        "json_has_actions": true,
+        "json_top_key_count": 2
+      },
+      "contract_shape": {
+        "top_keys": [
+          "actions",
+          "speak"
+        ],
+        "speak_type": "dict",
+        "speak_keys": [
+          "emotion",
+          "state",
+          "text"
+        ],
+        "state": "speak",
+        "emotion": "calm",
+        "text_type": "str",
+        "text_chars": 150,
+        "actions_type": "list",
+        "action_count": 0
+      },
+      "content_sha256_16": "eac9329dac5d07a9",
+      "usage": {
+        "prompt_tokens": 1880,
+        "completion_tokens": 120,
+        "total_tokens": 2000,
+        "cached_tokens": 1664,
+        "cache_miss_tokens": 216
+      }
+    }
+  ]
+}
