@@ -166,6 +166,7 @@ def test_session_reset_rotates_opencode_session_identity():
         runtime.controller = None
         runtime.history = SessionLedger()
         runtime.conversation = ConversationRuntime()
+        runtime.reasoning_mode = "deep"
         runtime.llm = DeepSeekClient(
             base_url="https://opencode.ai/zen/go/v1",
             model="deepseek-flash",
@@ -180,5 +181,6 @@ def test_session_reset_rotates_opencode_session_identity():
 
         assert runtime.conversation.conversation_id != before
         assert runtime.llm.session_id == runtime.conversation.conversation_id
+        assert runtime.reasoning_mode == "deep"
 
     asyncio.run(scenario())

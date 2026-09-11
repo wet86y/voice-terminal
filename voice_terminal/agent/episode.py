@@ -14,7 +14,11 @@ from uuid import uuid4
 from dataclasses import dataclass
 
 from .options import AgentOptions
-from .decision_envelope import Action, DecisionEnvelope, EnvelopeError, SpeechDecisionEnvelopeStream
+from .context_audit import capture_context_snapshot, capture_request_outcome
+from .decision_envelope import (
+    Action, DecisionEnvelope, EnvelopeError, SpeechDecisionEnvelopeStream,
+    json_structure_fingerprint, parse_compatible_decision_envelope,
+)
 from .decision_schema import THINKING_ACTION, decision_schema
 from .sentences import map_refinement
 from ..session.context import CurrentInput, LLMContextProjector
@@ -333,7 +337,8 @@ class AgentEpisodeRuntime:
             "SCHEDULER_EVENT_ENQUEUED", "SCHEDULER_TICK", "SCHEDULER_TIMER_RESET",
             "SENTENCE_CREATED", "SENTENCE_REVISED", "SPEAK_STATE_CHANGED",
             "ACTION_STARTED", "ACTION_COMPLETED", "SPEAK_ENVELOPE_INVALID", "EMOTION_NORMALIZED",
-            "LLM_EMPTY_OUTPUT",
+            "LLM_EMPTY_OUTPUT", "LLM_OUTPUT_COMPAT_RECOVERED", "LLM_CONTEXT_CAPTURED",
+            "LLM_REQUEST_COMPLETED",
             "RESPONSES_INCOMPLETE", "LLM_OUTPUT_FILTERED", "LLM_PROVIDER_UNAVAILABLE",
             "SPEAK_REPLACEMENT_INTERCEPTED",
             "OUTPUT_CANCELLED", "OUTPUT_REPLACED",
@@ -343,11 +348,31 @@ class AgentEpisodeRuntime:
         }:
             logger.info(
                 "agent.trace kind=%s episode_id=%s request_id=%s turn=%s events=%s reason=%s "
-                "status=%s speech_id=%s code=%s attempts=%s limit=%s terminal=%s",
+                "status=%s speech_id=%s code=%s attempts=%s limit=%s terminal=%s "
+                "effort=%s classification=%s error=%s raw_chars=%s non_whitespace_chars=%s "
+                "provisional_chars=%s partial_speech=%s json_syntax_valid=%s "
+                "json_first=%s json_last=%s json_fenced=%s json_error_kind=%s "
+                "json_error_pos=%s json_error_at_end=%s json_brace_balance=%s "
+                "json_bracket_balance=%s json_string_open=%s json_top_type=%s "
+                "json_has_speak=%s json_has_actions=%s json_top_key_count=%s repairs=%s "
+                "context_digest=%s validation=%s action_count=%s audit_capture_ms=%s",
                 kind, source[0], source[1], item["turn_id"],
                 payload.get("events"), payload.get("reason"), payload.get("status"), payload.get("speech_id"),
                 payload.get("code"), payload.get("attempts"), payload.get("limit"),
                 payload.get("terminal_kind"),
+                payload.get("reasoning_effort"), payload.get("classification"), payload.get("error"),
+                payload.get("raw_chars"), payload.get("non_whitespace_chars"),
+                payload.get("provisional_chars"), payload.get("partial_speech"),
+                payload.get("json_syntax_valid"), payload.get("json_first"),
+                payload.get("json_last"), payload.get("json_fenced"),
+                payload.get("json_error_kind"), payload.get("json_error_pos"),
+                payload.get("json_error_at_end"), payload.get("json_brace_balance"),
+                payload.get("json_bracket_balance"), payload.get("json_string_open"),
+                payload.get("json_top_type"), payload.get("json_has_speak"),
+                payload.get("json_has_actions"), payload.get("json_top_key_count"),
+                payload.get("repairs"),
+                payload.get("context_digest"), payload.get("validation"), payload.get("action_count"),
+                payload.get("audit_capture_ms"),
             )
         await self.emit("agent.trace", item)
         # A late output transaction may still need a trace after its Episode
@@ -988,7 +1013,8 @@ class AgentEpisodeRuntime:
                     self.active_recovery = recovery_signal
                     await self.log("LLM_DISPATCHED", identity=identity,
                                    mode="exception_recovery" if recovery else "normal",
-                                   events=sorted(kinds), error_id=(recovery_signal.error_id if recovery_signal else None))
+                                   events=sorted(kinds), reasoning_effort=reasoning_effort,
+                                   error_id=(recovery_signal.error_id if recovery_signal else None))
                     if recovery and recovery_signal is not None:
                         await self.log("LLM_RECOVERY_STARTED", identity=identity,
                                        error_id=recovery_signal.error_id, code=recovery_signal.code)
@@ -1721,10 +1747,41 @@ class AgentEpisodeRuntime:
             value for key, value in compacted.items() if key != "over_budget_base"
         )
         self.context_compaction = compacted if self.context_compacted else {}
+        audit_schema = (
+            self._decision_schema(shadow=False)
+            if getattr(self.provider, "supports_decision_schema", False)
+            else {}
+        )
+        audit_capture_started = time.perf_counter()
+        request_context_digest = capture_context_snapshot(
+            self.provider,
+            messages,
+            audit_schema,
+            conversation_id=identity[0],
+            request_id=identity[1],
+            turn_id=source_turn_id,
+            events=sorted(kinds),
+            mode="exception_recovery" if recovery else "normal",
+            reasoning_effort=reasoning_effort or "none",
+            context_compaction=self.context_compaction,
+            context_token_estimate=self.context_token_estimate,
+        )
+        audit_capture_ms = round((time.perf_counter() - audit_capture_started) * 1000, 2)
         self.request_count += 1
         self.request_started_at = time.monotonic()
         await self.log("AGENT_INVOKED", events=sorted(kinds),
                        mode="exception_recovery" if recovery else "normal")
+        await self.log(
+            "LLM_CONTEXT_CAPTURED",
+            identity=identity,
+            turn_id=source_turn_id,
+            context_digest=request_context_digest,
+            message_count=len(messages),
+            context_chars=self.context_chars,
+            context_token_estimate=self.context_token_estimate,
+            context_compacted=self.context_compacted,
+            audit_capture_ms=audit_capture_ms,
+        )
         speak_context = dict(self._last_model_speak_state)
         await self.log(
             "LLM_SPEAK_CONTEXT", identity=identity, turn_id=source_turn_id,
@@ -1744,6 +1801,7 @@ class AgentEpisodeRuntime:
                                          "provider_cached_tokens": self.provider_cached_tokens,
                                          "provider_cache_miss_tokens": self.provider_cache_miss_tokens,
                                          "provider_cache_hit_ratio": self.provider_cache_hit_ratio,
+                                         "context_digest": request_context_digest,
                                          "conversation_id": identity[0], "request_id": identity[1]})
         if not recovery:
             self._launch_shadow(messages, source_turn_id, identity[1])
@@ -1760,6 +1818,22 @@ class AgentEpisodeRuntime:
         prefix_baseline = None
         prefix_wait_reported = False
         speech_fed_chars = 0
+        validation = "strict_valid"
+        audit_outcome_recorded = False
+
+        def record_audit_outcome(outcome: str, **details) -> None:
+            nonlocal audit_outcome_recorded
+            if audit_outcome_recorded:
+                return
+            audit_outcome_recorded = True
+            capture_request_outcome(
+                conversation_id=identity[0],
+                request_id=identity[1],
+                turn_id=source_turn_id,
+                wire_sha256=request_context_digest,
+                outcome=outcome,
+                details=details,
+            )
 
         async def finish_streamed_speech() -> None:
             nonlocal speech_handle_finished
@@ -1954,8 +2028,33 @@ class AgentEpisodeRuntime:
                             })
             if not finished:
                 raise EnvelopeError("model stream missing finish")
-            envelope = parser.finish()
-            if getattr(self.provider, "transport", "chat_completions") == "responses":
+            responses_transport = getattr(self.provider, "transport", "chat_completions") == "responses"
+            try:
+                envelope = parser.finish()
+            except (EnvelopeError, ValueError, json.JSONDecodeError) as strict_exc:
+                if not responses_transport:
+                    raise
+                try:
+                    compatible = parse_compatible_decision_envelope(
+                        parser.raw, allow_empty_control_text=True,
+                    )
+                except (EnvelopeError, ValueError, json.JSONDecodeError):
+                    # Keep the original contract failure actionable for the
+                    # recovery prompt; compatibility rejection itself adds no
+                    # useful model-facing information.
+                    raise strict_exc
+                envelope = compatible.envelope
+                validation = "compat_recovered"
+                await self.log(
+                    "LLM_OUTPUT_COMPAT_RECOVERED",
+                    identity=identity,
+                    turn_id=source_turn_id,
+                    repairs=list(compatible.repairs),
+                    raw_chars=len(parser.raw),
+                    classification="bounded_json_repair",
+                    **json_structure_fingerprint(parser.raw),
+                )
+            if responses_transport:
                 envelope = self._normalize_schema_envelope(envelope)
             if reasoning_effort == "low" and source_turn_id:
                 expected_prefix = self._thinking_prefix_by_turn.pop(source_turn_id, "")
@@ -1975,11 +2074,36 @@ class AgentEpisodeRuntime:
             else:
                 await self._apply_decision_v06(identity, source_turn_id, envelope)
             await self._dispatch_actions_v06(identity, source_turn_id, envelope)
+            record_audit_outcome(
+                validation,
+                state=envelope.speak.state,
+                action_count=len(envelope.actions),
+                content_chars=content_chars,
+                reasoning_effort=reasoning_effort or "none",
+            )
+            await self.log(
+                "LLM_REQUEST_COMPLETED",
+                identity=identity,
+                turn_id=source_turn_id,
+                context_digest=request_context_digest,
+                validation=validation,
+                state=envelope.speak.state,
+                action_count=len(envelope.actions),
+                content_chars=content_chars,
+            )
             await self.emit("speak.preview", {
                 "conversation_id": identity[0], "request_id": identity[1],
                 "turn_id": source_turn_id, "status": "committed",
             })
             return "completed"
+        except asyncio.CancelledError:
+            record_audit_outcome(
+                "cancelled",
+                content_chars=content_chars,
+                finished=finished,
+                reasoning_effort=reasoning_effort or "none",
+            )
+            raise
         except (EnvelopeError, ValueError, json.JSONDecodeError) as exc:
             if speech_handle is not None:
                 try:
@@ -1999,8 +2123,14 @@ class AgentEpisodeRuntime:
                                turn_id=source_turn_id, error=error_text,
                                classification="LLM_EMPTY_OUTPUT", legacy_alias=True)
             await self.log(recovery_code, identity=identity, turn_id=source_turn_id,
-                           error=error_text, provisional_chars=len(provisional),
-                           partial_speech=speech_handle is not None)
+                           error=error_text,
+                           classification=("empty_output" if recovery_code == "LLM_EMPTY_OUTPUT"
+                                           else "envelope_validation"),
+                           raw_chars=len(parser.raw),
+                           non_whitespace_chars=len(parser.raw.strip()),
+                           provisional_chars=len(provisional),
+                           partial_speech=speech_handle is not None,
+                           **json_structure_fingerprint(parser.raw))
             if speech_handle is not None:
                 workspace = getattr(speech_handle, "workspace", None)
                 if workspace is not None and isinstance(getattr(workspace, "timings", None), dict):
@@ -2014,10 +2144,23 @@ class AgentEpisodeRuntime:
                     cancel(getattr(speech_handle, "speech_id", None), "cancelled")
             queued = await self._queue_recovery(recovery_code, error_text,
                                                 identity=identity, turn_id=source_turn_id)
-            return "recovery_queued" if queued is not None else "recovery_exhausted"
+            outcome = "recovery_queued" if queued is not None else "recovery_exhausted"
+            record_audit_outcome(
+                "invalid_envelope",
+                recovery_code=recovery_code,
+                recovery_outcome=outcome,
+                content_chars=content_chars,
+                **json_structure_fingerprint(parser.raw),
+            )
+            return outcome
         except Exception as exc:
             terminal_kind = getattr(exc, "terminal_kind", None)
             if terminal_kind is None:
+                record_audit_outcome(
+                    "runtime_error",
+                    error_type=type(exc).__name__,
+                    content_chars=content_chars,
+                )
                 raise
             reason = getattr(exc, "reason", None)
             if speech_handle is not None:
@@ -2036,7 +2179,15 @@ class AgentEpisodeRuntime:
                     "RESPONSES_INCOMPLETE", "max_output_tokens",
                     identity=identity, turn_id=source_turn_id,
                 )
-                return "recovery_queued" if queued is not None else "recovery_exhausted"
+                outcome = "recovery_queued" if queued is not None else "recovery_exhausted"
+                record_audit_outcome(
+                    "provider_incomplete",
+                    terminal_kind=terminal_kind,
+                    reason=reason,
+                    recovery_outcome=outcome,
+                    content_chars=content_chars,
+                )
+                return outcome
             if terminal_kind == "response.completed" and reason == "stream_final_mismatch":
                 await self.log("SPEAK_ENVELOPE_INVALID", identity=identity,
                                turn_id=source_turn_id,
@@ -2046,7 +2197,15 @@ class AgentEpisodeRuntime:
                     "SPEAK_ENVELOPE_INVALID", "stream_final_mismatch",
                     identity=identity, turn_id=source_turn_id,
                 )
-                return "recovery_queued" if queued is not None else "recovery_exhausted"
+                outcome = "recovery_queued" if queued is not None else "recovery_exhausted"
+                record_audit_outcome(
+                    "stream_final_mismatch",
+                    terminal_kind=terminal_kind,
+                    reason=reason,
+                    recovery_outcome=outcome,
+                    content_chars=content_chars,
+                )
+                return outcome
 
             filtered = terminal_kind == "response.incomplete" and reason == "content_filter"
             code = "LLM_OUTPUT_FILTERED" if filtered else "LLM_PROVIDER_UNAVAILABLE"
@@ -2066,8 +2225,20 @@ class AgentEpisodeRuntime:
             if latest.get("final") and not self.output.active:
                 await self._emit_turn_settled(identity, source_turn_id,
                                               "output_filtered" if filtered else "provider_unavailable")
+            record_audit_outcome(
+                "output_filtered" if filtered else "provider_unavailable",
+                terminal_kind=terminal_kind,
+                reason=reason,
+                content_chars=content_chars,
+            )
             return "terminal_failure"
         finally:
+            if not audit_outcome_recorded:
+                record_audit_outcome(
+                    "abandoned",
+                    content_chars=content_chars,
+                    finished=finished,
+                )
             if speech_handle is not None and not speech_handle_finished:
                 try:
                     await finish_streamed_speech()

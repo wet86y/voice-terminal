@@ -1,0 +1,228 @@
+{
+  "probe": "responses-schema-provider-matrix",
+  "model": "deepseek-flash",
+  "rows": [
+    {
+      "target": "deepseek",
+      "case": "no_actions",
+      "status": 200,
+      "accepted": true,
+      "provider_error": "stream_started",
+      "payload_meta": {
+        "top_level_keys": [
+          "input",
+          "instructions",
+          "max_output_tokens",
+          "model",
+          "reasoning",
+          "stream",
+          "text"
+        ],
+        "schema_digest": "a82f95b2aae56638",
+        "action_names": [],
+        "argument_properties": [],
+        "argument_required": []
+      }
+    },
+    {
+      "target": "deepseek",
+      "case": "thinking",
+      "status": 200,
+      "accepted": true,
+      "provider_error": "stream_started",
+      "payload_meta": {
+        "top_level_keys": [
+          "input",
+          "instructions",
+          "max_output_tokens",
+          "model",
+          "reasoning",
+          "stream",
+          "text"
+        ],
+        "schema_digest": "7df7894c7c38d267",
+        "action_names": [
+          "request_thinking"
+        ],
+        "argument_properties": [
+          "request"
+        ],
+        "argument_required": [
+          "request"
+        ]
+      }
+    },
+    {
+      "target": "deepseek",
+      "case": "web",
+      "status": 200,
+      "accepted": true,
+      "provider_error": "stream_started",
+      "payload_meta": {
+        "top_level_keys": [
+          "input",
+          "instructions",
+          "max_output_tokens",
+          "model",
+          "reasoning",
+          "stream",
+          "text"
+        ],
+        "schema_digest": "638ad142e31c0903",
+        "action_names": [
+          "web_search"
+        ],
+        "argument_properties": [
+          "query"
+        ],
+        "argument_required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "target": "deepseek",
+      "case": "web_and_thinking",
+      "status": 200,
+      "accepted": true,
+      "provider_error": "stream_started",
+      "payload_meta": {
+        "top_level_keys": [
+          "input",
+          "instructions",
+          "max_output_tokens",
+          "model",
+          "reasoning",
+          "stream",
+          "text"
+        ],
+        "schema_digest": "2f5ea6478daa8c44",
+        "action_names": [
+          "web_search",
+          "request_thinking"
+        ],
+        "argument_properties": [
+          "query",
+          "request"
+        ],
+        "argument_required": [
+          "query",
+          "request"
+        ]
+      }
+    },
+    {
+      "target": "opencode_go",
+      "case": "no_actions",
+      "status": 200,
+      "accepted": true,
+      "provider_error": "stream_started",
+      "payload_meta": {
+        "top_level_keys": [
+          "input",
+          "instructions",
+          "max_output_tokens",
+          "model",
+          "reasoning",
+          "stream",
+          "text"
+        ],
+        "schema_digest": "a82f95b2aae56638",
+        "action_names": [],
+        "argument_properties": [],
+        "argument_required": []
+      }
+    },
+    {
+      "target": "opencode_go",
+      "case": "thinking",
+      "status": 200,
+      "accepted": true,
+      "provider_error": "stream_started",
+      "payload_meta": {
+        "top_level_keys": [
+          "input",
+          "instructions",
+          "max_output_tokens",
+          "model",
+          "reasoning",
+          "stream",
+          "text"
+        ],
+        "schema_digest": "7df7894c7c38d267",
+        "action_names": [
+          "request_thinking"
+        ],
+        "argument_properties": [
+          "request"
+        ],
+        "argument_required": [
+          "request"
+        ]
+      }
+    },
+    {
+      "target": "opencode_go",
+      "case": "web",
+      "status": 200,
+      "accepted": true,
+      "provider_error": "stream_started",
+      "payload_meta": {
+        "top_level_keys": [
+          "input",
+          "instructions",
+          "max_output_tokens",
+          "model",
+          "reasoning",
+          "stream",
+          "text"
+        ],
+        "schema_digest": "638ad142e31c0903",
+        "action_names": [
+          "web_search"
+        ],
+        "argument_properties": [
+          "query"
+        ],
+        "argument_required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "target": "opencode_go",
+      "case": "web_and_thinking",
+      "status": 200,
+      "accepted": true,
+      "provider_error": "stream_started",
+      "payload_meta": {
+        "top_level_keys": [
+          "input",
+          "instructions",
+          "max_output_tokens",
+          "model",
+          "reasoning",
+          "stream",
+          "text"
+        ],
+        "schema_digest": "2f5ea6478daa8c44",
+        "action_names": [
+          "web_search",
+          "request_thinking"
+        ],
+        "argument_properties": [
+          "query",
+          "request"
+        ],
+        "argument_required": [
+          "query",
+          "request"
+        ]
+      }
+    }
+  ],
+  "generated_content_retained": false,
+  "reasoning_retained": false,
+  "prompt_retained": false,
+  "credentials_retained": false
+}

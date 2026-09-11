@@ -414,6 +414,12 @@ class DeepSeekClient:
                         if authoritative is None:
                             authoritative = response_text(result)
                         streamed = "".join(streamed_parts)
+                        logger.info(
+                            "deepseek.responses_completed effort=%s streamed_chars=%d authoritative_chars=%s match=%s",
+                            reasoning_effort, len(streamed),
+                            len(authoritative) if authoritative is not None else None,
+                            authoritative is None or authoritative == streamed,
+                        )
                         if authoritative is not None and authoritative != streamed:
                             if authoritative.startswith(streamed):
                                 suffix = authoritative[len(streamed):]

@@ -304,7 +304,10 @@ class SessionRuntime:
                 await self.controller.reset_session()
             self.history.reset()
             self.conversation.reset()
-            self.reasoning_mode = getattr(getattr(self, "config", None), "llm", None).reasoning_mode if getattr(getattr(self, "config", None), "llm", None) else "balanced"
+            # Reset rotates the conversation but must not silently discard the
+            # mode explicitly selected by the client.  The next Episode is
+            # rebuilt below (or on the next session start) from this staged
+            # mode, keeping its static prompt/schema cache contract intact.
             if self.controller is not None:
                 self.controller.set_reasoning_mode(self.reasoning_mode)
             if self.llm is not None:

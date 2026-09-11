@@ -1,10 +1,29 @@
 from __future__ import annotations
 
+import atexit
 import logging
 import os
+import queue
 import sys
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
+
+
+_context_audit_listener: QueueListener | None = None
+_context_audit_handler: RotatingFileHandler | None = None
+
+
+def _stop_context_audit() -> None:
+    global _context_audit_listener, _context_audit_handler
+    if _context_audit_listener is not None:
+        _context_audit_listener.stop()
+        _context_audit_listener = None
+    if _context_audit_handler is not None:
+        _context_audit_handler.close()
+        _context_audit_handler = None
+
+
+atexit.register(_stop_context_audit)
 
 
 def configure_logging(log_path: Path) -> None:
@@ -39,3 +58,39 @@ def configure_logging(log_path: Path) -> None:
     logging.getLogger("voice_terminal").setLevel(level)
     logging.getLogger("apps").setLevel(level)
     logging.getLogger(__name__).info("logging configured: path=%s level=%s", log_path, level_name)
+
+    # Exact LLM request bodies contain conversation text and are intentionally
+    # isolated from the ordinary console/server log.  Queue-backed writing
+    # keeps disk rotation off the realtime event loop.  Operators can disable
+    # this local diagnostic with VOICE_LLM_CONTEXT_AUDIT=0.
+    global _context_audit_listener, _context_audit_handler
+    _stop_context_audit()
+    audit_logger = logging.getLogger("voice_terminal.llm_context_audit")
+    audit_logger.handlers.clear()
+    audit_logger.propagate = False
+    audit_logger.disabled = False
+    audit_enabled = os.environ.get("VOICE_LLM_CONTEXT_AUDIT", "1").strip().casefold() not in {
+        "0", "false", "no", "off",
+    }
+    if audit_enabled:
+        audit_path = log_path.with_name(f"{log_path.stem}-llm-context.jsonl")
+        audit_handler = RotatingFileHandler(
+            audit_path,
+            maxBytes=50 * 1024 * 1024,
+            backupCount=9,
+            encoding="utf-8",
+        )
+        audit_handler.setFormatter(logging.Formatter("%(message)s"))
+        audit_queue: queue.SimpleQueue = queue.SimpleQueue()
+        audit_logger.addHandler(QueueHandler(audit_queue))
+        audit_logger.setLevel(logging.INFO)
+        _context_audit_handler = audit_handler
+        _context_audit_listener = QueueListener(audit_queue, audit_handler, respect_handler_level=True)
+        _context_audit_listener.start()
+        logging.getLogger(__name__).info(
+            "LLM context audit enabled: path=%s contains_conversation_content=true",
+            audit_path,
+        )
+    else:
+        audit_logger.disabled = True
+        logging.getLogger(__name__).info("LLM context audit disabled by VOICE_LLM_CONTEXT_AUDIT")

@@ -4,8 +4,14 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from voice_terminal.agent.decision_envelope import Action, DecisionEnvelope, SpeechDecision
-from voice_terminal.agent.decision_envelope import SpeechDecisionEnvelopeStream
+from voice_terminal.agent.context_audit import build_context_snapshot
+from voice_terminal.agent.decision_envelope import (
+    EnvelopeError, SpeechDecisionEnvelopeStream, json_structure_fingerprint,
+    parse_compatible_decision_envelope,
+)
 from voice_terminal.agent.decision_schema import THINKING_ACTION, decision_schema
 from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.providers.deepseek import DeepSeekClient
@@ -56,6 +62,77 @@ def test_responses_control_text_compatibility_is_explicit_not_global():
     responses = SpeechDecisionEnvelopeStream(allow_empty_control_text=True)
     responses.feed(raw)
     assert responses.finish().speak == SpeechDecision("wait", "calm", "")
+
+
+def test_invalid_json_fingerprint_is_structural_and_does_not_retain_text():
+    raw = '```json\n{"speak":{"state":"speak","text":"private words"}'
+    fingerprint = json_structure_fingerprint(raw)
+
+    assert fingerprint["json_syntax_valid"] is False
+    assert fingerprint["json_first"] == "backtick"
+    assert fingerprint["json_last"] == "object_close"
+    assert fingerprint["json_fenced"] is True
+    assert fingerprint["json_brace_balance"] == 1
+    assert "private" not in repr(fingerprint)
+
+
+def test_valid_json_fingerprint_records_only_contract_shape():
+    fingerprint = json_structure_fingerprint(
+        '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}'
+    )
+
+    assert fingerprint == {
+        "json_first": "object_open",
+        "json_last": "object_close",
+        "json_fenced": False,
+        "json_brace_balance": 0,
+        "json_bracket_balance": 0,
+        "json_string_open": False,
+        "json_syntax_valid": True,
+        "json_top_type": "dict",
+        "json_has_speak": True,
+        "json_has_actions": True,
+        "json_top_key_count": 2,
+    }
+
+
+def test_compatible_parser_combines_only_bounded_json_repairs():
+    raw = (
+        '\ufeff```json\n'
+        '{"speak":{"state":"speak","emotion":"","text":"第一行\n第二行",},}\n'
+        '```'
+    )
+    result = parse_compatible_decision_envelope(raw, allow_empty_control_text=True)
+
+    assert result.envelope.speak == SpeechDecision("speak", "calm", "第一行\n第二行")
+    assert result.envelope.actions == ()
+    assert set(result.repairs) == {
+        "utf8_bom", "single_json_fence", "trailing_comma",
+        "string_control_escape", "missing_actions", "empty_emotion",
+    }
+
+
+def test_compatible_parser_keeps_strict_parser_authoritative():
+    raw = '{"speak":{"state":"cancel","emotion":"","text":""},"actions":[]}'
+    strict = SpeechDecisionEnvelopeStream(allow_empty_control_text=True)
+    strict.feed(raw)
+    with pytest.raises(EnvelopeError, match="invalid speak emotion"):
+        strict.finish()
+
+    compatible = parse_compatible_decision_envelope(raw, allow_empty_control_text=True)
+    assert compatible.envelope.speak == SpeechDecision("cancel", "calm", "")
+    assert compatible.repairs == ("empty_emotion",)
+
+
+@pytest.mark.parametrize("raw", [
+    "这是一段完整的普通回答。",
+    '{"speak":{"state":"speak","emotion":"calm","text":"未闭合',
+    '说明：{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}',
+    '{"speak":{"state":"wait","emotion":"calm","text":""},"extra":true}',
+])
+def test_compatible_parser_rejects_prose_truncation_mixed_text_and_extra_fields(raw):
+    with pytest.raises(EnvelopeError, match="not safely recoverable"):
+        parse_compatible_decision_envelope(raw, allow_empty_control_text=True)
 
 
 def test_new_input_preempts_speculative_recovery_tts():
@@ -109,6 +186,46 @@ def test_responses_payload_separates_instructions_and_enables_strict_schema():
     assert payload["text"]["format"]["strict"] is True
     assert payload["text"]["format"]["schema"] == schema
     assert payload["input"][0]["content"][0] == {"type": "input_text", "text": "hello"}
+
+
+def test_context_audit_captures_exact_header_free_wire_payload():
+    client = DeepSeekClient(
+        base_url="https://example.invalid", model="deepseek-v4-flash", api_key="secret-key",
+        transport="responses", thinking="disabled", max_output_tokens=512,
+    )
+    schema = decision_schema([], allow_thinking=False)
+    messages = [static("exact rules"), history("user", "exact user context")]
+    snapshot = build_context_snapshot(
+        client,
+        messages,
+        schema,
+        conversation_id="conversation-a",
+        request_id="request-a",
+        turn_id="turn-a",
+        events=["USER_INPUT_FINALIZED"],
+        mode="normal",
+        reasoning_effort="none",
+        context_compaction={},
+        context_token_estimate=42,
+    )
+
+    expected = client._responses_payload(
+        messages,
+        model=client.model,
+        schema=schema,
+        schema_name="voice_decision_v06",
+        reasoning_effort="none",
+        max_output_tokens=512,
+    )
+    assert snapshot["wire_payload"] == expected
+    assert snapshot["wire_sha256"]
+    assert snapshot["schema_sha256"]
+    assert snapshot["lane_chars"] == {"static_instructions": 11, "history": 18}
+    assert snapshot["message_manifest"][1]["content_sha256"]
+    serialized = json.dumps(snapshot, ensure_ascii=False)
+    assert "exact user context" in serialized
+    assert "secret-key" not in serialized
+    assert "authorization" not in serialized.casefold()
 
 
 def test_responses_stream_normalizes_content_usage_and_terminal():
@@ -333,6 +450,88 @@ def test_runtime_does_not_ask_model_to_correct_content_filter():
         assert not runtime.recovery_queue
         assert any(kind == "error" and payload.get("code") == "LLM_OUTPUT_FILTERED"
                    for kind, payload in emitted)
+
+    asyncio.run(scenario())
+
+
+def test_responses_runtime_commits_bounded_json_repair_without_recovery(monkeypatch):
+    async def scenario():
+        raw = (
+            '\ufeff```json\n'
+            '{"speak":{"state":"wait","emotion":"","text":"",},}\n'
+            '```'
+        )
+
+        class Provider:
+            supports_decision_schema = True
+            transport = "responses"
+            thinking_action_enabled = False
+            protocol_recovery_limit = 1
+
+            def stream_events(self, _messages, **_kwargs):
+                async def stream():
+                    yield {"type": "content", "text": raw}
+                    yield {"type": "finish", "reason": "completed"}
+
+                return stream()
+
+        runtime = _runtime(Provider())
+        emitted = []
+        applied = []
+        outcomes = []
+
+        monkeypatch.setattr(
+            "voice_terminal.agent.episode.capture_context_snapshot",
+            lambda *_args, **_kwargs: "wire-digest-a",
+        )
+        monkeypatch.setattr(
+            "voice_terminal.agent.episode.capture_request_outcome",
+            lambda **kwargs: outcomes.append(kwargs),
+        )
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+
+        async def apply(_identity, _turn_id, envelope):
+            applied.append(envelope)
+
+        async def dispatch(_identity, _turn_id, _envelope):
+            return None
+
+        runtime.emit = emit
+        runtime._apply_decision_v06 = apply
+        runtime._dispatch_actions_v06 = dispatch
+        runtime.inputs["turn-a"] = {"text": "hello", "final": True}
+        identity = (runtime.episode_id, "request-a")
+        runtime._identity_turns[identity] = "turn-a"
+
+        assert await runtime._step(identity, {"USER_INPUT_FINALIZED"}) == "completed"
+        assert applied[0].speak == SpeechDecision("wait", "calm", "")
+        assert applied[0].actions == ()
+        assert not runtime.recovery_queue
+        traces = [
+            payload for kind, payload in emitted
+            if kind == "agent.trace" and payload.get("kind") == "LLM_OUTPUT_COMPAT_RECOVERED"
+        ]
+        assert len(traces) == 1
+        assert set(traces[0]["repairs"]) == {
+            "utf8_bom", "single_json_fence", "trailing_comma",
+            "missing_actions", "empty_emotion",
+        }
+        assert "raw" not in traces[0]
+        context_traces = [
+            payload for kind, payload in emitted
+            if kind == "agent.trace" and payload.get("kind") == "LLM_CONTEXT_CAPTURED"
+        ]
+        assert context_traces[0]["context_digest"] == "wire-digest-a"
+        completed = [
+            payload for kind, payload in emitted
+            if kind == "agent.trace" and payload.get("kind") == "LLM_REQUEST_COMPLETED"
+        ]
+        assert completed[0]["validation"] == "compat_recovered"
+        assert completed[0]["context_digest"] == "wire-digest-a"
+        assert outcomes[0]["wire_sha256"] == "wire-digest-a"
+        assert outcomes[0]["outcome"] == "compat_recovered"
 
     asyncio.run(scenario())
 

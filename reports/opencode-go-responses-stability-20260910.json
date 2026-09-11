@@ -1,0 +1,824 @@
+{
+  "probe": "opencode-go-responses-three-round-stability",
+  "provider": "opencode_go",
+  "base_url": "https://opencode.ai/zen/go/v1",
+  "model": "deepseek-flash",
+  "transport": "responses",
+  "samples": 12,
+  "rounds_per_sample": 3,
+  "total_requests": 36,
+  "concurrency": 3,
+  "tts_or_tools_started": false,
+  "round_summary": {
+    "1": {
+      "samples": 12,
+      "terminal_completed": 12,
+      "valid_json_envelope": 12,
+      "errors": {},
+      "states": {
+        "speak": 12
+      },
+      "latency_ms": {
+        "min": 3069.4,
+        "p50": 8056.049999999999,
+        "max": 13820.6
+      },
+      "usage_present": 12,
+      "cached_tokens_present": 12,
+      "cache_miss_tokens_present": 12
+    },
+    "2": {
+      "samples": 12,
+      "terminal_completed": 11,
+      "valid_json_envelope": 0,
+      "errors": {
+        "control_text": 11,
+        "DeepSeekError": 1
+      },
+      "states": {
+        "wait": 10,
+        "cancel": 1
+      },
+      "latency_ms": {
+        "min": 9253.3,
+        "p50": 11525.4,
+        "max": 13541.2
+      },
+      "usage_present": 11,
+      "cached_tokens_present": 11,
+      "cache_miss_tokens_present": 11
+    },
+    "3": {
+      "samples": 12,
+      "terminal_completed": 12,
+      "valid_json_envelope": 1,
+      "errors": {
+        "control_text": 11
+      },
+      "states": {
+        "wait": 11,
+        "speak": 1
+      },
+      "latency_ms": {
+        "min": 9166.8,
+        "p50": 9647.650000000001,
+        "max": 11359.1
+      },
+      "usage_present": 12,
+      "cached_tokens_present": 12,
+      "cache_miss_tokens_present": 12
+    }
+  },
+  "rows": [
+    {
+      "session": 1,
+      "round": 1,
+      "latency_ms": 3770.6,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 83,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 35,
+        "input_tokens": 343,
+        "output_tokens": 35,
+        "cached_tokens": 0,
+        "cache_miss_tokens": 343
+      },
+      "event_count": 37
+    },
+    {
+      "session": 1,
+      "round": 2,
+      "latency_ms": 12734.7,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 372,
+        "completion_tokens": 28,
+        "input_tokens": 372,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 244
+      },
+      "event_count": 30
+    },
+    {
+      "session": 1,
+      "round": 3,
+      "latency_ms": 9686.7,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 389,
+        "completion_tokens": 28,
+        "input_tokens": 389,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 261
+      },
+      "event_count": 30
+    },
+    {
+      "session": 2,
+      "round": 1,
+      "latency_ms": 3069.4,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 79,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 32,
+        "input_tokens": 343,
+        "output_tokens": 32,
+        "cached_tokens": 0,
+        "cache_miss_tokens": 343
+      },
+      "event_count": 34
+    },
+    {
+      "session": 2,
+      "round": 2,
+      "latency_ms": 13541.2,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 369,
+        "completion_tokens": 28,
+        "input_tokens": 369,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 241
+      },
+      "event_count": 30
+    },
+    {
+      "session": 2,
+      "round": 3,
+      "latency_ms": 11359.1,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 66,
+      "usage": {
+        "prompt_tokens": 386,
+        "completion_tokens": 23,
+        "input_tokens": 386,
+        "output_tokens": 23,
+        "cached_tokens": 252,
+        "cache_miss_tokens": 134
+      },
+      "event_count": 25
+    },
+    {
+      "session": 3,
+      "round": 1,
+      "latency_ms": 3275.5,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 71,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 26,
+        "input_tokens": 343,
+        "output_tokens": 26,
+        "cached_tokens": 0,
+        "cache_miss_tokens": 343
+      },
+      "event_count": 28
+    },
+    {
+      "session": 3,
+      "round": 2,
+      "latency_ms": 13094.4,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 369,
+        "completion_tokens": 28,
+        "input_tokens": 369,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 241
+      },
+      "event_count": 30
+    },
+    {
+      "session": 3,
+      "round": 3,
+      "latency_ms": 9166.8,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 386,
+        "completion_tokens": 28,
+        "input_tokens": 386,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 258
+      },
+      "event_count": 30
+    },
+    {
+      "session": 4,
+      "round": 1,
+      "latency_ms": 6328.2,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 83,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 35,
+        "input_tokens": 343,
+        "output_tokens": 35,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 215
+      },
+      "event_count": 37
+    },
+    {
+      "session": 4,
+      "round": 2,
+      "latency_ms": 12361.8,
+      "terminal": false,
+      "finish": null,
+      "valid_json_envelope": false,
+      "state": null,
+      "validation_error": "DeepSeekError",
+      "error_kind": "DeepSeekError",
+      "content_chars": 0,
+      "usage": {},
+      "event_count": 0
+    },
+    {
+      "session": 4,
+      "round": 3,
+      "latency_ms": 9400.4,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 80,
+      "usage": {
+        "prompt_tokens": 389,
+        "completion_tokens": 34,
+        "input_tokens": 389,
+        "output_tokens": 34,
+        "cached_tokens": 255,
+        "cache_miss_tokens": 134
+      },
+      "event_count": 36
+    },
+    {
+      "session": 5,
+      "round": 1,
+      "latency_ms": 6740.7,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 79,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 32,
+        "input_tokens": 343,
+        "output_tokens": 32,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 215
+      },
+      "event_count": 34
+    },
+    {
+      "session": 5,
+      "round": 2,
+      "latency_ms": 11989.0,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 369,
+        "completion_tokens": 28,
+        "input_tokens": 369,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 241
+      },
+      "event_count": 30
+    },
+    {
+      "session": 5,
+      "round": 3,
+      "latency_ms": 10993.4,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 386,
+        "completion_tokens": 28,
+        "input_tokens": 386,
+        "output_tokens": 28,
+        "cached_tokens": 252,
+        "cache_miss_tokens": 134
+      },
+      "event_count": 30
+    },
+    {
+      "session": 6,
+      "round": 1,
+      "latency_ms": 6534.3,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 83,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 35,
+        "input_tokens": 343,
+        "output_tokens": 35,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 215
+      },
+      "event_count": 37
+    },
+    {
+      "session": 6,
+      "round": 2,
+      "latency_ms": 11963.0,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 372,
+        "completion_tokens": 28,
+        "input_tokens": 372,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 244
+      },
+      "event_count": 30
+    },
+    {
+      "session": 6,
+      "round": 3,
+      "latency_ms": 9300.5,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 389,
+        "completion_tokens": 28,
+        "input_tokens": 389,
+        "output_tokens": 28,
+        "cached_tokens": 255,
+        "cache_miss_tokens": 134
+      },
+      "event_count": 30
+    },
+    {
+      "session": 7,
+      "round": 1,
+      "latency_ms": 11333.7,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 79,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 32,
+        "input_tokens": 343,
+        "output_tokens": 32,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 215
+      },
+      "event_count": 34
+    },
+    {
+      "session": 7,
+      "round": 2,
+      "latency_ms": 9534.6,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 369,
+        "completion_tokens": 28,
+        "input_tokens": 369,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 241
+      },
+      "event_count": 30
+    },
+    {
+      "session": 7,
+      "round": 3,
+      "latency_ms": 9318.6,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 386,
+        "completion_tokens": 28,
+        "input_tokens": 386,
+        "output_tokens": 28,
+        "cached_tokens": 252,
+        "cache_miss_tokens": 134
+      },
+      "event_count": 30
+    },
+    {
+      "session": 8,
+      "round": 1,
+      "latency_ms": 10787.4,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 79,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 32,
+        "input_tokens": 343,
+        "output_tokens": 32,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 215
+      },
+      "event_count": 34
+    },
+    {
+      "session": 8,
+      "round": 2,
+      "latency_ms": 11087.8,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 369,
+        "completion_tokens": 28,
+        "input_tokens": 369,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 241
+      },
+      "event_count": 30
+    },
+    {
+      "session": 8,
+      "round": 3,
+      "latency_ms": 9983.4,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 386,
+        "completion_tokens": 28,
+        "input_tokens": 386,
+        "output_tokens": 28,
+        "cached_tokens": 252,
+        "cache_miss_tokens": 134
+      },
+      "event_count": 30
+    },
+    {
+      "session": 9,
+      "round": 1,
+      "latency_ms": 9371.4,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 79,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 32,
+        "input_tokens": 343,
+        "output_tokens": 32,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 215
+      },
+      "event_count": 34
+    },
+    {
+      "session": 9,
+      "round": 2,
+      "latency_ms": 11084.8,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "cancel",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 76,
+      "usage": {
+        "prompt_tokens": 369,
+        "completion_tokens": 28,
+        "input_tokens": 369,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 241
+      },
+      "event_count": 30
+    },
+    {
+      "session": 9,
+      "round": 3,
+      "latency_ms": 9608.6,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 386,
+        "completion_tokens": 28,
+        "input_tokens": 386,
+        "output_tokens": 28,
+        "cached_tokens": 252,
+        "cache_miss_tokens": 134
+      },
+      "event_count": 30
+    },
+    {
+      "session": 10,
+      "round": 1,
+      "latency_ms": 12471.9,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 81,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 33,
+        "input_tokens": 343,
+        "output_tokens": 33,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 215
+      },
+      "event_count": 35
+    },
+    {
+      "session": 10,
+      "round": 2,
+      "latency_ms": 10204.2,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 370,
+        "completion_tokens": 28,
+        "input_tokens": 370,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 242
+      },
+      "event_count": 30
+    },
+    {
+      "session": 10,
+      "round": 3,
+      "latency_ms": 9758.0,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 387,
+        "completion_tokens": 28,
+        "input_tokens": 387,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 259
+      },
+      "event_count": 30
+    },
+    {
+      "session": 11,
+      "round": 1,
+      "latency_ms": 13767.6,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 79,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 32,
+        "input_tokens": 343,
+        "output_tokens": 32,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 215
+      },
+      "event_count": 34
+    },
+    {
+      "session": 11,
+      "round": 2,
+      "latency_ms": 9253.3,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 369,
+        "completion_tokens": 28,
+        "input_tokens": 369,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 241
+      },
+      "event_count": 30
+    },
+    {
+      "session": 11,
+      "round": 3,
+      "latency_ms": 9320.6,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 386,
+        "completion_tokens": 28,
+        "input_tokens": 386,
+        "output_tokens": 28,
+        "cached_tokens": 252,
+        "cache_miss_tokens": 134
+      },
+      "event_count": 30
+    },
+    {
+      "session": 12,
+      "round": 1,
+      "latency_ms": 13820.6,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": true,
+      "state": "speak",
+      "validation_error": null,
+      "error_kind": null,
+      "content_chars": 71,
+      "usage": {
+        "prompt_tokens": 343,
+        "completion_tokens": 26,
+        "input_tokens": 343,
+        "output_tokens": 26,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 215
+      },
+      "event_count": 28
+    },
+    {
+      "session": 12,
+      "round": 2,
+      "latency_ms": 10209.2,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 369,
+        "completion_tokens": 28,
+        "input_tokens": 369,
+        "output_tokens": 28,
+        "cached_tokens": 128,
+        "cache_miss_tokens": 241
+      },
+      "event_count": 30
+    },
+    {
+      "session": 12,
+      "round": 3,
+      "latency_ms": 10144.5,
+      "terminal": true,
+      "finish": "completed",
+      "valid_json_envelope": false,
+      "state": "wait",
+      "validation_error": "control_text",
+      "error_kind": null,
+      "content_chars": 74,
+      "usage": {
+        "prompt_tokens": 386,
+        "completion_tokens": 28,
+        "input_tokens": 386,
+        "output_tokens": 28,
+        "cached_tokens": 252,
+        "cache_miss_tokens": 134
+      },
+      "event_count": 30
+    }
+  ],
+  "protocol_blocking_issue": true
+}
