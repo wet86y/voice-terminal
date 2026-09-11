@@ -1,8 +1,4 @@
-"""Exact, request-correlated LLM context diagnostics.
-
-The dedicated audit log intentionally contains conversation content.  It
-never contains HTTP headers, API keys, provider output text, or reasoning.
-"""
+"""Request-correlated, content-free LLM context diagnostics."""
 from __future__ import annotations
 
 import hashlib
@@ -35,6 +31,12 @@ def build_context_snapshot(
     turn_id: str | None,
     events: Sequence[str],
     mode: str,
+    dispatch_kind: str = "normal",
+    prompt_kind: str = "normal",
+    scheduler_generation: int | None = None,
+    window_index: int | None = None,
+    system_check_id: str | None = None,
+    owner_scope: str | None = None,
     reasoning_effort: str,
     context_compaction: Mapping[str, Any],
     context_token_estimate: int,
@@ -75,26 +77,33 @@ def build_context_snapshot(
             "chars": len(content),
             "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         })
+    wire_serialized = _canonical(wire_payload)
     return {
         "record_type": "request_context",
-        "version": 1,
+        "version": 2,
         "at": time.time(),
-        "contains_conversation_content": True,
+        "contains_conversation_content": False,
         "conversation_id": conversation_id,
         "request_id": request_id,
         "turn_id": turn_id,
         "events": list(events),
         "mode": mode,
+        "dispatch_kind": dispatch_kind,
+        "prompt_kind": prompt_kind,
+        "scheduler_generation": scheduler_generation,
+        "window_index": window_index,
+        "system_check_id": system_check_id,
+        "owner_scope": owner_scope,
         "transport": transport,
         "reasoning_effort": reasoning_effort,
         "wire_sha256": _digest(wire_payload),
+        "wire_bytes": len(wire_serialized.encode("utf-8")),
         "schema_sha256": _digest(schema),
         "message_count": len(frozen_messages),
         "lane_chars": lane_chars,
         "context_token_estimate": context_token_estimate,
         "context_compaction": dict(context_compaction),
         "message_manifest": manifest,
-        "wire_payload": wire_payload,
     }
 
 

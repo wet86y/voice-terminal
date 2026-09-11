@@ -20,15 +20,15 @@ def scheduler() -> AgentDecisionScheduler:
     return AgentDecisionScheduler(AgentOptions(scheduler_tick_ms=400))
 
 
-def test_heartbeat_deadline_is_fixed_to_the_previous_deadline():
+def test_late_heartbeat_is_rebased_to_real_time_without_catch_up():
     value = scheduler()
     assert value.start_heartbeat(10.0) == 10.4
     assert value.heartbeat_delay(10.1) == pytest.approx(0.3)
 
-    # A late callback consumes the old deadline and schedules the next one
-    # from 10.4, rather than from the late callback time of 10.9.
+    # A late callback evaluates once at the real callback time.  It must not
+    # leave a backlog of historical 400ms deadlines to replay.
     value.heartbeat(10.9)
-    assert value.next_heartbeat == 10.8
+    assert value.next_heartbeat == pytest.approx(11.3)
 
 
 def test_staircase_windows_and_final_dispatch_are_single_shot():
@@ -91,6 +91,37 @@ def test_final_window_covered_by_ordinary_work_does_not_repeat():
     assert value.final_dispatched is True
     value.advance(10.4)
     assert value.forced_due(now=10.4) is None
+
+
+def test_pending_ordinary_work_does_not_consume_final_window_before_start():
+    value = scheduler()
+    value.arm(0.0)
+    value.advance(10.0)
+
+    # A forced dispatch that loses the race to ordinary pending work may
+    # consume the ordinary forced window, but the final fallback survives
+    # until an ordinary request really starts.
+    assert value.cover_forced_by_normal(now=10.0, include_final=False) == []
+    assert value.final_pending is True
+    assert value.forced_due(now=10.4)["prompt_kind"] == "final_silence"
+
+    assert value.cover_forced_by_normal(now=10.4) == [25]
+    assert value.final_dispatched is True
+
+
+def test_long_pause_resets_silence_ladder_and_heartbeat_axis():
+    value = scheduler()
+    value.arm(0.0, wall_time=100.0)
+    value.start_heartbeat(0.0)
+    value.advance(8.8)
+    old_generation = value.generation
+
+    assert value.reset_after_pause(20.0, wall_time=120.0) is True
+    assert value.generation == old_generation + 1
+    assert value.anchor_monotonic == 20.0
+    assert value.window_index == 0
+    assert value.final_pending is False
+    assert value.next_heartbeat == pytest.approx(20.4)
 
 
 def test_force_and_final_prompts_are_mutually_exclusive():
@@ -255,7 +286,11 @@ def test_runtime_heartbeat_continues_while_active_request_is_running():
         assert provider.calls == 1
         assert runtime.active_request is not None
         assert runtime.scheduler.window_index >= 6
-        assert 3 in runtime.scheduler.snapshot()["skipped_windows"]
+        # The active provider does not stop the scheduler loop; any skipped
+        # windows remain valid, single-shot staircase windows.
+        assert set(runtime.scheduler.snapshot()["skipped_windows"]).issubset(
+            set(runtime.scheduler.FORCE_WINDOWS)
+        )
         assert runtime.runner is not None and not runtime.runner.done()
 
         provider.release.set()

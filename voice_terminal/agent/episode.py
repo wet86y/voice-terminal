@@ -82,6 +82,9 @@ class RecoverySignal:
     occurred_at: float = 0.0
     received_at: float = 0.0
     delivery_feedback: dict | None = None
+    system_check_id: str | None = None
+    owner_scope: str | None = None
+    dispatch_context: dict | None = None
     error_id: str = ""
     consumed: bool = False
 
@@ -148,12 +151,12 @@ PERSONA_DOCUMENT_POLICY = """以下配置文档只用于补充当前 Agent 的�
 FORCED_POLL_PROMPT = """本次请求由系统400ms调度器的强制检查窗口触发。
 本次不代表出现了新的用户输入。请基于当前已有会话上下文重新评估是否需要开口。
 需要说话时输出合法的 speak 状态和非空文本；无需说话时输出合法的 wait 状态和空文本。
-不得虚构新的用户输入、工具结果或外部事实。"""
+不得虚构新的用户输入、工具结果或外部事实。actions 必须为 []；不得请求 request_thinking。"""
 
 FINAL_SILENCE_PROMPT = """系统即将进入静默状态。
 这是进入静默前的最后一次强制调度。请立即评估是否需要在静默前开口。
 需要说话时输出合法的 speak 状态和非空文本；无需说话时输出合法的 wait 状态和空文本。
-不得虚构新的用户输入或工具结果。"""
+不得虚构新的用户输入或工具结果。actions 必须为 []；不得请求 request_thinking。"""
 
 
 class AgentDecisionScheduler:
@@ -167,6 +170,7 @@ class AgentDecisionScheduler:
     FORCE_WINDOWS = (3, 6, 9, 16, 22)
     FINAL_WINDOW = 25
     SLOW_STAGE_WINDOW = 10
+    PAUSE_RESET_SECONDS = 4.0
     TTS_EVENTS = frozenset({
         "TTS_STARTED", "TTS_COMPLETED", "TTS_CANCELLED", "TTS_REPLACED",
         "TTS_FAILED", "TTS_SEGMENT", "TTS_PLAYBACK_STARTED", "TTS_PLAYBACK_ENDED",
@@ -235,22 +239,36 @@ class AgentDecisionScheduler:
         return now + 1e-9 >= self.next_heartbeat
 
     def heartbeat(self, now=None):
-        """Consume one fixed heartbeat deadline and advance the ladder.
+        """Consume at most one heartbeat and rebase the next fixed deadline.
 
-        The returned value is the current forced candidate, if the deadline
-        crossed one.  Calling this method late does not move the next deadline
-        relative to ``now``; it always advances from the previous deadline.
+        A late event-loop callback is evaluated at its real time, rather than
+        replaying every missed 400ms deadline after a pause.
         """
 
         now = time.monotonic() if now is None else float(now)
         self.start_heartbeat(now)
         if now + 1e-9 < self.next_heartbeat:
             return None
-        deadline = self.next_heartbeat
-        self.next_heartbeat = deadline + self.interval
-        self.last_tick = deadline
-        self.advance(deadline)
-        return self.forced_due(now=deadline)
+        self.next_heartbeat = now + self.interval
+        self.last_tick = now
+        self.advance(now)
+        return self.forced_due(now=now)
+
+    def heartbeat_lateness(self, now=None) -> float:
+        now = time.monotonic() if now is None else float(now)
+        self.start_heartbeat(now)
+        return max(0.0, now - self.next_heartbeat)
+
+    def reset_after_pause(self, now=None, *, wall_time=None) -> bool:
+        """Discard stale silence timing and begin a fresh post-pause ladder."""
+
+        now = time.monotonic() if now is None else float(now)
+        was_armed = self.armed
+        self.disarm()
+        if was_armed:
+            self.arm(now, wall_time=wall_time)
+        self.start_heartbeat(now)
+        return was_armed
 
     def arm(self, now=None, *, wall_time=None):
         """Arm a new ladder from a meaningful finalized/refined input."""
@@ -308,7 +326,7 @@ class AgentDecisionScheduler:
             return self._descriptor("forced_poll", self._forced_due_window, now)
         return None
 
-    def cover_forced_by_normal(self, *, now=None):
+    def cover_forced_by_normal(self, *, now=None, include_final=True):
         """Consume a coincident forced candidate in favor of ordinary work."""
 
         covered = []
@@ -316,7 +334,7 @@ class AgentDecisionScheduler:
             covered.append(self._forced_due_window)
             self._covered_windows.append(self._forced_due_window)
             self._forced_due_window = None
-        if self.final_pending and not self.final_dispatched:
+        if include_final and self.final_pending and not self.final_dispatched:
             covered.append(self.FINAL_WINDOW)
             self._covered_windows.append(self.FINAL_WINDOW)
             self.final_pending = False
@@ -618,11 +636,12 @@ class AgentEpisodeRuntime:
             "TTS_REPLACED", "TTS_REPLACE_FAILED", "TTS_PREWARM_REQUESTED", "TTS_PREWARM_READY",
             "TTS_PREWARM_FAILED", "TTS_PREWARM_FALLBACK",
             "SPEAK_CONFIRMATION_MISSING", "SPEAK_PROTOCOL_ERROR", "TOOL_PROTOCOL_ERROR",
-            "LLM_RECOVERY_QUEUED", "LLM_RECOVERY_STARTED", "LLM_RECOVERY_FAILED",
+            "LLM_RECOVERY_QUEUED", "LLM_RECOVERY_STARTING", "LLM_RECOVERY_STARTED", "LLM_RECOVERY_FAILED",
             "LLM_RECOVERY_COMPLETED", "LLM_DISPATCHED", "LLM_COALESCED",
             "SCHEDULER_ARMED", "SCHEDULER_EVENT_ENQUEUED",
-            "SCHEDULER_TICK", "SCHEDULER_TIMER_RESET", "SCHEDULER_FORCED_COVERED",
+            "SCHEDULER_TICK", "SCHEDULER_PAUSE_RESET", "SCHEDULER_FORCED_COVERED",
             "SCHEDULER_FINAL_PENDING", "SYSTEM_CHECK_SUPERSEDED", "SYSTEM_CHECK_STALE",
+            "SYSTEM_CHECK_ACTION_REJECTED",
             "SENTENCE_CREATED", "SENTENCE_REVISED", "SPEAK_STATE_CHANGED",
             "ACTION_STARTED", "ACTION_COMPLETED", "SPEAK_ENVELOPE_INVALID", "EMOTION_NORMALIZED",
             "LLM_EMPTY_OUTPUT", "LLM_OUTPUT_COMPAT_RECOVERED", "LLM_CONTEXT_CAPTURED",
@@ -646,7 +665,8 @@ class AgentEpisodeRuntime:
                 "context_digest=%s validation=%s action_count=%s audit_capture_ms=%s "
                 "error_layer=%s error_code=%s provider_schema_valid=%s local_contract_valid=%s "
                 "sse_events=%s sse_malformed=%s sequence_missing=%s sequence_duplicate=%s "
-                "sequence_non_increasing=%s sequence_jump=%s",
+                "sequence_non_increasing=%s sequence_jump=%s dispatch_kind=%s prompt_kind=%s "
+                "scheduler_generation=%s window_index=%s owner_scope=%s system_check_id=%s lateness_ms=%s",
                 kind, source[0], source[1], item["turn_id"],
                 payload.get("events"), payload.get("reason"), payload.get("status"), payload.get("speech_id"),
                 payload.get("code"), payload.get("attempts"), payload.get("limit"),
@@ -669,6 +689,9 @@ class AgentEpisodeRuntime:
                 payload.get("sse_event_count"), payload.get("sse_malformed_count"),
                 payload.get("sequence_missing_count"), payload.get("sequence_duplicate_count"),
                 payload.get("sequence_non_increasing_count"), payload.get("sequence_jump_count"),
+                payload.get("dispatch_kind"), payload.get("prompt_kind"),
+                payload.get("scheduler_generation"), payload.get("window_index"),
+                payload.get("owner_scope"), payload.get("system_check_id"), payload.get("lateness_ms"),
             )
         await self.emit("agent.trace", item)
         # A late output transaction may still need a trace after its Episode
@@ -939,11 +962,16 @@ class AgentEpisodeRuntime:
         self.pending.add(kind)
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self.log("SCHEDULER_EVENT_ENQUEUED", event=kind,
-                                      pending_count=len(self.pending)))
+            identity = self.identity()
+            turn_id = self._identity_turns.get(identity, self.last_turn_id)
+            pending_count = len(self.pending)
+            loop.create_task(self.log("SCHEDULER_EVENT_ENQUEUED", identity=identity,
+                                      turn_id=turn_id, event=kind,
+                                      pending_count=pending_count))
             if was_pending:
-                loop.create_task(self.log("LLM_COALESCED", event=kind,
-                                          pending_count=len(self.pending)))
+                loop.create_task(self.log("LLM_COALESCED", identity=identity,
+                                          turn_id=turn_id, event=kind,
+                                          pending_count=pending_count))
         except RuntimeError:
             pass
         if self.queue.empty():
@@ -978,8 +1006,11 @@ class AgentEpisodeRuntime:
         if queued or running:
             try:
                 loop = asyncio.get_running_loop()
+                identity = self.identity()
+                turn_id = self._identity_turns.get(identity, self.last_turn_id)
                 loop.create_task(self.log(
                     "LLM_RECOVERY_SUPERSEDED",
+                    identity=identity, turn_id=turn_id,
                     superseded_by=kind,
                     queued=queued,
                     running=running,
@@ -1022,8 +1053,11 @@ class AgentEpisodeRuntime:
         if running or cancelled_output:
             try:
                 loop = asyncio.get_running_loop()
+                identity = self.identity()
+                turn_id = self._identity_turns.get(identity, self.last_turn_id)
                 loop.create_task(self.log(
                     "SYSTEM_CHECK_SUPERSEDED",
+                    identity=identity, turn_id=turn_id,
                     superseded_by=kind,
                     cancelled_request=cancelled_request,
                     cancelled_output=cancelled_output,
@@ -1042,11 +1076,20 @@ class AgentEpisodeRuntime:
         Exhaustion itself never schedules an unbounded provider loop.
         """
         source_turn = turn_id or (self._identity_turns.get(identity) if identity else self.last_turn_id)
+        system_check_id = source_turn if source_turn in self._system_check_turn_ids else None
+        dispatch_context = (
+            dict(self.active_dispatch_context)
+            if system_check_id and isinstance(self.active_dispatch_context, dict)
+            else None
+        )
         signal = RecoverySignal(
             code=str(code), message=str(message)[:500],
             source_request_id=identity[1] if identity else self.agent_step_id,
             source_turn_id=source_turn,
             delivery_feedback=delivery_feedback if isinstance(delivery_feedback, dict) else None,
+            system_check_id=system_check_id,
+            owner_scope="system_check" if system_check_id else None,
+            dispatch_context=dispatch_context,
         )
         if getattr(self.provider, "transport", "chat_completions") == "responses":
             limit = int(getattr(self.provider, "protocol_recovery_limit", 1))
@@ -1080,7 +1123,9 @@ class AgentEpisodeRuntime:
                            code=signal.code)
         self.recovery_queue.append(signal)
         await self.log("LLM_RECOVERY_QUEUED", identity=identity, turn_id=signal.source_turn_id,
-                       error_id=signal.error_id, code=signal.code)
+                       error_id=signal.error_id, code=signal.code,
+                       owner_scope=signal.owner_scope,
+                       system_check_id=signal.system_check_id)
         if self.queue.empty():
             self.queue.put_nowait(True)
         if self.runner is None or self.runner.done():
@@ -1431,6 +1476,16 @@ class AgentEpisodeRuntime:
             dispatch_kind = str(candidate.get("dispatch_kind") or candidate.get("prompt_kind") or "forced_poll")
             prompt_kind = str(candidate.get("prompt_kind") or dispatch_kind)
             dispatch_context = dict(candidate)
+        elif recovery_signal and recovery_signal.system_check_id:
+            dispatch_kind = "system_check_recovery"
+            prompt_kind = "exception_recovery"
+            dispatch_context = dict(recovery_signal.dispatch_context or {})
+            dispatch_context.update({
+                "system_check_id": recovery_signal.system_check_id,
+                "dispatch_kind": dispatch_kind,
+                "prompt_kind": prompt_kind,
+                "owner_scope": "system_check",
+            })
 
         if not self._dispatch_allowed(respect_backoff=not recovery):
             return False
@@ -1438,7 +1493,7 @@ class AgentEpisodeRuntime:
         # ordinary semantics.  The re-check closes the small await/log race
         # between deciding a window and creating the provider task.
         if candidate is not None and self._meaningful_pending():
-            covered = self.scheduler.cover_forced_by_normal()
+            covered = self.scheduler.cover_forced_by_normal(include_final=False)
             if covered:
                 await self.log("SCHEDULER_FORCED_COVERED", windows=covered,
                                reason="ordinary_event_arrived_before_dispatch",
@@ -1460,6 +1515,10 @@ class AgentEpisodeRuntime:
             dispatch_context["dispatch_kind"] = dispatch_kind
             dispatch_context["prompt_kind"] = prompt_kind
             self._system_check_turn_ids.add(system_check_id)
+        elif recovery_signal and recovery_signal.system_check_id:
+            system_check_id = recovery_signal.system_check_id
+            source_turn_id = system_check_id
+            self._system_check_turn_ids.add(system_check_id)
         reasoning_effort = "low" if self.reasoning_mode == "deep" else "none"
         if "THINKING_READY" in kinds and self._thinking_lease_turn == source_turn_id:
             reasoning_effort = "low"
@@ -1471,6 +1530,18 @@ class AgentEpisodeRuntime:
         self.active_recovery = recovery_signal
         self.active_dispatch_context = dispatch_context
         self.scheduler_last_dispatch_at = time.monotonic()
+        if not recovery:
+            await self.log(
+                "SCHEDULER_TICK", identity=identity, turn_id=source_turn_id,
+                events=sorted(kinds) if candidate is None else ["SYSTEM_CHECK"],
+                mode=prompt_kind, dispatch_kind=dispatch_kind,
+                prompt_kind=prompt_kind,
+                scheduler_generation=(dispatch_context.get("generation")
+                                      if isinstance(dispatch_context, dict) else self.scheduler.generation),
+                window_index=(dispatch_context.get("window_index")
+                              if isinstance(dispatch_context, dict) else None),
+                system_check_id=system_check_id,
+            )
         await self.log("LLM_DISPATCHED", identity=identity,
                        mode="exception_recovery" if recovery else dispatch_kind,
                        dispatch_kind=("normal" if recovery else dispatch_kind),
@@ -1488,7 +1559,7 @@ class AgentEpisodeRuntime:
             await self.log("LLM_RECOVERY_STARTED", identity=identity,
                            error_id=recovery_signal.error_id, code=recovery_signal.code)
         if candidate is not None and self._meaningful_pending():
-            covered = self.scheduler.cover_forced_by_normal()
+            covered = self.scheduler.cover_forced_by_normal(include_final=False)
             if covered:
                 await self.log("SCHEDULER_FORCED_COVERED", windows=covered,
                                reason="ordinary_event_arrived_before_task_start",
@@ -1514,6 +1585,16 @@ class AgentEpisodeRuntime:
         )
         self.active_request_count += 1
         self.max_request_concurrency = max(self.max_request_concurrency, self.active_request_count)
+        # Ordinary work covers a coincident forced/final check only after its
+        # task exists.  Pending work, backoff, or a failed task creation must
+        # leave the final silent fallback available.
+        if not recovery and candidate is None:
+            covered = self.scheduler.cover_forced_by_normal()
+            if covered:
+                await self.log("SCHEDULER_FORCED_COVERED", identity=identity,
+                               turn_id=source_turn_id, windows=covered,
+                               reason="ordinary_task_started",
+                               resolution="covered_by_normal_dispatch")
         return True
 
     async def _start_recovery(self):
@@ -1522,9 +1603,10 @@ class AgentEpisodeRuntime:
         signal = self.recovery_queue.popleft()
         signal.consumed = True
         scheduler_generation = self.scheduler.generation
-        self.scheduler.reset()
-        await self.log("SCHEDULER_TIMER_RESET", reason="exception_recovery",
-                       error_id=signal.error_id)
+        await self.log("LLM_RECOVERY_STARTING", turn_id=signal.source_turn_id,
+                       error_id=signal.error_id, code=signal.code,
+                       owner_scope=signal.owner_scope,
+                       system_check_id=signal.system_check_id)
         if scheduler_generation != self.scheduler.generation:
             # A meaningful final/refined input re-armed the ladder while the
             # recovery diagnostic was being emitted.  The newer input owns the
@@ -1540,14 +1622,15 @@ class AgentEpisodeRuntime:
         return started
 
     async def _on_heartbeat(self, heartbeat_at):
+        was_final_pending = self.scheduler.final_pending
         self.scheduler.heartbeat(heartbeat_at)
+        if self.scheduler.final_pending and not was_final_pending:
+            await self.log("SCHEDULER_FINAL_PENDING",
+                           window_index=self.scheduler.FINAL_WINDOW,
+                           reason="final_window_crossed",
+                           scheduler_generation=self.scheduler.generation)
         meaningful = self._meaningful_pending()
         if meaningful:
-            covered = self.scheduler.cover_forced_by_normal(now=heartbeat_at)
-            if covered:
-                await self.log("SCHEDULER_FORCED_COVERED", windows=covered,
-                               reason="ordinary_dispatch_priority",
-                               resolution="covered_by_normal_dispatch")
             # Recovery retains its existing priority.  It never receives a
             # forced prompt and ordinary input remains in the mailbox behind
             # the bounded correction.
@@ -1559,7 +1642,6 @@ class AgentEpisodeRuntime:
                 return
             kinds = set(self.pending)
             self.pending.clear()
-            await self.log("SCHEDULER_TICK", events=sorted(kinds), mode="normal")
             if not await self._start_dispatch(kinds):
                 self.pending.update(kinds)
             return
@@ -1577,21 +1659,10 @@ class AgentEpisodeRuntime:
             return
         if not self._dispatch_allowed():
             if candidate.get("prompt_kind") == "final_silence":
-                if self.scheduler.mark_final_pending():
-                    await self.log("SCHEDULER_FINAL_PENDING", reason=self._busy_reason(),
-                                   window_index=candidate.get("window_index"))
+                self.scheduler.mark_final_pending()
             else:
                 self.scheduler.mark_forced_skipped(candidate, now=heartbeat_at, reason=self._busy_reason())
             return
-        await self.log(
-            "SCHEDULER_TICK",
-            events=["SYSTEM_CHECK"],
-            mode=candidate.get("prompt_kind"),
-            dispatch_kind=candidate.get("dispatch_kind"),
-            prompt_kind=candidate.get("prompt_kind"),
-            window_index=candidate.get("window_index"),
-            silence_elapsed_ms=candidate.get("silence_elapsed_ms"),
-        )
         if not await self._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate):
             # A new ordinary event may have arrived while the diagnostic log
             # yielded.  It now owns the next normal heartbeat.
@@ -1601,6 +1672,28 @@ class AgentEpisodeRuntime:
                 self.scheduler.mark_final_pending()
             else:
                 self.scheduler.mark_forced_skipped(candidate, now=heartbeat_at, reason="dispatch_race")
+
+    async def _reset_scheduler_after_pause(self, now: float, lateness: float) -> None:
+        """Discard timer-only work after a long event-loop suspension."""
+
+        queued_system = [signal for signal in self.recovery_queue if signal.system_check_id]
+        self.recovery_queue = deque(signal for signal in self.recovery_queue if not signal.system_check_id)
+        active_system_id = (
+            self.active_request_source_turn_id
+            if isinstance(self.active_dispatch_context, dict)
+            and self.active_dispatch_context.get("owner_scope") == "system_check"
+            else None
+        )
+        for signal in queued_system:
+            if signal.system_check_id != active_system_id:
+                self._system_check_turn_ids.discard(signal.system_check_id)
+                self._system_check_output_turn_ids.discard(signal.system_check_id)
+        rearmed = self.scheduler.reset_after_pause(now, wall_time=time.time())
+        await self.log(
+            "SCHEDULER_PAUSE_RESET", lateness_ms=round(lateness * 1000),
+            rearmed=rearmed, dropped_system_recoveries=len(queued_system),
+            scheduler_generation=self.scheduler.generation,
+        )
 
     async def _finish_active_request(self, request):
         """Consume a completed request task without blocking the heartbeat."""
@@ -1680,7 +1773,11 @@ class AgentEpisodeRuntime:
             self.active_dispatch_context = None
             self.last_llm_completed_at = time.monotonic()
             if (source_turn_id in self._system_check_turn_ids
-                    and source_turn_id not in self._system_check_output_turn_ids):
+                    and source_turn_id not in self._system_check_output_turn_ids
+                    and not any(
+                        signal.system_check_id == source_turn_id
+                        for signal in self.recovery_queue
+                    )):
                 # No speech candidate was created by this system-check.  If
                 # one was created, output_completed owns the final cleanup;
                 # keeping the ID until then prevents a cancellation race from
@@ -1693,14 +1790,14 @@ class AgentEpisodeRuntime:
         """Run the one non-blocking scheduler loop and its fixed heartbeat."""
 
         wake_task = asyncio.create_task(self.queue.get(), name="agent-episode-wakeup")
-        self.scheduler.start_heartbeat()
         try:
             while not self.closed and self.episode_id is not None:
                 active = self.active_request
                 waiters = {wake_task}
                 if active is not None:
                     waiters.add(active)
-                timeout = self.scheduler.heartbeat_delay()
+                timed_work = bool(self.scheduler.armed or self.pending or self.recovery_queue or active is not None)
+                timeout = self.scheduler.heartbeat_delay() if timed_work else None
                 done, _ = await asyncio.wait(
                     waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -1726,10 +1823,11 @@ class AgentEpisodeRuntime:
                 if self.active_request is not None and self.active_request.done():
                     await self._finish_active_request(self.active_request)
 
-                while self.scheduler.heartbeat_due(now):
-                    heartbeat_at = self.scheduler.next_heartbeat
-                    await self._on_heartbeat(heartbeat_at)
-                    now = time.monotonic()
+                lateness = self.scheduler.heartbeat_lateness(now)
+                if lateness >= self.scheduler.PAUSE_RESET_SECONDS:
+                    await self._reset_scheduler_after_pause(now, lateness)
+                elif self.scheduler.heartbeat_due(now):
+                    await self._on_heartbeat(now)
         except asyncio.CancelledError:
             pass
         finally:
@@ -2284,8 +2382,19 @@ class AgentEpisodeRuntime:
                        business_action_count=len(actions), timed_out=timed_out)
         self._wake("THINKING_READY")
 
-    async def _dispatch_actions_v06(self, identity, turn_id, envelope: DecisionEnvelope) -> None:
+    async def _dispatch_actions_v06(self, identity, turn_id, envelope: DecisionEnvelope,
+                                    *, system_check=None) -> None:
         actions = envelope.actions
+        if system_check is None:
+            system_check = turn_id in self._system_check_turn_ids
+        if system_check and actions:
+            await self.log(
+                "SYSTEM_CHECK_ACTION_REJECTED", identity=identity, turn_id=turn_id,
+                system_check_id=turn_id, owner_scope="system_check",
+                action_names=[action.name for action in actions],
+                action_count=len(actions),
+            )
+            return
         thinking = tuple(action for action in actions if action.name == THINKING_ACTION)
         business = tuple(action for action in actions if action.name != THINKING_ACTION)
         if not thinking:
@@ -2467,7 +2576,21 @@ class AgentEpisodeRuntime:
             request_id=identity[1],
             turn_id=source_turn_id,
             events=sorted(kinds),
-            mode="exception_recovery" if recovery else "normal",
+            mode=("system_check" if source_turn_id in self._system_check_turn_ids
+                  else "exception_recovery" if recovery else "normal"),
+            dispatch_kind=(dispatch_context.get("dispatch_kind")
+                           if isinstance(dispatch_context, dict)
+                           else "exception_recovery" if recovery else "normal"),
+            prompt_kind=(dispatch_context.get("prompt_kind")
+                         if isinstance(dispatch_context, dict)
+                         else "exception_recovery" if recovery else "normal"),
+            scheduler_generation=(dispatch_context.get("generation")
+                                  if isinstance(dispatch_context, dict) else self.scheduler.generation),
+            window_index=(dispatch_context.get("window_index")
+                          if isinstance(dispatch_context, dict) else None),
+            system_check_id=(dispatch_context.get("system_check_id")
+                             if isinstance(dispatch_context, dict) else None),
+            owner_scope=("system_check" if source_turn_id in self._system_check_turn_ids else None),
             reasoning_effort=reasoning_effort or "none",
             context_compaction=self.context_compaction,
             context_token_estimate=self.context_token_estimate,
@@ -2476,7 +2599,8 @@ class AgentEpisodeRuntime:
         self.request_count += 1
         self.request_started_at = time.monotonic()
         await self.log("AGENT_INVOKED", events=sorted(kinds),
-                       mode="exception_recovery" if recovery else "normal",
+                       mode=("system_check" if source_turn_id in self._system_check_turn_ids
+                             else "exception_recovery" if recovery else "normal"),
                        dispatch_kind=("normal" if recovery else prompt_kind),
                        prompt_kind=prompt_kind,
                        system_check_id=(dispatch_context.get("system_check_id")

@@ -217,7 +217,7 @@ def test_responses_payload_separates_instructions_and_enables_strict_schema():
     assert payload["input"][0]["content"][0] == {"type": "input_text", "text": "hello"}
 
 
-def test_context_audit_captures_exact_header_free_wire_payload():
+def test_context_audit_captures_content_free_wire_manifest():
     client = DeepSeekClient(
         base_url="https://example.invalid", model="deepseek-v4-flash", api_key="secret-key",
         transport="responses", thinking="disabled", max_output_tokens=512,
@@ -246,13 +246,16 @@ def test_context_audit_captures_exact_header_free_wire_payload():
         reasoning_effort="none",
         max_output_tokens=512,
     )
-    assert snapshot["wire_payload"] == expected
     assert snapshot["wire_sha256"]
+    assert snapshot["wire_bytes"] == len(json.dumps(
+        expected, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    ).encode("utf-8"))
     assert snapshot["schema_sha256"]
     assert snapshot["lane_chars"] == {"static_instructions": 11, "history": 18}
     assert snapshot["message_manifest"][1]["content_sha256"]
     serialized = json.dumps(snapshot, ensure_ascii=False)
-    assert "exact user context" in serialized
+    assert "exact user context" not in serialized
+    assert "exact rules" not in serialized
     assert "secret-key" not in serialized
     assert "authorization" not in serialized.casefold()
 
@@ -762,6 +765,59 @@ def test_thinking_and_business_actions_release_one_barrier_after_tools():
         assert wakes == ["THINKING_READY"]
         assert runtime._thinking_lease_turn == "turn-a"
         assert runtime._thinking_prefix_by_turn["turn-a"] == "让我想一想。"
+
+    asyncio.run(scenario())
+
+
+def test_system_check_actions_and_thinking_are_rejected_before_execution():
+    async def scenario():
+        runtime = _runtime(SimpleNamespace(thinking_action_enabled=True))
+        runtime._system_check_turn_ids.add("system-check-a")
+        executed = []
+
+        async def execute(*_args, **_kwargs):
+            executed.append(True)
+
+        runtime._execute_actions_v06 = execute
+        envelope = DecisionEnvelope(
+            SpeechDecision("speak", "calm", "系统检查播报。"),
+            (Action(THINKING_ACTION, {"request": True}), Action("web_search", {"query": "x"})),
+        )
+        await runtime._dispatch_actions_v06(
+            (runtime.episode_id, "request-a"), "system-check-a", envelope,
+        )
+
+        assert executed == []
+        rejected = [item for item in runtime.trace if item["kind"] == "SYSTEM_CHECK_ACTION_REJECTED"]
+        assert rejected and rejected[0]["action_names"] == [THINKING_ACTION, "web_search"]
+
+    asyncio.run(scenario())
+
+
+def test_system_check_recovery_signal_keeps_immutable_owner_metadata():
+    async def scenario():
+        runtime = _runtime(SimpleNamespace(transport="responses", protocol_recovery_limit=1))
+        runtime._system_check_turn_ids.add("system-check-a")
+        runtime.active_dispatch_context = {
+            "system_check_id": "system-check-a",
+            "dispatch_kind": "forced_poll",
+            "prompt_kind": "forced_poll",
+            "generation": 1,
+            "window_index": 3,
+        }
+        # Keep this focused on signal construction rather than starting the
+        # asynchronous runner in the background.
+        runtime.runner = SimpleNamespace(done=lambda: False)
+
+        signal = await runtime._queue_recovery(
+            "SPEAK_ENVELOPE_INVALID", "invalid json",
+            identity=(runtime.episode_id, "request-a"), turn_id="system-check-a",
+        )
+
+        assert signal is not None
+        assert signal.system_check_id == "system-check-a"
+        assert signal.owner_scope == "system_check"
+        assert signal.dispatch_context["window_index"] == 3
 
     asyncio.run(scenario())
 
