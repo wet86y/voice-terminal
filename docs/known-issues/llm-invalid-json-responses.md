@@ -1,6 +1,11 @@
 # DeepSeek Responses 返回无效决策 JSON
 
 状态：**开放，P1，已接入有界 JSON 自修复；纯文本降级未启用，provider 主因仍在定位**  
+
+长期候选方向、实施顺序和“说明影响并取得用户明确许可后才能修改”的治理门禁见
+[`LLM JSON 可靠性候选改进计划单`](../llm-json-reliability-improvement-plan.md)。该计划单不是已批准的修复
+backlog，不能据此自动修改 Prompt、Schema、模型参数、恢复预算或主线协议。
+
 首次单独建档：2026-09-10（Asia/Hong_Kong）  
 当前活动路径：官方 DeepSeek `Responses`、`deepseek-flash`、strict `json_schema`
 
@@ -401,7 +406,8 @@ JSONL 中精确比较异常请求和邻近正常请求，而无需根据 ASR/TTS
 
 ## 下一步诊断顺序
 
-已完成：结构指纹、真实节奏复放、按输入阶段统计、离线兼容候选实验，以及有界 JSON 自修复接入。
+已完成：结构指纹、真实节奏复放、按输入阶段统计、离线兼容候选实验、有界 JSON 自修复接入、
+Prompt/Schema wire contract 对齐、短 canonical 示例、分层失败诊断、SSE sequence 观测和类型化 transport error。
 
 接下来：
 

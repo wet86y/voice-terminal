@@ -28,4 +28,4 @@ npm run dev
 
 上下文字段的准入、缓存命中诊断与官方 DeepSeek 验收说明见[LLM 上下文缓存契约](docs/llm-context-cache-contract.md)；Web UI 会显示 provider 输入与缓存命中指标。
 
-详见：[架构与组件契约](docs/architecture.md)、[WebSocket V0.6 协议](docs/websocket-protocol.md)、[上下文与工具规范](docs/context-and-tools.md)、[LLM 上下文缓存契约](docs/llm-context-cache-contract.md)、[V0.6 可靠性审计](docs/v06-reliability-audit.md)、[运行与质量门槛](docs/operations-and-quality.md)。
+详见：[架构与组件契约](docs/architecture.md)、[WebSocket V0.6 协议](docs/websocket-protocol.md)、[上下文与工具规范](docs/context-and-tools.md)、[LLM 上下文缓存契约](docs/llm-context-cache-contract.md)、[LLM JSON 可靠性候选改进计划单](docs/llm-json-reliability-improvement-plan.md)、[V0.6 可靠性审计](docs/v06-reliability-audit.md)、[运行与质量门槛](docs/operations-and-quality.md)。

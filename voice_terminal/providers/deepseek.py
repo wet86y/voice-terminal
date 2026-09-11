@@ -11,18 +11,57 @@ logger = logging.getLogger(__name__)
 
 
 class DeepSeekError(RuntimeError):
-    pass
+    retryable = False
+    error_layer = "provider"
+    error_code = "PROVIDER_ERROR"
+
+
+class DeepSeekHttpError(DeepSeekError):
+    """HTTP failure with machine-readable retry policy."""
+
+    error_layer = "transport"
+
+    def __init__(self, status_code: int, body: str = "", *, retry_after: str | None = None) -> None:
+        self.status_code = int(status_code)
+        self.retry_after = retry_after
+        self.retryable = self.status_code == 429 or 500 <= self.status_code < 600
+        self.error_code = "RATE_LIMITED" if self.status_code == 429 else (
+            "PROVIDER_5XX" if 500 <= self.status_code < 600 else "HTTP_ERROR"
+        )
+        self.body_preview = str(body)[:500]
+        super().__init__(f"DeepSeek HTTP {self.status_code}: {self.body_preview}")
+
+
+class DeepSeekTransportError(DeepSeekError):
+    """Connection/timeout failure which preserves whether content arrived."""
+
+    error_layer = "transport"
+
+    def __init__(self, kind: str, *, received_content: bool = False) -> None:
+        self.transport_kind = kind
+        self.received_content = bool(received_content)
+        self.retryable = not self.received_content
+        self.error_code = {
+            "timeout": "TRANSPORT_TIMEOUT",
+            "connect": "TRANSPORT_CONNECT",
+        }.get(kind, "TRANSPORT_FAILURE")
+        super().__init__(
+            f"DeepSeek transport failure: {kind}; received_content={self.received_content}"
+        )
 
 
 class DeepSeekResponseTerminalError(DeepSeekError):
     """Structured non-success terminal from the Responses stream."""
 
     def __init__(self, kind: str, *, status: str | None = None,
-                 reason: str | None = None, error_code: str | None = None) -> None:
+                 reason: str | None = None, error_code: str | None = None,
+                 stream_metrics: Mapping[str, Any] | None = None) -> None:
         self.terminal_kind = kind
         self.status = status
         self.reason = reason
-        self.error_code = error_code
+        self.provider_error_code = error_code
+        self.error_code = "RESPONSE_TERMINAL_FAILURE"
+        self.stream_metrics = dict(stream_metrics or {})
         super().__init__(
             f"Responses terminal failure: {kind}/{status or 'unknown'}"
             f" reason={reason or 'unknown'} code={error_code or 'unknown'}"
@@ -273,7 +312,10 @@ class DeepSeekClient:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", errors="replace")
                     logger.error("deepseek.http_error status=%d body=%r", response.status_code, body[:500])
-                    raise DeepSeekError(f"DeepSeek HTTP {response.status_code}: {body[:500]}")
+                    raise DeepSeekHttpError(
+                        response.status_code, body,
+                        retry_after=getattr(response, "headers", {}).get("Retry-After"),
+                    )
                 async for line in response.aiter_lines():
                         if cancel_event is not None and cancel_event.is_set():
                             return
@@ -322,7 +364,10 @@ class DeepSeekClient:
             raise
         except Exception as exc:
             logger.exception("deepseek.request_failed")
-            raise DeepSeekError(f"DeepSeek 请求失败：{exc}") from exc
+            kind = "timeout" if "timeout" in type(exc).__name__.casefold() else (
+                "connect" if "connect" in type(exc).__name__.casefold() else "transport"
+            )
+            raise DeepSeekTransportError(kind, received_content=response_chars > 0) from exc
 
     async def _stream_responses(
         self,
@@ -341,6 +386,48 @@ class DeepSeekClient:
         terminal = False
         streamed_parts: list[str] = []
         completed_text: str | None = None
+        stream_metrics: dict[str, Any] = {
+            "sse_event_count": 0,
+            "sse_malformed_count": 0,
+            "sequence_missing_count": 0,
+            "sequence_duplicate_count": 0,
+            "sequence_non_increasing_count": 0,
+            "sequence_jump_count": 0,
+            "first_sequence": None,
+            "last_sequence": None,
+        }
+
+        def observe_sequence(event: Mapping[str, Any]) -> None:
+            stream_metrics["sse_event_count"] += 1
+            sequence = event.get("sequence_number")
+            if not isinstance(sequence, int) or isinstance(sequence, bool):
+                stream_metrics["sequence_missing_count"] += 1
+                return
+            previous = stream_metrics["last_sequence"]
+            if stream_metrics["first_sequence"] is None:
+                stream_metrics["first_sequence"] = sequence
+            if isinstance(previous, int):
+                if sequence == previous:
+                    stream_metrics["sequence_duplicate_count"] += 1
+                elif sequence < previous:
+                    stream_metrics["sequence_non_increasing_count"] += 1
+                elif sequence > previous + 1:
+                    # The provider documents monotonic increase, not strict
+                    # contiguity. A jump is diagnostic and never fails audio.
+                    stream_metrics["sequence_jump_count"] += 1
+            stream_metrics["last_sequence"] = sequence
+
+        def log_stream_metrics(*, terminal_kind: str) -> None:
+            logger.info(
+                "deepseek.responses_stream_integrity terminal=%s events=%d malformed=%d "
+                "sequence_missing=%d sequence_duplicate=%d sequence_non_increasing=%d "
+                "sequence_jump=%d first_sequence=%s last_sequence=%s",
+                terminal_kind,
+                stream_metrics["sse_event_count"], stream_metrics["sse_malformed_count"],
+                stream_metrics["sequence_missing_count"], stream_metrics["sequence_duplicate_count"],
+                stream_metrics["sequence_non_increasing_count"], stream_metrics["sequence_jump_count"],
+                stream_metrics["first_sequence"], stream_metrics["last_sequence"],
+            )
 
         def response_text(result: Any) -> str | None:
             if not isinstance(result, dict):
@@ -373,7 +460,10 @@ class DeepSeekClient:
                 )
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", errors="replace")
-                    raise DeepSeekError(f"DeepSeek Responses HTTP {response.status_code}: {body[:500]}")
+                    raise DeepSeekHttpError(
+                        response.status_code, body,
+                        retry_after=getattr(response, "headers", {}).get("Retry-After"),
+                    )
                 async for line in response.aiter_lines():
                     if cancel_event is not None and cancel_event.is_set():
                         return
@@ -385,9 +475,13 @@ class DeepSeekClient:
                     try:
                         event = json.loads(raw)
                     except json.JSONDecodeError:
+                        stream_metrics["sse_malformed_count"] += 1
+                        logger.warning("deepseek.responses_malformed_sse raw_chars=%d", len(raw))
                         continue
                     if not isinstance(event, dict):
+                        stream_metrics["sse_malformed_count"] += 1
                         continue
+                    observe_sequence(event)
                     kind = event.get("type")
                     if kind == "response.output_text.delta":
                         delta = event.get("delta")
@@ -434,7 +528,8 @@ class DeepSeekClient:
                         if isinstance(usage, dict):
                             yield {"type": "usage", "usage": self._normalize_usage(usage)}
                         terminal = True
-                        yield {"type": "finish", "reason": "completed"}
+                        log_stream_metrics(terminal_kind="response.completed")
+                        yield {"type": "finish", "reason": "completed", "stream_metrics": dict(stream_metrics)}
                         return
                     elif kind in {"response.incomplete", "response.failed"}:
                         result = event.get("response")
@@ -443,20 +538,27 @@ class DeepSeekClient:
                         details = result.get("incomplete_details") if isinstance(result, dict) else None
                         reason = details.get("reason") if isinstance(details, dict) else None
                         error_code = error.get("code") if isinstance(error, dict) else None
+                        log_stream_metrics(terminal_kind=str(kind))
                         raise DeepSeekResponseTerminalError(
                             str(kind), status=str(status) if status is not None else None,
                             reason=str(reason) if reason is not None else None,
                             error_code=str(error_code) if error_code is not None else None,
+                            stream_metrics=stream_metrics,
                         )
             if not terminal:
+                log_stream_metrics(terminal_kind="stream_disconnected")
                 raise DeepSeekResponseTerminalError(
                     "stream_disconnected", reason="missing_terminal_event",
+                    stream_metrics=stream_metrics,
                 )
         except DeepSeekError:
             raise
         except Exception as exc:
             logger.exception("deepseek.responses_failed")
-            raise DeepSeekError(f"DeepSeek Responses 请求失败：{exc}") from exc
+            kind = "timeout" if "timeout" in type(exc).__name__.casefold() else (
+                "connect" if "connect" in type(exc).__name__.casefold() else "transport"
+            )
+            raise DeepSeekTransportError(kind, received_content=bool(streamed_parts)) from exc
 
     async def check(self) -> None:
         if not self.api_key:

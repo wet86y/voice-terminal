@@ -9,12 +9,13 @@ import pytest
 from voice_terminal.agent.decision_envelope import Action, DecisionEnvelope, SpeechDecision
 from voice_terminal.agent.context_audit import build_context_snapshot
 from voice_terminal.agent.decision_envelope import (
-    EnvelopeError, SpeechDecisionEnvelopeStream, json_structure_fingerprint,
-    parse_compatible_decision_envelope,
+    EnvelopeError, SpeechDecisionEnvelopeStream, envelope_error_diagnostics,
+    json_structure_fingerprint, parse_compatible_decision_envelope,
+    provider_schema_diagnostics,
 )
 from voice_terminal.agent.decision_schema import THINKING_ACTION, decision_schema
-from voice_terminal.agent.episode import AgentEpisodeRuntime
-from voice_terminal.providers.deepseek import DeepSeekClient
+from voice_terminal.agent.episode import AgentEpisodeRuntime, PROMPT
+from voice_terminal.providers.deepseek import DeepSeekClient, DeepSeekHttpError, DeepSeekTransportError
 from voice_terminal.providers.deepseek import DeepSeekError
 from voice_terminal.providers.deepseek import DeepSeekResponseTerminalError
 from voice_terminal.session.ledger import SessionLedger
@@ -46,6 +47,34 @@ def test_decision_schema_keeps_wire_shape_and_reserves_thinking_action():
     assert item["required"] == ["name", "arguments"]
     assert item["properties"]["name"]["enum"] == ["web_search", THINKING_ACTION]
     assert item["properties"]["arguments"]["properties"]["request"] == {"type": "boolean"}
+
+
+def test_prompt_matches_required_responses_wire_contract_and_has_short_examples():
+    assert "state、emotion、text 以及顶层 actions 始终必填" in PROMPT
+    assert "state=cancel 或 state=wait 时 text 必须为 \"\"" in PROMPT
+    assert '{"speak":{"state":"speak","emotion":"calm","text":"好的。"},"actions":[]}' in PROMPT
+    assert '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}' in PROMPT
+    assert "emotion 可省略" not in PROMPT
+    assert "不得带 text" not in PROMPT
+
+
+def test_provider_schema_diagnostics_are_separate_from_local_contract():
+    schema = decision_schema([])
+    missing_emotion = '{"speak":{"state":"wait","text":""},"actions":[]}'
+    result = provider_schema_diagnostics(missing_emotion, schema)
+    assert result == {
+        "transport_valid": True,
+        "json_syntax_valid": True,
+        "provider_schema_valid": False,
+        "provider_schema_error_code": "MISSING_REQUIRED",
+        "provider_schema_error_path": "$.speak.emotion",
+    }
+
+    error = EnvelopeError("incomplete or invalid decision JSON")
+    prose = envelope_error_diagnostics("普通正文", error, schema)
+    assert prose["error_layer"] == "json_syntax"
+    assert prose["error_code"] == "PROSE_INSTEAD_OF_JSON"
+    assert prose["content_class"] == "prose"
 
 
 def test_responses_control_text_compatibility_is_explicit_not_global():
@@ -266,7 +295,10 @@ def test_responses_stream_normalizes_content_usage_and_terminal():
         assert [item["type"] for item in events] == ["content", "content", "usage", "finish"]
         assert events[-2]["usage"]["prompt_tokens"] == 12
         assert events[-2]["usage"]["completion_tokens"] == 7
-        assert events[-1] == {"type": "finish", "reason": "completed"}
+        assert events[-1]["type"] == "finish"
+        assert events[-1]["reason"] == "completed"
+        assert events[-1]["stream_metrics"]["sse_event_count"] == 4
+        assert events[-1]["stream_metrics"]["sequence_missing_count"] == 4
 
     asyncio.run(scenario())
 
@@ -339,7 +371,53 @@ def test_responses_done_text_repairs_missing_delta_suffix_before_finish():
             [history("user", "hello")], schema=decision_schema([]),
         )]
         assert "".join(item["text"] for item in events if item["type"] == "content") == full
-        assert events[-1] == {"type": "finish", "reason": "completed"}
+        assert events[-1]["type"] == "finish"
+        assert events[-1]["reason"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_responses_stream_observes_malformed_and_non_monotonic_sequences_without_failing():
+    async def scenario():
+        full = '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}'
+
+        class Response:
+            status_code = 200
+
+            async def aiter_lines(self):
+                yield "data: not-json"
+                yield "data: " + json.dumps({
+                    "type": "response.output_text.delta", "sequence_number": 1, "delta": full,
+                })
+                yield 'data: {"type":"response.created","sequence_number":1}'
+                yield 'data: {"type":"response.created","sequence_number":0}'
+                yield 'data: {"type":"response.completed","sequence_number":4,"response":{"status":"completed"}}'
+
+        class Context:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Http:
+            def stream(self, *_args, **_kwargs):
+                return Context()
+
+        client = DeepSeekClient(
+            base_url="https://example.invalid", model="model", api_key="key",
+            transport="responses", thinking="disabled",
+        )
+        client._client = Http()
+        events = [item async for item in client.stream_events(
+            [history("user", "hello")], schema=decision_schema([]),
+        )]
+        metrics = events[-1]["stream_metrics"]
+        assert metrics["sse_event_count"] == 4
+        assert metrics["sse_malformed_count"] == 1
+        assert metrics["sequence_duplicate_count"] == 1
+        assert metrics["sequence_non_increasing_count"] == 1
+        assert metrics["sequence_jump_count"] == 1
 
     asyncio.run(scenario())
 
@@ -549,7 +627,7 @@ def test_transport_retry_exhaustion_waits_for_an_external_event():
             def stream_events(self, _messages, **_kwargs):
                 async def stream():
                     self.calls += 1
-                    raise DeepSeekError("DeepSeek Responses HTTP 503: unavailable")
+                    raise DeepSeekHttpError(503, "unavailable")
                     yield  # pragma: no cover
 
                 return stream()
@@ -577,6 +655,14 @@ def test_transport_retry_exhaustion_waits_for_an_external_event():
         await asyncio.gather(runtime.runner, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_typed_transport_errors_retry_only_before_content_arrives():
+    assert DeepSeekHttpError(429).retryable is True
+    assert DeepSeekHttpError(503).retryable is True
+    assert DeepSeekHttpError(400).retryable is False
+    assert DeepSeekTransportError("timeout", received_content=False).retryable is True
+    assert DeepSeekTransportError("timeout", received_content=True).retryable is False
 
 
 class _Registry:
