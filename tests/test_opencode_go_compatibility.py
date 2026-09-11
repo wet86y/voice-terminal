@@ -153,7 +153,9 @@ def test_opencode_go_responses_sse_maps_to_existing_decision_envelope():
         assert decision.speak.state == "wait"
         assert decision.speak.text == ""
         assert any(item["type"] == "usage" for item in events)
-        assert events[-1] == {"type": "finish", "reason": "completed"}
+        assert events[-1]["type"] == "finish"
+        assert events[-1]["reason"] == "completed"
+        assert events[-1]["stream_metrics"]["sse_event_count"] == 4
         assert "secret-value" not in json.dumps(captured["json"], ensure_ascii=False)
 
     asyncio.run(scenario())

@@ -52,6 +52,128 @@ class CompatibleDecisionEnvelope:
     repairs: tuple[str, ...]
 
 
+def _schema_type_matches(value: Any, expected: str) -> bool:
+    """Return the JSON-type match used by the provider-facing schema audit."""
+
+    return {
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "boolean": isinstance(value, bool),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "null": value is None,
+    }.get(expected, True)
+
+
+def _validate_schema_subset(value: Any, schema: Any, path: str = "$") -> tuple[bool, str | None, str | None]:
+    """Validate the JSON-Schema subset emitted by ``decision_schema``.
+
+    This is diagnostic only: the streamed envelope validator and action
+    adapters remain authoritative. Keeping the small provider-facing check
+    local lets telemetry distinguish syntax, provider-schema and business
+    failures without introducing a new runtime dependency.
+    """
+
+    if not isinstance(schema, dict):
+        return True, None, None
+    expected = schema.get("type")
+    if isinstance(expected, str) and not _schema_type_matches(value, expected):
+        return False, "TYPE_MISMATCH", path
+    enum = schema.get("enum")
+    if isinstance(enum, list) and value not in enum:
+        return False, "ENUM_MISMATCH", path
+    if isinstance(value, dict):
+        properties = schema.get("properties")
+        properties = properties if isinstance(properties, dict) else {}
+        required = schema.get("required")
+        if isinstance(required, list):
+            for key in required:
+                if isinstance(key, str) and key not in value:
+                    return False, "MISSING_REQUIRED", f"{path}.{key}"
+        if schema.get("additionalProperties") is False:
+            extra = next((key for key in value if key not in properties), None)
+            if extra is not None:
+                return False, "ADDITIONAL_PROPERTY", f"{path}.{extra}"
+        for key, child in value.items():
+            if key in properties:
+                valid, code, child_path = _validate_schema_subset(child, properties[key], f"{path}.{key}")
+                if not valid:
+                    return valid, code, child_path
+    if isinstance(value, list):
+        maximum = schema.get("maxItems")
+        if isinstance(maximum, int) and len(value) > maximum:
+            return False, "MAX_ITEMS", path
+        item_schema = schema.get("items")
+        for index, child in enumerate(value):
+            valid, code, child_path = _validate_schema_subset(child, item_schema, f"{path}[{index}]")
+            if not valid:
+                return valid, code, child_path
+    return True, None, None
+
+
+def provider_schema_diagnostics(raw: str, schema: Any) -> dict[str, Any]:
+    """Return content-free syntax and provider-schema validation fields."""
+
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {
+            "transport_valid": True,
+            "json_syntax_valid": False,
+            "provider_schema_valid": False,
+            "provider_schema_error_code": "JSON_SYNTAX",
+            "provider_schema_error_path": "$",
+        }
+    valid, code, path = _validate_schema_subset(value, schema)
+    return {
+        "transport_valid": True,
+        "json_syntax_valid": True,
+        "provider_schema_valid": valid,
+        "provider_schema_error_code": code,
+        "provider_schema_error_path": path,
+    }
+
+
+def envelope_error_diagnostics(raw: str, error: Exception, schema: Any) -> dict[str, Any]:
+    """Classify a failed response without retaining generated content."""
+
+    result = provider_schema_diagnostics(raw, schema)
+    stripped = raw.strip() if isinstance(raw, str) else ""
+    message = str(error).casefold()
+    if not stripped:
+        result.update(error_layer="json_syntax", error_code="EMPTY_OUTPUT", content_class="empty")
+    elif not result["json_syntax_valid"]:
+        if not stripped.startswith(("{", "[", "```")):
+            code, content_class = "PROSE_INSTEAD_OF_JSON", "prose"
+        else:
+            fingerprint = json_structure_fingerprint(raw)
+            incomplete = bool(
+                fingerprint.get("json_brace_balance", 0) > 0
+                or fingerprint.get("json_bracket_balance", 0) > 0
+                or fingerprint.get("json_string_open")
+                or fingerprint.get("json_error_at_end")
+            )
+            code, content_class = (
+                ("JSON_TRUNCATED", "container_incomplete") if incomplete
+                else ("JSON_MALFORMED", "container_malformed")
+            )
+        result.update(error_layer="json_syntax", error_code=code, content_class=content_class)
+    elif any(marker in message for marker in ("action", "tool")):
+        result.update(error_layer="action_contract", error_code="INVALID_ACTION", content_class="valid_json")
+    elif result.get("provider_schema_valid") is False:
+        result.update(
+            error_layer="provider_schema",
+            error_code=result.get("provider_schema_error_code") or "SCHEMA_VIOLATION",
+            content_class="valid_json",
+        )
+    else:
+        result.update(error_layer="local_contract", error_code="BUSINESS_RULE_VIOLATION", content_class="valid_json")
+    result["local_contract_valid"] = False
+    result["action_adapter_valid"] = False if result["error_layer"] == "action_contract" else None
+    return result
+
+
 def _unwrap_single_json_fence(raw: str) -> str | None:
     stripped = raw.strip()
     if not stripped.startswith("```") or not stripped.endswith("```"):
