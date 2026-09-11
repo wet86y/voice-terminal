@@ -353,6 +353,33 @@ class PlayerAndProcessingTests(unittest.TestCase):
         self.assertEqual(current.key, "new")
         self.assertEqual(player.buffered_ms, 0)
 
+    def test_unstarted_player_hold_preserves_pcm_until_resume(self) -> None:
+        started: list[str] = []
+        player = PcmPlayer(
+            sample_rate=1000,
+            channels=1,
+            output_device=None,
+            on_playback_started=started.append,
+        )
+        player.allow("turn")
+        self.assertTrue(player.hold("turn"))
+        player.enqueue("turn", b"\x01\x00")
+
+        held_output = bytearray(2)
+        player._callback(held_output, 1, None, None)
+        self.assertEqual(bytes(held_output), b"\x00\x00")
+        self.assertFalse(player.progress("turn")["started"])
+        self.assertGreater(player.buffered_ms, 0)
+        self.assertEqual(started, [])
+
+        self.assertTrue(player.resume("turn"))
+        output = bytearray(2)
+        player._callback(output, 1, None, None)
+        self.assertEqual(bytes(output), b"\x01\x00")
+        self.assertTrue(player.progress("turn")["started"])
+        self.assertEqual(started, ["turn"])
+        self.assertFalse(player.hold("turn"))
+
     def test_disabled_audio_processing_is_explicit(self) -> None:
         processor = AudioPreprocessor(enabled=False)
         self.assertEqual(processor.status, "DISABLED")

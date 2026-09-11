@@ -774,12 +774,15 @@ class RealtimeController(SpeechPipeline, InputController):
 
     async def _resume(self, frame: AudioFrame) -> None:
         ws = self.workspace
-        # A same-turn continuation cancels the frozen answer before the first
-        # output sample is heard.  There may still be PCM queued between the
-        # provider reader and PortAudio, so close that generation's playback
-        # gate atomically; otherwise the superseded answer could start while
-        # the revised input is being recognized.
-        self._stop_playback_snapshot(ws.playback_key)
+        # A same-turn continuation used to clear the frozen answer here even
+        # when the Episode output had already atomically held it before the
+        # first real PCM callback. That discarded a valid text/TTS candidate
+        # and left its provider stream behind a closed player gate. Preserve
+        # the held queue; explicit barge-in/lifecycle cancellation still uses
+        # the stop-and-snapshot path when no passive hold is active.
+        output = getattr(self, "output", None)
+        if not bool(getattr(output, "playback_hold_active", False)):
+            self._stop_playback_snapshot(ws.playback_key)
         ws.resume()
         stopped = self._stop_generation()
         if stopped:

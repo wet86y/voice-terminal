@@ -81,6 +81,7 @@ class PcmPlayer:
         self._played_bytes = 0
         self._last_callback_played_bytes = 0
         self._allowed_key: str | None = None
+        self._held_key: str | None = None
         self._gated = False
         self._last_callback_at: float | None = None
         self._last_device_output_time: float | None = None
@@ -104,6 +105,7 @@ class PcmPlayer:
                 "sample_rate": self.sample_rate,
                 "channels": self.channels,
                 "active_key": self._active_turn,
+                "held_key": self._held_key,
                 "first_rendered_key": self._first_rendered_key,
                 "first_rendered_at": self._first_rendered_at,
                 "callback_status": self._last_callback_status,
@@ -116,6 +118,39 @@ class PcmPlayer:
             self._clear_unlocked()
             self._gated = True
             self._allowed_key = key
+
+    def hold(self, key: str) -> bool:
+        """Atomically pause an unstarted playback generation without clearing it.
+
+        The audio callback runs on another thread. Holding under the same queue
+        lock makes the check against ``_started_for_turn`` and the callback's
+        consumption decision one atomic boundary. PCM already admitted before
+        the hold remains in the queue; the speech pipeline stops pulling
+        additional provider PCM until ``resume``.
+        """
+        if not key:
+            return False
+        with self._queue_lock:
+            if self._started_for_turn == key:
+                return False
+            if self._active_turn not in (None, key):
+                return False
+            self._gated = True
+            self._allowed_key = key
+            self._held_key = key
+            return True
+
+    def resume(self, key: str) -> bool:
+        """Release a held playback generation without resetting its queue."""
+        if not key:
+            return False
+        with self._queue_lock:
+            if self._held_key != key:
+                return False
+            self._held_key = None
+            self._gated = True
+            self._allowed_key = key
+            return True
 
     def block(self) -> bool:
         """Atomically close playback and report whether any audio already played."""
@@ -131,12 +166,15 @@ class PcmPlayer:
 
         with self._queue_lock:
             if key is not None and self._active_turn not in (None, key):
+                if self._held_key == key:
+                    self._held_key = None
                 snapshot = self._empty_snapshot_unlocked(key)
                 self._last_stop_snapshot = snapshot
                 return snapshot
             snapshot = self._snapshot_unlocked()
             self._gated = True
             self._allowed_key = None
+            self._held_key = None
             self._clear_unlocked()
             self._last_stop_snapshot = snapshot
             return snapshot
@@ -313,18 +351,19 @@ class PcmPlayer:
             device_time = getattr(_time, "outputBufferDacTime", None)
             if isinstance(device_time, (int, float)):
                 self._last_device_output_time = float(device_time)
-            while remaining > 0 and self._chunks:
-                chunk = self._chunks.popleft()
-                take = min(remaining, len(chunk))
-                target[offset : offset + take] = chunk[:take]
-                offset += take
-                remaining -= take
-                self._buffered_bytes = max(0, self._buffered_bytes - take)
-                self._played_bytes += take
-                if take < len(chunk):
-                    # Preserve exact PCM order for the next callback.
-                    self._chunks.appendleft(chunk[take:])
-                    break
+            if self._held_key != self._active_turn:
+                while remaining > 0 and self._chunks:
+                    chunk = self._chunks.popleft()
+                    take = min(remaining, len(chunk))
+                    target[offset : offset + take] = chunk[:take]
+                    offset += take
+                    remaining -= take
+                    self._buffered_bytes = max(0, self._buffered_bytes - take)
+                    self._played_bytes += take
+                    if take < len(chunk):
+                        # Preserve exact PCM order for the next callback.
+                        self._chunks.appendleft(chunk[take:])
+                        break
 
             if offset > 0 and self._active_turn and self._started_for_turn != self._active_turn:
                 self._started_for_turn = self._active_turn
@@ -401,10 +440,13 @@ class PcmPlayer:
             if self._gated and turn_id != self._allowed_key:
                 return
             if self._active_turn != turn_id:
+                held_for_key = self._held_key == turn_id
                 self._render_points.clear()
                 self._clear_unlocked()
                 self._active_turn = turn_id
                 self._started_for_turn = None
+                if held_for_key:
+                    self._held_key = turn_id
             if not self._render_points:
                 # Establish a zero-output anchor before the first PortAudio
                 # callback.  An interruption can begin after enqueue but
@@ -433,6 +475,7 @@ class PcmPlayer:
         self._started_for_turn = None
         self._last_callback_at = None
         self._last_device_output_time = None
+        self._held_key = None
 
     async def wait_until_empty(self, timeout_seconds: float = 10.0) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds

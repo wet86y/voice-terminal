@@ -178,7 +178,7 @@ class EpisodeController(RealtimeController):
             if self.player:
                 progress = self.player.progress(h.workspace.playback_key)
                 h.overlap_start_ms = max(0, int(progress.get("output_estimated_ms", 0)) - decision.duration_ms)
-            await self.episode.speech_activity(True)
+            await self.episode.speech_activity(True, interrupt_reason="user_interrupted")
             self.barge_in_gate.reset()
             self._barge_trace_state = None
         else:
@@ -526,7 +526,7 @@ class EpisodeController(RealtimeController):
         self.output.playback_started(key)
 
     async def _handle_asr_disconnect(self):
-        await self.episode.speech_activity(None)
+        await self.episode.speech_activity(None, interrupt_reason="input_unavailable")
         self.output.cancel_all("input_unavailable")
         await super()._handle_asr_disconnect()
 
@@ -535,7 +535,7 @@ class EpisodeController(RealtimeController):
             if self.workspace is not None:
                 await self._cancel_turn(reason="failed", record=True)
             await self.episode.end("fatal_error")
-            await self.episode.speech_activity(None)
+            await self.episode.speech_activity(None, interrupt_reason="input_unavailable")
         await super()._error(code, message, recoverable=recoverable, turn_id=turn_id)
 
     async def stop_listening(self):
@@ -543,6 +543,7 @@ class EpisodeController(RealtimeController):
         if self.workspace is not None:
             await self._cancel_turn(reason="stopped", record=True)
         if not self.episode.closed:
+            await self.episode.speech_activity(None, interrupt_reason="stopped")
             await self.episode.stop()
         await self._cancel_tts_prewarm()
         close_tts = getattr(self.tts, "close", None)
@@ -555,6 +556,7 @@ class EpisodeController(RealtimeController):
         if self.workspace is not None:
             await self._cancel_turn(reason="reset", record=True)
         if not self.episode.closed:
+            await self.episode.speech_activity(None, interrupt_reason="reset")
             await self.episode.end("reset")
         await self.output.close()
         await self._cancel_tts_prewarm()
@@ -575,6 +577,7 @@ class EpisodeController(RealtimeController):
         if self.workspace is not None:
             await self._cancel_turn(reason="stopped", record=True)
         if not self.episode.closed:
+            await self.episode.speech_activity(None, interrupt_reason="stopped")
             await self.episode.stop()
         await self._cancel_tts_prewarm()
         close_tts = getattr(self.tts, "close", None)
