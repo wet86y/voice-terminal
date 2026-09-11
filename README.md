@@ -40,8 +40,9 @@ LLM transport 由 `llm.transport` 原子选择；默认生产接入为官方 Dee
 ```powershell
 .\scripts\setup.ps1 -Python D:\DevTools\Python312\python.exe -Analysis
 .\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe
-npm run dev
 ```
+
+`start.ps1` 默认会依次准备分析、ASR、Web 前端和 Voice Server；在继续启动前会确认 Web 前端实际可通过 `http://127.0.0.1:5173/` 访问。若 5173 已被其他进程监听、Vite 提前退出或页面在 30 秒内不可访问，脚本会失败并输出前端日志，而不会把仅后端健康误报为整套服务可用。只有需要独立调试后端时才使用 `-NoWeb`；前端单独开发仍可运行 `npm run dev`。
 
 在根目录的已忽略 `.env.local` 中配置 `DEEPSEEK_API_KEY`、`OPENCODE_GO_API_KEY`、`MINIMAX_API_KEY` 和可选的 `MINIMAX_API_HOST`。真实测试对话默认使用官方 DeepSeek；调试时可临时运行 `./scripts/start.ps1 -LlmProvider opencode_go` 切到 OpenCode Go，脚本结束后不会保留覆盖。浏览器默认连接 `ws://127.0.0.1:8765/ws`，不请求麦克风权限、不上传 PCM、不自行计算延迟。
 

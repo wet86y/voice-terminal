@@ -219,6 +219,14 @@ class AsrWorkerConfigurationTests(unittest.TestCase):
         self.assertIn("voice_terminal.asr.probe", script)
         self.assertNotIn('Connect("127.0.0.1", 8766)', script)
 
+    def test_start_script_starts_and_verifies_web_frontend_by_default(self) -> None:
+        script = Path("scripts/start.ps1").read_text(encoding="utf-8")
+        self.assertIn("[switch]$NoWeb", script)
+        self.assertIn("$webPort = 5173", script)
+        self.assertIn("Start-Process -FilePath $npmCommand.Source", script)
+        self.assertIn("Test-HttpReady $webUrl", script)
+        self.assertIn("Stop-ProcessTree $web.Id", script)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,8 @@
   [ValidateSet("deepseek", "opencode_go")]
   [string]$LlmProvider = "",
   [switch]$NoWorker,
-  [switch]$NoAnalysis
+  [switch]$NoAnalysis,
+  [switch]$NoWeb
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,6 +15,9 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Push-Location $RepoRoot
 $worker = $null
 $analysisWorker = $null
+$web = $null
+$webPort = 5173
+$webUrl = "http://127.0.0.1:$webPort/"
 $previousLlmProvider = $env:VOICE_LLM_PROVIDER
 $llmProviderOverridden = $false
 if ($LlmProvider) {
@@ -39,6 +43,26 @@ function Get-ListeningProcessDetails([int]$Port) {
       [PSCustomObject]@{ Id = $listenerProcessId; CommandLine = "unknown"; CreationDate = "unknown" }
     }
   }
+}
+
+function Test-HttpReady([string]$Uri) {
+  try {
+    $response = Invoke-WebRequest -Uri $Uri -TimeoutSec 2 -UseBasicParsing
+    return $response.StatusCode -ge 200 -and $response.StatusCode -lt 400
+  } catch {
+    return $false
+  }
+}
+
+function Stop-ProcessTree([int]$ProcessId) {
+  $children = @(
+    Get-CimInstance Win32_Process -Filter "ParentProcessId = $ProcessId" -ErrorAction SilentlyContinue |
+      Select-Object -ExpandProperty ProcessId
+  )
+  foreach ($childId in $children) {
+    Stop-ProcessTree $childId
+  }
+  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
 }
 
 try {
@@ -104,6 +128,35 @@ try {
     }
   }
 
+  if (-not $NoWeb) {
+    $existingWeb = @(Get-ListeningProcessDetails $webPort)
+    if ($existingWeb.Count -gt 0) {
+      $details = $existingWeb | ForEach-Object { "PID=$($_.Id) started=$($_.CreationDate) command=$($_.CommandLine)" }
+      throw "Web 前端端口 $webPort 已有监听进程。为防止继续使用未知或陈旧的前端构建，启动已中止。`n$($details -join [Environment]::NewLine)"
+    }
+    $npmCommand = Get-Command npm.cmd -ErrorAction Stop
+    $webOut = Join-Path $LogDir "web-dev-current.out.log"
+    $webErr = Join-Path $LogDir "web-dev-current.err.log"
+    $web = Start-Process -FilePath $npmCommand.Source -ArgumentList @("run", "dev") -WorkingDirectory $RepoRoot -WindowStyle Hidden -RedirectStandardOutput $webOut -RedirectStandardError $webErr -PassThru
+    $webReady = $false
+    for ($attempt = 0; $attempt -lt 60; $attempt++) {
+      Start-Sleep -Milliseconds 500
+      if ($web.HasExited) { break }
+      if (Test-HttpReady $webUrl) {
+        $webReady = $true
+        break
+      }
+    }
+    if (-not $webReady) {
+      $details = @()
+      if (Test-Path -LiteralPath $webErr) { $details += Get-Content -Raw -LiteralPath $webErr }
+      if (Test-Path -LiteralPath $webOut) { $details += Get-Content -Raw -LiteralPath $webOut }
+      if ($details.Count -eq 0) { $details = @("无 Web 前端日志") }
+      throw "Web 前端未能在 30 秒内通过 HTTP health：$webUrl`n$($details -join [Environment]::NewLine)"
+    }
+    Write-Host "Web 前端已就绪：$webUrl"
+  }
+
   & $Python -m apps.server.main --config $Config
   exit $LASTEXITCODE
 } finally {
@@ -119,6 +172,9 @@ try {
   }
   if ($worker -and -not $worker.HasExited) {
     Stop-Process -Id $worker.Id -Force -ErrorAction SilentlyContinue
+  }
+  if ($web -and -not $web.HasExited) {
+    Stop-ProcessTree $web.Id
   }
   Pop-Location
 }
