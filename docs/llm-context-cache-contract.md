@@ -12,11 +12,18 @@ DeepSeek 的前缀缓存按请求开头连续 token 匹配。官方 Responses �
 
 | Lane | 允许内容 | 生命周期与位置 | 禁止内容 |
 | --- | --- | --- | --- |
-| `STATIC_INSTRUCTIONS` | 固定 Agent 规则、固定 schema 兼容说明、会话日期基准、冻结动作目录 | 会话内不变；Responses `instructions` | 秒级时间、播放状态、工具可用性、恢复反馈 |
+| `STATIC_INSTRUCTIONS` | 固定 Agent 规则、固定 schema 兼容说明、会话日期基准、冻结动作目录、episode 级人格/用户/行为文档 | episode 内不变；Responses `instructions` | 秒级时间、播放状态、工具可用性、恢复反馈 |
 | `HISTORY` | 最终用户输入、实际 `heard_text`、结算的打断/替换、完成工具资料、持久精修 | 只能在末尾追加；Responses `input` | 未播文本、重排/摘要旧条目、运行时 ID |
 | `REQUEST_TAIL` | 当前输入候选、秒级时间、日期 epoch、活跃 speak、精修、工具可用性、恢复反馈 | 只存在于本请求末尾；Responses `input` | 固定规则、需要在未来复用的事实 |
 
 `ContextFrame` 是唯一模型消息构造器。没有 lane 的帧会在 provider 投影时失败；内部 `context_lane` 不会发送到 provider。Responses 仅将 `STATIC_INSTRUCTIONS` 合并到 `instructions`，其余 role、顺序和内容原样进入 `input`。冻结的 Chat Completions 回退只去除内部 lane，保留原有消息顺序。
+
+人格上下文文件位于 `config/persona/`，由 Agent 在新的 episode 首次建立时读取一次。
+`instructions.md`、`personality.md` 和 `user.md` 均属于 `STATIC_INSTRUCTIONS`，并按
+“指令集合 → 人格主体 → 用户资料”的固定顺序追加到内置协议和动作目录之后。文件
+内容改变不会在当前 episode 内重新读取，因此不会改变已建立的 static digest；停止后
+重新启动 Agent 或 session reset 创建新 episode 后，新的文档内容才会进入新的静态前缀。
+缺失、空文件或读取失败的文档不会替换为隐藏默认文本，只会被跳过并记录 warning。
 
 ## 标准字段准入表
 
@@ -24,6 +31,7 @@ DeepSeek 的前缀缓存按请求开头连续 token 匹配。官方 Responses �
 | --- | --- | --- | --- | --- | --- |
 | Agent 固定规则、schema compatibility | Agent runtime | STATIC | 否 | 是（冻结） | provider placement test |
 | 会话日期基准 | Conversation runtime | STATIC | reset 时重建 | 否 | 跨午夜 test |
+| `instructions.md`、`personality.md`、`user.md` 文档快照 | Agent runtime | STATIC | 否 | 否 | episode snapshot / placement test |
 | 最终用户文本 | Session ledger | HISTORY | 是 | 否 | ledger replay test |
 | 已完成 speak `heard_text` | Speech/ledger | HISTORY | 是 | 否 | delivery test |
 | 工具资料、结算中断、持久精修 | ledger | HISTORY | 是 | 否 | replay/order test |
