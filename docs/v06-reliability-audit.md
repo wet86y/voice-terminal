@@ -2,11 +2,11 @@
 
 V0.6 以 JSON 响应信封取代 DeepSeek 原生工具调用，但不移除已验证的输入、TTS、播放和交付能力。
 
-> 本文同时保留切换前的可靠性基线。当前项目已进入 Responses + strict `json_schema` 协议切换后的 Bug 检修期；下文涉及 Chat Completions/`json_object` 的内容均属于冻结历史路径，不代表当前活动配置。
+> 本文同时保留切换前的可靠性基线。当前项目已在生产运行 Responses + strict `json_schema` 协议；下文涉及 Chat Completions/`json_object` 的内容均属于冻结历史路径，不代表当前活动配置。
 
 | 业务能力 | 唯一 owner | 自动化证据 |
 | --- | --- | --- |
-| 400ms 单飞调度与事件合并 | `AgentEpisodeRuntime + AgentDecisionScheduler` | 调度、退避、恢复测试 |
+| 单一400ms心跳、普通优先与阶梯强制调度 | `AgentEpisodeRuntime + AgentDecisionScheduler` | 固定 deadline、窗口覆盖、忙碌跳过、最终 pending、单飞和生命周期测试 |
 | 必填语音决策 | `SpeechDecisionEnvelopeStream` | JSON 分片、前端参数半校验、完整信封与非法动作测试 |
 | 文本候选、前缀追加与 generation | `EpisodeSpeechOutput` + `AgentEpisodeRuntime` | `empty/queued/suspended/speaking`、严格前缀追加、抢占状态测试 |
 | TTS 隔离与零 PCM | `EpisodeSpeechOutput + MiniMaxTtsSession` | flush、cancel、新建会话、一次重试 |
@@ -26,6 +26,14 @@ V0.6 以 JSON 响应信封取代 DeepSeek 原生工具调用，但不移除已�
 - 如果已追加的流式 `speak` 随后完整 JSON 或动作校验失败，已获合法前缀授权的追加文本保留，并使用一次既有恢复请求纠正协议；已播放旧内容不会恢复或续播。
 - 完成播放后，assistant 的实际 `heard_text` 继续进入 ledger 供后续语义推理，但不再作为活动 continuation target。最近一次同会话 full delivery 仅用于检测异常跨轮累计；“已听文本 + 非空后缀”会在 TTS 前剥离旧前缀，完全相同文本保留显式复述能力，不同会话和 partial delivery 不参与比较。
 - 当前活动快照不得借用其他 speech handle 的 `last_delivery`。无法证明与当前 `speech_id` 绑定的 `heard_text` 必须省略，避免把上一轮交付错误投影到新目标。
-- 冻结历史路径曾对 DeepSeek thinking 请求使用 `response_format=json_object`。当前活动路径改为 Responses + strict `json_schema`，基础请求保持 `effort=none`，仍不传递 provider native tools；工具资料仅经本地 `actions` 和不可信账本来源块进入下一请求。预留的 `request_thinking(low)` 在检修期保持关闭。
+- 冻结历史路径曾对 DeepSeek thinking 请求使用 `response_format=json_object`。当前活动路径改为 Responses + strict `json_schema`，仍不传递 provider native tools；工具资料仅经本地 `actions` 和不可信账本来源块进入下一请求。快速与均衡模式的基础请求保持 `effort=none`；均衡模式可通过本地 `request_thinking` 触发一次 `effort=low` 续请求，深度模式直接使用 `effort=low`。
+
+### 当前单一400ms调度边界
+
+当前 Agent 不再依赖事件到达后才继续等待的单纯唤醒模型，而是由唯一的 `_run()` 循环持续推进本地400ms heartbeat。heartbeat 只推进 deadline、整理 mailbox 和检查本地 busy 状态；它不等待 active LLM、不等待 TTS 播放，也不建立第二个 watchdog。`active_request` 始终是独立 task，单请求约束仍为 `max_request_concurrency == 1`。
+
+有效的非空 `USER_INPUT_FINALIZED` 或发生语义变化的非空 `USER_INPUT_REFINED` 会重新开始静默阶梯。没有普通语义事件时，第3、6、9、16、22窗口发起 `forced_poll`，第25窗口发起一次 `final_silence`；第10窗口只切换到慢速阶段。普通事件与强制窗口同边界时，普通调度覆盖强制窗口并记录 `covered_by_normal_dispatch`，不会创建 system-check，也不会补发强制请求。普通强制窗口在 active LLM、TTS/待播内容或用户输入繁忙时跳过；最终窗口在这些状态下保留，恢复空闲后只消费一次。
+
+`TTS_*` 和语音活动不会成为普通语义事件，不更新静默锚点，也不会触发 provider。TTS 状态只作为 dispatch 门槛。`forced_poll` 与 `final_silence` 使用互斥的 request-tail 提示词，均复用普通 `_step()`、`_provider_stream()`、provider schema/transport/reasoning 和 `EpisodeSpeechOutput`；system-check 不开始用户 turn、不创建 `InputRecord`，已听到的输出才写入 assistant ledger。
 
 真实设备仍须完成连续五轮、SenseVoice 修正、动作后回复、同前缀长播报追加、文本分歧改口、耳机/扬声器插话和停止监听验收。跨轮验收应确认 `owner_scope` 从 `current_turn` 正确切换为 `none/previous_turn`，新 TTS 只收到本轮文本；若模型仍累计输出，必须出现 `CROSS_TURN_SPEECH_PREFIX_STRIPPED` 且 suffix 之前没有旧 PCM。追加验收应确认同轮新事件中只有 suffix，且没有因普通补充产生 `speech.replaced` 或 `local_playback_stopped`。

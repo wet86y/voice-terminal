@@ -6,7 +6,9 @@
 
 工具来源块包含工具名、参数、执行时间、结果与 `external_untrusted` 来源标记；不包含对话、轮次、语音、epoch 或决策身份。工具结果是资料，不是指令；模型不得从其中获取系统权限、改变会话规则或执行非只读操作。
 
-允许按意图调用受限目录文件工具与联网搜索。工具完成结果统一作为事件进入下一次 400ms 普通调度；新输入、精修和工具晚到不会让在飞请求失效。只有停止监听、会话重置等显式取消才会清理工具任务。
+允许按意图调用受限目录文件工具与联网搜索。工具完成结果统一作为事件进入同一个 `AgentDecisionScheduler` 的下一次 400ms 普通调度；新输入、精修和工具晚到不会让在飞请求失效。普通事件在同一心跳边界优先于扩展的强制检查窗口；没有普通语义事件时，调度器才会在阶梯窗口发起 `forced_poll`，并在约10秒的最终窗口发起一次独立 `final_silence` 检查。只有停止监听、会话重置等显式取消才会清理工具任务。
+
+TTS 和语音活动属于运行时状态，不是新的语义事件。TTS 开始、结束、取消、替换和失败不会重置用户静默锚点、加入 `pending` 或触发 LLM；TTS 是否正在播放或有待播内容，只决定当前心跳是否允许实际 dispatch。强制请求仍调用普通 `_step()`/provider stream 链路，但使用独立 `system_check_id`，不创建用户轮次或 `InputRecord`。只有用户实际听到的 system-check speech 才经 delivery report 写入 assistant ledger。
 
 action definitions、由其构建的 strict schema、`request_thinking` 可见性和动作目录在 Agent episode 开始时冻结。工具中途不可用不会修改 schema/catalog，而是作为 `REQUEST_TAIL` 的 availability；本地权限、参数和错误恢复仍是最终权威。`request_thinking` 是本地控制 action，不是业务工具，不产生 `ToolExchange`。
 

@@ -1,8 +1,10 @@
 # 运行与质量门槛
 
-> **当前状态：协议切换后的 Bug 检修期。** 默认活动 LLM 路径已经切换为 DeepSeek Responses + strict `json_schema`；冻结的 Chat/`json_object` adapter 只作为显式整体回退入口。检修期不启用普通影子双跑或 `request_thinking`，也不把当前默认配置视为已经完成生产验收。
+> **当前状态：生产运行。** 默认活动 LLM 路径为 DeepSeek Responses + strict `json_schema`；冻结的 Chat/`json_object` adapter 只作为显式整体回退入口。快速、均衡和深度思考模式均属于生产主链：均衡模式可请求一次本地 `request_thinking` 续请求，深度模式使用 `effort=low`。普通影子双跑仍不属于生产路径。
 
 默认 `config/default.yaml` 是当前唯一活动运行线。`smart_turn`、`agent` 与 `tools` 是能力配置，不是版本开关。文件工具默认仅限 `docs`；不包含 Shell、写文件、外部账号操作、RAG 或长期记忆。
+
+思考模式在 episode 创建时冻结：`fast` 为 `effort=none` 且不暴露思考 action，`balanced` 的基础请求为 `effort=none` 并可通过本地 `request_thinking` 获得一次 `effort=low` 续请求，`deep` 直接使用 `effort=low`。`request_thinking` 不是 provider native tool；它不能执行外部操作，且新输入、停止监听和 session reset 必须立即取消其等待或续请求。`config/local.yaml` 是本机覆盖文件；正常请求的 Schema 可见性和实际 effort 仍以启动时冻结的 episode `reasoning_mode` 为准，故该文件不能作为生产基线证据。
 
 默认 `audio.output_device: null`，由 Windows 选择当前活跃默认输出设备。这样可避免固定的 MME 端点在 PortAudio 实际打开 32 kHz PCM 流时失败，也能自然适应耳机和外接音箱切换。只有部署环境需要强制固定设备时，才在被忽略的 `config/local.yaml` 中设置 `audio.output_device`；修改后应先以真实输出流验证，而不只依赖设备能力查询。
 
@@ -16,6 +18,19 @@ npm run build --workspace @voice-terminal/web
 python -m compileall -q voice_terminal apps tests
 git diff --check
 ```
+
+调度器验收必须确认当前只有一个 `AgentDecisionScheduler` 和一个 Agent `_run()` 循环。400ms
+heartbeat 使用从上一个 deadline 推进的固定时间轴，不能等待 active LLM、TTS 播放或 provider
+返回，也不能因为 heartbeat 本身增加 provider 请求。普通事件在400ms边界合并并优先于同边界
+的强制窗口；无普通语义事件时才允许第3、6、9、16、22窗口的 `forced_poll`，第25窗口的
+`final_silence` 只能消费一次。普通窗口忙碌时跳过，最终窗口忙碌时保留到恢复空闲后补发。
+
+TTS 开始、结束、取消、替换、失败和语音活动不属于普通调度事件，不重置用户静默锚点，也不
+触发 provider；TTS 状态只负责阻止实际 dispatch。普通、`forced_poll` 和 `final_silence` 三类
+请求必须共用 `_step()`、`_provider_stream()`、原有 schema/transport/reasoning 和 TTS 输出协议。
+system-check 必须使用独立 `system_check_id`，不创建用户 `InputRecord` 或用户 turn 结算；只有
+已被听到的输出才进入 assistant ledger。reset、stop 和 episode end 后应清理 heartbeat、runner、
+active request 与 scheduler 状态。
 
 软件通过后仍必须在真实设备完成：[V0.6 可靠性审计](v06-reliability-audit.md)
 定义的核心 10 条人工验收，覆盖自然语音、耳机和扬声器下的打断、连续多轮、

@@ -2,10 +2,6 @@
 
 状态：**开放，P1，已接入有界 JSON 自修复；纯文本降级未启用，provider 主因仍在定位**  
 
-长期候选方向、实施顺序和“说明影响并取得用户明确许可后才能修改”的治理门禁见
-[`LLM JSON 可靠性候选改进计划单`](../llm-json-reliability-improvement-plan.md)。该计划单不是已批准的修复
-backlog，不能据此自动修改 Prompt、Schema、模型参数、恢复预算或主线协议。
-
 首次单独建档：2026-09-10（Asia/Hong_Kong）  
 当前活动路径：官方 DeepSeek `Responses`、`deepseek-flash`、strict `json_schema`
 
@@ -164,15 +160,24 @@ protocol recovery，不会让损坏 JSON 静默通过。
 - `input_20260910_230404_000023` 与 `input_20260910_230604_000029` 处在连续倾诉/“先听着”上下文，
   没有立即发声可能符合 `wait` 意图，不能和解析失败导致的无回应混为一类。
 
-### 400ms 调度器并非轮询器
+### 历史基线：400ms 调度器并非轮询器
 
-`AgentDecisionScheduler` 只实现请求合并窗口：`delay()`、`tick()` 和 `reset()`。Agent runner 最外层
-等待 `queue.get()`，没有周期任务、finalized-turn deadline 或 response watchdog。恢复耗尽后代码明确
-不插入新事件，runner 会回到 `WAITING_EVENT`，直至后续用户、refinement、endpoint 或工具事件唤醒。
+以下内容描述的是本报告采样时的旧实现，不是当前实现。旧版 `AgentDecisionScheduler` 只实现请求
+合并窗口：`delay()`、`tick()` 和 `reset()`；Agent runner 最外层等待 `queue.get()`，没有周期任务、
+finalized-turn deadline 或 response watchdog。恢复耗尽后代码明确不插入新事件，runner 会回到
+`WAITING_EVENT`，直至后续用户、refinement、endpoint 或工具事件唤醒。
 
 现场中用户说“喂”“听到了吗”后系统才恢复回复，实质上是用户输入代替了缺失的兜底唤醒。
 现有 `test_whitespace_recovery_reproduction.py` 还明确断言耗尽后不得自重试，用于防止历史 2.5Hz
 恢复风暴。因此当前行为不是 timer 偶发失效，而是既有设计选择与“finalized turn 必须有结果”职责冲突。
+
+当前实现已将该边界改为单一固定心跳：只有一个 `AgentDecisionScheduler` 和一个 Agent
+`_run()` 循环。400ms heartbeat 使用固定 deadline 持续推进本地窗口，active LLM、TTS 和用户输入
+不会暂停 heartbeat，也不会为每个 heartbeat 调用 provider。普通事件在心跳边界积累并优先调度；
+没有普通语义事件时，第3、6、9、16、22窗口进行 `forced_poll`，第25窗口进行一次
+`final_silence` 检查。普通事件与强制窗口同边界时，普通请求覆盖强制窗口；TTS 和语音活动不重置
+用户静默锚点、不进入普通语义队列。普通强制窗口忙碌时跳过，最终窗口忙碌时保留并在恢复空闲后
+只补发一次。
 
 ### recovery 预算作用域过粗
 
@@ -187,7 +192,7 @@ USER_SEGMENT_UPDATED 的推测请求格式失败
 → recovery 成功或被后续讲话取消
 → USER_INPUT_FINALIZED 的权威请求再次格式失败
 → 直接 LLM_RECOVERY_EXHAUSTED
-→ 没有 watchdog，最终无回应
+→ 旧实现没有强制检查，最终无回应
 ```
 
 `input_20260910_230819_000034` 是明确样本：早期请求在 `23:08:23.253` 首次失败并消耗 recovery；
@@ -200,17 +205,20 @@ finalized/refined 请求在 `23:08:25.476` 再次失败，随后立即耗尽；�
 剩余 12 次多数紧邻 `agent.request_cancelled reason=user_interrupted`。`CancelledError` 路径没有记录
 recovery cancelled 终态，且已消耗的 turn 额度不会归还。这既影响恢复机会，也使运行统计无法闭合。
 
-### 后续恢复修复边界
+### 当前恢复与强制检查边界
 
-在 JSON 主因明确后，恢复机制应至少区分：
+协议恢复仍保持有限次数和既有 recovery queue 优先级，不因为强制调度而变成无限 retry。当前实现
+区分以下边界：
 
 - speculative 输入恢复预算；
 - authoritative finalized revision 恢复预算；
-- 有界 `FINAL_RESPONSE_WATCHDOG` 预算。
+- 同一个400ms调度器中的 `forced_poll` 预算；
+- 一次性的 `final_silence` 窗口。
 
-watchdog 只能在“输入已 finalized、用户未讲话、无更新 turn、无活动 LLM/TTS、当前 revision 从未产生
-合法 speak/wait/cancel”时触发，并在新输入、合法控制决定、TTS 开始或 session stop 时取消。不能简单
-提高全局 recovery limit 或恢复无界自轮询。
+`forced_poll` 只在没有普通语义事件且实际 dispatch 门槛满足时触发；`final_silence` 在 active LLM、
+TTS/待播内容或用户输入繁忙时保留，恢复后只消费一次。两类强制请求都复用同一个 `_step()` 和
+provider stream 入口，使用互斥提示词，不能作为第二个 scheduler、watchdog 或 provider 调用链路。
+普通事件、有效新输入或有效修订仍拥有更高优先级；新输入还会使未播放的 system-check 结果失效。
 
 ## 与历史问题的区别
 
@@ -357,7 +365,7 @@ JSON 结构指纹和本地 Schema 结果；不记录用户正文或模型完整�
 Schema 失败，则继续二分 Schema 关键字/嵌套结构。若仅 A 失败而 B 稳定，才有依据移除 DeepSeek 路径的
 `strict`；在数据出来之前不应直接修改生产请求。
 
-## 当前恢复缺口
+## 历史恢复缺口（采样时）
 
 `protocol_recovery_limit=1` 以 `turn_id` 计数。额度只在 episode 启停时清空，不会在以下边界重置：
 
@@ -369,8 +377,13 @@ Schema 失败，则继续二分 Schema 关键字/嵌套结构。若仅 A 失败�
 因此，早期 `USER_SEGMENT_UPDATED` 请求可消耗整个 turn 唯一的恢复额度；真正的
 `USER_INPUT_FINALIZED` 请求若再次返回无效 JSON，会直接进入 `LLM_RECOVERY_EXHAUSTED`。
 
-400ms `AgentDecisionScheduler` 是事件合并/限频器，不是周期轮询器。恢复耗尽后 `_run()` 回到
-`await queue.get()`，不会自行唤醒。现有回归测试还明确要求耗尽后不得自重试，以防旧式恢复风暴。
+采样时的 400ms `AgentDecisionScheduler` 只是事件合并/限频器，不是周期轮询器。恢复耗尽后 `_run()`
+回到 `await queue.get()`，不会自行唤醒。现有回归测试还明确要求耗尽后不得自重试，以防旧式恢复风暴。
+
+当前实现已经将这一缺口收敛到同一个固定400ms调度链路：恢复耗尽不会启动独立 retry/watchdog，
+但后续阶梯窗口可以在没有普通语义事件时进行一次有界 `forced_poll` 或最终
+`final_silence` 评估。普通事件始终优先；TTS/语音活动不参与覆盖或重置；最终窗口在 busy 状态下
+保留并只补发一次。该机制不增加 provider 并发，也不改变既有 recovery 次数上限。
 
 ## 精确上下文审计日志（2026-09-11）
 
@@ -402,7 +415,8 @@ JSONL 中精确比较异常请求和邻近正常请求，而无需根据 ASR/TTS
 2. 最小 Schema 是否仍会返回普通正文，从而形成 provider 侧最小复现；
 3. 生产 Schema 的复杂度、动态 runtime tail、上下文长度或特定输入语义中，哪一项显著提高失约概率；
 4. `LLM_OUTPUT_COMPAT_RECOVERED` 在真实长会话中的命中率，以及仍进入 recovery 的结构分布；
-5. provider 主因缓解后，finalized revision watchdog 和分阶段恢复预算是否仍有必要。
+5. 真实长会话中，单一心跳、阶梯窗口和有限 recovery 组合是否仍能降低“恢复耗尽后无回应”，
+   同时不引入新的强制请求风暴。
 
 ## 下一步诊断顺序
 
@@ -419,8 +433,8 @@ Prompt/Schema wire contract 对齐、短 canonical 示例、分层失败诊断�
    - 冻结 Chat/`json_object`，仅作为显式诊断对照，不自动回退。
 2. 在真实会话中统计严格成功、兼容成功、兼容拒绝、即时 recovery 成功和最终无回应，避免只观察总请求数。
 3. 对兼容拒绝样本只保存结构指纹；若确需人工审查正文，使用短时诊断开关且不得进入持久报告。
-4. JSON 主因明确后，再单独实现 finalized revision 恢复预算和有界 response watchdog；兜底不能掩盖
-   provider/schema 的高失败率。
+4. 持续统计 `forced_poll`、`final_silence`、普通覆盖和最终 pending 的比例；调度兜底不能掩盖
+   provider/schema 的高失败率，也不能扩展为第二个 watchdog 或无限自轮询。
 
 ## 验收条件
 
