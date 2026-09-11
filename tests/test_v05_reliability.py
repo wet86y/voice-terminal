@@ -165,6 +165,77 @@ class PlaybackDiagnosticsTests(unittest.TestCase):
         self.assertIsInstance(submitted["first_rendered_at"], float)
 
 
+class BargeInCompletionGuardTests(unittest.IsolatedAsyncioTestCase):
+    def _controller(self, *, progress):
+        controller = object.__new__(EpisodeController)
+        controller.state = SimpleNamespace(listening=True)
+        controller._barge_trace_state = (True, False, "speech")
+        controller.player = SimpleNamespace(progress=lambda _key: dict(progress))
+        workspace = SimpleNamespace(playback_started=True, playback_key="speech-1", generation=1)
+        handle = SimpleNamespace(
+            identity=("conversation-1", "request-1"), turn_id="turn-1", speech_id="speech-1",
+            workspace=workspace, overlap_start_ms=None,
+        )
+        controller.output = SimpleNamespace(active=True, handle=handle)
+        return controller
+
+    async def test_drained_append_window_returns_speech_to_normal_input_path(self) -> None:
+        controller = self._controller(progress={
+            "enqueued_ms": 500, "played_ms": 500, "output_estimated_ms": 500,
+        })
+        calls = []
+        resets = []
+
+        async def speech_activity(value, **kwargs):
+            calls.append((value, kwargs))
+
+        def unexpected_feed(*_args, **_kwargs):
+            self.fail("drained output must not enter the barge-in gate")
+
+        controller.episode = SimpleNamespace(closed=False, speech_activity=speech_activity)
+        controller.barge_in_gate = SimpleNamespace(feed=unexpected_feed, reset=lambda: resets.append(True))
+        activity = SimpleNamespace(is_speech=True)
+
+        returned = await controller._observe_activity(activity, SimpleNamespace(captured_at=1.0))
+
+        self.assertIs(returned, activity)
+        self.assertEqual(calls, [(True, {})])
+        self.assertEqual(resets, [True])
+        self.assertIsNone(controller._barge_trace_state)
+
+    async def test_remaining_audio_keeps_real_barge_in_cancellation(self) -> None:
+        controller = self._controller(progress={
+            "enqueued_ms": 500, "played_ms": 250, "output_estimated_ms": 250,
+        })
+        calls = []
+        resets = []
+        traces = []
+
+        async def speech_activity(value, **kwargs):
+            calls.append((value, kwargs))
+
+        async def log(kind, **payload):
+            traces.append((kind, payload))
+
+        controller.episode = SimpleNamespace(closed=False, speech_activity=speech_activity, log=log)
+        controller.barge_in_gate = SimpleNamespace(
+            feed=lambda *_args, **_kwargs: SimpleNamespace(
+                candidate=True, confirmed=True, duration_ms=300, reason="near_voice",
+            ),
+            reset=lambda: resets.append(True),
+        )
+        controller._near_voice_activity = lambda: True
+        controller._barge_in_protected_available = lambda: True
+        activity = SimpleNamespace(is_speech=True)
+
+        await controller._observe_activity(activity, SimpleNamespace(captured_at=1.0))
+
+        self.assertEqual(calls, [(True, {"interrupt_reason": "user_interrupted"})])
+        self.assertEqual(resets, [True])
+        self.assertEqual([kind for kind, _payload in traces], ["BARGE_IN_CONFIRMED"])
+        self.assertEqual(controller.output.handle.overlap_start_ms, 0)
+
+
 class TurnSettlementTests(unittest.IsolatedAsyncioTestCase):
     async def test_idle_agent_snapshot_does_not_cancel_unsettled_tts_prewarm(self) -> None:
         """A stale idle snapshot must not tear down a prewarm needed by dispatch."""

@@ -188,6 +188,47 @@ class MiniMaxTtsProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cache.closed)
         self.assertEqual([pcm async for pcm in other.audio_chunks()], [])
 
+    async def test_local_close_does_not_turn_receiver_cancellation_into_failure(self):
+        waiting = asyncio.Event()
+
+        class Socket:
+            async def recv(self):
+                await waiting.wait()
+
+            async def close(self):
+                pass
+
+        session = MiniMaxTtsSession(SimpleNamespace(receive_timeout_seconds=1))
+        session._socket = Socket()
+        session._receiver = asyncio.create_task(session._receive_loop())
+        await asyncio.sleep(0)
+
+        await session.close()
+
+        self.assertTrue(session.receive_finished)
+        self.assertIsNone(session._error)
+
+    async def test_unowned_receiver_cancellation_remains_a_failure(self):
+        waiting = asyncio.Event()
+
+        class Socket:
+            async def recv(self):
+                await waiting.wait()
+
+            async def close(self):
+                pass
+
+        session = MiniMaxTtsSession(SimpleNamespace(receive_timeout_seconds=1))
+        session._socket = Socket()
+        receiver = asyncio.create_task(session._receive_loop())
+        await asyncio.sleep(0)
+        receiver.cancel()
+        await asyncio.gather(receiver, return_exceptions=True)
+
+        self.assertIsInstance(session._error, MiniMaxTtsError)
+        self.assertIn("接收已取消", str(session._error))
+        await session.close()
+
     async def test_final_audio_on_task_finished_is_preserved(self):
         session = self.session_with_events([{"event": "task_finished", "data": {"audio": "0100"}}])
         await session._receive_loop()

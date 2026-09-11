@@ -307,6 +307,120 @@ def test_refinement_is_supplemental_and_never_changes_cancellation_scope():
     assert conversation.scope_id == scope and wakes[-1] == "USER_INPUT_REFINED"
 
 
+def test_same_text_asr_final_confirms_a_live_segment_request_without_reprompting():
+    async def scenario():
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        async def emit(*_args): pass
+
+        runtime = AgentEpisodeRuntime(
+            None, Registry(), SimpleNamespace(active=False, status="IDLE"), emit,
+            conversation=ConversationRuntime(), ledger=SessionLedger(),
+        )
+        runtime.episode_id = "conversation-a"
+        identity = (runtime.episode_id, "segment-request")
+        wakes = []
+        runtime._wake = lambda kind: wakes.append(kind)
+
+        await runtime.observe("USER_SEGMENT_UPDATED", turn_id="turn-a", text="给自己起个名字吧")
+        runtime.inputs["turn-a"]["asr_segment_dispatch"] = {
+            "identity": identity,
+            "text": "给自己起个名字吧",
+            "revision": runtime.inputs["turn-a"]["input_revision"],
+            "state": "running",
+        }
+        wakes.clear()
+
+        await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-a", text="给自己起个名字吧")
+
+        current = runtime.inputs["turn-a"]
+        assert current["final"] is True
+        assert current["asr_final_confirmation"]["identity"] == identity
+        assert wakes == []
+
+        await runtime._resolve_asr_final_confirmation(identity, "turn-a", "speak")
+
+        assert "asr_final_confirmation" not in runtime.inputs["turn-a"]
+        assert runtime.inputs["turn-a"]["asr_segment_dispatch"]["state"] == "speak"
+        assert wakes == []
+
+    asyncio.run(scenario())
+
+
+def test_same_text_asr_final_replays_when_segment_request_does_not_speak():
+    async def scenario():
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        async def emit(*_args): pass
+
+        runtime = AgentEpisodeRuntime(
+            None, Registry(), SimpleNamespace(active=False, status="IDLE"), emit,
+            conversation=ConversationRuntime(), ledger=SessionLedger(),
+        )
+        runtime.episode_id = "conversation-a"
+        identity = (runtime.episode_id, "segment-request")
+        wakes = []
+        runtime._wake = lambda kind: wakes.append(kind)
+
+        await runtime.observe("USER_SEGMENT_UPDATED", turn_id="turn-a", text="给自己起个名字吧")
+        runtime.inputs["turn-a"]["asr_segment_dispatch"] = {
+            "identity": identity,
+            "text": "给自己起个名字吧",
+            "revision": runtime.inputs["turn-a"]["input_revision"],
+            "state": "running",
+        }
+        wakes.clear()
+        await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-a", text="给自己起个名字吧")
+
+        await runtime._resolve_asr_final_confirmation(identity, "turn-a", "wait")
+
+        assert "asr_final_confirmation" not in runtime.inputs["turn-a"]
+        assert runtime.inputs["turn-a"]["asr_segment_dispatch"]["state"] == "wait"
+        assert wakes == ["USER_INPUT_FINALIZED"]
+
+    asyncio.run(scenario())
+
+
+def test_changed_asr_final_keeps_final_text_and_exposes_revision_to_model():
+    async def scenario():
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        async def emit(*_args): pass
+
+        runtime = AgentEpisodeRuntime(
+            None, Registry(), SimpleNamespace(active=False, status="IDLE", speak_snapshot={}), emit,
+            conversation=ConversationRuntime(), ledger=SessionLedger(),
+        )
+        runtime.episode_id = "conversation-a"
+        wakes = []
+        runtime._wake = lambda kind: wakes.append(kind)
+
+        await runtime.observe("USER_SEGMENT_UPDATED", turn_id="turn-a", text="帮我查明天")
+        wakes.clear()
+        await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-a", text="帮我查明天上海天气")
+
+        current = runtime.inputs["turn-a"]
+        assert current["text"] == "帮我查明天上海天气"
+        assert current["final"] is True
+        assert current["asr_final_revision"] == {
+            "relation": "suffix",
+            "streamed_text": "帮我查明天",
+            "final_text": "帮我查明天上海天气",
+        }
+        assert wakes == ["USER_INPUT_FINALIZED"]
+        rendered = "\n".join(frame["content"] for frame in runtime.messages({"USER_INPUT_FINALIZED"}))
+        assert "本轮 ASR 已从提前处理的流式稿完成最终确认" in rendered
+        assert "帮我查明天上海天气" in rendered
+
+    asyncio.run(scenario())
+
+
 def test_held_text_and_suspend_do_not_start_tts_before_release():
     async def scenario():
         async def emit(*_): pass

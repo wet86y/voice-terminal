@@ -141,12 +141,25 @@ class EpisodeController(RealtimeController):
     async def _observe_activity(self, activity, frame):
         if not self.state.listening or self.episode.closed:
             return None
-        if self.output.active and self.output.handle.workspace.playback_started:
+        handle = getattr(self.output, "handle", None)
+        if self.output.active and handle and handle.workspace.playback_started:
+            progress = self._playback_progress(handle)
+            # The output transaction deliberately remains active for a brief
+            # append window after TTS and PCM have drained.  That bookkeeping
+            # window is not audible output: classifying later user speech as
+            # barge-in would incorrectly settle a fully delivered sentence as
+            # ``interrupted/full``.  Preserve the handle for same-turn suffix
+            # appends, but return VAD ownership to the normal input path once
+            # the player's conservative device-tail estimate is empty.
+            if self.player and int(progress.get("remaining_ms", 0) or 0) <= 0:
+                self.barge_in_gate.reset()
+                self._barge_trace_state = None
+                await self.episode.speech_activity(bool(activity.is_speech))
+                return activity
             decision = self.barge_in_gate.feed(activity, now=frame.captured_at,
                                                near_voice=self._near_voice_activity(),
                                                protected_available=self._barge_in_protected_available())
-            h = self.output.handle
-            progress = self.player.progress(h.workspace.playback_key) if self.player else {}
+            h = handle
             evidence = {"identity": h.identity, "turn_id": h.turn_id, "speech_id": h.speech_id,
                         "output_generation": h.workspace.generation, "vad_speech": bool(activity.is_speech),
                         "near_voice": self._near_voice_activity(),
@@ -187,6 +200,30 @@ class EpisodeController(RealtimeController):
         else:
             await self.episode.speech_activity(bool(activity.is_speech))
         return activity
+
+    def _playback_progress(self, handle):
+        """Return player progress with a conservative audible-tail estimate.
+
+        ``PcmPlayer.progress`` intentionally exposes raw queue and output
+        positions.  Barge-in needs the derived remaining duration so it does
+        not confuse the output layer's post-playback append window with audio
+        the listener can still hear.
+        """
+
+        if not self.player:
+            return {}
+        progress = dict(self.player.progress(handle.workspace.playback_key) or {})
+        try:
+            if "enqueued_ms" not in progress or "output_estimated_ms" not in progress:
+                raise ValueError("playback progress is incomplete")
+            enqueued = int(progress.get("enqueued_ms", 0) or 0)
+            output_estimated = int(progress.get("output_estimated_ms", 0) or 0)
+            progress["remaining_ms"] = max(0, enqueued - output_estimated)
+        except (TypeError, ValueError):
+            # Preserve the existing conservative behavior if an alternate
+            # player implementation cannot provide numeric progress.
+            progress["remaining_ms"] = 1
+        return progress
 
     async def _input_committed(self, ws, token):
         if ws.final_text:
