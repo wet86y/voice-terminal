@@ -53,6 +53,16 @@ Agent runtime 只有一个 `AgentDecisionScheduler` 实例和一个 `_run()` 循
 
 普通事件在400ms边界合并为一次请求。普通语义事件包括 ASR segment/final、SenseVoice 有语义变化的 refinement、工具完成和 thinking barrier 完成等现有事件。`SPEECH_STARTED`、`SPEECH_ENDED`、`ENDPOINT_CANDIDATE`、`VOICE_ACTIVE` 只作为本地活动信号，不覆盖强制窗口；所有 `TTS_*` 事件完全属于输出侧生命周期，不进入调度 mailbox、不重置静默锚点、不触发普通或强制请求。
 
+### 流式 ASR final 确认与连续输入
+
+同一用户轮次的 ASR 有两个正常阶段：稳定分段 `USER_SEGMENT_UPDATED` 用于降低首响延迟，端点后的 `USER_INPUT_FINALIZED` 是输入完成的权威信号。若稳定分段已经以相同规范化文本发起请求，且该请求最终形成有效 `speak`，同文 final 只确认该输入已结束，不得再创建第二个普通 LLM 请求。若先前请求返回 `wait`、被取消或失败，则释放 final 回到普通调度，保证权威输入不会因推测失败而丢失。
+
+final 与流式稿不同时，final 始终是权威主文本；本地仅保守地区分“追加后缀”和“修订”，并将流式稿到最终稿的差异作为本轮语义修订上下文交给模型。模型沿用现有同轮 append/replace/wait 决策，不重复已传达的回答。该机制不改变 LLM JSON 信封协议，也不关闭 `USER_SEGMENT_UPDATED` 的低延迟抢发。
+
+连续用户输入采用 latest-wins 的对话策略，而非逐 `turn_id` 排队播放回答：只要每个已 final 的输入已写入 append-only session ledger，最终请求就应基于累计会话内容形成一次整体回答。没有单独 TTS 的中间 turn 不自动视为漏答；只有已 final 内容未进入后续模型上下文，或在用户明显转题后补播过时回答，才属于需要修复的行为偏差。该策略持续通过真实会话观察，不因日志中缺少单独 speech transaction 而改为 FIFO。
+
+输出 handle 在 PCM 耗尽后仍保留一秒同轮追加窗口；它是逻辑续写边界而非可听音频。barge-in 只能在播放器的保守 `remaining_ms > 0` 时取消语音，避免播尽后的新用户发言将完整 delivery 错记为 `interrupted/full`。MiniMax one-shot 会话在本地主动 `close()` 时取消 receiver 属于正常资源回收，不应记录为未确认 `task_finished` 的接收失败；非本地关闭的 receiver 取消仍保留为错误。
+
 用户有内容的 `USER_INPUT_FINALIZED`，或有语义变化的非空 `USER_INPUT_REFINED`，会重新 arm 当前静默阶梯。无普通语义事件时，窗口 3、6、9、16、22 选择 `forced_poll`，窗口 25 选择一次 `final_silence`；窗口 10 仅表示进入慢速阶段。普通事件和强制窗口在同一个400ms边界同时存在时，普通调度覆盖强制调度，记录 `covered_by_normal_dispatch`，不添加强制提示词、不创建 `system_check_id`，也不在普通请求后补发强制请求。普通强制窗口在 busy 状态下直接跳过；最终窗口在 busy 状态下保留 `final_pending`，恢复空闲后只补发一次。
 
 三类 dispatch 仍共用 `AgentEpisodeRuntime._step()`、`_provider_stream()` 和原有 provider 参数，只在 request tail 增加互斥的 `forced_poll` 或 `final_silence` 提示词。system-check 使用独立 `system_check_id`，不开始用户 turn、不创建用户 `InputRecord`；已听到的 speech 仍通过 assistant delivery 写入 ledger。active request、TTS 播放/待播内容或用户输入繁忙时不会创建并发 LLM 请求。恢复/backoff 继续使用既有有限队列和优先级，不拆出第二个调度器或 watchdog。

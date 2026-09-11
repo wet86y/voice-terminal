@@ -133,6 +133,23 @@ def semantic_text(text: str) -> str:
     return "".join(result)
 
 
+def asr_final_relation(streamed: str, finalized: str) -> str:
+    """Classify a final ASR text relative to its streamed predecessor.
+
+    This deliberately stays lexical and conservative.  Only an identical
+    normalized transcript is a confirmation; any other change reaches the
+    model through the existing same-turn revision/output path.
+    """
+
+    before = semantic_text(streamed)
+    after = semantic_text(finalized)
+    if before == after:
+        return "confirmed"
+    if before and after.startswith(before):
+        return "suffix"
+    return "rewrite"
+
+
 PROMPT = """你是持续监听的中文语音 Agent。你的每次最终 content 都是必填的本地语音状态声明，不是普通聊天正文。
 最终 content 必须且只能是一个 JSON 对象，顶层字段必须且只能有 speak 和 actions。speak 的 state、emotion、text 以及顶层 actions 始终必填，不允许省略。state 只能是 speak、cancel、wait；emotion 只能是 calm、happy、sad、angry、fearful、disgusted、surprised；actions 没有动作时也必须为 []。state=speak 时 text 必须非空；state=cancel 或 state=wait 时 text 必须为 ""。禁止 JSON 外解释、Markdown、代码围栏或普通正文；thinking/reasoning 可以使用，但不能替代此 JSON。
 合法 speak 示例：{"speak":{"state":"speak","emotion":"calm","text":"好的。"},"actions":[]}
@@ -1254,6 +1271,7 @@ class AgentEpisodeRuntime:
         if turn_id:
             self.last_turn_id = turn_id
         changed = False
+        held_final_confirmation = None
         if kind == "USER_INPUT_REFINED" and turn_id:
             previous = self.inputs.get(turn_id, {})
             baseline = previous.get("refined_text") or previous.get("text", "")
@@ -1273,12 +1291,45 @@ class AgentEpisodeRuntime:
             previous = self.inputs.get(turn_id, {})
             changed = semantic_text(previous.get("text", "")) != semantic_text(text)
             revision = int(previous.get("input_revision") or 0) + (1 if changed or kind == "USER_INPUT_FINALIZED" else 0)
+            asr_final_revision = None
+            if kind == "USER_INPUT_FINALIZED":
+                streamed = str(previous.get("text") or "")
+                relation = asr_final_relation(streamed, text)
+                dispatch = previous.get("asr_segment_dispatch")
+                if streamed.strip() and relation != "confirmed":
+                    # The final remains authoritative primary text.  This
+                    # compact semantic delta lets the model reuse the normal
+                    # same-turn append/replace behavior rather than treating
+                    # an ASR correction as an unrelated new utterance.
+                    asr_final_revision = {
+                        "relation": relation,
+                        "streamed_text": streamed,
+                        "final_text": text,
+                    }
+                elif (
+                    relation == "confirmed"
+                    and isinstance(dispatch, dict)
+                    and dispatch.get("text") == semantic_text(text)
+                    and dispatch.get("state") in {"running", "speak"}
+                    and isinstance(dispatch.get("identity"), tuple)
+                ):
+                    held_final_confirmation = dict(dispatch)
             previous_sentences = previous.get("sentences") if isinstance(previous.get("sentences"), list) else []
             incoming_sentences = payload.get("sentences") if isinstance(payload.get("sentences"), list) else None
-            self.inputs[turn_id] = {**previous, **payload, "text": text,
-                                    "input_revision": revision,
-                                    "final": kind == "USER_INPUT_FINALIZED"
-                                    or previous.get("final", False)}
+            updated = {**previous, **payload, "text": text,
+                       "input_revision": revision,
+                       "final": kind == "USER_INPUT_FINALIZED"
+                       or previous.get("final", False)}
+            if kind == "USER_INPUT_FINALIZED":
+                updated.pop("asr_final_revision", None)
+                if asr_final_revision is not None:
+                    updated["asr_final_revision"] = asr_final_revision
+                if held_final_confirmation is not None:
+                    updated["asr_final_confirmation"] = {
+                        "identity": held_final_confirmation["identity"],
+                        "input_revision": revision,
+                    }
+            self.inputs[turn_id] = updated
             if incoming_sentences is not None:
                 old_by_id = {
                     int(item.get("sentence_id")): item for item in previous_sentences
@@ -1336,6 +1387,23 @@ class AgentEpisodeRuntime:
             except RuntimeError:
                 pass
         await self.log(kind, **({"text": text} if text is not None else {}), **payload)
+        if held_final_confirmation is not None:
+            # Do not enqueue a duplicate ordinary request while the matching
+            # speculative segment request is still deciding.  Its terminal
+            # result will either consume this final as a confirmation or
+            # release it via ``_resolve_asr_final_confirmation``.
+            if held_final_confirmation.get("state") == "speak":
+                await self._resolve_asr_final_confirmation(
+                    held_final_confirmation["identity"], turn_id, "speak",
+                )
+            else:
+                await self.log(
+                    "ASR_FINAL_CONFIRMATION_DEFERRED",
+                    identity=held_final_confirmation["identity"],
+                    turn_id=turn_id,
+                    input_revision=revision,
+                )
+            return
         if kind in {"SPEECH_STARTED", "SPEECH_ENDED", "ENDPOINT_CANDIDATE"}:
             # Activity itself never bypasses the provider gate, but it still
             # enters the scheduler inbox so the next tick can combine it with
@@ -1527,6 +1595,29 @@ class AgentEpisodeRuntime:
         self.active_request_identity = identity
         self.active_request_source_turn_id = source_turn_id
         self.active_request_kinds = set(kinds)
+        # A stable streamed ASR segment may be dispatched before its endpoint
+        # final arrives.  Retain only enough local correlation to decide
+        # whether that later final is a confirmation or needs a real revision
+        # request.  It is internal state and never crosses the model boundary.
+        if (
+            not recovery
+            and candidate is None
+            and "USER_SEGMENT_UPDATED" in kinds
+            and "USER_INPUT_FINALIZED" not in kinds
+            and source_turn_id
+        ):
+            current = self.inputs.get(source_turn_id, {})
+            streamed = str(current.get("text") or "")
+            if streamed.strip() and not current.get("final"):
+                self.inputs[source_turn_id] = {
+                    **current,
+                    "asr_segment_dispatch": {
+                        "identity": identity,
+                        "text": semantic_text(streamed),
+                        "revision": int(current.get("input_revision") or 0),
+                        "state": "running",
+                    },
+                }
         self.active_recovery = recovery_signal
         self.active_dispatch_context = dispatch_context
         self.scheduler_last_dispatch_at = time.monotonic()
@@ -1764,6 +1855,12 @@ class AgentEpisodeRuntime:
             if latest.get("final") and not self.output.active and not retryable:
                 await self._emit_turn_settled(identity, source_turn_id, "agent_error")
         finally:
+            # A speculative segment request can terminate before it reaches a
+            # valid decision (transport failure, cancellation, schema error).
+            # If its matching final was held as a confirmation, release that
+            # final back to the ordinary scheduler instead of silently losing
+            # the user's completed input.
+            await self._resolve_asr_final_confirmation(identity, source_turn_id, "failed")
             self.active_request_count = max(0, self.active_request_count - 1)
             self.active_request = None
             self.active_request_identity = None
@@ -1785,6 +1882,48 @@ class AgentEpisodeRuntime:
                 self._system_check_turn_ids.discard(source_turn_id)
         self.state = "WAITING_EVENT" if self.episode_id else "IDLE"
         await self.emit("agent.episode", self.snapshot(include_history=False))
+
+    async def _resolve_asr_final_confirmation(self, identity, turn_id, outcome):
+        """Settle a held final after its matching speculative request ends.
+
+        A same-text final is held only while its stable streamed predecessor
+        has a live request.  ``speak`` consumes it as a confirmation; every
+        other result releases the authoritative final for an ordinary request.
+        """
+
+        if not turn_id or not isinstance(identity, tuple):
+            return
+        current = self.inputs.get(turn_id)
+        if not isinstance(current, dict):
+            return
+        dispatch = current.get("asr_segment_dispatch")
+        pending = current.get("asr_final_confirmation")
+        if not isinstance(dispatch, dict) or dispatch.get("identity") != identity:
+            return
+        if dispatch.get("state") == "running":
+            dispatch["state"] = outcome
+        if not isinstance(pending, dict) or pending.get("identity") != identity:
+            return
+        updated = dict(current)
+        updated.pop("asr_final_confirmation", None)
+        self.inputs[turn_id] = updated
+        if outcome == "speak":
+            await self.log(
+                "ASR_FINAL_CONFIRMED",
+                identity=identity,
+                turn_id=turn_id,
+                relation="confirmed",
+                input_revision=pending.get("input_revision"),
+            )
+            return
+        await self.log(
+            "ASR_FINAL_REPLAY_REQUIRED",
+            identity=identity,
+            turn_id=turn_id,
+            reason=f"segment_{outcome}",
+            input_revision=pending.get("input_revision"),
+        )
+        self._wake("USER_INPUT_FINALIZED")
 
     async def _run(self):
         """Run the one non-blocking scheduler loop and its fixed heartbeat."""
@@ -2044,6 +2183,22 @@ class AgentEpisodeRuntime:
             ))
         messages.extend(self._persona_context_frames())
         messages.extend(self.context_projector.project(self.ledger, semantic))
+        asr_final_revision = current.get("asr_final_revision")
+        if isinstance(asr_final_revision, dict):
+            streamed = str(asr_final_revision.get("streamed_text") or "")[:800]
+            finalized = str(asr_final_revision.get("final_text") or "")[:800]
+            if streamed and finalized:
+                messages.append(ContextFrame.make(
+                    ContextLane.REQUEST_TAIL,
+                    "system",
+                    "本轮 ASR 已从提前处理的流式稿完成最终确认。最终稿是权威用户输入；"
+                    "请仅针对新增或修订信息决定追加、替换或等待，不要重复已经传达的回答："
+                    + json.dumps({
+                        "relation": asr_final_revision.get("relation"),
+                        "streamed": streamed,
+                        "final": finalized,
+                    }, ensure_ascii=False, separators=(",", ":")),
+                ))
         # Sentence revisions, event IDs, tick timestamps and performance
         # counters are local scheduling diagnostics.  The model retains the
         # semantic output control it needs: its current speech target and the
@@ -2930,6 +3085,9 @@ class AgentEpisodeRuntime:
                     if (isinstance(snapshot, dict)
                             and snapshot.get("turn_id") == source_turn_id):
                         self._system_check_output_turn_ids.add(source_turn_id)
+            await self._resolve_asr_final_confirmation(
+                identity, source_turn_id, envelope.speak.state,
+            )
             await self._dispatch_actions_v06(identity, source_turn_id, envelope)
             record_audit_outcome(
                 validation,

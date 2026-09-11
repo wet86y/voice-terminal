@@ -439,7 +439,16 @@ class MiniMaxTtsSession:
                     self._generation_done.set()
                     break
         except asyncio.CancelledError:
-            self._error = MiniMaxTtsError("MiniMax TTS 接收已取消，未确认任务完成")
+            # ``close`` marks the transaction closed before cancelling this
+            # task.  That is normal local resource cleanup after the speech
+            # pipeline has drained its usable PCM; recording it as a receive
+            # failure made every successful one-shot TTS look unhealthy.
+            # A cancellation not initiated by local close remains an error:
+            # it can still represent an aborted receiver or lost transport.
+            if not self._closed:
+                self._error = MiniMaxTtsError("MiniMax TTS 接收已取消，未确认任务完成")
+            else:
+                logger.debug("minimax.receive_cancelled_during_local_close")
             raise
         except Exception as exc:
             self._error = MiniMaxTtsError(f"MiniMax TTS 接收失败（未收到 task_finished）：{exc}")
