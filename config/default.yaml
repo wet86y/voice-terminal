@@ -16,6 +16,14 @@ tools:
   web_search: true
   allowed_roots: [docs]
 
+# Episode-scoped Markdown context. Files are read when a new Agent episode
+# starts and remain frozen for that episode.
+persona:
+  directory: config/persona
+  personality_file: personality.md
+  user_file: user.md
+  instructions_file: instructions.md
+
 audio:
   input_device: "麦克风阵列 (适用于数字麦克风的英特尔® 智音技术)"
   # Let Windows select the active default device. This avoids pinning an MME

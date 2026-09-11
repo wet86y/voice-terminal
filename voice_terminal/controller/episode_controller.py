@@ -16,9 +16,10 @@ logger = logging.getLogger(__name__)
 
 
 class EpisodeController(RealtimeController):
-    def __init__(self, *, agent_options, **kwargs):
+    def __init__(self, *, agent_options, persona_config=None, **kwargs):
         super().__init__(**kwargs)
         self.agent_options = agent_options
+        self.persona_config = persona_config
         self.output = EpisodeSpeechOutput(self)
         self.episode = self._make_episode()
         self._endpoint_context = None
@@ -34,7 +35,7 @@ class EpisodeController(RealtimeController):
         runtime = AgentEpisodeRuntime(self.llm, self.registry, self.output, self._agent_event,
                                       conversation=self.conversation, ledger=self.history,
                                       options=self.agent_options, tools_enabled=self.options.tools,
-                                      reasoning_mode=mode)
+                                      reasoning_mode=mode, persona_config=self.persona_config)
         self.output.runtime = runtime
         return runtime
 
@@ -60,18 +61,20 @@ class EpisodeController(RealtimeController):
                 termination=str(payload.get("status") or "completed"),
             )
             self.history.commit_delivery(str(payload.get("speech_id") or ""), str(payload.get("text") or ""), delivery)
-            await self._settle_committed_turn(
-                str(payload.get("turn_id") or ""),
-                outcome=str(payload.get("status") or "completed"),
-                speech_id=str(payload.get("speech_id") or "") or None,
-                latency=payload.get("latency") if isinstance(payload.get("latency"), dict) else None,
-            )
+            if payload.get("owner_scope") != "system_check":
+                await self._settle_committed_turn(
+                    str(payload.get("turn_id") or ""),
+                    outcome=str(payload.get("status") or "completed"),
+                    speech_id=str(payload.get("speech_id") or "") or None,
+                    latency=payload.get("latency") if isinstance(payload.get("latency"), dict) else None,
+                )
         elif kind == "turn.latency":
             latency = payload.get("latency")
             update = getattr(self.history, "update_turn_latency", None)
-            if callable(update) and isinstance(latency, dict):
+            if (payload.get("owner_scope") != "system_check"
+                    and callable(update) and isinstance(latency, dict)):
                 update(str(payload.get("turn_id") or ""), latency)
-            if isinstance(latency, dict):
+            if payload.get("owner_scope") != "system_check" and isinstance(latency, dict):
                 current_values = dict(self.state.latency.get("values") or {})
                 for key, value in latency.items():
                     if key in current_values and (value is None or isinstance(value, (int, float))):

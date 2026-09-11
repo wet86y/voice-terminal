@@ -211,10 +211,21 @@ class ToolConfig:
 
 
 @dataclass(frozen=True)
+class PersonaConfig:
+    """Paths for the episode-scoped Markdown personality documents."""
+
+    directory: Path = Path("config/persona")
+    personality_file: str = "personality.md"
+    user_file: str = "user.md"
+    instructions_file: str = "instructions.md"
+
+
+@dataclass(frozen=True)
 class AppConfig:
     smart_turn: InputOptions = field(default_factory=InputOptions)
     agent: AgentOptions = field(default_factory=AgentOptions)
     tools: ToolConfig = field(default_factory=ToolConfig)
+    persona: PersonaConfig = field(default_factory=PersonaConfig)
     model_dir: Path = Path(r"D:\模型\voice-terminal")
     debug_audio_capture: bool = False
     audio: AudioConfig = field(default_factory=AudioConfig)
@@ -273,6 +284,7 @@ class AppConfig:
         bridge = _section(data, "text_bridge")
         server = _section(data, "server")
         worker = _section(data, "asr_worker")
+        persona = _section(data, "persona")
 
         configured_llm_provider = _string(llm.get("provider"), "deepseek")
         llm_provider_override = os.environ.get("VOICE_LLM_PROVIDER", "").strip()
@@ -345,6 +357,12 @@ class AppConfig:
                              web_search=_bool(tool_data.get("web_search"), True),
                              allowed_roots=tuple(item for item in tool_data.get("allowed_roots", ["docs"])
                                                  if isinstance(item, str) and item.strip()) or ("docs",)),
+            persona=PersonaConfig(
+                directory=path_or_none(persona.get("directory")) or root / "config" / "persona",
+                personality_file=_string(persona.get("personality_file"), "personality.md"),
+                user_file=_string(persona.get("user_file"), "user.md"),
+                instructions_file=_string(persona.get("instructions_file"), "instructions.md"),
+            ),
             model_dir=model_dir,
             debug_audio_capture=_bool(
                 data.get("debug_audio_capture"),
