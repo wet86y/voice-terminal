@@ -965,16 +965,8 @@ class AgentEpisodeRuntime:
             return
         if not self.scheduler.accepts(kind):
             return
-        # Protocol recovery is speculative: its failed predecessor was never
-        # committed to the conversation ledger.  If a newer authoritative
-        # input/refinement arrives while that recovery is queued or running,
-        # letting the recovery speak first can produce two answers for one
-        # turn (the recovery answer followed by the normal answer).  This is
-        # exactly the duplicate-TTS shape seen in the live 2026-09-10 trace.
-        # Ordinary requests remain coalesced; only the disposable recovery
-        # transaction is preempted here.
         if kind in {"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"}:
-            self._supersede_recovery(kind)
+            self._supersede_recovery_without_request_cancel(kind)
         was_pending = bool(self.pending)
         self.pending.add(kind)
         try:
@@ -995,63 +987,52 @@ class AgentEpisodeRuntime:
             self.queue.put_nowait(True)
         if self.runner is None or self.runner.done():
             self.runner = asyncio.create_task(self._run(), name="agent-episode")
-        # Never cancel a live request for ordinary input, refinement, or tool
-        # arrivals.  They are coalesced into the next scheduler tick.
+        # Once any ordinary, recovery, forced-poll, or final-silence request
+        # has started, later input never preempts it.  New events remain in
+        # the shared mailbox for the next idle heartbeat.
 
-    def _supersede_recovery(self, kind: str) -> None:
-        """Drop speculative recovery work when newer input supersedes it.
+    def _supersede_recovery_without_request_cancel(self, kind: str) -> None:
+        """Preserve queue/output supersede behavior without cancelling LLM.
 
-        A recovery is intentionally different from a normal in-flight LLM
-        request: it repairs a protocol failure and has no committed result of
-        its own.  Keeping it alive after a same-turn final/refined input lets
-        both requests author speech for one turn.  Stop the local output
-        synchronously before cancelling the provider task so late PCM is
-        rejected by the player generation gate.
+        The former implementation also cancelled ``active_request``.  That
+        single operation is intentionally removed; unstarted recovery work
+        and speculative output retain their existing invalidation behavior.
         """
+
         queued = len(self.recovery_queue)
         if queued:
             self.recovery_queue.clear()
-
         running = self.active_recovery is not None
-        request = self.active_request
-        if running and request is not None and request is not asyncio.current_task() and not request.done():
+        if running:
             cancel_output = getattr(self.output, "cancel_all", None)
             if callable(cancel_output):
                 cancel_output("superseded_recovery")
-            request.cancel(f"superseded_recovery:{kind}")
+        if not queued and not running:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            identity = self.identity()
+            turn_id = self._identity_turns.get(identity, self.last_turn_id)
+            loop.create_task(self.log(
+                "LLM_RECOVERY_SUPERSEDED",
+                identity=identity,
+                turn_id=turn_id,
+                superseded_by=kind,
+                queued=queued,
+                running=running,
+                cancelled_request=False,
+            ))
+        except RuntimeError:
+            pass
 
-        if queued or running:
-            try:
-                loop = asyncio.get_running_loop()
-                identity = self.identity()
-                turn_id = self._identity_turns.get(identity, self.last_turn_id)
-                loop.create_task(self.log(
-                    "LLM_RECOVERY_SUPERSEDED",
-                    identity=identity, turn_id=turn_id,
-                    superseded_by=kind,
-                    queued=queued,
-                    running=running,
-                ))
-            except RuntimeError:
-                pass
-
-    def _supersede_system_check(self, kind: str) -> None:
-        """Invalidate speculative system-check work when user input arrives."""
+    def _supersede_system_output_without_request_cancel(self, kind: str) -> None:
+        """Invalidate only unplayed system-check output, never its LLM task."""
 
         context = self.active_dispatch_context
         running = bool(
             isinstance(context, dict)
             and context.get("dispatch_kind") in {"forced_poll", "final_silence"}
         )
-        request = self.active_request
-        cancelled_request = False
-        if running and request is not None and request is not asyncio.current_task() and not request.done():
-            request.cancel(f"superseded_system_check:{kind}")
-            cancelled_request = True
-
-        # Do not interrupt speech that has crossed the real playback boundary.
-        # Only an unplayed speculative system result is invalidated here; the
-        # normal barge-in path remains the authority for audible output.
         cancelled_output = 0
         candidates = ([getattr(self.output, "handle", None)]
                       + list(getattr(self.output, "_pending", []) or []))
@@ -1074,9 +1055,11 @@ class AgentEpisodeRuntime:
                 turn_id = self._identity_turns.get(identity, self.last_turn_id)
                 loop.create_task(self.log(
                     "SYSTEM_CHECK_SUPERSEDED",
-                    identity=identity, turn_id=turn_id,
+                    identity=identity,
+                    turn_id=turn_id,
                     superseded_by=kind,
-                    cancelled_request=cancelled_request,
+                    cancelled_request=False,
+                    request_continued=running,
                     cancelled_output=cancelled_output,
                 ))
             except RuntimeError:
@@ -1368,8 +1351,10 @@ class AgentEpisodeRuntime:
         )
         if valid_anchor:
             # A meaningful user event is the only operation that re-arms the
-            # silence ladder.  TTS and microphone activity never touch it.
-            self._supersede_system_check(kind)
+            # silence ladder.  Re-arming invalidates only an unstarted
+            # final_pending candidate; it never cancels an in-flight request.
+            # TTS and microphone activity never touch the ladder.
+            self._supersede_system_output_without_request_cancel(kind)
             generation = self.scheduler.arm(
                 now=time.monotonic(),
                 wall_time=(payload.get("occurred_at")
@@ -1699,11 +1684,12 @@ class AgentEpisodeRuntime:
                        owner_scope=signal.owner_scope,
                        system_check_id=signal.system_check_id)
         if scheduler_generation != self.scheduler.generation:
-            # A meaningful final/refined input re-armed the ladder while the
-            # recovery diagnostic was being emitted.  The newer input owns the
-            # next request, so do not let the old correction speak first.
+            # The provider task has not been created yet.  Preserve the
+            # existing pre-dispatch ownership rule without cancelling any
+            # in-flight request.
             await self.log("LLM_RECOVERY_SUPERSEDED", turn_id=signal.source_turn_id,
-                           error_id=signal.error_id, reason="new_input_during_dispatch")
+                           error_id=signal.error_id, reason="new_input_during_dispatch",
+                           cancelled_request=False)
             return False
         started = await self._start_dispatch(
             {"EXCEPTION_RECOVERY", signal.code}, recovery_signal=signal,
@@ -2334,13 +2320,6 @@ class AgentEpisodeRuntime:
             )
         return self.provider.stream_events(messages, json_mode=True)
 
-    def _system_check_is_stale(self, dispatch_context):
-        return bool(
-            isinstance(dispatch_context, dict)
-            and dispatch_context.get("dispatch_kind") in {"forced_poll", "final_silence"}
-            and dispatch_context.get("generation") != self.scheduler.generation
-        )
-
     def _launch_shadow(self, messages, turn_id: str | None, request_id: str | None) -> None:
         if not turn_id or not bool(getattr(self.provider, "shadow_enabled", False)):
             return
@@ -2705,10 +2684,6 @@ class AgentEpisodeRuntime:
         )
         if self.closed or not self.episode_id:
             return
-        if self._system_check_is_stale(dispatch_context):
-            await self.log("SYSTEM_CHECK_STALE", identity=identity, turn_id=source_turn_id,
-                           system_check_id=dispatch_context.get("system_check_id"))
-            return
         messages, compacted = self._fit_context(messages, [])
         # Cache history is intentionally never summarized, dropped or
         # rewritten.  ``over_budget_base`` is an observation, not a
@@ -2959,10 +2934,6 @@ class AgentEpisodeRuntime:
                 async for item in stream:
                     if self.closed or not self.episode_id:
                         return
-                    if self._system_check_is_stale(dispatch_context):
-                        await self.log("SYSTEM_CHECK_STALE", identity=identity, turn_id=source_turn_id,
-                                       system_check_id=dispatch_context.get("system_check_id"))
-                        return
                     if item["type"] == "finish":
                         finished = True
                         metrics = item.get("stream_metrics")
@@ -3063,10 +3034,6 @@ class AgentEpisodeRuntime:
                 )
             if responses_transport:
                 envelope = self._normalize_schema_envelope(envelope)
-            if self._system_check_is_stale(dispatch_context):
-                await self.log("SYSTEM_CHECK_STALE", identity=identity, turn_id=source_turn_id,
-                               system_check_id=dispatch_context.get("system_check_id"))
-                return
             schema_diagnostics = provider_schema_diagnostics(parser.raw, audit_schema)
             if reasoning_effort == "low" and source_turn_id:
                 expected_prefix = self._thinking_prefix_by_turn.pop(source_turn_id, "")

@@ -54,7 +54,7 @@ Agent episode 在第一次真正建立 `episode_id` 时读取 `config/persona/` 
 
 Responses 边界因供应商 strict 子集要求所有声明属性均为 required：`wait/cancel` 使用空 `speak.text`，异构 action 使用中性占位字段；进入 Agent 后立即投影回原有内部契约。本地信封校验和 action adapter 不得因 provider 返回 `completed` 或标记 `strict=true` 而跳过。
 
-DeepSeek provider 的输出预算固定为 `393216`（384K tokens），覆盖 reasoning 与可见正文。Agent 在 provider 调用前将完整请求写为 `request_context` version 3，在唯一终态处将完整或部分输出写为 `request_outcome` version 2。取消通过 `Task.cancel(reason)` 将生命周期来源传入终态审计；新用户输入淘汰恢复请求或 system-check，与播放期 `user_interrupted` 是不同原因，不能合并统计。审计写入使用独立后台队列和轮转文件，不参与实时调度，也不进入会话 ledger。
+DeepSeek provider 的输出预算固定为 `393216`（384K tokens），覆盖 reasoning 与可见正文。Agent 在 provider 调用前将完整请求写为 `request_context` version 3，在唯一终态处将完整或部分输出写为 `request_outcome` version 2。取消通过 `Task.cancel(reason)` 将真正的生命周期来源传入终态审计。新用户输入不得淘汰已启动的普通、恢复或 system-check 请求；它只能进入统一心跳邮箱。历史审计中的 `superseded_recovery:*` 和 `superseded_system_check:*` 属于已移除的旧抢占链路，必须与播放期 `user_interrupted` 分开统计。审计写入使用独立后台队列和轮转文件，不参与实时调度，也不进入会话 ledger。
 
 ## AgentDecisionScheduler 调度契约
 
@@ -72,6 +72,6 @@ final 与流式稿不同时，final 始终是权威主文本；本地仅保守�
 
 输出 handle 在 PCM 耗尽后仍保留一秒同轮追加窗口；它是逻辑续写边界而非可听音频。barge-in 只能在播放器的保守 `remaining_ms > 0` 时取消语音，避免播尽后的新用户发言将完整 delivery 错记为 `interrupted/full`。MiniMax one-shot 会话在本地主动 `close()` 时取消 receiver 属于正常资源回收，不应记录为未确认 `task_finished` 的接收失败；非本地关闭的 receiver 取消仍保留为错误。
 
-用户有内容的 `USER_INPUT_FINALIZED`，或有语义变化的非空 `USER_INPUT_REFINED`，会重新 arm 当前静默阶梯。无普通语义事件时，窗口 3、6、9、16、22 选择 `forced_poll`，窗口 25 选择一次 `final_silence`；窗口 10 仅表示进入慢速阶段。普通事件和强制窗口在同一个400ms边界同时存在时，普通调度覆盖强制调度，记录 `covered_by_normal_dispatch`，不添加强制提示词、不创建 `system_check_id`，也不在普通请求后补发强制请求。普通强制窗口在 busy 状态下直接跳过；最终窗口在 busy 状态下保留 `final_pending`，恢复空闲后只补发一次。
+用户有内容的 `USER_INPUT_FINALIZED`，或有语义变化的非空 `USER_INPUT_REFINED`，会重新 arm 当前静默阶梯。无普通语义事件时，窗口 3、6、9、16、22 选择 `forced_poll`，窗口 25 选择一次 `final_silence`；窗口 10 仅表示进入慢速阶段。普通事件和强制窗口在同一个400ms边界同时存在时，普通调度覆盖强制调度，记录 `covered_by_normal_dispatch`，不添加强制提示词、不创建 `system_check_id`，也不在普通请求后补发强制请求。普通强制窗口在 busy 状态下直接跳过；最终窗口是独立分支，在 busy 状态下保留 `final_pending`，恢复空闲后只补发一次。若等待期间出现新的有效用户输入，旧的最终静默条件失效，新输入仅重置尚未发出的 `final_pending` 并重新计时，不取消已启动的任何 LLM 请求。
 
 三类 dispatch 仍共用 `AgentEpisodeRuntime._step()`、`_provider_stream()` 和原有 provider 参数，只在 request tail 增加互斥的 `forced_poll` 或 `final_silence` 提示词。system-check 使用独立 `system_check_id`，不开始用户 turn、不创建用户 `InputRecord`；已听到的 speech 仍通过 assistant delivery 写入 ledger。active request、TTS 播放/待播内容或用户输入繁忙时不会创建并发 LLM 请求。恢复/backoff 继续使用既有有限队列和优先级，不拆出第二个调度器或 watchdog。
