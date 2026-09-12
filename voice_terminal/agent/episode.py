@@ -1494,12 +1494,12 @@ class AgentEpisodeRuntime:
         except Exception:
             return True
 
-    def _dispatch_allowed(self, *, respect_backoff=True):
+    def _dispatch_allowed(self, *, respect_backoff=True, allow_during_user_speech: bool = False):
         if self.closed or not self.episode_id:
             return False
         if self.active_request is not None:
             return False
-        if self.user_speaking is True:
+        if self.user_speaking is True and not allow_during_user_speech:
             return False
         if self._tts_busy():
             return False
@@ -1518,7 +1518,8 @@ class AgentEpisodeRuntime:
             return "backoff"
         return "not_allowed"
 
-    async def _start_dispatch(self, kinds, *, recovery_signal=None, candidate=None):
+    async def _start_dispatch(self, kinds, *, recovery_signal=None, candidate=None,
+                              allow_during_user_speech: bool = False):
         """Create one request task without ever waiting for its result."""
 
         recovery = recovery_signal is not None
@@ -1540,7 +1541,10 @@ class AgentEpisodeRuntime:
                 "owner_scope": "system_check",
             })
 
-        if not self._dispatch_allowed(respect_backoff=not recovery):
+        if not self._dispatch_allowed(
+            respect_backoff=not recovery,
+            allow_during_user_speech=allow_during_user_speech,
+        ):
             return False
         # A forced request is only valid while the mailbox is still empty of
         # ordinary semantics.  The re-check closes the small await/log race
@@ -1715,11 +1719,17 @@ class AgentEpisodeRuntime:
                 return
             if not self.scheduler.normal_due(meaningful, at_heartbeat=True):
                 return
-            if not self._dispatch_allowed():
+            # Ordinary mailbox semantics may precompute while the user is
+            # speaking.  This bypasses only the microphone-activity gate;
+            # active request, output, backoff, and lifecycle checks still
+            # apply inside both checks below.
+            if not self._dispatch_allowed(allow_during_user_speech=True):
                 return
             kinds = set(self.pending)
             self.pending.clear()
-            if not await self._start_dispatch(kinds):
+            if not await self._start_dispatch(
+                kinds, allow_during_user_speech=True,
+            ):
                 self.pending.update(kinds)
             return
 
