@@ -217,7 +217,7 @@ def test_responses_payload_separates_instructions_and_enables_strict_schema():
     assert payload["input"][0]["content"][0] == {"type": "input_text", "text": "hello"}
 
 
-def test_context_audit_captures_content_free_wire_manifest():
+def test_context_audit_captures_full_wire_payload_and_manifest():
     client = DeepSeekClient(
         base_url="https://example.invalid", model="deepseek-v4-flash", api_key="secret-key",
         transport="responses", thinking="disabled", max_output_tokens=512,
@@ -253,9 +253,13 @@ def test_context_audit_captures_content_free_wire_manifest():
     assert snapshot["schema_sha256"]
     assert snapshot["lane_chars"] == {"static_instructions": 11, "history": 18}
     assert snapshot["message_manifest"][1]["content_sha256"]
+    assert snapshot["contains_conversation_content"] is True
+    assert snapshot["messages"] == messages
+    assert snapshot["schema"] == schema
+    assert snapshot["wire_payload"] == expected
     serialized = json.dumps(snapshot, ensure_ascii=False)
-    assert "exact user context" not in serialized
-    assert "exact rules" not in serialized
+    assert "exact user context" in serialized
+    assert "exact rules" in serialized
     assert "secret-key" not in serialized
     assert "authorization" not in serialized.casefold()
 
@@ -613,6 +617,58 @@ def test_responses_runtime_commits_bounded_json_repair_without_recovery(monkeypa
         assert completed[0]["context_digest"] == "wire-digest-a"
         assert outcomes[0]["wire_sha256"] == "wire-digest-a"
         assert outcomes[0]["outcome"] == "compat_recovered"
+        assert outcomes[0]["details"]["output_text"] == raw
+        assert outcomes[0]["details"]["reasoning_text"] == ""
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_request_audit_retains_reason_and_partial_output(monkeypatch):
+    async def scenario():
+        started = asyncio.Event()
+
+        class Provider:
+            supports_decision_schema = True
+            transport = "responses"
+            thinking_action_enabled = False
+
+            def stream_events(self, _messages, **_kwargs):
+                async def stream():
+                    yield {"type": "reasoning", "text": "正在分析"}
+                    yield {"type": "content", "text": '{"speak":'}
+                    started.set()
+                    await asyncio.Event().wait()
+
+                return stream()
+
+        outcomes = []
+        monkeypatch.setattr(
+            "voice_terminal.agent.episode.capture_context_snapshot",
+            lambda *_args, **_kwargs: "wire-digest-cancelled",
+        )
+        monkeypatch.setattr(
+            "voice_terminal.agent.episode.capture_request_outcome",
+            lambda **kwargs: outcomes.append(kwargs),
+        )
+        runtime = _runtime(Provider())
+        runtime.inputs["turn-a"] = {"text": "hello", "final": True}
+        identity = (runtime.episode_id, "request-cancelled")
+        runtime._identity_turns[identity] = "turn-a"
+        task = asyncio.create_task(runtime._step(identity, {"USER_INPUT_FINALIZED"}))
+        await started.wait()
+        task.cancel("superseded_recovery:USER_INPUT_REFINED")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert outcomes[0]["outcome"] == "cancelled"
+        assert outcomes[0]["details"] == {
+            "cancel_reason": "superseded_recovery:USER_INPUT_REFINED",
+            "content_chars": 9,
+            "finished": False,
+            "reasoning_effort": "none",
+            "output_text": '{"speak":',
+            "reasoning_text": "正在分析",
+        }
 
     asyncio.run(scenario())
 

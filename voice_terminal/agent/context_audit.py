@@ -1,4 +1,4 @@
-"""Request-correlated, content-free LLM context diagnostics."""
+"""Request-correlated, full-fidelity LLM request and outcome diagnostics."""
 from __future__ import annotations
 
 import hashlib
@@ -41,7 +41,7 @@ def build_context_snapshot(
     context_compaction: Mapping[str, Any],
     context_token_estimate: int,
 ) -> dict[str, Any]:
-    """Build the exact header-free body and a compact comparison manifest."""
+    """Build the exact header-free body plus a comparison manifest."""
 
     frozen_messages = [dict(message) for message in messages]
     transport = str(getattr(provider, "transport", "chat_completions"))
@@ -80,9 +80,9 @@ def build_context_snapshot(
     wire_serialized = _canonical(wire_payload)
     return {
         "record_type": "request_context",
-        "version": 2,
+        "version": 3,
         "at": time.time(),
-        "contains_conversation_content": False,
+        "contains_conversation_content": True,
         "conversation_id": conversation_id,
         "request_id": request_id,
         "turn_id": turn_id,
@@ -96,6 +96,9 @@ def build_context_snapshot(
         "owner_scope": owner_scope,
         "transport": transport,
         "reasoning_effort": reasoning_effort,
+        "messages": frozen_messages,
+        "schema": dict(schema),
+        "wire_payload": wire_payload,
         "wire_sha256": _digest(wire_payload),
         "wire_bytes": len(wire_serialized.encode("utf-8")),
         "schema_sha256": _digest(schema),
@@ -128,13 +131,14 @@ def capture_request_outcome(
     outcome: str,
     details: Mapping[str, Any] | None = None,
 ) -> None:
-    """Append a content-free terminal record correlated to one context."""
+    """Append a full-fidelity terminal record correlated to one request."""
 
     try:
         record = {
             "record_type": "request_outcome",
-            "version": 1,
+            "version": 2,
             "at": time.time(),
+            "contains_conversation_content": True,
             "conversation_id": conversation_id,
             "request_id": request_id,
             "turn_id": turn_id,

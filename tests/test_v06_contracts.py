@@ -132,6 +132,7 @@ def test_sentence_ids_stay_stable_and_unmapped_refinement_is_retained():
 def test_scheduler_defaults_and_removed_prediction_configuration():
     config = load_config(Path("config/default.yaml"))
     assert config.agent.scheduler_tick_ms == 400 and config.agent.voice_activation_ms == 200
+    assert config.llm.max_output_tokens == 384 * 1024
     assert AgentDecisionScheduler(AgentOptions()).accepts("TOOL_COMPLETED")
     with pytest.raises(TypeError, match="predictions"):
         AppConfig.from_mapping({"smart_turn": {"predictions": True}})

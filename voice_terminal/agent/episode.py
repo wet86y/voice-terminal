@@ -1018,7 +1018,7 @@ class AgentEpisodeRuntime:
             cancel_output = getattr(self.output, "cancel_all", None)
             if callable(cancel_output):
                 cancel_output("superseded_recovery")
-            request.cancel()
+            request.cancel(f"superseded_recovery:{kind}")
 
         if queued or running:
             try:
@@ -1046,7 +1046,7 @@ class AgentEpisodeRuntime:
         request = self.active_request
         cancelled_request = False
         if running and request is not None and request is not asyncio.current_task() and not request.done():
-            request.cancel()
+            request.cancel(f"superseded_system_check:{kind}")
             cancelled_request = True
 
         # Do not interrupt speech that has crossed the real playback boundary.
@@ -1200,7 +1200,7 @@ class AgentEpisodeRuntime:
         """Cancel only an explicit lifecycle scope (stop/barge-in/close)."""
         request = self.active_request
         if request is not None and request is not asyncio.current_task() and not request.done():
-            request.cancel()
+            request.cancel(reason)
         self.recovery_queue.clear()
         if self.delay_task is not None and not self.delay_task.done():
             self.delay_task.cancel()
@@ -2815,13 +2815,18 @@ class AgentEpisodeRuntime:
             if audit_outcome_recorded:
                 return
             audit_outcome_recorded = True
+            full_details = {
+                **details,
+                "output_text": parser.raw,
+                "reasoning_text": "".join(reasoning),
+            }
             capture_request_outcome(
                 conversation_id=identity[0],
                 request_id=identity[1],
                 turn_id=source_turn_id,
                 wire_sha256=request_context_digest,
                 outcome=outcome,
-                details=details,
+                details=full_details,
             )
 
         async def finish_streamed_speech() -> None:
@@ -3117,9 +3122,10 @@ class AgentEpisodeRuntime:
                 "turn_id": source_turn_id, "status": "committed",
             })
             return "completed"
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             record_audit_outcome(
                 "cancelled",
+                cancel_reason=str(exc) or "cancelled",
                 content_chars=content_chars,
                 finished=finished,
                 reasoning_effort=reasoning_effort or "none",
@@ -3355,7 +3361,7 @@ class AgentEpisodeRuntime:
         current_task = asyncio.current_task()
         active_request = self.active_request
         if active_request and active_request is not current_task and not active_request.done():
-            active_request.cancel()
+            active_request.cancel(str(reason) or "episode_ended")
         if self.delay_task is not None and not self.delay_task.done():
             self.delay_task.cancel()
 

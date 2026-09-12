@@ -82,7 +82,7 @@ class DeepSeekClient:
         thinking: str = "disabled",
         reasoning_effort: str = "low",
         transport: str = "chat_completions",
-        max_output_tokens: int = 512,
+        max_output_tokens: int = 393216,
         shadow_enabled: bool = False,
         shadow_sample_rate: float = 1.0,
         shadow_thinking_enabled: bool = False,

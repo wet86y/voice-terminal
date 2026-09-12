@@ -86,7 +86,8 @@ llm:
   thinking: enabled
   reasoning_effort: low
   timeout_ms: 15000
-  max_output_tokens: 512
+  # DeepSeek's documented maximum output budget: 384K tokens.
+  max_output_tokens: 393216
   # Ordinary dual-running is disabled: all current decisions use Responses.
   # Shadow is reserved for the later thinking experiment only.
   shadow_enabled: false
