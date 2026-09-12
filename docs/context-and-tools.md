@@ -8,7 +8,7 @@
 
 影子任务报告包含可信的本地任务 ID/状态和不可信的文本内容；文本、工具结果和 checkpoint 都是资料，不是指令。它们不得改变语音协议、人格文件、调度规则或工具权限。影子创建时只获取已结算 user/assistant 历史；未播放输出、对话 runtime ID、语音状态与 REQUEST_TAIL 不进入影子上下文。
 
-主语音模型不直接调用文件或网络工具。它只有 `task(id,state,text)`：新任务使用 `request`，活动任务的补充方向使用 `modify`，取消使用 `cancel`；三个字段均为 strict Schema 必填字段。影子 agent 在 external 域自主进行多轮原生 function calling，首期只允许受限目录文件搜索/读取与联网搜索；internal 域当前没有模型可调用函数。任务受理、修改和取消可以在用户讲话中发生。`running` checkpoint 只入账；终态统一作为事件进入同一个 `AgentDecisionScheduler` 的下一次 400ms 普通调度，新输入、精修和任务晚到不会让在飞请求失效。`session.stop` 保留生产任务并缓冲事件，`session.reset` 与 runtime close 才终止生产任务；调试 sandbox 断连即终止。
+主语音模型不直接调用文件或网络工具。它只有 `task(id,state,text,question_id)`：新任务使用 `request`，活动任务的补充方向使用 `modify`，取消使用 `cancel`，对影子 `awaiting_user` 或 `paused` 问题的明确用户答复使用 `reply`；四个字段均为 strict Schema 必填字段，只有 reply 使用非空 question_id。影子 agent 在 external 域自主进行多轮原生 function calling，并可通过内部控制函数 `request_user_clarification(question, options)` 请求主助手代理提问；首期只允许受限目录文件搜索/读取与联网搜索。任务受理、修改、答复和取消可以在用户讲话中发生。`running` checkpoint 只入账；`awaiting_user`、`paused` 与终态统一作为事件进入同一个 `AgentDecisionScheduler` 的下一次 400ms 普通调度，新输入、精修和任务晚到不会让在飞请求失效。`session.stop` 保留生产任务并缓冲事件，`session.reset` 与 runtime close 才终止生产任务；调试 sandbox 断连即终止。
 
 TTS 和语音活动属于运行时状态，不是新的语义事件。TTS 开始、结束、取消、替换和失败不会重置用户静默锚点、加入 `pending` 或触发 LLM；TTS 是否正在播放或有待播内容，只决定当前心跳是否允许实际 dispatch。强制请求仍调用普通 `_step()`/provider stream 链路，但使用独立 `system_check_id`，不创建用户轮次或 `InputRecord`。只有用户实际听到的 system-check speech 才经 delivery report 写入 assistant ledger。
 
@@ -41,4 +41,4 @@ action definitions、由其构建的 strict schema、`request_thinking` 可见�
 
 会话模式为 `fast`、`balanced`、`deep`，默认 `balanced`。快速模式不暴露思考 action，基础请求为 `effort=none`；深度模式基础请求为 `effort=low`，同样不暴露 action。仅均衡模式向严格 schema 暴露 `request_thinking`，其唯一合法形状为 `{"name":"request_thinking","arguments":{"request":true}}`。`request` 是 schema 兼容的固定确认字段，不是模型可选择的 provider 参数；本地固定将它解释为一次 `effort=low` 的续请求。
 
-请求思考必须同时维护非空 `speak` 转换，并立即安排 low 续请求。task 与 `request_thinking` 可同一 decision 出现：task 会独立提交至影子 manager，绝不作为 thinking barrier 的等待对象。影子终态随后通过既有 400ms 普通调度队列反馈；运行中 checkpoint 不触发主模型请求。用户开口只更新主链 mailbox，不会取消影子任务；`session.reset` 才会终止生产 manager。
+请求思考必须同时维护非空 `speak` 转换，并立即安排 low 续请求。task 与 `request_thinking` 可同一 decision 出现：task 会独立提交至影子 manager，绝不作为 thinking barrier 的等待对象。影子请求澄清时，主模型在下一次 400ms 调度中代为向用户提问；用户答复仅在明确关联 question_id 时通过 reply 回注原任务。单次等待 120 秒后任务转为长期 paused，保留上下文直到 reply、modify、cancel、reset 或 close。影子终态随后通过既有 400ms 普通调度队列反馈；运行中 checkpoint 不触发主模型请求。用户开口只更新主链 mailbox，不会取消影子任务；`session.reset` 才会终止生产 manager。

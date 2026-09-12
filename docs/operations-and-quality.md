@@ -27,6 +27,29 @@ Responses、400ms scheduler、账本 bridge 和只读文件工具。`scripts/liv
 经 mailbox 回流，而不能卡住 session、串扰其他 ID 或直接发起并发主请求。优化 deadline 前优先评估
 更小的任务拆分、搜索轮数与工具结果压缩。
 
+### 澄清 / 等待确认真实验收（2026-09-12）
+
+澄清循环在真实 OpenCode Go `deepseek-flash` 上另有一个聚焦验收脚本：
+
+```powershell
+python scripts/real_opencode_go_shadow_clarification_acceptance.py `
+  --report reports/real-opencode-go-shadow-clarification-acceptance-20260912.json
+```
+
+该脚本同样从生产 `SessionRuntime` 与 `start_listening()` 装配进入，保留真实主 LLM、影子
+LLM、400ms scheduler、ledger 和 task receipt；仅将 ASR 注入与 TTS 输出替换为文本边界。已记录的
+验收执行包含两次用户交互、7 次真实 LLM 请求和 4 个 task action：真实影子调用
+`request_user_clarification` 后产生 `awaiting_user` 与精确 `question_id`，主 LLM 将自然语言答复
+转为 `task(reply)`，同一影子任务随后完成，脚本错误数为零。对应的串行 20 轮和并行补充报告分别为
+`reports/real-opencode-go-shadow-chain-acceptance-20260912.json` 与
+`reports/real-opencode-go-shadow-parallel-group1-20260912.json`。
+
+这证明本次验收中的生产协议、真实 provider 调用和代理回复路径可运行，**不等价于所有真实请求都
+必然一次成功**。此次真实模型曾输出不允许的动作状态与空 reply；严格 schema/receipt 使其被拒绝后
+在同一对话中恢复为有效 reply。因此上线观察应继续查看 `SHADOW_TASK_RECEIPT`、
+`awaiting_user`/`paused` 事件和 question ID 是否精确匹配；模型输出波动不能被描述为代码已无任何
+缺陷的证明。
+
 思考模式在 episode 创建时冻结：`fast` 为 `effort=none` 且不暴露思考 action，`balanced` 的基础请求为 `effort=none` 并可通过本地 `request_thinking` 获得一次 `effort=low` 续请求，`deep` 直接使用 `effort=low`。`request_thinking` 不是 provider native tool；它不能执行外部操作，且新输入、停止监听和 session reset 必须立即取消其等待或续请求。`config/local.yaml` 是本机覆盖文件；正常请求的 Schema 可见性和实际 effort 仍以启动时冻结的 episode `reasoning_mode` 为准，故该文件不能作为生产基线证据。
 
 默认 `audio.output_device: null`，由 Windows 选择当前活跃默认输出设备。这样可避免固定的 MME 端点在 PortAudio 实际打开 32 kHz PCM 流时失败，也能自然适应耳机和外接音箱切换。只有部署环境需要强制固定设备时，才在被忽略的 `config/local.yaml` 中设置 `audio.output_device`；修改后应先以真实输出流验证，而不只依赖设备能力查询。

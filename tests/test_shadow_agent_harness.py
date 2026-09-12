@@ -145,7 +145,7 @@ def test_native_multi_tool_roundtrip_keeps_call_order_and_outputs(tmp_path: Path
         ), {})
         provider = _Provider([first, _message("已找到并读取：shadow facts")])
         manager = ShadowTaskManager(provider, ShadowToolExecutor(FileTools((tmp_path,))), instructions_loader=lambda: "rules")
-        assert (await manager.handle({"id": 1, "state": "request", "text": "读取 note"})).accepted
+        assert (await manager.handle({"id": 1, "state": "request", "text": "读取 note", "question_id": ""})).accepted
         await _wait_terminal(manager, 1)
         second_input = provider.calls[1]["input_items"]
         outputs = [item for item in second_input if item.get("type") == "function_call_output"]
@@ -231,9 +231,9 @@ def test_modify_invalidates_cancellation_suppressed_old_response_before_tools(tm
 
         provider = _Provider([stale_response, _message("新方向完成")])
         manager = ShadowTaskManager(provider, Tools(), instructions_loader=lambda: "rules")
-        await manager.handle({"id": 1, "state": "request", "text": "旧方向"})
+        await manager.handle({"id": 1, "state": "request", "text": "旧方向", "question_id": ""})
         await asyncio.wait_for(started.wait(), timeout=1)
-        receipt = await manager.handle({"id": 1, "state": "modify", "text": "新方向"})
+        receipt = await manager.handle({"id": 1, "state": "modify", "text": "新方向", "question_id": ""})
         assert receipt.accepted
         await _wait_terminal(manager, 1)
         assert tool_calls == 0
@@ -268,9 +268,9 @@ def test_cancel_invalidates_cancellation_suppressed_old_response_before_tools():
                 return ShadowProviderResponse((_call("old", "files_search", '{"query":"old"}'),), {})
 
         manager = ShadowTaskManager(_Provider([stale_response]), Tools(), instructions_loader=lambda: "rules")
-        await manager.handle({"id": 1, "state": "request", "text": "旧任务"})
+        await manager.handle({"id": 1, "state": "request", "text": "旧任务", "question_id": ""})
         await asyncio.wait_for(started.wait(), timeout=1)
-        assert (await manager.handle({"id": 1, "state": "cancel", "text": ""})).accepted
+        assert (await manager.handle({"id": 1, "state": "cancel", "text": "", "question_id": ""})).accepted
         assert tool_calls == 0
         assert manager.drain_events()[-1].status == "cancelled"
 
@@ -299,7 +299,7 @@ def test_work_deadline_hard_cancels_inflight_work_then_reports_timeout():
             provider, tools, instructions_loader=lambda: "rules", slice_seconds=1,
             work_seconds=0.03, terminal_report_seconds=0.2,
         )
-        await manager.handle({"id": 1, "state": "request", "text": "有截止的任务"})
+        await manager.handle({"id": 1, "state": "request", "text": "有截止的任务", "question_id": ""})
         await asyncio.wait_for(started.wait(), timeout=1)
         await _wait_terminal(manager, 1)
         assert cancelled.is_set()
