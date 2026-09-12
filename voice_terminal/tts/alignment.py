@@ -250,6 +250,20 @@ class DeliveryResolver:
     def pending_count(self) -> int:
         return sum(1 for item in self._pending_text if item["end_ms"] is None)
 
+    @property
+    def diagnostics(self) -> dict[str, int | None]:
+        """Return non-content timing diagnostics for delivery reconciliation."""
+
+        spans = list(self._provider_spans)
+        starts = [int(item.start_ms) for item in spans]
+        ends = [int(item.end_ms) for item in spans if item.end_ms is not None]
+        values = starts + ends
+        return {
+            "provider_span_count": len(spans),
+            "provider_min_ms": min(values) if values else None,
+            "provider_max_ms": max(values) if values else None,
+        }
+
     def complete_pending(self, end_ms: int) -> None:
         """Close all locally tracked spans once the provider is fully drained."""
 

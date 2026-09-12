@@ -23,6 +23,10 @@ class CurrentInput:
     primary_transcript: str = ""
     refined_transcript: str = ""
     refinement_available: bool = False
+    # Final and refined transcripts are revisions of this same user turn.
+    # The dictionaries intentionally contain semantic transcript evidence
+    # only; runtime correlation IDs remain local.
+    transcript_updates: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     # Internal correlation only.  It is deliberately never rendered into a
     # model-facing message, but lets the projector avoid duplicating a turn
     # that the controller has already committed to the ledger.
@@ -70,13 +74,30 @@ class LLMContextProjector:
             payload["runtime"]["input_status"] = "finalized"
         elif current.user_speaking is True:
             payload["runtime"]["input_status"] = "speaking"
-        if current.refinement_available and current.refined_transcript.strip():
-            payload["runtime"]["refinement"] = current.refined_transcript.strip()
+        available = [
+            {
+                key: update[key]
+                for key in ("kind", "source", "text", "revision", "streamed_text")
+                if key in update
+            }
+            for update in current.transcript_updates
+            if isinstance(update, dict) and str(update.get("text") or "").strip()
+        ]
+        triggered_by: list[str] = []
+        if "USER_INPUT_FINALIZED" in current.recent_events:
+            triggered_by.append("asr_final")
+        if "USER_INPUT_REFINED" in current.recent_events:
+            triggered_by.append("refinement")
+        if available:
+            payload["runtime"]["transcript_updates"] = {
+                "same_user_turn": True,
+                "available": available,
+                "triggered_by": triggered_by,
+            }
         return "当前轮运行状态：" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     def project(self, ledger: SessionLedger, current: CurrentInput) -> list[dict[str, Any]]:
         primary = (current.primary_transcript or current.text or "").strip()
-        refined = (current.refined_transcript or "").strip()
         messages = ledger.context_messages("")
         committed = bool(current.turn_id) and ledger.has_input(current.turn_id)
         # Finalization commits the durable user entry before the asynchronous
@@ -86,5 +107,19 @@ class LLMContextProjector:
         if primary and not committed:
             # An uncommitted ASR candidate is current-request material. Once
             # finalized it enters the ledger and becomes an append-only frame.
-            messages.append(ContextFrame.make(ContextLane.REQUEST_TAIL, "user", primary))
+            updates = list(current.transcript_updates)
+            if updates:
+                transcript = {
+                    str(update.get("kind")): str(update.get("text") or "").strip()
+                    for update in updates
+                    if isinstance(update, dict)
+                    and update.get("kind") in {"asr_final", "refinement"}
+                    and str(update.get("text") or "").strip()
+                }
+                content = "用户语音最终文本：" + json.dumps(
+                    transcript, ensure_ascii=False, separators=(",", ":"),
+                )
+            else:
+                content = primary
+            messages.append(ContextFrame.make(ContextLane.REQUEST_TAIL, "user", content))
         return messages

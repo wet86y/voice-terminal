@@ -108,6 +108,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
         self._tts_session = None
         self.handle = None
         self._pending = deque()
+        self._settling_speech_ids: set[str] = set()
         self._handles_by_token = {}
         self.generation = 0
         self.tasks = set()
@@ -127,6 +128,14 @@ class EpisodeSpeechOutput(SpeechPipeline):
     @property
     def active(self):
         return self.handle is not None and not self.handle.task.done() and self.handle.reason is None
+
+    @property
+    def busy(self):
+        return bool(
+            self.active
+            or self._settling_speech_ids
+            or any(not item.reason and not item.task.done() for item in self._pending)
+        )
 
     @property
     def status(self):
@@ -709,6 +718,12 @@ class EpisodeSpeechOutput(SpeechPipeline):
                                        error=getattr(self.tts, "emotion_error", None))
             if self.state.current.get("tts_status") == "DEGRADED" or self.tts is None or self.player is None:
                 h.reason = "failed"
+            # The player has confirmed that its local PCM queue and device
+            # tail are drained.  Freeze that fact before the append window can
+            # admit another input/output generation and overwrite player state.
+            if not h.reason and h.snapshot is None and self.player is not None:
+                h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
+                h.workspace.timings["playback_snapshot_frozen"] = time.monotonic()
         except asyncio.CancelledError:
             h.reason = h.reason or "stopped"
         except Exception as exc:
@@ -765,9 +780,53 @@ class EpisodeSpeechOutput(SpeechPipeline):
             delivery = self._delivery_resolvers[h.speech_id].resolve(
                 h.snapshot or {"started": False}, h.text, overlap_start_ms=h.overlap_start_ms)
             delivery["termination"] = h.reason or "completed"
-            self.last_delivery = dict(delivery)
             if h.snapshot:
                 self.controller._add_playback_delivery_fields(delivery, h.snapshot)
+            snapshot = h.snapshot
+            playback_complete = bool(
+                not h.reason
+                and h.text
+                and h.workspace.timings.get("tts_text_sent")
+                and int(h.workspace.timings.get("tts_audio_bytes") or 0) > 0
+                and h.workspace.timings.get("playback_output_complete") is True
+                and snapshot is not None
+                and bool(getattr(snapshot, "started", False))
+                and int(getattr(snapshot, "buffered_ms", 0) or 0) == 0
+                and int(getattr(snapshot, "enqueued_ms", 0) or 0) > 0
+                and int(getattr(snapshot, "output_estimated_ms", 0) or 0)
+                    >= int(getattr(snapshot, "enqueued_ms", 0) or 0)
+            )
+            if playback_complete:
+                provider_status = str(delivery.get("status") or "none")
+                delivery.update({
+                    "status": "full",
+                    "termination": "completed",
+                    "heard_text": h.text,
+                    "uncertain_text": "",
+                    "unheard_text": "",
+                    "precision": "playback_complete",
+                    "reason": "completed_playback_authoritative",
+                })
+                if provider_status != "full":
+                    diagnostic = self._delivery_resolvers[h.speech_id].diagnostics
+                    logger.info(
+                        "delivery.reconciled speech_id=%s provider_status=%s final_status=full "
+                        "reason=completed_playback_authoritative played_ms=%s enqueued_ms=%s "
+                        "provider_span_count=%s provider_min_ms=%s provider_max_ms=%s",
+                        h.speech_id, provider_status,
+                        getattr(snapshot, "output_estimated_ms", None),
+                        getattr(snapshot, "enqueued_ms", None),
+                        diagnostic["provider_span_count"], diagnostic["provider_min_ms"],
+                        diagnostic["provider_max_ms"],
+                    )
+                    await self.runtime.log(
+                        "DELIVERY_RECONCILED", identity=h.identity, turn_id=h.turn_id,
+                        speech_id=h.speech_id, provider_status=provider_status,
+                        final_status="full", reason="completed_playback_authoritative",
+                        played_ms=getattr(snapshot, "output_estimated_ms", None),
+                        enqueued_ms=getattr(snapshot, "enqueued_ms", None), **diagnostic,
+                    )
+            self.last_delivery = dict(delivery)
             source_timings = getattr(self.controller, "_turn_timings", {}).get(h.turn_id)
             if isinstance(source_timings, dict):
                 h.workspace.timings.update(source_timings)
@@ -880,13 +939,33 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 record["status"], delivery.get("status"), timings.get("tts_text_sent"),
                 timings.get("tts_audio_bytes"), h.workspace.playback_started,
             )
+            self._settling_speech_ids.add(h.speech_id)
+            logger.info(
+                "speech.settling_started speech_id=%s turn_id=%s",
+                h.speech_id, h.turn_id,
+            )
+            await self.runtime.log(
+                "SPEECH_SETTLING_STARTED", identity=h.identity, turn_id=h.turn_id,
+                speech_id=h.speech_id,
+            )
             if self.handle is h:
                 self.handle = None
             self._handles_by_token.pop(h.workspace.token, None)
             source_timings = getattr(self.controller, "_turn_timings", {}).get(h.turn_id)
             if isinstance(source_timings, dict):
                 source_timings.update(h.workspace.timings)
-            await self.runtime.output_completed(record)
+            try:
+                await self.runtime.output_completed(record)
+            finally:
+                self._settling_speech_ids.discard(h.speech_id)
+                logger.info(
+                    "speech.settling_finished speech_id=%s turn_id=%s",
+                    h.speech_id, h.turn_id,
+                )
+                await self.runtime.log(
+                    "SPEECH_SETTLING_FINISHED", identity=h.identity, turn_id=h.turn_id,
+                    speech_id=h.speech_id,
+                )
             # A verified same-prefix extension is intentionally held while
             # this generation drains.  Activate it only after the old player
             # key has been settled, so its normal ``allow`` call cannot clear
