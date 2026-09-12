@@ -29,6 +29,7 @@ DeepSeek 的 `deepseek-flash`，读取 `DEEPSEEK_API_KEY`；调试 OpenCode Go �
 | Session ledger | 最终输入、传达报告、选中的工具交换 | append-only 可缓存 HISTORY | 唯一持久上下文事实源 |
 | LLM provider boundary | 带 `ContextLane` 的 frames、冻结 schema | 统一 `content/reasoning/usage/finish` 事件 | 缓存稳定投影、lane 校验、usage cache 指标归一化、strict Schema；保留冻结 Chat 回退 adapter |
 | Agent runtime | 账本投影、当前运行态、episode 级人格文档快照 | V0.6 JSON `speak` 决策 | 唯一 `AgentDecisionScheduler`、固定400ms心跳、普通优先的阶梯强制调度、static/history/tail context、信封校验、思考模式控制与有限恢复 |
+| LLM audit runtime | 完整 messages、Schema、wire payload、provider 增量与终态 | 关联的 `request_context` / `request_outcome` JSONL | 保存可逐请求复现的完整上下文、正文、reasoning、校验结果与取消原因 |
 | Action runtime | 本地 `actions` 请求 | `ToolExchange` | 只读执行、缓存与来源标记 |
 | Speech runtime | 文本 speak 队列、TTS、播放器 | `SpeechItem`、`DeliveryReport` | `empty/queued/suspended/speaking`、同轮所有权、严格前缀追加、跨轮防重、实质分歧抢占与传达结算 |
 | Protocol projection | 内部事件 | V0.6 Envelope | 唯一网络协议边界 |
@@ -52,6 +53,8 @@ Agent episode 在第一次真正建立 `episode_id` 时读取 `config/persona/` 
 `audio.aec_failure_policy` 决定保护链在已播放 PCM 期间失效时的行为。默认 `pause_recover` 原子暂停播放器队列、重建处理器并等待新的反向参考后续播；恢复失败或 750 ms 超时会转为 `stop_and_listen`，停止当前输出并释放正常监听，避免无限暂停或用户被静默锁死。可选 `stop_and_listen` 直接采用该安全终止路径；`continue_without_barge_in` 仅继续播放并暂禁自动插话，供兼容性排障使用。状态转换与结果记录为 `AEC_RECOVERING`、`AEC_RECOVERED`、`AEC_FAILED` 或 `AEC_BARGE_IN_SUPPRESSED`；每个 `BARGE_IN_CONFIRMED` 必须同时记录 `near_voice=true` 和 `protected_available=true`。
 
 Responses 边界因供应商 strict 子集要求所有声明属性均为 required：`wait/cancel` 使用空 `speak.text`，异构 action 使用中性占位字段；进入 Agent 后立即投影回原有内部契约。本地信封校验和 action adapter 不得因 provider 返回 `completed` 或标记 `strict=true` 而跳过。
+
+DeepSeek provider 的输出预算固定为 `393216`（384K tokens），覆盖 reasoning 与可见正文。Agent 在 provider 调用前将完整请求写为 `request_context` version 3，在唯一终态处将完整或部分输出写为 `request_outcome` version 2。取消通过 `Task.cancel(reason)` 将生命周期来源传入终态审计；新用户输入淘汰恢复请求或 system-check，与播放期 `user_interrupted` 是不同原因，不能合并统计。审计写入使用独立后台队列和轮转文件，不参与实时调度，也不进入会话 ledger。
 
 ## AgentDecisionScheduler 调度契约
 

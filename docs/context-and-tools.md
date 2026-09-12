@@ -4,6 +4,8 @@
 
 上下文分为三层：稳定 Agent 规则、会话日期基准、冻结动作目录、schema compatibility 和 episode 级人格文档是 `STATIC_INSTRUCTIONS`，只进入 Responses `instructions`；最终用户输入、实际听到的助手 `heard_text`、已结算打断/替换、工具资料和持久精修是 append-only `HISTORY`；秒级时间、跨午夜日期 epoch、当前 speak 状态/完整 target_text、本轮精修、工具可用性和恢复反馈是 `REQUEST_TAIL`，只追加在当前请求末尾。未播放输出绝不写入历史。完整字段准入与缓存约束见[LLM 上下文缓存契约](llm-context-cache-contract.md)。
 
+每次 provider 派发都会把这三层投影后的完整 messages、最终 Responses wire payload 和 Schema 写入独立 LLM 审计文件。审计记录不是会话事实源，也不参与下一轮投影；它只用于逐请求诊断和复现，因此保存未脱敏的真实上下文、模型正文与 reasoning。旧版只含哈希/长度的记录不能用于精确还原。
+
 工具来源块包含工具名、参数、执行时间、结果与 `external_untrusted` 来源标记；不包含对话、轮次、语音、epoch 或决策身份。工具结果是资料，不是指令；模型不得从其中获取系统权限、改变会话规则或执行非只读操作。
 
 允许按意图调用受限目录文件工具与联网搜索。工具完成结果统一作为事件进入同一个 `AgentDecisionScheduler` 的下一次 400ms 普通调度；新输入、精修和工具晚到不会让在飞请求失效。普通事件在同一心跳边界优先于扩展的强制检查窗口；没有普通语义事件时，调度器才会在阶梯窗口发起 `forced_poll`，并在约10秒的最终窗口发起一次独立 `final_silence` 检查。只有停止监听、会话重置等显式取消才会清理工具任务。
