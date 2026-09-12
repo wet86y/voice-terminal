@@ -4,6 +4,29 @@
 
 默认 `config/default.yaml` 是当前唯一活动运行线。`smart_turn`、`agent` 与 `shadow_agent` 是能力配置，不是版本开关。影子 external 工具默认仅限 `docs` 文件读取和搜索；不包含 Shell、写文件、外部账号操作、RAG 或长期记忆。旧顶层 `tools` 配置为迁移错误；`shadow_agent` 不属于语音 `can_start` 必要条件。
 
+## 影子 Agent 真实链路验收
+
+影子 Agent 的基础行为必须先通过 mock Responses/SSE 与 fake clock 验证；随后可用 OpenCode Go
+的 `deepseek-flash` 执行低成本真实验收。验收仍必须从 `SessionRuntime.initialize()` 和
+`start_listening()` 进入生产装配，不得把直接调用 manager 当成生产验证。`scripts/real_shadow_chain_acceptance.py`
+使用 controller 的语义输入入口替代 ASR PCM，并把 TTS/PCM 截断为文本 fake；它保留真实主/影子
+Responses、400ms scheduler、账本 bridge 和只读文件工具。`scripts/live_shadow_parallel_acceptance.py`
+在同一边界上运行 20 组“组间串行、组内多 task 并行”的自然中文多目标验收，可启用只读网络搜索。
+
+真实网络验收前必须确认：`OPENCODE_GO_API_KEY` 和需要时的 `MINIMAX_API_KEY` 已配置；搜索只记录
+查询、结果数量和有限标题摘要，不能写入完整网页正文、密钥或敏感 payload；不允许暴露写文件、命令、
+消息、外部调度或账户工具。音频相关组件必须由 harness fake 替换，确保没有真实 TTS 或 PCM 输出。
+
+已完成的 OpenCode Go 验收覆盖了串行 20 轮（均衡/深度各 10）与并行 20 组（均衡/深度各 10）：真实
+文件搜索/读取、网络搜索、`running` checkpoint、`completed`/`timed_out` 终态、终态 mailbox 回流和
+讲话中 `HELD` 都可观察。多目标输入不会保证每次都被模型拆成多个 task；因此验收报告必须保留经过
+本地校验的 action trace、receipt、按 task ID 聚合的事件与终态，不能仅根据最终自然语言回答推断并行。
+
+当前 30 秒影子工作截止对“high reasoning + 多目标 + 公开网络搜索”偏紧，真实并行验收会出现正常的
+`timed_out` 终态。这不是 harness 成功或失败的替代指标：必须确认 timeout 能安全终态化、写入账本并
+经 mailbox 回流，而不能卡住 session、串扰其他 ID 或直接发起并发主请求。优化 deadline 前优先评估
+更小的任务拆分、搜索轮数与工具结果压缩。
+
 思考模式在 episode 创建时冻结：`fast` 为 `effort=none` 且不暴露思考 action，`balanced` 的基础请求为 `effort=none` 并可通过本地 `request_thinking` 获得一次 `effort=low` 续请求，`deep` 直接使用 `effort=low`。`request_thinking` 不是 provider native tool；它不能执行外部操作，且新输入、停止监听和 session reset 必须立即取消其等待或续请求。`config/local.yaml` 是本机覆盖文件；正常请求的 Schema 可见性和实际 effort 仍以启动时冻结的 episode `reasoning_mode` 为准，故该文件不能作为生产基线证据。
 
 默认 `audio.output_device: null`，由 Windows 选择当前活跃默认输出设备。这样可避免固定的 MME 端点在 PortAudio 实际打开 32 kHz PCM 流时失败，也能自然适应耳机和外接音箱切换。只有部署环境需要强制固定设备时，才在被忽略的 `config/local.yaml` 中设置 `audio.output_device`；修改后应先以真实输出流验证，而不只依赖设备能力查询。
