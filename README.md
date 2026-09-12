@@ -12,7 +12,11 @@ Voice Terminal 是 Windows 本机实时语音会话终端。浏览器只负责�
 
 没有普通事件时的强制请求仍使用同一个 provider stream 入口，但会创建独立 `system_check_id`，不调用 `ConversationRuntime.begin_turn()`，不创建用户 `InputRecord`，也不产生用户轮次的 `turn.completed`。已被用户听到的 system-check speech 通过现有 assistant delivery 机制进入账本；新用户输入会使尚未播放的 system-check 结果失效。
 
-LLM transport 由 `llm.transport` 原子选择；默认生产接入为官方 DeepSeek Responses + strict `json_schema`。用户可在 Web 控制台选择快速、均衡或深度模式，选择在新的 Agent episode 生效：快速始终使用 `effort=none`；均衡基础请求使用 `effort=none`，模型仅在必要时可输出本地控制 action `{"name":"request_thinking","arguments":{"request":true}}`；深度每次使用 `effort=low`。该 action 不是 provider native tool，固定由本地解释为一次 low 推理。若同轮包含业务工具，均衡模式最多优先等待 2 秒；工具完成始终回到普通 400ms 调度队列，用户开口、停止监听和重置会立即使等待失效。`config/local.yaml` 是本机调试覆盖；正常请求的 Schema 可见性和实际 effort 以启动时冻结的 episode `reasoning_mode` 为准。情绪枚举只接受 `calm`、`happy`、`sad`、`angry`、`fearful`、`disgusted`、`surprised`；兼容性别名 `friendly` 会安全映射为 `calm`。推理原文只经本地调试 Web UI 的 `agent.reasoning` 事件显示，不写服务端日志、Agent trace、DeliveryReport 或持久会话历史。上下文精确 tokenizer 在后台预热，未完成预热时使用本地 fallback 估算，不阻塞实时事件循环。
+LLM transport 由 `llm.transport` 原子选择；默认生产接入为官方 DeepSeek Responses + strict `json_schema`。用户可在 Web 控制台选择快速、均衡或深度模式，选择在新的 Agent episode 生效：快速始终使用 `effort=none`；均衡基础请求使用 `effort=none`，模型仅在必要时可输出本地控制 action `{"name":"request_thinking","arguments":{"request":true}}`；深度每次使用 `effort=low`。该 action 不是 provider native tool，固定由本地解释为一次 low 推理。若同轮包含业务工具，均衡模式最多优先等待 2 秒；工具完成始终回到普通 400ms 调度队列，用户开口、停止监听和重置会立即使等待失效。`config/local.yaml` 是本机调试覆盖；正常请求的 Schema 可见性和实际 effort 以启动时冻结的 episode `reasoning_mode` 为准。情绪枚举只接受 `calm`、`happy`、`sad`、`angry`、`fearful`、`disgusted`、`surprised`；兼容性别名 `friendly` 会安全映射为 `calm`。推理原文经本地调试 Web UI 的 `agent.reasoning` 事件显示，也会写入独立的完整 LLM 审计日志，但不会进入普通 `voice-server.log`、Agent trace、DeliveryReport 或持久会话历史。上下文精确 tokenizer 在后台预热，未完成预热时使用本地 fallback 估算，不阻塞实时事件循环。
+
+DeepSeek Responses 的 `max_output_tokens` 当前固定为官方最大输出预算 `393216`（384K tokens）。这是单次响应的生成上限，并同时覆盖可见正文和 reasoning，不是字节数，也不是输入上下文长度。模型可以在自然完成时提前停止；若上游返回 `response.incomplete` 且原因为 `max_output_tokens`，运行时会将它与普通 JSON 校验失败分开记录并进入一次有界协议恢复。
+
+主服务默认启用 `logs/voice-server-llm-context.jsonl` 完整审计。`request_context` version 3 保存模型可见的完整 `messages`、Schema 和最终 wire payload；`request_outcome` version 2 保存完整或部分 `output_text`、`reasoning_text`、校验结果及明确的 `cancel_reason`。该文件包含真实会话内容并在后台异步轮转，不写控制台；旧版审计记录不会自动补全。格式、关联方法和排障要求见[运行与质量门槛](docs/operations-and-quality.md#llm-完整审计与故障复现)。
 
 破坏性升级的规则是“删除旧接口，不删除仍需的能力”：每项被移除实现的能力必须先迁移到唯一、可达且有行为测试的新主链 owner；旧配置和协议则直接失败，不做静默映射。完整准则见[运行与质量门槛](docs/operations-and-quality.md#破坏性升级与能力保全)。
 

@@ -345,6 +345,14 @@ Completions 的 `response_format={"type":"json_object"}`。它要求提示中包
 - **尚不能断言：**服务端究竟完全未执行 Schema、只做生成引导而不做结果校验，还是执行中存在特定触发
   条件。需要最小复现与请求矩阵才能向 provider 给出可证伪报告。
 
+### 2026-09-12 输出预算修正
+
+生产配置已将 Responses `max_output_tokens` 从 512 提升到 DeepSeek 官方最大输出预算 384K，即
+`393216` tokens。该上限同时计算 reasoning 和可见正文；它不是字节数，也不是模型输入上下文长度。
+历史样本中 3 条明确以 `response.incomplete/incomplete_details.reason=max_output_tokens` 结束，因此可以
+确认旧 512 token 预算实际造成过截断。其余 `PROSE_INSTEAD_OF_JSON` 以及由 `response.completed` 携带的
+`JSON_TRUNCATED` 仍需按 Schema/生成失约调查，不能因上限提升而视为已修复。
+
 ## 官方契约后的最小验证矩阵
 
 后续无需启动完整语音/TTS 链路，使用相同模型、相同 `/responses` endpoint 和固定小输入即可交错测试：
@@ -356,8 +364,8 @@ Completions 的 `response_format={"type":"json_object"}`。它要求提示中包
 | C | 最小对象 Schema，不发送 `strict` | 区分 provider 基础能力与生产 Schema 复杂度 |
 | D | 当前生产 Schema + 明确完整 JSON 示例 | 判断生成引导是否能缓解，但不把提示当服务端校验替代品 |
 
-每组至少记录 HTTP 状态、Responses 终态、response id、模型名、input/output/reasoning token、权威正文长度、
-JSON 结构指纹和本地 Schema 结果；不记录用户正文或模型完整输出。A/B/C/D 应交错而非顺序批量执行，避免
+每组至少记录 HTTP 状态、Responses 终态、response id、模型名、input/output/reasoning token、完整 wire
+payload、权威正文、reasoning、JSON 结构指纹和本地 Schema 结果。A/B/C/D 应交错而非顺序批量执行，避免
 把时段性 provider 波动误判成配置差异。
 
 若最小 Schema 仍返回 malformed `response.completed`，即可形成较强的 provider 最小复现；若只有生产
@@ -400,9 +408,13 @@ Schema 失败，则继续二分 Schema 关键字/嵌套结构。若仅 A 失败�
 JSONL 中精确比较异常请求和邻近正常请求，而无需根据 ASR/TTS 日志近似重建上下文。
 
 该文件明确包含真实用户/助手上下文，因此与普通日志隔离，不写控制台；单文件 50 MiB，保留 9 个轮转备份。
-磁盘写入通过后台日志队列完成，避免在实时事件循环中执行轮转 I/O。API key、Authorization header、模型
-模型输出正文和 reasoning 会写入该文件，以便对异常请求做完整复放和根因审计。需要临时禁用时可设置
+磁盘写入通过后台日志队列完成，避免在实时事件循环中执行轮转 I/O。API key、Authorization header 不在
+模型请求正文中，不写入该文件；模型输出正文和 reasoning 会写入，以便对异常请求做完整复放和根因审计。需要临时禁用时可设置
 `VOICE_LLM_CONTEXT_AUDIT=0`，但问题定位期间应保持默认开启。
+
+新记录格式为 `request_context` version 3 与 `request_outcome` version 2。前者保存完整 messages、Schema
+和 wire payload；后者保存完整或部分 `output_text`、`reasoning_text`，取消时还保存 `cancel_reason`。
+2026-09-12 之前产生的 version 2/1 旧记录不会自动补全，仍不能从哈希恢复原文。
 
 ## 待验证的问题
 
@@ -431,7 +443,7 @@ Prompt/Schema wire contract 对齐、短 canonical 示例、分层失败诊断�
    - 当前 schema 加完整合法对象示例；
    - 冻结 Chat/`json_object`，仅作为显式诊断对照，不自动回退。
 2. 在真实会话中统计严格成功、兼容成功、兼容拒绝、即时 recovery 成功和最终无回应，避免只观察总请求数。
-3. 对兼容拒绝样本只保存结构指纹；若确需人工审查正文，使用短时诊断开关且不得进入持久报告。
+3. 对兼容拒绝样本使用完整审计记录复核原始上下文、正文和 reasoning，并用同一 wire payload 做最小复现。
 4. 持续统计 `forced_poll`、`final_silence`、普通覆盖和最终 pending 的比例；调度兜底不能掩盖
    provider/schema 的高失败率，也不能扩展为第二个 watchdog 或无限自轮询。
 

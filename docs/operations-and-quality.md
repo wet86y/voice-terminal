@@ -60,6 +60,20 @@ Web 前端和 Voice Server。默认启动不能只依据 `8765/health` 声明成
 
 官方 DeepSeek 直连验收要连续记录多轮 `input_tokens`、`cached_tokens` 与 hit ratio，确认命中会随 append-only 历史增长；中转端点的结果单独记录。若端点未报告 cache usage，状态为不可观测，不得写成或口头解释为“零命中”。
 
+## LLM 完整审计与故障复现
+
+生产默认 `llm.max_output_tokens=393216`，即 [DeepSeek 官方模型规格](https://api-docs.deepseek.com/quick_start/pricing)中的最大输出预算 384K tokens。[Responses API](https://api-docs.deepseek.com/api/create-response/) 规定该参数限制单次响应生成的可见正文与 reasoning token 总和，不限制输入上下文，也不是字节数。任何 `response.incomplete` 都必须记录 provider 的 `incomplete_details.reason`；只有原因为 `max_output_tokens` 时才能归类为输出预算耗尽，不能把普通 `JSON_TRUNCATED` 或 `PROSE_INSTEAD_OF_JSON` 混入这一类。
+
+主服务默认启用独立的 `logs/voice-server-llm-context.jsonl`，并以 `conversation_id + request_id + turn_id + wire_sha256` 关联请求和终态：
+
+- `request_context` version 3 必须保存完整 `messages`、完整 Schema、最终无 HTTP headers 的 `wire_payload`、dispatch/prompt 类型、事件、reasoning effort、上下文估算及比较用哈希；`contains_conversation_content` 必须为 `true`。
+- `request_outcome` version 2 必须保存完整或截至终止时的 `output_text`、`reasoning_text`、provider/local 校验结果和错误分类；取消时必须保存 `cancel_reason`，以区分 `user_interrupted`、`superseded_recovery:*`、`superseded_system_check:*`、reset、stop 和 episode end。
+- API key 与 Authorization header 不属于模型上下文，不进入该文件；除此之外，不得用摘要、长度或哈希替代影响生成和校验的实际内容。
+
+该审计文件包含真实用户、助手和系统内容，单文件 50 MiB、保留 9 个轮转备份，写入由后台队列承担。排查输出异常时应直接使用同一请求的完整 wire payload 和部分/完整输出进行复现，并对照相邻成功请求；不得再把普通 ASR/TTS 日志的近似重建当作精确上下文。旧版 `request_context` version 2 / `request_outcome` version 1 只保留摘要或结构信息，不能逆向恢复正文，统计时必须按版本分层。
+
+每次修改审计格式、provider payload、输出预算或取消传播后，至少验证：完整用户文本和动态 request tail 可在审计记录中读取；wire payload 的 `max_output_tokens` 与有效配置一致；严格成功、无效 JSON、provider incomplete 和取消均产生唯一终态；取消原因以及取消前已接收的正文/reasoning 均未丢失。
+
 ## 语音运行排障
 
 当用户报告“播放后监听退出”或 `audio capture gap` 时，先按以下顺序判断，
