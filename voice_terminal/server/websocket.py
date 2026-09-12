@@ -4,6 +4,7 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ..audio.capture import AudioCapture
 from ..audio.devices import AudioDeviceError
@@ -20,7 +21,13 @@ from ..kws.detector import KwsDetector, KwsError
 from ..providers.deepseek import DeepSeekClient
 from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
-from ..agent.tool_registry import WebSearchTools
+from ..agent.tool_registry import FileTools, WebSearchTools
+from ..shadow_agent import ShadowAgentComponent, ShadowTaskCommand, ShadowTaskEvent
+from ..shadow_agent.component import ShadowAgentSession
+from ..shadow_agent.events import ShadowTaskEventBuffer
+from ..shadow_agent.prompts import load_shadow_instructions
+from ..shadow_agent.provider import DeepSeekResponsesShadowProvider
+from ..shadow_agent.tools import ShadowToolExecutor
 from ..session.ledger import SessionLedger
 from ..session.runtime import ConversationRuntime
 from ..vad.detector import FsmnVadDetector, VadError
@@ -50,7 +57,10 @@ class SessionRuntime:
         self.asr: AsrWorkerClient | None = None
         self.llm: DeepSeekClient | None = None
         self.tts: MiniMaxTtsClient | None = None
-        self.search_tools: WebSearchTools | None = None
+        self.shadow_search_tools: WebSearchTools | None = None
+        self.shadow_component: ShadowAgentComponent | None = None
+        self.shadow_session: ShadowAgentSession | None = None
+        self._shadow_pending = ShadowTaskEventBuffer()
         self.player: PcmPlayer | None = None
         self.audio_processor: AudioPreprocessor | None = None
         self.controller: EpisodeController | None = None
@@ -165,9 +175,6 @@ class SessionRuntime:
                 reasoning_effort=self.config.llm.reasoning_effort,
                 transport=self.config.llm.transport,
                 max_output_tokens=self.config.llm.max_output_tokens,
-                shadow_enabled=self.config.llm.shadow_enabled,
-                shadow_sample_rate=self.config.llm.shadow_sample_rate,
-                shadow_thinking_enabled=self.config.llm.shadow_thinking_enabled,
                 thinking_action_enabled=self.config.llm.thinking_action_enabled,
                 protocol_recovery_limit=self.config.llm.protocol_recovery_limit,
                 transport_retry_limit=self.config.llm.transport_retry_limit,
@@ -176,24 +183,49 @@ class SessionRuntime:
         else:
             self._record_error("llm", f"未配置 {self.config.llm.api_key_env}")
 
-        minimax_key = self.config.api_key(self.config.tts.api_key_env)
-        if self.config.tools.enabled and self.config.tools.web_search:
-            if not minimax_key:
-                self._disable_optional_search(f"未配置 {self.config.tts.api_key_env}")
+        shadow_cfg = self.config.shadow_agent
+        if shadow_cfg.enabled:
+            shadow_key = self.config.api_key(shadow_cfg.provider.api_key_env)
+            if not shadow_key:
+                self.state.set_service("shadow_agent", "DISABLED")
+                logger.warning("shadow agent disabled: missing %s", shadow_cfg.provider.api_key_env)
             else:
                 try:
-                    self.search_tools = WebSearchTools(MiniMaxSearchClient(
-                        base_url=self.config.tts.base_url,
-                        api_key=minimax_key,
-                        # Search runs inside the existing five-second tool
-                        # guard; keep the provider request bounded similarly.
-                        timeout_ms=5000,
-                    ))
-                    self.state.set_service("web_search", "READY")
+                    search_cfg = shadow_cfg.tools.web_search
+                    search_key = self.config.api_key(search_cfg.api_key_env)
+                    if search_cfg.enabled and search_key:
+                        self.shadow_search_tools = WebSearchTools(MiniMaxSearchClient(
+                            base_url=search_cfg.base_url, api_key=search_key,
+                            timeout_ms=search_cfg.timeout_ms,
+                        ))
+                        self.state.set_service("web_search", "READY")
+                    else:
+                        self.state.set_service("web_search", "DISABLED")
+                    files = FileTools(shadow_cfg.tools.allowed_roots) if shadow_cfg.tools.files_enabled else None
+                    executor = ShadowToolExecutor(files, self.shadow_search_tools,
+                                                   on_status=self._on_shadow_tool_status)
+                    provider = DeepSeekResponsesShadowProvider(
+                        base_url=shadow_cfg.provider.base_url,
+                        model=shadow_cfg.provider.model,
+                        api_key=shadow_key,
+                        timeout_ms=shadow_cfg.provider.timeout_ms,
+                    )
+                    self.shadow_component = ShadowAgentComponent(
+                        provider, executor, instructions_loader=load_shadow_instructions,
+                    )
+                    self.shadow_session = self.shadow_component.new_session(
+                        production_sink=self._on_shadow_events,
+                    )
+                    self.state.set_service("shadow_agent", "READY")
                 except Exception as exc:
-                    self._disable_optional_search(str(exc))
+                    self.state.set_service("shadow_agent", "ERROR")
+                    self.state.set_service("web_search", "DISABLED")
+                    logger.exception("shadow agent initialization failed: %s", exc)
         else:
+            self.state.set_service("shadow_agent", "DISABLED")
             self.state.set_service("web_search", "DISABLED")
+
+        minimax_key = self.config.api_key(self.config.tts.api_key_env)
 
         if minimax_key:
             self.tts = MiniMaxTtsClient(
@@ -242,8 +274,10 @@ class SessionRuntime:
         if self.config.audio.sample_rate != 16000 or self.config.audio.channels != 1 or self.config.audio.sample_format != "int16":
             raise ValueError("session runtime requires 16 kHz mono int16 capture")
         self.controller = EpisodeController(
-            options=self.config.smart_turn, search=self.search_tools, agent_options=self.config.agent,
+            options=self.config.smart_turn, agent_options=self.config.agent,
             persona_config=self.config.persona,
+            shadow_task_dispatcher=self._submit_shadow_task if self.shadow_session else None,
+            shadow_task_available=self.shadow_session is not None,
             state=self.state,
             bus=self.bus,
             history=self.history,
@@ -294,6 +328,10 @@ class SessionRuntime:
                 await self.bus.publish(event("error", code="RUNTIME_NOT_INITIALIZED", message="Voice Runtime 尚未初始化。", recoverable=False))
                 return
             await self.controller.start_listening()
+            pending_buffer = getattr(self, "_shadow_pending", None)
+            pending = pending_buffer.drain() if pending_buffer is not None else []
+            if pending:
+                await self.controller.accept_shadow_task_events(pending)
 
     async def stop_listening(self) -> None:
         async with self._session_lock:
@@ -304,6 +342,12 @@ class SessionRuntime:
         async with self._session_lock:
             if self.controller is not None and hasattr(self.controller, "reset_session"):
                 await self.controller.reset_session()
+            shadow_session = getattr(self, "shadow_session", None)
+            if shadow_session is not None:
+                await shadow_session.reset()
+            pending_buffer = getattr(self, "_shadow_pending", None)
+            if pending_buffer is not None:
+                pending_buffer.drain()
             self.history.reset()
             self.conversation.reset()
             # Reset rotates the conversation but must not silently discard the
@@ -318,12 +362,51 @@ class SessionRuntime:
     async def close(self) -> None:
         if self.controller is not None:
             await self.controller.close()
+        shadow_component = getattr(self, "shadow_component", None)
+        if shadow_component is not None:
+            await shadow_component.close()
         if self.tts is not None:
             await self.tts.close()
         if self.llm is not None:
             await self.llm.close()
         if self.audio_processor is not None:
             self.audio_processor.close()
+
+    async def _submit_shadow_task(self, command: ShadowTaskCommand, history) -> Any:
+        if self.shadow_session is None or not self.shadow_session.available:
+            raise ValueError("影子任务组件当前不可用")
+        return await self.shadow_session.handle_voice(command, history)
+
+    async def _on_shadow_events(self, events: list[ShadowTaskEvent]) -> None:
+        # Stop intentionally ends only the voice episode.  The independent
+        # manager continues, while its coalesced events wait for the next
+        # session.start.
+        controller = self.controller
+        if controller is None or not self.state.listening or controller.episode.closed:
+            for item in events:
+                self._shadow_pending.publish(item)
+            return
+        await controller.accept_shadow_task_events(events)
+
+    def _on_shadow_tool_status(self, name: str, status: str, reason: str) -> None:
+        if name == "web_search" and "web_search" in self.state.services:
+            self.state.set_service("web_search", status)
+            if status != "READY":
+                logger.warning("shadow web search status=%s reason=%s", status, str(reason)[:200])
+
+    async def debug_shadow_task(self, connection_id: str, payload: dict[str, Any], *, event_sink) -> Any:
+        if not self.config.shadow_agent.debug_websocket_enabled:
+            raise ValueError("SHADOW_DEBUG_DISABLED")
+        if self.shadow_session is None or not self.shadow_session.available:
+            raise ValueError("SHADOW_UNAVAILABLE")
+        command = ShadowTaskCommand.parse(payload)
+        return await self.shadow_session.handle_debug(
+            connection_id, command, self.history.settled_history(), event_sink=event_sink,
+        )
+
+    async def close_shadow_debug(self, connection_id: str) -> None:
+        if self.shadow_session is not None:
+            await self.shadow_session.close_debug(connection_id)
 
     def health_payload(self) -> dict[str, Any]:
         return {
@@ -367,7 +450,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
         logger.info("websocket.connected peer=%s", websocket.client)
         sequencer = ProtocolSequencer(lambda: runtime.conversation.conversation_id)
         subscription = runtime.bus.subscribe()
+        connection_id = uuid4().hex
+        debug_events: asyncio.Queue[VoiceEvent] = asyncio.Queue()
         event_task = asyncio.create_task(_forward_events(websocket, subscription, sequencer), name="websocket-events")
+        debug_task = asyncio.create_task(_forward_debug_events(websocket, debug_events, sequencer), name="websocket-shadow-debug")
         # Let the forwarding task register its queue before a fast
         # session.start command can publish the first turn event.
         await asyncio.sleep(0)
@@ -393,6 +479,21 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
                     mode = _payload.get("mode")
                     if not isinstance(mode, str) or not await runtime.set_reasoning_mode(mode):
                         await _send_error(websocket, sequencer, "INVALID_REASONING_MODE", "思考模式必须是 fast、balanced 或 deep。", None, True)
+                elif command == "shadow.debug.task":
+                    async def debug_sink(items: list[ShadowTaskEvent]) -> None:
+                        for item in items:
+                            await debug_events.put(event("shadow.debug.event", None, id=item.id,
+                                                         status=item.status, text=item.text))
+                    try:
+                        receipt = await runtime.debug_shadow_task(connection_id, _payload, event_sink=debug_sink)
+                        await debug_events.put(event("shadow.debug.receipt", None,
+                                                     request_id=message["request_id"], accepted=receipt.accepted,
+                                                     id=receipt.id, status=receipt.status, message=receipt.message))
+                    except ValueError as exc:
+                        code = str(exc)
+                        await _send_error(websocket, sequencer,
+                                          code if code in {"SHADOW_DEBUG_DISABLED", "SHADOW_UNAVAILABLE"} else "INVALID_SHADOW_DEBUG_TASK",
+                                          "影子调试任务不可受理。", None, True)
                 else:
                     await _send_error(websocket, sequencer, "UNKNOWN_COMMAND", f"不支持的命令：{command}", None, True)
         except WebSocketDisconnect:
@@ -402,7 +503,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
         finally:
             logger.info("websocket.disconnected peer=%s", websocket.client)
             event_task.cancel()
-            await asyncio.gather(event_task, return_exceptions=True)
+            debug_task.cancel()
+            await asyncio.gather(event_task, debug_task, return_exceptions=True)
+            await runtime.close_shadow_debug(connection_id)
 
     return app
 
@@ -428,6 +531,15 @@ async def _forward_events(websocket: Any, subscription: Any, sequencer: Protocol
         except Exception:
             pass
         return
+
+
+async def _forward_debug_events(websocket: Any, queue: asyncio.Queue[VoiceEvent], sequencer: ProtocolSequencer) -> None:
+    try:
+        while True:
+            value = await queue.get()
+            await websocket.send_json(sequencer.envelope(value))
+    except asyncio.CancelledError:
+        raise
 
 
 async def _send_error(

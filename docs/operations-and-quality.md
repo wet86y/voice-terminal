@@ -1,8 +1,8 @@
 # 运行与质量门槛
 
-> **当前状态：生产运行。** 默认活动 LLM 路径为 DeepSeek Responses + strict `json_schema`；冻结的 Chat/`json_object` adapter 只作为显式整体回退入口。快速、均衡和深度思考模式均属于生产主链：均衡模式可请求一次本地 `request_thinking` 续请求，深度模式使用 `effort=low`。普通影子双跑仍不属于生产路径。
+> **当前状态：生产运行。** 默认语音 LLM 路径为 DeepSeek Responses + strict `json_schema`；冻结的 Chat/`json_object` adapter 只作为显式整体回退入口。快速、均衡和深度思考模式均属于生产主链：均衡模式可请求一次本地 `request_thinking` 续请求，深度模式使用 `effort=low`。独立影子任务 Agent 默认启用，但没有主 LLM 调度权。
 
-默认 `config/default.yaml` 是当前唯一活动运行线。`smart_turn`、`agent` 与 `tools` 是能力配置，不是版本开关。文件工具默认仅限 `docs`；不包含 Shell、写文件、外部账号操作、RAG 或长期记忆。
+默认 `config/default.yaml` 是当前唯一活动运行线。`smart_turn`、`agent` 与 `shadow_agent` 是能力配置，不是版本开关。影子 external 工具默认仅限 `docs` 文件读取和搜索；不包含 Shell、写文件、外部账号操作、RAG 或长期记忆。旧顶层 `tools` 配置为迁移错误；`shadow_agent` 不属于语音 `can_start` 必要条件。
 
 思考模式在 episode 创建时冻结：`fast` 为 `effort=none` 且不暴露思考 action，`balanced` 的基础请求为 `effort=none` 并可通过本地 `request_thinking` 获得一次 `effort=low` 续请求，`deep` 直接使用 `effort=low`。`request_thinking` 不是 provider native tool；它不能执行外部操作，且新输入、停止监听和 session reset 必须立即取消其等待或续请求。`config/local.yaml` 是本机覆盖文件；正常请求的 Schema 可见性和实际 effort 仍以启动时冻结的 episode `reasoning_mode` 为准，故该文件不能作为生产基线证据。
 

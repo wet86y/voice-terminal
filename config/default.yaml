@@ -11,10 +11,21 @@ smart_turn:
   smart_timeout_ms: 300
   hard_silence_ms: 1400
   max_turn_ms: 60000
-tools:
+shadow_agent:
+  # Optional independent task runtime. It does not participate in the voice
+  # scheduler until a task action is issued, and debug commands stay closed.
   enabled: true
-  web_search: true
-  allowed_roots: [docs]
+  debug_websocket_enabled: false
+  # Omitted provider fields inherit llm.base_url, llm.model and llm.api_key_env.
+  provider: {}
+  tools:
+    files_enabled: true
+    allowed_roots: [docs]
+    web_search:
+      enabled: true
+      base_url: https://api.minimaxi.com
+      api_key_env: MINIMAX_API_KEY
+      timeout_ms: 5000
 
 # Episode-scoped Markdown context. Files are read when a new Agent episode
 # starts and remain frozen for that episode.
@@ -88,11 +99,6 @@ llm:
   timeout_ms: 15000
   # DeepSeek's documented maximum output budget: 384K tokens.
   max_output_tokens: 393216
-  # Ordinary dual-running is disabled: all current decisions use Responses.
-  # Shadow is reserved for the later thinking experiment only.
-  shadow_enabled: false
-  shadow_sample_rate: 1.0
-  shadow_thinking_enabled: false
   # Experimental control action; intentionally independent from transport.
   thinking_action_enabled: false
   protocol_recovery_limit: 1

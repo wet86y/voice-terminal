@@ -1,6 +1,6 @@
 # 架构与组件契约
 
-> 当前为生产运行的 Responses/`json_schema` 协议。活动 LLM 路径只有 Responses；Chat/`json_object` adapter 已冻结，仅用于显式回退。快速、均衡与深度思考模式均经过同一 Agent 主链；普通双路镜像仍不进入生产流量。
+> 当前为生产运行的 Responses/`json_schema` 协议。活动语音 LLM 路径只有 Responses；Chat/`json_object` adapter 已冻结，仅用于显式回退。快速、均衡与深度思考模式均经过同一 Agent 主链；独立影子任务 Agent 已进入生产装配，但不拥有主 LLM 调度权。
 
 `SessionRuntime` 是唯一装配入口。它协调但不实现输入、Agent 或语音细节。
 
@@ -26,11 +26,12 @@ DeepSeek 的 `deepseek-flash`，读取 `DEEPSEEK_API_KEY`；调试 OpenCode Go �
 | --- | --- | --- | --- |
 | Conversation runtime | 生命周期事件 | `conversation_id`、`turn_id`、取消作用域、日期 epoch | 生命周期、显式取消 authority 与稳定日期基准 |
 | Input pipeline | PCM、VAD、ASR、分析结果 | `TurnWorkspace` | 维护当前轮次、阶段、Paraformer 主文本与 SenseVoice 补充证据 |
-| Session ledger | 最终输入、传达报告、选中的工具交换 | append-only 可缓存 HISTORY | 唯一持久上下文事实源 |
+| Session ledger | 最终输入、传达报告、影子 task receipt/事件 | append-only 可缓存 HISTORY | 唯一持久上下文事实源；影子文本始终投影为不可信数据 |
 | LLM provider boundary | 带 `ContextLane` 的 frames、冻结 schema | 统一 `content/reasoning/usage/finish` 事件 | 缓存稳定投影、lane 校验、usage cache 指标归一化、strict Schema；保留冻结 Chat 回退 adapter |
-| Agent runtime | 账本投影、当前运行态、episode 级人格文档快照 | V0.6 JSON `speak` 决策 | 唯一 `AgentDecisionScheduler`、固定400ms心跳、普通优先的阶梯强制调度、static/history/tail context、信封校验、思考模式控制与有限恢复 |
+| Agent runtime | 账本投影、当前运行态、episode 级人格文档快照 | V0.6 JSON `speak` 决策与 `task` 命令 | 唯一 `AgentDecisionScheduler`、固定400ms心跳、普通优先的阶梯强制调度、static/history/tail context、信封校验、思考模式控制；完整 decision 后立即通过窄 bridge 提交 task |
 | LLM audit runtime | 完整 messages、Schema、wire payload、provider 增量与终态 | 关联的 `request_context` / `request_outcome` JSONL | 保存可逐请求复现的完整上下文、正文、reasoning、校验结果与取消原因 |
-| Action runtime | 本地 `actions` 请求 | `ToolExchange` | 只读执行、缓存与来源标记 |
+| ShadowAgentComponent | 独立任务命令、已结算 user/assistant 历史 | task event buffer | 独立 Responses high-reasoning agent、严格连续任务 ID、4 秒安全 checkpoint、30 秒截止、revision 防迟到、共享只读工具槽 |
+| Shadow tool executor | 影子 agent 原生 function calls | `function_call_output` | external 域只读文件/网络能力；internal 域暂不公开函数，未来调度协调从受控端口扩展 |
 | Speech runtime | 文本 speak 队列、TTS、播放器 | `SpeechItem`、`DeliveryReport` | `empty/queued/suspended/speaking`、同轮所有权、严格前缀追加、跨轮防重、实质分歧抢占与传达结算 |
 | Protocol projection | 内部事件 | V0.6 Envelope | 唯一网络协议边界 |
 
@@ -44,6 +45,14 @@ Agent episode 在第一次真正建立 `episode_id` 时读取 `config/persona/` 
 之后，顺序固定为“指令集合 → 人格主体 → 用户资料”。内置协议、本地 Schema、动作
 权限和语音运行时始终是最终权威，文档只能补充对话行为、人格风格和用户事实。
 
+影子任务在创建时只复制已经结算的 `user`/实际传达的 `assistant` 历史，并冻结
+`config/shadow_agent/instructions.md`。它不读取语音人格文件、当前播放状态、REQUEST_TAIL、
+语音动作目录或未播放文本。主语音模型只可用 `task(id,state,text)` 请求、修改、查询或取消
+任务；`id`、`state`、`text` 始终必填，state 为 `request|modify|cancel`。影子事件经 session
+bridge 写入账本：receipt 和 `running` 不唤醒调度器，`completed|cancelled|timed_out|failed` 仅向
+已有 mailbox 投递 `SHADOW_TASK_TERMINAL`，由下一次 400ms heartbeat 决定是否发起一条主请求。
+影子组件不得直接调用语音 LLM、TTS、播放器或 scheduler。
+
 输入中断只能通过显式取消作用域停止当前语音；普通语音活动、定稿、精修和工具结果不会取消在飞请求。用户在 `playback_started=false` 阶段开口时，输出层将未播放候选标记为 `HELD`，保留文本、handle 和当前推理状态；没有候选时则设置全局 hold，使随后完成的候选也等待。TTS session 或 provider 首段音频已经存在，都不代表已经开始播放。`SPEECH_ENDED` 后才释放最新的 `HELD` 候选，恢复同一文本事务；用户的新 ASR 信息仍由 400ms 单飞调度窗口合并，不直接启动第二个请求。只有播放器首次实际提交非零 PCM 后，确认的 barge-in 才进入显式取消路径。完整 `speak.text` 的前缀继承由 `conversation_id + turn_id` 所有权限定：只有活动 handle 属于当前轮时，模型才获得 `target_text` 和 `continuation_allowed=true`，完整覆盖旧文本时只创建 suffix 后续队列，前缀范围内出现差异时才创建 replacement generation。上一轮仍在播放的文本以 `observed_text` 暴露并标记 `owner_scope=previous_turn`，只提供会话认知，不授予续写权；上一轮已经结算后通过 ledger 的 assistant 历史继续可见。Speech Queue 中未开始的项目不会写入 heard_text，只保存文本；当前输出耗尽后保留 1 秒同轮追加窗口。最近一次 full delivery 只作为跨轮异常防重 guard，不进入活动快照：检测到“已听文本 + 非空后缀”时仅提交后缀，完全相同文本则保留合法复述。`request_id`、`speech_id` 和 `output_generation` 只用于追踪与播放器代际校验，不参与语义判旧。等待结束当前决策，而不结束连续对话。
 
 ### AEC 保护的播放期插话
@@ -54,13 +63,13 @@ Agent episode 在第一次真正建立 `episode_id` 时读取 `config/persona/` 
 
 Responses 边界因供应商 strict 子集要求所有声明属性均为 required：`wait/cancel` 使用空 `speak.text`，异构 action 使用中性占位字段；进入 Agent 后立即投影回原有内部契约。本地信封校验和 action adapter 不得因 provider 返回 `completed` 或标记 `strict=true` 而跳过。
 
-DeepSeek provider 的输出预算固定为 `393216`（384K tokens），覆盖 reasoning 与可见正文。Agent 在 provider 调用前将完整请求写为 `request_context` version 3，在唯一终态处将完整或部分输出写为 `request_outcome` version 2。取消通过 `Task.cancel(reason)` 将真正的生命周期来源传入终态审计。新用户输入不得淘汰已启动的普通、恢复或 system-check 请求；它只能进入统一心跳邮箱。历史审计中的 `superseded_recovery:*` 和 `superseded_system_check:*` 属于已移除的旧抢占链路，必须与播放期 `user_interrupted` 分开统计。审计写入使用独立后台队列和轮转文件，不参与实时调度，也不进入会话 ledger。
+DeepSeek provider 的输出预算固定为 `393216`（384K tokens），覆盖 reasoning 与可见正文。Agent 在 provider 调用前将完整请求写为 `request_context` version 3，在唯一终态处将完整或部分输出写为 `request_outcome` version 2。取消通过 `Task.cancel(reason)` 将真正的生命周期来源传入终态审计。新用户输入不得淘汰已启动的普通、恢复或 system-check 请求；它只能进入统一心跳邮箱。流式阶段已入队且合法的非空 `speak` 即使后续信封或 actions 校验失败，也保留并完成播放；未验证字段静默忽略，记录 `LLM_OUTPUT_COMPAT_SPEAK_ACCEPTED`，并把下一次普通调度交给心跳。只有 speak 本身不合法或未入队时才进入有限 protocol recovery。历史审计中的 `superseded_recovery:*` 和 `superseded_system_check:*` 属于已移除的旧抢占链路，必须与播放期 `user_interrupted` 分开统计。审计写入使用独立后台队列和轮转文件，不参与实时调度，也不进入会话 ledger。
 
 ## AgentDecisionScheduler 调度契约
 
 Agent runtime 只有一个 `AgentDecisionScheduler` 实例和一个 `_run()` 循环。`_run()` 以固定 deadline 持续推进本地 400ms 心跳：下一次 deadline 等于上一次 deadline 加 400ms，不使用“当前时间加400ms”的漂移式计时。心跳只读取唤醒信号、合并 `pending`、观察 active request/TTS/用户输入状态、推进窗口并决定是否创建一个 LLM task；它不等待正在运行的 provider，也不为每个心跳调用 provider。
 
-普通事件在400ms边界合并为一次请求。普通语义事件包括 ASR segment/final、SenseVoice 有语义变化的 refinement、工具完成和 thinking barrier 完成等现有事件。`SPEECH_STARTED`、`SPEECH_ENDED`、`ENDPOINT_CANDIDATE`、`VOICE_ACTIVE` 只作为本地活动信号，不覆盖强制窗口；所有 `TTS_*` 事件完全属于输出侧生命周期，不进入调度 mailbox、不重置静默锚点、不触发普通或强制请求。
+普通事件在400ms边界合并为一次请求。普通语义事件包括 ASR segment/final、SenseVoice 有语义变化的 refinement、影子任务终态和 thinking barrier 完成等现有事件。影子 `running` 只记录进度、不会唤醒；终态与 ASR 更新同一边界合并，仍受单请求并发限制。`SPEECH_STARTED`、`SPEECH_ENDED`、`ENDPOINT_CANDIDATE`、`VOICE_ACTIVE` 只作为本地活动信号，不覆盖强制窗口；所有 `TTS_*` 事件完全属于输出侧生命周期，不进入调度 mailbox、不重置静默锚点、不触发普通或强制请求。
 
 ### 流式 ASR final 确认与连续输入
 

@@ -11,8 +11,7 @@ from .turn_workspace import AudioFrame, CurrentTurnAudioBuffer, TurnWorkspace
 from .transcript_segmenter import TranscriptSegmenter
 from .options import InputOptions
 from ..analysis.client import AnalysisClient
-from ..agent.speculative_tools import ActionRunner
-from ..agent.tool_registry import FileTools, WebSearchTools
+from ..agent.task_registry import VoiceTaskRegistry
 from ..asr.protocol import AudioChunk
 from ..core.events import event, utc_now_iso
 from ..core.state import TerminalState
@@ -25,19 +24,15 @@ logger = logging.getLogger(__name__)
 class RealtimeController(SpeechPipeline, InputController):
     """Realtime input orchestration used by the session runtime."""
 
-    def __init__(self, *, options: InputOptions, analysis=None, search: WebSearchTools | None = None, **kwargs) -> None:
+    def __init__(self, *, options: InputOptions, analysis=None,
+                 shadow_task_dispatcher=None, shadow_task_available: bool = False, **kwargs) -> None:
         self.conversation = kwargs.pop("conversation")
         super().__init__(**kwargs)
         self.options = options
         self.analysis = analysis or AnalysisClient(options.analysis_url)
         self.analysis_health: dict = {}
-        self.registry = ActionRunner(
-            FileTools(options.allowed_roots),
-            search=search,
-            on_status=self._on_tool_status,
-        )
-        if "web_search" in self.state.services and (search is None or not search.available):
-            self.state.set_service("web_search", "DISABLED")
+        self.shadow_task_dispatcher = shadow_task_dispatcher
+        self.registry = VoiceTaskRegistry(available=shadow_task_available)
         self.workspace: TurnWorkspace | None = None
         self.segmenter = TranscriptSegmenter(options.min_segment_chars, options.max_segment_chars)
         self._endpoint_task: asyncio.Task | None = None
@@ -181,16 +176,6 @@ class RealtimeController(SpeechPipeline, InputController):
 
         output = getattr(self, "output", None)
         return getattr(output, "_tts_session", None) if output is not None else getattr(self, "_tts_session", None)
-
-    def _on_tool_status(self, name: str, status: str, reason: str) -> None:
-        if name == "web_search" and "web_search" in self.state.services:
-            # This hook can run in the bounded worker thread.  It only updates
-            # the small in-memory status map; event publication stays on the
-            # event-loop path in _tool_event.
-            self.state.set_service("web_search", status)
-            if status != "READY":
-                safe_reason = " ".join(str(reason or "搜索服务不可用").split())[:200]
-                logger.warning("web_search.status status=%s reason=%s", status, safe_reason)
 
     async def _detail(self, type_: str, **payload) -> None:
         ws = self.workspace

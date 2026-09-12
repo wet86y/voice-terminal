@@ -113,9 +113,6 @@ class LlmConfig:
     timeout_ms: int = 15000
     transport: str = "chat_completions"
     max_output_tokens: int = 393216
-    shadow_enabled: bool = False
-    shadow_sample_rate: float = 1.0
-    shadow_thinking_enabled: bool = False
     thinking_action_enabled: bool = False
     protocol_recovery_limit: int = 1
     transport_retry_limit: int = 2
@@ -133,8 +130,6 @@ class LlmConfig:
             raise ValueError("llm.reasoning_effort must be low, high, or max")
         if self.max_output_tokens <= 0 or self.timeout_ms <= 0:
             raise ValueError("llm token and timeout limits must be positive")
-        if not 0 <= self.shadow_sample_rate <= 1:
-            raise ValueError("llm.shadow_sample_rate must be between zero and one")
         if self.protocol_recovery_limit < 0:
             raise ValueError("llm.protocol_recovery_limit cannot be negative")
         if self.transport_retry_limit < 0:
@@ -208,10 +203,44 @@ class AsrWorkerConfig:
 
 
 @dataclass(frozen=True)
-class ToolConfig:
+class ShadowProviderConfig:
+    """Dedicated Responses provider settings for the shadow component."""
+
+    base_url: str = "https://api.deepseek.com"
+    model: str = "deepseek-flash"
+    api_key_env: str = "DEEPSEEK_API_KEY"
+    timeout_ms: int = 15000
+
+    def __post_init__(self) -> None:
+        if self.timeout_ms <= 0:
+            raise ValueError("shadow_agent.provider.timeout_ms must be positive")
+
+
+@dataclass(frozen=True)
+class ShadowWebSearchConfig:
     enabled: bool = True
-    web_search: bool = True
-    allowed_roots: tuple[str, ...] = ("docs",)
+    base_url: str = "https://api.minimaxi.com"
+    api_key_env: str = "MINIMAX_API_KEY"
+    timeout_ms: int = 5000
+
+    def __post_init__(self) -> None:
+        if self.timeout_ms <= 0:
+            raise ValueError("shadow_agent.tools.web_search.timeout_ms must be positive")
+
+
+@dataclass(frozen=True)
+class ShadowToolsConfig:
+    files_enabled: bool = True
+    allowed_roots: tuple[Path, ...] = (Path("docs"),)
+    web_search: ShadowWebSearchConfig = field(default_factory=ShadowWebSearchConfig)
+
+
+@dataclass(frozen=True)
+class ShadowAgentConfig:
+    enabled: bool = True
+    debug_websocket_enabled: bool = False
+    provider: ShadowProviderConfig = field(default_factory=ShadowProviderConfig)
+    tools: ShadowToolsConfig = field(default_factory=ShadowToolsConfig)
 
 
 @dataclass(frozen=True)
@@ -228,7 +257,7 @@ class PersonaConfig:
 class AppConfig:
     smart_turn: InputOptions = field(default_factory=InputOptions)
     agent: AgentOptions = field(default_factory=AgentOptions)
-    tools: ToolConfig = field(default_factory=ToolConfig)
+    shadow_agent: ShadowAgentConfig = field(default_factory=ShadowAgentConfig)
     persona: PersonaConfig = field(default_factory=PersonaConfig)
     model_dir: Path = Path(r"D:\模型\voice-terminal")
     debug_audio_capture: bool = False
@@ -289,6 +318,9 @@ class AppConfig:
         server = _section(data, "server")
         worker = _section(data, "asr_worker")
         persona = _section(data, "persona")
+        shadow = _section(data, "shadow_agent")
+        if "tools" in data:
+            raise ValueError("顶层 tools 配置已迁移至 shadow_agent.tools，请更新配置文件")
 
         configured_llm_provider = _string(llm.get("provider"), "deepseek")
         llm_provider_override = os.environ.get("VOICE_LLM_PROVIDER", "").strip()
@@ -347,20 +379,41 @@ class AppConfig:
             chunk_size = (0, 10, 5)
 
         smart_turn_data = dict(_section(data, "smart_turn"))
-        tool_data = _section(data, "tools")
-        smart_turn_data.update({
-            "enabled": True,
-            "tools": _bool(tool_data.get("enabled"), True),
-            "web_search": _bool(tool_data.get("web_search"), True),
-            "allowed_roots": tool_data.get("allowed_roots", ["docs"]),
-        })
+        smart_turn_data["enabled"] = True
+
+        shadow_provider = _section(shadow, "provider")
+        shadow_tools = _section(shadow, "tools")
+        shadow_search = _section(shadow_tools, "web_search")
+        raw_shadow_roots = shadow_tools.get("allowed_roots", ["docs"])
+        if not isinstance(raw_shadow_roots, list) or not all(isinstance(item, str) and item.strip() for item in raw_shadow_roots):
+            raise ValueError("shadow_agent.tools.allowed_roots must be a nonempty list of paths")
+        shadow_roots = tuple(
+            path if path.is_absolute() else (root / path).resolve()
+            for path in (Path(item) for item in raw_shadow_roots)
+        )
         return cls(
             smart_turn=InputOptions.from_mapping(smart_turn_data, root),
             agent=AgentOptions.from_mapping(_section(data, "agent")),
-            tools=ToolConfig(enabled=_bool(tool_data.get("enabled"), True),
-                             web_search=_bool(tool_data.get("web_search"), True),
-                             allowed_roots=tuple(item for item in tool_data.get("allowed_roots", ["docs"])
-                                                 if isinstance(item, str) and item.strip()) or ("docs",)),
+            shadow_agent=ShadowAgentConfig(
+                enabled=_bool(shadow.get("enabled"), True),
+                debug_websocket_enabled=_bool(shadow.get("debug_websocket_enabled"), False),
+                provider=ShadowProviderConfig(
+                    base_url=_string(shadow_provider.get("base_url"), llm_base_url),
+                    model=_string(shadow_provider.get("model"), llm_model),
+                    api_key_env=_string(shadow_provider.get("api_key_env"), llm_api_key_env),
+                    timeout_ms=int(_number(shadow_provider.get("timeout_ms"), 15000)),
+                ),
+                tools=ShadowToolsConfig(
+                    files_enabled=_bool(shadow_tools.get("files_enabled"), True),
+                    allowed_roots=shadow_roots,
+                    web_search=ShadowWebSearchConfig(
+                        enabled=_bool(shadow_search.get("enabled"), True),
+                        base_url=_string(shadow_search.get("base_url"), "https://api.minimaxi.com"),
+                        api_key_env=_string(shadow_search.get("api_key_env"), "MINIMAX_API_KEY"),
+                        timeout_ms=int(_number(shadow_search.get("timeout_ms"), 5000)),
+                    ),
+                ),
+            ),
             persona=PersonaConfig(
                 directory=path_or_none(persona.get("directory")) or root / "config" / "persona",
                 personality_file=_string(persona.get("personality_file"), "personality.md"),
@@ -431,9 +484,6 @@ class AppConfig:
                 timeout_ms=int(_number(llm.get("timeout_ms"), 15000)),
                 transport=_string(llm.get("transport"), "chat_completions"),
                 max_output_tokens=int(_number(llm.get("max_output_tokens"), 393216)),
-                shadow_enabled=_bool(llm.get("shadow_enabled"), False),
-                shadow_sample_rate=float(_number(llm.get("shadow_sample_rate"), 1.0)),
-                shadow_thinking_enabled=_bool(llm.get("shadow_thinking_enabled"), False),
                 thinking_action_enabled=_bool(llm.get("thinking_action_enabled"), False),
                 protocol_recovery_limit=max(0, int(_number(llm.get("protocol_recovery_limit"), 1))),
                 transport_retry_limit=max(0, int(_number(llm.get("transport_retry_limit"), 2))),
