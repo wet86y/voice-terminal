@@ -79,6 +79,10 @@ system-check 必须使用独立 `system_check_id`，不创建用户 `InputRecord
 已被听到的输出才进入 assistant ledger。reset、stop 和 episode end 后应清理 heartbeat、runner、
 active request 与 scheduler 状态。
 
+ASR 更新验收必须分别覆盖 Paraformer final 单独到达、SenseVoice refinement 后到、二者同一 400ms 窗口、相同文本以及晚到旧轮 refinement。每个首次合法 source revision 都必须进入同一 `turn_id` 的 `transcript_updates`；相同 provider callback 才允许按 revision 幂等去除，不得以规范化文本相同为由吞掉更新。检查 `transcript.update` 与 `transcript.dispatch` 日志中的 kind、revision、`available`、`triggered_by` 和 `same_turn`，不得再依赖 `confirmed/suffix/rewrite`。
+
+delivery 验收应构造 provider 字幕全部落在播放器时长之外而 PCM/设备尾部完整输出的场景，最终必须为 `full + playback_complete + completed_playback_authoritative`。同时检查 `speech.settling_started → speech.history_committed → speech.settling_finished` 顺序；在 history commit 返回前，即使 400ms heartbeat 已到，scheduler 也必须因 TTS busy 而拒绝 dispatch。同一 `speech_id` 重放 completion 时，assistant ledger 必须恰好只有一条记录。中断、替换、零 PCM 与播放失败不得使用完整播放兜底。
+
 软件通过后仍必须在真实设备完成：[V0.6 可靠性审计](v06-reliability-audit.md)
 定义的核心 10 条人工验收，覆盖自然语音、耳机和扬声器下的打断、连续多轮、
 停止/重置、真实 ASR/Analysis/LLM/TTS 链路，以及结束至实际首音的 p50/p95。

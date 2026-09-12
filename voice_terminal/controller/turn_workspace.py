@@ -71,6 +71,7 @@ class TurnWorkspace:
     # arrive later and is retained separately as supplemental evidence.
     refined_text: str = ""
     refinement_available: bool = False
+    transcript_updates: list[dict] = field(default_factory=list)
     final_text: str = ""
     staged_response: str = ""
     audio_cues: list[dict] = field(default_factory=list)
@@ -108,6 +109,10 @@ class TurnWorkspace:
         self.committed = False
         self.staged_response = ""
         self.final_text = ""
+        self.paraformer_final = ""
+        self.refined_text = ""
+        self.refinement_available = False
+        self.transcript_updates.clear()
         self.audio_cues.clear()
         self.agent_phase = "IDLE"
         self.tts_segments.clear()
@@ -121,6 +126,7 @@ class TurnWorkspace:
             "committed": self.committed, "agent_phase": self.agent_phase,
             "paraformer_final": self.paraformer_final, "refined_text": self.refined_text,
             "refinement_available": self.refinement_available,
+            "transcript_updates": [dict(item) for item in self.transcript_updates],
             "tts_prewarm_started": self.tts_prewarm_started,
             "tts_prewarm_status": self.tts_prewarm_status,
             "segments": list(self.segments),

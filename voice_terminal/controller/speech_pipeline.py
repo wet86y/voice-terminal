@@ -611,6 +611,7 @@ class SpeechPipeline:
             # the transaction can be retried once by EpisodeSpeechOutput.
             ws.timings["tts_audio_bytes"] = audio_returned_bytes
             ws.timings["tts_text_sent"] = int(tts_text_sent)
+            ws.timings["playback_output_complete"] = False
             if session and tts_text_sent and audio_returned_bytes == 0 and tts_failed is None:
                 tts_failed = RuntimeError("MiniMax TTS 已确认结束但未返回 PCM")
                 tts_disabled = True
@@ -624,6 +625,7 @@ class SpeechPipeline:
                 playback_timeout = max(120.0, 30.0 + self.player.buffered_ms / 1000)
                 try:
                     await self.player.wait_until_output_complete(timeout_seconds=playback_timeout)
+                    ws.timings["playback_output_complete"] = True
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:

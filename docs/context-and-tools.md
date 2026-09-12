@@ -2,7 +2,9 @@
 
 每次模型请求只能由统一调度器通过 `LLMContextProjector`、`SessionLedger` 和显式 `ContextLane` 生成。当前活动路径是 DeepSeek Responses + strict `json_schema`，返回必填的 `speak` 决策和可选本地 `actions`，不使用 native tool calling；冻结的 Chat/`json_object` 路径只允许显式回退。
 
-上下文分为三层：稳定 Agent 规则、会话日期基准、冻结动作目录、schema compatibility 和 episode 级人格文档是 `STATIC_INSTRUCTIONS`，只进入 Responses `instructions`；最终用户输入、实际听到的助手 `heard_text`、已结算打断/替换、工具资料和持久精修是 append-only `HISTORY`；秒级时间、跨午夜日期 epoch、当前 speak 状态/完整 target_text、本轮精修、工具可用性和恢复反馈是 `REQUEST_TAIL`，只追加在当前请求末尾。未播放输出绝不写入历史。完整字段准入与缓存约束见[LLM 上下文缓存契约](llm-context-cache-contract.md)。
+上下文分为三层：稳定 Agent 规则、会话日期基准、冻结动作目录、schema compatibility 和 episode 级人格文档是 `STATIC_INSTRUCTIONS`，只进入 Responses `instructions`；最终用户输入、实际听到的助手内容、已结算打断/替换、工具资料是 append-only `HISTORY`；秒级时间、跨午夜日期 epoch、当前 speak 状态/完整 target_text、当前调度涉及的转录更新、工具可用性和恢复反馈是 `REQUEST_TAIL`，只追加在当前请求末尾。每个 `turn_id` 在 HISTORY 中只生成一个 user frame，内容形如 `用户语音最终文本：{"asr_final":"…","refinement":"…"}`；精修到达时更新原 ledger input 的 metadata，不创建新的 user/system 消息。未播放输出绝不写入历史。完整字段准入与缓存约束见[LLM 上下文缓存契约](llm-context-cache-contract.md)。
+
+`runtime.transcript_updates` 是当前请求的同轮修订状态：`available` 保存 Paraformer `asr_final` 与 SenseVoice `refinement` 的完整文本、来源和 revision，`triggered_by` 仅说明本次 400ms 调度由哪类更新唤醒。两类更新可以独立到达，也可以在同一窗口自然合并；它们不是新用户发言。模型必须结合 `runtime.speak` 和 assistant HISTORY 判断 `wait`、必要后缀追加、实质错误替换或 `cancel`。本地只校验非空、`turn_id`、source revision 和幂等，不比较文本含义，也不发送 `confirmed/suffix/rewrite` relation。
 
 每次 provider 派发都会把这三层投影后的完整 messages、最终 Responses wire payload 和 Schema 写入独立 LLM 审计文件。审计记录不是会话事实源，也不参与下一轮投影；它只用于逐请求诊断和复现，因此保存未脱敏的真实上下文、模型正文与 reasoning。旧版只含哈希/长度的记录不能用于精确还原。
 
@@ -10,7 +12,7 @@
 
 主语音模型不直接调用文件或网络工具。它只有 `task(id,state,text,question_id)`：新任务使用 `request`，活动任务的补充方向使用 `modify`，取消使用 `cancel`，对影子 `awaiting_user` 或 `paused` 问题的明确用户答复使用 `reply`；四个字段均为 strict Schema 必填字段，只有 reply 使用非空 question_id。影子 agent 在 external 域自主进行多轮原生 function calling，并可通过内部控制函数 `request_user_clarification(question, options)` 请求主助手代理提问；首期只允许受限目录文件搜索/读取与联网搜索。任务受理、修改、答复和取消可以在用户讲话中发生。`running` checkpoint 只入账；`awaiting_user`、`paused` 与终态统一作为事件进入同一个 `AgentDecisionScheduler` 的下一次 400ms 普通调度，新输入、精修和任务晚到不会让在飞请求失效。`session.stop` 保留生产任务并缓冲事件，`session.reset` 与 runtime close 才终止生产任务；调试 sandbox 断连即终止。
 
-TTS 和语音活动属于运行时状态，不是新的语义事件。TTS 开始、结束、取消、替换和失败不会重置用户静默锚点、加入 `pending` 或触发 LLM；TTS 是否正在播放或有待播内容，只决定当前心跳是否允许实际 dispatch。强制请求仍调用普通 `_step()`/provider stream 链路，但使用独立 `system_check_id`，不创建用户轮次或 `InputRecord`。只有用户实际听到的 system-check speech 才经 delivery report 写入 assistant ledger。
+TTS 和语音活动属于运行时状态，不是新的语义事件。TTS 开始、结束、取消、替换和失败不会重置用户静默锚点、加入 `pending` 或触发 LLM；TTS 是否正在播放、待播或处于内部 `settling`，只决定当前心跳是否允许实际 dispatch。输出层必须在清空 active handle 之前建立 settling 屏障，并等待 `speech.completed` controller 回调把可靠 assistant 内容按 `speech_id` 幂等写入 ledger；回调返回后才解除屏障。强制请求仍调用普通 `_step()`/provider stream 链路，但使用独立 `system_check_id`，不创建用户轮次或 `InputRecord`。只有用户实际听到的 system-check speech 才经 delivery report 写入 assistant ledger。
 
 action definitions、由其构建的 strict schema、`request_thinking` 可见性和动作目录在 Agent episode 开始时冻结。生产语音目录只会在影子组件可用时公开 `task`；组件不可用不阻止会话启动，也不会向主模型暴露该 action。影子 provider/工具配置独立位于顶层 `shadow_agent`；旧顶层 `tools` 块被明确拒绝，不能静默映射。`request_thinking` 是本地控制 action，不是业务工具；task 也不产生 `ToolExchange`，而是通过 task receipt/event 写入 ledger。
 

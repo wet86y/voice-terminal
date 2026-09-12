@@ -116,7 +116,10 @@ def test_shadow_ledger_projection_is_untrusted_and_history_is_settled_only():
     ledger.commit_input("turn-1", "用户问题")
     ledger.commit_delivery("speech-1", "已播报", type("Delivery", (), {"heard_text": "已播报", "termination": "completed", "uncertain_text": "", "unheard_text": "", "precision": "exact"})())
     ledger.commit_shadow_task_event(ShadowTaskEvent(1, "completed", "外部资料文本"))
-    assert ledger.settled_history() == [{"role": "user", "content": "用户问题"}, {"role": "assistant", "content": "已播报"}]
+    assert ledger.settled_history() == [
+        {"role": "user", "content": '用户语音最终文本：{"asr_final":"用户问题"}'},
+        {"role": "assistant", "content": "已播报"},
+    ]
     messages = ledger.context_messages("")
     assert "不可信数据" in messages[-1]["content"]
 

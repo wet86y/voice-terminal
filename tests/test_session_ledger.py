@@ -42,3 +42,44 @@ def test_context_projects_current_input_as_tail_and_runtime_time_excludes_schedu
     assert '"local_time"' in rendered and '"precision":"second"' in rendered
     assert '"input_status":"speaking"' in rendered
     assert "SPEECH_STARTED" not in rendered
+
+
+def test_final_and_refinement_share_one_user_history_frame_and_runtime_update_object():
+    ledger = SessionLedger()
+    ledger.commit_input("turn-a", "明天开会")
+    ledger.update_input_refinement("turn-a", "明天下午开会")
+
+    messages = ledger.context_messages("")
+    user_messages = [item for item in messages if item["role"] == "user"]
+    assert len(user_messages) == 1
+    assert json.loads(user_messages[0]["content"].removeprefix("用户语音最终文本：")) == {
+        "asr_final": "明天开会",
+        "refinement": "明天下午开会",
+    }
+    assert not any(item["role"] == "system" and "精修补充" in item["content"] for item in messages)
+
+    current = CurrentInput(
+        text="明天开会", finalized=True, turn_id="turn-a",
+        recent_events=("USER_INPUT_REFINED",),
+        transcript_updates=(
+            {"kind": "asr_final", "source": "paraformer", "text": "明天开会", "revision": 1},
+            {"kind": "refinement", "source": "sensevoice", "text": "明天下午开会", "revision": 2},
+        ),
+    )
+    runtime = LLMContextProjector.runtime_tail(current=current, speak_state={"state": "empty"})
+    assert '"same_user_turn":true' in runtime
+    assert '"triggered_by":["refinement"]' in runtime
+
+
+def test_full_delivery_commits_original_speech_once_even_if_alignment_heard_text_is_empty():
+    ledger = SessionLedger()
+    delivery = DeliveryReport(
+        status="full", termination="completed", heard_text="", precision="playback_complete",
+    )
+
+    assert ledger.commit_delivery("speech-a", "完整回答", delivery) is True
+    assert ledger.commit_delivery("speech-a", "重复写入", delivery) is False
+    assistant = [entry for entry in ledger.entries if entry.kind == "speech"]
+    assert len(assistant) == 1
+    assert assistant[0].content == "完整回答"
+    assert ledger.has_speech("speech-a") is True

@@ -53,7 +53,9 @@ def test_context_projection_keeps_identical_text_for_a_new_turn() -> None:
     messages = LLMContextProjector().project(ledger, CurrentInput(
         text="重复文本", primary_transcript="重复文本", finalized=True, turn_id="turn_b",
     ))
-    assert [message for message in messages if message.get("role") == "user"] == [
-        {"role": "user", "content": "重复文本", "context_lane": ContextLane.HISTORY},
+    user_messages = [message for message in messages if message.get("role") == "user"]
+    assert user_messages == [
+        {"role": "user", "content": '用户语音最终文本：{"asr_final":"重复文本"}',
+         "context_lane": ContextLane.HISTORY},
         {"role": "user", "content": "重复文本", "context_lane": ContextLane.REQUEST_TAIL},
     ]

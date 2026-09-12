@@ -28,6 +28,7 @@ class EpisodeController(RealtimeController):
         self.episode_history: dict[str, str] = {}
         self._input_history_committed: set[str] = set()
         self._refinement_events: set[str] = set()
+        self._refinement_agent_events: set[str] = set()
         self._committed_workspaces: dict[str, object] = {}
         self._settled_turns: set[str] = set()
 
@@ -62,7 +63,22 @@ class EpisodeController(RealtimeController):
                 payload.get("delivery") if isinstance(payload.get("delivery"), dict) else None,
                 termination=str(payload.get("status") or "completed"),
             )
-            self.history.commit_delivery(str(payload.get("speech_id") or ""), str(payload.get("text") or ""), delivery)
+            speech_id = str(payload.get("speech_id") or "")
+            added = self.history.commit_delivery(
+                speech_id, str(payload.get("text") or ""), delivery,
+            )
+            await self.episode.log(
+                "SPEECH_HISTORY_COMMITTED",
+                identity=(payload.get("conversation_id"), payload.get("request_id")),
+                turn_id=str(payload.get("turn_id") or ""),
+                speech_id=speech_id,
+                added=added,
+                history_present=self.history.has_speech(speech_id),
+            )
+            logger.info(
+                "speech.history_committed speech_id=%s turn_id=%s added=%s history_present=%s",
+                speech_id, payload.get("turn_id"), added, self.history.has_speech(speech_id),
+            )
             if payload.get("owner_scope") != "system_check":
                 await self._settle_committed_turn(
                     str(payload.get("turn_id") or ""),
@@ -292,8 +308,14 @@ class EpisodeController(RealtimeController):
 
     async def _input_committed(self, ws, token):
         if ws.final_text:
+            if not any(item.get("kind") == "asr_final" for item in ws.transcript_updates):
+                ws.transcript_updates.append({
+                    "kind": "asr_final", "source": "paraformer",
+                    "text": ws.paraformer_final or ws.final_text, "revision": 1,
+                })
             await self.episode.observe("USER_INPUT_FINALIZED", turn_id=ws.turn_id,
                                        text=ws.paraformer_final or ws.final_text,
+                                       source="paraformer", source_revision=ws.generation,
                                        provisional_transcript=ws.paraformer_final, audio_cues=list(ws.audio_cues),
                                        analysis=dict(ws.analysis), output_generation=ws.generation,
                                        input_finished_at=ws.timings.get("commit"))
@@ -327,6 +349,7 @@ class EpisodeController(RealtimeController):
             "segments": list(ws.segments), "audio_cues": list(ws.audio_cues),
             "analysis": dict(ws.analysis), "refined_text": ws.refined_text,
             "refinement_available": ws.refinement_available,
+            "transcript_updates": [dict(item) for item in ws.transcript_updates],
         })
         record = self.history.append_record({
             "turn_id": ws.turn_id, "transcript": ws.final_text,
@@ -335,7 +358,8 @@ class EpisodeController(RealtimeController):
             "details": {"segments": list(ws.segments), "provisional_transcript": ws.paraformer_final,
                         "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis),
                         "refined_text": ws.refined_text,
-                        "refinement_available": ws.refinement_available},
+                        "refinement_available": ws.refinement_available,
+                        "transcript_updates": [dict(item) for item in ws.transcript_updates]},
         })
         self._input_history_committed.add(ws.turn_id)
         self._committed_workspaces[ws.turn_id] = ws
@@ -461,6 +485,20 @@ class EpisodeController(RealtimeController):
             text = strip_wake_prefix(text, self.wake_keyword)
         ws.refined_text = text
         ws.refinement_available = True
+        prior_refinement = next(
+            (item for item in ws.transcript_updates
+             if isinstance(item, dict) and item.get("kind") == "refinement"),
+            None,
+        )
+        if prior_refinement is None:
+            existing_revision = max(
+                [int(item.get("revision") or 0) for item in ws.transcript_updates
+                 if isinstance(item, dict)] or [0]
+            )
+            ws.transcript_updates.append({
+                "kind": "refinement", "source": "sensevoice", "text": text,
+                "revision": max(2, existing_revision + 1),
+            })
         segments = list(result.get("segments") or [])
         if segments:
             ws.audio_cues = segments
@@ -491,6 +529,9 @@ class EpisodeController(RealtimeController):
         source = self.episode.inputs.get(ws.turn_id, {}) if self.episode.episode_id else {}
         if not source.get("final"):
             return
+        if ws.turn_id in self._refinement_agent_events:
+            return
+        self._refinement_agent_events.add(ws.turn_id)
         updater = getattr(self.history, "update_input_refinement", None)
         if callable(updater):
             updater(ws.turn_id, text, details={"audio_cues": segments, "analysis": dict(ws.analysis)})
@@ -500,6 +541,7 @@ class EpisodeController(RealtimeController):
         # newer capture turn is already active.  It is attached to its own
         # sentence/turn record; no semantic-version check may discard it.
         await self.episode.observe("USER_INPUT_REFINED", turn_id=ws.turn_id, text=text,
+                                    source="sensevoice", source_revision=ws.generation,
                                     audio_cues=segments, analysis=dict(ws.analysis),
                                     input_finished_at=ws.timings.get("commit"), output_generation=ws.generation,
                                     sentences=list(ws.segments))

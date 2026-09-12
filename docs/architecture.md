@@ -25,8 +25,8 @@ DeepSeek 的 `deepseek-flash`，读取 `DEEPSEEK_API_KEY`；调试 OpenCode Go �
 | 组件 | 输入 | 输出 | 唯一职责 |
 | --- | --- | --- | --- |
 | Conversation runtime | 生命周期事件 | `conversation_id`、`turn_id`、取消作用域、日期 epoch | 生命周期、显式取消 authority 与稳定日期基准 |
-| Input pipeline | PCM、VAD、ASR、分析结果 | `TurnWorkspace` | 维护当前轮次、阶段、Paraformer 主文本与 SenseVoice 补充证据 |
-| Session ledger | 最终输入、传达报告、影子 task receipt/事件 | append-only 可缓存 HISTORY | 唯一持久上下文事实源；影子文本始终投影为不可信数据 |
+| Input pipeline | PCM、VAD、ASR、分析结果 | `TurnWorkspace` | 维护当前轮次、阶段及同一 `turn_id` 下的 Paraformer final/SenseVoice refinement 更新 |
+| Session ledger | 最终输入、同轮 `transcript_updates`、传达报告、影子 task receipt/事件 | append-only 可缓存 HISTORY | 唯一持久上下文事实源；每个用户轮次只投影一个 user frame，影子文本始终投影为不可信数据 |
 | LLM provider boundary | 带 `ContextLane` 的 frames、冻结 schema | 统一 `content/reasoning/usage/finish` 事件 | 缓存稳定投影、lane 校验、usage cache 指标归一化、strict Schema；保留冻结 Chat 回退 adapter |
 | Agent runtime | 账本投影、当前运行态、episode 级人格文档快照 | V0.6 JSON `speak` 决策与 `task` 命令 | 唯一 `AgentDecisionScheduler`、固定400ms心跳、普通优先的阶梯强制调度、static/history/tail context、信封校验、思考模式控制；完整 decision 后立即通过窄 bridge 提交 task |
 | LLM audit runtime | 完整 messages、Schema、wire payload、provider 增量与终态 | 关联的 `request_context` / `request_outcome` JSONL | 保存可逐请求复现的完整上下文、正文、reasoning、校验结果与取消原因 |
@@ -63,7 +63,7 @@ OpenCode 专用 header。
 上游 provider 吞掉 `CancelledError` 并返回一份迟到的完整 response，旧 revision 也无法写入
 task history、调度工具或发布事件。
 
-输入中断只能通过显式取消作用域停止当前语音；普通语音活动、定稿、精修和工具结果不会取消在飞请求。用户在 `playback_started=false` 阶段开口时，输出层将未播放候选标记为 `HELD`，保留文本、handle 和当前推理状态；没有候选时则设置全局 hold，使随后完成的候选也等待。TTS session 或 provider 首段音频已经存在，都不代表已经开始播放。`SPEECH_ENDED` 后才释放最新的 `HELD` 候选，恢复同一文本事务；用户的新 ASR 信息仍由 400ms 单飞调度窗口合并，不直接启动第二个请求。只有播放器首次实际提交非零 PCM 后，确认的 barge-in 才进入显式取消路径。完整 `speak.text` 的前缀继承由 `conversation_id + turn_id` 所有权限定：只有活动 handle 属于当前轮时，模型才获得 `target_text` 和 `continuation_allowed=true`，完整覆盖旧文本时只创建 suffix 后续队列，前缀范围内出现差异时才创建 replacement generation。上一轮仍在播放的文本以 `observed_text` 暴露并标记 `owner_scope=previous_turn`，只提供会话认知，不授予续写权；上一轮已经结算后通过 ledger 的 assistant 历史继续可见。Speech Queue 中未开始的项目不会写入 heard_text，只保存文本；当前输出耗尽后保留 1 秒同轮追加窗口。最近一次 full delivery 只作为跨轮异常防重 guard，不进入活动快照：检测到“已听文本 + 非空后缀”时仅提交后缀，完全相同文本则保留合法复述。`request_id`、`speech_id` 和 `output_generation` 只用于追踪与播放器代际校验，不参与语义判旧。等待结束当前决策，而不结束连续对话。
+输入中断只能通过显式取消作用域停止当前语音；普通语音活动、定稿、精修和工具结果不会取消在飞请求。用户在 `playback_started=false` 阶段开口时，输出层将未播放候选标记为 `HELD`，保留文本、handle 和当前推理状态；没有候选时则设置全局 hold，使随后完成的候选也等待。TTS session 或 provider 首段音频已经存在，都不代表已经开始播放。`SPEECH_ENDED` 后才释放最新的 `HELD` 候选，恢复同一文本事务；用户的新 ASR 信息仍由 400ms 单飞调度窗口合并，不直接启动第二个请求。只有播放器首次实际提交非零 PCM 后，确认的 barge-in 才进入显式取消路径。完整 `speak.text` 的前缀继承由 `conversation_id + turn_id` 所有权限定：只有活动 handle 属于当前轮时，模型才获得 `target_text` 和 `continuation_allowed=true`，完整覆盖旧文本时只创建 suffix 后续队列，前缀范围内出现差异时才创建 replacement generation。上一轮仍在播放的文本以 `observed_text` 暴露并标记 `owner_scope=previous_turn`，只提供会话认知，不授予续写权；上一轮已经结算后通过 ledger 的 assistant 历史继续可见。Speech Queue 中未开始的项目不会写入 heard_text，只保存文本；当前输出耗尽后保留 1 秒同轮追加窗口。播放器确认设备尾部输出完成后，输出层先冻结 `PlaybackSnapshot`，再进入追加窗口；完整播放事实优先于异常或缺失的 provider 字幕。结算期间 speech 进入内部 `settling`，在 `speech.completed` 回调提交 assistant ledger 前仍算 TTS busy，禁止下一次 LLM dispatch。最近一次 full delivery 只作为跨轮异常防重 guard，不进入活动快照：检测到“已听文本 + 非空后缀”时仅提交后缀，完全相同文本则保留合法复述。`request_id`、`speech_id` 和 `output_generation` 只用于追踪与播放器代际校验，不参与语义判旧。等待结束当前决策，而不结束连续对话。
 
 ### AEC 保护的播放期插话
 
@@ -79,18 +79,18 @@ DeepSeek provider 的输出预算固定为 `393216`（384K tokens），覆盖 re
 
 Agent runtime 只有一个 `AgentDecisionScheduler` 实例和一个 `_run()` 循环。`_run()` 以固定 deadline 持续推进本地 400ms 心跳：下一次 deadline 等于上一次 deadline 加 400ms，不使用“当前时间加400ms”的漂移式计时。心跳只读取唤醒信号、合并 `pending`、观察 active request/TTS/用户输入状态、推进窗口并决定是否创建一个 LLM task；它不等待正在运行的 provider，也不为每个心跳调用 provider。
 
-普通事件在400ms边界合并为一次请求。普通语义事件包括 ASR segment/final、SenseVoice 有语义变化的 refinement、影子任务的用户澄清/暂停/终态事件和 thinking barrier 完成等现有事件。影子 `running` 只记录进度、不会唤醒；`awaiting_user`、`paused` 与终态和 ASR 更新同一边界合并，仍受单请求并发限制。`SPEECH_STARTED`、`SPEECH_ENDED`、`ENDPOINT_CANDIDATE`、`VOICE_ACTIVE` 只作为本地活动信号，不覆盖强制窗口；所有 `TTS_*` 事件完全属于输出侧生命周期，不进入调度 mailbox、不重置静默锚点、不触发普通或强制请求。
+普通事件在400ms边界合并为一次请求。普通语义事件包括 ASR segment、每个首次合法的 Paraformer final、每个首次合法的 SenseVoice refinement、影子任务的用户澄清/暂停/终态事件和 thinking barrier 完成等现有事件。final/refinement 不进行本地文本含义比较，即使与前一稿相同也进入 mailbox；只按 `turn_id + source + source_revision` 做身份和幂等控制。影子 `running` 只记录进度、不会唤醒；`awaiting_user`、`paused` 与终态和 ASR 更新同一边界合并，仍受单请求并发限制。`SPEECH_STARTED`、`SPEECH_ENDED`、`ENDPOINT_CANDIDATE`、`VOICE_ACTIVE` 只作为本地活动信号，不覆盖强制窗口；所有 `TTS_*` 事件完全属于输出侧生命周期，不进入调度 mailbox、不重置静默锚点、不触发普通或强制请求。
 
-### 流式 ASR final 确认与连续输入
+### 同轮 ASR final/refinement 更新与连续输入
 
-同一用户轮次的 ASR 有两个正常阶段：稳定分段 `USER_SEGMENT_UPDATED` 用于降低首响延迟，端点后的 `USER_INPUT_FINALIZED` 是输入完成的权威信号。若稳定分段已经以相同规范化文本发起请求，且该请求最终形成有效 `speak`，同文 final 只确认该输入已结束，不得再创建第二个普通 LLM 请求。若先前请求返回 `wait`、被取消或失败，则释放 final 回到普通调度，保证权威输入不会因推测失败而丢失。
+同一用户轮次有三类转录证据：稳定分段 `USER_SEGMENT_UPDATED` 用于降低首响延迟，端点后的 Paraformer `USER_INPUT_FINALIZED` 是快速权威主文本，SenseVoice `USER_INPUT_REFINED` 是稍后到达的高质量补充。三者共用首次建立的 `turn_id`；final 与 refinement 作为同一轮 `transcript_updates` 的两个 revision 保存，不创建第二条用户消息，也不把 refinement 投影成 system 消息。
 
-final 与流式稿不同时，final 始终是权威主文本；本地仅保守地区分“追加后缀”和“修订”，并将流式稿到最终稿的差异作为本轮语义修订上下文交给模型。模型沿用现有同轮 append/replace/wait 决策，不重复已传达的回答。该机制不改变 LLM JSON 信封协议，也不关闭 `USER_SEGMENT_UPDATED` 的低延迟抢发。
+Paraformer final 与 SenseVoice refinement 各自在实际到达时独立进入现有 400ms 调度器，不互相等待。若二者落在同一个窗口，pending mailbox 自然合并成一次请求；若跨窗口到达，则分别触发评估。final 即使与流式稿完全相同、refinement 即使与 final 完全相同，也不会因本地语义比较被吞掉。本地不再生成 `confirmed/suffix/rewrite`，也不决定队列应该等待、追加还是替换；模型通过 request tail 的 `runtime.transcript_updates.available/triggered_by`、`runtime.speak` 和 assistant 历史作出 `wait/speak/cancel` 决策。晚到 refinement 写回原 `turn_id`，不得覆盖较新 capture turn 的 `last_turn_id`。
 
 连续用户输入采用 latest-wins 的对话策略，而非逐 `turn_id` 排队播放回答：只要每个已 final 的输入已写入 append-only session ledger，最终请求就应基于累计会话内容形成一次整体回答。没有单独 TTS 的中间 turn 不自动视为漏答；只有已 final 内容未进入后续模型上下文，或在用户明显转题后补播过时回答，才属于需要修复的行为偏差。该策略持续通过真实会话观察，不因日志中缺少单独 speech transaction 而改为 FIFO。
 
-输出 handle 在 PCM 耗尽后仍保留一秒同轮追加窗口；它是逻辑续写边界而非可听音频。barge-in 只能在播放器的保守 `remaining_ms > 0` 时取消语音，避免播尽后的新用户发言将完整 delivery 错记为 `interrupted/full`。MiniMax one-shot 会话在本地主动 `close()` 时取消 receiver 属于正常资源回收，不应记录为未确认 `task_finished` 的接收失败；非本地关闭的 receiver 取消仍保留为错误。
+输出 handle 在 PCM 耗尽后仍保留一秒同轮追加窗口；它是逻辑续写边界而非可听音频。播放器在追加窗口之前冻结完成快照。对于 `completed`，只有 TTS 已发送文本、返回非零 PCM、播放器已开始、本地缓冲为零、设备尾部等待成功且 `output_estimated_ms >= enqueued_ms` 时，才以 `completed_playback_authoritative` 强制结算为 full，并把 speech 完整文本写入 assistant ledger；MiniMax 字幕只参与中断、替换、停止或未完整播放时的边界判断。barge-in 只能在播放器的保守 `remaining_ms > 0` 时取消语音，避免播尽后的新用户发言将完整 delivery 错记为 interrupted。MiniMax one-shot 会话在本地主动 `close()` 时取消 receiver 属于正常资源回收，不应记录为未确认 `task_finished` 的接收失败；非本地关闭的 receiver 取消仍保留为错误。
 
-用户有内容的 `USER_INPUT_FINALIZED`，或有语义变化的非空 `USER_INPUT_REFINED`，会重新 arm 当前静默阶梯。无普通语义事件时，窗口 3、6、9、16、22 选择 `forced_poll`，窗口 25 选择一次 `final_silence`；窗口 10 仅表示进入慢速阶段。普通事件和强制窗口在同一个400ms边界同时存在时，普通调度覆盖强制调度，记录 `covered_by_normal_dispatch`，不添加强制提示词、不创建 `system_check_id`，也不在普通请求后补发强制请求。普通强制窗口在 busy 状态下直接跳过；最终窗口是独立分支，在 busy 状态下保留 `final_pending`，恢复空闲后只补发一次。若等待期间出现新的有效用户输入，旧的最终静默条件失效，新输入仅重置尚未发出的 `final_pending` 并重新计时，不取消已启动的任何 LLM 请求。
+每个首次合法、非空的 `USER_INPUT_FINALIZED` 或 `USER_INPUT_REFINED` 都会重新 arm 当前静默阶梯，不以文本是否发生语义变化为前提。无普通语义事件时，窗口 3、6、9、16、22 选择 `forced_poll`，窗口 25 选择一次 `final_silence`；窗口 10 仅表示进入慢速阶段。普通事件和强制窗口在同一个400ms边界同时存在时，普通调度覆盖强制调度，记录 `covered_by_normal_dispatch`，不添加强制提示词、不创建 `system_check_id`，也不在普通请求后补发强制请求。普通强制窗口在 busy 状态下直接跳过；最终窗口是独立分支，在 busy 状态下保留 `final_pending`，恢复空闲后只补发一次。若等待期间出现新的有效用户输入，旧的最终静默条件失效，新输入仅重置尚未发出的 `final_pending` 并重新计时，不取消已启动的任何 LLM 请求。
 
 三类 dispatch 仍共用 `AgentEpisodeRuntime._step()`、`_provider_stream()` 和原有 provider 参数，只在 request tail 增加互斥的 `forced_poll` 或 `final_silence` 提示词。system-check 使用独立 `system_check_id`，不开始用户 turn、不创建用户 `InputRecord`；已听到的 speech 仍通过 assistant delivery 写入 ledger。active request、TTS 播放/待播内容、backoff 或 episode 生命周期限制仍不会创建并发 LLM 请求。已进入 mailbox 的普通语义事件可在被动用户讲话期间由心跳启动预推理，但语音候选仍由输出层 hold；纯计时的 `forced_poll` / `final_silence` 与异常恢复继续遵守用户讲话门控。恢复/backoff 继续使用既有有限队列和优先级，不拆出第二个调度器或 watchdog。
