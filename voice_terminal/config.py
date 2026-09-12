@@ -112,7 +112,7 @@ class LlmConfig:
     reasoning_effort: str = "low"
     timeout_ms: int = 15000
     transport: str = "chat_completions"
-    max_output_tokens: int = 512
+    max_output_tokens: int = 393216
     shadow_enabled: bool = False
     shadow_sample_rate: float = 1.0
     shadow_thinking_enabled: bool = False
@@ -430,7 +430,7 @@ class AppConfig:
                 reasoning_effort=_string(llm.get("reasoning_effort"), "low"),
                 timeout_ms=int(_number(llm.get("timeout_ms"), 15000)),
                 transport=_string(llm.get("transport"), "chat_completions"),
-                max_output_tokens=int(_number(llm.get("max_output_tokens"), 512)),
+                max_output_tokens=int(_number(llm.get("max_output_tokens"), 393216)),
                 shadow_enabled=_bool(llm.get("shadow_enabled"), False),
                 shadow_sample_rate=float(_number(llm.get("shadow_sample_rate"), 1.0)),
                 shadow_thinking_enabled=_bool(llm.get("shadow_thinking_enabled"), False),

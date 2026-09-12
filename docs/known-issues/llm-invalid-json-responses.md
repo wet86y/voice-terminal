@@ -392,8 +392,8 @@ Schema 失败，则继续二分 Schema 关键字/嵌套结构。若仅 A 失败�
 
 - `request_context`：完整、无 HTTP headers 的 wire payload，包含最终 instructions、顺序一致的 input、
   reasoning effort、完整 Schema、max output tokens，以及逐消息 role/lane/字符数/content SHA-256；
-- `request_outcome`：不含模型正文的终态，分类为 `strict_valid`、`compat_recovered`、
-  `invalid_envelope`、`cancelled`、provider terminal failure 或 runtime error。
+- `request_outcome`：完整终态，包含模型输出正文、reasoning、明确的取消原因，并分类为
+  `strict_valid`、`compat_recovered`、`invalid_envelope`、`cancelled`、provider terminal failure 或 runtime error。
 
 两类记录共享 `conversation_id + request_id + turn_id + wire_sha256`。普通 `voice-server.log` 同时记录
 `LLM_CONTEXT_CAPTURED` 和 `LLM_REQUEST_COMPLETED` 摘要，因此可以先按错误事件的 request ID 定位，再在
@@ -401,8 +401,8 @@ JSONL 中精确比较异常请求和邻近正常请求，而无需根据 ASR/TTS
 
 该文件明确包含真实用户/助手上下文，因此与普通日志隔离，不写控制台；单文件 50 MiB，保留 9 个轮转备份。
 磁盘写入通过后台日志队列完成，避免在实时事件循环中执行轮转 I/O。API key、Authorization header、模型
-输出正文和 reasoning 不会写入该文件。需要临时禁用时可设置 `VOICE_LLM_CONTEXT_AUDIT=0`，但问题定位期间
-应保持默认开启。
+模型输出正文和 reasoning 会写入该文件，以便对异常请求做完整复放和根因审计。需要临时禁用时可设置
+`VOICE_LLM_CONTEXT_AUDIT=0`，但问题定位期间应保持默认开启。
 
 ## 待验证的问题
 
