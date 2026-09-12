@@ -164,7 +164,7 @@ def test_compatible_parser_rejects_prose_truncation_mixed_text_and_extra_fields(
         parse_compatible_decision_envelope(raw, allow_empty_control_text=True)
 
 
-def test_new_input_preempts_speculative_recovery_tts():
+def test_new_input_queues_behind_active_recovery_without_cancelling_llm():
     async def scenario():
         cancelled = []
 
@@ -183,17 +183,65 @@ def test_new_input_preempts_speculative_recovery_tts():
             conversation=ConversationRuntime(),
             ledger=SessionLedger(),
         )
-        runtime.active_recovery = object()
-        runtime.recovery_queue.append(object())
+        active_recovery = object()
+        runtime.active_recovery = active_recovery
         request = asyncio.create_task(asyncio.sleep(60))
         runtime.active_request = request
+        runtime.runner = request
 
-        runtime._supersede_recovery("USER_INPUT_REFINED")
+        runtime._wake("USER_INPUT_REFINED")
 
-        await asyncio.gather(request, return_exceptions=True)
+        await asyncio.sleep(0)
+        # Preserve the existing speculative-output invalidation while the
+        # provider task itself continues to completion.
         assert cancelled == ["superseded_recovery"]
-        assert not runtime.recovery_queue
-        assert request.cancelled()
+        assert runtime.active_recovery is active_recovery
+        assert request.cancelled() is False
+        assert runtime.pending == {"USER_INPUT_REFINED"}
+
+        request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("dispatch_kind", ["forced_poll", "final_silence"])
+def test_new_final_rearms_silence_without_cancelling_active_system_check(dispatch_kind):
+    async def scenario():
+        async def emit(*_args):
+            return None
+
+        runtime = AgentEpisodeRuntime(
+            None,
+            SimpleNamespace(),
+            SimpleNamespace(status="IDLE", active=False, queue_snapshot=[]),
+            emit,
+            conversation=ConversationRuntime(),
+            ledger=SessionLedger(),
+        )
+        runtime.episode_id = "episode"
+        runtime.state = "WAITING_EVENT"
+        runtime.scheduler.arm(0.0)
+        runtime.scheduler.advance(10.0 if dispatch_kind == "final_silence" else 1.2)
+        if dispatch_kind == "final_silence":
+            assert runtime.scheduler.final_pending is True
+        else:
+            assert runtime.scheduler.forced_due(now=1.2)["prompt_kind"] == "forced_poll"
+
+        request = asyncio.create_task(asyncio.sleep(60))
+        runtime.active_request = request
+        runtime.runner = request
+        runtime.active_dispatch_context = {"dispatch_kind": dispatch_kind, "generation": 1}
+
+        await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-new", text="新的用户输入")
+
+        assert request.cancelled() is False
+        assert runtime.scheduler.generation == 2
+        assert runtime.scheduler.final_pending is False
+        assert runtime.pending == {"USER_INPUT_FINALIZED"}
+
+        request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
 
     asyncio.run(scenario())
 

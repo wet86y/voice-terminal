@@ -23,11 +23,12 @@ git diff --check
 heartbeat 使用从上一个 deadline 推进的固定时间轴，不能等待 active LLM、TTS 播放或 provider
 返回，也不能因为 heartbeat 本身增加 provider 请求。普通事件在400ms边界合并并优先于同边界
 的强制窗口；无普通语义事件时才允许第3、6、9、16、22窗口的 `forced_poll`，第25窗口的
-`final_silence` 只能消费一次。普通窗口忙碌时跳过，最终窗口忙碌时保留到恢复空闲后补发。
+`final_silence` 只能消费一次。两个分支的 busy 规则不得混用：`forced_poll` 窗口忙碌时当场跳过且不补发；`final_silence` 最终窗口忙碌时保留到恢复空闲后只补发一次。若等待期间出现新的有效用户输入，撤销的只是尚未发出的旧 `final_pending`，并从新输入重新计时。
 
 TTS 开始、结束、取消、替换、失败和语音活动不属于普通调度事件，不重置用户静默锚点，也不
 触发 provider；TTS 状态只负责阻止实际 dispatch。普通、`forced_poll` 和 `final_silence` 三类
 请求必须共用 `_step()`、`_provider_stream()`、原有 schema/transport/reasoning 和 TTS 输出协议。
+普通、异常恢复、`forced_poll` 和 `final_silence` 请求一旦启动，新的 final/refined 输入只能进入统一心跳邮箱，不得取消 provider task，也不得以 scheduler generation 变化提前结束已启动的 system-check。本规则不改变尚未创建 provider task 的候选恢复项之既有淘汰规则，也不改变 barge-in、reset、stop、输入不可用或 episode end 的显式生命周期取消。只有 LLM 自然结束且本地输出校验失败时，才允许进入有界异常恢复链路。
 system-check 必须使用独立 `system_check_id`，不创建用户 `InputRecord` 或用户 turn 结算；只有
 已被听到的输出才进入 assistant ledger。reset、stop 和 episode end 后应清理 heartbeat、runner、
 active request 与 scheduler 状态。
@@ -62,12 +63,12 @@ Web 前端和 Voice Server。默认启动不能只依据 `8765/health` 声明成
 
 ## LLM 完整审计与故障复现
 
-生产默认 `llm.max_output_tokens=393216`，即 [DeepSeek 官方模型规格](https://api-docs.deepseek.com/quick_start/pricing)中的最大输出预算 384K tokens。[Responses API](https://api-docs.deepseek.com/api/create-response/) 规定该参数限制单次响应生成的可见正文与 reasoning token 总和，不限制输入上下文，也不是字节数。任何 `response.incomplete` 都必须记录 provider 的 `incomplete_details.reason`；只有原因为 `max_output_tokens` 时才能归类为输出预算耗尽，不能把普通 `JSON_TRUNCATED` 或 `PROSE_INSTEAD_OF_JSON` 混入这一类。
+生产默认 `llm.max_output_tokens=393216`，即 [DeepSeek 官方模型规格](https://api-docs.deepseek.com/quick_start/pricing)中的最大输出预算 384K tokens。[Responses API](https://api-docs.deepseek.com/api/create-response/) 规定该参数限制单次响应生成的可见正文与 reasoning token 总和，不限制输入上下文，也不是字节数。任何 `response.incomplete` 都必须记录 provider 的 `incomplete_details.reason`；只有原因为 `max_output_tokens` 时才能归类为输出预算耗尽，不能把普通 `JSON_TRUNCATED` 或 `PROSE_INSTEAD_OF_JSON` 混入这一类。若这些错误发生前已经存在合法非空 `speak` 队列，允许 speak-only 降级完成播放，记录 `LLM_OUTPUT_COMPAT_SPEAK_ACCEPTED`，`actions_executed=0`，并在下一次心跳重新调度；没有合法 speak 队列时仍按 protocol recovery 统计。
 
 主服务默认启用独立的 `logs/voice-server-llm-context.jsonl`，并以 `conversation_id + request_id + turn_id + wire_sha256` 关联请求和终态：
 
 - `request_context` version 3 必须保存完整 `messages`、完整 Schema、最终无 HTTP headers 的 `wire_payload`、dispatch/prompt 类型、事件、reasoning effort、上下文估算及比较用哈希；`contains_conversation_content` 必须为 `true`。
-- `request_outcome` version 2 必须保存完整或截至终止时的 `output_text`、`reasoning_text`、provider/local 校验结果和错误分类；取消时必须保存 `cancel_reason`，以区分 `user_interrupted`、`superseded_recovery:*`、`superseded_system_check:*`、reset、stop 和 episode end。
+- `request_outcome` version 2 必须保存完整或截至终止时的 `output_text`、`reasoning_text`、provider/local 校验结果和错误分类；取消时必须保存 `cancel_reason`，以区分 `user_interrupted`、reset、stop 和 episode end。历史记录中的 `superseded_recovery:*` 与 `superseded_system_check:*` 是已移除抢占链路的审计证据，不应再由新运行时产生。
 - API key 与 Authorization header 不属于模型上下文，不进入该文件；除此之外，不得用摘要、长度或哈希替代影响生成和校验的实际内容。
 
 该审计文件包含真实用户、助手和系统内容，单文件 50 MiB、保留 9 个轮转备份，写入由后台队列承担。排查输出异常时应直接使用同一请求的完整 wire payload 和部分/完整输出进行复现，并对照相邻成功请求；不得再把普通 ASR/TTS 日志的近似重建当作精确上下文。旧版 `request_context` version 2 / `request_outcome` version 1 只保留摘要或结构信息，不能逆向恢复正文，统计时必须按版本分层。
