@@ -20,6 +20,71 @@ def scheduler() -> AgentDecisionScheduler:
     return AgentDecisionScheduler(AgentOptions(scheduler_tick_ms=400))
 
 
+class _BlockingProvider:
+    transport = "responses"
+    protocol_recovery_limit = 1
+
+    def __init__(self):
+        self.calls = 0
+        self.release = asyncio.Event()
+
+    def stream_events(self, _messages, *, json_mode=False):
+        assert json_mode is True
+        self.calls += 1
+
+        async def stream():
+            await self.release.wait()
+            yield {"type": "content", "text": '{"speak":{"state":"wait"},"actions":[]}'}
+            yield {"type": "finish", "reason": "stop"}
+
+        return stream()
+
+
+def _speaking_runtime(provider):
+    class Registry:
+        def begin_turn(self, _episode_id):
+            return None
+
+        def cancel_turn(self, _episode_id):
+            return None
+
+        def action_definitions(self):
+            return []
+
+    class Output:
+        active = False
+        status = "IDLE"
+        queue_snapshot = []
+        speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+
+        def cancel_all(self, _reason):
+            return None
+
+        async def close(self):
+            return None
+
+    async def emit(*_args):
+        return None
+
+    runtime = AgentEpisodeRuntime(
+        provider, Registry(), Output(), emit,
+        conversation=ConversationRuntime(), ledger=SessionLedger(),
+    )
+    runtime.episode_id = runtime.conversation.conversation_id
+    runtime.last_turn_id = "turn-a"
+    runtime.inputs["turn-a"] = {"text": "你好", "final": False}
+    return runtime
+
+
+async def _finish_blocking_request(runtime, provider):
+    request = runtime.active_request
+    assert request is not None
+    provider.release.set()
+    await asyncio.wait_for(request, timeout=1)
+    await runtime._finish_active_request(request)
+    provider.release.clear()
+
+
 def test_late_heartbeat_is_rebased_to_real_time_without_catch_up():
     value = scheduler()
     assert value.start_heartbeat(10.0) == 10.4
@@ -295,6 +360,81 @@ def test_runtime_heartbeat_continues_while_active_request_is_running():
 
         provider.release.set()
         await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_speaking_semantic_mailbox_dispatches_once_and_coalesces():
+    async def scenario():
+        provider = _BlockingProvider()
+        runtime = _speaking_runtime(provider)
+        runtime.user_speaking = True
+        runtime.pending.update({"USER_SEGMENT_UPDATED", "TOOL_COMPLETED"})
+
+        await runtime._on_heartbeat(10.0)
+        await asyncio.sleep(0)
+
+        assert provider.calls == 1
+        assert runtime.active_request_kinds == {"USER_SEGMENT_UPDATED", "TOOL_COMPLETED"}
+        assert runtime.pending == set()
+        assert runtime.max_request_concurrency == 1
+
+        # Extra mailbox wakeups cannot create a concurrent request while the
+        # first semantic precomputation remains active.
+        await runtime._on_heartbeat(10.4)
+        assert provider.calls == 1
+        assert runtime.max_request_concurrency == 1
+
+        await _finish_blocking_request(runtime, provider)
+
+    asyncio.run(scenario())
+
+
+def test_speaking_timer_only_candidates_remain_gated():
+    async def scenario():
+        provider = _BlockingProvider()
+        runtime = _speaking_runtime(provider)
+        runtime.user_speaking = True
+        runtime.scheduler.start_heartbeat(9.6)
+
+        runtime.scheduler.arm(8.79)
+        await runtime._on_heartbeat(10.0)
+        assert provider.calls == 0
+        assert runtime.scheduler.snapshot()["skipped_windows"] == [3]
+
+        runtime.scheduler.arm(0.39)
+        await runtime._on_heartbeat(10.4)
+        assert provider.calls == 0
+        assert runtime.scheduler.final_pending is True
+        assert runtime.scheduler.final_dispatched is False
+
+    asyncio.run(scenario())
+
+
+def test_speaking_leaves_new_semantic_work_pending_until_active_request_finishes():
+    async def scenario():
+        provider = _BlockingProvider()
+        runtime = _speaking_runtime(provider)
+        runtime.pending.add("USER_SEGMENT_UPDATED")
+
+        await runtime._on_heartbeat(10.0)
+        await asyncio.sleep(0)
+        assert provider.calls == 1
+
+        runtime.user_speaking = True
+        runtime.pending.add("TOOL_COMPLETED")
+        await runtime._on_heartbeat(10.4)
+        assert provider.calls == 1
+        assert runtime.pending == {"TOOL_COMPLETED"}
+
+        await _finish_blocking_request(runtime, provider)
+        await runtime._on_heartbeat(10.8)
+        await asyncio.sleep(0)
+        assert provider.calls == 2
+        assert runtime.active_request_kinds == {"TOOL_COMPLETED"}
+        assert runtime.max_request_concurrency == 1
+
+        await _finish_blocking_request(runtime, provider)
 
     asyncio.run(scenario())
 
