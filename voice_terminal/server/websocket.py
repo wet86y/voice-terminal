@@ -209,6 +209,8 @@ class SessionRuntime:
                         model=shadow_cfg.provider.model,
                         api_key=shadow_key,
                         timeout_ms=shadow_cfg.provider.timeout_ms,
+                        session_id=(self.conversation.conversation_id
+                                    if self.config.llm.provider == "opencode_go" else None),
                     )
                     self.shadow_component = ShadowAgentComponent(
                         provider, executor, instructions_loader=load_shadow_instructions,
@@ -358,6 +360,13 @@ class SessionRuntime:
                 self.controller.set_reasoning_mode(self.reasoning_mode)
             if self.llm is not None:
                 self.llm.set_session_id(self.conversation.conversation_id)
+            shadow_provider = getattr(getattr(self, "shadow_component", None), "provider", None)
+            set_shadow_session = getattr(shadow_provider, "set_session_id", None)
+            if callable(set_shadow_session):
+                set_shadow_session(
+                    self.conversation.conversation_id
+                    if self.config.llm.provider == "opencode_go" else None
+                )
 
     async def close(self) -> None:
         if self.controller is not None:

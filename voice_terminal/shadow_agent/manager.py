@@ -143,8 +143,12 @@ class ShadowTaskManager:
             return TaskReceipt(False, command.id, "invalid", "modify requires an active task")
         if not command.text.strip():
             return TaskReceipt(False, command.id, "invalid", "modify requires nonempty text")
-        await self._interrupt(task)
         task.revision += 1
+        # Invalidate before awaiting cancellation.  A provider coroutine is
+        # allowed to suppress CancelledError and return one last completed
+        # response; that late response must not be committed or dispatch a
+        # tool call under the old direction.
+        await self._interrupt(task)
         task.modifications.append(command.text.strip())
         task.input_items.append({"role": "system", "content": modification_message(command.text)})
         task.checkpoint_pending = False
@@ -161,8 +165,10 @@ class ShadowTaskManager:
             return TaskReceipt(True, command.id, "missing", "task does not exist")
         if task.status in TERMINAL:
             return TaskReceipt(True, command.id, task.status, "task already terminal")
-        await self._interrupt(task)
         task.revision += 1
+        # As with modify, mark the old runner stale before it gets a chance
+        # to turn a cancellation-suppressed provider response into work.
+        await self._interrupt(task)
         self._terminal(task, "cancelled", "任务已取消。")
         return TaskReceipt(True, command.id, "cancelled", "task cancelled")
 

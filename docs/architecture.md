@@ -53,6 +53,15 @@ bridge 写入账本：receipt 和 `running` 不唤醒调度器，`completed|canc
 已有 mailbox 投递 `SHADOW_TASK_TERMINAL`，由下一次 400ms heartbeat 决定是否发起一条主请求。
 影子组件不得直接调用语音 LLM、TTS、播放器或 scheduler。
 
+当主 provider 为 OpenCode Go 时，影子 provider 同样使用当前 `conversation_id` 作为
+`x-opencode-session` 请求头；这是 OpenCode Go Responses 路由的必要条件。`session.reset`
+轮换 conversation 后必须同步更新影子 provider 的 header。直接 DeepSeek 路径不发送该
+OpenCode 专用 header。
+
+`modify` 与 `cancel` 先递增 task revision、再取消/等待旧 runner。这个顺序是取消屏障：即使
+上游 provider 吞掉 `CancelledError` 并返回一份迟到的完整 response，旧 revision 也无法写入
+task history、调度工具或发布事件。
+
 输入中断只能通过显式取消作用域停止当前语音；普通语音活动、定稿、精修和工具结果不会取消在飞请求。用户在 `playback_started=false` 阶段开口时，输出层将未播放候选标记为 `HELD`，保留文本、handle 和当前推理状态；没有候选时则设置全局 hold，使随后完成的候选也等待。TTS session 或 provider 首段音频已经存在，都不代表已经开始播放。`SPEECH_ENDED` 后才释放最新的 `HELD` 候选，恢复同一文本事务；用户的新 ASR 信息仍由 400ms 单飞调度窗口合并，不直接启动第二个请求。只有播放器首次实际提交非零 PCM 后，确认的 barge-in 才进入显式取消路径。完整 `speak.text` 的前缀继承由 `conversation_id + turn_id` 所有权限定：只有活动 handle 属于当前轮时，模型才获得 `target_text` 和 `continuation_allowed=true`，完整覆盖旧文本时只创建 suffix 后续队列，前缀范围内出现差异时才创建 replacement generation。上一轮仍在播放的文本以 `observed_text` 暴露并标记 `owner_scope=previous_turn`，只提供会话认知，不授予续写权；上一轮已经结算后通过 ledger 的 assistant 历史继续可见。Speech Queue 中未开始的项目不会写入 heard_text，只保存文本；当前输出耗尽后保留 1 秒同轮追加窗口。最近一次 full delivery 只作为跨轮异常防重 guard，不进入活动快照：检测到“已听文本 + 非空后缀”时仅提交后缀，完全相同文本则保留合法复述。`request_id`、`speech_id` 和 `output_generation` 只用于追踪与播放器代际校验，不参与语义判旧。等待结束当前决策，而不结束连续对话。
 
 ### AEC 保护的播放期插话

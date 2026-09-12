@@ -37,11 +37,18 @@ class DeepSeekResponsesShadowProvider:
     response.completed event; all partial SSE deltas remain transient.
     """
 
-    def __init__(self, *, base_url: str, api_key: str, model: str, timeout_ms: int = 15000) -> None:
+    def __init__(self, *, base_url: str, api_key: str, model: str, timeout_ms: int = 15000,
+                 session_id: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout_ms = timeout_ms
+        # OpenCode Go routes Responses requests by this header.  It is kept
+        # optional so direct DeepSeek remains byte-for-byte unchanged.
+        self.session_id = session_id
+
+    def set_session_id(self, session_id: str | None) -> None:
+        self.session_id = session_id
 
     def _payload(
         self,
@@ -82,6 +89,8 @@ class DeepSeekResponsesShadowProvider:
             raise ShadowProviderError("httpx is required for shadow Responses") from exc
         timeout = httpx.Timeout(self.timeout_ms / 1000, connect=min(5, self.timeout_ms / 1000))
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        if self.session_id:
+            headers["x-opencode-session"] = self.session_id
         completed: dict[str, Any] | None = None
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
