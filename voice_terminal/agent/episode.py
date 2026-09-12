@@ -3132,11 +3132,6 @@ class AgentEpisodeRuntime:
             )
             raise
         except (EnvelopeError, ValueError, json.JSONDecodeError) as exc:
-            if speech_handle is not None:
-                try:
-                    await finish_streamed_speech()
-                except Exception:
-                    pass
             error_text = str(exc)[:300]
             failure_diagnostics = {
                 **json_structure_fingerprint(parser.raw),
@@ -3147,6 +3142,72 @@ class AgentEpisodeRuntime:
                 else "TOOL_PROTOCOL_ERROR" if any(marker in error_text for marker in ("action", "tool"))
                 else "SPEAK_ENVELOPE_INVALID"
             )
+            # The streamed ``speak`` prefix is deliberately validated apart
+            # from the complete decision envelope.  A later malformed tail or
+            # invalid action must not cut off speech that is already safely in
+            # the local text-only queue.  This is a one-way compatibility
+            # downgrade: no unvalidated action or control state is applied,
+            # and the next ordinary heartbeat receives a chance to make a
+            # fresh complete decision.
+            speak_prefix = None
+            if speech_handle is not None:
+                try:
+                    speak_prefix = parser.speak_prefix()
+                except (EnvelopeError, ValueError, json.JSONDecodeError):
+                    speak_prefix = None
+            if speak_prefix is not None and speak_prefix.state == "speak" and speak_prefix.text.strip():
+                try:
+                    await finish_streamed_speech()
+                except Exception:
+                    # The queue has already accepted text, but a failure to
+                    # close its producer is not a reason to execute actions
+                    # or start a protocol-recovery loop.
+                    pass
+                workspace = getattr(speech_handle, "workspace", None)
+                if workspace is not None and isinstance(getattr(workspace, "timings", None), dict):
+                    workspace.timings["partial_speech_protocol_error"] = True
+                    workspace.timings["speak_only_compat_accepted"] = True
+                invalid_components = (
+                    ["actions"] if recovery_code == "TOOL_PROTOCOL_ERROR"
+                    else ["envelope_tail"]
+                )
+                await self.log(
+                    "LLM_OUTPUT_COMPAT_SPEAK_ACCEPTED",
+                    identity=identity,
+                    turn_id=source_turn_id,
+                    error=error_text,
+                    recovery_code=recovery_code,
+                    speak_chars=len(speak_prefix.text),
+                    queued_speech_id=getattr(speech_handle, "speech_id", None),
+                    invalid_components=invalid_components,
+                    actions_executed=0,
+                    next_dispatch="heartbeat",
+                    **failure_diagnostics,
+                )
+                await self.emit("speak.preview", {
+                    "conversation_id": identity[0], "request_id": identity[1],
+                    "turn_id": source_turn_id, "status": "committed_speak_only",
+                    "invalid_components": invalid_components,
+                    "actions_executed": 0,
+                })
+                await self._resolve_asr_final_confirmation(identity, source_turn_id, "speak")
+                record_audit_outcome(
+                    "compat_speak_only",
+                    recovery_code=recovery_code,
+                    recovery_outcome="not_queued",
+                    speak_chars=len(speak_prefix.text),
+                    invalid_components=invalid_components,
+                    actions_executed=0,
+                    content_chars=content_chars,
+                    **failure_diagnostics,
+                )
+                self._wake("SPEAK_COMPAT_ACCEPTED")
+                return "compat_speak_only"
+            if speech_handle is not None:
+                try:
+                    await finish_streamed_speech()
+                except Exception:
+                    pass
             if recovery_code == "LLM_EMPTY_OUTPUT":
                 # Preserve the frozen V0.6 aggregate while exposing the new,
                 # actionable empty-output classification.

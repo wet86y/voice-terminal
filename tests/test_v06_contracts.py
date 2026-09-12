@@ -729,7 +729,7 @@ def test_runtime_uses_json_mode_and_promotes_only_valid_envelope():
     asyncio.run(scenario())
 
 
-def test_runtime_streams_text_before_finish_and_keeps_it_on_bad_actions():
+def test_runtime_keeps_queued_speak_and_ignores_bad_actions():
     async def scenario():
         seen = {"feeds": [], "finishes": 0, "recoveries": []}
 
@@ -778,9 +778,76 @@ def test_runtime_streams_text_before_finish_and_keeps_it_on_bad_actions():
         assert seen["queued_before_finish"] is True
         assert seen["feeds"] == ["先到", "的回答"]
         assert seen["finishes"] == 1
-        assert seen["recoveries"] == ["TOOL_PROTOCOL_ERROR"]
-        assert any(kind == "agent.trace" and payload.get("kind") == "TOOL_PROTOCOL_ERROR"
+        assert seen["recoveries"] == []
+        accepted = [
+            payload for kind, payload in events
+            if kind == "agent.trace" and payload.get("kind") == "LLM_OUTPUT_COMPAT_SPEAK_ACCEPTED"
+        ]
+        assert len(accepted) == 1
+        assert accepted[0]["invalid_components"] == ["actions"]
+        assert accepted[0]["actions_executed"] == 0
+        assert accepted[0]["next_dispatch"] == "heartbeat"
+        assert any(kind == "speak.preview" and payload.get("status") == "committed_speak_only"
                    for kind, payload in events)
+    asyncio.run(scenario())
+
+
+def test_runtime_keeps_queued_speak_on_truncated_envelope():
+    async def scenario():
+        seen = {"feeds": [], "finishes": 0, "recoveries": []}
+
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    yield {"type": "content", "text": (
+                        '{"speak":{"state":"speak","emotion":"calm","text":"保留这段语音"},'
+                        '"actions":[]'
+                    )}
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Handle:
+            speech_id = "speech_truncated"
+            async def feed(self, value): seen["feeds"].append(value)
+            async def finish(self): seen["finishes"] += 1
+
+        class Output:
+            status = "IDLE"
+            speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+            async def begin(self, *_args, **_kwargs): return Handle()
+
+        events = []
+        async def emit(kind, payload): events.append((kind, payload))
+        conversation = ConversationRuntime(); conversation.begin_turn("turn")
+        runtime = AgentEpisodeRuntime(Provider(), Registry(), Output(), emit,
+                                      conversation=conversation, ledger=SessionLedger())
+        runtime.episode_id = conversation.conversation_id
+        runtime.last_turn_id = "turn"
+        runtime.inputs = {"turn": {"text": "你好", "final": True}}
+        identity = (runtime.episode_id, "request")
+        runtime.agent_step_id = "request"
+        runtime._identity_turns[identity] = "turn"
+
+        async def recovery(code, message, **kwargs):
+            seen["recoveries"].append(code)
+        runtime._queue_recovery = recovery
+
+        assert await runtime._step(identity, {"USER_INPUT_FINALIZED"}) == "compat_speak_only"
+        assert seen["feeds"] == ["保留这段语音"]
+        assert seen["finishes"] == 1
+        assert seen["recoveries"] == []
+        accepted = [
+            payload for kind, payload in events
+            if kind == "agent.trace" and payload.get("kind") == "LLM_OUTPUT_COMPAT_SPEAK_ACCEPTED"
+        ]
+        assert len(accepted) == 1
+        assert accepted[0]["invalid_components"] == ["envelope_tail"]
+        assert accepted[0]["actions_executed"] == 0
+
     asyncio.run(scenario())
 
 

@@ -11,8 +11,8 @@
 
 活动 LLM 请求虽然携带 strict JSON Schema，且上游以 HTTP 200 和
 `response.completed` 正常结束，最终 `content` 仍高频不能通过本地 V0.6 决策信封校验。
-失败输出不会写入会话语义账本；系统当前只允许一次即时协议恢复。连续失败时，用户可能只看到
-`LLM_PROTOCOL_RECOVERY_EXHAUSTED`，且本轮没有可播放回复。
+完整失败部分不会写入完整决策账本；如果流式阶段已经形成合法的非空 `speak` 队列，则保留该语音并
+静默丢弃未验证字段。只有 `speak` 本身不能安全确认时，才进入有界即时协议恢复。
 
 本问题只追踪模型输出格式可靠性及其直接恢复行为。用户打断、模型主动替换播放队列、深度模式
 推理展示等问题应分别记录，不能混入本问题的有效率统计。
@@ -125,8 +125,18 @@ Responses 严格解析失败后会尝试一次本地兼容解析；成功时记�
 - 信封形状完全正确但 `emotion=""` 时使用既有中性默认 `calm`；
 
 兼容器明确拒绝任意花括号片段提取、截断补全、歧义分隔符插入、普通纯文本、正文与 JSON 混合、额外字段，
-以及从普通文本推断 wait/cancel/action。每次修复都重新执行完整信封校验；最终仍不合约时继续进入原有
-protocol recovery，不会让损坏 JSON 静默通过。
+以及从普通文本推断 wait/cancel/action。完整信封的兼容修复每次仍重新执行完整信封校验；但如果严格校验失败
+时流式解析器已经确认合法的非空 `speak` 前缀并将其送入文本语音队列，运行时采用 speak-only 降级：
+不猜测或补全外层 JSON，不执行任何未验证的 actions，并记录 `LLM_OUTPUT_COMPAT_SPEAK_ACCEPTED`。
+损坏尾部或非法 actions 通过 `invalid_components` 标注为未执行，随后只投递一个普通心跳事件。若没有合法
+`speak` 队列，则继续进入原有 protocol recovery，不会让损坏 JSON 静默通过。
+
+### 2026-09-12 speak-only 降级边界
+
+该降级只在 `speak.state=speak`、emotion 已合法归一化、text 非空且已经实际创建 speech handle 后生效。
+已经入队的文本会正常完成播放；外层 JSON 截断、缺失顶层 `actions`、非法 action 名称/参数等不再撤销这条
+语音，也不会调用 action runtime。事件同时带有 `actions_executed=0` 和 `next_dispatch=heartbeat`，供 UI、审计和
+下一次普通心跳使用。`speak` 缺失、为空、state/emotion 不合法或尚未入队时仍保持原有恢复路径。
 
 接入后的 95 请求压缩复放报告：
 [`reports/real-frequency-json-bounded-repair-20260911.json`](../../reports/real-frequency-json-bounded-repair-20260911.json)
