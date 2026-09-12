@@ -53,8 +53,12 @@ class AudioConfig:
     block_ms: int = 20
     ring_buffer_ms: int = 2000
     wake_preroll_ms: int = 1200
-    processing_enabled: bool = False
+    processing_enabled: bool = True
     processing_required: bool = False
+    # What to do if the protected AEC path fails while PCM is audible.
+    # Do not silently fall back to raw microphone VAD: that reintroduces
+    # speaker echo as a false user interruption.
+    aec_failure_policy: str = "pause_recover"
     echo_cancellation: bool = True
     noise_suppression: bool = True
     automatic_gain_control: bool = False
@@ -377,8 +381,12 @@ class AppConfig:
                 block_ms=int(_number(audio.get("block_ms"), 20)),
                 ring_buffer_ms=int(_number(audio.get("ring_buffer_ms"), 2000)),
                 wake_preroll_ms=int(_number(audio.get("wake_preroll_ms"), 1200)),
-                processing_enabled=_bool(audio.get("processing_enabled"), False),
+                processing_enabled=_bool(audio.get("processing_enabled"), True),
                 processing_required=_bool(audio.get("processing_required"), False),
+                aec_failure_policy=_string(audio.get("aec_failure_policy"), "pause_recover").lower()
+                if _string(audio.get("aec_failure_policy"), "pause_recover").lower()
+                in {"pause_recover", "stop_and_listen", "continue_without_barge_in"}
+                else "pause_recover",
                 echo_cancellation=_bool(audio.get("echo_cancellation"), True),
                 noise_suppression=_bool(audio.get("noise_suppression"), True),
                 automatic_gain_control=_bool(audio.get("automatic_gain_control"), False),

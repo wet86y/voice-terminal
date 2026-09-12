@@ -235,6 +235,28 @@ class BargeInCompletionGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([kind for kind, _payload in traces], ["BARGE_IN_CONFIRMED"])
         self.assertEqual(controller.output.handle.overlap_start_ms, 0)
 
+    async def test_aec_unavailable_stop_policy_stops_output_without_raw_vad(self) -> None:
+        controller = self._controller(progress={
+            "enqueued_ms": 500, "played_ms": 250, "output_estimated_ms": 250,
+        })
+        cancelled, traces, resets = [], [], []
+
+        async def log(kind, **payload):
+            traces.append((kind, payload))
+
+        controller.aec_failure_policy = "stop_and_listen"
+        controller.audio_processor = SimpleNamespace(status="DEGRADED", error="reference stalled")
+        controller._aec_recovery_task = None
+        controller.output.cancel_all = lambda reason: cancelled.append(reason)
+        controller.episode = SimpleNamespace(closed=False, log=log)
+        controller.barge_in_gate = SimpleNamespace(reset=lambda: resets.append(True))
+
+        await controller._handle_aec_unavailable(controller.output.handle)
+
+        self.assertEqual(cancelled, ["input_unavailable"])
+        self.assertEqual(resets, [True])
+        self.assertEqual([kind for kind, _payload in traces], ["AEC_FAILED"])
+
 
 class TurnSettlementTests(unittest.IsolatedAsyncioTestCase):
     async def test_idle_agent_snapshot_does_not_cancel_unsettled_tts_prewarm(self) -> None:

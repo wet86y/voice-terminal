@@ -9,6 +9,7 @@ import unittest
 
 from voice_terminal.audio.player import PcmPlayer
 from voice_terminal.audio.processing import AudioPreprocessor
+from voice_terminal.config import AudioConfig
 from voice_terminal.controller.turn_controller import InputController
 from voice_terminal.providers.minimax_tts import MiniMaxTtsClient
 from voice_terminal.tts.alignment import DeliveryResolver, parse_alignment
@@ -295,8 +296,23 @@ class BargeInTests(unittest.TestCase):
         self.assertFalse(decision.confirmed)
         self.assertEqual(decision.duration_ms, 100)
 
+    def test_gate_rejects_unknown_processed_voice(self) -> None:
+        gate = BargeInGate(min_speech_ms=250)
+        self.assertEqual(
+            gate.feed(VadActivity(True, True, False), now=0.0, near_voice=None).reason,
+            "near_voice_unknown",
+        )
+        decision = gate.feed(VadActivity(True, False, False), now=0.5, near_voice=True)
+        self.assertFalse(decision.confirmed)
+        self.assertEqual(decision.duration_ms, 0)
+
 
 class PlayerAndProcessingTests(unittest.TestCase):
+    def test_aec_defaults_to_enabled_with_safe_recovery_policy(self) -> None:
+        config = AudioConfig()
+        self.assertTrue(config.processing_enabled)
+        self.assertEqual(config.aec_failure_policy, "pause_recover")
+
     def test_protected_gate_allows_input_before_first_output_callback(self) -> None:
         """Opening PortAudio must not make the first response frames deaf."""
 
@@ -380,11 +396,44 @@ class PlayerAndProcessingTests(unittest.TestCase):
         self.assertEqual(started, ["turn"])
         self.assertFalse(player.hold("turn"))
 
+    def test_started_player_pause_preserves_pcm_until_resume(self) -> None:
+        player = PcmPlayer(sample_rate=1000, channels=1, output_device=None)
+        player.allow("turn")
+        player.enqueue("turn", b"\x01\x00" * 4)
+        first = bytearray(2)
+        player._callback(first, 1, None, None)
+        self.assertTrue(player.pause("turn"))
+        paused = bytearray(2)
+        player._callback(paused, 1, None, None)
+        self.assertEqual(bytes(paused), b"\x00\x00")
+        self.assertTrue(player.resume("turn"))
+        resumed = bytearray(2)
+        player._callback(resumed, 1, None, None)
+        self.assertEqual(bytes(resumed), b"\x01\x00")
+
     def test_disabled_audio_processing_is_explicit(self) -> None:
         processor = AudioPreprocessor(enabled=False)
         self.assertEqual(processor.status, "DISABLED")
         self.assertFalse(processor.protected_interruption_available)
         self.assertEqual(processor.process(b"\x00\x00"), b"\x00\x00")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("aec_audio_processing") is not None
+        and importlib.util.find_spec("webrtcvad") is not None,
+        "AEC and WebRTC VAD wheels are optional in minimal test environments",
+    )
+    def test_degraded_processor_recovers_but_needs_new_reference(self) -> None:
+        processor = AudioPreprocessor(enabled=True, required=True)
+        try:
+            processor._degrade(RuntimeError("test failure"))
+            self.assertFalse(processor.protected_interruption_available)
+            self.assertTrue(processor.recover())
+            self.assertEqual(processor.status, "RECOVERED")
+            self.assertFalse(processor.protected_interruption_available)
+            processor.push_reverse(b"\x00\x00" * 160)
+            self.assertTrue(processor.protected_interruption_available)
+        finally:
+            processor.close()
 
     @unittest.skipUnless(
         importlib.util.find_spec("aec_audio_processing") is not None

@@ -45,6 +45,12 @@ Agent episode 在第一次真正建立 `episode_id` 时读取 `config/persona/` 
 
 输入中断只能通过显式取消作用域停止当前语音；普通语音活动、定稿、精修和工具结果不会取消在飞请求。用户在 `playback_started=false` 阶段开口时，输出层将未播放候选标记为 `HELD`，保留文本、handle 和当前推理状态；没有候选时则设置全局 hold，使随后完成的候选也等待。TTS session 或 provider 首段音频已经存在，都不代表已经开始播放。`SPEECH_ENDED` 后才释放最新的 `HELD` 候选，恢复同一文本事务；用户的新 ASR 信息仍由 400ms 单飞调度窗口合并，不直接启动第二个请求。只有播放器首次实际提交非零 PCM 后，确认的 barge-in 才进入显式取消路径。完整 `speak.text` 的前缀继承由 `conversation_id + turn_id` 所有权限定：只有活动 handle 属于当前轮时，模型才获得 `target_text` 和 `continuation_allowed=true`，完整覆盖旧文本时只创建 suffix 后续队列，前缀范围内出现差异时才创建 replacement generation。上一轮仍在播放的文本以 `observed_text` 暴露并标记 `owner_scope=previous_turn`，只提供会话认知，不授予续写权；上一轮已经结算后通过 ledger 的 assistant 历史继续可见。Speech Queue 中未开始的项目不会写入 heard_text，只保存文本；当前输出耗尽后保留 1 秒同轮追加窗口。最近一次 full delivery 只作为跨轮异常防重 guard，不进入活动快照：检测到“已听文本 + 非空后缀”时仅提交后缀，完全相同文本则保留合法复述。`request_id`、`speech_id` 和 `output_generation` 只用于追踪与播放器代际校验，不参与语义判旧。等待结束当前决策，而不结束连续对话。
 
+### AEC 保护的播放期插话
+
+播放回调把实际提交给设备的 PCM（包括补零）异步送入 `AudioPreprocessor` 的反向参考流；麦克风 PCM 固定按 16 kHz 单声道、10 ms 帧执行 AEC/NS，并由处理后的 WebRTC VAD 生成 `near_voice=true|false|unknown`。播放期间的 `BargeInGate` 只接受 `true`，并要求反向参考新鲜、处理器处于 `READY` 或 `RECOVERED`、持续语音达到既有最小时长。`false` 与 `unknown` 都清空候选，不提交 ASR，不触发用户打断；不存在原始麦克风 VAD 的自动回退。
+
+`audio.aec_failure_policy` 决定保护链在已播放 PCM 期间失效时的行为。默认 `pause_recover` 原子暂停播放器队列、重建处理器并等待新的反向参考后续播；恢复失败或 750 ms 超时会转为 `stop_and_listen`，停止当前输出并释放正常监听，避免无限暂停或用户被静默锁死。可选 `stop_and_listen` 直接采用该安全终止路径；`continue_without_barge_in` 仅继续播放并暂禁自动插话，供兼容性排障使用。状态转换与结果记录为 `AEC_RECOVERING`、`AEC_RECOVERED`、`AEC_FAILED` 或 `AEC_BARGE_IN_SUPPRESSED`；每个 `BARGE_IN_CONFIRMED` 必须同时记录 `near_voice=true` 和 `protected_available=true`。
+
 Responses 边界因供应商 strict 子集要求所有声明属性均为 required：`wait/cancel` 使用空 `speak.text`，异构 action 使用中性占位字段；进入 Agent 后立即投影回原有内部契约。本地信封校验和 action adapter 不得因 provider 返回 `completed` 或标记 `strict=true` 而跳过。
 
 ## AgentDecisionScheduler 调度契约

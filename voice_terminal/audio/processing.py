@@ -42,6 +42,9 @@ class AudioPreprocessor:
         self.enabled = enabled
         self.required = required
         self.vad_aggressiveness = vad_aggressiveness
+        self._enable_aec = enable_aec
+        self._enable_ns = enable_ns
+        self._enable_agc = enable_agc
         self._processor: Any = None
         self._near_end_vad: Any = None
         self._input_remainder = bytearray()
@@ -52,26 +55,31 @@ class AudioPreprocessor:
         self._processor_lock = threading.RLock()
         self.last_voice_activity: bool | None = None
         self._last_reverse_at: float | None = None
+        self.recovery_count = 0
+        self.last_recovery_ms: int | None = None
         self.status = "DISABLED" if not enabled else "DEGRADED"
         self.error: str | None = None
-        if not enabled:
-            return
+        if enabled:
+            self._start_processor(initial=True)
+
+    def _start_processor(self, *, initial: bool) -> bool:
+        """(Re)create the native AEC chain.  No capture samples are dropped here."""
         try:
             from aec_audio_processing import AudioProcessor  # type: ignore
             import webrtcvad  # type: ignore
 
             try:
                 self._processor = AudioProcessor(
-                    enable_aec=enable_aec,
-                    enable_ns=enable_ns,
-                    enable_agc=enable_agc,
+                    enable_aec=self._enable_aec,
+                    enable_ns=self._enable_ns,
+                    enable_agc=self._enable_agc,
                     enable_vad=True,
                 )
             except TypeError:
                 self._processor = AudioProcessor(
-                    echo_cancellation=enable_aec,
-                    noise_suppression=enable_ns,
-                    auto_gain_control=enable_agc,
+                    echo_cancellation=self._enable_aec,
+                    noise_suppression=self._enable_ns,
+                    auto_gain_control=self._enable_agc,
                 )
             self._configure_format()
             # ``aec-audio-processing==1.0.1`` exposes ``has_voice`` but its
@@ -81,7 +89,7 @@ class AudioPreprocessor:
             # for near-end voice confirmation.  FSMN-VAD still supplies the
             # speech candidate; this detector is the independent protection
             # gate used while the assistant is playing.
-            self._near_end_vad = webrtcvad.Vad(vad_aggressiveness)
+            self._near_end_vad = webrtcvad.Vad(self.vad_aggressiveness)
             self._reverse_queue = queue.Queue(maxsize=128)
             self._reverse_thread = threading.Thread(
                 target=self._reverse_loop,
@@ -89,28 +97,31 @@ class AudioPreprocessor:
                 daemon=True,
             )
             self._reverse_thread.start()
-            self.status = "READY"
+            self.status = "READY" if initial else "RECOVERED"
+            self.error = None
             logger.info(
                 "audio.processing_ready sample_rate=%d channels=%d reverse_sample_rate=%d "
                 "aec=%s ns=%s agc=%s near_vad=webrtcvad mode=%d",
                 self.sample_rate,
                 self.channels,
                 self.reverse_sample_rate,
-                enable_aec,
-                enable_ns,
-                enable_agc,
-                vad_aggressiveness,
+                self._enable_aec,
+                self._enable_ns,
+                self._enable_agc,
+                self.vad_aggressiveness,
             )
         except Exception as exc:
             self.error = str(exc) or "audio processor unavailable"
-            self.status = "ERROR" if required else "DEGRADED"
-            if required:
+            self.status = "ERROR" if self.required and initial else "DEGRADED"
+            if self.required and initial:
                 raise AudioProcessingError(f"音频前处理初始化失败：{self.error}") from exc
             logger.warning("audio.processing_unavailable error=%s", self.error)
+            return False
+        return True
 
     @property
     def available(self) -> bool:
-        return self._processor is not None and self.status == "READY"
+        return self._processor is not None and self.status in {"READY", "RECOVERED"}
 
     @property
     def protected_interruption_available(self) -> bool:
@@ -341,6 +352,36 @@ class AudioPreprocessor:
                 method = getattr(self._processor, "reset", None)
                 if method is not None:
                     method()
+
+    def recover(self) -> bool:
+        """Rebuild a degraded processor and wait for a new reverse reference.
+
+        The caller keeps playback paused during this method.  A successful
+        rebuild is deliberately not advertised as protected until the player
+        has supplied a fresh callback reference.
+        """
+        if not self.enabled:
+            return False
+        started = time.monotonic()
+        self.status = "RECOVERING"
+        self.close()
+        self._processor = None
+        self._near_end_vad = None
+        self._reverse_stop = threading.Event()
+        self._reverse_queue = None
+        self._reverse_thread = None
+        self._input_remainder.clear()
+        self._reverse_remainder.clear()
+        self._last_reverse_at = None
+        self.last_voice_activity = None
+        self.recovery_count += 1
+        ok = self._start_processor(initial=False)
+        self.last_recovery_ms = int((time.monotonic() - started) * 1000)
+        if not ok:
+            self.status = "FAILED"
+        logger.info("audio.processing_recovery ok=%s count=%d elapsed_ms=%d error=%s",
+                    ok, self.recovery_count, self.last_recovery_ms, self.error)
+        return ok
 
     def close(self) -> None:
         self._reverse_stop.set()

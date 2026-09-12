@@ -30,11 +30,13 @@ class InputController:
                  vad_end_silence_ms: int, max_turn_ms: int, bridge_min_chars: int,
                  bridge_max_chars: int, bridge_max_wait_ms: int, bridge_breaks: str,
                  audio_processor: AudioPreprocessor | None = None,
+                 aec_failure_policy: str = "pause_recover",
                  barge_in_gate: BargeInGate | None = None) -> None:
         self.state, self.bus, self.history = state, bus, history
         self.capture, self.kws, self.vad, self.asr = capture, kws, vad, asr
         self.llm, self.tts, self.player = llm, tts, player
         self.audio_processor = audio_processor
+        self.aec_failure_policy = aec_failure_policy
         self.barge_in_gate = barge_in_gate or BargeInGate(min_speech_ms=max(250, vad_min_speech_ms), enabled=True)
         self.wake_enabled, self.wake_keyword, self.wake_preroll_ms = wake_enabled, wake_keyword, wake_preroll_ms
         self.vad_min_speech_ms, self.vad_end_silence_ms, self.max_turn_ms = vad_min_speech_ms, vad_end_silence_ms, max_turn_ms
