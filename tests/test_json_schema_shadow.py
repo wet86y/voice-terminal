@@ -21,6 +21,7 @@ from voice_terminal.providers.deepseek import DeepSeekResponseTerminalError
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.context_frames import ContextFrame, ContextLane
 from voice_terminal.session.runtime import ConversationRuntime
+from voice_terminal.shadow_agent.contracts import ShadowTaskEvent
 
 
 def history(role: str, content: str) -> dict[str, str]:
@@ -56,6 +57,41 @@ def test_prompt_matches_required_responses_wire_contract_and_has_short_examples(
     assert '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}' in PROMPT
     assert "emotion 可省略" not in PROMPT
     assert "不得带 text" not in PROMPT
+
+
+def test_shadow_user_input_events_wake_main_scheduler_but_running_does_not():
+    async def scenario():
+        class Registry:
+            def action_definitions(self):
+                return []
+
+            def begin_turn(self, _episode_id):
+                return None
+
+        async def emit(*_args):
+            return None
+
+        runtime = AgentEpisodeRuntime(
+            None, Registry(), SimpleNamespace(status="IDLE"), emit,
+            conversation=ConversationRuntime(), ledger=SessionLedger(),
+        )
+        wakes = []
+        runtime._wake = wakes.append
+        await runtime.accept_shadow_task_event(
+            ShadowTaskEvent(1, "running", "正在检索")
+        )
+        await runtime.accept_shadow_task_event(
+            ShadowTaskEvent(1, "awaiting_user", "请选择范围", "task-1-question-1", ("A", "B"))
+        )
+        await runtime.accept_shadow_task_event(
+            ShadowTaskEvent(1, "paused", "请选择范围", "task-1-question-1", ("A", "B"))
+        )
+        assert wakes == ["SHADOW_TASK_USER_INPUT", "SHADOW_TASK_USER_INPUT"]
+        payload = runtime.ledger.entries[-1].content
+        assert payload["question_id"] == "task-1-question-1"
+        assert payload["options"] == ["A", "B"]
+
+    asyncio.run(scenario())
 
 
 def test_provider_schema_diagnostics_are_separate_from_local_contract():

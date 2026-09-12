@@ -47,10 +47,11 @@ Agent episode 在第一次真正建立 `episode_id` 时读取 `config/persona/` 
 
 影子任务在创建时只复制已经结算的 `user`/实际传达的 `assistant` 历史，并冻结
 `config/shadow_agent/instructions.md`。它不读取语音人格文件、当前播放状态、REQUEST_TAIL、
-语音动作目录或未播放文本。主语音模型只可用 `task(id,state,text)` 请求、修改、查询或取消
-任务；`id`、`state`、`text` 始终必填，state 为 `request|modify|cancel`。影子事件经 session
-bridge 写入账本：receipt 和 `running` 不唤醒调度器，`completed|cancelled|timed_out|failed` 仅向
-已有 mailbox 投递 `SHADOW_TASK_TERMINAL`，由下一次 400ms heartbeat 决定是否发起一条主请求。
+语音动作目录或未播放文本。主语音模型只可用 `task(id,state,text,question_id)` 请求、修改、答复或
+取消任务；四个字段始终必填，state 为 `request|modify|reply|cancel`，其中仅 reply 使用非空
+question_id。影子事件经 session bridge 写入账本：receipt 和 `running` 不唤醒调度器，
+`awaiting_user|paused` 投递 `SHADOW_TASK_USER_INPUT`，`completed|cancelled|timed_out|failed` 投递
+`SHADOW_TASK_TERMINAL`，均由下一次 400ms heartbeat 决定是否发起一条主请求。
 影子组件不得直接调用语音 LLM、TTS、播放器或 scheduler。
 
 当主 provider 为 OpenCode Go 时，影子 provider 同样使用当前 `conversation_id` 作为
@@ -78,7 +79,7 @@ DeepSeek provider 的输出预算固定为 `393216`（384K tokens），覆盖 re
 
 Agent runtime 只有一个 `AgentDecisionScheduler` 实例和一个 `_run()` 循环。`_run()` 以固定 deadline 持续推进本地 400ms 心跳：下一次 deadline 等于上一次 deadline 加 400ms，不使用“当前时间加400ms”的漂移式计时。心跳只读取唤醒信号、合并 `pending`、观察 active request/TTS/用户输入状态、推进窗口并决定是否创建一个 LLM task；它不等待正在运行的 provider，也不为每个心跳调用 provider。
 
-普通事件在400ms边界合并为一次请求。普通语义事件包括 ASR segment/final、SenseVoice 有语义变化的 refinement、影子任务终态和 thinking barrier 完成等现有事件。影子 `running` 只记录进度、不会唤醒；终态与 ASR 更新同一边界合并，仍受单请求并发限制。`SPEECH_STARTED`、`SPEECH_ENDED`、`ENDPOINT_CANDIDATE`、`VOICE_ACTIVE` 只作为本地活动信号，不覆盖强制窗口；所有 `TTS_*` 事件完全属于输出侧生命周期，不进入调度 mailbox、不重置静默锚点、不触发普通或强制请求。
+普通事件在400ms边界合并为一次请求。普通语义事件包括 ASR segment/final、SenseVoice 有语义变化的 refinement、影子任务的用户澄清/暂停/终态事件和 thinking barrier 完成等现有事件。影子 `running` 只记录进度、不会唤醒；`awaiting_user`、`paused` 与终态和 ASR 更新同一边界合并，仍受单请求并发限制。`SPEECH_STARTED`、`SPEECH_ENDED`、`ENDPOINT_CANDIDATE`、`VOICE_ACTIVE` 只作为本地活动信号，不覆盖强制窗口；所有 `TTS_*` 事件完全属于输出侧生命周期，不进入调度 mailbox、不重置静默锚点、不触发普通或强制请求。
 
 ### 流式 ASR final 确认与连续输入
 

@@ -492,7 +492,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
                     async def debug_sink(items: list[ShadowTaskEvent]) -> None:
                         for item in items:
                             await debug_events.put(event("shadow.debug.event", None, id=item.id,
-                                                         status=item.status, text=item.text))
+                                                         status=item.status, text=item.text,
+                                                         question_id=item.question_id,
+                                                         options=list(item.options)))
                     try:
                         receipt = await runtime.debug_shadow_task(connection_id, _payload, event_sink=debug_sink)
                         await debug_events.put(event("shadow.debug.receipt", None,

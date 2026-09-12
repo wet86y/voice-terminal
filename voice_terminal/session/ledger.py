@@ -150,6 +150,8 @@ class SessionLedger:
     def commit_shadow_task_event(self, event: ShadowTaskEvent) -> None:
         self.entries.append(SessionLedgerEntry("shadow_task", {
             "id": event.id, "status": event.status, "text": str(event.text)[:4000],
+            "question_id": event.question_id,
+            "options": list(event.options),
         }))
 
     def context_messages(self, current_input: str) -> list[dict[str, Any]]:

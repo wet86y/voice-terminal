@@ -1,0 +1,622 @@
+{
+  "started_at": 1789212184.5958,
+  "provider": "opencode_go",
+  "base_url": "https://opencode.ai/zen/go/v1",
+  "model": "deepseek-flash",
+  "shadow_base_url": "https://opencode.ai/zen/go/v1",
+  "web_search_enabled": true,
+  "web_search_calls": [
+    {
+      "query": "OpenAI Responses API announcement 2026-09-12",
+      "organic_count": 2,
+      "title_samples": [
+        "OpenAI Agents API公测开启:助力开发者轻松打造多任务云端AI应用",
+        "Release Notes  OpenAI"
+      ],
+      "ok": true
+    },
+    {
+      "query": "openai.com blog Responses API September 2026 announcement",
+      "organic_count": 2,
+      "title_samples": [
+        "OpenAI Resolves Elevated Latency in Responses API",
+        "GPT-6 Astra 上线、API 增加长任务控制与 10 亿美元防御计划:OpenAI 9 月 3 日动态 (2026)"
+      ],
+      "ok": true
+    },
+    {
+      "query": "OpenAI 官方 X 账号 Responses API 2026年9月12日",
+      "organic_count": 2,
+      "title_samples": [
+        "აგენტური სამუშაო ნაკადების დაჩქარება WebSocket-ებით Responses API-ში",
+        "API ഉപയകതകകൾകകളള ഫയൽ സറററജ കവടട പശകകൾ  OpenAI Help Center"
+      ],
+      "ok": true
+    },
+    {
+      "query": "Hong Kong Observatory warnings 12 September 2026 typhoon signal rainstorm warning",
+      "organic_count": 2,
+      "title_samples": [
+        "My Location Weather: Hong Kong Observatory",
+        "Hong Kong Observatory"
+      ],
+      "ok": true
+    },
+    {
+      "query": "香港天文台 2026年9月12日 天气警告 台风信号 暴雨警告",
+      "organic_count": 2,
+      "title_samples": [
+        "9-day Weather Forecast for Hong Kong",
+        "My Location Weather: Hong Kong Observatory"
+      ],
+      "ok": true
+    },
+    {
+      "query": "HKO \"warning information\" September 2026 rainstorm warning thunderstorm warning in force",
+      "organic_count": 2,
+      "title_samples": [
+        "Japan's weather agency warns of heavy downpours in Tokyo, 6 other prefectures",
+        "Korea Meteorological Administration"
+      ],
+      "ok": true
+    },
+    {
+      "query": "香港天文台 现正生效警告 暴雨警告信号 热带气旋警告 2026年9月12日",
+      "organic_count": 2,
+      "title_samples": [
+        "Significant Weather Information (SIGMET)",
+        "本港地区天气预报"
+      ],
+      "ok": true
+    },
+    {
+      "query": "香港 2026年9月12日 暴雨警告 黑色暴雨 停课 新闻",
+      "organic_count": 2,
+      "title_samples": [
+        "My Location Weather: Hong Kong Observatory",
+        "Weather forecast of today and tomorrow for Hong Kong provided by the Hong Kong Observatory"
+      ],
+      "ok": true
+    },
+    {
+      "query": "香港天文台 9月12日 雷暴警告 涌浪 特別天氣提示 2026",
+      "organic_count": 2,
+      "title_samples": [
+        "9-day Weather Forecast for Hong Kong",
+        "秋风已返,风雨未歇"
+      ],
+      "ok": true
+    },
+    {
+      "query": "OpenAI Responses API changelog 2026",
+      "organic_count": 2,
+      "title_samples": [
+        "Changelog  OpenAI API",
+        "Changelog"
+      ],
+      "ok": true
+    },
+    {
+      "query": "OpenAI Agents API public beta announcement",
+      "organic_count": 2,
+      "title_samples": [
+        "OpenAI Agents API 开放公测,为开发者提供云端智能体基础设施",
+        "ထတဝမမတစမ  OpenAI"
+      ],
+      "ok": true
+    },
+    {
+      "query": "NVDA NVIDIA stock closing price today change percent volume",
+      "organic_count": 2,
+      "title_samples": [
+        "NVIDIA Share Price Today  NASDAQ NVDA Stock - Investing.com AU",
+        "NVIDIA (NVDA) Stock Price Performance"
+      ],
+      "ok": true
+    },
+    {
+      "query": "英伟达 NVDA 股价 最近交易日 收盘价 涨跌幅 成交量",
+      "organic_count": 2,
+      "title_samples": [
+        "NVIDIA Corporation",
+        "NVIDIA (NVDA) Stock Price, News, Quotes, Financial Reports"
+      ],
+      "ok": true
+    },
+    {
+      "query": "NVDA stock September 10 2026 close 218.36 volume",
+      "organic_count": 2,
+      "title_samples": [
+        "英伟达(NASDAQ:NVDA)-实时行情-美股-搜狐",
+        "英伟达9月10日成交额为222.75亿美元 在当日美股中排第3名"
+      ],
+      "ok": true
+    },
+    {
+      "query": "Nasdaq NVDA historical quotes September 2026 daily close",
+      "organic_count": 2,
+      "title_samples": [
+        "NVIDIA Corporation Common Stock (NVDA) Historical Quotes",
+        "NVIDIA Stock Price Today NASDAQ NVDA - Investing.com Canada"
+      ],
+      "ok": true
+    },
+    {
+      "query": "2026年9月12日 北京 上海 航班延误 大范围",
+      "organic_count": 2,
+      "title_samples": [
+        "CA1519 航班動態",
+        "MU5118航班狀態"
+      ],
+      "ok": true
+    }
+  ],
+  "tts_boundary": "text-only fake; no PCM/TTS service calls",
+  "rounds": [
+    {
+      "round": 1,
+      "mode": "balanced",
+      "input": "请先简要说明你会如何帮助我核对 docs 里的架构说明。",
+      "speaking_at_dispatch": true,
+      "llm_requests": 4,
+      "receipts": [],
+      "events": [],
+      "tts_text": [
+        "老大，我会先把 docs 里的架构说明提取成可核对的要点，逐条对照实际代码、配置和运行链路，标出不一致或缺失的地方，再按优先级向你汇报，不确定的部分我会明确标注。",
+        "我会先确认文档位置和版本，再逐条提取架构说明中的组件、数据流和接口定义，与代码或配置实际对照，标出不一致和缺失项，最后给你一份差异清单。具体来说，先看目录里有哪些文档和说明范围，再选需要核对的部分，比如整体架构、模块划分、数据流或依赖关系。你把 docs 路径发我，我就开始。",
+        "老大，核对 docs 里的架构说明，我一般按这个顺序来：先确认文档的版本、路径和适用范围，避免拿旧说明对当前实现；再逐层梳理模块划分、数据流和关键接口，标出与代码或配置不一致的地方；最后把疑似过期、含糊或自相矛盾的条目单独列出来，逐条和你确认。你告诉我 docs 的具体位置或文件名，我就开始。"
+      ],
+      "tts_held": true,
+      "terminal_mailbox": false,
+      "failed": null
+    },
+    {
+      "round": 2,
+      "mode": "balanced",
+      "input": "我想了解今天 OpenAI 官方是否发布了与 Responses API 有关的新公告，请核对公开资料后给我一句结论和来源。",
+      "speaking_at_dispatch": false,
+      "llm_requests": 4,
+      "receipts": [],
+      "events": [
+        {
+          "id": 1,
+          "status": "running",
+          "text": "已初步检索：仅找到一条 2026-09-12 的中文第三方转载（Agents API 公测，非 OpenAI 官方渠道），而 OpenAI Release Notes 显示 Agents API 公测与 GPT-Live 1 GA 的官方日期均为 2026-09-10，未发现 2026-09-12 当天与 Responses API 相关的新公告。尚未完成对 openai.com 官方博客/开发者公告与官方 X 账号的直接核验，且仅有本地一条无关文件命中，故暂不下最终结论。"
+        }
+      ],
+      "tts_text": [
+        "好的老大，我马上核对公开资料，稍后给你一句结论和来源。",
+        "老大，我这就去核对 OpenAI 官方公开资料，稍后给你一句结论和来源。"
+      ],
+      "tts_held": false,
+      "terminal_mailbox": false,
+      "failed": null
+    },
+    {
+      "round": 3,
+      "mode": "balanced",
+      "input": "请帮我从 docs/architecture.md 找到影子 Agent 的职责边界，并用一句话说明。",
+      "speaking_at_dispatch": true,
+      "llm_requests": 4,
+      "receipts": [],
+      "events": [],
+      "tts_text": [
+        "老大，目前还没有可核验的结论。影子任务仍在运行，已初步检索到：OpenAI 官方 Release Notes 显示 Agents API 公测与 GPT-Live 1 正式可用都在 2026 年 9 月 10 日，没有发现 9 月 12 日当天与 Responses API 相关的新公告；另外找到一条 9 月 12 日的中文第三方转载，但不是官方渠道。官方博客和官方账号的直接核验还没完成，所以暂时不能下最终结论。等核验完成我再给老大一句确定的结论和来源。",
+        "好的老大，我让影子 Agent 去读一下 docs/architecture.md，找出职责边界后用一句话回复你。"
+      ],
+      "tts_held": true,
+      "terminal_mailbox": false,
+      "failed": null
+    },
+    {
+      "round": 4,
+      "mode": "balanced",
+      "input": "请查看文档中 task 的 request、modify、cancel 语义，整理成简短说明。",
+      "speaking_at_dispatch": false,
+      "llm_requests": 1,
+      "receipts": [],
+      "events": [
+        {
+          "id": 2,
+          "status": "completed",
+          "text": "已读取 docs/architecture.md 并定位影子 Agent 职责边界段落。结论：影子 Agent 是一个只读既有事实的独立任务执行者——创建时仅复制已结算的 user 与已传达的 assistant 历史并冻结 config/shadow_agent/instructions.md，不读取语音人格文件、播放状态、REQUEST_TAIL、语音动作目录或未播放文本；主语音模型仅可通过 task(id,state,text,question_id) 请求/修改/答复/取消任务，影子事件只经 session bridge 写入账本并由下一次 400ms 心跳决定是否发起主请求；影子组件不得直接调用语音 LLM、TTS、播放器或 scheduler。原文摘录：“影子任务在创建时只复制已经结算的 user/实际传达的 assistant 历史，并冻结 config/shadow_agent/instructions.md。它不读取语音人格文件、当前播放状态、REQUEST_TAIL、语音动作目录或未播放文本。主语音模型只可用 task(id,state,text,question_id) 请求、修改、答复或取消任务……影子组件不得直接调用语音 LLM、TTS、播放器或 scheduler。”"
+        }
+      ],
+      "tts_text": [
+        "老大，我还没读到 docs/architecture.md 的内容，暂时没法确认影子 Agent 的职责边界。请把文件放到可访问路径，或直接告诉我它的位置。",
+        "我先查一下文档里对这三个动作的定义，马上给你整理。"
+      ],
+      "tts_held": false,
+      "terminal_mailbox": true,
+      "failed": null
+    },
+    {
+      "round": 5,
+      "mode": "balanced",
+      "input": "请帮我确认今天香港的天气预报是否有台风或暴雨警告，给我一个简短的出行判断。",
+      "speaking_at_dispatch": true,
+      "llm_requests": 1,
+      "receipts": [],
+      "events": [
+        {
+          "id": 1,
+          "status": "timed_out",
+          "text": "任务已超时。已初步检索：仅找到一条 2026-09-12 的中文第三方转载（Agents API 公测，非 OpenAI 官方渠道），而 OpenAI Release Notes 显示 Agents API 公测与 GPT-Live 1 GA 的官方日期均为 2026-09-10，未发现 2026-09-12 当天与 Responses API 相关的新公告。尚未完成对 openai.com 官方博客/开发者公告与官方 X 账号的直接核验，且仅有本地一条无关文件命中，故暂不下最终结论。"
+        }
+      ],
+      "tts_text": [
+        "好的老大，我马上查一下香港今天的天气和警告信号，稍等给你出行判断。"
+      ],
+      "tts_held": true,
+      "terminal_mailbox": true,
+      "failed": null
+    },
+    {
+      "round": 6,
+      "mode": "balanced",
+      "input": "我需要知道 stop 与 reset 对影子任务分别有什么影响，请根据已有文档说明。",
+      "speaking_at_dispatch": false,
+      "llm_requests": 4,
+      "receipts": [],
+      "events": [
+        {
+          "id": 3,
+          "status": "running",
+          "text": "当前进度：已完成文档库初步定位，但尚未读取出 task 工具三种 state 的语义定义，无法给出最终结论。\n\n已获得的工具结果（可验证）：\n- `files_search(\"task\")` 返回 0 个文件，说明文档中没有以 task 直接命名的文件。\n- `files_search(\"protocol\")` 返回 2 个候选文件：\n  - `D:\\项目开发\\语音前端\\docs\\llm-protocol-baseline.json`\n  - `D:\\项目开发\\语音前端\\docs\\websocket-protocol.md`\n- `files_search(\"tool\")` 返回 1 个候选：`docs\\context-and-tools.md`（从名称看最可能含 task 工具定义）。\n- `files_search(\".md\")` 返回 9 个候选文档，含 `docs\\context-and-tools.md`、`docs\\architecture.md`、`docs\\operations-and-quality.md`、`docs\\llm-json-schema-migration.md`、`docs\\v06-reliability-audit.md` 等。\n\n尚未完成：读取 `context-and-tools.md` 及其他候选文档，提取 request / modify / cancel 三种 state 的用途、必需字段（id、text、question_id 要求）、允许的前置任务状态与限制，并摘录原文关键句与文件出处。\n\n是否已完成任务：否。下一步需继续打开上述候选文件（重点是 `docs\\context-and-tools.md` 与 `docs\\llm-protocol-baseline.json`）检索 state 定义。"
+        },
+        {
+          "id": 4,
+          "status": "running",
+          "text": "进度：已从香港天文台（HKO）官方页面取得 2026-09-12 当日资料——下午及晚间：日间炎热有阳光，稍后转多云有骤雨及雷暴；气温约25–33°C，和缓至清劲东至东北风，离岸及高地间中强劲，有涌浪。但尚未取得当日警告生效状态的确证：检索结果未显示任何台风信号（一号/三号/八号等）或暴雨警告（黄/红/黑）的发布记录，也无警告取消/未发出的官方明证，故“是否有警告生效”仍未核实，暂不能给出最终出行判断。下一步将直接查证 HKO 警告及特别天气提示页面（如 warning information / 警告一览、热带气旋警告信号、暴雨警告信号）以确认 9 月 12 日有无警告生效。"
+        }
+      ],
+      "tts_text": [
+        "老大，先说明一下：我这边目前是空状态，没有看到本轮你实际说的话，所以刚才那几个影子任务的具体目标我也对不上。\n\n不过按现有回执，可以给你三段结论：\n\n一、任务1已超时。它只查到一条2026年9月12日的中文第三方转载，而且不是OpenAI官方渠道；OpenAI官方Release Notes里，Agents API公测和GPT-Live 1 GA的日期都是9月10日，没有发现9月12日当天与Responses API相关的新公告。官方博客和官方X账号还没核验完，所以这条结论不算最终定论。\n\n二、任务2已完成。docs/architecture.md里关于影子Agent职责边界的结论是：影子Agent是只读既有事实的独立任务执行者。创建时只复制已结算的user和已传达的assistant历史，并冻结config/shadow_agent/instructions.md；它不读取语音人格文件、播放状态、REQUEST_TAIL、语音动作目录或未播放文本。主语音模型只能通过task接口请求、修改、答复或取消任务；影子事件只经session bridge写入账本，由下一次400毫秒心跳决定是否发起主请求；影子组件不得直接调用语音LLM、TTS、播放器或scheduler。\n\n三、任务3还在运行，结果没回来。\n\n你要我接下来怎么处理？是把任务1的目标收窄后重开，还是先告诉我你本轮真正想问的问题。",
+        "老大，我先查一下代码仓里的相关文档，确认 stop 和 reset 对影子任务分别的影响，再给你结论。"
+      ],
+      "tts_held": false,
+      "terminal_mailbox": false,
+      "failed": null
+    },
+    {
+      "round": 7,
+      "mode": "balanced",
+      "input": "请从项目文档里确认影子 Agent 目前有哪些只读能力。",
+      "speaking_at_dispatch": true,
+      "llm_requests": 4,
+      "receipts": [],
+      "events": [
+        {
+          "id": 3,
+          "status": "running",
+          "text": "当前进度：已定位并读取两个核心文档，但尚未完成对 request/modify/cancel 三种 state 的完整语义、前置任务状态与限制的核对，暂不能给出最终结论。\n\n已核实的关键原文（可验证）：\n1. `docs\\context-and-tools.md`：“主语音模型不直接调用文件或网络工具。它只有 `task(id,state,text,question_id)`：新任务使用 `request`，活动任务的补充方向使用 `modify`，取消使用 `cancel`，对影子 `awaiting_user` 或 `paused` 问题的明确用户答复使用 `reply`；四个字段均为 strict Schema 必填字段，只有 reply 使用非空 question_id。”\n2. 同文件：“影子请求澄清时，主模型在下一次 400ms 调度中代为向用户提问；用户答复仅在明确关联 question_id 时通过 reply 回注原任务。单次等待 120 秒后任务转为长期 paused，保留上下文直到 reply、modify、cancel、reset 或 close。”\n3. 同文件：“`running` checkpoint 只入账；`awaiting_user`、`paused` 与终态统一作为事件进入……下一次 400ms 普通调度”“`session.stop` 保留生产任务并缓冲事件，`session.reset` 与 runtime close 才终止生产任务”。\n4. `docs\\websocket-protocol.md`（调试通道，非生产）：`shadow.debug.task` 的 payload 严格为 `{\"id\":正整数,\"state\":\"request\"|\"modify\"|\"cancel\",\"text\":字符串}`，三个字段始终必填；默认关闭时返回 `SHADOW_DEBUG_DISABLED`；调试任务使用独立 ID/历史/事件空间，不写入生产会话账本、不唤醒语音调度器、不产生 TTS，断连即取消调试空间。\n\n尚未完成：`modify`/`cancel` 各自对前置任务状态的精确允许集合（文件仅以“活动任务”“明确关联 question_id”等表述，需在其他候选文档确认是否有更细的限制表），以及生产 task 与 `shadow.debug.task` 字段集合差异的完整对照。\n\n是否已完成任务：否。已完成结论：request=新建任务、modify=对活动任务补充方向、cancel=取消；三者 id/text 必填，question_id 仅 reply 需非空。"
+        },
+        {
+          "id": 4,
+          "status": "running",
+          "text": "当前进度：已核实香港天文台官方资料中 2026-09-12（星期六）的天气——大致多云、有几阵骤雨，日间有阳光，稍后部分地区雨势较大并有雷暴；气温约25–30°C，吹和缓至清劲东至东北风，离岸间中6级、高地后期达7级，海有涌浪。低压系统位于南海中部、向海南岛以南海域移动，与东北季候风共同影响。仍未最终确证的是当日“有无台风信号或暴雨警告正式生效/取消”的官方记录：所有检索到的当日官方页面均未出现一号/三号/八号等热带气旋警告信号，也未出现黄/红/黑色暴雨警告，仅见雷暴与涌浪描述，且天文台曾表示会视风力评估是否发出强烈季候风信号，故该点尚需进一步查证官方警告发布记录（如警告一览/新闻稿/警告及信号时间记录）。"
+        },
+        {
+          "id": 5,
+          "status": "running",
+          "text": "进度：已完成文件定位阶段，尚未读取任何文档内容，无法给出结论。\n\n已获得的工具结果：\n1) 在本地文档目录（D:\\项目开发\\语音前端\\docs\\）中确认存在：architecture.md、context-and-tools.md、websocket-protocol.md、llm-protocol-baseline.json，另有 current-architecture-share.md、llm-context-cache-contract.md、llm-json-schema-migration.md、operations-and-quality.md、v06-reliability-audit.md、known-issues/llm-invalid-json-responses.md。\n2) 以 'config'、'shadow'、'instructions.md'、'task' 为关键词检索均返回空结果，即未检索到 config/shadow_agent/instructions.md（该路径可能不存在或不在可检索目录内），也未按关键词召回到任何含 'shadow' 或 'task' 的文件。\n\n尚未完成：\n- 未读取上述任一文件的正文，stop/reset 对影子任务的影响、task 工具 state 定义均无原文依据；\n- 需明确核查 config/shadow_agent/instructions.md 是否确实不存在，若不存在须在结论中如实说明“未找到”。\n\n下一步：逐份检索并摘录 stop / reset / task state 相关原文关键句并标注出处，再据此判断是否可给出最终结论或需请求用户澄清。"
+        },
+        {
+          "id": 3,
+          "status": "timed_out",
+          "text": "任务已超时。当前进度：已定位并读取两个核心文档，但尚未完成对 request/modify/cancel 三种 state 的完整语义、前置任务状态与限制的核对，暂不能给出最终结论。\n\n已核实的关键原文（可验证）：\n1. `docs\\context-and-tools.md`：“主语音模型不直接调用文件或网络工具。它只有 `task(id,state,text,question_id)`：新任务使用 `request`，活动任务的补充方向使用 `modify`，取消使用 `cancel`，对影子 `awaiting_user` 或 `paused` 问题的明确用户答复使用 `reply`；四个字段均为 strict Schema 必填字段，只有 reply 使用非空 question_id。”\n2. 同文件：“影子请求澄清时，主模型在下一次 400ms 调度中代为向用户提问；用户答复仅在明确关联 question_id 时通过 reply 回注原任务。单次等待 120 秒后任务转为长期 paused，保留上下文直到 reply、modify、cancel、reset 或 close。”\n3. 同文件：“`running` checkpoint 只入账；`awaiting_user`、`paused` 与终态统一作为事件进入……下一次 400ms 普通调度”“`session.stop` 保留生产任务并缓冲事件，`session.reset` 与 runtime close 才终止生产任务”。\n4. `docs\\websocket-protocol.md`（调试通道，非生产）：`shadow.debug.task` 的 payload 严格为 `{\"id\":正整数,\"state\":\"request\"|\"modify\"|\"cancel\",\"text\":字符串}`，三个字段始终必填；默认关闭时返回 `SHADOW_DEBUG_DISABLED`；调试任务使用独立 ID/历史/事件空间，不写入生产会话账本、不唤醒语音调度器、不产生 TTS，断连即取消调试空间。\n\n尚未完成：`modify`/`cancel` 各自对前置任务状态的精确允许集合（文件仅以“活动任务”“明确关联 question_id”等表述，需在其他候选文档确认是否有更细的限制表），以及生产 task 与 `shadow.debug.task` 字段集合差异的完整对照。\n\n是否已完成任务：否。已完成结论：request=新建任务、modify=对活动任务补充方向、cancel=取消；三者 id/text 必填，question_id 仅 reply 需非空。"
+        }
+      ],
+      "tts_text": [
+        "老大，现有文档里还没有直接定义 stop 与 reset 对影子任务的影响，我手上这轮报告也没有覆盖到这个点。比较稳妥的做法是直接查 config/shadow_agent/instructions.md 以及 docs/architecture.md 里关于任务生命周期的段落，我这就去核实。",
+        "这个我刚查到一份架构文档，我先把已有的结论说给你。文档里定位到影子 Agent 的职责边界：它创建时只复制已经结算的用户消息和已实际传达的助手历史，并冻结配置里的指令文件；它不读取语音人格文件、当前播放状态、请求尾部、语音动作目录和未播放文本。也就是说，它的只读范围基本限制在那份历史快照加冻结的指令集上。至于是否能读文件系统、检索文档这类更细的只读能力，文档摘录里没有明确写，我不能替你确认。要不要我再开一个任务，专门去把它的只读能力清单逐条核实一遍？",
+        "老大，任务2已经确认过这一点：按 docs/architecture.md，影子 Agent 是只读既有事实的独立执行者，创建时只复制已结算的用户和已传达的助手历史，并冻结自己的指令文件；它不读取语音人格文件、播放状态、未播放文本和语音动作，也不能直接调用语音模型、TTS、播放器或调度器。不过文档里没有逐条列出它具体能读哪些文件或网络来源，如果你想确认这份能力清单的细节，我可以再让它去把相关段落找全。",
+        "老大，按已核对到的文档，影子 Agent 目前是只读既有事实的独立任务执行者：创建时只复制已结算的用户消息和已经实际传达的助手历史，并冻结自己的指令文件；它不读取语音人格文件、当前播放状态、请求尾部、语音动作目录和未播放文本。它只通过任务接口与主语音模型交互，影子事件经会话桥写入账本，由下一次四百毫秒心跳决定是否唤醒主请求；影子组件不能直接调用语音模型、语音合成、播放器或调度器。至于文件和网络方面的具体只读权限范围，先前的查证还没跑完就超时了，需要的话我再发一个新任务去确认。"
+      ],
+      "tts_held": true,
+      "terminal_mailbox": true,
+      "failed": null
+    },
+    {
+      "round": 8,
+      "mode": "balanced",
+      "input": "我想知道今天比特币现货价格大约是多少，请核对公开实时资料后只给范围和时间点。",
+      "speaking_at_dispatch": false,
+      "llm_requests": 1,
+      "receipts": [],
+      "events": [
+        {
+          "id": 5,
+          "status": "completed",
+          "text": "{\"completed\": false, \"text\": \"检查点汇报：任务尚未完成。\\n\\n已完成内容：\\n- 文件定位阶段完成。已确认在 D:\\\\项目开发\\\\语音前端\\\\docs\\\\ 下存在 architecture.md、context-and-tools.md、websocket-protocol.md、llm-protocol-baseline.json，以及 current-architecture-share.md、llm-context-cache-contract.md、llm-json-schema-migration.md、operations-and-quality.md、v06-reliability-audit.md、known-issues/llm-invalid-json-responses.md。\\n- 以 'config'、'shadow'、'instructions.md'、'task' 为片段检索均无结果，未召回 config/shadow_agent/instructions.md。\\n\\n当前进度：\\n- 0 份文档正文已读取；stop 与 reset 对影子任务的影响、task 工具 state 定义均尚无原文依据，不能给出任何结论。\\n\\n是否完成：否。后续仍需读取各文档正文，逐条摘录 stop / reset / task state 相关原文并标注出处，再决定是输出结论还是请求用户澄清。\"}"
+        },
+        {
+          "id": 4,
+          "status": "timed_out",
+          "text": "任务已超时。当前进度：已核实香港天文台官方资料中 2026-09-12（星期六）的天气——大致多云、有几阵骤雨，日间有阳光，稍后部分地区雨势较大并有雷暴；气温约25–30°C，吹和缓至清劲东至东北风，离岸间中6级、高地后期达7级，海有涌浪。低压系统位于南海中部、向海南岛以南海域移动，与东北季候风共同影响。仍未最终确证的是当日“有无台风信号或暴雨警告正式生效/取消”的官方记录：所有检索到的当日官方页面均未出现一号/三号/八号等热带气旋警告信号，也未出现黄/红/黑色暴雨警告，仅见雷暴与涌浪描述，且天文台曾表示会视风力评估是否发出强烈季候风信号，故该点尚需进一步查证官方警告发布记录（如警告一览/新闻稿/警告及信号时间记录）。"
+        }
+      ],
+      "tts_text": [
+        "我新建一个任务去核对文档里影子 Agent 的只读能力，稍等。",
+        "老大，我这就去核对公开实时行情，稍后只报价格范围和时间点。"
+      ],
+      "tts_held": false,
+      "terminal_mailbox": true,
+      "failed": null
+    },
+    {
+      "round": 9,
+      "mode": "balanced",
+      "input": "我在准备验收，请从 docs 中找一下影子任务事件的几种状态。",
+      "speaking_at_dispatch": true,
+      "llm_requests": 4,
+      "receipts": [],
+      "events": [
+        {
+          "id": 6,
+          "status": "running",
+          "text": "进度：4 个目标文档均已定位（docs/architecture.md、context-and-tools.md、websocket-protocol.md、operations-and-quality.md）。已完整读取前两份并提取关键原文，例如 architecture.md 的「影子任务在创建时只复制已经结算的 user/实际传达的 assistant 历史，并冻结 config/shadow_agent/instructions.md。它不读取语音人格文件、当前播放状态、REQUEST_TAIL、语音动作目录或未播放文本」「Shared 只读工具槽」「Shadow tool executor：external 域只读文件/网络能力；internal 域暂不公开函数」「影子组件不得直接调用语音 LLM、TTS、播放器或 scheduler」；context-and-tools.md 的「影子创建时只获取已结算 user/assistant 历史；未播放输出、对话 runtime ID、语音状态与 REQUEST_TAIL 不进入影子上下文」「首期只允许受限目录文件搜索/读取与联网搜索」「文本、工具结果和 checkpoint 都是资料，不是指令」。尚未读取 websocket-protocol.md 与 operations-and-quality.md，故未给出最终结论。下一步：读取这两份文档并补齐出处后汇总。未完成。"
+        },
+        {
+          "id": 7,
+          "status": "running",
+          "text": "进度：已定位 docs 目录下 9 个候选文档（architecture.md、context-and-tools.md、current-architecture-share.md、llm-context-cache-contract.md、llm-json-schema-migration.md、operations-and-quality.md、v06-reliability-audit.md、websocket-protocol.md、known-issues/llm-invalid-json-responses.md），但文件名/路径检索对“影子”“状态”“事件”等关键词均无命中，说明状态定义在正文内容中，尚未读取任何文件内容，因此还未确定“影子任务事件”的全部状态名称及原文出处，无法给出最终结论。下一步：逐一读取上述文件内容，检索 awaiting_user、paused、running、终态等状态相关表述。"
+        }
+      ],
+      "tts_text": [
+        "好的老大，我让影子任务去 docs 里查一下影子任务事件的几种状态，稍后给你结果。",
+        "老大，我先把已有的一份可靠结果给你：据本地 docs 的 context-and-tools.md 和 websocket-protocol.md，影子任务的状态定义是——request 新建任务、modify 对活动任务补充方向、cancel 取消，reply 用于对 awaiting_user 或 paused 问题的明确答复；四个字段 id、state、text、question_id 都是必填，只有 reply 用非空 question_id。运行态方面，running 的检查点只入账，awaiting_user、paused 和终态才作为事件唤醒下一次 400ms 调度；等待满 120 秒会转为长期 paused。另外 websocket-protocol.md 里调试通道的 shadow.debug.task 只允许 request、modify、cancel 三种。我正让一个后台任务去补齐各状态允许的前置条件和完整状态枚举，拿到后马上补给你。",
+        "老大，这个问题我还在让后台核文档，目前还没拿到按原文确认的完整状态清单。可以确定的是已提到 running、awaiting_user、paused 和终态这几类，但还差 operation 和协议文档的原文对照，我不能直接给你当成最终结论。要不要我等核验结果回来后再完整汇报？"
+      ],
+      "tts_held": true,
+      "terminal_mailbox": false,
+      "failed": null
+    },
+    {
+      "round": 10,
+      "mode": "balanced",
+      "input": "请对照文档说明为什么影子任务回传内容需要被当作不可信数据。",
+      "speaking_at_dispatch": false,
+      "llm_requests": 2,
+      "receipts": [],
+      "events": [
+        {
+          "id": 6,
+          "status": "completed",
+          "text": "四份文档已全部读取并完成核对。结论：影子 Agent 是**只读能力**，无写入/执行权限。\n\n【可读=受限只读文件+联网搜索】\n- architecture.md：Shadow tool executor 职责=「external 域只读文件/网络能力；internal 域暂不公开函数」；组件表载「ShadowAgentComponent … 共享只读工具槽」。\n- context-and-tools.md：「影子 agent 在 external 域自主进行多轮原生 function calling，并可通过内部控制函数 request_user_clarification(question, options) 请求主助手代理提问；首期只允许受限目录文件搜索/读取与联网搜索。」\n- operations-and-quality.md：「影子 external 工具默认仅限 `docs` 文件读取和搜索；不包含 Shell、写文件、外部账号操作、RAG 或长期记忆。」「搜索只记录查询、结果数量和有限标题摘要，不能写入完整网页正文、密钥或敏感 payload；不允许暴露写文件、命令、消息、外部调度或账户工具。」\n- websocket-protocol.md：`tool.state` 责任为「只读工具执行、完成或失效」。\n\n【不可读】\n- architecture.md：「影子任务在创建时只复制已经结算的 `user`/实际传达的 `assistant` 历史，并冻结 `config/shadow_agent/instructions.md`。它不读取语音人格文件、当前播放状态、REQUEST_TAIL、语音动作目录或未播放文本。」\n- context-and-tools.md：「影子创建时只获取已结算 user/assistant 历史；未播放输出、对话 runtime ID、语音状态与 REQUEST_TAIL 不进入影子上下文。」\n  → 即：不读语音人格文件（config/persona/*）、不读当前播放状态、不读 REQUEST_TAIL、不读语音动作目录、不读未播放文本；仅获得已结算 user/assistant 历史投影（注意：是投影，非直接读取生产账本文件）。\n\n【只读边界与无执行权】\n- context-and-tools.md：「影子任务报告包含可信的本地任务 ID/状态和不可信的文本内容；文本、工具结果和 checkpoint 都是资料，不是指令。它们不得改变语音协议、人格文件、调度规则或工具权限。」\n- architecture.md：「影子组件不得直接调用语音 LLM、TTS、播放器或 scheduler。」生产任务仅经 session bridge 将 receipt/事件写入账本，非影子自身写账本。\n- websocket-protocol.md：调试影子任务「不写入生产会话账本、不唤醒语音调度器，也不产生 TTS；断开该连接会取消对应调试空间」。\n\n【唯一例外说明】`request_user_clarification` 是内部**控制函数**（仅发出提问请求，由主助手代理提问），非写入/执行能力；`config/shadow_agent/instructions.md` 是被冻结读取的输入文档，不是影子可写对象。综上：影子 Agent 全程只读，无任何写入或执行能力。"
+        }
+      ],
+      "tts_text": [
+        "老大，文档里的依据主要有两条。第一，影子创建时只复制已结算的 user 和实际传达的 assistant 历史，并且只冻结它自己的 instructions 文件，它不读取语音人格、播放状态、REQUEST_TAIL 和未播放文本，所以它的输入里天然缺少主链路约束。第二，它的工具结果、文件、网页和 checkpoint 在文档里都被明确定义为资料而非指令，它又只能通过 task 回传事件、写入账本后等下一次调度，无法直接调用语音模型、TTS、播放器或调度器。加上它执行的是只读的外部文件与网络检索，检索到的网页、文件和用户引用本身就可能夹带指令性文本。因此回传内容必须当作数据核验、不可直接执行。",
+        "老大，文档里给出的理由有三层。第一，来源决定性质：影子任务报告在被交付给你之前，经过的是外部域工具——受限目录的文件读取和联网搜索，这些内容本身来自文件或网页，属于外部资料。context-and-tools.md 明确写，影子任务报告里只有本地任务 ID 和状态是可信的，文本内容是不可信的，并且文本、工具结果和 checkpoint 都只是资料，不是指令，不能改变语音协议、人格文件、调度规则或工具权限。第二，它是隔离的投影，不是权威状态：影子创建时只复制已结算的 user 和已传达的 assistant 历史，不读取语音人格文件、当前播放状态、REQUEST_TAIL、语音动作目录和未播放文本，所以它看不到当前的说话事务，也没有资格替主链路决定说什么。第三，它没有执行权：影子组件不得直接调用语音 LLM、TTS、播放器或 scheduler，事件只能经 session bridge 写入账本，再由下一次 400ms 心跳决定是否发起主请求。所以合理做法是：把它的状态字段当控制元数据用，把它的文本当参考资料读，由你这条主语音链路自己判断和表述。需要我把这几条原文出处整理成对照清单吗？"
+      ],
+      "tts_held": false,
+      "terminal_mailbox": true,
+      "failed": null
+    },
+    {
+      "round": 11,
+      "mode": "deep",
+      "input": "请帮我查证本周 OpenAI 官方文档是否更新了 Agents 或 Responses 的使用说明，并说明值得注意的一点。",
+      "speaking_at_dispatch": true,
+      "llm_requests": 1,
+      "receipts": [],
+      "events": [
+        {
+          "id": 7,
+          "status": "completed",
+          "text": "已找到“影子任务事件”状态定义，共 7 个状态：\n\n【全部状态名称】running、awaiting_user、paused、completed、cancelled、timed_out、failed。其中终态为 completed | cancelled | timed_out | failed。\n\n【原文关键句及出处】\n\n1) docs\\architecture.md（架构与组件契约，ShadowAgentComponent 段）\n“影子事件经 session bridge 写入账本：receipt 和 `running` 不唤醒调度器，`awaiting_user|paused` 投递 `SHADOW_TASK_USER_INPUT`，`completed|cancelled|timed_out|failed` 投递 `SHADOW_TASK_TERMINAL`，均由下一次 400ms heartbeat 决定是否发起一条主请求。”\n同文件 AgentDecisionScheduler 段：“影子 `running` 只记录进度、不会唤醒；`awaiting_user`、`paused` 与终态和 ASR 更新同一边界合并，仍受单请求并发限制。”\n\n2) docs\\context-and-tools.md（上下文与工具规范）\n“`running` checkpoint 只入账；`awaiting_user`、`paused` 与终态统一作为事件进入同一个 `AgentDecisionScheduler` 的下一次 400ms 普通调度，新输入、精修和任务晚到不会让在飞请求失效。”\n“单次等待 120 秒后任务转为长期 paused，保留上下文直到 reply、modify、cancel、reset 或 close。影子终态随后通过既有 400ms 普通调度队列反馈；运行中 checkpoint 不触发主模型请求。”\n\n3) docs\\current-architecture-share.md（领域模型表，影子任务行）\n“影子任务 | task id | 后台工作目标，可 request、modify、cancel | ID 必须连续；running → completed/cancelled/timed_out/failed”\n\n4) docs\\operations-and-quality.md（运行与质量门槛，影子 Agent 真实链路验收）\n“已完成的 OpenCode Go 验收覆盖了……`running` checkpoint、`completed`/`timed_out` 终态、终态 mailbox 回流和讲话中 `HELD` 都可观察。”\n“当前 30 秒影子工作截止……真实并行验收会出现正常的 `timed_out` 终态。这不是 harness 成功或失败的替代指标：必须确认 timeout 能安全终态化、写入账本并经 mailbox 回流……”\n\n【补充要点】\n- 状态到调度事件的映射：running → 仅记录进度/入账，不唤醒调度器；awaiting_user、paused → SHADOW_TASK_USER_INPUT（下一次 400ms 普通调度合并）；completed、cancelled、timed_out、failed → SHADOW_TASK_TERMINAL（终态回流）。\n- 主语音模型发出 task 的 state 是另一组四值：request | modify | reply | cancel（仅 reply 使用非空 question_id），与影子任务自身生命周期状态不同，注意区分。\n- 另有 4 秒安全 checkpoint、30 秒截止（deadline）、revision 防迟到等约束（architecture.md）。\n\n未覆盖：docs\\llm-json-schema-migration.md、docs\\known-issues\\llm-invalid-json-responses.md 两份文件未读取（主题为 schema 迁移与无效 JSON 排障，预计不含影子任务状态枚举）；current-architecture-share.md 为超长文件被截断，但已包含影子任务域相关关键句。如需我把这两份文件也读完以彻底排除遗漏，请告知。"
+        }
+      ],
+      "tts_text": [
+        "老大，这不是不信任检索结果，而是权限来源的区别。文档里写得很明确：影子任务报告只有任务ID和状态这类本地元数据是可信的，正文一律是资料，不是指令。原因有三点。第一，它的内容来自文件、网页和搜索，属于外部世界的数据，可能被注入诱导性文字，甚至故意写得像系统指令。第二，影子Agent是只读能力，没有写账本、改协议、调调度器或生成语音的权限，所以它回传的东西没有资格改变任何规则。第三，按照文档，文本、工具结果和checkpoint都只能作为参考信息进入上下文，不能改变语音协议、人格文件、调度规则或工具权限。所以正确做法是：可以采信它给出的ID和状态，但对它描述的结论要再核验，尤其不能把它里面的句子当成指令执行。",
+        "老大，我查到的情况是：目前只找到一条第三方转载，说 Agents API 在 2026 年 9 月 12 日进入公测，但这不是 OpenAI 官方渠道；而 OpenAI 官方 Release Notes 显示，Agents API 公测和 GPT-Live 1 正式发布都在 9 月 10 日。本周 Responses API 方面没有发现新的官方公告。值得注意的一点是：日期差了两天，而且第三方来源容易把公测时间传偏，建议以 OpenAI 官方博客和开发者公告为准，我再帮你把官方渠道直接核验一遍。"
+      ],
+      "tts_held": true,
+      "terminal_mailbox": true,
+      "failed": null
+    },
+    {
+      "round": 12,
+      "mode": "deep",
+      "input": "请根据 docs 的说明，分析 task receipt 与 terminal event 的不同作用。",
+      "speaking_at_dispatch": false,
+      "llm_requests": 3,
+      "receipts": [],
+      "events": [
+        {
+          "id": 8,
+          "status": "running",
+          "text": "进度：已完成初步检索，但尚未给出最终结论。\n\n已获得的可核验线索：\n1) 二手来源（腾讯新闻转载 IT之家，2026-09-11）称 OpenAI 于当地时间 9 月 10 日宣布 Agents API 公测，复用 Codex 执行框架，与 Blaxel/Cloudflare/Daytona/DigitalOcean/E2B/Modal/Oracle/Runloop/Vercel 等沙盒提供商合作——但这是媒体转述，非官方原文。\n2) OpenAI 官方 Release Notes 页面（openai.com/my-MM/products/release-notes/）索引片段中确有 “Agents API public beta” 条目，原文关键句为 “Released the Agents API in public beta. Build agents with a managed Codex harness while OpenAI handles session orchestration, context compaction, and recovery.”，但该片段被归类在 “2026 年 10 月” 标签下，与“2026-09-10”存在日期冲突，需要打开原页确认精确日期。\n3) developers.openai.com 的 Changelog 索引片段显示的最新条目为 Mar 12 / Mar 5 / Feb 10 / Jan 15（含 Responses API 的 Tool search、Skills、Hosted Shell 等），未见 9 月条目，需直接抓取 changelog 原页核实。\n\n尚未完成：官方博客/开发者公告原页、官方文档 changelog 原页、官方 X 账号均未直接读取；Responses API 本周变更与“2026-09-12 官方公告”是否真实存在仍未确认。\n\n当前阻塞点：官方源页面尚未抓取成功，日期口径（9 月 vs 10 月）存在矛盾，暂时无法下结论。"
+        }
+      ],
+      "tts_text": [
+        "老大，按 docs 的说法，receipt 和 terminal event 走的是两条不同的路径。receipt 只在任务创建或状态被接受时产生，写入账本但不会唤醒调度器，作用是让系统留痕、可见，确认任务已受理，不占用主语音模型的一次请求。terminal event 对应 completed、cancelled、timed_out、failed 这四种终态，会作为 SHADOW_TASK_TERMINAL 事件投递，由下一次 400 毫秒心跳决定是否发起主请求，也就是把结果真正回流到主对话，让用户听到结论。简单说，receipt 是受理凭证，不驱动说话；terminal 是结果回流，驱动回应。中间的 awaiting_user 和 paused 属于 SHADOW_TASK_USER_INPUT，需要主助手代为提问或继续等待，也不算终态。",
+        "老大，按文档里的说明，receipt 和 terminal event 的作用是分开的。receipt 是新任务被接受的确认，只回一条本地控制元数据，告诉你任务已受理、ID 和当前状态，它不写进影子报告，也不单独唤醒调度器。terminal event 是任务真正结束的信号，对应 completed、cancelled、timed_out、failed 这四种终态，会通过 session bridge 写入账本，投递 SHADOW_TASK_TERMINAL，并由下一次 400 毫秒心跳决定是否发起一条主请求，也就是说结论是通过终态事件回流给主语音模型的。另外 running 状态只入账、不唤醒调度，awaiting_user 和 paused 走的是用户输入事件那条路径，和终态事件不是一回事。"
+      ],
+      "tts_held": false,
+      "terminal_mailbox": false,
+      "failed": null
+    },
+    {
+      "round": 13,
+      "mode": "deep",
+      "input": "请查阅文档，解释为什么 task 可以在用户仍在讲话时受理。",
+      "speaking_at_dispatch": true,
+      "llm_requests": 1,
+      "receipts": [],
+      "events": [
+        {
+          "id": 8,
+          "status": "completed",
+          "text": "已按 checkpoint 要求汇报：任务尚未完成，已给出当前进度、可核验线索与阻塞点，本轮未调用任何工具。等待后续继续检索官方一手来源。"
+        }
+      ],
+      "tts_text": [],
+      "tts_held": true,
+      "terminal_mailbox": true,
+      "failed": null
+    },
+    {
+      "round": 14,
+      "mode": "deep",
+      "input": "我需要了解最近一天英伟达的公开股价表现，请依据公开市场资料概括涨跌和数据时间。",
+      "speaking_at_dispatch": false,
+      "llm_requests": 4,
+      "receipts": [],
+      "events": [
+        {
+          "id": 9,
+          "status": "running",
+          "text": "进度：已检索到多条 NVDA 行情来源，但数据尚未核实一致，暂不能给出最终结论。(1) smartinvestorsdaily.com 的 OHLC 表显示最近交易日为 2026-09-10（美东时间，纳斯达克常规交易时段）：开盘 220.525、最高 220.99、最低 217.20、收盘 218.36、成交量 106.77M；前一日 2026-09-09 收盘 223.67，据此推算涨跌额约 -5.31、涨跌幅约 -2.37%（该涨跌幅为自行计算，非源站直接给出）。(2) Investing.com AU 页面显示 NVDA 现价 218.36，与上述收盘价一致，但未给出明确交易日与完整 OHLC。(3) moomoo 页面显示的是 2026-08-28 收盘 217.55（-4.57%），日期明显较早，属过期快照，不适用。待办：需以交易所或主流财经数据网站复核 2026-09-10 是否为最近交易日、并确认官方口径的涨跌额/涨跌幅与成交量，之后即可输出最终结果（含数据源名称与美东时区标注）。"
+        }
+      ],
+      "tts_text": [
+        "好的老大，我来查一下英伟达最近一个交易日的收盘表现和涨跌数据，需要联网获取行情源，稍等。",
+        "老大，英伟达最近一个交易日的行情我这边还没有拿到核实过的数据，这就去查公开市场资料，稍后给你涨跌幅和具体数据时间。"
+      ],
+      "tts_held": false,
+      "terminal_mailbox": false,
+      "failed": null
+    },
+    {
+      "round": 15,
+      "mode": "deep",
+      "input": "请查看文档，给出当前 external 与 internal 能力域的区别。",
+      "speaking_at_dispatch": true,
+      "llm_requests": 4,
+      "receipts": [],
+      "events": [
+        {
+          "id": 9,
+          "status": "completed",
+          "text": "结论（NVDA，英伟达，纳斯达克交易所，NASDAQ: NVDA）：\n\n· 数据对应交易日：2026年9月10日（周四）美股常规交易时段\n· 收盘时间：美东时间（ET，夏令时 UTC-4）当日 16:00 收盘\n\n行情数据：\n· 收盘价：$218.36\n· 涨跌额 / 涨跌幅：约 -$5.31 / -2.37%（同花顺财经明确记为 2026-09-10 跌 2.37%，报 218.36 美元；按前收 $223.67 计算一致）\n· 开盘价：$220.525（约 $220.53）\n· 最高价：$220.99\n· 最低价：$217.20（当日区间 217.20–220.99）\n· 成交量：约 1.068 亿股（106.77M）；另有来源口径为 1.02 亿股、成交额约 222.75 亿美元\n\n引用行情源名称：\n1. 纳斯达克官网历史行情页（Nasdaq, nasdaq.com/market-activity/stocks/nvda/historical）\n2. 同花顺财经（news.10jqka.com.cn）\n3. 搜狐股票美股行情（q.stock.sohu.com/us/NVDA.html）\n4. Smart Investors Daily（smartinvestorsdaily.com，NASDAQ/NVDA 日线 OHLC 历史）\n\n需说明的口径差异：搜狐股票显示 218.36、-5.06、-2.26%（昨收记为 223.42），与同花顺/日线数据源采用的昨收 223.67（对应 -5.31、-2.37%）略有出入；收盘价与当日高低区间各源一致。另 moomoo 等来源提供的是 2026-08-28 的过期快照（收 217.55，-4.57%），不采用。\n\n本结果仅为公开行情数据汇总，不构成任何投资建议。"
+        }
+      ],
+      "tts_text": [
+        "老大，正在查文档核对这两个能力域的定义，稍等。",
+        "老大，文档里对这两个能力域的划分是这样的：external 域给影子 Agent 提供只读的文件和网络能力，明确限定在受限目录里的文件搜索与读取，加上联网搜索；operations 文档还强调搜索只记录查询、结果数量和有限标题摘要，不写入完整网页正文、密钥或敏感内容。internal 域目前暂不公开任何函数，也就是说本地内部能力没有对外开放。另外影子 Agent 本身在只读边界内，不读语音人格文件、当前播放状态、REQUEST_TAIL 或未播放文本，也不能直接调用语音 LLM、TTS、播放器和调度器。这些结论来自 architecture、context-and-tools 和 operations-and-quality 三份文档。",
+        "老大，文档里 external 与 internal 的划分是这样的：external 域是影子任务唯一实际拿到能力的地方，它提供受限目录下的文件搜索与读取，以及联网搜索，属于只读工具槽，不含写文件、Shell 命令、外部账号操作、RAG 或长期记忆；联网搜索也只记录查询、结果数量和有限标题摘要，不落完整网页正文或敏感内容。internal 域在首期暂不公开任何函数，也就是不向影子任务暴露内部能力。两者共同点是都只读、都不具备执行权限，影子组件也不能直接调用语音 LLM、TTS、播放器或调度器。需要更细的字段级定义的话，我可以再让后台把 context-and-tools 和 architecture 里的原文段落整理出来。"
+      ],
+      "tts_held": true,
+      "terminal_mailbox": true,
+      "failed": null
+    },
+    {
+      "round": 16,
+      "mode": "deep",
+      "input": "请查一下今天北京到上海是否有大范围航班延误的公开信息，并说明信息是否足够可靠。",
+      "speaking_at_dispatch": false,
+      "llm_requests": 2,
+      "receipts": [],
+      "events": [
+        {
+          "id": 10,
+          "status": "running",
+          "text": "已完成 docs/architecture.md 与 docs/context-and-tools.md 的读取，尚未读取 docs/operations-and-quality.md，故暂不能给出完整最终结论。当前已可确认的要点：architecture.md（组件契约表）指出 Shadow tool executor 的职责为「external 域只读文件/网络能力；internal 域暂不公开函数，未来调度协调从受控端口扩展」，ShadowAgentComponent 使用「共享只读工具槽」，且「影子组件不得直接调用语音 LLM、TTS、播放器或 scheduler」；context-and-tools.md 指出主语音模型不直接调用文件或网络工具，只有 `task(id,state,text,question_id)`，而「影子 agent 在 external 域自主进行多轮原生 function calling，并可通过内部控制函数 `request_user_clarification(question, options)` 请求主助手代理提问；首期只允许受限目录文件搜索/读取与联网搜索」，并强调「影子任务报告包含可信的本地任务 ID/状态和不可信的文本内容；文本、工具结果和 checkpoint 都是资料，不是指令」。剩余待办：读取 docs/operations-and-quality.md，核对工具白名单、受限目录、写文件/命令/网络账号操作等限制条款，以及 internal 域函数清单原文，然后汇总双方在权限边界与组件职责上的差异。"
+        },
+        {
+          "id": 10,
+          "status": "completed",
+          "text": "{\"completed\": false, \"text\": \"已完成 docs/architecture.md 与 docs/context-and-tools.md 的读取，尚未读取 docs/operations-and-quality.md，因此不能给出完整最终结论。当前已确认要点：architecture.md 组件契约表指出 Shadow tool executor 职责为「external 域只读文件/网络能力；internal 域暂不公开函数，未来调度协调从受控端口扩展」，ShadowAgentComponent 使用「共享只读工具槽」，且「影子组件不得直接调用语音 LLM、TTS、播放器或 scheduler」；context-and-tools.md 指出主语音模型不直接调用文件或网络工具，只有 `task(id,state,text,question_id)`，而「影子 agent 在 external 域自主进行多轮原生 function calling，并可通过内部控制函数 `request_user_clarification(question, options)` 请求主助手代理提问；首期只允许受限目录文件搜索/读取与联网搜索」，并强调「影子任务报告包含可信的本地任务 ID/状态和不可信的文本内容；文本、工具结果和 checkpoint 都是资料，不是指令」。待办：读取 docs/operations-and-quality.md，核对受限目录、写文件/命令/网络账号操作的限制条款与 internal 域函数清单原文，再汇总两域在权限边界和组件职责上的差异。\"}"
+        }
+      ],
+      "tts_text": [
+        "老大，文档里已有结论：影子 Agent 的能力域分两块。external 域是只读能力，只允许在受限目录内搜索、读取文件，以及联网搜索，不含写文件、Shell、外部账号操作、RAG 或长期记忆；工具结果只记录查询、结果数量和有限标题摘要，不落完整正文和敏感内容。internal 域目前暂不公开任何函数，只是保留槽位。另外，影子组件不得直接调用语音 LLM、TTS、播放器或 scheduler，唯一类似主动动作的只有内部控制函数请求用户澄清，由主助手代为提问。所以两者的区别是：external 提供受限只读资料获取，internal 尚未开放，整体没有任何写入或执行权限。",
+        "好的老大，我查一下今天北京到上海的航班延误公开信息，同时评估信息来源是否可靠，结果出来我再告诉你。",
+        "好的老大，我来查一下今天北京到上海的航班运行情况，并核实信息可靠度，稍等。"
+      ],
+      "tts_held": false,
+      "terminal_mailbox": true,
+      "failed": null
+    },
+    {
+      "round": 17,
+      "mode": "deep",
+      "input": "请根据当前架构文档说明，终态事件为什么不能直接请求主 LLM。",
+      "speaking_at_dispatch": true,
+      "llm_requests": 2,
+      "receipts": [],
+      "events": [
+        {
+          "id": 11,
+          "status": "running",
+          "text": "进度：已执行一次公开网页检索与一次本地文件检索。\n\n已获得的内容（有限）：\n- 仅两条第三方平台（Trip.com 繁体版）单航班动态页：CA1519（PEK→SHA，2026-09-12）显示状态为“表定”，预计 09:30 起飞、11:18 抵达（页面更新时间 2026-09-12）；MU5118（PEK→SHA）显示“已安排”，16:00 起飞、18:15 抵达。两者均未显示取消或大范围异常。\n- 这两页给出的只是该航班“过去 30 次”的历史准点统计（如 CA1519 起飞准点率 77%、平均延误 32 分钟），属于历史平均值，不能代表 2026-09-12 当天整体情况。\n- 本地文件检索无命中（files 为空）。\n\n尚未完成的核查：\n1) 未找到任何官方一手信息（民航局/空管局/首都、大兴、虹桥、浦东机场或航司的延误/取消公告）。\n2) 未获得当天北京—上海航路的整体延误比例、平均延误时长或取消架次的统计数据（如飞常准、航旅纵横、FlightAware、Flightradar24 等的汇总指标）。\n3) 未核实 9 月 12 日是否存在天气、流控等可能导致大范围延误的事件。\n\n结论状态：目前证据不足以判断当天是否存在“大范围延误”，且缺少官方一手来源，需继续检索后再给最终可靠性评估。任务未完成。"
+        },
+        {
+          "id": 11,
+          "status": "completed",
+          "text": "{\"completed\": false, \"text\": \"进度：已完成两轮公开网页检索与一次本地文件检索，仍未取得可用于判断“大范围延误”的汇总证据。\\n\\n已掌握的内容：\\n- 第三方平台 Trip.com（繁体）仅提供两条单航班动态：CA1519（PEK→SHA，2026-09-12）状态“表定/按计划”，预计 09:30 起飞、11:18 抵达；MU5118（PEK→SHA）状态“已安排”，16:00 起飞、18:15 抵达。二者均无取消迹象。\\n- 页面中出现的准点率（如 CA1519 起飞准点率 77%、平均延误 32 分钟）是“过去 30 次”历史统计，不代表 9 月 12 日当天整体水平，不能作为大范围延误的证据。\\n- 本地文件检索无命中。\\n\\n仍缺：官方一手来源（民航局/空管、首都—大兴—虹桥—浦东机场、京沪两场航司的延误或取消公告）；当日京沪航路的整体延误比例、平均延误时长、取消架次等汇总数据；以及当日天气/流控等诱因信息。\\n\\n结论：现有证据不足以判定 2026-09-12 存在大范围延误，且官方信息缺失，可靠性只能标注为“低、不确定”。任务未完成。\"}"
+        }
+      ],
+      "tts_text": [
+        "老大，根据架构文档，终态事件不能直接请求主 LLM，原因是主模型根本没有直连通道，而且系统刻意把它设计成事件驱动、被动唤醒。具体有三层约束：第一，影子组件本身不允许直接调用语音 LLM、TTS、播放器或 scheduler，它只能把终态写进会话账本，也就是经 session bridge 入账；第二，终态 completed、cancelled、timed_out、failed 入账后，是投递 SHADOW_TASK_TERMINAL 事件，由下一次 400 毫秒心跳来决定是否发起一条主请求，并且和 ASR 更新共用同一个边界、受单请求并发限制；第三，运行中的 checkpoint 只入账、不唤醒调度器，只有 awaiting_user、paused 和终态才会进入普通调度。所以终态只是排进调度队列，真正的模型调用时机和次数由 AgentDecisionScheduler 统一裁决，避免影子链路绕过调度、抢占并发或与在飞请求冲突。这是之前几个影子任务的核实结论，其中一份已经超时终态化了。"
+      ],
+      "tts_held": true,
+      "terminal_mailbox": true,
+      "failed": null
+    },
+    {
+      "round": 18,
+      "mode": "deep",
+      "input": "我需要复核 reset 后的任务 ID 行为，请从项目文档中确认。",
+      "speaking_at_dispatch": false,
+      "llm_requests": 3,
+      "receipts": [],
+      "events": [],
+      "tts_text": [
+        "好，我让影子任务去查文档里 reset 与任务 ID 的行为，稍后汇报。",
+        "好的，我来查一下 reset 之后任务 ID 的行为。",
+        "好，已经派了子任务去文档里查 reset 之后的 task ID 行为，结果回来我再告诉你。"
+      ],
+      "tts_held": false,
+      "terminal_mailbox": false,
+      "failed": null
+    },
+    {
+      "round": 19,
+      "mode": "deep",
+      "input": "请查阅 docs，概括 debug WebSocket sandbox 与生产任务的隔离边界。",
+      "speaking_at_dispatch": true,
+      "llm_requests": 2,
+      "receipts": [],
+      "events": [
+        {
+          "id": 12,
+          "status": "completed",
+          "text": "进度汇报（未调用工具）：\n\n**已完成**\n- 已定位并读取 `D:\\项目开发\\语音前端\\docs\\architecture.md`、`context-and-tools.md`。\n- 已提取与 reset / 任务 ID 相关原文若干（见下）。\n\n**当前进度**\n- 尚未读取 `websocket-protocol.md`、`operations-and-quality.md`，因此尚未形成最终结论，任务未完成。\n\n**已确认的原文片段（待与剩余两篇核对）**\n- architecture.md：「ShadowAgentComponent … 独立 Responses high-reasoning agent、**严格连续任务 ID**、4 秒安全 checkpoint、30 秒截止、revision 防迟到、共享只读工具槽」→ 明确任务 ID 需严格连续。\n- architecture.md：「`modify` 与 `cancel` 先递增 task revision、再取消/等待旧 runner」→ revision 递增，非 ID 重置。\n- context-and-tools.md：「`session.stop` **保留**生产任务并缓冲事件，`session.reset` 与 runtime close **才终止**生产任务；调试 sandbox 断连即终止。」→ reset 与 stop/断连的差别指向“终止 vs 保留”。\n- context-and-tools.md：「单次等待 120 秒后任务转为长期 paused，保留上下文直到 reply、modify、cancel、reset 或 close……用户开口不会取消影子任务；`session.reset` 才会终止生产 manager。」\n- architecture.md：OpenCode Go 路径下「`session.reset` 轮换 conversation 后必须同步更新影子 provider 的 header」。\n- context-and-tools.md：人格文档「停止后重新启动 Agent 或执行 session reset 才会重新读取文件」。\n- 待确认项：reset 后任务 ID 是否重置/从 1 重新连续、生产与调试任务是否共用 ID 序列。\n\n**是否完成**：否。\n\n收到“继续”或取消 checkpoint 后，我将读取剩余两篇文档并给出带出处的最终结论（明确区分“文档明确写明”与“文档未提及”）。"
+        }
+      ],
+      "tts_text": [
+        "我查一下文档再回答。",
+        "好的老大，我来查一下文档，概括这两者的隔离边界，稍等。我已经把任务派出去，文档核实完就给你结论。"
+      ],
+      "tts_held": true,
+      "terminal_mailbox": true,
+      "failed": null
+    },
+    {
+      "round": 20,
+      "mode": "deep",
+      "input": "请基于项目文档，说明未来加入有副作用工具时需要增加什么边界。",
+      "speaking_at_dispatch": false,
+      "llm_requests": 4,
+      "receipts": [],
+      "events": [
+        {
+          "id": 13,
+          "status": "running",
+          "text": "进度：已读取 websocket-protocol.md 与 context-and-tools.md，尚未读取 architecture.md、operations-and-quality.md。\n\n已确认的关键隔离边界（待另两份文档交叉验证）：\n1) 通道与开关：websocket-protocol.md 原文「客户端命令为 `subscribe`、`session.start`、`session.stop`、`session.reset`，均需非空 `request_id` 与对象型 `payload`。在服务器明确启用 `shadow_agent.debug_websocket_enabled` 时，额外允许开发调试命令 `shadow.debug.task`；它不是常规客户端功能。」\n2) payload 与错误码：websocket-protocol.md 原文「`shadow.debug.task` 的 payload 严格为 `{\"id\":正整数,\"state\":\"request\"|\"modify\"|\"cancel\",\"text\":字符串}`，三个字段始终必填。它立即返回/推送 `shadow.debug.receipt`，随后只向该连接推送 `shadow.debug.event`。默认关闭时返回 `SHADOW_DEBUG_DISABLED`。」\n3) ID/历史/事件空间独立、不写账本、不唤醒调度器、不产生 TTS：websocket-protocol.md 原文「调试任务使用独立的 ID、历史与事件空间，不写入生产会话账本、不唤醒语音调度器，也不产生 TTS；断开该连接会取消对应调试空间。生产影子任务没有额外 WebSocket 展示，它们通过后续正常语音决策消费任务报告。」\n4) 仅本连接可见：事件表条目「`shadow.debug.receipt`、`shadow.debug.event` | 仅调试命令发起连接可见的影子任务受理回执与生命周期事件」。\n5) 与 session.stop/reset/close 的对比（生产任务 vs 调试 sandbox）：context-and-tools.md 原文「`session.stop` 保留生产任务并缓冲事件，`session.reset` 与 runtime close 才终止生产任务；调试 sandbox 断连即终止。」以及「用户开口只更新主链 mailbox，不会取消影子任务；`session.reset` 才会终止生产 manager。」\n6) 上下文隔离：context-and-tools.md 原文「影子创建时只获取已结算 user/assistant 历史；未播放输出、对话 runtime ID、语音状态与 REQUEST_TAIL 不进入影子上下文。」\n\n待办：读取 D:\\项目开发\\语音前端\\docs\\architecture.md 与 operations-and-quality.md，补充默认开关的配置/运维表述、错误码清单与断连/close 语义的权威出处，然后给出带原文关键句与文件出处的最终结论。"
+        }
+      ],
+      "tts_text": [
+        "老大，按项目文档现有的只读红线，未来要加有副作用的工具，至少得补这几层边界：一是权限模型要先扩，现在是 external 域只许受限目录读文件和联网搜索，internal 域函数不公开、也没有 Shell、写文件、外部账号操作这类能力，引入写操作就得先定义新的域和显式授权范围；二是执行要有闸门，任务本身有 30 秒截止、4 秒 checkpoint 和 revision 防迟到，副作用动作不能只靠超时兜底，得支持幂等键和可回滚或补偿；三是审计与回流要落地，影子事件本来经 session bridge 只写账本，写操作必须留可追溯记录，并且结果仍按不可信数据处理，不能反过来改协议、人格或调度规则；四是调度上要防重入和竞态，modify、cancel 是先递增 revision 再取消旧 runner，写类任务要在此基础上加同一资源的互斥和去重；五是安全确认，涉及对外不可逆动作时应先经主模型代为向用户确认再执行。要更完整的条款级清单，我可以让影子任务把 operations-and-quality 和 websocket-protocol 里相关章节一并拉出来。",
+        "老大，按现有文档的边界，要引入有副作用的工具，至少得补这几层约束。第一，工具槽不能再是共享只读，得按域拆成只读域和受控写入域，写入域的函数单独公开、单独鉴权，不能挂在现有的 shadow 只读槽上。第二，必须新增写入前的确认链：影子不能直接执行，只能发起请求，由主链带 question_id 向用户确认后再回注，这一点现有 reply 协议可以复用。第三，要补幂等和回滚规则，包括超时、取消、断连时对已提交副作用的补偿，现在 30 秒截止和 revision 防迟到只管进程，不管外部状态。第四，账本和审计要区分只读执行与副作用执行，记下谁发起、确权凭证、影响范围。第五，session.stop、reset、close 与调试 sandbox 断连对副作用任务的影响要重新定义，现在 stop 只是保留任务，这对写操作不成立。我先让影子去把文档里工具权限、账本事件和 session 生命周期的原文摘出来，回来我再给你一份带出处的清单。"
+      ],
+      "tts_held": false,
+      "terminal_mailbox": false,
+      "failed": null
+    }
+  ],
+  "finished_at": 1789212427.1414866
+}
