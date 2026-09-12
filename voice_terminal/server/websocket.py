@@ -265,6 +265,7 @@ class SessionRuntime:
             bridge_max_wait_ms=self.config.text_bridge.max_wait_ms,
             bridge_breaks=self.config.text_bridge.preferred_breaks,
             audio_processor=self.audio_processor,
+            aec_failure_policy=self.config.audio.aec_failure_policy,
             barge_in_gate=BargeInGate(min_speech_ms=max(250, self.config.vad.min_speech_ms), enabled=True),
             conversation=self.conversation,
         )

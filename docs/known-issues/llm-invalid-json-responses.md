@@ -27,7 +27,7 @@
 | 深度模式没有真正运行 | `SessionRuntime.reset_session()` 会在会话重置时把客户端已选择的模式覆盖回配置默认值；后续请求因此仍可能记录 `reasoning_effort=none`，推理展示区自然没有 reasoning 内容 | 已修改为重置会话身份时保留当前显式选择，并增加保持 `deep` 的回归测试；仍需下一轮真实会话复验 UI 与上游 effort |
 | Responses 高频无效 JSON | 完整终态中 43/90 为 JSON 语法错误，SSE 拼接与 authoritative final 全部一致 | 本文主问题，P1；已增加结构指纹和有界 JSON 自修复，纯文本仍拒绝，provider 主因未修复 |
 | speech cleanup 明确代码 Bug | `EpisodeSpeechOutput` 清理路径读取未定义局部变量 `was_active`，历史日志中重复产生 `NameError`，会使 speech task 异常结束 | 已在 settlement 清理 handle 前捕获 active ownership；代码已修，待后续长会话确认异常不再出现 |
-| “模型自打断”与用户打断混淆 | 用户所指的是 LLM 在播放期间产生新决定、替换播放队列造成的自我截断，不是 VAD 用户 barge-in 失灵 | 针对 barge-in 的第一次代码改动导致用户打断不可用，现已完整回退；用户打断链保持原设计，自我截断后续按提示/决策引导单独处理 |
+| “模型自打断”与用户打断混淆 | 用户所指的是 LLM 在播放期间产生新决定、替换播放队列造成的自我截断，不是 VAD 用户 barge-in 失灵 | 现已接入 AEC 保护：播放期只有处理后 `near_voice=true`、反向参考新鲜时才可确认 barge-in；AEC 异常按可配置策略恢复或停止并监听，不退回原始 VAD |
 | 用户讲话时提前触发 LLM | `USER_SEGMENT_UPDATED` 上的 speculative dispatch 是有意的首字延迟优化，不是调度 Bug | 保留；当前体感收益良好，但恢复预算必须与 finalized 请求隔离，避免推测请求提前耗尽唯一 recovery |
 
 这里特别记录一次修正：不能再把“播放中的新 LLM 决定”当作麦克风抢话保护漏洞来修。两条链路分别是：
@@ -37,8 +37,7 @@
 模型自我截断：新 LLM 决定 → 输出/播放队列替换 → 旧 speech 被 supersede/cancel
 ```
 
-前者是已存在且需要保持的功能；后者的频率和意图服从性需要用独立日志指标与提示策略评估。除已回退的
-误改外，本轮没有保留会改变用户打断判定的代码。
+前者是已存在且需要保持的功能；后者的频率和意图服从性需要用独立日志指标与提示策略评估。播放期用户打断现受 AEC 保护：只有处理后确认的近端语音可进入取消路径，AEC 不可用时不会退回原始 VAD。
 
 ## 当前现场证据
 

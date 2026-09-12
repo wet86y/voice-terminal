@@ -48,6 +48,12 @@ LLM transport 由 `llm.transport` 原子选择；默认生产接入为官方 Dee
 
 真实耳机/扬声器、自然语音统计与第三方服务稳定性仍是独立发布门槛，不能由 fake provider 或内存播放器代替。
 
+## AEC 与播放期插话
+
+默认配置已启用 AEC（`audio.processing_enabled: true`）。助手播放期间，只有 AEC 健康、播放器反向参考新鲜且处理后近端 VAD 明确为 `true` 的连续用户语音，才可以中断 TTS；`false` 或 `unknown` 一律不进入 ASR/LLM，也不会退回原始麦克风 VAD。这样可以避免扬声器回声形成伪用户轮次。
+
+`audio.aec_failure_policy` 可选择 `pause_recover`（默认，暂停 PCM、重建 AEC 并续播）、`stop_and_listen`（停止本句并回到监听）或 `continue_without_barge_in`（仅兼容用途，播放期间暂禁自动插话）。AEC 恢复失败或超时会安全降为 `stop_and_listen`，不会无限暂停或静默锁死用户。实机验收时，每个 `BARGE_IN_CONFIRMED` 都应同时具有 `near_voice=true` 和 `protected_available=true`。
+
 上下文字段的准入、缓存命中诊断与官方 DeepSeek 验收说明见[LLM 上下文缓存契约](docs/llm-context-cache-contract.md)；Web UI 会显示 provider 输入与缓存命中指标。
 
 详见：[架构与组件契约](docs/architecture.md)、[WebSocket V0.6 协议](docs/websocket-protocol.md)、[上下文与工具规范](docs/context-and-tools.md)、[LLM 上下文缓存契约](docs/llm-context-cache-contract.md)、[V0.6 可靠性审计](docs/v06-reliability-audit.md)、[运行与质量门槛](docs/operations-and-quality.md)。

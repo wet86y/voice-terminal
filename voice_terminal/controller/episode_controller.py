@@ -24,6 +24,7 @@ class EpisodeController(RealtimeController):
         self.episode = self._make_episode()
         self._endpoint_context = None
         self._barge_trace_state = None
+        self._aec_recovery_task: asyncio.Task | None = None
         self.episode_history: dict[str, str] = {}
         self._input_history_committed: set[str] = set()
         self._refinement_events: set[str] = set()
@@ -156,14 +157,21 @@ class EpisodeController(RealtimeController):
                 self._barge_trace_state = None
                 await self.episode.speech_activity(bool(activity.is_speech))
                 return activity
+            protected = self._barge_in_protected_available()
+            if not protected:
+                await self._handle_aec_unavailable(handle)
+                # Never hand a playing-output frame to normal input handling:
+                # AEC-unavailable audio is neither trustworthy user speech nor
+                # eligible raw-VAD fallback.
+                return None
             decision = self.barge_in_gate.feed(activity, now=frame.captured_at,
                                                near_voice=self._near_voice_activity(),
-                                               protected_available=self._barge_in_protected_available())
+                                               protected_available=protected)
             h = handle
             evidence = {"identity": h.identity, "turn_id": h.turn_id, "speech_id": h.speech_id,
                         "output_generation": h.workspace.generation, "vad_speech": bool(activity.is_speech),
                         "near_voice": self._near_voice_activity(),
-                        "protected_available": self._barge_in_protected_available(),
+                        "protected_available": protected,
                         "duration_ms": decision.duration_ms, "reason": decision.reason,
                         "played_ms": progress.get("played_ms"), "remaining_ms": progress.get("remaining_ms")}
             marker = (decision.candidate, decision.confirmed, decision.reason)
@@ -182,7 +190,7 @@ class EpisodeController(RealtimeController):
                 await self.episode.log("BARGE_IN_CANDIDATE_CLEARED", **evidence)
                 logger.info("episode.barge_in kind=candidate_cleared speech_id=%s duration_ms=%s reason=%s",
                             h.speech_id, evidence["duration_ms"], evidence["reason"])
-            elif bool(activity.is_speech) and decision.reason in {"not_near_voice", "protected_audio_unavailable"} and marker != previous:
+            elif bool(activity.is_speech) and decision.reason in {"not_near_voice", "near_voice_unknown", "protected_audio_unavailable"} and marker != previous:
                 await self.episode.log("BARGE_IN_REJECTED", **evidence)
                 logger.info("episode.barge_in kind=rejected speech_id=%s vad_speech=%s near_voice=%s protected_available=%s duration_ms=%s reason=%s",
                             h.speech_id, evidence["vad_speech"], evidence["near_voice"], evidence["protected_available"],
@@ -200,6 +208,58 @@ class EpisodeController(RealtimeController):
         else:
             await self.episode.speech_activity(bool(activity.is_speech))
         return activity
+
+    async def _handle_aec_unavailable(self, handle) -> None:
+        """Apply the explicit, non-raw-VAD fallback while audio is audible."""
+        policy = getattr(self, "aec_failure_policy", "pause_recover")
+        processor = self.audio_processor
+        status = getattr(processor, "status", "UNAVAILABLE") if processor else "UNAVAILABLE"
+        error = getattr(processor, "error", None) if processor else "processor_missing"
+        if policy == "continue_without_barge_in":
+            await self.episode.log("AEC_BARGE_IN_SUPPRESSED", policy=policy, status=status, error=error)
+            return
+        if policy == "stop_and_listen":
+            await self.episode.log("AEC_FAILED", policy=policy, status=status, error=error)
+            self.output.cancel_all("input_unavailable")
+            self.barge_in_gate.reset()
+            return
+        task = self._aec_recovery_task
+        if task is not None and not task.done():
+            return
+        pause = getattr(self.player, "pause", None)
+        if not callable(pause) or not pause(handle.workspace.playback_key):
+            await self.episode.log("AEC_FAILED", policy="stop_and_listen", status=status,
+                                   error="unable_to_pause_playback")
+            self.output.cancel_all("input_unavailable")
+            return
+        await self.episode.log("AEC_RECOVERING", policy=policy, status=status, error=error)
+        self._aec_recovery_task = asyncio.create_task(
+            self._recover_aec_playback(handle.workspace.playback_key), name="aec-playback-recovery")
+
+    async def _recover_aec_playback(self, playback_key: str) -> None:
+        processor = self.audio_processor
+        try:
+            recover = getattr(processor, "recover", None)
+            ok = bool(recover and await asyncio.to_thread(recover))
+            if ok:
+                # The rebuilt processor is not protected until it has received
+                # a fresh reverse callback.  Paused playback keeps callbacks
+                # producing aligned silence references during this short wait.
+                deadline = time.monotonic() + 0.75
+                while time.monotonic() < deadline and not self._barge_in_protected_available():
+                    await asyncio.sleep(0.02)
+                if self._barge_in_protected_available() and self.player and self.player.resume(playback_key):
+                    self.barge_in_gate.reset()
+                    await self.episode.log("AEC_RECOVERED", recovery_ms=getattr(processor, "last_recovery_ms", None),
+                                           recovery_count=getattr(processor, "recovery_count", None))
+                    return
+            await self.episode.log("AEC_FAILED", policy="stop_and_listen",
+                                   status=getattr(processor, "status", "FAILED"),
+                                   error=getattr(processor, "error", "recovery_timeout"))
+            self.output.cancel_all("input_unavailable")
+            self.barge_in_gate.reset()
+        finally:
+            self._aec_recovery_task = None
 
     def _playback_progress(self, handle):
         """Return player progress with a conservative audible-tail estimate.

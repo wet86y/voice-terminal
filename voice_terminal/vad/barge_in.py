@@ -68,13 +68,15 @@ class BargeInGate:
         if not protected_available:
             self.reset()
             return BargeInDecision(False, False, 0, "protected_audio_unavailable")
-        if near_voice is False:
-            # A gap in the processed near-end voice decision must not be
-            # counted toward the confirmation window.  Retaining the old
-            # onset would let a noise frame followed by a later voice frame
-            # accumulate into a false interruption.
+        if near_voice is not True:
+            # A gap or unknown value in the processed near-end decision must
+            # never be counted toward the confirmation window.  Treating
+            # ``None`` as permission was an unsafe raw-microphone fallback:
+            # it let speaker echo cancel assistant speech whenever AEC was
+            # disabled, starting up, or degraded.
             self.reset()
-            return BargeInDecision(False, False, 0, "not_near_voice")
+            return BargeInDecision(False, False, 0,
+                                   "not_near_voice" if near_voice is False else "near_voice_unknown")
         if ended and not is_speech:
             self.reset()
             return BargeInDecision(False, False, 0, "speech_ended")

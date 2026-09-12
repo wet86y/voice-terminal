@@ -82,6 +82,7 @@ class PcmPlayer:
         self._last_callback_played_bytes = 0
         self._allowed_key: str | None = None
         self._held_key: str | None = None
+        self._paused_key: str | None = None
         self._gated = False
         self._last_callback_at: float | None = None
         self._last_device_output_time: float | None = None
@@ -145,11 +146,24 @@ class PcmPlayer:
         if not key:
             return False
         with self._queue_lock:
-            if self._held_key != key:
+            if self._held_key == key:
+                self._held_key = None
+            elif self._paused_key == key:
+                self._paused_key = None
+            else:
                 return False
-            self._held_key = None
             self._gated = True
             self._allowed_key = key
+            return True
+
+    def pause(self, key: str) -> bool:
+        """Pause an already audible generation without discarding queued PCM."""
+        if not key:
+            return False
+        with self._queue_lock:
+            if self._active_turn != key:
+                return False
+            self._paused_key = key
             return True
 
     def block(self) -> bool:
@@ -175,6 +189,7 @@ class PcmPlayer:
             self._gated = True
             self._allowed_key = None
             self._held_key = None
+            self._paused_key = None
             self._clear_unlocked()
             self._last_stop_snapshot = snapshot
             return snapshot
@@ -351,7 +366,7 @@ class PcmPlayer:
             device_time = getattr(_time, "outputBufferDacTime", None)
             if isinstance(device_time, (int, float)):
                 self._last_device_output_time = float(device_time)
-            if self._held_key != self._active_turn:
+            if self._held_key != self._active_turn and self._paused_key != self._active_turn:
                 while remaining > 0 and self._chunks:
                     chunk = self._chunks.popleft()
                     take = min(remaining, len(chunk))
@@ -476,6 +491,7 @@ class PcmPlayer:
         self._last_callback_at = None
         self._last_device_output_time = None
         self._held_key = None
+        self._paused_key = None
 
     async def wait_until_empty(self, timeout_seconds: float = 10.0) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
