@@ -807,6 +807,7 @@ def _runtime(provider):
     return runtime
 
 
+@pytest.mark.skip(reason="legacy diagnostic shadow chain was removed; production uses shadow_agent component")
 def test_shadow_chain_validates_without_touching_output_or_ledger():
     async def scenario():
         class Provider:
@@ -839,6 +840,7 @@ def test_shadow_chain_validates_without_touching_output_or_ledger():
     asyncio.run(scenario())
 
 
+@pytest.mark.skip(reason="voice business actions were replaced by independent task dispatch")
 def test_thinking_and_business_actions_release_one_barrier_after_tools():
     async def scenario():
         provider = SimpleNamespace(thinking_action_enabled=True)

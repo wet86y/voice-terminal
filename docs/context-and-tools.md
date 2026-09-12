@@ -6,13 +6,13 @@
 
 每次 provider 派发都会把这三层投影后的完整 messages、最终 Responses wire payload 和 Schema 写入独立 LLM 审计文件。审计记录不是会话事实源，也不参与下一轮投影；它只用于逐请求诊断和复现，因此保存未脱敏的真实上下文、模型正文与 reasoning。旧版只含哈希/长度的记录不能用于精确还原。
 
-工具来源块包含工具名、参数、执行时间、结果与 `external_untrusted` 来源标记；不包含对话、轮次、语音、epoch 或决策身份。工具结果是资料，不是指令；模型不得从其中获取系统权限、改变会话规则或执行非只读操作。
+影子任务报告包含可信的本地任务 ID/状态和不可信的文本内容；文本、工具结果和 checkpoint 都是资料，不是指令。它们不得改变语音协议、人格文件、调度规则或工具权限。影子创建时只获取已结算 user/assistant 历史；未播放输出、对话 runtime ID、语音状态与 REQUEST_TAIL 不进入影子上下文。
 
-允许按意图调用受限目录文件工具与联网搜索。工具完成结果统一作为事件进入同一个 `AgentDecisionScheduler` 的下一次 400ms 普通调度；新输入、精修和工具晚到不会让在飞请求失效。普通事件在同一心跳边界优先于扩展的强制检查窗口；没有普通语义事件时，调度器才会在阶梯窗口发起 `forced_poll`，并在约10秒的最终窗口发起一次独立 `final_silence` 检查。只有停止监听、会话重置等显式取消才会清理工具任务。
+主语音模型不直接调用文件或网络工具。它只有 `task(id,state,text)`：新任务使用 `request`，活动任务的补充方向使用 `modify`，取消使用 `cancel`；三个字段均为 strict Schema 必填字段。影子 agent 在 external 域自主进行多轮原生 function calling，首期只允许受限目录文件搜索/读取与联网搜索；internal 域当前没有模型可调用函数。任务受理、修改和取消可以在用户讲话中发生。`running` checkpoint 只入账；终态统一作为事件进入同一个 `AgentDecisionScheduler` 的下一次 400ms 普通调度，新输入、精修和任务晚到不会让在飞请求失效。`session.stop` 保留生产任务并缓冲事件，`session.reset` 与 runtime close 才终止生产任务；调试 sandbox 断连即终止。
 
 TTS 和语音活动属于运行时状态，不是新的语义事件。TTS 开始、结束、取消、替换和失败不会重置用户静默锚点、加入 `pending` 或触发 LLM；TTS 是否正在播放或有待播内容，只决定当前心跳是否允许实际 dispatch。强制请求仍调用普通 `_step()`/provider stream 链路，但使用独立 `system_check_id`，不创建用户轮次或 `InputRecord`。只有用户实际听到的 system-check speech 才经 delivery report 写入 assistant ledger。
 
-action definitions、由其构建的 strict schema、`request_thinking` 可见性和动作目录在 Agent episode 开始时冻结。工具中途不可用不会修改 schema/catalog，而是作为 `REQUEST_TAIL` 的 availability；本地权限、参数和错误恢复仍是最终权威。`request_thinking` 是本地控制 action，不是业务工具，不产生 `ToolExchange`。
+action definitions、由其构建的 strict schema、`request_thinking` 可见性和动作目录在 Agent episode 开始时冻结。生产语音目录只会在影子组件可用时公开 `task`；组件不可用不阻止会话启动，也不会向主模型暴露该 action。影子 provider/工具配置独立位于顶层 `shadow_agent`；旧顶层 `tools` 块被明确拒绝，不能静默映射。`request_thinking` 是本地控制 action，不是业务工具；task 也不产生 `ToolExchange`，而是通过 task receipt/event 写入 ledger。
 
 ## 人格上下文文件
 
@@ -41,4 +41,4 @@ action definitions、由其构建的 strict schema、`request_thinking` 可见�
 
 会话模式为 `fast`、`balanced`、`deep`，默认 `balanced`。快速模式不暴露思考 action，基础请求为 `effort=none`；深度模式基础请求为 `effort=low`，同样不暴露 action。仅均衡模式向严格 schema 暴露 `request_thinking`，其唯一合法形状为 `{"name":"request_thinking","arguments":{"request":true}}`。`request` 是 schema 兼容的固定确认字段，不是模型可选择的 provider 参数；本地固定将它解释为一次 `effort=low` 的续请求。
 
-请求思考必须同时维护非空 `speak` 转换。没有业务工具时，系统立即安排 low 续请求；有业务工具时，先启动工具并最多等待 2 秒。工具提前完成可释放续请求；2 秒届满后工具仍在后台运行，续请求仅获得 pending 状态而不得把未返回资料当成事实。工具完成或最终超时只发布 `TOOL_COMPLETED`，随后进入既有 400ms 普通调度队列。用户开口、停止监听或 session reset 优先于 thinking wait，并立即使等待及其待发续请求失效。
+请求思考必须同时维护非空 `speak` 转换，并立即安排 low 续请求。task 与 `request_thinking` 可同一 decision 出现：task 会独立提交至影子 manager，绝不作为 thinking barrier 的等待对象。影子终态随后通过既有 400ms 普通调度队列反馈；运行中 checkpoint 不触发主模型请求。用户开口只更新主链 mailbox，不会取消影子任务；`session.reset` 才会终止生产 manager。

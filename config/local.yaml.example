@@ -34,12 +34,24 @@ llm:
   reasoning_mode: balanced
   # Keep disabled during the pure protocol migration baseline.
   thinking: disabled
-  shadow_enabled: false
-  shadow_sample_rate: 1.0
-  shadow_thinking_enabled: false
   thinking_action_enabled: false
   protocol_recovery_limit: 1
   transport_retry_limit: 2
+
+# The shadow task component is enabled by default. Keep raw WebSocket task
+# debugging off unless this machine is intentionally being used for it.
+shadow_agent:
+  enabled: true
+  debug_websocket_enabled: false
+  provider: {}
+  tools:
+    files_enabled: true
+    allowed_roots: [docs]
+    web_search:
+      enabled: true
+      base_url: https://api.minimaxi.com
+      api_key_env: MINIMAX_API_KEY
+      timeout_ms: 5000
 
 tts:
   model: speech-2.8-hd

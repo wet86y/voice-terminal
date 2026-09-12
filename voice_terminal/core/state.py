@@ -32,6 +32,7 @@ class RuntimeState:
             "llm": "OFFLINE",
             "tts": "OFFLINE",
             "web_search": "OFFLINE",
+            "shadow_agent": "OFFLINE",
         }
     )
     current: dict[str, Any] = field(

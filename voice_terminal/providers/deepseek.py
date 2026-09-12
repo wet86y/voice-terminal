@@ -83,9 +83,6 @@ class DeepSeekClient:
         reasoning_effort: str = "low",
         transport: str = "chat_completions",
         max_output_tokens: int = 393216,
-        shadow_enabled: bool = False,
-        shadow_sample_rate: float = 1.0,
-        shadow_thinking_enabled: bool = False,
         thinking_action_enabled: bool = False,
         protocol_recovery_limit: int = 1,
         transport_retry_limit: int = 2,
@@ -108,13 +105,8 @@ class DeepSeekClient:
             raise ValueError("transport must be chat_completions or responses")
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
-        if not 0 <= shadow_sample_rate <= 1:
-            raise ValueError("shadow_sample_rate must be between zero and one")
         self.transport = transport
         self.max_output_tokens = max_output_tokens
-        self.shadow_enabled = shadow_enabled
-        self.shadow_sample_rate = shadow_sample_rate
-        self.shadow_thinking_enabled = shadow_thinking_enabled
         self.thinking_action_enabled = thinking_action_enabled
         self.protocol_recovery_limit = max(0, protocol_recovery_limit)
         self.transport_retry_limit = max(0, transport_retry_limit)
