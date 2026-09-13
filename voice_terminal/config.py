@@ -210,10 +210,13 @@ class ShadowProviderConfig:
     model: str = "deepseek-flash"
     api_key_env: str = "DEEPSEEK_API_KEY"
     timeout_ms: int = 15000
+    transport_retry_limit: int = 2
 
     def __post_init__(self) -> None:
         if self.timeout_ms <= 0:
             raise ValueError("shadow_agent.provider.timeout_ms must be positive")
+        if self.transport_retry_limit < 0:
+            raise ValueError("shadow_agent.provider.transport_retry_limit must be nonnegative")
 
 
 @dataclass(frozen=True)
@@ -236,11 +239,35 @@ class ShadowToolsConfig:
 
 
 @dataclass(frozen=True)
+class ShadowStatusObserverConfig:
+    enabled: bool = True
+    every_committed_steps: int = 5
+    reasoning_effort: str = "none"
+    max_output_tokens: int = 512
+    timeout_ms: int = 10000
+
+    def __post_init__(self) -> None:
+        if self.every_committed_steps < 1 or self.max_output_tokens < 1 or self.timeout_ms <= 0:
+            raise ValueError("invalid shadow_agent.status_observer configuration")
+        if self.reasoning_effort != "none":
+            raise ValueError("shadow_agent.status_observer.reasoning_effort must be none")
+
+
+@dataclass(frozen=True)
 class ShadowAgentConfig:
     enabled: bool = True
     debug_websocket_enabled: bool = False
     provider: ShadowProviderConfig = field(default_factory=ShadowProviderConfig)
     tools: ShadowToolsConfig = field(default_factory=ShadowToolsConfig)
+    max_context_tokens: int = 524288
+    compaction_threshold_ratio: float = 0.80
+    status_observer: ShadowStatusObserverConfig = field(default_factory=ShadowStatusObserverConfig)
+
+    def __post_init__(self) -> None:
+        if self.max_context_tokens < 1024:
+            raise ValueError("shadow_agent.max_context_tokens must be at least 1024")
+        if not 0 < self.compaction_threshold_ratio < 1:
+            raise ValueError("shadow_agent.compaction_threshold_ratio must be between 0 and 1")
 
 
 @dataclass(frozen=True)
@@ -384,6 +411,7 @@ class AppConfig:
         shadow_provider = _section(shadow, "provider")
         shadow_tools = _section(shadow, "tools")
         shadow_search = _section(shadow_tools, "web_search")
+        shadow_observer = _section(shadow, "status_observer")
         raw_shadow_roots = shadow_tools.get("allowed_roots", ["docs"])
         if not isinstance(raw_shadow_roots, list) or not all(isinstance(item, str) and item.strip() for item in raw_shadow_roots):
             raise ValueError("shadow_agent.tools.allowed_roots must be a nonempty list of paths")
@@ -402,6 +430,7 @@ class AppConfig:
                     model=_string(shadow_provider.get("model"), llm_model),
                     api_key_env=_string(shadow_provider.get("api_key_env"), llm_api_key_env),
                     timeout_ms=int(_number(shadow_provider.get("timeout_ms"), 15000)),
+                    transport_retry_limit=int(_number(shadow_provider.get("transport_retry_limit"), 2)),
                 ),
                 tools=ShadowToolsConfig(
                     files_enabled=_bool(shadow_tools.get("files_enabled"), True),
@@ -412,6 +441,15 @@ class AppConfig:
                         api_key_env=_string(shadow_search.get("api_key_env"), "MINIMAX_API_KEY"),
                         timeout_ms=int(_number(shadow_search.get("timeout_ms"), 5000)),
                     ),
+                ),
+                max_context_tokens=int(_number(shadow.get("max_context_tokens"), 524288)),
+                compaction_threshold_ratio=float(_number(shadow.get("compaction_threshold_ratio"), 0.80)),
+                status_observer=ShadowStatusObserverConfig(
+                    enabled=_bool(shadow_observer.get("enabled"), True),
+                    every_committed_steps=int(_number(shadow_observer.get("every_committed_steps"), 5)),
+                    reasoning_effort=_string(shadow_observer.get("reasoning_effort"), "none"),
+                    max_output_tokens=int(_number(shadow_observer.get("max_output_tokens"), 512)),
+                    timeout_ms=int(_number(shadow_observer.get("timeout_ms"), 10000)),
                 ),
             ),
             persona=PersonaConfig(

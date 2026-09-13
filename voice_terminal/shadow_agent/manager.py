@@ -1,503 +1,645 @@
-"""Concurrency-safe lifecycle manager for isolated shadow tasks."""
+"""Session-scoped, single-instance Shadow Agent runtime."""
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+import uuid
+from collections import deque
+from collections.abc import Callable, Sequence
+from typing import Any, Protocol
 
-from .contracts import ShadowTaskCommand, ShadowTaskEvent, TaskReceipt
-from .events import ShadowTaskEventBuffer
-from .prompts import CHECKPOINT_PROMPT, TIMEOUT_PROMPT, load_shadow_instructions, modification_message
+from .contracts import (
+    ShadowContextFrame,
+    ShadowContextSnapshot,
+    ShadowContextUpdate,
+    ShadowEvent,
+    ShadowVisibleStatus,
+    WakeResult,
+    shadow_control_tool_definitions,
+)
+from .prompts import COMPACTION_PROMPT, INTENT_REASSESSMENT_PROMPT, STATUS_OBSERVER_PROMPT
 from .provider import ShadowProvider, ShadowProviderError, ShadowProviderResponse
 from .tools import ShadowToolExecutor
 
 
-CHECKPOINT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["completed", "text"],
-    "properties": {
-        "completed": {"type": "boolean"},
-        "text": {"type": "string"},
-    },
-}
-TERMINAL = {"completed", "cancelled", "timed_out", "failed"}
-CLARIFICATION_TOOL_NAME = "request_user_clarification"
-CLARIFICATION_TOOL: dict[str, Any] = {
-    "type": "function",
-    "name": CLARIFICATION_TOOL_NAME,
-    "description": "Ask the coordinating voice agent to obtain missing user information. Call this alone, without external tools.",
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["question", "options"],
-        "properties": {
-            "question": {"type": "string"},
-            "options": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
-        },
-    },
-}
+log = logging.getLogger(__name__)
 
 
-@dataclass
-class _Task:
-    id: int
-    goal: str
-    history: tuple[dict[str, str], ...]
-    instructions: str
-    input_items: list[dict[str, Any]]
-    started_at: float
-    work_deadline: float
-    checkpoint_deadline: float
-    revision: int = 0
-    status: str = "running"
-    checkpoint_pending: bool = False
-    force_checkpoint: bool = False
-    modifications: list[str] = field(default_factory=list)
-    runner: asyncio.Task | None = None
-    waiter: asyncio.Task | None = None
-    last_event: ShadowTaskEvent | None = None
-    committed_steps: int = 0
-    question_sequence: int = 0
-    question_id: str = ""
-    question: str = ""
-    question_options: tuple[str, ...] = ()
+class ShadowContextSource(Protocol):
+    @property
+    def shadow_input_revision(self) -> int: ...
+
+    @property
+    def shadow_context_epoch(self) -> int: ...
+
+    def shadow_context_snapshot(self) -> ShadowContextSnapshot: ...
+
+    def shadow_context_update(self, since_revision: int, *, epoch: int) -> ShadowContextUpdate | ShadowContextSnapshot: ...
 
 
-class ShadowTaskManager:
-    """Owns task IDs, agent runs, deadlines, revisions, and event coalescing."""
+def _frame_payload(frame: ShadowContextFrame) -> dict[str, Any]:
+    return {
+        "revision": frame.revision, "origin": frame.origin,
+        "kind": frame.kind, "content": frame.content,
+    }
+
+
+def _text_from_output(output: Sequence[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for item in output:
+        if item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in {"output_text", "text"}:
+                    value = block.get("text")
+                    if isinstance(value, str):
+                        parts.append(value)
+    return "\n".join(part.strip() for part in parts if part.strip()).strip()
+
+
+class ShadowStatusObserver:
+    """Stateless, read-only summarizer over an immutable committed prefix."""
+
+    def __init__(self, *, max_output_tokens: int = 512, timeout_ms: int = 10000) -> None:
+        self.max_output_tokens = max_output_tokens
+        self.timeout_ms = timeout_ms
+
+    async def summarize(self, trace: Sequence[dict[str, Any]], complete: Callable[..., Any]) -> str:
+        response = await complete(
+            input_items=[*trace, {"role": "system", "content": STATUS_OBSERVER_PROMPT}],
+            tools=[], reasoning_effort="none", max_output_tokens=self.max_output_tokens,
+            timeout_ms=self.timeout_ms, retry=False,
+        )
+        return _text_from_output(response.output).strip()
+
+
+class ShadowRuntime:
+    """One durable cognitive/tool loop for one conversation session.
+
+    Wakes carry no task semantics.  They only advance the newest authoritative
+    context cursor; all intent recognition happens inside this loop.
+    """
 
     def __init__(
         self,
         provider: ShadowProvider,
         tools: ShadowToolExecutor,
+        context_source: ShadowContextSource,
         *,
-        instructions_loader: Callable[[], str] = load_shadow_instructions,
-        clock: Callable[[], float] = time.monotonic,
-        slice_seconds: float = 4.0,
-        work_seconds: float = 30.0,
-        terminal_report_seconds: float = 4.0,
-        user_wait_seconds: float = 120.0,
-        max_active_tasks: int = 8,
-        on_event: Callable[[ShadowTaskEvent], None] | None = None,
+        instructions_loader: Callable[[], str],
+        on_event: Callable[[ShadowEvent], None] | None = None,
+        provider_timeout_ms: int = 15000,
+        transport_retry_limit: int = 2,
+        max_context_tokens: int = 524288,
+        compaction_threshold_ratio: float = 0.80,
+        observer_enabled: bool = True,
+        observer_every_steps: int = 5,
+        observer_max_output_tokens: int = 512,
+        observer_timeout_ms: int = 10000,
+        on_metric: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
-        if min(slice_seconds, work_seconds, terminal_report_seconds, user_wait_seconds) <= 0 or max_active_tasks < 1:
-            raise ValueError("shadow task limits must be positive")
+        if transport_retry_limit < 0 or observer_every_steps < 1:
+            raise ValueError("invalid Shadow runtime retry/observer configuration")
+        if max_context_tokens < 1024 or not 0 < compaction_threshold_ratio < 1:
+            raise ValueError("invalid Shadow context budget")
+        tools.assert_read_only()
         self.provider = provider
         self.tools = tools
+        self.context_source = context_source
         self.instructions_loader = instructions_loader
-        self.clock = clock
-        self.slice_seconds = slice_seconds
-        self.work_seconds = work_seconds
-        self.terminal_report_seconds = terminal_report_seconds
-        self.user_wait_seconds = user_wait_seconds
-        self.max_active_tasks = max_active_tasks
         self.on_event = on_event
-        self._tasks: dict[int, _Task] = {}
-        self._last_accepted_id = 0
-        self._events = ShadowTaskEventBuffer()
-        self._closed = False
-
-    @staticmethod
-    def _history(value: Sequence[dict[str, Any]] | None) -> tuple[dict[str, str], ...]:
-        if value is None:
-            return ()
-        result: list[dict[str, str]] = []
-        for item in value:
-            if not isinstance(item, dict):
-                raise ValueError("settled history items must be objects")
-            role, content = item.get("role"), item.get("content")
-            if role not in {"user", "assistant"} or not isinstance(content, str):
-                raise ValueError("settled history only accepts user/assistant text messages")
-            result.append({"role": role, "content": content})
-        return tuple(result)
-
-    def _active_count(self) -> int:
-        return sum(task.status == "running" for task in self._tasks.values())
-
-    async def handle(self, command: ShadowTaskCommand | dict[str, Any], settled_history: Sequence[dict[str, Any]] | None = None) -> TaskReceipt:
-        command = ShadowTaskCommand.parse(command) if isinstance(command, dict) else command
-        if self._closed:
-            return TaskReceipt(False, command.id, "closed", "shadow task manager closed")
-        if command.state == "request":
-            return await self._request(command, settled_history)
-        if command.state == "modify":
-            return await self._modify(command)
-        if command.state == "reply":
-            return await self._reply(command)
-        return await self._cancel(command)
-
-    async def _request(self, command: ShadowTaskCommand, settled_history: Sequence[dict[str, Any]] | None) -> TaskReceipt:
-        existing = self._tasks.get(command.id)
-        if existing is not None:
-            if existing.status in TERMINAL:
-                if existing.last_event is not None:
-                    self._events.publish(existing.last_event)
-                return TaskReceipt(True, command.id, existing.status, "terminal task event replayed")
-            if command.text.strip():
-                return TaskReceipt(False, command.id, "invalid", "active task request must use empty text; use modify")
-            if existing.status in {"awaiting_user", "paused"}:
-                return TaskReceipt(True, command.id, existing.status, "task is waiting for a user reply")
-            existing.force_checkpoint = True
-            return TaskReceipt(True, command.id, "running", "checkpoint requested at next safe point")
-        expected = self._last_accepted_id + 1
-        if command.id != expected:
-            return TaskReceipt(False, command.id, "invalid", f"next task id must be {expected}")
-        if not command.text.strip():
-            return TaskReceipt(False, command.id, "invalid", "new task requires nonempty text")
-        if self._active_count() >= self.max_active_tasks:
-            return TaskReceipt(False, command.id, "capacity", "maximum active shadow tasks reached")
-        history = self._history(settled_history)
-        now = self.clock()
-        initial = [*history, {"role": "user", "content": f"【影子任务目标】\n{command.text.strip()}"}]
-        task = _Task(
-            id=command.id, goal=command.text.strip(), history=history,
-            instructions=self.instructions_loader(), input_items=initial,
-            started_at=now, work_deadline=now + self.work_seconds,
-            checkpoint_deadline=now + self.slice_seconds,
+        self.on_metric = on_metric
+        self.provider_timeout_ms = provider_timeout_ms
+        self.transport_retry_limit = transport_retry_limit
+        self.max_context_tokens = max_context_tokens
+        self.compaction_threshold_ratio = compaction_threshold_ratio
+        self.observer_enabled = observer_enabled
+        self.observer_every_steps = observer_every_steps
+        self.observer_max_output_tokens = observer_max_output_tokens
+        self.observer_timeout_ms = observer_timeout_ms
+        self.status_observer = ShadowStatusObserver(
+            max_output_tokens=observer_max_output_tokens,
+            timeout_ms=observer_timeout_ms,
         )
-        self._tasks[task.id] = task
-        self._last_accepted_id = task.id
-        task.runner = asyncio.create_task(self._run(task, task.revision), name=f"shadow-task-{task.id}")
-        return TaskReceipt(True, task.id, "running", "shadow task accepted")
 
-    async def _modify(self, command: ShadowTaskCommand) -> TaskReceipt:
-        task = self._tasks.get(command.id)
-        if task is None or task.status in TERMINAL:
-            return TaskReceipt(False, command.id, "invalid", "modify requires an active task")
-        if not command.text.strip():
-            return TaskReceipt(False, command.id, "invalid", "modify requires nonempty text")
-        task.revision += 1
-        # Invalidate before awaiting cancellation.  A provider coroutine is
-        # allowed to suppress CancelledError and return one last completed
-        # response; that late response must not be committed or dispatch a
-        # tool call under the old direction.
-        await self._interrupt(task)
-        await self._cancel_waiter(task)
-        task.modifications.append(command.text.strip())
-        task.input_items.append({"role": "system", "content": modification_message(command.text)})
-        task.checkpoint_pending = False
-        task.force_checkpoint = False
-        self._clear_question(task)
-        self._restart(task)
-        return TaskReceipt(True, task.id, "running", "task modified and restarted")
+        self.active = False
+        self.context_epoch = 0
+        self.applied_context_revision = 0
+        self.pending_context_revision = 0
+        self.trace_revision = 0
+        self.committed_model_steps = 0
+        self.last_status_step = 0
+        self.working_trace: list[dict[str, Any]] = []
+        self.latest_visible_status: ShadowVisibleStatus | None = None
+        self.user_input_required = False
+        self.runner: asyncio.Task[None] | None = None
+        self.observer_task: asyncio.Task[None] | None = None
 
-    async def _reply(self, command: ShadowTaskCommand) -> TaskReceipt:
-        task = self._tasks.get(command.id)
-        if task is None or task.status in TERMINAL:
-            return TaskReceipt(False, command.id, "invalid", "reply requires a waiting or paused task")
-        if task.status not in {"awaiting_user", "paused"}:
-            return TaskReceipt(False, command.id, "invalid", "reply requires a waiting or paused task")
-        if command.question_id != task.question_id:
-            return TaskReceipt(False, command.id, "invalid", "reply question_id does not match the current question")
-        task.revision += 1
-        await self._cancel_waiter(task)
-        task.input_items.append({
-            "role": "user",
-            "content": "【主助手转交的用户答复】\n" + command.text.strip(),
+        self._source_epoch = 0
+        self._last_processed_revision = -1
+        self._activation_serial = 0
+        self._observer_pending = False
+        self._last_status_trace_revision = 0
+        self._compaction_retry_pending = False
+        self._pending_since: float | None = None
+        self._closed = False
+        self._instructions = instructions_loader()
+        self._tools = tuple([*tools.responses_tools(), *shadow_control_tool_definitions()])
+        self.usage_samples: deque[dict[str, Any]] = deque(maxlen=256)
+
+    @property
+    def available(self) -> bool:
+        return not self._closed
+
+    def wake(self) -> WakeResult:
+        if self._closed:
+            return "unavailable"
+        revision = self.context_source.shadow_input_revision
+        if revision > self.applied_context_revision and self._pending_since is None:
+            self._pending_since = time.monotonic()
+        self.pending_context_revision = max(self.pending_context_revision, revision)
+        if self.active:
+            return "coalesced"
+        if revision <= self._last_processed_revision:
+            return "already_current"
+        self.active = True
+        self.user_input_required = False
+        self._notify_runtime_state(active=True)
+        self._activation_serial += 1
+        serial = self._activation_serial
+        self.runner = asyncio.create_task(self._run_activation(serial), name="shadow-agent-runtime")
+        self._metric("activation.started", {"revision": revision, "serial": serial})
+        return "started"
+
+    def _notify_runtime_state(self, *, active: bool) -> None:
+        setter = getattr(self.context_source, "set_shadow_runtime_state", None)
+        if callable(setter):
+            try:
+                setter(available=not self._closed, active=active)
+            except Exception:
+                pass
+
+    def _metric(self, name: str, payload: dict[str, Any]) -> None:
+        if self.on_metric is not None:
+            try:
+                self.on_metric(name, dict(payload))
+            except Exception:
+                pass
+
+    def _append(self, item: dict[str, Any]) -> None:
+        self.working_trace.append(item)
+        self.trace_revision += 1
+
+    def _append_context(self, label: str, payload: dict[str, Any]) -> None:
+        self._append({
+            "role": "system",
+            "content": label + "\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         })
-        self._clear_question(task)
-        self._restart(task)
-        return TaskReceipt(True, task.id, "running", "user reply accepted and task restarted")
+        self._append({"role": "system", "content": INTENT_REASSESSMENT_PROMPT})
 
-    async def _cancel(self, command: ShadowTaskCommand) -> TaskReceipt:
-        if command.text:
-            return TaskReceipt(False, command.id, "invalid", "cancel requires empty text")
-        task = self._tasks.get(command.id)
-        if task is None:
-            return TaskReceipt(True, command.id, "missing", "task does not exist")
-        if task.status in TERMINAL:
-            return TaskReceipt(True, command.id, task.status, "task already terminal")
-        task.revision += 1
-        # As with modify, mark the old runner stale before it gets a chance
-        # to turn a cancellation-suppressed provider response into work.
-        await self._interrupt(task)
-        await self._cancel_waiter(task)
-        self._terminal(task, "cancelled", "任务已取消。")
-        return TaskReceipt(True, command.id, "cancelled", "task cancelled")
+    def _apply_pending_context(self) -> bool:
+        latest = self.context_source.shadow_input_revision
+        self.pending_context_revision = max(self.pending_context_revision, latest)
+        source_epoch = self.context_source.shadow_context_epoch
+        if not self.working_trace or source_epoch != self._source_epoch:
+            snapshot = self.context_source.shadow_context_snapshot()
+            self._source_epoch = snapshot.epoch
+            self.context_epoch = max(1, self.context_epoch + 1)
+            self.applied_context_revision = snapshot.revision
+            self.pending_context_revision = max(self.pending_context_revision, snapshot.revision)
+            self._append_context("【权威会话完整快照】", {
+                "epoch": snapshot.epoch,
+                "frames": [_frame_payload(frame) for frame in snapshot.frames],
+            })
+            self._metric("context.applied", {
+                "revision": self.applied_context_revision,
+                "pending_revision": self.pending_context_revision,
+                "latency_ms": (
+                    round((time.monotonic() - self._pending_since) * 1000, 2)
+                    if self._pending_since is not None else 0.0
+                ),
+            })
+            self._pending_since = None
+            return True
+        if self.pending_context_revision <= self.applied_context_revision:
+            return False
+        update = self.context_source.shadow_context_update(
+            self.applied_context_revision, epoch=self._source_epoch,
+        )
+        if isinstance(update, ShadowContextSnapshot):
+            self._source_epoch = update.epoch
+            self.applied_context_revision = update.revision
+            self._append_context("【权威会话重新同步快照】", {
+                "epoch": update.epoch,
+                "frames": [_frame_payload(frame) for frame in update.frames],
+            })
+        else:
+            self.applied_context_revision = update.to_revision
+            self._append_context("【权威会话上下文更新】", {
+                "frames": [_frame_payload(frame) for frame in update.frames],
+            })
+        self._metric("context.applied", {
+            "revision": self.applied_context_revision,
+            "pending_revision": self.pending_context_revision,
+            "latency_ms": (
+                round((time.monotonic() - self._pending_since) * 1000, 2)
+                if self._pending_since is not None else 0.0
+            ),
+        })
+        self._pending_since = None
+        return True
 
-    async def _interrupt(self, task: _Task) -> None:
-        runner = task.runner
-        if runner is not None and runner is not asyncio.current_task() and not runner.done():
-            runner.cancel()
-            await asyncio.gather(runner, return_exceptions=True)
-
-    async def _cancel_waiter(self, task: _Task) -> None:
-        waiter = task.waiter
-        task.waiter = None
-        if waiter is not None and waiter is not asyncio.current_task() and not waiter.done():
-            waiter.cancel()
-            await asyncio.gather(waiter, return_exceptions=True)
-
-    def _restart(self, task: _Task) -> None:
-        now = self.clock()
-        task.status = "running"
-        task.checkpoint_pending = False
-        task.force_checkpoint = False
-        task.work_deadline = now + self.work_seconds
-        task.checkpoint_deadline = now + self.slice_seconds
-        task.runner = asyncio.create_task(self._run(task, task.revision), name=f"shadow-task-{task.id}-r{task.revision}")
-
-    def _clear_question(self, task: _Task) -> None:
-        task.question_id = ""
-        task.question = ""
-        task.question_options = ()
-
-    def _current(self, task: _Task, revision: int) -> bool:
-        return not self._closed and task.status == "running" and task.revision == revision
-
-    def _publish(self, task: _Task, status: str, text: str, *, question_id: str = "",
-                 options: tuple[str, ...] = ()) -> None:
-        event = ShadowTaskEvent(task.id, status, text.strip() or "任务仍在处理中。", question_id, options)
-        task.last_event = event
-        self._events.publish(event)
-        if self.on_event is not None:
-            self.on_event(event)
-
-    def _terminal(self, task: _Task, status: str, text: str) -> None:
-        if task.status in TERMINAL:
-            return
-        task.status = status
-        task.checkpoint_pending = False
-        if task.waiter is not None and not task.waiter.done():
-            task.waiter.cancel()
-        task.waiter = None
-        self._clear_question(task)
-        self._publish(task, status, text)
+    async def _provider_complete(
+        self, *, input_items: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]],
+        reasoning_effort: str, text_schema: dict[str, Any] | None = None,
+        max_output_tokens: int | None = None, timeout_ms: int | None = None,
+        retry: bool = True,
+    ) -> ShadowProviderResponse:
+        attempts = self.transport_retry_limit + 1 if retry else 1
+        last: BaseException | None = None
+        for attempt in range(attempts):
+            started = time.monotonic()
+            try:
+                kwargs: dict[str, Any] = {
+                    "instructions": self._instructions,
+                    "input_items": input_items,
+                    "tools": tools,
+                    "reasoning_effort": reasoning_effort,
+                    "text_schema": text_schema,
+                }
+                if max_output_tokens is not None:
+                    kwargs["max_output_tokens"] = max_output_tokens
+                try:
+                    call = self.provider.complete(**kwargs)
+                except TypeError as exc:
+                    if "max_output_tokens" not in str(exc):
+                        raise
+                    kwargs.pop("max_output_tokens", None)
+                    call = self.provider.complete(**kwargs)
+                response = await asyncio.wait_for(
+                    call, (timeout_ms or self.provider_timeout_ms) / 1000,
+                )
+                usage = dict(response.usage)
+                usage.update({"latency_ms": round((time.monotonic() - started) * 1000, 2)})
+                self.usage_samples.append(usage)
+                self._metric("provider.completed", usage)
+                return response
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last = exc
+                self._metric("provider.retry", {"attempt": attempt + 1, "error": type(exc).__name__})
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.15 * (attempt + 1))
+        raise ShadowProviderError(str(last)[:500] if last else "provider request failed")
 
     @staticmethod
-    def _function_calls(response: ShadowProviderResponse) -> list[dict[str, Any]]:
-        return [dict(item) for item in response.output if item.get("type") == "function_call"]
+    def _calls(output: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [dict(item) for item in output if item.get("type") == "function_call"]
 
     @staticmethod
-    def _function_output(call: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    def _arguments(call: dict[str, Any]) -> dict[str, Any] | None:
+        raw = call.get("arguments")
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                value = json.loads(raw)
+                return value if isinstance(value, dict) else None
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    @staticmethod
+    def _call_output(call_id: Any, value: dict[str, Any]) -> dict[str, Any]:
         return {
-            "type": "function_call_output",
-            "call_id": str(call.get("call_id") or ""),
-            "output": json.dumps(payload, ensure_ascii=False),
+            "type": "function_call_output", "call_id": str(call_id or "invalid"),
+            "output": json.dumps(value, ensure_ascii=False, separators=(",", ":")),
         }
 
-    @staticmethod
-    def _clarification(calls: list[dict[str, Any]]) -> tuple[str, tuple[str, ...], dict[str, Any]] | None:
-        clarification = [call for call in calls if call.get("name") == CLARIFICATION_TOOL_NAME]
-        if not clarification:
-            return None
-        if len(clarification) != 1 or len(calls) != 1:
-            return "", (), {"error": "request_user_clarification must be the only function call in a response"}
-        call = clarification[0]
-        try:
-            arguments = json.loads(str(call.get("arguments") or ""))
-        except json.JSONDecodeError:
-            return "", (), {"error": "request_user_clarification arguments must be valid JSON"}
-        if not isinstance(arguments, dict) or set(arguments) != {"question", "options"}:
-            return "", (), {"error": "request_user_clarification requires exactly question and options"}
-        question, options = arguments.get("question"), arguments.get("options")
-        if (not isinstance(question, str) or not question.strip() or not isinstance(options, list)
-                or len(options) > 5 or any(not isinstance(item, str) or not item.strip() for item in options)):
-            return "", (), {"error": "question must be nonempty and options must contain at most five nonempty strings"}
-        return question.strip(), tuple(item.strip() for item in options), {}
-
-    def _suspend_for_user(self, task: _Task, question: str, options: tuple[str, ...], revision: int) -> None:
-        if not self._current(task, revision):
-            return
-        task.question_sequence += 1
-        task.question_id = f"task-{task.id}-question-{task.question_sequence}"
-        task.question = question
-        task.question_options = options
-        task.status = "awaiting_user"
-        task.checkpoint_pending = False
-        task.force_checkpoint = False
-        task.runner = None
-        self._publish(task, "awaiting_user", question, question_id=task.question_id, options=options)
-        task.waiter = asyncio.create_task(
-            self._wait_for_user(task, task.question_id, revision), name=f"shadow-task-wait-{task.id}-{task.question_sequence}",
+    def _emit(self, kind: str, text: str, *, payload: dict[str, Any] | None = None) -> None:
+        wake_policy = {
+            "progress": "passive", "status": "normal", "observation": "normal",
+            "user_input_required": "priority", "result": "priority", "failed": "normal",
+        }[kind]
+        event = ShadowEvent(
+            event_id=uuid.uuid4().hex,
+            kind=kind,  # type: ignore[arg-type]
+            text=str(text).strip()[:8000],
+            based_on_context_revision=self.applied_context_revision,
+            wake_policy=wake_policy,  # type: ignore[arg-type]
+            payload=dict(payload or {}),
         )
+        if kind in {"status", "progress"}:
+            self.latest_visible_status = ShadowVisibleStatus(
+                active=self.active, text=event.text,
+                based_on_trace_revision=self.trace_revision, updated_at=time.time(),
+            )
+            if kind == "status":
+                self._last_status_trace_revision = self.trace_revision
+        if kind == "user_input_required":
+            self.user_input_required = True
+        elif kind in {"result", "failed"}:
+            self.user_input_required = False
+        if self.on_event is not None:
+            self.on_event(event)
+        self._metric("event.published", {"kind": kind})
 
-    async def _wait_for_user(self, task: _Task, question_id: str, revision: int) -> None:
-        try:
-            await asyncio.sleep(self.user_wait_seconds)
-            if (not self._closed and task.status == "awaiting_user" and task.revision == revision
-                    and task.question_id == question_id):
-                task.status = "paused"
-                task.waiter = None
-                self._publish(task, "paused", task.question, question_id=question_id, options=task.question_options)
-        except asyncio.CancelledError:
-            raise
+    def _latest_context_result(self, since_revision: int) -> dict[str, Any]:
+        latest = self.context_source.shadow_input_revision
+        if since_revision == latest and self.context_source.shadow_context_epoch == self._source_epoch:
+            return {"status": "unchanged", "epoch": self._source_epoch, "revision": latest, "frames": []}
+        update = self.context_source.shadow_context_update(since_revision, epoch=self._source_epoch)
+        if isinstance(update, ShadowContextSnapshot):
+            return {
+                "status": "snapshot", "epoch": update.epoch, "revision": update.revision,
+                "frames": [_frame_payload(frame) for frame in update.frames],
+            }
+        return {
+            "status": "delta", "epoch": update.epoch, "from_revision": update.from_revision,
+            "revision": update.to_revision,
+            "frames": [_frame_payload(frame) for frame in update.frames],
+        }
 
-    @staticmethod
-    def _message_text(response: ShadowProviderResponse) -> str:
-        parts: list[str] = []
-        for item in response.output:
-            if item.get("type") != "message":
+    async def _execute_calls(self, calls: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+        outputs: list[dict[str, Any]] = []
+        stop_activation = False
+        for index, call in enumerate(calls):
+            if index and self.context_source.shadow_input_revision > self.applied_context_revision:
+                remaining = calls[index:]
+                outputs.extend(
+                    self._call_output(item.get("call_id"), {
+                        "status": "not_executed", "reason": "conversation_context_updated",
+                    })
+                    for item in remaining
+                )
+                self.pending_context_revision = max(
+                    self.pending_context_revision, self.context_source.shadow_input_revision,
+                )
+                self._metric("tool.prevented_by_context", {"count": len(remaining)})
+                break
+            call_id, name = call.get("call_id"), call.get("name")
+            args = self._arguments(call)
+            if not isinstance(name, str) or args is None:
+                outputs.append(self._call_output(call_id, {"error": "malformed function call"}))
                 continue
-            content = item.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
-                    parts.append(part["text"])
-        return "".join(parts).strip()
-
-    @staticmethod
-    def _checkpoint(response: ShadowProviderResponse) -> tuple[bool, str] | None:
-        text = ShadowTaskManager._message_text(response)
-        try:
-            value = json.loads(text)
-        except (TypeError, json.JSONDecodeError):
-            return None
-        if not isinstance(value, dict) or not isinstance(value.get("completed"), bool) or not isinstance(value.get("text"), str):
-            return None
-        return value["completed"], value["text"].strip()
-
-    async def _call_work(self, task: _Task, revision: int) -> ShadowProviderResponse:
-        remaining = max(0.001, task.work_deadline - self.clock())
-        return await asyncio.wait_for(self.provider.complete(
-            instructions=task.instructions, input_items=tuple(task.input_items),
-            tools=[*self.tools.responses_tools(), CLARIFICATION_TOOL],
-            reasoning_effort="high",
-        ), timeout=remaining)
-
-    async def _call_checkpoint(self, task: _Task, prompt: str, timeout: float) -> tuple[bool, str] | None:
-        response = await asyncio.wait_for(self.provider.complete(
-            instructions=task.instructions,
-            input_items=tuple([*task.input_items, {"role": "system", "content": prompt}]),
-            tools=(), reasoning_effort="high", text_schema=CHECKPOINT_SCHEMA,
-        ), timeout=max(0.001, timeout))
-        task.input_items.extend(response.output)
-        return self._checkpoint(response)
-
-    async def _timeout(self, task: _Task, revision: int) -> None:
-        if not self._current(task, revision):
-            return
-        fallback = task.last_event.text if task.last_event is not None else "任务在截止前没有形成可用结论。"
-        try:
-            result = await self._call_checkpoint(task, TIMEOUT_PROMPT, self.terminal_report_seconds)
-            if result is not None and result[1]:
-                fallback = result[1]
-        except (asyncio.TimeoutError, ShadowProviderError, ValueError):
-            pass
-        if self._current(task, revision):
-            self._terminal(task, "timed_out", f"任务已超时。{fallback}")
-
-    async def _run(self, task: _Task, revision: int) -> None:
-        try:
-            while self._current(task, revision):
-                if self.clock() >= task.work_deadline:
-                    await self._timeout(task, revision)
-                    return
-                try:
-                    response = await self._call_work(task, revision)
-                except asyncio.TimeoutError:
-                    await self._timeout(task, revision)
-                    return
-                except ShadowProviderError as exc:
-                    if not self._current(task, revision):
-                        return
-                    self._publish(task, "running", f"任务请求暂时失败，正在重试：{str(exc)[:180]}")
-                    await asyncio.sleep(0.1)
-                    continue
-                if not self._current(task, revision):
-                    return
-                task.input_items.extend(response.output)
-                task.committed_steps += 1
-                calls = self._function_calls(response)
-                if calls:
-                    clarification = self._clarification(calls)
-                    if clarification is not None:
-                        question, options, error = clarification
-                        if error:
-                            task.input_items.append(self._function_output(calls[0], error))
-                            task.committed_steps += 1
-                            continue
-                        task.input_items.append(self._function_output(calls[0], {"status": "waiting_for_user"}))
-                        task.committed_steps += 1
-                        self._suspend_for_user(task, question, options, revision)
-                        return
-                    try:
-                        outputs = await self.tools.execute_calls(calls)
-                    except asyncio.CancelledError:
-                        raise
-                    if not self._current(task, revision):
-                        return
-                    task.input_items.extend(outputs)
-                    task.committed_steps += len(outputs)
+            if name == "get_latest_context":
+                since = args.get("since_revision")
+                value = self._latest_context_result(since if isinstance(since, int) else -1)
+                outputs.append(self._call_output(call_id, value))
+            elif name == "publish_main_event":
+                kind, text = args.get("kind"), args.get("text")
+                if kind not in {"progress", "observation"} or not isinstance(text, str) or not text.strip():
+                    outputs.append(self._call_output(call_id, {"error": "invalid event"}))
                 else:
-                    final_text = self._message_text(response)
-                    if final_text:
-                        self._terminal(task, "completed", final_text)
-                        return
-                # A synchronous read-only tool can finish just after the
-                # wall-clock deadline. Do not spend another normal checkpoint
-                # or work turn after that boundary.
-                if self.clock() >= task.work_deadline:
-                    await self._timeout(task, revision)
-                    return
-                if self.clock() >= task.checkpoint_deadline:
-                    task.checkpoint_pending = True
-                if task.force_checkpoint:
-                    task.checkpoint_pending = True
-                    task.force_checkpoint = False
-                if task.checkpoint_pending:
-                    try:
-                        checkpoint = await self._call_checkpoint(
-                            task, CHECKPOINT_PROMPT, max(0.001, task.work_deadline - self.clock()),
-                        )
-                    except asyncio.TimeoutError:
-                        await self._timeout(task, revision)
-                        return
-                    except ShadowProviderError as exc:
-                        self._publish(task, "running", f"进度汇报暂时失败：{str(exc)[:180]}")
-                        task.checkpoint_deadline = self.clock() + self.slice_seconds
-                        task.checkpoint_pending = False
-                        continue
-                    if not self._current(task, revision):
-                        return
-                    task.checkpoint_pending = False
-                    task.checkpoint_deadline = self.clock() + self.slice_seconds
-                    if checkpoint is None:
-                        self._publish(task, "running", "任务仍在处理中，进度汇报格式无效。")
-                    elif checkpoint[0]:
-                        self._terminal(task, "completed", checkpoint[1])
-                        return
-                    else:
-                        self._publish(task, "running", checkpoint[1])
+                    self._emit(kind, text)
+                    outputs.append(self._call_output(call_id, {"status": "published"}))
+            elif name == "request_user_input":
+                kind, question = args.get("kind"), args.get("question")
+                if kind not in {"clarification", "confirmation"} or not isinstance(question, str) or not question.strip():
+                    outputs.append(self._call_output(call_id, {"error": "invalid user input request"}))
+                else:
+                    payload = {
+                        "kind": kind,
+                        "options": [str(item) for item in args.get("options", []) if isinstance(item, str)],
+                        "operation_summary": str(args.get("operation_summary") or ""),
+                    }
+                    self._emit("user_input_required", question, payload=payload)
+                    outputs.append(self._call_output(call_id, {"status": "published", "activation": "idle"}))
+                    stop_activation = True
+            else:
+                tool_started = time.monotonic()
+                result = await self.tools.execute(name, args)
+                self._metric("tool.completed", {
+                    "name": name,
+                    "latency_ms": round((time.monotonic() - tool_started) * 1000, 2),
+                    "ok": "error" not in result,
+                })
+                outputs.append(self._call_output(call_id, result))
+            if stop_activation:
+                break
+        return outputs, stop_activation
+
+    def _estimate_tokens(self) -> int:
+        raw = json.dumps(self.working_trace, ensure_ascii=False, separators=(",", ":"))
+        ascii_count = sum(ord(char) < 128 for char in raw)
+        return max(1, (ascii_count + 3) // 4 + len(raw) - ascii_count)
+
+    async def _maybe_compact(self) -> None:
+        before = self._estimate_tokens()
+        if before < int(self.max_context_tokens * self.compaction_threshold_ratio):
+            return
+        schema = {
+            "type": "object", "additionalProperties": False,
+            "required": ["history_summary", "working_summary", "pending_state"],
+            "properties": {
+                "history_summary": {"type": "string"}, "working_summary": {"type": "string"},
+                "pending_state": {"type": "string"},
+            },
+        }
+        try:
+            response = await self._provider_complete(
+                input_items=[*self.working_trace, {"role": "system", "content": COMPACTION_PROMPT}],
+                tools=[], reasoning_effort="low", text_schema=schema, retry=False,
+            )
+            text = _text_from_output(response.output)
+            value = json.loads(text)
+            if not isinstance(value, dict):
+                raise ValueError("invalid compaction object")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if self._current(task, revision):
-                self._terminal(task, "failed", f"任务执行失败：{str(exc)[:300] or type(exc).__name__}")
+            self._compaction_retry_pending = True
+            self._metric("compaction.failed", {"error": type(exc).__name__, "tokens": before})
+            return
+        compact_snapshot = getattr(self.context_source, "shadow_compaction_snapshot", None)
+        snapshot = (
+            compact_snapshot(recent_interactions=10)
+            if callable(compact_snapshot)
+            else self.context_source.shadow_context_snapshot()
+        )
+        self.context_epoch += 1
+        self.working_trace = []
+        self.trace_revision += 1
+        self._append({"role": "system", "content": "【稳定历史与工作摘要】\n" + json.dumps(value, ensure_ascii=False)})
+        self._append_context("【当前权威会话快照】", {
+            "epoch": snapshot.epoch,
+            "frames": [_frame_payload(frame) for frame in snapshot.frames],
+        })
+        self._source_epoch = snapshot.epoch
+        self.applied_context_revision = snapshot.revision
+        self._compaction_retry_pending = False
+        self._metric("compaction.completed", {
+            "epoch": self.context_epoch, "before_tokens": before, "after_tokens": self._estimate_tokens(),
+        })
 
-    def drain_events(self) -> list[ShadowTaskEvent]:
-        return self._events.drain()
+    def _schedule_observer(self, serial: int) -> None:
+        if not self.observer_enabled or self.committed_model_steps - self.last_status_step < self.observer_every_steps:
+            return
+        if self.observer_task is not None and not self.observer_task.done():
+            self._observer_pending = True
+            return
+        self.last_status_step = self.committed_model_steps
+        trace = tuple(dict(item) for item in self.working_trace)
+        trace_revision = self.trace_revision
+        self.observer_task = asyncio.create_task(
+            self._observe(serial, trace, trace_revision), name="shadow-status-observer",
+        )
 
-    def snapshot(self, identifier: int) -> dict[str, Any] | None:
-        task = self._tasks.get(identifier)
-        if task is None:
-            return None
+    async def _observe(self, serial: int, trace: tuple[dict[str, Any], ...], trace_revision: int) -> None:
+        try:
+            text = await self.status_observer.summarize(trace, self._provider_complete)
+            if not text:
+                return
+            newer_visible = self._last_status_trace_revision > trace_revision
+            if not self.active or serial != self._activation_serial or newer_visible:
+                self._metric("observer.late_discard", {})
+                return
+            self._emit("status", text[:512])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._metric("observer.failed", {"error": type(exc).__name__})
+        finally:
+            pending = self._observer_pending
+            self._observer_pending = False
+            if pending and self.active and serial == self._activation_serial:
+                asyncio.get_running_loop().call_soon(self._schedule_observer, serial)
+
+    def _terminal_text(self, text: str) -> tuple[str, str]:
+        try:
+            value = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return ("result", text)
+        if isinstance(value, dict) and value.get("state") == "no_action":
+            return ("no_action", str(value.get("text") or ""))
+        if isinstance(value, dict) and value.get("state") == "result":
+            return ("result", str(value.get("text") or value.get("result") or ""))
+        return ("result", text)
+
+    async def _run_activation(self, serial: int) -> None:
+        started = time.monotonic()
+        try:
+            while not self._closed and serial == self._activation_serial:
+                self._apply_pending_context()
+                await self._maybe_compact()
+                response = await self._provider_complete(
+                    input_items=tuple(self.working_trace), tools=self._tools,
+                    reasoning_effort="high",
+                )
+                for item in response.output:
+                    self._append(dict(item))
+                self.committed_model_steps += 1
+                calls = self._calls(response.output)
+                if calls:
+                    # Guidance wins at the safe boundary before any old call starts.
+                    latest = self.context_source.shadow_input_revision
+                    if latest > self.applied_context_revision or self.pending_context_revision > self.applied_context_revision:
+                        self.pending_context_revision = max(self.pending_context_revision, latest)
+                        for call in calls:
+                            self._append(self._call_output(call.get("call_id"), {
+                                "status": "not_executed", "reason": "conversation_context_updated",
+                            }))
+                        self._metric("tool.prevented_by_context", {"count": len(calls)})
+                        self._schedule_observer(serial)
+                        continue
+                    outputs, stop = await self._execute_calls(calls)
+                    for output in outputs:
+                        self._append(output)
+                    # Context arriving during a read-only call is applied before the next provider step.
+                    self.pending_context_revision = max(
+                        self.pending_context_revision, self.context_source.shadow_input_revision,
+                    )
+                    if stop:
+                        self._last_processed_revision = self.applied_context_revision
+                        return
+                    self._schedule_observer(serial)
+                    continue
+                text = _text_from_output(response.output)
+                if not text:
+                    raise ShadowProviderError("completed response contained neither tool calls nor terminal text")
+                # Never publish a final drafted against a stale authority revision.
+                latest = self.context_source.shadow_input_revision
+                if latest > self.applied_context_revision or self.pending_context_revision > self.applied_context_revision:
+                    self.pending_context_revision = max(self.pending_context_revision, latest)
+                    self._metric("result.reconciled", {"draft_revision": self.applied_context_revision})
+                    continue
+                state, terminal = self._terminal_text(text)
+                if state == "result" and terminal.strip():
+                    self._emit("result", terminal)
+                self._last_processed_revision = self.applied_context_revision
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not self._closed and serial == self._activation_serial:
+                self._emit("failed", f"影子 Agent 暂时无法继续：{str(exc)[:300]}", payload={"category": type(exc).__name__})
+                self._last_processed_revision = self.applied_context_revision
+        finally:
+            if serial == self._activation_serial:
+                self.active = False
+                self._notify_runtime_state(active=False)
+                if self.latest_visible_status is not None:
+                    self.latest_visible_status = ShadowVisibleStatus(
+                        active=False, text=self.latest_visible_status.text,
+                        based_on_trace_revision=self.latest_visible_status.based_on_trace_revision,
+                        updated_at=self.latest_visible_status.updated_at,
+                    )
+                self._metric("activation.finished", {
+                    "serial": serial, "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                    "committed_steps": self.committed_model_steps,
+                })
+
+    def snapshot(self) -> dict[str, Any]:
         return {
-            "id": task.id, "status": task.status, "revision": task.revision,
-            "goal": task.goal, "modifications": list(task.modifications),
-            "committed_steps": task.committed_steps, "checkpoint_pending": task.checkpoint_pending,
-            "last_event": task.last_event,
-            "question_id": task.question_id, "question": task.question,
-            "question_options": list(task.question_options),
+            "available": self.available, "active": self.active,
+            "status": self.latest_visible_status.text if self.latest_visible_status else "",
+            "user_input_required": self.user_input_required,
+            "context_epoch": self.context_epoch,
+            "applied_context_revision": self.applied_context_revision,
+            "pending_context_revision": self.pending_context_revision,
+            "committed_model_steps": self.committed_model_steps,
         }
 
-    async def close(self, *, close_tools: bool = True) -> None:
+    async def reset(self) -> None:
+        self._activation_serial += 1
+        for task in (self.runner, self.observer_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (self.runner, self.observer_task) if task is not None),
+            return_exceptions=True,
+        )
+        self.active = False
+        self._notify_runtime_state(active=False)
+        self.context_epoch += 1
+        self.applied_context_revision = 0
+        self.pending_context_revision = 0
+        self.trace_revision = 0
+        self.committed_model_steps = 0
+        self.last_status_step = 0
+        self.working_trace.clear()
+        self.latest_visible_status = None
+        self.user_input_required = False
+        self.runner = None
+        self.observer_task = None
+        self._source_epoch = 0
+        self._last_processed_revision = -1
+        self._observer_pending = False
+        self._last_status_trace_revision = 0
+        self._pending_since = None
+        self.usage_samples.clear()
+
+    async def close(self, *, close_tools: bool = False) -> None:
+        if self._closed:
+            return
         self._closed = True
-        runners = [task.runner for task in self._tasks.values() if task.runner is not None and not task.runner.done()]
-        waiters = [task.waiter for task in self._tasks.values() if task.waiter is not None and not task.waiter.done()]
-        for task in self._tasks.values():
-            task.revision += 1
-            if task.status not in TERMINAL:
-                self._terminal(task, "cancelled", "影子任务管理器已关闭。")
-        for runner in runners:
-            runner.cancel()
-        if runners:
-            await asyncio.gather(*runners, return_exceptions=True)
-        if waiters:
-            await asyncio.gather(*waiters, return_exceptions=True)
+        await self.reset()
         if close_tools:
             self.tools.close()

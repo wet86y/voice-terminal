@@ -21,7 +21,7 @@ from voice_terminal.providers.deepseek import DeepSeekResponseTerminalError
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.context_frames import ContextFrame, ContextLane
 from voice_terminal.session.runtime import ConversationRuntime
-from voice_terminal.shadow_agent.contracts import ShadowTaskEvent
+from voice_terminal.shadow_agent.contracts import ShadowEvent
 
 
 def history(role: str, content: str) -> dict[str, str]:
@@ -47,7 +47,7 @@ def test_decision_schema_keeps_wire_shape_and_reserves_thinking_action():
     item = schema["properties"]["actions"]["items"]
     assert item["required"] == ["name", "arguments"]
     assert item["properties"]["name"]["enum"] == ["web_search", THINKING_ACTION]
-    assert item["properties"]["arguments"]["properties"]["request"] == {"type": "boolean"}
+    assert item["properties"]["arguments"]["properties"]["request"] == {"type": "boolean", "const": True}
 
 
 def test_prompt_matches_required_responses_wire_contract_and_has_short_examples():
@@ -59,7 +59,7 @@ def test_prompt_matches_required_responses_wire_contract_and_has_short_examples(
     assert "不得带 text" not in PROMPT
 
 
-def test_shadow_user_input_events_wake_main_scheduler_but_running_does_not():
+def test_shadow_priority_and_normal_events_wake_main_scheduler_but_progress_does_not():
     async def scenario():
         class Registry:
             def action_definitions(self):
@@ -77,19 +77,21 @@ def test_shadow_user_input_events_wake_main_scheduler_but_running_does_not():
         )
         wakes = []
         runtime._wake = wakes.append
-        await runtime.accept_shadow_task_event(
-            ShadowTaskEvent(1, "running", "正在检索")
+        await runtime.accept_shadow_event(
+            ShadowEvent("p", "progress", "正在检索", 1, "passive")
         )
-        await runtime.accept_shadow_task_event(
-            ShadowTaskEvent(1, "awaiting_user", "请选择范围", "task-1-question-1", ("A", "B"))
+        await runtime.accept_shadow_event(
+            ShadowEvent("q", "user_input_required", "请选择范围", 1, "priority", {
+                "kind": "clarification", "options": ["A", "B"], "operation_summary": "",
+            })
         )
-        await runtime.accept_shadow_task_event(
-            ShadowTaskEvent(1, "paused", "请选择范围", "task-1-question-1", ("A", "B"))
+        await runtime.accept_shadow_event(
+            ShadowEvent("s", "status", "正在等待用户说明", 1, "normal")
         )
-        assert wakes == ["SHADOW_TASK_USER_INPUT", "SHADOW_TASK_USER_INPUT"]
+        assert wakes == ["SHADOW_EVENT_PRIORITY", "SHADOW_EVENT"]
         payload = runtime.ledger.entries[-1].content
-        assert payload["question_id"] == "task-1-question-1"
-        assert payload["options"] == ["A", "B"]
+        assert payload["kind"] == "user_input_required"
+        assert payload["payload"]["options"] == ["A", "B"]
 
     asyncio.run(scenario())
 
@@ -876,7 +878,7 @@ def test_shadow_chain_validates_without_touching_output_or_ledger():
     asyncio.run(scenario())
 
 
-@pytest.mark.skip(reason="voice business actions were replaced by independent task dispatch")
+@pytest.mark.skip(reason="voice business tools were replaced by the content-free Shadow wake")
 def test_thinking_and_business_actions_release_one_barrier_after_tools():
     async def scenario():
         provider = SimpleNamespace(thinking_action_enabled=True)

@@ -1,11 +1,11 @@
-"""Voice-facing catalog for the single shadow-task business action."""
+"""Voice-facing catalog for the fixed Shadow wake action."""
 from __future__ import annotations
 
-from voice_terminal.shadow_agent.contracts import task_action_definition
+from voice_terminal.shadow_agent.contracts import request_shadow_action_definition
 
 
-class VoiceTaskRegistry:
-    """A schema/status adapter; task execution stays outside the Agent core."""
+class VoiceShadowRegistry:
+    """Expose only a content-free wake when the runtime is available."""
 
     def __init__(self, *, available: bool) -> None:
         self.available = available
@@ -20,7 +20,7 @@ class VoiceTaskRegistry:
         return None
 
     def action_definitions(self) -> list[dict]:
-        return [task_action_definition()] if self.available else []
+        return [request_shadow_action_definition()] if self.available else []
 
     def service_status(self, name: str) -> str:
-        return "READY" if name == "task" and self.available else "DISABLED"
+        return "READY" if name == "request_shadow" and self.available else "DISABLED"

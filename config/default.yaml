@@ -12,12 +12,22 @@ smart_turn:
   hard_silence_ms: 1400
   max_turn_ms: 60000
 shadow_agent:
-  # Optional independent task runtime. It does not participate in the voice
-  # scheduler until a task action is issued, and debug commands stay closed.
+  # Session-scoped single Shadow Agent. The voice model can only wake it;
+  # intent and tools are driven from authoritative conversation context.
   enabled: true
   debug_websocket_enabled: false
+  max_context_tokens: 524288
+  compaction_threshold_ratio: 0.80
   # Omitted provider fields inherit llm.base_url, llm.model and llm.api_key_env.
-  provider: {}
+  provider:
+    timeout_ms: 15000
+    transport_retry_limit: 2
+  status_observer:
+    enabled: true
+    every_committed_steps: 5
+    reasoning_effort: none
+    max_output_tokens: 512
+    timeout_ms: 10000
   tools:
     files_enabled: true
     allowed_roots: [docs]
