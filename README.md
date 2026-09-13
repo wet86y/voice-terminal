@@ -1,9 +1,9 @@
-# Voice Terminal V0.6
+# Voice Terminal V0.7
 
 Voice Terminal 是 Windows 本机实时语音会话终端。浏览器负责控制和可视化；音频采集、VAD、
 ASR、Smart Turn、SenseVoice、主 Agent、Shadow Agent、TTS、播放和延迟均由 Voice Server 管理。
 
-> 当前生产路径使用 DeepSeek Responses + strict `json_schema`。主语音链保持低延迟交互，
+> V0.7 当前生产路径使用 DeepSeek Responses + strict `json_schema`。主语音链保持低延迟交互，
 > 会话级单一 Shadow Agent 负责高思考意图理解与只读工具调用。
 
 ## 当前运行模型
@@ -115,11 +115,17 @@ shadow_agent:
 - [上下文与工具规范](docs/context-and-tools.md)
 - [WebSocket 协议](docs/websocket-protocol.md)
 - [LLM 上下文缓存契约](docs/llm-context-cache-contract.md)
+- [JSON Schema 迁移与回滚 Runbook](docs/llm-json-schema-migration.md)
 - [运行与质量门槛](docs/operations-and-quality.md)
+- [V0.7 发布审计](docs/v07-release-audit.md)
+- [当前已知 LLM 可靠性问题](docs/known-issues/llm-invalid-json-responses.md)
 
 ```powershell
 python -m pytest -q
-cd web
 npm test
 npm run typecheck
+npm run build
 ```
+
+所有命令均在仓库根目录执行；根 `package.json` 会转发到 `apps/web` workspace。运行时日志和
+诊断报告固定写入根目录的 `logs/` 与 `reports/`，两者都是本地运行产物，已被 Git 忽略。

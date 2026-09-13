@@ -486,7 +486,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
     if FastAPI is None:
         raise RuntimeError("缺少 fastapi，请先运行 scripts\\setup.ps1。")
 
-    app = FastAPI(title="Voice Terminal Server", version="0.6.0", lifespan=lifespan)
+    app = FastAPI(title="Voice Terminal Server", version="0.7.0", lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:

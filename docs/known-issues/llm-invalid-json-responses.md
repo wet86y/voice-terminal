@@ -10,7 +10,8 @@
 ## 问题摘要
 
 活动 LLM 请求虽然携带 strict JSON Schema，且上游以 HTTP 200 和
-`response.completed` 正常结束，最终 `content` 仍高频不能通过本地 V0.6 决策信封校验。
+`response.completed` 正常结束，最终 `content` 仍高频不能通过本地决策信封校验。信封的
+`voice_decision_v06` 名称是冻结的兼容标识，不代表当前 V0.7 产品版本。
 完整失败部分不会写入完整决策账本；如果流式阶段已经形成合法的非空 `speak` 队列，则保留该语音并
 静默丢弃未验证字段。只有 `speak` 本身不能安全确认时，才进入有界即时协议恢复。
 
