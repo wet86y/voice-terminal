@@ -711,6 +711,12 @@ class AgentEpisodeRuntime:
         self.active_request_identity = None
         self.active_request_source_turn_id = None
         self.active_dispatch_context: dict | None = None
+        # Advances only when a new microphone speech interval begins.  The
+        # scheduler generation intentionally waits for finalized/refined ASR,
+        # but an unplayed system-check answer must become stale earlier: it
+        # must never be released behind a newer user utterance merely because
+        # that utterance's ASR final has not arrived yet.
+        self._user_speech_epoch = 0
         self._system_check_turn_ids: set[str] = set()
         self._system_check_output_turn_ids: set[str] = set()
         self._system_check_speeches: dict[str, dict] = {}
@@ -1235,11 +1241,24 @@ class AgentEpisodeRuntime:
             and context.get("system_check_id")
         )
 
+    def _system_check_stale_reason(self, context) -> str | None:
+        if not self._is_system_check_context(context):
+            return None
+        if int(context.get("generation") or 0) != self.scheduler.generation:
+            return "scheduler_generation_changed"
+        # Timer-only checks are allowed to run while the user is speaking so
+        # the provider scheduler remains single-flight and non-preemptive.
+        # Their speech output is nevertheless obsolete by construction: it
+        # was requested without the utterance currently in progress.
+        if bool(context.get("user_speaking_at_dispatch")):
+            return "user_speaking_at_dispatch"
+        dispatch_epoch = context.get("user_speech_epoch")
+        if dispatch_epoch is not None and int(dispatch_epoch) != self._user_speech_epoch:
+            return "user_speech_started_after_dispatch"
+        return None
+
     def _system_check_is_stale(self, context) -> bool:
-        return bool(
-            self._is_system_check_context(context)
-            and int(context.get("generation") or 0) != self.scheduler.generation
-        )
+        return self._system_check_stale_reason(context) is not None
 
     def _track_system_check_speech(self, handle, context) -> None:
         speech_id = getattr(handle, "speech_id", None)
@@ -1808,6 +1827,13 @@ class AgentEpisodeRuntime:
             return
         previous = self.user_speaking
         self.user_speaking = speaking
+        if speaking is True and previous is not True:
+            self._user_speech_epoch += 1
+            # Withdraw only unplayed system-check speech.  The active provider
+            # request deliberately keeps running; its later output is rejected
+            # by the epoch check above.  Ordinary user-requested candidates are
+            # still held and released by the existing speech lifecycle.
+            self._supersede_system_output_without_request_cancel("SPEECH_STARTED")
         if speaking is True and not explicit_interrupt:
             hold = getattr(self.output, "hold_unplayed", None)
             if callable(hold):
@@ -1935,6 +1961,8 @@ class AgentEpisodeRuntime:
             dispatch_context["dispatch_kind"] = dispatch_kind
             dispatch_context["prompt_kind"] = prompt_kind
             dispatch_context["owner_scope"] = "system_check"
+            dispatch_context["user_speech_epoch"] = self._user_speech_epoch
+            dispatch_context["user_speaking_at_dispatch"] = self.user_speaking is True
             self._system_check_turn_ids.add(system_check_id)
         elif recovery_signal and recovery_signal.system_check_id:
             system_check_id = recovery_signal.system_check_id
@@ -1944,6 +1972,10 @@ class AgentEpisodeRuntime:
             ) or recovery_signal.source_turn_id
             if isinstance(dispatch_context, dict):
                 dispatch_context["speech_turn_id"] = source_turn_id
+                dispatch_context.setdefault("user_speech_epoch", self._user_speech_epoch)
+                dispatch_context.setdefault(
+                    "user_speaking_at_dispatch", self.user_speaking is True,
+                )
             self._system_check_turn_ids.add(system_check_id)
         reasoning_effort = "low" if self.reasoning_mode == "deep" else "none"
         if "THINKING_READY" in kinds and self._thinking_lease_turn == source_turn_id:
@@ -3180,6 +3212,8 @@ class AgentEpisodeRuntime:
         validation = "strict_valid"
         audit_outcome_recorded = False
         stale_reported = False
+        early_stream_abort = False
+        early_stream_abort_non_whitespace_chars: int | None = None
 
         async def report_stale() -> None:
             nonlocal stale_reported
@@ -3195,6 +3229,12 @@ class AgentEpisodeRuntime:
                 scheduler_generation=(dispatch_context.get("generation")
                                       if isinstance(dispatch_context, dict) else None),
                 current_scheduler_generation=self.scheduler.generation,
+                stale_reason=self._system_check_stale_reason(dispatch_context),
+                system_check_user_speech_epoch=(dispatch_context.get("user_speech_epoch")
+                                                if isinstance(dispatch_context, dict) else None),
+                current_user_speech_epoch=self._user_speech_epoch,
+                user_speaking_at_dispatch=(dispatch_context.get("user_speaking_at_dispatch")
+                                           if isinstance(dispatch_context, dict) else None),
                 stale_system_check_output_discarded=True,
             )
 
@@ -3420,6 +3460,14 @@ class AgentEpisodeRuntime:
                         if content_chars > 32768:
                             raise EnvelopeError("decision content too large")
                         text_delta = parser.feed(item["text"])
+                        if parser.definitive_non_json_prefix():
+                            early_stream_abort = True
+                            early_stream_abort_non_whitespace_chars = sum(
+                                not char.isspace() for char in parser.raw
+                            )
+                            raise EnvelopeError(
+                                "streamed decision is prose instead of JSON"
+                            )
                         if text_delta:
                             provisional += text_delta
                             if system_check and self._system_check_is_stale(dispatch_context):
@@ -3573,6 +3621,10 @@ class AgentEpisodeRuntime:
             failure_diagnostics = {
                 **json_structure_fingerprint(parser.raw),
                 **envelope_error_diagnostics(parser.raw, exc, audit_schema),
+                "early_stream_abort": early_stream_abort,
+                "early_stream_abort_non_whitespace_chars": (
+                    early_stream_abort_non_whitespace_chars
+                ),
             }
             if system_check and self._system_check_is_stale(dispatch_context):
                 await report_stale()

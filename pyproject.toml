@@ -11,3 +11,11 @@ requires-python = ">=3.12,<3.13"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+filterwarnings = [
+  # aec-audio-processing==1.0.1 ships a CPython 3.12 SWIG extension whose
+  # generated helper types lack __module__.  Ignore only its known third-party
+  # import warnings; do not suppress other deprecations.
+  "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+  "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+  "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+]

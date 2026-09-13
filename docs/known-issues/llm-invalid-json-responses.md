@@ -1,6 +1,6 @@
 # DeepSeek Responses 返回无效决策 JSON
 
-状态：**开放，P1，已接入有界 JSON 自修复；纯文本降级未启用，provider 主因仍在定位**  
+状态：**开放，P1，已接入有界 JSON 自修复与纯文本流式早停；纯文本降级未启用，provider 主因仍在定位**
 
 首次单独建档：2026-09-10（Asia/Hong_Kong）  
 当前活动路径：官方 DeepSeek `Responses`、`deepseek-flash`、strict `json_schema`
@@ -26,7 +26,7 @@
 | 问题 | 调查结论 | 当前处置状态 |
 | --- | --- | --- |
 | 深度模式没有真正运行 | `SessionRuntime.reset_session()` 会在会话重置时把客户端已选择的模式覆盖回配置默认值；后续请求因此仍可能记录 `reasoning_effort=none`，推理展示区自然没有 reasoning 内容 | 已修改为重置会话身份时保留当前显式选择，并增加保持 `deep` 的回归测试；仍需下一轮真实会话复验 UI 与上游 effort |
-| Responses 高频无效 JSON | 完整终态中 43/90 为 JSON 语法错误，SSE 拼接与 authoritative final 全部一致 | 本文主问题，P1；已增加结构指纹和有界 JSON 自修复，纯文本仍拒绝，provider 主因未修复 |
+| Responses 高频无效 JSON | 完整终态中 43/90 为 JSON 语法错误，SSE 拼接与 authoritative final 全部一致 | 本文主问题，P1；已增加结构指纹、有界 JSON 自修复和纯文本流式早停，纯文本仍拒绝，provider 主因未修复 |
 | speech cleanup 明确代码 Bug | `EpisodeSpeechOutput` 清理路径读取未定义局部变量 `was_active`，历史日志中重复产生 `NameError`，会使 speech task 异常结束 | 已在 settlement 清理 handle 前捕获 active ownership；代码已修，待后续长会话确认异常不再出现 |
 | “模型自打断”与用户打断混淆 | 用户所指的是 LLM 在播放期间产生新决定、替换播放队列造成的自我截断，不是 VAD 用户 barge-in 失灵 | 现已接入 AEC 保护：播放期只有处理后 `near_voice=true`、反向参考新鲜时才可确认 barge-in；AEC 异常按可配置策略恢复或停止并监听，不退回原始 VAD |
 | 用户讲话时提前触发 LLM | `USER_SEGMENT_UPDATED` 上的 speculative dispatch 是有意的首字延迟优化，不是调度 Bug | 保留；当前体感收益良好，但恢复预算必须与 finalized 请求隔离，避免推测请求提前耗尽唯一 recovery |
@@ -147,6 +147,23 @@ Responses 严格解析失败后会尝试一次本地兼容解析；成功时记�
 处理的是先前已人工确认的缺 `actions`、空 `emotion` 等低频但无歧义子类。纯文本兼容仍只保留为离线候选，
 没有接入运行时。
 
+### 2026-09-13 纯文本流式早停边界
+
+运行时不再等待明确的纯文本输出完整生成。忽略前导空白、一个 UTF-8 BOM 和最终兼容器已接受的单层
+JSON code fence 后，如果正文累计 10 个非空白字符仍未以 `{` 开始，解析器立即抛出协议错误；provider
+异步流由既有 `aclosing()` 路径关闭，并进入同一个一次性 protocol recovery。普通日志只记录
+`early_stream_abort=true`、有效字符数和既有结构指纹，不新增正文泄露。
+
+这条规则只处理已经不可能成为受支持 JSON object 的前缀，不放宽任何兼容边界：
+
+- 合法 JSON 即使按单字符分片，只要第一个有效正文字符是 `{` 就不会早停；
+- 前导空白、BOM、无语言标记或带 `json` 标记的单层 code fence 包装继续兼容；
+- 以 `{` 开始但截断、语法损坏或信封不合约的内容仍等待终态，并走原有严格校验/有界修复；
+- “解释文字 + JSON”会提前拒绝，但该形态原本也被最终兼容器明确拒绝；
+- 空白输出仍由既有 blank-output 逻辑处理，不会被 10 字符阈值误分类。
+
+因此改动只缩短明确纯文本失约的失败时间，不把纯文本送入 TTS、不执行其中任何动作，也不增加恢复预算。
+
 至少以下 finalized 输入在连续无效后没有创建 TTS，其中后四项有明确的用户追问或继续指令，
 可视为可感知的无回应：
 
@@ -228,7 +245,10 @@ recovery cancelled 终态，且已消耗的 turn 额度不会归还。这既影�
 `forced_poll` 只在没有普通语义事件且实际 dispatch 门槛满足时触发；`final_silence` 在 active LLM、
 TTS/待播内容或用户输入繁忙时保留，恢复后只消费一次。两类强制请求都复用同一个 `_step()` 和
 provider stream 入口，使用互斥提示词，不能作为第二个 scheduler、watchdog 或 provider 调用链路。
-普通事件、有效新输入或有效修订仍拥有更高优先级；新输入还会使未播放的 system-check 结果失效。
+普通事件、有效新输入或有效修订仍拥有更高优先级。system-check 在 dispatch 时记录 scheduler generation、
+用户语音 epoch 和 speaking 状态；如果检查在用户讲话期间发出，或发出后在 ASR final 之前出现新一段用户
+语音，其结果立即判为 `SYSTEM_CHECK_STALE`。已经生成但尚未播放的 system-check 候选在 `SPEECH_STARTED`
+时单独 supersede，普通候选和在飞普通 LLM 不受影响，因而旧检查结果不会在用户说完后从 hold 队列补播。
 
 ## 与历史问题的区别
 
@@ -443,7 +463,8 @@ JSONL 中精确比较异常请求和邻近正常请求，而无需根据 ASR/TTS
 ## 下一步诊断顺序
 
 已完成：结构指纹、真实节奏复放、按输入阶段统计、离线兼容候选实验、有界 JSON 自修复接入、
-Prompt/Schema wire contract 对齐、短 canonical 示例、分层失败诊断、SSE sequence 观测和类型化 transport error。
+明确纯文本的 10 个有效字符流式早停、Prompt/Schema wire contract 对齐、短 canonical 示例、分层失败诊断、
+SSE sequence 观测和类型化 transport error。
 
 接下来：
 

@@ -19,10 +19,10 @@
 
 ## 发布边界
 
-- 用户在 `playback_started=false` 阶段讲话时，语音候选进入 `HELD`；保留文本和 handle，不取消在飞 LLM。TTS session 即使已经建立，也不得继续发送文本、拉取新的 provider PCM 或让播放器消费队列；已经进入播放器的未播放 PCM 保留在队列中并由 player hold 阻止消费。
+- 用户在 `playback_started=false` 阶段讲话时，普通语音候选进入 `HELD`；保留文本和 handle，不取消在飞 LLM。TTS session 即使已经建立，也不得继续发送文本、拉取新的 provider PCM 或让播放器消费队列；已经进入播放器的未播放 PCM 保留在队列中并由 player hold 阻止消费。唯一例外是静默阶梯产生的未播放 system-check 候选：新一段用户语音开始时立即 supersede，避免在用户说完后补播过期检查结果。
 - 普通语音活动、ASR segment/final、SenseVoice 精修和动作完成不会取消在飞 LLM；这些用户信息继续进入 pending mailbox，由默认 400ms scheduler tick 合并处理。只有确认 barge-in、stop、reset、输入不可用、传输清理和播放中实质改口会显式取消。
 - Paraformer final 与 SenseVoice refinement 是同一 `turn_id` 下的 `transcript_updates`，各自在到达时独立进入现有调度器；同窗口只自然合并，不互相等待。首次合法更新即使文本相同也必须对模型可见，本地只按 source revision 幂等，不再推断 `confirmed/suffix/rewrite`。模型通过 `available/triggered_by + runtime.speak + assistant HISTORY` 决定 wait、追加、替换或 cancel。晚到 refinement 只能更新 request tail 和诊断/前端转录状态；已经发送给主模型的 user HISTORY frame 在该 Episode 内冻结，绝不因精修回写。
-- `cancel` 立即停止待播或正在播放的输出并清理 hold；`wait` 完全不改变事务。`SPEECH_ENDED` 释放最新的 `HELD` 候选并恢复原有文本事务，不重新调用 LLM 或重复发送整段文本。
+- `cancel` 立即停止待播或正在播放的输出并清理 hold；`wait` 完全不改变事务。`SPEECH_ENDED` 只释放最新且仍有效的 `HELD` 候选并恢复原有文本事务，不重新调用 LLM 或重复发送整段文本；已由用户语音 epoch 判定过期的 system-check 候选不得释放。
 - 播放中收到首个合法且非空的 `speak` 文本前缀时，先按 `conversation_id + turn_id` 检查 speech 所有权。同轮新文本完整覆盖旧文本时只提取 suffix，当前 PCM 不停止、不清空、不重播；跨轮活动文本只作为 `observed_text`，不得调用 `append_successor`。已接受的同轮文本范围内出现差异时，输出层才原子关闭旧 PCM generation 并启动新的 TTS transaction，旧 provider cancel/close 在后台完成，迟到 PCM 不得进入新 playback key。
 - 当前输出耗尽后保留 1 秒追加窗口。窗口内的同前缀扩展会进入不重播前缀的后续队列；窗口外仍只合成新增 suffix。`speech.append_waiting_prefix`、`speech.appended`、`speech.append_successor` 和 `append_window_*` 进度事件用于重建该路径。
 - 如果已追加的流式 `speak` 随后完整 JSON 或动作校验失败，已获合法前缀授权的追加文本保留，并使用一次既有恢复请求纠正协议；已播放旧内容不会恢复或续播。
@@ -36,6 +36,6 @@
 
 每个首次合法的非空 `USER_INPUT_FINALIZED` 或 `USER_INPUT_REFINED` 都会重新开始静默阶梯，不要求本地先证明语义发生变化。没有普通语义事件时，第3、6、9、16、22窗口发起 `forced_poll`，第25窗口发起一次 `final_silence`；第10窗口只切换到慢速阶段。普通事件与强制窗口同边界时，普通调度覆盖强制窗口并记录 `covered_by_normal_dispatch`，不会创建 system-check，也不会补发强制请求。普通强制窗口只在 active LLM 时记为 `covered_by_active_request`，或在 provider backoff 时记为 `skipped_backoff`；TTS 和用户讲话不参与该决定。最终窗口在 active LLM 或 backoff 时保留，恢复空闲后只消费一次。
 
-`TTS_*` 和语音活动不会成为普通语义事件，不更新静默锚点，也不会单独触发 provider；它们同时不能作为任何 LLM dispatch 的门槛。`forced_poll` 与 `final_silence` 使用互斥的 request-tail 提示词，均复用普通 `_step()`、`_provider_stream()`、provider schema/transport/reasoning 和 `EpisodeSpeechOutput`；system-check 保留独立 `system_check_id`，但以当前 scheduler generation 的真实 `speech_turn_id` 维护标准 `runtime.speak`。它不开始用户 turn、不创建 `InputRecord`，已听到的输出才写入 assistant ledger。
+`TTS_*` 和语音活动不会成为普通语义事件，不更新静默锚点，也不会单独触发 provider；它们同时不能作为任何 LLM dispatch 的门槛。新一段用户语音只递增输出有效性 epoch：不取消普通 LLM，也不重置静默阶梯，但会撤销尚未播放的 system-check 候选。`forced_poll` 与 `final_silence` 使用互斥的 request-tail 提示词，均复用普通 `_step()`、`_provider_stream()`、provider schema/transport/reasoning 和 `EpisodeSpeechOutput`；system-check 保留独立 `system_check_id`，并记录 dispatch 时的 scheduler generation、用户语音 epoch 与 speaking 状态。检查在用户讲话期间发出，或发出后出现新一段用户语音时，其返回只能记录 `SYSTEM_CHECK_STALE`，不得创建或释放语音。它不开始用户 turn、不创建 `InputRecord`，已听到的输出才写入 assistant ledger。
 
 真实设备仍须完成连续五轮、SenseVoice 修正、动作后回复、同前缀长播报追加、文本分歧改口、耳机/扬声器插话和停止监听验收。跨轮验收应确认 `owner_scope` 从 `current_turn` 正确切换为 `none/previous_turn`，新 TTS 只收到本轮文本；若模型仍累计输出，必须出现 `CROSS_TURN_SPEECH_PREFIX_STRIPPED` 且 suffix 之前没有旧 PCM。追加验收应确认同轮新事件中只有 suffix，且没有因普通补充产生 `speech.replaced` 或 `local_playback_stopped`。
