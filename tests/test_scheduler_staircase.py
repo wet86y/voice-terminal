@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -226,32 +227,37 @@ def test_force_and_final_prompts_are_mutually_exclusive():
     runtime.last_turn_id = "turn-a"
     runtime.inputs["turn-a"] = {"text": "你好", "final": True}
 
-    forced = "\n".join(
-        frame["content"] for frame in runtime.messages(
-            {"SYSTEM_CHECK"},
-            prompt_kind="forced_poll",
-            force_context={
-                "anchor_wall_time": 123.0,
-                "silence_elapsed_ms": 1200,
-                "window_index": 3,
-                "skipped_forced_windows": 0,
-            },
-        )
+    forced_messages = runtime.messages(
+        {"SYSTEM_CHECK"},
+        prompt_kind="forced_poll",
+        force_context={
+            "anchor_wall_time": 123.0,
+            "silence_elapsed_ms": 1200,
+            "window_index": 3,
+            "skipped_forced_windows": 0,
+        },
     )
-    final = "\n".join(
-        frame["content"] for frame in runtime.messages(
-            {"SYSTEM_CHECK"},
-            prompt_kind="final_silence",
-            force_context={
-                "anchor_wall_time": 123.0,
-                "silence_elapsed_ms": 10000,
-                "window_index": 25,
-                "skipped_forced_windows": 2,
-            },
-        )
+    final_messages = runtime.messages(
+        {"SYSTEM_CHECK"},
+        prompt_kind="final_silence",
+        force_context={
+            "anchor_wall_time": 123.0,
+            "silence_elapsed_ms": 10000,
+            "window_index": 25,
+            "skipped_forced_windows": 2,
+        },
     )
-    normal = "\n".join(frame["content"] for frame in runtime.messages({"USER_INPUT_FINALIZED"}))
 
+    def tail_contents(messages):
+        packet = json.loads(messages[-2]["content"])
+        return "\n".join(entry["content"] for entry in packet["entries"])
+
+    forced = tail_contents(forced_messages)
+    final = tail_contents(final_messages)
+    normal = tail_contents(runtime.messages({"USER_INPUT_FINALIZED"}))
+
+    assert json.loads(forced_messages[-2]["content"])["entries"][-1]["kind"] == "forced_poll"
+    assert json.loads(final_messages[-2]["content"])["entries"][-1]["kind"] == "final_silence"
     assert FORCED_POLL_PROMPT in forced
     assert "系统即将进入静默状态" not in forced
     assert FINAL_SILENCE_PROMPT in final

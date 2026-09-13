@@ -16,7 +16,50 @@ DeepSeek 的前缀缓存按请求开头连续 token 匹配。官方 Responses �
 | `HISTORY` | 最终用户输入、实际 `heard_text`、结算的打断/替换、完成工具资料、持久精修 | 只能在末尾追加；Responses `input` | 未播文本、重排/摘要旧条目、运行时 ID |
 | `REQUEST_TAIL` | 当前输入候选、秒级时间、日期 epoch、活跃 speak、精修、工具可用性、恢复反馈 | 只存在于本请求末尾；Responses `input` | 固定规则、需要在未来复用的事实 |
 
-`ContextFrame` 是唯一模型消息构造器。没有 lane 的帧会在 provider 投影时失败；内部 `context_lane` 不会发送到 provider。Responses 仅将 `STATIC_INSTRUCTIONS` 合并到 `instructions`，其余 role、顺序和内容原样进入 `input`。冻结的 Chat Completions 回退只去除内部 lane，保留原有消息顺序。
+`ContextFrame` 是唯一模型消息构造器。没有 lane 的帧会在 provider 投影时失败；内部
+`context_lane` 与 `context_kind` 均不会发送到 provider。Responses 仅将
+`STATIC_INSTRUCTIONS` 合并到 `instructions`，其余 role、顺序和 content 进入 `input`。
+冻结的 Chat Completions 回退同样去除内部元数据，保留模型可见的消息顺序。
+
+## V1 请求尾部信封
+
+主 Agent 的模型可见请求固定按以下顺序排列：
+
+1. episode 内冻结的 `STATIC_INSTRUCTIONS`；
+2. 只追加、不改写的 `HISTORY`；
+3. 可选的 `current_user_input`；
+4. 恰好一个 `voice_request_context`；
+5. 恰好一条最终 JSON 输出约束。
+
+尚未进入历史的当前用户输入无损包装为：
+
+```json
+{"type":"current_user_input","version":1,"content":"原始完整文本"}
+```
+
+已经按 `turn_id` 提交到 ledger 的用户输入仍只保留在 `HISTORY`，不得在 tail 重复。恢复反馈、
+秒级运行状态、工具状态和强制调度提示不再作为彼此分散的 system 消息发送，而是保持原始文本和顺序，
+合并为：
+
+```json
+{
+  "type": "voice_request_context",
+  "version": 1,
+  "entries": [
+    {"index": 0, "kind": "runtime_state", "content": "原始完整状态文本"}
+  ]
+}
+```
+
+已定义的 `kind` 为 `minor_protocol_feedback`、`immediate_recovery`、
+`deferred_recovery`、`runtime_state`、`pending_tools`、`forced_poll`、
+`final_silence` 和兜底的 `system_context`。`content` 不得被摘要、清洗或重新解释；只有既有的
+上下文超限策略可以处理请求副本，语义 ledger 不变。
+
+状态信封之后固定追加简短输出边界，要求最终 `output_text` 只能是一个符合
+`voice_decision_v06` 的完整 JSON 对象。这条约束必须是整个模型输入的最后一条消息；工具、恢复、
+runtime、Shadow 或调度代码都不得在其后追加内容。Provider 的 `text.format` Schema 仍是权威结构约束，
+尾部提示不能替代本地解析与校验。
 
 人格上下文文件位于 `config/persona/`，由 Agent 在新的 episode 首次建立时读取一次。
 `instructions.md`、`personality.md` 和 `user.md` 均属于 `STATIC_INSTRUCTIONS`，并按
@@ -35,10 +78,12 @@ DeepSeek 的前缀缓存按请求开头连续 token 匹配。官方 Responses �
 | 最终用户文本 | Session ledger | HISTORY | 是 | 否 | ledger replay test |
 | 已完成 speak `heard_text` | Speech/ledger | HISTORY | 是 | 否 | delivery test |
 | 工具资料、结算中断、持久精修 | ledger | HISTORY | 是 | 否 | replay/order test |
-| `HH:MM:SS` 秒级时间 | Context projector | REQUEST_TAIL | 否 | 否 | tail placement test |
+| 尚未提交的当前用户输入 | Context projector | REQUEST_TAIL / `current_user_input` | 否 | 否 | wrapper/order test |
+| `HH:MM:SS` 秒级时间 | Context projector | REQUEST_TAIL / `runtime_state` | 否 | 否 | tail placement test |
 | 跨午夜日期 epoch | Conversation runtime | REQUEST_TAIL | 否 | 否 | midnight test |
 | 活跃 speak state/target_text | Speech runtime | REQUEST_TAIL | 否 | 否 | append/replace/cancel test |
-| 工具实时可用性、恢复反馈 | Agent runtime | REQUEST_TAIL | 否 | 否 | frozen schema test |
+| 工具实时可用性、恢复反馈 | Agent runtime | REQUEST_TAIL / typed entry | 否 | 否 | frozen schema test |
+| 最终 JSON 输出边界 | Agent runtime | REQUEST_TAIL / `output_constraint` | 否 | 否 | final-position test |
 
 时间尾部格式为 `{"runtime":{"clock":{"local_time":"HH:MM:SS","precision":"second"},"speak":...}}`。非 empty speak 才带 `target_text`，让 LLM 自行决定 append、replace、wait 或 cancel；当前进度不得伪造为实时 heard cursor。会话跨午夜不 reset：静态基准保留，尾部持续附加新的日期 epoch、星期和时区。
 
@@ -48,7 +93,8 @@ DeepSeek 的前缀缓存按请求开头连续 token 匹配。官方 Responses �
 - 不要改写、截断、摘要、重排 HISTORY，也不要把未听到的文本写为 assistant 历史。
 - 不要向模型发送 request/speech/turn ID、调度 tick、性能时间或 Unix timestamp。
 - 不要在会话中更换动作目录、strict schema 或 `request_thinking` 可见性；不可用状态只能进入 tail，本地仍执行参数和权限校验。
-- REQUEST_TAIL 必须在当前 user frame 之后。新字段须先填准入表并补 placement、digest 与回归测试。
+- REQUEST_TAIL 必须位于所有 HISTORY 之后；可选 current user 必须位于状态信封之前。最终输出约束必须
+  恰好出现一次并处于整个请求末尾。新字段须先填准入表并补 placement、digest 与回归测试。
 
 运行时守护计算静态 instructions、历史序列和 schema/action catalog 的 canonical digest：同一 session 的静态/schema digest 不得变化；新的 history 必须以前次 history 为前缀。`llm.context` 诊断事件保留完整内部投影，供人工核对 lane placement。
 

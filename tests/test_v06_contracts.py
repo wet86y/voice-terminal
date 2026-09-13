@@ -1,5 +1,6 @@
 from pathlib import Path
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -497,7 +498,9 @@ def test_changed_asr_final_keeps_full_text_without_local_relation_classification
         assert current["transcript_updates"][0]["text"] == "帮我查明天上海天气"
         assert current["transcript_updates"][0]["streamed_text"] == "帮我查明天"
         assert wakes == ["USER_INPUT_FINALIZED"]
-        rendered = "\n".join(frame["content"] for frame in runtime.messages({"USER_INPUT_FINALIZED"}))
+        messages = runtime.messages({"USER_INPUT_FINALIZED"})
+        packet = json.loads(messages[-2]["content"])
+        rendered = "\n".join(entry["content"] for entry in packet["entries"])
         assert '"triggered_by":["asr_final"]' in rendered
         assert "帮我查明天上海天气" in rendered
 
@@ -1253,8 +1256,10 @@ def test_streamed_cross_turn_completed_prefix_is_stripped_before_tts():
         context = runtime.messages({"USER_INPUT_FINALIZED"})
         assert any(item["role"] == "assistant" and item["content"] == "能听到，你说吧，我在。"
                    for item in context)
-        runtime_tail = next(item["content"] for item in context
-                            if item.get("context_lane") == "request_tail" and "当前轮运行状态" in item["content"])
+        packet = next(json.loads(item["content"]) for item in context
+                      if item.get("context_kind") == "voice_request_context")
+        runtime_tail = next(entry["content"] for entry in packet["entries"]
+                            if entry["kind"] == "runtime_state")
         assert '"state":"empty"' in runtime_tail
         assert '"continuation_allowed":false' in runtime_tail
         assert "target_text" not in runtime_tail
