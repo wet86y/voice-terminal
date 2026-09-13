@@ -16,8 +16,9 @@ venv/
 config/local.yaml
 *.part
 
-# Runtime output
-logs/
+# Runtime artifacts (always local; do not version generated logs or reports)
+/logs/
+/reports/
 *.log
 
 # IDE / OS files

@@ -84,8 +84,8 @@ match=True
 写入报告。由于旧日志没有保存精确取消时刻，复放允许所有请求跑到终态；因此它适合测输出格式和请求密度，
 不能复原原会话的取消率、听见边界或播放队列状态。
 
-完整 1× 节奏报告：
-[`reports/real-frequency-json-replay-20260911.json`](../../reports/real-frequency-json-replay-20260911.json)
+完整 1× 节奏报告生成于本地固定目录 `reports/`：
+`real-frequency-json-replay-20260911.json`。该目录是忽略追踪的运行产物，报告不随仓库分发。
 
 | 指标 | 结果 |
 | --- | ---: |
@@ -108,8 +108,8 @@ match=True
 这 15 个包含截断正文或推理过程。该检查支持“相当一部分失败只是信封丢失，正文完整”的判断，但不能据此
 把任意纯文本都当作安全输出。
 
-兼容候选复放报告：
-[`reports/real-frequency-json-compatibility-candidate-20260911.json`](../../reports/real-frequency-json-compatibility-candidate-20260911.json)
+兼容候选复放报告生成于本地 `reports/`：
+`real-frequency-json-compatibility-candidate-20260911.json`（忽略追踪，不随仓库分发）。
 
 该次 95 请求中有 19 个严格失败，保守解析器恢复 16 个（84.2%）：14 个完整中文自然语言、2 个缺
 `actions`。其余 3 个包含两个“正文混入 JSON 容器”与一个额外闭合符/容器歧义，全部拒绝。注意 20×
@@ -138,8 +138,8 @@ Responses 严格解析失败后会尝试一次本地兼容解析；成功时记�
 语音，也不会调用 action runtime。事件同时带有 `actions_executed=0` 和 `next_dispatch=heartbeat`，供 UI、审计和
 下一次普通心跳使用。`speak` 缺失、为空、state/emotion 不合法或尚未入队时仍保持原有恢复路径。
 
-接入后的 95 请求压缩复放报告：
-[`reports/real-frequency-json-bounded-repair-20260911.json`](../../reports/real-frequency-json-bounded-repair-20260911.json)
+接入后的 95 请求压缩复放报告生成于本地 `reports/`：
+`real-frequency-json-bounded-repair-20260911.json`（忽略追踪，不随仓库分发）。
 
 该次随机样本有 13 个严格失败：11 个完整普通正文、1 个不完整容器、1 个损坏容器；有界 JSON 修复命中
 为 0。这说明当前改动不会覆盖仍占主导的“完全丢失 JSON 外壳”，短期不应预期总体无回应率大幅下降；它
@@ -233,7 +233,7 @@ provider stream 入口，使用互斥提示词，不能作为第二个 scheduler
 
 ### 2026-09-09 Chat Completions 空白风暴
 
-历史报告 [`reports/recovery-context-and-prompt-analysis-20260910.md`](../../reports/recovery-context-and-prompt-analysis-20260910.md)
+历史本地报告 `reports/recovery-context-and-prompt-analysis-20260910.md`（忽略追踪，不随仓库分发）
 记录的是 Chat Completions/`json_object` 返回纯空白 content，加上无上限同态恢复形成请求风暴。
 
 当前问题不同：
@@ -246,8 +246,8 @@ provider stream 入口，使用互斥提示词，不能作为第二个 scheduler
 
 ### strict Schema capability probe
 
-[`reports/deepseek-current-schema-acceptance-20260910.json`](../../reports/deepseek-current-schema-acceptance-20260910.json)
-和 [`reports/responses-schema-capabilities-implementation-20260910.json`](../../reports/responses-schema-capabilities-implementation-20260910.json)
+本地 `reports/` 中的 `deepseek-current-schema-acceptance-20260910.json` 和
+`responses-schema-capabilities-implementation-20260910.json`（均忽略追踪，不随仓库分发）
 证明上游接受当前 schema 请求，且少量样本可以返回合法信封。它们没有证明 strict schema 在长会话中
 被稳定强制执行，也不能代替迁移 runbook 规定的 300 次可靠性验收。
 
