@@ -23,7 +23,11 @@ from .decision_envelope import (
 from .decision_schema import THINKING_ACTION, decision_schema
 from .persona import PersonaDocumentLoader, PersonaDocuments
 from .sentences import map_refinement
-from ..session.context import CurrentInput, LLMContextProjector
+from ..session.context import (
+    CURRENT_USER_INPUT_TYPE, FINAL_OUTPUT_CONSTRAINT, OUTPUT_CONSTRAINT_KIND,
+    VOICE_REQUEST_CONTEXT_TYPE, CurrentInput, LLMContextProjector,
+    consolidate_request_tail,
+)
 from ..session.context_frames import ContextFrame, ContextLane
 from ..session.runtime import ConversationRuntime
 from ..shadow_agent.contracts import ShadowEvent, parse_shadow_wake
@@ -2477,15 +2481,59 @@ class AgentEpisodeRuntime:
             self._update_context_metrics(projected, schemas)
             if self.context_token_estimate <= self.options.max_context_tokens:
                 return projected, changes
-            snapshot_message = projected[-1]
-            try:
-                snapshot = json.loads(snapshot_message.get("content", ""))
-                inputs = snapshot.get("inputs") if isinstance(snapshot, dict) else None
-            except (TypeError, ValueError):
-                inputs = None
+            current_message = next((
+                frame for frame in reversed(projected)
+                if ContextFrame.kind_of(frame) == CURRENT_USER_INPUT_TYPE
+            ), None)
+            if current_message is not None:
+                try:
+                    current_envelope = json.loads(current_message.get("content", ""))
+                except (TypeError, ValueError):
+                    current_envelope = None
+                current_text = (
+                    current_envelope.get("content") if isinstance(current_envelope, dict) else None
+                )
+                if isinstance(current_text, str) and len(current_text) > 1024:
+                    current_envelope["content"] = "…[truncated]" + current_text[len(current_text) // 2:]
+                    current_message["content"] = json.dumps(
+                        current_envelope, ensure_ascii=False, separators=(",", ":"),
+                    )
+                    changes["truncated_current_input"] = True
+                    continue
+
+            packet_message = next((
+                frame for frame in reversed(projected)
+                if ContextFrame.kind_of(frame) == VOICE_REQUEST_CONTEXT_TYPE
+            ), None)
+            packet = None
+            entries = None
+            if packet_message is not None:
+                try:
+                    packet = json.loads(packet_message.get("content", ""))
+                    entries = packet.get("entries") if isinstance(packet, dict) else None
+                except (TypeError, ValueError):
+                    entries = None
+            snapshot_entry = None
+            snapshot = None
+            inputs = None
+            if isinstance(entries, list):
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        candidate = json.loads(str(entry.get("content") or ""))
+                    except (TypeError, ValueError):
+                        continue
+                    candidate_inputs = candidate.get("inputs") if isinstance(candidate, dict) else None
+                    if isinstance(candidate_inputs, dict):
+                        snapshot_entry, snapshot, inputs = entry, candidate, candidate_inputs
+                        break
             if isinstance(inputs, dict) and len(inputs) > 1:
                 inputs.pop(next(iter(inputs)))
-                snapshot_message["content"] = json.dumps(snapshot, ensure_ascii=False)
+                snapshot_entry["content"] = json.dumps(snapshot, ensure_ascii=False)
+                packet_message["content"] = json.dumps(
+                    packet, ensure_ascii=False, separators=(",", ":"),
+                )
                 changes["dropped_inputs"] += 1
                 continue
             if isinstance(inputs, dict) and inputs:
@@ -2493,7 +2541,10 @@ class AgentEpisodeRuntime:
                 text = latest.get("text") if isinstance(latest, dict) else None
                 if isinstance(text, str) and len(text) > 1024:
                     latest["text"] = "…[truncated]" + text[len(text) // 2:]
-                    snapshot_message["content"] = json.dumps(snapshot, ensure_ascii=False)
+                    snapshot_entry["content"] = json.dumps(snapshot, ensure_ascii=False)
+                    packet_message["content"] = json.dumps(
+                        packet, ensure_ascii=False, separators=(",", ":"),
+                    )
                     changes["truncated_current_input"] = True
                     continue
             # A system/schema-only request cannot be usefully reduced. The
@@ -2548,13 +2599,85 @@ class AgentEpisodeRuntime:
     def _guard_context_contract(self, messages) -> None:
         """Fail fast if a request would invalidate the cacheable prefix."""
 
+        lanes = [ContextFrame.lane_of(frame) for frame in messages]
         for frame in messages:
-            ContextFrame.lane_of(frame)
+            ContextFrame.kind_of(frame)
+        seen_non_static = False
+        seen_tail = False
+        for lane in lanes:
+            if lane == ContextLane.STATIC_INSTRUCTIONS:
+                if seen_non_static:
+                    raise RuntimeError("static instructions must precede history and request tail")
+                continue
+            seen_non_static = True
+            if lane == ContextLane.HISTORY:
+                if seen_tail:
+                    raise RuntimeError("history frames cannot follow request tail")
+                continue
+            seen_tail = True
         static = [frame for frame in messages if ContextFrame.lane_of(frame) == ContextLane.STATIC_INSTRUCTIONS]
         history = [frame for frame in messages if ContextFrame.lane_of(frame) == ContextLane.HISTORY]
         tail = [frame for frame in messages if ContextFrame.lane_of(frame) == ContextLane.REQUEST_TAIL]
         if tail and messages.index(tail[0]) < (messages.index(history[-1]) if history else -1):
             raise RuntimeError("request tail must follow all history frames")
+        constraint = [
+            frame for frame in tail
+            if ContextFrame.kind_of(frame) == OUTPUT_CONSTRAINT_KIND
+        ]
+        if len(constraint) != 1 or not messages or messages[-1] is not constraint[0]:
+            raise RuntimeError("request tail must end with exactly one output constraint")
+        if constraint[0].get("role") != "system" or constraint[0].get("content") != FINAL_OUTPUT_CONSTRAINT:
+            raise RuntimeError("request output constraint changed")
+        packets = [
+            frame for frame in tail
+            if ContextFrame.kind_of(frame) == VOICE_REQUEST_CONTEXT_TYPE
+        ]
+        if len(packets) != 1 or len(tail) < 2 or tail[-2] is not packets[0]:
+            raise RuntimeError("request context packet must immediately precede output constraint")
+        try:
+            packet = json.loads(str(packets[0].get("content") or ""))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("request context packet must be valid JSON") from exc
+        entries = packet.get("entries") if isinstance(packet, dict) else None
+        if (
+            not isinstance(packet, dict)
+            or packet.get("type") != VOICE_REQUEST_CONTEXT_TYPE
+            or packet.get("version") != 1
+            or not isinstance(entries, list)
+        ):
+            raise RuntimeError("request context packet has an invalid envelope")
+        for index, entry in enumerate(entries):
+            if (
+                not isinstance(entry, dict)
+                or entry.get("index") != index
+                or not isinstance(entry.get("kind"), str)
+                or not entry.get("kind")
+                or not isinstance(entry.get("content"), str)
+            ):
+                raise RuntimeError("request context packet has an invalid entry")
+        current_users = [
+            frame for frame in tail
+            if ContextFrame.kind_of(frame) == CURRENT_USER_INPUT_TYPE
+        ]
+        if len(current_users) > 1:
+            raise RuntimeError("request tail may contain at most one current user input")
+        expected_tail = [*current_users, packets[0], constraint[0]]
+        if tail != expected_tail:
+            raise RuntimeError("request tail contains an unwrapped or misplaced frame")
+        if current_users:
+            current_frame = current_users[0]
+            try:
+                current = json.loads(str(current_frame.get("content") or ""))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("current user input must be valid JSON") from exc
+            if (
+                current_frame.get("role") != "user"
+                or not isinstance(current, dict)
+                or current.get("type") != CURRENT_USER_INPUT_TYPE
+                or current.get("version") != 1
+                or not isinstance(current.get("content"), str)
+            ):
+                raise RuntimeError("current user input has an invalid envelope")
         static_digest = self._canonical_digest(static)
         if self.static_context_digest is not None and self.static_context_digest != static_digest:
             raise RuntimeError("static instructions changed during a session")
@@ -2697,6 +2820,7 @@ class AgentEpisodeRuntime:
             messages.append(ContextFrame.make(
                 ContextLane.REQUEST_TAIL, "system", "上一轮模型调用存在已被本地安全修复的轻度协议偏差；"
                 "此次请遵守该字段约束，不需要为它重复回答：" + json.dumps(repairs, ensure_ascii=False),
+                context_kind="minor_protocol_feedback",
             ))
         if recovery_signal is not None:
             feedback = {
@@ -2707,6 +2831,7 @@ class AgentEpisodeRuntime:
             }
             messages.append(ContextFrame.make(
                 ContextLane.REQUEST_TAIL, "system", "即时恢复反馈：" + json.dumps(feedback, ensure_ascii=False),
+                context_kind="immediate_recovery",
             ))
         elif self.deferred_recovery_feedback:
             # Recovery exhaustion does not wake the model.  The latest failure
@@ -2720,6 +2845,7 @@ class AgentEpisodeRuntime:
                     "source_request_id": deferred.source_request_id,
                     "instruction": self._recovery_instruction(deferred.code, deferred=True),
                 }, ensure_ascii=False),
+                context_kind="deferred_recovery",
             ))
         speak_state = self._model_speak_state(
             getattr(self.output, "speak_snapshot", {"queue_status": "empty", "text_only_queue": True}),
@@ -2733,6 +2859,7 @@ class AgentEpisodeRuntime:
                 calendar_epoch=self.conversation.calendar_epoch_if_changed(),
                 shadow=self.ledger.shadow_runtime_tail(),
             ) + "\n工具可用性：" + json.dumps(self._tool_availability(), ensure_ascii=False, separators=(",", ":")),
+            context_kind="runtime_state",
         ))
         pending = self._thinking_pending_by_turn.get(model_turn_id)
         if pending:
@@ -2740,6 +2867,7 @@ class AgentEpisodeRuntime:
                 ContextLane.REQUEST_TAIL, "system",
                 "工具状态：以下工具仍在处理中，尚无结果：" + json.dumps(pending, ensure_ascii=False)
                 + "。本轮请基于已知信息及时回应，不得虚构工具结果；减少继续推理，等待后续普通事件提供资料。",
+                context_kind="pending_tools",
             ))
         if prompt_kind in {"forced_poll", "final_silence"}:
             context = force_context if isinstance(force_context, dict) else {}
@@ -2754,7 +2882,9 @@ class AgentEpisodeRuntime:
                 ContextLane.REQUEST_TAIL, "system",
                 instruction + "\n调度上下文（仅供本次评估，不是新的用户输入）："
                 + json.dumps(details, ensure_ascii=False),
+                context_kind=prompt_kind,
             ))
+        messages = consolidate_request_tail(messages)
         self._guard_context_contract(messages)
         self._update_context_metrics(messages)
         return messages

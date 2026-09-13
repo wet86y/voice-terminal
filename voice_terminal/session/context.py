@@ -11,6 +11,104 @@ from .ledger import SessionLedger
 from .context_frames import ContextFrame, ContextLane
 
 
+CURRENT_USER_INPUT_TYPE = "current_user_input"
+VOICE_REQUEST_CONTEXT_TYPE = "voice_request_context"
+OUTPUT_CONSTRAINT_KIND = "output_constraint"
+REQUEST_SYSTEM_CONTEXT_KINDS = frozenset({
+    "minor_protocol_feedback",
+    "immediate_recovery",
+    "deferred_recovery",
+    "runtime_state",
+    "pending_tools",
+    "forced_poll",
+    "final_silence",
+    "system_context",
+})
+FINAL_OUTPUT_CONSTRAINT = (
+    "输出约束：最终 output_text 必须且只能是一个符合 voice_decision_v06 的完整 JSON 对象。"
+    "首个非空白字符必须是 {，末个非空白字符必须是 }。禁止输出解释、道歉、开场白、"
+    "Markdown、代码围栏或 JSON 之外的任何文字。"
+)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def wrap_current_user_input(content: str) -> str:
+    """Wrap volatile user text without changing any of its content."""
+
+    return _canonical_json({
+        "type": CURRENT_USER_INPUT_TYPE,
+        "version": 1,
+        "content": content,
+    })
+
+
+def consolidate_request_tail(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Return a lossless, canonical request tail followed by the output guard."""
+
+    prefix: list[dict[str, str]] = []
+    current_users: list[dict[str, Any]] = []
+    system_entries: list[dict[str, Any]] = []
+    tail_started = False
+    for raw in messages:
+        frame = dict(raw)
+        lane = ContextFrame.lane_of(frame)
+        if lane != ContextLane.REQUEST_TAIL:
+            if tail_started:
+                raise RuntimeError("non-tail frame cannot follow request tail")
+            prefix.append(frame)
+            continue
+        tail_started = True
+        role = str(frame.get("role") or "")
+        kind = ContextFrame.kind_of(frame)
+        content = str(frame.get("content") or "")
+        if role == "user":
+            if system_entries:
+                raise RuntimeError("current user input must precede request system context")
+            current_users.append(frame)
+            continue
+        if role != "system":
+            raise RuntimeError("request tail supports only user and system frames")
+        if kind in {VOICE_REQUEST_CONTEXT_TYPE, OUTPUT_CONSTRAINT_KIND}:
+            raise RuntimeError("request tail was already consolidated")
+        system_entries.append({
+            "index": len(system_entries),
+            "kind": kind if kind in REQUEST_SYSTEM_CONTEXT_KINDS else "system_context",
+            "content": content,
+        })
+    if len(current_users) > 1:
+        raise RuntimeError("request tail may contain at most one current user input")
+
+    result = list(prefix)
+    if current_users:
+        current = current_users[0]
+        result.append(ContextFrame.make(
+            ContextLane.REQUEST_TAIL,
+            "user",
+            wrap_current_user_input(str(current.get("content") or "")),
+            context_kind=CURRENT_USER_INPUT_TYPE,
+        ))
+    result.append(ContextFrame.make(
+        ContextLane.REQUEST_TAIL,
+        "system",
+        _canonical_json({
+            "type": VOICE_REQUEST_CONTEXT_TYPE,
+            "version": 1,
+            "entries": system_entries,
+        }),
+        context_kind=VOICE_REQUEST_CONTEXT_TYPE,
+    ))
+    result.append(ContextFrame.make(
+        ContextLane.REQUEST_TAIL,
+        "system",
+        FINAL_OUTPUT_CONSTRAINT,
+        context_kind=OUTPUT_CONSTRAINT_KIND,
+    ))
+    return result
+
+
 @dataclass(frozen=True)
 class CurrentInput:
     text: str = ""
@@ -131,5 +229,8 @@ class LLMContextProjector:
                 )
             else:
                 content = primary
-            messages.append(ContextFrame.make(ContextLane.REQUEST_TAIL, "user", content))
+            messages.append(ContextFrame.make(
+                ContextLane.REQUEST_TAIL, "user", content,
+                context_kind=CURRENT_USER_INPUT_TYPE,
+            ))
         return messages

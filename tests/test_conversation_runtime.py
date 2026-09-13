@@ -57,5 +57,6 @@ def test_context_projection_keeps_identical_text_for_a_new_turn() -> None:
     assert user_messages == [
         {"role": "user", "content": '用户语音最终文本：{"asr_final":"重复文本"}',
          "context_lane": ContextLane.HISTORY},
-        {"role": "user", "content": "重复文本", "context_lane": ContextLane.REQUEST_TAIL},
+        {"role": "user", "content": "重复文本", "context_lane": ContextLane.REQUEST_TAIL,
+         "context_kind": "current_user_input"},
     ]
