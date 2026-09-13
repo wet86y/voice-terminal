@@ -942,23 +942,28 @@ def test_system_check_recovery_signal_keeps_immutable_owner_metadata():
         runtime._system_check_turn_ids.add("system-check-a")
         runtime.active_dispatch_context = {
             "system_check_id": "system-check-a",
+            "speech_turn_id": "turn-a",
             "dispatch_kind": "forced_poll",
             "prompt_kind": "forced_poll",
+            "owner_scope": "system_check",
             "generation": 1,
             "window_index": 3,
         }
+        runtime.active_request_identity = (runtime.episode_id, "request-a")
         # Keep this focused on signal construction rather than starting the
         # asynchronous runner in the background.
         runtime.runner = SimpleNamespace(done=lambda: False)
 
         signal = await runtime._queue_recovery(
             "SPEAK_ENVELOPE_INVALID", "invalid json",
-            identity=(runtime.episode_id, "request-a"), turn_id="system-check-a",
+            identity=(runtime.episode_id, "request-a"), turn_id="turn-a",
         )
 
         assert signal is not None
         assert signal.system_check_id == "system-check-a"
         assert signal.owner_scope == "system_check"
+        assert signal.source_turn_id == "turn-a"
+        assert signal.dispatch_context["speech_turn_id"] == "turn-a"
         assert signal.dispatch_context["window_index"] == 3
 
     asyncio.run(scenario())

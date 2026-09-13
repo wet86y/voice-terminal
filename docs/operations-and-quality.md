@@ -66,22 +66,22 @@ git diff --check
 ```
 
 调度器验收必须确认当前只有一个 `AgentDecisionScheduler` 和一个 Agent `_run()` 循环。400ms
-heartbeat 使用从上一个 deadline 推进的固定时间轴，不能等待 active LLM、TTS 播放或 provider
+heartbeat 由每 Episode 的 daemon clock thread 以 `time.monotonic()` 维护绝对时间轴，通过容量为 1 的邮箱向主 event loop 投递合并 pulse；它不能等待 active LLM、TTS 播放或 provider
 返回，也不能因为 heartbeat 本身增加 provider 请求。普通事件在400ms边界合并并优先于同边界
 的强制窗口；无普通语义事件时才允许第3、6、9、16、22窗口的 `forced_poll`，第25窗口的
-`final_silence` 只能消费一次。两个分支的 busy 规则不得混用：`forced_poll` 窗口忙碌时当场跳过且不补发；`final_silence` 最终窗口忙碌时保留到恢复空闲后只补发一次。若等待期间出现新的有效用户输入，撤销的只是尚未发出的旧 `final_pending`，并从新输入重新计时。
+`final_silence` 只能消费一次。`forced_poll` 在 active LLM 时记为 `covered_by_active_request`、在 provider backoff 时记为 `skipped_backoff`，当场结束且不补发；`final_silence` 在这两种状态下保留到恢复空闲后只补发一次。TTS 和用户讲话不属于 dispatch busy。若等待期间出现新的有效用户输入，撤销的只是尚未发出的旧 `final_pending`，并从新输入重新计时。
 
 TTS 开始、结束、取消、替换、失败和语音活动不属于普通调度事件，不重置用户静默锚点，也不
-触发 provider；TTS 状态只负责阻止实际 dispatch。普通、`forced_poll` 和 `final_silence` 三类
+触发 provider；TTS 状态和用户讲话只影响本地播放，不阻止实际 LLM dispatch。普通、`forced_poll` 和 `final_silence` 三类
 请求必须共用 `_step()`、`_provider_stream()`、原有 schema/transport/reasoning 和 TTS 输出协议。
-普通、异常恢复、`forced_poll` 和 `final_silence` 请求一旦启动，新的 final/refined 输入只能进入统一心跳邮箱，不得取消 provider task，也不得以 scheduler generation 变化提前结束已启动的 system-check。本规则不改变尚未创建 provider task 的候选恢复项之既有淘汰规则，也不改变 barge-in、reset、stop、输入不可用或 episode end 的显式生命周期取消。只有 LLM 自然结束且本地输出校验失败时，才允许进入有界异常恢复链路。
-system-check 必须使用独立 `system_check_id`，不创建用户 `InputRecord` 或用户 turn 结算；只有
+普通、异常恢复、`forced_poll` 和 `final_silence` 请求一旦启动，新的 final/refined 输入只能进入统一心跳邮箱，不取消 provider task。scheduler generation 变化会使旧 system-check 输出失效：未播输出被取消，之后到达的 speak/action 被丢弃，provider task 本身仍自然结束并完成审计。本规则不改变尚未创建 provider task 的候选恢复项之既有淘汰规则，也不改变 barge-in、reset、stop、输入不可用或 episode end 的显式生命周期取消。只有非过期 LLM 自然结束且本地输出校验失败时，才允许进入有界异常恢复链路。
+system-check 必须使用独立 `system_check_id` 记录系统发起人，并以 scheduler generation 的真实 `speech_turn_id` 维护标准 `runtime.speak`；它不创建用户 `InputRecord` 或用户 turn 结算，只有
 已被听到的输出才进入 assistant ledger。reset、stop 和 episode end 后应清理 heartbeat、runner、
 active request 与 scheduler 状态。
 
 ASR 更新验收必须分别覆盖 Paraformer final 单独到达、SenseVoice refinement 后到、二者同一 400ms 窗口、相同文本以及晚到旧轮 refinement。每个首次合法 source revision 都必须进入同一 `turn_id` 的 `transcript_updates`；相同 provider callback 才允许按 revision 幂等去除，不得以规范化文本相同为由吞掉更新。检查 `transcript.update` 与 `transcript.dispatch` 日志中的 kind、revision、`available`、`triggered_by` 和 `same_turn`，不得再依赖 `confirmed/suffix/rewrite`。
 
-delivery 验收应构造 provider 字幕全部落在播放器时长之外而 PCM/设备尾部完整输出的场景，最终必须为 `full + playback_complete + completed_playback_authoritative`。同时检查 `speech.settling_started → speech.history_committed → speech.settling_finished` 顺序；在 history commit 返回前，即使 400ms heartbeat 已到，scheduler 也必须因 TTS busy 而拒绝 dispatch。同一 `speech_id` 重放 completion 时，assistant ledger 必须恰好只有一条记录。中断、替换、零 PCM 与播放失败不得使用完整播放兜底。
+delivery 验收应构造 provider 字幕全部落在播放器时长之外而 PCM/设备尾部完整输出的场景，最终必须为 `full + playback_complete + completed_playback_authoritative`。同时检查 `speech.settling_started → speech.history_committed → speech.settling_finished` 顺序；在 history commit 返回前，400ms heartbeat 和 LLM dispatch 仍可继续，但 assistant ledger 不得提前写入或重复写入。同一 `speech_id` 重放 completion 时，assistant ledger 必须恰好只有一条记录。中断、替换、零 PCM 与播放失败不得使用完整播放兜底。
 
 软件通过后仍必须在真实设备完成：[V0.6 可靠性审计](v06-reliability-audit.md)
 定义的核心 10 条人工验收，覆盖自然语音、耳机和扬声器下的打断、连续多轮、
