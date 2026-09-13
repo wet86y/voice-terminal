@@ -31,10 +31,10 @@ V0.6 以 JSON 响应信封取代 DeepSeek 原生工具调用，但不移除已�
 
 ### 当前单一400ms调度边界
 
-当前 Agent 不再依赖事件到达后才继续等待的单纯唤醒模型，而是由唯一的 `_run()` 循环持续推进本地400ms heartbeat。heartbeat 只推进 deadline、整理 mailbox 和检查本地 busy 状态；它不等待 active LLM、不等待 TTS 播放，也不建立第二个 watchdog。`active_request` 始终是独立 task，单请求约束仍为 `max_request_concurrency == 1`。
+当前 Agent 由每个 Episode 的 daemon clock thread 使用 `time.monotonic()` 维护绝对400ms heartbeat，线程只通过容量为 1 的合并邮箱投递 pulse。唯一 `_run()` 主 event-loop 循环仍串行推进 scheduler、整理 mailbox 和启动 LLM；它不使用 timeout 模拟心跳，也不等待 TTS 播放。线程不读写会话或 provider 状态，不建立第二个 LLM event loop。`active_request` 始终是独立 task，单请求约束仍为 `max_request_concurrency == 1`。
 
-每个首次合法的非空 `USER_INPUT_FINALIZED` 或 `USER_INPUT_REFINED` 都会重新开始静默阶梯，不要求本地先证明语义发生变化。没有普通语义事件时，第3、6、9、16、22窗口发起 `forced_poll`，第25窗口发起一次 `final_silence`；第10窗口只切换到慢速阶段。普通事件与强制窗口同边界时，普通调度覆盖强制窗口并记录 `covered_by_normal_dispatch`，不会创建 system-check，也不会补发强制请求。普通强制窗口在 active LLM、TTS/待播/settling 内容或用户输入繁忙时跳过；最终窗口在这些状态下保留，恢复空闲后只消费一次。
+每个首次合法的非空 `USER_INPUT_FINALIZED` 或 `USER_INPUT_REFINED` 都会重新开始静默阶梯，不要求本地先证明语义发生变化。没有普通语义事件时，第3、6、9、16、22窗口发起 `forced_poll`，第25窗口发起一次 `final_silence`；第10窗口只切换到慢速阶段。普通事件与强制窗口同边界时，普通调度覆盖强制窗口并记录 `covered_by_normal_dispatch`，不会创建 system-check，也不会补发强制请求。普通强制窗口只在 active LLM 时记为 `covered_by_active_request`，或在 provider backoff 时记为 `skipped_backoff`；TTS 和用户讲话不参与该决定。最终窗口在 active LLM 或 backoff 时保留，恢复空闲后只消费一次。
 
-`TTS_*` 和语音活动不会成为普通语义事件，不更新静默锚点，也不会触发 provider。TTS 状态只作为 dispatch 门槛。`forced_poll` 与 `final_silence` 使用互斥的 request-tail 提示词，均复用普通 `_step()`、`_provider_stream()`、provider schema/transport/reasoning 和 `EpisodeSpeechOutput`；system-check 不开始用户 turn、不创建 `InputRecord`，已听到的输出才写入 assistant ledger。
+`TTS_*` 和语音活动不会成为普通语义事件，不更新静默锚点，也不会单独触发 provider；它们同时不能作为任何 LLM dispatch 的门槛。`forced_poll` 与 `final_silence` 使用互斥的 request-tail 提示词，均复用普通 `_step()`、`_provider_stream()`、provider schema/transport/reasoning 和 `EpisodeSpeechOutput`；system-check 保留独立 `system_check_id`，但以当前 scheduler generation 的真实 `speech_turn_id` 维护标准 `runtime.speak`。它不开始用户 turn、不创建 `InputRecord`，已听到的输出才写入 assistant ledger。
 
 真实设备仍须完成连续五轮、SenseVoice 修正、动作后回复、同前缀长播报追加、文本分歧改口、耳机/扬声器插话和停止监听验收。跨轮验收应确认 `owner_scope` 从 `current_turn` 正确切换为 `none/previous_turn`，新 TTS 只收到本轮文本；若模型仍累计输出，必须出现 `CROSS_TURN_SPEECH_PREFIX_STRIPPED` 且 suffix 之前没有旧 PCM。追加验收应确认同轮新事件中只有 suffix，且没有因普通补充产生 `speech.replaced` 或 `local_playback_stopped`。

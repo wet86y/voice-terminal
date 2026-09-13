@@ -9,7 +9,7 @@ import logging
 import math
 import time
 import unicodedata
-from threading import Lock
+from threading import Event, Lock, Thread
 from uuid import uuid4
 from dataclasses import dataclass
 
@@ -86,6 +86,7 @@ class RecoverySignal:
     dispatch_context: dict | None = None
     error_id: str = ""
     consumed: bool = False
+    queued_at_monotonic: float = 0.0
 
     def __post_init__(self):
         if not self.occurred_at:
@@ -94,6 +95,110 @@ class RecoverySignal:
             self.received_at = time.time()
         if not self.error_id:
             self.error_id = uuid4().hex
+        if not self.queued_at_monotonic:
+            self.queued_at_monotonic = time.monotonic()
+
+
+@dataclass(frozen=True)
+class HeartbeatPulse:
+    """One absolute clock pulse delivered to the asyncio scheduler loop."""
+
+    episode_generation: int
+    sequence: int
+    scheduled_at: float
+    coalesced_count: int = 0
+
+
+class EpisodeHeartbeatClock:
+    """Maintain a fixed monotonic heartbeat without touching runtime state.
+
+    The timer thread owns only its deadline, sequence, and one coalescing
+    mailbox.  The callback always runs on the owning asyncio event loop.
+    """
+
+    def __init__(self, *, interval: float, episode_generation: int, loop, callback):
+        self.interval = max(0.001, float(interval))
+        self.episode_generation = int(episode_generation)
+        self.loop = loop
+        self.callback = callback
+        self._stop = Event()
+        self._lock = Lock()
+        self._pending: HeartbeatPulse | None = None
+        self._callback_scheduled = False
+        self._thread = Thread(
+            target=self._run,
+            name=f"agent-heartbeat-{self.episode_generation}",
+            daemon=True,
+        )
+
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def join(self, timeout: float = 1.0) -> None:
+        if self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        deadline = time.monotonic() + self.interval
+        sequence = 0
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            if self._stop.wait(remaining):
+                return
+            now = time.monotonic()
+            periods = max(1, int(math.floor((now - deadline) / self.interval)) + 1)
+            sequence += periods
+            scheduled_at = deadline + (periods - 1) * self.interval
+            pulse = HeartbeatPulse(
+                episode_generation=self.episode_generation,
+                sequence=sequence,
+                scheduled_at=scheduled_at,
+                coalesced_count=periods - 1,
+            )
+            should_schedule = False
+            with self._lock:
+                if self._pending is not None:
+                    pulse = HeartbeatPulse(
+                        episode_generation=pulse.episode_generation,
+                        sequence=pulse.sequence,
+                        scheduled_at=pulse.scheduled_at,
+                        coalesced_count=(self._pending.coalesced_count
+                                         + pulse.coalesced_count + 1),
+                    )
+                self._pending = pulse
+                if not self._callback_scheduled:
+                    self._callback_scheduled = True
+                    should_schedule = True
+            if should_schedule:
+                try:
+                    self.loop.call_soon_threadsafe(self._deliver)
+                except RuntimeError:
+                    return
+            # Keep the absolute axis.  A suspended process may wake after many
+            # deadlines; advance directly to the first future one.
+            deadline += periods * self.interval
+
+    def _deliver(self) -> None:
+        with self._lock:
+            pulse = self._pending
+            self._pending = None
+            self._callback_scheduled = False
+        if pulse is not None and not self._stop.is_set():
+            self.callback(pulse)
+        should_schedule = False
+        with self._lock:
+            if self._pending is not None and not self._callback_scheduled and not self._stop.is_set():
+                self._callback_scheduled = True
+                should_schedule = True
+        if should_schedule:
+            self.loop.call_soon(self._deliver)
 
 
 class ProtocolError(ValueError):
@@ -170,7 +275,6 @@ class AgentDecisionScheduler:
     FORCE_WINDOWS = (3, 6, 9, 16, 22)
     FINAL_WINDOW = 25
     SLOW_STAGE_WINDOW = 10
-    PAUSE_RESET_SECONDS = 4.0
     TTS_EVENTS = frozenset({
         "TTS_STARTED", "TTS_COMPLETED", "TTS_CANCELLED", "TTS_REPLACED",
         "TTS_FAILED", "TTS_SEGMENT", "TTS_PLAYBACK_STARTED", "TTS_PLAYBACK_ENDED",
@@ -187,15 +291,21 @@ class AgentDecisionScheduler:
         self.next_heartbeat = None
         self.anchor_monotonic = None
         self.anchor_wall_time = None
+        self.anchor_turn_id: str | None = None
         self.window_index = 0
         self.armed = False
         self.final_pending = False
+        self.final_pending_since: float | None = None
         self.final_dispatched = False
         self.generation = 0
         self._forced_due_window = None
         self._covered_windows: list[int] = []
+        self._active_covered_windows: list[int] = []
         self._skipped_windows: list[int] = []
         self._dispatched_windows: list[int] = []
+        self._coalesced_windows: list[int] = []
+        self._newly_coalesced_windows: list[int] = []
+        self._resolutions: dict[int, str] = {}
         self.last_resolution = None
 
     def accepts(self, _kind):
@@ -259,31 +369,26 @@ class AgentDecisionScheduler:
         self.start_heartbeat(now)
         return max(0.0, now - self.next_heartbeat)
 
-    def reset_after_pause(self, now=None, *, wall_time=None) -> bool:
-        """Discard stale silence timing and begin a fresh post-pause ladder."""
-
-        now = time.monotonic() if now is None else float(now)
-        was_armed = self.armed
-        self.disarm()
-        if was_armed:
-            self.arm(now, wall_time=wall_time)
-        self.start_heartbeat(now)
-        return was_armed
-
-    def arm(self, now=None, *, wall_time=None):
+    def arm(self, now=None, *, wall_time=None, turn_id=None):
         """Arm a new ladder from a meaningful finalized/refined input."""
 
         now = time.monotonic() if now is None else float(now)
         self.anchor_monotonic = now
         self.anchor_wall_time = time.time() if wall_time is None else float(wall_time)
+        self.anchor_turn_id = turn_id
         self.window_index = 0
         self.armed = True
         self.final_pending = False
+        self.final_pending_since = None
         self.final_dispatched = False
         self._forced_due_window = None
         self._covered_windows.clear()
+        self._active_covered_windows.clear()
         self._skipped_windows.clear()
         self._dispatched_windows.clear()
+        self._coalesced_windows.clear()
+        self._newly_coalesced_windows.clear()
+        self._resolutions.clear()
         self.last_resolution = None
         self.generation += 1
         return self.generation
@@ -303,11 +408,49 @@ class AgentDecisionScheduler:
         target = max(0, int(math.floor((elapsed + 1e-9) / self.interval)))
         if target <= self.window_index:
             return None
+        previous = self.window_index
+        previous_due = self._forced_due_window
         self.window_index = target
-        self._forced_due_window = target if target in self.FORCE_WINDOWS else None
+        crossed = [
+            window for window in (*self.FORCE_WINDOWS, self.FINAL_WINDOW)
+            if previous < window <= target
+            and window not in self._resolutions
+        ]
+        self._newly_coalesced_windows = []
         if target >= self.FINAL_WINDOW and not self.final_dispatched:
+            if not self.final_pending:
+                self.final_pending_since = now
             self.final_pending = True
+        selected = self.FINAL_WINDOW if self.FINAL_WINDOW in crossed else (
+            max((window for window in crossed if window in self.FORCE_WINDOWS), default=None)
+        )
+        for window in crossed:
+            if window == selected:
+                continue
+            self._coalesced_windows.append(window)
+            self._newly_coalesced_windows.append(window)
+            self._resolutions[window] = "coalesced_after_delay"
+        if previous_due is not None and selected is not None and previous_due != selected:
+            self._coalesced_windows.append(previous_due)
+            self._newly_coalesced_windows.append(previous_due)
+            self._resolutions[previous_due] = "coalesced_after_delay"
+        self._forced_due_window = (
+            selected if selected in self.FORCE_WINDOWS else None
+        )
         return self.forced_due(now=now)
+
+    def take_newly_coalesced_windows(self):
+        windows = list(self._newly_coalesced_windows)
+        self._newly_coalesced_windows.clear()
+        return windows
+
+    def pending_checkpoint_windows(self):
+        windows = []
+        if self._forced_due_window is not None:
+            windows.append(self._forced_due_window)
+        if self.final_pending and not self.final_dispatched:
+            windows.append(self.FINAL_WINDOW)
+        return windows
 
     def normal_due(self, pending=None, *, at_heartbeat=True):
         """Whether pending ordinary work may be considered at this tick."""
@@ -333,11 +476,14 @@ class AgentDecisionScheduler:
         if self._forced_due_window is not None:
             covered.append(self._forced_due_window)
             self._covered_windows.append(self._forced_due_window)
+            self._resolutions[self._forced_due_window] = "covered_by_normal_dispatch"
             self._forced_due_window = None
         if include_final and self.final_pending and not self.final_dispatched:
             covered.append(self.FINAL_WINDOW)
             self._covered_windows.append(self.FINAL_WINDOW)
+            self._resolutions[self.FINAL_WINDOW] = "covered_by_normal_dispatch"
             self.final_pending = False
+            self.final_pending_since = None
             self.final_dispatched = True
         if covered:
             self.last_resolution = {
@@ -358,8 +504,10 @@ class AgentDecisionScheduler:
         self._forced_due_window = None
         if prompt_kind == "final_silence" or window == self.FINAL_WINDOW:
             self.final_pending = False
+            self.final_pending_since = None
             self.final_dispatched = True
             self._dispatched_windows.append(self.FINAL_WINDOW)
+            self._resolutions[self.FINAL_WINDOW] = "dispatched"
             self.last_resolution = {
                 "kind": "final_dispatched", "window_index": self.FINAL_WINDOW, "at": at,
             }
@@ -371,6 +519,7 @@ class AgentDecisionScheduler:
             self.disarm(preserve_final=True, preserve_heartbeat=True)
             return True
         self._dispatched_windows.append(window)
+        self._resolutions[window] = "dispatched"
         self.last_resolution = {"kind": "forced_dispatched", "window_index": window, "at": at}
         return True
 
@@ -386,8 +535,25 @@ class AgentDecisionScheduler:
             return False
         self._forced_due_window = None
         self._skipped_windows.append(window)
+        self._resolutions[window] = reason
         self.last_resolution = {
             "kind": "forced_skipped", "window_index": window, "reason": reason,
+            "at": time.monotonic() if now is None else float(now),
+        }
+        return True
+
+    def mark_forced_covered_by_active(self, candidate=None, *, now=None):
+        """Resolve an ordinary checkpoint covered by the single active LLM."""
+
+        window = int(candidate.get("window_index") or 0) if isinstance(candidate, dict) else 0
+        if not window or window == self.FINAL_WINDOW:
+            return False
+        self._forced_due_window = None
+        self._active_covered_windows.append(window)
+        self._resolutions[window] = "covered_by_active_request"
+        self.last_resolution = {
+            "kind": "covered_by_active_request",
+            "window_index": window,
             "at": time.monotonic() if now is None else float(now),
         }
         return True
@@ -397,6 +563,8 @@ class AgentDecisionScheduler:
             return False
         was_pending = self.final_pending
         self.final_pending = True
+        if not was_pending:
+            self.final_pending_since = time.monotonic()
         return not was_pending
 
     def disarm(self, *, preserve_final=False, preserve_heartbeat=False):
@@ -406,7 +574,9 @@ class AgentDecisionScheduler:
         self.armed = False
         self.anchor_monotonic = None
         self.anchor_wall_time = None
+        self.anchor_turn_id = None
         self.final_pending = False
+        self.final_pending_since = None
         self.final_dispatched = final_dispatched
         self._forced_due_window = None
         if not preserve_heartbeat:
@@ -415,15 +585,19 @@ class AgentDecisionScheduler:
         if not preserve_final:
             self.window_index = 0
             self._covered_windows.clear()
+            self._active_covered_windows.clear()
             self._skipped_windows.clear()
             self._dispatched_windows.clear()
+            self._coalesced_windows.clear()
+            self._newly_coalesced_windows.clear()
+            self._resolutions.clear()
             self.last_resolution = None
 
     def _descriptor(self, prompt_kind, window_index, now):
         elapsed = 0.0
         if self.anchor_monotonic is not None:
             elapsed = max(0.0, now - self.anchor_monotonic)
-        return {
+        descriptor = {
             "prompt_kind": prompt_kind,
             "dispatch_kind": prompt_kind,
             "window_index": int(window_index),
@@ -432,6 +606,10 @@ class AgentDecisionScheduler:
             "anchor_wall_time": self.anchor_wall_time,
             "generation": self.generation,
         }
+        if self.anchor_turn_id is not None:
+            descriptor["anchor_turn_id"] = self.anchor_turn_id
+            descriptor["speech_turn_id"] = self.anchor_turn_id
+        return descriptor
 
     def snapshot(self, now=None):
         now = time.monotonic() if now is None else float(now)
@@ -445,15 +623,23 @@ class AgentDecisionScheduler:
             "generation": self.generation,
             "anchor_monotonic": self.anchor_monotonic,
             "anchor_wall_time": self.anchor_wall_time,
+            "anchor_turn_id": self.anchor_turn_id,
             "window_index": self.window_index,
             "stage": "slow" if self.window_index >= self.SLOW_STAGE_WINDOW else "fast",
             "silence_elapsed_ms": silence_elapsed_ms,
             "final_pending": self.final_pending,
+            "final_pending_duration_ms": (
+                int(round(max(0.0, now - self.final_pending_since) * 1000))
+                if self.final_pending and self.final_pending_since is not None else 0
+            ),
             "final_dispatched": self.final_dispatched,
             "next_forced_window": self._forced_due_window,
             "covered_windows": list(self._covered_windows),
+            "active_covered_windows": list(self._active_covered_windows),
             "skipped_windows": list(self._skipped_windows),
             "dispatched_windows": list(self._dispatched_windows),
+            "coalesced_windows": list(self._coalesced_windows),
+            "resolutions": dict(self._resolutions),
             "last_resolution": dict(self.last_resolution) if isinstance(self.last_resolution, dict) else None,
         }
 
@@ -493,9 +679,16 @@ class AgentEpisodeRuntime:
         }
         self._completed_speech_ids: set[str] = set()
         self.pending = set()
+        self._pending_since: float | None = None
         self._pending_transcript_turn_id: str | None = None
         self.event_inbox = deque(maxlen=128)
         self.queue = asyncio.Queue(maxsize=1)
+        self.heartbeat_queue = asyncio.Queue(maxsize=1)
+        self._heartbeat_clock: EpisodeHeartbeatClock | None = None
+        self._heartbeat_episode_generation = 0
+        self._heartbeat_generated = 0
+        self._heartbeat_delivered = 0
+        self._heartbeat_coalesced = 0
         self.runner = None
         self.last_reasoning = None
         self.delay_task = None
@@ -515,6 +708,7 @@ class AgentEpisodeRuntime:
         self.active_dispatch_context: dict | None = None
         self._system_check_turn_ids: set[str] = set()
         self._system_check_output_turn_ids: set[str] = set()
+        self._system_check_speeches: dict[str, dict] = {}
         self.closed = False
         self.request_count = 0
         self.active_request_count = 0
@@ -555,6 +749,117 @@ class AgentEpisodeRuntime:
         self._frozen_tool_catalog: tuple[dict, ...] | None = None
         self._frozen_thinking_action_enabled: bool | None = None
 
+    def _ensure_runner(self) -> None:
+        if self.closed or self.episode_id is None:
+            return
+        if self._heartbeat_clock is None:
+            clock = self._start_heartbeat_clock_sync()
+            if clock is not None:
+                asyncio.create_task(self.log(
+                    "SCHEDULER_HEARTBEAT_THREAD_STARTED",
+                    episode_generation=clock.episode_generation,
+                    interval_ms=int(round(self.scheduler.interval * 1000)),
+                ))
+        if self.runner is None or self.runner.done():
+            self.runner = asyncio.create_task(self._run(), name="agent-episode")
+
+    def _receive_heartbeat_pulse(self, pulse: HeartbeatPulse) -> None:
+        """Publish one clock pulse into the loop-owned capacity-one mailbox."""
+
+        if (
+            self.closed or self.episode_id is None
+            or pulse.episode_generation != self._heartbeat_episode_generation
+        ):
+            try:
+                asyncio.get_running_loop().create_task(self.log(
+                    "SCHEDULER_HEARTBEAT_STALE",
+                    episode_generation=pulse.episode_generation,
+                    pulse_sequence=pulse.sequence,
+                ))
+            except RuntimeError:
+                pass
+            return
+        self._heartbeat_generated = max(self._heartbeat_generated, pulse.sequence)
+        coalesced = pulse.coalesced_count
+        if self.heartbeat_queue.full():
+            try:
+                previous = self.heartbeat_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                previous = None
+            if isinstance(previous, HeartbeatPulse):
+                coalesced += previous.coalesced_count + 1
+        delivered = HeartbeatPulse(
+            episode_generation=pulse.episode_generation,
+            sequence=pulse.sequence,
+            scheduled_at=pulse.scheduled_at,
+            coalesced_count=coalesced,
+        )
+        self.heartbeat_queue.put_nowait(delivered)
+        self._ensure_runner()
+
+    def _start_heartbeat_clock_sync(self):
+        if self._heartbeat_clock is not None:
+            return None
+        self._heartbeat_episode_generation += 1
+        generation = self._heartbeat_episode_generation
+        loop = asyncio.get_running_loop()
+        self.scheduler.start_heartbeat(time.monotonic())
+        clock = EpisodeHeartbeatClock(
+            interval=self.scheduler.interval,
+            episode_generation=generation,
+            loop=loop,
+            callback=self._receive_heartbeat_pulse,
+        )
+        self._heartbeat_clock = clock
+        try:
+            clock.start()
+        except Exception as exc:
+            self._heartbeat_clock = None
+            logger.exception("agent.heartbeat_thread_start_failed")
+            asyncio.create_task(self.log(
+                "SCHEDULER_HEARTBEAT_THREAD_ERROR",
+                episode_generation=generation,
+                phase="start",
+                error_type=type(exc).__name__,
+            ))
+            return None
+        return clock
+
+    async def _start_heartbeat_clock(self) -> None:
+        clock = self._start_heartbeat_clock_sync()
+        if clock is None:
+            return
+        await self.log(
+            "SCHEDULER_HEARTBEAT_THREAD_STARTED",
+            episode_generation=clock.episode_generation,
+            interval_ms=int(round(self.scheduler.interval * 1000)),
+        )
+
+    async def _stop_heartbeat_clock(self) -> None:
+        clock = self._heartbeat_clock
+        if clock is None:
+            return
+        self._heartbeat_clock = None
+        clock.stop()
+        await asyncio.to_thread(clock.join)
+        while not self.heartbeat_queue.empty():
+            try:
+                self.heartbeat_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        await self.log(
+            "SCHEDULER_HEARTBEAT_THREAD_STOPPED",
+            episode_generation=clock.episode_generation,
+            thread_alive=clock.alive,
+        )
+        if clock.alive:
+            await self.log(
+                "SCHEDULER_HEARTBEAT_THREAD_ERROR",
+                episode_generation=clock.episode_generation,
+                phase="stop",
+                error_type="join_timeout",
+            )
+
     def snapshot(self, *, include_history=True):
         value = {"conversation_id": self.episode_id, "trace_id": self.agent_step_id,
                 "request_id": self.agent_step_id,
@@ -570,7 +875,16 @@ class AgentEpisodeRuntime:
                  "reasoning": self.last_reasoning,
                   "thinking_lease_turn": self._thinking_lease_turn,
                   "reasoning_mode": self.reasoning_mode,
-                  "scheduler": self.scheduler.snapshot()}
+                  "scheduler": self.scheduler.snapshot(),
+                  "heartbeat": {
+                      "episode_generation": self._heartbeat_episode_generation,
+                      "generated": self._heartbeat_generated,
+                      "delivered": self._heartbeat_delivered,
+                      "coalesced": self._heartbeat_coalesced,
+                      "timer_thread_alive": bool(
+                          self._heartbeat_clock and self._heartbeat_clock.alive
+                      ),
+                  }}
         value.update(context_limited=self.context_limited,
                     context_limit_reason=self.context_limit_reason,
                     context_compacted=self.context_compacted,
@@ -636,10 +950,16 @@ class AgentEpisodeRuntime:
             "SPEAK_CONFIRMATION_MISSING", "SPEAK_PROTOCOL_ERROR", "TOOL_PROTOCOL_ERROR",
             "LLM_RECOVERY_QUEUED", "LLM_RECOVERY_STARTING", "LLM_RECOVERY_STARTED", "LLM_RECOVERY_FAILED",
             "LLM_RECOVERY_COMPLETED", "LLM_DISPATCHED", "LLM_COALESCED",
+            "LLM_ACTIVE_REQUEST_FINISHED",
             "SCHEDULER_ARMED", "SCHEDULER_EVENT_ENQUEUED",
-            "SCHEDULER_TICK", "SCHEDULER_PAUSE_RESET", "SCHEDULER_FORCED_COVERED",
+            "SCHEDULER_TICK", "SCHEDULER_FORCED_COVERED", "SCHEDULER_FORCED_RESOLVED",
             "SCHEDULER_FINAL_PENDING", "SYSTEM_CHECK_SUPERSEDED", "SYSTEM_CHECK_STALE",
+            "SCHEDULER_HEARTBEAT_DELAYED", "SCHEDULER_HEARTBEAT_COALESCED",
+            "SCHEDULER_HEARTBEAT_STALE", "SCHEDULER_HEARTBEAT_THREAD_STARTED",
+            "SCHEDULER_HEARTBEAT_THREAD_STOPPED", "SCHEDULER_HEARTBEAT_THREAD_ERROR",
             "SYSTEM_CHECK_ACTION_REJECTED",
+            "SPEECH_APPEND_ELIGIBLE", "SPEECH_APPEND_SUCCEEDED",
+            "SPEECH_IDENTICAL_IGNORED", "SPEECH_DECISION_REPLACED",
             "SENTENCE_CREATED", "SENTENCE_REVISED", "SPEAK_STATE_CHANGED",
             "ACTION_STARTED", "ACTION_COMPLETED", "SPEAK_ENVELOPE_INVALID", "EMOTION_NORMALIZED",
             "LLM_EMPTY_OUTPUT", "LLM_OUTPUT_COMPAT_RECOVERED", "LLM_CONTEXT_CAPTURED",
@@ -875,6 +1195,9 @@ class AgentEpisodeRuntime:
         self._thinking_pending_by_turn.clear()
         self._recovery_attempts_by_turn.clear()
         self._transport_retry_attempts_by_turn.clear()
+        self._heartbeat_generated = 0
+        self._heartbeat_delivered = 0
+        self._heartbeat_coalesced = 0
         definitions = self.registry.action_definitions() if self.tools_enabled and hasattr(self.registry, "action_definitions") else []
         # A session-stable catalog keeps the strict output schema and the
         # request prefix cacheable. Live backend availability is a tail fact.
@@ -886,6 +1209,7 @@ class AgentEpisodeRuntime:
         if turn_id and text and text.strip():
             self.last_turn_id = turn_id
             self.inputs[turn_id] = {**payload, "text": text, "final": False}
+        await self._start_heartbeat_clock()
         await self.log("EPISODE_STARTED")
         return self.episode_id
 
@@ -897,6 +1221,32 @@ class AgentEpisodeRuntime:
     async def _begin_output(self, identity, input_id, emotion):
         """Authorise one V0.6 text speech item through the unified queue."""
         return await self.output.begin(identity, input_id, emotion=emotion)
+
+    @staticmethod
+    def _is_system_check_context(context) -> bool:
+        return bool(
+            isinstance(context, dict)
+            and context.get("owner_scope") == "system_check"
+            and context.get("system_check_id")
+        )
+
+    def _system_check_is_stale(self, context) -> bool:
+        return bool(
+            self._is_system_check_context(context)
+            and int(context.get("generation") or 0) != self.scheduler.generation
+        )
+
+    def _track_system_check_speech(self, handle, context) -> None:
+        speech_id = getattr(handle, "speech_id", None)
+        if not speech_id or not self._is_system_check_context(context):
+            return
+        system_check_id = str(context["system_check_id"])
+        self._system_check_speeches[speech_id] = {
+            "system_check_id": system_check_id,
+            "speech_turn_id": context.get("speech_turn_id"),
+            "scheduler_generation": context.get("generation"),
+        }
+        self._system_check_output_turn_ids.add(system_check_id)
 
     async def _begin_speech(self, identity, input_id, emotion, *, replace_current=False):
         """Begin ordinary or explicitly replacing speech after the gate."""
@@ -937,6 +1287,8 @@ class AgentEpisodeRuntime:
             self._supersede_recovery_without_request_cancel(kind)
         was_pending = bool(self.pending)
         self.pending.add(kind)
+        if not was_pending:
+            self._pending_since = time.monotonic()
         if kind in {"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"} and turn_id:
             self._pending_transcript_turn_id = turn_id
         try:
@@ -955,8 +1307,7 @@ class AgentEpisodeRuntime:
             pass
         if self.queue.empty():
             self.queue.put_nowait(True)
-        if self.runner is None or self.runner.done():
-            self.runner = asyncio.create_task(self._run(), name="agent-episode")
+        self._ensure_runner()
         # Once any ordinary, recovery, forced-poll, or final-silence request
         # has started, later input never preempts it.  New events remain in
         # the shared mailbox for the next idle heartbeat.
@@ -969,9 +1320,14 @@ class AgentEpisodeRuntime:
         and speculative output retain their existing invalidation behavior.
         """
 
-        queued = len(self.recovery_queue)
-        if queued:
+        queued_signals = list(self.recovery_queue)
+        queued = len(queued_signals)
+        if queued_signals:
             self.recovery_queue.clear()
+            for signal in queued_signals:
+                if (signal.system_check_id
+                        and signal.system_check_id not in self._system_check_output_turn_ids):
+                    self._system_check_turn_ids.discard(signal.system_check_id)
         running = self.active_recovery is not None
         if running:
             cancel_output = getattr(self.output, "cancel_all", None)
@@ -1001,19 +1357,19 @@ class AgentEpisodeRuntime:
         context = self.active_dispatch_context
         running = bool(
             isinstance(context, dict)
-            and context.get("dispatch_kind") in {"forced_poll", "final_silence"}
+            and context.get("owner_scope") == "system_check"
         )
         cancelled_output = 0
         candidates = ([getattr(self.output, "handle", None)]
                       + list(getattr(self.output, "_pending", []) or []))
         for candidate in candidates:
-            if candidate is None or getattr(candidate, "turn_id", None) not in self._system_check_turn_ids:
+            speech_id = getattr(candidate, "speech_id", None) if candidate is not None else None
+            if not speech_id or speech_id not in self._system_check_speeches:
                 continue
             workspace = getattr(candidate, "workspace", None)
             if bool(getattr(workspace, "playback_started", False)):
                 continue
             cancel = getattr(self.output, "cancel", None)
-            speech_id = getattr(candidate, "speech_id", None)
             if callable(cancel) and speech_id:
                 cancel(speech_id, "superseded_system_check")
                 cancelled_output += 1
@@ -1046,10 +1402,24 @@ class AgentEpisodeRuntime:
         Exhaustion itself never schedules an unbounded provider loop.
         """
         source_turn = turn_id or (self._identity_turns.get(identity) if identity else self.last_turn_id)
-        system_check_id = source_turn if source_turn in self._system_check_turn_ids else None
+        active_context = self.active_dispatch_context
+        is_active_identity = identity is None or identity == self.active_request_identity
+        system_check_id = (
+            active_context.get("system_check_id")
+            if is_active_identity and isinstance(active_context, dict)
+            and active_context.get("owner_scope") == "system_check"
+            else None
+        )
+        if (
+            system_check_id is None and isinstance(active_context, dict)
+            and active_context.get("system_check_id") in self._system_check_turn_ids
+            and source_turn in self._system_check_turn_ids
+        ):
+            system_check_id = active_context.get("system_check_id")
+            active_context = {**active_context, "owner_scope": "system_check"}
         dispatch_context = (
-            dict(self.active_dispatch_context)
-            if system_check_id and isinstance(self.active_dispatch_context, dict)
+            dict(active_context)
+            if system_check_id and isinstance(active_context, dict)
             else None
         )
         signal = RecoverySignal(
@@ -1098,8 +1468,7 @@ class AgentEpisodeRuntime:
                        system_check_id=signal.system_check_id)
         if self.queue.empty():
             self.queue.put_nowait(True)
-        if self.runner is None or self.runner.done():
-            self.runner = asyncio.create_task(self._run(), name="agent-episode")
+        self._ensure_runner()
         return signal
 
     @staticmethod
@@ -1358,14 +1727,29 @@ class AgentEpisodeRuntime:
             # final_pending candidate; it never cancels an in-flight request.
             # TTS and microphone activity never touch the ladder.
             self._supersede_system_output_without_request_cancel(kind)
+            superseded_windows = self.scheduler.pending_checkpoint_windows()
+            superseded_generation = self.scheduler.generation
+            superseded_turn_id = self.scheduler.anchor_turn_id
             generation = self.scheduler.arm(
                 now=time.monotonic(),
                 wall_time=(payload.get("occurred_at")
                            if isinstance(payload.get("occurred_at"), (int, float))
                            else None),
+                turn_id=turn_id,
             )
             try:
                 loop = asyncio.get_running_loop()
+                for window in superseded_windows:
+                    loop.create_task(self.log(
+                        "SCHEDULER_FORCED_RESOLVED",
+                        turn_id=superseded_turn_id or turn_id,
+                        window_index=window,
+                        scheduler_generation=superseded_generation,
+                        current_scheduler_generation=generation,
+                        expected=True,
+                        resolution="superseded_by_new_generation",
+                        reason=kind,
+                    ))
                 loop.create_task(self.log(
                     "SCHEDULER_ARMED",
                     turn_id=turn_id,
@@ -1471,31 +1855,10 @@ class AgentEpisodeRuntime:
             and not (isinstance(kind, str) and kind.startswith("TTS_"))
         }
 
-    def _tts_busy(self):
-        try:
-            if bool(getattr(self.output, "busy", False)):
-                return True
-            if bool(getattr(self.output, "active", False)):
-                return True
-            status = getattr(self.output, "status", None)
-            if isinstance(status, str) and status not in {"IDLE", "STOPPED", "CLOSED"}:
-                return True
-        except Exception:
-            return True
-        try:
-            queued = getattr(self.output, "queue_snapshot", [])
-            return bool(queued)
-        except Exception:
-            return True
-
-    def _dispatch_allowed(self, *, respect_backoff=True, allow_during_user_speech: bool = False):
+    def _dispatch_allowed(self, *, respect_backoff=True):
         if self.closed or not self.episode_id:
             return False
         if self.active_request is not None:
-            return False
-        if self.user_speaking is True and not allow_during_user_speech:
-            return False
-        if self._tts_busy():
             return False
         if respect_backoff and self.backoff_until > time.monotonic():
             return False
@@ -1504,16 +1867,11 @@ class AgentEpisodeRuntime:
     def _busy_reason(self):
         if self.active_request is not None:
             return "active_request"
-        if self.user_speaking is True:
-            return "user_speaking"
-        if self._tts_busy():
-            return "tts_busy"
         if self.backoff_until > time.monotonic():
             return "backoff"
         return "not_allowed"
 
-    async def _start_dispatch(self, kinds, *, recovery_signal=None, candidate=None,
-                              allow_during_user_speech: bool = False):
+    async def _start_dispatch(self, kinds, *, recovery_signal=None, candidate=None):
         """Create one request task without ever waiting for its result."""
 
         recovery = recovery_signal is not None
@@ -1535,10 +1893,7 @@ class AgentEpisodeRuntime:
                 "owner_scope": "system_check",
             })
 
-        if not self._dispatch_allowed(
-            respect_backoff=not recovery,
-            allow_during_user_speech=allow_during_user_speech,
-        ):
+        if not self._dispatch_allowed(respect_backoff=not recovery):
             return False
         # A forced request is only valid while the mailbox is still empty of
         # ordinary semantics.  The re-check closes the small await/log race
@@ -1567,14 +1922,23 @@ class AgentEpisodeRuntime:
         system_check_id = None
         if candidate is not None:
             system_check_id = f"system-check-{uuid4().hex}"
-            source_turn_id = system_check_id
+            source_turn_id = candidate.get("speech_turn_id") or candidate.get("anchor_turn_id")
+            if not source_turn_id:
+                return False
             dispatch_context["system_check_id"] = system_check_id
+            dispatch_context["speech_turn_id"] = source_turn_id
             dispatch_context["dispatch_kind"] = dispatch_kind
             dispatch_context["prompt_kind"] = prompt_kind
+            dispatch_context["owner_scope"] = "system_check"
             self._system_check_turn_ids.add(system_check_id)
         elif recovery_signal and recovery_signal.system_check_id:
             system_check_id = recovery_signal.system_check_id
-            source_turn_id = system_check_id
+            source_turn_id = (
+                dispatch_context.get("speech_turn_id")
+                if isinstance(dispatch_context, dict) else recovery_signal.source_turn_id
+            ) or recovery_signal.source_turn_id
+            if isinstance(dispatch_context, dict):
+                dispatch_context["speech_turn_id"] = source_turn_id
             self._system_check_turn_ids.add(system_check_id)
         reasoning_effort = "low" if self.reasoning_mode == "deep" else "none"
         if "THINKING_READY" in kinds and self._thinking_lease_turn == source_turn_id:
@@ -1587,6 +1951,10 @@ class AgentEpisodeRuntime:
         self.active_recovery = recovery_signal
         self.active_dispatch_context = dispatch_context
         self.scheduler_last_dispatch_at = time.monotonic()
+        pending_wait_ms = (
+            round(max(0.0, self.scheduler_last_dispatch_at - self._pending_since) * 1000, 3)
+            if self._pending_since is not None and candidate is None and not recovery else None
+        )
         if not recovery:
             await self.log(
                 "SCHEDULER_TICK", identity=identity, turn_id=source_turn_id,
@@ -1633,6 +2001,7 @@ class AgentEpisodeRuntime:
                                     if isinstance(dispatch_context, dict) else None),
                        silence_elapsed_ms=(dispatch_context.get("silence_elapsed_ms")
                                            if isinstance(dispatch_context, dict) else None),
+                       pending_wait_ms=pending_wait_ms,
                        skipped_forced_windows=(dispatch_context.get("skipped_forced_windows")
                                                if isinstance(dispatch_context, dict) else None),
                        events=sorted(kinds), reasoning_effort=reasoning_effort,
@@ -1640,6 +2009,31 @@ class AgentEpisodeRuntime:
         if recovery and recovery_signal is not None:
             await self.log("LLM_RECOVERY_STARTED", identity=identity,
                            error_id=recovery_signal.error_id, code=recovery_signal.code)
+        if (
+            candidate is not None
+            and int(candidate.get("generation") or 0) != self.scheduler.generation
+        ):
+            await self.log(
+                "SCHEDULER_FORCED_RESOLVED",
+                identity=identity,
+                turn_id=source_turn_id,
+                window_index=candidate.get("window_index"),
+                scheduler_generation=candidate.get("generation"),
+                current_scheduler_generation=self.scheduler.generation,
+                resolution="superseded_by_new_generation",
+                reason="scheduler_generation_changed_before_task_start",
+                system_check_id=system_check_id,
+            )
+            self._identity_turns.pop(identity, None)
+            if system_check_id:
+                self._system_check_turn_ids.discard(system_check_id)
+            self.active_request_identity = None
+            self.active_request_source_turn_id = None
+            self.active_request_kinds = set()
+            self.active_recovery = None
+            self.active_dispatch_context = None
+            self.state = "WAITING_EVENT" if self.episode_id else "IDLE"
+            return False
         if candidate is not None and self._meaningful_pending():
             covered = self.scheduler.cover_forced_by_normal(include_final=False)
             if covered:
@@ -1666,7 +2060,10 @@ class AgentEpisodeRuntime:
             name=f"agent-step-{identity[1]}",
         )
         self.active_request_count += 1
-        if self._pending_transcript_turn_id == source_turn_id:
+        if not recovery and candidate is None:
+            self._pending_since = None
+        if (not recovery and candidate is None
+                and self._pending_transcript_turn_id == source_turn_id):
             self._pending_transcript_turn_id = None
         self.max_request_concurrency = max(self.max_request_concurrency, self.active_request_count)
         # Ordinary work covers a coincident forced/final check only after its
@@ -1687,10 +2084,14 @@ class AgentEpisodeRuntime:
         signal = self.recovery_queue.popleft()
         signal.consumed = True
         scheduler_generation = self.scheduler.generation
+        recovery_queue_wait_ms = round(
+            max(0.0, time.monotonic() - signal.queued_at_monotonic) * 1000, 3,
+        )
         await self.log("LLM_RECOVERY_STARTING", turn_id=signal.source_turn_id,
                        error_id=signal.error_id, code=signal.code,
                        owner_scope=signal.owner_scope,
-                       system_check_id=signal.system_check_id)
+                       system_check_id=signal.system_check_id,
+                       recovery_queue_wait_ms=recovery_queue_wait_ms)
         if scheduler_generation != self.scheduler.generation:
             # The provider task has not been created yet.  Preserve the
             # existing pre-dispatch ownership rule without cancelling any
@@ -1706,9 +2107,78 @@ class AgentEpisodeRuntime:
             self.recovery_queue.appendleft(signal)
         return started
 
-    async def _on_heartbeat(self, heartbeat_at):
+    async def _record_checkpoint_resolution(self, candidate, resolution, *, reason=None):
+        if not isinstance(candidate, dict):
+            return
+        window = int(candidate.get("window_index") or 0)
+        if candidate.get("prompt_kind") != "final_silence":
+            if resolution == "covered_by_active_request":
+                self.scheduler.mark_forced_covered_by_active(
+                    candidate, now=time.monotonic(),
+                )
+            else:
+                self.scheduler.mark_forced_skipped(
+                    candidate, now=time.monotonic(), reason=resolution,
+                )
+        await self.log(
+            "SCHEDULER_FORCED_RESOLVED",
+            turn_id=candidate.get("speech_turn_id") or candidate.get("anchor_turn_id"),
+            window_index=window,
+            scheduler_generation=candidate.get("generation"),
+            expected=True,
+            resolution=resolution,
+            reason=reason or resolution,
+            silence_elapsed_ms=candidate.get("silence_elapsed_ms"),
+        )
+
+    async def _on_heartbeat(self, heartbeat_at, *, pulse: HeartbeatPulse | None = None,
+                            delivered_at: float | None = None):
+        previous_window = self.scheduler.window_index
         was_final_pending = self.scheduler.final_pending
-        self.scheduler.heartbeat(heartbeat_at)
+        candidate = self.scheduler.heartbeat(heartbeat_at)
+        current_window = self.scheduler.window_index
+        for window in self.scheduler.take_newly_coalesced_windows():
+            await self.log(
+                "SCHEDULER_FORCED_RESOLVED",
+                turn_id=self.scheduler.anchor_turn_id,
+                window_index=window,
+                scheduler_generation=self.scheduler.generation,
+                resolution="coalesced_after_delay",
+                reason="heartbeat_delay",
+            )
+        if pulse is not None:
+            delivered_at = time.monotonic() if delivered_at is None else delivered_at
+            delivery_delay_ms = max(0.0, (delivered_at - pulse.scheduled_at) * 1000)
+            self._heartbeat_delivered += 1
+            self._heartbeat_coalesced += pulse.coalesced_count
+            if delivery_delay_ms >= self.scheduler.interval * 1000:
+                await self.log(
+                    "SCHEDULER_HEARTBEAT_DELAYED",
+                    episode_generation=pulse.episode_generation,
+                    pulse_sequence=pulse.sequence,
+                    scheduled_at=pulse.scheduled_at,
+                    delivered_at=delivered_at,
+                    delivery_delay_ms=round(delivery_delay_ms, 3),
+                    coalesced_count=pulse.coalesced_count,
+                    scheduler_generation=self.scheduler.generation,
+                    previous_window=previous_window,
+                    current_window=current_window,
+                    selected_checkpoint=(candidate.get("window_index") if candidate else None),
+                )
+            if pulse.coalesced_count:
+                await self.log(
+                    "SCHEDULER_HEARTBEAT_COALESCED",
+                    episode_generation=pulse.episode_generation,
+                    pulse_sequence=pulse.sequence,
+                    scheduled_at=pulse.scheduled_at,
+                    delivered_at=delivered_at,
+                    delivery_delay_ms=round(delivery_delay_ms, 3),
+                    coalesced_count=pulse.coalesced_count,
+                    scheduler_generation=self.scheduler.generation,
+                    previous_window=previous_window,
+                    current_window=current_window,
+                    selected_checkpoint=(candidate.get("window_index") if candidate else None),
+                )
         if self.scheduler.final_pending and not was_final_pending:
             await self.log("SCHEDULER_FINAL_PENDING",
                            window_index=self.scheduler.FINAL_WINDOW,
@@ -1716,45 +2186,57 @@ class AgentEpisodeRuntime:
                            scheduler_generation=self.scheduler.generation)
         meaningful = self._meaningful_pending()
         if meaningful:
-            # Recovery retains its existing priority.  It never receives a
-            # forced prompt and ordinary input remains in the mailbox behind
-            # the bounded correction.
-            if self.recovery_queue:
-                return
             if not self.scheduler.normal_due(meaningful, at_heartbeat=True):
                 return
-            # Ordinary mailbox semantics may precompute while the user is
-            # speaking.  This bypasses only the microphone-activity gate;
-            # active request, output, backoff, and lifecycle checks still
-            # apply inside both checks below.
-            if not self._dispatch_allowed(allow_during_user_speech=True):
+            if self.active_request is not None:
+                if candidate and candidate.get("prompt_kind") == "forced_poll":
+                    await self._record_checkpoint_resolution(
+                        candidate, "covered_by_active_request",
+                    )
+                return
+            if not self._dispatch_allowed():
+                if candidate and candidate.get("prompt_kind") == "forced_poll":
+                    await self._record_checkpoint_resolution(
+                        candidate, "skipped_backoff", reason=self._busy_reason(),
+                    )
                 return
             kinds = set(self.pending)
             self.pending.clear()
-            if not await self._start_dispatch(
-                kinds, allow_during_user_speech=True,
-            ):
+            if not await self._start_dispatch(kinds):
                 self.pending.update(kinds)
             return
 
         # Activity-only entries are consumed at the heartbeat, but never
         # become an LLM request or an input to the forced priority decision.
         self.pending.clear()
-        if self.recovery_queue:
-            candidate = self.scheduler.forced_due(now=heartbeat_at)
-            if candidate and candidate.get("prompt_kind") == "forced_poll":
-                self.scheduler.mark_forced_skipped(candidate, now=heartbeat_at, reason="recovery_pending")
-            return
-        candidate = self.scheduler.forced_due(now=heartbeat_at)
+        self._pending_since = None
         if candidate is None:
             return
         if not self._dispatch_allowed():
             if candidate.get("prompt_kind") == "final_silence":
                 self.scheduler.mark_final_pending()
             else:
-                self.scheduler.mark_forced_skipped(candidate, now=heartbeat_at, reason=self._busy_reason())
+                resolution = (
+                    "covered_by_active_request" if self.active_request is not None
+                    else "skipped_backoff" if self.backoff_until > time.monotonic()
+                    else "superseded_by_new_generation"
+                )
+                await self._record_checkpoint_resolution(
+                    candidate, resolution, reason=self._busy_reason(),
+                )
             return
-        if not await self._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate):
+        if await self._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate):
+            await self.log(
+                "SCHEDULER_FORCED_RESOLVED",
+                turn_id=candidate.get("speech_turn_id") or candidate.get("anchor_turn_id"),
+                window_index=candidate.get("window_index"),
+                scheduler_generation=candidate.get("generation"),
+                resolution="dispatched",
+                reason="system_check_task_started",
+                system_check_id=(self.active_dispatch_context.get("system_check_id")
+                                 if isinstance(self.active_dispatch_context, dict) else None),
+            )
+        else:
             # A new ordinary event may have arrived while the diagnostic log
             # yielded.  It now owns the next normal heartbeat.
             if self._meaningful_pending():
@@ -1762,29 +2244,9 @@ class AgentEpisodeRuntime:
             if candidate.get("prompt_kind") == "final_silence":
                 self.scheduler.mark_final_pending()
             else:
-                self.scheduler.mark_forced_skipped(candidate, now=heartbeat_at, reason="dispatch_race")
-
-    async def _reset_scheduler_after_pause(self, now: float, lateness: float) -> None:
-        """Discard timer-only work after a long event-loop suspension."""
-
-        queued_system = [signal for signal in self.recovery_queue if signal.system_check_id]
-        self.recovery_queue = deque(signal for signal in self.recovery_queue if not signal.system_check_id)
-        active_system_id = (
-            self.active_request_source_turn_id
-            if isinstance(self.active_dispatch_context, dict)
-            and self.active_dispatch_context.get("owner_scope") == "system_check"
-            else None
-        )
-        for signal in queued_system:
-            if signal.system_check_id != active_system_id:
-                self._system_check_turn_ids.discard(signal.system_check_id)
-                self._system_check_output_turn_ids.discard(signal.system_check_id)
-        rearmed = self.scheduler.reset_after_pause(now, wall_time=time.time())
-        await self.log(
-            "SCHEDULER_PAUSE_RESET", lateness_ms=round(lateness * 1000),
-            rearmed=rearmed, dropped_system_recoveries=len(queued_system),
-            scheduler_generation=self.scheduler.generation,
-        )
+                await self._record_checkpoint_resolution(
+                    candidate, "superseded_by_new_generation", reason="dispatch_race",
+                )
 
     async def _finish_active_request(self, request):
         """Consume a completed request task without blocking the heartbeat."""
@@ -1795,6 +2257,11 @@ class AgentEpisodeRuntime:
         source_turn_id = self.active_request_source_turn_id
         recovery_signal = self.active_recovery
         recovery = recovery_signal is not None
+        dispatch_context = self.active_dispatch_context
+        system_check_id = (
+            dispatch_context.get("system_check_id")
+            if self._is_system_check_context(dispatch_context) else None
+        )
         try:
             step_outcome = request.result()
             if recovery and recovery_signal is not None:
@@ -1855,6 +2322,19 @@ class AgentEpisodeRuntime:
             if latest.get("final") and not self.output.active and not retryable:
                 await self._emit_turn_settled(identity, source_turn_id, "agent_error")
         finally:
+            active_request_duration_ms = (
+                round(max(0.0, time.monotonic() - self.request_started_at) * 1000, 3)
+                if self.request_started_at is not None else None
+            )
+            await self.log(
+                "LLM_ACTIVE_REQUEST_FINISHED",
+                identity=identity,
+                turn_id=source_turn_id,
+                system_check_id=system_check_id,
+                active_request_duration_ms=active_request_duration_ms,
+                active_request_concurrency_peak=self.max_request_concurrency,
+            )
+            self.request_started_at = None
             self.active_request_count = max(0, self.active_request_count - 1)
             self.active_request = None
             self.active_request_identity = None
@@ -1863,36 +2343,36 @@ class AgentEpisodeRuntime:
             self.active_recovery = None
             self.active_dispatch_context = None
             self.last_llm_completed_at = time.monotonic()
-            if (source_turn_id in self._system_check_turn_ids
-                    and source_turn_id not in self._system_check_output_turn_ids
+            if (system_check_id in self._system_check_turn_ids
+                    and system_check_id not in self._system_check_output_turn_ids
                     and not any(
-                        signal.system_check_id == source_turn_id
+                        signal.system_check_id == system_check_id
                         for signal in self.recovery_queue
                     )):
                 # No speech candidate was created by this system-check.  If
                 # one was created, output_completed owns the final cleanup;
                 # keeping the ID until then prevents a cancellation race from
                 # losing owner_scope=system_check.
-                self._system_check_turn_ids.discard(source_turn_id)
+                self._system_check_turn_ids.discard(system_check_id)
         self.state = "WAITING_EVENT" if self.episode_id else "IDLE"
         await self.emit("agent.episode", self.snapshot(include_history=False))
 
     async def _run(self):
-        """Run the one non-blocking scheduler loop and its fixed heartbeat."""
+        """Serialise runtime state while an independent thread owns the clock."""
 
         wake_task = asyncio.create_task(self.queue.get(), name="agent-episode-wakeup")
+        heartbeat_task = asyncio.create_task(
+            self.heartbeat_queue.get(), name="agent-heartbeat-wakeup",
+        )
         try:
             while not self.closed and self.episode_id is not None:
                 active = self.active_request
-                waiters = {wake_task}
+                waiters = {wake_task, heartbeat_task}
                 if active is not None:
                     waiters.add(active)
-                timed_work = bool(self.scheduler.armed or self.pending or self.recovery_queue or active is not None)
-                timeout = self.scheduler.heartbeat_delay() if timed_work else None
                 done, _ = await asyncio.wait(
-                    waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+                    waiters, return_when=asyncio.FIRST_COMPLETED,
                 )
-                now = time.monotonic()
                 wake_ready = wake_task in done
                 if wake_ready:
                     try:
@@ -1901,6 +2381,12 @@ class AgentEpisodeRuntime:
                         if self.closed:
                             raise
                     wake_task = asyncio.create_task(self.queue.get(), name="agent-episode-wakeup")
+                heartbeat_pulse = None
+                if heartbeat_task in done:
+                    heartbeat_pulse = heartbeat_task.result()
+                    heartbeat_task = asyncio.create_task(
+                        self.heartbeat_queue.get(), name="agent-heartbeat-wakeup",
+                    )
                 if active is not None and active in done and active is self.active_request:
                     await self._finish_active_request(active)
 
@@ -1914,18 +2400,32 @@ class AgentEpisodeRuntime:
                 if self.active_request is not None and self.active_request.done():
                     await self._finish_active_request(self.active_request)
 
-                lateness = self.scheduler.heartbeat_lateness(now)
-                if lateness >= self.scheduler.PAUSE_RESET_SECONDS:
-                    await self._reset_scheduler_after_pause(now, lateness)
-                elif self.scheduler.heartbeat_due(now):
-                    await self._on_heartbeat(now)
+                if heartbeat_pulse is not None:
+                    if heartbeat_pulse.episode_generation != self._heartbeat_episode_generation:
+                        await self.log(
+                            "SCHEDULER_HEARTBEAT_STALE",
+                            episode_generation=heartbeat_pulse.episode_generation,
+                            pulse_sequence=heartbeat_pulse.sequence,
+                        )
+                    else:
+                        delivered_at = time.monotonic()
+                        await self._on_heartbeat(
+                            heartbeat_pulse.scheduled_at,
+                            pulse=heartbeat_pulse,
+                            delivered_at=delivered_at,
+                        )
         except asyncio.CancelledError:
             pass
         finally:
             if wake_task is not None and not wake_task.done():
                 wake_task.cancel()
                 await asyncio.gather(wake_task, return_exceptions=True)
+            if heartbeat_task is not None and not heartbeat_task.done():
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
             if self.runner is asyncio.current_task():
+                if self._heartbeat_clock is not None:
+                    await self._stop_heartbeat_clock()
                 self.runner = None
 
     def _fit_context(self, messages, schemas):
@@ -2326,14 +2826,14 @@ class AgentEpisodeRuntime:
         self._wake("THINKING_READY")
 
     async def _dispatch_actions_v06(self, identity, turn_id, envelope: DecisionEnvelope,
-                                    *, system_check=None) -> None:
+                                    *, system_check=None, system_check_id=None) -> None:
         actions = envelope.actions
         if system_check is None:
             system_check = turn_id in self._system_check_turn_ids
         if system_check and actions:
             await self.log(
                 "SYSTEM_CHECK_ACTION_REJECTED", identity=identity, turn_id=turn_id,
-                system_check_id=turn_id, owner_scope="system_check",
+                system_check_id=system_check_id or turn_id, owner_scope="system_check",
                 action_names=[action.name for action in actions],
                 action_count=len(actions),
             )
@@ -2382,7 +2882,8 @@ class AgentEpisodeRuntime:
         elif event.status in {"completed", "cancelled", "timed_out", "failed"}:
             self._wake("SHADOW_TASK_TERMINAL")
 
-    async def _apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope):
+    async def _apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope,
+                                  *, dispatch_context=None):
         """Commit one fully validated V0.6 decision to the local transaction."""
         decision = envelope.speak
         snapshot = getattr(self.output, "speak_snapshot", {})
@@ -2423,17 +2924,37 @@ class AgentEpisodeRuntime:
             if (active_same_turn and existing_text and decision.text.startswith(existing_text)
                     and callable(append)):
                 suffix = decision.text[len(existing_text):]
+                await self.log(
+                    "SPEECH_APPEND_ELIGIBLE", identity=identity, turn_id=turn_id,
+                    system_check_id=(dispatch_context.get("system_check_id")
+                                     if isinstance(dispatch_context, dict) else None),
+                    model_continuation_allowed=True,
+                    baseline_chars=len(existing_text), suffix_chars=len(suffix),
+                )
                 if not suffix:
                     await self.emit("speech.append_ignored", {
                         "speech_id": existing_id, "turn_id": turn_id,
                         "reason": "identical_text",
                     })
                     self.current_action = "speak"
+                    await self.log(
+                        "SPEECH_IDENTICAL_IGNORED", identity=identity, turn_id=turn_id,
+                        system_check_id=(dispatch_context.get("system_check_id")
+                                         if isinstance(dispatch_context, dict) else None),
+                    )
                     return
                 handle = await append(identity, turn_id, baseline_speech_id=existing_id,
                                       baseline_generation=existing_generation, suffix=suffix,
                                       emotion=decision.emotion)
+                self._track_system_check_speech(handle, dispatch_context)
                 await handle.finish()
+                await self.log(
+                    "SPEECH_APPEND_SUCCEEDED", identity=identity, turn_id=turn_id,
+                    speech_id=handle.speech_id,
+                    system_check_id=(dispatch_context.get("system_check_id")
+                                     if isinstance(dispatch_context, dict) else None),
+                    suffix_chars=len(suffix),
+                )
                 self.current_action = "speak"
                 return
             speech_text = decision.text
@@ -2453,11 +2974,18 @@ class AgentEpisodeRuntime:
             # second model request here makes the user wait through old TTS
             # cancellation plus another LLM round-trip.
             handle = await self.output.replace_current(identity, turn_id, emotion=decision.emotion)
+            self._track_system_check_speech(handle, dispatch_context)
             await handle.feed(speech_text)
             await handle.finish()
             self.current_action = "speak"
             await self.log("SPEAK_ACCEPTED", identity=identity, turn_id=turn_id,
                            speech_id=handle.speech_id, replaced=True)
+            await self.log(
+                "SPEECH_DECISION_REPLACED", identity=identity, turn_id=turn_id,
+                speech_id=handle.speech_id,
+                system_check_id=(dispatch_context.get("system_check_id")
+                                 if isinstance(dispatch_context, dict) else None),
+            )
         else:
             # Candidate text is complete and valid at this point.  Existing
             # output owns all queue replacement/cancellation generation rules.
@@ -2491,6 +3019,7 @@ class AgentEpisodeRuntime:
             replace = queue_status in {"queued", "suspended"}
             handle = (await self.output.replace_current(identity, turn_id, emotion=decision.emotion)
                       if replace else await self.output.begin(identity, turn_id, emotion=decision.emotion))
+            self._track_system_check_speech(handle, dispatch_context)
             await handle.feed(speech_text)
             await handle.finish()
             self.current_action = "speak"
@@ -2500,6 +3029,10 @@ class AgentEpisodeRuntime:
                     reasoning_effort=None, dispatch_context=None):
         """The V0.6 content-envelope request path (no native provider tools)."""
         source_turn_id = self._identity_turns.get(identity, self.last_turn_id)
+        system_check = self._is_system_check_context(dispatch_context)
+        system_check_id = (
+            str(dispatch_context.get("system_check_id")) if system_check else None
+        )
         prompt_kind = (
             str(dispatch_context.get("prompt_kind") or "normal")
             if isinstance(dispatch_context, dict) and not recovery
@@ -2536,7 +3069,7 @@ class AgentEpisodeRuntime:
             request_id=identity[1],
             turn_id=source_turn_id,
             events=sorted(kinds),
-            mode=("system_check" if source_turn_id in self._system_check_turn_ids
+            mode=("system_check" if system_check
                   else "exception_recovery" if recovery else "normal"),
             dispatch_kind=(dispatch_context.get("dispatch_kind")
                            if isinstance(dispatch_context, dict)
@@ -2550,7 +3083,7 @@ class AgentEpisodeRuntime:
                           if isinstance(dispatch_context, dict) else None),
             system_check_id=(dispatch_context.get("system_check_id")
                              if isinstance(dispatch_context, dict) else None),
-            owner_scope=("system_check" if source_turn_id in self._system_check_turn_ids else None),
+            owner_scope=("system_check" if system_check else None),
             reasoning_effort=reasoning_effort or "none",
             context_compaction=self.context_compaction,
             context_token_estimate=self.context_token_estimate,
@@ -2559,7 +3092,7 @@ class AgentEpisodeRuntime:
         self.request_count += 1
         self.request_started_at = time.monotonic()
         await self.log("AGENT_INVOKED", events=sorted(kinds),
-                       mode=("system_check" if source_turn_id in self._system_check_turn_ids
+                       mode=("system_check" if system_check
                              else "exception_recovery" if recovery else "normal"),
                        dispatch_kind=("normal" if recovery else prompt_kind),
                        prompt_kind=prompt_kind,
@@ -2612,6 +3145,24 @@ class AgentEpisodeRuntime:
         speech_fed_chars = 0
         validation = "strict_valid"
         audit_outcome_recorded = False
+        stale_reported = False
+
+        async def report_stale() -> None:
+            nonlocal stale_reported
+            if stale_reported:
+                return
+            stale_reported = True
+            await self.log(
+                "SYSTEM_CHECK_STALE",
+                identity=identity,
+                turn_id=source_turn_id,
+                system_check_id=system_check_id,
+                speech_turn_id=source_turn_id,
+                scheduler_generation=(dispatch_context.get("generation")
+                                      if isinstance(dispatch_context, dict) else None),
+                current_scheduler_generation=self.scheduler.generation,
+                stale_system_check_output_discarded=True,
+            )
 
         def record_audit_outcome(outcome: str, **details) -> None:
             nonlocal audit_outcome_recorded
@@ -2693,6 +3244,7 @@ class AgentEpisodeRuntime:
                             if prefix_baseline["source"] == "active_previous_guard"
                             else await self.output.begin(identity, source_turn_id, emotion=decision.emotion)
                         )
+                        self._track_system_check_speech(speech_handle, dispatch_context)
                         await speech_handle.feed(suffix)
                         speech_fed_chars = len(suffix)
                         first_speech_text_at = time.monotonic()
@@ -2710,12 +3262,20 @@ class AgentEpisodeRuntime:
                         return True
                     append = getattr(self.output, "append_successor", None)
                     if prefix_baseline["source"] == "active_same_turn" and callable(append):
+                        await self.log(
+                            "SPEECH_APPEND_ELIGIBLE", identity=identity,
+                            turn_id=source_turn_id,
+                            system_check_id=system_check_id,
+                            model_continuation_allowed=True,
+                            baseline_chars=len(baseline), suffix_chars=len(suffix),
+                        )
                         speech_handle = await append(
                             identity, source_turn_id,
                             baseline_speech_id=prefix_baseline["speech_id"],
                             baseline_generation=prefix_baseline["generation"],
                             suffix=suffix, emotion=decision.emotion,
                         )
+                        self._track_system_check_speech(speech_handle, dispatch_context)
                         speech_fed_chars = len(suffix)
                         first_speech_text_at = time.monotonic()
                         await self.log(
@@ -2726,6 +3286,13 @@ class AgentEpisodeRuntime:
                             suffix_chars=len(suffix), stripped=True,
                             reason="same_turn_extension",
                             speech_id=speech_handle.speech_id,
+                        )
+                        await self.log(
+                            "SPEECH_APPEND_SUCCEEDED", identity=identity,
+                            turn_id=source_turn_id,
+                            speech_id=speech_handle.speech_id,
+                            system_check_id=system_check_id,
+                            suffix_chars=len(suffix),
                         )
                         return True
                     # Test/legacy outputs have no continuation primitive;
@@ -2747,6 +3314,7 @@ class AgentEpisodeRuntime:
             replace = queue_status in {"speaking", "queued", "suspended"}
             speech_handle = (await self.output.replace_current(identity, source_turn_id, emotion=decision.emotion)
                              if replace else await self.output.begin(identity, source_turn_id, emotion=decision.emotion))
+            self._track_system_check_speech(speech_handle, dispatch_context)
             first_speech_text_at = time.monotonic()
             workspace = getattr(speech_handle, "workspace", None)
             if workspace is not None and isinstance(getattr(workspace, "timings", None), dict):
@@ -2755,6 +3323,13 @@ class AgentEpisodeRuntime:
                 workspace.timings["speech_started_before_envelope_commit"] = True
             await self.log("SPEAK_ACCEPTED", identity=identity, turn_id=source_turn_id,
                            speech_id=speech_handle.speech_id, replaced=replace, partial=True)
+            if replace:
+                await self.log(
+                    "SPEECH_DECISION_REPLACED", identity=identity,
+                    turn_id=source_turn_id,
+                    speech_id=speech_handle.speech_id,
+                    system_check_id=system_check_id,
+                )
             return False
 
         try:
@@ -2802,12 +3377,12 @@ class AgentEpisodeRuntime:
                         text_delta = parser.feed(item["text"])
                         if text_delta:
                             provisional += text_delta
+                            if system_check and self._system_check_is_stale(dispatch_context):
+                                await report_stale()
+                                continue
                             prefix = parser.speak_prefix()
                             if prefix is not None and prefix.state == "speak":
                                 consumed = await queue_streamed_speech(prefix, provisional)
-                                if (speech_handle is not None
-                                        and source_turn_id in self._system_check_turn_ids):
-                                    self._system_check_output_turn_ids.add(source_turn_id)
                                 if speech_handle is not None and not consumed:
                                     # On a divergence the new transaction must
                                     # receive the complete accumulated target;
@@ -2863,6 +3438,19 @@ class AgentEpisodeRuntime:
             if responses_transport:
                 envelope = self._normalize_schema_envelope(envelope)
             schema_diagnostics = provider_schema_diagnostics(parser.raw, audit_schema)
+            if system_check and self._system_check_is_stale(dispatch_context):
+                await report_stale()
+                if speech_handle is not None:
+                    cancel = getattr(self.output, "cancel", None)
+                    if callable(cancel):
+                        cancel(getattr(speech_handle, "speech_id", None), "superseded_system_check")
+                record_audit_outcome(
+                    "system_check_stale",
+                    content_chars=content_chars,
+                    system_check_id=system_check_id,
+                    actions_executed=0,
+                )
+                return "system_check_stale"
             if reasoning_effort == "low" and source_turn_id:
                 expected_prefix = self._thinking_prefix_by_turn.pop(source_turn_id, "")
                 if (expected_prefix and envelope.speak.state == "speak"
@@ -2879,13 +3467,20 @@ class AgentEpisodeRuntime:
                                queue_status=getattr(self.output, "speak_snapshot", {}).get("queue_status", "queued"),
                                action_count=len(envelope.actions))
             else:
-                await self._apply_decision_v06(identity, source_turn_id, envelope)
-                if source_turn_id in self._system_check_turn_ids:
-                    snapshot = getattr(self.output, "speak_snapshot", {})
-                    if (isinstance(snapshot, dict)
-                            and snapshot.get("turn_id") == source_turn_id):
-                        self._system_check_output_turn_ids.add(source_turn_id)
-            await self._dispatch_actions_v06(identity, source_turn_id, envelope)
+                if system_check:
+                    await self._apply_decision_v06(
+                        identity, source_turn_id, envelope, dispatch_context=dispatch_context,
+                    )
+                else:
+                    await self._apply_decision_v06(identity, source_turn_id, envelope)
+            if system_check:
+                await self._dispatch_actions_v06(
+                    identity, source_turn_id, envelope,
+                    system_check=True,
+                    system_check_id=system_check_id,
+                )
+            else:
+                await self._dispatch_actions_v06(identity, source_turn_id, envelope)
             record_audit_outcome(
                 validation,
                 state=envelope.speak.state,
@@ -2929,6 +3524,20 @@ class AgentEpisodeRuntime:
                 **json_structure_fingerprint(parser.raw),
                 **envelope_error_diagnostics(parser.raw, exc, audit_schema),
             }
+            if system_check and self._system_check_is_stale(dispatch_context):
+                await report_stale()
+                if speech_handle is not None:
+                    cancel = getattr(self.output, "cancel", None)
+                    if callable(cancel):
+                        cancel(getattr(speech_handle, "speech_id", None), "superseded_system_check")
+                record_audit_outcome(
+                    "system_check_stale",
+                    content_chars=content_chars,
+                    system_check_id=system_check_id,
+                    actions_executed=0,
+                    **failure_diagnostics,
+                )
+                return "system_check_stale"
             recovery_code = (
                 "LLM_EMPTY_OUTPUT" if not parser.raw.strip()
                 else "TOOL_PROTOCOL_ERROR" if any(marker in error_text for marker in ("action", "tool"))
@@ -3163,12 +3772,23 @@ class AgentEpisodeRuntime:
         self._completed_speech_ids.add(speech_id)
         if len(self._completed_speech_ids) > self.options.output_limit * 4:
             self._completed_speech_ids = set(list(self._completed_speech_ids)[-self.options.output_limit * 2:])
-        system_check_id = record.get("turn_id")
-        if system_check_id in self._system_check_turn_ids:
+        system_context = self._system_check_speeches.pop(speech_id, None)
+        system_check_id = (
+            system_context.get("system_check_id")
+            if isinstance(system_context, dict) else None
+        )
+        if not system_check_id and record.get("turn_id") in self._system_check_turn_ids:
+            # Backward-compatible completion for transactions created before
+            # speech/system ownership was split.
+            system_check_id = record.get("turn_id")
+            system_context = {}
+        if system_check_id:
             # This additive marker lets the controller keep delivery in the
             # assistant ledger without treating a system check as a user turn.
             record["owner_scope"] = "system_check"
             record["system_check_id"] = system_check_id
+            record["speech_turn_id"] = record.get("turn_id")
+            record["scheduler_generation"] = system_context.get("scheduler_generation")
         self.outputs.append(record)
         record_identity = (record.get("conversation_id") or record.get("episode_id"),
                            record.get("request_id") or record.get("trace_id") or record.get("agent_step_id"))
@@ -3200,13 +3820,14 @@ class AgentEpisodeRuntime:
                        identity=record_identity, turn_id=record.get("turn_id"),
                        speech_id=speech_id, status=status)
         if record.get("owner_scope") == "system_check":
-            system_check_id = str(record.get("system_check_id") or record.get("turn_id") or "")
+            system_check_id = str(record.get("system_check_id") or "")
             self._system_check_turn_ids.discard(system_check_id)
             self._system_check_output_turn_ids.discard(system_check_id)
 
     async def end(self, reason):
         old = self.episode_id
         self.scheduler.disarm()
+        await self._stop_heartbeat_clock()
         self.recovery_queue.clear()
         self.active_dispatch_context = None
         self.output.cancel_all(reason)
@@ -3250,6 +3871,9 @@ class AgentEpisodeRuntime:
         if old:
             self.registry.cancel_turn(old)
         self.pending.clear()
+        self._system_check_speeches.clear()
+        self._system_check_turn_ids.clear()
+        self._system_check_output_turn_ids.clear()
         await self.log("EPISODE_ENDED", reason=reason)
         self.episode_id = None
         self.persona_documents = PersonaDocuments()

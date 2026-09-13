@@ -10,8 +10,10 @@ from voice_terminal.agent.episode import (
     FORCED_POLL_PROMPT,
     AgentDecisionScheduler,
     AgentEpisodeRuntime,
+    EpisodeHeartbeatClock,
 )
 from voice_terminal.agent.options import AgentOptions
+from voice_terminal.agent.decision_envelope import DecisionEnvelope, SpeechDecision
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
 
@@ -174,19 +176,33 @@ def test_pending_ordinary_work_does_not_consume_final_window_before_start():
     assert value.final_dispatched is True
 
 
-def test_long_pause_resets_silence_ladder_and_heartbeat_axis():
+def test_long_pause_coalesces_to_latest_checkpoint_without_resetting_anchor():
     value = scheduler()
-    value.arm(0.0, wall_time=100.0)
+    value.arm(0.0, wall_time=100.0, turn_id="turn-a")
     value.start_heartbeat(0.0)
-    value.advance(8.8)
     old_generation = value.generation
 
-    assert value.reset_after_pause(20.0, wall_time=120.0) is True
-    assert value.generation == old_generation + 1
-    assert value.anchor_monotonic == 20.0
-    assert value.window_index == 0
-    assert value.final_pending is False
-    assert value.next_heartbeat == pytest.approx(20.4)
+    value.advance(8.8)
+    candidate = value.forced_due(now=8.8)
+
+    assert candidate["window_index"] == 22
+    assert candidate["speech_turn_id"] == "turn-a"
+    assert value.take_newly_coalesced_windows() == [3, 6, 9, 16]
+    assert value.generation == old_generation
+    assert value.anchor_monotonic == 0.0
+    assert value.anchor_wall_time == 100.0
+    assert value.snapshot()["resolutions"] == {
+        3: "coalesced_after_delay",
+        6: "coalesced_after_delay",
+        9: "coalesced_after_delay",
+        16: "coalesced_after_delay",
+    }
+
+    value.advance(20.0)
+    final = value.forced_due(now=20.0)
+    assert final["prompt_kind"] == "final_silence"
+    assert value.take_newly_coalesced_windows() == [22]
+    assert value.generation == old_generation
 
 
 def test_force_and_final_prompts_are_mutually_exclusive():
@@ -280,6 +296,8 @@ def test_episode_end_clears_the_runner_and_heartbeat_axis():
         runtime._wake("SPEECH_STARTED")
         await asyncio.sleep(0)
         assert runtime.runner is not None and not runtime.runner.done()
+        clock = runtime._heartbeat_clock
+        assert clock is not None and clock.alive
 
         await runtime.end("reset")
 
@@ -287,6 +305,8 @@ def test_episode_end_clears_the_runner_and_heartbeat_axis():
         assert runtime.active_request is None
         assert runtime.scheduler.next_heartbeat is None
         assert runtime.scheduler.armed is False
+        assert runtime._heartbeat_clock is None
+        assert clock.alive is False
 
     asyncio.run(scenario())
 
@@ -346,7 +366,14 @@ def test_runtime_heartbeat_continues_while_active_request_is_running():
         # clock in this test makes the non-blocking property fast to verify.
         runtime.scheduler.interval = 0.01
         await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-a", text="你好")
-        await asyncio.sleep(0.08)
+        for _ in range(50):
+            if provider.calls:
+                break
+            await asyncio.sleep(0.01)
+        for _ in range(100):
+            if runtime.scheduler.window_index >= 6:
+                break
+            await asyncio.sleep(0.01)
 
         assert provider.calls == 1
         assert runtime.active_request is not None
@@ -390,23 +417,28 @@ def test_speaking_semantic_mailbox_dispatches_once_and_coalesces():
     asyncio.run(scenario())
 
 
-def test_speaking_timer_only_candidates_remain_gated():
+def test_speaking_does_not_gate_timer_only_candidates():
     async def scenario():
         provider = _BlockingProvider()
         runtime = _speaking_runtime(provider)
         runtime.user_speaking = True
         runtime.scheduler.start_heartbeat(9.6)
 
-        runtime.scheduler.arm(8.79)
+        runtime.scheduler.arm(8.79, turn_id="turn-a")
         await runtime._on_heartbeat(10.0)
-        assert provider.calls == 0
-        assert runtime.scheduler.snapshot()["skipped_windows"] == [3]
+        await asyncio.sleep(0)
+        assert provider.calls == 1
+        assert runtime.active_dispatch_context["system_check_id"].startswith("system-check-")
+        assert runtime.active_dispatch_context["speech_turn_id"] == "turn-a"
+        await _finish_blocking_request(runtime, provider)
 
-        runtime.scheduler.arm(0.39)
+        runtime.scheduler.arm(0.39, turn_id="turn-a")
         await runtime._on_heartbeat(10.4)
-        assert provider.calls == 0
-        assert runtime.scheduler.final_pending is True
-        assert runtime.scheduler.final_dispatched is False
+        await asyncio.sleep(0)
+        assert provider.calls == 2
+        assert runtime.scheduler.final_pending is False
+        assert runtime.scheduler.final_dispatched is True
+        await _finish_blocking_request(runtime, provider)
 
     asyncio.run(scenario())
 
@@ -463,12 +495,18 @@ def test_system_check_delivery_is_tagged_without_user_turn_settlement():
         runtime.episode_id = "conversation-a"
         runtime.agent_step_id = "request-a"
         runtime._system_check_turn_ids.add("system-check-a")
+        runtime._system_check_output_turn_ids.add("system-check-a")
+        runtime._system_check_speeches["speech-a"] = {
+            "system_check_id": "system-check-a",
+            "speech_turn_id": "turn-a",
+            "scheduler_generation": 3,
+        }
 
         await runtime.output_completed({
             "speech_id": "speech-a",
             "conversation_id": "conversation-a",
             "request_id": "request-a",
-            "turn_id": "system-check-a",
+            "turn_id": "turn-a",
             "text": "我还在这里。",
             "status": "completed",
         })
@@ -476,7 +514,222 @@ def test_system_check_delivery_is_tagged_without_user_turn_settlement():
         speech = next(payload for kind, payload in emitted if kind == "speech.completed")
         assert speech["owner_scope"] == "system_check"
         assert speech["system_check_id"] == "system-check-a"
+        assert speech["turn_id"] == "turn-a"
+        assert speech["speech_turn_id"] == "turn-a"
+        assert speech["scheduler_generation"] == 3
         assert not any(kind == "agent.turn_settled" for kind, _payload in emitted)
         assert runtime._system_check_turn_ids == set()
+
+    asyncio.run(scenario())
+
+
+def test_tts_state_never_blocks_llm_dispatch_authorization():
+    runtime = _speaking_runtime(_BlockingProvider())
+    runtime.output.active = True
+    runtime.output.busy = True
+    runtime.output.status = "SPEAKING"
+    runtime.output.queue_snapshot = [{"speech_id": "speech-a"}]
+    runtime.user_speaking = True
+
+    assert runtime._dispatch_allowed() is True
+    assert runtime._busy_reason() == "not_allowed"
+
+
+def test_system_check_keeps_system_identity_but_uses_current_speech_turn():
+    async def scenario():
+        provider = _BlockingProvider()
+        runtime = _speaking_runtime(provider)
+        runtime.output.speak_snapshot = {
+            "queue_status": "speaking",
+            "conversation_id": runtime.episode_id,
+            "turn_id": "turn-a",
+            "speech_id": "speech-a",
+            "output_generation": 1,
+            "text": "我先说明第一点。",
+        }
+        runtime.scheduler.arm(0.0, turn_id="turn-a")
+        runtime.scheduler.advance(1.2)
+        candidate = runtime.scheduler.forced_due(now=1.2)
+
+        assert await runtime._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate) is True
+        await asyncio.sleep(0)
+
+        context = runtime.active_dispatch_context
+        assert context["system_check_id"].startswith("system-check-")
+        assert context["speech_turn_id"] == "turn-a"
+        assert runtime.active_request_source_turn_id == "turn-a"
+        assert runtime._last_model_speak_state == {
+            "state": "speaking",
+            "owner_scope": "current_turn",
+            "continuation_allowed": True,
+            "target_text": "我先说明第一点。",
+        }
+
+        await _finish_blocking_request(runtime, provider)
+
+    asyncio.run(scenario())
+
+
+def test_system_check_extension_uses_existing_append_transaction():
+    async def scenario():
+        class Handle:
+            speech_id = "speech-suffix"
+
+            async def finish(self):
+                return None
+
+        class Output:
+            active = True
+            status = "SPEAKING"
+            queue_snapshot = []
+            speak_snapshot = {
+                "queue_status": "speaking",
+                "conversation_id": "conversation-a",
+                "turn_id": "turn-a",
+                "speech_id": "speech-base",
+                "output_generation": 4,
+                "text": "已有回答",
+            }
+
+            def __init__(self):
+                self.appended = []
+
+            async def append_successor(self, identity, turn_id, **kwargs):
+                self.appended.append((identity, turn_id, kwargs))
+                return Handle()
+
+            async def replace_current(self, *_args, **_kwargs):
+                raise AssertionError("a strict extension must not replace speech")
+
+        runtime = _speaking_runtime(_BlockingProvider())
+        runtime.episode_id = "conversation-a"
+        runtime.output = Output()
+        context = {
+            "owner_scope": "system_check",
+            "system_check_id": "system-check-a",
+            "speech_turn_id": "turn-a",
+            "generation": 1,
+        }
+        envelope = DecisionEnvelope(
+            SpeechDecision("speak", "calm", "已有回答，补充一点。"), (),
+        )
+
+        await runtime._apply_decision_v06(
+            ("conversation-a", "request-a"), "turn-a", envelope,
+            dispatch_context=context,
+        )
+
+        assert len(runtime.output.appended) == 1
+        identity, turn_id, kwargs = runtime.output.appended[0]
+        assert identity == ("conversation-a", "request-a")
+        assert turn_id == "turn-a"
+        assert kwargs["suffix"] == "，补充一点。"
+        assert runtime._system_check_speeches["speech-suffix"] == {
+            "system_check_id": "system-check-a",
+            "speech_turn_id": "turn-a",
+            "scheduler_generation": 1,
+        }
+
+    asyncio.run(scenario())
+
+
+def test_thread_heartbeat_coalesces_while_event_loop_is_blocked():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        pulses = []
+        clock = EpisodeHeartbeatClock(
+            interval=0.01,
+            episode_generation=7,
+            loop=loop,
+            callback=pulses.append,
+        )
+        clock.start()
+        try:
+            # Intentionally block only this test loop.  The heartbeat thread
+            # must continue advancing its absolute sequence meanwhile.
+            import time
+            time.sleep(0.065)
+            await asyncio.sleep(0.02)
+        finally:
+            clock.stop()
+            await asyncio.to_thread(clock.join)
+
+        assert pulses
+        assert pulses[0].episode_generation == 7
+        assert pulses[0].sequence >= 2
+        assert pulses[0].coalesced_count >= 1
+
+    asyncio.run(scenario())
+
+
+def test_new_scheduler_generation_discards_late_system_check_speech():
+    async def scenario():
+        class Provider:
+            transport = "responses"
+            protocol_recovery_limit = 1
+
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            def stream_events(self, _messages, *, json_mode=False):
+                assert json_mode is True
+
+                async def stream():
+                    self.started.set()
+                    await self.release.wait()
+                    yield {
+                        "type": "content",
+                        "text": '{"speak":{"state":"speak","emotion":"calm","text":"旧检查输出"},"actions":[]}',
+                    }
+                    yield {"type": "finish", "reason": "stop"}
+
+                return stream()
+
+        class Output:
+            active = False
+            status = "IDLE"
+            queue_snapshot = []
+            speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+
+            def __init__(self):
+                self.begin_calls = 0
+
+            async def begin(self, *_args, **_kwargs):
+                self.begin_calls += 1
+                raise AssertionError("stale system-check speech must not enter output")
+
+            def cancel_all(self, _reason):
+                return None
+
+        emitted = []
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+
+        provider = Provider()
+        runtime = _speaking_runtime(provider)
+        runtime.output = Output()
+        runtime.emit = emit
+        runtime.scheduler.arm(0.0, turn_id="turn-a")
+        runtime.scheduler.advance(1.2)
+        candidate = runtime.scheduler.forced_due(now=1.2)
+
+        assert await runtime._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate)
+        request = runtime.active_request
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        runtime.scheduler.arm(2.0, turn_id="turn-a")
+        provider.release.set()
+        assert await asyncio.wait_for(request, timeout=1) == "system_check_stale"
+        await runtime._finish_active_request(request)
+
+        assert runtime.output.begin_calls == 0
+        stale = [
+            payload for kind, payload in emitted
+            if kind == "agent.trace" and payload.get("kind") == "SYSTEM_CHECK_STALE"
+        ]
+        assert len(stale) == 1
+        assert stale[0]["speech_turn_id"] == "turn-a"
+        assert stale[0]["stale_system_check_output_discarded"] is True
 
     asyncio.run(scenario())
