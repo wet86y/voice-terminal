@@ -44,9 +44,10 @@ def test_context_projects_current_input_as_tail_and_runtime_time_excludes_schedu
     assert "SPEECH_STARTED" not in rendered
 
 
-def test_final_and_refinement_share_one_user_history_frame_and_runtime_update_object():
+def test_late_refinement_keeps_user_history_frozen_and_exposes_runtime_update_object():
     ledger = SessionLedger()
     ledger.commit_input("turn-a", "明天开会")
+    initial_history = ledger.context_messages("")
     ledger.update_input_refinement("turn-a", "明天下午开会")
 
     messages = ledger.context_messages("")
@@ -54,8 +55,8 @@ def test_final_and_refinement_share_one_user_history_frame_and_runtime_update_ob
     assert len(user_messages) == 1
     assert json.loads(user_messages[0]["content"].removeprefix("用户语音最终文本：")) == {
         "asr_final": "明天开会",
-        "refinement": "明天下午开会",
     }
+    assert user_messages[0] == initial_history[0]
     assert not any(item["role"] == "system" and "精修补充" in item["content"] for item in messages)
 
     current = CurrentInput(
@@ -69,6 +70,25 @@ def test_final_and_refinement_share_one_user_history_frame_and_runtime_update_ob
     runtime = LLMContextProjector.runtime_tail(current=current, speak_state={"state": "empty"})
     assert '"same_user_turn":true' in runtime
     assert '"triggered_by":["refinement"]' in runtime
+    assert '"kind":"refinement"' in runtime
+    assert '"text":"明天下午开会"' in runtime
+
+
+def test_refinement_available_when_input_commits_is_part_of_frozen_history_only_once():
+    ledger = SessionLedger()
+    ledger.commit_input("turn-a", "明天开会", details={"refined_text": "明天下午开会"})
+    initial_history = ledger.context_messages("")
+
+    ledger.update_input_refinement("turn-a", "明天上午开会")
+
+    user_messages = [item for item in ledger.context_messages("") if item["role"] == "user"]
+    assert len(user_messages) == 1
+    assert user_messages[0] == initial_history[0]
+    assert json.loads(user_messages[0]["content"].removeprefix("用户语音最终文本：")) == {
+        "asr_final": "明天开会",
+        "refinement": "明天下午开会",
+    }
+    assert ledger.input_refinement("turn-a") == "明天上午开会"
 
 
 def test_full_delivery_commits_original_speech_once_even_if_alignment_heard_text_is_empty():

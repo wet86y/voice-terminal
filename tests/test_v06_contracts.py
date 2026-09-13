@@ -1262,6 +1262,135 @@ def test_streamed_cross_turn_completed_prefix_is_stripped_before_tts():
     asyncio.run(scenario())
 
 
+def test_streamed_same_turn_completed_prefix_uses_only_suffix_for_refinement():
+    async def scenario():
+        seen = {"feeds": [], "append": 0}
+
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","text":"已经播出的回答。'}
+                    yield {"type": "content", "text": '补充的新事实。"},"actions":[]}' }
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Handle:
+            speech_id = "suffix_speech"
+            async def feed(self, value): seen["feeds"].append(value)
+            async def finish(self): seen["finished"] = True
+
+        class Output:
+            status = "IDLE"
+            speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+            last_completed_speech = None
+            async def begin(self, *_args, **_kwargs): return Handle()
+            async def append_successor(self, *_args, **_kwargs):
+                seen["append"] += 1
+                return Handle()
+
+        events = []
+        async def emit(kind, payload): events.append((kind, payload))
+        conversation = ConversationRuntime(); conversation.begin_turn("turn-a")
+        output = Output()
+        output.last_completed_speech = {
+            "speech_id": "completed_speech", "conversation_id": conversation.conversation_id,
+            "turn_id": "turn-a", "output_generation": 1,
+            "text": "已经播出的回答。", "heard_text": "已经播出的回答。",
+            "delivery_status": "full", "termination": "completed", "status": "completed",
+        }
+        runtime = AgentEpisodeRuntime(Provider(), Registry(), output, emit,
+                                      conversation=conversation, ledger=SessionLedger())
+        runtime.episode_id = conversation.conversation_id; runtime.last_turn_id = "turn-a"
+        runtime.inputs = {"turn-a": {"text": "原始转录", "final": True}}
+        identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"
+        runtime._identity_turns[identity] = "turn-a"
+
+        await runtime._step(identity, {"USER_INPUT_REFINED"})
+
+        assert seen["feeds"] == ["补充的新事实。"]
+        assert seen["append"] == 0 and seen["finished"]
+        traces = [payload for kind, payload in events if kind == "agent.trace"]
+        stripped = next(item for item in traces
+                        if item["kind"] == "SPEECH_COMPLETED_SAME_TURN_PREFIX_STRIPPED")
+        assert stripped["baseline_source"] == "completed_same_turn_guard"
+        assert stripped["reason"] == "completed_same_turn_extension"
+
+    asyncio.run(scenario())
+
+
+def test_completed_same_turn_identical_speak_is_ignored_only_for_transcript_reassessment():
+    async def scenario():
+        begun, events = [], []
+
+        class Registry:
+            def begin_turn(self, _): pass
+            def action_definitions(self): return []
+
+        class Output:
+            status = "IDLE"
+            speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+            last_completed_speech = None
+            async def begin(self, *_args, **_kwargs):
+                begun.append(True)
+                raise AssertionError("an identical same-turn replay must not reach TTS")
+
+        async def emit(kind, payload): events.append((kind, payload))
+        conversation = ConversationRuntime(); conversation.begin_turn("turn-a")
+        output = Output()
+        output.last_completed_speech = {
+            "speech_id": "completed_speech", "conversation_id": conversation.conversation_id,
+            "turn_id": "turn-a", "output_generation": 1,
+            "text": "已经播出的回答。", "heard_text": "已经播出的回答。",
+            "delivery_status": "full", "termination": "completed", "status": "completed",
+        }
+        runtime = AgentEpisodeRuntime(None, Registry(), output, emit,
+                                      conversation=conversation, ledger=SessionLedger())
+        runtime.episode_id = conversation.conversation_id
+        identity = (runtime.episode_id, "request")
+        envelope = DecisionEnvelope(SpeechDecision("speak", "calm", "已经播出的回答。"), ())
+        runtime._applying_transcript_reassessment = True
+
+        await runtime._apply_decision_v06(identity, "turn-a", envelope)
+
+        assert not begun
+        assert runtime.current_action == "wait"
+        assert any(kind == "speech.append_ignored"
+                   and payload["reason"] == "completed_same_turn_identical"
+                   for kind, payload in events)
+
+    asyncio.run(scenario())
+
+
+def test_completed_same_turn_guard_does_not_extend_during_non_transcript_dispatch():
+    class Registry:
+        def begin_turn(self, _): pass
+        def action_definitions(self): return []
+
+    async def emit(*_args): pass
+    conversation = ConversationRuntime(); conversation.begin_turn("turn-a")
+    output = SimpleNamespace(
+        last_completed_speech={
+            "speech_id": "completed_speech", "conversation_id": conversation.conversation_id,
+            "turn_id": "turn-a", "output_generation": 1,
+            "text": "已经播出的回答。", "heard_text": "已经播出的回答。",
+            "delivery_status": "full", "termination": "completed", "status": "completed",
+        },
+    )
+    runtime = AgentEpisodeRuntime(None, Registry(), output, emit,
+                                  conversation=conversation, ledger=SessionLedger())
+    runtime.episode_id = conversation.conversation_id
+
+    assert runtime._completed_speech_guard((runtime.episode_id, "request"), "turn-a") is None
+    guard = runtime._completed_speech_guard(
+        (runtime.episode_id, "request"), "turn-a", allow_same_turn=True,
+    )
+    assert guard is not None and guard["source"] == "completed_same_turn_guard"
+
+
 def test_exact_previous_completed_text_remains_a_valid_explicit_replay():
     async def scenario():
         seen = []

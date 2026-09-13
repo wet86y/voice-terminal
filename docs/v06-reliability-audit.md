@@ -20,12 +20,12 @@ V0.6 以 JSON 响应信封取代 DeepSeek 原生工具调用，但不移除已�
 
 - 用户在 `playback_started=false` 阶段讲话时，语音候选进入 `HELD`；保留文本和 handle，不取消在飞 LLM。TTS session 即使已经建立，也不得继续发送文本、拉取新的 provider PCM 或让播放器消费队列；已经进入播放器的未播放 PCM 保留在队列中并由 player hold 阻止消费。
 - 普通语音活动、ASR segment/final、SenseVoice 精修和动作完成不会取消在飞 LLM；这些用户信息继续进入 pending mailbox，由默认 400ms scheduler tick 合并处理。只有确认 barge-in、stop、reset、输入不可用、传输清理和播放中实质改口会显式取消。
-- Paraformer final 与 SenseVoice refinement 是同一 `turn_id` 下的 `transcript_updates`，各自在到达时独立进入现有调度器；同窗口只自然合并，不互相等待。首次合法更新即使文本相同也必须对模型可见，本地只按 source revision 幂等，不再推断 `confirmed/suffix/rewrite`。模型通过 `available/triggered_by + runtime.speak + assistant HISTORY` 决定 wait、追加、替换或 cancel。
+- Paraformer final 与 SenseVoice refinement 是同一 `turn_id` 下的 `transcript_updates`，各自在到达时独立进入现有调度器；同窗口只自然合并，不互相等待。首次合法更新即使文本相同也必须对模型可见，本地只按 source revision 幂等，不再推断 `confirmed/suffix/rewrite`。模型通过 `available/triggered_by + runtime.speak + assistant HISTORY` 决定 wait、追加、替换或 cancel。晚到 refinement 只能更新 request tail 和诊断/前端转录状态；已经发送给主模型的 user HISTORY frame 在该 Episode 内冻结，绝不因精修回写。
 - `cancel` 立即停止待播或正在播放的输出并清理 hold；`wait` 完全不改变事务。`SPEECH_ENDED` 释放最新的 `HELD` 候选并恢复原有文本事务，不重新调用 LLM 或重复发送整段文本。
 - 播放中收到首个合法且非空的 `speak` 文本前缀时，先按 `conversation_id + turn_id` 检查 speech 所有权。同轮新文本完整覆盖旧文本时只提取 suffix，当前 PCM 不停止、不清空、不重播；跨轮活动文本只作为 `observed_text`，不得调用 `append_successor`。已接受的同轮文本范围内出现差异时，输出层才原子关闭旧 PCM generation 并启动新的 TTS transaction，旧 provider cancel/close 在后台完成，迟到 PCM 不得进入新 playback key。
 - 当前输出耗尽后保留 1 秒追加窗口。窗口内的同前缀扩展会进入不重播前缀的后续队列；窗口外仍只合成新增 suffix。`speech.append_waiting_prefix`、`speech.appended`、`speech.append_successor` 和 `append_window_*` 进度事件用于重建该路径。
 - 如果已追加的流式 `speak` 随后完整 JSON 或动作校验失败，已获合法前缀授权的追加文本保留，并使用一次既有恢复请求纠正协议；已播放旧内容不会恢复或续播。
-- 完成播放后，播放器先冻结快照，再进入 1 秒追加窗口。满足 completed、非零 PCM、播放器开始、缓冲清空、设备尾部完成且输出时长覆盖入队时长时，完整播放事实强制得到 `delivery=full`，不能被 provider 字幕降级；完整 speech 文本按 `speech_id` 幂等写入 assistant ledger。handle 清理与 history commit 之间由内部 settling 保持 TTS busy。最近一次同会话 full delivery 仅用于检测异常跨轮累计；“已听文本 + 非空后缀”会在 TTS 前剥离旧前缀，完全相同文本保留显式复述能力，不同会话和 partial delivery 不参与比较。
+- 完成播放后，播放器先冻结快照，再进入 1 秒追加窗口。满足 completed、非零 PCM、播放器开始、缓冲清空、设备尾部完成且输出时长覆盖入队时长时，完整播放事实强制得到 `delivery=full`，不能被 provider 字幕降级；完整 speech 文本按 `speech_id` 幂等写入 assistant ledger。handle 清理与 history commit 之间由内部 settling 保持 TTS busy。最近一次同会话 full delivery 默认只用于检测异常跨轮累计，跨轮完整同文仍保留显式复述能力；但本轮由 `USER_INPUT_FINALIZED/REFINED` 重评估触发时，已完成 full delivery 可作为严格逐字基线：同文不再进入 TTS，完整旧前缀后的内容只播放新增 suffix。不同前缀仍按真正修正处理；partial delivery、不同会话和普通 heartbeat 不参与同轮追加比较。
 - 当前活动快照不得借用其他 speech handle 的 `last_delivery`。无法证明与当前 `speech_id` 绑定的 `heard_text` 必须省略，避免把上一轮交付错误投影到新目标。
 - 冻结历史路径曾对 DeepSeek thinking 请求使用 `response_format=json_object`。当前活动路径改为 Responses + strict `json_schema`，仍不传递 provider native tools；工具资料仅经本地 `actions` 和不可信账本来源块进入下一请求。快速与均衡模式的基础请求保持 `effort=none`；均衡模式可通过本地 `request_thinking` 触发一次 `effort=low` 续请求，深度模式直接使用 `effort=low`。
 
