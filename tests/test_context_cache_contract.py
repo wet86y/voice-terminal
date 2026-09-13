@@ -7,6 +7,7 @@ from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.providers.deepseek import DeepSeekClient
 from voice_terminal.session.context import CurrentInput, LLMContextProjector
 from voice_terminal.session.context_frames import ContextFrame, ContextLane
+from voice_terminal.session.contracts import DeliveryReport
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
 
@@ -99,3 +100,75 @@ def test_context_guards_reject_history_rewrite_and_static_drift():
     rewritten[1] = ContextFrame.make(ContextLane.HISTORY, "user", "changed")
     with pytest.raises(RuntimeError, match="history"):
         episode._guard_context_contract(rewritten)
+
+
+def test_late_refinement_does_not_rewrite_cached_history_prefix():
+    """The production P0 sequence must remain cache-prefix safe.
+
+    A Paraformer final can be used to answer the user before SenseVoice
+    returns.  Once an assistant delivery has followed it, the late refinement
+    must be request-tail evidence for that same turn, never a mutation of the
+    earlier user HISTORY frame.
+    """
+
+    class Registry:
+        def action_definitions(self):
+            return []
+
+    async def emit(*_args):
+        return None
+
+    ledger = SessionLedger()
+    projector = LLMContextProjector()
+    episode = AgentEpisodeRuntime(
+        None, Registry(), object(), emit,
+        conversation=ConversationRuntime(), ledger=ledger,
+    )
+    before_current = CurrentInput(
+        text="初始转录", primary_transcript="初始转录",
+        finalized=True, turn_id="turn-a",
+        transcript_updates=(
+            {"kind": "asr_final", "source": "paraformer", "text": "初始转录", "revision": 1},
+        ),
+    )
+
+    def request(current: CurrentInput):
+        return [
+            ContextFrame.make(ContextLane.STATIC_INSTRUCTIONS, "system", "stable rules"),
+            *projector.project(ledger, current),
+            ContextFrame.make(
+                ContextLane.REQUEST_TAIL, "system",
+                projector.runtime_tail(current=current, speak_state={"state": "empty"}),
+            ),
+        ]
+
+    ledger.commit_input("turn-a", "初始转录")
+    before = request(before_current)
+    episode._guard_context_contract(before)
+    before_history = [frame for frame in before if frame["context_lane"] == ContextLane.HISTORY]
+
+    ledger.commit_delivery("speech-a", "已经完整播出的回答", DeliveryReport(
+        status="full", termination="completed", heard_text="", precision="playback_complete",
+    ))
+    ledger.update_input_refinement("turn-a", "晚到精修转录")
+    after_current = CurrentInput(
+        text="初始转录", primary_transcript="初始转录",
+        finalized=True, turn_id="turn-a", recent_events=("USER_INPUT_REFINED",),
+        transcript_updates=(
+            {"kind": "asr_final", "source": "paraformer", "text": "初始转录", "revision": 1},
+            {"kind": "refinement", "source": "sensevoice", "text": "晚到精修转录", "revision": 2},
+        ),
+    )
+    after = request(after_current)
+
+    # Regression assertion: this used to raise
+    # ``existing history frames changed during a session`` here.
+    episode._guard_context_contract(after)
+    after_history = [frame for frame in after if frame["context_lane"] == ContextLane.HISTORY]
+    assert after_history[:1] == before_history
+    assert after_history[1]["role"] == "assistant"
+    assert after_history[1]["content"] == "已经完整播出的回答"
+    assert '"refinement":"晚到精修转录"' not in after_history[0]["content"]
+    assert '"kind":"refinement"' in after[-1]["content"]
+    assert '"text":"晚到精修转录"' in after[-1]["content"]
+    assert '"triggered_by":["refinement"]' in after[-1]["content"]

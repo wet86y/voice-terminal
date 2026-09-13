@@ -164,8 +164,21 @@ class SessionLedger:
         }
 
     @staticmethod
-    def _render_input(entry: SessionLedgerEntry) -> str:
-        updates = entry.metadata.get("transcript_updates")
+    def _render_input_snapshot(content: Any, metadata: dict[str, Any]) -> str:
+        """Render the transcript evidence available at one fixed instant.
+
+        ``transcript_updates`` intentionally remains mutable operational
+        state: a late SenseVoice result belongs to the same user turn and is
+        useful to the UI, diagnostics, Shadow, and the current request tail.
+        A model HISTORY frame has the opposite contract, however: after it
+        has been sent once it is part of the provider-cacheable prefix and
+        must never be regenerated from that mutable state.  This helper is
+        therefore used only while creating that immutable snapshot, plus as a
+        backwards-compatible fallback for ledger entries made before the
+        snapshot field existed.
+        """
+
+        updates = metadata.get("transcript_updates")
         transcript: dict[str, str] = {}
         if isinstance(updates, list):
             for update in updates:
@@ -175,14 +188,41 @@ class SessionLedger:
                 value = str(update.get("text") or "").strip()
                 if kind in {"asr_final", "refinement"} and value:
                     transcript[str(kind)] = value
-        if not transcript and isinstance(entry.content, str) and entry.content.strip():
-            transcript["asr_final"] = entry.content.strip()
-            refined = entry.metadata.get("refined_text")
+        if not transcript and isinstance(content, str) and content.strip():
+            transcript["asr_final"] = content.strip()
+            refined = metadata.get("refined_text")
             if isinstance(refined, str) and refined.strip():
                 transcript["refinement"] = refined.strip()
         return "用户语音最终文本：" + json.dumps(
             transcript, ensure_ascii=False, separators=(",", ":"),
         )
+
+    @classmethod
+    def _render_input(cls, entry: SessionLedgerEntry) -> str:
+        """Return the immutable model-history rendering for one input.
+
+        New entries always carry ``history_content``.  Do not replace it in
+        ``update_input_refinement``: doing so would rewrite an earlier
+        HISTORY frame and make every later LLM request fail the cache-prefix
+        contract.  The fallback only supports an entry created by an older
+        runtime; it is frozen before that entry is first mutated below.
+        """
+
+        frozen = entry.metadata.get("history_content")
+        if isinstance(frozen, str) and frozen.strip():
+            return frozen
+        return cls._render_input_snapshot(entry.content, entry.metadata)
+
+    @classmethod
+    def _freeze_input_history(cls, entry: SessionLedgerEntry) -> str:
+        """Persist and return an input's model-visible immutable snapshot."""
+
+        frozen = entry.metadata.get("history_content")
+        if isinstance(frozen, str) and frozen.strip():
+            return frozen
+        frozen = cls._render_input_snapshot(entry.content, entry.metadata)
+        entry.metadata["history_content"] = frozen
+        return frozen
 
     @staticmethod
     def _upsert_transcript_update(metadata: dict[str, Any], update: dict[str, Any]) -> None:
@@ -216,7 +256,12 @@ class SessionLedger:
                 "kind": "refinement", "source": "sensevoice",
                 "text": refined.strip(), "revision": 2,
             })
-        self.entries.append(SessionLedgerEntry("input", value, metadata))
+        entry = SessionLedgerEntry("input", value, metadata)
+        # This is the only point at which a newly committed user turn is
+        # projected into main-model HISTORY.  Refinements that arrive later
+        # continue to update metadata, but never this frozen model text.
+        self._freeze_input_history(entry)
+        self.entries.append(entry)
         self._commit_shadow_input("user", "user_input", {
             "turn_id": turn_id, "transcript": value,
             "transcript_updates": metadata.get("transcript_updates", []),
@@ -260,6 +305,10 @@ class SessionLedger:
         for entry in reversed(self.entries):
             if entry.kind != "input" or entry.metadata.get("turn_id") != turn_id:
                 continue
+            # Older in-memory entries can lack the field introduced above.
+            # Capture their pre-refinement form before changing any metadata;
+            # this makes a rolling upgrade safe for an already active Episode.
+            frozen_history = self._freeze_input_history(entry)
             entry.metadata["refined_text"] = value
             if details:
                 entry.metadata.update(details)
@@ -270,6 +319,10 @@ class SessionLedger:
             self._upsert_transcript_update(entry.metadata, {
                 "kind": "refinement", "source": "sensevoice", "text": value, "revision": revision,
             })
+            # ``details`` is diagnostic/UI state supplied by the controller.
+            # It must not be able to replace a prefix that may already have
+            # been handed to the provider.
+            entry.metadata["history_content"] = frozen_history
             stored_updates = [dict(item) for item in entry.metadata["transcript_updates"]]
             break
         if stored_updates is not None:
