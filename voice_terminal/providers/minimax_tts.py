@@ -166,6 +166,26 @@ class MiniMaxTtsSession:
             self._audio.close()
             self._audio = None
 
+    def _closed_error(self, operation: str) -> MiniMaxTtsError:
+        return MiniMaxTtsError(f"MiniMax TTS 会话已关闭，无法{operation}")
+
+    async def _send_bidi_event(self, payload: dict[str, Any], *, operation: str) -> None:
+        """Send one frame without dereferencing a socket detached by ``close``.
+
+        The lock covers only the local state check and one socket write.  In
+        particular, callers must not hold it while waiting for a provider
+        confirmation, because cancellation and replacement need to close a
+        session immediately.
+        """
+
+        async with self._send_lock:
+            if self._closed:
+                raise self._closed_error(operation)
+            socket = self._socket
+            if socket is None:
+                raise self._closed_error(operation)
+            await socket.send(json.dumps(payload, ensure_ascii=False))
+
     async def start(self) -> None:
         # Prewarm and the first real text can race on the same retained
         # session.  Serialize the handshake so task_start is sent exactly
@@ -482,15 +502,17 @@ class MiniMaxTtsSession:
                 raise MiniMaxTtsError("MiniMax TTS 任务已结束")
             self._reset_generation()
         self._generation_active = True
-        if self._receiver is not None and self._receiver.done():
+        receiver = self._receiver
+        if receiver is not None and receiver.done():
             if self._error is not None:
                 raise self._error
             raise MiniMaxTtsError(
                 f"MiniMax TTS 任务已结束（最后事件：{self._last_event or 'unknown'}）"
             )
-        async with self._send_lock:
-            self._sent_texts.append(text)
-            await self._socket.send(json.dumps({"event": "task_continue", "text": text}, ensure_ascii=False))
+        await self._send_bidi_event(
+            {"event": "task_continue", "text": text}, operation="发送文本"
+        )
+        self._sent_texts.append(text)
         logger.info("minimax.task_continue chars=%d text=%r", len(text), text[:120])
 
     async def flush(self) -> None:
@@ -503,17 +525,22 @@ class MiniMaxTtsSession:
             return
         await self._backpressure_idle.wait()
         self._flush_confirmed.clear()
-        async with self._send_lock:
-            await self._socket.send(json.dumps({"event": "task_flush"}))
+        await self._send_bidi_event({"event": "task_flush"}, operation="flush")
         logger.info("minimax.task_flush_sent")
-        if self._receiver is not None:
+        # ``close`` deliberately detaches ``self._receiver`` before awaiting
+        # its cancellation.  Retain the task that belongs to this flush so a
+        # later polling iteration cannot dereference ``None``.
+        receiver = self._receiver
+        if receiver is not None:
             deadline = asyncio.get_running_loop().time() + float(
                 getattr(self.client, "receive_timeout_seconds", 120.0)
             )
             while not self._flush_confirmed.is_set():
+                if self._closed:
+                    raise self._closed_error("等待 flush 确认")
                 if self._error is not None:
                     raise self._error
-                if self._receiver.done():
+                if receiver.done():
                     raise MiniMaxTtsError(
                         "MiniMax Bidi 接收任务已结束，未确认 task_flushed"
                     )
@@ -545,8 +572,7 @@ class MiniMaxTtsSession:
         self._cancel_confirmed.clear()
         self._cancel_requested = True
         self._retry_cancel.set()
-        async with self._send_lock:
-            await self._socket.send(json.dumps({"event": "task_cancel"}))
+        await self._send_bidi_event({"event": "task_cancel"}, operation="取消任务")
         timeout = timeout_seconds or float(getattr(self.client, "cancel_timeout_seconds", 2.0))
         if self._receiver is None:
             return True
@@ -560,10 +586,13 @@ class MiniMaxTtsSession:
         deadline = asyncio.get_running_loop().time() + float(
             timeout if timeout is not None else getattr(self.client, "cancel_timeout_seconds", 2.0)
         )
+        receiver = self._receiver
         while not self._cancel_confirmed.is_set():
+            if self._closed:
+                raise self._closed_error("等待取消确认")
             if self._error is not None:
                 raise self._error
-            if self._receiver is not None and self._receiver.done():
+            if receiver is not None and receiver.done():
                 raise MiniMaxTtsError(
                     "MiniMax Bidi 接收任务已结束，未确认 task_canceled"
                 )
@@ -585,8 +614,7 @@ class MiniMaxTtsSession:
         if self._socket is None:
             return
         self._finish_requested = True
-        async with self._send_lock:
-            await self._socket.send(json.dumps({"event": "task_finish"}))
+        await self._send_bidi_event({"event": "task_finish"}, operation="结束任务")
         logger.info("minimax.task_finish_sent")
 
     async def audio_chunks(self):
@@ -735,9 +763,10 @@ class MiniMaxTtsSession:
                     await asyncio.gather(sleep_task, cancel_task, return_exceptions=True)
                 if self._cancel_requested or self._closed:
                     return
-                async with self._send_lock:
-                    self._sent_texts.append(text)
-                    await self._socket.send(json.dumps({"event": "task_continue", "text": text}, ensure_ascii=False))
+                await self._send_bidi_event(
+                    {"event": "task_continue", "text": text}, operation="重试发送文本"
+                )
+                self._sent_texts.append(text)
                 self._retry_attempts[text] = attempt + 1
                 logger.info("minimax.task_continue_retry code=2205 attempt=%d chars=%d", attempt + 1, len(text))
                 return

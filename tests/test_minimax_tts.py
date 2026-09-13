@@ -208,6 +208,71 @@ class MiniMaxTtsProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.receive_finished)
         self.assertIsNone(session._error)
 
+    async def test_flush_close_race_reports_closed_session_without_none_receiver_error(self):
+        flush_sent = asyncio.Event()
+        block_receive = asyncio.Event()
+
+        class Socket:
+            async def send(self, payload):
+                if json.loads(payload)["event"] != "task_flush":
+                    raise AssertionError("expected task_flush")
+                flush_sent.set()
+
+            async def recv(self):
+                await block_receive.wait()
+
+            async def close(self):
+                return None
+
+        session = MiniMaxTtsSession(SimpleNamespace(
+            receive_timeout_seconds=1, transport="websocket_bidi", sample_rate=32000,
+        ))
+        session._socket = Socket()
+        session._started = True
+        session._receiver = asyncio.create_task(session._receive_loop())
+        try:
+            flushing = asyncio.create_task(session.flush())
+            await asyncio.wait_for(flush_sent.wait(), 1)
+            await session.close()
+            with self.assertRaisesRegex(MiniMaxTtsError, "会话已关闭"):
+                await asyncio.wait_for(flushing, 1)
+        finally:
+            if not session.closed:
+                await session.close()
+
+    async def test_cancel_close_race_reports_closed_session_without_none_receiver_error(self):
+        cancel_sent = asyncio.Event()
+        block_receive = asyncio.Event()
+
+        class Socket:
+            async def send(self, payload):
+                if json.loads(payload)["event"] != "task_cancel":
+                    raise AssertionError("expected task_cancel")
+                cancel_sent.set()
+
+            async def recv(self):
+                await block_receive.wait()
+
+            async def close(self):
+                return None
+
+        session = MiniMaxTtsSession(SimpleNamespace(
+            receive_timeout_seconds=1, cancel_timeout_seconds=1,
+            transport="websocket_bidi", sample_rate=32000,
+        ))
+        session._socket = Socket()
+        session._started = True
+        session._receiver = asyncio.create_task(session._receive_loop())
+        try:
+            cancelling = asyncio.create_task(session.cancel(timeout_seconds=1))
+            await asyncio.wait_for(cancel_sent.wait(), 1)
+            await session.close()
+            with self.assertRaisesRegex(MiniMaxTtsError, "会话已关闭"):
+                await asyncio.wait_for(cancelling, 1)
+        finally:
+            if not session.closed:
+                await session.close()
+
     async def test_unowned_receiver_cancellation_remains_a_failure(self):
         waiting = asyncio.Event()
 

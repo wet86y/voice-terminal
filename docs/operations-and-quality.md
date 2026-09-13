@@ -72,6 +72,28 @@ Web 前端固定使用 `npm run dev`，并在继续前要求 `http://127.0.0.1:5
 该文件包含真实会话内容，单文件 50 MiB、保留 9 个轮转备份，后台异步写入。排查异常应使用同一
 请求的精确 wire payload 和输出复现，不能用普通 ASR/TTS 日志近似重建。
 
+## MiniMax Bidi TTS 生命周期边界
+
+`MiniMaxTtsSession.close()` 可以与 `flush()` 或 `cancel()` 的 provider 确认等待并发发生。关闭会
+先摘除 session 持有的 receiver/socket，再取消 receiver 并关闭 socket；等待方必须保留操作开始时
+捕获的 receiver，且不得在 `await` 后重新解引用可被关闭路径清空的共享字段。关闭中的等待必须以
+明确的 session-closed 错误结束，绝不能泄漏 `NoneType.*` 内部异常。
+
+socket 发送只允许在短临界区中完成“closed 状态检查、获取当前 socket、发送单个 frame”。不得在
+等待 `task_flushed` 或 `task_canceled` 的整个周期持有该锁，否则用户 stop、reset、replacement 和
+barge-in 不能及时释放旧 TTS session。上层已经写入的 `stopped`、`replaced`、`interrupted` 等
+speech reason 仍优先于 provider 的关闭结果；真实 provider、网络或音频错误仍按失败处理。
+
+修改 Bidi 生命周期时，至少运行：
+
+```powershell
+python -m unittest tests.test_minimax_tts tests.test_tts_features.BidiLifecycleTests -v
+python -m unittest discover -s tests -v
+```
+
+回归测试必须覆盖正常 `task_flushed`，以及 flush/close、cancel/close 的并发交叠；这些路径均不应
+出现 `NoneType has no attribute 'done'` 或 `NoneType has no attribute 'send'`。
+
 ## 语音运行排障
 
 用户报告“播放后监听退出”或 `audio capture gap` 时：
