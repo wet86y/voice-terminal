@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -51,6 +52,11 @@ class SessionLedger:
         self.entries: list[SessionLedgerEntry] = []
         self.records: list[InputRecord] = []
         self._committed_delivery_ids: set[str] = set()
+        # The relay has at-least-once delivery semantics.  Keep a bounded
+        # idempotency window so a sink exception after partial acceptance
+        # cannot duplicate a result or wake the main Agent twice.
+        self._committed_shadow_event_ids: set[str] = set()
+        self._committed_shadow_event_order: deque[str] = deque()
         self._shadow_context_epoch = 1
         self._shadow_input_revision = 0
         self._shadow_frames: list[ShadowContextFrame] = []
@@ -64,6 +70,8 @@ class SessionLedger:
         self.entries.clear()
         self.records.clear()
         self._committed_delivery_ids.clear()
+        self._committed_shadow_event_ids.clear()
+        self._committed_shadow_event_order.clear()
         self._shadow_context_epoch += 1
         self._shadow_input_revision = 0
         self._shadow_frames.clear()
@@ -331,15 +339,29 @@ class SessionLedger:
         self.entries.append(SessionLedgerEntry("event", payload))
         self._commit_shadow_input("external_system", "semantic_event", payload)
 
-    def commit_shadow_event(self, event: ShadowEvent) -> None:
-        """Project Shadow output to the main plane without reflecting it back."""
+    def commit_shadow_event(self, event: ShadowEvent) -> bool:
+        """Project a once-only Shadow output to the main plane.
+
+        The event bridge retries an undelivered batch.  Returning ``False``
+        for a known ``event_id`` lets callers suppress duplicate scheduler
+        wakes when a prior sink invocation succeeded only partially.
+        """
+        event_id = str(event.event_id or "")
+        if event_id and event_id in self._committed_shadow_event_ids:
+            return False
+        if event_id:
+            self._committed_shadow_event_ids.add(event_id)
+            self._committed_shadow_event_order.append(event_id)
+            while len(self._committed_shadow_event_order) > 4096:
+                expired = self._committed_shadow_event_order.popleft()
+                self._committed_shadow_event_ids.discard(expired)
         if event.kind in {"status", "progress"}:
             self.shadow_visible_status = ShadowVisibleStatus(
                 active=True, text=event.text,
                 based_on_trace_revision=event.based_on_context_revision,
                 updated_at=time.time(),
             )
-            return
+            return True
         if event.kind == "user_input_required":
             self.shadow_user_input_required = True
         elif event.kind in {"result", "failed"}:
@@ -350,6 +372,7 @@ class SessionLedger:
             "event_id": event.event_id, "kind": event.kind, "text": str(event.text)[:8000],
             "wake_policy": event.wake_policy, "payload": dict(event.payload),
         }))
+        return True
 
     def context_messages(self, current_input: str) -> list[dict[str, Any]]:
         # The stable voice/JSON contract belongs to the single Agent prompt.
