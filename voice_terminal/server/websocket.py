@@ -334,6 +334,16 @@ class SessionRuntime:
 
     def snapshot(self) -> VoiceEvent:
         value = snapshot_event(self.state)
+        controller = self.controller
+        episode = getattr(controller, "episode", None) if controller is not None else None
+        if episode is not None:
+            try:
+                value.payload["agent"] = episode.snapshot(include_history=False)
+            except Exception:
+                # A live projection is preferable for reconnect recovery, but
+                # it must never make subscription less reliable than the
+                # existing cached RuntimeState snapshot.
+                logger.exception("runtime.live_episode_snapshot_failed")
         value.payload["recent_inputs"] = [record.to_payload() for record in self.history.records]
         value.payload["reasoning_mode"] = self.reasoning_mode
         return value

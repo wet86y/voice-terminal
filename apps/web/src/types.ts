@@ -316,6 +316,30 @@ export interface SpeechOutputRecord {
   kind?: 'formal'
 }
 
+export type PlaybackQueueState = 'waiting' | 'playing'
+
+export interface PlaybackQueueItem {
+  speech_id: string
+  conversation_id: string
+  request_id?: string
+  turn_id: string
+  output_generation?: number
+  text: string
+  state: PlaybackQueueState
+  emotion_requested?: string
+  emotion_applied?: string
+}
+
+export type PlaybackResultStatus = 'finished' | 'failed' | 'interrupted' | 'replaced'
+
+export interface LastPlaybackResult {
+  speech_id: string
+  conversation_id: string
+  turn_id: string
+  text: string
+  result: PlaybackResultStatus
+}
+
 export interface SpeakPreview {
   conversation_id: string
   request_id: string

@@ -2,6 +2,9 @@ import { computed, reactive, ref, shallowRef } from 'vue'
 import type {
   AgentEpisodeSnapshot,
   AgentTrace,
+  LastPlaybackResult,
+  PlaybackQueueItem,
+  PlaybackResultStatus,
   SpeakPreview,
   SpeechOutputRecord,
   CommandName,
@@ -186,11 +189,116 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const agentEpisode = ref<AgentEpisodeSnapshot | null>(null)
   const agentTrace = ref<AgentTrace[]>([])
   const speechOutputs = ref<SpeechOutputRecord[]>([])
-  const activeSpeech = ref<SpeechOutputRecord | null>(null)
+  const playbackQueue = ref<PlaybackQueueItem[]>([])
+  const lastPlayback = ref<LastPlaybackResult | null>(null)
+  const activeSpeech = computed(() =>
+    playbackQueue.value.find(item => item.state === 'playing') ?? playbackQueue.value[0] ?? null,
+  )
   const speechProgress = ref<Record<string, unknown> | null>(null)
   const reasoning = ref('')
   const speakPreview = ref<SpeakPreview | null>(null)
   const retiredEpisodes = new Set<string>()
+  const terminalPlaybackKeys = new Set<string>()
+
+  function speechKey(conversationId: string, speechId: string) {
+    return `${conversationId}\u0000${speechId}`
+  }
+
+  function readPlaybackItem(value: Record<string, unknown>, stateValue: PlaybackQueueItem['state']): PlaybackQueueItem | null {
+    const speechId = readString(value, 'speech_id')
+    const conversationId = readString(value, 'conversation_id')
+    if (!speechId || !conversationId || retiredEpisodes.has(conversationId)) return null
+    return {
+      speech_id: speechId,
+      conversation_id: conversationId,
+      request_id: readString(value, 'request_id') ?? readString(value, 'trace_id') ?? undefined,
+      turn_id: readString(value, 'turn_id') ?? '',
+      output_generation: isNonNegativeInteger(value.output_generation) ? value.output_generation : undefined,
+      text: readString(value, 'text') ?? '',
+      state: stateValue,
+      emotion_requested: readString(value, 'emotion_requested') ?? readString(value, 'emotion') ?? undefined,
+      emotion_applied: readString(value, 'emotion_applied') ?? undefined,
+    }
+  }
+
+  function upsertPlaybackItem(incoming: PlaybackQueueItem) {
+    const key = speechKey(incoming.conversation_id, incoming.speech_id)
+    const index = playbackQueue.value.findIndex(item => speechKey(item.conversation_id, item.speech_id) === key)
+    if (index < 0) {
+      playbackQueue.value = [...playbackQueue.value, incoming]
+      return
+    }
+    const currentItem = playbackQueue.value[index]
+    if (currentItem.output_generation !== undefined && incoming.output_generation !== undefined
+      && incoming.output_generation < currentItem.output_generation) return
+    const next = {
+      ...currentItem,
+      ...incoming,
+      text: incoming.text || currentItem.text,
+      state: currentItem.state === 'playing' ? 'playing' as const : incoming.state,
+    }
+    playbackQueue.value = playbackQueue.value.map((item, itemIndex) => itemIndex === index ? next : item)
+  }
+
+  function removePlaybackItem(conversationId: string, speechId: string) {
+    const key = speechKey(conversationId, speechId)
+    const removed = playbackQueue.value.find(item => speechKey(item.conversation_id, item.speech_id) === key) ?? null
+    playbackQueue.value = playbackQueue.value.filter(item => speechKey(item.conversation_id, item.speech_id) !== key)
+    return removed
+  }
+
+  function recordPlaybackResult(payload: Record<string, unknown>, result: PlaybackResultStatus) {
+    const speechId = readString(payload, 'speech_id')
+    const conversationId = readString(payload, 'conversation_id')
+    if (!speechId || !conversationId || retiredEpisodes.has(conversationId)) return
+    const activeItem = playbackQueue.value.find(item => item.speech_id === speechId && item.conversation_id === conversationId)
+    if (activeItem?.output_generation !== undefined && isNonNegativeInteger(payload.output_generation)
+      && payload.output_generation < activeItem.output_generation) return
+    terminalPlaybackKeys.add(speechKey(conversationId, speechId))
+    if (terminalPlaybackKeys.size > 128) terminalPlaybackKeys.delete(terminalPlaybackKeys.values().next().value!)
+    const removed = removePlaybackItem(conversationId, speechId)
+    const previous = lastPlayback.value?.speech_id === speechId
+      && lastPlayback.value.conversation_id === conversationId ? lastPlayback.value : null
+    lastPlayback.value = {
+      speech_id: speechId,
+      conversation_id: conversationId,
+      turn_id: readString(payload, 'turn_id') ?? removed?.turn_id ?? previous?.turn_id ?? '',
+      text: readString(payload, 'text') || removed?.text || previous?.text || '',
+      result: previous?.result ?? result,
+    }
+  }
+
+  function resultFromCompletion(status: string | null): PlaybackResultStatus {
+    if (status === 'completed') return 'finished'
+    if (status === 'failed') return 'failed'
+    if (status === 'replaced' || status === 'superseded') return 'replaced'
+    return 'interrupted'
+  }
+
+  function applyAuthoritativePlaybackSnapshot(value: Record<string, unknown>) {
+    const restored: PlaybackQueueItem[] = []
+    const hasStructuredPlaybackSnapshot = Object.prototype.hasOwnProperty.call(value, 'active_speech')
+      || Object.prototype.hasOwnProperty.call(value, 'speech_queue')
+    const append = (candidate: unknown, stateValue: PlaybackQueueItem['state']) => {
+      if (!isRecord(candidate)) return
+      const item = readPlaybackItem(candidate, stateValue)
+      if (!item) return
+      const key = speechKey(item.conversation_id, item.speech_id)
+      if (!restored.some(existing => speechKey(existing.conversation_id, existing.speech_id) === key)) restored.push(item)
+    }
+    const playbackAlreadyFinished = current.tts_status === 'FINISHED' || current.tts_status === 'DEGRADED'
+    if (isRecord(value.active_speech) && playbackAlreadyFinished) {
+      recordPlaybackResult(value.active_speech, current.tts_status === 'FINISHED' ? 'finished' : 'failed')
+    } else if (isRecord(value.active_speech)) {
+      append(value.active_speech, readString(value.active_speech, 'status')?.toUpperCase() === 'SPEAKING' ? 'playing' : 'waiting')
+    }
+    if (Array.isArray(value.speech_queue)) value.speech_queue.forEach(item => append(item, 'waiting'))
+    if (!hasStructuredPlaybackSnapshot && !restored.length && isRecord(value.speak_snapshot)
+      && readString(value.speak_snapshot, 'queue_status') !== 'empty') {
+      append(value.speak_snapshot, readString(value.speak_snapshot, 'queue_status') === 'speaking' ? 'playing' : 'waiting')
+    }
+    playbackQueue.value = restored
+  }
 
   function applyAgent(value: unknown, authoritative = false) {
     if (!isRecord(value) || !(value.conversation_id === null || typeof value.conversation_id === 'string')
@@ -221,22 +329,23 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       retiredEpisodes.add(previous.conversation_id)
       speechProgress.value = null
       speakPreview.value = null
+      playbackQueue.value = []
+      lastPlayback.value = null
+      terminalPlaybackKeys.clear()
     }
     if (value.conversation_id === null) {
       speechProgress.value = null
       speakPreview.value = null
+      playbackQueue.value = []
+      lastPlayback.value = null
+      terminalPlaybackKeys.clear()
     }
     if (retiredEpisodes.size > 64) retiredEpisodes.delete(retiredEpisodes.values().next().value!)
     agentEpisode.value = value as unknown as AgentEpisodeSnapshot
     if (Array.isArray(value.trace)) agentTrace.value = value.trace.filter(isAgentTrace).slice(-200)
     if (Array.isArray(value.outputs)) speechOutputs.value = value.outputs.filter(isSpeechOutput).slice(-32)
     if (isRecord(value.reasoning) && typeof value.reasoning.text === 'string') reasoning.value = value.reasoning.text
-    if (isSpeechOutput(value.active_speech)) activeSpeech.value = value.active_speech
-    else if (value.conversation_id === null) activeSpeech.value = null
-    else if (value.active_speech === null && Array.isArray(value.outputs)) {
-      activeSpeech.value = [...speechOutputs.value].reverse()
-        .find(output => output.conversation_id === value.conversation_id) ?? null
-    }
+    if (authoritative) applyAuthoritativePlaybackSnapshot(value)
   }
 
   function applySpeakPreview(value: Record<string, unknown>) {
@@ -296,8 +405,10 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     agentEpisode.value = null
     agentTrace.value = []
     speechOutputs.value = []
-    activeSpeech.value = null
+    playbackQueue.value = []
+    lastPlayback.value = null
     speechProgress.value = null
+    terminalPlaybackKeys.clear()
     retiredEpisodes.clear()
     resetCurrentTurn()
     llmContext.value = []
@@ -435,6 +546,12 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (typeof payload.listening === 'boolean') listening.value = payload.listening
     if (typeof payload.can_start === 'boolean') canStart.value = payload.can_start
     if (turnId) adoptTurn(turnId)
+    if (payload.listening === false && payload.state === 'IDLE') {
+      playbackQueue.value = []
+      lastPlayback.value = null
+      speechProgress.value = null
+      terminalPlaybackKeys.clear()
+    }
   }
 
   function applyCompletedTurn(payload: TurnCompletedPayload, turnId: string | null) {
@@ -506,31 +623,52 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (message.type === 'agent.trace') { applyAgentTrace(payload); return }
     if (message.type === 'agent.reasoning') { if (typeof payload.text === 'string') reasoning.value = payload.text; return }
     if (message.type === 'speak.preview') { applySpeakPreview(payload); return }
-    if (message.type === 'speech.queued') return
+    if (message.type === 'speech.queued') {
+      const item = readPlaybackItem(payload, 'waiting')
+      if (item && (!agentEpisode.value?.conversation_id || item.conversation_id === agentEpisode.value.conversation_id)) {
+        lastPlayback.value = null
+        upsertPlaybackItem(item)
+      }
+      return
+    }
+    if (message.type === 'speech.started') {
+      const item = readPlaybackItem(payload, 'playing')
+      if (item && (!agentEpisode.value?.conversation_id || item.conversation_id === agentEpisode.value.conversation_id)) {
+        upsertPlaybackItem(item)
+      }
+      return
+    }
     if (message.type === 'speech.completed') {
       if (isSpeechOutput(payload)) {
         speechOutputs.value = [...speechOutputs.value.filter(item => item.speech_id !== payload.speech_id), payload].slice(-32)
         if (speechProgress.value?.speech_id === payload.speech_id) speechProgress.value = null
-        if (activeSpeech.value?.speech_id === payload.speech_id) activeSpeech.value = payload
+        const conversationId = readString(payload, 'conversation_id')
+        const speechId = readString(payload, 'speech_id')
+        const key = conversationId && speechId ? speechKey(conversationId, speechId) : null
+        if (!key || !terminalPlaybackKeys.has(key)
+          || (lastPlayback.value?.conversation_id === conversationId && lastPlayback.value.speech_id === speechId)) {
+          recordPlaybackResult(payload, resultFromCompletion(readString(payload, 'status')))
+        } else if (conversationId && speechId) {
+          removePlaybackItem(conversationId, speechId)
+        }
       }
       return
     }
     if (message.type === 'speech.delta') {
-      const currentAgent = agentEpisode.value
       const textDelta = readString(payload, 'text_delta')
-      if (textDelta !== null && typeof payload.speech_id === 'string'
-        && payload.conversation_id === currentAgent?.conversation_id) {
-        if (activeSpeech.value?.speech_id !== payload.speech_id) {
-          activeSpeech.value = {
-            speech_id: payload.speech_id,
-            conversation_id: payload.conversation_id as string,
-            trace_id: typeof payload.trace_id === 'string' ? payload.trace_id : undefined,
-            output_generation: isNonNegativeInteger(payload.output_generation) ? payload.output_generation : undefined,
-            turn_id: typeof payload.turn_id === 'string' ? payload.turn_id : message.turn_id || '',
-            text: '', status: 'streaming',
-          }
-        }
-        if (activeSpeech.value) activeSpeech.value = { ...activeSpeech.value, text: activeSpeech.value.text + textDelta }
+      const item = readPlaybackItem(payload, 'waiting')
+      if (textDelta !== null && item
+        && (!agentEpisode.value?.conversation_id || item.conversation_id === agentEpisode.value.conversation_id)) {
+        const key = speechKey(item.conversation_id, item.speech_id)
+        const existing = playbackQueue.value.find(candidate => speechKey(candidate.conversation_id, candidate.speech_id) === key)
+        upsertPlaybackItem({
+          ...item,
+          text: `${existing?.text ?? ''}${textDelta}`,
+          state: existing?.state ?? 'waiting',
+        })
+      }
+      if (textDelta !== null && acceptsCurrentTurn(message.turn_id ?? readString(payload, 'turn_id'))) {
+        current.assistant_text += textDelta
       }
       return
     }
@@ -539,6 +677,18 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       if (typeof payload.speech_id === 'string' && typeof payload.conversation_id === 'string'
         && payload.conversation_id === currentAgent?.conversation_id
         && !speechOutputs.value.some(item => item.speech_id === payload.speech_id)) speechProgress.value = payload
+      const trigger = readString(payload, 'trigger')
+      const status = readString(payload, 'status')
+      const progressEvent = readString(payload, 'event')
+      if (trigger === 'playback_finished' && status === 'FINISHED') {
+        recordPlaybackResult(payload, 'finished')
+      } else if (trigger === 'playback_finished' && status === 'DEGRADED') {
+        recordPlaybackResult(payload, 'failed')
+      } else if (progressEvent === 'speech.replaced') {
+        const oldSpeechId = readString(payload, 'old_speech_id') ?? readString(payload, 'speech_id')
+        const conversationId = readString(payload, 'conversation_id')
+        if (oldSpeechId && conversationId) recordPlaybackResult({ ...payload, speech_id: oldSpeechId }, 'replaced')
+      }
     }
     if (message.type === 'input.started') adoptTurn(message.turn_id ?? null)
     if (message.turn_id === currentTurnId.value && isRecord(payload.workspace)) {
@@ -571,12 +721,6 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
               current.partial_text = ''
             }
           }
-        }
-        break
-      case 'speech.delta':
-        if (acceptsCurrentTurn(message.turn_id ?? null)) {
-          const textDelta = readString(payload, 'text_delta')
-          if (textDelta !== null) current.assistant_text += textDelta
         }
         break
       case 'context.snapshot':
@@ -703,8 +847,10 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   function resetSession() {
     if (connection.value !== 'connected') return false
     resetCurrentTurn()
-    activeSpeech.value = null
+    playbackQueue.value = []
+    lastPlayback.value = null
     speechProgress.value = null
+    terminalPlaybackKeys.clear()
     llmContext.value = []
     llmContextTurnId.value = null
     return sendCommand('session.reset')
@@ -743,6 +889,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     agentEpisode,
     agentTrace,
     speechOutputs,
+    playbackQueue,
+    lastPlayback,
     activeSpeech,
     speechProgress,
     reasoning,

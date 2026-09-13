@@ -18,10 +18,12 @@ from voice_terminal.agent.sentences import SentenceStore, map_refinement
 from voice_terminal.config import AppConfig, load_config
 from voice_terminal.controller.episode_output import EpisodeSpeechOutput, SpeechHandle
 from voice_terminal.controller.speech_pipeline import SpeechPipeline
+from voice_terminal.core.state import RuntimeState
 from voice_terminal.audio.player import PlaybackSnapshot
 from voice_terminal.core.events import event
 from voice_terminal.providers.deepseek import DeepSeekClient
 from voice_terminal.server.snapshot import ProtocolSequencer
+from voice_terminal.server.websocket import SessionRuntime
 from voice_terminal.session.contracts import DeliveryReport
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
@@ -59,6 +61,109 @@ def test_v06_prefix_is_safe_before_full_envelope_and_validates_emotion():
     with pytest.raises(EnvelopeError, match="invalid speak emotion"):
         bad = SpeechDecisionEnvelopeStream()
         bad.feed('{"speak":{"state":"speak","emotion":"unknown","text":"x"}')
+
+
+def test_real_playback_start_emits_one_observational_event():
+    async def scenario():
+        emitted = []
+        logged = []
+        tracked = []
+
+        class Runtime:
+            async def emit(self, kind, payload):
+                emitted.append((kind, payload))
+
+            async def log(self, kind, **payload):
+                logged.append((kind, payload))
+
+        output = object.__new__(EpisodeSpeechOutput)
+        output.loop = asyncio.get_running_loop()
+        output.runtime = Runtime()
+        output.player = SimpleNamespace(diagnostics={"started": True})
+        output.controller = SimpleNamespace(
+            state=SimpleNamespace(current={}),
+            _turn_timings={"turn_a": {}},
+            _track=lambda task: tracked.append(task),
+        )
+        output.handle = SimpleNamespace(
+            speech_id="speech_a",
+            identity=("conversation_a", "request_a"),
+            turn_id="turn_a",
+            reason=None,
+            text="正在播放",
+            kind="formal",
+            emotion_requested="calm",
+            emotion_applied="calm",
+            workspace=SimpleNamespace(
+                playback_key="key_a", playback_started=False, generation=7, timings={},
+            ),
+        )
+
+        output.playback_started("stale_key")
+        output.playback_started("key_a")
+        output.playback_started("key_a")
+        await asyncio.sleep(0)
+        await asyncio.gather(*tracked)
+
+        assert output.handle.workspace.playback_started is True
+        assert [kind for kind, _ in emitted] == ["speech.started"]
+        assert [kind for kind, _ in logged] == ["TTS_STARTED"]
+        assert emitted[0][1] == {
+            "speech_id": "speech_a",
+            "conversation_id": "conversation_a",
+            "request_id": "request_a",
+            "trace_id": "request_a",
+            "turn_id": "turn_a",
+            "output_generation": 7,
+            "text": "正在播放",
+            "status": "playing",
+            "kind": "formal",
+            "emotion_requested": "calm",
+            "emotion_applied": "calm",
+        }
+
+    asyncio.run(scenario())
+
+
+def test_subscription_snapshot_uses_live_episode_without_rewriting_cached_agent():
+    runtime = object.__new__(SessionRuntime)
+    runtime.state = RuntimeState()
+    runtime.state.agent = {"conversation_id": "stale", "speak_snapshot": {"queue_status": "speaking"}}
+    live = {"conversation_id": "live", "speak_snapshot": {"queue_status": "empty"}}
+    runtime.controller = SimpleNamespace(episode=SimpleNamespace(snapshot=lambda **_: live))
+    runtime.history = SimpleNamespace(records=[])
+    runtime.reasoning_mode = "balanced"
+
+    payload = runtime.snapshot().payload
+
+    assert payload["agent"] == live
+    assert runtime.state.agent["conversation_id"] == "stale"
+
+
+def test_subscription_snapshot_keeps_cached_agent_without_controller():
+    runtime = object.__new__(SessionRuntime)
+    runtime.state = RuntimeState()
+    runtime.state.agent = {"conversation_id": "cached"}
+    runtime.controller = None
+    runtime.history = SimpleNamespace(records=[])
+    runtime.reasoning_mode = "balanced"
+
+    assert runtime.snapshot().payload["agent"] == {"conversation_id": "cached"}
+
+
+def test_subscription_snapshot_falls_back_when_live_episode_snapshot_fails():
+    runtime = object.__new__(SessionRuntime)
+    runtime.state = RuntimeState()
+    runtime.state.agent = {"conversation_id": "cached"}
+
+    def failing_snapshot(**_kwargs):
+        raise RuntimeError("episode is being initialized")
+
+    runtime.controller = SimpleNamespace(episode=SimpleNamespace(snapshot=failing_snapshot))
+    runtime.history = SimpleNamespace(records=[])
+    runtime.reasoning_mode = "balanced"
+
+    assert runtime.snapshot().payload["agent"] == {"conversation_id": "cached"}
 
 
 def test_friendly_emotion_is_safely_normalized_and_remains_observable():
