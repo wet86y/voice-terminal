@@ -17,3 +17,10 @@ def test_legacy_internal_names_do_not_escape_v1_projection():
     assert not sequencer.public(event("assistant.delta", "input_a", text_delta="no"))
     assert sequencer.envelope(event("llm.context", "input_a", messages=[]))["type"] == "context.snapshot"
     assert sequencer.envelope(event("latency.snapshot", "input_a", complete=False, values={}))["type"] == "metrics.snapshot"
+
+
+def test_speech_started_is_a_public_protocol_event():
+    sequencer = ProtocolSequencer("conversation_a")
+    value = event("speech.started", "input_a", speech_id="speech_a", status="playing")
+    assert sequencer.public(value)
+    assert sequencer.envelope(value)["type"] == "speech.started"

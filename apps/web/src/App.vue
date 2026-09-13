@@ -61,22 +61,24 @@ const currentTurnLabel = computed(() => terminal.currentTurnId ?? '—')
 const transcriptPreview = computed(
   () => terminal.current.final_text || terminal.current.partial_text || '等待后端语音事件…',
 )
-const speakSnapshot = computed(() => terminal.agentEpisode?.speak_snapshot)
 const speakPreview = computed(() => terminal.speakPreview)
-const speakQueueStatus = computed(() => speakSnapshot.value?.queue_status || 'empty')
-const speakQueueText = computed(() =>
-  speakPreview.value?.text
-  || speakSnapshot.value?.text
-  || terminal.agentEpisode?.speech_queue?.[0]?.text
-  || terminal.activeSpeech?.text
-  || '',
-)
+const speakQueueStatus = computed(() => {
+  if (terminal.playbackQueue.some(item => item.state === 'playing')) return 'speaking'
+  if (terminal.playbackQueue.length) return 'queued'
+  return 'empty'
+})
 const speakQueueStatusLabel = computed(() => ({
   empty: '无内容',
   queued: '排队中',
-  suspended: '已挂起',
   speaking: '讲话中',
 }[speakQueueStatus.value] || speakQueueStatus.value.toUpperCase()))
+const playbackResultLabels: Record<string, string> = {
+  finished: '播放完毕',
+  failed: '播放失败',
+  interrupted: '播放中断',
+  replaced: '已被替换',
+}
+const playbackResultLabel = computed(() => playbackResultLabels[terminal.lastPlayback?.result || ''] || '')
 const currentLatencyRows = computed(() =>
   latencyDefinitions.map((definition) => ({
     ...definition,
@@ -389,9 +391,20 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
           <div class="response-block speak-queue-block" :class="`speak-${speakQueueStatus}`">
             <span class="box-label">{{ speakQueueStatusLabel }} / TEXT TRANSACTION</span>
             <span v-if="speakPreview" class="streaming-indicator">正在流式生成 · 尚未提交队列</span>
-            <p>{{ displayText(speakQueueText) }}</p>
+            <p v-if="speakPreview" class="speak-preview-text">{{ displayText(speakPreview.text) }}</p>
+            <div v-if="terminal.playbackQueue.length" class="speak-queue-list">
+              <div v-for="item in terminal.playbackQueue" :key="`${item.conversation_id}-${item.speech_id}`" class="speak-queue-item">
+                <small>{{ item.state === 'playing' ? '正在播放' : '等待播放' }} · {{ item.turn_id || '—' }}</small>
+                <p>{{ displayText(item.text) }}</p>
+              </div>
+            </div>
+            <p v-else-if="!speakPreview">当前播放队列为空</p>
             <small>队列仅保存文本；端点确认后才启动 TTS。</small>
             <small v-if="terminal.activeSpeech">表达情绪：{{ terminal.activeSpeech.emotion_requested || 'calm' }} → {{ terminal.activeSpeech.emotion_applied || 'calm' }}</small>
+            <div v-if="terminal.lastPlayback && !terminal.playbackQueue.length" class="last-playback-result">
+              <small>{{ playbackResultLabel }} · {{ terminal.lastPlayback.turn_id || '—' }}</small>
+              <p>{{ displayText(terminal.lastPlayback.text) }}</p>
+            </div>
           </div>
           <div v-if="terminal.current.delivery && (terminal.current.delivery.status || terminal.current.delivery.termination)" class="delivery-card">
             <div class="delivery-heading"><span>DELIVERY</span><strong>{{ deliveryStatusLabel(terminal.current.delivery) }}</strong></div>

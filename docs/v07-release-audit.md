@@ -22,6 +22,7 @@ WebSocket 命令和默认端口保持不变，因此本次不是网络协议破�
 | 语音与会话 | 一个 400 ms 单飞调度循环；仅实际传达的 assistant 文本进入历史；ASR late refinement 不回写已发送历史 | `docs/v06-reliability-audit.md`、`voice_terminal/agent/episode.py`、`voice_terminal/session/ledger.py` |
 | Shadow | 每个 session 一个长期 `ShadowRuntime`；只读工具、最新权威上下文、异步事件 relay；不控制语音 | `docs/architecture.md`、`docs/context-and-tools.md` |
 | Thinking | `reasoning_mode` 是 `fast` / `balanced` / `deep` 的主开关；`request_thinking` 是本地控制动作 | `docs/llm-json-schema-migration.md` |
+| TTS 播放看板 | `speech.queued/delta/started/progress/completed` 构成只读实时投影；首次实际播放由 `speech.started` 标记，`playback_finished` 立即结束 UI 活动态，`speech.completed` 仍负责最终结算；重连只读实时 Episode 快照 | `docs/websocket-protocol.md`、`voice_terminal/controller/episode_output.py`、`apps/web/src/composables/useVoiceTerminal.ts` |
 | 启动 | `scripts/start.ps1` 启动 Analysis、ASR、Web 与 Voice Server；`-NoWeb` 仅用于后端调试 | `docs/operations-and-quality.md` |
 | 运行产物 | 根目录 `logs/` 存放日志，`reports/` 存放诊断报告；二者都是本地、已忽略追踪的固定目录 | `.gitignore`、`README.md` |
 
@@ -34,6 +35,9 @@ WebSocket 命令和默认端口保持不变，因此本次不是网络协议破�
 - 文档中对本地 `logs/`、`reports/` 的引用均视为运行产物，而非应随仓库分发的证据文件。
 - Persona 与 Shadow 指令均符合权限边界：前者不覆盖本地协议，后者不接收主模型任务摘要、
   不拥有副作用工具或语音控制权。
+- Speak Queue 已收敛为事件驱动的只读观测组件。它不显示或改变 1 秒追加窗口、内部 hold、
+  provider session、replacement、delivery、SessionLedger 或 LLM `speak_snapshot` 的状态机；实时
+  Episode 快照读取失败时仍返回缓存的 `RuntimeState.agent`，不会中断 WebSocket 订阅。
 
 ## 仍然开放的风险
 
@@ -59,8 +63,8 @@ npm run build
 
 ## 本次审计结果
 
-- `python -m pytest -q`：236 passed、2 skipped；出现两条第三方 SWIG 弃用告警，不影响结果。
-- `npm test`：Web Vitest 6/6 通过。
+- `python -m pytest -q`：254 passed、2 skipped；出现两条第三方 SWIG 弃用告警，不影响结果。
+- `npm test`：Web Vitest 14/14 通过。
 - `npm run typecheck`：通过。
 - `npm run build`：通过，Vite 已完成生产构建。
 

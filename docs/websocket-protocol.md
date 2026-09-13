@@ -14,6 +14,22 @@
 - `session.reset`
 - `session.reasoning_mode`，payload 为 `{"mode":"fast|balanced|deep"}`
 
+## 语音输出观测事件
+
+播放看板只消费事件，不反向控制输出链路：
+
+- `speech.queued`：文本事务已进入等待队列，初始 `text` 可以为空；
+- `speech.delta`：按 `speech_id` 追加正式输出文本；
+- `speech.started`：播放器首次实际消费该事务的 PCM，payload 包含 `speech_id`、
+  `conversation_id`、`request_id`、`turn_id`、`output_generation`、当前完整 `text` 和情绪字段；
+- `speech.progress`：提供缓冲、播放时长和替换等诊断。`trigger=playback_finished` 表示物理播放已经结束，
+  `status=FINISHED` 为正常播完，`status=DEGRADED` 为播放失败；
+- `speech.completed`：追加窗口和 delivery 结算后的最终事务记录，可能晚于物理播放结束。
+
+`speech.started` 和 `playback_finished` 是看板的实时播放边界；`speech.completed` 是账本与历史边界，
+两者不得互相替代。`subscribe` 返回的 `runtime.snapshot.agent` 从当前 Episode 实时生成，用于刷新页面或
+断线重连后恢复活动输出和等待队列。
+
 ## Shadow 调试协议
 
 生产 Shadow 没有 task API，也不为每个 WebSocket 连接创建 manager。主模型只能通过内部

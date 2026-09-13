@@ -312,7 +312,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
 
     def playback_started(self, key):
         h = self.handle
-        if h and key == h.workspace.playback_key:
+        if h and key == h.workspace.playback_key and not h.workspace.playback_started:
             h.workspace.playback_started = True
             started_at = time.monotonic()
             h.workspace.timings.setdefault("playback", started_at)
@@ -330,8 +330,23 @@ class EpisodeSpeechOutput(SpeechPipeline):
             if self.loop and not self.loop.is_closed():
                 async def publish():
                     if self.handle is h and not h.reason:
+                        # Preserve the existing latency trace even if the
+                        # additional observer event cannot be delivered.
                         await self.runtime.log("TTS_STARTED", identity=h.identity, turn_id=h.turn_id,
                                                speech_id=h.speech_id)
+                        await self.runtime.emit("speech.started", {
+                            "speech_id": h.speech_id,
+                            "conversation_id": h.identity[0],
+                            "request_id": h.identity[1],
+                            "trace_id": h.identity[1],
+                            "turn_id": h.turn_id,
+                            "output_generation": h.workspace.generation,
+                            "text": h.text,
+                            "status": "playing",
+                            "kind": h.kind,
+                            "emotion_requested": h.emotion_requested,
+                            "emotion_applied": h.emotion_applied,
+                        })
                 self.loop.call_soon_threadsafe(lambda: self.controller._track(asyncio.create_task(publish())))
 
     async def begin(self, identity, turn_id, *, emotion="calm", kind="formal",
