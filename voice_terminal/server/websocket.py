@@ -22,9 +22,9 @@ from ..providers.deepseek import DeepSeekClient
 from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
 from ..agent.tool_registry import FileTools, WebSearchTools
-from ..shadow_agent import ShadowAgentComponent, ShadowTaskCommand, ShadowTaskEvent
+from ..shadow_agent import ShadowAgentComponent, ShadowContextProjector, ShadowEvent
 from ..shadow_agent.component import ShadowAgentSession
-from ..shadow_agent.events import ShadowTaskEventBuffer
+from ..shadow_agent.events import ShadowEventBuffer
 from ..shadow_agent.prompts import load_shadow_instructions
 from ..shadow_agent.provider import DeepSeekResponsesShadowProvider
 from ..shadow_agent.tools import ShadowToolExecutor
@@ -60,7 +60,18 @@ class SessionRuntime:
         self.shadow_search_tools: WebSearchTools | None = None
         self.shadow_component: ShadowAgentComponent | None = None
         self.shadow_session: ShadowAgentSession | None = None
-        self._shadow_pending = ShadowTaskEventBuffer()
+        try:
+            shadow_user_profile = (config.persona.directory / config.persona.user_file).read_text(
+                encoding="utf-8",
+            )
+        except OSError:
+            shadow_user_profile = ""
+        self._shadow_user_profile = shadow_user_profile
+        self.shadow_context = ShadowContextProjector(
+            self.history, user_profile=self._shadow_user_profile,
+        )
+        self._shadow_pending = ShadowEventBuffer()
+        self._shadow_debug_sinks: dict[str, Any] = {}
         self.player: PcmPlayer | None = None
         self.audio_processor: AudioPreprocessor | None = None
         self.controller: EpisodeController | None = None
@@ -214,10 +225,23 @@ class SessionRuntime:
                     )
                     self.shadow_component = ShadowAgentComponent(
                         provider, executor, instructions_loader=load_shadow_instructions,
+                        runtime_options={
+                            "provider_timeout_ms": shadow_cfg.provider.timeout_ms,
+                            "transport_retry_limit": shadow_cfg.provider.transport_retry_limit,
+                            "max_context_tokens": shadow_cfg.max_context_tokens,
+                            "compaction_threshold_ratio": shadow_cfg.compaction_threshold_ratio,
+                            "observer_enabled": shadow_cfg.status_observer.enabled,
+                            "observer_every_steps": shadow_cfg.status_observer.every_committed_steps,
+                            "observer_max_output_tokens": shadow_cfg.status_observer.max_output_tokens,
+                            "observer_timeout_ms": shadow_cfg.status_observer.timeout_ms,
+                            "on_metric": self._on_shadow_metric,
+                        },
                     )
                     self.shadow_session = self.shadow_component.new_session(
+                        self.shadow_context,
                         production_sink=self._on_shadow_events,
                     )
+                    self.history.set_shadow_runtime_state(available=True, active=False)
                     self.state.set_service("shadow_agent", "READY")
                 except Exception as exc:
                     self.state.set_service("shadow_agent", "ERROR")
@@ -278,8 +302,8 @@ class SessionRuntime:
         self.controller = EpisodeController(
             options=self.config.smart_turn, agent_options=self.config.agent,
             persona_config=self.config.persona,
-            shadow_task_dispatcher=self._submit_shadow_task if self.shadow_session else None,
-            shadow_task_available=self.shadow_session is not None,
+            shadow_waker=self._wake_shadow if self.shadow_session else None,
+            shadow_available=self.shadow_session is not None,
             state=self.state,
             bus=self.bus,
             history=self.history,
@@ -333,7 +357,7 @@ class SessionRuntime:
             pending_buffer = getattr(self, "_shadow_pending", None)
             pending = pending_buffer.drain() if pending_buffer is not None else []
             if pending:
-                await self.controller.accept_shadow_task_events(pending)
+                await self.controller.accept_shadow_events(pending)
 
     async def stop_listening(self) -> None:
         async with self._session_lock:
@@ -351,6 +375,11 @@ class SessionRuntime:
             if pending_buffer is not None:
                 pending_buffer.drain()
             self.history.reset()
+            self.shadow_context = ShadowContextProjector(
+                self.history, user_profile=getattr(self, "_shadow_user_profile", ""),
+            )
+            if shadow_session is not None:
+                shadow_session.replace_context_source(self.shadow_context)
             self.conversation.reset()
             # Reset rotates the conversation but must not silently discard the
             # mode explicitly selected by the client.  The next Episode is
@@ -381,21 +410,26 @@ class SessionRuntime:
         if self.audio_processor is not None:
             self.audio_processor.close()
 
-    async def _submit_shadow_task(self, command: ShadowTaskCommand, history) -> Any:
+    def _wake_shadow(self) -> str:
         if self.shadow_session is None or not self.shadow_session.available:
-            raise ValueError("影子任务组件当前不可用")
-        return await self.shadow_session.handle_voice(command, history)
+            return "unavailable"
+        return self.shadow_session.wake()
 
-    async def _on_shadow_events(self, events: list[ShadowTaskEvent]) -> None:
+    async def _on_shadow_events(self, events: list[ShadowEvent]) -> None:
         # Stop intentionally ends only the voice episode.  The independent
         # manager continues, while its coalesced events wait for the next
         # session.start.
+        if self._shadow_debug_sinks:
+            await asyncio.gather(
+                *(sink(events) for sink in tuple(self._shadow_debug_sinks.values())),
+                return_exceptions=True,
+            )
         controller = self.controller
         if controller is None or not self.state.listening or controller.episode.closed:
             for item in events:
                 self._shadow_pending.publish(item)
             return
-        await controller.accept_shadow_task_events(events)
+        await controller.accept_shadow_events(events)
 
     def _on_shadow_tool_status(self, name: str, status: str, reason: str) -> None:
         if name == "web_search" and "web_search" in self.state.services:
@@ -403,19 +437,24 @@ class SessionRuntime:
             if status != "READY":
                 logger.warning("shadow web search status=%s reason=%s", status, str(reason)[:200])
 
-    async def debug_shadow_task(self, connection_id: str, payload: dict[str, Any], *, event_sink) -> Any:
+    def _on_shadow_metric(self, name: str, payload: dict[str, Any]) -> None:
+        logger.info(
+            "shadow.metric name=%s payload=%s",
+            name,
+            {key: value for key, value in payload.items() if key not in {"text", "content"}},
+        )
+
+    def debug_shadow_wake(self, connection_id: str, *, event_sink) -> dict[str, Any]:
         if not self.config.shadow_agent.debug_websocket_enabled:
             raise ValueError("SHADOW_DEBUG_DISABLED")
         if self.shadow_session is None or not self.shadow_session.available:
             raise ValueError("SHADOW_UNAVAILABLE")
-        command = ShadowTaskCommand.parse(payload)
-        return await self.shadow_session.handle_debug(
-            connection_id, command, self.history.settled_history(), event_sink=event_sink,
-        )
+        self._shadow_debug_sinks[connection_id] = event_sink
+        result = self.shadow_session.wake()
+        return {"result": result, "shadow": self.shadow_session.snapshot()}
 
     async def close_shadow_debug(self, connection_id: str) -> None:
-        if self.shadow_session is not None:
-            await self.shadow_session.close_debug(connection_id)
+        self._shadow_debug_sinks.pop(connection_id, None)
 
     def health_payload(self) -> dict[str, Any]:
         return {
@@ -488,23 +527,24 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
                     mode = _payload.get("mode")
                     if not isinstance(mode, str) or not await runtime.set_reasoning_mode(mode):
                         await _send_error(websocket, sequencer, "INVALID_REASONING_MODE", "思考模式必须是 fast、balanced 或 deep。", None, True)
-                elif command == "shadow.debug.task":
-                    async def debug_sink(items: list[ShadowTaskEvent]) -> None:
+                elif command == "shadow.debug.wake":
+                    async def debug_sink(items: list[ShadowEvent]) -> None:
                         for item in items:
-                            await debug_events.put(event("shadow.debug.event", None, id=item.id,
-                                                         status=item.status, text=item.text,
-                                                         question_id=item.question_id,
-                                                         options=list(item.options)))
+                            await debug_events.put(event(
+                                "shadow.debug.event", None,
+                                event_id=item.event_id, kind=item.kind, text=item.text,
+                                wake_policy=item.wake_policy, payload=item.payload,
+                            ))
                     try:
-                        receipt = await runtime.debug_shadow_task(connection_id, _payload, event_sink=debug_sink)
-                        await debug_events.put(event("shadow.debug.receipt", None,
-                                                     request_id=message["request_id"], accepted=receipt.accepted,
-                                                     id=receipt.id, status=receipt.status, message=receipt.message))
+                        result = runtime.debug_shadow_wake(connection_id, event_sink=debug_sink)
+                        await debug_events.put(event(
+                            "shadow.debug.wake", None, request_id=message["request_id"], **result,
+                        ))
                     except ValueError as exc:
                         code = str(exc)
                         await _send_error(websocket, sequencer,
-                                          code if code in {"SHADOW_DEBUG_DISABLED", "SHADOW_UNAVAILABLE"} else "INVALID_SHADOW_DEBUG_TASK",
-                                          "影子调试任务不可受理。", None, True)
+                                          code if code in {"SHADOW_DEBUG_DISABLED", "SHADOW_UNAVAILABLE"} else "INVALID_SHADOW_DEBUG_WAKE",
+                                          "影子调试唤醒不可受理。", None, True)
                 else:
                     await _send_error(websocket, sequencer, "UNKNOWN_COMMAND", f"不支持的命令：{command}", None, True)
         except WebSocketDisconnect:

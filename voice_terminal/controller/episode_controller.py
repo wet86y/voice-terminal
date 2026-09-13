@@ -37,7 +37,7 @@ class EpisodeController(RealtimeController):
         runtime = AgentEpisodeRuntime(self.llm, self.registry, self.output, self._agent_event,
                                       conversation=self.conversation, ledger=self.history,
                                       options=self.agent_options, tools_enabled=True,
-                                      task_dispatcher=self.shadow_task_dispatcher,
+                                      shadow_waker=self.shadow_waker,
                                       reasoning_mode=mode, persona_config=self.persona_config)
         self.output.runtime = runtime
         return runtime
@@ -131,9 +131,9 @@ class EpisodeController(RealtimeController):
                 await self.episode.log("LLM_PREWARM_FALLBACK", reason=str(exc)[:200])
         await super().start_listening()
 
-    async def accept_shadow_task_events(self, events) -> None:
+    async def accept_shadow_events(self, events) -> None:
         for item in events:
-            await self.episode.accept_shadow_task_event(item)
+            await self.episode.accept_shadow_event(item)
 
     def _begin_tool_scope(self, turn_id):
         pass  # Tools belong to the episode, not the audio turn.

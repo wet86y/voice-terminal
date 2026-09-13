@@ -1,45 +1,96 @@
 # Voice Terminal V0.6
 
-Voice Terminal 是 Windows 本机实时语音会话终端。浏览器只负责控制与可视化；音频采集、VAD、ASR、Smart Turn、SenseVoice、Agent、工具、TTS、播放和延迟均由 Voice Server 负责。
+Voice Terminal 是 Windows 本机实时语音会话终端。浏览器负责控制和可视化；音频采集、VAD、
+ASR、Smart Turn、SenseVoice、主 Agent、Shadow Agent、TTS、播放和延迟均由 Voice Server 管理。
 
-> **项目状态：生产运行。** 实时会话使用 DeepSeek Responses + strict `json_schema`；冻结的 Chat Completions + `json_object` 仅作为显式回退路径。语音决策、思考控制和输出前缀经单一 Agent 主链处理；文件与网络检索由独立的影子任务 Agent 处理。
+> 当前生产路径使用 DeepSeek Responses + strict `json_schema`。主语音链保持低延迟交互，
+> 会话级单一 Shadow Agent 负责高思考意图理解与只读工具调用。
 
 ## 当前运行模型
 
-系统只有一条语音决策运行链：`SessionRuntime → EpisodeController → AgentDecisionScheduler + SpeechQueue`；`ShadowAgentComponent` 是同一 session 持有的独立任务组件，不直接调用主 LLM。核心关联字段为 `conversation_id`、`turn_id`、`request_id`、`speech_id` 和 `output_generation`；它们只用于追踪。普通事件不会因为文本修订或影子任务晚到而失效，只有停止监听、用户反打断、会话重置和播放中 `speak(text)` 才会关闭显式取消作用域。
+```text
+用户 → ASR → 主 LLM → speak → Speech transaction → TTS / Player
+                    └→ request_shadow({"request": true})
+                                  │
+                                  ▼
+                    最新权威上下文 → ShadowRuntime
+                                      ├→ READ_ONLY tools
+                                      └→ ShadowEvent → 400ms heartbeat → 主 LLM
+```
 
-影子任务可使用受控的 `request_user_clarification(question, options)` 请求主 LLM 代理向用户提问。任务进入 `awaiting_user` 后保留其工具轨迹与上下文；用户的明确答复由主 LLM 通过 `task(id, state="reply", text, question_id)` 回注原任务。每次等待最多两分钟，超时改为可长期恢复的 `paused`；`awaiting_user`、`paused` 和终态均经原有 400ms mailbox 回传，`running` checkpoint 仍只记账。
+主语音链只有一个 `AgentDecisionScheduler` 和一个 provider 请求循环。400ms mailbox、Speech
+transaction、TTS generation、barge-in 与传达感知 `SessionLedger` 保持单一权威。未播放的
+assistant 草稿不会成为历史；实际听到的内容、ASR refinement 和有语义影响的打断才会落账。
 
-所有主 Agent 请求都由同一个 `AgentDecisionScheduler` 和同一个 `_run()` 循环管理。调度器以固定 deadline 持续推进本地 400ms 心跳：下一次 deadline 从上一次 deadline 加 400ms 计算，不等待在飞 LLM、TTS 或 provider 返回。普通事件在心跳边界合并并优先调度；已进入 mailbox 的普通语义事件可在被动用户讲话期间启动预推理，且只放开用户讲话这一项门控：活动请求、TTS 忙碌、backoff 和 episode 生命周期限制仍生效，语音候选仍由输出层 hold。影子任务终态也是普通语义事件，但只投递 mailbox，绝不直接调用主 LLM；运行中 checkpoint 只写账本。没有普通语义事件时，才在第 3、6、9、16、22 个窗口进行 `forced_poll`，第 25 个窗口进行一次独立的 `final_silence` 检查；这两个纯计时分支与异常恢复继续遵守用户讲话门控。普通事件和强制窗口同一边界出现时，普通请求覆盖强制窗口，不创建 system-check。`forced_poll` 到窗时若运行时忙则当场跳过，不延迟补发；`final_silence` 是独立分支，忙时保留 `final_pending` 并在空闲后只补发一次，但等待期间若出现新的有效用户输入，旧静默条件失效并重新计时。普通、异常恢复、`forced_poll` 或 `final_silence` 请求一旦启动，后续用户语音只能进入统一心跳邮箱，不得取消在飞 LLM；只有请求自然结束且输出校验失败后，才进入有界的异常协议恢复链路。TTS 和语音活动事件不构成普通语义事件，也不重置用户静默锚点；TTS 状态只作为实际发起 LLM 请求的 busy gate。异常协议恢复仍沿用同一循环和既有有限预算，不形成第二个 watchdog 或无限自唤醒。Agent 每轮通过 Responses strict Schema 返回必填的 `{"speak":{"state":"speak|cancel|wait"},"actions":[]}` 信封，不传递 provider native tools。主动作目录只包含 `task` 与可选的 `request_thinking`；Schema 是生成约束，本地 `SpeechDecisionEnvelopeStream` 仍是最终权威。`speak.state/text/emotion` 通过前缀校验后即可进入文本语音队列；完整 JSON 与 `actions` 仍需最终校验。完整目标文本只允许在同一 `conversation_id + turn_id` 的活动 speech transaction 内续写：`runtime.speak` 通过 `owner_scope` 和 `continuation_allowed` 区分当前轮目标与上一轮可观察语音。相同的当前轮前缀只追加超出的 suffix；上一轮文本不能成为新轮 continuation baseline，模型若异常返回“已完整播放文本 + 新后缀”，本地会在 TTS 前剥离旧前缀。完全相同文本仍允许显式复述。替换 generation 的旧 provider 取消在后台完成；`cancel` 会立即停止输出。当前输出完成后保留 1 秒同轮追加窗口，讲话期间队列只保存文本，不预生成或保存 PCM，端点确认后才启动 TTS。会话上下文来自唯一的传达感知账本和 `LLMContextProjector`：最终用户输入、实际听到的语音前缀、被打断说明与不可信影子任务资料；跨轮隔离不删除 assistant 历史。
+每个 session 只有一个长期存在的 `ShadowRuntime`，不存在 task ID、任务列表、任务队列、
+modify/reply/cancel/checkpoint 或多任务调度器。主 LLM不能发送任务文本或意图摘要，只能在完整
+decision 校验后异步调用固定动作 `request_shadow({"request":true})`。Shadow 从专用
+`ShadowContextProjector` 读取最新完整上下文，自行识别用户当前意图。
 
-没有普通事件时的强制请求仍使用同一个 provider stream 入口，但会创建独立 `system_check_id`，不调用 `ConversationRuntime.begin_turn()`，不创建用户 `InputRecord`，也不产生用户轮次的 `turn.completed`。新用户输入不会取消已启动的 system-check LLM 请求；尚未播放的旧 system-check 语音候选仍沿用输出层既有失效规则，已被用户听到的 system-check speech 则通过现有 assistant delivery 机制进入账本。
+运行中出现新用户补充、修正或撤销时，wake 只合并最新 revision，不中断正在进行的 provider
+请求或已开始的只读工具。在下一个安全边界追加无损上下文 delta 和意图重判提示；尚未开始的
+旧工具返回 `conversation_context_updated`，任何 stale final 都不能发布。
 
-LLM transport 由 `llm.transport` 原子选择；默认生产接入为官方 DeepSeek Responses + strict `json_schema`。用户可在 Web 控制台选择快速、均衡或深度模式，选择在新的 Agent episode 生效：快速始终使用 `effort=none`；均衡基础请求使用 `effort=none`，模型仅在必要时可输出本地控制 action `{"name":"request_thinking","arguments":{"request":true}}`；深度每次使用 `effort=low`。该 action 不是 provider native tool，固定由本地解释为一次 low 推理。`task` 也不是 provider native tool：它在完整主 decision 后立即提交给 session-owned 影子 manager，不等待 thinking barrier。影子 Agent 独立使用 Responses、高思考、多轮原生 function calling，并且首期仅有只读文件/网络能力。任务接受、修改和取消可发生在用户讲话中；终态才由下一次 400ms heartbeat 反馈给主 LLM。`session.stop` 保留生产任务并缓存事件，`session.reset`/runtime close 终止任务。`config/local.yaml` 是本机调试覆盖；正常请求的 Schema 可见性和实际 effort 以启动时冻结的 episode `reasoning_mode` 为准。情绪枚举只接受 `calm`、`happy`、`sad`、`angry`、`fearful`、`disgusted`、`surprised`；兼容性别名 `friendly` 会安全映射为 `calm`。推理原文经本地调试 Web UI 的 `agent.reasoning` 事件显示，也会写入独立的完整 LLM 审计日志，但不会进入普通 `voice-server.log`、Agent trace、DeliveryReport 或持久会话历史。上下文精确 tokenizer 在后台预热，未完成预热时使用本地 fallback 估算，不阻塞实时事件循环。
+Shadow 固定拥有只读文件/搜索业务工具以及三个本地控制端口：主动读取最新上下文、发布
+progress/observation、请求 clarification。用户答复正常进入会话后，主 LLM只再次 wake，Shadow
+从用户原话继续理解，不使用 question ID 或 reply action。副作用工具 effect 仅保留契约，首版
+executor 拒绝所有非 `READ_ONLY` 能力。
 
-DeepSeek Responses 的 `max_output_tokens` 当前固定为官方最大输出预算 `393216`（384K tokens）。这是单次响应的生成上限，并同时覆盖可见正文和 reasoning，不是字节数，也不是输入上下文长度。模型可以在自然完成时提前停止；若上游返回 `response.incomplete` 且原因为 `max_output_tokens`，运行时会将它与普通 JSON 校验失败分开记录并进入一次有界协议恢复。
+每 5 个已提交 Shadow model response 会并行触发无思考、无工具的状态观察器。简报通过正常
+heartbeat 进入主 LLM，主模型可以自然播报或 wait。Shadow 不设 activation 总墙钟/步骤上限；
+单 provider 请求仍有 timeout 和有限 transport retry。默认在 524288 token 预算的 80% 处生成
+稳定摘要并切换 cache epoch，不终止长期工作。
 
-主服务默认启用 `logs/voice-server-llm-context.jsonl` 完整审计。`request_context` version 3 保存模型可见的完整 `messages`、Schema 和最终 wire payload；`request_outcome` version 2 保存完整或部分 `output_text`、`reasoning_text`、校验结果及明确的 `cancel_reason`。该文件包含真实会话内容并在后台异步轮转，不写控制台；旧版审计记录不会自动补全。格式、关联方法和排障要求见[运行与质量门槛](docs/operations-and-quality.md#llm-完整审计与故障复现)。
+`session.stop` 只停止语音 episode，Shadow 继续并缓存重要事件；`session.reset` 清空 Shadow
+trace/status、轮换上下文 epoch 与 OpenCode session header；runtime close 关闭所有资源。
 
-破坏性升级的规则是“删除旧接口，不删除仍需的能力”：每项被移除实现的能力必须先迁移到唯一、可达且有行为测试的新主链 owner；旧配置和协议则直接失败，不做静默映射。完整准则见[运行与质量门槛](docs/operations-and-quality.md#破坏性升级与能力保全)。
+## 思考模式与输出
 
-## 人格上下文文件
+Web 控制台可选择快速、均衡或深度模式。快速使用 `effort=none`；均衡基础请求无思考，必要时
+可输出本地 `request_thinking({"request":true})`；深度使用低思考。`request_thinking` 和
+`request_shadow` 都是主 decision 内的本地控制动作，不是 provider native tools。
 
-模型的会话级人格配置位于 `config/persona/`，由三份 Markdown 文件组成：
+Agent 每轮返回必填 `{"speak":{"state":"speak|cancel|wait","emotion":"...","text":"..."},
+"actions":[]}`。本地流式解析器与最终校验仍是权威。情绪只接受 `calm`、`happy`、`sad`、
+`angry`、`fearful`、`disgusted`、`surprised`。
 
-- `personality.md`：语音模型的身份、人格特质和表达风格；
-- `user.md`：用户资料、称呼、语言和沟通偏好；
-- `instructions.md`：等待、回应、追问、打断、工具使用和语音表达规则。
+## 人格上下文
 
-三份文件在新的 Agent episode 首次创建时读取一次，并作为稳定的
-`STATIC_INSTRUCTIONS` 注入模型。当前 episode 内修改文件不会热更新；停止后
-重新启动或执行会话重置后才会重新加载。缺失、空文件或无法读取的文档会被跳过并
-记录 warning，内置 Agent 协议和本地 JSON/语音校验仍然保持有效。文档的优先级为
-“内置协议 > 指令集合 > 人格主体 > 用户资料”。
+会话级人格位于 `config/persona/`：
 
-当前初始化内容为：模型名称暂不设定，身份是语音助理，表达风格稳重、中性，遵循
-“理性优先、证据优先”；用户称呼为“老大”，背景是当前系统调试人员，并允许在信息
-不足或需要继续讨论时主动追问。说话内容需要修改、补充或纠正时，优先追加；只有
-原内容明显错误、会误导、与新信息冲突或必须撤回时才打断，并说明打断原因。
+- `personality.md`：身份与表达风格；
+- `user.md`：用户资料和沟通偏好；
+- `instructions.md`：等待、回应、追问、打断和语音规则。
+
+文件在新 Agent episode 创建时冻结为静态 instructions，当前 episode 内不热更新。优先级为
+“内置协议 > 指令集合 > 人格主体 > 用户资料”。Shadow 不复用语音人格 prompt；稳定用户资料
+可由其专用 projector 显式提供。
+
+## 配置
+
+默认 Shadow 配置：
+
+```yaml
+shadow_agent:
+  enabled: true
+  debug_websocket_enabled: false
+  max_context_tokens: 524288
+  compaction_threshold_ratio: 0.80
+  provider:
+    timeout_ms: 15000
+    transport_retry_limit: 2
+  status_observer:
+    enabled: true
+    every_committed_steps: 5
+    reasoning_effort: none
+    max_output_tokens: 512
+    timeout_ms: 10000
+  tools:
+    files_enabled: true
+    allowed_roots: [docs]
+```
+
+`config/local.yaml` 用于本机非密钥覆盖；API key 放入 `.env.local` 或进程环境。
 
 ## 启动
 
@@ -48,18 +99,27 @@ DeepSeek Responses 的 `max_output_tokens` 当前固定为官方最大输出预�
 .\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe
 ```
 
-`start.ps1` 默认会依次准备分析、ASR、Web 前端和 Voice Server；在继续启动前会确认 Web 前端实际可通过 `http://127.0.0.1:5173/` 访问。若 5173 已被其他进程监听、Vite 提前退出或页面在 30 秒内不可访问，脚本会失败并输出前端日志，而不会把仅后端健康误报为整套服务可用。只有需要独立调试后端时才使用 `-NoWeb`；前端单独开发仍可运行 `npm run dev`。
-
-在根目录的已忽略 `.env.local` 中配置 `DEEPSEEK_API_KEY`、`OPENCODE_GO_API_KEY`、`MINIMAX_API_KEY` 和可选的 `MINIMAX_API_HOST`。真实测试对话默认使用官方 DeepSeek；调试时可临时运行 `./scripts/start.ps1 -LlmProvider opencode_go` 切到 OpenCode Go，脚本结束后不会保留覆盖。浏览器默认连接 `ws://127.0.0.1:8765/ws`，不请求麦克风权限、不上传 PCM、不自行计算延迟。
-
-真实耳机/扬声器、自然语音统计与第三方服务稳定性仍是独立发布门槛，不能由 fake provider 或内存播放器代替。
+`start.ps1` 会依次准备 Analysis、ASR、Web 前端和 Voice Server，并确认
+`http://127.0.0.1:5173/` 可访问。仅调试后端时使用 `-NoWeb`。真实运行需配置
+`DEEPSEEK_API_KEY`、`MINIMAX_API_KEY`，OpenCode Go 调试另需 `OPENCODE_GO_API_KEY`。
 
 ## AEC 与播放期插话
 
-默认配置已启用 AEC（`audio.processing_enabled: true`）。助手播放期间，只有 AEC 健康、播放器反向参考新鲜且处理后近端 VAD 明确为 `true` 的连续用户语音，才可以中断 TTS；`false` 或 `unknown` 一律不进入 ASR/LLM，也不会退回原始麦克风 VAD。这样可以避免扬声器回声形成伪用户轮次。
+默认启用 AEC。助手播放期间，只有 AEC 健康、反向参考新鲜且处理后近端 VAD 明确为 true 的
+连续用户语音才可中断 TTS；unknown 不回退到原始麦克风 VAD。`audio.aec_failure_policy` 支持
+`pause_recover`、`stop_and_listen` 和兼容用 `continue_without_barge_in`。
 
-`audio.aec_failure_policy` 可选择 `pause_recover`（默认，暂停 PCM、重建 AEC 并续播）、`stop_and_listen`（停止本句并回到监听）或 `continue_without_barge_in`（仅兼容用途，播放期间暂禁自动插话）。AEC 恢复失败或超时会安全降为 `stop_and_listen`，不会无限暂停或静默锁死用户。实机验收时，每个 `BARGE_IN_CONFIRMED` 都应同时具有 `near_voice=true` 和 `protected_available=true`。
+## 文档与验证
 
-上下文字段的准入、缓存命中诊断与官方 DeepSeek 验收说明见[LLM 上下文缓存契约](docs/llm-context-cache-contract.md)；Web UI 会显示 provider 输入与缓存命中指标。
+- [架构与组件契约](docs/architecture.md)
+- [上下文与工具规范](docs/context-and-tools.md)
+- [WebSocket 协议](docs/websocket-protocol.md)
+- [LLM 上下文缓存契约](docs/llm-context-cache-contract.md)
+- [运行与质量门槛](docs/operations-and-quality.md)
 
-详见：[架构与组件契约](docs/architecture.md)、[WebSocket V0.6 协议](docs/websocket-protocol.md)、[上下文与工具规范](docs/context-and-tools.md)、[LLM 上下文缓存契约](docs/llm-context-cache-contract.md)、[V0.6 可靠性审计](docs/v06-reliability-audit.md)、[运行与质量门槛](docs/operations-and-quality.md)。
+```powershell
+python -m pytest -q
+cd web
+npm test
+npm run typecheck
+```

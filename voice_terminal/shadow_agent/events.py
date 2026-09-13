@@ -1,29 +1,26 @@
-"""Coalescing event mailbox for future heartbeat integration."""
+"""Coalescing mailbox between the Shadow execution plane and heartbeat."""
 from __future__ import annotations
 
 from collections import OrderedDict
 
-from .contracts import ShadowTaskEvent
+from .contracts import ShadowEvent
 
 
-_TERMINAL = {"completed", "cancelled", "timed_out", "failed"}
-
-
-class ShadowTaskEventBuffer:
-    """Keep one pending event per task while preserving first enqueue order."""
+class ShadowEventBuffer:
+    """Coalesce visible state while preserving every semantic event."""
 
     def __init__(self) -> None:
-        self._pending: OrderedDict[int, ShadowTaskEvent] = OrderedDict()
+        self._state: OrderedDict[str, ShadowEvent] = OrderedDict()
+        self._semantic: list[ShadowEvent] = []
 
-    def publish(self, event: ShadowTaskEvent) -> None:
-        current = self._pending.get(event.id)
-        if current is not None and current.status in _TERMINAL and event.status == "running":
-            return
-        # Assignment to an existing OrderedDict key deliberately retains its
-        # original position, giving different task IDs stable event ordering.
-        self._pending[event.id] = event
+    def publish(self, event: ShadowEvent) -> None:
+        if event.kind in {"status", "progress"}:
+            self._state[event.kind] = event
+        else:
+            self._semantic.append(event)
 
-    def drain(self) -> list[ShadowTaskEvent]:
-        result = list(self._pending.values())
-        self._pending.clear()
+    def drain(self) -> list[ShadowEvent]:
+        result = [*self._state.values(), *self._semantic]
+        self._state.clear()
+        self._semantic.clear()
         return result

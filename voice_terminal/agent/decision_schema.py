@@ -36,13 +36,20 @@ def decision_schema(action_definitions: Iterable[dict[str, Any]], *, allow_think
             for key, value in properties.items():
                 if isinstance(key, str) and isinstance(value, dict):
                     # Every merged argument property is required for every
-                    # action in this provider subset. Keep only its base type
-                    # so irrelevant fields can carry a neutral value; the
-                    # action adapter remains authoritative for constraints.
+                    # action in this provider subset. Preserve a shared const
+                    # (notably the content-free wake boolean); conflicting
+                    # action shapes fall back to local authoritative checks.
                     value_type = value.get("type")
-                    argument_properties.setdefault(
-                        key, {"type": value_type if isinstance(value_type, str) else "string"},
-                    )
+                    projected = {"type": value_type if isinstance(value_type, str) else "string"}
+                    if "const" in value:
+                        projected["const"] = value["const"]
+                    existing = argument_properties.get(key)
+                    if existing is None:
+                        argument_properties[key] = projected
+                    elif existing != projected:
+                        # Merged actions must share a neutral shape. A local
+                        # parser still enforces any action-specific constraint.
+                        existing.pop("const", None)
 
     if THINKING_ACTION in names:
         raise ValueError(f"{THINKING_ACTION} is reserved for the local Agent control plane")
@@ -50,7 +57,9 @@ def decision_schema(action_definitions: Iterable[dict[str, Any]], *, allow_think
         names.append(THINKING_ACTION)
         # Strict Responses implementations reject an empty object.  This is a
         # local control-plane acknowledgement, not a provider effort choice.
-        argument_properties["request"] = {"type": "boolean"}
+        request = argument_properties.setdefault("request", {"type": "boolean", "const": True})
+        if request.get("type") == "boolean":
+            request["const"] = True
 
     # JSON Schema requires a non-empty enum.  With no actions available, an
     # impossible sentinel plus maxItems=0 keeps the public envelope stable.

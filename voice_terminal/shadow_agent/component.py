@@ -1,37 +1,28 @@
-"""Session-facing ownership for the independent shadow task runtime.
-
-The component deliberately knows nothing about voice controllers, session
-ledgers, WebSockets, or schedulers.  Callers provide narrow event sinks at
-the integration boundary; the component only owns task managers, provider
-state, and the shared read-only capability executor.
-"""
+"""Ownership boundary for session-scoped Shadow Agent runtimes."""
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .contracts import ShadowTaskCommand, ShadowTaskEvent, TaskReceipt
-from .events import ShadowTaskEventBuffer
-from .manager import ShadowTaskManager
+from .contracts import ShadowEvent, WakeResult
+from .events import ShadowEventBuffer
+from .manager import ShadowContextSource, ShadowRuntime
 from .provider import ShadowProvider
 from .tools import ShadowToolExecutor
 
 
-EventSink = Callable[[list[ShadowTaskEvent]], Awaitable[None]]
+EventSink = Callable[[list[ShadowEvent]], Awaitable[None]]
 
 
 class _EventRelay:
-    """Coalesce callbacks from one manager before crossing an async boundary."""
-
     def __init__(self, sink: EventSink | None) -> None:
         self.sink = sink
-        self.buffer = ShadowTaskEventBuffer()
-        self.task: asyncio.Task | None = None
+        self.buffer = ShadowEventBuffer()
+        self.task: asyncio.Task[None] | None = None
         self.closed = False
 
-    def publish(self, event: ShadowTaskEvent) -> None:
+    def publish(self, event: ShadowEvent) -> None:
         if self.closed:
             return
         self.buffer.publish(event)
@@ -49,11 +40,10 @@ class _EventRelay:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    # The owning integration can expose diagnostics. A failed
-                    # observer must never crash or resurrect a task manager.
+                    # The event stays non-fatal to both execution and voice.
                     pass
 
-    def drain(self) -> list[ShadowTaskEvent]:
+    def drain(self) -> list[ShadowEvent]:
         return self.buffer.drain()
 
     async def close(self) -> None:
@@ -65,118 +55,77 @@ class _EventRelay:
         self.buffer.drain()
 
 
-@dataclass
-class ShadowDebugSandbox:
-    """A manager with a connection-local ID scope and event relay."""
-
-    manager: ShadowTaskManager
-    relay: _EventRelay
-
-    async def handle(
-        self,
-        command: ShadowTaskCommand | dict[str, Any],
-        settled_history: Sequence[dict[str, Any]] | None,
-    ) -> TaskReceipt:
-        return await self.manager.handle(command, settled_history)
-
-    async def close(self) -> None:
-        await self.manager.close(close_tools=False)
-        await self.relay.close()
-
-
 class ShadowAgentSession:
-    """Conversation-scoped production manager plus isolated debug managers."""
+    """The sole Shadow runtime associated with one authoritative ledger."""
 
-    def __init__(self, component: "ShadowAgentComponent", *, production_sink: EventSink | None = None) -> None:
+    def __init__(
+        self, component: "ShadowAgentComponent", context_source: ShadowContextSource,
+        *, production_sink: EventSink | None = None,
+    ) -> None:
         self.component = component
-        self.production_sink = production_sink
-        self.production_relay = _EventRelay(production_sink)
-        self.production = self._new_manager(self.production_relay.publish)
-        self.debug: dict[str, ShadowDebugSandbox] = {}
-        self.closed = False
-
-    def _new_manager(self, on_event: Callable[[ShadowTaskEvent], None]) -> ShadowTaskManager:
-        return ShadowTaskManager(
-            self.component.provider,
-            self.component.tools,
-            instructions_loader=self.component.instructions_loader,
-            on_event=on_event,
+        self.relay = _EventRelay(production_sink)
+        self.runtime = ShadowRuntime(
+            component.provider, component.tools, context_source,
+            instructions_loader=component.instructions_loader,
+            on_event=self.relay.publish,
+            **component.runtime_options,
         )
+        self.closed = False
 
     @property
     def available(self) -> bool:
-        return not self.closed and not self.component.closed
+        return not self.closed and not self.component.closed and self.runtime.available
 
-    async def handle_voice(
-        self,
-        command: ShadowTaskCommand | dict[str, Any],
-        settled_history: Sequence[dict[str, Any]] | None,
-    ) -> TaskReceipt:
-        return await self.production.handle(command, settled_history)
+    def wake(self) -> WakeResult:
+        return self.runtime.wake()
 
-    async def handle_debug(
-        self,
-        connection_id: str,
-        command: ShadowTaskCommand | dict[str, Any],
-        settled_history: Sequence[dict[str, Any]] | None,
-        *,
-        event_sink: EventSink,
-    ) -> TaskReceipt:
-        sandbox = self.debug.get(connection_id)
-        if sandbox is None:
-            relay = _EventRelay(event_sink)
-            sandbox = ShadowDebugSandbox(self._new_manager(relay.publish), relay)
-            self.debug[connection_id] = sandbox
-        return await sandbox.handle(command, settled_history)
+    def snapshot(self) -> dict[str, Any]:
+        return self.runtime.snapshot()
 
-    async def close_debug(self, connection_id: str) -> None:
-        sandbox = self.debug.pop(connection_id, None)
-        if sandbox is not None:
-            await sandbox.close()
+    def replace_context_source(self, context_source: ShadowContextSource) -> None:
+        """Rotate the authority after a session reset while the runtime is idle."""
+        if self.runtime.active:
+            raise RuntimeError("cannot replace active Shadow context source")
+        self.runtime.context_source = context_source
+
+    def drain_events(self) -> list[ShadowEvent]:
+        return self.relay.drain()
 
     async def reset(self) -> None:
-        """Terminate every manager and create a clean production ID scope."""
-
-        await self.production.close(close_tools=False)
-        await self.production_relay.close()
-        for sandbox in list(self.debug.values()):
-            await sandbox.close()
-        self.debug.clear()
-        if not self.closed and not self.component.closed:
-            self.production_relay = _EventRelay(self.production_sink)
-            self.production = self._new_manager(self.production_relay.publish)
+        await self.runtime.reset()
+        sink = self.relay.sink
+        await self.relay.close()
+        self.relay = _EventRelay(sink)
+        self.runtime.on_event = self.relay.publish
 
     async def close(self) -> None:
         if self.closed:
             return
         self.closed = True
-        await self.production.close(close_tools=False)
-        await self.production_relay.close()
-        for sandbox in list(self.debug.values()):
-            await sandbox.close()
-        self.debug.clear()
+        await self.runtime.close(close_tools=False)
+        await self.relay.close()
 
 
 class ShadowAgentComponent:
-    """Reusable optional component with one shared provider and tool executor."""
+    """Reusable provider/tool owner; sessions never create task managers."""
 
     def __init__(
-        self,
-        provider: ShadowProvider,
-        tools: ShadowToolExecutor,
-        *,
-        instructions_loader: Callable[[], str],
+        self, provider: ShadowProvider, tools: ShadowToolExecutor, *,
+        instructions_loader: Callable[[], str], runtime_options: dict[str, Any] | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.instructions_loader = instructions_loader
+        self.runtime_options = dict(runtime_options or {})
         self.closed = False
         self._sessions: set[ShadowAgentSession] = set()
 
-    def new_session(self, *, production_sink: EventSink | None = None) -> ShadowAgentSession:
+    def new_session(
+        self, context_source: ShadowContextSource, *, production_sink: EventSink | None = None,
+    ) -> ShadowAgentSession:
         if self.closed:
             raise RuntimeError("shadow component closed")
-        session = ShadowAgentSession(self, production_sink=production_sink)
+        session = ShadowAgentSession(self, context_source, production_sink=production_sink)
         self._sessions.add(session)
         return session
 

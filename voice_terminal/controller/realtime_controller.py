@@ -11,7 +11,7 @@ from .turn_workspace import AudioFrame, CurrentTurnAudioBuffer, TurnWorkspace
 from .transcript_segmenter import TranscriptSegmenter
 from .options import InputOptions
 from ..analysis.client import AnalysisClient
-from ..agent.task_registry import VoiceTaskRegistry
+from ..agent.shadow_registry import VoiceShadowRegistry
 from ..asr.protocol import AudioChunk
 from ..core.events import event, utc_now_iso
 from ..core.state import TerminalState
@@ -25,14 +25,14 @@ class RealtimeController(SpeechPipeline, InputController):
     """Realtime input orchestration used by the session runtime."""
 
     def __init__(self, *, options: InputOptions, analysis=None,
-                 shadow_task_dispatcher=None, shadow_task_available: bool = False, **kwargs) -> None:
+                 shadow_waker=None, shadow_available: bool = False, **kwargs) -> None:
         self.conversation = kwargs.pop("conversation")
         super().__init__(**kwargs)
         self.options = options
         self.analysis = analysis or AnalysisClient(options.analysis_url)
         self.analysis_health: dict = {}
-        self.shadow_task_dispatcher = shadow_task_dispatcher
-        self.registry = VoiceTaskRegistry(available=shadow_task_available)
+        self.shadow_waker = shadow_waker
+        self.registry = VoiceShadowRegistry(available=shadow_available)
         self.workspace: TurnWorkspace | None = None
         self.segmenter = TranscriptSegmenter(options.min_segment_chars, options.max_segment_chars)
         self._endpoint_task: asyncio.Task | None = None

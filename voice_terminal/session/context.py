@@ -58,7 +58,10 @@ class LLMContextProjector:
         )
 
     @staticmethod
-    def runtime_tail(*, current: CurrentInput, speak_state: dict[str, Any], calendar_epoch: str | None = None) -> str:
+    def runtime_tail(
+        *, current: CurrentInput, speak_state: dict[str, Any],
+        calendar_epoch: str | None = None, shadow: dict[str, Any] | None = None,
+    ) -> str:
         """Create the only volatile model context block for one request."""
 
         now = datetime.now().astimezone()
@@ -70,6 +73,13 @@ class LLMContextProjector:
         }
         if calendar_epoch:
             payload["runtime"]["calendar_epoch"] = calendar_epoch
+        if shadow is not None:
+            payload["shadow"] = {
+                "available": bool(shadow.get("available")),
+                "active": bool(shadow.get("active")),
+                "status": str(shadow.get("status") or "")[:512],
+                "user_input_required": bool(shadow.get("user_input_required")),
+            }
         if current.finalized:
             payload["runtime"]["input_status"] = "finalized"
         elif current.user_speaking is True:

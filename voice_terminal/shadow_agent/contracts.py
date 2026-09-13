@@ -1,84 +1,123 @@
-"""Public command and event contracts for the isolated shadow task harness."""
+"""Contracts for the session-scoped single Shadow Agent runtime."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Literal
 
 
-TaskCommandState = Literal["request", "modify", "reply", "cancel"]
-TaskEventStatus = Literal[
-    "running", "awaiting_user", "paused", "completed", "cancelled", "timed_out", "failed",
+ShadowEventKind = Literal[
+    "status", "progress", "observation", "user_input_required", "result", "failed",
 ]
+WakePolicy = Literal["passive", "normal", "priority"]
+ContextOrigin = Literal["user", "main_agent", "external_system", "runtime"]
+WakeResult = Literal["started", "coalesced", "already_current", "unavailable"]
+
+
+class ToolEffect(StrEnum):
+    """Effect declaration frozen with every registered Shadow tool."""
+
+    READ_ONLY = "READ_ONLY"
+    REVERSIBLE_WRITE = "REVERSIBLE_WRITE"
+    EXTERNAL_COMMIT = "EXTERNAL_COMMIT"
+    DESTRUCTIVE = "DESTRUCTIVE"
 
 
 @dataclass(frozen=True)
-class ShadowTaskCommand:
-    id: int
-    state: TaskCommandState
+class ShadowContextFrame:
+    revision: int
+    origin: ContextOrigin
+    kind: str
+    content: Any
+
+
+@dataclass(frozen=True)
+class ShadowContextSnapshot:
+    epoch: int
+    revision: int
+    frames: tuple[ShadowContextFrame, ...]
+
+
+@dataclass(frozen=True)
+class ShadowContextUpdate:
+    epoch: int
+    from_revision: int
+    to_revision: int
+    frames: tuple[ShadowContextFrame, ...]
+
+
+@dataclass(frozen=True)
+class ShadowEvent:
+    event_id: str
+    kind: ShadowEventKind
     text: str
-    question_id: str
-
-    @classmethod
-    def parse(cls, value: Any) -> "ShadowTaskCommand":
-        if not isinstance(value, dict) or set(value) != {"id", "state", "text", "question_id"}:
-            raise ValueError("task command requires exactly id, state, text, and question_id")
-        identifier = value["id"]
-        if not isinstance(identifier, int) or isinstance(identifier, bool) or identifier < 1:
-            raise ValueError("task.id must be a positive integer")
-        state = value["state"]
-        if state not in {"request", "modify", "reply", "cancel"}:
-            raise ValueError("task.state must be request, modify, reply, or cancel")
-        text = value["text"]
-        if not isinstance(text, str):
-            raise ValueError("task.text must be a string")
-        question_id = value["question_id"]
-        if not isinstance(question_id, str):
-            raise ValueError("task.question_id must be a string")
-        if state == "reply":
-            if not text.strip() or not question_id.strip():
-                raise ValueError("task.reply requires nonempty text and question_id")
-        elif question_id:
-            raise ValueError("task.question_id must be empty unless state=reply")
-        return cls(identifier, state, text, question_id)
+    based_on_context_revision: int
+    wake_policy: WakePolicy
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
-class ShadowTaskEvent:
-    id: int
-    status: TaskEventStatus
+class ShadowVisibleStatus:
+    active: bool
     text: str
-    question_id: str = ""
-    options: tuple[str, ...] = ()
+    based_on_trace_revision: int
+    updated_at: float
 
 
-@dataclass(frozen=True)
-class TaskReceipt:
-    accepted: bool
-    id: int
-    status: str
-    message: str
+def parse_shadow_wake(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"request"} or value["request"] is not True:
+        raise ValueError('request_shadow requires exactly {"request": true}')
+    return True
 
 
-def task_action_definition() -> dict[str, Any]:
-    """Return the future voice-facing action definition without registering it.
-
-    Responses strict schemas require every declared argument property to be
-    required. Empty strings are therefore the schema-compatible representation
-    for fields unused by a command state.
-    """
-
+def request_shadow_action_definition() -> dict[str, Any]:
     return {
-        "name": "task",
-        "description": "Create, query, modify, reply to, or cancel one shadow task.",
+        "name": "request_shadow",
+        "description": "让独立影子 Agent 同步最新完整会话上下文，并推进当前仍需处理的工作。",
         "parameters": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["id", "state", "text", "question_id"],
-            "properties": {
-                "id": {"type": "integer", "minimum": 1},
-                "state": {"type": "string", "enum": ["request", "modify", "reply", "cancel"]},
-                "text": {"type": "string"},
-                "question_id": {"type": "string"},
-            },
+            "required": ["request"],
+            "properties": {"request": {"type": "boolean", "const": True}},
         },
     }
+
+
+def shadow_control_tool_definitions() -> list[dict[str, Any]]:
+    """Return the fixed, local-only tools appended after business tools."""
+
+    return [
+        {
+            "type": "function", "name": "get_latest_context",
+            "description": "读取指定会话修订之后的最新权威上下文。",
+            "parameters": {
+                "type": "object", "additionalProperties": False, "required": ["since_revision"],
+                "properties": {"since_revision": {"type": "integer", "minimum": 0}},
+            },
+        },
+        {
+            "type": "function", "name": "publish_main_event",
+            "description": "向主助手发布可覆盖的进度或具有会话意义的新发现。",
+            "parameters": {
+                "type": "object", "additionalProperties": False, "required": ["kind", "text"],
+                "properties": {
+                    "kind": {"type": "string", "enum": ["progress", "observation"]},
+                    "text": {"type": "string", "minLength": 1},
+                },
+            },
+        },
+        {
+            "type": "function", "name": "request_user_input",
+            "description": "请求主助手自然地向用户澄清；confirmation 仅保留契约，首版不得执行外部副作用。",
+            "parameters": {
+                "type": "object", "additionalProperties": False,
+                "required": ["kind", "question", "options", "operation_summary"],
+                "properties": {
+                    "kind": {"type": "string", "enum": ["clarification", "confirmation"]},
+                    "question": {"type": "string", "minLength": 1},
+                    "options": {"type": "array", "items": {"type": "string"}},
+                    "operation_summary": {"type": "string"},
+                },
+            },
+        },
+    ]

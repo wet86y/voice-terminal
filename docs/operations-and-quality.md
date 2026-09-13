@@ -1,152 +1,97 @@
 # 运行与质量门槛
 
-> **当前状态：生产运行。** 默认语音 LLM 路径为 DeepSeek Responses + strict `json_schema`；冻结的 Chat/`json_object` adapter 只作为显式整体回退入口。快速、均衡和深度思考模式均属于生产主链：均衡模式可请求一次本地 `request_thinking` 续请求，深度模式使用 `effort=low`。独立影子任务 Agent 默认启用，但没有主 LLM 调度权。
+> 当前生产主链为 DeepSeek Responses strict `json_schema` 语音决策，加会话级单一
+> ShadowRuntime。Shadow 默认启用但不属于语音 `can_start` 必要条件，首版能力全部只读。
 
-默认 `config/default.yaml` 是当前唯一活动运行线。`smart_turn`、`agent` 与 `shadow_agent` 是能力配置，不是版本开关。影子 external 工具默认仅限 `docs` 文件读取和搜索；不包含 Shell、写文件、外部账号操作、RAG 或长期记忆。旧顶层 `tools` 配置为迁移错误；`shadow_agent` 不属于语音 `can_start` 必要条件。
+## Shadow Agent 验收
 
-## 影子 Agent 真实链路验收
-
-影子 Agent 的基础行为必须先通过 mock Responses/SSE 与 fake clock 验证；随后可用 OpenCode Go
-的 `deepseek-flash` 执行低成本真实验收。验收仍必须从 `SessionRuntime.initialize()` 和
-`start_listening()` 进入生产装配，不得把直接调用 manager 当成生产验证。`scripts/real_shadow_chain_acceptance.py`
-使用 controller 的语义输入入口替代 ASR PCM，并把 TTS/PCM 截断为文本 fake；它保留真实主/影子
-Responses、400ms scheduler、账本 bridge 和只读文件工具。`scripts/live_shadow_parallel_acceptance.py`
-在同一边界上运行 20 组“组间串行、组内多 task 并行”的自然中文多目标验收，可启用只读网络搜索。
-
-真实网络验收前必须确认：`OPENCODE_GO_API_KEY` 和需要时的 `MINIMAX_API_KEY` 已配置；搜索只记录
-查询、结果数量和有限标题摘要，不能写入完整网页正文、密钥或敏感 payload；不允许暴露写文件、命令、
-消息、外部调度或账户工具。音频相关组件必须由 harness fake 替换，确保没有真实 TTS 或 PCM 输出。
-
-已完成的 OpenCode Go 验收覆盖了串行 20 轮（均衡/深度各 10）与并行 20 组（均衡/深度各 10）：真实
-文件搜索/读取、网络搜索、`running` checkpoint、`completed`/`timed_out` 终态、终态 mailbox 回流和
-讲话中 `HELD` 都可观察。多目标输入不会保证每次都被模型拆成多个 task；因此验收报告必须保留经过
-本地校验的 action trace、receipt、按 task ID 聚合的事件与终态，不能仅根据最终自然语言回答推断并行。
-
-当前 30 秒影子工作截止对“high reasoning + 多目标 + 公开网络搜索”偏紧，真实并行验收会出现正常的
-`timed_out` 终态。这不是 harness 成功或失败的替代指标：必须确认 timeout 能安全终态化、写入账本并
-经 mailbox 回流，而不能卡住 session、串扰其他 ID 或直接发起并发主请求。优化 deadline 前优先评估
-更小的任务拆分、搜索轮数与工具结果压缩。
-
-### 澄清 / 等待确认真实验收（2026-09-12）
-
-澄清循环在真实 OpenCode Go `deepseek-flash` 上另有一个聚焦验收脚本：
+基础门槛由以下测试覆盖：
 
 ```powershell
-python scripts/real_opencode_go_shadow_clarification_acceptance.py `
-  --report reports/real-opencode-go-shadow-clarification-acceptance-20260912.json
+python -m pytest -q tests/test_shadow_agent.py tests/test_shadow_agent_harness.py
+python -m pytest -q tests/test_opencode_go_shadow_e2e.py
 ```
 
-该脚本同样从生产 `SessionRuntime` 与 `start_listening()` 装配进入，保留真实主 LLM、影子
-LLM、400ms scheduler、ledger 和 task receipt；仅将 ASR 注入与 TTS 输出替换为文本边界。已记录的
-验收执行包含两次用户交互、7 次真实 LLM 请求和 4 个 task action：真实影子调用
-`request_user_clarification` 后产生 `awaiting_user` 与精确 `question_id`，主 LLM 将自然语言答复
-转为 `task(reply)`，同一影子任务随后完成，脚本错误数为零。对应的串行 20 轮和并行补充报告分别为
-`reports/real-opencode-go-shadow-chain-acceptance-20260912.json` 与
-`reports/real-opencode-go-shadow-parallel-group1-20260912.json`。
+合并前必须验证：
 
-这证明本次验收中的生产协议、真实 provider 调用和代理回复路径可运行，**不等价于所有真实请求都
-必然一次成功**。此次真实模型曾输出不允许的动作状态与空 reply；严格 schema/receipt 使其被拒绝后
-在同一对话中恢复为有效 reply。因此上线观察应继续查看 `SHADOW_TASK_RECEIPT`、
-`awaiting_user`/`paused` 事件和 question ID 是否精确匹配；模型输出波动不能被描述为代码已无任何
-缺陷的证明。
+- 主 Schema 只在 runtime 可用时出现严格 `request_shadow({"request":true})`；
+- 每个会话只有一个 runner，相同 revision 幂等，运行中 wake 合并；
+- 初始 snapshot 含触发动作的当前用户原文，后续 delta 无损且来源明确；
+- provider、工具后和 result 前均执行 freshness gate；stale 工具为 `not_executed`，stale final 不发布；
+- clarification 不使用 question ID/reply/waiter；用户回答依靠完整上下文继续；
+- 每 5 个 committed response 触发一个无工具、无思考 Observer；迟到摘要被丢弃；
+- 80% token 阈值在安全边界换代，失败不丢失旧 trace；
+- 20+ Responses/tool 循环没有 task ID、并行 runner 或结果自反馈；
+- stop 保留 Shadow，reset/close 清理，Shadow 故障不破坏语音。
 
-思考模式在 episode 创建时冻结：`fast` 为 `effort=none` 且不暴露思考 action，`balanced` 的基础请求为 `effort=none` 并可通过本地 `request_thinking` 获得一次 `effort=low` 续请求，`deep` 直接使用 `effort=low`。`request_thinking` 不是 provider native tool；它不能执行外部操作，且新输入、停止监听和 session reset 必须立即取消其等待或续请求。`config/local.yaml` 是本机覆盖文件；正常请求的 Schema 可见性和实际 effort 仍以启动时冻结的 episode `reasoning_mode` 为准，故该文件不能作为生产基线证据。
+真实 provider 验收应从 `SessionRuntime.start_listening()` 的生产装配进入，允许把 ASR/TTS 替换为
+文本边界 fake，但不得直接调用 runtime 私有方法冒充端到端结果。至少覆盖：查询中改口、补充筛选、
+长期 10+ 步状态简报、observation 并行播报、clarification 回合、stop 后事件缓存和 reset 隔离。
 
-默认 `audio.output_device: null`，由 Windows 选择当前活跃默认输出设备。这样可避免固定的 MME 端点在 PortAudio 实际打开 32 kHz PCM 流时失败，也能自然适应耳机和外接音箱切换。只有部署环境需要强制固定设备时，才在被忽略的 `config/local.yaml` 中设置 `audio.output_device`；修改后应先以真实输出流验证，而不只依赖设备能力查询。
+## Shadow 观测与缓存
 
-运行检查：
+运行诊断记录 activation 次数/时长、committed model steps、provider/tool latency、transport retry、
+context revision 应用延迟、被阻止旧工具数、被拦截 stale final 数、Observer 调用/失败/迟到、
+input/cached/miss tokens、cache hit ratio、compaction 前后 token/epoch 和各 ShadowEvent 数量。
+这些指标不进入主永久会话历史。
 
-```powershell
-python -m pytest -q
-npm run typecheck --workspace @voice-terminal/web
-npm run test --workspace @voice-terminal/web -- --run
-npm run build --workspace @voice-terminal/web
-python -m compileall -q voice_terminal apps tests
-git diff --check
-```
-
-调度器验收必须确认当前只有一个 `AgentDecisionScheduler` 和一个 Agent `_run()` 循环。400ms
-heartbeat 由每 Episode 的 daemon clock thread 以 `time.monotonic()` 维护绝对时间轴，通过容量为 1 的邮箱向主 event loop 投递合并 pulse；它不能等待 active LLM、TTS 播放或 provider
-返回，也不能因为 heartbeat 本身增加 provider 请求。普通事件在400ms边界合并并优先于同边界
-的强制窗口；无普通语义事件时才允许第3、6、9、16、22窗口的 `forced_poll`，第25窗口的
-`final_silence` 只能消费一次。`forced_poll` 在 active LLM 时记为 `covered_by_active_request`、在 provider backoff 时记为 `skipped_backoff`，当场结束且不补发；`final_silence` 在这两种状态下保留到恢复空闲后只补发一次。TTS 和用户讲话不属于 dispatch busy。若等待期间出现新的有效用户输入，撤销的只是尚未发出的旧 `final_pending`，并从新输入重新计时。
-
-TTS 开始、结束、取消、替换、失败和语音活动不属于普通调度事件，不重置用户静默锚点，也不
-触发 provider；TTS 状态和用户讲话只影响本地播放，不阻止实际 LLM dispatch。普通、`forced_poll` 和 `final_silence` 三类
-请求必须共用 `_step()`、`_provider_stream()`、原有 schema/transport/reasoning 和 TTS 输出协议。
-普通、异常恢复、`forced_poll` 和 `final_silence` 请求一旦启动，新的 final/refined 输入只能进入统一心跳邮箱，不取消 provider task。scheduler generation 变化会使旧 system-check 输出失效：未播输出被取消，之后到达的 speak/action 被丢弃，provider task 本身仍自然结束并完成审计。本规则不改变尚未创建 provider task 的候选恢复项之既有淘汰规则，也不改变 barge-in、reset、stop、输入不可用或 episode end 的显式生命周期取消。只有非过期 LLM 自然结束且本地输出校验失败时，才允许进入有界异常恢复链路。
-system-check 必须使用独立 `system_check_id` 记录系统发起人，并以 scheduler generation 的真实 `speech_turn_id` 维护标准 `runtime.speak`；它不创建用户 `InputRecord` 或用户 turn 结算，只有
-已被听到的输出才进入 assistant ledger。reset、stop 和 episode end 后应清理 heartbeat、runner、
-active request 与 scheduler 状态。
-
-ASR 更新验收必须分别覆盖 Paraformer final 单独到达、SenseVoice refinement 后到、二者同一 400ms 窗口、相同文本以及晚到旧轮 refinement。每个首次合法 source revision 都必须进入同一 `turn_id` 的 `transcript_updates`；相同 provider callback 才允许按 revision 幂等去除，不得以规范化文本相同为由吞掉更新。检查 `transcript.update` 与 `transcript.dispatch` 日志中的 kind、revision、`available`、`triggered_by` 和 `same_turn`，不得再依赖 `confirmed/suffix/rewrite`。
-
-delivery 验收应构造 provider 字幕全部落在播放器时长之外而 PCM/设备尾部完整输出的场景，最终必须为 `full + playback_complete + completed_playback_authoritative`。同时检查 `speech.settling_started → speech.history_committed → speech.settling_finished` 顺序；在 history commit 返回前，400ms heartbeat 和 LLM dispatch 仍可继续，但 assistant ledger 不得提前写入或重复写入。同一 `speech_id` 重放 completion 时，assistant ledger 必须恰好只有一条记录。中断、替换、零 PCM 与播放失败不得使用完整播放兜底。
-
-软件通过后仍必须在真实设备完成：[V0.6 可靠性审计](v06-reliability-audit.md)
-定义的核心 10 条人工验收，覆盖自然语音、耳机和扬声器下的打断、连续多轮、
-停止/重置、真实 ASR/Analysis/LLM/TTS 链路，以及结束至实际首音的 p50/p95。
-内存播放器结果不能替代这些证据。
+DeepSeek Responses 无状态；同一 cache epoch 依靠精确重叠的 append-only input prefix 使用自动
+Context Cache。相邻真实请求必须检查 `cached_tokens` 随重叠前缀增长。端点未报告 usage 时标记为
+不可观测，不得解释为零命中。Observer 只在相同 committed prefix 尾部追加固定 prompt；动态时间、
+run ID、revision、nonce 和服务状态不得污染固定前缀。
 
 ## 完整服务启动验收
 
-`scripts/start.ps1` 是本机整套服务的默认入口：它依次准备 Analysis Worker、ASR Worker、
-Web 前端和 Voice Server。默认启动不能只依据 `8765/health` 声明成功；浏览器控制台是产品
-运行面的一部分，必须纳入同一验收。
+`scripts/start.ps1` 是本机整套服务默认入口，依次准备 Analysis Worker、ASR Worker、Web 前端和
+Voice Server。启动不能只依据 `8765/health` 声明成功；浏览器控制台也是产品运行面。
 
-脚本启动 Web 前端时固定使用 `npm run dev`，并在继续前要求
-`http://127.0.0.1:5173/` 在 30 秒内返回 2xx/3xx HTTP 响应。5173 已有监听进程、Vite
-提前退出或页面不可达均必须使启动失败，且错误中应包含
-`logs/web-dev-current.out.log` 和 `logs/web-dev-current.err.log` 的诊断内容；不得复用
-未知或可能陈旧的开发服务器后仍宣称服务完整可用。
+Web 前端固定使用 `npm run dev`，并在继续前要求 `http://127.0.0.1:5173/` 在 30 秒内返回
+2xx/3xx。端口已被未知进程占用、Vite 提前退出或页面不可达都必须失败，并保留
+`logs/web-dev-current.out.log` 与 `logs/web-dev-current.err.log`。
 
-一次“完整服务已重启”的运行验收至少要同时确认：5173 页面可访问、8765 的 `/health`
-可访问、8766 和 8767 正在监听，且 `/health.services` 中每个启用服务均为 `READY`。
-`-NoWeb` 仅用于刻意的后端单独调试；带该开关的运行不得标记为完整 Web 语音终端。
-`npm run dev` 仍可用于独立前端开发，但不能代替上述完整启动验收。
+完整启动至少确认：5173 页面可访问、8765 `/health` 可访问、8766/8767 正在监听，且启用服务
+均为 READY。`-NoWeb` 只用于后端调试，不能标记为完整 Web 语音终端。
 
 ## LLM 上下文缓存质量门槛
 
-新增任何模型字段前，必须先完成[缓存契约的字段准入表](llm-context-cache-contract.md#标准字段准入表)，明确语义 owner、lane、持久化、schema 与 UI 影响。涉及 provider payload、上下文、schema 或动作目录的改动必须运行缓存 placement/digest 单测和完整 Python 回归。
-
-官方 DeepSeek 直连验收要连续记录多轮 `input_tokens`、`cached_tokens` 与 hit ratio，确认命中会随 append-only 历史增长；中转端点的结果单独记录。若端点未报告 cache usage，状态为不可观测，不得写成或口头解释为“零命中”。
+新增任何模型字段前，先完成[缓存契约的字段准入表](llm-context-cache-contract.md#标准字段准入表)，
+明确 owner、lane、持久化、Schema 与 UI 影响。涉及 provider payload、上下文、Schema 或动作目录的
+改动必须运行 placement/digest 单测和完整 Python 回归。
 
 ## LLM 完整审计与故障复现
 
-生产默认 `llm.max_output_tokens=393216`，即 [DeepSeek 官方模型规格](https://api-docs.deepseek.com/quick_start/pricing)中的最大输出预算 384K tokens。[Responses API](https://api-docs.deepseek.com/api/create-response/) 规定该参数限制单次响应生成的可见正文与 reasoning token 总和，不限制输入上下文，也不是字节数。任何 `response.incomplete` 都必须记录 provider 的 `incomplete_details.reason`；只有原因为 `max_output_tokens` 时才能归类为输出预算耗尽，不能把普通 `JSON_TRUNCATED` 或 `PROSE_INSTEAD_OF_JSON` 混入这一类。若这些错误发生前已经存在合法非空 `speak` 队列，允许 speak-only 降级完成播放，记录 `LLM_OUTPUT_COMPAT_SPEAK_ACCEPTED`，`actions_executed=0`，并在下一次心跳重新调度；没有合法 speak 队列时仍按 protocol recovery 统计。
+主服务默认启用 `logs/voice-server-llm-context.jsonl`，以
+`conversation_id + request_id + turn_id + wire_sha256` 关联请求与终态。
 
-主服务默认启用独立的 `logs/voice-server-llm-context.jsonl`，并以 `conversation_id + request_id + turn_id + wire_sha256` 关联请求和终态：
+- `request_context` version 3 保存完整 messages、Schema、无 HTTP header 的 wire payload、dispatch/
+  prompt 类型、reasoning effort、上下文估算和比较哈希；
+- `request_outcome` version 2 保存完整或截至终止时的 output/reasoning、provider/local 校验结果和
+  明确 cancel reason；
+- API key 与 Authorization header 永不进入审计。
 
-- `request_context` version 3 必须保存完整 `messages`、完整 Schema、最终无 HTTP headers 的 `wire_payload`、dispatch/prompt 类型、事件、reasoning effort、上下文估算及比较用哈希；`contains_conversation_content` 必须为 `true`。
-- `request_outcome` version 2 必须保存完整或截至终止时的 `output_text`、`reasoning_text`、provider/local 校验结果和错误分类；取消时必须保存 `cancel_reason`，以区分 `user_interrupted`、reset、stop 和 episode end。历史记录中的 `superseded_recovery:*` 与 `superseded_system_check:*` 是已移除抢占链路的审计证据，不应再由新运行时产生。
-- API key 与 Authorization header 不属于模型上下文，不进入该文件；除此之外，不得用摘要、长度或哈希替代影响生成和校验的实际内容。
-
-该审计文件包含真实用户、助手和系统内容，单文件 50 MiB、保留 9 个轮转备份，写入由后台队列承担。排查输出异常时应直接使用同一请求的完整 wire payload 和部分/完整输出进行复现，并对照相邻成功请求；不得再把普通 ASR/TTS 日志的近似重建当作精确上下文。旧版 `request_context` version 2 / `request_outcome` version 1 只保留摘要或结构信息，不能逆向恢复正文，统计时必须按版本分层。
-
-每次修改审计格式、provider payload、输出预算或取消传播后，至少验证：完整用户文本和动态 request tail 可在审计记录中读取；wire payload 的 `max_output_tokens` 与有效配置一致；严格成功、无效 JSON、provider incomplete 和取消均产生唯一终态；取消原因以及取消前已接收的正文/reasoning 均未丢失。
+该文件包含真实会话内容，单文件 50 MiB、保留 9 个轮转备份，后台异步写入。排查异常应使用同一
+请求的精确 wire payload 和输出复现，不能用普通 ASR/TTS 日志近似重建。
 
 ## 语音运行排障
 
-当用户报告“播放后监听退出”或 `audio capture gap` 时，先按以下顺序判断，
-不要仅凭 UI 的监听按钮推断原因：
+用户报告“播放后监听退出”或 `audio capture gap` 时：
 
-1. 查 `audio.capture_progress`：`dropped=0` 且队列水位稳定时，优先排查控制器缓存连续性，不要归因为声卡丢帧。
-2. 查 `controller.input_frame_failed`、`controller.input_capture_read_failed` 与 `AUDIO_*` 事件。前者是可恢复帧处理故障；后者才表示无法继续读取麦克风。
-3. 对照 `audio.player_first_pcm_submitted`、`audio.player_drained` 和对应的 `speech_id`。播放阶段不能自动成为 `session.stop` 的理由。
-4. 查 WebSocket 命令日志；只有明确的 `command=session.stop` 才能归因为用户停止。恢复性错误、ASR 重连和输出结算必须保持与用户停止不同的状态投影。
-5. 查 `agent.speak_context`：新轮应为 `owner_scope=none|previous_turn` 且 `continuation_allowed=False`；只有同轮活动 handle 才允许 `current_turn/True`。若紧随其后出现 `CROSS_TURN_SPEECH_PREFIX_STRIPPED`，说明模型返回了累计旧前缀，但本地已在 TTS 前安全剥离。日志中的 `baseline_chars/new_chars/suffix_chars` 可用于核对，不需要记录会话正文。
+1. 查 `audio.capture_progress`；dropped=0 时优先排查控制器连续性；
+2. 区分可恢复的 `controller.input_frame_failed` 与真正读取失败的 `AUDIO_*`；
+3. 对照 `audio.player_first_pcm_submitted`、`audio.player_drained` 和 `speech_id`；
+4. 只有明确 `command=session.stop` 才归因为用户停止；
+5. 查 `agent.speak_context` 的 owner_scope/continuation_allowed，确认跨轮旧前缀已在 TTS 前剥离。
 
-受保护插话拒绝的麦克风帧仍必须写入当前轮的有界 PCM 缓存，以避免下一帧
-被误判为逻辑缺口；详见[V0.6 可靠性审计](v06-reliability-audit.md)。
+受保护插话拒绝的麦克风帧仍必须进入当前轮有界 PCM 缓存，避免下一帧被误判为逻辑缺口。
 
 ## 破坏性升级与能力保全
 
-项目允许破坏性升级：旧配置、旧公开事件、旧类型和旧实现可以直接删除，**但删除实现不等于删除产品能力**。每次版本收敛必须先做能力归属检查，再开始移除工作。
+项目允许删除旧配置、公开事件、类型和实现，但必须先迁移仍需能力：
 
-1. 为每个将删除的模块列出它提供的用户可见能力、可靠性边界和协议职责；没有明确归属的模块不得删除。
-2. 每项仍需保留的能力必须在新主链有唯一、可达的 owner，并能从生产装配入口追踪到它。例如，V0.6 JSON 决策属于 `AgentEpisodeRuntime + SpeechDecisionEnvelopeStream`，本地动作属于 `ActionRunner + SessionLedger`；TTS 取消与复用属于 Speech Queue / TTS Session Manager，而不是旧单轮回答链。
-3. 先迁移或新增行为级测试，再删除旧实现。测试应验证能力结果和安全边界，不能只断言旧类、旧函数或旧事件仍存在。
-4. 删除后，旧配置键必须失败、旧协议不得被静默映射、旧接口不得由 `try/except` 或别名回退继续支持。运行时可靠性恢复（断连重建、取消屏障、zero-PCM 安全重试）属于当前版本能力，不属于兼容回退。
-5. 合并前必须完成 Python/Web 回归、生产构建、静态搜索和真实设备验证；静态搜索需确认旧实现不再被生产装配入口构造或导入。
+1. 列出被删除模块承载的用户能力、可靠性边界和协议职责；
+2. 每项能力在新主链必须有唯一可达 owner；
+3. 先迁移行为测试，再删除旧实现；
+4. 旧配置/协议必须明确失败，不能静默映射；
+5. 合并前完成 Python/Web 回归、生产构建、静态搜索和真实设备验证。
 
-升级评审应优先回答两个问题：**“这段代码承载的能力现在由谁唯一负责？”**以及 **“该能力在新主链中如何被测试证明？”**。若回答不完整，应保留或先迁移能力，而不是为了代码整洁提前删除。
+评审必须回答：“旧能力现在由谁唯一负责？”以及“新主链如何用行为测试证明？”

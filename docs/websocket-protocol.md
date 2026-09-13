@@ -1,44 +1,52 @@
-# Voice Terminal WebSocket V0.6
+# WebSocket 协议
 
-所有服务端事件使用一个连接内严格递增的 `seq`：
+## 连接与 envelope
+
+浏览器连接 `ws://127.0.0.1:8765/ws`。客户端命令均为 JSON 对象，并携带非空
+`request_id` 与对象型 `payload`。公共服务事件由 `ProtocolSequencer` 包装为带 `seq`、
+`timestamp`、`conversation_id`、可选 `turn_id` 和 `payload` 的 envelope。
+
+常规命令：
+
+- `subscribe`
+- `session.start`
+- `session.stop`
+- `session.reset`
+- `session.reasoning_mode`，payload 为 `{"mode":"fast|balanced|deep"}`
+
+## Shadow 调试协议
+
+生产 Shadow 没有 task API，也不为每个 WebSocket 连接创建 manager。主模型只能通过内部
+`request_shadow({"request":true})` 唤醒会话唯一 runtime；Shadow 事件走正常 heartbeat，
+不会直接向浏览器暴露私有 trace、revision、计划或工具栈。
+
+当 `shadow_agent.debug_websocket_enabled=true` 时，开发连接可发送：
 
 ```json
 {
-  "type": "speech.progress",
-  "seq": 42,
-  "timestamp": "2026-09-07T10:00:00.000Z",
-  "conversation_id": "conversation_abc",
-  "turn_id": "turn_abc",
-  "speech_id": "speech_abc",
+  "command": "shadow.debug.wake",
+  "request_id": "debug-1",
   "payload": {}
 }
 ```
 
-`conversation_id` 必填，`turn_id` 与 `speech_id` 只在相应资源存在时提供。`request_id`、`output_generation` 仅用于关联和显式取消后的播放器代际诊断，客户端不得把它们当作语义版本。`payload` 始终是对象；客户端先按 `seq` 去重，再按资源身份处理事件。
+服务器返回连接本地的 `shadow.debug.wake` 观察事件，payload 包含内部 wake 结果和经过裁剪的
+runtime snapshot；后续 `shadow.debug.event` 只镜像该会话产生的 status/progress/observation/
+user_input_required/result/failed。该命令唤醒的仍是生产会话唯一 ShadowRuntime，不创建 connection-local
+task manager，不接受任务文本、ID、modify/reply/cancel，也不绕过权威上下文。
 
-客户端命令为 `subscribe`、`session.start`、`session.stop`、`session.reset`，均需非空 `request_id` 与对象型 `payload`。在服务器明确启用 `shadow_agent.debug_websocket_enabled` 时，额外允许开发调试命令 `shadow.debug.task`；它不是常规客户端功能。
+默认关闭时返回 `SHADOW_DEBUG_DISABLED`；Shadow 不可用时返回 `SHADOW_UNAVAILABLE`。
+断开调试连接不会取消 session-owned Shadow。
 
-| 事件 | 责任 |
-| --- | --- |
-| `runtime.snapshot`、`session.state`、`metrics.snapshot` | 权威会话与服务状态、后端延迟 |
-| `input.started`、`input.updated`、`input.finalized`、`input.completed` | 用户输入生命周期 |
-| `agent.state`、`agent.trace`、`agent.reasoning`、`context.snapshot` | Agent 状态、本地推理调试、有限诊断、实际模型请求 |
-| `tool.state` | 只读工具执行、完成或失效 |
-| `speech.queued`、`speech.started`、`speech.delta`、`speech.progress`、`speech.completed` | 已授权语音输出、队列与传达结算 |
-| `speech.appended`、`speech.append_waiting_prefix`、`speech.append_successor` | 严格前缀续写、suffix 后续队列与追加关联 |
-| `error` | 可恢复或不可恢复错误 |
-| `shadow.debug.receipt`、`shadow.debug.event` | 仅调试命令发起连接可见的影子任务受理回执与生命周期事件 |
+## Shadow 与 session 生命周期
 
-`speech.queued`、`speech.delta`、`speech.progress` 和 `speech.completed` 是文本进入语音事务后的真实状态；它们不等待完整 JSON 信封提交。用户在 `playback_started=false` 阶段开口时，未播放的当前候选进入 `HELD`：文本和 `SpeechHandle` 保留，`playback_ready` 被清除，TTS 文本发送、provider PCM 拉取和播放器消费暂停；如果此时还没有 handle，则只设置输出层的全局 hold，后续完成的候选也不会立即播放。已经建立 TTS session、收到 provider 首段音频或把 PCM 放入播放器队列，都不等同于真实开始播放。用户语音结束后释放最新的 `HELD` 候选并继续原有文本事务，不重新调用 LLM，也不重复发送整段文本。只有播放器首次实际提交非零 PCM 的回调才越过 `playback_started` 边界，之后的用户语音才进入 barge-in gate。只有实际播放的文本才可能出现在 DeliveryReport。`speak.preview`（如启用）仅是模型流调试观察，不是队列提交或撤销状态。模型请求尾部的 `runtime.speak` 使用 `state=empty|queued|suspended|speaking`、`owner_scope=none|current_turn|previous_turn` 和 `continuation_allowed` 表达语音所有权；只有当前轮会收到可续写的 `target_text`，上一轮活动语音只以 `observed_text` 可见。`speech.append_waiting_prefix` 表示同轮新流尚未超出当前完整文本；`speech.appended` 表示已提取并提交 suffix；`speech.append_successor` 表示同轮逻辑 speech 已进入追加窗口或完成，suffix 被安排为不重播前缀的后续项。前缀已经合法但后续 JSON/工具错误时，已追加文本不会撤销；错误通过 `error`/`agent.trace` 和即时恢复请求报告。`speech.replaced` 仍表示实际文本分歧、用户 barge-in 或其他显式抢占，不用于普通 suffix 追加。`agent.reasoning` 仅限受控本地调试环境。
+- `session.stop` 只关闭语音 episode。Shadow 继续运行，重要事件缓存在 session event bridge；
+- 下一次 `session.start` 把缓存事件交回主 Agent 的 400ms mailbox；
+- `session.reset` 取消 Shadow provider/observer/compaction，清空 trace/status，增加上下文 epoch；
+- reset 同时轮换 `conversation_id` 和 OpenCode Go 的 `x-opencode-session`；
+- runtime close 才关闭 Shadow 组件、只读工具和共享 HTTP client。
 
-`speech.completed` 之前的内部 settling 不增加新的前端终端状态。播放器确认 PCM 缓冲与设备尾部全部输出后，服务端立即冻结该 `speech_id` 的播放快照，再等待追加窗口；满足完整播放硬条件时，`delivery.status=full`、`heard_text` 为该 speech 的完整文本、`precision=playback_complete`。provider 字幕缺失或越界不能把这种 completed delivery 降为 partial/unknown/none。中断、替换、停止与失败仍采用保守 alignment。服务端在 assistant ledger 按 `speech_id` 幂等提交完成事件之前保持 TTS busy，因此后续 LLM 不会看到“speak 已空但刚播内容尚未进入历史”的中间状态。
+## 兼容性说明
 
-客户端可发送 `session.reasoning_mode` 命令，payload 为 `{"mode":"fast"|"balanced"|"deep"}`。服务端在运行时快照中回传 `reasoning_mode`；无效模式返回可恢复的 `INVALID_REASONING_MODE`。模式变更不会重写当前已冻结的 Agent schema，新的 Agent episode 使用新选择；`session.reset` 会恢复配置默认模式。
-
-`shadow.debug.task` 的 payload 严格为 `{"id":正整数,"state":"request"|"modify"|"cancel","text":字符串}`，三个字段始终必填。它立即返回/推送 `shadow.debug.receipt`，随后只向该连接推送 `shadow.debug.event`。默认关闭时返回 `SHADOW_DEBUG_DISABLED`。调试任务使用独立的 ID、历史与事件空间，不写入生产会话账本、不唤醒语音调度器，也不产生 TTS；断开该连接会取消对应调试空间。生产影子任务没有额外 WebSocket 展示，它们通过后续正常语音决策消费任务报告。
-
-追加相关 `speech.progress` 可带 `event=append_window_opened` 或 `event=append_window_expired`。追加事件中的 `speech_id`、`successor_speech_id`、`baseline_speech_id`、`baseline_generation`、`appended_chars` 和 `provider_generation` 只用于关联，不构成新的语义版本；客户端必须继续按 `seq` 排序并按 speech/generation 丢弃迟到事件。
-
-`agent.trace` 可使用 `LLM_SPEAK_CONTEXT`、`SPEECH_PREFIX_RECONCILED`、`CROSS_TURN_SPEECH_PREFIX_STRIPPED`、`TTS_HELD` 和 `TTS_RELEASED` 重建所有权、防重及未播放保持决策。对应的 `speech.progress` 可带 `event=tts_hold_started` 或 `event=tts_hold_released`，并提供 `playback_hold_started`、`playback_hold_released` 和保持时长诊断。服务端持久日志只记录状态、baseline 来源和字符长度，不记录用户或 assistant 正文。`CROSS_TURN_SPEECH_PREFIX_STRIPPED` 表示模型违反跨轮隔离，但旧前缀已在进入 TTS 前被本地剥离。
-
-不存在 native `tool_calls`、`tool_call_id`、`speak(queue|modify)`、`session_id`、`input_id`、`episode_id`、`decision_id`、`generation_id`、`input_revision`、`context_version` 或 V0.4/V0.5 客户端映射。V0.6 是同步破坏性升级，旧客户端不受支持。
+Shadow 调试面只支持上文的 wake/event 协议，不提供其他命令的静默兼容。收到未知命令时
+服务器返回 `UNKNOWN_COMMAND`；协议错误不会停止主会话。

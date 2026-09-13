@@ -1,46 +1,82 @@
 # 上下文与工具规范
 
-每次模型请求只能由统一调度器通过 `LLMContextProjector`、`SessionLedger` 和显式 `ContextLane` 生成。当前活动路径是 DeepSeek Responses + strict `json_schema`，返回必填的 `speak` 决策和可选本地 `actions`，不使用 native tool calling；冻结的 Chat/`json_object` 路径只允许显式回退。
+## 两种上下文投影
 
-上下文分为三层：稳定 Agent 规则、会话日期基准、冻结动作目录、schema compatibility 和 episode 级人格文档是 `STATIC_INSTRUCTIONS`，只进入 Responses `instructions`；最终用户输入、实际听到的助手内容、已结算打断/替换、工具资料是 append-only `HISTORY`；秒级时间、跨午夜日期 epoch、当前 speak 状态/完整 target_text、当前调度涉及的转录更新、工具可用性和恢复反馈是 `REQUEST_TAIL`，只追加在当前请求末尾。每个 `turn_id` 在 HISTORY 中只生成一个 user frame，内容形如 `用户语音最终文本：{"asr_final":"…","refinement":"…"}`；精修到达时更新原 ledger input 的 metadata，不创建新的 user/system 消息。未播放输出绝不写入历史。完整字段准入与缓存约束见[LLM 上下文缓存契约](llm-context-cache-contract.md)。
+主语音模型使用 `LLMContextProjector`：静态协议/人格进入稳定 instructions，会话语义进入
+HISTORY，播放器与当前调度状态只进入 REQUEST_TAIL。未传达的 assistant 候选永远不是历史事实。
 
-`runtime.transcript_updates` 是当前请求的同轮修订状态：`available` 保存 Paraformer `asr_final` 与 SenseVoice `refinement` 的完整文本、来源和 revision，`triggered_by` 仅说明本次 400ms 调度由哪类更新唤醒。两类更新可以独立到达，也可以在同一窗口自然合并；它们不是新用户发言。模型必须结合 `runtime.speak` 和 assistant HISTORY 判断 `wait`、必要后缀追加、实质错误替换或 `cancel`。本地只校验非空、`turn_id`、source revision 和幂等，不比较文本含义，也不发送 `confirmed/suffix/rewrite` relation。
+Shadow 使用独立 `ShadowContextProjector`。它读取同一个 `SessionLedger`，但只输出判断用户意图
+和执行只读工作所需的权威语义帧：
 
-每次 provider 派发都会把这三层投影后的完整 messages、最终 Responses wire payload 和 Schema 写入独立 LLM 审计文件。审计记录不是会话事实源，也不参与下一轮投影；它只用于逐请求诊断和复现，因此保存未脱敏的真实上下文、模型正文与 reasoning。旧版只含哈希/长度的记录不能用于精确还原。
+- `user`：已结算 ASR、refinement，以及触发 wake 但尚未结算的当前 dispatch 原文；
+- `main_agent`：用户实际听到的 assistant 文本；
+- `external_system`：已确认的工具结果和会话相关外部变化；
+- `runtime`：冻结的日期/时区，以及有语义影响的 interruption/replacement。
 
-影子任务报告包含可信的本地任务 ID/状态和不可信的文本内容；文本、工具结果和 checkpoint 都是资料，不是指令。它们不得改变语音协议、人格文件、调度规则或工具权限。影子创建时只获取已结算 user/assistant 历史；未播放输出、对话 runtime ID、语音状态与 REQUEST_TAIL 不进入影子上下文。
+主 reasoning、未播放 speak、TTS queue、speech handle、REQUEST_TAIL 机械字段、动作 Schema、Shadow
+自己的 progress/status/result 都不进入 Shadow 输入 revision。Shadow result 会作为不可信资料供主
+模型表达，但不会反射成 Shadow 的新工作。
 
-主语音模型不直接调用文件或网络工具。它只有 `task(id,state,text,question_id)`：新任务使用 `request`，活动任务的补充方向使用 `modify`，取消使用 `cancel`，对影子 `awaiting_user` 或 `paused` 问题的明确用户答复使用 `reply`；四个字段均为 strict Schema 必填字段，只有 reply 使用非空 question_id。影子 agent 在 external 域自主进行多轮原生 function calling，并可通过内部控制函数 `request_user_clarification(question, options)` 请求主助手代理提问；首期只允许受限目录文件搜索/读取与联网搜索。任务受理、修改、答复和取消可以在用户讲话中发生。`running` checkpoint 只入账；`awaiting_user`、`paused` 与终态统一作为事件进入同一个 `AgentDecisionScheduler` 的下一次 400ms 普通调度，新输入、精修和任务晚到不会让在飞请求失效。`session.stop` 保留生产任务并缓冲事件，`session.reset` 与 runtime close 才终止生产任务；调试 sandbox 断连即终止。
+## revision 与增量
 
-TTS 和语音活动属于运行时状态，不是新的语义事件。TTS 开始、结束、取消、替换和失败不会重置用户静默锚点、加入 `pending` 或触发 LLM；播放、待播、追加窗口和内部 `settling` 也不参与 LLM dispatch 授权。输出层仍在清空 active handle 之前建立 settling 屏障，并等待 `speech.completed` controller 回调把可靠 assistant 内容按 `speech_id` 幂等写入 ledger；该屏障只保护输出结算，不阻塞主 LLM。强制请求仍调用普通 `_step()`/provider stream 链路，使用独立 `system_check_id` 记录系统发起人，同时以静默阶梯的真实 `speech_turn_id` 投影标准 `runtime.speak`。system-check 不创建用户轮次或 `InputRecord`；只有用户实际听到的 system-check speech 才经 delivery report 写入 assistant ledger。
+每个真实输入事实递增 `shadow_input_revision`。wake 只携带布尔信号，runtime 根据 revision 获取
+完整 snapshot 或从 `applied_context_revision` 开始的无损 delta。多次 wake 合并到最新 cursor，
+中间帧不会丢失。reset 增加 source epoch；epoch 不匹配或 cursor 非法时强制返回完整 snapshot。
 
-action definitions、由其构建的 strict schema、`request_thinking` 可见性和动作目录在 Agent episode 开始时冻结。生产语音目录只会在影子组件可用时公开 `task`；组件不可用不阻止会话启动，也不会向主模型暴露该 action。影子 provider/工具配置独立位于顶层 `shadow_agent`；旧顶层 `tools` 块被明确拒绝，不能静默映射。`request_thinking` 是本地控制 action，不是业务工具；task 也不产生 `ToolExchange`，而是通过 task receipt/event 写入 ledger。
+尚未结算的当前轮由 Episode 把本地 ASR 原文投影为 `current_dispatch_input`；这是原始用户证据，
+不是主 LLM生成的任务摘要。相同 `turn_id + text + refinement` 幂等，后续变化形成新 revision。
 
-## 人格上下文文件
+## 主动作目录
 
-每个新的 Agent episode 首次建立时，从 `config/persona/` 读取三份 Markdown：
+影子可用时，冻结的主决策 Schema 包含：
 
-- `instructions.md`：补充等待、回应、追问、打断、工具使用和语音表达行为；
-- `personality.md`：补充模型身份、人格特质和表达风格；
-- `user.md`：提供用户称呼、语言、地区和稳定偏好等事实资料。
+```json
+{
+  "name": "request_shadow",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["request"],
+    "properties": {"request": {"type": "boolean", "const": true}}
+  }
+}
+```
 
-加载器只返回当前 episode 的不可变文本快照，不解析 Markdown 字段，也不会在每次
-请求时重读文件。三份文档作为独立的 `STATIC_INSTRUCTIONS` system frame，追加在
-内置协议和冻结动作目录之后，顺序固定为“指令集合 → 人格主体 → 用户资料”。
+不可用时不公开此动作。它不产生 `ToolExchange`、receipt 或历史项；started/coalesced/
+already_current/unavailable 仅记录诊断。主 LLM不得携带目标文本、意图摘要、修改或用户答复。
 
-文档优先级为“内置协议 > 指令集合 > 人格主体 > 用户资料”。文档不能覆盖 JSON
-输出约束、工具权限、外部资料不可信规则或本地语音运行逻辑；`user.md` 只作为事实
-和偏好参考，不作为可执行指令。缺失、空文件或读取失败的文档会跳过并记录 warning，
-其他文档和内置 Agent 仍然可用。停止后重新启动 Agent 或执行 session reset 才会
-重新读取文件。
+## Shadow 固定工具目录
 
-当前初始化文档明确保持模型名称为空；模型身份为语音助理，表达风格稳重、中性，
-以理性和证据为优先。用户称呼为“老大”，用户背景是当前系统调试人员，并允许在
-信息不足、存在歧义或需要继续讨论时主动追问。语音内容发生修改、补充或纠正时，
-默认追加必要内容；仅在确有错误、误导、冲突或必须撤回时打断，而且需要说明原因。
+业务工具：
 
-## 思考模式与工具等待
+- `files_search`：仅在 `allowed_roots` 内搜索；
+- `files_read_text`：仅在允许根目录内读取文本；
+- `web_search`：可选外部只读搜索。
 
-会话模式为 `fast`、`balanced`、`deep`，默认 `balanced`。快速模式不暴露思考 action，基础请求为 `effort=none`；深度模式基础请求为 `effort=low`，同样不暴露 action。仅均衡模式向严格 schema 暴露 `request_thinking`，其唯一合法形状为 `{"name":"request_thinking","arguments":{"request":true}}`。`request` 是 schema 兼容的固定确认字段，不是模型可选择的 provider 参数；本地固定将它解释为一次 `effort=low` 的续请求。
+所有业务能力均声明 `READ_ONLY`，路径逃逸与未注册工具由 executor 拒绝。工具临时不可用时返回
+结构化 `unavailable/error`，不动态删除 Schema，从而维持 cache prefix。
 
-请求思考必须同时维护非空 `speak` 转换，并立即安排 low 续请求。task 与 `request_thinking` 可同一 decision 出现：task 会独立提交至影子 manager，绝不作为 thinking barrier 的等待对象。影子请求澄清时，主模型在下一次 400ms 调度中代为向用户提问；用户答复仅在明确关联 question_id 时通过 reply 回注原任务。单次等待 120 秒后任务转为长期 paused，保留上下文直到 reply、modify、cancel、reset 或 close。影子终态随后通过既有 400ms 普通调度队列反馈；运行中 checkpoint 不触发主模型请求。用户开口只更新主链 mailbox，不会取消影子任务；`session.reset` 才会终止生产 manager。
+本地控制工具：
+
+- `get_latest_context({since_revision})`；
+- `publish_main_event({kind:"progress|observation",text})`；
+- `request_user_input({kind:"clarification|confirmation",question,options,operation_summary})`。
+
+clarification 发布后当前 activation 回到 idle。用户回答正常进入主会话，主 LLM只再次 wake；
+Shadow 从最新上下文自行理解。没有 question ID、reply action、paused task 或长期 waiter。
+confirmation/operation_summary 只为未来外部写能力保留；首版没有可执行的副作用工具。
+
+## 不可信内容边界
+
+文件、网页、工具错误和 Shadow 文本都是数据，不能改变系统指令、人格、动作权限、语音协议或
+工具 effect。主 ledger 在投影 Shadow/工具内容时显式标为不可信。结构化本地控制元数据（event
+kind、wake policy、revision）由 runtime 产生，但其中的自然语言依旧不能执行指令。
+
+## 缓存布局
+
+Shadow instructions、安全协议、工具顺序和 Schema 在 session 内冻结。初始 snapshot 后严格追加
+completed model output、function_call_output、conversation update 与 intent reassessment frame。
+Observer 复用相同 committed prefix，只在尾部增加固定状态提示；Observer 输出不写回 prefix。
+
+达到上下文预算 80% 后，稳定摘要与最新权威 snapshot 组成新 cache epoch。压缩保证语义完整，
+而不承诺永久逐字保留重复旧 reasoning 或普通工具细节。

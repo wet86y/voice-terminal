@@ -1,4 +1,4 @@
-"""Prompt loading and fixed prompts for the shadow task agent."""
+"""Stable prompt material for the session-scoped Shadow Agent."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,15 +6,23 @@ from pathlib import Path
 
 DEFAULT_INSTRUCTIONS_PATH = Path(__file__).resolve().parents[2] / "config" / "shadow_agent" / "instructions.md"
 
-CHECKPOINT_PROMPT = """\
-你现在处于影子任务的强制进度汇报点。不要调用工具。只基于已经提交的任务历史和工具结果，
-输出一个严格 JSON 对象：{"completed": boolean, "text": string}。
-completed=true 仅表示任务已经可以给出最终结果；text 应简短说明已完成结论或当前进度。
+INTENT_REASSESSMENT_PROMPT = """\
+收到新的权威会话上下文后，第一要务是重新判断用户当前意图。
+在调用工具、延续旧计划、请求确认或输出结论前，检查用户是否补充、
+修正、撤销或替换了此前意图，并决定继续、调整、放弃或新增工作。
+最新明确的用户表达优先于旧计划和主助手此前的推测。
 """
 
-TIMEOUT_PROMPT = """\
-影子任务的工作时间已经耗尽。不要调用工具，也不要继续调查。输出一个严格 JSON 对象：
-{"completed": boolean, "text": string}。text 只总结已经完成的工作、可用结论和未完成部分。
+STATUS_OBSERVER_PROMPT = """\
+你是只读工作状态观察器。只总结上方已经提交的上下文与执行轨迹，不继续执行、不调用工具、
+不补充调查。用一段 80～160 个中文字符的普通文本，准确区分已完成、正在进行、下一步和阻塞；
+不得把计划描述成完成事实。若上下文刚更新，应说明正在重新判断最新用户意图。
+"""
+
+COMPACTION_PROMPT = """\
+将上方已提交轨迹压缩为稳定、语义完整的结构化摘要。优先压缩私有推理、重复查询和普通工具细节；
+完整保留当前未决用户意图、授权与确认、可信来源、关键工具事实、已完成操作、未决用户输入请求、
+真实外部回执和最近会话。不得继续任务或发明事实。
 """
 
 
@@ -27,14 +35,7 @@ def load_shadow_instructions(path: Path | None = None) -> str:
     if text:
         return text
     return (
-        "你是本地影子任务执行 agent。完成当前任务，使用提供的工具，"
-        "不要扮演语音助手，不要进行寒暄。"
-    )
-
-
-def modification_message(text: str) -> str:
-    return (
-        "【任务修改】\n当前任务没有取消，也不是新任务。主协调模型要求按以下方向修改：\n"
-        f"{text.strip()}\n"
-        "立即放弃冲突工作，保留仍有效的完整工具结果和事实；后续结论以此修改为准。"
+        "你是会话级影子 Agent，代替低思考实时模型理解用户意图并执行只读查询。"
+        "你只能从权威会话上下文确定目标，不接受主助手转述的任务。使用可用工具，"
+        "不要扮演语音助手，不直接控制语音或播放器。没有待处理工作时只输出 no_action。"
     )
