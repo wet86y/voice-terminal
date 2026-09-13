@@ -1,6 +1,7 @@
-# V0.6 语音链路可靠性审计
+# V0.6 语音链路可靠性基线（历史）
 
-V0.6 以 JSON 响应信封取代 DeepSeek 原生工具调用，但不移除已验证的输入、TTS、播放和交付能力。
+本文件保留 V0.6 切换到 JSON 响应信封时的可靠性基线，以便追溯协议与交付不变量。当前产品
+发布基线为 [V0.7 发布审计](v07-release-audit.md)；`voice_decision_v06` 仍是兼容 Schema 名称。
 
 > 本文同时保留切换前的可靠性基线。当前项目已在生产运行 Responses + strict `json_schema` 协议；下文涉及 Chat Completions/`json_object` 的内容均属于冻结历史路径，不代表当前活动配置。
 

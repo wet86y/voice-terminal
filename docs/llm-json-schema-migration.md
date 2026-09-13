@@ -4,8 +4,10 @@
 
 The default real-conversation backend is the official DeepSeek endpoint using
 the public model ID `deepseek-flash`, `https://api.deepseek.com`, and the local
-secret `DEEPSEEK_API_KEY`. The existing Responses/strict JSON Schema request
-path and the V0.6 WebSocket protocol are unchanged.
+secret `DEEPSEEK_API_KEY`. V0.7 continues to use the existing Responses/strict
+JSON Schema request path and public WebSocket protocol. The provider schema
+name `voice_decision_v06` is a frozen compatibility identifier, not the product
+release version.
 
 Use OpenCode Go for debugging without editing YAML:
 
@@ -55,15 +57,14 @@ Schema. The Chat adapter remains installed but normal requests never call it,
 ordinary protocol traffic is not dual-run, and restore happens only through
 the explicit transport rollback switch.
 
-The optional shadow runner remains a non-production diagnostic facility. It
-does not enable or gate the production thinking path. Its thinking-action
-validation still expects the historical `{"effort":"low"}` arguments shape,
-whereas the production strict Schema and main Agent require
-`{"request":true}`; therefore shadow thinking must remain disabled until that
-separate diagnostic contract is aligned and retested. If used for non-thinking
-diagnostics, it stores only normalized metadata in the bounded Agent snapshot
-and server log: validity, state, action names, character counts, latency, usage
-and error classification. Model output and reasoning text remain transient.
+The session-scoped Shadow Agent is enabled by default as an asynchronous,
+read-only execution plane. It does not enable or gate the main Agent's
+`balanced` or `deep` thinking modes, and it never owns speech, TTS, playback,
+or the main scheduler. The main Agent may only send the content-free local
+action `request_shadow({"request":true})`; Shadow reads the latest authoritative
+ledger context itself. Its provider loop, read-only tools, context compaction,
+and event relay are specified in [the architecture contract](architecture.md).
+There is no Shadow thinking-action contract in the production action schema.
 
 Protocol recovery is deliberately bounded and remains inside the single Agent
 400 ms scheduler. A Responses decision may use one immediate correction for
