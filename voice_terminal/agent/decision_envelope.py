@@ -19,6 +19,7 @@ EMOTIONS = {"calm", "happy", "sad", "angry", "fearful", "disgusted", "surprised"
 # creates an avoidable recovery round-trip.
 EMOTION_ALIASES = {"friendly": "calm"}
 SPEAK_STATES = {"speak", "cancel", "wait"}
+EARLY_NON_JSON_NON_WHITESPACE_LIMIT = 10
 
 
 class EnvelopeError(ValueError):
@@ -469,6 +470,41 @@ class SpeechDecisionEnvelopeStream:
         if not any(item["provided"] == value for item in self.emotion_normalizations):
             self.emotion_normalizations.append({"provided": value, "applied": mapped})
         return mapped
+
+    def definitive_non_json_prefix(
+        self, *, non_whitespace_limit: int = EARLY_NON_JSON_NON_WHITESPACE_LIMIT,
+    ) -> bool:
+        """Return true once the streamed prefix cannot be an accepted JSON envelope.
+
+        Leading whitespace and the two bounded compatibility wrappers accepted
+        at final validation (UTF-8 BOM and one JSON code fence) do not count
+        against the limit.  A real decision must then start with ``{``.  The
+        method deliberately does not diagnose malformed object JSON; only a
+        definitive prose/non-object prefix is terminated early.
+        """
+
+        if non_whitespace_limit <= 0:
+            raise ValueError("non_whitespace_limit must be positive")
+        candidate = self.raw.lstrip()
+        if candidate.startswith("\ufeff"):
+            candidate = candidate[1:].lstrip()
+        if candidate.startswith("{"):
+            return False
+        if candidate.startswith("```"):
+            first_line_end = candidate.find("\n")
+            if first_line_end < 0:
+                # A supported fence header contains at most seven effective
+                # characters (```json).  Once the general threshold is met it
+                # can no longer become one of the supported wrappers.
+                return sum(not char.isspace() for char in candidate) >= non_whitespace_limit
+            header = candidate[:first_line_end].strip().casefold()
+            if header not in {"```", "```json"}:
+                return sum(not char.isspace() for char in candidate) >= non_whitespace_limit
+            candidate = candidate[first_line_end + 1:].lstrip()
+            if candidate.startswith("{"):
+                return False
+        effective_chars = sum(not char.isspace() for char in candidate)
+        return effective_chars >= non_whitespace_limit
 
     def feed(self, delta: str) -> str:
         if not isinstance(delta, str):

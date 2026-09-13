@@ -21,6 +21,8 @@ ASR、Smart Turn、SenseVoice、主 Agent、Shadow Agent、TTS、播放和延迟
 主语音链只有一个 `AgentDecisionScheduler` 和一个 provider 请求循环。400ms mailbox、Speech
 transaction、TTS generation、barge-in 与传达感知 `SessionLedger` 保持单一权威。未播放的
 assistant 草稿不会成为历史；实际听到的内容、ASR refinement 和有语义影响的打断才会落账。
+普通回复在短暂 VAD 触发时仍按既有规则 hold，不取消在飞 LLM；但仅用于静默兜底的未播放
+system-check 回复会在新一段用户语音开始时立即失效，不再等 ASR final 后才撤销，也不会在用户说完后补播。
 
 每个 session 只有一个长期存在的 `ShadowRuntime`，不存在 task ID、任务列表、任务队列、
 modify/reply/cancel/checkpoint 或多任务调度器。主 LLM不能发送任务文本或意图摘要，只能在完整
@@ -53,6 +55,9 @@ Web 控制台可选择快速、均衡或深度模式。快速使用 `effort=none
 Agent 每轮返回必填 `{"speak":{"state":"speak|cancel|wait","emotion":"...","text":"..."},
 "actions":[]}`。本地流式解析器与最终校验仍是权威。情绪只接受 `calm`、`happy`、`sad`、
 `angry`、`fearful`、`disgusted`、`surprised`。
+若流在兼容的空白、BOM 或单层 JSON code fence 之后连续出现 10 个非空白字符，且正文仍未以
+`{` 开始，运行时会立即关闭该 provider 流并进入既有的一次有界协议恢复；合法分片 JSON 和以
+`{` 开始但最终损坏的 JSON 不会被这条纯文本早停规则截断。
 
 ## 人格上下文
 

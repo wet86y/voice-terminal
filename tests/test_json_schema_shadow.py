@@ -131,6 +131,136 @@ def test_responses_control_text_compatibility_is_explicit_not_global():
     assert responses.finish().speak == SpeechDecision("wait", "calm", "")
 
 
+def test_stream_parser_detects_only_definitive_non_json_prefixes_after_ten_chars():
+    prose = SpeechDecisionEnvelopeStream()
+    prose.feed("这是普通文本回复")  # 8 effective characters
+    assert prose.definitive_non_json_prefix() is False
+    prose.feed("而不是")  # 11 effective characters
+    assert prose.definitive_non_json_prefix() is True
+
+    spaced = SpeechDecisionEnvelopeStream()
+    spaced.feed("  普 通 文 本 回 复 测 试 ")
+    assert spaced.definitive_non_json_prefix() is False
+    spaced.feed("错误")
+    assert spaced.definitive_non_json_prefix() is True
+
+    for raw in (
+        '   {"speak":',
+        '\ufeff  {"speak":',
+        '```json\n  {"speak":',
+    ):
+        parser = SpeechDecisionEnvelopeStream()
+        parser.feed(raw)
+        assert parser.definitive_non_json_prefix() is False
+
+    fenced_prose = SpeechDecisionEnvelopeStream()
+    fenced_prose.feed("```json\n这不是合法的结构化输出文本")
+    assert fenced_prose.definitive_non_json_prefix() is True
+
+
+def test_runtime_aborts_prose_stream_at_ten_effective_chars_and_starts_recovery():
+    async def scenario():
+        class Provider:
+            supports_decision_schema = True
+            transport = "responses"
+            thinking_action_enabled = False
+            protocol_recovery_limit = 1
+
+            def __init__(self):
+                self.generated = 0
+                self.closed = asyncio.Event()
+
+            def stream_events(self, _messages, **_kwargs):
+                async def stream():
+                    try:
+                        for char in "这是模型输出的一段很长的普通文本，本不应继续生成。":
+                            self.generated += 1
+                            yield {"type": "content", "text": char}
+                        raise AssertionError("the prose stream should have been closed early")
+                    finally:
+                        self.closed.set()
+
+                return stream()
+
+        provider = Provider()
+        runtime = _runtime(provider)
+        emitted = []
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+
+        runtime.emit = emit
+        runtime.inputs["turn-a"] = {"text": "hello", "final": True}
+        identity = (runtime.episode_id, "request-prose")
+        runtime._identity_turns[identity] = "turn-a"
+
+        outcome = await runtime._step(identity, {"USER_INPUT_FINALIZED"})
+
+        assert outcome == "recovery_queued"
+        assert provider.generated == 10
+        assert provider.closed.is_set()
+        assert len(runtime.recovery_queue) == 1
+        assert runtime.recovery_queue[0].code == "SPEAK_ENVELOPE_INVALID"
+        invalid = [
+            payload for kind, payload in emitted
+            if kind == "agent.trace" and payload.get("kind") == "SPEAK_ENVELOPE_INVALID"
+        ]
+        assert invalid[-1]["error_code"] == "PROSE_INSTEAD_OF_JSON"
+        assert invalid[-1]["early_stream_abort"] is True
+        assert invalid[-1]["early_stream_abort_non_whitespace_chars"] == 10
+        assert invalid[-1]["raw_chars"] == 10
+
+    asyncio.run(scenario())
+
+
+def test_runtime_does_not_early_abort_fragmented_json_or_bounded_wrappers():
+    async def run(raw):
+        class Provider:
+            supports_decision_schema = True
+            transport = "responses"
+            thinking_action_enabled = False
+            protocol_recovery_limit = 1
+
+            def __init__(self):
+                self.closed = False
+
+            def stream_events(self, _messages, **_kwargs):
+                async def stream():
+                    try:
+                        for char in raw:
+                            yield {"type": "content", "text": char}
+                        yield {"type": "finish", "reason": "completed"}
+                    finally:
+                        self.closed = True
+
+                return stream()
+
+        provider = Provider()
+        runtime = _runtime(provider)
+        applied = []
+
+        async def apply(_identity, _turn_id, envelope):
+            applied.append(envelope)
+
+        async def dispatch(*_args, **_kwargs):
+            return None
+
+        runtime._apply_decision_v06 = apply
+        runtime._dispatch_actions_v06 = dispatch
+        runtime.inputs["turn-a"] = {"text": "hello", "final": True}
+        identity = (runtime.episode_id, "request-json")
+        runtime._identity_turns[identity] = "turn-a"
+
+        assert await runtime._step(identity, {"USER_INPUT_FINALIZED"}) == "completed"
+        assert provider.closed is True
+        assert applied[-1].speak == SpeechDecision("wait", "calm", "")
+        assert not runtime.recovery_queue
+
+    strict = '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}'
+    asyncio.run(run(" " * 64 + strict))
+    asyncio.run(run("\ufeff```json\n" + strict + "\n```"))
+
+
 def test_invalid_json_fingerprint_is_structural_and_does_not_retain_text():
     raw = '```json\n{"speak":{"state":"speak","text":"private words"}'
     fingerprint = json_structure_fingerprint(raw)

@@ -80,6 +80,18 @@ still subject to ordinary-event priority, active-request/TTS/user-input gates,
 and the one-shot final-silence boundary. This keeps the recovery budget finite
 without recreating the historical 2.5 Hz "slow storm".
 
+Definitive prose is rejected before the provider finishes the response. After
+leading whitespace, one UTF-8 BOM, and the single JSON code-fence wrapper
+accepted by final compatibility validation are accounted for, ten streamed
+non-whitespace characters without a leading `{` close the provider async
+stream and enter the same one-attempt protocol-recovery path. This is not a
+plain-text fallback: no prose is spoken or committed. A fragmented object that
+starts with `{`, a supported wrapper whose body starts with `{`, and malformed
+or truncated object JSON continue to final validation, so early termination
+cannot bypass the existing envelope/action validator. Diagnostics expose
+`early_stream_abort` and `early_stream_abort_non_whitespace_chars` without
+logging the generated text in ordinary runtime logs.
+
 `response.incomplete/content_filter`, `response.failed`, and a stream missing
 its terminal event are provider/policy failures rather than model-format
 errors. They do not consume the protocol correction budget or ask the model to

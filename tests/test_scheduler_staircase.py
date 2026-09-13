@@ -733,3 +733,219 @@ def test_new_scheduler_generation_discards_late_system_check_speech():
         assert stale[0]["stale_system_check_output_discarded"] is True
 
     asyncio.run(scenario())
+
+
+def test_user_speech_onset_discards_late_system_check_speech_before_asr_final():
+    async def scenario():
+        class Provider:
+            transport = "responses"
+            protocol_recovery_limit = 1
+
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            def stream_events(self, _messages, *, json_mode=False):
+                assert json_mode is True
+
+                async def stream():
+                    self.started.set()
+                    await self.release.wait()
+                    yield {
+                        "type": "content",
+                        "text": '{"speak":{"state":"speak","emotion":"calm","text":"旧检查输出"},"actions":[]}',
+                    }
+                    yield {"type": "finish", "reason": "stop"}
+
+                return stream()
+
+        class Output:
+            active = False
+            status = "IDLE"
+            queue_snapshot = []
+            speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+
+            def __init__(self):
+                self.begin_calls = 0
+                self.held = 0
+
+            async def begin(self, *_args, **_kwargs):
+                self.begin_calls += 1
+                raise AssertionError("speech from a pre-onset system check must remain inaudible")
+
+            def hold_unplayed(self):
+                self.held += 1
+
+            def cancel_all(self, _reason):
+                return None
+
+        emitted = []
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+
+        provider = Provider()
+        runtime = _speaking_runtime(provider)
+        runtime.output = Output()
+        runtime.emit = emit
+        runtime.scheduler.arm(0.0, turn_id="turn-a")
+        runtime.scheduler.advance(1.2)
+        candidate = runtime.scheduler.forced_due(now=1.2)
+
+        assert await runtime._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate)
+        request = runtime.active_request
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        dispatch_epoch = runtime.active_dispatch_context["user_speech_epoch"]
+
+        # No ASR final or scheduler re-arm has happened.  Speech onset alone
+        # must invalidate only the old system-check output.
+        await runtime.speech_activity(True)
+        assert runtime.scheduler.generation == 1
+        assert runtime._user_speech_epoch == dispatch_epoch + 1
+        assert runtime.output.held == 1
+        assert not request.cancelled()
+
+        provider.release.set()
+        assert await asyncio.wait_for(request, timeout=1) == "system_check_stale"
+        await runtime._finish_active_request(request)
+        assert runtime.output.begin_calls == 0
+
+        stale = [
+            payload for kind, payload in emitted
+            if kind == "agent.trace" and payload.get("kind") == "SYSTEM_CHECK_STALE"
+        ]
+        assert stale[-1]["stale_reason"] == "user_speech_started_after_dispatch"
+
+        if runtime.voice_activation_task and not runtime.voice_activation_task.done():
+            runtime.voice_activation_task.cancel()
+            await asyncio.gather(runtime.voice_activation_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_system_check_started_while_user_speaks_never_releases_old_answer():
+    async def scenario():
+        class Provider:
+            transport = "responses"
+            protocol_recovery_limit = 1
+
+            def __init__(self):
+                self.release = asyncio.Event()
+
+            def stream_events(self, _messages, *, json_mode=False):
+                assert json_mode is True
+
+                async def stream():
+                    await self.release.wait()
+                    yield {
+                        "type": "content",
+                        "text": '{"speak":{"state":"speak","emotion":"calm","text":"旧检查输出"},"actions":[]}',
+                    }
+                    yield {"type": "finish", "reason": "stop"}
+
+                return stream()
+
+        class Output:
+            active = False
+            status = "IDLE"
+            queue_snapshot = []
+            speak_snapshot = {"queue_status": "empty", "text_only_queue": True}
+
+            def __init__(self):
+                self.begin_calls = 0
+
+            async def begin(self, *_args, **_kwargs):
+                self.begin_calls += 1
+                raise AssertionError("a system check dispatched during speech must not queue TTS")
+
+            def cancel_all(self, _reason):
+                return None
+
+        emitted = []
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+
+        provider = Provider()
+        runtime = _speaking_runtime(provider)
+        runtime.output = Output()
+        runtime.emit = emit
+        runtime.user_speaking = True
+        runtime._user_speech_epoch = 4
+        runtime.scheduler.arm(0.0, turn_id="turn-a")
+        runtime.scheduler.advance(1.2)
+        candidate = runtime.scheduler.forced_due(now=1.2)
+
+        assert await runtime._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate)
+        request = runtime.active_request
+        assert runtime.active_dispatch_context["user_speaking_at_dispatch"] is True
+
+        # This reproduces the observed ordering: the timer request begins in
+        # the middle of an utterance, then the user stops before ASR final.
+        await runtime.speech_activity(False)
+        provider.release.set()
+        assert await asyncio.wait_for(request, timeout=1) == "system_check_stale"
+        await runtime._finish_active_request(request)
+        assert runtime.output.begin_calls == 0
+
+        stale = [
+            payload for kind, payload in emitted
+            if kind == "agent.trace" and payload.get("kind") == "SYSTEM_CHECK_STALE"
+        ]
+        assert stale[-1]["stale_reason"] == "user_speaking_at_dispatch"
+
+    asyncio.run(scenario())
+
+
+def test_user_speech_onset_withdraws_only_unplayed_system_check_candidate():
+    async def scenario():
+        class Workspace:
+            playback_started = False
+
+        class Handle:
+            def __init__(self, speech_id):
+                self.speech_id = speech_id
+                self.workspace = Workspace()
+
+        class Output:
+            active = False
+            status = "IDLE"
+            queue_snapshot = []
+            speak_snapshot = {"queue_status": "queued", "text_only_queue": True}
+
+            def __init__(self):
+                self.handle = Handle("ordinary-speech")
+                self._pending = [Handle("system-speech")]
+                self.cancelled = []
+                self.held = 0
+
+            def hold_unplayed(self):
+                self.held += 1
+
+            def cancel(self, speech_id, reason):
+                self.cancelled.append((speech_id, reason))
+                return True
+
+            def cancel_all(self, _reason):
+                raise AssertionError("passive onset must not cancel the ordinary output scope")
+
+        runtime = _speaking_runtime(_BlockingProvider())
+        runtime.output = Output()
+        runtime._system_check_speeches["system-speech"] = {
+            "system_check_id": "system-check-a",
+            "speech_turn_id": "turn-a",
+            "scheduler_generation": runtime.scheduler.generation,
+        }
+
+        await runtime.speech_activity(True)
+
+        assert runtime.output.held == 1
+        assert runtime.output.cancelled == [
+            ("system-speech", "superseded_system_check"),
+        ]
+
+        if runtime.voice_activation_task and not runtime.voice_activation_task.done():
+            runtime.voice_activation_task.cancel()
+            await asyncio.gather(runtime.voice_activation_task, return_exceptions=True)
+
+    asyncio.run(scenario())
