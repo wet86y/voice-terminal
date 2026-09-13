@@ -13,14 +13,40 @@ from .tools import ShadowToolExecutor
 
 
 EventSink = Callable[[list[ShadowEvent]], Awaitable[None]]
+MetricSink = Callable[[str, dict[str, Any]], None]
 
 
 class _EventRelay:
-    def __init__(self, sink: EventSink | None) -> None:
+    """At-least-once bridge from Shadow output to the voice heartbeat.
+
+    The Shadow loop must not be coupled to a transient voice-side exception.
+    A batch is therefore restored before retry.  Consumers use ``event_id``
+    as their idempotency key because an exception can occur after part of a
+    batch was already accepted.
+    """
+
+    def __init__(
+        self, sink: EventSink | None, *, on_metric: MetricSink | None = None,
+        retry_initial_delay_seconds: float = 0.05,
+        retry_max_delay_seconds: float = 1.0,
+    ) -> None:
+        if retry_initial_delay_seconds <= 0 or retry_max_delay_seconds < retry_initial_delay_seconds:
+            raise ValueError("invalid Shadow event relay retry delay")
         self.sink = sink
+        self.on_metric = on_metric
+        self.retry_initial_delay_seconds = retry_initial_delay_seconds
+        self.retry_max_delay_seconds = retry_max_delay_seconds
         self.buffer = ShadowEventBuffer()
         self.task: asyncio.Task[None] | None = None
         self.closed = False
+
+    def _metric(self, name: str, payload: dict[str, Any]) -> None:
+        if self.on_metric is None:
+            return
+        try:
+            self.on_metric(name, dict(payload))
+        except Exception:
+            pass
 
     def publish(self, event: ShadowEvent) -> None:
         if self.closed:
@@ -30,18 +56,39 @@ class _EventRelay:
             self.task = asyncio.create_task(self._flush(), name="shadow-event-relay")
 
     async def _flush(self) -> None:
+        retry_attempt = 0
         while not self.closed:
             events = self.buffer.drain()
             if not events:
                 return
-            if self.sink is not None:
-                try:
-                    await self.sink(events)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    # The event stays non-fatal to both execution and voice.
-                    pass
+            if self.sink is None:
+                self.buffer.restore(events)
+                return
+            try:
+                await self.sink(events)
+            except asyncio.CancelledError:
+                self.buffer.restore(events)
+                raise
+            except Exception as exc:
+                # Do not acknowledge a batch until its sink returns.  This
+                # gives terminal result/failed/clarification events a durable
+                # session-owned mailbox across transient voice-side failures.
+                self.buffer.restore(events)
+                retry_attempt += 1
+                delay = min(
+                    self.retry_initial_delay_seconds * (2 ** (retry_attempt - 1)),
+                    self.retry_max_delay_seconds,
+                )
+                self._metric("event.delivery_retry", {
+                    "attempt": retry_attempt,
+                    "event_count": len(events),
+                    "error": type(exc).__name__,
+                    "delay_ms": round(delay * 1000, 2),
+                })
+                await asyncio.sleep(delay)
+                continue
+            retry_attempt = 0
+            self._metric("event.delivered", {"event_count": len(events)})
 
     def drain(self) -> list[ShadowEvent]:
         return self.buffer.drain()
@@ -63,7 +110,8 @@ class ShadowAgentSession:
         *, production_sink: EventSink | None = None,
     ) -> None:
         self.component = component
-        self.relay = _EventRelay(production_sink)
+        on_metric = component.runtime_options.get("on_metric")
+        self.relay = _EventRelay(production_sink, on_metric=on_metric if callable(on_metric) else None)
         self.runtime = ShadowRuntime(
             component.provider, component.tools, context_source,
             instructions_loader=component.instructions_loader,
@@ -95,7 +143,8 @@ class ShadowAgentSession:
         await self.runtime.reset()
         sink = self.relay.sink
         await self.relay.close()
-        self.relay = _EventRelay(sink)
+        on_metric = self.component.runtime_options.get("on_metric")
+        self.relay = _EventRelay(sink, on_metric=on_metric if callable(on_metric) else None)
         self.runtime.on_event = self.relay.publish
 
     async def close(self) -> None:

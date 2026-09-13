@@ -2870,7 +2870,9 @@ class AgentEpisodeRuntime:
         request sees it.
         """
         await self.ensure_episode()
-        self.ledger.commit_shadow_event(event)
+        if not self.ledger.commit_shadow_event(event):
+            await self.log("SHADOW_EVENT_DUPLICATE", event_id=event.event_id, event_kind=event.kind)
+            return
         await self.log("SHADOW_EVENT", event_id=event.event_id, event_kind=event.kind,
                        wake_policy=event.wake_policy)
         if event.wake_policy != "passive":

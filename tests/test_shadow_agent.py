@@ -22,6 +22,7 @@ from voice_terminal.shadow_agent import (
     request_shadow_action_definition,
 )
 from voice_terminal.shadow_agent.events import ShadowEventBuffer
+from voice_terminal.shadow_agent.component import _EventRelay
 from voice_terminal.shadow_agent.provider import ShadowProviderResponse
 
 
@@ -179,6 +180,58 @@ def test_event_buffer_overwrites_status_and_preserves_semantic_events():
     assert [(item.kind, item.text) for item in buffer.drain()] == [
         ("progress", "新"), ("observation", "发现一"), ("observation", "发现二"),
     ]
+
+
+def test_event_buffer_restore_keeps_newer_visible_state_and_semantic_order():
+    buffer = ShadowEventBuffer()
+    old_status = ShadowEvent("old-status", "status", "旧状态", 1, "normal")
+    old_result = ShadowEvent("old-result", "result", "旧结果", 1, "priority")
+    buffer.publish(old_status)
+    buffer.publish(old_result)
+    in_flight = buffer.drain()
+    buffer.publish(ShadowEvent("new-status", "status", "新状态", 2, "normal"))
+    buffer.publish(ShadowEvent("new-observation", "observation", "新发现", 2, "normal"))
+    buffer.restore(in_flight)
+    assert [(item.event_id, item.text) for item in buffer.drain()] == [
+        ("new-status", "新状态"),
+        ("old-result", "旧结果"),
+        ("new-observation", "新发现"),
+    ]
+
+
+def test_event_relay_retries_without_losing_terminal_event_and_ledger_is_idempotent():
+    async def scenario():
+        attempts: list[list[str]] = []
+        metrics: list[tuple[str, dict]] = []
+        ledger = SessionLedger()
+        accepted = asyncio.Event()
+
+        async def sink(events):
+            attempts.append([item.event_id for item in events])
+            for item in events:
+                ledger.commit_shadow_event(item)
+            if len(attempts) == 1:
+                # Model a failure after the sink accepted the item but before
+                # it could acknowledge the relay's complete batch.
+                raise RuntimeError("temporary voice-side failure")
+            accepted.set()
+
+        relay = _EventRelay(
+            sink, on_metric=lambda name, payload: metrics.append((name, payload)),
+            retry_initial_delay_seconds=0.001, retry_max_delay_seconds=0.002,
+        )
+        terminal = ShadowEvent("terminal", "result", "完成", 1, "priority")
+        relay.publish(terminal)
+        await asyncio.wait_for(accepted.wait(), timeout=1.0)
+        await asyncio.gather(relay.task, return_exceptions=False)
+        assert attempts == [["terminal"], ["terminal"]]
+        assert [entry for entry in ledger.entries if entry.kind == "shadow_event"]
+        assert len([entry for entry in ledger.entries if entry.kind == "shadow_event"]) == 1
+        assert any(name == "event.delivery_retry" for name, _ in metrics)
+        assert any(name == "event.delivered" for name, _ in metrics)
+        await relay.close()
+
+    asyncio.run(scenario())
 
 
 def test_wake_is_single_runner_coalesced_and_same_revision_idempotent(tmp_path: Path):

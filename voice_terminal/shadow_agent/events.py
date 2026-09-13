@@ -24,3 +24,23 @@ class ShadowEventBuffer:
         self._state.clear()
         self._semantic.clear()
         return result
+
+    def restore(self, events: list[ShadowEvent]) -> None:
+        """Put an undelivered batch back without overwriting newer state.
+
+        A relay removes a batch temporarily while awaiting its consumer.  The
+        consumer may fail after a newer status/progress event has already
+        arrived.  Restoring the older batch must preserve that newer visible
+        state, while semantic events retain their original delivery order.
+        """
+        restored_state: OrderedDict[str, ShadowEvent] = OrderedDict()
+        restored_semantic: list[ShadowEvent] = []
+        for event in events:
+            if event.kind in {"status", "progress"}:
+                restored_state[event.kind] = event
+            else:
+                restored_semantic.append(event)
+        for kind, event in restored_state.items():
+            self._state.setdefault(kind, event)
+        if restored_semantic:
+            self._semantic[:0] = restored_semantic
