@@ -37,10 +37,44 @@ class EpisodeController(RealtimeController):
         runtime = AgentEpisodeRuntime(self.llm, self.registry, self.output, self._agent_event,
                                       conversation=self.conversation, ledger=self.history,
                                       options=self.agent_options, tools_enabled=True,
-                                      shadow_waker=self.shadow_waker,
-                                      reasoning_mode=mode, persona_config=self.persona_config)
+                                       shadow_waker=self.shadow_waker,
+                                       reasoning_mode=mode, persona_config=self.persona_config,
+                                       on_final_system_check_settled=self._final_system_check_settled)
         self.output.runtime = runtime
         return runtime
+
+    async def _on_kws_activated(self, source_id: str, generation: int) -> bool:
+        try:
+            await self.episode.schedule_system_check(
+                "kws_wake", source_id, arm_silence=True,
+                controller_generation=generation,
+            )
+        except Exception as exc:
+            logger.exception("controller.kws_wake_schedule_failed")
+            await self._error("KWS_WAKE_SCHEDULE_FAILED", str(exc), recoverable=True)
+        # The acknowledgement is advisory.  Once ASR readiness has succeeded,
+        # an LLM/TTS scheduling failure must not close the protected input path.
+        return True
+
+    async def _final_system_check_settled(self, context: dict) -> None:
+        scheduler_generation = context.get("generation")
+        activation_generation = self._activation_generation
+
+        async def return_when_input_is_idle() -> None:
+            while (self.state.listening and self.state.input_owner == "asr"
+                   and activation_generation == self._activation_generation):
+                if (isinstance(scheduler_generation, int)
+                        and scheduler_generation != self.episode.scheduler.generation):
+                    return
+                if self.workspace is None and self.episode.user_speaking is not True:
+                    await self._return_to_kws(activation_generation)
+                    return
+                await asyncio.sleep(0.05)
+
+        task = asyncio.create_task(
+            return_when_input_is_idle(), name="final-system-check-kws-return",
+        )
+        self._track(task)
 
     def set_reasoning_mode(self, mode: str) -> None:
         self.reasoning_mode = mode
@@ -718,6 +752,13 @@ class EpisodeController(RealtimeController):
             self.audio_processor.reset()
         self.state.clear_current()
         self.state.agent = {}
+        if self.wake_always_on and self.state.listening:
+            if self.state.input_owner == "asr":
+                await self._return_to_kws(self._activation_generation)
+                return
+            if self.kws is not None:
+                self.kws.reset()
+            await self._reset_owner_boundary()
         await self._state_event(TerminalState.IDLE, listening=self.state.listening)
 
     async def close(self):

@@ -390,7 +390,7 @@ def test_new_final_rearms_silence_without_cancelling_active_system_check(dispatc
         runtime.episode_id = "episode"
         runtime.state = "WAITING_EVENT"
         runtime.scheduler.arm(0.0)
-        runtime.scheduler.advance(10.0 if dispatch_kind == "final_silence" else 1.2)
+        runtime.scheduler.advance(30.0 if dispatch_kind == "final_silence" else 1.2)
         if dispatch_kind == "final_silence":
             assert runtime.scheduler.final_pending is True
         else:

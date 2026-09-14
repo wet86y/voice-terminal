@@ -35,6 +35,22 @@ describe('V0.6 session protocol', () => {
     expect(terminal.canStart.value).toBe(true)
   })
 
+  it('accepts optional always-on wake ownership without requiring it from old backends', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('runtime.snapshot', 1, { state: 'IDLE', listening: true, can_start: false,
+      wake_always_on: true, input_owner: 'kws',
+      services: { audio: 'RUNNING', kws: 'RUNNING', asr: 'READY', llm: 'READY', tts: 'READY' },
+      current: {} })
+    expect(terminal.wakeAlwaysOn.value).toBe(true)
+    expect(terminal.inputOwner.value).toBe('kws')
+
+    socket.push('runtime.snapshot', 2, { state: 'LISTENING', listening: true, can_start: false,
+      services: { audio: 'RUNNING', kws: 'READY', asr: 'RUNNING', llm: 'READY', tts: 'READY' },
+      current: {} })
+    expect(terminal.wakeAlwaysOn.value).toBe(true)
+    expect(terminal.inputOwner.value).toBe('kws')
+  })
+
   it('uses input identity for text and ignores an older sequence', () => {
     const { socket, terminal } = openTerminal()
     socket.push('input.started', 1, {}, { turn_id: 'input_a' })

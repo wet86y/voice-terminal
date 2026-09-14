@@ -11,7 +11,7 @@ from ..core.event_bus import EventBus
 from ..core.events import VoiceEvent, event
 from ..core.state import RuntimeState, TerminalState
 from ..core.turn import InputManager
-from ..kws.detector import KwsDetector
+from ..kws.service import KwsWorker
 from ..providers.deepseek import DeepSeekClient
 from ..providers.minimax_tts import MiniMaxTtsClient
 from ..vad.barge_in import BargeInGate
@@ -22,13 +22,14 @@ class InputController:
     """V0.6 shared device/input lifecycle, without an answer pipeline."""
 
     def __init__(self, *, state: RuntimeState, bus: EventBus, history: Any,
-                 capture: AudioCapture | None, kws: KwsDetector | None,
+                 capture: AudioCapture | None, kws: KwsWorker | None,
                  vad: FsmnVadDetector | None, asr: AsrWorkerClient | None,
                  llm: DeepSeekClient | None, tts: MiniMaxTtsClient | None,
                  player: PcmPlayer | None, wake_enabled: bool, wake_keyword: str,
                  wake_preroll_ms: int, vad_min_speech_ms: int,
                  vad_end_silence_ms: int, max_turn_ms: int, bridge_min_chars: int,
                  bridge_max_chars: int, bridge_max_wait_ms: int, bridge_breaks: str,
+                 wake_always_on: bool = False,
                  audio_processor: AudioPreprocessor | None = None,
                  aec_failure_policy: str = "pause_recover",
                  barge_in_gate: BargeInGate | None = None) -> None:
@@ -39,6 +40,9 @@ class InputController:
         self.aec_failure_policy = aec_failure_policy
         self.barge_in_gate = barge_in_gate or BargeInGate(min_speech_ms=max(250, vad_min_speech_ms), enabled=True)
         self.wake_enabled, self.wake_keyword, self.wake_preroll_ms = wake_enabled, wake_keyword, wake_preroll_ms
+        self.wake_always_on = bool(wake_enabled and wake_always_on)
+        self.state.wake_always_on = self.wake_always_on
+        self.state.input_owner = "none"
         self.vad_min_speech_ms, self.vad_end_silence_ms, self.max_turn_ms = vad_min_speech_ms, vad_end_silence_ms, max_turn_ms
         self.bridge_options = {"min_chars": bridge_min_chars, "max_chars": bridge_max_chars,
                                "max_wait_ms": bridge_max_wait_ms, "preferred_breaks": bridge_breaks}
@@ -87,23 +91,41 @@ class InputController:
             return
         required = ("audio", "kws", "asr", "llm", "tts")
         missing = [name for name in required if self.state.services.get(name) not in {"READY", "RUNNING", "STREAMING", "CONNECTED"}
-                   and not (name == "kws" and self.state.services.get(name) == "DISABLED")]
+                   and not (name == "kws" and self.state.services.get(name) == "DISABLED")
+                   and not (self.wake_always_on and name == "asr"
+                            and self.state.services.get(name) == "ERROR")]
         if missing:
             await self._error("RUNTIME_NOT_READY", f"后端服务尚未就绪：{', '.join(missing)}", recoverable=True)
             return
         if self.capture is None or self.vad is None or self.asr is None:
             await self._error("RUNTIME_NOT_READY", "真实音频链路尚未初始化。", recoverable=False)
             return
+        if self.wake_always_on and (
+            self.kws is None or self.kws.error is not None or not self.kws.running
+        ):
+            self.state.set_service("kws", "ERROR")
+            await self._error(
+                "KWS_WORKER_FAILED",
+                str(self.kws.error) if self.kws is not None else "KWS worker unavailable",
+                recoverable=True,
+            )
+            return
         try:
-            if not self.asr.connected:
+            if not self.wake_always_on and not self.asr.connected:
                 await self.asr.connect()
             await self.capture.start()
             if self.audio_processor is not None:
                 self.audio_processor.reset()
             self.vad.reset()
             self.state.set_service("audio", "RUNNING")
-            self.state.set_service("kws", "RUNNING" if self.wake_enabled else "DISABLED")
-            self.state.set_service("asr", "RUNNING")
+            if self.wake_always_on:
+                self.state.input_owner = "kws"
+                self.state.set_service("kws", "RUNNING")
+                self.state.set_service("asr", "READY" if self.asr.connected else "ERROR")
+            else:
+                self.state.input_owner = "asr"
+                self.state.set_service("kws", "RUNNING" if self.wake_enabled else "DISABLED")
+                self.state.set_service("asr", "RUNNING")
             self._listen_task = asyncio.create_task(self._listen_loop(), name="voice-input-loop")
             await self._state_event(TerminalState.IDLE, listening=True)
         except Exception as exc:
@@ -113,6 +135,7 @@ class InputController:
 
     async def stop_listening(self) -> None:
         self.state.listening = False
+        self.state.input_owner = "none"
         if self._listen_task is not None:
             self._listen_task.cancel()
             await asyncio.gather(self._listen_task, return_exceptions=True)

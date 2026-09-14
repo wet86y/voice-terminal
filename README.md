@@ -108,6 +108,28 @@ shadow_agent:
 `http://127.0.0.1:5173/` 可访问。仅调试后端时使用 `-NoWeb`。真实运行需配置
 `DEEPSEEK_API_KEY`、`MINIMAX_API_KEY`，OpenCode Go 调试另需 `OPENCODE_GO_API_KEY`。
 
+### 独立验证 KWS
+
+KWS 模型可在不启动 VAD、ASR、LLM、TTS、Web 前端或 Voice Server 的情况下单独验证。它会使用
+当前配置的输入设备、16 kHz 单声道 PCM 与 `wake` 配置中的模型/关键词文件；即使正常运行配置仍将
+`wake.enabled` 设为 `false`，该探针也会明确提示后继续运行，避免为了验收模型而接入完整语音链路。
+
+```powershell
+# 持续监听；说出配置中的 wake.keyword，按 Ctrl+C 结束。
+python -m voice_terminal.kws.probe
+
+# 用于检查设备、PCM 读取和模型初始化的短时冒烟测试。
+python -m voice_terminal.kws.probe --duration 10
+```
+
+检测成功时会输出 `WAKE_DETECTED label=HEI_CLAW ...`。探针不发送网络请求，也不创建 ASR/LLM/TTS
+会话，适合在调整关键词、阈值或麦克风设备后做单独验收。
+
+常驻待机模式需同时设置 `wake.enabled: true` 与 `wake.always_on: true`，也可通过
+`VOICE_WAKE_ENABLED=true`、`VOICE_WAKE_ALWAYS_ON=true` 覆盖。默认 `always_on=false`，因此旧部署仍按
+原有直接 ASR 或会话门控流程运行。常驻模式下“开始监听”先进入 KWS 待机，唤醒后切换到 ASR；
+30 秒最终静默检查及其播报结算后自动回到 KWS。“停止监听”仍会完整停止本次监听。
+
 ## AEC 与播放期插话
 
 默认启用 AEC。助手播放期间，只有 AEC 健康、反向参考新鲜且处理后近端 VAD 明确为 true 的
@@ -124,6 +146,7 @@ shadow_agent:
 - [运行与质量门槛](docs/operations-and-quality.md)
 - [V0.7 发布审计](docs/v07-release-audit.md)
 - [当前已知 LLM 可靠性问题](docs/known-issues/llm-invalid-json-responses.md)
+- [KWS 常驻待机与交互隔离处置记录](docs/known-issues/kws-always-on-standby.md)
 
 ```powershell
 python -m pytest -q

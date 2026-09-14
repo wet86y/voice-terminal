@@ -33,6 +33,13 @@ class KeywordTests(unittest.TestCase):
             generated.write_text("h e i c l a w @HEI_CLAW\n", encoding="utf-8")
             validate_keywords_file(generated)
 
+    def test_keyword_label_must_match_exactly(self) -> None:
+        with TemporaryDirectory() as directory:
+            generated = Path(directory) / "keywords.txt"
+            generated.write_text("h e i c l a w @HEI_CLAW_EXTRA\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "HEI_CLAW"):
+                validate_keywords_file(generated)
+
 
 if __name__ == "__main__":
     unittest.main()

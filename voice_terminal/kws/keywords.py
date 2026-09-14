@@ -47,7 +47,12 @@ def validate_keywords_file(path: Path, expected_label: str = DEFAULT_WAKE_LABEL)
     if not lines:
         raise ValueError(f"KWS 关键词文件为空：{path}")
     canonical = f"@{expected_label.upper()}"
-    if not any(canonical in line for line in lines):
+    # ``@HEI_CLAW_EXTRA`` is not the same keyword as ``@HEI_CLAW``.  The
+    # old substring check accepted it and subsequently let a differently
+    # named keyword pass the wake gate.  sherpa's generated file puts the
+    # original keyword label in the final whitespace-separated field.
+    labels = {line.split()[-1].upper() for line in lines if line.split()}
+    if canonical not in labels:
         raise ValueError(f"KWS 关键词文件未包含 {canonical}：{path}")
 
 

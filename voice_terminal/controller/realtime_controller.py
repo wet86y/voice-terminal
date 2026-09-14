@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 import logging
 import time
+from uuid import uuid4
 
 from .turn_controller import InputController
 from .speech_pipeline import SpeechPipeline
@@ -16,6 +17,7 @@ from ..asr.protocol import AudioChunk
 from ..core.events import event, utc_now_iso
 from ..core.state import TerminalState
 from ..kws.keywords import strip_wake_prefix
+from ..kws.service import KwsAudioFrame
 from ..tts.alignment import DeliveryResolver
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,7 @@ class RealtimeController(SpeechPipeline, InputController):
         self._resume_started: int | None = None
         self._vad_generation = 0
         self._reset_vad_pending = False
+        self._activation_generation = 0
 
     def _track(self, task: asyncio.Task | None) -> None:
         if task is None:
@@ -222,21 +225,136 @@ class RealtimeController(SpeechPipeline, InputController):
         # Analysis is optional and never becomes a mandatory start prerequisite.
         status = self.state.services.pop("analysis", "DISABLED")
         try:
-            if not await self._ensure_asr_ready():
+            if not self.wake_always_on and not await self._ensure_asr_ready():
                 return
             await super().start_listening()
         finally:
             self.state.services["analysis"] = status
         if self.state.listening and (self._asr_sender is None or self._asr_sender.done()):
             self._asr_sender = asyncio.create_task(self._send_asr_loop())
+        if self.state.listening and self.wake_always_on and self.kws is not None:
+            self.state.input_owner = "none"
+            self.kws.reset()
+            try:
+                await self._reset_owner_boundary()
+            except Exception as exc:
+                await self._fail_kws_closed(f"KWS standby initialization failed: {exc}")
+                return
+            self.state.input_owner = "kws"
+            await self._state_event(TerminalState.IDLE, listening=True)
 
-    async def _ensure_asr_ready(self) -> bool:
+    async def _reset_owner_boundary(self) -> None:
+        self._drain_asr_queue()
+        self._asr_queue_overflow = False
+        self._asr_queue_overflow_at = None
+        self._recent.clear()
+        self._last_frame = None
+        self._vad_origin = None
+        self._speech_start_sample = None
+        self._speech_end_sample = None
+        self._speech_samples = 0
+        self._resume_started = None
+        self._vad_generation += 1
+        self._reset_vad_pending = False
+        if self.vad is not None:
+            await asyncio.to_thread(self.vad.reset)
+
+    async def _fail_kws_closed(self, message: str) -> None:
+        self._activation_generation += 1
+        self.state.input_owner = "none"
+        self.state.listening = False
+        self.state.set_service("kws", "ERROR")
+        if self.workspace is not None:
+            await self._cancel_turn(reason="failed", record=False)
+        if self.capture is not None:
+            await self.capture.stop()
+            self.state.set_service("audio", "READY")
+        await self._error("KWS_WORKER_FAILED", message, recoverable=True)
+        await self._state_event(TerminalState.IDLE, listening=False)
+
+    async def _on_kws_activated(self, source_id: str, generation: int) -> bool:
+        return True
+
+    async def _activate_kws_detection(self) -> None:
+        if not self.wake_always_on or self.state.input_owner != "kws":
+            return
+        expected_generation = self._activation_generation
+        if self.kws is None or self.kws.error is not None or not self.kws.running:
+            await self._fail_kws_closed(
+                self.kws.error if self.kws is not None and self.kws.error else "KWS worker unavailable"
+            )
+            return
+        try:
+            if self.asr is None:
+                raise RuntimeError("ASR Worker 客户端未初始化。")
+            if not self.asr.connected:
+                await self.asr.connect()
+            health = getattr(self.asr, "health", None)
+            if callable(health):
+                await health()
+        except Exception as exc:
+            self.state.set_service("asr", "ERROR")
+            self.kws.reset()
+            await self._error("ASR_WORKER_NOT_READY", str(exc), recoverable=True)
+            await self._state_event(TerminalState.IDLE, listening=True)
+            return
+        if (not self.state.listening or self.state.input_owner != "kws"
+                or expected_generation != self._activation_generation):
+            return
+        self._activation_generation += 1
+        generation = self._activation_generation
+        source_id = f"wake-{uuid4().hex}"
+        self.kws.reset()
+        await self._reset_owner_boundary()
+        self.state.input_owner = "asr"
+        self.state.set_service("kws", "READY")
+        self.state.set_service("asr", "RUNNING")
+        if not await self._on_kws_activated(source_id, generation):
+            await self._return_to_kws(generation)
+            return
+        await self._state_event(TerminalState.IDLE, listening=True)
+
+    async def _return_to_kws(self, generation: int | None = None) -> bool:
+        if (not self.wake_always_on or not self.state.listening
+                or self.state.input_owner != "asr"):
+            return False
+        if generation is not None and generation != self._activation_generation:
+            return False
+        if self.kws is None or self.kws.error is not None or not self.kws.running:
+            await self._fail_kws_closed(
+                self.kws.error if self.kws is not None and self.kws.error else "KWS worker unavailable"
+            )
+            return False
+        self.state.input_owner = "none"
+        self._activation_generation += 1
+        transition_generation = self._activation_generation
+        self.kws.reset()
+        try:
+            await self._reset_owner_boundary()
+        except Exception as exc:
+            await self._fail_kws_closed(f"KWS rearm failed: {exc}")
+            return False
+        if (not self.state.listening
+                or transition_generation != self._activation_generation):
+            return False
+        self.state.input_owner = "kws"
+        self.state.set_service("kws", "RUNNING")
+        self.state.set_service(
+            "asr", "READY" if self.asr is not None and self.asr.connected else "ERROR",
+        )
+        await self._state_event(TerminalState.IDLE, listening=True)
+        return True
+
+    async def _ensure_asr_ready(self, *, preserve_listening: bool = False) -> bool:
         """Reconnect and perform an application-level ASR readiness check."""
 
         if self.asr is None:
             self.state.services["asr"] = "ERROR"
             await self._error("ASR_WORKER_UNAVAILABLE", "ASR Worker 客户端未初始化。", recoverable=True)
-            await self._state_event(TerminalState.IDLE, listening=False)
+            await self._state_event(
+                TerminalState.IDLE,
+                listening=self.state.listening if preserve_listening else False,
+            )
             return False
         try:
             if not self.asr.connected:
@@ -250,13 +368,50 @@ class RealtimeController(SpeechPipeline, InputController):
             code = getattr(exc, "code", "ASR_WORKER_NOT_READY")
             self.state.services["asr"] = "ERROR"
             await self._error(str(code), str(exc), recoverable=True)
-            await self._state_event(TerminalState.IDLE, listening=False)
+            await self._state_event(
+                TerminalState.IDLE,
+                listening=self.state.listening if preserve_listening else False,
+            )
             return False
 
     async def _handle_asr_disconnect(self) -> None:
         """Quiesce a broken input transport and schedule one safe reconnect."""
 
         self.state.services["asr"] = "ERROR"
+        if self.wake_always_on and self.state.listening:
+            sender = self._asr_sender
+            if sender is not None and sender is not asyncio.current_task() and not sender.done():
+                sender.cancel()
+                await asyncio.gather(sender, return_exceptions=True)
+            self._asr_sender = None
+            self._drain_asr_queue()
+            if self.kws is None or self.kws.error is not None or not self.kws.running:
+                await self._fail_kws_closed(
+                    self.kws.error if self.kws is not None and self.kws.error else "KWS worker unavailable"
+                )
+                return
+            self.state.input_owner = "none"
+            self._activation_generation += 1
+            transition_generation = self._activation_generation
+            self.kws.reset()
+            try:
+                await self._reset_owner_boundary()
+            except Exception as exc:
+                await self._fail_kws_closed(f"KWS recovery failed: {exc}")
+                return
+            if (not self.state.listening
+                    or transition_generation != self._activation_generation):
+                return
+            self.state.input_owner = "kws"
+            self.state.services["kws"] = "RUNNING"
+            self.state.services["audio"] = "RUNNING"
+            if (not self._closed and
+                    (self._asr_recovery_task is None or self._asr_recovery_task.done())):
+                self._asr_recovery_task = asyncio.create_task(
+                    self._recover_asr_session(), name="asr-session-recovery",
+                )
+                self._track(self._asr_recovery_task)
+            return
         self.state.listening = False
         listen_task = self._listen_task
         if listen_task is not None and listen_task is not asyncio.current_task() and not listen_task.done():
@@ -303,7 +458,18 @@ class RealtimeController(SpeechPipeline, InputController):
 
         try:
             await asyncio.sleep(0.5)
-            if self._closed or self.state.listening:
+            if self._closed:
+                return
+            if self.wake_always_on and self.state.listening and self.state.input_owner == "kws":
+                logger.info("controller.asr_recovery_attempt")
+                if await self._ensure_asr_ready(preserve_listening=True):
+                    self.state.services["asr"] = "READY"
+                    if self._asr_sender is None or self._asr_sender.done():
+                        self._asr_sender = asyncio.create_task(self._send_asr_loop())
+                    await self._state_event(TerminalState.IDLE, listening=True)
+                    logger.info("controller.asr_recovery_succeeded")
+                return
+            if self.state.listening:
                 return
             logger.info("controller.asr_recovery_attempt")
             await self.start_listening()
@@ -363,7 +529,7 @@ class RealtimeController(SpeechPipeline, InputController):
                 # feeding a dead ASR connection.
                 await self._handle_asr_disconnect()
                 await self._error(code, str(exc), recoverable=True)
-                await self._state_event(TerminalState.IDLE, listening=False)
+                await self._state_event(TerminalState.IDLE, listening=self.state.listening)
                 return
             finally:
                 self._asr_queue.task_done()
@@ -484,7 +650,7 @@ class RealtimeController(SpeechPipeline, InputController):
                 self.state.services["kws"] = "READY" if self.wake_enabled and self.kws is not None else "DISABLED"
                 self.state.services["asr"] = "READY" if self.asr is not None and self.vad is not None else "ERROR"
                 await self._error("AUDIO_PIPELINE_FAILED", str(exc), recoverable=True)
-                await self._state_event(TerminalState.IDLE, listening=False)
+                await self._state_event(TerminalState.IDLE, listening=self.state.listening)
                 break
             try:
                 await self.handle_frame(frame)
@@ -551,10 +717,40 @@ class RealtimeController(SpeechPipeline, InputController):
         )
         if processed != frame.pcm:
             frame = AudioFrame(processed, frame.start_sample, frame.captured_at)
+        always_on = bool(getattr(self, "wake_always_on", False))
+        if always_on:
+            if self.state.input_owner == "kws":
+                if self.kws is None or self.kws.error is not None or not self.kws.running:
+                    await self._fail_kws_closed(
+                        self.kws.error if self.kws is not None and self.kws.error else "KWS worker unavailable"
+                    )
+                    return
+                self.kws.submit(KwsAudioFrame(
+                    pcm=frame.pcm,
+                    start_sample=frame.start_sample,
+                    end_sample=frame.end_sample,
+                    captured_at=frame.captured_at,
+                ))
+                if self.kws.poll() is not None:
+                    await self._activate_kws_detection()
+                return
+            if self.state.input_owner != "asr":
+                return
         self._last_frame = frame
         self._recent.append(frame)
         while self._recent and frame.end_sample - self._recent[0].start_sample > max(1200, self.wake_preroll_ms) * 16:
             self._recent.popleft()
+        # KWS has its own native decoder thread.  The controller only hands it
+        # PCM while there is no active user turn; decoder work cannot stall
+        # VAD, ASR queueing, or the asyncio event loop.
+        if (self.workspace is None and self.wake_enabled and not always_on
+                and self.kws is not None):
+            self.kws.submit(KwsAudioFrame(
+                pcm=frame.pcm,
+                start_sample=frame.start_sample,
+                end_sample=frame.end_sample,
+                captured_at=frame.captured_at,
+            ))
         if self._vad_origin is None:
             self._vad_origin = frame.start_sample
         if self._reset_vad_pending:
@@ -592,10 +788,17 @@ class RealtimeController(SpeechPipeline, InputController):
             return
         ws = self.workspace
         if ws is None:
-            if self.wake_enabled:
-                detected = await asyncio.to_thread(self.kws.accept_pcm, frame.pcm) if self.kws else False
-                if not detected:
+            if self.wake_enabled and not always_on:
+                if self.kws is None or self.kws.error is not None:
+                    self.state.set_service("kws", "ERROR")
+                    await self._error("KWS_WORKER_FAILED", self.kws.error if self.kws else "KWS worker unavailable", recoverable=True)
                     return
+                detected = self.kws.poll()
+                if detected is None:
+                    return
+                # A detection is a hard boundary: no queued suffix from the
+                # wake phrase may trigger a second turn after this one ends.
+                self.kws.reset()
             elif not (activity.speech_started or activity.is_speech):
                 return
             await self._new_turn(frame)
@@ -1182,6 +1385,7 @@ class RealtimeController(SpeechPipeline, InputController):
         self._reset_vad_pending = True
 
     async def stop_listening(self) -> None:
+        self._activation_generation += 1
         recovery = self._asr_recovery_task
         if recovery is not None and recovery is not asyncio.current_task() and not recovery.done():
             recovery.cancel()

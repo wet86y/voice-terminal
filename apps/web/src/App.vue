@@ -49,6 +49,9 @@ const latencyDefinitions: Array<{ key: keyof LatencyValues; label: string }> = [
 const stateLabel = computed(() => stateLabels[terminal.state] ?? terminal.state)
 const systemLabel = computed(() => terminal.connectionLabel)
 const connectionClass = computed(() => terminal.connection)
+const waitingForWake = computed(
+  () => terminal.listening && terminal.wakeAlwaysOn && terminal.inputOwner === 'kws',
+)
 const buttonLabel = computed(() => {
   if (terminal.connection === 'connecting') return '连接中…'
   if (terminal.listening) return '停止监听'
@@ -275,7 +278,7 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
           <div class="stage-orbit orbit-two"></div>
           <div class="mic-core" :class="{ active: terminal.listening }">
             <span class="mic-glyph">◖</span>
-            <span class="mic-caption">{{ terminal.listening ? 'LISTENING' : 'STANDBY' }}</span>
+            <span class="mic-caption">{{ waitingForWake ? 'WAKE STANDBY' : terminal.listening ? 'LISTENING' : 'STANDBY' }}</span>
           </div>
         </div>
 
@@ -284,7 +287,7 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
             <span class="live-copy-label">CURRENT TURN</span>
             <strong>{{ currentTurnLabel }}</strong>
           </div>
-          <p>{{ terminal.listening ? '后端正在持续监听，VAD / ASR 由服务端处理；开始监听后会直接进入当前语音轮。' : '点击下方按钮启动后端持续监听。' }}</p>
+          <p>{{ waitingForWake ? '等待唤醒；当前音频仅由 KWS 消费，ASR 保持待机。' : terminal.listening ? '后端正在持续监听，VAD / ASR 由服务端处理；开始监听后会直接进入当前语音轮。' : '点击下方按钮启动后端持续监听。' }}</p>
         </div>
 
         <button
