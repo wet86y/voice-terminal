@@ -70,6 +70,7 @@ class AudioConfig:
 @dataclass(frozen=True)
 class WakeConfig:
     enabled: bool = False
+    always_on: bool = False
     provider: str = "sherpa_kws"
     keyword: str = "hei claw"
     keyword_label: str = "HEI_CLAW"
@@ -485,6 +486,9 @@ class AppConfig:
             ),
             wake=WakeConfig(
                 enabled=_env_bool("VOICE_WAKE_ENABLED", _bool(wake.get("enabled"), False)),
+                always_on=_env_bool(
+                    "VOICE_WAKE_ALWAYS_ON", _bool(wake.get("always_on"), False)
+                ),
                 provider=_string(wake.get("provider"), "sherpa_kws"),
                 keyword=keyword,
                 keyword_label=label,

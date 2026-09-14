@@ -103,7 +103,7 @@ def test_staircase_windows_and_final_dispatch_are_single_shot():
     value = scheduler()
     value.arm(0.0, wall_time=123.0)
 
-    for window in (3, 6, 9, 16, 22):
+    for window in (3, 6, 9, 16, 22, 28, 34, 40, 46, 52, 58, 64, 70):
         if window == 16:
             value.advance(4.0)
             assert value.window_index == 10
@@ -121,20 +121,101 @@ def test_staircase_windows_and_final_dispatch_are_single_shot():
         }
         value.mark_forced_dispatched(candidate, now=window * 0.4)
 
-    value.advance(10.0)
-    final = value.forced_due(now=10.0)
+    value.advance(30.0)
+    final = value.forced_due(now=30.0)
     assert final["prompt_kind"] == "final_silence"
-    assert final["window_index"] == 25
+    assert final["window_index"] == 75
     assert value.mark_final_pending() is False  # advance already retained it
 
     # A busy final window remains available until consumed, but it does not
     # create a second final request after the first one is dispatched.
-    value.advance(10.4)
-    assert value.forced_due(now=10.4)["prompt_kind"] == "final_silence"
-    value.mark_forced_dispatched(final, now=10.4)
+    value.advance(30.4)
+    assert value.forced_due(now=30.4)["prompt_kind"] == "final_silence"
+    value.mark_forced_dispatched(final, now=30.4)
     assert value.final_dispatched is True
     assert value.armed is False
     assert value.forced_due(now=20.0) is None
+
+
+def test_kws_wake_system_check_is_immediate_and_does_not_create_user_input():
+    async def scenario():
+        provider = _BlockingProvider()
+        runtime = _speaking_runtime(provider)
+        runtime.inputs.clear()
+        runtime.last_turn_id = None
+
+        generation = await runtime.schedule_system_check(
+            "kws_wake", "wake-a", arm_silence=True,
+        )
+        assert generation == runtime.scheduler.generation
+        assert runtime.inputs == {}
+        assert runtime.last_turn_id is None
+        assert runtime.scheduler.anchor_turn_id == "wake-a"
+
+        now = runtime.scheduler.anchor_monotonic
+        runtime.scheduler.start_heartbeat(now)
+        await runtime._on_heartbeat(now + 0.4)
+        await asyncio.sleep(0)
+
+        assert provider.calls == 1
+        assert runtime.active_request_source_turn_id == "wake-a"
+        assert runtime.active_dispatch_context["prompt_kind"] == "kws_wake"
+        assert runtime.active_dispatch_context["source_id"] == "wake-a"
+        await _finish_blocking_request(runtime, provider)
+
+    asyncio.run(scenario())
+
+
+def test_final_system_check_settlement_is_exactly_once_and_generation_guarded():
+    async def run_one(*, supersede: bool):
+        provider = _BlockingProvider()
+        settled = []
+        runtime = _speaking_runtime(provider)
+        runtime.on_final_system_check_settled = lambda context: settled.append(context)
+        runtime.scheduler.arm(0.0, turn_id="wake-a")
+        runtime.scheduler.advance(30.0)
+        candidate = runtime.scheduler.forced_due(now=30.0)
+        assert candidate["prompt_kind"] == "final_silence"
+        assert await runtime._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate)
+        await asyncio.sleep(0)
+        if supersede:
+            runtime.scheduler.arm(30.1, turn_id="turn-new")
+        await _finish_blocking_request(runtime, provider)
+        await runtime._finish_active_request(None)
+        return settled
+
+    assert len(asyncio.run(run_one(supersede=False))) == 1
+    assert asyncio.run(run_one(supersede=True)) == []
+
+
+def test_final_speak_settles_only_when_output_transaction_completes():
+    async def scenario():
+        settled = []
+        runtime = _speaking_runtime(_BlockingProvider())
+        runtime.on_final_system_check_settled = lambda context: settled.append(context)
+        runtime.scheduler.arm(0.0, turn_id="wake-a")
+        context = {"prompt_kind": "final_silence", "generation": 1}
+        runtime._final_system_checks["system-check-a"] = context
+        runtime._system_check_turn_ids.add("system-check-a")
+        runtime._system_check_output_turn_ids.add("system-check-a")
+        runtime._system_check_speeches["speech-a"] = {
+            "system_check_id": "system-check-a",
+            "speech_turn_id": "wake-a",
+            "scheduler_generation": 1,
+            "prompt_kind": "final_silence",
+        }
+
+        assert settled == []
+        record = {
+            "speech_id": "speech-a", "turn_id": "wake-a", "status": "completed",
+            "conversation_id": runtime.episode_id, "request_id": "request-a",
+            "text": "稍后见", "delivery": {"status": "full", "heard_text": "稍后见"},
+        }
+        await runtime.output_completed(record)
+        await runtime.output_completed(record)
+        assert len(settled) == 1
+
+    asyncio.run(scenario())
 
 
 def test_ordinary_dispatch_covers_forced_window_without_replaying_it():
@@ -153,27 +234,27 @@ def test_ordinary_dispatch_covers_forced_window_without_replaying_it():
 def test_final_window_covered_by_ordinary_work_does_not_repeat():
     value = scheduler()
     value.arm(0.0)
-    value.advance(10.0)
+    value.advance(30.0)
     assert value.final_pending is True
-    assert value.cover_forced_by_normal(now=10.0) == [25]
+    assert value.cover_forced_by_normal(now=30.0) == [75]
     assert value.final_dispatched is True
-    value.advance(10.4)
-    assert value.forced_due(now=10.4) is None
+    value.advance(30.4)
+    assert value.forced_due(now=30.4) is None
 
 
 def test_pending_ordinary_work_does_not_consume_final_window_before_start():
     value = scheduler()
     value.arm(0.0)
-    value.advance(10.0)
+    value.advance(30.0)
 
     # A forced dispatch that loses the race to ordinary pending work may
     # consume the ordinary forced window, but the final fallback survives
     # until an ordinary request really starts.
-    assert value.cover_forced_by_normal(now=10.0, include_final=False) == []
+    assert value.cover_forced_by_normal(now=30.0, include_final=False) == []
     assert value.final_pending is True
-    assert value.forced_due(now=10.4)["prompt_kind"] == "final_silence"
+    assert value.forced_due(now=30.4)["prompt_kind"] == "final_silence"
 
-    assert value.cover_forced_by_normal(now=10.4) == [25]
+    assert value.cover_forced_by_normal(now=30.4) == [75]
     assert value.final_dispatched is True
 
 
@@ -199,10 +280,10 @@ def test_long_pause_coalesces_to_latest_checkpoint_without_resetting_anchor():
         16: "coalesced_after_delay",
     }
 
-    value.advance(20.0)
-    final = value.forced_due(now=20.0)
+    value.advance(30.0)
+    final = value.forced_due(now=30.0)
     assert final["prompt_kind"] == "final_silence"
-    assert value.take_newly_coalesced_windows() == [22]
+    assert value.take_newly_coalesced_windows() == [28, 34, 40, 46, 52, 58, 64, 70, 22]
     assert value.generation == old_generation
 
 
@@ -242,8 +323,8 @@ def test_force_and_final_prompts_are_mutually_exclusive():
         prompt_kind="final_silence",
         force_context={
             "anchor_wall_time": 123.0,
-            "silence_elapsed_ms": 10000,
-            "window_index": 25,
+            "silence_elapsed_ms": 30000,
+            "window_index": 75,
             "skipped_forced_windows": 2,
         },
     )
@@ -438,7 +519,7 @@ def test_speaking_does_not_gate_timer_only_candidates():
         assert runtime.active_dispatch_context["speech_turn_id"] == "turn-a"
         await _finish_blocking_request(runtime, provider)
 
-        runtime.scheduler.arm(0.39, turn_id="turn-a")
+        runtime.scheduler.arm(-19.61, turn_id="turn-a")
         await runtime._on_heartbeat(10.4)
         await asyncio.sleep(0)
         assert provider.calls == 2

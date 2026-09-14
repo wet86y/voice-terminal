@@ -23,6 +23,8 @@ SERVICE_READY_STATES = {"READY", "RUNNING", "STREAMING", "CONNECTED"}
 class RuntimeState:
     state: TerminalState = TerminalState.STARTING
     listening: bool = False
+    wake_always_on: bool = False
+    input_owner: str = "none"
     agent: dict[str, Any] = field(default_factory=dict)
     services: dict[str, str] = field(
         default_factory=lambda: {
@@ -103,6 +105,10 @@ class RuntimeState:
             and all(
                 self.services.get(name) in SERVICE_READY_STATES
                 or (name == "kws" and self.services.get(name) == "DISABLED")
+                or (name == "kws" and self.wake_always_on
+                    and self.services.get(name) == "ERROR")
+                or (name == "asr" and self.wake_always_on
+                    and self.services.get(name) == "ERROR")
                 for name in required
             )
         )
@@ -145,6 +151,8 @@ class RuntimeState:
             "state": self.state.value,
             "listening": self.listening,
             "can_start": self.can_start,
+            "wake_always_on": self.wake_always_on,
+            "input_owner": self.input_owner,
             "services": dict(self.services),
             "current": dict(self.current),
             "latency": {

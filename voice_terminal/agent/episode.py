@@ -267,6 +267,10 @@ FINAL_SILENCE_PROMPT = """系统即将进入静默状态。
 需要说话时输出合法的 speak 状态和非空文本；无需说话时输出合法的 wait 状态和空文本。
 不得虚构新的用户输入或工具结果。actions 必须为 []；不得请求 request_thinking。"""
 
+KWS_WAKE_PROMPT = """本次请求由本地唤醒词命中触发，不代表用户已经提出了任务。
+必须返回 speak 和简短、自然、非空的确认语，例如“我在”“我听着”或“请说”。
+不要假设用户意图，不要补充任务内容。actions 必须为 []；禁止 thinking、shadow、工具和搜索。"""
+
 
 class AgentDecisionScheduler:
     """The sole scheduler and its fixed 400 ms local heartbeat.
@@ -276,8 +280,8 @@ class AgentDecisionScheduler:
     state and never creates an asyncio task of its own.
     """
 
-    FORCE_WINDOWS = (3, 6, 9, 16, 22)
-    FINAL_WINDOW = 25
+    FORCE_WINDOWS = (3, 6, 9, 16, 22, 28, 34, 40, 46, 52, 58, 64, 70)
+    FINAL_WINDOW = 75
     SLOW_STAGE_WINDOW = 10
     TTS_EVENTS = frozenset({
         "TTS_STARTED", "TTS_COMPLETED", "TTS_CANCELLED", "TTS_REPLACED",
@@ -658,7 +662,7 @@ class AgentEpisodeRuntime:
 
     def __init__(self, provider, registry, output, emit, *, conversation: ConversationRuntime, ledger,
                  options=None, tools_enabled=True, reasoning_mode="balanced", persona_config=None,
-                 shadow_waker=None):
+                 shadow_waker=None, on_final_system_check_settled=None):
         self.provider, self.registry, self.output, self.emit = provider, registry, output, emit
         self.options = options or AgentOptions()
         self.tools_enabled = tools_enabled
@@ -666,6 +670,7 @@ class AgentEpisodeRuntime:
         self.conversation = conversation
         self.ledger = ledger
         self.shadow_waker = shadow_waker
+        self.on_final_system_check_settled = on_final_system_check_settled
         self.context_projector = LLMContextProjector()
         self.persona_loader = PersonaDocumentLoader(persona_config) if persona_config is not None else None
         self.persona_documents = PersonaDocuments()
@@ -724,6 +729,9 @@ class AgentEpisodeRuntime:
         self._system_check_turn_ids: set[str] = set()
         self._system_check_output_turn_ids: set[str] = set()
         self._system_check_speeches: dict[str, dict] = {}
+        self._immediate_system_check: dict | None = None
+        self._final_system_checks: dict[str, dict] = {}
+        self._settled_final_system_checks: set[str] = set()
         self.closed = False
         self.request_count = 0
         self.active_request_count = 0
@@ -1228,6 +1236,36 @@ class AgentEpisodeRuntime:
         await self.log("EPISODE_STARTED")
         return self.episode_id
 
+    async def schedule_system_check(self, prompt_kind: str, source_id: str,
+                                    arm_silence: bool = False, **context) -> int | None:
+        """Queue one system-owned check without fabricating a user input."""
+
+        if prompt_kind != "kws_wake" or not isinstance(source_id, str) or not source_id:
+            raise ValueError("unsupported system check")
+        if await self.ensure_episode() is None:
+            return None
+        generation = self.scheduler.generation
+        if arm_silence:
+            generation = self.scheduler.arm(
+                time.monotonic(), wall_time=time.time(), turn_id=source_id,
+            )
+        candidate = {
+            "dispatch_kind": "system_check",
+            "prompt_kind": prompt_kind,
+            "source_id": source_id,
+            "anchor_turn_id": source_id,
+            "anchor_wall_time": self.scheduler.anchor_wall_time,
+            "silence_elapsed_ms": 0,
+            "window_index": 0,
+            "generation": generation,
+            **context,
+        }
+        current = self._immediate_system_check
+        if current is None or int(current.get("generation") or 0) <= generation:
+            self._immediate_system_check = candidate
+        self._ensure_runner()
+        return generation
+
     def gate(self, identity):
         if not self.scope_active(identity):
             return "scope_closed"
@@ -1269,11 +1307,14 @@ class AgentEpisodeRuntime:
         if not speech_id or not self._is_system_check_context(context):
             return
         system_check_id = str(context["system_check_id"])
-        self._system_check_speeches[speech_id] = {
+        speech_context = {
             "system_check_id": system_check_id,
             "speech_turn_id": context.get("speech_turn_id"),
             "scheduler_generation": context.get("generation"),
         }
+        if context.get("prompt_kind") is not None:
+            speech_context["prompt_kind"] = context.get("prompt_kind")
+        self._system_check_speeches[speech_id] = speech_context
         self._system_check_output_turn_ids.add(system_check_id)
 
     async def _begin_speech(self, identity, input_id, emotion, *, replace_current=False):
@@ -1957,7 +1998,11 @@ class AgentEpisodeRuntime:
         system_check_id = None
         if candidate is not None:
             system_check_id = f"system-check-{uuid4().hex}"
-            source_turn_id = candidate.get("speech_turn_id") or candidate.get("anchor_turn_id")
+            source_turn_id = (
+                candidate.get("source_id")
+                or candidate.get("speech_turn_id")
+                or candidate.get("anchor_turn_id")
+            )
             if not source_turn_id:
                 return False
             dispatch_context["system_check_id"] = system_check_id
@@ -1968,6 +2013,8 @@ class AgentEpisodeRuntime:
             dispatch_context["user_speech_epoch"] = self._user_speech_epoch
             dispatch_context["user_speaking_at_dispatch"] = self.user_speaking is True
             self._system_check_turn_ids.add(system_check_id)
+            if prompt_kind == "final_silence":
+                self._final_system_checks[system_check_id] = dict(dispatch_context)
         elif recovery_signal and recovery_signal.system_check_id:
             system_check_id = recovery_signal.system_check_id
             source_turn_id = (
@@ -1982,6 +2029,8 @@ class AgentEpisodeRuntime:
                 )
             self._system_check_turn_ids.add(system_check_id)
         reasoning_effort = "low" if self.reasoning_mode == "deep" else "none"
+        if prompt_kind == "kws_wake":
+            reasoning_effort = "none"
         if "THINKING_READY" in kinds and self._thinking_lease_turn == source_turn_id:
             reasoning_effort = "low"
             self._thinking_lease_turn = None
@@ -2068,6 +2117,7 @@ class AgentEpisodeRuntime:
             self._identity_turns.pop(identity, None)
             if system_check_id:
                 self._system_check_turn_ids.discard(system_check_id)
+                self._final_system_checks.pop(system_check_id, None)
             self.active_request_identity = None
             self.active_request_source_turn_id = None
             self.active_request_kinds = set()
@@ -2084,6 +2134,7 @@ class AgentEpisodeRuntime:
             self._identity_turns.pop(identity, None)
             if system_check_id:
                 self._system_check_turn_ids.discard(system_check_id)
+                self._final_system_checks.pop(system_check_id, None)
             self.active_request_identity = None
             self.active_request_source_turn_id = None
             self.active_request_kinds = set()
@@ -2091,7 +2142,7 @@ class AgentEpisodeRuntime:
             self.active_dispatch_context = None
             self.state = "WAITING_EVENT" if self.episode_id else "IDLE"
             return False
-        if candidate is not None:
+        if candidate is not None and prompt_kind in {"forced_poll", "final_silence"}:
             self.scheduler.mark_forced_dispatched(candidate)
         self.active_request = asyncio.create_task(
             self._step(identity, kinds, recovery=recovery,
@@ -2225,6 +2276,18 @@ class AgentEpisodeRuntime:
                            window_index=self.scheduler.FINAL_WINDOW,
                            reason="final_window_crossed",
                            scheduler_generation=self.scheduler.generation)
+        immediate = self._immediate_system_check
+        if immediate is not None:
+            if int(immediate.get("generation") or 0) != self.scheduler.generation:
+                self._immediate_system_check = None
+            elif self.active_request is not None or not self._dispatch_allowed():
+                return
+            elif await self._start_dispatch({"SYSTEM_CHECK"}, candidate=immediate):
+                if self._immediate_system_check is immediate:
+                    self._immediate_system_check = None
+                return
+            else:
+                return
         meaningful = self._meaningful_pending()
         if meaningful:
             if not self.scheduler.normal_due(meaningful, at_heartbeat=True):
@@ -2289,6 +2352,20 @@ class AgentEpisodeRuntime:
                     candidate, "superseded_by_new_generation", reason="dispatch_race",
                 )
 
+    async def _settle_final_system_check(self, system_check_id: str) -> None:
+        context = self._final_system_checks.pop(system_check_id, None)
+        if context is None or system_check_id in self._settled_final_system_checks:
+            return
+        self._settled_final_system_checks.add(system_check_id)
+        if int(context.get("generation") or 0) != self.scheduler.generation:
+            return
+        callback = self.on_final_system_check_settled
+        if not callable(callback):
+            return
+        result = callback(dict(context))
+        if asyncio.iscoroutine(result):
+            await result
+
     async def _finish_active_request(self, request):
         """Consume a completed request task without blocking the heartbeat."""
 
@@ -2319,7 +2396,14 @@ class AgentEpisodeRuntime:
             if self.closed:
                 raise
         except Exception as exc:
-            retryable = bool(getattr(exc, "retryable", False))
+            # Timer-owned system checks are terminal at the transport layer.
+            # Retrying one as ordinary mailbox work could outlive the final
+            # settlement and speak after the controller has returned to KWS.
+            terminal_system_check = bool(
+                system_check_id and isinstance(dispatch_context, dict)
+                and dispatch_context.get("prompt_kind") in {"final_silence", "kws_wake"}
+            )
+            retryable = bool(getattr(exc, "retryable", False)) and not terminal_system_check
             await self.log(
                 "AGENT_ERROR", error=str(exc)[:300],
                 error_layer=getattr(exc, "error_layer", "runtime"),
@@ -2395,6 +2479,7 @@ class AgentEpisodeRuntime:
                 # keeping the ID until then prevents a cancellation race from
                 # losing owner_scope=system_check.
                 self._system_check_turn_ids.discard(system_check_id)
+                await self._settle_final_system_check(system_check_id)
         self.state = "WAITING_EVENT" if self.episode_id else "IDLE"
         await self.emit("agent.episode", self.snapshot(include_history=False))
 
@@ -2884,6 +2969,11 @@ class AgentEpisodeRuntime:
                 + json.dumps(details, ensure_ascii=False),
                 context_kind=prompt_kind,
             ))
+        elif prompt_kind == "kws_wake":
+            messages.append(ContextFrame.make(
+                ContextLane.REQUEST_TAIL, "system", KWS_WAKE_PROMPT,
+                context_kind=prompt_kind,
+            ))
         messages = consolidate_request_tail(messages)
         self._guard_context_contract(messages)
         self._update_context_metrics(messages)
@@ -3059,6 +3149,10 @@ class AgentEpisodeRuntime:
                                   *, dispatch_context=None):
         """Commit one fully validated V0.6 decision to the local transaction."""
         decision = envelope.speak
+        if (isinstance(dispatch_context, dict)
+                and dispatch_context.get("prompt_kind") == "kws_wake"
+                and (decision.state != "speak" or not decision.text.strip() or envelope.actions)):
+            raise ProtocolError("kws_wake requires nonempty speak and actions=[]")
         snapshot = getattr(self.output, "speak_snapshot", {})
         queue_status = snapshot.get("queue_status", "empty") if isinstance(snapshot, dict) else "empty"
         active_same_turn = bool(
@@ -4055,6 +4149,7 @@ class AgentEpisodeRuntime:
             system_check_id = str(record.get("system_check_id") or "")
             self._system_check_turn_ids.discard(system_check_id)
             self._system_check_output_turn_ids.discard(system_check_id)
+            await self._settle_final_system_check(system_check_id)
 
     async def end(self, reason):
         old = self.episode_id
@@ -4103,9 +4198,12 @@ class AgentEpisodeRuntime:
         if old:
             self.registry.cancel_turn(old)
         self.pending.clear()
+        self._immediate_system_check = None
         self._system_check_speeches.clear()
         self._system_check_turn_ids.clear()
         self._system_check_output_turn_ids.clear()
+        self._final_system_checks.clear()
+        self._settled_final_system_checks.clear()
         await self.log("EPISODE_ENDED", reason=reason)
         self.episode_id = None
         self.persona_documents = PersonaDocuments()

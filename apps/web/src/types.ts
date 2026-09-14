@@ -161,6 +161,8 @@ export interface RuntimeSnapshotPayload {
   state: TerminalState
   listening: boolean
   can_start: boolean
+  wake_always_on?: boolean
+  input_owner?: 'none' | 'kws' | 'asr'
   reasoning_mode?: ReasoningMode
   services: ServiceStatuses
   current: CurrentTurnSnapshot

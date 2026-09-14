@@ -98,9 +98,12 @@ class KwsDetector:
                 result = str(detected)
                 self._spotter.reset_stream(self._stream)
                 break
-        if result and self.keyword_label.casefold() in result.casefold():
+        if result and self.keyword_label.casefold() == result.casefold():
             return self.keyword_label
-        return result
+        # A keyword file may contain diagnostic or future alternate labels.
+        # This detector represents one configured wake word, so never turn a
+        # different result into a truthy wake signal for its caller.
+        return None
 
     def reset(self) -> None:
         self._spotter.reset_stream(self._stream)

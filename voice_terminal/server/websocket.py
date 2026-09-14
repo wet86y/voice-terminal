@@ -18,6 +18,7 @@ from ..core.event_bus import EventBus
 from ..core.events import VoiceEvent, event
 from ..core.state import RuntimeState, TerminalState
 from ..kws.detector import KwsDetector, KwsError
+from ..kws.service import KwsWorker
 from ..providers.deepseek import DeepSeekClient
 from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
@@ -52,7 +53,7 @@ class SessionRuntime:
         self.history = SessionLedger(limit=10)
         self.startup_errors: list[str] = []
         self.capture: AudioCapture | None = None
-        self.kws: KwsDetector | None = None
+        self.kws: KwsWorker | None = None
         self.vad: FsmnVadDetector | None = None
         self.asr: AsrWorkerClient | None = None
         self.llm: DeepSeekClient | None = None
@@ -79,6 +80,22 @@ class SessionRuntime:
         self._session_lock = asyncio.Lock()
         self.build_info: dict[str, Any] = {}
         self.reasoning_mode = config.llm.reasoning_mode
+        self.state.wake_always_on = bool(config.wake.enabled and config.wake.always_on)
+
+    def _build_kws_worker(self) -> KwsWorker:
+        detector = KwsDetector(
+            model_dir=self.config.kws_dir,
+            keywords_file=self.config.kws_keywords_file,
+            keyword_label=self.config.wake.keyword_label,
+            threshold=self.config.wake.threshold,
+            keywords_score=self.config.wake.keywords_score,
+            num_trailing_blanks=self.config.wake.num_trailing_blanks,
+            provider=self.config.wake.device,
+            sample_rate=self.config.audio.sample_rate,
+        )
+        worker = KwsWorker(detector)
+        worker.start()
+        return worker
 
     def _record_error(self, service: str, message: str, *, status_service: str | None = None) -> None:
         # Keep the public service map compatible while preserving the actual
@@ -135,16 +152,7 @@ class SessionRuntime:
 
         if self.config.wake.enabled:
             try:
-                self.kws = KwsDetector(
-                    model_dir=self.config.kws_dir,
-                    keywords_file=self.config.kws_keywords_file,
-                    keyword_label=self.config.wake.keyword_label,
-                    threshold=self.config.wake.threshold,
-                    keywords_score=self.config.wake.keywords_score,
-                    num_trailing_blanks=self.config.wake.num_trailing_blanks,
-                    provider=self.config.wake.device,
-                    sample_rate=self.config.audio.sample_rate,
-                )
+                self.kws = self._build_kws_worker()
                 self.state.set_service("kws", "READY")
             except Exception as exc:
                 self._record_error("kws", str(exc))
@@ -315,6 +323,7 @@ class SessionRuntime:
             tts=self.tts,
             player=self.player,
             wake_enabled=self.config.wake.enabled,
+            wake_always_on=self.config.wake.always_on,
             wake_keyword=self.config.wake.keyword,
             wake_preroll_ms=self.config.audio.wake_preroll_ms,
             vad_min_speech_ms=self.config.vad.min_speech_ms,
@@ -363,6 +372,24 @@ class SessionRuntime:
             if self.controller is None:
                 await self.bus.publish(event("error", code="RUNTIME_NOT_INITIALIZED", message="Voice Runtime 尚未初始化。", recoverable=False))
                 return
+            if self.state.wake_always_on and (
+                self.kws is None or self.kws.error is not None or not self.kws.running
+            ):
+                if self.kws is not None:
+                    self.kws.close()
+                try:
+                    self.kws = self._build_kws_worker()
+                    self.controller.kws = self.kws
+                    self.state.set_service("kws", "READY")
+                except Exception as exc:
+                    self.kws = None
+                    self.controller.kws = None
+                    self._record_error("kws", str(exc))
+                    await self.bus.publish(event(
+                        "error", code="KWS_WORKER_FAILED", message=str(exc), recoverable=True,
+                    ))
+                    await self.bus.publish(self.snapshot())
+                    return
             await self.controller.start_listening()
             pending_buffer = getattr(self, "_shadow_pending", None)
             pending = pending_buffer.drain() if pending_buffer is not None else []
@@ -410,6 +437,8 @@ class SessionRuntime:
     async def close(self) -> None:
         if self.controller is not None:
             await self.controller.close()
+        if self.kws is not None:
+            self.kws.close()
         shadow_component = getattr(self, "shadow_component", None)
         if shadow_component is not None:
             await shadow_component.close()
@@ -474,6 +503,8 @@ class SessionRuntime:
             "services": dict(self.state.services),
             "startup_errors": list(self.startup_errors),
             "wake_enabled": self.config.wake.enabled,
+            "wake_always_on": self.state.wake_always_on,
+            "input_owner": self.state.input_owner,
             "wake_keyword": self.config.wake.keyword,
             "runtime": dict(self.build_info),
         }

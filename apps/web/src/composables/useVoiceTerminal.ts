@@ -179,6 +179,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const state = ref<TerminalState>('STARTING')
   const listening = ref(false)
   const canStart = ref(false)
+  const wakeAlwaysOn = ref(false)
+  const inputOwner = ref<'none' | 'kws' | 'asr'>('none')
   const reasoningMode = ref<ReasoningMode>('balanced')
   const currentTurnId = ref<string | null>(null)
   const current = reactive<CurrentTurnSnapshot>(createEmptyCurrentTurn())
@@ -521,6 +523,10 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (isTerminalState(payload.state)) state.value = payload.state
     if (typeof payload.listening === 'boolean') listening.value = payload.listening
     if (typeof payload.can_start === 'boolean') canStart.value = payload.can_start
+    if (typeof payload.wake_always_on === 'boolean') wakeAlwaysOn.value = payload.wake_always_on
+    if (payload.input_owner === 'none' || payload.input_owner === 'kws' || payload.input_owner === 'asr') {
+      inputOwner.value = payload.input_owner
+    }
     if (payload.reasoning_mode === 'fast' || payload.reasoning_mode === 'balanced' || payload.reasoning_mode === 'deep') reasoningMode.value = payload.reasoning_mode
     applyServices(payload.services)
     const hasCurrentTurnId = isRecord(payload.current)
@@ -800,6 +806,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     state.value = 'STARTING'
     listening.value = false
     canStart.value = false
+    wakeAlwaysOn.value = false
+    inputOwner.value = 'none'
     lastSequence.value = null
 
     try {
@@ -879,6 +887,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     state,
     listening,
     canStart,
+    wakeAlwaysOn,
+    inputOwner,
     reasoningMode,
     currentTurnId,
     current,
