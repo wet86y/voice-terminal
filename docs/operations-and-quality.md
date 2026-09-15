@@ -40,6 +40,41 @@ Context Cache。相邻真实请求必须检查 `cached_tokens` 随重叠前缀�
 不可观测，不得解释为零命中。Observer 只在相同 committed prefix 尾部追加固定 prompt；动态时间、
 run ID、revision、nonce 和服务状态不得污染固定前缀。
 
+## Web Product UI 页面切换验收
+
+真实产品入口是 `/`；`/ui-demo.html` 是不连接后端的旧版 UX Prototype。需要检查真实长会话
+布局时使用开发回放：
+
+```text
+http://127.0.0.1:5173/?replay=voice-shadow
+```
+
+在外部 Edge 中至少连续执行 `工作台 → 设置 → 工作台 → 设置`，确认两条方向都可用，设置表单
+状态不因往返丢失，且页面整体高度不随 Shadow 时间线或会话记录增长。工作台左侧 Shadow、
+中间运行时和右侧实时会话应分别在自己的内容区域滚动。
+
+页面切换的实现约束：
+
+- 导航只更新 Product 页面 ref；不在导航 handler 中请求 snapshot、重连 WebSocket 或等待 API；
+- 两个一级页面使用 `v-show` 保留组件状态；不能恢复成 `v-if/v-else` 的销毁/重建流程；
+- Product 大面板不得重新启用大面积 `backdrop-filter`；持续 orb/halo/状态点动画不得恢复；
+- 不以额外的 `pointerdown`/`mousedown` 导航链作为性能修复。若真实 Edge 与侧边浏览器行为不同，
+  对外部 Edge 本身的 Pointer、renderer 与 GPU 时间线做一次 Trace；点击事件是否到达页面、页面
+  状态是否已变更、画面是否完成呈现必须分开判断；
+- 通过浏览器或开发工具观察到页面状态已在毫秒级变更，但画面仍停顿时，应优先定位浏览器
+  compositor/GPU 或缩放环境，不要把延迟误报成后端 LLM/Voice Server latency。
+
+前端静态门槛：
+
+```powershell
+npm run typecheck --workspace @voice-terminal/web
+npm run build --workspace @voice-terminal/web
+git diff --check
+```
+
+长会话回放验收还应确认反复切换后没有 Detached Script、事件监听器持续增长或隐藏页面继续
+运行无限动画。回放只读，不得因为验收点击向后端发送 reset、配置保存或模型应用请求。
+
 ## 完整服务启动验收
 
 `scripts/start.ps1` 是本机整套服务默认入口，依次准备 Analysis Worker、ASR Worker、Web 前端和

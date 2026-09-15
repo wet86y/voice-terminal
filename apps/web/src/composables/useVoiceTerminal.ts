@@ -25,6 +25,7 @@ import type {
   TurnCompletedPayload,
   InputRecord,
   ReasoningMode,
+  VoiceReplayFixture,
 } from '../types'
 import { TERMINAL_STATES } from '../types'
 
@@ -481,6 +482,47 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     llmContextTurnId.value = null
     lastServerTimestamp.value = null
     shadowProduct.value = createEmptyShadowProduct()
+  }
+
+  function injectReplay(fixture: VoiceReplayFixture) {
+    // This is deliberately a local development hook.  It fills the same
+    // reactive stores used by the WebSocket protocol so the Product UI can be
+    // inspected with a recorded session without changing the backend.
+    connection.value = 'connected'
+    connectionError.value = ''
+    state.value = fixture.state
+    listening.value = fixture.listening
+    canStart.value = fixture.canStart ?? true
+    wakeAlwaysOn.value = fixture.wakeAlwaysOn ?? false
+    inputOwner.value = fixture.inputOwner ?? 'none'
+    reasoningMode.value = fixture.reasoningMode ?? 'balanced'
+    currentTurnId.value = fixture.current.turn_id ?? null
+    Object.assign(current, createEmptyCurrentTurn(), fixture.current)
+    Object.assign(currentLatency, createEmptyLatency(), fixture.currentLatency || {})
+    currentLatencyComplete.value = fixture.currentLatencyComplete ?? true
+    Object.assign(services, createOfflineStatuses(), fixture.services || {})
+    recentTurns.value = fixture.recentInputs.map(item => ({ ...item }))
+    shadowProduct.value = {
+      ...fixture.shadow,
+      timeline: fixture.shadow.timeline.map(item => ({ ...item })),
+      context: { ...(fixture.shadow.context || {}) },
+      provider: { ...(fixture.shadow.provider || {}) },
+    }
+    agentEpisode.value = null
+    agentTrace.value = []
+    speechOutputs.value = []
+    playbackQueue.value = []
+    lastPlayback.value = null
+    speechProgress.value = null
+    speakPreview.value = null
+    terminalPlaybackKeys.clear()
+    retiredEpisodes.clear()
+    if (fixture.agent) applyAgent(fixture.agent, true)
+    if (fixture.agentTrace) agentTrace.value = fixture.agentTrace.map(item => ({ ...item }))
+    if (fixture.speechOutputs) speechOutputs.value = fixture.speechOutputs.map(item => ({ ...item }))
+    if (fixture.playbackQueue) playbackQueue.value = fixture.playbackQueue.map(item => ({ ...item }))
+    if (fixture.lastPlayback) lastPlayback.value = { ...fixture.lastPlayback }
+    reasoning.value = fixture.reasoning || ''
   }
 
   function adoptTurn(turnId: string | null) {
@@ -984,6 +1026,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     lastSequence,
     webSocketUrl,
     connect,
+    injectReplay,
     toggleListening,
     resetSession,
     setReasoningMode,

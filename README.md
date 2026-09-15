@@ -108,6 +108,23 @@ shadow_agent:
 `http://127.0.0.1:5173/` 可访问。仅调试后端时使用 `-NoWeb`。真实运行需配置
 `DEEPSEEK_API_KEY`、`MINIMAX_API_KEY`，OpenCode Go 调试另需 `OPENCODE_GO_API_KEY`。
 
+### Web 产品页与日志回放
+
+`/` 是当前接入 Product API 和 Voice Server 的真实产品页，展示工作台、实时会话、Shadow
+摘要、延迟与设置。开发环境可以使用下面的只读日志回放入口检查长会话布局和拟真对话：
+
+```text
+http://127.0.0.1:5173/?replay=voice-shadow
+```
+
+回放 fixture 来源于本地 `logs/voice-server-llm-context.jsonl` 与 `logs/voice-server.log.1`，
+只保留产品允许展示的会话投影，不包含 prompt、工具参数、原始 provider payload、API key 或
+内部 trace。回放仅在 Vite development 环境启用，带有只读提示，不向后端提交操作；移除
+`replay` 参数即可恢复真实运行时页面。
+
+`/ui-demo.html` 仍是隔离的 UX Prototype P0.1，只使用固定模拟数据，不建立 WebSocket，也不
+读取或写入真实设置。它用于对照旧版视觉原型，不能作为真实运行时或页面切换性能的验收入口。
+
 ### 独立验证 KWS
 
 KWS 模型可在不启动 VAD、ASR、LLM、TTS、Web 前端或 Voice Server 的情况下单独验证。它会使用

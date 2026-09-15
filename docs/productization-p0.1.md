@@ -122,6 +122,37 @@ P0.1 的模型设置采用固定三段结构：首先是 API 供应商连接与�
 
 P0.1 用于确认三列工作台、对话信息层级、Shadow 展示和设置页信息架构。视觉与交互稳定后，P0.2 将以替换模拟适配器的方式接入真实数据，而不是推倒重建产品组件。
 
+## Product UI 当前实现与切换性能
+
+当前迁移中的真实 Product UI 由根入口 `/` 提供，使用 `ProductApp.vue` 和
+`useProductAdapter.ts` 接入 Product API、Voice Server WebSocket 与设置 API。它与上面的
+`/ui-demo.html` 是两个明确隔离的入口：前者用于真实运行时和开发回放，后者继续作为不连接
+后端的视觉原型。
+
+开发回放入口为：
+
+```text
+/?replay=voice-shadow
+```
+
+它从本地旧日志提取一组 Shadow Agent 与语音交互的公开产品投影，便于检查长会话、Shadow
+时间线、上下文/缓存指标和左右消息布局。回放只读，不把日志中的 prompt、工具参数、原始
+provider 数据或凭据带入页面；它不是生产数据源，也不会改变后端状态。
+
+Product 页的导航性能契约如下：
+
+- 工作台和设置页保留组件实例，用 `v-show` 隐藏未激活页面，避免导航时重复挂载大型设置表单；
+- 桌面端两个页面使用固定视口层，页面整体高度保持在浏览器视口内，长内容只在对应面板内滚动；
+- Product 大面板使用实体渐变背景，不使用大面积 `backdrop-filter`；
+- 运行态语音球、halo、Shadow 状态点和播报点使用静态状态表达，不使用持续的 transform 或
+  box-shadow 动画，避免外部 Edge 在切换时重复合成大型图层；
+- 导航的唯一状态变更仍是普通 `click` 更新页面 ref，不通过 `pointerdown` 另建一套兜底流程，
+  也不在点击时发请求或等待后端；
+- 以上规则只作用于 `.product-shell`，不改变旧版 UX Prototype 的视觉动画。
+
+切换验收至少覆盖外部 Edge 中 `工作台 → 设置 → 工作台` 的连续往返，并检查设置页和工作台
+均可再次进入；若出现卡顿，优先记录浏览器 Performance/GPU Trace，不要先添加第二套导航事件。
+
 ## 后续里程碑
 
 - **P0.2**：定义和实现统一 Voice App API、`ModelRegistryService` 和 `CredentialVault`；接入真实会话状态、设置、延迟、Shadow 简报、音频电平和受控模型管理。
