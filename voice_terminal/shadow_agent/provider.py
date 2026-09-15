@@ -68,7 +68,9 @@ class DeepSeekResponsesShadowProvider:
             "input": list(input_items),
             "tools": list(tools),
             "tool_choice": "auto" if tools else "none",
-            "reasoning": {"effort": reasoning_effort},
+            "reasoning": {
+                "effort": "none" if reasoning_effort == "off" else reasoning_effort,
+            },
             "stream": True,
         }
         if text_schema is not None:

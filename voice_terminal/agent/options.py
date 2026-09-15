@@ -8,6 +8,9 @@ class AgentOptions:
     trace_limit: int = 200
     output_limit: int = 32
     scheduler_tick_ms: int = 400
+    # Final silence is the long background-check boundary.  It is distinct
+    # from Smart Turn's short phrase-end silence in InputOptions.
+    final_silence_ms: int = 30000
     voice_activation_ms: int = 200
     text_debounce_ms: int = 180
     replace_grace_ms: int = 1000

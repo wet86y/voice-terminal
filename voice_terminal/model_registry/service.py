@@ -21,7 +21,12 @@ MODEL_CAPABILITIES = {
     "local_analysis_endpoint", "local_analysis_refine",
 }
 LOCAL_CAPABILITIES = MODEL_CAPABILITIES - {"llm", "tts"}
-REGISTRY_SCHEMA_VERSION = 1
+REGISTRY_SCHEMA_VERSION = 2
+SUPPORTED_REASONING_EFFORTS = ("off", "low", "medium", "high", "max")
+_PUBLIC_SECRET_KEYS = frozenset({
+    "api_key", "secret", "credential", "credential_ref", "secret_ref",
+    "password", "access_token", "refresh_token",
+})
 
 
 class ModelRegistryError(ValueError):
@@ -52,6 +57,22 @@ def _safe_url(value: Any) -> str:
     return result.rstrip("/")
 
 
+def _public_metadata(value: Any) -> Any:
+    """Recursively remove credential-bearing metadata from registry output."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: _public_metadata(item)
+            for key, item in value.items()
+            if str(key).lower() not in _PUBLIC_SECRET_KEYS
+        }
+    if isinstance(value, list):
+        return [_public_metadata(item) for item in value]
+    if isinstance(value, tuple):
+        return [_public_metadata(item) for item in value]
+    return value
+
+
 class ModelRegistryService:
     """Secret-safe registry persistence, scanning and provider verification.
 
@@ -72,6 +93,7 @@ class ModelRegistryService:
         self.vault = vault
         self.apply_callback = apply_callback
         self._lock = asyncio.Lock()
+        self._migration_dirty = False
 
     def _empty(self) -> dict[str, Any]:
         return {
@@ -80,6 +102,7 @@ class ModelRegistryService:
             "assignments": {
                 "voice_llm_model_id": None, "shadow_llm_model_id": None,
                 "status_llm_model_id": None, "tts_profile_id": None,
+                "policy_mode": "model",
                 "role_settings": {
                     "voice": {"reasoning_effort": "low", "max_context_tokens": 128000},
                     "shadow": {"reasoning_effort": "high", "max_context_tokens": 256000},
@@ -96,31 +119,196 @@ class ModelRegistryService:
             value = json.loads(self.registry_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ModelRegistryError(f"模型注册表无法读取：{type(exc).__name__}。") from exc
-        if not isinstance(value, dict) or value.get("schema_version") != REGISTRY_SCHEMA_VERSION:
+        if not isinstance(value, dict) or value.get("schema_version") not in {1, REGISTRY_SCHEMA_VERSION}:
             raise ModelRegistryError("模型注册表版本不受支持。")
+        source_version = int(value.get("schema_version", REGISTRY_SCHEMA_VERSION))
+        migrated = source_version != REGISTRY_SCHEMA_VERSION
         template = self._empty()
         for key, default in template.items():
             if key not in value or not isinstance(value[key], type(default)):
-                value[key] = default
+                value[key] = deepcopy(default)
+                migrated = True
         # Schema v1 predates the third independent LLM role.  It is safe to
         # upgrade shape in memory because no secret or model entry changes.
         if not isinstance(value["assignments"], dict):
             value["assignments"] = deepcopy(template["assignments"])
+            migrated = True
         else:
+            had_policy_mode = "policy_mode" in value["assignments"]
             for key, default in template["assignments"].items():
                 if key not in value["assignments"]:
                     value["assignments"][key] = deepcopy(default)
+                    migrated = True
             role_settings = value["assignments"].get("role_settings")
             if not isinstance(role_settings, dict):
                 value["assignments"]["role_settings"] = deepcopy(template["assignments"]["role_settings"])
+                migrated = True
             else:
                 for role, defaults in template["assignments"]["role_settings"].items():
                     if not isinstance(role_settings.get(role), dict):
                         role_settings[role] = deepcopy(defaults)
+                        migrated = True
                     else:
                         for key, default in defaults.items():
-                            role_settings[role].setdefault(key, default)
+                            if key not in role_settings[role]:
+                                role_settings[role][key] = default
+                                migrated = True
+            if not had_policy_mode:
+                value["assignments"]["policy_mode"] = "legacy" if source_version == 1 else "model"
+                migrated = True
+        value["schema_version"] = REGISTRY_SCHEMA_VERSION
+        migrated = self._normalize_model_policies(value) or migrated
+        migrated = self._canonicalize_product_models(value) or migrated
+        self._migration_dirty = migrated
+        if migrated:
+            self._write(value)
         return value
+
+    def _canonicalize_product_models(self, registry: dict[str, Any]) -> bool:
+        """Merge duplicate product-managed entries by stable model identity.
+
+        Runtime-imported role projections intentionally stay separate for
+        compatibility with the diagnostic registry.  Product-managed API
+        entries, which are the v2 user-editable pool, use one canonical ID per
+        provider/model/capability and carry one shared policy.
+        """
+
+        groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for item in registry.get("models", []):
+            if not isinstance(item, dict) or item.get("origin") != "product_managed":
+                continue
+            key = (
+                str(item.get("provider_id") or ""),
+                str(item.get("model_id") or ""),
+                str(item.get("capability") or ""),
+            )
+            if all(key) and key[2] in {"llm", "tts"}:
+                groups.setdefault(key, []).append(item)
+        changed = False
+        aliases: dict[str, str] = {}
+        remove_ids: set[str] = set()
+        for (provider_id, model_id, capability), entries in groups.items():
+            canonical_id = _stable_id("model", f"{provider_id}/{model_id}/{capability}")
+            primary = entries[0]
+            if primary.get("id") != canonical_id:
+                aliases[str(primary.get("id"))] = canonical_id
+                primary["id"] = canonical_id
+                changed = True
+            if capability == "llm":
+                contexts: list[int] = []
+                allowed: list[str] = []
+                for item in entries:
+                    try:
+                        contexts.append(int(item.get("max_context_tokens")))
+                    except (TypeError, ValueError):
+                        pass
+                    for effort in item.get("allowed_reasoning") or []:
+                        normalized = "off" if str(effort).lower() == "none" else str(effort).lower()
+                        if normalized in SUPPORTED_REASONING_EFFORTS and normalized not in allowed:
+                            allowed.append(normalized)
+                if contexts:
+                    primary["max_context_tokens"] = max(contexts)
+                primary["allowed_reasoning"] = [
+                    effort for effort in SUPPORTED_REASONING_EFFORTS if effort in allowed
+                ] or ["off", "low"]
+            for duplicate in entries[1:]:
+                duplicate_id = str(duplicate.get("id") or "")
+                if duplicate_id:
+                    aliases[duplicate_id] = canonical_id
+                    remove_ids.add(duplicate_id)
+                    changed = True
+        if not changed:
+            return False
+        # A malformed legacy registry may reuse the canonical id for a later
+        # duplicate.  Never remove the primary entry that now carries the
+        # merged policy.
+        remove_ids.discard(_stable_id("model", f"{provider_id}/{model_id}/{capability}"))
+        for assignment_key in (
+            "voice_llm_model_id", "shadow_llm_model_id", "status_llm_model_id",
+        ):
+            current = registry["assignments"].get(assignment_key)
+            if current in aliases:
+                registry["assignments"][assignment_key] = aliases[current]
+        registry["hidden_model_ids"] = [
+            aliases.get(item, item) for item in registry.get("hidden_model_ids", [])
+        ]
+        for profile in registry.get("tts_profiles", []):
+            if isinstance(profile, dict) and profile.get("model_id") in aliases:
+                profile["model_id"] = aliases[profile["model_id"]]
+        registry["models"] = [
+            item for item in registry["models"]
+            if not isinstance(item, dict) or item.get("id") not in remove_ids
+        ]
+        return True
+
+    def _normalize_model_policies(self, registry: dict[str, Any]) -> bool:
+        """Upgrade v1 entries to model-owned policy fields in memory."""
+
+        changed = False
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        legacy = assignments.get("role_settings") if isinstance(assignments.get("role_settings"), dict) else {}
+        role_to_model = {
+            "voice": assignments.get("voice_llm_model_id"),
+            "shadow": assignments.get("shadow_llm_model_id"),
+            "status": assignments.get("status_llm_model_id"),
+        }
+        for item in registry.get("models", []):
+            if not isinstance(item, dict) or item.get("capability") != "llm":
+                continue
+            model_id = item.get("id")
+            assigned_roles = [role for role, assigned in role_to_model.items() if assigned == model_id]
+            role_settings = [legacy.get(role) for role in assigned_roles]
+            contexts = []
+            efforts: list[str] = []
+            for setting in role_settings:
+                if not isinstance(setting, dict):
+                    continue
+                try:
+                    contexts.append(int(setting.get("max_context_tokens")))
+                except (TypeError, ValueError):
+                    pass
+                effort = str(setting.get("reasoning_effort") or "").lower()
+                if effort == "none":
+                    effort = "off"
+                if effort in SUPPORTED_REASONING_EFFORTS:
+                    efforts.append(effort)
+            default_context = 131072
+            if contexts:
+                default_context = max(contexts) if len(contexts) > 1 else contexts[0]
+            raw_context = item.get("max_context_tokens", default_context)
+            try:
+                context = int(raw_context)
+            except (TypeError, ValueError):
+                context = default_context
+            normalized_context = max(1024, min(524288, context))
+            if item.get("max_context_tokens") != normalized_context:
+                changed = True
+            item["max_context_tokens"] = normalized_context
+            raw_efforts = item.get("allowed_reasoning")
+            if isinstance(raw_efforts, list):
+                allowed = [str(value).lower() for value in raw_efforts if str(value).lower() in SUPPORTED_REASONING_EFFORTS]
+            else:
+                allowed = []
+            if not allowed:
+                allowed = list(dict.fromkeys(efforts))
+                if len(assigned_roles) > 1:
+                    allowed.append("off")
+                if "voice" in assigned_roles:
+                    # The main voice product modes need both fast/off and
+                    # balanced/deep low, even when v1 stored only the last
+                    # selected effort.
+                    allowed.extend(("off", "low"))
+                if not allowed:
+                    allowed = ["off", "low"]
+            normalized_allowed = [
+                value for value in SUPPORTED_REASONING_EFFORTS if value in allowed
+            ]
+            if not normalized_allowed:
+                normalized_allowed = ["off"]
+            if item.get("allowed_reasoning") != normalized_allowed:
+                changed = True
+            item["allowed_reasoning"] = normalized_allowed
+        return changed
 
     def _write(self, value: dict[str, Any]) -> None:
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,23 +327,26 @@ class ModelRegistryService:
 
     def _snapshot(self, registry: dict[str, Any]) -> dict[str, Any]:
         hidden = set(registry["hidden_model_ids"])
-        profiles = [deepcopy(item) for item in registry["providers"]]
-        # provider records are intentionally constructed without a secret, but
-        # this guard makes a future accidental field addition non-exportable.
-        for profile in profiles:
-            profile.pop("api_key", None)
-            profile.pop("secret", None)
+        # Registry records are currently constructed without secrets, but the
+        # recursive guard also protects snapshots of older/malformed files and
+        # future metadata fields.  Credential Manager references are omitted
+        # alongside credential contents so the browser only sees state.
+        profiles = [_public_metadata(deepcopy(item)) for item in registry["providers"]]
         models = []
         for item in registry["models"]:
-            public = deepcopy(item)
+            public = _public_metadata(deepcopy(item))
             public["hidden"] = public["id"] in hidden
+            if public.get("capability") == "llm":
+                public.setdefault("max_context_tokens", 131072)
+                public.setdefault("allowed_reasoning", ["off", "low"])
             models.append(public)
         return {
-            "credential_vault": {"available": self.vault.available, "diagnostic": self.vault.diagnostic},
+            "schema_version": REGISTRY_SCHEMA_VERSION,
+            "credential_vault": _public_metadata({"available": self.vault.available, "diagnostic": self.vault.diagnostic}),
             "providers": profiles,
             "models": models,
-            "tts_profiles": deepcopy(registry["tts_profiles"]),
-            "assignments": deepcopy(registry["assignments"]),
+            "tts_profiles": _public_metadata(deepcopy(registry["tts_profiles"])),
+            "assignments": _public_metadata(deepcopy(registry["assignments"])),
         }
 
     async def snapshot(self) -> dict[str, Any]:
@@ -182,9 +373,9 @@ class ModelRegistryService:
             status_provider_id = _stable_id("provider", f"runtime/status/{status.base_url}")
             providers.append({"id": status_provider_id, "name": "状态汇报（现有运行时配置）", "origin": "runtime_config", "protocol": llm.provider, "base_url": status.base_url, "capabilities": ["llm"], "discovery_capability": "inherited_or_models_endpoint", "credential_ref": None, "credential_state": "externally_managed" if bool(self.config.api_key(status.api_key_env)) else "missing", "last_validation": None, "last_validated_at": None})
         models = [
-            {"id": _stable_id("model", f"runtime/voice/{llm.base_url}/{llm.model}"), "name": llm.model, "model_id": llm.model, "provider_id": llm_provider_id, "capability": "llm", "origin": "runtime_config", "verification": "inherited", "health": "unknown", "local_path": None, "fingerprint": None},
-            {"id": _stable_id("model", f"runtime/shadow/{shadow.base_url}/{shadow.model}"), "name": f"Shadow · {shadow.model}", "model_id": shadow.model, "provider_id": shadow_provider_id, "capability": "llm", "origin": "runtime_config", "verification": "inherited", "health": "unknown", "local_path": None, "fingerprint": None},
-            {"id": _stable_id("model", f"runtime/status/{status.base_url}/{status.model}"), "name": f"状态汇报 · {status.model}", "model_id": status.model, "provider_id": status_provider_id, "capability": "llm", "origin": "runtime_config", "verification": "inherited", "health": "unknown", "local_path": None, "fingerprint": None},
+            {"id": _stable_id("model", f"runtime/voice/{llm.base_url}/{llm.model}"), "name": llm.model, "model_id": llm.model, "provider_id": llm_provider_id, "capability": "llm", "origin": "runtime_config", "verification": "inherited", "health": "unknown", "local_path": None, "fingerprint": None, "max_context_tokens": int(getattr(self.config.agent, "max_context_tokens", 131072)), "allowed_reasoning": list(getattr(llm, "allowed_reasoning", ("off", "low")))},
+            {"id": _stable_id("model", f"runtime/shadow/{shadow.base_url}/{shadow.model}"), "name": f"Shadow · {shadow.model}", "model_id": shadow.model, "provider_id": shadow_provider_id, "capability": "llm", "origin": "runtime_config", "verification": "inherited", "health": "unknown", "local_path": None, "fingerprint": None, "max_context_tokens": int(self.config.shadow_agent.max_context_tokens), "allowed_reasoning": list(getattr(self.config.shadow_agent, "allowed_reasoning", ("off", "low", "medium", "high", "max")))},
+            {"id": _stable_id("model", f"runtime/status/{status.base_url}/{status.model}"), "name": f"状态汇报 · {status.model}", "model_id": status.model, "provider_id": status_provider_id, "capability": "llm", "origin": "runtime_config", "verification": "inherited", "health": "unknown", "local_path": None, "fingerprint": None, "max_context_tokens": int(self.config.shadow_agent.status_observer.max_context_tokens), "allowed_reasoning": ["off"]},
             {"id": _stable_id("model", f"runtime/tts/{tts.base_url}/{tts.model}"), "name": tts.model, "model_id": tts.model, "provider_id": tts_provider_id, "capability": "tts", "origin": "runtime_config", "verification": "inherited", "health": "unknown", "local_path": None, "fingerprint": None},
         ]
         tts_profiles = [{"id": _stable_id("tts-profile", f"runtime/{tts.base_url}/{tts.model}/{tts.voice_id}"), "name": "当前 TTS 配置", "model_id": models[3]["id"], "origin": "runtime_config", "voice_id": tts.voice_id, "emotion_mode": tts.emotion_mode, "default_emotion": tts.default_emotion, "output_format": tts.output_format, "sample_rate": tts.sample_rate, "transport": tts.transport, "scheduling": tts.scheduling, "subtitle_enable": tts.subtitle_enable, "subtitle_type": tts.subtitle_type, "verification": "inherited"}]
@@ -282,6 +473,95 @@ class ModelRegistryService:
             self._write(registry)
             return self._snapshot(registry)
 
+    async def update_model(self, model_id: str, changes: Mapping[str, Any]) -> dict[str, Any]:
+        """Update only safe, product-managed model metadata and policy."""
+
+        allowed_keys = {"name", "max_context_tokens", "allowed_reasoning"}
+        unknown = set(changes) - allowed_keys
+        if unknown:
+            raise ModelRegistryError(f"不允许修改模型字段：{', '.join(sorted(unknown))}。")
+        async with self._lock:
+            registry = self._load()
+            model = next((item for item in registry["models"] if item.get("id") == model_id), None)
+            if model is None:
+                raise ModelRegistryError("未找到模型条目。")
+            if model.get("origin") != "product_managed":
+                raise ModelRegistryError("只有产品托管的 API 模型可以编辑。")
+            if "name" in changes:
+                model["name"] = _clean_text(changes.get("name"), "模型显示名称", max_length=200)
+            if model.get("capability") == "llm":
+                if "max_context_tokens" in changes:
+                    try:
+                        context = int(changes.get("max_context_tokens"))
+                    except (TypeError, ValueError) as exc:
+                        raise ModelRegistryError("模型上下文上限无效。") from exc
+                    if not 1024 <= context <= 524288:
+                        raise ModelRegistryError("模型上下文上限必须在 1024 至 524288 token 之间。")
+                    model["max_context_tokens"] = context
+                if "allowed_reasoning" in changes:
+                    raw = changes.get("allowed_reasoning")
+                    if not isinstance(raw, list):
+                        raise ModelRegistryError("模型思考等级必须是数组。")
+                    normalized = [str(value).lower() for value in raw]
+                    if any(value not in SUPPORTED_REASONING_EFFORTS for value in normalized):
+                        raise ModelRegistryError("模型思考等级包含不支持的值。")
+                    normalized = [value for value in SUPPORTED_REASONING_EFFORTS if value in normalized]
+                    if not normalized:
+                        raise ModelRegistryError("模型至少需要一个有效的思考等级。")
+                    model["allowed_reasoning"] = normalized
+            elif "max_context_tokens" in changes or "allowed_reasoning" in changes:
+                raise ModelRegistryError("TTS 模型不支持 LLM 思考策略。")
+            self._write(registry)
+            return self._snapshot(registry)
+
+    async def delete_model(self, model_id: str) -> dict[str, Any]:
+        """Delete an unassigned product-managed model and orphaned metadata."""
+
+        async with self._lock:
+            registry = self._load()
+            model = next((item for item in registry["models"] if item.get("id") == model_id), None)
+            if model is None:
+                raise ModelRegistryError("未找到模型条目。")
+            if model.get("origin") != "product_managed":
+                raise ModelRegistryError("运行时继承模型和本地模型不能删除，请使用隐藏/恢复。")
+            assignments = registry["assignments"]
+            if model_id in {
+                assignments.get("voice_llm_model_id"),
+                assignments.get("shadow_llm_model_id"),
+                assignments.get("status_llm_model_id"),
+            }:
+                raise ModelRegistryError("该模型正在被分配使用，请先解除分配。")
+            referenced_profiles = [
+                item for item in registry["tts_profiles"] if item.get("model_id") == model_id
+            ]
+            if any(item.get("id") == assignments.get("tts_profile_id") for item in referenced_profiles):
+                raise ModelRegistryError("该模型的 TTS 配置正在被使用，请先解除分配。")
+            provider_id = model.get("provider_id")
+            provider_model_ids = {
+                item.get("id") for item in registry["models"]
+                if item.get("provider_id") == provider_id
+            }
+            registry["models"] = [item for item in registry["models"] if item.get("id") != model_id]
+            registry["tts_profiles"] = [item for item in registry["tts_profiles"] if item.get("model_id") != model_id]
+            registry["hidden_model_ids"] = [item for item in registry["hidden_model_ids"] if item != model_id]
+            provider_has_profile_reference = any(
+                item.get("model_id") in provider_model_ids
+                for item in registry["tts_profiles"]
+            )
+            if (
+                provider_id
+                and not any(item.get("provider_id") == provider_id for item in registry["models"])
+                and not provider_has_profile_reference
+            ):
+                provider = next((item for item in registry["providers"] if item.get("id") == provider_id), None)
+                if provider is not None and provider.get("origin") == "product_managed":
+                    reference = provider.get("credential_ref")
+                    if reference:
+                        self.vault.delete(str(reference))
+                    registry["providers"] = [item for item in registry["providers"] if item.get("id") != provider_id]
+            self._write(registry)
+            return self._snapshot(registry)
+
     async def validate_connection(self, request: Mapping[str, Any]) -> dict[str, Any]:
         """Probe only.  Does not retain the secret, provider or models."""
         return await self._probe(request)
@@ -343,7 +623,7 @@ class ModelRegistryService:
         return [str(item.get("id") or item.get("name")).strip() for item in items if isinstance(item, dict) and str(item.get("id") or item.get("name") or "").strip()]
 
     async def _probe_llm(self, base_url: str, protocol: str, api_key: str, model_id: str) -> None:
-        endpoint = "responses" if protocol in {"deepseek", "responses"} else "chat/completions"
+        endpoint = "responses" if protocol in {"deepseek", "responses", "opencode_go"} else "chat/completions"
         payload: dict[str, Any] = {"model": model_id, "stream": False}
         if endpoint == "responses":
             payload.update({"input": "Reply only OK.", "max_output_tokens": 16})
@@ -395,11 +675,33 @@ class ModelRegistryService:
         credential_ref = _stable_id("credential", provider_id)
         async with self._lock:
             registry = self._load()
+            previous_secret = self.vault.get(credential_ref)
             self.vault.put(credential_ref, api_key)
             try:
                 profile = {"id": provider_id, "name": name, "origin": "product_managed", "protocol": protocol, "base_url": base_url, "capabilities": [capability], "discovery_capability": str(probe["discovery"]), "credential_ref": credential_ref, "credential_state": "stored", "last_validation": "success", "last_validated_at": _now()}
                 registry["providers"] = [item for item in registry["providers"] if item.get("id") != provider_id] + [profile]
-                entries = [{"id": _stable_id("model", f"managed/{provider_id}/{model_id}/{capability}"), "name": model_id, "model_id": model_id, "provider_id": provider_id, "capability": capability, "origin": "product_managed", "verification": "verified", "health": "healthy", "local_path": None, "fingerprint": None} for model_id in probe["models"]]
+                raw_policy = request.get("model_policy") if isinstance(request.get("model_policy"), Mapping) else {}
+                try:
+                    policy_context = int(raw_policy.get("max_context_tokens", 131072))
+                except (TypeError, ValueError) as exc:
+                    raise ModelRegistryError("模型上下文上限无效。") from exc
+                if not 1024 <= policy_context <= 524288:
+                    raise ModelRegistryError("模型上下文上限必须在 1024 至 524288 token 之间。")
+                raw_reasoning = raw_policy.get("allowed_reasoning")
+                if raw_reasoning is None:
+                    allowed_reasoning = list(SUPPORTED_REASONING_EFFORTS)
+                elif isinstance(raw_reasoning, list):
+                    allowed_reasoning = [str(value).lower() for value in raw_reasoning]
+                else:
+                    raise ModelRegistryError("模型思考等级必须是数组。")
+                if capability == "llm":
+                    allowed_reasoning = [
+                        value for value in SUPPORTED_REASONING_EFFORTS
+                        if value in allowed_reasoning
+                    ]
+                    if not allowed_reasoning:
+                        raise ModelRegistryError("模型至少需要一个有效的思考等级。")
+                entries = [{"id": _stable_id("model", f"{provider_id}/{model_id}/{capability}"), "name": model_id, "model_id": model_id, "provider_id": provider_id, "capability": capability, "origin": "product_managed", "verification": "verified", "health": "healthy", "local_path": None, "fingerprint": None, **({"max_context_tokens": policy_context, "allowed_reasoning": allowed_reasoning} if capability == "llm" else {})} for model_id in probe["models"]]
                 registry["models"] = [item for item in registry["models"] if item.get("provider_id") != provider_id] + entries
                 if capability == "tts":
                     settings = request.get("tts_profile") if isinstance(request.get("tts_profile"), Mapping) else {}
@@ -407,73 +709,237 @@ class ModelRegistryService:
                     registry["tts_profiles"] = [item for item in registry["tts_profiles"] if item.get("id") != profile_id] + [{"id": profile_id, "name": f"{name} 默认 TTS 配置", "model_id": entries[0]["id"], "origin": "product_managed", "voice_id": str(settings.get("voice_id") or request.get("voice_id") or "female-shaonv"), "emotion_mode": str(settings.get("emotion_mode") or "agent"), "default_emotion": str(settings.get("default_emotion") or "calm"), "output_format": str(settings.get("output_format") or request.get("output_format") or "pcm"), "sample_rate": int(settings.get("sample_rate") or request.get("sample_rate") or 32000), "transport": str(settings.get("transport") or request.get("transport") or "websocket_bidi"), "scheduling": str(settings.get("scheduling") or request.get("scheduling") or "direct"), "subtitle_enable": bool(settings.get("subtitle_enable", False)), "subtitle_type": str(settings.get("subtitle_type") or "word_streaming"), "verification": "verified"}]
                 self._write(registry)
             except Exception:
-                self.vault.delete(credential_ref)
+                # Re-adding an existing provider must not erase its last
+                # working secret when a later metadata write fails.
+                if previous_secret:
+                    self.vault.put(credential_ref, previous_secret)
+                else:
+                    self.vault.delete(credential_ref)
                 raise
             return self._snapshot(registry)
 
-    async def apply_assignments(self, assignments: Mapping[str, Any], *, confirmed: bool) -> dict[str, Any]:
-        if not confirmed:
-            return {"requires_confirmation": True, "impact": ["当前语音会话", "活动 TTS 播报", "主 LLM", "Shadow Agent", "状态汇报模型", "TTS"], "message": "应用模型分配会中止当前聆听或播报，并立即重启受影响服务。"}
-        async with self._lock:
-            registry = self._load()
-            target = {key: assignments.get(key) for key in ("voice_llm_model_id", "shadow_llm_model_id", "status_llm_model_id", "tts_profile_id")}
-            models = {item["id"]: item for item in registry["models"]}
-            profiles = {item["id"]: item for item in registry["tts_profiles"]}
-            hidden = set(registry["hidden_model_ids"])
-            for key in ("voice_llm_model_id", "shadow_llm_model_id", "status_llm_model_id"):
-                entry = models.get(target[key])
-                if entry is None or entry["capability"] != "llm" or entry["id"] in hidden or entry["verification"] not in {"verified", "inherited"}:
-                    raise ModelRegistryError(f"{key} 必须选择未隐藏、已验证的 LLM 条目。")
-            tts_profile = profiles.get(target["tts_profile_id"])
-            tts_model = models.get(tts_profile.get("model_id")) if tts_profile else None
-            if tts_profile is None or tts_model is None or tts_model["capability"] != "tts" or tts_model["id"] in hidden or tts_profile["verification"] not in {"verified", "inherited"}:
-                raise ModelRegistryError("tts_profile_id 必须选择未隐藏、已验证的 TTS 配置。")
-            if self.apply_callback is None:
-                raise ModelRegistryError("当前运行时尚未启用模型热重启适配器。")
-            raw_settings = assignments.get("role_settings")
-            raw_settings = raw_settings if isinstance(raw_settings, Mapping) else {}
-            defaults = self._empty()["assignments"]["role_settings"]
-            role_settings: dict[str, dict[str, Any]] = {}
-            for role in ("voice", "shadow", "status"):
-                item = raw_settings.get(role)
+    def _runtime_payload_for_assignments(
+        self,
+        registry: dict[str, Any],
+        assignments: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+        """Resolve a persisted assignment without mutating registry state.
+
+        The resolver is shared by explicit product applies and startup
+        recovery.  A v1 ``role_settings`` object is accepted only when the
+        assignment is marked legacy; new product assignments always derive
+        policy from the selected model entry.
+        """
+
+        target = {
+            key: assignments.get(key)
+            for key in (
+                "voice_llm_model_id", "shadow_llm_model_id",
+                "status_llm_model_id", "tts_profile_id",
+            )
+        }
+        models = {item["id"]: item for item in registry["models"] if isinstance(item, dict) and item.get("id")}
+        profiles = {item["id"]: item for item in registry["tts_profiles"] if isinstance(item, dict) and item.get("id")}
+        hidden = set(registry["hidden_model_ids"])
+        for key in ("voice_llm_model_id", "shadow_llm_model_id", "status_llm_model_id"):
+            entry = models.get(target[key])
+            if (
+                entry is None
+                or entry.get("capability") != "llm"
+                or entry.get("id") in hidden
+                or entry.get("verification") not in {"verified", "inherited"}
+            ):
+                raise ModelRegistryError(f"{key} 必须选择未隐藏、已验证的 LLM 条目。")
+        tts_profile = profiles.get(target["tts_profile_id"])
+        tts_model = models.get(tts_profile.get("model_id")) if tts_profile else None
+        if (
+            tts_profile is None
+            or tts_model is None
+            or tts_model.get("capability") != "tts"
+            or tts_model.get("id") in hidden
+            or tts_profile.get("verification") not in {"verified", "inherited"}
+        ):
+            raise ModelRegistryError("tts_profile_id 必须选择未隐藏、已验证的 TTS 配置。")
+
+        raw_settings = assignments.get("role_settings")
+        legacy_settings = (
+            raw_settings
+            if isinstance(raw_settings, Mapping)
+            and assignments.get("policy_mode") != "model"
+            else None
+        )
+        role_settings: dict[str, dict[str, Any]] = {}
+        for role in ("voice", "shadow", "status"):
+            selected = models[target[f"{role}_llm_model_id"]]
+            allowed = [
+                value for value in SUPPORTED_REASONING_EFFORTS
+                if value in (selected.get("allowed_reasoning") or ["off"])
+            ]
+            if not allowed:
+                raise ModelRegistryError(f"{role} 模型没有可用的思考等级。")
+            try:
+                context = int(selected.get("max_context_tokens", 131072))
+            except (TypeError, ValueError) as exc:
+                raise ModelRegistryError(f"{role} 上下文上限无效。") from exc
+            if not 1024 <= context <= 524288:
+                raise ModelRegistryError(f"{role} 上下文上限必须在 1024 至 524288 token 之间。")
+            if legacy_settings is not None:
+                item = legacy_settings.get(role)
                 item = item if isinstance(item, Mapping) else {}
                 try:
-                    context = int(item.get("max_context_tokens", defaults[role]["max_context_tokens"]))
+                    context = int(item.get("max_context_tokens", context))
                 except (TypeError, ValueError) as exc:
                     raise ModelRegistryError(f"{role} 上下文上限无效。") from exc
                 if not 1024 <= context <= 524288:
                     raise ModelRegistryError(f"{role} 上下文上限必须在 1024 至 524288 token 之间。")
-                effort = str(item.get("reasoning_effort", defaults[role]["reasoning_effort"])).lower()
-                if role == "status":
-                    effort = "none"
-                elif effort not in {"low", "high", "max"}:
-                    raise ModelRegistryError(f"{role} 思考等级无效。")
-                role_settings[role] = {"reasoning_effort": effort, "max_context_tokens": context}
-            providers = {item["id"]: item for item in registry["providers"]}
-
-            def runtime_entry(entry: dict[str, Any]) -> dict[str, Any]:
-                provider = providers.get(entry["provider_id"])
-                if provider is None:
-                    raise ModelRegistryError("模型条目缺少供应商配置。")
-                value = {"model_id": entry["model_id"], "provider": deepcopy(provider)}
-                reference = provider.get("credential_ref")
-                if reference:
-                    secret = self.vault.get(str(reference))
-                    if not secret:
-                        raise ModelRegistryError("供应商凭据不可用，请重新验证连接。")
-                    value["api_key"] = secret
-                return value
-
-            runtime_payload = {
-                "voice": {**runtime_entry(models[target["voice_llm_model_id"]]), "settings": role_settings["voice"]},
-                "shadow": {**runtime_entry(models[target["shadow_llm_model_id"]]), "settings": role_settings["shadow"]},
-                "status": {**runtime_entry(models[target["status_llm_model_id"]]), "settings": role_settings["status"]},
-                "tts": {**runtime_entry(tts_model), "profile": deepcopy(tts_profile)},
+                effort = str(item.get("reasoning_effort", "off")).lower()
+                if effort == "none":
+                    effort = "off"
+                if role != "status" and effort not in allowed:
+                    raise ModelRegistryError(f"{role} 模型不允许思考等级 {effort}。")
+            elif role == "voice":
+                if "off" not in allowed or "low" not in allowed:
+                    raise ModelRegistryError("voice 模型必须同时支持 off 和 low。")
+                effort = "low"
+            elif role == "shadow":
+                requested = assignments.get("shadow_reasoning_effort")
+                if requested is not None:
+                    effort = str(requested).lower()
+                    if effort == "none":
+                        effort = "off"
+                    if effort not in allowed:
+                        raise ModelRegistryError(f"shadow 模型不允许思考等级 {effort}。")
+                else:
+                    effort = next(
+                        (value for value in ("high", "max", "medium", "low", "off") if value in allowed),
+                        allowed[0],
+                    )
+            else:
+                effort = "none"
+            if role == "status":
+                effort = "none"
+            elif effort not in SUPPORTED_REASONING_EFFORTS:
+                raise ModelRegistryError(f"{role} 思考等级无效。")
+            role_settings[role] = {
+                "reasoning_effort": effort,
+                "max_context_tokens": context,
             }
-            result = await self.apply_callback(runtime_payload)
+        if assignments.get("shadow_reasoning_effort") is not None:
+            target["shadow_reasoning_effort"] = role_settings["shadow"]["reasoning_effort"]
+
+        providers = {item["id"]: item for item in registry["providers"] if isinstance(item, dict) and item.get("id")}
+
+        def runtime_entry(entry: dict[str, Any]) -> dict[str, Any]:
+            provider = providers.get(entry["provider_id"])
+            if provider is None:
+                raise ModelRegistryError("模型条目缺少供应商配置。")
+            value = {
+                "model_id": entry["model_id"],
+                "provider": deepcopy(provider),
+                "max_context_tokens": int(entry.get("max_context_tokens", 131072)),
+                "allowed_reasoning": list(entry.get("allowed_reasoning") or ["off"]),
+            }
+            reference = provider.get("credential_ref")
+            if reference:
+                secret = self.vault.get(str(reference))
+                if not secret:
+                    raise ModelRegistryError("供应商凭据不可用，请重新验证连接。")
+                value["api_key"] = secret
+            return value
+
+        runtime_payload = {
+            "voice": {
+                **runtime_entry(models[target["voice_llm_model_id"]]),
+                "settings": role_settings["voice"],
+            },
+            "shadow": {
+                **runtime_entry(models[target["shadow_llm_model_id"]]),
+                "settings": role_settings["shadow"],
+            },
+            "status": {
+                **runtime_entry(models[target["status_llm_model_id"]]),
+                "settings": role_settings["status"],
+            },
+            "tts": {**runtime_entry(tts_model), "profile": deepcopy(tts_profile)},
+        }
+        return runtime_payload, target, role_settings
+
+    async def runtime_assignment_payload(self) -> dict[str, Any] | None:
+        """Resolve the last committed assignment for boot-time recovery.
+
+        ``None`` means the registry has never had a complete assignment.  A
+        malformed or unavailable assignment raises a typed error so the
+        caller can keep YAML as the safe fallback and report a warning.
+        """
+
+        async with self._lock:
+            registry = self._load()
+            assignments = registry.get("assignments")
+            if not isinstance(assignments, Mapping):
+                return None
+            required = (
+                "voice_llm_model_id", "shadow_llm_model_id",
+                "status_llm_model_id", "tts_profile_id",
+            )
+            if any(not assignments.get(key) for key in required):
+                return None
+            payload, _target, _role_settings = self._runtime_payload_for_assignments(
+                registry, assignments,
+            )
+            return payload
+
+    async def apply_assignments(self, assignments: Mapping[str, Any], *, confirmed: bool) -> dict[str, Any]:
+        if not confirmed:
+            return {
+                "requires_confirmation": True,
+                "impact": ["当前语音会话", "活动 TTS 播报", "主 LLM", "Shadow Agent", "状态汇报模型", "TTS"],
+                "message": "应用模型分配会中止当前聆听或播报，并立即重启受影响服务。",
+            }
+        async with self._lock:
+            registry = self._load()
+            if self.apply_callback is None:
+                raise ModelRegistryError("当前运行时尚未启用模型热重启适配器。")
+            runtime_payload, target, role_settings = self._runtime_payload_for_assignments(
+                registry, assignments,
+            )
+            try:
+                result = await self.apply_callback(runtime_payload)
+            except Exception as exc:
+                return {
+                    "requires_confirmation": False,
+                    "applied": False,
+                    "message": f"模型服务重启失败：{type(exc).__name__}；已保留上一份有效分配。",
+                    "assignments": deepcopy(registry["assignments"]),
+                }
+            if not isinstance(result, Mapping):
+                return {
+                    "requires_confirmation": False,
+                    "applied": False,
+                    "message": "模型服务重启返回了无效结果；已保留上一份有效分配。",
+                    "assignments": deepcopy(registry["assignments"]),
+                }
             if not result.get("ok"):
-                return {"requires_confirmation": False, "applied": False, "message": result.get("message", "模型服务重启失败，已保留上一份有效分配。"), "assignments": deepcopy(registry["assignments"])}
+                return {
+                    "requires_confirmation": False,
+                    "applied": False,
+                    "message": result.get("message", "模型服务重启失败，已保留上一份有效分配。"),
+                    "assignments": deepcopy(registry["assignments"]),
+                }
+            # The selected model and its policy are the v2 source of truth.
+            # Keep a derived role_settings view for older local clients.
+            target["policy_mode"] = "model"
             target["role_settings"] = role_settings
             registry["assignments"] = target
             self._write(registry)
-            return {"requires_confirmation": False, "applied": True, "message": "模型服务已重启，新分配已生效。", "assignments": deepcopy(target), "runtime": result}
+            safe_runtime = {
+                "ok": True,
+                "restarted": list(result.get("restarted") or [])
+                if isinstance(result.get("restarted"), list) else [],
+            }
+            return {
+                "requires_confirmation": False,
+                "applied": True,
+                "message": "模型服务已重启，新分配已生效。",
+                "assignments": deepcopy(target),
+                "runtime": safe_runtime,
+            }

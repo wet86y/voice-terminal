@@ -16,6 +16,8 @@ import type {
   RuntimeSnapshotPayload,
   ServerMessage,
   ServiceStatuses,
+  ShadowProductSnapshot,
+  ShadowTimelineItem,
   SessionStatePayload,
   TerminalState,
   TurnDelivery,
@@ -139,6 +141,67 @@ function createOfflineStatuses(): ServiceStatuses {
   }
 }
 
+function createEmptyShadowProduct(): ShadowProductSnapshot {
+  return {
+    available: false,
+    active: false,
+    phase: 'unavailable',
+    user_input_required: false,
+    focus: '',
+    summary: '',
+    timeline: [],
+    context: {},
+    provider: {},
+  }
+}
+
+function readShadowProduct(value: unknown): ShadowProductSnapshot | null {
+  if (!isRecord(value)
+    || typeof value.available !== 'boolean'
+    || typeof value.active !== 'boolean'
+    || typeof value.phase !== 'string'
+    || typeof value.user_input_required !== 'boolean'
+    || typeof value.focus !== 'string'
+    || typeof value.summary !== 'string'
+    || !Array.isArray(value.timeline)) return null
+  const timeline: ShadowTimelineItem[] = []
+  for (const item of value.timeline.slice(-5)) {
+    if (!isRecord(item)
+      || typeof item.state !== 'string'
+      || typeof item.label !== 'string'
+      || typeof item.text !== 'string'
+      || typeof item.timestamp !== 'string') continue
+    timeline.push({
+      state: item.state,
+      label: item.label.slice(0, 120),
+      text: item.text.slice(0, 400),
+      timestamp: item.timestamp,
+    })
+  }
+  const readTelemetry = (candidate: unknown, keys: string[]) => {
+    if (!isRecord(candidate)) return {}
+    const result: Record<string, number | null> = {}
+    for (const key of keys) {
+      const field = candidate[key]
+      if (field === null || (typeof field === 'number' && Number.isFinite(field) && field >= 0)) {
+        result[key] = field as number | null
+      }
+    }
+    return result
+  }
+  return {
+    available: value.available,
+    active: value.active,
+    phase: value.phase,
+    user_input_required: value.user_input_required,
+    focus: value.focus.slice(0, 400),
+    summary: value.summary.slice(0, 400),
+    timeline,
+    context: readTelemetry(value.context, ['used_tokens', 'limit_tokens', 'usage_percent']),
+    provider: readTelemetry(value.provider, ['input_tokens', 'cached_tokens', 'cache_hit_ratio']),
+  }
+}
+
 function parseServerMessage(raw: unknown): ServerMessage | null {
   if (typeof raw !== 'string') return null
 
@@ -187,6 +250,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const currentLatency = reactive<LatencyValues>(createEmptyLatency())
   const currentLatencyComplete = ref(false)
   const services = reactive<ServiceStatuses>(createOfflineStatuses())
+  const shadowProduct = ref<ShadowProductSnapshot>(createEmptyShadowProduct())
   const recentTurns = ref<InputRecord[]>([])
   const agentEpisode = ref<AgentEpisodeSnapshot | null>(null)
   const agentTrace = ref<AgentTrace[]>([])
@@ -416,6 +480,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     llmContext.value = []
     llmContextTurnId.value = null
     lastServerTimestamp.value = null
+    shadowProduct.value = createEmptyShadowProduct()
   }
 
   function adoptTurn(turnId: string | null) {
@@ -537,6 +602,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     applyCurrentSnapshot(payload.current)
     if (payload.agent) applyAgent(payload.agent, true)
     if (payload.latency) applyLatencySnapshot(payload.latency)
+    const shadow = readShadowProduct(payload.shadow)
+    if (shadow) shadowProduct.value = shadow
     if (Array.isArray(payload.recent_inputs)) {
       recentTurns.value = (payload.recent_inputs.filter(item => isRecord(item) && typeof item.turn_id === 'string') as InputRecord[])
         .slice(0, MAX_RECENT_TURNS).map(item => ({
@@ -628,6 +695,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (message.type === 'agent.state') { applyAgent(payload); return }
     if (message.type === 'agent.trace') { applyAgentTrace(payload); return }
     if (message.type === 'agent.reasoning') { if (typeof payload.text === 'string') reasoning.value = payload.text; return }
+    if (message.type === 'shadow.product') {
+      const shadow = readShadowProduct(payload)
+      if (shadow) shadowProduct.value = shadow
+      return
+    }
     if (message.type === 'speak.preview') { applySpeakPreview(payload); return }
     if (message.type === 'speech.queued') {
       const item = readPlaybackItem(payload, 'waiting')
@@ -897,6 +969,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     services,
     recentTurns,
     agentEpisode,
+    shadowProduct,
     agentTrace,
     speechOutputs,
     playbackQueue,

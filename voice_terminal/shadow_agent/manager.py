@@ -105,9 +105,10 @@ class ShadowRuntime:
         status_provider: ShadowProvider | None = None,
         observer_max_context_tokens: int = 32768,
         reasoning_effort: str = "high",
+        allowed_reasoning: Sequence[str] | None = None,
         on_metric: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
-        if transport_retry_limit < 0 or observer_every_steps < 1 or reasoning_effort not in {"low", "high", "max"}:
+        if transport_retry_limit < 0 or observer_every_steps < 1 or reasoning_effort not in {"off", "low", "medium", "high", "max"}:
             raise ValueError("invalid Shadow runtime retry/observer configuration")
         if max_context_tokens < 1024 or observer_max_context_tokens < 1024 or not 0 < compaction_threshold_ratio < 1:
             raise ValueError("invalid Shadow context budget")
@@ -129,6 +130,13 @@ class ShadowRuntime:
         self.observer_timeout_ms = observer_timeout_ms
         self.observer_max_context_tokens = observer_max_context_tokens
         self.reasoning_effort = reasoning_effort
+        raw_allowed = ("off", "low", "medium", "high", "max") if allowed_reasoning is None else allowed_reasoning
+        self.allowed_reasoning = tuple(dict.fromkeys(str(value).strip().lower() for value in raw_allowed))
+        if not self.allowed_reasoning or any(
+            value not in {"off", "low", "medium", "high", "max"}
+            for value in self.allowed_reasoning
+        ) or self.reasoning_effort not in self.allowed_reasoning:
+            raise ValueError("invalid Shadow reasoning policy")
         self.status_observer = ShadowStatusObserver(
             max_output_tokens=observer_max_output_tokens,
             timeout_ms=observer_timeout_ms,
@@ -163,6 +171,10 @@ class ShadowRuntime:
     @property
     def available(self) -> bool:
         return not self._closed
+
+    def reload_instructions(self) -> None:
+        """Reload the allowlisted Shadow persona at an idle session boundary."""
+        self._instructions = self.instructions_loader()
 
     def wake(self) -> WakeResult:
         if self._closed:
@@ -268,6 +280,12 @@ class ShadowRuntime:
         max_output_tokens: int | None = None, timeout_ms: int | None = None,
         retry: bool = True,
     ) -> ShadowProviderResponse:
+        normalized_effort = "off" if reasoning_effort == "none" else reasoning_effort
+        if normalized_effort not in self.allowed_reasoning:
+            raise ShadowProviderError(
+                f"Shadow 模型不支持思考等级 {normalized_effort}；允许值为 "
+                f"{', '.join(self.allowed_reasoning)}。"
+            )
         attempts = self.transport_retry_limit + 1 if retry else 1
         last: BaseException | None = None
         for attempt in range(attempts):
@@ -277,7 +295,7 @@ class ShadowRuntime:
                     "instructions": self._instructions,
                     "input_items": input_items,
                     "tools": tools,
-                    "reasoning_effort": reasoning_effort,
+                    "reasoning_effort": normalized_effort,
                     "text_schema": text_schema,
                 }
                 if max_output_tokens is not None:
@@ -504,7 +522,7 @@ class ShadowRuntime:
         try:
             response = await self._provider_complete(
                 input_items=[*self.working_trace, {"role": "system", "content": COMPACTION_PROMPT}],
-                tools=[], reasoning_effort="low", text_schema=schema, retry=False,
+                tools=[], reasoning_effort=self.reasoning_effort, text_schema=schema, retry=False,
             )
             text = _text_from_output(response.output)
             value = json.loads(text)

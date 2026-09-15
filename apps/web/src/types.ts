@@ -49,6 +49,7 @@ export type ServiceStatus =
 export interface ServiceStatuses {
   analysis?: ServiceStatus
   web_search?: ServiceStatus
+  shadow_agent?: ServiceStatus
   audio: ServiceStatus
   kws: ServiceStatus
   asr: ServiceStatus
@@ -166,6 +167,7 @@ export interface RuntimeSnapshotPayload {
   reasoning_mode?: ReasoningMode
   services: ServiceStatuses
   current: CurrentTurnSnapshot
+  shadow?: ShadowProductSnapshot
   latency?: {
     complete: boolean
     values: Partial<LatencyValues>
@@ -189,6 +191,33 @@ export interface AssistantDeltaPayload {
 export interface LlmContextMessage {
   role: string
   content: string
+}
+
+export interface ShadowTimelineItem {
+  state: 'active' | 'done' | 'error' | string
+  label: string
+  text: string
+  timestamp: string
+}
+
+export interface ShadowProductSnapshot {
+  available: boolean
+  active: boolean
+  phase: string
+  user_input_required: boolean
+  focus: string
+  summary: string
+  timeline: ShadowTimelineItem[]
+  context?: {
+    used_tokens?: number | null
+    limit_tokens?: number | null
+    usage_percent?: number | null
+  }
+  provider?: {
+    input_tokens?: number | null
+    cached_tokens?: number | null
+    cache_hit_ratio?: number | null
+  }
 }
 
 export interface LlmContextPayload {
@@ -248,7 +277,7 @@ export type ServerMessageType =
   | 'input.started' | 'input.updated' | 'input.finalized' | 'input.completed'
   | 'agent.state' | 'agent.trace' | 'agent.reasoning' | 'context.snapshot' | 'tool.state' | 'speak.preview'
   | 'speech.queued' | 'speech.started' | 'speech.delta' | 'speech.progress' | 'speech.completed'
-  | 'error'
+  | 'shadow.product' | 'error'
 
 export type ReasoningMode = 'fast' | 'balanced' | 'deep'
 export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset' | 'session.reasoning_mode'

@@ -277,4 +277,36 @@ describe('V0.6 session protocol', () => {
     expect(terminal.currentLatency.replacement_count).toBe(1)
     expect(terminal.current.tts_prewarm_status).toBe('READY')
   })
+
+  it('restores and incrementally updates the safe Shadow product projection', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('runtime.snapshot', 1, {
+      state: 'IDLE', listening: false, can_start: true,
+      services: { audio: 'READY', kws: 'DISABLED', asr: 'READY', llm: 'READY', tts: 'READY' },
+      current: {},
+      shadow: {
+        available: true, active: true, phase: 'working', user_input_required: false,
+        focus: '整理当前会话', summary: '正在后台分析',
+        timeline: [{ state: 'active', label: '后台处理中', text: '正在分析', timestamp: '2026-09-07T10:00:00.000Z' }],
+        context: { used_tokens: 86000, limit_tokens: 256000, usage_percent: 34 },
+        provider: { input_tokens: 86000, cached_tokens: 81700, cache_hit_ratio: 0.95 },
+      },
+    })
+    expect(terminal.shadowProduct.value).toMatchObject({
+      available: true, active: true, phase: 'working', focus: '整理当前会话',
+    })
+    expect(terminal.shadowProduct.value.context?.used_tokens).toBe(86000)
+
+    socket.push('shadow.product', 2, {
+      available: true, active: false, phase: 'idle', user_input_required: false,
+      focus: '已完成', summary: '后台结果已更新',
+      timeline: Array.from({ length: 7 }, (_, index) => ({
+        state: 'done', label: `步骤 ${index}`, text: `结果 ${index}`,
+        timestamp: '2026-09-07T10:00:00.000Z',
+      })),
+    })
+    expect(terminal.shadowProduct.value.active).toBe(false)
+    expect(terminal.shadowProduct.value.timeline).toHaveLength(5)
+    expect(terminal.shadowProduct.value.timeline[0].label).toBe('步骤 2')
+  })
 })

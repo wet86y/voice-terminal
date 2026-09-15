@@ -7,8 +7,7 @@ export default defineConfig({
   build: {
     rollupOptions: {
       input: {
-        console: resolve(__dirname, 'index.html'),
-        'ui-demo': resolve(__dirname, 'ui-demo.html'),
+        index: resolve(__dirname, 'index.html'),
       },
     },
   },

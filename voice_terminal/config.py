@@ -10,6 +10,9 @@ from .controller.options import InputOptions
 from .agent.options import AgentOptions
 
 
+REASONING_EFFORTS = ("off", "low", "medium", "high", "max")
+
+
 def _string(value: Any, default: str) -> str:
     return value if isinstance(value, str) and value.strip() else default
 
@@ -20,6 +23,14 @@ def _number(value: Any, default: int | float) -> int | float:
 
 def _bool(value: Any, default: bool) -> bool:
     return value if isinstance(value, bool) else default
+
+
+def _reasoning_levels(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = value if isinstance(value, (list, tuple)) else default
+    normalized = tuple(dict.fromkeys(str(item).strip().lower() for item in raw))
+    if not normalized or any(item not in REASONING_EFFORTS for item in normalized):
+        raise ValueError("allowed_reasoning must contain off, low, medium, high, or max")
+    return tuple(item for item in REASONING_EFFORTS if item in normalized)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -111,6 +122,10 @@ class LlmConfig:
     reasoning_mode: str = "balanced"
     thinking: str = "enabled"
     reasoning_effort: str = "low"
+    # Direct programmatic construction keeps the provider-compatible full
+    # capability set for backwards compatibility.  YAML/product loading
+    # supplies the model-specific policy explicitly.
+    allowed_reasoning: tuple[str, ...] = REASONING_EFFORTS
     timeout_ms: int = 15000
     transport: str = "chat_completions"
     max_output_tokens: int = 393216
@@ -127,8 +142,11 @@ class LlmConfig:
             raise ValueError("llm.thinking must be disabled or enabled")
         if self.reasoning_mode not in {"fast", "balanced", "deep"}:
             raise ValueError("llm.reasoning_mode must be fast, balanced, or deep")
-        if self.reasoning_effort not in {"low", "high", "max"}:
-            raise ValueError("llm.reasoning_effort must be low, high, or max")
+        if self.reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError("llm.reasoning_effort must be off, low, medium, high, or max")
+        object.__setattr__(self, "allowed_reasoning", _reasoning_levels(self.allowed_reasoning, REASONING_EFFORTS))
+        if self.reasoning_effort not in self.allowed_reasoning:
+            raise ValueError("llm.reasoning_effort must be included in llm.allowed_reasoning")
         if self.max_output_tokens <= 0 or self.timeout_ms <= 0:
             raise ValueError("llm token and timeout limits must be positive")
         if self.protocol_recovery_limit < 0:
@@ -266,14 +284,18 @@ class ShadowAgentConfig:
     tools: ShadowToolsConfig = field(default_factory=ShadowToolsConfig)
     max_context_tokens: int = 524288
     reasoning_effort: str = "high"
+    allowed_reasoning: tuple[str, ...] = REASONING_EFFORTS
     compaction_threshold_ratio: float = 0.80
     status_observer: ShadowStatusObserverConfig = field(default_factory=ShadowStatusObserverConfig)
 
     def __post_init__(self) -> None:
         if self.max_context_tokens < 1024:
             raise ValueError("shadow_agent.max_context_tokens must be at least 1024")
-        if self.reasoning_effort not in {"low", "high", "max"}:
-            raise ValueError("shadow_agent.reasoning_effort must be low, high or max")
+        if self.reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError("shadow_agent.reasoning_effort must be off, low, medium, high, or max")
+        object.__setattr__(self, "allowed_reasoning", _reasoning_levels(self.allowed_reasoning, REASONING_EFFORTS))
+        if self.reasoning_effort not in self.allowed_reasoning:
+            raise ValueError("shadow_agent.reasoning_effort must be included in shadow_agent.allowed_reasoning")
         if not 0 < self.compaction_threshold_ratio < 1:
             raise ValueError("shadow_agent.compaction_threshold_ratio must be between 0 and 1")
 
@@ -453,6 +475,9 @@ class AppConfig:
                 ),
                 max_context_tokens=int(_number(shadow.get("max_context_tokens"), 524288)),
                 reasoning_effort=_string(shadow.get("reasoning_effort"), "high"),
+                allowed_reasoning=_reasoning_levels(
+                    shadow.get("allowed_reasoning"), REASONING_EFFORTS,
+                ),
                 compaction_threshold_ratio=float(_number(shadow.get("compaction_threshold_ratio"), 0.80)),
                 status_observer=ShadowStatusObserverConfig(
                     enabled=_bool(shadow_observer.get("enabled"), True),
@@ -540,6 +565,9 @@ class AppConfig:
                 reasoning_mode=_string(llm.get("reasoning_mode"), "balanced"),
                 thinking=_string(llm.get("thinking"), "enabled"),
                 reasoning_effort=_string(llm.get("reasoning_effort"), "low"),
+                allowed_reasoning=_reasoning_levels(
+                    llm.get("allowed_reasoning"), ("off", "low"),
+                ),
                 timeout_ms=int(_number(llm.get("timeout_ms"), 15000)),
                 transport=_string(llm.get("transport"), "chat_completions"),
                 max_output_tokens=int(_number(llm.get("max_output_tokens"), 393216)),

@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,10 +15,11 @@ if __package__ in (None, ""):
 
 import uvicorn  # type: ignore
 
-from voice_terminal.config import load_config
+from voice_terminal.config import PersonaConfig, load_config
 from voice_terminal.env import load_env_file
 from voice_terminal.logging_setup import configure_logging
 from voice_terminal.model_registry import ModelRegistryService, WindowsCredentialVault
+from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.server.websocket import SessionRuntime, create_app
 
 
@@ -59,8 +61,20 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
     default_path = root / "config" / "default.yaml"
     local_path = config_path or root / "config" / "local.yaml"
     effective_config = local_path if local_path.is_file() else default_path
-    config = load_config(default_path, local_path if local_path.is_file() else None)
-    runtime = SessionRuntime(config)
+    yaml_config = load_config(default_path, local_path if local_path.is_file() else None)
+    # Product Persona is a fixed, allowlisted sidecar surface.  Keep the
+    # runtime loader aligned with the API's paths even if legacy YAML carries
+    # a custom Persona directory or filename.
+    yaml_config = replace(
+        yaml_config,
+        persona=PersonaConfig(directory=root / "config" / "persona"),
+    )
+    product_settings = ProductSettingsStore(
+        path=root / "config" / "product-settings.json",
+        config=yaml_config,
+    )
+    config = product_settings.effective_config()
+    runtime = SessionRuntime(config, product_settings=product_settings)
     runtime.build_info = _runtime_build_info(root, effective_config)
     model_registry = ModelRegistryService(
         config=config,
@@ -71,13 +85,47 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
 
     @asynccontextmanager
     async def lifespan(_app):
+        # Restore the last explicitly committed product assignment before any
+        # audio, KWS, LLM, Shadow or TTS component is constructed.  A stale or
+        # unavailable assignment is non-fatal: YAML remains the safe fallback
+        # and the warning is visible through /health and Product snapshot.
+        try:
+            assignment = await model_registry.runtime_assignment_payload()
+            if assignment is not None:
+                restored = await runtime.restore_model_services(assignment)
+                if not restored.get("ok"):
+                    runtime.startup_errors.append(
+                        "model_assignment_restore: "
+                        + str(restored.get("message") or "恢复失败")[:300]
+                    )
+                else:
+                    model_registry.config = runtime.config
+        except Exception as exc:
+            runtime.startup_errors.append(
+                f"model_assignment_restore: {type(exc).__name__}: {str(exc)[:260]}"
+            )
+        # Populate the product snapshot with the current runtime projection
+        # and local model inventory before the first Web UI request.  This is
+        # filesystem/config metadata only; it never performs provider
+        # discovery or touches credentials.
+        try:
+            await model_registry.scan()
+        except Exception as exc:
+            runtime.startup_errors.append(
+                f"model_registry_scan: {type(exc).__name__}: {str(exc)[:260]}"
+            )
         await runtime.initialize()
         try:
             yield
         finally:
             await runtime.close()
 
-    app = create_app(runtime, lifespan=lifespan, model_registry=model_registry)
+    app = create_app(
+        runtime,
+        lifespan=lifespan,
+        model_registry=model_registry,
+        product_settings=product_settings,
+    )
 
     return app, runtime
 

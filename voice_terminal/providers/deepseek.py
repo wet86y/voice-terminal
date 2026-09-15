@@ -9,6 +9,21 @@ from ..session.context_frames import ContextFrame, ContextLane
 
 logger = logging.getLogger(__name__)
 
+REASONING_EFFORTS = frozenset({"off", "low", "medium", "high", "max"})
+
+
+def _canonical_reasoning_effort(value: str | None, *, default: str = "off") -> str:
+    candidate = str(value or default).strip().lower()
+    # ``none`` is the provider/native spelling used by the status observer;
+    # the product-facing model policy uses ``off`` consistently.
+    if candidate == "none":
+        candidate = "off"
+    if candidate not in REASONING_EFFORTS:
+        raise ValueError(
+            "reasoning_effort must be off, low, medium, high, or max"
+        )
+    return candidate
+
 
 class DeepSeekError(RuntimeError):
     retryable = False
@@ -81,6 +96,7 @@ class DeepSeekClient:
         timeout_ms: int = 15000,
         thinking: str = "disabled",
         reasoning_effort: str = "low",
+        allowed_reasoning: Sequence[str] | None = None,
         transport: str = "chat_completions",
         max_output_tokens: int = 393216,
         thinking_action_enabled: bool = False,
@@ -98,9 +114,16 @@ class DeepSeekClient:
         self.user_agent = "voice-terminal-backend/0.6" if provider == "opencode_go" else None
         self.timeout_ms = timeout_ms
         self.thinking = thinking
-        if reasoning_effort not in {"low", "high", "max"}:
-            raise ValueError("reasoning_effort must be low, high, or max")
-        self.reasoning_effort = reasoning_effort
+        self.reasoning_effort = _canonical_reasoning_effort(reasoning_effort)
+        raw_allowed = REASONING_EFFORTS if allowed_reasoning is None else allowed_reasoning
+        normalized_allowed = tuple(dict.fromkeys(
+            _canonical_reasoning_effort(value) for value in raw_allowed
+        ))
+        if not normalized_allowed:
+            raise ValueError("allowed_reasoning must contain at least one effort")
+        if self.reasoning_effort not in normalized_allowed:
+            raise ValueError("reasoning_effort must be included in allowed_reasoning")
+        self.allowed_reasoning = frozenset(normalized_allowed)
         if transport not in {"chat_completions", "responses"}:
             raise ValueError("transport must be chat_completions or responses")
         if max_output_tokens <= 0:
@@ -117,6 +140,9 @@ class DeepSeekClient:
         """Bind subsequent provider requests to the current conversation."""
         value = session_id.strip() if isinstance(session_id, str) else ""
         self.session_id = value or None
+
+    def supports_reasoning_effort(self, value: str | None) -> bool:
+        return _canonical_reasoning_effort(value, default=self.reasoning_effort) in self.allowed_reasoning
 
     def _request_headers(self, *, streaming: bool = False) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {self.api_key}"}
@@ -171,8 +197,17 @@ class DeepSeekClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        effective_effort = reasoning_effort or self.reasoning_effort
-        thinking_enabled = reasoning_effort is not None or self.thinking != "disabled"
+        effective_effort = _canonical_reasoning_effort(
+            reasoning_effort, default=self.reasoning_effort,
+        )
+        if effective_effort not in self.allowed_reasoning:
+            raise DeepSeekError(
+                f"模型不支持思考等级 {effective_effort}；允许值为 "
+                f"{', '.join(sorted(self.allowed_reasoning))}。"
+            )
+        thinking_enabled = effective_effort != "off" and (
+            reasoning_effort is not None or self.thinking != "disabled"
+        )
         payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
         if thinking_enabled:
             payload["reasoning_effort"] = effective_effort
@@ -232,7 +267,10 @@ class DeepSeekClient:
             "model": model,
             "instructions": "\n\n".join([*instructions, compatibility]),
             "input": input_items,
-            "reasoning": {"effort": reasoning_effort},
+            "reasoning": {
+                "effort": "none" if _canonical_reasoning_effort(reasoning_effort) == "off"
+                else _canonical_reasoning_effort(reasoning_effort),
+            },
             "text": {"format": {
                 "type": "json_schema", "name": schema_name,
                 "strict": True, "schema": dict(schema),
@@ -268,9 +306,18 @@ class DeepSeekClient:
         if selected_transport == "responses":
             if schema is None:
                 raise DeepSeekError("Responses transport requires a decision JSON Schema")
+            selected_effort = _canonical_reasoning_effort(
+                reasoning_effort,
+                default=self.reasoning_effort if self.thinking != "disabled" else "off",
+            )
+            if selected_effort not in self.allowed_reasoning:
+                raise DeepSeekError(
+                    f"模型不支持思考等级 {selected_effort}；允许值为 "
+                    f"{', '.join(sorted(self.allowed_reasoning))}。"
+                )
             async for item in self._stream_responses(
                 messages, schema=schema, schema_name=schema_name,
-                reasoning_effort=reasoning_effort or (self.reasoning_effort if self.thinking != "disabled" else "none"),
+                reasoning_effort=selected_effort,
                 cancel_event=cancel_event,
             ):
                 yield item
