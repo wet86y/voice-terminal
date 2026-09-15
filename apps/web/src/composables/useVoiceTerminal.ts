@@ -32,6 +32,7 @@ import { TERMINAL_STATES } from '../types'
 const DEFAULT_WS_URL = 'ws://127.0.0.1:8765/ws'
 const OPEN_READY_STATE = 1
 const MAX_RECENT_TURNS = 10
+const PERCEPTUAL_LATENCY_TICK_MS = 50
 
 export interface VoiceSocket {
   readyState: number
@@ -46,6 +47,8 @@ export interface VoiceSocket {
 export interface UseVoiceTerminalOptions {
   webSocketFactory?: (url: string) => VoiceSocket
   webSocketUrl?: string
+  /** Injectable only for deterministic tests; production uses a monotonic clock. */
+  now?: () => number
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -266,6 +269,69 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const speakPreview = ref<SpeakPreview | null>(null)
   const retiredEpisodes = new Set<string>()
   const terminalPlaybackKeys = new Set<string>()
+  const perceptualLatencyMs = ref<number | null>(null)
+  const perceptualLatencyRunning = ref(false)
+  const now = options.now ?? (() => typeof performance !== 'undefined' ? performance.now() : Date.now())
+  let perceptualLatencyTimer: ReturnType<typeof setInterval> | undefined
+  let perceptualLatencyTurnId: string | null = null
+  let perceptualLatencyStartedAt: number | null = null
+  let perceptualLatencySettled = false
+
+  function clearPerceptualLatencyTimer() {
+    if (perceptualLatencyTimer !== undefined) clearInterval(perceptualLatencyTimer)
+    perceptualLatencyTimer = undefined
+  }
+
+  function updatePerceptualLatency() {
+    if (!perceptualLatencyRunning.value || perceptualLatencyStartedAt === null) return
+    perceptualLatencyMs.value = Math.max(0, now() - perceptualLatencyStartedAt)
+  }
+
+  function resetPerceptualLatency() {
+    clearPerceptualLatencyTimer()
+    perceptualLatencyMs.value = null
+    perceptualLatencyRunning.value = false
+    perceptualLatencyTurnId = null
+    perceptualLatencyStartedAt = null
+    perceptualLatencySettled = false
+  }
+
+  function startPerceptualLatency(turnId: string | null) {
+    if (!turnId) return
+    // A late SenseVoice refinement can arrive after the primary final input;
+    // it must not restart a stopwatch that is already measuring this turn.
+    if (perceptualLatencyTurnId === turnId
+      && (perceptualLatencyRunning.value || perceptualLatencySettled)) return
+
+    resetPerceptualLatency()
+    perceptualLatencyTurnId = turnId
+    perceptualLatencyStartedAt = now()
+    perceptualLatencyMs.value = 0
+    perceptualLatencyRunning.value = true
+    perceptualLatencyTimer = setInterval(updatePerceptualLatency, PERCEPTUAL_LATENCY_TICK_MS)
+  }
+
+  function stopPerceptualLatency(turnId: string | null = null) {
+    if (!perceptualLatencyRunning.value || perceptualLatencyStartedAt === null) return
+    if (turnId && perceptualLatencyTurnId !== turnId) return
+    // Capture the boundary at event handling time rather than waiting for the
+    // next interval tick.  This is the value users actually perceive.
+    updatePerceptualLatency()
+    clearPerceptualLatencyTimer()
+    perceptualLatencyRunning.value = false
+    perceptualLatencyStartedAt = null
+    perceptualLatencySettled = true
+  }
+
+  function cancelPerceptualLatency(turnId: string | null = null) {
+    if (turnId && perceptualLatencyTurnId !== turnId) return
+    if (perceptualLatencyRunning.value) resetPerceptualLatency()
+  }
+
+  function preparePerceptualLatencyForInput(turnId: string | null) {
+    if (turnId && perceptualLatencyTurnId !== turnId) return
+    if (perceptualLatencyRunning.value || perceptualLatencySettled) resetPerceptualLatency()
+  }
 
   function speechKey(conversationId: string, speechId: string) {
     return `${conversationId}\u0000${speechId}`
@@ -336,9 +402,14 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     const speechId = readString(payload, 'speech_id')
     const conversationId = readString(payload, 'conversation_id')
     if (!speechId || !conversationId || retiredEpisodes.has(conversationId)) return
+    const turnId = readString(payload, 'turn_id')
     const activeItem = playbackQueue.value.find(item => item.speech_id === speechId && item.conversation_id === conversationId)
     if (activeItem?.output_generation !== undefined && isNonNegativeInteger(payload.output_generation)
       && payload.output_generation < activeItem.output_generation) return
+    // A terminal failure/replacement without a playback-start event does not
+    // have a perceptual response latency.  Clear only a still-running local
+    // stopwatch; a value already stopped by speech.started must be preserved.
+    cancelPerceptualLatency(turnId ?? activeItem?.turn_id ?? null)
     terminalPlaybackKeys.add(speechKey(conversationId, speechId))
     if (terminalPlaybackKeys.size > 128) terminalPlaybackKeys.delete(terminalPlaybackKeys.values().next().value!)
     const removed = removePlaybackItem(conversationId, speechId)
@@ -350,7 +421,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       ...(existingOutput || {}),
       speech_id: speechId,
       conversation_id: conversationId,
-      turn_id: readString(payload, 'turn_id') ?? removed?.turn_id ?? previous?.turn_id ?? '',
+      turn_id: turnId ?? removed?.turn_id ?? previous?.turn_id ?? '',
       text: readString(payload, 'text') || removed?.text || previous?.text || existingOutput?.text || '',
       status: result === 'finished' ? 'completed' : result,
     }
@@ -370,7 +441,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     lastPlayback.value = {
       speech_id: speechId,
       conversation_id: conversationId,
-      turn_id: readString(payload, 'turn_id') ?? removed?.turn_id ?? previous?.turn_id ?? '',
+      turn_id: turnId ?? removed?.turn_id ?? previous?.turn_id ?? '',
       text: readString(payload, 'text') || removed?.text || previous?.text || '',
       result: previous?.result ?? result,
     }
@@ -505,6 +576,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   })
 
   function resetCurrentTurn() {
+    resetPerceptualLatency()
     Object.assign(current, createEmptyCurrentTurn())
     Object.assign(currentLatency, createEmptyLatency())
     currentLatencyComplete.value = false
@@ -533,6 +605,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     // inspected with a recorded session without changing the backend.
     connection.value = 'connected'
     connectionError.value = ''
+    resetPerceptualLatency()
     state.value = fixture.state
     listening.value = fixture.listening
     canStart.value = fixture.canStart ?? true
@@ -704,7 +777,16 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (typeof payload.listening === 'boolean') listening.value = payload.listening
     if (typeof payload.can_start === 'boolean') canStart.value = payload.can_start
     if (turnId) adoptTurn(turnId)
+    if (payload.state === 'FINALIZING') {
+      // This is the earliest public end-of-input boundary.  The clock is
+      // local to the browser, so later backend latency snapshots cannot move
+      // or delay the displayed perceptual measurement.
+      startPerceptualLatency(turnId ?? currentTurnId.value)
+    }
     if (payload.listening === false && payload.state === 'IDLE') {
+      // Preserve the last completed value when the user stops the session;
+      // only an in-flight measurement should be cancelled here.
+      cancelPerceptualLatency()
       playbackQueue.value = []
       lastPlayback.value = null
       speechProgress.value = null
@@ -714,6 +796,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
   function applyCompletedTurn(payload: TurnCompletedPayload, turnId: string | null) {
     if (!turnId) return
+    cancelPerceptualLatency(turnId)
     const transcript = typeof payload.transcript === 'string' ? payload.transcript : current.final_text
     const response = typeof payload.response === 'string' ? payload.response : current.assistant_text
     const completedAt = typeof payload.completed_at === 'string' ? payload.completed_at : ''
@@ -798,6 +881,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       const item = readPlaybackItem(payload, 'playing')
       if (item && (!agentEpisode.value?.conversation_id || item.conversation_id === agentEpisode.value.conversation_id)) {
         upsertPlaybackItem(item)
+        stopPerceptualLatency(item.turn_id || message.turn_id || readString(payload, 'turn_id'))
       }
       return
     }
@@ -853,7 +937,12 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         if (oldSpeechId && conversationId) recordPlaybackResult({ ...payload, speech_id: oldSpeechId }, 'replaced')
       }
     }
-    if (message.type === 'input.started') adoptTurn(message.turn_id ?? null)
+    if (message.type === 'input.started') {
+      // input.started also covers a resumed same-turn input.  Resetting here
+      // lets the next finalized utterance get its own response measurement.
+      resetPerceptualLatency()
+      adoptTurn(message.turn_id ?? null)
+    }
     if (message.turn_id === currentTurnId.value && isRecord(payload.workspace)) {
       current.input_runtime = true
       applyWorkspace(payload.workspace)
@@ -868,12 +957,20 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         break
       case 'input.updated':
         if (acceptsCurrentTurn(message.turn_id ?? null)) {
+          // A new partial after playback (same turn continuation) begins a
+          // new measurement window; ordinary partials before finalization do
+          // not affect an idle stopwatch.
+          preparePerceptualLatencyForInput(message.turn_id ?? null)
           const text = readString(payload, 'text')
           if (text !== null) current.partial_text = text
         }
         break
       case 'input.finalized':
         if (acceptsCurrentTurn(message.turn_id ?? null)) {
+          // FINALIZING normally starts the timer earlier.  Keep this as a
+          // compatibility fallback for servers that only send transcript
+          // finalization, and make late refinements a no-op for the same turn.
+          startPerceptualLatency(message.turn_id ?? readString(payload, 'turn_id'))
           const text = readString(payload, 'text')
           if (text !== null) {
             if (readString(payload, 'source') === 'sensevoice') {
@@ -1052,6 +1149,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     current,
     currentLatency,
     currentLatencyComplete,
+    perceptualLatencyMs,
+    perceptualLatencyRunning,
     services,
     recentTurns,
     agentEpisode,

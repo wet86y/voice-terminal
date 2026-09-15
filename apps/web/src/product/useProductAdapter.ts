@@ -362,11 +362,22 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   })
 
   const latencyMs = computed(() => {
-    const values = connected.value ? voice.currentLatency : runtimeSource.value?.latency?.values
+    if (connected.value) {
+      // The product metric is deliberately browser-owned: it starts when
+      // FINALIZING reaches the UI and stops on speech.started.  Keep replay
+      // mode's recorded value available without allowing backend telemetry to
+      // overwrite a live measurement.
+      if (voice.perceptualLatencyMs.value !== null || !replayMode) return voice.perceptualLatencyMs.value
+      const values = voice.currentLatency
+      const candidates = [values.speech_end_to_playback_ms, values.agent_request_to_speak_ms, values.turn_total_ms]
+      return candidates.find(value => typeof value === 'number' && Number.isFinite(value)) ?? null
+    }
+    const values = runtimeSource.value?.latency?.values
     if (!values) return null
     const candidates = [values.speech_end_to_playback_ms, values.agent_request_to_speak_ms, values.turn_total_ms]
     return candidates.find(value => typeof value === 'number' && Number.isFinite(value)) ?? null
   })
+  const latencyRunning = computed(() => connected.value && voice.perceptualLatencyRunning.value)
 
   function runtimeAction() {
     if (replayMode) {
@@ -751,6 +762,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     conversation,
     shadow,
     latencyMs,
+    latencyRunning,
     wakeForm,
     silenceSeconds,
     personaDocument,
