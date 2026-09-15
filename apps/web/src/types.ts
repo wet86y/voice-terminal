@@ -416,3 +416,29 @@ export interface AgentEpisodeSnapshot {
   trace?: AgentTrace[]
   outputs?: SpeechOutputRecord[]
 }
+
+/**
+ * Development-only state injection used by the local log replay view.
+ * It mirrors the public runtime projection rather than exposing raw prompts
+ * or internal provider/tool payloads.
+ */
+export interface VoiceReplayFixture {
+  state: TerminalState
+  listening: boolean
+  canStart?: boolean
+  wakeAlwaysOn?: boolean
+  inputOwner?: 'none' | 'kws' | 'asr'
+  reasoningMode?: ReasoningMode
+  services?: Partial<ServiceStatuses>
+  current: Partial<CurrentTurnSnapshot>
+  currentLatency?: Partial<LatencyValues>
+  currentLatencyComplete?: boolean
+  recentInputs: InputRecord[]
+  shadow: ShadowProductSnapshot
+  agent?: AgentEpisodeSnapshot | null
+  agentTrace?: AgentTrace[]
+  speechOutputs?: SpeechOutputRecord[]
+  playbackQueue?: PlaybackQueueItem[]
+  lastPlayback?: LastPlaybackResult | null
+  reasoning?: string
+}

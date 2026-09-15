@@ -12,6 +12,7 @@ import type {
   ProductSnapshot,
   ProductTtsProfile,
 } from './types'
+import { voiceShadowReplayFixture, voiceShadowReplayMeta } from './replay-data'
 
 export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'models'
 export type ProductPage = 'home' | 'settings'
@@ -135,6 +136,9 @@ function updateSettingsFromResponse(settings: ProductSettingsSnapshot, result: P
 
 export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const voice = useVoiceTerminal(options)
+  const replayMode = import.meta.env.DEV
+    && typeof window !== 'undefined'
+    && new URLSearchParams(window.location.search).get('replay') === 'voice-shadow'
   const page = ref<ProductPage>('home')
   const settingsTab = ref<ProductSettingsTab>('wake')
   const snapshot = ref<ProductSnapshot | null>(null)
@@ -179,6 +183,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   let snapshotRequest: Promise<void> | null = null
   let reconnectTimer: number | undefined
+  let replayTimer: number | undefined
   let mutationQueue: Promise<unknown> = Promise.resolve()
 
   function enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -336,6 +341,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   })
 
   function runtimeAction() {
+    if (replayMode) {
+      setNotice('当前是日志回放，只读查看测试数据；移除 URL 中的 replay 参数后恢复真实操作。')
+      return false
+    }
     if (!connected.value) {
       voice.connect()
       void loadSnapshot()
@@ -345,11 +354,19 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   function resetSession() {
+    if (replayMode) {
+      setNotice('当前是日志回放，只读查看测试数据；不会向后端发送 reset。')
+      return false
+    }
     if (!connected.value) return false
     return voice.resetSession()
   }
 
   function setReasoningMode(mode: ReasoningMode) {
+    if (replayMode) {
+      setNotice('当前是日志回放，只读查看测试数据；思考模式不会提交到后端。')
+      return false
+    }
     if (!connected.value) return false
     return voice.setReasoningMode(mode)
   }
@@ -651,8 +668,19 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     void loadSnapshot()
   }
 
+  function scheduleReplay() {
+    if (!replayMode) return
+    if (replayTimer !== undefined) window.clearTimeout(replayTimer)
+    replayTimer = window.setTimeout(() => {
+      voice.injectReplay(voiceShadowReplayFixture)
+    }, 220)
+  }
+
   watch(voice.connection, value => {
-    if (value === 'connected') void loadSnapshot()
+    if (value === 'connected') {
+      void loadSnapshot()
+      scheduleReplay()
+    }
     if (value === 'offline') {
       lastError.value = voice.connectionError.value || 'Voice Server 连接已关闭。'
     }
@@ -660,6 +688,13 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   onMounted(() => {
     connect()
+    if (replayMode) {
+      // Keep the local page inspectable even if the WebSocket takes longer
+      // than usual to open; the normal connected path re-applies the fixture.
+      replayTimer = window.setTimeout(() => {
+        if (voice.connection.value !== 'connected') voice.injectReplay(voiceShadowReplayFixture)
+      }, 900)
+    }
     reconnectTimer = window.setInterval(() => {
       if (voice.connection.value === 'offline') voice.connect()
     }, 3000)
@@ -667,6 +702,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   onBeforeUnmount(() => {
     if (reconnectTimer !== undefined) window.clearInterval(reconnectTimer)
+    if (replayTimer !== undefined) window.clearTimeout(replayTimer)
     voice.dispose()
   })
 
@@ -680,6 +716,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     loading,
     saving,
     connected,
+    replayMode,
+    replayMeta: voiceShadowReplayMeta,
     runtimeState,
     current,
     conversation,

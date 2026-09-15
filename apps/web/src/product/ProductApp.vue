@@ -6,7 +6,7 @@ import { useProductAdapter, type AssignmentSlot, type ProductSettingsTab, type P
 const adapter = useProductAdapter()
 const {
   voice, page: activePage, settingsTab: activeSettingsTab, settings, loading, saving,
-  connected, runtimeState, current, conversation, shadow, latencyMs, wakeForm,
+  connected, replayMode, replayMeta, runtimeState, current, conversation, shadow, latencyMs, wakeForm,
   silenceSeconds, personaDocument: activePersona, personaDocuments, providerForm,
   providerStep, discoveredModels, modelAssignments, uiModels: modelEntries,
   availableLlmModels, availableTtsModels, visibleLocalPool, hiddenPool,
@@ -67,13 +67,65 @@ const runtimeMeta = computed(() => {
     error: ['需要检查', '运行时报告了错误，请查看服务状态或重试。', 'ERROR'],
   } as const
   const [label, description, chip] = labels[runtimeState.value]
-  return { label, description, chip, timestamp: connected.value ? '实时运行时状态' : '等待 Voice Server' }
+  return { label, description, chip, timestamp: replayMode ? replayMeta.label : connected.value ? '实时运行时状态' : '等待 Voice Server' }
 })
 
 const currentDocument = computed(() => personaItems.find(item => item.id === activePersona.value) || personaItems[0])
 const hasConversation = computed(() => conversation.value.length > 0
   || Boolean(current.value.partial_text || current.value.final_text || current.value.assistant_text || current.value.tts_text))
 const currentThinkingModel = computed(() => selectedModels.value.shadow)
+const thinkingOptionLabels: Record<string, { label: string; shortLabel: string }> = {
+  off: { label: '关闭', shortLabel: 'Off' },
+  low: { label: '低', shortLabel: 'Low' },
+  medium: { label: '中', shortLabel: 'Medium' },
+  high: { label: '高', shortLabel: 'High' },
+  max: { label: '最大', shortLabel: 'Max' },
+}
+const currentThinkingOption = computed(() => {
+  const options = shadowThinkingOptions.value.length ? shadowThinkingOptions.value : ['off']
+  const value = options.includes(shadowThinking.value) ? shadowThinking.value : options[options.length - 1]
+  return { value, ...(thinkingOptionLabels[value] || { label: value, shortLabel: value }) }
+})
+const currentThinkingIndex = computed(() => {
+  const index = shadowThinkingOptions.value.indexOf(currentThinkingOption.value.value)
+  return Math.max(0, index)
+})
+const thinkingProgress = computed(() => {
+  const count = shadowThinkingOptions.value.length
+  return count > 1 ? (currentThinkingIndex.value / (count - 1)) * 100 : 100
+})
+const thinkingSliderStyle = computed(() => ({ '--thinking-progress': `${thinkingProgress.value}%` }))
+const shadowContext = computed(() => {
+  const context = shadow.value.context
+  if (!context || (context.used_tokens == null && context.limit_tokens == null && context.usage_percent == null)) return null
+  return context
+})
+const shadowCacheHitRatio = computed(() => {
+  const ratio = shadow.value.provider?.cache_hit_ratio
+  return typeof ratio === 'number' && Number.isFinite(ratio) && ratio >= 0 && ratio <= 1 ? ratio : null
+})
+const conversationContext = computed(() => {
+  const episode = voice.agentEpisode.value
+  if (!episode || typeof episode.context_token_estimate !== 'number'
+    || !Number.isFinite(episode.context_token_estimate) || episode.context_token_estimate <= 0) return null
+  return {
+    usedTokens: episode.context_token_estimate,
+    limitTokens: episode.context_limit_tokens,
+    usagePercent: episode.context_usage_percent,
+  }
+})
+const conversationCacheHitRatio = computed(() => {
+  const ratio = voice.agentEpisode.value?.provider_cache_hit_ratio
+  return typeof ratio === 'number' && Number.isFinite(ratio) && ratio >= 0 && ratio <= 1 ? ratio : null
+})
+const shadowContextTooltip = computed(() => {
+  if (!shadowContext.value) return '上下文占用 · 后端尚未提供 telemetry'
+  return `上下文占用 · ${formatTokens(shadowContext.value.used_tokens)} / ${formatTokens(shadowContext.value.limit_tokens)} · ${shadowContext.value.usage_percent ?? '—'}%`
+})
+const conversationContextTooltip = computed(() => {
+  if (!conversationContext.value) return '上下文占用 · 后端尚未提供 telemetry'
+  return `上下文占用 · ${formatTokens(conversationContext.value.usedTokens)} / ${formatTokens(conversationContext.value.limitTokens)} · ${conversationContext.value.usagePercent ?? '—'}%`
+})
 const modelPoolSummary = computed(() => `${managedApiModelPool.value.length} 个可编辑 API · ${availableLlmModels.value.length} LLM · ${availableTtsModels.value.length} TTS`)
 const apiModelPool = computed(() => modelEntries.value.filter(item => (item.capability === 'llm' || item.capability === 'tts') && !item.hidden))
 const hiddenApiModelPool = computed(() => modelEntries.value.filter(item => (item.capability === 'llm' || item.capability === 'tts') && item.hidden))
@@ -104,6 +156,28 @@ function formatTokens(value: number | null | undefined) {
 
 function contextPercent(value: number | null | undefined) {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0
+}
+
+function setShadowThinkingFromSlider(event: Event, collapse = false) {
+  const slider = event.target as HTMLInputElement
+  const option = shadowThinkingOptions.value[Number(slider.value)]
+  if (!option) return
+  shadowThinking.value = option
+  if (collapse) {
+    setShadowThinking(option)
+    thinkingExpanded.value = false
+  }
+}
+
+function setShadowThinkingFromTrackClick(event: MouseEvent) {
+  const slider = event.currentTarget as HTMLInputElement
+  const bounds = slider.getBoundingClientRect()
+  const ratio = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width))
+  const optionIndex = Math.round(ratio * (shadowThinkingOptions.value.length - 1))
+  const option = shadowThinkingOptions.value[optionIndex]
+  if (!option) return
+  setShadowThinking(option)
+  thinkingExpanded.value = false
 }
 
 function providerClass(item: ProductUiModel | undefined) {
@@ -253,10 +327,11 @@ async function selectDiscoveredModel(event: Event) {
 function pageLabel() {
   return activePage.value === 'home' ? '工作台' : '设置'
 }
+
 </script>
 
 <template>
-  <main class="prototype-shell" :class="`runtime-${runtimeState}`">
+  <main class="prototype-shell product-shell" :class="`runtime-${runtimeState}`">
     <header class="prototype-topbar">
       <button class="brand" type="button" aria-label="回到首页" @click="activePage = 'home'">
         <span class="brand-symbol"><i></i><i></i><i></i></span>
@@ -268,32 +343,48 @@ function pageLabel() {
       </nav>
       <div class="topbar-status">
         <span class="prototype-tag"><i></i> PRODUCT UI · LIVE</span>
-        <span class="mock-tag">{{ connected ? '本机已连接' : '离线可重试' }}</span>
+        <span class="mock-tag">{{ replayMode ? `${replayMeta.label} · 只读` : connected ? '本机已连接' : '离线可重试' }}</span>
       </div>
     </header>
 
-    <section v-if="activePage === 'home'" class="workbench workbench-reordered" aria-label="Voice Terminal 工作台">
+    <!-- Keep both top-level views mounted; v-show preserves state without paying for a hidden layout. -->
+    <section v-show="activePage === 'home'" :class="{ 'view-hidden': activePage !== 'home' }" class="workbench workbench-reordered" aria-label="Voice Terminal 工作台">
       <aside class="shadow-column panel">
         <header class="shadow-header">
           <div><p class="panel-kicker"><span class="shadow-spark">✦</span> Shadow Agent</p><h2>后台协作</h2></div>
           <button class="expand-button" type="button" :aria-expanded="shadowExpanded" @click="shadowExpanded = !shadowExpanded">{{ shadowExpanded ? '收起' : '展开' }} <span>{{ shadowExpanded ? '−' : '+' }}</span></button>
         </header>
-        <section class="shadow-state-card">
-          <div><span class="shadow-live-dot" :style="{ opacity: shadow.available ? 1 : .45 }"></span>{{ shadow.available ? (shadow.active ? '正在后台处理' : shadow.user_input_required ? '等待你的输入' : '随时可协作') : '当前不可用' }}</div>
-          <strong>{{ shadow.available ? shadow.phase : 'Unavailable' }}</strong>
-        </section>
-        <section class="shadow-task"><p class="section-label">当前关注</p><h3>{{ shadow.available ? (shadow.focus || '等待真实会话上下文') : 'Shadow Agent 当前不可用' }}</h3><p>{{ shadow.available ? (shadow.summary || '启动会话后，后台状态会在这里出现。') : '后端没有提供可用 Shadow 运行时，不显示模拟任务。' }}</p></section>
-        <section class="shadow-summary"><div class="section-row"><span>实时工作简报</span><small>{{ shadow.available ? '产品投影' : '不可用' }}</small></div><p>{{ shadow.summary || (shadow.available ? '暂无可读简报。' : '当前没有 Shadow 简报。') }}</p></section>
-        <section class="shadow-timeline"><div class="section-row"><span>安全时间线</span><small>{{ shadow.timeline.length }} / 5</small></div><ol><li v-for="item in shadow.timeline" :key="`${item.timestamp}-${item.label}-${item.text}`" :class="item.state"><i></i><div><strong>{{ item.label }}</strong><span>{{ item.text || '已更新' }}<small v-if="item.timestamp"> · {{ formatTime(item.timestamp) }}</small></span></div></li><li v-if="!shadow.timeline.length" class="empty-shadow-line"><i></i><div><strong>暂无后台事件</strong><span>不会注入假任务或假时间线</span></div></li></ol></section>
-        <section v-if="shadowExpanded" class="shadow-details"><div class="detail-row"><span>状态</span><strong>{{ shadow.available ? shadow.phase : 'unavailable' }}</strong></div><div v-if="shadow.user_input_required" class="detail-row"><span>需要操作</span><strong>等待用户输入</strong></div><p>只显示后端安全投影；原始 trace、prompt、工具参数和内部 revision 不会进入产品页面。</p></section>
+        <div class="shadow-scroll">
+          <section class="shadow-state-card">
+            <div><span class="shadow-live-dot" :style="{ opacity: shadow.available ? 1 : .45 }"></span>{{ shadow.available ? (shadow.active ? '正在后台处理' : shadow.user_input_required ? '等待你的输入' : '随时可协作') : '当前不可用' }}</div>
+            <strong>{{ shadow.available ? shadow.phase : 'Unavailable' }}</strong>
+          </section>
+          <section class="shadow-task"><p class="section-label">当前关注</p><h3>{{ shadow.available ? (shadow.focus || '等待真实会话上下文') : 'Shadow Agent 当前不可用' }}</h3><p>{{ shadow.available ? (shadow.summary || '启动会话后，后台状态会在这里出现。') : '后端没有提供可用 Shadow 运行时，不显示模拟任务。' }}</p></section>
+          <section class="shadow-summary"><div class="section-row"><span>实时工作简报</span><small>{{ shadow.available ? '产品投影' : '不可用' }}</small></div><p>{{ shadow.summary || (shadow.available ? '暂无可读简报。' : '当前没有 Shadow 简报。') }}</p></section>
+          <section class="shadow-timeline"><div class="section-row"><span>安全时间线</span><small>{{ shadow.timeline.length }} / 5</small></div><ol><li v-for="item in shadow.timeline" :key="`${item.timestamp}-${item.label}-${item.text}`" :class="item.state"><i></i><div><strong>{{ item.label }}</strong><span>{{ item.text || '已更新' }}<small v-if="item.timestamp"> · {{ formatTime(item.timestamp) }}</small></span></div></li><li v-if="!shadow.timeline.length" class="empty-shadow-line"><i></i><div><strong>暂无后台事件</strong><span>不会注入假任务或假时间线</span></div></li></ol></section>
+          <section v-if="shadowExpanded" class="shadow-details"><div class="detail-row"><span>状态</span><strong>{{ shadow.available ? shadow.phase : 'unavailable' }}</strong></div><div v-if="shadow.user_input_required" class="detail-row"><span>需要操作</span><strong>等待用户输入</strong></div><p>只显示后端安全投影；原始 trace、prompt、工具参数和内部 revision 不会进入产品页面。</p></section>
+        </div>
         <footer class="panel-resource-footer shadow-resource-footer">
           <section class="resource-metrics shadow-resource-metrics" aria-label="Shadow 模型资源与思考强度">
-            <div v-if="shadow.context && shadow.context.used_tokens !== undefined && shadow.context.used_tokens !== null" class="resource-meter context-meter" role="img" :aria-label="`上下文占用 ${formatTokens(shadow.context.used_tokens)} / ${formatTokens(shadow.context.limit_tokens)}，使用率 ${contextPercent(shadow.context.usage_percent)}%`">
-              <span>上下文占用</span><strong>{{ formatTokens(shadow.context.used_tokens) }} <small>/ {{ formatTokens(shadow.context.limit_tokens) }}</small></strong><i><b :style="{ width: `${contextPercent(shadow.context.usage_percent)}%` }"></b></i><em>{{ shadow.context.usage_percent ?? '—' }}%</em>
+            <div class="resource-meter context-meter" tabindex="0" role="img" :aria-label="shadowContextTooltip" :data-tooltip="shadowContextTooltip">
+              <span>上下文占用</span><strong>{{ formatTokens(shadowContext?.used_tokens) }}<small v-if="shadowContext?.limit_tokens != null"> / {{ formatTokens(shadowContext.limit_tokens) }}</small></strong><i :class="{ 'meter-empty': shadowContext?.usage_percent == null }"><b :style="{ width: `${contextPercent(shadowContext?.usage_percent)}%` }"></b></i><em>{{ shadowContext?.usage_percent ?? '—' }}<span v-if="shadowContext?.usage_percent != null">%</span></em>
             </div>
-            <div v-else class="resource-meter context-meter"><span>上下文占用</span><strong>—</strong><small>后端尚未提供 telemetry</small></div>
-            <div class="thinking-meter"><div class="thinking-control"><button class="thinking-trigger" type="button" :aria-expanded="thinkingExpanded" :aria-label="`Shadow 思考等级：${selectedShadowReasoning}`" @click="thinkingExpanded = !thinkingExpanded"><strong>{{ selectedShadowReasoning }}</strong><i aria-hidden="true">⌄</i></button><div v-if="thinkingExpanded" class="thinking-popover" role="dialog" aria-label="Shadow 思考等级设置"><div class="thinking-popover-header"><div><strong>Shadow · {{ selectedShadowReasoning }}</strong><span>{{ currentThinkingModel?.name || '当前模型' }}</span></div><button type="button" aria-label="收起思考强度设置" @click="thinkingExpanded = false">×</button></div><div class="shadow-thinking"><span>模型允许等级</span><div><button v-for="level in shadowThinkingOptions" :key="level" type="button" :class="{ active: shadowThinking === level }" @click="setShadowThinking(level)">{{ level }}</button></div></div><small>选择会在下一次模型配置应用时按所选模型能力提交。</small></div></div></div>
-            <div v-if="shadow.provider && shadow.provider.cache_hit_ratio !== undefined && shadow.provider.cache_hit_ratio !== null" class="resource-meter cache-rate-number"><strong>{{ Math.round(Number(shadow.provider.cache_hit_ratio) * 100) }}%</strong><small>缓存命中</small></div><div v-else class="resource-meter cache-rate-number"><strong>—</strong><small>无缓存数据</small></div>
+            <div class="thinking-meter">
+              <div class="thinking-control">
+                <button class="thinking-trigger" type="button" :aria-expanded="thinkingExpanded" :aria-label="`Shadow 思考等级：${currentThinkingOption.label}`" @click="thinkingExpanded = !thinkingExpanded">
+                  <strong>{{ currentThinkingOption.shortLabel.toLowerCase() }}</strong><i aria-hidden="true">⌄</i>
+                </button>
+                <div v-if="thinkingExpanded" class="thinking-popover" role="dialog" aria-label="Shadow 思考等级设置">
+                  <div class="thinking-popover-header">
+                    <div><strong>{{ currentThinkingOption.label }}</strong><span>{{ currentThinkingModel?.name || '当前模型' }}</span></div>
+                    <button type="button" aria-label="收起思考强度设置" @click="thinkingExpanded = false">×</button>
+                  </div>
+                  <input class="thinking-slider" type="range" :min="0" :max="Math.max(shadowThinkingOptions.length - 1, 0)" step="1" :value="currentThinkingIndex" :style="thinkingSliderStyle" :aria-valuetext="currentThinkingOption.label" aria-label="选择思考强度" @input="setShadowThinkingFromSlider($event)" @change="setShadowThinkingFromSlider($event, true)" @click="setShadowThinkingFromTrackClick">
+                  <div class="thinking-scale" aria-hidden="true"><span v-for="(level, index) in shadowThinkingOptions" :key="level" :class="{ active: index === currentThinkingIndex }">{{ thinkingOptionLabels[level]?.shortLabel || level }}</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="resource-meter cache-rate-number shadow-cache-rate-number" tabindex="0" role="img" :aria-label="shadowCacheHitRatio === null ? '缓存命中率暂无数据' : `缓存命中率 ${Math.round(shadowCacheHitRatio * 100)}%`" :data-tooltip="shadowCacheHitRatio === null ? '缓存命中率 · 暂无数据' : `缓存命中率 · ${Math.round(shadowCacheHitRatio * 100)}%`"><strong>{{ shadowCacheHitRatio === null ? '—' : `${Math.round(shadowCacheHitRatio * 100)}%` }}</strong></div>
           </section>
         </footer>
       </aside>
@@ -303,10 +394,10 @@ function pageLabel() {
         <div class="system-heading"><div><h2 class="system-state">{{ runtimeMeta.label }}</h2><p class="system-subtitle">{{ runtimeMeta.timestamp }}</p></div><span class="state-chip" :class="runtimeState">{{ runtimeMeta.chip }}</span></div>
         <div class="orb-stage" :class="`orb-${runtimeState}`"><span class="orb-halo halo-one"></span><span class="orb-halo halo-two"></span><span class="orb-halo halo-three"></span><span class="voice-orb"><i></i><i></i><i></i><i></i><i></i></span></div>
         <p class="orb-caption">{{ runtimeMeta.description }}</p>
-        <button class="runtime-button" type="button" :disabled="loading" @click="runtimeAction">{{ connected ? (listening ? '停止当前会话' : '开始语音会话') : '重试连接' }}</button>
-        <button v-if="connected && !listening" class="ghost-action" type="button" @click="resetSession">重置当前会话</button>
+        <button class="runtime-button" type="button" :disabled="loading || replayMode" @click="runtimeAction">{{ replayMode ? '日志回放中' : connected ? (listening ? '停止当前会话' : '开始语音会话') : '重试连接' }}</button>
+        <button v-if="connected && !listening && !replayMode" class="ghost-action" type="button" @click="resetSession">重置当前会话</button>
         <section class="metric-card"><div class="metric-label"><span>本轮响应</span><button type="button" title="真实 latency，没有数据时显示破折号">i</button></div><strong>{{ formatMs(latencyMs) }}</strong><p>用户说完 → AI 开口</p><div class="metric-spark"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></section>
-        <section class="mode-picker"><div class="section-row"><span>运行模式</span><small>下一轮生效</small></div><div class="mode-options"><button v-for="mode in [{ value: 'fast', label: '快速' }, { value: 'balanced', label: '均衡' }, { value: 'deep', label: '深度' }]" :key="mode.value" type="button" :class="{ selected: reasoningMode === mode.value }" :disabled="!connected" @click="setReasoningMode(mode.value as ReasoningMode)">{{ mode.label }}</button></div></section>
+        <section class="mode-picker"><div class="section-row"><span>运行模式</span><small>下一轮生效</small></div><div class="mode-options"><button v-for="mode in [{ value: 'fast', label: '快速' }, { value: 'balanced', label: '均衡' }, { value: 'deep', label: '深度' }]" :key="mode.value" type="button" :class="{ selected: reasoningMode === mode.value }" :disabled="!connected || replayMode" @click="setReasoningMode(mode.value as ReasoningMode)">{{ mode.label }}</button></div></section>
         <section class="system-model-config"><div class="section-row"><span>当前模型</span><small>{{ connected ? '已应用运行时' : '等待连接' }}</small></div><div class="system-model-grid"><article class="system-model-card"><p>VOICE</p><strong>{{ activeModels.voice?.name || '未分配' }}</strong><small>{{ activeModels.voice?.modelId || '—' }}</small></article><article class="system-model-card"><p>SHADOW</p><strong>{{ activeModels.shadow?.name || '未分配' }}</strong><small>{{ activeModels.shadow?.modelId || '—' }}</small></article><article class="system-model-card"><p>TTS</p><strong>{{ activeModels.tts?.name || '未分配' }}</strong><small>{{ activeTtsModel?.modelId || (activeModels.tts ? activeModels.tts.model_id : '—') }}</small></article></div></section>
       </section>
 
@@ -315,18 +406,21 @@ function pageLabel() {
         <div class="conversation-stream" :class="{ empty: !hasConversation }">
           <div v-if="!hasConversation" class="empty-conversation"><span class="empty-mark">✦</span><strong>{{ runtimeState === 'error' ? '语音服务需要检查' : runtimeState === 'offline' ? '后端离线，页面仍可重试' : '等待真实语音输入' }}</strong><p>{{ runtimeState === 'offline' ? (lastError || '确认 Voice Server 已启动后点击重试。') : '语音、转写、助手回复和 TTS 进度会从真实运行时进入这里。' }}</p><button v-if="runtimeState === 'offline'" class="outline-button" type="button" @click="retry">重试连接</button></div>
           <template v-else>
-            <article v-for="record in conversation" :key="record.turn_id" class="message user-message"><div class="message-meta"><span class="avatar user-avatar">你</span><span>你</span><time>{{ formatTime(record.completed_at) }}</time></div><p>{{ record.transcript || '（没有可显示的转写）' }}</p><span class="message-status">{{ record.status || record.delivery?.status || '已记录' }}</span><div v-if="record.response" class="message assistant-message"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ formatTime(record.completed_at) }}</time></div><p>{{ record.response }}</p><div class="speech-queue"><span class="queue-dot"></span>已完成本轮播报结算</div></div></article>
+            <template v-for="record in conversation" :key="record.turn_id">
+              <article class="message user-message"><div class="message-meta"><span class="avatar user-avatar">你</span><span>你</span><time>{{ formatTime(record.completed_at) }}</time></div><p>{{ record.transcript || '（没有可显示的转写）' }}</p><span class="message-status">{{ record.status || record.delivery?.status || '已记录' }}</span></article>
+              <article v-if="record.response" class="message assistant-message"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ formatTime(record.completed_at) }}</time></div><p>{{ record.response }}</p><div class="speech-queue"><span class="queue-dot"></span>已完成本轮播报结算</div></article>
+            </template>
             <article v-if="current.final_text && !conversation.some(item => item.transcript === current.final_text)" class="message user-message live-final"><div class="message-meta"><span class="avatar user-avatar">你</span><span>你</span><time>本轮</time></div><p>{{ current.final_text }}</p><span class="message-status">已完成识别 · 等待回复</span></article>
             <div v-if="current.partial_text" class="live-asr"><span class="live-dot"></span><span>实时识别</span><p>{{ current.partial_text }}</p><span class="typing-bars"><i></i><i></i><i></i></span></div>
             <div v-if="runtimeState === 'thinking' && !current.assistant_text" class="assistant-pending"><span><i></i><i></i><i></i></span>正在准备回复</div>
             <article v-if="current.assistant_text && !conversation.some(item => item.response === current.assistant_text)" class="message assistant-message" :class="{ speaking: runtimeState === 'speaking' }"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ runtimeState === 'speaking' ? '正在播报' : '本轮' }}</time></div><p>{{ current.assistant_text }}</p><div class="speech-queue"><span class="queue-dot" :class="{ playing: runtimeState === 'speaking' }"></span>{{ runtimeState === 'speaking' ? '正在播放真实 TTS · 随时可以打断' : current.tts_status || '等待播报结算' }}</div></article>
           </template>
         </div>
-        <footer class="panel-resource-footer conversation-footer"><div><span class="footer-mic"><i></i>{{ listening ? '正在聆听你的声音' : connected ? '语音由本机服务处理' : '等待本机 Voice Server' }}</span><span>无输入框 · 通过语音继续 · {{ pageLabel() }}</span></div><section class="resource-metrics conversation-resource-metrics" aria-label="当前模型 telemetry"><div v-if="contextUsagePercent !== null" class="resource-meter context-meter"><span>上下文占用</span><strong>{{ contextUsagePercent }}%</strong></div><div v-else class="resource-meter context-meter"><span>延迟数据</span><strong>{{ formatMs(latencyMs) }}</strong></div><div class="resource-meter cache-rate-number"><strong>{{ current.tts_status || '—' }}</strong><small>TTS 状态</small></div></section></footer>
+        <footer class="panel-resource-footer conversation-footer"><div><span class="footer-mic"><i></i>{{ listening ? '正在聆听你的声音' : connected ? '语音由本机服务处理' : '等待本机 Voice Server' }}</span><span>无输入框 · 通过语音继续 · {{ pageLabel() }}</span></div><section class="resource-metrics conversation-resource-metrics" aria-label="模型资源概览"><div class="resource-meter context-meter" tabindex="0" role="img" :aria-label="conversationContextTooltip" :data-tooltip="conversationContextTooltip"><span>上下文占用</span><strong>{{ formatTokens(conversationContext?.usedTokens) }}<small v-if="conversationContext?.limitTokens != null"> / {{ formatTokens(conversationContext.limitTokens) }}</small></strong><i :class="{ 'meter-empty': conversationContext?.usagePercent == null }"><b :style="{ width: `${contextPercent(conversationContext?.usagePercent)}%` }"></b></i><em>{{ conversationContext?.usagePercent ?? '—' }}<span v-if="conversationContext?.usagePercent != null">%</span></em></div><div class="resource-meter cache-rate-number" tabindex="0" role="img" :aria-label="conversationCacheHitRatio === null ? '缓存命中率暂无数据' : `缓存命中率 ${Math.round(conversationCacheHitRatio * 100)}%`" :data-tooltip="conversationCacheHitRatio === null ? '缓存命中率 · 暂无数据' : `缓存命中率 · ${Math.round(conversationCacheHitRatio * 100)}%`"><strong>{{ conversationCacheHitRatio === null ? '—' : `${Math.round(conversationCacheHitRatio * 100)}%` }}</strong></div></section></footer>
       </section>
     </section>
 
-    <section v-else class="settings-page">
+    <section v-show="activePage === 'settings'" :class="{ 'view-hidden': activePage !== 'settings' }" class="settings-page">
       <header class="settings-heading"><div><p class="panel-kicker">应用设置</p><h1>让助手更像你的工作方式</h1><p>设置通过 Voice Server 产品 API 保存；KWS、Persona、最终静默设置在安全边界后于下一次会话或 Episode 生效。</p></div><span class="settings-badge">{{ connected ? '实时后端已连接' : '后端离线 · 可重试' }}</span></header>
       <div v-if="settings.warnings.length" class="model-safety"><span>!</span><p>{{ settings.warnings.join(' ') }}</p></div>
       <div class="settings-layout">

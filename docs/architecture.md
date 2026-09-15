@@ -130,3 +130,15 @@ revision、时间、run ID、nonce 不进入固定前缀。相邻请求依靠完
 | READ_ONLY capabilities | `voice_terminal/shadow_agent/tools.py` |
 | revision authority/main projection | `voice_terminal/session/ledger.py` |
 | main action dispatch/heartbeat accept | `voice_terminal/agent/episode.py` |
+| Product UI 页面与会话投影 | `apps/web/src/product/ProductApp.vue` |
+| Product API、Voice Server 适配与设置状态 | `apps/web/src/product/useProductAdapter.ts` |
+| 日志回放 fixture（开发只读） | `apps/web/src/product/replay-data.ts` |
+
+Product UI 的一级导航只有 `home` 和 `settings`。两个页面组件可以保留各自的表单/滚动状态，
+但隐藏页面必须通过 `v-show` 进入 `display: none`，不能用 `v-if/v-else` 在导航时反复销毁和
+重建。导航只更新前端页面 ref，不发 Voice Server 请求，也不等待后端响应。
+
+Product 页使用固定视口和面板内部滚动；长 Shadow 时间线、系统状态和实时会话不得把整个
+文档高度撑大。Product 大面板不使用大面积 `backdrop-filter`，运行态的 orb、halo 和状态点
+不使用持续的 transform/box-shadow 动画，以避免外部 Edge 在切换页面时重复合成大层。旧版
+`/ui-demo.html` 不继承这些 Product 专用性能规则。

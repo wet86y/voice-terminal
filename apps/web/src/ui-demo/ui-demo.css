@@ -427,3 +427,106 @@ button { cursor: pointer; }
 .workbench-reordered .conversation-resource-metrics > .context-meter, .workbench-reordered .conversation-resource-metrics > .cache-rate-number { height: 32px; min-height: 32px; }
 .workbench-reordered .conversation-resource-metrics > .context-meter { display: flex; align-items: center; }
 .workbench-reordered .conversation-resource-metrics > .context-meter i { height: 5px; margin-top: 0; }
+
+/* Keep the Product workbench inside one viewport; long content belongs to its own pane. */
+html:has(.product-shell), body:has(.product-shell), #app:has(.product-shell) { height: 100%; }
+body:has(.product-shell) { overflow: hidden; }
+.product-shell { height: 100vh; min-height: 100vh; overflow: hidden; }
+.product-shell .workbench { height: calc(100vh - 136px); min-height: 0; }
+.product-shell .workbench-reordered > .shadow-column,
+.product-shell .workbench-reordered > .system-focus-column,
+.product-shell .workbench-reordered > .conversation-column { height: 100%; min-height: 0; }
+.product-shell .shadow-column { min-height: 0; overflow: hidden; }
+.product-shell .shadow-scroll { min-height: 0; flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; padding-right: 4px; scrollbar-gutter: stable; }
+.product-shell .system-focus-column { min-height: 0; }
+.product-shell .workbench-reordered .system-focus-column { justify-content: flex-start; overflow-x: hidden; overflow-y: auto; scrollbar-gutter: stable; }
+.product-shell .conversation-column { min-height: 0; overflow: hidden; }
+.product-shell .conversation-stream { min-height: 0; gap: 10px; padding: 22px clamp(14px, 1.4vw, 24px); overscroll-behavior: contain; scrollbar-gutter: stable; }
+
+/* Make the two side panes visibly scrollable without changing the dark product palette. */
+.product-shell .shadow-scroll, .product-shell .conversation-stream, .product-shell .workbench-reordered .system-focus-column, .product-shell .settings-page { scrollbar-width: thin; scrollbar-color: #7187c0 #0a1426; }
+.product-shell .shadow-scroll::-webkit-scrollbar, .product-shell .conversation-stream::-webkit-scrollbar, .product-shell .workbench-reordered .system-focus-column::-webkit-scrollbar, .product-shell .settings-page::-webkit-scrollbar { width: 7px; }
+.product-shell .shadow-scroll::-webkit-scrollbar-track, .product-shell .conversation-stream::-webkit-scrollbar-track, .product-shell .workbench-reordered .system-focus-column::-webkit-scrollbar-track, .product-shell .settings-page::-webkit-scrollbar-track { border-radius: 99px; background: #0a1426a8; }
+.product-shell .shadow-scroll::-webkit-scrollbar-thumb, .product-shell .conversation-stream::-webkit-scrollbar-thumb, .product-shell .workbench-reordered .system-focus-column::-webkit-scrollbar-thumb, .product-shell .settings-page::-webkit-scrollbar-thumb { border: 1px solid #101b31; border-radius: 99px; background: #7187c0b8; }
+.product-shell .shadow-scroll::-webkit-scrollbar-thumb:hover, .product-shell .conversation-stream::-webkit-scrollbar-thumb:hover, .product-shell .workbench-reordered .system-focus-column::-webkit-scrollbar-thumb:hover, .product-shell .settings-page::-webkit-scrollbar-thumb:hover { background: #91a8e2; }
+
+/* Chat bubbles use the full available rail: user on the right, Voice Terminal on the left. */
+.product-shell .conversation-stream .message { width: min(92%, 680px); max-width: 92%; }
+.product-shell .conversation-stream .user-message { align-self: flex-end; }
+.product-shell .conversation-stream .user-message .message-meta { justify-content: flex-end; }
+.product-shell .conversation-stream .message > p { width: 100%; }
+.product-shell .conversation-stream .user-message > p { border-radius: 14px 4px 14px 14px; background: linear-gradient(135deg, #ffffff12, #ffffff07); }
+.product-shell .conversation-stream .user-message .message-status { display: block; margin: 7px 5px 0 0; text-align: right; }
+.product-shell .conversation-stream .assistant-message { align-self: flex-start; }
+.product-shell .conversation-stream .assistant-message > p { border-radius: 4px 14px 14px 14px; }
+
+/* Product navigation must not rebuild large backdrop-filter surfaces on every page switch. */
+.product-shell > .workbench > .panel,
+.product-shell > .settings-page .panel {
+  backdrop-filter: none;
+  background: linear-gradient(145deg, #17243e, #0e182d);
+}
+
+/* Keep the Product monitor composited as a static surface. The live state is
+   still conveyed by color and text; continuous transform/box-shadow animation
+   makes external Edge repaint large layers while navigation is happening. */
+.product-shell .shadow-live-dot,
+.product-shell .orb-stage .orb-halo,
+.product-shell .orb-stage .voice-orb,
+.product-shell .queue-dot.playing,
+.product-shell .live-dot,
+.product-shell .typing-bars i,
+.product-shell .assistant-pending i,
+.product-shell .shadow-timeline li.active > i {
+  animation: none !important;
+}
+
+/* Settings uses the same fixed viewport contract, so switching pages does not resize the document. */
+.product-shell .settings-page { height: calc(100vh - 155px); min-height: 0; margin: 43px auto 24px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+
+@media (max-width: 800px) {
+  .product-shell .workbench { height: calc(100vh - 118px); margin-top: 20px; margin-bottom: 20px; overflow-y: auto; }
+  .product-shell .workbench-reordered > .shadow-column, .product-shell .workbench-reordered > .system-focus-column, .product-shell .workbench-reordered > .conversation-column { height: auto; min-height: 590px; overflow: visible; }
+  .product-shell .workbench-reordered .system-focus-column { overflow-y: visible; }
+  .product-shell .settings-page { height: calc(100vh - 118px); margin-top: 20px; margin-bottom: 20px; }
+}
+
+/* Pre-layout the two Product views on desktop so switching pages never reflows the document. */
+@media (min-width: 801px) {
+  .product-shell {
+    position: relative;
+  }
+
+  .product-shell > .workbench,
+  .product-shell > .settings-page {
+    position: absolute;
+    left: 50%;
+    margin: 0;
+    transform: translateX(-50%);
+    contain: layout;
+  }
+
+  .product-shell > .workbench {
+    top: 112px;
+  }
+
+  .product-shell > .settings-page {
+    top: 131px;
+  }
+
+  .product-shell > .view-hidden {
+    visibility: hidden;
+    pointer-events: none;
+  }
+
+  .product-shell > .workbench:not(.view-hidden),
+  .product-shell > .settings-page:not(.view-hidden) {
+    z-index: 1;
+  }
+}
+
+@media (max-width: 800px) {
+  .product-shell > .view-hidden {
+    display: none !important;
+  }
+}
