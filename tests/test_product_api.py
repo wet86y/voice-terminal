@@ -92,9 +92,8 @@ class ProductApiTests(unittest.TestCase):
             "PUT", "/api/v1/product/settings/wake",
             json={
                 "enabled": True,
-                "always_on": False,
                 "keyword": "hei claw",
-                "sensitivity": 25,
+                "sensitivity": 75,
             },
         ))
         self.assertEqual(valid_wake.status_code, 200)

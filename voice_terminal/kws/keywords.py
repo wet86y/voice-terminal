@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
 
@@ -12,8 +13,31 @@ DEFAULT_WAKE_KEYWORD = "hei claw"
 DEFAULT_WAKE_LABEL = "HEI_CLAW"
 
 
+def _is_cjk_character(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        0x3400 <= codepoint <= 0x4DBF  # CJK Unified Ideographs Extension A
+        or 0x4E00 <= codepoint <= 0x9FFF  # CJK Unified Ideographs
+        or 0xF900 <= codepoint <= 0xFAFF  # CJK Compatibility Ideographs
+        or 0x20000 <= codepoint <= 0x2FA1F  # CJK Extensions B-I / compatibility
+    )
+
+
+def _contains_cjk(text: str) -> bool:
+    return any(_is_cjk_character(character) for character in text)
+
+
 def normalize_keyword(keyword: str) -> str:
-    normalized = " ".join(keyword.casefold().strip().split())
+    # sherpa's phone+ppinyin converter accepts CJK text directly, but raw
+    # punctuation (especially Chinese comma/colon) is not a pronunciation
+    # token.  Treat Unicode punctuation and whitespace as phrase separators,
+    # while keeping the user-visible spelling and allowing Chinese phrases.
+    folded = unicodedata.normalize("NFKC", keyword).casefold()
+    separated = "".join(
+        " " if character.isspace() or unicodedata.category(character).startswith("P") else character
+        for character in folded
+    )
+    normalized = " ".join(separated.strip().split())
     if not normalized:
         raise ValueError("唤醒词不能为空")
     return normalized
@@ -21,7 +45,12 @@ def normalize_keyword(keyword: str) -> str:
 
 def keyword_label(keyword: str) -> str:
     normalized = normalize_keyword(keyword)
-    label = re.sub(r"[^A-Z0-9]+", "_", normalized.upper()).strip("_")
+    label = "".join(
+        character.upper() if character != " " else "_"
+        for character in normalized
+        if character == " " or character.isalnum() or _is_cjk_character(character)
+    )
+    label = re.sub(r"_+", "_", label).strip("_")
     if not label:
         raise ValueError(f"无法从唤醒词生成标签：{keyword!r}")
     return label
@@ -30,7 +59,7 @@ def keyword_label(keyword: str) -> str:
 def raw_keyword_line(keyword: str, label: str | None = None) -> str:
     normalized = normalize_keyword(keyword)
     canonical = label or keyword_label(normalized)
-    if " " in canonical:
+    if any(character.isspace() for character in canonical):
         raise ValueError("KWS 规范标签不能包含空格")
     return f"{normalized.upper()} @{canonical.upper()}"
 
@@ -60,8 +89,14 @@ def strip_wake_prefix(text: str, keyword: str = DEFAULT_WAKE_KEYWORD) -> str:
     """Remove only the configured wake phrase at the beginning of ASR text."""
 
     normalized_keyword = normalize_keyword(keyword)
-    escaped = re.escape(normalized_keyword).replace(r"\ ", r"[\s_-]+")
-    pattern = re.compile(rf"^\s*{escaped}(?:\b|$)[\s,，:：\-—]*", re.IGNORECASE)
+    separator = r"[\s_-]*" if _contains_cjk(normalized_keyword) else r"[\s_-]+"
+    escaped = re.escape(normalized_keyword).replace(r"\ ", separator)
+    # Chinese ASR often concatenates the wake phrase and the command without
+    # an ASCII word boundary (for example ``嘿小爪打开浏览器``).  An ASCII
+    # ``\b`` would reject that valid prefix, so CJK phrases use the explicit
+    # phrase length as the boundary while English keeps the stricter check.
+    boundary = "" if _contains_cjk(normalized_keyword) else r"(?:\b|$)"
+    pattern = re.compile(rf"^\s*{escaped}{boundary}[\s,，:：\-—]*", re.IGNORECASE)
     return pattern.sub("", text, count=1).strip()
 
 
@@ -102,9 +137,21 @@ def generate_keywords(
     lexicon_for_cli = lexicon
     temporary_lexicon: tempfile.TemporaryDirectory[str] | None = None
     lexicon_lines = lexicon.read_text(encoding="utf-8", errors="strict").splitlines()
-    lexicon_words = {line.split(maxsplit=1)[0] for line in lexicon_lines if line.split(maxsplit=1)}
+    lexicon_words = {
+        line.split(maxsplit=1)[0].upper()
+        for line in lexicon_lines
+        if line.split(maxsplit=1)
+    }
     aliases = {"HEI": "HEY"}
-    missing_words = [word.upper() for word in normalize_keyword(keyword).split() if word.upper() not in lexicon_words]
+    # CJK words are converted by sherpa's ``ppinyin`` path and therefore do
+    # not appear in the bundled English CMU lexicon.  Only require lexicon
+    # entries for non-CJK words; otherwise every Chinese wake word is rejected
+    # before the official text2token command gets a chance to handle it.
+    missing_words = [
+        word.upper()
+        for word in normalize_keyword(keyword).split()
+        if not _contains_cjk(word) and word.upper() not in lexicon_words
+    ]
     unresolved = [word for word in missing_words if word not in aliases or aliases[word] not in lexicon_words]
     if unresolved:
         raise RuntimeError(
@@ -117,7 +164,10 @@ def generate_keywords(
         augmented_lines = list(lexicon_lines)
         for word in missing_words:
             source = aliases[word]
-            source_line = next(line for line in lexicon_lines if line.split(maxsplit=1)[0] == source)
+            source_line = next(
+                line for line in lexicon_lines
+                if line.split(maxsplit=1)[0].upper() == source
+            )
             augmented_lines.append(f"{word} {source_line.split(maxsplit=1)[1]}")
         lexicon_for_cli = Path(temporary_lexicon.name) / lexicon.name
         lexicon_for_cli.write_text("\n".join(augmented_lines) + "\n", encoding="utf-8")

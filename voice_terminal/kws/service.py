@@ -63,6 +63,19 @@ class KwsWorker:
     def error(self) -> str | None:
         return self._error
 
+    @property
+    def diagnostics(self) -> dict[str, int | str | bool | None]:
+        """Expose bounded counters without exposing microphone PCM."""
+
+        return {
+            "running": self.running,
+            "error": self.error,
+            "submitted_frames": self.submitted_frames,
+            "dropped_frames": self.dropped_frames,
+            "detected_count": self.detected_count,
+            "queue_depth": self._input.qsize(),
+        }
+
     def start(self) -> None:
         if self._thread is not None:
             return

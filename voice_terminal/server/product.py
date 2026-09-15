@@ -43,6 +43,21 @@ class ProductSettingsError(ValueError):
     """Invalid or unsafe product setting."""
 
 
+def _threshold_to_sensitivity(threshold: float) -> int:
+    """Expose sherpa's inverse threshold as an intuitive UI percentage."""
+
+    return max(
+        MIN_KWS_SENSITIVITY,
+        min(MAX_KWS_SENSITIVITY, round((1.0 - float(threshold)) * 100)),
+    )
+
+
+def _sensitivity_to_threshold(sensitivity: int) -> float:
+    """Higher sensitivity means a lower/easier sherpa match threshold."""
+
+    return (100 - sensitivity) / 100
+
+
 def _clean_text(value: Any, name: str, *, max_length: int = 240) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ProductSettingsError(f"{name}不能为空。")
@@ -64,13 +79,9 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
         "schema_version": PRODUCT_SETTINGS_SCHEMA_VERSION,
         "wake": {
             "enabled": bool(config.wake.enabled),
-            "always_on": bool(config.wake.always_on),
             "keyword": str(config.wake.keyword),
             "keyword_label": str(config.wake.keyword_label),
-            "sensitivity": max(
-                MIN_KWS_SENSITIVITY,
-                min(MAX_KWS_SENSITIVITY, round(float(config.wake.threshold) * 100)),
-            ),
+            "sensitivity": _threshold_to_sensitivity(config.wake.threshold),
         },
         "silence": {
             "seconds": max(MIN_SILENCE_SECONDS, min(MAX_SILENCE_SECONDS, round(final_silence_ms / 1000))),
@@ -93,7 +104,6 @@ def _merge_settings(defaults: dict[str, Any], value: Any) -> dict[str, Any]:
     result["schema_version"] = PRODUCT_SETTINGS_SCHEMA_VERSION
     wake = result["wake"]
     wake["enabled"] = wake["enabled"] if type(wake.get("enabled")) is bool else defaults["wake"]["enabled"]
-    wake["always_on"] = wake["always_on"] if type(wake.get("always_on")) is bool else defaults["wake"]["always_on"]
     wake["keyword"] = wake["keyword"] if isinstance(wake.get("keyword"), str) and wake["keyword"].strip() else defaults["wake"]["keyword"]
     wake["keyword_label"] = wake["keyword_label"] if isinstance(wake.get("keyword_label"), str) else defaults["wake"]["keyword_label"]
     try:
@@ -119,7 +129,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     if schema_version is not None and schema_version != PRODUCT_SETTINGS_SCHEMA_VERSION:
         invalid = True
     for section_name, fields in (
-        ("wake", ("enabled", "always_on", "keyword", "keyword_label", "sensitivity")),
+        ("wake", ("enabled", "keyword", "keyword_label", "sensitivity")),
         ("silence", ("seconds",)),
     ):
         section = value.get(section_name)
@@ -132,7 +142,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
             if field not in section:
                 continue
             candidate = section[field]
-            if section_name == "wake" and field in {"enabled", "always_on"}:
+            if section_name == "wake" and field == "enabled":
                 invalid = invalid or type(candidate) is not bool
             elif section_name == "wake" and field == "keyword":
                 invalid = invalid or not isinstance(candidate, str) or not candidate.strip()
@@ -191,17 +201,22 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         seconds = 30
     seconds = max(MIN_SILENCE_SECONDS, min(MAX_SILENCE_SECONDS, seconds))
     try:
-        sensitivity = int(wake.get("sensitivity", round(config.wake.threshold * 100)))
+        sensitivity = int(wake.get("sensitivity", _threshold_to_sensitivity(config.wake.threshold)))
     except (TypeError, ValueError):
-        sensitivity = round(config.wake.threshold * 100)
+        sensitivity = _threshold_to_sensitivity(config.wake.threshold)
     sensitivity = max(MIN_KWS_SENSITIVITY, min(MAX_KWS_SENSITIVITY, sensitivity))
+    enabled = bool(wake.get("enabled", config.wake.enabled))
     next_wake = replace(
         config.wake,
-        enabled=bool(wake.get("enabled", config.wake.enabled)),
-        always_on=bool(wake.get("always_on", config.wake.always_on)),
+        enabled=enabled,
+        # KWS has one product mode: enabled means the microphone stays in
+        # wake-word standby until the user stops the session.  Keep the
+        # legacy dataclass field synchronized for older controller fixtures,
+        # but do not expose or read a second UI setting.
+        always_on=enabled,
         keyword=str(wake.get("keyword") or config.wake.keyword),
         keyword_label=str(wake.get("keyword_label") or config.wake.keyword_label),
-        threshold=sensitivity / 100,
+        threshold=_sensitivity_to_threshold(sensitivity),
     )
     next_agent = replace(
         config.agent,
@@ -329,8 +344,8 @@ class ProductSettingsStore:
                 ) from exc
 
     async def save_wake(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if type(payload.get("enabled")) is not bool or type(payload.get("always_on")) is not bool:
-            raise ProductSettingsError("enabled 和 always_on 必须是布尔值。")
+        if type(payload.get("enabled")) is not bool:
+            raise ProductSettingsError("enabled 必须是布尔值。")
         keyword = _clean_text(payload.get("keyword"), "唤醒词", max_length=120)
         raw_sensitivity = payload.get("sensitivity")
         if type(raw_sensitivity) is not int:
@@ -354,7 +369,6 @@ class ProductSettingsStore:
             await asyncio.to_thread(self._compile_keyword, normalized, label)
         self._settings["wake"] = {
             "enabled": payload["enabled"],
-            "always_on": payload["always_on"],
             "keyword": normalized,
             "keyword_label": label,
             "sensitivity": sensitivity,

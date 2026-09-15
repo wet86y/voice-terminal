@@ -69,7 +69,6 @@ audio:
 
 wake:
   enabled: false
-  always_on: false
   provider: sherpa_kws
   keyword: "hei claw"
   keyword_label: "HEI_CLAW"

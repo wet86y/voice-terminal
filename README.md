@@ -139,13 +139,22 @@ python -m voice_terminal.kws.probe
 python -m voice_terminal.kws.probe --duration 10
 ```
 
-检测成功时会输出 `WAKE_DETECTED label=HEI_CLAW ...`。探针不发送网络请求，也不创建 ASR/LLM/TTS
-会话，适合在调整关键词、阈值或麦克风设备后做单独验收。
+检测成功时会输出 `WAKE_DETECTED label=<keyword_label> ...`。探针不发送网络请求，也不创建
+ASR/LLM/TTS 会话，适合在调整关键词、阈值或麦克风设备后做单独验收。
 
-常驻待机模式需同时设置 `wake.enabled: true` 与 `wake.always_on: true`，也可通过
-`VOICE_WAKE_ENABLED=true`、`VOICE_WAKE_ALWAYS_ON=true` 覆盖。默认 `always_on=false`，因此旧部署仍按
-原有直接 ASR 或会话门控流程运行。常驻模式下“开始监听”先进入 KWS 待机，唤醒后切换到 ASR；
+启用 KWS 即表示语音会话期间持续进入唤醒词待机：设置 `wake.enabled: true`，也可通过
+`VOICE_WAKE_ENABLED=true` 覆盖。关闭 KWS 后，点击开始会直接进入 ASR。常驻模式下“开始监听”先进入 KWS 待机，唤醒后切换到 ASR；
 30 秒最终静默检查及其播报结算后自动回到 KWS。“停止监听”仍会完整停止本次监听。
+
+产品页中的“灵敏度”是面向用户的易唤醒程度，不是 sherpa 的原始阈值：
+`sensitivity = 100 - threshold * 100`。因此默认 sherpa 阈值 `0.25` 在页面显示为 `75%`，
+`98%` 对应 `0.02`，数值越高越容易唤醒；通常建议先从 `60–80%` 开始。当前中文模型使用
+`phone+ppinyin` 生成词条，中文短语（例如“执事”或“嘿，小爪”）无需出现在英文词典中即可编译。
+
+服务运行时可通过 `GET http://127.0.0.1:8765/health` 检查 KWS 链路：`wake_enabled` 表示产品开关，
+`input_owner` 在待机时应为 `kws`，`kws.submitted_frames` 应持续增长；若 `dropped_frames` 增长，
+说明 KWS 队列拥塞；若 `detected_count` 保持为零，则优先检查关键词、灵敏度、麦克风输入和
+`kws.error`。`wake_always_on` 如果仍出现在运行时状态中只是兼容性状态字段，不是另一个设置项。
 
 ## AEC 与播放期插话
 

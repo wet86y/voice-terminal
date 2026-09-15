@@ -30,7 +30,6 @@ export interface ProductSettingsSnapshot {
   schema_version: number
   wake: {
     enabled: boolean
-    always_on: boolean
     keyword: string
     keyword_label?: string
     sensitivity: number

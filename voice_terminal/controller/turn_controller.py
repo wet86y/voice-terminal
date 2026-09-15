@@ -40,7 +40,11 @@ class InputController:
         self.aec_failure_policy = aec_failure_policy
         self.barge_in_gate = barge_in_gate or BargeInGate(min_speech_ms=max(250, vad_min_speech_ms), enabled=True)
         self.wake_enabled, self.wake_keyword, self.wake_preroll_ms = wake_enabled, wake_keyword, wake_preroll_ms
-        self.wake_always_on = bool(wake_enabled and wake_always_on)
+        # Product semantics are intentionally single-switch: if KWS is
+        # enabled, the microphone starts in KWS standby and only transfers to
+        # ASR after a wake hit.  Keep the constructor argument for old
+        # fixtures/callers, but do not let it create a second product mode.
+        self.wake_always_on = bool(wake_enabled)
         self.state.wake_always_on = self.wake_always_on
         self.state.input_owner = "none"
         self.vad_min_speech_ms, self.vad_end_silence_ms, self.max_turn_ms = vad_min_speech_ms, vad_end_silence_ms, max_turn_ms

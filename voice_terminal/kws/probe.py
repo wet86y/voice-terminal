@@ -13,6 +13,7 @@ from pathlib import Path
 
 from ..audio.devices import resolve_device
 from ..config import load_config
+from ..server.product import ProductSettingsStore
 from .detector import KwsDetector
 
 
@@ -79,6 +80,10 @@ def main(argv: list[str] | None = None) -> int:
 
     root = Path(__file__).resolve().parents[2]
     config = load_config(root / "config" / "default.yaml", args.config if args.config.is_file() else None)
+    config = ProductSettingsStore(
+        path=root / "config" / "product-settings.json",
+        config=config,
+    ).effective_config()
     if not config.wake.enabled:
         print("note: wake.enabled=false in the normal runtime; probe continues for isolated verification.", file=sys.stderr)
     detector = build_detector(config)
