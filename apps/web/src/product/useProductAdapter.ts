@@ -18,6 +18,9 @@ export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'models'
 export type ProductPage = 'home' | 'settings'
 export type AssignmentSlot = 'voice' | 'shadow' | 'status' | 'tts'
 
+const NOTICE_DISPLAY_MS = 5000
+const NOTICE_FADE_MS = 420
+
 export interface ProductUiModel extends ProductModel {
   provider: string
   modelId: string
@@ -147,6 +150,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const saving = ref(false)
   const lastError = ref('')
   const notice = ref('')
+  const noticeVisible = ref(false)
   const shadowExpanded = ref(false)
   const thinkingExpanded = ref(false)
   const personaDocument = ref<keyof ProductSettingsSnapshot['persona']>('instructions')
@@ -183,6 +187,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   let snapshotRequest: Promise<void> | null = null
   let reconnectTimer: number | undefined
   let replayTimer: number | undefined
+  let noticeDisplayTimer: ReturnType<typeof setTimeout> | undefined
+  let noticeFadeTimer: ReturnType<typeof setTimeout> | undefined
   let mutationQueue: Promise<unknown> = Promise.resolve()
 
   function enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -191,14 +197,38 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     return next
   }
 
+  function clearNoticeTimers() {
+    if (noticeDisplayTimer !== undefined) clearTimeout(noticeDisplayTimer)
+    if (noticeFadeTimer !== undefined) clearTimeout(noticeFadeTimer)
+    noticeDisplayTimer = undefined
+    noticeFadeTimer = undefined
+  }
+
   function setNotice(value: string) {
-    notice.value = value
+    clearNoticeTimers()
     lastError.value = ''
+    if (!value) {
+      notice.value = ''
+      noticeVisible.value = false
+      return
+    }
+    notice.value = value
+    noticeVisible.value = true
+    noticeDisplayTimer = setTimeout(() => {
+      noticeDisplayTimer = undefined
+      noticeVisible.value = false
+      noticeFadeTimer = setTimeout(() => {
+        notice.value = ''
+        noticeFadeTimer = undefined
+      }, NOTICE_FADE_MS)
+    }, NOTICE_DISPLAY_MS)
   }
 
   function setError(error: unknown) {
+    clearNoticeTimers()
     lastError.value = messageFromError(error)
     notice.value = ''
+    noticeVisible.value = false
   }
 
   function applySnapshot(value: ProductSnapshot) {
@@ -679,7 +709,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       scheduleReplay()
     }
     if (value === 'offline') {
-      lastError.value = voice.connectionError.value || 'Voice Server 连接已关闭。'
+      setError(new Error(voice.connectionError.value || 'Voice Server 连接已关闭。'))
     }
   })
 
@@ -700,6 +730,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   onBeforeUnmount(() => {
     if (reconnectTimer !== undefined) window.clearInterval(reconnectTimer)
     if (replayTimer !== undefined) window.clearTimeout(replayTimer)
+    clearNoticeTimers()
     voice.dispose()
   })
 
@@ -748,6 +779,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     applyImpact,
     lastError,
     notice,
+    noticeVisible,
     loadSnapshot,
     refreshRegistry,
     runtimeAction,

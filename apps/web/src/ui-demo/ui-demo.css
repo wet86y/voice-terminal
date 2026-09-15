@@ -530,3 +530,45 @@ body:has(.product-shell) { overflow: hidden; }
     display: none !important;
   }
 }
+
+/* Completed TTS transactions remain readable after their temporary queue
+   item is removed.  Failures and interruptions keep a quiet diagnostic tint
+   without turning the conversation rail into a status dashboard. */
+.product-shell .conversation-stream .speech-history .speech-queue {
+  flex-wrap: wrap;
+}
+.product-shell .conversation-stream .speech-history.speech-failed > p {
+  border-color: #f0808f3d;
+}
+.product-shell .conversation-stream .speech-history.speech-interrupted > p,
+.product-shell .conversation-stream .speech-history.speech-replaced > p {
+  border-color: #e7b6753d;
+}
+
+/* Settings feedback stays visible for five seconds, then leaves through the
+   same short transition used when it is dismissed manually. */
+.product-shell .save-notice {
+  transition: opacity .42s ease, transform .42s ease;
+}
+.product-shell .save-notice.is-fading {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(10px);
+}
+.save-notice-enter-active,
+.save-notice-leave-active {
+  transition: opacity .42s ease, transform .42s ease;
+}
+.save-notice-enter-from,
+.save-notice-leave-to {
+  opacity: 0;
+  transform: translateY(10px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .product-shell .save-notice,
+  .save-notice-enter-active,
+  .save-notice-leave-active {
+    transition-duration: .01ms;
+  }
+}

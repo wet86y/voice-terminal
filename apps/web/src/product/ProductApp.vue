@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from 'vue'
-import type { ReasoningMode } from '../types'
+import type { PlaybackQueueItem, ReasoningMode, SpeechOutputRecord } from '../types'
 import { useProductAdapter, type AssignmentSlot, type ProductSettingsTab, type ProductUiModel } from './useProductAdapter'
 
 const adapter = useProductAdapter()
@@ -12,7 +12,7 @@ const {
   availableLlmModels, availableTtsModels, visibleLocalPool, hiddenPool,
   managedApiModelPool, selectedModels, activeModels, selectedTtsProfile, selectedTtsModel, activeTtsModel, registry, shadowThinking, shadowThinkingOptions,
   shadowExpanded, thinkingExpanded, modelScanState, restartState, applyImpact,
-  lastError, notice, runtimeAction, resetSession, setReasoningMode, setShadowThinking,
+  lastError, notice, noticeVisible, runtimeAction, resetSession, setReasoningMode, setShadowThinking,
   toggleProviderReasoning,
   saveWake, saveSilence, savePersona, scanModels, discoverProvider, verifyCustomModel,
   addVerifiedProvider,
@@ -20,6 +20,8 @@ const {
 } = adapter
 const reasoningMode = voice.reasoningMode
 const listening = voice.listening
+const speechOutputs = voice.speechOutputs
+const playbackQueue = voice.playbackQueue
 const waitingForWake = computed(() => (
   listening.value
   && voice.wakeAlwaysOn.value
@@ -80,7 +82,21 @@ const runtimeMeta = computed(() => {
 
 const currentDocument = computed(() => personaItems.find(item => item.id === activePersona.value) || personaItems[0])
 const hasConversation = computed(() => conversation.value.length > 0
+  || speechOutputs.value.length > 0
   || Boolean(current.value.partial_text || current.value.final_text || current.value.assistant_text || current.value.tts_text))
+const standaloneSpeechOutputs = computed(() => speechOutputs.value.filter(output => (
+  typeof output.text === 'string' && output.text.trim()
+  && !conversation.value.some(record => record.turn_id === output.turn_id)
+)))
+const standalonePlaybackItems = computed(() => playbackQueue.value.filter(item => (
+  typeof item.text === 'string' && item.text.trim()
+  && !speechOutputExists(item)
+  && !conversation.value.some(record => record.turn_id === item.turn_id)
+)))
+const currentTurnHasSpeechTrack = computed(() => {
+  const turnId = voice.currentTurnId.value
+  return Boolean(turnId && hasSpeechTrackForTurn(turnId))
+})
 const currentThinkingModel = computed(() => selectedModels.value.shadow)
 const thinkingOptionLabels: Record<string, { label: string; shortLabel: string }> = {
   off: { label: '关闭', shortLabel: 'Off' },
@@ -212,6 +228,73 @@ function modelStatusLabel(item: ProductUiModel | undefined) {
 
 function formatContext(value: number | undefined) {
   return value ? `${formatTokens(value)} tokens` : '未设置'
+}
+
+function speechOutputsForTurn(turnId: string) {
+  return speechOutputs.value.filter(output => output.turn_id === turnId
+    && typeof output.text === 'string' && output.text.trim())
+}
+
+function speechOutputExists(item: Pick<PlaybackQueueItem, 'conversation_id' | 'speech_id'>) {
+  return speechOutputs.value.some(output => output.speech_id === item.speech_id
+    && output.conversation_id === item.conversation_id)
+}
+
+function playbackItemsForTurn(turnId: string) {
+  return playbackQueue.value.filter(item => item.turn_id === turnId
+    && typeof item.text === 'string' && item.text.trim() && !speechOutputExists(item))
+}
+
+function hasSpeechTrackForTurn(turnId: string) {
+  return speechOutputsForTurn(turnId).length > 0 || playbackItemsForTurn(turnId).length > 0
+}
+
+function speechOutputStatusLabel(output: SpeechOutputRecord) {
+  const labels: Record<string, string> = {
+    completed: '已完成播报',
+    failed: '播报失败',
+    interrupted: '播报中断',
+    replaced: '已被新内容替换',
+    superseded: '已被新内容替换',
+    speaking: '正在播报',
+    playing: '正在播报',
+    queued: '等待播放',
+    waiting: '等待播放',
+  }
+  const status = typeof output.status === 'string' ? output.status : ''
+  return labels[status.toLowerCase()] || status || '已记录'
+}
+
+function speechOutputStatusKey(output: SpeechOutputRecord) {
+  return typeof output.status === 'string' && output.status ? output.status.toLowerCase() : 'recorded'
+}
+
+function speechOutputIsPlaying(output: SpeechOutputRecord) {
+  return voice.playbackQueue.value.some(item => item.speech_id === output.speech_id
+    && item.conversation_id === output.conversation_id && item.state === 'playing')
+}
+
+function playbackItemStatusLabel(item: PlaybackQueueItem) {
+  return item.state === 'playing' ? '正在播报' : '等待播放'
+}
+
+function deliveryStatusLabel(delivery: { status?: string; termination?: string } | undefined) {
+  if (!delivery) return ''
+  const statusLabels: Record<string, string> = {
+    full: '已完整传达',
+    partial: '已传达前缀',
+    none: '未传达',
+    unknown: '传达边界未知',
+  }
+  const terminationLabels: Record<string, string> = {
+    interrupted: '被插话打断',
+    failed: 'TTS 失败',
+    stopped: '手动停止',
+    completed: '正常结束',
+  }
+  const status = statusLabels[delivery.status || ''] || delivery.status || '播放信息不可用'
+  const termination = terminationLabels[delivery.termination || '']
+  return termination ? `${status} · ${termination}` : status
 }
 
 function reasoningSummary(item: ProductUiModel | undefined) {
@@ -416,12 +499,34 @@ function pageLabel() {
           <template v-else>
             <template v-for="record in conversation" :key="record.turn_id">
               <article class="message user-message"><div class="message-meta"><span class="avatar user-avatar">你</span><span>你</span><time>{{ formatTime(record.completed_at) }}</time></div><p>{{ record.transcript || '（没有可显示的转写）' }}</p><span class="message-status">{{ record.status || record.delivery?.status || '已记录' }}</span></article>
-              <article v-if="record.response" class="message assistant-message"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ formatTime(record.completed_at) }}</time></div><p>{{ record.response }}</p><div class="speech-queue"><span class="queue-dot"></span>已完成本轮播报结算</div></article>
+              <template v-if="hasSpeechTrackForTurn(record.turn_id)">
+                <article v-for="output in speechOutputsForTurn(record.turn_id)" :key="`speech-${output.conversation_id}-${output.speech_id}`" class="message assistant-message speech-history" :class="[{ speaking: speechOutputIsPlaying(output) }, `speech-${speechOutputStatusKey(output)}`]">
+                  <div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ formatTime(record.completed_at) }}</time></div>
+                  <p>{{ output.text }}</p>
+                  <div class="speech-queue"><span class="queue-dot" :class="{ playing: speechOutputIsPlaying(output) }"></span>{{ speechOutputStatusLabel(output) }}<span v-if="output.delivery?.status"> · {{ deliveryStatusLabel(output.delivery) }}</span></div>
+                </article>
+                <article v-for="item in playbackItemsForTurn(record.turn_id)" :key="`pending-speech-${item.conversation_id}-${item.speech_id}`" class="message assistant-message speech-history speech-pending" :class="{ speaking: item.state === 'playing' }">
+                  <div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ playbackItemStatusLabel(item) }}</time></div>
+                  <p>{{ item.text }}</p>
+                  <div class="speech-queue"><span class="queue-dot" :class="{ playing: item.state === 'playing' }"></span>{{ playbackItemStatusLabel(item) }}</div>
+                </article>
+              </template>
+              <article v-else-if="record.response" class="message assistant-message"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ formatTime(record.completed_at) }}</time></div><p>{{ record.response }}</p><div class="speech-queue"><span class="queue-dot"></span>已完成本轮播报结算</div></article>
             </template>
+            <article v-for="output in standaloneSpeechOutputs" :key="`standalone-speech-${output.conversation_id}-${output.speech_id}`" class="message assistant-message speech-history" :class="[{ speaking: speechOutputIsPlaying(output) }, `speech-${speechOutputStatusKey(output)}`]">
+              <div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>已结算</time></div>
+              <p>{{ output.text }}</p>
+              <div class="speech-queue"><span class="queue-dot" :class="{ playing: speechOutputIsPlaying(output) }"></span>{{ speechOutputStatusLabel(output) }}<span v-if="output.delivery?.status"> · {{ deliveryStatusLabel(output.delivery) }}</span></div>
+            </article>
+            <article v-for="item in standalonePlaybackItems" :key="`standalone-pending-speech-${item.conversation_id}-${item.speech_id}`" class="message assistant-message speech-history speech-pending" :class="{ speaking: item.state === 'playing' }">
+              <div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ playbackItemStatusLabel(item) }}</time></div>
+              <p>{{ item.text }}</p>
+              <div class="speech-queue"><span class="queue-dot" :class="{ playing: item.state === 'playing' }"></span>{{ playbackItemStatusLabel(item) }}</div>
+            </article>
             <article v-if="current.final_text && !conversation.some(item => item.transcript === current.final_text)" class="message user-message live-final"><div class="message-meta"><span class="avatar user-avatar">你</span><span>你</span><time>本轮</time></div><p>{{ current.final_text }}</p><span class="message-status">已完成识别 · 等待回复</span></article>
             <div v-if="current.partial_text" class="live-asr"><span class="live-dot"></span><span>实时识别</span><p>{{ current.partial_text }}</p><span class="typing-bars"><i></i><i></i><i></i></span></div>
             <div v-if="runtimeState === 'thinking' && !current.assistant_text" class="assistant-pending"><span><i></i><i></i><i></i></span>正在准备回复</div>
-            <article v-if="current.assistant_text && !conversation.some(item => item.response === current.assistant_text)" class="message assistant-message" :class="{ speaking: runtimeState === 'speaking' }"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ runtimeState === 'speaking' ? '正在播报' : '本轮' }}</time></div><p>{{ current.assistant_text }}</p><div class="speech-queue"><span class="queue-dot" :class="{ playing: runtimeState === 'speaking' }"></span>{{ runtimeState === 'speaking' ? '正在播放真实 TTS · 随时可以打断' : current.tts_status || '等待播报结算' }}</div></article>
+            <article v-if="current.assistant_text && !conversation.some(item => item.response === current.assistant_text) && !currentTurnHasSpeechTrack" class="message assistant-message" :class="{ speaking: runtimeState === 'speaking' }"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ runtimeState === 'speaking' ? '正在播报' : '本轮' }}</time></div><p>{{ current.assistant_text }}</p><div class="speech-queue"><span class="queue-dot" :class="{ playing: runtimeState === 'speaking' }"></span>{{ runtimeState === 'speaking' ? '正在播放真实 TTS · 随时可以打断' : current.tts_status || '等待播报结算' }}</div></article>
           </template>
         </div>
         <footer class="panel-resource-footer conversation-footer"><div><span class="footer-mic"><i></i>{{ waitingForWake ? 'KWS 正在监听唤醒词' : listening ? '正在聆听你的声音' : connected ? '语音由本机服务处理' : '等待本机 Voice Server' }}</span><span>无输入框 · 通过语音继续 · {{ pageLabel() }}</span></div><section class="resource-metrics conversation-resource-metrics" aria-label="模型资源概览"><div class="resource-meter context-meter" tabindex="0" role="img" :aria-label="conversationContextTooltip" :data-tooltip="conversationContextTooltip"><span>上下文占用</span><strong>{{ formatTokens(conversationContext?.usedTokens) }}<small v-if="conversationContext?.limitTokens != null"> / {{ formatTokens(conversationContext.limitTokens) }}</small></strong><i :class="{ 'meter-empty': conversationContext?.usagePercent == null }"><b :style="{ width: `${contextPercent(conversationContext?.usagePercent)}%` }"></b></i><em>{{ conversationContext?.usagePercent ?? '—' }}<span v-if="conversationContext?.usagePercent != null">%</span></em></div><div class="resource-meter cache-rate-number" tabindex="0" role="img" :aria-label="conversationCacheHitRatio === null ? '缓存命中率暂无数据' : `缓存命中率 ${Math.round(conversationCacheHitRatio * 100)}%`" :data-tooltip="conversationCacheHitRatio === null ? '缓存命中率 · 暂无数据' : `缓存命中率 · ${Math.round(conversationCacheHitRatio * 100)}%`"><strong>{{ conversationCacheHitRatio === null ? '—' : `${Math.round(conversationCacheHitRatio * 100)}%` }}</strong></div></section></footer>
@@ -469,8 +574,12 @@ function pageLabel() {
       </div>
     </section>
 
-    <div v-if="lastError" class="save-notice error-notice" role="alert"><span>!</span>{{ lastError }}<button type="button" aria-label="关闭错误" @click="lastError = ''">×</button></div>
-    <div v-else-if="notice" class="save-notice" role="status"><span>✓</span>{{ notice }}<button type="button" aria-label="关闭提示" @click="setNotice('')">×</button></div>
+    <Transition name="save-notice">
+      <div v-if="lastError" class="save-notice error-notice" role="alert"><span>!</span>{{ lastError }}<button type="button" aria-label="关闭错误" @click="lastError = ''">×</button></div>
+    </Transition>
+    <Transition name="save-notice">
+      <div v-if="notice" class="save-notice" :class="{ 'is-fading': !noticeVisible }" role="status"><span>✓</span>{{ notice }}<button type="button" aria-label="关闭提示" @click="setNotice('')">×</button></div>
+    </Transition>
     <div v-if="showApplyConfirm" class="modal-backdrop"><section class="apply-dialog" role="dialog" aria-modal="true"><p class="panel-kicker">立即应用</p><h2>重启受影响的模型服务？</h2><p>后端将停止当前聆听和 TTS 播放，统一重建 Voice、Shadow、status observer 和 TTS。当前配置只有在重启成功后才会提交。</p><ul><li v-for="item in applyImpact" :key="item">{{ item }}</li></ul><div><button class="outline-button" type="button" @click="showApplyConfirm = false">暂不应用</button><button class="save-button" type="button" @click="confirmApply">确认并立即重启</button></div></section></div>
   </main>
 </template>

@@ -97,7 +97,31 @@ describe('V0.6 session protocol', () => {
     { turn_id: 'input_a', speech_id: 'speech_a' })
     expect(terminal.playbackQueue.value).toHaveLength(0)
     expect(terminal.lastPlayback.value).toMatchObject({ text: '实时内容', result: 'finished' })
-    expect(terminal.speechOutputs.value).toHaveLength(0)
+    expect(terminal.speechOutputs.value).toMatchObject([{
+      speech_id: 'speech_a', text: '实时内容', status: 'completed', turn_id: 'input_a',
+    }])
+  })
+
+  it('keeps each completed speech transaction as its own conversation track', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('speech.queued', 1, { speech_id: 'speech_a', conversation_id: 'episode_a', turn_id: 'input_a', text: '' },
+      { turn_id: 'input_a', speech_id: 'speech_a' })
+    socket.push('speech.delta', 2, { speech_id: 'speech_a', conversation_id: 'episode_a', turn_id: 'input_a', text_delta: '第一段' },
+      { turn_id: 'input_a', speech_id: 'speech_a' })
+    socket.push('speech.progress', 3, { speech_id: 'speech_a', conversation_id: 'episode_a', turn_id: 'input_a',
+      event: 'tts.progress', trigger: 'playback_finished', status: 'FINISHED' },
+    { turn_id: 'input_a', speech_id: 'speech_a' })
+    socket.push('speech.queued', 4, { speech_id: 'speech_b', conversation_id: 'episode_a', turn_id: 'input_a', text: '' },
+      { turn_id: 'input_a', speech_id: 'speech_b' })
+    socket.push('speech.delta', 5, { speech_id: 'speech_b', conversation_id: 'episode_a', turn_id: 'input_a', text_delta: '第二段' },
+      { turn_id: 'input_a', speech_id: 'speech_b' })
+    socket.push('speech.completed', 6, { speech_id: 'speech_b', conversation_id: 'episode_a', turn_id: 'input_a',
+      text: '第二段', status: 'completed' }, { turn_id: 'input_a', speech_id: 'speech_b' })
+
+    expect(terminal.speechOutputs.value.map(item => [item.speech_id, item.text])).toEqual([
+      ['speech_a', '第一段'], ['speech_b', '第二段'],
+    ])
+    expect(terminal.playbackQueue.value).toHaveLength(0)
   })
 
   it('keeps a failed playback result when the final failed record arrives', () => {
