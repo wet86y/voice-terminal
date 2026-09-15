@@ -1,7 +1,8 @@
 # Voice Terminal V0.7
 
-Voice Terminal 是 Windows 本机实时语音会话终端。浏览器负责控制和可视化；音频采集、VAD、
-ASR、Smart Turn、SenseVoice、主 Agent、Shadow Agent、TTS、播放和延迟均由 Voice Server 管理。
+Voice Terminal 是 Windows 本机实时语音会话终端。浏览器负责控制和可视化，并在产品首页本地维护
+“用户说完 → AI 开口”的感知延迟；音频采集、VAD、ASR、Smart Turn、SenseVoice、主 Agent、
+Shadow Agent、TTS、播放和后端诊断指标由 Voice Server 管理。
 
 > V0.7 当前生产路径使用 DeepSeek Responses + strict `json_schema`。主语音链保持低延迟交互，
 > 会话级单一 Shadow Agent 负责高思考意图理解与只读工具调用。

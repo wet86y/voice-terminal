@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { useVoiceTerminal, type VoiceSocket } from './useVoiceTerminal'
 
 class FakeSocket implements VoiceSocket {
@@ -17,9 +17,9 @@ class FakeSocket implements VoiceSocket {
   }
 }
 
-function openTerminal() {
+function openTerminal(now?: () => number) {
   const socket = new FakeSocket()
-  const terminal = useVoiceTerminal({ webSocketFactory: () => socket })
+  const terminal = useVoiceTerminal({ webSocketFactory: () => socket, now })
   terminal.connect(); socket.open()
   return { socket, terminal }
 }
@@ -60,6 +60,43 @@ describe('V0.6 session protocol', () => {
     expect(terminal.currentTurnId.value).toBe('input_a')
     expect(terminal.current.partial_text).toBe('')
     expect(terminal.current.final_text).toBe('最终输入')
+    terminal.dispose()
+  })
+
+  it('measures perceptual latency locally until the first real playback event', () => {
+    vi.useFakeTimers()
+    try {
+      let clock = 1000
+      const { socket, terminal } = openTerminal(() => clock)
+      socket.push('input.started', 1, {}, { turn_id: 'input_a' })
+      socket.push('session.state', 2, { state: 'FINALIZING', listening: true, can_start: false }, { turn_id: 'input_a' })
+
+      expect(terminal.perceptualLatencyRunning.value).toBe(true)
+      expect(terminal.perceptualLatencyMs.value).toBe(0)
+
+      clock = 1240
+      vi.advanceTimersByTime(50)
+      expect(terminal.perceptualLatencyMs.value).toBe(240)
+
+      // A delayed server metric is diagnostic-only and must not replace the
+      // browser stopwatch used by the product card.
+      socket.push('metrics.snapshot', 3, {
+        latency: { speech_end_to_playback_ms: 9999 },
+      }, { turn_id: 'input_a' })
+      expect(terminal.currentLatency.speech_end_to_playback_ms).toBe(9999)
+      expect(terminal.perceptualLatencyMs.value).toBe(240)
+
+      clock = 1813
+      socket.push('speech.started', 4, {
+        speech_id: 'speech_a', conversation_id: 'conversation_a', turn_id: 'input_a',
+        text: '开始播放', status: 'playing',
+      }, { turn_id: 'input_a', speech_id: 'speech_a' })
+      expect(terminal.perceptualLatencyRunning.value).toBe(false)
+      expect(terminal.perceptualLatencyMs.value).toBe(813)
+      terminal.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('renders only authorized speech deltas and complete delivery', () => {
@@ -300,6 +337,7 @@ describe('V0.6 session protocol', () => {
     expect(terminal.currentLatency.speech_end_to_first_pcm_ms).toBe(812)
     expect(terminal.currentLatency.replacement_count).toBe(1)
     expect(terminal.current.tts_prewarm_status).toBe('READY')
+    terminal.dispose()
   })
 
   it('restores and incrementally updates the safe Shadow product projection', () => {

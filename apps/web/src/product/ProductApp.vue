@@ -6,7 +6,7 @@ import { useProductAdapter, type AssignmentSlot, type ProductSettingsTab, type P
 const adapter = useProductAdapter()
 const {
   voice, page: activePage, settingsTab: activeSettingsTab, settings, loading, saving,
-  connected, replayMode, replayMeta, runtimeState, current, conversation, shadow, latencyMs, wakeForm,
+  connected, replayMode, replayMeta, runtimeState, current, conversation, shadow, latencyMs, latencyRunning, wakeForm,
   silenceSeconds, personaDocument: activePersona, personaDocuments, providerForm,
   providerStep, discoveredModels, modelAssignments, uiModels: modelEntries,
   availableLlmModels, availableTtsModels, visibleLocalPool, hiddenPool,
@@ -167,8 +167,11 @@ function formatTime(value: string | undefined) {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
-function formatMs(value: number | null | undefined) {
-  return typeof value === 'number' && Number.isFinite(value) ? `${Math.round(value)} ms` : '—'
+function formatResponseLatency(value: number | null | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+  if (value < 1000) return `${Math.round(value)} ms`
+  const seconds = Number((value / 1000).toFixed(2))
+  return `${seconds} s`
 }
 
 function formatTokens(value: number | null | undefined) {
@@ -487,7 +490,7 @@ function pageLabel() {
         <p class="orb-caption">{{ runtimeMeta.description }}</p>
         <button class="runtime-button" type="button" :disabled="loading || replayMode" @click="runtimeAction">{{ replayMode ? '日志回放中' : connected ? (listening ? '停止当前会话' : '开始语音会话') : '重试连接' }}</button>
         <button v-if="connected && !listening && !replayMode" class="ghost-action" type="button" @click="resetSession">重置当前会话</button>
-        <section class="metric-card"><div class="metric-label"><span>本轮响应</span><button type="button" title="真实 latency，没有数据时显示破折号">i</button></div><strong>{{ formatMs(latencyMs) }}</strong><p>用户说完 → AI 开口</p><div class="metric-spark"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></section>
+        <section class="metric-card" :class="{ 'metric-card-live': latencyRunning }"><div class="metric-label"><span>本轮响应</span><button type="button" title="前端计时：从用户输入结束到 TTS 开始播放">i</button></div><strong>{{ formatResponseLatency(latencyMs) }}</strong><p>{{ latencyRunning ? '计时中 · 等待 TTS 开始播放' : '用户说完 → AI 开口' }}</p><div class="metric-spark"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></section>
         <section class="mode-picker"><div class="section-row"><span>运行模式</span><small>下一轮生效</small></div><div class="mode-options"><button v-for="mode in [{ value: 'fast', label: '快速' }, { value: 'balanced', label: '均衡' }, { value: 'deep', label: '深度' }]" :key="mode.value" type="button" :class="{ selected: reasoningMode === mode.value }" :disabled="!connected || replayMode" @click="setReasoningMode(mode.value as ReasoningMode)">{{ mode.label }}</button></div></section>
         <section class="system-model-config"><div class="section-row"><span>当前模型</span><small>{{ connected ? '已应用运行时' : '等待连接' }}</small></div><div class="system-model-grid"><article class="system-model-card"><p>VOICE</p><strong>{{ activeModels.voice?.name || '未分配' }}</strong><small>{{ activeModels.voice?.modelId || '—' }}</small></article><article class="system-model-card"><p>SHADOW</p><strong>{{ activeModels.shadow?.name || '未分配' }}</strong><small>{{ activeModels.shadow?.modelId || '—' }}</small></article><article class="system-model-card"><p>TTS</p><strong>{{ activeModels.tts?.name || '未分配' }}</strong><small>{{ activeTtsModel?.modelId || (activeModels.tts ? activeModels.tts.model_id : '—') }}</small></article></div></section>
       </section>
