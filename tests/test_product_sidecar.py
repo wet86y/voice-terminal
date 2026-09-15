@@ -151,7 +151,7 @@ class ProductSidecarTests(unittest.TestCase):
         safe = projection.snapshot({
             "available": True,
             "active": False,
-            "context_token_estimate": 0,
+            "context_token_estimate": 1,
             "context_limit_tokens": 256000,
             "context_usage_percent": 0,
             "provider_input_tokens": None,

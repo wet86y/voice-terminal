@@ -562,7 +562,11 @@ class ShadowProductProjection:
             has_context_telemetry = (
                 isinstance(used_tokens, (int, float))
                 and not isinstance(used_tokens, bool)
-                and used_tokens > 0
+                # ShadowRuntime's empty context estimator returns ``1`` as a
+                # sentinel before the first real provider/context sample.
+                # Treat that value like zero so the product UI cannot show a
+                # fabricated ``1 / limit · 0%`` resource meter.
+                and used_tokens > 1
             )
             if has_context_telemetry:
                 context_values = {
