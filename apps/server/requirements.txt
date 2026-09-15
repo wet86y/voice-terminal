@@ -12,6 +12,7 @@ uvicorn[standard]>=0.30,<1
 pydantic>=2,<3
 pyyaml>=6,<7
 httpx>=0.27,<1
+keyring>=25,<26
 psutil>=6,<8
 aec-audio-processing==1.0.1
 # The AEC wheel's bundled has_voice() VAD is not initialized on Windows;

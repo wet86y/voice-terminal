@@ -87,8 +87,8 @@ class DeepSeekClient:
         protocol_recovery_limit: int = 1,
         transport_retry_limit: int = 2,
     ) -> None:
-        if provider not in {"deepseek", "opencode_go"}:
-            raise ValueError("provider must be deepseek or opencode_go")
+        if provider not in {"deepseek", "opencode_go", "openai_compatible"}:
+            raise ValueError("provider must be deepseek, opencode_go, or openai_compatible")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key

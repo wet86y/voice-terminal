@@ -116,6 +116,7 @@ class ShadowAgentSession:
             component.provider, component.tools, context_source,
             instructions_loader=component.instructions_loader,
             on_event=self.relay.publish,
+            status_provider=component.status_provider,
             **component.runtime_options,
         )
         self.closed = False
@@ -160,9 +161,11 @@ class ShadowAgentComponent:
 
     def __init__(
         self, provider: ShadowProvider, tools: ShadowToolExecutor, *,
+        status_provider: ShadowProvider | None = None,
         instructions_loader: Callable[[], str], runtime_options: dict[str, Any] | None = None,
     ) -> None:
         self.provider = provider
+        self.status_provider = status_provider or provider
         self.tools = tools
         self.instructions_loader = instructions_loader
         self.runtime_options = dict(runtime_options or {})
@@ -191,3 +194,9 @@ class ShadowAgentComponent:
             result = close()
             if asyncio.iscoroutine(result):
                 await result
+        if self.status_provider is not self.provider:
+            close = getattr(self.status_provider, "close", None)
+            if callable(close):
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
