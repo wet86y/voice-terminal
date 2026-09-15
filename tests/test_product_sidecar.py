@@ -53,6 +53,11 @@ class ProductSidecarTests(unittest.TestCase):
         # user's artifact without an explicit save.
         self.assertEqual(self.settings_path.read_text(encoding="utf-8"), "{not-json")
 
+        self.settings_path.write_text(json.dumps({"schema_version": []}), encoding="utf-8")
+        malformed = self.store()
+        self.assertTrue(malformed.warnings)
+        self.assertEqual(malformed.snapshot()["schema_version"], 1)
+
     def test_kws_compile_replaces_files_only_after_validation(self) -> None:
         kws_dir = self.config.kws_dir
         kws_dir.mkdir(parents=True)
