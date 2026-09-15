@@ -307,6 +307,24 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     playbackQueue.value = playbackQueue.value.map((item, itemIndex) => itemIndex === index ? next : item)
   }
 
+  function upsertSpeechOutput(incoming: SpeechOutputRecord) {
+    const key = speechKey(incoming.conversation_id, incoming.speech_id)
+    const index = speechOutputs.value.findIndex(item => speechKey(item.conversation_id, item.speech_id) === key)
+    if (index < 0) {
+      speechOutputs.value = [...speechOutputs.value, incoming].slice(-32)
+      return
+    }
+    const currentOutput = speechOutputs.value[index]
+    const next: SpeechOutputRecord = {
+      ...currentOutput,
+      ...incoming,
+      text: incoming.text || currentOutput.text,
+      status: incoming.status || currentOutput.status,
+      delivery: incoming.delivery ?? currentOutput.delivery,
+    }
+    speechOutputs.value = speechOutputs.value.map((item, itemIndex) => itemIndex === index ? next : item)
+  }
+
   function removePlaybackItem(conversationId: string, speechId: string) {
     const key = speechKey(conversationId, speechId)
     const removed = playbackQueue.value.find(item => speechKey(item.conversation_id, item.speech_id) === key) ?? null
@@ -326,6 +344,29 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     const removed = removePlaybackItem(conversationId, speechId)
     const previous = lastPlayback.value?.speech_id === speechId
       && lastPlayback.value.conversation_id === conversationId ? lastPlayback.value : null
+    const existingOutput = speechOutputs.value.find(item => speechKey(item.conversation_id, item.speech_id)
+      === speechKey(conversationId, speechId))
+    const output: SpeechOutputRecord = {
+      ...(existingOutput || {}),
+      speech_id: speechId,
+      conversation_id: conversationId,
+      turn_id: readString(payload, 'turn_id') ?? removed?.turn_id ?? previous?.turn_id ?? '',
+      text: readString(payload, 'text') || removed?.text || previous?.text || existingOutput?.text || '',
+      status: result === 'finished' ? 'completed' : result,
+    }
+    const requestId = readString(payload, 'request_id') ?? removed?.request_id
+    if (requestId) output.request_id = requestId
+    const traceId = readString(payload, 'trace_id')
+    if (traceId) output.trace_id = traceId
+    if (isNonNegativeInteger(payload.output_generation)) output.output_generation = payload.output_generation
+    else if (removed?.output_generation !== undefined) output.output_generation = removed.output_generation
+    const delivery = readDelivery(payload.delivery)
+    if (delivery !== undefined) output.delivery = delivery
+    const emotionRequested = readString(payload, 'emotion_requested') ?? removed?.emotion_requested
+    if (emotionRequested) output.emotion_requested = emotionRequested
+    const emotionApplied = readString(payload, 'emotion_applied') ?? removed?.emotion_applied
+    if (emotionApplied) output.emotion_applied = emotionApplied
+    upsertSpeechOutput(output)
     lastPlayback.value = {
       speech_id: speechId,
       conversation_id: conversationId,
@@ -396,6 +437,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       retiredEpisodes.add(previous.conversation_id)
       speechProgress.value = null
       speakPreview.value = null
+      speechOutputs.value = []
       playbackQueue.value = []
       lastPlayback.value = null
       terminalPlaybackKeys.clear()
@@ -403,6 +445,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (value.conversation_id === null) {
       speechProgress.value = null
       speakPreview.value = null
+      speechOutputs.value = []
       playbackQueue.value = []
       lastPlayback.value = null
       terminalPlaybackKeys.clear()
@@ -760,7 +803,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     }
     if (message.type === 'speech.completed') {
       if (isSpeechOutput(payload)) {
-        speechOutputs.value = [...speechOutputs.value.filter(item => item.speech_id !== payload.speech_id), payload].slice(-32)
+        upsertSpeechOutput(payload)
         if (speechProgress.value?.speech_id === payload.speech_id) speechProgress.value = null
         const conversationId = readString(payload, 'conversation_id')
         const speechId = readString(payload, 'speech_id')
@@ -969,6 +1012,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   function resetSession() {
     if (connection.value !== 'connected') return false
     resetCurrentTurn()
+    speechOutputs.value = []
     playbackQueue.value = []
     lastPlayback.value = null
     speechProgress.value = null

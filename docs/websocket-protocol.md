@@ -27,8 +27,13 @@
 - `speech.completed`：追加窗口和 delivery 结算后的最终事务记录，可能晚于物理播放结束。
 
 `speech.started` 和 `playback_finished` 是看板的实时播放边界；`speech.completed` 是账本与历史边界，
-两者不得互相替代。`subscribe` 返回的 `runtime.snapshot.agent` 从当前 Episode 实时生成，用于刷新页面或
-断线重连后恢复活动输出和等待队列。
+两者不得互相替代。前端可以在收到 `playback_finished` 后，把队列中已经取得的文本转入当前会话的本地
+历史轨迹，并以 `conversation_id + speech_id` 合并后续事件。这样物理播放结束后仍保留该条播报的独立
+轨迹，同时不把播放结束误报为服务端已经完成结算；后到的 `speech.completed` 负责补齐最终状态、
+delivery 与延迟等字段。切换会话、`session.reset` 或断开连接时，客户端应清理对应的会话级投影。
+
+`subscribe` 返回的 `runtime.snapshot.agent` 从当前 Episode 实时生成，用于刷新页面或断线重连后恢复活动
+输出和等待队列；快照中的已结算 outputs 仍应与前端刚刚形成的本地轨迹按同一复合键去重合并。
 
 ## Shadow 调试协议
 

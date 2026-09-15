@@ -1,6 +1,6 @@
 # V0.7 发布审计
 
-审计日期：2026-09-13（Asia/Hong_Kong）
+审计日期：2026-09-15（Asia/Hong_Kong）
 审计范围：受版本控制的项目文档、发布元数据、默认配置、主语音链、会话级 Shadow Agent、
 WebSocket 公共协议与自动化验证入口。
 
@@ -22,7 +22,8 @@ WebSocket 命令和默认端口保持不变，因此本次不是网络协议破�
 | 语音与会话 | 一个 400 ms 单飞调度循环；仅实际传达的 assistant 文本进入历史；ASR late refinement 不回写已发送历史 | `docs/v06-reliability-audit.md`、`voice_terminal/agent/episode.py`、`voice_terminal/session/ledger.py` |
 | Shadow | 每个 session 一个长期 `ShadowRuntime`；只读工具、最新权威上下文、异步事件 relay；不控制语音 | `docs/architecture.md`、`docs/context-and-tools.md` |
 | Thinking | `reasoning_mode` 是 `fast` / `balanced` / `deep` 的主开关；`request_thinking` 是本地控制动作 | `docs/llm-json-schema-migration.md` |
-| TTS 播放看板 | `speech.queued/delta/started/progress/completed` 构成只读实时投影；首次实际播放由 `speech.started` 标记，`playback_finished` 立即结束 UI 活动态，`speech.completed` 仍负责最终结算；重连只读实时 Episode 快照 | `docs/websocket-protocol.md`、`voice_terminal/controller/episode_output.py`、`apps/web/src/composables/useVoiceTerminal.ts` |
+| TTS 播放看板 | `speech.queued/delta/started/progress/completed` 构成只读实时投影；首次实际播放由 `speech.started` 标记，`playback_finished` 结束队列中的 UI 活动态并把已知文本转入当前会话历史轨迹，`speech.completed` 按 `conversation_id + speech_id` 合并最终状态与 delivery；重连只读实时 Episode 快照 | `docs/websocket-protocol.md`、`voice_terminal/controller/episode_output.py`、`apps/web/src/composables/useVoiceTerminal.ts` |
+| 设置反馈提示 | 保存成功或只读操作提示展示 5 秒，随后经过约 420 ms 的透明度过渡自动移除；新的提示会重置计时，错误提示不走该自动淡出生命周期并保留显式关闭入口 | `apps/web/src/product/useProductAdapter.ts`、`apps/web/src/product/ProductApp.vue`、`apps/web/src/ui-demo/ui-demo.css` |
 | 启动 | `scripts/start.ps1` 启动 Analysis、ASR、Web 与 Voice Server；`-NoWeb` 仅用于后端调试 | `docs/operations-and-quality.md` |
 | 运行产物 | 根目录 `logs/` 存放日志，`reports/` 存放诊断报告；二者都是本地、已忽略追踪的固定目录 | `.gitignore`、`README.md` |
 
@@ -38,6 +39,11 @@ WebSocket 命令和默认端口保持不变，因此本次不是网络协议破�
 - Speak Queue 已收敛为事件驱动的只读观测组件。它不显示或改变 1 秒追加窗口、内部 hold、
   provider session、replacement、delivery、SessionLedger 或 LLM `speak_snapshot` 的状态机；实时
   Episode 快照读取失败时仍返回缓存的 `RuntimeState.agent`，不会中断 WebSocket 订阅。
+- Product UI 的当前 Voice Terminal 会话会为每个 `conversation_id + speech_id` 保留独立播报轨迹：
+  等待/播放中的事务仍显示在队列，物理播放结束后转入历史轨迹，晚到的 `speech.completed` 只补齐同一条
+ 轨迹的最终状态，不会把已经播完的内容丢掉。切换 Episode、reset 或断开连接时清理该会话级本地投影。
+- Product UI 的设置反馈提示采用“5 秒可读期 + 淡出过渡”的生命周期；提示定时器在组件卸载时清理，
+  避免离开设置页后仍修改已卸载视图。
 
 ## 仍然开放的风险
 
@@ -64,7 +70,7 @@ npm run build
 ## 本次审计结果
 
 - `python -m pytest -q`：254 passed、2 skipped；出现两条第三方 SWIG 弃用告警，不影响结果。
-- `npm test`：Web Vitest 14/14 通过。
+- `npm test`：Web Vitest 17/17 通过。
 - `npm run typecheck`：通过。
 - `npm run build`：通过，Vite 已完成生产构建。
 
