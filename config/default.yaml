@@ -20,22 +20,26 @@ shadow_agent:
   compaction_threshold_ratio: 0.80
   # Omitted provider fields inherit llm.base_url, llm.model and llm.api_key_env.
   provider:
-    timeout_ms: 15000
-    transport_retry_limit: 2
+    # null means Shadow has no local request deadline or retry-count ceiling.
+    # reset/close/cancellation and provider-side terminal failures still apply.
+    timeout_ms: null
+    transport_retry_limit: null
   status_observer:
     enabled: true
     every_committed_steps: 5
     reasoning_effort: none
     max_output_tokens: 512
-    timeout_ms: 10000
+    timeout_ms: null
   tools:
     files_enabled: true
     allowed_roots: [docs]
+    # Maximum duration of one file/search tool execution.
+    timeout_ms: 15000
     web_search:
       enabled: true
       base_url: https://api.minimaxi.com
       api_key_env: MINIMAX_API_KEY
-      timeout_ms: 5000
+      timeout_ms: 15000
 
 # Episode-scoped Markdown context. Files are read when a new Agent episode
 # starts and remain frozen for that episode.

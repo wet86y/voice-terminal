@@ -43,14 +43,14 @@ class MiniMaxSearchClient:
     MAX_DATE_CHARS = 64
     MAX_RELATED_QUERY_CHARS = 256
 
-    def __init__(self, *, base_url: str, api_key: str | None, timeout_ms: int = 5000) -> None:
+    def __init__(self, *, base_url: str, api_key: str | None, timeout_ms: int | None = 15000) -> None:
         normalized_base_url = str(base_url or "").strip().rstrip("/")
         if not normalized_base_url:
             raise ValueError("MiniMax 搜索服务缺少 base_url")
 
         self.base_url = normalized_base_url
         self.api_key = str(api_key or "").strip()
-        self.timeout_ms = max(1, int(timeout_ms))
+        self.timeout_ms = None if timeout_ms is None else max(1, int(timeout_ms))
 
     @classmethod
     def normalize_query(cls, query: Any) -> str:
@@ -71,8 +71,10 @@ class MiniMaxSearchClient:
             raise MiniMaxSearchAuthError("未配置 MiniMax 搜索 API key")
 
         try:
-            timeout_seconds = self.timeout_ms / 1000
-            timeout = httpx.Timeout(timeout_seconds, connect=min(5.0, timeout_seconds))
+            timeout = None
+            if self.timeout_ms is not None:
+                timeout_seconds = self.timeout_ms / 1000
+                timeout = httpx.Timeout(timeout_seconds, connect=min(5.0, timeout_seconds))
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections import deque
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from voice_terminal.agent.decision_envelope import Action, DecisionEnvelope, Spe
 from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.agent.tool_registry import FileTools
 from voice_terminal.agent.shadow_registry import VoiceShadowRegistry
-from voice_terminal.config import AppConfig
+from voice_terminal.config import AppConfig, load_config
 from voice_terminal.session.contracts import DeliveryReport
 from voice_terminal.session.context import CurrentInput, LLMContextProjector
 from voice_terminal.session.ledger import SessionLedger
@@ -81,13 +82,120 @@ def test_request_shadow_contract_is_content_free_and_strict():
     assert VoiceShadowRegistry(available=True).action_definitions() == [definition]
 
 
-def test_configuration_exposes_compaction_retry_and_observer_defaults():
+def test_configuration_exposes_unlimited_shadow_execution_defaults():
     cfg = AppConfig().shadow_agent
     assert cfg.max_context_tokens == 524288
     assert cfg.compaction_threshold_ratio == 0.80
-    assert cfg.provider.transport_retry_limit == 2
+    assert cfg.provider.timeout_ms is None
+    assert cfg.provider.transport_retry_limit is None
+    assert cfg.tools.timeout_ms == 15000
+    assert cfg.tools.web_search.timeout_ms == 15000
+    assert cfg.status_observer.timeout_ms is None
     assert cfg.status_observer.every_committed_steps == 5
     assert cfg.status_observer.reasoning_effort == "none"
+
+    loaded = load_config(Path(__file__).parents[1] / "config" / "default.yaml").shadow_agent
+    assert loaded.provider.timeout_ms is None
+    assert loaded.provider.transport_retry_limit is None
+    assert loaded.tools.timeout_ms == 15000
+    assert loaded.tools.web_search.timeout_ms == 15000
+    assert loaded.status_observer.timeout_ms is None
+
+
+def test_shadow_runtime_has_no_provider_deadline_or_retry_count_ceiling(monkeypatch, tmp_path: Path):
+    async def scenario():
+        ledger, events = SessionLedger(), []
+        ledger.commit_input("u1", "持续核对")
+        provider = QueueProvider([
+            RuntimeError("stream interrupted once"),
+            RuntimeError("stream interrupted twice"),
+            [message("无限重试后完成")],
+        ])
+        runtime = make_runtime(
+            provider, ledger, tmp_path, events,
+            provider_timeout_ms=None, transport_retry_limit=None,
+        )
+        runtime.wake()
+        await wait_idle(runtime)
+        assert len(provider.requests) == 3
+        assert events[-1].kind == "result"
+        assert events[-1].text == "无限重试后完成"
+        await runtime.close()
+
+    async def forbidden_wait_for(*_args, **_kwargs):
+        raise AssertionError("unlimited Shadow requests must not use asyncio.wait_for")
+
+    monkeypatch.setattr(asyncio, "wait_for", forbidden_wait_for)
+    asyncio.run(scenario())
+
+
+def test_shadow_tool_calls_are_unbounded_by_default():
+    class ConcurrentBackend:
+        available = True
+
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.entered = 0
+            self.max_seen = 0
+            self.all_entered = threading.Event()
+
+        def action_definitions(self):
+            return [{
+                "name": "files_search", "description": "test", "parameters": {
+                    "type": "object", "properties": {"query": {"type": "string"}},
+                    "required": ["query"], "additionalProperties": False,
+                },
+            }]
+
+        def normalize(self, name, arguments):
+            return name, arguments
+
+        def execute(self, _name, _arguments):
+            with self.lock:
+                self.entered += 1
+                self.max_seen = max(self.max_seen, self.entered)
+                if self.entered >= 3:
+                    self.all_entered.set()
+            if not self.all_entered.wait(timeout=1):
+                raise RuntimeError("tool calls were serialized by a local concurrency cap")
+            return {"ok": True}
+
+    async def scenario():
+        backend = ConcurrentBackend()
+        executor = ShadowToolExecutor(backend)
+        calls = [
+            {"call_id": f"c{index}", "name": "files_search", "arguments": json.dumps({"query": str(index)})}
+            for index in range(3)
+        ]
+        outputs = await asyncio.wait_for(executor.execute_calls(calls), timeout=2)
+        assert backend.max_seen >= 3
+        assert all(json.loads(item["output"]) == {"ok": True} for item in outputs)
+
+    asyncio.run(scenario())
+
+
+def test_shadow_tool_call_uses_configured_fifteen_second_deadline():
+    class SlowBackend:
+        available = True
+
+        def action_definitions(self):
+            return []
+
+        def normalize(self, name, arguments):
+            return name, arguments
+
+        def execute(self, _name, _arguments):
+            threading.Event().wait(0.05)
+            return {"ok": True}
+
+    async def scenario():
+        executor = ShadowToolExecutor(SlowBackend(), timeout_ms=10)
+        result = await executor.execute("files_search", {"query": "x"})
+        assert result["error"] == "工具 files_search 执行超过 10ms"
+        await asyncio.sleep(0.08)
+        assert not executor._detached_work
+
+    asyncio.run(scenario())
 
 
 def test_shadow_projection_tracks_authoritative_facts_but_not_shadow_output():

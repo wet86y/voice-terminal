@@ -43,8 +43,10 @@ activation 结束后 runtime 回到 idle，但工作摘要和 cache epoch 保留
 相同已处理 revision 返回 `already_current`。这些结果仅用于日志，不进入主 ledger。
 
 Shadow 使用普通 Responses function-calling 循环。只提交 `response.completed.output`；
-SSE partial reasoning/text 不进入 committed trace。每个 provider 请求有 timeout 和有限 transport
-retry，但 activation 不设总墙钟或总步骤上限。
+SSE partial reasoning/text 不进入 committed trace。Shadow 的 activation、工具调用轮次、调用次数、
+provider 请求时长和 transport retry 均不设本地上限；每一次文件/搜索工具执行有 15 秒本地上限；
+reset、close、取消、provider 协议终止
+以及外部服务本身的限制仍然有效。activation 不设总墙钟或总步骤上限。
 
 ## 权威 Shadow 上下文
 
@@ -93,7 +95,7 @@ ledger reset 增加 source epoch 并从 revision 0 重新开始。Shadow 的 cac
 ## StatusObserver
 
 每 5 个成功提交的 Shadow provider response 触发一次无状态只读观察。Observer 使用 committed
-prefix 的不可变快照，`reasoning_effort=none`、`tools=[]`、`max_output_tokens=512`、10 秒 timeout，
+prefix 的不可变快照，`reasoning_effort=none`、`tools=[]`、`max_output_tokens=512`，不设本地请求 timeout；
 只返回 80～160 字工作简报。它不计入 Shadow model step、不写回 trace、不阻塞主循环；同时只有
 一个请求，重复触发合并。activation 已结束、reset/close 或已有更新状态时丢弃迟到摘要。
 

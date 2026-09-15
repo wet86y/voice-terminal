@@ -244,6 +244,7 @@ class SessionRuntime:
                         self.state.set_service("web_search", "DISABLED")
                     files = FileTools(shadow_cfg.tools.allowed_roots) if shadow_cfg.tools.files_enabled else None
                     executor = ShadowToolExecutor(files, self.shadow_search_tools,
+                                                   timeout_ms=shadow_cfg.tools.timeout_ms,
                                                    on_status=self._on_shadow_tool_status)
                     provider = DeepSeekResponsesShadowProvider(
                         base_url=shadow_cfg.provider.base_url,

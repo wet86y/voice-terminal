@@ -67,7 +67,13 @@ def test_responses_adapter_commits_only_completed_output_and_normalizes_cache_us
             },
         }
         response = FakeResponse([*(f"data: {json.dumps(item)}" for item in streamed), f"data: {json.dumps(complete)}"])
-        monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: FakeClient(response))
+        client_options = []
+
+        def make_client(*args, **kwargs):
+            client_options.append(kwargs)
+            return FakeClient(response)
+
+        monkeypatch.setattr("httpx.AsyncClient", make_client)
         provider = DeepSeekResponsesShadowProvider(
             base_url="https://example.test", api_key="key", model="m",
         )
@@ -84,6 +90,7 @@ def test_responses_adapter_commits_only_completed_output_and_normalizes_cache_us
             item["type"] for item in streamed
         ] + ["response.completed"]
         assert received[3]["delta"] == "private reasoning"
+        assert client_options == [{"timeout": None}]
         await provider.close()
 
     asyncio.run(scenario())
