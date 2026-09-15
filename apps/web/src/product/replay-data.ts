@@ -87,6 +87,18 @@ const shadowTimeline: ShadowProductSnapshot['timeline'] = [
   },
 ]
 
+const shadowActivities: NonNullable<ShadowProductSnapshot['activities']> = [
+  { run_seq: 7, item_id: 'context-7', stream: 'thinking', phase: 'completed', text: '上下文已同步', timestamp: '2026-09-14T22:24:31+08:00' },
+  { run_seq: 7, item_id: 'thinking-7', stream: 'thinking', phase: 'completed', text: '已整理会话目标，正在核对模型与运行时配置。', timestamp: '2026-09-14T22:24:34+08:00' },
+  { run_seq: 7, item_id: 'tool-7-search', stream: 'tool', phase: 'completed', tool_name: 'files_search', tool_status: 'completed', text: '工具执行完成', timestamp: '2026-09-14T22:25:17+08:00' },
+  { run_seq: 7, item_id: 'event-7-progress', stream: 'event', phase: 'completed', event_kind: 'progress', text: '继续检索运行时配置与环境覆盖。', timestamp: '2026-09-14T22:25:18+08:00' },
+  { run_seq: 7, item_id: 'tool-7-publish', stream: 'tool', phase: 'completed', tool_name: 'publish_main_event', tool_status: 'completed', text: '事件已传递', timestamp: '2026-09-14T22:25:29+08:00' },
+  { run_seq: 7, item_id: 'event-7-observation', stream: 'event', phase: 'completed', event_kind: 'observation', text: '已把最新会话上下文同步给主语音 Agent。', timestamp: '2026-09-14T22:25:29+08:00' },
+  { run_seq: 7, item_id: 'thinking-7-status', stream: 'thinking', phase: 'completed', text: '已核对可读状态，等待用户确认运行时配置。', timestamp: '2026-09-14T22:25:43+08:00' },
+  { run_seq: 7, item_id: 'event-7-waiting', stream: 'event', phase: 'completed', event_kind: 'user_input_required', text: '当前阻塞点：等待用户确认运行时配置。', timestamp: '2026-09-14T22:25:43+08:00' },
+  { run_seq: 7, item_id: 'run-7', stream: 'lifecycle', phase: 'completed', text: 'Shadow Agent 已完成本轮处理，等待输入', timestamp: '2026-09-14T22:25:43+08:00' },
+]
+
 const shadow: ShadowProductSnapshot = {
   available: true,
   active: false,
@@ -95,6 +107,8 @@ const shadow: ShadowProductSnapshot = {
   focus: '继续核对运行时配置与 Shadow 自身模型',
   summary: shadowSummary,
   timeline: shadowTimeline,
+  activities: shadowActivities,
+  last_activity_at: '2026-09-14T22:25:43+08:00',
   context: {
     used_tokens: 41069,
     limit_tokens: 524288,

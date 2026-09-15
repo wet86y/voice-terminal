@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
-import type { PlaybackQueueItem, ReasoningMode, SpeechOutputRecord } from '../types'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
+import type { PlaybackQueueItem, ReasoningMode, ShadowActivity, SpeechOutputRecord } from '../types'
 import { useProductAdapter, type AssignmentSlot, type ProductSettingsTab, type ProductUiModel } from './useProductAdapter'
 
 const adapter = useProductAdapter()
@@ -10,7 +10,7 @@ const {
   silenceSeconds, personaDocument: activePersona, personaDocuments, providerForm,
   providerStep, discoveredModels, modelAssignments, uiModels: modelEntries,
   availableLlmModels, availableTtsModels, visibleLocalPool, hiddenPool,
-  managedApiModelPool, selectedModels, activeModels, selectedTtsProfile, selectedTtsModel, activeTtsModel, registry, shadowThinking, shadowThinkingOptions,
+  managedApiModelPool, selectedModels, activeModels, selectedTtsProfile, selectedTtsModel, activeTtsModel, registry, shadowThinking, shadowThinkingCommitted, shadowThinkingPending, shadowThinkingOptions,
   shadowExpanded, thinkingExpanded, modelScanState, restartState, applyImpact,
   lastError, notice, noticeVisible, runtimeAction, resetSession, setReasoningMode, setShadowThinking,
   toggleProviderReasoning,
@@ -159,6 +159,122 @@ const assignedModelIds = computed(() => new Set([
   selectedModels.value.tts?.model_id,
 ]))
 const selectedShadowReasoning = computed(() => shadowThinking.value || shadowThinkingOptions.value[0] || 'off')
+
+const shadowActivities = computed(() => shadow.value.activities || [])
+const shadowScrollElement = ref<HTMLElement | null>(null)
+let shadowFollowTail: boolean | null = null
+
+function captureShadowScrollPosition() {
+  const element = shadowScrollElement.value
+  if (!element) return
+  shadowFollowTail = element.scrollHeight - element.scrollTop - element.clientHeight < 24
+}
+
+watch(shadowActivities, async () => {
+  const elementBeforeUpdate = shadowScrollElement.value
+  if (shadowFollowTail === null && elementBeforeUpdate) {
+    shadowFollowTail = elementBeforeUpdate.scrollHeight
+      - elementBeforeUpdate.scrollTop - elementBeforeUpdate.clientHeight < 24
+  }
+  if (!shadowFollowTail) return
+  await nextTick()
+  if (!shadowFollowTail) return
+  const element = shadowScrollElement.value
+  if (element) element.scrollTop = element.scrollHeight
+}, { deep: true })
+
+const shadowLastActivityAt = computed(() => (
+  shadow.value.last_activity_at
+  || shadowActivities.value[shadowActivities.value.length - 1]?.timestamp
+  || shadow.value.timeline[shadow.value.timeline.length - 1]?.timestamp
+  || ''
+))
+const shadowDisplayStatus = computed(() => {
+  if (!shadow.value.available) return '不可用'
+  if (shadow.value.user_input_required || shadow.value.phase === 'waiting') return '等待输入'
+  if (shadow.value.active || shadow.value.phase === 'working') return '运行中'
+  if (shadow.value.phase === 'error' || shadow.value.phase === 'failed') return '失败'
+  if (shadow.value.phase === 'completed' || shadow.value.phase === 'done') return '已完成'
+  return '空闲'
+})
+const shadowStatusClass = computed(() => {
+  if (!shadow.value.available) return 'unavailable'
+  if (shadow.value.user_input_required || shadow.value.phase === 'waiting') return 'waiting'
+  if (shadow.value.active || shadow.value.phase === 'working') return 'working'
+  if (shadow.value.phase === 'error' || shadow.value.phase === 'failed') return 'failed'
+  if (shadow.value.phase === 'completed' || shadow.value.phase === 'done') return 'completed'
+  return 'idle'
+})
+
+function legacyShadowEvents(): ShadowActivity[] {
+  const eventKinds: Record<string, ShadowActivity['event_kind']> = {
+    '后台处理中': 'progress',
+    '发布观察': 'observation',
+    '等待你的输入': 'user_input_required',
+    '完成': 'result',
+    '需要注意': 'failed',
+  }
+  return shadow.value.timeline.map((item, index) => ({
+    run_seq: 0,
+    item_id: `legacy-event-${index}`,
+    stream: 'event',
+    phase: item.state === 'error' ? 'failed' : 'completed',
+    text: item.text || item.label,
+    event_kind: eventKinds[item.label],
+    timestamp: item.timestamp,
+  }))
+}
+
+const shadowThinkingActivities = computed(() => {
+  const values = shadowActivities.value.filter(item => item.stream === 'thinking' || item.stream === 'lifecycle')
+  return (values.length ? values : (shadow.value.active ? [] : [])).slice(shadowExpanded.value ? -96 : -8)
+})
+const shadowToolActivities = computed(() => shadowActivities.value
+  .filter(item => item.stream === 'tool')
+  .slice(shadowExpanded.value ? -96 : -8))
+const shadowEventActivities = computed(() => {
+  const values = shadowActivities.value.filter(item => item.stream === 'event')
+  return (values.length ? values : legacyShadowEvents()).slice(shadowExpanded.value ? -96 : -8)
+})
+
+function shadowActivityPhaseLabel(activity: ShadowActivity) {
+  if (activity.stream === 'tool') {
+    const labels: Record<string, string> = {
+      preparing: '准备调用', running: '执行中', completed: '已完成',
+      failed: '失败', waiting: '等待输入', skipped: '已跳过', ready: '待执行',
+    }
+    if (activity.tool_status && labels[activity.tool_status]) return labels[activity.tool_status]
+  }
+  if (activity.event_kind === 'user_input_required') return '等待输入'
+  if (activity.event_kind === 'failed' || activity.phase === 'failed') return '失败'
+  if (activity.phase === 'started' || activity.phase === 'delta') return '进行中'
+  return '已完成'
+}
+
+function shadowActivityText(activity: ShadowActivity) {
+  if (activity.text) return activity.text
+  if (activity.stream === 'tool') return activity.tool_name ? `正在处理 ${activity.tool_name}` : '正在处理工具调用'
+  if (activity.event_kind === 'user_input_required') return 'Shadow 正在等待你的输入'
+  if (activity.phase === 'failed') return '这项活动没有完成'
+  return activity.phase === 'started' || activity.phase === 'delta' ? '正在运行' : '已更新'
+}
+
+function shadowActivityKindLabel(activity: ShadowActivity) {
+  const labels: Record<string, string> = {
+    progress: '处理中', observation: '观察', user_input_required: '需要输入',
+    result: '结果', failed: '失败',
+  }
+  return activity.event_kind ? labels[activity.event_kind] || activity.event_kind : '事件'
+}
+
+function shadowActivityClass(activity: ShadowActivity) {
+  return {
+    active: activity.phase === 'started' || activity.phase === 'delta',
+    complete: activity.phase === 'completed',
+    failed: activity.phase === 'failed' || activity.tool_status === 'failed',
+    waiting: activity.tool_status === 'waiting' || activity.event_kind === 'user_input_required',
+  }
+}
 
 function formatTime(value: string | undefined) {
   if (!value) return ''
@@ -448,15 +564,54 @@ function pageLabel() {
           <div><p class="panel-kicker"><span class="shadow-spark">✦</span> Shadow Agent</p><h2>后台协作</h2></div>
           <button class="expand-button" type="button" :aria-expanded="shadowExpanded" @click="shadowExpanded = !shadowExpanded">{{ shadowExpanded ? '收起' : '展开' }} <span>{{ shadowExpanded ? '−' : '+' }}</span></button>
         </header>
-        <div class="shadow-scroll">
-          <section class="shadow-state-card">
-            <div><span class="shadow-live-dot" :style="{ opacity: shadow.available ? 1 : .45 }"></span>{{ shadow.available ? (shadow.active ? '正在后台处理' : shadow.user_input_required ? '等待你的输入' : '随时可协作') : '当前不可用' }}</div>
-            <strong>{{ shadow.available ? shadow.phase : 'Unavailable' }}</strong>
+        <div ref="shadowScrollElement" class="shadow-scroll" @scroll="captureShadowScrollPosition">
+          <section class="shadow-summary-card" :class="`status-${shadowStatusClass}`">
+            <div class="shadow-summary-heading">
+              <div><p class="section-label">当前 Shadow 摘要</p><h3>{{ shadow.summary || (shadow.available ? '等待 Shadow 生成本轮可读摘要。' : 'Shadow Agent 当前不可用') }}</h3></div>
+              <span class="shadow-status-pill" :class="shadowStatusClass"><i></i>{{ shadowDisplayStatus }}</span>
+            </div>
+            <p class="shadow-focus-line"><span>当前关注</span>{{ shadow.focus || (shadow.available ? '等待真实会话上下文' : '后端没有提供可用 Shadow 运行时') }}</p>
+            <div class="shadow-summary-meta"><span>{{ shadow.active ? '运行中' : shadow.user_input_required ? '等待你的输入' : '最近更新' }}</span><time>{{ shadowLastActivityAt ? formatTime(shadowLastActivityAt) : '尚无活动记录' }}</time></div>
           </section>
-          <section class="shadow-task"><p class="section-label">当前关注</p><h3>{{ shadow.available ? (shadow.focus || '等待真实会话上下文') : 'Shadow Agent 当前不可用' }}</h3><p>{{ shadow.available ? (shadow.summary || '启动会话后，后台状态会在这里出现。') : '后端没有提供可用 Shadow 运行时，不显示模拟任务。' }}</p></section>
-          <section class="shadow-summary"><div class="section-row"><span>实时工作简报</span><small>{{ shadow.available ? '产品投影' : '不可用' }}</small></div><p>{{ shadow.summary || (shadow.available ? '暂无可读简报。' : '当前没有 Shadow 简报。') }}</p></section>
-          <section class="shadow-timeline"><div class="section-row"><span>安全时间线</span><small>{{ shadow.timeline.length }} / 5</small></div><ol><li v-for="item in shadow.timeline" :key="`${item.timestamp}-${item.label}-${item.text}`" :class="item.state"><i></i><div><strong>{{ item.label }}</strong><span>{{ item.text || '已更新' }}<small v-if="item.timestamp"> · {{ formatTime(item.timestamp) }}</small></span></div></li><li v-if="!shadow.timeline.length" class="empty-shadow-line"><i></i><div><strong>暂无后台事件</strong><span>不会注入假任务或假时间线</span></div></li></ol></section>
-          <section v-if="shadowExpanded" class="shadow-details"><div class="detail-row"><span>状态</span><strong>{{ shadow.available ? shadow.phase : 'unavailable' }}</strong></div><div v-if="shadow.user_input_required" class="detail-row"><span>需要操作</span><strong>等待用户输入</strong></div><p>只显示后端安全投影；原始 trace、prompt、工具参数和内部 revision 不会进入产品页面。</p></section>
+
+          <section class="shadow-runtime-card" :class="`status-${shadowStatusClass}`">
+            <header class="shadow-runtime-heading">
+              <div><p class="section-label">Agent 运行轨迹</p><h3>{{ shadow.active ? 'Shadow 正在处理' : shadowDisplayStatus }}</h3></div>
+              <span class="shadow-run-indicator" :class="shadowStatusClass"><i></i>{{ shadow.active ? 'LIVE' : shadowDisplayStatus }}</span>
+            </header>
+            <div class="shadow-runtime-sections">
+              <section class="shadow-activity-section thinking-section">
+                <header><span class="activity-section-icon thinking-icon">✦</span><div><strong>思考内容</strong><small>可读摘要与运行阶段</small></div><em>{{ shadowThinkingActivities.length }}</em></header>
+                <ol class="shadow-activity-list">
+                  <li v-for="activity in shadowThinkingActivities" :key="`${activity.run_seq}-${activity.item_id}`" class="shadow-activity-item" :class="shadowActivityClass(activity)">
+                    <span class="activity-node"><i></i></span><div class="activity-copy"><div class="activity-line"><strong>{{ shadowActivityText(activity) }}</strong><span>{{ shadowActivityPhaseLabel(activity) }}</span></div><time>{{ formatTime(activity.timestamp) }}</time></div>
+                  </li>
+                  <li v-if="!shadowThinkingActivities.length" class="shadow-activity-empty"><span class="activity-node"><i></i></span><div><strong>{{ shadow.available ? (shadow.active ? '正在分析' : '暂无可读摘要') : '等待 Shadow 可用' }}</strong><span>{{ shadow.available ? '运行过程中会在这里显示阶段与摘要增量。' : '连接后会恢复当前运行活动。' }}</span></div></li>
+                </ol>
+              </section>
+
+              <section class="shadow-activity-section tool-section">
+                <header><span class="activity-section-icon tool-icon">⌘</span><div><strong>工具调用情况</strong><small>准备、执行与结果</small></div><em>{{ shadowToolActivities.length }}</em></header>
+                <ol class="shadow-activity-list">
+                  <li v-for="activity in shadowToolActivities" :key="`${activity.run_seq}-${activity.item_id}`" class="shadow-activity-item" :class="shadowActivityClass(activity)">
+                    <span class="activity-node"><i></i></span><div class="activity-copy"><div class="activity-line"><strong>{{ activity.tool_name || '未知工具' }}</strong><span>{{ shadowActivityPhaseLabel(activity) }}</span></div><p>{{ shadowActivityText(activity) }}</p><time>{{ formatTime(activity.timestamp) }}</time></div>
+                  </li>
+                  <li v-if="!shadowToolActivities.length" class="shadow-activity-empty"><span class="activity-node"><i></i></span><div><strong>暂无工具调用</strong><span>工具开始准备后会保留调用顺序。</span></div></li>
+                </ol>
+              </section>
+
+              <section class="shadow-activity-section event-section">
+                <header><span class="activity-section-icon event-icon">↗</span><div><strong>传递到事件的输出</strong><small>ShadowEvent 公共事件</small></div><em>{{ shadowEventActivities.length }}</em></header>
+                <ol class="shadow-activity-list">
+                  <li v-for="activity in shadowEventActivities" :key="`${activity.run_seq}-${activity.item_id}`" class="shadow-activity-item" :class="shadowActivityClass(activity)">
+                    <span class="activity-node"><i></i></span><div class="activity-copy"><div class="activity-line"><strong>{{ shadowActivityKindLabel(activity) }}</strong><span>{{ shadowActivityPhaseLabel(activity) }}</span></div><p>{{ shadowActivityText(activity) }}</p><time>{{ formatTime(activity.timestamp) }}</time></div>
+                  </li>
+                  <li v-if="!shadowEventActivities.length" class="shadow-activity-empty"><span class="activity-node"><i></i></span><div><strong>{{ shadow.user_input_required ? '等待你的输入' : '暂无事件输出' }}</strong><span>{{ shadow.user_input_required ? 'Shadow 会在收到输入后继续。' : '进度、观察和结果会按时间顺序出现在这里。' }}</span></div></li>
+                </ol>
+              </section>
+            </div>
+            <section v-if="shadowExpanded" class="shadow-details"><div class="detail-row"><span>运行状态</span><strong>{{ shadowDisplayStatus }}</strong></div><div class="detail-row"><span>当前激活</span><strong>{{ shadow.active ? '处理中' : '已结束' }}</strong></div><div v-if="shadow.user_input_required" class="detail-row"><span>需要操作</span><strong>等待用户输入</strong></div><p>这里仅显示 Shadow 的公开活动、可读摘要和事件状态；原始私有 reasoning、prompt、工具参数与内部 revision 不会进入产品页面。</p></section>
+          </section>
         </div>
         <footer class="panel-resource-footer shadow-resource-footer">
           <section class="resource-metrics shadow-resource-metrics" aria-label="Shadow 模型资源与思考强度">
@@ -470,13 +625,14 @@ function pageLabel() {
                 </button>
                 <div v-if="thinkingExpanded" class="thinking-popover" role="dialog" aria-label="Shadow 思考等级设置">
                   <div class="thinking-popover-header">
-                    <div><strong>{{ currentThinkingOption.label }}</strong><span>{{ currentThinkingModel?.name || '当前模型' }}</span></div>
+                    <div><strong>{{ currentThinkingOption.label }}</strong><span>{{ currentThinkingModel?.name || '当前模型' }} · 已提交 {{ thinkingOptionLabels[shadowThinkingCommitted]?.shortLabel || shadowThinkingCommitted }}</span></div>
                     <button type="button" aria-label="收起思考强度设置" @click="thinkingExpanded = false">×</button>
                   </div>
                   <input class="thinking-slider" type="range" :min="0" :max="Math.max(shadowThinkingOptions.length - 1, 0)" step="1" :value="currentThinkingIndex" :style="thinkingSliderStyle" :aria-valuetext="currentThinkingOption.label" aria-label="选择思考强度" @input="setShadowThinkingFromSlider($event)" @change="setShadowThinkingFromSlider($event, true)" @click="setShadowThinkingFromTrackClick">
                   <div class="thinking-scale" aria-hidden="true"><span v-for="(level, index) in shadowThinkingOptions" :key="level" :class="{ active: index === currentThinkingIndex }">{{ thinkingOptionLabels[level]?.shortLabel || level }}</span></div>
                 </div>
               </div>
+              <span class="thinking-apply-state" :class="{ pending: shadowThinkingPending }">{{ shadowThinkingPending ? '待应用' : '已提交' }}</span>
             </div>
             <div class="resource-meter cache-rate-number shadow-cache-rate-number" tabindex="0" role="img" :aria-label="shadowCacheHitRatio === null ? '缓存命中率暂无数据' : `缓存命中率 ${Math.round(shadowCacheHitRatio * 100)}%`" :data-tooltip="shadowCacheHitRatio === null ? '缓存命中率 · 暂无数据' : `缓存命中率 · ${Math.round(shadowCacheHitRatio * 100)}%`"><strong>{{ shadowCacheHitRatio === null ? '—' : `${Math.round(shadowCacheHitRatio * 100)}%` }}</strong></div>
           </section>

@@ -47,6 +47,42 @@ delivery 与延迟等字段。切换会话、`session.reset` 或断开连接时�
 `subscribe` 返回的 `runtime.snapshot.agent` 从当前 Episode 实时生成，用于刷新页面或断线重连后恢复活动
 输出和等待队列；快照中的已结算 outputs 仍应与前端刚刚形成的本地轨迹按同一复合键去重合并。
 
+## Shadow 产品快照与活动流
+
+Shadow 产品面板使用两种互补的公共消息：
+
+- `shadow.product`：权威的 Shadow 产品投影。它包含当前 `available`、`active`、`phase`、`focus`、
+  `summary`、最近五条兼容时间线、资源 telemetry，以及有界的 `activities` 恢复列表；
+- `shadow.activity`：当前运行的实时增量。它只描述公开的生命周期、可读思考阶段、工具状态和
+  `ShadowEvent` 输出，不写入 Shadow committed trace。
+
+活动 payload 采用简化的 item 生命周期：
+
+```json
+{
+  "run_seq": 7,
+  "item_id": "tool-7-local-id",
+  "stream": "lifecycle|thinking|tool|event",
+  "phase": "started|delta|completed|failed",
+  "text": "正在执行工具",
+  "delta": "可读摘要增量",
+  "tool_name": "files_search",
+  "tool_status": "running",
+  "event_kind": "progress|observation|user_input_required|result|failed",
+  "timestamp": "2026-09-15T00:00:00.000Z"
+}
+```
+
+`run_seq` 与 `item_id` 由本地 Shadow runtime 生成；provider request、trace 和 response ID 不会进入
+公共协议。客户端重连时先应用 `shadow.product`，再按 WebSocket `seq` 应用后续 `shadow.activity`。
+同一 item 的 delta 必须合并，`completed` 或 `failed` 是该 item 的最终状态；旧 `run_seq` 的迟到活动
+直接丢弃。服务端只在内存中保留当前运行的有限活动，因此快照不会膨胀。
+
+`response.reasoning_text.delta` 只作为 provider 内部运行信号，不直接作为产品文本发送。思考区域展示
+状态阶段和独立的可读 Shadow summary；工具区域展示公开工具名/状态；事件区域展示真正传给
+`ShadowEventBuffer` 的 `progress`、`observation`、`user_input_required`、`result`、`failed` 内容。
+`shadow.activity` 与 `shadow.product` 均在公共协议白名单中，且不会改变主语音、speech 或 TTS 事件链路。
+
 ## Shadow 调试协议
 
 生产 Shadow 没有 task API，也不为每个 WebSocket 连接创建 manager。主模型只能通过内部

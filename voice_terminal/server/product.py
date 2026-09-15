@@ -509,6 +509,9 @@ class ShadowProductProjection:
         self.focus = ""
         self.summary = ""
         self.timeline: deque[dict[str, Any]] = deque(maxlen=5)
+        self.activities: deque[dict[str, Any]] = deque(maxlen=96)
+        self._activity_run_seq: int | None = None
+        self.last_activity_at = ""
 
     def reset(self, *, available: bool | None = None) -> None:
         if available is not None:
@@ -519,6 +522,9 @@ class ShadowProductProjection:
         self.focus = ""
         self.summary = ""
         self.timeline.clear()
+        self.activities.clear()
+        self._activity_run_seq = None
+        self.last_activity_at = ""
 
     def update_runtime(self, value: Mapping[str, Any] | None) -> None:
         if not isinstance(value, Mapping):
@@ -529,14 +535,14 @@ class ShadowProductProjection:
         status = _safe_display_text(value.get("status"), limit=320)
         if status:
             self.summary = status
-        if self.user_input_required:
+        if not self.available:
+            self.phase = "unavailable"
+        elif self.user_input_required:
             self.phase = "waiting"
         elif self.active:
             self.phase = "working"
-        elif self.available:
+        elif self.phase not in {"completed", "error"}:
             self.phase = "idle"
-        else:
-            self.phase = "unavailable"
 
     def update_events(self, events: list[ShadowEvent]) -> None:
         for item in events:
@@ -551,10 +557,14 @@ class ShadowProductProjection:
                 self.user_input_required = True
                 self.active = False
                 self.phase = "waiting"
-            elif kind in {"result", "failed"}:
+            elif kind == "result":
                 self.user_input_required = False
                 self.active = False
-                self.phase = "idle" if kind == "result" else "error"
+                self.phase = "completed"
+            elif kind == "failed":
+                self.user_input_required = False
+                self.active = False
+                self.phase = "error"
             elif kind in {"status", "progress", "observation"}:
                 self.active = True
                 self.phase = "working"
@@ -564,6 +574,121 @@ class ShadowProductProjection:
                 "text": text,
                 "timestamp": getattr(item, "timestamp", "") or utc_now_iso(),
             })
+
+    def update_activities(self, activities: list[Mapping[str, Any]]) -> None:
+        """Merge ordered UI-only activities without changing Shadow state."""
+        valid_streams = {"lifecycle", "thinking", "tool", "event"}
+        valid_phases = {"started", "delta", "completed", "failed"}
+        valid_event_kinds = {"progress", "observation", "user_input_required", "result", "failed"}
+        for raw in activities:
+            if not isinstance(raw, Mapping):
+                continue
+            run_seq = raw.get("run_seq")
+            if isinstance(run_seq, bool) or not isinstance(run_seq, int) or run_seq < 0:
+                continue
+            item_id = raw.get("item_id")
+            stream = raw.get("stream")
+            phase = raw.get("phase")
+            if not isinstance(item_id, str) or not item_id.strip() or stream not in valid_streams or phase not in valid_phases:
+                continue
+            if self._activity_run_seq is not None and run_seq < self._activity_run_seq:
+                continue
+            if self._activity_run_seq is None or run_seq > self._activity_run_seq:
+                # Keep a short completed tail for reconnect/history while
+                # discarding unfinished items from the previous run.
+                completed_tail = [
+                    dict(item) for item in self.activities
+                    if item.get("phase") in {"completed", "failed"}
+                ][-32:]
+                self.activities = deque(completed_tail, maxlen=96)
+                self._activity_run_seq = run_seq
+            timestamp = raw.get("timestamp")
+            item: dict[str, Any] = {
+                "run_seq": run_seq,
+                "item_id": item_id[:160],
+                "stream": stream,
+                "phase": phase,
+                "timestamp": timestamp if isinstance(timestamp, str) and timestamp else utc_now_iso(),
+            }
+            for key, limit in (("text", 4000), ("delta", 2000), ("tool_name", 160), ("tool_status", 120)):
+                value = raw.get(key)
+                if isinstance(value, str):
+                    item[key] = _safe_display_text(value, limit=limit) if key != "delta" else value[:limit]
+            event_kind = raw.get("event_kind")
+            if event_kind in valid_event_kinds:
+                item["event_kind"] = event_kind
+
+            current_index = next(
+                (index for index, existing in enumerate(self.activities)
+                 if existing.get("run_seq") == run_seq and existing.get("item_id") == item_id),
+                None,
+            )
+            if current_index is not None:
+                existing_phase = self.activities[current_index].get("phase")
+                if existing_phase in {"completed", "failed"} and phase != existing_phase:
+                    # A terminal item is authoritative even if a delayed
+                    # provider delta arrives after the relay has completed.
+                    continue
+            current = dict(self.activities[current_index]) if current_index is not None else {}
+            merged = {**current, **item}
+            if phase == "delta":
+                delta = item.get("delta")
+                if isinstance(delta, str) and delta:
+                    merged["text"] = f"{current.get('text', '')}{delta}"[:4000]
+                merged.pop("delta", None)
+            elif "text" not in item and "text" in current:
+                merged["text"] = current["text"]
+            if current_index is not None:
+                values = list(self.activities)
+                values[current_index] = merged
+                self.activities = deque(values, maxlen=96)
+            else:
+                self.activities.append(merged)
+            self._apply_activity_state(merged)
+            self.last_activity_at = str(merged.get("timestamp") or self.last_activity_at)
+
+    def _apply_activity_state(self, activity: Mapping[str, Any]) -> None:
+        """Reflect the live activity lifecycle in the summary status card."""
+        stream = activity.get("stream")
+        phase = activity.get("phase")
+        event_kind = activity.get("event_kind")
+        item_id = str(activity.get("item_id") or "")
+        if stream == "event":
+            if event_kind == "user_input_required":
+                self.user_input_required = True
+                self.active = False
+                self.phase = "waiting"
+            elif event_kind == "result":
+                self.user_input_required = False
+                self.active = False
+                self.phase = "completed"
+            elif event_kind == "failed" or phase == "failed":
+                self.user_input_required = False
+                self.active = False
+                self.phase = "error"
+            elif event_kind in {"progress", "observation"} and phase in {"started", "delta"}:
+                self.user_input_required = False
+                self.active = True
+                self.phase = "working"
+            return
+        if stream in {"thinking", "tool"} and phase in {"started", "delta"}:
+            self.user_input_required = False
+            self.active = True
+            self.phase = "working"
+            return
+        if stream != "lifecycle" or not item_id.startswith("run-"):
+            return
+        if phase == "started":
+            self.user_input_required = False
+            self.active = True
+            self.phase = "working"
+        elif phase == "failed":
+            self.user_input_required = False
+            self.active = False
+            self.phase = "error"
+        elif phase == "completed":
+            self.active = False
+            self.phase = "waiting" if self.user_input_required else "completed"
 
     def snapshot(self, runtime: Mapping[str, Any] | None = None) -> dict[str, Any]:
         self.update_runtime(runtime)
@@ -604,6 +729,8 @@ class ShadowProductProjection:
             "focus": self.focus,
             "summary": self.summary,
             "timeline": [dict(item) for item in self.timeline],
+            "activities": [dict(item) for item in self.activities],
+            "last_activity_at": self.last_activity_at or None,
             "context": context,
             "provider": provider,
         }

@@ -384,6 +384,7 @@ def test_debug_events_are_public_protocol_events():
     assert sequencer.public(event("speech.queued", "input_a"))
     assert sequencer.public(event("shadow.debug.wake", None))
     assert sequencer.public(event("shadow.debug.event", None))
+    assert sequencer.public(event("shadow.activity", None, run_seq=1, item_id="run-1", stream="lifecycle", phase="started"))
 
 
 def test_replacement_delivery_alignment_is_scoped_to_each_speech_id():

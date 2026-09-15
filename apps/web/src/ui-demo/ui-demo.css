@@ -572,3 +572,102 @@ body:has(.product-shell) { overflow: hidden; }
     transition-duration: .01ms;
   }
 }
+
+/* Shadow Agent activity stream: summary first, then one connected vertical
+   run card with thinking, tools, and public ShadowEvent output. */
+.product-shell .shadow-summary-card,
+.product-shell .shadow-runtime-card {
+  border: 1px solid #ffffff12;
+  border-radius: 14px;
+  background: linear-gradient(145deg, #18274676, #050b182e);
+}
+.product-shell .shadow-summary-card { margin-top: 20px; padding: 16px; }
+.product-shell .shadow-summary-card.status-working { border-color: #b782ee55; }
+.product-shell .shadow-summary-card.status-waiting { border-color: #e7b67555; }
+.product-shell .shadow-summary-card.status-failed { border-color: #f0808f55; }
+.shadow-summary-heading,
+.shadow-runtime-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.shadow-summary-heading > div,
+.shadow-runtime-heading > div { min-width: 0; }
+.shadow-summary-heading h3 { margin: 8px 0 0; color: #e5ecff; font-size: 14px; font-weight: 620; line-height: 1.55; }
+.shadow-status-pill,
+.shadow-run-indicator { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; padding: 5px 7px; border: 1px solid #ffffff1c; border-radius: 7px; color: #9caac4; background: #ffffff08; font-size: 9px; white-space: nowrap; }
+.shadow-status-pill i,
+.shadow-run-indicator i { width: 6px; height: 6px; border-radius: 50%; background: #7d8ca6; }
+.shadow-status-pill.working,
+.shadow-run-indicator.working { border-color: #c491f355; color: #dfc3fb; background: #b782ee13; }
+.shadow-status-pill.working i,
+.shadow-run-indicator.working i { background: #d1a1ff; box-shadow: 0 0 8px #ce96ff; }
+.shadow-status-pill.waiting,
+.shadow-run-indicator.waiting { border-color: #e7b67555; color: #e9c78e; background: #e7b67512; }
+.shadow-status-pill.waiting i,
+.shadow-run-indicator.waiting i { background: #e7b675; }
+.shadow-status-pill.completed,
+.shadow-run-indicator.completed { border-color: #78e2c244; color: #a1ddca; background: #78e2c210; }
+.shadow-status-pill.completed i,
+.shadow-run-indicator.completed i { background: var(--mint); }
+.shadow-status-pill.failed,
+.shadow-run-indicator.failed { border-color: #f0808f55; color: #f0a4ae; background: #f0808f12; }
+.shadow-status-pill.failed i,
+.shadow-run-indicator.failed i { background: var(--danger); }
+.shadow-focus-line { display: flex; align-items: baseline; gap: 8px; margin: 15px 0 0; color: #a6b4cd; font-size: 10px; line-height: 1.6; }
+.shadow-focus-line span { flex: 0 0 auto; color: #71809d; }
+.shadow-summary-meta { display: flex; justify-content: space-between; gap: 10px; margin-top: 14px; padding-top: 11px; border-top: 1px solid #ffffff0c; color: #7787a5; font-size: 9px; }
+.shadow-summary-meta time { color: #a0acc4; }
+.product-shell .shadow-runtime-card { margin-top: 13px; padding: 14px 14px 15px; }
+.shadow-runtime-heading { padding-bottom: 12px; border-bottom: 1px solid #ffffff0d; }
+.shadow-runtime-heading h3 { margin: 6px 0 0; color: #dbe5fb; font-size: 13px; font-weight: 620; }
+.shadow-runtime-sections { display: grid; gap: 0; }
+.shadow-activity-section { padding: 15px 0 2px; }
+.shadow-activity-section + .shadow-activity-section { border-top: 1px solid #ffffff0d; }
+.shadow-activity-section > header { display: flex; align-items: center; gap: 8px; }
+.activity-section-icon { width: 22px; height: 22px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid #ffffff17; border-radius: 7px; font-size: 11px; }
+.thinking-icon { color: #d3a5ff; background: #b782ee16; }
+.tool-icon { color: #86b3ff; background: #7899f116; }
+.event-icon { color: #8fd8c2; background: #78e2c214; }
+.shadow-activity-section > header > div { min-width: 0; display: grid; gap: 2px; }
+.shadow-activity-section > header strong { color: #cbd7ed; font-size: 11px; font-weight: 620; }
+.shadow-activity-section > header small { color: #71809d; font-size: 9px; }
+.shadow-activity-section > header em { min-width: 18px; margin-left: auto; color: #6f7f9c; font-size: 9px; font-style: normal; text-align: right; }
+.shadow-activity-list { display: grid; gap: 0; margin: 11px 0 0; padding: 0; list-style: none; }
+.shadow-activity-item,
+.shadow-activity-empty { position: relative; display: grid; grid-template-columns: 15px minmax(0, 1fr); gap: 8px; min-width: 0; padding: 0 0 12px; }
+.shadow-activity-item:last-child,
+.shadow-activity-empty:last-child { padding-bottom: 2px; }
+.activity-node { position: relative; display: flex; justify-content: center; width: 15px; }
+.activity-node::before { content: ""; position: absolute; top: 9px; bottom: -4px; width: 1px; background: #ffffff17; }
+.shadow-activity-item:last-child .activity-node::before,
+.shadow-activity-empty:last-child .activity-node::before { display: none; }
+.activity-node i { position: relative; z-index: 1; width: 7px; height: 7px; margin-top: 3px; border: 1px solid #71809d; border-radius: 50%; background: #182641; }
+.shadow-activity-item.active .activity-node i { border-color: #d1a1ff; background: #b782ee; box-shadow: 0 0 8px #ce96ff; }
+.shadow-activity-item.complete .activity-node i { border-color: #78e2c2; background: #78e2c2; }
+.shadow-activity-item.failed .activity-node i { border-color: #f0808f; background: #f0808f; }
+.shadow-activity-item.waiting .activity-node i { border-color: #e7b675; background: #e7b675; }
+.activity-copy { min-width: 0; }
+.activity-line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.activity-line strong { min-width: 0; overflow: hidden; color: #bbc8df; font-size: 10px; font-weight: 560; line-height: 1.45; text-overflow: ellipsis; }
+.shadow-activity-item.active .activity-line strong { color: #e1c9fb; }
+.shadow-activity-item.failed .activity-line strong { color: #efaab2; }
+.activity-line span { flex: 0 0 auto; color: #7787a3; font-size: 8px; }
+.activity-copy p { margin: 4px 0 0; color: #8291ac; font-size: 9px; line-height: 1.55; }
+.activity-copy time { display: block; margin-top: 3px; color: #5f6e89; font-size: 8px; }
+.shadow-activity-empty { color: #7787a3; }
+.shadow-activity-empty strong { display: block; color: #9aa8c1; font-size: 10px; font-weight: 560; }
+.shadow-activity-empty span:not(.activity-node) { display: block; margin-top: 3px; color: #687895; font-size: 9px; line-height: 1.5; }
+.shadow-runtime-card.status-unavailable .shadow-activity-empty .activity-node i { border-color: #596781; background: #2d3850; }
+.shadow-runtime-card.status-failed { border-color: #f0808f35; }
+.shadow-runtime-card.status-waiting { border-color: #e7b67535; }
+.shadow-runtime-card .shadow-details { margin-top: 12px; padding-top: 12px; }
+.workbench-reordered .shadow-resource-metrics > .thinking-meter { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px; }
+.thinking-apply-state { color: #6f7f9b; font-size: 8px; white-space: nowrap; }
+.thinking-apply-state.pending { color: #e7b675; }
+
+@media (max-width: 1180px) {
+  .product-shell .workbench-reordered .shadow-column { display: flex; grid-column: 1 / -1; }
+  .product-shell .workbench-reordered .shadow-scroll { display: block; }
+}
+
+@media (max-width: 800px) {
+  .product-shell .workbench-reordered .shadow-column { display: flex; grid-column: auto; }
+  .product-shell .shadow-summary-heading h3 { font-size: 13px; }
+}

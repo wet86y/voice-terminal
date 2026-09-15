@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, Sequence
 
 
 class ShadowProviderError(RuntimeError):
     pass
+
+
+ShadowStreamCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,7 @@ class ShadowProvider(Protocol):
         reasoning_effort: str,
         text_schema: dict[str, Any] | None = None,
         max_output_tokens: int | None = None,
+        on_stream: ShadowStreamCallback | None = None,
     ) -> ShadowProviderResponse: ...
 
 
@@ -88,6 +94,7 @@ class DeepSeekResponsesShadowProvider:
         reasoning_effort: str,
         text_schema: dict[str, Any] | None = None,
         max_output_tokens: int | None = None,
+        on_stream: ShadowStreamCallback | None = None,
     ) -> ShadowProviderResponse:
         if not self.api_key:
             raise ShadowProviderError("missing DeepSeek API key")
@@ -127,6 +134,10 @@ class DeepSeekResponsesShadowProvider:
                     if not isinstance(event, dict):
                         continue
                     kind = event.get("type")
+                    if on_stream is not None:
+                        callback_result = on_stream(dict(event))
+                        if inspect.isawaitable(callback_result):
+                            await callback_result
                     if kind == "response.completed":
                         candidate = event.get("response")
                         if isinstance(candidate, dict):

@@ -19,6 +19,7 @@ from .contracts import (
     WakeResult,
     shadow_control_tool_definitions,
 )
+from ..core.events import utc_now_iso
 from .prompts import COMPACTION_PROMPT, INTENT_REASSESSMENT_PROMPT, STATUS_OBSERVER_PROMPT
 from .provider import ShadowProvider, ShadowProviderError, ShadowProviderResponse
 from .tools import ShadowToolExecutor
@@ -94,6 +95,7 @@ class ShadowRuntime:
         *,
         instructions_loader: Callable[[], str],
         on_event: Callable[[ShadowEvent], None] | None = None,
+        on_activity: Callable[[dict[str, Any]], None] | None = None,
         provider_timeout_ms: int = 15000,
         transport_retry_limit: int = 2,
         max_context_tokens: int = 524288,
@@ -119,6 +121,7 @@ class ShadowRuntime:
         self.context_source = context_source
         self.instructions_loader = instructions_loader
         self.on_event = on_event
+        self.on_activity = on_activity
         self.on_metric = on_metric
         self.provider_timeout_ms = provider_timeout_ms
         self.transport_retry_limit = transport_retry_limit
@@ -167,6 +170,11 @@ class ShadowRuntime:
         self._tools = tuple([*tools.responses_tools(), *shadow_control_tool_definitions()])
         self.usage_samples: deque[dict[str, Any]] = deque(maxlen=256)
         self.status_usage_samples: deque[dict[str, Any]] = deque(maxlen=64)
+        # Provider item identifiers never cross this boundary.  They are only
+        # used while one activation is being translated into stable local
+        # activity items for the product UI.
+        self._provider_activity_items: dict[str, str] = {}
+        self._provider_activity_item_streams: dict[str, str] = {}
 
     @property
     def available(self) -> bool:
@@ -192,6 +200,10 @@ class ShadowRuntime:
         self._notify_runtime_state(active=True)
         self._activation_serial += 1
         serial = self._activation_serial
+        self._activity(
+            "lifecycle", "started", item_id=f"run-{serial}",
+            text="Shadow Agent 开始运行", run_seq=serial,
+        )
         self.runner = asyncio.create_task(self._run_activation(serial), name="shadow-agent-runtime")
         self._metric("activation.started", {"revision": revision, "serial": serial})
         return "started"
@@ -210,6 +222,76 @@ class ShadowRuntime:
                 self.on_metric(name, dict(payload))
             except Exception:
                 pass
+
+    def _activity(
+        self,
+        stream: str,
+        phase: str,
+        *,
+        item_id: str,
+        text: str | None = None,
+        delta: str | None = None,
+        tool_name: str | None = None,
+        tool_status: str | None = None,
+        event_kind: str | None = None,
+        run_seq: int | None = None,
+    ) -> None:
+        """Publish a bounded, product-safe activity item.
+
+        This relay is intentionally separate from ``ShadowEventBuffer``.  A
+        model delta is useful for the live panel, but it is not an
+        authoritative Shadow trace entry and must never affect tool ordering
+        or context reconciliation.
+        """
+        if self.on_activity is None:
+            return
+        payload: dict[str, Any] = {
+            "run_seq": self._activation_serial if run_seq is None else run_seq,
+            "item_id": str(item_id),
+            "stream": str(stream),
+            "phase": str(phase),
+            "timestamp": utc_now_iso(),
+        }
+        if text is not None:
+            payload["text"] = str(text).strip()[:4000]
+        if delta is not None:
+            payload["delta"] = str(delta)[:2000]
+        if tool_name is not None:
+            payload["tool_name"] = str(tool_name)[:160]
+        if tool_status is not None:
+            payload["tool_status"] = str(tool_status)[:120]
+        if event_kind is not None:
+            payload["event_kind"] = str(event_kind)
+        try:
+            self.on_activity(payload)
+        except Exception:
+            # Activity is diagnostic UI state.  It must never make the
+            # authoritative Shadow loop fail because a browser sink closed.
+            self._metric("activity.delivery_failed", {"stream": stream, "phase": phase})
+
+    def _activity_id(self, prefix: str, serial: int | None = None) -> str:
+        return f"{prefix}-{self._activation_serial if serial is None else serial}-{uuid.uuid4().hex[:12]}"
+
+    @staticmethod
+    def _provider_call(provider: ShadowProvider, kwargs: dict[str, Any]) -> Any:
+        """Call current and older test providers without breaking either API."""
+        try:
+            return provider.complete(**kwargs)
+        except TypeError as exc:
+            message = str(exc)
+            if "on_stream" in message:
+                kwargs.pop("on_stream", None)
+                try:
+                    return provider.complete(**kwargs)
+                except TypeError as retry_exc:
+                    if "max_output_tokens" not in str(retry_exc):
+                        raise
+                    kwargs.pop("max_output_tokens", None)
+                    return provider.complete(**kwargs)
+            if "max_output_tokens" not in message:
+                raise
+            kwargs.pop("max_output_tokens", None)
+            return provider.complete(**kwargs)
 
     def _append(self, item: dict[str, Any]) -> None:
         self.working_trace.append(item)
@@ -278,7 +360,8 @@ class ShadowRuntime:
         self, *, input_items: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]],
         reasoning_effort: str, text_schema: dict[str, Any] | None = None,
         max_output_tokens: int | None = None, timeout_ms: int | None = None,
-        retry: bool = True,
+        retry: bool = True, activity_mode: str | None = None,
+        activity_item_id: str | None = None,
     ) -> ShadowProviderResponse:
         normalized_effort = "off" if reasoning_effort == "none" else reasoning_effort
         if normalized_effort not in self.allowed_reasoning:
@@ -290,6 +373,25 @@ class ShadowRuntime:
         last: BaseException | None = None
         for attempt in range(attempts):
             started = time.monotonic()
+            attempt_activity_id = (
+                activity_item_id if activity_item_id and attempt == 0
+                else self._activity_id("model") if activity_mode else ""
+            )
+            activity_stream = "thinking" if activity_mode == "thinking" else "lifecycle"
+            if activity_mode:
+                self._activity(
+                    activity_stream, "started", item_id=attempt_activity_id,
+                    text=("正在整理可读工作简报" if activity_mode == "thinking" else "正在分析 Shadow 上下文"),
+                )
+            self._provider_activity_items = {}
+            self._provider_activity_item_streams = {}
+
+            async def on_stream(event: dict[str, Any]) -> None:
+                self._handle_provider_activity(
+                    event, mode=activity_mode or "main",
+                    activity_item_id=attempt_activity_id,
+                )
+
             try:
                 kwargs: dict[str, Any] = {
                     "instructions": self._instructions,
@@ -300,13 +402,9 @@ class ShadowRuntime:
                 }
                 if max_output_tokens is not None:
                     kwargs["max_output_tokens"] = max_output_tokens
-                try:
-                    call = self.provider.complete(**kwargs)
-                except TypeError as exc:
-                    if "max_output_tokens" not in str(exc):
-                        raise
-                    kwargs.pop("max_output_tokens", None)
-                    call = self.provider.complete(**kwargs)
+                if activity_mode and self.on_activity is not None:
+                    kwargs["on_stream"] = on_stream
+                call = self._provider_call(self.provider, kwargs)
                 response = await asyncio.wait_for(
                     call, (timeout_ms or self.provider_timeout_ms) / 1000,
                 )
@@ -314,11 +412,33 @@ class ShadowRuntime:
                 usage.update({"latency_ms": round((time.monotonic() - started) * 1000, 2)})
                 self.usage_samples.append(usage)
                 self._metric("provider.completed", usage)
+                if activity_mode:
+                    self._activity(
+                        activity_stream, "completed", item_id=attempt_activity_id,
+                        text=("可读工作简报已更新" if activity_mode == "thinking" else "模型处理完成"),
+                    )
                 return response
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 last = exc
+                if activity_mode:
+                    # A provider retry gets fresh local item IDs.  Close any
+                    # reasoning/tool item that was left open by the failed
+                    # attempt so it cannot remain visually active beside the
+                    # retry result.
+                    for stale_id in dict.fromkeys(self._provider_activity_items.values()):
+                        if stale_id == attempt_activity_id:
+                            continue
+                        self._activity(
+                            self._provider_activity_item_streams.get(stale_id, "thinking"),
+                            "failed", item_id=stale_id,
+                            text="模型流中断，活动未完成；正在重试" if attempt + 1 < attempts else "模型流中断，活动未完成",
+                        )
+                    self._activity(
+                        activity_stream, "failed", item_id=attempt_activity_id,
+                        text=f"本次模型流已结束：{str(exc)[:240] or type(exc).__name__}",
+                    )
                 self._metric("provider.retry", {"attempt": attempt + 1, "error": type(exc).__name__})
                 if attempt + 1 < attempts:
                     await asyncio.sleep(0.15 * (attempt + 1))
@@ -328,7 +448,7 @@ class ShadowRuntime:
         self, *, input_items: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]],
         reasoning_effort: str, text_schema: dict[str, Any] | None = None,
         max_output_tokens: int | None = None, timeout_ms: int | None = None,
-        retry: bool = False,
+        retry: bool = False, activity_item_id: str | None = None,
     ) -> ShadowProviderResponse:
         """Status reporting is isolated: no tools and always no reasoning."""
         if tools or reasoning_effort != "none":
@@ -340,24 +460,115 @@ class ShadowRuntime:
         }
         if max_output_tokens is not None:
             kwargs["max_output_tokens"] = max_output_tokens
+        item_id = activity_item_id or self._activity_id("thinking")
+
+        async def on_stream(event: dict[str, Any]) -> None:
+            self._handle_provider_activity(event, mode="thinking", activity_item_id=item_id)
+
+        if self.on_activity is not None:
+            kwargs["on_stream"] = on_stream
+        self._activity(
+            "thinking", "started", item_id=item_id, text="正在整理可读工作简报",
+        )
         try:
-            try:
-                call = self.status_provider.complete(**kwargs)
-            except TypeError as exc:
-                if "max_output_tokens" not in str(exc):
-                    raise
-                kwargs.pop("max_output_tokens", None)
-                call = self.status_provider.complete(**kwargs)
+            call = self._provider_call(self.status_provider, kwargs)
             response = await asyncio.wait_for(call, (timeout_ms or self.provider_timeout_ms) / 1000)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._activity(
+                "thinking", "failed", item_id=item_id,
+                text=f"可读工作简报暂时不可用：{str(exc)[:240] or type(exc).__name__}",
+            )
             raise ShadowProviderError(str(exc)[:500]) from exc
         usage = dict(response.usage)
         usage.update({"latency_ms": round((time.monotonic() - started) * 1000, 2)})
         self.status_usage_samples.append(usage)
         self._metric("status_provider.completed", usage)
+        self._activity("thinking", "completed", item_id=item_id, text="可读工作简报已更新")
         return response
+
+    def _handle_provider_activity(
+        self, event: dict[str, Any], *, mode: str, activity_item_id: str,
+    ) -> None:
+        """Translate provider lifecycle signals into public-safe activities."""
+        kind = event.get("type")
+        if not isinstance(kind, str):
+            return
+        if mode == "thinking":
+            # The status observer's output is an intentionally readable
+            # summary.  Raw response.reasoning_text.delta is never forwarded.
+            if kind == "response.output_text.delta":
+                delta = event.get("delta")
+                if isinstance(delta, str) and delta:
+                    self._activity(
+                        "thinking", "delta", item_id=activity_item_id, delta=delta,
+                    )
+            return
+
+        if kind == "response.output_item.added":
+            item = event.get("item")
+            if not isinstance(item, dict):
+                return
+            item_type = item.get("type")
+            if item_type == "reasoning":
+                reasoning_id = self._activity_id("thinking")
+                for provider_key in (item.get("id"), item.get("call_id")):
+                    if provider_key:
+                        self._provider_activity_items[str(provider_key)] = reasoning_id
+                self._provider_activity_item_streams[reasoning_id] = "thinking"
+                self._activity(
+                    "thinking", "started", item_id=reasoning_id,
+                    text="正在分析 Shadow 上下文",
+                )
+            elif item_type == "function_call":
+                tool_id = self._activity_id("tool")
+                for provider_key in (item.get("id"), item.get("call_id")):
+                    if provider_key:
+                        self._provider_activity_items[str(provider_key)] = tool_id
+                self._provider_activity_item_streams[tool_id] = "tool"
+                self._activity(
+                    "tool", "started", item_id=tool_id,
+                    tool_name=str(item.get("name") or "未知工具"),
+                    tool_status="preparing", text="准备调用工具",
+                )
+            return
+
+        if kind == "response.function_call_arguments.delta":
+            provider_key = str(
+                event.get("item_id") or event.get("call_id") or event.get("id") or ""
+            )
+            tool_id = self._provider_activity_items.get(provider_key)
+            if tool_id:
+                self._activity("tool", "delta", item_id=tool_id, tool_status="preparing")
+            return
+
+        if kind == "response.output_item.done":
+            item = event.get("item")
+            if not isinstance(item, dict):
+                return
+            local_id = next(
+                (self._provider_activity_items.get(str(provider_key))
+                 for provider_key in (item.get("id"), item.get("call_id")) if provider_key),
+                None,
+            )
+            if not local_id:
+                return
+            item_type = item.get("type")
+            if item_type == "function_call":
+                self._activity(
+                    # ``output_item.done`` only means the provider finished
+                    # assembling the call.  The actual tool has not run yet;
+                    # keep the item live so _execute_calls can transition it
+                    # to running and then to its terminal state.
+                    "tool", "delta", item_id=local_id,
+                    tool_name=str(item.get("name") or "未知工具"),
+                    tool_status="ready", text="工具调用已准备",
+                )
+            elif item_type == "reasoning":
+                self._activity(
+                    "thinking", "completed", item_id=local_id, text="分析阶段完成",
+                )
 
     @staticmethod
     def _calls(output: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -409,6 +620,12 @@ class ShadowRuntime:
             self.user_input_required = False
         if self.on_event is not None:
             self.on_event(event)
+        if kind != "status":
+            self._activity(
+                "event", "failed" if kind == "failed" else "completed",
+                item_id=self._activity_id("event"), text=event.text,
+                event_kind=kind,
+            )
         self._metric("event.published", {"kind": kind})
 
     def _latest_context_result(self, since_revision: int) -> dict[str, Any]:
@@ -431,6 +648,14 @@ class ShadowRuntime:
         outputs: list[dict[str, Any]] = []
         stop_activation = False
         for index, call in enumerate(calls):
+            call_key = str(call.get("call_id") or call.get("id") or "")
+            tool_activity_id = self._provider_activity_items.get(call_key)
+            if not tool_activity_id:
+                tool_activity_id = self._activity_id("tool")
+                if call_key:
+                    self._provider_activity_items[call_key] = tool_activity_id
+            self._provider_activity_item_streams[tool_activity_id] = "tool"
+            tool_name = str(call.get("name") or "未知工具")
             if index and self.context_source.shadow_input_revision > self.applied_context_revision:
                 remaining = calls[index:]
                 outputs.extend(
@@ -442,27 +667,59 @@ class ShadowRuntime:
                 self.pending_context_revision = max(
                     self.pending_context_revision, self.context_source.shadow_input_revision,
                 )
+                for item in remaining:
+                    remaining_key = str(item.get("call_id") or item.get("id") or "")
+                    remaining_id = self._provider_activity_items.get(remaining_key) or self._activity_id("tool")
+                    self._activity(
+                        "tool", "completed", item_id=remaining_id,
+                        tool_name=str(item.get("name") or "未知工具"),
+                        tool_status="skipped", text="上下文已更新，未执行",
+                    )
                 self._metric("tool.prevented_by_context", {"count": len(remaining)})
                 break
             call_id, name = call.get("call_id"), call.get("name")
             args = self._arguments(call)
             if not isinstance(name, str) or args is None:
+                self._activity(
+                    "tool", "failed", item_id=tool_activity_id,
+                    tool_name=tool_name, tool_status="failed", text="工具参数无效",
+                )
                 outputs.append(self._call_output(call_id, {"error": "malformed function call"}))
                 continue
+            self._activity(
+                "tool", "started", item_id=tool_activity_id,
+                tool_name=name, tool_status="running", text="正在执行工具",
+            )
             if name == "get_latest_context":
                 since = args.get("since_revision")
                 value = self._latest_context_result(since if isinstance(since, int) else -1)
                 outputs.append(self._call_output(call_id, value))
+                self._activity(
+                    "tool", "completed", item_id=tool_activity_id,
+                    tool_name=name, tool_status="completed", text="上下文已同步",
+                )
             elif name == "publish_main_event":
                 kind, text = args.get("kind"), args.get("text")
                 if kind not in {"progress", "observation"} or not isinstance(text, str) or not text.strip():
+                    self._activity(
+                        "tool", "failed", item_id=tool_activity_id,
+                        tool_name=name, tool_status="failed", text="事件内容无效",
+                    )
                     outputs.append(self._call_output(call_id, {"error": "invalid event"}))
                 else:
                     self._emit(kind, text)
                     outputs.append(self._call_output(call_id, {"status": "published"}))
+                    self._activity(
+                        "tool", "completed", item_id=tool_activity_id,
+                        tool_name=name, tool_status="completed", text="事件已传递",
+                    )
             elif name == "request_user_input":
                 kind, question = args.get("kind"), args.get("question")
                 if kind not in {"clarification", "confirmation"} or not isinstance(question, str) or not question.strip():
+                    self._activity(
+                        "tool", "failed", item_id=tool_activity_id,
+                        tool_name=name, tool_status="failed", text="输入请求无效",
+                    )
                     outputs.append(self._call_output(call_id, {"error": "invalid user input request"}))
                 else:
                     payload = {
@@ -472,14 +729,24 @@ class ShadowRuntime:
                     }
                     self._emit("user_input_required", question, payload=payload)
                     outputs.append(self._call_output(call_id, {"status": "published", "activation": "idle"}))
+                    self._activity(
+                        "tool", "completed", item_id=tool_activity_id,
+                        tool_name=name, tool_status="waiting", text="等待用户输入",
+                    )
                     stop_activation = True
             else:
                 tool_started = time.monotonic()
                 result = await self.tools.execute(name, args)
+                tool_ok = "error" not in result
+                self._activity(
+                    "tool", "completed" if tool_ok else "failed", item_id=tool_activity_id,
+                    tool_name=name, tool_status="completed" if tool_ok else "failed",
+                    text="工具执行完成" if tool_ok else str(result.get("error") or "工具执行失败")[:240],
+                )
                 self._metric("tool.completed", {
                     "name": name,
                     "latency_ms": round((time.monotonic() - tool_started) * 1000, 2),
-                    "ok": "error" not in result,
+                    "ok": tool_ok,
                 })
                 outputs.append(self._call_output(call_id, result))
             if stop_activation:
@@ -523,6 +790,7 @@ class ShadowRuntime:
             response = await self._provider_complete(
                 input_items=[*self.working_trace, {"role": "system", "content": COMPACTION_PROMPT}],
                 tools=[], reasoning_effort=self.reasoning_effort, text_schema=schema, retry=False,
+                activity_mode="main",
             )
             text = _text_from_output(response.output)
             value = json.loads(text)
@@ -569,20 +837,43 @@ class ShadowRuntime:
         )
 
     async def _observe(self, serial: int, trace: tuple[dict[str, Any], ...], trace_revision: int) -> None:
+        activity_item_id = self._activity_id("thinking", serial)
+
+        async def complete(**kwargs: Any) -> ShadowProviderResponse:
+            return await self._status_provider_complete(
+                activity_item_id=activity_item_id, **kwargs,
+            )
+
         try:
             text = await self.status_observer.summarize(
-                self._status_trace_prefix(trace), self._status_provider_complete,
+                self._status_trace_prefix(trace), complete,
             )
             if not text:
+                self._activity(
+                    "thinking", "completed", item_id=activity_item_id,
+                    text="暂无新的可读工作简报",
+                )
                 return
             newer_visible = self._last_status_trace_revision > trace_revision
             if not self.active or serial != self._activation_serial or newer_visible:
+                self._activity(
+                    "thinking", "failed", item_id=activity_item_id,
+                    text="这次工作简报已过期，未覆盖当前运行",
+                )
                 self._metric("observer.late_discard", {})
                 return
             self._emit("status", text[:512])
+            self._activity(
+                "thinking", "completed", item_id=activity_item_id,
+                text=text[:512],
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._activity(
+                "thinking", "failed", item_id=activity_item_id,
+                text=f"可读工作简报失败：{str(exc)[:240] or type(exc).__name__}",
+            )
             self._metric("observer.failed", {"error": type(exc).__name__})
         finally:
             pending = self._observer_pending
@@ -603,13 +894,24 @@ class ShadowRuntime:
 
     async def _run_activation(self, serial: int) -> None:
         started = time.monotonic()
+        context_activity_id = f"context-{serial}"
         try:
+            self._activity(
+                "thinking", "started", item_id=context_activity_id,
+                text="正在同步上下文", run_seq=serial,
+            )
+            self._apply_pending_context()
+            self._activity(
+                "thinking", "completed", item_id=context_activity_id,
+                text="上下文已同步", run_seq=serial,
+            )
             while not self._closed and serial == self._activation_serial:
                 self._apply_pending_context()
                 await self._maybe_compact()
                 response = await self._provider_complete(
                     input_items=tuple(self.working_trace), tools=self._tools,
                     reasoning_effort=self.reasoning_effort,
+                    activity_mode="main",
                 )
                 for item in response.output:
                     self._append(dict(item))
@@ -624,6 +926,14 @@ class ShadowRuntime:
                             self._append(self._call_output(call.get("call_id"), {
                                 "status": "not_executed", "reason": "conversation_context_updated",
                             }))
+                            call_key = str(call.get("call_id") or call.get("id") or "")
+                            tool_activity_id = self._provider_activity_items.get(call_key) or self._activity_id("tool")
+                            self._provider_activity_item_streams[tool_activity_id] = "tool"
+                            self._activity(
+                                "tool", "completed", item_id=tool_activity_id,
+                                tool_name=str(call.get("name") or "未知工具"),
+                                tool_status="skipped", text="上下文已更新，未执行",
+                            )
                         self._metric("tool.prevented_by_context", {"count": len(calls)})
                         self._schedule_observer(serial)
                         continue
@@ -636,6 +946,10 @@ class ShadowRuntime:
                     )
                     if stop:
                         self._last_processed_revision = self.applied_context_revision
+                        self._activity(
+                            "lifecycle", "completed", item_id=f"run-{serial}",
+                            text="等待用户输入", run_seq=serial,
+                        )
                         return
                     self._schedule_observer(serial)
                     continue
@@ -651,6 +965,15 @@ class ShadowRuntime:
                 state, terminal = self._terminal_text(text)
                 if state == "result" and terminal.strip():
                     self._emit("result", terminal)
+                    self._activity(
+                        "lifecycle", "completed", item_id=f"run-{serial}",
+                        text="Shadow Agent 已完成本轮处理", run_seq=serial,
+                    )
+                elif state == "no_action":
+                    self._activity(
+                        "lifecycle", "completed", item_id=f"run-{serial}",
+                        text="本轮无需继续操作", run_seq=serial,
+                    )
                 self._last_processed_revision = self.applied_context_revision
                 return
         except asyncio.CancelledError:
@@ -658,6 +981,11 @@ class ShadowRuntime:
         except Exception as exc:
             if not self._closed and serial == self._activation_serial:
                 self._emit("failed", f"影子 Agent 暂时无法继续：{str(exc)[:300]}", payload={"category": type(exc).__name__})
+                self._activity(
+                    "lifecycle", "failed", item_id=f"run-{serial}",
+                    text=f"Shadow Agent 运行失败：{str(exc)[:240] or type(exc).__name__}",
+                    run_seq=serial,
+                )
                 self._last_processed_revision = self.applied_context_revision
         finally:
             if serial == self._activation_serial:
@@ -723,6 +1051,8 @@ class ShadowRuntime:
         self._observer_pending = False
         self._last_status_trace_revision = 0
         self._pending_since = None
+        self._provider_activity_items = {}
+        self._provider_activity_item_streams = {}
         self.usage_samples.clear()
         self.status_usage_samples.clear()
 

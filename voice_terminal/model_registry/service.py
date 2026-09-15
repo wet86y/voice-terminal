@@ -102,6 +102,7 @@ class ModelRegistryService:
             "assignments": {
                 "voice_llm_model_id": None, "shadow_llm_model_id": None,
                 "status_llm_model_id": None, "tts_profile_id": None,
+                "shadow_reasoning_effort": "high",
                 "policy_mode": "model",
                 "role_settings": {
                     "voice": {"reasoning_effort": "low", "max_context_tokens": 128000},
@@ -135,6 +136,7 @@ class ModelRegistryService:
             migrated = True
         else:
             had_policy_mode = "policy_mode" in value["assignments"]
+            had_shadow_reasoning_effort = "shadow_reasoning_effort" in value["assignments"]
             for key, default in template["assignments"].items():
                 if key not in value["assignments"]:
                     value["assignments"][key] = deepcopy(default)
@@ -155,6 +157,30 @@ class ModelRegistryService:
                                 migrated = True
             if not had_policy_mode:
                 value["assignments"]["policy_mode"] = "legacy" if source_version == 1 else "model"
+                migrated = True
+            # v2 clients use a direct field.  Older registries kept the same
+            # value only under role_settings.shadow; migrate that value while
+            # retaining the nested view for older clients.
+            nested_shadow = value["assignments"].get("role_settings", {}).get("shadow", {})
+            nested_effort = nested_shadow.get("reasoning_effort") if isinstance(nested_shadow, dict) else None
+            direct_effort = value["assignments"].get("shadow_reasoning_effort")
+            normalized_direct = str(direct_effort or "").strip().lower()
+            if normalized_direct == "none":
+                normalized_direct = "off"
+            if normalized_direct not in SUPPORTED_REASONING_EFFORTS:
+                normalized_direct = str(nested_effort or template["assignments"]["shadow_reasoning_effort"]).strip().lower()
+                if normalized_direct == "none":
+                    normalized_direct = "off"
+                if normalized_direct not in SUPPORTED_REASONING_EFFORTS:
+                    normalized_direct = str(template["assignments"]["shadow_reasoning_effort"])
+            if not had_shadow_reasoning_effort or direct_effort != normalized_direct:
+                value["assignments"]["shadow_reasoning_effort"] = normalized_direct
+                migrated = True
+            # Keep the old nested field as a true compatibility view.  This
+            # also makes legacy ``none`` and mixed-case values converge on
+            # the same value used by the runtime and the new UI.
+            if isinstance(nested_shadow, dict) and nested_shadow.get("reasoning_effort") != normalized_direct:
+                nested_shadow["reasoning_effort"] = normalized_direct
                 migrated = True
         value["schema_version"] = REGISTRY_SCHEMA_VERSION
         migrated = self._normalize_model_policies(value) or migrated
@@ -286,7 +312,13 @@ class ModelRegistryService:
             item["max_context_tokens"] = normalized_context
             raw_efforts = item.get("allowed_reasoning")
             if isinstance(raw_efforts, list):
-                allowed = [str(value).lower() for value in raw_efforts if str(value).lower() in SUPPORTED_REASONING_EFFORTS]
+                allowed = []
+                for value in raw_efforts:
+                    normalized = str(value).lower()
+                    if normalized == "none":
+                        normalized = "off"
+                    if normalized in SUPPORTED_REASONING_EFFORTS and normalized not in allowed:
+                        allowed.append(normalized)
             else:
                 allowed = []
             if not allowed:
@@ -803,6 +835,10 @@ class ModelRegistryService:
                 effort = "low"
             elif role == "shadow":
                 requested = assignments.get("shadow_reasoning_effort")
+                if requested is None:
+                    nested_shadow = assignments.get("role_settings")
+                    nested_shadow = nested_shadow.get("shadow") if isinstance(nested_shadow, Mapping) else None
+                    requested = nested_shadow.get("reasoning_effort") if isinstance(nested_shadow, Mapping) else None
                 if requested is not None:
                     effort = str(requested).lower()
                     if effort == "none":
@@ -824,8 +860,9 @@ class ModelRegistryService:
                 "reasoning_effort": effort,
                 "max_context_tokens": context,
             }
-        if assignments.get("shadow_reasoning_effort") is not None:
-            target["shadow_reasoning_effort"] = role_settings["shadow"]["reasoning_effort"]
+        # Every successful v2 assignment carries the canonical direct field;
+        # role_settings.shadow remains a derived compatibility view.
+        target["shadow_reasoning_effort"] = role_settings["shadow"]["reasoning_effort"]
 
         providers = {item["id"]: item for item in registry["providers"] if isinstance(item, dict) and item.get("id")}
 

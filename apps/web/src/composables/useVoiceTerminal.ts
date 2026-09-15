@@ -16,6 +16,7 @@ import type {
   RuntimeSnapshotPayload,
   ServerMessage,
   ServiceStatuses,
+  ShadowActivity,
   ShadowProductSnapshot,
   ShadowTimelineItem,
   SessionStatePayload,
@@ -32,6 +33,7 @@ import { TERMINAL_STATES } from '../types'
 const DEFAULT_WS_URL = 'ws://127.0.0.1:8765/ws'
 const OPEN_READY_STATE = 1
 const MAX_RECENT_TURNS = 10
+const MAX_SHADOW_ACTIVITIES = 96
 const PERCEPTUAL_LATENCY_TICK_MS = 50
 
 export interface VoiceSocket {
@@ -154,9 +156,36 @@ function createEmptyShadowProduct(): ShadowProductSnapshot {
     focus: '',
     summary: '',
     timeline: [],
+    activities: [],
     context: {},
     provider: {},
   }
+}
+
+function readShadowActivity(value: unknown): ShadowActivity | null {
+  if (!isRecord(value)
+    || !isNonNegativeInteger(value.run_seq)
+    || typeof value.item_id !== 'string'
+    || !value.item_id.trim()
+    || (value.stream !== 'lifecycle' && value.stream !== 'thinking' && value.stream !== 'tool' && value.stream !== 'event')
+    || (value.phase !== 'started' && value.phase !== 'delta' && value.phase !== 'completed' && value.phase !== 'failed')
+    || typeof value.timestamp !== 'string') return null
+  const result: ShadowActivity = {
+    run_seq: value.run_seq,
+    item_id: value.item_id.slice(0, 160),
+    stream: value.stream,
+    phase: value.phase,
+    timestamp: value.timestamp,
+  }
+  for (const key of ['text', 'delta', 'tool_name', 'tool_status'] as const) {
+    if (typeof value[key] === 'string') result[key] = value[key].slice(0, key === 'delta' ? 2000 : 4000)
+  }
+  if (value.event_kind === 'progress' || value.event_kind === 'observation'
+    || value.event_kind === 'user_input_required' || value.event_kind === 'result'
+    || value.event_kind === 'failed') {
+    result.event_kind = value.event_kind
+  }
+  return result
 }
 
 function readShadowProduct(value: unknown): ShadowProductSnapshot | null {
@@ -182,6 +211,9 @@ function readShadowProduct(value: unknown): ShadowProductSnapshot | null {
       timestamp: item.timestamp,
     })
   }
+  const activities = Array.isArray(value.activities)
+    ? value.activities.map(readShadowActivity).filter((item): item is ShadowActivity => item !== null).slice(-MAX_SHADOW_ACTIVITIES)
+    : undefined
   const readTelemetry = (candidate: unknown, keys: string[]) => {
     if (!isRecord(candidate)) return {}
     const result: Record<string, number | null> = {}
@@ -193,7 +225,7 @@ function readShadowProduct(value: unknown): ShadowProductSnapshot | null {
     }
     return result
   }
-  return {
+  const result: ShadowProductSnapshot = {
     available: value.available,
     active: value.active,
     phase: value.phase,
@@ -204,6 +236,11 @@ function readShadowProduct(value: unknown): ShadowProductSnapshot | null {
     context: readTelemetry(value.context, ['used_tokens', 'limit_tokens', 'usage_percent']),
     provider: readTelemetry(value.provider, ['input_tokens', 'cached_tokens', 'cache_hit_ratio']),
   }
+  if (activities !== undefined) result.activities = activities
+  if (value.last_activity_at === null || typeof value.last_activity_at === 'string') {
+    result.last_activity_at = value.last_activity_at
+  }
+  return result
 }
 
 function parseServerMessage(raw: unknown): ServerMessage | null {
@@ -272,6 +309,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const perceptualLatencyMs = ref<number | null>(null)
   const perceptualLatencyRunning = ref(false)
   const now = options.now ?? (() => typeof performance !== 'undefined' ? performance.now() : Date.now())
+  const pendingShadowActivities: unknown[] = []
+  let shadowActivityFrame: number | undefined
   let perceptualLatencyTimer: ReturnType<typeof setInterval> | undefined
   let perceptualLatencyTurnId: string | null = null
   let perceptualLatencyStartedAt: number | null = null
@@ -294,6 +333,19 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     perceptualLatencyTurnId = null
     perceptualLatencyStartedAt = null
     perceptualLatencySettled = false
+  }
+
+  function cancelShadowActivityFrame() {
+    if (shadowActivityFrame === undefined) return
+    if (typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') {
+      window.cancelAnimationFrame(shadowActivityFrame)
+    }
+    shadowActivityFrame = undefined
+  }
+
+  function clearShadowActivityQueue() {
+    pendingShadowActivities.length = 0
+    cancelShadowActivityFrame()
   }
 
   function startPerceptualLatency(turnId: string | null) {
@@ -583,6 +635,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function resetConnectionData() {
+    clearShadowActivityQueue()
     currentTurnId.value = null
     agentEpisode.value = null
     agentTrace.value = []
@@ -599,12 +652,91 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     shadowProduct.value = createEmptyShadowProduct()
   }
 
+  function applyShadowProductSnapshot(value: ShadowProductSnapshot) {
+    // Flush deltas that arrived before this authoritative message so an
+    // animation-frame batch cannot overwrite the snapshot out of order.
+    flushShadowActivities()
+    // A product snapshot is authoritative on reconnect.  Keep the activity
+    // list bounded and never let an older backend snapshot resurrect a live
+    // run that has already been reset.
+    shadowProduct.value = {
+      ...value,
+      activities: value.activities
+        ? value.activities.slice(-MAX_SHADOW_ACTIVITIES)
+        : (shadowProduct.value.activities || []).slice(-MAX_SHADOW_ACTIVITIES),
+    }
+  }
+
+  function mergeShadowActivity(value: unknown) {
+    const incoming = readShadowActivity(value)
+    if (!incoming) return
+    const existingActivities = shadowProduct.value.activities || []
+    const latestRun = existingActivities.reduce<number | null>(
+      (currentRun, item) => currentRun === null ? item.run_seq : Math.max(currentRun, item.run_seq),
+      null,
+    )
+    if (latestRun !== null && incoming.run_seq < latestRun) return
+    const activities = incoming.run_seq > (latestRun ?? -1)
+      ? existingActivities.filter(item => item.phase === 'completed' || item.phase === 'failed').slice(-32)
+      : [...existingActivities]
+    const index = activities.findIndex(item => item.run_seq === incoming.run_seq && item.item_id === incoming.item_id)
+    if (index >= 0) {
+      const current = activities[index]
+      // A completed/failed item is final.  Provider retries get a new local
+      // item id, so a late delta can never splice itself into the retry.
+      if ((current.phase === 'completed' || current.phase === 'failed')
+        && incoming.phase !== current.phase) return
+      const merged: ShadowActivity = { ...current, ...incoming }
+      if (incoming.phase === 'delta') {
+        if (incoming.delta) merged.text = `${current.text || ''}${incoming.delta}`.slice(0, 4000)
+        delete merged.delta
+      }
+      activities[index] = merged
+    } else {
+      const item = { ...incoming }
+      if (item.phase === 'delta' && item.delta) {
+        item.text = item.delta.slice(0, 4000)
+        delete item.delta
+      }
+      activities.push(item)
+    }
+    shadowProduct.value = {
+      ...shadowProduct.value,
+      activities: activities.slice(-MAX_SHADOW_ACTIVITIES),
+      last_activity_at: incoming.timestamp,
+    }
+  }
+
+  function flushShadowActivities() {
+    cancelShadowActivityFrame()
+    const queued = pendingShadowActivities.splice(0)
+    for (const value of queued) mergeShadowActivity(value)
+  }
+
+  function queueShadowActivity(value: unknown) {
+    // Vitest and SSR do not provide requestAnimationFrame.  Keep those paths
+    // synchronous for deterministic consumers; browsers get one DOM update
+    // per frame while preserving the server sequence inside the queue.
+    if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
+      mergeShadowActivity(value)
+      return
+    }
+    pendingShadowActivities.push(value)
+    if (shadowActivityFrame !== undefined) return
+    shadowActivityFrame = window.requestAnimationFrame(() => {
+      shadowActivityFrame = undefined
+      const queued = pendingShadowActivities.splice(0)
+      for (const item of queued) mergeShadowActivity(item)
+    })
+  }
+
   function injectReplay(fixture: VoiceReplayFixture) {
     // This is deliberately a local development hook.  It fills the same
     // reactive stores used by the WebSocket protocol so the Product UI can be
     // inspected with a recorded session without changing the backend.
     connection.value = 'connected'
     connectionError.value = ''
+    clearShadowActivityQueue()
     resetPerceptualLatency()
     state.value = fixture.state
     listening.value = fixture.listening
@@ -621,6 +753,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     shadowProduct.value = {
       ...fixture.shadow,
       timeline: fixture.shadow.timeline.map(item => ({ ...item })),
+      activities: (fixture.shadow.activities || []).map(item => ({ ...item })),
       context: { ...(fixture.shadow.context || {}) },
       provider: { ...(fixture.shadow.provider || {}) },
     }
@@ -761,7 +894,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (payload.agent) applyAgent(payload.agent, true)
     if (payload.latency) applyLatencySnapshot(payload.latency)
     const shadow = readShadowProduct(payload.shadow)
-    if (shadow) shadowProduct.value = shadow
+    if (shadow) applyShadowProductSnapshot(shadow)
     if (Array.isArray(payload.recent_inputs)) {
       recentTurns.value = (payload.recent_inputs.filter(item => isRecord(item) && typeof item.turn_id === 'string') as InputRecord[])
         .slice(0, MAX_RECENT_TURNS).map(item => ({
@@ -865,7 +998,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (message.type === 'agent.reasoning') { if (typeof payload.text === 'string') reasoning.value = payload.text; return }
     if (message.type === 'shadow.product') {
       const shadow = readShadowProduct(payload)
-      if (shadow) shadowProduct.value = shadow
+      if (shadow) applyShadowProductSnapshot(shadow)
+      return
+    }
+    if (message.type === 'shadow.activity') {
+      queueShadowActivity(payload)
       return
     }
     if (message.type === 'speak.preview') { applySpeakPreview(payload); return }
@@ -1108,6 +1245,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
   function resetSession() {
     if (connection.value !== 'connected') return false
+    clearShadowActivityQueue()
+    shadowProduct.value = createEmptyShadowProduct()
     resetCurrentTurn()
     speechOutputs.value = []
     playbackQueue.value = []
