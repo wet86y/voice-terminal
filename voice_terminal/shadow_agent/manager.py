@@ -102,14 +102,18 @@ class ShadowRuntime:
         observer_every_steps: int = 5,
         observer_max_output_tokens: int = 512,
         observer_timeout_ms: int = 10000,
+        status_provider: ShadowProvider | None = None,
+        observer_max_context_tokens: int = 32768,
+        reasoning_effort: str = "high",
         on_metric: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
-        if transport_retry_limit < 0 or observer_every_steps < 1:
+        if transport_retry_limit < 0 or observer_every_steps < 1 or reasoning_effort not in {"low", "high", "max"}:
             raise ValueError("invalid Shadow runtime retry/observer configuration")
-        if max_context_tokens < 1024 or not 0 < compaction_threshold_ratio < 1:
+        if max_context_tokens < 1024 or observer_max_context_tokens < 1024 or not 0 < compaction_threshold_ratio < 1:
             raise ValueError("invalid Shadow context budget")
         tools.assert_read_only()
         self.provider = provider
+        self.status_provider = status_provider or provider
         self.tools = tools
         self.context_source = context_source
         self.instructions_loader = instructions_loader
@@ -123,6 +127,8 @@ class ShadowRuntime:
         self.observer_every_steps = observer_every_steps
         self.observer_max_output_tokens = observer_max_output_tokens
         self.observer_timeout_ms = observer_timeout_ms
+        self.observer_max_context_tokens = observer_max_context_tokens
+        self.reasoning_effort = reasoning_effort
         self.status_observer = ShadowStatusObserver(
             max_output_tokens=observer_max_output_tokens,
             timeout_ms=observer_timeout_ms,
@@ -152,6 +158,7 @@ class ShadowRuntime:
         self._instructions = instructions_loader()
         self._tools = tuple([*tools.responses_tools(), *shadow_control_tool_definitions()])
         self.usage_samples: deque[dict[str, Any]] = deque(maxlen=256)
+        self.status_usage_samples: deque[dict[str, Any]] = deque(maxlen=64)
 
     @property
     def available(self) -> bool:
@@ -299,6 +306,41 @@ class ShadowRuntime:
                     await asyncio.sleep(0.15 * (attempt + 1))
         raise ShadowProviderError(str(last)[:500] if last else "provider request failed")
 
+    async def _status_provider_complete(
+        self, *, input_items: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]],
+        reasoning_effort: str, text_schema: dict[str, Any] | None = None,
+        max_output_tokens: int | None = None, timeout_ms: int | None = None,
+        retry: bool = False,
+    ) -> ShadowProviderResponse:
+        """Status reporting is isolated: no tools and always no reasoning."""
+        if tools or reasoning_effort != "none":
+            raise ShadowProviderError("status observer must not use tools or reasoning")
+        started = time.monotonic()
+        kwargs: dict[str, Any] = {
+            "instructions": self._instructions, "input_items": input_items,
+            "tools": [], "reasoning_effort": "none", "text_schema": text_schema,
+        }
+        if max_output_tokens is not None:
+            kwargs["max_output_tokens"] = max_output_tokens
+        try:
+            try:
+                call = self.status_provider.complete(**kwargs)
+            except TypeError as exc:
+                if "max_output_tokens" not in str(exc):
+                    raise
+                kwargs.pop("max_output_tokens", None)
+                call = self.status_provider.complete(**kwargs)
+            response = await asyncio.wait_for(call, (timeout_ms or self.provider_timeout_ms) / 1000)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ShadowProviderError(str(exc)[:500]) from exc
+        usage = dict(response.usage)
+        usage.update({"latency_ms": round((time.monotonic() - started) * 1000, 2)})
+        self.status_usage_samples.append(usage)
+        self._metric("status_provider.completed", usage)
+        return response
+
     @staticmethod
     def _calls(output: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         return [dict(item) for item in output if item.get("type") == "function_call"]
@@ -431,6 +473,22 @@ class ShadowRuntime:
         ascii_count = sum(ord(char) < 128 for char in raw)
         return max(1, (ascii_count + 3) // 4 + len(raw) - ascii_count)
 
+    @staticmethod
+    def _estimate_items_tokens(items: Sequence[dict[str, Any]]) -> int:
+        raw = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+        ascii_count = sum(ord(char) < 128 for char in raw)
+        return max(1, (ascii_count + 3) // 4 + len(raw) - ascii_count)
+
+    def _status_trace_prefix(self, trace: Sequence[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+        """Keep only a bounded, committed tail for the independent observer."""
+        selected: list[dict[str, Any]] = []
+        for item in reversed(trace):
+            candidate = [dict(item), *selected]
+            if self._estimate_items_tokens(candidate) > self.observer_max_context_tokens:
+                break
+            selected = candidate
+        return tuple(selected)
+
     async def _maybe_compact(self) -> None:
         before = self._estimate_tokens()
         if before < int(self.max_context_tokens * self.compaction_threshold_ratio):
@@ -494,7 +552,9 @@ class ShadowRuntime:
 
     async def _observe(self, serial: int, trace: tuple[dict[str, Any], ...], trace_revision: int) -> None:
         try:
-            text = await self.status_observer.summarize(trace, self._provider_complete)
+            text = await self.status_observer.summarize(
+                self._status_trace_prefix(trace), self._status_provider_complete,
+            )
             if not text:
                 return
             newer_visible = self._last_status_trace_revision > trace_revision
@@ -531,7 +591,7 @@ class ShadowRuntime:
                 await self._maybe_compact()
                 response = await self._provider_complete(
                     input_items=tuple(self.working_trace), tools=self._tools,
-                    reasoning_effort="high",
+                    reasoning_effort=self.reasoning_effort,
                 )
                 for item in response.output:
                     self._append(dict(item))
@@ -597,6 +657,11 @@ class ShadowRuntime:
                 })
 
     def snapshot(self) -> dict[str, Any]:
+        context_tokens = self._estimate_tokens()
+        usage = self.usage_samples[-1] if self.usage_samples else None
+        input_tokens = usage.get("input_tokens") if usage else None
+        cached_tokens = usage.get("cached_tokens") if usage else None
+        cache_ratio = usage.get("cache_hit_ratio") if usage else None
         return {
             "available": self.available, "active": self.active,
             "status": self.latest_visible_status.text if self.latest_visible_status else "",
@@ -605,6 +670,12 @@ class ShadowRuntime:
             "applied_context_revision": self.applied_context_revision,
             "pending_context_revision": self.pending_context_revision,
             "committed_model_steps": self.committed_model_steps,
+            "context_token_estimate": context_tokens,
+            "context_limit_tokens": self.max_context_tokens,
+            "context_usage_percent": round(context_tokens / self.max_context_tokens * 100, 2),
+            "provider_input_tokens": input_tokens,
+            "provider_cached_tokens": cached_tokens,
+            "provider_cache_hit_ratio": cache_ratio,
         }
 
     async def reset(self) -> None:
@@ -635,6 +706,7 @@ class ShadowRuntime:
         self._last_status_trace_revision = 0
         self._pending_since = None
         self.usage_samples.clear()
+        self.status_usage_samples.clear()
 
     async def close(self, *, close_tools: bool = False) -> None:
         if self._closed:

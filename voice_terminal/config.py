@@ -119,8 +119,8 @@ class LlmConfig:
     transport_retry_limit: int = 2
 
     def __post_init__(self) -> None:
-        if self.provider not in {"deepseek", "opencode_go"}:
-            raise ValueError("llm.provider must be deepseek or opencode_go")
+        if self.provider not in {"deepseek", "opencode_go", "openai_compatible"}:
+            raise ValueError("llm.provider must be deepseek, opencode_go, or openai_compatible")
         if self.transport not in {"chat_completions", "responses"}:
             raise ValueError("llm.transport must be chat_completions or responses")
         if self.thinking not in {"disabled", "enabled"}:
@@ -246,9 +246,13 @@ class ShadowStatusObserverConfig:
     reasoning_effort: str = "none"
     max_output_tokens: int = 512
     timeout_ms: int = 10000
+    # None intentionally means inherit the Shadow Agent provider.  A managed
+    # product assignment supplies an explicit, independent status provider.
+    provider: ShadowProviderConfig | None = None
+    max_context_tokens: int = 32768
 
     def __post_init__(self) -> None:
-        if self.every_committed_steps < 1 or self.max_output_tokens < 1 or self.timeout_ms <= 0:
+        if self.every_committed_steps < 1 or self.max_output_tokens < 1 or self.timeout_ms <= 0 or self.max_context_tokens < 1024:
             raise ValueError("invalid shadow_agent.status_observer configuration")
         if self.reasoning_effort != "none":
             raise ValueError("shadow_agent.status_observer.reasoning_effort must be none")
@@ -261,12 +265,15 @@ class ShadowAgentConfig:
     provider: ShadowProviderConfig = field(default_factory=ShadowProviderConfig)
     tools: ShadowToolsConfig = field(default_factory=ShadowToolsConfig)
     max_context_tokens: int = 524288
+    reasoning_effort: str = "high"
     compaction_threshold_ratio: float = 0.80
     status_observer: ShadowStatusObserverConfig = field(default_factory=ShadowStatusObserverConfig)
 
     def __post_init__(self) -> None:
         if self.max_context_tokens < 1024:
             raise ValueError("shadow_agent.max_context_tokens must be at least 1024")
+        if self.reasoning_effort not in {"low", "high", "max"}:
+            raise ValueError("shadow_agent.reasoning_effort must be low, high or max")
         if not 0 < self.compaction_threshold_ratio < 1:
             raise ValueError("shadow_agent.compaction_threshold_ratio must be between 0 and 1")
 
@@ -413,6 +420,7 @@ class AppConfig:
         shadow_tools = _section(shadow, "tools")
         shadow_search = _section(shadow_tools, "web_search")
         shadow_observer = _section(shadow, "status_observer")
+        status_provider = _section(shadow_observer, "provider")
         raw_shadow_roots = shadow_tools.get("allowed_roots", ["docs"])
         if not isinstance(raw_shadow_roots, list) or not all(isinstance(item, str) and item.strip() for item in raw_shadow_roots):
             raise ValueError("shadow_agent.tools.allowed_roots must be a nonempty list of paths")
@@ -444,6 +452,7 @@ class AppConfig:
                     ),
                 ),
                 max_context_tokens=int(_number(shadow.get("max_context_tokens"), 524288)),
+                reasoning_effort=_string(shadow.get("reasoning_effort"), "high"),
                 compaction_threshold_ratio=float(_number(shadow.get("compaction_threshold_ratio"), 0.80)),
                 status_observer=ShadowStatusObserverConfig(
                     enabled=_bool(shadow_observer.get("enabled"), True),
@@ -451,6 +460,14 @@ class AppConfig:
                     reasoning_effort=_string(shadow_observer.get("reasoning_effort"), "none"),
                     max_output_tokens=int(_number(shadow_observer.get("max_output_tokens"), 512)),
                     timeout_ms=int(_number(shadow_observer.get("timeout_ms"), 10000)),
+                    provider=(ShadowProviderConfig(
+                        base_url=_string(status_provider.get("base_url"), _string(shadow_provider.get("base_url"), llm_base_url)),
+                        model=_string(status_provider.get("model"), _string(shadow_provider.get("model"), llm_model)),
+                        api_key_env=_string(status_provider.get("api_key_env"), _string(shadow_provider.get("api_key_env"), llm_api_key_env)),
+                        timeout_ms=int(_number(status_provider.get("timeout_ms"), _number(shadow_provider.get("timeout_ms"), 15000))),
+                        transport_retry_limit=int(_number(status_provider.get("transport_retry_limit"), _number(shadow_provider.get("transport_retry_limit"), 2))),
+                    ) if status_provider else None),
+                    max_context_tokens=int(_number(shadow_observer.get("max_context_tokens"), 32768)),
                 ),
             ),
             persona=PersonaConfig(

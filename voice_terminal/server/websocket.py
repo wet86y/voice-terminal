@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -32,16 +33,19 @@ from ..shadow_agent.tools import ShadowToolExecutor
 from ..session.ledger import SessionLedger
 from ..session.runtime import ConversationRuntime
 from ..vad.detector import FsmnVadDetector, VadError
+from ..model_registry.service import ModelRegistryError, ModelRegistryService
+from ..model_registry.vault import CredentialVaultUnavailable
 from .snapshot import ProtocolSequencer, snapshot_event
 
 logger = logging.getLogger(__name__)
 
 try:
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # type: ignore
+    from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect  # type: ignore
 except ImportError:  # pragma: no cover - exercised by doctor/setup, not unit tests
     FastAPI = None  # type: ignore[assignment]
     WebSocket = Any  # type: ignore[assignment,misc]
     WebSocketDisconnect = Exception  # type: ignore[assignment,misc]
+    HTTPException = RuntimeError  # type: ignore[assignment,misc]
 
 
 class SessionRuntime:
@@ -80,6 +84,7 @@ class SessionRuntime:
         self._session_lock = asyncio.Lock()
         self.build_info: dict[str, Any] = {}
         self.reasoning_mode = config.llm.reasoning_mode
+        self._credential_overrides: dict[str, str] = {}
         self.state.wake_always_on = bool(config.wake.enabled and config.wake.always_on)
 
     def _build_kws_worker(self) -> KwsWorker:
@@ -180,7 +185,7 @@ class SessionRuntime:
             code = getattr(exc, "code", "ASR_WORKER_UNAVAILABLE")
             self._record_error("asr", f"{code}: {exc}")
 
-        llm_key = self.config.api_key(self.config.llm.api_key_env)
+        llm_key = self._api_key(self.config.llm.api_key_env)
         if llm_key:
             self.llm = DeepSeekClient(
                 base_url=self.config.llm.base_url,
@@ -204,14 +209,14 @@ class SessionRuntime:
 
         shadow_cfg = self.config.shadow_agent
         if shadow_cfg.enabled:
-            shadow_key = self.config.api_key(shadow_cfg.provider.api_key_env)
+            shadow_key = self._api_key(shadow_cfg.provider.api_key_env)
             if not shadow_key:
                 self.state.set_service("shadow_agent", "DISABLED")
                 logger.warning("shadow agent disabled: missing %s", shadow_cfg.provider.api_key_env)
             else:
                 try:
                     search_cfg = shadow_cfg.tools.web_search
-                    search_key = self.config.api_key(search_cfg.api_key_env)
+                    search_key = self._api_key(search_cfg.api_key_env)
                     if search_cfg.enabled and search_key:
                         self.shadow_search_tools = WebSearchTools(MiniMaxSearchClient(
                             base_url=search_cfg.base_url, api_key=search_key,
@@ -231,8 +236,21 @@ class SessionRuntime:
                         session_id=(self.conversation.conversation_id
                                     if self.config.llm.provider == "opencode_go" else None),
                     )
+                    status_cfg = shadow_cfg.status_observer.provider
+                    status_provider = provider
+                    if status_cfg is not None:
+                        status_key = self._api_key(status_cfg.api_key_env)
+                        if not status_key:
+                            raise RuntimeError(f"未配置状态汇报模型凭据 {status_cfg.api_key_env}")
+                        status_provider = DeepSeekResponsesShadowProvider(
+                            base_url=status_cfg.base_url, model=status_cfg.model,
+                            api_key=status_key, timeout_ms=status_cfg.timeout_ms,
+                            session_id=(self.conversation.conversation_id
+                                        if self.config.llm.provider == "opencode_go" else None),
+                        )
                     self.shadow_component = ShadowAgentComponent(
-                        provider, executor, instructions_loader=load_shadow_instructions,
+                        provider, executor, status_provider=status_provider,
+                        instructions_loader=load_shadow_instructions,
                         runtime_options={
                             "provider_timeout_ms": shadow_cfg.provider.timeout_ms,
                             "transport_retry_limit": shadow_cfg.provider.transport_retry_limit,
@@ -242,6 +260,8 @@ class SessionRuntime:
                             "observer_every_steps": shadow_cfg.status_observer.every_committed_steps,
                             "observer_max_output_tokens": shadow_cfg.status_observer.max_output_tokens,
                             "observer_timeout_ms": shadow_cfg.status_observer.timeout_ms,
+                            "observer_max_context_tokens": shadow_cfg.status_observer.max_context_tokens,
+                            "reasoning_effort": shadow_cfg.reasoning_effort,
                             "on_metric": self._on_shadow_metric,
                         },
                     )
@@ -259,7 +279,7 @@ class SessionRuntime:
             self.state.set_service("shadow_agent", "DISABLED")
             self.state.set_service("web_search", "DISABLED")
 
-        minimax_key = self.config.api_key(self.config.tts.api_key_env)
+        minimax_key = self._api_key(self.config.tts.api_key_env)
 
         if minimax_key:
             self.tts = MiniMaxTtsClient(
@@ -366,6 +386,88 @@ class SessionRuntime:
                 self.controller.set_reasoning_mode(mode)
             await self.bus.publish(self.snapshot())
         return True
+
+    def _api_key(self, environment_name: str) -> str:
+        """Read a process credential or a short-lived vault-backed override."""
+        return self._credential_overrides.get(environment_name) or self.config.api_key(environment_name)
+
+    async def restart_model_services(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Rebuild compatible LLM, Shadow and TTS components as one safe unit.
+
+        A controller owns cancellation and output lifetimes, so changing client
+        references in place would leave an active episode using old providers.
+        The prior configuration is rebuilt if the new one cannot start.
+        """
+        voice = payload.get("voice") if isinstance(payload.get("voice"), dict) else {}
+        shadow = payload.get("shadow") if isinstance(payload.get("shadow"), dict) else {}
+        status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+        tts = payload.get("tts") if isinstance(payload.get("tts"), dict) else {}
+        voice_provider = voice.get("provider") if isinstance(voice.get("provider"), dict) else {}
+        shadow_provider = shadow.get("provider") if isinstance(shadow.get("provider"), dict) else {}
+        status_provider = status.get("provider") if isinstance(status.get("provider"), dict) else {}
+        tts_provider = tts.get("provider") if isinstance(tts.get("provider"), dict) else {}
+        allowed_llm = {"deepseek", "opencode_go", "openai_compatible"}
+        if any(provider.get("protocol") not in allowed_llm for provider in (voice_provider, shadow_provider, status_provider)):
+            return {"ok": False, "message": "所选 LLM 供应商尚未安装兼容的运行时适配器。"}
+        if tts_provider.get("protocol") != "minimax":
+            return {"ok": False, "message": "所选 TTS 供应商尚未安装兼容的运行时适配器。"}
+        profile = tts.get("profile") if isinstance(tts.get("profile"), dict) else {}
+        if str(profile.get("output_format") or "pcm").lower() != "pcm":
+            return {"ok": False, "message": "当前原生播放器仅支持 PCM TTS 输出。"}
+        async with self._session_lock:
+            previous_config = self.config
+            previous_overrides = dict(self._credential_overrides)
+            previous_listening = self.state.listening
+            try:
+                voice_env, shadow_env, status_env, tts_env = "VOICE_PRODUCT_VOICE_LLM_KEY", "VOICE_PRODUCT_SHADOW_LLM_KEY", "VOICE_PRODUCT_STATUS_LLM_KEY", "VOICE_PRODUCT_TTS_KEY"
+                overrides: dict[str, str] = {}
+                if isinstance(voice.get("api_key"), str): overrides[voice_env] = voice["api_key"]
+                if isinstance(shadow.get("api_key"), str): overrides[shadow_env] = shadow["api_key"]
+                if isinstance(status.get("api_key"), str): overrides[status_env] = status["api_key"]
+                if isinstance(tts.get("api_key"), str): overrides[tts_env] = tts["api_key"]
+                shadow_settings = shadow.get("settings") if isinstance(shadow.get("settings"), dict) else {}
+                status_settings = status.get("settings") if isinstance(status.get("settings"), dict) else {}
+                voice_settings = voice.get("settings") if isinstance(voice.get("settings"), dict) else {}
+                next_status_provider = replace(
+                    previous_config.shadow_agent.status_observer.provider or previous_config.shadow_agent.provider,
+                    base_url=str(status_provider.get("base_url") or previous_config.shadow_agent.provider.base_url),
+                    model=str(status.get("model_id") or previous_config.shadow_agent.provider.model),
+                    api_key_env=status_env if status_env in overrides else (previous_config.shadow_agent.status_observer.provider or previous_config.shadow_agent.provider).api_key_env,
+                )
+                next_shadow = replace(previous_config.shadow_agent, provider=replace(
+                    previous_config.shadow_agent.provider,
+                    base_url=str(shadow_provider.get("base_url") or previous_config.shadow_agent.provider.base_url),
+                    model=str(shadow.get("model_id") or previous_config.shadow_agent.provider.model),
+                    api_key_env=shadow_env if shadow_env in overrides else previous_config.shadow_agent.provider.api_key_env,
+                ), max_context_tokens=int(shadow_settings.get("max_context_tokens") or previous_config.shadow_agent.max_context_tokens), reasoning_effort=str(shadow_settings.get("reasoning_effort") or previous_config.shadow_agent.reasoning_effort), status_observer=replace(
+                    previous_config.shadow_agent.status_observer, provider=next_status_provider,
+                    max_context_tokens=int(status_settings.get("max_context_tokens") or previous_config.shadow_agent.status_observer.max_context_tokens),
+                    reasoning_effort="none",
+                ))
+                next_config = replace(
+                    previous_config,
+                    llm=replace(previous_config.llm, provider=str(voice_provider.get("protocol")), base_url=str(voice_provider.get("base_url")), model=str(voice.get("model_id")), api_key_env=voice_env if voice_env in overrides else previous_config.llm.api_key_env, reasoning_effort=str(voice_settings.get("reasoning_effort") or previous_config.llm.reasoning_effort)),
+                    shadow_agent=next_shadow,
+                    tts=replace(previous_config.tts, provider="minimax", base_url=str(tts_provider.get("base_url")), model=str(tts.get("model_id")), api_key_env=tts_env if tts_env in overrides else previous_config.tts.api_key_env, voice_id=str(profile.get("voice_id") or previous_config.tts.voice_id), emotion_mode=str(profile.get("emotion_mode") or previous_config.tts.emotion_mode), default_emotion=str(profile.get("default_emotion") or previous_config.tts.default_emotion), output_format="pcm", sample_rate=int(profile.get("sample_rate") or previous_config.tts.sample_rate), transport=str(profile.get("transport") or previous_config.tts.transport), scheduling=str(profile.get("scheduling") or previous_config.tts.scheduling), subtitle_enable=bool(profile.get("subtitle_enable", previous_config.tts.subtitle_enable)), subtitle_type=str(profile.get("subtitle_type") or previous_config.tts.subtitle_type)),
+                )
+                await self.close()
+                self.config, self._credential_overrides = next_config, overrides
+                await self.initialize()
+                if previous_listening and self.controller is not None:
+                    await self.controller.start_listening()
+                await self.bus.publish(self.snapshot())
+                return {"ok": True, "restarted": ["llm", "shadow_agent", "status_provider", "tts"]}
+            except Exception as exc:
+                logger.exception("model_registry.restart_failed")
+                try:
+                    await self.close()
+                    self.config, self._credential_overrides = previous_config, previous_overrides
+                    await self.initialize()
+                    if previous_listening and self.controller is not None:
+                        await self.controller.start_listening()
+                except Exception:
+                    logger.exception("model_registry.rollback_failed")
+                return {"ok": False, "message": f"模型服务重启失败：{type(exc).__name__}；已尝试恢复上一份有效分配。"}
 
     async def start_listening(self) -> None:
         async with self._session_lock:
@@ -523,7 +625,8 @@ def _valid_command(message: Any) -> tuple[str, dict[str, Any]] | None:
     return command, payload
 
 
-def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
+def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
+               model_registry: ModelRegistryService | None = None) -> Any:
     if FastAPI is None:
         raise RuntimeError("缺少 fastapi，请先运行 scripts\\setup.ps1。")
 
@@ -532,6 +635,77 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None) -> Any:
     @app.get("/health")
     async def health() -> dict[str, Any]:
         return runtime.health_payload()
+
+    def registry_or_404() -> ModelRegistryService:
+        if model_registry is None:
+            raise HTTPException(status_code=404, detail="模型管理服务尚未启用。")
+        return model_registry
+
+    def registry_error(exc: Exception) -> None:
+        if isinstance(exc, CredentialVaultUnavailable):
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if isinstance(exc, ModelRegistryError):
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise exc
+
+    @app.get("/api/v1/models/registry")
+    async def get_model_registry() -> dict[str, Any]:
+        try:
+            return await registry_or_404().snapshot()
+        except Exception as exc:
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/v1/models/scan")
+    async def scan_models() -> dict[str, Any]:
+        try:
+            return await registry_or_404().scan()
+        except Exception as exc:
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/v1/models/validate")
+    async def validate_model_provider(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await registry_or_404().validate_connection(body)
+        except Exception as exc:
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/v1/models/providers")
+    async def create_model_provider(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await registry_or_404().create_verified_provider(body)
+        except Exception as exc:
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/v1/models/{model_id}/hide")
+    async def hide_model(model_id: str) -> dict[str, Any]:
+        try:
+            return await registry_or_404().hide(model_id)
+        except Exception as exc:
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/v1/models/{model_id}/restore")
+    async def restore_model(model_id: str) -> dict[str, Any]:
+        try:
+            return await registry_or_404().restore(model_id)
+        except Exception as exc:
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.post("/api/v1/models/assignments/apply")
+    async def apply_model_assignments(body: dict[str, Any]) -> dict[str, Any]:
+        assignments = body.get("assignments")
+        if not isinstance(assignments, dict):
+            raise HTTPException(status_code=422, detail="assignments 必须是对象。")
+        try:
+            return await registry_or_404().apply_assignments(assignments, confirmed=body.get("confirmed") is True)
+        except Exception as exc:
+            registry_error(exc)
+            raise AssertionError("unreachable")
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

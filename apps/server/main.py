@@ -17,6 +17,7 @@ import uvicorn  # type: ignore
 from voice_terminal.config import load_config
 from voice_terminal.env import load_env_file
 from voice_terminal.logging_setup import configure_logging
+from voice_terminal.model_registry import ModelRegistryService, WindowsCredentialVault
 from voice_terminal.server.websocket import SessionRuntime, create_app
 
 
@@ -61,6 +62,12 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
     config = load_config(default_path, local_path if local_path.is_file() else None)
     runtime = SessionRuntime(config)
     runtime.build_info = _runtime_build_info(root, effective_config)
+    model_registry = ModelRegistryService(
+        config=config,
+        registry_path=root / "config" / "model-registry.json",
+        vault=WindowsCredentialVault(),
+        apply_callback=runtime.restart_model_services,
+    )
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -70,7 +77,7 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
         finally:
             await runtime.close()
 
-    app = create_app(runtime, lifespan=lifespan)
+    app = create_app(runtime, lifespan=lifespan, model_registry=model_registry)
 
     return app, runtime
 

@@ -137,6 +137,44 @@ def test_observer_runs_exactly_at_five_committed_steps_without_tools(tmp_path: P
     asyncio.run(scenario())
 
 
+def test_status_provider_is_isolated_and_trace_is_context_bounded(tmp_path: Path):
+    class MainProvider:
+        def __init__(self): self.requests = []
+        async def complete(self, **kwargs):
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                return ShadowProviderResponse((call(1),), {"input_tokens": 120, "cached_tokens": 90, "cache_hit_ratio": .75})
+            return ShadowProviderResponse((message("完成"),), {"input_tokens": 120, "cached_tokens": 90, "cache_hit_ratio": .75})
+
+    class StatusProvider:
+        def __init__(self): self.requests = []
+        async def complete(self, **kwargs):
+            self.requests.append(kwargs)
+            return ShadowProviderResponse((message("正在整理已提交的工作。"),), {"input_tokens": 10})
+
+    async def scenario():
+        main, status, ledger = MainProvider(), StatusProvider(), SessionLedger()
+        ledger.commit_input("u", "请安排今天下午的工作" * 80)
+        runtime = ShadowRuntime(
+            main, ShadowToolExecutor(FileTools((tmp_path,))), ledger,
+            instructions_loader=lambda: "fixed", status_provider=status,
+            observer_every_steps=1, observer_max_context_tokens=1024,
+        )
+        runtime.wake()
+        await wait_idle(runtime)
+        assert status.requests and all(request["tools"] == [] for request in status.requests)
+        assert all(request["reasoning_effort"] == "none" for request in status.requests)
+        assert all(request["reasoning_effort"] != "none" for request in main.requests)
+        trace = status.requests[0]["input_items"][:-1]
+        assert runtime._estimate_items_tokens(trace) <= 1024
+        snapshot = runtime.snapshot()
+        assert snapshot["context_limit_tokens"] == runtime.max_context_tokens
+        assert snapshot["provider_cache_hit_ratio"] == .75
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
 class CompactionProvider:
     def __init__(self): self.requests = []
 
