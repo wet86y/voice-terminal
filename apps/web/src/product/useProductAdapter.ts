@@ -44,7 +44,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
   schema_version: 1,
-  wake: { enabled: false, always_on: false, keyword: 'hei claw', keyword_label: '', sensitivity: 25 },
+  wake: { enabled: false, keyword: 'hei claw', keyword_label: '', sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
   persona: { instructions: '', personality: '', user: '', shadow: '' },
   warnings: [],
@@ -77,7 +77,6 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
     schema_version: typeof value.schema_version === 'number' ? value.schema_version : 1,
     wake: {
       enabled: wake.enabled === true,
-      always_on: wake.always_on === true,
       keyword: text(wake.keyword) || DEFAULT_SETTINGS.wake.keyword,
       keyword_label: text(wake.keyword_label),
       sensitivity: typeof wake.sensitivity === 'number' ? wake.sensitivity : DEFAULT_SETTINGS.wake.sensitivity,
@@ -158,7 +157,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const restartState = ref<'idle' | 'restarting' | 'complete' | 'error'>('idle')
   const applyImpact = ref<string[]>([])
 
-  const wakeForm = reactive({ enabled: false, alwaysOn: false, keyword: 'hei claw', sensitivity: 25 })
+  const wakeForm = reactive({ enabled: false, keyword: 'hei claw', sensitivity: 75 })
   const personaDocuments = reactive<Record<keyof ProductSettingsSnapshot['persona'], string>>({
     instructions: '', personality: '', user: '', shadow: '',
   })
@@ -212,7 +211,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     settings.warnings = nextSettings.warnings
     Object.assign(wakeForm, {
       enabled: nextSettings.wake.enabled,
-      alwaysOn: nextSettings.wake.always_on,
       keyword: nextSettings.wake.keyword,
       sensitivity: nextSettings.wake.sensitivity,
     })
@@ -393,7 +391,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       try {
         const result = await productApi.saveWake({
           enabled: wakeForm.enabled,
-          always_on: wakeForm.alwaysOn,
           keyword: wakeForm.keyword,
           sensitivity: wakeForm.sensitivity,
         })

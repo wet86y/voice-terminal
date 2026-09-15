@@ -40,6 +40,7 @@ from .product import (
     ProductSettingsError,
     ProductSettingsStore,
     ShadowProductProjection,
+    _threshold_to_sensitivity,
     apply_settings_to_config,
     sanitize_runtime_snapshot,
 )
@@ -99,7 +100,7 @@ class SessionRuntime:
         self.build_info: dict[str, Any] = {}
         self.reasoning_mode = config.llm.reasoning_mode
         self._credential_overrides: dict[str, str] = {}
-        self.state.wake_always_on = bool(config.wake.enabled and config.wake.always_on)
+        self.state.wake_always_on = bool(config.wake.enabled)
 
     def _build_kws_worker(self) -> KwsWorker:
         detector = KwsDetector(
@@ -362,7 +363,7 @@ class SessionRuntime:
             tts=self.tts,
             player=self.player,
             wake_enabled=self.config.wake.enabled,
-            wake_always_on=self.config.wake.always_on,
+            wake_always_on=self.config.wake.enabled,
             wake_keyword=self.config.wake.keyword,
             wake_preroll_ms=self.config.audio.wake_preroll_ms,
             vad_min_speech_ms=self.config.vad.min_speech_ms,
@@ -441,7 +442,7 @@ class SessionRuntime:
                 self.kws.close()
                 self.kws = None
             self.config = next_config
-            self.state.wake_always_on = bool(self.config.wake.enabled and self.config.wake.always_on)
+            self.state.wake_always_on = bool(self.config.wake.enabled)
             if self.controller is not None:
                 set_agent_options = getattr(self.controller, "set_agent_options", None)
                 if callable(set_agent_options):
@@ -471,9 +472,7 @@ class SessionRuntime:
             # setting pending so the next start can retry after the asset or
             # model problem has been corrected.
             self.config = previous_config
-            self.state.wake_always_on = bool(
-                previous_config.wake.enabled and previous_config.wake.always_on
-            )
+            self.state.wake_always_on = bool(previous_config.wake.enabled)
             if self.controller is not None:
                 set_agent_options = getattr(self.controller, "set_agent_options", None)
                 if callable(set_agent_options):
@@ -670,7 +669,7 @@ class SessionRuntime:
                 next_config, overrides = self._resolve_model_config(payload)
                 self.config = next_config
                 self._credential_overrides = overrides
-                self.state.wake_always_on = bool(next_config.wake.enabled and next_config.wake.always_on)
+                self.state.wake_always_on = bool(next_config.wake.enabled)
                 return {"ok": True, "restored": True}
             except Exception as exc:
                 self.config = previous_config
@@ -927,6 +926,14 @@ class SessionRuntime:
             "input_owner": self.state.input_owner,
             "wake_keyword": self.config.wake.keyword,
             "runtime": dict(self.build_info),
+            "kws": self.kws.diagnostics if self.kws is not None else {
+                "running": False,
+                "error": None,
+                "submitted_frames": 0,
+                "dropped_frames": 0,
+                "detected_count": 0,
+                "queue_depth": 0,
+            },
         }
         if self.product_settings is not None:
             payload["product_settings"] = {
@@ -999,10 +1006,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         settings = product_settings.snapshot() if product_settings is not None else {
             "wake": {
                 "enabled": runtime.config.wake.enabled,
-                "always_on": runtime.config.wake.always_on,
                 "keyword": runtime.config.wake.keyword,
                 "keyword_label": runtime.config.wake.keyword_label,
-                "sensitivity": round(runtime.config.wake.threshold * 100),
+                "sensitivity": _threshold_to_sensitivity(runtime.config.wake.threshold),
             },
             "silence": {
                 "seconds": int(getattr(runtime.config.agent, "final_silence_ms", 30000) / 1000),

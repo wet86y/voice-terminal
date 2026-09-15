@@ -35,7 +35,7 @@ const saveNotice = ref('')
 const showApplyConfirm = ref(false)
 const restartState = ref<'idle' | 'restarting' | 'complete'>('idle')
 
-const wakeSettings = reactive({ enabled: true, alwaysOn: true, keyword: '嘿，小爪', threshold: 72 })
+const wakeSettings = reactive({ enabled: true, keyword: '嘿，小爪', threshold: 72 })
 const silenceSeconds = ref(30)
 const personaDocuments = reactive(
   Object.fromEntries(primaryPersonaDocuments.map(item => [item.id, item.value])) as Record<string, string>,
@@ -458,8 +458,8 @@ function confirmApply() {
 
         <article class="settings-panel panel">
           <template v-if="activeSettingsTab === 'wake'">
-            <header><p class="panel-kicker">KWS 唤醒词</p><h2>让助手在需要时醒来</h2><p>设置全天候待机和唤醒词。正式产品将通过受控设置接口校验设备与模型状态。</p></header>
-            <div class="settings-stack"><label class="switch-row"><div><strong>启用唤醒词</strong><span>在后台持续检测本机音频</span></div><input v-model="wakeSettings.enabled" type="checkbox"><i></i></label><label class="switch-row"><div><strong>全天候待机</strong><span>播报和最终静默检查结束后自动回到待机</span></div><input v-model="wakeSettings.alwaysOn" type="checkbox"><i></i></label><label class="form-field"><span>唤醒词</span><input v-model="wakeSettings.keyword" type="text"><small>建议使用自然、容易区分的短语。</small></label><label class="form-field"><span>识别灵敏度 <b>{{ wakeSettings.threshold }}%</b></span><input v-model="wakeSettings.threshold" type="range" min="20" max="95"><div class="range-label"><small>更少误触发</small><small>更容易唤醒</small></div></label></div>
+            <header><p class="panel-kicker">KWS 唤醒词</p><h2>让助手在需要时醒来</h2><p>开启 KWS 后会在语音会话期间持续监听唤醒词；正式产品将通过受控设置接口校验设备与模型状态。</p></header>
+            <div class="settings-stack"><label class="switch-row"><div><strong>启用 KWS</strong><span>开启后持续检测本机音频，关闭后直接进入语音识别</span></div><input v-model="wakeSettings.enabled" type="checkbox"><i></i></label><label class="form-field"><span>唤醒词</span><input v-model="wakeSettings.keyword" type="text"><small>建议使用自然、容易区分的短语。</small></label><label class="form-field"><span>识别灵敏度 <b>{{ wakeSettings.threshold }}%</b></span><input v-model="wakeSettings.threshold" type="range" min="20" max="95"><div class="range-label"><small>更严格 · 少误触发</small><small>更容易唤醒</small></div></label></div>
             <footer><button class="save-button" type="button" @click="saveDemo('KWS 设置')">保存 KWS 设置</button></footer>
           </template>
 

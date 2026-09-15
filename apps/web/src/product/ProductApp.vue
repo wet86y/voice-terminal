@@ -20,6 +20,11 @@ const {
 } = adapter
 const reasoningMode = voice.reasoningMode
 const listening = voice.listening
+const waitingForWake = computed(() => (
+  listening.value
+  && voice.wakeAlwaysOn.value
+  && voice.inputOwner.value === 'kws'
+))
 const contextUsagePercent = computed(() => {
   const episode = voice.agentEpisode.value
   // An idle Agent reports a zero-initialized estimate before the first real
@@ -66,7 +71,10 @@ const runtimeMeta = computed(() => {
     speaking: ['正在播报', '正在播放真实 TTS 输出，随时可以打断。', 'LIVE'],
     error: ['需要检查', '运行时报告了错误，请查看服务状态或重试。', 'ERROR'],
   } as const
-  const [label, description, chip] = labels[runtimeState.value]
+  const meta = waitingForWake.value
+    ? ['等待唤醒', 'KWS 正在监听唤醒词；唤醒后才会进入语音识别。', 'LIVE'] as const
+    : labels[runtimeState.value]
+  const [label, description, chip] = meta
   return { label, description, chip, timestamp: replayMode ? replayMeta.label : connected.value ? '实时运行时状态' : '等待 Voice Server' }
 })
 
@@ -416,7 +424,7 @@ function pageLabel() {
             <article v-if="current.assistant_text && !conversation.some(item => item.response === current.assistant_text)" class="message assistant-message" :class="{ speaking: runtimeState === 'speaking' }"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ runtimeState === 'speaking' ? '正在播报' : '本轮' }}</time></div><p>{{ current.assistant_text }}</p><div class="speech-queue"><span class="queue-dot" :class="{ playing: runtimeState === 'speaking' }"></span>{{ runtimeState === 'speaking' ? '正在播放真实 TTS · 随时可以打断' : current.tts_status || '等待播报结算' }}</div></article>
           </template>
         </div>
-        <footer class="panel-resource-footer conversation-footer"><div><span class="footer-mic"><i></i>{{ listening ? '正在聆听你的声音' : connected ? '语音由本机服务处理' : '等待本机 Voice Server' }}</span><span>无输入框 · 通过语音继续 · {{ pageLabel() }}</span></div><section class="resource-metrics conversation-resource-metrics" aria-label="模型资源概览"><div class="resource-meter context-meter" tabindex="0" role="img" :aria-label="conversationContextTooltip" :data-tooltip="conversationContextTooltip"><span>上下文占用</span><strong>{{ formatTokens(conversationContext?.usedTokens) }}<small v-if="conversationContext?.limitTokens != null"> / {{ formatTokens(conversationContext.limitTokens) }}</small></strong><i :class="{ 'meter-empty': conversationContext?.usagePercent == null }"><b :style="{ width: `${contextPercent(conversationContext?.usagePercent)}%` }"></b></i><em>{{ conversationContext?.usagePercent ?? '—' }}<span v-if="conversationContext?.usagePercent != null">%</span></em></div><div class="resource-meter cache-rate-number" tabindex="0" role="img" :aria-label="conversationCacheHitRatio === null ? '缓存命中率暂无数据' : `缓存命中率 ${Math.round(conversationCacheHitRatio * 100)}%`" :data-tooltip="conversationCacheHitRatio === null ? '缓存命中率 · 暂无数据' : `缓存命中率 · ${Math.round(conversationCacheHitRatio * 100)}%`"><strong>{{ conversationCacheHitRatio === null ? '—' : `${Math.round(conversationCacheHitRatio * 100)}%` }}</strong></div></section></footer>
+        <footer class="panel-resource-footer conversation-footer"><div><span class="footer-mic"><i></i>{{ waitingForWake ? 'KWS 正在监听唤醒词' : listening ? '正在聆听你的声音' : connected ? '语音由本机服务处理' : '等待本机 Voice Server' }}</span><span>无输入框 · 通过语音继续 · {{ pageLabel() }}</span></div><section class="resource-metrics conversation-resource-metrics" aria-label="模型资源概览"><div class="resource-meter context-meter" tabindex="0" role="img" :aria-label="conversationContextTooltip" :data-tooltip="conversationContextTooltip"><span>上下文占用</span><strong>{{ formatTokens(conversationContext?.usedTokens) }}<small v-if="conversationContext?.limitTokens != null"> / {{ formatTokens(conversationContext.limitTokens) }}</small></strong><i :class="{ 'meter-empty': conversationContext?.usagePercent == null }"><b :style="{ width: `${contextPercent(conversationContext?.usagePercent)}%` }"></b></i><em>{{ conversationContext?.usagePercent ?? '—' }}<span v-if="conversationContext?.usagePercent != null">%</span></em></div><div class="resource-meter cache-rate-number" tabindex="0" role="img" :aria-label="conversationCacheHitRatio === null ? '缓存命中率暂无数据' : `缓存命中率 ${Math.round(conversationCacheHitRatio * 100)}%`" :data-tooltip="conversationCacheHitRatio === null ? '缓存命中率 · 暂无数据' : `缓存命中率 · ${Math.round(conversationCacheHitRatio * 100)}%`"><strong>{{ conversationCacheHitRatio === null ? '—' : `${Math.round(conversationCacheHitRatio * 100)}%` }}</strong></div></section></footer>
       </section>
     </section>
 
@@ -428,8 +436,8 @@ function pageLabel() {
 
         <article class="settings-panel panel">
           <template v-if="activeSettingsTab === 'wake'">
-            <header><p class="panel-kicker">KWS 唤醒词</p><h2>让助手在需要时醒来</h2><p>唤醒词由后端现有 sherpa text2token 流程生成并原子校验；生成失败会保留旧词条和旧设置，不打断当前回合。</p></header>
-            <div class="settings-stack"><label class="switch-row"><div><strong>启用唤醒词</strong><span>由后端在下一次 session.start 前应用</span></div><input v-model="wakeForm.enabled" type="checkbox"><i></i></label><label class="switch-row"><div><strong>全天候待机</strong><span>最终静默检查完成后回到 KWS</span></div><input v-model="wakeForm.alwaysOn" type="checkbox"><i></i></label><label class="form-field"><span>唤醒词</span><input v-model="wakeForm.keyword" type="text" autocomplete="off"><small>支持的词条会在后端生成并验证标签。</small></label><label class="form-field"><span>识别灵敏度 <b>{{ wakeForm.sensitivity }}%</b></span><input v-model.number="wakeForm.sensitivity" type="range" min="1" max="99"><div class="range-label"><small>更少误触发</small><small>更容易唤醒</small></div></label></div>
+            <header><p class="panel-kicker">KWS 唤醒词</p><h2>让助手在需要时醒来</h2><p>唤醒词由后端现有 sherpa text2token 流程生成并原子校验；支持中文和英文词条。生成失败会保留旧词条和旧设置，不打断当前回合。</p></header>
+            <div class="settings-stack"><label class="switch-row"><div><strong>启用 KWS</strong><span>开启后本次语音会话持续监听唤醒词；关闭后直接进入语音识别</span></div><input v-model="wakeForm.enabled" type="checkbox"><i></i></label><label class="form-field"><span>唤醒词</span><input v-model="wakeForm.keyword" type="text" autocomplete="off"><small>支持中文、英文和常见标点；后端会自动生成并验证标签。</small></label><label class="form-field"><span>识别灵敏度 <b>{{ wakeForm.sensitivity }}%</b></span><input v-model.number="wakeForm.sensitivity" type="range" min="1" max="99"><div class="range-label"><small>更严格 · 少误触发</small><small>更容易唤醒</small></div><small>灵敏度越高越容易唤醒；建议先使用 60–80%。</small></label></div>
             <footer><button class="save-button" type="button" :disabled="saving" @click="saveWake">{{ saving ? '正在保存…' : '保存 KWS 设置' }}</button></footer>
           </template>
 

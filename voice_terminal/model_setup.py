@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .kws.keywords import generate_keywords, write_raw_keywords
+from .kws.keywords import generate_keywords, validate_keywords_file, write_raw_keywords
 
 
 KWS_ARCHIVE_URL = (
@@ -158,7 +158,7 @@ def _file_manifest(path: Path) -> list[dict[str, Any]]:
     return result
 
 
-def validate_models(model_dir: Path) -> list[str]:
+def validate_models(model_dir: Path, *, keyword_label: str | None = None) -> list[str]:
     errors: list[str] = []
     kws = model_dir / "kws" / "sherpa-onnx-kws-zipformer-zh-en-3M"
     if (
@@ -174,8 +174,15 @@ def validate_models(model_dir: Path) -> list[str]:
     if not _is_funasr_model_complete(model_dir / "funasr" / "fsmn-vad"):
         errors.append(f"FSMN-VAD 模型不完整：{model_dir / 'funasr' / 'fsmn-vad'}")
     keywords = kws / "keywords.txt"
-    if not keywords.is_file() or "HEI_CLAW" not in keywords.read_text(encoding="utf-8", errors="ignore"):
-        errors.append(f"KWS 关键词文件缺少 HEI_CLAW：{keywords}")
+    if not keywords.is_file():
+        errors.append(f"KWS 关键词文件不存在：{keywords}")
+    elif keyword_label is not None:
+        try:
+            validate_keywords_file(keywords, keyword_label)
+        except (OSError, UnicodeError, ValueError) as exc:
+            errors.append(str(exc))
+    elif not any(line.strip() for line in keywords.read_text(encoding="utf-8", errors="ignore").splitlines()):
+        errors.append(f"KWS 关键词文件为空：{keywords}")
     return errors
 
 

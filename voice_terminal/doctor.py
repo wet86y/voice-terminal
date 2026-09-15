@@ -14,6 +14,7 @@ from typing import Any
 from .config import load_config
 from .kws.keywords import validate_keywords_file
 from .model_setup import validate_models
+from .server.product import ProductSettingsStore
 
 
 @dataclass
@@ -39,6 +40,15 @@ def run_checks(config_path: Path, *, online: bool = False, model_dir: Path | Non
     config = load_config(default_path, config_path if config_path.is_file() else None)
     if model_dir is not None:
         config = replace(config, model_dir=model_dir.resolve())
+    # The product UI keeps wake settings in a sidecar so that they can be
+    # edited without rewriting YAML.  Diagnostics must inspect the same
+    # effective runtime config as Voice Server, otherwise a custom (including
+    # Chinese) keyword is reported against the stale YAML/default label.
+    product_settings = ProductSettingsStore(
+        path=root / "config" / "product-settings.json",
+        config=config,
+    )
+    config = product_settings.effective_config()
     checks: list[Check] = []
     checks.append(_check("python", sys.version_info[:2] == (3, 12), sys.version.split()[0]))
 
@@ -84,11 +94,11 @@ def run_checks(config_path: Path, *, online: bool = False, model_dir: Path | Non
     if config.wake.enabled:
         try:
             validate_keywords_file(config.kws_keywords_file, config.wake.keyword_label)
-            checks.append(_check("kws:hei claw", True, str(config.kws_keywords_file)))
+            checks.append(_check(f"kws:{config.wake.keyword}", True, str(config.kws_keywords_file)))
         except Exception as exc:
-            checks.append(_check("kws:hei claw", False, str(exc)))
+            checks.append(_check(f"kws:{config.wake.keyword}", False, str(exc)))
     else:
-        checks.append(_check("kws:hei claw", True, "disabled by wake.enabled=false"))
+        checks.append(_check(f"kws:{config.wake.keyword}", True, "disabled by wake.enabled=false"))
 
     voice_port_busy = _port_in_use(config.server.host, config.server.port)
     checks.append(

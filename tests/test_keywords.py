@@ -18,9 +18,15 @@ class KeywordTests(unittest.TestCase):
         self.assertEqual(keyword_label("hei claw"), "HEI_CLAW")
         self.assertEqual(raw_keyword_line("hei claw"), "HEI CLAW @HEI_CLAW")
 
+    def test_chinese_keyword_keeps_text_and_label(self) -> None:
+        self.assertEqual(normalize_keyword(" 嘿，小爪 "), "嘿 小爪")
+        self.assertEqual(keyword_label("嘿，小爪"), "嘿_小爪")
+        self.assertEqual(raw_keyword_line("嘿，小爪"), "嘿 小爪 @嘿_小爪")
+
     def test_wake_prefix_only_at_start_is_removed(self) -> None:
         self.assertEqual(strip_wake_prefix("hei claw 打开浏览器"), "打开浏览器")
         self.assertEqual(strip_wake_prefix("  HEI_CLAW: 打开浏览器"), "打开浏览器")
+        self.assertEqual(strip_wake_prefix("嘿小爪打开浏览器", "嘿，小爪"), "打开浏览器")
         self.assertEqual(strip_wake_prefix("请不要删除 hei claw"), "请不要删除 hei claw")
 
     def test_raw_file_can_be_checked(self) -> None:

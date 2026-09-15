@@ -78,9 +78,8 @@ class ProductSidecarTests(unittest.TestCase):
              patch("voice_terminal.kws.detector.discover_model_paths", return_value=object()):
             result = asyncio.run(store.save_wake({
                 "enabled": True,
-                "always_on": True,
                 "keyword": "new claw",
-                "sensitivity": 25,
+                "sensitivity": 75,
             }))
         self.assertEqual(result["wake"]["keyword"], "new claw")
         self.assertIn("@NEW_CLAW", keywords_file.read_text(encoding="utf-8"))
@@ -99,7 +98,6 @@ class ProductSidecarTests(unittest.TestCase):
             with self.assertRaises(ProductSettingsError):
                 asyncio.run(failing.save_wake({
                     "enabled": False,
-                    "always_on": False,
                     "keyword": "another claw",
                     "sensitivity": 40,
                 }))
@@ -114,7 +112,7 @@ class ProductSidecarTests(unittest.TestCase):
             asyncio.run(store.save_silence({"seconds": 4}))
         with self.assertRaises(ProductSettingsError):
             asyncio.run(store.save_wake({
-                "enabled": True, "always_on": False,
+                "enabled": True,
                 "keyword": "hei claw", "sensitivity": 100,
             }))
 
@@ -140,6 +138,29 @@ class ProductSidecarTests(unittest.TestCase):
             store.save_persona({**payload, "user": "bad\x00value"})
         with self.assertRaises(ProductSettingsError):
             store.save_persona({**payload, "user": "x" * (MAX_PERSONA_DOCUMENT_BYTES + 1)})
+
+    def test_chinese_wake_keyword_is_compiled_and_persisted(self) -> None:
+        kws_dir = self.config.kws_dir
+        kws_dir.mkdir(parents=True)
+        store = self.store()
+
+        def fake_generate(*, raw_path, output_path, label, **_kwargs):
+            raw_path.write_text(f"嘿 小爪 @{label}\n", encoding="utf-8")
+            output_path.write_text(f"h ei @{label}\n", encoding="utf-8")
+
+        with patch("voice_terminal.kws.keywords.generate_keywords", fake_generate), \
+             patch("voice_terminal.kws.detector.discover_model_paths", return_value=object()):
+            result = asyncio.run(store.save_wake({
+                "enabled": True,
+                "keyword": "嘿，小爪",
+                "sensitivity": 70,
+            }))
+
+        self.assertEqual(result["wake"]["keyword"], "嘿 小爪")
+        self.assertEqual(result["wake"]["keyword_label"], "嘿_小爪")
+        self.assertNotIn("always_on", result["wake"])
+        self.assertAlmostEqual(store.effective_config().wake.threshold, 0.30)
+        self.assertIn("@嘿_小爪", (kws_dir / "keywords.txt").read_text(encoding="utf-8"))
 
     def test_shadow_projection_is_bounded_safe_and_does_not_fabricate_telemetry(self) -> None:
         projection = ShadowProductProjection()

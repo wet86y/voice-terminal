@@ -418,6 +418,7 @@ class AppConfig:
         if os.environ.get("ASR_WORKER_HOST", "").strip() or os.environ.get("ASR_WORKER_PORT", "").strip():
             worker_url = f"ws://{worker_host}:{worker_port}/asr"
 
+        wake_enabled = _env_bool("VOICE_WAKE_ENABLED", _bool(wake.get("enabled"), False))
         keyword = _string(wake.get("keyword"), "hei claw")
         label = _string(wake.get("keyword_label"), "HEI_CLAW")
         kws_dir = wake.get("model_dir")
@@ -527,10 +528,11 @@ class AppConfig:
                 device_latency_ms=max(0, int(_number(audio.get("device_latency_ms"), 0))),
             ),
             wake=WakeConfig(
-                enabled=_env_bool("VOICE_WAKE_ENABLED", _bool(wake.get("enabled"), False)),
-                always_on=_env_bool(
-                    "VOICE_WAKE_ALWAYS_ON", _bool(wake.get("always_on"), False)
-                ),
+                enabled=wake_enabled,
+                # Kept as a compatibility alias for the existing runtime
+                # state/controller contract.  Product semantics are now
+                # single-switch: enabling KWS always means standby.
+                always_on=wake_enabled,
                 provider=_string(wake.get("provider"), "sherpa_kws"),
                 keyword=keyword,
                 keyword_label=label,

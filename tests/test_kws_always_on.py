@@ -33,12 +33,16 @@ class _ForbiddenVad:
         raise AssertionError("VAD must not run while KWS owns input")
 
 
-def test_wake_always_on_defaults_false_and_supports_environment(monkeypatch):
+def test_enabling_wake_always_enters_standby(monkeypatch):
     default_path = Path(__file__).parents[1] / "config" / "default.yaml"
-    monkeypatch.delenv("VOICE_WAKE_ALWAYS_ON", raising=False)
+    # load_config intentionally loads .env.local, so make the two cases
+    # explicit instead of depending on the developer machine's environment.
+    monkeypatch.setenv("VOICE_WAKE_ENABLED", "false")
     assert load_config(default_path).wake.always_on is False
-    monkeypatch.setenv("VOICE_WAKE_ALWAYS_ON", "true")
-    assert load_config(default_path).wake.always_on is True
+    monkeypatch.setenv("VOICE_WAKE_ENABLED", "true")
+    config = load_config(default_path)
+    assert config.wake.enabled is True
+    assert config.wake.always_on is True
 
 
 def test_always_on_can_start_protected_kws_while_asr_is_unavailable():
