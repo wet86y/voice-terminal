@@ -10,7 +10,17 @@ from typing import Any, Protocol, Sequence
 
 
 class ShadowProviderError(RuntimeError):
-    pass
+    """Failure from the Shadow Responses transport.
+
+    Transport interruptions are retryable by default.  Provider-side
+    terminal responses and deterministic configuration/authentication errors
+    can opt out so the unlimited local retry mode does not turn a permanent
+    failure into an invisible forever-running activation.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 ShadowStreamCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -44,7 +54,7 @@ class DeepSeekResponsesShadowProvider:
     response.completed event; all partial SSE deltas remain transient.
     """
 
-    def __init__(self, *, base_url: str, api_key: str, model: str, timeout_ms: int = 15000,
+    def __init__(self, *, base_url: str, api_key: str, model: str, timeout_ms: int | None = None,
                  session_id: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -97,12 +107,15 @@ class DeepSeekResponsesShadowProvider:
         on_stream: ShadowStreamCallback | None = None,
     ) -> ShadowProviderResponse:
         if not self.api_key:
-            raise ShadowProviderError("missing DeepSeek API key")
+            raise ShadowProviderError("missing DeepSeek API key", retryable=False)
         try:
             import httpx  # type: ignore
         except ImportError as exc:  # pragma: no cover - deployment dependency
-            raise ShadowProviderError("httpx is required for shadow Responses") from exc
-        timeout = httpx.Timeout(self.timeout_ms / 1000, connect=min(5, self.timeout_ms / 1000))
+            raise ShadowProviderError("httpx is required for shadow Responses", retryable=False) from exc
+        timeout = (
+            None if self.timeout_ms is None
+            else httpx.Timeout(self.timeout_ms / 1000, connect=min(5, self.timeout_ms / 1000))
+        )
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         if self.session_id:
             headers["x-opencode-session"] = self.session_id
@@ -120,7 +133,11 @@ class DeepSeekResponsesShadowProvider:
             ) as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", errors="replace")
-                    raise ShadowProviderError(f"Responses HTTP {response.status_code}: {body[:300]}")
+                    retryable = response.status_code in {408, 425, 429} or response.status_code >= 500
+                    raise ShadowProviderError(
+                        f"Responses HTTP {response.status_code}: {body[:300]}",
+                        retryable=retryable,
+                    )
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue
@@ -146,18 +163,24 @@ class DeepSeekResponsesShadowProvider:
                     if kind in {"response.incomplete", "response.failed"}:
                         candidate = event.get("response")
                         details = candidate.get("error") if isinstance(candidate, dict) else None
-                        raise ShadowProviderError(f"Responses {kind}: {str(details)[:300]}")
+                        raise ShadowProviderError(
+                            f"Responses {kind}: {str(details)[:300]}", retryable=False,
+                        )
         except asyncio.CancelledError:
             raise
         except ShadowProviderError:
             raise
         except Exception as exc:
             raise ShadowProviderError(str(exc)[:500] or type(exc).__name__) from exc
-        if completed is None or completed.get("status") not in {None, "completed"}:
+        if completed is None:
+            # A dropped stream is a transport interruption.  In unlimited
+            # mode the runtime may reconnect without a local attempt ceiling.
             raise ShadowProviderError("Responses stream ended without response.completed")
+        if completed.get("status") not in {None, "completed"}:
+            raise ShadowProviderError("Responses completed with a terminal non-completed status", retryable=False)
         output = completed.get("output")
         if not isinstance(output, list):
-            raise ShadowProviderError("Responses completed without output")
+            raise ShadowProviderError("Responses completed without output", retryable=False)
         items = tuple(dict(item) for item in output if isinstance(item, dict) and item.get("status", "completed") == "completed")
         return ShadowProviderResponse(items, self.normalize_usage(completed.get("usage")))
 

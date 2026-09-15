@@ -67,7 +67,7 @@ def _text_from_output(output: Sequence[dict[str, Any]]) -> str:
 class ShadowStatusObserver:
     """Stateless, read-only summarizer over an immutable committed prefix."""
 
-    def __init__(self, *, max_output_tokens: int = 512, timeout_ms: int = 10000) -> None:
+    def __init__(self, *, max_output_tokens: int = 512, timeout_ms: int | None = None) -> None:
         self.max_output_tokens = max_output_tokens
         self.timeout_ms = timeout_ms
 
@@ -96,21 +96,21 @@ class ShadowRuntime:
         instructions_loader: Callable[[], str],
         on_event: Callable[[ShadowEvent], None] | None = None,
         on_activity: Callable[[dict[str, Any]], None] | None = None,
-        provider_timeout_ms: int = 15000,
-        transport_retry_limit: int = 2,
+        provider_timeout_ms: int | None = None,
+        transport_retry_limit: int | None = None,
         max_context_tokens: int = 524288,
         compaction_threshold_ratio: float = 0.80,
         observer_enabled: bool = True,
         observer_every_steps: int = 5,
         observer_max_output_tokens: int = 512,
-        observer_timeout_ms: int = 10000,
+        observer_timeout_ms: int | None = None,
         status_provider: ShadowProvider | None = None,
         observer_max_context_tokens: int = 32768,
         reasoning_effort: str = "high",
         allowed_reasoning: Sequence[str] | None = None,
         on_metric: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
-        if transport_retry_limit < 0 or observer_every_steps < 1 or reasoning_effort not in {"off", "low", "medium", "high", "max"}:
+        if (provider_timeout_ms is not None and provider_timeout_ms <= 0) or (transport_retry_limit is not None and transport_retry_limit < 0) or observer_every_steps < 1 or reasoning_effort not in {"off", "low", "medium", "high", "max"}:
             raise ValueError("invalid Shadow runtime retry/observer configuration")
         if max_context_tokens < 1024 or observer_max_context_tokens < 1024 or not 0 < compaction_threshold_ratio < 1:
             raise ValueError("invalid Shadow context budget")
@@ -369,12 +369,21 @@ class ShadowRuntime:
                 f"Shadow 模型不支持思考等级 {normalized_effort}；允许值为 "
                 f"{', '.join(self.allowed_reasoning)}。"
             )
-        attempts = self.transport_retry_limit + 1 if retry else 1
+        # ``None`` is the explicit unlimited mode.  It is intentionally
+        # represented as a loop condition instead of a very large sentinel so
+        # a long-lived Shadow activation is never cut off by a local counter.
+        attempt_limit = (
+            1 if not retry
+            else None if self.transport_retry_limit is None
+            else self.transport_retry_limit + 1
+        )
         last: BaseException | None = None
-        for attempt in range(attempts):
+        attempt = 0
+        while attempt_limit is None or attempt < attempt_limit:
+            attempt += 1
             started = time.monotonic()
             attempt_activity_id = (
-                activity_item_id if activity_item_id and attempt == 0
+                activity_item_id if activity_item_id and attempt == 1
                 else self._activity_id("model") if activity_mode else ""
             )
             activity_stream = "thinking" if activity_mode == "thinking" else "lifecycle"
@@ -405,9 +414,11 @@ class ShadowRuntime:
                 if activity_mode and self.on_activity is not None:
                     kwargs["on_stream"] = on_stream
                 call = self._provider_call(self.provider, kwargs)
-                response = await asyncio.wait_for(
-                    call, (timeout_ms or self.provider_timeout_ms) / 1000,
-                )
+                deadline_ms = timeout_ms if timeout_ms is not None else self.provider_timeout_ms
+                if deadline_ms is None or deadline_ms <= 0:
+                    response = await call
+                else:
+                    response = await asyncio.wait_for(call, deadline_ms / 1000)
                 usage = dict(response.usage)
                 usage.update({"latency_ms": round((time.monotonic() - started) * 1000, 2)})
                 self.usage_samples.append(usage)
@@ -422,6 +433,8 @@ class ShadowRuntime:
                 raise
             except Exception as exc:
                 last = exc
+                retryable = bool(getattr(exc, "retryable", True))
+                will_retry = retryable and (attempt_limit is None or attempt < attempt_limit)
                 if activity_mode:
                     # A provider retry gets fresh local item IDs.  Close any
                     # reasoning/tool item that was left open by the failed
@@ -433,15 +446,21 @@ class ShadowRuntime:
                         self._activity(
                             self._provider_activity_item_streams.get(stale_id, "thinking"),
                             "failed", item_id=stale_id,
-                            text="模型流中断，活动未完成；正在重试" if attempt + 1 < attempts else "模型流中断，活动未完成",
+                            text="模型流中断，活动未完成；正在重试" if will_retry else "模型流中断，活动未完成",
                         )
                     self._activity(
                         activity_stream, "failed", item_id=attempt_activity_id,
                         text=f"本次模型流已结束：{str(exc)[:240] or type(exc).__name__}",
                     )
-                self._metric("provider.retry", {"attempt": attempt + 1, "error": type(exc).__name__})
-                if attempt + 1 < attempts:
-                    await asyncio.sleep(0.15 * (attempt + 1))
+                self._metric("provider.retry", {
+                    "attempt": attempt, "error": type(exc).__name__, "retryable": retryable,
+                })
+                if not will_retry:
+                    break
+                # Unlimited means unlimited attempts, not an ever-growing
+                # local delay between attempts.  Keep the small transport
+                # backoff stable so a long-lived activation remains live.
+                await asyncio.sleep(0.15)
         raise ShadowProviderError(str(last)[:500] if last else "provider request failed")
 
     async def _status_provider_complete(
@@ -472,7 +491,11 @@ class ShadowRuntime:
         )
         try:
             call = self._provider_call(self.status_provider, kwargs)
-            response = await asyncio.wait_for(call, (timeout_ms or self.provider_timeout_ms) / 1000)
+            deadline_ms = timeout_ms if timeout_ms is not None else self.observer_timeout_ms
+            if deadline_ms is None or deadline_ms <= 0:
+                response = await call
+            else:
+                response = await asyncio.wait_for(call, deadline_ms / 1000)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -21,6 +21,15 @@ def _number(value: Any, default: int | float) -> int | float:
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else default
 
 
+def _optional_int(value: Any, default: int | None = None) -> int | None:
+    """Read an integer where ``None`` deliberately means unlimited."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    return default
+
+
 def _bool(value: Any, default: bool) -> bool:
     return value if isinstance(value, bool) else default
 
@@ -223,19 +232,24 @@ class AsrWorkerConfig:
 
 @dataclass(frozen=True)
 class ShadowProviderConfig:
-    """Dedicated Responses provider settings for the shadow component."""
+    """Dedicated Responses provider settings for the shadow component.
+
+    ``None`` disables the local request deadline and retry-count ceiling.  A
+    reset, close, provider protocol failure, or external service failure can
+    still end the operation normally.
+    """
 
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-flash"
     api_key_env: str = "DEEPSEEK_API_KEY"
-    timeout_ms: int = 15000
-    transport_retry_limit: int = 2
+    timeout_ms: int | None = None
+    transport_retry_limit: int | None = None
 
     def __post_init__(self) -> None:
-        if self.timeout_ms <= 0:
-            raise ValueError("shadow_agent.provider.timeout_ms must be positive")
-        if self.transport_retry_limit < 0:
-            raise ValueError("shadow_agent.provider.transport_retry_limit must be nonnegative")
+        if self.timeout_ms is not None and self.timeout_ms <= 0:
+            raise ValueError("shadow_agent.provider.timeout_ms must be positive or null")
+        if self.transport_retry_limit is not None and self.transport_retry_limit < 0:
+            raise ValueError("shadow_agent.provider.transport_retry_limit must be nonnegative or null")
 
 
 @dataclass(frozen=True)
@@ -243,18 +257,26 @@ class ShadowWebSearchConfig:
     enabled: bool = True
     base_url: str = "https://api.minimaxi.com"
     api_key_env: str = "MINIMAX_API_KEY"
-    timeout_ms: int = 5000
+    timeout_ms: int | None = 15000
 
     def __post_init__(self) -> None:
-        if self.timeout_ms <= 0:
-            raise ValueError("shadow_agent.tools.web_search.timeout_ms must be positive")
+        if self.timeout_ms is not None and self.timeout_ms <= 0:
+            raise ValueError("shadow_agent.tools.web_search.timeout_ms must be positive or null")
 
 
 @dataclass(frozen=True)
 class ShadowToolsConfig:
     files_enabled: bool = True
     allowed_roots: tuple[Path, ...] = (Path("docs"),)
+    # Per-tool execution deadline.  ``None`` is retained for embedding users
+    # that intentionally want an unbounded backend, while the product default
+    # is 15 seconds.
+    timeout_ms: int | None = 15000
     web_search: ShadowWebSearchConfig = field(default_factory=ShadowWebSearchConfig)
+
+    def __post_init__(self) -> None:
+        if self.timeout_ms is not None and self.timeout_ms <= 0:
+            raise ValueError("shadow_agent.tools.timeout_ms must be positive or null")
 
 
 @dataclass(frozen=True)
@@ -263,14 +285,14 @@ class ShadowStatusObserverConfig:
     every_committed_steps: int = 5
     reasoning_effort: str = "none"
     max_output_tokens: int = 512
-    timeout_ms: int = 10000
+    timeout_ms: int | None = None
     # None intentionally means inherit the Shadow Agent provider.  A managed
     # product assignment supplies an explicit, independent status provider.
     provider: ShadowProviderConfig | None = None
     max_context_tokens: int = 32768
 
     def __post_init__(self) -> None:
-        if self.every_committed_steps < 1 or self.max_output_tokens < 1 or self.timeout_ms <= 0 or self.max_context_tokens < 1024:
+        if self.every_committed_steps < 1 or self.max_output_tokens < 1 or (self.timeout_ms is not None and self.timeout_ms <= 0) or self.max_context_tokens < 1024:
             raise ValueError("invalid shadow_agent.status_observer configuration")
         if self.reasoning_effort != "none":
             raise ValueError("shadow_agent.status_observer.reasoning_effort must be none")
@@ -461,17 +483,18 @@ class AppConfig:
                     base_url=_string(shadow_provider.get("base_url"), llm_base_url),
                     model=_string(shadow_provider.get("model"), llm_model),
                     api_key_env=_string(shadow_provider.get("api_key_env"), llm_api_key_env),
-                    timeout_ms=int(_number(shadow_provider.get("timeout_ms"), 15000)),
-                    transport_retry_limit=int(_number(shadow_provider.get("transport_retry_limit"), 2)),
+                    timeout_ms=_optional_int(shadow_provider.get("timeout_ms")),
+                    transport_retry_limit=_optional_int(shadow_provider.get("transport_retry_limit")),
                 ),
                 tools=ShadowToolsConfig(
                     files_enabled=_bool(shadow_tools.get("files_enabled"), True),
                     allowed_roots=shadow_roots,
+                    timeout_ms=_optional_int(shadow_tools.get("timeout_ms"), 15000),
                     web_search=ShadowWebSearchConfig(
                         enabled=_bool(shadow_search.get("enabled"), True),
                         base_url=_string(shadow_search.get("base_url"), "https://api.minimaxi.com"),
                         api_key_env=_string(shadow_search.get("api_key_env"), "MINIMAX_API_KEY"),
-                        timeout_ms=int(_number(shadow_search.get("timeout_ms"), 5000)),
+                        timeout_ms=_optional_int(shadow_search.get("timeout_ms"), 15000),
                     ),
                 ),
                 max_context_tokens=int(_number(shadow.get("max_context_tokens"), 524288)),
@@ -485,13 +508,19 @@ class AppConfig:
                     every_committed_steps=int(_number(shadow_observer.get("every_committed_steps"), 5)),
                     reasoning_effort=_string(shadow_observer.get("reasoning_effort"), "none"),
                     max_output_tokens=int(_number(shadow_observer.get("max_output_tokens"), 512)),
-                    timeout_ms=int(_number(shadow_observer.get("timeout_ms"), 10000)),
+                    timeout_ms=_optional_int(shadow_observer.get("timeout_ms")),
                     provider=(ShadowProviderConfig(
                         base_url=_string(status_provider.get("base_url"), _string(shadow_provider.get("base_url"), llm_base_url)),
                         model=_string(status_provider.get("model"), _string(shadow_provider.get("model"), llm_model)),
                         api_key_env=_string(status_provider.get("api_key_env"), _string(shadow_provider.get("api_key_env"), llm_api_key_env)),
-                        timeout_ms=int(_number(status_provider.get("timeout_ms"), _number(shadow_provider.get("timeout_ms"), 15000))),
-                        transport_retry_limit=int(_number(status_provider.get("transport_retry_limit"), _number(shadow_provider.get("transport_retry_limit"), 2))),
+                        timeout_ms=_optional_int(
+                            status_provider.get("timeout_ms"),
+                            _optional_int(shadow_provider.get("timeout_ms")),
+                        ),
+                        transport_retry_limit=_optional_int(
+                            status_provider.get("transport_retry_limit"),
+                            _optional_int(shadow_provider.get("transport_retry_limit")),
+                        ),
                     ) if status_provider else None),
                     max_context_tokens=int(_number(shadow_observer.get("max_context_tokens"), 32768)),
                 ),

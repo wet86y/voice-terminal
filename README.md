@@ -40,9 +40,11 @@ progress/observation、请求 clarification。用户答复正常进入会话后�
 executor 拒绝所有非 `READ_ONLY` 能力。
 
 每 5 个已提交 Shadow model response 会并行触发无思考、无工具的状态观察器。简报通过正常
-heartbeat 进入主 LLM，主模型可以自然播报或 wait。Shadow 不设 activation 总墙钟/步骤上限；
-单 provider 请求仍有 timeout 和有限 transport retry。默认在 524288 token 预算的 80% 处生成
-稳定摘要并切换 cache epoch，不终止长期工作。
+heartbeat 进入主 LLM，主模型可以自然播报或 wait。Shadow 不设 activation 总墙钟、步骤、工具
+调用轮次、工具调用次数或本地 provider timeout；transport retry 也不设次数上限。每次文件或
+搜索工具执行最多运行 15 秒。默认在 524288 token 预算的 80% 处生成稳定摘要并切换 cache epoch，
+不终止长期工作。reset、close、
+取消、provider 协议终止和外部服务本身的限制仍然有效。
 
 `session.stop` 只停止语音 episode，Shadow 继续并缓存重要事件；`session.reset` 清空 Shadow
 trace/status、轮换上下文 epoch 与 OpenCode session header；runtime close 关闭所有资源。
@@ -83,17 +85,20 @@ shadow_agent:
   max_context_tokens: 524288
   compaction_threshold_ratio: 0.80
   provider:
-    timeout_ms: 15000
-    transport_retry_limit: 2
+    timeout_ms: null             # 不设 Shadow provider 请求时长上限
+    transport_retry_limit: null  # 不设传输重试次数上限
   status_observer:
     enabled: true
     every_committed_steps: 5
     reasoning_effort: none
     max_output_tokens: 512
-    timeout_ms: 10000
+    timeout_ms: null
   tools:
     files_enabled: true
     allowed_roots: [docs]
+    timeout_ms: 15000           # 单次文件/搜索工具执行上限
+    web_search:
+      timeout_ms: 15000          # 搜索 HTTP 请求上限
 ```
 
 `config/local.yaml` 用于本机非密钥覆盖；API key 放入 `.env.local` 或进程环境。
