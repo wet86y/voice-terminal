@@ -170,3 +170,33 @@ def test_final_settlement_waits_for_user_input_and_rejects_stale_generation():
         assert returned == []
 
     asyncio.run(scenario())
+
+
+def test_final_settlement_waits_for_output_transaction_to_become_idle():
+    async def scenario():
+        controller = object.__new__(EpisodeController)
+        controller.state = SimpleNamespace(listening=True, input_owner="asr")
+        controller._activation_generation = 4
+        controller.workspace = None
+        controller.output = SimpleNamespace(active=False, busy=True)
+        controller.episode = SimpleNamespace(
+            user_speaking=False,
+            scheduler=SimpleNamespace(generation=8),
+        )
+        controller._background = set()
+        returned = []
+
+        async def return_to_kws(generation):
+            returned.append(generation)
+            return True
+
+        controller._return_to_kws = return_to_kws
+        await controller._final_system_check_settled({"generation": 8})
+        await asyncio.sleep(0.06)
+        assert returned == []
+
+        controller.output.busy = False
+        await asyncio.sleep(0.06)
+        assert returned == [4]
+
+    asyncio.run(scenario())

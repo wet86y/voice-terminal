@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -43,7 +44,7 @@ class _BlockingProvider:
         return stream()
 
 
-def _speaking_runtime(provider):
+def _speaking_runtime(provider, *, defer_silence_until_output=False):
     class Registry:
         def begin_turn(self, _episode_id):
             return None
@@ -72,6 +73,7 @@ def _speaking_runtime(provider):
     runtime = AgentEpisodeRuntime(
         provider, Registry(), Output(), emit,
         conversation=ConversationRuntime(), ledger=SessionLedger(),
+        defer_silence_until_output=defer_silence_until_output,
     )
     runtime.episode_id = runtime.conversation.conversation_id
     runtime.last_turn_id = "turn-a"
@@ -135,6 +137,188 @@ def test_staircase_windows_and_final_dispatch_are_single_shot():
     assert value.final_dispatched is True
     assert value.armed is False
     assert value.forced_due(now=20.0) is None
+
+
+def test_deferred_scheduler_activates_same_generation_from_later_playback():
+    value = scheduler()
+    generation = value.defer(0.0, wall_time=100.0, turn_id="turn-a")
+
+    assert generation == 1
+    assert value.armed is False
+    assert value.is_deferred(generation) is True
+    assert value.forced_due(now=100.0) is None
+
+    assert value.activate_deferred(
+        45.0,
+        wall_time=145.0,
+        turn_id="turn-a",
+        generation=generation,
+        anchor_source="tts_playback_completed",
+    ) is True
+    assert value.generation == generation
+    assert value.anchor_monotonic == 45.0
+    assert value.anchor_source == "tts_playback_completed"
+
+    value.advance(74.99)
+    assert value.forced_due(now=74.99)["prompt_kind"] == "forced_poll"
+    assert value.forced_due(now=74.99)["window_index"] == 70
+    value.advance(75.0)
+    candidate = value.forced_due(now=75.0)
+    assert candidate["prompt_kind"] == "final_silence"
+    assert candidate["silence_elapsed_ms"] == 30000
+    assert candidate["generation"] == generation
+    assert candidate["anchor_source"] == "tts_playback_completed"
+
+
+def test_deferred_runtime_uses_user_silence_when_playback_completed_earlier():
+    async def scenario():
+        runtime = _speaking_runtime(
+            _BlockingProvider(), defer_silence_until_output=True,
+        )
+        user_silence = time.monotonic()
+        await runtime.observe(
+            "USER_INPUT_FINALIZED",
+            turn_id="turn-a",
+            text="你好",
+            input_finished_at=user_silence,
+        )
+        pending = runtime._pending_silence_anchor
+        assert pending is not None
+        pending["request_id"] = "request-a"
+        generation = pending["generation"]
+
+        assert await runtime.playback_completed(
+            turn_id="turn-a",
+            conversation_id=runtime.episode_id,
+            request_id="request-a",
+            playback_completed_at=user_silence - 1.0,
+            wall_time=100.0,
+        ) is True
+        assert runtime.scheduler.generation == generation
+        assert runtime.scheduler.anchor_source == "user_silence"
+        assert runtime.scheduler.anchor_monotonic == user_silence
+        assert runtime._pending_silence_anchor is None
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_deferred_runtime_uses_transaction_settlement_without_audio():
+    async def scenario():
+        runtime = _speaking_runtime(
+            _BlockingProvider(), defer_silence_until_output=True,
+        )
+        await runtime.observe(
+            "USER_INPUT_FINALIZED",
+            turn_id="turn-a",
+            text="请继续",
+        )
+        pending = runtime._pending_silence_anchor
+        assert pending is not None
+        pending["request_id"] = "request-a"
+        runtime.output.busy = True
+
+        assert await runtime._settle_pending_silence_after_request(
+            (runtime.episode_id, "request-a"), "turn-a", "completed",
+        ) is False
+        assert runtime.scheduler.armed is False
+        assert pending["waiting_for_output"] is True
+
+        runtime.output.busy = False
+        assert await runtime.output_transaction_settled({
+            "request_id": "request-a", "turn_id": "turn-a", "status": "failed",
+            "speech_id": "speech-a",
+        }) is True
+        assert runtime.scheduler.armed is True
+        assert runtime.scheduler.anchor_source == "transaction_settled"
+        assert runtime._pending_silence_anchor is None
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_deferred_runtime_wait_response_arms_after_request_settles():
+    async def scenario():
+        provider = _BlockingProvider()
+        runtime = _speaking_runtime(
+            provider, defer_silence_until_output=True,
+        )
+        await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-a", text="请听着")
+        for _ in range(50):
+            if provider.calls:
+                break
+            await asyncio.sleep(0.01)
+        assert provider.calls == 1
+        assert runtime.scheduler.armed is False
+
+        await _finish_blocking_request(runtime, provider)
+        assert runtime.scheduler.armed is True
+        assert runtime.scheduler.anchor_source == "transaction_settled"
+        assert runtime._pending_silence_anchor is None
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_deferred_runtime_rebinds_retry_request_identity_before_settlement():
+    async def scenario():
+        runtime = _speaking_runtime(
+            _BlockingProvider(), defer_silence_until_output=True,
+        )
+        await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-a", text="重试这句")
+        pending = runtime._pending_silence_anchor
+        assert pending is not None
+        pending["request_id"] = "request-a"
+        runtime.output.busy = True
+
+        # A transport retry/recovery request owns the same user turn but has
+        # a new request identity.  Its settlement must not be rejected as a
+        # stale callback for the first request.
+        runtime._bind_pending_silence_request(
+            (runtime.episode_id, "request-b"), "turn-a", allow_rebind=True,
+        )
+        assert pending["request_id"] == "request-b"
+        assert await runtime._settle_pending_silence_after_request(
+            (runtime.episode_id, "request-b"), "turn-a", "completed",
+        ) is False
+        assert pending["waiting_for_output"] is True
+
+        runtime.output.busy = False
+        assert await runtime.output_transaction_settled({
+            "request_id": "request-b", "turn_id": "turn-a", "status": "failed",
+        }) is True
+        assert runtime.scheduler.anchor_source == "transaction_settled"
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_deferred_runtime_ignores_old_playback_after_new_input_generation():
+    async def scenario():
+        runtime = _speaking_runtime(
+            _BlockingProvider(), defer_silence_until_output=True,
+        )
+        await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-a", text="第一句")
+        old = runtime._pending_silence_anchor
+        assert old is not None
+        old["request_id"] = "request-a"
+        old_generation = old["generation"]
+
+        await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-b", text="第二句")
+        current = runtime._pending_silence_anchor
+        assert current is not None
+        assert current["generation"] != old_generation
+        assert await runtime.playback_completed(
+            turn_id="turn-a",
+            conversation_id=runtime.episode_id,
+            request_id="request-a",
+            playback_completed_at=time.monotonic() + 45.0,
+        ) is False
+        assert runtime.scheduler.armed is False
+        assert runtime._pending_silence_anchor is current
+        await runtime.stop()
+
+    asyncio.run(scenario())
 
 
 def test_kws_wake_system_check_is_immediate_and_does_not_create_user_input():
