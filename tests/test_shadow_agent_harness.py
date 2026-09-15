@@ -49,7 +49,16 @@ class FakeClient:
 
 def test_responses_adapter_commits_only_completed_output_and_normalizes_cache_usage(monkeypatch):
     async def scenario():
-        partial = {"type": "response.output_text.delta", "delta": "ignore"}
+        streamed = [
+            {"type": "response.created", "response": {"id": "private-response"}},
+            {"type": "response.in_progress"},
+            {"type": "response.output_item.added", "item": {"id": "private-reasoning", "type": "reasoning"}},
+            {"type": "response.reasoning_text.delta", "delta": "private reasoning"},
+            {"type": "response.output_item.added", "item": {"id": "private-call", "type": "function_call", "call_id": "private-call", "name": "files_search"}},
+            {"type": "response.function_call_arguments.delta", "item_id": "private-call", "delta": "{\"query\":\"x\"}"},
+            {"type": "response.output_text.delta", "delta": "ignore"},
+            {"type": "response.output_item.done", "item": {"id": "private-call", "type": "function_call", "call_id": "private-call", "name": "files_search", "status": "completed"}},
+        ]
         complete = {
             "type": "response.completed",
             "response": {
@@ -57,18 +66,24 @@ def test_responses_adapter_commits_only_completed_output_and_normalizes_cache_us
                 "usage": {"input_tokens": 100, "input_tokens_details": {"cached_tokens": 80}},
             },
         }
-        response = FakeResponse([f"data: {json.dumps(partial)}", f"data: {json.dumps(complete)}"])
+        response = FakeResponse([*(f"data: {json.dumps(item)}" for item in streamed), f"data: {json.dumps(complete)}"])
         monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: FakeClient(response))
         provider = DeepSeekResponsesShadowProvider(
             base_url="https://example.test", api_key="key", model="m",
         )
+        received = []
         result = await provider.complete(
             instructions="fixed", input_items=[], tools=[], reasoning_effort="none",
+            on_stream=received.append,
         )
         assert result.output == (message("authoritative"),)
         assert result.usage["cached_tokens"] == 80
         assert result.usage["cache_miss_tokens"] == 20
         assert result.usage["cache_hit_ratio"] == 0.8
+        assert [item["type"] for item in received] == [
+            item["type"] for item in streamed
+        ] + ["response.completed"]
+        assert received[3]["delta"] == "private reasoning"
         await provider.close()
 
     asyncio.run(scenario())

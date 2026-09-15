@@ -200,6 +200,23 @@ export interface ShadowTimelineItem {
   timestamp: string
 }
 
+export type ShadowActivityStream = 'lifecycle' | 'thinking' | 'tool' | 'event'
+export type ShadowActivityPhase = 'started' | 'delta' | 'completed' | 'failed'
+export type ShadowActivityEventKind = 'progress' | 'observation' | 'user_input_required' | 'result' | 'failed'
+
+export interface ShadowActivity {
+  run_seq: number
+  item_id: string
+  stream: ShadowActivityStream
+  phase: ShadowActivityPhase
+  text?: string
+  delta?: string
+  tool_name?: string
+  tool_status?: string
+  event_kind?: ShadowActivityEventKind
+  timestamp: string
+}
+
 export interface ShadowProductSnapshot {
   available: boolean
   active: boolean
@@ -208,6 +225,8 @@ export interface ShadowProductSnapshot {
   focus: string
   summary: string
   timeline: ShadowTimelineItem[]
+  activities?: ShadowActivity[]
+  last_activity_at?: string | null
   context?: {
     used_tokens?: number | null
     limit_tokens?: number | null
@@ -277,7 +296,7 @@ export type ServerMessageType =
   | 'input.started' | 'input.updated' | 'input.finalized' | 'input.completed'
   | 'agent.state' | 'agent.trace' | 'agent.reasoning' | 'context.snapshot' | 'tool.state' | 'speak.preview'
   | 'speech.queued' | 'speech.started' | 'speech.delta' | 'speech.progress' | 'speech.completed'
-  | 'shadow.product' | 'error'
+  | 'shadow.product' | 'shadow.activity' | 'error'
 
 export type ReasoningMode = 'fast' | 'balanced' | 'deep'
 export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset' | 'session.reasoning_mode'

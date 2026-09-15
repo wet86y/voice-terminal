@@ -20,6 +20,7 @@ export type AssignmentSlot = 'voice' | 'shadow' | 'status' | 'tts'
 
 const NOTICE_DISPLAY_MS = 5000
 const NOTICE_FADE_MS = 420
+const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 
 export interface ProductUiModel extends ProductModel {
   provider: string
@@ -66,8 +67,17 @@ function defaultCurrent() {
 function defaultShadow(): ShadowProductSnapshot {
   return {
     available: false, active: false, phase: 'unavailable', user_input_required: false,
-    focus: '', summary: '', timeline: [], context: {}, provider: {},
+    focus: '', summary: '', timeline: [], activities: [], context: {}, provider: {},
   }
+}
+
+function normalizeReasoningEffort(value: unknown, fallback = 'off') {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return normalized === 'none' ? 'off' : SHADOW_REASONING_LEVELS.includes(normalized) ? normalized : fallback
+}
+
+function fallbackReasoningEffort(allowed: string[]) {
+  return ['high', 'max', 'medium', 'low', 'off'].find(value => allowed.includes(value)) || 'off'
 }
 
 function normalizeSettings(value: unknown): ProductSettingsSnapshot {
@@ -101,12 +111,18 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
 
 function normalizeRegistry(value: unknown): ProductModelRegistry {
   if (!isRecord(value)) return structuredClone(DEFAULT_REGISTRY)
+  const models = Array.isArray(value.models) ? value.models.filter(isRecord).map(item => ({
+    ...item,
+    allowed_reasoning: Array.isArray(item.allowed_reasoning)
+      ? [...new Set(item.allowed_reasoning.map(level => normalizeReasoningEffort(level)).filter(level => level))]
+      : item.allowed_reasoning,
+  })) : []
   return {
     credential_vault: isRecord(value.credential_vault)
       ? { available: value.credential_vault.available === true, diagnostic: typeof value.credential_vault.diagnostic === 'string' ? value.credential_vault.diagnostic : null }
       : undefined,
     providers: Array.isArray(value.providers) ? value.providers.filter(isRecord) as ProductModelRegistry['providers'] : [],
-    models: Array.isArray(value.models) ? value.models.filter(isRecord) as ProductModelRegistry['models'] : [],
+    models: models as ProductModelRegistry['models'],
     tts_profiles: Array.isArray(value.tts_profiles) ? value.tts_profiles.filter(isRecord) as ProductModelRegistry['tts_profiles'] : [],
     assignments: isRecord(value.assignments) ? value.assignments as ProductAssignments : {},
   }
@@ -183,6 +199,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     voice: '', shadow: '', status: '', tts: '',
   })
   const shadowThinking = ref('off')
+  const shadowThinkingCommitted = ref('off')
+  const shadowThinkingNeedsApply = ref(false)
 
   let snapshotRequest: Promise<void> | null = null
   let reconnectTimer: number | undefined
@@ -267,17 +285,38 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
     const selected = uiModels.value.find(item => item.id === modelAssignments.shadow)
     const allowed = selected?.allowedReasoning || []
-    const persistedShadowThinking = assignments.shadow_reasoning_effort
-    if (typeof persistedShadowThinking === 'string' && allowed.includes(persistedShadowThinking)) {
-      shadowThinking.value = persistedShadowThinking
-    } else if (allowed.length && !allowed.includes(shadowThinking.value)) {
-      shadowThinking.value = allowed.includes('high') ? 'high' : allowed[allowed.length - 1]
-    } else if (!allowed.length) {
-      shadowThinking.value = 'off'
-    }
+    const nestedShadow = isRecord(assignments.role_settings?.shadow)
+      ? assignments.role_settings?.shadow.reasoning_effort
+      : undefined
+    const persistedShadowThinking = normalizeReasoningEffort(
+      assignments.shadow_reasoning_effort ?? nestedShadow,
+      'off',
+    )
+    const fallback = fallbackReasoningEffort(allowed)
+    const committed = allowed.includes(persistedShadowThinking) ? persistedShadowThinking : fallback
+    shadowThinkingCommitted.value = committed
+    shadowThinking.value = committed
+    shadowThinkingNeedsApply.value = Boolean(allowed.length && persistedShadowThinking !== committed)
   }
 
+  watch(
+    () => modelAssignments.shadow,
+    () => {
+      const allowed = selectedModels.value.shadow?.allowedReasoning || []
+      if (!allowed.length) {
+        shadowThinking.value = 'off'
+        return
+      }
+      if (!allowed.includes(shadowThinking.value)) {
+        shadowThinking.value = fallbackReasoningEffort(allowed)
+        shadowThinkingNeedsApply.value = true
+      }
+    },
+    { flush: 'sync' },
+  )
+
   async function loadSnapshot() {
+    if (replayMode) return
     if (snapshotRequest) return snapshotRequest
     loading.value = true
     snapshotRequest = productApi.snapshot().then(value => {
@@ -351,6 +390,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
   })
   const shadowThinkingOptions = computed(() => selectedModels.value.shadow?.allowedReasoning || ['off'])
+  const shadowThinkingPending = computed(() => (
+    shadowThinkingNeedsApply.value
+    || normalizeReasoningEffort(shadowThinking.value) !== normalizeReasoningEffort(shadowThinkingCommitted.value)
+  ))
   const selectedTtsProfile = computed<ProductTtsProfile | undefined>(() => selectedModels.value.tts)
   const selectedTtsModel = computed<ProductUiModel | undefined>(() => {
     const profile = selectedTtsProfile.value
@@ -411,9 +454,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   function setShadowThinking(value: string) {
-    if (!shadowThinkingOptions.value.includes(value)) return
-    shadowThinking.value = value
-    setNotice(`Shadow 思考等级已选择 ${value}；应用模型配置时按所选模型策略提交。`)
+    const normalized = normalizeReasoningEffort(value)
+    if (!shadowThinkingOptions.value.includes(normalized)) return
+    shadowThinking.value = normalized
+    setNotice(`Shadow 思考等级已选择 ${normalized}；点击“应用模型配置”并确认后生效。`)
   }
 
   function toggleProviderReasoning(value: string) {
@@ -655,12 +699,15 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   function assignmentPayload() {
+    const allowed = shadowThinkingOptions.value
+    const requested = normalizeReasoningEffort(shadowThinking.value)
+    const shadowReasoningEffort = allowed.includes(requested) ? requested : fallbackReasoningEffort(allowed)
     return {
       voice_llm_model_id: modelAssignments.voice || null,
       shadow_llm_model_id: modelAssignments.shadow || null,
       status_llm_model_id: modelAssignments.status || null,
       tts_profile_id: modelAssignments.tts || null,
-      shadow_reasoning_effort: shadowThinking.value || null,
+      shadow_reasoning_effort: shadowReasoningEffort,
     }
   }
 
@@ -686,11 +733,15 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
         await loadSnapshot()
       } else {
         restartState.value = 'error'
+        shadowThinking.value = shadowThinkingCommitted.value
+        shadowThinkingNeedsApply.value = false
         setError(new Error(typeof result.message === 'string' ? result.message : '模型服务重启失败，已保留上一份有效配置。'))
       }
       return result
     } catch (error) {
       restartState.value = 'error'
+      shadowThinking.value = shadowThinkingCommitted.value
+      shadowThinkingNeedsApply.value = false
       setError(error)
       return null
     }
@@ -725,14 +776,14 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   })
 
   onMounted(() => {
-    connect()
     if (replayMode) {
-      // Keep the local page inspectable even if the WebSocket takes longer
-      // than usual to open; the normal connected path re-applies the fixture.
-      replayTimer = window.setTimeout(() => {
-        if (voice.connection.value !== 'connected') voice.injectReplay(voiceShadowReplayFixture)
-      }, 900)
+      // Replay is a self-contained visual fixture.  Avoid opening a real
+      // socket or snapshot request here so an offline local server cannot
+      // obscure the fixture with a connection error toast.
+      voice.injectReplay(voiceShadowReplayFixture)
+      return
     }
+    connect()
     reconnectTimer = window.setInterval(() => {
       if (voice.connection.value === 'offline') voice.connect()
     }, 3000)
@@ -783,6 +834,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     selectedTtsModel,
     activeTtsModel,
     shadowThinking,
+    shadowThinkingCommitted,
+    shadowThinkingPending,
     shadowThinkingOptions,
     shadowExpanded,
     thinkingExpanded,

@@ -350,6 +350,7 @@ describe('V0.6 session protocol', () => {
         available: true, active: true, phase: 'working', user_input_required: false,
         focus: '整理当前会话', summary: '正在后台分析',
         timeline: [{ state: 'active', label: '后台处理中', text: '正在分析', timestamp: '2026-09-07T10:00:00.000Z' }],
+        activities: [{ run_seq: 8, item_id: 'thinking-8', stream: 'thinking', phase: 'started', text: '正在', timestamp: '2026-09-07T10:00:00.000Z' }],
         context: { used_tokens: 86000, limit_tokens: 256000, usage_percent: 34 },
         provider: { input_tokens: 86000, cached_tokens: 81700, cache_hit_ratio: 0.95 },
       },
@@ -366,9 +367,49 @@ describe('V0.6 session protocol', () => {
         state: 'done', label: `步骤 ${index}`, text: `结果 ${index}`,
         timestamp: '2026-09-07T10:00:00.000Z',
       })),
+      activities: [{ run_seq: 8, item_id: 'thinking-8', stream: 'thinking', phase: 'started', text: '正在', timestamp: '2026-09-07T10:00:00.000Z' }],
     })
     expect(terminal.shadowProduct.value.active).toBe(false)
+    expect(terminal.shadowProduct.value.activities?.[0]).toMatchObject({
+      run_seq: 8, item_id: 'thinking-8', text: '正在', phase: 'started',
+    })
     expect(terminal.shadowProduct.value.timeline).toHaveLength(5)
     expect(terminal.shadowProduct.value.timeline[0].label).toBe('步骤 2')
+
+    socket.push('shadow.activity', 3, {
+      run_seq: 8, item_id: 'thinking-8', stream: 'thinking', phase: 'delta',
+      delta: '分析', timestamp: '2026-09-07T10:00:01.000Z',
+    })
+    socket.push('shadow.activity', 4, {
+      run_seq: 8, item_id: 'thinking-8', stream: 'thinking', phase: 'completed',
+      timestamp: '2026-09-07T10:00:02.000Z',
+    })
+    socket.push('shadow.activity', 5, {
+      run_seq: 8, item_id: 'tool-8', stream: 'tool', phase: 'started',
+      tool_name: 'files_search', tool_status: 'running', timestamp: '2026-09-07T10:00:03.000Z',
+    })
+    socket.push('shadow.activity', 6, {
+      run_seq: 7, item_id: 'late-7', stream: 'event', phase: 'completed',
+      event_kind: 'result', text: '旧运行', timestamp: '2026-09-07T10:00:04.000Z',
+    })
+    socket.push('shadow.activity', 7, {
+      run_seq: 8, item_id: 'thinking-8', stream: 'thinking', phase: 'delta',
+      delta: '迟到', timestamp: '2026-09-07T10:00:05.000Z',
+    })
+    socket.push('shadow.activity', 8, {
+      run_seq: 8, item_id: 'tool-8', stream: 'tool', phase: 'completed',
+      tool_name: 'files_search', tool_status: 'completed', text: '完成', timestamp: '2026-09-07T10:00:05.500Z',
+    })
+    socket.push('shadow.activity', 9, {
+      run_seq: 9, item_id: 'run-9', stream: 'lifecycle', phase: 'started',
+      text: '新一轮运行', timestamp: '2026-09-07T10:00:06.000Z',
+    })
+    expect(terminal.shadowProduct.value.activities).toEqual(expect.arrayContaining([
+      expect.objectContaining({ item_id: 'thinking-8', text: '正在分析', phase: 'completed' }),
+      expect.objectContaining({ item_id: 'tool-8', tool_name: 'files_search', tool_status: 'completed' }),
+      expect.objectContaining({ item_id: 'run-9', run_seq: 9, phase: 'started' }),
+    ]))
+    expect(terminal.shadowProduct.value.activities?.some(item => item.item_id === 'thinking-8')).toBe(true)
+    expect(terminal.shadowProduct.value.activities?.some(item => item.item_id === 'late-7')).toBe(false)
   })
 })

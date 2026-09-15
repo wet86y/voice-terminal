@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -13,6 +14,7 @@ from .tools import ShadowToolExecutor
 
 
 EventSink = Callable[[list[ShadowEvent]], Awaitable[None]]
+ActivitySink = Callable[[list[dict[str, Any]]], Awaitable[None]]
 MetricSink = Callable[[str, dict[str, Any]], None]
 
 
@@ -102,20 +104,71 @@ class _EventRelay:
         self.buffer.drain()
 
 
+class _ActivityRelay:
+    """Ordered, transient bridge for high-frequency product activities."""
+
+    def __init__(self, sink: ActivitySink | None) -> None:
+        self.sink = sink
+        self.buffer: deque[dict[str, Any]] = deque()
+        self.task: asyncio.Task[None] | None = None
+        self.closed = False
+
+    def publish(self, activity: dict[str, Any]) -> None:
+        if self.closed or self.sink is None:
+            return
+        self.buffer.append(dict(activity))
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self._flush(), name="shadow-activity-relay")
+
+    async def _flush(self) -> None:
+        # Give a burst of provider deltas one event-loop turn to coalesce into
+        # one WebSocket publication while retaining their original order.
+        await asyncio.sleep(0)
+        while not self.closed and self.buffer:
+            batch = [self.buffer.popleft() for _ in range(min(64, len(self.buffer)))]
+            sink = self.sink
+            if sink is None:
+                return
+            try:
+                await sink(batch)
+            except asyncio.CancelledError:
+                for item in reversed(batch):
+                    self.buffer.appendleft(item)
+                raise
+            except Exception:
+                # Activities are replayable from the product snapshot; keep a
+                # failed batch briefly so a transient bus error cannot reorder
+                # or silently splice a streamed item.
+                for item in reversed(batch):
+                    self.buffer.appendleft(item)
+                await asyncio.sleep(0.05)
+
+    async def close(self) -> None:
+        self.closed = True
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+        self.task = None
+        self.buffer.clear()
+
+
 class ShadowAgentSession:
     """The sole Shadow runtime associated with one authoritative ledger."""
 
     def __init__(
         self, component: "ShadowAgentComponent", context_source: ShadowContextSource,
         *, production_sink: EventSink | None = None,
+        activity_sink: ActivitySink | None = None,
     ) -> None:
         self.component = component
         on_metric = component.runtime_options.get("on_metric")
         self.relay = _EventRelay(production_sink, on_metric=on_metric if callable(on_metric) else None)
+        self.activity_relay = _ActivityRelay(activity_sink)
         self.runtime = ShadowRuntime(
             component.provider, component.tools, context_source,
             instructions_loader=component.instructions_loader,
             on_event=self.relay.publish,
+            on_activity=self.activity_relay.publish,
             status_provider=component.status_provider,
             **component.runtime_options,
         )
@@ -147,10 +200,14 @@ class ShadowAgentSession:
     async def reset(self) -> None:
         await self.runtime.reset()
         sink = self.relay.sink
+        activity_sink = self.activity_relay.sink
         await self.relay.close()
+        await self.activity_relay.close()
         on_metric = self.component.runtime_options.get("on_metric")
         self.relay = _EventRelay(sink, on_metric=on_metric if callable(on_metric) else None)
+        self.activity_relay = _ActivityRelay(activity_sink)
         self.runtime.on_event = self.relay.publish
+        self.runtime.on_activity = self.activity_relay.publish
 
     async def close(self) -> None:
         if self.closed:
@@ -158,6 +215,7 @@ class ShadowAgentSession:
         self.closed = True
         await self.runtime.close(close_tools=False)
         await self.relay.close()
+        await self.activity_relay.close()
 
 
 class ShadowAgentComponent:
@@ -178,10 +236,14 @@ class ShadowAgentComponent:
 
     def new_session(
         self, context_source: ShadowContextSource, *, production_sink: EventSink | None = None,
+        activity_sink: ActivitySink | None = None,
     ) -> ShadowAgentSession:
         if self.closed:
             raise RuntimeError("shadow component closed")
-        session = ShadowAgentSession(self, context_source, production_sink=production_sink)
+        session = ShadowAgentSession(
+            self, context_source, production_sink=production_sink,
+            activity_sink=activity_sink,
+        )
         self._sessions.add(session)
         return session
 

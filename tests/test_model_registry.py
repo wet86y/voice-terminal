@@ -138,10 +138,13 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertEqual(set(shared[0]["allowed_reasoning"]), {"off", "low", "high"})
         self.assertEqual(snapshot["assignments"]["voice_llm_model_id"], shared[0]["id"])
         self.assertEqual(snapshot["assignments"]["shadow_llm_model_id"], shared[0]["id"])
+        self.assertEqual(snapshot["assignments"]["shadow_reasoning_effort"], "high")
+        self.assertEqual(snapshot["assignments"]["role_settings"]["shadow"]["reasoning_effort"], "high")
         self.assertEqual(snapshot["schema_version"], 2)
         persisted = json.loads(self.service.registry_path.read_text(encoding="utf-8"))
         self.assertEqual(persisted["schema_version"], 2)
         self.assertEqual(persisted["assignments"]["policy_mode"], "legacy")
+        self.assertEqual(persisted["assignments"]["shadow_reasoning_effort"], "high")
 
     def test_model_policy_apply_uses_model_fields_and_failure_keeps_assignment(self) -> None:
         registry = self.service._empty()
@@ -182,6 +185,14 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertEqual(self.applied[0]["voice"]["api_key"], "llm-secret")
         self.assertEqual(applied["assignments"]["policy_mode"], "model")
         self.assertEqual(applied["assignments"]["shadow_reasoning_effort"], "medium")
+        self.assertEqual(applied["assignments"]["role_settings"]["shadow"]["reasoning_effort"], "medium")
+
+        off_assignments = {**assignments, "shadow_reasoning_effort": "off"}
+        applied_off = asyncio.run(self.service.apply_assignments(off_assignments, confirmed=True))
+        self.assertTrue(applied_off["applied"])
+        self.assertEqual(self.applied[-1]["shadow"]["settings"]["reasoning_effort"], "off")
+        self.assertEqual(applied_off["assignments"]["shadow_reasoning_effort"], "off")
+        self.assertEqual(applied_off["assignments"]["role_settings"]["shadow"]["reasoning_effort"], "off")
 
         public = asyncio.run(self.service.snapshot())
         self.assertNotIn("llm-secret", repr(public))

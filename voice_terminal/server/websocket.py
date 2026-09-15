@@ -286,6 +286,7 @@ class SessionRuntime:
                     self.shadow_session = self.shadow_component.new_session(
                         self.shadow_context,
                         production_sink=self._on_shadow_events,
+                        activity_sink=self._on_shadow_activity,
                     )
                     self.history.set_shadow_runtime_state(available=True, active=False)
                     self.shadow_product.reset(available=True)
@@ -412,6 +413,7 @@ class SessionRuntime:
                 "focus": "",
                 "summary": "",
                 "timeline": [],
+                "activities": [],
             }
         runtime_snapshot = None
         session = getattr(self, "shadow_session", None)
@@ -424,6 +426,14 @@ class SessionRuntime:
 
     async def publish_shadow_product(self) -> None:
         await self.bus.publish(event("shadow.product", None, **self._shadow_product_snapshot()))
+
+    async def _on_shadow_activity(self, activities: list[dict[str, Any]]) -> None:
+        """Publish transient Shadow activities beside the authoritative event relay."""
+        projection = getattr(self, "shadow_product", None)
+        if projection is not None:
+            projection.update_activities(activities)
+        for activity in activities:
+            await self.bus.publish(event("shadow.activity", None, **dict(activity)))
 
     def stage_product_settings(self, settings: Mapping[str, Any]) -> None:
         self._pending_product_settings = dict(settings)

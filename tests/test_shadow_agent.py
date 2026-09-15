@@ -24,6 +24,7 @@ from voice_terminal.shadow_agent import (
 from voice_terminal.shadow_agent.events import ShadowEventBuffer
 from voice_terminal.shadow_agent.component import _EventRelay
 from voice_terminal.shadow_agent.provider import ShadowProviderResponse
+from voice_terminal.server.product import ShadowProductProjection
 
 
 def message(text: str) -> dict:
@@ -230,6 +231,99 @@ def test_event_relay_retries_without_losing_terminal_event_and_ledger_is_idempot
         assert any(name == "event.delivery_retry" for name, _ in metrics)
         assert any(name == "event.delivered" for name, _ in metrics)
         await relay.close()
+
+    asyncio.run(scenario())
+
+
+def test_shadow_activity_stream_merges_items_and_discards_stale_runs():
+    projection = ShadowProductProjection()
+    projection.update_activities([
+        {"run_seq": 4, "item_id": "thinking-4", "stream": "thinking", "phase": "started", "text": "正在", "timestamp": "2026-09-07T10:00:00Z"},
+        {"run_seq": 4, "item_id": "thinking-4", "stream": "thinking", "phase": "delta", "delta": "分析", "timestamp": "2026-09-07T10:00:01Z"},
+        {"run_seq": 4, "item_id": "thinking-4", "stream": "thinking", "phase": "completed", "timestamp": "2026-09-07T10:00:01Z"},
+        {"run_seq": 4, "item_id": "tool-4", "stream": "tool", "phase": "started", "tool_name": "files_search", "tool_status": "running", "timestamp": "2026-09-07T10:00:02Z"},
+        {"run_seq": 4, "item_id": "tool-4", "stream": "tool", "phase": "completed", "tool_name": "files_search", "tool_status": "completed", "text": "工具执行完成", "timestamp": "2026-09-07T10:00:03Z"},
+    ])
+    projection.update_activities([
+        {"run_seq": 3, "item_id": "late", "stream": "event", "phase": "completed", "event_kind": "result", "text": "旧运行", "timestamp": "2026-09-07T09:59:00Z"},
+    ])
+    snapshot = projection.snapshot()
+    assert [item["item_id"] for item in snapshot["activities"]] == ["thinking-4", "tool-4"]
+    assert snapshot["activities"][0]["text"] == "正在分析"
+    assert snapshot["activities"][1]["tool_status"] == "completed"
+    projection.update_activities([
+        {"run_seq": 4, "item_id": "tool-4", "stream": "tool", "phase": "delta", "tool_status": "running", "timestamp": "2026-09-07T10:00:04Z"},
+    ])
+    assert projection.snapshot()["activities"][1]["tool_status"] == "completed"
+
+    projection.update_activities([
+        {"run_seq": 5, "item_id": "run-5", "stream": "lifecycle", "phase": "started", "text": "新运行", "timestamp": "2026-09-07T10:01:00Z"},
+    ])
+    activity_ids = [item["item_id"] for item in projection.snapshot()["activities"]]
+    assert activity_ids[-1] == "run-5"
+    assert activity_ids[:2] == ["thinking-4", "tool-4"]
+
+
+def test_shadow_runtime_emits_separate_activity_stream_without_trace_deltas(tmp_path: Path):
+    async def scenario():
+        ledger, events, activities = SessionLedger(), [], []
+        ledger.commit_input("u1", "查找说明")
+        provider = QueueProvider([
+            [call("event", "publish_main_event", {"kind": "progress", "text": "开始查找"})],
+            [message("最终完成")],
+        ])
+        runtime = make_runtime(
+            provider, ledger, tmp_path, events, on_activity=activities.append,
+        )
+        runtime.wake()
+        await wait_idle(runtime)
+        assert events[-1].kind == "result"
+        assert any(item["stream"] == "thinking" for item in activities)
+        assert any(item["stream"] == "tool" and item.get("tool_name") == "publish_main_event" for item in activities)
+        assert any(item["stream"] == "event" and item.get("event_kind") == "progress" for item in activities)
+        assert any(item["stream"] == "lifecycle" and item["phase"] == "completed" for item in activities)
+        assert all("private" not in json.dumps(item, ensure_ascii=False) for item in activities)
+        assert all("run_seq" not in item and "stream" not in item for item in runtime.working_trace)
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_shadow_provider_retry_closes_unfinished_activity_items(tmp_path: Path):
+    class StreamingRetryProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                callback = kwargs.get("on_stream")
+                assert callback is not None
+                await callback({
+                    "type": "response.output_item.added",
+                    "item": {"id": "provider-call", "type": "function_call", "call_id": "provider-call", "name": "files_search"},
+                })
+                raise RuntimeError("stream disconnected")
+            return ShadowProviderResponse((message("重试完成"),), {"input_tokens": 12})
+
+    async def scenario():
+        ledger, events, activities = SessionLedger(), [], []
+        ledger.commit_input("u1", "查找说明")
+        runtime = make_runtime(
+            StreamingRetryProvider(), ledger, tmp_path, events,
+            on_activity=activities.append, transport_retry_limit=1,
+        )
+        runtime.wake()
+        await wait_idle(runtime)
+        assert events[-1].kind == "result"
+        failed_tools = [
+            item for item in activities
+            if item["stream"] == "tool" and item["phase"] == "failed"
+        ]
+        assert failed_tools
+        assert any(item["stream"] == "lifecycle" and item["phase"] == "failed" for item in activities)
+        assert any(item["stream"] == "lifecycle" and item["phase"] == "completed" for item in activities)
+        await runtime.close()
 
     asyncio.run(scenario())
 
