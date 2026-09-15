@@ -115,7 +115,8 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     """Report malformed persisted fields without exposing their contents."""
 
     invalid = False
-    if value.get("schema_version") not in {None, PRODUCT_SETTINGS_SCHEMA_VERSION}:
+    schema_version = value.get("schema_version")
+    if schema_version is not None and schema_version != PRODUCT_SETTINGS_SCHEMA_VERSION:
         invalid = True
     for section_name, fields in (
         ("wake", ("enabled", "always_on", "keyword", "keyword_label", "sensitivity")),
