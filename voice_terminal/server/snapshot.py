@@ -25,7 +25,7 @@ class ProtocolSequencer:
     }
     _PUBLIC = {"runtime.snapshot", "session.state", "metrics.snapshot", "input.started", "input.updated",
                "input.finalized", "input.completed", "agent.state", "agent.trace", "context.snapshot",
-               "tool.state", "agent.reasoning", "speak.preview", "speech.queued", "speech.started", "speech.delta", "speech.progress", "speech.completed", "shadow.debug.wake", "shadow.debug.event", "error"}
+               "tool.state", "agent.reasoning", "speak.preview", "speech.queued", "speech.started", "speech.delta", "speech.progress", "speech.completed", "shadow.product", "shadow.debug.wake", "shadow.debug.event", "error"}
 
     def __init__(self, conversation_id: str | Callable[[], str]) -> None:
         self._seq = 0

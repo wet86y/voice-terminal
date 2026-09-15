@@ -83,6 +83,21 @@ class EpisodeController(RealtimeController):
         if self.episode.episode_id is None and not self.episode.closed:
             self.episode = self._make_episode()
 
+    def set_agent_options(self, options) -> None:
+        """Stage Agent options for the next Episode without touching live work.
+
+        Product settings are deliberately applied at a session start
+        boundary.  ``AgentEpisodeRuntime`` owns its scheduler, so changing
+        only ``self.agent_options`` would leave an idle-but-not-closed
+        Episode (for example after ``session.reset``) using the old final
+        silence window.  Rebuilding here is safe because no Episode is active
+        and preserves the existing controller/audio lifecycle.
+        """
+
+        self.agent_options = options
+        if self.episode.episode_id is None and not self.episode.closed:
+            self.episode = self._make_episode()
+
     async def _agent_event(self, kind, payload):
         # Only an authoritative Episode snapshot may replace the compact
         # current-state projection.  Late trace/output events deliberately

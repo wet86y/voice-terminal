@@ -295,6 +295,20 @@ class AgentDecisionScheduler:
     def __init__(self, options):
         self.options = options
         self.interval = max(0.001, float(options.scheduler_tick_ms) / 1000.0)
+        # Keep the default 30-second/75-tick behavior byte-for-byte
+        # compatible, while allowing the product settings sidecar to stage a
+        # different final-silence boundary for the next Episode.  Ordinary
+        # staircase windows at or after that boundary must not win over the
+        # final check.
+        self.FINAL_WINDOW = max(
+            1,
+            math.ceil(float(getattr(options, "final_silence_ms", 30000))
+                      / max(1, int(options.scheduler_tick_ms))),
+        )
+        self.FORCE_WINDOWS = tuple(
+            window for window in type(self).FORCE_WINDOWS
+            if window < self.FINAL_WINDOW
+        )
         self.last_tick = 0.0
         self.next_heartbeat = None
         self.anchor_monotonic = None

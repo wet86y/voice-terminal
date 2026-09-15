@@ -137,6 +137,10 @@ class ShadowAgentSession:
             raise RuntimeError("cannot replace active Shadow context source")
         self.runtime.context_source = context_source
 
+    def reload_instructions(self) -> None:
+        """Refresh Shadow persona after a product settings save/reset."""
+        self.runtime.reload_instructions()
+
     def drain_events(self) -> list[ShadowEvent]:
         return self.relay.drain()
 
