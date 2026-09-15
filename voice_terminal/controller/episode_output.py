@@ -365,6 +365,9 @@ class EpisodeSpeechOutput(SpeechPipeline):
         h = SpeechHandle(self, identity, turn_id, self.generation, emotion, kind=kind)
         h.force_fresh_tts_session = _fresh_session
         self._handles_by_token[h.workspace.token] = h
+        register = getattr(self.runtime, "_register_speech_transaction", None)
+        if callable(register):
+            register(h)
         if (getattr(self.runtime, "user_speaking", False) is False
                 and not self._playback_hold and not _defer_activation):
             h.playback_ready.set()
@@ -678,6 +681,47 @@ class EpisodeSpeechOutput(SpeechPipeline):
             return True
         return False
 
+    async def _notify_playback_completed(self, h):
+        """Notify Agent at the player-drained boundary, before append wait."""
+
+        if h.reason or h.workspace.timings.get("playback_completion_notified"):
+            return
+        timings = h.workspace.timings
+        if not (
+            h.text
+            and timings.get("tts_text_sent")
+            and int(timings.get("tts_audio_bytes") or 0) > 0
+            and timings.get("playback_output_complete") is True
+        ):
+            return
+        completed_at = timings.get("playback_output_completed_at")
+        if not isinstance(completed_at, (int, float)) or completed_at <= 0:
+            completed_at = time.monotonic()
+            timings["playback_output_completed_at"] = completed_at
+        timings["playback_completion_notified"] = completed_at
+        callback = getattr(self.runtime, "playback_completed", None)
+        if not callable(callback):
+            return
+        try:
+            result = callback(
+                turn_id=h.turn_id,
+                speech_id=h.speech_id,
+                conversation_id=h.identity[0],
+                request_id=h.identity[1],
+                output_generation=h.workspace.generation,
+                playback_completed_at=completed_at,
+                wall_time=time.time(),
+            )
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            # The scheduling diagnostic must never turn a successfully played
+            # response into a failed speech transaction.
+            logger.exception(
+                "episode.playback_completion_callback_failed speech_id=%s turn_id=%s",
+                h.speech_id, h.turn_id,
+            )
+
     async def _run(self, h):
         # Record completion even if cancellation occurs before the first delta.
         try:
@@ -689,6 +733,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 h.workspace.timings.update(source_timings)
             h.workspace.timings["llm_request"] = self.runtime.request_started_at or time.monotonic()
             await self._play_stream(h.workspace, h.workspace.token, h.stream(), speech_id=h.speech_id)
+            await self._notify_playback_completed(h)
             # A zero-PCM Bidi transaction cannot have delivered any text, so
             # one replay is safe and avoids making the user repeat a request
             # after a cancelled/non-reusable MiniMax session.  Never retry
@@ -718,6 +763,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
                     yield h.text
 
                 await self._play_stream(h.workspace, h.workspace.token, replay(), speech_id=h.speech_id)
+                await self._notify_playback_completed(h)
                 if h.workspace.timings.get("tts_text_sent") and h.workspace.timings.get("tts_audio_bytes", 0) == 0:
                     await self.runtime.log(
                         "TTS_EMPTY_AUDIO_RETRY_FAILED",
@@ -973,6 +1019,17 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 await self.runtime.output_completed(record)
             finally:
                 self._settling_speech_ids.discard(h.speech_id)
+                settled = getattr(self.runtime, "output_transaction_settled", None)
+                if callable(settled):
+                    try:
+                        result = settled(record)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception:
+                        logger.exception(
+                            "episode.output_settlement_callback_failed speech_id=%s turn_id=%s",
+                            h.speech_id, h.turn_id,
+                        )
                 logger.info(
                     "speech.settling_finished speech_id=%s turn_id=%s",
                     h.speech_id, h.turn_id,

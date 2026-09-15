@@ -39,6 +39,7 @@ class EpisodeController(RealtimeController):
                                       options=self.agent_options, tools_enabled=True,
                                        shadow_waker=self.shadow_waker,
                                        reasoning_mode=mode, persona_config=self.persona_config,
+                                       defer_silence_until_output=self.wake_always_on,
                                        on_final_system_check_settled=self._final_system_check_settled)
         self.output.runtime = runtime
         return runtime
@@ -66,7 +67,15 @@ class EpisodeController(RealtimeController):
                 if (isinstance(scheduler_generation, int)
                         and scheduler_generation != self.episode.scheduler.generation):
                     return
-                if self.workspace is None and self.episode.user_speaking is not True:
+                output = getattr(self, "output", None)
+                output_busy = bool(
+                    getattr(output, "busy", False)
+                    or getattr(output, "active", False)
+                    or getattr(output, "_settling_speech_ids", None)
+                    or getattr(output, "_pending", None)
+                )
+                if (self.workspace is None and self.episode.user_speaking is not True
+                        and not output_busy):
                     await self._return_to_kws(activation_generation)
                     return
                 await asyncio.sleep(0.05)

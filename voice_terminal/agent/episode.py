@@ -314,6 +314,7 @@ class AgentDecisionScheduler:
         self.anchor_monotonic = None
         self.anchor_wall_time = None
         self.anchor_turn_id: str | None = None
+        self.anchor_source: str | None = None
         self.window_index = 0
         self.armed = False
         self.final_pending = False
@@ -329,6 +330,7 @@ class AgentDecisionScheduler:
         self._newly_coalesced_windows: list[int] = []
         self._resolutions: dict[int, str] = {}
         self.last_resolution = None
+        self._deferred_generation: int | None = None
 
     def accepts(self, _kind):
         # TTS is output-side state, not a scheduler input.  All other event
@@ -391,15 +393,10 @@ class AgentDecisionScheduler:
         self.start_heartbeat(now)
         return max(0.0, now - self.next_heartbeat)
 
-    def arm(self, now=None, *, wall_time=None, turn_id=None):
-        """Arm a new ladder from a meaningful finalized/refined input."""
+    def _reset_ladder(self):
+        """Clear one ladder without changing the fixed heartbeat axis."""
 
-        now = time.monotonic() if now is None else float(now)
-        self.anchor_monotonic = now
-        self.anchor_wall_time = time.time() if wall_time is None else float(wall_time)
-        self.anchor_turn_id = turn_id
         self.window_index = 0
-        self.armed = True
         self.final_pending = False
         self.final_pending_since = None
         self.final_dispatched = False
@@ -412,8 +409,72 @@ class AgentDecisionScheduler:
         self._newly_coalesced_windows.clear()
         self._resolutions.clear()
         self.last_resolution = None
+
+    def _set_anchor(self, now, *, wall_time=None, turn_id=None, anchor_source=None):
+        now = time.monotonic() if now is None else float(now)
+        self.anchor_monotonic = now
+        self.anchor_wall_time = time.time() if wall_time is None else float(wall_time)
+        self.anchor_turn_id = turn_id
+        self.anchor_source = anchor_source
+        self._reset_ladder()
+        self.armed = True
+
+    def arm(self, now=None, *, wall_time=None, turn_id=None, anchor_source=None):
+        """Arm a new ladder from a meaningful finalized/refined input."""
+
         self.generation += 1
+        self._deferred_generation = None
+        self._set_anchor(
+            now, wall_time=wall_time, turn_id=turn_id,
+            anchor_source=anchor_source,
+        )
         return self.generation
+
+    def defer(self, now=None, *, wall_time=None, turn_id=None):
+        """Invalidate the old ladder while waiting for an output boundary.
+
+        KWS sessions use this two-phase lifecycle for a finalized input.  The
+        generation advances immediately, so forced candidates from the old
+        turn become stale, but no new silence window can fire until the
+        runtime supplies the authoritative playback/settlement timestamp.
+        """
+
+        # ``now`` is accepted for symmetry with ``arm`` and to make callers'
+        # event timestamps explicit, but the deferred state intentionally has
+        # no active monotonic anchor yet.
+        _ = time.monotonic() if now is None else float(now)
+        self._reset_ladder()
+        self.armed = False
+        self.anchor_monotonic = None
+        self.anchor_wall_time = None
+        self.anchor_turn_id = None
+        self.anchor_source = None
+        self.generation += 1
+        self._deferred_generation = self.generation
+        return self.generation
+
+    def is_deferred(self, generation=None):
+        """Whether ``generation`` is waiting for its real output boundary."""
+
+        return self._deferred_generation is not None and (
+            generation is None or int(generation) == self._deferred_generation
+        )
+
+    def activate_deferred(self, now=None, *, wall_time=None, turn_id=None,
+                          generation=None, anchor_source=None):
+        """Activate the latest deferred generation without incrementing it."""
+
+        expected = self._deferred_generation
+        if expected is None or expected != self.generation:
+            return False
+        if generation is not None and int(generation) != expected:
+            return False
+        self._deferred_generation = None
+        self._set_anchor(
+            now, wall_time=wall_time, turn_id=turn_id,
+            anchor_source=anchor_source,
+        )
+        return True
 
     def advance(self, now=None):
         """Advance relative 400 ms windows using a caller-controlled clock.
@@ -593,10 +654,12 @@ class AgentDecisionScheduler:
         """Close the ladder on final dispatch, reset, stop, or episode end."""
 
         final_dispatched = self.final_dispatched if preserve_final else False
+        self._deferred_generation = None
         self.armed = False
         self.anchor_monotonic = None
         self.anchor_wall_time = None
         self.anchor_turn_id = None
+        self.anchor_source = None
         self.final_pending = False
         self.final_pending_since = None
         self.final_dispatched = final_dispatched
@@ -628,6 +691,8 @@ class AgentDecisionScheduler:
             "anchor_wall_time": self.anchor_wall_time,
             "generation": self.generation,
         }
+        if self.anchor_source is not None:
+            descriptor["anchor_source"] = self.anchor_source
         if self.anchor_turn_id is not None:
             descriptor["anchor_turn_id"] = self.anchor_turn_id
             descriptor["speech_turn_id"] = self.anchor_turn_id
@@ -638,7 +703,7 @@ class AgentDecisionScheduler:
         silence_elapsed_ms = None
         if self.anchor_monotonic is not None:
             silence_elapsed_ms = int(round(max(0.0, now - self.anchor_monotonic) * 1000))
-        return {
+        value = {
             "interval_ms": int(round(self.interval * 1000)),
             "heartbeat_deadline": self.next_heartbeat,
             "armed": self.armed,
@@ -664,6 +729,7 @@ class AgentDecisionScheduler:
             "resolutions": dict(self._resolutions),
             "last_resolution": dict(self.last_resolution) if isinstance(self.last_resolution, dict) else None,
         }
+        return value
 
 
 class AgentEpisodeRuntime:
@@ -676,7 +742,8 @@ class AgentEpisodeRuntime:
 
     def __init__(self, provider, registry, output, emit, *, conversation: ConversationRuntime, ledger,
                  options=None, tools_enabled=True, reasoning_mode="balanced", persona_config=None,
-                 shadow_waker=None, on_final_system_check_settled=None):
+                 shadow_waker=None, on_final_system_check_settled=None,
+                 defer_silence_until_output=False):
         self.provider, self.registry, self.output, self.emit = provider, registry, output, emit
         self.options = options or AgentOptions()
         self.tools_enabled = tools_enabled
@@ -685,6 +752,10 @@ class AgentEpisodeRuntime:
         self.ledger = ledger
         self.shadow_waker = shadow_waker
         self.on_final_system_check_settled = on_final_system_check_settled
+        # This is enabled only for the resident-KWS product mode.  Ordinary
+        # sessions retain the historical behavior where the finalized input
+        # itself arms the silence staircase.
+        self.defer_silence_until_output = bool(defer_silence_until_output)
         self.context_projector = LLMContextProjector()
         self.persona_loader = PersonaDocumentLoader(persona_config) if persona_config is not None else None
         self.persona_documents = PersonaDocuments()
@@ -746,6 +817,8 @@ class AgentEpisodeRuntime:
         self._immediate_system_check: dict | None = None
         self._final_system_checks: dict[str, dict] = {}
         self._settled_final_system_checks: set[str] = set()
+        self._pending_silence_anchor: dict | None = None
+        self._speech_transactions_by_request: dict[str, set[str]] = {}
         self.closed = False
         self.request_count = 0
         self.active_request_count = 0
@@ -989,6 +1062,8 @@ class AgentEpisodeRuntime:
             "LLM_RECOVERY_COMPLETED", "LLM_DISPATCHED", "LLM_COALESCED",
             "LLM_ACTIVE_REQUEST_FINISHED",
             "SCHEDULER_ARMED", "SCHEDULER_EVENT_ENQUEUED",
+            "SCHEDULER_ANCHOR_DEFERRED", "SCHEDULER_ANCHOR_ACTIVATED",
+            "SCHEDULER_ANCHOR_WAITING_FOR_OUTPUT", "TTS_PLAYBACK_COMPLETED",
             "SCHEDULER_TICK", "SCHEDULER_FORCED_COVERED", "SCHEDULER_FORCED_RESOLVED",
             "SCHEDULER_FINAL_PENDING", "SYSTEM_CHECK_SUPERSEDED", "SYSTEM_CHECK_STALE",
             "SCHEDULER_HEARTBEAT_DELAYED", "SCHEDULER_HEARTBEAT_COALESCED",
@@ -1021,7 +1096,9 @@ class AgentEpisodeRuntime:
                 "error_layer=%s error_code=%s provider_schema_valid=%s local_contract_valid=%s "
                 "sse_events=%s sse_malformed=%s sequence_missing=%s sequence_duplicate=%s "
                 "sequence_non_increasing=%s sequence_jump=%s dispatch_kind=%s prompt_kind=%s "
-                "scheduler_generation=%s window_index=%s owner_scope=%s system_check_id=%s lateness_ms=%s",
+                "scheduler_generation=%s window_index=%s owner_scope=%s system_check_id=%s lateness_ms=%s "
+                "anchor_source=%s user_silence_monotonic=%s tts_playback_completed_monotonic=%s "
+                "anchor_monotonic=%s",
                 kind, source[0], source[1], item["turn_id"],
                 payload.get("events"), payload.get("reason"), payload.get("status"), payload.get("speech_id"),
                 payload.get("code"), payload.get("attempts"), payload.get("limit"),
@@ -1045,8 +1122,10 @@ class AgentEpisodeRuntime:
                 payload.get("sequence_missing_count"), payload.get("sequence_duplicate_count"),
                 payload.get("sequence_non_increasing_count"), payload.get("sequence_jump_count"),
                 payload.get("dispatch_kind"), payload.get("prompt_kind"),
-                payload.get("scheduler_generation"), payload.get("window_index"),
-                payload.get("owner_scope"), payload.get("system_check_id"), payload.get("lateness_ms"),
+                 payload.get("scheduler_generation"), payload.get("window_index"),
+                 payload.get("owner_scope"), payload.get("system_check_id"), payload.get("lateness_ms"),
+                 payload.get("anchor_source"), payload.get("user_silence_monotonic"),
+                 payload.get("tts_playback_completed_monotonic"), payload.get("anchor_monotonic"),
             )
         await self.emit("agent.trace", item)
         # A late output transaction may still need a trace after its Episode
@@ -1631,6 +1710,312 @@ class AgentEpisodeRuntime:
             "status": "completed",
         })
 
+    @staticmethod
+    def _positive_time(value):
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        return None
+
+    def _output_is_busy(self) -> bool:
+        """Return the output transaction's conservative busy state."""
+
+        output = self.output
+        if output is None:
+            return False
+        if bool(getattr(output, "busy", False)) or bool(getattr(output, "active", False)):
+            return True
+        settling = getattr(output, "_settling_speech_ids", None)
+        if settling:
+            return True
+        pending = getattr(output, "_pending", None)
+        if pending:
+            return any(
+                item is not None
+                and not getattr(item, "reason", None)
+                and not getattr(getattr(item, "task", None), "done", lambda: False)()
+                for item in pending
+            )
+        return False
+
+    def _register_speech_transaction(self, handle) -> None:
+        """Associate a speech transaction with its originating LLM request."""
+
+        identity = getattr(handle, "identity", None)
+        speech_id = getattr(handle, "speech_id", None)
+        if not isinstance(identity, (tuple, list)) or len(identity) < 2:
+            return
+        if not identity[1] or not speech_id:
+            return
+        request_id = str(identity[1])
+        self._speech_transactions_by_request.setdefault(request_id, set()).add(str(speech_id))
+
+    def _forget_speech_transaction(self, record) -> None:
+        if not isinstance(record, dict):
+            return
+        request_id = record.get("request_id") or record.get("trace_id") or record.get("agent_step_id")
+        speech_id = record.get("speech_id")
+        if not request_id or not speech_id:
+            return
+        speech_ids = self._speech_transactions_by_request.get(str(request_id))
+        if not speech_ids:
+            return
+        speech_ids.discard(str(speech_id))
+        if not speech_ids:
+            self._speech_transactions_by_request.pop(str(request_id), None)
+
+    def _bind_pending_silence_request(self, identity, turn_id, *, allow_rebind=False) -> None:
+        pending = self._pending_silence_anchor
+        if not self.defer_silence_until_output or not isinstance(pending, dict):
+            return
+        generation = pending.get("generation")
+        if (pending.get("turn_id") != turn_id
+                or generation != self.scheduler.generation
+                or not self.scheduler.is_deferred(generation)):
+            return
+        if pending.get("request_id") is None or allow_rebind:
+            pending["conversation_id"] = identity[0]
+            pending["request_id"] = identity[1]
+
+    def _defer_silence_anchor_for_input(self, turn_id, payload):
+        now = time.monotonic()
+        user_silence = self._positive_time(payload.get("input_finished_at")) or now
+        user_wall_time = self._positive_time(payload.get("occurred_at")) or time.time()
+        previous = self._pending_silence_anchor
+        generation = self.scheduler.defer(
+            now=now, wall_time=user_wall_time, turn_id=turn_id,
+        )
+        pending = {
+            "turn_id": turn_id,
+            "conversation_id": self.episode_id,
+            "request_id": None,
+            "generation": generation,
+            "user_silence_monotonic": user_silence,
+            "user_silence_wall_time": user_wall_time,
+            "tts_playback_completed_monotonic": None,
+            "tts_playback_completed_wall_time": None,
+            "request_settled_at": None,
+            "request_outcome": None,
+            "waiting_for_output": False,
+        }
+        self._pending_silence_anchor = pending
+        return previous, pending
+
+    def _pending_silence_matches(self, *, turn_id=None, request_id=None,
+                                 generation=None, allow_output_settlement=False) -> bool:
+        pending = self._pending_silence_anchor
+        if not self.defer_silence_until_output or not isinstance(pending, dict):
+            return False
+        expected_generation = pending.get("generation")
+        if (expected_generation != self.scheduler.generation
+                or not self.scheduler.is_deferred(expected_generation)):
+            return False
+        if generation is not None and generation != expected_generation:
+            return False
+        if turn_id is not None and pending.get("turn_id") != turn_id:
+            return False
+        expected_request = pending.get("request_id")
+        if expected_request is None:
+            return request_id is None
+        if allow_output_settlement and pending.get("waiting_for_output"):
+            return True
+        return request_id is not None and str(request_id) == str(expected_request)
+
+    async def _activate_pending_silence_anchor(
+        self, *, turn_id, request_id=None, generation=None,
+        playback_completed_at=None, playback_wall_time=None,
+        settled_at=None, settled_wall_time=None, source_hint=None,
+        speech_id=None, allow_output_settlement=False,
+    ) -> bool:
+        if not self._pending_silence_matches(
+                turn_id=turn_id, request_id=request_id, generation=generation,
+                allow_output_settlement=allow_output_settlement):
+            return False
+        pending = self._pending_silence_anchor
+        user_silence = pending["user_silence_monotonic"]
+        playback_at = self._positive_time(playback_completed_at)
+        settled = self._positive_time(settled_at)
+        candidate = playback_at if source_hint == "tts_playback_completed" else settled
+        if candidate is None and source_hint == "tts_playback_completed":
+            candidate = time.monotonic()
+        if candidate is None and source_hint == "transaction_settled":
+            candidate = time.monotonic()
+
+        if candidate is not None and candidate >= user_silence:
+            anchor_at = candidate
+            if source_hint == "tts_playback_completed" and playback_at is not None:
+                anchor_source = "tts_playback_completed"
+                anchor_wall_time = (
+                    self._positive_time(playback_wall_time) or time.time()
+                )
+            elif source_hint == "transaction_settled":
+                anchor_source = "transaction_settled"
+                anchor_wall_time = (
+                    self._positive_time(settled_wall_time) or time.time()
+                )
+            else:
+                anchor_source = "user_silence"
+                anchor_wall_time = pending["user_silence_wall_time"]
+        else:
+            anchor_at = user_silence
+            anchor_source = "user_silence"
+            anchor_wall_time = pending["user_silence_wall_time"]
+
+        activated = self.scheduler.activate_deferred(
+            anchor_at,
+            wall_time=anchor_wall_time,
+            turn_id=pending["turn_id"],
+            generation=pending["generation"],
+            anchor_source=anchor_source,
+        )
+        if not activated:
+            return False
+        pending.update({
+            "tts_playback_completed_monotonic": playback_at,
+            "tts_playback_completed_wall_time": self._positive_time(playback_wall_time),
+            "anchor_monotonic": anchor_at,
+            "anchor_wall_time": anchor_wall_time,
+            "anchor_source": anchor_source,
+            "speech_id": speech_id,
+        })
+        self._pending_silence_anchor = None
+        identity = (
+            pending.get("conversation_id") or self.episode_id,
+            pending.get("request_id") or self.agent_step_id,
+        )
+        await self.log(
+            "SCHEDULER_ANCHOR_ACTIVATED",
+            identity=identity,
+            turn_id=pending["turn_id"],
+            request_id=pending.get("request_id"),
+            speech_id=speech_id,
+            scheduler_generation=pending["generation"],
+            anchor_source=anchor_source,
+            user_silence_monotonic=pending["user_silence_monotonic"],
+            user_silence_wall_time=pending["user_silence_wall_time"],
+            tts_playback_completed_monotonic=playback_at,
+            tts_playback_completed_wall_time=self._positive_time(playback_wall_time),
+            settled_at=settled,
+            anchor_monotonic=anchor_at,
+            anchor_wall_time=anchor_wall_time,
+        )
+        await self.log(
+            "SCHEDULER_ARMED",
+            identity=identity,
+            turn_id=pending["turn_id"],
+            request_id=pending.get("request_id"),
+            generation=pending["generation"],
+            anchor_time=anchor_wall_time,
+            anchor_source=anchor_source,
+            user_silence_monotonic=pending["user_silence_monotonic"],
+            tts_playback_completed_monotonic=playback_at,
+            anchor_monotonic=anchor_at,
+        )
+        self._ensure_runner()
+        return True
+
+    async def playback_completed(self, *, turn_id, speech_id=None,
+                                 conversation_id=None, request_id=None,
+                                 output_generation=None,
+                                 playback_completed_at=None, wall_time=None):
+        """Activate a deferred KWS ladder at the real player drain boundary."""
+
+        if not self.defer_silence_until_output:
+            return False
+        if conversation_id is not None and conversation_id != self.episode_id:
+            return False
+        pending = self._pending_silence_anchor
+        generation = pending.get("generation") if isinstance(pending, dict) else None
+        if not self._pending_silence_matches(
+                turn_id=turn_id, request_id=request_id, generation=generation):
+            return False
+        await self.log(
+            "TTS_PLAYBACK_COMPLETED",
+            identity=(conversation_id or self.episode_id, request_id),
+            turn_id=turn_id,
+            request_id=request_id,
+            speech_id=speech_id,
+            output_generation=output_generation,
+            playback_completed_at=playback_completed_at,
+        )
+        return await self._activate_pending_silence_anchor(
+            turn_id=turn_id,
+            request_id=request_id,
+            generation=generation,
+            playback_completed_at=playback_completed_at,
+            playback_wall_time=wall_time,
+            source_hint="tts_playback_completed",
+            speech_id=speech_id,
+        )
+
+    async def _settle_pending_silence_after_request(self, identity, turn_id,
+                                                     outcome) -> bool:
+        """Use request settlement only when that request created no speech."""
+
+        request_id = identity[1] if isinstance(identity, (tuple, list)) and len(identity) > 1 else None
+        pending = self._pending_silence_anchor
+        if not self._pending_silence_matches(
+                turn_id=turn_id, request_id=request_id,
+                generation=(pending.get("generation") if isinstance(pending, dict) else None),
+        ):
+            return False
+        if request_id and self._speech_transactions_by_request.get(str(request_id)):
+            return False
+        settled_at = time.monotonic()
+        pending["request_settled_at"] = settled_at
+        pending["request_outcome"] = outcome
+        if self._output_is_busy():
+            pending["waiting_for_output"] = True
+            await self.log(
+                "SCHEDULER_ANCHOR_WAITING_FOR_OUTPUT",
+                identity=identity,
+                turn_id=turn_id,
+                request_id=request_id,
+                scheduler_generation=pending["generation"],
+                outcome=outcome,
+            )
+            return False
+        return await self._activate_pending_silence_anchor(
+            turn_id=turn_id,
+            request_id=request_id,
+            generation=pending["generation"],
+            settled_at=settled_at,
+            settled_wall_time=time.time(),
+            source_hint="transaction_settled",
+        )
+
+    async def output_transaction_settled(self, record) -> bool:
+        """Complete the no-audio fallback after output bookkeeping settles."""
+
+        if not isinstance(record, dict) or record.get("status") not in {"completed", "failed"}:
+            return False
+        pending = self._pending_silence_anchor
+        if not isinstance(pending, dict) or not pending.get("waiting_for_output"):
+            return False
+        request_id = record.get("request_id") or record.get("trace_id") or record.get("agent_step_id")
+        turn_id = record.get("turn_id") or record.get("input_id")
+        strict_match = self._pending_silence_matches(
+            turn_id=turn_id, request_id=request_id,
+            generation=pending.get("generation"),
+        )
+        if not strict_match:
+            if not self._pending_silence_matches(
+                    turn_id=None, request_id=request_id,
+                    generation=pending.get("generation"),
+                    allow_output_settlement=True,
+            ):
+                return False
+            turn_id = pending["turn_id"]
+        return await self._activate_pending_silence_anchor(
+            turn_id=turn_id,
+            request_id=pending.get("request_id") if not strict_match else request_id,
+            generation=pending["generation"],
+            settled_at=time.monotonic(),
+            settled_wall_time=time.time(),
+            source_hint="transaction_settled",
+            speech_id=record.get("speech_id"),
+            allow_output_settlement=not strict_match,
+        )
+
     async def observe(self, kind, *, turn_id=None, text=None, **payload):
         if self.closed:
             return
@@ -1805,21 +2190,50 @@ class AgentEpisodeRuntime:
             and bool(text.strip())
         )
         if valid_anchor:
-            # A meaningful user event is the only operation that re-arms the
-            # silence ladder.  Re-arming invalidates only an unstarted
-            # final_pending candidate; it never cancels an in-flight request.
-            # TTS and microphone activity never touch the ladder.
+            # A meaningful user event is the only operation that re-arms or
+            # replaces the silence ladder.  Re-arming invalidates only an
+            # unstarted final_pending candidate; it never cancels an in-flight
+            # request.  TTS and microphone activity never enter the semantic
+            # scheduler mailbox.
             self._supersede_system_output_without_request_cancel(kind)
             superseded_windows = self.scheduler.pending_checkpoint_windows()
             superseded_generation = self.scheduler.generation
             superseded_turn_id = self.scheduler.anchor_turn_id
-            generation = self.scheduler.arm(
-                now=time.monotonic(),
-                wall_time=(payload.get("occurred_at")
-                           if isinstance(payload.get("occurred_at"), (int, float))
-                           else None),
-                turn_id=turn_id,
-            )
+            if self.defer_silence_until_output:
+                superseded_anchor = self._pending_silence_anchor
+                generation, pending_anchor = self._defer_silence_anchor_for_input(
+                    turn_id, payload,
+                )
+                anchor_log = {
+                    "turn_id": turn_id,
+                    "generation": generation,
+                    "user_silence_monotonic": pending_anchor["user_silence_monotonic"],
+                    "user_silence_wall_time": pending_anchor["user_silence_wall_time"],
+                    "superseded_generation": (
+                        superseded_anchor.get("generation")
+                        if isinstance(superseded_anchor, dict) else None
+                    ),
+                    "superseded_turn_id": (
+                        superseded_anchor.get("turn_id")
+                        if isinstance(superseded_anchor, dict) else None
+                    ),
+                }
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self.log(
+                        "SCHEDULER_ANCHOR_DEFERRED", **anchor_log,
+                    ))
+                except RuntimeError:
+                    pass
+            else:
+                self._pending_silence_anchor = None
+                generation = self.scheduler.arm(
+                    now=time.monotonic(),
+                    wall_time=(payload.get("occurred_at")
+                               if isinstance(payload.get("occurred_at"), (int, float))
+                               else None),
+                    turn_id=turn_id,
+                )
             try:
                 loop = asyncio.get_running_loop()
                 for window in superseded_windows:
@@ -1833,12 +2247,13 @@ class AgentEpisodeRuntime:
                         resolution="superseded_by_new_generation",
                         reason=kind,
                     ))
-                loop.create_task(self.log(
-                    "SCHEDULER_ARMED",
-                    turn_id=turn_id,
-                    anchor_time=payload.get("occurred_at"),
-                    generation=generation,
-                ))
+                if not self.defer_silence_until_output:
+                    loop.create_task(self.log(
+                        "SCHEDULER_ARMED",
+                        turn_id=turn_id,
+                        anchor_time=payload.get("occurred_at"),
+                        generation=generation,
+                    ))
             except RuntimeError:
                 pass
         await self.log(kind, **({"text": text} if text is not None else {}), **payload)
@@ -2009,6 +2424,15 @@ class AgentEpisodeRuntime:
             and self._pending_transcript_turn_id
         ):
             source_turn_id = self._pending_transcript_turn_id
+        if candidate is None and self.defer_silence_until_output:
+            final_input_dispatch = bool(
+                {"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"}.intersection(kinds)
+            )
+            recovery_or_retry = bool(recovery or "LLM_RETRY" in kinds)
+            if final_input_dispatch or recovery_or_retry:
+                self._bind_pending_silence_request(
+                    identity, source_turn_id, allow_rebind=recovery_or_retry,
+                )
         system_check_id = None
         if candidate is not None:
             system_check_id = f"system-check-{uuid4().hex}"
@@ -2394,8 +2818,14 @@ class AgentEpisodeRuntime:
             dispatch_context.get("system_check_id")
             if self._is_system_check_context(dispatch_context) else None
         )
+        settle_pending_silence = False
+        step_outcome = None
         try:
             step_outcome = request.result()
+            settle_pending_silence = step_outcome in {
+                "completed", "system_check_stale", "terminal_failure",
+                "recovery_exhausted",
+            }
             if recovery and recovery_signal is not None:
                 await self.log(
                     "LLM_RECOVERY_COMPLETED" if step_outcome == "completed" else "LLM_RECOVERY_FAILED",
@@ -2429,6 +2859,7 @@ class AgentEpisodeRuntime:
                 attempts = self._transport_retry_attempts_by_turn.get(retry_key, 0)
                 limit = int(getattr(self.provider, "transport_retry_limit", 2))
                 if attempts >= limit:
+                    settle_pending_silence = True
                     await self.log("LLM_TRANSPORT_RETRY_EXHAUSTED", identity=identity,
                                    turn_id=source_turn_id, attempts=attempts, limit=limit)
                     await self.emit("error", {
@@ -2455,12 +2886,18 @@ class AgentEpisodeRuntime:
                     if self.queue.empty():
                         self.queue.put_nowait(True)
             else:
+                settle_pending_silence = True
                 self.backoff_step = 0
                 self.backoff_until = 0.0
             latest = self.inputs.get(source_turn_id or "", {})
             if latest.get("final") and not self.output.active and not retryable:
                 await self._emit_turn_settled(identity, source_turn_id, "agent_error")
         finally:
+            if settle_pending_silence:
+                await self._settle_pending_silence_after_request(
+                    identity, source_turn_id,
+                    step_outcome or "request_settled",
+                )
             active_request_duration_ms = (
                 round(max(0.0, time.monotonic() - self.request_started_at) * 1000, 3)
                 if self.request_started_at is not None else None
@@ -4110,6 +4547,7 @@ class AgentEpisodeRuntime:
         if speech_id in self._completed_speech_ids:
             return
         self._completed_speech_ids.add(speech_id)
+        self._forget_speech_transaction(record)
         if len(self._completed_speech_ids) > self.options.output_limit * 4:
             self._completed_speech_ids = set(list(self._completed_speech_ids)[-self.options.output_limit * 2:])
         system_context = self._system_check_speeches.pop(speech_id, None)
@@ -4212,6 +4650,8 @@ class AgentEpisodeRuntime:
         if old:
             self.registry.cancel_turn(old)
         self.pending.clear()
+        self._pending_silence_anchor = None
+        self._speech_transactions_by_request.clear()
         self._immediate_system_check = None
         self._system_check_speeches.clear()
         self._system_check_turn_ids.clear()

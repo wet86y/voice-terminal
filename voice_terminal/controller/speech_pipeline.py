@@ -626,6 +626,7 @@ class SpeechPipeline:
                 try:
                     await self.player.wait_until_output_complete(timeout_seconds=playback_timeout)
                     ws.timings["playback_output_complete"] = True
+                    ws.timings["playback_output_completed_at"] = time.monotonic()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
