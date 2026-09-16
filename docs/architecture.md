@@ -33,6 +33,12 @@ EpisodeSpeechOutput` 构成。Shadow 是同一会话持有的认知执行平面�
 - system-check 与 final-silence 禁止任何 action。
 - 完整 decision 通过本地校验后才后台 wake；主决策和语音输出不等待 Shadow。
 
+主语音状态的决策先回答“是否需要变更当前语音队列”：`wait` 是正常调用中的通用队列不变更
+决策，适用于没有新内容、现有语音仍正确、内容已经传达、Shadow 只是状态或事件已经过时等情况；
+`speak` 只用于仍相关且尚未传达的新内容；`cancel` 仅用于必须停止现有待播/播放内容且没有
+可立即替换文本的情况。`continuation_allowed` 不表示需要重播 `target_text`，没有新增后缀时
+必须 `wait`。KWS 等明确要求确认的系统场景是显式例外。
+
 ## 单一 ShadowRuntime
 
 每个 session 只有一个 `ShadowRuntime`、一个活动 runner 和一份私有 committed trace。
@@ -90,14 +96,19 @@ ledger reset 增加 source epoch 并从 revision 0 重新开始。Shadow 的 cac
   并结束本次 activation。
 
 `progress` 和 `status` 覆盖可见状态；`observation`、`user_input_required`、`result`、`failed`
-进入主语义 ledger。除 progress 外，事件进入现有 400ms mailbox；主 LLM决定 speak 或 wait。
+进入主语义 ledger。除 progress 外，事件进入现有 400ms mailbox；`status` 保持 normal wake，
+由心跳交给主 LLM 重新评估。事件文本是异步参考资料而不是播报指令，可能晚于最新会话状态；
+主 LLM 必须结合最新用户输入、assistant 历史和 `runtime.speak` 自行决定 `speak`、`wait` 或
+`cancel`，不得重复已经传达或当前队列已经覆盖的内容。
 
 ## StatusObserver
 
 每 5 个成功提交的 Shadow provider response 触发一次无状态只读观察。Observer 使用 committed
 prefix 的不可变快照，`reasoning_effort=none`、`tools=[]`、`max_output_tokens=512`，不设本地请求 timeout；
-只返回 80～160 字工作简报。它不计入 Shadow model step、不写回 trace、不阻塞主循环；同时只有
-一个请求，重复触发合并。activation 已结束、reset/close 或已有更新状态时丢弃迟到摘要。
+只返回 80～160 字工作简报，内容只陈述已确认事实、正在核实事项和实际阻塞，不得建议主助手
+说什么、询问什么、调用什么动作或选择何种语音状态。它不计入 Shadow model step、不写回 trace、
+不阻塞主循环；同时只有一个请求，重复触发合并。`status` 仍通过 normal heartbeat 送入主 LLM，
+但不因此自动要求语音输出。activation 已结束、reset/close 或已有更新状态时丢弃迟到摘要。
 
 ## 缓存与换代压缩
 

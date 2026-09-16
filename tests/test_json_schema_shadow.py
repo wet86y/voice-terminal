@@ -55,6 +55,12 @@ def test_prompt_matches_required_responses_wire_contract_and_has_short_examples(
     assert "state=cancel 或 state=wait 时 text 必须为 \"\"" in PROMPT
     assert '{"speak":{"state":"speak","emotion":"calm","text":"好的。"},"actions":[]}' in PROMPT
     assert '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}' in PROMPT
+    assert "state=wait 表示判断无需变更当前语音队列" in PROMPT
+    assert "任何正常调用都可以使用 wait" in PROMPT
+    assert "单纯无需新增播报、队列无需变化或队列为空时必须 wait，不能 cancel" in PROMPT
+    assert "绝不能把 target_text 原样作为新的 speak.text" in PROMPT
+    assert "收到它们不等于必须 speak" in PROMPT
+    assert "相关性、时效性、可靠性、是否已经表达" in PROMPT
     assert "emotion 可省略" not in PROMPT
     assert "不得带 text" not in PROMPT
 

@@ -24,7 +24,9 @@ from voice_terminal.shadow_agent import (
 )
 from voice_terminal.shadow_agent.events import ShadowEventBuffer
 from voice_terminal.shadow_agent.component import _EventRelay
+from voice_terminal.shadow_agent.contracts import shadow_control_tool_definitions
 from voice_terminal.shadow_agent.provider import ShadowProviderResponse
+from voice_terminal.shadow_agent.prompts import STATUS_OBSERVER_PROMPT
 from voice_terminal.server.product import ShadowProductProjection
 
 
@@ -74,12 +76,25 @@ def test_request_shadow_contract_is_content_free_and_strict():
     definition = request_shadow_action_definition()
     assert definition["name"] == "request_shadow"
     assert definition["parameters"]["properties"] == {"request": {"type": "boolean", "const": True}}
+    assert "不表示当前必须向用户说话" in definition["description"]
     assert parse_shadow_wake({"request": True}) is True
     for invalid in ({}, {"request": False}, {"request": True, "text": "x"}, True):
         with pytest.raises(ValueError):
             parse_shadow_wake(invalid)
     assert VoiceShadowRegistry(available=False).action_definitions() == []
     assert VoiceShadowRegistry(available=True).action_definitions() == [definition]
+
+
+def test_shadow_event_prompts_report_facts_without_directing_main_speech():
+    publish = next(
+        item for item in shadow_control_tool_definitions()
+        if item["name"] == "publish_main_event"
+    )
+    assert "只陈述事实及不确定性" in publish["description"]
+    assert "不得指示主助手" in publish["description"]
+    assert "不得建议或指示主助手说什么" in STATUS_OBSERVER_PROMPT
+    assert "下一步向用户" in STATUS_OBSERVER_PROMPT
+    assert "准确区分已完成、正在进行、下一步和阻塞" not in STATUS_OBSERVER_PROMPT
 
 
 def test_configuration_exposes_unlimited_shadow_execution_defaults():
