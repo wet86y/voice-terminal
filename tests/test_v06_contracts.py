@@ -17,6 +17,8 @@ from voice_terminal.agent.options import AgentOptions
 from voice_terminal.agent.sentences import SentenceStore, map_refinement
 from voice_terminal.config import AppConfig, load_config
 from voice_terminal.controller.episode_output import EpisodeSpeechOutput, SpeechHandle
+from voice_terminal.controller.episode_controller import EpisodeController
+from voice_terminal.controller.realtime_controller import RealtimeController
 from voice_terminal.controller.speech_pipeline import SpeechPipeline
 from voice_terminal.core.state import RuntimeState
 from voice_terminal.audio.player import PlaybackSnapshot
@@ -305,6 +307,49 @@ def test_passive_speech_activity_keeps_llm_and_thinking_state_alive():
                 await asyncio.gather(runtime.voice_activation_task, return_exceptions=True)
             request.cancel()
             await asyncio.gather(request, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_stopping_listening_does_not_cancel_the_episode_output_scope(monkeypatch):
+    async def scenario():
+        calls = []
+
+        class Episode:
+            closed = False
+
+            async def speech_activity(self, speaking, **kwargs):
+                calls.append(("speech_activity", speaking, kwargs))
+
+            async def stop(self):
+                raise AssertionError("stopping input must not close the Agent episode")
+
+        class Tts:
+            async def close(self):
+                raise AssertionError("stopping input must not close the shared TTS client")
+
+        async def cancel_prewarm(*_args, **_kwargs):
+            calls.append(("cancel_prewarm",))
+
+        async def base_stop(self):
+            calls.append(("base_stop",))
+
+        monkeypatch.setattr(RealtimeController, "stop_listening", base_stop)
+        controller = object.__new__(EpisodeController)
+        controller.state = SimpleNamespace(listening=True)
+        controller.workspace = None
+        controller.episode = Episode()
+        controller.tts = Tts()
+        controller._cancel_tts_prewarm = cancel_prewarm
+
+        await EpisodeController.stop_listening(controller)
+
+        assert controller.state.listening is False
+        assert calls == [
+            ("speech_activity", None, {}),
+            ("cancel_prewarm",),
+            ("base_stop",),
+        ]
 
     asyncio.run(scenario())
 

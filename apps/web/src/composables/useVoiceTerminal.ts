@@ -933,13 +933,10 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       startPerceptualLatency(turnId ?? currentTurnId.value)
     }
     if (payload.listening === false && payload.state === 'IDLE') {
-      // Preserve the last completed value when the user stops the session;
-      // only an in-flight measurement should be cancelled here.
+      // Stopping the microphone is not an output cancellation boundary. The
+      // LLM/TTS queue is an independent FIFO and must remain visible and
+      // continue settling after input capture has stopped.
       cancelPerceptualLatency()
-      playbackQueue.value = []
-      lastPlayback.value = null
-      speechProgress.value = null
-      terminalPlaybackKeys.clear()
     }
   }
 

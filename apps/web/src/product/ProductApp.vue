@@ -87,6 +87,10 @@ const currentDocument = computed(() => personaItems.find(item => item.id === act
 const hasConversation = computed(() => conversation.value.length > 0
   || speechOutputs.value.length > 0
   || Boolean(current.value.partial_text || current.value.final_text || current.value.assistant_text || current.value.tts_text))
+// recentTurns is maintained newest-first by the terminal adapter.  The
+// conversation rail is a chat surface, so render the copy oldest-first and
+// keep the newest entry at the visual tail.
+const orderedConversation = computed(() => [...conversation.value].reverse())
 const standaloneSpeechOutputs = computed(() => speechOutputs.value.filter(output => (
   typeof output.text === 'string' && output.text.trim()
   && !conversation.value.some(record => record.turn_id === output.turn_id)
@@ -163,6 +167,33 @@ watch(shadowActivities, async () => {
   const element = shadowScrollElement.value
   if (element) element.scrollTop = element.scrollHeight
 }, { deep: true })
+
+const conversationScrollElement = ref<HTMLElement | null>(null)
+let conversationFollowTail: boolean | null = null
+
+function captureConversationScrollPosition() {
+  const element = conversationScrollElement.value
+  if (!element) return
+  conversationFollowTail = element.scrollHeight - element.scrollTop - element.clientHeight < 24
+}
+
+watch(
+  [conversation, speechOutputs, playbackQueue,
+    () => current.value.final_text, () => current.value.partial_text, () => current.value.assistant_text],
+  async () => {
+    const elementBeforeUpdate = conversationScrollElement.value
+    if (conversationFollowTail === null && elementBeforeUpdate) {
+      conversationFollowTail = elementBeforeUpdate.scrollHeight
+        - elementBeforeUpdate.scrollTop - elementBeforeUpdate.clientHeight < 24
+    }
+    if (!conversationFollowTail) return
+    await nextTick()
+    if (!conversationFollowTail) return
+    const element = conversationScrollElement.value
+    if (element) element.scrollTop = element.scrollHeight
+  },
+  { deep: true },
+)
 
 const shadowLastActivityAt = computed(() => (
   shadow.value.last_activity_at
@@ -844,10 +875,10 @@ function pageLabel() {
 
       <section class="conversation-column panel">
         <header class="conversation-header"><div><p class="panel-kicker">实时会话</p><h1>{{ hasConversation ? '当前 Voice Terminal 会话' : '准备开始真实对话' }}</h1></div><div class="session-security"><span class="lock-icon">⌁</span><span>本机处理</span></div></header>
-        <div class="conversation-stream" :class="{ empty: !hasConversation }">
+        <div ref="conversationScrollElement" class="conversation-stream" :class="{ empty: !hasConversation }" @scroll="captureConversationScrollPosition">
           <div v-if="!hasConversation" class="empty-conversation"><span class="empty-mark">✦</span><strong>{{ runtimeState === 'error' ? '语音服务需要检查' : runtimeState === 'offline' ? '后端离线，页面仍可重试' : '等待真实语音输入' }}</strong><p>{{ runtimeState === 'offline' ? (lastError || '确认 Voice Server 已启动后点击重试。') : '语音、转写、助手回复和 TTS 进度会从真实运行时进入这里。' }}</p><button v-if="runtimeState === 'offline'" class="outline-button" type="button" @click="retry">重试连接</button></div>
-          <template v-else>
-            <template v-for="record in conversation" :key="record.turn_id">
+          <div v-else class="conversation-stack">
+            <template v-for="record in orderedConversation" :key="record.turn_id">
               <article class="message user-message"><div class="message-meta"><span class="avatar user-avatar">你</span><span>你</span><time>{{ formatTime(record.completed_at) }}</time></div><p>{{ record.transcript || '（没有可显示的转写）' }}</p><span class="message-status">{{ record.status || record.delivery?.status || '已记录' }}</span></article>
               <template v-if="hasSpeechTrackForTurn(record.turn_id)">
                 <article v-for="output in speechOutputsForTurn(record.turn_id)" :key="`speech-${output.conversation_id}-${output.speech_id}`" class="message assistant-message speech-history" :class="[{ speaking: speechOutputIsPlaying(output) }, `speech-${speechOutputStatusKey(output)}`]">
@@ -877,7 +908,7 @@ function pageLabel() {
             <div v-if="current.partial_text" class="live-asr"><span class="live-dot"></span><span>实时识别</span><p>{{ current.partial_text }}</p><span class="typing-bars"><i></i><i></i><i></i></span></div>
             <div v-if="runtimeState === 'thinking' && !current.assistant_text" class="assistant-pending"><span><i></i><i></i><i></i></span>正在准备回复</div>
             <article v-if="current.assistant_text && !conversation.some(item => item.response === current.assistant_text) && !currentTurnHasSpeechTrack" class="message assistant-message" :class="{ speaking: runtimeState === 'speaking' }"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ runtimeState === 'speaking' ? '正在播报' : '本轮' }}</time></div><p>{{ current.assistant_text }}</p><div class="speech-queue"><span class="queue-dot" :class="{ playing: runtimeState === 'speaking' }"></span>{{ runtimeState === 'speaking' ? '正在播放真实 TTS · 随时可以打断' : current.tts_status || '等待播报结算' }}</div></article>
-          </template>
+          </div>
         </div>
         <footer class="panel-resource-footer conversation-footer"><div><span class="footer-mic"><i></i>{{ waitingForWake ? 'KWS 正在监听唤醒词' : listening ? '正在聆听你的声音' : connected ? '语音由本机服务处理' : '等待本机 Voice Server' }}</span><span>无输入框 · 通过语音继续 · {{ pageLabel() }}</span></div><section class="resource-metrics conversation-resource-metrics" aria-label="模型资源概览"><div class="resource-meter context-meter" tabindex="0" role="img" :aria-label="conversationContextTooltip" :data-tooltip="conversationContextTooltip"><span>上下文占用</span><strong>{{ formatTokens(conversationContext?.usedTokens) }}<small v-if="conversationContext?.limitTokens != null"> / {{ formatTokens(conversationContext.limitTokens) }}</small></strong><i :class="{ 'meter-empty': conversationContext?.usagePercent == null }"><b :style="{ width: `${contextPercent(conversationContext?.usagePercent)}%` }"></b></i><em>{{ conversationContext?.usagePercent ?? '—' }}<span v-if="conversationContext?.usagePercent != null">%</span></em></div><div class="resource-meter cache-rate-number" tabindex="0" role="img" :aria-label="conversationCacheHitRatio === null ? '缓存命中率暂无数据' : `缓存命中率 ${Math.round(conversationCacheHitRatio * 100)}%`" :data-tooltip="conversationCacheHitRatio === null ? '缓存命中率 · 暂无数据' : `缓存命中率 · ${Math.round(conversationCacheHitRatio * 100)}%`"><strong>{{ conversationCacheHitRatio === null ? '—' : `${Math.round(conversationCacheHitRatio * 100)}%` }}</strong></div></section></footer>
       </section>

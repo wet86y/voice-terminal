@@ -53,7 +53,7 @@ result、failed 进入唯一 heartbeat 邮箱。Shadow 不设 activation 总墙�
 不终止长期工作。reset、close、
 取消、provider 协议终止和外部服务本身的限制仍然有效。
 
-`session.stop` 只停止语音 episode，Shadow 继续并缓存重要事件；`session.reset` 清空 Shadow
+`session.stop` 只停止语音输入，已经进入 Agent/LLM/TTS 队列的输出继续完成并保留在对话历史中，Shadow 继续并缓存重要事件；`session.reset` 清空 Shadow
 trace/status、轮换上下文 epoch 与 OpenCode session header；runtime close 关闭所有资源。
 
 ## 思考模式与输出
