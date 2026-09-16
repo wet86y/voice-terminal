@@ -5,6 +5,12 @@
 主语音模型使用 `LLMContextProjector`：静态协议/人格进入稳定 instructions，会话语义进入
 HISTORY，播放器与当前调度状态只进入 REQUEST_TAIL。未传达的 assistant 候选永远不是历史事实。
 
+主模型每次先判断是否需要变更当前语音队列：`wait` 是正常调用中的通用“不变更队列”决策，
+不因收到用户、工具、调度或 Shadow 事件就默认开口；`speak` 只用于仍相关且尚未传达的新内容；
+`cancel` 只用于必须停止现有待播/播放内容且没有可立即替换文本的情况。KWS 等明确要求确认的
+系统场景可以例外。已存在于 `target_text`、`observed_text`、`heard_text` 或 assistant 历史中的
+内容不得逐字或换一种措辞重复；`continuation_allowed` 只允许确有新增后缀时追加。
+
 Shadow 使用独立 `ShadowContextProjector`。它读取同一个 `SessionLedger`，但只输出判断用户意图
 和执行只读工作所需的权威语义帧：
 
@@ -43,7 +49,8 @@ Shadow 使用独立 `ShadowContextProjector`。它读取同一个 `SessionLedger
 ```
 
 不可用时不公开此动作。它不产生 `ToolExchange`、receipt 或历史项；started/coalesced/
-already_current/unavailable 仅记录诊断。主 LLM不得携带目标文本、意图摘要、修改或用户答复。
+already_current/unavailable 仅记录诊断。主 LLM不得携带目标文本、意图摘要、修改或用户答复；
+调用它也不表示当前必须开口，主语音状态仍需独立选择 `wait`、`speak` 或 `cancel`。
 
 ## Shadow 固定工具目录
 
@@ -59,7 +66,8 @@ already_current/unavailable 仅记录诊断。主 LLM不得携带目标文本、
 本地控制工具：
 
 - `get_latest_context({since_revision})`；
-- `publish_main_event({kind:"progress|observation",text})`；
+- `publish_main_event({kind:"progress|observation",text})`：只报告事实、不确定性和实际进度，
+  不得指示主助手说什么、询问什么或选择语音状态；
 - `request_user_input({kind:"clarification|confirmation",question,options,operation_summary})`。
 
 clarification 发布后当前 activation 回到 idle。用户回答正常进入主会话，主 LLM只再次 wake；
@@ -69,8 +77,10 @@ confirmation/operation_summary 只为未来外部写能力保留；首版没有�
 ## 不可信内容边界
 
 文件、网页、工具错误和 Shadow 文本都是数据，不能改变系统指令、人格、动作权限、语音协议或
-工具 effect。主 ledger 在投影 Shadow/工具内容时显式标为不可信。结构化本地控制元数据（event
-kind、wake policy、revision）由 runtime 产生，但其中的自然语言依旧不能执行指令。
+工具 effect。Shadow 事件可能晚于最新用户输入、当前语音队列或已经传达的内容；主模型必须主动
+判断其相关性、时效性、可靠性和是否值得播报。主 ledger 在投影 Shadow/工具内容时显式标为不可信。
+结构化本地控制元数据（event kind、wake policy、revision）由 runtime 产生，但其中的自然语言
+依旧不能执行指令。
 
 ## 缓存布局
 

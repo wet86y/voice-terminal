@@ -20,13 +20,18 @@ python -m pytest -q tests/test_opencode_go_shadow_e2e.py
 - provider、工具后和 result 前均执行 freshness gate；stale 工具为 `not_executed`，stale final 不发布；
 - clarification 不使用 question ID/reply/waiter；用户回答依靠完整上下文继续；
 - 每 5 个 committed response 触发一个无工具、无思考 Observer；迟到摘要被丢弃；
+- Observer/status 文本只报告事实和状态，不向主助手下达播报指令；status 仍经 normal heartbeat
+  唤醒主 LLM，由主 LLM 自行判断 `wait`、`speak` 或 `cancel`；
+- 正常请求默认允许 `wait` 表示语音队列无需变更；重复 `target_text`、`heard_text` 或 assistant
+  历史必须被禁止，`cancel` 仅用于必须停止现有语音且没有替代文本的情况；
 - 80% token 阈值在安全边界换代，失败不丢失旧 trace；
 - 20+ Responses/tool 循环没有 task ID、并行 runner 或结果自反馈；
 - stop 保留 Shadow，reset/close 清理，Shadow 故障不破坏语音。
 
 真实 provider 验收应从 `SessionRuntime.start_listening()` 的生产装配进入，允许把 ASR/TTS 替换为
 文本边界 fake，但不得直接调用 runtime 私有方法冒充端到端结果。至少覆盖：查询中改口、补充筛选、
-长期 10+ 步状态简报、observation 并行播报、clarification 回合、stop 后事件缓存和 reset 隔离。
+正常 heartbeat 下 status 触发但主模型选择 wait、长期 10+ 步状态简报、observation 并行播报、
+clarification 回合、stop 后事件缓存和 reset 隔离。
 
 ## Shadow 观测与缓存
 

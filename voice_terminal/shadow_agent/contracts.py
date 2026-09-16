@@ -73,7 +73,10 @@ def parse_shadow_wake(value: Any) -> bool:
 def request_shadow_action_definition() -> dict[str, Any]:
     return {
         "name": "request_shadow",
-        "description": "让独立影子 Agent 同步最新完整会话上下文，并推进当前仍需处理的工作。",
+        "description": (
+            "让独立影子 Agent 在后台同步最新完整会话上下文并推进当前仍需处理的工作。"
+            "调用此动作不表示当前必须向用户说话；主语音状态仍需独立选择 wait、speak 或 cancel。"
+        ),
         "parameters": {
             "type": "object",
             "additionalProperties": False,
@@ -97,7 +100,10 @@ def shadow_control_tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "type": "function", "name": "publish_main_event",
-            "description": "向主助手发布可覆盖的进度或具有会话意义的新发现。",
+            "description": (
+                "向主助手发布可覆盖的事实性进度或具有会话意义的新发现。"
+                "text 只陈述事实及不确定性，不得指示主助手说什么、询问什么或选择何种语音状态。"
+            ),
             "parameters": {
                 "type": "object", "additionalProperties": False, "required": ["kind", "text"],
                 "properties": {
