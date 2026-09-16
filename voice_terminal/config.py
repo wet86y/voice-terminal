@@ -302,6 +302,7 @@ class ShadowStatusObserverConfig:
 class ShadowAgentConfig:
     enabled: bool = True
     debug_websocket_enabled: bool = False
+    experimental_context_gate_enabled: bool = False
     provider: ShadowProviderConfig = field(default_factory=ShadowProviderConfig)
     tools: ShadowToolsConfig = field(default_factory=ShadowToolsConfig)
     max_context_tokens: int = 524288
@@ -479,6 +480,9 @@ class AppConfig:
             shadow_agent=ShadowAgentConfig(
                 enabled=_bool(shadow.get("enabled"), True),
                 debug_websocket_enabled=_bool(shadow.get("debug_websocket_enabled"), False),
+                experimental_context_gate_enabled=_bool(
+                    shadow.get("experimental_context_gate_enabled"), False,
+                ),
                 provider=ShadowProviderConfig(
                     base_url=_string(shadow_provider.get("base_url"), llm_base_url),
                     model=_string(shadow_provider.get("model"), llm_model),

@@ -60,6 +60,7 @@ export const productApi = {
   snapshot: () => request<ProductSnapshot>('/api/v1/product/snapshot'),
   saveWake: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/wake', jsonBody(value)),
   saveSilence: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/silence', jsonBody(value)),
+  saveShadow: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/shadow', jsonBody(value)),
   savePersona: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/persona', jsonBody(value)),
   registry: () => request<ProductSnapshot['models']>('/api/v1/models/registry'),
   scanModels: () => request<ProductSnapshot['models']>('/api/v1/models/scan', { method: 'POST' }),

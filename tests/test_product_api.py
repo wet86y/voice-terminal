@@ -100,6 +100,21 @@ class ProductApiTests(unittest.TestCase):
         self.assertEqual(valid_wake.json()["effective_from"], "next_session")
         self.assertTrue(valid_wake.json()["pending"])
 
+        invalid_shadow = asyncio.run(self._request(
+            "PUT", "/api/v1/product/settings/shadow",
+            json={"experimental_context_gate_enabled": True, "extra": False},
+        ))
+        self.assertEqual(invalid_shadow.status_code, 422)
+
+        valid_shadow = asyncio.run(self._request(
+            "PUT", "/api/v1/product/settings/shadow",
+            json={"experimental_context_gate_enabled": True},
+        ))
+        self.assertEqual(valid_shadow.status_code, 200)
+        self.assertEqual(valid_shadow.json()["effective_from"], "immediate")
+        self.assertFalse(valid_shadow.json()["pending"])
+        self.assertTrue(valid_shadow.json()["settings"]["shadow"]["experimental_context_gate_enabled"])
+
         valid_persona = asyncio.run(self._request(
             "PUT", "/api/v1/product/settings/persona",
             json={

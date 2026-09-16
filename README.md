@@ -14,9 +14,9 @@ Shadow Agent、TTS、播放和后端诊断指标由 Voice Server 管理。
                     └→ request_shadow({"request": true})
                                   │
                                   ▼
-                    最新权威上下文 → ShadowRuntime
-                                      ├→ READ_ONLY tools
-                                      └→ ShadowEvent → 400ms heartbeat → 主 LLM
+                    最新权威上下文 → ShadowRuntime ─→ READ_ONLY tools
+                                      ├→ status/progress/activity → 产品 UI
+                                      └→ 语义事件 → 400ms heartbeat → 主 LLM
 ```
 
 主语音链只有一个 `AgentDecisionScheduler` 和一个 provider 请求循环。400ms mailbox、Speech
@@ -34,13 +34,19 @@ decision 校验后异步调用固定动作 `request_shadow({"request":true})`。
 请求或已开始的只读工具。在下一个安全边界追加无损上下文 delta 和意图重判提示；尚未开始的
 旧工具返回 `conversation_context_updated`，任何 stale final 都不能发布。
 
+实验性上下文门禁默认关闭。开启后，运行中的 wake 会让侧载模型只判断本次尚未可见的连续
+revision 区间应立即注入还是暂缓一次；暂缓不会删除或改写正文，下一次 wake 会重新判断包含
+此前暂缓内容在内的完整区间。空闲启动、侧载异常和关闭开关均无损直通。当前 activation 尚无
+状态摘要时，本次正文直接进入，同时后台强制生成一次摘要供下一次判断使用。
+
 Shadow 固定拥有只读文件/搜索业务工具以及三个本地控制端口：主动读取最新上下文、发布
 progress/observation、请求 clarification。用户答复正常进入会话后，主 LLM只再次 wake，Shadow
 从用户原话继续理解，不使用 question ID 或 reply action。副作用工具 effect 仅保留契约，首版
 executor 拒绝所有非 `READ_ONLY` 能力。
 
-每 5 个已提交 Shadow model response 会并行触发无思考、无工具的状态观察器。简报通过正常
-heartbeat 进入主 LLM，主模型可以自然播报或 wait。Shadow 不设 activation 总墙钟、步骤、工具
+每 5 个已提交 Shadow model response 会并行触发无思考、无工具的状态观察器。简报与
+status/progress/activity 只更新产品 UI，不触发主 LLM；只有 observation、user_input_required、
+result、failed 进入唯一 heartbeat 邮箱。Shadow 不设 activation 总墙钟、步骤、工具
 调用轮次、工具调用次数或本地 provider timeout；transport retry 也不设次数上限。每次文件或
 搜索工具执行最多运行 15 秒。默认在 524288 token 预算的 80% 处生成稳定摘要并切换 cache epoch，
 不终止长期工作。reset、close、
@@ -82,6 +88,7 @@ Agent 每轮返回必填 `{"speak":{"state":"speak|cancel|wait","emotion":"...",
 shadow_agent:
   enabled: true
   debug_websocket_enabled: false
+  experimental_context_gate_enabled: false
   max_context_tokens: 524288
   compaction_threshold_ratio: 0.80
   provider:
@@ -113,6 +120,9 @@ shadow_agent:
 `start.ps1` 会依次准备 Analysis、ASR、Web 前端和 Voice Server，并确认
 `http://127.0.0.1:5173/` 可访问。仅调试后端时使用 `-NoWeb`。真实运行需配置
 `DEEPSEEK_API_KEY`、`MINIMAX_API_KEY`，OpenCode Go 调试另需 `OPENCODE_GO_API_KEY`。
+默认 Voice Server 地址为 `http://127.0.0.1:8765/`；可用 `/health` 检查
+`shadow_agent`、`analysis`、`asr`、`llm` 和 `tts` 服务状态。产品页设置中的“实验性 Shadow
+上下文门禁”也可通过 `PUT /api/v1/product/settings/shadow` 即时切换，服务无需重启。
 
 ### Web 产品页与日志回放
 

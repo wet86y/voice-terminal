@@ -20,7 +20,13 @@ from .contracts import (
     shadow_control_tool_definitions,
 )
 from ..core.events import utc_now_iso
-from .prompts import COMPACTION_PROMPT, INTENT_REASSESSMENT_PROMPT, STATUS_OBSERVER_PROMPT
+from .prompts import (
+    COMPACTION_PROMPT,
+    CONTEXT_GATE_PROMPT,
+    FORCED_STATUS_OBSERVER_PROMPT,
+    INTENT_REASSESSMENT_PROMPT,
+    STATUS_OBSERVER_PROMPT,
+)
 from .provider import ShadowProvider, ShadowProviderError, ShadowProviderResponse
 from .tools import ShadowToolExecutor
 
@@ -71,9 +77,16 @@ class ShadowStatusObserver:
         self.max_output_tokens = max_output_tokens
         self.timeout_ms = timeout_ms
 
-    async def summarize(self, trace: Sequence[dict[str, Any]], complete: Callable[..., Any]) -> str:
+    async def summarize(
+        self, trace: Sequence[dict[str, Any]], complete: Callable[..., Any], *, forced: bool = False,
+    ) -> str:
         response = await complete(
-            input_items=[*trace, {"role": "system", "content": STATUS_OBSERVER_PROMPT}],
+            input_items=[
+                *trace,
+                {"role": "system", "content": (
+                    FORCED_STATUS_OBSERVER_PROMPT if forced else STATUS_OBSERVER_PROMPT
+                )},
+            ],
             tools=[], reasoning_effort="none", max_output_tokens=self.max_output_tokens,
             timeout_ms=self.timeout_ms, retry=False,
         )
@@ -162,7 +175,9 @@ class ShadowRuntime:
         self._last_processed_revision = -1
         self._activation_serial = 0
         self._observer_pending = False
+        self._observer_force_pending = False
         self._last_status_trace_revision = 0
+        self._last_status_activation_serial = 0
         self._compaction_retry_pending = False
         self._pending_since: float | None = None
         self._closed = False
@@ -175,10 +190,27 @@ class ShadowRuntime:
         # activity items for the product UI.
         self._provider_activity_items: dict[str, str] = {}
         self._provider_activity_item_streams: dict[str, str] = {}
+        # Raw provider reasoning is never a product event or committed trace.
+        # This bounded, per-attempt tap only lets an on-demand status observer
+        # describe a long-running request before response.completed arrives.
+        self._reasoning_stream_tail = ""
+        self._provider_attempt_started_at: float | None = None
+        self._last_reasoning_delta_at: float | None = None
 
     @property
     def available(self) -> bool:
         return not self._closed
+
+    @property
+    def activation_serial(self) -> int:
+        return self._activation_serial
+
+    @property
+    def has_current_summary(self) -> bool:
+        return bool(
+            self.latest_visible_status is not None
+            and self._last_status_activation_serial == self._activation_serial
+        )
 
     def reload_instructions(self) -> None:
         """Reload the allowlisted Shadow persona at an idle session boundary."""
@@ -394,6 +426,10 @@ class ShadowRuntime:
                 )
             self._provider_activity_items = {}
             self._provider_activity_item_streams = {}
+            if activity_mode == "main":
+                self._reasoning_stream_tail = ""
+                self._provider_attempt_started_at = started
+                self._last_reasoning_delta_at = None
 
             async def on_stream(event: dict[str, Any]) -> None:
                 self._handle_provider_activity(
@@ -411,7 +447,7 @@ class ShadowRuntime:
                 }
                 if max_output_tokens is not None:
                     kwargs["max_output_tokens"] = max_output_tokens
-                if activity_mode and self.on_activity is not None:
+                if activity_mode and (self.on_activity is not None or activity_mode == "main"):
                     kwargs["on_stream"] = on_stream
                 call = self._provider_call(self.provider, kwargs)
                 deadline_ms = timeout_ms if timeout_ms is not None else self.provider_timeout_ms
@@ -428,11 +464,19 @@ class ShadowRuntime:
                         activity_stream, "completed", item_id=attempt_activity_id,
                         text=("可读工作简报已更新" if activity_mode == "thinking" else "模型处理完成"),
                     )
+                if activity_mode == "main":
+                    self._reasoning_stream_tail = ""
+                    self._provider_attempt_started_at = None
+                    self._last_reasoning_delta_at = None
                 return response
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 last = exc
+                if activity_mode == "main":
+                    self._reasoning_stream_tail = ""
+                    self._provider_attempt_started_at = None
+                    self._last_reasoning_delta_at = None
                 retryable = bool(getattr(exc, "retryable", True))
                 will_retry = retryable and (attempt_limit is None or attempt < attempt_limit)
                 if activity_mode:
@@ -517,6 +561,19 @@ class ShadowRuntime:
         """Translate provider lifecycle signals into public-safe activities."""
         kind = event.get("type")
         if not isinstance(kind, str):
+            return
+        if mode == "main" and kind == "response.reasoning_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str) and delta:
+                self._reasoning_stream_tail += delta
+                # Use at most half of the existing observer token budget for
+                # the transient tail.  A one-character-per-token character
+                # cap is deliberately conservative for mixed Chinese/ASCII
+                # streams and avoids a second configuration knob.
+                limit = max(512, self.observer_max_context_tokens // 2)
+                if len(self._reasoning_stream_tail) > limit:
+                    self._reasoning_stream_tail = self._reasoning_stream_tail[-limit:]
+                self._last_reasoning_delta_at = time.monotonic()
             return
         if mode == "thinking":
             # The status observer's output is an intentionally readable
@@ -637,6 +694,7 @@ class ShadowRuntime:
             )
             if kind == "status":
                 self._last_status_trace_revision = self.trace_revision
+                self._last_status_activation_serial = self._activation_serial
         if kind == "user_input_required":
             self.user_input_required = True
         elif kind in {"result", "failed"}:
@@ -787,12 +845,15 @@ class ShadowRuntime:
         ascii_count = sum(ord(char) < 128 for char in raw)
         return max(1, (ascii_count + 3) // 4 + len(raw) - ascii_count)
 
-    def _status_trace_prefix(self, trace: Sequence[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    def _status_trace_prefix(
+        self, trace: Sequence[dict[str, Any]], *, budget: int | None = None,
+    ) -> tuple[dict[str, Any], ...]:
         """Keep only a bounded, committed tail for the independent observer."""
+        token_budget = self.observer_max_context_tokens if budget is None else max(512, budget)
         selected: list[dict[str, Any]] = []
         for item in reversed(trace):
             candidate = [dict(item), *selected]
-            if self._estimate_items_tokens(candidate) > self.observer_max_context_tokens:
+            if self._estimate_items_tokens(candidate) > token_budget:
                 break
             selected = candidate
         return tuple(selected)
@@ -846,20 +907,100 @@ class ShadowRuntime:
             "epoch": self.context_epoch, "before_tokens": before, "after_tokens": self._estimate_tokens(),
         })
 
-    def _schedule_observer(self, serial: int) -> None:
-        if not self.observer_enabled or self.committed_model_steps - self.last_status_step < self.observer_every_steps:
+    def _schedule_observer(self, serial: int, *, force: bool = False) -> None:
+        if (not self.observer_enabled and not force) or (
+            not force
+            and self.committed_model_steps - self.last_status_step < self.observer_every_steps
+        ):
             return
         if self.observer_task is not None and not self.observer_task.done():
             self._observer_pending = True
+            self._observer_force_pending = self._observer_force_pending or force
             return
         self.last_status_step = self.committed_model_steps
         trace = tuple(dict(item) for item in self.working_trace)
         trace_revision = self.trace_revision
         self.observer_task = asyncio.create_task(
-            self._observe(serial, trace, trace_revision), name="shadow-status-observer",
+            self._observe(serial, trace, trace_revision, forced=force), name="shadow-status-observer",
         )
 
-    async def _observe(self, serial: int, trace: tuple[dict[str, Any], ...], trace_revision: int) -> None:
+    def force_observer(self, serial: int | None = None) -> None:
+        """Request one summary even before the first model step commits."""
+        selected = self._activation_serial if serial is None else serial
+        if not self.active or selected != self._activation_serial:
+            return
+        self._metric("observer.force_requested", {"serial": selected})
+        self._schedule_observer(selected, force=True)
+
+    async def classify_context_update(self, update: ShadowContextUpdate) -> dict[str, str]:
+        """Return an injection-timing recommendation without mutating trace."""
+        summary = self.latest_visible_status.text if self.has_current_summary and self.latest_visible_status else ""
+        schema = {
+            "type": "object", "additionalProperties": False,
+            "required": ["timing", "relation", "reason"],
+            "properties": {
+                "timing": {"type": "string", "enum": ["inject_now", "defer_once"]},
+                "relation": {"type": "string", "enum": [
+                    "supplement", "change", "deviation", "guidance",
+                    "irrelevant", "duplicate", "uncertain",
+                ]},
+                "reason": {"type": "string", "maxLength": 240},
+            },
+        }
+        payload = {
+            "shadow_summary": summary,
+            "candidate": {
+                "from_revision": update.from_revision,
+                "to_revision": update.to_revision,
+                "frames": [_frame_payload(frame) for frame in update.frames],
+            },
+        }
+        kwargs: dict[str, Any] = {
+            "instructions": CONTEXT_GATE_PROMPT,
+            "input_items": [
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
+            ],
+            "tools": [], "reasoning_effort": "none", "text_schema": schema,
+            "max_output_tokens": min(256, self.observer_max_output_tokens),
+        }
+        started = time.monotonic()
+        call = self._provider_call(self.status_provider, kwargs)
+        # Unlike the long-running Shadow provider, the timing gate must never
+        # hold authoritative context indefinitely.  Reuse an explicit status
+        # timeout, or apply a bounded 15-second fail-open default.
+        deadline_ms = self.observer_timeout_ms or 15_000
+        response = await asyncio.wait_for(call, deadline_ms / 1000)
+        value = json.loads(_text_from_output(response.output))
+        relations = {
+            "supplement", "change", "deviation", "guidance",
+            "irrelevant", "duplicate", "uncertain",
+        }
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"timing", "relation", "reason"}
+            or value.get("timing") not in {"inject_now", "defer_once"}
+            or value.get("relation") not in relations
+            or not isinstance(value.get("reason"), str)
+            or len(value["reason"]) > 240
+        ):
+            raise ValueError("context gate returned an invalid schema")
+        relation = value["relation"]
+        timing = value["timing"]
+        if relation not in {"irrelevant", "duplicate"}:
+            timing = "inject_now"
+        elif timing != "defer_once":
+            timing = "inject_now"
+        reason = value["reason"]
+        self._metric("context_gate.completed", {
+            "relation": relation, "timing": timing,
+            "latency_ms": round((time.monotonic() - started) * 1000, 2),
+        })
+        return {"timing": timing, "relation": relation, "reason": reason}
+
+    async def _observe(
+        self, serial: int, trace: tuple[dict[str, Any], ...], trace_revision: int,
+        *, forced: bool = False,
+    ) -> None:
         activity_item_id = self._activity_id("thinking", serial)
 
         async def complete(**kwargs: Any) -> ShadowProviderResponse:
@@ -868,8 +1009,53 @@ class ShadowRuntime:
             )
 
         try:
+            observer_trace = self._status_trace_prefix(trace)
+            used_stream_snapshot = False
+            if forced:
+                half_budget = max(512, self.observer_max_context_tokens // 2)
+                observer_trace = self._status_trace_prefix(trace, budget=half_budget)
+                now = time.monotonic()
+                reasoning_tail = self._reasoning_stream_tail
+                runtime_state = {
+                    "state": "provider_request_active" if self._provider_attempt_started_at is not None else "between_steps",
+                    "elapsed_ms": (
+                        round((now - self._provider_attempt_started_at) * 1000, 2)
+                        if self._provider_attempt_started_at is not None else 0.0
+                    ),
+                    "last_stream_delta_age_ms": (
+                        round((now - self._last_reasoning_delta_at) * 1000, 2)
+                        if self._last_reasoning_delta_at is not None else None
+                    ),
+                    "stream_complete": False,
+                    "provisional_reasoning_tail": reasoning_tail,
+                }
+                def provisional_item() -> dict[str, Any]:
+                    return {
+                        "role": "system",
+                        "content": "【当前未提交运行快照】\n" + json.dumps(
+                            runtime_state, ensure_ascii=False, separators=(",", ":"),
+                        ),
+                    }
+
+                # Metadata also consumes the second half of the budget.  Keep
+                # the newest suffix and shrink it until the combined request
+                # stays within the existing observer context limit.
+                low, high, best = 0, len(reasoning_tail), ""
+                while low <= high:
+                    length = (low + high) // 2
+                    runtime_state["provisional_reasoning_tail"] = (
+                        reasoning_tail[-length:] if length else ""
+                    )
+                    if self._estimate_items_tokens((*observer_trace, provisional_item())) <= self.observer_max_context_tokens:
+                        best = runtime_state["provisional_reasoning_tail"]
+                        low = length + 1
+                    else:
+                        high = length - 1
+                runtime_state["provisional_reasoning_tail"] = best
+                used_stream_snapshot = bool(best)
+                observer_trace = (*observer_trace, provisional_item())
             text = await self.status_observer.summarize(
-                self._status_trace_prefix(trace), complete,
+                observer_trace, complete, forced=forced,
             )
             if not text:
                 self._activity(
@@ -886,6 +1072,12 @@ class ShadowRuntime:
                 self._metric("observer.late_discard", {})
                 return
             self._emit("status", text[:512])
+            if forced:
+                self._metric("observer.force_completed", {
+                    "serial": serial, "used_stream_snapshot": used_stream_snapshot,
+                })
+                if used_stream_snapshot:
+                    self._metric("observer.force_used_stream_snapshot", {"serial": serial})
             self._activity(
                 "thinking", "completed", item_id=activity_item_id,
                 text=text[:512],
@@ -898,11 +1090,17 @@ class ShadowRuntime:
                 text=f"可读工作简报失败：{str(exc)[:240] or type(exc).__name__}",
             )
             self._metric("observer.failed", {"error": type(exc).__name__})
+            if forced:
+                self._metric("observer.force_failed", {"serial": serial, "error": type(exc).__name__})
         finally:
             pending = self._observer_pending
+            forced_pending = self._observer_force_pending
             self._observer_pending = False
+            self._observer_force_pending = False
             if pending and self.active and serial == self._activation_serial:
-                asyncio.get_running_loop().call_soon(self._schedule_observer, serial)
+                asyncio.get_running_loop().call_soon(
+                    lambda: self._schedule_observer(serial, force=forced_pending)
+                )
 
     def _terminal_text(self, text: str) -> tuple[str, str]:
         try:
@@ -939,6 +1137,11 @@ class ShadowRuntime:
                 for item in response.output:
                     self._append(dict(item))
                 self.committed_model_steps += 1
+                # Once a provider response is committed, the raw reasoning tap
+                # is no longer needed and must not survive as hidden history.
+                self._reasoning_stream_tail = ""
+                self._provider_attempt_started_at = None
+                self._last_reasoning_delta_at = None
                 calls = self._calls(response.output)
                 if calls:
                     # Guidance wins at the safe boundary before any old call starts.
@@ -1012,6 +1215,9 @@ class ShadowRuntime:
                 self._last_processed_revision = self.applied_context_revision
         finally:
             if serial == self._activation_serial:
+                self._reasoning_stream_tail = ""
+                self._provider_attempt_started_at = None
+                self._last_reasoning_delta_at = None
                 self.active = False
                 self._notify_runtime_state(active=False)
                 if self.latest_visible_status is not None:
@@ -1072,10 +1278,15 @@ class ShadowRuntime:
         self._source_epoch = 0
         self._last_processed_revision = -1
         self._observer_pending = False
+        self._observer_force_pending = False
         self._last_status_trace_revision = 0
+        self._last_status_activation_serial = 0
         self._pending_since = None
         self._provider_activity_items = {}
         self._provider_activity_item_streams = {}
+        self._reasoning_stream_tail = ""
+        self._provider_attempt_started_at = None
+        self._last_reasoning_delta_at = None
         self.usage_samples.clear()
         self.status_usage_samples.clear()
 

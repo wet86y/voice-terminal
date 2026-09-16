@@ -56,7 +56,25 @@ class ProductSidecarTests(unittest.TestCase):
         self.settings_path.write_text(json.dumps({"schema_version": []}), encoding="utf-8")
         malformed = self.store()
         self.assertTrue(malformed.warnings)
-        self.assertEqual(malformed.snapshot()["schema_version"], 1)
+        self.assertEqual(malformed.snapshot()["schema_version"], 2)
+
+    def test_shadow_gate_defaults_off_and_persists_without_losing_old_settings(self) -> None:
+        store = self.store()
+        self.assertFalse(store.snapshot()["shadow"]["experimental_context_gate_enabled"])
+        saved = store.save_shadow({"experimental_context_gate_enabled": True})
+        self.assertTrue(saved["experimental_context_gate_enabled"])
+        reloaded = self.store()
+        self.assertTrue(reloaded.snapshot()["shadow"]["experimental_context_gate_enabled"])
+        self.assertTrue(reloaded.effective_config().shadow_agent.experimental_context_gate_enabled)
+
+        self.settings_path.write_text(json.dumps({
+            "schema_version": 1,
+            "silence": {"seconds": 45},
+        }), encoding="utf-8")
+        upgraded = self.store()
+        self.assertEqual(upgraded.snapshot()["silence"]["seconds"], 45)
+        self.assertFalse(upgraded.snapshot()["shadow"]["experimental_context_gate_enabled"])
+        self.assertFalse(upgraded.warnings)
 
     def test_kws_compile_replaces_files_only_after_validation(self) -> None:
         kws_dir = self.config.kws_dir

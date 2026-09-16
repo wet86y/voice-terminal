@@ -16,6 +16,8 @@ shadow_agent:
   # intent and tools are driven from authoritative conversation context.
   enabled: true
   debug_websocket_enabled: false
+  # Experimental sidecar gate only changes injection timing; context remains intact.
+  experimental_context_gate_enabled: false
   max_context_tokens: 524288
   compaction_threshold_ratio: 0.80
   # Omitted provider fields inherit llm.base_url, llm.model and llm.api_key_env.

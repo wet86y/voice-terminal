@@ -289,6 +289,9 @@ class SessionRuntime:
                         production_sink=self._on_shadow_events,
                         activity_sink=self._on_shadow_activity,
                     )
+                    self.shadow_session.set_context_gate_enabled(
+                        shadow_cfg.experimental_context_gate_enabled,
+                    )
                     self.history.set_shadow_runtime_state(available=True, active=False)
                     self.shadow_product.reset(available=True)
                     self.state.set_service("shadow_agent", "READY")
@@ -877,10 +880,24 @@ class SessionRuntime:
         self.shadow_component = None
         self.shadow_session = None
 
-    def _wake_shadow(self) -> str:
+    async def _wake_shadow(self) -> str:
         if self.shadow_session is None or not self.shadow_session.available:
             return "unavailable"
-        return self.shadow_session.wake()
+        return await self.shadow_session.request_wake()
+
+    def set_shadow_context_gate_enabled(self, enabled: bool) -> bool:
+        """Apply the experimental timing gate without restarting the session."""
+        value = bool(enabled)
+        self.config = replace(
+            self.config,
+            shadow_agent=replace(
+                self.config.shadow_agent,
+                experimental_context_gate_enabled=value,
+            ),
+        )
+        if self.shadow_session is not None:
+            self.shadow_session.set_context_gate_enabled(value)
+        return value
 
     async def _on_shadow_events(self, events: list[ShadowEvent]) -> None:
         # Stop intentionally ends only the voice episode.  The independent
@@ -893,12 +910,18 @@ class SessionRuntime:
             )
         self.shadow_product.update_events(events)
         await self.publish_shadow_product()
+        semantic_events = [
+            item for item in events
+            if item.kind in {"observation", "user_input_required", "result", "failed"}
+        ]
+        if not semantic_events:
+            return
         controller = self.controller
         if controller is None or not self.state.listening or controller.episode.closed:
-            for item in events:
+            for item in semantic_events:
                 self._shadow_pending.publish(item)
             return
-        await controller.accept_shadow_events(events)
+        await controller.accept_shadow_events(semantic_events)
 
     def _on_shadow_tool_status(self, name: str, status: str, reason: str) -> None:
         if name == "web_search" and "web_search" in self.state.services:
@@ -1015,6 +1038,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         runtime_payload = sanitize_runtime_snapshot(runtime.snapshot().payload)
         conversation = runtime_payload.pop("conversation", {"recent": [], "current": {}})
         settings = product_settings.snapshot() if product_settings is not None else {
+            "schema_version": 2,
             "wake": {
                 "enabled": runtime.config.wake.enabled,
                 "keyword": runtime.config.wake.keyword,
@@ -1024,6 +1048,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             "silence": {
                 "seconds": int(getattr(runtime.config.agent, "final_silence_ms", 30000) / 1000),
                 "smart_turn_hard_silence_ms": runtime.config.smart_turn.hard_silence_ms,
+            },
+            "shadow": {
+                "experimental_context_gate_enabled": (
+                    runtime.config.shadow_agent.experimental_context_gate_enabled
+                ),
             },
             "persona": {},
             "warnings": [],
@@ -1086,6 +1115,32 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "effective_from": "next_episode",
                 "pending": True,
                 "message": "静默设置已保存，将在下一次 Episode 生效。",
+            }
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                raise
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.put("/api/v1/product/settings/shadow")
+    async def update_product_shadow(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            store = product_store_or_404()
+            value = await asyncio.to_thread(store.save_shadow, body)
+            enabled = runtime.set_shadow_context_gate_enabled(
+                value["experimental_context_gate_enabled"],
+            )
+            # Keep the persisted overlay synchronized for future resets and
+            # process restarts without staging a voice-session restart.
+            store.config = runtime.config
+            return {
+                "settings": {"shadow": value},
+                "effective_from": "immediate",
+                "pending": False,
+                "message": (
+                    "实验性 Shadow 上下文门禁已开启。"
+                    if enabled else "实验性 Shadow 上下文门禁已关闭，正文恢复直通。"
+                ),
             }
         except Exception as exc:
             if isinstance(exc, HTTPException):
