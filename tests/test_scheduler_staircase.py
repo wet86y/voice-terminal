@@ -13,6 +13,7 @@ from voice_terminal.agent.episode import (
     AgentDecisionScheduler,
     AgentEpisodeRuntime,
     EpisodeHeartbeatClock,
+    RecoverySignal,
 )
 from voice_terminal.agent.options import AgentOptions
 from voice_terminal.agent.decision_envelope import DecisionEnvelope, SpeechDecision
@@ -525,10 +526,78 @@ def test_force_and_final_prompts_are_mutually_exclusive():
     assert json.loads(final_messages[-2]["content"])["entries"][-1]["kind"] == "final_silence"
     assert FORCED_POLL_PROMPT in forced
     assert "系统即将进入静默状态" not in forced
+    assert "actions 必须为 []" not in forced
+    assert "actions 按当前动作目录和工具可用性正常决定" in forced
+    assert "没有新增的用户可见信息时必须 wait" in forced
+    assert "actions 与 speak 独立判断" in forced
+    assert "不表示需要复述或维持之前的播报" in forced
     assert FINAL_SILENCE_PROMPT in final
     assert "系统400ms调度器的强制检查窗口触发" not in final
+    assert "actions 必须为 []" in final
+    assert "进入静默本身不是需要播报的事件" in final
     assert FORCED_POLL_PROMPT not in normal
     assert FINAL_SILENCE_PROMPT not in normal
+
+
+def test_forced_poll_protocol_recovery_keeps_the_forced_poll_request_scope():
+    async def scenario():
+        class Provider:
+            transport = "responses"
+            protocol_recovery_limit = 1
+
+            def __init__(self):
+                self.messages = None
+
+            def stream_events(self, messages, *, json_mode=False):
+                assert json_mode is True
+                self.messages = messages
+
+                async def stream():
+                    yield {
+                        "type": "content",
+                        "text": '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}',
+                    }
+                    yield {"type": "finish", "reason": "stop"}
+
+                return stream()
+
+        provider = Provider()
+        runtime = _speaking_runtime(provider)
+        signal = RecoverySignal(
+            "SPEAK_ENVELOPE_INVALID",
+            "invalid json",
+            source_request_id="request-a",
+            source_turn_id="turn-a",
+            system_check_id="system-check-a",
+            owner_scope="system_check",
+            dispatch_context={
+                "system_check_id": "system-check-a",
+                "speech_turn_id": "turn-a",
+                "dispatch_kind": "forced_poll",
+                "prompt_kind": "forced_poll",
+                "owner_scope": "system_check",
+                "generation": runtime.scheduler.generation,
+                "window_index": 3,
+                "silence_elapsed_ms": 1200,
+            },
+        )
+
+        assert await runtime._start_dispatch(
+            {"EXCEPTION_RECOVERY", signal.code}, recovery_signal=signal,
+        )
+        request = runtime.active_request
+        assert request is not None
+        assert await asyncio.wait_for(request, timeout=1) == "completed"
+        await runtime._finish_active_request(request)
+
+        packet = json.loads(provider.messages[-2]["content"])
+        entries = {entry["kind"]: entry["content"] for entry in packet["entries"]}
+        assert "forced_poll" in entries
+        assert FORCED_POLL_PROMPT in entries["forced_poll"]
+        assert "本次没有新的用户输入" in entries["immediate_recovery"]
+        assert "重新处理最后一条用户输入" not in entries["immediate_recovery"]
+
+    asyncio.run(scenario())
 
 
 def test_tts_events_are_not_scheduler_events():

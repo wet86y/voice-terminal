@@ -61,6 +61,12 @@ def test_prompt_matches_required_responses_wire_contract_and_has_short_examples(
     assert "绝不能把 target_text 原样作为新的 speak.text" in PROMPT
     assert "收到它们不等于必须 speak" in PROMPT
     assert "相关性、时效性、可靠性、是否已经表达" in PROMPT
+    assert 'HISTORY 中 assistant 角色的 <voice_delivery>' in PROMPT
+    assert 'status="full"' in PROMPT
+    assert "调度器触发、shadow.active" in PROMPT
+    assert "只有更新提供了当前回答尚未覆盖、仍需向用户传达的新信息" in PROMPT
+    assert "若没有确需补充的新后缀则 wait" in PROMPT
+    assert "回答仍正确但缺少新信息" not in PROMPT
     assert "emotion 可省略" not in PROMPT
     assert "不得带 text" not in PROMPT
 
@@ -1049,27 +1055,61 @@ def test_thinking_and_business_actions_release_one_barrier_after_tools():
     asyncio.run(scenario())
 
 
-def test_system_check_actions_and_thinking_are_rejected_before_execution():
+def test_forced_poll_actions_and_thinking_follow_normal_dispatch_rules():
     async def scenario():
         runtime = _runtime(SimpleNamespace(thinking_action_enabled=True))
         runtime._system_check_turn_ids.add("system-check-a")
-        executed = []
+        shadow_wakes = []
+        runtime.shadow_waker = lambda: shadow_wakes.append("wake") or "started"
+        envelope = DecisionEnvelope(
+            SpeechDecision("speak", "calm", "我继续处理。"),
+            (
+                Action(THINKING_ACTION, {"request": True}),
+                Action("request_shadow", {"request": True}),
+            ),
+        )
 
-        async def execute(*_args, **_kwargs):
-            executed.append(True)
+        await runtime._dispatch_actions_v06(
+            (runtime.episode_id, "request-a"), "turn-a", envelope,
+            system_check=True,
+            system_check_id="system-check-a",
+            system_check_prompt_kind="forced_poll",
+        )
+        await asyncio.gather(*tuple(runtime._background_tools))
 
-        runtime._execute_actions_v06 = execute
+        assert shadow_wakes == ["wake"]
+        assert any(item["kind"] == "SHADOW_WAKE" for item in runtime.trace)
+        assert any(item["kind"] == "THINKING_REQUESTED" for item in runtime.trace)
+        assert not any(item["kind"] == "SYSTEM_CHECK_ACTION_REJECTED" for item in runtime.trace)
+
+    asyncio.run(scenario())
+
+
+def test_final_silence_actions_and_thinking_are_rejected_before_execution():
+    async def scenario():
+        runtime = _runtime(SimpleNamespace(thinking_action_enabled=True))
+        runtime._system_check_turn_ids.add("system-check-a")
+        shadow_wakes = []
+        runtime.shadow_waker = lambda: shadow_wakes.append("wake") or "started"
         envelope = DecisionEnvelope(
             SpeechDecision("speak", "calm", "系统检查播报。"),
-            (Action(THINKING_ACTION, {"request": True}), Action("web_search", {"query": "x"})),
+            (
+                Action(THINKING_ACTION, {"request": True}),
+                Action("request_shadow", {"request": True}),
+            ),
         )
         await runtime._dispatch_actions_v06(
             (runtime.episode_id, "request-a"), "system-check-a", envelope,
+            system_check=True,
+            system_check_id="system-check-a",
+            system_check_prompt_kind="final_silence",
         )
 
-        assert executed == []
+        assert shadow_wakes == []
+        assert runtime._background_tools == set()
         rejected = [item for item in runtime.trace if item["kind"] == "SYSTEM_CHECK_ACTION_REJECTED"]
-        assert rejected and rejected[0]["action_names"] == [THINKING_ACTION, "web_search"]
+        assert rejected and rejected[0]["action_names"] == [THINKING_ACTION, "request_shadow"]
+        assert rejected[0]["prompt_kind"] == "final_silence"
 
     asyncio.run(scenario())
 
@@ -1104,7 +1144,59 @@ def test_system_check_recovery_signal_keeps_immutable_owner_metadata():
         assert signal.dispatch_context["speech_turn_id"] == "turn-a"
         assert signal.dispatch_context["window_index"] == 3
 
+        prompt_kind = runtime._recovery_origin_prompt_kind(signal)
+        messages = runtime.messages(
+            {"EXCEPTION_RECOVERY", signal.code},
+            recovery_signal=signal,
+            prompt_kind=prompt_kind,
+            force_context=signal.dispatch_context,
+            current_turn_id="turn-a",
+        )
+        packet = json.loads(messages[-2]["content"])
+        entries = {entry["kind"]: entry["content"] for entry in packet["entries"]}
+        feedback = json.loads(entries["immediate_recovery"].removeprefix("即时恢复反馈："))
+
+        assert prompt_kind == "forced_poll"
+        assert "forced_poll" in entries
+        assert feedback["origin_prompt_kind"] == "forced_poll"
+        assert "本次没有新的用户输入" in feedback["instruction"]
+        assert "不要重新回答历史用户请求" in feedback["instruction"]
+        assert "重新处理最后一条用户输入" not in feedback["instruction"]
+
     asyncio.run(scenario())
+
+
+def test_thinking_action_is_explicitly_present_in_tool_availability():
+    balanced = _runtime(SimpleNamespace(thinking_action_enabled=True))
+    balanced.reasoning_mode = "balanced"
+    balanced._frozen_thinking_action_enabled = True
+    assert balanced._tool_availability()[THINKING_ACTION] == "ready"
+
+    fast = _runtime(SimpleNamespace(thinking_action_enabled=False))
+    fast.reasoning_mode = "fast"
+    fast._frozen_thinking_action_enabled = False
+    assert THINKING_ACTION not in fast._tool_availability()
+
+
+@pytest.mark.parametrize(
+    ("prompt_kind", "expected"),
+    [
+        ("forced_poll", "不要重新回答历史用户请求"),
+        ("final_silence", "不要把最后一条历史用户输入当成新的请求"),
+        ("kws_wake", "不要处理历史用户任务"),
+    ],
+)
+def test_system_check_recovery_instruction_preserves_original_scope(prompt_kind, expected):
+    instruction = AgentEpisodeRuntime._recovery_instruction(
+        "SPEAK_ENVELOPE_INVALID", origin_prompt_kind=prompt_kind,
+    )
+    assert expected in instruction
+    assert "重新处理最后一条用户输入" not in instruction
+
+
+def test_normal_recovery_still_reprocesses_the_latest_user_input():
+    instruction = AgentEpisodeRuntime._recovery_instruction("SPEAK_ENVELOPE_INVALID")
+    assert "重新处理最后一条用户输入" in instruction
 
 
 def test_new_user_turn_invalidates_pending_thinking_barrier():

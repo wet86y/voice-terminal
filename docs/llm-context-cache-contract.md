@@ -13,13 +13,51 @@ DeepSeek 的前缀缓存按请求开头连续 token 匹配。官方 Responses �
 | Lane | 允许内容 | 生命周期与位置 | 禁止内容 |
 | --- | --- | --- | --- |
 | `STATIC_INSTRUCTIONS` | 固定 Agent 规则、固定 schema 兼容说明、会话日期基准、冻结动作目录、episode 级人格/用户/行为文档 | episode 内不变；Responses `instructions` | 秒级时间、播放状态、工具可用性、恢复反馈 |
-| `HISTORY` | 最终用户输入、实际 `heard_text`、结算的打断/替换、完成工具资料、持久精修 | 只能在末尾追加；Responses `input` | 未播文本、重排/摘要旧条目、运行时 ID |
+| `HISTORY` | 最终用户输入、冻结的 `<voice_delivery>` 播放结算、结算的零已听打断/替换、完成工具资料、持久精修 | 只能在末尾追加；Responses `input` | 未结算文本、重排/摘要旧条目、运行时 ID |
 | `REQUEST_TAIL` | 当前输入候选、秒级时间、日期 epoch、活跃 speak、精修、工具可用性、恢复反馈 | 只存在于本请求末尾；Responses `input` | 固定规则、需要在未来复用的事实 |
 
 `ContextFrame` 是唯一模型消息构造器。没有 lane 的帧会在 provider 投影时失败；内部
 `context_lane` 与 `context_kind` 均不会发送到 provider。Responses 仅将
 `STATIC_INSTRUCTIONS` 合并到 `instructions`，其余 role、顺序和 content 进入 `input`。
 冻结的 Chat Completions 回退同样去除内部元数据，保留模型可见的消息顺序。
+
+已结算语音在 `commit_delivery()` 时一次性生成并冻结模型可见内容。完整播放使用
+`<voice_delivery status="full">…</voice_delivery>`；部分播放使用同一包装中的
+`heard`、`uncertain`、`unheard` 子元素。投影后不得重新渲染、补字段或修改既有包装，
+后续结算只能在 HISTORY 末尾追加，以保持 DeepSeek 连续 token 前缀缓存稳定。
+
+### 语音传达包装语义
+
+`voice_delivery` 是 assistant 历史消息的模型可见包装，不是新的 assistant 回复，也不应
+被复制到新的 `speak.text` 中。包装只在播放结算完成后生成一次：
+
+```xml
+<voice_delivery status="full">已完整播放并被用户听到的文本</voice_delivery>
+```
+
+被打断或替换时，如果用户已经听到部分内容，使用：
+
+```xml
+<voice_delivery status="partial" termination="interrupted"><heard>确定听到</heard><uncertain>边界不确定</uncertain><unheard>确定未听到</unheard></voice_delivery>
+```
+
+`heard` 是已经传达的事实，`uncertain` 不得当作已传达，`unheard` 也不代表下一次调度
+必须自动补播。下一次 `forced_poll` 是否 `speak`，只取决于最近一次已传达内容之后是否出现
+新的、仍然相关且值得用户现在听到的信息。没有信息增量时使用 `wait`；Shadow 仍 active、
+后台任务仍运行、播放队列变空、时间经过以及调度器触发本身都不构成信息增量。
+
+`forced_poll` 可以在有新结果、必要纠错、事实变化或确实需要传达的未听内容时再次开口，
+但只能表达新增或修正部分，不能复述已传达内容。`actions` 与 `speak` 独立决定：需要
+继续后台处理但没有新的用户可见内容时，可以保持 `wait` 并请求相应 action。
+
+### DeepSeek 缓存切换不变量
+
+新协议采用直接切换：新建 episode 后所有 speech history 都使用 `voice_delivery_v1`。
+同一 episode 内，已经发送过的 HISTORY 永远不回写；`model_content` 在结算时冻结，后续
+请求只复制该字符串。不得在一次请求中先发送裸 assistant 文本、下一次请求再为同一条文本
+补上包装，也不得把 speech ID、request ID、时间戳、播放时长、队列状态或 Shadow 状态放入
+包装。这样 DeepSeek 请求仍保持“稳定 STATIC + 只追加 HISTORY + 动态 REQUEST_TAIL”的
+连续 token 前缀，新增包装只作为当轮新增后缀参与首次计算。
 
 ## V1 请求尾部信封
 

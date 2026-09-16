@@ -65,6 +65,11 @@ Web 控制台可选择快速、均衡或深度模式。快速使用 `effort=none
 Agent 每轮返回必填 `{"speak":{"state":"speak|cancel|wait","emotion":"...","text":"..."},
 "actions":[]}`。本地流式解析器与最终校验仍是权威。情绪只接受 `calm`、`happy`、`sad`、
 `angry`、`fearful`、`disgusted`、`surprised`。
+模型历史中的 assistant 语音使用冻结的 `<voice_delivery>` 包装：`status="full"` 表示文本已经
+完整播放，`status="partial"` 通过 `heard`、`uncertain`、`unheard` 表示实际传达边界。包装
+只在播放结算时追加到 HISTORY，不携带运行时 ID 或时间戳，因此不会改写 DeepSeek 的缓存前缀。
+`forced_poll` 只有在最近一次已传达内容之后出现新的用户可见信息时才应 `speak`；无信息增量
+时使用 `wait`，但仍可独立请求 Shadow 继续后台处理。
 若流在兼容的空白、BOM 或单层 JSON code fence 之后连续出现 10 个非空白字符，且正文仍未以
 `{` 开始，运行时会立即关闭该 provider 流并进入既有的一次有界协议恢复；合法分片 JSON 和以
 `{` 开始但最终损坏的 JSON 不会被这条纯文本早停规则截断。

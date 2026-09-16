@@ -4,6 +4,7 @@ import json
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
+from html import escape
 from typing import Any
 
 from .contracts import DeliveryReport, ToolExchange
@@ -355,6 +356,36 @@ class SessionLedger:
             for entry in self.entries
         )
 
+    @staticmethod
+    def _voice_delivery_content(text: str, delivery: DeliveryReport) -> str:
+        """Freeze one model-visible, cache-stable playback settlement.
+
+        The rendered value is stored when the delivery is committed rather
+        than regenerated while projecting later requests.  This keeps every
+        HISTORY frame byte-stable for prefix caching and binds the playback
+        fact directly to the assistant text it qualifies.
+        """
+
+        completed = delivery.termination == "completed" and delivery.status == "full"
+        if completed:
+            return f'<voice_delivery status="full">{escape(text, quote=False)}</voice_delivery>'
+
+        termination = escape(str(delivery.termination or "unknown"), quote=True)
+        fields = [
+            f'<heard>{escape(str(delivery.heard_text or "").strip(), quote=False)}</heard>'
+        ]
+        uncertain = str(delivery.uncertain_text or "").strip()
+        unheard = str(delivery.unheard_text or "").strip()
+        if uncertain:
+            fields.append(f"<uncertain>{escape(uncertain, quote=False)}</uncertain>")
+        if unheard:
+            fields.append(f"<unheard>{escape(unheard, quote=False)}</unheard>")
+        return (
+            f'<voice_delivery status="partial" termination="{termination}">'
+            + "".join(fields)
+            + "</voice_delivery>"
+        )
+
     def commit_delivery(self, speech_id: str, text: str, delivery: DeliveryReport) -> bool:
         if not speech_id or speech_id in self._committed_delivery_ids:
             return False
@@ -367,7 +398,11 @@ class SessionLedger:
             else delivery.heard_text.strip()
         )
         if heard:
-            self.entries.append(SessionLedgerEntry("speech", heard, {"speech_id": speech_id}))
+            self.entries.append(SessionLedgerEntry("speech", heard, {
+                "speech_id": speech_id,
+                "model_history_format": "voice_delivery_v1",
+                "model_content": self._voice_delivery_content(heard, delivery),
+            }))
             self._commit_shadow_input("main_agent", "delivered_speech", {
                 "speech_id": speech_id, "text": heard,
             })
@@ -377,7 +412,12 @@ class SessionLedger:
                 "unheard": delivery.unheard_text, "precision": delivery.precision,
                 "termination": delivery.termination,
             }
-            self.entries.append(SessionLedgerEntry("delivery_notice", notice))
+            # A partial delivery with audible text is already represented by
+            # its self-contained ``voice_delivery`` assistant frame.  Retain
+            # the system notice only when nothing was heard and therefore no
+            # assistant HISTORY frame exists.
+            if not heard:
+                self.entries.append(SessionLedgerEntry("delivery_notice", notice))
             self._commit_shadow_input("runtime", "delivery_interruption", notice)
         return bool(heard)
 
@@ -438,7 +478,16 @@ class SessionLedger:
                     ContextLane.HISTORY, "user", self._render_input(entry),
                 ))
             elif entry.kind == "speech":
-                messages.append(ContextFrame.make(ContextLane.HISTORY, "assistant", entry.content))
+                model_content = entry.metadata.get("model_content")
+                if (
+                    entry.metadata.get("model_history_format") != "voice_delivery_v1"
+                    or not isinstance(model_content, str)
+                    or not model_content
+                ):
+                    raise RuntimeError("speech history is missing frozen voice_delivery content")
+                messages.append(ContextFrame.make(
+                    ContextLane.HISTORY, "assistant", model_content,
+                ))
             elif entry.kind == "delivery_notice":
                 messages.append(ContextFrame.make(
                     ContextLane.HISTORY, "system", "上一段语音被打断：" + json.dumps(entry.content, ensure_ascii=False),

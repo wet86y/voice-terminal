@@ -179,6 +179,8 @@ def test_runtime_classifies_recovery_pending_tools_and_runtime_without_loss():
         "deferred_recovery", "runtime_state",
     ]
     assert "SPEAK_ENVELOPE_INVALID" in deferred["entries"][0]["content"]
+    assert "已回到普通事件调度" not in deferred["entries"][0]["content"]
+    assert "重新处理最后一条用户输入" not in deferred["entries"][0]["content"]
 
 
 def test_fit_context_locates_typed_current_input_before_final_constraint():
@@ -322,7 +324,9 @@ def test_late_refinement_does_not_rewrite_cached_history_prefix():
     after_history = [frame for frame in after if frame["context_lane"] == ContextLane.HISTORY]
     assert after_history[:1] == before_history
     assert after_history[1]["role"] == "assistant"
-    assert after_history[1]["content"] == "已经完整播出的回答"
+    assert after_history[1]["content"] == (
+        '<voice_delivery status="full">已经完整播出的回答</voice_delivery>'
+    )
     assert '"refinement":"晚到精修转录"' not in after_history[0]["content"]
     packet = json.loads(after[-2]["content"])
     runtime_content = packet["entries"][0]["content"]
