@@ -38,6 +38,9 @@ export interface ProductSettingsSnapshot {
     seconds: number
     smart_turn_hard_silence_ms: number
   }
+  shadow: {
+    experimental_context_gate_enabled: boolean
+  }
   persona: Record<'instructions' | 'personality' | 'user' | 'shadow', string>
   warnings: string[]
 }

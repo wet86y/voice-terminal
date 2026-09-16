@@ -23,11 +23,12 @@ from voice_terminal.shadow_agent import (
     request_shadow_action_definition,
 )
 from voice_terminal.shadow_agent.events import ShadowEventBuffer
-from voice_terminal.shadow_agent.component import _EventRelay
+from voice_terminal.shadow_agent.component import ShadowAgentComponent, _EventRelay
 from voice_terminal.shadow_agent.contracts import shadow_control_tool_definitions
 from voice_terminal.shadow_agent.provider import ShadowProviderResponse
 from voice_terminal.shadow_agent.prompts import STATUS_OBSERVER_PROMPT
 from voice_terminal.server.product import ShadowProductProjection
+from voice_terminal.server.websocket import SessionRuntime
 
 
 def message(text: str) -> dict:
@@ -354,6 +355,114 @@ def test_event_relay_retries_without_losing_terminal_event_and_ledger_is_idempot
         assert any(name == "event.delivery_retry" for name, _ in metrics)
         assert any(name == "event.delivered" for name, _ in metrics)
         await relay.close()
+
+    asyncio.run(scenario())
+
+
+def test_experimental_gate_defers_once_then_rechecks_full_unreleased_prefix(tmp_path: Path):
+    class BlockingProvider:
+        def __init__(self):
+            self.started = asyncio.Event()
+
+        async def complete(self, **kwargs):
+            stream = kwargs.get("on_stream")
+            if stream is not None:
+                await stream({"type": "response.reasoning_text.delta", "delta": "正在核对原始任务"})
+            self.started.set()
+            await asyncio.Event().wait()
+
+    async def scenario():
+        ledger = SessionLedger()
+        ledger.commit_input("u1", "初始任务")
+        projector = ShadowContextProjector(ledger)
+        main_provider = BlockingProvider()
+        status_provider = QueueProvider([
+            [message("已确认进展：初始任务已开始；当前关注：核对原始任务。")],
+            [message(json.dumps({
+                "timing": "defer_once", "relation": "irrelevant", "reason": "与当前工作无关",
+            }, ensure_ascii=False))],
+            [message(json.dumps({
+                "timing": "inject_now", "relation": "guidance", "reason": "补充了明确引导",
+            }, ensure_ascii=False))],
+            [message("not-json")],
+        ])
+        metrics = []
+        component = ShadowAgentComponent(
+            main_provider, ShadowToolExecutor(FileTools((tmp_path,))),
+            status_provider=status_provider,
+            instructions_loader=lambda: "fixed",
+            runtime_options={
+                "observer_enabled": True, "observer_every_steps": 99,
+                "on_metric": lambda name, payload: metrics.append((name, payload)),
+            },
+        )
+        session = component.new_session(projector)
+        session.set_context_gate_enabled(True)
+        assert await session.request_wake() == "started"
+        await asyncio.wait_for(main_provider.started.wait(), timeout=1)
+
+        ledger.commit_input("u2", "第一条运行中正文")
+        assert await session.request_wake() == "coalesced"
+        assert projector.visible_revision == 2
+        for _ in range(100):
+            if session.runtime.has_current_summary:
+                break
+            await asyncio.sleep(0.01)
+        assert session.runtime.has_current_summary
+        forced_request = status_provider.requests[0]
+        assert "正在核对原始任务" in json.dumps(forced_request["input_items"], ensure_ascii=False)
+        assert "正在核对原始任务" not in repr(session.runtime.working_trace)
+
+        ledger.commit_input("u3", "本次可以暂缓的闲话")
+        assert await session.request_wake() == "coalesced"
+        assert projector.visible_revision == 2
+
+        ledger.commit_input("u4", "新的明确引导")
+        assert await session.request_wake() == "coalesced"
+        assert projector.visible_revision == 4
+        gate_payload = json.loads(status_provider.requests[-1]["input_items"][0]["content"])
+        assert gate_payload["candidate"]["from_revision"] == 2
+        assert gate_payload["candidate"]["to_revision"] == 4
+        assert [frame["content"]["transcript"] for frame in gate_payload["candidate"]["frames"]] == [
+            "本次可以暂缓的闲话", "新的明确引导",
+        ]
+        assert all("shadow_summary" not in repr(frame)
+                   for frame in projector.shadow_context_snapshot().frames)
+
+        ledger.commit_input("u5", "非法门禁输出也不能丢失")
+        assert await session.request_wake() == "coalesced"
+        assert projector.visible_revision == 5
+        assert any(name == "context_gate.fail_open" for name, _ in metrics)
+        await component.close()
+        assert session.runtime._reasoning_stream_tail == ""
+
+    asyncio.run(scenario())
+
+
+def test_disabling_context_gate_releases_deferred_authority_prefix():
+    ledger = SessionLedger()
+    ledger.commit_input("u1", "一")
+    projector = ShadowContextProjector(ledger)
+    projector.set_gate_enabled(True)
+    ledger.commit_input("u2", "二")
+    assert projector.visible_revision == 1
+    projector.set_gate_enabled(False)
+    assert projector.visible_revision == 2
+    assert [frame.content["transcript"] for frame in projector.shadow_context_snapshot().frames[1:]] == ["一", "二"]
+
+
+def test_status_and_progress_are_product_only_while_semantic_events_use_mailbox():
+    async def scenario():
+        runtime = SessionRuntime(AppConfig())
+        status = ShadowEvent("s", "status", "正在整理", 1, "normal")
+        progress = ShadowEvent("p", "progress", "已读取文件", 1, "normal")
+        await runtime._on_shadow_events([status, progress])
+        assert runtime.shadow_product.summary == "已读取文件"
+        assert runtime._shadow_pending.drain() == []
+
+        result = ShadowEvent("r", "result", "整理完成", 1, "priority")
+        await runtime._on_shadow_events([result])
+        assert [item.event_id for item in runtime._shadow_pending.drain()] == ["r"]
 
     asyncio.run(scenario())
 

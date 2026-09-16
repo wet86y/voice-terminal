@@ -173,22 +173,199 @@ class ShadowAgentSession:
             **component.runtime_options,
         )
         self.closed = False
+        self._gate_task: asyncio.Task[WakeResult] | None = None
+        self._pending_gate_target = 0
+        self._gate_followup_target = 0
 
     @property
     def available(self) -> bool:
         return not self.closed and not self.component.closed and self.runtime.available
 
     def wake(self) -> WakeResult:
+        """Legacy synchronous wake; releases context rather than gating it."""
+        release = getattr(self.runtime.context_source, "release_through", None)
+        if callable(release):
+            release()
         return self.runtime.wake()
 
+    async def request_wake(self) -> WakeResult:
+        """Wake Shadow, applying the optional one-request context timing gate."""
+        if not self.available:
+            return "unavailable"
+        source = self.runtime.context_source
+        gate_enabled = bool(getattr(source, "gate_enabled", False))
+        release = getattr(source, "release_through", None)
+        source_revision = int(getattr(source, "source_revision", source.shadow_input_revision))
+
+        if not gate_enabled:
+            if callable(release):
+                release(source_revision)
+            return self.runtime.wake()
+
+        # A new activation always sees the complete authoritative prefix.  The
+        # experimental model only controls guidance injected into an already
+        # running activation.
+        if not self.runtime.active:
+            if callable(release):
+                release(source_revision)
+            return self.runtime.wake()
+
+        visible_revision = int(getattr(source, "visible_revision", source.shadow_input_revision))
+        if source_revision <= visible_revision:
+            if not self.runtime.has_current_summary:
+                self.runtime.force_observer(self.runtime.activation_serial)
+            return "coalesced"
+
+        serial = self.runtime.activation_serial
+        if not self.runtime.has_current_summary:
+            if callable(release):
+                release(source_revision)
+            result = self.runtime.wake()
+            self.runtime.force_observer(serial)
+            return result
+
+        if self._gate_task is not None and not self._gate_task.done():
+            self._pending_gate_target = max(self._pending_gate_target, source_revision)
+            self._gate_followup_target = max(self._gate_followup_target, source_revision)
+            self.runtime._metric("context_gate.rechecked", {
+                "run": serial, "revision": source_revision,
+            })
+            return "coalesced"
+
+        generation = int(getattr(source, "gate_generation", 0))
+        task = asyncio.create_task(
+            self._run_gate_loop(serial, source_revision, generation),
+            name="shadow-context-gate",
+        )
+        self._pending_gate_target = source_revision
+        self._gate_task = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if self._gate_task is task:
+                self._gate_task = None
+                self._pending_gate_target = 0
+
+    async def _run_gate_loop(self, serial: int, target: int, generation: int) -> WakeResult:
+        source = self.runtime.context_source
+        result: WakeResult = "coalesced"
+        while not self.closed:
+            started = asyncio.get_running_loop().time()
+            candidate = getattr(source, "candidate_update")(to_revision=target)
+            if candidate.to_revision <= candidate.from_revision or not candidate.frames:
+                if candidate.to_revision > candidate.from_revision:
+                    getattr(source, "release_through")(target)
+                    if self.runtime.active and self.runtime.activation_serial == serial:
+                        result = self.runtime.wake()
+                    self.runtime._metric("context_gate.fail_open", {
+                        "run": serial, "revision": target, "error": "empty_interval",
+                    })
+                return result
+            self.runtime._metric("context_gate.requested", {
+                "run": serial, "from_revision": candidate.from_revision,
+                "revision": candidate.to_revision,
+            })
+            fail_open_error: str | None = None
+            try:
+                verdict = await self.runtime.classify_context_update(candidate)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                verdict = {"timing": "inject_now", "relation": "uncertain"}
+                fail_open_error = type(exc).__name__
+
+            current_generation = int(getattr(source, "gate_generation", 0))
+            stale = (
+                not bool(getattr(source, "gate_enabled", False))
+                or current_generation != generation
+                or not self.runtime.active
+                or self.runtime.activation_serial != serial
+            )
+            if stale:
+                getattr(source, "release_through")(target)
+                late_payload = {
+                    "run": serial, "revision": target,
+                    "duration_ms": round((asyncio.get_running_loop().time() - started) * 1000, 2),
+                    "error": "stale_generation_or_activation",
+                }
+                self.runtime._metric("context_gate.late_discarded", late_payload)
+                self.runtime._metric("context_gate.fail_open", late_payload)
+                # If the same activation is still alive, make its newly visible
+                # prefix pending.  Otherwise the next idle wake reads it.
+                if self.runtime.active and self.runtime.activation_serial == serial:
+                    result = self.runtime.wake()
+                return result
+
+            timing = verdict.get("timing", "inject_now")
+            relation = verdict.get("relation", "uncertain")
+            metric_payload = {
+                "run": serial, "revision": target, "relation": relation,
+                "duration_ms": round((asyncio.get_running_loop().time() - started) * 1000, 2),
+            }
+            if fail_open_error is not None or relation == "uncertain":
+                metric_payload["error"] = fail_open_error or "uncertain"
+                self.runtime._metric("context_gate.fail_open", metric_payload)
+                timing = "inject_now"
+
+            if timing == "defer_once":
+                self.runtime._metric("context_gate.deferred_once", metric_payload)
+            else:
+                getattr(source, "release_through")(target)
+                result = self.runtime.wake()
+                self.runtime._metric("context_gate.injected", metric_payload)
+
+            followup = self._gate_followup_target
+            self._gate_followup_target = 0
+            visible = int(getattr(source, "visible_revision", source.shadow_input_revision))
+            latest = int(getattr(source, "source_revision", source.shadow_input_revision))
+            next_target = max(followup, latest if followup else 0)
+            if followup > 0 and next_target > visible and self.runtime.active:
+                target = next_target
+                self._pending_gate_target = target
+                generation = int(getattr(source, "gate_generation", generation))
+                self.runtime._metric("context_gate.rechecked", {
+                    "run": serial, "revision": target,
+                })
+                continue
+            return result
+
+    def set_context_gate_enabled(self, enabled: bool) -> bool:
+        source = self.runtime.context_source
+        setter = getattr(source, "set_gate_enabled", None)
+        changed = bool(setter(enabled)) if callable(setter) else False
+        if not changed:
+            return bool(getattr(source, "gate_enabled", False))
+        self._gate_followup_target = 0
+        self._pending_gate_target = 0
+        if not enabled:
+            release = getattr(source, "release_through", None)
+            if callable(release):
+                release()
+            if self.runtime.active:
+                self.runtime.wake()
+        return bool(enabled)
+
     def snapshot(self) -> dict[str, Any]:
-        return self.runtime.snapshot()
+        snapshot = self.runtime.snapshot()
+        source = self.runtime.context_source
+        snapshot["context_gate"] = {
+            "enabled": bool(getattr(source, "gate_enabled", False)),
+            "source_revision": int(getattr(source, "source_revision", source.shadow_input_revision)),
+            "visible_revision": int(getattr(source, "visible_revision", source.shadow_input_revision)),
+            "pending": self._gate_task is not None and not self._gate_task.done(),
+            "target_revision": self._pending_gate_target or None,
+        }
+        return snapshot
 
     def replace_context_source(self, context_source: ShadowContextSource) -> None:
         """Rotate the authority after a session reset while the runtime is idle."""
         if self.runtime.active:
             raise RuntimeError("cannot replace active Shadow context source")
+        enabled = bool(getattr(self.runtime.context_source, "gate_enabled", False))
         self.runtime.context_source = context_source
+        setter = getattr(context_source, "set_gate_enabled", None)
+        if callable(setter):
+            setter(enabled)
 
     def reload_instructions(self) -> None:
         """Refresh Shadow persona after a product settings save/reset."""
@@ -198,6 +375,12 @@ class ShadowAgentSession:
         return self.relay.drain()
 
     async def reset(self) -> None:
+        if self._gate_task is not None and not self._gate_task.done():
+            self._gate_task.cancel()
+            await asyncio.gather(self._gate_task, return_exceptions=True)
+        self._gate_task = None
+        self._pending_gate_target = 0
+        self._gate_followup_target = 0
         await self.runtime.reset()
         sink = self.relay.sink
         activity_sink = self.activity_relay.sink
@@ -213,6 +396,11 @@ class ShadowAgentSession:
         if self.closed:
             return
         self.closed = True
+        if self._gate_task is not None and not self._gate_task.done():
+            self._gate_task.cancel()
+            await asyncio.gather(self._gate_task, return_exceptions=True)
+        self._gate_task = None
+        self._pending_gate_target = 0
         await self.runtime.close(close_tools=False)
         await self.relay.close()
         await self.activity_relay.close()

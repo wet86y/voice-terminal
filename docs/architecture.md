@@ -47,6 +47,9 @@ activation 结束后 runtime 回到 idle，但工作摘要和 cache epoch 保留
 
 `wake()` 只读取当前 `shadow_input_revision`：空闲时启动，运行中合并到最新 revision，
 相同已处理 revision 返回 `already_current`。这些结果仅用于日志，不进入主 ledger。
+动作校验后 wake 立即作为后台任务提交，不等待 TTS、播放、思考租约或下一次心跳。
+Shadow runner、provider 与只读工具完全由 session runtime 驱动；语音 episode stop 或心跳忙碌
+都不会暂停它们。
 
 Shadow 使用普通 Responses function-calling 循环。只提交 `response.completed.output`；
 SSE partial reasoning/text 不进入 committed trace。Shadow 的 activation、工具调用轮次、调用次数、
@@ -67,6 +70,20 @@ REQUEST_TAIL。它包含：用户输入与 refinement、尚未结算但触发 wa
 
 ledger reset 增加 source epoch 并从 revision 0 重新开始。Shadow 的 cache epoch 与 source epoch
 分离：换代压缩不会伪装成用户事件。
+
+实验性门禁在 projector 前维护连续可见水位。`source_revision` 是 ledger 权威尾部，
+`visible_revision` 是 Shadow 当前可读的最大 revision；可见输入永远是 `(0, visible_revision]`
+的连续前缀，不复制、不过滤、不重写 frame。门禁默认关闭，此时可见水位自动追平来源。
+运行中开启时，侧载模型只可返回 `inject_now` 或 `defer_once`：只有明确的 irrelevant/duplicate
+可以暂缓一次，补充、变更、偏移、引导、不确定和任何错误都立即注入。下一次 wake 必须从旧
+可见水位重新判断完整未释放区间；放行较新 revision 时，此前暂缓正文自然按原顺序一起进入。
+空闲 wake 永远绕过门禁并读取完整前缀。判断文本、reason 和摘要都不写入 ledger、working trace
+或 Shadow 输入。
+
+产品设置 API 使用独立 schema 版本。`PUT /api/v1/product/settings/shadow` 严格接受
+`{"experimental_context_gate_enabled": true|false}`，写入成功后立即更新当前 Session 的
+门禁状态；切换不会停止语音、取消 Shadow 或创建新的会话。旧 schema 设置文件缺少 `shadow`
+段时自动补 `false`，并保留 wake、silence 和 Persona 配置。
 
 ## 引导式上下文更新
 
@@ -95,9 +112,9 @@ ledger reset 增加 source epoch 并从 revision 0 重新开始。Shadow 的 cac
 - `request_user_input(kind, question, options, operation_summary)`：发布 clarification/未来 confirmation，
   并结束本次 activation。
 
-`progress` 和 `status` 覆盖可见状态；`observation`、`user_input_required`、`result`、`failed`
-进入主语义 ledger。除 progress 外，事件进入现有 400ms mailbox；`status` 保持 normal wake，
-由心跳交给主 LLM 重新评估。事件文本是异步参考资料而不是播报指令，可能晚于最新会话状态；
+`progress`、`status`、工具 lifecycle 和所有 activity 只覆盖产品投影/UI，不写主邮箱、不触发
+heartbeat。只有 `observation`、`user_input_required`、`result`、`failed` 进入主语义 ledger 和
+现有 400ms mailbox，并继续由唯一心跳串行消费。事件文本是异步参考资料而不是播报指令，可能晚于最新会话状态；
 主 LLM 必须结合最新用户输入、assistant 历史和 `runtime.speak` 自行决定 `speak`、`wait` 或
 `cancel`，不得重复已经传达或当前队列已经覆盖的内容。
 
@@ -107,8 +124,11 @@ ledger reset 增加 source epoch 并从 revision 0 重新开始。Shadow 的 cac
 prefix 的不可变快照，`reasoning_effort=none`、`tools=[]`、`max_output_tokens=512`，不设本地请求 timeout；
 只返回 80～160 字工作简报，内容只陈述已确认事实、正在核实事项和实际阻塞，不得建议主助手
 说什么、询问什么、调用什么动作或选择何种语音状态。它不计入 Shadow model step、不写回 trace、
-不阻塞主循环；同时只有一个请求，重复触发合并。`status` 仍通过 normal heartbeat 送入主 LLM，
-但不因此自动要求语音输出。activation 已结束、reset/close 或已有更新状态时丢弃迟到摘要。
+不阻塞主循环；同时只有一个请求，重复触发合并。`status` 只进入产品摘要槽位，不进入主 LLM。
+若运行中 wake 时当前 activation 尚无有效摘要，本次上下文先直通并立即强制一次 Observer；它可从
+provider stream 内部旁路读取有界 reasoning tail，并明确标记为未提交关注方向。原始 reasoning
+不写日志、ledger、trace、持久文件或产品 UI，provider attempt 完成、重试、reset/close 时清空。
+activation 已结束、reset/close 或已有更新状态时丢弃迟到摘要。
 
 ## 缓存与换代压缩
 
@@ -126,7 +146,7 @@ revision、时间、run ID、nonce 不进入固定前缀。相邻请求依靠完
 - `session.start`：启动语音 episode，并消费 stop 期间缓存的 Shadow 重要事件；
 - `session.stop`：只停止语音 episode，Shadow 继续运行；
 - barge-in：只影响语音输出；
-- `session.reset`：终止 Shadow runner/Observer/压缩，清空 trace/status，轮换 ledger epoch 与
+- `session.reset`：终止 Shadow runner/Observer/门禁/压缩，清空临时 reasoning、trace/status，轮换 ledger epoch 与
   OpenCode session header；
 - runtime close：取消 provider/observer 请求，关闭组件和共享 HTTP client；
 - Shadow result/no_action/failed：只结束 activation，session runtime 仍可在新 revision 上再次唤醒。
@@ -145,6 +165,7 @@ revision、时间、run ID、nonce 不进入固定前缀。相邻请求依靠完
 | main action dispatch/heartbeat accept | `voice_terminal/agent/episode.py` |
 | Product UI 页面与会话投影 | `apps/web/src/product/ProductApp.vue` |
 | Product API、Voice Server 适配与设置状态 | `apps/web/src/product/useProductAdapter.ts` |
+| Shadow 实验开关 API 与持久化 | `voice_terminal/server/product.py`、`voice_terminal/server/websocket.py` |
 | 日志回放 fixture（开发只读） | `apps/web/src/product/replay-data.ts` |
 
 Product UI 的一级导航只有 `home` 和 `settings`。两个页面组件可以保留各自的表单/滚动状态，

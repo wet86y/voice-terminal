@@ -20,8 +20,12 @@ python -m pytest -q tests/test_opencode_go_shadow_e2e.py
 - provider、工具后和 result 前均执行 freshness gate；stale 工具为 `not_executed`，stale final 不发布；
 - clarification 不使用 question ID/reply/waiter；用户回答依靠完整上下文继续；
 - 每 5 个 committed response 触发一个无工具、无思考 Observer；迟到摘要被丢弃；
-- Observer/status 文本只报告事实和状态，不向主助手下达播报指令；status 仍经 normal heartbeat
-  唤醒主 LLM，由主 LLM 自行判断 `wait`、`speak` 或 `cancel`；
+- Observer/status 文本只报告事实和状态，并且仅更新产品 UI；status/progress/tool activity 不进入
+  主邮箱。只有 observation/user_input_required/result/failed 经唯一 heartbeat 交给主 LLM；
+- 实验门禁默认关闭；开启时 defer_once 不推进可见 revision，下一次判断覆盖全部未释放正文；
+  侧载超时、异常、非法 Schema、uncertain、迟到 activation 或关闭开关必须 fail-open；
+- activation 无摘要时正文直通且强制摘要；流式 reasoning 只作为有界未提交快照，不能出现在
+  ledger、日志、产品 snapshot 或持久文件；
 - 正常请求默认允许 `wait` 表示语音队列无需变更；重复 `target_text`、`heard_text` 或 assistant
   历史必须被禁止，`cancel` 仅用于必须停止现有语音且没有替代文本的情况；
 - 80% token 阈值在安全边界换代，失败不丢失旧 trace；
@@ -30,13 +34,14 @@ python -m pytest -q tests/test_opencode_go_shadow_e2e.py
 
 真实 provider 验收应从 `SessionRuntime.start_listening()` 的生产装配进入，允许把 ASR/TTS 替换为
 文本边界 fake，但不得直接调用 runtime 私有方法冒充端到端结果。至少覆盖：查询中改口、补充筛选、
-正常 heartbeat 下 status 触发但主模型选择 wait、长期 10+ 步状态简报、observation 并行播报、
+语义事件进入唯一 heartbeat 后主模型选择 wait、长期 10+ 步状态简报、observation 并行播报、
 clarification 回合、stop 后事件缓存和 reset 隔离。
 
 ## Shadow 观测与缓存
 
 运行诊断记录 activation 次数/时长、committed model steps、provider/tool latency、transport retry、
 context revision 应用延迟、被阻止旧工具数、被拦截 stale final 数、Observer 调用/失败/迟到、
+门禁 requested/injected/deferred/rechecked/fail-open/late-discarded、强制摘要请求/完成/失败/流快照使用、
 input/cached/miss tokens、cache hit ratio、compaction 前后 token/epoch 和各 ShadowEvent 数量。
 这些指标不进入主永久会话历史。
 

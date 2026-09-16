@@ -24,7 +24,7 @@ from ..core.events import utc_now_iso
 from ..shadow_agent import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 1
+PRODUCT_SETTINGS_SCHEMA_VERSION = 2
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 90
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -87,6 +87,11 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
             "seconds": max(MIN_SILENCE_SECONDS, min(MAX_SILENCE_SECONDS, round(final_silence_ms / 1000))),
             "smart_turn_hard_silence_ms": int(getattr(config.smart_turn, "hard_silence_ms", 1400)),
         },
+        "shadow": {
+            "experimental_context_gate_enabled": bool(
+                config.shadow_agent.experimental_context_gate_enabled,
+            ),
+        },
     }
 
 
@@ -94,7 +99,7 @@ def _merge_settings(defaults: dict[str, Any], value: Any) -> dict[str, Any]:
     result = deepcopy(defaults)
     if not isinstance(value, Mapping):
         return result
-    for section in ("wake", "silence"):
+    for section in ("wake", "silence", "shadow"):
         raw = value.get(section)
         if isinstance(raw, Mapping):
             result[section].update({key: raw[key] for key in result[section] if key in raw})
@@ -118,6 +123,9 @@ def _merge_settings(defaults: dict[str, Any], value: Any) -> dict[str, Any]:
         seconds = int(defaults["silence"]["seconds"])
     silence["seconds"] = max(MIN_SILENCE_SECONDS, min(MAX_SILENCE_SECONDS, seconds))
     silence["smart_turn_hard_silence_ms"] = int(defaults["silence"]["smart_turn_hard_silence_ms"])
+    shadow = result["shadow"]
+    if type(shadow.get("experimental_context_gate_enabled")) is not bool:
+        shadow["experimental_context_gate_enabled"] = defaults["shadow"]["experimental_context_gate_enabled"]
     return result
 
 
@@ -126,11 +134,15 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
 
     invalid = False
     schema_version = value.get("schema_version")
-    if schema_version is not None and schema_version != PRODUCT_SETTINGS_SCHEMA_VERSION:
+    if schema_version is not None and (
+        type(schema_version) is not int
+        or schema_version not in {1, PRODUCT_SETTINGS_SCHEMA_VERSION}
+    ):
         invalid = True
     for section_name, fields in (
         ("wake", ("enabled", "keyword", "keyword_label", "sensitivity")),
         ("silence", ("seconds",)),
+        ("shadow", ("experimental_context_gate_enabled",)),
     ):
         section = value.get(section_name)
         if section is None:
@@ -152,6 +164,8 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
                 invalid = invalid or type(candidate) is not int or not MIN_KWS_SENSITIVITY <= candidate <= MAX_KWS_SENSITIVITY
             elif section_name == "silence" and field == "seconds":
                 invalid = invalid or type(candidate) is not int or not MIN_SILENCE_SECONDS <= candidate <= MAX_SILENCE_SECONDS
+            elif section_name == "shadow" and field == "experimental_context_gate_enabled":
+                invalid = invalid or type(candidate) is not bool
     return "product_settings: 部分字段无效，已回退为安全值。" if invalid else None
 
 
@@ -195,6 +209,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
 
     wake = settings.get("wake") if isinstance(settings.get("wake"), Mapping) else {}
     silence = settings.get("silence") if isinstance(settings.get("silence"), Mapping) else {}
+    shadow = settings.get("shadow") if isinstance(settings.get("shadow"), Mapping) else {}
     try:
         seconds = int(silence.get("seconds", getattr(config.agent, "final_silence_ms", 30_000) // 1000))
     except (TypeError, ValueError):
@@ -222,7 +237,16 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         config.agent,
         final_silence_ms=seconds * 1000,
     )
-    return replace(config, wake=next_wake, agent=next_agent)
+    next_shadow = replace(
+        config.shadow_agent,
+        experimental_context_gate_enabled=bool(
+            shadow.get(
+                "experimental_context_gate_enabled",
+                config.shadow_agent.experimental_context_gate_enabled,
+            )
+        ),
+    )
+    return replace(config, wake=next_wake, agent=next_agent, shadow_agent=next_shadow)
 
 
 class ProductSettingsStore:
@@ -459,6 +483,20 @@ class ProductSettingsStore:
         }
         self._save_settings()
         return self.snapshot()
+
+    def save_shadow(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if set(payload) != {"experimental_context_gate_enabled"}:
+            raise ProductSettingsError(
+                "Shadow 设置字段必须仅包含 experimental_context_gate_enabled。"
+            )
+        enabled = payload.get("experimental_context_gate_enabled")
+        if type(enabled) is not bool:
+            raise ProductSettingsError("experimental_context_gate_enabled 必须是布尔值。")
+        self._settings["shadow"] = {
+            "experimental_context_gate_enabled": enabled,
+        }
+        self._save_settings()
+        return deepcopy(self._settings["shadow"])
 
     def save_persona(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if set(payload) != set(PERSONA_FILES) | {"shadow"}:

@@ -47,9 +47,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 1,
+  schema_version: 2,
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
+  shadow: { experimental_context_gate_enabled: false },
   persona: { instructions: '', personality: '', user: '', shadow: '' },
   warnings: [],
 }
@@ -84,10 +85,11 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   if (!isRecord(value)) return structuredClone(DEFAULT_SETTINGS)
   const wake = isRecord(value.wake) ? value.wake : {}
   const silence = isRecord(value.silence) ? value.silence : {}
+  const shadow = isRecord(value.shadow) ? value.shadow : {}
   const persona = isRecord(value.persona) ? value.persona : {}
   const text = (candidate: unknown) => typeof candidate === 'string' ? candidate : ''
   return {
-    schema_version: typeof value.schema_version === 'number' ? value.schema_version : 1,
+    schema_version: typeof value.schema_version === 'number' ? value.schema_version : DEFAULT_SETTINGS.schema_version,
     wake: {
       enabled: wake.enabled === true,
       keyword: text(wake.keyword) || DEFAULT_SETTINGS.wake.keyword,
@@ -98,6 +100,9 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
       seconds: typeof silence.seconds === 'number' ? silence.seconds : 30,
       smart_turn_hard_silence_ms: typeof silence.smart_turn_hard_silence_ms === 'number'
         ? silence.smart_turn_hard_silence_ms : 1400,
+    },
+    shadow: {
+      experimental_context_gate_enabled: shadow.experimental_context_gate_enabled === true,
     },
     persona: {
       instructions: text(persona.instructions),
@@ -148,6 +153,7 @@ function updateSettingsFromResponse(settings: ProductSettingsSnapshot, result: P
   if (!isRecord(candidate)) return
   if (isRecord(candidate.wake)) Object.assign(settings.wake, candidate.wake)
   if (isRecord(candidate.silence)) Object.assign(settings.silence, candidate.silence)
+  if (isRecord(candidate.shadow)) Object.assign(settings.shadow, candidate.shadow)
   if (isRecord(candidate.persona)) Object.assign(settings.persona, candidate.persona)
   if (Array.isArray(candidate.warnings)) settings.warnings = candidate.warnings.filter((item): item is string => typeof item === 'string')
 }
@@ -254,6 +260,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     const nextSettings = normalizeSettings(value.settings)
     Object.assign(settings.wake, nextSettings.wake)
     Object.assign(settings.silence, nextSettings.silence)
+    Object.assign(settings.shadow, nextSettings.shadow)
     Object.assign(settings.persona, nextSettings.persona)
     settings.schema_version = nextSettings.schema_version
     settings.warnings = nextSettings.warnings
@@ -497,6 +504,23 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
         updateSettingsFromResponse(settings, result)
         setNotice(result.message || '静默设置已保存，将在下一次 Episode 生效。')
       } catch (error) {
+        setError(error)
+      } finally {
+        saving.value = false
+      }
+    })
+  }
+
+  async function saveShadowGate() {
+    const desired = settings.shadow.experimental_context_gate_enabled
+    await enqueue(async () => {
+      saving.value = true
+      try {
+        const result = await productApi.saveShadow({ experimental_context_gate_enabled: desired })
+        updateSettingsFromResponse(settings, result)
+        setNotice(result.message || 'Shadow 上下文门禁设置已立即生效。')
+      } catch (error) {
+        settings.shadow.experimental_context_gate_enabled = !desired
         setError(error)
       } finally {
         saving.value = false
@@ -854,6 +878,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     toggleProviderReasoning,
     saveWake,
     saveSilence,
+    saveShadowGate,
     savePersona,
     scanModels,
     discoverProvider,
