@@ -109,7 +109,7 @@ function createEmptyCurrentTurn(): CurrentTurnSnapshot {
     input_runtime: true, output_generation: 0, committed: false,
     agent_phase: 'IDLE', paraformer_final: '', refined_text: '',
     refinement_available: false, tts_prewarm_started: false, tts_prewarm_status: 'NOT_REQUESTED',
-    segments: [], tools: [], audio_cues: [], analysis: {},
+    segments: [], tools: [], audio_cues: [], analysis: {}, speaker_decision: {},
   }
 }
 
@@ -140,6 +140,7 @@ function createOfflineStatuses(): ServiceStatuses {
     audio: 'OFFLINE',
     kws: 'OFFLINE',
     asr: 'OFFLINE',
+    speaker: 'OFFLINE',
     llm: 'OFFLINE',
     tts: 'OFFLINE',
     web_search: 'DISABLED',
@@ -848,6 +849,21 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (Array.isArray(snapshot.tools)) current.tools = snapshot.tools as NonNullable<CurrentTurnSnapshot['tools']>
     if (Array.isArray(snapshot.audio_cues)) current.audio_cues = snapshot.audio_cues as NonNullable<CurrentTurnSnapshot['audio_cues']>
     if (isRecord(snapshot.analysis)) current.analysis = snapshot.analysis as NonNullable<CurrentTurnSnapshot['analysis']>
+    if (isRecord(snapshot.speaker_decision)) current.speaker_decision = snapshot.speaker_decision as NonNullable<CurrentTurnSnapshot['speaker_decision']>
+  }
+
+  function applySpeakerDecision(payload: Record<string, unknown>, turnId: string | null) {
+    const candidate = isRecord(payload.decision)
+      ? payload.decision
+      : isRecord(payload.state) ? payload.state : payload
+    if (!isRecord(candidate)) return
+    const candidateTurn = typeof candidate.turn_id === 'string' ? candidate.turn_id : turnId
+    if (!acceptsCurrentTurn(candidateTurn ?? null)) return
+    const candidateGeneration = candidate.generation
+    const currentGeneration = current.output_generation
+    if (typeof candidateGeneration === 'number' && typeof currentGeneration === 'number'
+      && candidateGeneration < currentGeneration) return
+    current.speaker_decision = candidate as NonNullable<CurrentTurnSnapshot['speaker_decision']>
   }
 
   function applyLatencySnapshot(payload: LatencySnapshotPayload) {
@@ -1160,6 +1176,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         if (acceptsCurrentTurn(message.turn_id ?? null)) {
           applyLatencySnapshot(payload as unknown as LatencySnapshotPayload)
         }
+        break
+      case 'speaker.state':
+      case 'speaker.decision':
+      case 'speaker.blocked':
+        applySpeakerDecision(payload, message.turn_id ?? null)
         break
       case 'input.completed':
         applyCompletedTurn(payload as unknown as TurnCompletedPayload, message.turn_id ?? null)

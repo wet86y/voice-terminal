@@ -53,6 +53,7 @@ export interface ServiceStatuses {
   audio: ServiceStatus
   kws: ServiceStatus
   asr: ServiceStatus
+  speaker?: ServiceStatus
   llm: ServiceStatus
   tts: ServiceStatus
 }
@@ -112,6 +113,21 @@ export interface CurrentTurnSnapshot {
   playback_diagnostics?: PlaybackDiagnostics
   tts_transport?: string
   tts_scheduling?: string
+  speaker_decision?: {
+    turn_id?: string
+    generation?: number
+    user_id?: string | null
+    state?: string
+    similarity?: number | null
+    threshold_used?: number | null
+    speech_ms?: number
+    observation_count?: number
+    continuity_source?: string | null
+    route?: string
+    reason?: string
+    degraded?: boolean
+    anti_spoofing?: string
+  }
 }
 
 export interface LatencyValues {

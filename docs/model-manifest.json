@@ -22,6 +22,13 @@
       "source": "ModelScope alias: fsmn-vad",
       "relative_path": "funasr/fsmn-vad",
       "status": "not_downloaded"
+    },
+    {
+      "name": "wespeaker-cnceleb-resnet34",
+      "kind": "speaker_embedding",
+      "source": "https://huggingface.co/Wespeaker/wespeaker-cnceleb-resnet34/resolve/main/cnceleb_resnet34.onnx?download=true",
+      "relative_path": "speaker/wespeaker-cnceleb-resnet34/cnceleb_resnet34.onnx",
+      "status": "not_downloaded"
     }
   ]
 }

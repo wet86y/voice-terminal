@@ -14,7 +14,7 @@ import type {
 } from './types'
 import { voiceShadowReplayFixture, voiceShadowReplayMeta } from './replay-data'
 
-export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'models'
+export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'models'
 export type ProductPage = 'home' | 'settings'
 export type AssignmentSlot = 'voice' | 'shadow' | 'status' | 'tts'
 
@@ -47,10 +47,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 2,
+  schema_version: 3,
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
   shadow: { experimental_context_gate_enabled: false },
+  speaker: { mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4 },
   persona: { instructions: '', personality: '', user: '', shadow: '' },
   warnings: [],
 }
@@ -86,6 +87,7 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   const wake = isRecord(value.wake) ? value.wake : {}
   const silence = isRecord(value.silence) ? value.silence : {}
   const shadow = isRecord(value.shadow) ? value.shadow : {}
+  const speaker = isRecord(value.speaker) ? value.speaker : {}
   const persona = isRecord(value.persona) ? value.persona : {}
   const text = (candidate: unknown) => typeof candidate === 'string' ? candidate : ''
   return {
@@ -103,6 +105,12 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
     },
     shadow: {
       experimental_context_gate_enabled: shadow.experimental_context_gate_enabled === true,
+    },
+    speaker: {
+      mode: typeof speaker.mode === 'string' && ['off', 'observe', 'filter'].includes(speaker.mode)
+        ? speaker.mode as ProductSettingsSnapshot['speaker']['mode'] : 'off',
+      confirm_threshold: typeof speaker.confirm_threshold === 'number' ? speaker.confirm_threshold : 0.5,
+      continuity_threshold: typeof speaker.continuity_threshold === 'number' ? speaker.continuity_threshold : 0.4,
     },
     persona: {
       instructions: text(persona.instructions),
@@ -154,6 +162,7 @@ function updateSettingsFromResponse(settings: ProductSettingsSnapshot, result: P
   if (isRecord(candidate.wake)) Object.assign(settings.wake, candidate.wake)
   if (isRecord(candidate.silence)) Object.assign(settings.silence, candidate.silence)
   if (isRecord(candidate.shadow)) Object.assign(settings.shadow, candidate.shadow)
+  if (isRecord(candidate.speaker)) Object.assign(settings.speaker, candidate.speaker)
   if (isRecord(candidate.persona)) Object.assign(settings.persona, candidate.persona)
   if (Array.isArray(candidate.warnings)) settings.warnings = candidate.warnings.filter((item): item is string => typeof item === 'string')
 }
@@ -179,6 +188,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const silenceSeconds = ref(30)
   const modelScanState = ref<'idle' | 'scanning' | 'complete'>('idle')
   const providerStep = ref<'idle' | 'discovering' | 'select-model' | 'custom-id' | 'verified'>('idle')
+  const speakerForm = reactive({ mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4 })
+  const speakerStatus = ref<Record<string, unknown>>({})
+  const speakerProfile = ref<Record<string, unknown>>({})
+  const speakerTestResult = ref<Record<string, unknown> | null>(null)
+  const ambientContext = ref<Record<string, unknown>>({ records: [] })
+  const speakerEnrollment = ref<{ id: string; segments: number[] } | null>(null)
   const discoveredModels = ref<string[]>([])
   const restartState = ref<'idle' | 'restarting' | 'complete' | 'error'>('idle')
   const applyImpact = ref<string[]>([])
@@ -261,6 +276,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     Object.assign(settings.wake, nextSettings.wake)
     Object.assign(settings.silence, nextSettings.silence)
     Object.assign(settings.shadow, nextSettings.shadow)
+    Object.assign(settings.speaker, nextSettings.speaker)
     Object.assign(settings.persona, nextSettings.persona)
     settings.schema_version = nextSettings.schema_version
     settings.warnings = nextSettings.warnings
@@ -270,6 +286,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       sensitivity: nextSettings.wake.sensitivity,
     })
     silenceSeconds.value = nextSettings.silence.seconds
+    Object.assign(speakerForm, nextSettings.speaker)
     Object.assign(personaDocuments, nextSettings.persona)
     registry.value = normalizeRegistry(value.models)
     syncAssignments(registry.value.assignments)
@@ -326,14 +343,140 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (replayMode) return
     if (snapshotRequest) return snapshotRequest
     loading.value = true
-    snapshotRequest = productApi.snapshot().then(value => {
+    snapshotRequest = productApi.snapshot().then(async value => {
       applySnapshot(value)
+      await refreshSpeaker()
       lastError.value = ''
     }).catch(setError).finally(() => {
       loading.value = false
       snapshotRequest = null
     })
     return snapshotRequest
+  }
+
+  async function refreshSpeaker() {
+    if (replayMode) return
+    try {
+      const [status, profile, ambient] = await Promise.all([
+        productApi.speakerStatus(), productApi.speakerProfile(), productApi.ambientContext(),
+      ])
+      speakerStatus.value = status
+      speakerProfile.value = profile
+      ambientContext.value = ambient
+    } catch (error) {
+      // The sidecar is optional; do not make the main product snapshot fail.
+      speakerStatus.value = { service: 'UNAVAILABLE', last_error: messageFromError(error) }
+    }
+  }
+
+  async function saveSpeaker() {
+    await enqueue(async () => {
+      saving.value = true
+      try {
+        const result = await productApi.saveSpeaker({ ...speakerForm })
+        updateSettingsFromResponse(settings, result)
+        Object.assign(speakerForm, settings.speaker)
+        await refreshSpeaker()
+        setNotice(result.message || '声纹设置已保存。')
+      } catch (error) {
+        setError(error)
+      } finally {
+        saving.value = false
+      }
+    })
+  }
+
+  async function startSpeakerEnrollment() {
+    try {
+      const value = await productApi.startSpeakerEnrollment()
+      const id = value.enrollment_id
+      if (typeof id !== 'string') throw new Error('后端未返回录音会话。')
+      speakerEnrollment.value = { id, segments: [] }
+      setNotice('录音会话已开始，请依次录制三段 5–10 秒声音。')
+    } catch (error) { setError(error) }
+  }
+
+  async function cancelSpeakerEnrollment(options: unknown = {}) {
+    const enrollment = speakerEnrollment.value
+    speakerEnrollment.value = null
+    if (enrollment) {
+      try {
+        await productApi.cancelSpeakerEnrollment(enrollment.id)
+      } catch {
+        // The local UI is already reset.  If the server is offline, its
+        // short-lived enrollment session still expires and is never written
+        // to disk; do not turn a best-effort cleanup into a blocking error.
+      }
+    }
+    const notify = !isRecord(options) || options.notify !== false
+    if (notify) {
+      setNotice('已取消本次录音会话；未提交的原始录音不会保留。')
+    }
+  }
+
+  async function addSpeakerEnrollmentSegment(index: number, label: string, pcmBase64: string) {
+    const enrollment = speakerEnrollment.value
+    if (!enrollment) return
+    try {
+      await productApi.addSpeakerEnrollmentSegment(enrollment.id, {
+        index, label, pcm_base64: pcmBase64,
+      })
+      if (!enrollment.segments.includes(index)) enrollment.segments.push(index)
+      setNotice(`第 ${index + 1} 段录音已接收。`)
+    } catch (error) { setError(error) }
+  }
+
+  async function commitSpeakerEnrollment() {
+    const enrollment = speakerEnrollment.value
+    if (!enrollment || enrollment.segments.length !== 3) {
+      setError(new Error('请先完成三段录音。'))
+      return
+    }
+    try {
+      await productApi.commitSpeakerEnrollment(enrollment.id)
+      speakerEnrollment.value = null
+      await refreshSpeaker()
+      setNotice('声纹资料已更新；原始录音已删除。')
+    } catch (error) { setError(error) }
+  }
+
+  async function deleteSpeakerTemplate(id: string) {
+    try {
+      const result = await productApi.deleteSpeakerTemplate(id)
+      if (result.downgraded_to === 'off') {
+        // Removing the last usable template safely disables filter mode on
+        // the server; keep the form and local settings projection aligned.
+        speakerForm.mode = 'off'
+        settings.speaker.mode = 'off'
+      }
+      await refreshSpeaker()
+      setNotice(result.downgraded_to === 'off'
+        ? '最后一个声纹模板已删除，筛选模式已降级为直通。'
+        : '声纹模板已删除。')
+    } catch (error) { setError(error) }
+  }
+
+  async function setSpeakerTemplateCentroid(id: string, include: boolean) {
+    try {
+      await productApi.setSpeakerTemplateCentroid(id, include)
+      await refreshSpeaker()
+      setNotice(include ? '模板已纳入主声纹中心。' : '模板已从主声纹中心移除。')
+    } catch (error) { setError(error) }
+  }
+
+  async function testSpeakerAudio(pcmBase64: string) {
+    try {
+      speakerTestResult.value = await productApi.testSpeaker({ pcm_base64: pcmBase64 })
+      setNotice('现场声纹测试已完成。')
+    } catch (error) { setError(error) }
+  }
+
+  async function refreshAmbientContext() {
+    try { ambientContext.value = await productApi.ambientContext() } catch (error) { setError(error) }
+  }
+
+  async function clearAmbientContext() {
+    try { ambientContext.value = await productApi.clearAmbientContext(); setNotice('环境记录已清空。') } catch (error) { setError(error) }
   }
 
   async function refreshRegistry() {
@@ -842,6 +985,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     silenceSeconds,
     personaDocument,
     personaDocuments,
+    speakerForm,
+    speakerStatus,
+    speakerProfile,
+    speakerTestResult,
+    ambientContext,
+    speakerEnrollment,
     providerForm,
     providerStep,
     discoveredModels,
@@ -880,6 +1029,17 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     saveSilence,
     saveShadowGate,
     savePersona,
+    saveSpeaker,
+    refreshSpeaker,
+    startSpeakerEnrollment,
+    cancelSpeakerEnrollment,
+    addSpeakerEnrollmentSegment,
+    commitSpeakerEnrollment,
+    deleteSpeakerTemplate,
+    setSpeakerTemplateCentroid,
+    testSpeakerAudio,
+    refreshAmbientContext,
+    clearAmbientContext,
     scanModels,
     discoverProvider,
     verifyCustomModel,

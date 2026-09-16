@@ -231,6 +231,38 @@ class AsrWorkerConfig:
 
 
 @dataclass(frozen=True)
+class SpeakerConfig:
+    mode: str = "off"
+    confirm_threshold: float = 0.50
+    continuity_threshold: float = 0.40
+    window_ms: int = 1500
+    step_ms: int = 500
+    min_speech_ms: int = 500
+    wait_ms: int = 150
+    model_id: str = "wespeaker-cnceleb-resnet34"
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"off", "observe", "filter"}:
+            raise ValueError("speaker.mode must be off, observe, or filter")
+        if not 0.0 <= self.continuity_threshold < self.confirm_threshold <= 1.0:
+            raise ValueError("speaker thresholds must satisfy 0 <= continuity < confirm <= 1")
+        if self.window_ms < 500 or self.step_ms < 100 or self.step_ms > self.window_ms:
+            raise ValueError("speaker window settings are invalid")
+        if self.min_speech_ms < 100 or self.min_speech_ms > self.window_ms:
+            raise ValueError("speaker.min_speech_ms is invalid")
+        if not 0 <= self.wait_ms <= 150:
+            raise ValueError("speaker.wait_ms must be between 0 and 150")
+
+
+@dataclass(frozen=True)
+class SpeakerWorkerConfig:
+    host: str = "127.0.0.1"
+    # Keep the speaker sidecar separate from the analysis worker, which uses
+    # the legacy 8767 endpoint by default.
+    port: int = 8768
+
+
+@dataclass(frozen=True)
 class ShadowProviderConfig:
     """Dedicated Responses provider settings for the shadow component.
 
@@ -350,6 +382,8 @@ class AppConfig:
     text_bridge: TextBridgeConfig = field(default_factory=TextBridgeConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     asr_worker: AsrWorkerConfig = field(default_factory=AsrWorkerConfig)
+    speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
+    speaker_worker: SpeakerWorkerConfig = field(default_factory=SpeakerWorkerConfig)
 
     @property
     def kws_dir(self) -> Path:
@@ -366,6 +400,14 @@ class AppConfig:
     @property
     def vad_model_dir(self) -> Path:
         return self.model_dir / "funasr" / "fsmn-vad"
+
+    @property
+    def speaker_model_path(self) -> Path:
+        return self.model_dir / "speaker" / self.speaker.model_id / "cnceleb_resnet34.onnx"
+
+    @property
+    def speaker_worker_url(self) -> str:
+        return f"ws://{self.speaker_worker.host}:{self.speaker_worker.port}/speaker"
 
     @property
     def resolved_asr_device(self) -> str:
@@ -397,6 +439,8 @@ class AppConfig:
         bridge = _section(data, "text_bridge")
         server = _section(data, "server")
         worker = _section(data, "asr_worker")
+        speaker = _section(data, "speaker")
+        speaker_worker = _section(data, "speaker_worker")
         persona = _section(data, "persona")
         shadow = _section(data, "shadow_agent")
         if "tools" in data:
@@ -645,6 +689,20 @@ class AppConfig:
             asr_worker=AsrWorkerConfig(
                 host=worker_host,
                 port=worker_port,
+            ),
+            speaker=SpeakerConfig(
+                mode=_string(speaker.get("mode"), "off").lower(),
+                confirm_threshold=float(_number(speaker.get("confirm_threshold"), 0.50)),
+                continuity_threshold=float(_number(speaker.get("continuity_threshold"), 0.40)),
+                window_ms=int(_number(speaker.get("window_ms"), 1500)),
+                step_ms=int(_number(speaker.get("step_ms"), 500)),
+                min_speech_ms=int(_number(speaker.get("min_speech_ms"), 500)),
+                wait_ms=int(_number(speaker.get("wait_ms"), 150)),
+                model_id=_string(speaker.get("model_id"), "wespeaker-cnceleb-resnet34"),
+            ),
+            speaker_worker=SpeakerWorkerConfig(
+                host=_string(speaker_worker.get("host"), "127.0.0.1"),
+                port=int(_number(speaker_worker.get("port"), 8768)),
             ),
         )
 

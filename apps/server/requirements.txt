@@ -4,6 +4,7 @@ funasr>=1.4.0,<1.5
 pypinyin>=0.50,<1
 modelscope>=1.20,<2
 sherpa-onnx==1.13.7
+onnxruntime==1.24.3
 sounddevice==0.5.6
 soundfile>=0.12,<1
 websockets>=12,<16

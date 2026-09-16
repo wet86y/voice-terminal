@@ -365,6 +365,29 @@ class EpisodeController(RealtimeController):
         return progress
 
     async def _input_committed(self, ws, token):
+        speaker_decision = await self._speaker_decision(ws)
+        if speaker_decision is not None and speaker_decision.route == "ambient" and ws.final_text:
+            if self.ambient_store is not None:
+                self.ambient_store.append({
+                    "turn_id": ws.turn_id,
+                    "text": ws.final_text,
+                    "speaker_state": speaker_decision.state.value,
+                    "similarity": speaker_decision.similarity,
+                    "reason": speaker_decision.reason,
+                    "refined_text": ws.refined_text,
+                })
+            ws.speaker_blocked = True
+            await self._detail("speaker.blocked", decision=speaker_decision.to_payload(), text=ws.final_text)
+            # ASR partials may have started an optimistic Bidi/TTS prewarm
+            # before the 150 ms speaker gate completed. A filtered turn must
+            # never retain or emit that output resource.
+            await self._cancel_tts_prewarm(ws.turn_id)
+            await self._retire_committed_input(ws)
+            # A filtered transcript is an ambient-only record, not the active
+            # user input shown in the ordinary conversation projection.
+            self.state.current.update(final_text="", partial_text="")
+            await self._state_event(TerminalState.IDLE, listening=self.state.listening)
+            return True
         if ws.final_text:
             if not any(item.get("kind") == "asr_final" for item in ws.transcript_updates):
                 ws.transcript_updates.append({
@@ -375,7 +398,8 @@ class EpisodeController(RealtimeController):
                                        text=ws.paraformer_final or ws.final_text,
                                        source="paraformer", source_revision=ws.generation,
                                        provisional_transcript=ws.paraformer_final, audio_cues=list(ws.audio_cues),
-                                       analysis=dict(ws.analysis), output_generation=ws.generation,
+                                       analysis=dict(ws.analysis), speaker_decision=dict(ws.speaker_decision),
+                                       output_generation=ws.generation,
                                        input_finished_at=ws.timings.get("commit"))
             ws.episode_id = self.episode.episode_id
             if ws.episode_id:
@@ -407,6 +431,7 @@ class EpisodeController(RealtimeController):
             "segments": list(ws.segments), "audio_cues": list(ws.audio_cues),
             "analysis": dict(ws.analysis), "refined_text": ws.refined_text,
             "refinement_available": ws.refinement_available,
+            "speaker_decision": dict(ws.speaker_decision),
             "transcript_updates": [dict(item) for item in ws.transcript_updates],
         })
         record = self.history.append_record({
@@ -417,6 +442,7 @@ class EpisodeController(RealtimeController):
                         "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis),
                         "refined_text": ws.refined_text,
                         "refinement_available": ws.refinement_available,
+                        "speaker_decision": dict(ws.speaker_decision),
                         "transcript_updates": [dict(item) for item in ws.transcript_updates]},
         })
         self._input_history_committed.add(ws.turn_id)
@@ -580,6 +606,13 @@ class EpisodeController(RealtimeController):
                 await self._publish(event("speech.emotion", ws.turn_id, output_generation=ws.generation,
                                            status="READY", source="SenseVoiceSmall", segments=segments,
                                            workspace=ws.snapshot()))
+
+        # A filtered turn has no ordinary SessionLedger/Agent entry.  A late
+        # SenseVoice result may enrich only its session-scoped ambient record.
+        if ws.speaker_blocked:
+            if self.ambient_store is not None:
+                self.ambient_store.update_refined(ws.turn_id, text)
+            return
 
         # Do not let a refinement that wins the race with finalization start a
         # provisional Agent decision.  The final observer below will call this

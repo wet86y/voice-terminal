@@ -15,6 +15,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Push-Location $RepoRoot
 $worker = $null
 $analysisWorker = $null
+$speakerWorker = $null
 $web = $null
 $webPort = 5173
 $webUrl = "http://127.0.0.1:$webPort/"
@@ -66,7 +67,11 @@ function Stop-ProcessTree([int]$ProcessId) {
 }
 
 try {
-  $serviceConfig = & $Python -c "import json,sys; from pathlib import Path; from voice_terminal.config import load_config; from urllib.parse import urlparse; c=load_config(Path('config/default.yaml'),Path(sys.argv[1]) if Path(sys.argv[1]).is_file() else None); a=urlparse(c.smart_turn.analysis_url); w=urlparse(c.asr.worker_url); print(json.dumps({'analysis_enabled':c.smart_turn.smart_turn or c.smart_turn.sensevoice,'analysis_smart_turn':c.smart_turn.smart_turn,'analysis_sensevoice':c.smart_turn.sensevoice,'analysis_health':'http://'+a.netloc+'/health','asr_url':c.asr.worker_url,'asr_host':w.hostname,'asr_port':w.port,'server_host':c.server.host,'server_port':c.server.port}))" $Config
+  $serviceConfig = & $Python -c "import json,sys; from pathlib import Path; from voice_terminal.config import load_config; from urllib.parse import urlparse; c=load_config(Path('config/default.yaml'),Path(sys.argv[1]) if Path(sys.argv[1]).is_file() else None); p=Path('config/product-settings.json'); mode=c.speaker.mode;
+if p.is_file():
+ try: mode=json.loads(p.read_text(encoding='utf-8')).get('speaker',{}).get('mode',mode)
+ except Exception: pass
+a=urlparse(c.smart_turn.analysis_url); w=urlparse(c.asr.worker_url); print(json.dumps({'analysis_enabled':c.smart_turn.smart_turn or c.smart_turn.sensevoice,'analysis_smart_turn':c.smart_turn.smart_turn,'analysis_sensevoice':c.smart_turn.sensevoice,'analysis_health':'http://'+a.netloc+'/health','asr_url':c.asr.worker_url,'asr_host':w.hostname,'asr_port':w.port,'speaker_enabled':mode != 'off','speaker_mode':mode,'speaker_url':c.speaker_worker_url,'speaker_model_path':str(c.speaker_model_path),'speaker_host':c.speaker_worker.host,'speaker_port':c.speaker_worker.port,'server_host':c.server.host,'server_port':c.server.port}))" $Config
   if ($LASTEXITCODE -ne 0) { throw "无法读取启动配置" }
   $serviceConfig = $serviceConfig | ConvertFrom-Json
   $existingServer = @(Get-ListeningProcessDetails ([int]$serviceConfig.server_port))
@@ -128,6 +133,34 @@ try {
     }
   }
 
+  if ($serviceConfig.speaker_enabled) {
+    $speakerOut = Join-Path $LogDir "speaker-worker.out.log"
+    $speakerErr = Join-Path $LogDir "speaker-worker.err.log"
+    $speakerProbeOutput = & $Python -m voice_terminal.speaker.probe --url $serviceConfig.speaker_url --timeout 2 2>&1
+    if ($LASTEXITCODE -eq 0) {
+      Write-Host "Speaker Worker 已就绪：$($serviceConfig.speaker_url)"
+    } elseif (-not (Test-Path -LiteralPath $serviceConfig.speaker_model_path)) {
+      Write-Warning "声纹模式已启用，但 WeSpeaker 模型不存在：$($serviceConfig.speaker_model_path)。将以降级直通运行。"
+    } else {
+      $speakerWorker = Start-Process -FilePath $Python -ArgumentList @("-m", "voice_terminal.speaker.worker", "--config", $Config) -WorkingDirectory $RepoRoot -WindowStyle Hidden -RedirectStandardOutput $speakerOut -RedirectStandardError $speakerErr -PassThru
+      $speakerReady = $false
+      for ($attempt = 0; $attempt -lt 60; $attempt++) {
+        Start-Sleep -Milliseconds 500
+        if ($speakerWorker.HasExited) { break }
+        $speakerProbeOutput = & $Python -m voice_terminal.speaker.probe --url $serviceConfig.speaker_url --timeout 2 2>&1
+        if ($LASTEXITCODE -eq 0) {
+          $speakerReady = $true
+          break
+        }
+      }
+      if (-not $speakerReady) {
+        Write-Warning "Speaker Worker 未能通过应用层 health；Voice Server 将以降级直通运行。`n探针：$speakerProbeOutput"
+      } else {
+        Write-Host "Speaker Worker 已就绪：$($serviceConfig.speaker_url)"
+      }
+    }
+  }
+
   if (-not $NoWeb) {
     $existingWeb = @(Get-ListeningProcessDetails $webPort)
     if ($existingWeb.Count -gt 0) {
@@ -172,6 +205,9 @@ try {
   }
   if ($worker -and -not $worker.HasExited) {
     Stop-Process -Id $worker.Id -Force -ErrorAction SilentlyContinue
+  }
+  if ($speakerWorker -and -not $speakerWorker.HasExited) {
+    Stop-Process -Id $speakerWorker.Id -Force -ErrorAction SilentlyContinue
   }
   if ($web -and -not $web.HasExited) {
     Stop-ProcessTree $web.Id

@@ -79,8 +79,26 @@ def run_checks(config_path: Path, *, online: bool = False, model_dir: Path | Non
     except Exception as exc:
         checks.append(_check("audio", False, str(exc)))
 
-    model_errors = validate_models(config.model_dir)
+    # WeSpeaker is an optional sidecar.  Core audio/ASR readiness must not be
+    # reported as failed merely because its model has not been installed.
+    model_errors = validate_models(config.model_dir, require_speaker=False)
     checks.append(_check("models", not model_errors, "ready" if not model_errors else "; ".join(model_errors)))
+    from .model_setup import _is_wespeaker_model_complete
+    speaker_model = config.model_dir / "speaker" / config.speaker.model_id
+    speaker_ready = _is_wespeaker_model_complete(speaker_model)
+    if config.speaker.mode == "off":
+        checks.append(_check("models:speaker", True, "optional sidecar disabled"))
+    else:
+        checks.append(_check(
+            "models:speaker", speaker_ready,
+            str(speaker_model) if speaker_ready else f"optional model unavailable: {speaker_model}",
+            warning=True,
+        ))
+        try:
+            import onnxruntime  # type: ignore
+            checks.append(_check("python:onnxruntime", True, "installed"))
+        except ImportError:
+            checks.append(_check("python:onnxruntime", False, "missing; speaker sidecar will degrade", warning=True))
     if config.smart_turn.enabled:
         from .analysis.model_setup import validate
         analysis_errors = validate(config.model_dir)

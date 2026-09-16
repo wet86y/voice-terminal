@@ -19,6 +19,10 @@ from ..core.state import TerminalState
 from ..kws.keywords import strip_wake_prefix
 from ..kws.service import KwsAudioFrame
 from ..tts.alignment import DeliveryResolver
+from ..speaker.client import SpeakerWorkerClient
+from ..speaker.contracts import SpeakerDecision, SpeakerObservation, SpeakerMode, SpeakerState
+from ..speaker.router import SpeakerRouter
+from ..session.ambient import AmbientTranscriptStore
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,11 @@ class RealtimeController(SpeechPipeline, InputController):
     def __init__(self, *, options: InputOptions, analysis=None,
                  shadow_waker=None, shadow_available: bool = False, **kwargs) -> None:
         self.conversation = kwargs.pop("conversation")
+        self.speaker_client: SpeakerWorkerClient | None = kwargs.pop("speaker_client", None)
+        self.speaker_router: SpeakerRouter | None = kwargs.pop("speaker_router", None)
+        self.speaker_mode = str(kwargs.pop("speaker_mode", "off"))
+        self.speaker_wait_ms = int(kwargs.pop("speaker_wait_ms", 150))
+        self.ambient_store: AmbientTranscriptStore | None = kwargs.pop("ambient_store", None)
         super().__init__(**kwargs)
         self.options = options
         self.analysis = analysis or AnalysisClient(options.analysis_url)
@@ -64,6 +73,86 @@ class RealtimeController(SpeechPipeline, InputController):
         self._vad_generation = 0
         self._reset_vad_pending = False
         self._activation_generation = 0
+
+    async def on_speaker_observation(self, observation: SpeakerObservation) -> None:
+        router = getattr(self, "speaker_router", None)
+        if router is None:
+            return
+        previous_state = router.machine.state
+        enriched = router.observe(observation)
+        ws = self.workspace
+        if ws is None or ws.turn_id != enriched.turn_id or ws.generation != enriched.generation:
+            return
+        ws.speaker_observations.append(enriched.to_payload(include_embedding=False))
+        if len(ws.speaker_observations) > 16:
+            del ws.speaker_observations[:-8]
+        decision = router.decision()
+        # Window scores stay inside the sidecar.  Publish only a meaningful
+        # state transition; the final per-turn decision is emitted below at
+        # the semantic commit boundary.
+        if decision.state != previous_state:
+            ws.speaker_decision = decision.to_payload()
+            ws.speaker_state = decision.state.value
+            ws.speaker_degraded_reason = decision.reason if decision.degraded else ""
+            self.state.current.update(speaker_decision=decision.to_payload())
+            await self._publish(event("speaker.state", ws.turn_id,
+                                      output_generation=ws.generation,
+                                      state=decision.to_payload(),
+                                      observation=enriched.to_payload(include_embedding=False)))
+
+    async def _speaker_decision(self, ws: TurnWorkspace) -> SpeakerDecision | None:
+        mode = str(getattr(ws, "speaker_mode", getattr(self, "speaker_mode", "off")))
+        speaker_router = getattr(self, "speaker_router", None)
+        if mode == SpeakerMode.OFF or speaker_router is None:
+            return None
+        router = speaker_router
+        speaker_client = getattr(self, "speaker_client", None)
+        if speaker_client is None or not speaker_client.connected:
+            router.mark_unavailable("speaker_worker_unavailable")
+            decision = router.decision(
+                route="main" if mode == SpeakerMode.OBSERVE else "passthrough",
+                degraded=True,
+            )
+        else:
+            finished = await speaker_client.finish_turn(
+                ws.turn_id, ws.generation,
+                timeout_ms=getattr(self, "speaker_wait_ms", 150),
+            )
+            if not finished or speaker_client.degraded:
+                reason = "speaker_queue_overflow" if speaker_client.degraded else "speaker_timeout"
+                # A timeout is itself a degraded observation boundary.  Mark
+                # the optional service accordingly while still fail-opening
+                # the semantic route; a later reconnect/health check can
+                # return it to READY.
+                self.state.set_service("speaker", "DEGRADED")
+                decision = router.decision(
+                    route="main" if mode == SpeakerMode.OBSERVE else "passthrough",
+                    degraded=True, reason=reason,
+                )
+            else:
+                decision = router.decision()
+                if decision.state == SpeakerState.NON_OWNER_CONFIRMED:
+                    route = "ambient" if mode == SpeakerMode.FILTER else "main"
+                    decision = router.decision(route=route)
+                elif mode == SpeakerMode.OBSERVE:
+                    decision = router.decision(route="main")
+                elif decision.state in {SpeakerState.UNKNOWN, SpeakerState.UNAVAILABLE}:
+                    decision = router.decision(
+                        route="main" if mode == SpeakerMode.OBSERVE else "passthrough",
+                        degraded=True,
+                        reason=("speaker_unavailable" if decision.state == SpeakerState.UNAVAILABLE
+                                else "speaker_insufficient_evidence"),
+                    )
+                else:
+                    decision = router.decision(route="main")
+        ws.speaker_decision = decision.to_payload()
+        ws.speaker_state = decision.state.value
+        ws.speaker_degraded_reason = decision.reason if decision.degraded else ""
+        self.state.current.update(speaker_decision=decision.to_payload())
+        await self._publish(event("speaker.decision", ws.turn_id,
+                                  output_generation=ws.generation,
+                                  decision=decision.to_payload()))
+        return decision
 
     def _track(self, task: asyncio.Task | None) -> None:
         if task is None:
@@ -812,6 +901,21 @@ class RealtimeController(SpeechPipeline, InputController):
             if self._active_input:
                 self._queue_asr(AudioChunk(self._sub_id, frame.pcm))
 
+        speaker_client = getattr(self, "speaker_client", None)
+        if speaker_client is not None and ws is not None:
+            submitted = speaker_client.submit_frame(
+                turn_id=ws.turn_id,
+                generation=ws.generation,
+                pcm=frame.pcm,
+                start_sample=frame.start_sample,
+                end_sample=frame.end_sample,
+            )
+            if not submitted and speaker_client.degraded:
+                # Queue overflow never backpressures this audio callback; it
+                # only downgrades the optional service so the final gate will
+                # pass the turn through.
+                self.state.set_service("speaker", "DEGRADED")
+
         if not self._active_input:
             if activity.speech_started:
                 self._resume_started = self._vad_origin + (activity.speech_start_sample or 0)
@@ -914,7 +1018,13 @@ class RealtimeController(SpeechPipeline, InputController):
         turn_id = self.turns.begin()
         self.state.clear_current()
         self.conversation.begin_turn(turn_id)
-        self.workspace = ws = TurnWorkspace(turn_id, started_at=frame.captured_at)
+        self.workspace = ws = TurnWorkspace(
+            turn_id,
+            started_at=frame.captured_at,
+            speaker_mode=self.speaker_mode,
+        )
+        if self.speaker_router is not None:
+            self.speaker_router.reset(turn_id=turn_id, generation=ws.generation)
         ws.timings["turn_started"] = ws.started_at
         self._turn_timings[turn_id] = ws.timings
         if len(self._turn_timings) > 64:
@@ -972,6 +1082,16 @@ class RealtimeController(SpeechPipeline, InputController):
         if not bool(getattr(output, "playback_hold_active", False)):
             self._stop_playback_snapshot(ws.playback_key)
         ws.resume()
+        # A resumed same-turn segment is a new semantic speech segment.  Pick
+        # up a mode change made while the previous segment was finalizing, but
+        # keep the old segment's captured mode for its already-running gate.
+        ws.speaker_mode = self.speaker_mode
+        if self.speaker_router is not None:
+            # A resumed turn keeps its public turn_id but starts a new
+            # speaker generation.  Any late embedding from the previous
+            # generation must therefore be rejected just like a stale ASR or
+            # refinement callback.
+            self.speaker_router.reset(turn_id=ws.turn_id, generation=ws.generation)
         stopped = self._stop_generation()
         if stopped:
             await asyncio.gather(*stopped, return_exceptions=True)

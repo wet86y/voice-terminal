@@ -88,6 +88,15 @@ class TurnWorkspace:
     timings: dict[str, float] = field(default_factory=dict)
     tts_prewarm_started: bool = False
     tts_prewarm_status: str = "NOT_REQUESTED"
+    speaker_decision: dict = field(default_factory=dict)
+    speaker_observations: list[dict] = field(default_factory=list)
+    speaker_state: str = "unknown"
+    speaker_degraded_reason: str = ""
+    speaker_blocked: bool = False
+    # Capture the routing mode at turn start.  Product mode changes can then
+    # take effect on the next speech segment without rewriting a turn that is
+    # already being finalized.
+    speaker_mode: str = "off"
 
     @property
     def token(self) -> tuple[str, int]:
@@ -118,6 +127,11 @@ class TurnWorkspace:
         self.tts_segments.clear()
         self.delivery.clear()
         self.interruption_recorded = False
+        self.speaker_decision.clear()
+        self.speaker_observations.clear()
+        self.speaker_state = "unknown"
+        self.speaker_degraded_reason = ""
+        self.speaker_blocked = False
 
     def snapshot(self) -> dict:
         return {
@@ -129,6 +143,12 @@ class TurnWorkspace:
             "transcript_updates": [dict(item) for item in self.transcript_updates],
             "tts_prewarm_started": self.tts_prewarm_started,
             "tts_prewarm_status": self.tts_prewarm_status,
+            "speaker_decision": dict(self.speaker_decision),
+            "speaker_observations": [dict(item) for item in self.speaker_observations[-8:]],
+            "speaker_state": self.speaker_state,
+            "speaker_degraded_reason": self.speaker_degraded_reason,
+            "speaker_blocked": self.speaker_blocked,
+            "speaker_mode": self.speaker_mode,
             "segments": list(self.segments),
             "tools": list(self.tools), "audio_cues": list(self.audio_cues),
             "analysis": dict(self.analysis),

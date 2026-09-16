@@ -41,6 +41,11 @@ export interface ProductSettingsSnapshot {
   shadow: {
     experimental_context_gate_enabled: boolean
   }
+  speaker: {
+    mode: 'off' | 'observe' | 'filter' | string
+    confirm_threshold: number
+    continuity_threshold: number
+  }
   persona: Record<'instructions' | 'personality' | 'user' | 'shadow', string>
   warnings: string[]
 }

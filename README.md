@@ -110,6 +110,36 @@ shadow_agent:
 
 `config/local.yaml` 用于本机非密钥覆盖；API key 放入 `.env.local` 或进程环境。
 
+### 可选声纹增强
+
+声纹识别是独立旁路，默认关闭，不会挡住音频采集、VAD、Paraformer partial/final 或
+SenseVoice 精修。设置页的“声纹识别”标签可以录制固定的主人用户；首版要求三段 5–10 秒
+录音，允许为每段添加标签（例如“低声”“夹嗓子”）。声纹提取成功后只保存向量和质量摘要，
+原始注册录音立即删除。
+
+运行模式只有三种：
+
+- `off`：不启动实时声纹旁路；行为与未安装组件完全相同。
+- `observe`：运行识别并附加诊断，所有 ASR final 仍照常进入主对话；首次启用建议使用此模式。
+- `filter`：只有连续证据明确判定为非本人时才把文本放入当前会话的环境记录；证据不足、
+  Worker 不可用、队列溢出或 150 ms 等待超时都会安全直通。
+
+产品设置文件只保存以下非敏感字段：
+
+```json
+{"speaker":{"mode":"off","confirm_threshold":0.5,"continuity_threshold":0.4}}
+```
+
+声纹使用 1.5 秒滑动窗口和 500 ms 更新步长。普通确认阈值与连续保持阈值采用固定迟滞，
+不是会话级动态调阈值；设置页高级区域可以调整并恢复默认。阈值是交互测试基线，不是付款、
+删除、门锁等高风险操作的身份认证，也没有录音回放、合成语音或变声防伪能力。
+`similarity` 记录 WeSpeaker 的原始余弦相似度（约 -1 到 1），不会平移成概率。
+
+资料存放在 `config/speaker/registry.json` 与受管 `templates/` 目录，不写入
+`product-settings.json`。筛选到旁路的文字只在当前 Voice Server 会话内保留，设置页可以查看
+和清空；Shadow 只有在确有需要时才能通过只读 `read_ambient_context` 工具读取，不会因为环境
+记录自动唤醒。
+
 ## 启动
 
 ```powershell
@@ -121,7 +151,8 @@ shadow_agent:
 `http://127.0.0.1:5173/` 可访问。仅调试后端时使用 `-NoWeb`。真实运行需配置
 `DEEPSEEK_API_KEY`、`MINIMAX_API_KEY`，OpenCode Go 调试另需 `OPENCODE_GO_API_KEY`。
 默认 Voice Server 地址为 `http://127.0.0.1:8765/`；可用 `/health` 检查
-`shadow_agent`、`analysis`、`asr`、`llm` 和 `tts` 服务状态。产品页设置中的“实验性 Shadow
+`speaker`、`shadow_agent`、`analysis`、`asr`、`llm` 和 `tts` 服务状态；其中 `speaker` 为可选旁路，
+`DEGRADED` 不会阻塞主链。产品页设置中的“实验性 Shadow
 上下文门禁”也可通过 `PUT /api/v1/product/settings/shadow` 即时切换，服务无需重启。
 
 ### Web 产品页与日志回放
@@ -172,6 +203,12 @@ ASR/LLM/TTS 会话，适合在调整关键词、阈值或麦克风设备后做�
 `input_owner` 在待机时应为 `kws`，`kws.submitted_frames` 应持续增长；若 `dropped_frames` 增长，
 说明 KWS 队列拥塞；若 `detected_count` 保持为零，则优先检查关键词、灵敏度、麦克风输入和
 `kws.error`。`wake_always_on` 如果仍出现在运行时状态中只是兼容性状态字段，不是另一个设置项。
+
+若点击“开始语音会话”后没有进入监听，先检查 `services.kws` 和 `startup_errors`。启用 KWS 时，
+配置中的 `wake.keyword_label` 必须与受管 `keywords.txt` 中的 `@LABEL` 一致；例如唤醒词设置为
+“执事”时，文件必须包含 `@执事`，如果仍只有旧的 `@HEI_CLAW`，后端会返回
+`KWS_WORKER_FAILED` 并保持未监听。只进行声纹测试时，可在“设置 → KWS 唤醒词”关闭 KWS，保存后
+下一次点击会直接进入 ASR；需要保留唤醒词时，在设置页重新保存目标词以触发关键词文件重新生成。
 
 ## AEC 与播放期插话
 
