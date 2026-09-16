@@ -157,6 +157,22 @@ asr_worker:
   host: 127.0.0.1
   port: 8766
 
+speaker:
+  # Optional sidecar.  off | observe | filter
+  mode: off
+  confirm_threshold: 0.50
+  continuity_threshold: 0.40
+  window_ms: 1500
+  step_ms: 500
+  min_speech_ms: 500
+  wait_ms: 150
+  model_id: wespeaker-cnceleb-resnet34
+
+speaker_worker:
+  host: 127.0.0.1
+  # 8767 is reserved for the Smart Turn / SenseVoice analysis worker.
+  port: 8768
+
 agent:
   enabled: true
   max_context_tokens: 524288

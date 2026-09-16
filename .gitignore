@@ -16,6 +16,7 @@ venv/
 config/local.yaml
 config/model-registry.json
 config/product-settings.json
+config/speaker/
 *.part
 
 # Runtime artifacts (always local; do not version generated logs or reports)

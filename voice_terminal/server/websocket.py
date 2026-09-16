@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
@@ -30,9 +32,15 @@ from ..shadow_agent.component import ShadowAgentSession
 from ..shadow_agent.events import ShadowEventBuffer
 from ..shadow_agent.prompts import load_shadow_instructions
 from ..shadow_agent.provider import DeepSeekResponsesShadowProvider
-from ..shadow_agent.tools import ShadowToolExecutor
+from ..shadow_agent.tools import AmbientContextTools, ShadowToolExecutor
 from ..session.ledger import SessionLedger
 from ..session.runtime import ConversationRuntime
+from ..session.ambient import AmbientTranscriptStore
+from ..speaker.client import SpeakerWorkerClient, SpeakerWorkerError
+from ..speaker.registry import SpeakerProfileStore
+from ..speaker.router import SpeakerRouter
+from ..speaker.engine import SpeakerModelError, WeSpeakerOnnxEngine
+from ..speaker.recording import decode_audio_bytes
 from ..vad.detector import FsmnVadDetector, VadError
 from ..model_registry.service import ModelRegistryError, ModelRegistryService
 from ..model_registry.vault import CredentialVaultUnavailable
@@ -95,12 +103,257 @@ class SessionRuntime:
         self.player: PcmPlayer | None = None
         self.audio_processor: AudioPreprocessor | None = None
         self.controller: EpisodeController | None = None
+        profile_root = config.persona.directory.resolve().parent / "speaker"
+        self.ambient_store = AmbientTranscriptStore()
+        self.speaker_profile = SpeakerProfileStore(profile_root, model_id=config.speaker.model_id)
+        self.speaker_router = SpeakerRouter(
+            self.speaker_profile,
+            confirm_threshold=config.speaker.confirm_threshold,
+            continuity_threshold=config.speaker.continuity_threshold,
+            min_speech_ms=config.speaker.min_speech_ms,
+        )
+        self.speaker: SpeakerWorkerClient | None = None
+        self._speaker_engine: WeSpeakerOnnxEngine | None = None
+        self._speaker_enrollment: dict[str, dict[str, Any]] = {}
+        self._speaker_test_result: dict[str, Any] | None = None
         self.conversation = ConversationRuntime()
         self._session_lock = asyncio.Lock()
         self.build_info: dict[str, Any] = {}
         self.reasoning_mode = config.llm.reasoning_mode
         self._credential_overrides: dict[str, str] = {}
         self.state.wake_always_on = bool(config.wake.enabled)
+        self.state.set_service("speaker", "DISABLED" if config.speaker.mode == "off" else "STARTING")
+
+    async def _on_speaker_observation(self, observation) -> None:
+        controller = self.controller
+        if controller is not None:
+            await controller.on_speaker_observation(observation)
+
+    async def _initialize_speaker(self, *, force: bool = False) -> None:
+        self.state.set_service("speaker", "DISABLED")
+        if self.config.speaker.mode == "off" and not force:
+            return
+        self.state.set_service("speaker", "STARTING")
+        if not self.speaker_profile.available:
+            logger.info("speaker sidecar enabled without a registered profile")
+        client: SpeakerWorkerClient | None = None
+        try:
+            client = SpeakerWorkerClient(
+                self.config.speaker_worker_url,
+                on_observation=self._on_speaker_observation,
+            )
+            await client.connect()
+            await client.health(timeout_s=1.5)
+            self.speaker = client
+            self.state.set_service("speaker", "READY")
+        except Exception as exc:
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:
+                    logger.debug("speaker.client_cleanup_failed", exc_info=True)
+            self.speaker = None
+            self.state.set_service("speaker", "DEGRADED")
+            self.startup_errors.append(f"speaker: {type(exc).__name__}: {str(exc)[:240]}")
+            logger.warning("optional speaker sidecar unavailable: %s", exc)
+
+    async def ensure_speaker_worker(self) -> bool:
+        """Start the sidecar on demand before enabling strict filtering."""
+        if (self.speaker is not None and self.speaker.connected
+                and not self.speaker.degraded
+                and self.state.services.get("speaker") == "READY"):
+            return True
+        stale = self.speaker
+        self.speaker = None
+        if stale is not None:
+            try:
+                await stale.close()
+            except Exception:
+                logger.debug("speaker.stale_client_cleanup_failed", exc_info=True)
+        await self._initialize_speaker(force=True)
+        return bool(self.speaker is not None and self.speaker.connected)
+
+    def speaker_status(self) -> dict[str, Any]:
+        profile = self.speaker_profile.snapshot()
+        service = self.state.services.get("speaker", "DISABLED")
+        # The receive loop marks a disconnected socket locally so the next
+        # turn can fail open immediately.  Reflect that edge in the public
+        # health/status projection as well; otherwise a READY value could be
+        # displayed after the worker has already gone away.
+        if (self.config.speaker.mode != "off"
+                and self.speaker is not None and not self.speaker.connected
+                and service == "READY"):
+            service = "DEGRADED"
+            self.state.set_service("speaker", service)
+        startup_error = next((item for item in reversed(self.startup_errors)
+                              if str(item).startswith("speaker:")), None)
+        return {
+            "mode": self.config.speaker.mode,
+            "service": service,
+            "worker_connected": bool(self.speaker is not None and self.speaker.connected),
+            "model_id": self.config.speaker.model_id,
+            "model_path": str(self.config.speaker_model_path),
+            "model_present": self.config.speaker_model_path.is_file(),
+            "registered": bool(profile.get("available")),
+            "filter_allowed": bool(profile.get("available")) and service == "READY"
+            and bool(self.speaker is not None and self.speaker.connected),
+            "profile": profile,
+            "last_error": (
+                self.speaker.last_error if self.speaker is not None and self.speaker.last_error
+                else startup_error or profile.get("warning")
+            ),
+            "test": dict(self._speaker_test_result or {}),
+            "anti_spoofing": "unavailable",
+        }
+
+    def speaker_profile_snapshot(self) -> dict[str, Any]:
+        return self.speaker_profile.snapshot()
+
+    def start_speaker_enrollment(self) -> dict[str, Any]:
+        enrollment_id = uuid4().hex
+        while len(self._speaker_enrollment) >= 4:
+            oldest_id = next(iter(self._speaker_enrollment))
+            stale = self._speaker_enrollment.pop(oldest_id, {})
+            if isinstance(stale, dict) and isinstance(stale.get("segments"), dict):
+                stale["segments"].clear()
+        # Enrollment IDs are intentionally short-lived and single-use; raw
+        # PCM exists only in this in-memory session until commit/failure.
+        self._speaker_enrollment[enrollment_id] = {
+            "segments": {}, "created_at": time.monotonic(),
+        }
+        return {
+            "enrollment_id": enrollment_id,
+            "required_segments": 3,
+            "min_segment_ms": 5000,
+            "max_segment_ms": 10000,
+        }
+
+    def cancel_speaker_enrollment(self, enrollment_id: str) -> bool:
+        """Discard one in-progress enrollment and every raw PCM reference."""
+        session = self._speaker_enrollment.pop(str(enrollment_id or ""), None)
+        if not isinstance(session, dict):
+            return False
+        segments = session.get("segments")
+        if isinstance(segments, dict):
+            segments.clear()
+        return True
+
+    def add_speaker_enrollment_segment(self, enrollment_id: str, *, index: int,
+                                       label: str, encoded: str) -> dict[str, Any]:
+        session = self._speaker_enrollment.get(enrollment_id)
+        if session is None:
+            raise ValueError("录音会话不存在或已过期")
+        if time.monotonic() - float(session.get("created_at") or 0) > 15 * 60:
+            expired = self._speaker_enrollment.pop(enrollment_id, None)
+            if isinstance(expired, dict) and isinstance(expired.get("segments"), dict):
+                expired["segments"].clear()
+            raise ValueError("录音会话已过期，请重新开始")
+        if isinstance(index, bool) or not isinstance(index, int) or index not in {0, 1, 2}:
+            raise ValueError("录音段编号必须是 0、1 或 2")
+        if not isinstance(encoded, str) or len(encoded) > 4_000_000:
+            raise ValueError("录音数据过大")
+        try:
+            audio = decode_audio_bytes(base64.b64decode(encoded, validate=True))
+        except Exception as exc:
+            raise ValueError(f"录音数据无效：{type(exc).__name__}") from exc
+        duration_ms = len(audio) // 2 * 1000 // self.config.audio.sample_rate
+        if duration_ms < 5000 or duration_ms > 10000:
+            raise ValueError("每段录音长度必须在 5 至 10 秒之间")
+        try:
+            import numpy as np  # type: ignore
+            values = np.frombuffer(audio, dtype="<i2").astype(np.float32)
+            rms = float(np.sqrt(np.mean((values / 32768.0) ** 2))) if values.size else 0.0
+            clipped = float(np.mean(np.abs(values) >= 32760.0)) if values.size else 0.0
+            effective_ms = int(np.count_nonzero(np.abs(values) >= 327.0) * 1000 / self.config.audio.sample_rate)
+            if rms < 0.003 or effective_ms < 500:
+                raise ValueError("录音音量过低或有效人声不足，请在安静环境中重录")
+            if clipped > 0.02:
+                raise ValueError("录音存在明显削波，请降低麦克风音量后重录")
+        except ImportError:
+            pass
+        session["segments"][index] = {
+            "label": str(label or "自定义")[:80],
+            "pcm": audio,
+            "duration_ms": duration_ms,
+        }
+        return {"index": index, "duration_ms": duration_ms, "received": len(session["segments"])}
+
+    def _get_speaker_engine(self) -> WeSpeakerOnnxEngine:
+        engine = self._speaker_engine
+        if engine is None or engine.model_path != self.config.speaker_model_path:
+            engine = WeSpeakerOnnxEngine(self.config.speaker_model_path, sample_rate=self.config.audio.sample_rate)
+            self._speaker_engine = engine
+        if not engine.loaded:
+            engine.load()
+        return engine
+
+    async def _embed_speaker_audio(self, pcm: bytes) -> tuple[float, ...]:
+        """Use the sidecar for embeddings; keep a local fallback for setup/offline enrollment."""
+        if self.speaker is not None and self.speaker.connected:
+            try:
+                return await self.speaker.embed_pcm(pcm)
+            except SpeakerWorkerError as exc:
+                if exc.code == "SPEAKER_AUDIO_QUALITY":
+                    raise
+                logger.warning("speaker worker embedding failed; trying local fallback", exc_info=True)
+        engine = await asyncio.to_thread(self._get_speaker_engine)
+        return await asyncio.to_thread(engine.embed_pcm, pcm)
+
+    async def commit_speaker_enrollment(self, enrollment_id: str) -> dict[str, Any]:
+        session = self._speaker_enrollment.pop(enrollment_id, None)
+        if session is None:
+            raise ValueError("录音会话不存在或已过期")
+        segments = session.get("segments") if isinstance(session, dict) else {}
+        if not isinstance(segments, dict) or len(segments) != 3:
+            if isinstance(segments, dict):
+                segments.clear()
+            raise ValueError("请完成三段引导录音")
+        try:
+            samples: list[tuple[str, Any, Mapping[str, Any]]] = []
+            for index in range(3):
+                item = segments.get(index)
+                if not isinstance(item, dict):
+                    raise ValueError("录音段不完整")
+                pcm = item.get("pcm")
+                embedding = await self._embed_speaker_audio(pcm)
+                samples.append((str(item.get("label") or "自定义"), embedding, {
+                    "duration_ms": int(item.get("duration_ms") or 0),
+                    "source": "enrollment",
+                }))
+            result = await asyncio.to_thread(self.speaker_profile.replace_templates, samples)
+            if self.speaker_router is not None:
+                self.speaker_router.profile.load()
+            return result
+        finally:
+            # Drop all raw PCM references as soon as extraction completes or fails.
+            segments.clear() if isinstance(segments, dict) else None
+
+    async def test_speaker_audio(self, encoded: str) -> dict[str, Any]:
+        if not self.speaker_profile.available:
+            raise ValueError("尚未注册声纹")
+        if not isinstance(encoded, str) or len(encoded) > 4_000_000:
+            raise ValueError("录音数据过大")
+        try:
+            audio = decode_audio_bytes(base64.b64decode(encoded, validate=True))
+        except Exception as exc:
+            raise ValueError(f"录音数据无效：{type(exc).__name__}") from exc
+        duration_ms = len(audio) // 2 * 1000 // self.config.audio.sample_rate
+        if duration_ms < 500 or duration_ms > 10000:
+            raise ValueError("现场测试录音长度必须在 0.5 至 10 秒之间")
+        embedding = await self._embed_speaker_audio(audio)
+        scored = []
+        for template_id, vector in self.speaker_profile.vectors(include_centroid=True):
+            scored.append({"template_id": template_id, "similarity": WeSpeakerOnnxEngine.similarity(embedding, vector)})
+        best = max(scored, key=lambda item: item["similarity"]) if scored else None
+        result = {
+            "state": "owner_confirmed" if best and best["similarity"] >= self.config.speaker.confirm_threshold else "unknown",
+            "similarity": best["similarity"] if best else None,
+            "matched_template_id": best["template_id"] if best else None,
+            "scores": scored,
+            "anti_spoofing": "unavailable",
+        }
+        self._speaker_test_result = dict(result)
+        return result
 
     def _build_kws_worker(self) -> KwsWorker:
         detector = KwsDetector(
@@ -201,6 +454,8 @@ class SessionRuntime:
             code = getattr(exc, "code", "ASR_WORKER_UNAVAILABLE")
             self._record_error("asr", f"{code}: {exc}")
 
+        await self._initialize_speaker()
+
         llm_key = self._api_key(self.config.llm.api_key_env)
         if llm_key:
             self.llm = DeepSeekClient(
@@ -244,6 +499,7 @@ class SessionRuntime:
                         self.state.set_service("web_search", "DISABLED")
                     files = FileTools(shadow_cfg.tools.allowed_roots) if shadow_cfg.tools.files_enabled else None
                     executor = ShadowToolExecutor(files, self.shadow_search_tools,
+                                                   AmbientContextTools(self.ambient_store),
                                                    timeout_ms=shadow_cfg.tools.timeout_ms,
                                                    on_status=self._on_shadow_tool_status)
                     provider = DeepSeekResponsesShadowProvider(
@@ -382,6 +638,11 @@ class SessionRuntime:
             aec_failure_policy=self.config.audio.aec_failure_policy,
             barge_in_gate=BargeInGate(min_speech_ms=max(250, self.config.vad.min_speech_ms), enabled=True),
             conversation=self.conversation,
+            speaker_client=self.speaker,
+            speaker_router=self.speaker_router,
+            speaker_mode=self.config.speaker.mode,
+            speaker_wait_ms=self.config.speaker.wait_ms,
+            ambient_store=self.ambient_store,
         )
         self.controller.set_reasoning_mode(self.reasoning_mode)
         await self.controller.initialize()
@@ -802,6 +1063,9 @@ class SessionRuntime:
             if pending_buffer is not None:
                 pending_buffer.drain()
             self.history.reset()
+            ambient_store = getattr(self, "ambient_store", None)
+            if ambient_store is not None:
+                ambient_store.clear()
             product_settings = getattr(self, "product_settings", None)
             if product_settings is not None:
                 shadow_user_profile = product_settings.read_persona().get("user", "")
@@ -853,6 +1117,9 @@ class SessionRuntime:
     async def close(self) -> None:
         if self.controller is not None:
             await self.controller.close()
+        speaker = getattr(self, "speaker", None)
+        if speaker is not None:
+            await speaker.close()
         if self.kws is not None:
             self.kws.close()
         shadow_component = getattr(self, "shadow_component", None)
@@ -876,6 +1143,10 @@ class SessionRuntime:
         self.tts = None
         self.player = None
         self.audio_processor = None
+        self.speaker = None
+        self._speaker_engine = None
+        self._speaker_enrollment = {}
+        self._speaker_test_result = None
         self.shadow_search_tools = None
         self.shadow_component = None
         self.shadow_session = None
@@ -898,6 +1169,51 @@ class SessionRuntime:
         if self.shadow_session is not None:
             self.shadow_session.set_context_gate_enabled(value)
         return value
+
+    async def set_speaker_settings(self, settings: Mapping[str, Any]) -> dict[str, Any]:
+        """Apply optional speaker mode/thresholds without restarting audio."""
+        mode = str(settings.get("mode") or "off")
+        confirm = float(settings.get("confirm_threshold", 0.50))
+        continuity = float(settings.get("continuity_threshold", 0.40))
+        next_speaker = replace(
+            self.config.speaker,
+            mode=mode,
+            confirm_threshold=confirm,
+            continuity_threshold=continuity,
+        )
+        if mode == "filter":
+            if not self.speaker_profile.available:
+                raise ValueError("未注册声纹前不能启用筛选模式")
+            if not await self.ensure_speaker_worker():
+                raise ValueError("Speaker Worker 不可用，暂时不能启用筛选模式")
+        self.config = replace(self.config, speaker=next_speaker)
+        if self.speaker_router is not None:
+            self.speaker_router.configure(
+                confirm_threshold=confirm,
+                continuity_threshold=continuity,
+            )
+        if self.controller is not None:
+            self.controller.speaker_mode = mode
+            # ``ensure_speaker_worker`` may have replaced a degraded/stale
+            # client while preparing filter mode. Always refresh the
+            # controller reference for every enabled mode; otherwise a
+            # reconnect can leave the controller holding the old ``None`` or
+            # disconnected client even though the runtime is READY.
+            if mode != "off":
+                self.controller.speaker_client = self.speaker
+        if mode == "off":
+            if self.speaker is not None:
+                await self.speaker.close()
+            self.speaker = None
+            self.state.set_service("speaker", "DISABLED")
+            if self.controller is not None:
+                self.controller.speaker_client = None
+        elif self.speaker is None:
+            await self._initialize_speaker()
+            if self.controller is not None:
+                self.controller.speaker_client = self.speaker
+        await self.bus.publish(self.snapshot())
+        return {"mode": mode, "confirm_threshold": confirm, "continuity_threshold": continuity}
 
     async def _on_shadow_events(self, events: list[ShadowEvent]) -> None:
         # Stop intentionally ends only the voice episode.  The independent
@@ -1038,7 +1354,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         runtime_payload = sanitize_runtime_snapshot(runtime.snapshot().payload)
         conversation = runtime_payload.pop("conversation", {"recent": [], "current": {}})
         settings = product_settings.snapshot() if product_settings is not None else {
-            "schema_version": 2,
+            "schema_version": 3,
             "wake": {
                 "enabled": runtime.config.wake.enabled,
                 "keyword": runtime.config.wake.keyword,
@@ -1053,6 +1369,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "experimental_context_gate_enabled": (
                     runtime.config.shadow_agent.experimental_context_gate_enabled
                 ),
+            },
+            "speaker": {
+                "mode": runtime.config.speaker.mode,
+                "confirm_threshold": runtime.config.speaker.confirm_threshold,
+                "continuity_threshold": runtime.config.speaker.continuity_threshold,
             },
             "persona": {},
             "warnings": [],
@@ -1164,6 +1485,152 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 raise
             registry_error(exc)
             raise AssertionError("unreachable")
+
+    @app.put("/api/v1/product/settings/speaker")
+    async def update_product_speaker(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            store = product_store_or_404()
+            previous_speaker = store.settings_only().get("speaker", {
+                "mode": "off", "confirm_threshold": 0.50, "continuity_threshold": 0.40,
+            })
+            if body.get("mode") == "filter":
+                if not runtime.speaker_profile.available:
+                    raise HTTPException(status_code=422, detail="未注册声纹前不能启用筛选模式")
+                if not await runtime.ensure_speaker_worker():
+                    raise HTTPException(status_code=422, detail="Speaker Worker 不可用，暂时不能启用筛选模式")
+            value = await asyncio.to_thread(store.save_speaker, body)
+            try:
+                applied = await runtime.set_speaker_settings(value)
+            except Exception:
+                # Runtime availability is part of the filter-mode contract;
+                # restore the previous persisted mode when live application
+                # cannot complete.
+                await asyncio.to_thread(store.save_speaker, previous_speaker)
+                raise
+            return {
+                "settings": {"speaker": value},
+                "effective_from": "next_speech_segment",
+                "pending": False,
+                "message": "声纹阈值立即用于后续窗口；运行模式从下一语音段生效。",
+                "runtime": applied,
+            }
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                raise
+            if isinstance(exc, (ValueError, TypeError)):
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise
+
+    @app.get("/api/v1/speaker/status")
+    async def get_speaker_status() -> dict[str, Any]:
+        return runtime.speaker_status()
+
+    @app.get("/api/v1/speaker/profile")
+    async def get_speaker_profile() -> dict[str, Any]:
+        return runtime.speaker_profile_snapshot()
+
+    @app.post("/api/v1/speaker/enrollment/start")
+    async def start_speaker_enrollment() -> dict[str, Any]:
+        return runtime.start_speaker_enrollment()
+
+    @app.post("/api/v1/speaker/enrollment/{enrollment_id}/segment")
+    async def add_speaker_enrollment_segment(enrollment_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            if set(body) != {"index", "label", "pcm_base64"}:
+                raise ValueError("录音段字段必须是 index、label、pcm_base64")
+            return runtime.add_speaker_enrollment_segment(
+                enrollment_id,
+                index=body.get("index"),
+                label=str(body.get("label") or "自定义"),
+                encoded=body.get("pcm_base64"),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/speaker/enrollment/{enrollment_id}/commit")
+    async def commit_speaker_enrollment(enrollment_id: str) -> dict[str, Any]:
+        try:
+            return await runtime.commit_speaker_enrollment(enrollment_id)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.delete("/api/v1/speaker/enrollment/{enrollment_id}")
+    async def cancel_speaker_enrollment(enrollment_id: str) -> dict[str, Any]:
+        runtime.cancel_speaker_enrollment(enrollment_id)
+        return {"cancelled": True}
+
+    @app.delete("/api/v1/speaker/templates/{template_id}")
+    async def delete_speaker_template(template_id: str) -> dict[str, Any]:
+        try:
+            profile = await asyncio.to_thread(runtime.speaker_profile.delete_template, template_id)
+            if runtime.speaker_router is not None:
+                runtime.speaker_router.profile.load()
+            # A filter profile is a prerequisite, not an authorization
+            # boundary.  Removing the last usable template therefore turns
+            # the live mode off and persists the safe direct-routing fallback.
+            if not profile.get("available") and runtime.config.speaker.mode == "filter":
+                thresholds = {
+                    "confirm_threshold": runtime.config.speaker.confirm_threshold,
+                    "continuity_threshold": runtime.config.speaker.continuity_threshold,
+                }
+                next_settings = {"mode": "off", **thresholds}
+                previous_settings = (
+                    product_settings.settings_only().get("speaker")
+                    if product_settings is not None else None
+                )
+                if product_settings is not None:
+                    await asyncio.to_thread(product_settings.save_speaker, next_settings)
+                try:
+                    applied = await runtime.set_speaker_settings(next_settings)
+                except Exception:
+                    if product_settings is not None and isinstance(previous_settings, Mapping):
+                        await asyncio.to_thread(product_settings.save_speaker, previous_settings)
+                    raise
+                response = dict(profile)
+                response.update({"runtime": applied, "downgraded_to": "off"})
+                return response
+            response = dict(profile)
+            response["downgraded_to"] = None
+            return response
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.patch("/api/v1/speaker/templates/{template_id}")
+    async def update_speaker_template(template_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            if set(body) != {"include_in_centroid"} or type(body.get("include_in_centroid")) is not bool:
+                raise ValueError("模板设置字段必须是 include_in_centroid 布尔值")
+            profile = await asyncio.to_thread(
+                runtime.speaker_profile.set_template_centroid,
+                template_id,
+                body["include_in_centroid"],
+            )
+            if runtime.speaker_router is not None:
+                runtime.speaker_router.profile.load()
+            return profile
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/speaker/test")
+    async def test_speaker(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            if set(body) != {"pcm_base64"}:
+                raise ValueError("现场测试字段必须是 pcm_base64")
+            encoded = body.get("pcm_base64")
+            if not isinstance(encoded, str):
+                raise ValueError("pcm_base64 必须是字符串")
+            return await runtime.test_speaker_audio(encoded)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/ambient-context")
+    async def get_ambient_context(limit: int = 20) -> dict[str, Any]:
+        return runtime.ambient_store.snapshot(limit)
+
+    @app.delete("/api/v1/ambient-context")
+    async def clear_ambient_context() -> dict[str, Any]:
+        runtime.ambient_store.clear()
+        return runtime.ambient_store.snapshot()
 
     @app.get("/api/v1/models/registry")
     async def get_model_registry() -> dict[str, Any]:

@@ -21,6 +21,10 @@ KWS_ARCHIVE_URL = (
 )
 PARAFORMER_MODEL_ID = "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
 VAD_MODEL_ID = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+WESPEAKER_MODEL_URL = (
+    "https://huggingface.co/Wespeaker/wespeaker-cnceleb-resnet34/"
+    "resolve/main/cnceleb_resnet34.onnx?download=true"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -138,6 +142,28 @@ def _install_modelscope(model_dir: Path, model_id: str, target: Path, name: str,
     }
 
 
+def _is_wespeaker_model_complete(path: Path) -> bool:
+    model = path / "cnceleb_resnet34.onnx"
+    return model.is_file() and model.stat().st_size > 1_000_000
+
+
+def _install_wespeaker(model_dir: Path) -> dict[str, Any]:
+    target = model_dir / "speaker" / "wespeaker-cnceleb-resnet34"
+    model = target / "cnceleb_resnet34.onnx"
+    if not _is_wespeaker_model_complete(target):
+        if target.exists() and any(target.iterdir()):
+            raise RuntimeError(f"WeSpeaker 模型目录不完整，请人工移走后重试：{target}")
+        target.mkdir(parents=True, exist_ok=True)
+        _download_atomic(WESPEAKER_MODEL_URL, model)
+    return {
+        "name": "wespeaker-cnceleb-resnet34",
+        "kind": "speaker_embedding",
+        "source": WESPEAKER_MODEL_URL,
+        "path": str(target),
+        "files": _file_manifest(target),
+    }
+
+
 def _is_funasr_model_complete(path: Path) -> bool:
     if not (path / "config.yaml").is_file():
         return False
@@ -158,7 +184,12 @@ def _file_manifest(path: Path) -> list[dict[str, Any]]:
     return result
 
 
-def validate_models(model_dir: Path, *, keyword_label: str | None = None) -> list[str]:
+def validate_models(
+    model_dir: Path,
+    *,
+    keyword_label: str | None = None,
+    require_speaker: bool = True,
+) -> list[str]:
     errors: list[str] = []
     kws = model_dir / "kws" / "sherpa-onnx-kws-zipformer-zh-en-3M"
     if (
@@ -173,6 +204,11 @@ def validate_models(model_dir: Path, *, keyword_label: str | None = None) -> lis
         errors.append(f"Paraformer 模型不完整：{model_dir / 'funasr' / 'paraformer-zh-streaming'}")
     if not _is_funasr_model_complete(model_dir / "funasr" / "fsmn-vad"):
         errors.append(f"FSMN-VAD 模型不完整：{model_dir / 'funasr' / 'fsmn-vad'}")
+    if require_speaker and not _is_wespeaker_model_complete(model_dir / "speaker" / "wespeaker-cnceleb-resnet34"):
+        errors.append(
+            "WeSpeaker 模型不完整："
+            f"{model_dir / 'speaker' / 'wespeaker-cnceleb-resnet34'}"
+        )
     keywords = kws / "keywords.txt"
     if not keywords.is_file():
         errors.append(f"KWS 关键词文件不存在：{keywords}")
@@ -236,6 +272,7 @@ def main() -> int:
             "fsmn-vad",
             "vad",
         ),
+        _install_wespeaker(model_dir),
     ]
     errors = validate_models(model_dir)
     if errors:

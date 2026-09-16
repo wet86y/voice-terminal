@@ -24,12 +24,14 @@ from ..core.events import utc_now_iso
 from ..shadow_agent import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 2
+PRODUCT_SETTINGS_SCHEMA_VERSION = 3
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 90
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
 MIN_KWS_SENSITIVITY = 1
 MAX_KWS_SENSITIVITY = 99
+MIN_SPEAKER_THRESHOLD = 0.0
+MAX_SPEAKER_THRESHOLD = 1.0
 
 PERSONA_FILES = {
     "instructions": "instructions.md",
@@ -92,6 +94,11 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
                 config.shadow_agent.experimental_context_gate_enabled,
             ),
         },
+        "speaker": {
+            "mode": str(getattr(config.speaker, "mode", "off")),
+            "confirm_threshold": float(getattr(config.speaker, "confirm_threshold", 0.50)),
+            "continuity_threshold": float(getattr(config.speaker, "continuity_threshold", 0.40)),
+        },
     }
 
 
@@ -99,7 +106,7 @@ def _merge_settings(defaults: dict[str, Any], value: Any) -> dict[str, Any]:
     result = deepcopy(defaults)
     if not isinstance(value, Mapping):
         return result
-    for section in ("wake", "silence", "shadow"):
+    for section in ("wake", "silence", "shadow", "speaker"):
         raw = value.get(section)
         if isinstance(raw, Mapping):
             result[section].update({key: raw[key] for key in result[section] if key in raw})
@@ -126,6 +133,20 @@ def _merge_settings(defaults: dict[str, Any], value: Any) -> dict[str, Any]:
     shadow = result["shadow"]
     if type(shadow.get("experimental_context_gate_enabled")) is not bool:
         shadow["experimental_context_gate_enabled"] = defaults["shadow"]["experimental_context_gate_enabled"]
+    speaker = result["speaker"]
+    if speaker.get("mode") not in {"off", "observe", "filter"}:
+        speaker["mode"] = defaults["speaker"]["mode"]
+    try:
+        confirm = float(speaker.get("confirm_threshold"))
+        continuity = float(speaker.get("continuity_threshold"))
+    except (TypeError, ValueError):
+        confirm = defaults["speaker"]["confirm_threshold"]
+        continuity = defaults["speaker"]["continuity_threshold"]
+    if not MIN_SPEAKER_THRESHOLD <= continuity < confirm <= MAX_SPEAKER_THRESHOLD:
+        confirm = defaults["speaker"]["confirm_threshold"]
+        continuity = defaults["speaker"]["continuity_threshold"]
+    speaker["confirm_threshold"] = round(confirm, 4)
+    speaker["continuity_threshold"] = round(continuity, 4)
     return result
 
 
@@ -136,13 +157,14 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     schema_version = value.get("schema_version")
     if schema_version is not None and (
         type(schema_version) is not int
-        or schema_version not in {1, PRODUCT_SETTINGS_SCHEMA_VERSION}
+        or schema_version not in {1, 2, PRODUCT_SETTINGS_SCHEMA_VERSION}
     ):
         invalid = True
     for section_name, fields in (
         ("wake", ("enabled", "keyword", "keyword_label", "sensitivity")),
         ("silence", ("seconds",)),
         ("shadow", ("experimental_context_gate_enabled",)),
+        ("speaker", ("mode", "confirm_threshold", "continuity_threshold")),
     ):
         section = value.get(section_name)
         if section is None:
@@ -166,6 +188,20 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
                 invalid = invalid or type(candidate) is not int or not MIN_SILENCE_SECONDS <= candidate <= MAX_SILENCE_SECONDS
             elif section_name == "shadow" and field == "experimental_context_gate_enabled":
                 invalid = invalid or type(candidate) is not bool
+            elif section_name == "speaker" and field == "mode":
+                invalid = invalid or candidate not in {"off", "observe", "filter"}
+            elif section_name == "speaker" and field in {"confirm_threshold", "continuity_threshold"}:
+                invalid = invalid or not isinstance(candidate, (int, float)) or isinstance(candidate, bool) or not 0 <= float(candidate) <= 1
+    speaker_section = value.get("speaker")
+    if isinstance(speaker_section, Mapping):
+        try:
+            confirm_value = float(speaker_section.get("confirm_threshold"))
+            continuity_value = float(speaker_section.get("continuity_threshold"))
+            invalid = invalid or not 0 <= continuity_value < confirm_value <= 1
+        except (TypeError, ValueError):
+            # The field-level checks above already mark non-numeric values;
+            # keep this branch quiet and let the normal merge fallback apply.
+            pass
     return "product_settings: 部分字段无效，已回退为安全值。" if invalid else None
 
 
@@ -210,6 +246,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     wake = settings.get("wake") if isinstance(settings.get("wake"), Mapping) else {}
     silence = settings.get("silence") if isinstance(settings.get("silence"), Mapping) else {}
     shadow = settings.get("shadow") if isinstance(settings.get("shadow"), Mapping) else {}
+    speaker = settings.get("speaker") if isinstance(settings.get("speaker"), Mapping) else {}
     try:
         seconds = int(silence.get("seconds", getattr(config.agent, "final_silence_ms", 30_000) // 1000))
     except (TypeError, ValueError):
@@ -246,7 +283,24 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
             )
         ),
     )
-    return replace(config, wake=next_wake, agent=next_agent, shadow_agent=next_shadow)
+    mode = str(speaker.get("mode", getattr(config.speaker, "mode", "off")))
+    try:
+        confirm_threshold = float(speaker.get("confirm_threshold", getattr(config.speaker, "confirm_threshold", 0.50)))
+        continuity_threshold = float(speaker.get("continuity_threshold", getattr(config.speaker, "continuity_threshold", 0.40)))
+    except (TypeError, ValueError):
+        confirm_threshold = getattr(config.speaker, "confirm_threshold", 0.50)
+        continuity_threshold = getattr(config.speaker, "continuity_threshold", 0.40)
+    if mode not in {"off", "observe", "filter"} or not 0 <= continuity_threshold < confirm_threshold <= 1:
+        mode = "off"
+        confirm_threshold = 0.50
+        continuity_threshold = 0.40
+    next_speaker = replace(
+        config.speaker,
+        mode=mode,
+        confirm_threshold=confirm_threshold,
+        continuity_threshold=continuity_threshold,
+    )
+    return replace(config, wake=next_wake, agent=next_agent, shadow_agent=next_shadow, speaker=next_speaker)
 
 
 class ProductSettingsStore:
@@ -256,6 +310,11 @@ class ProductSettingsStore:
         self.path = path
         self.config = config
         self.warnings: list[str] = []
+        # Keep the legacy observable version for a damaged schema marker.
+        # A normal load and every successful save use the current schema (3),
+        # while older callers that used the malformed-file recovery path still
+        # see the last known schema version instead of a fabricated upgrade.
+        self._malformed_schema_marker = False
         self._settings = self._load()
 
     def _load(self) -> dict[str, Any]:
@@ -273,10 +332,14 @@ class ProductSettingsStore:
         warning = _settings_validation_warning(value)
         if warning:
             self.warnings = [warning]
+            marker = value.get("schema_version")
+            self._malformed_schema_marker = not isinstance(marker, int)
         return _merge_settings(defaults, value)
 
     def snapshot(self) -> dict[str, Any]:
         value = deepcopy(self._settings)
+        if self._malformed_schema_marker:
+            value["schema_version"] = 2
         value["persona"] = self.read_persona()
         value["warnings"] = list(self.warnings)
         return value
@@ -311,6 +374,7 @@ class ProductSettingsStore:
         # artifact.  Keep the warning until that point, but do not continue
         # advertising a stale recovery warning after the file is valid.
         self.warnings.clear()
+        self._malformed_schema_marker = False
 
     @staticmethod
     def _atomic_replace_documents(documents: Mapping[Path, str]) -> None:
@@ -497,6 +561,30 @@ class ProductSettingsStore:
         }
         self._save_settings()
         return deepcopy(self._settings["shadow"])
+
+    def save_speaker(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        allowed = {"mode", "confirm_threshold", "continuity_threshold"}
+        if set(payload) != allowed:
+            raise ProductSettingsError("声纹设置字段必须是 mode、confirm_threshold、continuity_threshold。")
+        mode = payload.get("mode")
+        if mode not in {"off", "observe", "filter"}:
+            raise ProductSettingsError("声纹模式必须是 off、observe 或 filter。")
+        confirm = payload.get("confirm_threshold")
+        continuity = payload.get("continuity_threshold")
+        if (isinstance(confirm, bool) or not isinstance(confirm, (int, float))
+                or isinstance(continuity, bool) or not isinstance(continuity, (int, float))):
+            raise ProductSettingsError("声纹阈值必须是数字。")
+        confirm = float(confirm)
+        continuity = float(continuity)
+        if not 0 <= continuity < confirm <= 1:
+            raise ProductSettingsError("声纹阈值必须满足 0 ≤ 连续保持阈值 < 普通确认阈值 ≤ 1。")
+        self._settings["speaker"] = {
+            "mode": mode,
+            "confirm_threshold": round(confirm, 4),
+            "continuity_threshold": round(continuity, 4),
+        }
+        self._save_settings()
+        return deepcopy(self._settings["speaker"])
 
     def save_persona(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if set(payload) != set(PERSONA_FILES) | {"shadow"}:
@@ -814,6 +902,16 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
                 )
             },
         }
+    raw_speaker = current.get("speaker_decision") if isinstance(current.get("speaker_decision"), Mapping) else {}
+    safe_speaker = {
+        key: raw_speaker.get(key)
+        for key in (
+            "turn_id", "generation", "user_id", "state", "similarity",
+            "threshold_used", "speech_ms", "observation_count",
+            "continuity_source", "route", "reason", "degraded", "anti_spoofing",
+        )
+        if key in raw_speaker
+    }
     return {
         "state": value.get("state"),
         "listening": bool(value.get("listening")),
@@ -831,6 +929,7 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
                 "assistant_text": _safe_display_text(current.get("assistant_text"), limit=4000),
                 "tts_text": _safe_display_text(current.get("tts_text"), limit=4000),
                 "tts_status": _safe_display_text(current.get("tts_status"), limit=120),
+                "speaker_decision": safe_speaker,
             },
         },
     }
