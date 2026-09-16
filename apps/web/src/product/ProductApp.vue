@@ -10,9 +10,9 @@ const {
   silenceSeconds, personaDocument: activePersona, personaDocuments, providerForm,
   providerStep, discoveredModels, modelAssignments, uiModels: modelEntries,
   availableLlmModels, availableTtsModels, visibleLocalPool, hiddenPool,
-  managedApiModelPool, selectedModels, activeModels, selectedTtsProfile, selectedTtsModel, activeTtsModel, registry, shadowThinking, shadowThinkingCommitted, shadowThinkingPending, shadowThinkingOptions,
-  shadowExpanded, thinkingExpanded, modelScanState, restartState, applyImpact,
-  lastError, notice, noticeVisible, runtimeAction, resetSession, setReasoningMode, setShadowThinking,
+  managedApiModelPool, selectedModels, activeModels, selectedTtsProfile, selectedTtsModel, activeTtsModel, registry,
+  shadowExpanded, modelScanState, restartState, applyImpact,
+  lastError, notice, noticeVisible, runtimeAction, resetSession, setReasoningMode,
   toggleProviderReasoning,
   saveWake, saveSilence, saveShadowGate, savePersona, scanModels, discoverProvider, verifyCustomModel,
   addVerifiedProvider,
@@ -100,28 +100,6 @@ const currentTurnHasSpeechTrack = computed(() => {
   const turnId = voice.currentTurnId.value
   return Boolean(turnId && hasSpeechTrackForTurn(turnId))
 })
-const currentThinkingModel = computed(() => selectedModels.value.shadow)
-const thinkingOptionLabels: Record<string, { label: string; shortLabel: string }> = {
-  off: { label: '关闭', shortLabel: 'Off' },
-  low: { label: '低', shortLabel: 'Low' },
-  medium: { label: '中', shortLabel: 'Medium' },
-  high: { label: '高', shortLabel: 'High' },
-  max: { label: '最大', shortLabel: 'Max' },
-}
-const currentThinkingOption = computed(() => {
-  const options = shadowThinkingOptions.value.length ? shadowThinkingOptions.value : ['off']
-  const value = options.includes(shadowThinking.value) ? shadowThinking.value : options[options.length - 1]
-  return { value, ...(thinkingOptionLabels[value] || { label: value, shortLabel: value }) }
-})
-const currentThinkingIndex = computed(() => {
-  const index = shadowThinkingOptions.value.indexOf(currentThinkingOption.value.value)
-  return Math.max(0, index)
-})
-const thinkingProgress = computed(() => {
-  const count = shadowThinkingOptions.value.length
-  return count > 1 ? (currentThinkingIndex.value / (count - 1)) * 100 : 100
-})
-const thinkingSliderStyle = computed(() => ({ '--thinking-progress': `${thinkingProgress.value}%` }))
 const shadowContext = computed(() => {
   const context = shadow.value.context
   if (!context || (context.used_tokens == null && context.limit_tokens == null && context.usage_percent == null)) return null
@@ -161,7 +139,7 @@ const assignedModelIds = computed(() => new Set([
   modelAssignments.voice, modelAssignments.shadow, modelAssignments.status,
   selectedModels.value.tts?.model_id,
 ]))
-const selectedShadowReasoning = computed(() => shadowThinking.value || shadowThinkingOptions.value[0] || 'off')
+const selectedShadowReasoning = computed(() => 'high')
 
 const shadowActivities = computed(() => shadow.value.activities || [])
 const shadowScrollElement = ref<HTMLElement | null>(null)
@@ -302,28 +280,6 @@ function formatTokens(value: number | null | undefined) {
 
 function contextPercent(value: number | null | undefined) {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0
-}
-
-function setShadowThinkingFromSlider(event: Event, collapse = false) {
-  const slider = event.target as HTMLInputElement
-  const option = shadowThinkingOptions.value[Number(slider.value)]
-  if (!option) return
-  shadowThinking.value = option
-  if (collapse) {
-    setShadowThinking(option)
-    thinkingExpanded.value = false
-  }
-}
-
-function setShadowThinkingFromTrackClick(event: MouseEvent) {
-  const slider = event.currentTarget as HTMLInputElement
-  const bounds = slider.getBoundingClientRect()
-  const ratio = Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width))
-  const optionIndex = Math.round(ratio * (shadowThinkingOptions.value.length - 1))
-  const option = shadowThinkingOptions.value[optionIndex]
-  if (!option) return
-  setShadowThinking(option)
-  thinkingExpanded.value = false
 }
 
 function providerClass(item: ProductUiModel | undefined) {
@@ -865,21 +821,9 @@ function pageLabel() {
             <div class="resource-meter context-meter" tabindex="0" role="img" :aria-label="shadowContextTooltip" :data-tooltip="shadowContextTooltip">
               <span>上下文占用</span><strong>{{ formatTokens(shadowContext?.used_tokens) }}<small v-if="shadowContext?.limit_tokens != null"> / {{ formatTokens(shadowContext.limit_tokens) }}</small></strong><i :class="{ 'meter-empty': shadowContext?.usage_percent == null }"><b :style="{ width: `${contextPercent(shadowContext?.usage_percent)}%` }"></b></i><em>{{ shadowContext?.usage_percent ?? '—' }}<span v-if="shadowContext?.usage_percent != null">%</span></em>
             </div>
-            <div class="thinking-meter">
-              <div class="thinking-control">
-                <button class="thinking-trigger" type="button" :aria-expanded="thinkingExpanded" :aria-label="`Shadow 思考等级：${currentThinkingOption.label}`" @click="thinkingExpanded = !thinkingExpanded">
-                  <strong>{{ currentThinkingOption.shortLabel.toLowerCase() }}</strong><i aria-hidden="true">⌄</i>
-                </button>
-                <div v-if="thinkingExpanded" class="thinking-popover" role="dialog" aria-label="Shadow 思考等级设置">
-                  <div class="thinking-popover-header">
-                    <div><strong>{{ currentThinkingOption.label }}</strong><span>{{ currentThinkingModel?.name || '当前模型' }} · 已提交 {{ thinkingOptionLabels[shadowThinkingCommitted]?.shortLabel || shadowThinkingCommitted }}</span></div>
-                    <button type="button" aria-label="收起思考强度设置" @click="thinkingExpanded = false">×</button>
-                  </div>
-                  <input class="thinking-slider" type="range" :min="0" :max="Math.max(shadowThinkingOptions.length - 1, 0)" step="1" :value="currentThinkingIndex" :style="thinkingSliderStyle" :aria-valuetext="currentThinkingOption.label" aria-label="选择思考强度" @input="setShadowThinkingFromSlider($event)" @change="setShadowThinkingFromSlider($event, true)" @click="setShadowThinkingFromTrackClick">
-                  <div class="thinking-scale" aria-hidden="true"><span v-for="(level, index) in shadowThinkingOptions" :key="level" :class="{ active: index === currentThinkingIndex }">{{ thinkingOptionLabels[level]?.shortLabel || level }}</span></div>
-                </div>
-              </div>
-              <span class="thinking-apply-state" :class="{ pending: shadowThinkingPending }">{{ shadowThinkingPending ? '待应用' : '已提交' }}</span>
+            <div class="thinking-meter" aria-label="Shadow 思考等级固定为 High">
+              <div class="thinking-control"><span class="thinking-trigger"><strong>high</strong></span></div>
+              <span class="thinking-apply-state">High · 固定</span>
             </div>
             <div class="resource-meter cache-rate-number shadow-cache-rate-number" tabindex="0" role="img" :aria-label="shadowCacheHitRatio === null ? '缓存命中率暂无数据' : `缓存命中率 ${Math.round(shadowCacheHitRatio * 100)}%`" :data-tooltip="shadowCacheHitRatio === null ? '缓存命中率 · 暂无数据' : `缓存命中率 · ${Math.round(shadowCacheHitRatio * 100)}%`"><strong>{{ shadowCacheHitRatio === null ? '—' : `${Math.round(shadowCacheHitRatio * 100)}%` }}</strong></div>
           </section>

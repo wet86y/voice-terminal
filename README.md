@@ -36,19 +36,20 @@ decision 校验后异步调用固定动作 `request_shadow({"request":true})`。
 
 实验性上下文门禁默认关闭。开启后，运行中的 wake 会让侧载模型只判断本次尚未可见的连续
 revision 区间应立即注入还是暂缓一次；暂缓不会删除或改写正文，下一次 wake 会重新判断包含
-此前暂缓内容在内的完整区间。空闲启动、侧载异常和关闭开关均无损直通。当前 activation 尚无
-状态摘要时，本次正文直接进入，同时后台强制生成一次摘要供下一次判断使用。
+此前暂缓内容在内的完整区间。空闲启动、侧载异常和关闭开关均无损直通。每次 activation 在应用完
+权威上下文后立即并行生成首条状态摘要，不依赖实验性门禁开关。
 
 Shadow 固定拥有只读文件/搜索业务工具以及三个本地控制端口：主动读取最新上下文、发布
 progress/observation、请求 clarification。用户答复正常进入会话后，主 LLM只再次 wake，Shadow
 从用户原话继续理解，不使用 question ID 或 reply action。副作用工具 effect 仅保留契约，首版
 executor 拒绝所有非 `READ_ONLY` 能力。
 
-每 5 个已提交 Shadow model response 会并行触发无思考、无工具的状态观察器。简报与
+启动时和每 5 个已提交 Shadow model response 会并行触发无思考、无工具的状态观察器。简报与
 status/progress/activity 只更新产品 UI，不触发主 LLM；只有 observation、user_input_required、
 result、failed 进入唯一 heartbeat 邮箱。Shadow 不设 activation 总墙钟、步骤、工具
-调用轮次、工具调用次数或本地 provider timeout；transport retry 也不设次数上限。每次文件或
-搜索工具执行最多运行 15 秒。默认在 524288 token 预算的 80% 处生成稳定摘要并切换 cache epoch，
+调用轮次、工具调用次数或本地 provider timeout；transport retry 也不设次数上限。文件或
+搜索工具超过 8 秒会先返回后台作业标识，完整结果在原 activation 仍活跃时于安全点回注。
+默认在 524288 token 预算的 80% 处生成稳定摘要并切换 cache epoch，
 不终止长期工作。reset、close、
 取消、provider 协议终止和外部服务本身的限制仍然有效。
 
@@ -91,6 +92,7 @@ shadow_agent:
   experimental_context_gate_enabled: false
   max_context_tokens: 524288
   compaction_threshold_ratio: 0.80
+  runtime_reminder_interval_ms: 20000 # 下一安全点注入收敛提醒
   provider:
     timeout_ms: null             # 不设 Shadow provider 请求时长上限
     transport_retry_limit: null  # 不设传输重试次数上限
@@ -103,7 +105,7 @@ shadow_agent:
   tools:
     files_enabled: true
     allowed_roots: [docs]
-    timeout_ms: 15000           # 单次文件/搜索工具执行上限
+    soft_yield_ms: 8000         # 软返回阈值；底层只读工作继续运行
     web_search:
       timeout_ms: 15000          # 搜索 HTTP 请求上限
 ```

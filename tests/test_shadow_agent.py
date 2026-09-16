@@ -26,7 +26,7 @@ from voice_terminal.shadow_agent.events import ShadowEventBuffer
 from voice_terminal.shadow_agent.component import ShadowAgentComponent, _EventRelay
 from voice_terminal.shadow_agent.contracts import shadow_control_tool_definitions
 from voice_terminal.shadow_agent.provider import ShadowProviderResponse
-from voice_terminal.shadow_agent.prompts import STATUS_OBSERVER_PROMPT
+from voice_terminal.shadow_agent.prompts import DEFAULT_INSTRUCTIONS_PATH, STATUS_OBSERVER_PROMPT
 from voice_terminal.server.product import ShadowProductProjection
 from voice_terminal.server.websocket import SessionRuntime
 
@@ -98,22 +98,33 @@ def test_shadow_event_prompts_report_facts_without_directing_main_speech():
     assert "准确区分已完成、正在进行、下一步和阻塞" not in STATUS_OBSERVER_PROMPT
 
 
-def test_configuration_exposes_unlimited_shadow_execution_defaults():
+def test_shadow_instructions_require_fast_convergence_without_unlimited_authorization():
+    instructions = DEFAULT_INSTRUCTIONS_PATH.read_text(encoding="utf-8")
+    assert "快速识别最新用户意图" in instructions
+    assert "减少无意义的思考" in instructions
+    assert "已有信息足以形成可靠结论时立即输出" in instructions
+    assert "不存在总步骤或总墙钟期限" not in instructions
+
+
+def test_configuration_exposes_shadow_soft_yield_and_reminder_defaults():
     cfg = AppConfig().shadow_agent
     assert cfg.max_context_tokens == 524288
     assert cfg.compaction_threshold_ratio == 0.80
     assert cfg.provider.timeout_ms is None
     assert cfg.provider.transport_retry_limit is None
-    assert cfg.tools.timeout_ms == 15000
+    assert cfg.tools.soft_yield_ms == 8000
+    assert cfg.tools.timeout_ms == 8000
     assert cfg.tools.web_search.timeout_ms == 15000
     assert cfg.status_observer.timeout_ms is None
     assert cfg.status_observer.every_committed_steps == 5
     assert cfg.status_observer.reasoning_effort == "none"
+    assert cfg.runtime_reminder_interval_ms == 20000
+    assert cfg.reasoning_effort == "high"
 
     loaded = load_config(Path(__file__).parents[1] / "config" / "default.yaml").shadow_agent
     assert loaded.provider.timeout_ms is None
     assert loaded.provider.transport_retry_limit is None
-    assert loaded.tools.timeout_ms == 15000
+    assert loaded.tools.soft_yield_ms == 8000
     assert loaded.tools.web_search.timeout_ms == 15000
     assert loaded.status_observer.timeout_ms is None
 
@@ -190,7 +201,7 @@ def test_shadow_tool_calls_are_unbounded_by_default():
     asyncio.run(scenario())
 
 
-def test_shadow_tool_call_uses_configured_fifteen_second_deadline():
+def test_shadow_tool_call_soft_yields_and_finishes_in_background():
     class SlowBackend:
         available = True
 
@@ -207,9 +218,10 @@ def test_shadow_tool_call_uses_configured_fifteen_second_deadline():
     async def scenario():
         executor = ShadowToolExecutor(SlowBackend(), timeout_ms=10)
         result = await executor.execute("files_search", {"query": "x"})
-        assert result["error"] == "工具 files_search 执行超过 10ms"
+        assert result["status"] == "running"
+        assert result["job_id"].startswith("tool-")
         await asyncio.sleep(0.08)
-        assert not executor._detached_work
+        assert not executor._background_work
 
     asyncio.run(scenario())
 
@@ -379,6 +391,9 @@ def test_experimental_gate_defers_once_then_rechecks_full_unreleased_prefix(tmp_
         status_provider = QueueProvider([
             [message("已确认进展：初始任务已开始；当前关注：核对原始任务。")],
             [message(json.dumps({
+                "timing": "inject_now", "relation": "supplement", "reason": "首条运行中正文",
+            }, ensure_ascii=False))],
+            [message(json.dumps({
                 "timing": "defer_once", "relation": "irrelevant", "reason": "与当前工作无关",
             }, ensure_ascii=False))],
             [message(json.dumps({
@@ -410,7 +425,7 @@ def test_experimental_gate_defers_once_then_rechecks_full_unreleased_prefix(tmp_
             await asyncio.sleep(0.01)
         assert session.runtime.has_current_summary
         forced_request = status_provider.requests[0]
-        assert "正在核对原始任务" in json.dumps(forced_request["input_items"], ensure_ascii=False)
+        assert "正在核对原始任务" not in json.dumps(forced_request["input_items"], ensure_ascii=False)
         assert "正在核对原始任务" not in repr(session.runtime.working_trace)
 
         ledger.commit_input("u3", "本次可以暂缓的闲话")

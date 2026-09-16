@@ -164,15 +164,9 @@ class ModelRegistryService:
             nested_shadow = value["assignments"].get("role_settings", {}).get("shadow", {})
             nested_effort = nested_shadow.get("reasoning_effort") if isinstance(nested_shadow, dict) else None
             direct_effort = value["assignments"].get("shadow_reasoning_effort")
-            normalized_direct = str(direct_effort or "").strip().lower()
-            if normalized_direct == "none":
-                normalized_direct = "off"
-            if normalized_direct not in SUPPORTED_REASONING_EFFORTS:
-                normalized_direct = str(nested_effort or template["assignments"]["shadow_reasoning_effort"]).strip().lower()
-                if normalized_direct == "none":
-                    normalized_direct = "off"
-                if normalized_direct not in SUPPORTED_REASONING_EFFORTS:
-                    normalized_direct = str(template["assignments"]["shadow_reasoning_effort"])
+            # Shadow reasoning is a product policy, not a mutable assignment.
+            # Keep both legacy views canonical for older clients.
+            normalized_direct = "high"
             if not had_shadow_reasoning_effort or direct_effort != normalized_direct:
                 value["assignments"]["shadow_reasoning_effort"] = normalized_direct
                 migrated = True
@@ -834,25 +828,16 @@ class ModelRegistryService:
                     raise ModelRegistryError("voice 模型必须同时支持 off 和 low。")
                 effort = "low"
             elif role == "shadow":
-                requested = assignments.get("shadow_reasoning_effort")
-                if requested is None:
-                    nested_shadow = assignments.get("role_settings")
-                    nested_shadow = nested_shadow.get("shadow") if isinstance(nested_shadow, Mapping) else None
-                    requested = nested_shadow.get("reasoning_effort") if isinstance(nested_shadow, Mapping) else None
-                if requested is not None:
-                    effort = str(requested).lower()
-                    if effort == "none":
-                        effort = "off"
-                    if effort not in allowed:
-                        raise ModelRegistryError(f"shadow 模型不允许思考等级 {effort}。")
-                else:
-                    effort = next(
-                        (value for value in ("high", "max", "medium", "low", "off") if value in allowed),
-                        allowed[0],
-                    )
+                if "high" not in allowed:
+                    raise ModelRegistryError("shadow 模型必须支持 high 思考等级。")
+                effort = "high"
             else:
                 effort = "none"
-            if role == "status":
+            if role == "shadow":
+                if "high" not in allowed:
+                    raise ModelRegistryError("shadow 模型必须支持 high 思考等级。")
+                effort = "high"
+            elif role == "status":
                 effort = "none"
             elif effort not in SUPPORTED_REASONING_EFFORTS:
                 raise ModelRegistryError(f"{role} 思考等级无效。")

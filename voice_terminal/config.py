@@ -300,15 +300,20 @@ class ShadowWebSearchConfig:
 class ShadowToolsConfig:
     files_enabled: bool = True
     allowed_roots: tuple[Path, ...] = (Path("docs"),)
-    # Per-tool execution deadline.  ``None`` is retained for embedding users
-    # that intentionally want an unbounded backend, while the product default
-    # is 15 seconds.
-    timeout_ms: int | None = 15000
+    # Time before a read-only tool yields a pending job to the model.  The
+    # backend continues running; this is deliberately not a cancellation
+    # deadline.
+    soft_yield_ms: int | None = 8000
     web_search: ShadowWebSearchConfig = field(default_factory=ShadowWebSearchConfig)
 
     def __post_init__(self) -> None:
-        if self.timeout_ms is not None and self.timeout_ms <= 0:
-            raise ValueError("shadow_agent.tools.timeout_ms must be positive or null")
+        if self.soft_yield_ms is not None and self.soft_yield_ms <= 0:
+            raise ValueError("shadow_agent.tools.soft_yield_ms must be positive or null")
+
+    @property
+    def timeout_ms(self) -> int | None:
+        """Deprecated compatibility view for older embedding callers."""
+        return self.soft_yield_ms
 
 
 @dataclass(frozen=True)
@@ -341,6 +346,7 @@ class ShadowAgentConfig:
     reasoning_effort: str = "high"
     allowed_reasoning: tuple[str, ...] = REASONING_EFFORTS
     compaction_threshold_ratio: float = 0.80
+    runtime_reminder_interval_ms: int = 20000
     status_observer: ShadowStatusObserverConfig = field(default_factory=ShadowStatusObserverConfig)
 
     def __post_init__(self) -> None:
@@ -349,10 +355,13 @@ class ShadowAgentConfig:
         if self.reasoning_effort not in REASONING_EFFORTS:
             raise ValueError("shadow_agent.reasoning_effort must be off, low, medium, high, or max")
         object.__setattr__(self, "allowed_reasoning", _reasoning_levels(self.allowed_reasoning, REASONING_EFFORTS))
-        if self.reasoning_effort not in self.allowed_reasoning:
-            raise ValueError("shadow_agent.reasoning_effort must be included in shadow_agent.allowed_reasoning")
+        if "high" not in self.allowed_reasoning:
+            raise ValueError("shadow_agent.allowed_reasoning must include high")
+        object.__setattr__(self, "reasoning_effort", "high")
         if not 0 < self.compaction_threshold_ratio < 1:
             raise ValueError("shadow_agent.compaction_threshold_ratio must be between 0 and 1")
+        if self.runtime_reminder_interval_ms <= 0:
+            raise ValueError("shadow_agent.runtime_reminder_interval_ms must be positive")
 
 
 @dataclass(frozen=True)
@@ -537,7 +546,10 @@ class AppConfig:
                 tools=ShadowToolsConfig(
                     files_enabled=_bool(shadow_tools.get("files_enabled"), True),
                     allowed_roots=shadow_roots,
-                    timeout_ms=_optional_int(shadow_tools.get("timeout_ms"), 15000),
+                    soft_yield_ms=_optional_int(
+                        shadow_tools.get("soft_yield_ms"),
+                        _optional_int(shadow_tools.get("timeout_ms"), 8000),
+                    ),
                     web_search=ShadowWebSearchConfig(
                         enabled=_bool(shadow_search.get("enabled"), True),
                         base_url=_string(shadow_search.get("base_url"), "https://api.minimaxi.com"),
@@ -551,6 +563,9 @@ class AppConfig:
                     shadow.get("allowed_reasoning"), REASONING_EFFORTS,
                 ),
                 compaction_threshold_ratio=float(_number(shadow.get("compaction_threshold_ratio"), 0.80)),
+                runtime_reminder_interval_ms=int(_number(
+                    shadow.get("runtime_reminder_interval_ms"), 20000,
+                )),
                 status_observer=ShadowStatusObserverConfig(
                     enabled=_bool(shadow_observer.get("enabled"), True),
                     every_committed_steps=int(_number(shadow_observer.get("every_committed_steps"), 5)),

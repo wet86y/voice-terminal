@@ -500,7 +500,7 @@ class SessionRuntime:
                     files = FileTools(shadow_cfg.tools.allowed_roots) if shadow_cfg.tools.files_enabled else None
                     executor = ShadowToolExecutor(files, self.shadow_search_tools,
                                                    AmbientContextTools(self.ambient_store),
-                                                   timeout_ms=shadow_cfg.tools.timeout_ms,
+                                                   soft_yield_ms=shadow_cfg.tools.soft_yield_ms,
                                                    on_status=self._on_shadow_tool_status)
                     provider = DeepSeekResponsesShadowProvider(
                         base_url=shadow_cfg.provider.base_url,
@@ -530,6 +530,7 @@ class SessionRuntime:
                             "transport_retry_limit": shadow_cfg.provider.transport_retry_limit,
                             "max_context_tokens": shadow_cfg.max_context_tokens,
                             "compaction_threshold_ratio": shadow_cfg.compaction_threshold_ratio,
+                            "runtime_reminder_interval_ms": shadow_cfg.runtime_reminder_interval_ms,
                             "observer_enabled": shadow_cfg.status_observer.enabled,
                             "observer_every_steps": shadow_cfg.status_observer.every_committed_steps,
                             "observer_max_output_tokens": shadow_cfg.status_observer.max_output_tokens,
@@ -870,10 +871,7 @@ class SessionRuntime:
                 or shadow.get("max_context_tokens")
                 or previous_config.shadow_agent.max_context_tokens
             ),
-            reasoning_effort=str(
-                shadow_settings.get("reasoning_effort")
-                or previous_config.shadow_agent.reasoning_effort
-            ),
+            reasoning_effort="high",
             allowed_reasoning=tuple(
                 shadow.get("allowed_reasoning")
                 or previous_config.shadow_agent.allowed_reasoning

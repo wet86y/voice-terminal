@@ -45,6 +45,7 @@ shadow_agent:
   debug_websocket_enabled: false
   max_context_tokens: 524288
   compaction_threshold_ratio: 0.80
+  runtime_reminder_interval_ms: 20000
   provider:
     timeout_ms: 15000
     transport_retry_limit: 2
@@ -57,6 +58,7 @@ shadow_agent:
   tools:
     files_enabled: true
     allowed_roots: [docs]
+    soft_yield_ms: 8000
     web_search:
       enabled: true
       base_url: https://api.minimaxi.com
