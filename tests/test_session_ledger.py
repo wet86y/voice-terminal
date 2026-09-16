@@ -17,6 +17,10 @@ def test_ledger_injects_only_heard_speech_and_structured_tool_source():
     serialized = json.dumps(messages, ensure_ascii=False)
     assert "前半句" in serialized
     assert "完整回答" not in serialized
+    assert '<voice_delivery status=\\"partial\\" termination=\\"interrupted\\">' in serialized
+    assert "<heard>前半句</heard>" in serialized
+    assert "<unheard>后半句</unheard>" in serialized
+    assert "上一段语音被打断" not in serialized
     assert "external_untrusted" in serialized
     assert messages[-1]["role"] == "user"
     assert messages[-1]["content"] == "继续"
@@ -102,4 +106,30 @@ def test_full_delivery_commits_original_speech_once_even_if_alignment_heard_text
     assistant = [entry for entry in ledger.entries if entry.kind == "speech"]
     assert len(assistant) == 1
     assert assistant[0].content == "完整回答"
+    assert assistant[0].metadata["model_history_format"] == "voice_delivery_v1"
+    assert assistant[0].metadata["model_content"] == (
+        '<voice_delivery status="full">完整回答</voice_delivery>'
+    )
+    messages = ledger.context_messages("")
+    assert messages == [{
+        "role": "assistant",
+        "content": '<voice_delivery status="full">完整回答</voice_delivery>',
+        "context_lane": ContextLane.HISTORY,
+    }]
     assert ledger.has_speech("speech-a") is True
+
+
+def test_voice_delivery_content_is_frozen_and_xml_escaped():
+    ledger = SessionLedger()
+    delivery = DeliveryReport(
+        status="full", termination="completed", precision="playback_complete",
+    )
+
+    ledger.commit_delivery("speech-a", 'A < B & C 说“好”', delivery)
+    entry = next(item for item in ledger.entries if item.kind == "speech")
+    frozen = entry.metadata["model_content"]
+
+    assert frozen == (
+        '<voice_delivery status="full">A &lt; B &amp; C 说“好”</voice_delivery>'
+    )
+    assert ledger.context_messages("")[0]["content"] == frozen

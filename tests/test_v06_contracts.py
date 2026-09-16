@@ -1405,8 +1405,12 @@ def test_streamed_cross_turn_completed_prefix_is_stripped_before_tts():
         traces = [payload for kind, payload in events if kind == "agent.trace"]
         assert any(item["kind"] == "CROSS_TURN_SPEECH_PREFIX_STRIPPED" for item in traces)
         context = runtime.messages({"USER_INPUT_FINALIZED"})
-        assert any(item["role"] == "assistant" and item["content"] == "能听到，你说吧，我在。"
-                   for item in context)
+        assistant_history = [
+            item["content"] for item in context if item["role"] == "assistant"
+        ]
+        assert assistant_history == [
+            '<voice_delivery status="full">能听到，你说吧，我在。</voice_delivery>'
+        ]
         packet = next(json.loads(item["content"]) for item in context
                       if item.get("context_kind") == "voice_request_context")
         runtime_tail = next(entry["content"] for entry in packet["entries"]
