@@ -70,7 +70,10 @@ Protocol recovery is deliberately bounded and remains inside the single Agent
 400 ms scheduler. A Responses decision may use one immediate correction for
 blank output, an invalid envelope/action, or `response.incomplete` caused by
 `max_output_tokens`. The immediate request receives a short error-specific
-system instruction. If that correction also fails, the runtime publishes a
+system instruction. Recovery preserves the originating request kind:
+`forced_poll`, `final_silence`, and `kws_wake` retain their own request-tail
+constraints and never receive the normal instruction to reprocess the latest
+user input. If that correction also fails, the runtime publishes a
 deterministic recoverable error, settles a finalized turn with no active
 speech, and returns to `WAITING_EVENT`. Recovery exhaustion never creates an
 independent retry/watchdog loop: deferred feedback is supplied only when a
