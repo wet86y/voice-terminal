@@ -1433,7 +1433,7 @@ def test_streamed_same_turn_completed_prefix_uses_only_suffix_for_refinement():
     asyncio.run(scenario())
 
 
-def test_completed_same_turn_identical_speak_is_ignored_and_reported_to_next_context():
+def test_completed_same_turn_identical_speak_is_ignored_only_for_transcript_reassessment():
     async def scenario():
         begun, events = [], []
 
@@ -1458,88 +1458,20 @@ def test_completed_same_turn_identical_speak_is_ignored_and_reported_to_next_con
             "text": "已经播出的回答。", "heard_text": "已经播出的回答。",
             "delivery_status": "full", "termination": "completed", "status": "completed",
         }
-        ledger = SessionLedger()
         runtime = AgentEpisodeRuntime(None, Registry(), output, emit,
-                                      conversation=conversation, ledger=ledger)
+                                      conversation=conversation, ledger=SessionLedger())
         runtime.episode_id = conversation.conversation_id
         identity = (runtime.episode_id, "request")
         envelope = DecisionEnvelope(SpeechDecision("speak", "calm", "已经播出的回答。"), ())
+        runtime._applying_transcript_reassessment = True
 
-        await runtime._apply_decision_v06(
-            identity, "turn-a", envelope, dispatch_context={"prompt_kind": "normal"},
-        )
+        await runtime._apply_decision_v06(identity, "turn-a", envelope)
 
         assert not begun
         assert runtime.current_action == "wait"
         assert any(kind == "speech.append_ignored"
                    and payload["reason"] == "completed_same_turn_identical"
                    for kind, payload in events)
-        context_events = [
-            item["content"] for item in ledger.context_messages("")
-            if item["role"] == "system" and item["content"].startswith("会话事件：")
-        ]
-        assert any(
-            "speech_duplicate_suppressed" in content
-            and "completed_speech" in content
-            and "request" in content
-            and "已经播出的回答。" in content
-            for content in context_events
-        )
-        completed_event = next(
-            json.loads(content[len("会话事件："):])
-            for content in context_events
-            if "speech_duplicate_suppressed" in content
-        )
-        assert completed_event["heard_text"] == "已经播出的回答。"
-
-    asyncio.run(scenario())
-
-
-def test_active_same_turn_identical_speak_is_reported_once_without_flooding_context():
-    async def scenario():
-        events = []
-
-        class Registry:
-            def begin_turn(self, _): pass
-            def action_definitions(self): return []
-
-        class Output:
-            status = "SPEAKING"
-            speak_snapshot = {
-                "queue_status": "speaking", "conversation_id": "conversation",
-                "turn_id": "turn-a", "speech_id": "active_speech",
-                "output_generation": 2, "text": "正在播放的回答。",
-            }
-            last_completed_speech = None
-            async def append_successor(self, *_args, **_kwargs):
-                raise AssertionError("an identical active replay must not append")
-
-        async def emit(kind, payload): events.append((kind, payload))
-        conversation = ConversationRuntime(); conversation.begin_turn("turn-a")
-        output = Output()
-        output.speak_snapshot["conversation_id"] = conversation.conversation_id
-        ledger = SessionLedger()
-        runtime = AgentEpisodeRuntime(None, Registry(), output, emit,
-                                      conversation=conversation, ledger=ledger)
-        runtime.episode_id = conversation.conversation_id
-        identity = (runtime.episode_id, "request")
-        envelope = DecisionEnvelope(SpeechDecision("speak", "calm", "正在播放的回答。"), ())
-
-        await runtime._apply_decision_v06(identity, "turn-a", envelope)
-        await runtime._apply_decision_v06(identity, "turn-a", envelope)
-
-        context_events = [
-            entry for entry in ledger.entries
-            if entry.kind == "event"
-            and entry.content.get("kind") == "speech_duplicate_suppressed"
-        ]
-        assert len(context_events) == 1
-        assert context_events[0].content["speech_id"] == "active_speech"
-        assert context_events[0].content["reason"] == "active_same_turn_identical"
-        assert "heard_text" not in context_events[0].content
-        assert sum(
-            kind == "speech.append_ignored" for kind, _payload in events
-        ) == 2
 
     asyncio.run(scenario())
 
