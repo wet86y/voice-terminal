@@ -777,16 +777,19 @@ class EpisodeController(RealtimeController):
         await super()._error(code, message, recoverable=recoverable, turn_id=turn_id)
 
     async def stop_listening(self):
+        """Stop microphone input without cancelling the Agent output scope.
+
+        Listening is an input boundary.  The Agent episode and its FIFO TTS
+        output may already contain a response that still needs to be heard,
+        so closing the episode here would incorrectly cancel that response.
+        Full output teardown remains owned by reset/close/error paths.
+        """
         self.state.listening = False
         if self.workspace is not None:
             await self._cancel_turn(reason="stopped", record=True)
         if not self.episode.closed:
-            await self.episode.speech_activity(None, interrupt_reason="stopped")
-            await self.episode.stop()
+            await self.episode.speech_activity(None)
         await self._cancel_tts_prewarm()
-        close_tts = getattr(self.tts, "close", None)
-        if callable(close_tts):
-            await close_tts()
         await super().stop_listening()
 
     async def reset_session(self):

@@ -280,7 +280,7 @@ describe('V0.6 session protocol', () => {
     expect(terminal.activeSpeech.value?.speech_id).toBe('speech_b')
   })
 
-  it('ignores retired conversations and clears dashboard state when the session stops', () => {
+  it('ignores retired conversations while keeping the active output queue on input stop', () => {
     const { socket, terminal } = openTerminal()
     socket.push('agent.state', 1, { conversation_id: 'episode_old', agent_busy: false })
     socket.push('speech.delta', 2, { speech_id: 'speech_old', conversation_id: 'episode_old', turn_id: 'input_old',
@@ -293,8 +293,35 @@ describe('V0.6 session protocol', () => {
     expect(terminal.playbackQueue.value.map(item => item.speech_id)).toEqual(['speech_new'])
 
     socket.push('session.state', 6, { state: 'IDLE', listening: false, can_start: true })
+    expect(terminal.playbackQueue.value).toHaveLength(1)
+    expect(terminal.activeSpeech.value?.speech_id).toBe('speech_new')
+  })
+
+  it('keeps the assistant queue and chat history after listening stops', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('agent.state', 1, { conversation_id: 'episode_a', agent_busy: true })
+    socket.push('input.started', 2, {}, { turn_id: 'input_a' })
+    socket.push('input.finalized', 3, { text: '用户内容' }, { turn_id: 'input_a' })
+    socket.push('speech.queued', 4, { speech_id: 'speech_a', conversation_id: 'episode_a', turn_id: 'input_a', text: '' },
+      { turn_id: 'input_a', speech_id: 'speech_a' })
+    socket.push('speech.delta', 5, { speech_id: 'speech_a', conversation_id: 'episode_a', turn_id: 'input_a', text_delta: '模型内容' },
+      { turn_id: 'input_a', speech_id: 'speech_a' })
+    socket.push('input.completed', 6, { conversation_id: 'episode_a', transcript: '用户内容' }, { turn_id: 'input_a' })
+    expect(terminal.recentTurns.value[0]).toMatchObject({ transcript: '用户内容', response: '模型内容' })
+
+    socket.push('session.state', 7, { state: 'IDLE', listening: false, can_start: true })
+    expect(terminal.playbackQueue.value).toMatchObject([{ speech_id: 'speech_a', text: '模型内容' }])
+    expect(terminal.speechOutputs.value).toHaveLength(0)
+    expect(terminal.current.assistant_text).toBe('模型内容')
+    expect(terminal.recentTurns.value[0]).toMatchObject({ transcript: '用户内容', response: '模型内容' })
+
+    // Stopping input must not prevent the same queue item from settling into
+    // the normal speech history after playback completes.
+    socket.push('speech.completed', 8, { speech_id: 'speech_a', conversation_id: 'episode_a', turn_id: 'input_a',
+      text: '模型内容', status: 'completed' }, { turn_id: 'input_a', speech_id: 'speech_a' })
     expect(terminal.playbackQueue.value).toHaveLength(0)
-    expect(terminal.lastPlayback.value).toBeNull()
+    expect(terminal.speechOutputs.value).toMatchObject([{ speech_id: 'speech_a', text: '模型内容', status: 'completed' }])
+    terminal.dispose()
   })
 
   it('shows a speak preview while the JSON decision is still uncommitted', () => {

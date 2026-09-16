@@ -46,6 +46,9 @@ delivery 与延迟等字段。切换会话、`session.reset` 或断开连接时�
 
 `subscribe` 返回的 `runtime.snapshot.agent` 从当前 Episode 实时生成，用于刷新页面或断线重连后恢复活动
 输出和等待队列；快照中的已结算 outputs 仍应与前端刚刚形成的本地轨迹按同一复合键去重合并。
+`session.stop` 只停止麦克风输入，不取消已经进入 Agent/TTS FIFO 的输出；这些输出继续通过
+`speech.started`、`speech.progress` 和 `speech.completed` 完成播放与结算，用户与 LLMspeak
+记录在右侧对话卡片中保持可见。需要终止输出时使用 `session.reset` 或关闭 runtime。
 
 ## Shadow 产品快照与活动流
 
@@ -109,7 +112,7 @@ task manager，不接受任务文本、ID、modify/reply/cancel，也不绕过�
 
 ## Shadow 与 session 生命周期
 
-- `session.stop` 只关闭语音 episode。Shadow 继续运行，重要事件缓存在 session event bridge；
+- `session.stop` 只停止语音输入；Agent episode、LLM/TTS 输出队列继续运行，Shadow 继续运行，重要事件缓存在 session event bridge；
 - 下一次 `session.start` 把缓存事件交回主 Agent 的 400ms mailbox；
 - `session.reset` 取消 Shadow provider/observer/compaction，清空 trace/status，增加上下文 epoch；
 - reset 同时轮换 `conversation_id` 和 OpenCode Go 的 `x-opencode-session`；

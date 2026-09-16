@@ -14,4 +14,12 @@ describe('fixed Shadow reasoning policy', () => {
     expect(productAdapterSource).not.toContain('shadow_reasoning_effort:')
     expect(productAdapterSource).not.toContain('setShadowThinking')
   })
+
+  it('renders the conversation rail chronologically and keeps it anchored to the tail', () => {
+    expect(productAppSource).toContain('const orderedConversation = computed(() => [...conversation.value].reverse())')
+    expect(productAppSource).toContain('ref="conversationScrollElement"')
+    expect(productAppSource).toContain('@scroll="captureConversationScrollPosition"')
+    expect(productAppSource).toContain('class="conversation-stack"')
+    expect(productAppSource).toContain('v-for="record in orderedConversation"')
+  })
 })
