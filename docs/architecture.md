@@ -53,9 +53,13 @@ Shadow runner、provider 与只读工具完全由 session runtime 驱动；语�
 
 Shadow 使用普通 Responses function-calling 循环。只提交 `response.completed.output`；
 SSE partial reasoning/text 不进入 committed trace。Shadow 的 activation、工具调用轮次、调用次数、
-provider 请求时长和 transport retry 均不设本地上限；每一次文件/搜索工具执行有 15 秒本地上限；
+provider 请求时长和 transport retry 均不设本地上限；文件/搜索工具运行 8 秒后软返回，
+底层只读工作继续运行并在原 activation 活跃时回注完整结果；
 reset、close、取消、provider 协议终止
 以及外部服务本身的限制仍然有效。activation 不设总墙钟或总步骤上限。
+activation 从启动起按 20 秒周期累计运行时间；跨过周期后只在模型响应、工具输出已配对且
+上下文可安全追加的边界合并注入一条咨询式收敛提醒。提醒不会取消正在进行的 provider 请求；
+已有合法终态时直接发布，不为补发提醒额外增加模型轮次。
 
 ## 权威 Shadow 上下文
 
@@ -120,14 +124,14 @@ heartbeat。只有 `observation`、`user_input_required`、`result`、`failed` �
 
 ## StatusObserver
 
-每 5 个成功提交的 Shadow provider response 触发一次无状态只读观察。Observer 使用 committed
-prefix 的不可变快照，`reasoning_effort=none`、`tools=[]`、`max_output_tokens=512`，不设本地请求 timeout；
+每次 activation 启动时以及每 5 个成功提交的 Shadow provider response 触发一次无状态只读观察。Observer 使用
+协议无关的会话、已提交模型阶段和完整工具观察记录，`reasoning_effort=none`、`tools=[]`、
+`max_output_tokens=512`，不设本地请求 timeout；
 只返回 80～160 字工作简报，内容只陈述已确认事实、正在核实事项和实际阻塞，不得建议主助手
 说什么、询问什么、调用什么动作或选择何种语音状态。它不计入 Shadow model step、不写回 trace、
 不阻塞主循环；同时只有一个请求，重复触发合并。`status` 只进入产品摘要槽位，不进入主 LLM。
-若运行中 wake 时当前 activation 尚无有效摘要，本次上下文先直通并立即强制一次 Observer；它可从
-provider stream 内部旁路读取有界 reasoning tail，并明确标记为未提交关注方向。原始 reasoning
-不写日志、ledger、trace、持久文件或产品 UI，provider attempt 完成、重试、reset/close 时清空。
+首条 Observer 在权威快照应用后立即启动，与实验性 context gate 无关。Observer 不读取原始
+reasoning tail 或 Responses 工具协议项；首次失败时用更短的安全记录重试，再失败则发布本地静态运行状态。
 activation 已结束、reset/close 或已有更新状态时丢弃迟到摘要。
 
 ## 缓存与换代压缩

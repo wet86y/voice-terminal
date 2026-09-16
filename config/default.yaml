@@ -20,6 +20,8 @@ shadow_agent:
   experimental_context_gate_enabled: false
   max_context_tokens: 524288
   compaction_threshold_ratio: 0.80
+  # Advisory reminder injected at the next protocol-safe boundary.
+  runtime_reminder_interval_ms: 20000
   # Omitted provider fields inherit llm.base_url, llm.model and llm.api_key_env.
   provider:
     # null means Shadow has no local request deadline or retry-count ceiling.
@@ -35,8 +37,9 @@ shadow_agent:
   tools:
     files_enabled: true
     allowed_roots: [docs]
-    # Maximum duration of one file/search tool execution.
-    timeout_ms: 15000
+    # Return control to Shadow after this interval while the read-only work
+    # continues in the background. This is not a cancellation deadline.
+    soft_yield_ms: 8000
     web_search:
       enabled: true
       base_url: https://api.minimaxi.com

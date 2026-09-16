@@ -212,8 +212,6 @@ class ShadowAgentSession:
 
         visible_revision = int(getattr(source, "visible_revision", source.shadow_input_revision))
         if source_revision <= visible_revision:
-            if not self.runtime.has_current_summary:
-                self.runtime.force_observer(self.runtime.activation_serial)
             return "coalesced"
 
         serial = self.runtime.activation_serial
@@ -221,7 +219,6 @@ class ShadowAgentSession:
             if callable(release):
                 release(source_revision)
             result = self.runtime.wake()
-            self.runtime.force_observer(serial)
             return result
 
         if self._gate_task is not None and not self._gate_task.done():

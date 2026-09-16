@@ -78,10 +78,6 @@ function normalizeReasoningEffort(value: unknown, fallback = 'off') {
   return normalized === 'none' ? 'off' : SHADOW_REASONING_LEVELS.includes(normalized) ? normalized : fallback
 }
 
-function fallbackReasoningEffort(allowed: string[]) {
-  return ['high', 'max', 'medium', 'low', 'off'].find(value => allowed.includes(value)) || 'off'
-}
-
 function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   if (!isRecord(value)) return structuredClone(DEFAULT_SETTINGS)
   const wake = isRecord(value.wake) ? value.wake : {}
@@ -183,7 +179,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const notice = ref('')
   const noticeVisible = ref(false)
   const shadowExpanded = ref(false)
-  const thinkingExpanded = ref(false)
   const personaDocument = ref<keyof ProductSettingsSnapshot['persona']>('instructions')
   const silenceSeconds = ref(30)
   const modelScanState = ref<'idle' | 'scanning' | 'complete'>('idle')
@@ -219,9 +214,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const modelAssignments = reactive<Record<AssignmentSlot, string>>({
     voice: '', shadow: '', status: '', tts: '',
   })
-  const shadowThinking = ref('off')
-  const shadowThinkingCommitted = ref('off')
-  const shadowThinkingNeedsApply = ref(false)
 
   let snapshotRequest: Promise<void> | null = null
   let reconnectTimer: number | undefined
@@ -307,37 +299,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     for (const slot of Object.keys(values) as AssignmentSlot[]) {
       modelAssignments[slot] = typeof values[slot] === 'string' ? values[slot] : ''
     }
-    const selected = uiModels.value.find(item => item.id === modelAssignments.shadow)
-    const allowed = selected?.allowedReasoning || []
-    const nestedShadow = isRecord(assignments.role_settings?.shadow)
-      ? assignments.role_settings?.shadow.reasoning_effort
-      : undefined
-    const persistedShadowThinking = normalizeReasoningEffort(
-      assignments.shadow_reasoning_effort ?? nestedShadow,
-      'off',
-    )
-    const fallback = fallbackReasoningEffort(allowed)
-    const committed = allowed.includes(persistedShadowThinking) ? persistedShadowThinking : fallback
-    shadowThinkingCommitted.value = committed
-    shadowThinking.value = committed
-    shadowThinkingNeedsApply.value = Boolean(allowed.length && persistedShadowThinking !== committed)
   }
-
-  watch(
-    () => modelAssignments.shadow,
-    () => {
-      const allowed = selectedModels.value.shadow?.allowedReasoning || []
-      if (!allowed.length) {
-        shadowThinking.value = 'off'
-        return
-      }
-      if (!allowed.includes(shadowThinking.value)) {
-        shadowThinking.value = fallbackReasoningEffort(allowed)
-        shadowThinkingNeedsApply.value = true
-      }
-    },
-    { flush: 'sync' },
-  )
 
   async function loadSnapshot() {
     if (replayMode) return
@@ -539,11 +501,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
         || registry.value.tts_profiles.find(item => item.origin === 'runtime_config'),
     }
   })
-  const shadowThinkingOptions = computed(() => selectedModels.value.shadow?.allowedReasoning || ['off'])
-  const shadowThinkingPending = computed(() => (
-    shadowThinkingNeedsApply.value
-    || normalizeReasoningEffort(shadowThinking.value) !== normalizeReasoningEffort(shadowThinkingCommitted.value)
-  ))
   const selectedTtsProfile = computed<ProductTtsProfile | undefined>(() => selectedModels.value.tts)
   const selectedTtsModel = computed<ProductUiModel | undefined>(() => {
     const profile = selectedTtsProfile.value
@@ -601,13 +558,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
     if (!connected.value) return false
     return voice.setReasoningMode(mode)
-  }
-
-  function setShadowThinking(value: string) {
-    const normalized = normalizeReasoningEffort(value)
-    if (!shadowThinkingOptions.value.includes(normalized)) return
-    shadowThinking.value = normalized
-    setNotice(`Shadow 思考等级已选择 ${normalized}；点击“应用模型配置”并确认后生效。`)
   }
 
   function toggleProviderReasoning(value: string) {
@@ -866,15 +816,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   function assignmentPayload() {
-    const allowed = shadowThinkingOptions.value
-    const requested = normalizeReasoningEffort(shadowThinking.value)
-    const shadowReasoningEffort = allowed.includes(requested) ? requested : fallbackReasoningEffort(allowed)
     return {
       voice_llm_model_id: modelAssignments.voice || null,
       shadow_llm_model_id: modelAssignments.shadow || null,
       status_llm_model_id: modelAssignments.status || null,
       tts_profile_id: modelAssignments.tts || null,
-      shadow_reasoning_effort: shadowReasoningEffort,
     }
   }
 
@@ -900,15 +846,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
         await loadSnapshot()
       } else {
         restartState.value = 'error'
-        shadowThinking.value = shadowThinkingCommitted.value
-        shadowThinkingNeedsApply.value = false
         setError(new Error(typeof result.message === 'string' ? result.message : '模型服务重启失败，已保留上一份有效配置。'))
       }
       return result
     } catch (error) {
       restartState.value = 'error'
-      shadowThinking.value = shadowThinkingCommitted.value
-      shadowThinkingNeedsApply.value = false
       setError(error)
       return null
     }
@@ -1006,12 +948,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     selectedTtsProfile,
     selectedTtsModel,
     activeTtsModel,
-    shadowThinking,
-    shadowThinkingCommitted,
-    shadowThinkingPending,
-    shadowThinkingOptions,
     shadowExpanded,
-    thinkingExpanded,
     modelScanState,
     restartState,
     applyImpact,
@@ -1023,7 +960,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     runtimeAction,
     resetSession,
     setReasoningMode,
-    setShadowThinking,
     toggleProviderReasoning,
     saveWake,
     saveSilence,

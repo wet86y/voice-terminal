@@ -19,13 +19,13 @@ python -m pytest -q tests/test_opencode_go_shadow_e2e.py
 - 初始 snapshot 含触发动作的当前用户原文，后续 delta 无损且来源明确；
 - provider、工具后和 result 前均执行 freshness gate；stale 工具为 `not_executed`，stale final 不发布；
 - clarification 不使用 question ID/reply/waiter；用户回答依靠完整上下文继续；
-- 每 5 个 committed response 触发一个无工具、无思考 Observer；迟到摘要被丢弃；
+- activation 启动时与每 5 个 committed response 触发无工具、无思考 Observer；迟到摘要被丢弃；
 - Observer/status 文本只报告事实和状态，并且仅更新产品 UI；status/progress/tool activity 不进入
   主邮箱。只有 observation/user_input_required/result/failed 经唯一 heartbeat 交给主 LLM；
 - 实验门禁默认关闭；开启时 defer_once 不推进可见 revision，下一次判断覆盖全部未释放正文；
   侧载超时、异常、非法 Schema、uncertain、迟到 activation 或关闭开关必须 fail-open；
-- activation 无摘要时正文直通且强制摘要；流式 reasoning 只作为有界未提交快照，不能出现在
-  ledger、日志、产品 snapshot 或持久文件；
+- 首条摘要不依赖 context gate；Observer 只接收协议安全的纯文本观察记录，不接收原始 reasoning
+  或 Responses 工具项，请求失败时缩短重试并发布静态兜底；
 - 正常请求默认允许 `wait` 表示语音队列无需变更；重复 `target_text`、`heard_text` 或 assistant
   历史必须被禁止，`cancel` 仅用于必须停止现有语音且没有替代文本的情况；
 - 80% token 阈值在安全边界换代，失败不丢失旧 trace；

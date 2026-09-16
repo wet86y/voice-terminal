@@ -136,7 +136,7 @@ async def wait_idle(runtime: ShadowRuntime):
     raise AssertionError("not idle")
 
 
-def test_observer_runs_exactly_at_five_committed_steps_without_tools(tmp_path: Path):
+def test_observer_runs_at_activation_start_and_five_committed_steps_without_tools(tmp_path: Path):
     async def scenario():
         provider, ledger, events = ObserverProvider(), SessionLedger(), []
         ledger.commit_input("u", "长期查找")
@@ -148,7 +148,7 @@ def test_observer_runs_exactly_at_five_committed_steps_without_tools(tmp_path: P
         runtime.wake()
         await wait_idle(runtime)
         observer = [request for request in provider.requests if request["reasoning_effort"] == "none"]
-        assert len(observer) == 1
+        assert len(observer) == 2
         assert observer[0]["tools"] == []
         assert observer[0]["max_output_tokens"] == 512
         assert runtime.committed_model_steps == 6
@@ -227,6 +227,178 @@ def test_compaction_rolls_cache_epoch_and_retains_authoritative_snapshot(tmp_pat
         assert any(request.get("text_schema") for request in provider.requests)
         assert "当前意图" in json.dumps(runtime.working_trace, ensure_ascii=False)
         assert events[-1].kind == "result"
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_reminder_is_injected_at_next_safe_boundary_only(tmp_path: Path):
+    class Provider:
+        def __init__(self): self.requests = []
+        async def complete(self, **kwargs):
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                await asyncio.sleep(0.02)
+                return ShadowProviderResponse((call(1),), {})
+            return ShadowProviderResponse((message("已收敛完成"),), {})
+
+    async def scenario():
+        provider, ledger, events = Provider(), SessionLedger(), []
+        ledger.commit_input("u", "请快速处理")
+        runtime = ShadowRuntime(
+            provider, ShadowToolExecutor(FileTools((tmp_path,))), ledger,
+            instructions_loader=lambda: "fixed", on_event=events.append,
+            observer_enabled=False, runtime_reminder_interval_ms=10,
+        )
+        runtime.wake()
+        await wait_idle(runtime)
+        assert len(provider.requests) == 2
+        second = json.dumps(provider.requests[1]["input_items"], ensure_ascii=False)
+        assert "运行时限提醒" in second
+        assert "立即收敛" in second
+        assert events[-1].text == "已收敛完成"
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_response_does_not_add_a_reminder_round(tmp_path: Path):
+    class Provider:
+        def __init__(self): self.requests = []
+        async def complete(self, **kwargs):
+            self.requests.append(kwargs)
+            await asyncio.sleep(0.02)
+            return ShadowProviderResponse((message("直接完成"),), {})
+
+    async def scenario():
+        provider, ledger, events = Provider(), SessionLedger(), []
+        ledger.commit_input("u", "直接回答")
+        runtime = ShadowRuntime(
+            provider, ShadowToolExecutor(FileTools((tmp_path,))), ledger,
+            instructions_loader=lambda: "fixed", on_event=events.append,
+            observer_enabled=False, runtime_reminder_interval_ms=10,
+        )
+        runtime.wake()
+        await wait_idle(runtime)
+        assert len(provider.requests) == 1
+        assert events[-1].text == "直接完成"
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_slow_tool_returns_one_pending_output_then_reinjects_completion(tmp_path: Path):
+    import threading
+
+    class SlowBackend:
+        available = True
+        def action_definitions(self):
+            return [{
+                "name": "files_search", "description": "test",
+                "parameters": {"type": "object", "properties": {
+                    "query": {"type": "string"},
+                }, "required": ["query"], "additionalProperties": False},
+            }]
+        def normalize(self, name, arguments): return name, arguments
+        def execute(self, _name, _arguments):
+            threading.Event().wait(0.03)
+            return {"files": ["done.md"]}
+
+    class Provider:
+        def __init__(self): self.requests = []
+        async def complete(self, **kwargs):
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                return ShadowProviderResponse(({
+                    "type": "function_call", "status": "completed",
+                    "call_id": "slow-1", "name": "files_search",
+                    "arguments": json.dumps({"query": "done"}),
+                },), {})
+            if len(self.requests) == 2:
+                await asyncio.sleep(0.15)
+                return ShadowProviderResponse((message("过期草稿"),), {})
+            return ShadowProviderResponse((message("包含后台结果的最终答案"),), {})
+
+    async def scenario():
+        provider, ledger, events = Provider(), SessionLedger(), []
+        ledger.commit_input("u", "查找文件")
+        runtime = ShadowRuntime(
+            provider, ShadowToolExecutor(SlowBackend(), soft_yield_ms=5), ledger,
+            instructions_loader=lambda: "fixed", on_event=events.append,
+            observer_enabled=False,
+        )
+        runtime.wake()
+        await wait_idle(runtime)
+        assert len(provider.requests) == 3
+        first_followup = provider.requests[1]["input_items"]
+        outputs = [item for item in first_followup if item.get("type") == "function_call_output"]
+        assert [item["call_id"] for item in outputs] == ["slow-1"]
+        pending = json.loads(outputs[0]["output"])
+        assert pending["status"] == "running" and pending["job_id"].startswith("tool-")
+        final_input = json.dumps(provider.requests[2]["input_items"], ensure_ascii=False)
+        assert "后台工具作业完成记录" in final_input
+        assert "done.md" in final_input
+        assert [event.text for event in events if event.kind == "result"] == ["包含后台结果的最终答案"]
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_observer_receives_no_reasoning_or_responses_tool_items(tmp_path: Path):
+    runtime = ShadowRuntime(
+        ObserverProvider(), ShadowToolExecutor(FileTools((tmp_path,))), SessionLedger(),
+        instructions_loader=lambda: "fixed", observer_enabled=False,
+    )
+    trace = (
+        {"type": "reasoning", "summary": "private chain"},
+        {"type": "function_call", "call_id": "c", "name": "web_search", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c", "output": '{"organic":[]}'},
+        {"type": "function_call_output", "call_id": "orphan", "output": '{"error":"x"}'},
+    )
+    safe = runtime._status_trace_prefix(trace)
+    assert safe and all(set(item).issuperset({"role", "content"}) for item in safe)
+    encoded = json.dumps(safe, ensure_ascii=False)
+    assert "private chain" not in encoded
+    assert '"type": "function_call"' not in encoded
+    assert '"type": "function_call_output"' not in encoded
+
+
+def test_initial_observer_is_gate_independent_and_falls_back_after_retry(tmp_path: Path):
+    class BlockingMain:
+        def __init__(self): self.started = asyncio.Event()
+        async def complete(self, **_kwargs):
+            self.started.set()
+            await asyncio.Event().wait()
+
+    class FailingStatus:
+        def __init__(self): self.requests = []
+        async def complete(self, **kwargs):
+            self.requests.append(kwargs)
+            raise ShadowProviderError("Responses HTTP 400: invalid tool history", retryable=False)
+
+    async def scenario():
+        main, status, ledger, events = BlockingMain(), FailingStatus(), SessionLedger(), []
+        ledger.commit_input("u", "需要首条摘要")
+        runtime = ShadowRuntime(
+            main, ShadowToolExecutor(FileTools((tmp_path,))), ledger,
+            instructions_loader=lambda: "fixed", status_provider=status,
+            on_event=events.append,
+        )
+        runtime.wake()
+        await asyncio.wait_for(main.started.wait(), timeout=1)
+        for _ in range(100):
+            if any(event.kind == "status" for event in events):
+                break
+            await asyncio.sleep(0.01)
+        assert len(status.requests) == 2
+        assert all(request["tools"] == [] for request in status.requests)
+        assert all(
+            item.get("type") not in {"reasoning", "function_call", "function_call_output"}
+            for request in status.requests for item in request["input_items"]
+        )
+        assert [event.text for event in events if event.kind == "status"] == [
+            "Shadow Agent 正在处理当前任务；可读状态摘要暂时不可用，任务仍在运行。"
+        ]
         await runtime.close()
 
     asyncio.run(scenario())

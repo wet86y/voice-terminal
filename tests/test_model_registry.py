@@ -123,7 +123,7 @@ class ModelRegistryTests(unittest.TestCase):
                 "tts_profile_id": "tts-profile",
                 "role_settings": {
                     "voice": {"reasoning_effort": "low", "max_context_tokens": 131072},
-                    "shadow": {"reasoning_effort": "high", "max_context_tokens": 262144},
+                    "shadow": {"reasoning_effort": "max", "max_context_tokens": 262144},
                     "status": {"reasoning_effort": "none", "max_context_tokens": 32768},
                 },
             },
@@ -179,20 +179,20 @@ class ModelRegistryTests(unittest.TestCase):
         applied = asyncio.run(self.service.apply_assignments(assignments, confirmed=True))
         self.assertTrue(applied["applied"])
         self.assertEqual(self.applied[0]["voice"]["settings"]["reasoning_effort"], "low")
-        self.assertEqual(self.applied[0]["shadow"]["settings"]["reasoning_effort"], "medium")
+        self.assertEqual(self.applied[0]["shadow"]["settings"]["reasoning_effort"], "high")
         self.assertEqual(self.applied[0]["status"]["settings"]["reasoning_effort"], "none")
         self.assertEqual(self.applied[0]["tts"]["profile"]["model_id"], tts_id)
         self.assertEqual(self.applied[0]["voice"]["api_key"], "llm-secret")
         self.assertEqual(applied["assignments"]["policy_mode"], "model")
-        self.assertEqual(applied["assignments"]["shadow_reasoning_effort"], "medium")
-        self.assertEqual(applied["assignments"]["role_settings"]["shadow"]["reasoning_effort"], "medium")
+        self.assertEqual(applied["assignments"]["shadow_reasoning_effort"], "high")
+        self.assertEqual(applied["assignments"]["role_settings"]["shadow"]["reasoning_effort"], "high")
 
         off_assignments = {**assignments, "shadow_reasoning_effort": "off"}
         applied_off = asyncio.run(self.service.apply_assignments(off_assignments, confirmed=True))
         self.assertTrue(applied_off["applied"])
-        self.assertEqual(self.applied[-1]["shadow"]["settings"]["reasoning_effort"], "off")
-        self.assertEqual(applied_off["assignments"]["shadow_reasoning_effort"], "off")
-        self.assertEqual(applied_off["assignments"]["role_settings"]["shadow"]["reasoning_effort"], "off")
+        self.assertEqual(self.applied[-1]["shadow"]["settings"]["reasoning_effort"], "high")
+        self.assertEqual(applied_off["assignments"]["shadow_reasoning_effort"], "high")
+        self.assertEqual(applied_off["assignments"]["role_settings"]["shadow"]["reasoning_effort"], "high")
 
         public = asyncio.run(self.service.snapshot())
         self.assertNotIn("llm-secret", repr(public))
@@ -207,6 +207,15 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertFalse(failed["applied"])
         self.assertEqual(failed["assignments"], previous)
         self.assertEqual(asyncio.run(self.service.snapshot())["assignments"], previous)
+
+        incompatible = self.service._load()
+        shadow_entry = next(
+            item for item in incompatible["models"] if item.get("model_id") == "shadow-model"
+        )
+        shadow_entry["allowed_reasoning"] = ["off", "medium"]
+        self.service._write(incompatible)
+        with self.assertRaisesRegex(ModelRegistryError, "必须支持 high"):
+            asyncio.run(self.service.apply_assignments(assignments, confirmed=True))
 
         with self.assertRaises(ModelRegistryError):
             asyncio.run(self.service.update_model(voice_id, {"provider_id": "other"}))
