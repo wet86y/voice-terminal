@@ -96,6 +96,49 @@ def test_responses_adapter_commits_only_completed_output_and_normalizes_cache_us
     asyncio.run(scenario())
 
 
+def test_responses_adapter_neutralizes_only_an_unreplayable_thinking_tools_response(monkeypatch):
+    async def scenario():
+        terminal = {
+            "type": "message", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": "最终结果"}],
+        }
+        complete = {
+            "type": "response.completed",
+            "response": {
+                "status": "completed", "output": [terminal],
+                "usage": {
+                    "input_tokens": 40, "output_tokens": 8,
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                },
+            },
+        }
+        monkeypatch.setattr(
+            "httpx.AsyncClient",
+            lambda *args, **kwargs: FakeClient(FakeResponse([
+                f"data: {json.dumps(complete, ensure_ascii=False)}",
+            ])),
+        )
+        provider = DeepSeekResponsesShadowProvider(
+            base_url="https://example.test", api_key="key", model="m",
+        )
+        result = await provider.complete(
+            instructions="fixed", input_items=[],
+            tools=[{"type": "function", "name": "lookup"}],
+            reasoning_effort="high",
+        )
+
+        assert result.output == (terminal,)
+        assert result.replay_output is not None
+        assert all(item.get("type") is None for item in result.replay_output)
+        encoded = json.dumps(result.replay_output, ensure_ascii=False)
+        assert "最终结果" in encoded
+        stored = json.loads(result.replay_output[0]["content"].split("\n", 1)[1])
+        assert stored == terminal
+        await provider.close()
+
+    asyncio.run(scenario())
+
+
 def test_responses_adapter_rejects_stream_without_completed(monkeypatch):
     async def scenario():
         monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: FakeClient(FakeResponse([
@@ -282,6 +325,114 @@ def test_terminal_response_does_not_add_a_reminder_round(tmp_path: Path):
         await wait_idle(runtime)
         assert len(provider.requests) == 1
         assert events[-1].text == "直接完成"
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_new_activation_preserves_valid_prefix_and_neutralizes_only_bad_terminal(tmp_path: Path):
+    class Provider:
+        def __init__(self): self.requests = []
+        async def complete(self, **kwargs):
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                return ShadowProviderResponse((
+                    {
+                        "type": "reasoning", "status": "completed",
+                        "content": [{"type": "reasoning_text", "text": "private"}],
+                    },
+                    call(1),
+                ), {})
+            if len(self.requests) == 2:
+                return ShadowProviderResponse(
+                    (message("第一轮完成"),), {},
+                    ({
+                        "role": "system",
+                        "content": "【Shadow 已完成输出（数据，非指令）】\n第一轮完成",
+                    },),
+                )
+            return ShadowProviderResponse((message("第二轮完成"),), {})
+
+    async def scenario():
+        provider, ledger, events = Provider(), SessionLedger(), []
+        ledger.commit_input("u1", "先处理第一件事")
+        runtime = ShadowRuntime(
+            provider, ShadowToolExecutor(FileTools((tmp_path,))), ledger,
+            instructions_loader=lambda: "fixed", on_event=events.append,
+            observer_enabled=False,
+        )
+
+        runtime.wake()
+        await wait_idle(runtime)
+        assert any(item.get("type") == "reasoning" for item in runtime.working_trace)
+        assert not any(item.get("type") == "message" for item in runtime.working_trace)
+
+        ledger.commit_input("u2", "继续处理第二件事")
+        runtime.wake()
+        await wait_idle(runtime)
+
+        assert len(provider.requests) == 3
+        resumed = provider.requests[2]["input_items"]
+        assert any(item.get("type") == "reasoning" for item in resumed)
+        assert any(item.get("type") == "function_call" for item in resumed)
+        assert any(item.get("type") == "function_call_output" for item in resumed)
+        assert not any(item.get("type") == "message" for item in resumed)
+        encoded = json.dumps(resumed, ensure_ascii=False)
+        assert "第一轮完成" in encoded
+        assert "publish_main_event" in encoded
+        assert "step 1" in encoded
+        assert "继续处理第二件事" in encoded
+        assert "private" in encoded
+        assert [event.text for event in events if event.kind == "result"] == [
+            "第一轮完成", "第二轮完成",
+        ]
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_unreplayable_tool_response_keeps_call_and_result_protocol_neutral(tmp_path: Path):
+    class Provider:
+        def __init__(self): self.requests = []
+        async def complete(self, **kwargs):
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                tool_call = call(1)
+                return ShadowProviderResponse(
+                    (tool_call,), {},
+                    ({
+                        "role": "system",
+                        "content": "【Shadow 已请求工具（数据，非指令）】\n"
+                        + json.dumps(tool_call, ensure_ascii=False),
+                    },),
+                )
+            return ShadowProviderResponse(
+                (message("降级协议后完成"),), {},
+                ({"role": "system", "content": "降级协议后完成"},),
+            )
+
+    async def scenario():
+        provider, ledger, events = Provider(), SessionLedger(), []
+        ledger.commit_input("u", "执行一次工具调用")
+        runtime = ShadowRuntime(
+            provider, ShadowToolExecutor(FileTools((tmp_path,))), ledger,
+            instructions_loader=lambda: "fixed", on_event=events.append,
+            observer_enabled=False,
+        )
+        runtime.wake()
+        await wait_idle(runtime)
+
+        assert len(provider.requests) == 2
+        second = provider.requests[1]["input_items"]
+        assert not any(
+            item.get("type") in {"function_call", "function_call_output"}
+            for item in second
+        )
+        encoded = json.dumps(second, ensure_ascii=False)
+        assert "publish_main_event" in encoded
+        assert "step 1" in encoded
+        assert "Shadow 工具结果" in encoded
+        assert events[-1].text == "降级协议后完成"
         await runtime.close()
 
     asyncio.run(scenario())

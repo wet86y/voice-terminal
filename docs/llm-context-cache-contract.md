@@ -59,6 +59,16 @@ DeepSeek 的前缀缓存按请求开头连续 token 匹配。官方 Responses �
 包装。这样 DeepSeek 请求仍保持“稳定 STATIC + 只追加 HISTORY + 动态 REQUEST_TAIL”的
 连续 token 前缀，新增包装只作为当轮新增后缀参与首次计算。
 
+### Shadow Responses 回放不变量
+
+Shadow 的 thinking+tools 请求遵循同一条追加原则：正常完成的 `reasoning`、
+`function_call`、`function_call_output` 和 `message` item 原样保留，并在下一次 activation
+按原顺序回传；不能因为一次 activation 暂停/恢复而批量重写或重新包装整个历史。DeepSeek
+可能接受一轮成功响应，却因该响应缺少非空 `reasoning_text` 而拒绝下一轮工具回放。此时
+provider 只标记这一轮为不可直接回放，并把该轮（包括对应工具结果）转换为协议无关的
+`system` 数据记录；此前合法前缀、缓存重叠和后续追加顺序保持不变。该兜底只处理实际
+触发问题的单轮，不改变标准协议路径。
+
 ## V1 请求尾部信封
 
 主 Agent 的模型可见请求固定按以下顺序排列：

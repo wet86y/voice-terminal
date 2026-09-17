@@ -61,6 +61,12 @@ activation 从启动起按 20 秒周期累计运行时间；跨过周期后只�
 上下文可安全追加的边界合并注入一条咨询式收敛提醒。提醒不会取消正在进行的 provider 请求；
 已有合法终态时直接发布，不为补发提醒额外增加模型轮次。
 
+DeepSeek thinking+tools 的正常响应按官方协议原样进入 committed trace，跨 activation 继续完整
+回传 `reasoning`、`function_call`、`function_call_output` 和 `message`，以保持合法续接和缓存前缀。
+若服务端成功返回的单次响应缺少非空 `reasoning_text`，该响应可用于当前结果/工具执行，但不能
+在下一次 thinking+tools 请求中原样重放；provider 只把这一批输出转换为协议无关的数据记录，
+对应工具结果也使用相同表示。此前所有合法前缀保持不变，不在 activation 边界批量改写历史。
+
 ## 权威 Shadow 上下文
 
 `ShadowContextProjector` 从 `SessionLedger` 投影专用上下文，不复用语音模型的 prompt 或
