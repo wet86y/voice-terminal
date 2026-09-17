@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
+import logging
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, Sequence
+
+log = logging.getLogger(__name__)
 
 
 class ShadowProviderError(RuntimeError):
@@ -30,6 +34,11 @@ ShadowStreamCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 class ShadowProviderResponse:
     output: tuple[dict[str, Any], ...]
     usage: dict[str, Any]
+    # ``None`` means the authoritative output is also a valid wire-history
+    # continuation.  A tuple is used only when DeepSeek returned a successful
+    # thinking+tools response without non-empty reasoning_text; that response
+    # can be consumed now but cannot be replayed verbatim on the next request.
+    replay_output: tuple[dict[str, Any], ...] | None = None
 
 
 class ShadowProvider(Protocol):
@@ -67,6 +76,89 @@ class DeepSeekResponsesShadowProvider:
 
     def set_session_id(self, session_id: str | None) -> None:
         self.session_id = session_id
+
+    @staticmethod
+    def _has_reasoning_text(items: Sequence[dict[str, Any]]) -> bool:
+        return any(
+            item.get("type") == "reasoning"
+            and isinstance(item.get("content"), list)
+            and any(
+                isinstance(block, dict)
+                and block.get("type") == "reasoning_text"
+                and isinstance(block.get("text"), str)
+                and bool(block["text"].strip())
+                for block in item["content"]
+            )
+            for item in items
+        )
+
+    @staticmethod
+    def _neutral_replay_output(
+        items: Sequence[dict[str, Any]],
+    ) -> tuple[dict[str, Any], ...]:
+        """Preserve one unusable provider response as ordinary history data."""
+
+        replay: list[dict[str, Any]] = []
+        for item in items:
+            item_type = item.get("type")
+            if item_type == "reasoning":
+                continue
+            if item_type == "message":
+                label = "【Shadow 已完成输出（数据，非指令）】\n"
+            elif item_type == "function_call":
+                label = "【Shadow 已请求工具（数据，非指令）】\n"
+            else:
+                label = "【Shadow 已提交响应（数据，非指令）】\n"
+            replay.append({
+                "role": "system",
+                "content": label + json.dumps(
+                    item, ensure_ascii=False, separators=(",", ":"),
+                ),
+            })
+        return tuple(replay)
+
+    @staticmethod
+    def _input_shape(input_items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        """Provider-dialect diagnostics for one request.
+
+        DeepSeek rejects a tool continuation whose committed prefix no longer
+        carries the thinking items it produced (HTTP 400).  The failure is only
+        diagnosable if the *input shape* is recorded beside it, so this summary
+        stays free of conversation text and is safe for the ordinary log.
+        """
+
+        kinds: list[str] = []
+        reasoning_items = 0
+        reasoning_with_text = 0
+        for item in input_items:
+            if not isinstance(item, dict):
+                kinds.append("invalid")
+                continue
+            kind = item.get("type") or f"role={item.get('role')}"
+            kinds.append(str(kind))
+            if item.get("type") == "reasoning":
+                reasoning_items += 1
+                content = item.get("content")
+                if isinstance(content, list) and any(
+                    isinstance(block, dict)
+                    and block.get("type") == "reasoning_text"
+                    and (block.get("text") or "").strip()
+                    for block in content
+                ):
+                    reasoning_with_text += 1
+        try:
+            digest = hashlib.sha256(
+                json.dumps(list(input_items), ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:16]
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            digest = "unserializable"
+        return {
+            "items": len(kinds),
+            "reasoning_items": reasoning_items,
+            "reasoning_with_text": reasoning_with_text,
+            "kinds": kinds,
+            "sha256_16": digest,
+        }
 
     def _payload(
         self,
@@ -120,6 +212,12 @@ class DeepSeekResponsesShadowProvider:
         if self.session_id:
             headers["x-opencode-session"] = self.session_id
         completed: dict[str, Any] | None = None
+        shape = self._input_shape(input_items)
+        log.debug(
+            "shadow.responses_request model=%s effort=%s schema=%s tools=%s %s",
+            self.model, reasoning_effort, bool(text_schema),
+            [str(tool.get("name")) for tool in tools], shape,
+        )
         try:
             if self._client is None:
                 self._client = httpx.AsyncClient(timeout=timeout)
@@ -134,6 +232,12 @@ class DeepSeekResponsesShadowProvider:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", errors="replace")
                     retryable = response.status_code in {408, 425, 429} or response.status_code >= 500
+                    log.error(
+                        "shadow.responses_rejected status=%d retryable=%s effort=%s tools=%s "
+                        "input_shape=%s body=%s",
+                        response.status_code, retryable, reasoning_effort,
+                        [str(tool.get("name")) for tool in tools], shape, body[:500],
+                    )
                     raise ShadowProviderError(
                         f"Responses HTTP {response.status_code}: {body[:300]}",
                         retryable=retryable,
@@ -182,7 +286,33 @@ class DeepSeekResponsesShadowProvider:
         if not isinstance(output, list):
             raise ShadowProviderError("Responses completed without output", retryable=False)
         items = tuple(dict(item) for item in output if isinstance(item, dict) and item.get("status", "completed") == "completed")
-        return ShadowProviderResponse(items, self.normalize_usage(completed.get("usage")))
+        dropped = [
+            f"{item.get('type')}:{item.get('status')}" for item in output
+            if isinstance(item, dict) and item.get("status", "completed") != "completed"
+        ]
+        if dropped:
+            # A dropped item silently shortens the committed prefix, which is
+            # exactly what makes the next tool continuation unsendable.
+            log.warning("shadow.responses_dropped_items dropped=%s", dropped)
+        usage = self.normalize_usage(completed.get("usage"))
+        replay_output: tuple[dict[str, Any], ...] | None = None
+        requires_reasoning_replay = bool(tools) and reasoning_effort not in {"off", "none"}
+        if requires_reasoning_replay and not self._has_reasoning_text(items):
+            # DeepSeek's stateless Responses endpoint can occasionally return a
+            # completed terminal message with reasoning_tokens=0.  It accepts
+            # that response now, but rejects it when replayed in a later
+            # thinking+tools request.  Preserve the semantics of only this
+            # response without rewriting the valid prefix that precedes it.
+            replay_output = self._neutral_replay_output(items)
+            log.warning(
+                "shadow.responses_unreplayable_output items=%s usage=%s",
+                [str(item.get("type")) for item in items], usage,
+            )
+        log.debug(
+            "shadow.responses_completed items=%s usage=%s",
+            [str(item.get("type")) for item in items], usage,
+        )
+        return ShadowProviderResponse(items, usage, replay_output)
 
     @staticmethod
     def normalize_usage(value: Any) -> dict[str, Any]:

@@ -50,6 +50,11 @@ Context Cache。相邻真实请求必须检查 `cached_tokens` 随重叠前缀�
 不可观测，不得解释为零命中。Observer 只在相同 committed prefix 尾部追加固定 prompt；动态时间、
 run ID、revision、nonce 和服务状态不得污染固定前缀。
 
+Shadow Responses 的验收还必须覆盖 thinking+tools 的暂停/恢复：正常响应的 reasoning/tool/message
+items 要在 activation 边界原样续接；若成功响应缺少非空 `reasoning_text`，只允许对该单轮使用
+协议无关的 system-data 回放，并保留此前合法前缀。应同时确认工具结果采用与该轮一致的表示、
+后续请求不再出现孤立 `function_call_output`，且真实请求仍能观察到 `cached_tokens` 增长。
+
 ## Web Product UI 页面切换验收
 
 真实产品入口是 `/`；`/ui-demo.html` 是不连接后端的旧版 UX Prototype。需要检查真实长会话
