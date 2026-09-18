@@ -493,18 +493,30 @@ button { cursor: pointer; }
 /* Keep the Product workbench inside one viewport; long content belongs to its own pane. */
 html:has(.product-shell), body:has(.product-shell), #app:has(.product-shell) { height: 100%; }
 body:has(.product-shell) { overflow: hidden; }
-.product-shell { height: 100vh; min-height: 100vh; overflow: hidden; }
-.product-shell .workbench { height: calc(100vh - 136px); min-height: 0; }
+/* The product page is presented at 80% so more of the console fits one screen.
+   ``zoom`` scales layout AND viewport units together, so every ``100vh``-based
+   height below must be divided by the same factor: that keeps the shell's
+   physical height exactly equal to the viewport.  Changing one without the
+   other clips the bottom of the page. */
+.product-shell { height: calc(100vh / 0.8); min-height: calc(100vh / 0.8); zoom: 0.8; overflow: hidden; }
+.product-shell .workbench { height: calc(100vh / 0.8 - 136px); min-height: 0; }
 .product-shell .workbench-reordered > .shadow-column,
 .product-shell .workbench-reordered > .system-focus-column,
 .product-shell .workbench-reordered > .conversation-column { height: 100%; min-height: 0; }
 .product-shell .shadow-column { min-height: 0; overflow: hidden; }
-.product-shell .shadow-scroll { min-height: 0; flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; padding-right: 4px; scrollbar-gutter: stable; }
+/* The Shadow panel is three fixed regions: a bounded summary, the run trace
+   (the only region that scrolls), and the public event output.  The column
+   itself must never scroll, otherwise a long summary pushes the other two
+   regions out of view. */
+.product-shell .shadow-scroll { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden; }
 .product-shell .system-focus-column { min-height: 0; }
 .product-shell .workbench-reordered .system-focus-column { justify-content: flex-start; overflow-x: hidden; overflow-y: auto; scrollbar-gutter: stable; }
 .product-shell .conversation-column { min-height: 0; overflow: hidden; }
 .product-shell .conversation-stream:not(.empty) { display: block; min-height: 0; gap: 0; padding: 22px clamp(14px, 1.4vw, 24px); overscroll-behavior: contain; scrollbar-gutter: stable; }
-.product-shell .conversation-stack { min-height: 100%; display: flex; flex-direction: column; justify-content: flex-end; gap: 10px; overflow-anchor: none; }
+.product-shell .conversation-stack { min-height: 100%; display: flex; flex-direction: column; justify-content: flex-start; gap: 10px; overflow-anchor: none; }
+/* Pin a short history to the bottom without pushing overflow into the
+   unreachable main-start region, which ``justify-content: flex-end`` does. */
+.product-shell .conversation-stack.is-tail-anchored > :first-child { margin-top: auto; }
 
 /* Make the two side panes visibly scrollable without changing the dark product palette. */
 .product-shell .shadow-scroll, .product-shell .conversation-stream, .product-shell .workbench-reordered .system-focus-column, .product-shell .settings-page { scrollbar-width: thin; scrollbar-color: #7187c0 #0a1426; }
@@ -545,13 +557,13 @@ body:has(.product-shell) { overflow: hidden; }
 }
 
 /* Settings uses the same fixed viewport contract, so switching pages does not resize the document. */
-.product-shell .settings-page { height: calc(100vh - 155px); min-height: 0; margin: 43px auto 24px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.product-shell .settings-page { height: calc(100vh / 0.8 - 155px); min-height: 0; margin: 43px auto 24px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 
 @media (max-width: 800px) {
-  .product-shell .workbench { height: calc(100vh - 118px); margin-top: 20px; margin-bottom: 20px; overflow-y: auto; }
+  .product-shell .workbench { height: calc(100vh / 0.8 - 118px); margin-top: 20px; margin-bottom: 20px; overflow-y: auto; }
   .product-shell .workbench-reordered > .shadow-column, .product-shell .workbench-reordered > .system-focus-column, .product-shell .workbench-reordered > .conversation-column { height: auto; min-height: 590px; overflow: visible; }
   .product-shell .workbench-reordered .system-focus-column { overflow-y: visible; }
-  .product-shell .settings-page { height: calc(100vh - 118px); margin-top: 20px; margin-bottom: 20px; }
+  .product-shell .settings-page { height: calc(100vh / 0.8 - 118px); margin-top: 20px; margin-bottom: 20px; }
 }
 
 /* Pre-layout the two Product views on desktop so switching pages never reflows the document. */
@@ -644,15 +656,18 @@ body:has(.product-shell) { overflow: hidden; }
   border-radius: 14px;
   background: linear-gradient(145deg, #18274676, #050b182e);
 }
-.product-shell .shadow-summary-card { margin-top: 20px; padding: 16px; }
+/* Region 1 — summary takes its content height, yields to the regions below,
+   and keeps a ceiling so a long brief can never swallow the run trace. */
+.product-shell .shadow-summary-card { margin-top: 20px; padding: 16px; flex: 0 1 auto; min-height: 48px; max-height: 180px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #7187c0 #0a1426; }
 .product-shell .shadow-summary-card.status-working { border-color: #b782ee55; }
 .product-shell .shadow-summary-card.status-waiting { border-color: #e7b67555; }
 .product-shell .shadow-summary-card.status-failed { border-color: #f0808f55; }
-.shadow-summary-heading,
-.shadow-runtime-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-.shadow-summary-heading > div,
-.shadow-runtime-heading > div { min-width: 0; }
-.shadow-summary-heading h3 { margin: 8px 0 0; color: #e5ecff; font-size: 14px; font-weight: 620; line-height: 1.55; }
+/* The summary heading is a single row: kicker left, status chip right.  Its
+   body then claims a full row of its own, which is why wrapping stays on. */
+.shadow-summary-heading { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 8px 12px; }
+.shadow-summary-heading .section-label { flex: 0 0 auto; min-width: 0; margin-right: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shadow-summary-heading > h3 { flex: 1 1 100%; }
+.shadow-summary-heading h3 { margin: 6px 0 0; color: #e5ecff; font-size: 13px; font-weight: 620; line-height: 1.5; }
 .shadow-status-pill,
 .shadow-run-indicator { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; padding: 5px 7px; border: 1px solid #ffffff1c; border-radius: 7px; color: #9caac4; background: #ffffff08; font-size: 9px; white-space: nowrap; }
 .shadow-status-pill i,
@@ -677,13 +692,23 @@ body:has(.product-shell) { overflow: hidden; }
 .shadow-focus-line span { flex: 0 0 auto; color: #71809d; }
 .shadow-summary-meta { display: flex; justify-content: space-between; gap: 10px; margin-top: 14px; padding-top: 11px; border-top: 1px solid #ffffff0c; color: #7787a5; font-size: 9px; }
 .shadow-summary-meta time { color: #a0acc4; }
-.product-shell .shadow-runtime-card { margin-top: 13px; padding: 14px 14px 15px; }
-.shadow-runtime-heading { padding-bottom: 12px; border-bottom: 1px solid #ffffff0d; }
-.shadow-runtime-heading h3 { margin: 6px 0 0; color: #dbe5fb; font-size: 13px; font-weight: 620; }
-.shadow-runtime-sections { display: grid; gap: 0; }
-.shadow-activity-section { padding: 15px 0 2px; }
-.shadow-activity-section + .shadow-activity-section { border-top: 1px solid #ffffff0d; }
-.shadow-activity-section > header { display: flex; align-items: center; gap: 8px; }
+/* Regions 2 + 3 live in the run card.  There is a single heading row: the
+   kicker, the visible title and the status chip all sit on it, so the card
+   never repeats its own title and never spends a row on the chip alone.  The
+   floor is the sum of the section floors plus this card's own padding
+   (29 + 143 + 186), so no region can be squeezed past its own minimum. */
+.product-shell .shadow-runtime-card { margin-top: 13px; padding: 14px 14px 15px; flex: 1 1 419px; min-height: 419px; display: flex; flex-direction: column; }
+.product-shell .shadow-activity-section { padding: 15px 0 2px; }
+.product-shell .shadow-activity-section + .shadow-activity-section { border-top: 1px solid #ffffff0d; }
+/* Region 2 owns the flexible space; region 3 only takes what it needs.  The
+   floor sits on the section so the box can never outgrow its own parent. */
+.product-shell .shadow-activity-section.thinking-section { flex: 1 1 0; min-height: 143px; display: flex; flex-direction: column; }
+.product-shell .shadow-activity-section.event-section { flex: 0 0 auto; }
+.shadow-activity-section > header { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+/* The run card's heading row: kicker, visible title, status chip and count all
+   share one line, so the card never repeats its own title on a second row. */
+.product-shell .shadow-activity-section.thinking-section > header > div { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 7px; }
+.product-shell .shadow-activity-section.thinking-section > header .shadow-run-indicator { margin-left: auto; }
 .activity-section-icon { width: 22px; height: 22px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid #ffffff17; border-radius: 7px; font-size: 11px; }
 .thinking-icon { color: #d3a5ff; background: #b782ee16; }
 .tool-icon { color: #86b3ff; background: #7899f116; }
@@ -720,14 +745,56 @@ body:has(.product-shell) { overflow: hidden; }
 .shadow-runtime-card.status-unavailable .shadow-activity-empty .activity-node i { border-color: #596781; background: #2d3850; }
 .shadow-runtime-card.status-failed { border-color: #f0808f35; }
 .shadow-runtime-card.status-waiting { border-color: #e7b67535; }
+
+/* Fixed Shadow display boxes.  The run trace and the public ShadowEvent output
+   each render inside one bounded region instead of growing like a transcript,
+   so the panel height stays stable across a long activation. */
+.product-shell .shadow-trace-box,
+.product-shell .shadow-event-box {
+  margin-top: 11px;
+  padding: 12px 11px 2px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid #ffffff0f;
+  border-radius: 11px;
+  background: #050b182e;
+  scrollbar-width: thin;
+  scrollbar-color: #7187c0 #0a1426;
+}
+/* Region 2: height comes from the flex parent, and it is the scrolling area.
+   The floor keeps roughly two steps readable on short windows; the run card's
+   own floor is sized so this box is never squeezed past it. */
+.product-shell .shadow-trace-box { flex: 1 1 auto; min-height: 80px; }
+/* Region 3: content-sized with a cap so a long result cannot dominate.  The
+   floor covers the empty state and keeps a multi-line result readable; it was
+   raised by half over the previous 95/168 so the newest output is not cramped. */
+.product-shell .shadow-event-box { flex: 0 0 auto; min-height: 143px; max-height: 252px; }
+.product-shell .shadow-trace-box .shadow-activity-list,
+.product-shell .shadow-event-box .shadow-activity-list { margin-top: 0; flex: 0 1 auto; min-height: 0; }
+/* The box padding already provides the tail gap; a short list must not stretch
+   and a list pinned to the bottom must not clip against the rounded edge. */
+.product-shell .shadow-trace-box .shadow-activity-item,
+.product-shell .shadow-event-box .shadow-activity-item { padding-bottom: 8px; }
+.product-shell .shadow-trace-box .shadow-activity-item:last-child,
+.product-shell .shadow-event-box .shadow-activity-item:last-child { padding-bottom: 2px; }
+.product-shell .shadow-trace-box::-webkit-scrollbar,
+.product-shell .shadow-event-box::-webkit-scrollbar { width: 6px; }
+.product-shell .shadow-trace-box::-webkit-scrollbar-track,
+.product-shell .shadow-event-box::-webkit-scrollbar-track { border-radius: 99px; background: #0a1426a8; }
+.product-shell .shadow-trace-box::-webkit-scrollbar-thumb,
+.product-shell .shadow-event-box::-webkit-scrollbar-thumb { border: 1px solid #101b31; border-radius: 99px; background: #7187c0b8; }
+
 .shadow-runtime-card .shadow-details { margin-top: 12px; padding-top: 12px; }
 .workbench-reordered .shadow-resource-metrics > .thinking-meter { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px; }
 .thinking-apply-state { color: #6f7f9b; font-size: 8px; white-space: nowrap; }
 .thinking-apply-state.pending { color: #e7b675; }
 
 @media (max-width: 1180px) {
+  /* The panel becomes a full-width band in this range; its grid row is much
+     shorter than the three regions want, so the regions keep their flex
+     distribution and yield proportionally (the summary scrolls first). */
   .product-shell .workbench-reordered .shadow-column { display: flex; grid-column: 1 / -1; }
-  .product-shell .workbench-reordered .shadow-scroll { display: block; }
 }
 
 @media (max-width: 800px) {
