@@ -793,6 +793,7 @@ class AgentEpisodeRuntime:
         self.runner = None
         self.last_reasoning = None
         self.delay_task = None
+        self.input_scope_closed = False
         self.recovery_queue: deque[RecoverySignal] = deque()
         self.deferred_recovery_feedback: deque[RecoverySignal] = deque(maxlen=4)
         self.minor_protocol_feedback: deque[dict[str, str]] = deque(maxlen=8)
@@ -1715,6 +1716,26 @@ class AgentEpisodeRuntime:
         logger.info("agent.request_cancelled reason=%s episode_id=%s request_id=%s",
                     reason, self.episode_id, self.agent_step_id)
 
+    def close_input_scope(self) -> None:
+        """Stop starting new input-driven work without cancelling live work.
+
+        Stopping the microphone is an input boundary: a response that is
+        already being generated or is waiting in the TTS FIFO still has to be
+        heard, so the active request keeps running.  Only the paths that would
+        dispatch *new* work are closed here — a queued recovery signal or a
+        scheduled revisit must not produce speech after the user stopped.
+        """
+
+        self.input_scope_closed = True
+        self.recovery_queue.clear()
+        if self.delay_task is not None and not self.delay_task.done():
+            self.delay_task.cancel()
+
+    def open_input_scope(self) -> None:
+        """Re-open dispatch for a session that starts listening again."""
+
+        self.input_scope_closed = False
+
     async def _emit_turn_settled(self, identity, turn_id, outcome):
         """Tell the controller that a finalized turn ended without speech.
 
@@ -2386,6 +2407,10 @@ class AgentEpisodeRuntime:
 
     def _dispatch_allowed(self, *, respect_backoff=True):
         if self.closed or not self.episode_id:
+            return False
+        if self.input_scope_closed:
+            # Microphone input was stopped; the request already in flight may
+            # finish, but no new turn may be dispatched for it.
             return False
         if self.active_request is not None:
             return False

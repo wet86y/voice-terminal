@@ -32,6 +32,28 @@
 轨迹，同时不把播放结束误报为服务端已经完成结算；后到的 `speech.completed` 负责补齐最终状态、
 delivery 与延迟等字段。切换会话、`session.reset` 或断开连接时，客户端应清理对应的会话级投影。
 
+已结算的正式播报同时进入下文的 `conversation.append` 顺序流；本地播放队列只表示尚未结算的事务，
+两者不得重复渲染同一条 `conversation_id + speech_id`。
+
+## 会话顺序事件
+
+右侧对话卡片（“当前 Voice Terminal 会话”）只渲染服务端给出的会话顺序，不在客户端推断先后：
+
+- `conversation.append`：一条会话记录产生或更新时下发。payload 为
+  `{seq, kind, conversation_id, turn_id, speech_id, text, status, delivery, termination, at}`；
+  `kind` 取 `user_turn`（用户轮次）、`assistant_speech`（助手播报）或 `system_speech`
+  （系统播报，例如 KWS 唤醒确认与最终静默检查）。同一 `turn_id` / `speech_id` 的再次下发只刷新
+  文本与状态，`seq` 不变，因此已经出现的记录不会被重新排序。
+- `conversation.snapshot`：权威全量视图 `{entries, latest_seq}`。`session.reset` 之后立即下发，
+  用于让客户端丢弃上一个会话的顺序，而不是跨边界合并。
+- `subscribe` 返回的 `runtime.snapshot.payload.conversation` 同样是 `{entries, latest_seq}`；
+  刷新页面或断线重连时，客户端以它整体替换本地会话列表——助手回复与系统播报因此可以完整恢复。
+  只携带 `latest_seq`（没有 `entries`）的快照不会替换客户端已有的列表。
+
+`seq` 在每次 `session.reset` 后从 1 重新开始；客户端始终以快照为准。服务端按提交顺序分配 `seq`：
+用户轮次在结算（`turn.completed`）时进入，播报事务在 `speech.completed` 时进入，所以唤醒确认会
+落在它真实发生的两条轮次之间。
+
 ### 产品感知延迟
 
 产品首页的“用户说完 → AI 开口”是浏览器本地测量的感知延迟，不是 `metrics.snapshot` 中后端
@@ -48,7 +70,9 @@ delivery 与延迟等字段。切换会话、`session.reset` 或断开连接时�
 输出和等待队列；快照中的已结算 outputs 仍应与前端刚刚形成的本地轨迹按同一复合键去重合并。
 `session.stop` 只停止麦克风输入，不取消已经进入 Agent/TTS FIFO 的输出；这些输出继续通过
 `speech.started`、`speech.progress` 和 `speech.completed` 完成播放与结算，用户与 LLMspeak
-记录在右侧对话卡片中保持可见。需要终止输出时使用 `session.reset` 或关闭 runtime。
+记录在右侧对话卡片中保持可见。需要终止输出时使用 `session.reset` 或关闭 runtime。实现上停止只关闭
+“输入作用域”：已经派发的 LLM 请求、恢复队列中属于本轮的工作和播放队列继续运行，服务端同时释放
+用户讲话时挂起的播放 hold，且不再为已关闭的作用域派发新轮次。
 
 ## Shadow 产品快照与活动流
 

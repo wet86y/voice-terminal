@@ -27,6 +27,7 @@ from voice_terminal.providers.deepseek import DeepSeekClient
 from voice_terminal.server.snapshot import ProtocolSequencer
 from voice_terminal.server.websocket import SessionRuntime
 from voice_terminal.session.contracts import DeliveryReport
+from voice_terminal.session.conversation_log import ASSISTANT_SPEECH, SYSTEM_SPEECH, USER_TURN
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
 
@@ -321,8 +322,21 @@ def test_stopping_listening_does_not_cancel_the_episode_output_scope(monkeypatch
             async def speech_activity(self, speaking, **kwargs):
                 calls.append(("speech_activity", speaking, kwargs))
 
+            def close_input_scope(self):
+                calls.append(("close_input_scope",))
+
+            def cancel_active_request(self, reason):
+                raise AssertionError("stopping input must not cancel the running Agent request")
+
             async def stop(self):
                 raise AssertionError("stopping input must not close the Agent episode")
+
+        class Output:
+            def release_held(self):
+                calls.append(("release_held",))
+
+            def cancel_all(self, reason):
+                raise AssertionError("stopping input must not cancel queued speech")
 
         class Tts:
             async def close(self):
@@ -339,17 +353,182 @@ def test_stopping_listening_does_not_cancel_the_episode_output_scope(monkeypatch
         controller.state = SimpleNamespace(listening=True)
         controller.workspace = None
         controller.episode = Episode()
+        controller.output = Output()
         controller.tts = Tts()
         controller._cancel_tts_prewarm = cancel_prewarm
 
         await EpisodeController.stop_listening(controller)
 
         assert controller.state.listening is False
+        # A response queued while the user was speaking waits behind the
+        # pre-playback hold, so the input boundary has to release it.
         assert calls == [
             ("speech_activity", None, {}),
+            ("close_input_scope",),
+            ("release_held",),
             ("cancel_prewarm",),
             ("base_stop",),
         ]
+
+    asyncio.run(scenario())
+
+
+def test_input_stop_keeps_the_active_request_until_a_lifecycle_boundary():
+    """``stopped`` is the microphone boundary, not an output boundary."""
+
+    async def scenario():
+        calls = []
+
+        class Episode:
+            closed = False
+
+            def cancel_active_request(self, reason):
+                calls.append(("cancel_request", reason))
+
+        async def cancel_prewarm(*_args, **_kwargs):
+            calls.append(("cancel_prewarm",))
+
+        def make_controller():
+            controller = object.__new__(EpisodeController)
+            controller.workspace = None
+            controller.episode = Episode()
+            controller.history = SimpleNamespace(records=[])
+            controller._input_history_committed = set()
+            controller.turns = SimpleNamespace(invalidate=lambda: None)
+            controller._active_input = True
+            controller._sub_parts = {}
+            controller._sub_finals = {}
+            controller._resume_started = None
+            controller._speech_samples = 0
+            controller._speech_start_sample = None
+            controller._speech_end_sample = None
+            controller._vad_origin = None
+            controller._vad_generation = 0
+            controller._reset_vad_pending = False
+            controller._completion_task = None
+            controller._refine_task = None
+            controller._endpoint_task = None
+            controller._turn_cancel = None
+            controller._cancel_tts_prewarm = cancel_prewarm
+            return controller
+
+        for reason in ("stopped", "completed"):
+            calls.clear()
+            await make_controller()._cancel_turn(reason=reason, record=False)
+            assert not [item for item in calls if item[0] == "cancel_request"], (
+                "an input stop must not cancel the dispatched Agent request"
+            )
+
+        for reason in ("reset", "failed", "interrupted"):
+            calls.clear()
+            await make_controller()._cancel_turn(reason=reason, record=False)
+            assert ("cancel_request", reason) in calls
+
+    asyncio.run(scenario())
+
+
+def test_controller_records_turns_and_speech_in_one_ordered_log():
+    """The rail's order comes from the server, once, in commit order."""
+
+    async def scenario():
+        published = []
+
+        async def publish(value):
+            published.append(value)
+
+        async def state_event(*_args, **_kwargs):
+            return None
+
+        async def cancel_prewarm(*_args, **_kwargs):
+            return None
+
+        async def episode_log(*_args, **_kwargs):
+            return None
+
+        ledger = SessionLedger()
+        controller = object.__new__(EpisodeController)
+        controller.history = ledger
+        controller._settled_turns = set()
+        controller._committed_workspaces = {}
+        controller._publish = publish
+        controller._state_event = state_event
+        controller._cancel_tts_prewarm = cancel_prewarm
+        controller.conversation = SimpleNamespace(current_turn_id=None)
+        controller.workspace = None
+        controller.output = SimpleNamespace(active=False)
+        controller.state = SimpleNamespace(listening=False)
+        controller.episode = SimpleNamespace(last_turn_id=None, log=episode_log)
+
+        controller._committed_workspaces["input_1"] = SimpleNamespace(
+            turn_id="input_1", final_text="灵月是什么游戏？",
+            episode_id="conversation_a", timings={},
+        )
+        # The real commit path persists the transcript for model context first.
+        ledger.commit_input("input_1", "灵月是什么游戏？")
+        await controller._settle_committed_turn("input_1", outcome="completed", latency={})
+        # The wake acknowledgement of the next turn settles while turn 1 is the
+        # newest turn on screen; it must keep that place in the order.
+        await controller._agent_event("speech.completed", {
+            "speech_id": "speech_wake", "conversation_id": "conversation_a", "turn_id": "wake_1",
+            "text": "我在，请说。", "status": "completed", "owner_scope": "system_check",
+            "delivery": {"status": "full", "termination": "completed"},
+        })
+        await controller._agent_event("speech.completed", {
+            "speech_id": "speech_1", "conversation_id": "conversation_a", "turn_id": "input_1",
+            "text": "它应该是《怪物猎人荒野》的扩充。", "status": "completed",
+            "delivery": {"status": "full", "termination": "completed"},
+        })
+
+        assert [(entry["kind"], entry["text"], entry["seq"]) for entry in ledger.conversation.entries] == [
+            (USER_TURN, "灵月是什么游戏？", 1),
+            (SYSTEM_SPEECH, "我在，请说。", 2),
+            (ASSISTANT_SPEECH, "它应该是《怪物猎人荒野》的扩充。", 3),
+        ]
+        # The ordered log is a projection beside the model context, not a
+        # replacement: the durable conversation is unchanged.
+        assert [entry.kind for entry in ledger.entries] == ["input", "speech", "speech"]
+
+    asyncio.run(scenario())
+
+
+def test_closing_input_scope_blocks_new_dispatch_and_spares_live_work():
+    """Stopping the microphone closes dispatch without dropping queued work."""
+
+    class Registry:
+        def begin_turn(self, _): pass
+        def action_definitions(self): return []
+
+    async def scenario():
+        async def emit(*_): pass
+
+        runtime = AgentEpisodeRuntime(None, Registry(), SimpleNamespace(active=False, status="IDLE"), emit,
+                                      conversation=ConversationRuntime(), ledger=SessionLedger())
+        runtime.episode_id = "conversation_a"
+        runtime.recovery_queue.append(object())
+        runtime.delay_task = asyncio.create_task(asyncio.sleep(30))
+        live_request = asyncio.create_task(asyncio.sleep(30))
+
+        assert runtime._dispatch_allowed() is True
+        assert len(runtime.recovery_queue) == 1
+
+        # An active request already blocks further dispatch; the input scope is
+        # what keeps the scheduler from starting the next turn once it settles.
+        runtime.active_request = live_request
+        runtime.close_input_scope()
+        await asyncio.sleep(0)
+
+        assert runtime.input_scope_closed is True
+        assert runtime._dispatch_allowed() is False
+        assert not runtime.recovery_queue, "a closed input scope must drop queued follow-ups"
+        assert runtime.delay_task.cancelled(), "a scheduled revisit belongs to the closed scope"
+        assert not live_request.cancelled(), "the dispatched request must still be allowed to finish"
+
+        runtime.active_request = None
+        await asyncio.gather(live_request, return_exceptions=True)
+        assert runtime._dispatch_allowed() is False
+
+        runtime.open_input_scope()
+        assert runtime._dispatch_allowed() is True
 
     asyncio.run(scenario())
 

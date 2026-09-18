@@ -1,12 +1,20 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
-import type { PlaybackQueueItem, ReasoningMode, ShadowActivity, SpeechOutputRecord } from '../types'
-import { useProductAdapter, type AssignmentSlot, type ProductSettingsTab, type ProductUiModel } from './useProductAdapter'
+import type { ReasoningMode, ShadowActivity } from '../types'
+import {
+  useProductAdapter,
+  type AssignmentSlot,
+  type ConversationRow,
+  type PendingSpeechRow,
+  type ProductSettingsTab,
+  type ProductUiModel,
+} from './useProductAdapter'
 
 const adapter = useProductAdapter()
 const {
   voice, page: activePage, settingsTab: activeSettingsTab, settings, loading, saving,
-  connected, replayMode, replayMeta, runtimeState, current, conversation, shadow, latencyMs, latencyRunning, wakeForm,
+  connected, replayMode, replayMeta, runtimeState, current, conversationRows, pendingSpeechRows,
+  currentTurnLogged, currentTurnSpeechLogged, currentTurnSpeechPending, shadow, latencyMs, latencyRunning, wakeForm,
   silenceSeconds, personaDocument: activePersona, personaDocuments, providerForm,
   providerStep, discoveredModels, modelAssignments, uiModels: modelEntries,
   availableLlmModels, availableTtsModels, visibleLocalPool, hiddenPool,
@@ -23,8 +31,6 @@ const {
 } = adapter
 const reasoningMode = voice.reasoningMode
 const listening = voice.listening
-const speechOutputs = voice.speechOutputs
-const playbackQueue = voice.playbackQueue
 const waitingForWake = computed(() => (
   listening.value
   && voice.wakeAlwaysOn.value
@@ -84,26 +90,20 @@ const runtimeMeta = computed(() => {
 })
 
 const currentDocument = computed(() => personaItems.find(item => item.id === activePersona.value) || personaItems[0])
-const hasConversation = computed(() => conversation.value.length > 0
-  || speechOutputs.value.length > 0
+const hasConversation = computed(() => conversationRows.value.length > 0
+  || pendingSpeechRows.value.length > 0
   || Boolean(current.value.partial_text || current.value.final_text || current.value.assistant_text || current.value.tts_text))
-// recentTurns is maintained newest-first by the terminal adapter.  The
-// conversation rail is a chat surface, so render the copy oldest-first and
-// keep the newest entry at the visual tail.
-const orderedConversation = computed(() => [...conversation.value].reverse())
-const standaloneSpeechOutputs = computed(() => speechOutputs.value.filter(output => (
-  typeof output.text === 'string' && output.text.trim()
-  && !conversation.value.some(record => record.turn_id === output.turn_id)
-)))
-const standalonePlaybackItems = computed(() => playbackQueue.value.filter(item => (
-  typeof item.text === 'string' && item.text.trim()
-  && !speechOutputExists(item)
-  && !conversation.value.some(record => record.turn_id === item.turn_id)
-)))
-const currentTurnHasSpeechTrack = computed(() => {
-  const turnId = voice.currentTurnId.value
-  return Boolean(turnId && hasSpeechTrackForTurn(turnId))
-})
+// The rail renders the server-ordered conversation log plus the transactions
+// that have not settled into it yet.  Ordering (including where the KWS wake
+// acknowledgement belongs) is the server's ``seq``, never a client guess.
+const conversationEntries = computed(() => conversationRows.value)
+const liveSpeechEntries = computed(() => pendingSpeechRows.value)
+const liveUserText = computed(() => (currentTurnLogged.value ? '' : current.value.final_text))
+const liveAssistantText = computed(() => (
+  current.value.assistant_text && !currentTurnSpeechLogged.value && !currentTurnSpeechPending.value
+    ? current.value.assistant_text
+    : ''
+))
 const shadowContext = computed(() => {
   const context = shadow.value.context
   if (!context || (context.used_tokens == null && context.limit_tokens == null && context.usage_percent == null)) return null
@@ -112,6 +112,16 @@ const shadowContext = computed(() => {
 const shadowCacheHitRatio = computed(() => {
   const ratio = shadow.value.provider?.cache_hit_ratio
   return typeof ratio === 'number' && Number.isFinite(ratio) && ratio >= 0 && ratio <= 1 ? ratio : null
+})
+// The backend projection writes the same event text into both ``focus`` and
+// ``summary`` for status/progress/observation events.  Showing the focus line
+// then repeats the summary verbatim, so only render it when it carries
+// genuinely different information.
+const shadowFocusText = computed(() => {
+  const focus = (shadow.value.focus || '').trim()
+  const summary = (shadow.value.summary || '').trim()
+  if (!focus || focus === summary) return ''
+  return focus
 })
 const conversationContext = computed(() => {
   const episode = voice.agentEpisode.value
@@ -146,39 +156,65 @@ const assignedModelIds = computed(() => new Set([
 const selectedShadowReasoning = computed(() => 'high')
 
 const shadowActivities = computed(() => shadow.value.activities || [])
-const shadowScrollElement = ref<HTMLElement | null>(null)
-let shadowFollowTail: boolean | null = null
+const shadowTraceElement = ref<HTMLElement | null>(null)
+// ``null`` means the user has not touched the trace box yet; the run trace
+// defaults to the bottom so the newest activity is always the visible one.
+let shadowTraceFollowTail: boolean | null = null
 
-function captureShadowScrollPosition() {
-  const element = shadowScrollElement.value
+function captureShadowTraceScroll() {
+  const element = shadowTraceElement.value
   if (!element) return
-  shadowFollowTail = element.scrollHeight - element.scrollTop - element.clientHeight < 24
+  shadowTraceFollowTail = element.scrollHeight - element.scrollTop - element.clientHeight < 24
+}
+
+function followShadowTraceTail() {
+  const element = shadowTraceElement.value
+  if (!element) return
+  // Follow the tail on first paint and while the user stays at the bottom.
+  // Scrolling up to read earlier steps must not be yanked back.
+  const atTail = element.scrollHeight - element.scrollTop - element.clientHeight < 24
+  if (shadowTraceFollowTail === false && !atTail) return
+  element.scrollTop = element.scrollHeight
+  shadowTraceFollowTail = true
 }
 
 watch(shadowActivities, async () => {
-  const elementBeforeUpdate = shadowScrollElement.value
-  if (shadowFollowTail === null && elementBeforeUpdate) {
-    shadowFollowTail = elementBeforeUpdate.scrollHeight
-      - elementBeforeUpdate.scrollTop - elementBeforeUpdate.clientHeight < 24
-  }
-  if (!shadowFollowTail) return
   await nextTick()
-  if (!shadowFollowTail) return
-  const element = shadowScrollElement.value
-  if (element) element.scrollTop = element.scrollHeight
+  followShadowTraceTail()
 }, { deep: true })
+
+// The box height is driven by the flex layout, so a window resize can leave it
+// showing the oldest steps even though the user never scrolled away.
+let shadowTraceResizeObserver: ResizeObserver | null = null
+watch(shadowTraceElement, (element, previous) => {
+  if (previous) shadowTraceResizeObserver?.disconnect()
+  shadowTraceResizeObserver = null
+  if (!element || typeof ResizeObserver === 'undefined') return
+  shadowTraceResizeObserver = new ResizeObserver(() => followShadowTraceTail())
+  shadowTraceResizeObserver.observe(element)
+}, { immediate: true })
 
 const conversationScrollElement = ref<HTMLElement | null>(null)
 let conversationFollowTail: boolean | null = null
+// A chat rail pins short histories to the bottom.  Doing that with
+// ``justify-content: flex-end`` also pushes overflowing content into the
+// unreachable main-start region, so anchor from the top edge and only add the
+// bottom auto-margin while the rail genuinely fits.
+const conversationOverflow = ref(false)
+
+function measureConversationOverflow(element: HTMLElement) {
+  conversationOverflow.value = element.scrollHeight - element.clientHeight > 4
+}
 
 function captureConversationScrollPosition() {
   const element = conversationScrollElement.value
   if (!element) return
   conversationFollowTail = element.scrollHeight - element.scrollTop - element.clientHeight < 24
+  measureConversationOverflow(element)
 }
 
 watch(
-  [conversation, speechOutputs, playbackQueue,
+  [conversationRows, pendingSpeechRows,
     () => current.value.final_text, () => current.value.partial_text, () => current.value.assistant_text],
   async () => {
     const elementBeforeUpdate = conversationScrollElement.value
@@ -186,10 +222,10 @@ watch(
       conversationFollowTail = elementBeforeUpdate.scrollHeight
         - elementBeforeUpdate.scrollTop - elementBeforeUpdate.clientHeight < 24
     }
-    if (!conversationFollowTail) return
     await nextTick()
-    if (!conversationFollowTail) return
     const element = conversationScrollElement.value
+    if (element) measureConversationOverflow(element)
+    if (!conversationFollowTail) return
     if (element) element.scrollTop = element.scrollHeight
   },
   { deep: true },
@@ -237,16 +273,20 @@ function legacyShadowEvents(): ShadowActivity[] {
   }))
 }
 
-const shadowThinkingActivities = computed(() => {
-  const values = shadowActivities.value.filter(item => item.stream === 'thinking' || item.stream === 'lifecycle')
-  return (values.length ? values : (shadow.value.active ? [] : [])).slice(shadowExpanded.value ? -96 : -8)
-})
-const shadowToolActivities = computed(() => shadowActivities.value
-  .filter(item => item.stream === 'tool')
-  .slice(shadowExpanded.value ? -96 : -8))
+// The run box shows the trajectory of the current activation.  It is bounded by
+// the backend projection (96 activities) and scrolls internally, so the full
+// trajectory is kept: capping it here would make that scrolling pointless.
+const shadowRunningTrace = computed(() => shadowActivities.value
+  .filter(item => item.stream === 'thinking' || item.stream === 'lifecycle' || item.stream === 'tool'))
 const shadowEventActivities = computed(() => {
   const values = shadowActivities.value.filter(item => item.stream === 'event')
-  return (values.length ? values : legacyShadowEvents()).slice(shadowExpanded.value ? -96 : -8)
+  return values.length ? values : legacyShadowEvents()
+})
+// A fixed output box only presents the newest public ShadowEvent; older ones
+// remain in the bounded snapshot but are deliberately not stacked here.
+const shadowLatestEventActivity = computed<ShadowActivity | null>(() => {
+  const values = shadowEventActivities.value
+  return values.length ? values[values.length - 1] : null
 })
 
 function shadowActivityPhaseLabel(activity: ShadowActivity) {
@@ -339,26 +379,19 @@ function formatContext(value: number | undefined) {
   return value ? `${formatTokens(value)} tokens` : '未设置'
 }
 
-function speechOutputsForTurn(turnId: string) {
-  return speechOutputs.value.filter(output => output.turn_id === turnId
-    && typeof output.text === 'string' && output.text.trim())
+function turnStatusLabel(row: ConversationRow) {
+  const labels: Record<string, string> = {
+    completed: '已完成识别',
+    empty_input: '没有听到内容',
+    stopped: '已停止',
+    reset: '已重置',
+    failed: '识别失败',
+    pending: '识别中',
+  }
+  return labels[row.status] || labels[row.termination] || row.status || row.termination || '已记录'
 }
 
-function speechOutputExists(item: Pick<PlaybackQueueItem, 'conversation_id' | 'speech_id'>) {
-  return speechOutputs.value.some(output => output.speech_id === item.speech_id
-    && output.conversation_id === item.conversation_id)
-}
-
-function playbackItemsForTurn(turnId: string) {
-  return playbackQueue.value.filter(item => item.turn_id === turnId
-    && typeof item.text === 'string' && item.text.trim() && !speechOutputExists(item))
-}
-
-function hasSpeechTrackForTurn(turnId: string) {
-  return speechOutputsForTurn(turnId).length > 0 || playbackItemsForTurn(turnId).length > 0
-}
-
-function speechOutputStatusLabel(output: SpeechOutputRecord) {
+function speechStatusLabel(row: ConversationRow) {
   const labels: Record<string, string> = {
     completed: '已完成播报',
     failed: '播报失败',
@@ -370,21 +403,16 @@ function speechOutputStatusLabel(output: SpeechOutputRecord) {
     queued: '等待播放',
     waiting: '等待播放',
   }
-  const status = typeof output.status === 'string' ? output.status : ''
+  const status = row.status || ''
   return labels[status.toLowerCase()] || status || '已记录'
 }
 
-function speechOutputStatusKey(output: SpeechOutputRecord) {
-  return typeof output.status === 'string' && output.status ? output.status.toLowerCase() : 'recorded'
+function speechStatusKey(row: ConversationRow) {
+  return row.status ? row.status.toLowerCase() : 'recorded'
 }
 
-function speechOutputIsPlaying(output: SpeechOutputRecord) {
-  return voice.playbackQueue.value.some(item => item.speech_id === output.speech_id
-    && item.conversation_id === output.conversation_id && item.state === 'playing')
-}
-
-function playbackItemStatusLabel(item: PlaybackQueueItem) {
-  return item.state === 'playing' ? '正在播报' : '等待播放'
+function pendingSpeechStatusLabel(row: PendingSpeechRow) {
+  return row.state === 'playing' ? '正在播报' : '等待播放'
 }
 
 function deliveryStatusLabel(delivery: { status?: string; termination?: string } | undefined) {
@@ -750,6 +778,8 @@ async function stopSpeakerRecording() {
 }
 
 onBeforeUnmount(() => {
+  shadowTraceResizeObserver?.disconnect()
+  shadowTraceResizeObserver = null
   const capture = speakerCapture
   if (capture) {
     speakerCapture = null
@@ -798,52 +828,49 @@ function pageLabel() {
           <div><p class="panel-kicker"><span class="shadow-spark">✦</span> Shadow Agent</p><h2>后台协作</h2></div>
           <button class="expand-button" type="button" :aria-expanded="shadowExpanded" @click="shadowExpanded = !shadowExpanded">{{ shadowExpanded ? '收起' : '展开' }} <span>{{ shadowExpanded ? '−' : '+' }}</span></button>
         </header>
-        <div ref="shadowScrollElement" class="shadow-scroll" @scroll="captureShadowScrollPosition">
+        <div class="shadow-scroll">
           <section class="shadow-summary-card" :class="`status-${shadowStatusClass}`">
             <div class="shadow-summary-heading">
-              <div><p class="section-label">当前 Shadow 摘要</p><h3>{{ shadow.summary || (shadow.available ? '等待 Shadow 生成本轮可读摘要。' : 'Shadow Agent 当前不可用') }}</h3></div>
+              <p class="section-label">当前 Shadow 摘要</p>
               <span class="shadow-status-pill" :class="shadowStatusClass"><i></i>{{ shadowDisplayStatus }}</span>
+              <h3>{{ shadow.summary || (shadow.available ? '等待 Shadow 生成本轮可读摘要。' : 'Shadow Agent 当前不可用') }}</h3>
             </div>
-            <p class="shadow-focus-line"><span>当前关注</span>{{ shadow.focus || (shadow.available ? '等待真实会话上下文' : '后端没有提供可用 Shadow 运行时') }}</p>
+            <p v-if="shadowFocusText" class="shadow-focus-line"><span>当前关注</span>{{ shadowFocusText }}</p>
             <div class="shadow-summary-meta"><span>{{ shadow.active ? '运行中' : shadow.user_input_required ? '等待你的输入' : '最近更新' }}</span><time>{{ shadowLastActivityAt ? formatTime(shadowLastActivityAt) : '尚无活动记录' }}</time></div>
           </section>
 
           <section class="shadow-runtime-card" :class="`status-${shadowStatusClass}`">
-            <header class="shadow-runtime-heading">
-              <div><p class="section-label">Agent 运行轨迹</p><h3>{{ shadow.active ? 'Shadow 正在处理' : shadowDisplayStatus }}</h3></div>
-              <span class="shadow-run-indicator" :class="shadowStatusClass"><i></i>{{ shadow.active ? 'LIVE' : shadowDisplayStatus }}</span>
-            </header>
-            <div class="shadow-runtime-sections">
-              <section class="shadow-activity-section thinking-section">
-                <header><span class="activity-section-icon thinking-icon">✦</span><div><strong>思考内容</strong><small>可读摘要与运行阶段</small></div><em>{{ shadowThinkingActivities.length }}</em></header>
+            <!-- One heading row for the whole run card.  It used to repeat the
+                 same title twice ("AGENT 运行轨迹" over "运行轨迹") and spend a
+                 second row on the status chip alone. -->
+            <section class="shadow-activity-section thinking-section">
+              <header>
+                <span class="activity-section-icon thinking-icon">✦</span>
+                <div><p class="section-label">Agent 运行轨迹</p><strong>运行轨迹</strong></div>
+                <span class="shadow-run-indicator" :class="shadowStatusClass"><i></i>{{ shadow.active ? 'LIVE' : shadowDisplayStatus }}</span>
+                <em>{{ shadowRunningTrace.length }}</em>
+              </header>
+              <div ref="shadowTraceElement" class="shadow-trace-box" @scroll="captureShadowTraceScroll">
                 <ol class="shadow-activity-list">
-                  <li v-for="activity in shadowThinkingActivities" :key="`${activity.run_seq}-${activity.item_id}`" class="shadow-activity-item" :class="shadowActivityClass(activity)">
-                    <span class="activity-node"><i></i></span><div class="activity-copy"><div class="activity-line"><strong>{{ shadowActivityText(activity) }}</strong><span>{{ shadowActivityPhaseLabel(activity) }}</span></div><time>{{ formatTime(activity.timestamp) }}</time></div>
+                  <li v-for="activity in shadowRunningTrace" :key="`${activity.run_seq}-${activity.item_id}`" class="shadow-activity-item" :class="shadowActivityClass(activity)">
+                    <span class="activity-node"><i></i></span><div class="activity-copy"><div class="activity-line"><strong>{{ activity.stream === 'tool' ? (activity.tool_name || '未知工具') : shadowActivityText(activity) }}</strong><span>{{ shadowActivityPhaseLabel(activity) }}</span></div><p v-if="activity.stream === 'tool'">{{ shadowActivityText(activity) }}</p><time>{{ formatTime(activity.timestamp) }}</time></div>
                   </li>
-                  <li v-if="!shadowThinkingActivities.length" class="shadow-activity-empty"><span class="activity-node"><i></i></span><div><strong>{{ shadow.available ? (shadow.active ? '正在分析' : '暂无可读摘要') : '等待 Shadow 可用' }}</strong><span>{{ shadow.available ? '运行过程中会在这里显示阶段与摘要增量。' : '连接后会恢复当前运行活动。' }}</span></div></li>
+                  <li v-if="!shadowRunningTrace.length" class="shadow-activity-empty"><span class="activity-node"><i></i></span><div><strong>{{ shadow.available ? (shadow.active ? '正在分析' : '暂无运行轨迹') : '等待 Shadow 可用' }}</strong><span>{{ shadow.available ? '当前运行的动作会固定显示在这个区域。' : '连接后会恢复当前运行活动。' }}</span></div></li>
                 </ol>
-              </section>
+              </div>
+            </section>
 
-              <section class="shadow-activity-section tool-section">
-                <header><span class="activity-section-icon tool-icon">⌘</span><div><strong>工具调用情况</strong><small>准备、执行与结果</small></div><em>{{ shadowToolActivities.length }}</em></header>
+            <section class="shadow-activity-section event-section">
+              <header><span class="activity-section-icon event-icon">↗</span><div><strong>传递到事件的输出</strong><small>最新 ShadowEvent 公共事件</small></div><em>{{ shadowLatestEventActivity ? 1 : 0 }}</em></header>
+              <div class="shadow-event-box">
                 <ol class="shadow-activity-list">
-                  <li v-for="activity in shadowToolActivities" :key="`${activity.run_seq}-${activity.item_id}`" class="shadow-activity-item" :class="shadowActivityClass(activity)">
-                    <span class="activity-node"><i></i></span><div class="activity-copy"><div class="activity-line"><strong>{{ activity.tool_name || '未知工具' }}</strong><span>{{ shadowActivityPhaseLabel(activity) }}</span></div><p>{{ shadowActivityText(activity) }}</p><time>{{ formatTime(activity.timestamp) }}</time></div>
+                  <li v-if="shadowLatestEventActivity" class="shadow-activity-item" :class="shadowActivityClass(shadowLatestEventActivity)">
+                    <span class="activity-node"><i></i></span><div class="activity-copy"><div class="activity-line"><strong>{{ shadowActivityKindLabel(shadowLatestEventActivity) }}</strong><span>{{ shadowActivityPhaseLabel(shadowLatestEventActivity) }}</span></div><p>{{ shadowActivityText(shadowLatestEventActivity) }}</p><time>{{ formatTime(shadowLatestEventActivity.timestamp) }}</time></div>
                   </li>
-                  <li v-if="!shadowToolActivities.length" class="shadow-activity-empty"><span class="activity-node"><i></i></span><div><strong>暂无工具调用</strong><span>工具开始准备后会保留调用顺序。</span></div></li>
+                  <li v-else class="shadow-activity-empty"><span class="activity-node"><i></i></span><div><strong>{{ shadow.user_input_required ? '等待你的输入' : '暂无事件输出' }}</strong><span>{{ shadow.user_input_required ? 'Shadow 会在收到输入后继续。' : '最新一条进度、观察或结果会固定显示在这个区域。' }}</span></div></li>
                 </ol>
-              </section>
-
-              <section class="shadow-activity-section event-section">
-                <header><span class="activity-section-icon event-icon">↗</span><div><strong>传递到事件的输出</strong><small>ShadowEvent 公共事件</small></div><em>{{ shadowEventActivities.length }}</em></header>
-                <ol class="shadow-activity-list">
-                  <li v-for="activity in shadowEventActivities" :key="`${activity.run_seq}-${activity.item_id}`" class="shadow-activity-item" :class="shadowActivityClass(activity)">
-                    <span class="activity-node"><i></i></span><div class="activity-copy"><div class="activity-line"><strong>{{ shadowActivityKindLabel(activity) }}</strong><span>{{ shadowActivityPhaseLabel(activity) }}</span></div><p>{{ shadowActivityText(activity) }}</p><time>{{ formatTime(activity.timestamp) }}</time></div>
-                  </li>
-                  <li v-if="!shadowEventActivities.length" class="shadow-activity-empty"><span class="activity-node"><i></i></span><div><strong>{{ shadow.user_input_required ? '等待你的输入' : '暂无事件输出' }}</strong><span>{{ shadow.user_input_required ? 'Shadow 会在收到输入后继续。' : '进度、观察和结果会按时间顺序出现在这里。' }}</span></div></li>
-                </ol>
-              </section>
-            </div>
+              </div>
+            </section>
             <section v-if="shadowExpanded" class="shadow-details"><div class="detail-row"><span>运行状态</span><strong>{{ shadowDisplayStatus }}</strong></div><div class="detail-row"><span>当前激活</span><strong>{{ shadow.active ? '处理中' : '已结束' }}</strong></div><div v-if="shadow.user_input_required" class="detail-row"><span>需要操作</span><strong>等待用户输入</strong></div><p>这里仅显示 Shadow 的公开活动、可读摘要和事件状态；原始私有 reasoning、prompt、工具参数与内部 revision 不会进入产品页面。</p></section>
           </section>
         </div>
@@ -877,37 +904,28 @@ function pageLabel() {
         <header class="conversation-header"><div><p class="panel-kicker">实时会话</p><h1>{{ hasConversation ? '当前 Voice Terminal 会话' : '准备开始真实对话' }}</h1></div><div class="session-security"><span class="lock-icon">⌁</span><span>本机处理</span></div></header>
         <div ref="conversationScrollElement" class="conversation-stream" :class="{ empty: !hasConversation }" @scroll="captureConversationScrollPosition">
           <div v-if="!hasConversation" class="empty-conversation"><span class="empty-mark">✦</span><strong>{{ runtimeState === 'error' ? '语音服务需要检查' : runtimeState === 'offline' ? '后端离线，页面仍可重试' : '等待真实语音输入' }}</strong><p>{{ runtimeState === 'offline' ? (lastError || '确认 Voice Server 已启动后点击重试。') : '语音、转写、助手回复和 TTS 进度会从真实运行时进入这里。' }}</p><button v-if="runtimeState === 'offline'" class="outline-button" type="button" @click="retry">重试连接</button></div>
-          <div v-else class="conversation-stack">
-            <template v-for="record in orderedConversation" :key="record.turn_id">
-              <article class="message user-message"><div class="message-meta"><span class="avatar user-avatar">你</span><span>你</span><time>{{ formatTime(record.completed_at) }}</time></div><p>{{ record.transcript || '（没有可显示的转写）' }}</p><span class="message-status">{{ record.status || record.delivery?.status || '已记录' }}</span></article>
-              <template v-if="hasSpeechTrackForTurn(record.turn_id)">
-                <article v-for="output in speechOutputsForTurn(record.turn_id)" :key="`speech-${output.conversation_id}-${output.speech_id}`" class="message assistant-message speech-history" :class="[{ speaking: speechOutputIsPlaying(output) }, `speech-${speechOutputStatusKey(output)}`]">
-                  <div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ formatTime(record.completed_at) }}</time></div>
-                  <p>{{ output.text }}</p>
-                  <div class="speech-queue"><span class="queue-dot" :class="{ playing: speechOutputIsPlaying(output) }"></span>{{ speechOutputStatusLabel(output) }}<span v-if="output.delivery?.status"> · {{ deliveryStatusLabel(output.delivery) }}</span></div>
-                </article>
-                <article v-for="item in playbackItemsForTurn(record.turn_id)" :key="`pending-speech-${item.conversation_id}-${item.speech_id}`" class="message assistant-message speech-history speech-pending" :class="{ speaking: item.state === 'playing' }">
-                  <div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ playbackItemStatusLabel(item) }}</time></div>
-                  <p>{{ item.text }}</p>
-                  <div class="speech-queue"><span class="queue-dot" :class="{ playing: item.state === 'playing' }"></span>{{ playbackItemStatusLabel(item) }}</div>
-                </article>
-              </template>
-              <article v-else-if="record.response" class="message assistant-message"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ formatTime(record.completed_at) }}</time></div><p>{{ record.response }}</p><div class="speech-queue"><span class="queue-dot"></span>已完成本轮播报结算</div></article>
+          <div v-else class="conversation-stack" :class="{ 'is-tail-anchored': !conversationOverflow }">
+            <template v-for="entry in conversationEntries" :key="entry.key">
+              <article v-if="entry.role === 'user'" class="message user-message">
+                <div class="message-meta"><span class="avatar user-avatar">你</span><span>你</span><time>{{ formatTime(entry.at) }}</time></div>
+                <p>{{ entry.text || '（没有可显示的转写）' }}</p>
+                <span class="message-status">{{ turnStatusLabel(entry) }}</span>
+              </article>
+              <article v-else class="message assistant-message speech-history" :class="[{ speaking: entry.speaking }, `speech-${speechStatusKey(entry)}`]">
+                <div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ entry.kind === 'system_speech' ? '系统播报' : formatTime(entry.at) }}</time></div>
+                <p v-if="entry.text">{{ entry.text }}</p>
+                <div class="speech-queue"><span class="queue-dot" :class="{ playing: entry.speaking }"></span>{{ speechStatusLabel(entry) }}<span v-if="entry.delivery?.status"> · {{ deliveryStatusLabel(entry.delivery) }}</span></div>
+              </article>
             </template>
-            <article v-for="output in standaloneSpeechOutputs" :key="`standalone-speech-${output.conversation_id}-${output.speech_id}`" class="message assistant-message speech-history" :class="[{ speaking: speechOutputIsPlaying(output) }, `speech-${speechOutputStatusKey(output)}`]">
-              <div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>已结算</time></div>
-              <p>{{ output.text }}</p>
-              <div class="speech-queue"><span class="queue-dot" :class="{ playing: speechOutputIsPlaying(output) }"></span>{{ speechOutputStatusLabel(output) }}<span v-if="output.delivery?.status"> · {{ deliveryStatusLabel(output.delivery) }}</span></div>
+            <article v-for="entry in liveSpeechEntries" :key="entry.key" class="message assistant-message speech-history speech-pending" :class="{ speaking: entry.speaking }">
+              <div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ pendingSpeechStatusLabel(entry) }}</time></div>
+              <p>{{ entry.text }}</p>
+              <div class="speech-queue"><span class="queue-dot" :class="{ playing: entry.speaking }"></span>{{ pendingSpeechStatusLabel(entry) }}</div>
             </article>
-            <article v-for="item in standalonePlaybackItems" :key="`standalone-pending-speech-${item.conversation_id}-${item.speech_id}`" class="message assistant-message speech-history speech-pending" :class="{ speaking: item.state === 'playing' }">
-              <div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ playbackItemStatusLabel(item) }}</time></div>
-              <p>{{ item.text }}</p>
-              <div class="speech-queue"><span class="queue-dot" :class="{ playing: item.state === 'playing' }"></span>{{ playbackItemStatusLabel(item) }}</div>
-            </article>
-            <article v-if="current.final_text && !conversation.some(item => item.transcript === current.final_text)" class="message user-message live-final"><div class="message-meta"><span class="avatar user-avatar">你</span><span>你</span><time>本轮</time></div><p>{{ current.final_text }}</p><span class="message-status">已完成识别 · 等待回复</span></article>
+            <article v-if="liveUserText" class="message user-message live-final"><div class="message-meta"><span class="avatar user-avatar">你</span><span>你</span><time>本轮</time></div><p>{{ liveUserText }}</p><span class="message-status">已完成识别 · 等待回复</span></article>
             <div v-if="current.partial_text" class="live-asr"><span class="live-dot"></span><span>实时识别</span><p>{{ current.partial_text }}</p><span class="typing-bars"><i></i><i></i><i></i></span></div>
             <div v-if="runtimeState === 'thinking' && !current.assistant_text" class="assistant-pending"><span><i></i><i></i><i></i></span>正在准备回复</div>
-            <article v-if="current.assistant_text && !conversation.some(item => item.response === current.assistant_text) && !currentTurnHasSpeechTrack" class="message assistant-message" :class="{ speaking: runtimeState === 'speaking' }"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ runtimeState === 'speaking' ? '正在播报' : '本轮' }}</time></div><p>{{ current.assistant_text }}</p><div class="speech-queue"><span class="queue-dot" :class="{ playing: runtimeState === 'speaking' }"></span>{{ runtimeState === 'speaking' ? '正在播放真实 TTS · 随时可以打断' : current.tts_status || '等待播报结算' }}</div></article>
+            <article v-if="liveAssistantText" class="message assistant-message" :class="{ speaking: runtimeState === 'speaking' }"><div class="message-meta"><span class="avatar assistant-avatar"><i></i><i></i><i></i></span><span>Voice Terminal</span><time>{{ runtimeState === 'speaking' ? '正在播报' : '本轮' }}</time></div><p>{{ liveAssistantText }}</p><div class="speech-queue"><span class="queue-dot" :class="{ playing: runtimeState === 'speaking' }"></span>{{ runtimeState === 'speaking' ? '正在播放真实 TTS · 随时可以打断' : current.tts_status || '等待播报结算' }}</div></article>
           </div>
         </div>
         <footer class="panel-resource-footer conversation-footer"><div><span class="footer-mic"><i></i>{{ waitingForWake ? 'KWS 正在监听唤醒词' : listening ? '正在聆听你的声音' : connected ? '语音由本机服务处理' : '等待本机 Voice Server' }}</span><span>无输入框 · 通过语音继续 · {{ pageLabel() }}</span></div><section class="resource-metrics conversation-resource-metrics" aria-label="模型资源概览"><div class="resource-meter context-meter" tabindex="0" role="img" :aria-label="conversationContextTooltip" :data-tooltip="conversationContextTooltip"><span>上下文占用</span><strong>{{ formatTokens(conversationContext?.usedTokens) }}<small v-if="conversationContext?.limitTokens != null"> / {{ formatTokens(conversationContext.limitTokens) }}</small></strong><i :class="{ 'meter-empty': conversationContext?.usagePercent == null }"><b :style="{ width: `${contextPercent(conversationContext?.usagePercent)}%` }"></b></i><em>{{ conversationContext?.usagePercent ?? '—' }}<span v-if="conversationContext?.usagePercent != null">%</span></em></div><div class="resource-meter cache-rate-number" tabindex="0" role="img" :aria-label="conversationCacheHitRatio === null ? '缓存命中率暂无数据' : `缓存命中率 ${Math.round(conversationCacheHitRatio * 100)}%`" :data-tooltip="conversationCacheHitRatio === null ? '缓存命中率 · 暂无数据' : `缓存命中率 · ${Math.round(conversationCacheHitRatio * 100)}%`"><strong>{{ conversationCacheHitRatio === null ? '—' : `${Math.round(conversationCacheHitRatio * 100)}%` }}</strong></div></section></footer>

@@ -154,7 +154,8 @@ revision、时间、run ID、nonce 不进入固定前缀。相邻请求依靠完
 ## 生命周期
 
 - `session.start`：启动语音 episode，并消费 stop 期间缓存的 Shadow 重要事件；
-- `session.stop`：只停止语音输入，保留 Agent/LLM/TTS 输出队列继续结算，Shadow 继续运行；
+- `session.stop`：只停止语音输入（关闭输入作用域），保留已经派发的 LLM 请求与 Agent/LLM/TTS 输出队列继续结算，
+  释放被挂起的播放 hold，且不再为已关闭的输入作用域派发新轮次；Shadow 继续运行；
 - barge-in：只影响语音输出；
 - `session.reset`：终止 Shadow runner/Observer/门禁/压缩，清空临时 reasoning、trace/status，轮换 ledger epoch 与
   OpenCode session header；

@@ -74,6 +74,10 @@ class SessionRuntime:
         self.state = RuntimeState()
         self.bus = EventBus()
         self.history = SessionLedger(limit=10)
+        self._conversation_tasks: set[asyncio.Task] = set()
+        # The conversation log is written from synchronous commit paths, so the
+        # runtime owns the publication that follows every append.
+        self.history.conversation.set_sink(self._publish_conversation_entry)
         self.startup_errors: list[str] = []
         self.capture: AudioCapture | None = None
         self.kws: KwsWorker | None = None
@@ -661,9 +665,44 @@ class SessionRuntime:
                 # existing cached RuntimeState snapshot.
                 logger.exception("runtime.live_episode_snapshot_failed")
         value.payload["recent_inputs"] = [record.to_payload() for record in self.history.records]
+        # One authoritative, server-ordered conversation: the product rail
+        # renders this instead of merging recent_inputs with the episode output
+        # projections, and a reload restores the same view.
+        conversation_snapshot = getattr(getattr(self.history, "conversation", None), "snapshot", None)
+        if callable(conversation_snapshot):
+            # Additive projection: fixtures that construct this runtime without
+            # a real ledger keep the legacy snapshot shape.
+            value.payload["conversation"] = conversation_snapshot()
         value.payload["reasoning_mode"] = self.reasoning_mode
         value.payload["shadow"] = self._shadow_product_snapshot()
         return value
+
+    def _publish_conversation_entry(self, entry: dict[str, Any]) -> None:
+        """Publish one conversation line from a synchronous commit path."""
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - sync setup/tests have no loop
+            return
+        payload = dict(entry)
+        turn_id = str(payload.pop("turn_id", "") or "") or None
+        task = loop.create_task(
+            self.bus.publish(event("conversation.append", turn_id, **payload)),
+            name=f"conversation-append-{entry.get('seq')}",
+        )
+        self._conversation_tasks.add(task)
+        task.add_done_callback(self._conversation_tasks.discard)
+
+    async def publish_conversation_snapshot(self) -> None:
+        """Re-state the whole ordered conversation (session reset, reinitialize)."""
+
+        conversation = getattr(self.history, "conversation", None)
+        bus = getattr(self, "bus", None)
+        if conversation is None or bus is None:
+            # Fixtures that construct this runtime without __init__ keep the
+            # legacy reset behaviour.
+            return
+        await bus.publish(event("conversation.snapshot", None, **conversation.snapshot()))
 
     def _shadow_product_snapshot(self) -> dict[str, Any]:
         projection = getattr(self, "shadow_product", None)
@@ -1061,6 +1100,9 @@ class SessionRuntime:
             if pending_buffer is not None:
                 pending_buffer.drain()
             self.history.reset()
+            # The ordered conversation starts over with the session; clients
+            # adopt this snapshot instead of merging across the boundary.
+            await self.publish_conversation_snapshot()
             ambient_store = getattr(self, "ambient_store", None)
             if ambient_store is not None:
                 ambient_store.clear()
