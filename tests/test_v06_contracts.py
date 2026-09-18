@@ -427,44 +427,72 @@ def test_input_stop_keeps_the_active_request_until_a_lifecycle_boundary():
     asyncio.run(scenario())
 
 
+class RailWorkspace(SimpleNamespace):
+    """Capture workspace fields the rail commit/settle paths read."""
+
+    def __init__(self, turn_id, text, *, episode_id="conversation_a", raw_partial=""):
+        super().__init__(
+            turn_id=turn_id, final_text=text, raw_partial=raw_partial, episode_id=episode_id,
+            segments=[], audio_cues=[], analysis={}, refined_text="", refinement_available=False,
+            speaker_decision={}, transcript_updates=[], paraformer_final="", timings={},
+        )
+
+
+def rail_controller(*, current_turn_id=None):
+    """A controller double wired to a real ledger for rail-ordering tests."""
+
+    published = []
+
+    async def publish(value):
+        published.append(value)
+
+    async def state_event(*_args, **_kwargs):
+        return None
+
+    async def cancel_prewarm(*_args, **_kwargs):
+        return None
+
+    async def episode_log(*_args, **_kwargs):
+        return None
+
+    async def detail(*_args, **_kwargs):
+        return None
+
+    ledger = SessionLedger()
+    controller = object.__new__(EpisodeController)
+    controller.history = ledger
+    controller._input_history_committed = set()
+    controller._settled_turns = set()
+    controller._committed_workspaces = {}
+    controller.episode_history = {}
+    controller._publish = publish
+    controller._state_event = state_event
+    controller._cancel_tts_prewarm = cancel_prewarm
+    controller._detail = detail
+    controller.conversation = SimpleNamespace(current_turn_id=current_turn_id)
+    controller.workspace = None
+    controller.output = SimpleNamespace(active=False)
+    controller.state = SimpleNamespace(listening=False)
+    controller.episode = SimpleNamespace(last_turn_id=None, log=episode_log)
+    # Capture-scope bookkeeping ``_cancel_turn`` touches after recording the
+    # line; the rail tests never own real ASR subscriptions.
+    controller.turns = SimpleNamespace(invalidate=lambda: None)
+    controller._stop_generation = lambda: None
+    controller._sub_parts = set()
+    controller._sub_finals = set()
+    controller._active_input = False
+    controller._vad_generation = 0
+    return controller, ledger, published
+
+
 def test_controller_records_turns_and_speech_in_one_ordered_log():
     """The rail's order comes from the server, once, in commit order."""
 
     async def scenario():
-        published = []
-
-        async def publish(value):
-            published.append(value)
-
-        async def state_event(*_args, **_kwargs):
-            return None
-
-        async def cancel_prewarm(*_args, **_kwargs):
-            return None
-
-        async def episode_log(*_args, **_kwargs):
-            return None
-
-        ledger = SessionLedger()
-        controller = object.__new__(EpisodeController)
-        controller.history = ledger
-        controller._settled_turns = set()
-        controller._committed_workspaces = {}
-        controller._publish = publish
-        controller._state_event = state_event
-        controller._cancel_tts_prewarm = cancel_prewarm
-        controller.conversation = SimpleNamespace(current_turn_id=None)
-        controller.workspace = None
-        controller.output = SimpleNamespace(active=False)
-        controller.state = SimpleNamespace(listening=False)
-        controller.episode = SimpleNamespace(last_turn_id=None, log=episode_log)
-
-        controller._committed_workspaces["input_1"] = SimpleNamespace(
-            turn_id="input_1", final_text="灵月是什么游戏？",
-            episode_id="conversation_a", timings={},
-        )
-        # The real commit path persists the transcript for model context first.
-        ledger.commit_input("input_1", "灵月是什么游戏？")
+        controller, ledger, _published = rail_controller()
+        # The real commit path persists the transcript for model context first
+        # and gives the user's turn its line before any reply can exist.
+        await controller._commit_input_workspace(RailWorkspace("input_1", "灵月是什么游戏？"))
         await controller._settle_committed_turn("input_1", outcome="completed", latency={})
         # The wake acknowledgement of the next turn settles while turn 1 is the
         # newest turn on screen; it must keep that place in the order.
@@ -487,6 +515,61 @@ def test_controller_records_turns_and_speech_in_one_ordered_log():
         # The ordered log is a projection beside the model context, not a
         # replacement: the durable conversation is unchanged.
         assert [entry.kind for entry in ledger.entries] == ["input", "speech", "speech"]
+
+    asyncio.run(scenario())
+
+
+def test_a_reply_can_never_be_ordered_above_the_utterance_it_answers():
+    """Regression: the rail filed every assistant reply above its question.
+
+    A turn settles only after its reply has been spoken and settled, and the
+    ``speech.completed`` handler appends the speech line before it settles the
+    turn.  While the user's line was created by that settlement it therefore got
+    a higher ``seq`` than its own reply, so the rail rendered the answer one
+    line early — above the utterance it belonged to.
+    """
+
+    async def scenario():
+        controller, ledger, _published = rail_controller()
+        await controller._commit_input_workspace(RailWorkspace("input_1", "对呀躺着多舒服啊"))
+        # Measured wall-clock order of the real runtime: the reply is appended
+        # first, and the turn it answers is settled (and refreshed) second.
+        await controller._agent_event("speech.completed", {
+            "speech_id": "speech_1", "conversation_id": "conversation_a", "turn_id": "input_1",
+            "text": "对，躺着最舒服。歇着吧老大，有事喊我。", "status": "completed",
+            "delivery": {"status": "full", "termination": "completed"},
+            "latency": {},
+        })
+
+        assert [(entry["kind"], entry["text"], entry["seq"]) for entry in ledger.conversation.entries] == [
+            (USER_TURN, "对呀躺着多舒服啊", 1),
+            (ASSISTANT_SPEECH, "对，躺着最舒服。歇着吧老大，有事喊我。", 2),
+        ]
+        # The late settlement refreshed the user's line in place instead of
+        # appending a second one behind its reply.
+        assert ledger.conversation.entries[0]["status"] == "completed"
+        assert ledger.conversation.entries[0]["delivery"]["termination"] == "completed"
+        assert ledger.conversation.latest_seq == 2
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_and_empty_turns_still_get_exactly_one_ordered_line():
+    """A turn that never committed a transcript keeps one line, at its own place."""
+
+    async def scenario():
+        controller, ledger, _published = rail_controller()
+        # An empty input is committed (nothing to say) and settled as such.
+        await controller._commit_input_workspace(RailWorkspace("input_empty", ""))
+        await controller._settle_committed_turn("input_empty", outcome="empty_input", latency={})
+        # A capture stopped before the transcript became final is cancelled.
+        controller.workspace = RailWorkspace("input_stopped", "", raw_partial="嗯退")
+        await controller._cancel_turn(reason="stopped")
+
+        assert [(entry["kind"], entry["text"], entry["status"]) for entry in ledger.conversation.entries] == [
+            (USER_TURN, "", "empty_input"),
+            (USER_TURN, "嗯退", "stopped"),
+        ]
 
     asyncio.run(scenario())
 

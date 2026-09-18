@@ -470,7 +470,35 @@ class EpisodeController(RealtimeController):
         self._committed_workspaces[ws.turn_id] = ws
         if len(self._committed_workspaces) > 64:
             self._committed_workspaces.pop(next(iter(self._committed_workspaces)), None)
+        # The user's line owns the position of the moment the user said it.  A
+        # turn only settles after its reply has been generated, spoken and
+        # settled, so creating this line at settlement filed every assistant
+        # reply above the utterance it answered.  The commit (ASR final) is the
+        # last boundary that provably precedes any reply, and settlement later
+        # refreshes this same line in place — the log keys a line by
+        # ``turn_id``, so the true outcome never moves it.
+        if ws.final_text:
+            self._record_user_turn(ws, text=ws.final_text, status="completed")
         return record
+
+    def _record_user_turn(self, ws, *, text, status, delivery=None, termination=""):
+        """Give the user's turn its one line in the ordered conversation.
+
+        Identity is ``turn_id``: the commit creates the line, and every later
+        settlement of the same turn (``turn.completed``/``turn.latency``) only
+        refreshes its text and status, so a status that arrives late can never
+        reorder the rail.
+        """
+
+        self.history.conversation.append(
+            USER_TURN,
+            conversation_id=str(ws.episode_id or ""),
+            turn_id=ws.turn_id,
+            text=text,
+            status=status,
+            delivery=dict(delivery or {"status": "pending", "termination": "pending"}),
+            termination=termination,
+        )
 
     async def _retire_committed_input(self, ws):
         """Release capture-only state after commit without cancelling output work."""
@@ -568,12 +596,12 @@ class EpisodeController(RealtimeController):
             record.delivery = {"status": outcome, "termination": outcome}
             if isinstance(latency, dict):
                 record.details["latency"] = dict(latency)
-        # The rail reads this ordered log instead of merging three unrelated
-        # projections, so a turn enters it exactly where it became final.
-        self.history.conversation.append(
-            USER_TURN,
-            conversation_id=str(ws.episode_id or ""),
-            turn_id=turn_id,
+        # Settlement never decides the position of this turn: the commit gave it
+        # one before the reply could exist, so this is an in-place refresh of
+        # that line.  A turn that never committed a transcript (an empty input)
+        # has no line yet and gets its single one here.
+        self._record_user_turn(
+            ws,
             text=ws.final_text,
             status=outcome,
             delivery={"status": outcome, "termination": outcome},
@@ -706,6 +734,10 @@ class EpisodeController(RealtimeController):
                                                              "refined_text": ws.refined_text,
                                                              "refinement_available": ws.refinement_available}})
             self._input_history_committed.add(ws.turn_id)
+            # Same rule as the commit path: the user's line enters the ordered
+            # conversation where the user said it, never where the turn settled.
+            if ws.final_text:
+                self._record_user_turn(ws, text=ws.final_text, status="completed")
         else:
             record = next((item for item in self.history.records if item.turn_id == ws.turn_id), None)
         # A turn without an output still needs a terminal timestamp.  If a
@@ -768,10 +800,10 @@ class EpisodeController(RealtimeController):
                 "conversation_id": ws.episode_id,
             })
             self._input_history_committed.add(ws.turn_id)
-            self.history.conversation.append(
-                USER_TURN,
-                conversation_id=str(ws.episode_id or ""),
-                turn_id=ws.turn_id,
+            # A turn cancelled before its transcript became final has no line
+            # yet; this is its one line, created where the capture stopped.
+            self._record_user_turn(
+                ws,
                 text=ws.final_text or ws.raw_partial,
                 status=reason,
                 delivery={"termination": reason, "status": "none"},
