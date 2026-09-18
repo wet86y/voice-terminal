@@ -172,9 +172,38 @@ export interface TurnLatencyValues extends LatencyValues {
   prewarm_used?: boolean
 }
 
+export type ConversationEntryKind = 'user_turn' | 'assistant_speech' | 'system_speech'
+
+/**
+ * One line of the server-ordered conversation log.
+ *
+ * The order is the server's ``seq``: the rail renders this projection directly
+ * instead of merging ``recent_inputs``, the episode outputs and the playback
+ * queue on the client, so a system-owned line (the KWS wake acknowledgement)
+ * keeps the place it really happened in.
+ */
+export interface ConversationEntry {
+  seq: number
+  kind: ConversationEntryKind
+  conversation_id: string
+  turn_id: string
+  speech_id: string
+  text: string
+  status: string
+  delivery: TurnDelivery
+  termination: string
+  at: string
+}
+
+export interface ConversationSnapshotPayload {
+  entries?: ConversationEntry[]
+  latest_seq?: number
+}
+
 export interface RuntimeSnapshotPayload {
   agent?: AgentEpisodeSnapshot
   recent_inputs?: InputRecord[]
+  conversation?: ConversationSnapshotPayload
   state: TerminalState
   listening: boolean
   can_start: boolean
@@ -312,6 +341,7 @@ export type ServerMessageType =
   | 'input.started' | 'input.updated' | 'input.finalized' | 'input.completed'
   | 'agent.state' | 'agent.trace' | 'agent.reasoning' | 'context.snapshot' | 'tool.state' | 'speak.preview'
   | 'speech.queued' | 'speech.started' | 'speech.delta' | 'speech.progress' | 'speech.completed'
+  | 'conversation.append' | 'conversation.snapshot'
   | 'shadow.product' | 'shadow.activity' | 'error'
 
 export type ReasoningMode = 'fast' | 'balanced' | 'deep'

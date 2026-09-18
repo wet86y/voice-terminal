@@ -912,6 +912,26 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
         )
         if key in raw_speaker
     }
+    # The bootstrap rail renders the same server-ordered conversation the live
+    # session publishes, so an offline page shows the identical history.
+    raw_conversation = value.get("conversation") if isinstance(value.get("conversation"), Mapping) else {}
+    safe_entries: list[dict[str, Any]] = []
+    for item in raw_conversation.get("entries") or []:
+        if not isinstance(item, Mapping):
+            continue
+        delivery = item.get("delivery") if isinstance(item.get("delivery"), Mapping) else {}
+        safe_entries.append({
+            "seq": item.get("seq"),
+            "kind": item.get("kind"),
+            "conversation_id": item.get("conversation_id"),
+            "turn_id": item.get("turn_id"),
+            "speech_id": item.get("speech_id"),
+            "text": _safe_display_text(item.get("text"), limit=4000),
+            "status": item.get("status"),
+            "termination": item.get("termination"),
+            "delivery": {str(key): candidate for key, candidate in delivery.items()},
+            "at": item.get("at"),
+        })
     return {
         "state": value.get("state"),
         "listening": bool(value.get("listening")),
@@ -923,6 +943,8 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
         "latency": safe_latency,
         "conversation": {
             "recent": safe_recent,
+            "entries": safe_entries,
+            "latest_seq": raw_conversation.get("latest_seq") or 0,
             "current": {
                 "partial_text": _safe_display_text(current.get("partial_text"), limit=4000),
                 "final_text": _safe_display_text(current.get("final_text"), limit=4000),

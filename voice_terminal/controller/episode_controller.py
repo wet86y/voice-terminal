@@ -10,6 +10,7 @@ from ..agent.episode import AgentEpisodeRuntime
 from ..core.events import VoiceEvent, event, utc_now_iso
 from ..core.state import TerminalState
 from ..session.contracts import DeliveryReport
+from ..session.conversation_log import USER_TURN, speech_kind
 
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,20 @@ class EpisodeController(RealtimeController):
             added = self.history.commit_delivery(
                 speech_id, str(payload.get("text") or ""), delivery,
             )
+            # Every settled transaction becomes one conversation line — also a
+            # failed or interrupted one, whose status is what the user needs to
+            # understand why they did not hear it.
+            payload_delivery = payload.get("delivery") if isinstance(payload.get("delivery"), dict) else {}
+            self.history.conversation.append(
+                speech_kind(payload.get("owner_scope")),
+                conversation_id=str(payload.get("conversation_id") or ""),
+                turn_id=str(payload.get("turn_id") or ""),
+                speech_id=speech_id,
+                text=str(payload.get("text") or ""),
+                status=str(payload.get("status") or "completed"),
+                delivery=dict(payload_delivery),
+                termination=str(payload_delivery.get("termination") or payload.get("status") or ""),
+            )
             await self.episode.log(
                 "SPEECH_HISTORY_COMMITTED",
                 identity=(payload.get("conversation_id"), payload.get("request_id")),
@@ -174,6 +189,12 @@ class EpisodeController(RealtimeController):
     async def start_listening(self):
         if self.episode.closed:
             self.episode = self._make_episode()
+        else:
+            # A previous stop closed the input scope while leaving the running
+            # request alive.  Starting the microphone again re-opens dispatch.
+            open_input_scope = getattr(self.episode, "open_input_scope", None)
+            if callable(open_input_scope):
+                open_input_scope()
         # Warm the shared DeepSeek transport on session activation.  This is
         # only a lightweight /models request (DNS/TCP/TLS/auth connection
         # reuse); it never starts model inference or consumes a scheduler
@@ -547,6 +568,17 @@ class EpisodeController(RealtimeController):
             record.delivery = {"status": outcome, "termination": outcome}
             if isinstance(latency, dict):
                 record.details["latency"] = dict(latency)
+        # The rail reads this ordered log instead of merging three unrelated
+        # projections, so a turn enters it exactly where it became final.
+        self.history.conversation.append(
+            USER_TURN,
+            conversation_id=str(ws.episode_id or ""),
+            turn_id=turn_id,
+            text=ws.final_text,
+            status=outcome,
+            delivery={"status": outcome, "termination": outcome},
+            termination=outcome,
+        )
         await self._publish(VoiceEvent("turn.completed", turn_id, {
             "turn_id": turn_id, "input_id": turn_id, "speech_id": speech_id,
             "transcript": ws.final_text, "status": outcome,
@@ -736,12 +768,26 @@ class EpisodeController(RealtimeController):
                 "conversation_id": ws.episode_id,
             })
             self._input_history_committed.add(ws.turn_id)
+            self.history.conversation.append(
+                USER_TURN,
+                conversation_id=str(ws.episode_id or ""),
+                turn_id=ws.turn_id,
+                text=ws.final_text or ws.raw_partial,
+                status=reason,
+                delivery={"termination": reason, "status": "none"},
+                termination=reason,
+            )
             await self._detail("turn.completed", **{k: v for k, v in record.to_payload().items()
                                                      if k != "turn_id"})
         self.workspace = None
         self.turns.invalidate()
         self._active_input = False
-        if reason != "completed":
+        if reason not in {"completed", "stopped"}:
+            # Dropping the active Agent request belongs to lifecycle boundaries
+            # (reset/failed/close/confirmed barge-in).  ``stopped`` is the
+            # microphone boundary: a reply that is already being generated or
+            # queued still has to be heard, so it is closed by input scope
+            # instead of being cancelled.
             self.episode.cancel_active_request(reason)
         stopped = self._stop_generation()
         if stopped:
@@ -789,6 +835,17 @@ class EpisodeController(RealtimeController):
             await self._cancel_turn(reason="stopped", record=True)
         if not self.episode.closed:
             await self.episode.speech_activity(None)
+        # No new turn may be dispatched for the closed input scope, but the
+        # request already in flight and everything in the TTS FIFO survives.
+        close_input_scope = getattr(self.episode, "close_input_scope", None)
+        if callable(close_input_scope):
+            close_input_scope()
+        # A response queued while the user was speaking waits behind the
+        # pre-playback hold.  Releasing it here is what lets the surviving
+        # output actually be heard after the microphone stopped.
+        release_held = getattr(getattr(self, "output", None), "release_held", None)
+        if callable(release_held):
+            release_held()
         await self._cancel_tts_prewarm()
         await super().stop_listening()
 

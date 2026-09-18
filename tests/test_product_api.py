@@ -11,6 +11,7 @@ from voice_terminal.config import AppConfig, PersonaConfig
 from voice_terminal.model_registry.service import ModelRegistryService
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.server.websocket import SessionRuntime, create_app
+from voice_terminal.session.conversation_log import SYSTEM_SPEECH, USER_TURN
 
 
 class FakeVault:
@@ -45,6 +46,7 @@ class ProductApiTests(unittest.TestCase):
             config=config,
         )
         runtime = SessionRuntime(config, product_settings=settings)
+        self.runtime = runtime
         registry = ModelRegistryService(
             config=config,
             registry_path=self.root / "config" / "model-registry.json",
@@ -105,7 +107,6 @@ class ProductApiTests(unittest.TestCase):
             json={"experimental_context_gate_enabled": True, "extra": False},
         ))
         self.assertEqual(invalid_shadow.status_code, 422)
-
         valid_shadow = asyncio.run(self._request(
             "PUT", "/api/v1/product/settings/shadow",
             json={"experimental_context_gate_enabled": True},
@@ -126,6 +127,28 @@ class ProductApiTests(unittest.TestCase):
         ))
         self.assertEqual(valid_persona.status_code, 200)
         self.assertEqual(valid_persona.json()["effective_from"], "next_episode")
+
+    def test_bootstrap_returns_the_server_ordered_conversation(self) -> None:
+        ledger = self.runtime.history
+        ledger.conversation.append(
+            USER_TURN, conversation_id="conversation_a", turn_id="input_1", text="灵月是什么游戏？",
+            status="completed", delivery={"status": "completed", "termination": "completed"},
+        )
+        ledger.conversation.append(
+            SYSTEM_SPEECH, conversation_id="conversation_a", turn_id="wake_1", speech_id="speech_wake",
+            text="我在，请说。", status="completed",
+            delivery={"status": "full", "termination": "completed"},
+        )
+
+        response = asyncio.run(self._request("GET", "/api/v1/product/snapshot"))
+
+        self.assertEqual(response.status_code, 200)
+        conversation = response.json()["conversation"]
+        self.assertEqual(conversation["latest_seq"], 2)
+        self.assertEqual(
+            [(entry["kind"], entry["seq"], entry["text"]) for entry in conversation["entries"]],
+            [(USER_TURN, 1, "灵月是什么游戏？"), (SYSTEM_SPEECH, 2, "我在，请说。")],
+        )
 
     def test_cors_allows_local_product_origins_but_not_wildcard(self) -> None:
         allowed = asyncio.run(self._request(

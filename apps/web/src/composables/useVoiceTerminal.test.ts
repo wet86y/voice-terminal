@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { useVoiceTerminal, type VoiceSocket } from './useVoiceTerminal'
+import { voiceShadowReplayFixture } from '../product/replay-data'
 
 class FakeSocket implements VoiceSocket {
   readyState = 0
@@ -111,6 +112,94 @@ describe('V0.6 session protocol', () => {
     expect(terminal.lastPlayback.value?.text).toBe('已授权输出')
     expect(terminal.lastPlayback.value?.result).toBe('finished')
     expect(terminal.speechOutputs.value[0].delivery?.heard_text).toBe('已授权输出')
+  })
+
+  it('keeps the server order when the wake acknowledgement precedes later turns', () => {
+    // Regression: the rail used to re-derive the order, which pushed the wake
+    // acknowledgement under every turn that arrived afterwards.
+    const { socket, terminal } = openTerminal()
+    socket.push('conversation.append', 1, {
+      seq: 1, kind: 'user_turn', conversation_id: 'conversation_a', turn_id: 'input_1', text: '灵月是什么游戏？',
+    })
+    socket.push('conversation.append', 2, {
+      seq: 2, kind: 'assistant_speech', conversation_id: 'conversation_a', turn_id: 'input_1',
+      speech_id: 'speech_1', text: '它应该是……',
+    })
+    socket.push('conversation.append', 3, {
+      seq: 3, kind: 'system_speech', conversation_id: 'conversation_a', turn_id: 'wake_1',
+      speech_id: 'speech_wake', text: '我在，请说。', status: 'completed',
+    })
+    expect(terminal.latestConversationSeq.value).toBe(3)
+    expect(terminal.conversationEntries.value.map(entry => entry.text)).toEqual([
+      '灵月是什么游戏？', '它应该是……', '我在，请说。',
+    ])
+
+    socket.push('conversation.append', 4, {
+      seq: 4, kind: 'user_turn', conversation_id: 'conversation_a', turn_id: 'input_2', text: '补充一点。',
+    })
+
+    expect(terminal.conversationEntries.value.map(entry => entry.text)).toEqual([
+      '灵月是什么游戏？', '它应该是……', '我在，请说。', '补充一点。',
+    ])
+    terminal.dispose()
+  })
+
+  it('refreshes a re-published conversation line without moving it', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('conversation.append', 1, {
+      seq: 1, kind: 'user_turn', conversation_id: 'conversation_a', turn_id: 'input_1', text: '进行中', status: 'pending',
+    })
+    socket.push('conversation.append', 2, {
+      seq: 1, kind: 'user_turn', conversation_id: 'conversation_a', turn_id: 'input_1',
+      text: '最终转写', status: 'empty_input',
+    })
+
+    expect(terminal.conversationEntries.value).toHaveLength(1)
+    expect(terminal.conversationEntries.value[0]).toMatchObject({ text: '最终转写', status: 'empty_input' })
+    terminal.dispose()
+  })
+
+  it('restores the whole rail from a subscription snapshot and replaces it on reset', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('conversation.append', 1, {
+      seq: 1, kind: 'user_turn', conversation_id: 'conversation_a', turn_id: 'input_1', text: '旧会话',
+    })
+
+    // A reload subscribes again: one authoritative snapshot restores the rail,
+    // including the assistant side that the output projections never carried.
+    socket.push('runtime.snapshot', 2, {
+      state: 'IDLE', listening: false, can_start: true,
+      services: { audio: 'READY', kws: 'DISABLED', asr: 'READY', llm: 'READY', tts: 'READY' },
+      current: {},
+      recent_inputs: [],
+      conversation: {
+        latest_seq: 3,
+        entries: [
+          { seq: 1, kind: 'user_turn', conversation_id: 'conversation_a', turn_id: 'input_1', text: '灵月是什么游戏？' },
+          { seq: 2, kind: 'system_speech', conversation_id: 'conversation_a', turn_id: 'wake_1',
+            speech_id: 'speech_wake', text: '我在，请说。' },
+          { seq: 3, kind: 'assistant_speech', conversation_id: 'conversation_a', turn_id: 'input_1',
+            speech_id: 'speech_1', text: '它应该是……' },
+        ],
+      },
+    })
+    expect(terminal.latestConversationSeq.value).toBe(3)
+    expect(terminal.conversationEntries.value.map(entry => entry.kind)).toEqual([
+      'user_turn', 'system_speech', 'assistant_speech',
+    ])
+
+    // A snapshot that only re-states the head position never clears the rail.
+    socket.push('runtime.snapshot', 3, {
+      state: 'LISTENING', listening: true, can_start: false,
+      services: { audio: 'RUNNING', kws: 'READY', asr: 'RUNNING', llm: 'READY', tts: 'READY' },
+      current: {},
+      conversation: { latest_seq: 5 },
+    })
+    expect(terminal.conversationEntries.value).toHaveLength(3)
+
+    socket.push('conversation.snapshot', 4, { entries: [], latest_seq: 0 })
+    expect(terminal.conversationEntries.value).toEqual([])
+    terminal.dispose()
   })
 
   it('projects queued text, real playback start, and playback finish without waiting for settlement', () => {
@@ -321,6 +410,31 @@ describe('V0.6 session protocol', () => {
       text: '模型内容', status: 'completed' }, { turn_id: 'input_a', speech_id: 'speech_a' })
     expect(terminal.playbackQueue.value).toHaveLength(0)
     expect(terminal.speechOutputs.value).toMatchObject([{ speech_id: 'speech_a', text: '模型内容', status: 'completed' }])
+    terminal.dispose()
+  })
+
+  it('renders a recorded fixture as the ordered conversation', () => {
+    const socket = new FakeSocket()
+    const terminal = useVoiceTerminal({ webSocketFactory: () => socket })
+    terminal.injectReplay(voiceShadowReplayFixture)
+
+    const entries = terminal.conversationEntries.value
+    const turns = voiceShadowReplayFixture.recentInputs
+    expect(entries).toHaveLength(turns.length * 2)
+    // The fixture is newest-first; the rail reads it oldest-first with each
+    // recorded reply directly after the turn it answered.
+    expect(entries[0]).toMatchObject({
+      kind: 'user_turn',
+      text: turns[turns.length - 1].transcript,
+      status: 'completed',
+    })
+    expect(entries[1]).toMatchObject({
+      kind: 'assistant_speech',
+      text: turns[turns.length - 1].response,
+      status: 'completed',
+    })
+    expect(entries.map(entry => entry.seq)).toEqual(entries.map((_entry, index) => index + 1))
+    expect(terminal.latestConversationSeq.value).toBe(entries.length)
     terminal.dispose()
   })
 

@@ -1,6 +1,6 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useVoiceTerminal } from '../composables/useVoiceTerminal'
-import type { ReasoningMode, ShadowProductSnapshot } from '../types'
+import type { ConversationEntry, ConversationEntryKind, ReasoningMode, ShadowProductSnapshot, TurnDelivery } from '../types'
 import { productApi, ProductApiError } from './api'
 import type {
   ProductAssignments,
@@ -40,6 +40,30 @@ export interface ProviderFormState {
   maxContextTokens: number
   allowedReasoning: string[]
   voiceId: string
+}
+
+/** One rendered rail line, projected from the server-ordered conversation. */
+export interface ConversationRow {
+  key: string
+  role: 'user' | 'assistant'
+  kind: ConversationEntryKind
+  text: string
+  at: string
+  status: string
+  termination: string
+  delivery: TurnDelivery
+  speaking: boolean
+}
+
+/** Speech that is queued or playing but has not settled into the log yet. */
+export interface PendingSpeechRow {
+  key: string
+  conversationId: string
+  speechId: string
+  turnId: string
+  text: string
+  state: 'waiting' | 'playing'
+  speaking: boolean
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -457,6 +481,67 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     ? voice.current
     : snapshot.value?.conversation.current || defaultCurrent())
   const conversation = computed(() => connected.value ? voice.recentTurns.value : snapshot.value?.conversation.recent || [])
+
+  // The rail renders the server-ordered conversation log directly.  Ordering is
+  // the server's ``seq``, so a system-owned line (the KWS wake acknowledgement)
+  // keeps the place it really happened in and a reload restores the same view
+  // instead of rebuilding the chronology from three unrelated projections.  The
+  // offline bootstrap exposes the same projection from the product API.
+  const railEntries = computed<ConversationEntry[]>(() => connected.value
+    ? voice.conversationEntries.value
+    : snapshot.value?.conversation.entries || [])
+
+  const conversationRows = computed<ConversationRow[]>(() => {
+    const playingKeys = new Set(voice.playbackQueue.value
+      .filter(item => item.state === 'playing')
+      .map(item => `${item.conversation_id}\u0000${item.speech_id}`))
+    return railEntries.value.map(entry => ({
+      key: `${entry.kind === 'user_turn' ? 'turn' : 'speech'}:${entry.conversation_id}:${entry.turn_id || entry.speech_id}:${entry.seq}`,
+      role: entry.kind === 'user_turn' ? 'user' as const : 'assistant' as const,
+      kind: entry.kind,
+      text: entry.text,
+      at: entry.at,
+      status: entry.status,
+      termination: entry.termination,
+      delivery: entry.delivery,
+      speaking: entry.speech_id ? playingKeys.has(`${entry.conversation_id}\u0000${entry.speech_id}`) : false,
+    }))
+  })
+
+  // Speech that is queued or playing but has not settled into the log yet.  Its
+  // identity is the same ``conversation_id + speech_id``, so a transaction moves
+  // from this tail into the ordered log exactly once.
+  const pendingSpeechRows = computed<PendingSpeechRow[]>(() => {
+    const settled = new Set(railEntries.value
+      .map(entry => `${entry.conversation_id}\u0000${entry.speech_id}`))
+    return voice.playbackQueue.value
+      .filter(item => typeof item.text === 'string' && item.text.trim().length > 0)
+      .filter(item => !settled.has(`${item.conversation_id}\u0000${item.speech_id}`))
+      .map(item => ({
+        key: `pending:${item.conversation_id}:${item.speech_id}`,
+        conversationId: item.conversation_id,
+        speechId: item.speech_id,
+        turnId: item.turn_id,
+        text: item.text,
+        state: item.state,
+        speaking: item.state === 'playing',
+      }))
+  })
+
+  const currentTurnId = computed(() => voice.currentTurnId.value)
+  const currentTurnLogged = computed(() => {
+    const turnId = currentTurnId.value
+    return Boolean(turnId) && railEntries.value.some(entry => entry.turn_id === turnId)
+  })
+  const currentTurnSpeechLogged = computed(() => {
+    const turnId = currentTurnId.value
+    return Boolean(turnId) && railEntries.value
+      .some(entry => entry.turn_id === turnId && entry.kind !== 'user_turn')
+  })
+  const currentTurnSpeechPending = computed(() => {
+    const turnId = currentTurnId.value
+    return Boolean(turnId) && pendingSpeechRows.value.some(row => row.turnId === turnId)
+  })
   const shadow = computed<ShadowProductSnapshot>(() => connected.value ? voice.shadowProduct.value : snapshot.value?.shadow || defaultShadow())
   const uiModels = computed<ProductUiModel[]>(() => {
     const providers = new Map(registry.value.providers.map(provider => [provider.id, provider]))
@@ -920,6 +1005,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     runtimeState,
     current,
     conversation,
+    conversationRows,
+    pendingSpeechRows,
+    currentTurnId,
+    currentTurnLogged,
+    currentTurnSpeechLogged,
+    currentTurnSpeechPending,
     shadow,
     latencyMs,
     latencyRunning,

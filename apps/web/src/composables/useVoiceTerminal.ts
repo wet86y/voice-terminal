@@ -2,6 +2,8 @@ import { computed, reactive, ref, shallowRef } from 'vue'
 import type {
   AgentEpisodeSnapshot,
   AgentTrace,
+  ConversationEntry,
+  ConversationSnapshotPayload,
   LastPlaybackResult,
   PlaybackQueueItem,
   PlaybackResultStatus,
@@ -29,6 +31,7 @@ import type {
   VoiceReplayFixture,
 } from '../types'
 import { TERMINAL_STATES } from '../types'
+import { ConversationLog, readConversationEntry } from '../conversation-log'
 
 const DEFAULT_WS_URL = 'ws://127.0.0.1:8765/ws'
 const OPEN_READY_STATE = 1
@@ -294,6 +297,18 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const services = reactive<ServiceStatuses>(createOfflineStatuses())
   const shadowProduct = ref<ShadowProductSnapshot>(createEmptyShadowProduct())
   const recentTurns = ref<InputRecord[]>([])
+  // Server-ordered conversation log.  The rail renders this instead of merging
+  // recent inputs with the output projections, so ordering never depends on
+  // client-side reconstruction of the chronology.
+  const conversationLog = new ConversationLog()
+  const conversationEntries = ref<ConversationEntry[]>([])
+  const latestConversationSeq = ref(0)
+
+  /** Mirror the log into reactive state after every mutation. */
+  function syncConversation() {
+    conversationEntries.value = conversationLog.entries()
+    latestConversationSeq.value = conversationLog.latestSeq()
+  }
   const agentEpisode = ref<AgentEpisodeSnapshot | null>(null)
   const agentTrace = ref<AgentTrace[]>([])
   const speechOutputs = ref<SpeechOutputRecord[]>([])
@@ -773,6 +788,56 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (fixture.playbackQueue) playbackQueue.value = fixture.playbackQueue.map(item => ({ ...item }))
     if (fixture.lastPlayback) lastPlayback.value = { ...fixture.lastPlayback }
     reasoning.value = fixture.reasoning || ''
+    // The fixture predates the server-ordered conversation, so its recorded
+    // turns are converted once, in the fixture's own order.  Nothing is
+    // ordered at render time.
+    conversationLog.applySnapshot({
+      entries: replayConversationEntries(fixture.recentInputs),
+      latest_seq: (fixture.recentInputs?.length || 0) * 2,
+    })
+    syncConversation()
+  }
+
+  /**
+   * Convert a recorded fixture into the ordered conversation shape.
+   *
+   * The fixture is a recording of the older projections (newest-first turns,
+   * each carrying its own response text), so the conversion happens once when
+   * the fixture is injected — never while rendering.
+   */
+  function replayConversationEntries(records: InputRecord[] | undefined): ConversationEntry[] {
+    const entries: ConversationEntry[] = []
+    let seq = 0
+    for (const turn of [...(records || [])].reverse()) {
+      seq += 1
+      entries.push({
+        seq,
+        kind: 'user_turn',
+        conversation_id: turn.conversation_id || 'conversation_replay',
+        turn_id: turn.turn_id,
+        speech_id: '',
+        text: turn.transcript,
+        status: turn.status || 'completed',
+        delivery: turn.delivery || {},
+        termination: turn.status || 'completed',
+        at: turn.completed_at,
+      })
+      if (!turn.response) continue
+      seq += 1
+      entries.push({
+        seq,
+        kind: 'assistant_speech',
+        conversation_id: turn.conversation_id || 'conversation_replay',
+        turn_id: turn.turn_id,
+        speech_id: `${turn.turn_id}-reply`,
+        text: turn.response,
+        status: 'completed',
+        delivery: { status: 'full', termination: 'completed' },
+        termination: 'completed',
+        at: turn.completed_at,
+      })
+    }
+    return entries
   }
 
   function adoptTurn(turnId: string | null) {
@@ -919,6 +984,12 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
           delivery: readDelivery(item.delivery),
         }))
     }
+    // A snapshot without entries only re-states the head position; the ordered
+    // conversation itself is never replaced by an unrelated state transition.
+    if (payload.conversation) {
+      conversationLog.applySnapshot(payload.conversation)
+      syncConversation()
+    }
   }
 
   function applySessionState(payload: SessionStatePayload, turnId: string | null) {
@@ -1005,6 +1076,19 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     lastSequence.value = message.seq
     lastServerTimestamp.value = message.timestamp
     const payload = isRecord(message.payload) ? message.payload : {}
+    if (message.type === 'conversation.snapshot') {
+      conversationLog.applySnapshot(payload as ConversationSnapshotPayload)
+      syncConversation()
+      return
+    }
+    if (message.type === 'conversation.append') {
+      const entry = readConversationEntry(payload, message.turn_id ?? null)
+      if (entry) {
+        conversationLog.applyEntry(entry)
+        syncConversation()
+      }
+      return
+    }
     // Agent/output generations are independent of the currently displayed input turn.
     if (message.type === 'agent.state') { applyAgent(payload); return }
     if (message.type === 'agent.trace') { applyAgentTrace(payload); return }
@@ -1273,6 +1357,10 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     terminalPlaybackKeys.clear()
     llmContext.value = []
     llmContextTurnId.value = null
+    // The server publishes the empty conversation right after a reset; clear it
+    // locally as well so the rail cannot show a superseded session meanwhile.
+    conversationLog.clear()
+    syncConversation()
     return sendCommand('session.reset')
   }
 
@@ -1310,6 +1398,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     perceptualLatencyRunning,
     services,
     recentTurns,
+    conversationEntries,
+    latestConversationSeq,
     agentEpisode,
     shadowProduct,
     agentTrace,

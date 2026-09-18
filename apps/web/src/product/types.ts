@@ -1,4 +1,5 @@
 import type {
+  ConversationEntry,
   CurrentTurnSnapshot,
   InputRecord,
   LatencyValues,
@@ -120,6 +121,9 @@ export interface ProductModelRegistry {
 
 export interface ProductConversationSnapshot {
   recent: InputRecord[]
+  /** Server-ordered conversation log; absent on older backends. */
+  entries?: ConversationEntry[]
+  latest_seq?: number
   current: Partial<CurrentTurnSnapshot>
 }
 

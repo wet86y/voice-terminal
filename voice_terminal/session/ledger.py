@@ -9,6 +9,7 @@ from typing import Any
 
 from .contracts import DeliveryReport, ToolExchange
 from .context_frames import ContextFrame, ContextLane
+from .conversation_log import ConversationLog
 from ..core.events import utc_now_iso
 from ..shadow_agent.contracts import (
     ShadowContextFrame,
@@ -52,6 +53,10 @@ class SessionLedger:
         self.limit = limit
         self.entries: list[SessionLedgerEntry] = []
         self.records: list[InputRecord] = []
+        # Client-facing, monotonically ordered view of the same conversation.
+        # It is owned here because the ledger is the durable conversation of
+        # record: the controller appends the terminal states it publishes.
+        self.conversation = ConversationLog()
         self._committed_delivery_ids: set[str] = set()
         # The relay has at-least-once delivery semantics.  Keep a bounded
         # idempotency window so a sink exception after partial acceptance
@@ -70,6 +75,7 @@ class SessionLedger:
     def reset(self) -> None:
         self.entries.clear()
         self.records.clear()
+        self.conversation.reset()
         self._committed_delivery_ids.clear()
         self._committed_shadow_event_ids.clear()
         self._committed_shadow_event_order.clear()
