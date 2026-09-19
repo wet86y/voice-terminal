@@ -284,6 +284,7 @@ wake:
 - [V0.7 发布审计](docs/v07-release-audit.md)
 - [当前已知 LLM 可靠性问题](docs/known-issues/llm-invalid-json-responses.md)
 - [KWS 常驻待机与交互隔离处置记录](docs/known-issues/kws-always-on-standby.md)
+- [KWS 唤醒“要喊好几次”根因诊断与调参上限](docs/known-issues/kws-wake-recall-diagnosis.md)
 
 ```powershell
 python -m pytest -q
