@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from typing import Any
 
 from ..asr.client import AsrWorkerClient
@@ -30,6 +31,7 @@ class InputController:
                  vad_end_silence_ms: int, max_turn_ms: int, bridge_min_chars: int,
                  bridge_max_chars: int, bridge_max_wait_ms: int, bridge_breaks: str,
                  wake_always_on: bool = False,
+                 wake_keywords: Sequence[str] | None = None,
                  audio_processor: AudioPreprocessor | None = None,
                  aec_failure_policy: str = "pause_recover",
                  barge_in_gate: BargeInGate | None = None) -> None:
@@ -40,6 +42,9 @@ class InputController:
         self.aec_failure_policy = aec_failure_policy
         self.barge_in_gate = barge_in_gate or BargeInGate(min_speech_ms=max(250, vad_min_speech_ms), enabled=True)
         self.wake_enabled, self.wake_keyword, self.wake_preroll_ms = wake_enabled, wake_keyword, wake_preroll_ms
+        # Every configured spelling is stripped from a transcript; ``wake_keyword``
+        # stays the primary phrase for older fixtures and display.
+        self.wake_keywords = tuple(wake_keywords or (wake_keyword,))
         # Product semantics are intentionally single-switch: if KWS is
         # enabled, the microphone starts in KWS standby and only transfers to
         # ASR after a wake hit.  Keep the constructor argument for old

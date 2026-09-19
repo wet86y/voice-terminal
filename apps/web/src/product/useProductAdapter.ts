@@ -70,9 +70,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
+/** One wake word, up to five accepted spellings; the server enforces the same cap. */
+export const MAX_WAKE_KEYWORDS = 5
+
 const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
   schema_version: 3,
-  wake: { enabled: false, keyword: 'hei claw', keyword_label: '', sensitivity: 75 },
+  wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
   shadow: { experimental_context_gate_enabled: false },
   speaker: { mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4 },
@@ -110,12 +113,19 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   const speaker = isRecord(value.speaker) ? value.speaker : {}
   const persona = isRecord(value.persona) ? value.persona : {}
   const text = (candidate: unknown) => typeof candidate === 'string' ? candidate : ''
+  const wakeKeywords = Array.isArray(wake.keywords)
+    ? wake.keywords.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .slice(0, MAX_WAKE_KEYWORDS)
+    : []
+  const primaryKeyword = text(wake.keyword) || DEFAULT_SETTINGS.wake.keyword
   return {
     schema_version: typeof value.schema_version === 'number' ? value.schema_version : DEFAULT_SETTINGS.schema_version,
     wake: {
       enabled: wake.enabled === true,
-      keyword: text(wake.keyword) || DEFAULT_SETTINGS.wake.keyword,
+      keyword: primaryKeyword,
       keyword_label: text(wake.keyword_label),
+      // An older backend only sends `keyword`; keep the list usable either way.
+      keywords: wakeKeywords.length ? wakeKeywords : [primaryKeyword],
       sensitivity: typeof wake.sensitivity === 'number' ? wake.sensitivity : DEFAULT_SETTINGS.wake.sensitivity,
     },
     silence: {
@@ -212,12 +222,19 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const speakerProfile = ref<Record<string, unknown>>({})
   const speakerTestResult = ref<Record<string, unknown> | null>(null)
   const ambientContext = ref<Record<string, unknown>>({ records: [] })
-  const speakerEnrollment = ref<{ id: string; segments: number[] } | null>(null)
+  const speakerEnrollment = ref<{
+    id: string
+    segments: number[]
+    /** One distinct sentence per segment, shown so the user does not repeat one line. */
+    prompts: string[]
+    required: number
+    guidance: string
+  } | null>(null)
   const discoveredModels = ref<string[]>([])
   const restartState = ref<'idle' | 'restarting' | 'complete' | 'error'>('idle')
   const applyImpact = ref<string[]>([])
 
-  const wakeForm = reactive({ enabled: false, keyword: 'hei claw', sensitivity: 75 })
+  const wakeForm = reactive({ enabled: false, keywords: ['hei claw'] as string[], sensitivity: 75 })
   const personaDocuments = reactive<Record<keyof ProductSettingsSnapshot['persona'], string>>({
     instructions: '', personality: '', user: '', shadow: '',
   })
@@ -298,7 +315,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     settings.warnings = nextSettings.warnings
     Object.assign(wakeForm, {
       enabled: nextSettings.wake.enabled,
-      keyword: nextSettings.wake.keyword,
+      keywords: [...nextSettings.wake.keywords],
       sensitivity: nextSettings.wake.sensitivity,
     })
     silenceSeconds.value = nextSettings.silence.seconds
@@ -377,8 +394,21 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       const value = await productApi.startSpeakerEnrollment()
       const id = value.enrollment_id
       if (typeof id !== 'string') throw new Error('后端未返回录音会话。')
-      speakerEnrollment.value = { id, segments: [] }
-      setNotice('录音会话已开始，请依次录制三段 5–10 秒声音。')
+      const prompts = Array.isArray(value.prompts)
+        ? (value.prompts as Array<Record<string, unknown>>)
+            .map(item => String(item?.text || '')).filter(text => text.length > 0)
+        : []
+      const required = typeof value.required_segments === 'number' && value.required_segments > 0
+        ? value.required_segments
+        : 3
+      speakerEnrollment.value = {
+        id,
+        segments: [],
+        prompts,
+        required,
+        guidance: String(value.guidance || ''),
+      }
+      setNotice(`录音会话已开始，请依次朗读 ${required} 段不同的句子（每段 5–10 秒）。`)
     } catch (error) { setError(error) }
   }
 
@@ -400,6 +430,46 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
   }
 
+  /**
+   * Record one enrollment segment on the server, from the same device and
+   * processing chain the live session uses.  Browser capture stays available
+   * as a fallback via `addSpeakerEnrollmentSegment`.
+   */
+  async function captureSpeakerEnrollmentSegment(index: number, label: string, seconds: number) {
+    const enrollment = speakerEnrollment.value
+    if (!enrollment) return false
+    try {
+      const result = await productApi.captureSpeakerEnrollmentSegment(enrollment.id, {
+        index, label, seconds,
+      })
+      if (!enrollment.segments.includes(index)) enrollment.segments.push(index)
+      const quality = isRecord(result.quality) ? result.quality : {}
+      const speech = Number(quality.speech_ms || 0) / 1000
+      setNotice(`第 ${index + 1} 段已录制：有效人声 ${speech.toFixed(1)} 秒。`)
+      return true
+    } catch (error) {
+      const detail = isRecord(error) ? error : {}
+      // No server-side capture device: let the caller fall back to browser
+      // recording rather than blocking enrollment entirely.
+      if (String(detail.code || '').includes('SPEAKER_CAPTURE_UNAVAILABLE')) return false
+      setError(error)
+      return false
+    }
+  }
+
+  async function captureSpeakerTest(seconds: number) {
+    try {
+      speakerTestResult.value = await productApi.captureSpeakerTest({ seconds })
+      setNotice('现场声纹测试已完成。')
+      return true
+    } catch (error) {
+      const detail = isRecord(error) ? error : {}
+      if (String(detail.code || '').includes('SPEAKER_CAPTURE_UNAVAILABLE')) return false
+      setError(error)
+      return false
+    }
+  }
+
   async function addSpeakerEnrollmentSegment(index: number, label: string, pcmBase64: string) {
     const enrollment = speakerEnrollment.value
     if (!enrollment) return
@@ -414,15 +484,19 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   async function commitSpeakerEnrollment() {
     const enrollment = speakerEnrollment.value
-    if (!enrollment || enrollment.segments.length !== 3) {
-      setError(new Error('请先完成三段录音。'))
+    const required = enrollment?.required && enrollment.required > 0 ? enrollment.required : 3
+    if (!enrollment || enrollment.segments.length !== required) {
+      setError(new Error(`请先完成${required}段录音。`))
       return
     }
     try {
-      await productApi.commitSpeakerEnrollment(enrollment.id)
+      const result = await productApi.commitSpeakerEnrollment(enrollment.id)
       speakerEnrollment.value = null
       await refreshSpeaker()
-      setNotice('声纹资料已更新；原始录音已删除。')
+      const detail = isRecord(result.enrollment) ? result.enrollment : {}
+      const weakest = Number(detail.min_similarity)
+      const suffix = Number.isFinite(weakest) ? `三段最低相似度 ${weakest.toFixed(2)}。` : ''
+      setNotice(`声纹资料已更新；原始录音已删除。${suffix}`)
     } catch (error) { setError(error) }
   }
 
@@ -655,13 +729,29 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     providerForm.allowedReasoning = [...current, value]
   }
 
+  function addWakeKeyword() {
+    if (wakeForm.keywords.length >= MAX_WAKE_KEYWORDS) return
+    wakeForm.keywords.push('')
+  }
+
+  function removeWakeKeyword(index: number) {
+    // One phrase is mandatory: the wake word must always exist.
+    if (wakeForm.keywords.length <= 1) return
+    wakeForm.keywords.splice(index, 1)
+  }
+
   async function saveWake() {
     await enqueue(async () => {
       saving.value = true
       try {
+        const keywords = wakeForm.keywords.map(item => item.trim()).filter(Boolean)
+        if (!keywords.length) {
+          setError('请至少填写 1 个唤醒词。')
+          return
+        }
         const result = await productApi.saveWake({
           enabled: wakeForm.enabled,
-          keyword: wakeForm.keyword,
+          keywords,
           sensitivity: wakeForm.sensitivity,
         })
         updateSettingsFromResponse(settings, result)
@@ -1015,6 +1105,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     latencyMs,
     latencyRunning,
     wakeForm,
+    maxWakeKeywords: MAX_WAKE_KEYWORDS,
+    addWakeKeyword,
+    removeWakeKeyword,
     silenceSeconds,
     personaDocument,
     personaDocuments,
@@ -1065,6 +1158,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     deleteSpeakerTemplate,
     setSpeakerTemplateCentroid,
     testSpeakerAudio,
+    captureSpeakerEnrollmentSegment,
+    captureSpeakerTest,
     refreshAmbientContext,
     clearAmbientContext,
     scanModels,

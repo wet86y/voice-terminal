@@ -5,7 +5,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
 from ..core.events import utc_now_iso
@@ -14,6 +14,36 @@ try:  # numpy is already a runtime dependency of the audio stack.
     import numpy as np  # type: ignore
 except ImportError:  # pragma: no cover - optional sidecar remains unavailable
     np = None  # type: ignore[assignment]
+
+
+#: Minimum cosine between the stored frontend probe embedding and the one
+#: produced by the running binary.  Anything below this means the features (or
+#: the model weights) changed and every stored template is in a different
+#: coordinate system.
+PROBE_MATCH_THRESHOLD = 0.9999
+
+#: Pairwise cosine below which three enrollment segments are considered to
+#: disagree about who is speaking.  Same-speaker segments recorded minutes
+#: apart through one device score well above this.
+ENROLLMENT_SELF_SIMILARITY_MIN = 0.70
+
+#: Shortest acceptable voiced speech per enrollment segment.
+ENROLLMENT_MIN_SEGMENT_SPEECH_MS = 3000
+
+#: Total voiced speech required across the whole enrollment.  Text-independent
+#: verification services commonly ask for ~20 s of audio; we accept less but
+#: not so little that the centroid is built from a couple of seconds.
+ENROLLMENT_MIN_TOTAL_SPEECH_MS = 15000
+
+#: Minimum voiced fraction of an enrollment segment when the WebRTC VAD
+#: measured it.  Speech buried in noise (or a segment that is mostly silence)
+#: produces a template dominated by the room, not the speaker.  Published
+#: vendor guidance asks for 60%+; 50% is used here so that a normal continuous
+#: reading is never rejected outright.
+ENROLLMENT_MIN_SPEECH_RATIO = 0.50
+
+#: Largest tolerated clipped-sample fraction in an enrollment segment.
+ENROLLMENT_MAX_CLIPPED_RATIO = 0.005
 
 
 @dataclass(frozen=True)
@@ -37,12 +67,13 @@ class SpeakerTemplate:
 class SpeakerProfileStore:
     """Local, atomic single-user profile store; raw enrollment audio is never saved."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, root: Path, *, model_id: str = "wespeaker-cnceleb-resnet34") -> None:
         self.root = root.resolve()
         self.path = self.root / "registry.json"
         self.templates_dir = self.root / "templates"
+        self.probe_path = self.root / "probe.npy"
         self.model_id = model_id
         self.model_version = model_id
         self.user_id = "owner"
@@ -51,7 +82,83 @@ class SpeakerProfileStore:
         self.centroid: tuple[float, ...] = ()
         self.vector_dim = 0
         self.warning: str | None = None
+        self.stale = False
+        self.stale_reason: str | None = None
+        self._stored_fingerprint: dict[str, Any] | None = None
+        self._runtime_fingerprint: dict[str, Any] | None = None
         self.load()
+
+    # ------------------------------------------------------------- fingerprint
+    def set_runtime_fingerprint(self, fingerprint: Mapping[str, Any] | None,
+                                probe: Sequence[float] | None = None) -> None:
+        """Declare which feature frontend/model the running process uses.
+
+        Called by Voice Server once the ONNX session is available.  Profiles
+        recorded by a different frontend are marked stale instead of being
+        silently compared in the wrong coordinate system: that failure mode
+        looks like "everyone is rejected" and is impossible to diagnose from
+        the scores alone.
+        """
+        if fingerprint:
+            value = {str(key): fingerprint[key] for key in sorted(fingerprint)}
+            if probe:
+                value["probe"] = [float(item) for item in probe]
+            self._runtime_fingerprint = value
+        else:
+            self._runtime_fingerprint = None
+        self._refresh_stale()
+
+    def _probe_cosine(self) -> float | None:
+        """Cosine between the stored probe and the running one, if both exist."""
+        stored = (self._stored_fingerprint or {}).get("probe")
+        current = (self._runtime_fingerprint or {}).get("probe")
+        if np is None or not stored or not current or len(stored) != len(current):
+            return None
+        a = np.asarray(stored, dtype=np.float32)
+        b = np.asarray(current, dtype=np.float32)
+        if not np.isfinite(a).all() or not np.isfinite(b).all():
+            return None
+        denominator = float(np.linalg.norm(a) * np.linalg.norm(b))
+        if denominator <= 1e-8:
+            return None
+        return float(np.dot(a, b) / denominator)
+
+    def _refresh_stale(self) -> None:
+        stored = self._stored_fingerprint
+        runtime = self._runtime_fingerprint
+        self.stale = False
+        self.stale_reason = None
+        if self.warning:
+            return
+        if self.path.is_file() and stored is None:
+            # A schema-1 profile predates fingerprinting entirely.
+            self.stale = True
+            self.stale_reason = "profile_schema_upgraded"
+            return
+        if runtime is None or stored is None:
+            # No runtime fingerprint declared (unit tests, offline tooling) or
+            # nothing enrolled yet: leave the profile usable.
+            return
+        if str(stored.get("frontend_version") or "") != str(runtime.get("frontend_version") or ""):
+            self.stale = True
+            self.stale_reason = "feature_frontend_changed"
+            return
+        if str(stored.get("model_id") or "") != str(runtime.get("model_id") or ""):
+            self.stale = True
+            self.stale_reason = "speaker_model_changed"
+            return
+        cosine = self._probe_cosine()
+        if cosine is None:
+            if runtime.get("probe") and not stored.get("probe"):
+                # The running process can prove itself numerically but the
+                # profile cannot: treat it as unverifiable rather than assume
+                # it matches.
+                self.stale = True
+                self.stale_reason = "profile_missing_probe"
+            return
+        if cosine < PROBE_MATCH_THRESHOLD:
+            self.stale = True
+            self.stale_reason = "feature_numeric_mismatch"
 
     @property
     def available(self) -> bool:
@@ -59,7 +166,7 @@ class SpeakerProfileStore:
         # vector must still be readable and compatible with the stored
         # dimension.  This also makes a partially deleted/corrupt template
         # fail open as "unregistered" instead of advertising a stale centre.
-        if not self.centroid or not self.templates:
+        if self.stale or not self.centroid or not self.templates:
             return False
         if np is not None:
             try:
@@ -70,18 +177,27 @@ class SpeakerProfileStore:
                 return False
         return bool(self.vectors(include_centroid=False))
 
+    @property
+    def centroid_template_count(self) -> int:
+        return sum(1 for item in self.templates.values() if item.include_in_centroid)
+
     def load(self) -> None:
         self.templates = {}
         self.centroid = ()
         self.vector_dim = 0
         self.warning = None
+        self._stored_fingerprint = None
         self.user_id = "owner"
         self.user_name = "主人"
         if not self.path.is_file():
+            self._refresh_stale()
             return
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(raw, Mapping) or raw.get("schema_version") != self.SCHEMA_VERSION:
+            if not isinstance(raw, Mapping):
+                raise ValueError("speaker profile schema mismatch")
+            schema = raw.get("schema_version")
+            if schema not in {1, self.SCHEMA_VERSION}:
                 raise ValueError("speaker profile schema mismatch")
             stored_model_id = str(raw.get("model_id") or self.model_id)
             if stored_model_id != self.model_id:
@@ -112,6 +228,19 @@ class SpeakerProfileStore:
             raw_dim = raw.get("vector_dim")
             if isinstance(raw_dim, int) and raw_dim > 0:
                 self.vector_dim = raw_dim
+            fingerprint = raw.get("feature_fingerprint")
+            self._stored_fingerprint = dict(fingerprint) if isinstance(fingerprint, Mapping) else None
+            if schema == 1:
+                # Preserve the vectors for inspection but never score against
+                # them: they were produced by a different feature frontend.
+                self._stored_fingerprint = None
+            elif self._stored_fingerprint is not None and self.probe_path.is_file() and np is not None:
+                try:
+                    probe = np.load(self.probe_path, allow_pickle=False).reshape(-1)
+                    if probe.size and np.isfinite(probe).all():
+                        self._stored_fingerprint["probe"] = [float(x) for x in probe]
+                except Exception:
+                    pass
             # The centre is derived from the template files every time.  A
             # crash between vector/registry replacement must never leave a
             # stale centre being used for a later identity decision.
@@ -120,6 +249,8 @@ class SpeakerProfileStore:
             self.warning = f"声纹资料无法读取，已按未注册处理：{type(exc).__name__}"
             self.templates = {}
             self.centroid = ()
+            self._stored_fingerprint = None
+        self._refresh_stale()
 
     @staticmethod
     def _valid_template_id(value: str) -> bool:
@@ -128,6 +259,10 @@ class SpeakerProfileStore:
         return len(value) == 32 and all(char in "0123456789abcdef" for char in value)
 
     def snapshot(self) -> dict[str, Any]:
+        count = self.centroid_template_count
+        warning = self.warning
+        if warning is None and self.templates and count < 2:
+            warning = "只有 1 组模板纳入主声纹中心，建议至少保留 2 组以提高稳定性。"
         return {
             "available": self.available,
             "schema_version": self.SCHEMA_VERSION,
@@ -136,8 +271,18 @@ class SpeakerProfileStore:
             "model_version": self.model_version,
             "vector_dim": self.vector_dim,
             "template_count": len(self.templates),
+            "centroid_template_count": count,
             "templates": [item.to_payload() for item in self.templates.values()],
-            "warning": self.warning,
+            "warning": warning,
+            "stale": self.stale,
+            "stale_reason": self.stale_reason,
+            "feature_fingerprint": ({
+                key: value for key, value in (self._stored_fingerprint or {}).items() if key != "probe"
+            } or None),
+            "runtime_fingerprint": ({
+                key: value for key, value in (self._runtime_fingerprint or {}).items() if key != "probe"
+            } or None),
+            "needs_reenrollment": bool(self.stale),
         }
 
     def vectors(self, *, include_centroid: bool = True) -> list[tuple[str, tuple[float, ...]]]:
@@ -199,7 +344,23 @@ class SpeakerProfileStore:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _write_probe(self, probe: Sequence[float]) -> None:
+        if np is None:
+            return
+        self.root.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".speaker-probe-", suffix=".npy", dir=str(self.root))
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            np.save(temporary, np.asarray(probe, dtype=np.float32), allow_pickle=False)
+            os.replace(temporary, self.probe_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def _payload(self) -> dict[str, Any]:
+        fingerprint = None
+        if self._stored_fingerprint:
+            fingerprint = {key: value for key, value in self._stored_fingerprint.items() if key != "probe"}
         return {
             "schema_version": self.SCHEMA_VERSION,
             "user": {"user_id": self.user_id, "display_name": self.user_name},
@@ -208,6 +369,7 @@ class SpeakerProfileStore:
             "vector_dim": self.vector_dim,
             "centroid": list(self.centroid),
             "templates": [item.to_payload() for item in self.templates.values()],
+            "feature_fingerprint": fingerprint,
         }
 
     def _write_vector(self, template_id: str, vector: Any) -> None:
@@ -264,7 +426,10 @@ class SpeakerProfileStore:
             self._write_json(self._payload())
         return self.centroid
 
-    def replace_templates(self, samples: list[tuple[str, Any, Mapping[str, Any]]], *, display_name: str = "主人") -> dict[str, Any]:
+    def replace_templates(self, samples: list[tuple[str, Any, Mapping[str, Any]]], *,
+                          display_name: str = "主人",
+                          fingerprint: Mapping[str, Any] | None = None,
+                          probe: Sequence[float] | None = None) -> dict[str, Any]:
         if not samples:
             raise ValueError("至少需要一段有效声纹样本")
         if len(samples) > 8:
@@ -274,6 +439,8 @@ class SpeakerProfileStore:
         old_centroid = self.centroid
         old_vector_dim = self.vector_dim
         old_user_name = self.user_name
+        old_fingerprint = self._stored_fingerprint
+        old_stale = (self.stale, self.stale_reason)
         next_templates: dict[str, SpeakerTemplate] = {}
         self.user_name = str(display_name or "主人")[:80]
         written: set[str] = set()
@@ -297,16 +464,27 @@ class SpeakerProfileStore:
                 )
             self.templates = next_templates
             self.vector_dim = int(new_dimension or 0)
+            if fingerprint is not None:
+                self._stored_fingerprint = {str(key): fingerprint[key] for key in sorted(fingerprint)}
+                if probe:
+                    self._write_probe(probe)
+                    # Keep the in-memory copy complete so a later
+                    # set_runtime_fingerprint() can compare numerically without
+                    # a reload.
+                    self._stored_fingerprint["probe"] = [float(x) for x in probe]
             self.rebuild_centroid(persist=False)
             if not self.centroid:
                 raise ValueError("无法从这些模板重建主声纹中心")
-            self._write_json(self._payload())
             self.warning = None
+            self._refresh_stale()
+            self._write_json(self._payload())
         except Exception:
             self.templates = old_templates
             self.centroid = old_centroid
             self.vector_dim = old_vector_dim
             self.user_name = old_user_name
+            self._stored_fingerprint = old_fingerprint
+            self.stale, self.stale_reason = old_stale
             for template_id in written:
                 (self.templates_dir / f"{template_id}.npy").unlink(missing_ok=True)
             raise

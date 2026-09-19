@@ -801,3 +801,21 @@ body:has(.product-shell) { overflow: hidden; }
   .product-shell .workbench-reordered .shadow-column { display: flex; grid-column: auto; }
   .product-shell .shadow-summary-heading h3 { font-size: 13px; }
 }
+
+/* Multiple wake-phrase rows.  Reuses the settings-panel form vocabulary so the
+   added rows read as the same control, not a new widget. */
+.wake-keyword-row { display: flex; align-items: center; gap: 7px; margin-top: 8px; }
+.wake-keyword-row input { flex: 1; min-width: 0; }
+.wake-keyword-remove {
+  flex: 0 0 auto; width: 30px; height: 30px; display: grid; place-items: center;
+  border: 1px solid #ffffff1f; border-radius: 7px; color: #b9c6e4;
+  background: #ffffff08; font-size: 15px; line-height: 1;
+}
+.wake-keyword-remove:hover:not(:disabled) { border-color: #f0808f66; color: #ffc4bb; background: #f0808f14; }
+.wake-keyword-remove:disabled { opacity: .35; cursor: not-allowed; }
+.wake-keyword-add {
+  margin-top: 8px; padding: 7px 11px; border: 1px dashed #ffffff2b; border-radius: 7px;
+  color: #b8c6ee; background: #ffffff05; font-size: 11px; font-weight: 600;
+}
+.wake-keyword-add:hover:not(:disabled) { border-color: #a8bbf077; background: #7899f11c; }
+.wake-keyword-add:disabled { opacity: .4; cursor: not-allowed; }

@@ -909,6 +909,10 @@ class RealtimeController(SpeechPipeline, InputController):
                 pcm=frame.pcm,
                 start_sample=frame.start_sample,
                 end_sample=frame.end_sample,
+                # Hand the VAD verdict to the sidecar so its windows are gated
+                # on real speech rather than a fixed amplitude threshold that
+                # drifts with microphone gain.
+                speech=bool(activity.is_speech),
             )
             if not submitted and speaker_client.degraded:
                 # Queue overflow never backpressures this audio callback; it
@@ -1176,7 +1180,7 @@ class RealtimeController(SpeechPipeline, InputController):
                 raise ValueError("incomplete refinement")
             refined_text = result["text"].strip()
             if self.wake_enabled:
-                refined_text = strip_wake_prefix(refined_text, self.wake_keyword)
+                refined_text = strip_wake_prefix(refined_text, self.wake_keywords)
             result["text"] = refined_text
             # SenseVoice is a supplemental result.  Keep it attached to the
             # same workspace even after the fast Paraformer commit has
@@ -1214,7 +1218,7 @@ class RealtimeController(SpeechPipeline, InputController):
             # still be running and must not delay the Agent decision.
             ws.final_text = ws.paraformer_final
             if self.wake_enabled:
-                ws.final_text = strip_wake_prefix(ws.final_text, self.wake_keyword)
+                ws.final_text = strip_wake_prefix(ws.final_text, self.wake_keywords)
             # If SenseVoice happened to finish first, retain its supplemental
             # fields; otherwise these remain the empty defaults until the
             # background refinement task completes.

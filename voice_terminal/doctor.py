@@ -109,14 +109,15 @@ def run_checks(config_path: Path, *, online: bool = False, model_dir: Path | Non
                 checks.append(_check(f"python:{module}", True, "installed"))
             except ImportError:
                 checks.append(_check(f"python:{module}", False, "missing; analysis will degrade", warning=True))
+    wake_name = "/".join(config.wake.keywords) or config.wake.keyword
     if config.wake.enabled:
         try:
-            validate_keywords_file(config.kws_keywords_file, config.wake.keyword_label)
-            checks.append(_check(f"kws:{config.wake.keyword}", True, str(config.kws_keywords_file)))
+            validate_keywords_file(config.kws_keywords_file, config.wake.keyword_labels)
+            checks.append(_check(f"kws:{wake_name}", True, str(config.kws_keywords_file)))
         except Exception as exc:
-            checks.append(_check(f"kws:{config.wake.keyword}", False, str(exc)))
+            checks.append(_check(f"kws:{wake_name}", False, str(exc)))
     else:
-        checks.append(_check(f"kws:{config.wake.keyword}", True, "disabled by wake.enabled=false"))
+        checks.append(_check(f"kws:{wake_name}", True, "disabled by wake.enabled=false"))
 
     voice_port_busy = _port_in_use(config.server.host, config.server.port)
     checks.append(

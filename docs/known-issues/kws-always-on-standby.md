@@ -48,21 +48,23 @@ KWS 接到现有帧链，KWS、VAD 和 ASR 会同时消费 PCM，唤醒词也可
 这类现象要区分“关闭 KWS 后可以启动”和“启用 KWS 后初始化失败”。关闭 KWS 只能绕过
 KWS 初始化路径，不能证明 KWS 不是故障来源。
 
-启用 KWS 时，Voice Server 会在 `session.start` 之前校验受管关键词文件。产品设置中的
-`wake.keyword_label` 必须与 `keywords.txt` 最后一列的 `@LABEL` 完全一致。例如唤醒词为
-“执事”时，两个文件都必须由当前设置生成，并包含 `@执事`；如果设置已经改成“执事”但文件仍
-保留旧的 `@HEI_CLAW`，KWS Worker 会在启动阶段失败，`session.start` 不会进入监听状态。
+启用 KWS 时，Voice Server 会在 `session.start` 之前校验受管关键词文件。产品设置中的 `wake.keywords`
+（最多 5 个说法，旧的单个 `wake.keyword` 仍兼容）里的**每一个**说法，都必须在 `keywords.txt`
+最后一列找到对应的 `@LABEL`。例如配置了“七三 / 你好七三 / 七三同学”时，文件必须有三行三个标签；
+只要缺任意一个，KWS Worker 就会在启动阶段失败，错误信息会点名缺失的标签，`session.start` 不会
+进入监听状态。
 
 排查顺序：
 
 1. 查询 `GET http://127.0.0.1:8765/health`，检查 `services.kws`、`kws.error` 和
    `startup_errors`；启动成功后应看到 `services.kws=READY` 且 `startup_errors=[]`。
-2. 检查 `wake_enabled`、`wake_keyword` 与受管 `keywords.txt` 中的标签是否一致。不要只看
-   前端下拉框，因为产品设置和模型资源可能处在不同版本。
-3. 在“设置 → KWS 唤醒词”重新保存当前唤醒词，让系统重新生成并原子替换
+2. 检查 `wake_enabled`、`wake_keywords`（旧字段 `wake_keyword` 只显示第一个）与受管
+   `keywords.txt` 中的标签是否一一对应。不要只看前端下拉框，因为产品设置和模型资源可能处在
+   不同版本。
+3. 在“设置 → KWS 唤醒词”重新保存唤醒词列表，让系统一次性重新生成并原子替换
    `keywords_raw.txt` 与 `keywords.txt`，再重新启动会话。
 4. 启用 KWS 后，按钮成功启动的表现是进入 `listening=true`、`input_owner=kws` 的唤醒待机，
-   而不是立即显示 ASR 文字；必须先说出配置的唤醒词，才会切换到 ASR。
+   而不是立即显示 ASR 文字；必须先说出任意一个已配置的说法，才会切换到 ASR。
 
 本次“执事”故障已按上述流程重新生成关键词文件，并完成冷启动与 WebSocket
 `session.start` 验证。关闭 KWS 的直通模式和启用 KWS 的唤醒待机模式均保持可用。

@@ -21,10 +21,11 @@ def build_detector(config) -> KwsDetector:
     return KwsDetector(
         model_dir=config.kws_dir,
         keywords_file=config.kws_keywords_file,
-        keyword_label=config.wake.keyword_label,
+        keyword_label=config.wake.keyword_labels,
         threshold=config.wake.threshold,
         keywords_score=config.wake.keywords_score,
         num_trailing_blanks=config.wake.num_trailing_blanks,
+        max_active_paths=config.wake.max_active_paths,
         provider=config.wake.device,
         sample_rate=config.audio.sample_rate,
     )
@@ -43,7 +44,8 @@ def run_microphone(detector: KwsDetector, config, *, duration: float | None) -> 
     device = resolve_device(config.audio.input_device, input_device=True)
     deadline = time.monotonic() + duration if duration is not None else None
     print(
-        f"KWS ready: keyword={config.wake.keyword!r} label=@{config.wake.keyword_label} "
+        f"KWS ready: keywords={list(config.wake.keywords)!r} "
+        f"labels={['@' + item for item in config.wake.keyword_labels]!r} "
         f"device={device if device is not None else 'system default'}; press Ctrl+C to stop.",
         flush=True,
     )

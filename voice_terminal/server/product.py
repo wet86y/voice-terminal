@@ -14,6 +14,7 @@ import json
 import os
 import tempfile
 from collections import deque
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -21,10 +22,11 @@ from typing import Any, Mapping
 
 from ..config import AppConfig
 from ..core.events import utc_now_iso
+from ..kws.keywords import MAX_WAKE_KEYWORDS
 from ..shadow_agent import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 3
+PRODUCT_SETTINGS_SCHEMA_VERSION = 4
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 90
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -83,6 +85,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
             "enabled": bool(config.wake.enabled),
             "keyword": str(config.wake.keyword),
             "keyword_label": str(config.wake.keyword_label),
+            "keywords": list(config.wake.keywords or (config.wake.keyword,)),
             "sensitivity": _threshold_to_sensitivity(config.wake.threshold),
         },
         "silence": {
@@ -102,7 +105,34 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
     }
 
 
-def _merge_settings(defaults: dict[str, Any], value: Any) -> dict[str, Any]:
+def _legacy_speaker_scale(value: Mapping[str, Any]) -> bool:
+    """True when the stored file carries speaker thresholds from the old scale.
+
+    The speaker frontend was replaced, which moved the raw-cosine operating
+    point (genuine ~0.86, impostor ~0.02 instead of everything landing between
+    0.4 and 0.65).  Thresholds saved against the old scale — including ones a
+    user raised by hand to fight false accepts — cannot be carried over.  A file
+    with no speaker section has nothing to migrate and stays warning-free.
+    """
+    marker = value.get("schema_version")
+    if not isinstance(marker, int) or isinstance(marker, bool):
+        return False
+    if marker >= PRODUCT_SETTINGS_SCHEMA_VERSION:
+        return False
+    speaker = value.get("speaker")
+    if not isinstance(speaker, Mapping):
+        return False
+    return "confirm_threshold" in speaker or "continuity_threshold" in speaker
+
+
+def _merge_settings(defaults: dict[str, Any], value: Any, *,
+                    legacy_speaker_scale: bool = False) -> dict[str, Any]:
+    from ..kws.keywords import (
+        DEFAULT_WAKE_KEYWORD,
+        canonical_labels,
+        normalize_keyword_list,
+    )
+
     result = deepcopy(defaults)
     if not isinstance(value, Mapping):
         return result
@@ -118,6 +148,29 @@ def _merge_settings(defaults: dict[str, Any], value: Any) -> dict[str, Any]:
     wake["enabled"] = wake["enabled"] if type(wake.get("enabled")) is bool else defaults["wake"]["enabled"]
     wake["keyword"] = wake["keyword"] if isinstance(wake.get("keyword"), str) and wake["keyword"].strip() else defaults["wake"]["keyword"]
     wake["keyword_label"] = wake["keyword_label"] if isinstance(wake.get("keyword_label"), str) else defaults["wake"]["keyword_label"]
+    # ``keywords`` is additive: a legacy file that only has ``keyword`` yields a
+    # one-item list, and whatever survives is mirrored back into
+    # ``keyword``/``keyword_label`` so both shapes always agree.
+    raw_keywords = wake.get("keywords")
+    if isinstance(raw_keywords, (list, tuple)) and raw_keywords:
+        candidates = [item for item in raw_keywords if isinstance(item, str)]
+    else:
+        candidates = [wake["keyword"]]
+    try:
+        keywords = normalize_keyword_list(candidates or [wake["keyword"]])
+    except ValueError:
+        # The stored list is unusable; the default phrase is validated at import
+        # time, so this fallback cannot fail in practice.
+        try:
+            keywords = normalize_keyword_list(defaults["wake"]["keywords"])
+        except ValueError:
+            keywords = normalize_keyword_list([DEFAULT_WAKE_KEYWORD])
+    wake["keywords"] = list(keywords)
+    wake["keyword"] = keywords[0]
+    try:
+        wake["keyword_label"] = canonical_labels(keywords)[0]
+    except ValueError:
+        wake["keyword_label"] = defaults["wake"]["keyword_label"]
     try:
         sensitivity = int(wake.get("sensitivity"))
     except (TypeError, ValueError):
@@ -136,6 +189,14 @@ def _merge_settings(defaults: dict[str, Any], value: Any) -> dict[str, Any]:
     speaker = result["speaker"]
     if speaker.get("mode") not in {"off", "observe", "filter"}:
         speaker["mode"] = defaults["speaker"]["mode"]
+    if legacy_speaker_scale:
+        speaker["confirm_threshold"] = defaults["speaker"]["confirm_threshold"]
+        speaker["continuity_threshold"] = defaults["speaker"]["continuity_threshold"]
+        if speaker["mode"] == "filter":
+            # Never resume strict filtering against templates and thresholds
+            # that belong to the previous frontend.
+            speaker["mode"] = "observe"
+        return result
     try:
         confirm = float(speaker.get("confirm_threshold"))
         continuity = float(speaker.get("continuity_threshold"))
@@ -157,11 +218,11 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     schema_version = value.get("schema_version")
     if schema_version is not None and (
         type(schema_version) is not int
-        or schema_version not in {1, 2, PRODUCT_SETTINGS_SCHEMA_VERSION}
+        or schema_version not in {1, 2, 3, PRODUCT_SETTINGS_SCHEMA_VERSION}
     ):
         invalid = True
     for section_name, fields in (
-        ("wake", ("enabled", "keyword", "keyword_label", "sensitivity")),
+        ("wake", ("enabled", "keyword", "keyword_label", "keywords", "sensitivity")),
         ("silence", ("seconds",)),
         ("shadow", ("experimental_context_gate_enabled",)),
         ("speaker", ("mode", "confirm_threshold", "continuity_threshold")),
@@ -182,6 +243,12 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
                 invalid = invalid or not isinstance(candidate, str) or not candidate.strip()
             elif section_name == "wake" and field == "keyword_label":
                 invalid = invalid or not isinstance(candidate, str)
+            elif section_name == "wake" and field == "keywords":
+                invalid = invalid or (
+                    not isinstance(candidate, (list, tuple))
+                    or not 1 <= len(candidate) <= MAX_WAKE_KEYWORDS
+                    or any(not isinstance(item, str) or not item.strip() for item in candidate)
+                )
             elif section_name == "wake" and field == "sensitivity":
                 invalid = invalid or type(candidate) is not int or not MIN_KWS_SENSITIVITY <= candidate <= MAX_KWS_SENSITIVITY
             elif section_name == "silence" and field == "seconds":
@@ -243,6 +310,8 @@ def _atomic_write_text(path: Path, value: str) -> None:
 def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> AppConfig:
     """Return a config overlay without changing the YAML or secret source."""
 
+    from ..kws.keywords import canonical_labels, normalize_keyword_list
+
     wake = settings.get("wake") if isinstance(settings.get("wake"), Mapping) else {}
     silence = settings.get("silence") if isinstance(settings.get("silence"), Mapping) else {}
     shadow = settings.get("shadow") if isinstance(settings.get("shadow"), Mapping) else {}
@@ -258,6 +327,16 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         sensitivity = _threshold_to_sensitivity(config.wake.threshold)
     sensitivity = max(MIN_KWS_SENSITIVITY, min(MAX_KWS_SENSITIVITY, sensitivity))
     enabled = bool(wake.get("enabled", config.wake.enabled))
+    # ``keywords`` is the authoritative phrase list; a settings file that still
+    # carries only the legacy single ``keyword`` falls back to a one-item list.
+    try:
+        keywords = normalize_keyword_list(
+            wake.get("keywords") if isinstance(wake.get("keywords"), (list, tuple))
+            else [wake.get("keyword") or config.wake.keyword]
+        )
+    except ValueError:
+        keywords = config.wake.keywords or (config.wake.keyword,)
+    labels = canonical_labels(keywords)
     next_wake = replace(
         config.wake,
         enabled=enabled,
@@ -266,8 +345,9 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         # legacy dataclass field synchronized for older controller fixtures,
         # but do not expose or read a second UI setting.
         always_on=enabled,
-        keyword=str(wake.get("keyword") or config.wake.keyword),
-        keyword_label=str(wake.get("keyword_label") or config.wake.keyword_label),
+        keyword=keywords[0],
+        keyword_label=labels[0],
+        keywords=keywords,
         threshold=_sensitivity_to_threshold(sensitivity),
     )
     next_agent = replace(
@@ -334,7 +414,13 @@ class ProductSettingsStore:
             self.warnings = [warning]
             marker = value.get("schema_version")
             self._malformed_schema_marker = not isinstance(marker, int)
-        return _merge_settings(defaults, value)
+        legacy = _legacy_speaker_scale(value)
+        if legacy:
+            self.warnings.append(
+                "product_settings: 声纹特征管线已更换，旧阈值是在另一套分数尺度上标定的，"
+                "已重置为新默认值并切回测试模式；请重新注册声纹后再校准。"
+            )
+        return _merge_settings(defaults, value, legacy_speaker_scale=legacy)
 
     def snapshot(self) -> dict[str, Any]:
         value = deepcopy(self._settings)
@@ -434,42 +520,70 @@ class ProductSettingsStore:
     async def save_wake(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if type(payload.get("enabled")) is not bool:
             raise ProductSettingsError("enabled 必须是布尔值。")
-        keyword = _clean_text(payload.get("keyword"), "唤醒词", max_length=120)
         raw_sensitivity = payload.get("sensitivity")
         if type(raw_sensitivity) is not int:
             raise ProductSettingsError("sensitivity 必须是整数。")
         sensitivity = raw_sensitivity
         if not MIN_KWS_SENSITIVITY <= sensitivity <= MAX_KWS_SENSITIVITY:
             raise ProductSettingsError(f"sensitivity 必须在 {MIN_KWS_SENSITIVITY} 至 {MAX_KWS_SENSITIVITY} 之间。")
-        from ..kws.keywords import keyword_label, normalize_keyword
+        from ..kws.keywords import (
+            MAX_WAKE_KEYWORDS,
+            canonical_labels,
+            normalize_keyword_list,
+        )
 
+        # ``keywords`` (a list) is the current contract; ``keyword`` (a string)
+        # stays accepted so an older client or a stored payload keeps working.
+        raw_keywords = payload.get("keywords")
+        if raw_keywords is None:
+            raw_keywords = [payload.get("keyword")]
+        if isinstance(raw_keywords, (str, bytes)) or not isinstance(raw_keywords, (list, tuple)):
+            raise ProductSettingsError("keywords 必须是唤醒词列表。")
+        if not raw_keywords:
+            raise ProductSettingsError("请至少填写 1 个唤醒词。")
+        cleaned: list[str] = []
+        for item in raw_keywords:
+            if not isinstance(item, str):
+                raise ProductSettingsError("唤醒词必须是字符串。")
+            if item.strip():
+                cleaned.append(_clean_text(item, "唤醒词", max_length=120))
         try:
-            normalized = normalize_keyword(keyword)
-            label = keyword_label(normalized)
+            keywords = normalize_keyword_list(cleaned)
+            labels = canonical_labels(keywords)
         except (TypeError, ValueError) as exc:
             raise ProductSettingsError(f"唤醒词无法生成有效标签：{str(exc)[:200]}") from exc
+        if len(keywords) > MAX_WAKE_KEYWORDS:  # defensive: normalize already caps
+            raise ProductSettingsError(f"最多支持 {MAX_WAKE_KEYWORDS} 个唤醒词。")
         previous = self._settings["wake"]
-        changed_keyword = (
-            normalized != str(previous.get("keyword") or "")
-            or label.upper() != str(previous.get("keyword_label") or "").upper()
-        )
+        try:
+            previous_keywords = normalize_keyword_list(
+                previous.get("keywords") if isinstance(previous.get("keywords"), (list, tuple))
+                else [previous.get("keyword") or ""]
+            )
+        except ValueError:
+            previous_keywords = ()
+        changed_keyword = keywords != previous_keywords
         if changed_keyword:
-            await asyncio.to_thread(self._compile_keyword, normalized, label)
+            await asyncio.to_thread(self._compile_keyword, tuple(zip(keywords, labels)))
         self._settings["wake"] = {
             "enabled": payload["enabled"],
-            "keyword": normalized,
-            "keyword_label": label,
+            "keyword": keywords[0],
+            "keyword_label": labels[0],
+            "keywords": list(keywords),
             "sensitivity": sensitivity,
         }
         self._save_settings()
         return self.snapshot()
 
-    def _compile_keyword(self, keyword: str, label: str) -> None:
-        """Compile a KWS keyword and atomically replace both keyword files."""
+    def _compile_keyword(self, entries: Sequence[tuple[str, str]]) -> None:
+        """Compile every wake phrase and atomically replace both keyword files."""
 
         from ..kws.detector import discover_model_paths
-        from ..kws.keywords import generate_keywords, validate_keywords_file
+        from ..kws.keywords import generate_keywords_for, validate_keywords_file
 
+        if not entries:
+            raise ProductSettingsError("请至少填写 1 个唤醒词。")
+        labels = tuple(label for _keyword, label in entries)
         model_dir = self.config.kws_dir.resolve()
         target = self.config.kws_keywords_file.resolve()
         try:
@@ -483,17 +597,16 @@ class ProductSettingsStore:
             raw_path = temporary / "keywords_raw.txt"
             compiled_path = temporary / "keywords.txt"
             try:
-                generate_keywords(
+                generate_keywords_for(
                     model_dir=model_dir,
                     raw_path=raw_path,
                     output_path=compiled_path,
-                    keyword=keyword,
-                    label=label,
+                    entries=tuple(entries),
                 )
-                validate_keywords_file(compiled_path, label)
+                validate_keywords_file(compiled_path, labels)
                 # Force path discovery/label validation once more before any
                 # live worker can observe the new files.
-                discover_model_paths(model_dir, compiled_path, label)
+                discover_model_paths(model_dir, compiled_path, labels)
             except Exception as exc:
                 if isinstance(exc, ProductSettingsError):
                     raise

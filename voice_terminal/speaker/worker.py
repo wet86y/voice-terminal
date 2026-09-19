@@ -11,8 +11,7 @@ from typing import Any
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from .contracts import SpeakerObservation
-from .engine import SpeakerModelError, WeSpeakerOnnxEngine
+from .engine import InsufficientAudioError, WeSpeakerOnnxEngine
 from .protocol import decode_pcm
 from ..config import load_config
 from ..core.events import utc_now_iso
@@ -24,17 +23,29 @@ logger = logging.getLogger(__name__)
 
 class SpeakerWorkerEngine:
     def __init__(self, model_path: Path, *, sample_rate: int = 16000,
-                 window_ms: int = 1500, step_ms: int = 500,
-                 min_speech_ms: int = 500) -> None:
+                 window_ms: int = 2000, step_ms: int = 500,
+                 min_speech_ms: int = 700,
+                 min_window_speech_ratio: float = 0.40) -> None:
         self.model_path = model_path
         self.model = WeSpeakerOnnxEngine(model_path, sample_rate=sample_rate)
         self.sample_rate = sample_rate
         self.window_samples = sample_rate * window_ms // 1000
         self.step_samples = sample_rate * step_ms // 1000
+        self.window_ms = int(window_ms)
         self.min_speech_ms = max(1, int(min_speech_ms))
+        self.min_window_speech_ratio = min(1.0, max(0.0, float(min_window_speech_ratio)))
         self.buffers: dict[tuple[str, int], bytearray] = {}
         self.starts: dict[tuple[str, int], int] = {}
         self.last_emitted: dict[tuple[str, int], int] = {}
+        # Per-window VAD speech bookkeeping: absolute sample index of every
+        # frame the controller marked as speech, so a window's speech duration
+        # is measured from the upstream VAD instead of a fixed amplitude gate.
+        self.speech_ranges: dict[tuple[str, int], list[tuple[int, int]]] = {}
+        # Turns for which the caller supplied an explicit VAD verdict on at
+        # least one frame.  Distinguishing "no speech" from "no verdict" is
+        # what lets a noise-only window be rejected outright instead of
+        # silently falling back to the energy heuristic.
+        self.vad_tracked: set[tuple[str, int]] = set()
         self.latest_generation: dict[str, int] = {}
         # A finish command closes a turn generation.  Frames that were still
         # queued when the 150 ms budget expired must not recreate that old
@@ -48,32 +59,64 @@ class SpeakerWorkerEngine:
     def model_version(self) -> str:
         return self.model.model_version
 
-    def _quality(self, pcm: bytes) -> tuple[str, int]:
+    def _quality(self, pcm: bytes) -> tuple[str, int, bool]:
+        """Return ``(quality, speech_ms, vad_supplied)``.
+
+        ``speech_ms`` is only an energy-based estimate.  When the controller
+        supplies a VAD verdict per frame the window-level speech duration is
+        computed from it instead (see :meth:`_speech_ms`), because a fixed
+        absolute amplitude threshold drifts with microphone gain and counts
+        non-speech energy as speech.
+        """
         try:
             import numpy as np  # type: ignore
             values = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
             if values.size == 0:
-                return "insufficient_audio", 0
+                return "insufficient_audio", 0, False
             rms = float(np.sqrt(np.mean((values / 32768.0) ** 2)))
             if rms < 0.003:
-                return "too_quiet", 0
+                return "too_quiet", 0, False
             clipped = float(np.mean(np.abs(values) >= 32760.0))
             if clipped > 0.02:
-                return "clipped", int(values.size * 1000 / self.sample_rate)
-            # Approximate effective speech duration from non-silent samples;
-            # VAD remains authoritative for routing, this quality gate only
-            # prevents a short utterance from becoming a false identity hit.
+                return "clipped", int(values.size * 1000 / self.sample_rate), False
             voiced = int(np.count_nonzero(np.abs(values) >= 327.0))
             speech_ms = int(voiced * 1000 / self.sample_rate)
             if speech_ms < self.min_speech_ms:
-                return "insufficient_audio", speech_ms
-            return "ready", speech_ms
+                return "insufficient_audio", speech_ms, False
+            return "ready", speech_ms, False
         except Exception:
-            return "ready", len(pcm) // 2 * 1000 // self.sample_rate
+            return "ready", len(pcm) // 2 * 1000 // self.sample_rate, False
+
+    def _speech_ms(self, key: tuple[str, int], start: int, end: int) -> tuple[int, bool]:
+        """Speech duration inside ``[start, end)`` from VAD frame ranges."""
+        if key not in self.vad_tracked:
+            return 0, False
+        total = 0
+        for frame_start, frame_end in self.speech_ranges.get(key, ()):
+            overlap = min(end, frame_end) - max(start, frame_start)
+            if overlap > 0:
+                total += overlap
+        return int(total * 1000 / self.sample_rate), True
 
     def _observation(self, *, turn_id: str, generation: int, start: int, end: int,
                      pcm: bytes) -> dict[str, Any]:
-        quality, speech_ms = self._quality(pcm)
+        key = (turn_id, generation)
+        quality, fallback_speech_ms, _ = self._quality(pcm)
+        vad_speech_ms, vad_supplied = self._speech_ms(key, start, end)
+        if vad_supplied:
+            speech_ms = vad_speech_ms
+            window_ms = max(1, self.window_samples * 1000 // self.sample_rate)
+            speech_ratio: float | None = round(min(1.0, speech_ms / window_ms), 4)
+            if quality == "ready" and speech_ratio < self.min_window_speech_ratio:
+                # A window made mostly of noise or another source must not
+                # produce an embedding, otherwise background audio would be
+                # scored as if it were the enrolled speaker.
+                quality = "not_speech"
+            elif quality == "ready" and speech_ms < self.min_speech_ms:
+                quality = "insufficient_audio"
+        else:
+            speech_ms = fallback_speech_ms
+            speech_ratio = None
         payload: dict[str, Any] = {
             "type": "speaker.embedding",
             "turn_id": turn_id,
@@ -82,18 +125,22 @@ class SpeakerWorkerEngine:
             "window_ended_sample": end,
             # The sidecar does not own the user's template registry, so the
             # initial payload leaves matching fields empty.  Voice Server
-            # fills them after comparing the embedding with its centre and
-            # optional labelled templates.
+            # fills them after comparing the embedding with its centre.
             "similarity": None,
             "matched_template_id": None,
             "speech_ms": speech_ms,
+            "speech_ratio": speech_ratio,
             "quality": quality,
             "model_version": self.model_version,
             "timestamp": utc_now_iso(),
             "embedding": [],
         }
         if quality == "ready":
-            payload["embedding"] = list(self.model.embed_pcm(pcm))
+            try:
+                payload["embedding"] = list(self.model.embed_pcm(pcm))
+            except InsufficientAudioError:
+                # Never let the graph's NaN path reach the decision layer.
+                payload["quality"] = "insufficient_audio"
         return payload
 
     def feed(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -121,6 +168,8 @@ class SpeakerWorkerEngine:
                 self.buffers.pop(stale_key, None)
                 self.starts.pop(stale_key, None)
                 self.last_emitted.pop(stale_key, None)
+                self.speech_ranges.pop(stale_key, None)
+                self.vad_tracked.discard(stale_key)
             self.finished = {key: value for key, value in self.finished.items() if key[0] != turn_id}
         key = (turn_id, generation)
         if key in self.finished:
@@ -130,11 +179,16 @@ class SpeakerWorkerEngine:
             raise ValueError("speaker audio.frame PCM is not int16 aligned")
         if (end_sample - start_sample) != len(pcm) // 2:
             raise ValueError("speaker audio.frame sample range does not match PCM length")
+        speech = payload.get("speech")
+        if isinstance(speech, bool):
+            self.vad_tracked.add(key)
+            if speech:
+                self.speech_ranges.setdefault(key, []).append((start_sample, end_sample))
         if key not in self.buffers:
             self.buffers[key] = bytearray()
             self.starts[key] = start_sample
-            # The first complete window is emitted once the 1.5 s buffer is
-            # available.  Subsequent windows advance by the 500 ms step;
+            # The first complete window is emitted once the full buffer is
+            # available.  Subsequent windows advance by the step;
             # initializing at ``window - step`` avoids emitting the same
             # initial window three times.
             self.last_emitted[key] = start_sample + self.window_samples - self.step_samples
@@ -173,6 +227,11 @@ class SpeakerWorkerEngine:
             if trim:
                 del buffer[:trim * 2]
                 self.starts[key] += trim
+        pruning = self.starts[key] - self.window_samples
+        if pruning > 0 and key in self.speech_ranges:
+            self.speech_ranges[key] = [
+                (max(a, pruning), b) for a, b in self.speech_ranges[key] if b > pruning
+            ]
         return result
 
     def finish(self, turn_id: str, generation: int) -> list[dict[str, Any]]:
@@ -184,6 +243,8 @@ class SpeakerWorkerEngine:
                 self.buffers.pop(stale_key, None)
                 self.starts.pop(stale_key, None)
                 self.last_emitted.pop(stale_key, None)
+                self.speech_ranges.pop(stale_key, None)
+                self.vad_tracked.discard(stale_key)
             self.finished = {item: value for item, value in self.finished.items() if item[0] != turn_id}
         self.finished[key] = None
         if len(self.finished) > 1024:
@@ -191,13 +252,13 @@ class SpeakerWorkerEngine:
         buffer = self.buffers.get(key)
         result: list[dict[str, Any]] = []
         # Preserve a useful final observation for turns shorter than the
-        # sliding window.  Under 500 ms is explicitly marked insufficient and
-        # can never become a non-owner decision.
+        # sliding window.  Anything the model cannot embed is explicitly marked
+        # ``insufficient_audio`` and can never become a non-owner decision.
         if buffer:
             sample_count = len(buffer) // 2
             if sample_count >= self.window_samples and self.starts[key] + sample_count > self.last_emitted[key]:
                 # Flush the newest full window even when the turn ended
-                # between the regular 500 ms update points.
+                # between the regular step points.
                 end = self.starts[key] + sample_count
                 start = end - self.window_samples
                 result.append(self._observation(
@@ -214,6 +275,8 @@ class SpeakerWorkerEngine:
         self.buffers.pop((turn_id, generation), None)
         self.starts.pop((turn_id, generation), None)
         self.last_emitted.pop((turn_id, generation), None)
+        self.speech_ranges.pop((turn_id, generation), None)
+        self.vad_tracked.discard((turn_id, generation))
         return result
 
 
@@ -229,6 +292,7 @@ async def run(config_path: Path | None = None) -> None:
         model_path, sample_rate=config.audio.sample_rate,
         window_ms=config.speaker.window_ms, step_ms=config.speaker.step_ms,
         min_speech_ms=config.speaker.min_speech_ms,
+        min_window_speech_ratio=config.speaker.min_window_speech_ratio,
     )
     await asyncio.to_thread(engine.load)
 
@@ -245,14 +309,36 @@ async def run(config_path: Path | None = None) -> None:
                         "type": "health", "request_id": message.get("request_id"),
                         "status": "READY", "model_loaded": True,
                         "model_version": engine.model_version,
+                        "frontend_version": engine.model.frontend_version,
                     }, ensure_ascii=False))
+                elif kind == "fingerprint":
+                    # Lets Voice Server prove that the enrolled templates were
+                    # produced by this exact feature frontend and these exact
+                    # model weights, without loading a second ONNX session.
+                    try:
+                        probe = list(engine.model.probe_embedding())
+                        payload = {
+                            "type": "fingerprint",
+                            "request_id": message.get("request_id"),
+                            "frontend_version": engine.model.frontend_version,
+                            "model_version": engine.model_version,
+                            "embedding_dim": len(probe),
+                            "probe": probe,
+                        }
+                    except Exception as exc:
+                        payload = {
+                            "type": "fingerprint",
+                            "request_id": message.get("request_id"),
+                            "error": f"{type(exc).__name__}: {exc}"[:300],
+                        }
+                    await websocket.send(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
                 elif kind == "audio.frame":
                     for item in await asyncio.to_thread(engine.feed, message):
                         await websocket.send(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
                 elif kind == "embed":
                     request_id = message.get("request_id")
                     pcm = decode_pcm(message.get("pcm_base64"))
-                    quality, speech_ms = engine._quality(pcm)
+                    quality, speech_ms, _ = engine._quality(pcm)
                     embedding = list(engine.model.embed_pcm(pcm)) if quality == "ready" else []
                     await websocket.send(json.dumps({
                         "type": "speaker.embed_result", "request_id": request_id,

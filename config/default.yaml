@@ -81,9 +81,22 @@ wake:
   provider: sherpa_kws
   keyword: "hei claw"
   keyword_label: "HEI_CLAW"
+  # Optional list of wake phrases (at most 5).  When present it is the
+  # authoritative set the spotter matches, and `keyword`/`keyword_label` are
+  # kept in sync with its first entry; when absent the single `keyword` is used.
+  keywords: ["hei claw"]
   threshold: 0.25
-  keywords_score: 1.0
-  num_trailing_blanks: 1
+  # Boosting score per keyword token.  1.5 is the measured sweet spot: it
+  # repairs the 8 dB band and lifts "你好七三" from 5/9 to 7/9 at 5 dB, while
+  # 2.0 shows no further gain on the same corpus.
+  keywords_score: 1.5
+  # 3 costs no recall and keeps overlapping phrases (七三 vs 七三同学) from
+  # being merged into one another.
+  num_trailing_blanks: 3
+  # Beam width.  8 is the only knob measured to improve the bare two-syllable
+  # "七三" (5 dB recall 3/9 -> 5/9) with no false accepts on the 7.3-minute
+  # wake-word-free corpus.
+  max_active_paths: 8
   device: cpu
 
 vad:
@@ -169,11 +182,27 @@ asr_worker:
 speaker:
   # Optional sidecar.  off | observe | filter
   mode: off
-  confirm_threshold: 0.50
-  continuity_threshold: 0.40
-  window_ms: 1500
+  # Raw-cosine thresholds against the enrolled centroid.  The authorising
+  # score is one cosine between the turn's speech-weighted mean embedding and
+  # the centroid, so these are comparable to the numbers the settings-page
+  # "现场测试" reports.  Measured on the reference corpus: genuine p05 ≈ 0.86,
+  # impostor p95 ≈ 0.19 at a 2 s window, so 0.60/0.50 keeps a wide margin.
+  confirm_threshold: 0.60
+  continuity_threshold: 0.50
+  # Windows are gated on the upstream VAD verdict: a window must contain at
+  # least min_speech_ms of speech and that speech must cover at least
+  # min_window_speech_ratio of the window before an embedding is extracted.
+  window_ms: 2000
   step_ms: 500
-  min_speech_ms: 500
+  min_speech_ms: 700
+  min_window_speech_ratio: 0.40
+  # A turn needs this much voiced speech before any identity decision is made;
+  # below it the turn stays "unknown" and keeps the fail-open passthrough.
+  # 2 s of voiced speech is roughly 2.5-3 s of wall time.  Raising it trades
+  # coverage (more short turns pass through) for fewer false accepts, which is
+  # the safe direction; text-independent verification APIs commonly require a
+  # 4 s minimum.
+  min_turn_speech_ms: 2000
   wait_ms: 150
   model_id: wespeaker-cnceleb-resnet34
 

@@ -32,6 +32,10 @@ class SpeakerObservation:
     model_version: str = ""
     timestamp: str = ""
     embedding: tuple[float, ...] = field(default_factory=tuple, repr=False)
+    #: Fraction of the window that the upstream VAD marked as speech.  ``None``
+    #: means the caller could not supply a VAD verdict and the worker fell back
+    #: to its energy heuristic.
+    speech_ratio: float | None = None
 
     def to_payload(self, *, include_embedding: bool = False) -> dict[str, Any]:
         value = asdict(self)
@@ -54,6 +58,8 @@ class SpeakerDecision:
     reason: str
     degraded: bool = False
     anti_spoofing: str = "unavailable"
+    #: Number of windows that contributed to the aggregated turn embedding.
+    aggregated_windows: int = 0
 
     def to_payload(self) -> dict[str, Any]:
         value = asdict(self)

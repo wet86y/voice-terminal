@@ -129,32 +129,45 @@ shadow_agent:
 ### 可选声纹增强
 
 声纹识别是独立旁路，默认关闭，不会挡住音频采集、VAD、Paraformer partial/final 或
-SenseVoice 精修。设置页的“声纹识别”标签可以录制固定的主人用户；首版要求三段 5–10 秒
-录音，允许为每段添加标签（例如“低声”“夹嗓子”）。声纹提取成功后只保存向量和质量摘要，
-原始注册录音立即删除。
+SenseVoice 精修。设置页的“声纹识别”标签可以注册固定的主人用户：三段 5–10 秒录音，
+界面为每段显示**一句不同**的提示句。声纹提取成功后只保存向量、质量摘要和特征指纹，
+原始注册录音立即删除。设计、参数依据与验收流程见
+[可选声纹增强组件](docs/speaker-enhancement.md)。
+
+注册与运行使用**同一条采集链路**：都在服务端按 `audio.input_device` 以 16 kHz 单声道采集，
+并经过同一个近端处理实例。注册时三段必须内容不同——同一句话重复三遍会通过内容捷径抬高
+分数，却不会让模型更好地认识说话人，而运行时面对的永远是自发语音。
 
 运行模式只有三种：
 
 - `off`：不启动实时声纹旁路；行为与未安装组件完全相同。
 - `observe`：运行识别并附加诊断，所有 ASR final 仍照常进入主对话；首次启用建议使用此模式。
-- `filter`：只有连续证据明确判定为非本人时才把文本放入当前会话的环境记录；证据不足、
+- `filter`：只有明确判定为非本人时才把文本放入当前会话的环境记录；证据不足、资料过期、
   Worker 不可用、队列溢出或 150 ms 等待超时都会安全直通。
 
 产品设置文件只保存以下非敏感字段：
 
 ```json
-{"speaker":{"mode":"off","confirm_threshold":0.5,"continuity_threshold":0.4}}
+{"speaker":{"mode":"off","confirm_threshold":0.6,"continuity_threshold":0.5}}
 ```
 
-声纹使用 1.5 秒滑动窗口和 500 ms 更新步长。普通确认阈值与连续保持阈值采用固定迟滞，
-不是会话级动态调阈值；设置页高级区域可以调整并恢复默认。阈值是交互测试基线，不是付款、
-删除、门锁等高风险操作的身份认证，也没有录音回放、合成语音或变声防伪能力。
+声纹使用 2 秒滑动窗口和 500 ms 更新步长，并且**只在窗口内有足够 VAD 语音时才提取特征**。
+判定不用逐窗口结论：整轮的语音加权平均 embedding 与质心做**一次余弦**，该分数就是唯一权威
+分数（设置页“现场测试”用同一公式，因此两个数字可以直接对比）。普通确认阈值与连续保持阈值
+采用固定迟滞，不是会话级动态调阈值；设置页高级区域可以调整并恢复默认。阈值是交互测试基线，
+不是付款、删除、门锁等高风险操作的身份认证，也没有录音回放、合成语音或变声防伪能力。
 `similarity` 记录 WeSpeaker 的原始余弦相似度（约 -1 到 1），不会平移成概率。
 
-资料存放在 `config/speaker/registry.json` 与受管 `templates/` 目录，不写入
-`product-settings.json`。筛选到旁路的文字只在当前 Voice Server 会话内保留，设置页可以查看
-和清空；Shadow 只有在确有需要时才能通过只读 `read_ambient_context` 工具读取，不会因为环境
-记录自动唤醒。
+资料存放在 `config/speaker/registry.json`、受管 `templates/` 目录与 `probe.npy`，不写入
+`product-settings.json`。资料里带特征指纹：一旦特征前端或模型发生任何变化（包括纯数值
+修正），旧模板会被标记为过期并停止参与判定，设置页提示重新注册——否则换前端会表现为
+“所有人都不被承认”，从分数上无法与“阈值太高”区分。
+
+`product-settings.json` 的 schema v4 迁移会把旧阈值重置为 0.60/0.50：旧值是上一套分数尺度
+上的标定结果（包括为对抗误接受手动抬高的值），在新尺度上没有意义，`filter` 同时回落为
+`observe`。筛选到旁路的文字只在当前 Voice Server 会话内保留，设置页可以查看和清空；
+Shadow 只有在确有需要时才能通过只读 `read_ambient_context` 工具读取，不会因为环境记录
+自动唤醒。
 
 ## 启动
 
@@ -208,8 +221,26 @@ python -m voice_terminal.kws.probe
 python -m voice_terminal.kws.probe --duration 10
 ```
 
-检测成功时会输出 `WAKE_DETECTED label=<keyword_label> ...`。探针不发送网络请求，也不创建
-ASR/LLM/TTS 会话，适合在调整关键词、阈值或麦克风设备后做单独验收。
+检测成功时会输出 `WAKE_DETECTED label=<label> ...`（每个说法各有自己的标签）。探针不发送网络请求，
+也不创建 ASR/LLM/TTS 会话，适合在调整关键词、阈值或麦克风设备后做单独验收。
+
+#### 一个唤醒词，多个说法
+
+唤醒词支持一次配置最多 **5 个说法**（设置页“KWS 唤醒词”可增删）。所有说法都属于同一个唤醒词，
+命中任意一个即算唤醒，`keywords.txt` 会为每个说法生成一行并带各自的 `@LABEL`。实测（合成音 +
+加性噪声，每档 9 个样本）：只说两个字“七三”在 5 dB 信噪比下只有 3/9 命中，而登记
+“七三 / 你好七三 / 七三同学”后，把称呼说得长一点可达 9/9，负样本（7.3 分钟无唤醒词语音）
+误触发 0/12。建议保留短称呼的同时补上更长的说法。
+
+`sherpa` 的可调参数在 `config/default.yaml` 的 `wake` 段，产品设置页不暴露：
+
+```yaml
+wake:
+  keywords: ["七三", "你好七三", "七三同学"]   # 可选，缺省时回退到单个 keyword
+  keywords_score: 1.5        # 关键词 boosting；1.5 为实测拐点，2.0 无额外收益
+  num_trailing_blanks: 3     # 重叠说法之间不互相吞并；对召回无损
+  max_active_paths: 8        # beam 宽度；唯一能改善最短说法的参数
+```
 
 启用 KWS 即表示语音会话期间持续进入唤醒词待机：设置 `wake.enabled: true`，也可通过
 `VOICE_WAKE_ENABLED=true` 覆盖。关闭 KWS 后，点击开始会直接进入 ASR。常驻模式下“开始监听”先进入 KWS 待机，唤醒后切换到 ASR；
@@ -218,19 +249,22 @@ ASR/LLM/TTS 会话，适合在调整关键词、阈值或麦克风设备后做�
 
 产品页中的“灵敏度”是面向用户的易唤醒程度，不是 sherpa 的原始阈值：
 `sensitivity = 100 - threshold * 100`。因此默认 sherpa 阈值 `0.25` 在页面显示为 `75%`，
-`98%` 对应 `0.02`，数值越高越容易唤醒；通常建议先从 `60–80%` 开始。当前中文模型使用
-`phone+ppinyin` 生成词条，中文短语（例如“执事”或“嘿，小爪”）无需出现在英文词典中即可编译。
+`98%` 对应 `0.02`，数值越高越容易唤醒。实测 `threshold` 在 `0.001–0.25`（灵敏度 75–99%）
+之间行为一致，只有升到 `0.5`（灵敏度 50%）才明显变差，因此**保持最高即可**，降低灵敏度不会
+更“保守”，只会更难唤醒。当前中文模型使用 `phone+ppinyin` 生成词条，中文短语（例如“七三”或
+“嘿，小爪”）无需出现在英文词典中即可编译。
 
 服务运行时可通过 `GET http://127.0.0.1:8765/health` 检查 KWS 链路：`wake_enabled` 表示产品开关，
-`input_owner` 在待机时应为 `kws`，`kws.submitted_frames` 应持续增长；若 `dropped_frames` 增长，
-说明 KWS 队列拥塞；若 `detected_count` 保持为零，则优先检查关键词、灵敏度、麦克风输入和
-`kws.error`。`wake_always_on` 如果仍出现在运行时状态中只是兼容性状态字段，不是另一个设置项。
+`wake_keywords` 是当前生效的全部说法，`input_owner` 在待机时应为 `kws`，`kws.submitted_frames`
+应持续增长；若 `dropped_frames` 增长，说明 KWS 队列拥塞；若 `detected_count` 保持为零，则优先
+检查关键词、灵敏度、麦克风输入和 `kws.error`。`wake_always_on` 如果仍出现在运行时状态中只是
+兼容性状态字段，不是另一个设置项。
 
 若点击“开始语音会话”后没有进入监听，先检查 `services.kws` 和 `startup_errors`。启用 KWS 时，
-配置中的 `wake.keyword_label` 必须与受管 `keywords.txt` 中的 `@LABEL` 一致；例如唤醒词设置为
-“执事”时，文件必须包含 `@执事`，如果仍只有旧的 `@HEI_CLAW`，后端会返回
-`KWS_WORKER_FAILED` 并保持未监听。只进行声纹测试时，可在“设置 → KWS 唤醒词”关闭 KWS，保存后
-下一次点击会直接进入 ASR；需要保留唤醒词时，在设置页重新保存目标词以触发关键词文件重新生成。
+配置里的**每一个** `wake.keywords` 说法都必须能在受管 `keywords.txt` 中找到对应的 `@LABEL`；
+例如三个说法都配置了，文件就必须有三行标签，缺任意一个后端都会返回 `KWS_WORKER_FAILED` 并保持
+未监听（错误信息会点名缺失的标签）。只进行声纹测试时，可在“设置 → KWS 唤醒词”关闭 KWS，保存后
+下一次点击会直接进入 ASR；需要保留唤醒词时，在设置页重新保存唤醒词即可重新生成关键词文件。
 
 ## AEC 与播放期插话
 
@@ -241,6 +275,7 @@ ASR/LLM/TTS 会话，适合在调整关键词、阈值或麦克风设备后做�
 ## 文档与验证
 
 - [架构与组件契约](docs/architecture.md)
+- [可选声纹增强组件](docs/speaker-enhancement.md)
 - [上下文与工具规范](docs/context-and-tools.md)
 - [WebSocket 协议](docs/websocket-protocol.md)
 - [LLM 上下文缓存契约](docs/llm-context-cache-contract.md)
