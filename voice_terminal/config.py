@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from .env import load_env_file
 from .controller.options import InputOptions
 from .agent.options import AgentOptions
+from .kws.keywords import canonical_labels, normalize_keyword_list
 
 
 REASONING_EFFORTS = ("off", "low", "medium", "high", "max")
@@ -92,14 +93,27 @@ class WakeConfig:
     enabled: bool = False
     always_on: bool = False
     provider: str = "sherpa_kws"
+    # ``keyword``/``keyword_label`` stay the *primary* (first) phrase so every
+    # older consumer — health payloads, doctor, probe banners, fixtures — keeps
+    # working.  ``keywords`` is the authoritative list the detector matches.
     keyword: str = "hei claw"
     keyword_label: str = "HEI_CLAW"
+    keywords: tuple[str, ...] = ("hei claw",)
     threshold: float = 0.25
     keywords_score: float = 1.0
     num_trailing_blanks: int = 1
+    # Beam width for the keyword spotter.  Wider means more surviving paths for
+    # a short phrase; 4 is sherpa's default and was previously hard-coded.
+    max_active_paths: int = 4
     device: str = "cpu"
     model_dir: Path | None = None
     keywords_file: Path | None = None
+
+    @property
+    def keyword_labels(self) -> tuple[str, ...]:
+        """The ``@LABEL`` of every configured phrase, in order."""
+
+        return canonical_labels(self.keywords or (self.keyword,))
 
 
 @dataclass(frozen=True)
@@ -242,11 +256,13 @@ class AsrWorkerConfig:
 @dataclass(frozen=True)
 class SpeakerConfig:
     mode: str = "off"
-    confirm_threshold: float = 0.50
-    continuity_threshold: float = 0.40
-    window_ms: int = 1500
+    confirm_threshold: float = 0.60
+    continuity_threshold: float = 0.50
+    window_ms: int = 2000
     step_ms: int = 500
-    min_speech_ms: int = 500
+    min_speech_ms: int = 700
+    min_window_speech_ratio: float = 0.40
+    min_turn_speech_ms: int = 1500
     wait_ms: int = 150
     model_id: str = "wespeaker-cnceleb-resnet34"
 
@@ -259,6 +275,10 @@ class SpeakerConfig:
             raise ValueError("speaker window settings are invalid")
         if self.min_speech_ms < 100 or self.min_speech_ms > self.window_ms:
             raise ValueError("speaker.min_speech_ms is invalid")
+        if not 0.0 < float(self.min_window_speech_ratio) <= 1.0:
+            raise ValueError("speaker.min_window_speech_ratio must be in (0, 1]")
+        if self.min_turn_speech_ms < self.min_speech_ms:
+            raise ValueError("speaker.min_turn_speech_ms must be at least min_speech_ms")
         if not 0 <= self.wait_ms <= 150:
             raise ValueError("speaker.wait_ms must be between 0 and 150")
 
@@ -506,6 +526,18 @@ class AppConfig:
         wake_enabled = _env_bool("VOICE_WAKE_ENABLED", _bool(wake.get("enabled"), False))
         keyword = _string(wake.get("keyword"), "hei claw")
         label = _string(wake.get("keyword_label"), "HEI_CLAW")
+        # ``wake.keywords`` is optional and additive: a file that only carries
+        # the legacy single ``keyword`` keeps behaving exactly as before.
+        raw_keywords = wake.get("keywords")
+        if isinstance(raw_keywords, (list, tuple)) and raw_keywords:
+            try:
+                keywords = normalize_keyword_list(raw_keywords)
+            except ValueError:
+                keywords = normalize_keyword_list([keyword])
+        else:
+            keywords = normalize_keyword_list([keyword])
+        keyword = keywords[0]
+        label = canonical_labels(keywords)[0]
         kws_dir = wake.get("model_dir")
         keywords_file = wake.get("keywords_file")
 
@@ -637,9 +669,11 @@ class AppConfig:
                 provider=_string(wake.get("provider"), "sherpa_kws"),
                 keyword=keyword,
                 keyword_label=label,
+                keywords=keywords,
                 threshold=float(_number(wake.get("threshold"), 0.25)),
                 keywords_score=float(_number(wake.get("keywords_score"), 1.0)),
                 num_trailing_blanks=int(_number(wake.get("num_trailing_blanks"), 1)),
+                max_active_paths=min(16, max(1, int(_number(wake.get("max_active_paths"), 4)))),
                 device=_string(wake.get("device"), "cpu"),
                 model_dir=path_or_none(kws_dir),
                 keywords_file=path_or_none(keywords_file),
@@ -717,11 +751,13 @@ class AppConfig:
             ),
             speaker=SpeakerConfig(
                 mode=_string(speaker.get("mode"), "off").lower(),
-                confirm_threshold=float(_number(speaker.get("confirm_threshold"), 0.50)),
-                continuity_threshold=float(_number(speaker.get("continuity_threshold"), 0.40)),
-                window_ms=int(_number(speaker.get("window_ms"), 1500)),
+                confirm_threshold=float(_number(speaker.get("confirm_threshold"), 0.60)),
+                continuity_threshold=float(_number(speaker.get("continuity_threshold"), 0.50)),
+                window_ms=int(_number(speaker.get("window_ms"), 2000)),
                 step_ms=int(_number(speaker.get("step_ms"), 500)),
-                min_speech_ms=int(_number(speaker.get("min_speech_ms"), 500)),
+                min_speech_ms=int(_number(speaker.get("min_speech_ms"), 700)),
+                min_window_speech_ratio=float(_number(speaker.get("min_window_speech_ratio"), 0.40)),
+                min_turn_speech_ms=int(_number(speaker.get("min_turn_speech_ms"), 1500)),
                 wait_ms=int(_number(speaker.get("wait_ms"), 150)),
                 model_id=_string(speaker.get("model_id"), "wespeaker-cnceleb-resnet34"),
             ),

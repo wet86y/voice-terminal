@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from collections.abc import Iterable
 
 import struct
 
-from .keywords import validate_keywords_file
+from .keywords import expected_label_set, validate_keywords_file
 
 
 class KwsError(RuntimeError):
@@ -29,7 +30,11 @@ def _find_one(directory: Path, pattern: str, description: str) -> Path:
     return matches[0]
 
 
-def discover_model_paths(model_dir: Path, keywords_file: Path, keyword_label: str) -> KwsModelPaths:
+def discover_model_paths(
+    model_dir: Path,
+    keywords_file: Path,
+    keyword_label: str | Iterable[str],
+) -> KwsModelPaths:
     paths = KwsModelPaths(
         tokens=_find_one(model_dir, "tokens.txt", "tokens.txt"),
         encoder=_find_one(model_dir, "encoder*.onnx", "encoder onnx"),
@@ -47,16 +52,24 @@ class KwsDetector:
         *,
         model_dir: Path,
         keywords_file: Path,
-        keyword_label: str,
+        keyword_label: str | Iterable[str],
         threshold: float = 0.25,
         keywords_score: float = 1.0,
         num_trailing_blanks: int = 1,
+        max_active_paths: int = 4,
         provider: str = "cpu",
         sample_rate: int = 16000,
     ) -> None:
         self.sample_rate = sample_rate
-        self.keyword_label = keyword_label.upper()
-        self.paths = discover_model_paths(model_dir, keywords_file, self.keyword_label)
+        # One detector represents one wake word with up to MAX_WAKE_KEYWORDS
+        # accepted spellings; every configured label is a valid hit, anything
+        # else in the keywords file is diagnostic-only and stays falsy.
+        self.keyword_labels = tuple(
+            dict.fromkeys(label.upper() for label in expected_label_set(keyword_label))
+        )
+        self.keyword_label = self.keyword_labels[0]
+        self._label_index = {label.casefold(): label for label in self.keyword_labels}
+        self.paths = discover_model_paths(model_dir, keywords_file, self.keyword_labels)
         try:
             import numpy as np  # type: ignore
             import sherpa_onnx  # type: ignore
@@ -71,7 +84,7 @@ class KwsDetector:
                 decoder=str(self.paths.decoder),
                 joiner=str(self.paths.joiner),
                 num_threads=1,
-                max_active_paths=4,
+                max_active_paths=max(1, int(max_active_paths)),
                 keywords_file=str(self.paths.keywords),
                 keywords_score=keywords_score,
                 keywords_threshold=threshold,
@@ -98,8 +111,10 @@ class KwsDetector:
                 result = str(detected)
                 self._spotter.reset_stream(self._stream)
                 break
-        if result and self.keyword_label.casefold() == result.casefold():
-            return self.keyword_label
+        if result:
+            matched = self._label_index.get(result.casefold())
+            if matched is not None:
+                return matched
         # A keyword file may contain diagnostic or future alternate labels.
         # This detector represents one configured wake word, so never turn a
         # different result into a truthy wake signal for its caller.

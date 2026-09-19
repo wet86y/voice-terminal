@@ -76,6 +76,38 @@ class ProductSidecarTests(unittest.TestCase):
         self.assertFalse(upgraded.snapshot()["shadow"]["experimental_context_gate_enabled"])
         self.assertFalse(upgraded.warnings)
 
+    def test_legacy_speaker_thresholds_are_reset_to_the_new_scale(self) -> None:
+        """Old raw-cosine thresholds cannot survive the frontend replacement."""
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.settings_path.write_text(json.dumps({
+            "schema_version": 3,
+            "speaker": {"mode": "filter", "confirm_threshold": 0.81, "continuity_threshold": 0.72},
+        }), encoding="utf-8")
+        migrated = self.store()
+        speaker = migrated.snapshot()["speaker"]
+        self.assertEqual(speaker["confirm_threshold"], 0.60)
+        self.assertEqual(speaker["continuity_threshold"], 0.50)
+        # Strict filtering must not resume against a stale scale.
+        self.assertEqual(speaker["mode"], "observe")
+        self.assertTrue(any("声纹特征管线" in item for item in migrated.warnings))
+        # A v1 file with no speaker section has nothing to migrate.
+        self.settings_path.write_text(json.dumps({
+            "schema_version": 1, "silence": {"seconds": 45},
+        }), encoding="utf-8")
+        untouched = self.store()
+        self.assertFalse(untouched.warnings)
+        self.assertEqual(untouched.snapshot()["silence"]["seconds"], 45)
+
+    def test_current_schema_keeps_user_speaker_thresholds(self) -> None:
+        store = self.store()
+        saved = store.save_speaker({
+            "mode": "observe", "confirm_threshold": 0.72, "continuity_threshold": 0.61,
+        })
+        self.assertEqual(saved["confirm_threshold"], 0.72)
+        reloaded = self.store()
+        self.assertEqual(reloaded.snapshot()["speaker"]["confirm_threshold"], 0.72)
+        self.assertFalse(reloaded.warnings)
+
     def test_kws_compile_replaces_files_only_after_validation(self) -> None:
         kws_dir = self.config.kws_dir
         kws_dir.mkdir(parents=True)
@@ -88,11 +120,15 @@ class ProductSidecarTests(unittest.TestCase):
         old_keywords = keywords_file.read_text(encoding="utf-8")
         old_raw = raw_file.read_text(encoding="utf-8")
 
-        def fake_generate(*, raw_path, output_path, label, **_kwargs):
-            raw_path.write_text(f"NEW CLAW @{label}\n", encoding="utf-8")
-            output_path.write_text(f"phones @{label}\n", encoding="utf-8")
+        def fake_generate(*, raw_path, output_path, entries, **_kwargs):
+            raw_path.write_text(
+                "".join(f"{keyword} @{label}\n" for keyword, label in entries), encoding="utf-8",
+            )
+            output_path.write_text(
+                "".join(f"phones @{label}\n" for _keyword, label in entries), encoding="utf-8",
+            )
 
-        with patch("voice_terminal.kws.keywords.generate_keywords", fake_generate), \
+        with patch("voice_terminal.kws.keywords.generate_keywords_for", fake_generate), \
              patch("voice_terminal.kws.detector.discover_model_paths", return_value=object()):
             result = asyncio.run(store.save_wake({
                 "enabled": True,
@@ -100,6 +136,7 @@ class ProductSidecarTests(unittest.TestCase):
                 "sensitivity": 75,
             }))
         self.assertEqual(result["wake"]["keyword"], "new claw")
+        self.assertEqual(result["wake"]["keywords"], ["new claw"])
         self.assertIn("@NEW_CLAW", keywords_file.read_text(encoding="utf-8"))
         self.assertIn("@NEW_CLAW", raw_file.read_text(encoding="utf-8"))
         self.assertNotEqual(old_keywords, keywords_file.read_text(encoding="utf-8"))
@@ -111,7 +148,7 @@ class ProductSidecarTests(unittest.TestCase):
         previous = failing.settings_only()["wake"]
         previous_keywords = keywords_file.read_text(encoding="utf-8")
         previous_raw = raw_file.read_text(encoding="utf-8")
-        with patch("voice_terminal.kws.keywords.generate_keywords", side_effect=RuntimeError("dictionary unsupported")), \
+        with patch("voice_terminal.kws.keywords.generate_keywords_for", side_effect=RuntimeError("dictionary unsupported")), \
              patch("voice_terminal.kws.detector.discover_model_paths", return_value=object()):
             with self.assertRaises(ProductSettingsError):
                 asyncio.run(failing.save_wake({
@@ -123,6 +160,81 @@ class ProductSidecarTests(unittest.TestCase):
         self.assertEqual(keywords_file.read_text(encoding="utf-8"), previous_keywords)
         self.assertEqual(raw_file.read_text(encoding="utf-8"), previous_raw)
         self.assertEqual(old_settings["keyword"], "hei claw")
+
+    def test_multiple_wake_phrases_compile_into_one_label_set(self) -> None:
+        """Up to five spellings of one wake word share the managed file."""
+
+        kws_dir = self.config.kws_dir
+        kws_dir.mkdir(parents=True)
+        keywords_file = self.config.kws_keywords_file
+        raw_file = keywords_file.parent / "keywords_raw.txt"
+        store = self.store()
+
+        def fake_generate(*, raw_path, output_path, entries, **_kwargs):
+            raw_path.write_text(
+                "".join(f"{keyword} @{label}\n" for keyword, label in entries), encoding="utf-8",
+            )
+            output_path.write_text(
+                "".join(f"phones @{label}\n" for _keyword, label in entries), encoding="utf-8",
+            )
+
+        with patch("voice_terminal.kws.keywords.generate_keywords_for", fake_generate), \
+             patch("voice_terminal.kws.detector.discover_model_paths", return_value=object()):
+            result = asyncio.run(store.save_wake({
+                "enabled": True,
+                "keywords": ["七三", "你好七三", "七三同学"],
+                "sensitivity": 99,
+            }))
+
+        self.assertEqual(result["wake"]["keywords"], ["七三", "你好七三", "七三同学"])
+        self.assertEqual(result["wake"]["keyword"], "七三")
+        self.assertEqual(result["wake"]["keyword_label"], "七三")
+        compiled = keywords_file.read_text(encoding="utf-8")
+        for label in ("@七三", "@你好七三", "@七三同学"):
+            self.assertIn(label, compiled)
+        self.assertEqual(len(compiled.strip().splitlines()), 3)
+        self.assertEqual(len(raw_file.read_text(encoding="utf-8").strip().splitlines()), 3)
+
+        effective = store.effective_config().wake
+        self.assertEqual(effective.keywords, ("七三", "你好七三", "七三同学"))
+        self.assertEqual(effective.keyword, "七三")
+        self.assertEqual(effective.keyword_labels, ("七三", "你好七三", "七三同学"))
+
+        # A reload must reproduce the same list from the persisted file.
+        self.assertEqual(self.store().snapshot()["wake"]["keywords"], ["七三", "你好七三", "七三同学"])
+
+    def test_wake_phrase_list_is_deduped_and_capped(self) -> None:
+        kws_dir = self.config.kws_dir
+        kws_dir.mkdir(parents=True)
+        store = self.store()
+
+        def fake_generate(*, raw_path, output_path, entries, **_kwargs):
+            raw_path.write_text("\n".join(f"{keyword} @{label}" for keyword, label in entries), encoding="utf-8")
+            output_path.write_text("\n".join(f"phones @{label}" for _keyword, label in entries), encoding="utf-8")
+
+        with patch("voice_terminal.kws.keywords.generate_keywords_for", fake_generate), \
+             patch("voice_terminal.kws.detector.discover_model_paths", return_value=object()):
+            # Repeated spellings and case/alias variants collapse into one entry;
+            # "七三" and "七 三" are genuinely different phrases and both stay.
+            deduped = asyncio.run(store.save_wake({
+                "enabled": True,
+                "keywords": ["七三", "七三", "你好七三", "HEI_CLAW"],
+                "sensitivity": 75,
+            }))
+            self.assertEqual(deduped["wake"]["keywords"], ["七三", "你好七三", "hei claw"])
+
+            with self.assertRaises(ProductSettingsError):
+                asyncio.run(store.save_wake({
+                    "enabled": True,
+                    "keywords": ["一", "二", "三", "四", "五", "六"],
+                    "sensitivity": 75,
+                }))
+            with self.assertRaises(ProductSettingsError):
+                asyncio.run(store.save_wake({"enabled": True, "keywords": [], "sensitivity": 75}))
+            with self.assertRaises(ProductSettingsError):
+                asyncio.run(store.save_wake({"enabled": True, "keywords": ["七三", 7], "sensitivity": 75}))
+        # Rejected saves never touched the persisted list.
+        self.assertEqual(store.snapshot()["wake"]["keywords"], ["七三", "你好七三", "hei claw"])
 
     def test_kws_and_silence_ranges_and_persona_allowlist(self) -> None:
         store = self.store()
@@ -162,11 +274,15 @@ class ProductSidecarTests(unittest.TestCase):
         kws_dir.mkdir(parents=True)
         store = self.store()
 
-        def fake_generate(*, raw_path, output_path, label, **_kwargs):
-            raw_path.write_text(f"嘿 小爪 @{label}\n", encoding="utf-8")
-            output_path.write_text(f"h ei @{label}\n", encoding="utf-8")
+        def fake_generate(*, raw_path, output_path, entries, **_kwargs):
+            raw_path.write_text(
+                "".join(f"嘿 小爪 @{label}\n" for _keyword, label in entries), encoding="utf-8",
+            )
+            output_path.write_text(
+                "".join(f"h ei @{label}\n" for _keyword, label in entries), encoding="utf-8",
+            )
 
-        with patch("voice_terminal.kws.keywords.generate_keywords", fake_generate), \
+        with patch("voice_terminal.kws.keywords.generate_keywords_for", fake_generate), \
              patch("voice_terminal.kws.detector.discover_model_paths", return_value=object()):
             result = asyncio.run(store.save_wake({
                 "enabled": True,
@@ -176,6 +292,7 @@ class ProductSidecarTests(unittest.TestCase):
 
         self.assertEqual(result["wake"]["keyword"], "嘿 小爪")
         self.assertEqual(result["wake"]["keyword_label"], "嘿_小爪")
+        self.assertEqual(result["wake"]["keywords"], ["嘿 小爪"])
         self.assertNotIn("always_on", result["wake"])
         self.assertAlmostEqual(store.effective_config().wake.threshold, 0.30)
         self.assertIn("@嘿_小爪", (kws_dir / "keywords.txt").read_text(encoding="utf-8"))

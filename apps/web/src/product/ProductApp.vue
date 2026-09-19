@@ -15,6 +15,7 @@ const {
   voice, page: activePage, settingsTab: activeSettingsTab, settings, loading, saving,
   connected, replayMode, replayMeta, runtimeState, current, conversationRows, pendingSpeechRows,
   currentTurnLogged, currentTurnSpeechLogged, currentTurnSpeechPending, shadow, latencyMs, latencyRunning, wakeForm,
+  maxWakeKeywords, addWakeKeyword, removeWakeKeyword,
   silenceSeconds, personaDocument: activePersona, personaDocuments, providerForm,
   providerStep, discoveredModels, modelAssignments, uiModels: modelEntries,
   availableLlmModels, availableTtsModels, visibleLocalPool, hiddenPool,
@@ -27,7 +28,8 @@ const {
   requestModelApply, confirmModelApply, retry, setNotice,
   speakerForm, speakerStatus, speakerProfile, speakerTestResult, ambientContext, speakerEnrollment,
   saveSpeaker, refreshSpeaker, startSpeakerEnrollment, addSpeakerEnrollmentSegment,
-  commitSpeakerEnrollment, cancelSpeakerEnrollment, deleteSpeakerTemplate, setSpeakerTemplateCentroid, testSpeakerAudio, refreshAmbientContext, clearAmbientContext,
+  commitSpeakerEnrollment, cancelSpeakerEnrollment, deleteSpeakerTemplate, setSpeakerTemplateCentroid, testSpeakerAudio,
+  captureSpeakerEnrollmentSegment, captureSpeakerTest, refreshAmbientContext, clearAmbientContext,
 } = adapter
 const reasoningMode = voice.reasoningMode
 const listening = voice.listening
@@ -555,6 +557,8 @@ async function selectDiscoveredModel(event: Event) {
 const speakerRecordingSegment = ref<number | null>(null)
 const speakerTestRecording = ref(false)
 const speakerRecordingSeconds = ref(0)
+/** True while the server is recording; there is nothing for the browser to stop. */
+const speakerServerCapture = ref(false)
 type SpeakerCapture = {
   index: number
   label: string
@@ -598,6 +602,32 @@ const speakerHasProfile = computed(() => (
   || (speakerStatus.value.profile && (speakerStatus.value.profile as Record<string, unknown>).available === true)
 ))
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+const speakerNeedsReenrollment = computed(() => {
+  const profile = speakerProfile.value
+  if (!isRecord(profile)) return false
+  if (profile.stale === true || profile.needs_reenrollment === true) return true
+  const nested = speakerStatus.value.profile
+  return isRecord(nested) && (nested.stale === true || nested.needs_reenrollment === true)
+})
+
+const speakerStaleReason = computed(() => {
+  const profile = isRecord(speakerProfile.value) ? speakerProfile.value : {}
+  const nested = isRecord(speakerStatus.value.profile) ? speakerStatus.value.profile as Record<string, unknown> : {}
+  const reason = String(profile.stale_reason || nested.stale_reason || '')
+  const labels: Record<string, string> = {
+    feature_frontend_changed: '特征前端版本已更新；',
+    feature_numeric_mismatch: '特征数值指纹与注册时不一致；',
+    speaker_model_changed: '声纹模型已更换；',
+    profile_schema_upgraded: '声纹资料格式已升级；',
+    profile_missing_probe: '旧资料缺少特征指纹；',
+  }
+  return labels[reason] || ''
+})
+
 const speakerFilterAllowed = computed(() => {
   if (!speakerHasProfile.value || speakerStatus.value.model_present === false) return false
   const service = String(speakerStatus.value.service || '').toUpperCase()
@@ -627,9 +657,12 @@ function speakerStateLabel(value: unknown) {
 }
 
 function restoreSpeakerDefaults() {
-  speakerForm.confirm_threshold = 0.5
-  speakerForm.continuity_threshold = 0.4
-  setNotice('声纹阈值已恢复默认值，点击保存后应用。')
+  // Mirrors config/default.yaml.  Changing the feature frontend moved the raw
+  // cosine operating point, so these numbers are not comparable with any
+  // threshold calibrated before that change.
+  speakerForm.confirm_threshold = 0.6
+  speakerForm.continuity_threshold = 0.5
+  setNotice('声纹阈值已恢复默认值（0.60 / 0.50），点击保存后应用。')
 }
 
 function mergeFloat32(chunks: Float32Array[]) {
@@ -692,10 +725,15 @@ async function openSpeakerCapture(index: number, label: string, kind: SpeakerCap
     return
   }
   try {
+    // Fallback path only.  The primary enrollment/test flow records on the
+    // server so that it uses the same device and processing chain as a live
+    // turn.  If that path is unavailable, at least ask for a 16 kHz context so
+    // the browser resamples properly, and keep WebRTC AEC/NS/AGC off so the
+    // signal is not reshaped differently from the runtime chain.
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     })
-    const context = new AudioContext()
+    const context = new AudioContext({ sampleRate: 16000 })
     await context.resume()
     const source = context.createMediaStreamSource(stream)
     const processor = context.createScriptProcessor(4096, 1, 1)
@@ -727,11 +765,46 @@ async function openSpeakerCapture(index: number, label: string, kind: SpeakerCap
   }
 }
 
+/** Seconds of audio requested for one segment of each flow. */
+const SPEAKER_ENROLLMENT_SECONDS = 8
+const SPEAKER_TEST_SECONDS = 6
+
+/**
+ * Record through the server.  Returns false when no capture device is
+ * available so the caller can fall back to browser recording.
+ */
+async function captureOnServer(
+  kind: SpeakerCapture['kind'], index: number, label: string, seconds: number,
+) {
+  speakerRecordingSeconds.value = 0
+  speakerRecordingSegment.value = kind === 'enrollment' ? index : null
+  speakerTestRecording.value = kind === 'test'
+  speakerServerCapture.value = true
+  let done = false
+  const ticker = window.setInterval(() => {
+    if (!done) speakerRecordingSeconds.value += 1
+  }, 1000)
+  try {
+    const ok = kind === 'test'
+      ? await captureSpeakerTest(seconds)
+      : await captureSpeakerEnrollmentSegment(index, label, seconds)
+    return ok
+  } finally {
+    done = true
+    speakerServerCapture.value = false
+    window.clearInterval(ticker)
+    speakerRecordingSegment.value = null
+    speakerTestRecording.value = false
+    speakerRecordingSeconds.value = 0
+  }
+}
+
 async function beginSpeakerRecording(index: number, label: string) {
   if (speakerRecordingSegment.value !== null || speakerTestRecording.value) return
   if (!speakerEnrollment.value) await startSpeakerEnrollment()
   if (!speakerEnrollment.value) return
-  await openSpeakerCapture(index, label, 'enrollment')
+  const started = await captureOnServer('enrollment', index, label, SPEAKER_ENROLLMENT_SECONDS)
+  if (!started) await openSpeakerCapture(index, label, 'enrollment')
 }
 
 async function beginSpeakerTest() {
@@ -739,7 +812,13 @@ async function beginSpeakerTest() {
     adapter.setError(new Error('请先完成声纹注册，再进行现场测试。'))
     return
   }
-  await openSpeakerCapture(-1, '现场测试', 'test')
+  const started = await captureOnServer('test', -1, '现场测试', SPEAKER_TEST_SECONDS)
+  if (!started) await openSpeakerCapture(-1, '现场测试', 'test')
+}
+
+function speakerPrompt(index: number) {
+  const prompts = speakerEnrollment.value?.prompts || []
+  return prompts[index] || ''
 }
 
 function speakerSegmentLabel(index: number, fallback: string) {
@@ -940,8 +1019,9 @@ function pageLabel() {
 
         <article class="settings-panel panel">
           <template v-if="activeSettingsTab === 'wake'">
-            <header><p class="panel-kicker">KWS 唤醒词</p><h2>让助手在需要时醒来</h2><p>唤醒词由后端现有 sherpa text2token 流程生成并原子校验；支持中文和英文词条。生成失败会保留旧词条和旧设置，不打断当前回合。</p></header>
-            <div class="settings-stack"><label class="switch-row"><div><strong>启用 KWS</strong><span>开启后本次语音会话持续监听唤醒词；关闭后直接进入语音识别</span></div><input v-model="wakeForm.enabled" type="checkbox"><i></i></label><label class="form-field"><span>唤醒词</span><input v-model="wakeForm.keyword" type="text" autocomplete="off"><small>支持中文、英文和常见标点；后端会自动生成并验证标签。</small></label><label class="form-field"><span>识别灵敏度 <b>{{ wakeForm.sensitivity }}%</b></span><input v-model.number="wakeForm.sensitivity" type="range" min="1" max="99"><div class="range-label"><small>更严格 · 少误触发</small><small>更容易唤醒</small></div><small>灵敏度越高越容易唤醒；建议先使用 60–80%。</small></label></div>
+            <header><p class="panel-kicker">KWS 唤醒词</p><h2>让助手在需要时醒来</h2><p>唤醒词由后端现有 sherpa text2token 流程生成并原子校验；支持中文和英文词条。可以给同一个唤醒词配置多个说法（最多 5 个），命中任意一个都算唤醒。生成失败会保留旧词条和旧设置，不打断当前回合。</p></header>
+            <div class="settings-stack"><label class="switch-row"><div><strong>启用 KWS</strong><span>开启后本次语音会话持续监听唤醒词；关闭后直接进入语音识别</span></div><input v-model="wakeForm.enabled" type="checkbox"><i></i></label><div class="form-field"><span>唤醒词 <b>{{ wakeForm.keywords.length }} / {{ maxWakeKeywords }}</b></span><div v-for="(item, index) in wakeForm.keywords" :key="`wake-keyword-${index}`" class="wake-keyword-row"><input v-model="wakeForm.keywords[index]" type="text" autocomplete="off" :placeholder="index === 0 ? '例如：七三' : '例如：你好七三'"><button type="button" class="wake-keyword-remove" :disabled="wakeForm.keywords.length <= 1" :aria-label="`删除第 ${index + 1} 个唤醒词`" @click="removeWakeKeyword(index)">×</button></div><button type="button" class="wake-keyword-add" :disabled="wakeForm.keywords.length >= maxWakeKeywords" @click="addWakeKeyword">+ 添加唤醒词</button><div class="range-label"><small>命中任意一个即唤醒</small><small>最多 {{ maxWakeKeywords }} 个说法</small></div><small>建议把称呼说得长一点（如"你好七三""七三同学"），短词在噪声里更容易漏检；支持中文、英文和常见标点，后端会自动生成并验证每个标签。</small></div>
+            <label class="form-field"><span>识别灵敏度 <b>{{ wakeForm.sensitivity }}%</b></span><input v-model.number="wakeForm.sensitivity" type="range" min="1" max="99"><div class="range-label"><small>更严格 · 少误触发</small><small>更容易唤醒</small></div><small>灵敏度越高越容易唤醒；实测 75% 以上已是最宽松，低于 50% 基本无法唤醒，建议保持最高。</small></label></div>
             <footer><button class="save-button" type="button" :disabled="saving" @click="saveWake">{{ saving ? '正在保存…' : '保存 KWS 设置' }}</button></footer>
           </template>
 
@@ -967,13 +1047,15 @@ function pageLabel() {
               <div class="speaker-status-detail"><span>{{ speakerHasProfile ? '已注册主人声纹' : '尚未注册声纹' }}</span><span v-if="speakerStatus.worker_connected === true">Worker 已连接</span><span v-else>Worker 未连接</span></div>
             </section>
 
+            <div v-if="speakerNeedsReenrollment" class="info-callout"><span>!</span><p><strong>需要重新注册声纹。</strong>{{ speakerStaleReason }} 特征管线更换后，旧模板与新的分数不再处于同一坐标，系统已停止用它们判定身份（不确定状态一律放行）。请重新录制三段。</p></div>
+
             <div class="speaker-settings-grid">
               <label class="form-field"><span>运行模式</span><select v-model="speakerForm.mode"><option value="off">关闭</option><option value="observe">测试（只记录，不拦截）</option><option value="filter" :disabled="!speakerFilterAllowed">筛选（只拦截明确非本人）</option></select><small v-if="!speakerFilterAllowed">完成声纹注册且 Worker 就绪后才能选择筛选；不确定状态始终放行。</small><small v-else>首次建议使用测试模式，确认样本表现后再手动切换筛选。</small></label>
-              <details class="speaker-advanced"><summary>高级设置 · 阈值基线</summary><div class="speaker-thresholds"><label class="form-field"><span>普通确认阈值 <b>{{ Number(speakerForm.confirm_threshold).toFixed(2) }}</b></span><input v-model.number="speakerForm.confirm_threshold" type="range" min="0.01" max="1" step="0.01"><small>达到此分数并具备连续证据才确认是本人。</small></label><label class="form-field"><span>连续保持阈值 <b>{{ Number(speakerForm.continuity_threshold).toFixed(2) }}</b></span><input v-model.number="speakerForm.continuity_threshold" type="range" min="0" max="0.99" step="0.01"><small>已确认对话中的宽松保持阈值；必须低于普通确认阈值。</small></label><button class="ghost-action" type="button" @click="restoreSpeakerDefaults">恢复默认阈值（0.50 / 0.40）</button></div></details>
+              <details class="speaker-advanced"><summary>高级设置 · 阈值基线</summary><div class="speaker-thresholds"><label class="form-field"><span>普通确认阈值 <b>{{ Number(speakerForm.confirm_threshold).toFixed(2) }}</b></span><input v-model.number="speakerForm.confirm_threshold" type="range" min="0.01" max="1" step="0.01"><small>达到此分数并具备连续证据才确认是本人。</small></label><label class="form-field"><span>连续保持阈值 <b>{{ Number(speakerForm.continuity_threshold).toFixed(2) }}</b></span><input v-model.number="speakerForm.continuity_threshold" type="range" min="0" max="0.99" step="0.01"><small>已确认对话中的宽松保持阈值；必须低于普通确认阈值。</small></label><button class="ghost-action" type="button" @click="restoreSpeakerDefaults">恢复默认阈值（0.60 / 0.50）</button></div></details>
             </div>
             <div class="info-callout"><span>!</span><p>阈值只是当前测试基线，不代表安全等级。阈值越宽松越容易连续对话，也越可能误认；第一版不提供防伪和变声检测（anti-spoofing：不可用）。</p></div>
 
-            <section class="speaker-enrollment-card"><div class="speaker-card-heading"><div><p class="section-label">VOICE PROFILE</p><h3>主人声纹模板</h3><p>固定一个逻辑用户，可保存多组带标签模板。原始注册录音在提取成功后立即删除；夹嗓子等特殊说法可以用自定义标签单独测试，但不能当作防伪保证。</p></div><div><button v-if="!speakerEnrollment && !speakerTestRecording" class="outline-button" type="button" @click="startSpeakerEnrollment">开始录制</button><button v-if="!speakerEnrollment && !speakerTestRecording" class="ghost-action" type="button" :disabled="!speakerHasProfile" @click="beginSpeakerTest">现场测试</button><button v-if="speakerTestRecording" class="save-button compact-save" type="button" @click="stopSpeakerRecording">停止测试（{{ speakerRecordingSeconds }} 秒）</button></div></div><div v-if="speakerTestResult" class="speaker-test-result"><strong>{{ speakerStateLabel(speakerTestResult.state) }}</strong><span v-if="typeof speakerTestResult.similarity === 'number'">相似度 {{ Number(speakerTestResult.similarity).toFixed(2) }}</span><small>本次测试不会改变运行模式。</small></div><div v-if="speakerEnrollment" class="speaker-recording-flow"><p>请依次录制三段，每段 5–10 秒；可以重录同一段。</p><div class="speaker-segment-list"><div v-for="(segment, index) in ['正常朗读', '自然说话', '自定义标签']" :key="segment" class="speaker-segment-row"><span class="speaker-segment-index">0{{ index + 1 }}</span><div><strong>{{ segment }}</strong><small>{{ speakerEnrollment.segments.includes(index) ? '已接收' : '尚未录制' }}</small></div><input v-if="index === 2" :id="`speaker-label-${index}`" type="text" value="自定义" aria-label="自定义模板标签"><button v-if="speakerRecordingSegment === index" class="save-button compact-save" type="button" @click="stopSpeakerRecording">停止录音（{{ speakerRecordingSeconds }} 秒）</button><button v-else class="outline-button" type="button" :disabled="speakerRecordingSegment !== null" @click="beginSpeakerRecording(index, speakerSegmentLabel(index, segment))">{{ speakerEnrollment.segments.includes(index) ? '重新录制' : '开始录制' }}</button></div></div><footer class="speaker-flow-footer"><span>{{ speakerEnrollment.segments.length }}/3 段已完成</span><div><button class="ghost-action" type="button" @click="cancelSpeakerEnrollment">取消本次录制</button><button class="save-button" type="button" :disabled="!speakerEnrollmentComplete || saving" @click="commitSpeakerEnrollment">提交声纹资料</button></div></footer></div><div v-else-if="speakerTemplates.length" class="speaker-template-list"><article v-for="template in speakerTemplates" :key="String(template.template_id)"><div><strong>{{ String(template.label || '自定义') }}</strong><small>{{ String(template.template_id).slice(0, 8) }} · {{ String(template.created_at || '').replace('T', ' ').slice(0, 16) }}</small></div><span>{{ template.include_in_centroid === false ? '未纳入主中心' : '已纳入主中心' }}</span><button class="ghost-action" type="button" @click="setSpeakerTemplateCentroid(String(template.template_id), template.include_in_centroid === false)">{{ template.include_in_centroid === false ? '纳入主中心' : '移出主中心' }}</button><button class="danger-action" type="button" @click="deleteSpeakerTemplate(String(template.template_id))">删除</button></article></div><div v-else class="pool-empty">还没有模板，请点击“开始录制”。</div></section>
+            <section class="speaker-enrollment-card"><div class="speaker-card-heading"><div><p class="section-label">VOICE PROFILE</p><h3>主人声纹模板</h3><p>固定一个逻辑用户，可保存多组带标签模板。原始注册录音在提取成功后立即删除；夹嗓子等特殊说法可以用自定义标签单独测试，但不能当作防伪保证。</p></div><div><button v-if="!speakerEnrollment && !speakerTestRecording" class="outline-button" type="button" @click="startSpeakerEnrollment">开始录制</button><button v-if="!speakerEnrollment && !speakerTestRecording" class="ghost-action" type="button" :disabled="!speakerHasProfile" @click="beginSpeakerTest">现场测试</button><button v-if="speakerTestRecording && speakerServerCapture" class="save-button compact-save" type="button" disabled>正在录制（{{ speakerRecordingSeconds }} 秒）</button><button v-else-if="speakerTestRecording" class="save-button compact-save" type="button" @click="stopSpeakerRecording">停止测试（{{ speakerRecordingSeconds }} 秒）</button></div></div><div v-if="speakerTestResult" class="speaker-test-result"><strong>{{ speakerStateLabel(speakerTestResult.state) }}</strong><span v-if="typeof speakerTestResult.similarity === 'number'">相似度 {{ Number(speakerTestResult.similarity).toFixed(2) }}</span><span v-if="typeof speakerTestResult.threshold_used === 'number'">判定阈值 {{ Number(speakerTestResult.threshold_used).toFixed(2) }}</span><small>与运行时同一口径（2 秒滑窗 + 整段聚合），本次测试不会改变运行模式。</small></div><div v-if="speakerEnrollment" class="speaker-recording-flow"><p>请依次朗读下方三段<strong>不同</strong>的句子，每段 5–10 秒，用平时对助手说话的速度与音量；三段之间保持同一设备与距离。不要反复念同一句，也不要用拖长音的持续元音。</p><p v-if="speakerEnrollment.guidance" class="speaker-guidance">{{ speakerEnrollment.guidance }}</p><div class="speaker-segment-list"><div v-for="(segment, index) in ['第 1 段', '第 2 段', '第 3 段']" :key="segment" class="speaker-segment-row"><span class="speaker-segment-index">0{{ index + 1 }}</span><div><strong>{{ segment }}</strong><small v-if="speakerPrompt(index)" class="speaker-prompt">「{{ speakerPrompt(index) }}」</small><small>{{ speakerEnrollment.segments.includes(index) ? '已接收' : '尚未录制' }}</small></div><input v-if="index === 2" :id="`speaker-label-${index}`" type="text" value="自定义" aria-label="自定义模板标签"><button v-if="speakerRecordingSegment === index && speakerServerCapture" class="save-button compact-save" type="button" disabled>正在录制（{{ speakerRecordingSeconds }} 秒）</button><button v-else-if="speakerRecordingSegment === index" class="save-button compact-save" type="button" @click="stopSpeakerRecording">停止录音（{{ speakerRecordingSeconds }} 秒）</button><button v-else class="outline-button" type="button" :disabled="speakerRecordingSegment !== null" @click="beginSpeakerRecording(index, speakerSegmentLabel(index, segment))">{{ speakerEnrollment.segments.includes(index) ? '重新录制' : '开始录制' }}</button></div></div><footer class="speaker-flow-footer"><span>{{ speakerEnrollment.segments.length }}/3 段已完成</span><div><button class="ghost-action" type="button" @click="cancelSpeakerEnrollment">取消本次录制</button><button class="save-button" type="button" :disabled="!speakerEnrollmentComplete || saving" @click="commitSpeakerEnrollment">提交声纹资料</button></div></footer></div><div v-else-if="speakerTemplates.length" class="speaker-template-list"><article v-for="template in speakerTemplates" :key="String(template.template_id)"><div><strong>{{ String(template.label || '自定义') }}</strong><small>{{ String(template.template_id).slice(0, 8) }} · {{ String(template.created_at || '').replace('T', ' ').slice(0, 16) }}</small></div><span>{{ template.include_in_centroid === false ? '未纳入主中心' : '已纳入主中心' }}</span><button class="ghost-action" type="button" @click="setSpeakerTemplateCentroid(String(template.template_id), template.include_in_centroid === false)">{{ template.include_in_centroid === false ? '纳入主中心' : '移出主中心' }}</button><button class="danger-action" type="button" @click="deleteSpeakerTemplate(String(template.template_id))">删除</button></article></div><div v-else class="pool-empty">还没有模板，请点击“开始录制”。</div></section>
 
             <section class="speaker-ambient-card"><div class="speaker-card-heading"><div><p class="section-label">AMBIENT CONTEXT</p><h3>当前会话环境记录</h3><p>筛选模式拦截的非本人文本只保存在内存中，不跨会话、不保存音频，也不会自动进入主 Agent。</p></div><div><button class="ghost-action" type="button" @click="refreshAmbientContext">刷新</button><button class="danger-action" type="button" :disabled="!ambientRecords.length" @click="clearAmbientContext">全部清空</button></div></div><div v-if="ambientRecords.length" class="ambient-record-list"><article v-for="record in ambientRecords" :key="String(record.turn_id) + String(record.timestamp)"><time>{{ formatTime(String(record.timestamp || '')) }}</time><p>{{ String(record.text || '') }}</p><small>{{ speakerStateLabel(record.speaker_state) }} · {{ String(record.reason || '路由到环境记录') }}</small></article></div><div v-else class="pool-empty">当前会话还没有被拦截的环境文本。</div></section>
 

@@ -31,8 +31,11 @@ export interface ProductSettingsSnapshot {
   schema_version: number
   wake: {
     enabled: boolean
+    /** Primary phrase; mirrors `keywords[0]` for older consumers. */
     keyword: string
     keyword_label?: string
+    /** Every accepted spelling of the wake word (1–5 entries). */
+    keywords: string[]
     sensitivity: number
   }
   silence: {

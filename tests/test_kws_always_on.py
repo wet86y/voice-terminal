@@ -33,6 +33,39 @@ class _ForbiddenVad:
         raise AssertionError("VAD must not run while KWS owns input")
 
 
+def test_wake_phrases_and_detector_knobs_come_from_config(tmp_path):
+    """The measured operating point and the multi-phrase list are config-owned."""
+
+    default_path = Path(__file__).parents[1] / "config" / "default.yaml"
+    config = load_config(default_path)
+    assert config.wake.keywords_score == 1.5
+    assert config.wake.num_trailing_blanks == 3
+    assert config.wake.max_active_paths == 8
+    assert config.wake.keywords == ("hei claw",)
+    assert config.wake.keyword_labels == ("HEI_CLAW",)
+
+    override = tmp_path / "local.yaml"
+    override.write_text(
+        "wake:\n"
+        "  keywords: [\"七三\", \"你好七三\", \"七三同学\"]\n"
+        "  max_active_paths: 12\n",
+        encoding="utf-8",
+    )
+    multi = load_config(default_path, override)
+    assert multi.wake.keywords == ("七三", "你好七三", "七三同学")
+    assert multi.wake.keyword == "七三"
+    assert multi.wake.keyword_label == "七三"
+    assert multi.wake.keyword_labels == ("七三", "你好七三", "七三同学")
+    assert multi.wake.max_active_paths == 12
+
+    # A file that only carries the legacy single keyword still yields one phrase.
+    legacy = tmp_path / "legacy.yaml"
+    legacy.write_text("wake:\n  keyword: \"hei claw\"\n  keyword_label: \"HEI_CLAW\"\n", encoding="utf-8")
+    single = load_config(default_path, legacy)
+    assert single.wake.keywords == ("hei claw",)
+    assert single.wake.keyword_label == "HEI_CLAW"
+
+
 def test_enabling_wake_always_enters_standby(monkeypatch):
     default_path = Path(__file__).parents[1] / "config" / "default.yaml"
     # load_config intentionally loads .env.local, so make the two cases

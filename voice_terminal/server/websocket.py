@@ -37,7 +37,23 @@ from ..session.ledger import SessionLedger
 from ..session.runtime import ConversationRuntime
 from ..session.ambient import AmbientTranscriptStore
 from ..speaker.client import SpeakerWorkerClient, SpeakerWorkerError
-from ..speaker.registry import SpeakerProfileStore
+from ..speaker.contracts import SpeakerObservation
+from ..speaker.enrollment import (
+    ENROLLMENT_REQUIRED_SEGMENTS,
+    EnrollmentRejectedError,
+    centroid_of,
+    check_segments,
+    enrollment_prompts,
+)
+from ..speaker.enrollment_capture import (
+    MAX_SEGMENT_SECONDS,
+    MIN_SEGMENT_SECONDS,
+    EnrollmentCaptureError,
+    capture_segment,
+    speech_ms_for_pcm,
+)
+from ..speaker.features import FRONTEND_VERSION
+from ..speaker.registry import ENROLLMENT_MAX_CLIPPED_RATIO, SpeakerProfileStore
 from ..speaker.router import SpeakerRouter
 from ..speaker.engine import SpeakerModelError, WeSpeakerOnnxEngine
 from ..speaker.recording import decode_audio_bytes
@@ -115,6 +131,7 @@ class SessionRuntime:
             confirm_threshold=config.speaker.confirm_threshold,
             continuity_threshold=config.speaker.continuity_threshold,
             min_speech_ms=config.speaker.min_speech_ms,
+            min_turn_speech_ms=config.speaker.min_turn_speech_ms,
         )
         self.speaker: SpeakerWorkerClient | None = None
         self._speaker_engine: WeSpeakerOnnxEngine | None = None
@@ -150,6 +167,7 @@ class SessionRuntime:
             await client.health(timeout_s=1.5)
             self.speaker = client
             self.state.set_service("speaker", "READY")
+            await self._sync_speaker_fingerprint(client)
         except Exception as exc:
             if client is not None:
                 try:
@@ -160,6 +178,31 @@ class SessionRuntime:
             self.state.set_service("speaker", "DEGRADED")
             self.startup_errors.append(f"speaker: {type(exc).__name__}: {str(exc)[:240]}")
             logger.warning("optional speaker sidecar unavailable: %s", exc)
+
+    async def _sync_speaker_fingerprint(self, client: SpeakerWorkerClient) -> None:
+        """Verify that stored templates belong to the running frontend.
+
+        The sidecar already holds the ONNX session, so ask it for the probe
+        embedding instead of loading a second session here.  A mismatch marks
+        the profile stale, which makes ``available`` false and keeps every
+        route fail-open — far safer than silently scoring templates in a
+        different coordinate system.
+        """
+        try:
+            response = await client.fingerprint(timeout_s=5.0)
+        except Exception as exc:
+            logger.info("speaker.fingerprint_unavailable error=%s", str(exc)[:200])
+            return
+        probe = response.get("probe")
+        self.speaker_profile.set_runtime_fingerprint(
+            {
+                "frontend_version": str(response.get("frontend_version") or ""),
+                "model_id": str(self.config.speaker.model_id),
+            },
+            probe if isinstance(probe, list) else None,
+        )
+        if self.speaker_profile.stale:
+            logger.warning("speaker.profile_stale reason=%s", self.speaker_profile.stale_reason)
 
     async def ensure_speaker_worker(self) -> bool:
         """Start the sidecar on demand before enabling strict filtering."""
@@ -213,6 +256,59 @@ class SessionRuntime:
     def speaker_profile_snapshot(self) -> dict[str, Any]:
         return self.speaker_profile.snapshot()
 
+    def _speaker_speech_ms(self, pcm: bytes) -> tuple[int, bool]:
+        """Voiced duration measured by the same detector the live chain runs.
+
+        Returns ``(speech_ms, measured)``.  ``measured`` is false only when the
+        WebRTC VAD is unavailable, in which case a gain-dependent energy
+        estimate is used as a clearly-labelled fallback.
+        """
+        sample_rate = self.config.audio.sample_rate
+        processor = self.audio_processor
+        if processor is not None and getattr(processor, "available", False):
+            try:
+                processor.reset()
+                value, measured = speech_ms_for_pcm(pcm, sample_rate=sample_rate, processor=processor)
+                processor.reset()
+                if measured:
+                    return value, True
+            except Exception:
+                logger.debug("speaker.vad_measure_failed", exc_info=True)
+        try:
+            import numpy as np  # type: ignore
+            values = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+            if not values.size:
+                return 0, False
+            return int(np.count_nonzero(np.abs(values) >= 327.0) * 1000 / sample_rate), False
+        except Exception:
+            return 0, False
+
+    @staticmethod
+    def _segment_quality(pcm: bytes, speech_ms: int, *, source: str, measured: bool) -> dict[str, Any]:
+        import math
+        try:
+            import numpy as np  # type: ignore
+            values = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+            rms = float(np.sqrt(np.mean((values / 32768.0) ** 2))) if values.size else 0.0
+            clipped = float(np.mean(np.abs(values) >= 32760.0)) if values.size else 0.0
+        except Exception:
+            rms, clipped = 0.0, 0.0
+        return {
+            "source": source,
+            "duration_ms": int(len(pcm) // 2 * 1000 // 16000),
+            "speech_ms": int(speech_ms),
+            "speech_measured_by_vad": bool(measured),
+            "rms_dbfs": round(20.0 * math.log10(rms), 2) if rms > 1e-9 else -120.0,
+            "clipped_ratio": round(clipped, 4),
+        }
+
+    @staticmethod
+    def _prompt_label(index: int) -> str:
+        for item in enrollment_prompts():
+            if int(item.get("index", -1)) == int(index):
+                return str(item.get("label") or "自定义")
+        return "自定义"
+
     def start_speaker_enrollment(self) -> dict[str, Any]:
         enrollment_id = uuid4().hex
         while len(self._speaker_enrollment) >= 4:
@@ -227,9 +323,18 @@ class SessionRuntime:
         }
         return {
             "enrollment_id": enrollment_id,
-            "required_segments": 3,
-            "min_segment_ms": 5000,
-            "max_segment_ms": 10000,
+            "required_segments": ENROLLMENT_REQUIRED_SEGMENTS,
+            "min_segment_ms": int(MIN_SEGMENT_SECONDS * 1000),
+            "max_segment_ms": int(MAX_SEGMENT_SECONDS * 1000),
+            # Three *different* continuous sentences.  Same-text enrollment
+            # inflates same-text scores without modelling the speaker better,
+            # and the live path only ever sees spontaneous speech.
+            "prompts": enrollment_prompts(),
+            "capture_endpoint": f"/api/v1/speaker/enrollment/{enrollment_id}/capture",
+            "guidance": (
+                "请用日常说话的速度与音量，在注册时使用的同一设备、同一距离下连续朗读；"
+                "三段请朗读不同的句子，不要反复念同一句，也不要用拖长音的持续元音。"
+            ),
         }
 
     def cancel_speaker_enrollment(self, enrollment_id: str) -> bool:
@@ -263,24 +368,69 @@ class SessionRuntime:
         duration_ms = len(audio) // 2 * 1000 // self.config.audio.sample_rate
         if duration_ms < 5000 or duration_ms > 10000:
             raise ValueError("每段录音长度必须在 5 至 10 秒之间")
-        try:
-            import numpy as np  # type: ignore
-            values = np.frombuffer(audio, dtype="<i2").astype(np.float32)
-            rms = float(np.sqrt(np.mean((values / 32768.0) ** 2))) if values.size else 0.0
-            clipped = float(np.mean(np.abs(values) >= 32760.0)) if values.size else 0.0
-            effective_ms = int(np.count_nonzero(np.abs(values) >= 327.0) * 1000 / self.config.audio.sample_rate)
-            if rms < 0.003 or effective_ms < 500:
-                raise ValueError("录音音量过低或有效人声不足，请在安静环境中重录")
-            if clipped > 0.02:
-                raise ValueError("录音存在明显削波，请降低麦克风音量后重录")
-        except ImportError:
-            pass
+        speech_ms, measured = self._speaker_speech_ms(audio)
+        quality = self._segment_quality(audio, speech_ms, source="enrollment_upload",
+                                        measured=measured)
+        if quality["rms_dbfs"] < -50.0 or speech_ms < 1000:
+            raise ValueError("录音音量过低或有效人声不足，请在安静环境中重录")
+        if quality["clipped_ratio"] > ENROLLMENT_MAX_CLIPPED_RATIO:
+            raise ValueError("录音存在明显削波，请降低麦克风音量后重录")
         session["segments"][index] = {
-            "label": str(label or "自定义")[:80],
+            "label": str(label or self._prompt_label(index))[:80],
             "pcm": audio,
             "duration_ms": duration_ms,
+            "quality": quality,
         }
-        return {"index": index, "duration_ms": duration_ms, "received": len(session["segments"])}
+        return {"index": index, "duration_ms": duration_ms, "quality": quality,
+                "received": len(session["segments"])}
+
+    async def capture_speaker_enrollment_segment(self, enrollment_id: str, *, index: int,
+                                                 label: str, seconds: float) -> dict[str, Any]:
+        """Record one segment from the runtime input device.
+
+        Enrollment used to run through the browser, which selected a different
+        device and applied WebRTC AEC/NS/AGC on top of a hand-written resampler.
+        Recording here instead means the enrolled templates and the live audio
+        travel the same chain.
+        """
+        session = self._speaker_enrollment.get(enrollment_id)
+        if session is None:
+            raise ValueError("录音会话不存在或已过期")
+        if isinstance(index, bool) or not isinstance(index, int) or index not in {0, 1, 2}:
+            raise ValueError("录音段编号必须是 0、1 或 2")
+        controller = self.controller
+        if controller is not None and getattr(controller, "workspace", None) is not None:
+            raise EnrollmentCaptureError(
+                "语音会话正在进行，请先停止监听再录制声纹。",
+                code="SPEAKER_INPUT_BUSY",
+            )
+        captured = await asyncio.to_thread(
+            capture_segment,
+            sample_rate=self.config.audio.sample_rate,
+            channels=self.config.audio.channels,
+            input_device=self.config.audio.input_device,
+            seconds=seconds,
+            processor=self.audio_processor,
+        )
+        speech_ms = captured.speech_ms
+        measured = speech_ms > 0
+        if not measured:
+            speech_ms, measured = self._speaker_speech_ms(captured.pcm)
+        if captured.rms_dbfs < -50.0:
+            raise ValueError("录音音量过低，请靠近麦克风或在安静环境中重录")
+        if captured.clipped_ratio > ENROLLMENT_MAX_CLIPPED_RATIO:
+            raise ValueError("录音存在明显削波，请降低麦克风音量后重录")
+        quality = self._segment_quality(captured.pcm, speech_ms, source="enrollment_capture",
+                                        measured=measured)
+        quality["processor_applied"] = bool(captured.processed)
+        session["segments"][index] = {
+            "label": str(label or self._prompt_label(index))[:80],
+            "pcm": captured.pcm,
+            "duration_ms": captured.duration_ms,
+            "quality": quality,
+        }
+        return {"index": index, "duration_ms": captured.duration_ms, "quality": quality,
+                "received": len(session["segments"])}
 
     def _get_speaker_engine(self) -> WeSpeakerOnnxEngine:
         engine = self._speaker_engine
@@ -303,31 +453,98 @@ class SessionRuntime:
         engine = await asyncio.to_thread(self._get_speaker_engine)
         return await asyncio.to_thread(engine.embed_pcm, pcm)
 
+    def _speaker_runtime_fingerprint(self) -> dict[str, Any]:
+        probe = self._speaker_runtime_probe()
+        return {
+            "frontend_version": FRONTEND_VERSION,
+            "model_id": str(self.config.speaker.model_id),
+            "embedding_dim": len(probe) if probe else 0,
+        }
+
+    def _speaker_runtime_probe(self) -> tuple[float, ...] | None:
+        engine = self._speaker_engine
+        if engine is None or not engine.loaded:
+            return None
+        try:
+            return engine.probe_embedding()
+        except Exception:
+            logger.debug("speaker.probe_failed", exc_info=True)
+            return None
+
+    async def _speaker_fingerprint(self) -> tuple[dict[str, Any], tuple[float, ...] | None]:
+        """Fingerprint to store alongside a new enrollment.
+
+        Prefer the sidecar (it already holds the session) so enrollment does
+        not force a second ONNX load; fall back to the local engine that
+        produced the embeddings.
+        """
+        client = self.speaker
+        if client is not None and client.connected:
+            try:
+                response = await client.fingerprint(timeout_s=5.0)
+                probe = response.get("probe")
+                if isinstance(probe, list) and probe:
+                    values = tuple(float(x) for x in probe)
+                    return ({
+                        "frontend_version": str(response.get("frontend_version") or ""),
+                        "model_id": str(self.config.speaker.model_id),
+                        "embedding_dim": len(values),
+                    }, values)
+            except Exception:
+                logger.info("speaker.fingerprint_unavailable", exc_info=True)
+        if self._speaker_engine is None or not self._speaker_engine.loaded:
+            await asyncio.to_thread(self._get_speaker_engine)
+        return self._speaker_runtime_fingerprint(), self._speaker_runtime_probe()
+
     async def commit_speaker_enrollment(self, enrollment_id: str) -> dict[str, Any]:
         session = self._speaker_enrollment.pop(enrollment_id, None)
         if session is None:
             raise ValueError("录音会话不存在或已过期")
         segments = session.get("segments") if isinstance(session, dict) else {}
-        if not isinstance(segments, dict) or len(segments) != 3:
+        if not isinstance(segments, dict) or len(segments) != ENROLLMENT_REQUIRED_SEGMENTS:
             if isinstance(segments, dict):
                 segments.clear()
             raise ValueError("请完成三段引导录音")
         try:
             samples: list[tuple[str, Any, Mapping[str, Any]]] = []
-            for index in range(3):
+            quality: list[dict[str, Any]] = []
+            embeddings: list[tuple[float, ...]] = []
+            for index in range(ENROLLMENT_REQUIRED_SEGMENTS):
                 item = segments.get(index)
                 if not isinstance(item, dict):
                     raise ValueError("录音段不完整")
                 pcm = item.get("pcm")
                 embedding = await self._embed_speaker_audio(pcm)
-                samples.append((str(item.get("label") or "自定义"), embedding, {
-                    "duration_ms": int(item.get("duration_ms") or 0),
-                    "source": "enrollment",
-                }))
-            result = await asyncio.to_thread(self.speaker_profile.replace_templates, samples)
+                embeddings.append(embedding)
+                quality.append(dict(item.get("quality") or {}))
+                samples.append((str(item.get("label") or self._prompt_label(index)), embedding, quality[-1]))
+            # Refuse an enrollment whose own segments disagree about the
+            # speaker.  Storing a template that already fails this check is
+            # how a profile ends up silently useless.
+            detail = check_segments(quality, embeddings)
+            for index, item in enumerate(quality):
+                item["cosine_to_centroid"] = round(
+                    WeSpeakerOnnxEngine.similarity(embeddings[index], centroid_of(embeddings)), 4
+                )
+            fingerprint, probe = await self._speaker_fingerprint()
+            result = await asyncio.to_thread(
+                self.speaker_profile.replace_templates,
+                samples,
+                fingerprint=fingerprint,
+                probe=probe,
+            )
             if self.speaker_router is not None:
                 self.speaker_router.profile.load()
-            return result
+            merged = dict(result)
+            merged["enrollment"] = {
+                "min_similarity": detail.get("min_similarity"),
+                "min_pair": detail.get("min_pair"),
+                "pairwise": detail.get("pairwise"),
+                "segments": quality,
+            }
+            return merged
+        except EnrollmentRejectedError:
+            raise
         finally:
             # Drop all raw PCM references as soon as extraction completes or fails.
             segments.clear() if isinstance(segments, dict) else None
@@ -342,20 +559,107 @@ class SessionRuntime:
         except Exception as exc:
             raise ValueError(f"录音数据无效：{type(exc).__name__}") from exc
         duration_ms = len(audio) // 2 * 1000 // self.config.audio.sample_rate
-        if duration_ms < 500 or duration_ms > 10000:
-            raise ValueError("现场测试录音长度必须在 0.5 至 10 秒之间")
-        embedding = await self._embed_speaker_audio(audio)
-        scored = []
-        for template_id, vector in self.speaker_profile.vectors(include_centroid=True):
-            scored.append({"template_id": template_id, "similarity": WeSpeakerOnnxEngine.similarity(embedding, vector)})
-        best = max(scored, key=lambda item: item["similarity"]) if scored else None
-        result = {
-            "state": "owner_confirmed" if best and best["similarity"] >= self.config.speaker.confirm_threshold else "unknown",
-            "similarity": best["similarity"] if best else None,
-            "matched_template_id": best["template_id"] if best else None,
-            "scores": scored,
+        if duration_ms < 500 or duration_ms > 20000:
+            raise ValueError("现场测试录音长度必须在 0.5 至 20 秒之间")
+        speech_ms, _measured = self._speaker_speech_ms(audio)
+        scored = await asyncio.to_thread(self._score_speaker_audio, audio, speech_ms)
+        self._speaker_test_result = dict(scored)
+        return scored
+
+    def _score_speaker_audio(self, pcm: bytes, speech_ms: int) -> dict[str, Any]:
+        """Aggregate-slide a test clip exactly like the live turn pipeline.
+
+        The previous implementation reported ``max`` over the centroid and
+        every labelled template, which is a different (and systematically more
+        optimistic) formula than the runtime uses.  A settings-page number that
+        cannot be compared with the live decision is worse than no number.
+        """
+        from ..speaker.state import SpeakerStateMachine
+
+        sample_rate = self.config.audio.sample_rate
+        window = max(1, self.config.speaker.window_ms * sample_rate // 1000)
+        step = max(1, self.config.speaker.step_ms * sample_rate // 1000)
+        total_samples = len(pcm) // 2
+        sampled = [
+            pcm[start * 2:(start + window) * 2]
+            for start in range(0, max(0, total_samples - window) + 1, step)
+        ]
+        if not sampled and total_samples:
+            sampled = [pcm]
+        engine = self._get_speaker_engine()
+        embeddings: list[tuple[float, ...]] = []
+        for chunk in sampled:
+            try:
+                embeddings.append(tuple(float(x) for x in engine.embed_pcm(chunk)))
+            except Exception:
+                continue
+        if not embeddings:
+            return {
+                "state": "unknown",
+                "similarity": None,
+                "threshold_used": None,
+                "speech_ms": int(speech_ms),
+                "measured_speech_ms": int(speech_ms),
+                "window_count": 0,
+                "frontend_version": FRONTEND_VERSION,
+                "reason": "speaker_test_no_usable_window",
+                "anti_spoofing": "unavailable",
+            }
+        machine = SpeakerStateMachine(config=self.speaker_router.state_config,
+                                     scorer=self.speaker_router.score_aggregate)
+        machine.reset(turn_id="speaker-test", generation=0)
+        per_window_speech = max(1, int(speech_ms // max(1, len(embeddings))))
+        for embedding in embeddings:
+            machine.observe(SpeakerObservation(
+                turn_id="speaker-test", generation=0,
+                window_started_sample=0, window_ended_sample=window,
+                similarity=self.speaker_router.score_embedding(embedding),
+                quality="ready", speech_ms=per_window_speech,
+                embedding=embedding,
+            ))
+        decision = machine.decision()
+        return {
+            "state": decision.state.value,
+            "similarity": decision.similarity,
+            "threshold_used": decision.threshold_used,
+            "speech_ms": decision.speech_ms,
+            "measured_speech_ms": int(speech_ms),
+            "window_count": decision.aggregated_windows,
+            "frontend_version": FRONTEND_VERSION,
             "anti_spoofing": "unavailable",
         }
+
+    async def capture_speaker_test(self, *, seconds: float) -> dict[str, Any]:
+        """Record and score a live test clip through the runtime chain.
+
+        Using the same device and processing as a real turn is what makes the
+        reported score comparable with the routing decision; a browser
+        recording would answer a different question.
+        """
+        if not self.speaker_profile.available:
+            raise ValueError("尚未注册声纹")
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+            raise ValueError("录制时长必须是数字")
+        controller = self.controller
+        if controller is not None and getattr(controller, "workspace", None) is not None:
+            raise EnrollmentCaptureError(
+                "语音会话正在进行，请先停止监听再做现场测试。",
+                code="SPEAKER_INPUT_BUSY",
+            )
+        captured = await asyncio.to_thread(
+            capture_segment,
+            sample_rate=self.config.audio.sample_rate,
+            channels=self.config.audio.channels,
+            input_device=self.config.audio.input_device,
+            seconds=seconds,
+            processor=self.audio_processor,
+        )
+        speech_ms = captured.speech_ms
+        if speech_ms <= 0:
+            speech_ms, _measured = self._speaker_speech_ms(captured.pcm)
+        result = await asyncio.to_thread(self._score_speaker_audio, captured.pcm, speech_ms)
+        result["duration_ms"] = captured.duration_ms
+        result["rms_dbfs"] = captured.rms_dbfs
         self._speaker_test_result = dict(result)
         return result
 
@@ -363,10 +667,11 @@ class SessionRuntime:
         detector = KwsDetector(
             model_dir=self.config.kws_dir,
             keywords_file=self.config.kws_keywords_file,
-            keyword_label=self.config.wake.keyword_label,
+            keyword_label=self.config.wake.keyword_labels,
             threshold=self.config.wake.threshold,
             keywords_score=self.config.wake.keywords_score,
             num_trailing_blanks=self.config.wake.num_trailing_blanks,
+            max_active_paths=self.config.wake.max_active_paths,
             provider=self.config.wake.device,
             sample_rate=self.config.audio.sample_rate,
         )
@@ -632,6 +937,7 @@ class SessionRuntime:
             wake_enabled=self.config.wake.enabled,
             wake_always_on=self.config.wake.enabled,
             wake_keyword=self.config.wake.keyword,
+            wake_keywords=self.config.wake.keywords,
             wake_preroll_ms=self.config.audio.wake_preroll_ms,
             vad_min_speech_ms=self.config.vad.min_speech_ms,
             vad_end_silence_ms=self.config.vad.end_silence_ms,
@@ -772,6 +1078,7 @@ class SessionRuntime:
                 self.controller.wake_always_on = self.state.wake_always_on
                 self.controller.state.wake_always_on = self.state.wake_always_on
                 self.controller.wake_keyword = self.config.wake.keyword
+                self.controller.wake_keywords = self.config.wake.keywords
             if wake_changed:
                 if self.config.wake.enabled:
                     self.kws = self._build_kws_worker()
@@ -799,6 +1106,7 @@ class SessionRuntime:
                 self.controller.wake_always_on = self.state.wake_always_on
                 self.controller.state.wake_always_on = self.state.wake_always_on
                 self.controller.wake_keyword = previous_config.wake.keyword
+                self.controller.wake_keywords = previous_config.wake.keywords
             if wake_changed:
                 try:
                     if previous_config.wake.enabled:
@@ -1214,8 +1522,8 @@ class SessionRuntime:
     async def set_speaker_settings(self, settings: Mapping[str, Any]) -> dict[str, Any]:
         """Apply optional speaker mode/thresholds without restarting audio."""
         mode = str(settings.get("mode") or "off")
-        confirm = float(settings.get("confirm_threshold", 0.50))
-        continuity = float(settings.get("continuity_threshold", 0.40))
+        confirm = float(settings.get("confirm_threshold", self.config.speaker.confirm_threshold))
+        continuity = float(settings.get("continuity_threshold", self.config.speaker.continuity_threshold))
         next_speaker = replace(
             self.config.speaker,
             mode=mode,
@@ -1316,6 +1624,7 @@ class SessionRuntime:
             "wake_always_on": self.state.wake_always_on,
             "input_owner": self.state.input_owner,
             "wake_keyword": self.config.wake.keyword,
+            "wake_keywords": list(self.config.wake.keywords),
             "runtime": dict(self.build_info),
             "kws": self.kws.diagnostics if self.kws is not None else {
                 "running": False,
@@ -1400,6 +1709,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "enabled": runtime.config.wake.enabled,
                 "keyword": runtime.config.wake.keyword,
                 "keyword_label": runtime.config.wake.keyword_label,
+                "keywords": list(runtime.config.wake.keywords),
                 "sensitivity": _threshold_to_sensitivity(runtime.config.wake.threshold),
             },
             "silence": {
@@ -1532,7 +1842,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         try:
             store = product_store_or_404()
             previous_speaker = store.settings_only().get("speaker", {
-                "mode": "off", "confirm_threshold": 0.50, "continuity_threshold": 0.40,
+                "mode": "off",
+                "confirm_threshold": runtime.config.speaker.confirm_threshold,
+                "continuity_threshold": runtime.config.speaker.continuity_threshold,
             })
             if body.get("mode") == "filter":
                 if not runtime.speaker_profile.available:
@@ -1588,10 +1900,37 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.post("/api/v1/speaker/enrollment/{enrollment_id}/capture")
+    async def capture_speaker_enrollment_segment(enrollment_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Record one enrollment segment from the runtime input device."""
+        try:
+            if set(body) != {"index", "label", "seconds"}:
+                raise ValueError("录制字段必须是 index、label、seconds")
+            seconds = body.get("seconds")
+            if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+                raise ValueError("录制时长必须是数字")
+            return await runtime.capture_speaker_enrollment_segment(
+                enrollment_id,
+                index=body.get("index"),
+                label=str(body.get("label") or ""),
+                seconds=float(seconds),
+            )
+        except EnrollmentCaptureError as exc:
+            raise HTTPException(status_code=422,
+                                detail={"code": exc.code, "message": str(exc)}) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post("/api/v1/speaker/enrollment/{enrollment_id}/commit")
     async def commit_speaker_enrollment(enrollment_id: str) -> dict[str, Any]:
         try:
             return await runtime.commit_speaker_enrollment(enrollment_id)
+        except EnrollmentRejectedError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "SPEAKER_ENROLLMENT_INCONSISTENT",
+                        "message": str(exc), **exc.detail},
+            ) from exc
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1661,6 +2000,19 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             if not isinstance(encoded, str):
                 raise ValueError("pcm_base64 必须是字符串")
             return await runtime.test_speaker_audio(encoded)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/speaker/test/capture")
+    async def capture_speaker_test(body: dict[str, Any]) -> dict[str, Any]:
+        """Record and score a live test clip through the runtime chain."""
+        try:
+            if set(body) != {"seconds"}:
+                raise ValueError("录制字段必须是 seconds")
+            return await runtime.capture_speaker_test(seconds=body.get("seconds"))
+        except EnrollmentCaptureError as exc:
+            raise HTTPException(status_code=422,
+                                detail={"code": exc.code, "message": str(exc)}) from exc
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

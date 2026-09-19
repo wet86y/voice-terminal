@@ -626,7 +626,7 @@ class EpisodeController(RealtimeController):
             return
         if self.wake_enabled:
             from ..kws.keywords import strip_wake_prefix
-            text = strip_wake_prefix(text, self.wake_keyword)
+            text = strip_wake_prefix(text, self.wake_keywords)
         ws.refined_text = text
         ws.refinement_available = True
         prior_refinement = next(

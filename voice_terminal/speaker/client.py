@@ -38,6 +38,7 @@ class SpeakerWorkerClient:
         self.pending_finish: dict[tuple[str, int], asyncio.Future[None]] = {}
         self.pending_health: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.pending_embed: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self.pending_fingerprint: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.dropped_frames = 0
         self.degraded = False
         self.last_error: str | None = None
@@ -101,6 +102,12 @@ class SpeakerWorkerClient:
                     if waiter is not None and not waiter.done():
                         waiter.set_result(message)
                     continue
+                if kind == "fingerprint":
+                    request_id = message.get("request_id")
+                    waiter = self.pending_fingerprint.get(request_id) if isinstance(request_id, str) else None
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(message)
+                    continue
                 if kind == "speaker.embedding":
                     embedding = message.get("embedding")
                     if not isinstance(embedding, list) or len(embedding) > 4096:
@@ -146,6 +153,19 @@ class SpeakerWorkerClient:
                         if matched_template_id is not None and not isinstance(matched_template_id, str):
                             self._mark_degraded("Speaker Worker 模板标识无效")
                             continue
+                        raw_ratio = message.get("speech_ratio")
+                        speech_ratio: float | None
+                        if raw_ratio is None:
+                            speech_ratio = None
+                        elif isinstance(raw_ratio, bool) or not isinstance(raw_ratio, (int, float)):
+                            self._mark_degraded("Speaker Worker 语音占比无效")
+                            continue
+                        else:
+                            speech_ratio = float(raw_ratio)
+                            if not math.isfinite(speech_ratio):
+                                self._mark_degraded("Speaker Worker 语音占比包含无效数值")
+                                continue
+                            speech_ratio = max(0.0, min(1.0, speech_ratio))
                         observation = SpeakerObservation(
                             turn_id=turn_id,
                             generation=generation,
@@ -158,6 +178,7 @@ class SpeakerWorkerClient:
                             model_version=str(message.get("model_version") or ""),
                             timestamp=str(message.get("timestamp") or ""),
                             embedding=values,
+                            speech_ratio=speech_ratio,
                         )
                     except (TypeError, ValueError, OverflowError):
                         self._mark_degraded("Speaker Worker embedding 解析失败")
@@ -205,6 +226,10 @@ class SpeakerWorkerClient:
                     if not waiter.done():
                         waiter.set_exception(error)
                 self.pending_embed.clear()
+                for waiter in self.pending_fingerprint.values():
+                    if not waiter.done():
+                        waiter.set_exception(error)
+                self.pending_fingerprint.clear()
 
     async def _send_loop(self) -> None:
         while True:
@@ -248,6 +273,35 @@ class SpeakerWorkerClient:
         finally:
             self.pending_health.pop(request_id, None)
 
+    async def fingerprint(self, timeout_s: float = 5.0) -> dict[str, Any]:
+        """Ask the sidecar for its frontend/model fingerprint.
+
+        The worker already holds the ONNX session, so Voice Server can verify
+        that stored templates match the running frontend without opening a
+        second session of its own.
+        """
+        if self.socket is None:
+            raise SpeakerWorkerError("Speaker Worker 尚未连接")
+        request_id = uuid.uuid4().hex
+        waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self.pending_fingerprint[request_id] = waiter
+        try:
+            await self._send_immediate({"type": "fingerprint", "request_id": request_id})
+            response = await asyncio.wait_for(waiter, timeout=max(0.05, float(timeout_s)))
+            if response.get("error"):
+                raise SpeakerWorkerError(str(response["error"]), code="SPEAKER_FINGERPRINT_FAILED")
+            probe = response.get("probe")
+            if not isinstance(probe, list) or not probe:
+                raise SpeakerWorkerError("Speaker Worker 未返回指纹向量",
+                                         code="SPEAKER_FINGERPRINT_FAILED")
+            return response
+        except SpeakerWorkerError:
+            raise
+        except Exception as exc:
+            raise SpeakerWorkerError(str(exc), code="SPEAKER_FINGERPRINT_FAILED") from exc
+        finally:
+            self.pending_fingerprint.pop(request_id, None)
+
     async def embed_pcm(self, pcm: bytes, *, timeout_ms: int = 2500) -> tuple[float, ...]:
         if self.socket is None:
             raise SpeakerWorkerError("Speaker Worker 尚未连接")
@@ -274,7 +328,8 @@ class SpeakerWorkerClient:
             self.pending_embed.pop(request_id, None)
 
     def submit_frame(self, *, turn_id: str, generation: int, pcm: bytes,
-                     start_sample: int, end_sample: int) -> bool:
+                     start_sample: int, end_sample: int,
+                     speech: bool | None = None) -> bool:
         if self.socket is None or not pcm:
             return False
         item = {
@@ -282,6 +337,10 @@ class SpeakerWorkerClient:
             "start_sample": int(start_sample), "end_sample": int(end_sample),
             "pcm_base64": base64.b64encode(pcm).decode("ascii"),
         }
+        # The upstream VAD verdict lets the worker gate windows on real speech
+        # instead of a fixed amplitude threshold that drifts with mic gain.
+        if isinstance(speech, bool):
+            item["speech"] = speech
         try:
             self.queue.put_nowait(item)
             return True
@@ -378,3 +437,7 @@ class SpeakerWorkerClient:
             if not waiter.done():
                 waiter.cancel()
         self.pending_embed.clear()
+        for waiter in self.pending_fingerprint.values():
+            if not waiter.done():
+                waiter.cancel()
+        self.pending_fingerprint.clear()

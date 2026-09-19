@@ -10,6 +10,31 @@ import { readFileSync } from 'node:fs'
 // so it needs a direct source-level guard.
 const productCssSource = readFileSync(new URL('../ui-demo/ui-demo.css', import.meta.url), 'utf8')
 
+describe('multiple wake phrases', () => {
+  it('renders one input per configured spelling with add/remove controls', () => {
+    expect(productAppSource).toContain('v-for="(item, index) in wakeForm.keywords"')
+    expect(productAppSource).toContain('v-model="wakeForm.keywords[index]"')
+    expect(productAppSource).toContain('@click="addWakeKeyword"')
+    expect(productAppSource).toContain('@click="removeWakeKeyword(index)"')
+    expect(productAppSource).toContain('maxWakeKeywords')
+    // The single-phrase binding is gone: the list is the only contract now.
+    expect(productAppSource).not.toContain('wakeForm.keyword"')
+  })
+
+  it('posts the phrase list and keeps the cap in one place', () => {
+    expect(productAdapterSource).toContain('export const MAX_WAKE_KEYWORDS = 5')
+    expect(productAdapterSource).toContain('keywords,')
+    expect(productAdapterSource).toContain('wakeForm.keywords.length >= MAX_WAKE_KEYWORDS')
+    expect(productAdapterSource).not.toContain('keyword: wakeForm.keyword,')
+  })
+
+  it('styles the repeated rows with the existing settings vocabulary', () => {
+    expect(productCssSource).toContain('.wake-keyword-row')
+    expect(productCssSource).toContain('.wake-keyword-add')
+    expect(productCssSource).toContain('.wake-keyword-remove')
+  })
+})
+
 describe('fixed Shadow reasoning policy', () => {
   it('renders a read-only High indicator without the reasoning slider', () => {
     expect(productAppSource).toContain('High · 固定')
