@@ -129,7 +129,13 @@ tts:
   base_url: https://api.minimaxi.com
   websocket_path: /ws/v1/t2a_v2
   transport: websocket_bidi
-  scheduling: direct
+  # Bidi applies only the lead window of this policy: text is released while
+  # the returned-but-unplayed audio stays below admission_lead_ms, so the tail
+  # of a live answer stays locally replaceable.  The legacy per-segment
+  # completion wait is never used with Bidi.  Set scheduling: direct to
+  # disable admission control entirely.
+  scheduling: playback_window
+  admission_lead_ms: 2500
   subtitle_enable: true
   subtitle_type: word_streaming
   audio_cache_max_bytes: 67108864

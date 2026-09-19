@@ -156,6 +156,22 @@ python -m unittest discover -s tests -v
 
 受保护插话拒绝的麦克风帧仍必须进入当前轮有界 PCM 缓存，避免下一帧被误判为逻辑缺口。
 
+### 发送闸门排障
+
+开启 `tts.scheduling: playback_window` 后，若怀疑闸门没有生效，按顺序查：
+
+1. `WAITING_PLAYBACK` / `lead_window` 是否在 `logs/voice-server.log` 中出现。**零次就说明闸门
+   从未闭合**，此时再看播放进度没有意义。
+2. `controller.tts_progress` 的 `returned_ms` 与 `played_ms` 差值。它应稳定在
+   `tts.admission_lead_ms` 量级；出现数十秒的差值说明文本仍然被一次性送出。
+3. `minimax.task_continue chars=` 的时间戳。同一秒内出现整段回答的全部帧，就是一次性送出的
+   直接证据。
+4. `tts.admission_overrun` 表示暂存区超出字符预算而放弃窗口，属于降级而非故障。
+
+闸门判据读的是 provider **已返回**的音频，所以每次发送后必须等到该帧有 PCM 才重新测量。
+`tests/test_speech_admission.py::test_window_stays_closed_until_the_provider_answers` 是这条
+不变量的回归保护；修改 `_play_stream` 的发送循环后必须运行它。
+
 ## 破坏性升级与能力保全
 
 项目允许删除旧配置、公开事件、类型和实现，但必须先迁移仍需能力：
