@@ -818,14 +818,17 @@ class MiniMaxTtsClient:
         default_emotion: str = "calm",
         emotion_transport: str = "voice_setting",
         session_reuse: bool = True,
+        admission_lead_ms: int = 2500,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         if transport not in {"websocket", "websocket_bidi"}:
             raise ValueError("tts.transport must be websocket or websocket_bidi")
         if scheduling not in {"auto", "direct", "playback_window"}:
             raise ValueError("tts.scheduling must be auto, direct, or playback_window")
-        if transport == "websocket_bidi" and scheduling == "playback_window":
-            raise ValueError("Bidi TTS cannot use playback_window scheduling")
+        # Bidi may use playback_window for its lead window; only the legacy
+        # per-segment completion wait is unavailable on that transport.
+        if admission_lead_ms <= 0:
+            raise ValueError("tts.admission_lead_ms must be positive")
         if audio_cache_max_bytes <= 0 or cancel_timeout_ms <= 0 or keepalive_seconds <= 0:
             raise ValueError("TTS cache, cancel timeout, and keepalive values must be positive")
         if emotion_mode not in {"off", "agent"}:
@@ -834,6 +837,7 @@ class MiniMaxTtsClient:
             raise ValueError("tts.emotion_transport must be voice_setting")
         self.transport = transport
         self.scheduling = scheduling
+        self.admission_lead_ms = admission_lead_ms
         if transport == "websocket_bidi" and websocket_path.rstrip("/") == "/ws/v1/t2a_v2":
             websocket_path = "/ws/v1/t2a_v2_bidi"
         self.websocket_path = websocket_path

@@ -209,6 +209,21 @@ class ProtocolError(ValueError):
     """A model-controlled tool/protocol error eligible for immediate recovery."""
 
 
+def common_prefix_chars(left: str, right: str) -> int:
+    """Return the length of the longest common character prefix.
+
+    The divergence offset is the only quantity that decides where a live
+    response stops agreeing with a new one, so it is recorded on every
+    reconciliation rather than inferred from the two total lengths.
+    """
+
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
 def semantic_text(text: str) -> str:
     """Return a comparison form for ASR refinements.
 
@@ -3701,6 +3716,40 @@ class AgentEpisodeRuntime:
             existing_text = str(snapshot.get("text") or "")
             existing_id = snapshot.get("speech_id")
             existing_generation = snapshot.get("output_generation")
+            if isinstance(snapshot.get("sent_chars"), int):
+                sent_chars = max(0, min(len(existing_text), snapshot["sent_chars"]))
+            else:
+                sent_chars = len(existing_text)
+            sent_prefix = existing_text[:sent_chars]
+            # Text the provider has not received yet is still replaceable.
+            # Rewriting that tail in place keeps the audible prefix playing
+            # instead of cutting the sentence in half.
+            rewrite = getattr(self.output, "rewrite_unsent", None)
+            if (active_same_turn and existing_text and decision.text != existing_text
+                    and decision.text.startswith(sent_prefix)
+                    and snapshot.get("rewritable") and callable(rewrite)):
+                rewritten = await rewrite(identity, turn_id, speech_id=existing_id,
+                                          text=decision.text)
+                if rewritten is not None:
+                    self.current_action = "speak"
+                    await self.log(
+                        "SPEECH_TAIL_REWRITTEN", identity=identity, turn_id=turn_id,
+                        baseline_source="active_same_turn",
+                        baseline_chars=len(sent_prefix), new_chars=len(decision.text),
+                        lcp_chars=len(sent_prefix), sent_chars=sent_chars,
+                        suffix_chars=len(decision.text) - len(sent_prefix),
+                        speech_id=rewritten.speech_id,
+                        system_check_id=(dispatch_context.get("system_check_id")
+                                         if isinstance(dispatch_context, dict) else None),
+                    )
+                    return
+                await self.log(
+                    "SPEECH_TAIL_REWRITE_UNAVAILABLE", identity=identity, turn_id=turn_id,
+                    baseline_source="active_same_turn",
+                    reason="sent_prefix_contradicts_new_text",
+                    baseline_chars=len(sent_prefix), new_chars=len(decision.text),
+                    sent_chars=sent_chars, speech_id=existing_id,
+                )
             # A completed envelope can be a strict extension of the audible
             # text.  Queue only its suffix; repeating the prefix would sound
             # like a model interruption even though the decision agrees.
@@ -3714,6 +3763,8 @@ class AgentEpisodeRuntime:
                                      if isinstance(dispatch_context, dict) else None),
                     model_continuation_allowed=True,
                     baseline_chars=len(existing_text), suffix_chars=len(suffix),
+                    lcp_chars=common_prefix_chars(existing_text, decision.text),
+                    sent_chars=sent_chars,
                 )
                 if not suffix:
                     await self.emit("speech.append_ignored", {
@@ -3950,6 +4001,9 @@ class AgentEpisodeRuntime:
         prefix_baseline = None
         prefix_wait_reported = False
         speech_fed_chars = 0
+        # Set once a live transaction's unsent tail is being replaced in place:
+        # every further delta then extends that same replacement.
+        rewrite_speech_id = None
         validation = "strict_valid"
         audit_outcome_recorded = False
         stale_reported = False
@@ -4001,11 +4055,45 @@ class AgentEpisodeRuntime:
         async def finish_streamed_speech() -> None:
             nonlocal speech_handle_finished
             if speech_handle is not None and not speech_handle_finished:
-                await speech_handle.finish()
+                try:
+                    await speech_handle.finish()
+                except ValueError:
+                    # A rewritten transaction is the already-running handle
+                    # from the previous decision.  It may settle between the
+                    # replacement and this close, and a closed producer is not
+                    # a protocol error in the model's output.
+                    pass
                 speech_handle_finished = True
 
         async def queue_streamed_speech(decision, full_text) -> bool:
             nonlocal speech_handle, first_speech_text_at, prefix_baseline, prefix_wait_reported, speech_fed_chars
+            nonlocal rewrite_speech_id
+            if rewrite_speech_id is not None:
+                # A live transaction's unsent tail is already being replaced.
+                # Each further delta extends that same replacement rather than
+                # opening another transaction.
+                rewrite = getattr(self.output, "rewrite_unsent", None)
+                if callable(rewrite):
+                    rewritten = await rewrite(
+                        identity, source_turn_id,
+                        speech_id=rewrite_speech_id, text=full_text,
+                    )
+                    if rewritten is not None:
+                        speech_handle = rewritten
+                        return True
+                # The tail became irreversible while the model was still
+                # writing.  Fall through so the correction is still delivered
+                # through the ordinary replacement path.
+                await self.log(
+                    "SPEECH_TAIL_REWRITE_UNAVAILABLE", identity=identity,
+                    turn_id=source_turn_id, baseline_source="active_same_turn",
+                    reason="tail_became_irreversible_mid_stream",
+                    speech_id=rewrite_speech_id, new_chars=len(full_text),
+                    system_check_id=system_check_id,
+                )
+                rewrite_speech_id = None
+                prefix_baseline = None
+                speech_handle = None
             if speech_handle is not None:
                 return False
             snapshot = getattr(self.output, "speak_snapshot", {})
@@ -4017,10 +4105,24 @@ class AgentEpisodeRuntime:
                 and snapshot.get("turn_id") == source_turn_id
             )
             if prefix_baseline is None and existing_text and active_same_turn:
+                # Only text the provider already received is irreversible.
+                # Everything after it is still held locally, so the
+                # continuation baseline of a live response is its sent
+                # frontier rather than the whole accepted text.  A snapshot
+                # without that field is a legacy/collaborator shape: treat
+                # every accepted character as already sent, which reproduces
+                # the previous strict behaviour exactly.
+                if isinstance(snapshot.get("sent_chars"), int):
+                    sent_chars = max(0, min(len(existing_text), snapshot["sent_chars"]))
+                else:
+                    sent_chars = len(existing_text)
                 prefix_baseline = {
-                    "text": existing_text,
+                    "text": existing_text[:sent_chars],
+                    "full_text": existing_text,
+                    "sent_chars": sent_chars,
                     "speech_id": snapshot.get("speech_id"),
                     "generation": snapshot.get("output_generation"),
+                    "rewritable": bool(snapshot.get("rewritable")),
                     "source": "active_same_turn",
                 }
             elif (
@@ -4084,6 +4186,40 @@ class AgentEpisodeRuntime:
                             speech_id=speech_handle.speech_id,
                         )
                         return True
+                    rewrite = getattr(self.output, "rewrite_unsent", None)
+                    if (prefix_baseline["source"] == "active_same_turn"
+                            and prefix_baseline.get("rewritable") and callable(rewrite)):
+                        rewritten = await rewrite(
+                            identity, source_turn_id,
+                            speech_id=prefix_baseline["speech_id"], text=full_text,
+                        )
+                        if rewritten is not None:
+                            speech_handle = rewritten
+                            rewrite_speech_id = rewritten.speech_id
+                            speech_fed_chars = len(rewritten.text)
+                            first_speech_text_at = time.monotonic()
+                            await self.log(
+                                "SPEECH_TAIL_REWRITTEN", identity=identity,
+                                turn_id=source_turn_id,
+                                baseline_source="active_same_turn",
+                                baseline_chars=len(baseline), new_chars=len(full_text),
+                                lcp_chars=len(baseline),
+                                sent_chars=prefix_baseline.get("sent_chars"),
+                                suffix_chars=len(full_text) - len(rewritten.text[:prefix_baseline["sent_chars"]]),
+                                speech_id=rewritten.speech_id,
+                                system_check_id=system_check_id,
+                            )
+                            return True
+                        await self.log(
+                            "SPEECH_TAIL_REWRITE_UNAVAILABLE", identity=identity,
+                            turn_id=source_turn_id,
+                            baseline_source="active_same_turn",
+                            reason="sent_prefix_contradicts_new_text",
+                            baseline_chars=len(baseline), new_chars=len(full_text),
+                            sent_chars=prefix_baseline.get("sent_chars"),
+                            speech_id=prefix_baseline["speech_id"],
+                            system_check_id=system_check_id,
+                        )
                     append = getattr(self.output, "append_successor", None)
                     if prefix_baseline["source"] == "active_same_turn" and callable(append):
                         await self.log(
@@ -4125,18 +4261,21 @@ class AgentEpisodeRuntime:
                 # a real correction, not an append.
                 if prefix_baseline["source"] in {"active_same_turn", "active_previous_guard"}:
                     queue_status = "speaking"
-                if prefix_baseline["source"] != "active_same_turn":
-                    await self.log(
-                        "SPEECH_PREFIX_RECONCILED",
-                        identity=identity, turn_id=source_turn_id,
-                        baseline_source=prefix_baseline["source"],
-                        baseline_chars=len(baseline), new_chars=len(full_text),
-                        suffix_chars=0, stripped=False,
-                        reason=("same_turn_text_diverged"
-                                if prefix_baseline["source"] == "completed_same_turn_guard"
-                                else "new_turn_text_diverged"),
-                    )
-                    prefix_baseline = None
+                await self.log(
+                    "SPEECH_PREFIX_RECONCILED",
+                    identity=identity, turn_id=source_turn_id,
+                    baseline_source=prefix_baseline["source"],
+                    baseline_chars=len(baseline), new_chars=len(full_text),
+                    suffix_chars=0, stripped=False,
+                    lcp_chars=common_prefix_chars(baseline, full_text),
+                    sent_chars=prefix_baseline.get("sent_chars"),
+                    reason=("same_turn_text_diverged"
+                            if prefix_baseline["source"] == "active_same_turn"
+                            else "same_turn_guard_diverged"
+                            if prefix_baseline["source"] == "completed_same_turn_guard"
+                            else "new_turn_text_diverged"),
+                )
+                prefix_baseline = None
             replace = queue_status in {"speaking", "queued", "suspended"}
             speech_handle = (await self.output.replace_current(identity, source_turn_id, emotion=decision.emotion)
                              if replace else await self.output.begin(identity, source_turn_id, emotion=decision.emotion))

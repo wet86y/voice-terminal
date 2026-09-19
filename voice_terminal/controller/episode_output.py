@@ -57,6 +57,28 @@ class SpeechHandle:
         self.started = asyncio.Event()
         self.playback_ready = asyncio.Event()
         self.state = "CREATING"
+        # Bound by ``_play_stream`` for the duration of this transaction.  It
+        # owns the boundary between text the provider already received and
+        # text this transaction can still replace.
+        self.admission = None
+
+    @property
+    def sent_chars(self):
+        """Length of the irreversible prefix already handed to the provider.
+
+        Without a live admission state every accepted character counts as
+        irreversible, which reproduces the pre-admission behaviour exactly.
+        """
+
+        state = self.admission
+        return state.sent_chars if state is not None else len(self.text)
+
+    @property
+    def rewritable(self):
+        """Whether a later decision may still replace this tail in place."""
+
+        state = self.admission
+        return bool(state is not None and state.rewritable and self.finished)
 
     async def _put(self, value):
         if self.reason or self.task.done():
@@ -592,8 +614,74 @@ class EpisodeSpeechOutput(SpeechPipeline):
         value = {"queue_status": status, "text_only_queue": True, "text": h.text,
                  "speech_id": h.speech_id, "output_generation": h.workspace.generation,
                  "conversation_id": h.identity[0], "turn_id": h.turn_id,
-                 "emotion": h.emotion_requested}
+                 "emotion": h.emotion_requested,
+                 # Admission frontiers.  ``text`` stays the accepted response;
+                 # only ``sent_chars`` delimits what can no longer be replaced.
+                 # A handle shape without them is legacy/collaborator input:
+                 # report the whole text as already sent, which reproduces the
+                 # previous strict behaviour exactly.
+                 "sent_chars": getattr(h, "sent_chars", len(h.text)),
+                 "rewritable": bool(getattr(h, "rewritable", False))}
+        self._add_playback_frontiers(value, h)
         return value
+
+    def _add_playback_frontiers(self, value, h):
+        """Attach playback position facts used for diagnostics and tuning."""
+
+        workspace = getattr(h, "workspace", None)
+        playback_key = getattr(workspace, "playback_key", None)
+        player = getattr(self, "player", None)
+        if player is None or playback_key is None:
+            return
+        try:
+            current = player.progress(playback_key)
+        except Exception:
+            return
+        bytes_per_second = player.sample_rate * player.channels * 2
+        received = int(getattr(getattr(h, "tts_session", None), "received_bytes", 0) or 0)
+        value["played_ms"] = int(current.get("output_estimated_ms") or 0)
+        value["synthesized_ms"] = (
+            int(received * 1000 / bytes_per_second) if bytes_per_second and received else 0
+        )
+
+    async def rewrite_unsent(self, identity, turn_id, *, speech_id, text):
+        """Replace a live transaction's not-yet-synthesised tail in place.
+
+        This is the third output primitive, between ``append_successor`` (which
+        waits behind audible playback) and ``replace_current`` (which stops
+        it).  It is valid only while the provider has not yet received the
+        tail: the already-sent prefix stays audible, nothing is cancelled, and
+        the transaction keeps its speech id, generation and playback key.
+
+        The suffix is derived here rather than by the caller so a racing
+        ``sent_chars`` advance can never splice the wrong offset.  ``None``
+        means the new text no longer agrees with what the provider already
+        has, and the caller must fall back to a real replacement.
+        """
+
+        h = self.handle
+        if h is None or h.speech_id != speech_id or h.reason or h.task.done():
+            return None
+        state = h.admission
+        if state is None or not state.rewritable or not h.finished:
+            return None
+        baseline = h.text[:state.sent_chars]
+        if not text.startswith(baseline):
+            return None
+        suffix = text[len(baseline):]
+        dropped = state.replace_unsent(suffix)
+        if dropped < 0:
+            return None
+        h.text = baseline + suffix
+        await self.runtime.emit("speech.tail_rewritten", {
+            "speech_id": h.speech_id, "conversation_id": h.identity[0],
+            "turn_id": h.turn_id,
+            "output_generation": h.workspace.generation,
+            "sent_chars": state.sent_chars,
+            "dropped_chars": dropped, "staged_chars": len(suffix),
+            "cumulative_chars": len(h.text),
+        })
+        return h
 
     async def enqueue_text(self, identity, turn_id, text, *, emotion="calm", kind="formal"):
         h = await self.begin(identity, turn_id, emotion=emotion, kind=kind)
@@ -732,7 +820,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
             if isinstance(source_timings, dict):
                 h.workspace.timings.update(source_timings)
             h.workspace.timings["llm_request"] = self.runtime.request_started_at or time.monotonic()
-            await self._play_stream(h.workspace, h.workspace.token, h.stream(), speech_id=h.speech_id)
+            await self._play_stream(h.workspace, h.workspace.token, h.stream(),
+                                    speech_id=h.speech_id, handle=h)
             await self._notify_playback_completed(h)
             # A zero-PCM Bidi transaction cannot have delivered any text, so
             # one replay is safe and avoids making the user repeat a request
@@ -762,7 +851,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 async def replay():
                     yield h.text
 
-                await self._play_stream(h.workspace, h.workspace.token, replay(), speech_id=h.speech_id)
+                await self._play_stream(h.workspace, h.workspace.token, replay(),
+                                        speech_id=h.speech_id, handle=h)
                 await self._notify_playback_completed(h)
                 if h.workspace.timings.get("tts_text_sent") and h.workspace.timings.get("tts_audio_bytes", 0) == 0:
                     await self.runtime.log(

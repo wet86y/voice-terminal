@@ -24,6 +24,9 @@
   `conversation_id`、`request_id`、`turn_id`、`output_generation`、当前完整 `text` 和情绪字段；
 - `speech.progress`：提供缓冲、播放时长和替换等诊断。`trigger=playback_finished` 表示物理播放已经结束，
   `status=FINISHED` 为正常播完，`status=DEGRADED` 为播放失败；
+- `speech.tail_rewritten`：同一播报事务未送出的尾巴被就地替换，已播出的前缀继续播放。
+  payload 含 `speech_id`、`sent_chars`、`dropped_chars`、`staged_chars` 与 `cumulative_chars`。
+  `speech_id`、`output_generation` 与播放键都不变，因此前端不需要把它当成一次替换或新事务；
 - `speech.completed`：追加窗口和 delivery 结算后的最终事务记录，可能晚于物理播放结束。
 
 `speech.started` 和 `playback_finished` 是看板的实时播放边界；`speech.completed` 是账本与历史边界，

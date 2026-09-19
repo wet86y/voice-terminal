@@ -33,6 +33,35 @@ EpisodeSpeechOutput` 构成。Shadow 是同一会话持有的认知执行平面�
 - system-check 与 final-silence 禁止任何 action。
 - 完整 decision 通过本地校验后才后台 wake；主决策和语音输出不等待 Shadow。
 
+### 语音事务的发送前沿（admission）
+
+一个播报事务中的文本有两条线：**已接收**（`SpeechHandle.text`，模型本次输出的全部文本）和
+**已送出**（`sent_chars`，真正交给 TTS provider 的字符数）。只有已送出的部分不可撤回。
+
+`speak_snapshot` 因此同时给出 `text`、`sent_chars`、`rewritable`、`played_ms` 和
+`synthesized_ms`。判定一个到达的 decision 是否与正在播放的内容冲突时，基准是**发送前沿**
+而不是整段已接收文本：
+
+- 新文本仍在发送前沿之内 → 等待，尚不能判定；
+- 新文本以发送前沿开头 → 未送出的尾巴可以就地替换，已播出的前缀照常播放；
+- 分歧落在发送前沿之内 → 已生效内容确实要改，走原有的替换路径。
+
+`AppConfig.tts.scheduling: playback_window` 为 Bidi 启用发送闸门：只有当 provider 已返回但
+尚未播放的音频低于 `tts.admission_lead_ms` 时，才放出下一帧文本。这个窗口只控制**文本发送
+时机**，与旧的“等待单段合成完成”语义无关——Bidi 服务端自行断句，一个发送帧不等于一个
+服务端句子，所以后者在 Bidi 上始终关闭。发送暂存区不阻塞生产者：把播放时钟反压到 LLM 读取
+循环会让长回答停滞到 provider 超时。暂存区超过字符预算时放弃窗口并直接发送（记
+`tts.admission_overrun`）。`scheduling: direct` 完全关闭该机制。
+
+窗口的测量对象是 **provider 已返回的音频**，因此每次发送后必须先等 provider 为这一帧返回
+PCM，再重新测量。一段回答刚开始时尚未返回任何音频，`remaining_ms` 读数为零，窗口会一直
+敞开：实测中整段 20 帧文本在 48 毫秒内被一次性送出，provider 随后又跑到播放前面 28 秒，
+闸门形同不存在。这个等待有上限（`ADMISSION_CATCH_UP_SECONDS`，0.5 秒）且不致命，provider
+较慢时退回原来的直接发送行为，不会把事务降级为失败。
+
+用户 barge-in、AEC 失败回退、`speak.state=cancel` 与 `session.stop` 仍然是立即中止，不经过
+这条柔性路径。
+
 主语音状态的决策先回答“是否需要变更当前语音队列”：`wait` 是正常调用中的通用队列不变更
 决策，适用于没有新内容、现有语音仍正确、内容已经传达、Shadow 只是状态或事件已经过时等情况；
 `speak` 只用于仍相关且尚未传达的新内容；`cancel` 仅用于必须停止现有待播/播放内容且没有

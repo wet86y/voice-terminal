@@ -186,14 +186,23 @@ class TtsConfig:
     default_emotion: str = "calm"
     emotion_transport: str = "voice_setting"
     session_reuse: bool = True
+    # Lead window for text admission.  Text is released to the provider only
+    # while the returned-but-unplayed audio stays below this value, so the tail
+    # of a live response stays locally replaceable for as long as possible.
+    admission_lead_ms: int = 2500
 
     def __post_init__(self) -> None:
         if self.transport not in {"websocket", "websocket_bidi"}:
             raise ValueError("tts.transport must be websocket or websocket_bidi")
         if self.scheduling not in {"auto", "direct", "playback_window"}:
             raise ValueError("tts.scheduling must be auto, direct, or playback_window")
-        if self.transport == "websocket_bidi" and self.scheduling == "playback_window":
-            raise ValueError("Bidi TTS cannot use playback_window scheduling")
+        # A Bidi deployment may use playback_window for its lead window.  The
+        # legacy per-segment completion wait stays unavailable there because
+        # the server breaks sentences itself: one sent frame is not one server
+        # segment, so waiting for "this frame finished" would stall.  The two
+        # behaviours are selected independently in the speech pipeline.
+        if self.admission_lead_ms <= 0:
+            raise ValueError("tts.admission_lead_ms must be positive")
         if self.subtitle_type not in {"sentence", "word", "word_streaming"}:
             raise ValueError("tts.subtitle_type is invalid")
         if self.audio_cache_max_bytes <= 0 or self.cancel_timeout_ms <= 0 or self.keepalive_seconds <= 0:
@@ -690,6 +699,7 @@ class AppConfig:
                 default_emotion=_string(tts.get("default_emotion"), "calm"),
                 emotion_transport=_string(tts.get("emotion_transport"), "voice_setting"),
                 session_reuse=_bool(tts.get("session_reuse"), True),
+                admission_lead_ms=int(_number(tts.get("admission_lead_ms"), 2500)),
             ),
             text_bridge=TextBridgeConfig(
                 min_chars=int(_number(bridge.get("min_chars"), 8)),

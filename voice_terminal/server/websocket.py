@@ -588,6 +588,7 @@ class SessionRuntime:
                 default_emotion=self.config.tts.default_emotion,
                 emotion_transport=self.config.tts.emotion_transport,
                 session_reuse=self.config.tts.session_reuse,
+                admission_lead_ms=self.config.tts.admission_lead_ms,
             )
             self.state.current.update(
                 tts_transport=self.config.tts.transport,

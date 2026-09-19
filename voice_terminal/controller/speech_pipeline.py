@@ -13,6 +13,90 @@ logger = logging.getLogger(__name__)
 
 FLUSH_DUE = object()
 
+# A staged tail is held locally until the admission window releases it.  The
+# cap only bounds memory when playback stalls; it is a character budget rather
+# than a blocking queue, so the LLM reader is never throttled by the playback
+# clock.
+ADMISSION_STAGING_CHARS = 6000
+
+# How long one sent frame may wait for the provider to return its first PCM
+# before the lead window is evaluated again.  Bounded so a slow provider keeps
+# the previous direct behaviour instead of stalling the transaction.
+ADMISSION_CATCH_UP_SECONDS = 0.5
+
+
+class AdmissionState:
+    """Retractable text frontier shared by one live speech transaction.
+
+    ``sent_chars`` is the only irreversible boundary of an accepted response.
+    Everything after it is still held locally -- in the handle queue, the merge
+    buffer or this staging deque -- so a later LLM decision may replace that
+    tail without interrupting audible playback or opening a new TTS session.
+
+    Every mutating method is synchronous, so under the event loop they are
+    atomic with respect to each other and no extra lock is required.
+    """
+
+    def __init__(self, *, lead_ms: int, char_limit: int = ADMISSION_STAGING_CHARS) -> None:
+        self.lead_ms = lead_ms
+        self.char_limit = char_limit
+        self.staged: deque[str] = deque()
+        self.staged_chars = 0
+        self.sent_chars = 0
+        self.epoch = 0
+        self.closed = False
+        self.overrun_reported = False
+        self.signal = asyncio.Event()
+
+    @property
+    def rewritable(self) -> bool:
+        """Whether an unsent tail still exists that a replacement can reach."""
+
+        return not self.closed
+
+    @property
+    def overrun(self) -> bool:
+        """Whether the staging budget was exceeded and the window must yield."""
+
+        return self.staged_chars > self.char_limit
+
+    def push(self, segment: str) -> None:
+        self.staged.append(segment)
+        self.staged_chars += len(segment)
+        self.signal.set()
+
+    def pop(self) -> str | None:
+        if not self.staged:
+            return None
+        segment = self.staged.popleft()
+        self.staged_chars -= len(segment)
+        return segment
+
+    def close(self) -> None:
+        self.closed = True
+        self.signal.set()
+
+    def replace_unsent(self, suffix: str) -> int:
+        """Drop every unsent frame and stage ``suffix`` in its place.
+
+        Returns the number of dropped characters, or ``-1`` when this
+        transaction can no longer accept a replacement.
+        """
+
+        if self.closed:
+            return -1
+        dropped = self.staged_chars
+        self.staged.clear()
+        self.staged_chars = 0
+        # Bumping the epoch invalidates a frame the sender may already hold
+        # between popping it and handing it to the provider.
+        self.epoch += 1
+        if suffix:
+            self.push(suffix)
+        else:
+            self.signal.set()
+        return dropped
+
 
 async def buffered_stream(source, bridge):
     """Arm one local flush deadline only while a speakable prefix is buffered.
@@ -80,7 +164,8 @@ class SpeechPipeline:
         """Hook for output owners that defer pre-playback TTS."""
         return
 
-    async def _play_stream(self, ws, token, deltas, *, speech_id: str | None = None) -> str:
+    async def _play_stream(self, ws, token, deltas, *, speech_id: str | None = None,
+                           handle=None) -> str:
         transport = getattr(self.tts, "transport", "websocket") if self.tts is not None else "websocket"
         bridge = BidiTextMerger(max_chars=128, max_wait_ms=30) if transport == "websocket_bidi" else TextBridge(**self.bridge_options)
         session = None
@@ -96,21 +181,27 @@ class SpeechPipeline:
             "effective_scheduling",
             getattr(self.tts, "scheduling", "auto") if self.tts is not None else "auto",
         )
-        if transport == "websocket_bidi" or configured_scheduling == "direct":
-            scheduling_policy = DirectStreamingPolicy()
-        elif configured_scheduling == "playback_window" or self.options.tts_pacing:
-            scheduling_policy = PlaybackWindowPolicy(max(1, self.options.tts_lead_ms))
+        # The lead window and the legacy per-segment completion wait are two
+        # independent behaviours.  A Bidi server breaks sentences itself, so
+        # one sent frame is never one server segment and waiting for "this
+        # frame finished" would stall; its lead window is still useful.
+        if configured_scheduling == "playback_window":
+            lead_ms = max(1, int(getattr(self.tts, "admission_lead_ms", 0) or self.options.tts_lead_ms))
+        elif self.options.tts_pacing:
+            lead_ms = max(1, int(self.options.tts_lead_ms))
         else:
-            scheduling_policy = DirectStreamingPolicy()
-        pacing_enabled = isinstance(scheduling_policy, PlaybackWindowPolicy) and self.player is not None
-        lead_ms = scheduling_policy.lead_ms
-        # The queue keeps the LLM consumer independent from the playback
-        # clock, while still putting a hard bound on text waiting for TTS.
-        pending_segments: deque[str] = deque()
-        pending_signal = asyncio.Event()
+            lead_ms = 0
+        lead_window_enabled = bool(lead_ms and self.player is not None)
+        segment_waits_enabled = bool(lead_window_enabled and transport != "websocket_bidi")
+        scheduling_policy = (
+            PlaybackWindowPolicy(lead_ms) if lead_window_enabled else DirectStreamingPolicy()
+        )
+        # Text accepted after ``sent_chars`` is still ours to replace.
+        state = AdmissionState(lead_ms=lead_ms)
+        if handle is not None:
+            handle.admission = state
         audio_signal = asyncio.Event()
         progress_stop = asyncio.Event()
-        pending_limit = 32
         producer_done = False
         audio_returned_bytes = 0
         tts_text_sent = False
@@ -222,7 +313,10 @@ class SpeechPipeline:
                     audio_played_ms=int(snapshot["played_ms"]),
                     audio_output_estimated_ms=int(snapshot["output_estimated_ms"]),
                     audio_remaining_ms=int(snapshot["remaining_ms"]),
-                    pacing_enabled=pacing_enabled,
+                    pacing_enabled=lead_window_enabled,
+                    segment_waits_enabled=segment_waits_enabled,
+                    sent_chars=state.sent_chars,
+                    staged_chars=state.staged_chars,
                     lead_ms=lead_ms,
                     trigger=trigger,
                 )
@@ -314,7 +408,7 @@ class SpeechPipeline:
             return reader.exception()
 
         async def wait_for_audio(before_bytes: int) -> None:
-            if not pacing_enabled:
+            if not segment_waits_enabled:
                 return
             await scheduling_policy.wait_for_audio(
                 before_bytes,
@@ -325,8 +419,54 @@ class SpeechPipeline:
             )
             await emit_progress(status="STREAMING", trigger="audio_available")
 
+        async def wait_for_provider_catch_up(before_bytes: int) -> None:
+            """Let the provider answer the frame we just sent, then re-measure.
+
+            The lead window compares returned audio against playback.  A burst
+            of frames sent faster than the provider can synthesise makes that
+            measurement stale -- at the very start of an answer nothing has
+            been returned yet, so ``remaining_ms`` reads zero and the window
+            stays open for the whole response.  Waiting for one new PCM chunk
+            keeps the next window decision based on what the provider actually
+            produced.  The wait is bounded and never fatal: a slow answer keeps
+            the previous behaviour instead of degrading the transaction.
+            """
+
+            if not lead_window_enabled:
+                return
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + ADMISSION_CATCH_UP_SECONDS
+            while audio_returned_bytes <= before_bytes:
+                if not self._valid(token) or tts_disabled:
+                    return
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return
+                audio_signal.clear()
+                if audio_returned_bytes > before_bytes:
+                    return
+                try:
+                    await asyncio.wait_for(audio_signal.wait(), remaining)
+                except asyncio.TimeoutError:
+                    return
+
         async def wait_for_playback_window() -> None:
-            if not pacing_enabled:
+            if not lead_window_enabled:
+                return
+            if state.overrun:
+                # Playback stalled long enough to exhaust the staging budget.
+                # Release text immediately rather than throttling the LLM
+                # reader; the admission benefit is simply lost for this turn.
+                if not state.overrun_reported:
+                    state.overrun_reported = True
+                    logger.warning(
+                        "controller.tts_admission_overrun turn_id=%s staged_chars=%d limit=%d",
+                        ws.turn_id, state.staged_chars, state.char_limit,
+                    )
+                    await self._detail(
+                        "tts.admission_overrun",
+                        staged_chars=state.staged_chars, limit=state.char_limit,
+                    )
                 return
             await scheduling_policy.wait_before_send(
                 lambda: PlaybackProgress.from_mapping(playback_progress()),
@@ -335,26 +475,38 @@ class SpeechPipeline:
             )
 
         async def next_segment() -> str | None:
-            while not pending_segments and not producer_done and not tts_disabled and self._valid(token):
-                pending_signal.clear()
-                if pending_segments or producer_done or tts_disabled:
+            while True:
+                segment = state.pop()
+                if segment is not None:
+                    return segment
+                if producer_done or tts_disabled or not self._valid(token):
+                    state.close()
+                    return None
+                state.signal.clear()
+                if state.staged:
                     continue
-                await pending_signal.wait()
-            if not pending_segments:
-                return None
-            segment = pending_segments.popleft()
-            # Wake a producer waiting on the bounded queue.
-            pending_signal.set()
-            return segment
+                await state.signal.wait()
 
         async def tts_sender() -> None:
             nonlocal session, reader, progress_task, tts_failed, tts_disabled, tts_text_sent
             sent_any = False
             try:
                 while True:
+                    if sent_any:
+                        # Wait for the admission window before taking ownership
+                        # of the next unsent frame.  A frame that is merely
+                        # staged can still be replaced by a later decision;
+                        # one already popped cannot.
+                        await self._wait_for_playback_permission(ws, token)
+                        if not self._valid(token) or not ws.committed:
+                            return
+                        await wait_for_playback_window()
+                        if not self._valid(token):
+                            return
                     segment = await next_segment()
                     if segment is None:
                         return
+                    epoch = state.epoch
                     if not self._valid(token):
                         return
                     await self._wait_for_playback_permission(ws, token)
@@ -467,7 +619,6 @@ class SpeechPipeline:
                         await self._wait_for_playback_permission(ws, token)
                         if not self._valid(token) or not ws.committed:
                             return
-                        await wait_for_playback_window()
                     if not self._valid(token):
                         return
                     await self._wait_for_playback_permission(ws, token)
@@ -476,12 +627,18 @@ class SpeechPipeline:
                     receiver_error = await reader_exception()
                     if receiver_error is not None:
                         raise receiver_error
+                    if state.epoch != epoch:
+                        # A replacement invalidated this frame while we held
+                        # it.  It was never sent, so drop it silently.
+                        continue
                     before_bytes = audio_returned_bytes
                     before_segments = getattr(session, "completed_segments", 0)
                     ws.timings.setdefault("first_tts_text", time.monotonic())
                     self.state.current["tts_text"] = segment
                     resolver.add_text(segment, int(playback_progress()["returned_ms"]))
                     await session.send_text(segment)
+                    # Only text the provider accepted is irreversible.
+                    state.sent_chars += len(segment)
                     tts_text_sent = True
                     await emit_progress(
                         status="QUEUED",
@@ -494,17 +651,16 @@ class SpeechPipeline:
                     # current segment's final response before evaluating the
                     # total playback backlog and releasing another segment.
                     wait_for_segment = getattr(session, "wait_for_segment", None)
-                    if pacing_enabled and wait_for_segment is not None:
+                    if segment_waits_enabled and wait_for_segment is not None:
                         await wait_for_segment(before_segments)
                     else:
-                        await wait_for_audio(before_bytes)
+                        await wait_for_provider_catch_up(before_bytes)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 tts_failed = exc
                 tts_disabled = True
-                pending_segments.clear()
-                pending_signal.set()
+                state.close()
                 progress_stop.set()
                 logger.warning("controller.tts_degraded turn_id=%s error=%s", ws.turn_id, exc)
 
@@ -517,20 +673,17 @@ class SpeechPipeline:
             for segment in segments:
                 if not segment or not segment.strip():
                     continue
-                while len(pending_segments) >= pending_limit and not tts_disabled and self._valid(token):
-                    pending_signal.clear()
-                    if len(pending_segments) < pending_limit:
-                        continue
-                    await pending_signal.wait()
                 if tts_disabled or not self._valid(token):
                     return
-                pending_segments.append(segment)
-                pending_signal.set()
+                # Staging never blocks its producer.  Blocking here would
+                # propagate the playback clock back into the LLM reader, and a
+                # long answer would then stall until the provider deadline.
+                state.push(segment)
 
         async def finish_send_queue() -> None:
             nonlocal producer_done
             producer_done = True
-            pending_signal.set()
+            state.signal.set()
 
         stream = buffered_stream(deltas, bridge)
         try:
