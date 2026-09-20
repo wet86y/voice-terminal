@@ -197,7 +197,10 @@ class RealtimeController(SpeechPipeline, InputController):
                 ws.timings["tts_prewarm_status"] = ws.tts_prewarm_status
                 await self._publish_tts_prewarm(ws, ws.tts_prewarm_status, reason="unsupported")
                 return
-            result = await prewarm()
+            try:
+                result = await prewarm(turn_id=ws.turn_id)
+            except TypeError:
+                result = await prewarm()
             if isinstance(result, dict) and result.get("status") == "READY":
                 ws.timings["tts_prewarm_ready"] = time.monotonic()
                 ws.tts_prewarm_status = "READY"
@@ -228,7 +231,9 @@ class RealtimeController(SpeechPipeline, InputController):
             return
         ws.tts_prewarm_started = True
         ws.timings.setdefault("tts_prewarm_requested", time.monotonic())
-        if self.tts is None or getattr(self.tts, "transport", None) != "websocket_bidi":
+        if self.tts is None or getattr(self.tts, "transport", None) not in {
+            "websocket", "websocket_bidi"
+        }:
             ws.tts_prewarm_status = "DISABLED"
             ws.timings["tts_prewarm_status"] = ws.tts_prewarm_status
             return
@@ -251,17 +256,13 @@ class RealtimeController(SpeechPipeline, InputController):
         # A ready warm session is no longer represented by a running task.
         # If no speech transaction has checked it out, dispose of it on turn
         # cancellation so an abandoned turn cannot hold a socket forever.
-        output = getattr(self, "output", None)
-        output_has_pending = bool(
-            output is not None
-            and (getattr(output, "active", False) or getattr(output, "_pending", None))
-        )
-        if not output_has_pending and self._tts_session_for_controller() is None and self.tts is not None:
-            session = getattr(self.tts, "_bidi_session", None)
-            if session is not None and getattr(session, "_prewarmed", False):
-                close = getattr(self.tts, "close", None)
-                if callable(close):
-                    await close()
+        if self.tts is not None:
+            discard = getattr(self.tts, "discard_prewarm", None)
+            if callable(discard):
+                try:
+                    await discard(turn_id=turn_id)
+                except TypeError:
+                    await discard()
 
     def _tts_session_for_controller(self):
         """Return an output-owned session without assuming the controller type."""

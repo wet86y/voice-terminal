@@ -26,13 +26,13 @@ assistant 草稿不会成为历史；实际听到的内容、ASR refinement 和�
 system-check 回复会在新一段用户语音开始时立即失效，不再等 ASR final 后才撤销，也不会在用户说完后补播。
 
 一个播报事务中的文本有两条线：已接收（本次输出的全部文本）与已送出（真正交给 TTS provider
-的字符数）。只有已送出的部分不可撤回。`tts.scheduling: playback_window` 为 Bidi 启用发送闸门：
-provider 已返回但尚未播放的音频低于 `tts.admission_lead_ms`（默认 2500ms）时才放出下一帧文本；
-每次发送后先等 provider 返回这一帧的 PCM 再重新测量，否则刚开口时读数为零会让整段话一次性送出。
-因此当 LLM 在同一轮里改口、而分歧点仍落在尚未送出的文本内时，就地把尾巴换掉即可——已播出的
-前缀继续播放，不打断、不换事务、不新建 TTS 连接；分歧落在已送出内容内时仍走原有的替换路径。
-用户 barge-in、AEC 失败回退、模型 `cancel` 与 `session.stop` 不受影响，仍然立即停止。
-`scheduling: direct` 完全关闭该机制。
+的字符数）。只有已送出的部分不可撤回。默认 `tts.scheduling: sentence_window` 在本地按朗读标点
+切成完整短句；首块 400ms 无标点时才按时间兜底。标准 WebSocket 的一个 `task_start` 顺序接收
+多个短句，当前块收到 `is_final` 后用累计 PCM 边界计算本地剩余播放时间，进入 2000ms 窗口才
+预取下一块，因此 provider 同时最多拥有当前块和一个预取块。后续短句仍留在本地，不依赖字幕或
+provider 合成进度。当 LLM 在同一轮里改口、而分歧点仍落在尚未送出的短句内时，就地重建本地
+尾巴——已播出的前缀继续播放，不打断、不换事务、不新建 TTS 连接；分歧落在当前块或预取块内
+时仍走硬替换。`direct` 和旧 `playback_window` 继续作为兼容模式保留。
 
 每个 session 只有一个长期存在的 `ShadowRuntime`，不存在 task ID、任务列表、任务队列、
 modify/reply/cancel/checkpoint 或多任务调度器。主 LLM不能发送任务文本或意图摘要，只能在完整

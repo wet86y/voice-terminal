@@ -141,15 +141,16 @@ tts:
   provider: minimax
   base_url: https://api.minimaxi.com
   websocket_path: /ws/v1/t2a_v2
-  transport: websocket_bidi
-  # Bidi applies only the lead window of this policy: text is released while
-  # the returned-but-unplayed audio stays below admission_lead_ms, so the tail
-  # of a live answer stays locally replaceable.  The legacy per-segment
-  # completion wait is never used with Bidi.  Set scheduling: direct to
-  # disable admission control entirely.
-  scheduling: playback_window
+  transport: websocket
+  # Split model output at spoken punctuation.  Keep at most the current block
+  # plus one block prefetched on the same task_start connection.
+  scheduling: sentence_window
+  sentence_prefetch_ms: 2000
+  sentence_tick_ms: 50
+  first_clause_timeout_ms: 400
+  # Retained for the legacy playback_window compatibility mode.
   admission_lead_ms: 2500
-  subtitle_enable: true
+  subtitle_enable: false
   subtitle_type: word_streaming
   audio_cache_max_bytes: 67108864
   cancel_timeout_ms: 2000

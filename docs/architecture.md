@@ -46,18 +46,19 @@ EpisodeSpeechOutput` 构成。Shadow 是同一会话持有的认知执行平面�
 - 新文本以发送前沿开头 → 未送出的尾巴可以就地替换，已播出的前缀照常播放；
 - 分歧落在发送前沿之内 → 已生效内容确实要改，走原有的替换路径。
 
-`AppConfig.tts.scheduling: playback_window` 为 Bidi 启用发送闸门：只有当 provider 已返回但
-尚未播放的音频低于 `tts.admission_lead_ms` 时，才放出下一帧文本。这个窗口只控制**文本发送
-时机**，与旧的“等待单段合成完成”语义无关——Bidi 服务端自行断句，一个发送帧不等于一个
-服务端句子，所以后者在 Bidi 上始终关闭。发送暂存区不阻塞生产者：把播放时钟反压到 LLM 读取
-循环会让长回答停滞到 provider 超时。暂存区超过字符预算时放弃窗口并直接发送（记
-`tts.admission_overrun`）。`scheduling: direct` 完全关闭该机制。
+`AppConfig.tts.scheduling: sentence_window` 是默认发送闸门。本地按常见中英文朗读标点切短句，
+首个非空文本 400ms 内没有标点才发送当时已有内容；后续不按字符数量截断。标准 WebSocket 在
+同一个 `task_start` 中顺序接收多个 `task_continue`，每个请求的 `is_final` 生成一个
+`TtsSegmentReceipt`，其中累计 PCM 结束字节就是该块的播放边界。
 
-窗口的测量对象是 **provider 已返回的音频**，因此每次发送后必须先等 provider 为这一帧返回
-PCM，再重新测量。一段回答刚开始时尚未返回任何音频，`remaining_ms` 读数为零，窗口会一直
-敞开：实测中整段 20 帧文本在 48 毫秒内被一次性送出，provider 随后又跑到播放前面 28 秒，
-闸门形同不存在。这个等待有上限（`ADMISSION_CATCH_UP_SECONDS`，0.5 秒）且不致命，provider
-较慢时退回原来的直接发送行为，不会把事务降级为失败。
+调度只读取播放器的 `output_estimated_ms`：当前块距离边界不超过 2000ms 时，才允许发送一个
+预取块。任何时刻 provider 最多持有当前块和一个预取块，其他完整短句仍在本地，可被同轮新
+decision 原地替换。字幕、word alignment 和 provider 已返回多少音频都不参与发送判据；长回答
+也不会因本地暂存量而绕过窗口。`direct` 和旧 `playback_window` 只作为兼容模式保留。
+
+标准 WebSocket 在首个可靠 ASR partial 时异步完成连接和 `task_start`，并按 turn 归属 checkout。
+第一块形成后直接发送 `task_continue`；预热缺失或失败才冷启动。声音设置变化、turn 取消和 session
+reset 都会丢弃尚未领取的错误预热连接。
 
 用户 barge-in、AEC 失败回退、`speak.state=cancel` 与 `session.stop` 仍然是立即中止，不经过
 这条柔性路径。

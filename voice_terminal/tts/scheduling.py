@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Mapping
+from typing import AsyncIterator, Awaitable, Callable, Mapping, Protocol
 
 
 class TtsSchedulingError(RuntimeError):
@@ -45,6 +45,41 @@ class PlaybackProgress:
                 else None
             ),
         )
+
+
+@dataclass(frozen=True)
+class TtsSegmentReceipt:
+    """Provider-neutral completion boundary for one submitted text block.
+
+    ``end_received_bytes`` is cumulative within the current speech
+    transaction.  It identifies the exact PCM position after this block
+    without requiring subtitles or provider-specific sentence events.
+    """
+
+    index: int
+    text_chars: int
+    end_received_bytes: int
+
+
+class TtsSegmentSession(Protocol):
+    """Provider-neutral session contract used by sentence scheduling.
+
+    Online and future local engines may buffer or synthesize differently, but
+    the controller only needs ordered PCM plus one cumulative boundary receipt
+    for each successfully submitted text block.
+    """
+
+    async def start(self) -> None: ...
+
+    async def send_text(self, text: str) -> None: ...
+
+    def audio_chunks(self) -> AsyncIterator[bytes]: ...
+
+    async def wait_for_segment(self, previous_index: int) -> TtsSegmentReceipt: ...
+
+    async def finish(self) -> None: ...
+
+    async def close(self) -> None: ...
 
 
 ProgressReader = Callable[[], PlaybackProgress | Mapping[str, object]]

@@ -7,6 +7,8 @@ import logging
 import tempfile
 from typing import Any
 
+from ..tts.scheduling import TtsSegmentReceipt
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,6 +70,8 @@ class MiniMaxTtsSession:
         self._retry_attempts: dict[str, int] = {}
         self._retry_deadlines: dict[str, float] = {}
         self._sent_texts: deque[str] = deque(maxlen=256)
+        self._pending_segment_chars: deque[int] = deque()
+        self._segment_receipts: list[TtsSegmentReceipt] = []
         self._backpressure_idle = asyncio.Event()
         self._backpressure_idle.set()
         self._retry_cancel = asyncio.Event()
@@ -87,6 +91,19 @@ class MiniMaxTtsSession:
             and not self._connection_dead
             and self._socket is not None
             and self._error is None
+            and (self._receiver is None or not self._receiver.done())
+        )
+
+    @property
+    def connection_ready(self) -> bool:
+        """Whether this task_start connection can accept real text now."""
+
+        return (
+            not self._closed
+            and not self._connection_dead
+            and self._socket is not None
+            and self._error is None
+            and self._started
             and (self._receiver is None or not self._receiver.done())
         )
 
@@ -134,7 +151,7 @@ class MiniMaxTtsSession:
         bytes_per_second = max(1, int(self.client.sample_rate) * 2)
         return int(round(self._audio_bytes_received * 1000 / bytes_per_second))
 
-    async def wait_for_segment(self, previous_count: int) -> None:
+    async def wait_for_segment(self, previous_count: int) -> TtsSegmentReceipt:
         """Wait for this text's is_final, never infer it from another PCM chunk."""
         while self.completed_segments <= previous_count:
             if self._error is not None:
@@ -143,6 +160,10 @@ class MiniMaxTtsSession:
                 raise MiniMaxTtsError("MiniMax TTS 未确认当前文本分段完成")
             self._segment_available.clear()
             await asyncio.wait_for(self._segment_available.wait(), self.client.receive_timeout_seconds)
+        try:
+            return self._segment_receipts[previous_count]
+        except IndexError as exc:
+            raise MiniMaxTtsError("MiniMax TTS 分段回执缺失") from exc
 
     def _store_audio(self, pcm: bytes) -> None:
         if self.received_bytes + len(pcm) > self._cache_max_bytes:
@@ -198,15 +219,8 @@ class MiniMaxTtsSession:
         # ``session()`` returns the same object for Bidi.  A previous flush or
         # cancel ended only its generation, so starting the next one must not
         # send a second task_start or create a second receiver task.
-        if (
-            self.bidi
-            and self._started
-            and self._socket is not None
-            and not self._closed
-            and not self._connection_dead
-            and (self._receiver is None or not self._receiver.done())
-        ):
-            if self._generation_done.is_set():
+        if self.connection_ready:
+            if self.bidi and self._generation_done.is_set():
                 self._reset_generation()
             return
         try:
@@ -452,8 +466,21 @@ class MiniMaxTtsSession:
                 if parsed.get("is_final") is True:
                     if (not self.bidi or self._generation_active) and not self._cancel_requested and not cancel_confirmation:
                         self._completed_segments += 1
+                        text_chars = self._pending_segment_chars.popleft() if self._pending_segment_chars else 0
+                        self._segment_receipts.append(
+                            TtsSegmentReceipt(
+                                index=self._completed_segments - 1,
+                                text_chars=text_chars,
+                                end_received_bytes=self._audio_bytes_received,
+                            )
+                        )
                         self._segment_available.set()
-                        logger.debug("minimax.segment_finished count=%d", self.completed_segments)
+                        logger.debug(
+                            "minimax.segment_finished count=%d text_chars=%d end_received_bytes=%d",
+                            self.completed_segments,
+                            text_chars,
+                            self._audio_bytes_received,
+                        )
                 if event == "task_finished":
                     self._server_finished = True
                     self._generation_done.set()
@@ -509,9 +536,19 @@ class MiniMaxTtsSession:
             raise MiniMaxTtsError(
                 f"MiniMax TTS 任务已结束（最后事件：{self._last_event or 'unknown'}）"
             )
-        await self._send_bidi_event(
-            {"event": "task_continue", "text": text}, operation="发送文本"
-        )
+        self._pending_segment_chars.append(len(text))
+        try:
+            await self._send_bidi_event(
+                {"event": "task_continue", "text": text}, operation="发送文本"
+            )
+        except BaseException:
+            # A cancellation may land after the frame reached the server and
+            # its fast is_final already consumed this marker.  Preserve the
+            # original transport exception instead of masking it with an
+            # empty-deque error.
+            if self._pending_segment_chars:
+                self._pending_segment_chars.pop()
+            raise
         self._sent_texts.append(text)
         logger.info("minimax.task_continue chars=%d text=%r", len(text), text[:120])
 
@@ -678,6 +715,8 @@ class MiniMaxTtsSession:
         self._audio_available.clear()
         self._server_finished = False
         self._completed_segments = 0
+        self._pending_segment_chars.clear()
+        self._segment_receipts.clear()
         self._segment_available.clear()
         self._finished.clear()
         self._error = None
@@ -819,16 +858,21 @@ class MiniMaxTtsClient:
         emotion_transport: str = "voice_setting",
         session_reuse: bool = True,
         admission_lead_ms: int = 2500,
+        sentence_prefetch_ms: int = 2000,
+        sentence_tick_ms: int = 50,
+        first_clause_timeout_ms: int = 400,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         if transport not in {"websocket", "websocket_bidi"}:
             raise ValueError("tts.transport must be websocket or websocket_bidi")
-        if scheduling not in {"auto", "direct", "playback_window"}:
-            raise ValueError("tts.scheduling must be auto, direct, or playback_window")
+        if scheduling not in {"auto", "direct", "playback_window", "sentence_window"}:
+            raise ValueError("tts.scheduling must be auto, direct, playback_window, or sentence_window")
         # Bidi may use playback_window for its lead window; only the legacy
         # per-segment completion wait is unavailable on that transport.
         if admission_lead_ms <= 0:
             raise ValueError("tts.admission_lead_ms must be positive")
+        if sentence_prefetch_ms <= 0 or sentence_tick_ms <= 0 or first_clause_timeout_ms <= 0:
+            raise ValueError("TTS sentence scheduling values must be positive")
         if audio_cache_max_bytes <= 0 or cancel_timeout_ms <= 0 or keepalive_seconds <= 0:
             raise ValueError("TTS cache, cancel timeout, and keepalive values must be positive")
         if emotion_mode not in {"off", "agent"}:
@@ -838,6 +882,9 @@ class MiniMaxTtsClient:
         self.transport = transport
         self.scheduling = scheduling
         self.admission_lead_ms = admission_lead_ms
+        self.sentence_prefetch_ms = sentence_prefetch_ms
+        self.sentence_tick_ms = sentence_tick_ms
+        self.first_clause_timeout_ms = first_clause_timeout_ms
         if transport == "websocket_bidi" and websocket_path.rstrip("/") == "/ws/v1/t2a_v2":
             websocket_path = "/ws/v1/t2a_v2_bidi"
         self.websocket_path = websocket_path
@@ -866,6 +913,8 @@ class MiniMaxTtsClient:
         # valid long response during a temporary synthesis pause.
         self.receive_timeout_seconds = max(120.0, self.timeout_seconds)
         self._bidi_session: MiniMaxTtsSession | None = None
+        self._prewarm_session: MiniMaxTtsSession | None = None
+        self._prewarm_turn_id: str | None = None
         self.last_prewarm_checkout_reason = "not_requested"
         self._connection_sequence = 0
 
@@ -930,6 +979,17 @@ class MiniMaxTtsClient:
         selected = self.normalize_emotion(emotion)
         if self.emotion_mode != "agent":
             selected = self.default_emotion
+        if self.transport == "websocket" and self._prewarm_session is not None:
+            if detach_active or self._prewarm_session.emotion != selected:
+                session = self._prewarm_session
+                self._prewarm_session = None
+                self._prewarm_turn_id = None
+                start_lock = getattr(session, "_start_lock", None)
+                if start_lock is not None:
+                    async with start_lock:
+                        await session.close()
+                else:
+                    await session.close()
         if self.transport == "websocket_bidi" and self._bidi_session is not None and detach_active:
             # The output owner has already transferred cancellation ownership
             # to a retired generation.  Detach its reusable pointer instead
@@ -964,7 +1024,7 @@ class MiniMaxTtsClient:
     def applied_emotion(self) -> str:
         return self._active_emotion if self.emotion_enabled else self.default_emotion
 
-    def session(self, *, fresh: bool = False) -> MiniMaxTtsSession:
+    def session(self, *, fresh: bool = False, turn_id: str | None = None) -> MiniMaxTtsSession:
         if not self.api_key:
             raise MiniMaxTtsError("未配置 MINIMAX_API_KEY")
         if self.output_format.lower() != "pcm":
@@ -976,6 +1036,12 @@ class MiniMaxTtsClient:
             isolated = MiniMaxTtsSession(self, emotion=self._active_emotion)
             isolated._isolated_transaction = True
             return isolated
+        if self.transport == "websocket" and self.session_reuse:
+            if (
+                self._prewarm_session is not None
+                and (self._prewarm_turn_id is None or self._prewarm_turn_id == turn_id)
+            ):
+                return self._prewarm_session
         if self.transport == "websocket_bidi" and self.session_reuse:
             if (
                 self._bidi_session is None
@@ -988,21 +1054,36 @@ class MiniMaxTtsClient:
             return self._bidi_session
         return MiniMaxTtsSession(self, emotion=self._active_emotion)
 
-    async def prewarm(self, emotion: str | None = None) -> dict[str, Any]:
-        """Open an idle Bidi task_start session without sending any text.
+    async def prewarm(self, emotion: str | None = None,
+                      turn_id: str | None = None) -> dict[str, Any]:
+        """Open an idle task_start session without sending any text.
 
         The returned session is deliberately only a checkout candidate.  It
         has not synthesized audio and becomes consumed as soon as the first
-        real speech transaction claims it.  Non-Bidi transports report a
-        disabled result so the controller can keep the same asynchronous
-        trigger without changing their cold-start behavior.
+        real speech transaction claims it.  Standard
+        WebSocket candidates are scoped to one turn and consumed on checkout.
         """
 
-        if self.transport != "websocket_bidi" or not self.session_reuse:
-            return {"status": "DISABLED", "reason": "bidi_session_reuse_unavailable"}
+        if self.transport not in {"websocket", "websocket_bidi"} or not self.session_reuse:
+            return {"status": "DISABLED", "reason": "session_prewarm_unavailable"}
         selected = self.normalize_emotion(emotion or self.default_emotion)
-        await self.prepare_emotion(selected)
-        session = self.session()
+        selected = await self.prepare_emotion(selected)
+        if self.transport == "websocket":
+            if self._prewarm_session is not None:
+                if self._prewarm_turn_id == turn_id and not self._prewarm_session.closed:
+                    session = self._prewarm_session
+                else:
+                    stale = self._prewarm_session
+                    self._prewarm_session = None
+                    self._prewarm_turn_id = None
+                    await stale.close()
+                    session = MiniMaxTtsSession(self, emotion=selected)
+            else:
+                session = MiniMaxTtsSession(self, emotion=selected)
+            self._prewarm_session = session
+            self._prewarm_turn_id = turn_id
+        else:
+            session = self.session(turn_id=turn_id)
         # Emotion is part of task_start, so a concurrent Agent decision may
         # have selected a different voice between prepare_emotion() and
         # session().  Never label that connection as a calm warm candidate;
@@ -1011,6 +1092,10 @@ class MiniMaxTtsClient:
             if session is self._bidi_session and not session.generation_active:
                 await session.close()
                 self._bidi_session = None
+            if session is self._prewarm_session:
+                await session.close()
+                self._prewarm_session = None
+                self._prewarm_turn_id = None
             return {"status": "FALLBACK", "reason": "emotion_changed"}
         if session.generation_active:
             return {"status": "FALLBACK", "reason": "session_busy"}
@@ -1018,11 +1103,17 @@ class MiniMaxTtsClient:
         session._prewarm_ready.clear()
         try:
             await session.start()
-            if (session is not self._bidi_session or session.emotion != self._active_emotion
-                    or not session.reusable):
+            retained = session is (
+                self._bidi_session if self.transport == "websocket_bidi" else self._prewarm_session
+            )
+            usable = session.reusable if self.transport == "websocket_bidi" else session.connection_ready
+            if not retained or session.emotion != self._active_emotion or not usable:
                 await session.close()
                 if session is self._bidi_session:
                     self._bidi_session = None
+                if session is self._prewarm_session:
+                    self._prewarm_session = None
+                    self._prewarm_turn_id = None
                 return {"status": "FALLBACK", "reason": "session_not_reusable"}
             session._prewarmed = True
             logger.info("minimax.prewarm_ready connection_id=%s emotion=%s", session.connection_id, selected)
@@ -1031,24 +1122,38 @@ class MiniMaxTtsClient:
             await session.close()
             if session is self._bidi_session:
                 self._bidi_session = None
+            if session is self._prewarm_session:
+                self._prewarm_session = None
+                self._prewarm_turn_id = None
             raise
         except MiniMaxEmotionUnsupported as exc:
             # ``start`` has already closed the rejected socket and disabled
             # the optional emotion extension.  A future real speak will use
             # the normal neutral cold-start fallback.
             logger.info("minimax.prewarm_emotion_fallback error=%s", str(exc)[:300])
+            if session is self._prewarm_session:
+                self._prewarm_session = None
+                self._prewarm_turn_id = None
             return {"status": "FALLBACK", "reason": "emotion_unsupported"}
         except Exception as exc:
             logger.info("minimax.prewarm_failed error=%s", str(exc)[:300])
+            if session is self._prewarm_session:
+                self._prewarm_session = None
+                self._prewarm_turn_id = None
             return {"status": "FALLBACK", "reason": str(exc)[:300]}
         finally:
             session._prewarm_inflight = False
             session._prewarm_ready.set()
 
-    def checkout_prewarm(self, session: MiniMaxTtsSession) -> bool:
+    def checkout_prewarm(self, session: MiniMaxTtsSession,
+                         turn_id: str | None = None) -> bool:
         """Claim a ready warm session exactly once for real speech."""
-        if session is not self._bidi_session:
+        retained = self._bidi_session if self.transport == "websocket_bidi" else self._prewarm_session
+        if session is not retained:
             self.last_prewarm_checkout_reason = "stale_generation"
+            return False
+        if self.transport == "websocket" and self._prewarm_turn_id not in {None, turn_id}:
+            self.last_prewarm_checkout_reason = "wrong_turn"
             return False
         if not getattr(session, "_prewarmed", False):
             self.last_prewarm_checkout_reason = "not_prewarmed"
@@ -1056,25 +1161,52 @@ class MiniMaxTtsClient:
         if session.emotion != self._active_emotion:
             self.last_prewarm_checkout_reason = "emotion_changed"
             return False
-        if not session.reusable or session.closed or session._connection_dead:
+        usable = session.reusable if self.transport == "websocket_bidi" else session.connection_ready
+        if not usable or session.closed or session._connection_dead:
             self.last_prewarm_checkout_reason = "session_closed"
             return False
         if session.generation_active:
             self.last_prewarm_checkout_reason = "session_busy"
             return False
-        if session is self._bidi_session:
-            session._prewarmed = False
-            self.last_prewarm_checkout_reason = "hit"
-            return True
-        self.last_prewarm_checkout_reason = "unknown"
-        return False
+        session._prewarmed = False
+        if self.transport == "websocket":
+            self._prewarm_session = None
+            self._prewarm_turn_id = None
+        self.last_prewarm_checkout_reason = "hit"
+        return True
+
+    async def discard_prewarm(self, turn_id: str | None = None) -> None:
+        """Close an unused warm candidate owned by a cancelled turn."""
+
+        if self.transport == "websocket":
+            if self._prewarm_session is None:
+                return
+            if turn_id is not None and self._prewarm_turn_id != turn_id:
+                return
+            session = self._prewarm_session
+            self._prewarm_session = None
+            self._prewarm_turn_id = None
+            if getattr(session, "_prewarmed", False) or getattr(session, "_prewarm_inflight", False):
+                await session.close()
+            return
+        session = self._bidi_session
+        if session is not None and (
+            getattr(session, "_prewarmed", False) or getattr(session, "_prewarm_inflight", False)
+        ):
+            await session.close()
+            if session is self._bidi_session:
+                self._bidi_session = None
 
     async def close(self) -> None:
-        """Close a retained Bidi connection during runtime shutdown."""
+        """Close retained Bidi and unused standard prewarm connections."""
 
         if self._bidi_session is not None:
             await self._bidi_session.close()
             self._bidi_session = None
+        if self._prewarm_session is not None:
+            await self._prewarm_session.close()
+            self._prewarm_session = None
+            self._prewarm_turn_id = None
 
     async def check(self) -> None:
         if not self.api_key:

@@ -158,19 +158,22 @@ python -m unittest discover -s tests -v
 
 ### 发送闸门排障
 
-开启 `tts.scheduling: playback_window` 后，若怀疑闸门没有生效，按顺序查：
+开启 `tts.scheduling: sentence_window` 后，若怀疑闸门没有生效，按顺序查：
 
-1. `WAITING_PLAYBACK` / `lead_window` 是否在 `logs/voice-server.log` 中出现。**零次就说明闸门
-   从未闭合**，此时再看播放进度没有意义。
-2. `controller.tts_progress` 的 `returned_ms` 与 `played_ms` 差值。它应稳定在
-   `tts.admission_lead_ms` 量级；出现数十秒的差值说明文本仍然被一次性送出。
-3. `minimax.task_continue chars=` 的时间戳。同一秒内出现整段回答的全部帧，就是一次性送出的
-   直接证据。
-4. `tts.admission_overrun` 表示暂存区超出字符预算而放弃窗口，属于降级而非故障。
+1. `prewarm_checkout_result` 是否为 `hit`；miss 时结合 reason 和 `tts_session_start` /
+   `tts_session_ready` 判断是否发生冷启动。
+2. `first_llm_text`、`first_clause_ready`、`first_task_continue`、`first_pcm` 四个 timing，分别定位
+   标点等待、session 等待和 provider 首 PCM 延迟。
+3. `WAITING_PLAYBACK` / `sentence_window` 是否出现；它表示完整短句仍留在本地等待播放窗口。
+4. `minimax.segment_finished` 的 `end_received_bytes` 必须逐块递增；部分 PCM 不会产生块回执。
+5. `minimax.task_continue chars=` 的时间戳。日志中同时已发送的文本最多只能覆盖当前块和一个
+   预取块，长回答不得在数百毫秒内全部送出。
+6. `controller.tts_prefetch_miss` / `prefetch_miss_ms` 大于零表示下一块合成慢于 2 秒预取窗口，
+   可能已经产生块间播放缺口；首版不会自动扩大窗口。
 
-闸门判据读的是 provider **已返回**的音频，所以每次发送后必须等到该帧有 PCM 才重新测量。
-`tests/test_speech_admission.py::test_window_stays_closed_until_the_provider_answers` 是这条
-不变量的回归保护；修改 `_play_stream` 的发送循环后必须运行它。
+`tests/test_sentence_scheduling.py` 覆盖断句、400ms 首块兜底、标准 WS 分段回执、turn-scoped 预热
+和“当前块 + 一个预取块”的上限；修改 `_play_stream` 的发送循环后必须运行它。旧
+`playback_window` 的回归仍由 `tests/test_speech_admission.py` 保留。
 
 ## 破坏性升级与能力保全
 

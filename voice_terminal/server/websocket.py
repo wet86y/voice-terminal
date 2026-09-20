@@ -894,6 +894,9 @@ class SessionRuntime:
                 emotion_transport=self.config.tts.emotion_transport,
                 session_reuse=self.config.tts.session_reuse,
                 admission_lead_ms=self.config.tts.admission_lead_ms,
+                sentence_prefetch_ms=self.config.tts.sentence_prefetch_ms,
+                sentence_tick_ms=self.config.tts.sentence_tick_ms,
+                first_clause_timeout_ms=self.config.tts.first_clause_timeout_ms,
             )
             self.state.current.update(
                 tts_transport=self.config.tts.transport,
