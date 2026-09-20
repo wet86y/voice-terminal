@@ -623,6 +623,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
                  "sent_chars": getattr(h, "sent_chars", len(h.text)),
                  "rewritable": bool(getattr(h, "rewritable", False))}
         self._add_playback_frontiers(value, h)
+        self._add_model_text_parts(value, h)
         return value
 
     def _add_playback_frontiers(self, value, h):
@@ -643,6 +644,38 @@ class EpisodeSpeechOutput(SpeechPipeline):
         value["synthesized_ms"] = (
             int(received * 1000 / bytes_per_second) if bytes_per_second and received else 0
         )
+
+    def _add_model_text_parts(self, value, h):
+        """Attach one non-overlapping semantic text partition for projection.
+
+        The raw snapshot keeps its local execution fields.  The Agent later
+        selects only these text parts plus ownership/authority for the model,
+        so playback counters and transaction identifiers never cross the
+        request-tail boundary.
+        """
+
+        state = getattr(h, "admission", None)
+        if state is None:
+            value["_model_text_parts"] = {
+                "committed_prefix": h.text,
+                "current_clause": "",
+                "prefetched_clause": "",
+                "revisable_tail": "",
+            }
+            value["_model_text_parts_valid"] = True
+            return
+        player = getattr(self, "player", None)
+        output_estimated_ms = int(value.get("played_ms") or 0)
+        bytes_per_second = 0
+        if player is not None:
+            bytes_per_second = int(player.sample_rate * player.channels * 2)
+        parts, valid = state.model_text_parts(
+            h.text,
+            output_estimated_ms=output_estimated_ms,
+            bytes_per_second=bytes_per_second,
+        )
+        value["_model_text_parts"] = parts
+        value["_model_text_parts_valid"] = valid
 
     async def rewrite_unsent(self, identity, turn_id, *, speech_id, text):
         """Replace a live transaction's not-yet-synthesised tail in place.

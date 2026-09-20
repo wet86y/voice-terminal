@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.controller.episode_output import EpisodeSpeechOutput, SpeechHandle
 from voice_terminal.controller.speech_pipeline import AdmissionState
 from voice_terminal.config import load_config
@@ -60,6 +61,72 @@ def test_rewrite_restages_complete_sentence_tail() -> None:
     state.replace_unsent("新尾巴，第二句。末尾")
     assert list(state.staged) == ["新尾巴，", "第二句。", "末尾"]
     assert state.sent_chars == len("已发送。")
+
+
+def test_admission_projects_each_character_once_into_fixed_text_parts() -> None:
+    state = AdmissionState(lead_ms=0, sentence_window=True)
+    state.commit_segment("更早内容。", receipt_index=0)
+    state.complete_segment(TtsSegmentReceipt(0, len("更早内容。"), 2000))
+    state.commit_segment("当前短句。", receipt_index=1)
+    state.complete_segment(TtsSegmentReceipt(1, len("当前短句。"), 6000))
+    state.commit_segment("预取短句。", receipt_index=2)
+    text = "更早内容。当前短句。预取短句。本地尾巴。"
+
+    parts, valid = state.model_text_parts(
+        text, output_estimated_ms=2500, bytes_per_second=1000,
+    )
+
+    assert valid is True
+    assert parts == {
+        "committed_prefix": "更早内容。",
+        "current_clause": "当前短句。",
+        "prefetched_clause": "预取短句。",
+        "revisable_tail": "本地尾巴。",
+    }
+    assert "".join(parts.values()) == text
+    assert (
+        parts["committed_prefix"] + parts["current_clause"] + parts["prefetched_clause"]
+        == text[:state.sent_chars]
+    )
+
+
+def test_model_speak_projection_uses_parts_without_legacy_text_fields() -> None:
+    text = "更早内容。当前短句。预取短句。本地尾巴。"
+    locked = "更早内容。当前短句。预取短句。"
+    snapshot = {
+        "queue_status": "speaking",
+        "conversation_id": "conversation",
+        "turn_id": "turn",
+        "text": text,
+        "sent_chars": len(locked),
+        "rewritable": True,
+        "_model_text_parts_valid": True,
+        "_model_text_parts": {
+            "committed_prefix": "更早内容。",
+            "current_clause": "当前短句。",
+            "prefetched_clause": "预取短句。",
+            "revisable_tail": "本地尾巴。",
+        },
+        "speech_id": "speech",
+        "delivery": {"speech_id": "speech", "heard_text": "独立传达事实。"},
+    }
+
+    projected = AgentEpisodeRuntime._model_speak_state(
+        snapshot, conversation_id="conversation", turn_id="turn",
+    )
+
+    assert projected == {
+        "state": "speaking",
+        "owner_scope": "current_turn",
+        "continuation_mode": "rewrite_tail",
+        "text_parts": snapshot["_model_text_parts"],
+        "delivery": {"heard_text": "独立传达事实。"},
+    }
+    serialized = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+    for unique in ("更早内容。", "当前短句。", "预取短句。", "本地尾巴。"):
+        assert serialized.count(unique) == 1
+    for removed in ("target_text", "observed_text", "continuation_allowed", "sent_chars"):
+        assert removed not in serialized
 
 
 def _sentence_output_harness():
@@ -189,6 +256,7 @@ def _sentence_output_harness():
 def test_sentence_window_keeps_only_current_and_one_prefetched_block() -> None:
     async def scenario():
         output, handle, session, player = _sentence_output_harness()
+        handle.text = "第一句。第二句。第三句。"
 
         async def deltas():
             yield "第一句。第二句。第三句。"
@@ -205,10 +273,26 @@ def test_sentence_window_keeps_only_current_and_one_prefetched_block() -> None:
         )
         await asyncio.sleep(0.08)
         assert session.sent == ["第一句。"]
+        parts, valid = handle.admission.model_text_parts(
+            handle.text, output_estimated_ms=0, bytes_per_second=2000,
+        )
+        assert valid is True
+        assert parts == {
+            "committed_prefix": "", "current_clause": "第一句。",
+            "prefetched_clause": "", "revisable_tail": "第二句。第三句。",
+        }
 
         player.played_ms = 1000  # first block has exactly 2000 ms left
         await asyncio.sleep(0.08)
         assert session.sent == ["第一句。", "第二句。"]
+        parts, valid = handle.admission.model_text_parts(
+            handle.text, output_estimated_ms=1000, bytes_per_second=2000,
+        )
+        assert valid is True
+        assert parts == {
+            "committed_prefix": "", "current_clause": "第一句。",
+            "prefetched_clause": "第二句。", "revisable_tail": "第三句。",
+        }
 
         player.played_ms = 3000  # second is current, but still has 3000 ms left
         await asyncio.sleep(0.08)

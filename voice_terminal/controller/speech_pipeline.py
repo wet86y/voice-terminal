@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 from collections import deque
+from dataclasses import dataclass
 import logging
 import time
 from ..stream.text_bridge import TextBridge
@@ -26,6 +27,20 @@ ADMISSION_STAGING_CHARS = 6000
 ADMISSION_CATCH_UP_SECONDS = 0.5
 
 
+@dataclass
+class SubmittedClause:
+    """One sentence-window block already accepted by the TTS provider.
+
+    Text becomes irreversible as soon as ``send_text`` succeeds.  The PCM
+    boundary arrives later, so it is deliberately optional until the
+    provider's per-block receipt is observed.
+    """
+
+    index: int
+    text: str
+    end_received_bytes: int | None = None
+
+
 class AdmissionState:
     """Retractable text frontier shared by one live speech transaction.
 
@@ -39,10 +54,13 @@ class AdmissionState:
     """
 
     def __init__(self, *, lead_ms: int, char_limit: int = ADMISSION_STAGING_CHARS,
-                 restage=None) -> None:
+                 restage=None, sentence_window: bool = False) -> None:
         self.lead_ms = lead_ms
         self.char_limit = char_limit
+        self.sentence_window = sentence_window
         self.staged: deque[str] = deque()
+        self.submitted_clauses: deque[SubmittedClause] = deque()
+        self.last_completed_boundary_bytes = 0
         self.staged_chars = 0
         self.sent_chars = 0
         self.epoch = 0
@@ -78,6 +96,124 @@ class AdmissionState:
     def close(self) -> None:
         self.closed = True
         self.signal.set()
+
+    def commit_segment(self, text: str, *, receipt_index: int | None = None) -> None:
+        """Atomically advance the irreversible frontier after provider acceptance."""
+
+        self.sent_chars += len(text)
+        if self.sentence_window:
+            index = len(self.submitted_clauses) if receipt_index is None else int(receipt_index)
+            self.submitted_clauses.append(SubmittedClause(index=index, text=text))
+
+    def complete_segment(self, receipt: TtsSegmentReceipt) -> None:
+        """Attach a cumulative PCM boundary to its submitted text block."""
+
+        matching = next(
+            (item for item in self.submitted_clauses if item.index == receipt.index),
+            None,
+        )
+        if matching is None:
+            raise RuntimeError("TTS 短句块回执没有对应的已提交文本")
+        if matching.end_received_bytes is not None:
+            raise RuntimeError("TTS 短句块回执重复")
+        if receipt.text_chars != len(matching.text):
+            raise RuntimeError("TTS 短句块回执文本长度不匹配")
+        if receipt.end_received_bytes <= self.last_completed_boundary_bytes:
+            raise RuntimeError("TTS 短句块回执边界没有递增")
+        matching.end_received_bytes = receipt.end_received_bytes
+        self.last_completed_boundary_bytes = receipt.end_received_bytes
+
+    @staticmethod
+    def _boundary_ms(item: SubmittedClause, bytes_per_second: int) -> int | None:
+        if item.end_received_bytes is None or bytes_per_second <= 0:
+            return None
+        return int(item.end_received_bytes * 1000 / bytes_per_second)
+
+    def active_clauses(self, *, output_estimated_ms: int, bytes_per_second: int) -> tuple[SubmittedClause, ...]:
+        """Return current/prefetched blocks without mutating scheduling state."""
+
+        active: list[SubmittedClause] = []
+        for item in self.submitted_clauses:
+            boundary_ms = self._boundary_ms(item, bytes_per_second)
+            if boundary_ms is not None and output_estimated_ms >= boundary_ms:
+                continue
+            active.append(item)
+        return tuple(active)
+
+    def prune_played(self, *, output_estimated_ms: int, bytes_per_second: int) -> list[tuple[int, bool]]:
+        """Drop played blocks and report their boundary/successor state."""
+
+        removed: list[tuple[int, bool]] = []
+        while self.submitted_clauses:
+            boundary_ms = self._boundary_ms(self.submitted_clauses[0], bytes_per_second)
+            if boundary_ms is None or output_estimated_ms < boundary_ms:
+                break
+            removed.append((boundary_ms, len(self.submitted_clauses) > 1))
+            self.submitted_clauses.popleft()
+        return removed
+
+    def model_text_parts(self, text: str, *, output_estimated_ms: int = 0,
+                         bytes_per_second: int = 0) -> tuple[dict[str, str], bool]:
+        """Project the accepted text once into four non-overlapping parts.
+
+        The returned boolean is false when active clause bookkeeping does not
+        exactly describe the submitted prefix.  Callers must then expose the
+        conservative all-committed fallback rather than promise a rewrite.
+        """
+
+        if not isinstance(text, str) or not isinstance(self.sent_chars, int):
+            return {
+                "committed_prefix": str(text or ""),
+                "current_clause": "",
+                "prefetched_clause": "",
+                "revisable_tail": "",
+            }, False
+        if self.sent_chars < 0 or self.sent_chars > len(text):
+            return {
+                "committed_prefix": text,
+                "current_clause": "",
+                "prefetched_clause": "",
+                "revisable_tail": "",
+            }, False
+        submitted = text[:self.sent_chars]
+        revisable = text[self.sent_chars:]
+        active = self.active_clauses(
+            output_estimated_ms=output_estimated_ms,
+            bytes_per_second=bytes_per_second,
+        ) if self.sentence_window else ()
+        if len(active) > 2:
+            return {
+                "committed_prefix": text,
+                "current_clause": "",
+                "prefetched_clause": "",
+                "revisable_tail": "",
+            }, False
+        current = active[0].text if active else ""
+        prefetched = active[1].text if len(active) > 1 else ""
+        active_suffix = current + prefetched
+        if active_suffix and not submitted.endswith(active_suffix):
+            return {
+                "committed_prefix": text,
+                "current_clause": "",
+                "prefetched_clause": "",
+                "revisable_tail": "",
+            }, False
+        committed = submitted[:-len(active_suffix)] if active_suffix else submitted
+        parts = {
+            "committed_prefix": committed,
+            "current_clause": current,
+            "prefetched_clause": prefetched,
+            "revisable_tail": revisable,
+        }
+        valid = "".join(parts.values()) == text
+        if not valid:
+            return {
+                "committed_prefix": text,
+                "current_clause": "",
+                "prefetched_clause": "",
+                "revisable_tail": "",
+            }, False
+        return parts, True
 
     def replace_unsent(self, suffix: str) -> int:
         """Drop every unsent frame and stage ``suffix`` in its place.
@@ -222,6 +358,7 @@ class SpeechPipeline:
         state = AdmissionState(
             lead_ms=lead_ms,
             restage=split_complete_text if sentence_window_enabled else None,
+            sentence_window=sentence_window_enabled,
         )
         if handle is not None:
             handle.admission = state
@@ -230,7 +367,6 @@ class SpeechPipeline:
         producer_done = False
         audio_returned_bytes = 0
         tts_text_sent = False
-        segment_receipts: deque[TtsSegmentReceipt] = deque()
         prefetch_miss_boundary_ms: int | None = None
         sentence_prefetch_ms = max(1, int(getattr(self.tts, "sentence_prefetch_ms", 2000)))
         sentence_tick_seconds = max(0.001, int(getattr(self.tts, "sentence_tick_ms", 50)) / 1000)
@@ -519,23 +655,21 @@ class SpeechPipeline:
                 return
             while self._valid(token) and not tts_disabled:
                 output_ms = int(playback_progress()["output_estimated_ms"])
-                while segment_receipts:
-                    boundary_ms = int(
-                        segment_receipts[0].end_received_bytes * 1000 / audio_bytes_per_second
-                    )
-                    if output_ms < boundary_ms:
-                        break
-                    had_prefetched_successor = len(segment_receipts) > 1
-                    segment_receipts.popleft()
+                for boundary_ms, had_prefetched_successor in state.prune_played(
+                    output_estimated_ms=output_ms,
+                    bytes_per_second=audio_bytes_per_second,
+                ):
                     if not had_prefetched_successor and output_ms > boundary_ms:
                         prefetch_miss_boundary_ms = boundary_ms
-                if not segment_receipts:
+                active = tuple(state.submitted_clauses)
+                if not active:
                     return
-                current_end_ms = int(
-                    segment_receipts[0].end_received_bytes * 1000 / audio_bytes_per_second
-                )
+                current_end_ms = state._boundary_ms(active[0], audio_bytes_per_second)
+                if current_end_ms is None:
+                    await asyncio.sleep(sentence_tick_seconds)
+                    continue
                 remaining_ms = max(0, current_end_ms - output_ms)
-                if len(segment_receipts) == 1 and remaining_ms <= sentence_prefetch_ms:
+                if len(active) == 1 and remaining_ms <= sentence_prefetch_ms:
                     return
                 await emit_progress(
                     status="WAITING_PLAYBACK",
@@ -732,7 +866,7 @@ class SpeechPipeline:
                     resolver.add_text(segment, int(playback_progress()["returned_ms"]))
                     await session.send_text(segment)
                     # Only text the provider accepted is irreversible.
-                    state.sent_chars += len(segment)
+                    state.commit_segment(segment, receipt_index=before_segments)
                     tts_text_sent = True
                     await emit_progress(
                         status="QUEUED",
@@ -749,8 +883,9 @@ class SpeechPipeline:
                         if wait_for_segment is None:
                             raise RuntimeError("TTS session 不支持短句块完成回执")
                         previous_boundary_ms = (
-                            int(segment_receipts[-1].end_received_bytes * 1000 / audio_bytes_per_second)
-                            if segment_receipts else None
+                            int(state.last_completed_boundary_bytes * 1000 / audio_bytes_per_second)
+                            if state.last_completed_boundary_bytes and audio_bytes_per_second > 0
+                            else None
                         )
                         receipt = await wait_for_segment(before_segments)
                         if not isinstance(receipt, TtsSegmentReceipt):
@@ -762,9 +897,7 @@ class SpeechPipeline:
                                 )
                             except (AttributeError, TypeError, ValueError) as exc:
                                 raise RuntimeError("TTS session 返回了无效的短句块回执") from exc
-                        if segment_receipts and receipt.end_received_bytes <= segment_receipts[-1].end_received_bytes:
-                            raise RuntimeError("TTS 短句块回执边界没有递增")
-                        segment_receipts.append(receipt)
+                        state.complete_segment(receipt)
                         miss_boundary_ms = (
                             previous_boundary_ms
                             if previous_boundary_ms is not None

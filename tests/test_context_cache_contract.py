@@ -57,7 +57,14 @@ def test_runtime_tail_is_after_current_user_and_time_is_not_static():
     messages.extend(projector.project(ledger, current))
     messages.append(ContextFrame.make(
         ContextLane.REQUEST_TAIL, "system",
-        projector.runtime_tail(current=current, speak_state={"state": "speaking", "target_text": "正在播报"}),
+        projector.runtime_tail(current=current, speak_state={
+            "state": "speaking", "owner_scope": "current_turn",
+            "continuation_mode": "rewrite_tail",
+            "text_parts": {
+                "committed_prefix": "", "current_clause": "正在播报",
+                "prefetched_clause": "", "revisable_tail": "",
+            },
+        }),
         context_kind="runtime_state",
     ))
     messages = consolidate_request_tail(messages)
@@ -68,6 +75,72 @@ def test_runtime_tail_is_after_current_user_and_time_is_not_static():
     assert '"local_time"' not in messages[0]["content"]
     packet = json.loads(messages[-2]["content"])
     assert '"local_time"' in packet["entries"][0]["content"]
+
+
+def test_dynamic_speak_parts_change_only_request_tail_and_keep_cache_prefix_frozen():
+    class Registry:
+        def action_definitions(self):
+            return []
+
+        def begin_turn(self, _turn_id):
+            return None
+
+    async def emit(*_args):
+        return None
+
+    output = SimpleNamespace(speak_snapshot={
+        "queue_status": "speaking",
+        "conversation_id": "conversation",
+        "turn_id": "turn-a",
+        "text": "第一句。第二句。第三句。",
+        "sent_chars": len("第一句。第二句。"),
+        "rewritable": True,
+        "_model_text_parts_valid": True,
+        "_model_text_parts": {
+            "committed_prefix": "", "current_clause": "第一句。",
+            "prefetched_clause": "第二句。", "revisable_tail": "第三句。",
+        },
+    })
+    conversation = ConversationRuntime()
+    conversation.begin_turn("turn-a")
+    runtime = AgentEpisodeRuntime(
+        None, Registry(), output, emit,
+        conversation=conversation, ledger=SessionLedger(),
+    )
+    runtime.episode_id = "conversation"
+    runtime.last_turn_id = "turn-a"
+    runtime.inputs["turn-a"] = {"text": "继续", "final": False}
+
+    before = runtime.messages({"USER_SEGMENT_UPDATED"}, current_turn_id="turn-a")
+    runtime._guard_context_contract(before)
+    static_before = [item for item in before if ContextFrame.lane_of(item) == ContextLane.STATIC_INSTRUCTIONS]
+    history_before = [item for item in before if ContextFrame.lane_of(item) == ContextLane.HISTORY]
+    static_digest = runtime.static_context_digest
+    history_digest = runtime.history_context_digest
+
+    output.speak_snapshot = {
+        **output.speak_snapshot,
+        "sent_chars": len("第一句。第二句。第三句。"),
+        "rewritable": False,
+        "_model_text_parts": {
+            "committed_prefix": "第一句。", "current_clause": "第二句。",
+            "prefetched_clause": "第三句。", "revisable_tail": "",
+        },
+    }
+    after = runtime.messages({"TOOL_COMPLETED"}, current_turn_id="turn-a")
+    runtime._guard_context_contract(after)
+
+    assert [item for item in after if ContextFrame.lane_of(item) == ContextLane.STATIC_INSTRUCTIONS] == static_before
+    assert [item for item in after if ContextFrame.lane_of(item) == ContextLane.HISTORY] == history_before
+    assert runtime.static_context_digest == static_digest
+    assert runtime.history_context_digest == history_digest
+    packet = json.loads(after[-2]["content"])
+    runtime_entry = next(item for item in packet["entries"] if item["kind"] == "runtime_state")
+    assert '"continuation_mode":"append_only"' in runtime_entry["content"]
+    assert '"text_parts"' in runtime_entry["content"]
+    assert "target_text" not in runtime_entry["content"]
+    assert "第一句。" not in "".join(item["content"] for item in static_before)
+    assert "第三句。" not in "".join(item["content"] for item in history_before)
 
 
 def test_request_tail_consolidation_is_lossless_ordered_and_final():

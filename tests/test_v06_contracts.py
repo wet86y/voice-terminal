@@ -1490,18 +1490,26 @@ def test_model_speak_state_separates_knowledge_from_continuation_authority():
     )
     assert previous == {
         "state": "speaking", "owner_scope": "previous_turn",
-        "continuation_allowed": False, "observed_text": "上一轮仍在播放",
+        "continuation_mode": "none",
+        "text_parts": {
+            "committed_prefix": "上一轮仍在播放", "current_clause": "",
+            "prefetched_clause": "", "revisable_tail": "",
+        },
     }
     current = AgentEpisodeRuntime._model_speak_state(
         snapshot, conversation_id="conversation", turn_id="old_turn",
     )
     assert current == {
         "state": "speaking", "owner_scope": "current_turn",
-        "continuation_allowed": True, "target_text": "上一轮仍在播放",
+        "continuation_mode": "append_only",
+        "text_parts": {
+            "committed_prefix": "上一轮仍在播放", "current_clause": "",
+            "prefetched_clause": "", "revisable_tail": "",
+        },
     }
     assert AgentEpisodeRuntime._model_speak_state(
         {"queue_status": "empty"}, conversation_id="conversation", turn_id="new_turn",
-    ) == {"state": "empty", "owner_scope": "none", "continuation_allowed": False}
+    ) == {"state": "empty", "owner_scope": "none", "continuation_mode": "none"}
 
 
 def test_speak_snapshot_never_attaches_delivery_from_a_different_handle():
@@ -1678,8 +1686,9 @@ def test_streamed_cross_turn_completed_prefix_is_stripped_before_tts():
         runtime_tail = next(entry["content"] for entry in packet["entries"]
                             if entry["kind"] == "runtime_state")
         assert '"state":"empty"' in runtime_tail
-        assert '"continuation_allowed":false' in runtime_tail
+        assert '"continuation_mode":"none"' in runtime_tail
         assert "target_text" not in runtime_tail
+        assert "observed_text" not in runtime_tail
 
     asyncio.run(scenario())
 
