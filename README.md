@@ -34,6 +34,13 @@ provider 合成进度。当 LLM 在同一轮里改口、而分歧点仍落在尚
 尾巴——已播出的前缀继续播放，不打断、不换事务、不新建 TTS 连接；分歧落在当前块或预取块内
 时仍走硬替换。`direct` 和旧 `playback_window` 继续作为兼容模式保留。
 
+模型上下文不会暴露播放器进度、PCM 边界或 provider 连接状态。活动 Speak 只在请求尾部以
+`owner_scope + continuation_mode + text_parts` 投影，其中正文固定拆为
+`committed_prefix`、`current_clause`、`prefetched_clause`、`revisable_tail` 四段且各出现一次；
+模型按这四段恢复完整计划，只有 `revisable_tail` 可在 `rewrite_tail` 模式下原地改写。该投影
+不进入静态 instructions 或 HISTORY，短句移动只影响当前请求尾部，因此不会破坏 DeepSeek
+前缀缓存。完整字段语义和缓存放置见[LLM 上下文缓存契约](docs/llm-context-cache-contract.md)。
+
 每个 session 只有一个长期存在的 `ShadowRuntime`，不存在 task ID、任务列表、任务队列、
 modify/reply/cancel/checkpoint 或多任务调度器。主 LLM不能发送任务文本或意图摘要，只能在完整
 decision 校验后异步调用固定动作 `request_shadow({"request":true})`。Shadow 从专用

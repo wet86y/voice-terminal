@@ -109,6 +109,86 @@ provider 只标记这一轮为不可直接回放，并把该轮（包括对应�
 runtime、Shadow 或调度代码都不得在其后追加内容。Provider 的 `text.format` Schema 仍是权威结构约束，
 尾部提示不能替代本地解析与校验。
 
+### 活动 Speak 的四段投影
+
+活动语音只存在于 `REQUEST_TAIL/runtime_state`。模型看到的是一份稳定键顺序、四段正文互不重复的
+运行时投影，而不是播放器或 TTS 的内部快照；可选的 `delivery.heard_text` 是独立的传达事实，
+不属于四段计划文本，因此允许与已传达正文重叠：
+
+```json
+{
+  "runtime": {
+    "speak": {
+      "state": "speaking",
+      "owner_scope": "current_turn",
+      "continuation_mode": "rewrite_tail",
+      "text_parts": {
+        "committed_prefix": "已经交给 TTS 且离开活动窗口的前缀。",
+        "current_clause": "当前短句。",
+        "prefetched_clause": "预取短句。",
+        "revisable_tail": "仍在本地、尚未交给 TTS 的后续内容。"
+      }
+    }
+  }
+}
+```
+
+字段语义由固定拼接顺序定义，不依赖 JSON 对象遍历顺序：
+
+```text
+planned_text = committed_prefix + current_clause + prefetched_clause + revisable_tail
+locked_text  = committed_prefix + current_clause + prefetched_clause
+```
+
+`committed_prefix`、`current_clause` 和 `prefetched_clause` 均已成功送入 TTS，属于当前
+事务的锁定前缀；其中前一段表示已经离开“当前块 + 一个预取块”的活动窗口，并不等于用户
+一定已经听到。`revisable_tail` 仍在本地短句队列或分段缓冲中，只有这一段可以在同轮改口时
+原地替换。`prefetched_clause` 最多只有一个；它已经锁定，即使播放器尚未开始播放也不能再
+宣称可改写。
+
+只要 `state` 不是 `empty`，四个 `text_parts` 键都必须存在；没有内容的部分使用 `""`，
+不能有时省略、有时使用 `null`。`state == "empty"` 时为节省 token 可以省略 `text_parts`，
+但仍保留 `state`、`owner_scope` 和 `continuation_mode`：
+
+```json
+{"state":"empty","owner_scope":"none","continuation_mode":"none"}
+```
+
+权限只由 `continuation_mode` 表达，不再发送重复布尔字段：
+
+| 值 | 模型行为 |
+| --- | --- |
+| `rewrite_tail` | 当前轮允许原地替换 `revisable_tail`，也可以在完整计划后追加；修改必须落在尾巴内。 |
+| `append_only` | 不得改写任何已锁定内容或声称修改本地尾巴；可以等待，或逐字保留完整计划后追加。 |
+| `none` | 当前 Speak 不是本轮续写目标；上一轮只能观察，确有新内容时创建独立回答。 |
+
+`owner_scope` 继续取 `current_turn`、`previous_turn` 或 `none`，表示语音事务所有权；它
+不表示可修改范围。上一轮仍在播放时也使用同一四段结构，但必须是
+`owner_scope=previous_turn` 且 `continuation_mode=none`。模型不得复制上一轮正文后追加到
+本轮回答。
+
+用户实际听到的事实与 TTS 锁定位置是两种不同语义。若存在同一 speech 的已验证传达记录，
+才在运行时投影可选的 `delivery.heard_text`；不能从 `current_clause` 或
+`prefetched_clause` 推断 heard。播放结算后，完整或部分传达仍只通过冻结的
+`<voice_delivery>` 在 HISTORY 末尾追加一次。
+
+以下字段继续只保留在执行层和诊断层，不得出现在模型请求：
+
+```text
+target_text / observed_text / continuation_allowed / tail_rewrite_allowed
+sent_chars / played_ms / synthesized_ms / speech_id / generation / playback_key
+PCM 字节位置 / 短句索引 / provider 连接状态 / TTS transport 状态
+```
+
+执行层仍以最新的 `sent_chars`、PCM receipt 和播放器 `output_estimated_ms` 作为唯一权威；
+模型结果应用前必须重新读取这些状态，不能直接复用请求开始时捕获的四段内容。
+
+Speak 投影使用固定构造顺序：`state`、`owner_scope`、`continuation_mode`、`text_parts`、
+`delivery`；`text_parts` 内部固定为 `committed_prefix`、`current_clause`、
+`prefetched_clause`、`revisable_tail`。继续使用紧凑 JSON（`ensure_ascii=False`、
+`separators=(",", ":")`）。短句移动、预取完成和尾巴改写只改变 HISTORY 之后的动态请求尾部，
+不写入 `STATIC_INSTRUCTIONS`，不回写既有 HISTORY，也不单独唤醒 LLM。
+
 人格上下文文件位于 `config/persona/`，由 Agent 在新的 episode 首次建立时读取一次。
 `instructions.md`、`personality.md` 和 `user.md` 均属于 `STATIC_INSTRUCTIONS`，并按
 “指令集合 → 人格主体 → 用户资料”的固定顺序追加到内置协议和动作目录之后。文件
