@@ -33,7 +33,7 @@ SR = 16000
 CORPUS_NOTE = """\
 语料局限（必须连同数字一起读）：
   * `logs/evaluation/audio/` 是 Microsoft Huihui Desktop 合成语音，不是真人录音
-    （见 docs/known-issues/kws-wake-recall-diagnosis.md）。
+    （见 docs/known-issues.md）。
   * 该目录中 8 个文件是同一次 60 秒录音的不同截断（首 20 秒字节相同），
     因此"同一说话人"的窗口高度相关，不能当作独立试对数量。
   * `sustained-20s.wav` 在两条独立声纹管线上都与其余文件相距很远，按另一个

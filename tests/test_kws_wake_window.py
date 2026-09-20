@@ -1,7 +1,7 @@
 """Reproduction of the KWS wake-window defect.
 
 These are *characterization* tests for the behaviour diagnosed in
-``docs/known-issues/kws-wake-recall-diagnosis.md``.  They pin down, with the
+``docs/known-issues.md``.  They pin down, with the
 real controller code, why a user who repeats the wake word hears nothing:
 
 1. while the microphone belongs to ASR (the "continuous conversation" window
