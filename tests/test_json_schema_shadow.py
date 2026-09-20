@@ -58,7 +58,9 @@ def test_prompt_matches_required_responses_wire_contract_and_has_short_examples(
     assert "state=wait 表示判断无需变更当前语音队列" in PROMPT
     assert "任何正常调用都可以使用 wait" in PROMPT
     assert "单纯无需新增播报、队列无需变化或队列为空时必须 wait，不能 cancel" in PROMPT
-    assert "绝不能把 target_text 原样作为新的 speak.text" in PROMPT
+    assert "绝不能把拼接后的计划文本原样作为新的 speak.text" in PROMPT
+    assert "committed_prefix、current_clause、prefetched_clause、revisable_tail" in PROMPT
+    assert "continuation_mode=rewrite_tail" in PROMPT
     assert "收到它们不等于必须 speak" in PROMPT
     assert "相关性、时效性、可靠性、是否已经表达" in PROMPT
     assert 'HISTORY 中 assistant 角色的 <voice_delivery>' in PROMPT

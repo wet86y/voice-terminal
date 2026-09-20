@@ -901,8 +901,13 @@ def test_system_check_keeps_system_identity_but_uses_current_speech_turn():
         assert runtime._last_model_speak_state == {
             "state": "speaking",
             "owner_scope": "current_turn",
-            "continuation_allowed": True,
-            "target_text": "我先说明第一点。",
+            "continuation_mode": "append_only",
+            "text_parts": {
+                "committed_prefix": "我先说明第一点。",
+                "current_clause": "",
+                "prefetched_clause": "",
+                "revisable_tail": "",
+            },
         }
 
         await _finish_blocking_request(runtime, provider)

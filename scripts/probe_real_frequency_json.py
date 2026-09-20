@@ -176,7 +176,9 @@ def build_messages(
 
     active = [speech for speech in speeches.values()
               if speech.accepted_at <= at and (speech.final_at is None or speech.final_at > at)]
-    speak_state: dict[str, Any] = {"state": "empty", "owner_scope": "none", "continuation_allowed": False}
+    speak_state: dict[str, Any] = {
+        "state": "empty", "owner_scope": "none", "continuation_mode": "none",
+    }
     if active:
         speech = max(active, key=lambda item: item.accepted_at)
         text = speech.text_at(at)
@@ -184,10 +186,14 @@ def build_messages(
         speak_state = {
             "state": "speaking",
             "owner_scope": "current_turn" if same_turn else "previous_turn",
-            "continuation_allowed": same_turn,
+            "continuation_mode": "append_only" if same_turn else "none",
+            "text_parts": {
+                "committed_prefix": text,
+                "current_clause": "",
+                "prefetched_clause": "",
+                "revisable_tail": "",
+            },
         }
-        if text:
-            speak_state["target_text" if same_turn else "observed_text"] = text
     semantic = CurrentInput(
         text=current, primary_transcript=current, finalized=finalized,
         user_speaking=user_speaking, recent_events=events, turn_id=turn_id,

@@ -129,15 +129,22 @@ runtime、Shadow 或调度代码都不得在其后追加内容。Provider 的 `t
 | 尚未提交的当前用户输入 | Context projector | REQUEST_TAIL / `current_user_input` | 否 | 否 | wrapper/order test |
 | `HH:MM:SS` 秒级时间 | Context projector | REQUEST_TAIL / `runtime_state` | 否 | 否 | tail placement test |
 | 跨午夜日期 epoch | Conversation runtime | REQUEST_TAIL | 否 | 否 | midnight test |
-| 活跃 speak state/target_text | Speech runtime | REQUEST_TAIL | 否 | 否 | append/replace/cancel test |
+| 活跃 speak `state/owner_scope/continuation_mode/text_parts` | Speech runtime | REQUEST_TAIL / `runtime_state` | 否 | 否 | append/rewrite/replace、placement、digest test |
 | 工具实时可用性、恢复反馈 | Agent runtime | REQUEST_TAIL / typed entry | 否 | 否 | frozen schema test |
 | 最终 JSON 输出边界 | Agent runtime | REQUEST_TAIL / `output_constraint` | 否 | 否 | final-position test |
 
-时间尾部格式为 `{"runtime":{"clock":{"local_time":"HH:MM:SS","precision":"second"},"speak":...}}`。非 empty speak 才带 `target_text`，让 LLM 自行决定 append、replace、wait 或 cancel；当前进度不得伪造为实时 heard cursor。会话跨午夜不 reset：静态基准保留，尾部持续附加新的日期 epoch、星期和时区。
+时间尾部格式为 `{"runtime":{"clock":{"local_time":"HH:MM:SS","precision":"second"},"speak":...}}`。
+非 empty speak 固定使用 `text_parts={committed_prefix,current_clause,prefetched_clause,revisable_tail}`，
+正文在四段中各出现一次；`owner_scope` 表达所有权，`continuation_mode` 只能是
+`rewrite_tail`、`append_only` 或 `none`。四段、活动窗口和权限只属于 REQUEST_TAIL，不能写入
+instructions 或 HISTORY；current/prefetched 也不得伪造为实时 heard cursor。会话跨午夜不 reset：
+静态基准保留，尾部持续附加新的日期 epoch、星期和时区。
 
 ## 不可违反的规则
 
 - 不要把动态 system 状态、时间、可用性或恢复反馈追加到 `instructions`。
+- 不要把活动 Speak 的 `text_parts`、owner、continuation mode 或 TTS 窗口写入 `instructions`
+  或 HISTORY；只有结算后的冻结 `voice_delivery` 可以追加到 HISTORY。
 - 不要改写、截断、摘要、重排 HISTORY，也不要把未听到的文本写为 assistant 历史。
 - 不要向模型发送 request/speech/turn ID、调度 tick、性能时间或 Unix timestamp。
 - 不要在会话中更换动作目录、strict schema 或 `request_thinking` 可见性；不可用状态只能进入 tail，本地仍执行参数和权限校验。
@@ -152,7 +159,13 @@ runtime、Shadow 或调度代码都不得在其后追加内容。Provider 的 `t
 
 ```powershell
 python .\scripts\probe_context_cache.py --model deepseek-chat
+python .\scripts\probe_context_cache.py --model deepseek-chat --dynamic-speak
 python .\scripts\probe_context_cache.py --model deepseek-chat --dynamic-instructions
 ```
 
-首个命令执行三轮 append-only 历史并让尾部秒级时间变化，输出每轮 `input_tokens/cached_tokens/hit_ratio`；第 2、3 轮 cached tokens 应随着历史增长。第二个命令是把秒级时间错误放进 instructions 的反例，命中会退化为较短的固定前缀；它只用于报告，绝不能进入生产代码。中转 profile 单独记录，缺少 usage 字段时结论为“不可观测”。
+探针使用足够长的合成静态协议前缀，并在轮次间短暂等待 best-effort 缓存落盘；不会发送生产
+prompt 或用户数据。首个命令执行三轮 append-only 历史并让尾部秒级时间变化，输出每轮
+`input_tokens/cached_tokens/hit_ratio`；第二个命令同时让四段 Speak 只在 REQUEST_TAIL 中推进，
+两者的第 2、3 轮 cached tokens 都应随着稳定历史增长。最后一个命令是把秒级时间错误放进
+instructions 的反例，命中会退化为较短的固定前缀；它只用于报告，绝不能进入生产代码。
+中转 profile 单独记录，缺少 usage 字段时结论为“不可观测”。

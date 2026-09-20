@@ -26,8 +26,9 @@ python -m pytest -q tests/test_opencode_go_shadow_e2e.py
   侧载超时、异常、非法 Schema、uncertain、迟到 activation 或关闭开关必须 fail-open；
 - 首条摘要不依赖 context gate；Observer 只接收协议安全的纯文本观察记录，不接收原始 reasoning
   或 Responses 工具项，请求失败时缩短重试并发布静态兜底；
-- 正常请求默认允许 `wait` 表示语音队列无需变更；重复 `target_text`、`heard_text` 或 assistant
-  历史必须被禁止，`cancel` 仅用于必须停止现有语音且没有替代文本的情况；
+- 正常请求默认允许 `wait` 表示语音队列无需变更；重复 `runtime.speak.text_parts`、
+  `delivery.heard_text` 或 assistant 历史必须被禁止，`cancel` 仅用于必须停止现有语音且没有
+  替代文本的情况；
 - 80% token 阈值在安全边界换代，失败不丢失旧 trace；
 - 20+ Responses/tool 循环没有 task ID、并行 runner 或结果自反馈；
 - stop 保留 Shadow，reset/close 清理，Shadow 故障不破坏语音。
@@ -152,7 +153,8 @@ python -m unittest discover -s tests -v
 2. 区分可恢复的 `controller.input_frame_failed` 与真正读取失败的 `AUDIO_*`；
 3. 对照 `audio.player_first_pcm_submitted`、`audio.player_drained` 和 `speech_id`；
 4. 只有明确 `command=session.stop` 才归因为用户停止；
-5. 查 `agent.speak_context` 的 owner_scope/continuation_allowed，确认跨轮旧前缀已在 TTS 前剥离。
+5. 查 `agent.speak_context` 的 owner_scope/continuation_mode，确认跨轮旧前缀只作为观察状态，
+   没有被当作当前轮续写目标。
 
 受保护插话拒绝的麦克风帧仍必须进入当前轮有界 PCM 缓存，避免下一帧被误判为逻辑缺口。
 

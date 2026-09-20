@@ -8,8 +8,10 @@ HISTORY，播放器与当前调度状态只进入 REQUEST_TAIL。未传达的 as
 主模型每次先判断是否需要变更当前语音队列：`wait` 是正常调用中的通用“不变更队列”决策，
 不因收到用户、工具、调度或 Shadow 事件就默认开口；`speak` 只用于仍相关且尚未传达的新内容；
 `cancel` 只用于必须停止现有待播/播放内容且没有可立即替换文本的情况。KWS 等明确要求确认的
-系统场景可以例外。已存在于 `target_text`、`observed_text`、`heard_text` 或 assistant 历史中的
-内容不得逐字或换一种措辞重复；`continuation_allowed` 只允许确有新增后缀时追加。
+系统场景可以例外。活动 Speak 只在 REQUEST_TAIL 中以
+`owner_scope + continuation_mode + text_parts` 投影；四段正文按
+`committed_prefix + current_clause + prefetched_clause + revisable_tail` 恢复且各出现一次。
+已存在于该计划、`delivery.heard_text` 或 assistant 历史中的内容不得逐字或换一种措辞重复。
 
 Shadow 使用独立 `ShadowContextProjector`。它读取同一个 `SessionLedger`，但只输出判断用户意图
 和执行只读工作所需的权威语义帧：

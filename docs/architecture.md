@@ -38,8 +38,11 @@ EpisodeSpeechOutput` 构成。Shadow 是同一会话持有的认知执行平面�
 一个播报事务中的文本有两条线：**已接收**（`SpeechHandle.text`，模型本次输出的全部文本）和
 **已送出**（`sent_chars`，真正交给 TTS provider 的字符数）。只有已送出的部分不可撤回。
 
-`speak_snapshot` 因此同时给出 `text`、`sent_chars`、`rewritable`、`played_ms` 和
-`synthesized_ms`。判定一个到达的 decision 是否与正在播放的内容冲突时，基准是**发送前沿**
+本地 `speak_snapshot` 因此同时保留 `text`、`sent_chars`、`rewritable`、`played_ms` 和
+`synthesized_ms`。这些执行字段不直接发送给模型；REQUEST_TAIL 把文本无重复地投影为
+`committed_prefix/current_clause/prefetched_clause/revisable_tail`，并用 `continuation_mode`
+表达可改尾巴、只追加或不可续写。判定一个到达的 decision 是否与正在播放的内容冲突时，
+基准仍是**发送前沿**
 而不是整段已接收文本：
 
 - 新文本仍在发送前沿之内 → 等待，尚不能判定；
@@ -66,8 +69,9 @@ reset 都会丢弃尚未领取的错误预热连接。
 主语音状态的决策先回答“是否需要变更当前语音队列”：`wait` 是正常调用中的通用队列不变更
 决策，适用于没有新内容、现有语音仍正确、内容已经传达、Shadow 只是状态或事件已经过时等情况；
 `speak` 只用于仍相关且尚未传达的新内容；`cancel` 仅用于必须停止现有待播/播放内容且没有
-可立即替换文本的情况。`continuation_allowed` 不表示需要重播 `target_text`，没有新增后缀时
-必须 `wait`。KWS 等明确要求确认的系统场景是显式例外。
+可立即替换文本的情况。`continuation_mode=rewrite_tail` 只授权修改本地 `revisable_tail`，
+`append_only` 只授权逐字保留完整计划后追加；没有新增内容或明显必要优化时必须 `wait`。
+KWS 等明确要求确认的系统场景是显式例外。
 
 ## 单一 ShadowRuntime
 
