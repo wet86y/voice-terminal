@@ -204,12 +204,15 @@ class TtsConfig:
     # while the returned-but-unplayed audio stays below this value, so the tail
     # of a live response stays locally replaceable for as long as possible.
     admission_lead_ms: int = 2500
+    sentence_prefetch_ms: int = 2000
+    sentence_tick_ms: int = 50
+    first_clause_timeout_ms: int = 400
 
     def __post_init__(self) -> None:
         if self.transport not in {"websocket", "websocket_bidi"}:
             raise ValueError("tts.transport must be websocket or websocket_bidi")
-        if self.scheduling not in {"auto", "direct", "playback_window"}:
-            raise ValueError("tts.scheduling must be auto, direct, or playback_window")
+        if self.scheduling not in {"auto", "direct", "playback_window", "sentence_window"}:
+            raise ValueError("tts.scheduling must be auto, direct, playback_window, or sentence_window")
         # A Bidi deployment may use playback_window for its lead window.  The
         # legacy per-segment completion wait stays unavailable there because
         # the server breaks sentences itself: one sent frame is not one server
@@ -217,6 +220,12 @@ class TtsConfig:
         # behaviours are selected independently in the speech pipeline.
         if self.admission_lead_ms <= 0:
             raise ValueError("tts.admission_lead_ms must be positive")
+        if self.sentence_prefetch_ms <= 0:
+            raise ValueError("tts.sentence_prefetch_ms must be positive")
+        if self.sentence_tick_ms <= 0:
+            raise ValueError("tts.sentence_tick_ms must be positive")
+        if self.first_clause_timeout_ms <= 0:
+            raise ValueError("tts.first_clause_timeout_ms must be positive")
         if self.subtitle_type not in {"sentence", "word", "word_streaming"}:
             raise ValueError("tts.subtitle_type is invalid")
         if self.audio_cache_max_bytes <= 0 or self.cancel_timeout_ms <= 0 or self.keepalive_seconds <= 0:
@@ -734,6 +743,9 @@ class AppConfig:
                 emotion_transport=_string(tts.get("emotion_transport"), "voice_setting"),
                 session_reuse=_bool(tts.get("session_reuse"), True),
                 admission_lead_ms=int(_number(tts.get("admission_lead_ms"), 2500)),
+                sentence_prefetch_ms=int(_number(tts.get("sentence_prefetch_ms"), 2000)),
+                sentence_tick_ms=int(_number(tts.get("sentence_tick_ms"), 50)),
+                first_clause_timeout_ms=int(_number(tts.get("first_clause_timeout_ms"), 400)),
             ),
             text_bridge=TextBridgeConfig(
                 min_chars=int(_number(bridge.get("min_chars"), 8)),

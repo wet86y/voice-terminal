@@ -5,7 +5,8 @@ import logging
 import time
 from ..stream.text_bridge import TextBridge
 from ..tts.alignment import DeliveryResolver
-from ..tts.scheduling import DirectStreamingPolicy, PlaybackProgress, PlaybackWindowPolicy
+from ..tts.scheduling import DirectStreamingPolicy, PlaybackProgress, PlaybackWindowPolicy, TtsSegmentReceipt
+from ..tts.sentence_segmenter import PunctuationSentenceSegmenter, split_complete_text
 from ..tts.text_merger import BidiTextMerger
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,8 @@ class AdmissionState:
     atomic with respect to each other and no extra lock is required.
     """
 
-    def __init__(self, *, lead_ms: int, char_limit: int = ADMISSION_STAGING_CHARS) -> None:
+    def __init__(self, *, lead_ms: int, char_limit: int = ADMISSION_STAGING_CHARS,
+                 restage=None) -> None:
         self.lead_ms = lead_ms
         self.char_limit = char_limit
         self.staged: deque[str] = deque()
@@ -46,6 +48,7 @@ class AdmissionState:
         self.epoch = 0
         self.closed = False
         self.overrun_reported = False
+        self._restage = restage or (lambda value: [value] if value else [])
         self.signal = asyncio.Event()
 
     @property
@@ -91,9 +94,11 @@ class AdmissionState:
         # Bumping the epoch invalidates a frame the sender may already hold
         # between popping it and handing it to the provider.
         self.epoch += 1
-        if suffix:
-            self.push(suffix)
-        else:
+        replacements = self._restage(suffix)
+        for segment in replacements:
+            if segment:
+                self.push(segment)
+        if not replacements:
             self.signal.set()
         return dropped
 
@@ -111,7 +116,11 @@ async def buffered_stream(source, bridge):
             if pending is None:
                 pending = asyncio.create_task(iterator.__anext__())
             text = getattr(bridge, "pending_text", getattr(bridge, "buffer", ""))
-            timeout = bridge.max_wait_ms / 1000 if len(text) >= getattr(bridge, "min_chars", 1) else None
+            wait_reader = getattr(bridge, "flush_wait_seconds", None)
+            if callable(wait_reader):
+                timeout = wait_reader(now=time.monotonic())
+            else:
+                timeout = bridge.max_wait_ms / 1000 if len(text) >= getattr(bridge, "min_chars", 1) else None
             ready, _ = await asyncio.wait({pending}, timeout=timeout)
             if not ready:
                 yield FLUSH_DUE
@@ -149,9 +158,12 @@ class SpeechPipeline:
     def _new_tts_session(self, ws, *, fresh=False):
         """Factory hook for transaction-owned output implementations."""
         try:
-            return self.tts.session(fresh=fresh)
+            return self.tts.session(fresh=fresh, turn_id=ws.turn_id)
         except TypeError:
-            return self.tts.session()
+            try:
+                return self.tts.session(fresh=fresh)
+            except TypeError:
+                return self.tts.session()
 
     def _bind_tts_session(self, ws, session):
         self._tts_session = session
@@ -167,7 +179,6 @@ class SpeechPipeline:
     async def _play_stream(self, ws, token, deltas, *, speech_id: str | None = None,
                            handle=None) -> str:
         transport = getattr(self.tts, "transport", "websocket") if self.tts is not None else "websocket"
-        bridge = BidiTextMerger(max_chars=128, max_wait_ms=30) if transport == "websocket_bidi" else TextBridge(**self.bridge_options)
         session = None
         reader = None
         sender_task = None
@@ -181,6 +192,17 @@ class SpeechPipeline:
             "effective_scheduling",
             getattr(self.tts, "scheduling", "auto") if self.tts is not None else "auto",
         )
+        sentence_window_enabled = configured_scheduling == "sentence_window"
+        if sentence_window_enabled:
+            bridge = PunctuationSentenceSegmenter(
+                first_clause_timeout_ms=max(
+                    1, int(getattr(self.tts, "first_clause_timeout_ms", 400))
+                )
+            )
+        elif transport == "websocket_bidi":
+            bridge = BidiTextMerger(max_chars=128, max_wait_ms=30)
+        else:
+            bridge = TextBridge(**self.bridge_options)
         # The lead window and the legacy per-segment completion wait are two
         # independent behaviours.  A Bidi server breaks sentences itself, so
         # one sent frame is never one server segment and waiting for "this
@@ -191,13 +213,16 @@ class SpeechPipeline:
             lead_ms = max(1, int(self.options.tts_lead_ms))
         else:
             lead_ms = 0
-        lead_window_enabled = bool(lead_ms and self.player is not None)
+        lead_window_enabled = bool(lead_ms and self.player is not None and not sentence_window_enabled)
         segment_waits_enabled = bool(lead_window_enabled and transport != "websocket_bidi")
         scheduling_policy = (
             PlaybackWindowPolicy(lead_ms) if lead_window_enabled else DirectStreamingPolicy()
         )
         # Text accepted after ``sent_chars`` is still ours to replace.
-        state = AdmissionState(lead_ms=lead_ms)
+        state = AdmissionState(
+            lead_ms=lead_ms,
+            restage=split_complete_text if sentence_window_enabled else None,
+        )
         if handle is not None:
             handle.admission = state
         audio_signal = asyncio.Event()
@@ -205,6 +230,10 @@ class SpeechPipeline:
         producer_done = False
         audio_returned_bytes = 0
         tts_text_sent = False
+        segment_receipts: deque[TtsSegmentReceipt] = deque()
+        prefetch_miss_boundary_ms: int | None = None
+        sentence_prefetch_ms = max(1, int(getattr(self.tts, "sentence_prefetch_ms", 2000)))
+        sentence_tick_seconds = max(0.001, int(getattr(self.tts, "sentence_tick_ms", 50)) / 1000)
         progress_lock = asyncio.Lock()
         last_progress: tuple[int, int, int, int, int] | None = None
         last_progress_at = 0.0
@@ -315,6 +344,7 @@ class SpeechPipeline:
                     audio_remaining_ms=int(snapshot["remaining_ms"]),
                     pacing_enabled=lead_window_enabled,
                     segment_waits_enabled=segment_waits_enabled,
+                    sentence_window_enabled=sentence_window_enabled,
                     sent_chars=state.sent_chars,
                     staged_chars=state.staged_chars,
                     lead_ms=lead_ms,
@@ -347,6 +377,7 @@ class SpeechPipeline:
                     audio_returned_bytes += len(pcm)
                     audio_signal.set()
                     ws.timings.setdefault("first_audio", time.monotonic())
+                    ws.timings.setdefault("first_pcm", time.monotonic())
                     if self.player:
                         # Keep the native player bounded.  Audio held by the
                         # provider spool is included in audio_remaining_ms
@@ -474,6 +505,44 @@ class SpeechPipeline:
                 lambda snapshot: emit_progress(status="WAITING_PLAYBACK", trigger="lead_window"),
             )
 
+        async def wait_for_sentence_window() -> None:
+            """Admit one more complete clause from local staging.
+
+            Receipts are cumulative PCM boundaries.  Keeping at most two of
+            them means the provider owns only the currently playing block and
+            one prefetched block; every later clause remains locally
+            replaceable regardless of provider synthesis speed.
+            """
+
+            nonlocal prefetch_miss_boundary_ms
+            if not sentence_window_enabled or self.player is None:
+                return
+            while self._valid(token) and not tts_disabled:
+                output_ms = int(playback_progress()["output_estimated_ms"])
+                while segment_receipts:
+                    boundary_ms = int(
+                        segment_receipts[0].end_received_bytes * 1000 / audio_bytes_per_second
+                    )
+                    if output_ms < boundary_ms:
+                        break
+                    had_prefetched_successor = len(segment_receipts) > 1
+                    segment_receipts.popleft()
+                    if not had_prefetched_successor and output_ms > boundary_ms:
+                        prefetch_miss_boundary_ms = boundary_ms
+                if not segment_receipts:
+                    return
+                current_end_ms = int(
+                    segment_receipts[0].end_received_bytes * 1000 / audio_bytes_per_second
+                )
+                remaining_ms = max(0, current_end_ms - output_ms)
+                if len(segment_receipts) == 1 and remaining_ms <= sentence_prefetch_ms:
+                    return
+                await emit_progress(
+                    status="WAITING_PLAYBACK",
+                    trigger="sentence_window",
+                )
+                await asyncio.sleep(sentence_tick_seconds)
+
         async def next_segment() -> str | None:
             while True:
                 segment = state.pop()
@@ -489,9 +558,13 @@ class SpeechPipeline:
 
         async def tts_sender() -> None:
             nonlocal session, reader, progress_task, tts_failed, tts_disabled, tts_text_sent
+            nonlocal prefetch_miss_boundary_ms
             sent_any = False
             try:
                 while True:
+                    if sent_any and producer_done and not state.staged:
+                        state.close()
+                        return
                     if sent_any:
                         # Wait for the admission window before taking ownership
                         # of the next unsent frame.  A frame that is merely
@@ -500,7 +573,10 @@ class SpeechPipeline:
                         await self._wait_for_playback_permission(ws, token)
                         if not self._valid(token) or not ws.committed:
                             return
-                        await wait_for_playback_window()
+                        if sentence_window_enabled:
+                            await wait_for_sentence_window()
+                        else:
+                            await wait_for_playback_window()
                         if not self._valid(token):
                             return
                     segment = await next_segment()
@@ -521,7 +597,13 @@ class SpeechPipeline:
                         session = self._new_tts_session(ws)
                         self._bind_tts_session(ws, session)
                         checkout = getattr(self.tts, "checkout_prewarm", None)
-                        warm = bool(checkout(session)) if callable(checkout) else False
+                        if callable(checkout):
+                            try:
+                                warm = bool(checkout(session, turn_id=ws.turn_id))
+                            except TypeError:
+                                warm = bool(checkout(session))
+                        else:
+                            warm = False
                         checkout_reason = getattr(
                             self.tts, "last_prewarm_checkout_reason",
                             "not_available" if not callable(checkout) else "not_prewarmed",
@@ -543,8 +625,16 @@ class SpeechPipeline:
                                     and prewarm_ready is not None):
                                 await prewarm_ready.wait()
                                 if callable(checkout):
-                                    warm = bool(checkout(session))
-                            if not getattr(session, "reusable", True):
+                                    try:
+                                        warm = bool(checkout(session, turn_id=ws.turn_id))
+                                    except TypeError:
+                                        warm = bool(checkout(session))
+                            session_usable = (
+                                getattr(session, "reusable", True)
+                                if getattr(session, "bidi", False)
+                                else getattr(session, "connection_ready", True)
+                            )
+                            if not session_usable:
                                 # A failed/cancelled prewarm may have closed
                                 # the shared candidate while this sender was
                                 # waiting for it.  Fall back to a fresh cold
@@ -571,7 +661,10 @@ class SpeechPipeline:
                             # first speak on the warm path without sending a
                             # second task_start.
                             if not warm and callable(checkout):
-                                warm = bool(checkout(session))
+                                try:
+                                    warm = bool(checkout(session, turn_id=ws.turn_id))
+                                except TypeError:
+                                    warm = bool(checkout(session))
                             checkout_reason = getattr(
                                 self.tts, "last_prewarm_checkout_reason",
                                 "not_available" if not callable(checkout) else "not_prewarmed",
@@ -634,6 +727,7 @@ class SpeechPipeline:
                     before_bytes = audio_returned_bytes
                     before_segments = getattr(session, "completed_segments", 0)
                     ws.timings.setdefault("first_tts_text", time.monotonic())
+                    ws.timings.setdefault("first_task_continue", time.monotonic())
                     self.state.current["tts_text"] = segment
                     resolver.add_text(segment, int(playback_progress()["returned_ms"]))
                     await session.send_text(segment)
@@ -651,7 +745,44 @@ class SpeechPipeline:
                     # current segment's final response before evaluating the
                     # total playback backlog and releasing another segment.
                     wait_for_segment = getattr(session, "wait_for_segment", None)
-                    if segment_waits_enabled and wait_for_segment is not None:
+                    if sentence_window_enabled:
+                        if wait_for_segment is None:
+                            raise RuntimeError("TTS session 不支持短句块完成回执")
+                        previous_boundary_ms = (
+                            int(segment_receipts[-1].end_received_bytes * 1000 / audio_bytes_per_second)
+                            if segment_receipts else None
+                        )
+                        receipt = await wait_for_segment(before_segments)
+                        if not isinstance(receipt, TtsSegmentReceipt):
+                            try:
+                                receipt = TtsSegmentReceipt(
+                                    index=int(receipt.index),
+                                    text_chars=int(receipt.text_chars),
+                                    end_received_bytes=int(receipt.end_received_bytes),
+                                )
+                            except (AttributeError, TypeError, ValueError) as exc:
+                                raise RuntimeError("TTS session 返回了无效的短句块回执") from exc
+                        if segment_receipts and receipt.end_received_bytes <= segment_receipts[-1].end_received_bytes:
+                            raise RuntimeError("TTS 短句块回执边界没有递增")
+                        segment_receipts.append(receipt)
+                        miss_boundary_ms = (
+                            previous_boundary_ms
+                            if previous_boundary_ms is not None
+                            else prefetch_miss_boundary_ms
+                        )
+                        prefetch_miss_boundary_ms = None
+                        if miss_boundary_ms is not None:
+                            output_ms = int(playback_progress()["output_estimated_ms"])
+                            if output_ms > miss_boundary_ms:
+                                miss_ms = output_ms - miss_boundary_ms
+                                ws.timings["prefetch_miss_ms"] = max(
+                                    int(ws.timings.get("prefetch_miss_ms", 0)), miss_ms
+                                )
+                                logger.warning(
+                                    "controller.tts_prefetch_miss turn_id=%s miss_ms=%d block=%d",
+                                    ws.turn_id, miss_ms, receipt.index,
+                                )
+                    elif segment_waits_enabled and wait_for_segment is not None:
                         await wait_for_segment(before_segments)
                     else:
                         await wait_for_provider_catch_up(before_bytes)
@@ -675,6 +806,7 @@ class SpeechPipeline:
                     continue
                 if tts_disabled or not self._valid(token):
                     return
+                ws.timings.setdefault("first_clause_ready", time.monotonic())
                 # Staging never blocks its producer.  Blocking here would
                 # propagate the playback clock back into the LLM reader, and a
                 # long answer would then stall until the provider deadline.
@@ -697,6 +829,7 @@ class SpeechPipeline:
                     await send(bridge.finish())
                     continue
                 ws.timings.setdefault("first_token", time.monotonic())
+                ws.timings.setdefault("first_llm_text", time.monotonic())
                 parts.append(delta)
                 self.state.current["assistant_text"] = "".join(parts)
                 ws.staged_response = "".join(parts).strip()
