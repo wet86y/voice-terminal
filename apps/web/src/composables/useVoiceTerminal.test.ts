@@ -553,4 +553,51 @@ describe('V0.6 session protocol', () => {
     expect(terminal.shadowProduct.value.activities?.some(item => item.item_id === 'thinking-8')).toBe(true)
     expect(terminal.shadowProduct.value.activities?.some(item => item.item_id === 'late-7')).toBe(false)
   })
+
+  it('keeps a DSH observer summary and its activity synchronized in the WebUI', () => {
+    const { socket, terminal } = openTerminal()
+    const summary = '已确认 DSH 正在处理当前任务，已提交一个模型步骤，当前没有待处理工具。'
+
+    socket.push('runtime.snapshot', 1, {
+      state: 'IDLE', listening: false, can_start: true,
+      services: { audio: 'READY', kws: 'DISABLED', asr: 'READY', llm: 'READY', tts: 'READY' },
+      current: {},
+      shadow: {
+        available: true, active: true, phase: 'working', user_input_required: false,
+        focus: '', summary: '', timeline: [], activities: [],
+      },
+    })
+    // The Bridge publishes the public activity first.  The following product
+    // snapshot is authoritative and must retain the same observer item while
+    // making its summary immediately available to the rendered status card.
+    socket.push('shadow.activity', 2, {
+      run_seq: 4, item_id: 'observer-4', stream: 'thinking', phase: 'delta',
+      text: summary, timestamp: '2026-09-21T12:00:01.000Z',
+    })
+    socket.push('shadow.product', 3, {
+      available: true, active: true, phase: 'working', user_input_required: false,
+      focus: summary, summary,
+      timeline: [{
+        state: 'active', label: '状态汇报', text: summary,
+        timestamp: '2026-09-21T12:00:01.000Z',
+      }],
+      activities: [{
+        run_seq: 4, item_id: 'observer-4', stream: 'thinking', phase: 'delta',
+        text: summary, timestamp: '2026-09-21T12:00:01.000Z',
+      }],
+      last_activity_at: '2026-09-21T12:00:01.000Z',
+    })
+
+    expect(terminal.shadowProduct.value.summary).toBe(summary)
+    expect(terminal.shadowProduct.value.timeline).toEqual([
+      expect.objectContaining({ label: '状态汇报', text: summary }),
+    ])
+    expect(terminal.shadowProduct.value.activities).toEqual([
+      expect.objectContaining({
+        run_seq: 4, item_id: 'observer-4', stream: 'thinking', phase: 'delta', text: summary,
+      }),
+    ])
+    expect(terminal.shadowProduct.value.last_activity_at).toBe('2026-09-21T12:00:01.000Z')
+    terminal.dispose()
+  })
 })

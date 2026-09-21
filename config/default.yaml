@@ -15,6 +15,8 @@ shadow_agent:
   # Session-scoped single Shadow Agent. The voice model can only wake it;
   # intent and tools are driven from authoritative conversation context.
   enabled: true
+  # Fixed when a new Voice Session is created; never hot-switches or fails over.
+  backend: dsh
   debug_websocket_enabled: false
   # Experimental sidecar gate only changes injection timing; context remains intact.
   experimental_context_gate_enabled: false
@@ -45,6 +47,23 @@ shadow_agent:
       base_url: https://api.minimaxi.com
       api_key_env: MINIMAX_API_KEY
       timeout_ms: 15000
+
+dsh:
+  enabled: true
+  auto_start: true
+  source_dir: .runtime/dsh/source
+  home_dir: .runtime/dsh/home
+  profile: web
+  host: 127.0.0.1
+  port: 3081
+  startup_timeout_ms: 120000
+  shutdown_timeout_ms: 5000
+  bridge_timeout_ms: 15000
+  bridge_protocol_version: "1.0"
+  restart_limit: 2
+  restart_delay_ms: 1000
+  expected_version: 0.1.5-rc.2
+  expected_commit: fb2c4b9e698e30edb738bca4cf0618587db7d203
 
 # Episode-scoped Markdown context. Files are read when a new Agent episode
 # starts and remain frozen for that episode.

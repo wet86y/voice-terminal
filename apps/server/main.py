@@ -115,10 +115,12 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
                 f"model_registry_scan: {type(exc).__name__}: {str(exc)[:260]}"
             )
         await runtime.initialize()
+        runtime.dsh.begin_start()
         try:
             yield
         finally:
             await runtime.close()
+            await runtime.dsh.close()
 
     app = create_app(
         runtime,

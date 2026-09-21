@@ -71,13 +71,14 @@ class ProductApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(
-            set(body), {"schema_version", "runtime", "conversation", "shadow", "settings", "models", "warnings"},
+            set(body), {"schema_version", "runtime", "conversation", "shadow", "dsh", "settings", "models", "warnings"},
         )
         self.assertIn("current", body["conversation"])
         self.assertIn("services", body["runtime"])
         rendered = repr(body).lower()
         self.assertNotIn("api_key", rendered)
         self.assertNotIn("credential_ref", rendered)
+        self.assertNotIn("token=", rendered)
 
         invalid_silence = asyncio.run(self._request(
             "PUT", "/api/v1/product/settings/silence", json={"seconds": 4},
@@ -170,6 +171,43 @@ class ProductApiTests(unittest.TestCase):
         ))
         self.assertNotEqual(blocked.headers.get("access-control-allow-origin"), "*")
         self.assertIsNone(blocked.headers.get("access-control-allow-origin"))
+
+    def test_dsh_launch_is_origin_json_and_ready_gated(self) -> None:
+        status = asyncio.run(self._request("GET", "/api/v1/dsh/status"))
+        self.assertEqual(status.status_code, 200)
+        self.assertNotIn("token", repr(status.json()).lower())
+
+        blocked = asyncio.run(self._request(
+            "POST", "/api/v1/dsh/ui-launch", json={},
+            headers={"Origin": "http://evil.example"},
+        ))
+        self.assertEqual(blocked.status_code, 403)
+
+        wrong_type = asyncio.run(self._request(
+            "POST", "/api/v1/dsh/ui-launch", content="{}",
+            headers={"Origin": "http://127.0.0.1:5173", "Content-Type": "text/plain"},
+        ))
+        self.assertEqual(wrong_type.status_code, 415)
+
+        self.runtime.dsh._state = "starting"
+        starting = asyncio.run(self._request(
+            "POST", "/api/v1/dsh/ui-launch", json={},
+            headers={"Origin": "http://127.0.0.1:5173"},
+        ))
+        self.assertEqual(starting.status_code, 409)
+
+        self.runtime.dsh._state = "ready"
+        self.runtime.dsh._launch_url = "http://127.0.0.1:3081/?token=secret-launch-token"
+        ready = asyncio.run(self._request(
+            "POST", "/api/v1/dsh/ui-launch", json={},
+            headers={"Origin": "http://127.0.0.1:5173"},
+        ))
+        self.assertEqual(ready.status_code, 200)
+        self.assertEqual(ready.headers["cache-control"], "no-store")
+        self.assertEqual(ready.json()["url"], self.runtime.dsh._launch_url)
+
+        snapshot = asyncio.run(self._request("GET", "/api/v1/product/snapshot"))
+        self.assertNotIn("secret-launch-token", snapshot.text)
 
 
 if __name__ == "__main__":

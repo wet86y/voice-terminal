@@ -1,0 +1,6 @@
+- id: agent-presets
+  config:
+    default: shadow-agent
+
+- id: session-log-deepseek
+  disabled: true

@@ -89,6 +89,7 @@ def test_shadow_priority_and_normal_events_wake_main_scheduler_but_progress_does
             None, Registry(), SimpleNamespace(status="IDLE"), emit,
             conversation=ConversationRuntime(), ledger=SessionLedger(),
         )
+        runtime.ledger.set_shadow_runtime_state(available=True, active=True)
         wakes = []
         runtime._wake = wakes.append
         await runtime.accept_shadow_event(
@@ -106,6 +107,8 @@ def test_shadow_priority_and_normal_events_wake_main_scheduler_but_progress_does
         payload = runtime.ledger.entries[-1].content
         assert payload["kind"] == "user_input_required"
         assert payload["payload"]["options"] == ["A", "B"]
+        model_context = runtime.messages({"SHADOW_EVENT"})
+        assert any("正在等待用户说明" in item["content"] for item in model_context)
 
     asyncio.run(scenario())
 

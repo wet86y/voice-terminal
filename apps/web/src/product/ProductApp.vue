@@ -20,7 +20,7 @@ const {
   providerStep, discoveredModels, modelAssignments, uiModels: modelEntries,
   availableLlmModels, availableTtsModels, visibleLocalPool, hiddenPool,
   managedApiModelPool, selectedModels, activeModels, selectedTtsProfile, selectedTtsModel, activeTtsModel, registry,
-  shadowExpanded, modelScanState, restartState, applyImpact,
+  shadowExpanded, modelScanState, restartState, applyImpact, dsh, openDshConsole,
   lastError, notice, noticeVisible, runtimeAction, resetSession, setReasoningMode,
   toggleProviderReasoning,
   saveWake, saveSilence, saveShadowGate, savePersona, scanModels, discoverProvider, verifyCustomModel,
@@ -894,6 +894,17 @@ function pageLabel() {
         <button type="button" :class="{ active: activePage === 'home' }" @click="activePage = 'home'">工作台</button>
         <button type="button" :class="{ active: activePage === 'settings' }" @click="activePage = 'settings'">设置</button>
       </nav>
+      <div class="dsh-console-control">
+        <button
+          class="dsh-console-button"
+          type="button"
+          :disabled="dsh.state !== 'ready'"
+          :title="dsh.message || `DeepSeek Harness ${dsh.version || ''}`"
+          @click="openDshConsole"
+        >{{ dsh.state === 'starting' ? 'DSH 启动中' : '打开 DSH 控制台' }}</button>
+        <small v-if="shadow.backend === 'dsh'">Shadow 模型与 reasoning 由 DSH Harness 管理</small>
+        <small v-if="dsh.state === 'unavailable' || dsh.state === 'exited'">{{ dsh.message || 'DSH 不可用' }}</small>
+      </div>
       <div class="topbar-status">
         <span class="prototype-tag"><i></i> PRODUCT UI · LIVE</span>
         <span class="mock-tag">{{ replayMode ? `${replayMeta.label} · 只读` : connected ? '本机已连接' : '离线可重试' }}</span>
@@ -1028,7 +1039,8 @@ function pageLabel() {
           <template v-else-if="activeSettingsTab === 'persona'">
             <header><p class="panel-kicker">人格与指令</p><h2>定义助手如何与你协作</h2><p>仅允许写入四个后端白名单 Markdown 文档。当前 Episode 继续使用已冻结内容，reset 或新 Episode 后读取新内容。</p></header>
             <div class="persona-layout"><nav class="persona-nav"><button v-for="document in personaItems" :key="document.id" type="button" :class="{ active: activePersona === document.id }" @click="activePersona = document.id"><strong>{{ document.label }}</strong><small>{{ document.owner }}</small></button></nav><label class="document-editor"><span>{{ currentDocument.path }}</span><textarea v-model="personaDocuments[currentDocument.id]" spellcheck="false"></textarea><small>UTF-8、无 NUL、单文档不超过 64 KB；保存后下一次 Episode 生效。</small></label></div>
-            <label class="switch-row"><div><strong>实验性 Shadow 上下文门禁</strong><span>只调用侧载模型判断新上下文的注入时机；不删除、不改写正文。关闭后立即恢复全部直通。</span></div><input v-model="settings.shadow.experimental_context_gate_enabled" type="checkbox" :disabled="saving" @change="saveShadowGate"><i></i></label>
+            <label v-if="shadow.backend !== 'dsh'" class="switch-row"><div><strong>实验性 Shadow 上下文门禁</strong><span>只调用侧载模型判断新上下文的注入时机；不删除、不改写正文。关闭后立即恢复全部直通。</span></div><input v-model="settings.shadow.experimental_context_gate_enabled" type="checkbox" :disabled="saving" @change="saveShadowGate"><i></i></label>
+            <div v-else class="config-callout"><span class="callout-icon">DSH</span><p>DSH Shadow 使用插件强制注入 Voice 权威上下文，不启用旧 context gate。根模型、provider、reasoning 和凭据由 DSH Harness 管理。</p></div>
             <div class="info-callout"><span>β</span><p>这是实验功能。一次暂缓仅对当次请求有效；下一次请求会重新判断，真正放行时会按原 revision 顺序带入全部正文。</p></div>
             <footer><button class="save-button" type="button" :disabled="saving" @click="savePersona">{{ saving ? '正在保存…' : '保存 Persona 文档' }}</button></footer>
           </template>

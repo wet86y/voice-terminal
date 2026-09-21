@@ -22,6 +22,7 @@ config/speaker/
 # Runtime artifacts (always local; do not version generated logs or reports)
 /logs/
 /reports/
+/.runtime/dsh/
 *.log
 
 # IDE / OS files

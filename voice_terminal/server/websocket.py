@@ -17,6 +17,12 @@ from ..audio.processing import AudioPreprocessor
 from ..asr.client import AsrWorkerClient
 from ..config import AppConfig
 from ..controller.episode_controller import EpisodeController
+from ..dsh import (
+    DshBridgeError,
+    DshMappingStore,
+    DshRuntimeManager,
+    DshShadowAgentSession,
+)
 from ..vad.barge_in import BargeInGate
 from ..core.event_bus import EventBus
 from ..core.events import VoiceEvent, event
@@ -73,18 +79,25 @@ from .snapshot import ProtocolSequencer, snapshot_event
 logger = logging.getLogger(__name__)
 
 try:
-    from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect  # type: ignore
+    from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect  # type: ignore
+    from fastapi.responses import JSONResponse  # type: ignore
 except ImportError:  # pragma: no cover - exercised by doctor/setup, not unit tests
     FastAPI = None  # type: ignore[assignment]
     WebSocket = Any  # type: ignore[assignment,misc]
     WebSocketDisconnect = Exception  # type: ignore[assignment,misc]
     HTTPException = RuntimeError  # type: ignore[assignment,misc]
+    Request = Any  # type: ignore[assignment,misc]
+    JSONResponse = Any  # type: ignore[assignment,misc]
 
 
 class SessionRuntime:
     """The sole production runtime: a session orchestrating input, agent and speech."""
     def __init__(self, config: AppConfig, *, product_settings: ProductSettingsStore | None = None) -> None:
         self.config = config
+        self.dsh = DshRuntimeManager(
+            config.dsh,
+            callback_origin=f"http://127.0.0.1:{config.server.port}",
+        )
         self.product_settings = product_settings
         self._pending_product_settings: dict[str, Any] | None = None
         self.state = RuntimeState()
@@ -103,7 +116,7 @@ class SessionRuntime:
         self.tts: MiniMaxTtsClient | None = None
         self.shadow_search_tools: WebSearchTools | None = None
         self.shadow_component: ShadowAgentComponent | None = None
-        self.shadow_session: ShadowAgentSession | None = None
+        self.shadow_session: ShadowAgentSession | DshShadowAgentSession | None = None
         if product_settings is not None:
             shadow_user_profile = product_settings.read_persona().get("user", "")
         else:
@@ -790,88 +803,58 @@ class SessionRuntime:
 
         shadow_cfg = self.config.shadow_agent
         if shadow_cfg.enabled:
-            shadow_key = self._api_key(shadow_cfg.provider.api_key_env)
-            if not shadow_key:
-                self.state.set_service("shadow_agent", "DISABLED")
-                logger.warning("shadow agent disabled: missing %s", shadow_cfg.provider.api_key_env)
-            else:
+            if shadow_cfg.backend == "dsh":
                 try:
-                    search_cfg = shadow_cfg.tools.web_search
-                    search_key = self._api_key(search_cfg.api_key_env)
-                    if search_cfg.enabled and search_key:
-                        self.shadow_search_tools = WebSearchTools(MiniMaxSearchClient(
-                            base_url=search_cfg.base_url, api_key=search_key,
-                            timeout_ms=search_cfg.timeout_ms,
-                        ))
-                        self.state.set_service("web_search", "READY")
-                    else:
-                        self.state.set_service("web_search", "DISABLED")
-                    files = FileTools(shadow_cfg.tools.allowed_roots) if shadow_cfg.tools.files_enabled else None
-                    executor = ShadowToolExecutor(files, self.shadow_search_tools,
-                                                   AmbientContextTools(self.ambient_store),
-                                                   soft_yield_ms=shadow_cfg.tools.soft_yield_ms,
-                                                   on_status=self._on_shadow_tool_status)
-                    provider = DeepSeekResponsesShadowProvider(
-                        base_url=shadow_cfg.provider.base_url,
-                        model=shadow_cfg.provider.model,
-                        api_key=shadow_key,
-                        timeout_ms=shadow_cfg.provider.timeout_ms,
-                        session_id=(self.conversation.conversation_id
-                                    if self.config.llm.provider == "opencode_go" else None),
-                    )
-                    status_cfg = shadow_cfg.status_observer.provider
-                    status_provider = provider
-                    if status_cfg is not None:
+                    status_provider = None
+                    if shadow_cfg.status_observer.enabled:
+                        status_cfg = shadow_cfg.status_observer.provider or shadow_cfg.provider
                         status_key = self._api_key(status_cfg.api_key_env)
                         if not status_key:
                             raise RuntimeError(f"未配置状态汇报模型凭据 {status_cfg.api_key_env}")
                         status_provider = DeepSeekResponsesShadowProvider(
-                            base_url=status_cfg.base_url, model=status_cfg.model,
-                            api_key=status_key, timeout_ms=status_cfg.timeout_ms,
+                            base_url=status_cfg.base_url,
+                            model=status_cfg.model,
+                            api_key=status_key,
+                            timeout_ms=status_cfg.timeout_ms,
                             session_id=(self.conversation.conversation_id
                                         if self.config.llm.provider == "opencode_go" else None),
                         )
-                    self.shadow_component = ShadowAgentComponent(
-                        provider, executor, status_provider=status_provider,
-                        instructions_loader=load_shadow_instructions,
-                        runtime_options={
-                            "provider_timeout_ms": shadow_cfg.provider.timeout_ms,
-                            "transport_retry_limit": shadow_cfg.provider.transport_retry_limit,
-                            "max_context_tokens": shadow_cfg.max_context_tokens,
-                            "compaction_threshold_ratio": shadow_cfg.compaction_threshold_ratio,
-                            "runtime_reminder_interval_ms": shadow_cfg.runtime_reminder_interval_ms,
-                            "observer_enabled": shadow_cfg.status_observer.enabled,
-                            "observer_every_steps": shadow_cfg.status_observer.every_committed_steps,
-                            "observer_max_output_tokens": shadow_cfg.status_observer.max_output_tokens,
-                            "observer_timeout_ms": shadow_cfg.status_observer.timeout_ms,
-                            "observer_max_context_tokens": shadow_cfg.status_observer.max_context_tokens,
-                            "reasoning_effort": shadow_cfg.reasoning_effort,
-                            "allowed_reasoning": shadow_cfg.allowed_reasoning,
-                            "on_metric": self._on_shadow_metric,
-                        },
-                    )
-                    self.shadow_session = self.shadow_component.new_session(
-                        self.shadow_context,
+                    self.shadow_session = DshShadowAgentSession(
+                        client=self.dsh.bridge,
+                        mapping_store=DshMappingStore(self.config.dsh.home_dir.parent / "session-mappings.json"),
+                        context_source=self.shadow_context,
+                        voice_session_id=self.conversation.conversation_id,
+                        workspace=self.dsh.repo_root,
                         production_sink=self._on_shadow_events,
                         activity_sink=self._on_shadow_activity,
+                        status_provider=status_provider,
+                        observer_every_steps=shadow_cfg.status_observer.every_committed_steps,
+                        observer_max_output_tokens=shadow_cfg.status_observer.max_output_tokens,
+                        observer_timeout_ms=shadow_cfg.status_observer.timeout_ms,
+                        availability_waiter=self.dsh.wait_ready,
                     )
-                    self.shadow_session.set_context_gate_enabled(
-                        shadow_cfg.experimental_context_gate_enabled,
-                    )
+                    self.dsh.bridge_hub.register(self.shadow_session)
                     self.history.set_shadow_runtime_state(available=True, active=False)
                     self.shadow_product.reset(available=True)
                     self.state.set_service("shadow_agent", "READY")
+                    self.state.set_service("web_search", "DISABLED")
                 except Exception as exc:
                     self.state.set_service("shadow_agent", "ERROR")
                     self.state.set_service("web_search", "DISABLED")
-                    logger.exception("shadow agent initialization failed: %s", exc)
+                    logger.exception("DSH shadow initialization failed: %s", exc)
+            else:
+                shadow_key = self._api_key(shadow_cfg.provider.api_key_env)
+                if not shadow_key:
+                    self.state.set_service("shadow_agent", "DISABLED")
+                    logger.warning("shadow agent disabled: missing %s", shadow_cfg.provider.api_key_env)
+                else:
+                    await self._initialize_native_shadow(shadow_cfg, shadow_key)
         else:
             self.shadow_product.reset(available=False)
             self.state.set_service("shadow_agent", "DISABLED")
             self.state.set_service("web_search", "DISABLED")
 
         minimax_key = self._api_key(self.config.tts.api_key_env)
-
         if minimax_key:
             self.tts = MiniMaxTtsClient(
                 base_url=self.config.tts.base_url,
@@ -962,6 +945,78 @@ class SessionRuntime:
         self.controller.set_reasoning_mode(self.reasoning_mode)
         await self.controller.initialize()
 
+    async def _initialize_native_shadow(self, shadow_cfg: Any, shadow_key: str) -> None:
+        try:
+                    search_cfg = shadow_cfg.tools.web_search
+                    search_key = self._api_key(search_cfg.api_key_env)
+                    if search_cfg.enabled and search_key:
+                        self.shadow_search_tools = WebSearchTools(MiniMaxSearchClient(
+                            base_url=search_cfg.base_url, api_key=search_key,
+                            timeout_ms=search_cfg.timeout_ms,
+                        ))
+                        self.state.set_service("web_search", "READY")
+                    else:
+                        self.state.set_service("web_search", "DISABLED")
+                    files = FileTools(shadow_cfg.tools.allowed_roots) if shadow_cfg.tools.files_enabled else None
+                    executor = ShadowToolExecutor(files, self.shadow_search_tools,
+                                                   AmbientContextTools(self.ambient_store),
+                                                   soft_yield_ms=shadow_cfg.tools.soft_yield_ms,
+                                                   on_status=self._on_shadow_tool_status)
+                    provider = DeepSeekResponsesShadowProvider(
+                        base_url=shadow_cfg.provider.base_url,
+                        model=shadow_cfg.provider.model,
+                        api_key=shadow_key,
+                        timeout_ms=shadow_cfg.provider.timeout_ms,
+                        session_id=(self.conversation.conversation_id
+                                    if self.config.llm.provider == "opencode_go" else None),
+                    )
+                    status_cfg = shadow_cfg.status_observer.provider
+                    status_provider = provider
+                    if status_cfg is not None:
+                        status_key = self._api_key(status_cfg.api_key_env)
+                        if not status_key:
+                            raise RuntimeError(f"未配置状态汇报模型凭据 {status_cfg.api_key_env}")
+                        status_provider = DeepSeekResponsesShadowProvider(
+                            base_url=status_cfg.base_url, model=status_cfg.model,
+                            api_key=status_key, timeout_ms=status_cfg.timeout_ms,
+                            session_id=(self.conversation.conversation_id
+                                        if self.config.llm.provider == "opencode_go" else None),
+                        )
+                    self.shadow_component = ShadowAgentComponent(
+                        provider, executor, status_provider=status_provider,
+                        instructions_loader=load_shadow_instructions,
+                        runtime_options={
+                            "provider_timeout_ms": shadow_cfg.provider.timeout_ms,
+                            "transport_retry_limit": shadow_cfg.provider.transport_retry_limit,
+                            "max_context_tokens": shadow_cfg.max_context_tokens,
+                            "compaction_threshold_ratio": shadow_cfg.compaction_threshold_ratio,
+                            "runtime_reminder_interval_ms": shadow_cfg.runtime_reminder_interval_ms,
+                            "observer_enabled": shadow_cfg.status_observer.enabled,
+                            "observer_every_steps": shadow_cfg.status_observer.every_committed_steps,
+                            "observer_max_output_tokens": shadow_cfg.status_observer.max_output_tokens,
+                            "observer_timeout_ms": shadow_cfg.status_observer.timeout_ms,
+                            "observer_max_context_tokens": shadow_cfg.status_observer.max_context_tokens,
+                            "reasoning_effort": shadow_cfg.reasoning_effort,
+                            "allowed_reasoning": shadow_cfg.allowed_reasoning,
+                            "on_metric": self._on_shadow_metric,
+                        },
+                    )
+                    self.shadow_session = self.shadow_component.new_session(
+                        self.shadow_context,
+                        production_sink=self._on_shadow_events,
+                        activity_sink=self._on_shadow_activity,
+                    )
+                    self.shadow_session.set_context_gate_enabled(
+                        shadow_cfg.experimental_context_gate_enabled,
+                    )
+                    self.history.set_shadow_runtime_state(available=True, active=False)
+                    self.shadow_product.reset(available=True)
+                    self.state.set_service("shadow_agent", "READY")
+        except Exception as exc:
+            self.state.set_service("shadow_agent", "ERROR")
+            self.state.set_service("web_search", "DISABLED")
+            logger.exception("shadow agent initialization failed: %s", exc)
+
     def snapshot(self) -> VoiceEvent:
         value = snapshot_event(self.state)
         controller = self.controller
@@ -1037,7 +1092,12 @@ class SessionRuntime:
                 runtime_snapshot = session.snapshot()
             except Exception:
                 logger.exception("shadow.product_snapshot_failed")
-        return projection.snapshot(runtime_snapshot)
+        value = projection.snapshot(runtime_snapshot)
+        value["backend"] = self.config.shadow_agent.backend
+        value["model_management"] = (
+            "dsh_harness" if self.config.shadow_agent.backend == "dsh" else "voice_terminal"
+        )
+        return value
 
     async def publish_shadow_product(self) -> None:
         await self.bus.publish(event("shadow.product", None, **self._shadow_product_snapshot()))
@@ -1047,8 +1107,12 @@ class SessionRuntime:
         projection = getattr(self, "shadow_product", None)
         if projection is not None:
             projection.update_activities(activities)
+            session = getattr(self, "shadow_session", None)
+            if session is not None:
+                projection.update_runtime(session.snapshot())
         for activity in activities:
             await self.bus.publish(event("shadow.activity", None, **dict(activity)))
+        await self.publish_shadow_product()
 
     def stage_product_settings(self, settings: Mapping[str, Any]) -> None:
         self._pending_product_settings = dict(settings)
@@ -1163,7 +1227,10 @@ class SessionRuntime:
             "deepseek", "responses", "opencode_go", "openai_compatible",
             "manual", "custom",
         }
-        if any(provider.get("protocol") not in allowed_llm for provider in (voice_provider, shadow_provider, status_provider)):
+        llm_providers = (voice_provider, status_provider) + (
+            (shadow_provider,) if self.config.shadow_agent.backend == "native" else ()
+        )
+        if any(provider.get("protocol") not in allowed_llm for provider in llm_providers):
             raise ValueError("所选 LLM 供应商尚未安装兼容的运行时适配器。")
         if tts_provider.get("protocol") != "minimax":
             raise ValueError("所选 TTS 供应商尚未安装兼容的运行时适配器。")
@@ -1177,10 +1244,10 @@ class SessionRuntime:
         status_env = "VOICE_PRODUCT_STATUS_LLM_KEY"
         tts_env = "VOICE_PRODUCT_TTS_KEY"
         overrides: dict[str, str] = {}
-        for item, environment_name in (
-            (voice, voice_env), (shadow, shadow_env),
-            (status, status_env), (tts, tts_env),
-        ):
+        credential_rows = [(voice, voice_env), (status, status_env), (tts, tts_env)]
+        if self.config.shadow_agent.backend == "native":
+            credential_rows.append((shadow, shadow_env))
+        for item, environment_name in credential_rows:
             api_key = item.get("api_key")
             if isinstance(api_key, str) and api_key:
                 overrides[environment_name] = api_key
@@ -1209,17 +1276,20 @@ class SessionRuntime:
             model=str(status.get("model_id") or previous_status_provider.model),
             api_key_env=status_env if status_env in overrides else previous_status_provider.api_key_env,
         )
-        next_shadow = replace(
-            previous_config.shadow_agent,
-            provider=replace(
+        next_shadow_provider = previous_config.shadow_agent.provider
+        if previous_config.shadow_agent.backend == "native":
+            next_shadow_provider = replace(
                 previous_config.shadow_agent.provider,
                 base_url=str(shadow_provider.get("base_url") or previous_config.shadow_agent.provider.base_url),
                 model=str(shadow.get("model_id") or previous_config.shadow_agent.provider.model),
                 api_key_env=shadow_env if shadow_env in overrides else previous_config.shadow_agent.provider.api_key_env,
-            ),
+            )
+        next_shadow = replace(
+            previous_config.shadow_agent,
+            provider=next_shadow_provider,
             max_context_tokens=int(
-                shadow_settings.get("max_context_tokens")
-                or shadow.get("max_context_tokens")
+                (shadow_settings.get("max_context_tokens") if previous_config.shadow_agent.backend == "native" else None)
+                or (shadow.get("max_context_tokens") if previous_config.shadow_agent.backend == "native" else None)
                 or previous_config.shadow_agent.max_context_tokens
             ),
             reasoning_effort="high",
@@ -1447,6 +1517,10 @@ class SessionRuntime:
             if projection is not None:
                 projection.reset(available=shadow_session is not None and shadow_session.available)
             self.conversation.reset()
+            if isinstance(shadow_session, DshShadowAgentSession):
+                self.dsh.bridge_hub.unregister(shadow_session)
+                shadow_session.rotate_voice_session_id(self.conversation.conversation_id)
+                self.dsh.bridge_hub.register(shadow_session)
             # Reset rotates the conversation but must not silently discard the
             # mode explicitly selected by the client.  The next Episode is
             # rebuilt below (or on the next session start) from this staged
@@ -1477,6 +1551,10 @@ class SessionRuntime:
         shadow_component = getattr(self, "shadow_component", None)
         if shadow_component is not None:
             await shadow_component.close()
+        shadow_session = getattr(self, "shadow_session", None)
+        if shadow_component is None and isinstance(shadow_session, DshShadowAgentSession):
+            self.dsh.bridge_hub.unregister(shadow_session)
+            await shadow_session.close()
         if self.tts is not None:
             await self.tts.close()
         if self.llm is not None:
@@ -1506,7 +1584,19 @@ class SessionRuntime:
     async def _wake_shadow(self) -> str:
         if self.shadow_session is None or not self.shadow_session.available:
             return "unavailable"
-        return await self.shadow_session.request_wake()
+        try:
+            return await self.shadow_session.request_wake()
+        except DshBridgeError as exc:
+            revision = int(getattr(self.shadow_context, "shadow_input_revision", 0))
+            await self._on_shadow_events([ShadowEvent(
+                event_id=str(uuid4()), kind="failed",
+                text=f"DSH Shadow 基础设施失败：{exc}",
+                based_on_context_revision=revision,
+                wake_policy="priority",
+                payload={"backend": "dsh", "infrastructure": True},
+            )])
+            self.state.set_service("shadow_agent", "ERROR")
+            return "unavailable"
 
     def set_shadow_context_gate_enabled(self, enabled: bool) -> bool:
         """Apply the experimental timing gate without restarting the session."""
@@ -1578,18 +1668,18 @@ class SessionRuntime:
             )
         self.shadow_product.update_events(events)
         await self.publish_shadow_product()
-        semantic_events = [
+        model_events = [
             item for item in events
-            if item.kind in {"observation", "user_input_required", "result", "failed"}
+            if item.kind in {"status", "observation", "user_input_required", "result", "failed"}
         ]
-        if not semantic_events:
+        if not model_events:
             return
         controller = self.controller
         if controller is None or not self.state.listening or controller.episode.closed:
-            for item in semantic_events:
+            for item in model_events:
                 self._shadow_pending.publish(item)
             return
-        await controller.accept_shadow_events(semantic_events)
+        await controller.accept_shadow_events(model_events)
 
     def _on_shadow_tool_status(self, name: str, status: str, reason: str) -> None:
         if name == "web_search" and "web_search" in self.state.services:
@@ -1665,17 +1755,17 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         raise RuntimeError("缺少 fastapi，请先运行 scripts\\setup.ps1。")
 
     app = FastAPI(title="Voice Terminal Server", version="0.8.0", lifespan=lifespan)
+    configured_origins = [
+        item.strip() for item in os.environ.get("VOICE_WEB_ORIGINS", "").split(",")
+        if item.strip() and item.strip() != "*"
+    ]
+    origins = list(dict.fromkeys([
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        *configured_origins,
+    ]))
     try:
         from fastapi.middleware.cors import CORSMiddleware  # type: ignore
-        configured_origins = [
-            item.strip() for item in os.environ.get("VOICE_WEB_ORIGINS", "").split(",")
-            if item.strip() and item.strip() != "*"
-        ]
-        origins = list(dict.fromkeys([
-            "http://127.0.0.1:5173",
-            "http://localhost:5173",
-            *configured_origins,
-        ]))
         app.add_middleware(
             CORSMiddleware,
             allow_origins=origins,
@@ -1750,10 +1840,109 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             "runtime": runtime_payload,
             "conversation": conversation,
             "shadow": runtime._shadow_product_snapshot(),
+            "dsh": runtime.dsh.status_payload(),
             "settings": settings,
             "models": models,
             "warnings": restore_warnings,
         }
+
+    @app.get("/api/v1/dsh/status")
+    async def get_dsh_status() -> dict[str, object]:
+        return runtime.dsh.status_payload()
+
+    @app.post("/api/v1/dsh/ui-launch")
+    async def launch_dsh_ui(request: Request) -> JSONResponse:
+        if request.headers.get("origin") not in origins:
+            raise HTTPException(status_code=403, detail="不允许从该 Origin 打开 DSH 控制台。")
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail="DSH 启动接口只接受 application/json。")
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="请求体必须是有效 JSON。") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象。")
+        status = runtime.dsh.status()
+        if status.state == "starting":
+            raise HTTPException(status_code=409, detail="DSH 控制台仍在启动。")
+        launch_url = runtime.dsh.launch_url
+        if status.state != "ready" or not launch_url:
+            raise HTTPException(status_code=503, detail=status.message or "DSH 控制台不可用。")
+        return JSONResponse(
+            {"url": launch_url},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def dsh_callback_body(request: Request) -> tuple[dict[str, Any], DshShadowAgentSession]:
+        remote = request.client.host if request.client is not None else None
+        if not runtime.dsh.bridge_hub.authorize(request.headers.get("authorization"), remote):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail="application/json required")
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="invalid JSON") from exc
+        if not isinstance(payload, dict) or payload.get("protocol_version") != "1.0":
+            raise HTTPException(status_code=409, detail="protocol mismatch")
+        session = runtime.dsh.bridge_hub.resolve(payload)
+        if session is None:
+            raise HTTPException(status_code=404, detail="binding not found")
+        if (payload.get("dsh_session_id") != session.dsh_session_id
+                or payload.get("epoch") != session.epoch):
+            raise HTTPException(status_code=409, detail="stale binding")
+        return payload, session
+
+    @app.post("/api/internal/dsh-bridge/shadow.event")
+    async def dsh_shadow_event(request: Request) -> JSONResponse:
+        payload, session = await dsh_callback_body(request)
+        code = await session.accept_event(payload)
+        return JSONResponse(
+            {"protocol_version": "1.0", "result": code},
+            status_code=200 if code in {"accepted", "duplicate"} else 409,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/internal/dsh-bridge/shadow.activity")
+    @app.post("/api/internal/dsh-bridge/shadow.lifecycle")
+    async def dsh_shadow_activity(request: Request) -> JSONResponse:
+        payload, session = await dsh_callback_body(request)
+        code = await session.accept_activity(payload)
+        return JSONResponse(
+            {"protocol_version": "1.0", "result": code},
+            status_code=200 if code == "accepted" else 409,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/internal/dsh-bridge/shadow.context.read")
+    async def dsh_shadow_context_read(request: Request) -> JSONResponse:
+        payload, session = await dsh_callback_body(request)
+        since = payload.get("since_revision")
+        if not isinstance(since, int) or isinstance(since, bool) or since < 0:
+            raise HTTPException(status_code=422, detail="invalid since_revision")
+        value = session.latest_context(since)
+        return JSONResponse(
+            {"protocol_version": "1.0", "result": "accepted", **value},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/internal/dsh-bridge/shadow.ambient.read")
+    async def dsh_shadow_ambient_read(request: Request) -> JSONResponse:
+        payload, _session = await dsh_callback_body(request)
+        limit = payload.get("limit")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
+            raise HTTPException(status_code=422, detail="invalid limit")
+        return JSONResponse(
+            {
+                "protocol_version": "1.0",
+                "result": "accepted",
+                "source": "ambient_untrusted",
+                **runtime.ambient_store.snapshot(limit),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     def product_store_or_404() -> ProductSettingsStore:
         if product_settings is None:

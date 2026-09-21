@@ -263,6 +263,8 @@ export interface ShadowActivity {
 }
 
 export interface ShadowProductSnapshot {
+  backend?: 'native' | 'dsh'
+  model_management?: 'voice_terminal' | 'dsh_harness'
   available: boolean
   active: boolean
   phase: string

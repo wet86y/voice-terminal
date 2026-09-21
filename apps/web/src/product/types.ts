@@ -130,11 +130,21 @@ export interface ProductConversationSnapshot {
   current: Partial<CurrentTurnSnapshot>
 }
 
+export interface DshRuntimeStatus {
+  enabled: boolean
+  state: 'disabled' | 'starting' | 'ready' | 'unavailable' | 'exited'
+  version: string | null
+  profile: 'web'
+  ui_origin: string | null
+  message: string
+}
+
 export interface ProductSnapshot {
   schema_version: number
   runtime: ProductRuntimeSnapshot
   conversation: ProductConversationSnapshot
   shadow: ShadowProductSnapshot
+  dsh: DshRuntimeStatus
   settings: ProductSettingsSnapshot
   models: ProductModelRegistry
   warnings?: string[]

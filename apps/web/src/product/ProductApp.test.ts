@@ -10,6 +10,33 @@ import { readFileSync } from 'node:fs'
 // so it needs a direct source-level guard.
 const productCssSource = readFileSync(new URL('../ui-demo/ui-demo.css', import.meta.url), 'utf8')
 
+describe('project-isolated DSH console', () => {
+  it('renders a state-gated console button without changing Shadow controls', () => {
+    expect(productAppSource).toContain('class="dsh-console-button"')
+    expect(productAppSource).toContain(`:disabled="dsh.state !== 'ready'"`)
+    expect(productAppSource).toContain("dsh.state === 'starting' ? 'DSH 启动中'")
+    expect(productAppSource).toContain('@click="openDshConsole"')
+    expect(productAppSource).toContain('class="shadow-column panel"')
+  })
+
+  it('opens synchronously, severs opener, navigates after POST, and closes on failure', () => {
+    const start = productAdapterSource.indexOf('async function openDshConsole()')
+    const end = productAdapterSource.indexOf('function scheduleDshStatusPoll()', start)
+    const block = productAdapterSource.slice(start, end)
+    expect(block.indexOf("window.open('about:blank', '_blank')")).toBeGreaterThan(-1)
+    expect(block.indexOf('await productApi.launchDsh()')).toBeGreaterThan(block.indexOf('window.open'))
+    expect(block).toContain('tab.opener = null')
+    expect(block).toContain('tab.location.replace(result.url)')
+    expect(block).toContain('tab.close()')
+  })
+
+  it('polls startup state until the managed runtime settles', () => {
+    expect(productAdapterSource).toContain("dsh.value.state !== 'starting'")
+    expect(productAdapterSource).toContain('productApi.dshStatus()')
+    expect(productAdapterSource).toContain('window.clearInterval(dshStatusTimer)')
+  })
+})
+
 describe('multiple wake phrases', () => {
   it('renders one input per configured spelling with add/remove controls', () => {
     expect(productAppSource).toContain('v-for="(item, index) in wakeForm.keywords"')

@@ -15,15 +15,15 @@ Voice Terminal 是 Windows 本机实时语音会话终端。浏览器负责产�
                                       ▼
                          单一 ShadowRuntime → READ_ONLY tools
                                       │
-                                      ▼
-                              主 LLM 400ms mailbox
+                                      ├─ status observer → ShadowVisibleStatus → 主 LLM runtime.shadow.status
+                                      └─ observation / input / result / failed → 主 LLM 400ms mailbox
 ```
 
-主语音链只有一个调度循环和一个语音事务 owner。未播放的 assistant 草稿不会写入历史；只有用户输入、实际传达的 assistant 文本、有效 refinement 和有语义影响的打断会进入会话账本。Shadow 是同一 session 的只读认知旁路，不控制语音、TTS、播放器或主调度器。
+主语音链只有一个调度循环和一个语音事务 owner。未播放的 assistant 草稿不会写入历史；只有用户输入、实际传达的 assistant 文本、有效 refinement 和有语义影响的打断会进入会话账本。Shadow 是同一 session 的只读认知旁路，不控制语音、TTS、播放器或主调度器。status observer 摘要属于可替换的运行状态：会被 Voice 主 LLM 消费，但不追加为长期语义历史；progress 仍只更新产品 UI，不触发主 LLM。
 
 ## 快速开始
 
-环境要求：Windows、Python 3.12、Node.js 20 或更高版本。
+环境要求：Windows x64、Python 3.12、Node.js 22.19 或更高兼容版本（项目隔离 DSH 的最低要求）。
 
 ```powershell
 .\scripts\setup.ps1 -Python D:\DevTools\Python312\python.exe -Analysis
@@ -43,6 +43,7 @@ MINIMAX_API_KEY=
 - Voice Server：`http://127.0.0.1:8765/`
 - WebSocket：`ws://127.0.0.1:8765/ws`
 - 健康检查：`http://127.0.0.1:8765/health`
+- DSH 控制台：从 Product UI 顶栏的“打开 DSH 控制台”安全进入
 - 后端调试：`.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe -NoWeb`
 
 完整启动需要同时确认 Web 页面、Voice Server、ASR worker 和 analysis worker 可用；只看到 `/health` 返回成功不代表浏览器端已经准备好。
@@ -61,6 +62,7 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 - `config/local.yaml`：本机非密钥覆盖，不提交真实凭据。
 - `config/persona/`：`instructions.md`、`personality.md`、`user.md`；在新 Agent episode 创建时读取并冻结。
 - `config/shadow_agent/`：Shadow 指令和工具策略。
+- `config/dsh/`：项目隔离 DSH 的锁版、Web profile patch、Shadow 验证预设和许可证快照。
 - `config/product-settings.json`：本机产品设置，包含 KWS、静默、Shadow 开关和声纹设置等非密钥内容。
 - `config/speaker/`：声纹资料、模板和特征指纹；详见 [声纹增强](docs/speaker-enhancement.md)。
 
@@ -96,6 +98,7 @@ git diff --check
 - [LLM 上下文缓存契约](docs/llm-context-cache-contract.md)
 - [LLM JSON Schema 迁移与回滚 Runbook](docs/llm-json-schema-migration.md)
 - [可选声纹增强](docs/speaker-enhancement.md)
+- [项目隔离 DSH 控制台](docs/dsh-console.md)
 - [运行与质量门槛](docs/operations-and-quality.md)
 - [当前已知问题](docs/known-issues.md)
 

@@ -466,14 +466,14 @@ def test_disabling_context_gate_releases_deferred_authority_prefix():
     assert [frame.content["transcript"] for frame in projector.shadow_context_snapshot().frames[1:]] == ["一", "二"]
 
 
-def test_status_and_progress_are_product_only_while_semantic_events_use_mailbox():
+def test_status_reaches_model_mailbox_while_progress_remains_product_only():
     async def scenario():
         runtime = SessionRuntime(AppConfig())
         status = ShadowEvent("s", "status", "正在整理", 1, "normal")
         progress = ShadowEvent("p", "progress", "已读取文件", 1, "normal")
         await runtime._on_shadow_events([status, progress])
         assert runtime.shadow_product.summary == "已读取文件"
-        assert runtime._shadow_pending.drain() == []
+        assert [item.event_id for item in runtime._shadow_pending.drain()] == ["s"]
 
         result = ShadowEvent("r", "result", "整理完成", 1, "priority")
         await runtime._on_shadow_events([result])

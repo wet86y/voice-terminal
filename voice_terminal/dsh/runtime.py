@@ -1,0 +1,360 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+from ..config import DshConfig
+from .bridge import DshBridgeClient, DshBridgeHub, new_bridge_token
+
+logger = logging.getLogger(__name__)
+
+DshRuntimeState = Literal["disabled", "starting", "ready", "unavailable", "exited"]
+_TOKEN_RE = re.compile(r"([?&]token=)[^\s\"'<>]+", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):\d+/\?token=[^\s\"'<>]+", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class DshRuntimeStatus:
+    enabled: bool
+    state: DshRuntimeState
+    version: str | None
+    profile: str
+    ui_origin: str | None
+    message: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "state": self.state,
+            "version": self.version,
+            "profile": self.profile,
+            "ui_origin": self.ui_origin,
+            "message": self.message,
+        }
+
+
+class DshRuntimeManager:
+    """Own one project-local DSH Web child without exposing its launch token."""
+
+    def __init__(self, config: DshConfig, *, callback_origin: str = "http://127.0.0.1:8765") -> None:
+        self.config = config
+        self.repo_root = config.source_dir.parents[2]
+        if not callback_origin.startswith("http://127.0.0.1:"):
+            raise ValueError("DSH callback origin must be loopback HTTP")
+        self._bridge_token = new_bridge_token()
+        self.bridge = DshBridgeClient(
+            origin=f"http://{config.host}:{config.port}",
+            token=self._bridge_token,
+            timeout_ms=config.bridge_timeout_ms,
+        )
+        self.bridge_hub = DshBridgeHub(self._bridge_token)
+        self.callback_origin = callback_origin
+        self._state: DshRuntimeState = "disabled" if not config.enabled else "unavailable"
+        self._message = "" if config.enabled else "DSH 已禁用。"
+        self._process: asyncio.subprocess.Process | None = None
+        self._start_task: asyncio.Task[None] | None = None
+        self._reader_tasks: list[asyncio.Task[None]] = []
+        self._monitor_task: asyncio.Task[None] | None = None
+        self._launch_url: str | None = None
+        self._launch_event = asyncio.Event()
+        self._closing = False
+        self._restart_count = 0
+
+    @property
+    def launch_url(self) -> str | None:
+        return self._launch_url if self._state == "ready" else None
+
+    def status(self) -> DshRuntimeStatus:
+        return DshRuntimeStatus(
+            enabled=self.config.enabled,
+            state=self._state,
+            version=self.config.expected_version if self.config.enabled else None,
+            profile=self.config.profile,
+            ui_origin=(f"http://{self.config.host}:{self.config.port}" if self.config.enabled else None),
+            message=self._message,
+        )
+
+    def status_payload(self) -> dict[str, object]:
+        return self.status().as_dict()
+
+    def begin_start(self) -> None:
+        if not self.config.enabled:
+            self._state = "disabled"
+            return
+        if self._start_task is None or self._start_task.done():
+            self._start_task = asyncio.create_task(self.start(), name="dsh-web-start")
+
+    async def wait_ready(self) -> bool:
+        task = self._start_task
+        if task is not None and not task.done():
+            await asyncio.shield(task)
+        return self._state == "ready"
+
+    async def start(self) -> None:
+        if not self.config.enabled:
+            self._state = "disabled"
+            return
+        if not self.config.auto_start:
+            self._state = "unavailable"
+            self._message = "DSH 自动启动已关闭。"
+            return
+        if self._process is not None and self._process.returncode is None:
+            return
+        self._state = "starting"
+        self._message = "DSH 控制台正在启动。"
+        self._launch_url = None
+        self._launch_event.clear()
+        self._closing = False
+        try:
+            node, cli = await self._validate_installation()
+            if self._port_in_use():
+                raise RuntimeError(f"端口 {self.config.port} 已被未知进程占用；拒绝附着。")
+            self.config.home_dir.mkdir(parents=True, exist_ok=True)
+            env = os.environ.copy()
+            env.update({
+                "DSH_HOME": str(self.config.home_dir),
+                "DSH_PERMISSION_MODE": "read-only",
+                "DSH_TELEMETRY_DISABLED": "1",
+                "VOICE_DSH_BRIDGE_TOKEN": self._bridge_token,
+                "VOICE_DSH_CALLBACK_ORIGIN": self.callback_origin,
+            })
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            self._process = await asyncio.create_subprocess_exec(
+                node, str(cli), "web", "--host", self.config.host,
+                "--port", str(self.config.port), "--no-open",
+                cwd=str(self.repo_root), env=env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                creationflags=creationflags,
+            )
+            assert self._process.stdout is not None and self._process.stderr is not None
+            self._reader_tasks = [
+                asyncio.create_task(self._read_stream(self._process.stdout, "stdout")),
+                asyncio.create_task(self._read_stream(self._process.stderr, "stderr")),
+            ]
+            process = self._process
+            self._monitor_task = asyncio.create_task(self._monitor(process), name="dsh-web-monitor")
+            await asyncio.wait_for(
+                self._wait_until_ready(process),
+                timeout=self.config.startup_timeout_ms / 1000,
+            )
+            health = await self.bridge.health()
+            if health.get("protocol_version") != self.config.bridge_protocol_version:
+                raise RuntimeError("DSH Bridge 协议版本不匹配。")
+            self._state = "ready"
+            self._message = ""
+            logger.info("DSH Web ready at %s", self.status().ui_origin)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._state = "unavailable"
+            self._message = self._safe_message(exc)
+            logger.warning("DSH unavailable: %s", self._message)
+            await self._stop_child(force=True)
+
+    async def close(self) -> None:
+        self._closing = True
+        task = self._start_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self._stop_child(force=False)
+        if self.config.enabled and self._state not in {"unavailable", "exited"}:
+            self._state = "disabled"
+            self._message = "DSH 已随 Voice Server 关闭。"
+
+    async def _validate_installation(self) -> tuple[str, Path]:
+        if os.name != "nt" or os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() not in {"amd64", "x86_64"}:
+            raise RuntimeError("当前 DSH 基线仅正式支持 Windows x64。")
+        node = shutil.which("node")
+        if not node:
+            raise RuntimeError("未找到 Node.js；需要 22.19.0 或更高兼容版本。")
+        version_output = await self._run_checked(node, "--version")
+        match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", version_output)
+        node_version = tuple(map(int, match.groups())) if match else (0, 0, 0)
+        supported_node = (
+            node_version[0] == 22 and node_version >= (22, 19, 0)
+        ) or node_version[0] >= 24
+        if not supported_node:
+            raise RuntimeError(f"Node.js 版本不满足 22.19.0 最低要求（当前 {version_output.strip()}）。")
+        package_file = self.config.source_dir / "package.json"
+        cli = self.config.source_dir / "apps" / "cli" / "lib" / "bin.js"
+        if not package_file.is_file():
+            raise RuntimeError("DSH 源码缺失；请运行 scripts\\setup-dsh.ps1。")
+        try:
+            package_version = str(json.loads(package_file.read_text(encoding="utf-8"))["version"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError("无法读取 DSH 根 package.json 版本。") from exc
+        if package_version != self.config.expected_version:
+            raise RuntimeError(f"DSH 源码版本不匹配：期望 {self.config.expected_version}，实际 {package_version}。")
+        if not cli.is_file():
+            raise RuntimeError("DSH CLI 构建产物缺失；请重新运行 scripts\\setup-dsh.ps1。")
+        git = shutil.which("git")
+        if not git:
+            raise RuntimeError("未找到 Git，无法验证 DSH commit。")
+        head = (await self._run_checked(git, "-C", str(self.config.source_dir), "rev-parse", "HEAD")).strip()
+        if head.lower() != self.config.expected_commit.lower():
+            raise RuntimeError(f"DSH commit 不匹配：期望 {self.config.expected_commit}，实际 {head}。")
+        cli_version = (await self._run_checked(node, str(cli), "--version", cwd=self.repo_root)).strip()
+        if self.config.expected_version not in cli_version:
+            raise RuntimeError(f"DSH CLI 版本不匹配：{cli_version or '无版本输出'}。")
+        if not self.config.profile_patch.is_file():
+            raise RuntimeError("DSH Web profile patch 缺失。")
+        managed_patch = self.config.home_dir / "profiles" / "web" / "cordis.patch.yml"
+        managed_preset = self.config.home_dir / ".agent-presets" / "shadow-agent" / "agent.cordis.yml"
+        source_preset = self.repo_root / "config" / "dsh" / "agent-presets" / "shadow-agent" / "agent.cordis.yml"
+        managed_preset_meta = managed_preset.with_name("preset.yml")
+        source_preset_meta = source_preset.with_name("preset.yml")
+        for source, managed, label in (
+            (self.config.profile_patch, managed_patch, "Web profile patch"),
+            (source_preset, managed_preset, "shadow-agent preset"),
+            (source_preset_meta, managed_preset_meta, "shadow-agent preset metadata"),
+        ):
+            if not managed.is_file() or managed.read_bytes() != source.read_bytes():
+                raise RuntimeError(f"DSH_HOME 的 {label} 缺失或已漂移；请运行 scripts\\setup-dsh.ps1。")
+        build_state = self.config.source_dir.parent / "build-state.json"
+        try:
+            state = json.loads(build_state.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("DSH build-state.json 缺失或无效。") from exc
+        if state.get("bridge_protocol_version") != self.config.bridge_protocol_version:
+            raise RuntimeError("DSH Bridge build-state 协议版本漂移；请重新运行 setup-dsh.ps1。")
+        bundle_dir = self.config.source_dir.parent / "bundles" / "voice-terminal-shadow-bridge"
+        bridge_source = self.repo_root / "integrations" / "dsh" / "voice-terminal-shadow-bridge"
+        common_prompt = self.repo_root / "config" / "shadow_agent" / "instructions.md"
+        dsh_rules = self.repo_root / "config" / "dsh" / "shadow-agent.rules.md"
+        checks = (
+            ("bridge_bundle_sha256", self._tree_hash(bundle_dir), "Bundle"),
+            ("bridge_source_sha256", self._tree_hash(bridge_source), "Bundle 源码"),
+            ("shadow_prompt_sha256", self._tree_hash(common_prompt, dsh_rules), "Shadow 提示词"),
+        )
+        for key, actual, label in checks:
+            if state.get(key) != actual:
+                raise RuntimeError(f"DSH {label} hash 漂移；请重新运行 setup-dsh.ps1。")
+        return node, cli
+
+    def _tree_hash(self, *paths: Path) -> str:
+        rows: list[str] = []
+        for root in paths:
+            files = [root] if root.is_file() else sorted(
+                (item for item in root.rglob("*") if item.is_file()),
+                key=lambda item: str(item).lower(),
+            )
+            for item in files:
+                relative = item.resolve().relative_to(self.repo_root.resolve()).as_posix()
+                file_hash = hashlib.sha256(item.read_bytes()).hexdigest().upper()
+                rows.append(f"/{relative}:{file_hash}")
+        return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+
+    async def _run_checked(self, *args: str, cwd: Path | None = None) -> str:
+        process = await asyncio.create_subprocess_exec(
+            *args, cwd=str(cwd) if cwd else None,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            detail = self.redact_line(stderr.decode(errors="replace")).strip()[:240]
+            raise RuntimeError(detail or f"命令验证失败（exit {process.returncode}）。")
+        return stdout.decode(errors="replace")
+
+    async def _read_stream(self, stream: asyncio.StreamReader, name: str) -> None:
+        while line := await stream.readline():
+            decoded = line.decode(errors="replace").rstrip()
+            launch = self.extract_launch_url(decoded)
+            if launch:
+                self._launch_url = launch
+                self._launch_event.set()
+            safe = self.redact_line(decoded)
+            if safe:
+                logger.info("DSH[%s] %s", name, safe)
+
+    async def _wait_until_ready(self, process: asyncio.subprocess.Process) -> None:
+        await self._launch_event.wait()
+        for _ in range(100):
+            if process.returncode is not None:
+                raise RuntimeError(f"DSH 在就绪前退出（exit {process.returncode}）。")
+            if self._port_in_use():
+                return
+            await asyncio.sleep(0.05)
+        raise RuntimeError("DSH 已报告启动地址，但端口未开始监听。")
+
+    async def _monitor(self, process: asyncio.subprocess.Process) -> None:
+        returncode = await process.wait()
+        if process is self._process and not self._closing:
+            self._state = "exited"
+            self._message = f"DSH 进程已退出（exit {returncode}）。"
+            self._launch_url = None
+            logger.warning("%s", self._message)
+            self._process = None
+            readers, self._reader_tasks = self._reader_tasks, []
+            await asyncio.gather(*readers, return_exceptions=True)
+            if self._restart_count < self.config.restart_limit:
+                self._restart_count += 1
+                self._start_task = asyncio.create_task(
+                    self._restart_after_exit(), name=f"dsh-web-restart-{self._restart_count}",
+                )
+            else:
+                self._state = "unavailable"
+                self._message = "DSH 已达到自动重启上限；Voice 主链继续运行。"
+
+    async def _restart_after_exit(self) -> None:
+        await asyncio.sleep(self.config.restart_delay_ms / 1000)
+        if not self._closing:
+            await self.start()
+
+    def _port_in_use(self) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.15)
+            return sock.connect_ex((self.config.host, self.config.port)) == 0
+
+    async def _stop_child(self, *, force: bool) -> None:
+        process = self._process
+        if process is None:
+            return
+        if process.returncode is None:
+            try:
+                if os.name == "nt" and not force:
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    process.terminate()
+                await asyncio.wait_for(process.wait(), self.config.shutdown_timeout_ms / 1000)
+            except (ProcessLookupError, asyncio.TimeoutError):
+                if os.name == "nt":
+                    killer = await asyncio.create_subprocess_exec(
+                        "taskkill", "/PID", str(process.pid), "/T", "/F",
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await killer.wait()
+                elif process.returncode is None:
+                    process.kill()
+                    await process.wait()
+        for task in self._reader_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*self._reader_tasks, return_exceptions=True)
+        self._reader_tasks.clear()
+        self._process = None
+        self._launch_url = None
+
+    @staticmethod
+    def extract_launch_url(line: str) -> str | None:
+        match = _URL_RE.search(line)
+        return match.group(0) if match else None
+
+    @staticmethod
+    def redact_line(line: str) -> str:
+        return _TOKEN_RE.sub(r"\1[REDACTED]", line)
+
+    @classmethod
+    def _safe_message(cls, exc: Exception) -> str:
+        return " ".join(cls.redact_line(str(exc)).split())[:320] or type(exc).__name__
