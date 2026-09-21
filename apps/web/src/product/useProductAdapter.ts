@@ -3,6 +3,7 @@ import { useVoiceTerminal } from '../composables/useVoiceTerminal'
 import type { ConversationEntry, ConversationEntryKind, ReasoningMode, ShadowProductSnapshot, TurnDelivery } from '../types'
 import { productApi, ProductApiError } from './api'
 import type {
+  DshRuntimeStatus,
   ProductAssignments,
   ProductModel,
   ProductModelRegistry,
@@ -85,6 +86,10 @@ const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
 
 const DEFAULT_REGISTRY: ProductModelRegistry = {
   providers: [], models: [], tts_profiles: [], assignments: {},
+}
+
+const DEFAULT_DSH: DshRuntimeStatus = {
+  enabled: false, state: 'disabled', version: null, profile: 'web', ui_origin: null, message: '',
 }
 
 function defaultCurrent() {
@@ -207,6 +212,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const snapshot = ref<ProductSnapshot | null>(null)
   const settings = reactive<ProductSettingsSnapshot>(structuredClone(DEFAULT_SETTINGS))
   const registry = ref<ProductModelRegistry>(structuredClone(DEFAULT_REGISTRY))
+  const dsh = ref<DshRuntimeStatus>(structuredClone(DEFAULT_DSH))
   const loading = ref(false)
   const saving = ref(false)
   const lastError = ref('')
@@ -259,6 +265,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   let snapshotRequest: Promise<void> | null = null
   let reconnectTimer: number | undefined
   let replayTimer: number | undefined
+  let dshStatusTimer: number | undefined
   let noticeDisplayTimer: ReturnType<typeof setTimeout> | undefined
   let noticeFadeTimer: ReturnType<typeof setTimeout> | undefined
   let mutationQueue: Promise<unknown> = Promise.resolve()
@@ -305,6 +312,19 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   function applySnapshot(value: ProductSnapshot) {
     snapshot.value = value
+    if (isRecord(value.dsh)) {
+      const state = ['disabled', 'starting', 'ready', 'unavailable', 'exited'].includes(String(value.dsh.state))
+        ? value.dsh.state as DshRuntimeStatus['state'] : 'unavailable'
+      dsh.value = {
+        enabled: value.dsh.enabled === true,
+        state,
+        version: typeof value.dsh.version === 'string' ? value.dsh.version : null,
+        profile: 'web',
+        ui_origin: typeof value.dsh.ui_origin === 'string' ? value.dsh.ui_origin : null,
+        message: typeof value.dsh.message === 'string' ? value.dsh.message : '',
+      }
+      scheduleDshStatusPoll()
+    }
     const nextSettings = normalizeSettings(value.settings)
     Object.assign(settings.wake, nextSettings.wake)
     Object.assign(settings.silence, nextSettings.silence)
@@ -355,6 +375,46 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       snapshotRequest = null
     })
     return snapshotRequest
+  }
+
+  async function openDshConsole() {
+    const tab = window.open('about:blank', '_blank')
+    if (!tab) {
+      setError(new Error('浏览器阻止了 DSH 控制台的新标签页，请允许本站弹出窗口。'))
+      return
+    }
+    tab.opener = null
+    try {
+      const result = await productApi.launchDsh()
+      const launchUrl = new URL(result.url)
+      if (!dsh.value.ui_origin || launchUrl.origin !== dsh.value.ui_origin || launchUrl.pathname !== '/' || !launchUrl.searchParams.has('token')) {
+        throw new Error('Voice Server 返回了无效的 DSH 地址。')
+      }
+      tab.location.replace(result.url)
+    } catch (error) {
+      tab.close()
+      setError(error)
+      void productApi.dshStatus().then(value => { dsh.value = value }).catch(() => undefined)
+    }
+  }
+
+  function scheduleDshStatusPoll() {
+    if (dshStatusTimer !== undefined) window.clearInterval(dshStatusTimer)
+    dshStatusTimer = undefined
+    if (replayMode || dsh.value.state !== 'starting') return
+    dshStatusTimer = window.setInterval(() => {
+      void productApi.dshStatus().then(value => {
+        const wasStarting = dsh.value.state === 'starting'
+        dsh.value = value
+        if (value.state !== 'starting') {
+          if (dshStatusTimer !== undefined) window.clearInterval(dshStatusTimer)
+          dshStatusTimer = undefined
+          if (wasStarting && (value.state === 'unavailable' || value.state === 'exited')) {
+            setError(new Error(value.message || 'DSH 控制台不可用；Voice Terminal 仍可正常使用。'))
+          }
+        }
+      }).catch(() => undefined)
+    }, 1000)
   }
 
   async function refreshSpeaker() {
@@ -1076,6 +1136,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   onBeforeUnmount(() => {
     if (reconnectTimer !== undefined) window.clearInterval(reconnectTimer)
     if (replayTimer !== undefined) window.clearTimeout(replayTimer)
+    if (dshStatusTimer !== undefined) window.clearInterval(dshStatusTimer)
     clearNoticeTimers()
     voice.dispose()
   })
@@ -1087,6 +1148,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     snapshot,
     settings,
     registry,
+    dsh,
     loading,
     saving,
     connected,
@@ -1140,6 +1202,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     notice,
     noticeVisible,
     loadSnapshot,
+    openDshConsole,
     refreshRegistry,
     runtimeAction,
     resetSession,

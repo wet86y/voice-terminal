@@ -131,10 +131,11 @@ Product UI 的“用户说完 → AI 开口”由浏览器单调时钟测量：
 
 Shadow UI 使用：
 
-- `shadow.product`：当前可用性、active/phase/focus、summary、最近活动和资源指标的有界快照；
-- `shadow.activity`：当前运行中的 lifecycle、thinking、tool 和公开事件增量。
+- `shadow.product`：当前可用性、active/phase/focus、summary、最近活动和资源指标的有界权威快照；
+- `shadow.activity`：当前运行中的 lifecycle、thinking、tool 和公开事件增量。DSH status observer
+  摘要通过 Voice 侧 `status` 投影更新 summary，不作为 event 输出区域中的终态事件。
 
-活动 item 使用 `run_seq + item_id` 标识，状态为 `started`、`delta`、`completed` 或 `failed`。provider request、trace ID、私有 reasoning 和内部工具参数不得进入公共协议。重连时先应用 `shadow.product`，再按 WebSocket `seq` 应用增量；旧 `run_seq` 的迟到事件直接丢弃。
+活动 item 使用 `run_seq + item_id` 标识，状态为 `started`、`delta`、`completed` 或 `failed`，并且必须带有服务端生成的 `timestamp`。provider request、trace ID、私有 reasoning 和内部工具参数不得进入公共协议。重连时先应用 `shadow.product`，再按 WebSocket `seq` 应用增量；旧 `run_seq` 的迟到事件直接丢弃。浏览器在应用快照前冲刷同一帧内的增量，不能让旧 activity 覆盖新 summary。
 
 调试协议只有在 `shadow_agent.debug_websocket_enabled=true` 时可用：
 

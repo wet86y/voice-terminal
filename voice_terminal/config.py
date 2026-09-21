@@ -376,6 +376,7 @@ class ShadowStatusObserverConfig:
 @dataclass(frozen=True)
 class ShadowAgentConfig:
     enabled: bool = True
+    backend: Literal["native", "dsh"] = "dsh"
     debug_websocket_enabled: bool = False
     experimental_context_gate_enabled: bool = False
     provider: ShadowProviderConfig = field(default_factory=ShadowProviderConfig)
@@ -388,6 +389,8 @@ class ShadowAgentConfig:
     status_observer: ShadowStatusObserverConfig = field(default_factory=ShadowStatusObserverConfig)
 
     def __post_init__(self) -> None:
+        if self.backend not in {"native", "dsh"}:
+            raise ValueError("shadow_agent.backend must be native or dsh")
         if self.max_context_tokens < 1024:
             raise ValueError("shadow_agent.max_context_tokens must be at least 1024")
         if self.reasoning_effort not in REASONING_EFFORTS:
@@ -400,6 +403,42 @@ class ShadowAgentConfig:
             raise ValueError("shadow_agent.compaction_threshold_ratio must be between 0 and 1")
         if self.runtime_reminder_interval_ms <= 0:
             raise ValueError("shadow_agent.runtime_reminder_interval_ms must be positive")
+
+
+@dataclass(frozen=True)
+class DshConfig:
+    enabled: bool = True
+    auto_start: bool = True
+    source_dir: Path = Path(".runtime/dsh/source")
+    home_dir: Path = Path(".runtime/dsh/home")
+    profile_patch: Path = Path("config/dsh/web-profile.patch.yml")
+    profile: str = "web"
+    host: str = "127.0.0.1"
+    port: int = 3081
+    startup_timeout_ms: int = 120000
+    shutdown_timeout_ms: int = 5000
+    bridge_timeout_ms: int = 15000
+    bridge_protocol_version: str = "1.0"
+    restart_limit: int = 2
+    restart_delay_ms: int = 1000
+    expected_version: str = "0.1.5-rc.2"
+    expected_commit: str = "fb2c4b9e698e30edb738bca4cf0618587db7d203"
+
+    def __post_init__(self) -> None:
+        if self.host != "127.0.0.1":
+            raise ValueError("dsh.host must be 127.0.0.1")
+        if self.profile != "web":
+            raise ValueError("dsh.profile must be web")
+        if self.port != 3081:
+            raise ValueError("dsh.port must be 3081")
+        if self.startup_timeout_ms <= 0 or self.shutdown_timeout_ms <= 0 or self.bridge_timeout_ms <= 0:
+            raise ValueError("dsh timeouts must be positive")
+        if self.bridge_protocol_version != "1.0":
+            raise ValueError("unsupported dsh.bridge_protocol_version")
+        if self.restart_limit < 0 or self.restart_delay_ms < 0:
+            raise ValueError("dsh restart policy must be non-negative")
+        if not self.expected_version.strip() or len(self.expected_commit) != 40:
+            raise ValueError("dsh expected version and full commit are required")
 
 
 @dataclass(frozen=True)
@@ -417,6 +456,7 @@ class AppConfig:
     smart_turn: InputOptions = field(default_factory=InputOptions)
     agent: AgentOptions = field(default_factory=AgentOptions)
     shadow_agent: ShadowAgentConfig = field(default_factory=ShadowAgentConfig)
+    dsh: DshConfig = field(default_factory=DshConfig)
     persona: PersonaConfig = field(default_factory=PersonaConfig)
     model_dir: Path = Path(r"D:\模型\voice-terminal")
     debug_audio_capture: bool = False
@@ -490,6 +530,7 @@ class AppConfig:
         speaker_worker = _section(data, "speaker_worker")
         persona = _section(data, "persona")
         shadow = _section(data, "shadow_agent")
+        dsh = _section(data, "dsh")
         if "tools" in data:
             raise ValueError("顶层 tools 配置已迁移至 shadow_agent.tools，请更新配置文件")
 
@@ -577,11 +618,23 @@ class AppConfig:
             path if path.is_absolute() else (root / path).resolve()
             for path in (Path(item) for item in raw_shadow_roots)
         )
+        dsh_runtime_root = (root / ".runtime" / "dsh").resolve()
+
+        def dsh_runtime_path(value: Any, default: str, field_name: str) -> Path:
+            candidate = Path(_string(value, default))
+            resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+            try:
+                resolved.relative_to(dsh_runtime_root)
+            except ValueError as exc:
+                raise ValueError(f"dsh.{field_name} must remain inside {dsh_runtime_root}") from exc
+            return resolved
+
         return cls(
             smart_turn=InputOptions.from_mapping(smart_turn_data, root),
             agent=AgentOptions.from_mapping(_section(data, "agent")),
             shadow_agent=ShadowAgentConfig(
                 enabled=_bool(shadow.get("enabled"), True),
+                backend=_string(shadow.get("backend"), "dsh").lower(),
                 debug_websocket_enabled=_bool(shadow.get("debug_websocket_enabled"), False),
                 experimental_context_gate_enabled=_bool(
                     shadow.get("experimental_context_gate_enabled"), False,
@@ -637,6 +690,24 @@ class AppConfig:
                     ) if status_provider else None),
                     max_context_tokens=int(_number(shadow_observer.get("max_context_tokens"), 32768)),
                 ),
+            ),
+            dsh=DshConfig(
+                enabled=_bool(dsh.get("enabled"), True),
+                auto_start=_bool(dsh.get("auto_start"), True),
+                source_dir=dsh_runtime_path(dsh.get("source_dir"), ".runtime/dsh/source", "source_dir"),
+                home_dir=dsh_runtime_path(dsh.get("home_dir"), ".runtime/dsh/home", "home_dir"),
+                profile_patch=(root / "config" / "dsh" / "web-profile.patch.yml").resolve(),
+                profile=_string(dsh.get("profile"), "web"),
+                host=_string(dsh.get("host"), "127.0.0.1"),
+                port=int(_number(dsh.get("port"), 3081)),
+                startup_timeout_ms=int(_number(dsh.get("startup_timeout_ms"), 120000)),
+                shutdown_timeout_ms=int(_number(dsh.get("shutdown_timeout_ms"), 5000)),
+                bridge_timeout_ms=int(_number(dsh.get("bridge_timeout_ms"), 15000)),
+                bridge_protocol_version=_string(dsh.get("bridge_protocol_version"), "1.0"),
+                restart_limit=int(_number(dsh.get("restart_limit"), 2)),
+                restart_delay_ms=int(_number(dsh.get("restart_delay_ms"), 1000)),
+                expected_version=_string(dsh.get("expected_version"), "0.1.5-rc.2"),
+                expected_commit=_string(dsh.get("expected_commit"), "fb2c4b9e698e30edb738bca4cf0618587db7d203"),
             ),
             persona=PersonaConfig(
                 directory=path_or_none(persona.get("directory")) or root / "config" / "persona",

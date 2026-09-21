@@ -60,7 +60,10 @@ committed_prefix + current_clause + prefetched_clause + revisable_tail
 
 - 每个 session 只有一个 `ShadowRuntime`、一个活动 runner 和一份私有 committed trace。
 - Shadow 只读取 `ShadowContextProjector` 的权威语义帧，工具首版全部为 `READ_ONLY`。
-- `progress`、status 和工具生命周期只更新产品投影；`observation`、`user_input_required`、`result`、`failed` 才进入主语义邮箱。
+- `progress` 和工具生命周期只更新产品投影；status observer 的摘要以可替换的
+  `ShadowVisibleStatus` 进入 Voice 普通 ShadowEvent 调度（`wake_policy=normal`），并在下一次
+  主 LLM 请求的 `runtime.shadow.status` 中可见，但不追加为长期语义历史。`observation`、
+  `user_input_required`、`result`、`failed` 仍进入主语义邮箱并按各自策略调度。
 - 新上下文到达时，运行中的 provider 和已开始的只读工具不被强行打断；尚未开始的旧工具必须标记为 `not_executed`，旧 final 不得发布。
 - `session.stop` 保留 Shadow；`session.reset` 清理 Shadow trace、状态、临时请求和 context epoch；runtime close 关闭 provider、工具和共享 HTTP client。
 
@@ -103,6 +106,9 @@ none → kws standby → asr active → kws standby → none
 - `/?replay=voice-shadow` 是开发环境只读回放，不应提交 reset、配置保存或模型应用请求。
 - `/ui-demo.html` 是 legacy 视觉原型，不属于真实运行时。
 - 页面只渲染服务端 conversation `seq` 和 `conversation_id + turn_id/speech_id`，不自行推断服务端顺序。
+- Shadow 摘要和运行轨迹只消费服务端的 `shadow.product` 权威快照与 `shadow.activity` 增量；
+  增量按 `run_seq + item_id` 合并，重连先应用快照再应用 WebSocket `seq` 有序增量。前端不得
+  从 status 文本推断任务终态，也不得把 status observer 摘要伪装成 `result`。
 
 ## 主要代码归属
 

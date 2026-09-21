@@ -1,4 +1,5 @@
 import type {
+  DshRuntimeStatus,
   ProductApiErrorShape,
   ProductMutationResult,
   ProductSnapshot,
@@ -58,6 +59,8 @@ function jsonBody(value: unknown): RequestInit {
 
 export const productApi = {
   snapshot: () => request<ProductSnapshot>('/api/v1/product/snapshot'),
+  dshStatus: () => request<DshRuntimeStatus>('/api/v1/dsh/status'),
+  launchDsh: () => request<{ url: string }>('/api/v1/dsh/ui-launch', { method: 'POST', body: '{}' }),
   saveWake: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/wake', jsonBody(value)),
   saveSilence: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/silence', jsonBody(value)),
   saveShadow: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/shadow', jsonBody(value)),

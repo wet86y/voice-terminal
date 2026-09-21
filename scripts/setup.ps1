@@ -3,6 +3,7 @@ param(
   [string]$ModelDir = "D:\模型\voice-terminal",
   [switch]$Offline,
   [switch]$SkipInstall,
+  [switch]$SkipDsh,
   [switch]$Analysis,
   [switch]$NoDownloadProxy
 )
@@ -49,11 +50,19 @@ if ($Offline) {
   }
 }
 
-Write-Host "Setup complete. Next: .\scripts\doctor.ps1 -Python `"$Python`"" -ForegroundColor Green
-
 if ($Analysis) {
   $analysisArgs = @("-m", "voice_terminal.analysis.model_setup", "--model-dir", $ModelDir)
   if ($Offline) { $analysisArgs += "--offline" }
   if ($NoDownloadProxy) { $analysisArgs += "--no-proxy" }
   Invoke-Python @analysisArgs
 }
+
+if (-not $SkipDsh) {
+  $dshArgs = @()
+  if ($Offline) { $dshArgs += "-Offline" }
+  if ($SkipInstall) { $dshArgs += "-SkipInstall" }
+  & (Join-Path $PSScriptRoot "setup-dsh.ps1") @dshArgs
+  if ($LASTEXITCODE -ne 0) { throw "DSH setup failed with exit code $LASTEXITCODE" }
+}
+
+Write-Host "Setup complete. Next: .\scripts\doctor.ps1 -Python `"$Python`"" -ForegroundColor Green
