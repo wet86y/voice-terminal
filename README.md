@@ -72,7 +72,9 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 - `balanced`：基础请求不思考，必要时通过本地 `request_thinking` 触发一次低思考续请求。
 - `deep`：主请求直接使用低思考。
 - KWS：`wake.enabled=true` 时进入唤醒词待机；关闭后 `session.start` 直接进入 ASR。
-- Shadow：默认开启，但只读、异步，不是主语音链路能够启动的必要条件。
+- Shadow：默认开启，但只读、异步，不是主语音链路能够启动的必要条件；活跃期上下文更新按安全点合并，
+  长推理每 20 秒通过 `inject` 发送一次不打断执行的收敛提醒（可由
+  `shadow_agent.runtime_reminder_interval_ms` 调整）。
 
 KWS 和声纹是独立能力。KWS 负责输入所有权和唤醒待机，声纹负责 ASR final 后的可选路由增强；任一旁路发生故障，都不能默默改变另一条链路的语义。
 

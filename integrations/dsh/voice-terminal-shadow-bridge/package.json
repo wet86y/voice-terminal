@@ -12,7 +12,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "node build.mjs"
+    "build": "node build.mjs",
+    "test": "node build.mjs ../../../.runtime/dsh/bundles/voice-terminal-shadow-bridge-test && node --test test/context-merge.test.mjs"
   },
   "dsh": {
     "bundle": {

@@ -39,6 +39,17 @@ DSH 固定监听 `127.0.0.1:3081`。Voice Server 每次启动生成独立 Bridge
 
 Voice 模型仍只发送无正文的 `request_shadow({"request": true})`。Voice Terminal 是唯一权威上下文
 源；Bundle 先强制注入带来源、epoch、revision 的完整 snapshot/连续 update，再唤醒根 Agent。
+DSH 已经处于运行/推理状态时，后续 `request_shadow` 只同步 Voice 的最新权威上下文，不会创建第二个
+activation、打断模型或取消工具。下一个 `next-step` 安全点之前，连续 delta 会按 revision 合并为一条
+待处理输入并保留该窗口内的全部 frames；snapshot 会覆盖尚未 claim 的旧输入。消息已被安全点 claim
+后才会进入下一个窗口，完全重复的 revision/digest 不会再次注入。上下文更新的传输超时会通过
+`session.state` 核对并以同一 request ID 幂等重试，不能仅凭丢失的 HTTP 响应判定 DSH 失败。
+
+每个 activation 从 `wake` 被接受时开始按 `shadow_agent.runtime_reminder_interval_ms` 计时，默认每
+20 秒向最近的 next-step 安全边界注入一次软性收敛提醒（20、40、60 秒……）。提醒使用 `inject`，不
+唤醒 idle Agent、不恢复工具前硬阻断，也不重置 activation 计时；上一条提醒尚未 claim 时原位替换，
+因此安全点前最多保留一条待处理提醒。terminal、cancel、retire 或插件释放会清理计时器，不为提醒额外
+开启模型步骤。
 普通 DSH assistant 正文永远不进入 Voice 邮箱。正常回传只允许六个根 Agent控制工具：
 
 - `get_latest_context`（仅同步补救）；
@@ -72,9 +83,11 @@ revision 和 snapshot/delta。reset 会取消旧 Turn、把旧 Session 标记 re
 ## 故障边界
 
 3081 被现有进程占用时 Runtime Manager拒绝附着。DSH 异常退出只做有限自动重启，达到上限后标记
-unavailable；Voice 主链继续运行，并且不会为同一 Voice Session自动切到 native。Bridge、模型、
-恢复或协议未结算故障由系统产生真实 `failed`；业务上的“没有结果”由根 Agent选择澄清、result
-或 no-action。
+unavailable；Voice 主链继续运行，并且不会为同一 Voice Session自动切到 native。首次 activation 无法
+建立、显式协议拒绝，或状态核对与一次幂等重试仍无法确认且 Bridge 确实不可用时，系统才产生一次真实
+`failed`。活跃 activation 的单次引导传输超时会保留当前 activation 并后台重同步；只要随后收到有效
+activity/result 就恢复健康，不把瞬时超时升级为持久 `ERROR`。业务上的“没有结果”由根 Agent选择
+澄清、result 或 no-action。
 
 产品顶栏通过 Voice Server取得一次性 launch URL；不要收藏、记录或分享带 `?token=` 的地址。
 Session upload、DeepSeek Session Log 和 OTel 保持禁用。固定上游许可证快照位于
