@@ -832,6 +832,7 @@ class SessionRuntime:
                         observer_max_output_tokens=shadow_cfg.status_observer.max_output_tokens,
                         observer_timeout_ms=shadow_cfg.status_observer.timeout_ms,
                         availability_waiter=self.dsh.wait_ready,
+                        runtime_reminder_interval_ms=shadow_cfg.runtime_reminder_interval_ms,
                     )
                     self.dsh.bridge_hub.register(self.shadow_session)
                     self.history.set_shadow_runtime_state(available=True, active=False)
@@ -1104,6 +1105,11 @@ class SessionRuntime:
 
     async def _on_shadow_activity(self, activities: list[dict[str, Any]]) -> None:
         """Publish transient Shadow activities beside the authoritative event relay."""
+        if (
+            isinstance(getattr(self, "shadow_session", None), DshShadowAgentSession)
+            and any(str(item.get("state") or "") != "failed" for item in activities)
+        ):
+            self.state.set_service("shadow_agent", "READY")
         projection = getattr(self, "shadow_product", None)
         if projection is not None:
             projection.update_activities(activities)
@@ -1661,6 +1667,11 @@ class SessionRuntime:
         # Stop intentionally ends only the voice episode.  The independent
         # manager continues, while its coalesced events wait for the next
         # session.start.
+        if (
+            isinstance(getattr(self, "shadow_session", None), DshShadowAgentSession)
+            and any(item.kind != "failed" for item in events)
+        ):
+            self.state.set_service("shadow_agent", "READY")
         if self._shadow_debug_sinks:
             await asyncio.gather(
                 *(sink(events) for sink in tuple(self._shadow_debug_sinks.values())),

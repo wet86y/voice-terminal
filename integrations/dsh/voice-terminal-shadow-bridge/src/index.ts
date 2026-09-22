@@ -27,6 +27,14 @@ interface Envelope {
 
 interface StoredRequest { digest: string; response: Json }
 interface ObserverRecord { trace_revision: number; type: string; data: Json }
+interface PendingContext {
+  messageId: string
+  update: 'snapshot' | 'delta'
+  fromRevision: number
+  revision: number
+  frames: Json[]
+}
+interface PendingReminder { messageId: string }
 interface Binding {
   voiceSessionId: string
   dshSessionId: string
@@ -45,14 +53,20 @@ interface Binding {
   agentState: string
   committedSteps: number
   pendingTools: Map<string, string>
+  pendingContext?: PendingContext
+  reminderIntervalMs: number
+  activationStartedAt?: number
+  nextReminderMs: number
+  reminderTimer?: ReturnType<typeof setTimeout>
+  pendingReminder?: PendingReminder
 }
 
 const MAX_OBSERVER_RECORDS = 512
 const TOKEN = process.env.VOICE_DSH_BRIDGE_TOKEN ?? ''
 const CALLBACK_ORIGIN = process.env.VOICE_DSH_CALLBACK_ORIGIN ?? ''
 
-function createUserMessage(input: { content: unknown[]; source: Record<string, unknown> }): Record<string, unknown> {
-  return Object.freeze({ ...input, id: randomUUID(), role: 'user' })
+function createUserMessage(input: { content: unknown[]; source: Record<string, unknown> }, id: string = randomUUID()): Record<string, unknown> {
+  return Object.freeze({ ...input, id, role: 'user' })
 }
 
 function compileSchema(node: any): any {
@@ -158,6 +172,184 @@ function publicContextMessage(body: Envelope, update: 'snapshot' | 'delta'): str
   ].join('\n')
 }
 
+function contextMessage(binding: Binding, pending: PendingContext): Record<string, unknown> {
+  return createUserMessage({
+    content: [{
+      type: 'text',
+      text: publicContextMessage({
+        protocol_version: BRIDGE_PROTOCOL_VERSION,
+        request_id: 'merged-context',
+        voice_session_id: binding.voiceSessionId,
+        dsh_session_id: binding.dshSessionId,
+        epoch: binding.epoch,
+        context_revision: pending.revision,
+        from_revision: pending.fromRevision,
+        frames: pending.frames,
+      }, pending.update),
+    }],
+    source: { kind: 'plugin', plugin: name },
+  }, pending.messageId)
+}
+
+export function enqueueAuthoritativeContext(
+  binding: Binding,
+  body: Envelope,
+  update: 'snapshot' | 'delta',
+): 'inserted' | 'replaced' | 'already_claimed' {
+  const revision = Number(body.context_revision)
+  const fromRevision = update === 'snapshot' ? 0 : Number(body.from_revision)
+  const frames = (Array.isArray(body.frames) ? body.frames : []) as Json[]
+  const prior = binding.pendingContext
+  if (prior) {
+    const merged: PendingContext = update === 'snapshot'
+      ? { messageId: prior.messageId, update, fromRevision: 0, revision, frames }
+      : {
+          messageId: prior.messageId,
+          update: prior.update,
+          fromRevision: prior.fromRevision,
+          revision,
+          frames: [...prior.frames, ...frames],
+        }
+    if (binding.handle.agent.inbox.replace(prior.messageId, contextMessage(binding, merged))) {
+      binding.pendingContext = merged
+      console.info('[voice-shadow-bridge] context merge', {
+        action: 'replaced', from_revision: merged.fromRevision,
+        context_revision: revision, frame_count: merged.frames.length,
+      })
+      return 'replaced'
+    }
+  }
+  const pending: PendingContext = {
+    messageId: randomUUID(), update, fromRevision, revision, frames,
+  }
+  binding.handle.agent.inject(contextMessage(binding, pending))
+  binding.pendingContext = pending
+  const action = prior ? 'already_claimed' : 'inserted'
+  console.info('[voice-shadow-bridge] context merge', {
+    action, from_revision: fromRevision, context_revision: revision,
+    frame_count: frames.length,
+  })
+  return action
+}
+
+function runtimeReminderMessage(binding: Binding, messageId: string, elapsedMs: number): Record<string, unknown> {
+  return createUserMessage({
+    content: [{
+      type: 'text',
+      text: [
+        'VOICE SHADOW RUNTIME ADVISORY',
+        `Activation: ${binding.activationId ?? ''}`,
+        `Elapsed: ${(elapsedMs / 1000).toFixed(1)} seconds`,
+        '',
+        '【运行时限提醒】本次 Shadow activation 已运行较长时间。请立即收敛已有信息，停止低收益思考、重复搜索和非必要工具调用，并尽快输出可用结果。',
+      ].join('\n'),
+    }],
+    source: { kind: 'plugin', plugin: name },
+  }, messageId)
+}
+
+export function deliverRuntimeReminder(
+  binding: Binding,
+  nowMs = Date.now(),
+): false | 'inserted' | 'replaced' | 'already_claimed' {
+  if (
+    binding.state !== 'active' || binding.terminal || !binding.activationId
+    || binding.activationStartedAt === undefined
+  ) return false
+  const elapsedMs = Math.max(0, Math.round(nowMs - binding.activationStartedAt))
+  if (elapsedMs < binding.nextReminderMs) return false
+  const crossedIntervals = Math.max(1, Math.floor(elapsedMs / binding.reminderIntervalMs))
+  binding.nextReminderMs = (crossedIntervals + 1) * binding.reminderIntervalMs
+  const prior = binding.pendingReminder
+  if (prior) {
+    const replacement = runtimeReminderMessage(binding, prior.messageId, elapsedMs)
+    if (binding.handle.agent.inbox.replace(prior.messageId, replacement)) {
+      recordRuntimeReminder(binding, 'replaced', elapsedMs, crossedIntervals)
+      return 'replaced'
+    }
+  }
+  const pending = { messageId: randomUUID() }
+  binding.handle.agent.inject(runtimeReminderMessage(binding, pending.messageId, elapsedMs))
+  binding.pendingReminder = pending
+  const action = prior ? 'already_claimed' : 'inserted'
+  recordRuntimeReminder(binding, action, elapsedMs, crossedIntervals)
+  return action
+}
+
+function recordRuntimeReminder(
+  binding: Binding,
+  action: 'inserted' | 'replaced' | 'already_claimed',
+  elapsedMs: number,
+  crossedIntervals: number,
+): void {
+  binding.traceRevision += 1
+  binding.records.push({
+    trace_revision: binding.traceRevision,
+    type: 'voice/runtime-reminder',
+    data: { elapsed_ms: elapsedMs, crossed_intervals: crossedIntervals, action },
+  })
+  if (binding.records.length > MAX_OBSERVER_RECORDS) binding.records.splice(0, binding.records.length - MAX_OBSERVER_RECORDS)
+  console.info('[voice-shadow-bridge] runtime reminder', {
+    activation_id: binding.activationId, elapsed_ms: elapsedMs,
+    crossed_intervals: crossedIntervals, action,
+  })
+}
+
+export function stopRuntimeReminder(binding: Binding, discardPending = false): void {
+  if (binding.reminderTimer !== undefined) clearTimeout(binding.reminderTimer)
+  binding.reminderTimer = undefined
+  binding.activationStartedAt = undefined
+  binding.nextReminderMs = binding.reminderIntervalMs
+  if (!discardPending || !binding.pendingReminder) return
+  const messageId = binding.pendingReminder.messageId
+  binding.pendingReminder = undefined
+  queueMicrotask(() => {
+    try { binding.handle?.agent?.inbox?.remove(messageId) } catch { /* session may be closing */ }
+  })
+}
+
+function scheduleRuntimeReminder(binding: Binding, activationId: string): void {
+  if (
+    binding.state !== 'active' || binding.terminal
+    || binding.activationId !== activationId || binding.activationStartedAt === undefined
+  ) return
+  const dueAt = binding.activationStartedAt + binding.nextReminderMs
+  const delayMs = Math.max(0, dueAt - Date.now())
+  binding.reminderTimer = setTimeout(() => {
+    binding.reminderTimer = undefined
+    if (
+      binding.state !== 'active' || binding.terminal
+      || binding.activationId !== activationId
+    ) return
+    deliverRuntimeReminder(binding)
+    scheduleRuntimeReminder(binding, activationId)
+  }, delayMs)
+  ;(binding.reminderTimer as { unref?: () => void }).unref?.()
+}
+
+function armRuntimeReminder(binding: Binding): void {
+  stopRuntimeReminder(binding, true)
+  binding.activationStartedAt = Date.now()
+  binding.nextReminderMs = binding.reminderIntervalMs
+  scheduleRuntimeReminder(binding, String(binding.activationId ?? ''))
+}
+
+function discardResumedAuthoritativeContext(binding: Binding): void {
+  const pending = [...(binding.handle.agent.inbox.nextStep ?? [])]
+  let removed = 0
+  for (const message of pending) {
+    const source = message?.source
+    const content = message?.content?.[0]
+    if (
+      source?.kind === 'plugin' && source?.plugin === name
+      && typeof content?.text === 'string'
+      && content.text.startsWith('VOICE AUTHORITATIVE CONTEXT')
+      && binding.handle.agent.inbox.remove(message.id)
+    ) removed += 1
+  }
+  if (removed) console.info('[voice-shadow-bridge] context merge', { action: 'resume_discarded', count: removed })
+}
+
 function reassertContextAfterCompaction(binding: Binding): void {
   void callback('/api/internal/dsh-bridge/shadow.context.read', {
     request_id: randomUUID(), voice_session_id: binding.voiceSessionId,
@@ -165,17 +357,12 @@ function reassertContextAfterCompaction(binding: Binding): void {
     since_revision: 0,
   }).then((value: any) => {
     if (value?.result !== 'accepted' || !Array.isArray(value.frames)) return
-    binding.handle.agent.inject(createUserMessage({
-      content: [{ type: 'text', text: [
-        'VOICE AUTHORITATIVE CONTEXT REASSERTION AFTER COMPACTION',
-        `Voice Session: ${binding.voiceSessionId.slice(0, 12)}`,
-        `Epoch: ${binding.epoch}`,
-        `Revision: ${binding.revision}`,
-        'Source: Voice Terminal Bridge',
-        '', JSON.stringify(value.frames),
-      ].join('\n') }],
-      source: { kind: 'plugin', plugin: name },
-    }))
+    enqueueAuthoritativeContext(binding, {
+      protocol_version: BRIDGE_PROTOCOL_VERSION,
+      request_id: randomUUID(), voice_session_id: binding.voiceSessionId,
+      dsh_session_id: binding.dshSessionId, epoch: binding.epoch,
+      context_revision: binding.revision, frames: value.frames,
+    }, 'snapshot')
   }).catch(() => undefined)
 }
 
@@ -246,7 +433,10 @@ function installRootTools(agentCtx: any, binding: Binding): void {
       epoch: binding.epoch, context_revision: binding.revision,
       activation_id: binding.activationId ?? '', kind, ...fields,
     })
-    if (terminal && (response as any).result === 'accepted') binding.terminal = true
+    if (terminal && (response as any).result === 'accepted') {
+      binding.terminal = true
+      stopRuntimeReminder(binding, true)
+    }
     return response
   }
   agentCtx.tools.register(defineTool({
@@ -302,7 +492,11 @@ export function apply(ctx: any, config: Config): void {
     binding.records.push({ trace_revision: binding.traceRevision, type, data: observerData(event, binding) })
     if (binding.records.length > MAX_OBSERVER_RECORDS) binding.records.splice(0, binding.records.length - MAX_OBSERVER_RECORDS)
     if (type === 'tool/result' && binding.terminal) {
-      queueMicrotask(() => binding.handle.agent.cancel('voice-terminal-terminal-settled', { keepInbox: false }))
+      queueMicrotask(() => {
+        binding.handle.agent.cancel('voice-terminal-terminal-settled', { keepInbox: false })
+        binding.pendingContext = undefined
+        binding.pendingReminder = undefined
+      })
     }
     if (type === 'compaction/end' && !event?.data?.error) reassertContextAfterCompaction(binding)
     if (type === 'tool/call') binding.pendingTools.set(String(event?.data?.callId ?? binding.traceRevision), String(event?.data?.name ?? ''))
@@ -329,6 +523,7 @@ export function apply(ctx: any, config: Config): void {
         binding.protocolRecoveryPending = true
       } else {
         binding.terminal = true
+        stopRuntimeReminder(binding, true)
         void callback('/api/internal/dsh-bridge/shadow.event', {
           request_id: randomUUID(), event_id: randomUUID(),
           voice_session_id: binding.voiceSessionId, dsh_session_id: binding.dshSessionId,
@@ -381,7 +576,10 @@ export function apply(ctx: any, config: Config): void {
         if (prior) { json(res, 200, prior.digest === bodyDigest ? result('duplicate', { original: prior.response }) : result('conflict')); return }
         if (path === 'session.open' || path === 'session.resume') {
           if (existing) { json(res, 409, result('conflict')); return }
-          const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', terminal: false, protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map() }
+          const requestedReminderMs = Number(body.runtime_reminder_interval_ms)
+          const reminderIntervalMs = Number.isSafeInteger(requestedReminderMs) && requestedReminderMs > 0
+            ? requestedReminderMs : 20000
+          const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', terminal: false, protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map(), reminderIntervalMs, nextReminderMs: reminderIntervalMs }
           const preset = await ctx.agentPresets.resolve('shadow-agent')
           const modelSelection = ctx.agentDefaultModel.currentSelection()
           const setup = async (agentCtx: any) => { await ctx.agentPresets.mount(agentCtx, preset.id); installRootTools(agentCtx, binding) }
@@ -394,6 +592,7 @@ export function apply(ctx: any, config: Config): void {
               setup,
             })
           binding.handle = handle
+          if (path === 'session.resume') discardResumedAuthoritativeContext(binding)
           bindings.set(binding.dshSessionId, binding)
           ctx.sessionTitle.rename(handle.agent.session, `Voice Shadow · ${binding.voiceSessionId.slice(0, 8)} · epoch ${binding.epoch}`)
           handle.agent.inject(createUserMessage({
@@ -415,11 +614,18 @@ export function apply(ctx: any, config: Config): void {
           else if (!isSnapshot && Number(body.from_revision) !== existing.revision) response = result('resync_required')
           else if (!isSnapshot && revision <= Number(body.from_revision)) response = result('conflict')
           else if (revision < existing.revision) response = result('stale')
-          else if (revision === existing.revision && existing.contextDigest !== undefined) response = existing.contextDigest === contextDigest ? result('duplicate') : result('conflict')
+          else if (revision === existing.revision && existing.contextDigest === contextDigest) {
+              console.info('[voice-shadow-bridge] context merge', {
+                action: 'duplicate', context_revision: revision,
+                frame_count: Array.isArray(body.frames) ? body.frames.length : 0,
+              })
+              response = result('duplicate')
+          }
+          else if (!isSnapshot && revision === existing.revision) response = result('conflict')
           else {
+            enqueueAuthoritativeContext(existing, body, isSnapshot ? 'snapshot' : 'delta')
             existing.revision = revision
             existing.contextDigest = contextDigest
-            existing.handle.agent.inject(createUserMessage({ content: [{ type: 'text', text: publicContextMessage(body, isSnapshot ? 'snapshot' : 'delta') }], source: { kind: 'plugin', plugin: name } }))
             existing.traceRevision += 1
             existing.records.push({
               trace_revision: existing.traceRevision,
@@ -439,16 +645,23 @@ export function apply(ctx: any, config: Config): void {
             const wake = createUserMessage({ content: [{ type: 'text', text: `VOICE SHADOW ACTIVATION\nActivation: ${existing.activationId}\nRevision: ${existing.revision}\nJudge and execute the current task. End only with a Voice Bridge terminal tool.` }], source: { kind: 'plugin', plugin: name } })
             if (existing.handle.agent.status === 'idle') existing.handle.agent.followup(wake)
             else existing.handle.agent.steer(wake)
+            armRuntimeReminder(existing)
             response = result('accepted')
           }
         } else if (path === 'session.cancel') {
-          existing.handle.agent.cancel('voice-terminal-cancel', { keepInbox: false }); existing.terminal = true; response = result('accepted')
+          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-cancel', { keepInbox: false }); existing.pendingContext = undefined; existing.pendingReminder = undefined; existing.terminal = true; response = result('accepted')
         } else if (path === 'session.retire') {
-          existing.handle.agent.cancel('voice-terminal-retire', { keepInbox: false }); existing.state = 'retired'; existing.terminal = true
+          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-retire', { keepInbox: false }); existing.pendingContext = undefined; existing.pendingReminder = undefined; existing.state = 'retired'; existing.terminal = true
           ctx.sessionTitle.rename(existing.handle.agent.session, `Voice Shadow · ${existing.voiceSessionId.slice(0, 8)} · epoch ${existing.epoch} · retired`)
           response = result('accepted')
         } else if (path === 'session.state') {
-          response = result('accepted', { state: existing.state, context_revision: existing.revision, terminal: existing.terminal })
+          response = result('accepted', {
+            state: existing.state,
+            context_revision: existing.revision,
+            activation_id: existing.activationId ?? '',
+            terminal: existing.terminal,
+            agent_state: existing.agentState,
+          })
         } else if (path === 'observer.snapshot' || path === 'observer.update') {
           const since = Number(body.trace_revision ?? 0)
           const first = existing.records[0]?.trace_revision ?? existing.traceRevision
@@ -476,5 +689,12 @@ export function apply(ctx: any, config: Config): void {
       }
     },
   }
-  ctx.effect(() => ctx.webServer.register(route), `voice-terminal-shadow-bridge: ${config.routePrefix}`)
+  ctx.effect(() => {
+    const dispose = ctx.webServer.register(route)
+    return () => {
+      for (const binding of bindings.values()) stopRuntimeReminder(binding, true)
+      bindings.clear()
+      if (typeof dispose === 'function') dispose()
+    }
+  }, `voice-terminal-shadow-bridge: ${config.routePrefix}`)
 }

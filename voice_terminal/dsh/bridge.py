@@ -48,6 +48,15 @@ AvailabilityWaiter = Callable[[], Awaitable[bool]]
 class DshBridgeError(RuntimeError):
     """A protocol or transport failure without sensitive response material."""
 
+    def __init__(
+        self, message: str, *, operation: str | None = None,
+        request_id: str | None = None, transport: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.operation = operation
+        self.request_id = request_id
+        self.transport = bool(transport)
+
 
 def new_bridge_token() -> str:
     return secrets.token_urlsafe(48)
@@ -145,14 +154,40 @@ class DshBridgeClient:
         return await self._request("GET", "health", None)
 
     async def call(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+        request_id = str(payload.get("request_id") or uuid.uuid4())
         body = {
             "protocol_version": BRIDGE_PROTOCOL_VERSION,
-            "request_id": str(payload.get("request_id") or uuid.uuid4()),
+            "request_id": request_id,
             **payload,
         }
-        response = await self._request("POST", operation, body)
+        started = time.monotonic()
+        try:
+            response = await self._request("POST", operation, body)
+        except DshBridgeError as exc:
+            elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+            log.warning(
+                "dsh.bridge operation=%s request_id=%s context_revision=%s "
+                "activation_id=%s elapsed_ms=%s result=error transport=%s error=%s",
+                operation, request_id, body.get("context_revision"),
+                body.get("activation_id"), elapsed_ms, exc.transport, exc,
+            )
+            if exc.operation is None:
+                exc.operation = operation
+            if exc.request_id is None:
+                exc.request_id = request_id
+            raise
         if response.get("protocol_version") != BRIDGE_PROTOCOL_VERSION:
-            raise DshBridgeError("DSH Bridge protocol mismatch")
+            raise DshBridgeError(
+                "DSH Bridge protocol mismatch", operation=operation,
+                request_id=request_id,
+            )
+        log.info(
+            "dsh.bridge operation=%s request_id=%s context_revision=%s "
+            "activation_id=%s elapsed_ms=%s result=%s",
+            operation, request_id, body.get("context_revision"),
+            body.get("activation_id"),
+            round((time.monotonic() - started) * 1000, 1), response.get("result"),
+        )
         return response
 
     async def _request(
@@ -177,7 +212,11 @@ class DshBridgeClient:
             with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
                 raw = response.read(2 * 1024 * 1024 + 1)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise DshBridgeError(f"DSH Bridge transport failed: {type(exc).__name__}") from None
+            request_id = str((payload or {}).get("request_id") or "")
+            raise DshBridgeError(
+                f"DSH Bridge transport failed: {type(exc).__name__}",
+                operation=operation, request_id=request_id, transport=True,
+            ) from None
         if len(raw) > 2 * 1024 * 1024:
             raise DshBridgeError("DSH Bridge response exceeds limit")
         try:
@@ -207,7 +246,10 @@ class DshShadowAgentSession:
         observer_max_output_tokens: int = 512,
         observer_timeout_ms: int | None = None,
         availability_waiter: AvailabilityWaiter | None = None,
+        runtime_reminder_interval_ms: int = 20000,
     ) -> None:
+        if runtime_reminder_interval_ms <= 0:
+            raise ValueError("runtime_reminder_interval_ms must be positive")
         self.client = client
         self.mapping_store = mapping_store
         self.context_source = context_source
@@ -217,6 +259,7 @@ class DshShadowAgentSession:
         self.activity_sink = activity_sink
         self.status_provider = status_provider
         self.availability_waiter = availability_waiter
+        self.runtime_reminder_interval_ms = int(runtime_reminder_interval_ms)
         self.observer_every_steps = max(1, int(observer_every_steps))
         self._observer = ShadowStatusObserver(
             max_output_tokens=observer_max_output_tokens,
@@ -240,6 +283,7 @@ class DshShadowAgentSession:
         self._visible_status = ""
         self._run_seq = 0
         self._observer_committed_steps = 0
+        self._context_resync_task: asyncio.Task[None] | None = None
 
     @property
     def available(self) -> bool:
@@ -280,15 +324,30 @@ class DshShadowAgentSession:
             if self.availability_waiter is not None and not await self.availability_waiter():
                 return "unavailable"
             await self._ensure_open()
-            await self._sync_context()
+            was_active = self.activation_id is not None
+            try:
+                await self._sync_context()
+            except DshBridgeError as exc:
+                if not was_active or not exc.transport:
+                    raise
+                log.warning(
+                    "dsh.context_sync deferred voice_session_id=%s activation_id=%s "
+                    "local_revision=%s target_revision=%s error=%s",
+                    self.voice_session_id, self.activation_id,
+                    self.last_applied_revision,
+                    int(self.context_source.shadow_input_revision), exc,
+                )
+                self._schedule_context_resync()
+                return "coalesced"
             if self.activation_id is not None:
                 return "coalesced"
             revision = self.last_applied_revision
             activation = str(uuid.uuid4())
-            response = await self.client.call("wake", self._envelope(
+            response = await self._call_reconciled("wake", self._envelope(
+                request_id=str(uuid.uuid4()),
                 context_revision=revision,
                 activation_id=activation,
-            ))
+            ), expected_activation_id=activation)
             code = str(response.get("result"))
             if code not in {"accepted", "duplicate"}:
                 if code == "stale":
@@ -316,7 +375,14 @@ class DshShadowAgentSession:
                 # Recovery always reasserts the complete Voice-authoritative snapshot.
                 self.last_applied_revision = -1
                 operation = "session.resume"
-        response = await self.client.call(operation, self._envelope(cwd=str(self.workspace)))
+        response = await self._call_reconciled(
+            operation,
+            self._envelope(
+                request_id=str(uuid.uuid4()), cwd=str(self.workspace),
+                runtime_reminder_interval_ms=self.runtime_reminder_interval_ms,
+            ),
+            expected_context_revision=0,
+        )
         if response.get("result") not in {"accepted", "duplicate"}:
             raise DshBridgeError(f"DSH session open rejected: {response.get('result')}")
         self._opened = True
@@ -348,7 +414,10 @@ class DshShadowAgentSession:
                 from_revision=update.from_revision,
                 frames=[_frame(item) for item in update.frames],
             )
-        response = await self.client.call(operation, payload)
+        payload["request_id"] = str(uuid.uuid4())
+        response = await self._call_reconciled(
+            operation, payload, expected_context_revision=int(payload["context_revision"]),
+        )
         if response.get("result") == "resync_required" and operation != "context.snapshot":
             await self._sync_context(force_snapshot=True)
             return
@@ -357,7 +426,100 @@ class DshShadowAgentSession:
         self.last_applied_revision = int(payload["context_revision"])
         await self._save_mapping(state="active")
 
+    async def _session_state(self) -> dict[str, Any]:
+        response = await self.client.call(
+            "session.state", self._envelope(request_id=str(uuid.uuid4())),
+        )
+        if response.get("result") != "accepted":
+            raise DshBridgeError(
+                f"DSH state rejected: {response.get('result')}",
+                operation="session.state",
+            )
+        return response
+
+    @staticmethod
+    def _state_confirms(
+        state: dict[str, Any], *, expected_context_revision: int | None,
+        expected_activation_id: str | None,
+    ) -> bool:
+        if expected_activation_id is not None:
+            return str(state.get("activation_id") or "") == expected_activation_id
+        if expected_context_revision is not None:
+            revision = state.get("context_revision")
+            return (
+                isinstance(revision, int) and not isinstance(revision, bool)
+                and revision >= expected_context_revision
+            )
+        return False
+
+    async def _call_reconciled(
+        self, operation: str, payload: dict[str, Any], *,
+        expected_context_revision: int | None = None,
+        expected_activation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Retry one ambiguous transport loss with a stable request identity."""
+
+        try:
+            return await self.client.call(operation, payload)
+        except DshBridgeError as first:
+            if not first.transport:
+                raise
+        for attempt in ("state_before_retry", "state_after_retry"):
+            try:
+                state = await self._session_state()
+            except DshBridgeError:
+                state = {}
+            if self._state_confirms(
+                state,
+                expected_context_revision=expected_context_revision,
+                expected_activation_id=expected_activation_id,
+            ):
+                log.info(
+                    "dsh.bridge reconciled operation=%s request_id=%s via=%s "
+                    "context_revision=%s activation_id=%s",
+                    operation, payload.get("request_id"), attempt,
+                    expected_context_revision, expected_activation_id,
+                )
+                return {"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": "accepted"}
+            if attempt == "state_before_retry":
+                try:
+                    retried = await self.client.call(operation, payload)
+                    if retried.get("result") == "duplicate":
+                        original = retried.get("original")
+                        if isinstance(original, dict):
+                            return original
+                    return retried
+                except DshBridgeError as retry_error:
+                    if not retry_error.transport:
+                        raise
+                    first = retry_error
+        raise first
+
+    def _schedule_context_resync(self) -> None:
+        if self._context_resync_task is not None and not self._context_resync_task.done():
+            return
+
+        async def resync() -> None:
+            await asyncio.sleep(0.25)
+            try:
+                async with self._wake_lock:
+                    if self.available and self.activation_id is not None:
+                        await self._sync_context()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "dsh.context_sync background_failed voice_session_id=%s "
+                    "activation_id=%s error=%s",
+                    self.voice_session_id, self.activation_id, exc,
+                )
+
+        self._context_resync_task = asyncio.create_task(
+            resync(), name=f"dsh-context-resync-{self.voice_session_id[:12]}",
+        )
+
     async def reset(self) -> None:
+        await self._stop_context_resync()
         await self._stop_observer()
         if self._opened and not self._retired:
             try:
@@ -378,6 +540,7 @@ class DshShadowAgentSession:
         self._visible_status = ""
 
     async def cancel(self) -> None:
+        await self._stop_context_resync()
         if self._opened and not self._retired:
             try:
                 await self.client.call("session.cancel", self._envelope())
@@ -388,6 +551,7 @@ class DshShadowAgentSession:
         await self._activity("cancelled")
 
     async def close(self) -> None:
+        await self._stop_context_resync()
         await self._stop_observer()
         if self._opened and not self._retired:
             try:
@@ -405,7 +569,7 @@ class DshShadowAgentSession:
         previous = self._accepted_events.get(event_id)
         if previous is not None:
             return "duplicate" if previous == digest else "conflict"
-        if not self._callback_matches(payload):
+        if not await self._callback_matches_or_reconcile(payload):
             return "stale"
         kind = str(payload.get("kind", ""))
         if kind == "no_action":
@@ -442,7 +606,7 @@ class DshShadowAgentSession:
         return "accepted"
 
     async def accept_activity(self, payload: dict[str, Any]) -> BridgeResult:
-        if not self._callback_matches(payload):
+        if not await self._callback_matches_or_reconcile(payload):
             return "stale"
         await self._activity(str(payload.get("state") or "running"),
                              trace_revision=payload.get("trace_revision"))
@@ -658,6 +822,58 @@ class DshShadowAgentSession:
             and payload.get("context_revision") == self.last_applied_revision
             and not self._retired
         )
+
+    async def _callback_matches_or_reconcile(self, payload: dict[str, Any]) -> bool:
+        if self._callback_matches(payload):
+            return True
+        if (
+            payload.get("protocol_version") != BRIDGE_PROTOCOL_VERSION
+            or payload.get("voice_session_id") != self.voice_session_id
+            or payload.get("dsh_session_id") != self.dsh_session_id
+            or payload.get("epoch") != self.epoch
+            or payload.get("activation_id") != self.activation_id
+            or self._retired
+        ):
+            return False
+        payload_revision = payload.get("context_revision")
+        current_revision = int(self.context_source.shadow_input_revision)
+        if (
+            not isinstance(payload_revision, int)
+            or isinstance(payload_revision, bool)
+            or payload_revision <= self.last_applied_revision
+            or payload_revision > current_revision
+        ):
+            return False
+        try:
+            state = await self._session_state()
+        except DshBridgeError:
+            return False
+        state_revision = state.get("context_revision")
+        if (
+            not isinstance(state_revision, int)
+            or isinstance(state_revision, bool)
+            or state_revision < payload_revision
+            or state_revision > current_revision
+            or str(state.get("activation_id") or "") != str(self.activation_id or "")
+        ):
+            return False
+        self.last_applied_revision = state_revision
+        await self._save_mapping(state="active")
+        log.info(
+            "dsh.callback reconciled voice_session_id=%s activation_id=%s "
+            "payload_revision=%s state_revision=%s",
+            self.voice_session_id, self.activation_id,
+            payload_revision, state_revision,
+        )
+        return True
+
+    async def _stop_context_resync(self) -> None:
+        task = self._context_resync_task
+        self._context_resync_task = None
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     def _envelope(self, **extra: Any) -> dict[str, Any]:
         return {
