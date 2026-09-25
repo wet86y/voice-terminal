@@ -1,9 +1,15 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { GENERATED_SHADOW_PROMPT } from './generated-prompt.js'
+import { createAttachedVoiceSession, initializeVoiceTerminalSettings } from './settings.js'
+
+export { createAttachedVoiceSession } from './settings.js'
 
 export const name = 'voice-terminal-shadow-bridge'
-export const inject = ['webServer', 'agents', 'agentPresets', 'agentDefaultModel', 'sessionTitle']
+export const inject = [
+  'webServer', 'agents', 'agentPresets', 'agentDefaultModel', 'sessionTitle',
+  'settings', 'workspaceRegistry', 'loader',
+]
 export const BRIDGE_PROTOCOL_VERSION = '1.0'
 
 export interface Config {
@@ -482,6 +488,15 @@ export function apply(ctx: any, config: Config): void {
   if (!CALLBACK_ORIGIN.startsWith('http://127.0.0.1:')) throw new Error('VOICE_DSH_CALLBACK_ORIGIN must be loopback HTTP')
   if (!config.routePrefix.startsWith('/') || config.routePrefix.endsWith('/')) throw new Error('invalid routePrefix')
   const bindings = new Map<string, Binding>()
+  let startupError: unknown
+  const settingsReady = initializeVoiceTerminalSettings(ctx).catch((error) => {
+    startupError = error
+    console.error('[voice-shadow-bridge] plugin settings or default workspace initialization failed', error)
+    throw error
+  })
+  // The same rejected promise is surfaced to each attempted voice open below;
+  // observe it here as well so a failed first boot does not become an unhandled rejection.
+  void settingsReady.catch(() => undefined)
 
   ctx.on('session/event', (session: any, event: any) => {
     const binding = bindings.get(String(session.id))
@@ -583,14 +598,34 @@ export function apply(ctx: any, config: Config): void {
           const preset = await ctx.agentPresets.resolve('shadow-agent')
           const modelSelection = ctx.agentDefaultModel.currentSelection()
           const setup = async (agentCtx: any) => { await ctx.agentPresets.mount(agentCtx, preset.id); installRootTools(agentCtx, binding) }
-          const handle = path === 'session.resume'
-            ? await ctx.agents.resume({ resumeSessionId: body.dsh_session_id, agentOptions: modelSelection, setup })
-            : await ctx.agents.create({
-              sessionId: body.dsh_session_id,
-              agentOptions: modelSelection,
-              meta: { cwd: String(body.cwd ?? process.cwd()), agentPreset: preset.id },
-              setup,
-            })
+          let handle: any
+          if (path === 'session.resume') {
+            // A resumed voice session keeps its persisted Session settings; plugin defaults
+            // are resolved only for a newly opened session.
+            handle = await ctx.agents.resume({ resumeSessionId: body.dsh_session_id, agentOptions: modelSelection, setup })
+          } else {
+            try {
+              const initialized = await settingsReady
+              const opened = await createAttachedVoiceSession({
+                ctx,
+                settings: initialized.settings,
+                sessionId: body.dsh_session_id,
+                presetId: preset.id,
+                globalSelection: modelSelection,
+                setup,
+              })
+              handle = opened.handle
+            } catch (error) {
+              const message = String(error instanceof Error ? error.message : error).slice(0, 240)
+              console.error('[voice-shadow-bridge] voice session startup failed', {
+                session_id: body.dsh_session_id,
+                startup_error: startupError === undefined ? undefined : String(startupError),
+                error: message,
+              })
+              json(res, 503, result('conflict', { message: `voice session startup failed: ${message}` }))
+              return
+            }
+          }
           binding.handle = handle
           if (path === 'session.resume') discardResumedAuthoritativeContext(binding)
           bindings.set(binding.dshSessionId, binding)

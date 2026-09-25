@@ -1,0 +1,113 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 760px;
+  padding: 18px 4px 36px;
+  color: var(--dsw-alias-label-primary);
+}
+
+.heading {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.intro {
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.status,
+.warning {
+  margin: 4px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.warning {
+  color: var(--dsw-alias-state-warn-label);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 10px;
+}
+
+.fieldLabel {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 20px;
+}
+
+.menuAnchor {
+  display: block;
+  width: 100%;
+}
+
+.trigger.trigger {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  height: auto;
+  min-height: 40px;
+  padding: 7px 11px;
+  border-radius: 10px;
+  text-align: left;
+}
+
+.triggerValue {
+  display: block;
+  flex: 1;
+  min-width: 0;
+}
+
+.chevron {
+  flex: none;
+  color: var(--dsw-alias-label-caption);
+}
+
+.choiceContent {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.choicePrimary {
+  color: var(--dsw-alias-label-primary);
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+
+.choiceDetail {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 17px;
+  overflow-wrap: anywhere;
+}
+
+.help {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 13px;
+  line-height: 19px;
+}
+
+.saveState {
+  min-height: 20px;
+  margin: 8px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 13px;
+  line-height: 20px;
+}

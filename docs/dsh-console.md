@@ -17,10 +17,36 @@ Web RPC，或启动第二个长期持有同一 Session 的 DSH 进程。
 .\scripts\setup-dsh.ps1 -ValidateOnly
 ```
 
-setup 会验证固定 source/tag/commit、Node、pnpm 和 CLI，构建 TypeScript Bridge Bundle，用官方
+setup 会验证固定 source/tag/commit、Node、pnpm 和 CLI，构建 TypeScript Bridge Bundle（插件运行包），用官方
 `dsh plugin --profile web add` 安装到项目 profile，同步正式 preset，运行 `dump-config`，并记录
-Bundle 版本、协议版本、Bundle hash、公共提示词 hash 和受管配置 hash。`-ValidateOnly` 对缺失或
-漂移 fail-closed。
+Node Bundle（Node.js 插件运行包）与浏览器插件页的 hash（哈希值）、协议版本、公共提示词哈希和受管配置哈希。浏览器插件构建会
+使用临时 staging directory（暂存目录），结束后移除，不保留对固定 DSH source（源码）的修改。`-ValidateOnly`
+会检查 Node Bundle（Node.js 插件运行包）、浏览器入口、插件页 manifest（清单）和安装状态；发现缺失或漂移即拒绝通过校验。
+
+## Voice Terminal 插件设置
+
+DSH 启动后，在设置侧栏“Agent 预设”下方打开独立的 `Voice Terminal` 页面。首次启动时 Bridge（插件桥接层）会在项目根目录确保
+`workspace` 文件夹存在，并把它注册为项目默认工作区。之后可为语音新会话选择 DSH 已注册的工作区，
+工作区菜单使用 DSH 原生控件且不会切换当前工作区或会话。也可选择一个专用模型与该模型支持的推理强度；
+模型默认设置是跟随 DSH 全局模型。设置保存在 DSH 的 settings document（设置文档）中，
+更改会作用于下一次新建的语音 DSH 会话，无需重启。
+
+插件设置使用 `voice-terminal-shadow-bridge` namespace（命名空间），持久化字段如下：
+
+| 字段 | 中文说明 | 用途 |
+| --- | --- | --- |
+| `workspaceId` | 选择的工作区标识 | 指向 DSH 已注册的工作区；仅影响新语音会话的 `cwd`（会话工作目录）。 |
+| `defaultWorkspaceId` | 项目默认工作区标识 | Bridge 维护的回退目标，对应项目根目录的 `workspace` 文件夹。 |
+| `provider` | 模型供应方 | 与 `model` 一起指定插件专属模型；未设置时继承 DSH 全局模型。 |
+| `model` | 模型标识 | 指定插件专属模型；模型不可用时回退至 DSH 全局模型。 |
+| `reasoningEffort` | 推理强度 | 指定所选模型支持的强度；未设置时使用模型默认值。 |
+| `fallbackNotice` | 回退提示状态 | 记录工作区、模型或推理强度回退原因，并在设置页提示。 |
+
+工作区和模型选择只应用于 Voice Terminal 触发的新 `session.open`（会话打开请求）。手动新建的 DSH
+会话、已经运行的语音会话以及恢复的语音会话都继续沿用原有工作目录和模型选择。已保存工作区失效
+时回退到项目默认 `workspace`；专属模型失效时回退到当前 DSH 全局模型。Bridge 会记录回退诊断并在
+该设置页显示提示。新建会话须成功挂接工作区后才会接受语音唤醒；目录创建、注册或挂接失败会拒绝
+本次语音会话启动。
 
 项目私有运行数据位于 `.runtime/dsh`：
 
@@ -68,7 +94,8 @@ activation、打断模型或取消工具。下一个 `next-step` 安全点之前
 workflow 和子代理；Bridge 不调用 `tools.restrict()`。受管进程默认
 `DSH_PERMISSION_MODE=read-only`，实际允许/拒绝由官方 Harness 权限面板人工控制。
 
-DSH 根模型、provider、reasoning 和凭据只由 Harness UI 管理；Voice 设置只管理 Voice 主模型、
+DSH 全局模型、provider、reasoning 和凭据仍由 Harness UI 管理；Voice Terminal 插件设置只为
+语音触发的新 DSH 会话提供工作区、可选模型与推理强度覆盖。Voice 设置还管理 Voice 主模型、
 status observer 和 TTS。status observer 仍由 Voice 托管，但只能通过 Bundle 的有界
 ObserverSnapshot 读取已提交事件，不接收 reasoning、流式草稿、完整敏感参数、环境变量、凭据或
 子代理私有轨迹，也不回注 DSH 根 Agent。status observer 的真实摘要会在 Voice 侧生成

@@ -1,0 +1,53 @@
+/** Localized copy for the Voice Terminal plugin settings page（插件设置页面）. */
+
+/** Simplified Chinese copy; English technical terms include Chinese descriptions. */
+export const zh = {
+  nav: 'Voice Terminal',
+  intro: '这些设置只影响 Voice Terminal 通过语音交互新建的 DSH 会话。',
+  workspace: '默认工作区 (Default workspace)',
+  workspaceHelp: '新语音会话会使用所选工作区作为 cwd（会话工作目录），并登记到该工作区。',
+  noWorkspace: '未选择工作区',
+  followGlobal: '跟随 DSH 全局模型 (Follow DSH global model)',
+  model: '模型 (Model)',
+  modelHelp: '模型选择只覆盖新语音会话，不修改 DSH 的全局模型。',
+  effort: '推理强度 (Reasoning effort)',
+  modelDefault: '模型默认 (Model default)',
+  loading: '正在读取工作区和模型目录…',
+  catalogError: '暂时无法读取 DSH 模型目录。',
+  workspaceError: '暂时无法读取 DSH 工作区。',
+  workspaceUnavailable: '已保存的工作区不可用。新的语音会话将回退到项目默认 workspace（工作区）；请重新选择工作区。',
+  modelUnavailable: '已保存的模型当前不可用。新的语音会话将回退到 DSH 全局模型。',
+  reasoningUnavailable: '所选模型不支持已保存的 reasoning effort（推理强度）；新的语音会话将使用模型默认值。',
+  workspaceMissing: '已保存的工作区标识未注册。新的语音会话将回退到项目默认 workspace（工作区）。',
+  modelMissing: '已保存的模型未出现在当前模型目录中。新的语音会话将跟随 DSH 全局模型。',
+  saving: '正在保存…',
+  saved: '已保存；后续新语音会话立即生效。',
+  saveError: '设置保存失败，请重试。',
+} satisfies Record<string, string>
+
+/** English copy checked against the Chinese key set. */
+export const en = {
+  nav: 'Voice Terminal',
+  intro: 'These options apply only to new DSH sessions opened by Voice Terminal voice interaction.',
+  workspace: 'Default workspace（默认工作区）',
+  workspaceHelp: 'New voice sessions use the selected workspace as cwd（session working directory）and are attached to it.',
+  noWorkspace: 'No workspace selected（未选择工作区）',
+  followGlobal: 'Follow DSH global model（跟随 DSH 全局模型）',
+  model: 'Model（模型）',
+  modelHelp: 'A model choice overrides only new voice sessions and does not change the DSH global model.',
+  effort: 'Reasoning effort（推理强度）',
+  modelDefault: 'Model default（模型默认）',
+  loading: 'Loading workspaces and model catalog…',
+  catalogError: 'The DSH model catalog is temporarily unavailable.',
+  workspaceError: 'DSH workspaces are temporarily unavailable.',
+  workspaceUnavailable: 'The saved workspace is unavailable. New voice sessions will fall back to the project default workspace（项目默认工作区）; choose another workspace.',
+  modelUnavailable: 'The saved model is unavailable. New voice sessions will fall back to the DSH global model.',
+  reasoningUnavailable: 'The selected model does not support the saved reasoning effort（推理强度）; new voice sessions will use the model default.',
+  workspaceMissing: 'The saved workspace id is not registered. New voice sessions will fall back to the project default workspace（项目默认工作区）.',
+  modelMissing: 'The saved model is missing from the current catalog. New voice sessions will follow the DSH global model.',
+  saving: 'Saving…',
+  saved: 'Saved; changes apply immediately to later voice sessions.',
+  saveError: 'Settings could not be saved. Please retry.',
+} satisfies Record<keyof typeof zh, string>
+
+export type VoiceTerminalLocaleKey = keyof typeof zh
