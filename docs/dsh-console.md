@@ -23,6 +23,10 @@ Node Bundle（Node.js 插件运行包）与浏览器插件页的 hash（哈希�
 使用临时 staging directory（暂存目录），结束后移除，不保留对固定 DSH source（源码）的修改。`-ValidateOnly`
 会检查 Node Bundle（Node.js 插件运行包）、浏览器入口、插件页 manifest（清单）和安装状态；发现缺失或漂移即拒绝通过校验。
 
+运行时 freshness check（新鲜度校验）只覆盖 Bridge 的 `src/`、`package.json`、`build.mjs`、`cordis.patch.yml`
+和 `scripts/build-dsh-client.mjs`（浏览器构建脚本）；README、`test/` 目录和 source map（源码映射）变更不会阻止启动。
+产物 hash（哈希值）只覆盖 DSH 实际加载的包清单、Cordis patch（配置补丁）和 JavaScript 运行文件，不包含声明文件或文档。
+
 ## Voice Terminal 插件设置
 
 DSH 启动后，在设置侧栏“Agent 预设”下方打开独立的 `Voice Terminal` 页面。首次启动时 Bridge（插件桥接层）会在项目根目录确保
