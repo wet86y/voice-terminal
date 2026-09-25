@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -60,49 +61,57 @@ class TtsSwitchingTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test") as client:
             return await client.request(method, path, **kwargs)
 
-    async def test_switch_retains_transaction_provider_and_drains_worker(self):
-        worker = self.runtime.cosyvoice_worker
-        async def ready():
-            worker.state = "ready"
-        worker.ensure_ready = ready
-        worker.stop = AsyncMock(side_effect=lambda: setattr(worker, "state", "stopped"))
-        old_backend, old_client = self.runtime.tts.bind()
-        response = await self.request("PUT", "/api/v1/product/settings/tts", json={"backend": "cosyvoice"})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["effective_from"], "next_speech")
-        self.assertEqual(self.store.settings_only()["tts"]["backend"], "cosyvoice")
-        self.assertEqual((old_backend, old_client), ("minimax", self.remote))
-        local_backend, local_client = self.runtime.tts.bind()
-        self.assertEqual(local_backend, "cosyvoice")
-        self.assertIsInstance(local_client, CosyVoiceTtsClient)
-        response = await self.request("PUT", "/api/v1/product/settings/tts", json={"backend": "minimax"})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(worker.state, "draining")
-        self.assertEqual(self.runtime.tts.bind()[0], "minimax")
-        # A pre-switch local transaction can open its Worker connection after
-        # the new selection is already MiniMax.
-        worker.port = 12345
-        worker.token = "test-token"
-        pending_local_session = local_client.session(emotion="calm")
-        with patch("voice_terminal.tts.cosyvoice_runtime.websockets.connect",
-                   new=AsyncMock(return_value=FakeSocket())):
-            await pending_local_session.start()
-            await pending_local_session.close()
-        self.runtime.tts.release(local_backend)
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        worker.stop.assert_awaited()
-        self.assertEqual(self.store.settings_only()["tts"]["backend"], "minimax")
+    async def test_product_switch_route_is_removed_and_status_is_locked_to_api(self):
+        self.runtime.cosyvoice_worker.ensure_ready = AsyncMock()
+        status = await self.request("GET", "/api/v1/tts/status")
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["backend"], "minimax")
+        self.assertEqual(status.json()["worker"]["state"], "stopped")
 
-    async def test_failed_local_health_keeps_remote_and_saved_choice(self):
-        self.runtime.cosyvoice_worker.ensure_ready = AsyncMock(
-            side_effect=CosyVoiceRuntimeError("模型初始化失败"),
+        response = await self.request(
+            "PUT", "/api/v1/product/settings/tts", json={"backend": "cosyvoice"},
         )
-        response = await self.request("PUT", "/api/v1/product/settings/tts", json={"backend": "cosyvoice"})
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json()["detail"]["code"], "TTS_WORKER_UNAVAILABLE")
+        self.assertEqual(response.status_code, 404)
+        self.runtime.cosyvoice_worker.ensure_ready.assert_not_awaited()
         self.assertEqual(self.runtime.tts.backend, "minimax")
         self.assertEqual(self.store.settings_only()["tts"]["backend"], "minimax")
+
+    async def test_legacy_local_settings_and_assignment_restore_are_forced_to_api(self):
+        loaded = AppConfig.from_mapping({
+            "tts": {"backend": "cosyvoice", "provider": "cosyvoice"},
+        })
+        self.assertEqual(loaded.tts.backend, "minimax")
+        self.assertEqual(loaded.tts.provider, "minimax")
+        local_config = replace(
+            self.store.config,
+            tts=replace(self.store.config.tts, backend="cosyvoice"),
+        )
+        settings_path = self.root / "legacy-product-settings.json"
+        settings_path.write_text(json.dumps({
+            "schema_version": 5, "tts": {"backend": "cosyvoice"},
+        }), encoding="utf-8")
+        settings = ProductSettingsStore(path=settings_path, config=local_config)
+        runtime = SessionRuntime(local_config, product_settings=settings)
+        self.assertEqual(settings.snapshot()["tts"]["backend"], "minimax")
+        self.assertEqual(settings.effective_config().tts.backend, "minimax")
+        self.assertEqual(runtime.config.tts.backend, "minimax")
+        self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8"))["tts"]["backend"], "minimax")
+        self.assertEqual(runtime.cosyvoice_worker.state, "stopped")
+
+        runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, backend="cosyvoice"))
+        payload = {
+            "voice": {"model_id": "voice-model", "provider": {"protocol": "deepseek", "base_url": "https://llm.example"}},
+            "shadow": {"model_id": "shadow-model", "provider": {"protocol": "deepseek", "base_url": "https://llm.example"}},
+            "status": {"model_id": "status-model", "provider": {"protocol": "deepseek", "base_url": "https://llm.example"}},
+            "tts": {
+                "model_id": "speech-2.8-hd",
+                "provider": {"protocol": "minimax", "base_url": "https://api.minimaxi.com"},
+                "profile": {"voice_id": "female-shaonv", "output_format": "pcm"},
+            },
+        }
+        restored = await runtime.restore_model_services(payload)
+        self.assertTrue(restored["ok"])
+        self.assertEqual(runtime.config.tts.backend, "minimax")
 
     async def test_speech_handle_keeps_provider_chosen_at_creation(self):
         async def ready():
@@ -123,12 +132,14 @@ class TtsSwitchingTests(unittest.IsolatedAsyncioTestCase):
         await output.close()
 
     async def test_invalid_backend_and_settings_reload(self):
-        invalid = await self.request("PUT", "/api/v1/product/settings/tts", json={"backend": "other"})
-        self.assertEqual(invalid.status_code, 422)
-        self.assertEqual(invalid.json()["detail"]["code"], "TTS_BACKEND_INVALID")
-        self.store.save_tts({"backend": "cosyvoice"})
+        self.store.path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.path.write_text(json.dumps({
+            "schema_version": 5, "tts": {"backend": "cosyvoice"},
+        }), encoding="utf-8")
         reloaded = ProductSettingsStore(path=self.store.path, config=self.store.config)
-        self.assertEqual(reloaded.snapshot()["tts"]["backend"], "cosyvoice")
+        self.assertEqual(reloaded.snapshot()["tts"]["backend"], "minimax")
+        self.assertEqual(reloaded.effective_config().tts.backend, "minimax")
+        self.assertEqual(json.loads(self.store.path.read_text(encoding="utf-8"))["tts"]["backend"], "minimax")
         self.store.path.write_text(json.dumps({
             "schema_version": 4,
             "silence": {"seconds": 30},

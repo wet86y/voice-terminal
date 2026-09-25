@@ -472,6 +472,9 @@ class ModelRegistryService:
             registry["providers"] = providers + managed
             registry["models"] = runtime_models + self._local_entries() + managed_models
             registry["tts_profiles"] = tts_profiles + managed_tts
+            # Keep a stable current TTS profile（语音配置）for new registries
+            # and repair assignments that no longer resolve to an API model.
+            registry["assignments"]["tts_profile_id"] = self._locked_tts_profile_id(registry)
             self._write(registry)
             return self._snapshot(registry)
 
@@ -744,6 +747,51 @@ class ModelRegistryService:
                 raise
             return self._snapshot(registry)
 
+    @staticmethod
+    def _locked_tts_profile_id(registry: Mapping[str, Any]) -> str:
+        assignments = registry.get("assignments")
+        assignments = assignments if isinstance(assignments, Mapping) else {}
+        profiles = registry.get("tts_profiles")
+        profiles = profiles if isinstance(profiles, list) else []
+        models = registry.get("models")
+        models = models if isinstance(models, list) else []
+        providers = registry.get("providers")
+        providers = providers if isinstance(providers, list) else []
+        by_model = {item.get("id"): item for item in models if isinstance(item, Mapping)}
+        by_provider = {item.get("id"): item for item in providers if isinstance(item, Mapping)}
+        by_profile = {item.get("id"): item for item in profiles if isinstance(item, Mapping)}
+
+        def is_api_profile(profile: Mapping[str, Any] | None) -> bool:
+            if profile is None:
+                return False
+            model = by_model.get(profile.get("model_id"))
+            provider = by_provider.get(model.get("provider_id")) if isinstance(model, Mapping) else None
+            return (
+                isinstance(model, Mapping)
+                and model.get("capability") == "tts"
+                and isinstance(provider, Mapping)
+                and provider.get("protocol") == "minimax"
+            )
+
+        current_id = assignments.get("tts_profile_id")
+        current = by_profile.get(current_id)
+        if is_api_profile(current):
+            return str(current_id)
+
+        # Missing or stale selections fall back to the runtime-imported
+        # MiniMax profile（MiniMax API 的当前配置）.
+        valid_profiles = [
+            profile for profile in profiles
+            if isinstance(profile, Mapping) and is_api_profile(profile)
+        ]
+        fallback = next(
+            (profile for profile in valid_profiles if profile.get("origin") == "runtime_config"),
+            valid_profiles[0] if len(valid_profiles) == 1 else None,
+        )
+        if fallback is None:
+            raise ModelRegistryError("当前 MiniMax TTS profile（语音配置）不可用。")
+        return str(fallback["id"])
+
     def _runtime_payload_for_assignments(
         self,
         registry: dict[str, Any],
@@ -757,13 +805,20 @@ class ModelRegistryService:
         policy from the selected model entry.
         """
 
+        locked_tts_profile_id = self._locked_tts_profile_id(registry)
+        requested_tts_profile_id = assignments.get("tts_profile_id", locked_tts_profile_id)
+        if requested_tts_profile_id != locked_tts_profile_id:
+            raise ModelRegistryError(
+                "tts_profile_id（TTS 语音配置 ID）已锁定，不能通过模型分配更改。"
+            )
         target = {
             key: assignments.get(key)
             for key in (
                 "voice_llm_model_id", "shadow_llm_model_id",
-                "status_llm_model_id", "tts_profile_id",
+                "status_llm_model_id",
             )
         }
+        target["tts_profile_id"] = locked_tts_profile_id
         models = {item["id"]: item for item in registry["models"] if isinstance(item, dict) and item.get("id")}
         profiles = {item["id"]: item for item in registry["tts_profiles"] if isinstance(item, dict) and item.get("id")}
         hidden = set(registry["hidden_model_ids"])
@@ -911,14 +966,22 @@ class ModelRegistryService:
             return payload
 
     async def apply_assignments(self, assignments: Mapping[str, Any], *, confirmed: bool) -> dict[str, Any]:
-        if not confirmed:
-            return {
-                "requires_confirmation": True,
-                "impact": ["当前语音会话", "活动 TTS 播报", "主 LLM", "Shadow Agent", "状态汇报模型", "TTS"],
-                "message": "应用模型分配会中止当前聆听或播报，并立即重启受影响服务。",
-            }
         async with self._lock:
             registry = self._load()
+            locked_tts_profile_id = self._locked_tts_profile_id(registry)
+            if (
+                "tts_profile_id" in assignments
+                and assignments.get("tts_profile_id") != locked_tts_profile_id
+            ):
+                raise ModelRegistryError(
+                    "tts_profile_id（TTS 语音配置 ID）已锁定，不能通过模型分配更改。"
+                )
+            if not confirmed:
+                return {
+                    "requires_confirmation": True,
+                    "impact": ["当前语音会话", "活动 TTS 播报", "主 LLM", "Shadow Agent", "状态汇报模型", "TTS"],
+                    "message": "应用模型分配会中止当前聆听或播报，并立即重启受影响服务。",
+                }
             if self.apply_callback is None:
                 raise ModelRegistryError("当前运行时尚未启用模型热重启适配器。")
             runtime_payload, target, role_settings = self._runtime_payload_for_assignments(

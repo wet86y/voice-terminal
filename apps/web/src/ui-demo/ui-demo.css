@@ -234,8 +234,8 @@ button { cursor: pointer; }
 .callout-icon { width: 17px; height: 17px; display: grid; flex: 0 0 auto; place-items: center; border: 1px solid #9ab0fa65; border-radius: 50%; color: #b9c8f5; font-size: 10px; font-weight: 700; }
 .config-callout p { margin: 0; font-size: 10px; line-height: 1.65; }
 .assignment-grid-four { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 14px; }
+.assignment-grid-three { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 14px; }
 .assignment-slot { display: grid; align-content: start; gap: 11px; min-width: 0; padding: 13px; border: 1px solid #ffffff10; border-radius: 11px; background: #03091630; }
-.assignment-slot-tts { border-color: #78e2c222; background: linear-gradient(145deg, #78e2c20b, #03091630); }
 .slot-heading { display: flex; align-items: center; justify-content: space-between; gap: 7px; }
 .slot-kind { display: inline-flex; padding: 4px 6px; border: 1px solid #91aaff3e; border-radius: 5px; color: #acbcf2; background: #7899f114; font-family: "Cascadia Code", Consolas, monospace; font-size: 8px; font-weight: 750; letter-spacing: .04em; }
 .slot-kind.tts-kind { border-color: #78e2c244; color: #9edbc9; background: #78e2c212; }
@@ -340,7 +340,7 @@ button { cursor: pointer; }
 .model-settings-footer { align-items: center; gap: 15px; }
 
 @media (max-width: 1180px) {
-  .assignment-grid-four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .assignment-grid-four, .assignment-grid-three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .pool-entry { grid-template-columns: minmax(240px, 1fr) auto; }
   .pool-entry-policy { grid-column: 1; }
   .pool-entry-actions, .readonly-tag { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
@@ -351,7 +351,7 @@ button { cursor: pointer; }
   .accordion-index { width: 27px; height: 27px; }
   .accordion-status { display: none; }
   .model-card-content { padding-right: 12px; padding-left: 12px; }
-  .assignment-grid-four, .edit-fields { grid-template-columns: 1fr; }
+  .assignment-grid-four, .assignment-grid-three, .edit-fields { grid-template-columns: 1fr; }
   .reasoning-fieldset { grid-column: auto; }
   .reasoning-chip-list { grid-template-columns: repeat(5, minmax(0, 1fr)); }
   .pool-entry { grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
@@ -820,10 +820,3 @@ body:has(.product-shell) { overflow: hidden; }
 }
 .wake-keyword-add:hover:not(:disabled) { border-color: #a8bbf077; background: #7899f11c; }
 .wake-keyword-add:disabled { opacity: .4; cursor: not-allowed; }
-.tts-backend-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 30px 0 18px; }
-.tts-backend-options button { padding: 18px; border: 1px solid var(--line); border-radius: 11px; color: var(--text); background: #ffffff04; text-align: left; }
-.tts-backend-options button.active { border-color: #94aaf377; background: #7899f11b; }
-.tts-backend-options button:disabled { opacity: .6; cursor: wait; }
-.tts-backend-options strong, .tts-backend-options small { display: block; }
-.tts-backend-options small { margin-top: 7px; color: var(--subtle); }
-@media (max-width: 620px) { .tts-backend-options { grid-template-columns: 1fr; } }

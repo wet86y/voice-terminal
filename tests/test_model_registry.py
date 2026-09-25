@@ -73,11 +73,19 @@ class ModelRegistryTests(unittest.TestCase):
         shadow = next(item for item in scanned["models"] if item["name"].startswith("Shadow"))
         status = next(item for item in scanned["models"] if item["name"].startswith("状态汇报"))
         tts = scanned["tts_profiles"][0]
+        self.assertEqual(scanned["assignments"]["tts_profile_id"], tts["id"])
         assignments = {"voice_llm_model_id": voice["id"], "shadow_llm_model_id": shadow["id"], "status_llm_model_id": status["id"], "tts_profile_id": tts["id"], "role_settings": {"voice": {"reasoning_effort": "low", "max_context_tokens": 32768}, "shadow": {"reasoning_effort": "high", "max_context_tokens": 65536}, "status": {"reasoning_effort": "none", "max_context_tokens": 4096}}}
-        planned = asyncio.run(self.service.apply_assignments(assignments, confirmed=False))
+        assignments_without_tts = {key: value for key, value in assignments.items() if key != "tts_profile_id"}
+        planned = asyncio.run(self.service.apply_assignments(assignments_without_tts, confirmed=False))
         self.assertTrue(planned["requires_confirmation"])
-        applied = asyncio.run(self.service.apply_assignments(assignments, confirmed=True))
+        with self.assertRaises(ModelRegistryError):
+            asyncio.run(self.service.apply_assignments(
+                {**assignments_without_tts, "tts_profile_id": "different-profile"},
+                confirmed=False,
+            ))
+        applied = asyncio.run(self.service.apply_assignments(assignments_without_tts, confirmed=True))
         self.assertTrue(applied["applied"])
+        self.assertEqual(applied["assignments"]["tts_profile_id"], tts["id"])
         self.assertEqual(len(self.applied), 1)
         self.assertIn("status", self.applied[0])
         self.assertEqual(self.applied[0]["status"]["settings"]["reasoning_effort"], "none")

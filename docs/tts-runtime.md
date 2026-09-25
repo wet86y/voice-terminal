@@ -1,23 +1,19 @@
-# TTS（语音合成）运行时切换
+# TTS（语音合成）运行模式
 
-Voice Server（语音服务）负责对话状态、文本分段与调度、中断决策、播放、完成结算和历史记录。MiniMax 与 CosyVoice provider（语音供应方）只合成已提交的文本块，并返回 PCM（原始音频）与文本块完成回执。每条语音事务在创建时绑定供应方；切换只影响下一条新事务。
+Voice Server（语音服务）当前固定使用 MiniMax API（在线语音接口）合成已提交的文本块，并负责文本分段、调度、播放、中断结算和历史记录。当前产品模型配置继续使用 `speech-2.8-hd`（语音模型）和 `female-shaonv`（音色）。设置页不提供服务商切换，模型分配也不能更改当前 TTS profile（语音配置）。
 
-## 本地环境
+旧产品设置中的 `tts.backend`（TTS 运行后端）如果为 `cosyvoice`，加载时会改为并写回 `minimax`。TTS API（在线语音接口）未配置或不可用时，服务会报告错误，不会回退到本地模型。
 
-在 Windows PowerShell 中运行 `scripts/setup-cosyvoice.ps1`。脚本将 Python 3.10、固定版本的 CosyVoice 上游代码、依赖与上游示例参考 WAV 安装到项目内 `.runtime/cosyvoice`；权重仍从配置的模型根目录下 `cosyvoice3-0.5b-2512` 读取。安装不会修改主服务 Python 环境。若模型根目录不同，使用 `-ModelDir` 指定完整的 CosyVoice 权重目录。
+连接或 `task_started`（任务已启动）确认前发生临时网络故障，或 MiniMax 返回可重试的 `408`、`425`、`429`、`5xx` 状态码时，客户端会丢弃失效连接并新建连接重试一次。文本提交后不会自动重发，避免网络中断时重复播报；认证、参数等明确拒绝不会重试。只有错误明确指向不支持的音色情绪字段时，才会去掉该可选字段后重新建连。
 
-启动 Voice Server 后，在设置页的“TTS 语音”中选择供应方。若 Worker（工作进程）启动或健康检查失败，API 返回错误并保留原选择；本地合成失败不会自动转发到 MiniMax。
+## 只读状态
 
-## 产品接口
+`GET /api/v1/tts/status` 返回固定的 `backend: "minimax"`（当前语音后端）和本地 Worker（工作进程）状态。产品快照中的 `runtime.tts_worker`（本地 Worker 状态）保留作诊断信息；正常产品运行不会启动该 Worker。
 
-`PUT /api/v1/product/settings/tts` 接收 `{ "backend": "minimax" }` 或 `{ "backend": "cosyvoice" }`。`backend`（语音供应方选择）只接受这两个值，旧设置默认为 `minimax`。成功响应包含 `settings.tts.backend`（已保存的供应方）、`effective_from: "next_speech"`（从下一条新建语音事务生效）、`pending: false`（已完成切换）和 `worker`（本地工作进程状态）。
+模型分配接口保留 `tts_profile_id`（当前 TTS 语音配置 ID）用于读取和恢复现有配置。请求可以省略该字段以沿用已保存的配置；尝试更换时会被拒绝。
 
-`GET /api/v1/tts/status` 与产品快照的 `runtime.tts_worker` 返回非敏感的 Worker 状态：`stopped`（已停止）、`starting`（启动中）、`ready`（已就绪）、`draining`（等待旧本地事务结束）或 `error`（失败）。失败响应的 `detail.code`（错误代码）与 `detail.message`（中文错误说明）可供设置页显示。
+## 本地兼容实现
 
-Worker 状态中的 `state` 是运行阶段，`message` 是失败说明，`model_present` 表示模型目录是否存在。语音运行事件和完成记录中的 `provider` 是该事务实际绑定的供应方。`TtsSegmentReceipt`（文本块完成回执）的 `index` 是块序号，`text_chars` 是该块字符数，`end_received_bytes` 是事务内累计 PCM 字节边界；Voice Server 使用该边界结算中断。
+`TtsBackendRouter`（TTS 兼容路由器）、CosyVoice 客户端、Worker（工作进程）和安装脚本仍保留，供本地模型调试完成后重新接入产品运行时。当前产品入口不会启动或切换到该实现。
 
-本地输出固定转换为 32 kHz 单声道 PCM16（16 位脉冲编码调制）。本地中断结算以 provider 已确认的文本块为精度边界。
-
-## 真实模型验收
-
-在项目根目录运行 `python -m scripts.probe_cosyvoice`，检查首个音频块、连续文本块、完成回执、24→32 kHz 时长和取消响应。增加 `--play` 可通过系统默认扬声器检查实际播放，并以真实回执及播放器停止快照核对打断后的文本块结算；命令结束会关闭 Worker（工作进程）。
+需要单独调试本地 Worker 时，可在 Windows PowerShell 运行 `scripts/setup-cosyvoice.ps1`。要直接检查兼容 Worker 的 PCM（脉冲编码调制）输出、分段回执和取消行为，可运行 `python -m scripts.probe_cosyvoice`；增加 `--play` 可检查实际播放。

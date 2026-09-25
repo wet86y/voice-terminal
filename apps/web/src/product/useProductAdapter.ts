@@ -9,16 +9,14 @@ import type {
   ProductModelRegistry,
   ProductMutationResult,
   ProductRuntimeState,
-  ProductRuntimeSnapshot,
   ProductSettingsSnapshot,
   ProductSnapshot,
-  ProductTtsProfile,
 } from './types'
 import { voiceShadowReplayFixture, voiceShadowReplayMeta } from './replay-data'
 
-export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'tts' | 'speaker' | 'models'
+export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'models'
 export type ProductPage = 'home' | 'settings'
-export type AssignmentSlot = 'voice' | 'shadow' | 'status' | 'tts'
+export type AssignmentSlot = 'voice' | 'shadow' | 'status'
 
 const NOTICE_DISPLAY_MS = 5000
 const NOTICE_FADE_MS = 420
@@ -128,7 +126,7 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   const primaryKeyword = text(wake.keyword) || DEFAULT_SETTINGS.wake.keyword
   return {
     schema_version: typeof value.schema_version === 'number' ? value.schema_version : DEFAULT_SETTINGS.schema_version,
-    tts: { backend: tts.backend === 'cosyvoice' ? 'cosyvoice' : 'minimax' },
+    tts: { backend: 'minimax' },
     wake: {
       enabled: wake.enabled === true,
       keyword: primaryKeyword,
@@ -220,8 +218,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const dsh = ref<DshRuntimeStatus>(structuredClone(DEFAULT_DSH))
   const loading = ref(false)
   const saving = ref(false)
-  const ttsSwitching = ref(false)
-  const ttsWorker = ref<ProductRuntimeSnapshot['tts_worker']>({ state: 'stopped' })
   const lastError = ref('')
   const notice = ref('')
   const noticeVisible = ref(false)
@@ -266,14 +262,13 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     { flush: 'sync' },
   )
   const modelAssignments = reactive<Record<AssignmentSlot, string>>({
-    voice: '', shadow: '', status: '', tts: '',
+    voice: '', shadow: '', status: '',
   })
 
   let snapshotRequest: Promise<void> | null = null
   let reconnectTimer: number | undefined
   let replayTimer: number | undefined
   let dshStatusTimer: number | undefined
-  let ttsStatusTimer: number | undefined
   let noticeDisplayTimer: ReturnType<typeof setTimeout> | undefined
   let noticeFadeTimer: ReturnType<typeof setTimeout> | undefined
   let mutationQueue: Promise<unknown> = Promise.resolve()
@@ -339,7 +334,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     Object.assign(settings.shadow, nextSettings.shadow)
     Object.assign(settings.speaker, nextSettings.speaker)
     Object.assign(settings.tts, nextSettings.tts)
-    ttsWorker.value = value.runtime.tts_worker || { state: 'stopped' }
     Object.assign(settings.persona, nextSettings.persona)
     settings.schema_version = nextSettings.schema_version
     settings.warnings = nextSettings.warnings
@@ -365,7 +359,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       voice: assignments.voice_llm_model_id,
       shadow: assignments.shadow_llm_model_id,
       status: assignments.status_llm_model_id,
-      tts: assignments.tts_profile_id,
     }
     for (const slot of Object.keys(values) as AssignmentSlot[]) {
       modelAssignments[slot] = typeof values[slot] === 'string' ? values[slot] : ''
@@ -458,43 +451,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       }
     })
   }
-
-  async function switchTts(backend: ProductSettingsSnapshot['tts']['backend']) {
-    if (ttsSwitching.value || (settings.tts.backend === backend && ttsWorker.value?.state !== 'error')) return
-    await enqueue(async () => {
-      const previousWorker = ttsWorker.value
-      ttsSwitching.value = true
-      if (backend === 'cosyvoice') ttsWorker.value = { state: 'starting' }
-      try {
-        const result = await productApi.saveTts(backend)
-        updateSettingsFromResponse(settings, result)
-        if (isRecord(result.worker)) {
-          ttsWorker.value = result.worker as ProductRuntimeSnapshot['tts_worker']
-        }
-        setNotice(result.message || 'TTS 供应方已切换，下一条语音生效。')
-      } catch (error) {
-        ttsWorker.value = backend === 'cosyvoice'
-          ? { state: 'error', message: messageFromError(error) }
-          : previousWorker
-        setError(error)
-      } finally {
-        ttsSwitching.value = false
-      }
-    })
-  }
-
-  watch(settingsTab, tab => {
-    if (ttsStatusTimer !== undefined) window.clearInterval(ttsStatusTimer)
-    ttsStatusTimer = undefined
-    if (replayMode || tab !== 'tts') return
-    const refresh = () => {
-      void productApi.ttsStatus().then(value => { ttsWorker.value = value.worker }).catch(() => undefined)
-    }
-    refresh()
-    ttsStatusTimer = window.setInterval(() => {
-      refresh()
-    }, 1000)
-  })
 
   async function startSpeakerEnrollment() {
     try {
@@ -752,7 +708,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     voice: uiModels.value.find(item => item.id === modelAssignments.voice),
     shadow: uiModels.value.find(item => item.id === modelAssignments.shadow),
     status: uiModels.value.find(item => item.id === modelAssignments.status),
-    tts: registry.value.tts_profiles.find(item => item.id === modelAssignments.tts),
   }))
   const activeModels = computed(() => {
     const committed = registry.value.assignments
@@ -766,11 +721,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       tts: registry.value.tts_profiles.find(item => item.id === committed.tts_profile_id)
         || registry.value.tts_profiles.find(item => item.origin === 'runtime_config'),
     }
-  })
-  const selectedTtsProfile = computed<ProductTtsProfile | undefined>(() => selectedModels.value.tts)
-  const selectedTtsModel = computed<ProductUiModel | undefined>(() => {
-    const profile = selectedTtsProfile.value
-    return profile ? uiModels.value.find(item => item.id === profile.model_id) : undefined
   })
   const activeTtsModel = computed<ProductUiModel | undefined>(() => {
     const profile = activeModels.value.tts
@@ -1102,7 +1052,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       voice_llm_model_id: modelAssignments.voice || null,
       shadow_llm_model_id: modelAssignments.shadow || null,
       status_llm_model_id: modelAssignments.status || null,
-      tts_profile_id: modelAssignments.tts || null,
     }
   }
 
@@ -1184,7 +1133,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (reconnectTimer !== undefined) window.clearInterval(reconnectTimer)
     if (replayTimer !== undefined) window.clearTimeout(replayTimer)
     if (dshStatusTimer !== undefined) window.clearInterval(dshStatusTimer)
-    if (ttsStatusTimer !== undefined) window.clearInterval(ttsStatusTimer)
     clearNoticeTimers()
     voice.dispose()
   })
@@ -1199,8 +1147,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     dsh,
     loading,
     saving,
-    ttsSwitching,
-    ttsWorker,
     connected,
     replayMode,
     replayMeta: voiceShadowReplayMeta,
@@ -1241,8 +1187,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     managedApiModelPool,
     selectedModels,
     activeModels,
-    selectedTtsProfile,
-    selectedTtsModel,
     activeTtsModel,
     shadowExpanded,
     modelScanState,
@@ -1263,7 +1207,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     saveShadowGate,
     savePersona,
     saveSpeaker,
-    switchTts,
     refreshSpeaker,
     startSpeakerEnrollment,
     cancelSpeakerEnrollment,

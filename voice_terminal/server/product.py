@@ -97,7 +97,8 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
                 config.shadow_agent.experimental_context_gate_enabled,
             ),
         },
-        "tts": {"backend": str(getattr(config.tts, "backend", "minimax"))},
+        # TTS（语音合成）固定走在线 API（程序接口）；backend（运行后端）不再是产品设置。
+        "tts": {"backend": "minimax"},
         "speaker": {
             "mode": str(getattr(config.speaker, "mode", "off")),
             "confirm_threshold": float(getattr(config.speaker, "confirm_threshold", 0.50)),
@@ -189,8 +190,8 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     shadow = result["shadow"]
     if type(shadow.get("experimental_context_gate_enabled")) is not bool:
         shadow["experimental_context_gate_enabled"] = defaults["shadow"]["experimental_context_gate_enabled"]
-    if result["tts"].get("backend") not in {"minimax", "cosyvoice"}:
-        result["tts"]["backend"] = "minimax"
+    # 旧设置可能记录了 cosyvoice；合并后统一锁定 MiniMax API（在线语音接口）。
+    result["tts"]["backend"] = "minimax"
     speaker = result["speaker"]
     if speaker.get("mode") not in {"off", "observe", "filter"}:
         speaker["mode"] = defaults["speaker"]["mode"]
@@ -323,7 +324,6 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     wake = settings.get("wake") if isinstance(settings.get("wake"), Mapping) else {}
     silence = settings.get("silence") if isinstance(settings.get("silence"), Mapping) else {}
     shadow = settings.get("shadow") if isinstance(settings.get("shadow"), Mapping) else {}
-    tts = settings.get("tts") if isinstance(settings.get("tts"), Mapping) else {}
     speaker = settings.get("speaker") if isinstance(settings.get("speaker"), Mapping) else {}
     try:
         seconds = int(silence.get("seconds", getattr(config.agent, "final_silence_ms", 30_000) // 1000))
@@ -389,7 +389,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         confirm_threshold=confirm_threshold,
         continuity_threshold=continuity_threshold,
     )
-    next_tts = replace(config.tts, backend=str(tts.get("backend", config.tts.backend)))
+    next_tts = replace(config.tts, backend="minimax", provider="minimax")
     return replace(config, wake=next_wake, agent=next_agent, shadow_agent=next_shadow, speaker=next_speaker, tts=next_tts)
 
 
@@ -430,7 +430,22 @@ class ProductSettingsStore:
                 "product_settings: 声纹特征管线已更换，旧阈值是在另一套分数尺度上标定的，"
                 "已重置为新默认值并切回测试模式；请重新注册声纹后再校准。"
             )
-        return _merge_settings(defaults, value, legacy_speaker_scale=legacy)
+        merged = _merge_settings(defaults, value, legacy_speaker_scale=legacy)
+        stored_tts = value.get("tts")
+        if isinstance(stored_tts, Mapping) and stored_tts.get("backend") == "cosyvoice":
+            # Migrate only the obsolete selection value; preserve all other
+            # persisted fields and any diagnostics recorded above.
+            migrated = deepcopy(dict(value))
+            migrated_tts = deepcopy(dict(stored_tts))
+            migrated_tts["backend"] = "minimax"
+            migrated["tts"] = migrated_tts
+            try:
+                _atomic_write_json(self.path, migrated)
+            except OSError:
+                self.warnings.append(
+                    "product_settings: 已在运行时锁定 MiniMax API，但旧 TTS 设置未能写回文件。"
+                )
+        return merged
 
     def snapshot(self) -> dict[str, Any]:
         value = deepcopy(self._settings)
@@ -471,19 +486,6 @@ class ProductSettingsStore:
         # advertising a stale recovery warning after the file is valid.
         self.warnings.clear()
         self._malformed_schema_marker = False
-
-    def save_tts(self, payload: Mapping[str, Any]) -> dict[str, str]:
-        """保存 TTS backend（语音供应方）；调用方先确认本地 Worker 就绪。"""
-        if set(payload) != {"backend"} or payload.get("backend") not in {"minimax", "cosyvoice"}:
-            raise ProductSettingsError("tts.backend 仅接受 minimax 或 cosyvoice。")
-        previous = self._settings["tts"]
-        self._settings["tts"] = {"backend": str(payload["backend"])}
-        try:
-            self._save_settings()
-        except Exception:
-            self._settings["tts"] = previous
-            raise
-        return deepcopy(self._settings["tts"])
 
     @staticmethod
     def _atomic_replace_documents(documents: Mapping[Path, str]) -> None:

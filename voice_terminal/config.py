@@ -797,8 +797,9 @@ class AppConfig:
                 transport_retry_limit=max(0, int(_number(llm.get("transport_retry_limit"), 2))),
             ),
             tts=TtsConfig(
-                provider=_string(tts.get("provider"), "minimax"),
-                backend=_string(tts.get("backend"), "minimax"),
+                provider="minimax",
+                # 历史 YAML 可能仍含 cosyvoice；产品配置加载固定使用在线 API。
+                backend="minimax",
                 base_url=os.environ.get("MINIMAX_API_HOST", "").strip() or _string(tts.get("base_url"), "https://api.minimaxi.com"),
                 websocket_path=_string(tts.get("websocket_path"), "/ws/v1/t2a_v2"),
                 transport=_string(tts.get("transport"), "websocket"),
