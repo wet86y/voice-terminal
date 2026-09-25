@@ -19,6 +19,7 @@ $BridgeDir = Join-Path $RepoRoot "integrations\dsh\voice-terminal-shadow-bridge"
 $BridgeArtifactDir = Join-Path $RuntimeRoot "bundles\voice-terminal-shadow-bridge"
 $BridgePackagePath = Join-Path $BridgeDir "package.json"
 $BridgeEntryPath = Join-Path $BridgeArtifactDir "lib\index.js"
+$BridgeClientEntryPath = Join-Path $BridgeArtifactDir "lib\client.js"
 $CommonPromptPath = Join-Path $RepoRoot "config\shadow_agent\instructions.md"
 $DshRulesPath = Join-Path $RepoRoot "config\dsh\shadow-agent.rules.md"
 $ProfileDir = Join-Path $HomeDir "profiles\web"
@@ -113,6 +114,8 @@ if ($PresetText -match "tools\.restrict|exact safe tool surface") { throw "正�
 if (-not $ValidateOnly) {
   Invoke-Checked -Command node -Arguments @((Join-Path $BridgeDir "build.mjs"), $BridgeArtifactDir)
   if (-not (Test-Path -LiteralPath $BridgeEntryPath)) { throw "DSH Bridge 构建产物缺失：$BridgeEntryPath" }
+  Invoke-Checked -Command node -Arguments @((Join-Path $PSScriptRoot "build-dsh-client.mjs"), $BridgeDir, $BridgeArtifactDir, $SourceDir)
+  if (-not (Test-Path -LiteralPath $BridgeClientEntryPath)) { throw "DSH Bridge 浏览器插件产物缺失：$BridgeClientEntryPath" }
 }
 
 if ($ValidateOnly) {
@@ -129,10 +132,16 @@ if ($ValidateOnly) {
   }
   if (-not (Test-Path -LiteralPath $BuildStatePath)) { throw "DSH build-state.json 缺失。" }
   if (-not (Test-Path -LiteralPath $BridgeEntryPath)) { throw "DSH Bridge 构建产物缺失。" }
+  if (-not (Test-Path -LiteralPath $BridgeClientEntryPath)) { throw "DSH Bridge 浏览器插件产物缺失。" }
   if (-not (Test-Path -LiteralPath $ProfilePackagePath)) { throw "DSH web profile manifest 缺失。" }
   $ProfilePackage = Get-Content -LiteralPath $ProfilePackagePath -Raw | ConvertFrom-Json
   if (-not $ProfilePackage.dependencies.'@voice-terminal/dsh-shadow-bridge') { throw "DSH Bridge 未安装到 web profile。" }
   if ($ProfilePackage.dsh.profile.bundles -notcontains '@voice-terminal/dsh-shadow-bridge') { throw "DSH Bridge bundle 未注册到 web profile。" }
+  $ArtifactPackagePath = Join-Path $BridgeArtifactDir "package.json"
+  if (-not (Test-Path -LiteralPath $ArtifactPackagePath)) { throw "DSH Bridge artifact package.json 缺失。" }
+  $ArtifactPackage = Get-Content -LiteralPath $ArtifactPackagePath -Raw | ConvertFrom-Json
+  if ($ArtifactPackage.exports.'./client' -ne './lib/client.js') { throw "DSH Bridge 浏览器入口未导出。" }
+  if ($ArtifactPackage.dsh.client.platform -ne 'web') { throw "DSH Bridge 未声明 web client bundle。" }
   $State = Get-Content -LiteralPath $BuildStatePath -Raw | ConvertFrom-Json
   $CurrentBundleHash = Get-TreeHash @($BridgeArtifactDir)
   $CurrentSourceHash = Get-TreeHash @($BridgeDir)

@@ -1,0 +1,46 @@
+import type {} from '@deepseek-ai/dsh-client-locale/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-api-session-controller/client'
+import type {} from '@deepseek-ai/dsh-api-workspace-controller/client'
+import { VoiceTerminalSettingsPage, type VoiceTerminalSettingsInjected } from './VoiceTerminalSettingsTab.tsx'
+import { en, zh, type VoiceTerminalLocaleKey } from './locales.js'
+import type { VoiceTerminalSettings } from '../settings-contract.js'
+import { VOICE_TERMINAL_SETTINGS_NAMESPACE } from '../settings-contract.js'
+
+export type { VoiceTerminalLocaleKey } from './locales.js'
+export type { VoiceTerminalSettingsInjected } from './VoiceTerminalSettingsTab.tsx'
+
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface LocaleNamespaceMap {
+    /** Voice Terminal settings page copy（Voice Terminal 插件设置页文案）. */
+    'settings.voiceTerminal': VoiceTerminalLocaleKey
+  }
+}
+
+/** Browser services required by the dedicated plugin settings page. */
+export const inject = ['slots', 'locale', 'settingsScope', 'remote', 'remote.session', 'workspaces']
+
+/** Register Voice Terminal as an independent DSH settings page（独立设置页面）. */
+export function apply(ctx: ClientContext): void {
+  ctx.effect(() => ctx.locale.register('settings.voiceTerminal', { zh, en }), 'voice-terminal: settings dictionaries')
+
+  const settings = ctx.settingsScope.bind<VoiceTerminalSettings>({ namespace: VOICE_TERMINAL_SETTINGS_NAMESPACE })
+  const modelCatalog: VoiceTerminalSettingsInjected['modelCatalog'] = async () => {
+    const response = await ctx.remote.session.modelCatalog()
+    if (!response.ok) throw new Error(`session.modelCatalog failed: ${response.error.code}: ${response.error.message}`)
+    return response.value
+  }
+  const injected = (): VoiceTerminalSettingsInjected => ({ settings, workspaces: ctx.workspaces, modelCatalog })
+  const t = ctx.locale.bind('settings.voiceTerminal')
+
+  ctx.slots.inject('settings.section', () => ctx.slots.register({
+    name: 'settings.section',
+    id: 'voice-terminal',
+    order: 30,
+    label: () => t('nav'),
+    locale: 'settings.voiceTerminal',
+    inject: injected,
+  }, VoiceTerminalSettingsPage))
+}
