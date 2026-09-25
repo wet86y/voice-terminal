@@ -23,6 +23,7 @@ config/speaker/
 /logs/
 /reports/
 /.runtime/dsh/
+/.runtime/cosyvoice/
 *.log
 
 # IDE / OS files

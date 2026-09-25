@@ -87,7 +87,7 @@ button { cursor: pointer; }
 .compact-save { padding: 7px 9px; font-size: 10px; }
 
 @media (max-width: 800px) {
-  .settings-tabs { grid-template-columns: repeat(5, 1fr); }
+  .settings-tabs { grid-template-columns: repeat(3, 1fr); }
   .speaker-settings-grid { grid-template-columns: 1fr; }
   .speaker-segment-row { grid-template-columns: 28px minmax(100px, 1fr) auto; }
   .speaker-segment-row input { grid-column: 2 / -1; grid-row: 2; }
@@ -820,3 +820,10 @@ body:has(.product-shell) { overflow: hidden; }
 }
 .wake-keyword-add:hover:not(:disabled) { border-color: #a8bbf077; background: #7899f11c; }
 .wake-keyword-add:disabled { opacity: .4; cursor: not-allowed; }
+.tts-backend-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 30px 0 18px; }
+.tts-backend-options button { padding: 18px; border: 1px solid var(--line); border-radius: 11px; color: var(--text); background: #ffffff04; text-align: left; }
+.tts-backend-options button.active { border-color: #94aaf377; background: #7899f11b; }
+.tts-backend-options button:disabled { opacity: .6; cursor: wait; }
+.tts-backend-options strong, .tts-backend-options small { display: block; }
+.tts-backend-options small { margin-top: 7px; color: var(--subtle); }
+@media (max-width: 620px) { .tts-backend-options { grid-template-columns: 1fr; } }

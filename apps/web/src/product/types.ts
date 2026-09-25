@@ -21,6 +21,8 @@ export interface ProductRuntimeSnapshot {
   input_owner: string
   reasoning_mode: ReasoningMode
   services: ServiceStatuses
+  /** CosyVoice Worker（本地语音工作进程）的非敏感运行状态。 */
+  tts_worker?: { state: 'stopped' | 'starting' | 'ready' | 'draining' | 'error'; message?: string | null; model_present?: boolean }
   latency: {
     complete?: boolean
     values?: Partial<LatencyValues>
@@ -29,6 +31,8 @@ export interface ProductRuntimeSnapshot {
 
 export interface ProductSettingsSnapshot {
   schema_version: number
+  /** TTS backend（语音供应方）；只影响下一条新建语音事务。 */
+  tts: { backend: 'minimax' | 'cosyvoice' }
   wake: {
     enabled: boolean
     /** Primary phrase; mirrors `keywords[0]` for older consumers. */

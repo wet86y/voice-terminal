@@ -51,6 +51,8 @@ class SpeechHandle:
         # the superseded transaction.  The pipeline binds the concrete
         # session to this handle, not to the output singleton.
         self.tts_session = None
+        self.tts_backend = "minimax"
+        self.tts_client = None
         self.force_fresh_tts_session = False
         self.overlap_start_ms = None
         self.queued_at = time.monotonic()
@@ -277,10 +279,21 @@ class EpisodeSpeechOutput(SpeechPipeline):
         """Create and bind a provider session to this output transaction."""
         h = self._handle_for_workspace(ws)
         fresh = bool(fresh or (h and h.force_fresh_tts_session))
+        client = h.tts_client if h is not None else self.tts
+        if client is None and not hasattr(self.tts, "bind"):
+            client = self.tts
+        if client is None:
+            raise RuntimeError("所选 TTS provider 不可用。")
         try:
-            session = self.tts.session(fresh=fresh)
+            session = client.session(fresh=fresh, turn_id=ws.turn_id, emotion=h.emotion_applied if h else "calm")
         except TypeError:  # Non-MiniMax/test providers retain the old API.
-            session = self.tts.session()
+            try:
+                session = client.session(fresh=fresh, turn_id=ws.turn_id)
+            except TypeError:
+                try:
+                    session = client.session(fresh=fresh)
+                except TypeError:
+                    session = client.session()
         if h is not None:
             h.tts_session = session
         if h is self.handle:
@@ -310,6 +323,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
             "turn_id": h.turn_id,
             "output_generation": h.workspace.generation,
             "event": event,
+            "provider": h.tts_backend,
             **payload,
         })
 
@@ -318,7 +332,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
         if h:
             await self.runtime.emit("speech.progress", {
                 "speech_id": h.speech_id, "conversation_id": h.identity[0], "turn_id": h.turn_id,
-                "output_generation": h.workspace.generation, "event": kind, **payload})
+                "output_generation": h.workspace.generation, "event": kind,
+                "provider": h.tts_backend, **payload})
 
     async def _text_delta(self, h, text):
         if not text:
@@ -327,6 +342,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
             "speech_id": h.speech_id, "conversation_id": h.identity[0], "turn_id": h.turn_id,
             "output_generation": h.workspace.generation, "text_delta": text,
             "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
+            "provider": h.tts_backend,
         })
 
     async def _latency(self, ws):
@@ -368,6 +384,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
                             "kind": h.kind,
                             "emotion_requested": h.emotion_requested,
                             "emotion_applied": h.emotion_applied,
+                            "provider": h.tts_backend,
                         })
                 self.loop.call_soon_threadsafe(lambda: self.controller._track(asyncio.create_task(publish())))
 
@@ -385,6 +402,10 @@ class EpisodeSpeechOutput(SpeechPipeline):
             self.generation += 1
         self.loop = asyncio.get_running_loop()
         h = SpeechHandle(self, identity, turn_id, self.generation, emotion, kind=kind)
+        if hasattr(self.tts, "bind"):
+            h.tts_backend, h.tts_client = self.tts.bind()
+        else:
+            h.tts_backend, h.tts_client = "minimax", self.tts
         h.force_fresh_tts_session = _fresh_session
         self._handles_by_token[h.workspace.token] = h
         register = getattr(self.runtime, "_register_speech_transaction", None)
@@ -405,6 +426,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
         self.tasks.add(h.task)
         def forget_finished(task, handle=h):
             self.tasks.discard(task)
+            if hasattr(self.tts, "release"):
+                self.tts.release(handle.tts_backend)
             # A held/superseded task can be cancelled before it ever enters
             # _run() (and therefore before _run's final cleanup executes).
             if self.handle is not handle:
@@ -419,7 +442,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
             await self._activate(h)
         await self.runtime.emit("speech.queued", {"speech_id": h.speech_id, "conversation_id": h.identity[0],
                                  "turn_id": turn_id, "output_generation": h.workspace.generation,
-                                 "kind": kind, "text": h.text, "status": h.state})
+                                 "kind": kind, "text": h.text, "status": h.state,
+                                 "provider": h.tts_backend})
         await asyncio.sleep(0)
         return h
 
@@ -459,6 +483,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
             "baseline_chars": len(active.text) if same_active else 0, "appended_chars": len(suffix),
             "cumulative_chars": (len(active.text) + len(suffix)) if same_active else len(suffix),
             "provider_generation": handle.workspace.generation,
+            "provider": handle.tts_backend,
         })
         return handle
 
@@ -515,6 +540,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
                 "output_generation": handle.workspace.generation,
                 "reason": "replaced",
                 "event": "speech.replaced",
+                "provider": handle.tts_backend,
+                "old_provider": old_candidate.tts_backend,
                 "status": "replaced",
             })
         return handle
@@ -529,7 +556,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
             pass
         self.handle = h
         self.state.clear_current()
-        prepare = getattr(self.tts, "prepare_emotion", None)
+        prepare = getattr(h.tts_client, "prepare_emotion", None)
         if prepare is not None:
             try:
                 h.emotion_applied = await prepare(
@@ -713,6 +740,7 @@ class EpisodeSpeechOutput(SpeechPipeline):
             "sent_chars": state.sent_chars,
             "dropped_chars": dropped, "staged_chars": len(suffix),
             "cumulative_chars": len(h.text),
+            "provider": h.tts_backend,
         })
         return h
 
@@ -861,7 +889,8 @@ class EpisodeSpeechOutput(SpeechPipeline):
             # after a cancelled/non-reusable MiniMax session.  Never retry
             # once any PCM was returned: that could duplicate audible speech.
             if (
-                h.text
+                h.tts_backend == "minimax"
+                and h.text
                 and h.workspace.timings.get("tts_text_sent")
                 and h.workspace.timings.get("tts_audio_bytes", 0) == 0
                 and self._valid(h.workspace.token)
@@ -895,12 +924,13 @@ class EpisodeSpeechOutput(SpeechPipeline):
                         speech_id=h.speech_id,
                         attempt=2,
                     )
-            if getattr(self.tts, "emotion_status", None) == "unsupported":
-                h.emotion_applied = getattr(self.tts, "applied_emotion", "calm")
+            if getattr(h.tts_client, "emotion_status", None) == "unsupported":
+                h.emotion_applied = getattr(h.tts_client, "applied_emotion", "calm")
                 await self.runtime.log("TTS_EMOTION_UNSUPPORTED", identity=h.identity, turn_id=h.turn_id,
                                        speech_id=h.speech_id,
-                                       error=getattr(self.tts, "emotion_error", None))
-            if self.state.current.get("tts_status") == "DEGRADED" or self.tts is None or self.player is None:
+                                       error=getattr(h.tts_client, "emotion_error", None))
+            provider_missing = h.tts_client is None and (self.tts is None or hasattr(self.tts, "bind"))
+            if self.state.current.get("tts_status") == "DEGRADED" or provider_missing or self.player is None:
                 h.reason = "failed"
             # The player has confirmed that its local PCM queue and device
             # tail are drained.  Freeze that fact before the append window can
@@ -1099,8 +1129,9 @@ class EpisodeSpeechOutput(SpeechPipeline):
                        "turn_id": h.turn_id, "output_generation": h.workspace.generation, "text": h.text,
                        "kind": h.kind, "queued_at": h.queued_at,
                       "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
-                      "emotion_transport": getattr(self.tts, "emotion_transport", "voice_setting"),
-                      "emotion_status": getattr(self.tts, "emotion_status", "applied"),
+                      "emotion_transport": getattr(h.tts_client, "emotion_transport", "voice_setting"),
+                      "emotion_status": getattr(h.tts_client, "emotion_status", "applied"),
+                      "provider": h.tts_backend,
                        "status": h.reason or "completed", "delivery": delivery,
                        "turn_latency": turn_latency,
                         "latency": {**settled_latency,

@@ -27,6 +27,10 @@ async function readError(response: Response): Promise<string> {
     if (typeof payload === 'object' && payload !== null) {
       const record = payload as Record<string, unknown>
       if (typeof record.detail === 'string') return record.detail
+      if (typeof record.detail === 'object' && record.detail !== null) {
+        const detail = record.detail as Record<string, unknown>
+        if (typeof detail.message === 'string') return detail.message
+      }
       if (typeof record.message === 'string') return record.message
     }
   } catch {
@@ -66,6 +70,9 @@ export const productApi = {
   saveShadow: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/shadow', jsonBody(value)),
   savePersona: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/persona', jsonBody(value)),
   saveSpeaker: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/speaker', jsonBody(value)),
+  /** 保存 TTS backend（语音供应方）；新事务立即使用返回的选择。 */
+  saveTts: (backend: 'minimax' | 'cosyvoice') => request<ProductMutationResult>('/api/v1/product/settings/tts', jsonBody({ backend })),
+  ttsStatus: () => request<{ backend: 'minimax' | 'cosyvoice'; worker: { state: 'stopped' | 'starting' | 'ready' | 'draining' | 'error'; message?: string | null; model_present?: boolean } }>('/api/v1/tts/status'),
   speakerStatus: () => request<Record<string, unknown>>('/api/v1/speaker/status'),
   speakerProfile: () => request<Record<string, unknown>>('/api/v1/speaker/profile'),
   startSpeakerEnrollment: () => request<Record<string, unknown>>('/api/v1/speaker/enrollment/start', { method: 'POST' }),

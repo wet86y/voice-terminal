@@ -9,13 +9,14 @@ import type {
   ProductModelRegistry,
   ProductMutationResult,
   ProductRuntimeState,
+  ProductRuntimeSnapshot,
   ProductSettingsSnapshot,
   ProductSnapshot,
   ProductTtsProfile,
 } from './types'
 import { voiceShadowReplayFixture, voiceShadowReplayMeta } from './replay-data'
 
-export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'models'
+export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'tts' | 'speaker' | 'models'
 export type ProductPage = 'home' | 'settings'
 export type AssignmentSlot = 'voice' | 'shadow' | 'status' | 'tts'
 
@@ -75,7 +76,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export const MAX_WAKE_KEYWORDS = 5
 
 const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 3,
+  schema_version: 5,
+  tts: { backend: 'minimax' },
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
   shadow: { experimental_context_gate_enabled: false },
@@ -115,6 +117,7 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   const wake = isRecord(value.wake) ? value.wake : {}
   const silence = isRecord(value.silence) ? value.silence : {}
   const shadow = isRecord(value.shadow) ? value.shadow : {}
+  const tts = isRecord(value.tts) ? value.tts : {}
   const speaker = isRecord(value.speaker) ? value.speaker : {}
   const persona = isRecord(value.persona) ? value.persona : {}
   const text = (candidate: unknown) => typeof candidate === 'string' ? candidate : ''
@@ -125,6 +128,7 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   const primaryKeyword = text(wake.keyword) || DEFAULT_SETTINGS.wake.keyword
   return {
     schema_version: typeof value.schema_version === 'number' ? value.schema_version : DEFAULT_SETTINGS.schema_version,
+    tts: { backend: tts.backend === 'cosyvoice' ? 'cosyvoice' : 'minimax' },
     wake: {
       enabled: wake.enabled === true,
       keyword: primaryKeyword,
@@ -198,6 +202,7 @@ function updateSettingsFromResponse(settings: ProductSettingsSnapshot, result: P
   if (isRecord(candidate.silence)) Object.assign(settings.silence, candidate.silence)
   if (isRecord(candidate.shadow)) Object.assign(settings.shadow, candidate.shadow)
   if (isRecord(candidate.speaker)) Object.assign(settings.speaker, candidate.speaker)
+  if (isRecord(candidate.tts)) Object.assign(settings.tts, candidate.tts)
   if (isRecord(candidate.persona)) Object.assign(settings.persona, candidate.persona)
   if (Array.isArray(candidate.warnings)) settings.warnings = candidate.warnings.filter((item): item is string => typeof item === 'string')
 }
@@ -215,6 +220,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const dsh = ref<DshRuntimeStatus>(structuredClone(DEFAULT_DSH))
   const loading = ref(false)
   const saving = ref(false)
+  const ttsSwitching = ref(false)
+  const ttsWorker = ref<ProductRuntimeSnapshot['tts_worker']>({ state: 'stopped' })
   const lastError = ref('')
   const notice = ref('')
   const noticeVisible = ref(false)
@@ -266,6 +273,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   let reconnectTimer: number | undefined
   let replayTimer: number | undefined
   let dshStatusTimer: number | undefined
+  let ttsStatusTimer: number | undefined
   let noticeDisplayTimer: ReturnType<typeof setTimeout> | undefined
   let noticeFadeTimer: ReturnType<typeof setTimeout> | undefined
   let mutationQueue: Promise<unknown> = Promise.resolve()
@@ -330,6 +338,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     Object.assign(settings.silence, nextSettings.silence)
     Object.assign(settings.shadow, nextSettings.shadow)
     Object.assign(settings.speaker, nextSettings.speaker)
+    Object.assign(settings.tts, nextSettings.tts)
+    ttsWorker.value = value.runtime.tts_worker || { state: 'stopped' }
     Object.assign(settings.persona, nextSettings.persona)
     settings.schema_version = nextSettings.schema_version
     settings.warnings = nextSettings.warnings
@@ -448,6 +458,43 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       }
     })
   }
+
+  async function switchTts(backend: ProductSettingsSnapshot['tts']['backend']) {
+    if (ttsSwitching.value || (settings.tts.backend === backend && ttsWorker.value?.state !== 'error')) return
+    await enqueue(async () => {
+      const previousWorker = ttsWorker.value
+      ttsSwitching.value = true
+      if (backend === 'cosyvoice') ttsWorker.value = { state: 'starting' }
+      try {
+        const result = await productApi.saveTts(backend)
+        updateSettingsFromResponse(settings, result)
+        if (isRecord(result.worker)) {
+          ttsWorker.value = result.worker as ProductRuntimeSnapshot['tts_worker']
+        }
+        setNotice(result.message || 'TTS 供应方已切换，下一条语音生效。')
+      } catch (error) {
+        ttsWorker.value = backend === 'cosyvoice'
+          ? { state: 'error', message: messageFromError(error) }
+          : previousWorker
+        setError(error)
+      } finally {
+        ttsSwitching.value = false
+      }
+    })
+  }
+
+  watch(settingsTab, tab => {
+    if (ttsStatusTimer !== undefined) window.clearInterval(ttsStatusTimer)
+    ttsStatusTimer = undefined
+    if (replayMode || tab !== 'tts') return
+    const refresh = () => {
+      void productApi.ttsStatus().then(value => { ttsWorker.value = value.worker }).catch(() => undefined)
+    }
+    refresh()
+    ttsStatusTimer = window.setInterval(() => {
+      refresh()
+    }, 1000)
+  })
 
   async function startSpeakerEnrollment() {
     try {
@@ -1137,6 +1184,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (reconnectTimer !== undefined) window.clearInterval(reconnectTimer)
     if (replayTimer !== undefined) window.clearTimeout(replayTimer)
     if (dshStatusTimer !== undefined) window.clearInterval(dshStatusTimer)
+    if (ttsStatusTimer !== undefined) window.clearInterval(ttsStatusTimer)
     clearNoticeTimers()
     voice.dispose()
   })
@@ -1151,6 +1199,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     dsh,
     loading,
     saving,
+    ttsSwitching,
+    ttsWorker,
     connected,
     replayMode,
     replayMeta: voiceShadowReplayMeta,
@@ -1213,6 +1263,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     saveShadowGate,
     savePersona,
     saveSpeaker,
+    switchTts,
     refreshSpeaker,
     startSpeakerEnrollment,
     cancelSpeakerEnrollment,

@@ -157,6 +157,8 @@ llm:
   transport_retry_limit: 2
 
 tts:
+  # backend（语音供应方）：minimax 为远程，cosyvoice 为本地；设置页可即时切换后续事务。
+  backend: minimax
   provider: minimax
   base_url: https://api.minimaxi.com
   websocket_path: /ws/v1/t2a_v2

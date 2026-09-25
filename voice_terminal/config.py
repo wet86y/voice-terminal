@@ -181,6 +181,8 @@ class LlmConfig:
 @dataclass(frozen=True)
 class TtsConfig:
     provider: str = "minimax"
+    # Product selection; ``provider`` remains the legacy MiniMax model metadata.
+    backend: str = "minimax"
     base_url: str = "https://api.minimaxi.com"
     websocket_path: str = "/ws/v1/t2a_v2"
     transport: str = "websocket"
@@ -209,6 +211,8 @@ class TtsConfig:
     first_clause_timeout_ms: int = 400
 
     def __post_init__(self) -> None:
+        if self.backend not in {"minimax", "cosyvoice"}:
+            raise ValueError("tts.backend 必须为 minimax 或 cosyvoice")
         if self.transport not in {"websocket", "websocket_bidi"}:
             raise ValueError("tts.transport must be websocket or websocket_bidi")
         if self.scheduling not in {"auto", "direct", "playback_window", "sentence_window"}:
@@ -794,6 +798,7 @@ class AppConfig:
             ),
             tts=TtsConfig(
                 provider=_string(tts.get("provider"), "minimax"),
+                backend=_string(tts.get("backend"), "minimax"),
                 base_url=os.environ.get("MINIMAX_API_HOST", "").strip() or _string(tts.get("base_url"), "https://api.minimaxi.com"),
                 websocket_path=_string(tts.get("websocket_path"), "/ws/v1/t2a_v2"),
                 transport=_string(tts.get("transport"), "websocket"),

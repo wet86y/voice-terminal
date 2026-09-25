@@ -314,7 +314,11 @@ class SpeechPipeline:
 
     async def _play_stream(self, ws, token, deltas, *, speech_id: str | None = None,
                            handle=None) -> str:
-        transport = getattr(self.tts, "transport", "websocket") if self.tts is not None else "websocket"
+        tts_client = handle.tts_client if handle is not None else self.tts
+        if tts_client is None and not hasattr(self.tts, "bind"):
+            tts_client = self.tts
+        tts_backend = handle.tts_backend if handle is not None else "minimax"
+        transport = getattr(tts_client, "transport", "websocket") if tts_client is not None else "websocket"
         session = None
         reader = None
         sender_task = None
@@ -324,15 +328,15 @@ class SpeechPipeline:
         tts_disabled = False
         playback_key = ws.playback_key
         configured_scheduling = getattr(
-            self.tts,
+            tts_client,
             "effective_scheduling",
-            getattr(self.tts, "scheduling", "auto") if self.tts is not None else "auto",
+            getattr(tts_client, "scheduling", "auto") if tts_client is not None else "auto",
         )
         sentence_window_enabled = configured_scheduling == "sentence_window"
         if sentence_window_enabled:
             bridge = PunctuationSentenceSegmenter(
                 first_clause_timeout_ms=max(
-                    1, int(getattr(self.tts, "first_clause_timeout_ms", 400))
+                    1, int(getattr(tts_client, "first_clause_timeout_ms", 400))
                 )
             )
         elif transport == "websocket_bidi":
@@ -344,7 +348,7 @@ class SpeechPipeline:
         # one sent frame is never one server segment and waiting for "this
         # frame finished" would stall; its lead window is still useful.
         if configured_scheduling == "playback_window":
-            lead_ms = max(1, int(getattr(self.tts, "admission_lead_ms", 0) or self.options.tts_lead_ms))
+            lead_ms = max(1, int(getattr(tts_client, "admission_lead_ms", 0) or self.options.tts_lead_ms))
         elif self.options.tts_pacing:
             lead_ms = max(1, int(self.options.tts_lead_ms))
         else:
@@ -368,8 +372,8 @@ class SpeechPipeline:
         audio_returned_bytes = 0
         tts_text_sent = False
         prefetch_miss_boundary_ms: int | None = None
-        sentence_prefetch_ms = max(1, int(getattr(self.tts, "sentence_prefetch_ms", 2000)))
-        sentence_tick_seconds = max(0.001, int(getattr(self.tts, "sentence_tick_ms", 50)) / 1000)
+        sentence_prefetch_ms = max(1, int(getattr(tts_client, "sentence_prefetch_ms", 2000)))
+        sentence_tick_seconds = max(0.001, int(getattr(tts_client, "sentence_tick_ms", 50)) / 1000)
         progress_lock = asyncio.Lock()
         last_progress: tuple[int, int, int, int, int] | None = None
         last_progress_at = 0.0
@@ -470,7 +474,7 @@ class SpeechPipeline:
                 )
                 await self._detail(
                     "tts.progress",
-                    provider="minimax",
+                    provider=tts_backend,
                     status=current_status,
                     waiting_text=waiting_text if waiting_text is not None else self.state.current.get("tts_text", ""),
                     audio_buffer_ms=int(snapshot["queued_ms"]),
@@ -606,6 +610,11 @@ class SpeechPipeline:
             while audio_returned_bytes <= before_bytes:
                 if not self._valid(token) or tts_disabled:
                     return
+                # The provider has ended its PCM stream.  There can be no
+                # catch-up chunk, so do not spend one timeout per staged
+                # frame while draining the Voice Server's text queue.
+                if reader is not None and reader.done():
+                    return
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     return
@@ -692,7 +701,7 @@ class SpeechPipeline:
 
         async def tts_sender() -> None:
             nonlocal session, reader, progress_task, tts_failed, tts_disabled, tts_text_sent
-            nonlocal prefetch_miss_boundary_ms
+            nonlocal prefetch_miss_boundary_ms, completed_markers
             sent_any = False
             try:
                 while True:
@@ -730,7 +739,7 @@ class SpeechPipeline:
                         sync_turn_timings()
                         session = self._new_tts_session(ws)
                         self._bind_tts_session(ws, session)
-                        checkout = getattr(self.tts, "checkout_prewarm", None)
+                        checkout = getattr(tts_client, "checkout_prewarm", None)
                         if callable(checkout):
                             try:
                                 warm = bool(checkout(session, turn_id=ws.turn_id))
@@ -739,7 +748,7 @@ class SpeechPipeline:
                         else:
                             warm = False
                         checkout_reason = getattr(
-                            self.tts, "last_prewarm_checkout_reason",
+                            tts_client, "last_prewarm_checkout_reason",
                             "not_available" if not callable(checkout) else "not_prewarmed",
                         )
                         warm_connection_id = getattr(session, "connection_id", None) if warm else None
@@ -800,7 +809,7 @@ class SpeechPipeline:
                                 except TypeError:
                                     warm = bool(checkout(session))
                             checkout_reason = getattr(
-                                self.tts, "last_prewarm_checkout_reason",
+                                tts_client, "last_prewarm_checkout_reason",
                                 "not_available" if not callable(checkout) else "not_prewarmed",
                             )
                             ws.timings["prewarm_checkout_result"] = "hit" if warm else "miss"
@@ -898,6 +907,9 @@ class SpeechPipeline:
                             except (AttributeError, TypeError, ValueError) as exc:
                                 raise RuntimeError("TTS session 返回了无效的短句块回执") from exc
                         state.complete_segment(receipt)
+                        if completed_markers <= receipt.index:
+                            completed_markers = receipt.index + 1
+                            resolver.mark_boundary(int(receipt.end_received_bytes * 1000 / audio_bytes_per_second))
                         miss_boundary_ms = (
                             previous_boundary_ms
                             if previous_boundary_ms is not None
@@ -930,7 +942,7 @@ class SpeechPipeline:
 
         async def send(segments):
             nonlocal sender_task
-            if not segments or self.tts is None or tts_disabled or not self._valid(token):
+            if not segments or tts_client is None or tts_disabled or not self._valid(token):
                 return
             if sender_task is None:
                 sender_task = asyncio.create_task(tts_sender(), name=f"tts-sender-{ws.turn_id}")
@@ -1026,13 +1038,13 @@ class SpeechPipeline:
             # this generation.  It is not evidence that the server produced
             # usable PCM.  Calling that a completed speech made the UI show
             # a fully answered request while the user heard nothing.  Record
-            # the transport fact before final status/delivery resolution so
-            # the transaction can be retried once by EpisodeSpeechOutput.
+            # the transport fact before final status/delivery resolution;
+            # EpisodeSpeechOutput preserves the MiniMax-only empty-audio retry.
             ws.timings["tts_audio_bytes"] = audio_returned_bytes
             ws.timings["tts_text_sent"] = int(tts_text_sent)
             ws.timings["playback_output_complete"] = False
             if session and tts_text_sent and audio_returned_bytes == 0 and tts_failed is None:
-                tts_failed = RuntimeError("MiniMax TTS 已确认结束但未返回 PCM")
+                tts_failed = RuntimeError(f"{tts_backend} TTS 已确认结束但未返回 PCM")
                 tts_disabled = True
                 logger.error(
                     "controller.tts_empty_audio turn_id=%s transport=%s generation_finished=%s",
@@ -1066,7 +1078,7 @@ class SpeechPipeline:
                 self.state.current["tts_status"] = "DEGRADED"
                 await self._detail(
                     "tts.status",
-                    provider="minimax",
+                    provider=tts_backend,
                     status="DEGRADED",
                     waiting_text="",
                     audio_buffer_ms=self.player.buffered_ms if self.player else 0,
