@@ -20,6 +20,22 @@ $BridgeArtifactDir = Join-Path $RuntimeRoot "bundles\voice-terminal-shadow-bridg
 $BridgePackagePath = Join-Path $BridgeDir "package.json"
 $BridgeEntryPath = Join-Path $BridgeArtifactDir "lib\index.js"
 $BridgeClientEntryPath = Join-Path $BridgeArtifactDir "lib\client.js"
+$BridgeBuildInputPaths = @(
+  (Join-Path $BridgeDir "src"),
+  $BridgePackagePath,
+  (Join-Path $BridgeDir "build.mjs"),
+  (Join-Path $BridgeDir "cordis.patch.yml"),
+  (Join-Path $PSScriptRoot "build-dsh-client.mjs")
+)
+$BridgeRuntimeArtifactPaths = @(
+  (Join-Path $BridgeArtifactDir "package.json"),
+  (Join-Path $BridgeArtifactDir "cordis.patch.yml"),
+  (Join-Path $BridgeArtifactDir "lib\index.js"),
+  (Join-Path $BridgeArtifactDir "lib\settings.js"),
+  (Join-Path $BridgeArtifactDir "lib\settings-contract.js"),
+  (Join-Path $BridgeArtifactDir "lib\generated-prompt.js"),
+  (Join-Path $BridgeArtifactDir "lib\client.js")
+)
 $CommonPromptPath = Join-Path $RepoRoot "config\shadow_agent\instructions.md"
 $DshRulesPath = Join-Path $RepoRoot "config\dsh\shadow-agent.rules.md"
 $ProfileDir = Join-Path $HomeDir "profiles\web"
@@ -39,7 +55,12 @@ function Invoke-Checked {
 function Get-TreeHash {
   param([string[]]$Paths)
   $rows = foreach ($Path in $Paths) {
-    Get-ChildItem -LiteralPath $Path -File -Recurse | Sort-Object FullName | ForEach-Object {
+    $Files = if (Test-Path -LiteralPath $Path -PathType Leaf) {
+      @(Get-Item -LiteralPath $Path)
+    } else {
+      @(Get-ChildItem -LiteralPath $Path -File -Recurse)
+    }
+    $Files | Sort-Object FullName | ForEach-Object {
       "$(($_.FullName.Substring($RepoRoot.Length)).Replace('\','/')):$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
     }
   }
@@ -139,15 +160,19 @@ if ($ValidateOnly) {
   if ($ProfilePackage.dsh.profile.bundles -notcontains '@voice-terminal/dsh-shadow-bridge') { throw "DSH Bridge bundle 未注册到 web profile。" }
   $ArtifactPackagePath = Join-Path $BridgeArtifactDir "package.json"
   if (-not (Test-Path -LiteralPath $ArtifactPackagePath)) { throw "DSH Bridge artifact package.json 缺失。" }
+  foreach ($RuntimeArtifactPath in $BridgeRuntimeArtifactPaths) {
+    if (-not (Test-Path -LiteralPath $RuntimeArtifactPath -PathType Leaf)) { throw "DSH Bridge 运行产物缺失：$RuntimeArtifactPath" }
+  }
   $ArtifactPackage = Get-Content -LiteralPath $ArtifactPackagePath -Raw | ConvertFrom-Json
   if ($ArtifactPackage.exports.'./client' -ne './lib/client.js') { throw "DSH Bridge 浏览器入口未导出。" }
   if ($ArtifactPackage.dsh.client.platform -ne 'web') { throw "DSH Bridge 未声明 web client bundle。" }
   $State = Get-Content -LiteralPath $BuildStatePath -Raw | ConvertFrom-Json
-  $CurrentBundleHash = Get-TreeHash @($BridgeArtifactDir)
-  $CurrentSourceHash = Get-TreeHash @($BridgeDir)
+  if ($State.schema_version -ne 3) { throw "DSH build-state 格式版本已过期；请重新运行 setup-dsh.ps1。" }
+  $CurrentRuntimeArtifactHash = Get-TreeHash @($BridgeRuntimeArtifactPaths)
+  $CurrentBuildInputsHash = Get-TreeHash @($BridgeBuildInputPaths)
   if ($State.bridge_protocol_version -ne $BridgeProtocolVersion) { throw "DSH Bridge 协议版本漂移。" }
-  if ($State.bridge_bundle_sha256 -ne $CurrentBundleHash) { throw "DSH Bridge Bundle 内容已漂移。" }
-  if ($State.bridge_source_sha256 -ne $CurrentSourceHash) { throw "DSH Bridge 源码或构建规则已漂移。" }
+  if ($State.bridge_runtime_artifacts_sha256 -ne $CurrentRuntimeArtifactHash) { throw "DSH Bridge 运行产物 hash 漂移。" }
+  if ($State.bridge_build_inputs_sha256 -ne $CurrentBuildInputsHash) { throw "DSH Bridge 构建输入 hash 漂移。" }
   if ($State.shadow_prompt_sha256 -ne $PromptHash) { throw "Shadow 公共提示词或 DSH 附加规则已漂移。" }
 }
 
@@ -165,10 +190,13 @@ if (-not $ValidateOnly) {
   if ($DumpConfig -notmatch [regex]::Escape('@voice-terminal/dsh-shadow-bridge')) { throw "DSH dump-config 未包含 Bridge Bundle。" }
   $DumpConfig | Set-Content -LiteralPath $DumpConfigPath -Encoding utf8
   $ManagedHash = Get-TreeHash @((Split-Path -Parent $PatchSource), $PresetSource)
-  $BundleHash = Get-TreeHash @($BridgeArtifactDir)
-  $BridgeSourceHash = Get-TreeHash @($BridgeDir)
+  foreach ($RuntimeArtifactPath in $BridgeRuntimeArtifactPaths) {
+    if (-not (Test-Path -LiteralPath $RuntimeArtifactPath -PathType Leaf)) { throw "DSH Bridge 运行产物缺失：$RuntimeArtifactPath" }
+  }
+  $RuntimeArtifactHash = Get-TreeHash @($BridgeRuntimeArtifactPaths)
+  $BridgeBuildInputsHash = Get-TreeHash @($BridgeBuildInputPaths)
   [ordered]@{
-    schema_version = 2
+    schema_version = 3
     repository = $Lock.repository
     tag = $Tag
     commit = $Head
@@ -178,8 +206,8 @@ if (-not $ValidateOnly) {
     managed_config_sha256 = $ManagedHash
     bridge_bundle_version = $BridgeVersion
     bridge_protocol_version = $BridgeProtocolVersion
-    bridge_bundle_sha256 = $BundleHash
-    bridge_source_sha256 = $BridgeSourceHash
+    bridge_runtime_artifacts_sha256 = $RuntimeArtifactHash
+    bridge_build_inputs_sha256 = $BridgeBuildInputsHash
     shadow_prompt_sha256 = $PromptHash
     source_dir = $SourceDir
     home_dir = $HomeDir

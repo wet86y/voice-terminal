@@ -227,15 +227,33 @@ class DshRuntimeManager:
             state = json.loads(build_state.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as exc:
             raise RuntimeError("DSH build-state.json 缺失或无效。") from exc
+        if state.get("schema_version") != 3:
+            raise RuntimeError("DSH build-state 格式版本不受支持；请重新运行 scripts\\setup-dsh.ps1。")
         if state.get("bridge_protocol_version") != self.config.bridge_protocol_version:
             raise RuntimeError("DSH Bridge build-state 协议版本漂移；请重新运行 setup-dsh.ps1。")
         bundle_dir = self.config.source_dir.parent / "bundles" / "voice-terminal-shadow-bridge"
         bridge_source = self.repo_root / "integrations" / "dsh" / "voice-terminal-shadow-bridge"
+        bridge_build_inputs = (
+            bridge_source / "src",
+            bridge_source / "package.json",
+            bridge_source / "build.mjs",
+            bridge_source / "cordis.patch.yml",
+            self.repo_root / "scripts" / "build-dsh-client.mjs",
+        )
+        bridge_runtime_artifacts = (
+            bundle_dir / "package.json",
+            bundle_dir / "cordis.patch.yml",
+            bundle_dir / "lib" / "index.js",
+            bundle_dir / "lib" / "settings.js",
+            bundle_dir / "lib" / "settings-contract.js",
+            bundle_dir / "lib" / "generated-prompt.js",
+            bundle_dir / "lib" / "client.js",
+        )
         common_prompt = self.repo_root / "config" / "shadow_agent" / "instructions.md"
         dsh_rules = self.repo_root / "config" / "dsh" / "shadow-agent.rules.md"
         checks = (
-            ("bridge_bundle_sha256", self._tree_hash(bundle_dir), "Bundle"),
-            ("bridge_source_sha256", self._tree_hash(bridge_source), "Bundle 源码"),
+            ("bridge_runtime_artifacts_sha256", self._tree_hash(*bridge_runtime_artifacts), "Bridge 运行产物"),
+            ("bridge_build_inputs_sha256", self._tree_hash(*bridge_build_inputs), "Bridge 构建输入"),
             ("shadow_prompt_sha256", self._tree_hash(common_prompt, dsh_rules), "Shadow 提示词"),
         )
         for key, actual, label in checks:
