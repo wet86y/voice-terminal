@@ -4,11 +4,13 @@ import unittest
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
 
 from voice_terminal.config import load_config
-from voice_terminal.providers.minimax_tts import MiniMaxTtsError, MiniMaxTtsSession, MiniMaxTtsClient
+from voice_terminal.providers.minimax_tts import (
+    MiniMaxEmotionUnsupported, MiniMaxTtsError, MiniMaxTtsSession, MiniMaxTtsClient,
+)
 
 
 class MiniMaxTtsAudioTests(unittest.TestCase):
@@ -55,6 +57,141 @@ class MiniMaxTtsAudioTests(unittest.TestCase):
 
 
 class MiniMaxTtsProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retryable_task_failure_retries_before_text_without_disabling_emotion(self) -> None:
+        class Socket:
+            def __init__(self, events):
+                self.events = list(events)
+                self.sent = []
+
+            async def send(self, payload):
+                self.sent.append(json.loads(payload))
+
+            async def recv(self):
+                if self.events:
+                    return json.dumps(self.events.pop(0))
+                await asyncio.Future()
+
+            async def close(self):
+                return None
+
+        rejected = Socket([{
+            "event": "task_failed",
+            "base_resp": {"status_code": 429, "status_msg": "rate limit"},
+        }])
+        ready = Socket([{"event": "task_started"}])
+        connect = AsyncMock(side_effect=[rejected, ready])
+        client = MiniMaxTtsClient(
+            base_url="https://example.invalid", websocket_path="/ws",
+            model="speech-2.8-hd", api_key="test", session_reuse=False,
+        )
+        with patch("websockets.connect", new=connect):
+            session = await client.start_session_with_retry(client.session(fresh=True))
+        try:
+            self.assertEqual(connect.await_count, 2)
+            self.assertTrue(client.emotion_enabled)
+            self.assertTrue(session.connection_ready)
+            self.assertEqual([item["event"] for item in rejected.sent], ["task_start"])
+            self.assertEqual([item["event"] for item in ready.sent], ["task_start"])
+        finally:
+            await session.close()
+
+    async def test_auth_rejection_does_not_trigger_emotion_fallback_or_retry(self) -> None:
+        class Socket:
+            async def send(self, _payload):
+                return None
+
+            async def recv(self):
+                return json.dumps({
+                    "event": "task_failed",
+                    "base_resp": {"status_code": 401, "status_msg": "authorization failed"},
+                })
+
+            async def close(self):
+                return None
+
+        connect = AsyncMock(return_value=Socket())
+        client = MiniMaxTtsClient(
+            base_url="https://example.invalid", websocket_path="/ws",
+            model="speech-2.8-hd", api_key="test", session_reuse=False,
+        )
+        with patch("websockets.connect", new=connect):
+            with self.assertRaisesRegex(MiniMaxTtsError, "authorization failed"):
+                await client.start_session_with_retry(client.session(fresh=True))
+        self.assertEqual(connect.await_count, 1)
+        self.assertTrue(client.emotion_enabled)
+
+    async def test_only_explicit_emotion_rejection_disables_emotion_transport(self) -> None:
+        class Socket:
+            async def send(self, _payload):
+                return None
+
+            async def recv(self):
+                return json.dumps({
+                    "event": "task_failed",
+                    "base_resp": {
+                        "status_code": 1002,
+                        "status_msg": "unknown voice_setting.emotion",
+                    },
+                })
+
+            async def close(self):
+                return None
+
+        client = MiniMaxTtsClient(
+            base_url="https://example.invalid", websocket_path="/ws",
+            model="speech-2.8-hd", api_key="test", session_reuse=False,
+        )
+        with patch("websockets.connect", new=AsyncMock(return_value=Socket())):
+            with self.assertRaises(MiniMaxEmotionUnsupported):
+                await client.session(fresh=True).start()
+        self.assertFalse(client.emotion_enabled)
+
+    async def test_transient_start_failure_retries_with_fresh_session(self) -> None:
+        class Socket:
+            def __init__(self):
+                self.sent = []
+                self.first_receive = True
+
+            async def send(self, payload):
+                self.sent.append(json.loads(payload))
+
+            async def recv(self):
+                if self.first_receive:
+                    self.first_receive = False
+                    return json.dumps({"event": "task_started"})
+                await asyncio.Future()
+
+            async def close(self):
+                return None
+
+        socket = Socket()
+        connect = AsyncMock(side_effect=[OSError("temporary network reset"), socket])
+        client = MiniMaxTtsClient(
+            base_url="https://example.invalid", websocket_path="/ws",
+            model="speech-2.8-hd", api_key="test", session_reuse=False,
+        )
+        original = client.session(fresh=True)
+        with patch("websockets.connect", new=connect):
+            recovered = await client.start_session_with_retry(original)
+        try:
+            self.assertIsNot(recovered, original)
+            self.assertEqual(connect.await_count, 2)
+            self.assertTrue(recovered.connection_ready)
+            self.assertEqual(socket.sent[0]["event"], "task_start")
+        finally:
+            await recovered.close()
+
+    async def test_non_transient_start_failure_is_not_retried(self) -> None:
+        connect = AsyncMock(side_effect=RuntimeError("invalid handshake"))
+        client = MiniMaxTtsClient(
+            base_url="https://example.invalid", websocket_path="/ws",
+            model="speech-2.8-hd", api_key="test", session_reuse=False,
+        )
+        with patch("websockets.connect", new=connect):
+            with self.assertRaises(MiniMaxTtsError):
+                await client.start_session_with_retry(client.session(fresh=True))
+        self.assertEqual(connect.await_count, 1)
+
     async def test_finish_close_after_audio_is_failure(self) -> None:
         class ConnectionClosedError(Exception):
             pass

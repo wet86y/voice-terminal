@@ -12,8 +12,51 @@ from ..tts.scheduling import TtsSegmentReceipt
 logger = logging.getLogger(__name__)
 
 
+def _retryable_status_code(status: Any) -> bool:
+    if status is None:
+        return False
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return False
+    return code in {408, 425, 429} or 500 <= code < 600
+
+
+def _is_emotion_rejection(message: str) -> bool:
+    normalized = message.casefold()
+    mentions_emotion = "emotion" in normalized or "voice_setting" in normalized
+    rejected = any(marker in normalized for marker in (
+        "unsupported", "not supported", "unknown", "invalid", "not allowed",
+        "unrecognized", "illegal", "不支持", "无效", "未知", "不合法", "不允许",
+    ))
+    return mentions_emotion and rejected
+
+
 class MiniMaxTtsError(RuntimeError):
     pass
+
+
+class MiniMaxTtsConnectionError(MiniMaxTtsError):
+    """连接或 task_start 握手失败，可携带安全重试标记。"""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _retryable_connection_failure(exc: Exception) -> bool:
+    """Retry only transient transport failures before text is submitted."""
+
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    if status is not None:
+        return _retryable_status_code(status)
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError)):
+        return True
+    name = type(exc).__name__
+    return name.startswith("ConnectionClosed") or name == "InvalidHandshake"
 
 
 class MiniMaxEmotionUnsupported(MiniMaxTtsError):
@@ -274,7 +317,11 @@ class MiniMaxTtsSession:
                 )
                 connected_event = connected.get("event")
                 if connected_event == "task_failed":
-                    raise MiniMaxTtsError(self._error_message(connected))
+                    code = self._error_code(connected)
+                    message = self._error_message(connected)
+                    if _retryable_status_code(code):
+                        raise MiniMaxTtsConnectionError(message, retryable=True)
+                    raise MiniMaxTtsError(message)
                 if connected_event != "connected_success":
                     raise MiniMaxTtsError(
                         f"MiniMax Bidi 连接握手异常：期望 connected_success，收到 {connected_event or 'unknown'}"
@@ -288,12 +335,15 @@ class MiniMaxTtsSession:
                 event = parsed.get("event")
                 if event == "task_failed":
                     message = self._error_message(parsed)
-                    if self.client.emotion_enabled:
+                    code = self._error_code(parsed)
+                    if self.client.emotion_enabled and _is_emotion_rejection(message):
                         # The WebSocket public examples do not document this
                         # optional HTTP/MCP field.  Retry this output without
                         # it rather than leaving a rejected session retained.
                         self.client.disable_emotion_transport(message)
                         raise MiniMaxEmotionUnsupported(message)
+                    if _retryable_status_code(code):
+                        raise MiniMaxTtsConnectionError(message, retryable=True)
                     raise MiniMaxTtsError(message)
                 if event == "task_started":
                     self._started = True
@@ -310,7 +360,10 @@ class MiniMaxTtsSession:
         except Exception as exc:
             logger.exception("minimax.start_failed")
             await self.close()
-            raise MiniMaxTtsError(f"MiniMax TTS 连接失败：{exc}") from exc
+            raise MiniMaxTtsConnectionError(
+                f"MiniMax TTS 连接失败：{exc}",
+                retryable=_retryable_connection_failure(exc),
+            ) from exc
 
     @staticmethod
     def _parse(raw: Any) -> dict[str, Any]:
@@ -921,6 +974,44 @@ class MiniMaxTtsClient:
     def _next_connection_id(self) -> int:
         self._connection_sequence += 1
         return self._connection_sequence
+
+    async def start_session_with_retry(
+        self,
+        session: MiniMaxTtsSession,
+        *,
+        max_attempts: int = 2,
+    ) -> MiniMaxTtsSession:
+        """Retry transient connection/start errors before any text is sent.
+
+        A failed session is discarded, then the retry uses a fresh object so
+        stale receiver state or PCM offsets cannot cross transaction boundaries.
+        """
+
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
+        active = session
+        for attempt in range(max_attempts):
+            try:
+                await active.start()
+                return active
+            except MiniMaxTtsConnectionError as exc:
+                if not exc.retryable or attempt + 1 >= max_attempts:
+                    raise
+                logger.warning(
+                    "minimax.start_retry attempt=%d/%d error=%s",
+                    attempt + 1,
+                    max_attempts,
+                    str(exc)[:240],
+                )
+                await active.close()
+                if self._prewarm_session is active:
+                    self._prewarm_session = None
+                    self._prewarm_turn_id = None
+                if self._bidi_session is active:
+                    self._bidi_session = None
+                await asyncio.sleep(0.25 * (2 ** attempt))
+                active = self.session(fresh=True)
+        return active
 
     @property
     def effective_scheduling(self) -> str:

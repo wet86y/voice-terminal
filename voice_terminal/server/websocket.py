@@ -32,7 +32,7 @@ from ..kws.service import KwsWorker
 from ..providers.deepseek import DeepSeekClient
 from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
-from ..tts.cosyvoice_runtime import CosyVoiceRuntimeError, CosyVoiceWorkerManager
+from ..tts.cosyvoice_runtime import CosyVoiceWorkerManager
 from ..tts.router import TtsBackendRouter
 from ..agent.tool_registry import FileTools, WebSearchTools
 from ..shadow_agent import ShadowAgentComponent, ShadowContextProjector, ShadowEvent
@@ -95,6 +95,9 @@ except ImportError:  # pragma: no cover - exercised by doctor/setup, not unit te
 class SessionRuntime:
     """The sole production runtime: a session orchestrating input, agent and speech."""
     def __init__(self, config: AppConfig, *, product_settings: ProductSettingsStore | None = None) -> None:
+        # The compatibility router remains available for future local-model
+        # work, while this product runtime is locked to MiniMax API（在线语音接口）.
+        config = replace(config, tts=replace(config.tts, backend="minimax", provider="minimax"))
         self.config = config
         self.dsh = DshRuntimeManager(
             config.dsh,
@@ -120,7 +123,6 @@ class SessionRuntime:
             project_root=project_root, model_dir=config.model_dir / "cosyvoice3-0.5b-2512",
         )
         self.tts: TtsBackendRouter | None = None
-        self._tts_setting_lock = asyncio.Lock()
         self.shadow_search_tools: WebSearchTools | None = None
         self.shadow_component: ShadowAgentComponent | None = None
         self.shadow_session: ShadowAgentSession | DshShadowAgentSession | None = None
@@ -891,7 +893,7 @@ class SessionRuntime:
                 first_clause_timeout_ms=self.config.tts.first_clause_timeout_ms,
             )
         self.tts = TtsBackendRouter(remote=remote_tts, worker=self.cosyvoice_worker,
-                                    backend=self.config.tts.backend)
+                                    backend="minimax")
         self.state.current.update(
             tts_transport=self.tts.transport,
             tts_scheduling=getattr(self.tts.current_client(), "effective_scheduling", "auto"),
@@ -899,8 +901,6 @@ class SessionRuntime:
         try:
             if self.config.tts.output_format.lower() != "pcm":
                 raise RuntimeError("TTS 播放器需要 PCM 输出。")
-            if self.config.tts.backend == "cosyvoice" and self.config.tts.sample_rate != 32000:
-                raise RuntimeError("CosyVoice 模式需要 32 kHz 播放器。")
             self.player = PcmPlayer(
                 sample_rate=self.config.tts.sample_rate,
                 channels=1,
@@ -910,9 +910,7 @@ class SessionRuntime:
             )
             self.player.start()
             self.state.current["playback_diagnostics"] = self.player.diagnostics
-            if self.config.tts.backend == "cosyvoice":
-                await self.cosyvoice_worker.ensure_ready()
-            elif remote_tts is None:
+            if remote_tts is None:
                 raise RuntimeError(f"未配置 {self.config.tts.api_key_env}")
             self.state.set_service("tts", "READY")
         except Exception as exc:
@@ -1356,6 +1354,7 @@ class SessionRuntime:
             shadow_agent=next_shadow,
             tts=replace(
                 previous_config.tts,
+                backend="minimax",
                 provider="minimax",
                 base_url=str(tts_provider.get("base_url")),
                 model=str(tts.get("model_id")),
@@ -1600,42 +1599,6 @@ class SessionRuntime:
         self.shadow_search_tools = None
         self.shadow_component = None
         self.shadow_session = None
-
-    async def set_tts_backend(self, backend: str, store: ProductSettingsStore) -> dict[str, Any]:
-        """原子切换后续语音事务；正在运行的事务保留原 provider。"""
-        if backend not in {"minimax", "cosyvoice"}:
-            raise ValueError("tts.backend 仅接受 minimax 或 cosyvoice。")
-        async with self._tts_setting_lock:
-            router = self.tts
-            if router is None:
-                raise CosyVoiceRuntimeError("TTS 运行时尚未初始化。")
-            previous = router.backend
-            if backend == "cosyvoice" and (self.player is None or self.player.sample_rate != 32000):
-                raise CosyVoiceRuntimeError("CosyVoice 模式需要已启动的 32 kHz 播放器。")
-            if backend == "minimax" and router.remote is None:
-                raise CosyVoiceRuntimeError(f"未配置 {self.config.tts.api_key_env}，无法切换到 MiniMax。")
-            if backend == "cosyvoice":
-                await self.cosyvoice_worker.ensure_ready()
-            try:
-                saved = await asyncio.to_thread(store.save_tts, {"backend": backend})
-                await router.switch(backend)
-            except Exception:
-                if store.settings_only()["tts"]["backend"] != previous:
-                    await asyncio.to_thread(store.save_tts, {"backend": previous})
-                if backend == "cosyvoice" and previous != "cosyvoice":
-                    await self.cosyvoice_worker.stop()
-                raise
-            self.config = replace(self.config, tts=replace(self.config.tts, backend=backend))
-            store.config = self.config
-            self.state.current.update(
-                tts_transport=router.transport,
-                tts_scheduling=getattr(router.current_client(), "effective_scheduling", "auto"),
-            )
-            self.state.set_service("tts", "READY" if router.current_client() is not None else "ERROR")
-            await self.bus.publish(self.snapshot())
-            return {"settings": {"tts": saved}, "effective_from": "next_speech",
-                    "pending": False, "worker": self.cosyvoice_worker.status(),
-                    "message": "TTS 供应方已切换，下一条语音生效。"}
 
     async def _wake_shadow(self) -> str:
         if self.shadow_session is None or not self.shadow_session.available:
@@ -2014,29 +1977,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
 
     @app.get("/api/v1/tts/status")
     async def get_tts_status() -> dict[str, Any]:
-        return {"backend": runtime.tts.backend if runtime.tts else runtime.config.tts.backend,
+        return {"backend": "minimax",
                 "worker": runtime.cosyvoice_worker.status()}
-
-    @app.put("/api/v1/product/settings/tts")
-    async def update_product_tts(body: dict[str, Any]) -> dict[str, Any]:
-        store = product_store_or_404()
-        if set(body) != {"backend"} or body.get("backend") not in {"minimax", "cosyvoice"}:
-            raise HTTPException(status_code=422, detail={
-                "code": "TTS_BACKEND_INVALID", "message": "tts.backend 仅接受 minimax 或 cosyvoice。",
-            })
-        try:
-            return await runtime.set_tts_backend(str(body["backend"]), store)
-        except CosyVoiceRuntimeError as exc:
-            raise HTTPException(status_code=503, detail={
-                "code": "TTS_WORKER_UNAVAILABLE" if body["backend"] == "cosyvoice" else "TTS_BACKEND_UNAVAILABLE",
-                "message": str(exc),
-                "backend": runtime.tts.backend if runtime.tts else runtime.config.tts.backend,
-                "worker": runtime.cosyvoice_worker.status(),
-            }) from exc
-        except ProductSettingsError as exc:
-            raise HTTPException(status_code=422, detail={
-                "code": "TTS_SETTINGS_INVALID", "message": str(exc),
-            }) from exc
 
     @app.put("/api/v1/product/settings/wake")
     async def update_product_wake(body: dict[str, Any]) -> dict[str, Any]:

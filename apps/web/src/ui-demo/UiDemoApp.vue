@@ -19,8 +19,7 @@ import {
 
 type PageName = 'home' | 'settings'
 type SettingsTab = 'wake' | 'persona' | 'silence' | 'models'
-type AssignmentSlot = 'voice' | 'shadow' | 'status' | 'tts'
-type LlmAssignmentSlot = Exclude<AssignmentSlot, 'tts'>
+type AssignmentSlot = 'voice' | 'shadow' | 'status'
 type ModelSection = 'add' | 'config' | 'pool'
 
 const activePage = ref<PageName>('home')
@@ -56,7 +55,6 @@ const modelAssignments = reactive<Record<AssignmentSlot, string>>({
   voice: 'runtime-voice-llm',
   shadow: 'runtime-shadow-llm',
   status: 'managed-reasoning',
-  tts: 'runtime-tts',
 })
 
 const expandedModelSections = reactive<Record<ModelSection, boolean>>({
@@ -125,9 +123,8 @@ const roleLabels: Record<AssignmentSlot, { title: string; hint: string; kind: st
   voice: { title: '语音交互主模型', hint: '正式回答与 speak 队列', kind: 'LLM 01' },
   shadow: { title: 'Shadow Agent 模型', hint: '后台理解、工具与任务推进', kind: 'LLM 02' },
   status: { title: '状态汇报模型', hint: 'Shadow 的可读实时工作简报', kind: 'LLM 03' },
-  tts: { title: '语音合成模型', hint: '将回复转换为可播放语音', kind: 'TTS' },
 }
-const llmAssignmentSlots: LlmAssignmentSlot[] = ['voice', 'shadow', 'status']
+const llmAssignmentSlots: AssignmentSlot[] = ['voice', 'shadow', 'status']
 const modelStatusLabels: Record<DemoModelStatus, string> = {
   verified: '已验证',
   inherited: '运行时导入',
@@ -499,22 +496,16 @@ function confirmApply() {
 
               <section class="model-accordion-card" :class="{ open: expandedModelSections.config }">
                 <button class="model-accordion-toggle" type="button" :aria-expanded="expandedModelSections.config" aria-controls="model-section-config" @click="toggleModelSection('config')">
-                  <span class="accordion-index">02</span><span class="accordion-copy"><strong>模型配置</strong><small>把 3 个 LLM 与 1 个 TTS 分配到运行时角色</small></span><span class="accordion-status">4 个运行槽位</span><span class="accordion-chevron" :class="{ open: expandedModelSections.config }">⌄</span>
+                  <span class="accordion-index">02</span><span class="accordion-copy"><strong>模型配置</strong><small>选择 3 个 LLM；TTS 固定使用当前在线配置</small></span><span class="accordion-status">3 个可分配角色</span><span class="accordion-chevron" :class="{ open: expandedModelSections.config }">⌄</span>
                 </button>
                 <transition name="model-accordion"><div v-if="expandedModelSections.config" id="model-section-config" class="model-card-content">
-                  <div class="config-callout"><span class="callout-icon">i</span><p>这里仅选择“谁负责什么”。上下文上限和思考能力属于模型本身的策略，请在模型池中编辑；同一个模型被多个角色使用时会保持一致。</p></div>
-                  <div class="assignment-grid assignment-grid-four">
+                  <div class="config-callout"><span class="callout-icon">i</span><p>这里仅分配 LLM（文字模型）角色；TTS（语音合成）固定使用当前 MiniMax API（在线语音接口）配置。上下文上限和思考能力属于模型本身的策略，请在模型池中编辑。</p></div>
+                  <div class="assignment-grid assignment-grid-three">
                     <article v-for="role in llmAssignmentSlots" :key="role" class="assignment-slot">
                       <div class="slot-heading"><span class="slot-kind">{{ roleLabels[role].kind }}</span><span class="slot-check">✓ 已分配</span></div>
                       <div class="slot-copy"><h3>{{ roleLabels[role].title }}</h3><p>{{ roleLabels[role].hint }}</p></div>
                       <label class="model-select-field"><span>选择模型</span><select v-model="modelAssignments[role]"><option v-for="item in availableLlmModels" :key="item.id" :value="item.id">{{ item.provider }} · {{ item.name }}（{{ item.modelId }}）</option></select></label>
                       <div class="slot-policy"><span>{{ modelPolicySummary(selectedModel(role)) }}</span><small>{{ modelStatusLabel(selectedModel(role)?.status ?? 'needs_check') }}</small></div>
-                    </article>
-                    <article class="assignment-slot assignment-slot-tts">
-                      <div class="slot-heading"><span class="slot-kind tts-kind">{{ roleLabels.tts.kind }}</span><span class="slot-check">✓ 已分配</span></div>
-                      <div class="slot-copy"><h3>{{ roleLabels.tts.title }}</h3><p>{{ roleLabels.tts.hint }}</p></div>
-                      <label class="model-select-field"><span>选择模型</span><select v-model="modelAssignments.tts"><option v-for="item in availableTtsModels" :key="item.id" :value="item.id">{{ item.provider }} · {{ item.name }}（{{ item.modelId }}）</option></select></label>
-                      <div class="slot-policy"><span>{{ modelPolicySummary(selectedModel('tts')) }}</span><small>{{ modelStatusLabel(selectedModel('tts')?.status ?? 'needs_check') }}</small></div>
                     </article>
                   </div>
                 </div></transition>

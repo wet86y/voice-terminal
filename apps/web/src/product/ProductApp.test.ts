@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 
 import productAppSource from './ProductApp.vue?raw'
 import productAdapterSource from './useProductAdapter.ts?raw'
+import productApiSource from './api.ts?raw'
+import uiDemoAppSource from '../ui-demo/UiDemoApp.vue?raw'
 import { readFileSync } from 'node:fs'
 
 // Vitest returns an empty string for every CSS text form (``?raw``, ``?inline``
@@ -10,15 +12,19 @@ import { readFileSync } from 'node:fs'
 // so it needs a direct source-level guard.
 const productCssSource = readFileSync(new URL('../ui-demo/ui-demo.css', import.meta.url), 'utf8')
 
-describe('TTS provider（语音供应方）切换', () => {
-  it('shows both choices, blocks repeat clicks, and reports Worker（工作进程）状态', () => {
-    expect(productAppSource).toContain("switchTts('minimax')")
-    expect(productAppSource).toContain("switchTts('cosyvoice')")
-    expect(productAppSource).toContain(':disabled="ttsSwitching"')
-    expect(productAppSource).toContain('workerStatusLabel(ttsWorker, ttsSwitching)')
-    expect(productAdapterSource).toContain('productApi.saveTts(backend)')
-    expect(productAdapterSource).toContain('productApi.ttsStatus()')
-    expect(productAdapterSource).toContain("? { state: 'error', message: messageFromError(error) }")
+describe('TTS provider（语音服务商）锁定', () => {
+  it('removes provider switching and profile assignment controls while retaining read-only status', () => {
+    expect(productAppSource).not.toContain("activeSettingsTab === 'tts'")
+    expect(productAppSource).not.toContain('switchTts(')
+    expect(productAppSource).not.toContain('assignment-slot-tts')
+    expect(productAppSource).not.toContain('选择 TTS profile')
+    expect(uiDemoAppSource).not.toContain('assignment-slot-tts')
+    expect(uiDemoAppSource).not.toContain('modelAssignments.tts')
+    expect(uiDemoAppSource).not.toContain('选择 TTS profile')
+    expect(productAdapterSource).not.toContain('productApi.saveTts')
+    expect(productAdapterSource).not.toContain('modelAssignments.tts')
+    expect(productApiSource).not.toContain('saveTts:')
+    expect(productApiSource).toContain("'/api/v1/tts/status'")
   })
 })
 

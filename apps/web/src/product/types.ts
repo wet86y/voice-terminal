@@ -31,8 +31,8 @@ export interface ProductRuntimeSnapshot {
 
 export interface ProductSettingsSnapshot {
   schema_version: number
-  /** TTS backend（语音供应方）；只影响下一条新建语音事务。 */
-  tts: { backend: 'minimax' | 'cosyvoice' }
+  /** TTS backend（语音后端）固定为 MiniMax API（在线语音接口）。 */
+  tts: { backend: 'minimax' }
   wake: {
     enabled: boolean
     /** Primary phrase; mirrors `keywords[0]` for older consumers. */

@@ -388,6 +388,15 @@ class SpeechPipeline:
         alignment_cursor = 0
         timing_owner = getattr(self, "controller", self)
 
+        async def start_tts_session(active_session):
+            # MiniMax can retry a connection handshake before accepting text;
+            # other providers keep their existing single-start behavior.
+            retry_start = getattr(tts_client, "start_session_with_retry", None)
+            if callable(retry_start):
+                return await retry_start(active_session)
+            await active_session.start()
+            return active_session
+
         def sync_turn_timings() -> None:
             shared = getattr(timing_owner, "_turn_timings", {}).get(ws.turn_id)
             if isinstance(shared, dict):
@@ -757,7 +766,8 @@ class SpeechPipeline:
                             await self._wait_for_playback_permission(ws, token)
                             if not self._valid(token) or not ws.committed:
                                 return
-                            await session.start()
+                            session = await start_tts_session(session)
+                            self._bind_tts_session(ws, session)
                             if warm and getattr(session, "connection_id", None) != warm_connection_id:
                                 # The retained socket disappeared between
                                 # checkout and start(), so this transaction
@@ -792,7 +802,8 @@ class SpeechPipeline:
                                 await self._wait_for_playback_permission(ws, token)
                                 if not self._valid(token) or not ws.committed:
                                     return
-                                await session.start()
+                                session = await start_tts_session(session)
+                                self._bind_tts_session(ws, session)
                                 warm = False
                             ws.timings.setdefault("tts_session_ready", time.monotonic())
                             if ws.timings.get("replacement_detected"):
@@ -843,7 +854,8 @@ class SpeechPipeline:
                             await self._wait_for_playback_permission(ws, token)
                             if not self._valid(token) or not ws.committed:
                                 return
-                            await session.start()
+                            session = await start_tts_session(session)
+                            self._bind_tts_session(ws, session)
                             ws.timings["tts_session_ready"] = time.monotonic()
                             sync_turn_timings()
                         await self._wait_for_playback_permission(ws, token)
