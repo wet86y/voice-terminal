@@ -26,7 +26,7 @@ from ..kws.keywords import MAX_WAKE_KEYWORDS
 from ..shadow_agent import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 4
+PRODUCT_SETTINGS_SCHEMA_VERSION = 5
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 90
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -97,6 +97,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
                 config.shadow_agent.experimental_context_gate_enabled,
             ),
         },
+        "tts": {"backend": str(getattr(config.tts, "backend", "minimax"))},
         "speaker": {
             "mode": str(getattr(config.speaker, "mode", "off")),
             "confirm_threshold": float(getattr(config.speaker, "confirm_threshold", 0.50)),
@@ -117,7 +118,9 @@ def _legacy_speaker_scale(value: Mapping[str, Any]) -> bool:
     marker = value.get("schema_version")
     if not isinstance(marker, int) or isinstance(marker, bool):
         return False
-    if marker >= PRODUCT_SETTINGS_SCHEMA_VERSION:
+    # Version 4 already migrated the speaker scale.  The TTS field added in
+    # version 5 must not reset a user's version 4 thresholds a second time.
+    if marker >= 4:
         return False
     speaker = value.get("speaker")
     if not isinstance(speaker, Mapping):
@@ -136,7 +139,7 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     result = deepcopy(defaults)
     if not isinstance(value, Mapping):
         return result
-    for section in ("wake", "silence", "shadow", "speaker"):
+    for section in ("wake", "silence", "shadow", "speaker", "tts"):
         raw = value.get(section)
         if isinstance(raw, Mapping):
             result[section].update({key: raw[key] for key in result[section] if key in raw})
@@ -186,6 +189,8 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     shadow = result["shadow"]
     if type(shadow.get("experimental_context_gate_enabled")) is not bool:
         shadow["experimental_context_gate_enabled"] = defaults["shadow"]["experimental_context_gate_enabled"]
+    if result["tts"].get("backend") not in {"minimax", "cosyvoice"}:
+        result["tts"]["backend"] = "minimax"
     speaker = result["speaker"]
     if speaker.get("mode") not in {"off", "observe", "filter"}:
         speaker["mode"] = defaults["speaker"]["mode"]
@@ -218,13 +223,14 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     schema_version = value.get("schema_version")
     if schema_version is not None and (
         type(schema_version) is not int
-        or schema_version not in {1, 2, 3, PRODUCT_SETTINGS_SCHEMA_VERSION}
+        or schema_version not in {1, 2, 3, 4, PRODUCT_SETTINGS_SCHEMA_VERSION}
     ):
         invalid = True
     for section_name, fields in (
         ("wake", ("enabled", "keyword", "keyword_label", "keywords", "sensitivity")),
         ("silence", ("seconds",)),
         ("shadow", ("experimental_context_gate_enabled",)),
+        ("tts", ("backend",)),
         ("speaker", ("mode", "confirm_threshold", "continuity_threshold")),
     ):
         section = value.get(section_name)
@@ -255,6 +261,8 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
                 invalid = invalid or type(candidate) is not int or not MIN_SILENCE_SECONDS <= candidate <= MAX_SILENCE_SECONDS
             elif section_name == "shadow" and field == "experimental_context_gate_enabled":
                 invalid = invalid or type(candidate) is not bool
+            elif section_name == "tts" and field == "backend":
+                invalid = invalid or candidate not in {"minimax", "cosyvoice"}
             elif section_name == "speaker" and field == "mode":
                 invalid = invalid or candidate not in {"off", "observe", "filter"}
             elif section_name == "speaker" and field in {"confirm_threshold", "continuity_threshold"}:
@@ -315,6 +323,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     wake = settings.get("wake") if isinstance(settings.get("wake"), Mapping) else {}
     silence = settings.get("silence") if isinstance(settings.get("silence"), Mapping) else {}
     shadow = settings.get("shadow") if isinstance(settings.get("shadow"), Mapping) else {}
+    tts = settings.get("tts") if isinstance(settings.get("tts"), Mapping) else {}
     speaker = settings.get("speaker") if isinstance(settings.get("speaker"), Mapping) else {}
     try:
         seconds = int(silence.get("seconds", getattr(config.agent, "final_silence_ms", 30_000) // 1000))
@@ -380,7 +389,8 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         confirm_threshold=confirm_threshold,
         continuity_threshold=continuity_threshold,
     )
-    return replace(config, wake=next_wake, agent=next_agent, shadow_agent=next_shadow, speaker=next_speaker)
+    next_tts = replace(config.tts, backend=str(tts.get("backend", config.tts.backend)))
+    return replace(config, wake=next_wake, agent=next_agent, shadow_agent=next_shadow, speaker=next_speaker, tts=next_tts)
 
 
 class ProductSettingsStore:
@@ -461,6 +471,19 @@ class ProductSettingsStore:
         # advertising a stale recovery warning after the file is valid.
         self.warnings.clear()
         self._malformed_schema_marker = False
+
+    def save_tts(self, payload: Mapping[str, Any]) -> dict[str, str]:
+        """保存 TTS backend（语音供应方）；调用方先确认本地 Worker 就绪。"""
+        if set(payload) != {"backend"} or payload.get("backend") not in {"minimax", "cosyvoice"}:
+            raise ProductSettingsError("tts.backend 仅接受 minimax 或 cosyvoice。")
+        previous = self._settings["tts"]
+        self._settings["tts"] = {"backend": str(payload["backend"])}
+        try:
+            self._save_settings()
+        except Exception:
+            self._settings["tts"] = previous
+            raise
+        return deepcopy(self._settings["tts"])
 
     @staticmethod
     def _atomic_replace_documents(documents: Mapping[Path, str]) -> None:

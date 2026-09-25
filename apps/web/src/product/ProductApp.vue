@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import type { ReasoningMode, ShadowActivity } from '../types'
+import { workerStatusLabel } from './ttsUi'
 import {
   useProductAdapter,
   type AssignmentSlot,
@@ -12,7 +13,7 @@ import {
 
 const adapter = useProductAdapter()
 const {
-  voice, page: activePage, settingsTab: activeSettingsTab, settings, loading, saving,
+  voice, page: activePage, settingsTab: activeSettingsTab, settings, loading, saving, ttsSwitching, ttsWorker, switchTts,
   connected, replayMode, replayMeta, runtimeState, current, conversationRows, pendingSpeechRows,
   currentTurnLogged, currentTurnSpeechLogged, currentTurnSpeechPending, shadow, latencyMs, latencyRunning, wakeForm,
   maxWakeKeywords, addWakeKeyword, removeWakeKeyword,
@@ -1026,7 +1027,7 @@ function pageLabel() {
       <header class="settings-heading"><div><p class="panel-kicker">应用设置</p><h1>让助手更像你的工作方式</h1><p>设置通过 Voice Server 产品 API 保存；KWS、Persona、最终静默设置在安全边界后于下一次会话或 Episode 生效。</p></div><span class="settings-badge">{{ connected ? '实时后端已连接' : '后端离线 · 可重试' }}</span></header>
       <div v-if="settings.warnings.length" class="model-safety"><span>!</span><p>{{ settings.warnings.join(' ') }}</p></div>
       <div class="settings-layout">
-        <nav class="settings-tabs"><button type="button" :class="{ active: activeSettingsTab === 'wake' }" @click="activeSettingsTab = 'wake'"><span>◌</span><div><strong>KWS 唤醒词</strong><small>启动与待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'persona' }" @click="activeSettingsTab = 'persona'"><span>✦</span><div><strong>人格与指令</strong><small>主 LLM 与 Shadow</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'silence' }" @click="activeSettingsTab = 'silence'"><span>◷</span><div><strong>静默等待</strong><small>最终检查与回待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'speaker' }" @click="activeSettingsTab = 'speaker'"><span>♬</span><div><strong>声纹识别</strong><small>可选身份增强</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'models' }" @click="activeSettingsTab = 'models'"><span>◇</span><div><strong>模型管理</strong><small>连接、配置与模型池</small></div></button></nav>
+        <nav class="settings-tabs"><button type="button" :class="{ active: activeSettingsTab === 'wake' }" @click="activeSettingsTab = 'wake'"><span>◌</span><div><strong>KWS 唤醒词</strong><small>启动与待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'persona' }" @click="activeSettingsTab = 'persona'"><span>✦</span><div><strong>人格与指令</strong><small>主 LLM 与 Shadow</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'silence' }" @click="activeSettingsTab = 'silence'"><span>◷</span><div><strong>静默等待</strong><small>最终检查与回待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'tts' }" @click="activeSettingsTab = 'tts'"><span>♫</span><div><strong>TTS 语音</strong><small>远程与本地切换</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'speaker' }" @click="activeSettingsTab = 'speaker'"><span>♬</span><div><strong>声纹识别</strong><small>可选身份增强</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'models' }" @click="activeSettingsTab = 'models'"><span>◇</span><div><strong>模型管理</strong><small>连接、配置与模型池</small></div></button></nav>
 
         <article class="settings-panel panel">
           <template v-if="activeSettingsTab === 'wake'">
@@ -1049,6 +1050,15 @@ function pageLabel() {
             <header><p class="panel-kicker">最终静默检查</p><h2>留出恰当的等待时间</h2><p>只控制最终静默检查和回到 KWS 的窗口；Smart Turn 的约 1.4 秒短语结束判断保持只读，不会被设置页修改。</p></header>
             <div class="silence-control"><span>最终静默等待</span><div><input v-model.number="silenceSeconds" min="5" max="90" type="number"><b>秒</b></div><input v-model.number="silenceSeconds" min="5" max="90" step="1" type="range"><div class="silence-scale"><small>5 秒</small><small>默认 30 秒</small><small>90 秒</small></div></div><div class="info-callout"><span>i</span><p>Smart Turn 短语结束阈值：{{ settings.silence.smart_turn_hard_silence_ms }} ms（只读）。保存后在下一次 Episode 创建时使用新的最终静默窗口。</p></div>
             <footer><button class="save-button" type="button" :disabled="saving" @click="saveSilence">{{ saving ? '正在保存…' : '保存最终静默设置' }}</button></footer>
+          </template>
+
+          <template v-else-if="activeSettingsTab === 'tts'">
+            <header><p class="panel-kicker">TTS 语音合成</p><h2>选择语音供应方</h2><p>Voice Server 负责文本分段、播放和中断结算。这里的选择从下一条语音生效；当前回复由原供应方完成。</p></header>
+            <div class="tts-backend-options">
+              <button type="button" :class="{ active: settings.tts.backend === 'minimax' }" :disabled="ttsSwitching" @click="switchTts('minimax')"><strong>MiniMax · 远程</strong><small>使用当前已配置的 MiniMax 语音模型</small></button>
+              <button type="button" :class="{ active: settings.tts.backend === 'cosyvoice' }" :disabled="ttsSwitching" @click="switchTts('cosyvoice')"><strong>CosyVoice3 · 本地</strong><small>使用本机模型与独立 Worker（工作进程）</small></button>
+            </div>
+            <div class="info-callout"><span>i</span><p>当前选择：{{ settings.tts.backend === 'cosyvoice' ? '本地 CosyVoice3' : '远程 MiniMax' }}。Worker 状态：{{ workerStatusLabel(ttsWorker, ttsSwitching) }}。<span v-if="ttsWorker?.message">{{ ttsWorker.message }}</span></p></div>
           </template>
 
           <template v-else-if="activeSettingsTab === 'speaker'">

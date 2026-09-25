@@ -97,6 +97,7 @@ def test_real_playback_start_emits_one_observational_event():
             kind="formal",
             emotion_requested="calm",
             emotion_applied="calm",
+            tts_backend="minimax",
             workspace=SimpleNamespace(
                 playback_key="key_a", playback_started=False, generation=7, timings={},
             ),
@@ -123,6 +124,7 @@ def test_real_playback_start_emits_one_observational_event():
             "kind": "formal",
             "emotion_requested": "calm",
             "emotion_applied": "calm",
+            "provider": "minimax",
         }
 
     asyncio.run(scenario())

@@ -32,6 +32,8 @@ from ..kws.service import KwsWorker
 from ..providers.deepseek import DeepSeekClient
 from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
+from ..tts.cosyvoice_runtime import CosyVoiceRuntimeError, CosyVoiceWorkerManager
+from ..tts.router import TtsBackendRouter
 from ..agent.tool_registry import FileTools, WebSearchTools
 from ..shadow_agent import ShadowAgentComponent, ShadowContextProjector, ShadowEvent
 from ..shadow_agent.component import ShadowAgentSession
@@ -113,7 +115,12 @@ class SessionRuntime:
         self.vad: FsmnVadDetector | None = None
         self.asr: AsrWorkerClient | None = None
         self.llm: DeepSeekClient | None = None
-        self.tts: MiniMaxTtsClient | None = None
+        project_root = Path(__file__).resolve().parents[2]
+        self.cosyvoice_worker = CosyVoiceWorkerManager(
+            project_root=project_root, model_dir=config.model_dir / "cosyvoice3-0.5b-2512",
+        )
+        self.tts: TtsBackendRouter | None = None
+        self._tts_setting_lock = asyncio.Lock()
         self.shadow_search_tools: WebSearchTools | None = None
         self.shadow_component: ShadowAgentComponent | None = None
         self.shadow_session: ShadowAgentSession | DshShadowAgentSession | None = None
@@ -856,8 +863,9 @@ class SessionRuntime:
             self.state.set_service("web_search", "DISABLED")
 
         minimax_key = self._api_key(self.config.tts.api_key_env)
+        remote_tts = None
         if minimax_key:
-            self.tts = MiniMaxTtsClient(
+            remote_tts = MiniMaxTtsClient(
                 base_url=self.config.tts.base_url,
                 websocket_path=self.config.tts.websocket_path,
                 model=self.config.tts.model,
@@ -882,27 +890,33 @@ class SessionRuntime:
                 sentence_tick_ms=self.config.tts.sentence_tick_ms,
                 first_clause_timeout_ms=self.config.tts.first_clause_timeout_ms,
             )
-            self.state.current.update(
-                tts_transport=self.config.tts.transport,
-                tts_scheduling=self.config.tts.effective_scheduling,
+        self.tts = TtsBackendRouter(remote=remote_tts, worker=self.cosyvoice_worker,
+                                    backend=self.config.tts.backend)
+        self.state.current.update(
+            tts_transport=self.tts.transport,
+            tts_scheduling=getattr(self.tts.current_client(), "effective_scheduling", "auto"),
+        )
+        try:
+            if self.config.tts.output_format.lower() != "pcm":
+                raise RuntimeError("TTS 播放器需要 PCM 输出。")
+            if self.config.tts.backend == "cosyvoice" and self.config.tts.sample_rate != 32000:
+                raise RuntimeError("CosyVoice 模式需要 32 kHz 播放器。")
+            self.player = PcmPlayer(
+                sample_rate=self.config.tts.sample_rate,
+                channels=1,
+                output_device=self.config.audio.output_device,
+                device_latency_ms=self.config.audio.device_latency_ms,
+                on_audio_rendered=(self.audio_processor.push_reverse if self.audio_processor else None),
             )
-            try:
-                if self.config.tts.output_format.lower() != "pcm":
-                    raise RuntimeError("TTS output_format 必须为 pcm，当前播放器不自动回退 MP3。")
-                self.player = PcmPlayer(
-                    sample_rate=self.config.tts.sample_rate,
-                    channels=1,
-                    output_device=self.config.audio.output_device,
-                    device_latency_ms=self.config.audio.device_latency_ms,
-                    on_audio_rendered=(self.audio_processor.push_reverse if self.audio_processor else None),
-                )
-                self.player.start()
-                self.state.current["playback_diagnostics"] = self.player.diagnostics
-                self.state.set_service("tts", "READY")
-            except Exception as exc:
-                self._record_error("tts", str(exc))
-        else:
-            self._record_error("tts", f"未配置 {self.config.tts.api_key_env}")
+            self.player.start()
+            self.state.current["playback_diagnostics"] = self.player.diagnostics
+            if self.config.tts.backend == "cosyvoice":
+                await self.cosyvoice_worker.ensure_ready()
+            elif remote_tts is None:
+                raise RuntimeError(f"未配置 {self.config.tts.api_key_env}")
+            self.state.set_service("tts", "READY")
+        except Exception as exc:
+            self._record_error("tts", str(exc))
 
         if self.config.audio.sample_rate != 16000 or self.config.audio.channels != 1 or self.config.audio.sample_format != "int16":
             raise ValueError("session runtime requires 16 kHz mono int16 capture")
@@ -1562,7 +1576,7 @@ class SessionRuntime:
             self.dsh.bridge_hub.unregister(shadow_session)
             await shadow_session.close()
         if self.tts is not None:
-            await self.tts.close()
+            await self.tts.shutdown()
         if self.llm is not None:
             await self.llm.close()
         if self.audio_processor is not None:
@@ -1586,6 +1600,42 @@ class SessionRuntime:
         self.shadow_search_tools = None
         self.shadow_component = None
         self.shadow_session = None
+
+    async def set_tts_backend(self, backend: str, store: ProductSettingsStore) -> dict[str, Any]:
+        """原子切换后续语音事务；正在运行的事务保留原 provider。"""
+        if backend not in {"minimax", "cosyvoice"}:
+            raise ValueError("tts.backend 仅接受 minimax 或 cosyvoice。")
+        async with self._tts_setting_lock:
+            router = self.tts
+            if router is None:
+                raise CosyVoiceRuntimeError("TTS 运行时尚未初始化。")
+            previous = router.backend
+            if backend == "cosyvoice" and (self.player is None or self.player.sample_rate != 32000):
+                raise CosyVoiceRuntimeError("CosyVoice 模式需要已启动的 32 kHz 播放器。")
+            if backend == "minimax" and router.remote is None:
+                raise CosyVoiceRuntimeError(f"未配置 {self.config.tts.api_key_env}，无法切换到 MiniMax。")
+            if backend == "cosyvoice":
+                await self.cosyvoice_worker.ensure_ready()
+            try:
+                saved = await asyncio.to_thread(store.save_tts, {"backend": backend})
+                await router.switch(backend)
+            except Exception:
+                if store.settings_only()["tts"]["backend"] != previous:
+                    await asyncio.to_thread(store.save_tts, {"backend": previous})
+                if backend == "cosyvoice" and previous != "cosyvoice":
+                    await self.cosyvoice_worker.stop()
+                raise
+            self.config = replace(self.config, tts=replace(self.config.tts, backend=backend))
+            store.config = self.config
+            self.state.current.update(
+                tts_transport=router.transport,
+                tts_scheduling=getattr(router.current_client(), "effective_scheduling", "auto"),
+            )
+            self.state.set_service("tts", "READY" if router.current_client() is not None else "ERROR")
+            await self.bus.publish(self.snapshot())
+            return {"settings": {"tts": saved}, "effective_from": "next_speech",
+                    "pending": False, "worker": self.cosyvoice_worker.status(),
+                    "message": "TTS 供应方已切换，下一条语音生效。"}
 
     async def _wake_shadow(self) -> str:
         if self.shadow_session is None or not self.shadow_session.available:
@@ -1806,9 +1856,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     @app.get("/api/v1/product/snapshot")
     async def get_product_snapshot() -> dict[str, Any]:
         runtime_payload = sanitize_runtime_snapshot(runtime.snapshot().payload)
+        runtime_payload["tts_worker"] = runtime.cosyvoice_worker.status()
         conversation = runtime_payload.pop("conversation", {"recent": [], "current": {}})
         settings = product_settings.snapshot() if product_settings is not None else {
-            "schema_version": 3,
+            "schema_version": 5,
             "wake": {
                 "enabled": runtime.config.wake.enabled,
                 "keyword": runtime.config.wake.keyword,
@@ -1825,6 +1876,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     runtime.config.shadow_agent.experimental_context_gate_enabled
                 ),
             },
+            "tts": {"backend": runtime.config.tts.backend},
             "speaker": {
                 "mode": runtime.config.speaker.mode,
                 "confirm_threshold": runtime.config.speaker.confirm_threshold,
@@ -1959,6 +2011,32 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         if product_settings is None:
             raise HTTPException(status_code=404, detail="产品设置服务尚未启用。")
         return product_settings
+
+    @app.get("/api/v1/tts/status")
+    async def get_tts_status() -> dict[str, Any]:
+        return {"backend": runtime.tts.backend if runtime.tts else runtime.config.tts.backend,
+                "worker": runtime.cosyvoice_worker.status()}
+
+    @app.put("/api/v1/product/settings/tts")
+    async def update_product_tts(body: dict[str, Any]) -> dict[str, Any]:
+        store = product_store_or_404()
+        if set(body) != {"backend"} or body.get("backend") not in {"minimax", "cosyvoice"}:
+            raise HTTPException(status_code=422, detail={
+                "code": "TTS_BACKEND_INVALID", "message": "tts.backend 仅接受 minimax 或 cosyvoice。",
+            })
+        try:
+            return await runtime.set_tts_backend(str(body["backend"]), store)
+        except CosyVoiceRuntimeError as exc:
+            raise HTTPException(status_code=503, detail={
+                "code": "TTS_WORKER_UNAVAILABLE" if body["backend"] == "cosyvoice" else "TTS_BACKEND_UNAVAILABLE",
+                "message": str(exc),
+                "backend": runtime.tts.backend if runtime.tts else runtime.config.tts.backend,
+                "worker": runtime.cosyvoice_worker.status(),
+            }) from exc
+        except ProductSettingsError as exc:
+            raise HTTPException(status_code=422, detail={
+                "code": "TTS_SETTINGS_INVALID", "message": str(exc),
+            }) from exc
 
     @app.put("/api/v1/product/settings/wake")
     async def update_product_wake(body: dict[str, Any]) -> dict[str, Any]:

@@ -10,6 +10,18 @@ import { readFileSync } from 'node:fs'
 // so it needs a direct source-level guard.
 const productCssSource = readFileSync(new URL('../ui-demo/ui-demo.css', import.meta.url), 'utf8')
 
+describe('TTS provider（语音供应方）切换', () => {
+  it('shows both choices, blocks repeat clicks, and reports Worker（工作进程）状态', () => {
+    expect(productAppSource).toContain("switchTts('minimax')")
+    expect(productAppSource).toContain("switchTts('cosyvoice')")
+    expect(productAppSource).toContain(':disabled="ttsSwitching"')
+    expect(productAppSource).toContain('workerStatusLabel(ttsWorker, ttsSwitching)')
+    expect(productAdapterSource).toContain('productApi.saveTts(backend)')
+    expect(productAdapterSource).toContain('productApi.ttsStatus()')
+    expect(productAdapterSource).toContain("? { state: 'error', message: messageFromError(error) }")
+  })
+})
+
 describe('project-isolated DSH console', () => {
   it('renders a state-gated console button without changing Shadow controls', () => {
     expect(productAppSource).toContain('class="dsh-console-button"')
