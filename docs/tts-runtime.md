@@ -8,12 +8,10 @@ Voice Server（语音服务）当前固定使用 MiniMax API（在线语音接�
 
 ## 只读状态
 
-`GET /api/v1/tts/status` 返回固定的 `backend: "minimax"`（当前语音后端）和本地 Worker（工作进程）状态。产品快照中的 `runtime.tts_worker`（本地 Worker 状态）保留作诊断信息；正常产品运行不会启动该 Worker。
+`GET /api/v1/tts/status` 返回固定的 `backend: "minimax"`（当前语音后端）和兼容 Worker（工作进程）的诊断状态。产品快照中的 `runtime.tts_worker`（Worker 状态）仅供诊断；正常产品运行不会启动本地 Worker。
 
 模型分配接口保留 `tts_profile_id`（当前 TTS 语音配置 ID）用于读取和恢复现有配置。请求可以省略该字段以沿用已保存的配置；尝试更换时会被拒绝。
 
-## 本地兼容实现
+## 后续支持：本地 TTS
 
-`TtsBackendRouter`（TTS 兼容路由器）、CosyVoice 客户端、Worker（工作进程）和安装脚本仍保留，供本地模型调试完成后重新接入产品运行时。当前产品入口不会启动或切换到该实现。
-
-需要单独调试本地 Worker 时，可在 Windows PowerShell 运行 `scripts/setup-cosyvoice.ps1`。要直接检查兼容 Worker 的 PCM（脉冲编码调制）输出、分段回执和取消行为，可运行 `python -m scripts.probe_cosyvoice`；增加 `--play` 可检查实际播放。
+本地 TTS 属于项目后续支持内容，当前不是受支持的产品能力，不参与正常产品运行，也不提供可依赖的本地安装、启动或播放流程。现有 `TtsBackendRouter`（TTS 兼容路由器）、CosyVoice 客户端和 Worker（工作进程）代码仅作为后续开发基础保留；待本地模型调试和质量验证完成后，再重新接入并补齐面向使用者的支持文档。当前 TTS 始终使用 MiniMax API（在线语音接口），发生故障时报告错误，不回退到本地实现。
