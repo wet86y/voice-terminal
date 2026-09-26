@@ -36,6 +36,6 @@ FunASR（语音识别工具包）的接口允许通过 device（运行设备）�
 
 2026-09-26 保存 `sensevoice=cuda`（SenseVoiceSmall 使用 GPU）并完整重启应用后，`GET /api/v1/product/compute-status`（运行状态 API）报告 SenseVoiceSmall 的 `requested_device=cuda`（请求设备）、`device=cuda`（实际设备）、`service=READY`（服务就绪），内部 FSMN-VAD 也为 `cuda`；分析工作进程健康接口报告两者均就绪且 `load_error=null`（无加载错误）。ASR Worker（自动语音识别工作进程）探针返回 `READY`。这确认应用后端已使用 GPU 设置，不只是独立 Python（编程语言）基准进程使用 GPU。
 
-同一状态快照中 Paraformer 也已配置为 `cuda` 并报告就绪。Voice Server FSMN-VAD、KWS、SmartTurn 和 WeSpeaker 保持 CPU；本机尚未安装 Sherpa-ONNX CUDA 或 ONNX Runtime CUDA 执行提供程序。此应用级检查只验证设备选择和模型加载，不是 CPU/GPU 速度对照；速度对照仍限于上方注明的独立进程与单条音频。
+同一状态快照中 Paraformer 也已配置为 `cuda` 并报告就绪。Voice Server FSMN-VAD 当前选择 CPU，但本机 PyTorch CUDA 后端可用；KWS 保持 CPU 是因为尚未安装 Sherpa-ONNX CUDA，SmartTurn 和 WeSpeaker 保持 CPU 是因为 ONNX Runtime 未提供 CUDA 执行提供程序。此应用级检查只验证设备选择和模型加载，不是 CPU/GPU 速度对照；速度对照仍限于上方注明的独立进程与单条音频。
 
 本机当前安装的是 CPU 版 Sherpa-ONNX 1.13.7 和仅提供 Azure/CPU 执行提供程序的 ONNX Runtime 1.24.3。因此本次实测只覆盖 FunASR/PyTorch CUDA 路径；KWS（关键字唤醒）、SmartTurn（语音结束判断）与 WeSpeaker（声纹识别）的 GPU 后端需先安装可选 GPU 依赖后再验证。
