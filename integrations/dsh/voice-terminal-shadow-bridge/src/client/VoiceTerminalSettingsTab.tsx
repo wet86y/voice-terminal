@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useState, useSyncExternalStore, type ReactNode } from 'react'
 import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { IWorkspaces, WorkspaceSnapshot } from '@deepseek-ai/dsh-api-workspace-controller/client'
-import { Button, IconChevronDownOutline14, IconFolderClose16, Menu } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, IconChevronDownOutlineRegular, IconFolderCloseRegular, Menu } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRuntime, InjectFace } from '@deepseek-ai/dsh-client-ui-slots'
 import type { VoiceTerminalSettings } from '../settings-contract.js'
@@ -113,7 +113,7 @@ function MenuField({ label, description, value, items, selectedId, disabled, onS
             onClick={() => { setOpen(current => !current) }}
           >
             <span className={css.triggerValue}>{value}</span>
-            <IconChevronDownOutline14 className={css.chevron} />
+            <IconChevronDownOutlineRegular className={css.chevron} />
           </Button>
         )}
         items={items}
@@ -225,7 +225,7 @@ export function VoiceTerminalSettingsPage({ settings, workspaces, modelCatalog, 
 
   const workspaceItems = useMemo<readonly MenuEntry[]>(() => workspaceSnapshot.items.map(item => ({
     id: item.workspaceId,
-    icon: <IconFolderClose16 size={16} />,
+    icon: <IconFolderCloseRegular size={16} />,
     label: <ChoiceContent primary={item.title} detail={item.path} />,
   })), [workspaceSnapshot.items])
   const workspaceValue = effectiveWorkspace
