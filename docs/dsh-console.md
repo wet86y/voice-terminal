@@ -17,8 +17,9 @@ Web RPC，或启动第二个长期持有同一 Session 的 DSH 进程。
 .\scripts\setup-dsh.ps1 -ValidateOnly
 ```
 
-setup 会验证固定 source/tag/commit、Node、pnpm 和 CLI，构建 TypeScript Bridge Bundle（插件运行包）与正式
-Shadow preset Bundle（Shadow 预设功能包），用官方 `dsh plugin --profile web add` 安装到项目 profile，
+setup 会验证固定 source/tag/commit、Node、pnpm 和 CLI，构建 TypeScript Bridge Bundle（插件运行包）、
+Wake Tasks Bundle（唤醒任务插件运行包）与正式 Shadow preset Bundle（Shadow 预设功能包），
+用官方 `dsh plugin --profile web add` 安装到项目 profile，
 运行 `dump-config`，并记录 Node Bundle（Node.js 插件运行包）、浏览器插件页、预设功能包的 hash（哈希值）、
 协议版本、公共提示词哈希和受管配置哈希。浏览器插件构建会
 使用临时 staging directory（暂存目录），结束后移除，不保留对固定 DSH source（源码）的修改。`-ValidateOnly`
@@ -83,6 +84,12 @@ DSH 启动后，在设置侧栏“Agent 预设”下方打开独立的 `Voice Te
 时回退到项目默认 `workspace`；专属模型失效时回退到当前 DSH 全局模型。Bridge 会记录回退诊断并在
 该设置页显示提示。新建会话须成功挂接工作区后才会接受语音唤醒；目录创建、注册或挂接失败会拒绝
 本次语音会话启动。
+
+`setup-dsh.ps1`（DSH 插件安装脚本）也会安装独立的
+`voice-terminal-wake-tasks`（语音终端唤醒任务插件）。插件只向 DSH 正式根 Agent（正式根代理）
+提供创建、取消和读取冻结参考的工具；任务规则由 Voice Server（语音服务端）保存和触发。
+用户在 Voice Terminal（语音终端）主设置的“唤醒任务”页查看、修改或移除任务。完整的工具字段、
+循环与服务恢复规则见[连续性底座说明](continuity-foundation.md)（组件 1 与组件 2）。
 
 项目私有运行数据位于 `.runtime/dsh`：
 

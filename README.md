@@ -95,7 +95,7 @@ git diff --check
 ## 文档入口
 
 - [架构与生命周期](docs/architecture.md)
-- [连续性底座：上下文服务与触发器设计](docs/continuity-foundation.md)
+- [连续性底座：上下文衔接与定时唤醒](docs/continuity-foundation.md)
 - [上下文与工具规范](docs/context-and-tools.md)
 - [WebSocket 协议](docs/websocket-protocol.md)
 - [LLM 上下文缓存契约](docs/llm-context-cache-contract.md)

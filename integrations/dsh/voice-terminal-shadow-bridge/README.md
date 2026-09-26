@@ -15,6 +15,23 @@ launch tokens, or ordinary assistant prose to the Voice mailbox.
 The runtime requires `VOICE_DSH_BRIDGE_TOKEN` and `VOICE_DSH_CALLBACK_ORIGIN`.
 Both are supplied only to the project-managed DSH child process.
 
+## Continuity and wake tasks（上下文衔接与唤醒任务）
+
+This Bridge（插件桥接层） works with the separate
+`voice-terminal-wake-tasks`（语音终端唤醒任务插件）. The wake-task plugin exposes
+`schedule_wake`（创建唤醒）, `cancel_wake`（取消唤醒）, and
+`read_wake_reference`（读取冻结参考） to the formal root Agent（正式根代理）. Voice
+Server（语音服务端） owns task persistence（任务持久化） and scheduling（任务调度）;
+this Bridge does not store or schedule jobs.
+
+When a `shadow_agent`（影子代理） wake arrives through `wake.open`（打开唤醒会话接口）,
+the Bridge creates an independent DSH（影子代理宿主） session（会话） and sends the task description together
+with the current continuity document（会话衔接文档）. The frozen task reference is
+not injected; the DSH Agent（影子代理） reads it only through `read_wake_reference`（读取冻结参考工具）.
+The wake-task lifecycle, Voice Terminal task-management page（唤醒任务管理页）, and
+recovery behavior are documented in
+[continuity foundation](../../../docs/continuity-foundation.md)（连续性底座说明）.
+
 The browser half registers an independent Voice Terminal settings page（独立设置页面）
 in the DSH Settings sidebar（设置侧栏）, after Agent Presets（Agent 预设）. Its
 workspace menu（工作区菜单） lists registered DSH workspaces and does not
