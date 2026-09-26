@@ -9,7 +9,7 @@ const ts = await import(pathToFileURL(typescriptPath).href)
 const outputRoot = resolve(process.argv[2] ?? resolve(repo, '.runtime/dsh/bundles/voice-terminal-shadow-bridge'))
 const commonPromptPath = resolve(repo, 'config/shadow_agent/instructions.md')
 const dshRulesPath = resolve(repo, 'config/dsh/shadow-agent.rules.md')
-for (const sourceName of ['index.ts', 'settings.ts', 'settings-contract.ts']) {
+for (const sourceName of ['index.ts', 'plugin.ts', 'settings.ts', 'settings-contract.ts']) {
   const sourcePath = resolve(here, 'src', sourceName)
   const outputPath = resolve(outputRoot, 'lib', sourceName.replace(/\.ts$/u, '.js'))
   const source = await readFile(sourcePath, 'utf8')

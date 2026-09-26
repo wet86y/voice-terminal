@@ -1,21 +1,23 @@
-# 项目隔离的 DSH 基线
+# 项目 DSH 基线
 
-本目录定义 Voice Terminal 使用的 DeepSeek Harness（DSH）可审计基线。当前锁定候选版
-`0.1.5-rc.2`（tag `dsh-v0.1.5-rc.2`，commit
-`fb2c4b9e698e30edb738bca4cf0618587db7d203`）。DSH 仍是 developer preview；升级必须显式
-修改锁文件、复核许可证与预设，并重新运行测试，绝不追踪浮动版本。
+Voice Terminal 使用的 DeepSeek Harness（DSH，DeepSeek 开发框架）固定为预发布版
+`dsh-v0.1.7-rc.2`，提交号为
+`477b4f420553e8a52c2fbccc464d7561b239c443`。升级必须显式更新锁定文件、许可证快照和回归检查，
+不追踪浮动版本。
 
-`scripts/setup-dsh.ps1` 将官方源码和项目专属 DSH_HOME 安装到 Git 忽略的
-`.runtime/dsh/`。它不会读取或写入用户的 `~/.dsh`。受管 Web 进程只监听
-`127.0.0.1:3081`，由 Voice Server 启停；`3080` 保留给已有的全局 DSH。不要把项目端口暴露到局域网、公网或反向代理。
+运行 `scripts/setup-dsh.ps1` 安装或修复项目运行时，使用
+`scripts/setup-dsh.ps1 -ValidateOnly` 检查安装状态。官方源码和项目专属 DSH_HOME（DSH 数据目录）
+位于 Git 忽略的 `.runtime/dsh/`；该数据目录与用户级 `~/.dsh` 隔离。升级时保留项目设置和会话数据，
+并按安装脚本流程备份后再启动新版本。
 
-当前 `shadow-agent` 是隔离验证预设，不是正式 Python Shadow 会话的实时镜像。它只装载
-官方内置的文件搜索、Web 搜索/抓取、UI 提问、原生工具展示和基础压缩组件；没有文件写入、
-Shell、代码执行、任务、子代理、Skills、MCP、Hooks 或第三方/自定义插件。
+项目 DSH Web Host（DSH 网页服务）仅监听 `127.0.0.1:3081`，由 Voice Server（语音服务）管理。
+打开 Voice Terminal 页面 `http://127.0.0.1:5173/`，再使用顶栏的 DSH 控制台入口取得一次性访问地址；
+直接访问 3081 不带 launch token（临时访问令牌）时不能完成网页授权。不要收藏、记录或分享带
+`?token=` 的完整地址。
 
-首次进入控制台后选择本仓库根目录作为 workspace，创建专用会话，并发送：
+`voice-terminal-shadow-bridge`（语音终端插件桥接层）按 DSH v0.1.7 的公开插件接口构建。该版本使用
+`configForms`（设置表单服务）提供插件设置页面，不再提供旧的 `settingsScope` 接口。页面注册受服务
+生命周期控制，避免服务尚未就绪时插件启动失败。
 
-> 初始化 Voice Terminal Shadow 验证会话。只检查当前预设、可见工具和只读边界，不执行项目修改。
-
-源码：<https://github.com/deepseek-ai/deepseek-harness>
-许可证快照：`licenses/LICENSE` 与 `licenses/THIRD_PARTY_NOTICES.md`。
+完整的安装、设置、运行和故障说明见 [`docs/dsh-console.md`](../../docs/dsh-console.md)。许可证快照位于
+`licenses/`。

@@ -1,5 +1,6 @@
 import { mkdir } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import type { Config } from './index.js'
 import type { VoiceTerminalSettings } from './settings-contract.js'
 import { VOICE_TERMINAL_SETTINGS_NAMESPACE } from './settings-contract.js'
 
@@ -11,36 +12,40 @@ async function ensureProjectWorkspace(ctx: any): Promise<any> {
   return existing ?? await ctx.workspaceRegistry.create(path, 'Voice Terminal')
 }
 
-/** Register persistent plugin settings and seed the project workspace on first startup. */
-export async function initializeVoiceTerminalSettings(ctx: any): Promise<{
+/** Adapt v0.1.7 settings forms to the bridge's existing get/update contract（适配新设置服务并保留旧接口）. */
+function createSettingsAdapter(ctx: any, config: Config): {
+  get(): VoiceTerminalSettings
+  update(patch: Partial<VoiceTerminalSettings>): Promise<void>
+} {
+  const read = (value: string): string | undefined => value.length === 0 ? undefined : value
+  return {
+    get() {
+      const fallbackNotice = config.fallbackNotice.get()
+      return {
+        workspaceId: read(config.workspaceId.get()),
+        defaultWorkspaceId: read(config.defaultWorkspaceId.get()),
+        provider: read(config.provider.get()),
+        model: read(config.model.get()),
+        reasoningEffort: read(config.reasoningEffort.get()),
+        fallbackNotice: fallbackNotice === 'workspace-unavailable'
+          || fallbackNotice === 'model-unavailable'
+          || fallbackNotice === 'reasoning-unavailable'
+          ? fallbackNotice
+          : undefined,
+      }
+    },
+    update(patch) {
+      return ctx.settings.update(VOICE_TERMINAL_SETTINGS_NAMESPACE, patch)
+    },
+  }
+}
+
+/** Seed the project workspace on first startup using the public settings service（首次启动时登记项目工作区）. */
+export async function initializeVoiceTerminalSettings(ctx: any, config: Config): Promise<{
   readonly settings: any
   readonly defaultWorkspace: any
 }> {
-  const internal = ctx.loader?.internal
-  if (internal === undefined || typeof internal.import !== 'function') {
-    throw new Error('DSH loader internal import service is unavailable for the settings schema')
-  }
-  const schemaModuleBase = typeof ctx.baseUrl === 'string' && ctx.baseUrl.length > 0
-    ? ctx.baseUrl
-    : new URL('./settings.js', import.meta.url).href
-  const schemaModule = await internal.import(
-    '@deepseek-ai/schemastery',
-    schemaModuleBase,
-    {},
-  ) as { default?: any }
-  const z = schemaModule.default
-  if (z === undefined || typeof z.object !== 'function') {
-    throw new Error('DSH schemastery module did not expose its default schema builder')
-  }
-  const schema = z.object({
-    workspaceId: z.string(),
-    defaultWorkspaceId: z.string(),
-    provider: z.string(),
-    model: z.string(),
-    reasoningEffort: z.string(),
-    fallbackNotice: z.string(),
-  })
-  const settings = ctx.settings.register(VOICE_TERMINAL_SETTINGS_NAMESPACE, schema)
+  const settings = createSettingsAdapter(ctx, config)
   const defaultWorkspace = await ensureProjectWorkspace(ctx)
   const current = settings.get() as VoiceTerminalSettings
   const patch: Record<string, string> = {}

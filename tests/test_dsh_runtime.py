@@ -58,6 +58,38 @@ class DshRuntimeTests(unittest.TestCase):
         self.assertIn("token=[REDACTED]", rendered)
         self.assertNotIn("secret-value", rendered)
 
+    def test_profile_patch_validation_keeps_persisted_plugin_settings(self) -> None:
+        """Profile validation accepts persisted settings beside managed rows（允許受管项外的持久设置）."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.yml"
+            managed = root / "managed.yml"
+            source.write_text(
+                "- id: agent-presets\n  config:\n    default: shadow-agent\n"
+                "\n- id: session-log-deepseek\n  disabled: true\n",
+                encoding="utf-8",
+            )
+            managed.write_text(
+                source.read_text(encoding="utf-8")
+                + "\n- id: voice-terminal-shadow-bridge\n  config:\n    workspaceId: saved-workspace\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(DshRuntimeManager._profile_patch_preserves_managed_defaults(source, managed))
+
+    def test_profile_patch_validation_requires_managed_defaults(self) -> None:
+        """Profile validation rejects missing managed rows（缺失受管配置时校验失败）."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.yml"
+            managed = root / "managed.yml"
+            source.write_text(
+                "- id: agent-presets\n  config:\n    default: shadow-agent\n"
+                "\n- id: session-log-deepseek\n  disabled: true\n",
+                encoding="utf-8",
+            )
+            managed.write_text("- id: unrelated\n  enabled: true\n", encoding="utf-8")
+            self.assertFalse(DshRuntimeManager._profile_patch_preserves_managed_defaults(source, managed))
+
 
 class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_port_owner_is_never_attached(self) -> None:

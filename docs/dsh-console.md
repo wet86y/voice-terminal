@@ -5,8 +5,8 @@ Voice Terminal 内置第一方 DSH Bundle `voice-terminal-shadow-bridge`。当
 已经切换为 `dsh`，`native` 仅作为显式人工回滚后端保留。后端在新 Voice Session 创建时固定，同一 Session不热切换，也不在 DSH
 故障时自动转交 native。
 
-固定基线为 `dsh-v0.1.5-rc.2` / commit
-`fb2c4b9e698e30edb738bca4cf0618587db7d203`。Bundle 只使用该版本的公开 Cordis、Web Host、Agent、
+固定基线为 `dsh-v0.1.7-rc.2` / commit
+`477b4f420553e8a52c2fbccc464d7561b239c443`。Bundle 只使用该版本的公开 Cordis、Web Host、Agent、
 Session、Tool 和事件扩展点；不得修改 `.runtime/dsh/source`、解析私有 Session 文件、依赖私有
 Web RPC，或启动第二个长期持有同一 Session 的 DSH 进程。
 
@@ -26,6 +26,24 @@ Node Bundle（Node.js 插件运行包）与浏览器插件页的 hash（哈希�
 运行时 freshness check（新鲜度校验）只覆盖 Bridge 的 `src/`、`package.json`、`build.mjs`、`cordis.patch.yml`
 和 `scripts/build-dsh-client.mjs`（浏览器构建脚本）；README、`test/` 目录和 source map（源码映射）变更不会阻止启动。
 产物 hash（哈希值）只覆盖 DSH 实际加载的包清单、Cordis patch（配置补丁）和 JavaScript 运行文件，不包含声明文件或文档。
+
+## 打开 DSH 界面
+
+先启动 Voice Terminal 项目服务，再打开 `http://127.0.0.1:5173/`，使用产品顶栏的 DSH 控制台入口。
+该入口会向 Voice Server 请求一次性 launch URL（启动地址），并在 DSH 界面就绪后打开控制台。
+DSH Web Host（网页服务）固定监听 `127.0.0.1:3081`；直接访问该端口时，必须使用受管入口生成的临时访问令牌。
+不要收藏、复制给他人或写入日志带有 `?token=` 的完整地址。
+
+若界面显示 `Failed to load plugins`（插件加载失败），并提示
+`@voice-terminal/dsh-shadow-bridge: pending`（插件等待服务），先确认 DSH 设置页服务已经就绪，再执行以下校验：
+
+```powershell
+.\scripts\setup-dsh.ps1 -ValidateOnly
+```
+
+该命令确认 Node Bundle（Node.js 插件运行包）和浏览器插件页与锁定版本一致。v0.1.7-rc.2 使用 `configForms`（设置表单服务）；旧版
+`settingsScope` 接口已移除。Bridge（插件桥接层）通过 `configForms.whileServed(...)`
+（仅在设置服务可用时注册页面）延迟注册设置页，因此不应把 `settingsScope` 当作回退接口。
 
 ## Voice Terminal 插件设置
 

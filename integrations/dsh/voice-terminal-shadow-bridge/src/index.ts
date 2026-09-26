@@ -1,5 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { Volatile } from '@deepseek-ai/cordis'
 import { GENERATED_SHADOW_PROMPT } from './generated-prompt.js'
 import { createAttachedVoiceSession, initializeVoiceTerminalSettings } from './settings.js'
 
@@ -13,8 +14,22 @@ export const inject = [
 export const BRIDGE_PROTOCOL_VERSION = '1.0'
 
 export interface Config {
+  /** HTTP route prefix（HTTP 路由前缀）. */
   readonly routePrefix: string
+  /** Maximum request body size（请求体最大字节数）. */
   readonly maxBodyBytes: number
+  /** Selected workspace id（所选工作区标识）. */
+  readonly workspaceId: Volatile<string>
+  /** Project fallback workspace id（项目备用工作区标识）. */
+  readonly defaultWorkspaceId: Volatile<string>
+  /** Model provider id（模型供应方标识）. */
+  readonly provider: Volatile<string>
+  /** Model id（模型标识）. */
+  readonly model: Volatile<string>
+  /** Reasoning effort id（推理强度标识）. */
+  readonly reasoningEffort: Volatile<string>
+  /** Settings fallback notice（设置回退提示）. */
+  readonly fallbackNotice: Volatile<string>
 }
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
@@ -489,7 +504,7 @@ export function apply(ctx: any, config: Config): void {
   if (!config.routePrefix.startsWith('/') || config.routePrefix.endsWith('/')) throw new Error('invalid routePrefix')
   const bindings = new Map<string, Binding>()
   let startupError: unknown
-  const settingsReady = initializeVoiceTerminalSettings(ctx).catch((error) => {
+  const settingsReady = initializeVoiceTerminalSettings(ctx, config).catch((error) => {
     startupError = error
     console.error('[voice-shadow-bridge] plugin settings or default workspace initialization failed', error)
     throw error
