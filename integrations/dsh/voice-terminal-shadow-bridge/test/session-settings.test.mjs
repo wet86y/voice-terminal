@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createAttachedVoiceSession } from '../../../../.runtime/dsh/bundles/voice-terminal-shadow-bridge-test/lib/index.js'
+import { createAttachedVoiceSession, inject } from '../../../../.runtime/dsh/bundles/voice-terminal-shadow-bridge-test/lib/index.js'
+
+test('Bridge 的 inject（依赖注入声明）包含设置代码调用的 llm（模型服务）', () => {
+  assert.ok(inject.includes('llm'))
+})
 
 function fixture({ selection = {}, selectedWorkspace, attachmentError } = {}) {
   const operations = []

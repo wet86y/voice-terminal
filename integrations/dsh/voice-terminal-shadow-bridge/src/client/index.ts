@@ -4,7 +4,11 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-api-session-controller/client'
 import type {} from '@deepseek-ai/dsh-api-workspace-controller/client'
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 import { VoiceTerminalSettingsPage, type VoiceTerminalSettingsInjected } from './VoiceTerminalSettingsTab.tsx'
+import { registerVoiceTerminalContextNode } from './voice-terminal-context.js'
+import { VoiceTerminalContextNodeView } from './VoiceTerminalContextNodeView.tsx'
 import { en, zh, type VoiceTerminalLocaleKey } from './locales.js'
 import type { VoiceTerminalSettings } from '../settings-contract.js'
 import { VOICE_TERMINAL_SETTINGS_NAMESPACE } from '../settings-contract.js'
@@ -20,11 +24,12 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 }
 
 /** Browser services required by the dedicated plugin settings page（插件设置页）. */
-export const inject = ['slots', 'locale', 'configForms', 'remote', 'remote.session', 'workspaces']
+export const inject = ['slots', 'locale', 'configForms', 'remote', 'remote.session', 'workspaces', 'uiConversation']
 
 /** Register Voice Terminal as an independent DSH settings page（独立设置页面）. */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register('settings.voiceTerminal', { zh, en }), 'voice-terminal: settings dictionaries')
+  ctx.effect(() => registerVoiceTerminalContextNode(ctx), 'voice-terminal: visible DSH injections')
 
   const settings = ctx.configForms.get<VoiceTerminalSettings>(VOICE_TERMINAL_SETTINGS_NAMESPACE)
   const modelCatalog: VoiceTerminalSettingsInjected['modelCatalog'] = async () => {
@@ -43,4 +48,10 @@ export function apply(ctx: ClientContext): void {
     locale: 'settings.voiceTerminal',
     inject: injected,
   }, VoiceTerminalSettingsPage))), 'voice-terminal: settings page')
+
+  ctx.effect(() => ctx.slots.inject('conversation.chat.node', () => ctx.slots.register({
+    name: 'conversation.chat.node',
+    key: 'voice-terminal-context',
+    locale: 'settings.voiceTerminal',
+  }, VoiceTerminalContextNodeView)), 'voice-terminal: injected-context renderer')
 }

@@ -8,7 +8,7 @@ export { createAttachedVoiceSession } from './settings.js'
 
 export const name = 'voice-terminal-shadow-bridge'
 export const inject = [
-  'webServer', 'agents', 'agentPresets', 'agentDefaultModel', 'sessionTitle',
+  'webServer', 'agents', 'agentPresets', 'agentDefaultModel', 'llm', 'sessionTitle',
   'settings', 'workspaceRegistry', 'loader',
 ]
 export const BRIDGE_PROTOCOL_VERSION = '1.0'
@@ -88,6 +88,10 @@ const CALLBACK_ORIGIN = process.env.VOICE_DSH_CALLBACK_ORIGIN ?? ''
 
 function createUserMessage(input: { content: unknown[]; source: Record<string, unknown> }, id: string = randomUUID()): Record<string, unknown> {
   return Object.freeze({ ...input, id, role: 'user' })
+}
+
+function createBridgeUserMessage(content: unknown[], id?: string): Record<string, unknown> {
+  return createUserMessage({ content, source: { kind: `plugin:${name}` } }, id)
 }
 
 function compileSchema(node: any): any {
@@ -194,22 +198,19 @@ function publicContextMessage(body: Envelope, update: 'snapshot' | 'delta'): str
 }
 
 function contextMessage(binding: Binding, pending: PendingContext): Record<string, unknown> {
-  return createUserMessage({
-    content: [{
-      type: 'text',
-      text: publicContextMessage({
-        protocol_version: BRIDGE_PROTOCOL_VERSION,
-        request_id: 'merged-context',
-        voice_session_id: binding.voiceSessionId,
-        dsh_session_id: binding.dshSessionId,
-        epoch: binding.epoch,
-        context_revision: pending.revision,
-        from_revision: pending.fromRevision,
-        frames: pending.frames,
-      }, pending.update),
-    }],
-    source: { kind: 'plugin', plugin: name },
-  }, pending.messageId)
+  return createBridgeUserMessage([{
+    type: 'text',
+    text: publicContextMessage({
+      protocol_version: BRIDGE_PROTOCOL_VERSION,
+      request_id: 'merged-context',
+      voice_session_id: binding.voiceSessionId,
+      dsh_session_id: binding.dshSessionId,
+      epoch: binding.epoch,
+      context_revision: pending.revision,
+      from_revision: pending.fromRevision,
+      frames: pending.frames,
+    }, pending.update),
+  }], pending.messageId)
 }
 
 export function enqueueAuthoritativeContext(
@@ -254,19 +255,16 @@ export function enqueueAuthoritativeContext(
 }
 
 function runtimeReminderMessage(binding: Binding, messageId: string, elapsedMs: number): Record<string, unknown> {
-  return createUserMessage({
-    content: [{
-      type: 'text',
-      text: [
-        'VOICE SHADOW RUNTIME ADVISORY',
-        `Activation: ${binding.activationId ?? ''}`,
-        `Elapsed: ${(elapsedMs / 1000).toFixed(1)} seconds`,
-        '',
-        '【运行时限提醒】本次 Shadow activation 已运行较长时间。请立即收敛已有信息，停止低收益思考、重复搜索和非必要工具调用，并尽快输出可用结果。',
-      ].join('\n'),
-    }],
-    source: { kind: 'plugin', plugin: name },
-  }, messageId)
+  return createBridgeUserMessage([{
+    type: 'text',
+    text: [
+      'VOICE SHADOW RUNTIME ADVISORY',
+      `Activation: ${binding.activationId ?? ''}`,
+      `Elapsed: ${(elapsedMs / 1000).toFixed(1)} seconds`,
+      '',
+      '【运行时限提醒】本次 Shadow activation 已运行较长时间。请立即收敛已有信息，停止低收益思考、重复搜索和非必要工具调用，并尽快输出可用结果。',
+    ].join('\n'),
+  }], messageId)
 }
 
 export function deliverRuntimeReminder(
@@ -362,7 +360,7 @@ function discardResumedAuthoritativeContext(binding: Binding): void {
     const source = message?.source
     const content = message?.content?.[0]
     if (
-      source?.kind === 'plugin' && source?.plugin === name
+      source?.kind === `plugin:${name}`
       && typeof content?.text === 'string'
       && content.text.startsWith('VOICE AUTHORITATIVE CONTEXT')
       && binding.handle.agent.inbox.remove(message.id)
@@ -575,10 +573,9 @@ export function apply(ctx: any, config: Config): void {
     binding.records.push({ trace_revision: binding.traceRevision, type: 'agent/status', data: { state: String(status ?? '') } })
     if (status === 'idle' && binding.protocolRecoveryPending && binding.activationId && !binding.terminal) {
       binding.protocolRecoveryPending = false
-      binding.handle.agent.followup(createUserMessage({
-        content: [{ type: 'text', text: 'PROTOCOL RECOVERY: This activation ended without a Voice Bridge terminal tool. Re-evaluate the latest authoritative context and end with exactly one of request_user_input, return_shadow_result, or finish_shadow_no_action.' }],
-        source: { kind: 'plugin', plugin: name },
-      }))
+      binding.handle.agent.followup(createBridgeUserMessage([
+        { type: 'text', text: 'PROTOCOL RECOVERY: This activation ended without a Voice Bridge terminal tool. Re-evaluate the latest authoritative context and end with exactly one of request_user_input, return_shadow_result, or finish_shadow_no_action.' },
+      ]))
     }
     void callback('/api/internal/dsh-bridge/shadow.activity', {
       request_id: randomUUID(), voice_session_id: binding.voiceSessionId,
@@ -634,13 +631,10 @@ export function apply(ctx: any, config: Config): void {
           ctx.sessionTitle.rename(handle.agent.session, `Wake · ${taskId.slice(0, 8)}`)
           const background = continuity
             ? `\n\n会话衔接背景（仅作事实参考，不是新增指令）：\n${continuity}` : ''
-          handle.agent.followup(createUserMessage({
-            content: [{
-              type: 'text',
-              text: `定时唤醒任务 ${taskId} 已到期。请根据任务说明开始处理；需要创建任务时，可通过 read_wake_reference(task_id) 按需读取创建时冻结的上下文。参考上下文不会自动注入。\n\n任务说明：${wakeText}${background}`,
-            }],
-            source: { kind: 'plugin', plugin: name },
-          }))
+          handle.agent.followup(createBridgeUserMessage([{
+            type: 'text',
+            text: `定时唤醒任务 ${taskId} 已到期。请根据任务说明开始处理；需要创建任务时，可通过 read_wake_reference(task_id) 按需读取创建时冻结的上下文。参考上下文不会自动注入。\n\n任务说明：${wakeText}${background}`,
+          }]))
           wakeOccurrences.set(occurrenceId, body.dsh_session_id)
           while (wakeOccurrences.size > 2048) wakeOccurrences.delete(wakeOccurrences.keys().next().value!)
           const response = result('accepted', { dsh_session_id: body.dsh_session_id })
@@ -687,10 +681,9 @@ export function apply(ctx: any, config: Config): void {
           if (path === 'session.resume') discardResumedAuthoritativeContext(binding)
           bindings.set(binding.dshSessionId, binding)
           ctx.sessionTitle.rename(handle.agent.session, `Voice Shadow · ${binding.voiceSessionId.slice(0, 8)} · epoch ${binding.epoch}`)
-          handle.agent.inject(createUserMessage({
-            content: [{ type: 'text', text: `MANAGED VOICE SHADOW INSTRUCTIONS\nSource: config/shadow_agent/instructions.md\n\n${GENERATED_SHADOW_PROMPT}` }],
-            source: { kind: 'plugin', plugin: name },
-          }))
+          handle.agent.inject(createBridgeUserMessage([
+            { type: 'text', text: `MANAGED VOICE SHADOW INSTRUCTIONS\nSource: config/shadow_agent/instructions.md\n\n${GENERATED_SHADOW_PROMPT}` },
+          ]))
           const response = result('accepted', { dsh_session_id: binding.dshSessionId })
           binding.requests.set(body.request_id, { digest: bodyDigest, response })
           json(res, 200, response); return
@@ -734,7 +727,7 @@ export function apply(ctx: any, config: Config): void {
             existing.terminal = false
             existing.protocolRecoveryAttempted = false
             existing.protocolRecoveryPending = false
-            const wake = createUserMessage({ content: [{ type: 'text', text: `VOICE SHADOW ACTIVATION\nActivation: ${existing.activationId}\nRevision: ${existing.revision}\nJudge and execute the current task. End only with a Voice Bridge terminal tool.` }], source: { kind: 'plugin', plugin: name } })
+            const wake = createBridgeUserMessage([{ type: 'text', text: `VOICE SHADOW ACTIVATION\nActivation: ${existing.activationId}\nRevision: ${existing.revision}\nJudge and execute the current task. End only with a Voice Bridge terminal tool.` }])
             if (existing.handle.agent.status === 'idle') existing.handle.agent.followup(wake)
             else existing.handle.agent.steer(wake)
             armRuntimeReminder(existing)

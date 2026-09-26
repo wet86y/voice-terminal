@@ -9,7 +9,7 @@ export const inject = bridgeInject
 export interface Config extends BridgeConfig {}
 
 /** Volatile fields are persisted by DSH Settings（volatile 字段由 DSH 设置服务持久化）. */
-export const Config: z<Config> = z.object({
+export const Config = z.object({
   routePrefix: z.string().default('/api/voice-terminal-shadow/v1'),
   maxBodyBytes: z.natural().min(1).default(2_097_152),
   workspaceId: z.string().default('').volatile(),
@@ -18,7 +18,7 @@ export const Config: z<Config> = z.object({
   model: z.string().default('').volatile(),
   reasoningEffort: z.string().default('').volatile(),
   fallbackNotice: z.string().default('').volatile(),
-})
+}) as unknown as z<Config>
 
 /** DSH plugin entry point（DSH 插件入口）. */
 export function apply(ctx: any, config: Config): void {

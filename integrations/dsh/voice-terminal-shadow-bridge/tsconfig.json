@@ -1,12 +1,19 @@
 {
+  "extends": "../../../.runtime/dsh/source/tsconfig.base.json",
   "compilerOptions": {
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "strict": true,
     "noEmit": true,
-    "skipLibCheck": true,
-    "types": ["node"]
+    "composite": false,
+    "incremental": false,
+    "exactOptionalPropertyTypes": false,
+    "noUncheckedIndexedAccess": false,
+    "noImplicitOverride": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/client/**"],
+  "references": [
+    { "path": "../../../.runtime/dsh/source/vendor/cordis" },
+    { "path": "../../../.runtime/dsh/source/vendor/schemastery" }
+  ]
 }

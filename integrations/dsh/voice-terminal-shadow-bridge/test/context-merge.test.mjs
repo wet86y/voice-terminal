@@ -6,6 +6,7 @@ import {
   enqueueAuthoritativeContext,
   stopRuntimeReminder,
 } from '../../../../.runtime/dsh/bundles/voice-terminal-shadow-bridge-test/lib/index.js'
+import { assertV4MessageSources } from '../../../../.runtime/dsh/source/packages/session/session-format-v3-to-v4/src/message-sources.ts'
 
 function fixture() {
   const nextStep = []
@@ -28,7 +29,7 @@ function fixture() {
   }
   const binding = {
     voiceSessionId: 'voice-session', dshSessionId: 'dsh-session', epoch: 1,
-    handle: { agent },
+    handle: { agent }, traceRevision: 0, records: [],
   }
   return { binding, nextStep }
 }
@@ -45,6 +46,22 @@ function envelope(revision, frames, fromRevision = undefined) {
 function textOf(message) {
   return message.content[0].text
 }
+
+test('Bridge inbox 消息使用 DSH v4 接受的 source（来源字段）', () => {
+  const { binding, nextStep } = fixture()
+  enqueueAuthoritativeContext(binding, envelope(1, [{ revision: 1 }]), 'snapshot')
+  Object.assign(binding, {
+    state: 'active', terminal: false, activationId: 'activation-1',
+    activationStartedAt: 0, reminderIntervalMs: 10, nextReminderMs: 10,
+  })
+  assert.equal(deliverRuntimeReminder(binding, 10), 'inserted')
+
+  for (const message of nextStep) {
+    assert.doesNotThrow(() => assertV4MessageSources({
+      type: 'user/message', seq: 0, time: 1, surfaceOp: 'append', data: message,
+    }))
+  }
+})
 
 test('updates before claim replace one pending input and preserve every frame', () => {
   const { binding, nextStep } = fixture()
