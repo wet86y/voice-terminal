@@ -45,6 +45,12 @@ DSH Web Host（网页服务）固定监听 `127.0.0.1:3081`；直接访问该端
 `settingsScope` 接口已移除。Bridge（插件桥接层）通过 `configForms.whileServed(...)`
 （仅在设置服务可用时注册页面）延迟注册设置页，因此不应把 `settingsScope` 当作回退接口。
 
+若设置侧栏已出现 `Voice Terminal`，但右侧内容为空，并且浏览器控制台报告 React error #130
+（React 渲染错误：组件类型未定义），请检查 Bridge 使用的 UI icon export（界面图标导出）是否属于锁定 DSH 版本。
+v0.1.7-rc.2 的图标名称已更新；当前页面使用 `IconChevronDownOutlineRegular` 和
+`IconFolderCloseRegular`。修改客户端后需重新运行 `setup-dsh.ps1` 重建插件，并从 Voice Terminal 顶栏入口重新打开
+DSH，以载入新产物和新的 launch token（临时访问令牌）。
+
 ## Voice Terminal 插件设置
 
 DSH 启动后，在设置侧栏“Agent 预设”下方打开独立的 `Voice Terminal` 页面。首次启动时 Bridge（插件桥接层）会在项目根目录确保
