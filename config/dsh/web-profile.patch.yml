@@ -1,4 +1,4 @@
-- id: agent-presets
+- id: agent-preset-registry
   config:
     default: shadow-agent
 

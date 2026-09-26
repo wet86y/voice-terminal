@@ -211,28 +211,32 @@ class DshRuntimeManager:
         if not self.config.profile_patch.is_file():
             raise RuntimeError("DSH Web profile patch 缺失。")
         managed_patch = self.config.home_dir / "profiles" / "web" / "cordis.patch.yml"
-        managed_preset = self.config.home_dir / ".agent-presets" / "shadow-agent" / "agent.cordis.yml"
-        source_preset = self.repo_root / "config" / "dsh" / "agent-presets" / "shadow-agent" / "agent.cordis.yml"
-        managed_preset_meta = managed_preset.with_name("preset.yml")
-        source_preset_meta = source_preset.with_name("preset.yml")
-        for source, managed, label in (
-            (source_preset, managed_preset, "shadow-agent preset"),
-            (source_preset_meta, managed_preset_meta, "shadow-agent preset metadata"),
-        ):
-            if not managed.is_file() or managed.read_bytes() != source.read_bytes():
-                raise RuntimeError(f"DSH_HOME 的 {label} 缺失或已漂移；请运行 scripts\\setup-dsh.ps1。")
         if not self._profile_patch_preserves_managed_defaults(self.config.profile_patch, managed_patch):
             raise RuntimeError("DSH_HOME 的 Web profile patch（Web 配置补丁）缺少正式 Shadow preset（Shadow 预设）或 session-log（会话日志）设置；请运行 scripts\\setup-dsh.ps1。")
+        preset_bundle_dir = self.config.source_dir.parent / "bundles" / "voice-terminal-shadow-preset"
+        source_preset = self.repo_root / "config" / "dsh" / "agent-presets" / "shadow-agent"
+        preset_artifacts = (preset_bundle_dir / "package.json", preset_bundle_dir / "cordis.patch.yml")
+        if any(not item.is_file() for item in preset_artifacts):
+            raise RuntimeError("Shadow preset Bundle（Shadow 预设功能包）构建产物缺失；请运行 scripts\\setup-dsh.ps1。")
+        try:
+            profile_manifest = json.loads((self.config.home_dir / "profiles" / "web" / "package.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("DSH Web profile package.json（配置清单）缺失或无效。") from exc
+        preset_package_name = "@voice-terminal/dsh-shadow-agent-preset"
+        if not profile_manifest.get("dependencies", {}).get(preset_package_name):
+            raise RuntimeError("Shadow preset Bundle（Shadow 预设功能包）未安装到 Web profile（网页配置）。")
+        if preset_package_name not in profile_manifest.get("dsh", {}).get("profile", {}).get("bundles", []):
+            raise RuntimeError("Shadow preset Bundle（Shadow 预设功能包）未注册到 Web profile（网页配置）。")
         build_state = self.config.source_dir.parent / "build-state.json"
         try:
             state = json.loads(build_state.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as exc:
             raise RuntimeError("DSH build-state.json 缺失或无效。") from exc
-        if state.get("schema_version") != 3:
+        if state.get("schema_version") != 4:
             raise RuntimeError("DSH build-state 格式版本不受支持；请重新运行 scripts\\setup-dsh.ps1。")
         if state.get("bridge_protocol_version") != self.config.bridge_protocol_version:
             raise RuntimeError("DSH Bridge build-state 协议版本漂移；请重新运行 setup-dsh.ps1。")
-        bundle_dir = self.config.source_dir.parent / "bundles" / "voice-terminal-shadow-bridge"
+        bridge_bundle_dir = self.config.source_dir.parent / "bundles" / "voice-terminal-shadow-bridge"
         bridge_source = self.repo_root / "integrations" / "dsh" / "voice-terminal-shadow-bridge"
         bridge_build_inputs = (
             bridge_source / "src",
@@ -242,27 +246,30 @@ class DshRuntimeManager:
             self.repo_root / "scripts" / "build-dsh-client.mjs",
         )
         bridge_runtime_artifacts = (
-            bundle_dir / "package.json",
-            bundle_dir / "cordis.patch.yml",
-            bundle_dir / "lib" / "index.js",
-            bundle_dir / "lib" / "plugin.js",
-            bundle_dir / "lib" / "settings.js",
-            bundle_dir / "lib" / "settings-contract.js",
-            bundle_dir / "lib" / "generated-prompt.js",
-            bundle_dir / "lib" / "client.js",
+            bridge_bundle_dir / "package.json",
+            bridge_bundle_dir / "cordis.patch.yml",
+            bridge_bundle_dir / "lib" / "index.js",
+            bridge_bundle_dir / "lib" / "plugin.js",
+            bridge_bundle_dir / "lib" / "settings.js",
+            bridge_bundle_dir / "lib" / "settings-contract.js",
+            bridge_bundle_dir / "lib" / "generated-prompt.js",
+            bridge_bundle_dir / "lib" / "client.js",
         )
         common_prompt = self.repo_root / "config" / "shadow_agent" / "instructions.md"
         dsh_rules = self.repo_root / "config" / "dsh" / "shadow-agent.rules.md"
+        preset_runtime_artifacts = (preset_bundle_dir / "package.json", preset_bundle_dir / "cordis.patch.yml")
         checks = (
             ("bridge_runtime_artifacts_sha256", self._tree_hash(*bridge_runtime_artifacts), "Bridge 运行产物"),
             ("bridge_build_inputs_sha256", self._tree_hash(*bridge_build_inputs), "Bridge 构建输入"),
+            ("shadow_preset_runtime_artifacts_sha256", self._tree_hash(*preset_runtime_artifacts), "Shadow preset Bundle 运行产物"),
+            ("shadow_preset_build_inputs_sha256", self._tree_hash(source_preset), "Shadow preset Bundle 构建输入"),
             ("shadow_prompt_sha256", self._tree_hash(common_prompt, dsh_rules), "Shadow 提示词"),
         )
         for key, actual, label in checks:
             if state.get(key) != actual:
                 raise RuntimeError(f"DSH {label} hash 漂移；请重新运行 setup-dsh.ps1。")
         try:
-            bridge_package = json.loads((bundle_dir / "package.json").read_text(encoding="utf-8"))
+            bridge_package = json.loads((bridge_bundle_dir / "package.json").read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise RuntimeError("DSH Bridge package.json 缺失或无效。") from exc
         if bridge_package.get("main") != "lib/plugin.js" or bridge_package.get("exports", {}).get(".") != "./lib/plugin.js":
@@ -286,7 +293,7 @@ class DshRuntimeManager:
             return match.group("body") if match else None
 
         checks = (
-            ("agent-presets", re.compile(r"(?m)^\s+default:\s*shadow-agent\s*$")),
+            ("agent-preset-registry", re.compile(r"(?m)^\s+default:\s*shadow-agent\s*$")),
             ("session-log-deepseek", re.compile(r"(?m)^\s+disabled:\s*true\s*$")),
         )
         for entry_id, expected in checks:

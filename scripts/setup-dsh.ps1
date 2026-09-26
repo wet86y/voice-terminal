@@ -17,6 +17,12 @@ $PackagePath = Join-Path $SourceDir "package.json"
 $BuildStatePath = Join-Path $RuntimeRoot "build-state.json"
 $BridgeDir = Join-Path $RepoRoot "integrations\dsh\voice-terminal-shadow-bridge"
 $BridgeArtifactDir = Join-Path $RuntimeRoot "bundles\voice-terminal-shadow-bridge"
+$ShadowPresetArtifactDir = Join-Path $RuntimeRoot "bundles\voice-terminal-shadow-preset"
+$ShadowPresetPackageName = "@voice-terminal/dsh-shadow-agent-preset"
+$ShadowPresetPackagePath = Join-Path $ShadowPresetArtifactDir "package.json"
+$ShadowPresetPatchPath = Join-Path $ShadowPresetArtifactDir "cordis.patch.yml"
+$ShadowPresetBuildInputPaths = @($PresetSource)
+$ShadowPresetRuntimeArtifactPaths = @($ShadowPresetPackagePath, $ShadowPresetPatchPath)
 $BridgePackagePath = Join-Path $BridgeDir "package.json"
 $BridgeEntryPath = Join-Path $BridgeArtifactDir "lib\index.js"
 $BridgePluginEntryPath = Join-Path $BridgeArtifactDir "lib\plugin.js"
@@ -72,9 +78,69 @@ function Get-TreeHash {
   finally { $sha.Dispose() }
 }
 
+function Write-Utf8NoBom {
+  param([string]$Path, [string]$Text)
+  [System.IO.File]::WriteAllText($Path, $Text, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Get-ShadowPresetBundlePatch {
+  $MetadataPath = Join-Path $PresetSource "preset.yml"
+  $CompositionPath = Join-Path $PresetSource "agent.cordis.yml"
+  $Metadata = Get-Content -LiteralPath $MetadataPath -Raw
+  $NameMatch = [regex]::Match($Metadata, '(?m)^name:\s*(.+?)\s*$')
+  $DescriptionMatch = [regex]::Match($Metadata, '(?m)^description:\s*(.+?)\s*$')
+  if (-not $NameMatch.Success -or -not $DescriptionMatch.Success) { throw "Shadow preset 元数据（预设说明）缺少 name/description（名称/说明字段）。" }
+  $NameYaml = $NameMatch.Groups[1].Value | ConvertTo-Json -Compress
+  $DescriptionYaml = $DescriptionMatch.Groups[1].Value | ConvertTo-Json -Compress
+  $Composition = (Get-Content -LiteralPath $CompositionPath -Raw).TrimEnd([char[]]"`r`n")
+  $IndentedComposition = (($Composition -split "`r?`n") | ForEach-Object { "          $_" }) -join "`n"
+  return @"
+- insert:
+    - id: preset-shadow-agent
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: shadow-agent
+        name: $NameYaml
+        description: $DescriptionYaml
+        order: 5
+        plugins:
+$IndentedComposition
+"@
+}
+
+function Update-ManagedProfilePatch {
+  param([string]$ProfilePatchPath)
+  if (-not (Test-Path -LiteralPath $ProfilePatchPath)) {
+    Copy-Item -LiteralPath $PatchSource -Destination $ProfilePatchPath
+  }
+  $Text = Get-Content -LiteralPath $ProfilePatchPath -Raw
+  # DSH 0.1.7 使用 agent-preset-registry（Agent 预设注册器）；旧 agent-presets 注册行已废弃。
+  $Text = [regex]::Replace($Text, '(?ms)^- id: agent-presets[ \t]*\r?\n.*?(?=^- id:|\z)', '')
+  $Registry = [regex]::Match($Text, '(?ms)^- id: agent-preset-registry[ \t]*\r?\n.*?(?=^- id:|\z)')
+  if (-not $Registry.Success) {
+    $Text = "- id: agent-preset-registry`n  config:`n    default: shadow-agent`n`n$Text"
+  } else {
+    $Block = $Registry.Value
+    $Default = [regex]::new('(?m)^([ \t]*)default:[^\r\n]*')
+    if ($Default.IsMatch($Block)) {
+      $Block = $Default.Replace($Block, '$1default: shadow-agent', 1)
+    } else {
+      $Config = [regex]::Match($Block, '(?m)^([ \t]*)config:[ \t]*$')
+      if ($Config.Success) {
+        $Block = $Block.Insert($Config.Index + $Config.Length, "`n$($Config.Groups[1].Value)  default: shadow-agent")
+      } else {
+        $Header = [regex]::Match($Block, '(?m)^- id: agent-preset-registry[ \t]*$')
+        $Block = $Block.Insert($Header.Index + $Header.Length, "`n  config:`n    default: shadow-agent")
+      }
+    }
+    $Text = $Text.Substring(0, $Registry.Index) + $Block + $Text.Substring($Registry.Index + $Registry.Length)
+  }
+  Write-Utf8NoBom -Path $ProfilePatchPath -Text ($Text.TrimStart([char[]]"`r`n").TrimEnd() + "`n")
+}
+
 if (-not (Test-Path -LiteralPath $LockPath)) { throw "DSH 锁文件缺失：$LockPath" }
-foreach ($Required in @($BridgePackagePath, (Join-Path $BridgeDir "src\index.ts"), $CommonPromptPath, $DshRulesPath)) {
-  if (-not (Test-Path -LiteralPath $Required)) { throw "DSH Bridge 受管源文件缺失：$Required" }
+foreach ($Required in @($BridgePackagePath, (Join-Path $BridgeDir "src\index.ts"), (Join-Path $PresetSource "preset.yml"), (Join-Path $PresetSource "agent.cordis.yml"), $CommonPromptPath, $DshRulesPath)) {
+  if (-not (Test-Path -LiteralPath $Required)) { throw "DSH 受管源文件缺失：$Required" }
 }
 $Lock = Get-Content -LiteralPath $LockPath -Raw | ConvertFrom-Json
 $IsWindowsHost = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
@@ -196,7 +262,15 @@ $BridgeVersion = [string]$BridgePackage.version
 $BridgeProtocolVersion = "1.0"
 $PromptHash = Get-TreeHash @($CommonPromptPath, $DshRulesPath)
 $PresetText = Get-Content -LiteralPath (Join-Path $PresetSource "agent.cordis.yml") -Raw
-foreach ($RequiredPresetRow in @("tool-pwsh", "tool-fs", "tool-jobs", "tool-skill", "compaction-basic", "tool-subagent", "tool-web")) {
+$ShadowPresetPackageText = ([ordered]@{
+  name = $ShadowPresetPackageName
+  version = "0.1.0"
+  private = $true
+  type = "module"
+  dsh = @{ bundle = @{ patch = "./cordis.patch.yml" } }
+} | ConvertTo-Json -Depth 8) + "`n"
+$ShadowPresetPatchText = Get-ShadowPresetBundlePatch
+foreach ($RequiredPresetRow in @("tool-pwsh", "tool-fs", "tool-jobs", "tool-skill", "compaction-basic", "tool-subagent", "tool-web", "workflow-ptc")) {
   if ($PresetText -notmatch [regex]::Escape("id: $RequiredPresetRow")) { throw "正式 Shadow preset 缺少默认工具/能力：$RequiredPresetRow" }
 }
 if ($PresetText -match "tools\.restrict|exact safe tool surface") { throw "正式 Shadow preset 不得缩减默认工具可见性。" }
@@ -210,20 +284,15 @@ if (-not $ValidateOnly) {
 }
 
 if ($ValidateOnly) {
-  $ManagedCopies = @(
-    @((Join-Path $PresetSource "agent.cordis.yml"), (Join-Path $HomeDir ".agent-presets\shadow-agent\agent.cordis.yml")),
-    @((Join-Path $PresetSource "preset.yml"), (Join-Path $HomeDir ".agent-presets\shadow-agent\preset.yml"))
-  )
-  foreach ($Pair in $ManagedCopies) {
-    if (-not (Test-Path -LiteralPath $Pair[1])) { throw "DSH_HOME 缺少受管配置：$($Pair[1])" }
-    $ExpectedHash = (Get-FileHash -LiteralPath $Pair[0] -Algorithm SHA256).Hash
-    $ActualHash = (Get-FileHash -LiteralPath $Pair[1] -Algorithm SHA256).Hash
-    if ($ExpectedHash -ne $ActualHash) { throw "DSH_HOME 受管配置已漂移：$($Pair[1])" }
+  foreach ($RuntimeArtifactPath in $ShadowPresetRuntimeArtifactPaths) {
+    if (-not (Test-Path -LiteralPath $RuntimeArtifactPath -PathType Leaf)) { throw "Shadow preset Bundle（Shadow 预设功能包）产物缺失：$RuntimeArtifactPath" }
   }
+  if ((Get-Content -LiteralPath $ShadowPresetPackagePath -Raw) -ne $ShadowPresetPackageText) { throw "Shadow preset Bundle（Shadow 预设功能包）清单已漂移。" }
+  if ((Get-Content -LiteralPath $ShadowPresetPatchPath -Raw) -ne $ShadowPresetPatchText) { throw "Shadow preset Bundle（Shadow 预设功能包）配置补丁已漂移。" }
   $ProfilePatchPath = Join-Path $HomeDir "profiles\web\cordis.patch.yml"
   if (-not (Test-Path -LiteralPath $ProfilePatchPath)) { throw "DSH_HOME 缺少 Web profile patch（Web 配置补丁）：$ProfilePatchPath" }
   $ProfilePatchText = Get-Content -LiteralPath $ProfilePatchPath -Raw
-  if ($ProfilePatchText -notmatch '(?m)^\s*- id: agent-presets\s*$' -or $ProfilePatchText -notmatch '(?m)^\s+default: shadow-agent\s*$') {
+  if ($ProfilePatchText -notmatch '(?m)^- id: agent-preset-registry\s*$' -or $ProfilePatchText -notmatch '(?m)^\s+default: shadow-agent\s*$') {
     throw "DSH_HOME Web profile patch（Web 配置补丁）缺少正式 Shadow preset（Shadow 预设）默认项。"
   }
   if ($ProfilePatchText -notmatch '(?m)^\s*- id: session-log-deepseek\s*$' -or $ProfilePatchText -notmatch '(?m)^\s+disabled: true\s*$') {
@@ -237,6 +306,8 @@ if ($ValidateOnly) {
   $ProfilePackage = Get-Content -LiteralPath $ProfilePackagePath -Raw | ConvertFrom-Json
   if (-not $ProfilePackage.dependencies.'@voice-terminal/dsh-shadow-bridge') { throw "DSH Bridge 未安装到 web profile。" }
   if ($ProfilePackage.dsh.profile.bundles -notcontains '@voice-terminal/dsh-shadow-bridge') { throw "DSH Bridge bundle 未注册到 web profile。" }
+  if ($ProfilePackage.dependencies.PSObject.Properties.Name -notcontains $ShadowPresetPackageName) { throw "Shadow preset Bundle（Shadow 预设功能包）未安装到 web profile。" }
+  if ($ProfilePackage.dsh.profile.bundles -notcontains $ShadowPresetPackageName) { throw "Shadow preset Bundle（Shadow 预设功能包）未注册到 web profile。" }
   $ArtifactPackagePath = Join-Path $BridgeArtifactDir "package.json"
   if (-not (Test-Path -LiteralPath $ArtifactPackagePath)) { throw "DSH Bridge artifact package.json 缺失。" }
   foreach ($RuntimeArtifactPath in $BridgeRuntimeArtifactPaths) {
@@ -247,12 +318,16 @@ if ($ValidateOnly) {
   if ($ArtifactPackage.exports.'./client' -ne './lib/client.js') { throw "DSH Bridge 浏览器入口未导出。" }
   if ($ArtifactPackage.dsh.client.platform -ne 'web') { throw "DSH Bridge 未声明 web client bundle。" }
   $State = Get-Content -LiteralPath $BuildStatePath -Raw | ConvertFrom-Json
-  if ($State.schema_version -ne 3) { throw "DSH build-state 格式版本已过期；请重新运行 setup-dsh.ps1。" }
+  if ($State.schema_version -ne 4) { throw "DSH build-state 格式版本已过期；请重新运行 setup-dsh.ps1。" }
   $CurrentRuntimeArtifactHash = Get-TreeHash @($BridgeRuntimeArtifactPaths)
   $CurrentBuildInputsHash = Get-TreeHash @($BridgeBuildInputPaths)
+  $CurrentShadowPresetRuntimeHash = Get-TreeHash @($ShadowPresetRuntimeArtifactPaths)
+  $CurrentShadowPresetBuildInputsHash = Get-TreeHash @($ShadowPresetBuildInputPaths)
   if ($State.bridge_protocol_version -ne $BridgeProtocolVersion) { throw "DSH Bridge 协议版本漂移。" }
   if ($State.bridge_runtime_artifacts_sha256 -ne $CurrentRuntimeArtifactHash) { throw "DSH Bridge 运行产物 hash 漂移。" }
   if ($State.bridge_build_inputs_sha256 -ne $CurrentBuildInputsHash) { throw "DSH Bridge 构建输入 hash 漂移。" }
+  if ($State.shadow_preset_runtime_artifacts_sha256 -ne $CurrentShadowPresetRuntimeHash) { throw "Shadow preset Bundle（Shadow 预设功能包）运行产物 hash 漂移。" }
+  if ($State.shadow_preset_build_inputs_sha256 -ne $CurrentShadowPresetBuildInputsHash) { throw "Shadow preset Bundle（Shadow 预设功能包）源文件 hash 漂移。" }
   if ($State.shadow_prompt_sha256 -ne $PromptHash) { throw "Shadow 公共提示词或 DSH 附加规则已漂移。" }
 }
 
@@ -262,7 +337,7 @@ if (-not $ValidateOnly) {
     if (Test-Path -LiteralPath $BuildStatePath) {
       try { $PreviousState = Get-Content -LiteralPath $BuildStatePath -Raw | ConvertFrom-Json } catch { }
     }
-    if (-not $PreviousState -or $PreviousState.commit -ne $Lock.commit) {
+    if (-not $PreviousState -or $PreviousState.commit -ne $Lock.commit -or $PreviousState.schema_version -ne 4) {
       $BackupPath = Join-Path $RuntimeRoot ("home.backup-{0}-{1}" -f $Lock.version, (Get-Date -Format "yyyyMMdd-HHmmss"))
       New-Item -ItemType Directory -Force -Path $RuntimeRoot | Out-Null
       & robocopy $HomeDir $BackupPath /E /COPY:DAT /DCOPY:DAT /SL /SJ /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
@@ -270,22 +345,21 @@ if (-not $ValidateOnly) {
       Write-Host "DSH_HOME 已备份到 $BackupPath" -ForegroundColor Yellow
     }
   }
-  $PresetTarget = Join-Path $HomeDir ".agent-presets\shadow-agent"
-  New-Item -ItemType Directory -Force -Path $ProfileDir, $PresetTarget | Out-Null
+  New-Item -ItemType Directory -Force -Path $ProfileDir, $ShadowPresetArtifactDir | Out-Null
   $ProfilePatchPath = Join-Path $ProfileDir "cordis.patch.yml"
-  if (-not (Test-Path -LiteralPath $ProfilePatchPath)) {
-    Copy-Item -LiteralPath $PatchSource -Destination $ProfilePatchPath
-  } else {
-    Write-Host "保留现有 Web profile patch（Web 配置补丁）及其中的 DSH_HOME 设置：$ProfilePatchPath" -ForegroundColor Yellow
-  }
-  Copy-Item -LiteralPath (Join-Path $PresetSource "agent.cordis.yml") -Destination $PresetTarget -Force
-  Copy-Item -LiteralPath (Join-Path $PresetSource "preset.yml") -Destination $PresetTarget -Force
+  Update-ManagedProfilePatch -ProfilePatchPath $ProfilePatchPath
+  Write-Utf8NoBom -Path $ShadowPresetPackagePath -Text $ShadowPresetPackageText
+  Write-Utf8NoBom -Path $ShadowPresetPatchPath -Text $ShadowPresetPatchText
   $PluginArgs = @($CliPath, "plugin", "--profile", "web", "add", $BridgeArtifactDir, "--save-exact")
   if ($Offline) { $PluginArgs += "--offline" }
   Invoke-Checked -Command node -Arguments $PluginArgs
+  $PresetPluginArgs = @($CliPath, "plugin", "--profile", "web", "add", $ShadowPresetArtifactDir, "--save-exact")
+  if ($Offline) { $PresetPluginArgs += "--offline" }
+  Invoke-Checked -Command node -Arguments $PresetPluginArgs
   $DumpConfig = (& node $CliPath --profile web --dump-config 2>&1 | Out-String)
   if ($LASTEXITCODE -ne 0) { throw "DSH dump-config 失败。" }
   if ($DumpConfig -notmatch [regex]::Escape('@voice-terminal/dsh-shadow-bridge')) { throw "DSH dump-config 未包含 Bridge Bundle。" }
+  if ($DumpConfig -notmatch [regex]::Escape($ShadowPresetPackageName) -or $DumpConfig -notmatch 'preset-shadow-agent') { throw "DSH dump-config 未包含 Shadow preset Bundle（Shadow 预设功能包）声明。" }
   $DumpConfig | Set-Content -LiteralPath $DumpConfigPath -Encoding utf8
   $ManagedHash = Get-TreeHash @((Split-Path -Parent $PatchSource), $PresetSource)
   foreach ($RuntimeArtifactPath in $BridgeRuntimeArtifactPaths) {
@@ -293,8 +367,10 @@ if (-not $ValidateOnly) {
   }
   $RuntimeArtifactHash = Get-TreeHash @($BridgeRuntimeArtifactPaths)
   $BridgeBuildInputsHash = Get-TreeHash @($BridgeBuildInputPaths)
+  $ShadowPresetRuntimeArtifactHash = Get-TreeHash @($ShadowPresetRuntimeArtifactPaths)
+  $ShadowPresetBuildInputsHash = Get-TreeHash @($ShadowPresetBuildInputPaths)
   [ordered]@{
-    schema_version = 3
+    schema_version = 4
     repository = $Lock.repository
     tag = $Tag
     commit = $Head
@@ -306,6 +382,8 @@ if (-not $ValidateOnly) {
     bridge_protocol_version = $BridgeProtocolVersion
     bridge_runtime_artifacts_sha256 = $RuntimeArtifactHash
     bridge_build_inputs_sha256 = $BridgeBuildInputsHash
+    shadow_preset_runtime_artifacts_sha256 = $ShadowPresetRuntimeArtifactHash
+    shadow_preset_build_inputs_sha256 = $ShadowPresetBuildInputsHash
     shadow_prompt_sha256 = $PromptHash
     source_dir = $SourceDir
     home_dir = $HomeDir

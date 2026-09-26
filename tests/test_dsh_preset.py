@@ -31,6 +31,8 @@ class DshPresetTests(unittest.TestCase):
         delegated_ids = {row["id"] for row in delegated}
         self.assertIn("tool-subagent", delegated_ids)
         self.assertIn("tool-subagent-control", delegated_ids)
+        self.assertIn("workflow-ptc", delegated_ids)
+        self.assertNotIn("workflow-worker-thread", delegated_ids)
         self.assertNotIn("restrict", (self.preset_dir / "agent.cordis.yml").read_text(encoding="utf-8").lower())
 
     def test_bridge_bundle_and_managed_prompt_rules_exist(self) -> None:
@@ -56,7 +58,8 @@ class DshPresetTests(unittest.TestCase):
     def test_web_patch_selects_shadow_and_disables_session_upload(self) -> None:
         patch = yaml.safe_load((self.root / "config" / "dsh" / "web-profile.patch.yml").read_text(encoding="utf-8"))
         by_id = {row["id"]: row for row in patch}
-        self.assertEqual(by_id["agent-presets"]["config"]["default"], "shadow-agent")
+        self.assertEqual(by_id["agent-preset-registry"]["config"]["default"], "shadow-agent")
+        self.assertNotIn("agent-presets", by_id)
         self.assertTrue(by_id["session-log-deepseek"]["disabled"])
 
 

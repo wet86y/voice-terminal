@@ -10,6 +10,11 @@ Voice Terminal 使用的 DeepSeek Harness（DSH，DeepSeek 开发框架）固定
 位于 Git 忽略的 `.runtime/dsh/`；该数据目录与用户级 `~/.dsh` 隔离。升级时保留项目设置和会话数据，
 并按安装脚本流程备份后再启动新版本。
 
+正式 `shadow-agent`（Shadow 执行 Agent）由 `config/dsh/agent-presets/shadow-agent/` 维护。
+安装脚本会把该配置包装成项目本地 `voice-terminal-shadow-preset` Bundle（预设功能包），安装到 Web
+profile（网页配置），并通过 `agent-preset-registry`（Agent 预设注册器）的 `default`（部署默认预设字段）
+设为默认项。DSH 0.1.7-rc.2 不再读取 DSH_HOME 中旧版 `.agent-presets/` 目录；该目录即使为回退保留，也不会注册预设。
+
 项目 DSH Web Host（DSH 网页服务）仅监听 `127.0.0.1:3081`，由 Voice Server（语音服务）管理。
 打开 Voice Terminal 页面 `http://127.0.0.1:5173/`，再使用顶栏的 DSH 控制台入口取得一次性访问地址；
 直接访问 3081 不带 launch token（临时访问令牌）时不能完成网页授权。不要收藏、记录或分享带
