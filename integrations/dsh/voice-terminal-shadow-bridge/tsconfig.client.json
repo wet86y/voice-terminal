@@ -1,0 +1,36 @@
+{
+  "extends": "../../../.runtime/dsh/source/tsconfig.base.client.json", // 继承 DSH 客户端的 paths（类型映射）和 jsx=react-jsx（JSX 转换）设置。
+  "compilerOptions": {
+    // React declaration package exposed by DSH Client packages（DSH 客户端提供的 React 声明类型）.
+    "typeRoots": [
+      "../../../.runtime/dsh/source/scripts/types",
+      "../../../.runtime/dsh/source/node_modules/@types",
+      "../../../.runtime/dsh/source/packages/client/ui-settings/node_modules/@types"
+    ],
+    // Load DSH's browser build globals and React types（加载 DSH 浏览器构建环境与 React 类型）.
+    "types": ["client-build-environment", "react"],
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "exactOptionalPropertyTypes": false,
+    "noUncheckedIndexedAccess": false,
+    "noImplicitOverride": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx"],
+  // Project references（项目引用） mirror the DSH client type dependencies（客户端类型依赖）.
+  "references": [
+    { "path": "../../../.runtime/dsh/source/vendor/cordis" },
+    { "path": "../../../.runtime/dsh/source/packages/api/remotes/tsconfig.client.json" },
+    { "path": "../../../.runtime/dsh/source/packages/api/session-controller/tsconfig.client.json" },
+    { "path": "../../../.runtime/dsh/source/packages/api/workspace-controller/tsconfig.client.json" },
+    { "path": "../../../.runtime/dsh/source/packages/client/locale/tsconfig.client.json" },
+    { "path": "../../../.runtime/dsh/source/packages/client/ui-primitives" },
+    { "path": "../../../.runtime/dsh/source/packages/client/ui-renderer" },
+    { "path": "../../../.runtime/dsh/source/packages/client/ui-settings/tsconfig.client.json" },
+    { "path": "../../../.runtime/dsh/source/packages/client/ui-conversation/tsconfig.client.json" },
+    { "path": "../../../.runtime/dsh/source/packages/client/ui-chat/tsconfig.client.json" },
+    { "path": "../../../.runtime/dsh/source/packages/client/ui-slots" }
+  ]
+}

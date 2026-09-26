@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useState, useSyncExternalStore, type ReactNode } from 'react'
+// DSH Remote API's SettingsPathOpView（设置接口提供的路径操作类型）.
+import type { SettingsPathOpView } from '@deepseek-ai/dsh-api-remotes/client'
 import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { IWorkspaces, WorkspaceSnapshot } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import { Button, IconChevronDownOutlineRegular, IconFolderCloseRegular, Menu } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -179,7 +181,7 @@ export function VoiceTerminalSettingsPage({ settings, workspaces, modelCatalog, 
   const effectiveEffort = effortMissing ? effectiveModel?.reasoning?.defaultEffort ?? ''
     : configuredEffort || effectiveModel?.reasoning?.defaultEffort || ''
 
-  const save = async (ops: readonly { op: 'set' | 'unset'; path: readonly string[]; value?: unknown }[]): Promise<void> => {
+  const save = async (ops: readonly SettingsPathOpView[]): Promise<void> => {
     setSaveState('saving')
     try {
       await settings.mutate(ops)

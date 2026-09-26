@@ -41,3 +41,10 @@ and browser module（浏览器插件模块） are both built and installed by
 `scripts/setup-dsh.ps1`. A Bridge build（插件构建） verifies the pinned DSH
 source（固定版本源码） remains unchanged after its temporary browser build
 staging directory（浏览器构建暂存目录） is removed.
+
+Bridge（插件桥接层） context（上下文） messages（消息） that DSH（影子代理宿主）
+records as ordinary injected context（注入上下文） are shown in the Chat（对话）
+transcript（对话记录） with their complete content（完整内容） and source（消息来源）.
+Messages（消息） already shown as native DSH wake notices（原生唤醒提示） keep that
+presentation. Assistant（助手） and Tool（工具） execution records remain in DSH's
+existing Chat（对话） and Trajectory（执行轨迹） views（视图）.
