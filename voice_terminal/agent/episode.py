@@ -763,7 +763,8 @@ class AgentEpisodeRuntime:
     def __init__(self, provider, registry, output, emit, *, conversation: ConversationRuntime, ledger,
                  options=None, tools_enabled=True, reasoning_mode="balanced", persona_config=None,
                  shadow_waker=None, on_final_system_check_settled=None,
-                 defer_silence_until_output=False):
+                 defer_silence_until_output=False, continuity_document_provider=None,
+                 on_user_activity=None, on_silence_anchor=None):
         self.provider, self.registry, self.output, self.emit = provider, registry, output, emit
         self.options = options or AgentOptions()
         self.tools_enabled = tools_enabled
@@ -772,6 +773,9 @@ class AgentEpisodeRuntime:
         self.ledger = ledger
         self.shadow_waker = shadow_waker
         self.on_final_system_check_settled = on_final_system_check_settled
+        self.continuity_document_provider = continuity_document_provider
+        self.on_user_activity = on_user_activity
+        self.on_silence_anchor = on_silence_anchor
         # This is enabled only for the resident-KWS product mode.  Ordinary
         # sessions retain the historical behavior where the finalized input
         # itself arms the silence staircase.
@@ -798,6 +802,7 @@ class AgentEpisodeRuntime:
         }
         self._completed_speech_ids: set[str] = set()
         self.pending = set()
+        self._scheduled_wakes: list[dict] = []
         self._pending_since: float | None = None
         self._pending_transcript_turn_id: str | None = None
         self.event_inbox = deque(maxlen=128)
@@ -1352,6 +1357,8 @@ class AgentEpisodeRuntime:
             self.inputs[turn_id] = {**payload, "text": text, "final": False}
         await self._start_heartbeat_clock()
         await self.log("EPISODE_STARTED")
+        if self._scheduled_wakes:
+            self._wake("SCHEDULED_WAKE")
         return self.episode_id
 
     async def schedule_system_check(self, prompt_kind: str, source_id: str,
@@ -1383,6 +1390,25 @@ class AgentEpisodeRuntime:
             self._immediate_system_check = candidate
         self._ensure_runner()
         return generation
+
+    async def enqueue_scheduled_wake(self, task: dict) -> bool:
+        """Queue a project wake for the next ordinary heartbeat dispatch."""
+
+        task_id = str(task.get("task_id") or "").strip()
+        occurrence_id = str(task.get("occurrence_id") or "").strip()
+        text = str(task.get("text") or "").strip()
+        if not task_id or not occurrence_id or not text or self.closed:
+            return False
+        if await self.ensure_episode() is None:
+            return False
+        self.open_input_scope()
+        self._scheduled_wakes.append({
+            "task_id": task_id,
+            "occurrence_id": occurrence_id,
+            "text": text[:500],
+        })
+        self._wake("SCHEDULED_WAKE")
+        return True
 
     def gate(self, identity):
         if not self.scope_active(identity):
@@ -1498,6 +1524,22 @@ class AgentEpisodeRuntime:
         # Once any ordinary, recovery, forced-poll, or final-silence request
         # has started, later input never preempts it.  New events remain in
         # the shared mailbox for the next idle heartbeat.
+
+    def _notify_user_activity(self) -> None:
+        callback = self.on_user_activity
+        if callable(callback):
+            try:
+                callback()
+            except Exception:
+                logger.exception("agent.continuity_user_activity_failed")
+
+    def _notify_silence_anchor(self, wall_time: float) -> None:
+        callback = self.on_silence_anchor
+        if callable(callback):
+            try:
+                callback(float(wall_time))
+            except Exception:
+                logger.exception("agent.continuity_anchor_failed")
 
     def _supersede_recovery_without_request_cancel(self, kind: str) -> None:
         """Preserve queue/output supersede behavior without cancelling LLM.
@@ -1936,6 +1978,7 @@ class AgentEpisodeRuntime:
         )
         if not activated:
             return False
+        self._notify_silence_anchor(anchor_wall_time)
         pending.update({
             "tts_playback_completed_monotonic": playback_at,
             "tts_playback_completed_wall_time": self._positive_time(playback_wall_time),
@@ -2086,6 +2129,8 @@ class AgentEpisodeRuntime:
     async def observe(self, kind, *, turn_id=None, text=None, **payload):
         if self.closed:
             return
+        if kind in {"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"}:
+            self._notify_user_activity()
         if kind in {"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"} and (
             not isinstance(text, str) or not text.strip()
         ):
@@ -2301,6 +2346,8 @@ class AgentEpisodeRuntime:
                                else None),
                     turn_id=turn_id,
                 )
+                if kind in {"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"}:
+                    self._notify_silence_anchor(self.scheduler.anchor_wall_time)
             try:
                 loop = asyncio.get_running_loop()
                 for window in superseded_windows:
@@ -2369,6 +2416,7 @@ class AgentEpisodeRuntime:
         previous = self.user_speaking
         self.user_speaking = speaking
         if speaking is True and previous is not True:
+            self._notify_user_activity()
             self._user_speech_epoch += 1
             # Withdraw only unplayed system-check speech.  The active provider
             # request deliberately keeps running; its later output is rejected
@@ -2470,6 +2518,16 @@ class AgentEpisodeRuntime:
                 "origin_prompt_kind": origin_prompt_kind,
                 "owner_scope": "system_check",
             })
+
+        scheduled_wakes = []
+        if candidate is None and not recovery and "SCHEDULED_WAKE" in kinds:
+            scheduled_wakes = list(self._scheduled_wakes)
+            if scheduled_wakes:
+                dispatch_context = {
+                    "dispatch_kind": "scheduled_wake",
+                    "scheduled_wakes": scheduled_wakes,
+                }
+                dispatch_kind = "scheduled_wake"
 
         if not self._dispatch_allowed(respect_backoff=not recovery):
             return False
@@ -2662,6 +2720,9 @@ class AgentEpisodeRuntime:
                        dispatch_context=dispatch_context),
             name=f"agent-step-{identity[1]}",
         )
+        if scheduled_wakes:
+            count = min(len(scheduled_wakes), len(self._scheduled_wakes))
+            del self._scheduled_wakes[:count]
         self.active_request_count += 1
         if not recovery and candidate is None:
             self._pending_since = None
@@ -3460,6 +3521,27 @@ class AgentEpisodeRuntime:
             ))
         messages.extend(self._persona_context_frames())
         messages.extend(self.context_projector.project(self.ledger, semantic))
+        document_provider = self.continuity_document_provider
+        continuity_document = document_provider() if callable(document_provider) else ""
+        if isinstance(continuity_document, str) and continuity_document.strip():
+            messages.append(ContextFrame.make(
+                ContextLane.REQUEST_TAIL, "system",
+                "【会话衔接文档】以下是跨窗口延续的简短背景资料，仅在与当前任务相关时使用：\n"
+                + continuity_document.strip()[:800],
+                context_kind="continuity_document",
+            ))
+        scheduled_wakes = (
+            force_context.get("scheduled_wakes")
+            if isinstance(force_context, dict) else None
+        )
+        if isinstance(scheduled_wakes, list) and scheduled_wakes:
+            messages.append(ContextFrame.make(
+                ContextLane.REQUEST_TAIL, "system",
+                "【定时唤醒事件】以下事件由用户先前设置的唤醒任务触发。请依说明直接决定是否回应并用语音表达；"
+                "这不是用户刚说的新内容，也不要声称已完成需要外部行动的任务：\n"
+                + json.dumps(scheduled_wakes, ensure_ascii=False),
+                context_kind="scheduled_wake",
+            ))
         # Sentence revisions, event IDs, tick timestamps and performance
         # counters are local scheduling diagnostics.  The model retains the
         # semantic output control it needs: its current speech target and the

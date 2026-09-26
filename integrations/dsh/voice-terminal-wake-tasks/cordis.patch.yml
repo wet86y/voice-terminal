@@ -1,0 +1,4 @@
+- insert:
+    - id: voice-terminal-wake-tasks
+      name: '@voice-terminal/dsh-wake-tasks'
+      config: {}

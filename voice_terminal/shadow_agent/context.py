@@ -15,7 +15,7 @@ class ShadowContextProjector:
     monotonic input revision and deliberately excludes Shadow-origin events.
     """
 
-    def __init__(self, ledger: Any, *, user_profile: str = "") -> None:
+    def __init__(self, ledger: Any, *, user_profile: str = "", continuity_document: str = "") -> None:
         self.ledger = ledger
         # The experimental context gate never filters semantic frames.  It
         # only controls the contiguous source revision currently visible to
@@ -26,14 +26,36 @@ class ShadowContextProjector:
         self._gate_generation = 0
         self._known_epoch = int(getattr(ledger, "shadow_context_epoch", 0))
         now = datetime.now().astimezone()
+        self._continuity_document = str(continuity_document or "").strip()
+        environment = {
+            "date": now.date().isoformat(),
+            "timezone": str(now.tzinfo),
+            "user_profile": str(user_profile or "").strip(),
+        }
+        if self._continuity_document:
+            environment["continuity_document"] = self._continuity_document
         self._environment = ShadowContextFrame(
             revision=0, origin="runtime", kind="session_environment",
-            content={
-                "date": now.date().isoformat(),
-                "timezone": str(now.tzinfo),
-                "user_profile": str(user_profile or "").strip(),
-            },
+            content=environment,
         )
+
+    def set_continuity_document(self, value: str) -> None:
+        """Refresh the current handoff note and publish its Shadow revision."""
+        text = str(value or "").strip()
+        if text == self._continuity_document:
+            return
+        self._continuity_document = text
+        content = dict(self._environment.content)
+        if text:
+            content["continuity_document"] = text
+        else:
+            content.pop("continuity_document", None)
+        self._environment = ShadowContextFrame(
+            revision=0, origin="runtime", kind="session_environment", content=content,
+        )
+        commit = getattr(self.ledger, "commit_runtime_context", None)
+        if callable(commit):
+            commit("continuity_document", {"document": text})
 
     @property
     def shadow_input_revision(self) -> int:

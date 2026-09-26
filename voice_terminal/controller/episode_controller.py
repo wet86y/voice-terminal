@@ -17,10 +17,15 @@ logger = logging.getLogger(__name__)
 
 
 class EpisodeController(RealtimeController):
-    def __init__(self, *, agent_options, persona_config=None, **kwargs):
+    def __init__(self, *, agent_options, persona_config=None,
+                 continuity_document_provider=None, on_user_activity=None,
+                 on_silence_anchor=None, **kwargs):
         super().__init__(**kwargs)
         self.agent_options = agent_options
         self.persona_config = persona_config
+        self.continuity_document_provider = continuity_document_provider
+        self.on_user_activity = on_user_activity
+        self.on_silence_anchor = on_silence_anchor
         self.output = EpisodeSpeechOutput(self)
         self.episode = self._make_episode()
         self._endpoint_context = None
@@ -41,7 +46,10 @@ class EpisodeController(RealtimeController):
                                        shadow_waker=self.shadow_waker,
                                        reasoning_mode=mode, persona_config=self.persona_config,
                                        defer_silence_until_output=self.wake_always_on,
-                                       on_final_system_check_settled=self._final_system_check_settled)
+                                       on_final_system_check_settled=self._final_system_check_settled,
+                                       continuity_document_provider=self.continuity_document_provider,
+                                       on_user_activity=self.on_user_activity,
+                                       on_silence_anchor=self.on_silence_anchor)
         self.output.runtime = runtime
         return runtime
 
@@ -213,6 +221,11 @@ class EpisodeController(RealtimeController):
     async def accept_shadow_events(self, events) -> None:
         for item in events:
             await self.episode.accept_shadow_event(item)
+
+    async def enqueue_scheduled_wake(self, task: dict) -> bool:
+        if self.episode.closed:
+            self.episode = self._make_episode()
+        return await self.episode.enqueue_scheduled_wake(task)
 
     def _begin_tool_scope(self, turn_id):
         pass  # Tools belong to the episode, not the audio turn.

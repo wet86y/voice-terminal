@@ -11,10 +11,11 @@ import type {
   ProductRuntimeState,
   ProductSettingsSnapshot,
   ProductSnapshot,
+  WakeTask,
 } from './types'
 import { voiceShadowReplayFixture, voiceShadowReplayMeta } from './replay-data'
 
-export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'models'
+export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models'
 export type ProductPage = 'home' | 'settings'
 export type AssignmentSlot = 'voice' | 'shadow' | 'status'
 
@@ -216,6 +217,18 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const settings = reactive<ProductSettingsSnapshot>(structuredClone(DEFAULT_SETTINGS))
   const registry = ref<ProductModelRegistry>(structuredClone(DEFAULT_REGISTRY))
   const dsh = ref<DshRuntimeStatus>(structuredClone(DEFAULT_DSH))
+  const wakeTasks = ref<WakeTask[]>([])
+  const editingWakeTaskId = ref('')
+  const wakeTaskDraft = reactive({
+    /** target（目标）: 唤醒哪一侧 Agent. */
+    target: 'voice_llm' as WakeTask['target'],
+    /** when（时间）: 项目本地时间. */
+    when: '',
+    /** repeat（间隔）: 固定循环间隔，空值表示一次性. */
+    repeat: '',
+    /** text（任务说明）: 触发时提供给 Agent 的方向. */
+    text: '',
+  })
   const loading = ref(false)
   const saving = ref(false)
   const lastError = ref('')
@@ -371,7 +384,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     loading.value = true
     snapshotRequest = productApi.snapshot().then(async value => {
       applySnapshot(value)
-      await refreshSpeaker()
+      await Promise.all([refreshSpeaker(), refreshWakeTasks()])
       lastError.value = ''
     }).catch(setError).finally(() => {
       loading.value = false
@@ -379,6 +392,57 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     })
     return snapshotRequest
   }
+
+  async function refreshWakeTasks() {
+    if (replayMode) return
+    try {
+      const result = await productApi.wakeTasks()
+      wakeTasks.value = Array.isArray(result.tasks) ? result.tasks : []
+    } catch (error) { setError(error) }
+  }
+
+  function editWakeTask(task: WakeTask) {
+    if (task.status !== 'pending') return
+    editingWakeTaskId.value = task.task_id
+    wakeTaskDraft.target = task.target
+    if (task.when) {
+      const date = new Date(task.when)
+      const pad = (value: number) => String(value).padStart(2, '0')
+      wakeTaskDraft.when = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+    } else wakeTaskDraft.when = ''
+    wakeTaskDraft.repeat = task.repeat || ''
+    wakeTaskDraft.text = task.text
+  }
+
+  async function saveWakeTask() {
+    if (!editingWakeTaskId.value) return
+    saving.value = true
+    try {
+      await productApi.updateWakeTask(editingWakeTaskId.value, {
+        target: wakeTaskDraft.target,
+        when: wakeTaskDraft.when,
+        repeat: wakeTaskDraft.repeat,
+        text: wakeTaskDraft.text,
+      })
+      editingWakeTaskId.value = ''
+      await refreshWakeTasks()
+      setNotice('唤醒任务已更新。')
+    } catch (error) { setError(error) }
+    finally { saving.value = false }
+  }
+
+  async function removeWakeTask(task: WakeTask) {
+    try {
+      await productApi.deleteWakeTask(task.task_id)
+      if (editingWakeTaskId.value === task.task_id) editingWakeTaskId.value = ''
+      await refreshWakeTasks()
+      setNotice(task.status === 'pending' ? '唤醒任务已取消并移除。' : '归档任务已移除。')
+    } catch (error) { setError(error) }
+  }
+
+  watch(settingsTab, value => {
+    if (value === 'wakes') void refreshWakeTasks()
+  })
 
   async function openDshConsole() {
     const tab = window.open('about:blank', '_blank')
@@ -1145,6 +1209,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     settings,
     registry,
     dsh,
+    wakeTasks,
+    editingWakeTaskId,
+    wakeTaskDraft,
     loading,
     saving,
     connected,
@@ -1197,6 +1264,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     noticeVisible,
     loadSnapshot,
     openDshConsole,
+    refreshWakeTasks,
+    editWakeTask,
+    saveWakeTask,
+    removeWakeTask,
     refreshRegistry,
     runtimeAction,
     resetSession,
