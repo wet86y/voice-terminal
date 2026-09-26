@@ -3,6 +3,7 @@ import type {
   ProductApiErrorShape,
   ProductMutationResult,
   ProductSnapshot,
+  WakeTask,
 } from './types'
 
 const DEFAULT_API_URL = 'http://127.0.0.1:8765'
@@ -65,6 +66,9 @@ export const productApi = {
   snapshot: () => request<ProductSnapshot>('/api/v1/product/snapshot'),
   dshStatus: () => request<DshRuntimeStatus>('/api/v1/dsh/status'),
   launchDsh: () => request<{ url: string }>('/api/v1/dsh/ui-launch', { method: 'POST', body: '{}' }),
+  wakeTasks: () => request<{ tasks: WakeTask[] }>('/api/v1/wake-tasks'),
+  updateWakeTask: (id: string, value: unknown) => request<WakeTask>(`/api/v1/wake-tasks/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(value) }),
+  deleteWakeTask: (id: string) => request<{ deleted: boolean }>(`/api/v1/wake-tasks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   saveWake: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/wake', jsonBody(value)),
   saveSilence: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/silence', jsonBody(value)),
   saveShadow: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/shadow', jsonBody(value)),

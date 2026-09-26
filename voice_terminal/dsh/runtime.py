@@ -223,16 +223,21 @@ class DshRuntimeManager:
         except (OSError, ValueError) as exc:
             raise RuntimeError("DSH Web profile package.json（配置清单）缺失或无效。") from exc
         preset_package_name = "@voice-terminal/dsh-shadow-agent-preset"
+        wake_package_name = "@voice-terminal/dsh-wake-tasks"
         if not profile_manifest.get("dependencies", {}).get(preset_package_name):
             raise RuntimeError("Shadow preset Bundle（Shadow 预设功能包）未安装到 Web profile（网页配置）。")
         if preset_package_name not in profile_manifest.get("dsh", {}).get("profile", {}).get("bundles", []):
             raise RuntimeError("Shadow preset Bundle（Shadow 预设功能包）未注册到 Web profile（网页配置）。")
+        if not profile_manifest.get("dependencies", {}).get(wake_package_name):
+            raise RuntimeError("唤醒任务插件未安装到 Web profile（网页配置）。")
+        if wake_package_name not in profile_manifest.get("dsh", {}).get("profile", {}).get("bundles", []):
+            raise RuntimeError("唤醒任务插件未注册到 Web profile（网页配置）。")
         build_state = self.config.source_dir.parent / "build-state.json"
         try:
             state = json.loads(build_state.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as exc:
             raise RuntimeError("DSH build-state.json 缺失或无效。") from exc
-        if state.get("schema_version") != 4:
+        if state.get("schema_version") != 5:
             raise RuntimeError("DSH build-state 格式版本不受支持；请重新运行 scripts\\setup-dsh.ps1。")
         if state.get("bridge_protocol_version") != self.config.bridge_protocol_version:
             raise RuntimeError("DSH Bridge build-state 协议版本漂移；请重新运行 setup-dsh.ps1。")
@@ -255,6 +260,20 @@ class DshRuntimeManager:
             bridge_bundle_dir / "lib" / "generated-prompt.js",
             bridge_bundle_dir / "lib" / "client.js",
         )
+        wake_bundle_dir = self.config.source_dir.parent / "bundles" / "voice-terminal-wake-tasks"
+        wake_source = self.repo_root / "integrations" / "dsh" / "voice-terminal-wake-tasks"
+        wake_build_inputs = (
+            wake_source / "src",
+            wake_source / "package.json",
+            wake_source / "build.mjs",
+            wake_source / "cordis.patch.yml",
+        )
+        wake_runtime_artifacts = (
+            wake_bundle_dir / "package.json",
+            wake_bundle_dir / "cordis.patch.yml",
+            wake_bundle_dir / "lib" / "index.js",
+            wake_bundle_dir / "lib" / "plugin.js",
+        )
         common_prompt = self.repo_root / "config" / "shadow_agent" / "instructions.md"
         dsh_rules = self.repo_root / "config" / "dsh" / "shadow-agent.rules.md"
         preset_runtime_artifacts = (preset_bundle_dir / "package.json", preset_bundle_dir / "cordis.patch.yml")
@@ -264,6 +283,8 @@ class DshRuntimeManager:
             ("shadow_preset_runtime_artifacts_sha256", self._tree_hash(*preset_runtime_artifacts), "Shadow preset Bundle 运行产物"),
             ("shadow_preset_build_inputs_sha256", self._tree_hash(source_preset), "Shadow preset Bundle 构建输入"),
             ("shadow_prompt_sha256", self._tree_hash(common_prompt, dsh_rules), "Shadow 提示词"),
+            ("wake_tasks_runtime_artifacts_sha256", self._tree_hash(*wake_runtime_artifacts), "唤醒任务插件运行产物"),
+            ("wake_tasks_build_inputs_sha256", self._tree_hash(*wake_build_inputs), "唤醒任务插件构建输入"),
         )
         for key, actual, label in checks:
             if state.get(key) != actual:
@@ -274,6 +295,12 @@ class DshRuntimeManager:
             raise RuntimeError("DSH Bridge package.json 缺失或无效。") from exc
         if bridge_package.get("main") != "lib/plugin.js" or bridge_package.get("exports", {}).get(".") != "./lib/plugin.js":
             raise RuntimeError("DSH Bridge 插件包入口未指向带配置模式的 plugin.js。")
+        try:
+            wake_package = json.loads((wake_bundle_dir / "package.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("唤醒任务插件 package.json 缺失或无效。") from exc
+        if wake_package.get("main") != "lib/plugin.js" or wake_package.get("exports", {}).get(".") != "./lib/plugin.js":
+            raise RuntimeError("唤醒任务插件入口未指向 plugin.js。")
         return node, cli
 
     @staticmethod

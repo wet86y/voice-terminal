@@ -119,8 +119,13 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
         try:
             yield
         finally:
-            await runtime.close()
-            await runtime.dsh.close()
+            try:
+                await runtime.close_background_services()
+            finally:
+                try:
+                    await runtime.close()
+                finally:
+                    await runtime.dsh.close()
 
     app = create_app(
         runtime,

@@ -16,6 +16,8 @@ venv/
 config/local.yaml
 config/model-registry.json
 config/product-settings.json
+config/continuity-state.json
+config/wake-tasks.json
 config/speaker/
 *.part
 

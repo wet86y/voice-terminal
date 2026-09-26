@@ -104,6 +104,10 @@ class SessionLedger:
             content=content,
         ))
 
+    def commit_runtime_context(self, kind: str, content: Any) -> None:
+        """Project non-dialogue runtime context to Shadow without adding LLM history."""
+        self._commit_shadow_input("runtime", kind, content)
+
     def shadow_context_snapshot(self) -> ShadowContextSnapshot:
         return ShadowContextSnapshot(
             epoch=self._shadow_context_epoch,

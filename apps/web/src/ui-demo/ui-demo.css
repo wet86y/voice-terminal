@@ -290,6 +290,15 @@ button { cursor: pointer; }
 .pool-entry-actions .danger-action:hover { border-color: #f0808f78; color: #f0b3bd; background: #f0808f12; }
 .readonly-tag { padding: 5px 6px; border: 1px solid #ffffff0e; border-radius: 5px; color: #8996ae; font-size: 8px; white-space: nowrap; }
 .model-edit-panel { grid-column: 1 / -1; display: grid; gap: 14px; margin: 2px -1px -1px; padding: 14px 0 0; border-top: 1px solid #ffffff12; }
+.wake-task-list { display: grid; gap: 9px; margin-top: 12px; }
+.wake-task-card { padding: 13px 14px; }
+.wake-task-summary { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.wake-task-summary > div:first-child { display: grid; flex: 1; gap: 5px; min-width: 0; }
+.wake-task-summary .pool-entry-title strong { overflow-wrap: anywhere; white-space: normal; }
+.wake-task-summary small { color: var(--subtle); font-size: 9px; line-height: 1.5; }
+.wake-task-card .model-edit-panel { margin-top: 12px; }
+.wake-task-card .wake-task-text-field textarea { width: 100%; min-width: 0; min-height: 82px; resize: vertical; padding: 8px 9px; border: 1px solid #ffffff19; border-radius: 7px; outline: none; color: #dbe5fb; background: #050b18a1; font: inherit; font-size: 11px; line-height: 1.5; }
+.wake-task-card .wake-task-text-field textarea:focus { border-color: #91aaff78; box-shadow: 0 0 0 2px #7899f112; }
 .edit-panel-heading, .edit-panel-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .edit-panel-heading strong, .edit-panel-heading small { display: block; }
 .edit-panel-heading strong { color: #dce6fa; font-size: 11px; font-weight: 620; }
@@ -355,6 +364,8 @@ button { cursor: pointer; }
   .reasoning-fieldset { grid-column: auto; }
   .reasoning-chip-list { grid-template-columns: repeat(5, minmax(0, 1fr)); }
   .pool-entry { grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
+  .wake-task-summary { align-items: start; }
+  .wake-task-summary .pool-entry-actions { flex-wrap: wrap; }
   .pool-entry-policy { grid-column: 1 / -1; }
   .pool-entry-actions, .readonly-tag { grid-column: 2; grid-row: 1; }
   .pool-entry-actions { align-self: start; }
@@ -374,6 +385,8 @@ button { cursor: pointer; }
   .reasoning-chip-list button strong { font-size: 9px; }
   .reasoning-chip-list button small { font-size: 7px; }
   .pool-entry { grid-template-columns: 1fr; }
+  .wake-task-summary { align-items: start; flex-direction: column; }
+  .wake-task-summary .pool-entry-actions { justify-self: start; }
   .pool-entry-actions, .readonly-tag { grid-column: 1; grid-row: auto; justify-self: start; }
   .pool-entry-policy { grid-column: 1; }
   .local-models-disclosure summary { align-items: start; flex-wrap: wrap; }

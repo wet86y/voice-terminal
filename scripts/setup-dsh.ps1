@@ -17,6 +17,22 @@ $PackagePath = Join-Path $SourceDir "package.json"
 $BuildStatePath = Join-Path $RuntimeRoot "build-state.json"
 $BridgeDir = Join-Path $RepoRoot "integrations\dsh\voice-terminal-shadow-bridge"
 $BridgeArtifactDir = Join-Path $RuntimeRoot "bundles\voice-terminal-shadow-bridge"
+$WakeTasksDir = Join-Path $RepoRoot "integrations\dsh\voice-terminal-wake-tasks"
+$WakeTasksArtifactDir = Join-Path $RuntimeRoot "bundles\voice-terminal-wake-tasks"
+$WakeTasksPackageName = "@voice-terminal/dsh-wake-tasks"
+$WakeTasksPackagePath = Join-Path $WakeTasksArtifactDir "package.json"
+$WakeTasksBuildInputPaths = @(
+  (Join-Path $WakeTasksDir "src"),
+  (Join-Path $WakeTasksDir "package.json"),
+  (Join-Path $WakeTasksDir "build.mjs"),
+  (Join-Path $WakeTasksDir "cordis.patch.yml")
+)
+$WakeTasksRuntimeArtifactPaths = @(
+  $WakeTasksPackagePath,
+  (Join-Path $WakeTasksArtifactDir "cordis.patch.yml"),
+  (Join-Path $WakeTasksArtifactDir "lib\index.js"),
+  (Join-Path $WakeTasksArtifactDir "lib\plugin.js")
+)
 $ShadowPresetArtifactDir = Join-Path $RuntimeRoot "bundles\voice-terminal-shadow-preset"
 $ShadowPresetPackageName = "@voice-terminal/dsh-shadow-agent-preset"
 $ShadowPresetPackagePath = Join-Path $ShadowPresetArtifactDir "package.json"
@@ -139,7 +155,7 @@ function Update-ManagedProfilePatch {
 }
 
 if (-not (Test-Path -LiteralPath $LockPath)) { throw "DSH 锁文件缺失：$LockPath" }
-foreach ($Required in @($BridgePackagePath, (Join-Path $BridgeDir "src\index.ts"), (Join-Path $PresetSource "preset.yml"), (Join-Path $PresetSource "agent.cordis.yml"), $CommonPromptPath, $DshRulesPath)) {
+foreach ($Required in @($BridgePackagePath, (Join-Path $BridgeDir "src\index.ts"), (Join-Path $WakeTasksDir "src\index.ts"), (Join-Path $WakeTasksDir "src\plugin.ts"), (Join-Path $PresetSource "preset.yml"), (Join-Path $PresetSource "agent.cordis.yml"), $CommonPromptPath, $DshRulesPath)) {
   if (-not (Test-Path -LiteralPath $Required)) { throw "DSH 受管源文件缺失：$Required" }
 }
 $Lock = Get-Content -LiteralPath $LockPath -Raw | ConvertFrom-Json
@@ -277,8 +293,10 @@ if ($PresetText -match "tools\.restrict|exact safe tool surface") { throw "正�
 
 if (-not $ValidateOnly) {
   Invoke-Checked -Command node -Arguments @((Join-Path $BridgeDir "build.mjs"), $BridgeArtifactDir)
+  Invoke-Checked -Command node -Arguments @((Join-Path $WakeTasksDir "build.mjs"), $WakeTasksArtifactDir)
   if (-not (Test-Path -LiteralPath $BridgeEntryPath)) { throw "DSH Bridge 核心构建产物缺失：$BridgeEntryPath" }
   if (-not (Test-Path -LiteralPath $BridgePluginEntryPath)) { throw "DSH Bridge 插件入口缺失：$BridgePluginEntryPath" }
+  if (-not (Test-Path -LiteralPath (Join-Path $WakeTasksArtifactDir "lib\plugin.js"))) { throw "唤醒任务插件入口缺失。" }
   Invoke-Checked -Command node -Arguments @((Join-Path $PSScriptRoot "build-dsh-client.mjs"), $BridgeDir, $BridgeArtifactDir, $SourceDir)
   if (-not (Test-Path -LiteralPath $BridgeClientEntryPath)) { throw "DSH Bridge 浏览器插件产物缺失：$BridgeClientEntryPath" }
 }
@@ -302,12 +320,17 @@ if ($ValidateOnly) {
   if (-not (Test-Path -LiteralPath $BridgeEntryPath)) { throw "DSH Bridge 构建产物缺失。" }
   if (-not (Test-Path -LiteralPath $BridgePluginEntryPath)) { throw "DSH Bridge 插件入口缺失。" }
   if (-not (Test-Path -LiteralPath $BridgeClientEntryPath)) { throw "DSH Bridge 浏览器插件产物缺失。" }
+  foreach ($RuntimeArtifactPath in $WakeTasksRuntimeArtifactPaths) {
+    if (-not (Test-Path -LiteralPath $RuntimeArtifactPath -PathType Leaf)) { throw "唤醒任务插件运行产物缺失：$RuntimeArtifactPath" }
+  }
   if (-not (Test-Path -LiteralPath $ProfilePackagePath)) { throw "DSH web profile manifest 缺失。" }
   $ProfilePackage = Get-Content -LiteralPath $ProfilePackagePath -Raw | ConvertFrom-Json
   if (-not $ProfilePackage.dependencies.'@voice-terminal/dsh-shadow-bridge') { throw "DSH Bridge 未安装到 web profile。" }
   if ($ProfilePackage.dsh.profile.bundles -notcontains '@voice-terminal/dsh-shadow-bridge') { throw "DSH Bridge bundle 未注册到 web profile。" }
   if ($ProfilePackage.dependencies.PSObject.Properties.Name -notcontains $ShadowPresetPackageName) { throw "Shadow preset Bundle（Shadow 预设功能包）未安装到 web profile。" }
   if ($ProfilePackage.dsh.profile.bundles -notcontains $ShadowPresetPackageName) { throw "Shadow preset Bundle（Shadow 预设功能包）未注册到 web profile。" }
+  if ($ProfilePackage.dependencies.PSObject.Properties.Name -notcontains $WakeTasksPackageName) { throw "唤醒任务插件未安装到 web profile。" }
+  if ($ProfilePackage.dsh.profile.bundles -notcontains $WakeTasksPackageName) { throw "唤醒任务插件未注册到 web profile。" }
   $ArtifactPackagePath = Join-Path $BridgeArtifactDir "package.json"
   if (-not (Test-Path -LiteralPath $ArtifactPackagePath)) { throw "DSH Bridge artifact package.json 缺失。" }
   foreach ($RuntimeArtifactPath in $BridgeRuntimeArtifactPaths) {
@@ -317,17 +340,23 @@ if ($ValidateOnly) {
   if ($ArtifactPackage.main -ne 'lib/plugin.js' -or $ArtifactPackage.exports.'.' -ne './lib/plugin.js') { throw "DSH Bridge 插件包入口未指向带配置模式的 plugin.js。" }
   if ($ArtifactPackage.exports.'./client' -ne './lib/client.js') { throw "DSH Bridge 浏览器入口未导出。" }
   if ($ArtifactPackage.dsh.client.platform -ne 'web') { throw "DSH Bridge 未声明 web client bundle。" }
+  $WakeTasksArtifactPackage = Get-Content -LiteralPath $WakeTasksPackagePath -Raw | ConvertFrom-Json
+  if ($WakeTasksArtifactPackage.main -ne 'lib/plugin.js' -or $WakeTasksArtifactPackage.exports.'.' -ne './lib/plugin.js') { throw "唤醒任务插件入口未指向 plugin.js。" }
   $State = Get-Content -LiteralPath $BuildStatePath -Raw | ConvertFrom-Json
-  if ($State.schema_version -ne 4) { throw "DSH build-state 格式版本已过期；请重新运行 setup-dsh.ps1。" }
+  if ($State.schema_version -ne 5) { throw "DSH build-state 格式版本已过期；请重新运行 setup-dsh.ps1。" }
   $CurrentRuntimeArtifactHash = Get-TreeHash @($BridgeRuntimeArtifactPaths)
   $CurrentBuildInputsHash = Get-TreeHash @($BridgeBuildInputPaths)
   $CurrentShadowPresetRuntimeHash = Get-TreeHash @($ShadowPresetRuntimeArtifactPaths)
   $CurrentShadowPresetBuildInputsHash = Get-TreeHash @($ShadowPresetBuildInputPaths)
+  $CurrentWakeTasksRuntimeHash = Get-TreeHash @($WakeTasksRuntimeArtifactPaths)
+  $CurrentWakeTasksBuildInputsHash = Get-TreeHash @($WakeTasksBuildInputPaths)
   if ($State.bridge_protocol_version -ne $BridgeProtocolVersion) { throw "DSH Bridge 协议版本漂移。" }
   if ($State.bridge_runtime_artifacts_sha256 -ne $CurrentRuntimeArtifactHash) { throw "DSH Bridge 运行产物 hash 漂移。" }
   if ($State.bridge_build_inputs_sha256 -ne $CurrentBuildInputsHash) { throw "DSH Bridge 构建输入 hash 漂移。" }
   if ($State.shadow_preset_runtime_artifacts_sha256 -ne $CurrentShadowPresetRuntimeHash) { throw "Shadow preset Bundle（Shadow 预设功能包）运行产物 hash 漂移。" }
   if ($State.shadow_preset_build_inputs_sha256 -ne $CurrentShadowPresetBuildInputsHash) { throw "Shadow preset Bundle（Shadow 预设功能包）源文件 hash 漂移。" }
+  if ($State.wake_tasks_runtime_artifacts_sha256 -ne $CurrentWakeTasksRuntimeHash) { throw "唤醒任务插件运行产物 hash 漂移。" }
+  if ($State.wake_tasks_build_inputs_sha256 -ne $CurrentWakeTasksBuildInputsHash) { throw "唤醒任务插件源文件 hash 漂移。" }
   if ($State.shadow_prompt_sha256 -ne $PromptHash) { throw "Shadow 公共提示词或 DSH 附加规则已漂移。" }
 }
 
@@ -337,7 +366,7 @@ if (-not $ValidateOnly) {
     if (Test-Path -LiteralPath $BuildStatePath) {
       try { $PreviousState = Get-Content -LiteralPath $BuildStatePath -Raw | ConvertFrom-Json } catch { }
     }
-    if (-not $PreviousState -or $PreviousState.commit -ne $Lock.commit -or $PreviousState.schema_version -ne 4) {
+    if (-not $PreviousState -or $PreviousState.commit -ne $Lock.commit -or $PreviousState.schema_version -ne 5) {
       $BackupPath = Join-Path $RuntimeRoot ("home.backup-{0}-{1}" -f $Lock.version, (Get-Date -Format "yyyyMMdd-HHmmss"))
       New-Item -ItemType Directory -Force -Path $RuntimeRoot | Out-Null
       & robocopy $HomeDir $BackupPath /E /COPY:DAT /DCOPY:DAT /SL /SJ /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
@@ -345,7 +374,7 @@ if (-not $ValidateOnly) {
       Write-Host "DSH_HOME 已备份到 $BackupPath" -ForegroundColor Yellow
     }
   }
-  New-Item -ItemType Directory -Force -Path $ProfileDir, $ShadowPresetArtifactDir | Out-Null
+  New-Item -ItemType Directory -Force -Path $ProfileDir, $ShadowPresetArtifactDir, $WakeTasksArtifactDir | Out-Null
   $ProfilePatchPath = Join-Path $ProfileDir "cordis.patch.yml"
   Update-ManagedProfilePatch -ProfilePatchPath $ProfilePatchPath
   Write-Utf8NoBom -Path $ShadowPresetPackagePath -Text $ShadowPresetPackageText
@@ -356,10 +385,14 @@ if (-not $ValidateOnly) {
   $PresetPluginArgs = @($CliPath, "plugin", "--profile", "web", "add", $ShadowPresetArtifactDir, "--save-exact")
   if ($Offline) { $PresetPluginArgs += "--offline" }
   Invoke-Checked -Command node -Arguments $PresetPluginArgs
+  $WakeTasksPluginArgs = @($CliPath, "plugin", "--profile", "web", "add", $WakeTasksArtifactDir, "--save-exact")
+  if ($Offline) { $WakeTasksPluginArgs += "--offline" }
+  Invoke-Checked -Command node -Arguments $WakeTasksPluginArgs
   $DumpConfig = (& node $CliPath --profile web --dump-config 2>&1 | Out-String)
   if ($LASTEXITCODE -ne 0) { throw "DSH dump-config 失败。" }
   if ($DumpConfig -notmatch [regex]::Escape('@voice-terminal/dsh-shadow-bridge')) { throw "DSH dump-config 未包含 Bridge Bundle。" }
   if ($DumpConfig -notmatch [regex]::Escape($ShadowPresetPackageName) -or $DumpConfig -notmatch 'preset-shadow-agent') { throw "DSH dump-config 未包含 Shadow preset Bundle（Shadow 预设功能包）声明。" }
+  if ($DumpConfig -notmatch [regex]::Escape($WakeTasksPackageName)) { throw "DSH dump-config 未包含唤醒任务插件声明。" }
   $DumpConfig | Set-Content -LiteralPath $DumpConfigPath -Encoding utf8
   $ManagedHash = Get-TreeHash @((Split-Path -Parent $PatchSource), $PresetSource)
   foreach ($RuntimeArtifactPath in $BridgeRuntimeArtifactPaths) {
@@ -369,8 +402,10 @@ if (-not $ValidateOnly) {
   $BridgeBuildInputsHash = Get-TreeHash @($BridgeBuildInputPaths)
   $ShadowPresetRuntimeArtifactHash = Get-TreeHash @($ShadowPresetRuntimeArtifactPaths)
   $ShadowPresetBuildInputsHash = Get-TreeHash @($ShadowPresetBuildInputPaths)
+  $WakeTasksRuntimeArtifactHash = Get-TreeHash @($WakeTasksRuntimeArtifactPaths)
+  $WakeTasksBuildInputsHash = Get-TreeHash @($WakeTasksBuildInputPaths)
   [ordered]@{
-    schema_version = 4
+    schema_version = 5
     repository = $Lock.repository
     tag = $Tag
     commit = $Head
@@ -384,6 +419,8 @@ if (-not $ValidateOnly) {
     bridge_build_inputs_sha256 = $BridgeBuildInputsHash
     shadow_preset_runtime_artifacts_sha256 = $ShadowPresetRuntimeArtifactHash
     shadow_preset_build_inputs_sha256 = $ShadowPresetBuildInputsHash
+    wake_tasks_runtime_artifacts_sha256 = $WakeTasksRuntimeArtifactHash
+    wake_tasks_build_inputs_sha256 = $WakeTasksBuildInputsHash
     shadow_prompt_sha256 = $PromptHash
     source_dir = $SourceDir
     home_dir = $HomeDir

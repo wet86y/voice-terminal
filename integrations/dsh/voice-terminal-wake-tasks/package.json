@@ -1,0 +1,16 @@
+{
+  "name": "@voice-terminal/dsh-wake-tasks",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/plugin.js",
+  "files": ["lib/index.js", "lib/plugin.js", "cordis.patch.yml", "README.md"],
+  "exports": { ".": "./lib/plugin.js" },
+  "scripts": { "build": "node build.mjs" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/schemastery": "*"
+  }
+}

@@ -15,6 +15,7 @@ const {
   voice, page: activePage, settingsTab: activeSettingsTab, settings, loading, saving,
   connected, replayMode, replayMeta, runtimeState, current, conversationRows, pendingSpeechRows,
   currentTurnLogged, currentTurnSpeechLogged, currentTurnSpeechPending, shadow, latencyMs, latencyRunning, wakeForm,
+  wakeTasks, editingWakeTaskId, wakeTaskDraft, refreshWakeTasks, editWakeTask, saveWakeTask, removeWakeTask,
   maxWakeKeywords, addWakeKeyword, removeWakeKeyword,
   silenceSeconds, personaDocument: activePersona, personaDocuments, providerForm,
   providerStep, discoveredModels, modelAssignments, uiModels: modelEntries,
@@ -650,6 +651,64 @@ function speakerStateLabel(value: unknown) {
   return labels[String(value || '')] || String(value || '—')
 }
 
+function speakerTestReasonLabel(result: Record<string, unknown> | null | undefined) {
+  if (!result) return ''
+  const reason = String(result.reason || '')
+  const candidateWindows = Math.max(0, Number(result.candidate_window_count) || 0)
+  const failedWindows = Math.max(0, Number(result.failed_window_count) || 0)
+  const minWindowMs = Math.max(1, Number(result.minimum_window_speech_ms) || 700)
+  // minimum_window_speech_ratio（窗口最小人声占比）与最短人声时长同时生效。
+  const minWindowRatio = Math.max(0, Math.min(1, Number(result.minimum_window_speech_ratio) || 0))
+  const windowMs = Math.max(1, Number(result.window_ms) || 2000)
+  const minTurnMs = Math.max(minWindowMs, Number(result.minimum_turn_speech_ms) || 1500)
+  const qualityCounts = (result.window_quality_counts || {}) as Record<string, unknown>
+  const tooQuietWindows = Math.max(0, Number(qualityCounts.too_quiet) || 0)
+  const clippedWindows = Math.max(0, Number(qualityCounts.clipped) || 0)
+  if (reason === 'speaker_test_no_usable_window') {
+    return failedWindows > 0
+      ? `${candidateWindows} 个候选窗口中有 ${failedWindows} 个未能生成声纹特征，服务端已记录诊断。`
+      : '没有生成可用的声纹特征，请检查录音内容和声纹模型状态。'
+  }
+  if (reason === 'speaker_test_insufficient_window_speech') {
+    if (candidateWindows > 0 && tooQuietWindows === candidateWindows) {
+      return `所有 ${candidateWindows} 个候选窗口的电平都过低，请提高麦克风输入音量后再测。`
+    }
+    if (candidateWindows > 0 && clippedWindows === candidateWindows) {
+      return `所有 ${candidateWindows} 个候选窗口都发生削波，请降低麦克风输入增益后再测。`
+    }
+    const ratioRule = minWindowRatio > 0
+      ? `，并覆盖完整 ${(windowMs / 1000).toFixed(1)} 秒窗口的 ${Math.round(minWindowRatio * 100)}%`
+      : ''
+    return `每个滑窗至少需要 ${(minWindowMs / 1000).toFixed(1)} 秒有效人声${ratioRule}；本次没有窗口达到门槛。`
+  }
+  if (reason === 'speaker_test_insufficient_turn_speech') {
+    return `整段测试至少需要 ${(minTurnMs / 1000).toFixed(1)} 秒有效人声。`
+  }
+  if (reason === 'speaker_score_ambiguous') {
+    return '已提取到有效声纹，但相似度处于不确定区间。'
+  }
+  return ''
+}
+
+function speakerTestWindowSummary(result: Record<string, unknown> | null | undefined) {
+  if (!result) return ''
+  const measuredMs = Math.max(0, Number(result.measured_speech_ms) || 0)
+  const candidates = Math.max(0, Number(result.candidate_window_count) || 0)
+  const eligible = Math.max(0, Number(result.eligible_window_count) || 0)
+  const scored = Math.max(0, Number(result.window_count) || 0)
+  const diagnostics = Array.isArray(result.window_diagnostics)
+    ? result.window_diagnostics as Array<Record<string, unknown>>
+    : []
+  const vadMeasured = diagnostics.some(item => typeof item.speech_ratio === 'number')
+  const measurementLabel = vadMeasured
+    ? 'VAD检测人声'
+    : diagnostics.length > 0 ? '能量估算人声（VAD不可用）' : '检测人声'
+  const maxWindowMs = diagnostics.reduce(
+    (max, item) => Math.max(max, Number(item.speech_ms) || 0), 0,
+  )
+  return `${measurementLabel} ${(measuredMs / 1000).toFixed(1)} 秒 · 单窗最高 ${(maxWindowMs / 1000).toFixed(1)} 秒 · 门槛通过 ${eligible} / ${candidates} 个窗口 · 参与判定 ${scored} 个`
+}
+
 function restoreSpeakerDefaults() {
   // Mirrors config/default.yaml.  Changing the feature frontend moved the raw
   // cosine operating point, so these numbers are not comparable with any
@@ -1020,7 +1079,7 @@ function pageLabel() {
       <header class="settings-heading"><div><p class="panel-kicker">应用设置</p><h1>让助手更像你的工作方式</h1><p>设置通过 Voice Server 产品 API 保存；KWS、Persona、最终静默设置在安全边界后于下一次会话或 Episode 生效。</p></div><span class="settings-badge">{{ connected ? '实时后端已连接' : '后端离线 · 可重试' }}</span></header>
       <div v-if="settings.warnings.length" class="model-safety"><span>!</span><p>{{ settings.warnings.join(' ') }}</p></div>
       <div class="settings-layout">
-        <nav class="settings-tabs"><button type="button" :class="{ active: activeSettingsTab === 'wake' }" @click="activeSettingsTab = 'wake'"><span>◌</span><div><strong>KWS 唤醒词</strong><small>启动与待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'persona' }" @click="activeSettingsTab = 'persona'"><span>✦</span><div><strong>人格与指令</strong><small>主 LLM 与 Shadow</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'silence' }" @click="activeSettingsTab = 'silence'"><span>◷</span><div><strong>静默等待</strong><small>最终检查与回待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'speaker' }" @click="activeSettingsTab = 'speaker'"><span>♬</span><div><strong>声纹识别</strong><small>可选身份增强</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'models' }" @click="activeSettingsTab = 'models'"><span>◇</span><div><strong>模型管理</strong><small>连接、配置与模型池</small></div></button></nav>
+        <nav class="settings-tabs"><button type="button" :class="{ active: activeSettingsTab === 'wake' }" @click="activeSettingsTab = 'wake'"><span>◌</span><div><strong>KWS 唤醒词</strong><small>启动与待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'persona' }" @click="activeSettingsTab = 'persona'"><span>✦</span><div><strong>人格与指令</strong><small>主 LLM 与 Shadow</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'silence' }" @click="activeSettingsTab = 'silence'"><span>◷</span><div><strong>静默等待</strong><small>最终检查与回待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'speaker' }" @click="activeSettingsTab = 'speaker'"><span>♬</span><div><strong>声纹识别</strong><small>可选身份增强</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'wakes' }" @click="activeSettingsTab = 'wakes'"><span>⏱</span><div><strong>唤醒任务</strong><small>定时与循环事件</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'models' }" @click="activeSettingsTab = 'models'"><span>◇</span><div><strong>模型管理</strong><small>连接、配置与模型池</small></div></button></nav>
 
         <article class="settings-panel panel">
           <template v-if="activeSettingsTab === 'wake'">
@@ -1061,11 +1120,28 @@ function pageLabel() {
             </div>
             <div class="info-callout"><span>!</span><p>阈值只是当前测试基线，不代表安全等级。阈值越宽松越容易连续对话，也越可能误认；第一版不提供防伪和变声检测（anti-spoofing：不可用）。</p></div>
 
-            <section class="speaker-enrollment-card"><div class="speaker-card-heading"><div><p class="section-label">VOICE PROFILE</p><h3>主人声纹模板</h3><p>固定一个逻辑用户，可保存多组带标签模板。原始注册录音在提取成功后立即删除；夹嗓子等特殊说法可以用自定义标签单独测试，但不能当作防伪保证。</p></div><div><button v-if="!speakerEnrollment && !speakerTestRecording" class="outline-button" type="button" @click="startSpeakerEnrollment">开始录制</button><button v-if="!speakerEnrollment && !speakerTestRecording" class="ghost-action" type="button" :disabled="!speakerHasProfile" @click="beginSpeakerTest">现场测试</button><button v-if="speakerTestRecording && speakerServerCapture" class="save-button compact-save" type="button" disabled>正在录制（{{ speakerRecordingSeconds }} 秒）</button><button v-else-if="speakerTestRecording" class="save-button compact-save" type="button" @click="stopSpeakerRecording">停止测试（{{ speakerRecordingSeconds }} 秒）</button></div></div><div v-if="speakerTestResult" class="speaker-test-result"><strong>{{ speakerStateLabel(speakerTestResult.state) }}</strong><span v-if="typeof speakerTestResult.similarity === 'number'">相似度 {{ Number(speakerTestResult.similarity).toFixed(2) }}</span><span v-if="typeof speakerTestResult.threshold_used === 'number'">判定阈值 {{ Number(speakerTestResult.threshold_used).toFixed(2) }}</span><small>与运行时同一口径（2 秒滑窗 + 整段聚合），本次测试不会改变运行模式。</small></div><div v-if="speakerEnrollment" class="speaker-recording-flow"><p>请依次朗读下方三段<strong>不同</strong>的句子，每段 5–10 秒，用平时对助手说话的速度与音量；三段之间保持同一设备与距离。不要反复念同一句，也不要用拖长音的持续元音。</p><p v-if="speakerEnrollment.guidance" class="speaker-guidance">{{ speakerEnrollment.guidance }}</p><div class="speaker-segment-list"><div v-for="(segment, index) in ['第 1 段', '第 2 段', '第 3 段']" :key="segment" class="speaker-segment-row"><span class="speaker-segment-index">0{{ index + 1 }}</span><div><strong>{{ segment }}</strong><small v-if="speakerPrompt(index)" class="speaker-prompt">「{{ speakerPrompt(index) }}」</small><small>{{ speakerEnrollment.segments.includes(index) ? '已接收' : '尚未录制' }}</small></div><input v-if="index === 2" :id="`speaker-label-${index}`" type="text" value="自定义" aria-label="自定义模板标签"><button v-if="speakerRecordingSegment === index && speakerServerCapture" class="save-button compact-save" type="button" disabled>正在录制（{{ speakerRecordingSeconds }} 秒）</button><button v-else-if="speakerRecordingSegment === index" class="save-button compact-save" type="button" @click="stopSpeakerRecording">停止录音（{{ speakerRecordingSeconds }} 秒）</button><button v-else class="outline-button" type="button" :disabled="speakerRecordingSegment !== null" @click="beginSpeakerRecording(index, speakerSegmentLabel(index, segment))">{{ speakerEnrollment.segments.includes(index) ? '重新录制' : '开始录制' }}</button></div></div><footer class="speaker-flow-footer"><span>{{ speakerEnrollment.segments.length }}/3 段已完成</span><div><button class="ghost-action" type="button" @click="cancelSpeakerEnrollment">取消本次录制</button><button class="save-button" type="button" :disabled="!speakerEnrollmentComplete || saving" @click="commitSpeakerEnrollment">提交声纹资料</button></div></footer></div><div v-else-if="speakerTemplates.length" class="speaker-template-list"><article v-for="template in speakerTemplates" :key="String(template.template_id)"><div><strong>{{ String(template.label || '自定义') }}</strong><small>{{ String(template.template_id).slice(0, 8) }} · {{ String(template.created_at || '').replace('T', ' ').slice(0, 16) }}</small></div><span>{{ template.include_in_centroid === false ? '未纳入主中心' : '已纳入主中心' }}</span><button class="ghost-action" type="button" @click="setSpeakerTemplateCentroid(String(template.template_id), template.include_in_centroid === false)">{{ template.include_in_centroid === false ? '纳入主中心' : '移出主中心' }}</button><button class="danger-action" type="button" @click="deleteSpeakerTemplate(String(template.template_id))">删除</button></article></div><div v-else class="pool-empty">还没有模板，请点击“开始录制”。</div></section>
+            <section class="speaker-enrollment-card"><div class="speaker-card-heading"><div><p class="section-label">VOICE PROFILE</p><h3>主人声纹模板</h3><p>固定一个逻辑用户，可保存多组带标签模板。原始注册录音在提取成功后立即删除；夹嗓子等特殊说法可以用自定义标签单独测试，但不能当作防伪保证。</p></div><div><button v-if="!speakerEnrollment && !speakerTestRecording" class="outline-button" type="button" @click="startSpeakerEnrollment">开始录制</button><button v-if="!speakerEnrollment && !speakerTestRecording" class="ghost-action" type="button" :disabled="!speakerHasProfile" @click="beginSpeakerTest">现场测试</button><button v-if="speakerTestRecording && speakerServerCapture" class="save-button compact-save" type="button" disabled>正在录制（{{ speakerRecordingSeconds }} 秒）</button><button v-else-if="speakerTestRecording" class="save-button compact-save" type="button" @click="stopSpeakerRecording">停止测试（{{ speakerRecordingSeconds }} 秒）</button></div></div><div v-if="speakerTestResult" class="speaker-test-result"><strong>{{ speakerStateLabel(speakerTestResult.state) }}</strong><span v-if="typeof speakerTestResult.similarity === 'number'">相似度 {{ Number(speakerTestResult.similarity).toFixed(2) }}</span><span v-if="typeof speakerTestResult.threshold_used === 'number'">判定阈值 {{ Number(speakerTestResult.threshold_used).toFixed(2) }}</span><small v-if="speakerTestReasonLabel(speakerTestResult)">{{ speakerTestReasonLabel(speakerTestResult) }}</small><small>{{ speakerTestWindowSummary(speakerTestResult) }}</small><small>与运行时同一口径（2 秒滑窗 + 整段聚合），本次测试不会改变运行模式。</small></div><div v-if="speakerEnrollment" class="speaker-recording-flow"><p>请依次朗读下方三段<strong>不同</strong>的句子，每段 5–10 秒，用平时对助手说话的速度与音量；三段之间保持同一设备与距离。不要反复念同一句，也不要用拖长音的持续元音。</p><p v-if="speakerEnrollment.guidance" class="speaker-guidance">{{ speakerEnrollment.guidance }}</p><div class="speaker-segment-list"><div v-for="(segment, index) in ['第 1 段', '第 2 段', '第 3 段']" :key="segment" class="speaker-segment-row"><span class="speaker-segment-index">0{{ index + 1 }}</span><div><strong>{{ segment }}</strong><small v-if="speakerPrompt(index)" class="speaker-prompt">「{{ speakerPrompt(index) }}」</small><small>{{ speakerEnrollment.segments.includes(index) ? '已接收' : '尚未录制' }}</small></div><input v-if="index === 2" :id="`speaker-label-${index}`" type="text" value="自定义" aria-label="自定义模板标签"><button v-if="speakerRecordingSegment === index && speakerServerCapture" class="save-button compact-save" type="button" disabled>正在录制（{{ speakerRecordingSeconds }} 秒）</button><button v-else-if="speakerRecordingSegment === index" class="save-button compact-save" type="button" @click="stopSpeakerRecording">停止录音（{{ speakerRecordingSeconds }} 秒）</button><button v-else class="outline-button" type="button" :disabled="speakerRecordingSegment !== null" @click="beginSpeakerRecording(index, speakerSegmentLabel(index, segment))">{{ speakerEnrollment.segments.includes(index) ? '重新录制' : '开始录制' }}</button></div></div><footer class="speaker-flow-footer"><span>{{ speakerEnrollment.segments.length }}/3 段已完成</span><div><button class="ghost-action" type="button" @click="cancelSpeakerEnrollment">取消本次录制</button><button class="save-button" type="button" :disabled="!speakerEnrollmentComplete || saving" @click="commitSpeakerEnrollment">提交声纹资料</button></div></footer></div><div v-else-if="speakerTemplates.length" class="speaker-template-list"><article v-for="template in speakerTemplates" :key="String(template.template_id)"><div><strong>{{ String(template.label || '自定义') }}</strong><small>{{ String(template.template_id).slice(0, 8) }} · {{ String(template.created_at || '').replace('T', ' ').slice(0, 16) }}</small></div><span>{{ template.include_in_centroid === false ? '未纳入主中心' : '已纳入主中心' }}</span><button class="ghost-action" type="button" @click="setSpeakerTemplateCentroid(String(template.template_id), template.include_in_centroid === false)">{{ template.include_in_centroid === false ? '纳入主中心' : '移出主中心' }}</button><button class="danger-action" type="button" @click="deleteSpeakerTemplate(String(template.template_id))">删除</button></article></div><div v-else class="pool-empty">还没有模板，请点击“开始录制”。</div></section>
 
             <section class="speaker-ambient-card"><div class="speaker-card-heading"><div><p class="section-label">AMBIENT CONTEXT</p><h3>当前会话环境记录</h3><p>筛选模式拦截的非本人文本只保存在内存中，不跨会话、不保存音频，也不会自动进入主 Agent。</p></div><div><button class="ghost-action" type="button" @click="refreshAmbientContext">刷新</button><button class="danger-action" type="button" :disabled="!ambientRecords.length" @click="clearAmbientContext">全部清空</button></div></div><div v-if="ambientRecords.length" class="ambient-record-list"><article v-for="record in ambientRecords" :key="String(record.turn_id) + String(record.timestamp)"><time>{{ formatTime(String(record.timestamp || '')) }}</time><p>{{ String(record.text || '') }}</p><small>{{ speakerStateLabel(record.speaker_state) }} · {{ String(record.reason || '路由到环境记录') }}</small></article></div><div v-else class="pool-empty">当前会话还没有被拦截的环境文本。</div></section>
 
             <footer><button class="save-button" type="button" :disabled="saving || Number(speakerForm.continuity_threshold) >= Number(speakerForm.confirm_threshold)" @click="saveSpeaker">{{ saving ? '正在保存…' : '保存声纹设置' }}</button></footer>
+          </template>
+
+          <template v-else-if="activeSettingsTab === 'wakes'">
+            <header><p class="panel-kicker">项目级唤醒</p><h2>定时唤醒任务</h2><p>任务由 DSH 创建并由 Voice Server 持久化调度。一次性任务在目标端接受唤醒后归档；循环任务按固定间隔继续。编辑任务不会更改创建时冻结的参考上下文。</p></header>
+            <div class="settings-stack">
+              <div class="speaker-card-heading"><div><span class="section-label">WAKE TASKS</span><p>待执行 {{ wakeTasks.filter(task => task.status === 'pending').length }} 项 · 已归档 {{ wakeTasks.filter(task => task.status === 'archived').length }} 项</p></div><button class="ghost-action" type="button" @click="refreshWakeTasks">刷新</button></div>
+              <div v-if="wakeTasks.length" class="wake-task-list">
+                <article v-for="task in wakeTasks" :key="task.task_id" class="model-accordion-card wake-task-card">
+                  <div class="wake-task-summary"><div><div class="pool-entry-title"><strong>{{ task.text }}</strong><span class="entry-status" :class="task.status">{{ task.status === 'pending' ? '待执行' : task.status === 'archived' ? '已归档' : '已取消' }}</span></div><small>目标：{{ task.target === 'voice_llm' ? '语音 LLM' : task.target === 'shadow_agent' ? '影子 Agent' : '双方' }} · 时间：{{ task.when ? formatTime(task.when) : '—' }}<template v-if="task.repeat"> · 每 {{ task.repeat }} 重复</template></small><small>参考上下文：{{ task.has_reference ? '已冻结，可按需读取' : '无' }}<template v-if="task.last_triggered_at"> · 最近触发：{{ formatTime(task.last_triggered_at) }}</template></small></div><div class="pool-entry-actions"><button v-if="task.status === 'pending'" type="button" @click="editingWakeTaskId === task.task_id ? editingWakeTaskId = '' : editWakeTask(task)">{{ editingWakeTaskId === task.task_id ? '收起' : '修改' }}</button><button class="danger-action" type="button" @click="removeWakeTask(task)">移除</button></div></div>
+                  <div v-if="editingWakeTaskId === task.task_id" class="model-edit-panel">
+                    <div class="provider-fields"><label><span>目标</span><select v-model="wakeTaskDraft.target"><option value="voice_llm">语音 LLM</option><option value="shadow_agent">影子 Agent</option><option value="both">双方</option></select></label><label><span>触发时间（项目本地时间）</span><input v-model="wakeTaskDraft.when" type="datetime-local"></label><label><span>固定重复间隔</span><input v-model="wakeTaskDraft.repeat" placeholder="留空表示一次性，例如 1h、1d" type="text"></label><label class="wake-task-text-field"><span>任务说明</span><textarea v-model="wakeTaskDraft.text" maxlength="500" rows="3"></textarea></label></div>
+                    <div class="edit-panel-footer"><span>任务说明最多 500 字；冻结参考上下文保持不变。</span><div><button class="ghost-action" type="button" @click="editingWakeTaskId = ''">取消</button><button class="save-button compact-save" type="button" :disabled="saving || !wakeTaskDraft.when || !wakeTaskDraft.text.trim()" @click="saveWakeTask">保存修改</button></div></div>
+                  </div>
+                </article>
+              </div>
+              <div v-else class="pool-empty">还没有唤醒任务。可在 DSH 会话中使用 schedule_wake（创建唤醒）工具添加。</div>
+            </div>
           </template>
 
           <template v-else>

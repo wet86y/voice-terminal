@@ -143,6 +143,32 @@ export interface DshRuntimeStatus {
   message: string
 }
 
+/** One Voice Terminal project wake task（一个语音项目定时唤醒任务）. */
+export interface WakeTask {
+  /** task_id（任务标识）. */
+  task_id: string
+  /** target（唤醒目标）：voice_llm、shadow_agent 或 both. */
+  target: 'voice_llm' | 'shadow_agent' | 'both'
+  /** when（触发时间）：按项目本地时区解释. */
+  when: string | null
+  /** repeat（固定重复间隔）；null 表示一次性任务. */
+  repeat: string | null
+  /** text（触发时传递的任务说明）. */
+  text: string
+  /** status（任务状态）. */
+  status: 'pending' | 'archived' | 'cancelled' | string
+  /** created_at（创建时间）. */
+  created_at: string | null
+  /** updated_at（更新时间）. */
+  updated_at: string | null
+  /** last_triggered_at（最近触发时间）. */
+  last_triggered_at: string | null
+  /** occurrence（当前循环序号）. */
+  occurrence: number
+  /** has_reference（是否保存了冻结参考）. */
+  has_reference: boolean
+}
+
 export interface ProductSnapshot {
   schema_version: number
   runtime: ProductRuntimeSnapshot
