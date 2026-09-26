@@ -48,3 +48,15 @@ transcript（对话记录） with their complete content（完整内容） and s
 Messages（消息） already shown as native DSH wake notices（原生唤醒提示） keep that
 presentation. Assistant（助手） and Tool（工具） execution records remain in DSH's
 existing Chat（对话） and Trajectory（执行轨迹） views（视图）.
+
+## DSH 0.1.7 对话显示兼容性
+
+从 DSH 0.1.5 升级到 0.1.7 后，Bridge（插件桥接层）写入的 `user/message`（用户消息）
+仍保存在会话事件流中并参与模型上下文，但 DSH Chat（对话页）的新节点投影默认不显示
+普通 `context`（上下文）节点，因此这些注入内容会从对话记录中消失。Bridge（插件桥接层）
+现在注册 `voice-terminal-context`（语音终端上下文节点），只呈现来源标记属于本插件的消息，
+并保留完整内容和来源。已经由 DSH 原生显示的唤醒提示不会重复呈现。
+
+从没有待办任务的空会话触发 DSH（影子代理宿主）时，代理可能以
+`finish_shadow_no_action`（无操作结束工具）正常结束，而不生成助手文字。验证唤醒执行时，
+应在唤醒说明或会话上下文中提供明确任务。
