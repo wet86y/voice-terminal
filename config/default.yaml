@@ -62,8 +62,8 @@ dsh:
   bridge_protocol_version: "1.0"
   restart_limit: 2
   restart_delay_ms: 1000
-  expected_version: 0.1.5-rc.2
-  expected_commit: fb2c4b9e698e30edb738bca4cf0618587db7d203
+  expected_version: 0.1.7-rc.2
+  expected_commit: 477b4f420553e8a52c2fbccc464d7561b239c443
 
 # Episode-scoped Markdown context. Files are read when a new Agent episode
 # starts and remain frozen for that episode.

@@ -3,9 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "lib/index.js",
+  "main": "lib/plugin.js",
   "files": [
     "lib/index.js",
+    "lib/index.js.map",
+    "lib/plugin.js",
+    "lib/plugin.js.map",
+    "lib/settings.js",
+    "lib/settings.js.map",
+    "lib/settings-contract.js",
+    "lib/settings-contract.js.map",
     "lib/client.js",
     "lib/client.js.map",
     "lib/generated-prompt.js",
@@ -14,7 +21,7 @@
     "README.md"
   ],
   "exports": {
-    ".": "./lib/index.js",
+    ".": "./lib/plugin.js",
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },

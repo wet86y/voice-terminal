@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useState, useSyncExternalStore, type ReactNode } from 'react'
-import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client'
+import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { IWorkspaces, WorkspaceSnapshot } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import { Button, IconChevronDownOutline14, IconFolderClose16, Menu } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -38,7 +38,7 @@ interface ModelCatalog {
 /** DSH services captured by this settings page（设置页面）. */
 export interface VoiceTerminalSettingsInjected {
   /** Persistent plugin preferences（插件专属持久设置）. */
-  readonly settings: SettingsScope<VoiceTerminalSettings>
+  readonly settings: ConfigForm<VoiceTerminalSettings>
   /** DSH's durable workspace projection（DSH 持久工作区列表）. */
   readonly workspaces: IWorkspaces
   /** Current routable DSH models（DSH 当前可用模型目录）. */

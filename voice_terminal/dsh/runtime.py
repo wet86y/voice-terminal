@@ -216,12 +216,13 @@ class DshRuntimeManager:
         managed_preset_meta = managed_preset.with_name("preset.yml")
         source_preset_meta = source_preset.with_name("preset.yml")
         for source, managed, label in (
-            (self.config.profile_patch, managed_patch, "Web profile patch"),
             (source_preset, managed_preset, "shadow-agent preset"),
             (source_preset_meta, managed_preset_meta, "shadow-agent preset metadata"),
         ):
             if not managed.is_file() or managed.read_bytes() != source.read_bytes():
                 raise RuntimeError(f"DSH_HOME 的 {label} 缺失或已漂移；请运行 scripts\\setup-dsh.ps1。")
+        if not self._profile_patch_preserves_managed_defaults(self.config.profile_patch, managed_patch):
+            raise RuntimeError("DSH_HOME 的 Web profile patch（Web 配置补丁）缺少正式 Shadow preset（Shadow 预设）或 session-log（会话日志）设置；请运行 scripts\\setup-dsh.ps1。")
         build_state = self.config.source_dir.parent / "build-state.json"
         try:
             state = json.loads(build_state.read_text(encoding="utf-8-sig"))
@@ -244,6 +245,7 @@ class DshRuntimeManager:
             bundle_dir / "package.json",
             bundle_dir / "cordis.patch.yml",
             bundle_dir / "lib" / "index.js",
+            bundle_dir / "lib" / "plugin.js",
             bundle_dir / "lib" / "settings.js",
             bundle_dir / "lib" / "settings-contract.js",
             bundle_dir / "lib" / "generated-prompt.js",
@@ -259,7 +261,40 @@ class DshRuntimeManager:
         for key, actual, label in checks:
             if state.get(key) != actual:
                 raise RuntimeError(f"DSH {label} hash 漂移；请重新运行 setup-dsh.ps1。")
+        try:
+            bridge_package = json.loads((bundle_dir / "package.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("DSH Bridge package.json 缺失或无效。") from exc
+        if bridge_package.get("main") != "lib/plugin.js" or bridge_package.get("exports", {}).get(".") != "./lib/plugin.js":
+            raise RuntimeError("DSH Bridge 插件包入口未指向带配置模式的 plugin.js。")
         return node, cli
+
+    @staticmethod
+    def _profile_patch_preserves_managed_defaults(source: Path, managed: Path) -> bool:
+        """Allow volatile user settings（热更新用户设置） in cordis.patch.yml（Cordis 配置补丁） while retaining managed rows（受管配置项）."""
+        try:
+            source_text = source.read_text(encoding="utf-8-sig")
+            managed_text = managed.read_text(encoding="utf-8-sig")
+        except OSError:
+            return False
+
+        def entry_block(text: str, entry_id: str) -> str | None:
+            match = re.search(
+                rf"(?ms)^- id: {re.escape(entry_id)}\s*$\n(?P<body>.*?)(?=^- id:|\Z)",
+                text,
+            )
+            return match.group("body") if match else None
+
+        checks = (
+            ("agent-presets", re.compile(r"(?m)^\s+default:\s*shadow-agent\s*$")),
+            ("session-log-deepseek", re.compile(r"(?m)^\s+disabled:\s*true\s*$")),
+        )
+        for entry_id, expected in checks:
+            source_block = entry_block(source_text, entry_id)
+            managed_block = entry_block(managed_text, entry_id)
+            if source_block is None or managed_block is None or not expected.search(source_block) or not expected.search(managed_block):
+                return False
+        return True
 
     def _tree_hash(self, *paths: Path) -> str:
         rows: list[str] = []

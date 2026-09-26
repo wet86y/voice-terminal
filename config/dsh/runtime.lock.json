@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "repository": "https://github.com/deepseek-ai/deepseek-harness.git",
-  "tag": "dsh-v0.1.5-rc.2",
-  "commit": "fb2c4b9e698e30edb738bca4cf0618587db7d203",
-  "version": "0.1.5-rc.2",
+  "tag": "dsh-v0.1.7-rc.2",
+  "commit": "477b4f420553e8a52c2fbccc464d7561b239c443",
+  "version": "0.1.7-rc.2",
   "package_manager": "pnpm@11.7.0",
   "minimum_node_version": "22.19.0",
   "supported_platforms": ["win32-x64"]
