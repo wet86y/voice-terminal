@@ -69,6 +69,8 @@ from ..speaker.router import SpeakerRouter
 from ..speaker.engine import SpeakerModelError, WeSpeakerOnnxEngine
 from ..speaker.recording import decode_audio_bytes
 from ..vad.detector import FsmnVadDetector, VadError
+from ..compute import device_candidates, hardware_status, process_memory_bytes
+from ..analysis.client import AnalysisClient
 from ..model_registry.service import ModelRegistryError, ModelRegistryService
 from ..model_registry.vault import CredentialVaultUnavailable
 from .product import (
@@ -116,6 +118,8 @@ class SessionRuntime:
         # runtime owns the publication that follows every append.
         self.history.conversation.set_sink(self._publish_conversation_entry)
         self.startup_errors: list[str] = []
+        # compute_status（计算状态）记录 Voice Server 内 KWS 与 FSMN-VAD 的实际设备。
+        self._compute_models: dict[str, dict[str, Any]] = {}
         self.capture: AudioCapture | None = None
         self.kws: KwsWorker | None = None
         self.vad: FsmnVadDetector | None = None
@@ -471,7 +475,12 @@ class SessionRuntime:
     def _get_speaker_engine(self) -> WeSpeakerOnnxEngine:
         engine = self._speaker_engine
         if engine is None or engine.model_path != self.config.speaker_model_path:
-            engine = WeSpeakerOnnxEngine(self.config.speaker_model_path, sample_rate=self.config.audio.sample_rate)
+            engine = WeSpeakerOnnxEngine(
+                self.config.speaker_model_path,
+                sample_rate=self.config.audio.sample_rate,
+                device=self.config.compute.devices.get("wespeaker", "cpu"),
+                fallback_device=self.config.compute.fallback_devices.get("wespeaker", "cpu"),
+            )
             self._speaker_engine = engine
         if not engine.loaded:
             engine.load()
@@ -700,20 +709,43 @@ class SessionRuntime:
         return result
 
     def _build_kws_worker(self) -> KwsWorker:
-        detector = KwsDetector(
-            model_dir=self.config.kws_dir,
-            keywords_file=self.config.kws_keywords_file,
-            keyword_label=self.config.wake.keyword_labels,
-            threshold=self.config.wake.threshold,
-            keywords_score=self.config.wake.keywords_score,
-            num_trailing_blanks=self.config.wake.num_trailing_blanks,
-            max_active_paths=self.config.wake.max_active_paths,
-            provider=self.config.wake.device,
-            sample_rate=self.config.audio.sample_rate,
-        )
-        worker = KwsWorker(detector)
-        worker.start()
-        return worker
+        requested = self.config.compute.devices.get("kws", "cpu")
+        fallback = self.config.compute.fallback_devices.get("kws", "cpu")
+        last_error: Exception | None = None
+        for device in device_candidates(requested, "kws", fallback):
+            try:
+                detector = KwsDetector(
+                    model_dir=self.config.kws_dir,
+                    keywords_file=self.config.kws_keywords_file,
+                    keyword_label=self.config.wake.keyword_labels,
+                    threshold=self.config.wake.threshold,
+                    keywords_score=self.config.wake.keywords_score,
+                    num_trailing_blanks=self.config.wake.num_trailing_blanks,
+                    max_active_paths=self.config.wake.max_active_paths,
+                    provider=device,
+                    sample_rate=self.config.audio.sample_rate,
+                )
+                worker = KwsWorker(detector)
+                worker.start()
+                self._compute_models["kws"] = {
+                    "requested_device": requested,
+                    "device": device,
+                    "service": "READY",
+                    "load_error": (
+                        f"CUDA（图形处理器）加载失败，已回退到 {device}：{type(last_error).__name__}: {last_error}"
+                        if last_error is not None else None
+                    ),
+                }
+                return worker
+            except Exception as exc:
+                last_error = exc
+        self._compute_models["kws"] = {
+            "requested_device": requested,
+            "device": None,
+            "service": "ERROR",
+            "load_error": str(last_error) if last_error else "KWS 初始化失败",
+        }
+        raise KwsError(str(last_error) if last_error else "KWS 初始化失败") from last_error
 
     def _record_error(self, service: str, message: str, *, status_service: str | None = None) -> None:
         # Keep the public service map compatible while preserving the actual
@@ -777,16 +809,36 @@ class SessionRuntime:
                 self._record_error("kws", str(exc))
         else:
             self.state.set_service("kws", "DISABLED")
+            self._compute_models["kws"] = {
+                "requested_device": self.config.compute.devices.get("kws", "cpu"),
+                "device": None,
+                "service": "DISABLED",
+                "load_error": None,
+            }
             logger.info("wake word disabled; session.start enters the voice turn directly")
 
         try:
+            vad_requested = self.config.compute.devices.get("voice_vad", "cpu")
             self.vad = FsmnVadDetector(
                 model_dir=self.config.vad_model_dir,
-                device="cpu",
+                device=vad_requested,
+                fallback_device=self.config.compute.fallback_devices.get("voice_vad", "cpu"),
                 sample_rate=self.config.audio.sample_rate,
                 end_silence_ms=300 if self.config.smart_turn.enabled else None,
             )
+            self._compute_models["voice_vad"] = {
+                "requested_device": vad_requested,
+                "device": self.vad.device,
+                "service": "READY",
+                "load_error": self.vad.load_error,
+            }
         except Exception as exc:
+            self._compute_models["voice_vad"] = {
+                "requested_device": self.config.compute.devices.get("voice_vad", "cpu"),
+                "device": None,
+                "service": "ERROR",
+                "load_error": str(exc),
+            }
             self._record_error("vad", str(exc), status_service="asr")
 
         self.asr = AsrWorkerClient(self.config.asr.worker_url)
@@ -1897,6 +1949,82 @@ class SessionRuntime:
             }
         return payload
 
+    async def compute_status(self) -> dict[str, Any]:
+        """读取设备能力、模型实际设备和工作进程常驻内存。"""
+        hardware = hardware_status()
+        requests = self.config.compute.devices
+        models: dict[str, dict[str, Any]] = {
+            name: {
+                "requested_device": requests.get(name, "cpu"),
+                "device": None,
+                "service": "UNKNOWN",
+                "load_error": None,
+                "process_memory_rss_bytes": None,
+                "gpu_available": bool(hardware["models"].get(name, {}).get("gpu_available")),
+                "gpu_unavailable_reason": hardware["models"].get(name, {}).get("reason"),
+            }
+            for name in ("paraformer", "sensevoice", "voice_vad", "kws", "smart_turn", "wespeaker")
+        }
+
+        models["kws"].update(self._compute_models.get("kws", {}))
+        models["voice_vad"].update(self._compute_models.get("voice_vad", {}))
+        server_rss = process_memory_bytes()
+        for name in ("kws", "voice_vad"):
+            models[name]["process_memory_rss_bytes"] = server_rss
+        models["kws"]["service"] = self.state.services.get("kws", models["kws"].get("service", "UNKNOWN"))
+        if self.asr is not None:
+            try:
+                status = await self.asr.health(timeout_s=2.0)
+                models["paraformer"].update({
+                    "device": status.get("device"),
+                    "requested_device": status.get("requested_device", requests.get("paraformer", "auto")),
+                    "service": status.get("status", "READY"),
+                    "load_error": status.get("load_error"),
+                    "process_memory_rss_bytes": status.get("process_memory_rss_bytes"),
+                })
+            except Exception as exc:
+                models["paraformer"].update({
+                    "service": "ERROR",
+                    "load_error": str(exc)[:300],
+                })
+        else:
+            models["paraformer"]["service"] = self.state.services.get("asr", "DISABLED")
+
+        try:
+            analysis = await AnalysisClient(self.config.smart_turn.analysis_url).health()
+            for lane_name, model_name in (("refine", "sensevoice"), ("endpoint", "smart_turn")):
+                lane = analysis.get(lane_name, {})
+                if isinstance(lane, dict):
+                    models[model_name].update({
+                        "device": lane.get("device"),
+                        "requested_device": lane.get("requested_device", requests.get(model_name, "cpu")),
+                        "service": lane.get("status", "UNKNOWN"),
+                        "load_error": lane.get("load_error") or lane.get("error"),
+                        "process_memory_rss_bytes": lane.get("process_memory_rss_bytes"),
+                    })
+                    if model_name == "sensevoice":
+                        models[model_name]["internal_vad_device"] = lane.get("internal_vad_device")
+        except Exception as exc:
+            for name in ("sensevoice", "smart_turn"):
+                models[name].update({"service": "UNAVAILABLE", "load_error": str(exc)[:300]})
+
+        if self.speaker is not None and self.speaker.connected:
+            try:
+                status = await self.speaker.health(timeout_s=2.0)
+                models["wespeaker"].update({
+                    "device": status.get("device"),
+                    "requested_device": status.get("requested_device", requests.get("wespeaker", "cpu")),
+                    "service": status.get("status", "READY"),
+                    "load_error": status.get("load_error"),
+                    "process_memory_rss_bytes": status.get("process_memory_rss_bytes"),
+                })
+            except Exception as exc:
+                models["wespeaker"].update({"service": "ERROR", "load_error": str(exc)[:300]})
+        else:
+            models["wespeaker"]["service"] = self.state.services.get("speaker", "DISABLED")
+
+        return {"hardware": hardware, "models": models}
+
 
 def _valid_command(message: Any) -> tuple[str, dict[str, Any]] | None:
     if not isinstance(message, dict) or message.get("type") != "command":
@@ -1961,7 +2089,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         runtime_payload["tts_worker"] = runtime.cosyvoice_worker.status()
         conversation = runtime_payload.pop("conversation", {"recent": [], "current": {}})
         settings = product_settings.snapshot() if product_settings is not None else {
-            "schema_version": 5,
+            "schema_version": 6,
             "wake": {
                 "enabled": runtime.config.wake.enabled,
                 "keyword": runtime.config.wake.keyword,
@@ -1983,6 +2111,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "mode": runtime.config.speaker.mode,
                 "confirm_threshold": runtime.config.speaker.confirm_threshold,
                 "continuity_threshold": runtime.config.speaker.continuity_threshold,
+            },
+            "compute": {
+                "devices": dict(runtime.config.compute.devices),
+                "fallback_devices": dict(runtime.config.compute.fallback_devices),
             },
             "persona": {},
             "warnings": [],
@@ -2170,6 +2302,40 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         if product_settings is None:
             raise HTTPException(status_code=404, detail="产品设置服务尚未启用。")
         return product_settings
+
+    @app.get("/api/v1/product/compute-status")
+    async def get_product_compute_status() -> dict[str, Any]:
+        return await runtime.compute_status()
+
+    @app.put("/api/v1/product/settings/compute")
+    async def update_product_compute(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            store = product_store_or_404()
+            if set(body) != {"devices"} or not isinstance(body.get("devices"), dict):
+                raise ProductSettingsError("计算设备设置字段必须仅包含 devices（模型设备选项）。")
+            hardware = hardware_status()
+            for name, mode in body["devices"].items():
+                if mode == "cuda" and not hardware.get("models", {}).get(name, {}).get("gpu_available"):
+                    reason = hardware.get("models", {}).get(name, {}).get("reason") or "GPU 后端不可用。"
+                    raise ProductSettingsError(f"{name} 暂不能使用 GPU：{reason}")
+            current = await runtime.compute_status()
+            active_devices = {
+                name: str(item.get("device") or "cpu")
+                for name, item in current["models"].items()
+            }
+            value = await asyncio.to_thread(store.save_compute, body, active_devices=active_devices)
+            return {
+                "settings": {"compute": value},
+                "effective_from": "application_restart",
+                "restart_required": True,
+                "pending": True,
+                "message": "本地模型运行设备设置已保存，重新启动应用后生效。",
+            }
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                raise
+            registry_error(exc)
+            raise AssertionError("unreachable")
 
     @app.get("/api/v1/tts/status")
     async def get_tts_status() -> dict[str, Any]:

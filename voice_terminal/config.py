@@ -135,6 +135,50 @@ class AsrConfig:
     decoder_chunk_look_back: int = 1
 
 
+COMPUTE_MODEL_IDS = (
+    "paraformer",
+    "sensevoice",
+    "voice_vad",
+    "kws",
+    "smart_turn",
+    "wespeaker",
+)
+COMPUTE_DEVICE_MODES = {"auto", "cpu", "cuda"}
+
+
+@dataclass(frozen=True)
+class ComputeConfig:
+    """各本地模型的设备偏好和上次成功设备。"""
+
+    # devices（设备偏好）：auto 自动选择，cpu 仅中央处理器，cuda 使用 NVIDIA GPU。
+    devices: Mapping[str, str] = field(default_factory=lambda: {
+        "paraformer": "auto",
+        "sensevoice": "cpu",
+        "voice_vad": "cpu",
+        "kws": "cpu",
+        "smart_turn": "cpu",
+        "wespeaker": "cpu",
+    })
+    # fallback_devices（回退设备）：显式 GPU 加载失败时使用的上次成功设备。
+    fallback_devices: Mapping[str, str] = field(default_factory=lambda: {
+        "paraformer": "cpu",
+        "sensevoice": "cpu",
+        "voice_vad": "cpu",
+        "kws": "cpu",
+        "smart_turn": "cpu",
+        "wespeaker": "cpu",
+    })
+
+    def __post_init__(self) -> None:
+        for name in COMPUTE_MODEL_IDS:
+            device = self.devices.get(name, "cpu")
+            fallback = self.fallback_devices.get(name, "cpu")
+            if device not in COMPUTE_DEVICE_MODES:
+                raise ValueError(f"compute.devices.{name} must be auto, cpu, or cuda")
+            if fallback not in {"cpu", "cuda"}:
+                raise ValueError(f"compute.fallback_devices.{name} must be cpu or cuda")
+
+
 @dataclass(frozen=True)
 class LlmConfig:
     provider: str = "deepseek"
@@ -468,6 +512,8 @@ class AppConfig:
     wake: WakeConfig = field(default_factory=WakeConfig)
     vad: VadConfig = field(default_factory=VadConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
+    # compute（本地模型计算设备偏好）：由产品设置覆盖 YAML 默认值。
+    compute: ComputeConfig = field(default_factory=ComputeConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
     text_bridge: TextBridgeConfig = field(default_factory=TextBridgeConfig)
@@ -502,8 +548,9 @@ class AppConfig:
 
     @property
     def resolved_asr_device(self) -> str:
-        if self.asr.device != "auto":
-            return self.asr.device
+        requested = self.compute.devices.get("paraformer", self.asr.device)
+        if requested != "auto":
+            return requested
         try:
             import torch  # type: ignore
 
@@ -532,6 +579,7 @@ class AppConfig:
         worker = _section(data, "asr_worker")
         speaker = _section(data, "speaker")
         speaker_worker = _section(data, "speaker_worker")
+        compute = _section(data, "compute")
         persona = _section(data, "persona")
         shadow = _section(data, "shadow_agent")
         dsh = _section(data, "dsh")
@@ -776,6 +824,20 @@ class AppConfig:
                 chunk_size=chunk_size,
                 encoder_chunk_look_back=int(_number(asr.get("encoder_chunk_look_back"), 4)),
                 decoder_chunk_look_back=int(_number(asr.get("decoder_chunk_look_back"), 1)),
+            ),
+            compute=ComputeConfig(
+                devices={
+                    **ComputeConfig().devices,
+                    **({key: value for key, value in compute.get("devices", {}).items()
+                        if key in COMPUTE_MODEL_IDS and isinstance(value, str) and value in COMPUTE_DEVICE_MODES}
+                       if isinstance(compute.get("devices"), Mapping) else {}),
+                },
+                fallback_devices={
+                    **ComputeConfig().fallback_devices,
+                    **({key: value for key, value in compute.get("fallback_devices", {}).items()
+                        if key in COMPUTE_MODEL_IDS and isinstance(value, str) and value in {"cpu", "cuda"}}
+                       if isinstance(compute.get("fallback_devices"), Mapping) else {}),
+                },
             ),
             llm=LlmConfig(
                 provider=llm_provider,

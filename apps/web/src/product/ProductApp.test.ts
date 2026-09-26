@@ -12,6 +12,30 @@ import { readFileSync } from 'node:fs'
 // so it needs a direct source-level guard.
 const productCssSource = readFileSync(new URL('../ui-demo/ui-demo.css', import.meta.url), 'utf8')
 
+describe('本地模型计算设备设置', () => {
+  it('显示六种非 TTS 模型并按后端能力禁用 GPU 选择', () => {
+    expect(productAppSource).toContain("activeSettingsTab === 'compute'")
+    for (const model of ['paraformer', 'sensevoice', 'voice_vad', 'kws', 'smart_turn', 'wespeaker']) {
+      expect(productAppSource).toContain("id: '" + model + "'")
+    }
+    const modelRowsStart = productAppSource.indexOf('const computeModelRows')
+    const modelRowsEnd = productAppSource.indexOf('function formatComputeBytes', modelRowsStart)
+    const modelRows = productAppSource.slice(modelRowsStart, modelRowsEnd)
+    expect(modelRows).not.toContain('TTS')
+    expect(productAppSource).toContain(':disabled="!computeStatus.models[model.id].gpu_available"')
+    expect(productAppSource).toContain('internal_vad_device')
+    expect(productAppSource).toContain('process_memory_rss_bytes')
+  })
+
+  it('保存设备偏好并明确要求重启应用', () => {
+    expect(productApiSource).toContain("'/api/v1/product/compute-status'")
+    expect(productApiSource).toContain("'/api/v1/product/settings/compute'")
+    expect(productAdapterSource).toContain('saveComputeSettings')
+    expect(productAdapterSource).toContain('restart_required')
+    expect(productAppSource).toContain('保存后需要完全重启应用')
+  })
+})
+
 describe('TTS provider（语音服务商）锁定', () => {
   it('removes provider switching and profile assignment controls while retaining read-only status', () => {
     expect(productAppSource).not.toContain("activeSettingsTab === 'tts'")

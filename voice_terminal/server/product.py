@@ -20,13 +20,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..config import AppConfig
+from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig
 from ..core.events import utc_now_iso
 from ..kws.keywords import MAX_WAKE_KEYWORDS
 from ..shadow_agent import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 5
+PRODUCT_SETTINGS_SCHEMA_VERSION = 6
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 90
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -79,6 +79,9 @@ def _safe_display_text(value: Any, *, limit: int = 240) -> str:
 
 def _default_settings(config: AppConfig) -> dict[str, Any]:
     final_silence_ms = int(getattr(config.agent, "final_silence_ms", 30_000))
+    paraformer_mode = config.asr.device if config.asr.device in COMPUTE_DEVICE_MODES else "auto"
+    compute_devices = {name: "cpu" for name in COMPUTE_MODEL_IDS}
+    compute_devices["paraformer"] = paraformer_mode
     return {
         "schema_version": PRODUCT_SETTINGS_SCHEMA_VERSION,
         "wake": {
@@ -103,6 +106,11 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
             "mode": str(getattr(config.speaker, "mode", "off")),
             "confirm_threshold": float(getattr(config.speaker, "confirm_threshold", 0.50)),
             "continuity_threshold": float(getattr(config.speaker, "continuity_threshold", 0.40)),
+        },
+        # compute（计算设备）首版沿用旧运行方式：Paraformer 自动选择，其余模型保持 CPU。
+        "compute": {
+            "devices": compute_devices,
+            "fallback_devices": {name: "cpu" for name in COMPUTE_MODEL_IDS},
         },
     }
 
@@ -148,6 +156,15 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     # model registry.  Unknown fields are discarded rather than echoed to the
     # browser, which keeps this file a narrow, non-secret state boundary.
     result["schema_version"] = PRODUCT_SETTINGS_SCHEMA_VERSION
+    raw_compute = value.get("compute")
+    if isinstance(raw_compute, Mapping):
+        for field, allowed in (("devices", COMPUTE_DEVICE_MODES), ("fallback_devices", {"cpu", "cuda"})):
+            entries = raw_compute.get(field)
+            if isinstance(entries, Mapping):
+                for name in COMPUTE_MODEL_IDS:
+                    mode = entries.get(name)
+                    if isinstance(mode, str) and mode in allowed:
+                        result["compute"][field][name] = mode
     wake = result["wake"]
     wake["enabled"] = wake["enabled"] if type(wake.get("enabled")) is bool else defaults["wake"]["enabled"]
     wake["keyword"] = wake["keyword"] if isinstance(wake.get("keyword"), str) and wake["keyword"].strip() else defaults["wake"]["keyword"]
@@ -224,7 +241,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     schema_version = value.get("schema_version")
     if schema_version is not None and (
         type(schema_version) is not int
-        or schema_version not in {1, 2, 3, 4, PRODUCT_SETTINGS_SCHEMA_VERSION}
+        or schema_version not in {1, 2, 3, 4, 5, PRODUCT_SETTINGS_SCHEMA_VERSION}
     ):
         invalid = True
     for section_name, fields in (
@@ -278,6 +295,23 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
             # The field-level checks above already mark non-numeric values;
             # keep this branch quiet and let the normal merge fallback apply.
             pass
+    compute = value.get("compute")
+    if compute is not None:
+        if not isinstance(compute, Mapping):
+            invalid = True
+        else:
+            for field, allowed in (("devices", COMPUTE_DEVICE_MODES), ("fallback_devices", {"cpu", "cuda"})):
+                entries = compute.get(field)
+                if entries is not None:
+                    if not isinstance(entries, Mapping):
+                        invalid = True
+                    else:
+                        invalid = invalid or any(
+                            key not in COMPUTE_MODEL_IDS
+                            or not isinstance(candidate, str)
+                            or candidate not in allowed
+                            for key, candidate in entries.items()
+                        )
     return "product_settings: 部分字段无效，已回退为安全值。" if invalid else None
 
 
@@ -325,6 +359,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     silence = settings.get("silence") if isinstance(settings.get("silence"), Mapping) else {}
     shadow = settings.get("shadow") if isinstance(settings.get("shadow"), Mapping) else {}
     speaker = settings.get("speaker") if isinstance(settings.get("speaker"), Mapping) else {}
+    compute = settings.get("compute") if isinstance(settings.get("compute"), Mapping) else {}
     try:
         seconds = int(silence.get("seconds", getattr(config.agent, "final_silence_ms", 30_000) // 1000))
     except (TypeError, ValueError):
@@ -390,7 +425,14 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         continuity_threshold=continuity_threshold,
     )
     next_tts = replace(config.tts, backend="minimax", provider="minimax")
-    return replace(config, wake=next_wake, agent=next_agent, shadow_agent=next_shadow, speaker=next_speaker, tts=next_tts)
+    next_compute = ComputeConfig(
+        devices={**ComputeConfig().devices,
+                 **(compute.get("devices") if isinstance(compute.get("devices"), Mapping) else {})},
+        fallback_devices={**ComputeConfig().fallback_devices,
+                          **(compute.get("fallback_devices") if isinstance(compute.get("fallback_devices"), Mapping) else {})},
+    )
+    return replace(config, wake=next_wake, agent=next_agent, shadow_agent=next_shadow,
+                   speaker=next_speaker, tts=next_tts, compute=next_compute)
 
 
 class ProductSettingsStore:
@@ -401,9 +443,8 @@ class ProductSettingsStore:
         self.config = config
         self.warnings: list[str] = []
         # Keep the legacy observable version for a damaged schema marker.
-        # A normal load and every successful save use the current schema (3),
-        # while older callers that used the malformed-file recovery path still
-        # see the last known schema version instead of a fabricated upgrade.
+        # A normal load and every successful save use schema version 6;
+        # malformed legacy markers still expose the safe recovery version 2.
         self._malformed_schema_marker = False
         self._settings = self._load()
 
@@ -723,6 +764,61 @@ class ProductSettingsStore:
         }
         self._save_settings()
         return deepcopy(self._settings["speaker"])
+
+    def save_compute(self, payload: Mapping[str, Any], *,
+                     active_devices: Mapping[str, str] | None = None) -> dict[str, Any]:
+        """保存本地模型设备选择，并记录每项最近成功设备作为启动回退。"""
+        if set(payload) != {"devices"} or not isinstance(payload.get("devices"), Mapping):
+            raise ProductSettingsError("计算设备设置字段必须仅包含 devices（模型设备选项）。")
+        submitted = payload["devices"]
+        if set(submitted) != set(COMPUTE_MODEL_IDS):
+            raise ProductSettingsError("计算设备设置必须包含全部六种非 TTS 本地模型。")
+        devices: dict[str, str] = {}
+        for name in COMPUTE_MODEL_IDS:
+            mode = submitted.get(name)
+            if not isinstance(mode, str) or mode not in COMPUTE_DEVICE_MODES:
+                raise ProductSettingsError(f"{name} 的设备必须是 auto、cpu 或 cuda。")
+            devices[name] = mode
+        previous = self._settings.get("compute", {})
+        old_fallbacks = previous.get("fallback_devices", {}) if isinstance(previous, Mapping) else {}
+        fallbacks: dict[str, str] = {}
+        for name in COMPUTE_MODEL_IDS:
+            active = (active_devices or {}).get(name)
+            if active in {"cpu", "cuda", "cuda:0"}:
+                fallbacks[name] = "cuda" if active.startswith("cuda") else "cpu"
+            else:
+                old = old_fallbacks.get(name) if isinstance(old_fallbacks, Mapping) else None
+                fallbacks[name] = old if old in {"cpu", "cuda"} else "cpu"
+        self._settings["compute"] = {"devices": devices, "fallback_devices": fallbacks}
+        self._save_settings()
+        return deepcopy(self._settings["compute"])
+
+    def revert_failed_compute_devices(self, model_status: Mapping[str, Any]) -> dict[str, str]:
+        """把显式 CUDA 启动失败的偏好恢复为上次成功设备。"""
+        compute = self._settings.get("compute", {})
+        if not isinstance(compute, Mapping):
+            return {}
+        devices = dict(compute.get("devices", {})) if isinstance(compute.get("devices"), Mapping) else {}
+        fallbacks = dict(compute.get("fallback_devices", {})) if isinstance(compute.get("fallback_devices"), Mapping) else {}
+        actual: dict[str, str] = {}
+        restored: dict[str, str] = {}
+        for name in COMPUTE_MODEL_IDS:
+            item = model_status.get(name)
+            if not isinstance(item, Mapping):
+                continue
+            device = item.get("device")
+            if device in {"cpu", "cuda", "cuda:0"}:
+                actual[name] = "cuda" if str(device).startswith("cuda") else "cpu"
+            if devices.get(name) == "cuda" and actual.get(name) == "cpu" and item.get("load_error"):
+                devices[name] = fallbacks.get(name, "cpu") if fallbacks.get(name) in {"cpu", "cuda"} else "cpu"
+                restored[name] = devices[name]
+        if devices != compute.get("devices", {}):
+            self._settings["compute"] = {
+                "devices": devices,
+                "fallback_devices": {name: actual.get(name, fallbacks.get(name, "cpu")) for name in COMPUTE_MODEL_IDS},
+            }
+            self._save_settings()
+        return restored
 
     def save_persona(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if set(payload) != set(PERSONA_FILES) | {"shadow"}:

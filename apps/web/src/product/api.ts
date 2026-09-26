@@ -1,6 +1,7 @@
 import type {
   DshRuntimeStatus,
   ProductApiErrorShape,
+  ProductComputeStatus,
   ProductMutationResult,
   ProductSnapshot,
   WakeTask,
@@ -74,6 +75,10 @@ export const productApi = {
   saveShadow: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/shadow', jsonBody(value)),
   savePersona: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/persona', jsonBody(value)),
   saveSpeaker: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/speaker', jsonBody(value)),
+  /** 获取本地模型设备、硬件能力与工作进程资源状态。 */
+  computeStatus: () => request<ProductComputeStatus>('/api/v1/product/compute-status'),
+  /** 保存本地模型设备偏好；返回值会标明需要重启应用。 */
+  saveCompute: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/compute', jsonBody(value)),
   /** 读取 TTS（语音合成）固定在线 API（程序接口）的只读状态。 */
   ttsStatus: () => request<{ backend: 'minimax'; worker: { state: 'stopped' | 'starting' | 'ready' | 'draining' | 'error'; message?: string | null; model_present?: boolean } }>('/api/v1/tts/status'),
   speakerStatus: () => request<Record<string, unknown>>('/api/v1/speaker/status'),

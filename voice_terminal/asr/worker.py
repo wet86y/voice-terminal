@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .protocol import asr_result, decode_audio_chunk
+from ..compute import process_memory_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +32,14 @@ class AsrWorkerEngine:
         chunk_size: tuple[int, int, int] = (0, 10, 5),
         encoder_chunk_look_back: int = 4,
         decoder_chunk_look_back: int = 1,
+        fallback_device: str = "cpu",
     ) -> None:
         self.model_dir = model_dir
-        self.device = device
+        # device（请求设备）：auto/cpu/cuda；self.device（实际设备）由加载结果决定。
+        self.requested_device = device
+        self.device = "cpu"
+        self.fallback_device = fallback_device
+        self.load_error: str | None = None
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         self.encoder_chunk_look_back = encoder_chunk_look_back
@@ -86,13 +92,43 @@ class AsrWorkerEngine:
         if not self.model_dir.is_dir():
             raise FileNotFoundError(f"Paraformer 模型目录不存在：{self.model_dir}")
         self._np = np
-        self._model = AutoModel(
-            model=str(self.model_dir),
-            device=self.device,
-            disable_update=True,
-            disable_pbar=True,
-        )
-        logger.info("asr.worker.model_ready model_dir=%s device=%s", self.model_dir, self.device)
+        fallback = self.fallback_device if self.fallback_device in {"cpu", "cuda"} else "cpu"
+        requested = self.requested_device
+        from ..compute import startup_device
+        initial = startup_device(requested, "paraformer")
+        candidates = [initial]
+        if initial == "cuda":
+            if fallback != initial:
+                candidates.append(fallback)
+            if "cpu" not in candidates:
+                candidates.append("cpu")
+        last_error: Exception | None = None
+        for candidate in candidates:
+            try:
+                self._model = AutoModel(
+                    model=str(self.model_dir),
+                    device=candidate,
+                    disable_update=True,
+                    disable_pbar=True,
+                )
+                self.device = candidate
+                self.load_error = (
+                    f"CUDA（图形处理器）加载失败，已回退到 {candidate}：{type(last_error).__name__}: {last_error}"
+                    if last_error is not None else None
+                )
+                logger.info("asr.worker.model_ready model_dir=%s device=%s", self.model_dir, self.device)
+                return
+            except Exception as exc:
+                last_error = exc
+                if candidate == "cuda":
+                    try:
+                        import torch  # type: ignore
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+        self._model = None
+        self.load_error = str(last_error) if last_error else "模型加载失败"
+        raise RuntimeError(self.load_error) from last_error
 
     def _infer_sync(self, turn_id: str, pcm: bytes, is_final: bool) -> str:
         self.load()
@@ -227,6 +263,10 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                             "type": "health",
                             "status": "READY",
                             "model_loaded": engine.model_loaded,
+                            "device": getattr(engine, "device", None),
+                            "requested_device": getattr(engine, "requested_device", None),
+                            "load_error": getattr(engine, "load_error", None),
+                            "process_memory_rss_bytes": process_memory_bytes(),
                         }
                     except Exception as exc:
                         # Keep the connection available long enough for the
@@ -236,6 +276,9 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                             "status": "ERROR",
                             "model_loaded": False,
                             "error": str(exc),
+                            "device": getattr(engine, "device", None),
+                            "requested_device": getattr(engine, "requested_device", None),
+                            "process_memory_rss_bytes": process_memory_bytes(),
                         }
                     if isinstance(request_id, str):
                         response["request_id"] = request_id

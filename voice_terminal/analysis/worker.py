@@ -6,6 +6,7 @@ import time
 from typing import Callable
 
 from .protocol import decode_request
+from ..compute import process_memory_bytes
 
 
 class AnalysisLane:
@@ -23,10 +24,16 @@ class AnalysisLane:
         self.active: asyncio.Future | None = None
 
     def health_payload(self) -> dict:
+        model = self.model
         return {
-            "status": "READY" if self.model else "DEGRADED",
+            "status": "DISABLED" if self.error == "disabled" else "READY" if self.model else "DEGRADED",
             "model": self.model_name,
             "model_loaded": self.model is not None,
+            "requested_device": getattr(model, "requested_device", None),
+            "device": getattr(model, "device", None),
+            "internal_vad_device": getattr(model, "internal_vad_device", None),
+            "load_error": getattr(model, "load_error", None),
+            "process_memory_rss_bytes": process_memory_bytes(),
             "error": self.error,
         }
 

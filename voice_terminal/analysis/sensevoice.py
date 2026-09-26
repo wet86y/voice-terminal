@@ -35,7 +35,8 @@ def bounded_segments(segments: list, duration_ms: int) -> list[tuple[int, int]]:
 
 
 class SenseVoice:
-    def __init__(self, model_dir: Path, vad_dir: Path) -> None:
+    def __init__(self, model_dir: Path, vad_dir: Path, *,
+                 device: str = "cpu", fallback_device: str = "cpu") -> None:
         from funasr import AutoModel
         from funasr.tokenizer.sentencepiece_tokenizer import SentencepiecesTokenizer
         from funasr.register import tables
@@ -47,10 +48,41 @@ class SenseVoice:
                 if self.sp is None:
                     self.sp = sentencepiece.SentencePieceProcessor(model_proto=Path(self.bpemodel).read_bytes())
         tables.tokenizer_classes["VoiceTerminalSentencepiece"] = UnicodeSentencepiece
-        self.model = AutoModel(model=str(model_dir), tokenizer="VoiceTerminalSentencepiece", device="cpu",
-                               disable_update=True, disable_pbar=True, ncpu=2)
-        self.vad = AutoModel(model=str(vad_dir), device="cpu", disable_update=True, disable_pbar=True,
-                             max_single_segment_time=30000)
+        self.requested_device = device
+        self.device = "cpu"
+        self.load_error: str | None = None
+        self.internal_vad_device = "cpu"
+        from ..compute import device_candidates
+        last_error: Exception | None = None
+        for candidate in device_candidates(device, "sensevoice", fallback_device):
+            model = vad = None
+            try:
+                model = AutoModel(
+                    model=str(model_dir), tokenizer="VoiceTerminalSentencepiece", device=candidate,
+                    disable_update=True, disable_pbar=True, ncpu=2,
+                )
+                vad = AutoModel(
+                    model=str(vad_dir), device=candidate, disable_update=True, disable_pbar=True,
+                    max_single_segment_time=30000,
+                )
+                self.model, self.vad = model, vad
+                self.device = self.internal_vad_device = candidate
+                self.load_error = (
+                    f"CUDA（图形处理器）加载失败，已回退到 {candidate}：{type(last_error).__name__}: {last_error}"
+                    if last_error is not None else None
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                model = vad = None
+                if candidate == "cuda":
+                    try:
+                        import torch  # type: ignore
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+        else:
+            raise RuntimeError(f"SenseVoiceSmall 或内部 FSMN-VAD 加载失败：{last_error}") from last_error
 
     def __call__(self, pcm: bytes) -> dict:
         import numpy as np

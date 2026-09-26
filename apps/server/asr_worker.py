@@ -13,6 +13,7 @@ from voice_terminal.asr.worker import AsrWorkerEngine, handle_asr_connection
 from voice_terminal.config import load_config
 from voice_terminal.env import load_env_file
 from voice_terminal.logging_setup import configure_logging
+from voice_terminal.server.product import ProductSettingsStore
 
 
 async def run(config_path: Path | None = None) -> None:
@@ -25,9 +26,14 @@ async def run(config_path: Path | None = None) -> None:
     default_path = root / "config" / "default.yaml"
     local_path = config_path or root / "config" / "local.yaml"
     config = load_config(default_path, local_path if local_path.is_file() else None)
+    config = ProductSettingsStore(
+        path=root / "config" / "product-settings.json",
+        config=config,
+    ).effective_config()
     engine = AsrWorkerEngine(
         model_dir=config.asr_model_dir,
-        device=config.resolved_asr_device,
+        device=config.compute.devices.get("paraformer", "auto"),
+        fallback_device=config.compute.fallback_devices.get("paraformer", "cpu"),
         sample_rate=config.audio.sample_rate,
         chunk_size=config.asr.chunk_size,
         encoder_chunk_look_back=config.asr.encoder_chunk_look_back,
@@ -48,7 +54,7 @@ async def run(config_path: Path | None = None) -> None:
             "ASR Worker listening on ws://%s:%s/asr (device=%s)",
             config.asr_worker.host,
             config.asr_worker.port,
-            config.resolved_asr_device,
+            engine.device,
         )
         await asyncio.Future()
 

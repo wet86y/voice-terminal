@@ -29,10 +29,15 @@ class SpeakerModelError(RuntimeError):
 class WeSpeakerOnnxEngine:
     """Optional ONNX embedding engine; importing it never makes the runtime mandatory."""
 
-    def __init__(self, model_path: Path, *, sample_rate: int = 16000, model_version: str = "") -> None:
+    def __init__(self, model_path: Path, *, sample_rate: int = 16000, model_version: str = "",
+                 device: str = "cpu", fallback_device: str = "cpu") -> None:
         self.model_path = model_path
         self.sample_rate = sample_rate
         self.model_version = model_version or model_path.stem
+        self.requested_device = device
+        self.fallback_device = fallback_device
+        self.device = "cpu"
+        self.load_error: str | None = None
         self.session: Any = None
         self.input_name = "feats"
         self.output_name = "embs"
@@ -59,9 +64,26 @@ class WeSpeakerOnnxEngine:
             raise SpeakerModelError(self.error)
         try:
             import onnxruntime as ort  # type: ignore
-            self.session = ort.InferenceSession(
-                str(self.model_path),
-                providers=["CPUExecutionProvider"],
+            from ..compute import device_candidates
+            last_error: Exception | None = None
+            session = None
+            for candidate in device_candidates(self.requested_device, "wespeaker", self.fallback_device):
+                try:
+                    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if candidate == "cuda" else ["CPUExecutionProvider"]
+                    session = ort.InferenceSession(str(self.model_path), providers=providers)
+                    if candidate == "cuda" and "CUDAExecutionProvider" not in session.get_providers():
+                        raise SpeakerModelError("ONNX Runtime did not activate CUDAExecutionProvider")
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    session = None
+            if session is None:
+                raise SpeakerModelError(str(last_error or "ONNX Runtime could not create a session"))
+            self.session = session
+            self.device = "cuda" if "CUDAExecutionProvider" in session.get_providers() else "cpu"
+            self.load_error = (
+                f"CUDA（图形处理器）加载失败，已回退到 {self.device}：{type(last_error).__name__}: {last_error}"
+                if last_error is not None else None
             )
             inputs = self.session.get_inputs()
             if not inputs:

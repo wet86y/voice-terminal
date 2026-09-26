@@ -5,6 +5,7 @@ param(
   [switch]$SkipInstall,
   [switch]$SkipDsh,
   [switch]$Analysis,
+  [switch]$Gpu,
   [switch]$NoDownloadProxy
 )
 
@@ -27,11 +28,28 @@ $version = (& $Python -c "import sys; print(f'{sys.version_info[0]}.{sys.version
 if ($LASTEXITCODE -ne 0 -or $version -ne "3.12") { throw "需要 Python 3.12，当前为：$version。可使用 -Python D:\DevTools\Python312\python.exe" }
 
 if (-not $Offline -and -not $SkipInstall) {
-  Write-Host "Installing PyTorch CUDA wheels..." -ForegroundColor Cyan
   Invoke-Python -m pip install --upgrade pip
-  Invoke-Python -m pip install torch==2.11.0+cu128 torchaudio==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+  if ($Gpu) {
+    Write-Host "Installing PyTorch CUDA wheels..." -ForegroundColor Cyan
+    Invoke-Python -m pip install torch==2.11.0+cu128 torchaudio==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+  } else {
+    Write-Host "Installing default PyTorch CPU wheels..." -ForegroundColor Cyan
+    Invoke-Python -m pip uninstall -y torch torchaudio
+    Invoke-Python -m pip install torch==2.11.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+  }
   Write-Host "Installing Voice Server dependencies..." -ForegroundColor Cyan
+  if (-not $Gpu) {
+    # GPU wheels share the same Python import package names. Remove the optional
+    # CUDA build first so reinstalling the default CPU profile is deterministic.
+    Invoke-Python -m pip uninstall -y onnxruntime-gpu
+  }
   Invoke-Python -m pip install -r $Requirements
+  if ($Gpu) {
+    Write-Host "Installing optional ONNX Runtime and Sherpa-ONNX CUDA backends..." -ForegroundColor Cyan
+    Invoke-Python -m pip uninstall -y onnxruntime onnxruntime-gpu sherpa-onnx
+    Invoke-Python -m pip install onnxruntime-gpu==1.24.3
+    Invoke-Python -m pip install --find-links https://k2-fsa.github.io/sherpa/onnx/cuda.html "sherpa-onnx==1.13.8+cuda12.cudnn9"
+  }
 }
 
 $env:MODELSCOPE_CACHE = Join-Path $ModelDir "cache\modelscope"
