@@ -65,7 +65,7 @@ class DshRuntimeTests(unittest.TestCase):
             source = root / "source.yml"
             managed = root / "managed.yml"
             source.write_text(
-                "- id: agent-presets\n  config:\n    default: shadow-agent\n"
+                "- id: agent-preset-registry\n  config:\n    default: shadow-agent\n"
                 "\n- id: session-log-deepseek\n  disabled: true\n",
                 encoding="utf-8",
             )
@@ -83,12 +83,26 @@ class DshRuntimeTests(unittest.TestCase):
             source = root / "source.yml"
             managed = root / "managed.yml"
             source.write_text(
-                "- id: agent-presets\n  config:\n    default: shadow-agent\n"
+                "- id: agent-preset-registry\n  config:\n    default: shadow-agent\n"
                 "\n- id: session-log-deepseek\n  disabled: true\n",
                 encoding="utf-8",
             )
             managed.write_text("- id: unrelated\n  enabled: true\n", encoding="utf-8")
             self.assertFalse(DshRuntimeManager._profile_patch_preserves_managed_defaults(source, managed))
+
+    def test_profile_patch_validation_rejects_retired_agent_presets_row(self) -> None:
+        """旧版 agent-presets 配置行不能作为新版注册器配置（拒绝旧预设注册项）."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "legacy.yml"
+            managed = root / "managed.yml"
+            legacy.write_text(
+                "- id: agent-presets\n  config:\n    default: shadow-agent\n"
+                "\n- id: session-log-deepseek\n  disabled: true\n",
+                encoding="utf-8",
+            )
+            managed.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
+            self.assertFalse(DshRuntimeManager._profile_patch_preserves_managed_defaults(legacy, managed))
 
 
 class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):

@@ -17,15 +17,23 @@ Web RPC，或启动第二个长期持有同一 Session 的 DSH 进程。
 .\scripts\setup-dsh.ps1 -ValidateOnly
 ```
 
-setup 会验证固定 source/tag/commit、Node、pnpm 和 CLI，构建 TypeScript Bridge Bundle（插件运行包），用官方
-`dsh plugin --profile web add` 安装到项目 profile，同步正式 preset，运行 `dump-config`，并记录
-Node Bundle（Node.js 插件运行包）与浏览器插件页的 hash（哈希值）、协议版本、公共提示词哈希和受管配置哈希。浏览器插件构建会
+setup 会验证固定 source/tag/commit、Node、pnpm 和 CLI，构建 TypeScript Bridge Bundle（插件运行包）与正式
+Shadow preset Bundle（Shadow 预设功能包），用官方 `dsh plugin --profile web add` 安装到项目 profile，
+运行 `dump-config`，并记录 Node Bundle（Node.js 插件运行包）、浏览器插件页、预设功能包的 hash（哈希值）、
+协议版本、公共提示词哈希和受管配置哈希。浏览器插件构建会
 使用临时 staging directory（暂存目录），结束后移除，不保留对固定 DSH source（源码）的修改。`-ValidateOnly`
-会检查 Node Bundle（Node.js 插件运行包）、浏览器入口、插件页 manifest（清单）和安装状态；发现缺失或漂移即拒绝通过校验。
+会检查 Node Bundle（Node.js 插件运行包）、浏览器入口、插件页 manifest（清单）、Shadow preset 声明和安装状态；发现缺失或漂移即拒绝通过校验。
 
-运行时 freshness check（新鲜度校验）只覆盖 Bridge 的 `src/`、`package.json`、`build.mjs`、`cordis.patch.yml`
-和 `scripts/build-dsh-client.mjs`（浏览器构建脚本）；README、`test/` 目录和 source map（源码映射）变更不会阻止启动。
-产物 hash（哈希值）只覆盖 DSH 实际加载的包清单、Cordis patch（配置补丁）和 JavaScript 运行文件，不包含声明文件或文档。
+运行时 freshness check（新鲜度校验）覆盖 Bridge 的 `src/`、`package.json`、`build.mjs`、`cordis.patch.yml`、
+`scripts/build-dsh-client.mjs`（浏览器构建脚本）和正式 Shadow preset（Shadow 预设）源文件；README、`test/`
+目录和 source map（源码映射）变更不会阻止启动。产物 hash（哈希值）覆盖 DSH 实际加载的包清单、Cordis patch
+（配置补丁）和 JavaScript 运行文件，不包含声明文件或文档。
+
+DSH 0.1.7-rc.2 的 Agent 预设只从 Cordis Bundle（Cordis 功能包）中的 `@deepseek-ai/dsh-agent-preset`
+声明加载，不再扫描 DSH_HOME 的 `.agent-presets/<id>/` 目录。安装脚本从
+`config/dsh/agent-presets/shadow-agent/` 生成项目本地 preset Bundle（预设功能包），并将正式预设注册到 Web
+profile；profile patch（配置补丁）使用 `agent-preset-registry`（Agent 预设注册器）的 `default`（默认预设字段）。
+旧目录保留供回滚和数据核对，不再参与新版本加载。
 
 ## 打开 DSH 界面
 

@@ -227,8 +227,9 @@
         backgroundMode: one-shot
         maxDepth: provider-managed
 
-    - id: workflow-worker-thread
-      name: '@deepseek-ai/dsh-workflow-worker-thread'
+    # DSH 0.1.7 的 workflow-ptc（PTC 工作流插件）是新版内置的可用实现。
+    - id: workflow-ptc
+      name: '@deepseek-ai/dsh-workflow-ptc'
       config:
         provider: spawn
 
