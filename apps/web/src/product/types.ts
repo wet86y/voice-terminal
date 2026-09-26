@@ -12,6 +12,51 @@ import type {
 export type ProductRuntimeState = 'offline' | 'standby' | 'listening' | 'thinking' | 'speaking' | 'error'
 export type ProductCapability = 'llm' | 'tts' | 'local_kws' | 'local_asr' | 'local_vad' | 'local_analysis_endpoint' | 'local_analysis_refine' | string
 export type ProductModelOrigin = 'runtime_config' | 'local_scan' | 'product_managed' | string
+/** 本地模型 device mode（设备模式）：自动、仅 CPU（中央处理器）或 CUDA（NVIDIA GPU）。 */
+export type ComputeDeviceMode = 'auto' | 'cpu' | 'cuda'
+/** 可调度的非 TTS 本地模型标识。 */
+export type ProductLocalModelId = 'paraformer' | 'sensevoice' | 'voice_vad' | 'kws' | 'smart_turn' | 'wespeaker'
+
+export interface ProductComputeSettings {
+  /** devices（设备选项）：每个本地模型选择自动、仅 CPU 或 GPU。 */
+  devices: Record<ProductLocalModelId, ComputeDeviceMode>
+  /** fallback_devices（回退设备）：保存时记录的上次成功设备，供启动失败时回退。 */
+  fallback_devices?: Record<ProductLocalModelId, 'cpu' | 'cuda'>
+}
+
+export interface ProductComputeModelStatus {
+  /** requested_device（请求设备）：设置中保存的设备偏好。 */
+  requested_device: ComputeDeviceMode
+  /** device（实际设备）：当前模型报告的运行设备。 */
+  device: string | null
+  /** service（服务状态）：模型当前的加载与服务状态。 */
+  service: string
+  /** load_error（加载诊断）：启动回退原因或当前加载错误。 */
+  load_error?: string | null
+  /** process_memory_rss_bytes（进程常驻内存）：所在工作进程当前占用的 RAM。 */
+  process_memory_rss_bytes?: number | null
+  /** gpu_available（GPU 可用性）：当前模型的 GPU 推理后端是否已安装并可用。 */
+  gpu_available: boolean
+  /** gpu_unavailable_reason（GPU 不可用原因）：后端未安装或设备不兼容的解释。 */
+  gpu_unavailable_reason?: string | null
+  /** internal_vad_device（内部 VAD 设备）：SenseVoiceSmall 内部 FSMN-VAD 的实际设备。 */
+  internal_vad_device?: string | null
+}
+
+export interface ProductComputeStatus {
+  hardware: {
+    system_memory: { available_bytes: number | null; total_bytes: number | null }
+    gpu: { available: boolean; name: string | null; free_bytes: number | null; total_bytes: number | null }
+    backends: {
+      pytorch_cuda: boolean
+      onnxruntime_providers: string[]
+      sherpa_onnx_version: string | null
+      sherpa_onnx_cuda: boolean
+    }
+    models: Record<ProductLocalModelId, { gpu_available: boolean; reason: string | null }>
+  }
+  models: Record<ProductLocalModelId, ProductComputeModelStatus>
+}
 
 export interface ProductRuntimeSnapshot {
   state: TerminalState
@@ -54,6 +99,8 @@ export interface ProductSettingsSnapshot {
     confirm_threshold: number
     continuity_threshold: number
   }
+  /** compute（本地模型设备偏好）：不包含 TTS（语音合成）。 */
+  compute: ProductComputeSettings
   persona: Record<'instructions' | 'personality' | 'user' | 'shadow', string>
   warnings: string[]
 }
@@ -184,6 +231,8 @@ export interface ProductMutationResult {
   settings?: ProductSettingsSnapshot | Record<string, unknown>
   effective_from?: 'next_session' | 'next_episode' | string
   pending?: boolean
+  /** restart_required（需要重启）：修改计算设备后必须重启整个应用。 */
+  restart_required?: boolean
   message?: string
   [key: string]: unknown
 }

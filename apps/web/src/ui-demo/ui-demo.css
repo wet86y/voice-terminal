@@ -833,3 +833,37 @@ body:has(.product-shell) { overflow: hidden; }
 }
 .wake-keyword-add:hover:not(:disabled) { border-color: #a8bbf077; background: #7899f11c; }
 .wake-keyword-add:disabled { opacity: .4; cursor: not-allowed; }
+
+.compute-resource-card, .compute-model-card {
+  border: 1px solid var(--line); border-radius: 12px; background: #ffffff04;
+}
+.compute-resource-card { margin-top: 24px; padding: 17px; }
+.compute-resource-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.compute-resource-grid > div { display: grid; gap: 5px; min-width: 0; }
+.compute-resource-grid small, .compute-resource-grid span, .compute-model-heading small,
+.compute-model-stats, .compute-resource-card > p, .compute-model-note, .compute-model-error {
+  color: var(--subtle); font-size: 10px; line-height: 1.6;
+}
+.compute-resource-grid strong { overflow-wrap: anywhere; color: #d9e3f9; font-size: 13px; }
+.compute-resource-card > p { margin: 14px 0 0; }
+.compute-model-list { display: grid; gap: 10px; margin-top: 14px; }
+.compute-model-card { display: grid; gap: 12px; padding: 15px; }
+.compute-model-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.compute-model-heading > div { display: grid; gap: 4px; }
+.compute-model-heading strong { color: #d9e3f9; font-size: 12px; }
+.compute-model-heading > span { flex: 0 0 auto; }
+.compute-model-stats { display: flex; flex-wrap: wrap; gap: 5px 14px; }
+.compute-model-note, .compute-model-error { margin: 0; }
+.compute-model-error { color: #f1a8aa; }
+.compute-device-field { display: grid; grid-template-columns: 145px minmax(0, 1fr); align-items: center; gap: 12px; }
+.compute-device-field > span { color: #d9e3f9; font-size: 11px; }
+.compute-device-field select {
+  width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid #ffffff19;
+  border-radius: 7px; outline: none; color: var(--text); background: #050b18a1; font-size: 11px;
+}
+.compute-device-field select option { color: var(--text); background: #111a2b; }
+.settings-panel footer.compute-settings-footer { justify-content: space-between; gap: 10px; }
+@media (max-width: 800px) {
+  .compute-resource-grid { grid-template-columns: 1fr; }
+  .compute-device-field { grid-template-columns: 1fr; gap: 7px; }
+}

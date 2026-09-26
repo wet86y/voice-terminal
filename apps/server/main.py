@@ -115,6 +115,22 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
                 f"model_registry_scan: {type(exc).__name__}: {str(exc)[:260]}"
             )
         await runtime.initialize()
+        try:
+            compute_status = await runtime.compute_status()
+            restored_devices = await asyncio.to_thread(
+                product_settings.revert_failed_compute_devices,
+                compute_status.get("models", {}),
+            )
+            if restored_devices:
+                runtime.startup_errors.append(
+                    "compute_device_restore: CUDA 加载失败后已恢复为上次成功设备（"
+                    + ", ".join(f"{name}={device}" for name, device in sorted(restored_devices.items()))
+                    + ")."
+                )
+        except Exception as exc:
+            runtime.startup_errors.append(
+                f"compute_status_startup: {type(exc).__name__}: {str(exc)[:240]}"
+            )
         runtime.dsh.begin_start()
         try:
             yield

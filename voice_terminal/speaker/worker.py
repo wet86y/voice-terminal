@@ -17,6 +17,8 @@ from ..config import load_config
 from ..core.events import utc_now_iso
 from ..env import load_env_file
 from ..logging_setup import configure_logging
+from ..server.product import ProductSettingsStore
+from ..compute import process_memory_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +27,13 @@ class SpeakerWorkerEngine:
     def __init__(self, model_path: Path, *, sample_rate: int = 16000,
                  window_ms: int = 2000, step_ms: int = 500,
                  min_speech_ms: int = 700,
-                 min_window_speech_ratio: float = 0.40) -> None:
+                 min_window_speech_ratio: float = 0.40,
+                 device: str = "cpu", fallback_device: str = "cpu") -> None:
         self.model_path = model_path
-        self.model = WeSpeakerOnnxEngine(model_path, sample_rate=sample_rate)
+        self.model = WeSpeakerOnnxEngine(
+            model_path, sample_rate=sample_rate,
+            device=device, fallback_device=fallback_device,
+        )
         self.sample_rate = sample_rate
         self.window_samples = sample_rate * window_ms // 1000
         self.step_samples = sample_rate * step_ms // 1000
@@ -287,12 +293,18 @@ async def run(config_path: Path | None = None) -> None:
         raise RuntimeError("缺少 websockets，请先运行安装脚本。") from exc
     root = Path(__file__).resolve().parents[2]
     config = load_config(root / "config" / "default.yaml", config_path if config_path and config_path.is_file() else None)
+    config = ProductSettingsStore(
+        path=root / "config" / "product-settings.json",
+        config=config,
+    ).effective_config()
     model_path = config.speaker_model_path
     engine = SpeakerWorkerEngine(
         model_path, sample_rate=config.audio.sample_rate,
         window_ms=config.speaker.window_ms, step_ms=config.speaker.step_ms,
         min_speech_ms=config.speaker.min_speech_ms,
         min_window_speech_ratio=config.speaker.min_window_speech_ratio,
+        device=config.compute.devices.get("wespeaker", "cpu"),
+        fallback_device=config.compute.fallback_devices.get("wespeaker", "cpu"),
     )
     await asyncio.to_thread(engine.load)
 
@@ -310,6 +322,10 @@ async def run(config_path: Path | None = None) -> None:
                         "status": "READY", "model_loaded": True,
                         "model_version": engine.model_version,
                         "frontend_version": engine.model.frontend_version,
+                        "device": engine.model.device,
+                        "requested_device": engine.model.requested_device,
+                        "load_error": engine.model.load_error,
+                        "process_memory_rss_bytes": process_memory_bytes(),
                     }, ensure_ascii=False))
                 elif kind == "fingerprint":
                     # Lets Voice Server prove that the enrolled templates were

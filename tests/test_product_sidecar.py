@@ -36,6 +36,47 @@ class ProductSidecarTests(unittest.TestCase):
     def store(self) -> ProductSettingsStore:
         return ProductSettingsStore(path=self.settings_path, config=self.config)
 
+    def test_compute_settings_migrate_default_and_restore_after_gpu_failure(self) -> None:
+        legacy = ProductSettingsStore(
+            path=self.settings_path,
+            config=self.config,
+        )
+        devices = legacy.snapshot()["compute"]["devices"]
+        self.assertEqual(devices["paraformer"], "auto")
+        self.assertEqual(
+            {key: value for key, value in devices.items() if key != "paraformer"},
+            {key: "cpu" for key in devices if key != "paraformer"},
+        )
+
+        selected = dict(devices)
+        selected["sensevoice"] = "cuda"
+        legacy.save_compute(
+            {"devices": selected},
+            active_devices={key: "cpu" for key in selected},
+        )
+        self.assertEqual(self.store().snapshot()["compute"]["devices"]["sensevoice"], "cuda")
+
+        reverted = self.store().revert_failed_compute_devices({
+            "sensevoice": {
+                "device": "cpu",
+                "requested_device": "cuda",
+                "load_error": "CUDA 初始化失败",
+            },
+        })
+        self.assertEqual(reverted, {"sensevoice": "cpu"})
+        saved = self.store().snapshot()["compute"]
+        self.assertEqual(saved["devices"]["sensevoice"], "cpu")
+        self.assertEqual(saved["fallback_devices"]["sensevoice"], "cpu")
+
+    def test_compute_settings_reject_incomplete_or_invalid_device_maps(self) -> None:
+        store = self.store()
+        with self.assertRaises(ProductSettingsError):
+            store.save_compute({"devices": {"sensevoice": "cuda"}})
+        devices = dict(store.snapshot()["compute"]["devices"])
+        devices["sensevoice"] = "gpu"
+        with self.assertRaises(ProductSettingsError):
+            store.save_compute({"devices": devices})
+
     def test_settings_are_atomic_reloadable_and_corruption_is_reported(self) -> None:
         store = self.store()
         asyncio.run(store.save_silence({"seconds": 60}))

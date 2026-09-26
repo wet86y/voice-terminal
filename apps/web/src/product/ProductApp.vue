@@ -21,6 +21,7 @@ const {
   providerStep, discoveredModels, modelAssignments, uiModels: modelEntries,
   availableLlmModels, availableTtsModels, visibleLocalPool, hiddenPool,
   managedApiModelPool, selectedModels, activeModels, activeTtsModel, registry,
+  computeStatus, refreshComputeStatus, saveComputeSettings,
   shadowExpanded, modelScanState, restartState, applyImpact, dsh, openDshConsole,
   lastError, notice, noticeVisible, runtimeAction, resetSession, setReasoningMode,
   toggleProviderReasoning,
@@ -32,6 +33,48 @@ const {
   commitSpeakerEnrollment, cancelSpeakerEnrollment, deleteSpeakerTemplate, setSpeakerTemplateCentroid, testSpeakerAudio,
   captureSpeakerEnrollmentSegment, captureSpeakerTest, refreshAmbientContext, clearAmbientContext,
 } = adapter
+const computeModelRows = [
+  { id: 'paraformer', title: 'Paraformer（流式语音识别）', detail: '实时语音识别工作进程。' },
+  { id: 'sensevoice', title: 'SenseVoiceSmall（语音识别与分析）', detail: '包含同设备运行的内部 FSMN-VAD（语音活动检测）。' },
+  { id: 'voice_vad', title: 'Voice Server FSMN-VAD（语音活动检测）', detail: '实时语音输入与分段检测。' },
+  { id: 'kws', title: 'KWS（关键字唤醒）', detail: 'Sherpa-ONNX 关键字唤醒模型。' },
+  { id: 'smart_turn', title: 'SmartTurn（语音结束判断）', detail: 'ONNX Runtime 语音轮次结束分类。' },
+  { id: 'wespeaker', title: 'WeSpeaker（声纹识别）', detail: '本地 ONNX 声纹向量提取。' },
+] as const
+function formatComputeBytes(value: number | null | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '不可用'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let amount = value
+  let unit = 0
+  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1 }
+  return amount.toFixed(unit > 1 ? 1 : 0) + ' ' + units[unit]
+}
+function deviceLabel(value: string | null | undefined) {
+  if (value === 'cpu') return 'CPU（中央处理器）'
+  if (value?.startsWith('cuda')) return 'GPU（CUDA）'
+  return '未运行'
+}
+function requestedDeviceLabel(value: string | null | undefined) {
+  if (value === 'auto') return '自动选择'
+  return deviceLabel(value)
+}
+function computeChangePending() {
+  return computeModelRows.some(row => {
+    const runtimeModel = computeStatus.value?.models[row.id]
+    if (!runtimeModel) return false
+    const selected = settings.compute.devices[row.id]
+    const actual = runtimeModel.device?.startsWith('cuda') ? 'cuda' : runtimeModel.device
+    return selected !== runtimeModel.requested_device
+      && !(runtimeModel.load_error && selected === actual)
+  })
+}
+function hasUnsupportedGpuChoice() {
+  return computeModelRows.some(row => settings.compute.devices[row.id] === 'cuda'
+    && computeStatus.value?.models[row.id]?.gpu_available !== true)
+}
+function serviceLabel(value: string | undefined) {
+  return ({ READY: '运行中', DEGRADED: '降级运行', ERROR: '启动错误', UNAVAILABLE: '无法连接', DISABLED: '已停用', STARTING: '启动中', UNKNOWN: '状态未知' } as Record<string, string>)[value || 'UNKNOWN'] || value || '状态未知'
+}
 const reasoningMode = voice.reasoningMode
 const listening = voice.listening
 const waitingForWake = computed(() => (
@@ -1079,7 +1122,7 @@ function pageLabel() {
       <header class="settings-heading"><div><p class="panel-kicker">应用设置</p><h1>让助手更像你的工作方式</h1><p>设置通过 Voice Server 产品 API 保存；KWS、Persona、最终静默设置在安全边界后于下一次会话或 Episode 生效。</p></div><span class="settings-badge">{{ connected ? '实时后端已连接' : '后端离线 · 可重试' }}</span></header>
       <div v-if="settings.warnings.length" class="model-safety"><span>!</span><p>{{ settings.warnings.join(' ') }}</p></div>
       <div class="settings-layout">
-        <nav class="settings-tabs"><button type="button" :class="{ active: activeSettingsTab === 'wake' }" @click="activeSettingsTab = 'wake'"><span>◌</span><div><strong>KWS 唤醒词</strong><small>启动与待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'persona' }" @click="activeSettingsTab = 'persona'"><span>✦</span><div><strong>人格与指令</strong><small>主 LLM 与 Shadow</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'silence' }" @click="activeSettingsTab = 'silence'"><span>◷</span><div><strong>静默等待</strong><small>最终检查与回待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'speaker' }" @click="activeSettingsTab = 'speaker'"><span>♬</span><div><strong>声纹识别</strong><small>可选身份增强</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'wakes' }" @click="activeSettingsTab = 'wakes'"><span>⏱</span><div><strong>唤醒任务</strong><small>定时与循环事件</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'models' }" @click="activeSettingsTab = 'models'"><span>◇</span><div><strong>模型管理</strong><small>连接、配置与模型池</small></div></button></nav>
+        <nav class="settings-tabs"><button type="button" :class="{ active: activeSettingsTab === 'wake' }" @click="activeSettingsTab = 'wake'"><span>◌</span><div><strong>KWS 唤醒词</strong><small>启动与待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'persona' }" @click="activeSettingsTab = 'persona'"><span>✦</span><div><strong>人格与指令</strong><small>主 LLM 与 Shadow</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'silence' }" @click="activeSettingsTab = 'silence'"><span>◷</span><div><strong>静默等待</strong><small>最终检查与回待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'speaker' }" @click="activeSettingsTab = 'speaker'"><span>♬</span><div><strong>声纹识别</strong><small>可选身份增强</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'wakes' }" @click="activeSettingsTab = 'wakes'"><span>⏱</span><div><strong>唤醒任务</strong><small>定时与循环事件</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'models' }" @click="activeSettingsTab = 'models'"><span>◇</span><div><strong>模型管理</strong><small>连接、配置与模型池</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'compute' }" @click="activeSettingsTab = 'compute'"><span>▦</span><div><strong>本地模型设备</strong><small>CPU、GPU 与资源状态</small></div></button></nav>
 
         <article class="settings-panel panel">
           <template v-if="activeSettingsTab === 'wake'">
@@ -1142,6 +1185,34 @@ function pageLabel() {
               </div>
               <div v-else class="pool-empty">还没有唤醒任务。可在 DSH 会话中使用 schedule_wake（创建唤醒）工具添加。</div>
             </div>
+          </template>
+
+          <template v-else-if="activeSettingsTab === 'compute'">
+            <header><p class="panel-kicker">本地模型运行设备</p><h2>在 CPU 与 GPU 间分配本地推理</h2><p>逐项设置本地模型的运行设备。保存后需要完全重启应用；TTS（语音合成）不在此页管理。</p></header>
+            <section class="compute-resource-card">
+              <div class="compute-resource-grid">
+                <div><small>系统可用内存</small><strong>{{ formatComputeBytes(computeStatus?.hardware.system_memory.available_bytes) }}</strong><span>总量 {{ formatComputeBytes(computeStatus?.hardware.system_memory.total_bytes) }}</span></div>
+                <div><small>GPU（图形处理器）</small><strong>{{ computeStatus?.hardware.gpu.available ? computeStatus.hardware.gpu.name : '未检测到可用 CUDA 显卡' }}</strong><span>可用显存 {{ formatComputeBytes(computeStatus?.hardware.gpu.free_bytes) }} / {{ formatComputeBytes(computeStatus?.hardware.gpu.total_bytes) }}</span></div>
+              </div>
+              <p>显存数字是整张 GPU 的系统可用量；当前运行库无法准确拆分每个模型的显存占用。GPU 选项要求对应推理后端已安装。</p>
+            </section>
+            <div v-if="!computeStatus" class="pool-empty">正在读取硬件能力与工作进程状态…</div>
+            <div v-else class="compute-model-list">
+              <article v-for="model in computeModelRows" :key="model.id" class="compute-model-card">
+                <div class="compute-model-heading"><div><strong>{{ model.title }}</strong><small>{{ model.detail }}</small></div><span class="entry-status" :class="computeStatus.models[model.id].service">{{ serviceLabel(computeStatus.models[model.id].service) }}</span></div>
+                <div class="compute-model-stats">
+                  <span>当前请求：{{ requestedDeviceLabel(computeStatus.models[model.id].requested_device) }}</span>
+                  <span>实际设备：{{ deviceLabel(computeStatus.models[model.id].device) }}</span>
+                  <span>工作进程常驻内存：{{ formatComputeBytes(computeStatus.models[model.id].process_memory_rss_bytes) }}</span>
+                  <span v-if="model.id === 'sensevoice'">内部 FSMN-VAD：{{ deviceLabel(computeStatus.models.sensevoice.internal_vad_device) }}</span>
+                </div>
+                <p v-if="computeStatus.models[model.id].load_error" class="compute-model-error">{{ computeStatus.models[model.id].load_error }}</p>
+                <p v-else-if="!computeStatus.models[model.id].gpu_available" class="compute-model-note">GPU 不可用：{{ computeStatus.models[model.id].gpu_unavailable_reason || '对应 GPU 推理后端未就绪。' }}</p>
+                <label class="compute-device-field"><span>保存后的运行偏好</span><select v-model="settings.compute.devices[model.id]"><option value="auto">自动（优先尝试 GPU，失败或显存不足时回退 CPU）</option><option value="cpu">仅 CPU（中央处理器）</option><option value="cuda" :disabled="!computeStatus.models[model.id].gpu_available">GPU（CUDA）</option></select></label>
+              </article>
+            </div>
+            <div v-if="computeChangePending()" class="info-callout"><span>i</span><p><strong>设置尚未运行。</strong>保存后需重启整个应用；当前会话和工作进程会继续使用现有设备，重启后状态会同步更新。</p></div>
+            <footer class="compute-settings-footer"><button class="outline-button" type="button" :disabled="saving" @click="refreshComputeStatus">刷新状态</button><button class="save-button" type="button" :disabled="saving || hasUnsupportedGpuChoice()" @click="saveComputeSettings">{{ saving ? '正在保存…' : '保存设备设置' }}</button></footer>
           </template>
 
           <template v-else>

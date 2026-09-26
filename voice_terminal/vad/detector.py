@@ -24,10 +24,13 @@ class VadActivity:
 class FsmnVadDetector:
     """Thin adapter around FunASR's streaming FSMN-VAD model."""
 
-    def __init__(self, *, model_dir: Path, device: str = "cpu", sample_rate: int = 16000,
-                 end_silence_ms: int | None = None) -> None:
+    def __init__(self, *, model_dir: Path, device: str = "cpu", fallback_device: str = "cpu",
+                 sample_rate: int = 16000, end_silence_ms: int | None = None) -> None:
         self.model_dir = model_dir
-        self.device = device
+        self.requested_device = device
+        self.fallback_device = fallback_device
+        self.device = "cpu"
+        self.load_error: str | None = None
         self.sample_rate = sample_rate
         self.end_silence_ms = end_silence_ms
         self._cache: dict[str, Any] = {}
@@ -46,15 +49,31 @@ class FsmnVadDetector:
             raise VadError("缺少 numpy/funasr，请先运行 scripts\\setup.ps1。") from exc
 
         self._np = np
-        try:
-            self._model = AutoModel(
-                model=str(model_dir),
-                device=device,
-                disable_update=True,
-                disable_pbar=True,
-            )
-        except Exception as exc:
-            raise VadError(f"FSMN-VAD 模型初始化失败：{exc}") from exc
+        from ..compute import device_candidates
+        last_error: Exception | None = None
+        for candidate in device_candidates(device, "voice_vad", fallback_device):
+            try:
+                self._model = AutoModel(
+                    model=str(model_dir),
+                    device=candidate,
+                    disable_update=True,
+                    disable_pbar=True,
+                )
+                self.device = candidate
+                self.load_error = (
+                    f"CUDA（图形处理器）加载失败，已回退到 {candidate}：{type(last_error).__name__}: {last_error}"
+                    if last_error is not None else None
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                if candidate == "cuda":
+                    try:
+                        import torch  # type: ignore
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+        raise VadError(f"FSMN-VAD 模型初始化失败：{last_error}") from last_error
 
     def reset(self) -> None:
         self._cache = {}

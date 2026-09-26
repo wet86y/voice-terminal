@@ -6,8 +6,10 @@ import unittest
 from pathlib import Path
 
 import httpx
+from unittest.mock import AsyncMock, patch
 
 from voice_terminal.config import AppConfig, PersonaConfig
+from voice_terminal.config import COMPUTE_MODEL_IDS
 from voice_terminal.model_registry.service import ModelRegistryService
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.server.websocket import SessionRuntime, create_app
@@ -65,6 +67,59 @@ class ProductApiTests(unittest.TestCase):
         transport = httpx.ASGITransport(app=self.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             return await client.request(method, path, **kwargs)
+
+    def test_compute_api_saves_device_choices_for_full_application_restart(self) -> None:
+        devices = {
+            name: ("auto" if name == "paraformer" else "cpu")
+            for name in COMPUTE_MODEL_IDS
+        }
+        status_models = {
+            name: {"device": "cpu", "requested_device": devices[name]}
+            for name in COMPUTE_MODEL_IDS
+        }
+        with patch.object(
+            self.runtime,
+            "compute_status",
+            new=AsyncMock(return_value={"models": status_models, "hardware": {}}),
+        ):
+            saved = asyncio.run(self._request(
+                "PUT", "/api/v1/product/settings/compute", json={"devices": devices},
+            ))
+        self.assertEqual(saved.status_code, 200)
+        self.assertTrue(saved.json()["restart_required"])
+        self.assertEqual(saved.json()["effective_from"], "application_restart")
+        self.assertEqual(self.runtime.product_settings.snapshot()["compute"]["devices"], devices)
+
+        with patch.object(
+            self.runtime,
+            "compute_status",
+            new=AsyncMock(return_value={"models": status_models, "hardware": {}}),
+        ):
+            status = asyncio.run(self._request("GET", "/api/v1/product/compute-status"))
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(set(status.json()), {"hardware", "models"})
+        self.assertEqual(set(status.json()["models"]), set(COMPUTE_MODEL_IDS))
+
+    def test_compute_api_rejects_gpu_when_model_backend_is_missing(self) -> None:
+        unavailable = {
+            "models": {
+                name: {"gpu_available": False, "reason": "后端未安装"}
+                for name in COMPUTE_MODEL_IDS
+            },
+        }
+        devices = {
+            name: ("cuda" if name == "sensevoice" else "cpu")
+            for name in COMPUTE_MODEL_IDS
+        }
+        with patch("voice_terminal.server.websocket.hardware_status", return_value=unavailable):
+            response = asyncio.run(self._request(
+                "PUT", "/api/v1/product/settings/compute", json={"devices": devices},
+            ))
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(
+            self.runtime.product_settings.snapshot()["compute"]["devices"]["sensevoice"],
+            "cpu",
+        )
 
     def test_snapshot_is_product_safe_and_settings_routes_are_bounded(self) -> None:
         response = asyncio.run(self._request("GET", "/api/v1/product/snapshot"))

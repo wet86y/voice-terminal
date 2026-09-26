@@ -5,6 +5,8 @@ import { productApi, ProductApiError } from './api'
 import type {
   DshRuntimeStatus,
   ProductAssignments,
+  ProductComputeStatus,
+  ProductLocalModelId,
   ProductModel,
   ProductModelRegistry,
   ProductMutationResult,
@@ -15,7 +17,7 @@ import type {
 } from './types'
 import { voiceShadowReplayFixture, voiceShadowReplayMeta } from './replay-data'
 
-export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models'
+export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models' | 'compute'
 export type ProductPage = 'home' | 'settings'
 export type AssignmentSlot = 'voice' | 'shadow' | 'status'
 
@@ -75,12 +77,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export const MAX_WAKE_KEYWORDS = 5
 
 const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 5,
+  schema_version: 6,
   tts: { backend: 'minimax' },
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
   shadow: { experimental_context_gate_enabled: false },
   speaker: { mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4 },
+  compute: {
+    devices: {
+      paraformer: 'auto', sensevoice: 'cpu', voice_vad: 'cpu',
+      kws: 'cpu', smart_turn: 'cpu', wespeaker: 'cpu',
+    },
+    fallback_devices: {
+      paraformer: 'cpu', sensevoice: 'cpu', voice_vad: 'cpu',
+      kws: 'cpu', smart_turn: 'cpu', wespeaker: 'cpu',
+    },
+  },
   persona: { instructions: '', personality: '', user: '', shadow: '' },
   warnings: [],
 }
@@ -118,6 +130,9 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   const shadow = isRecord(value.shadow) ? value.shadow : {}
   const tts = isRecord(value.tts) ? value.tts : {}
   const speaker = isRecord(value.speaker) ? value.speaker : {}
+  const compute = isRecord(value.compute) ? value.compute : {}
+  const computeDevices = isRecord(compute.devices) ? compute.devices : {}
+  const fallbackDevices = isRecord(compute.fallback_devices) ? compute.fallback_devices : {}
   const persona = isRecord(value.persona) ? value.persona : {}
   const text = (candidate: unknown) => typeof candidate === 'string' ? candidate : ''
   const wakeKeywords = Array.isArray(wake.keywords)
@@ -149,6 +164,21 @@ function normalizeSettings(value: unknown): ProductSettingsSnapshot {
         ? speaker.mode as ProductSettingsSnapshot['speaker']['mode'] : 'off',
       confirm_threshold: typeof speaker.confirm_threshold === 'number' ? speaker.confirm_threshold : 0.5,
       continuity_threshold: typeof speaker.continuity_threshold === 'number' ? speaker.continuity_threshold : 0.4,
+    },
+    compute: {
+      devices: Object.fromEntries(
+        Object.keys(DEFAULT_SETTINGS.compute.devices).map(key => {
+          const candidate = computeDevices[key]
+          const fallback = DEFAULT_SETTINGS.compute.devices[key as ProductLocalModelId]
+          return [key, ['auto', 'cpu', 'cuda'].includes(String(candidate)) ? candidate : fallback]
+        }),
+      ) as ProductSettingsSnapshot['compute']['devices'],
+      fallback_devices: Object.fromEntries(
+        Object.keys(DEFAULT_SETTINGS.compute.fallback_devices || {}).map(key => [
+          key,
+          fallbackDevices[key] === 'cuda' ? 'cuda' : 'cpu',
+        ]),
+      ) as NonNullable<ProductSettingsSnapshot['compute']['fallback_devices']>,
     },
     persona: {
       instructions: text(persona.instructions),
@@ -201,6 +231,10 @@ function updateSettingsFromResponse(settings: ProductSettingsSnapshot, result: P
   if (isRecord(candidate.silence)) Object.assign(settings.silence, candidate.silence)
   if (isRecord(candidate.shadow)) Object.assign(settings.shadow, candidate.shadow)
   if (isRecord(candidate.speaker)) Object.assign(settings.speaker, candidate.speaker)
+  if (isRecord(candidate.compute)) {
+    if (isRecord(candidate.compute.devices)) Object.assign(settings.compute.devices, candidate.compute.devices)
+    if (isRecord(candidate.compute.fallback_devices)) Object.assign(settings.compute.fallback_devices || {}, candidate.compute.fallback_devices)
+  }
   if (isRecord(candidate.tts)) Object.assign(settings.tts, candidate.tts)
   if (isRecord(candidate.persona)) Object.assign(settings.persona, candidate.persona)
   if (Array.isArray(candidate.warnings)) settings.warnings = candidate.warnings.filter((item): item is string => typeof item === 'string')
@@ -215,6 +249,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const settingsTab = ref<ProductSettingsTab>('wake')
   const snapshot = ref<ProductSnapshot | null>(null)
   const settings = reactive<ProductSettingsSnapshot>(structuredClone(DEFAULT_SETTINGS))
+  const computeStatus = ref<ProductComputeStatus | null>(null)
   const registry = ref<ProductModelRegistry>(structuredClone(DEFAULT_REGISTRY))
   const dsh = ref<DshRuntimeStatus>(structuredClone(DEFAULT_DSH))
   const wakeTasks = ref<WakeTask[]>([])
@@ -278,10 +313,20 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     voice: '', shadow: '', status: '',
   })
 
+  watch(settingsTab, tab => {
+    if (computeStatusTimer !== undefined) window.clearInterval(computeStatusTimer)
+    computeStatusTimer = undefined
+    if (tab === 'compute' && !replayMode) {
+      void refreshComputeStatus()
+      computeStatusTimer = window.setInterval(() => void refreshComputeStatus(), 5000)
+    }
+  })
+
   let snapshotRequest: Promise<void> | null = null
   let reconnectTimer: number | undefined
   let replayTimer: number | undefined
   let dshStatusTimer: number | undefined
+  let computeStatusTimer: number | undefined
   let noticeDisplayTimer: ReturnType<typeof setTimeout> | undefined
   let noticeFadeTimer: ReturnType<typeof setTimeout> | undefined
   let mutationQueue: Promise<unknown> = Promise.resolve()
@@ -346,6 +391,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     Object.assign(settings.silence, nextSettings.silence)
     Object.assign(settings.shadow, nextSettings.shadow)
     Object.assign(settings.speaker, nextSettings.speaker)
+    Object.assign(settings.compute.devices, nextSettings.compute.devices)
+    Object.assign(settings.compute.fallback_devices || {}, nextSettings.compute.fallback_devices || {})
     Object.assign(settings.tts, nextSettings.tts)
     Object.assign(settings.persona, nextSettings.persona)
     settings.schema_version = nextSettings.schema_version
@@ -384,13 +431,39 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     loading.value = true
     snapshotRequest = productApi.snapshot().then(async value => {
       applySnapshot(value)
-      await Promise.all([refreshSpeaker(), refreshWakeTasks()])
+      await Promise.all([refreshSpeaker(), refreshWakeTasks(), refreshComputeStatus()])
       lastError.value = ''
     }).catch(setError).finally(() => {
       loading.value = false
       snapshotRequest = null
     })
     return snapshotRequest
+  }
+
+  async function refreshComputeStatus() {
+    if (replayMode) return
+    try {
+      computeStatus.value = await productApi.computeStatus()
+    } catch (error) {
+      setError(error)
+    }
+  }
+
+  async function saveComputeSettings() {
+    await enqueue(async () => {
+      saving.value = true
+      try {
+        const result = await productApi.saveCompute({ devices: { ...settings.compute.devices } })
+        updateSettingsFromResponse(settings, result)
+        setNotice(result.message || (result.restart_required
+          ? '本地模型运行设备设置已保存，重新启动应用后生效。'
+          : '本地模型运行设备设置已保存。'))
+      } catch (error) {
+        setError(error)
+      } finally {
+        saving.value = false
+      }
+    })
   }
 
   async function refreshWakeTasks() {
@@ -1197,6 +1270,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (reconnectTimer !== undefined) window.clearInterval(reconnectTimer)
     if (replayTimer !== undefined) window.clearTimeout(replayTimer)
     if (dshStatusTimer !== undefined) window.clearInterval(dshStatusTimer)
+    if (computeStatusTimer !== undefined) window.clearInterval(computeStatusTimer)
     clearNoticeTimers()
     voice.dispose()
   })
@@ -1207,6 +1281,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     settingsTab,
     snapshot,
     settings,
+    computeStatus,
     registry,
     dsh,
     wakeTasks,
@@ -1278,6 +1353,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     saveShadowGate,
     savePersona,
     saveSpeaker,
+    refreshComputeStatus,
+    saveComputeSettings,
     refreshSpeaker,
     startSpeakerEnrollment,
     cancelSpeakerEnrollment,
