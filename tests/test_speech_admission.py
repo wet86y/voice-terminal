@@ -283,8 +283,10 @@ def test_rewrite_unsent_splices_the_tail_and_truncates_accepted_text():
         state.sent_chars = 3
         state.push("还会继续")
 
+        # ``text`` is the new tail only: the caller never reproduces the
+        # locked prefix, so the runtime stitches it locally.
         rewritten = await output.rewrite_unsent(
-            ("episode", "request"), "turn", speech_id=handle.speech_id, text="前半句改了口",
+            ("episode", "request"), "turn", speech_id=handle.speech_id, text="改了口",
         )
         assert rewritten is handle
         assert handle.text == "前半句改了口"
@@ -298,7 +300,7 @@ def test_rewrite_unsent_splices_the_tail_and_truncates_accepted_text():
     asyncio.run(scenario())
 
 
-def test_rewrite_unsent_refuses_when_the_sent_prefix_already_disagrees():
+def test_rewrite_unsent_replaces_the_tail_without_comparing_prefixes():
     async def scenario():
         output, handle, _tts, _player = _output_harness("playback_window", 500)
         state = AdmissionState(lead_ms=500)
@@ -308,12 +310,15 @@ def test_rewrite_unsent_refuses_when_the_sent_prefix_already_disagrees():
         state.sent_chars = 4
         state.push("的内容")
 
-        assert await output.rewrite_unsent(
-            ("episode", "request"), "turn", speech_id=handle.speech_id, text="完全不同的话",
-        ) is None
-        # Nothing was dropped: the caller must fall back to a real replacement.
-        assert handle.text == "已经送出的内容"
-        assert list(state.staged) == ["的内容"]
+        # A tail that does not extend the locked prefix is still a legal
+        # revision: only the unsent remainder is dropped and replaced.
+        rewritten = await output.rewrite_unsent(
+            ("episode", "request"), "turn", speech_id=handle.speech_id, text="完全改口了",
+        )
+        assert rewritten is handle
+        assert handle.text == "已经送出" + "完全改口了"
+        assert state.sent_chars == 4
+        assert list(state.staged) == ["完全改口了"]
 
     asyncio.run(scenario())
 
@@ -373,8 +378,10 @@ def test_streamed_decision_extends_one_in_place_rewrite():
             speak_snapshot = {}
 
             async def rewrite_unsent(self, identity, turn_id, *, speech_id, text):
+                # ``text`` is the new tail; a live transaction stitches it onto
+                # its own locked prefix.
                 seen["rewrite"].append((speech_id, text))
-                return Handle(text)
+                return Handle("已有" + text)
 
             async def replace_current(self, *_args, **_kwargs):
                 seen["replace"] += 1
@@ -404,8 +411,8 @@ def test_streamed_decision_extends_one_in_place_rewrite():
         await runtime._step(identity, {"USER_INPUT_REFINED"})
 
         assert seen["rewrite"] == [
-            ("live_speech", "已有改"),
-            ("live_speech", "已有改正"),
+            ("live_speech", "改"),
+            ("live_speech", "正"),
         ]
         assert seen["replace"] == 0
 
@@ -470,7 +477,8 @@ def test_complete_decision_rewrites_the_unsent_tail_instead_of_replacing():
         envelope = DecisionEnvelope(SpeechDecision("speak", "calm", "概括一下修正内容"), ())
         await runtime._apply_decision_v06(identity, "turn", envelope)
 
-        assert seen["rewrite"] == [("live_speech", "概括一下修正内容")]
+        # Only the part beyond the four locked characters is offered.
+        assert seen["rewrite"] == [("live_speech", "修正内容")]
         assert seen["replace"] == [] and seen["cancel"] == []
 
     asyncio.run(scenario())

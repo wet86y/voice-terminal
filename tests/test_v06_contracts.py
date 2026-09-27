@@ -1439,7 +1439,14 @@ def test_stream_prefix_replaces_playing_speak_and_only_feeds_new_handle():
     asyncio.run(scenario())
 
 
-def test_streamed_prefix_divergence_replaces_with_complete_accumulated_text():
+def test_streamed_prefix_divergence_replaces_with_undelivered_text_only():
+    """A streamed replacement never re-synthesises what was already accepted.
+
+    The snapshot accepts "已有播报" with nothing sent yet, so the divergent
+    answer must still contribute only the part that is not already queued; the
+    old behaviour fed the complete accumulated text and replayed it.
+    """
+
     async def scenario():
         seen = {"replace": 0, "feeds": []}
 
@@ -1464,21 +1471,35 @@ def test_streamed_prefix_divergence_replaces_with_complete_accumulated_text():
             status = "SPEAKING"
             speak_snapshot = {"queue_status": "speaking", "speech_id": "old", "output_generation": 3,
                               "text": "已有播报"}
+
+            def __init__(self):
+                self.cancelled = []
+
+            async def rewrite_unsent(self, identity, turn_id, *, speech_id, text):
+                # The four accepted characters are irreversible here.
+                self.cancelled.append(text)
+                return None
+
             async def replace_current(self, *_args, **_kwargs):
                 seen["replace"] += 1
                 return Handle()
 
         async def emit(*_args): pass
         conversation = ConversationRuntime(); conversation.begin_turn("turn")
-        runtime = AgentEpisodeRuntime(Provider(), Registry(), Output(), emit,
+        output = Output()
+        runtime = AgentEpisodeRuntime(Provider(), Registry(), output, emit,
                                       conversation=conversation, ledger=SessionLedger())
         runtime.episode_id = conversation.conversation_id; runtime.last_turn_id = "turn"
         runtime.inputs = {"turn": {"text": "你好", "final": True}}
-        Output.speak_snapshot.update(conversation_id=runtime.episode_id, turn_id="turn")
+        Output.speak_snapshot.update(conversation_id=runtime.episode_id, turn_id="turn",
+                                     sent_chars=len("已有播报"))
         identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"
         runtime._identity_turns[identity] = "turn"
         await runtime._step(identity, {"USER_INPUT_REFINED"})
-        assert seen["replace"] == 1 and seen["feeds"] == ["已有改", "正"]
+        # The accepted text is fully irreversible, so nothing of it may reach
+        # the replacement transaction; only the genuinely new remainder does.
+        assert seen["replace"] == 1
+        assert seen["feeds"] == ["改", "正"]
     asyncio.run(scenario())
 
 

@@ -85,10 +85,21 @@ assistant 历史只记录播放结算后的传达事实，不记录尚未发送�
 
 - 非 `empty` 状态必须包含四个 `text_parts` 键，空内容使用 `""`，不能使用 `null` 或随机省略；
 - `committed_prefix`、`current_clause`、`prefetched_clause` 都已经锁定；只有 `revisable_tail` 可重写；
+- 当一个追加的后继事务成为队头时，`committed_prefix` 必须包含本轮此前已交付的前沿，不得比上一次请求更短；
 - `owner_scope` 取 `current_turn`、`previous_turn` 或 `none`，只表达所有权；
 - `continuation_mode` 取 `rewrite_tail`、`append_only` 或 `none`，表达修改权限；
 - `delivery.heard_text` 是独立的传达事实，不等于 TTS 已发送或播放器已播放；
+- `delivery` 只在队列为空（`state=empty`）时出现，只含 `heard_text`、`status`、`termination`；队列非空时不出现，避免与 `text_parts` 争夺"说到哪"的解释权；
 - `sent_chars`、`played_ms`、PCM 边界、provider session、TTS 状态、speech ID 和 generation 永远留在执行层。
+
+### 决策状态
+
+`speak.state` 取 `speak`、`revision`、`cancel`、`wait`：
+
+- `speak`：`text` 是完整文本，本地只合成尚未交付的部分；
+- `revision`：`text` 只是新的尾巴，仅在 `continuation_mode=rewrite_tail` 时可用；本地把锁定前缀与新尾巴拼成完整文本，模型不再复述前缀；
+- `cancel`：`text` 为空表示只停止，非空表示停止并替换；
+- `wait`：`text` 必须为空。
 
 执行层在应用模型结果前必须重新读取最新 `sent_chars`、PCM receipt 和播放器状态，不能直接复用请求开始时的快照。
 
@@ -107,6 +118,8 @@ Shadow thinking+tools 的合法 `reasoning`、`function_call`、`function_call_o
 | 已完成 speech 的传达事实 | Speech/ledger | HISTORY | 是 | delivery/order |
 | 当前未提交输入 | Context projector | REQUEST_TAIL | 否 | wrapper/order |
 | 活动 speak 四段 | Speech runtime | REQUEST_TAIL | 否 | append/rewrite/replace |
+| 最近一次传达前沿 `delivery`（仅 `state=empty`） | Speech runtime | REQUEST_TAIL | 否 | delivery/order |
+| revision 拒绝或降级的轻度反馈 | Agent runtime | REQUEST_TAIL | 否 | placement/final-position |
 | 时间、工具可用性、恢复反馈 | Runtime | REQUEST_TAIL | 否 | placement/final-position |
 | 最终 JSON 输出约束 | Agent runtime | REQUEST_TAIL 尾部 | 否 | schema/final-position |
 

@@ -52,8 +52,10 @@ def test_decision_schema_keeps_wire_shape_and_reserves_thinking_action():
 
 def test_prompt_matches_required_responses_wire_contract_and_has_short_examples():
     assert "state、emotion、text 以及顶层 actions 始终必填" in PROMPT
-    assert "state=cancel 或 state=wait 时 text 必须为 \"\"" in PROMPT
+    assert "state=wait 时 text 必须为 \"\"" in PROMPT
+    assert "state=cancel 时 text 为空表示只停止，text 非空表示停止并替换" in PROMPT
     assert '{"speak":{"state":"speak","emotion":"calm","text":"好的。"},"actions":[]}' in PROMPT
+    assert '{"speak":{"state":"revision","emotion":"calm","text":"另外，明早可能堵车。"},"actions":[]}' in PROMPT
     assert '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}' in PROMPT
     assert "state=wait 表示判断无需变更当前语音队列" in PROMPT
     assert "任何正常调用都可以使用 wait" in PROMPT
@@ -61,6 +63,7 @@ def test_prompt_matches_required_responses_wire_contract_and_has_short_examples(
     assert "绝不能把拼接后的计划文本原样作为新的 speak.text" in PROMPT
     assert "committed_prefix、current_clause、prefetched_clause、revisable_tail" in PROMPT
     assert "continuation_mode=rewrite_tail" in PROMPT
+    assert "优先用 state=revision 只写新的尾巴" in PROMPT
     assert "收到它们不等于必须 speak" in PROMPT
     assert "相关性、时效性、可靠性、是否已经表达" in PROMPT
     assert 'HISTORY 中 assistant 角色的 <voice_delivery>' in PROMPT
@@ -443,7 +446,7 @@ def test_responses_payload_separates_instructions_and_enables_strict_schema():
         reasoning_effort="none", max_output_tokens=512,
     )
     assert payload["instructions"].startswith("rules\n\n")
-    assert "wait/cancel set speak.text to the empty string" in payload["instructions"]
+    assert "For wait set speak.text to the empty string" in payload["instructions"]
     assert payload["reasoning"] == {"effort": "none"}
     assert payload["text"]["format"]["strict"] is True
     assert payload["text"]["format"]["schema"] == schema

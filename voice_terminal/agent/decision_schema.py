@@ -100,7 +100,12 @@ def decision_schema(action_definitions: Iterable[dict[str, Any]], *, allow_think
                 # this provider boundary and is normalized locally.
                 "required": ["state", "emotion", "text"],
                 "properties": {
-                    "state": {"type": "string", "enum": ["speak", "cancel", "wait"]},
+                    # ``revision`` carries only the new tail; the local runtime
+                    # stitches it onto the locked prefix.  ``cancel`` may carry
+                    # replacement text: empty means stop only, non-empty means
+                    # stop and replace.
+                    "state": {"type": "string",
+                              "enum": ["speak", "revision", "cancel", "wait"]},
                     "emotion": {"type": "string", "enum": EMOTIONS},
                     "text": {"type": "string"},
                 },

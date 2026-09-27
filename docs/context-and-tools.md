@@ -23,9 +23,14 @@
     "current_clause": "",
     "prefetched_clause": "",
     "revisable_tail": ""
-  }
+  },
+  "delivery": {"heard_text": "", "status": "partial", "termination": "interrupted"}
 }
 ```
+
+`text_parts` 描述的是**本轮已接受文本**：当一个追加的后继事务成为队头时，本地会把本轮此前已交付的前沿还原到它前面，因此 `committed_prefix` 不会在事务换头时缩短。
+
+`delivery` 只在队列为空（`state=empty`）时出现，且只含 `heard_text`、`status`、`termination` 三个键：它是"用户实际听到的前沿"，与 `text_parts` 的"已发送"不是同一件事，也不携带任何 speech/turn/request ID。队列非空时不投影 `delivery`，避免与当前事务的 `text_parts` 争夺"说到哪"的解释权。
 
 ### Shadow
 

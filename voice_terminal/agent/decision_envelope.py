@@ -18,7 +18,7 @@ EMOTIONS = {"calm", "happy", "sad", "angry", "fearful", "disgusted", "surprised"
 # safe provider fallback, so treating them as a fatal envelope error only
 # creates an avoidable recovery round-trip.
 EMOTION_ALIASES = {"friendly": "calm"}
-SPEAK_STATES = {"speak", "cancel", "wait"}
+SPEAK_STATES = {"speak", "revision", "cancel", "wait"}
 EARLY_NON_JSON_NON_WHITESPACE_LIMIT = 10
 
 
@@ -584,9 +584,12 @@ class SpeechDecisionEnvelopeStream:
         text = speak.get("text", "")
         if not isinstance(text, str):
             raise EnvelopeError("speak text must be a string")
-        if state == "speak" and not text.strip():
-            raise EnvelopeError("speak requires nonempty text")
-        if state != "speak" and has_text and not (self.allow_empty_control_text and text == ""):
+        if state in {"speak", "revision"} and not text.strip():
+            raise EnvelopeError("speak/revision requires nonempty text")
+        # ``cancel`` has two legitimate shapes: empty text stops output
+        # immediately, non-empty text stops and replaces.  ``wait`` stays
+        # text-free because the provider boundary normalizes it that way.
+        if state == "wait" and has_text and (text.strip() or not self.allow_empty_control_text):
             raise EnvelopeError("cancel/wait cannot contain text")
         actions = value.get("actions")
         if not isinstance(actions, list) or len(actions) > 8:
