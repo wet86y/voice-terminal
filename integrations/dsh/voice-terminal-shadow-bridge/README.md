@@ -77,3 +77,39 @@ existing Chat（对话） and Trajectory（执行轨迹） views（视图）.
 从没有待办任务的空会话触发 DSH（影子代理宿主）时，代理可能以
 `finish_shadow_no_action`（无操作结束工具）正常结束，而不生成助手文字。验证唤醒执行时，
 应在唤醒说明或会话上下文中提供明确任务。
+
+## 终端工具与回合终结
+
+`request_user_input`、`return_shadow_result` 和 `finish_shadow_no_action`（三个终端工具）
+在 Voice Server（语音服务端）确认收下事件后调用 `exec.concludeTurn()`，把当前 DSH 回合
+标记为在该步终结。`accepted`（首次投递）与 `duplicate`（同一 `request_id` 的重放确认）
+都算投递成功——两者都是 HTTP 200。缺少这个标记时，Agent Loop 的 `step()` 不返回终结原因，
+`turn/end` 会带着 `reason: null` 落盘，而 DSH 0.1.7-rc.2 的 Chat（对话页）会在正常渲染
+路径上读取 `turn/end.data.reason.kind`，于是抛出
+`TypeError: Cannot read properties of null (reading 'kind')`，打死共享的 event feed 订阅，
+使**所有**会话的对话页变空。
+
+## Known Limitations and Deferred Work
+
+- **无法从插件侧修复读取端崩溃。** 阻止 `reason: null` 写入是插件职责（见上节），但崩溃点
+  在 DSH 官方源码内：`ui-chat` 与 `ui-trajectory` 的多个 definition 以
+  `reason.kind` 直接解引用，`?.` 拦不住 `null`（`turn-process.ts`、`ChatGroupSeat.tsx`、
+  `TurnProcessNodeView.tsx`、`turn-error.ts`、`turn-tail.ts`、`turn-max-tokens.ts`、
+  `ui-chat/apply.ts`、`trajectory-assistant-definition.ts`）。`ConversationNodeDefinition`
+  按 `kind` 唯一注册、无法替换内置 definition，因此插件无法覆盖这些读取。
+  `config/dsh/README.md` 同时禁止修改 `.runtime/dsh/source`；一旦解除该禁令，应优先在
+  DSH 侧加空值保护，并向上游反馈：`agent.ts` 让「工具未声明终结」退化成 `turn/end` 的
+  `reason: null`，绕过了 `reason: TurnEndReason` 的非空类型契约。
+- **残留风险：** 若模型在某一回合既没有调用任何终端工具、也没有以文本收尾，该回合仍可能写入
+  `reason: null`。Bridge 的 protocol recovery（一次恢复回合）会尝试纠正，但那一回合的
+  `turn/end` 仍会被读取端看到。遇到对话页空白时，先跑
+  `node scripts/dsh-diagnose/find-null-kind-rows.mjs` 排查是否存在 `reason: null` 记录，
+  必要时用 `node scripts/dsh-diagnose/purge-poisoned-sessions.mjs` 备份后清理。
+- **`session.resume` 不安装根工具。** 只有新建会话（`session.open`）与唤醒会话
+  （`wake.open`）会注册 Voice 控制工具；恢复会话沿用既有 composition，不重复安装。
+- **唤醒会话的根工具注册尚未对齐。** `wake.open` 路径只挂载 Shadow preset，没有注册
+  Voice 控制工具，因此唤醒会话的代理无法通过 Bridge 工具回投结果。补齐它需要让工具注册
+  与 `ensure()` 的绑定校验共用同一份 binding 状态，属于行为改动，留待单独确认。
+- **事件注入工具不响应取消。** `post()` 与 `get_latest_context` / `read_ambient_context`
+  向 Voice Server 发起的循环回环请求不接 `exec.signal`；DSH 仍会在 `tools/execute` 层
+  中止调用，但已发出的 HTTP 请求不会被取消。

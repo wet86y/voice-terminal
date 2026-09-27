@@ -76,6 +76,20 @@ function Invoke-Checked {
   } finally { Pop-Location }
 }
 
+function Compare-PathOrdinal {
+  param([string]$Left, [string]$Right)
+  # Compare code point by code point. `Sort-Object` uses culture collation, which
+  # orders `settings.ts` before `settings-contract.ts` ('.' before '-') and would
+  # break the tree hash parity with the DSH runtime's Python sort key.
+  $a = $Left.ToLowerInvariant()
+  $b = $Right.ToLowerInvariant()
+  $limit = [Math]::Min($a.Length, $b.Length)
+  for ($index = 0; $index -lt $limit; $index++) {
+    if ($a[$index] -ne $b[$index]) { return [int]$a[$index] - [int]$b[$index] }
+  }
+  return $a.Length - $b.Length
+}
+
 function Get-TreeHash {
   param([string[]]$Paths)
   $rows = foreach ($Path in $Paths) {
@@ -84,7 +98,15 @@ function Get-TreeHash {
     } else {
       @(Get-ChildItem -LiteralPath $Path -File -Recurse)
     }
-    $Files | Sort-Object FullName | ForEach-Object {
+    # The DSH runtime re-derives this hash in Python and refuses to start DSH when
+    # the two disagree, so the order must match its lowercased code-point sort.
+    $Sorted = [System.Collections.Generic.List[object]]::new()
+    foreach ($File in $Files) { $Sorted.Add($File) }
+    $Comparer = [System.Collections.Generic.Comparer[object]]::Create(
+      [Comparison[object]]{ param($x, $y) Compare-PathOrdinal $x.FullName.Substring($RepoRoot.Length) $y.FullName.Substring($RepoRoot.Length) }
+    )
+    $Sorted.Sort($Comparer)
+    $Sorted | ForEach-Object {
       "$(($_.FullName.Substring($RepoRoot.Length)).Replace('\','/')):$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
     }
   }
@@ -305,8 +327,8 @@ if ($ValidateOnly) {
   foreach ($RuntimeArtifactPath in $ShadowPresetRuntimeArtifactPaths) {
     if (-not (Test-Path -LiteralPath $RuntimeArtifactPath -PathType Leaf)) { throw "Shadow preset Bundle（Shadow 预设功能包）产物缺失：$RuntimeArtifactPath" }
   }
-  if ((Get-Content -LiteralPath $ShadowPresetPackagePath -Raw) -ne $ShadowPresetPackageText) { throw "Shadow preset Bundle（Shadow 预设功能包）清单已漂移。" }
-  if ((Get-Content -LiteralPath $ShadowPresetPatchPath -Raw) -ne $ShadowPresetPatchText) { throw "Shadow preset Bundle（Shadow 预设功能包）配置补丁已漂移。" }
+  if ((Get-Content -LiteralPath $ShadowPresetPackagePath -Encoding UTF8 -Raw) -ne $ShadowPresetPackageText) { throw "Shadow preset Bundle（Shadow 预设功能包）清单已漂移。" }
+  if ((Get-Content -LiteralPath $ShadowPresetPatchPath -Encoding UTF8 -Raw) -ne $ShadowPresetPatchText) { throw "Shadow preset Bundle（Shadow 预设功能包）配置补丁已漂移。" }
   $ProfilePatchPath = Join-Path $HomeDir "profiles\web\cordis.patch.yml"
   if (-not (Test-Path -LiteralPath $ProfilePatchPath)) { throw "DSH_HOME 缺少 Web profile patch（Web 配置补丁）：$ProfilePatchPath" }
   $ProfilePatchText = Get-Content -LiteralPath $ProfilePatchPath -Raw
