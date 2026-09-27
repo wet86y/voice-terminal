@@ -162,3 +162,9 @@ activity/result 就恢复健康，不把瞬时超时升级为持久 `ERROR`。�
 产品顶栏通过 Voice Server取得一次性 launch URL；不要收藏、记录或分享带 `?token=` 的地址。
 Session upload、DeepSeek Session Log 和 OTel 保持禁用。固定上游许可证快照位于
 `config/dsh/licenses/`。
+
+排查提示：控制台「对话」页在启动时就显示为空（「轨迹」页仍有内容、普通会话刷新后也不恢复）
+时，先看浏览器控制台是否有 `event feed subscriber failed: TypeError: Cannot read properties of
+null (reading 'kind')`。该报错说明存储中存在 `turn/end` 的 `reason` 为空值的会话，按
+`docs/dsh-plugin-audit-20260927.md` 的说明定位并处置；插件的写入侧修复见
+`integrations/dsh/voice-terminal-shadow-bridge/README.md` 的「终端工具与回合终结」。

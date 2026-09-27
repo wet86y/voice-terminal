@@ -159,25 +159,32 @@ function installAgentTools(agentCtx: any, agent: any): () => void {
 
 export function apply(ctx: any): void {
   const installed = new WeakSet<object>()
-  const attached = new Map<object, () => Promise<void>>()
+  // Weak keys: an Agent that disappears without a matching `agent/disposed`
+  // event must not be kept alive by this registry. Disposal order is tracked by
+  // the detach closures themselves, which hold no Agent reference.
+  const attached = new WeakMap<object, () => Promise<void>>()
+  const detachers: Array<() => Promise<void>> = []
   const install = (agent: any): void => {
     if (!agent || !ctx.agents.roots().includes(agent) || installed.has(agent)) return
     installed.add(agent)
-    attached.set(agent, ctx.effect(
+    const detach = ctx.effect(
       () => agent.ctx.effect(() => installAgentTools(agent.ctx, agent)),
-    ))
+    )
+    attached.set(agent, detach)
+    detachers.push(detach)
   }
   ctx.on('agent/created', ({ agent }: any) => install(agent))
   ctx.on('agent/disposed', ({ agent }: any) => {
     const detach = attached.get(agent)
     if (detach === undefined) return
     attached.delete(agent)
+    const index = detachers.indexOf(detach)
+    if (index !== -1) detachers.splice(index, 1)
     void detach()
   })
   for (const agent of ctx.agents.list()) install(agent)
   ctx.effect(() => async () => {
-    const detach = [...attached.values()]
-    attached.clear()
-    await Promise.all(detach.map(release => release()))
+    const pending = detachers.splice(0, detachers.length)
+    await Promise.all(pending.map(release => release()))
   })
 }

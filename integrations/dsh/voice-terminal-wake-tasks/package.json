@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "main": "lib/plugin.js",
-  "files": ["lib/index.js", "lib/plugin.js", "cordis.patch.yml", "README.md"],
+  "files": ["lib/index.js", "lib/index.js.map", "lib/plugin.js", "lib/plugin.js.map", "cordis.patch.yml", "README.md"],
   "exports": { ".": "./lib/plugin.js" },
   "scripts": { "build": "node build.mjs" },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },

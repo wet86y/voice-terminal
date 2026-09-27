@@ -43,3 +43,13 @@ authenticated local task API（本机唤醒任务接口）; it does not expose t
 the browser.
 
 Build and install this plugin with `scripts/setup-dsh.ps1`（DSH 插件安装脚本）.
+
+## Known Limitations and Deferred Work
+
+- The tool-disposal registry keys agents with a `WeakMap`（弱引用映射）so an Agent that
+  disappears without a matching `agent/disposed`（代理已释放）event is not kept alive
+  by this plugin. Removal order is tracked by the detach closures（拆卸闭包）, which
+  hold no Agent reference.
+- The three tools do not observe `exec.signal`（执行取消信号）: an in-flight loopback
+  request to Voice Server（语音服务端）is not cancelled when the call is aborted. DSH
+  still aborts the call at the `tools/execute` layer.
