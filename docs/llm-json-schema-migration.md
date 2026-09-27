@@ -63,7 +63,7 @@ llm:
 - provider schema 使用 strict `json_schema`；本地 parser/validator 始终是最终权威。
 - 每个 object property 必须满足 provider 的 `required` 约束。
 - 不使用 provider native tools；主 Agent 的业务动作经本地 `actions` 和受控的上下文来源块进入下一请求。
-- `wait`、`cancel` 等异构 speech 状态使用 provider 可接受的中性字段，provider adapter 返回后再由本地 validator 解释。
+- `wait`、`cancel` 等异构 speech 状态使用 provider 可接受的中性字段，provider adapter 返回后再由本地 validator 解释；`cancel` 的替换文本与 `revision` 的新尾巴同样只由本地 validator 赋予语义，provider schema 只保证字段存在。
 - action catalog、schema 和 action 可见性在一个 episode 内冻结。
 
 ## 回滚

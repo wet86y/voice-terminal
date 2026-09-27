@@ -31,7 +31,7 @@ SessionLedger ──> LLMContextProjector ──> 主 LLM 请求
 
 - 一个 episode 只有一个 Agent 调度循环和一个活动 provider 请求。
 - `request_shadow` 只能是 `{"request": true}`；主模型不能向 Shadow 传任务文本或意图摘要。
-- `wait` 表示不改变语音队列；`speak` 只表达仍相关且尚未传达的新内容；`cancel` 只用于必须停止且没有可立即替换文本的情况。
+- `wait` 表示不改变语音队列；`speak` 只表达仍相关且尚未传达的新内容；`revision` 只改尚未发送的尾巴且只写新尾巴；`cancel` 空文本用于必须立即停止、`cancel` 带文本用于停止并替换。
 - 未播放的 assistant 草稿不进入 HISTORY；实际传达内容在结算时通过冻结的 `voice_delivery` 追加。
 - ASR refinement 更新当前输入和诊断，不回写已经提交的用户 HISTORY。
 
