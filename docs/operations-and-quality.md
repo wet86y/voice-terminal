@@ -21,7 +21,7 @@ git diff --check
 | Shadow、上下文和 ledger | `tests/test_shadow_agent.py`、`tests/test_shadow_agent_harness.py`、`tests/test_session_ledger.py`、`tests/test_conversation_runtime.py` |
 | TTS、speech admission、分段发送 | `tests/test_minimax_tts.py`、`tests/test_speech_admission.py`、`tests/test_sentence_scheduling.py` |
 | 声纹 | `tests/test_speaker.py`、`tests/test_speaker_features.py` |
-| KWS | `tests/test_kws_wake_window.py` 及 KWS 相关测试 |
+| KWS、输入所有权与静默窗口 | `tests/test_kws_always_on.py`、`tests/test_scheduler_staircase.py`、`tests/test_kws_wake_window.py` |
 | Product UI | `npm test`、`npm run typecheck` |
 
 完整回归不能只运行局部测试；协议、上下文、生命周期或公共事件变更必须运行 Python 全量、前端测试、类型检查和构建。
@@ -41,8 +41,11 @@ git diff --check
 3. ASR worker（默认 8766）和 analysis worker（默认 8767）按配置启动；
 4. WebSocket `subscribe` 可以获取 `runtime.snapshot`；
 5. KWS 开启时 `input_owner=kws`，关闭时可以直接进入 ASR；
-6. `session.stop` 停止输入但不误取消已经进入 TTS 的输出；
-7. `session.reset` 清理 conversation、Shadow 和 speech 临时状态。
+6. 唤醒确认播完后麦克风仍归 ASR：窗口内接话不需要再喊唤醒词，静默窗口到期后由 `final_silence`
+   检查交回 `input_owner=kws`（日志依次出现 `SCHEDULER_FINAL_PENDING window_index=225`、
+   `prompt_kind=final_silence`，且交接完成后不再有 `forced_poll` 派发）；
+7. `session.stop` 停止输入但不误取消已经进入 TTS 的输出；
+8. `session.reset` 清理 conversation、Shadow 和 speech 临时状态。
 
 `-NoWeb` 只用于后端调试，不能作为完整 Web 语音终端验收结果。
 

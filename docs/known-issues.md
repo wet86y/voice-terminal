@@ -18,6 +18,7 @@
 | P2 | LLM/DeepSeek 仍需真实供应商回归非法 JSON、恢复和协议终态 | 本地校验与一次有界恢复已接入，但未在当前环境重新完成真实供应商验收 | 按 [LLM Runbook](llm-json-schema-migration.md) 完成 300 次、跨三日的质量门槛 |
 | P2 | 版本号和产品配置 schema 在代码、fallback 和注释中不一致 | 包版本为 `0.7.0`，FastAPI metadata 为 `0.8.0`；schema 常量为 4，部分 fallback/注释仍为 3 | 建立单一版本来源并补 fallback 测试 |
 | P2 | `revision` 与 `cancel` 带文本只有本地契约覆盖 | 契约测试与确定性回归通过，尚未在真实 provider 会话中观察模型是否稳定选用 | 在真实会话中回归一次改口/修订场景，确认模型按新 prompt 选择 `revision` |
+| P2 | Python 全量 `pytest -q` 在本机挂起、无法跑完 | 未改动的 HEAD 上同样复现：25 分钟未结束、CPU 仅 48s、进程持一对 `127.0.0.1` 回环连接；定向测试文件正常 | 先停掉常驻 ASR/analysis worker（8766/8767）再二分，定位挂起用例 |
 | P3 | 模型配置缺少非空/类型校验，缺字段可能被转换为字符串 `"None"` | 正常 registry payload 不受影响 | 在 runtime 入口执行结构化 schema 校验 |
 
 ## 已确认的边界

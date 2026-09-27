@@ -72,6 +72,8 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 - `balanced`：基础请求不思考，必要时通过本地 `request_thinking` 触发一次低思考续请求。
 - `deep`：主请求直接使用低思考。
 - KWS：`wake.enabled=true` 时进入唤醒词待机；关闭后 `session.start` 直接进入 ASR。
+  唤醒命中或模型主动发声把麦克风交给 ASR 后，输入所有权只在静默窗口（`silence.seconds`，默认 90s）
+  到期时由 `final_silence` 系统检查交回 KWS；窗口内接话不需要再喊唤醒词，语音结算和播放结束都不改变所有权。
 - Shadow：默认开启，但只读、异步，不是主语音链路能够启动的必要条件；活跃期上下文更新按安全点合并，
   长推理每 20 秒通过 `inject` 发送一次不打断执行的收敛提醒（可由
   `shadow_agent.runtime_reminder_interval_ms` 调整）。
