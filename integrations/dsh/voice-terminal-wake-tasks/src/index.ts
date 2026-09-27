@@ -1,7 +1,10 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { randomUUID, timingSafeEqual } from 'node:crypto'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import { TaskService } from './task-service.js'
 
 export const name = 'voice-terminal-wake-tasks'
-export const inject = ['agents']
+export const inject = ['agents', 'webServer']
 
 const CALLBACK_ORIGIN = process.env.VOICE_DSH_CALLBACK_ORIGIN ?? ''
 const TOKEN = process.env.VOICE_DSH_BRIDGE_TOKEN ?? ''
@@ -52,6 +55,7 @@ async function voiceApi(path: string, method: string, body?: unknown): Promise<u
   }
   const response = await fetch(`${CALLBACK_ORIGIN}${path}`, {
     method,
+    signal: AbortSignal.timeout(15_000),
     headers: {
       Authorization: `Bearer ${TOKEN}`,
       Accept: 'application/json',
@@ -101,7 +105,7 @@ function freezeCurrentContext(agent: any): string {
   return JSON.stringify(rows)
 }
 
-function installAgentTools(agentCtx: any, agent: any): () => void {
+function installAgentTools(agentCtx: any, agent: any, service: TaskService): () => void {
   const dispose: Array<() => void> = []
   const ensureRoot = (exec: any): void => {
     if (exec.agent !== agent) {
@@ -121,13 +125,7 @@ function installAgentTools(agentCtx: any, agent: any): () => void {
     async execute(args: any, exec: any) {
       ensureRoot(exec)
       const reference = freezeCurrentContext(agent)
-      return voiceApi('/api/internal/wake-tasks', 'POST', {
-        target: args.target,
-        when: args.when,
-        ...(args.repeat ? { repeat: args.repeat } : {}),
-        text: args.text,
-        reference,
-      })
+      return service.create(args, reference)
     },
   })))
   dispose.push(agentCtx.tools.register(defineTool({
@@ -139,7 +137,7 @@ function installAgentTools(agentCtx: any, agent: any): () => void {
     output: responseToolOutput(),
     async execute(args: any, exec: any) {
       ensureRoot(exec)
-      return voiceApi(`/api/internal/wake-tasks/${encodeURIComponent(args.task_id)}/cancel`, 'POST')
+      return service.cancel(args.task_id)
     },
   })))
   dispose.push(agentCtx.tools.register(defineTool({
@@ -151,13 +149,129 @@ function installAgentTools(agentCtx: any, agent: any): () => void {
     output: responseToolOutput(),
     async execute(args: any, exec: any) {
       ensureRoot(exec)
-      return voiceApi(`/api/internal/wake-tasks/${encodeURIComponent(args.task_id)}/reference`, 'GET')
+      return service.reference(args.task_id)
     },
+  })))
+  dispose.push(agentCtx.tools.register(defineTool({
+    name: 'publish_voice_event',
+    description: '把自由文本事件投递到 Voice（语音）持久信箱；无需 Voice 先唤醒 DSH。',
+    parameters: {
+      text: { type: 'string', required: true, description: 'text（事件内容）：给语音模型处理的普通事件文本。' },
+      event_id: { type: 'string', description: 'event_id（事件标识）：重试同一事件时复用，可省略。' },
+      payload: { type: 'object', description: 'payload（附加内容）：可选的结构化数据。', additionalProperties: true },
+    },
+    output: responseToolOutput(),
+    async execute(args: any, exec: any) {
+      ensureRoot(exec)
+      const result = await voiceApi('/api/internal/dsh-bridge/voice.publish', 'POST', {
+        event_id: args.event_id || randomUUID(), source_session_id: String(agent.session.id),
+        text: args.text, ...(args.payload ? { payload: args.payload } : {}),
+      })
+      if (result.result !== 'accepted' && result.result !== 'duplicate') throw new Error('Voice 信箱未接受事件。')
+      exec.concludeTurn()
+      return result
+    },
+  })))
+  dispose.push(agentCtx.tools.register(defineTool({
+    name: 'schedule_create',
+    description: '创建项目级 DSH 定时任务；任务不绑定创建会话。仅提供一种时间规则。',
+    parameters: {
+      title: { type: 'string', required: true, description: 'title（任务名称）。' },
+      prompt: { type: 'string', required: true, description: 'prompt（任务内容）。' },
+      after_seconds: { type: 'integer', description: 'after_seconds（延迟秒数）。' },
+      at: { oneOf: [{ type: 'string' }, { type: 'object', additionalProperties: true }], description: 'at（带时区的绝对时点或本地时间对象）。' },
+      every_seconds: { type: 'integer', description: 'every_seconds（固定重复秒数）。' },
+      daily: { type: 'object', description: 'daily（每日时间与时区）。', additionalProperties: true },
+      weekly: { type: 'object', description: 'weekly（每周时间、时区和星期）。', additionalProperties: true },
+      cron: { type: 'object', description: 'cron（五字段定时表达式与时区）。', additionalProperties: true },
+    },
+    output: responseToolOutput(),
+    async execute(args: any, exec: any) { ensureRoot(exec); return service.create(args, freezeCurrentContext(agent)) },
+  })))
+  dispose.push(agentCtx.tools.register(defineTool({
+    name: 'schedule_list',
+    description: '列出插件统一管理的项目定时任务。',
+    parameters: {},
+    output: { schema: { type: 'array', items: { type: 'object', additionalProperties: true } },
+      render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(_args: any, exec: any) { ensureRoot(exec); return service.list() },
+  })))
+  dispose.push(agentCtx.tools.register(defineTool({
+    name: 'schedule_update',
+    description: '更新项目定时任务的名称、内容或时间规则。',
+    parameters: {
+      id: { type: 'string', required: true, description: 'id（任务标识）。' },
+      title: { type: 'string', description: 'title（任务名称）。' },
+      prompt: { type: 'string', description: 'prompt（任务内容）。' },
+      at: { oneOf: [{ type: 'string' }, { type: 'object', additionalProperties: true }], description: 'at（带时区的绝对时点或本地时间对象）。' },
+      every_seconds: { type: 'integer', description: 'every_seconds（固定重复秒数）。' },
+      daily: { type: 'object', description: 'daily（每日规则）。', additionalProperties: true },
+      weekly: { type: 'object', description: 'weekly（每周规则）。', additionalProperties: true },
+      cron: { type: 'object', description: 'cron（定时表达式）。', additionalProperties: true },
+    },
+    output: responseToolOutput(),
+    async execute(args: any, exec: any) {
+      ensureRoot(exec)
+      const change: any = {}
+      for (const key of ['at', 'every_seconds', 'daily', 'weekly', 'cron']) if (args[key] !== undefined) change[key] = args[key]
+      return service.update(args.id, { title: args.title, prompt: args.prompt,
+        ...(Object.keys(change).length ? { change } : {}) })
+    },
+  })))
+  dispose.push(agentCtx.tools.register(defineTool({
+    name: 'schedule_delete',
+    description: '取消项目定时任务。',
+    parameters: { id: { type: 'string', required: true, description: 'id（任务标识）。' } },
+    output: responseToolOutput(),
+    async execute(args: any, exec: any) { ensureRoot(exec); return service.cancel(args.id) },
   })))
   return () => { for (const release of dispose.reverse()) release() }
 }
 
 export function apply(ctx: any): void {
+  if (process.env.VOICE_DSH_TASKS_ACTIVE !== '1') return
+  const service = new TaskService()
+  ctx.effect(() => async () => { await service.close() })
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'prefix', path: '/api/voice-terminal-wake/v1',
+    async handler(req: IncomingMessage, res: ServerResponse) {
+      const actual = Buffer.from(String(req.headers.authorization ?? ''))
+      const expected = Buffer.from(`Bearer ${TOKEN}`)
+      const remote = String(req.socket.remoteAddress ?? '').replace(/^::ffff:/u, '')
+      if (!TOKEN || !['127.0.0.1', '::1'].includes(remote)
+          || actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+        res.statusCode = 401; res.end('{}'); return
+      }
+      const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname.replace(/^\/api\/voice-terminal-wake\/v1\/?/u, '')
+      try {
+        let body: any = {}
+        if (req.method !== 'GET') {
+          const chunks: Buffer[] = []
+          let bytes = 0
+          for await (const chunk of req) {
+            const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+            bytes += data.length
+            if (bytes > 2_097_152) throw new Error('请求体过大。')
+            chunks.push(data)
+          }
+          body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}
+        }
+        let value: any
+        if (req.method === 'GET' && path === 'tasks') value = { tasks: service.list() }
+        else if (req.method === 'GET' && /^tasks\/[^/]+\/reference$/u.test(path)) value = service.reference(decodeURIComponent(path.split('/')[1]))
+        else if (req.method === 'POST' && path === 'tasks') value = await service.create(body, String(body.reference ?? ''))
+        else if (req.method === 'PATCH' && /^tasks\/[^/]+$/u.test(path)) value = await service.update(decodeURIComponent(path.split('/')[1]), body)
+        else if (req.method === 'DELETE' && /^tasks\/[^/]+$/u.test(path)) value = await service.cancel(decodeURIComponent(path.split('/')[1]))
+        else { res.statusCode = 404; res.end('{}'); return }
+        res.setHeader('content-type', 'application/json; charset=utf-8')
+        res.end(JSON.stringify(value))
+      } catch (error) {
+        res.statusCode = 422
+        res.setHeader('content-type', 'application/json; charset=utf-8')
+        res.end(JSON.stringify({ detail: String(error instanceof Error ? error.message : error) }))
+      }
+    },
+  }))
   const installed = new WeakSet<object>()
   // Weak keys: an Agent that disappears without a matching `agent/disposed`
   // event must not be kept alive by this registry. Disposal order is tracked by
@@ -168,7 +282,7 @@ export function apply(ctx: any): void {
     if (!agent || !ctx.agents.roots().includes(agent) || installed.has(agent)) return
     installed.add(agent)
     const detach = ctx.effect(
-      () => agent.ctx.effect(() => installAgentTools(agent.ctx, agent)),
+      () => agent.ctx.effect(() => installAgentTools(agent.ctx, agent, service)),
     )
     attached.set(agent, detach)
     detachers.push(detach)

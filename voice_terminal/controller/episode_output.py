@@ -392,6 +392,9 @@ class EpisodeSpeechOutput(SpeechPipeline):
                     _generation_advanced=False, _fresh_session=False, _defer_activation=False):
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during cleanup")
+        on_model_speech = getattr(self.controller, "_on_model_speech_accepted", None)
+        if callable(on_model_speech):
+            await on_model_speech()
         # Keep at most one latest text candidate behind the active playback.
         # The queue stores text handles only; it never owns provider PCM.
         for pending in list(self._pending):

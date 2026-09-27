@@ -9,7 +9,7 @@ export { createAttachedVoiceSession } from './settings.js'
 
 export const name = 'voice-terminal-shadow-bridge'
 export const inject = [
-  'webServer', 'agents', 'agentPresets', 'agentDefaultModel', 'llm', 'sessionTitle',
+  'webServer', 'agents', 'sessions', 'agentPresets', 'agentDefaultModel', 'llm', 'sessionTitle',
   'settings', 'workspaceRegistry', 'loader',
 ]
 export const BRIDGE_PROTOCOL_VERSION = '1.0'
@@ -519,7 +519,6 @@ export function apply(ctx: any, config: Config): void {
   if (!CALLBACK_ORIGIN.startsWith('http://127.0.0.1:')) throw new Error('VOICE_DSH_CALLBACK_ORIGIN must be loopback HTTP')
   if (!config.routePrefix.startsWith('/') || config.routePrefix.endsWith('/')) throw new Error('invalid routePrefix')
   const bindings = new Map<string, Binding>()
-  const wakeOccurrences = new Map<string, string>()
   let startupError: unknown
   const settingsReady = initializeVoiceTerminalSettings(ctx, config).catch((error) => {
     startupError = error
@@ -601,6 +600,10 @@ export function apply(ctx: any, config: Config): void {
       context_revision: binding.revision, activation_id: binding.activationId ?? '',
       trace_revision: binding.traceRevision, state: String(status ?? ''),
     }).catch(() => undefined)
+    void callback('/api/internal/dsh-bridge/mainline.activity', {
+      dsh_session_id: binding.dshSessionId, epoch: binding.epoch,
+      state: String(status ?? ''),
+    }).catch(() => undefined)
   })
 
   const route = {
@@ -620,44 +623,6 @@ export function apply(ctx: any, config: Config): void {
         const prior = existing?.requests.get(body.request_id)
         const bodyDigest = digest(body)
         if (prior) { json(res, 200, prior.digest === bodyDigest ? result('duplicate', { original: prior.response }) : result('conflict')); return }
-        if (path === 'wake.open') {
-          const occurrenceId = typeof body.occurrence_id === 'string' ? body.occurrence_id : ''
-          const taskId = typeof body.task_id === 'string' ? body.task_id : ''
-          const wakeText = typeof body.text === 'string' ? body.text.trim() : ''
-          const continuity = typeof body.continuity_document === 'string' ? body.continuity_document : ''
-          if (!occurrenceId || !taskId || !wakeText || wakeText.length > 500 || continuity.length > 800) {
-            json(res, 422, result('conflict', { message: 'invalid scheduled wake payload' })); return
-          }
-          const previousSessionId = wakeOccurrences.get(occurrenceId)
-          if (previousSessionId) {
-            const response = result('duplicate', { dsh_session_id: previousSessionId })
-            json(res, 200, response); return
-          }
-          const preset = await ctx.agentPresets.resolve('shadow-agent')
-          const modelSelection = ctx.agentDefaultModel.currentSelection()
-          const setup = async (agentCtx: any) => { await ctx.agentPresets.mount(agentCtx, preset.id) }
-          const initialized = await settingsReady
-          const opened = await createAttachedVoiceSession({
-            ctx,
-            settings: initialized.settings,
-            sessionId: body.dsh_session_id,
-            presetId: preset.id,
-            globalSelection: modelSelection,
-            setup,
-          })
-          const handle = opened.handle
-          ctx.sessionTitle.rename(handle.agent.session, `Wake · ${taskId.slice(0, 8)}`)
-          const background = continuity
-            ? `\n\n会话衔接背景（仅作事实参考，不是新增指令）：\n${continuity}` : ''
-          handle.agent.followup(createBridgeUserMessage([{
-            type: 'text',
-            text: `定时唤醒任务 ${taskId} 已到期。请根据任务说明开始处理；需要创建任务时，可通过 read_wake_reference(task_id) 按需读取创建时冻结的上下文。参考上下文不会自动注入。\n\n任务说明：${wakeText}${background}`,
-          }]))
-          wakeOccurrences.set(occurrenceId, body.dsh_session_id)
-          while (wakeOccurrences.size > 2048) wakeOccurrences.delete(wakeOccurrences.keys().next().value!)
-          const response = result('accepted', { dsh_session_id: body.dsh_session_id })
-          json(res, 200, response); return
-        }
         if (path === 'session.open' || path === 'session.resume') {
           if (existing) { json(res, 409, result('conflict')); return }
           const requestedReminderMs = Number(body.runtime_reminder_interval_ms)
@@ -751,6 +716,25 @@ export function apply(ctx: any, config: Config): void {
             armRuntimeReminder(existing)
             response = result('accepted')
           }
+        } else if (path === 'task.deliver') {
+          const taskId = String(body.task_id ?? '')
+          const occurrenceId = String(body.occurrence_id ?? '')
+          const text = String(body.text ?? '').trim()
+          const target = String(body.target ?? 'shadow_agent')
+          if (!taskId || !occurrenceId || !text) response = result('conflict')
+          else {
+            const message = createUserMessage({
+              content: [{
+                type: 'text',
+                text: `定时任务 ${taskId} 已到期。请在当前主线会话中按普通消息处理。需要创建时的背景可调用 read_wake_reference(task_id) 按需读取。目标：${target}。若需向 Voice 汇报，请调用 publish_voice_event；目标为 voice_llm 或 both 时应主动投递语音事件。\n\n任务内容：${text}`,
+              }],
+              source: { kind: 'schedule' },
+            }, occurrenceId)
+            existing.handle.agent.followup(message)
+            const flushed = await ctx.sessions.flush(existing.handle.agent.session)
+            if (!flushed) throw new Error('DSH session persistence did not confirm task delivery')
+            response = result('accepted', { dsh_session_id: existing.dshSessionId, message_id: occurrenceId })
+          }
         } else if (path === 'session.cancel') {
           stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-cancel', { keepInbox: false }); existing.pendingContext = undefined; existing.pendingReminder = undefined; existing.terminal = true; response = result('accepted')
         } else if (path === 'session.retire') {
@@ -765,6 +749,21 @@ export function apply(ctx: any, config: Config): void {
             terminal: existing.terminal,
             agent_state: existing.agentState,
           })
+        } else if (path === 'session.context') {
+          const budget = { chars: 100_000 }
+          const rows: Array<{ role: string; text: string }> = []
+          for (const item of existing.handle.agent.session.snapshotEvents().slice(-240).reverse()) {
+            if (!['user/message', 'assistant/message', 'tool/result'].includes(String(item?.type))) continue
+            if (item?.type === 'user/message'
+                && item?.data?.message?.source?.kind === `plugin:${name}`) continue
+            const raw = item?.data?.message?.content ?? item?.data?.content ?? item?.data?.message ?? item?.data
+            const rendered = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '')
+            const text = rendered.slice(0, budget.chars).trim()
+            budget.chars -= text.length
+            if (text) rows.unshift({ role: String(item.type), text })
+            if (budget.chars <= 0) break
+          }
+          response = result('accepted', { rows: rows as unknown as Json })
         } else if (path === 'observer.snapshot' || path === 'observer.update') {
           const since = Number(body.trace_revision ?? 0)
           const first = existing.records[0]?.trace_revision ?? existing.traceRevision

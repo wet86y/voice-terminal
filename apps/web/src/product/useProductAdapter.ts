@@ -261,6 +261,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     when: '',
     /** repeat（间隔）: 固定循环间隔，空值表示一次性. */
     repeat: '',
+    ruleKind: 'at' as NonNullable<WakeTask['rule_kind']>,
+    ruleText: '',
+    timeZone: 'Asia/Hong_Kong',
+    weekdays: '',
     /** text（任务说明）: 触发时提供给 Agent 的方向. */
     text: '',
   })
@@ -485,17 +489,27 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     } else wakeTaskDraft.when = ''
     wakeTaskDraft.repeat = task.repeat || ''
     wakeTaskDraft.text = task.text
+    wakeTaskDraft.ruleKind = task.rule_kind || 'at'
+    const rule = task.rule || {}
+    wakeTaskDraft.ruleText = String(rule.expression || rule.time || '')
+    wakeTaskDraft.timeZone = String(rule.timeZone || 'Asia/Hong_Kong')
+    wakeTaskDraft.weekdays = Array.isArray(rule.weekdays) ? rule.weekdays.join(',') : ''
   }
 
   async function saveWakeTask() {
     if (!editingWakeTaskId.value) return
     saving.value = true
     try {
+      const calendar = ['daily', 'weekly', 'cron'].includes(wakeTaskDraft.ruleKind)
+      const change = wakeTaskDraft.ruleKind === 'daily'
+        ? { daily: { time: wakeTaskDraft.ruleText, time_zone: wakeTaskDraft.timeZone } }
+        : wakeTaskDraft.ruleKind === 'weekly'
+          ? { weekly: { time: wakeTaskDraft.ruleText, time_zone: wakeTaskDraft.timeZone,
+            weekdays: wakeTaskDraft.weekdays.split(',').map(value => Number(value.trim())) } }
+          : { cron: { expression: wakeTaskDraft.ruleText, time_zone: wakeTaskDraft.timeZone } }
       await productApi.updateWakeTask(editingWakeTaskId.value, {
-        target: wakeTaskDraft.target,
-        when: wakeTaskDraft.when,
-        repeat: wakeTaskDraft.repeat,
-        text: wakeTaskDraft.text,
+        target: wakeTaskDraft.target, text: wakeTaskDraft.text,
+        ...(calendar ? { change } : { when: wakeTaskDraft.when, repeat: wakeTaskDraft.repeat }),
       })
       editingWakeTaskId.value = ''
       await refreshWakeTasks()

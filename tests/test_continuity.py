@@ -72,6 +72,39 @@ def test_continuity_uses_pre_reset_snapshot_and_user_activity_cancels_summary(tm
     asyncio.run(scenario())
 
 
+def test_continuity_delegates_commit_and_rejects_activity_during_summary(tmp_path: Path):
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        committed: list[str] = []
+        manager: ContinuityManager
+
+        async def summarize(_snapshot, _previous):
+            started.set()
+            await release.wait()
+            return "不应提交"
+
+        async def commit(document: str, generation: int) -> bool:
+            if manager.commit_document(document, generation):
+                committed.append(document)
+                return True
+            return False
+
+        manager = ContinuityManager(
+            tmp_path / "continuity.json", summarize, on_organized=commit, idle_seconds=0,
+        )
+        manager.arm(time.time() - 1, list)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        manager.user_started()
+        release.set()
+        await asyncio.sleep(0)
+        assert committed == []
+        assert not (tmp_path / "continuity.json").exists()
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
 def test_voice_request_includes_continuity_and_scheduled_wake_in_request_tail():
     class Registry:
         def action_definitions(self):

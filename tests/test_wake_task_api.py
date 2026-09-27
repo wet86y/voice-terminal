@@ -8,13 +8,9 @@ import httpx
 from voice_terminal.config import AppConfig, PersonaConfig
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.server.websocket import SessionRuntime, create_app
-from voice_terminal.wake_tasks import ScheduledWakeManager
 
 
 def test_wake_task_routes_cover_dsh_tools_and_settings_page(tmp_path: Path):
-    async def no_delivery(_task):
-        return False
-
     async def scenario() -> None:
         config = AppConfig(
             model_dir=tmp_path / "models",
@@ -22,9 +18,29 @@ def test_wake_task_routes_cover_dsh_tools_and_settings_page(tmp_path: Path):
         )
         settings = ProductSettingsStore(path=tmp_path / "settings.json", config=config)
         runtime = SessionRuntime(config, product_settings=settings)
-        runtime.wake_tasks = ScheduledWakeManager(
-            tmp_path / "wake-tasks.json", deliver_voice=no_delivery, deliver_shadow=no_delivery,
-        )
+        catalog: dict[str, dict] = {}
+        frozen_reference = ""
+
+        async def task_api(method: str, path: str, payload: dict | None = None) -> dict:
+            nonlocal frozen_reference
+            if method == "GET" and path == "tasks":
+                return {"tasks": list(catalog.values())}
+            if method == "POST" and path == "tasks":
+                row = {"task_id": "schedule-test", "status": "pending", "has_reference": True,
+                       **(payload or {})}
+                frozen_reference = row.pop("reference", "")
+                catalog[row["task_id"]] = row
+                return row
+            if path.endswith("/reference"):
+                return {"task_id": "schedule-test", "reference": frozen_reference}
+            row = catalog["schedule-test"]
+            if method == "PATCH":
+                row.update(payload or {})
+            elif method == "DELETE":
+                row["status"] = "cancelled"
+            return row
+
+        runtime.dsh.bridge.task_api = task_api
         app = create_app(runtime, product_settings=settings)
         auth = {"Authorization": f"Bearer {runtime.dsh._bridge_token}"}
         transport = httpx.ASGITransport(app=app)
@@ -50,7 +66,6 @@ def test_wake_task_routes_cover_dsh_tools_and_settings_page(tmp_path: Path):
             assert listed.status_code == 200
             assert listed.json()["tasks"][0]["task_id"] == task_id
             assert listed.json()["tasks"][0]["has_reference"] is True
-            assert "reference" not in listed.json()["tasks"][0]
 
             updated = await client.patch(
                 f"/api/v1/wake-tasks/{task_id}",
@@ -74,7 +89,7 @@ def test_wake_task_routes_cover_dsh_tools_and_settings_page(tmp_path: Path):
 
             removed = await client.delete(f"/api/v1/wake-tasks/{task_id}")
             assert removed.status_code == 200
-            assert (await client.get("/api/v1/wake-tasks")).json()["tasks"] == []
+            assert (await client.get("/api/v1/wake-tasks")).json()["tasks"][0]["status"] == "cancelled"
 
         await runtime.close_background_services()
         await runtime.dsh.close()

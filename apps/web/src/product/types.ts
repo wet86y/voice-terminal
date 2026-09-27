@@ -200,6 +200,9 @@ export interface WakeTask {
   when: string | null
   /** repeat（固定重复间隔）；null 表示一次性任务. */
   repeat: string | null
+  /** rule_kind（规则类型）与 rule（原生调度规则）。 */
+  rule_kind?: 'after' | 'at' | 'every' | 'daily' | 'weekly' | 'cron'
+  rule?: Record<string, unknown>
   /** text（触发时传递的任务说明）. */
   text: string
   /** status（任务状态）. */

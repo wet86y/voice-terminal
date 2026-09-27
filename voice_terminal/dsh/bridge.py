@@ -190,6 +190,44 @@ class DshBridgeClient:
         )
         return response
 
+    async def task_api(
+        self, method: str, path: str, payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call the DSH-owned task catalog（DSH 管理的任务目录）."""
+        return await asyncio.to_thread(self._task_api_sync, method, path, payload)
+
+    def _task_api_sync(
+        self, method: str, path: str, payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not path.startswith("tasks") or ".." in path:
+            raise DshBridgeError("invalid task path")
+        data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.origin}/api/voice-terminal-wake/v1/{path}",
+            data=data, method=method,
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/json",
+                **({"Content-Type": "application/json"} if data is not None else {}),
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+                value = json.loads(response.read(2 * 1024 * 1024 + 1))
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.loads(exc.read(8192)).get("detail", "任务请求失败。")
+            except (ValueError, AttributeError):
+                detail = "任务请求失败。"
+            error = DshBridgeError(str(detail)[:500])
+            error.status_code = exc.code
+            raise error from None
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            raise DshBridgeError(f"DSH task API failed: {type(exc).__name__}") from None
+        if not isinstance(value, dict):
+            raise DshBridgeError("DSH task API returned a non-object response")
+        return value
+
     async def _request(
         self, method: str, operation: str, payload: dict[str, Any] | None,
     ) -> dict[str, Any]:
@@ -518,14 +556,15 @@ class DshShadowAgentSession:
             resync(), name=f"dsh-context-resync-{self.voice_session_id[:12]}",
         )
 
-    async def reset(self) -> None:
+    async def reset(self, *, strict: bool = False) -> None:
         await self._stop_context_resync()
         await self._stop_observer()
         if self._opened and not self._retired:
             try:
                 await self.client.call("session.retire", self._envelope())
             except DshBridgeError:
-                pass
+                if strict:
+                    raise
             await self._save_mapping(state="retired", retired=True)
         self.dsh_session_id = f"voice-shadow-{uuid.uuid4()}"
         self.epoch = int(self.context_source.shadow_context_epoch)
