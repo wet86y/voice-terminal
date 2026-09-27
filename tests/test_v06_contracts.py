@@ -1286,7 +1286,7 @@ def test_runtime_keeps_queued_speak_and_ignores_bad_actions():
         assert len(accepted) == 1
         assert accepted[0]["invalid_components"] == ["actions"]
         assert accepted[0]["actions_executed"] == 0
-        assert accepted[0]["next_dispatch"] == "heartbeat"
+        assert accepted[0]["next_dispatch"] == "next_triggered_request"
         assert any(kind == "speak.preview" and payload.get("status") == "committed_speak_only"
                    for kind, payload in events)
     asyncio.run(scenario())
@@ -1340,6 +1340,7 @@ def test_runtime_keeps_queued_speak_on_truncated_envelope():
         assert seen["feeds"] == ["保留这段语音"]
         assert seen["finishes"] == 1
         assert seen["recoveries"] == []
+        assert "SPEAK_COMPAT_ACCEPTED" not in runtime.pending
         accepted = [
             payload for kind, payload in events
             if kind == "agent.trace" and payload.get("kind") == "LLM_OUTPUT_COMPAT_SPEAK_ACCEPTED"

@@ -58,7 +58,7 @@ committed_prefix + current_clause + prefetched_clause + revisable_tail
 
 speak 决策状态为 `speak`、`revision`、`cancel`、`wait`：
 
-- `speak`：`text` 是完整文本，本地只合成尚未交付的那一部分；
+- `speak`：`text` 是完整文本，只提交尚未交付的部分进行合成；
 - `revision`：`text` 只是新的尾巴，仅在 `rewrite_tail` 可用；本地负责拼接，任何情况下都不会重播已交付内容；
 - `cancel`：`text` 为空表示立即停止；`text` 非空表示停止并替换，替换文本直接播给用户；
 - `wait`：不改变语音队列。
@@ -89,6 +89,9 @@ none → kws standby → asr active → kws standby → none
 - ASR→KWS 的交接只由静默窗口（`final_silence_ms`，本机产品设置为 90s）到期后的
   `final_silence` 系统检查触发；语音结算、播放结束和 LLM 输出都不改变输入所有权。
   模型主动发声触发的 KWS→ASR 轮换同样要挂这套窗口（`AgentEpisodeRuntime.arm_silence_window`）。
+- 静默窗口内，影子代理的 `progress`（进度）更新合并进入二等信箱；普通事件请求会带出其最新状态，
+  否则系统从静默窗口起点每 4 秒检查一次，只有信箱非空且用户未讲话、模型空闲时才请求模型。
+  TTS（语音合成）、语音活动和交付结算继续更新本地状态与会话历史，本身不触发二等请求。
 - KWS 初始化或重新接管失败时 fail-closed，不得在没有受保护状态的情况下放开输入。
 - 声纹注册/测试必须与实时采集互斥，不能重置正在工作的共享音频处理器。
 

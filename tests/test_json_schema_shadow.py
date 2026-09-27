@@ -393,7 +393,7 @@ def test_new_input_queues_behind_active_recovery_without_cancelling_llm():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("dispatch_kind", ["forced_poll", "final_silence"])
+@pytest.mark.parametrize("dispatch_kind", ["secondary_mailbox", "final_silence"])
 def test_new_final_rearms_silence_without_cancelling_active_system_check(dispatch_kind):
     async def scenario():
         async def emit(*_args):
@@ -410,11 +410,11 @@ def test_new_final_rearms_silence_without_cancelling_active_system_check(dispatc
         runtime.episode_id = "episode"
         runtime.state = "WAITING_EVENT"
         runtime.scheduler.arm(0.0)
-        runtime.scheduler.advance(30.0 if dispatch_kind == "final_silence" else 1.2)
+        runtime.scheduler.advance(30.0 if dispatch_kind == "final_silence" else 4.0)
         if dispatch_kind == "final_silence":
             assert runtime.scheduler.final_pending is True
         else:
-            assert runtime.scheduler.forced_due(now=1.2)["prompt_kind"] == "forced_poll"
+            assert runtime.scheduler.secondary_candidate(now=4.0)["prompt_kind"] == "secondary_mailbox"
 
         request = asyncio.create_task(asyncio.sleep(60))
         runtime.active_request = request
@@ -1063,7 +1063,7 @@ def test_thinking_and_business_actions_release_one_barrier_after_tools():
     asyncio.run(scenario())
 
 
-def test_forced_poll_actions_and_thinking_follow_normal_dispatch_rules():
+def test_secondary_mailbox_actions_and_thinking_follow_normal_dispatch_rules():
     async def scenario():
         runtime = _runtime(SimpleNamespace(thinking_action_enabled=True))
         runtime._system_check_turn_ids.add("system-check-a")
@@ -1081,7 +1081,7 @@ def test_forced_poll_actions_and_thinking_follow_normal_dispatch_rules():
             (runtime.episode_id, "request-a"), "turn-a", envelope,
             system_check=True,
             system_check_id="system-check-a",
-            system_check_prompt_kind="forced_poll",
+            system_check_prompt_kind="secondary_mailbox",
         )
         await asyncio.gather(*tuple(runtime._background_tools))
 
@@ -1129,8 +1129,8 @@ def test_system_check_recovery_signal_keeps_immutable_owner_metadata():
         runtime.active_dispatch_context = {
             "system_check_id": "system-check-a",
             "speech_turn_id": "turn-a",
-            "dispatch_kind": "forced_poll",
-            "prompt_kind": "forced_poll",
+            "dispatch_kind": "secondary_mailbox",
+            "prompt_kind": "secondary_mailbox",
             "owner_scope": "system_check",
             "generation": 1,
             "window_index": 3,
@@ -1164,9 +1164,9 @@ def test_system_check_recovery_signal_keeps_immutable_owner_metadata():
         entries = {entry["kind"]: entry["content"] for entry in packet["entries"]}
         feedback = json.loads(entries["immediate_recovery"].removeprefix("即时恢复反馈："))
 
-        assert prompt_kind == "forced_poll"
-        assert "forced_poll" in entries
-        assert feedback["origin_prompt_kind"] == "forced_poll"
+        assert prompt_kind == "secondary_mailbox"
+        assert "secondary_mailbox" in entries
+        assert feedback["origin_prompt_kind"] == "secondary_mailbox"
         assert "本次没有新的用户输入" in feedback["instruction"]
         assert "不要重新回答历史用户请求" in feedback["instruction"]
         assert "重新处理最后一条用户输入" not in feedback["instruction"]
@@ -1189,7 +1189,7 @@ def test_thinking_action_is_explicitly_present_in_tool_availability():
 @pytest.mark.parametrize(
     ("prompt_kind", "expected"),
     [
-        ("forced_poll", "不要重新回答历史用户请求"),
+        ("secondary_mailbox", "不要重新回答历史用户请求"),
         ("final_silence", "不要把最后一条历史用户输入当成新的请求"),
         ("kws_wake", "不要处理历史用户任务"),
     ],

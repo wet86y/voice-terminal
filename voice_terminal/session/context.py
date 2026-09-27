@@ -20,7 +20,8 @@ REQUEST_SYSTEM_CONTEXT_KINDS = frozenset({
     "deferred_recovery",
     "runtime_state",
     "pending_tools",
-    "forced_poll",
+    "secondary_mailbox",
+    "secondary_update",
     "final_silence",
     "system_context",
 })
