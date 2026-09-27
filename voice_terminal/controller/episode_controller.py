@@ -66,6 +66,11 @@ class EpisodeController(RealtimeController):
         # an LLM/TTS scheduling failure must not close the protected input path.
         return True
 
+    async def _on_model_speech_accepted(self) -> None:
+        if callable(self.on_user_activity):
+            self.on_user_activity()
+        await self.activate_asr_for_model_speech()
+
     async def _final_system_check_settled(self, context: dict) -> None:
         scheduler_generation = context.get("generation")
         activation_generation = self._activation_generation
@@ -123,6 +128,8 @@ class EpisodeController(RealtimeController):
         if kind == "agent.episode":
             self.state.agent = dict(payload)
         elif kind == "speech.completed":
+            if self.wake_always_on and self.state.input_owner == "asr":
+                await self._final_system_check_settled({})
             # The session ledger is the only durable conversational memory.
             # A speech record enters it only after the player reports what the
             # user actually heard.
@@ -167,6 +174,8 @@ class EpisodeController(RealtimeController):
                     speech_id=str(payload.get("speech_id") or "") or None,
                     latency=payload.get("latency") if isinstance(payload.get("latency"), dict) else None,
                 )
+            if callable(self.on_silence_anchor):
+                self.on_silence_anchor(time.time())
         elif kind == "turn.latency":
             latency = payload.get("latency")
             update = getattr(self.history, "update_turn_latency", None)

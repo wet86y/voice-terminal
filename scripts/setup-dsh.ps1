@@ -31,6 +31,7 @@ $WakeTasksRuntimeArtifactPaths = @(
   $WakeTasksPackagePath,
   (Join-Path $WakeTasksArtifactDir "cordis.patch.yml"),
   (Join-Path $WakeTasksArtifactDir "lib\index.js"),
+  (Join-Path $WakeTasksArtifactDir "lib\task-service.js"),
   (Join-Path $WakeTasksArtifactDir "lib\plugin.js")
 )
 $ShadowPresetArtifactDir = Join-Path $RuntimeRoot "bundles\voice-terminal-shadow-preset"
@@ -152,6 +153,18 @@ function Update-ManagedProfilePatch {
     Copy-Item -LiteralPath $PatchSource -Destination $ProfilePatchPath
   }
   $Text = Get-Content -LiteralPath $ProfilePatchPath -Raw
+  # The project plugin owns the task catalog and delivery target. The native
+  # Schedule service would otherwise dispatch to the creating Session.
+  foreach ($ScheduleId in @('schedule', 'ui-schedule')) {
+    $BlockPattern = "(?ms)^- id: $ScheduleId[ \t]*\r?\n.*?(?=^- id:|\z)"
+    $Block = [regex]::Match($Text, $BlockPattern)
+    if ($Block.Success) {
+      $Replacement = "- id: $ScheduleId`n  disabled: true`n"
+      $Text = $Text.Substring(0, $Block.Index) + $Replacement + $Text.Substring($Block.Index + $Block.Length)
+    } else {
+      $Text = $Text.TrimEnd() + "`n- id: $ScheduleId`n  disabled: true`n"
+    }
+  }
   # DSH 0.1.7 使用 agent-preset-registry（Agent 预设注册器）；旧 agent-presets 注册行已废弃。
   $Text = [regex]::Replace($Text, '(?ms)^- id: agent-presets[ \t]*\r?\n.*?(?=^- id:|\z)', '')
   $Registry = [regex]::Match($Text, '(?ms)^- id: agent-preset-registry[ \t]*\r?\n.*?(?=^- id:|\z)')
@@ -398,6 +411,12 @@ if (-not $ValidateOnly) {
   }
   New-Item -ItemType Directory -Force -Path $ProfileDir, $ShadowPresetArtifactDir, $WakeTasksArtifactDir | Out-Null
   $ProfilePatchPath = Join-Path $ProfileDir "cordis.patch.yml"
+  Invoke-Checked -Command node -Arguments @(
+    (Join-Path $PSScriptRoot "check-dsh-wake-migration.mjs"),
+    (Join-Path $SourceDir "packages\schedule\schedule\lib\index.js"),
+    (Join-Path $HomeDir "storages\schedule.json"),
+    (Join-Path $RepoRoot "config\wake-tasks.json")
+  )
   Update-ManagedProfilePatch -ProfilePatchPath $ProfilePatchPath
   Write-Utf8NoBom -Path $ShadowPresetPackagePath -Text $ShadowPresetPackageText
   Write-Utf8NoBom -Path $ShadowPresetPatchPath -Text $ShadowPresetPatchText

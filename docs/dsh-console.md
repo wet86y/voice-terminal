@@ -87,9 +87,25 @@ DSH 启动后，在设置侧栏“Agent 预设”下方打开独立的 `Voice Te
 
 `setup-dsh.ps1`（DSH 插件安装脚本）也会安装独立的
 `voice-terminal-wake-tasks`（语音终端唤醒任务插件）。插件只向 DSH 正式根 Agent（正式根代理）
-提供创建、取消和读取冻结参考的工具；任务规则由 Voice Server（语音服务端）保存和触发。
-用户在 Voice Terminal（语音终端）主设置的“唤醒任务”页查看、修改或移除任务。完整的工具字段、
-循环与服务恢复规则见[连续性底座说明](continuity-foundation.md)（组件 1 与组件 2）。
+提供创建、取消、读取冻结参考和投递语音事件的工具。插件负责项目任务的唯一持久化与调度；任意 DSH
+根会话均可创建任务，任务与创建会话的生命周期无关。创建时的 DSH 文本上下文快照保存在任务记录，
+默认不注入；任务模型可通过 `read_wake_reference`（读取冻结参考工具）按需读取。
+
+任务到期后，插件经桥接层在 Voice 会话交接锁（防止旧会话被唤醒的互斥锁）内解析当前关联的 DSH
+主线，并用普通 `user/message`（用户消息）投递任务。创建任务的会话不作为投递目标；如果旧主线已退役，
+任务转投当前主线。暂时无法解析或投递时保留任务并重试。Voice Terminal（语音终端）主设置中的
+“唤醒任务”页读取同一插件任务目录，因此能查看、修改和取消任意 DSH 会话创建的任务。
+
+插件安装时会幂等导入 DSH 原生 `schedule.json`（原生任务文件）及旧 Voice `wake-tasks.json`
+（旧任务文件）中的可转换记录，并保留任务标识、状态和可用投递历史。安装脚本在切换调度来源前运行
+迁移预检；有效记录无法转换时中止安装。安装完成后，DSH 原生 `schedule`（调度器）与
+`ui-schedule`（原生任务页面）会停用，以免任务被两套调度器重复触发。
+
+DSH 模型需要通知 Voice 时，必须显式调用 `publish_voice_event`（投递语音事件工具），写入 Voice
+持久信箱（可在进程重启后恢复的事件队列）。事件不要求预先存在唤醒标识或上下文版本；重复事件按
+`event_id`（事件标识）去重。Voice 停止监听时，事件保留到下次手动启动处理，不会自动打开语音监听；
+普通 DSH 助手正文不会自动转成语音事件。完整工具字段、规则格式和交接恢复行为见
+[跨会话衔接与 DSH 定时任务](continuity-foundation.md)。
 
 项目私有运行数据位于 `.runtime/dsh`：
 
@@ -103,8 +119,10 @@ DSH 启动后，在设置侧栏“Agent 预设”下方打开独立的 `Voice Te
 
 DSH 固定监听 `127.0.0.1:3081`。Voice Server 每次启动生成独立 Bridge Bearer token，仅通过受管
 子进程环境交给 Bundle；它与浏览器 launch token、DSH Cookie 和模型 API key完全分离。Bridge
-路由和 Voice 内部回调都拒绝非 loopback、错误 token、错误 Session/epoch/revision/activation、
-跨 Session发布、冲突重放和 retired Session。
+路由和 Voice 内部回调都拒绝非 loopback（本机回环地址）和错误 token（访问令牌）。有会话边界的
+上下文与生命周期操作继续校验 Session（会话）、epoch（会话代次）及 revision（上下文版本）；定时任务
+只允许投递当前未退役主线。`publish_voice_event`（投递语音事件工具）通过桥接鉴权、事件标识去重和
+退役会话校验，但不要求预先建立 Voice activation（语音激活）或匹配上下文版本。
 
 Voice 模型仍只发送无正文的 `request_shadow({"request": true})`。Voice Terminal 是唯一权威上下文
 源；Bundle 先强制注入带来源、epoch、revision 的完整 snapshot/连续 update，再唤醒根 Agent。

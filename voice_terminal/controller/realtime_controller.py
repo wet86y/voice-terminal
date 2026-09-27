@@ -404,6 +404,34 @@ class RealtimeController(SpeechPipeline, InputController):
             return
         await self._state_event(TerminalState.IDLE, listening=True)
 
+    async def activate_asr_for_model_speech(self) -> None:
+        """Rotate KWS→ASR when a model speech transaction is accepted."""
+        if not self.wake_always_on or not self.state.listening or self.state.input_owner != "kws":
+            return
+        generation = self._activation_generation
+        try:
+            if self.asr is None:
+                raise RuntimeError("ASR Worker 客户端未初始化。")
+            if not self.asr.connected:
+                await self.asr.connect()
+            health = getattr(self.asr, "health", None)
+            if callable(health):
+                await health()
+        except Exception as exc:
+            self.state.set_service("asr", "ERROR")
+            await self._error("ASR_WORKER_NOT_READY", str(exc), recoverable=True)
+            return
+        if not self.state.listening or self.state.input_owner != "kws" or generation != self._activation_generation:
+            return
+        self._activation_generation += 1
+        if self.kws is not None:
+            self.kws.reset()
+        await self._reset_owner_boundary()
+        self.state.input_owner = "asr"
+        self.state.set_service("kws", "READY")
+        self.state.set_service("asr", "RUNNING")
+        await self._state_event(TerminalState.IDLE, listening=True)
+
     async def _return_to_kws(self, generation: int | None = None) -> bool:
         if (not self.wake_always_on or not self.state.listening
                 or self.state.input_owner != "asr"):

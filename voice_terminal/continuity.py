@@ -26,11 +26,13 @@ class ContinuityManager:
         summarize: Callable[[Sequence[dict], str], Awaitable[str]],
         *,
         on_document_changed: Callable[[str], None] | None = None,
+        on_organized: Callable[[str, int], Awaitable[bool]] | None = None,
         idle_seconds: float = CONTINUITY_IDLE_SECONDS,
     ) -> None:
         self.path = path
         self.summarize = summarize
         self.on_document_changed = on_document_changed
+        self.on_organized = on_organized
         self.idle_seconds = max(0.0, float(idle_seconds))
         self.document = self._read_document()
         self._generation = 0
@@ -111,7 +113,11 @@ class ContinuityManager:
             updated = await organizer
             if generation != self._generation:
                 return
-            self._replace_document(self._bounded(updated))
+            bounded = self._bounded(updated)
+            if self.on_organized is None:
+                self._replace_document(bounded)
+            elif not await self.on_organized(bounded, generation):
+                return
             logger.info(
                 "continuity.document_replaced chars=%d snapshot_items=%d",
                 len(self.document), len(snapshot),
@@ -140,6 +146,13 @@ class ContinuityManager:
         os.replace(temporary, self.path)
         if self.on_document_changed is not None:
             self.on_document_changed(text)
+
+    def commit_document(self, text: str, generation: int) -> bool:
+        """Commit only the currently silent generation（当前静默代次）."""
+        if generation != self._generation:
+            return False
+        self._replace_document(self._bounded(text))
+        return True
 
     async def close(self) -> None:
         self.user_started()

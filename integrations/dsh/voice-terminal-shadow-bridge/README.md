@@ -17,20 +17,14 @@ Both are supplied only to the project-managed DSH child process.
 
 ## Continuity and wake tasks（上下文衔接与唤醒任务）
 
-This Bridge（插件桥接层） works with the separate
-`voice-terminal-wake-tasks`（语音终端唤醒任务插件）. The wake-task plugin exposes
-`schedule_wake`（创建唤醒）, `cancel_wake`（取消唤醒）, and
-`read_wake_reference`（读取冻结参考） to the formal root Agent（正式根代理）. Voice
-Server（语音服务端） owns task persistence（任务持久化） and scheduling（任务调度）;
-this Bridge does not store or schedule jobs.
-
-When a `shadow_agent`（影子代理） wake arrives through `wake.open`（打开唤醒会话接口）,
-the Bridge creates an independent DSH（影子代理宿主） session（会话） and sends the task description together
-with the current continuity document（会话衔接文档）. The frozen task reference is
-not injected; the DSH Agent（影子代理） reads it only through `read_wake_reference`（读取冻结参考工具）.
-The wake-task lifecycle, Voice Terminal task-management page（唤醒任务管理页）, and
-recovery behavior are documented in
-[continuity foundation](../../../docs/continuity-foundation.md)（连续性底座说明）.
+This Bridge（插件桥接层） works with `voice-terminal-wake-tasks`（语音终端唤醒任务插件）.
+The plugin owns task persistence（任务持久化） and scheduling（任务调度）. On due delivery,
+the Bridge writes a normal `user/message`（用户消息） to the current Voice-linked
+DSH Session（语音关联影子会话） while Voice Server（语音服务端） holds its session handoff lock（会话交接锁）.
+The creating Session（创建会话） is not a delivery target. The frozen task reference（冻结任务参考）
+is read only on demand via `read_wake_reference`（读取冻结参考工具）. DSH reports to Voice
+through `publish_voice_event`（投递语音事件工具） and a durable mailbox（持久信箱）.
+See [continuity foundation](../../../docs/continuity-foundation.md)（连续性底座说明）.
 
 The browser half registers an independent Voice Terminal settings page（独立设置页面）
 in the DSH Settings sidebar（设置侧栏）, after Agent Presets（Agent 预设）. Its
@@ -105,11 +99,8 @@ existing Chat（对话） and Trajectory（执行轨迹） views（视图）.
   `turn/end` 仍会被读取端看到。遇到对话页空白时，先跑
   `node scripts/dsh-diagnose/find-null-kind-rows.mjs` 排查是否存在 `reason: null` 记录，
   必要时用 `node scripts/dsh-diagnose/purge-poisoned-sessions.mjs` 备份后清理。
-- **`session.resume` 不安装根工具。** 只有新建会话（`session.open`）与唤醒会话
-  （`wake.open`）会注册 Voice 控制工具；恢复会话沿用既有 composition，不重复安装。
-- **唤醒会话的根工具注册尚未对齐。** `wake.open` 路径只挂载 Shadow preset，没有注册
-  Voice 控制工具，因此唤醒会话的代理无法通过 Bridge 工具回投结果。补齐它需要让工具注册
-  与 `ensure()` 的绑定校验共用同一份 binding 状态，属于行为改动，留待单独确认。
+- 定时任务现在投递到当前关联的普通 DSH 会话，`wake.open`（旧独立唤醒会话接口）
+  不再是调度路径；语音事件通过 `publish_voice_event`（投递语音事件工具）写入持久信箱。
 - **事件注入工具不响应取消。** `post()` 与 `get_latest_context` / `read_ambient_context`
   向 Voice Server 发起的循环回环请求不接 `exec.signal`；DSH 仍会在 `tools/execute` 层
   中止调用，但已发出的 HTTP 请求不会被取消。

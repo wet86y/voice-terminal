@@ -128,6 +128,11 @@ class DshRuntimeManager:
                 "DSH_TELEMETRY_DISABLED": "1",
                 "VOICE_DSH_BRIDGE_TOKEN": self._bridge_token,
                 "VOICE_DSH_CALLBACK_ORIGIN": self.callback_origin,
+                "VOICE_DSH_TASKS_PATH": str(self.config.home_dir / "storages" / "voice-terminal-wake-tasks.json"),
+                "VOICE_DSH_NATIVE_SCHEDULE_PATH": str(self.config.home_dir / "storages" / "schedule.json"),
+                "VOICE_DSH_LEGACY_WAKE_PATH": str(self.repo_root / "config" / "wake-tasks.json"),
+                "VOICE_DSH_SCHEDULE_MODULE": str(self.config.source_dir / "packages" / "schedule" / "schedule" / "lib" / "index.js"),
+                "VOICE_DSH_TASKS_ACTIVE": "1",
             })
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             self._process = await asyncio.create_subprocess_exec(
@@ -213,6 +218,10 @@ class DshRuntimeManager:
         managed_patch = self.config.home_dir / "profiles" / "web" / "cordis.patch.yml"
         if not self._profile_patch_preserves_managed_defaults(self.config.profile_patch, managed_patch):
             raise RuntimeError("DSH_HOME 的 Web profile patch（Web 配置补丁）缺少正式 Shadow preset（Shadow 预设）或 session-log（会话日志）设置；请运行 scripts\\setup-dsh.ps1。")
+        profile_text = managed_patch.read_text(encoding="utf-8")
+        for plugin_id in ("schedule", "ui-schedule"):
+            if not re.search(rf"(?ms)^- id: {plugin_id}\s*\n\s+disabled: true\s*(?=\n|$)", profile_text):
+                raise RuntimeError(f"DSH 原生 {plugin_id}（旧调度插件）仍启用；请运行 scripts\\setup-dsh.ps1。")
         preset_bundle_dir = self.config.source_dir.parent / "bundles" / "voice-terminal-shadow-preset"
         source_preset = self.repo_root / "config" / "dsh" / "agent-presets" / "shadow-agent"
         preset_artifacts = (preset_bundle_dir / "package.json", preset_bundle_dir / "cordis.patch.yml")
@@ -272,6 +281,7 @@ class DshRuntimeManager:
             wake_bundle_dir / "package.json",
             wake_bundle_dir / "cordis.patch.yml",
             wake_bundle_dir / "lib" / "index.js",
+            wake_bundle_dir / "lib" / "task-service.js",
             wake_bundle_dir / "lib" / "plugin.js",
         )
         common_prompt = self.repo_root / "config" / "shadow_agent" / "instructions.md"
