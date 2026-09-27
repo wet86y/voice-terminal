@@ -75,7 +75,11 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
         config=yaml_config,
     )
     config = product_settings.effective_config()
-    runtime = SessionRuntime(config, product_settings=product_settings)
+    runtime = SessionRuntime(
+        config,
+        product_settings=product_settings,
+        speaker_worker_config_path=effective_config,
+    )
     runtime.build_info = _runtime_build_info(root, effective_config)
     model_registry = ModelRegistryService(
         config=config,

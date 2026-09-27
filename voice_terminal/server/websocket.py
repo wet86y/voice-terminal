@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import base64
 from contextlib import asynccontextmanager
+import ipaddress
 import json
 import logging
 import os
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from ..audio.capture import AudioCapture
@@ -64,8 +66,10 @@ from ..speaker.enrollment_capture import (
     EnrollmentCaptureError,
     capture_segment,
     speech_ms_for_pcm,
+    voiced_ranges_for_windows,
 )
 from ..speaker.features import FRONTEND_VERSION
+from ..speaker.quality import base_window_quality
 from ..speaker.registry import ENROLLMENT_MAX_CLIPPED_RATIO, SpeakerProfileStore
 from ..speaker.router import SpeakerRouter
 from ..speaker.engine import SpeakerModelError, WeSpeakerOnnxEngine
@@ -106,7 +110,8 @@ async def _no_session_lock():
 
 class SessionRuntime:
     """The sole production runtime: a session orchestrating input, agent and speech."""
-    def __init__(self, config: AppConfig, *, product_settings: ProductSettingsStore | None = None) -> None:
+    def __init__(self, config: AppConfig, *, product_settings: ProductSettingsStore | None = None,
+                 speaker_worker_config_path: Path | None = None) -> None:
         # The compatibility router remains available for future local-model
         # work, while this product runtime is locked to MiniMax API（在线语音接口）.
         config = replace(config, tts=replace(config.tts, backend="minimax", provider="minimax"))
@@ -133,6 +138,17 @@ class SessionRuntime:
         self.asr: AsrWorkerClient | None = None
         self.llm: DeepSeekClient | None = None
         project_root = Path(__file__).resolve().parents[2]
+        self._project_root = project_root
+        default_worker_config = project_root / "config" / "default.yaml"
+        # Child config（子进程配置文件） keeps the worker on the same model and port.
+        self._speaker_worker_config_path = (
+            speaker_worker_config_path or default_worker_config
+        ).resolve()
+        if not self._speaker_worker_config_path.is_file():
+            self._speaker_worker_config_path = default_worker_config.resolve()
+        # Process handle（进程句柄） and lock（互斥锁） keep startup single-owner and race-safe.
+        self._speaker_worker_process: asyncio.subprocess.Process | None = None
+        self._speaker_worker_lock = asyncio.Lock()
         self.cosyvoice_worker = CosyVoiceWorkerManager(
             project_root=project_root, model_dir=config.model_dir / "cosyvoice3-0.5b-2512",
         )
@@ -205,34 +221,13 @@ class SessionRuntime:
         if controller is not None:
             await controller.on_speaker_observation(observation)
 
-    async def _initialize_speaker(self, *, force: bool = False) -> None:
-        self.state.set_service("speaker", "DISABLED")
-        if self.config.speaker.mode == "off" and not force:
+    async def _initialize_speaker(self) -> None:
+        if self.config.speaker.mode == "off":
+            self.state.set_service("speaker", "DISABLED")
             return
-        self.state.set_service("speaker", "STARTING")
         if not self.speaker_profile.available:
             logger.info("speaker sidecar enabled without a registered profile")
-        client: SpeakerWorkerClient | None = None
-        try:
-            client = SpeakerWorkerClient(
-                self.config.speaker_worker_url,
-                on_observation=self._on_speaker_observation,
-            )
-            await client.connect()
-            await client.health(timeout_s=1.5)
-            self.speaker = client
-            self.state.set_service("speaker", "READY")
-            await self._sync_speaker_fingerprint(client)
-        except Exception as exc:
-            if client is not None:
-                try:
-                    await client.close()
-                except Exception:
-                    logger.debug("speaker.client_cleanup_failed", exc_info=True)
-            self.speaker = None
-            self.state.set_service("speaker", "DEGRADED")
-            self.startup_errors.append(f"speaker: {type(exc).__name__}: {str(exc)[:240]}")
-            logger.warning("optional speaker sidecar unavailable: %s", exc)
+        await self.ensure_speaker_worker()
 
     async def _sync_speaker_fingerprint(self, client: SpeakerWorkerClient) -> None:
         """Verify that stored templates belong to the running frontend.
@@ -260,20 +255,149 @@ class SessionRuntime:
             logger.warning("speaker.profile_stale reason=%s", self.speaker_profile.stale_reason)
 
     async def ensure_speaker_worker(self) -> bool:
-        """Start the sidecar on demand before enabling strict filtering."""
-        if (self.speaker is not None and self.speaker.connected
-                and not self.speaker.degraded
-                and self.state.services.get("speaker") == "READY"):
+        """Connect to or launch the local sidecar before enabling speaker modes."""
+        async with self._speaker_worker_lock:
+            if (self.speaker is not None and self.speaker.connected
+                    and not self.speaker.degraded
+                    and self.state.services.get("speaker") == "READY"):
+                return True
+
+            stale = self.speaker
+            self.speaker = None
+            if stale is not None:
+                try:
+                    await stale.close()
+                except Exception:
+                    logger.debug("speaker.stale_client_cleanup_failed", exc_info=True)
+
+            self.state.set_service("speaker", "STARTING")
+            connected, last_error = await self._connect_speaker_worker()
+            if connected:
+                return True
+
+            if not self.config.speaker_model_path.is_file():
+                return self._speaker_start_failed(
+                    f"声纹模型文件不存在：{self.config.speaker_model_path}"
+                )
+            if not self._speaker_worker_host_is_local():
+                return self._speaker_start_failed(
+                    f"远程 Speaker Worker 不可连接：{last_error or self.config.speaker_worker_url}"
+                )
+
+            process = self._speaker_worker_process
+            if process is None or process.returncode is not None:
+                self._speaker_worker_process = None
+                try:
+                    process = await self._start_managed_speaker_worker()
+                except Exception as exc:
+                    return self._speaker_start_failed(
+                        f"启动 Speaker Worker 失败：{type(exc).__name__}: {exc}"
+                    )
+
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
+                if process.returncode is not None:
+                    break
+                connected, current_error = await self._connect_speaker_worker()
+                if connected:
+                    return True
+                if current_error:
+                    last_error = current_error
+                await asyncio.sleep(0.5)
+
+            if process.returncode is None:
+                await self._stop_managed_speaker_worker()
+                reason = f"Speaker Worker 启动等待超时（60 秒）：{last_error or '无 health 响应'}"
+            else:
+                reason = f"Speaker Worker 已退出（exit code {process.returncode}）：{last_error or '无 health 响应'}"
+            return self._speaker_start_failed(reason)
+
+    def _speaker_worker_host_is_local(self) -> bool:
+        host = urlsplit(self.config.speaker_worker_url).hostname or ""
+        if host.lower() == "localhost":
             return True
-        stale = self.speaker
-        self.speaker = None
-        if stale is not None:
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return address.is_loopback or address.is_unspecified
+
+    async def _connect_speaker_worker(self) -> tuple[bool, str | None]:
+        client = SpeakerWorkerClient(
+            self.config.speaker_worker_url,
+            on_observation=self._on_speaker_observation,
+        )
+        try:
+            await client.connect()
+            await client.health(timeout_s=1.5)
+        except Exception as exc:
             try:
-                await stale.close()
+                await client.close()
             except Exception:
-                logger.debug("speaker.stale_client_cleanup_failed", exc_info=True)
-        await self._initialize_speaker(force=True)
-        return bool(self.speaker is not None and self.speaker.connected)
+                logger.debug("speaker.client_cleanup_failed", exc_info=True)
+            return False, f"{type(exc).__name__}: {str(exc)[:200]}"
+
+        self.speaker = client
+        self.state.set_service("speaker", "READY")
+        self.startup_errors = [
+            item for item in self.startup_errors if not str(item).startswith("speaker:")
+        ]
+        await self._sync_speaker_fingerprint(client)
+        logger.info("speaker.worker_ready url=%s", self.config.speaker_worker_url)
+        return True, None
+
+    async def _start_managed_speaker_worker(self) -> asyncio.subprocess.Process:
+        log_dir = self._project_root / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = log_dir / "speaker-worker.out.log"
+        stderr_path = log_dir / "speaker-worker.err.log"
+        command = [
+            sys.executable, "-m", "voice_terminal.speaker.worker",
+            "--config", str(self._speaker_worker_config_path),
+        ]
+        with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(self._project_root),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        self._speaker_worker_process = process
+        logger.info(
+            "speaker.worker_started pid=%s config=%s",
+            process.pid, self._speaker_worker_config_path,
+        )
+        return process
+
+    def _speaker_start_failed(self, reason: str) -> bool:
+        self.speaker = None
+        self.state.set_service("speaker", "DEGRADED")
+        message = str(reason)[:240]
+        self.startup_errors = [
+            item for item in self.startup_errors if not str(item).startswith("speaker:")
+        ]
+        self.startup_errors.append(f"speaker: {message}")
+        logger.warning("optional speaker sidecar unavailable: %s", message)
+        return False
+
+    async def _stop_managed_speaker_worker(self) -> None:
+        process, self._speaker_worker_process = self._speaker_worker_process, None
+        if process is None or process.returncode is not None:
+            return
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+        logger.info("speaker.worker_stopped pid=%s", process.pid)
 
     def speaker_status(self) -> dict[str, Any]:
         profile = self.speaker_profile.snapshot()
@@ -323,8 +447,12 @@ class SessionRuntime:
         if processor is not None and getattr(processor, "available", False):
             try:
                 processor.reset()
-                value, measured = speech_ms_for_pcm(pcm, sample_rate=sample_rate, processor=processor)
-                processor.reset()
+                try:
+                    value, measured = speech_ms_for_pcm(
+                        pcm, sample_rate=sample_rate, processor=processor,
+                    )
+                finally:
+                    processor.reset()
                 if measured:
                     return value, True
             except Exception:
@@ -641,43 +769,151 @@ class SessionRuntime:
         step = max(1, self.config.speaker.step_ms * sample_rate // 1000)
         total_samples = len(pcm) // 2
         sampled = [
-            pcm[start * 2:(start + window) * 2]
+            (start, pcm[start * 2:(start + window) * 2])
             for start in range(0, max(0, total_samples - window) + 1, step)
         ]
         if not sampled and total_samples:
-            sampled = [pcm]
+            sampled = [(0, pcm)]
         engine = self._get_speaker_engine()
-        embeddings: list[tuple[float, ...]] = []
-        for chunk in sampled:
+        # The same upstream VAD（语音活动检测） frames are intersected with
+        # each window, exactly as the live Worker does. The whole-clip duration
+        # remains separate so overlapping windows cannot inflate the turn gate.
+        window_ranges = [
+            (start, start + len(chunk) // 2)
+            for start, chunk in sampled
+        ]
+        try:
+            window_voiced_ranges, window_speech_measured = voiced_ranges_for_windows(
+                pcm,
+                windows=window_ranges,
+                sample_rate=sample_rate,
+                processor=self.audio_processor,
+            )
+        except Exception:
+            logger.debug("speaker.test_vad_window_measure_failed", exc_info=True)
+            window_voiced_ranges, window_speech_measured = [], False
+        if not window_speech_measured:
+            window_speech_values = [self._speaker_speech_ms(chunk)[0] for _, chunk in sampled]
+            window_voiced_ranges = [None for _ in sampled]
+        else:
+            window_speech_values = [
+                int(sum(end - start for start, end in ranges) * 1000 // sample_rate)
+                for ranges in window_voiced_ranges
+            ]
+
+        minimum_window_speech_ms = self.speaker_router.state_config.min_speech_ms
+        minimum_window_speech_ratio = float(self.config.speaker.min_window_speech_ratio)
+        configured_window_ms = max(1, int(self.config.speaker.window_ms))
+        window_diagnostics: list[dict[str, Any]] = []
+        embeddings: list[tuple[int, int, int, float | None, tuple[float, ...]]] = []
+        failed_window_count = 0
+        gate_rejected_window_count = 0
+        eligible_window_count = 0
+        quality_counts: dict[str, int] = {}
+        first_embedding_error: str | None = None
+        for index, ((start, chunk), window_speech_ms, _voiced_ranges) in enumerate(
+                zip(sampled, window_speech_values, window_voiced_ranges), start=1):
+            quality, fallback_speech_ms = base_window_quality(
+                chunk,
+                sample_rate=sample_rate,
+                min_speech_ms=minimum_window_speech_ms,
+                vad_measured=window_speech_measured,
+            )
+            # When VAD is available its speech duration is authoritative; the
+            # amplitude estimate is only a fallback. Low level and clipping
+            # checks remain active in either measurement mode.
+            if not window_speech_measured:
+                window_speech_ms = fallback_speech_ms
+            speech_ratio = (
+                round(min(1.0, window_speech_ms / configured_window_ms), 4)
+                if window_speech_measured else None
+            )
+            if quality == "ready":
+                if (window_speech_measured
+                        and speech_ratio is not None
+                        and speech_ratio < minimum_window_speech_ratio):
+                    quality = "not_speech"
+                elif window_speech_ms < minimum_window_speech_ms:
+                    quality = "insufficient_audio"
+            quality_counts[quality] = quality_counts.get(quality, 0) + 1
+            window_diagnostics.append({
+                "index": index,
+                "speech_ms": int(window_speech_ms),
+                "speech_ratio": speech_ratio,
+                "quality": quality,
+            })
+            if quality != "ready":
+                gate_rejected_window_count += 1
+                continue
+            eligible_window_count += 1
             try:
-                embeddings.append(tuple(float(x) for x in engine.embed_pcm(chunk)))
-            except Exception:
+                embedding = tuple(float(x) for x in engine.embed_pcm(chunk))
+                embeddings.append((
+                    start, start + len(chunk) // 2, int(window_speech_ms),
+                    speech_ratio, embedding,
+                ))
+            except Exception as exc:
+                failed_window_count += 1
+                first_embedding_error = first_embedding_error or f"{type(exc).__name__}: {exc}"
                 continue
         if not embeddings:
+            if failed_window_count:
+                logger.warning(
+                    "speaker.test_no_usable_embedding candidate_windows=%d failed_windows=%d first_error=%s",
+                    len(sampled), failed_window_count, (first_embedding_error or "")[:240],
+                )
+            reason = (
+                "speaker_test_insufficient_window_speech"
+                if eligible_window_count == 0
+                else "speaker_test_no_usable_window"
+            )
             return {
                 "state": "unknown",
                 "similarity": None,
                 "threshold_used": None,
-                "speech_ms": int(speech_ms),
+                "speech_ms": 0,
                 "measured_speech_ms": int(speech_ms),
                 "window_count": 0,
+                "candidate_window_count": len(sampled),
+                "eligible_window_count": eligible_window_count,
+                "window_gate_rejected_count": gate_rejected_window_count,
+                "failed_window_count": failed_window_count,
+                "window_quality_counts": quality_counts,
+                "window_diagnostics": window_diagnostics,
+                "window_ms": configured_window_ms,
+                "minimum_window_speech_ms": minimum_window_speech_ms,
+                "minimum_window_speech_ratio": minimum_window_speech_ratio,
+                "minimum_turn_speech_ms": self.speaker_router.state_config.min_turn_speech_ms,
                 "frontend_version": FRONTEND_VERSION,
-                "reason": "speaker_test_no_usable_window",
+                "reason": reason,
                 "anti_spoofing": "unavailable",
             }
+        if failed_window_count:
+            logger.warning(
+                "speaker.test_partial_embedding_failure candidate_windows=%d failed_windows=%d first_error=%s",
+                len(sampled), failed_window_count, (first_embedding_error or "")[:240],
+            )
         machine = SpeakerStateMachine(config=self.speaker_router.state_config,
                                      scorer=self.speaker_router.score_aggregate)
         machine.reset(turn_id="speaker-test", generation=0)
-        per_window_speech = max(1, int(speech_ms // max(1, len(embeddings))))
-        for embedding in embeddings:
+        for start, end, window_speech_ms, speech_ratio, embedding in embeddings:
             machine.observe(SpeakerObservation(
                 turn_id="speaker-test", generation=0,
-                window_started_sample=0, window_ended_sample=window,
+                window_started_sample=start, window_ended_sample=end,
                 similarity=self.speaker_router.score_embedding(embedding),
-                quality="ready", speech_ms=per_window_speech,
+                quality="ready", speech_ms=window_speech_ms,
                 embedding=embedding,
+                speech_ratio=speech_ratio,
+                turn_speech_ms=int(speech_ms),
             ))
         decision = machine.decision()
+        reason = None
+        if decision.aggregated_windows == 0:
+            reason = "speaker_test_insufficient_window_speech"
+        elif decision.speech_ms < self.speaker_router.state_config.min_turn_speech_ms:
+            reason = "speaker_test_insufficient_turn_speech"
+        elif decision.state.value == "unknown":
+            reason = "speaker_score_ambiguous"
         return {
             "state": decision.state.value,
             "similarity": decision.similarity,
@@ -685,7 +921,18 @@ class SessionRuntime:
             "speech_ms": decision.speech_ms,
             "measured_speech_ms": int(speech_ms),
             "window_count": decision.aggregated_windows,
+            "candidate_window_count": len(sampled),
+            "eligible_window_count": eligible_window_count,
+            "window_gate_rejected_count": gate_rejected_window_count,
+            "failed_window_count": failed_window_count,
+            "window_quality_counts": quality_counts,
+            "window_diagnostics": window_diagnostics,
+            "window_ms": configured_window_ms,
+            "minimum_window_speech_ms": minimum_window_speech_ms,
+            "minimum_window_speech_ratio": minimum_window_speech_ratio,
+            "minimum_turn_speech_ms": self.speaker_router.state_config.min_turn_speech_ms,
             "frontend_version": FRONTEND_VERSION,
+            "reason": reason,
             "anti_spoofing": "unavailable",
         }
 
@@ -1853,6 +2100,7 @@ class SessionRuntime:
         speaker = getattr(self, "speaker", None)
         if speaker is not None:
             await speaker.close()
+        await self._stop_managed_speaker_worker()
         if self.kws is not None:
             self.kws.close()
         shadow_component = getattr(self, "shadow_component", None)
@@ -1962,6 +2210,7 @@ class SessionRuntime:
             if self.speaker is not None:
                 await self.speaker.close()
             self.speaker = None
+            await self._stop_managed_speaker_worker()
             self.state.set_service("speaker", "DISABLED")
             if self.controller is not None:
                 self.controller.speaker_client = None

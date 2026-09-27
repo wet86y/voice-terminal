@@ -12,6 +12,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from .engine import InsufficientAudioError, WeSpeakerOnnxEngine
+from .quality import base_window_quality
 from .protocol import decode_pcm
 from ..config import load_config
 from ..core.events import utc_now_iso
@@ -47,6 +48,10 @@ class SpeakerWorkerEngine:
         # frame the controller marked as speech, so a window's speech duration
         # is measured from the upstream VAD instead of a fixed amplitude gate.
         self.speech_ranges: dict[tuple[str, int], list[tuple[int, int]]] = {}
+        # Merged VAD ranges for the full turn.  The rolling window ranges above
+        # are pruned; this compact list preserves distinct turn speech time so
+        # overlapping windows cannot inflate the minimum-turn gate.
+        self.turn_speech_ranges: dict[tuple[str, int], list[tuple[int, int]]] = {}
         # Turns for which the caller supplied an explicit VAD verdict on at
         # least one frame.  Distinguishing "no speech" from "no verdict" is
         # what lets a noise-only window be rejected outright instead of
@@ -65,52 +70,66 @@ class SpeakerWorkerEngine:
     def model_version(self) -> str:
         return self.model.model_version
 
-    def _quality(self, pcm: bytes) -> tuple[str, int, bool]:
+    def _quality(self, pcm: bytes, *, vad_measured: bool = False) -> tuple[str, int, bool]:
         """Return ``(quality, speech_ms, vad_supplied)``.
 
         ``speech_ms`` is only an energy-based estimate.  When the controller
         supplies a VAD verdict per frame the window-level speech duration is
-        computed from it instead (see :meth:`_speech_ms`), because a fixed
+        computed from it instead (see :meth:`_window_speech_ranges`), because a fixed
         absolute amplitude threshold drifts with microphone gain and counts
         non-speech energy as speech.
         """
-        try:
-            import numpy as np  # type: ignore
-            values = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-            if values.size == 0:
-                return "insufficient_audio", 0, False
-            rms = float(np.sqrt(np.mean((values / 32768.0) ** 2)))
-            if rms < 0.003:
-                return "too_quiet", 0, False
-            clipped = float(np.mean(np.abs(values) >= 32760.0))
-            if clipped > 0.02:
-                return "clipped", int(values.size * 1000 / self.sample_rate), False
-            voiced = int(np.count_nonzero(np.abs(values) >= 327.0))
-            speech_ms = int(voiced * 1000 / self.sample_rate)
-            if speech_ms < self.min_speech_ms:
-                return "insufficient_audio", speech_ms, False
-            return "ready", speech_ms, False
-        except Exception:
-            return "ready", len(pcm) // 2 * 1000 // self.sample_rate, False
+        quality, speech_ms = base_window_quality(
+            pcm, sample_rate=self.sample_rate, min_speech_ms=self.min_speech_ms,
+            vad_measured=vad_measured,
+        )
+        return quality, speech_ms, False
 
-    def _speech_ms(self, key: tuple[str, int], start: int, end: int) -> tuple[int, bool]:
-        """Speech duration inside ``[start, end)`` from VAD frame ranges."""
+    @staticmethod
+    def _append_range(ranges: list[tuple[int, int]], start: int, end: int) -> None:
+        """Add an interval while merging duplicate, overlapping, or adjacent frames."""
+        if end <= start:
+            return
+        index = 0
+        while index < len(ranges) and ranges[index][1] < start:
+            index += 1
+        while index < len(ranges) and ranges[index][0] <= end:
+            previous_start, previous_end = ranges.pop(index)
+            start = min(start, previous_start)
+            end = max(end, previous_end)
+        ranges.insert(index, (start, end))
+
+    def _window_speech_ranges(self, key: tuple[str, int], start: int,
+                              end: int) -> tuple[list[tuple[int, int]], bool]:
+        """Merged voiced sample ranges intersecting ``[start, end)``."""
         if key not in self.vad_tracked:
-            return 0, False
-        total = 0
+            return [], False
+        result: list[tuple[int, int]] = []
         for frame_start, frame_end in self.speech_ranges.get(key, ()):
-            overlap = min(end, frame_end) - max(start, frame_start)
-            if overlap > 0:
-                total += overlap
-        return int(total * 1000 / self.sample_rate), True
+            overlap_start = max(start, frame_start)
+            overlap_end = min(end, frame_end)
+            self._append_range(result, overlap_start, overlap_end)
+        return result, True
+
+    def _turn_speech_ms(self, key: tuple[str, int], through_sample: int) -> int | None:
+        """Distinct VAD speech time from the turn start through ``through_sample``."""
+        if key not in self.vad_tracked:
+            return None
+        total_samples = sum(
+            max(0, min(through_sample, frame_end) - frame_start)
+            for frame_start, frame_end in self.turn_speech_ranges.get(key, ())
+            if frame_start < through_sample
+        )
+        return int(total_samples * 1000 / self.sample_rate)
 
     def _observation(self, *, turn_id: str, generation: int, start: int, end: int,
                      pcm: bytes) -> dict[str, Any]:
         key = (turn_id, generation)
-        quality, fallback_speech_ms, _ = self._quality(pcm)
-        vad_speech_ms, vad_supplied = self._speech_ms(key, start, end)
+        speech_ranges, vad_supplied = self._window_speech_ranges(key, start, end)
+        quality, fallback_speech_ms, _ = self._quality(pcm, vad_measured=vad_supplied)
         if vad_supplied:
-            speech_ms = vad_speech_ms
+            speech_samples = sum(range_end - range_start for range_start, range_end in speech_ranges)
+            speech_ms = int(speech_samples * 1000 / self.sample_rate)
             window_ms = max(1, self.window_samples * 1000 // self.sample_rate)
             speech_ratio: float | None = round(min(1.0, speech_ms / window_ms), 4)
             if quality == "ready" and speech_ratio < self.min_window_speech_ratio:
@@ -123,6 +142,7 @@ class SpeakerWorkerEngine:
         else:
             speech_ms = fallback_speech_ms
             speech_ratio = None
+        turn_speech_ms = self._turn_speech_ms(key, end)
         payload: dict[str, Any] = {
             "type": "speaker.embedding",
             "turn_id": turn_id,
@@ -136,6 +156,7 @@ class SpeakerWorkerEngine:
             "matched_template_id": None,
             "speech_ms": speech_ms,
             "speech_ratio": speech_ratio,
+            "turn_speech_ms": turn_speech_ms,
             "quality": quality,
             "model_version": self.model_version,
             "timestamp": utc_now_iso(),
@@ -175,6 +196,7 @@ class SpeakerWorkerEngine:
                 self.starts.pop(stale_key, None)
                 self.last_emitted.pop(stale_key, None)
                 self.speech_ranges.pop(stale_key, None)
+                self.turn_speech_ranges.pop(stale_key, None)
                 self.vad_tracked.discard(stale_key)
             self.finished = {key: value for key, value in self.finished.items() if key[0] != turn_id}
         key = (turn_id, generation)
@@ -189,7 +211,12 @@ class SpeakerWorkerEngine:
         if isinstance(speech, bool):
             self.vad_tracked.add(key)
             if speech:
-                self.speech_ranges.setdefault(key, []).append((start_sample, end_sample))
+                self._append_range(
+                    self.speech_ranges.setdefault(key, []), start_sample, end_sample,
+                )
+                self._append_range(
+                    self.turn_speech_ranges.setdefault(key, []), start_sample, end_sample,
+                )
         if key not in self.buffers:
             self.buffers[key] = bytearray()
             self.starts[key] = start_sample
@@ -250,6 +277,7 @@ class SpeakerWorkerEngine:
                 self.starts.pop(stale_key, None)
                 self.last_emitted.pop(stale_key, None)
                 self.speech_ranges.pop(stale_key, None)
+                self.turn_speech_ranges.pop(stale_key, None)
                 self.vad_tracked.discard(stale_key)
             self.finished = {item: value for item, value in self.finished.items() if item[0] != turn_id}
         self.finished[key] = None
@@ -282,6 +310,7 @@ class SpeakerWorkerEngine:
         self.starts.pop((turn_id, generation), None)
         self.last_emitted.pop((turn_id, generation), None)
         self.speech_ranges.pop((turn_id, generation), None)
+        self.turn_speech_ranges.pop((turn_id, generation), None)
         self.vad_tracked.discard((turn_id, generation))
         return result
 

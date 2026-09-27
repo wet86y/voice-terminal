@@ -85,7 +85,8 @@ class CosyVoiceWorkerManager:
                     stdout=self._log_handle, stderr=self._log_handle,
                 )
                 loop = asyncio.get_running_loop()
-                deadline = loop.time() + 90.0
+                # Windows 上加载权重和缓存零样本提示音常超过一分钟，给冷启动留余量。
+                deadline = loop.time() + 180.0
                 while loop.time() < deadline:
                     if self.process.returncode is not None:
                         raise CosyVoiceRuntimeError("CosyVoice Worker 启动时退出；请检查 .runtime/cosyvoice/worker.log。")
@@ -143,8 +144,8 @@ class CosyVoiceWorkerManager:
 
 
 class CosyVoiceTtsSession:
-    bidi = False
-    reusable = False
+    bidi = True
+    reusable = True
 
     def __init__(self, client: "CosyVoiceTtsClient", *, emotion: str) -> None:
         self.client = client
@@ -159,6 +160,8 @@ class CosyVoiceTtsSession:
         self.received_bytes = 0
         self.completed_segments = 0
         self._closed = False
+        self._finish_sent = False
+        self.generation_finished = False
 
     async def start(self) -> None:
         if self._socket is not None:
@@ -190,6 +193,7 @@ class CosyVoiceTtsSession:
                 elif kind == "error":
                     raise CosyVoiceRuntimeError(str(message.get("message") or "CosyVoice 合成失败。")[:300])
                 elif kind == "finished":
+                    self.generation_finished = True
                     break
         except asyncio.CancelledError:
             raise
@@ -233,9 +237,14 @@ class CosyVoiceTtsSession:
             yield pcm
 
     async def finish(self) -> None:
-        if self._socket is not None and not self._closed:
+        if self._socket is not None and not self._closed and not self._finish_sent:
             async with self._send_lock:
                 await self._socket.send(json.dumps({"type": "finish"}))
+                self._finish_sent = True
+
+    async def flush(self) -> None:
+        """结束当前双向流文本输入，并等待 Worker 刷出最后音频块。"""
+        await self.finish()
 
     async def cancel(self, *, timeout_seconds: float | None = None) -> bool:
         if self._socket is not None and not self._closed:
@@ -260,9 +269,9 @@ class CosyVoiceTtsSession:
 
 
 class CosyVoiceTtsClient:
-    transport = "worker"
-    effective_scheduling = "sentence_window"
-    scheduling = "sentence_window"
+    transport = "websocket_bidi"
+    effective_scheduling = "direct"
+    scheduling = "direct"
     emotion_transport = "instruction"
     emotion_status = "applied"
     sentence_prefetch_ms = 2000
