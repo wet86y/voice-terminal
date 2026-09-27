@@ -233,3 +233,116 @@ def test_final_settlement_waits_for_output_transaction_to_become_idle():
         assert returned == [4]
 
     asyncio.run(scenario())
+
+
+def _ownership_controller(*, generation=8, owner="asr", output_busy=False):
+    """EpisodeController double that only instruments the handover decision."""
+
+    returned: list = []
+    tasks: set = set()
+
+    async def publish(*_args, **_kwargs):
+        return None
+
+    async def episode_log(*_args, **_kwargs):
+        return None
+
+    async def settle_committed_turn(*_args, **_kwargs):
+        return None
+
+    controller = object.__new__(EpisodeController)
+    controller.wake_always_on = True
+    controller.state = SimpleNamespace(
+        listening=True, input_owner=owner, agent={}, latency={},
+    )
+    controller._activation_generation = 4
+    controller.workspace = None
+    controller.output = SimpleNamespace(active=False, busy=output_busy)
+    controller._track = tasks.add
+    controller._settled_turns = set()
+    controller._committed_workspaces = {}
+    controller.history = SimpleNamespace(
+        commit_delivery=lambda *_a, **_kw: False,
+        has_speech=lambda *_a, **_kw: False,
+        conversation=SimpleNamespace(append=lambda *_a, **_kw: None),
+    )
+    controller.episode = SimpleNamespace(
+        user_speaking=False, last_turn_id=None,
+        scheduler=SimpleNamespace(generation=generation), log=episode_log,
+    )
+    controller.on_silence_anchor = None
+    controller._publish = publish
+    controller._settle_committed_turn = settle_committed_turn
+
+    async def return_to_kws(activation_generation):
+        returned.append(activation_generation)
+        return True
+
+    controller._return_to_kws = return_to_kws
+    return controller, returned
+
+
+def test_speech_completed_never_hands_the_microphone_back_to_kws():
+    """Regression (78dc97c): a settled speech must not cut the ASR window short."""
+
+    async def scenario():
+        controller, returned = _ownership_controller()
+        await controller._agent_event("speech.completed", {
+            "speech_id": "speech-wake", "turn_id": "wake_1",
+            "conversation_id": "conversation_a", "owner_scope": "system_check",
+            "text": "我在，请说。", "status": "completed",
+            "delivery": {"status": "full", "termination": "completed"},
+        })
+        await asyncio.sleep(0.15)
+        assert returned == [], (
+            "语音结算不得改变输入所有权；交接只能由 final_silence 系统检查触发"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_final_settlement_without_a_ladder_generation_is_ignored():
+    """A callback that cannot name its ladder must not rearm KWS."""
+
+    async def scenario():
+        controller, returned = _ownership_controller()
+        await controller._final_system_check_settled({})
+        await asyncio.sleep(0.15)
+        assert returned == [], "缺少 generation 的回调无法证明静默窗口已到期"
+
+        await controller._final_system_check_settled({"generation": 8})
+        await asyncio.sleep(0.15)
+        assert returned == [4], "正常结算仍必须在输入空闲后交还 KWS"
+
+    asyncio.run(scenario())
+
+
+def test_model_initiated_speech_arms_the_same_silence_window():
+    """A KWS→ASR rotation without a wake word still needs its timer."""
+
+    async def scenario():
+        armed: list = []
+        controller = object.__new__(EpisodeController)
+        controller.on_user_activity = None
+
+        async def arm_silence_window(*_args, **_kwargs):
+            armed.append(True)
+            return 1
+
+        controller.episode = SimpleNamespace(arm_silence_window=arm_silence_window)
+
+        async def rotated():
+            return True
+
+        async def already_asr():
+            return False
+
+        controller.activate_asr_for_model_speech = rotated
+        await controller._on_model_speech_accepted()
+        assert armed == [True], "KWS→ASR 轮换后必须挂上静默梯子"
+
+        controller.activate_asr_for_model_speech = already_asr
+        await controller._on_model_speech_accepted()
+        assert armed == [True], "没有发生所有权轮换时不得重复挂梯子"
+
+    asyncio.run(scenario())

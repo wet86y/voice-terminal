@@ -1415,6 +1415,34 @@ class AgentEpisodeRuntime:
         self._ensure_runner()
         return generation
 
+    async def arm_silence_window(self, turn_id: str | None = None, *,
+                                 anchor_source: str = "model_speech") -> int | None:
+        """Arm the KWS final-silence ladder without dispatching a check.
+
+        ``kws_wake`` and a finalized user input already enter ASR ownership
+        together with their timer.  A model-initiated speech (scheduled/DSH
+        wake task) rotates KWS→ASR as well, and the ladder's final window is
+        the only operation that gives the microphone back to KWS.
+
+        Returns the armed generation, or ``None`` when no ladder was armed:
+        an active or deferred user ladder already owns the handover, and a
+        closed or not-yet-started Episode has no ownership to protect.
+        """
+
+        if self.closed or self.episode_id is None:
+            return None
+        if self.scheduler.armed or self.scheduler.is_deferred():
+            return None
+        anchor_turn_id = turn_id or self.last_turn_id
+        generation = self.scheduler.arm(
+            time.monotonic(), wall_time=time.time(),
+            turn_id=anchor_turn_id, anchor_source=anchor_source,
+        )
+        self._ensure_runner()
+        await self.log("SCHEDULER_ARMED", turn_id=anchor_turn_id,
+                       generation=generation, anchor_source=anchor_source)
+        return generation
+
     async def enqueue_scheduled_wake(self, task: dict) -> bool:
         """Queue a project wake for the next ordinary heartbeat dispatch."""
 

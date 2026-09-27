@@ -86,6 +86,8 @@ none → kws standby → asr active → kws standby → none
 
 - KWS 命中不创建用户 turn，只触发唤醒确认。
 - ASR active 时 KWS worker 保留但不接收 PCM。
+- ASR→KWS 的交接只由静默窗口（`final_silence_ms`，本机产品设置为 90s）到期后的
+  `final_silence` 系统检查触发；语音结算、播放结束和 LLM 输出都不改变输入所有权。
 - KWS 初始化或重新接管失败时 fail-closed，不得在没有受保护状态的情况下放开输入。
 - 声纹注册/测试必须与实时采集互斥，不能重置正在工作的共享音频处理器。
 
