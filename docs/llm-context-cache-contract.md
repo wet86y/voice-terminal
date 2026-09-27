@@ -39,7 +39,7 @@ assistant 历史只记录播放结算后的传达事实，不记录尚未发送�
 </voice_delivery>
 ```
 
-`uncertain` 不能当作已听到，`unheard` 不自动要求下一轮补播。下一次 `forced_poll` 是否说话，只由最新用户可见信息和仍然相关的未传达内容决定。
+`uncertain`（听到与否不确定）不能当作已听到，`unheard`（尚未听到）不自动要求下一轮补播。下一次 `secondary_mailbox`（二等信箱检查）是否说话，只由最新用户可见信息和仍然相关的未传达内容决定；影子代理进度变化本身不要求播报。
 
 同一 speech 只能在结算时生成一次包装；不得先写裸 assistant 文本、下一轮再补包装，也不得把 `speech_id`、request ID、时间戳、播放时长或 Shadow 状态放进包装。
 
@@ -96,7 +96,7 @@ assistant 历史只记录播放结算后的传达事实，不记录尚未发送�
 
 `speak.state` 取 `speak`、`revision`、`cancel`、`wait`：
 
-- `speak`：`text` 是完整文本，本地只合成尚未交付的部分；
+- `speak`：`text` 是完整文本，只提交尚未交付的部分进行合成；
 - `revision`：`text` 只是新的尾巴，仅在 `continuation_mode=rewrite_tail` 时可用；本地把锁定前缀与新尾巴拼成完整文本，模型不再复述前缀；
 - `cancel`：`text` 为空表示只停止，非空表示停止并替换；
 - `wait`：`text` 必须为空。

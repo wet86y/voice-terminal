@@ -1,6 +1,6 @@
 # 本地模型运行设备
 
-设置页中的“本地模型设备”可以分别配置 Paraformer（流式语音识别）、SenseVoiceSmall（语音识别与分析）、Voice Server FSMN-VAD（语音活动检测）、KWS（关键字唤醒）、SmartTurn（语音结束判断）和 WeSpeaker（声纹识别）。TTS（语音合成）不受这些选项影响。
+设置页中的“本地模型设备”可以分别配置 Paraformer（流式语音识别）、SenseVoiceSmall（语音识别与分析）、Voice Server FSMN-VAD（语音活动检测）、KWS（关键字唤醒）、SmartTurn（语音结束判断）和 WeSpeaker（声纹识别）。
 
 每个模型可选择：
 

@@ -43,11 +43,17 @@ git diff --check
 5. KWS 开启时 `input_owner=kws`，关闭时可以直接进入 ASR；
 6. 唤醒确认播完后麦克风仍归 ASR：窗口内接话不需要再喊唤醒词，静默窗口到期后由 `final_silence`
    检查交回 `input_owner=kws`（日志依次出现 `SCHEDULER_FINAL_PENDING window_index=225`、
-   `prompt_kind=final_silence`，且交接完成后不再有 `forced_poll` 派发）；
+   `prompt_kind=final_silence`（最终静默检查请求类型），且交接完成后不再有 `secondary_mailbox`（二等信箱检查）派发）；
 7. `session.stop` 停止输入但不误取消已经进入 TTS 的输出；
 8. `session.reset` 清理 conversation、Shadow 和 speech 临时状态。
 
 `-NoWeb` 只用于后端调试，不能作为完整 Web 语音终端验收结果。
+
+## 二等信箱观察
+
+每个 episode 的运行快照包含 `secondary_mailbox`（二等信箱）计数：`pending_count`（待评估来源数）、`enqueued`（新版本入箱数）、`consumed_normal`（普通请求带出数）、`consumed_check`（二等请求消费数）、`dispatched`（二等请求派发数）和 `cleared_final`（最终静默清空数）。日志用 `SECONDARY_MAILBOX_ENQUEUED`、`SECONDARY_MAILBOX_CONSUMED`、`SECONDARY_MAILBOX_DISPATCHED` 和 `SECONDARY_MAILBOX_CLEARED_FINAL` 对齐这些计数，不记录进度正文。
+
+现场对照同一 episode 的 `dispatch_kind=secondary_mailbox`（二等派发类型）、普通请求带出的消费日志、`LLM_DISPATCHED`（模型请求派发）及 `SPEAK_ACCEPTED`（播报接纳）数量，并检查过期请求和最终静默交接。进度持续变化时最多每个 4 秒检查点派发一次；若普通请求已经带出更新，该检查点不重复派发。
 
 ## Shadow 验收
 

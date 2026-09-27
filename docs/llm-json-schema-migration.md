@@ -46,7 +46,7 @@ llm:
 4. 本地 action registry 和权限校验；
 5. 只有完整合法结果才允许进入 Agent/TTS。
 
-运行时保留一次有界协议恢复，用于空输出、非法 envelope/action 或因 `max_output_tokens` 导致的 `response.incomplete`。恢复请求必须保留原始 request kind（普通事件、`forced_poll`、`final_silence`、`kws_wake`），不能把静默检查改写成普通用户输入重处理。
+运行时保留一次有界协议恢复，用于空输出、非法 envelope/action 或因 `max_output_tokens` 导致的 `response.incomplete`。恢复请求必须保留原始 request kind（请求类型：普通事件、`secondary_mailbox` 二等信箱检查、`final_silence` 最终静默检查、`kws_wake` 唤醒确认），不能把系统检查改写成普通用户输入重处理。
 
 以下情况不消耗协议修复预算，也不请求模型“自我修复”：
 
