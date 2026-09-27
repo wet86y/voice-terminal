@@ -66,8 +66,8 @@ export interface ProductRuntimeSnapshot {
   input_owner: string
   reasoning_mode: ReasoningMode
   services: ServiceStatuses
-  /** CosyVoice Worker（本地语音工作进程）的非敏感运行状态。 */
-  tts_worker?: { state: 'stopped' | 'starting' | 'ready' | 'draining' | 'error'; message?: string | null; model_present?: boolean }
+  /** 兼容旧字段：归档后的本地 TTS（语音合成）工作进程始终为停止状态。 */
+  tts_worker?: { state: 'stopped' }
   latency: {
     complete?: boolean
     values?: Partial<LatencyValues>
