@@ -36,6 +36,9 @@ class SpeakerObservation:
     #: means the caller could not supply a VAD verdict and the worker fell back
     #: to its energy heuristic.
     speech_ratio: float | None = None
+    #: turn_speech_ms（整轮不重复人声时长，毫秒）：从本轮开始到当前观察窗末尾，
+    #: 按 VAD 区间并集累计；不同于 speech_ms（单窗人声时长），不会重复计入重叠窗。
+    turn_speech_ms: int | None = None
 
     def to_payload(self, *, include_embedding: bool = False) -> dict[str, Any]:
         value = asdict(self)

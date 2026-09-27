@@ -204,29 +204,25 @@ asr_worker:
 speaker:
   # Optional sidecar.  off | observe | filter
   mode: off
-  # Raw-cosine thresholds against the enrolled centroid.  The authorising
-  # score is one cosine between the turn's speech-weighted mean embedding and
-  # the centroid, so these are comparable to the numbers the settings-page
-  # "现场测试" reports.  Measured on the reference corpus: genuine p05 ≈ 0.86,
-  # impostor p95 ≈ 0.19 at a 2 s window, so 0.60/0.50 keeps a wide margin.
+  # confirm_threshold（确认阈值）和 continuity_threshold（连续保持阈值）使用
+  # 注册质心上的原始余弦分数。最终分数是整轮聚合向量与质心的余弦值；
+  # 现场测试使用相同口径。参考语料同人 p05≈0.86、异人 p95≈0.19，
+  # 但该语料不能替代真实用户校准。
   confirm_threshold: 0.60
   continuity_threshold: 0.50
-  # Windows are gated on the upstream VAD verdict: a window must contain at
-  # least min_speech_ms of speech and that speech must cover at least
-  # min_window_speech_ratio of the window before an embedding is extracted.
-  window_ms: 2000
-  step_ms: 500
+  # min_speech_ms（单窗最低人声时长）和 min_window_speech_ratio（单窗最低人声占比）
+  # 同时门控；必须满足后才会提取 embedding（说话人向量）。
+  window_ms: 2000 # 分析窗长度（毫秒）
+  step_ms: 500 # 相邻分析窗步进（毫秒）
   min_speech_ms: 700
   min_window_speech_ratio: 0.40
-  # A turn needs this much voiced speech before any identity decision is made;
-  # below it the turn stays "unknown" and keeps the fail-open passthrough.
-  # 2 s of voiced speech is roughly 2.5-3 s of wall time.  Raising it trades
-  # coverage (more short turns pass through) for fewer false accepts, which is
-  # the safe direction; text-independent verification APIs commonly require a
-  # 4 s minimum.
+  # min_turn_speech_ms（整轮最低不重复人声时长）：按 VAD 区间并集计数，
+  # 不累加重叠滑窗中重复的语音；低于门槛时状态为 "unknown"（未知）并直通。
+  # 2 s 的有效人声通常需要约 2.5-3 s 实际录音。提高该值会减少可判定的短语句，
+  # 但可降低误接受风险；
   min_turn_speech_ms: 2000
   wait_ms: 150
-  model_id: wespeaker-cnceleb-resnet34
+  model_id: wespeaker-cnceleb-resnet34 # 声纹嵌入模型标识
 
 speaker_worker:
   host: 127.0.0.1

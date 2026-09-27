@@ -4,12 +4,11 @@ import time
 
 
 class BidiTextMerger:
-    """Small time/size bounded merger for a provider with server-side breaks.
+    """Small time/size bounded merger for a text-in streaming TTS backend.
 
-    MiniMax Bidi performs sentence buffering itself.  The client therefore
-    sends short, ordered text frames instead of waiting for a local sentence
-    boundary.  Punctuation is preserved byte-for-byte; it is never inserted
-    or removed to make a frame reach the size limit.
+    The client sends short, ordered text frames instead of waiting for a local
+    sentence boundary. Punctuation is preserved byte-for-byte; it is never
+    inserted or removed to make a frame reach the size limit.
     """
 
     def __init__(self, *, max_chars: int = 128, max_wait_ms: int = 30) -> None:

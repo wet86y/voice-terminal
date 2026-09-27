@@ -62,9 +62,29 @@ config/speaker/probe.npy
 
 ```text
 窗口 2000ms，步进 500ms；窗口内有效语音 ≥ 700ms 且占比 ≥ 0.40 才提取 embedding
-turn_emb = normalize(Σ speech_msᵢ · normalize(embᵢ))
+turn_speech_ms = 截止当前窗口末尾的 VAD 语音区间并集时长（重叠窗口不重复累计）
+turn_emb = normalize(Σ window_speech_msᵢ · normalize(embᵢ))
 turn_score = cos(turn_emb, centroid)
 ```
+
+`window_speech_ms`（单窗有效人声时长）必须同时达到 700ms 和窗口占比门槛；对完整 2 秒窗口而言，实际至少需要 800ms。`turn_speech_ms`（整轮不重复人声时长）按 VAD 区间并集统计，不能把相邻重叠窗的时长直接相加。
+
+现场测试与实时 Worker（实时声纹工作进程）共用基础音频质量检查、单窗人声门槛和窗口占比门槛。现场测试回报字段说明：
+
+| 字段 | 中文说明 |
+| --- | --- |
+| `measured_speech_ms` | 整段测试由 VAD 测得的人声时长 |
+| `turn_speech_ms` | Worker（工作进程）随每个观察窗报告的整轮不重复人声时长 |
+| `candidate_window_count` | 按滑窗规则产生的候选窗口数 |
+| `eligible_window_count` | 通过单窗质量和人声门槛的窗口数 |
+| `window_gate_rejected_count` | 被单窗质量或人声门槛拒绝的窗口数 |
+| `window_quality_counts` | 按质量标签汇总的窗口计数 |
+| `window_diagnostics` | 每个窗口的人声时长、占比和质量标签 |
+| `minimum_window_speech_ms` | 单窗最低人声时长要求 |
+| `minimum_window_speech_ratio` | 单窗最低人声占比要求 |
+| `minimum_turn_speech_ms` | 整轮最低不重复人声时长要求 |
+
+`window_diagnostics`（逐窗诊断）的子字段说明：`index`（窗口序号）、`speech_ms`（窗口人声时长）、`speech_ratio`（窗口人声占比）、`quality`（质量标签：`ready` 就绪、`not_speech` 非语音占比不足、`insufficient_audio` 人声时长不足、`too_quiet` 电平过低、`clipped` 削波过多）。
 
 默认阈值：
 

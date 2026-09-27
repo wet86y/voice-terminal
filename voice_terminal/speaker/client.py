@@ -135,6 +135,16 @@ class SpeakerWorkerClient:
                                 or speech_ms < 0):
                             self._mark_degraded("Speaker Worker embedding 语音时长无效")
                             continue
+                        raw_turn_speech_ms = message.get("turn_speech_ms")
+                        if raw_turn_speech_ms is None:
+                            turn_speech_ms = None
+                        elif (isinstance(raw_turn_speech_ms, bool)
+                              or not isinstance(raw_turn_speech_ms, int)
+                              or raw_turn_speech_ms < 0):
+                            self._mark_degraded("Speaker Worker 整轮语音时长无效")
+                            continue
+                        else:
+                            turn_speech_ms = raw_turn_speech_ms
                         values = tuple(float(item) for item in embedding)
                         if any(not math.isfinite(item) for item in values):
                             self._mark_degraded("Speaker Worker embedding 包含无效数值")
@@ -179,6 +189,7 @@ class SpeakerWorkerClient:
                             timestamp=str(message.get("timestamp") or ""),
                             embedding=values,
                             speech_ratio=speech_ratio,
+                            turn_speech_ms=turn_speech_ms,
                         )
                     except (TypeError, ValueError, OverflowError):
                         self._mark_degraded("Speaker Worker embedding 解析失败")
@@ -414,10 +425,12 @@ class SpeakerWorkerClient:
             self.pending_finish.pop(key, None)
 
     async def close(self) -> None:
-        for task in (self.send_task, self.receive_task):
+        tasks = [task for task in (self.send_task, self.receive_task) if task is not None]
+        for task in tasks:
             if task is not None and not task.done():
                 task.cancel()
-        await asyncio.gather(self.send_task, self.receive_task, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self.send_task = self.receive_task = None
         socket, self.socket = self.socket, None
         if socket is not None:

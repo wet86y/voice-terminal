@@ -68,21 +68,82 @@ def speech_ms_for_pcm(pcm: bytes, *, sample_rate: int = 16000,
     detector the live chain runs.  Without one, no verdict is produced rather
     than falling back to a gain-dependent amplitude threshold.
     """
+    values, measured = speech_ms_for_windows(
+        pcm,
+        windows=[(0, len(pcm) // 2)],
+        sample_rate=sample_rate,
+        processor=processor,
+    )
+    return (values[0] if values else 0), measured
+
+
+def speech_ms_for_windows(pcm: bytes, *, windows: list[tuple[int, int]],
+                          sample_rate: int = 16000,
+                          processor: Any = None) -> tuple[list[int], bool]:
+    """Measure VAD（语音活动检测） time for each window in one sequential pass."""
+    ranges, measured = voiced_ranges_for_windows(
+        pcm, windows=windows, sample_rate=sample_rate, processor=processor,
+    )
+    durations = [
+        int(sum(end - start for start, end in window_ranges) * 1000 // sample_rate)
+        for window_ranges in ranges
+    ]
+    return durations, measured
+
+
+def voiced_ranges_for_windows(pcm: bytes, *, windows: list[tuple[int, int]],
+                              sample_rate: int = 16000,
+                              processor: Any = None) -> tuple[list[list[tuple[int, int]]], bool]:
+    """Return VAD（语音活动检测） ranges intersecting each window.
+
+    Ranges use sample offsets relative to the start of ``pcm``.  The VAD sees
+    every 10 ms frame once; adjacent voiced frames are merged before
+    intersection, so overlapping analysis windows can share exact ranges
+    without losing the non-overlapping turn duration.
+    """
     if processor is None or not getattr(processor, "available", False):
-        return 0, False
-    frame_bytes = max(2, sample_rate // 100 * 2)  # 10 ms of mono int16
-    voiced = 0
+        return [[] for _ in windows], False
+    frame_samples = max(1, sample_rate // 100)  # 10 ms of mono int16
+    frame_bytes = frame_samples * 2
+    voiced_ranges: list[tuple[int, int]] = []
     frames = 0
-    for offset in range(0, len(pcm) - frame_bytes + 1, frame_bytes):
-        processor.process(pcm[offset:offset + frame_bytes])
-        verdict = getattr(processor, "last_voice_activity", None)
-        if verdict is not None:
+    processor.reset()
+    try:
+        for offset in range(0, len(pcm) - frame_bytes + 1, frame_bytes):
+            processor.process(pcm[offset:offset + frame_bytes])
+            verdict = getattr(processor, "last_voice_activity", None)
+            if verdict is None:
+                continue
             frames += 1
-            if verdict:
-                voiced += 1
+            if not verdict:
+                continue
+            frame_start = offset // 2
+            frame_end = frame_start + frame_samples
+            if voiced_ranges and frame_start <= voiced_ranges[-1][1]:
+                previous_start, previous_end = voiced_ranges[-1]
+                voiced_ranges[-1] = (previous_start, max(previous_end, frame_end))
+            else:
+                voiced_ranges.append((frame_start, frame_end))
+    finally:
+        processor.reset()
     if not frames:
-        return 0, False
-    return int(voiced * 1000 // 100), True
+        return [[] for _ in windows], False
+
+    per_window: list[list[tuple[int, int]]] = []
+    for window_start, window_end in windows:
+        intersections: list[tuple[int, int]] = []
+        for speech_start, speech_end in voiced_ranges:
+            start = max(window_start, speech_start)
+            end = min(window_end, speech_end)
+            if end <= start:
+                continue
+            if intersections and start <= intersections[-1][1]:
+                previous_start, previous_end = intersections[-1]
+                intersections[-1] = (previous_start, max(previous_end, end))
+            else:
+                intersections.append((start, end))
+        per_window.append(intersections)
+    return per_window, True
 
 
 def capture_segment(*, sample_rate: int = 16000, channels: int = 1,

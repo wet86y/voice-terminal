@@ -18,14 +18,17 @@ config/model-registry.json
 config/product-settings.json
 config/continuity-state.json
 config/wake-tasks.json
+config/dsh-task-deliveries.json
+config/voice-mailbox.json
 config/speaker/
 *.part
 
 # Runtime artifacts (always local; do not version generated logs or reports)
 /logs/
 /reports/
-/.runtime/dsh/
-/.runtime/cosyvoice/
+/.runtime/
+# Local scratch: one-off analysis scripts and timeline dumps from debugging
+/workspace/
 *.log
 
 # IDE / OS files

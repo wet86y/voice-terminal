@@ -36,7 +36,7 @@ class SpeakerStateConfig:
 
 @dataclass(frozen=True)
 class TurnAggregate:
-    """Speech-weighted aggregation of one turn's eligible windows."""
+    """单轮聚合结果：窗口分数按语音加权，整轮语音时长不重复计数。"""
 
     embedding: tuple[float, ...] | None
     score: float
@@ -145,14 +145,26 @@ class SpeakerStateMachine:
     def _build_aggregate(self, eligible: list[SpeakerObservation]) -> TurnAggregate | None:
         if not eligible:
             return None
-        total_speech = sum(self._speech_ms(item) for item in eligible)
-        weight_total = float(total_speech) if total_speech > 0 else float(len(eligible))
+        # The worker's cumulative turn duration uses the union of VAD frames,
+        # so adjacent windows cannot count the same audio several times. Keep
+        # the score-normalization weight separate from this decision gate.
+        turn_speech_values = [
+            max(0, int(item.turn_speech_ms))
+            for item in self.observations
+            if item.turn_speech_ms is not None
+        ]
+        total_speech = (
+            max(turn_speech_values) if turn_speech_values
+            else sum(self._speech_ms(item) for item in eligible)
+        )
+        window_weight_total = sum(self._speech_ms(item) for item in eligible)
+        weight_total = float(window_weight_total) if window_weight_total > 0 else float(len(eligible))
         weighted_score = 0.0
         weighted_vectors: list[Any] = []
         vector_weight = 0.0
         dimension: int | None = None
         for item in eligible:
-            weight = float(self._speech_ms(item)) if total_speech > 0 else 1.0
+            weight = float(self._speech_ms(item)) if window_weight_total > 0 else 1.0
             weighted_score += max(-1.0, min(1.0, float(item.similarity))) * weight
             if np is None or not item.embedding:
                 continue
