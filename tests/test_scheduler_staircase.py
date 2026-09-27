@@ -1294,3 +1294,48 @@ def test_user_speech_onset_withdraws_only_unplayed_system_check_candidate():
             await asyncio.gather(runtime.voice_activation_task, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_arm_silence_window_arms_only_an_idle_ladder():
+    """A model-initiated KWS→ASR rotation gets the final-silence ladder."""
+
+    async def scenario():
+        runtime = _speaking_runtime(_BlockingProvider())
+        generation = await runtime.arm_silence_window("wake-task")
+        assert generation == runtime.scheduler.generation
+        assert runtime.scheduler.armed is True
+        assert runtime.scheduler.anchor_turn_id == "wake-task"
+        assert runtime.scheduler.anchor_source == "model_speech"
+
+        # An armed ladder owns the handover: no second window may be stacked.
+        assert await runtime.arm_silence_window("wake-task") is None
+        assert runtime.scheduler.generation == generation
+
+        # The final window carries exactly the generation the settlement guard
+        # compares against, so a superseded ladder can never rearm KWS.
+        anchor = runtime.scheduler.anchor_monotonic
+        at = anchor + runtime.scheduler.FINAL_WINDOW * runtime.scheduler.interval
+        runtime.scheduler.advance(at)
+        candidate = runtime.scheduler.forced_due(now=at)
+        assert candidate["prompt_kind"] == "final_silence"
+        assert candidate["generation"] == generation
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_arm_silence_window_leaves_a_user_ladder_alone():
+    """KWS sessions defer the user ladder until its playback boundary."""
+
+    async def scenario():
+        runtime = _speaking_runtime(
+            _BlockingProvider(), defer_silence_until_output=True,
+        )
+        await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-a", text="你好")
+        assert runtime.scheduler.is_deferred() is True
+
+        assert await runtime.arm_silence_window("wake-task") is None
+        assert runtime.scheduler.armed is False, "延迟中的用户梯子不得被替换"
+        await runtime.stop()
+
+    asyncio.run(scenario())

@@ -404,10 +404,14 @@ class RealtimeController(SpeechPipeline, InputController):
             return
         await self._state_event(TerminalState.IDLE, listening=True)
 
-    async def activate_asr_for_model_speech(self) -> None:
-        """Rotate KWS→ASR when a model speech transaction is accepted."""
+    async def activate_asr_for_model_speech(self) -> bool:
+        """Rotate KWS→ASR when a model speech transaction is accepted.
+
+        Returns ``True`` only when this call really moved input ownership, so
+        the caller can arm the matching silence window.
+        """
         if not self.wake_always_on or not self.state.listening or self.state.input_owner != "kws":
-            return
+            return False
         generation = self._activation_generation
         try:
             if self.asr is None:
@@ -420,9 +424,9 @@ class RealtimeController(SpeechPipeline, InputController):
         except Exception as exc:
             self.state.set_service("asr", "ERROR")
             await self._error("ASR_WORKER_NOT_READY", str(exc), recoverable=True)
-            return
+            return False
         if not self.state.listening or self.state.input_owner != "kws" or generation != self._activation_generation:
-            return
+            return False
         self._activation_generation += 1
         if self.kws is not None:
             self.kws.reset()
@@ -431,6 +435,7 @@ class RealtimeController(SpeechPipeline, InputController):
         self.state.set_service("kws", "READY")
         self.state.set_service("asr", "RUNNING")
         await self._state_event(TerminalState.IDLE, listening=True)
+        return True
 
     async def _return_to_kws(self, generation: int | None = None) -> bool:
         if (not self.wake_always_on or not self.state.listening

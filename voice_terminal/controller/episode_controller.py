@@ -69,17 +69,26 @@ class EpisodeController(RealtimeController):
     async def _on_model_speech_accepted(self) -> None:
         if callable(self.on_user_activity):
             self.on_user_activity()
-        await self.activate_asr_for_model_speech()
+        if await self.activate_asr_for_model_speech():
+            # A model-initiated speech (scheduled/DSH wake task) moved the
+            # microphone from KWS standby to ASR.  Arm the same silence window
+            # a wake word arms, so ownership returns to KWS only after the
+            # configured final silence has really elapsed.
+            await self.episode.arm_silence_window()
 
     async def _final_system_check_settled(self, context: dict) -> None:
         scheduler_generation = context.get("generation")
+        if not isinstance(scheduler_generation, int):
+            # Only an elapsed silence ladder may hand input ownership back to
+            # KWS.  A callback that cannot name its ladder generation cannot
+            # prove the configured window expired, so it must not rearm KWS.
+            return
         activation_generation = self._activation_generation
 
         async def return_when_input_is_idle() -> None:
             while (self.state.listening and self.state.input_owner == "asr"
                    and activation_generation == self._activation_generation):
-                if (isinstance(scheduler_generation, int)
-                        and scheduler_generation != self.episode.scheduler.generation):
+                if scheduler_generation != self.episode.scheduler.generation:
                     return
                 output = getattr(self, "output", None)
                 output_busy = bool(
@@ -128,8 +137,8 @@ class EpisodeController(RealtimeController):
         if kind == "agent.episode":
             self.state.agent = dict(payload)
         elif kind == "speech.completed":
-            if self.wake_always_on and self.state.input_owner == "asr":
-                await self._final_system_check_settled({})
+            # Speech settlement never moves input ownership: only a settled
+            # silence ladder may rearm KWS.  See _final_system_check_settled.
             # The session ledger is the only durable conversational memory.
             # A speech record enters it only after the player reports what the
             # user actually heard.
@@ -174,7 +183,9 @@ class EpisodeController(RealtimeController):
                     speech_id=str(payload.get("speech_id") or "") or None,
                     latency=payload.get("latency") if isinstance(payload.get("latency"), dict) else None,
                 )
-            if callable(self.on_silence_anchor):
+            # The continuity anchor callback is optional, exactly like every
+            # other observer this path consults.
+            if callable(getattr(self, "on_silence_anchor", None)):
                 self.on_silence_anchor(time.time())
         elif kind == "turn.latency":
             latency = payload.get("latency")
