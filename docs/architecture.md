@@ -52,9 +52,18 @@ committed_prefix + current_clause + prefetched_clause + revisable_tail
 
 `continuation_mode` 为：
 
-- `rewrite_tail`：只允许改写尚未发送的尾巴；
+- `rewrite_tail`：只允许改写尚未发送的尾巴，此时模型用 `state=revision` 只输出新尾巴，本地把锁定前缀与新尾巴拼成完整文本；
 - `append_only`：保留原计划后追加；
 - `none`：不把上一轮内容当作当前轮续写目标。
+
+speak 决策状态为 `speak`、`revision`、`cancel`、`wait`：
+
+- `speak`：`text` 是完整文本，本地只合成尚未交付的那一部分；
+- `revision`：`text` 只是新的尾巴，仅在 `rewrite_tail` 可用；本地负责拼接，任何情况下都不会重播已交付内容；
+- `cancel`：`text` 为空表示立即停止；`text` 非空表示停止并替换，替换文本直接播给用户；
+- `wait`：不改变语音队列。
+
+队列为空时，`runtime.speak.delivery.heard_text` 是最近一次确认听到的前沿；被打断的投递会标记为不可续写（`delivered_resumable=false`），只允许作为"已听过前缀"的重复基线。
 
 ### Shadow 平面
 

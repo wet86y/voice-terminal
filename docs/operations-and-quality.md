@@ -117,8 +117,9 @@ python -m unittest discover -s tests -v
 1. `/health` 中的 `startup_errors`、`services`、`input_owner`、KWS 和 speaker 状态；
 2. `audio.capture_progress`、`audio.player_first_pcm_submitted`、`audio.player_drained`；
 3. `speech_id`、`turn_id`、`owner_scope`、`continuation_mode` 和 speech 结算事件；
-4. LLM context audit 中的 `conversation_id + request_id + turn_id + wire_sha256`；
-5. `logs/`、`reports/` 的本地诊断产物。
+4. 重复播报类问题按这些锚点定位：`SPEECH_PREFIX_RECONCILED`（`baseline_chars` 是否在事务换头时缩短）、`SPEECH_REVISED`（`path=rewrite|append|begin`）、`SPEECH_REVISION_NOOP`、`SPEECH_TAIL_REWRITE_UNAVAILABLE`、`SPEAK_CANCELLED_WITH_REPLACEMENT`、`SPEECH_IDENTICAL_IGNORED`，以及 `LLM_SPEAK_CONTEXT` 的 `heard_chars`；
+5. LLM context audit 中的 `conversation_id + request_id + turn_id + wire_sha256`；
+6. `logs/`、`reports/` 的本地诊断产物。
 
 不要把本地日志路径或一次性 probe 结果写进当前规范文档。日志可能包含真实会话内容，不能提交到仓库；API key 和 Authorization header 永远不得出现在日志中。
 

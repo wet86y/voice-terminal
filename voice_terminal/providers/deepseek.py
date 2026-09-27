@@ -259,7 +259,9 @@ class DeepSeekClient:
             })
         compatibility = (
             "Provider schema compatibility: every declared property is required. "
-            "For wait/cancel set speak.text to the empty string. "
+            "For wait set speak.text to the empty string; for cancel an empty text "
+            "stops output and a non-empty text stops and replaces it; for revision "
+            "write only the new tail. "
             "For action arguments, set fields irrelevant to that action to empty/neutral values; "
             "the local runtime will retain only that action's declared fields."
         )
