@@ -1,25 +1,33 @@
-"""Transaction-bound provider selection owned by the Voice Server."""
+"""Transaction-bound TTS provider compatibility layer.
+
+The product currently uses the remote provider directly. This adapter keeps
+the transaction binding boundary available for a future local provider without
+starting or importing any local synthesis runtime.
+"""
 
 from __future__ import annotations
 
 import asyncio
 from typing import Any
 
-from .cosyvoice_runtime import CosyVoiceTtsClient, CosyVoiceWorkerManager
-
 
 class TtsBackendRouter:
-    def __init__(self, *, remote: Any | None, worker: CosyVoiceWorkerManager, backend: str) -> None:
+    def __init__(self, *, remote: Any | None, local: Any | None = None,
+                 backend: str = "minimax") -> None:
+        if backend not in {"minimax", "cosyvoice"}:
+            raise ValueError("tts.backend 仅接受 minimax 或 cosyvoice。")
+        if backend == "cosyvoice" and local is None:
+            raise ValueError("本地 TTS 后端尚未接入。")
         self.remote = remote
-        self.local = CosyVoiceTtsClient(worker)
-        self.worker = worker
+        self.local = local
         self.backend = backend
         self._local_leases = 0
+        self._local_ready = backend == "cosyvoice"
         self._switch_lock = asyncio.Lock()
 
     @property
     def transport(self) -> str:
-        return getattr(self.current_client(), "transport", "worker")
+        return getattr(self.current_client(), "transport", "websocket")
 
     def current_client(self) -> Any | None:
         return self.local if self.backend == "cosyvoice" else self.remote
@@ -36,25 +44,29 @@ class TtsBackendRouter:
             return
         self._local_leases = max(0, self._local_leases - 1)
         if self._local_leases == 0 and self.backend != "cosyvoice":
-            asyncio.create_task(self._stop_after_drain(), name="cosyvoice-drain-stop")
+            asyncio.create_task(self._stop_after_drain(), name="local-tts-drain-stop")
 
     async def _stop_after_drain(self) -> None:
         async with self._switch_lock:
-            if self._local_leases == 0 and self.backend != "cosyvoice":
-                await self.worker.stop()
+            if (self._local_leases == 0 and self.backend != "cosyvoice"
+                    and self.local is not None and self._local_ready):
+                await self.local.close()
+                self._local_ready = False
 
     async def switch(self, backend: str) -> None:
         if backend not in {"minimax", "cosyvoice"}:
             raise ValueError("tts.backend 仅接受 minimax 或 cosyvoice。")
         async with self._switch_lock:
             if backend == "cosyvoice":
-                await self.worker.ensure_ready()
-                self.worker.state = "ready"
+                if self.local is None:
+                    raise ValueError("本地 TTS 后端尚未接入。")
+                await self.local.ensure_ready()
+                self._local_ready = True
             self.backend = backend
-            if backend == "minimax" and self._local_leases == 0:
-                await self.worker.stop()
-            elif backend == "minimax":
-                self.worker.state = "draining"
+            if (backend == "minimax" and self.local is not None
+                    and self._local_leases == 0 and self._local_ready):
+                await self.local.close()
+                self._local_ready = False
 
     async def prewarm(self, *, turn_id: str | None = None) -> dict[str, Any]:
         if self.backend == "minimax" and self.remote is not None:
@@ -71,4 +83,7 @@ class TtsBackendRouter:
 
     async def shutdown(self) -> None:
         await self.close()
-        await self.worker.stop()
+        async with self._switch_lock:
+            if self.local is not None and self._local_ready:
+                await self.local.close()
+                self._local_ready = False

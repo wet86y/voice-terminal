@@ -8,6 +8,8 @@ TTS API（在线语音接口）未配置或不可用时，服务会报告错误�
 
 ## 只读状态
 
-`GET /api/v1/tts/status` 返回固定的 `backend: "minimax"`（当前语音后端）及服务诊断状态。
+`GET /api/v1/tts/status` 返回固定的 `backend: "minimax"`（当前语音后端）和 `worker: {"state": "stopped"}`（兼容旧客户端的已停止状态）。产品快照中的 `tts_worker`（本地语音工作进程状态）也固定为已停止。历史 CosyVoice（本地语音合成）实现已归档，当前运行时不创建本地合成工作进程。
+
+`TtsBackendRouter`（语音后端兼容路由）与 `EpisodeSpeechOutput`（语音事务输出）的 `bind/release`（绑定／释放）接口仍保留，供本地 TTS 调试完成后接入。当前产品启动和设置接口不会启用该路由的本地分支。
 
 模型分配接口保留 `tts_profile_id`（当前 TTS 语音配置 ID）用于读取和恢复现有配置。请求可以省略该字段以沿用已保存的配置；尝试更换时会被拒绝。

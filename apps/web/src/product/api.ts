@@ -80,7 +80,7 @@ export const productApi = {
   /** 保存本地模型设备偏好；返回值会标明需要重启应用。 */
   saveCompute: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/compute', jsonBody(value)),
   /** 读取 TTS（语音合成）固定在线 API（程序接口）的只读状态。 */
-  ttsStatus: () => request<{ backend: 'minimax'; worker: { state: 'stopped' | 'starting' | 'ready' | 'draining' | 'error'; message?: string | null; model_present?: boolean } }>('/api/v1/tts/status'),
+  ttsStatus: () => request<{ backend: 'minimax'; worker: { state: 'stopped' } }>('/api/v1/tts/status'),
   speakerStatus: () => request<Record<string, unknown>>('/api/v1/speaker/status'),
   speakerProfile: () => request<Record<string, unknown>>('/api/v1/speaker/profile'),
   startSpeakerEnrollment: () => request<Record<string, unknown>>('/api/v1/speaker/enrollment/start', { method: 'POST' }),

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import productAppSource from './ProductApp.vue?raw'
 import productAdapterSource from './useProductAdapter.ts?raw'
+import normalizationSource from './normalization.ts?raw'
 import productApiSource from './api.ts?raw'
 import uiDemoAppSource from '../ui-demo/UiDemoApp.vue?raw'
 import { readFileSync } from 'node:fs'
@@ -91,7 +92,7 @@ describe('multiple wake phrases', () => {
   })
 
   it('posts the phrase list and keeps the cap in one place', () => {
-    expect(productAdapterSource).toContain('export const MAX_WAKE_KEYWORDS = 5')
+    expect(normalizationSource).toContain('export const MAX_WAKE_KEYWORDS = 5')
     expect(productAdapterSource).toContain('keywords,')
     expect(productAdapterSource).toContain('wakeForm.keywords.length >= MAX_WAKE_KEYWORDS')
     expect(productAdapterSource).not.toContain('keyword: wakeForm.keyword,')

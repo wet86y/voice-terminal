@@ -1,0 +1,241 @@
+"""Projection and revision of a speech transaction frontier."""
+from __future__ import annotations
+
+
+class SpeechFrontierMixin:
+    @property
+    def speak_snapshot(self):
+        h = (self.handle if self.handle and not self.handle.reason and not self.handle.task.done() else None)
+        h = h or next((item for item in self._pending if not item.reason and not item.task.done()), None)
+        if h is None:
+            value = {"queue_status": "empty", "text_only_queue": True}
+            self._add_delivered_frontier(value)
+            return value
+        if h.workspace.playback_started:
+            status = "speaking"
+        elif h.state == "SUSPENDED":
+            status = "suspended"
+        else:
+            status = "queued"
+        text, locked_chars = self._accumulated_text(h)
+        value = {"queue_status": status, "text_only_queue": True, "text": text,
+                 "speech_id": h.speech_id, "output_generation": h.workspace.generation,
+                 "conversation_id": h.identity[0], "turn_id": h.turn_id,
+                 "emotion": h.emotion_requested,
+                 # Admission frontiers.  ``text`` stays the accepted response;
+                 # only ``sent_chars`` delimits what can no longer be replaced.
+                 # A handle shape without them is legacy/collaborator input:
+                 # report the whole text as already sent, which reproduces the
+                 # previous strict behaviour exactly.
+                 "sent_chars": locked_chars + getattr(h, "sent_chars", len(h.text)),
+                 "rewritable": bool(getattr(h, "rewritable", False))}
+        self._add_playback_frontiers(value, h)
+        self._add_model_text_parts(value, h, locked_chars=locked_chars)
+        return value
+
+    def _add_delivered_frontier(self, value):
+        """Expose the settled frontier while no transaction is active.
+
+        The queue-empty snapshot carries the two halves of the delivery fact:
+        ``delivered_text`` is what this turn already committed to playback and
+        ``delivery.heard_text`` is what the listener actually heard.  Without
+        them a new decision has no baseline and a repeated answer replays from
+        its first character.
+        """
+
+        frontier = getattr(self, "delivered", None)
+        frontier = frontier if isinstance(frontier, dict) else {}
+        text = str(frontier.get("text") or "")
+        turn_id = frontier.get("turn_id")
+        delivery = self._delivery_fact()
+        if delivery is not None:
+            value["delivery"] = delivery
+        # An interrupted answer is a deliberate user barge-in, so its text is
+        # never *resumed*: it may only serve as a repeat baseline, never as a
+        # continuation target that could suppress new content.
+        interrupted = (delivery is not None
+                       and delivery.get("status") == "partial"
+                       and delivery.get("termination") in {"interrupted", "replaced"})
+        if text and isinstance(turn_id, str) and turn_id:
+            value["delivered_text"] = text
+            value["delivered_turn_id"] = turn_id
+            value["delivered_resumable"] = not interrupted
+
+    def _delivery_fact(self):
+        """Return the latest delivered-and-heard fact without any runtime id.
+
+        This is the queue-empty half of the delivery frontier: when nothing is
+        active, the only honest answer to "where does the speech continue" is
+        what the listener already heard.
+        """
+
+        item = getattr(self, "last_delivery", None)
+        item = item if isinstance(item, dict) else None
+        if not item:
+            return None
+        heard = str(item.get("heard_text") or "")
+        if not heard:
+            return None
+        return {"heard_text": heard,
+                "status": item.get("status"),
+                "termination": item.get("termination")}
+
+    def _accumulated_text(self, h):
+        """Return ``(text, locked_chars)`` for the model-visible transaction.
+
+        ``text`` is the accepted response with the turn's already-delivered
+        frontier restored in front of the active handle, and ``locked_chars``
+        is how much of it is irreversible.  A successor handle starts *after*
+        the frontier, so the two halves are concatenated rather than compared;
+        a handle that already carries the cumulative text is left alone.
+        """
+
+        handle_text = str(getattr(h, "text", "") or "")
+        frontier = getattr(self, "delivered", None)
+        frontier = frontier if isinstance(frontier, dict) else {}
+        prefix = str(frontier.get("text") or "")
+        if not prefix or not h.turn_id or frontier.get("turn_id") != h.turn_id:
+            return handle_text, 0
+        if not handle_text or handle_text == prefix:
+            return prefix, len(prefix)
+        if handle_text.startswith(prefix):
+            # The handle already carries the whole cumulative text.
+            return handle_text, len(prefix)
+        overlap = self._frontier_overlap(prefix, handle_text)
+        if overlap is not None:
+            return prefix + handle_text[overlap:], len(prefix)
+        # A successor handle normally begins exactly where the frontier ends.
+        return prefix + handle_text, len(prefix)
+
+    @staticmethod
+    def _frontier_overlap(prefix, handle_text):
+        """Return how much of ``handle_text`` the delivered frontier covers.
+
+        The frontier is a concatenation of earlier transactions, so a handle is
+        cumulative when it starts anywhere near the end of it.  ``None`` means
+        no overlap was found and the caller treats the handle as new text.
+        """
+
+        for start in range(min(len(prefix), 8), 0, -1):
+            if handle_text.startswith(prefix[start:]):
+                return len(prefix) - start
+        return None
+
+    def _add_playback_frontiers(self, value, h):
+        """Attach playback position facts used for diagnostics and tuning."""
+
+        workspace = getattr(h, "workspace", None)
+        playback_key = getattr(workspace, "playback_key", None)
+        player = getattr(self, "player", None)
+        if player is None or playback_key is None:
+            return
+        try:
+            current = player.progress(playback_key)
+        except Exception:
+            return
+        bytes_per_second = player.sample_rate * player.channels * 2
+        received = int(getattr(getattr(h, "tts_session", None), "received_bytes", 0) or 0)
+        value["played_ms"] = int(current.get("output_estimated_ms") or 0)
+        value["synthesized_ms"] = (
+            int(received * 1000 / bytes_per_second) if bytes_per_second and received else 0
+        )
+
+    def _add_model_text_parts(self, value, h, *, locked_chars=0):
+        """Attach one non-overlapping semantic text partition for projection.
+
+        The raw snapshot keeps its local execution fields.  The Agent later
+        selects only these text parts plus ownership/authority for the model,
+        so playback counters and transaction identifiers never cross the
+        request-tail boundary.
+        """
+
+        text = str(value.get("text") or "")
+        handle_text = str(getattr(h, "text", "") or "")
+        state = getattr(h, "admission", None)
+        if locked_chars > 0 and locked_chars > len(handle_text):
+            # The locked frontier spans earlier transactions of this turn.  The
+            # active handle only owns what comes after it, so the clause split
+            # has nothing left to describe: everything already sent stays in
+            # ``committed_prefix`` and the whole handle text is revisable.
+            prefix = text[:locked_chars]
+            value["_model_text_parts"] = {
+                "committed_prefix": prefix,
+                "current_clause": "",
+                "prefetched_clause": "",
+                "revisable_tail": text[len(prefix):],
+            }
+            value["_model_text_parts_valid"] = True
+            return
+        if state is None:
+            value["_model_text_parts"] = {
+                "committed_prefix": text,
+                "current_clause": "",
+                "prefetched_clause": "",
+                "revisable_tail": "",
+            }
+            value["_model_text_parts_valid"] = True
+            return
+        player = getattr(self, "player", None)
+        output_estimated_ms = int(value.get("played_ms") or 0)
+        bytes_per_second = 0
+        if player is not None:
+            bytes_per_second = int(player.sample_rate * player.channels * 2)
+        parts, valid = state.model_text_parts(
+            h.text,
+            output_estimated_ms=output_estimated_ms,
+            bytes_per_second=bytes_per_second,
+        )
+        if locked_chars > 0:
+            # Shift the split's boundary by the restored frontier so the four
+            # parts still concatenate to the snapshot's accepted text.
+            prefix = text[:locked_chars]
+            parts = {
+                "committed_prefix": prefix + parts["committed_prefix"],
+                "current_clause": parts["current_clause"],
+                "prefetched_clause": parts["prefetched_clause"],
+                "revisable_tail": parts["revisable_tail"],
+            }
+            valid = valid and "".join(parts.values()) == text
+        value["_model_text_parts"] = parts
+        value["_model_text_parts_valid"] = valid
+
+    async def rewrite_unsent(self, identity, turn_id, *, speech_id, text):
+        """Replace a live transaction's not-yet-synthesised tail in place.
+
+        This is the third output primitive, between ``append_successor`` (which
+        waits behind audible playback) and ``replace_current`` (which stops
+        it).  It is valid only while the provider has not yet received the
+        tail: the already-sent prefix stays audible, nothing is cancelled, and
+        the transaction keeps its speech id, generation and playback key.
+
+        ``text`` is the **new tail only**, never the complete answer: the
+        caller no longer has to reproduce the locked prefix, so no string
+        comparison decides the model's intent any more.  The prefix is read
+        here from the transaction's own irreversible frontier, which means a
+        racing ``sent_chars`` advance can never splice the wrong offset.
+        ``None`` means the replacement window has closed and the caller must
+        degrade to a successor transaction or a fresh one.
+        """
+
+        h = self.handle
+        if h is None or h.speech_id != speech_id or h.reason or h.task.done():
+            return None
+        state = h.admission
+        if state is None or not state.rewritable or not h.finished:
+            return None
+        baseline = h.text[:state.sent_chars]
+        suffix = text
+        dropped = state.replace_unsent(suffix)
+        if dropped < 0:
+            return None
+        h.text = baseline + suffix
+        await self.runtime.emit("speech.tail_rewritten", {
+            "speech_id": h.speech_id, "conversation_id": h.identity[0],
+            "turn_id": h.turn_id,
+            "output_generation": h.workspace.generation,
+            "sent_chars": state.sent_chars,
+            "dropped_chars": dropped, "staged_chars": len(suffix),
+            "cumulative_chars": len(h.text),
+            "provider": h.tts_backend,
+        })
+        return h

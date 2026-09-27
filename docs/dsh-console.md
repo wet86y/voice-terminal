@@ -13,9 +13,11 @@ Web RPC，或启动第二个长期持有同一 Session 的 DSH 进程。
 ## 安装与漂移校验
 
 ```powershell
-.\scripts\setup-dsh.ps1
-.\scripts\setup-dsh.ps1 -ValidateOnly
+pwsh -NoProfile -File .\scripts\setup-dsh.ps1
+pwsh -NoProfile -File .\scripts\setup-dsh.ps1 -ValidateOnly
 ```
+
+脚本使用 UTF-8（统一字符编码）源码，须由 PowerShell 7 的 `pwsh` 运行。修改 Bridge（集成桥接）的构建输入后，先重建产物、运行 `-ValidateOnly`（仅校验模式），再重启 Voice Server（语音服务）；否则运行时会因构建指纹漂移而拒绝启动 DSH。
 
 setup 会验证固定 source/tag/commit、Node、pnpm 和 CLI，构建 TypeScript Bridge Bundle（插件运行包）、
 Wake Tasks Bundle（唤醒任务插件运行包）与正式 Shadow preset Bundle（Shadow 预设功能包），
@@ -47,7 +49,7 @@ DSH Web Host（网页服务）固定监听 `127.0.0.1:3081`；直接访问该端
 `@voice-terminal/dsh-shadow-bridge: pending`（插件等待服务），先确认 DSH 设置页服务已经就绪，再执行以下校验：
 
 ```powershell
-.\scripts\setup-dsh.ps1 -ValidateOnly
+pwsh -NoProfile -File .\scripts\setup-dsh.ps1 -ValidateOnly
 ```
 
 该命令确认 Node Bundle（Node.js 插件运行包）和浏览器插件页与锁定版本一致。v0.1.7-rc.2 使用 `configForms`（设置表单服务）；旧版

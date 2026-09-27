@@ -5,8 +5,8 @@ Voice Terminal 使用的 DeepSeek Harness（DSH，DeepSeek 开发框架）固定
 `477b4f420553e8a52c2fbccc464d7561b239c443`。升级必须显式更新锁定文件、许可证快照和回归检查，
 不追踪浮动版本。
 
-运行 `scripts/setup-dsh.ps1` 安装或修复项目运行时，使用
-`scripts/setup-dsh.ps1 -ValidateOnly` 检查安装状态。官方源码和项目专属 DSH_HOME（DSH 数据目录）
+使用 PowerShell 7 的 `pwsh -NoProfile -File scripts/setup-dsh.ps1` 安装或修复项目运行时，使用
+`pwsh -NoProfile -File scripts/setup-dsh.ps1 -ValidateOnly` 检查安装状态。官方源码和项目专属 DSH_HOME（DSH 数据目录）
 位于 Git 忽略的 `.runtime/dsh/`；该数据目录与用户级 `~/.dsh` 隔离。升级时保留项目设置和会话数据，
 并按安装脚本流程备份后再启动新版本。
 

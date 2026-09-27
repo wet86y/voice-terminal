@@ -20,7 +20,7 @@ SessionLedger ──> LLMContextProjector ──> 主 LLM 请求
 
 - `SessionRuntime`：创建和关闭服务资源，管理 session、设置、KWS、Shadow 和 provider。
 - `EpisodeController`：拥有一次语音 episode 的输入、调度、TTS 和 reset 语义。
-- `AgentEpisodeRuntime`：维护 400ms 单飞调度、LLM 请求、动作校验和思考续请求。
+- `AgentEpisodeRuntime`：拥有唯一活动 LLM 请求和调度循环；确定性时钟、提示文本和流式语音准入由内部协作模块实现。
 - `EpisodeSpeechOutput`：维护 speak transaction、发送前沿、TTS 分段、播放和 delivery 结算。
 - `SessionLedger`：记录用户输入、已传达 assistant 文本、有效 refinement、工具结果和有语义影响的打断。
 - `ShadowRuntime`：每个 session 一个，异步执行只读工具和状态观察，不拥有语音控制权。
@@ -129,9 +129,9 @@ none → kws standby → asr active → kws standby → none
 
 | 能力 | 主要位置 |
 | --- | --- |
-| session、HTTP、WebSocket、产品设置 | `voice_terminal/server/websocket.py`、`voice_terminal/server/product.py` |
-| 主 Agent 与调度 | `voice_terminal/agent/episode.py`、`voice_terminal/controller/episode_controller.py` |
-| TTS、播放和 delivery | `voice_terminal/controller/episode_output.py`、`voice_terminal/providers/` |
+| session、HTTP、WebSocket、产品设置 | `voice_terminal/server/websocket.py`、`voice_terminal/server/http_api.py`、`voice_terminal/server/speaker_runtime.py`、`voice_terminal/server/product.py` |
+| 主 Agent 与调度 | `voice_terminal/agent/episode.py`、`voice_terminal/agent/scheduler.py`、`voice_terminal/agent/context_builder.py`、`voice_terminal/agent/decision_application.py`、`voice_terminal/agent/streamed_speech.py`、`voice_terminal/controller/episode_controller.py` |
+| TTS、播放和 delivery | `voice_terminal/controller/episode_output.py`、`voice_terminal/controller/speech_frontier.py`、`voice_terminal/controller/speech_pipeline.py`、`voice_terminal/controller/speech_admission.py`、`voice_terminal/providers/` |
 | 会话账本和上下文 | `voice_terminal/session/ledger.py`、`voice_terminal/session/context.py` |
 | Shadow 合约、上下文、工具和 provider | `voice_terminal/shadow_agent/` |
 | Product UI 与适配器 | `apps/web/src/product/` |
@@ -140,3 +140,19 @@ none → kws standby → asr active → kws standby → none
 ## 变更要求
 
 修改跨模块能力时，先明确唯一 owner，再补行为测试和协议文档。不得通过复制旧实现、增加第二个调度循环或让前端猜测后端状态来修复边界问题。
+
+文件超过约 800 行或方法超过约 150 行时，审查是否混合了可独立描述的职责；行数是审查提醒，不是强制拆分条件。迁移代码时保留既有导入入口，逐批对照事件、模型上下文和语音交付行为。
+
+`_step`（单次决策执行方法）与 `_play_stream`（流式播放方法）仍较长，但剩余流程分别属于一次模型请求和一次语音事务，且共享严格排序的可变状态。本轮到此结束，不因行数继续拆分。只有具体改动证明职责混合、逻辑重复或测试难以隔离时，才针对该边界迁移；届时须对照事件顺序、取消结果及已发送／已听到边界。
+
+当前职责与重复实现核对：
+
+| 区域 | 状态归属与复用边界 |
+| --- | --- |
+| 主决策 | `AgentEpisodeRuntime` 仍是唯一调度和请求 owner；`scheduler.py` 保存确定性计时状态，`context_builder.py` 构造并校验模型上下文，`decision_application.py` 应用已校验的最终决策，`streamed_speech.py` 只处理一次请求内的语音准入。`prompts.py` 和 `runtime_events.py` 分别保存提示文本与时钟／恢复信号。 |
+| 会话与接口 | `SessionRuntime` 负责资源生命周期；`speaker_runtime.py` 实现声纹工作进程、注册与评分操作，仍使用会话运行时的唯一状态；`http_api.py` 注册 HTTP 和 WebSocket 路由，并通过旧导入入口公开 `create_app`。 |
+| 输入与语音 | `RealtimeController` 管输入设备与识别，`input_ownership.py` 实现 KWS／ASR 所有权和恢复路径；`EpisodeController` 的同名方法是特定 episode 的覆盖钩子，不按名称合并。`EpisodeSpeechOutput` 管事务，`speech_frontier.py` 投影已传达与可改写前沿，`SpeechPipeline` 管在线语音流和播放器边界；`speech_admission.py` 管尚未提交的可撤回文本，`stream_buffer.py` 管模型文本的本地刷新时限。 |
+| Shadow | `ShadowRuntime` 是单一运行实例；`projection.py` 共享只读上下文与状态观察投影，`tool_loop.py` 实现工具调用、结果入账与事件发布，供原生 Shadow 和 DSH 桥接使用。 |
+| 前端 | `voiceTerminalProjection.ts` 负责服务端消息解析和快照投影，`normalization.ts` 负责产品设置与模型列表归一化；两处重复的 `isRecord`（对象类型收窄函数）已统一到 `record.ts`。语音与 Shadow 的上下文投影语义不同，不能合并。 |
+| DSH | `protocol.ts` 负责桥接协议校验、鉴权和响应；`index.ts` 继续负责会话绑定、观察者和工具注册。 |
+| 本地 TTS | CosyVoice（本地语音合成）实现与脚本归档到 `archive/cosyvoice/`，当前产品仅实例化 MiniMax 在线客户端；`tts/router.py` 保留未来接入本地后端的事务兼容层。历史本地设置继续归一化为在线模式，旧 `tts_worker` 状态字段固定报告 `stopped`（已停止）。 |
