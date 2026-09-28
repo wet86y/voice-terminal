@@ -8,7 +8,7 @@ const typescriptPath = resolve(repo, '.runtime/dsh/source/node_modules/typescrip
 const ts = await import(pathToFileURL(typescriptPath).href)
 const outputRoot = resolve(process.argv[2] ?? resolve(repo, '.runtime/dsh/bundles/voice-terminal-wake-tasks'))
 
-for (const sourceName of ['task-service.ts', 'index.ts', 'plugin.ts']) {
+for (const sourceName of ['event-id.ts', 'task-service.ts', 'index.ts', 'plugin.ts']) {
   const sourcePath = resolve(here, 'src', sourceName)
   const outputPath = resolve(outputRoot, 'lib', sourceName.replace(/\.ts$/u, '.js'))
   const source = await readFile(sourcePath, 'utf8')

@@ -30,6 +30,7 @@ $WakeTasksBuildInputPaths = @(
 $WakeTasksRuntimeArtifactPaths = @(
   $WakeTasksPackagePath,
   (Join-Path $WakeTasksArtifactDir "cordis.patch.yml"),
+  (Join-Path $WakeTasksArtifactDir "lib\event-id.js"),
   (Join-Path $WakeTasksArtifactDir "lib\index.js"),
   (Join-Path $WakeTasksArtifactDir "lib\task-service.js"),
   (Join-Path $WakeTasksArtifactDir "lib\plugin.js")

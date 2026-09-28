@@ -105,7 +105,8 @@ DSH 启动后，在设置侧栏“Agent 预设”下方打开独立的 `Voice Te
 
 DSH 模型需要通知 Voice 时，必须显式调用 `publish_voice_event`（投递语音事件工具），写入 Voice
 持久信箱（可在进程重启后恢复的事件队列）。事件不要求预先存在唤醒标识或上下文版本；重复事件按
-`event_id`（事件标识）去重。Voice 停止监听时，事件保留到下次手动启动处理，不会自动打开语音监听；
+`event_id`（事件标识）去重，省略该字段时插件按 DSH 会话标识和 `callId`（工具调用标识）生成稳定标识。
+Voice 停止监听时，事件保留到下次手动启动处理，不会自动打开语音监听；
 普通 DSH 助手正文不会自动转成语音事件。完整工具字段、规则格式和交接恢复行为见
 [跨会话衔接与 DSH 定时任务](continuity-foundation.md)。
 
@@ -185,6 +186,9 @@ Session upload、DeepSeek Session Log 和 OTel 保持禁用。固定上游许可
 
 排查提示：控制台「对话」页在启动时就显示为空（「轨迹」页仍有内容、普通会话刷新后也不恢复）
 时，先看浏览器控制台是否有 `event feed subscriber failed: TypeError: Cannot read properties of
-null (reading 'kind')`。该报错说明存储中存在 `turn/end` 的 `reason` 为空值的会话，按
-`docs/dsh-plugin-audit-20260927.md` 的说明定位并处置；插件的写入侧修复见
+null (reading 'kind')`。该报错说明存储中存在 `turn/end` 的 `reason` 为空值的会话，先运行
+`node scripts/dsh-diagnose/find-null-kind-rows.mjs` 检查。受影响会话应先备份，再使用
+`node scripts/dsh-diagnose/purge-poisoned-sessions.mjs` 从活动目录移出并重新建立 Voice（语音）绑定，
+不要直接改写 DSH JSONL（逐行 JSON 日志）。插件通过 `exec.concludeTurn`（结束当前回合）在产生端
+处理终端工具回合，细节见
 `integrations/dsh/voice-terminal-shadow-bridge/README.md` 的「终端工具与回合终结」。
