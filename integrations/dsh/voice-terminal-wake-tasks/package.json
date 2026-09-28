@@ -4,9 +4,12 @@
   "private": true,
   "type": "module",
   "main": "lib/plugin.js",
-  "files": ["lib/task-service.js", "lib/task-service.js.map", "lib/index.js", "lib/index.js.map", "lib/plugin.js", "lib/plugin.js.map", "cordis.patch.yml", "README.md"],
+  "files": ["lib/event-id.js", "lib/event-id.js.map", "lib/task-service.js", "lib/task-service.js.map", "lib/index.js", "lib/index.js.map", "lib/plugin.js", "lib/plugin.js.map", "cordis.patch.yml", "README.md"],
   "exports": { ".": "./lib/plugin.js" },
-  "scripts": { "build": "node build.mjs" },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "npm run build && node --test test/task-service.test.mjs test/event-id.test.mjs"
+  },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",

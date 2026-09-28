@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  clearActivationIfCurrent,
   deliverRuntimeReminder,
   enqueueAuthoritativeContext,
+  stableBridgeToolId,
   stopRuntimeReminder,
 } from '../../../../.runtime/dsh/bundles/voice-terminal-shadow-bridge-test/lib/index.js'
 import { assertV4MessageSources } from '../../../../.runtime/dsh/source/packages/session/session-format-v3-to-v4/src/message-sources.ts'
@@ -51,7 +53,7 @@ test('Bridge inbox 消息使用 DSH v4 接受的 source（来源字段）', () =
   const { binding, nextStep } = fixture()
   enqueueAuthoritativeContext(binding, envelope(1, [{ revision: 1 }]), 'snapshot')
   Object.assign(binding, {
-    state: 'active', terminal: false, activationId: 'activation-1',
+    state: 'active', activationId: 'activation-1',
     activationStartedAt: 0, reminderIntervalMs: 10, nextReminderMs: 10,
   })
   assert.equal(deliverRuntimeReminder(binding, 10), 'inserted')
@@ -104,7 +106,7 @@ test('an update after claim opens a new safe-window input', () => {
 function reminderFixture() {
   const value = fixture()
   Object.assign(value.binding, {
-    state: 'active', terminal: false, activationId: 'activation-1',
+    state: 'active', activationId: 'activation-1',
     reminderIntervalMs: 20, activationStartedAt: 1000, nextReminderMs: 20,
     traceRevision: 0, records: [],
   })
@@ -146,12 +148,27 @@ test('a delayed timer emits only the newest crossed-interval reminder', () => {
   assert.equal(binding.records.at(-1).data.crossed_intervals, 5)
 })
 
-test('terminal activations never enqueue a runtime reminder', () => {
+test('settled activations never enqueue a runtime reminder', () => {
   const { binding, nextStep } = reminderFixture()
-  binding.terminal = true
+  delete binding.activationId
 
   assert.equal(deliverRuntimeReminder(binding, 1100), false)
   assert.equal(nextStep.length, 0)
+})
+
+test('a late terminal callback cannot clear a newer activation', () => {
+  const binding = { activationId: 'activation-new' }
+  assert.equal(clearActivationIfCurrent(binding, 'activation-old'), false)
+  assert.equal(binding.activationId, 'activation-new')
+  assert.equal(clearActivationIfCurrent(binding, 'activation-new'), true)
+  assert.equal(binding.activationId, undefined)
+})
+
+test('tool callback ids are stable per DSH call and separated by purpose', () => {
+  const first = stableBridgeToolId('event', 'dsh-session', 'call-1')
+  assert.equal(first, stableBridgeToolId('event', 'dsh-session', 'call-1'))
+  assert.notEqual(first, stableBridgeToolId('request', 'dsh-session', 'call-1'))
+  assert.notEqual(first, stableBridgeToolId('event', 'dsh-session', 'call-2'))
 })
 
 test('stopping an activation clears its timer and pending reminder', async () => {

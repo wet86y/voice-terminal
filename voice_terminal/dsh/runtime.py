@@ -280,6 +280,7 @@ class DshRuntimeManager:
         wake_runtime_artifacts = (
             wake_bundle_dir / "package.json",
             wake_bundle_dir / "cordis.patch.yml",
+            wake_bundle_dir / "lib" / "event-id.js",
             wake_bundle_dir / "lib" / "index.js",
             wake_bundle_dir / "lib" / "task-service.js",
             wake_bundle_dir / "lib" / "plugin.js",

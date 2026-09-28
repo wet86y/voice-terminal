@@ -1,6 +1,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { randomUUID, timingSafeEqual } from 'node:crypto'
+import { timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { stableVoiceEventId } from './event-id.js'
 import { TaskService } from './task-service.js'
 
 export const name = 'voice-terminal-wake-tasks'
@@ -163,8 +164,10 @@ function installAgentTools(agentCtx: any, agent: any, service: TaskService): () 
     output: responseToolOutput(),
     async execute(args: any, exec: any) {
       ensureRoot(exec)
+      const sourceSessionId = String(agent.session.id)
       const result = await voiceApi('/api/internal/dsh-bridge/voice.publish', 'POST', {
-        event_id: args.event_id || randomUUID(), source_session_id: String(agent.session.id),
+        event_id: args.event_id || stableVoiceEventId(sourceSessionId, exec.callId),
+        source_session_id: sourceSessionId,
         text: args.text, ...(args.payload ? { payload: args.payload } : {}),
       })
       if (result.result !== 'accepted' && result.result !== 'duplicate') throw new Error('Voice 信箱未接受事件。')

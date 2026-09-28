@@ -83,6 +83,11 @@ existing Chat（对话） and Trajectory（执行轨迹） views（视图）.
 `TypeError: Cannot read properties of null (reading 'kind')`，打死共享的 event feed 订阅，
 使**所有**会话的对话页变空。
 
+Bridge（桥接层）不再在任意 `tool/result`（工具结果）后调用 `agent.cancel()`（取消代理）。
+Voice activation（语音激活）是否仍有效只由现有 `activation_id`（语音激活标识）表达；终端回调
+只清理发起该回调的同一激活，较晚返回的旧回调不能结束新的激活。普通定时任务因此可以在同一
+主线会话中继续使用 DSH 的完整 Harness（执行环境）能力。
+
 ## Known Limitations and Deferred Work
 
 - **无法从插件侧修复读取端崩溃。** 阻止 `reason: null` 写入是插件职责（见上节），但崩溃点
@@ -101,6 +106,9 @@ existing Chat（对话） and Trajectory（执行轨迹） views（视图）.
   必要时用 `node scripts/dsh-diagnose/purge-poisoned-sessions.mjs` 备份后清理。
 - 定时任务现在投递到当前关联的普通 DSH 会话，`wake.open`（旧独立唤醒会话接口）
   不再是调度路径；语音事件通过 `publish_voice_event`（投递语音事件工具）写入持久信箱。
+- `source.kind = schedule`（来源类型为定时任务）不属于 Voice activation（语音激活），不得使用
+  Voice terminal tool（语音终端工具）；其正常回合与 Voice activation（语音激活）共享会话历史，
+  但不共享终态状态。
 - **事件注入工具不响应取消。** `post()` 与 `get_latest_context` / `read_ambient_context`
   向 Voice Server 发起的循环回环请求不接 `exec.signal`；DSH 仍会在 `tools/execute` 层
   中止调用，但已发出的 HTTP 请求不会被取消。

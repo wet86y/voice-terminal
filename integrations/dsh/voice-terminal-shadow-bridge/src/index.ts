@@ -52,7 +52,6 @@ interface Binding {
   revision: number
   state: 'active' | 'retired'
   activationId?: string
-  terminal: boolean
   protocolRecoveryAttempted: boolean
   protocolRecoveryPending: boolean
   contextDigest?: string
@@ -80,6 +79,18 @@ function createUserMessage(input: { content: unknown[]; source: Record<string, u
 
 function createBridgeUserMessage(content: unknown[], id?: string): Record<string, unknown> {
   return createUserMessage({ content, source: { kind: `plugin:${name}` } }, id)
+}
+
+/** Stable idempotency identity（稳定幂等标识） for one DSH tool side effect. */
+export function stableBridgeToolId(scope: 'request' | 'event', dshSessionId: string, callId: unknown): string {
+  return digest({ scope: `shadow-tool-${scope}`, dsh_session_id: dshSessionId, call_id: String(callId) })
+}
+
+/** Clear only the activation that initiated an asynchronous terminal callback（仅清理发起异步终态回调的激活）. */
+export function clearActivationIfCurrent(binding: { activationId?: string }, activationId: string): boolean {
+  if (binding.activationId !== activationId) return false
+  delete binding.activationId
+  return true
 }
 
 function compileSchema(node: any): any {
@@ -201,7 +212,7 @@ export function deliverRuntimeReminder(
   nowMs = Date.now(),
 ): false | 'inserted' | 'replaced' | 'already_claimed' {
   if (
-    binding.state !== 'active' || binding.terminal || !binding.activationId
+    binding.state !== 'active' || !binding.activationId
     || binding.activationStartedAt === undefined
   ) return false
   const elapsedMs = Math.max(0, Math.round(nowMs - binding.activationStartedAt))
@@ -258,16 +269,15 @@ export function stopRuntimeReminder(binding: Binding, discardPending = false): v
 
 function scheduleRuntimeReminder(binding: Binding, activationId: string): void {
   if (
-    binding.state !== 'active' || binding.terminal
-    || binding.activationId !== activationId || binding.activationStartedAt === undefined
+    binding.state !== 'active' || binding.activationId !== activationId
+    || binding.activationStartedAt === undefined
   ) return
   const dueAt = binding.activationStartedAt + binding.nextReminderMs
   const delayMs = Math.max(0, dueAt - Date.now())
   binding.reminderTimer = setTimeout(() => {
     binding.reminderTimer = undefined
     if (
-      binding.state !== 'active' || binding.terminal
-      || binding.activationId !== activationId
+      binding.state !== 'active' || binding.activationId !== activationId
     ) return
     deliverRuntimeReminder(binding)
     scheduleRuntimeReminder(binding, activationId)
@@ -368,22 +378,28 @@ function toolOutput() {
 }
 
 function installRootTools(agentCtx: any, binding: Binding): void {
-  const ensure = (exec: ToolRunContext): void => {
-    if (binding.state !== 'active' || binding.terminal || exec.agent?.id !== binding.handle?.agent?.id) {
+  const ensure = (exec: ToolRunContext): string => {
+    const activationId = binding.activationId
+    if (binding.state !== 'active' || !activationId || exec.agent?.id !== binding.handle?.agent?.id) {
       throw new Error('Voice Bridge control tool rejected: caller is not the active bound root Agent')
     }
+    return activationId
   }
   const post = async (exec: ToolRunContext, kind: string, fields: Record<string, Json>, terminal = false): Promise<Json> => {
-    ensure(exec)
+    const activationId = ensure(exec)
     const response = await callback('/api/internal/dsh-bridge/shadow.event', {
-      request_id: randomUUID(), event_id: randomUUID(),
+      request_id: stableBridgeToolId('request', binding.dshSessionId, exec.callId),
+      event_id: stableBridgeToolId('event', binding.dshSessionId, exec.callId),
       voice_session_id: binding.voiceSessionId, dsh_session_id: binding.dshSessionId,
       epoch: binding.epoch, context_revision: binding.revision,
-      activation_id: binding.activationId ?? '', kind, ...fields,
+      activation_id: activationId, kind, ...fields,
     })
     if (terminal && isDelivered(response)) {
-      binding.terminal = true
-      stopRuntimeReminder(binding, true)
+      if (clearActivationIfCurrent(binding, activationId)) {
+        stopRuntimeReminder(binding, true)
+        binding.protocolRecoveryAttempted = false
+        binding.protocolRecoveryPending = false
+      }
       // Declare the DSH turn terminal at this step. Without it the agent loop
       // leaves `step()`'s conclusion unset, which stores `turn/end` with
       // `reason: null` — a value the Web client dereferences as `reason.kind`.
@@ -452,13 +468,6 @@ export function apply(ctx: any, config: Config): void {
     binding.traceRevision += 1
     binding.records.push({ trace_revision: binding.traceRevision, type, data: observerData(event, binding) })
     if (binding.records.length > MAX_OBSERVER_RECORDS) binding.records.splice(0, binding.records.length - MAX_OBSERVER_RECORDS)
-    if (type === 'tool/result' && binding.terminal) {
-      queueMicrotask(() => {
-        binding.handle.agent.cancel('voice-terminal-terminal-settled', { keepInbox: false })
-        binding.pendingContext = undefined
-        binding.pendingReminder = undefined
-      })
-    }
     if (type === 'compaction/end' && !event?.data?.error) reassertContextAfterCompaction(binding)
     if (type === 'tool/call') binding.pendingTools.set(String(event?.data?.callId ?? binding.traceRevision), String(event?.data?.name ?? ''))
     if (type === 'tool/result') {
@@ -475,7 +484,7 @@ export function apply(ctx: any, config: Config): void {
         state: binding.agentState,
       }).catch(() => undefined)
     }
-    if (type === 'turn/end' && binding.activationId && !binding.terminal) {
+    if (type === 'turn/end' && binding.activationId) {
       if (!binding.protocolRecoveryAttempted) {
         binding.protocolRecoveryAttempted = true
         // turn/end is published while Session.append() still rejects reentrant
@@ -483,13 +492,15 @@ export function apply(ctx: any, config: Config): void {
         // following running→idle status edge (the public Agent safe boundary).
         binding.protocolRecoveryPending = true
       } else {
-        binding.terminal = true
+        const activationId = binding.activationId
+        clearActivationIfCurrent(binding, activationId)
         stopRuntimeReminder(binding, true)
         void callback('/api/internal/dsh-bridge/shadow.event', {
-          request_id: randomUUID(), event_id: randomUUID(),
+          request_id: digest({ scope: 'protocol-recovery-request', dsh_session_id: binding.dshSessionId, activation_id: activationId }),
+          event_id: digest({ scope: 'protocol-recovery-event', dsh_session_id: binding.dshSessionId, activation_id: activationId }),
           voice_session_id: binding.voiceSessionId, dsh_session_id: binding.dshSessionId,
           epoch: binding.epoch, context_revision: binding.revision,
-          activation_id: binding.activationId, kind: 'failed',
+          activation_id: activationId, kind: 'failed',
           text: 'DSH Shadow protocol failed to settle after one recovery turn.',
           payload: { infrastructure: true, reason: 'missing_terminal_tool' },
         }).catch(() => undefined)
@@ -503,7 +514,7 @@ export function apply(ctx: any, config: Config): void {
     binding.traceRevision += 1
     binding.agentState = String(status ?? '')
     binding.records.push({ trace_revision: binding.traceRevision, type: 'agent/status', data: { state: String(status ?? '') } })
-    if (status === 'idle' && binding.protocolRecoveryPending && binding.activationId && !binding.terminal) {
+    if (status === 'idle' && binding.protocolRecoveryPending && binding.activationId) {
       binding.protocolRecoveryPending = false
       binding.handle.agent.followup(createBridgeUserMessage([
         { type: 'text', text: 'PROTOCOL RECOVERY: This activation ended without a Voice Bridge terminal tool. Re-evaluate the latest authoritative context and end with exactly one of request_user_input, return_shadow_result, or finish_shadow_no_action.' },
@@ -543,7 +554,7 @@ export function apply(ctx: any, config: Config): void {
           const requestedReminderMs = Number(body.runtime_reminder_interval_ms)
           const reminderIntervalMs = Number.isSafeInteger(requestedReminderMs) && requestedReminderMs > 0
             ? requestedReminderMs : 20000
-          const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', terminal: false, protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map(), reminderIntervalMs, nextReminderMs: reminderIntervalMs }
+          const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map(), reminderIntervalMs, nextReminderMs: reminderIntervalMs }
           const preset = await ctx.agentPresets.resolve('shadow-agent')
           const modelSelection = ctx.agentDefaultModel.currentSelection()
           const setup = async (agentCtx: any) => { await ctx.agentPresets.mount(agentCtx, preset.id); installRootTools(agentCtx, binding) }
@@ -622,7 +633,6 @@ export function apply(ctx: any, config: Config): void {
           if (revision !== existing.revision) response = revision < existing.revision ? result('stale') : result('resync_required')
           else {
             existing.activationId = String(body.activation_id ?? '')
-            existing.terminal = false
             existing.protocolRecoveryAttempted = false
             existing.protocolRecoveryPending = false
             const wake = createBridgeUserMessage([{ type: 'text', text: `VOICE SHADOW ACTIVATION\nActivation: ${existing.activationId}\nRevision: ${existing.revision}\nJudge and execute the current task. End only with a Voice Bridge terminal tool.` }])
@@ -651,9 +661,9 @@ export function apply(ctx: any, config: Config): void {
             response = result('accepted', { dsh_session_id: existing.dshSessionId, message_id: occurrenceId })
           }
         } else if (path === 'session.cancel') {
-          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-cancel', { keepInbox: false }); existing.pendingContext = undefined; existing.pendingReminder = undefined; existing.terminal = true; response = result('accepted')
+          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-cancel', { keepInbox: false }); existing.pendingContext = undefined; existing.pendingReminder = undefined; delete existing.activationId; response = result('accepted')
         } else if (path === 'session.retire') {
-          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-retire', { keepInbox: false }); existing.pendingContext = undefined; existing.pendingReminder = undefined; existing.state = 'retired'; existing.terminal = true
+          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-retire', { keepInbox: false }); existing.pendingContext = undefined; existing.pendingReminder = undefined; existing.state = 'retired'; delete existing.activationId
           ctx.sessionTitle.rename(existing.handle.agent.session, `Voice Shadow · ${existing.voiceSessionId.slice(0, 8)} · epoch ${existing.epoch} · retired`)
           response = result('accepted')
         } else if (path === 'session.state') {
@@ -661,7 +671,7 @@ export function apply(ctx: any, config: Config): void {
             state: existing.state,
             context_revision: existing.revision,
             activation_id: existing.activationId ?? '',
-            terminal: existing.terminal,
+            terminal: !existing.activationId,
             agent_state: existing.agentState,
           })
         } else if (path === 'session.context') {

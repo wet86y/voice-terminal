@@ -14,6 +14,15 @@ Voice 发声、用户输入或关联 DSH 会话恢复活动都会取消未提交
 
 到期时插件请求桥接层在 Voice 会话交接锁内解析当前语音关联 DSH 会话，并将任务作为普通 `user/message`（用户消息）持久投递到该会话。旧会话已退役时使用新会话；投递暂时失败时保留任务并重试。任务投递不直接控制 Voice 侧的语音模型。DSH 模型需要通知 Voice 时调用 `publish_voice_event`（投递语音事件），将自由文本及可选附加内容写入 Voice 持久信箱。Voice 手动停止监听时，事件留待下次手动启动处理。
 
+### 投递幂等与执行状态
+
+- 每次触发复用 `occurrence_id`（任务发生标识）作为 `request_id`（请求标识）和 DSH `message.id`（消息标识）。同一任务发生重复投递时返回 `duplicate`（重复确认），不再生成第二条任务消息。
+- 定时消息的 `source.kind = schedule`（来源类型为定时任务）表示普通 DSH 任务，不代表 Voice activation（语音激活）。它可以使用 DSH Harness（执行环境）的全部现有工具和子代理能力。目标包含 Voice（语音模型）时，任务应调用 `publish_voice_event`（投递语音事件）；仅面向 Shadow Agent（影子代理）的任务可以普通完成。
+- `publish_voice_event`（投递语音事件）没有显式 `event_id`（事件标识）时，Wake Tasks（定时任务插件）使用现有 DSH 会话标识和 `callId`（工具调用标识）生成稳定事件标识。同一工具调用被恢复或重放时，Voice 持久信箱只收下一份事件。
+- `activation_id`（语音激活标识）只标识当前 Voice activation（语音激活）。`turn`（回合号）、`step`（步骤号）和 `callId`（工具调用标识）沿用 DSH 执行记录关联回合过程；不增加 `run_id`（运行标识）或任务字段。
+- 任务 `status`（任务状态）只表示调度状态，如 `pending`（待触发）、`archived`（已归档）和 `cancelled`（已取消）；`delivery_history`（投递历史）只表示任务消息已持久投递。这两者都不表示执行成功、失败或运行中。任务存储 `schema_version`（结构版本）保持不变。未来如需展示单次执行结果，应使用独立的执行记录。
+- Voice terminal tool（语音终端工具）在 Voice 确认结果已收下后调用 `exec.concludeTurn`（结束当前回合）。Bridge（桥接层）只清理该工具开始时捕获、且仍与当前相同的 `activation_id`（语音激活标识）；普通 `tool/result`（工具结果）不会取消 DSH Agent（代理）。只有显式 `session.cancel`（取消会话）或 `session.retire`（退役会话）才取消整个 DSH Agent（代理）。
+
 插件提供 `schedule_wake`（创建唤醒任务）、`cancel_wake`（取消唤醒任务）、`read_wake_reference`（读取冻结参考），以及与原生工具同名的 `schedule_create`（创建任务）、`schedule_list`（列出任务）、`schedule_update`（更新任务）、`schedule_delete`（取消任务）。原生工具支持的延迟、绝对时间、固定间隔、每日、每周和 Cron（定时表达式）规则由同一 DSH 规则模块解析。Voice Terminal（语音终端）的“唤醒任务”页读取插件任务目录，显示项目内所有 DSH 任务。
 
 插件存储位于 DSH home（DSH 用户数据目录）的 `storages/voice-terminal-wake-tasks.json`（统一任务文件）。安装前，`scripts/check-dsh-wake-migration.mjs`（任务迁移预检脚本）验证原生 `schedule.json`（原生任务文件）和旧 Voice `wake-tasks.json`（旧任务文件）。插件首次启动时幂等导入，保留任务标识、状态及可用投递历史；无法转换的任务会阻止切换。安装脚本禁用 DSH 内置 Schedule（调度器）及其原生任务页，防止两套计时器重复投递。
