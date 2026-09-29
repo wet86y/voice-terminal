@@ -15,7 +15,8 @@ class ShadowContextProjector:
     monotonic input revision and deliberately excludes Shadow-origin events.
     """
 
-    def __init__(self, ledger: Any, *, user_profile: str = "", continuity_document: str = "") -> None:
+    def __init__(self, ledger: Any, *, user_profile: str = "", continuity_document: str = "",
+                 custom_instructions: list[dict[str, str]] | None = None) -> None:
         self.ledger = ledger
         # The experimental context gate never filters semantic frames.  It
         # only controls the contiguous source revision currently visible to
@@ -34,6 +35,8 @@ class ShadowContextProjector:
         }
         if self._continuity_document:
             environment["continuity_document"] = self._continuity_document
+        if custom_instructions:
+            environment["custom_instructions"] = [dict(item) for item in custom_instructions]
         self._environment = ShadowContextFrame(
             revision=0, origin="runtime", kind="session_environment",
             content=environment,

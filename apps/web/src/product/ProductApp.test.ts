@@ -6,12 +6,48 @@ import normalizationSource from './normalization.ts?raw'
 import productApiSource from './api.ts?raw'
 import uiDemoAppSource from '../ui-demo/UiDemoApp.vue?raw'
 import { readFileSync } from 'node:fs'
+import { normalizeSettings, updateSettingsFromResponse } from './normalization'
 
 // Vitest returns an empty string for every CSS text form (``?raw``, ``?inline``
 // and ``import.meta.glob``), so the stylesheet is read from disk.  The Shadow
 // panel's three-region layout only exists in CSS and it regressed once already,
 // so it needs a direct source-level guard.
 const productCssSource = readFileSync(new URL('../ui-demo/ui-demo.css', import.meta.url), 'utf8')
+
+describe('自定义语音指令', () => {
+  it('从服务端快照读取条目并更新保存结果', () => {
+    const settings = normalizeSettings({
+      custom_instructions: [{ id: 'wait', trigger: '等一下', target: 'voice', instruction: '等待用户继续说', enabled: true }],
+      persona: { instructions: '旧工作指令', shadow: '旧影子规则', personality: '稳重', user: '称呼老大' },
+    })
+    expect(settings.custom_instructions).toHaveLength(1)
+    expect(settings.persona).toEqual({ personality: '稳重', user: '称呼老大' })
+    updateSettingsFromResponse(settings, {
+      settings: { custom_instructions: [{ id: 'wait', trigger: '等一下', target: 'voice', instruction: '等待用户继续说', enabled: false }] },
+      effective_from: 'next_session', pending: true, message: '已保存',
+    })
+    expect(settings.custom_instructions[0].enabled).toBe(false)
+  })
+
+  it('提供逐条编辑、执行位置选择、启停和持久化入口', () => {
+    expect(productAppSource).toContain('v-for="item in customInstructions"')
+    expect(productAppSource).toContain('v-model="instructionDraft.trigger"')
+    expect(productAppSource).toContain('v-model="instructionDraft.target"')
+    expect(productAppSource).toContain('v-model="instructionDraft.instruction"')
+    expect(productAppSource).toContain('v-model="item.enabled"')
+    expect(productAppSource).toContain('stageInstruction')
+    expect(productAppSource).toContain('removeInstruction(item.id)')
+    expect(productAppSource).toContain('saveCustomInstructions')
+    expect(productCssSource).toContain('@media (max-width: 640px) { .instruction-row')
+  })
+
+  it('不暴露内部工作与影子指令文档', () => {
+    expect(productAppSource).not.toContain("id: 'instructions', label: '工作指令'")
+    expect(productAppSource).not.toContain("id: 'shadow', label: 'Shadow 指令'")
+    expect(productApiSource).toContain("'/api/v1/product/settings/custom-instructions'")
+    expect(productAdapterSource).toContain('custom_instructions: customInstructions.value')
+  })
+})
 
 describe('本地模型计算设备设置', () => {
   it('显示六种非 TTS 模型并按后端能力禁用 GPU 选择', () => {

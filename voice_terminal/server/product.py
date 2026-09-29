@@ -21,12 +21,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig
+from ..custom_instructions import validate_entries
 from ..core.events import utc_now_iso
 from ..kws.keywords import MAX_WAKE_KEYWORDS
 from ..shadow_agent import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 6
+PRODUCT_SETTINGS_SCHEMA_VERSION = 7
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 90
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -36,11 +37,9 @@ MIN_SPEAKER_THRESHOLD = 0.0
 MAX_SPEAKER_THRESHOLD = 1.0
 
 PERSONA_FILES = {
-    "instructions": "instructions.md",
     "personality": "personality.md",
     "user": "user.md",
 }
-SHADOW_PERSONA_FILE = "instructions.md"
 
 
 class ProductSettingsError(ValueError):
@@ -100,6 +99,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
                 config.shadow_agent.experimental_context_gate_enabled,
             ),
         },
+        "custom_instructions": [],
         # TTS（语音合成）固定走在线 API（程序接口）；backend（运行后端）不再是产品设置。
         "tts": {"backend": "minimax"},
         "speaker": {
@@ -152,6 +152,10 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
         raw = value.get(section)
         if isinstance(raw, Mapping):
             result[section].update({key: raw[key] for key in result[section] if key in raw})
+    try:
+        result["custom_instructions"] = validate_entries(value.get("custom_instructions", []))
+    except ValueError:
+        result["custom_instructions"] = []
     # Product settings are intentionally versioned independently from the
     # model registry.  Unknown fields are discarded rather than echoed to the
     # browser, which keeps this file a narrow, non-secret state boundary.
@@ -241,7 +245,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     schema_version = value.get("schema_version")
     if schema_version is not None and (
         type(schema_version) is not int
-        or schema_version not in {1, 2, 3, 4, 5, PRODUCT_SETTINGS_SCHEMA_VERSION}
+        or schema_version not in {1, 2, 3, 4, 5, 6, PRODUCT_SETTINGS_SCHEMA_VERSION}
     ):
         invalid = True
     for section_name, fields in (
@@ -296,6 +300,11 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
             # keep this branch quiet and let the normal merge fallback apply.
             pass
     compute = value.get("compute")
+    if "custom_instructions" in value:
+        try:
+            validate_entries(value["custom_instructions"])
+        except ValueError:
+            invalid = True
     if compute is not None:
         if not isinstance(compute, Mapping):
             invalid = True
@@ -509,13 +518,17 @@ class ProductSettingsStore:
                 result[key] = path.read_text(encoding="utf-8") if path.is_file() else ""
             except (OSError, UnicodeError, ValueError):
                 result[key] = ""
-        shadow_path = (directory.parent / "shadow_agent" / SHADOW_PERSONA_FILE).resolve()
-        try:
-            shadow_path.relative_to(directory.parent.resolve())
-            result["shadow"] = shadow_path.read_text(encoding="utf-8") if shadow_path.is_file() else ""
-        except (OSError, UnicodeError, ValueError):
-            result["shadow"] = ""
         return result
+
+    def save_custom_instructions(self, value: Any) -> dict[str, Any]:
+        try:
+            entries = validate_entries(value)
+        except ValueError as exc:
+            raise ProductSettingsError(str(exc)) from exc
+        self._settings["custom_instructions"] = entries
+        self._settings["schema_version"] = PRODUCT_SETTINGS_SCHEMA_VERSION
+        self._save_settings()
+        return self.snapshot()
 
     def effective_config(self) -> AppConfig:
         return apply_settings_to_config(self.config, self._settings)
@@ -821,10 +834,10 @@ class ProductSettingsStore:
         return restored
 
     def save_persona(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if set(payload) != set(PERSONA_FILES) | {"shadow"}:
-            raise ProductSettingsError("Persona 文档字段必须是 instructions、personality、user、shadow。")
+        if set(payload) != set(PERSONA_FILES):
+            raise ProductSettingsError("Persona 文档字段必须是 personality、user。")
         values: dict[str, str] = {}
-        for key in (*PERSONA_FILES, "shadow"):
+        for key in PERSONA_FILES:
             value = payload.get(key)
             if not isinstance(value, str) or "\x00" in value:
                 raise ProductSettingsError(f"Persona 文档 {key} 内容无效。")
@@ -836,12 +849,10 @@ class ProductSettingsStore:
         # layout.  The client never supplies a path, and a YAML override must
         # not turn this API into an arbitrary filesystem writer.
         persona_dir = (self.path.resolve().parent / "persona").resolve()
-        shadow_dir = (persona_dir.parent / "shadow_agent").resolve()
         paths = {key: persona_dir / filename for key, filename in PERSONA_FILES.items()}
-        paths["shadow"] = shadow_dir / SHADOW_PERSONA_FILE
         for path in paths.values():
             try:
-                path.resolve().relative_to(persona_dir if path.parent == persona_dir else shadow_dir)
+                path.resolve().relative_to(persona_dir)
             except ValueError as exc:
                 raise ProductSettingsError("Persona 路径不在允许目录内。") from exc
 

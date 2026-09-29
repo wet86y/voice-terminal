@@ -1,5 +1,5 @@
 import type { ShadowProductSnapshot } from '../types'
-import type { DshRuntimeStatus, ProductAssignments, ProductLocalModelId, ProductModelRegistry, ProductMutationResult, ProductRuntimeState, ProductSettingsSnapshot } from './types'
+import type { CustomInstruction, DshRuntimeStatus, ProductAssignments, ProductLocalModelId, ProductModelRegistry, ProductMutationResult, ProductRuntimeState, ProductSettingsSnapshot } from './types'
 import { isRecord } from '../record'
 
 const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
@@ -7,7 +7,7 @@ const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 export const MAX_WAKE_KEYWORDS = 5
 
 export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 6,
+  schema_version: 7,
   tts: { backend: 'minimax' },
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
@@ -23,7 +23,8 @@ export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
       kws: 'cpu', smart_turn: 'cpu', wespeaker: 'cpu',
     },
   },
-  persona: { instructions: '', personality: '', user: '', shadow: '' },
+  custom_instructions: [],
+  persona: { personality: '', user: '' },
   warnings: [],
 }
 
@@ -64,6 +65,12 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   const computeDevices = isRecord(compute.devices) ? compute.devices : {}
   const fallbackDevices = isRecord(compute.fallback_devices) ? compute.fallback_devices : {}
   const persona = isRecord(value.persona) ? value.persona : {}
+  const customInstructions = Array.isArray(value.custom_instructions)
+    ? value.custom_instructions.filter((item): item is CustomInstruction => isRecord(item)
+      && typeof item.id === 'string' && typeof item.trigger === 'string'
+      && (item.target === 'voice' || item.target === 'shadow')
+      && typeof item.instruction === 'string' && typeof item.enabled === 'boolean')
+    : []
   const text = (candidate: unknown) => typeof candidate === 'string' ? candidate : ''
   const wakeKeywords = Array.isArray(wake.keywords)
     ? wake.keywords.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
@@ -89,6 +96,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
     shadow: {
       experimental_context_gate_enabled: shadow.experimental_context_gate_enabled === true,
     },
+    custom_instructions: customInstructions.map(item => ({ ...item })),
     speaker: {
       mode: typeof speaker.mode === 'string' && ['off', 'observe', 'filter'].includes(speaker.mode)
         ? speaker.mode as ProductSettingsSnapshot['speaker']['mode'] : 'off',
@@ -111,10 +119,8 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
       ) as NonNullable<ProductSettingsSnapshot['compute']['fallback_devices']>,
     },
     persona: {
-      instructions: text(persona.instructions),
       personality: text(persona.personality),
       user: text(persona.user),
-      shadow: text(persona.shadow),
     },
     warnings: Array.isArray(value.warnings) ? value.warnings.filter(item => typeof item === 'string') : [],
   }
@@ -160,5 +166,8 @@ export function updateSettingsFromResponse(settings: ProductSettingsSnapshot, re
   }
   if (isRecord(candidate.tts)) Object.assign(settings.tts, candidate.tts)
   if (isRecord(candidate.persona)) Object.assign(settings.persona, candidate.persona)
+  if (Array.isArray(candidate.custom_instructions)) {
+    settings.custom_instructions = normalizeSettings({ custom_instructions: candidate.custom_instructions }).custom_instructions
+  }
   if (Array.isArray(candidate.warnings)) settings.warnings = candidate.warnings.filter((item): item is string => typeof item === 'string')
 }

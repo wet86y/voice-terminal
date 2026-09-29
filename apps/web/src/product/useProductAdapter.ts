@@ -3,6 +3,7 @@ import { useVoiceTerminal } from '../composables/useVoiceTerminal'
 import type { ConversationEntry, ConversationEntryKind, ReasoningMode, ShadowProductSnapshot, TurnDelivery } from '../types'
 import { productApi, ProductApiError } from './api'
 import type {
+  CustomInstruction,
   DshRuntimeStatus,
   ProductAssignments,
   ProductComputeStatus,
@@ -114,7 +115,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const notice = ref('')
   const noticeVisible = ref(false)
   const shadowExpanded = ref(false)
-  const personaDocument = ref<keyof ProductSettingsSnapshot['persona']>('instructions')
+  const personaDocument = ref<keyof ProductSettingsSnapshot['persona']>('personality')
+  const customInstructions = ref<CustomInstruction[]>([])
   const silenceSeconds = ref(30)
   const modelScanState = ref<'idle' | 'scanning' | 'complete'>('idle')
   const providerStep = ref<'idle' | 'discovering' | 'select-model' | 'custom-id' | 'verified'>('idle')
@@ -137,7 +139,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   const wakeForm = reactive({ enabled: false, keywords: ['hei claw'] as string[], sensitivity: 75 })
   const personaDocuments = reactive<Record<keyof ProductSettingsSnapshot['persona'], string>>({
-    instructions: '', personality: '', user: '', shadow: '',
+    personality: '', user: '',
   })
   const providerForm = reactive<ProviderFormState>({
     name: '', baseUrl: 'https://api.example.com/v1', protocol: 'openai_compatible',
@@ -239,6 +241,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     Object.assign(settings.compute.fallback_devices || {}, nextSettings.compute.fallback_devices || {})
     Object.assign(settings.tts, nextSettings.tts)
     Object.assign(settings.persona, nextSettings.persona)
+    const hasPendingInstructionEdits = JSON.stringify(customInstructions.value) !== JSON.stringify(settings.custom_instructions)
+    settings.custom_instructions = nextSettings.custom_instructions.map(item => ({ ...item }))
+    if (!hasPendingInstructionEdits) {
+      customInstructions.value = nextSettings.custom_instructions.map(item => ({ ...item }))
+    }
     settings.schema_version = nextSettings.schema_version
     settings.warnings = nextSettings.warnings
     Object.assign(wakeForm, {
@@ -859,6 +866,22 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     })
   }
 
+  async function saveCustomInstructions() {
+    await enqueue(async () => {
+      saving.value = true
+      try {
+        const result = await productApi.saveCustomInstructions({ custom_instructions: customInstructions.value })
+        updateSettingsFromResponse(settings, result)
+        customInstructions.value = settings.custom_instructions.map(item => ({ ...item }))
+        setNotice(result.message || '自定义指令已保存，将在下一次会话或重置后生效。')
+      } catch (error) {
+        setError(error)
+      } finally {
+        saving.value = false
+      }
+    })
+  }
+
   async function scanModels() {
     await enqueue(async () => {
       modelScanState.value = 'scanning'
@@ -1165,6 +1188,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     silenceSeconds,
     personaDocument,
     personaDocuments,
+    customInstructions,
     speakerForm,
     speakerStatus,
     speakerProfile,
@@ -1206,6 +1230,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     saveSilence,
     saveShadowGate,
     savePersona,
+    saveCustomInstructions,
     saveSpeaker,
     refreshComputeStatus,
     saveComputeSettings,

@@ -58,12 +58,12 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 
 ## 主要配置
 
-- `config/default.yaml`：默认运行参数、端口、模型、KWS、音频和 Shadow 配置。
+- `config/default.yaml`：默认运行参数、端口、模型、KWS（关键词唤醒）、音频和 Shadow（影子代理）配置。
 - `config/local.yaml`：本机非密钥覆盖，不提交真实凭据。
-- `config/persona/`：`instructions.md`、`personality.md`、`user.md`；在新 Agent episode 创建时读取并冻结。
-- `config/shadow_agent/`：Shadow 指令和工具策略。
+- `config/persona/`：`personality.md`（人格风格）和 `user.md`（用户资料）在会话初始化时读取并冻结；旧 `instructions.md`（历史工作指令）仅留档，不再加载。
+- `config/shadow_agent/`：Shadow（影子代理）指令和工具策略。
 - `config/dsh/`：项目隔离 DSH 的锁版、Web profile patch、Shadow 验证预设和许可证快照。
-- `config/product-settings.json`：本机产品设置，包含 KWS、静默、Shadow 开关和声纹设置等非密钥内容。
+- `config/product-settings.json`：本机产品设置，包含 KWS（关键词唤醒）、静默、Shadow（影子代理）、自定义指令和声纹设置等非密钥内容。
 - `config/speaker/`：声纹资料、模板和特征指纹；详见 [声纹增强](docs/speaker-enhancement.md)。
 
 ### 运行模式
@@ -99,6 +99,7 @@ git diff --check
 - [架构与生命周期](docs/architecture.md)
 - [连续性底座：上下文衔接与定时唤醒](docs/continuity-foundation.md)
 - [上下文与工具规范](docs/context-and-tools.md)
+- [自定义指令条目与提示词投影](docs/context-and-tools.md#用户自定义指令)
 - [WebSocket 协议](docs/websocket-protocol.md)
 - [LLM 上下文缓存契约](docs/llm-context-cache-contract.md)
 - [LLM JSON Schema 迁移与回滚 Runbook](docs/llm-json-schema-migration.md)

@@ -12,6 +12,12 @@
 2. `HISTORY`：已提交用户输入、已结算 `voice_delivery`、有效 refinement、工具结果和有语义影响的打断；
 3. `REQUEST_TAIL`：当前未提交输入、运行时间、恢复反馈、工具状态和活动 speak。
 
+产品设置中的 `custom_instructions`（自定义指令）在新会话或 `session.reset`（会话重置）时冻结。
+主模型的静态层包含启用条目的触发语义和执行位置；仅语音链路条目包含执行目标。
+影子条目的目标不进入主模型上下文。触发采用完整语义判断，不做关键词硬匹配。
+旧 `config/persona/instructions.md`（历史工作指令文档）留在磁盘供查阅，不再加载；
+通用对话原则已收进内置提示词，产品界面只编辑人格风格、用户资料和自定义指令条目。
+
 未播放的 assistant 草稿、播放器进度和 TTS 连接状态不是历史事实。活动 speak 只按以下四段投影，正文不得重复：
 
 ```json
@@ -62,7 +68,51 @@ Shadow 使用独立的 `ShadowContextProjector`，来源仍是 `SessionLedger`�
 - `external_system`：确认过的工具结果和外部变化；
 - `runtime`：日期、时区和有语义影响的 interruption/replacement。
 
+会话环境还包含启用的影子 `custom_instructions`（自定义指令）的触发语义与执行目标，
+来自与主模型相同的冻结快照。Shadow（影子代理）须根据完整用户原话复核意图；条目不授予新的工具权限。
+
 排除：主模型 reasoning、未播放 speak、TTS/播放器机械状态、主动作 schema、Shadow 自己的 progress/status/result 和已经存在于 Shadow trace 的输出。
+
+## 用户自定义指令
+
+设置页按条目保存自定义指令，不再把工作指令和影子系统指令的大文档交给用户编辑。每条数据使用以下字段；英文名称是接口和存储字段，括号内是中文说明：
+
+| 字段 | 中文说明 | 取值与约束 |
+| --- | --- | --- |
+| `id`（标识） | 条目的稳定标识 | 1～80 位 ASCII（美国信息交换标准代码）字母、数字、下划线或连字符；列表中不可重复。 |
+| `trigger`（触发语义） | 用户可能表达的完整意图 | 必填，最多 200 字；按整句话的语义理解，不按关键词硬匹配。 |
+| `target`（执行位置） | 由哪条运行链路处理 | `voice`（语音链路）或 `shadow`（影子代理）。 |
+| `instruction`（执行目标） | 命中后应该做什么 | 必填，最多 2000 字。语音目标由语音 LLM（大语言模型）读取；影子目标由 Shadow（影子代理）读取。 |
+| `enabled`（启用状态） | 是否注入模型提示词 | 布尔值；停用条目保留在设置中，但不注入会话上下文。 |
+
+最多保存 50 条，所有条目序列化后的总大小不超过 32 KB。产品快照由 `GET /api/v1/product/snapshot`（读取产品设置快照）返回；整表保存使用 `PUT /api/v1/product/settings/custom-instructions`（保存自定义指令列表），请求体为 JSON（数据交换格式）：
+
+```json
+{
+  "custom_instructions": [
+    {
+      "id": "wait",
+      "trigger": "用户希望我先暂停回答，等他继续",
+      "target": "voice",
+      "instruction": "保持等待，不补充解释；等用户继续说后再响应。",
+      "enabled": true
+    },
+    {
+      "id": "lookup",
+      "trigger": "用户要求查询附近的地点或服务",
+      "target": "shadow",
+      "instruction": "根据用户原话查询附近的目标，并把来源和结果反馈给语音会话。",
+      "enabled": true
+    }
+  ]
+}
+```
+
+保存响应中的 `effective_from`（生效时机）为 `next_session`（下一次会话），`pending`（当前会话仍使用旧版本）为 `true`。正在进行的会话继续使用创建时冻结的条目快照；`session.reset`（会话重置）后，语音模型与影子代理共同切换到最新版本。
+
+语音模型能看到启用条目的 `trigger`（触发语义）和 `target`（执行位置），但只会看到 `target: "voice"`（语音链路）的 `instruction`（执行目标）。对于 `target: "shadow"`（影子代理）的条目，语音模型只根据语义发出既有的 `request_shadow`（请求影子代理）信号，不传递用户编写的执行目标，也不获得新的工具权限。
+
+Shadow 在权威会话环境中读取启用的影子条目及其执行目标，并独立核对最新用户原话，再使用自身已有能力处理。条目只描述任务，不扩展工具权限；影子代理不可用或缺少完成任务的能力时，不得声称任务已经完成。
 
 ## Revision 与 reset
 

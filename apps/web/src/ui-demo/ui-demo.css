@@ -867,3 +867,21 @@ body:has(.product-shell) { overflow: hidden; }
   .compute-resource-grid { grid-template-columns: 1fr; }
   .compute-device-field { grid-template-columns: 1fr; gap: 7px; }
 }
+.instruction-section { display: grid; gap: 11px; margin-top: 26px; }
+.instruction-section h3, .instruction-form h4 { margin: 0; color: #dce6fb; font-size: 14px; }
+.instruction-hint, .instruction-empty { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.instruction-empty { padding: 18px; border: 1px dashed var(--line); border-radius: 10px; }
+.instruction-row { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #ffffff04; }
+.instruction-row > div { min-width: 0; flex: 1; }
+.instruction-row strong, .instruction-row small { display: block; overflow-wrap: anywhere; }
+.instruction-row strong { color: #dce6fb; font-size: 12px; }
+.instruction-row small { margin-top: 5px; color: var(--muted); font-size: 10px; }
+.instruction-enabled { display: flex; align-items: center; gap: 4px; white-space: nowrap; color: var(--muted); font-size: 11px; }
+.instruction-row button, .instruction-actions button { padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; color: #dce6fb; background: #ffffff08; font-size: 11px; }
+.instruction-form { display: grid; gap: 9px; margin-top: 5px; padding: 16px; border: 1px solid var(--line); border-radius: 11px; }
+.instruction-form .form-field select, .instruction-form .form-field textarea { width: 100%; margin-top: 10px; padding: 9px 10px; border: 1px solid #ffffff19; border-radius: 7px; color: var(--text); background: #050b18a1; font-size: 12px; }
+.instruction-form .form-field textarea { min-height: 88px; resize: vertical; }
+.instruction-actions { display: flex; gap: 8px; }
+.instruction-error { margin: 0; color: #ff9d9d; font-size: 11px; }
+.instruction-section > .save-button { justify-self: start; }
+@media (max-width: 640px) { .instruction-row { flex-wrap: wrap; }.instruction-row > div { flex-basis: 100%; }.instruction-form { padding: 11px; } }

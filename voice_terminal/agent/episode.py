@@ -149,6 +149,7 @@ class AgentEpisodeRuntime(AgentContextMixin):
 
     def __init__(self, provider, registry, output, emit, *, conversation: ConversationRuntime, ledger,
                  options=None, tools_enabled=True, reasoning_mode="balanced", persona_config=None,
+                 custom_instructions_provider=None,
                  shadow_waker=None, on_final_system_check_settled=None,
                  defer_silence_until_output=False, continuity_document_provider=None,
                  on_user_activity=None, on_silence_anchor=None):
@@ -170,6 +171,8 @@ class AgentEpisodeRuntime(AgentContextMixin):
         self.context_projector = LLMContextProjector()
         self.persona_loader = PersonaDocumentLoader(persona_config) if persona_config is not None else None
         self.persona_documents = PersonaDocuments()
+        self.custom_instructions_provider = custom_instructions_provider
+        self.custom_instructions = []
         self.scheduler = AgentDecisionScheduler(self.options)
         self.episode_id = None
         self.agent_step_id = None
@@ -722,6 +725,10 @@ class AgentEpisodeRuntime(AgentContextMixin):
             self.persona_loader.load()
             if self.persona_loader is not None
             else PersonaDocuments()
+        )
+        self.custom_instructions = (
+            list(self.custom_instructions_provider())
+            if callable(self.custom_instructions_provider) else []
         )
         self.episode_id = self.conversation.conversation_id
         self.state = "WAITING_EVENT"

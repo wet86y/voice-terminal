@@ -16,6 +16,7 @@ from ..audio.player import PcmPlayer
 from ..audio.processing import AudioPreprocessor
 from ..asr.client import AsrWorkerClient
 from ..config import AppConfig
+from ..custom_instructions import shadow_projection
 from ..controller.episode_controller import EpisodeController
 from ..dsh import (
     DshBridgeError,
@@ -78,6 +79,10 @@ class SessionRuntime(SpeakerRuntimeMixin):
             callback_origin=f"http://127.0.0.1:{config.server.port}",
         )
         self.product_settings = product_settings
+        self._instruction_snapshot = (
+            product_settings.settings_only().get("custom_instructions", [])
+            if product_settings is not None else []
+        )
         self._pending_product_settings: dict[str, Any] | None = None
         self.state = RuntimeState()
         self.bus = EventBus()
@@ -139,6 +144,7 @@ class SessionRuntime(SpeakerRuntimeMixin):
         self.shadow_context = ShadowContextProjector(
             self.history, user_profile=self._shadow_user_profile,
             continuity_document=self.continuity.document,
+            custom_instructions=shadow_projection(self._instruction_snapshot),
         )
         self._shadow_pending = ShadowEventBuffer()
         self._voice_mailbox = DurableShadowMailbox(project_root / "config" / "voice-mailbox.json")
@@ -450,6 +456,7 @@ class SessionRuntime(SpeakerRuntimeMixin):
         self.controller = EpisodeController(
             options=self.config.smart_turn, agent_options=self.config.agent,
             persona_config=self.config.persona,
+            custom_instructions_provider=lambda: self._instruction_snapshot,
             continuity_document_provider=lambda: self.continuity.document,
             on_user_activity=self._on_voice_activity,
             on_silence_anchor=self._on_voice_silence_anchor,
@@ -1244,6 +1251,7 @@ class SessionRuntime(SpeakerRuntimeMixin):
             product_settings = getattr(self, "product_settings", None)
             if product_settings is not None:
                 shadow_user_profile = product_settings.read_persona().get("user", "")
+                self._instruction_snapshot = product_settings.settings_only().get("custom_instructions", [])
             else:
                 config = getattr(self, "config", None)
                 persona = getattr(config, "persona", None)
@@ -1260,6 +1268,7 @@ class SessionRuntime(SpeakerRuntimeMixin):
             shadow_context = ShadowContextProjector(
                 self.history, user_profile=self._shadow_user_profile,
                 continuity_document=str(getattr(continuity, "document", "") or ""),
+                custom_instructions=shadow_projection(getattr(self, "_instruction_snapshot", [])),
             )
             self.shadow_context = shadow_context
             if shadow_session is not None:

@@ -38,10 +38,9 @@ def test_persona_loader_preserves_markdown_and_records_status(tmp_path):
 
     documents = PersonaDocumentLoader(PersonaConfig(directory=tmp_path)).load()
 
-    assert documents.instructions == "# 指令\n等待定稿。\n"
     assert documents.personality == "# 人格\n保持平静。\n"
     assert documents.user == "# 用户\n称呼：小林。\n"
-    assert [status.name for status in documents.statuses] == ["instructions", "personality", "user"]
+    assert [status.name for status in documents.statuses] == ["personality", "user"]
     assert all(status.loaded for status in documents.statuses)
     assert all(status.chars > 0 for status in documents.statuses)
 
@@ -55,9 +54,9 @@ def test_persona_loader_skips_missing_empty_and_invalid_documents(tmp_path, capl
         documents = PersonaDocumentLoader(PersonaConfig(directory=tmp_path)).load()
 
     assert documents == documents.__class__(statuses=documents.statuses)
-    assert {status.reason for status in documents.statuses} == {"empty", "invalid_utf8", "missing"}
+    assert {status.reason for status in documents.statuses} == {"invalid_utf8", "missing"}
     assert "agent.persona_document_skipped" in caplog.text
-    assert "document=instructions" in caplog.text
+    assert "document=instructions" not in caplog.text
     assert "document=personality" in caplog.text
     assert "document=user" in caplog.text
 
@@ -101,12 +100,11 @@ def test_persona_documents_are_static_and_projected_into_responses_in_order(tmp_
             if message["context_lane"] == ContextLane.STATIC_INSTRUCTIONS
         ]
         first_rendered = "\n".join(first_static)
-        assert "# 指令" in first_rendered
+        assert "# 指令\n等待定稿" not in first_rendered
         assert "# 人格" in first_rendered
         assert "# 用户" in first_rendered
-        assert first_rendered.index("指令集合文档") < first_rendered.index("人格主体文档")
         assert first_rendered.index("人格主体文档") < first_rendered.index("用户资料文档")
-        assert "内置协议规则 > 指令集合 > 人格主体 > 用户资料" in first_rendered
+        assert "内置协议规则 > 用户自定义指令 > 人格主体 > 用户资料" in first_rendered
 
         payload = DeepSeekClient._responses_payload(
             first,
@@ -116,12 +114,11 @@ def test_persona_documents_are_static_and_projected_into_responses_in_order(tmp_
             reasoning_effort="none",
             max_output_tokens=100,
         )
-        assert "# 指令" in payload["instructions"]
+        assert "# 指令\n等待定稿" not in payload["instructions"]
         assert "# 人格" in payload["instructions"]
         assert "# 用户" in payload["instructions"]
         assert all(
-            "# 指令" not in item["content"][0]["text"]
-            and "# 人格" not in item["content"][0]["text"]
+            "# 人格" not in item["content"][0]["text"]
             and "# 用户" not in item["content"][0]["text"]
             for item in payload["input"]
         )
