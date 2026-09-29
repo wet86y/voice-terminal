@@ -1670,6 +1670,8 @@ class AgentEpisodeRuntime(AgentContextMixin):
             transcript_update = {
                 "kind": "refinement", "source": source, "text": text or "", "revision": revision,
             }
+            if isinstance(payload.get("audio_cues"), list):
+                transcript_update["audio_cues"] = payload["audio_cues"]
             updates = [
                 dict(item) for item in previous.get("transcript_updates", [])
                 if isinstance(item, dict) and item.get("kind") != "refinement"

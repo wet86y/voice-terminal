@@ -36,14 +36,25 @@ class SmartTurn:
             raise RuntimeError(f"SmartTurn ONNX Runtime（ONNX 推理运行时）初始化失败：{last_error}") from last_error
         self.extractor = WhisperFeatureExtractor.from_pretrained(str(model_dir), local_files_only=True)
 
-    def __call__(self, pcm: bytes) -> dict:
+    @staticmethod
+    def new_run_options():
+        import onnxruntime as ort
+        return ort.RunOptions()
+
+    def __call__(self, pcm: bytes, run_options=None) -> dict:
         import numpy as np
+        if run_options is not None and run_options.terminate:
+            raise RuntimeError("analysis cancelled")
         audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32)[-128000:] / 32768
         audio = np.pad(audio, (128000 - len(audio), 0))
         features = self.extractor(audio, sampling_rate=16000, return_tensors="np",
                                   padding="max_length", max_length=128000,
                                   truncation=True, do_normalize=True).input_features.astype(np.float32)
-        probability = float(self.session.run(None, {self.session.get_inputs()[0].name: features})[0].reshape(-1)[0])
+        if run_options is not None and run_options.terminate:
+            raise RuntimeError("analysis cancelled")
+        probability = float(self.session.run(
+            None, {self.session.get_inputs()[0].name: features}, run_options,
+        )[0].reshape(-1)[0])
         if not 0 <= probability <= 1:
             raise ValueError("invalid endpoint probability")
         return {"probability": probability}

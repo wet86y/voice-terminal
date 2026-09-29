@@ -789,8 +789,20 @@ def test_refinement_is_supplemental_and_never_changes_cancellation_scope():
     wakes = []; runtime._wake = lambda kind: wakes.append(kind)
     asyncio.run(runtime.observe("USER_INPUT_FINALIZED", turn_id="turn_a", text="明天开会"))
     scope = conversation.scope_id
-    asyncio.run(runtime.observe("USER_INPUT_REFINED", turn_id="turn_a", text="明天下午开会"))
+    asyncio.run(runtime.observe(
+        "USER_INPUT_REFINED", turn_id="turn_a", text="明天下午开会",
+        audio_cues=[{"start_ms": 0, "end_ms": 800, "emotion": "HAPPY", "events": ["Speech", "BGM"]}],
+    ))
     assert conversation.scope_id == scope and wakes[-1] == "USER_INPUT_REFINED"
+    assert runtime.inputs["turn_a"]["transcript_updates"][-1]["audio_cues"][0]["emotion"] == "HAPPY"
+    context = runtime.messages({"USER_INPUT_REFINED"}, current_turn_id="turn_a")
+    packet = json.loads(context[-2]["content"])
+    current_tail = next(item["content"] for item in packet["entries"] if item["kind"] == "runtime_state")
+    assert '"emotion":"HAPPY"' in current_tail and '"events":["BGM"]' in current_tail
+    later = runtime.messages(set(), current_turn_id="turn_a")
+    later_packet = json.loads(later[-2]["content"])
+    later_tail = next(item["content"] for item in later_packet["entries"] if item["kind"] == "runtime_state")
+    assert '"audio_cues"' not in later_tail
 
 
 def test_late_refinement_keeps_newest_turn_current_but_targets_original_turn_for_dispatch():

@@ -357,7 +357,7 @@ function deliveryStatusLabel(delivery: { status?: string; termination?: string }
             <span v-if="analysis.probability != null">结束概率 {{ Math.round(analysis.probability * 100) }}%</span>
           </p>
           <ul><li v-for="(segment, index) in terminal.current.segments" :key="index">{{ segment.text }}</li></ul>
-          <p v-if="terminal.current.audio_cues?.length"><strong>SenseVoice 语音情绪：</strong>已进入最终请求的 speech_emotion</p>
+          <p v-if="terminal.current.audio_cues?.length"><strong>SenseVoice 语音线索：</strong>精修更新到达时，情绪与声学事件随该次请求提供给主模型判断。</p>
           <p v-for="(cue, index) in terminal.current.audio_cues" :key="index">
             {{ cue.start_ms }}–{{ cue.end_ms }} ms · {{ cue.language }} · {{ cue.emotion }} · {{ cue.events.join(', ') }}
           </p>

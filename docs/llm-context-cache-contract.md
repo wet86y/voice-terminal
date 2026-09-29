@@ -116,6 +116,7 @@ Shadow thinking+tools 的合法 `reasoning`、`function_call`、`function_call_o
 | 固定协议、动作目录、人格文档快照 | Agent runtime | STATIC | 否 | placement/digest |
 | 最终用户输入 | SessionLedger | HISTORY | 是 | ledger/replay |
 | 已完成 speech 的传达事实 | Speech/ledger | HISTORY | 是 | delivery/order |
+| `transcript_updates.available.audio_cues`（可用精修更新中的情绪与声学事件线索） | LLMContextProjector（LLM 上下文投影器） | 仅由 USER_INPUT_REFINED（用户输入精修完成事件）触发的 REQUEST_TAIL（请求尾部） | 否 | 字段筛选/单次发送/缓存前缀 |
 | 当前未提交输入 | Context projector | REQUEST_TAIL | 否 | wrapper/order |
 | 活动 speak 四段 | Speech runtime | REQUEST_TAIL | 否 | append/rewrite/replace |
 | 最近一次传达前沿 `delivery`（仅 `state=empty`） | Speech runtime | REQUEST_TAIL | 否 | delivery/order |

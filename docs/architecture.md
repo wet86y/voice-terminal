@@ -35,6 +35,13 @@ SessionLedger ──> LLMContextProjector ──> 主 LLM 请求
 - 未播放的 assistant 草稿不进入 HISTORY；实际传达内容在结算时通过冻结的 `voice_delivery` 追加。
 - ASR refinement 更新当前输入和诊断，不回写已经提交的用户 HISTORY。
 
+#### 语音端点与分析模型
+
+- Voice Server 的 FSMN‑VAD（语音活动检测模型）以 `vad.end_silence_ms`（VAD 结束静音时长）200ms 判断停顿。每次 `speech_ended`（语音结束事件）只启动一次 SmartTurn（语句结束判断）；`candidate_ms`（候选等待时长）和 `recheck_ms`（重试间隔）只为旧配置兼容读取，不再影响端点判断。
+- VAD 在 SmartTurn 推理时持续接收音频。若检测到再次开口，控制器立即使该次判断失效，并通过分析 WebSocket 的 `cancel`（取消消息）通知工作进程；SmartTurn 每次推理使用独立的 ONNX Runtime `RunOptions`（推理选项）请求终止。分析通道只有在原生推理实际结束后才释放，因此取消不成功时不会排队重叠推理。
+- SmartTurn 使用当前停顿前的最近 8 秒音频窗口；窗口不会因一次分析而从输入缓冲中删除。分析繁忙、失败、超时或未判定结束时继续收音，`hard_silence_ms`（硬静音封口时长）1400ms 执行兜底封口。
+- 确认封口后，Paraformer（流式语音识别）最终稿与 SenseVoiceSmall（语音精修和声学分析）并行处理。SenseVoice 的精修稿与音频线索随 `USER_INPUT_REFINED`（用户输入精修完成事件）进入对应请求尾部；线索只用于该次精修触发的请求，不写入冻结 HISTORY，也不在后续心跳重复发送。线索是模型推断，不是转写事实。
+
 ### 语音事务
 
 语音文本有两个边界：
@@ -113,7 +120,7 @@ none → kws standby → asr active → kws standby → none
 - 主模型：稳定 instructions、追加 HISTORY、请求末尾 REQUEST_TAIL。
 - Shadow：用户输入/refinement、实际传达的 assistant 文本、有效外部事件和有语义打断；排除播放器机械状态、未播放草稿和自己的进度文本。
 
-具体字段准入和缓存前缀要求以[LLM 上下文缓存契约](llm-context-cache-contract.md)为准，不在本文复制字段表。
+具体字段准入和缓存前缀要求以[LLM 上下文缓存契约](llm-context-cache-contract.md)为准，不在本文复制字段表。`audio_cues`（情绪与声学事件线索）属于精修更新的临时 `REQUEST_TAIL`（请求尾部），其准入和筛选规则见[上下文与工具规范](context-and-tools.md)。
 
 ## Product UI 边界
 
