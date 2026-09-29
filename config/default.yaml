@@ -6,8 +6,6 @@ smart_turn:
   smart_turn: true
   sensevoice: true
   analysis_url: ws://127.0.0.1:8767/analysis
-  candidate_ms: 500
-  recheck_ms: 200
   smart_timeout_ms: 300
   hard_silence_ms: 1400
   max_turn_ms: 60000
@@ -121,9 +119,8 @@ wake:
 vad:
   model: fsmn-vad
   min_speech_ms: 250
-  # Smart Turn uses a 300 ms VAD end boundary and then applies the
-  # candidate/recheck/hard-silence policy above.
-  end_silence_ms: 300
+  # One SmartTurn check starts at this VAD end boundary; hard silence remains a fallback.
+  end_silence_ms: 200
   max_turn_ms: 15000
 
 asr:

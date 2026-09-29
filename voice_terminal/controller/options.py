@@ -11,6 +11,7 @@ class InputOptions:
     web_search: bool = False
     analysis_url: str = "ws://127.0.0.1:8767/analysis"
     threshold: float = 0.5
+    # Accepted for older configurations; VAD end now starts one analysis per pause.
     candidate_ms: int = 500
     recheck_ms: int = 200
     smart_timeout_ms: int = 300
@@ -48,7 +49,7 @@ class InputOptions:
             value = getattr(result, key)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"smart_turn.{key} must be a positive integer")
-        if not 0 <= result.threshold <= 1 or result.hard_silence_ms < result.candidate_ms:
+        if not 0 <= result.threshold <= 1:
             raise ValueError("invalid Smart Turn thresholds")
         if result.max_turn_ms > 60000 or result.max_segment_chars < result.min_segment_chars:
             raise ValueError("invalid smart_turn bounds")

@@ -136,6 +136,36 @@ class LLMContextProjector:
     """Expose semantic facts only; runtime IDs and playback state never cross."""
 
     @staticmethod
+    def _refinement_cues(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        cues = []
+        for segment in value[:32]:
+            if not isinstance(segment, dict):
+                continue
+            emotion = segment.get("emotion")
+            emotion = emotion if isinstance(emotion, str) and emotion not in {"", "unknown"} else None
+            raw_events = segment.get("events")
+            events = (
+                [item for item in raw_events[:8]
+                 if isinstance(item, str) and item and item != "Speech"]
+                if isinstance(raw_events, list) else []
+            )
+            if not emotion and not events:
+                continue
+            cue: dict[str, Any] = {}
+            for key in ("start_ms", "end_ms"):
+                boundary = segment.get(key)
+                if type(boundary) is int and boundary >= 0:
+                    cue[key] = boundary
+            if emotion:
+                cue["emotion"] = emotion[:32]
+            if events:
+                cue["events"] = [item[:32] for item in events]
+            cues.append(cue)
+        return cues
+
+    @staticmethod
     def current_session_time() -> str:
         """Render wall-clock time as a conversational fact, never an epoch value.
 
@@ -183,15 +213,20 @@ class LLMContextProjector:
             payload["runtime"]["input_status"] = "finalized"
         elif current.user_speaking is True:
             payload["runtime"]["input_status"] = "speaking"
-        available = [
-            {
+        available = []
+        for update in current.transcript_updates:
+            if not isinstance(update, dict) or not str(update.get("text") or "").strip():
+                continue
+            item = {
                 key: update[key]
                 for key in ("kind", "source", "text", "revision", "streamed_text")
                 if key in update
             }
-            for update in current.transcript_updates
-            if isinstance(update, dict) and str(update.get("text") or "").strip()
-        ]
+            if update.get("kind") == "refinement" and "USER_INPUT_REFINED" in current.recent_events:
+                cues = LLMContextProjector._refinement_cues(update.get("audio_cues"))
+                if cues:
+                    item["audio_cues"] = cues
+            available.append(item)
         triggered_by: list[str] = []
         if "USER_INPUT_FINALIZED" in current.recent_events:
             triggered_by.append("asr_final")

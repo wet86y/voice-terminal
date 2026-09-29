@@ -57,7 +57,6 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self._speech_end_sample: int | None = None
         self._speech_start_sample: int | None = None
         self._speech_samples = 0
-        self._last_candidate = 0.0
         self._sub_sequence = 0
         self._sub_id: str | None = None
         self._sub_parts: dict[str, str] = {}
@@ -525,9 +524,12 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             return
 
         if activity.speech_started:
-            self._last_candidate = 0
             if self._endpoint_task:
-                self._endpoint_task.cancel()
+                stale_task = self._endpoint_task
+                self._endpoint_task = None
+                # The task sends native inference cancellation without holding
+                # up this VAD/audio callback.
+                stale_task.cancel()
         if activity.speech_ended:
             await self._segment(ws.raw_partial, pause=True)
         elapsed_ms = (frame.captured_at - ws.started_at) * 1000
@@ -538,14 +540,15 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         if self._speech_end_sample is None:
             return
         silence_ms = max(0, (frame.end_sample - self._speech_end_sample) / 16)
-        if silence_ms < self.options.candidate_ms:
-            return
-        ws.timings["last_speech"] = frame.captured_at - (frame.end_sample - self._speech_end_sample) / 16000
-        if not self.options.smart_turn or silence_ms >= self.options.hard_silence_ms:
-            await self._freeze("hard_silence" if self.options.smart_turn else "vad_end", frame)
-        elif (self._endpoint_task is None or self._endpoint_task.done()) and time.monotonic() - self._last_candidate >= self.options.recheck_ms / 1000:
-            self._last_candidate = time.monotonic()
-            self._endpoint_task = asyncio.create_task(self._endpoint(ws, frame))
+        if activity.speech_ended:
+            ws.timings["last_speech"] = frame.captured_at - silence_ms / 1000
+        if not self.options.smart_turn:
+            if activity.speech_ended:
+                await self._freeze("vad_end", frame)
+        elif silence_ms >= self.options.hard_silence_ms:
+            await self._freeze("hard_silence", frame)
+        elif activity.speech_ended:
+            self._endpoint_task = asyncio.create_task(self._endpoint(ws, frame, ws.audio.tail()))
             self._track(self._endpoint_task)
 
     async def _new_turn(self, frame: AudioFrame) -> None:
@@ -572,7 +575,6 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self.segmenter = TranscriptSegmenter(self.options.min_segment_chars, self.options.max_segment_chars)
         self._active_input = True
         self.barge_in_gate.reset()
-        self._last_candidate = 0
         self._turn_cancel = asyncio.Event()
         self._sub_parts.clear()
         self._sub_finals.clear()
@@ -662,25 +664,35 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         await self._detail("turn.resumed")
         await self._state_event(TerminalState.LISTENING, listening=True, turn_id=ws.turn_id)
 
-    async def _endpoint(self, ws: TurnWorkspace, frame: AudioFrame) -> None:
+    async def _endpoint(self, ws: TurnWorkspace, frame: AudioFrame, audio: bytes) -> None:
         token = ws.token
-        await self._detail("turn.endpoint_candidate", audio_end_sample=frame.end_sample)
+        task = asyncio.current_task()
+        # Start native inference before publishing the candidate event; Agent
+        # scheduling must not delay the endpoint check.
+        analysis_task = asyncio.create_task(self.analysis.analyze(
+            "endpoint", audio, *token, self.options.smart_timeout_ms,
+        ))
         try:
-            reply = await self.analysis.analyze("endpoint", ws.audio.tail(), *token, self.options.smart_timeout_ms)
-            if not self._valid(token) or not self._active_input:
+            await self._detail("turn.endpoint_candidate", audio_end_sample=frame.end_sample)
+            reply = await analysis_task
+            if task is not self._endpoint_task or not self._valid(token) or not self._active_input:
                 return
             result = reply["result"]
             ws.analysis["endpoint"] = {**result, "status": "READY"}
             ws.timings["smart_turn_ms"] = reply["elapsed_ms"]
             await self._detail("turn.semantic_state", **result)
-            if result["probability"] >= self.options.threshold:
+            if result["probability"] >= self.options.threshold and task is self._endpoint_task:
                 await self._freeze("smart_turn", self._last_frame)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if self._valid(token):
+            if task is self._endpoint_task and self._valid(token):
                 ws.analysis["endpoint"] = {"status": "DEGRADED", "error": str(exc) or "timeout"}
                 await self._detail("turn.semantic_state", **ws.analysis["endpoint"])
+        finally:
+            if not analysis_task.done():
+                analysis_task.cancel()
+            await asyncio.gather(analysis_task, return_exceptions=True)
 
     async def _freeze(self, reason: str, frame: AudioFrame) -> None:
         if not self._active_input:

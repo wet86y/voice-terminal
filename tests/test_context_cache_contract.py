@@ -386,7 +386,10 @@ def test_late_refinement_does_not_rewrite_cached_history_prefix():
         finalized=True, turn_id="turn-a", recent_events=("USER_INPUT_REFINED",),
         transcript_updates=(
             {"kind": "asr_final", "source": "paraformer", "text": "初始转录", "revision": 1},
-            {"kind": "refinement", "source": "sensevoice", "text": "晚到精修转录", "revision": 2},
+            {"kind": "refinement", "source": "sensevoice", "text": "晚到精修转录", "revision": 2,
+             "audio_cues": [{"start_ms": 0, "end_ms": 900, "text": "晚到精修转录",
+                             "language": "zh", "emotion": "HAPPY",
+                             "events": ["Speech", "BGM"], "raw_tags": ["HAPPY", "BGM"]}]},
         ),
     )
     after = request(after_current)
@@ -406,3 +409,17 @@ def test_late_refinement_does_not_rewrite_cached_history_prefix():
     assert '"kind":"refinement"' in runtime_content
     assert '"text":"晚到精修转录"' in runtime_content
     assert '"triggered_by":["refinement"]' in runtime_content
+    assert '"audio_cues":[{"start_ms":0,"end_ms":900,"emotion":"HAPPY","events":["BGM"]}]' in runtime_content
+    assert "raw_tags" not in runtime_content
+    assert "language" not in runtime_content
+    provider = DeepSeekClient._responses_payload(
+        after, model="deepseek", schema=decision_schema([]), schema_name="decision",
+        reasoning_effort="none", max_output_tokens=100,
+    )
+    assert "audio_cues" in json.dumps(provider["input"], ensure_ascii=False)
+
+    later = request(CurrentInput(
+        text="初始转录", primary_transcript="初始转录", finalized=True,
+        turn_id="turn-a", transcript_updates=after_current.transcript_updates,
+    ))
+    assert '"audio_cues"' not in json.dumps(later, ensure_ascii=False)

@@ -32,6 +32,27 @@
 
 `delivery` 只在队列为空（`state=empty`）时出现，且只含 `heard_text`、`status`、`termination` 三个键：它是"用户实际听到的前沿"，与 `text_parts` 的"已发送"不是同一件事，也不携带任何 speech/turn/request ID。队列非空时不投影 `delivery`，避免与当前事务的 `text_parts` 争夺"说到哪"的解释权。
 
+### SenseVoice 精修线索
+
+SenseVoiceSmall（语音精修和声学分析）返回的精修文本进入同一用户轮次的 `transcript_updates.available`（可用转写更新）。有可用情绪或声学事件时，该条 `refinement`（精修更新）可额外携带 `audio_cues`（音频判断线索）。示例中的 `kind`（更新种类）、`source`（来源）、`text`（精修文本）和 `revision`（修订序号）用于标识同一轮次的精修：
+
+```json
+{
+  "kind": "refinement",
+  "source": "sensevoice",
+  "text": "精修后的文本",
+  "revision": 2,
+  "audio_cues": [
+    {"start_ms": 0, "end_ms": 900, "emotion": "HAPPY", "events": ["BGM"]}
+  ]
+}
+```
+
+- `start_ms`（片段开始毫秒）、`end_ms`（片段结束毫秒）、`emotion`（语音情绪）和 `events`（声学事件）仅用于描述 SenseVoice 的模型推断；不是用户转写内容或确定事实。`Speech`（普通语音事件）、未知情绪、转写文本、语言字段和原始标签不复制进线索。
+- `audio_cues` 只在当前请求由 `USER_INPUT_REFINED`（用户输入精修完成事件）触发时出现。`transcript_updates.available`（可用转写更新）后续仍可保留精修文本，但不重复带入音频线索；如果 ASR 最终稿与精修同窗到达，线索仍只属于精修条目。
+- `audio_cues.emotion`（输入语音情绪）与 `speak.emotion`（输出播报情绪）是不同信息，前者为理解语音提供参考，不会设置后者。
+- 线索只在当前 `REQUEST_TAIL`（请求尾部）中短暂出现，不追加到 `HISTORY`（会话历史）；历史缓存前缀保持不变。
+
 ### Shadow
 
 Shadow 使用独立的 `ShadowContextProjector`，来源仍是 `SessionLedger`，但不复用主模型 prompt。允许内容：

@@ -288,7 +288,7 @@ class SessionRuntime(SpeakerRuntimeMixin):
                 device=vad_requested,
                 fallback_device=self.config.compute.fallback_devices.get("voice_vad", "cpu"),
                 sample_rate=self.config.audio.sample_rate,
-                end_silence_ms=300 if self.config.smart_turn.enabled else None,
+                end_silence_ms=self.config.vad.end_silence_ms,
             )
             self._compute_models["voice_vad"] = {
                 "requested_device": vad_requested,
