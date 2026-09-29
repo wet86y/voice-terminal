@@ -74,6 +74,19 @@ export interface ProductRuntimeSnapshot {
   }
 }
 
+export interface CustomInstruction {
+  /** id（稳定标识）。 */
+  id: string
+  /** trigger（自然语言触发语义）。 */
+  trigger: string
+  /** target（执行位置）。 */
+  target: 'voice' | 'shadow'
+  /** instruction（执行目标）。 */
+  instruction: string
+  /** enabled（启用状态）。 */
+  enabled: boolean
+}
+
 export interface ProductSettingsSnapshot {
   schema_version: number
   /** TTS backend（语音后端）固定为 MiniMax API（在线语音接口）。 */
@@ -101,7 +114,9 @@ export interface ProductSettingsSnapshot {
   }
   /** compute（本地模型设备偏好）：不包含 TTS（语音合成）。 */
   compute: ProductComputeSettings
-  persona: Record<'instructions' | 'personality' | 'user' | 'shadow', string>
+  /** custom_instructions（用户自定义指令条目）。 */
+  custom_instructions: CustomInstruction[]
+  persona: Record<'personality' | 'user', string>
   warnings: string[]
 }
 

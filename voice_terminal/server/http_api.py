@@ -101,7 +101,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         runtime_payload["tts_worker"] = {"state": "stopped"}
         conversation = runtime_payload.pop("conversation", {"recent": [], "current": {}})
         settings = product_settings.snapshot() if product_settings is not None else {
-            "schema_version": 6,
+            "schema_version": 7,
             "wake": {
                 "enabled": runtime.config.wake.enabled,
                 "keyword": runtime.config.wake.keyword,
@@ -129,6 +129,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "fallback_devices": dict(runtime.config.compute.fallback_devices),
             },
             "persona": {},
+            "custom_instructions": [],
             "warnings": [],
         }
         models = await model_registry.snapshot() if model_registry is not None else {
@@ -489,6 +490,25 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "effective_from": "next_episode",
                 "pending": True,
                 "message": "Persona 已保存，将在下一次 Episode/会话生效。",
+            }
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                raise
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.put("/api/v1/product/settings/custom-instructions")
+    async def update_custom_instructions(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            if set(body) != {"custom_instructions"}:
+                raise ProductSettingsError("请求字段必须是 custom_instructions（自定义指令列表）。")
+            store = product_store_or_404()
+            value = await asyncio.to_thread(store.save_custom_instructions, body["custom_instructions"])
+            return {
+                "settings": {"custom_instructions": value["custom_instructions"]},
+                "effective_from": "next_session",
+                "pending": True,
+                "message": "自定义指令已保存，将在下一次会话或重置后生效。",
             }
         except Exception as exc:
             if isinstance(exc, HTTPException):

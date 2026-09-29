@@ -288,21 +288,15 @@ class ProductSidecarTests(unittest.TestCase):
             }))
 
         payload = {
-            "instructions": "主指令",
             "personality": "温和",
             "user": "用户资料",
-            "shadow": "Shadow 指令",
         }
         snapshot = store.save_persona(payload)
         self.assertEqual(snapshot["persona"], payload)
-        self.assertEqual(
-            (self.config.persona.directory / "instructions.md").read_text(encoding="utf-8"),
-            "主指令",
-        )
-        self.assertEqual(
-            (self.config.persona.directory.parent / "shadow_agent" / "instructions.md").read_text(encoding="utf-8"),
-            "Shadow 指令",
-        )
+        with self.assertRaises(ProductSettingsError):
+            store.save_persona({**payload, "instructions": "不能修改内部指令"})
+        with self.assertRaises(ProductSettingsError):
+            store.save_persona({**payload, "shadow": "不能修改影子规则"})
         with self.assertRaises(ProductSettingsError):
             store.save_persona({**payload, "path": "../../outside.txt"})
         with self.assertRaises(ProductSettingsError):

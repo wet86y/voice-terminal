@@ -18,11 +18,13 @@ logger = logging.getLogger(__name__)
 
 class EpisodeController(RealtimeController):
     def __init__(self, *, agent_options, persona_config=None,
+                 custom_instructions_provider=None,
                  continuity_document_provider=None, on_user_activity=None,
                  on_silence_anchor=None, **kwargs):
         super().__init__(**kwargs)
         self.agent_options = agent_options
         self.persona_config = persona_config
+        self.custom_instructions_provider = custom_instructions_provider
         self.continuity_document_provider = continuity_document_provider
         self.on_user_activity = on_user_activity
         self.on_silence_anchor = on_silence_anchor
@@ -45,6 +47,7 @@ class EpisodeController(RealtimeController):
                                       options=self.agent_options, tools_enabled=True,
                                        shadow_waker=self.shadow_waker,
                                        reasoning_mode=mode, persona_config=self.persona_config,
+                                       custom_instructions_provider=self.custom_instructions_provider,
                                        defer_silence_until_output=self.wake_always_on,
                                        on_final_system_check_settled=self._final_system_check_settled,
                                        continuity_document_provider=self.continuity_document_provider,

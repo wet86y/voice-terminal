@@ -34,7 +34,6 @@ class PersonaDocuments:
 
     personality: str = ""
     user: str = ""
-    instructions: str = ""
     statuses: tuple[PersonaDocumentStatus, ...] = ()
 
 
@@ -47,7 +46,6 @@ class PersonaDocumentLoader:
     """
 
     _SPECS = (
-        ("instructions", "instructions_file"),
         ("personality", "personality_file"),
         ("user", "user_file"),
     )
@@ -105,7 +103,6 @@ class PersonaDocumentLoader:
         return PersonaDocuments(
             personality=values.get("personality", ""),
             user=values.get("user", ""),
-            instructions=values.get("instructions", ""),
             statuses=tuple(statuses),
         )
 

@@ -175,14 +175,28 @@ class ProductApiTests(unittest.TestCase):
         valid_persona = asyncio.run(self._request(
             "PUT", "/api/v1/product/settings/persona",
             json={
-                "instructions": "instructions",
                 "personality": "personality",
                 "user": "user",
-                "shadow": "shadow",
             },
         ))
         self.assertEqual(valid_persona.status_code, 200)
         self.assertEqual(valid_persona.json()["effective_from"], "next_episode")
+        entry = {
+            "id": "search", "trigger": "帮我查查", "target": "shadow",
+            "instruction": "查询用户所问的资料。", "enabled": True,
+        }
+        saved = asyncio.run(self._request(
+            "PUT", "/api/v1/product/settings/custom-instructions",
+            json={"custom_instructions": [entry]},
+        ))
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()["effective_from"], "next_session")
+        self.assertEqual(saved.json()["settings"]["custom_instructions"], [entry])
+        invalid = asyncio.run(self._request(
+            "PUT", "/api/v1/product/settings/custom-instructions",
+            json={"custom_instructions": [entry, entry]},
+        ))
+        self.assertEqual(invalid.status_code, 422)
 
     def test_bootstrap_returns_the_server_ordered_conversation(self) -> None:
         ledger = self.runtime.history

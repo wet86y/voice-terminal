@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import type { ReasoningMode, ShadowActivity } from '../types'
+import type { CustomInstruction } from './types'
 import {
   useProductAdapter,
   type AssignmentSlot,
@@ -17,7 +18,7 @@ const {
   currentTurnLogged, currentTurnSpeechLogged, currentTurnSpeechPending, shadow, latencyMs, latencyRunning, wakeForm,
   wakeTasks, editingWakeTaskId, wakeTaskDraft, refreshWakeTasks, editWakeTask, saveWakeTask, removeWakeTask,
   maxWakeKeywords, addWakeKeyword, removeWakeKeyword,
-  silenceSeconds, personaDocument: activePersona, personaDocuments, providerForm,
+  silenceSeconds, personaDocument: activePersona, personaDocuments, customInstructions, providerForm,
   providerStep, discoveredModels, modelAssignments, uiModels: modelEntries,
   availableLlmModels, availableTtsModels, visibleLocalPool, hiddenPool,
   managedApiModelPool, selectedModels, activeModels, activeTtsModel, registry,
@@ -25,7 +26,7 @@ const {
   shadowExpanded, modelScanState, restartState, applyImpact, dsh, openDshConsole,
   lastError, notice, noticeVisible, runtimeAction, resetSession, setReasoningMode,
   toggleProviderReasoning,
-  saveWake, saveSilence, saveShadowGate, savePersona, scanModels, discoverProvider, verifyCustomModel,
+  saveWake, saveSilence, saveShadowGate, savePersona, saveCustomInstructions, scanModels, discoverProvider, verifyCustomModel,
   addVerifiedProvider,
   requestModelApply, confirmModelApply, retry, setNotice,
   speakerForm, speakerStatus, speakerProfile, speakerTestResult, ambientContext, speakerEnrollment,
@@ -110,11 +111,52 @@ const roleLabels: Record<AssignmentSlot, { title: string; hint: string; kind: st
 }
 const llmAssignmentSlots: AssignmentSlot[] = ['voice', 'shadow', 'status']
 const personaItems: Array<{ id: keyof typeof personaDocuments; label: string; path: string; owner: string }> = [
-  { id: 'instructions', label: '工作指令', path: 'config/persona/instructions.md', owner: '主 LLM' },
   { id: 'personality', label: '人格风格', path: 'config/persona/personality.md', owner: '主 LLM' },
   { id: 'user', label: '用户资料', path: 'config/persona/user.md', owner: '主 LLM' },
-  { id: 'shadow', label: 'Shadow 指令', path: 'config/shadow_agent/instructions.md', owner: 'Shadow Agent' },
 ]
+const emptyInstruction = (): CustomInstruction => ({ id: '', trigger: '', target: 'voice', instruction: '', enabled: true })
+const instructionDraft = reactive<CustomInstruction>(emptyInstruction())
+const instructionFormError = ref('')
+
+function editInstruction(item: CustomInstruction) {
+  Object.assign(instructionDraft, item)
+  instructionFormError.value = ''
+}
+
+function clearInstructionDraft() {
+  Object.assign(instructionDraft, emptyInstruction())
+  instructionFormError.value = ''
+}
+
+function stageInstruction() {
+  const trigger = instructionDraft.trigger.trim()
+  const instruction = instructionDraft.instruction.trim()
+  if (!trigger || !instruction) {
+    instructionFormError.value = '请填写触发语义和执行目标。'
+    return false
+  }
+  if (trigger.length > 200 || instruction.length > 2000) {
+    instructionFormError.value = '触发语义最多 200 字，执行目标最多 2000 字。'
+    return false
+  }
+  const item = { ...instructionDraft, id: instructionDraft.id || crypto.randomUUID(), trigger, instruction }
+  const index = customInstructions.value.findIndex(row => row.id === item.id)
+  if (index >= 0) customInstructions.value.splice(index, 1, item)
+  else customInstructions.value.push(item)
+  clearInstructionDraft()
+  return true
+}
+
+async function saveInstructionSettings() {
+  if ((instructionDraft.id || instructionDraft.trigger.trim() || instructionDraft.instruction.trim())
+      && !stageInstruction()) return
+  await saveCustomInstructions()
+}
+
+function removeInstruction(id: string) {
+  customInstructions.value = customInstructions.value.filter(item => item.id !== id)
+  if (instructionDraft.id === id) clearInstructionDraft()
+}
 const modelContextOptions = [32768, 65536, 131072, 262144, 524288]
 const reasoningOptions = ['off', 'low', 'medium', 'high', 'max']
 
@@ -1133,12 +1175,33 @@ function pageLabel() {
           </template>
 
           <template v-else-if="activeSettingsTab === 'persona'">
-            <header><p class="panel-kicker">人格与指令</p><h2>定义助手如何与你协作</h2><p>仅允许写入四个后端白名单 Markdown 文档。当前 Episode 继续使用已冻结内容，reset 或新 Episode 后读取新内容。</p></header>
+            <header><p class="panel-kicker">人格与指令</p><h2>定义助手如何与你协作</h2><p>用自然语言逐条定义触发语义和执行目标。保存后将在下一次会话或重置后生效。</p></header>
+            <section class="instruction-section" aria-label="自定义指令">
+              <h3>自定义指令</h3>
+              <p class="instruction-hint">语音模型按整句话的意思判断；影子代理会独立阅读用户原话。配置不会增加模型的工具权限。</p>
+              <div v-if="!customInstructions.length" class="instruction-empty">还没有自定义指令。可在下方添加第一条。</div>
+              <div v-for="item in customInstructions" :key="item.id" class="instruction-row">
+                <div><strong>{{ item.trigger }}</strong><small>{{ item.target === 'shadow' ? '影子代理执行' : '语音链路执行' }} · {{ item.instruction }}</small></div>
+                <label class="instruction-enabled"><input v-model="item.enabled" type="checkbox" :aria-label="`启用 ${item.trigger}`">启用</label>
+                <button type="button" @click="editInstruction(item)">编辑</button>
+                <button type="button" @click="removeInstruction(item.id)">删除</button>
+              </div>
+              <div class="instruction-form">
+                <h4>{{ instructionDraft.id ? '编辑指令' : '添加指令' }}</h4>
+                <label class="form-field"><span>触发语义</span><input v-model="instructionDraft.trigger" type="text" maxlength="200" placeholder="例如：帮我查查明天的天气"><small>描述用户会怎样表达，不要求逐字匹配。</small></label>
+                <label class="form-field"><span>执行位置</span><select v-model="instructionDraft.target"><option value="voice">语音链路</option><option value="shadow">影子代理</option></select></label>
+                <label class="form-field"><span>{{ instructionDraft.target === 'shadow' ? '影子代理执行目标' : '语音模型执行目标' }}</span><textarea v-model="instructionDraft.instruction" maxlength="2000" :placeholder="instructionDraft.target === 'shadow' ? '例如：查询用户所问的资料，返回已核实的结果。' : '例如：暂停回应，等待用户继续说。'"></textarea></label>
+                <p v-if="instructionFormError" class="instruction-error" role="alert">{{ instructionFormError }}</p>
+                <div class="instruction-actions"><button type="button" @click="stageInstruction">{{ instructionDraft.id ? '更新条目' : '添加条目' }}</button><button v-if="instructionDraft.id" type="button" @click="clearInstructionDraft">取消编辑</button></div>
+              </div>
+              <button class="save-button" type="button" :disabled="saving" @click="saveInstructionSettings">{{ saving ? '正在保存…' : '保存自定义指令' }}</button>
+              <small class="instruction-hint">表单和列表中的增删改、启停会在保存后持久化。</small>
+            </section>
             <div class="persona-layout"><nav class="persona-nav"><button v-for="document in personaItems" :key="document.id" type="button" :class="{ active: activePersona === document.id }" @click="activePersona = document.id"><strong>{{ document.label }}</strong><small>{{ document.owner }}</small></button></nav><label class="document-editor"><span>{{ currentDocument.path }}</span><textarea v-model="personaDocuments[currentDocument.id]" spellcheck="false"></textarea><small>UTF-8、无 NUL、单文档不超过 64 KB；保存后下一次 Episode 生效。</small></label></div>
             <label v-if="shadow.backend !== 'dsh'" class="switch-row"><div><strong>实验性 Shadow 上下文门禁</strong><span>只调用侧载模型判断新上下文的注入时机；不删除、不改写正文。关闭后立即恢复全部直通。</span></div><input v-model="settings.shadow.experimental_context_gate_enabled" type="checkbox" :disabled="saving" @change="saveShadowGate"><i></i></label>
             <div v-else class="config-callout"><span class="callout-icon">DSH</span><p>DSH Shadow 使用插件强制注入 Voice 权威上下文，不启用旧 context gate。根模型、provider、reasoning 和凭据由 DSH Harness 管理。</p></div>
             <div class="info-callout"><span>β</span><p>这是实验功能。一次暂缓仅对当次请求有效；下一次请求会重新判断，真正放行时会按原 revision 顺序带入全部正文。</p></div>
-            <footer><button class="save-button" type="button" :disabled="saving" @click="savePersona">{{ saving ? '正在保存…' : '保存 Persona 文档' }}</button></footer>
+            <footer><button class="save-button" type="button" :disabled="saving" @click="savePersona">{{ saving ? '正在保存…' : '保存人格与用户资料' }}</button></footer>
           </template>
 
           <template v-else-if="activeSettingsTab === 'silence'">
