@@ -42,7 +42,8 @@ class DshPresetTests(unittest.TestCase):
         rules = (self.root / "config" / "dsh" / "shadow-agent.rules.md").read_text(encoding="utf-8")
         self.assertIn('"dsh"', manifest)
         for tool in (
-            "get_latest_context", "read_ambient_context", "publish_main_event",
+            "get_latest_context", "read_ambient_context", "publish_progress",
+            "publish_voice_information",
             "request_user_input", "return_shadow_result", "finish_shadow_no_action",
         ):
             self.assertIn(tool, source)

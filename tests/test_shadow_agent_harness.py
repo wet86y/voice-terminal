@@ -23,8 +23,8 @@ def message(text: str) -> dict:
 def call(index: int) -> dict:
     return {
         "type": "function_call", "status": "completed", "call_id": f"c{index}",
-        "name": "publish_main_event",
-        "arguments": json.dumps({"kind": "progress", "text": f"step {index}"}),
+        "name": "publish_progress",
+        "arguments": json.dumps({"text": f"step {index}"}),
     }
 
 
@@ -195,7 +195,7 @@ def test_observer_runs_at_activation_start_and_five_committed_steps_without_tool
         assert observer[0]["tools"] == []
         assert observer[0]["max_output_tokens"] == 512
         assert runtime.committed_model_steps == 6
-        assert any(event.kind == "status" for event in events)
+        assert any(event.kind == "information" and event.source == "observer" for event in events)
         assert events[-1].kind == "result"
         await runtime.close()
 
@@ -379,7 +379,7 @@ def test_new_activation_preserves_valid_prefix_and_neutralizes_only_bad_terminal
         assert not any(item.get("type") == "message" for item in resumed)
         encoded = json.dumps(resumed, ensure_ascii=False)
         assert "第一轮完成" in encoded
-        assert "publish_main_event" in encoded
+        assert "publish_progress" in encoded
         assert "step 1" in encoded
         assert "继续处理第二件事" in encoded
         assert "private" in encoded
@@ -429,7 +429,7 @@ def test_unreplayable_tool_response_keeps_call_and_result_protocol_neutral(tmp_p
             for item in second
         )
         encoded = json.dumps(second, ensure_ascii=False)
-        assert "publish_main_event" in encoded
+        assert "publish_progress" in encoded
         assert "step 1" in encoded
         assert "Shadow 工具结果" in encoded
         assert events[-1].text == "降级协议后完成"
@@ -538,7 +538,7 @@ def test_initial_observer_is_gate_independent_and_falls_back_after_retry(tmp_pat
         runtime.wake()
         await asyncio.wait_for(main.started.wait(), timeout=1)
         for _ in range(100):
-            if any(event.kind == "status" for event in events):
+            if any(event.kind == "information" and event.source == "observer" for event in events):
                 break
             await asyncio.sleep(0.01)
         assert len(status.requests) == 2
@@ -547,7 +547,8 @@ def test_initial_observer_is_gate_independent_and_falls_back_after_retry(tmp_pat
             item.get("type") not in {"reasoning", "function_call", "function_call_output"}
             for request in status.requests for item in request["input_items"]
         )
-        assert [event.text for event in events if event.kind == "status"] == [
+        assert [event.text for event in events
+                if event.kind == "information" and event.source == "observer"] == [
             "Shadow Agent 正在处理当前任务；可读状态摘要暂时不可用，任务仍在运行。"
         ]
         await runtime.close()

@@ -11,7 +11,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from ..core.events import VoiceEvent, event
-from ..dsh import DshBridgeError, DshShadowAgentSession
+from ..dsh import BRIDGE_PROTOCOL_VERSION, DshBridgeError, DshShadowAgentSession
 from ..speaker.enrollment import EnrollmentRejectedError
 from ..speaker.enrollment_capture import EnrollmentCaptureError
 from ..model_registry.service import ModelRegistryError, ModelRegistryService
@@ -184,7 +184,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             headers={"Cache-Control": "no-store"},
         )
 
-    async def dsh_callback_body(request: Request) -> tuple[dict[str, Any], DshShadowAgentSession]:
+    async def dsh_callback_body(
+        request: Request, *, allow_terminal_replay: bool = False,
+    ) -> tuple[dict[str, Any], DshShadowAgentSession]:
         remote = request.client.host if request.client is not None else None
         if not runtime.dsh.bridge_hub.authorize(request.headers.get("authorization"), remote):
             raise HTTPException(status_code=401, detail="unauthorized")
@@ -195,22 +197,24 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             payload = await request.json()
         except Exception as exc:
             raise HTTPException(status_code=400, detail="invalid JSON") from exc
-        if not isinstance(payload, dict) or payload.get("protocol_version") != "1.0":
+        if not isinstance(payload, dict) or payload.get("protocol_version") != BRIDGE_PROTOCOL_VERSION:
             raise HTTPException(status_code=409, detail="protocol mismatch")
         session = runtime.dsh.bridge_hub.resolve(payload)
         if session is None:
             raise HTTPException(status_code=404, detail="binding not found")
+        await session.prepare_callback_binding(payload)
         if (payload.get("dsh_session_id") != session.dsh_session_id
                 or payload.get("epoch") != session.epoch):
-            raise HTTPException(status_code=409, detail="stale binding")
+            if not (allow_terminal_replay and session.matches_last_terminal_identity(payload)):
+                raise HTTPException(status_code=409, detail="stale binding")
         return payload, session
 
     @app.post("/api/internal/dsh-bridge/shadow.event")
     async def dsh_shadow_event(request: Request) -> JSONResponse:
-        payload, session = await dsh_callback_body(request)
+        payload, session = await dsh_callback_body(request, allow_terminal_replay=True)
         code = await session.accept_event(payload)
         return JSONResponse(
-            {"protocol_version": "1.0", "result": code},
+            {"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": code},
             status_code=200 if code in {"accepted", "duplicate"} else 409,
             headers={"Cache-Control": "no-store"},
         )
@@ -221,7 +225,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         payload, session = await dsh_callback_body(request)
         code = await session.accept_activity(payload)
         return JSONResponse(
-            {"protocol_version": "1.0", "result": code},
+            {"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": code},
             status_code=200 if code == "accepted" else 409,
             headers={"Cache-Control": "no-store"},
         )
@@ -234,7 +238,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             raise HTTPException(status_code=422, detail="invalid since_revision")
         value = session.latest_context(since)
         return JSONResponse(
-            {"protocol_version": "1.0", "result": "accepted", **value},
+            {"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": "accepted", **value},
             headers={"Cache-Control": "no-store"},
         )
 
@@ -246,7 +250,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             raise HTTPException(status_code=422, detail="invalid limit")
         return JSONResponse(
             {
-                "protocol_version": "1.0",
+                "protocol_version": BRIDGE_PROTOCOL_VERSION,
                 "result": "accepted",
                 "source": "ambient_untrusted",
                 **runtime.ambient_store.snapshot(limit),
@@ -825,7 +829,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                             await debug_events.put(event(
                                 "shadow.debug.event", None,
                                 event_id=item.event_id, kind=item.kind, text=item.text,
-                                wake_policy=item.wake_policy, payload=item.payload,
+                                source=item.source, options=list(item.options),
+                                failure_code=item.failure_code,
+                                infrastructure=item.infrastructure,
                             ))
                     try:
                         result = runtime.debug_shadow_wake(connection_id, event_sink=debug_sink)

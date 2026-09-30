@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from contextlib import aclosing
-import hashlib
 import json
 import logging
 import time
@@ -18,7 +17,7 @@ from .context_builder import AgentContextMixin
 from .runtime_events import RecoverySignal, HeartbeatPulse, EpisodeHeartbeatClock
 from .prompts import (
     PROMPT, BALANCED_THINKING_PROMPT, DEEP_THINKING_PROMPT,
-    PERSONA_DOCUMENT_POLICY, SECONDARY_MAILBOX_PROMPT,
+    PERSONA_DOCUMENT_POLICY,
     FINAL_SILENCE_PROMPT, KWS_WAKE_PROMPT,
 )
 from .options import AgentOptions
@@ -38,7 +37,7 @@ from ..session.context import (
 )
 from ..session.context_frames import ContextFrame, ContextLane
 from ..session.runtime import ConversationRuntime
-from ..shadow_agent.contracts import ShadowEvent, parse_shadow_wake
+from ..shadow_agent.contracts import DurableVoiceEvent, ShadowEvent, parse_shadow_wake
 
 
 logger = logging.getLogger(__name__)
@@ -192,16 +191,6 @@ class AgentEpisodeRuntime(AgentContextMixin):
         }
         self._completed_speech_ids: set[str] = set()
         self.pending = set()
-        self._secondary_pending: dict[str, int] = {}
-        self._secondary_seen: dict[str, str] = {}
-        self._secondary_version = 0
-        self._secondary_enqueued = 0
-        self._secondary_consumed_normal = 0
-        self._secondary_consumed_check = 0
-        self._secondary_cleared_final = 0
-        self._secondary_dispatched = 0
-        self._secondary_skipped_speaking = 0
-        self._secondary_skipped_busy = 0
         self._scheduled_wakes: list[dict] = []
         self._pending_since: float | None = None
         self._pending_transcript_turn_id: str | None = None
@@ -281,6 +270,7 @@ class AgentEpisodeRuntime(AgentContextMixin):
         self._thinking_pending_by_turn: dict[str, list[str]] = {}
         self._recovery_attempts_by_turn: dict[str, int] = {}
         self._transport_retry_attempts_by_turn: dict[str, int] = {}
+        self._retry_shadow_information_by_turn: dict[str, dict] = {}
         self._frozen_action_definitions: tuple[dict, ...] | None = None
         self._frozen_tool_catalog: tuple[dict, ...] | None = None
         self._frozen_thinking_action_enabled: bool | None = None
@@ -412,18 +402,6 @@ class AgentEpisodeRuntime(AgentContextMixin):
                   "thinking_lease_turn": self._thinking_lease_turn,
                   "reasoning_mode": self.reasoning_mode,
                   "scheduler": self.scheduler.snapshot(),
-                  "secondary_mailbox": {
-                      "pending_sources": sorted(self._secondary_pending),
-                      "pending_count": len(self._secondary_pending),
-                      "latest_version": self._secondary_version,
-                      "enqueued": self._secondary_enqueued,
-                      "consumed_normal": self._secondary_consumed_normal,
-                      "consumed_check": self._secondary_consumed_check,
-                      "cleared_final": self._secondary_cleared_final,
-                      "dispatched": self._secondary_dispatched,
-                      "skipped_speaking": self._secondary_skipped_speaking,
-                      "skipped_busy": self._secondary_skipped_busy,
-                  },
                   "heartbeat": {
                       "episode_generation": self._heartbeat_episode_generation,
                       "generated": self._heartbeat_generated,
@@ -733,16 +711,6 @@ class AgentEpisodeRuntime(AgentContextMixin):
         self.episode_id = self.conversation.conversation_id
         self.state = "WAITING_EVENT"
         self.inputs.clear()
-        self._secondary_pending.clear()
-        self._secondary_seen.clear()
-        self._secondary_version = 0
-        self._secondary_enqueued = 0
-        self._secondary_consumed_normal = 0
-        self._secondary_consumed_check = 0
-        self._secondary_cleared_final = 0
-        self._secondary_dispatched = 0
-        self._secondary_skipped_speaking = 0
-        self._secondary_skipped_busy = 0
         # Request correlation is local to this Episode and is never consulted
         # to cancel an in-flight call.
         self.context_chars = 0
@@ -767,6 +735,7 @@ class AgentEpisodeRuntime(AgentContextMixin):
         self._thinking_pending_by_turn.clear()
         self._recovery_attempts_by_turn.clear()
         self._transport_retry_attempts_by_turn.clear()
+        self._retry_shadow_information_by_turn.clear()
         self._heartbeat_generated = 0
         self._heartbeat_delivered = 0
         self._heartbeat_coalesced = 0
@@ -1113,6 +1082,9 @@ class AgentEpisodeRuntime(AgentContextMixin):
             system_check_id=system_check_id,
             owner_scope="system_check" if system_check_id else None,
             dispatch_context=dispatch_context,
+            shadow_information=(dict(self._retry_shadow_information_by_turn[source_turn or ""])
+                                if (source_turn or "") in self._retry_shadow_information_by_turn
+                                else None),
         )
         if getattr(self.provider, "transport", "chat_completions") == "responses":
             limit = int(getattr(self.provider, "protocol_recovery_limit", 1))
@@ -1160,7 +1132,7 @@ class AgentEpisodeRuntime(AgentContextMixin):
         if not isinstance(context, dict):
             return "normal"
         value = str(context.get("origin_prompt_kind") or context.get("prompt_kind") or "normal")
-        return value if value in {"secondary_mailbox", "final_silence", "kws_wake"} else "normal"
+        return value if value in {"final_silence", "kws_wake"} else "normal"
 
     @staticmethod
     def _recovery_instruction(code: str, *, deferred: bool = False,
@@ -1200,8 +1172,6 @@ class AgentEpisodeRuntime(AgentContextMixin):
         instruction = templates.get(code, templates["SPEAK_ENVELOPE_INVALID"])
         if deferred:
             scope = "遵守本次请求当前携带的场景约束，不要把上一次失败输出当成新的会话事实。"
-        elif origin_prompt_kind == "secondary_mailbox":
-            scope = "继续原二等信箱状态评估；本次没有新的用户输入，不要重新回答历史用户请求。"
         elif origin_prompt_kind == "final_silence":
             scope = "继续原 final-silence 状态评估；不要把最后一条历史用户输入当成新的请求。"
         elif origin_prompt_kind == "kws_wake":
@@ -1973,7 +1943,7 @@ class AgentEpisodeRuntime(AgentContextMixin):
         prompt_kind = "normal"
         dispatch_context = None
         if isinstance(candidate, dict):
-            dispatch_kind = str(candidate.get("dispatch_kind") or candidate.get("prompt_kind") or "secondary_mailbox")
+            dispatch_kind = str(candidate.get("dispatch_kind") or candidate.get("prompt_kind") or "system_check")
             prompt_kind = str(candidate.get("prompt_kind") or dispatch_kind)
             dispatch_context = dict(candidate)
         elif recovery_signal and recovery_signal.system_check_id:
@@ -2175,7 +2145,7 @@ class AgentEpisodeRuntime(AgentContextMixin):
                        dispatch_context=dispatch_context),
             name=f"agent-step-{identity[1]}",
         )
-        if candidate is not None and prompt_kind in {"secondary_mailbox", "final_silence"}:
+        if candidate is not None and prompt_kind == "final_silence":
             self.scheduler.mark_forced_dispatched(candidate)
         if scheduled_wakes:
             count = min(len(scheduled_wakes), len(self._scheduled_wakes))
@@ -2224,7 +2194,6 @@ class AgentEpisodeRuntime(AgentContextMixin):
         was_final_pending = self.scheduler.final_pending
         candidate = self.scheduler.heartbeat(heartbeat_at)
         current_window = self.scheduler.window_index
-        secondary_due = self.scheduler.secondary_due(previous_window)
         if pulse is not None:
             delivered_at = time.monotonic() if delivered_at is None else delivered_at
             delivery_delay_ms = max(0.0, (delivered_at - pulse.scheduled_at) * 1000)
@@ -2289,8 +2258,8 @@ class AgentEpisodeRuntime(AgentContextMixin):
                 self.pending.update(kinds)
             return
 
-        # Activity-only entries are consumed at the heartbeat, but never
-        # become an LLM request or an input to the secondary priority decision.
+        # Activity-only entries are consumed at the heartbeat but never become
+        # an LLM request or a Voice-model context item.
         self.pending.clear()
         self._pending_since = None
         if candidate is not None:
@@ -2307,29 +2276,6 @@ class AgentEpisodeRuntime(AgentContextMixin):
                 )
                 return
             return
-        if not secondary_due or not self._secondary_pending:
-            return
-        if self.user_speaking is True:
-            self._secondary_skipped_speaking += 1
-            await self.log("SECONDARY_MAILBOX_SKIPPED", reason="user_speaking",
-                           window_index=current_window,
-                           pending_count=len(self._secondary_pending))
-            return
-        if not self._dispatch_allowed():
-            self._secondary_skipped_busy += 1
-            await self.log("SECONDARY_MAILBOX_SKIPPED", reason=self._busy_reason(),
-                           window_index=current_window,
-                           pending_count=len(self._secondary_pending))
-            return
-        secondary_candidate = self.scheduler.secondary_candidate(now=heartbeat_at)
-        if secondary_candidate is not None and await self._start_dispatch(
-                {"SYSTEM_CHECK"}, candidate=secondary_candidate):
-            self._secondary_dispatched += 1
-            await self.log("SECONDARY_MAILBOX_DISPATCHED",
-                           window_index=current_window,
-                           pending_count=len(self._secondary_pending),
-                           system_check_id=(self.active_dispatch_context.get("system_check_id")
-                                            if isinstance(self.active_dispatch_context, dict) else None))
 
     async def _settle_final_system_check(self, system_check_id: str) -> None:
         context = self._final_system_checks.pop(system_check_id, None)
@@ -2338,12 +2284,6 @@ class AgentEpisodeRuntime(AgentContextMixin):
         self._settled_final_system_checks.add(system_check_id)
         if int(context.get("generation") or 0) != self.scheduler.generation:
             return
-        if self._secondary_pending:
-            cleared = len(self._secondary_pending)
-            self._secondary_pending.clear()
-            self._secondary_cleared_final += cleared
-            await self.log("SECONDARY_MAILBOX_CLEARED_FINAL", count=cleared,
-                           scheduler_generation=self.scheduler.generation)
         callback = self.on_final_system_check_settled
         if not callable(callback):
             return
@@ -2365,6 +2305,14 @@ class AgentEpisodeRuntime(AgentContextMixin):
             dispatch_context.get("system_check_id")
             if self._is_system_check_context(dispatch_context) else None
         )
+
+        def discard_shadow_snapshot(snapshot) -> None:
+            if not isinstance(snapshot, dict):
+                return
+            version = snapshot.get("version")
+            if isinstance(version, int) and not isinstance(version, bool):
+                self.ledger.consume_shadow_information(version)
+
         settle_pending_silence = False
         step_outcome = None
         try:
@@ -2381,11 +2329,21 @@ class AgentEpisodeRuntime(AgentContextMixin):
                 )
             if step_outcome == "completed":
                 self._transport_retry_attempts_by_turn.pop(source_turn_id or "", None)
+                self._retry_shadow_information_by_turn.pop(source_turn_id or "", None)
+            elif recovery:
+                retry_snapshot = self._retry_shadow_information_by_turn.pop(source_turn_id or "", None)
+                discard_shadow_snapshot(
+                    recovery_signal.shadow_information if recovery_signal is not None
+                    else retry_snapshot
+                )
             self.backoff_step = 0
             self.backoff_until = 0.0
         except asyncio.CancelledError:
             if self.closed:
                 raise
+            discard_shadow_snapshot(
+                self._retry_shadow_information_by_turn.pop(source_turn_id or "", None)
+            )
         except Exception as exc:
             # Timer-owned system checks are terminal at the transport layer.
             # Retrying one as ordinary mailbox work could outlive the final
@@ -2406,6 +2364,9 @@ class AgentEpisodeRuntime(AgentContextMixin):
                 attempts = self._transport_retry_attempts_by_turn.get(retry_key, 0)
                 limit = int(getattr(self.provider, "transport_retry_limit", 2))
                 if attempts >= limit:
+                    discard_shadow_snapshot(
+                        self._retry_shadow_information_by_turn.pop(retry_key, None)
+                    )
                     settle_pending_silence = True
                     await self.log("LLM_TRANSPORT_RETRY_EXHAUSTED", identity=identity,
                                    turn_id=source_turn_id, attempts=attempts, limit=limit)
@@ -2433,6 +2394,9 @@ class AgentEpisodeRuntime(AgentContextMixin):
                     if self.queue.empty():
                         self.queue.put_nowait(True)
             else:
+                discard_shadow_snapshot(
+                    self._retry_shadow_information_by_turn.pop(source_turn_id or "", None)
+                )
                 settle_pending_silence = True
                 self.backoff_step = 0
                 self.backoff_until = 0.0
@@ -2872,10 +2836,10 @@ class AgentEpisodeRuntime(AgentContextMixin):
         actions = envelope.actions
         if system_check is None:
             system_check = turn_id in self._system_check_turn_ids
-        # A secondary mailbox check is a normal decision over existing context and may use
-        # any currently advertised action.  Other system-check kinds retain
-        # their explicit no-action contract.
-        if system_check and system_check_prompt_kind != "secondary_mailbox" and actions:
+        # Timer-owned system checks retain their explicit no-action contract.
+        # SHADOW_INFORMATION is an ordinary dispatch and follows the normal
+        # advertised-action policy.
+        if system_check and actions:
             await self.log(
                 "SYSTEM_CHECK_ACTION_REJECTED", identity=identity, turn_id=turn_id,
                 system_check_id=system_check_id or turn_id, owner_scope="system_check",
@@ -2913,7 +2877,7 @@ class AgentEpisodeRuntime(AgentContextMixin):
         ))
 
     async def accept_shadow_event(self, event: ShadowEvent) -> None:
-        """Project a shadow event into the voice ledger and scheduler mailbox.
+        """Project a Bridge event into the Voice ledger and scheduler.
 
         The event's lifecycle fields are local control metadata; its text is
         explicitly marked untrusted by the ledger before a later main-model
@@ -2923,40 +2887,24 @@ class AgentEpisodeRuntime(AgentContextMixin):
         if not self.ledger.commit_shadow_event(event):
             await self.log("SHADOW_EVENT_DUPLICATE", event_id=event.event_id, event_kind=event.kind)
             return
-        if event.kind == "progress" and event.wake_policy == "passive" and event.text.strip():
-            source = "shadow_progress"
-            fingerprint = hashlib.sha256(event.text.strip().encode("utf-8")).hexdigest()
-            if self._secondary_seen.get(source) != fingerprint:
-                self._secondary_seen[source] = fingerprint
-                self._secondary_version += 1
-                self._secondary_pending[source] = self._secondary_version
-                self._secondary_enqueued += 1
-                await self.log(
-                    "SECONDARY_MAILBOX_ENQUEUED", source=source,
-                    version=self._secondary_version,
-                    pending_count=len(self._secondary_pending),
-                )
-        await self.log("SHADOW_EVENT", event_id=event.event_id, event_kind=event.kind,
-                       wake_policy=event.wake_policy)
-        if event.wake_policy != "passive":
-            self._wake("SHADOW_EVENT_PRIORITY" if event.wake_policy == "priority" else "SHADOW_EVENT")
+        await self.log("SHADOW_EVENT", event_id=event.event_id, event_kind=event.kind)
+        if event.kind == "information":
+            self._wake("SHADOW_INFORMATION")
+        elif event.kind in {"input_required", "result", "failed"}:
+            self._wake("SHADOW_EVENT_PRIORITY")
 
-    def _secondary_snapshot(self) -> dict[str, int]:
-        return dict(self._secondary_pending)
+    async def accept_durable_voice_event(self, event: DurableVoiceEvent) -> None:
+        """Commit a scheduled durable event independently of Shadow information."""
 
-    def _consume_secondary(self, captured: dict[str, int], *, prompt_kind: str) -> list[str]:
-        consumed = []
-        for source, version in captured.items():
-            if self._secondary_pending.get(source, 0) <= version:
-                self._secondary_pending.pop(source, None)
-                consumed.append(source)
-        if prompt_kind == "final_silence":
-            self._secondary_cleared_final += len(consumed)
-        elif prompt_kind == "secondary_mailbox":
-            self._secondary_consumed_check += len(consumed)
-        else:
-            self._secondary_consumed_normal += len(consumed)
-        return consumed
+        await self.ensure_episode()
+        self.ledger.commit_semantic_event("durable_voice_event", {
+            "event_id": event.event_id,
+            "text": event.text,
+            "source_session_id": event.source_session_id,
+            "payload": dict(event.payload),
+        })
+        await self.log("DURABLE_VOICE_EVENT", event_id=event.event_id)
+        self._wake("DURABLE_VOICE_EVENT")
 
     async def _apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope,
                                   *, dispatch_context=None):
@@ -2982,14 +2930,22 @@ class AgentEpisodeRuntime(AgentContextMixin):
         same_turn_transcript_reassessment = bool(
             {"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"}.intersection(kinds)
         )
-        secondary_context = self._secondary_snapshot()
+        retry_key = source_turn_id or ""
+        if recovery and recovery_signal is not None and recovery_signal.shadow_information:
+            shadow_information = dict(recovery_signal.shadow_information)
+        elif "LLM_RETRY" in kinds and retry_key in self._retry_shadow_information_by_turn:
+            shadow_information = dict(self._retry_shadow_information_by_turn[retry_key])
+        else:
+            shadow_information = self.ledger.shadow_information_snapshot()
+            if shadow_information is not None:
+                self._retry_shadow_information_by_turn[retry_key] = dict(shadow_information)
         messages = self.messages(
             kinds,
             recovery_signal=recovery_signal,
             prompt_kind=prompt_kind,
             force_context=dispatch_context,
             current_turn_id=source_turn_id,
-            secondary_context=secondary_context,
+            shadow_information=shadow_information,
         )
         if self.closed or not self.episode_id:
             return
@@ -3032,16 +2988,12 @@ class AgentEpisodeRuntime(AgentContextMixin):
             context_compaction=self.context_compaction,
             context_token_estimate=self.context_token_estimate,
         )
-        consumed_secondary = self._consume_secondary(
-            secondary_context, prompt_kind=prompt_kind,
-        )
-        if consumed_secondary:
+        if shadow_information and self.ledger.consume_shadow_information(int(shadow_information["version"])):
             await self.log(
-                "SECONDARY_MAILBOX_CONSUMED", identity=identity,
+                "SHADOW_INFORMATION_CONSUMED", identity=identity,
                 turn_id=source_turn_id, prompt_kind=prompt_kind,
-                sources=consumed_secondary,
-                captured_version=max(secondary_context.values()),
-                pending_count=len(self._secondary_pending),
+                source=shadow_information["source"],
+                captured_version=shadow_information["version"],
             )
         audit_capture_ms = round((time.perf_counter() - audit_capture_started) * 1000, 2)
         self.request_count += 1
@@ -3725,8 +3677,6 @@ class AgentEpisodeRuntime(AgentContextMixin):
     async def end(self, reason):
         old = self.episode_id
         self.scheduler.disarm()
-        self._secondary_pending.clear()
-        self._secondary_seen.clear()
         await self._stop_heartbeat_clock()
         self.recovery_queue.clear()
         self.active_dispatch_context = None
@@ -3807,6 +3757,7 @@ class AgentEpisodeRuntime(AgentContextMixin):
         self._thinking_pending_by_turn.clear()
         self._recovery_attempts_by_turn.clear()
         self._transport_retry_attempts_by_turn.clear()
+        self._retry_shadow_information_by_turn.clear()
         self.deferred_recovery_feedback.clear()
         self.state = "IDLE"
         await self.emit("agent.episode", self.snapshot(include_history=False))

@@ -20,8 +20,6 @@ REQUEST_SYSTEM_CONTEXT_KINDS = frozenset({
     "deferred_recovery",
     "runtime_state",
     "pending_tools",
-    "secondary_mailbox",
-    "secondary_update",
     "final_silence",
     "system_context",
 })
@@ -206,9 +204,14 @@ class LLMContextProjector:
             payload["shadow"] = {
                 "available": bool(shadow.get("available")),
                 "active": bool(shadow.get("active")),
-                "status": str(shadow.get("status") or "")[:512],
                 "user_input_required": bool(shadow.get("user_input_required")),
             }
+            information = shadow.get("information")
+            if isinstance(information, dict) and str(information.get("text") or "").strip():
+                payload["shadow"]["information"] = {
+                    "text": str(information.get("text") or "")[:2000],
+                    "source": str(information.get("source") or "agent"),
+                }
         if current.finalized:
             payload["runtime"]["input_status"] = "finalized"
         elif current.user_speaking is True:

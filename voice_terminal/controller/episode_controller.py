@@ -245,6 +245,9 @@ class EpisodeController(RealtimeController):
         for item in events:
             await self.episode.accept_shadow_event(item)
 
+    async def accept_durable_voice_event(self, item) -> None:
+        await self.episode.accept_durable_voice_event(item)
+
     async def enqueue_scheduled_wake(self, task: dict) -> bool:
         if self.episode.closed:
             self.episode = self._make_episode()

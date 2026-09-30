@@ -201,7 +201,7 @@ const shadowCacheHitRatio = computed(() => {
   return typeof ratio === 'number' && Number.isFinite(ratio) && ratio >= 0 && ratio <= 1 ? ratio : null
 })
 // The backend projection writes the same event text into both ``focus`` and
-// ``summary`` for status/progress/observation events.  Showing the focus line
+// ``summary`` for progress/information events. Showing the focus line
 // then repeats the summary verbatim, so only render it when it carries
 // genuinely different information.
 const shadowFocusText = computed(() => {
@@ -344,9 +344,10 @@ const shadowStatusClass = computed(() => {
 function legacyShadowEvents(): ShadowActivity[] {
   const eventKinds: Record<string, ShadowActivity['event_kind']> = {
     '后台处理中': 'progress',
-    '发布观察': 'observation',
-    '等待你的输入': 'user_input_required',
+    'Voice 信息': 'information',
+    '等待你的输入': 'input_required',
     '完成': 'result',
+    '无需动作': 'no_action',
     '需要注意': 'failed',
   }
   return shadow.value.timeline.map((item, index) => ({
@@ -384,7 +385,7 @@ function shadowActivityPhaseLabel(activity: ShadowActivity) {
     }
     if (activity.tool_status && labels[activity.tool_status]) return labels[activity.tool_status]
   }
-  if (activity.event_kind === 'user_input_required') return '等待输入'
+  if (activity.event_kind === 'input_required') return '等待输入'
   if (activity.event_kind === 'failed' || activity.phase === 'failed') return '失败'
   if (activity.phase === 'started' || activity.phase === 'delta') return '进行中'
   return '已完成'
@@ -393,15 +394,15 @@ function shadowActivityPhaseLabel(activity: ShadowActivity) {
 function shadowActivityText(activity: ShadowActivity) {
   if (activity.text) return activity.text
   if (activity.stream === 'tool') return activity.tool_name ? `正在处理 ${activity.tool_name}` : '正在处理工具调用'
-  if (activity.event_kind === 'user_input_required') return 'Shadow 正在等待你的输入'
+  if (activity.event_kind === 'input_required') return 'Shadow 正在等待你的输入'
   if (activity.phase === 'failed') return '这项活动没有完成'
   return activity.phase === 'started' || activity.phase === 'delta' ? '正在运行' : '已更新'
 }
 
 function shadowActivityKindLabel(activity: ShadowActivity) {
   const labels: Record<string, string> = {
-    progress: '处理中', observation: '观察', user_input_required: '需要输入',
-    result: '结果', failed: '失败',
+    progress: '处理中', information: 'Voice 信息', input_required: '需要输入',
+    result: '结果', no_action: '无需动作', failed: '失败',
   }
   return activity.event_kind ? labels[activity.event_kind] || activity.event_kind : '事件'
 }
@@ -411,7 +412,7 @@ function shadowActivityClass(activity: ShadowActivity) {
     active: activity.phase === 'started' || activity.phase === 'delta',
     complete: activity.phase === 'completed',
     failed: activity.phase === 'failed' || activity.tool_status === 'failed',
-    waiting: activity.tool_status === 'waiting' || activity.event_kind === 'user_input_required',
+    waiting: activity.tool_status === 'waiting' || activity.event_kind === 'input_required',
   }
 }
 
@@ -1095,7 +1096,7 @@ function pageLabel() {
                   <li v-if="shadowLatestEventActivity" class="shadow-activity-item" :class="shadowActivityClass(shadowLatestEventActivity)">
                     <span class="activity-node"><i></i></span><div class="activity-copy"><div class="activity-line"><strong>{{ shadowActivityKindLabel(shadowLatestEventActivity) }}</strong><span>{{ shadowActivityPhaseLabel(shadowLatestEventActivity) }}</span></div><p>{{ shadowActivityText(shadowLatestEventActivity) }}</p><time>{{ formatTime(shadowLatestEventActivity.timestamp) }}</time></div>
                   </li>
-                  <li v-else class="shadow-activity-empty"><span class="activity-node"><i></i></span><div><strong>{{ shadow.user_input_required ? '等待你的输入' : '暂无事件输出' }}</strong><span>{{ shadow.user_input_required ? 'Shadow 会在收到输入后继续。' : '最新一条进度、观察或结果会固定显示在这个区域。' }}</span></div></li>
+                  <li v-else class="shadow-activity-empty"><span class="activity-node"><i></i></span><div><strong>{{ shadow.user_input_required ? '等待你的输入' : '暂无事件输出' }}</strong><span>{{ shadow.user_input_required ? 'Shadow 会在收到输入后继续。' : '最新一条进度、Voice 信息或结果会固定显示在这个区域。' }}</span></div></li>
                 </ol>
               </div>
             </section>

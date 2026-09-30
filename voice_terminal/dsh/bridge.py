@@ -28,7 +28,7 @@ from ..shadow_agent.manager import ShadowStatusObserver
 from ..shadow_agent.provider import ShadowProvider, ShadowProviderError, ShadowProviderResponse
 
 
-BRIDGE_PROTOCOL_VERSION = "1.0"
+BRIDGE_PROTOCOL_VERSION = "2.0"
 log = logging.getLogger(__name__)
 
 _STATUS_OBSERVER_INSTRUCTIONS = (
@@ -72,26 +72,111 @@ def _frame(frame: ShadowContextFrame) -> dict[str, Any]:
 
 
 def _safe_identifier(value: str, *, field: str) -> str:
-    value = str(value).strip()
+    raw = str(value)
+    value = raw.strip()
     if not value or len(value) > 160 or any(char in value for char in "\r\n\0"):
+        raise DshBridgeError(f"invalid {field}")
+    if value != raw:
         raise DshBridgeError(f"invalid {field}")
     return value
 
 
+def _strict_text(value: Any, *, field: str, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise DshBridgeError(f"invalid {field}")
+    text = value.strip()
+    if not text or len(text) > maximum:
+        raise DshBridgeError(f"invalid {field}")
+    return text
+
+
+def _strict_event(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one Bridge 2.0 discriminated event without compatibility aliases."""
+
+    allowed_envelope = {
+        "protocol_version", "request_id", "event_id", "voice_session_id",
+        "dsh_session_id", "epoch", "context_revision", "activation_id", "event",
+    }
+    if set(payload) != allowed_envelope:
+        raise DshBridgeError("invalid shadow.event envelope")
+    if payload.get("protocol_version") != BRIDGE_PROTOCOL_VERSION:
+        raise DshBridgeError("unsupported protocol version")
+    for field in (
+        "request_id", "event_id", "voice_session_id", "dsh_session_id", "activation_id",
+    ):
+        value = payload.get(field)
+        if not isinstance(value, str):
+            raise DshBridgeError(f"invalid {field}")
+        _safe_identifier(value, field=field)
+    for field, minimum in (("epoch", 0), ("context_revision", 0)):
+        value = payload.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise DshBridgeError(f"invalid {field}")
+    raw = payload.get("event")
+    if not isinstance(raw, dict) or not isinstance(raw.get("type"), str):
+        raise DshBridgeError("invalid event")
+    event_type = raw["type"]
+    if event_type == "progress":
+        expected = {"type", "text"}
+        event = {"type": event_type, "text": _strict_text(raw.get("text"), field="text", maximum=512)}
+    elif event_type == "information":
+        expected = {"type", "text"}
+        event = {"type": event_type, "text": _strict_text(raw.get("text"), field="text", maximum=2000)}
+    elif event_type == "input_required":
+        expected = {"type", "question", "options"}
+        options = raw.get("options")
+        if not isinstance(options, list) or len(options) > 8:
+            raise DshBridgeError("invalid options")
+        event = {
+            "type": event_type,
+            "question": _strict_text(raw.get("question"), field="question", maximum=1000),
+            "options": [
+                _strict_text(item, field=f"options[{index}]", maximum=200)
+                for index, item in enumerate(options)
+            ],
+        }
+    elif event_type == "result":
+        expected = {"type", "text"}
+        event = {"type": event_type, "text": _strict_text(raw.get("text"), field="text", maximum=8000)}
+    elif event_type == "no_action":
+        expected = {"type"} if "reason" not in raw else {"type", "reason"}
+        event = {"type": event_type}
+        if "reason" in raw:
+            event["reason"] = _strict_text(raw.get("reason"), field="reason", maximum=500)
+    elif event_type == "failed":
+        expected = {"type", "message", "code", "infrastructure"}
+        if not isinstance(raw.get("infrastructure"), bool):
+            raise DshBridgeError("invalid infrastructure")
+        event = {
+            "type": event_type,
+            "message": _strict_text(raw.get("message"), field="message", maximum=2000),
+            "code": _strict_text(raw.get("code"), field="code", maximum=128),
+            "infrastructure": raw["infrastructure"],
+        }
+    else:
+        raise DshBridgeError("unknown event type")
+    if set(raw) != expected:
+        raise DshBridgeError("event contains unknown or inapplicable fields")
+    return event
+
+
 @dataclass
 class DshSessionMapping:
-    schema_version: int
-    voice_session_id: str
-    backend: str
-    dsh_session_id: str
-    epoch: int
-    state: str
-    last_applied_revision: int
-    last_activation_id: str | None
-    last_accepted_event_id: str | None
-    created_at: float
-    updated_at: float
-    retired_at: float | None = None
+    schema_version: int  # 映射结构版本：固定为 2，不读取旧结构。
+    voice_session_id: str  # Voice 会话标识：本地语音会话的主键。
+    backend: str  # 后端类型：当前固定为 dsh。
+    dsh_session_id: str  # DSH 会话标识：本进程创建的新绑定。
+    epoch: int  # 会话代次：与 Voice 权威上下文一致。
+    state: str  # 映射状态：active、idle、waiting_user、failed 或 retired。
+    last_applied_revision: int  # 已应用修订号：DSH 已同步的最新 Voice 上下文版本。
+    last_activation_id: str | None  # 当前激活标识：无活动任务时为空。
+    last_terminal_activation_id: str | None  # 最后终态激活标识：供重启后确认终态重放。
+    last_terminal_dsh_session_id: str | None  # 终态来源 DSH 会话标识：供旧绑定回执校验。
+    last_terminal_event_id: str | None  # 最后终态事件标识：限制仅确认最近一条终态重放。
+    last_terminal_event_digest: str | None  # 终态正文摘要：判断重放正文是否完全一致。
+    created_at: float  # 创建时间：本地映射创建时间戳。
+    updated_at: float  # 更新时间：本地映射最后写入时间戳。
+    retired_at: float | None = None  # 退役时间：绑定退役时记录的时间戳。
 
 
 class DshMappingStore:
@@ -120,7 +205,7 @@ class DshMappingStore:
             value = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             raise DshBridgeError("DSH mapping state is unreadable") from None
-        if not isinstance(value, dict) or value.get("schema_version") != 1:
+        if not isinstance(value, dict) or value.get("schema_version") != 2:
             raise DshBridgeError("DSH mapping schema is unsupported")
         sessions = value.get("sessions")
         if not isinstance(sessions, dict):
@@ -131,7 +216,7 @@ class DshMappingStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
         payload = json.dumps(
-            {"schema_version": 1, "sessions": sessions},
+            {"schema_version": 2, "sessions": sessions},
             ensure_ascii=False, sort_keys=True, indent=2,
         )
         temporary.write_text(payload, encoding="utf-8")
@@ -310,7 +395,13 @@ class DshShadowAgentSession:
         self._opened = False
         self._retired = False
         self._wake_lock = asyncio.Lock()
+        self._event_lock = asyncio.Lock()
         self._accepted_events: dict[str, str] = {}
+        self._accepted_requests: dict[str, str] = {}
+        self._last_terminal_activation_id: str | None = None
+        self._last_terminal_dsh_session_id: str | None = None
+        self._last_terminal_event_id: str | None = None
+        self._last_terminal_event_digest: str | None = None
         self._waiting_user = False
         self._created_at = time.time()
         self._mapping_checked = False
@@ -349,6 +440,29 @@ class DshShadowAgentSession:
         # The generated DSH preset is synchronized by setup and validated at boot.
         return None
 
+    async def prepare_callback_binding(self, payload: dict[str, Any]) -> None:
+        """Restore only a version-2 binding/terminal receipt before callback routing."""
+
+        if self._mapping_checked:
+            return
+        async with self._event_lock:
+            if self._mapping_checked:
+                return
+            mapping = await self.mapping_store.load(self.voice_session_id)
+            self._mapping_checked = True
+            if (
+                mapping is None or mapping.backend != "dsh" or mapping.epoch != self.epoch
+                or not (
+                    payload.get("dsh_session_id") == mapping.dsh_session_id
+                    or payload.get("dsh_session_id") == mapping.last_terminal_dsh_session_id
+                )
+            ):
+                return
+            self._last_terminal_activation_id = mapping.last_terminal_activation_id
+            self._last_terminal_dsh_session_id = mapping.last_terminal_dsh_session_id
+            self._last_terminal_event_id = mapping.last_terminal_event_id
+            self._last_terminal_event_digest = mapping.last_terminal_event_digest
+
     def wake(self) -> WakeResult:
         if not self.available:
             return "unavailable"
@@ -381,20 +495,21 @@ class DshShadowAgentSession:
                 return "coalesced"
             revision = self.last_applied_revision
             activation = str(uuid.uuid4())
-            response = await self._call_reconciled("wake", self._envelope(
-                request_id=str(uuid.uuid4()),
-                context_revision=revision,
-                activation_id=activation,
-            ), expected_activation_id=activation)
-            code = str(response.get("result"))
-            if code not in {"accepted", "duplicate"}:
-                if code == "stale":
-                    return "already_current"
-                raise DshBridgeError(f"DSH wake rejected: {code}")
-            self.activation_id = activation
-            self._run_seq += 1
-            self._waiting_user = False
-            await self._save_mapping(state="active")
+            async with self._event_lock:
+                response = await self._call_reconciled("wake", self._envelope(
+                    request_id=str(uuid.uuid4()),
+                    context_revision=revision,
+                    activation_id=activation,
+                ), expected_activation_id=activation)
+                code = str(response.get("result"))
+                if code not in {"accepted", "duplicate"}:
+                    if code == "stale":
+                        return "already_current"
+                    raise DshBridgeError(f"DSH wake rejected: {code}")
+                self.activation_id = activation
+                self._run_seq += 1
+                self._waiting_user = False
+                await self._save_mapping(state="active")
             await self._activity("running", activation_id=activation, context_revision=revision)
             self._schedule_observer(force=True)
             return "started" if code == "accepted" else "coalesced"
@@ -406,13 +521,11 @@ class DshShadowAgentSession:
         if not self._mapping_checked:
             self._mapping_checked = True
             mapping = await self.mapping_store.load(self.voice_session_id)
-            if (mapping is not None and mapping.backend == "dsh" and mapping.state == "active"
-                    and mapping.epoch == self.epoch):
-                self.dsh_session_id = mapping.dsh_session_id
-                self.activation_id = mapping.last_activation_id
-                # Recovery always reasserts the complete Voice-authoritative snapshot.
-                self.last_applied_revision = -1
-                operation = "session.resume"
+            if mapping is not None and mapping.backend == "dsh" and mapping.epoch == self.epoch:
+                self._last_terminal_activation_id = mapping.last_terminal_activation_id
+                self._last_terminal_dsh_session_id = mapping.last_terminal_dsh_session_id
+                self._last_terminal_event_id = mapping.last_terminal_event_id
+                self._last_terminal_event_digest = mapping.last_terminal_event_digest
         response = await self._call_reconciled(
             operation,
             self._envelope(
@@ -453,16 +566,24 @@ class DshShadowAgentSession:
                 frames=[_frame(item) for item in update.frames],
             )
         payload["request_id"] = str(uuid.uuid4())
-        response = await self._call_reconciled(
-            operation, payload, expected_context_revision=int(payload["context_revision"]),
-        )
-        if response.get("result") == "resync_required" and operation != "context.snapshot":
+        async with self._event_lock:
+            response = await self._call_reconciled(
+                operation, payload, expected_context_revision=int(payload["context_revision"]),
+            )
+            result = response.get("result")
+            if result not in {"accepted", "duplicate", "resync_required"}:
+                raise DshBridgeError(f"DSH context rejected: {result}")
+            if result != "resync_required":
+                self.last_applied_revision = int(payload["context_revision"])
+                mapping_state = "active" if self.activation_id is not None else (
+                    "waiting_user" if self._waiting_user else "idle"
+                )
+                await self._save_mapping(state=mapping_state)
+        if result == "resync_required" and operation != "context.snapshot":
             await self._sync_context(force_snapshot=True)
             return
-        if response.get("result") not in {"accepted", "duplicate"}:
-            raise DshBridgeError(f"DSH context rejected: {response.get('result')}")
-        self.last_applied_revision = int(payload["context_revision"])
-        await self._save_mapping(state="active")
+        if result == "resync_required":
+            raise DshBridgeError("DSH context snapshot requires resynchronization")
 
     async def _session_state(self) -> dict[str, Any]:
         response = await self.client.call(
@@ -559,105 +680,143 @@ class DshShadowAgentSession:
     async def reset(self, *, strict: bool = False) -> None:
         await self._stop_context_resync()
         await self._stop_observer()
-        if self._opened and not self._retired:
-            try:
-                await self.client.call("session.retire", self._envelope())
-            except DshBridgeError:
-                if strict:
-                    raise
-            await self._save_mapping(state="retired", retired=True)
-        self.dsh_session_id = f"voice-shadow-{uuid.uuid4()}"
-        self.epoch = int(self.context_source.shadow_context_epoch)
-        self.last_applied_revision = -1
-        self.activation_id = None
-        self._opened = False
-        self._mapping_checked = True
-        self._retired = False
-        self._waiting_user = False
-        self._accepted_events.clear()
-        self._observer_trace_revision = 0
-        self._visible_status = ""
+        async with self._event_lock:
+            if self._opened and not self._retired:
+                try:
+                    await self.client.call("session.retire", self._envelope())
+                except DshBridgeError:
+                    if strict:
+                        raise
+                await self._save_mapping(state="retired", retired=True)
+            self.dsh_session_id = f"voice-shadow-{uuid.uuid4()}"
+            self.epoch = int(self.context_source.shadow_context_epoch)
+            self.last_applied_revision = -1
+            self.activation_id = None
+            self._opened = False
+            self._mapping_checked = True
+            self._retired = False
+            self._waiting_user = False
+            self._accepted_events.clear()
+            self._accepted_requests.clear()
+            self._last_terminal_activation_id = None
+            self._last_terminal_dsh_session_id = None
+            self._last_terminal_event_id = None
+            self._last_terminal_event_digest = None
+            self._observer_trace_revision = 0
+            self._visible_status = ""
 
     async def cancel(self) -> None:
         await self._stop_context_resync()
-        if self._opened and not self._retired:
-            try:
-                await self.client.call("session.cancel", self._envelope())
-            except DshBridgeError:
-                pass
-        self.activation_id = None
-        self._waiting_user = False
+        async with self._event_lock:
+            if self._opened and not self._retired:
+                try:
+                    await self.client.call("session.cancel", self._envelope())
+                except DshBridgeError:
+                    pass
+            self.activation_id = None
+            self._waiting_user = False
         await self._activity("cancelled")
 
     async def close(self) -> None:
         await self._stop_context_resync()
         await self._stop_observer()
-        if self._opened and not self._retired:
-            try:
-                await self.client.call("session.retire", self._envelope())
-            except DshBridgeError:
-                pass
-            await self._save_mapping(state="retired", retired=True)
-        self._retired = True
-        self.activation_id = None
+        async with self._event_lock:
+            if self._opened and not self._retired:
+                try:
+                    await self.client.call("session.retire", self._envelope())
+                except DshBridgeError:
+                    pass
+                await self._save_mapping(state="retired", retired=True)
+            self._retired = True
+            self.activation_id = None
 
     async def accept_event(self, payload: dict[str, Any]) -> BridgeResult:
-        event_id = _safe_identifier(str(payload.get("event_id", "")), field="event_id")
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-        previous = self._accepted_events.get(event_id)
-        if previous is not None:
-            return "duplicate" if previous == digest else "conflict"
-        if not await self._callback_matches_or_reconcile(payload):
-            return "stale"
-        kind = str(payload.get("kind", ""))
-        if kind == "no_action":
-            self.activation_id = None
+        async with self._event_lock:
+            try:
+                event_body = _strict_event(payload)
+            except DshBridgeError:
+                return "conflict"
+            event_id = str(payload["event_id"])
+            encoded = json.dumps(event_body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            request_id = str(payload["request_id"])
+            request_digest = hashlib.sha256(json.dumps(
+                {"event_id": event_id, "event": event_body},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            event_type = str(event_body["type"])
+            terminal = event_type in {"input_required", "result", "no_action", "failed"}
+            if self._last_terminal_event_id == event_id:
+                if self._last_terminal_event_digest != digest:
+                    return "conflict"
+                return "duplicate" if self.is_terminal_replay(
+                    payload, normalized_event=event_body,
+                ) else "stale"
+            if not await self._callback_matches_or_reconcile(payload):
+                return "stale"
+            previous_request = self._accepted_requests.get(request_id)
+            if previous_request is not None:
+                return "duplicate" if previous_request == request_digest else "conflict"
+            previous = self._accepted_events.get(event_id)
+            if previous is not None:
+                return "duplicate" if previous == digest else "conflict"
+
+            activation_id = str(self.activation_id or "")
+            if event_type == "input_required":
+                text = str(event_body["question"])
+            elif event_type == "failed":
+                text = str(event_body["message"])
+            else:
+                text = str(event_body.get("text") or event_body.get("reason") or "")
+            event = ShadowEvent(
+                event_id=event_id,
+                kind=event_type,  # type: ignore[arg-type]
+                text=text,
+                based_on_context_revision=int(payload["context_revision"]),
+                activation_id=activation_id,
+                source="agent",
+                options=tuple(event_body.get("options") or ()),
+                failure_code=(str(event_body["code"]) if event_type == "failed" else None),
+                infrastructure=bool(event_body.get("infrastructure", False)),
+            )
+            if self.production_sink is not None:
+                await self.production_sink([event])
             self._accepted_events[event_id] = digest
-            await self._activity("idle", terminal="no_action")
+            self._accepted_requests[request_id] = request_digest
+            if len(self._accepted_requests) > 4096:
+                self._accepted_requests.pop(next(iter(self._accepted_requests)))
+
+            if terminal:
+                self._last_terminal_activation_id = activation_id
+                self._last_terminal_dsh_session_id = self.dsh_session_id
+                self._last_terminal_event_id = event_id
+                self._last_terminal_event_digest = digest
+                self._waiting_user = event_type == "input_required"
+                self.activation_id = None
+                state = "waiting_user" if self._waiting_user else (
+                    "failed" if event_type == "failed" else "idle"
+                )
+                await self._activity(state, terminal=event_type)
+                await self._save_mapping(state=state)
+            else:
+                await self._save_mapping(state="active")
             return "accepted"
-        if kind not in {"progress", "observation", "user_input_required", "result", "failed"}:
-            return "conflict"
-        text = str(payload.get("text", "")).strip()
-        if not text:
-            return "conflict"
-        wake_policy = "passive" if kind == "progress" else (
-            "normal" if kind == "observation" else "priority"
-        )
-        event = ShadowEvent(
-            event_id=event_id,
-            kind=kind,  # type: ignore[arg-type]
-            text=text,
-            based_on_context_revision=int(payload["context_revision"]),
-            wake_policy=wake_policy,  # type: ignore[arg-type]
-            payload=dict(payload.get("payload") or {}),
-        )
-        self._accepted_events[event_id] = digest
-        if self.production_sink is not None:
-            await self.production_sink([event])
-        if kind in {"user_input_required", "result", "failed"}:
-            self._waiting_user = kind == "user_input_required"
-            self.activation_id = None
-            await self._activity("waiting_user" if self._waiting_user else (
-                "failed" if kind == "failed" else "idle"
-            ), terminal=kind)
-        await self._save_mapping(state="active", last_event_id=event_id)
-        return "accepted"
 
     async def accept_activity(self, payload: dict[str, Any]) -> BridgeResult:
-        if not await self._callback_matches_or_reconcile(payload):
-            return "stale"
-        await self._activity(str(payload.get("state") or "running"),
-                             trace_revision=payload.get("trace_revision"))
-        trace_revision = payload.get("trace_revision")
-        committed_steps = payload.get("committed_steps")
-        if isinstance(trace_revision, int) and not isinstance(trace_revision, bool):
-            self._observer_target_revision = max(self._observer_target_revision, trace_revision)
-        if isinstance(committed_steps, int) and not isinstance(committed_steps, bool):
-            if committed_steps - self._observer_committed_steps >= self.observer_every_steps:
-                self._observer_committed_steps = committed_steps
-                self._schedule_observer()
-        return "accepted"
+        async with self._event_lock:
+            if not await self._callback_matches_or_reconcile(payload):
+                return "stale"
+            await self._activity(str(payload.get("state") or "running"),
+                                 trace_revision=payload.get("trace_revision"))
+            trace_revision = payload.get("trace_revision")
+            committed_steps = payload.get("committed_steps")
+            if isinstance(trace_revision, int) and not isinstance(trace_revision, bool):
+                self._observer_target_revision = max(self._observer_target_revision, trace_revision)
+            if isinstance(committed_steps, int) and not isinstance(committed_steps, bool):
+                if committed_steps - self._observer_committed_steps >= self.observer_every_steps:
+                    self._observer_committed_steps = committed_steps
+                    self._schedule_observer()
+            return "accepted"
 
     def _schedule_observer(self, *, force: bool = False) -> None:
         if self.status_provider is None:
@@ -807,14 +966,25 @@ class DshShadowAgentSession:
 
         if self.production_sink is None:
             return
-        await self.production_sink([ShadowEvent(
-            event_id=uuid.uuid4().hex,
-            kind="status",
-            text=text[:512],
-            based_on_context_revision=self.last_applied_revision,
-            wake_policy="normal",
-            payload={"trace_revision": trace_revision},
-        )])
+        normalized = text.strip()
+        if not normalized or len(normalized) > 2000:
+            log.warning(
+                "dsh.status_observer_summary_rejected voice_session_id=%s chars=%s",
+                self.voice_session_id, len(normalized),
+            )
+            return
+        async with self._event_lock:
+            activation_id = self.activation_id
+            if activation_id is None:
+                return
+            await self.production_sink([ShadowEvent(
+                event_id=uuid.uuid4().hex,
+                kind="information",
+                text=normalized,
+                based_on_context_revision=self.last_applied_revision,
+                activation_id=activation_id,
+                source="observer",
+            )])
 
     async def _stop_observer(self) -> None:
         task = self._observer_task
@@ -857,6 +1027,7 @@ class DshShadowAgentSession:
             and payload.get("voice_session_id") == self.voice_session_id
             and payload.get("dsh_session_id") == self.dsh_session_id
             and payload.get("epoch") == self.epoch
+            and self.epoch == int(self.context_source.shadow_context_epoch)
             and payload.get("activation_id") == self.activation_id
             and payload.get("context_revision") == self.last_applied_revision
             and not self._retired
@@ -870,6 +1041,7 @@ class DshShadowAgentSession:
             or payload.get("voice_session_id") != self.voice_session_id
             or payload.get("dsh_session_id") != self.dsh_session_id
             or payload.get("epoch") != self.epoch
+            or self.epoch != int(self.context_source.shadow_context_epoch)
             or payload.get("activation_id") != self.activation_id
             or self._retired
         ):
@@ -906,6 +1078,37 @@ class DshShadowAgentSession:
         )
         return True
 
+    def is_terminal_replay(
+        self, payload: dict[str, Any], *, normalized_event: dict[str, Any] | None = None,
+    ) -> bool:
+        """Recognize exactly the last persisted terminal callback after restart."""
+
+        if not self.matches_last_terminal_identity(payload):
+            return False
+        try:
+            event_body = normalized_event or _strict_event(payload)
+        except DshBridgeError:
+            return False
+        if event_body.get("type") not in {"input_required", "result", "no_action", "failed"}:
+            return False
+        encoded = json.dumps(event_body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest() == self._last_terminal_event_digest
+
+    def matches_last_terminal_identity(self, payload: dict[str, Any]) -> bool:
+        """Match receipt routing fields, leaving body conflicts to accept_event."""
+
+        if (
+            payload.get("protocol_version") != BRIDGE_PROTOCOL_VERSION
+            or payload.get("voice_session_id") != self.voice_session_id
+            or payload.get("dsh_session_id") != self._last_terminal_dsh_session_id
+            or payload.get("epoch") != self.epoch
+            or self.epoch != int(self.context_source.shadow_context_epoch)
+            or payload.get("activation_id") != self._last_terminal_activation_id
+            or payload.get("event_id") != self._last_terminal_event_id
+        ):
+            return False
+        return self.epoch == int(self.context_source.shadow_context_epoch)
+
     async def _stop_context_resync(self) -> None:
         task = self._context_resync_task
         self._context_resync_task = None
@@ -922,12 +1125,10 @@ class DshShadowAgentSession:
             **extra,
         }
 
-    async def _save_mapping(
-        self, *, state: str, retired: bool = False, last_event_id: str | None = None,
-    ) -> None:
+    async def _save_mapping(self, *, state: str, retired: bool = False) -> None:
         now = time.time()
         await self.mapping_store.save(DshSessionMapping(
-            schema_version=1,
+            schema_version=2,
             voice_session_id=self.voice_session_id,
             backend="dsh",
             dsh_session_id=self.dsh_session_id,
@@ -935,7 +1136,10 @@ class DshShadowAgentSession:
             state=state,
             last_applied_revision=self.last_applied_revision,
             last_activation_id=self.activation_id,
-            last_accepted_event_id=last_event_id,
+            last_terminal_activation_id=self._last_terminal_activation_id,
+            last_terminal_dsh_session_id=self._last_terminal_dsh_session_id,
+            last_terminal_event_id=self._last_terminal_event_id,
+            last_terminal_event_digest=self._last_terminal_event_digest,
             created_at=self._created_at,
             updated_at=now,
             retired_at=now if retired else None,

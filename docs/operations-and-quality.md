@@ -18,6 +18,7 @@ git diff --check
 
 | 区域 | 测试入口 |
 | --- | --- |
+| Bridge 2.0（桥接协议 2.0）与 DSH（代理运行时）事件 | `tests/test_dsh_bridge.py`、`tests/test_bridge_v2_information.py`、`tests/test_durable_shadow_mailbox.py`、`tests/test_shadow_agent_harness.py` |
 | Shadow、上下文和 ledger | `tests/test_shadow_agent.py`、`tests/test_shadow_agent_harness.py`、`tests/test_session_ledger.py`、`tests/test_conversation_runtime.py` |
 | TTS、speech admission、分段发送 | `tests/test_minimax_tts.py`、`tests/test_speech_admission.py`、`tests/test_sentence_scheduling.py` |
 | 声纹 | `tests/test_speaker.py`、`tests/test_speaker_features.py` |
@@ -43,17 +44,19 @@ git diff --check
 5. KWS 开启时 `input_owner=kws`，关闭时可以直接进入 ASR；
 6. 唤醒确认播完后麦克风仍归 ASR：窗口内接话不需要再喊唤醒词，静默窗口到期后由 `final_silence`
    检查交回 `input_owner=kws`（日志依次出现 `SCHEDULER_FINAL_PENDING window_index=225`、
-   `prompt_kind=final_silence`（最终静默检查请求类型），且交接完成后不再有 `secondary_mailbox`（二等信箱检查）派发）；
+   `prompt_kind=final_silence`（最终静默检查请求类型），且交接完成后调度器不再派发检查请求）；
 7. `session.stop` 停止输入但不误取消已经进入 TTS 的输出；
 8. `session.reset` 清理 conversation、Shadow 和 speech 临时状态。
 
 `-NoWeb` 只用于后端调试，不能作为完整 Web 语音终端验收结果。
 
-## 二等信箱观察
+## Bridge 2.0 信息观察
 
-每个 episode 的运行快照包含 `secondary_mailbox`（二等信箱）计数：`pending_count`（待评估来源数）、`enqueued`（新版本入箱数）、`consumed_normal`（普通请求带出数）、`consumed_check`（二等请求消费数）、`dispatched`（二等请求派发数）和 `cleared_final`（最终静默清空数）。日志用 `SECONDARY_MAILBOX_ENQUEUED`、`SECONDARY_MAILBOX_CONSUMED`、`SECONDARY_MAILBOX_DISPATCHED` 和 `SECONDARY_MAILBOX_CLEARED_FINAL` 对齐这些计数，不记录进度正文。
+`progress`（界面进度）只更新产品活动视图，不创建语音模型请求。`information`（Voice 信息）由 DSH 根 Agent 或状态观察器写入同一个内存单槽；最后到达的信息覆盖旧值，并在调度安全点合并为一次 Voice 请求。请求审计快照完成后，信息按本地版本认领并从共享槽清除；重试只能使用该逻辑请求的本地快照，不能把旧信息带入后续无关请求。是否播报由 Voice 主模型结合当前用户上下文判断。
 
-现场对照同一 episode 的 `dispatch_kind=secondary_mailbox`（二等派发类型）、普通请求带出的消费日志、`LLM_DISPATCHED`（模型请求派发）及 `SPEAK_ACCEPTED`（播报接纳）数量，并检查过期请求和最终静默交接。进度持续变化时最多每个 4 秒检查点派发一次；若普通请求已经带出更新，该检查点不重复派发。
+现场检查 `SHADOW_INFORMATION`（影子信息事件）、`SHADOW_INFORMATION_CONSUMED`（影子信息认领）与 `LLM_DISPATCHED`（模型请求派发）的数量和版本；确认 UI 进度变化没有引发模型请求、被覆盖的信息没有进入请求上下文、静默决策不会重新消费旧信息。终态应清除尚未认领的信息，并且每次激活只接受一个终态。
+
+协议结构、会话迁移要求、本次自动化测试结果和隔离 HTTP（超文本传输协议）验收边界见 [Bridge 2.0 可替换信息协议](bridge-2.0-protocol.md)。现场端到端验收从 `SessionRuntime.start_listening()`（启动 Voice 输入会话）进入；若要验证真实模型推理，必须在启动服务后观察实际模型请求和语音端决策，不能将请求消息构造测试视为模型实测。
 
 ## Shadow 验收
 

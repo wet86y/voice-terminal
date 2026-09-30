@@ -27,6 +27,7 @@ class RecoverySignal:
     system_check_id: str | None = None
     owner_scope: str | None = None
     dispatch_context: dict | None = None
+    shadow_information: dict | None = None
     error_id: str = ""
     consumed: bool = False
     queued_at_monotonic: float = 0.0

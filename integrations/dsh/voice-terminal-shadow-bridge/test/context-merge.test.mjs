@@ -38,7 +38,7 @@ function fixture() {
 
 function envelope(revision, frames, fromRevision = undefined) {
   return {
-    protocol_version: '1.0', request_id: `request-${revision}`,
+    protocol_version: '2.0', request_id: `request-${revision}`,
     voice_session_id: 'voice-session', dsh_session_id: 'dsh-session', epoch: 1,
     context_revision: revision, ...(fromRevision === undefined ? {} : { from_revision: fromRevision }),
     frames,

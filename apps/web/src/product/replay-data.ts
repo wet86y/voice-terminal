@@ -92,10 +92,10 @@ const shadowActivities: NonNullable<ShadowProductSnapshot['activities']> = [
   { run_seq: 7, item_id: 'thinking-7', stream: 'thinking', phase: 'completed', text: '已整理会话目标，正在核对模型与运行时配置。', timestamp: '2026-09-14T22:24:34+08:00' },
   { run_seq: 7, item_id: 'tool-7-search', stream: 'tool', phase: 'completed', tool_name: 'files_search', tool_status: 'completed', text: '工具执行完成', timestamp: '2026-09-14T22:25:17+08:00' },
   { run_seq: 7, item_id: 'event-7-progress', stream: 'event', phase: 'completed', event_kind: 'progress', text: '继续检索运行时配置与环境覆盖。', timestamp: '2026-09-14T22:25:18+08:00' },
-  { run_seq: 7, item_id: 'tool-7-publish', stream: 'tool', phase: 'completed', tool_name: 'publish_main_event', tool_status: 'completed', text: '事件已传递', timestamp: '2026-09-14T22:25:29+08:00' },
-  { run_seq: 7, item_id: 'event-7-observation', stream: 'event', phase: 'completed', event_kind: 'observation', text: '已把最新会话上下文同步给主语音 Agent。', timestamp: '2026-09-14T22:25:29+08:00' },
+  { run_seq: 7, item_id: 'tool-7-publish', stream: 'tool', phase: 'completed', tool_name: 'publish_voice_information', tool_status: 'completed', text: '信息已传递', timestamp: '2026-09-14T22:25:29+08:00' },
+  { run_seq: 7, item_id: 'event-7-information', stream: 'event', phase: 'completed', event_kind: 'information', text: '已把最新会话上下文同步给主语音 Agent。', timestamp: '2026-09-14T22:25:29+08:00' },
   { run_seq: 7, item_id: 'thinking-7-status', stream: 'thinking', phase: 'completed', text: '已核对可读状态，等待用户确认运行时配置。', timestamp: '2026-09-14T22:25:43+08:00' },
-  { run_seq: 7, item_id: 'event-7-waiting', stream: 'event', phase: 'completed', event_kind: 'user_input_required', text: '当前阻塞点：等待用户确认运行时配置。', timestamp: '2026-09-14T22:25:43+08:00' },
+  { run_seq: 7, item_id: 'event-7-waiting', stream: 'event', phase: 'completed', event_kind: 'input_required', text: '当前阻塞点：等待用户确认运行时配置。', timestamp: '2026-09-14T22:25:43+08:00' },
   { run_seq: 7, item_id: 'run-7', stream: 'lifecycle', phase: 'completed', text: 'Shadow Agent 已完成本轮处理，等待输入', timestamp: '2026-09-14T22:25:43+08:00' },
 ]
 

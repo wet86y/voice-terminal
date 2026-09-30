@@ -28,8 +28,8 @@ class LongProvider:
         if self.main_steps <= 20:
             return ShadowProviderResponse(({
                 "type": "function_call", "status": "completed", "call_id": f"c{self.main_steps}",
-                "name": "publish_main_event",
-                "arguments": json.dumps({"kind": "progress", "text": f"第 {self.main_steps} 步"}, ensure_ascii=False),
+                "name": "publish_progress",
+                "arguments": json.dumps({"text": f"第 {self.main_steps} 步"}, ensure_ascii=False),
             },), {"input_tokens": self.main_steps * 20, "cached_tokens": max(0, self.main_steps - 1) * 20})
         return ShadowProviderResponse((message("二十轮以上循环完成"),), {})
 

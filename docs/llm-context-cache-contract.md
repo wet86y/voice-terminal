@@ -39,7 +39,7 @@ assistant 历史只记录播放结算后的传达事实，不记录尚未发送�
 </voice_delivery>
 ```
 
-`uncertain`（听到与否不确定）不能当作已听到，`unheard`（尚未听到）不自动要求下一轮补播。下一次 `secondary_mailbox`（二等信箱检查）是否说话，只由最新用户可见信息和仍然相关的未传达内容决定；影子代理进度变化本身不要求播报。
+`uncertain`（听到与否不确定）不能当作已听到，`unheard`（尚未听到）不自动要求下一轮补播。Bridge 2.0 的 `information`（Voice 信息）只触发一次可合并的 Voice 推理，并仅作为该逻辑请求 `REQUEST_TAIL`（请求尾部）中的快照；是否说话由 Voice 模型结合最新用户可见信息和仍然相关的未传达内容决定。信息请求若选择 `wait`（静默），旧信息不会再次触发推理；`progress`（界面进度）仅更新产品界面，不触发模型请求。
 
 同一 speech 只能在结算时生成一次包装；不得先写裸 assistant 文本、下一轮再补包装，也不得把 `speech_id`、request ID、时间戳、播放时长或 Shadow 状态放进包装。
 

@@ -864,11 +864,11 @@ class ShadowProductProjection:
     """Bounded, user-readable projection of Shadow status/progress events."""
 
     _KIND_LABELS = {
-        "status": "状态汇报",
         "progress": "后台处理中",
-        "observation": "发布观察",
-        "user_input_required": "等待你的输入",
+        "information": "Voice 信息",
+        "input_required": "等待你的输入",
         "result": "完成",
+        "no_action": "无需动作",
         "failed": "需要注意",
     }
 
@@ -921,14 +921,14 @@ class ShadowProductProjection:
             if kind not in self._KIND_LABELS:
                 continue
             text = _safe_display_text(item.text, limit=320)
-            if kind in {"status", "progress", "observation"} and text:
+            if kind in {"progress", "information"} and text:
                 self.focus = text
                 self.summary = text
-            if kind == "user_input_required":
+            if kind == "input_required":
                 self.user_input_required = True
                 self.active = False
                 self.phase = "waiting"
-            elif kind == "result":
+            elif kind in {"result", "no_action"}:
                 self.user_input_required = False
                 self.active = False
                 self.phase = "completed"
@@ -936,11 +936,11 @@ class ShadowProductProjection:
                 self.user_input_required = False
                 self.active = False
                 self.phase = "error"
-            elif kind in {"status", "progress", "observation"}:
+            elif kind in {"progress", "information"}:
                 self.active = True
                 self.phase = "working"
             self.timeline.append({
-                "state": "active" if self.active and kind in {"status", "progress", "observation"} else "done",
+                "state": "active" if self.active and kind in {"progress", "information"} else "done",
                 "label": self._KIND_LABELS[kind],
                 "text": text,
                 "timestamp": getattr(item, "timestamp", "") or utc_now_iso(),
@@ -950,7 +950,7 @@ class ShadowProductProjection:
         """Merge ordered UI-only activities without changing Shadow state."""
         valid_streams = {"lifecycle", "thinking", "tool", "event"}
         valid_phases = {"started", "delta", "completed", "failed"}
-        valid_event_kinds = {"progress", "observation", "user_input_required", "result", "failed"}
+        valid_event_kinds = {"progress", "information", "input_required", "result", "no_action", "failed"}
         for raw in activities:
             if not isinstance(raw, Mapping):
                 continue
@@ -1025,11 +1025,11 @@ class ShadowProductProjection:
         event_kind = activity.get("event_kind")
         item_id = str(activity.get("item_id") or "")
         if stream == "event":
-            if event_kind == "user_input_required":
+            if event_kind == "input_required":
                 self.user_input_required = True
                 self.active = False
                 self.phase = "waiting"
-            elif event_kind == "result":
+            elif event_kind in {"result", "no_action"}:
                 self.user_input_required = False
                 self.active = False
                 self.phase = "completed"
@@ -1037,7 +1037,7 @@ class ShadowProductProjection:
                 self.user_input_required = False
                 self.active = False
                 self.phase = "error"
-            elif event_kind in {"progress", "observation"} and phase in {"started", "delta"}:
+            elif event_kind in {"progress", "information"} and phase in {"started", "delta"}:
                 self.user_input_required = False
                 self.active = True
                 self.phase = "working"

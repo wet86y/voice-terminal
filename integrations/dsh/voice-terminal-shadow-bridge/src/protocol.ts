@@ -1,17 +1,33 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
-export const BRIDGE_PROTOCOL_VERSION = '1.0'
+export const BRIDGE_PROTOCOL_VERSION = '2.0'
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
 type ResultCode = 'accepted' | 'duplicate' | 'stale' | 'resync_required' | 'conflict' | 'not_found' | 'unauthorized'
 
+/** Bridge 2.0 shadow.event 正文（影子事件正文）的严格判别联合。 */
+export type ShadowEventBody =
+  | { /** 事件类型：仅更新产品界面，不触发语音推理。 */ type: 'progress'; /** 进度文本：去除首尾空白后 1～512 字符。 */ text: string }
+  | { /** 事件类型：更新 Voice 信息单槽并触发一次可合并推理。 */ type: 'information'; /** 信息文本：去除首尾空白后 1～2000 字符。 */ text: string }
+  | { /** 事件类型：请求用户澄清，是激活终态。 */ type: 'input_required'; /** 问题文本：去除首尾空白后最多 1000 字符。 */ question: string; /** 选项列表：最多 8 项，每项最多 200 字符。 */ options: string[] }
+  | { /** 事件类型：返回自包含最终结果，是激活终态。 */ type: 'result'; /** 最终结果文本：包含完整后续事实，最多 8000 字符。 */ text: string }
+  | { /** 事件类型：确认无需动作，是无语义历史的激活终态。 */ type: 'no_action'; /** 内部原因：可选，不作为 Voice 语义内容，最多 500 字符。 */ reason?: string }
+  | { /** 事件类型：仅 Bridge 内部生成的基础设施失败终态。 */ type: 'failed'; /** 失败说明：最多 2000 字符。 */ message: string; /** 失败代码：最多 128 字符。 */ code: string; /** 基础设施标记：说明是否为基础设施故障。 */ infrastructure: boolean }
+
 export interface Envelope {
+  /** 协议版本：固定为 2.0。 */
   protocol_version: string
+  /** 请求幂等标识：同一操作重试时保持不变。 */
   request_id: string
+  /** Voice 会话标识：绑定的语音主会话。 */
   voice_session_id: string
+  /** DSH 会话标识：绑定的影子执行会话。 */
   dsh_session_id: string
+  /** 会话代次：阻止旧会话事件进入新上下文。 */
   epoch: number
+  /** 上下文修订号：事件所依据的权威上下文版本。 */
   context_revision?: number
+  /** 激活标识：仅标记当前有效的影子任务激活。 */
   activation_id?: string
   [key: string]: unknown
 }

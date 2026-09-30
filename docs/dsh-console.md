@@ -140,17 +140,19 @@ activation、打断模型或取消工具。下一个 `next-step` 安全点之前
 唤醒 idle Agent、不恢复工具前硬阻断，也不重置 activation 计时；上一条提醒尚未 claim 时原位替换，
 因此安全点前最多保留一条待处理提醒。terminal、cancel、retire 或插件释放会清理计时器，不为提醒额外
 开启模型步骤。
-普通 DSH assistant 正文永远不进入 Voice 邮箱。正常回传只允许六个根 Agent控制工具：
+普通 DSH assistant 正文永远不进入 Voice 邮箱。Bridge 2.0（桥接协议 2.0）回传只允许七个根 Agent 控制工具：
 
 - `get_latest_context`（仅同步补救）；
 - `read_ambient_context`（旁路、不可信、Session 内）；
-- `publish_main_event`；
+- `publish_progress`（发布界面进度）；
+- `publish_voice_information`（发布 Voice 信息）；
 - `request_user_input`；
 - `return_shadow_result`；
 - `finish_shadow_no_action`。
 
 子代理可承担明确并行任务，但执行入口会拒绝子代理调用 Voice 控制工具。根 Agent统一决定澄清、
-确认、观察和唯一终态。语音 confirmation 不会批准或修改 DSH Harness 权限。
+确认、中途信息和唯一终态。非终态工具不结束 DSH 回合；只有终态获得 `accepted`（已接受）
+或 `duplicate`（重复确认）后才结束回合。语音 confirmation 不会批准或修改 DSH Harness 权限。
 
 ## 模型、工具与可见性
 
@@ -163,9 +165,9 @@ DSH 全局模型、provider、reasoning 和凭据仍由 Harness UI 管理；Voic
 status observer 和 TTS。status observer 仍由 Voice 托管，但只能通过 Bundle 的有界
 ObserverSnapshot 读取已提交事件，不接收 reasoning、流式草稿、完整敏感参数、环境变量、凭据或
 子代理私有轨迹，也不回注 DSH 根 Agent。status observer 的真实摘要会在 Voice 侧生成
-`ShadowEvent(kind=status, wake_policy=normal)`：它更新可替换的 `ShadowVisibleStatus`，触发一次
-普通 Voice LLM 调度，并在下一次请求的 `runtime.shadow.status` 中可见；它不追加为长期语义历史，
-也不会伪装成 `result` 或其他终态事件。
+`ShadowEvent(kind=information, source=observer)`（影子信息，来源为状态观察器）：它与根 Agent 信息共用单槽，
+触发一次可合并的 Voice LLM 调度，只在该 logical request（逻辑请求）的 `runtime.shadow.information`
+中可见；它不追加为长期语义历史，也不会伪装成 `result` 或其他终态事件。
 
 正式 Session 在官方 DSH UI 中显示完整 Voice 权威上下文，并标记 `Source: Voice Terminal`、epoch、
 revision 和 snapshot/delta。reset 会取消旧 Turn、把旧 Session 标记 retired 并保留在 UI中，再为

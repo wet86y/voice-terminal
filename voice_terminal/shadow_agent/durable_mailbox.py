@@ -1,4 +1,4 @@
-"""Durable DSH-to-Voice event mailbox（持久化影子到语音事件信箱）."""
+"""Durable DSH-to-Voice event mailbox（持久语音事件信箱）."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from .contracts import ShadowEvent
+from .contracts import DurableVoiceEvent
 
 
-class DurableShadowMailbox:
+class DurableVoiceMailbox:
     """Persist accepted events before acknowledging their DSH publisher."""
 
     def __init__(self, path: Path) -> None:
@@ -37,7 +37,7 @@ class DurableShadowMailbox:
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(temporary, self.path)
 
-    async def publish(self, event: ShadowEvent) -> str:
+    async def publish(self, event: DurableVoiceEvent) -> str:
         async with self._lock:
             if event.event_id in self._delivered:
                 return "duplicate"
@@ -49,9 +49,9 @@ class DurableShadowMailbox:
             self._save()
             return "accepted"
 
-    async def pending(self) -> list[ShadowEvent]:
+    async def pending(self) -> list[DurableVoiceEvent]:
         async with self._lock:
-            return [ShadowEvent(**value) for value in self._pending.values()]
+            return [DurableVoiceEvent(**value) for value in self._pending.values()]
 
     async def acknowledge(self, event_id: str) -> None:
         async with self._lock:

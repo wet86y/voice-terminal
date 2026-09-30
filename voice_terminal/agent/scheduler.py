@@ -12,7 +12,6 @@ class AgentDecisionScheduler:
     state and never creates an asyncio task of its own.
     """
 
-    SECONDARY_INTERVAL_MS = 4000
     FINAL_WINDOW = 75
     TTS_EVENTS = frozenset({
         "TTS_STARTED", "TTS_COMPLETED", "TTS_CANCELLED", "TTS_REPLACED",
@@ -27,15 +26,12 @@ class AgentDecisionScheduler:
         self.options = options
         self.interval = max(0.001, float(options.scheduler_tick_ms) / 1000.0)
         # Product settings can stage a different final-silence boundary for
-        # the next episode. It takes precedence over a secondary checkpoint.
+        # the next episode.
         self.FINAL_WINDOW = max(
             1,
             math.ceil(float(getattr(options, "final_silence_ms", 30000))
                       / max(1, int(options.scheduler_tick_ms))),
         )
-        self.secondary_interval_windows = max(1, math.ceil(
-            self.SECONDARY_INTERVAL_MS / 1000.0 / self.interval
-        ))
         self.last_tick = 0.0
         self.next_heartbeat = None
         self.anchor_monotonic = None
@@ -210,23 +206,6 @@ class AgentDecisionScheduler:
                 self.final_pending_since = now
             self.final_pending = True
         return self.forced_due(now=now)
-
-    def secondary_due(self, previous_window: int) -> bool:
-        """One 4-second checkpoint crossed on the active silence clock."""
-        return bool(
-            self.armed and not self.final_pending
-            and self.window_index < self.FINAL_WINDOW
-            and self.window_index // self.secondary_interval_windows
-            > previous_window // self.secondary_interval_windows
-        )
-
-    def secondary_candidate(self, *, now=None):
-        if not self.armed or self.final_pending:
-            return None
-        return self._descriptor(
-            "secondary_mailbox", self.window_index,
-            time.monotonic() if now is None else float(now),
-        )
 
     def pending_checkpoint_windows(self):
         windows = []
