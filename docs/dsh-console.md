@@ -135,6 +135,33 @@ activation、打断模型或取消工具。下一个 `next-step` 安全点之前
 后才会进入下一个窗口，完全重复的 revision/digest 不会再次注入。上下文更新的传输超时会通过
 `session.state` 核对并以同一 request ID 幂等重试，不能仅凭丢失的 HTTP 响应判定 DSH 失败。
 
+实验性 `experimental_context_gate_enabled`（上下文门禁开关）关闭时完全沿用上述直通行为。开启后，
+运行中后续 `request_shadow` 的新正文仍先同步到 DSH 插件，侧载模型只判断何时将其排入模型消息。
+有意义的正文合并到当前步骤；暂缓的正文在当前激活的唯一终态后，以新 `activation_id`（激活标识）
+作为下一回合消息交付，并标记延迟来源。同一区间可在每次新请求时重新判断，不限制暂缓次数。
+插件的 `context.snapshot/update`（上下文快照／更新）仅在显式携带
+`guidance_delivery: "hold"`（仅同步暂存）时停止立即注入；字段缺省仍使用原路径。
+`context.guidance`（引导决策操作）按激活与版本幂等放行或暂缓；`session.state`（会话状态）
+报告 `queued_revision`（已排队版本）、`claimed_revision`（已领取版本）与
+`deferred_revision`（暂缓版本），用于传输重试核对。结构化 `dsh.context_gate` 日志记录
+判断、版本区间、队列目标、终态交接和失败放行，不包含权威正文或访问凭据。
+
+### 真实运行验证（2026-09-30）
+
+在本机 DSH 0.1.7-rc.2（版本）与真实 DSH Agent（代理）会话中验证了插件交接链路，测试上下文由脚本生成，未启用麦克风或 ASR（语音识别）。
+门禁关闭时，运行中的 revision 2（上下文版本）通过普通 `context.update`（上下文更新）进入 DSH 并被领取。
+门禁开启时，revision 2/3 先以 `hold`（暂存）同步；两次真实侧载判断均返回
+`inject_now / supplement`（立即引导／补充），插件将它们合并进同一条待处理消息并报告领取。
+
+为检查暂缓分支，对真实插件提交了两次受控的 `defer_once`（本次推迟）决策。插件均接受；旧激活结束后，
+Voice 创建新的 `activation_id`（激活标识），插件以 `next_turn`（下一回合）交付延迟正文。新激活领取后到达的
+revision 3（上下文版本）通过 `already_claimed`（已领取）分支排入 `next_step`（当前回合下一步骤）。重放实际
+DSH `result`（结果终态）回执得到 `duplicate`（重复确认），没有生成额外激活或交接。
+
+本次在线判断模型没有自然选择暂缓；`defer_once`（本次推迟）验证由测试控制决策结果，因此验证的是插件协议、
+真实队列和 DSH 激活交接，不能说明分类器会在实际场景中选择暂缓。新激活领取速度约为 8 毫秒，未能稳定覆盖
+领取前的 `inbox.replace`（收件箱原位替换）时序；`input_required`（等待用户输入）终态、麦克风输入也未进行真实运行验证。
+
 每个 activation 从 `wake` 被接受时开始按 `shadow_agent.runtime_reminder_interval_ms` 计时，默认每
 20 秒向最近的 next-step 安全边界注入一次软性收敛提醒（20、40、60 秒……）。提醒使用 `inject`，不
 唤醒 idle Agent、不恢复工具前硬阻断，也不重置 activation 计时；上一条提醒尚未 claim 时原位替换，

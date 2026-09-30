@@ -364,6 +364,19 @@ class SessionRuntime(SpeakerRuntimeMixin):
                             session_id=(self.conversation.conversation_id
                                         if self.config.llm.provider == "opencode_go" else None),
                         )
+                    gate_provider = status_provider
+                    if gate_provider is None:
+                        gate_cfg = shadow_cfg.status_observer.provider or shadow_cfg.provider
+                        gate_key = self._api_key(gate_cfg.api_key_env)
+                        if gate_key:
+                            gate_provider = DeepSeekResponsesShadowProvider(
+                                base_url=gate_cfg.base_url,
+                                model=gate_cfg.model,
+                                api_key=gate_key,
+                                timeout_ms=gate_cfg.timeout_ms,
+                                session_id=(self.conversation.conversation_id
+                                            if self.config.llm.provider == "opencode_go" else None),
+                            )
                     self.shadow_session = DshShadowAgentSession(
                         client=self.dsh.bridge,
                         mapping_store=DshMappingStore(self.config.dsh.home_dir.parent / "session-mappings.json"),
@@ -373,13 +386,18 @@ class SessionRuntime(SpeakerRuntimeMixin):
                         production_sink=self._on_shadow_events,
                         activity_sink=self._on_shadow_activity,
                         status_provider=status_provider,
+                        gate_provider=gate_provider,
                         observer_every_steps=shadow_cfg.status_observer.every_committed_steps,
                         observer_max_output_tokens=shadow_cfg.status_observer.max_output_tokens,
                         observer_timeout_ms=shadow_cfg.status_observer.timeout_ms,
                         availability_waiter=self.dsh.wait_ready,
                         runtime_reminder_interval_ms=shadow_cfg.runtime_reminder_interval_ms,
                     )
+                    self.shadow_session.set_context_gate_enabled(
+                        shadow_cfg.experimental_context_gate_enabled,
+                    )
                     self.dsh.bridge_hub.register(self.shadow_session)
+                    await self.shadow_session.resume_pending_gate()
                     self.history.set_shadow_runtime_state(available=True, active=False)
                     self.shadow_product.reset(available=True)
                     self.state.set_service("shadow_agent", "READY")
@@ -1371,9 +1389,11 @@ class SessionRuntime(SpeakerRuntimeMixin):
             self.state.set_service("shadow_agent", "ERROR")
             return "unavailable"
 
-    def set_shadow_context_gate_enabled(self, enabled: bool) -> bool:
+    async def set_shadow_context_gate_enabled(self, enabled: bool) -> bool:
         """Apply the experimental timing gate without restarting the session."""
         value = bool(enabled)
+        previous = self.config.shadow_agent.experimental_context_gate_enabled
+        old_config = self.config
         self.config = replace(
             self.config,
             shadow_agent=replace(
@@ -1381,8 +1401,16 @@ class SessionRuntime(SpeakerRuntimeMixin):
                 experimental_context_gate_enabled=value,
             ),
         )
-        if self.shadow_session is not None:
-            self.shadow_session.set_context_gate_enabled(value)
+        try:
+            if self.shadow_session is not None:
+                self.shadow_session.set_context_gate_enabled(value)
+                if not value and isinstance(self.shadow_session, DshShadowAgentSession):
+                    await self.shadow_session.flush_context_gate()
+        except Exception:
+            self.config = old_config
+            if self.shadow_session is not None:
+                self.shadow_session.set_context_gate_enabled(previous)
+            raise
         return value
 
     async def set_speaker_settings(self, settings: Mapping[str, Any]) -> dict[str, Any]:

@@ -5,6 +5,9 @@ import {
   clearActivationIfCurrent,
   deliverRuntimeReminder,
   enqueueAuthoritativeContext,
+  enqueueDeferredActivation,
+  holdAuthoritativeContext,
+  releaseHeldContext,
   stableBridgeToolId,
   stopRuntimeReminder,
 } from '../../../../.runtime/dsh/bundles/voice-terminal-shadow-bridge-test/lib/index.js'
@@ -12,13 +15,15 @@ import { assertV4MessageSources } from '../../../../.runtime/dsh/source/packages
 
 function fixture() {
   const nextStep = []
+  const nextTurn = []
   const agent = {
     inbox: {
       replace(id, message) {
-        const index = nextStep.findIndex(item => item.id === id)
-        if (index < 0) return false
-        nextStep.splice(index, 1, message)
-        return true
+        for (const queue of [nextStep, nextTurn]) {
+          const index = queue.findIndex(item => item.id === id)
+          if (index >= 0) { queue.splice(index, 1, message); return true }
+        }
+        return false
       },
       remove(id) {
         const index = nextStep.findIndex(item => item.id === id)
@@ -28,12 +33,13 @@ function fixture() {
       },
     },
     inject(message) { nextStep.push(message) },
+    followup(message) { nextTurn.push(message) },
   }
   const binding = {
     voiceSessionId: 'voice-session', dshSessionId: 'dsh-session', epoch: 1,
     handle: { agent }, traceRevision: 0, records: [],
   }
-  return { binding, nextStep }
+  return { binding, nextStep, nextTurn }
 }
 
 function envelope(revision, frames, fromRevision = undefined) {
@@ -101,6 +107,58 @@ test('an update after claim opens a new safe-window input', () => {
   assert.notEqual(nextStep[0].id, claimed.id)
   assert.doesNotMatch(textOf(nextStep[0]), /"revision":2/)
   assert.match(textOf(nextStep[0]), /"revision":3/)
+})
+
+test('held authority is synchronized without model injection and releases in revision order', () => {
+  const { binding, nextStep } = fixture()
+  holdAuthoritativeContext(binding, envelope(3, [{ revision: 3 }], 2), 'delta')
+  holdAuthoritativeContext(binding, envelope(4, [{ revision: 4 }], 3), 'delta')
+  assert.equal(nextStep.length, 0)
+  assert.equal(releaseHeldContext(binding, 4), 'inserted')
+  assert.equal(nextStep.length, 1)
+  assert.match(textOf(nextStep[0]), /"revision":3.*"revision":4/)
+})
+
+test('a guidance decision releases only its version when a newer update is already held', () => {
+  const { binding, nextStep } = fixture()
+  holdAuthoritativeContext(binding, envelope(3, [{ revision: 3 }], 2), 'delta')
+  holdAuthoritativeContext(binding, envelope(4, [{ revision: 4 }], 3), 'delta')
+  assert.equal(releaseHeldContext(binding, 3), 'inserted')
+  assert.match(textOf(nextStep[0]), /"revision":3/)
+  assert.doesNotMatch(textOf(nextStep[0]), /"revision":4/)
+  assert.equal(binding.heldContext.revision, 4)
+  assert.equal(binding.heldContext.fromRevision, 3)
+  assert.equal(releaseHeldContext(binding, 4), 'replaced')
+  assert.match(textOf(nextStep[0]), /"revision":3.*"revision":4/)
+})
+
+test('user answer merges into unclaimed deferred activation before its next turn', () => {
+  const { binding, nextStep, nextTurn } = fixture()
+  holdAuthoritativeContext(binding, envelope(3, [{ revision: 3 }], 2), 'delta')
+  binding.deferredRevision = 3
+  assert.equal(enqueueDeferredActivation(binding, 'activation-b'), true)
+  const id = nextTurn[0].id
+  holdAuthoritativeContext(binding, envelope(4, [{ revision: 4 }], 3), 'delta')
+  assert.equal(releaseHeldContext(binding, 4), 'replaced')
+  assert.equal(nextStep.length, 0)
+  assert.equal(nextTurn.length, 1)
+  assert.equal(nextTurn[0].id, id)
+  assert.match(textOf(nextTurn[0]), /VOICE SHADOW ACTIVATION/)
+  assert.match(textOf(nextTurn[0]), /VOICE GATE DEFERRED CONTEXT/)
+  assert.match(textOf(nextTurn[0]), /"revision":3.*"revision":4/)
+})
+
+test('user answer after deferred activation claim enters the next step', () => {
+  const { binding, nextStep, nextTurn } = fixture()
+  holdAuthoritativeContext(binding, envelope(3, [{ revision: 3 }], 2), 'delta')
+  binding.deferredRevision = 3
+  enqueueDeferredActivation(binding, 'activation-b')
+  nextTurn.shift()
+  holdAuthoritativeContext(binding, envelope(4, [{ revision: 4 }], 3), 'delta')
+  assert.equal(releaseHeldContext(binding, 4), 'already_claimed')
+  assert.equal(nextStep.length, 1)
+  assert.doesNotMatch(textOf(nextStep[0]), /"revision":3/)
+  assert.match(textOf(nextStep[0]), /"revision":4/)
 })
 
 function reminderFixture() {

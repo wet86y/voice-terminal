@@ -309,8 +309,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             runtime.continuity.user_started()
             runtime._dsh_busy = True
             try:
-                await session._ensure_open()
-                await session._sync_context()
+                async with session._wake_lock:
+                    await session._ensure_open()
+                    await session._sync_context(hold=session._gate_enabled and session.activation_id is not None)
                 response = await runtime.dsh.bridge.call("task.deliver", {
                     "request_id": str(payload["occurrence_id"]),
                     "voice_session_id": session.voice_session_id,
@@ -462,10 +463,17 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     async def update_product_shadow(body: dict[str, Any]) -> dict[str, Any]:
         try:
             store = product_store_or_404()
+            previous = store.snapshot()["shadow"]["experimental_context_gate_enabled"]
             value = await asyncio.to_thread(store.save_shadow, body)
-            enabled = runtime.set_shadow_context_gate_enabled(
-                value["experimental_context_gate_enabled"],
-            )
+            try:
+                enabled = await runtime.set_shadow_context_gate_enabled(
+                    value["experimental_context_gate_enabled"],
+                )
+            except Exception:
+                await asyncio.to_thread(store.save_shadow, {
+                    "experimental_context_gate_enabled": previous,
+                })
+                raise
             # Keep the persisted overlay synchronized for future resets and
             # process restarts without staging a voice-session restart.
             store.config = runtime.config
