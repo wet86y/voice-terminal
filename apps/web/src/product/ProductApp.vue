@@ -668,6 +668,15 @@ const speakerServiceLabel = computed(() => {
   return service === 'DISABLED' ? '已关闭' : '不可用'
 })
 
+const speakerRollingSummary = computed(() => {
+  if (speakerForm.mode === 'off') return ''
+  const rolling = speakerStatus.value.rolling_state
+  if (!isRecord(rolling)) return '当前声音：证据不足'
+  const age = Number(rolling.age_ms)
+  const ageText = Number.isFinite(age) ? ` · ${Math.round(age)}ms（毫秒）前` : ''
+  return `当前声音：${speakerStateLabel(rolling.identity)}${ageText}`
+})
+
 const speakerTemplates = computed(() => {
   const templates = speakerProfile.value.templates
   return Array.isArray(templates) ? templates.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>> : []
@@ -728,6 +737,8 @@ const speakerEnrollmentComplete = computed(() => (
 
 function speakerStateLabel(value: unknown) {
   const labels: Record<string, string> = {
+    owner: '确认是主人',
+    non_owner: '明确非主人',
     owner_confirmed: '确认是本人',
     owner_continuity: '连续保持本人',
     non_owner_confirmed: '明确非本人',
@@ -1212,18 +1223,20 @@ function pageLabel() {
           </template>
 
           <template v-else-if="activeSettingsTab === 'speaker'">
-            <header><p class="panel-kicker">可选声纹增强</p><h2>让连续对话更自然</h2><p>声纹只在本地旁路观察和路由，不会阻塞音频采集、VAD、ASR partial 或 final；组件关闭、未注册、超时或出错时自动直通。它不是付款、删除、门锁等高风险操作的身份认证。</p></header>
+            <header><p class="panel-kicker">可选声纹增强</p><h2>让连续对话更自然</h2><p>声纹只在本地旁路观察和路由，不会阻塞音频采集、VAD（语音活动检测）、ASR（自动语音识别）的局部或最终转写；普通请求在未注册、超时或出错时保守放行，主人打断则必须获得确认。它不是付款、删除、门锁等高风险操作的身份认证。</p></header>
 
             <section class="speaker-status-card">
               <div><span class="section-label">STATUS</span><strong>{{ speakerServiceLabel }}</strong><small>{{ String(speakerStatus.model_id || 'WeSpeaker 中文 ResNet34') }} · CPU 独立 Worker</small><small v-if="speakerStatus.last_error" class="speaker-last-error">最近错误：{{ String(speakerStatus.last_error) }}</small></div>
-              <div class="speaker-status-detail"><span>{{ speakerHasProfile ? '已注册主人声纹' : '尚未注册声纹' }}</span><span v-if="speakerStatus.worker_connected === true">Worker 已连接</span><span v-else>Worker 未连接</span></div>
+              <div class="speaker-status-detail"><span>{{ speakerHasProfile ? '已注册主人声纹' : '尚未注册声纹' }}</span><span v-if="speakerStatus.worker_connected === true">Worker（工作进程）已连接</span><span v-else>Worker（工作进程）未连接</span><span v-if="speakerRollingSummary">{{ speakerRollingSummary }}</span></div>
             </section>
 
             <div v-if="speakerNeedsReenrollment" class="info-callout"><span>!</span><p><strong>需要重新注册声纹。</strong>{{ speakerStaleReason }} 特征管线更换后，旧模板与新的分数不再处于同一坐标，系统已停止用它们判定身份（不确定状态一律放行）。请重新录制三段。</p></div>
 
             <div class="speaker-settings-grid">
-              <label class="form-field"><span>运行模式</span><select v-model="speakerForm.mode"><option value="off">关闭</option><option value="observe">测试（只记录，不拦截）</option><option value="filter" :disabled="!speakerFilterAllowed">筛选（只拦截明确非本人）</option></select><small v-if="!speakerFilterAllowed">完成声纹注册且 Worker 就绪后才能选择筛选；不确定状态始终放行。</small><small v-else>首次建议使用测试模式，确认样本表现后再手动切换筛选。</small></label>
-              <details class="speaker-advanced"><summary>高级设置 · 阈值基线</summary><div class="speaker-thresholds"><label class="form-field"><span>普通确认阈值 <b>{{ Number(speakerForm.confirm_threshold).toFixed(2) }}</b></span><input v-model.number="speakerForm.confirm_threshold" type="range" min="0.01" max="1" step="0.01"><small>达到此分数并具备连续证据才确认是本人。</small></label><label class="form-field"><span>连续保持阈值 <b>{{ Number(speakerForm.continuity_threshold).toFixed(2) }}</b></span><input v-model.number="speakerForm.continuity_threshold" type="range" min="0" max="0.99" step="0.01"><small>已确认对话中的宽松保持阈值；必须低于普通确认阈值。</small></label><button class="ghost-action" type="button" @click="restoreSpeakerDefaults">恢复默认阈值（0.60 / 0.50）</button></div></details>
+              <label class="form-field"><span>声纹模式</span><select v-model="speakerForm.mode"><option value="off">关闭</option><option value="observe">仅标记</option><option value="filter" :disabled="!speakerFilterAllowed">拦截明确非主人</option></select><small v-if="!speakerFilterAllowed">注册主人声纹且 Worker（工作进程）就绪后才能启用拦截；不确定状态始终放行。</small><small v-else>仅标记只更新说话人状态；拦截会将明确非主人的转写转入环境记录。</small></label>
+              <label class="speaker-barge-toggle"><input v-model="speakerForm.owner_only_barge_in" type="checkbox" :disabled="!speakerHasProfile && !speakerForm.owner_only_barge_in"><span><strong>主人打断</strong><small>只在当前打断候选确认是主人后停止播放；最多等待约 2.5 秒。关闭声纹模式时也可单独启用。</small></span></label>
+              <div v-if="speakerForm.owner_only_barge_in" class="speaker-barge-status" :class="{ effective: speakerStatus.owner_only_barge_in_effective === true }"><strong>{{ speakerStatus.owner_only_barge_in_effective === true ? '主人打断已生效' : '主人打断当前不可用' }}</strong><small v-if="speakerStatus.owner_only_barge_in_effective !== true">{{ String(speakerStatus.owner_only_barge_in_reason || (!speakerHasProfile ? '请先注册主人声纹。' : '等待声纹服务与回声消除就绪。')) }}</small></div>
+              <details class="speaker-advanced"><summary>高级设置 · 阈值基线</summary><div class="speaker-thresholds"><label class="form-field"><span>主人确认阈值 <b>{{ Number(speakerForm.confirm_threshold).toFixed(2) }}</b></span><input v-model.number="speakerForm.confirm_threshold" type="range" min="0.01" max="1" step="0.01"><small>达到此分数且证据充足才确认是主人。</small></label><label class="form-field"><span>非主人确认界限 <b>{{ Number(speakerForm.continuity_threshold).toFixed(2) }}</b></span><input v-model.number="speakerForm.continuity_threshold" type="range" min="0" max="0.99" step="0.01"><small>低于此分数且证据充足才确认是非主人；两阈值之间保持未知。必须低于主人确认阈值。</small></label><button class="ghost-action" type="button" @click="restoreSpeakerDefaults">恢复默认阈值（0.60 / 0.50）</button></div></details>
             </div>
             <div class="info-callout"><span>!</span><p>阈值只是当前测试基线，不代表安全等级。阈值越宽松越容易连续对话，也越可能误认；第一版不提供防伪和变声检测（anti-spoofing：不可用）。</p></div>
 

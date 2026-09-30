@@ -313,6 +313,7 @@ class AsrWorkerConfig:
 @dataclass(frozen=True)
 class SpeakerConfig:
     mode: str = "off"
+    owner_only_barge_in: bool = False
     confirm_threshold: float = 0.60
     continuity_threshold: float = 0.50
     window_ms: int = 2000
@@ -326,6 +327,8 @@ class SpeakerConfig:
     def __post_init__(self) -> None:
         if self.mode not in {"off", "observe", "filter"}:
             raise ValueError("speaker.mode must be off, observe, or filter")
+        if type(self.owner_only_barge_in) is not bool:
+            raise ValueError("speaker.owner_only_barge_in must be boolean")
         if not 0.0 <= self.continuity_threshold < self.confirm_threshold <= 1.0:
             raise ValueError("speaker thresholds must satisfy 0 <= continuity < confirm <= 1")
         if self.window_ms < 500 or self.step_ms < 100 or self.step_ms > self.window_ms:
@@ -902,6 +905,7 @@ class AppConfig:
             ),
             speaker=SpeakerConfig(
                 mode=_string(speaker.get("mode"), "off").lower(),
+                owner_only_barge_in=speaker.get("owner_only_barge_in", False),
                 confirm_threshold=float(_number(speaker.get("confirm_threshold"), 0.60)),
                 continuity_threshold=float(_number(speaker.get("continuity_threshold"), 0.50)),
                 window_ms=int(_number(speaker.get("window_ms"), 2000)),

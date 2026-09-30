@@ -21,6 +21,7 @@ from ..kws.service import KwsAudioFrame
 from ..speaker.client import SpeakerWorkerClient
 from ..speaker.contracts import SpeakerDecision, SpeakerObservation, SpeakerMode, SpeakerState
 from ..speaker.router import SpeakerRouter
+from ..speaker.rolling import RollingSpeakerIdentity, RollingSpeakerSensor, RollingSpeakerSnapshot
 from ..session.ambient import AmbientTranscriptStore
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,12 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self.speaker_client: SpeakerWorkerClient | None = kwargs.pop("speaker_client", None)
         self.speaker_router: SpeakerRouter | None = kwargs.pop("speaker_router", None)
         self.speaker_mode = str(kwargs.pop("speaker_mode", "off"))
+        self.owner_only_barge_in = bool(kwargs.pop("owner_only_barge_in", False))
         self.speaker_wait_ms = int(kwargs.pop("speaker_wait_ms", 150))
+        self.speaker_window_ms = int(kwargs.pop("speaker_window_ms", 2000))
+        self.speaker_min_speech_ms = int(kwargs.pop("speaker_min_speech_ms", 700))
+        self.speaker_min_turn_speech_ms = int(kwargs.pop("speaker_min_turn_speech_ms", 2000))
+        self.speaker_min_window_speech_ratio = float(kwargs.pop("speaker_min_window_speech_ratio", 0.40))
         self.ambient_store: AmbientTranscriptStore | None = kwargs.pop("ambient_store", None)
         super().__init__(**kwargs)
         self.options = options
@@ -71,8 +77,90 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self._vad_generation = 0
         self._reset_vad_pending = False
         self._activation_generation = 0
+        self.speaker_sensor: RollingSpeakerSensor | None = None
+        self._speaker_snapshot: RollingSpeakerSnapshot | None = None
+        self._speaker_snapshot_turn_id: str | None = None
+        self._speaker_snapshot_generation: int | None = None
+        self._speaker_snapshot_barge_id: str | None = None
+        self._speaker_turn_start_sample: int | None = None
+        self._speaker_analysis_task: asyncio.Task | None = None
+        self._speaker_timer_handle: asyncio.TimerHandle | None = None
+        self.configure_speaker_runtime()
+
+    def configure_speaker_runtime(self) -> None:
+        """Apply mode and worker changes without another periodic scheduler."""
+        enabled = self.speaker_mode != "off" or self.owner_only_barge_in
+        client = self.speaker_client
+        router = self.speaker_router
+        if not enabled or client is None or router is None:
+            self.speaker_sensor = None
+            self._speaker_snapshot = None
+            return
+        current = self.speaker_sensor
+        if current is not None and current.embed_pcm == client.embed_pcm:
+            thresholds_changed = (
+                current.confirm_threshold != router.state_config.confirm_threshold
+                or current.non_owner_threshold != router.state_config.continuity_threshold
+            )
+            current.confirm_threshold = router.state_config.confirm_threshold
+            current.non_owner_threshold = router.state_config.continuity_threshold
+            if thresholds_changed:
+                # A decision made with the previous policy must not authorize
+                # a request or playback interruption after a hot update.
+                self._speaker_snapshot = None
+                self._speaker_snapshot_turn_id = None
+                self._speaker_snapshot_generation = None
+                self._speaker_snapshot_barge_id = None
+            return
+        self.speaker_sensor = RollingSpeakerSensor(
+            client.embed_pcm, router.score_embedding,
+            window_ms=self.speaker_window_ms,
+            min_voiced_ms=self.speaker_min_speech_ms,
+            min_decision_voiced_ms=self.speaker_min_turn_speech_ms,
+            min_window_speech_ratio=self.speaker_min_window_speech_ratio,
+            confirm_threshold=router.state_config.confirm_threshold,
+            non_owner_threshold=router.state_config.continuity_threshold,
+        )
+        self._speaker_snapshot = None
+        self._speaker_snapshot_turn_id = None
+        self._speaker_snapshot_generation = None
+        self._speaker_snapshot_barge_id = None
+
+    def speaker_vetoes_turn(self, turn_id: str) -> bool:
+        if getattr(self, "speaker_mode", "off") != "filter":
+            return False
+        ws = self.workspace
+        snapshot = self._speaker_snapshot
+        return bool(
+            ws is not None and ws.turn_id == turn_id
+            and snapshot is not None and snapshot.identity == RollingSpeakerIdentity.NON_OWNER
+            and snapshot.is_fresh()
+            and snapshot.candidate_start_sample == self._speaker_turn_start_sample
+            and self._speaker_snapshot_turn_id == turn_id
+            and self._speaker_snapshot_generation == ws.generation
+        )
+
+    async def _stop_speaker_sensor(self) -> None:
+        timer = getattr(self, "_speaker_timer_handle", None)
+        if timer is not None:
+            timer.cancel()
+            self._speaker_timer_handle = None
+        task = getattr(self, "_speaker_analysis_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._speaker_analysis_task = None
+        sensor = getattr(self, "speaker_sensor", None)
+        if sensor is not None:
+            sensor.clear()
+        self._speaker_snapshot = None
+        self._speaker_snapshot_turn_id = None
+        self._speaker_snapshot_generation = None
+        self._speaker_snapshot_barge_id = None
 
     async def on_speaker_observation(self, observation: SpeakerObservation) -> None:
+        if getattr(self, "speaker_mode", "off") == SpeakerMode.OFF:
+            return
         router = getattr(self, "speaker_router", None)
         if router is None:
             return
@@ -338,6 +426,10 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         always_on = bool(getattr(self, "wake_always_on", False))
         if always_on:
             if self.state.input_owner == "kws":
+                if getattr(self, "speaker_sensor", None) is not None:
+                    self.speaker_sensor.submit_frame(
+                        frame.pcm, start_sample=frame.start_sample, speech=None,
+                    )
                 if self.kws is None or self.kws.error is not None or not self.kws.running:
                     await self._fail_kws_closed(
                         self.kws.error if self.kws is not None and self.kws.error else "KWS worker unavailable"
@@ -356,7 +448,8 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                 return
         self._last_frame = frame
         self._recent.append(frame)
-        while self._recent and frame.end_sample - self._recent[0].start_sample > max(1200, self.wake_preroll_ms) * 16:
+        recent_ms = max(4000 if getattr(self, "owner_only_barge_in", False) else 1200, self.wake_preroll_ms)
+        while self._recent and frame.end_sample - self._recent[0].start_sample > recent_ms * 16:
             self._recent.popleft()
         # KWS has its own native decoder thread.  The controller only hands it
         # PCM while there is no active user turn; decoder work cannot stall
@@ -378,9 +471,17 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         activity = await asyncio.to_thread(self.vad.feed, frame.pcm)
         if generation != self._vad_generation:
             return  # Turn was cancelled while native VAD was running.
+        if getattr(self, "speaker_sensor", None) is not None:
+            self.speaker_sensor.submit_frame(
+                frame.pcm, start_sample=frame.start_sample, speech=bool(activity.is_speech),
+            )
         if activity.speech_started:
             self._speech_start_sample = self._vad_origin + (activity.speech_start_sample or 0)
             self._speech_end_sample = None
+            if self.workspace is not None and self._active_input:
+                # A new VAD speech epoch may belong to a different person;
+                # do not reuse the previous epoch's identity evidence.
+                self._speaker_turn_start_sample = self._speech_start_sample
         if activity.speech_end_sample is not None:
             self._speech_end_sample = self._vad_origin + activity.speech_end_sample
             if self._speech_start_sample is not None:
@@ -431,7 +532,8 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                 self._queue_asr(AudioChunk(self._sub_id, frame.pcm))
 
         speaker_client = getattr(self, "speaker_client", None)
-        if speaker_client is not None and ws is not None:
+        if (speaker_client is not None and ws is not None
+                and str(getattr(ws, "speaker_mode", self.speaker_mode)) != SpeakerMode.OFF):
             submitted = speaker_client.submit_frame(
                 turn_id=ws.turn_id,
                 generation=ws.generation,
@@ -553,6 +655,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
 
     async def _new_turn(self, frame: AudioFrame) -> None:
         turn_id = self.turns.begin()
+        self._speaker_turn_start_sample = self._speech_start_sample or frame.start_sample
         self.state.clear_current()
         self.conversation.begin_turn(turn_id)
         self.workspace = ws = TurnWorkspace(
@@ -608,6 +711,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
 
     async def _resume(self, frame: AudioFrame) -> None:
         ws = self.workspace
+        self._speaker_turn_start_sample = self._speech_start_sample or frame.start_sample
         # A same-turn continuation used to clear the frozen answer here even
         # when the Episode output had already atomically held it before the
         # first real PCM callback. That discarded a valid text/TTS candidate

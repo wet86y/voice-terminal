@@ -149,6 +149,9 @@ class InputController:
             self._listen_task.cancel()
             await asyncio.gather(self._listen_task, return_exceptions=True)
             self._listen_task = None
+        stop_speaker = getattr(self, "_stop_speaker_sensor", None)
+        if callable(stop_speaker):
+            await stop_speaker()
         await self._cancel_turn(reason="stopped")
         if self.capture is not None:
             await self.capture.stop()
@@ -200,14 +203,19 @@ class InputController:
     def _barge_in_protected_available(self) -> bool:
         if self.player is None or not bool(getattr(self.player, "running", False)):
             return True
+        output_handle = getattr(getattr(self, "output", None), "handle", None)
+        output_workspace = getattr(output_handle, "workspace", None)
         workspace = getattr(self, "workspace", None)
-        key = (getattr(workspace, "playback_key", None)
-               or getattr(getattr(self, "inputs", None), "current", None)
-               or getattr(getattr(self, "turns", None), "current", None))
+        # Input workspaces retire at ASR commit while their output continues.
+        # The player's key includes the output generation; a bare input id
+        # must never make an already-audible stream look "not started".
+        key = (getattr(output_workspace, "playback_key", None)
+               or getattr(workspace, "playback_key", None)
+               or getattr(self.player, "_active_turn", None))
         started = getattr(self.player, "has_started", None)
         if key is not None and callable(started):
             try:
-                if not started(key):
+                if not started(key) and not bool(getattr(output_workspace, "playback_started", False)):
                     return True
             except Exception:
                 pass

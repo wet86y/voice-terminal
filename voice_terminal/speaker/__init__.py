@@ -8,6 +8,7 @@ from .features import FRONTEND_VERSION, InsufficientAudioError, pcm_to_fbank
 from .registry import SpeakerProfileStore
 from .state import SpeakerStateMachine
 from .worker import SpeakerWorkerEngine
+from .rolling import RollingSpeakerIdentity, RollingSpeakerSensor, RollingSpeakerSnapshot
 
 __all__ = [
     "ENROLLMENT_PROMPTS",
@@ -25,6 +26,9 @@ __all__ = [
     "SpeakerModelError",
     "WeSpeakerOnnxEngine",
     "SpeakerWorkerEngine",
+    "RollingSpeakerIdentity",
+    "RollingSpeakerSensor",
+    "RollingSpeakerSnapshot",
     "check_segments",
     "pcm_to_fbank",
 ]

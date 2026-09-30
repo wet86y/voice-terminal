@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 import httpx
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from voice_terminal.config import AppConfig, PersonaConfig
 from voice_terminal.config import COMPUTE_MODEL_IDS
@@ -120,6 +120,38 @@ class ProductApiTests(unittest.TestCase):
             self.runtime.product_settings.snapshot()["compute"]["devices"]["sensevoice"],
             "cpu",
         )
+
+    def test_owner_only_barge_in_requires_profile_and_worker_even_when_mode_off(self) -> None:
+        payload = {
+            "mode": "off", "confirm_threshold": 0.5,
+            "continuity_threshold": 0.4, "owner_only_barge_in": True,
+        }
+        self.assertFalse(self.runtime.product_settings.snapshot()["speaker"]["owner_only_barge_in"])
+        response = asyncio.run(self._request(
+            "PUT", "/api/v1/product/settings/speaker", json=payload,
+        ))
+        self.assertEqual(response.status_code, 422)
+        self.assertFalse(self.runtime.product_settings.snapshot()["speaker"]["owner_only_barge_in"])
+
+    def test_owner_only_barge_in_saves_independently_of_speaker_mode(self) -> None:
+        payload = {
+            "mode": "off", "confirm_threshold": 0.5,
+            "continuity_threshold": 0.4, "owner_only_barge_in": True,
+        }
+        with patch("voice_terminal.speaker.registry.SpeakerProfileStore.available", new_callable=PropertyMock, return_value=True), \
+             patch.object(self.runtime, "ensure_speaker_worker", new=AsyncMock(return_value=True)), \
+             patch.object(self.runtime, "set_speaker_settings", new=AsyncMock(return_value={
+                 "owner_only_barge_in_selected": True,
+                 "owner_only_barge_in_effective": True,
+                 "owner_only_barge_in_reason": None,
+             })) as apply_settings:
+            response = asyncio.run(self._request(
+                "PUT", "/api/v1/product/settings/speaker", json=payload,
+            ))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["settings"]["speaker"]["owner_only_barge_in"])
+        self.assertEqual(apply_settings.await_args.args[0]["mode"], "off")
+        self.assertTrue(apply_settings.await_args.args[0]["owner_only_barge_in"])
 
     def test_snapshot_is_product_safe_and_settings_routes_are_bounded(self) -> None:
         response = asyncio.run(self._request("GET", "/api/v1/product/snapshot"))

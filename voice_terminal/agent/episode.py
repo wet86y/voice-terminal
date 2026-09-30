@@ -151,7 +151,8 @@ class AgentEpisodeRuntime(AgentContextMixin):
                  custom_instructions_provider=None,
                  shadow_waker=None, on_final_system_check_settled=None,
                  defer_silence_until_output=False, continuity_document_provider=None,
-                 on_user_activity=None, on_silence_anchor=None):
+                 on_user_activity=None, on_silence_anchor=None,
+                 on_speaker_heartbeat=None, admit_user_turn=None):
         self.provider, self.registry, self.output, self.emit = provider, registry, output, emit
         self.options = options or AgentOptions()
         self.tools_enabled = tools_enabled
@@ -163,6 +164,8 @@ class AgentEpisodeRuntime(AgentContextMixin):
         self.continuity_document_provider = continuity_document_provider
         self.on_user_activity = on_user_activity
         self.on_silence_anchor = on_silence_anchor
+        self.on_speaker_heartbeat = on_speaker_heartbeat
+        self.admit_user_turn = admit_user_turn
         # This is enabled only for the resident-KWS product mode.  Ordinary
         # sessions retain the historical behavior where the finalized input
         # itself arms the silence window.
@@ -305,6 +308,13 @@ class AgentEpisodeRuntime(AgentContextMixin):
             except RuntimeError:
                 pass
             return
+        # The optional speaker sampler is a one-shot child of this clock,
+        # never another periodic scheduler or a blocker of the Agent mailbox.
+        if callable(self.on_speaker_heartbeat):
+            try:
+                self.on_speaker_heartbeat(pulse)
+            except Exception:
+                logger.exception("speaker.heartbeat_schedule_failed")
         self._heartbeat_generated = max(self._heartbeat_generated, pulse.sequence)
         coalesced = pulse.coalesced_count
         if self.heartbeat_queue.full():
@@ -1915,6 +1925,16 @@ class AgentEpisodeRuntime(AgentContextMixin):
             and not (isinstance(kind, str) and kind.startswith("TTS_"))
         }
 
+    def discard_speaker_vetoed_input(self, turn_id: str) -> None:
+        """Remove provisional text after a confirmed pre-dispatch veto."""
+        self.inputs.pop(turn_id, None)
+        if self.last_turn_id == turn_id:
+            self.pending.difference_update({
+                "USER_SEGMENT_UPDATED", "USER_INPUT_FINALIZED", "USER_INPUT_REFINED",
+            })
+        if self._pending_transcript_turn_id == turn_id:
+            self._pending_transcript_turn_id = None
+
     def _dispatch_allowed(self, *, respect_backoff=True):
         if self.closed or not self.episode_id:
             return False
@@ -2253,6 +2273,28 @@ class AgentEpisodeRuntime(AgentContextMixin):
             if not self._dispatch_allowed():
                 return
             kinds = set(self.pending)
+            user_kinds = kinds.intersection({
+                "USER_SEGMENT_UPDATED", "USER_INPUT_FINALIZED", "USER_INPUT_REFINED",
+            })
+            source_turn_id = self._pending_transcript_turn_id or self.last_turn_id
+            if user_kinds and source_turn_id and callable(self.admit_user_turn):
+                try:
+                    admitted = bool(self.admit_user_turn(source_turn_id))
+                except Exception:
+                    # An optional speaker failure must preserve the ordinary
+                    # fail-open request policy.
+                    logger.exception("speaker.admission_check_failed")
+                    admitted = True
+                if not admitted:
+                    self.inputs.pop(source_turn_id, None)
+                    self.pending.difference_update(user_kinds)
+                    kinds.difference_update(user_kinds)
+                    await self.log("SPEAKER_REQUEST_VETOED", turn_id=source_turn_id,
+                                   events=sorted(user_kinds))
+                    if not kinds or not self._meaningful_pending():
+                        self.pending.clear()
+                        self._pending_since = None
+                        return
             self.pending.clear()
             if not await self._start_dispatch(kinds):
                 self.pending.update(kinds)

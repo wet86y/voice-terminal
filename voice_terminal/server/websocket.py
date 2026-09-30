@@ -174,7 +174,11 @@ class SessionRuntime(SpeakerRuntimeMixin):
         self.reasoning_mode = config.llm.reasoning_mode
         self._credential_overrides: dict[str, str] = {}
         self.state.wake_always_on = bool(config.wake.enabled)
-        self.state.set_service("speaker", "DISABLED" if config.speaker.mode == "off" else "STARTING")
+        self.state.set_service(
+            "speaker",
+            "DISABLED" if config.speaker.mode == "off" and not config.speaker.owner_only_barge_in
+            else "STARTING",
+        )
 
 
     def _build_kws_worker(self) -> KwsWorker:
@@ -509,7 +513,12 @@ class SessionRuntime(SpeakerRuntimeMixin):
             speaker_client=self.speaker,
             speaker_router=self.speaker_router,
             speaker_mode=self.config.speaker.mode,
+            owner_only_barge_in=self.config.speaker.owner_only_barge_in,
             speaker_wait_ms=self.config.speaker.wait_ms,
+            speaker_window_ms=self.config.speaker.window_ms,
+            speaker_min_speech_ms=self.config.speaker.min_speech_ms,
+            speaker_min_turn_speech_ms=self.config.speaker.min_turn_speech_ms,
+            speaker_min_window_speech_ratio=self.config.speaker.min_window_speech_ratio,
             ambient_store=self.ambient_store,
         )
         self.controller.set_reasoning_mode(self.reasoning_mode)
@@ -709,6 +718,13 @@ class SessionRuntime(SpeakerRuntimeMixin):
                 self.kws.close()
                 self.kws = None
             self.config = next_config
+            if next_config.speaker != previous_config.speaker:
+                await self.set_speaker_settings({
+                    "mode": next_config.speaker.mode,
+                    "confirm_threshold": next_config.speaker.confirm_threshold,
+                    "continuity_threshold": next_config.speaker.continuity_threshold,
+                    "owner_only_barge_in": next_config.speaker.owner_only_barge_in,
+                })
             self.state.wake_always_on = bool(self.config.wake.enabled)
             if self.controller is not None:
                 set_agent_options = getattr(self.controller, "set_agent_options", None)
@@ -1415,12 +1431,16 @@ class SessionRuntime(SpeakerRuntimeMixin):
 
     async def set_speaker_settings(self, settings: Mapping[str, Any]) -> dict[str, Any]:
         """Apply optional speaker mode/thresholds without restarting audio."""
+        previous_mode = self.config.speaker.mode
+        previous_owner_only = self.config.speaker.owner_only_barge_in
         mode = str(settings.get("mode") or "off")
+        owner_only = bool(settings.get("owner_only_barge_in", self.config.speaker.owner_only_barge_in))
         confirm = float(settings.get("confirm_threshold", self.config.speaker.confirm_threshold))
         continuity = float(settings.get("continuity_threshold", self.config.speaker.continuity_threshold))
         next_speaker = replace(
             self.config.speaker,
             mode=mode,
+            owner_only_barge_in=owner_only,
             confirm_threshold=confirm,
             continuity_threshold=continuity,
         )
@@ -1429,6 +1449,10 @@ class SessionRuntime(SpeakerRuntimeMixin):
                 raise ValueError("未注册声纹前不能启用筛选模式")
             if not await self.ensure_speaker_worker():
                 raise ValueError("Speaker Worker 不可用，暂时不能启用筛选模式")
+        elif owner_only and self.speaker_profile.available:
+            # The API checks prerequisites when enabling.  A profile removed
+            # later leaves the selected toggle intact but ineffective.
+            await self.ensure_speaker_worker()
         self.config = replace(self.config, speaker=next_speaker)
         if self.speaker_router is not None:
             self.speaker_router.configure(
@@ -1437,14 +1461,27 @@ class SessionRuntime(SpeakerRuntimeMixin):
             )
         if self.controller is not None:
             self.controller.speaker_mode = mode
+            self.controller.owner_only_barge_in = owner_only
+            if previous_mode != mode:
+                self.controller._speaker_snapshot = None
+                self.controller._speaker_snapshot_turn_id = None
+                self.controller._speaker_snapshot_generation = None
+                self.controller._speaker_snapshot_barge_id = None
+            if mode == "off":
+                self.state.current.pop("speaker_rolling", None)
+                self.state.current.pop("speaker_decision", None)
+            if previous_owner_only != owner_only:
+                self.controller.barge_in_gate.reset()
+                self.controller._clear_owner_barge_candidate()
+                self.controller._owner_barge_expired = False
             # ``ensure_speaker_worker`` may have replaced a degraded/stale
             # client while preparing filter mode. Always refresh the
             # controller reference for every enabled mode; otherwise a
             # reconnect can leave the controller holding the old ``None`` or
             # disconnected client even though the runtime is READY.
-            if mode != "off":
+            if mode != "off" or owner_only:
                 self.controller.speaker_client = self.speaker
-        if mode == "off":
+        if mode == "off" and not owner_only:
             if self.speaker is not None:
                 await self.speaker.close()
             self.speaker = None
@@ -1452,12 +1489,23 @@ class SessionRuntime(SpeakerRuntimeMixin):
             self.state.set_service("speaker", "DISABLED")
             if self.controller is not None:
                 self.controller.speaker_client = None
-        elif self.speaker is None:
+        elif self.speaker is None and self.speaker_profile.available:
             await self._initialize_speaker()
             if self.controller is not None:
                 self.controller.speaker_client = self.speaker
+        if self.controller is not None:
+            self.controller.configure_speaker_runtime()
         await self.bus.publish(self.snapshot())
-        return {"mode": mode, "confirm_threshold": confirm, "continuity_threshold": continuity}
+        status = self.speaker_status()
+        return {
+            "mode": mode,
+            "confirm_threshold": confirm,
+            "continuity_threshold": continuity,
+            "owner_only_barge_in": owner_only,
+            "owner_only_barge_in_selected": status["owner_only_barge_in_selected"],
+            "owner_only_barge_in_effective": status["owner_only_barge_in_effective"],
+            "owner_only_barge_in_reason": status["owner_only_barge_in_reason"],
+        }
 
     async def publish_voice_event(self, payload: dict[str, Any]) -> str:
         """Accept an ordinary DSH event without a Voice-initiated activation."""

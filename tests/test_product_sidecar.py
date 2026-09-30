@@ -143,11 +143,22 @@ class ProductSidecarTests(unittest.TestCase):
         store = self.store()
         saved = store.save_speaker({
             "mode": "observe", "confirm_threshold": 0.72, "continuity_threshold": 0.61,
+            "owner_only_barge_in": True,
         })
         self.assertEqual(saved["confirm_threshold"], 0.72)
+        self.assertTrue(saved["owner_only_barge_in"])
         reloaded = self.store()
         self.assertEqual(reloaded.snapshot()["speaker"]["confirm_threshold"], 0.72)
+        self.assertTrue(reloaded.snapshot()["speaker"]["owner_only_barge_in"])
         self.assertFalse(reloaded.warnings)
+
+    def test_owner_only_barge_in_defaults_off_for_old_settings(self) -> None:
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.settings_path.write_text(json.dumps({
+            "schema_version": 7,
+            "speaker": {"mode": "off", "confirm_threshold": 0.6, "continuity_threshold": 0.5},
+        }), encoding="utf-8")
+        self.assertFalse(self.store().snapshot()["speaker"]["owner_only_barge_in"])
 
     def test_kws_compile_replaces_files_only_after_validation(self) -> None:
         kws_dir = self.config.kws_dir

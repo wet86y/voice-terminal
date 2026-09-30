@@ -111,6 +111,8 @@ export interface ProductSettingsSnapshot {
     mode: 'off' | 'observe' | 'filter' | string
     confirm_threshold: number
     continuity_threshold: number
+      /** owner_only_barge_in（主人打断开关）：仅主人确认后允许停止播放。 */
+      owner_only_barge_in: boolean
   }
   /** compute（本地模型设备偏好）：不包含 TTS（语音合成）。 */
   compute: ProductComputeSettings

@@ -120,7 +120,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const silenceSeconds = ref(30)
   const modelScanState = ref<'idle' | 'scanning' | 'complete'>('idle')
   const providerStep = ref<'idle' | 'discovering' | 'select-model' | 'custom-id' | 'verified'>('idle')
-  const speakerForm = reactive({ mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4 })
+  const speakerForm = reactive({ mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4, owner_only_barge_in: false })
   const speakerStatus = ref<Record<string, unknown>>({})
   const speakerProfile = ref<Record<string, unknown>>({})
   const speakerTestResult = ref<Record<string, unknown> | null>(null)
@@ -159,12 +159,18 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     voice: '', shadow: '', status: '',
   })
 
-  watch(settingsTab, tab => {
+  watch([page, settingsTab], ([currentPage, tab]) => {
     if (computeStatusTimer !== undefined) window.clearInterval(computeStatusTimer)
     computeStatusTimer = undefined
-    if (tab === 'compute' && !replayMode) {
+    if (speakerStatusTimer !== undefined) window.clearInterval(speakerStatusTimer)
+    speakerStatusTimer = undefined
+    if (currentPage === 'settings' && tab === 'compute' && !replayMode) {
       void refreshComputeStatus()
       computeStatusTimer = window.setInterval(() => void refreshComputeStatus(), 5000)
+    }
+    if (currentPage === 'settings' && tab === 'speaker' && !replayMode) {
+      void refreshSpeakerStatus()
+      speakerStatusTimer = window.setInterval(() => void refreshSpeakerStatus(), 3000)
     }
   })
 
@@ -173,6 +179,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   let replayTimer: number | undefined
   let dshStatusTimer: number | undefined
   let computeStatusTimer: number | undefined
+  let speakerStatusTimer: number | undefined
   let noticeDisplayTimer: ReturnType<typeof setTimeout> | undefined
   let noticeFadeTimer: ReturnType<typeof setTimeout> | undefined
   let mutationQueue: Promise<unknown> = Promise.resolve()
@@ -433,6 +440,15 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
   }
 
+  async function refreshSpeakerStatus() {
+    if (replayMode) return
+    try {
+      speakerStatus.value = await productApi.speakerStatus()
+    } catch (error) {
+      speakerStatus.value = { service: 'UNAVAILABLE', last_error: messageFromError(error) }
+    }
+  }
+
   async function saveSpeaker() {
     await enqueue(async () => {
       saving.value = true
@@ -564,15 +580,15 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   async function deleteSpeakerTemplate(id: string) {
     try {
       const result = await productApi.deleteSpeakerTemplate(id)
-      if (result.downgraded_to === 'off') {
-        // Removing the last usable template safely disables filter mode on
-        // the server; keep the form and local settings projection aligned.
-        speakerForm.mode = 'off'
-        settings.speaker.mode = 'off'
+      if (typeof result.downgraded_to === 'string') {
+        // Profile loss disables filtering while preserving the independent
+        // owner-only toggle so the UI can show that it is selected but inert.
+        speakerForm.mode = result.downgraded_to
+        settings.speaker.mode = result.downgraded_to as typeof settings.speaker.mode
       }
       await refreshSpeaker()
-      setNotice(result.downgraded_to === 'off'
-        ? '最后一个声纹模板已删除，筛选模式已降级为直通。'
+      setNotice(typeof result.downgraded_to === 'string'
+        ? '主人声纹资料已删除；依赖声纹的能力当前不可用，主人打断保持选中但不会执行。'
         : '声纹模板已删除。')
     } catch (error) { setError(error) }
   }
@@ -1148,6 +1164,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (replayTimer !== undefined) window.clearTimeout(replayTimer)
     if (dshStatusTimer !== undefined) window.clearInterval(dshStatusTimer)
     if (computeStatusTimer !== undefined) window.clearInterval(computeStatusTimer)
+    if (speakerStatusTimer !== undefined) window.clearInterval(speakerStatusTimer)
     clearNoticeTimers()
     voice.dispose()
   })
