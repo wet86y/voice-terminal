@@ -101,7 +101,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         runtime_payload["tts_worker"] = {"state": "stopped"}
         conversation = runtime_payload.pop("conversation", {"recent": [], "current": {}})
         settings = product_settings.snapshot() if product_settings is not None else {
-            "schema_version": 7,
+            "schema_version": 8,
             "wake": {
                 "enabled": runtime.config.wake.enabled,
                 "keyword": runtime.config.wake.keyword,
@@ -123,6 +123,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "mode": runtime.config.speaker.mode,
                 "confirm_threshold": runtime.config.speaker.confirm_threshold,
                 "continuity_threshold": runtime.config.speaker.continuity_threshold,
+                "owner_only_barge_in": runtime.config.speaker.owner_only_barge_in,
             },
             "compute": {
                 "devices": dict(runtime.config.compute.devices),
@@ -536,12 +537,13 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "mode": "off",
                 "confirm_threshold": runtime.config.speaker.confirm_threshold,
                 "continuity_threshold": runtime.config.speaker.continuity_threshold,
+                "owner_only_barge_in": runtime.config.speaker.owner_only_barge_in,
             })
-            if body.get("mode") == "filter":
+            if body.get("mode") == "filter" or body.get("owner_only_barge_in") is True:
                 if not runtime.speaker_profile.available:
-                    raise HTTPException(status_code=422, detail="未注册声纹前不能启用筛选模式")
+                    raise HTTPException(status_code=422, detail="未注册主人声纹前不能启用拦截或主人打断")
                 if not await runtime.ensure_speaker_worker():
-                    raise HTTPException(status_code=422, detail="Speaker Worker 不可用，暂时不能启用筛选模式")
+                    raise HTTPException(status_code=422, detail="声纹 Worker（工作进程）不可用，暂时不能启用拦截或主人打断")
             value = await asyncio.to_thread(store.save_speaker, body)
             try:
                 applied = await runtime.set_speaker_settings(value)
@@ -555,7 +557,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "settings": {"speaker": value},
                 "effective_from": "next_speech_segment",
                 "pending": False,
-                "message": "声纹阈值立即用于后续窗口；运行模式从下一语音段生效。",
+                "message": "声纹阈值立即用于后续窗口；模式和主人打断设置立即生效。",
                 "runtime": applied,
             }
         except Exception as exc:
@@ -636,15 +638,27 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             profile = await asyncio.to_thread(runtime.speaker_profile.delete_template, template_id)
             if runtime.speaker_router is not None:
                 runtime.speaker_router.profile.load()
-            # A filter profile is a prerequisite, not an authorization
-            # boundary.  Removing the last usable template therefore turns
-            # the live mode off and persists the safe direct-routing fallback.
-            if not profile.get("available") and runtime.config.speaker.mode == "filter":
+            # A profile is required for both filtering and owner-only barge in.
+            # Keep the selected owner-only toggle on profile loss so runtime and
+            # UI can report the degraded state instead of silently restoring
+            # ordinary barge-in.
+            current_speaker_settings = (
+                product_settings.settings_only().get("speaker", {})
+                if product_settings is not None else {}
+            )
+            if not profile.get("available") and (
+                current_speaker_settings.get("mode", runtime.config.speaker.mode) == "filter"
+                or current_speaker_settings.get("owner_only_barge_in") is True
+            ):
                 thresholds = {
                     "confirm_threshold": runtime.config.speaker.confirm_threshold,
                     "continuity_threshold": runtime.config.speaker.continuity_threshold,
                 }
-                next_settings = {"mode": "off", **thresholds}
+                next_settings = {
+                    "mode": "off" if current_speaker_settings.get("mode", runtime.config.speaker.mode) == "filter" else current_speaker_settings.get("mode", runtime.config.speaker.mode),
+                    "owner_only_barge_in": bool(current_speaker_settings.get("owner_only_barge_in", False)),
+                    **thresholds,
+                }
                 previous_settings = (
                     product_settings.settings_only().get("speaker")
                     if product_settings is not None else None
@@ -658,7 +672,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                         await asyncio.to_thread(product_settings.save_speaker, previous_settings)
                     raise
                 response = dict(profile)
-                response.update({"runtime": applied, "downgraded_to": "off"})
+                response.update({"runtime": applied, "downgraded_to": next_settings["mode"]})
                 return response
             response = dict(profile)
             response["downgraded_to"] = None

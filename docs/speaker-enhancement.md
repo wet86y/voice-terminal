@@ -1,16 +1,24 @@
 # 可选声纹增强
 
-声纹是 Voice Terminal 的可选旁路，不是音频主链前置条件。主链为 AEC/降噪 → VAD/ASR；声纹异常、模型缺失或 Worker 不可用时，主语音链仍按降级策略运行。
+声纹是 Voice Terminal（语音终端）的可选旁路，不是音频主链前置条件。主链为 AEC（回声消除）/降噪 → VAD（语音活动检测）/ASR（自动语音识别）。普通请求在声纹异常时仍直通；开启“主人打断”时，打断授权必须在异常时关闭，不能退回普通打断。
 
 ## 运行模式
 
 | 模式 | 行为 |
 | --- | --- |
-| `off` | 不启动声纹旁路，ASR/Agent 原样直通。 |
-| `observe` | 执行识别并记录诊断，所有 ASR final 直通。 |
-| `filter` | 只拦截明确判定为 `non_owner_confirmed` 的文本，其余状态直通。 |
+| `off`（关闭） | 不显示说话人标记，不按声纹拦截普通请求。 |
+| `observe`（仅标记） | 更新当前声音与可可靠关联的整轮标记，不拦截请求。 |
+| `filter`（拦截） | 包含标记；只否决与当前音频候选匹配、明确判为非主人的转写，未知仍直通。 |
 
-`filter` 从 ASR final 可提交时开始等待，预算为 150ms。超时、unknown、Worker 不可用、队列溢出、资料过期和格式错误都必须安全直通。被拦截文本只写入有界的 `AmbientTranscriptStore`，不进入主 Agent、TTS 或普通对话历史。
+另有独立的 `owner_only_barge_in`（主人打断开关），默认关闭；`off`（关闭）与主人打断开启可同时选择，此时声纹仅供打断授权，不显示普通标记或拦截请求。开启要求已注册主人资料及可用声纹工作进程。运行中资料、工作进程或 AEC（回声消除）失效时，保持开关选择但禁止打断，并公开不可用原因。
+
+`filter`（拦截）在流式文本派发前和最终提交时检查。已有最终整轮判断仍最多等待 150ms；超时、`unknown`（未知）、工作进程不可用、队列溢出、资料过期和格式错误都直通。被拦截文本只写入有界的 `AmbientTranscriptStore`（环境文字区），不进入主 Agent（决策代理）、TTS（语音合成）或普通对话历史。已经派发的请求无法回撤，因此拦截是保守否决，不是严格身份认证。
+
+## 滚动状态与主人打断
+
+音频处理后在内存中保留约 4 秒 PCM（脉冲编码音频）缓存；复用现有 400ms 心跳，每次心跳计划时刻后 300ms 安排一次性声纹分析，不建立第二套周期队列。模型仍分析最近约 2 秒音频；2 秒有效人声证据在当前候选对应的有界缓存中按 VAD（语音活动检测）区间累计。每份结果保留采样边界、完成时间、质量与有效期；不能用上一位说话人的结果判断新候选。声纹分数、身份标签及向量不直接注入模型上下文。
+
+播放期间仅对经 AEC（回声消除）处理、由近端语音门确认的候选累计声纹证据。正常音量播放继续进行；只有候选自身得到主人正向确认且回声保护持续有效，才在停止播放前授权打断，并把候选缓存交给 ASR（自动语音识别）。目标等待约 2 秒、上限约 2.5 秒；非主人、未知、超时及保护失效都不打断。播放自然结束后按普通新输入处理。播放标识必须取当前输出事务的真实代次，不能退回已退役输入轮次的不带代次标识。
 
 ## 唯一特征前端
 
@@ -58,7 +66,7 @@ config/speaker/probe.npy
 
 ## 判定口径
 
-每轮只产生一个权威分数：
+原有整轮声纹链只产生一个最终聚合分数；它仍用于整轮结束时的补充判定和现场测试。生产旁路另按心跳产生滚动快照，不能把旧整轮结果误认为当前打断候选的授权证据：
 
 ```text
 窗口 2000ms，步进 500ms；窗口内有效语音 ≥ 700ms 且占比 ≥ 0.40 才提取 embedding
@@ -92,6 +100,8 @@ turn_score = cos(turn_emb, centroid)
 - `turn_score < 0.50`：明确非本人；
 - 中间区间：`unknown`，直通；
 - 最近一次确认过本人时，短暂模糊结果可使用 continuity window 保持状态，但明确非本人立即清除。
+
+滚动快照使用 `confirm_threshold`（主人确认阈值）作为主人下界，`continuity_threshold`（非主人确认界限；旧整轮链仍用作连续保持阈值）作为非主人上界；两者之间为未知。滚动快照不继承上一位说话人的连续状态，且必须与当前候选的采样区间、轮次／播放标识和有效期匹配。
 
 设置页现场测试必须使用同一公式和阈值，不能用“所有模板最大值”替代运行时质心分数。schema v4 迁移会将旧阈值重置为 `0.60/0.50`，并把 `filter` 降为 `observe`。
 
@@ -145,7 +155,7 @@ DELETE /api/v1/ambient-context
 自动化：
 
 ```powershell
-python -m pytest tests/test_speaker.py tests/test_speaker_features.py -q
+python -m pytest tests/test_speaker.py tests/test_speaker_features.py tests/test_speaker_rolling.py tests/test_speaker_production.py -q
 ```
 
 现场验收：
@@ -154,7 +164,9 @@ python -m pytest tests/test_speaker.py tests/test_speaker_features.py -q
 2. `observe` 跑至少 10 轮本人语音，检查分数、unknown 和降级直通；
 3. 检查异人或回放样本；
 4. 确认 `filter` 只拦截明确非本人；
-5. 分别验证 KWS standby、ASR active、停止会话时的注册/测试冲突行为。
+5. 分别验证 KWS（关键词唤醒）待机、ASR（自动语音识别）活动、停止会话时的注册／测试冲突行为；
+6. 验证三种模式与主人打断开／关的六种组合，包括关闭模式下独立主人打断；
+7. 用真实麦克风和扬声器双工测试纯扬声器声、主人或非主人叠加播放声、AEC（回声消除）失效、候选超时及播放先结束。上线顺序为仅标记观察 → 拦截 → 单独启用主人打断。
 
 健康检查：
 
@@ -164,3 +176,25 @@ GET http://127.0.0.1:8765/api/v1/speaker/status
 ```
 
 重点查看 `services.kws`、`startup_errors`、`input_owner`、`kws.error`、`speaker.available` 和 `speaker.stale_reason`。
+
+## 本机验证记录（2026-09-30）
+
+本轮在 Windows 本机执行了 ONNX（开放神经网络交换格式）模型回归、临时 Worker（工作进程）请求和音频设备格式检查：
+
+| 项目 | 结果 |
+|---|---|
+| 模型文件与运行依赖 | `cnceleb_resnet34` 模型文件存在（26,534,127 字节）；`onnxruntime`、`torch`、`torchaudio`、`sounddevice` 可导入 |
+| ONNX 回归脚本 | 327 个合成语音窗口用时 12.51 秒；同人均分 0.9143、异人均分 0.0439，增益测试最大分数漂移 0.0024 |
+| Worker（工作进程）请求 | 1.277 秒内就绪；2 秒合成 PCM（脉冲编码调制）请求返回 `quality=ready`（质量可用）、`speech_ms=1038`（人声时长）、`embedding_dim=256`（向量维度）、`embedding_norm=1.0`（向量范数） |
+| 输入设备格式 | Intel 麦克风阵列解析至 PortAudio index 1，16 kHz、单声道、`int16` 格式检查通过；未打开采集流 |
+| 自动化测试 | `test_speaker.py`、`test_speaker_features.py`、`test_speaker_rolling.py`、`test_speaker_production.py` 共 60 项通过 |
+
+回归命令如下；报告输出到 Windows 临时目录，不写入仓库日志：
+
+```powershell
+$probeReport = Join-Path $env:TEMP 'speaker-verification-latest.md'
+python -X utf8 scripts\probe_speaker_verification.py --out $probeReport
+python -X utf8 -m pytest tests\test_speaker.py tests\test_speaker_features.py tests\test_speaker_rolling.py tests\test_speaker_production.py -q
+```
+
+以上模型分数来自合成语音语料，只能说明本机模型及推理链运行正常，不能代表真人识别率。设备只通过格式检查，没有采集声音；真人主人／非主人区分、播放期间的说话识别、AEC（回声消除）失效和双工打断仍须按现场验收第 7 项测试。Worker 验证使用本机临时进程，验证完成后已结束；本次没有修改主人声纹模板或持久化设置。

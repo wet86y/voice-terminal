@@ -48,6 +48,12 @@ button { cursor: pointer; }
 .speaker-status-card strong { margin-top: 5px; color: #dce6ff; font-size: 18px; }
 .speaker-status-card small { margin-top: 5px; color: var(--subtle); font-size: 10px; }
 .speaker-status-card .speaker-last-error { color: #ffb4a9; max-width: 560px; }
+.speaker-barge-toggle { display: flex; align-items: flex-start; gap: 11px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #ffffff04; }
+.speaker-barge-toggle input { margin-top: 3px; accent-color: var(--accent); }
+.speaker-barge-toggle strong, .speaker-barge-toggle small { display: block; }
+.speaker-barge-toggle small, .speaker-barge-status small { margin-top: 5px; color: var(--subtle); }
+.speaker-barge-status { display: grid; gap: 3px; padding: 10px 13px; border-radius: 9px; background: #ffb45412; color: #ffd39a; }
+.speaker-barge-status.effective { background: #75d8a112; color: #9de7b8; }
 .speaker-status-detail { display: grid; gap: 5px; color: #a9bddf; font-size: 10px; text-align: right; }
 .speaker-settings-grid { display: grid; grid-template-columns: minmax(210px, .85fr) minmax(0, 1.15fr); gap: 12px; margin-top: 13px; }
 .speaker-advanced { min-width: 0; }

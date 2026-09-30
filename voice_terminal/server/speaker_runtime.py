@@ -32,7 +32,8 @@ class SpeakerRuntimeMixin:
             await controller.on_speaker_observation(observation)
 
     async def _initialize_speaker(self) -> None:
-        if self.config.speaker.mode == "off":
+        if (self.config.speaker.mode == "off"
+                and not self.config.speaker.owner_only_barge_in):
             self.state.set_service("speaker", "DISABLED")
             return
         if not self.speaker_profile.available:
@@ -216,13 +217,35 @@ class SpeakerRuntimeMixin:
         # turn can fail open immediately.  Reflect that edge in the public
         # health/status projection as well; otherwise a READY value could be
         # displayed after the worker has already gone away.
-        if (self.config.speaker.mode != "off"
+        if ((self.config.speaker.mode != "off" or self.config.speaker.owner_only_barge_in)
                 and self.speaker is not None and not self.speaker.connected
                 and service == "READY"):
             service = "DEGRADED"
             self.state.set_service("speaker", service)
         startup_error = next((item for item in reversed(self.startup_errors)
                               if str(item).startswith("speaker:")), None)
+        owner_selected = bool(self.config.speaker.owner_only_barge_in)
+        processor = getattr(self, "audio_processor", None)
+        controller = getattr(self, "controller", None)
+        protected = getattr(controller, "_barge_in_protected_available", None)
+        owner_reason = ""
+        if owner_selected:
+            if not profile.get("available"):
+                owner_reason = "主人声纹资料不可用"
+            elif service != "READY" or self.speaker is None or not self.speaker.connected:
+                owner_reason = "声纹工作进程不可用"
+            elif processor is None or not processor.enabled:
+                owner_reason = "回声消除未启用"
+            elif controller is None or getattr(controller, "speaker_sensor", None) is None:
+                owner_reason = "声纹采样链未就绪"
+            elif not getattr(getattr(controller, "output", None), "active", False):
+                # The reverse-reference freshness check can degrade the AEC
+                # processor; do not probe it while playback is idle.
+                owner_reason = "等待播放期间的回声保护验证"
+            elif not callable(protected) or not protected():
+                owner_reason = "播放期间回声保护不可用"
+        owner_effective = owner_selected and not owner_reason
+        rolling = getattr(controller, "_speaker_snapshot", None)
         return {
             "mode": self.config.speaker.mode,
             "service": service,
@@ -240,6 +263,20 @@ class SpeakerRuntimeMixin:
             ),
             "test": dict(self._speaker_test_result or {}),
             "anti_spoofing": "unavailable",
+            "owner_only_barge_in_selected": owner_selected,
+            "owner_only_barge_in_effective": owner_effective,
+            "owner_only_barge_in_reason": owner_reason,
+            "rolling_state": (
+                {"identity": rolling.identity.value, "quality": rolling.quality,
+                 "reason": rolling.reason, "score": rolling.score,
+                 "analysis_start_sample": rolling.analysis_start_sample,
+                 "analysis_end_sample": rolling.analysis_end_sample,
+                 "candidate_start_sample": rolling.candidate_start_sample,
+                 "candidate_end_sample": rolling.candidate_end_sample,
+                 "age_ms": round(max(0.0, (time.monotonic() - rolling.completed_at) * 1000), 1)}
+                if self.config.speaker.mode != "off" and rolling is not None and rolling.is_fresh()
+                else {"identity": "unknown", "reason": "disabled_or_stale"}
+            ),
         }
 
     def speaker_profile_snapshot(self) -> dict[str, Any]:

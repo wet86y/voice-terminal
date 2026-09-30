@@ -201,6 +201,7 @@ asr_worker:
 speaker:
   # Optional sidecar.  off | observe | filter
   mode: off
+  owner_only_barge_in: false # 主人专属打断开关；与声纹模式独立
   # confirm_threshold（确认阈值）和 continuity_threshold（连续保持阈值）使用
   # 注册质心上的原始余弦分数。最终分数是整轮聚合向量与质心的余弦值；
   # 现场测试使用相同口径。参考语料同人 p05≈0.86、异人 p95≈0.19，

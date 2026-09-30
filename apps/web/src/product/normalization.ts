@@ -12,7 +12,7 @@ export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
   shadow: { experimental_context_gate_enabled: false },
-  speaker: { mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4 },
+  speaker: { mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4, owner_only_barge_in: false },
   compute: {
     devices: {
       paraformer: 'auto', sensevoice: 'cpu', voice_vad: 'cpu',
@@ -102,6 +102,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
         ? speaker.mode as ProductSettingsSnapshot['speaker']['mode'] : 'off',
       confirm_threshold: typeof speaker.confirm_threshold === 'number' ? speaker.confirm_threshold : 0.5,
       continuity_threshold: typeof speaker.continuity_threshold === 'number' ? speaker.continuity_threshold : 0.4,
+      owner_only_barge_in: speaker.owner_only_barge_in === true,
     },
     compute: {
       devices: Object.fromEntries(

@@ -3,14 +3,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
+from uuid import uuid4
 
 from .realtime_controller import RealtimeController
 from .episode_output import EpisodeSpeechOutput
+from .turn_workspace import AudioFrame
 from ..agent.episode import AgentEpisodeRuntime
 from ..core.events import VoiceEvent, event, utc_now_iso
 from ..core.state import TerminalState
 from ..session.contracts import DeliveryReport
 from ..session.conversation_log import USER_TURN, speech_kind
+from ..speaker.rolling import RollingSpeakerIdentity
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +43,12 @@ class EpisodeController(RealtimeController):
         self._refinement_agent_events: set[str] = set()
         self._committed_workspaces: dict[str, object] = {}
         self._settled_turns: set[str] = set()
+        self._speaker_vetoed_turns: set[str] = set()
+        self._owner_barge_candidate_id: str | None = None
+        self._owner_barge_start_sample: int | None = None
+        self._owner_barge_started_at: float | None = None
+        self._owner_barge_output_key: str | None = None
+        self._owner_barge_expired = False
 
     def _make_episode(self):
         mode = getattr(self, "reasoning_mode", "balanced")
@@ -52,9 +62,111 @@ class EpisodeController(RealtimeController):
                                        on_final_system_check_settled=self._final_system_check_settled,
                                        continuity_document_provider=self.continuity_document_provider,
                                        on_user_activity=self.on_user_activity,
-                                       on_silence_anchor=self.on_silence_anchor)
+                                        on_silence_anchor=self.on_silence_anchor,
+                                        on_speaker_heartbeat=self._speaker_heartbeat_pulse,
+                                        admit_user_turn=self._speaker_admit_turn)
         self.output.runtime = runtime
         return runtime
+
+    def _speaker_admit_turn(self, turn_id: str) -> bool:
+        if turn_id in self._speaker_vetoed_turns:
+            return False
+        if self.speaker_vetoes_turn(turn_id):
+            self._speaker_vetoed_turns.add(turn_id)
+            late = getattr(self.episode, "active_request_source_turn_id", None) == turn_id
+            logger.info("speaker.request_veto turn_id=%s reason=rolling_non_owner late=%s",
+                        turn_id, late)
+            return False
+        return True
+
+    def _speaker_heartbeat_pulse(self, pulse) -> None:
+        if self.speaker_sensor is None:
+            return
+        loop = asyncio.get_running_loop()
+        interval = float(self.episode.scheduler.interval)
+        next_heartbeat = pulse.scheduled_at + interval
+        if loop.time() >= next_heartbeat:
+            logger.info("speaker.heartbeat_skipped sequence=%s reason=late_pulse", pulse.sequence)
+            return
+        pending = self._speaker_timer_handle
+        if pending is not None and not pending.cancelled():
+            pending.cancel()
+        self._speaker_timer_handle = loop.call_at(
+            max(loop.time(), pulse.scheduled_at + max(0.0, interval - 0.1)),
+            self._launch_speaker_analysis, pulse.episode_generation, pulse.sequence,
+        )
+
+    def _launch_speaker_analysis(self, generation: int, sequence: int) -> None:
+        self._speaker_timer_handle = None
+        if self.speaker_sensor is None or self.episode.closed:
+            return
+        if generation != self.episode._heartbeat_episode_generation:
+            return
+        if self._speaker_analysis_task is not None and not self._speaker_analysis_task.done():
+            logger.info("speaker.analysis_skipped sequence=%s reason=inference_in_progress", sequence)
+            return
+        task = asyncio.create_task(self._analyze_speaker_snapshot(sequence), name="speaker-heartbeat-analysis")
+        self._speaker_analysis_task = task
+
+    async def _analyze_speaker_snapshot(self, sequence: int) -> None:
+        sensor = self.speaker_sensor
+        if sensor is None:
+            return
+        end_sample = sensor.latest_sample
+        if end_sample is None:
+            return
+        ws = self.workspace
+        owner_candidate = self._owner_barge_start_sample is not None
+        barge_id = self._owner_barge_candidate_id if owner_candidate else None
+        start_sample = (self._owner_barge_start_sample if owner_candidate
+                        else self._speaker_turn_start_sample if ws is not None else None)
+        turn_id = ws.turn_id if ws is not None and not owner_candidate else None
+        turn_generation = ws.generation if ws is not None and not owner_candidate else None
+        started = time.monotonic()
+        snapshot = await sensor.analyze(
+            candidate_start_sample=start_sample,
+            candidate_end_sample=end_sample if start_sample is not None else None,
+        )
+        if sensor is not self.speaker_sensor:
+            return
+        if owner_candidate:
+            if (self._owner_barge_candidate_id != barge_id
+                    or self._owner_barge_start_sample != start_sample):
+                logger.info("speaker.analysis_discarded sequence=%s reason=barge_candidate_changed", sequence)
+                return
+        elif ws is not None:
+            if self.workspace is not ws or ws.generation != turn_generation:
+                logger.info("speaker.analysis_discarded sequence=%s reason=input_turn_changed", sequence)
+                return
+        elif self.workspace is not None or self._owner_barge_candidate_id is not None:
+            logger.info("speaker.analysis_discarded sequence=%s reason=candidate_started", sequence)
+            return
+        self._speaker_snapshot = snapshot
+        self._speaker_snapshot_turn_id = turn_id
+        self._speaker_snapshot_generation = turn_generation
+        self._speaker_snapshot_barge_id = barge_id
+        age_ms = max(0, round((time.monotonic() - snapshot.completed_at) * 1000, 2))
+        elapsed_ms = round((time.monotonic() - started) * 1000, 2)
+        logger.info(
+            "speaker.rolling_result sequence=%s turn_id=%s candidate_id=%s start_sample=%s "
+            "end_sample=%s identity=%s quality=%s reason=%s score=%s latency_ms=%s age_ms=%s",
+            sequence, turn_id, self._owner_barge_candidate_id if owner_candidate else None,
+            snapshot.analysis_start_sample, snapshot.analysis_end_sample,
+            snapshot.identity.value, snapshot.quality, snapshot.reason,
+            snapshot.score, elapsed_ms, age_ms,
+        )
+        if self.speaker_mode != "off":
+            self.state.current["speaker_rolling"] = {
+                "state": snapshot.identity.value,
+                "quality": snapshot.quality,
+                "reason": snapshot.reason,
+                "score": snapshot.score,
+                "analysis_start_sample": snapshot.analysis_start_sample,
+                "analysis_end_sample": snapshot.analysis_end_sample,
+                "completed_at_monotonic": snapshot.completed_at,
+            }
+            await self._publish(event("speaker.rolling", turn_id,
+                                      state=self.state.current["speaker_rolling"]))
 
     async def _on_kws_activated(self, source_id: str, generation: int) -> bool:
         try:
@@ -268,6 +380,10 @@ class EpisodeController(RealtimeController):
         if not ws:
             return
         if kind == "transcript.segment":
+            if not self._speaker_admit_turn(ws.turn_id):
+                # Final text still reaches the environment store at commit;
+                # provisional text must not wake the model meanwhile.
+                return
             await self.episode.observe("USER_SEGMENT_UPDATED", turn_id=ws.turn_id,
                                        text="".join(s["text"] for s in ws.segments),
                                        output_generation=ws.generation, sentences=list(ws.segments),
@@ -292,12 +408,19 @@ class EpisodeController(RealtimeController):
             # appends, but return VAD ownership to the normal input path once
             # the player's conservative device-tail estimate is empty.
             if self.player and int(progress.get("remaining_ms", 0) or 0) <= 0:
+                self._clear_owner_barge_candidate()
+                self._owner_barge_expired = False
                 self.barge_in_gate.reset()
                 self._barge_trace_state = None
                 await self.episode.speech_activity(bool(activity.is_speech))
                 return activity
             protected = self._barge_in_protected_available()
             if not protected:
+                self._clear_owner_barge_candidate()
+                if getattr(self, "owner_only_barge_in", False):
+                    self.barge_in_gate.reset()
+                    await self.episode.log("SPEAKER_BARGE_SUPPRESSED", reason="aec_unavailable")
+                    return None
                 await self._handle_aec_unavailable(handle)
                 # Never hand a playing-output frame to normal input handling:
                 # AEC-unavailable audio is neither trustworthy user speech nor
@@ -306,6 +429,8 @@ class EpisodeController(RealtimeController):
             decision = self.barge_in_gate.feed(activity, now=frame.captured_at,
                                                near_voice=self._near_voice_activity(),
                                                protected_available=protected)
+            if getattr(self, "owner_only_barge_in", False):
+                return await self._observe_owner_barge(activity, frame, handle, progress, decision)
             h = handle
             evidence = {"identity": h.identity, "turn_id": h.turn_id, "speech_id": h.speech_id,
                         "output_generation": h.workspace.generation, "vad_speech": bool(activity.is_speech),
@@ -347,6 +472,96 @@ class EpisodeController(RealtimeController):
         else:
             await self.episode.speech_activity(bool(activity.is_speech))
         return activity
+
+    def _clear_owner_barge_candidate(self) -> None:
+        self._owner_barge_candidate_id = None
+        self._owner_barge_start_sample = None
+        self._owner_barge_started_at = None
+        self._owner_barge_output_key = None
+
+    async def _observe_owner_barge(self, activity, frame, handle, progress, decision):
+        """Fail closed until this playback candidate has its own owner proof."""
+        if self._owner_barge_expired:
+            if not bool(activity.is_speech):
+                self._owner_barge_expired = False
+                self.barge_in_gate.reset()
+            return None
+        if not decision.candidate:
+            if self._owner_barge_candidate_id is not None:
+                logger.info("speaker.barge_candidate_cleared candidate_id=%s reason=%s",
+                            self._owner_barge_candidate_id, decision.reason)
+            self._clear_owner_barge_candidate()
+            return None
+        if self._owner_barge_candidate_id is None:
+            self._owner_barge_candidate_id = uuid4().hex
+            self._owner_barge_start_sample = (
+                self._speech_start_sample if self._speech_start_sample is not None else frame.start_sample
+            )
+            self._owner_barge_started_at = (
+                getattr(self.barge_in_gate, "candidate_started_at", None) or frame.captured_at
+            )
+            self._owner_barge_output_key = handle.workspace.playback_key
+            logger.info("speaker.barge_candidate_started candidate_id=%s speech_id=%s start_sample=%s",
+                        self._owner_barge_candidate_id, handle.speech_id,
+                        self._owner_barge_start_sample)
+        candidate_id = self._owner_barge_candidate_id
+        elapsed_ms = max(0, (frame.captured_at - (self._owner_barge_started_at or frame.captured_at)) * 1000)
+        if elapsed_ms >= 2500:
+            logger.info("speaker.barge_denied candidate_id=%s reason=deadline elapsed_ms=%.1f",
+                        candidate_id, elapsed_ms)
+            self._owner_barge_expired = True
+            self._clear_owner_barge_candidate()
+            self.barge_in_gate.reset()
+            return None
+        snapshot = self._speaker_snapshot
+        if snapshot is not None and snapshot.identity == RollingSpeakerIdentity.NON_OWNER and (
+            snapshot.candidate_start_sample == self._owner_barge_start_sample
+            and snapshot.is_fresh()
+        ):
+            logger.info("speaker.barge_denied candidate_id=%s reason=non_owner score=%s",
+                        candidate_id, snapshot.score)
+            self._owner_barge_expired = True
+            self._clear_owner_barge_candidate()
+            self.barge_in_gate.reset()
+            return None
+        authorized = bool(
+            decision.confirmed and snapshot is not None
+            and snapshot.identity == RollingSpeakerIdentity.OWNER
+            and snapshot.is_fresh()
+            and snapshot.candidate_start_sample == self._owner_barge_start_sample
+            and self._speaker_snapshot_barge_id == candidate_id
+            and snapshot.candidate_end_sample is not None
+            and snapshot.candidate_end_sample <= frame.end_sample
+            and self._owner_barge_output_key == handle.workspace.playback_key
+            and self._barge_in_protected_available()
+        )
+        if not authorized:
+            return None
+        start_sample = self._owner_barge_start_sample or frame.start_sample
+        self._recent = deque(
+            AudioFrame(f.pcm[max(0, start_sample - f.start_sample) * 2:],
+                       max(start_sample, f.start_sample), f.captured_at)
+            for f in self._recent if f.end_sample > start_sample
+        )
+        logger.info("speaker.barge_authorized candidate_id=%s speech_id=%s score=%s elapsed_ms=%.1f",
+                    candidate_id, handle.speech_id, snapshot.score, elapsed_ms)
+        await self.episode.log("SPEAKER_BARGE_AUTHORIZED", candidate_id=candidate_id,
+                               speech_id=handle.speech_id, score=snapshot.score,
+                               elapsed_ms=round(elapsed_ms, 1))
+        handle.overlap_start_ms = max(
+            0, int(progress.get("output_estimated_ms", 0)) - decision.duration_ms,
+        )
+        self._clear_owner_barge_candidate()
+        self._owner_barge_expired = False
+        self.barge_in_gate.reset()
+        self.turns.invalidate()
+        playback = self._stop_playback_snapshot(handle.workspace.playback_key)
+        await self._state_event(TerminalState.INTERRUPTING, listening=True, turn_id=handle.turn_id)
+        await self.episode.speech_activity(True, interrupt_reason="user_interrupted")
+        await self._cancel_turn(reason="interrupted", snapshot=playback)
+        await self._new_turn(frame)
+        self._speaker_turn_start_sample = start_sample
+        return None
 
     async def _handle_aec_unavailable(self, handle) -> None:
         """Apply the explicit, non-raw-VAD fallback while audio is audible."""
@@ -426,23 +641,39 @@ class EpisodeController(RealtimeController):
 
     async def _input_committed(self, ws, token):
         speaker_decision = await self._speaker_decision(ws)
-        if speaker_decision is not None and speaker_decision.route == "ambient" and ws.final_text:
+        rolling_veto = (ws.turn_id in getattr(self, "_speaker_vetoed_turns", set())
+                        or self.speaker_vetoes_turn(ws.turn_id))
+        final_veto = speaker_decision is not None and speaker_decision.route == "ambient"
+        mode = str(getattr(ws, "speaker_mode", getattr(self, "speaker_mode", "off")))
+        if mode == "filter" and (rolling_veto or final_veto) and ws.final_text:
+            self._speaker_vetoed_turns.add(ws.turn_id)
+            decision_payload = (speaker_decision.to_payload() if speaker_decision is not None else {})
+            if rolling_veto:
+                decision_payload = dict(decision_payload)
+                decision_payload.update({"route": "ambient", "reason": "rolling_non_owner",
+                                         "state": "non_owner_confirmed"})
+                ws.speaker_decision = decision_payload
             if self.ambient_store is not None:
                 self.ambient_store.append({
                     "turn_id": ws.turn_id,
                     "text": ws.final_text,
-                    "speaker_state": speaker_decision.state.value,
-                    "similarity": speaker_decision.similarity,
-                    "reason": speaker_decision.reason,
+                    "speaker_state": decision_payload.get("state", "non_owner_confirmed"),
+                    "similarity": decision_payload.get("similarity"),
+                    "reason": decision_payload.get("reason", "rolling_non_owner"),
                     "refined_text": ws.refined_text,
                 })
             ws.speaker_blocked = True
-            await self._detail("speaker.blocked", decision=speaker_decision.to_payload(), text=ws.final_text)
+            self.episode.discard_speaker_vetoed_input(ws.turn_id)
+            await self._detail("speaker.blocked", decision=decision_payload, text=ws.final_text)
+            logger.info("speaker.request_veto turn_id=%s reason=%s final=%s late=%s",
+                        ws.turn_id, decision_payload.get("reason"), True,
+                        getattr(self.episode, "active_request_source_turn_id", None) == ws.turn_id)
             # ASR partials may have started an optimistic Bidi/TTS prewarm
             # before the 150 ms speaker gate completed. A filtered turn must
             # never retain or emit that output resource.
             await self._cancel_tts_prewarm(ws.turn_id)
             await self._retire_committed_input(ws)
+            self._speaker_vetoed_turns.discard(ws.turn_id)
             # A filtered transcript is an ambient-only record, not the active
             # user input shown in the ordinary conversation projection.
             self.state.current.update(final_text="", partial_text="")
@@ -938,6 +1169,10 @@ class EpisodeController(RealtimeController):
             self.vad.reset()
         if self.audio_processor is not None:
             self.audio_processor.reset()
+        await self._stop_speaker_sensor()
+        self._clear_owner_barge_candidate()
+        self._owner_barge_expired = False
+        self._speaker_vetoed_turns.clear()
         self.state.clear_current()
         self.state.agent = {}
         if self.wake_always_on and self.state.listening:

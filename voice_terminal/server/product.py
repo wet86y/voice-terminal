@@ -27,7 +27,7 @@ from ..kws.keywords import MAX_WAKE_KEYWORDS
 from ..shadow_agent import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 7
+PRODUCT_SETTINGS_SCHEMA_VERSION = 8
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 90
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -106,6 +106,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
             "mode": str(getattr(config.speaker, "mode", "off")),
             "confirm_threshold": float(getattr(config.speaker, "confirm_threshold", 0.50)),
             "continuity_threshold": float(getattr(config.speaker, "continuity_threshold", 0.40)),
+            "owner_only_barge_in": bool(getattr(config.speaker, "owner_only_barge_in", False)),
         },
         # compute（计算设备）首版沿用旧运行方式：Paraformer 自动选择，其余模型保持 CPU。
         "compute": {
@@ -216,6 +217,8 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     speaker = result["speaker"]
     if speaker.get("mode") not in {"off", "observe", "filter"}:
         speaker["mode"] = defaults["speaker"]["mode"]
+    if type(speaker.get("owner_only_barge_in")) is not bool:
+        speaker["owner_only_barge_in"] = False
     if legacy_speaker_scale:
         speaker["confirm_threshold"] = defaults["speaker"]["confirm_threshold"]
         speaker["continuity_threshold"] = defaults["speaker"]["continuity_threshold"]
@@ -245,7 +248,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     schema_version = value.get("schema_version")
     if schema_version is not None and (
         type(schema_version) is not int
-        or schema_version not in {1, 2, 3, 4, 5, 6, PRODUCT_SETTINGS_SCHEMA_VERSION}
+        or schema_version not in {1, 2, 3, 4, 5, 6, 7, PRODUCT_SETTINGS_SCHEMA_VERSION}
     ):
         invalid = True
     for section_name, fields in (
@@ -253,7 +256,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
         ("silence", ("seconds",)),
         ("shadow", ("experimental_context_gate_enabled",)),
         ("tts", ("backend",)),
-        ("speaker", ("mode", "confirm_threshold", "continuity_threshold")),
+        ("speaker", ("mode", "confirm_threshold", "continuity_threshold", "owner_only_barge_in")),
     ):
         section = value.get(section_name)
         if section is None:
@@ -287,6 +290,8 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
                 invalid = invalid or candidate not in {"minimax", "cosyvoice"}
             elif section_name == "speaker" and field == "mode":
                 invalid = invalid or candidate not in {"off", "observe", "filter"}
+            elif section_name == "speaker" and field == "owner_only_barge_in":
+                invalid = invalid or type(candidate) is not bool
             elif section_name == "speaker" and field in {"confirm_threshold", "continuity_threshold"}:
                 invalid = invalid or not isinstance(candidate, (int, float)) or isinstance(candidate, bool) or not 0 <= float(candidate) <= 1
     speaker_section = value.get("speaker")
@@ -430,6 +435,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     next_speaker = replace(
         config.speaker,
         mode=mode,
+        owner_only_barge_in=bool(speaker.get("owner_only_barge_in", getattr(config.speaker, "owner_only_barge_in", False))),
         confirm_threshold=confirm_threshold,
         continuity_threshold=continuity_threshold,
     )
@@ -755,12 +761,15 @@ class ProductSettingsStore:
         return deepcopy(self._settings["shadow"])
 
     def save_speaker(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        allowed = {"mode", "confirm_threshold", "continuity_threshold"}
+        allowed = {"mode", "confirm_threshold", "continuity_threshold", "owner_only_barge_in"}
         if set(payload) != allowed:
-            raise ProductSettingsError("声纹设置字段必须是 mode、confirm_threshold、continuity_threshold。")
+            raise ProductSettingsError("声纹设置字段必须是 mode（声纹模式）、confirm_threshold（主人确认阈值）、continuity_threshold（非主人确认界限／旧整轮连续保持阈值）、owner_only_barge_in（主人打断开关）。")
         mode = payload.get("mode")
         if mode not in {"off", "observe", "filter"}:
             raise ProductSettingsError("声纹模式必须是 off、observe 或 filter。")
+        owner_only_barge_in = payload.get("owner_only_barge_in")
+        if type(owner_only_barge_in) is not bool:
+            raise ProductSettingsError("owner_only_barge_in（主人打断开关）必须是布尔值。")
         confirm = payload.get("confirm_threshold")
         continuity = payload.get("continuity_threshold")
         if (isinstance(confirm, bool) or not isinstance(confirm, (int, float))
@@ -774,6 +783,7 @@ class ProductSettingsStore:
             "mode": mode,
             "confirm_threshold": round(confirm, 4),
             "continuity_threshold": round(continuity, 4),
+            "owner_only_barge_in": owner_only_barge_in,
         }
         self._save_settings()
         return deepcopy(self._settings["speaker"])
