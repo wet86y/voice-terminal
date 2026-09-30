@@ -57,7 +57,7 @@ dsh:
   startup_timeout_ms: 120000
   shutdown_timeout_ms: 5000
   bridge_timeout_ms: 15000
-  bridge_protocol_version: "1.0"
+  bridge_protocol_version: "2.0"
   restart_limit: 2
   restart_delay_ms: 1000
   expected_version: 0.1.7-rc.2

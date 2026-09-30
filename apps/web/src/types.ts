@@ -247,18 +247,29 @@ export interface ShadowTimelineItem {
 
 export type ShadowActivityStream = 'lifecycle' | 'thinking' | 'tool' | 'event'
 export type ShadowActivityPhase = 'started' | 'delta' | 'completed' | 'failed'
-export type ShadowActivityEventKind = 'progress' | 'observation' | 'user_input_required' | 'result' | 'failed'
+/** 影子活动事件类型：progress 仅显示界面，information 是可替换 Voice 信息，其余为终态。 */
+export type ShadowActivityEventKind = 'progress' | 'information' | 'input_required' | 'result' | 'no_action' | 'failed'
 
 export interface ShadowActivity {
+  /** 运行序号：同一影子激活内单调递增。 */
   run_seq: number
+  /** 活动条目标识：用于产品界面更新已存在的活动项。 */
   item_id: string
+  /** 活动流类型：生命周期、思考、工具或事件。 */
   stream: ShadowActivityStream
+  /** 活动阶段：开始、增量、完成或失败。 */
   phase: ShadowActivityPhase
+  /** 活动正文：展示给产品界面的文本。 */
   text?: string
+  /** 增量正文：活动文本的新增部分。 */
   delta?: string
+  /** 工具名称：仅工具活动使用。 */
   tool_name?: string
+  /** 工具状态：工具执行阶段说明。 */
   tool_status?: string
+  /** 事件类型：Bridge 2.0 判别联合的产品界面投影。 */
   event_kind?: ShadowActivityEventKind
+  /** 发生时间：活动事件的 ISO 8601 时间戳。 */
   timestamp: string
 }
 

@@ -128,8 +128,9 @@ export function readShadowActivity(value: unknown): ShadowActivity | null {
   for (const key of ['text', 'delta', 'tool_name', 'tool_status'] as const) {
     if (typeof value[key] === 'string') result[key] = value[key].slice(0, key === 'delta' ? 2000 : 4000)
   }
-  if (value.event_kind === 'progress' || value.event_kind === 'observation'
-    || value.event_kind === 'user_input_required' || value.event_kind === 'result'
+  if (value.event_kind === 'progress' || value.event_kind === 'information'
+    || value.event_kind === 'input_required' || value.event_kind === 'result'
+    || value.event_kind === 'no_action'
     || value.event_kind === 'failed') {
     result.event_kind = value.event_kind
   }

@@ -154,15 +154,19 @@ Shadow 可用时，主模型只获得以下本地控制动作：
 本地控制工具：
 
 - `get_latest_context({since_revision})`：返回 unchanged、delta 或 epoch snapshot；
-- `publish_main_event({kind, text})`：发布 `progress` 或 `observation`；
-- `request_user_input({kind, question, options, operation_summary})`：发布 clarification/未来 confirmation。
+- `publish_progress({text})`（发布界面进度）：只更新 Product UI（产品界面）；
+- `publish_voice_information({text})`（发布 Voice 信息）：更新单个全局最新信息槽并触发可合并推理；
+- `request_user_input({question, options})`（请求用户输入）：发布唯一终态问题；
+- `return_shadow_result({text})`（返回最终结果）：发布自包含的唯一终态结果；
+- `finish_shadow_no_action({reason?})`（无动作结束）：结束激活但不写入语义历史。
 
 首版 executor 只接受 `READ_ONLY` 能力；`REVERSIBLE_WRITE`、`EXTERNAL_COMMIT` 和 `DESTRUCTIVE` 仅保留类型，不加载实现。所有路径、工具名、参数和 effect 都在本地再次校验。
 
 事件处理规则：
 
-- `progress`、status 和工具 lifecycle 只更新 Product UI；
-- `observation`、`user_input_required`、`result`、`failed` 才进入主 heartbeat；
+- `progress` 和工具 lifecycle 只更新 Product UI，不触发 LLM（大语言模型）请求；
+- `information` 只进入一次 logical request（逻辑请求）的 `REQUEST_TAIL`（请求尾部），被认领后即丢弃；
+- `input_required`、`result`、`failed` 进入持久语义历史；`no_action` 不进入语义历史；
 - 文件、网页、工具错误和 Shadow 文本都是不可信资料，不能覆盖系统指令、人格、动作权限或语音协议；
 - stale 工具不得执行，stale final 不得发布；
 - 用户回答正常进入主会话，Shadow 通过下一次 wake 重新读取上下文，不使用 question ID、reply action 或长期 waiter。

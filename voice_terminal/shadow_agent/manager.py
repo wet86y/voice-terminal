@@ -915,7 +915,7 @@ class ShadowRuntime(ShadowToolLoopMixin):
                     self._metric("observer.late_discard", {"serial": serial})
                     return
                 fallback = "Shadow Agent 正在处理当前任务；可读状态摘要暂时不可用，任务仍在运行。"
-                self._emit("status", fallback)
+                self._emit("information", fallback, source="observer")
                 self._activity(
                     "thinking", "completed", item_id=activity_item_id, text=fallback,
                 )
@@ -948,14 +948,24 @@ class ShadowRuntime(ShadowToolLoopMixin):
             )
             self._metric("observer.late_discard", {"serial": serial})
             return
-        self._emit("status", text[:512])
+        normalized = text.strip()
+        if not normalized or len(normalized) > 2000:
+            self._activity(
+                "thinking", "failed", item_id=activity_item_id,
+                text="工作简报为空或超过 2000 字符，未投递",
+            )
+            self._metric("observer.summary_rejected", {
+                "serial": serial, "characters": len(normalized),
+            })
+            return
+        self._emit("information", normalized, source="observer")
         if forced:
             self._metric("observer.force_completed", {
                 "serial": serial, "used_stream_snapshot": False,
             })
         self._activity(
             "thinking", "completed", item_id=activity_item_id,
-            text=text[:512],
+            text=normalized,
         )
         if first_error is not None:
             self._metric("observer.retry_completed", {"serial": serial})
@@ -1062,7 +1072,9 @@ class ShadowRuntime(ShadowToolLoopMixin):
                         self._last_processed_revision = self.applied_context_revision
                         self._activity(
                             "lifecycle", "completed", item_id=f"run-{serial}",
-                            text="等待用户输入", run_seq=serial,
+                            text=("等待用户输入" if self.user_input_required
+                                  else "Shadow Agent 已完成本轮处理"),
+                            run_seq=serial,
                         )
                         return
                     self._drain_completed_tool_jobs(serial)
@@ -1095,6 +1107,7 @@ class ShadowRuntime(ShadowToolLoopMixin):
                         text="Shadow Agent 已完成本轮处理", run_seq=serial,
                     )
                 elif state == "no_action":
+                    self._emit("no_action", terminal)
                     self._activity(
                         "lifecycle", "completed", item_id=f"run-{serial}",
                         text="本轮无需继续操作", run_seq=serial,
@@ -1105,7 +1118,10 @@ class ShadowRuntime(ShadowToolLoopMixin):
             raise
         except Exception as exc:
             if not self._closed and serial == self._activation_serial:
-                self._emit("failed", f"影子 Agent 暂时无法继续：{str(exc)[:300]}", payload={"category": type(exc).__name__})
+                self._emit(
+                    "failed", f"影子 Agent 暂时无法继续：{str(exc)[:300]}",
+                    failure_code=type(exc).__name__, infrastructure=True,
+                )
                 self._activity(
                     "lifecycle", "failed", item_id=f"run-{serial}",
                     text=f"Shadow Agent 运行失败：{str(exc)[:240] or type(exc).__name__}",

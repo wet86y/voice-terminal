@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,7 +44,7 @@ class FakeClient:
 
     async def call(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((operation, payload))
-        return {"protocol_version": "1.0", "result": "accepted"}
+        return {"protocol_version": "2.0", "result": "accepted"}
 
 
 class MutableContext:
@@ -92,7 +93,7 @@ class ReconciliationClient(FakeClient):
                     transport=True,
                 )
             return {
-                "protocol_version": "1.0", "result": "accepted",
+                "protocol_version": "2.0", "result": "accepted",
                 "context_revision": self.state_revision,
                 "activation_id": self.activation_id,
                 "terminal": False, "agent_state": "running" if self.activation_id else "idle",
@@ -108,7 +109,7 @@ class ReconciliationClient(FakeClient):
                 operation=operation, request_id=str(payload.get("request_id")),
                 transport=True,
             )
-        return {"protocol_version": "1.0", "result": "accepted"}
+        return {"protocol_version": "2.0", "result": "accepted"}
 
 
 class RetryOnceClient(ReconciliationClient):
@@ -146,7 +147,7 @@ class ObserverClient(FakeClient):
         self.calls.append((operation, payload))
         if operation == "observer.snapshot":
             return {
-                "protocol_version": "1.0",
+                "protocol_version": "2.0",
                 "result": "accepted",
                 "mode": "snapshot",
                 "trace_revision": 3,
@@ -156,7 +157,7 @@ class ObserverClient(FakeClient):
                 "pending_subagents": [],
                 "records": [{"kind": "turn/start"}],
             }
-        return {"protocol_version": "1.0", "result": "accepted"}
+        return {"protocol_version": "2.0", "result": "accepted"}
 
 
 class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
@@ -164,9 +165,10 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.client = FakeClient()
         self.events = []
+        self.mapping_store = DshMappingStore(Path(self.temp.name) / "mappings.json")
         self.session = DshShadowAgentSession(
             client=self.client,  # type: ignore[arg-type]
-            mapping_store=DshMappingStore(Path(self.temp.name) / "mappings.json"),
+            mapping_store=self.mapping_store,
             context_source=FakeContext(),
             voice_session_id="voice-session",
             workspace=Path(self.temp.name),
@@ -354,11 +356,12 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
         context.advance("accepted by plugin but response was lost")
         client.state_revision = 3
         payload = {
-            "protocol_version": "1.0", "event_id": "event-forward-revision",
+            "protocol_version": "2.0", "request_id": "request-forward-revision",
+            "event_id": "event-forward-revision",
             "voice_session_id": "callback-reconcile-session",
             "dsh_session_id": session.dsh_session_id,
             "epoch": 1, "context_revision": 3, "activation_id": activation,
-            "kind": "result", "text": "done", "payload": {},
+            "event": {"type": "result", "text": "done"},
         }
 
         self.assertEqual(await session.accept_event(payload), "accepted")
@@ -368,16 +371,15 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_event_requires_exact_binding_epoch_revision_and_activation(self) -> None:
         await self.session.request_wake()
         payload = {
-            "protocol_version": "1.0",
+            "protocol_version": "2.0",
+            "request_id": "request-0001",
             "event_id": "event-0001",
             "voice_session_id": "voice-session",
             "dsh_session_id": self.session.dsh_session_id,
             "epoch": 1,
             "context_revision": 2,
             "activation_id": self.session.activation_id,
-            "kind": "result",
-            "text": "done",
-            "payload": {},
+            "event": {"type": "result", "text": "done"},
         }
         self.assertEqual(await self.session.accept_event(payload), "accepted")
         self.assertEqual(await self.session.accept_event(payload), "duplicate")
@@ -388,14 +390,141 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_action_is_terminal_without_semantic_mailbox_event(self) -> None:
         await self.session.request_wake()
         payload = {
-            "protocol_version": "1.0", "event_id": "event-no-action",
+            "protocol_version": "2.0", "request_id": "request-no-action",
+            "event_id": "event-no-action",
             "voice_session_id": "voice-session", "dsh_session_id": self.session.dsh_session_id,
             "epoch": 1, "context_revision": 2, "activation_id": self.session.activation_id,
-            "kind": "no_action", "reason": "nothing pending",
+            "event": {"type": "no_action", "reason": "nothing pending"},
         }
         self.assertEqual(await self.session.accept_event(payload), "accepted")
-        self.assertEqual(self.events, [])
+        self.assertEqual([item.kind for item in self.events], ["no_action"])
         self.assertIsNone(self.session.activation_id)
+
+    async def test_concurrent_terminal_events_have_exactly_one_winner_and_persist_receipt(self) -> None:
+        await self.session.request_wake()
+        activation = self.session.activation_id
+
+        def terminal(event_id: str, text: str) -> dict[str, Any]:
+            return {
+                "protocol_version": "2.0", "request_id": f"request-{event_id}",
+                "event_id": event_id, "voice_session_id": "voice-session",
+                "dsh_session_id": self.session.dsh_session_id, "epoch": 1,
+                "context_revision": 2, "activation_id": activation,
+                "event": {"type": "result", "text": text},
+            }
+
+        first = terminal("event-terminal-a", "result A")
+        second = terminal("event-terminal-b", "result B")
+        outcomes = await asyncio.gather(
+            self.session.accept_event(first), self.session.accept_event(second),
+        )
+
+        self.assertCountEqual(outcomes, ["accepted", "stale"])
+        accepted_payload = first if outcomes[0] == "accepted" else second
+        self.assertEqual(await self.session.accept_event(accepted_payload), "duplicate")
+        conflicting = {
+            **accepted_payload,
+            "event": {"type": "result", "text": "different body"},
+        }
+        self.assertEqual(await self.session.accept_event(conflicting), "conflict")
+        mapping = json.loads(
+            (Path(self.temp.name) / "mappings.json").read_text(encoding="utf-8"),
+        )
+        row = mapping["sessions"]["voice-session"]
+        self.assertEqual(mapping["schema_version"], 2)
+        self.assertEqual(row["state"], "idle")
+        self.assertIsNone(row["last_activation_id"])
+        self.assertEqual(row["last_terminal_activation_id"], activation)
+        self.assertEqual(row["last_terminal_event_id"], accepted_payload["event_id"])
+        self.assertTrue(row["last_terminal_event_digest"])
+
+    async def test_terminal_replay_receipt_survives_new_dsh_binding_and_process_restart(self) -> None:
+        await self.session.request_wake()
+        payload = {
+            "protocol_version": "2.0", "request_id": "request-persisted-terminal",
+            "event_id": "event-persisted-terminal", "voice_session_id": "voice-session",
+            "dsh_session_id": self.session.dsh_session_id, "epoch": 1,
+            "context_revision": 2, "activation_id": self.session.activation_id,
+            "event": {"type": "result", "text": "self-contained result"},
+        }
+        self.assertEqual(await self.session.accept_event(payload), "accepted")
+
+        # A new process never resumes the old DSH session, but can acknowledge
+        # its one persisted terminal receipt before the new binding opens.
+        second = DshShadowAgentSession(
+            client=self.client,  # type: ignore[arg-type]
+            mapping_store=self.mapping_store,
+            context_source=FakeContext(),
+            voice_session_id="voice-session",
+            workspace=Path(self.temp.name),
+        )
+        old_dsh_session = payload["dsh_session_id"]
+        self.assertNotEqual(second.dsh_session_id, old_dsh_session)
+        await second.prepare_callback_binding(payload)
+        self.assertTrue(second.is_terminal_replay(payload))
+        self.assertEqual(await second.accept_event(payload), "duplicate")
+        conflicting_replay = {
+            **payload, "event": {"type": "result", "text": "different result"},
+        }
+        self.assertTrue(second.matches_last_terminal_identity(conflicting_replay))
+        self.assertEqual(await second.accept_event(conflicting_replay), "conflict")
+
+        # Opening a fresh DSH session preserves the receipt for another restart.
+        await second.request_wake()
+        third = DshShadowAgentSession(
+            client=self.client,  # type: ignore[arg-type]
+            mapping_store=self.mapping_store,
+            context_source=FakeContext(),
+            voice_session_id="voice-session",
+            workspace=Path(self.temp.name),
+        )
+        await third.prepare_callback_binding(payload)
+        self.assertTrue(third.is_terminal_replay(payload))
+        self.assertEqual(await third.accept_event(payload), "duplicate")
+
+    async def test_information_is_nonterminal_and_late_information_is_stale(self) -> None:
+        await self.session.request_wake()
+        activation = self.session.activation_id
+        base = {
+            "protocol_version": "2.0", "voice_session_id": "voice-session",
+            "dsh_session_id": self.session.dsh_session_id, "epoch": 1,
+            "context_revision": 2, "activation_id": activation,
+        }
+        information = {
+            **base, "request_id": "request-information", "event_id": "event-information",
+            "event": {"type": "information", "text": " newest fact "},
+        }
+        self.assertEqual(await self.session.accept_event(information), "accepted")
+        self.assertEqual(self.events[-1].text, "newest fact")
+        self.assertEqual(self.events[-1].source, "agent")
+        terminal = {
+            **base, "request_id": "request-result", "event_id": "event-result",
+            "event": {"type": "result", "text": "self-contained result"},
+        }
+        self.assertEqual(await self.session.accept_event(terminal), "accepted")
+        late = {
+            **base, "request_id": "request-late", "event_id": "event-late",
+            "event": {"type": "information", "text": "too late"},
+        }
+        self.assertEqual(await self.session.accept_event(late), "stale")
+
+    async def test_strict_event_union_rejects_unknown_and_inapplicable_fields(self) -> None:
+        await self.session.request_wake()
+        base = {
+            "protocol_version": "2.0", "request_id": "request-invalid",
+            "event_id": "event-invalid", "voice_session_id": "voice-session",
+            "dsh_session_id": self.session.dsh_session_id, "epoch": 1,
+            "context_revision": 2, "activation_id": self.session.activation_id,
+        }
+        invalid = {**base, "event": {"type": "progress", "text": "ok", "options": []}}
+        self.assertEqual(await self.session.accept_event(invalid), "conflict")
+        blank = {**base, "event_id": "event-blank", "event": {"type": "information", "text": "  "}}
+        self.assertEqual(await self.session.accept_event(blank), "conflict")
+        legacy = {**base, "event_id": "event-legacy", "kind": "result", "text": "legacy"}
+        self.assertEqual(await self.session.accept_event(legacy), "conflict")
+        invalid_envelope = {**base, "event_id": "event-bool-epoch", "epoch": True,
+                            "event": {"type": "progress", "text": "ok"}}
+        self.assertEqual(await self.session.accept_event(invalid_envelope), "conflict")
 
     async def test_reset_retires_old_dsh_session_and_rotates_identity(self) -> None:
         await self.session.request_wake()
@@ -466,9 +595,9 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已提交", status["text"])
         self.assertEqual(session.snapshot()["trace_revision"], 3)
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].kind, "status")
-        self.assertEqual(events[0].wake_policy, "normal")
-        self.assertEqual(events[0].payload["trace_revision"], 3)
+        self.assertEqual(events[0].kind, "information")
+        self.assertEqual(events[0].source, "observer")
+        self.assertEqual(events[0].activation_id, "activation-1")
 
 
 if __name__ == "__main__":

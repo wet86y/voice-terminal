@@ -37,34 +37,36 @@ class ShadowToolLoopMixin:
             "output": json.dumps(value, ensure_ascii=False, separators=(",", ":")),
         }
 
-    def _emit(self, kind: str, text: str, *, payload: dict[str, Any] | None = None) -> None:
-        wake_policy = {
-            "progress": "passive", "status": "normal", "observation": "normal",
-            "user_input_required": "priority", "result": "priority", "failed": "normal",
-        }[kind]
+    def _emit(
+        self, kind: str, text: str, *, source: str = "agent",
+        options: tuple[str, ...] = (), failure_code: str | None = None,
+        infrastructure: bool = False,
+    ) -> None:
         event = ShadowEvent(
             event_id=uuid.uuid4().hex,
             kind=kind,  # type: ignore[arg-type]
-            text=str(text).strip()[:8000],
+            text=str(text).strip(),
             based_on_context_revision=self.applied_context_revision,
-            wake_policy=wake_policy,  # type: ignore[arg-type]
-            payload=dict(payload or {}),
+            source=source,  # type: ignore[arg-type]
+            options=options,
+            failure_code=failure_code,
+            infrastructure=infrastructure,
         )
-        if kind in {"status", "progress"}:
+        if kind in {"information", "progress"}:
             self.latest_visible_status = ShadowVisibleStatus(
                 active=self.active, text=event.text,
                 based_on_trace_revision=self.trace_revision, updated_at=time.time(),
             )
-            if kind == "status":
+            if kind == "information":
                 self._last_status_trace_revision = self.trace_revision
                 self._last_status_activation_serial = self._activation_serial
-        if kind == "user_input_required":
+        if kind == "input_required":
             self.user_input_required = True
         elif kind in {"result", "failed"}:
             self.user_input_required = False
         if self.on_event is not None:
             self.on_event(event)
-        if kind != "status":
+        if kind != "information" or source != "observer":
             self._activity(
                 "event", "failed" if kind == "failed" else "completed",
                 item_id=self._activity_id("event"), text=event.text,
@@ -222,46 +224,96 @@ class ShadowToolLoopMixin:
             )
             if name == "get_latest_context":
                 since = args.get("since_revision")
-                value = self._latest_context_result(since if isinstance(since, int) else -1)
-                outputs.append(self._call_output(call_id, value))
-                self._activity(
-                    "tool", "completed", item_id=tool_activity_id,
-                    tool_name=name, tool_status="completed", text="上下文已同步",
+                valid = (
+                    set(args) == {"since_revision"}
+                    and isinstance(since, int) and not isinstance(since, bool) and since >= 0
                 )
-            elif name == "publish_main_event":
-                kind, text = args.get("kind"), args.get("text")
-                if kind not in {"progress", "observation"} or not isinstance(text, str) or not text.strip():
+                if valid:
+                    outputs.append(self._call_output(call_id, self._latest_context_result(since)))
+                    self._activity(
+                        "tool", "completed", item_id=tool_activity_id,
+                        tool_name=name, tool_status="completed", text="上下文已同步",
+                    )
+                else:
+                    outputs.append(self._call_output(call_id, {"error": "invalid since_revision"}))
+                    self._activity(
+                        "tool", "failed", item_id=tool_activity_id,
+                        tool_name=name, tool_status="failed", text="上下文修订号无效",
+                    )
+            elif name in {"publish_progress", "publish_voice_information"}:
+                kind = "progress" if name == "publish_progress" else "information"
+                text = args.get("text")
+                limit = 512 if kind == "progress" else 2000
+                clean = text.strip() if isinstance(text, str) else ""
+                if set(args) != {"text"} or not clean or len(clean) > limit:
                     self._activity(
                         "tool", "failed", item_id=tool_activity_id,
                         tool_name=name, tool_status="failed", text="事件内容无效",
                     )
                     outputs.append(self._call_output(call_id, {"error": "invalid event"}))
                 else:
-                    self._emit(kind, text)
+                    self._emit(kind, clean)
                     outputs.append(self._call_output(call_id, {"status": "published"}))
                     self._activity(
                         "tool", "completed", item_id=tool_activity_id,
                         tool_name=name, tool_status="completed", text="事件已传递",
                     )
             elif name == "request_user_input":
-                kind, question = args.get("kind"), args.get("question")
-                if kind not in {"clarification", "confirmation"} or not isinstance(question, str) or not question.strip():
+                question = args.get("question")
+                clean = question.strip() if isinstance(question, str) else ""
+                raw_options = args.get("options")
+                options = tuple(item.strip() for item in raw_options
+                                if isinstance(item, str)) if isinstance(raw_options, list) else ()
+                if (set(args) != {"question", "options"}
+                        or not isinstance(raw_options, list)
+                        or len(options) != len(raw_options)
+                        or not clean or len(clean) > 1000 or len(options) > 8
+                        or any(not item or len(item) > 200 for item in options)):
                     self._activity(
                         "tool", "failed", item_id=tool_activity_id,
                         tool_name=name, tool_status="failed", text="输入请求无效",
                     )
                     outputs.append(self._call_output(call_id, {"error": "invalid user input request"}))
                 else:
-                    payload = {
-                        "kind": kind,
-                        "options": [str(item) for item in args.get("options", []) if isinstance(item, str)],
-                        "operation_summary": str(args.get("operation_summary") or ""),
-                    }
-                    self._emit("user_input_required", question, payload=payload)
+                    self._emit("input_required", clean, options=options)
                     outputs.append(self._call_output(call_id, {"status": "published", "activation": "idle"}))
                     self._activity(
                         "tool", "completed", item_id=tool_activity_id,
                         tool_name=name, tool_status="waiting", text="等待用户输入",
+                    )
+                    stop_activation = True
+            elif name == "return_shadow_result":
+                text = args.get("text")
+                clean = text.strip() if isinstance(text, str) else ""
+                if set(args) != {"text"} or not clean or len(clean) > 8000:
+                    self._activity(
+                        "tool", "failed", item_id=tool_activity_id,
+                        tool_name=name, tool_status="failed", text="最终结果无效",
+                    )
+                    outputs.append(self._call_output(call_id, {"error": "invalid final result"}))
+                else:
+                    self._emit("result", clean)
+                    outputs.append(self._call_output(call_id, {"status": "published", "activation": "idle"}))
+                    self._activity(
+                        "tool", "completed", item_id=tool_activity_id,
+                        tool_name=name, tool_status="completed", text="最终结果已传递",
+                    )
+                    stop_activation = True
+            elif name == "finish_shadow_no_action":
+                reason = args.get("reason")
+                clean = reason.strip() if isinstance(reason, str) else ""
+                if set(args) - {"reason"} or ("reason" in args and (not clean or len(clean) > 500)):
+                    self._activity(
+                        "tool", "failed", item_id=tool_activity_id,
+                        tool_name=name, tool_status="failed", text="结束原因无效",
+                    )
+                    outputs.append(self._call_output(call_id, {"error": "invalid no-action reason"}))
+                else:
+                    self._emit("no_action", clean)
+                    outputs.append(self._call_output(call_id, {"status": "published", "activation": "idle"}))
+                    self._activity(
+                        "tool", "completed", item_id=tool_activity_id,
+                        tool_name=name, tool_status="completed", text="本轮无需动作",
                     )
                     stop_activation = True
             else:

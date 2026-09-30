@@ -341,8 +341,6 @@ class ProductSidecarTests(unittest.TestCase):
                 kind="progress" if index < 5 else "result",
                 text=f"  进度 {index}   \n 内部 trace {index} ",
                 based_on_context_revision=9000 + index,
-                wake_policy="passive" if index < 5 else "priority",
-                payload={"event_id": "must-not-leak", "prompt": "private"},
             )])
         safe = projection.snapshot({
             "available": True,
@@ -384,7 +382,7 @@ class ProductSidecarTests(unittest.TestCase):
         for seconds, final_window in expected.items():
             scheduler = AgentDecisionScheduler(AgentOptions(final_silence_ms=seconds * 1000))
             self.assertEqual(scheduler.FINAL_WINDOW, final_window)
-            self.assertEqual(scheduler.secondary_interval_windows, 10)
+            self.assertFalse(hasattr(scheduler, "secondary_interval_windows"))
             self.assertIsNone(scheduler.forced_due(now=4.0))
         self.assertEqual(AgentDecisionScheduler(AgentOptions()).FINAL_WINDOW, 75)
 

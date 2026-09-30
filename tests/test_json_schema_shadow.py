@@ -64,8 +64,8 @@ def test_prompt_matches_required_responses_wire_contract_and_has_short_examples(
     assert "committed_prefix、current_clause、prefetched_clause、revisable_tail" in PROMPT
     assert "continuation_mode=rewrite_tail" in PROMPT
     assert "优先用 state=revision 只写新的尾巴" in PROMPT
-    assert "收到它们不等于必须 speak" in PROMPT
-    assert "相关性、时效性、可靠性、是否已经表达" in PROMPT
+    assert "不表示必须 speak" in PROMPT
+    assert "相关性、时效性、是否已经表达" in PROMPT
     assert 'HISTORY 中 assistant 角色的 <voice_delivery>' in PROMPT
     assert 'status="full"' in PROMPT
     assert "调度器触发、shadow.active" in PROMPT
@@ -76,7 +76,7 @@ def test_prompt_matches_required_responses_wire_contract_and_has_short_examples(
     assert "不得带 text" not in PROMPT
 
 
-def test_shadow_priority_and_normal_events_wake_main_scheduler_but_progress_does_not():
+def test_shadow_information_and_terminal_wake_main_scheduler_but_progress_does_not():
     async def scenario():
         class Registry:
             def action_definitions(self):
@@ -96,22 +96,23 @@ def test_shadow_priority_and_normal_events_wake_main_scheduler_but_progress_does
         wakes = []
         runtime._wake = wakes.append
         await runtime.accept_shadow_event(
-            ShadowEvent("p", "progress", "正在检索", 1, "passive")
+            ShadowEvent("p", "progress", "正在检索", 1)
         )
         await runtime.accept_shadow_event(
-            ShadowEvent("q", "user_input_required", "请选择范围", 1, "priority", {
-                "kind": "clarification", "options": ["A", "B"], "operation_summary": "",
-            })
+            ShadowEvent("s", "information", "正在等待用户说明", 1)
         )
-        await runtime.accept_shadow_event(
-            ShadowEvent("s", "status", "正在等待用户说明", 1, "normal")
-        )
-        assert wakes == ["SHADOW_EVENT_PRIORITY", "SHADOW_EVENT"]
-        payload = runtime.ledger.entries[-1].content
-        assert payload["kind"] == "user_input_required"
-        assert payload["payload"]["options"] == ["A", "B"]
-        model_context = runtime.messages({"SHADOW_EVENT"})
+        model_context = runtime.messages({"SHADOW_INFORMATION"},
+                                         shadow_information=runtime.ledger.shadow_information_snapshot())
         assert any("正在等待用户说明" in item["content"] for item in model_context)
+        await runtime.accept_shadow_event(
+            ShadowEvent("q", "input_required", "请选择范围", 1,
+                        options=("A", "B"))
+        )
+        assert wakes == ["SHADOW_INFORMATION", "SHADOW_EVENT_PRIORITY"]
+        payload = runtime.ledger.entries[-1].content
+        assert payload["kind"] == "input_required"
+        assert payload["options"] == ["A", "B"]
+        assert runtime.ledger.shadow_information_snapshot() is None
 
     asyncio.run(scenario())
 
@@ -393,8 +394,7 @@ def test_new_input_queues_behind_active_recovery_without_cancelling_llm():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("dispatch_kind", ["secondary_mailbox", "final_silence"])
-def test_new_final_rearms_silence_without_cancelling_active_system_check(dispatch_kind):
+def test_new_final_rearms_silence_without_cancelling_active_system_check():
     async def scenario():
         async def emit(*_args):
             return None
@@ -410,16 +410,13 @@ def test_new_final_rearms_silence_without_cancelling_active_system_check(dispatc
         runtime.episode_id = "episode"
         runtime.state = "WAITING_EVENT"
         runtime.scheduler.arm(0.0)
-        runtime.scheduler.advance(30.0 if dispatch_kind == "final_silence" else 4.0)
-        if dispatch_kind == "final_silence":
-            assert runtime.scheduler.final_pending is True
-        else:
-            assert runtime.scheduler.secondary_candidate(now=4.0)["prompt_kind"] == "secondary_mailbox"
+        runtime.scheduler.advance(30.0)
+        assert runtime.scheduler.final_pending is True
 
         request = asyncio.create_task(asyncio.sleep(60))
         runtime.active_request = request
         runtime.runner = request
-        runtime.active_dispatch_context = {"dispatch_kind": dispatch_kind, "generation": 1}
+        runtime.active_dispatch_context = {"dispatch_kind": "final_silence", "generation": 1}
 
         await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-new", text="新的用户输入")
 
@@ -1063,36 +1060,6 @@ def test_thinking_and_business_actions_release_one_barrier_after_tools():
     asyncio.run(scenario())
 
 
-def test_secondary_mailbox_actions_and_thinking_follow_normal_dispatch_rules():
-    async def scenario():
-        runtime = _runtime(SimpleNamespace(thinking_action_enabled=True))
-        runtime._system_check_turn_ids.add("system-check-a")
-        shadow_wakes = []
-        runtime.shadow_waker = lambda: shadow_wakes.append("wake") or "started"
-        envelope = DecisionEnvelope(
-            SpeechDecision("speak", "calm", "我继续处理。"),
-            (
-                Action(THINKING_ACTION, {"request": True}),
-                Action("request_shadow", {"request": True}),
-            ),
-        )
-
-        await runtime._dispatch_actions_v06(
-            (runtime.episode_id, "request-a"), "turn-a", envelope,
-            system_check=True,
-            system_check_id="system-check-a",
-            system_check_prompt_kind="secondary_mailbox",
-        )
-        await asyncio.gather(*tuple(runtime._background_tools))
-
-        assert shadow_wakes == ["wake"]
-        assert any(item["kind"] == "SHADOW_WAKE" for item in runtime.trace)
-        assert any(item["kind"] == "THINKING_REQUESTED" for item in runtime.trace)
-        assert not any(item["kind"] == "SYSTEM_CHECK_ACTION_REJECTED" for item in runtime.trace)
-
-    asyncio.run(scenario())
-
-
 def test_final_silence_actions_and_thinking_are_rejected_before_execution():
     async def scenario():
         runtime = _runtime(SimpleNamespace(thinking_action_enabled=True))
@@ -1129,8 +1096,8 @@ def test_system_check_recovery_signal_keeps_immutable_owner_metadata():
         runtime.active_dispatch_context = {
             "system_check_id": "system-check-a",
             "speech_turn_id": "turn-a",
-            "dispatch_kind": "secondary_mailbox",
-            "prompt_kind": "secondary_mailbox",
+            "dispatch_kind": "final_silence",
+            "prompt_kind": "final_silence",
             "owner_scope": "system_check",
             "generation": 1,
             "window_index": 3,
@@ -1164,11 +1131,10 @@ def test_system_check_recovery_signal_keeps_immutable_owner_metadata():
         entries = {entry["kind"]: entry["content"] for entry in packet["entries"]}
         feedback = json.loads(entries["immediate_recovery"].removeprefix("即时恢复反馈："))
 
-        assert prompt_kind == "secondary_mailbox"
-        assert "secondary_mailbox" in entries
-        assert feedback["origin_prompt_kind"] == "secondary_mailbox"
-        assert "本次没有新的用户输入" in feedback["instruction"]
-        assert "不要重新回答历史用户请求" in feedback["instruction"]
+        assert prompt_kind == "final_silence"
+        assert "final_silence" in entries
+        assert feedback["origin_prompt_kind"] == "final_silence"
+        assert "不要把最后一条历史用户输入当成新的请求" in feedback["instruction"]
         assert "重新处理最后一条用户输入" not in feedback["instruction"]
 
     asyncio.run(scenario())
@@ -1189,7 +1155,6 @@ def test_thinking_action_is_explicitly_present_in_tool_availability():
 @pytest.mark.parametrize(
     ("prompt_kind", "expected"),
     [
-        ("secondary_mailbox", "不要重新回答历史用户请求"),
         ("final_silence", "不要把最后一条历史用户输入当成新的请求"),
         ("kws_wake", "不要处理历史用户任务"),
     ],

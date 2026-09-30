@@ -34,13 +34,13 @@ from ..providers.deepseek import DeepSeekClient
 from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
 from ..agent.tool_registry import FileTools, WebSearchTools
-from ..shadow_agent import ShadowAgentComponent, ShadowContextProjector, ShadowEvent
+from ..shadow_agent import DurableVoiceEvent, ShadowAgentComponent, ShadowContextProjector, ShadowEvent
 from ..shadow_agent.component import ShadowAgentSession
 from ..shadow_agent.events import ShadowEventBuffer
 from ..shadow_agent.prompts import load_shadow_instructions
 from ..shadow_agent.provider import DeepSeekResponsesShadowProvider
 from ..shadow_agent.tools import AmbientContextTools, ShadowToolExecutor
-from ..shadow_agent.durable_mailbox import DurableShadowMailbox
+from ..shadow_agent.durable_mailbox import DurableVoiceMailbox
 from ..continuity import ContinuityManager
 from ..session.ledger import SessionLedger
 from ..session.runtime import ConversationRuntime
@@ -147,7 +147,7 @@ class SessionRuntime(SpeakerRuntimeMixin):
             custom_instructions=shadow_projection(self._instruction_snapshot),
         )
         self._shadow_pending = ShadowEventBuffer()
-        self._voice_mailbox = DurableShadowMailbox(project_root / "config" / "voice-mailbox.json")
+        self._voice_mailbox = DurableVoiceMailbox(project_root / "config" / "voice-mailbox.json")
         self.shadow_product = ShadowProductProjection()
         self._shadow_debug_sinks: dict[str, Any] = {}
         self.player: PcmPlayer | None = None
@@ -1365,8 +1365,8 @@ class SessionRuntime(SpeakerRuntimeMixin):
                 event_id=str(uuid4()), kind="failed",
                 text=f"DSH Shadow 基础设施失败：{exc}",
                 based_on_context_revision=revision,
-                wake_policy="priority",
-                payload={"backend": "dsh", "infrastructure": True},
+                failure_code="dsh_bridge_unavailable",
+                infrastructure=True,
             )])
             self.state.set_service("shadow_agent", "ERROR")
             return "unavailable"
@@ -1444,13 +1444,11 @@ class SessionRuntime(SpeakerRuntimeMixin):
         extra = payload.get("payload")
         if extra is not None and not isinstance(extra, dict):
             return "conflict"
-        voice_event = ShadowEvent(
+        voice_event = DurableVoiceEvent(
             event_id=event_id,
-            kind="observation",
             text=message,
-            based_on_context_revision=max(0, int(getattr(self.shadow_session, "last_applied_revision", 0))),
-            wake_policy="normal",
-            payload={"source_session_id": source, **(extra or {})},
+            source_session_id=source,
+            payload=dict(extra or {}),
         )
         async with self._session_lock:
             code = await self._voice_mailbox.publish(voice_event)
@@ -1464,7 +1462,7 @@ class SessionRuntime(SpeakerRuntimeMixin):
         if controller is None or not self.state.listening or controller.episode.closed:
             return
         for item in await self._voice_mailbox.pending():
-            await controller.accept_shadow_events([item])
+            await controller.accept_durable_voice_event(item)
             await self._voice_mailbox.acknowledge(item.event_id)
 
     async def _on_shadow_events(self, events: list[ShadowEvent]) -> None:
@@ -1485,7 +1483,7 @@ class SessionRuntime(SpeakerRuntimeMixin):
         await self.publish_shadow_product()
         model_events = [
             item for item in events
-            if item.kind in {"status", "observation", "user_input_required", "result", "failed"}
+            if item.kind in {"information", "input_required", "result", "no_action", "failed"}
         ]
         if not model_events:
             return

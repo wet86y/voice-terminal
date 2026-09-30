@@ -466,7 +466,7 @@ class DshConfig:
     startup_timeout_ms: int = 120000
     shutdown_timeout_ms: int = 5000
     bridge_timeout_ms: int = 15000
-    bridge_protocol_version: str = "1.0"
+    bridge_protocol_version: str = "2.0"
     restart_limit: int = 2
     restart_delay_ms: int = 1000
     expected_version: str = "0.1.7-rc.2"
@@ -481,7 +481,7 @@ class DshConfig:
             raise ValueError("dsh.port must be 3081")
         if self.startup_timeout_ms <= 0 or self.shutdown_timeout_ms <= 0 or self.bridge_timeout_ms <= 0:
             raise ValueError("dsh timeouts must be positive")
-        if self.bridge_protocol_version != "1.0":
+        if self.bridge_protocol_version != "2.0":
             raise ValueError("unsupported dsh.bridge_protocol_version")
         if self.restart_limit < 0 or self.restart_delay_ms < 0:
             raise ValueError("dsh restart policy must be non-negative")
@@ -755,7 +755,7 @@ class AppConfig:
                 startup_timeout_ms=int(_number(dsh.get("startup_timeout_ms"), 120000)),
                 shutdown_timeout_ms=int(_number(dsh.get("shutdown_timeout_ms"), 5000)),
                 bridge_timeout_ms=int(_number(dsh.get("bridge_timeout_ms"), 15000)),
-                bridge_protocol_version=_string(dsh.get("bridge_protocol_version"), "1.0"),
+                bridge_protocol_version=_string(dsh.get("bridge_protocol_version"), "2.0"),
                 restart_limit=int(_number(dsh.get("restart_limit"), 2)),
                 restart_delay_ms=int(_number(dsh.get("restart_delay_ms"), 1000)),
                 expected_version=_string(dsh.get("expected_version"), "0.1.7-rc.2"),

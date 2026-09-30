@@ -1,7 +1,7 @@
 """Session-scoped Shadow Agent execution-plane primitives."""
 
 from .contracts import (
-    ShadowContextFrame, ShadowContextSnapshot, ShadowContextUpdate, ShadowEvent,
+    DurableVoiceEvent, ShadowContextFrame, ShadowContextSnapshot, ShadowContextUpdate, ShadowEvent,
     ShadowVisibleStatus, ToolEffect, parse_shadow_wake, request_shadow_action_definition,
 )
 from .component import ShadowAgentComponent, ShadowAgentSession
@@ -13,6 +13,7 @@ from .tools import ShadowToolDomain
 
 __all__ = [
     "DeepSeekResponsesShadowProvider",
+    "DurableVoiceEvent",
     "ShadowAgentComponent",
     "ShadowAgentSession",
     "ShadowProvider",

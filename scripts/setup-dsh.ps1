@@ -15,6 +15,7 @@ $PresetSource = Join-Path $RepoRoot "config\dsh\agent-presets\shadow-agent"
 $CliPath = Join-Path $SourceDir "apps\cli\lib\bin.js"
 $PackagePath = Join-Path $SourceDir "package.json"
 $BuildStatePath = Join-Path $RuntimeRoot "build-state.json"
+$SessionMappingPath = Join-Path $RuntimeRoot "session-mappings.json"
 $BridgeDir = Join-Path $RepoRoot "integrations\dsh\voice-terminal-shadow-bridge"
 $BridgeArtifactDir = Join-Path $RuntimeRoot "bundles\voice-terminal-shadow-bridge"
 $WakeTasksDir = Join-Path $RepoRoot "integrations\dsh\voice-terminal-wake-tasks"
@@ -204,6 +205,37 @@ $Node = [version]$NodeVersion
 $NodeSupported = (($Node.Major -eq 22 -and $Node -ge [version]$Lock.minimum_node_version) -or $Node.Major -ge 24)
 if (-not $NodeSupported) { throw "Node.js 版本不受支持：$NodeVersion；需要 ^22.19.0 或 >=24.0.0。" }
 
+if (-not $ValidateOnly) {
+  $VoiceServerPort = 8765
+  foreach ($VoiceConfigPath in @(
+    (Join-Path $RepoRoot "config\default.yaml"),
+    (Join-Path $RepoRoot "config\local.yaml")
+  )) {
+    if (-not (Test-Path -LiteralPath $VoiceConfigPath -PathType Leaf)) { continue }
+    $VoiceConfigText = Get-Content -LiteralPath $VoiceConfigPath -Raw
+    $ServerBlock = [regex]::Match($VoiceConfigText, '(?ms)^server:[ \t]*\r?\n(?<block>(?:[ \t].*(?:\r?\n|$))*)')
+    if ($ServerBlock.Success) {
+      $PortMatch = [regex]::Match($ServerBlock.Groups['block'].Value, '(?m)^[ \t]+port:[ \t]*(\d+)\s*$')
+      if ($PortMatch.Success) { $VoiceServerPort = [int]$PortMatch.Groups[1].Value }
+    }
+  }
+  if (-not [string]::IsNullOrWhiteSpace($env:VOICE_SERVER_PORT)) {
+    $EnvironmentVoicePort = 0
+    $EnvironmentVoicePortValid = [int]::TryParse($env:VOICE_SERVER_PORT, [ref]$EnvironmentVoicePort)
+    if (-not $EnvironmentVoicePortValid -or $EnvironmentVoicePort -lt 1 -or $EnvironmentVoicePort -gt 65535) {
+      throw "VOICE_SERVER_PORT 必须为 1～65535 的端口号。"
+    }
+    $VoiceServerPort = $EnvironmentVoicePort
+  }
+  if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
+    throw "无法确认 Voice Server 是否已停止；请在安装前停止服务并确保 Get-NetTCPConnection 可用。"
+  }
+  $VoiceListeners = @(Get-NetTCPConnection -State Listen -LocalPort $VoiceServerPort -ErrorAction SilentlyContinue)
+  if ($VoiceListeners.Count -gt 0) {
+    throw "检测到 Voice Server 端口 $VoiceServerPort 仍在监听；请先停止 Voice Server，再部署 Bridge 2.0。"
+  }
+}
+
 $SourceExisted = Test-Path -LiteralPath $SourceDir -PathType Container
 $PriorRuntimeCommit = $null
 if (Test-Path -LiteralPath $BuildStatePath) {
@@ -311,7 +343,7 @@ if ($LASTEXITCODE -ne 0 -or $CliVersion -notmatch [regex]::Escape($Lock.version)
 
 $BridgePackage = Get-Content -LiteralPath $BridgePackagePath -Raw | ConvertFrom-Json
 $BridgeVersion = [string]$BridgePackage.version
-$BridgeProtocolVersion = "1.0"
+$BridgeProtocolVersion = "2.0"
 $PromptHash = Get-TreeHash @($CommonPromptPath, $DshRulesPath)
 $PresetText = Get-Content -LiteralPath (Join-Path $PresetSource "agent.cordis.yml") -Raw
 $ShadowPresetPackageText = ([ordered]@{
@@ -397,6 +429,18 @@ if ($ValidateOnly) {
 }
 
 if (-not $ValidateOnly) {
+  if (Test-Path -LiteralPath $SessionMappingPath -PathType Leaf) {
+    $MappingSchemaVersion = $null
+    try { $MappingSchemaVersion = (Get-Content -LiteralPath $SessionMappingPath -Raw | ConvertFrom-Json).schema_version } catch { }
+    if ($MappingSchemaVersion -ne 2) {
+      $MappingArchivePath = Join-Path $RuntimeRoot ("session-mappings.v1.archive-{0}.json" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+      Move-Item -LiteralPath $SessionMappingPath -Destination $MappingArchivePath
+      Write-Host "旧版 Session mapping（会话映射）已归档到 $MappingArchivePath" -ForegroundColor Yellow
+    }
+  }
+  if (-not (Test-Path -LiteralPath $SessionMappingPath -PathType Leaf)) {
+    Write-Utf8NoBom -Path $SessionMappingPath -Text (([ordered]@{ schema_version = 2; sessions = @{} } | ConvertTo-Json -Depth 4) + "`n")
+  }
   if ((Test-Path -LiteralPath $HomeDir -PathType Container) -and @(Get-ChildItem -Force -LiteralPath $HomeDir).Count -gt 0) {
     $PreviousState = $null
     if (Test-Path -LiteralPath $BuildStatePath) {

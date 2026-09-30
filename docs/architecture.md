@@ -77,10 +77,10 @@ speak 决策状态为 `speak`、`revision`、`cancel`、`wait`：
 
 - 每个 session 只有一个 `ShadowRuntime`、一个活动 runner 和一份私有 committed trace。
 - Shadow 只读取 `ShadowContextProjector` 的权威语义帧，工具首版全部为 `READ_ONLY`。
-- `progress` 和工具生命周期只更新产品投影；status observer 的摘要以可替换的
-  `ShadowVisibleStatus` 进入 Voice 普通 ShadowEvent 调度（`wake_policy=normal`），并在下一次
-  主 LLM 请求的 `runtime.shadow.status` 中可见，但不追加为长期语义历史。`observation`、
-  `user_input_required`、`result`、`failed` 仍进入主语义邮箱并按各自策略调度。
+- `progress` 和工具生命周期只更新产品投影。status observer（状态观察器）与根 Agent
+  共用 `latest_shadow_information`（最新影子信息）单槽，严格按到达顺序覆盖。请求冻结时将最新快照
+  放入 `runtime.shadow.information`，然后按 `version`（本地版本）比较清除；新版本保留给下一次请求。
+  `input_required`、`result`、`failed` 进入语义历史，`no_action` 只结束激活。
 - 新上下文到达时，运行中的 provider 和已开始的只读工具不被强行打断；尚未开始的旧工具必须标记为 `not_executed`，旧 final 不得发布。
 - `session.stop` 保留 Shadow；`session.reset` 清理 Shadow trace、状态、临时请求和 context epoch；runtime close 关闭 provider、工具和共享 HTTP client。
 

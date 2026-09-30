@@ -7,14 +7,14 @@ from .contracts import ShadowEvent
 
 
 class ShadowEventBuffer:
-    """Coalesce visible state while preserving every semantic event."""
+    """Coalesce replaceable state while preserving terminal semantic events."""
 
     def __init__(self) -> None:
         self._state: OrderedDict[str, ShadowEvent] = OrderedDict()
         self._semantic: list[ShadowEvent] = []
 
     def publish(self, event: ShadowEvent) -> None:
-        if event.kind in {"status", "progress"}:
+        if event.kind in {"progress", "information"}:
             self._state[event.kind] = event
         else:
             self._semantic.append(event)
@@ -36,7 +36,7 @@ class ShadowEventBuffer:
         restored_state: OrderedDict[str, ShadowEvent] = OrderedDict()
         restored_semantic: list[ShadowEvent] = []
         for event in events:
-            if event.kind in {"status", "progress"}:
+            if event.kind in {"progress", "information"}:
                 restored_state[event.kind] = event
             else:
                 restored_semantic.append(event)

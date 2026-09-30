@@ -16,7 +16,6 @@ from ..shadow_agent.contracts import (
     ShadowContextSnapshot,
     ShadowContextUpdate,
     ShadowEvent,
-    ShadowVisibleStatus,
 )
 
 
@@ -66,7 +65,10 @@ class SessionLedger:
         self._shadow_context_epoch = 1
         self._shadow_input_revision = 0
         self._shadow_frames: list[ShadowContextFrame] = []
-        self.shadow_visible_status: ShadowVisibleStatus | None = None
+        # Voice 替换信息单槽：version（本地版本）、text（正文）、source（来源）、
+        # activation_id（激活标识）和 context_revision（上下文修订号）只在进程内暂存。
+        self.latest_shadow_information: dict[str, Any] | None = None
+        self._shadow_information_version = 0
         self.shadow_user_input_required = False
         self.shadow_available = False
         self.shadow_active = False
@@ -82,7 +84,8 @@ class SessionLedger:
         self._shadow_context_epoch += 1
         self._shadow_input_revision = 0
         self._shadow_frames.clear()
-        self.shadow_visible_status = None
+        self.latest_shadow_information = None
+        self._shadow_information_version = 0
         self.shadow_user_input_required = False
         self.shadow_active = False
         self._shadow_current_turn_keys.clear()
@@ -157,22 +160,33 @@ class SessionLedger:
             self.shadow_active = bool(active)
             if active:
                 self.shadow_user_input_required = False
-        if self.shadow_visible_status is not None and active is not None:
-            self.shadow_visible_status = ShadowVisibleStatus(
-                active=bool(active), text=self.shadow_visible_status.text,
-                based_on_trace_revision=self.shadow_visible_status.based_on_trace_revision,
-                updated_at=self.shadow_visible_status.updated_at,
-            )
 
-    def shadow_runtime_tail(self) -> dict[str, Any] | None:
+    def shadow_runtime_tail(
+        self, *, information: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         if not self.shadow_available:
             return None
-        return {
+        value = {
             "available": True,
             "active": self.shadow_active,
-            "status": self.shadow_visible_status.text if self.shadow_visible_status else "",
             "user_input_required": self.shadow_user_input_required,
         }
+        if information is not None:
+            value["information"] = {
+                "text": str(information.get("text") or "")[:2000],
+                "source": str(information.get("source") or "agent"),
+            }
+        return value
+
+    def shadow_information_snapshot(self) -> dict[str, Any] | None:
+        return dict(self.latest_shadow_information) if self.latest_shadow_information else None
+
+    def consume_shadow_information(self, version: int) -> bool:
+        current = self.latest_shadow_information
+        if current is None or int(current.get("version") or 0) != int(version):
+            return False
+        self.latest_shadow_information = None
+        return True
 
     @staticmethod
     def _render_input_snapshot(content: Any, metadata: dict[str, Any]) -> str:
@@ -458,22 +472,31 @@ class SessionLedger:
             while len(self._committed_shadow_event_order) > 4096:
                 expired = self._committed_shadow_event_order.popleft()
                 self._committed_shadow_event_ids.discard(expired)
-        if event.kind in {"status", "progress"}:
-            self.shadow_visible_status = ShadowVisibleStatus(
-                active=True, text=event.text,
-                based_on_trace_revision=event.based_on_context_revision,
-                updated_at=time.time(),
-            )
+        if event.kind == "progress":
             return True
-        if event.kind == "user_input_required":
+        if event.kind == "information":
+            self._shadow_information_version += 1
+            self.latest_shadow_information = {
+                "version": self._shadow_information_version,
+                "text": event.text,
+                "source": event.source,
+                "activation_id": event.activation_id,
+                "context_revision": event.based_on_context_revision,
+            }
+            return True
+        self.latest_shadow_information = None
+        if event.kind == "input_required":
             self.shadow_user_input_required = True
         elif event.kind in {"result", "failed"}:
             self.shadow_user_input_required = False
-        if event.kind in {"user_input_required", "result", "failed"}:
+        if event.kind in {"input_required", "result", "no_action", "failed"}:
             self.set_shadow_runtime_state(active=False)
+        if event.kind == "no_action":
+            return True
         self.entries.append(SessionLedgerEntry("shadow_event", {
             "event_id": event.event_id, "kind": event.kind, "text": str(event.text)[:8000],
-            "wake_policy": event.wake_policy, "payload": dict(event.payload),
+            "options": list(event.options), "failure_code": event.failure_code,
+            "infrastructure": event.infrastructure,
         }))
         return True
 

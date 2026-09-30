@@ -76,7 +76,9 @@ def make_runtime(provider, ledger, tmp_path: Path, events, **options):
 def test_request_shadow_contract_is_content_free_and_strict():
     definition = request_shadow_action_definition()
     assert definition["name"] == "request_shadow"
-    assert definition["parameters"]["properties"] == {"request": {"type": "boolean", "const": True}}
+    assert definition["parameters"]["properties"]["request"]["type"] == "boolean"
+    assert definition["parameters"]["properties"]["request"]["const"] is True
+    assert "true" in definition["parameters"]["properties"]["request"]["description"]
     assert "不表示当前必须向用户说话" in definition["description"]
     assert parse_shadow_wake({"request": True}) is True
     for invalid in ({}, {"request": False}, {"request": True, "text": "x"}, True):
@@ -89,10 +91,12 @@ def test_request_shadow_contract_is_content_free_and_strict():
 def test_shadow_event_prompts_report_facts_without_directing_main_speech():
     publish = next(
         item for item in shadow_control_tool_definitions()
-        if item["name"] == "publish_main_event"
+        if item["name"] == "publish_voice_information"
     )
     assert "只陈述事实及不确定性" in publish["description"]
-    assert "不得指示主助手" in publish["description"]
+    assert "不得指示主模型" in publish["description"]
+    progress = next(item for item in shadow_control_tool_definitions() if item["name"] == "publish_progress")
+    assert "不会触发语音主模型推理" in progress["description"]
     assert "不得建议或指示主助手说什么" in STATUS_OBSERVER_PROMPT
     assert "下一步向用户" in STATUS_OBSERVER_PROMPT
     assert "准确区分已完成、正在进行、下一步和阻塞" not in STATUS_OBSERVER_PROMPT
@@ -261,16 +265,24 @@ def test_projector_merges_unsettled_current_turn_and_freezes_environment():
     assert [frame.content["transcript"] for frame in first.frames[1:]] == ["先查北京", "改查上海"]
 
 
-def test_main_tail_exposes_only_bounded_shadow_state():
+def test_main_tail_exposes_only_request_scoped_shadow_information():
     ledger = SessionLedger()
     ledger.set_shadow_runtime_state(available=True, active=True)
     ledger.commit_shadow_event(ShadowEvent("p", "progress", "正在核对第二个来源。", 0, "passive"))
     tail = LLMContextProjector.runtime_tail(
         current=CurrentInput(), speak_state={}, shadow=ledger.shadow_runtime_tail(),
     )
-    assert "正在核对第二个来源" in tail
+    assert "正在核对第二个来源" not in tail
     assert "task" not in tail.lower()
     assert "revision" not in tail.lower()
+    ledger.commit_shadow_event(ShadowEvent(
+        "i", "information", "正在核对第二个来源。", 0, "agent",
+    ))
+    tail = LLMContextProjector.runtime_tail(
+        current=CurrentInput(), speak_state={},
+        shadow=ledger.shadow_runtime_tail(information=ledger.shadow_information_snapshot()),
+    )
+    assert "正在核对第二个来源" in tail
     ledger.commit_shadow_event(ShadowEvent("r", "result", "完成", 0, "priority"))
     assert ledger.shadow_runtime_tail()["active"] is False
 
@@ -310,29 +322,29 @@ def test_main_action_passes_only_wake_and_projects_current_dispatch_input():
 
 def test_event_buffer_overwrites_status_and_preserves_semantic_events():
     buffer = ShadowEventBuffer()
-    buffer.publish(ShadowEvent("p1", "progress", "旧", 1, "passive"))
-    buffer.publish(ShadowEvent("p2", "progress", "新", 1, "passive"))
-    buffer.publish(ShadowEvent("o1", "observation", "发现一", 1, "normal"))
-    buffer.publish(ShadowEvent("o2", "observation", "发现二", 1, "normal"))
+    buffer.publish(ShadowEvent("p1", "progress", "旧", 1))
+    buffer.publish(ShadowEvent("p2", "progress", "新", 1))
+    buffer.publish(ShadowEvent("o1", "information", "发现一", 1))
+    buffer.publish(ShadowEvent("o2", "information", "发现二", 1))
     assert [(item.kind, item.text) for item in buffer.drain()] == [
-        ("progress", "新"), ("observation", "发现一"), ("observation", "发现二"),
+        ("progress", "新"), ("information", "发现二"),
     ]
 
 
 def test_event_buffer_restore_keeps_newer_visible_state_and_semantic_order():
     buffer = ShadowEventBuffer()
-    old_status = ShadowEvent("old-status", "status", "旧状态", 1, "normal")
-    old_result = ShadowEvent("old-result", "result", "旧结果", 1, "priority")
+    old_status = ShadowEvent("old-status", "information", "旧状态", 1)
+    old_result = ShadowEvent("old-result", "result", "旧结果", 1)
     buffer.publish(old_status)
     buffer.publish(old_result)
     in_flight = buffer.drain()
-    buffer.publish(ShadowEvent("new-status", "status", "新状态", 2, "normal"))
-    buffer.publish(ShadowEvent("new-observation", "observation", "新发现", 2, "normal"))
+    buffer.publish(ShadowEvent("new-status", "information", "新状态", 2))
+    buffer.publish(ShadowEvent("new-result", "result", "新发现", 2))
     buffer.restore(in_flight)
     assert [(item.event_id, item.text) for item in buffer.drain()] == [
         ("new-status", "新状态"),
         ("old-result", "旧结果"),
-        ("new-observation", "新发现"),
+        ("new-result", "新发现"),
     ]
 
 
@@ -466,16 +478,16 @@ def test_disabling_context_gate_releases_deferred_authority_prefix():
     assert [frame.content["transcript"] for frame in projector.shadow_context_snapshot().frames[1:]] == ["一", "二"]
 
 
-def test_status_reaches_model_mailbox_while_progress_remains_product_only():
+def test_information_reaches_model_mailbox_while_progress_remains_product_only():
     async def scenario():
         runtime = SessionRuntime(AppConfig())
-        status = ShadowEvent("s", "status", "正在整理", 1, "normal")
-        progress = ShadowEvent("p", "progress", "已读取文件", 1, "normal")
+        status = ShadowEvent("s", "information", "正在整理", 1)
+        progress = ShadowEvent("p", "progress", "已读取文件", 1)
         await runtime._on_shadow_events([status, progress])
         assert runtime.shadow_product.summary == "已读取文件"
         assert [item.event_id for item in runtime._shadow_pending.drain()] == ["s"]
 
-        result = ShadowEvent("r", "result", "整理完成", 1, "priority")
+        result = ShadowEvent("r", "result", "整理完成", 1)
         await runtime._on_shadow_events([result])
         assert [item.event_id for item in runtime._shadow_pending.drain()] == ["r"]
 
@@ -516,7 +528,7 @@ def test_shadow_runtime_emits_separate_activity_stream_without_trace_deltas(tmp_
         ledger, events, activities = SessionLedger(), [], []
         ledger.commit_input("u1", "查找说明")
         provider = QueueProvider([
-            [call("event", "publish_main_event", {"kind": "progress", "text": "开始查找"})],
+            [call("event", "publish_progress", {"text": "开始查找"})],
             [message("最终完成")],
         ])
         runtime = make_runtime(
@@ -526,7 +538,7 @@ def test_shadow_runtime_emits_separate_activity_stream_without_trace_deltas(tmp_
         await wait_idle(runtime)
         assert events[-1].kind == "result"
         assert any(item["stream"] == "thinking" for item in activities)
-        assert any(item["stream"] == "tool" and item.get("tool_name") == "publish_main_event" for item in activities)
+        assert any(item["stream"] == "tool" and item.get("tool_name") == "publish_progress" for item in activities)
         assert any(item["stream"] == "event" and item.get("event_kind") == "progress" for item in activities)
         assert any(item["stream"] == "lifecycle" and item["phase"] == "completed" for item in activities)
         assert all("private" not in json.dumps(item, ensure_ascii=False) for item in activities)
@@ -651,17 +663,15 @@ def test_clarification_ends_activation_with_context_only_correlation(tmp_path: P
         ledger.commit_input("u1", "查文档")
         provider = QueueProvider([[
             call("q", "request_user_input", {
-                "kind": "clarification", "question": "查哪个目录？",
-                "options": ["docs", "src"], "operation_summary": "",
+                "question": "查哪个目录？", "options": ["docs", "src"],
             })
         ]])
         runtime = make_runtime(provider, ledger, tmp_path, events)
         runtime.wake()
         await wait_idle(runtime)
         event = events[-1]
-        assert event.kind == "user_input_required"
-        assert event.payload == {"kind": "clarification", "options": ["docs", "src"], "operation_summary": ""}
-        assert set(event.payload) == {"kind", "options", "operation_summary"}
+        assert event.kind == "input_required"
+        assert event.options == ("docs", "src")
         await runtime.close()
 
     asyncio.run(scenario())
