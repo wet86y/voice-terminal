@@ -1199,9 +1199,9 @@ function pageLabel() {
               <small class="instruction-hint">表单和列表中的增删改、启停会在保存后持久化。</small>
             </section>
             <div class="persona-layout"><nav class="persona-nav"><button v-for="document in personaItems" :key="document.id" type="button" :class="{ active: activePersona === document.id }" @click="activePersona = document.id"><strong>{{ document.label }}</strong><small>{{ document.owner }}</small></button></nav><label class="document-editor"><span>{{ currentDocument.path }}</span><textarea v-model="personaDocuments[currentDocument.id]" spellcheck="false"></textarea><small>UTF-8、无 NUL、单文档不超过 64 KB；保存后下一次 Episode 生效。</small></label></div>
-            <label v-if="shadow.backend !== 'dsh'" class="switch-row"><div><strong>实验性 Shadow 上下文门禁</strong><span>只调用侧载模型判断新上下文的注入时机；不删除、不改写正文。关闭后立即恢复全部直通。</span></div><input v-model="settings.shadow.experimental_context_gate_enabled" type="checkbox" :disabled="saving" @change="saveShadowGate"><i></i></label>
-            <div v-else class="config-callout"><span class="callout-icon">DSH</span><p>DSH Shadow 使用插件强制注入 Voice 权威上下文，不启用旧 context gate。根模型、provider、reasoning 和凭据由 DSH Harness 管理。</p></div>
-            <div class="info-callout"><span>β</span><p>这是实验功能。一次暂缓仅对当次请求有效；下一次请求会重新判断，真正放行时会按原 revision 顺序带入全部正文。</p></div>
+            <label class="switch-row"><div><strong>实验性 Shadow 上下文门禁</strong><span>开启后，侧载模型只判断运行中 DSH 的新引导应进入当前步骤还是下一回合；权威上下文仍完整同步。关闭后恢复直接注入。</span></div><input v-model="settings.shadow.experimental_context_gate_enabled" type="checkbox" :disabled="saving" @change="saveShadowGate"><i></i></label>
+            <div v-if="shadow.backend === 'dsh'" class="config-callout"><span class="callout-icon">DSH</span><p>DSH 的执行模型和工具由 Harness（执行环境）管理；门禁开关只控制后续上下文的引导时机。</p></div>
+            <div class="info-callout"><span>β</span><p>这是实验功能。一次暂缓仅对当次请求有效；下一次请求会重新判断。暂缓正文在当前激活结束后作为新激活的下一条消息进入，且保留原始版本顺序。</p></div>
             <footer><button class="save-button" type="button" :disabled="saving" @click="savePersona">{{ saving ? '正在保存…' : '保存人格与用户资料' }}</button></footer>
           </template>
 

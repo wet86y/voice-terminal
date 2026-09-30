@@ -43,6 +43,10 @@ interface PendingContext {
   fromRevision: number
   revision: number
   frames: Json[]
+  /** 下一回合激活标识；存在时须在合并后保留激活正文。 */
+  activationId?: string
+  /** 门禁暂缓的最晚版本；用于在下一回合标明来源。 */
+  deferredThrough?: number
 }
 interface PendingReminder { messageId: string }
 interface Binding {
@@ -63,6 +67,18 @@ interface Binding {
   committedSteps: number
   pendingTools: Map<string, string>
   pendingContext?: PendingContext
+  /** 排队消息标识到上下文版本的映射，用于记录实际领取水位。 */
+  queuedMessages?: Map<string, number>
+  /** 已同步但尚未排入模型消息的完整区间。 */
+  heldContext?: PendingContext
+  /** 此绑定是否实际运行过侧载门禁。 */
+  gateObserved?: boolean
+  /** 已排队引导的最新版本。 */
+  queuedRevision?: number
+  /** DSH 已领取的最新版本。 */
+  claimedRevision?: number
+  /** 本激活已暂缓的最新版本。 */
+  deferredRevision?: number
   reminderIntervalMs: number
   activationStartedAt?: number
   nextReminderMs: number
@@ -138,9 +154,18 @@ function publicContextMessage(body: Envelope, update: 'snapshot' | 'delta'): str
 }
 
 function contextMessage(binding: Binding, pending: PendingContext): Record<string, unknown> {
+  const prefix = pending.activationId ? [
+    'VOICE SHADOW ACTIVATION',
+    `Activation: ${pending.activationId}`,
+    `Revision: ${pending.revision}`,
+    'Judge and execute the current task. End only with a Voice Bridge terminal tool.',
+    '',
+    `VOICE GATE DEFERRED CONTEXT: revisions through ${pending.deferredThrough ?? pending.revision} were delayed to this next turn.`,
+    '',
+  ].join('\n') : ''
   return createBridgeUserMessage([{
     type: 'text',
-    text: publicContextMessage({
+    text: prefix + publicContextMessage({
       protocol_version: BRIDGE_PROTOCOL_VERSION,
       request_id: 'merged-context',
       voice_session_id: binding.voiceSessionId,
@@ -157,6 +182,7 @@ export function enqueueAuthoritativeContext(
   binding: Binding,
   body: Envelope,
   update: 'snapshot' | 'delta',
+  preferredMessageId?: string,
 ): 'inserted' | 'replaced' | 'already_claimed' {
   const revision = Number(body.context_revision)
   const fromRevision = update === 'snapshot' ? 0 : Number(body.from_revision)
@@ -164,34 +190,119 @@ export function enqueueAuthoritativeContext(
   const prior = binding.pendingContext
   if (prior) {
     const merged: PendingContext = update === 'snapshot'
-      ? { messageId: prior.messageId, update, fromRevision: 0, revision, frames }
+      ? { messageId: prior.messageId, update, fromRevision: 0, revision, frames,
+          activationId: prior.activationId, deferredThrough: prior.deferredThrough }
       : {
           messageId: prior.messageId,
           update: prior.update,
           fromRevision: prior.fromRevision,
           revision,
           frames: [...prior.frames, ...frames],
+          activationId: prior.activationId,
+          deferredThrough: prior.deferredThrough,
         }
     if (binding.handle.agent.inbox.replace(prior.messageId, contextMessage(binding, merged))) {
       binding.pendingContext = merged
+      binding.queuedRevision = revision
+      binding.queuedMessages?.set(merged.messageId, revision)
       console.info('[voice-shadow-bridge] context merge', {
         action: 'replaced', from_revision: merged.fromRevision,
         context_revision: revision, frame_count: merged.frames.length,
+        target: merged.activationId ? 'next_turn' : 'next_step',
+        message_id: merged.messageId,
       })
       return 'replaced'
     }
   }
   const pending: PendingContext = {
-    messageId: randomUUID(), update, fromRevision, revision, frames,
+    messageId: preferredMessageId ?? randomUUID(), update, fromRevision, revision, frames,
   }
-  binding.handle.agent.inject(contextMessage(binding, pending))
   binding.pendingContext = pending
+  binding.queuedRevision = revision
+  binding.queuedMessages?.set(pending.messageId, revision)
+  binding.handle.agent.inject(contextMessage(binding, pending))
   const action = prior ? 'already_claimed' : 'inserted'
   console.info('[voice-shadow-bridge] context merge', {
     action, from_revision: fromRevision, context_revision: revision,
-    frame_count: frames.length,
+    frame_count: frames.length, target: 'next_step', message_id: pending.messageId,
   })
   return action
+}
+
+export function holdAuthoritativeContext(binding: Binding, body: Envelope, update: 'snapshot' | 'delta'): void {
+  binding.gateObserved = true
+  const revision = Number(body.context_revision)
+  const frames = (Array.isArray(body.frames) ? body.frames : []) as Json[]
+  const prior = binding.heldContext
+  binding.heldContext = update === 'snapshot' || !prior
+    ? { messageId: prior?.messageId ?? randomUUID(), update, fromRevision: update === 'snapshot' ? 0 : Number(body.from_revision), revision, frames }
+    : { ...prior, revision, frames: [...prior.frames, ...frames] }
+  console.info('[voice-shadow-bridge] context gate', {
+    action: 'held', activation_id: binding.activationId ?? '',
+    from_revision: binding.heldContext.fromRevision, context_revision: revision,
+    frame_count: binding.heldContext.frames.length,
+  })
+}
+
+export function releaseHeldContext(binding: Binding, revision: number): 'inserted' | 'replaced' | 'already_claimed' | 'empty' {
+  const held = binding.heldContext
+  if (!held || revision > held.revision || revision <= held.fromRevision) return 'empty'
+  const released = held.frames.filter((frame: any) => Number(frame?.revision ?? 0) <= revision)
+  const remaining = held.frames.filter((frame: any) => Number(frame?.revision ?? 0) > revision)
+  const remainder: PendingContext | undefined = held.revision > revision
+    ? { messageId: held.messageId, update: 'delta', fromRevision: revision,
+        revision: held.revision, frames: remaining }
+    : undefined
+  const action = enqueueAuthoritativeContext(binding, {
+    protocol_version: BRIDGE_PROTOCOL_VERSION, request_id: held.messageId,
+    voice_session_id: binding.voiceSessionId, dsh_session_id: binding.dshSessionId,
+    epoch: binding.epoch, context_revision: revision,
+    from_revision: held.fromRevision, frames: released,
+  }, held.update, held.messageId)
+  binding.heldContext = remainder
+  if ((binding.deferredRevision ?? 0) <= revision) binding.deferredRevision = undefined
+  return action
+}
+
+export function enqueueDeferredActivation(binding: Binding, activationId: string): boolean {
+  const held = binding.heldContext
+  if (!held) return false
+  const delivered = binding.pendingContext?.messageId === held.messageId
+    && binding.pendingContext.activationId === activationId
+    && ((binding.handle.agent.inbox.nextTurn ?? []).some((item: any) => item.id === held.messageId)
+      || (binding.claimedRevision ?? 0) >= held.revision)
+  if (delivered) {
+    binding.heldContext = undefined
+    binding.deferredRevision = undefined
+    return true
+  }
+  const pending: PendingContext = {
+    ...held, messageId: held.messageId, activationId,
+    deferredThrough: held.revision,
+  }
+  const previousPending = binding.pendingContext
+  const previousQueued = binding.queuedRevision
+  binding.pendingContext = pending
+  binding.queuedRevision = pending.revision
+  binding.queuedMessages?.set(pending.messageId, pending.revision)
+  try {
+    binding.handle.agent.followup(contextMessage(binding, pending))
+  } catch (error) {
+    if (!(binding.handle.agent.inbox.nextTurn ?? []).some((item: any) => item.id === pending.messageId)) {
+      binding.pendingContext = previousPending
+      binding.queuedRevision = previousQueued
+      binding.queuedMessages?.delete(pending.messageId)
+      throw error
+    }
+  }
+  binding.heldContext = undefined
+  binding.deferredRevision = undefined
+  console.info('[voice-shadow-bridge] context gate', {
+    action: 'next_turn', activation_id: activationId,
+    from_revision: pending.fromRevision, context_revision: pending.revision,
+    message_id: pending.messageId,
+  })
+  return true
 }
 
 function runtimeReminderMessage(binding: Binding, messageId: string, elapsedMs: number): Record<string, unknown> {
@@ -315,12 +426,27 @@ function reassertContextAfterCompaction(binding: Binding): void {
     since_revision: 0,
   }).then((value: any) => {
     if (value?.result !== 'accepted' || !Array.isArray(value.frames)) return
-    enqueueAuthoritativeContext(binding, {
-      protocol_version: BRIDGE_PROTOCOL_VERSION,
-      request_id: randomUUID(), voice_session_id: binding.voiceSessionId,
-      dsh_session_id: binding.dshSessionId, epoch: binding.epoch,
-      context_revision: binding.revision, frames: value.frames,
-    }, 'snapshot')
+    if (!binding.gateObserved) {
+      enqueueAuthoritativeContext(binding, {
+        protocol_version: BRIDGE_PROTOCOL_VERSION,
+        request_id: randomUUID(), voice_session_id: binding.voiceSessionId,
+        dsh_session_id: binding.dshSessionId, epoch: binding.epoch,
+        context_revision: binding.revision, frames: value.frames,
+      }, 'snapshot')
+      return
+    }
+    const guided = binding.claimedRevision ?? 0
+    if (guided <= 0) return
+    const pending: PendingContext = {
+      messageId: randomUUID(), update: 'snapshot',
+      fromRevision: 0, revision: guided,
+      frames: value.frames.filter((frame: any) => Number(frame?.revision ?? 0) <= guided),
+    }
+    binding.handle.agent.inject(contextMessage(binding, pending))
+    console.info('[voice-shadow-bridge] context merge', {
+      action: 'compaction_reassert', activation_id: binding.activationId ?? '',
+      context_revision: guided, message_id: pending.messageId,
+    })
   }).catch(() => undefined)
 }
 
@@ -557,6 +683,26 @@ export function apply(ctx: any, config: Config): void {
     }
   })
 
+  ctx.on('agent/inbox/claimed', ({ agent, message }: any) => {
+    const binding = bindings.get(String(agent?.id ?? ''))
+    const revision = binding?.queuedMessages?.get(String(message?.id ?? ''))
+    if (!binding || revision === undefined) return
+    binding.queuedMessages?.delete(String(message.id))
+    binding.claimedRevision = Math.max(binding.claimedRevision ?? 0, revision)
+    if (binding.gateObserved) console.info('[voice-shadow-bridge] context gate', {
+      action: 'claimed', activation_id: binding.activationId ?? '',
+      context_revision: binding.claimedRevision, message_id: message.id,
+    })
+    if (binding.gateObserved && binding.activationId) {
+      void callback('/api/internal/dsh-bridge/shadow.activity', {
+        request_id: randomUUID(), voice_session_id: binding.voiceSessionId,
+        dsh_session_id: binding.dshSessionId, epoch: binding.epoch,
+        context_revision: binding.revision, activation_id: binding.activationId,
+        claimed_revision: binding.claimedRevision, state: binding.agentState,
+      }).catch(() => undefined)
+    }
+  })
+
   ctx.on('agent/status', ({ agent, status }: any) => {
     const binding = bindings.get(String(agent?.id ?? ''))
     if (!binding || binding.state !== 'active') return
@@ -573,7 +719,8 @@ export function apply(ctx: any, config: Config): void {
       request_id: randomUUID(), voice_session_id: binding.voiceSessionId,
       dsh_session_id: binding.dshSessionId, epoch: binding.epoch,
       context_revision: binding.revision, activation_id: binding.activationId ?? '',
-      trace_revision: binding.traceRevision, state: String(status ?? ''),
+      trace_revision: binding.traceRevision, claimed_revision: binding.claimedRevision ?? 0,
+      state: String(status ?? ''),
     }).catch(() => undefined)
     void callback('/api/internal/dsh-bridge/mainline.activity', {
       dsh_session_id: binding.dshSessionId, epoch: binding.epoch,
@@ -603,7 +750,7 @@ export function apply(ctx: any, config: Config): void {
           const requestedReminderMs = Number(body.runtime_reminder_interval_ms)
           const reminderIntervalMs = Number.isSafeInteger(requestedReminderMs) && requestedReminderMs > 0
             ? requestedReminderMs : 20000
-          const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map(), reminderIntervalMs, nextReminderMs: reminderIntervalMs }
+          const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map(), queuedMessages: new Map(), reminderIntervalMs, nextReminderMs: reminderIntervalMs, queuedRevision: 0, claimedRevision: 0 }
           const preset = await ctx.agentPresets.resolve('shadow-agent')
           const modelSelection = ctx.agentDefaultModel.currentSelection()
           const setup = async (agentCtx: any) => { await ctx.agentPresets.mount(agentCtx, preset.id); installRootTools(agentCtx, binding) }
@@ -666,7 +813,11 @@ export function apply(ctx: any, config: Config): void {
           }
           else if (!isSnapshot && revision === existing.revision) response = result('conflict')
           else {
-            enqueueAuthoritativeContext(existing, body, isSnapshot ? 'snapshot' : 'delta')
+            if (body.guidance_delivery === 'hold') holdAuthoritativeContext(existing, body, isSnapshot ? 'snapshot' : 'delta')
+            else {
+              if (!existing.heldContext) existing.gateObserved = false
+              enqueueAuthoritativeContext(existing, body, isSnapshot ? 'snapshot' : 'delta')
+            }
             existing.revision = revision
             existing.contextDigest = contextDigest
             existing.traceRevision += 1
@@ -677,6 +828,25 @@ export function apply(ctx: any, config: Config): void {
             })
             response = result('accepted', { context_revision: revision })
           }
+        } else if (path === 'context.guidance') {
+          const revision = Number(body.context_revision)
+          const timing = String(body.timing ?? '')
+          if (!existing.activationId || body.activation_id !== existing.activationId
+              || !Number.isSafeInteger(revision) || revision > existing.revision
+              || !['inject_now', 'defer_once'].includes(timing)
+              || !existing.heldContext || existing.heldContext.fromRevision >= revision
+              || existing.heldContext.revision < revision) response = result('conflict')
+          else if (timing === 'defer_once') {
+            existing.deferredRevision = revision
+            console.info('[voice-shadow-bridge] context gate', {
+              action: 'deferred', activation_id: existing.activationId,
+              from_revision: existing.heldContext.fromRevision, context_revision: revision,
+            })
+            response = result('accepted', { queued_revision: existing.queuedRevision ?? 0, deferred_revision: revision })
+          } else {
+            const action = releaseHeldContext(existing, revision)
+            response = result('accepted', { queued_revision: existing.queuedRevision ?? 0, merge_action: action })
+          }
         } else if (path === 'wake') {
           const revision = Number(body.context_revision)
           if (revision !== existing.revision) response = revision < existing.revision ? result('stale') : result('resync_required')
@@ -684,9 +854,16 @@ export function apply(ctx: any, config: Config): void {
             existing.activationId = String(body.activation_id ?? '')
             existing.protocolRecoveryAttempted = false
             existing.protocolRecoveryPending = false
-            const wake = createBridgeUserMessage([{ type: 'text', text: `VOICE SHADOW ACTIVATION\nActivation: ${existing.activationId}\nRevision: ${existing.revision}\nJudge and execute the current task. End only with a Voice Bridge terminal tool.` }])
-            if (existing.handle.agent.status === 'idle') existing.handle.agent.followup(wake)
-            else existing.handle.agent.steer(wake)
+            existing.traceRevision += 1
+            existing.records.push({ trace_revision: existing.traceRevision, type: 'voice/activation', data: { activation_id: existing.activationId } })
+            if (existing.records.length > MAX_OBSERVER_RECORDS) existing.records.splice(0, existing.records.length - MAX_OBSERVER_RECORDS)
+            if (body.guidance_delivery === 'deferred_next_turn') {
+              if (!enqueueDeferredActivation(existing, existing.activationId)) throw new Error('deferred context missing')
+            } else {
+              const wake = createBridgeUserMessage([{ type: 'text', text: `VOICE SHADOW ACTIVATION\nActivation: ${existing.activationId}\nRevision: ${existing.revision}\nJudge and execute the current task. End only with a Voice Bridge terminal tool.` }])
+              if (existing.handle.agent.status === 'idle') existing.handle.agent.followup(wake)
+              else existing.handle.agent.steer(wake)
+            }
             armRuntimeReminder(existing)
             response = result('accepted')
           }
@@ -710,9 +887,9 @@ export function apply(ctx: any, config: Config): void {
             response = result('accepted', { dsh_session_id: existing.dshSessionId, message_id: occurrenceId })
           }
         } else if (path === 'session.cancel') {
-          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-cancel', { keepInbox: false }); existing.pendingContext = undefined; existing.pendingReminder = undefined; delete existing.activationId; response = result('accepted')
+          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-cancel', { keepInbox: false }); existing.pendingContext = undefined; existing.queuedMessages?.clear(); existing.heldContext = undefined; existing.deferredRevision = undefined; existing.pendingReminder = undefined; delete existing.activationId; response = result('accepted')
         } else if (path === 'session.retire') {
-          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-retire', { keepInbox: false }); existing.pendingContext = undefined; existing.pendingReminder = undefined; existing.state = 'retired'; delete existing.activationId
+          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-retire', { keepInbox: false }); existing.pendingContext = undefined; existing.queuedMessages?.clear(); existing.heldContext = undefined; existing.deferredRevision = undefined; existing.pendingReminder = undefined; existing.state = 'retired'; delete existing.activationId
           ctx.sessionTitle.rename(existing.handle.agent.session, `Voice Shadow · ${existing.voiceSessionId.slice(0, 8)} · epoch ${existing.epoch} · retired`)
           response = result('accepted')
         } else if (path === 'session.state') {
@@ -721,7 +898,11 @@ export function apply(ctx: any, config: Config): void {
             context_revision: existing.revision,
             activation_id: existing.activationId ?? '',
             terminal: !existing.activationId,
-            agent_state: existing.agentState,
+            agent_state: existing.handle.agent.status,
+            ready_for_handoff: !existing.activationId && existing.handle.agent.status === 'idle',
+            queued_revision: existing.queuedRevision ?? 0,
+            claimed_revision: existing.claimedRevision ?? 0,
+            deferred_revision: existing.deferredRevision ?? 0,
           })
         } else if (path === 'session.context') {
           const budget = { chars: 100_000 }

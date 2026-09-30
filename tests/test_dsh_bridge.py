@@ -160,6 +160,77 @@ class ObserverClient(FakeClient):
         return {"protocol_version": "2.0", "result": "accepted"}
 
 
+class GateClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.activation_id = ""
+        self.synced_revision = 0
+        self.queued_revision = 0
+        self.deferred_revision = 0
+
+    async def call(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((operation, payload))
+        if operation in {"context.snapshot", "context.update"}:
+            self.synced_revision = int(payload["context_revision"])
+            if payload.get("guidance_delivery") != "hold":
+                self.queued_revision = self.synced_revision
+        elif operation == "wake":
+            self.activation_id = str(payload["activation_id"])
+            if payload.get("guidance_delivery") == "deferred_next_turn":
+                self.queued_revision = self.synced_revision
+                self.deferred_revision = 0
+        elif operation == "context.guidance":
+            if payload["timing"] == "defer_once":
+                self.deferred_revision = int(payload["context_revision"])
+            else:
+                self.queued_revision = int(payload["context_revision"])
+                self.deferred_revision = 0
+        elif operation == "observer.snapshot":
+            return {"result": "accepted", "records": [
+                {"type": "voice/activation", "data": {"activation_id": self.activation_id}},
+                {"type": "step/end", "data": {"committed": True}},
+            ]}
+        elif operation == "session.state":
+            return {"result": "accepted", "context_revision": self.synced_revision,
+                    "activation_id": self.activation_id,
+                    "queued_revision": self.queued_revision,
+                    "deferred_revision": self.deferred_revision,
+                    "ready_for_handoff": not self.activation_id}
+        return {"protocol_version": "2.0", "result": "accepted"}
+
+
+class LostGuidanceResponseClient(GateClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lost_response = False
+
+    async def call(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = await super().call(operation, payload)
+        if operation == "context.guidance" and not self.lost_response:
+            self.lost_response = True
+            raise DshBridgeError(
+                "DSH Bridge transport failed: TimeoutError",
+                operation=operation, request_id=str(payload.get("request_id")),
+                transport=True,
+            )
+        return response
+
+
+class GateProvider:
+    def __init__(self, verdicts: list[str]) -> None:
+        self.verdicts = verdicts
+        self.calls = 0
+
+    async def complete(self, **kwargs: Any) -> ShadowProviderResponse:
+        self.calls += 1
+        timing = self.verdicts.pop(0)
+        relation = "irrelevant" if timing == "defer_once" else "change"
+        return ShadowProviderResponse(output=({"type": "message", "content": [{
+            "type": "output_text",
+            "text": json.dumps({"timing": timing, "relation": relation, "reason": "fixture"}),
+        }]},), usage={})
+
+
 class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -200,6 +271,201 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(names.count("context.snapshot"), 1)
         self.assertEqual(names.count("context.update"), 0)
         self.assertEqual(names.count("wake"), 1)
+
+    async def test_dsh_gate_can_defer_repeatedly_then_handoff_and_guide_new_answer(self) -> None:
+        context = MutableContext()
+        client = GateClient()
+        provider = GateProvider(["defer_once", "defer_once", "inject_now"])
+        session = DshShadowAgentSession(
+            client=client,  # type: ignore[arg-type]
+            mapping_store=DshMappingStore(Path(self.temp.name) / "gate.json"),
+            context_source=context, voice_session_id="gate-session",
+            workspace=Path(self.temp.name), gate_provider=provider, status_provider=None,
+        )
+        session.set_context_gate_enabled(True)
+        self.assertEqual(await session.request_wake(), "started")
+        first_activation = session.activation_id
+        self.assertEqual(provider.calls, 0)
+        context.advance("irrelevant while working")
+        with self.assertLogs("voice_terminal.dsh.bridge", level="INFO") as gate_logs:
+            self.assertEqual(await session.request_wake(), "coalesced")
+        self.assertIn("dsh.context_gate requested", "\n".join(gate_logs.output))
+        self.assertIn("timing=defer_once", "\n".join(gate_logs.output))
+        self.assertEqual(await session.request_wake(), "coalesced")
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual([payload["timing"] for name, payload in client.calls
+                          if name == "context.guidance"], ["defer_once", "defer_once"])
+        self.assertEqual([payload.get("guidance_delivery") for name, payload in client.calls
+                          if name == "context.update"], ["hold"])
+        terminal = {
+            "protocol_version": "2.0", "request_id": "request-gate-terminal",
+            "event_id": "event-gate-terminal", "voice_session_id": "gate-session",
+            "dsh_session_id": session.dsh_session_id, "epoch": 1,
+            "context_revision": 3, "activation_id": first_activation,
+            "event": {"type": "input_required", "question": "Need an answer?", "options": []},
+        }
+        self.assertEqual(await session.accept_event(terminal), "accepted")
+        client.activation_id = ""
+        for _ in range(50):
+            if session.activation_id is not None:
+                break
+            await asyncio.sleep(0.01)
+        self.assertIsNotNone(session.activation_id)
+        self.assertNotEqual(session.activation_id, first_activation)
+        second_wake = [payload for name, payload in client.calls if name == "wake"][-1]
+        self.assertEqual(second_wake.get("guidance_delivery"), "deferred_next_turn")
+        self.assertEqual(await session.accept_event(terminal), "duplicate")
+        self.assertEqual([name for name, _ in client.calls].count("wake"), 2)
+        self.assertEqual(await session.accept_activity({
+            "protocol_version": "2.0", "voice_session_id": "gate-session",
+            "dsh_session_id": session.dsh_session_id, "epoch": 1,
+            "context_revision": 3, "activation_id": session.activation_id,
+            "claimed_revision": 3, "state": "running",
+        }), "accepted")
+        self.assertEqual(session.last_claimed_revision, 3)
+        context.advance("user answer changes the task")
+        self.assertEqual(await session.request_wake(), "coalesced")
+        self.assertEqual(provider.calls, 3)
+        self.assertEqual([payload["timing"] for name, payload in client.calls
+                          if name == "context.guidance"][-1], "inject_now")
+        self.assertEqual(session.last_guided_revision, 4)
+        await session.close()
+
+    async def test_disabling_dsh_gate_flushes_pending_context_then_stays_direct(self) -> None:
+        context = MutableContext()
+        client = GateClient()
+        provider = GateProvider(["defer_once"])
+        session = DshShadowAgentSession(
+            client=client,  # type: ignore[arg-type]
+            mapping_store=DshMappingStore(Path(self.temp.name) / "gate-disable.json"),
+            context_source=context, voice_session_id="gate-disable-session",
+            workspace=Path(self.temp.name), gate_provider=provider,
+        )
+        session.set_context_gate_enabled(True)
+        await session.request_wake()
+        context.advance("defer then disable")
+        await session.request_wake()
+        session.set_context_gate_enabled(False)
+        await session.flush_context_gate()
+        self.assertEqual(session.last_guided_revision, 3)
+        self.assertEqual([payload["timing"] for name, payload in client.calls
+                          if name == "context.guidance"], ["defer_once", "inject_now"])
+        context.advance("direct again")
+        await session.request_wake()
+        self.assertEqual(provider.calls, 1)
+        self.assertNotIn("guidance_delivery", [payload for name, payload in client.calls
+                                               if name == "context.update"][-1])
+        await session.close()
+
+    async def test_lost_guidance_response_uses_state_without_replaying_decision(self) -> None:
+        context = MutableContext()
+        client = LostGuidanceResponseClient()
+        session = DshShadowAgentSession(
+            client=client,  # type: ignore[arg-type]
+            mapping_store=DshMappingStore(Path(self.temp.name) / "gate-lost-response.json"),
+            context_source=context, voice_session_id="gate-lost-response",
+            workspace=Path(self.temp.name), gate_provider=GateProvider(["defer_once"]),
+        )
+        session.set_context_gate_enabled(True)
+        await session.request_wake()
+        context.advance("delay despite lost response")
+        self.assertEqual(await session.request_wake(), "coalesced")
+        self.assertTrue(client.lost_response)
+        self.assertEqual(client.deferred_revision, 3)
+        self.assertEqual(session.snapshot()["context_gate"]["deferred_revision"], 3)
+        self.assertEqual([name for name, _ in client.calls].count("context.guidance"), 1)
+        await session.close()
+
+    async def test_deferred_context_handoff_works_for_other_terminal_kinds(self) -> None:
+        terminal_bodies = [
+            {"type": "result", "text": "Done"},
+            {"type": "no_action", "reason": "No action"},
+            {"type": "failed", "message": "Infrastructure error", "code": "fixture", "infrastructure": True},
+        ]
+        for index, body in enumerate(terminal_bodies):
+            context = MutableContext()
+            client = GateClient()
+            session = DshShadowAgentSession(
+                client=client,  # type: ignore[arg-type]
+                mapping_store=DshMappingStore(Path(self.temp.name) / f"gate-terminal-{index}.json"),
+                context_source=context, voice_session_id=f"gate-terminal-{index}",
+                workspace=Path(self.temp.name), gate_provider=GateProvider(["defer_once"]),
+            )
+            session.set_context_gate_enabled(True)
+            await session.request_wake()
+            first = session.activation_id
+            context.advance("delayed")
+            await session.request_wake()
+            event = {
+                "protocol_version": "2.0", "request_id": f"request-kind-{index}",
+                "event_id": f"event-kind-{index}", "voice_session_id": f"gate-terminal-{index}",
+                "dsh_session_id": session.dsh_session_id, "epoch": 1,
+                "context_revision": 3, "activation_id": first, "event": body,
+            }
+            self.assertEqual(await session.accept_event(event), "accepted")
+            client.activation_id = ""
+            for _ in range(50):
+                if session.activation_id is not None:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIsNotNone(session.activation_id)
+            self.assertNotEqual(session.activation_id, first)
+            self.assertEqual([name for name, _ in client.calls].count("wake"), 2)
+            await session.close()
+
+    async def test_deferred_gate_state_restores_as_new_activation(self) -> None:
+        context = MutableContext()
+        store = DshMappingStore(Path(self.temp.name) / "gate-restore.json")
+        first_client = GateClient()
+        first = DshShadowAgentSession(
+            client=first_client,  # type: ignore[arg-type]
+            mapping_store=store, context_source=context,
+            voice_session_id="gate-restore-session", workspace=Path(self.temp.name),
+            gate_provider=GateProvider(["defer_once"]),
+        )
+        first.set_context_gate_enabled(True)
+        await first.request_wake()
+        old_activation = first.activation_id
+        context.advance("recover after restart")
+        await first.request_wake()
+        await first.close()
+        second_client = GateClient()
+        second = DshShadowAgentSession(
+            client=second_client,  # type: ignore[arg-type]
+            mapping_store=store, context_source=context,
+            voice_session_id="gate-restore-session", workspace=Path(self.temp.name),
+        )
+        second.set_context_gate_enabled(True)
+        await second.resume_pending_gate()
+        for _ in range(50):
+            if second.activation_id is not None:
+                break
+            await asyncio.sleep(0.01)
+        self.assertIsNotNone(second.activation_id)
+        self.assertNotEqual(second.activation_id, old_activation)
+        wake = [payload for name, payload in second_client.calls if name == "wake"][-1]
+        self.assertEqual(wake.get("guidance_delivery"), "deferred_next_turn")
+        self.assertEqual(second.last_guided_revision, 3)
+        await second.close()
+
+    async def test_disabled_dsh_gate_uses_original_update_path(self) -> None:
+        context = MutableContext()
+        client = GateClient()
+        provider = GateProvider(["defer_once"])
+        session = DshShadowAgentSession(
+            client=client,  # type: ignore[arg-type]
+            mapping_store=DshMappingStore(Path(self.temp.name) / "gate-off.json"),
+            context_source=context, voice_session_id="gate-off-session",
+            workspace=Path(self.temp.name), gate_provider=provider,
+        )
+        await session.request_wake()
+        context.advance("straight through")
+        await session.request_wake()
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual([name for name, _ in client.calls].count("context.guidance"), 0)
+        update = next(payload for name, payload in client.calls if name == "context.update")
+        self.assertNotIn("guidance_delivery", update)
+        await session.close()
 
     async def test_custom_runtime_reminder_interval_is_sent_when_opening(self) -> None:
         session = DshShadowAgentSession(

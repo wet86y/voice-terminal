@@ -26,6 +26,7 @@ from ..shadow_agent.contracts import (
 from ..shadow_agent.manager import ShadowContextSource
 from ..shadow_agent.manager import ShadowStatusObserver
 from ..shadow_agent.provider import ShadowProvider, ShadowProviderError, ShadowProviderResponse
+from ..shadow_agent.projection import _text_from_output
 
 
 BRIDGE_PROTOCOL_VERSION = "2.0"
@@ -35,6 +36,13 @@ _STATUS_OBSERVER_INSTRUCTIONS = (
     "You are the isolated, read-only Voice Terminal Shadow status observer. "
     "Summarize only the committed ObserverSnapshot supplied in the request. "
     "Never use tools, continue the task, or expose private reasoning."
+)
+_DSH_CONTEXT_GATE_PROMPT = (
+    "你是 DSH Shadow 的侧载引导时机判断器。候选权威正文已经同步到 DSH；"
+    "只判断是否要在当前激活中主动引导代理注意它。补充事实、条件变化、意图偏移、"
+    "用户回答及不确定情况一律 inject_now；只有明确无关或完全重复时才可 defer_once。"
+    "defer_once 仅推迟本次引导，下一次请求可以重新判断同一区间。"
+    "不得改写正文、执行任务、生成指令或控制语音；严格按给定 JSON Schema 输出。"
 )
 BridgeResult = Literal[
     "accepted", "duplicate", "stale", "resync_required", "conflict",
@@ -177,6 +185,9 @@ class DshSessionMapping:
     created_at: float  # 创建时间：本地映射创建时间戳。
     updated_at: float  # 更新时间：本地映射最后写入时间戳。
     retired_at: float | None = None  # 退役时间：绑定退役时记录的时间戳。
+    gate_queued_revision: int = 0  # 已排队引导版本：与已同步版本分离。
+    gate_claimed_revision: int = 0  # 已领取引导版本：供恢复与诊断使用。
+    gate_deferred_revision: int = 0  # 暂缓版本：重启后从权威正文重建下一激活。
 
 
 class DshMappingStore:
@@ -334,6 +345,22 @@ class DshBridgeClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
                 raw = response.read(2 * 1024 * 1024 + 1)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read(2 * 1024 * 1024 + 1)
+            if 400 <= exc.code < 500 and len(raw) <= 2 * 1024 * 1024:
+                try:
+                    rejected = json.loads(raw)
+                except ValueError:
+                    rejected = None
+                if (isinstance(rejected, dict)
+                        and rejected.get("protocol_version") == BRIDGE_PROTOCOL_VERSION
+                        and isinstance(rejected.get("result"), str)):
+                    return rejected
+            request_id = str((payload or {}).get("request_id") or "")
+            raise DshBridgeError(
+                f"DSH Bridge HTTP failure: {exc.code}", operation=operation,
+                request_id=request_id, transport=exc.code >= 500,
+            ) from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             request_id = str((payload or {}).get("request_id") or "")
             raise DshBridgeError(
@@ -365,6 +392,7 @@ class DshShadowAgentSession:
         production_sink: EventSink | None = None,
         activity_sink: ActivitySink | None = None,
         status_provider: ShadowProvider | None = None,
+        gate_provider: ShadowProvider | None = None,
         observer_every_steps: int = 5,
         observer_max_output_tokens: int = 512,
         observer_timeout_ms: int | None = None,
@@ -381,6 +409,7 @@ class DshShadowAgentSession:
         self.production_sink = production_sink
         self.activity_sink = activity_sink
         self.status_provider = status_provider
+        self.gate_provider = gate_provider or status_provider
         self.availability_waiter = availability_waiter
         self.runtime_reminder_interval_ms = int(runtime_reminder_interval_ms)
         self.observer_every_steps = max(1, int(observer_every_steps))
@@ -391,6 +420,13 @@ class DshShadowAgentSession:
         self.dsh_session_id = f"voice-shadow-{uuid.uuid4()}"
         self.epoch = int(context_source.shadow_context_epoch)
         self.last_applied_revision = -1
+        self.last_guided_revision = 0
+        self.last_claimed_revision = 0
+        self._deferred_revision = 0
+        self._gate_requested_revision = 0
+        self._gate_enabled = False
+        self._gate_generation = 0
+        self._handoff_task: asyncio.Task[None] | None = None
         self.activation_id: str | None = None
         self._opened = False
         self._retired = False
@@ -418,9 +454,53 @@ class DshShadowAgentSession:
     def available(self) -> bool:
         return not self._retired
 
-    def set_context_gate_enabled(self, _enabled: bool) -> bool:
-        """DSH deliberately ignores the legacy native-only context gate."""
-        return False
+    def set_context_gate_enabled(self, enabled: bool) -> bool:
+        value = bool(enabled)
+        if self._gate_enabled != value:
+            self._gate_enabled = value
+            self._gate_generation += 1
+            log.info("dsh.context_gate toggle voice_session_id=%s enabled=%s generation=%s",
+                     self.voice_session_id, value, self._gate_generation)
+        return self._gate_enabled
+
+    async def resume_pending_gate(self) -> None:
+        mapping = await self.mapping_store.load(self.voice_session_id)
+        if mapping is None or mapping.backend != "dsh" or mapping.epoch != self.epoch:
+            return
+        if mapping.gate_deferred_revision <= 0:
+            return
+        self.last_guided_revision = mapping.gate_queued_revision
+        self.last_claimed_revision = mapping.gate_claimed_revision
+        self._deferred_revision = mapping.gate_deferred_revision
+        log.info("dsh.context_gate restore voice_session_id=%s queued_revision=%s deferred_revision=%s",
+                 self.voice_session_id, self.last_guided_revision,
+                 self._deferred_revision)
+        self._schedule_handoff()
+
+    async def flush_context_gate(self) -> None:
+        """Release one pending interval before the disabled path resumes."""
+        async with self._wake_lock:
+            if not self._opened:
+                return
+            if int(self.context_source.shadow_input_revision) > self.last_applied_revision:
+                await self._sync_context(hold=(
+                    self.last_applied_revision > self.last_guided_revision
+                    or self._deferred_revision > 0
+                ))
+            if self.last_applied_revision <= self.last_guided_revision:
+                return
+            target = self.last_applied_revision
+            if self.activation_id is not None:
+                await self._send_guidance("inject_now", target, self.activation_id)
+                self.last_guided_revision = target
+                self._deferred_revision = 0
+                await self._save_mapping(state="active")
+                log.info("dsh.context_gate released_on_disable voice_session_id=%s activation_id=%s queued_revision=%s target=next_step",
+                         self.voice_session_id, self.activation_id, target)
+                return
+            self._deferred_revision = target
+            await self._save_mapping(state="idle")
+        await self.request_wake()
 
     def replace_context_source(self, source: ShadowContextSource) -> None:
         self.context_source = source
@@ -477,8 +557,14 @@ class DshShadowAgentSession:
                 return "unavailable"
             await self._ensure_open()
             was_active = self.activation_id is not None
+            deferred_handoff = not was_active and self._deferred_revision > 0
+            if was_active and self._gate_enabled:
+                self._gate_requested_revision = max(
+                    self._gate_requested_revision,
+                    int(self.context_source.shadow_input_revision),
+                )
             try:
-                await self._sync_context()
+                await self._sync_context(hold=self._gate_enabled and was_active or deferred_handoff)
             except DshBridgeError as exc:
                 if not was_active or not exc.transport:
                     raise
@@ -491,7 +577,15 @@ class DshShadowAgentSession:
                 )
                 self._schedule_context_resync()
                 return "coalesced"
+            deferred_handoff = self.activation_id is None and self._deferred_revision > 0
+            if was_active and self.activation_id is None and self.last_applied_revision > self.last_guided_revision:
+                self._deferred_revision = max(self._deferred_revision, self.last_applied_revision)
+                deferred_handoff = True
             if self.activation_id is not None:
+                if self._gate_enabled:
+                    await self._judge_running_context()
+                return "coalesced"
+            if deferred_handoff and not await self._wait_handoff_idle():
                 return "coalesced"
             revision = self.last_applied_revision
             activation = str(uuid.uuid4())
@@ -500,6 +594,7 @@ class DshShadowAgentSession:
                     request_id=str(uuid.uuid4()),
                     context_revision=revision,
                     activation_id=activation,
+                    **({"guidance_delivery": "deferred_next_turn"} if deferred_handoff else {}),
                 ), expected_activation_id=activation)
                 code = str(response.get("result"))
                 if code not in {"accepted", "duplicate"}:
@@ -507,12 +602,185 @@ class DshShadowAgentSession:
                         return "already_current"
                     raise DshBridgeError(f"DSH wake rejected: {code}")
                 self.activation_id = activation
+                if deferred_handoff:
+                    log.info("dsh.context_gate handoff voice_session_id=%s old_activation_id=%s new_activation_id=%s queued_revision=%s",
+                             self.voice_session_id, self._last_terminal_activation_id,
+                             activation, revision)
+                    self.last_guided_revision = revision
+                    self._deferred_revision = 0
+                    self._gate_requested_revision = 0
+                else:
+                    self.last_guided_revision = max(self.last_guided_revision, revision)
                 self._run_seq += 1
                 self._waiting_user = False
+                self._visible_status = ""
                 await self._save_mapping(state="active")
             await self._activity("running", activation_id=activation, context_revision=revision)
             self._schedule_observer(force=True)
             return "started" if code == "accepted" else "coalesced"
+
+    async def _wait_handoff_idle(self) -> bool:
+        deadline = asyncio.get_running_loop().time() + 30
+        while self.available and self._deferred_revision:
+            try:
+                state = await self._session_state()
+                if state.get("ready_for_handoff") is True:
+                    return True
+            except DshBridgeError as exc:
+                log.warning("dsh.context_gate handoff_state_failed voice_session_id=%s error_type=%s",
+                            self.voice_session_id, type(exc).__name__)
+            if asyncio.get_running_loop().time() >= deadline:
+                log.warning("dsh.context_gate handoff_wait_timeout voice_session_id=%s deferred_revision=%s",
+                            self.voice_session_id, self._deferred_revision)
+                return False
+            await asyncio.sleep(0.1)
+        return False
+
+    async def _send_guidance(self, timing: str, revision: int, activation_id: str) -> None:
+        payload = self._envelope(
+            request_id=str(uuid.uuid4()), activation_id=activation_id,
+            context_revision=revision, timing=timing,
+        )
+        for attempt in range(2):
+            try:
+                response = await self.client.call("context.guidance", payload)
+                code = response.get("result")
+                if code == "duplicate" and isinstance(response.get("original"), dict):
+                    code = response["original"].get("result")
+                if code == "accepted":
+                    return
+                raise DshBridgeError(f"DSH context guidance rejected: {code}")
+            except DshBridgeError as exc:
+                if not exc.transport:
+                    raise
+                try:
+                    state = await self._session_state()
+                    key = "deferred_revision" if timing == "defer_once" else "queued_revision"
+                    if int(state.get(key) or 0) >= revision:
+                        return
+                except DshBridgeError:
+                    pass
+                if attempt:
+                    raise
+
+    async def _judge_running_context(self) -> None:
+        target = self.last_applied_revision
+        if target <= self.last_guided_revision:
+            return
+        activation_id = self.activation_id
+        if activation_id is None:
+            return
+        generation = self._gate_generation
+        epoch = self.epoch
+        raw = self.context_source.shadow_context_update(
+            self.last_guided_revision, epoch=epoch,
+        )
+        frames = tuple(frame for frame in raw.frames if self.last_guided_revision < frame.revision <= target)
+        started = time.monotonic()
+        timing = "inject_now"
+        relation = "uncertain"
+        failure = ""
+        log.info("dsh.context_gate requested voice_session_id=%s activation_id=%s from_revision=%s target_revision=%s frame_count=%s",
+                 self.voice_session_id, activation_id, self.last_guided_revision,
+                 target, len(frames))
+        try:
+            if not frames:
+                raise ValueError("empty_interval")
+            if self.gate_provider is None:
+                raise ValueError("provider_unavailable")
+            snapshot = await self.client.call("observer.snapshot", self._envelope(
+                request_id=str(uuid.uuid4()), activation_id=activation_id,
+                context_revision=target, trace_revision=0,
+            ))
+            records = snapshot.get("records")
+            if snapshot.get("result") != "accepted" or not isinstance(records, list):
+                raise ValueError("snapshot_unavailable")
+            starts = [index for index, item in enumerate(records)
+                      if isinstance(item, dict) and item.get("type") == "voice/activation"
+                      and isinstance(item.get("data"), dict)
+                      and item["data"].get("activation_id") == activation_id]
+            if not starts:
+                raise ValueError("activation_trace_unavailable")
+            current_records = records[starts[-1] + 1:][-80:]
+            status = self._visible_status
+            if not current_records and not status:
+                raise ValueError("current_status_unavailable")
+            schema = {
+                "type": "object", "additionalProperties": False,
+                "required": ["timing", "relation", "reason"],
+                "properties": {
+                    "timing": {"type": "string", "enum": ["inject_now", "defer_once"]},
+                    "relation": {"type": "string", "enum": [
+                        "supplement", "change", "deviation", "guidance",
+                        "irrelevant", "duplicate", "uncertain",
+                    ]},
+                    "reason": {"type": "string", "maxLength": 240},
+                },
+            }
+            body = {"shadow_summary": status,
+                    "committed_trace": current_records,
+                    "candidate": {"from_revision": self.last_guided_revision,
+                                  "to_revision": target,
+                                  "frames": [_frame(item) for item in frames]}}
+            serialized = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+            if len(serialized) > 24000:
+                raise ValueError("candidate_too_large")
+            response = await asyncio.wait_for(self.gate_provider.complete(
+                instructions=_DSH_CONTEXT_GATE_PROMPT,
+                input_items=[{"role": "user", "content": serialized}],
+                tools=[], reasoning_effort="none", text_schema=schema,
+                max_output_tokens=256,
+            ), timeout=15)
+            verdict = json.loads(_text_from_output(response.output))
+            if not isinstance(verdict, dict) or set(verdict) != {"timing", "relation", "reason"}:
+                raise ValueError("invalid_verdict")
+            relation = str(verdict["relation"])
+            if relation not in {"supplement", "change", "deviation", "guidance", "irrelevant", "duplicate", "uncertain"}:
+                raise ValueError("invalid_relation")
+            if not isinstance(verdict["reason"], str) or len(verdict["reason"]) > 240:
+                raise ValueError("invalid_reason")
+            if verdict["timing"] == "defer_once" and relation in {"irrelevant", "duplicate"}:
+                timing = "defer_once"
+            elif verdict["timing"] != "inject_now":
+                raise ValueError("invalid_timing")
+            if relation == "uncertain":
+                failure = "uncertain"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failure = type(exc).__name__ if not isinstance(exc, ValueError) else str(exc)
+            timing = "inject_now"
+        elapsed = round((time.monotonic() - started) * 1000, 2)
+        if epoch != self.epoch or generation != self._gate_generation or activation_id != self.activation_id:
+            log.info("dsh.context_gate stale voice_session_id=%s old_activation_id=%s current_activation_id=%s target_revision=%s elapsed_ms=%s",
+                     self.voice_session_id, activation_id, self.activation_id, target, elapsed)
+            if epoch != self.epoch or not self._opened or self._retired or (
+                generation != self._gate_generation and self.activation_id is None
+                and self._deferred_revision == 0
+            ):
+                return
+            if self.activation_id is None:
+                self._deferred_revision = max(self._deferred_revision, target)
+                self._schedule_handoff()
+                return
+            timing = "inject_now"
+            activation_id = self.activation_id
+        if failure:
+            log.warning("dsh.context_gate fail_open voice_session_id=%s activation_id=%s target_revision=%s reason=%s elapsed_ms=%s",
+                        self.voice_session_id, activation_id, target, failure, elapsed)
+        await self._send_guidance(timing, target, activation_id)
+        if timing == "inject_now":
+            self.last_guided_revision = target
+            self._deferred_revision = 0
+            if self._gate_requested_revision <= target:
+                self._gate_requested_revision = 0
+        else:
+            self._deferred_revision = target
+        await self._save_mapping(state="active")
+        log.info("dsh.context_gate decided voice_session_id=%s activation_id=%s from_revision=%s target_revision=%s timing=%s relation=%s elapsed_ms=%s",
+                 self.voice_session_id, activation_id,
+                 raw.from_revision if isinstance(raw, ShadowContextUpdate) else 0,
+                 target, timing, relation, elapsed)
 
     async def _ensure_open(self) -> None:
         if self._opened:
@@ -522,10 +790,23 @@ class DshShadowAgentSession:
             self._mapping_checked = True
             mapping = await self.mapping_store.load(self.voice_session_id)
             if mapping is not None and mapping.backend == "dsh" and mapping.epoch == self.epoch:
+                if mapping.gate_deferred_revision > 0 and mapping.state != "retired" and mapping.dsh_session_id != self.dsh_session_id:
+                    retired = await self.client.call("session.retire", {
+                        "request_id": str(uuid.uuid4()),
+                        "voice_session_id": self.voice_session_id,
+                        "dsh_session_id": mapping.dsh_session_id,
+                        "epoch": self.epoch,
+                    })
+                    if retired.get("result") not in {"accepted", "duplicate", "not_found", "stale"}:
+                        raise DshBridgeError("previous DSH activation could not be retired before gate recovery")
                 self._last_terminal_activation_id = mapping.last_terminal_activation_id
                 self._last_terminal_dsh_session_id = mapping.last_terminal_dsh_session_id
                 self._last_terminal_event_id = mapping.last_terminal_event_id
                 self._last_terminal_event_digest = mapping.last_terminal_event_digest
+                self._deferred_revision = max(self._deferred_revision, mapping.gate_deferred_revision)
+                if mapping.gate_deferred_revision:
+                    self.last_guided_revision = mapping.gate_queued_revision
+                    self.last_claimed_revision = mapping.gate_claimed_revision
         response = await self._call_reconciled(
             operation,
             self._envelope(
@@ -539,12 +820,13 @@ class DshShadowAgentSession:
         self._opened = True
         await self._save_mapping(state="active")
 
-    async def _sync_context(self, *, force_snapshot: bool = False) -> None:
+    async def _sync_context(self, *, force_snapshot: bool = False, hold: bool = False) -> None:
         current_epoch = int(self.context_source.shadow_context_epoch)
         if current_epoch != self.epoch:
             await self.reset()
             await self._ensure_open()
             force_snapshot = True
+            hold = False
         current_revision = int(self.context_source.shadow_input_revision)
         if not force_snapshot and current_revision == self.last_applied_revision:
             return
@@ -566,6 +848,8 @@ class DshShadowAgentSession:
                 frames=[_frame(item) for item in update.frames],
             )
         payload["request_id"] = str(uuid.uuid4())
+        if hold:
+            payload["guidance_delivery"] = "hold"
         async with self._event_lock:
             response = await self._call_reconciled(
                 operation, payload, expected_context_revision=int(payload["context_revision"]),
@@ -575,12 +859,19 @@ class DshShadowAgentSession:
                 raise DshBridgeError(f"DSH context rejected: {result}")
             if result != "resync_required":
                 self.last_applied_revision = int(payload["context_revision"])
+                if not hold:
+                    self.last_guided_revision = max(self.last_guided_revision, self.last_applied_revision)
+                elif self._gate_enabled:
+                    log.info("dsh.context_gate synced voice_session_id=%s activation_id=%s from_revision=%s synced_revision=%s queued_revision=%s delivery=hold",
+                             self.voice_session_id, self.activation_id,
+                             payload.get("from_revision", 0), self.last_applied_revision,
+                             self.last_guided_revision)
                 mapping_state = "active" if self.activation_id is not None else (
                     "waiting_user" if self._waiting_user else "idle"
                 )
                 await self._save_mapping(state=mapping_state)
         if result == "resync_required" and operation != "context.snapshot":
-            await self._sync_context(force_snapshot=True)
+            await self._sync_context(force_snapshot=True, hold=hold)
             return
         if result == "resync_required":
             raise DshBridgeError("DSH context snapshot requires resynchronization")
@@ -663,7 +954,7 @@ class DshShadowAgentSession:
             try:
                 async with self._wake_lock:
                     if self.available and self.activation_id is not None:
-                        await self._sync_context()
+                        await self._sync_context(hold=self._gate_enabled)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -677,7 +968,35 @@ class DshShadowAgentSession:
             resync(), name=f"dsh-context-resync-{self.voice_session_id[:12]}",
         )
 
+    def _schedule_handoff(self) -> None:
+        if self._handoff_task is not None and not self._handoff_task.done():
+            return
+
+        async def drain() -> None:
+            while self.available and self._deferred_revision > 0 and self.activation_id is None:
+                try:
+                    await self.request_wake()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("dsh.context_gate handoff_retry voice_session_id=%s deferred_revision=%s error_type=%s",
+                                self.voice_session_id, self._deferred_revision, type(exc).__name__)
+                if self._deferred_revision > 0:
+                    await asyncio.sleep(1)
+
+        self._handoff_task = asyncio.create_task(
+            drain(), name=f"dsh-gate-handoff-{self.voice_session_id[:12]}",
+        )
+
+    async def _stop_handoff(self) -> None:
+        task = self._handoff_task
+        self._handoff_task = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def reset(self, *, strict: bool = False) -> None:
+        await self._stop_handoff()
         await self._stop_context_resync()
         await self._stop_observer()
         async with self._event_lock:
@@ -691,6 +1010,11 @@ class DshShadowAgentSession:
             self.dsh_session_id = f"voice-shadow-{uuid.uuid4()}"
             self.epoch = int(self.context_source.shadow_context_epoch)
             self.last_applied_revision = -1
+            self.last_guided_revision = 0
+            self.last_claimed_revision = 0
+            self._deferred_revision = 0
+            self._gate_requested_revision = 0
+            self._gate_generation += 1
             self.activation_id = None
             self._opened = False
             self._mapping_checked = True
@@ -706,6 +1030,7 @@ class DshShadowAgentSession:
             self._visible_status = ""
 
     async def cancel(self) -> None:
+        await self._stop_handoff()
         await self._stop_context_resync()
         async with self._event_lock:
             if self._opened and not self._retired:
@@ -715,9 +1040,14 @@ class DshShadowAgentSession:
                     pass
             self.activation_id = None
             self._waiting_user = False
+            self._deferred_revision = 0
+            self._gate_requested_revision = 0
+            self.last_guided_revision = self.last_applied_revision
+            self._gate_generation += 1
         await self._activity("cancelled")
 
     async def close(self) -> None:
+        await self._stop_handoff()
         await self._stop_context_resync()
         await self._stop_observer()
         async with self._event_lock:
@@ -729,6 +1059,13 @@ class DshShadowAgentSession:
                 await self._save_mapping(state="retired", retired=True)
             self._retired = True
             self.activation_id = None
+        providers = [self.status_provider]
+        if self.gate_provider is not self.status_provider:
+            providers.append(self.gate_provider)
+        for provider in providers:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                await close()
 
     async def accept_event(self, payload: dict[str, Any]) -> BridgeResult:
         async with self._event_lock:
@@ -787,6 +1124,13 @@ class DshShadowAgentSession:
                 self._accepted_requests.pop(next(iter(self._accepted_requests)))
 
             if terminal:
+                if self._gate_enabled and max(
+                    self._gate_requested_revision, self.last_applied_revision,
+                ) > self.last_guided_revision:
+                    self._deferred_revision = max(
+                        self._deferred_revision, self._gate_requested_revision,
+                        self.last_applied_revision,
+                    )
                 self._last_terminal_activation_id = activation_id
                 self._last_terminal_dsh_session_id = self.dsh_session_id
                 self._last_terminal_event_id = event_id
@@ -798,6 +1142,8 @@ class DshShadowAgentSession:
                 )
                 await self._activity(state, terminal=event_type)
                 await self._save_mapping(state=state)
+                if self._deferred_revision > 0:
+                    self._schedule_handoff()
             else:
                 await self._save_mapping(state="active")
             return "accepted"
@@ -806,6 +1152,14 @@ class DshShadowAgentSession:
         async with self._event_lock:
             if not await self._callback_matches_or_reconcile(payload):
                 return "stale"
+            claimed = payload.get("claimed_revision")
+            if isinstance(claimed, int) and not isinstance(claimed, bool) and claimed >= self.last_claimed_revision:
+                if claimed > self.last_claimed_revision:
+                    self.last_claimed_revision = claimed
+                    if self._gate_enabled:
+                        log.info("dsh.context_gate claimed voice_session_id=%s activation_id=%s claimed_revision=%s",
+                                 self.voice_session_id, self.activation_id, claimed)
+                    await self._save_mapping(state="active")
             await self._activity(str(payload.get("state") or "running"),
                                  trace_revision=payload.get("trace_revision"))
             trace_revision = payload.get("trace_revision")
@@ -1018,6 +1372,13 @@ class DshShadowAgentSession:
             "waiting_user": self._waiting_user,
             "status": self._visible_status,
             "trace_revision": self._observer_trace_revision,
+            "context_gate": {
+                "enabled": self._gate_enabled,
+                "synced_revision": self.last_applied_revision,
+                "queued_revision": self.last_guided_revision,
+                "claimed_revision": self.last_claimed_revision,
+                "deferred_revision": self._deferred_revision,
+            },
             "state": "retired" if self._retired else ("active" if self.activation_id else "idle"),
         }
 
@@ -1140,6 +1501,9 @@ class DshShadowAgentSession:
             last_terminal_dsh_session_id=self._last_terminal_dsh_session_id,
             last_terminal_event_id=self._last_terminal_event_id,
             last_terminal_event_digest=self._last_terminal_event_digest,
+            gate_queued_revision=self.last_guided_revision,
+            gate_claimed_revision=self.last_claimed_revision,
+            gate_deferred_revision=self._deferred_revision,
             created_at=self._created_at,
             updated_at=now,
             retired_at=now if retired else None,
