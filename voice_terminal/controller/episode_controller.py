@@ -52,6 +52,78 @@ class EpisodeController(RealtimeController):
         self._owner_barge_started_at: float | None = None
         self._owner_barge_output_key: str | None = None
         self._owner_barge_expired = False
+        self._early_silence_task: asyncio.Task | None = None  # 提前静默请求：保留到进入 KWS（关键词唤醒）待机。
+
+    async def request_early_silence(self) -> str:
+        """Advance the current ASR silence ladder at its next safe boundary."""
+        if not self.wake_always_on or self.kws is None:
+            return "kws_disabled"
+        if self.kws.error is not None or not self.kws.running:
+            return "kws_unavailable"
+        if not self.state.listening:
+            return "not_listening"
+        if self.state.input_owner != "asr":
+            return "not_asr"
+        if self.episode.closed:
+            return "unavailable"
+        if self.episode.scheduler.final_dispatched:
+            return "already_finishing"
+        task = self._early_silence_task
+        if task is not None and not task.done():
+            return "already_pending"
+        self._early_silence_task = asyncio.create_task(
+            self._advance_early_silence(), name="early-silence-request",
+        )
+        self._track(self._early_silence_task)
+        return "scheduled"
+
+    async def _cancel_early_silence(self) -> None:
+        task = getattr(self, "_early_silence_task", None)
+        self._early_silence_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _advance_early_silence(self) -> None:
+        activation_generation = self._activation_generation
+        episode = self.episode
+        marked_generation: int | None = None
+        try:
+            while (self.state.listening and self.state.input_owner == "asr"
+                   and activation_generation == self._activation_generation
+                   and episode is self.episode and not episode.closed):
+                scheduler = episode.scheduler
+                if scheduler.final_dispatched:
+                    await asyncio.sleep(0.05)
+                    continue
+                output = self.output
+                output_busy = bool(
+                    getattr(output, "busy", False)
+                    or getattr(output, "active", False)
+                    or getattr(output, "_settling_speech_ids", None)
+                    or getattr(output, "_pending", None)
+                )
+                if (self.workspace is None and episode.user_speaking is not True
+                        and not output_busy and episode.active_request is None):
+                    if not scheduler.armed and not scheduler.is_deferred():
+                        await episode.arm_silence_window(
+                            f"early-silence-{uuid4().hex}", anchor_source="early_silence",
+                        )
+                    if scheduler.armed and not scheduler.anchor_turn_id:
+                        # System checks need a source even before the first user turn.
+                        scheduler.anchor_turn_id = f"early-silence-{uuid4().hex}"
+                    if (marked_generation != scheduler.generation
+                            and (scheduler.mark_final_pending() or scheduler.final_pending)):
+                        episode._ensure_runner()
+                        marked_generation = scheduler.generation
+                        await episode.log(
+                            "SCHEDULER_FINAL_PENDING", window_index=scheduler.FINAL_WINDOW,
+                            reason="early_silence_request", scheduler_generation=scheduler.generation,
+                        )
+                await asyncio.sleep(0.05)
+        finally:
+            if self._early_silence_task is asyncio.current_task():
+                self._early_silence_task = None
 
     def _make_episode(self):
         mode = getattr(self, "reasoning_mode", "balanced")
@@ -1146,6 +1218,7 @@ class EpisodeController(RealtimeController):
         so closing the episode here would incorrectly cancel that response.
         Full output teardown remains owned by reset/close/error paths.
         """
+        await self._cancel_early_silence()
         self.state.listening = False
         if self.workspace is not None:
             await self._cancel_turn(reason="stopped", record=True)
@@ -1167,6 +1240,7 @@ class EpisodeController(RealtimeController):
 
     async def reset_session(self):
         """End the active Agent task while keeping microphone listening alive."""
+        await self._cancel_early_silence()
         if self.workspace is not None:
             await self._cancel_turn(reason="reset", record=True)
         if not self.episode.closed:

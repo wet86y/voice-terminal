@@ -435,6 +435,7 @@ class DshShadowAgentSession:
         self._event_lock = asyncio.Lock()
         self._accepted_events: dict[str, str] = {}
         self._accepted_requests: dict[str, str] = {}
+        self._accepted_early_silence: dict[str, tuple[str, str]] = {}  # 提前静默受理记录：请求标识对应激活身份与受理状态。
         self._last_terminal_activation_id: str | None = None
         self._last_terminal_dsh_session_id: str | None = None
         self._last_terminal_event_id: str | None = None
@@ -1162,6 +1163,43 @@ class DshShadowAgentSession:
             else:
                 await self._save_mapping(state="active")
             return "accepted"
+
+    async def accept_early_silence(
+        self, payload: dict[str, Any], request: Callable[[], Awaitable[str]],
+    ) -> tuple[BridgeResult, str]:
+        """Authorize one root activation's single-purpose silence request."""
+        expected = {
+            "protocol_version", "request_id", "voice_session_id", "dsh_session_id",
+            "epoch", "context_revision", "activation_id",
+        }
+        if set(payload) != expected or payload.get("protocol_version") != BRIDGE_PROTOCOL_VERSION:
+            return "conflict", "invalid_request"
+        try:
+            for field in ("request_id", "voice_session_id", "dsh_session_id", "activation_id"):
+                if not isinstance(payload[field], str):
+                    return "conflict", "invalid_request"
+                _safe_identifier(payload[field], field=field)
+            for field, minimum in (("epoch", 1), ("context_revision", 0)):
+                value = payload[field]
+                if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                    return "conflict", "invalid_request"
+            request_id = payload["request_id"]
+        except (KeyError, DshBridgeError):
+            return "conflict", "invalid_request"
+        async with self._event_lock:
+            if self.activation_id is None or not await self._callback_matches_or_reconcile(payload):
+                return "stale", "stale_binding"
+            identity = f"{payload['activation_id']}:{payload['epoch']}"
+            previous = self._accepted_early_silence.get(request_id)
+            if previous is not None:
+                return ("duplicate", previous[1]) if previous[0] == identity else ("conflict", "request_id_conflict")
+            status = await request()
+            if status in {"scheduled", "already_pending", "already_finishing"}:
+                self._accepted_early_silence[request_id] = (identity, status)
+                if len(self._accepted_early_silence) > 4096:
+                    self._accepted_early_silence.pop(next(iter(self._accepted_early_silence)))
+                return "accepted", status
+            return "conflict", status
 
     async def accept_activity(self, payload: dict[str, Any]) -> BridgeResult:
         async with self._event_lock:

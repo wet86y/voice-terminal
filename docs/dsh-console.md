@@ -167,15 +167,32 @@ DSH `result`（结果终态）回执得到 `duplicate`（重复确认），没�
 唤醒 idle Agent、不恢复工具前硬阻断，也不重置 activation 计时；上一条提醒尚未 claim 时原位替换，
 因此安全点前最多保留一条待处理提醒。terminal、cancel、retire 或插件释放会清理计时器，不为提醒额外
 开启模型步骤。
-普通 DSH assistant 正文永远不进入 Voice 邮箱。Bridge 2.0（桥接协议 2.0）回传只允许七个根 Agent 控制工具：
+普通 DSH assistant 正文永远不进入 Voice 邮箱。Bridge 2.0（桥接协议 2.0）回传只允许以下八个根 Agent 控制工具：
 
 - `get_latest_context`（仅同步补救）；
 - `read_ambient_context`（旁路、不可信、Session 内）；
 - `publish_progress`（发布界面进度）；
 - `publish_voice_information`（发布 Voice 信息）；
-- `request_user_input`；
-- `return_shadow_result`；
-- `finish_shadow_no_action`。
+- `request_user_input`（请求用户输入）；
+- `return_shadow_result`（返回最终结果）；
+- `finish_shadow_no_action`（无动作结束）；
+- `request_early_silence`（请求提前执行静默前最终检查；仅当前用户明确要求，或会话中已启用、目标为影子代理的自定义指令明确规定当前场景时可用）。
+
+提前静默请求仅在 ASR（自动语音识别）活跃期受理。系统等待用户输入和当前播报结束，提前执行原本由
+30～90 秒静默窗口触发的 `final_silence`（静默前最终检查），并在该检查及必要播报结算后回到
+KWS（关键词唤醒）待机。工具返回受理状态，不表示切换已经完成；重复请求会合并。
+
+工具响应中的 `result`（协议结果）为 `accepted`（已受理）、`duplicate`（重复确认）或拒绝代码；
+`status`（受理状态）为 `scheduled`（已排队）、`already_pending`（已有待执行请求）、
+`already_finishing`（最终检查已开始），或者 `not_listening`（会话未监听）、`not_asr`（不在 ASR 活跃期）、
+`kws_disabled`（未启用关键词唤醒）、`kws_unavailable`（关键词唤醒不可用）、`unavailable`（语音运行时不可用）。
+
+调用方式为 `request_early_silence({})`（请求提前进入静默，空参数对象）。可在产品设置中创建影子自定义指令，
+例如 `trigger`（触发语义）为“用户说本轮到此结束”，`target`（执行位置）为 `shadow`（影子代理），
+`instruction`（执行目标）为“明确满足此触发场景时调用 request_early_silence，提前进入静默”，
+`enabled`（启用状态）为 `true`（已启用）。自定义指令在新会话或重置后进入冻结快照。
+调用条件由工具说明与受管指令约束；服务端核对活动绑定和运行状态，不对自然语言授权作额外语义判断。
+重建插件后启动或重启 Voice Server（语音服务），在新语音会话中加载新工具和规则。
 
 子代理可承担明确并行任务，但执行入口会拒绝子代理调用 Voice 控制工具。根 Agent统一决定澄清、
 确认、中途信息和唯一终态。非终态工具不结束 DSH 回合；只有终态获得 `accepted`（已接受）

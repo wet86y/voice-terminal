@@ -220,6 +220,23 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.post("/api/internal/dsh-bridge/input.early-silence")
+    async def dsh_early_silence(request: Request) -> JSONResponse:
+        payload, session = await dsh_callback_body(request)
+        async with runtime._session_lock:
+            async def schedule() -> str:
+                controller = runtime.controller
+                if controller is None:
+                    return "unavailable"
+                return await controller.request_early_silence()
+
+            code, status = await session.accept_early_silence(payload, schedule)
+        return JSONResponse(
+            {"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": code, "status": status},
+            status_code=200 if code in {"accepted", "duplicate"} else 409,
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.post("/api/internal/dsh-bridge/shadow.activity")
     @app.post("/api/internal/dsh-bridge/shadow.lifecycle")
     async def dsh_shadow_activity(request: Request) -> JSONResponse:

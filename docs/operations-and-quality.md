@@ -48,6 +48,13 @@ git diff --check
 7. `session.stop` 停止输入但不误取消已经进入 TTS 的输出；
 8. `session.reset` 清理 conversation、Shadow 和 speech 临时状态。
 
+提前静默的现场验收：在 ASR（自动语音识别）活跃期明确要求影子代理调用
+`request_early_silence({})`（请求提前进入静默），确认工具先返回受理状态，随后日志出现
+`SCHEDULER_FINAL_PENDING`（最终检查待执行事件），其中 `reason=early_silence_request`（原因是提前静默请求），
+再执行 `prompt_kind=final_silence`（静默前最终检查），检查及必要播报结束后才出现
+`input_owner=kws`（输入交给关键词唤醒）。讲话中或播报期间请求时应等待；等待期间补充新输入时仍按最新一轮收尾，
+停止或重置会话后旧请求不得恢复。该场景须使用重建后的插件和新语音会话。
+
 `-NoWeb` 只用于后端调试，不能作为完整 Web 语音终端验收结果。
 
 ## Bridge 2.0 信息观察

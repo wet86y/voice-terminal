@@ -55,7 +55,20 @@ Voice 主模型可以输出 `wait`（静默），且旧信息不会再次触发�
 
 `progress`（界面进度）只更新 Product UI（产品界面），不会唤醒 Voice 推理。根 Agent 与 status observer（状态观察器）发布的信息按到达顺序共享同一槽，来源没有优先级；观察器简报同时更新产品活动视图并触发 Voice 推理。一个逻辑请求认领信息后，后续到达的新版本保留到下一次推理；传输重试和协议恢复沿用该逻辑请求的本地快照，不重新认领共享槽。终态清除该激活尚未认领的信息，已经认领的信息不被反向撤销。
 
-DSH（代理运行时）工具面只保留 `publish_progress`（发布界面进度）、`publish_voice_information`（发布 Voice 信息）、`request_user_input`（请求用户输入）、`return_shadow_result`（返回最终结果）和 `finish_shadow_no_action`（无动作结束）五个控制工具，以及上下文读取工具。移除 `publish_main_event`（旧主线事件入口）、通用 `payload`（附加数据）和旧工具别名。非终态调用不会执行 `exec.concludeTurn()`（结束 DSH 回合）；终态仅在 Voice 接受 `accepted`（已接受）或 `duplicate`（重复确认）后结束该回合。
+DSH（代理运行时）工具面包含 `publish_progress`（发布界面进度）、`publish_voice_information`（发布 Voice 信息）、`request_user_input`（请求用户输入）、`return_shadow_result`（返回最终结果）、`finish_shadow_no_action`（无动作结束）和 `request_early_silence`（请求提前进入静默）六个控制工具，以及上下文读取工具。移除 `publish_main_event`（旧主线事件入口）、通用 `payload`（附加数据）和旧工具别名。非终态调用不会执行 `exec.concludeTurn()`（结束 DSH 回合）；终态仅在 Voice 接受 `accepted`（已接受）或 `duplicate`（重复确认）后结束该回合。
+
+## 提前静默请求
+
+`request_early_silence`（请求提前进入静默）无参数，仅当前用户明确要求或本会话已启用的影子自定义指令明确规定当前场景时调用。
+它通过 `/api/internal/dsh-bridge/input.early-silence`（提前静默端点）发送
+`protocol_version`（协议版本）、`request_id`（请求幂等标识）、`voice_session_id`（语音会话标识）、
+`dsh_session_id`（DSH 会话标识）、`epoch`（会话代次）、`context_revision`（上下文修订号）和
+`activation_id`（当前激活标识）。插件限制根代理调用，服务端校验当前活动绑定并合并重复请求。
+
+该请求不属于 `shadow.event`（影子事件），不结束激活，不伪造用户输入或已经过的静默时长。
+Voice（语音服务）等待输入及播报安静后，将当前静默窗口提前标记为最终检查待执行，沿用
+`final_silence`（静默前最终检查）及其播报结算与 KWS（关键词唤醒）交接。请求保留到交接完成；
+停止、重置或输入所有权代次变化时清除，不持久化到重启后的会话。
 
 ## 原子性与恢复
 
@@ -79,6 +92,13 @@ Session mapping（会话映射）保存与激活清理。同一 `event_id`（事
 麦克风、ASR（自动语音识别）、TTS（语音合成）、播放器、语音事务、用户打断规则及定时任务存储格式不属于本协议的变更范围。定时任务 `publish_voice_event`（投递语音事件）仍使用独立持久邮箱。
 
 ## 本次实施与验证记录
+
+2026-10-02 增加 `request_early_silence`（请求提前进入静默）。完整 Python（后端）回归为
+**571 passed（通过）、17 skipped（跳过）**，Bridge（桥接插件）测试为 **22 passed（通过）**，
+TypeScript（类型检查）、DSH（影子代理宿主）重建和 `-ValidateOnly`（产物一致性校验）通过。
+Product UI（产品界面）测试、类型检查与生产构建通过。
+新增自动化测试覆盖等待安静、窗口被新输入替换后继续请求、最终检查结算后交还 KWS（关键词唤醒）以及
+当前激活校验和重复请求确认。真实麦克风现场验收尚未执行。
 
 2026-09-30 完成本协议实施与回归。全量 Python 自动化测试为 **498 passed（通过）、17 skipped（跳过）**；Bridge 插件 Node（插件运行时）测试为 **17 passed**，TypeScript（类型检查）通过；Product UI（产品界面）测试为 **61 passed**，类型检查通过。DSH Bundle（功能包）已重新构建，`setup-dsh.ps1 -ValidateOnly`（仅校验模式）通过，检查到 `protocol_version`（协议版本）2.0 和映射结构版本 2。`git diff --check`（提交差异空白检查）通过。
 

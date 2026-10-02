@@ -272,6 +272,44 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(names.count("context.update"), 0)
         self.assertEqual(names.count("wake"), 1)
 
+    async def test_early_silence_requires_current_activation_and_is_idempotent(self) -> None:
+        self.assertEqual(await self.session.request_wake(), "started")
+        payload = {
+            "protocol_version": "2.0", "request_id": "early-request-1",
+            "voice_session_id": self.session.voice_session_id,
+            "dsh_session_id": self.session.dsh_session_id,
+            "epoch": self.session.epoch,
+            "context_revision": self.session.last_applied_revision,
+            "activation_id": self.session.activation_id,
+        }
+        calls = []
+
+        async def request() -> str:
+            calls.append(True)
+            return "scheduled"
+
+        self.assertEqual(await self.session.accept_early_silence(payload, request),
+                         ("accepted", "scheduled"))
+        self.assertEqual(await self.session.accept_early_silence(payload, request),
+                         ("duplicate", "scheduled"))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(await self.session.accept_early_silence(
+            {**payload, "activation_id": "old-activation", "request_id": "early-request-2"}, request,
+        ), ("stale", "stale_binding"))
+        self.assertEqual(await self.session.accept_early_silence(
+            {**payload, "request_id": "early-request-3", "target": "asr"}, request,
+        ), ("conflict", "invalid_request"))
+        self.assertEqual(len(calls), 1)
+
+        for invalid in (None, "", 1):
+            self.assertEqual(await self.session.accept_early_silence(
+                {**payload, "activation_id": invalid}, request,
+            ), ("conflict", "invalid_request"))
+        self.session.activation_id = None
+        self.assertEqual(await self.session.accept_early_silence(payload, request),
+                         ("stale", "stale_binding"))
+        self.assertEqual(len(calls), 1)
+
     async def test_dsh_gate_can_defer_repeatedly_then_handoff_and_guide_new_answer(self) -> None:
         context = MutableContext()
         client = GateClient()
