@@ -60,12 +60,17 @@ class PcmPlayer:
         on_playback_started: Callable[[str], None] | None = None,
         device_latency_ms: int = 0,
         on_audio_rendered: Callable[[bytes], None] | None = None,
+        playback_permission: Callable[[], bool] | None = None,
+        on_policy_blocked: Callable[[str], None] | None = None,
     ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
         self.output_device = output_device
         self.on_playback_started = on_playback_started
         self.on_audio_rendered = on_audio_rendered
+        self.playback_permission = playback_permission  # playback_permission（播放器出口策略）。
+        self.on_policy_blocked = on_policy_blocked  # on_policy_blocked（被策略阻止时通知事务所有者）。
+        self._policy_blocked_key: str | None = None
         self.device_latency_ms = max(0, int(device_latency_ms))
         # The callback can consume only part of a TTS chunk.  A queue.Queue
         # cannot put that remainder at the front, so using it directly would
@@ -353,6 +358,8 @@ class PcmPlayer:
         offset = 0
         playback_turn: str | None = None
         first_rendered_turn: str | None = None
+        blocked_key: str | None = None
+        permitted = self.playback_permission is None or self.playback_permission()
 
         if _status:
             status_text = str(_status)
@@ -362,11 +369,15 @@ class PcmPlayer:
                     logger.warning("audio.player_callback_status status=%s", status_text)
 
         with self._queue_lock:
+            if not permitted and self._active_turn is not None and self._policy_blocked_key != self._active_turn:
+                self._policy_blocked_key = self._active_turn
+                blocked_key = self._active_turn
             callback_at = time.monotonic()
             device_time = getattr(_time, "outputBufferDacTime", None)
             if isinstance(device_time, (int, float)):
                 self._last_device_output_time = float(device_time)
-            if self._held_key != self._active_turn and self._paused_key != self._active_turn:
+            if (self._held_key != self._active_turn and self._paused_key != self._active_turn
+                    and self._policy_blocked_key != self._active_turn):
                 while remaining > 0 and self._chunks:
                     chunk = self._chunks.popleft()
                     take = min(remaining, len(chunk))
@@ -397,6 +408,9 @@ class PcmPlayer:
                 self._last_callback_at = callback_at
                 self._render_points.append((callback_at, self._played_bytes))
             self._last_callback_played_bytes = self._played_bytes
+
+        if blocked_key and self.on_policy_blocked is not None:
+            self.on_policy_blocked(blocked_key)
 
         if self.on_audio_rendered and len(target) > 0:
             # The callback receives the complete buffer submitted to the

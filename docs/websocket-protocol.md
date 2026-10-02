@@ -4,6 +4,8 @@
 
 ## 连接和安全边界
 
+运行快照新增 `quiet_hours`（被动静默状态），包含 `passive_quiet`（当前抑制主动语音）、`user_interaction`（用户交互窗口开启）、`within_quiet_hours`（当前处于配置时段）三个布尔值。旧客户端可以忽略。待传达槽位没有正文事件或读取命令；逻辑会话重置先完成成对归档和交接，失败返回 `HANDOFF_RESET_FAILED`（交接重置失败）并保留旧会话。设置接口与恢复规则见[交接说明](continuity-foundation.md)。
+
 默认连接：
 
 ```text

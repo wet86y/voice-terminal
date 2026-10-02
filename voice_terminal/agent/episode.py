@@ -14,6 +14,7 @@ from .scheduler import AgentDecisionScheduler
 from .streamed_speech import StreamedSpeechAdmissionState, queue_streamed_speech, common_prefix_chars
 from .decision_application import ProtocolError, apply_decision_v06
 from .context_builder import AgentContextMixin
+from .deferred_speech import DeferredSpeechMixin
 from .runtime_events import RecoverySignal, HeartbeatPulse, EpisodeHeartbeatClock
 from .prompts import (
     PROMPT, BALANCED_THINKING_PROMPT, DEEP_THINKING_PROMPT,
@@ -138,7 +139,7 @@ def semantic_text(text: str) -> str:
 
 
 
-class AgentEpisodeRuntime(AgentContextMixin):
+class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
     # Tool adapters already bound the provider response, but a search can
     # still contain several thousand characters of snippets and links.  Keep
     # the model-facing protocol bounded without changing the cached result or
@@ -154,6 +155,11 @@ class AgentEpisodeRuntime(AgentContextMixin):
                  on_user_activity=None, on_silence_anchor=None,
                  on_speaker_heartbeat=None, admit_user_turn=None):
         self.provider, self.registry, self.output, self.emit = provider, registry, output, emit
+        self.quiet_policy = None
+        self.deferred_capture = None
+        self.deferred_append = None
+        self._deferred_outputs = []
+        self._deferred_seen = set()
         self.options = options or AgentOptions()
         self.tools_enabled = tools_enabled
         self.reasoning_mode = reasoning_mode
@@ -959,6 +965,8 @@ class AgentEpisodeRuntime(AgentContextMixin):
         # the shared mailbox for the next idle heartbeat.
 
     def _notify_user_activity(self) -> None:
+        if self.quiet_policy is not None:
+            self.quiet_policy.user_interaction = True
         callback = self.on_user_activity
         if callable(callback):
             try:
@@ -2957,6 +2965,11 @@ class AgentEpisodeRuntime(AgentContextMixin):
     async def _step(self, identity, kinds, *, recovery=False, recovery_signal=None,
                     reasoning_effort=None, dispatch_context=None):
         """The V0.6 content-envelope request path (no native provider tools)."""
+        if kinds == {"DEFERRED_OUTPUT"}:
+            await self._normalize_deferred_outputs()
+            return "deferred_output"
+        # 协议恢复会复用 identity（请求标识）；本次流仍须重新通过完整决策校验。
+        self._validated_envelope_identity = None
         source_turn_id = self._identity_turns.get(identity, self.last_turn_id)
         system_check = self._is_system_check_context(dispatch_context)
         system_check_id = (
@@ -3257,7 +3270,8 @@ class AgentEpisodeRuntime(AgentContextMixin):
                             prefix = parser.speak_prefix()
                             if prefix is not None and prefix.state == "speak":
                                 consumed = await queue_streamed_speech(self, admission, prefix, provisional)
-                                if admission.speech_handle is not None and not consumed:
+                                if (admission.speech_handle is not None and not consumed
+                                        and getattr(admission.speech_handle, "reason", None) != "passive_quiet"):
                                     # On a divergence the new transaction must
                                     # receive the complete accumulated target;
                                     # on append only the first suffix was
@@ -3337,6 +3351,17 @@ class AgentEpisodeRuntime(AgentContextMixin):
                                    expected_chars=len(expected_prefix),
                                    received_chars=len(envelope.speak.text))
             await self._record_emotion_normalizations(parser, identity=identity, turn_id=source_turn_id)
+            self._validated_envelope_identity = identity
+            if admission.speech_handle is not None:
+                admission.speech_handle.envelope_validated = True
+            if (admission.speech_handle is not None
+                    and getattr(admission.speech_handle, "reason", None) == "passive_quiet"):
+                handle = admission.speech_handle
+                handle.text = delivered_remainder(envelope.speak.text)
+                handle.finished = True
+                remainder, heard = self.output.deferred_remainder(handle, handle.text)
+                self.defer_speech(admission.speech_handle.speech_id,
+                                  remainder, heard_text=heard)
             if admission.speech_handle is not None:
                 await finish_streamed_speech()
                 await self.log("SPEAK_STATE_CHANGED", identity=identity, turn_id=source_turn_id,
@@ -3368,6 +3393,7 @@ class AgentEpisodeRuntime(AgentContextMixin):
                 )
             else:
                 await self._dispatch_actions_v06(identity, source_turn_id, envelope)
+            await self._normalize_deferred_outputs()
             record_audit_outcome(
                 validation,
                 state=envelope.speak.state,

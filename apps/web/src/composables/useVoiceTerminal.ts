@@ -66,6 +66,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const canStart = ref(false)
   const wakeAlwaysOn = ref(false)
   const inputOwner = ref<'none' | 'kws' | 'asr'>('none')
+  const quietHours = reactive({ passive_quiet: false, user_interaction: false, within_quiet_hours: false })
   const reasoningMode = ref<ReasoningMode>('balanced')
   const currentTurnId = ref<string | null>(null)
   const current = reactive<CurrentTurnSnapshot>(createEmptyCurrentTurn())
@@ -734,6 +735,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function applyRuntimeSnapshot(payload: RuntimeSnapshotPayload, turnId: string | null) {
+    if (payload.quiet_hours) Object.assign(quietHours, payload.quiet_hours)
     if (isTerminalState(payload.state)) state.value = payload.state
     if (typeof payload.listening === 'boolean') listening.value = payload.listening
     if (typeof payload.can_start === 'boolean') canStart.value = payload.can_start
@@ -1166,6 +1168,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     canStart,
     wakeAlwaysOn,
     inputOwner,
+    quietHours,
     reasoningMode,
     currentTurnId,
     current,

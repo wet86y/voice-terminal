@@ -22,12 +22,13 @@ from typing import Any, Mapping
 
 from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig
 from ..custom_instructions import validate_entries
+from ..quiet_hours import QuietHoursConfig
 from ..core.events import utc_now_iso
 from ..kws.keywords import MAX_WAKE_KEYWORDS
 from ..shadow_agent import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 8
+PRODUCT_SETTINGS_SCHEMA_VERSION = 9
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 90
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -83,6 +84,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
     compute_devices["paraformer"] = paraformer_mode
     return {
         "schema_version": PRODUCT_SETTINGS_SCHEMA_VERSION,
+        "quiet_hours": config.quiet_hours.snapshot(),
         "wake": {
             "enabled": bool(config.wake.enabled),
             "keyword": str(config.wake.keyword),
@@ -149,7 +151,7 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     result = deepcopy(defaults)
     if not isinstance(value, Mapping):
         return result
-    for section in ("wake", "silence", "shadow", "speaker", "tts"):
+    for section in ("wake", "silence", "shadow", "speaker", "tts", "quiet_hours"):
         raw = value.get(section)
         if isinstance(raw, Mapping):
             result[section].update({key: raw[key] for key in result[section] if key in raw})
@@ -202,6 +204,12 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     except (TypeError, ValueError):
         sensitivity = int(defaults["wake"]["sensitivity"])
     wake["sensitivity"] = max(MIN_KWS_SENSITIVITY, min(MAX_KWS_SENSITIVITY, sensitivity))
+    try:
+        result["quiet_hours"] = QuietHoursConfig(**result["quiet_hours"]).snapshot()
+    except ValueError:
+        result["quiet_hours"] = defaults["quiet_hours"]
+    if not wake["enabled"]:
+        result["quiet_hours"]["enabled"] = False
     silence = result["silence"]
     try:
         seconds = int(silence.get("seconds"))
@@ -245,10 +253,18 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     """Report malformed persisted fields without exposing their contents."""
 
     invalid = False
+    quiet = value.get("quiet_hours")
+    if quiet is not None:
+        try:
+            if not isinstance(quiet, Mapping):
+                raise ValueError("被动静默设置格式无效。")
+            QuietHoursConfig(**quiet)
+        except (TypeError, ValueError):
+            invalid = True
     schema_version = value.get("schema_version")
     if schema_version is not None and (
         type(schema_version) is not int
-        or schema_version not in {1, 2, 3, 4, 5, 6, 7, PRODUCT_SETTINGS_SCHEMA_VERSION}
+        or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, PRODUCT_SETTINGS_SCHEMA_VERSION}
     ):
         invalid = True
     for section_name, fields in (
@@ -446,7 +462,10 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         fallback_devices={**ComputeConfig().fallback_devices,
                           **(compute.get("fallback_devices") if isinstance(compute.get("fallback_devices"), Mapping) else {})},
     )
-    return replace(config, wake=next_wake, agent=next_agent, shadow_agent=next_shadow,
+    quiet = QuietHoursConfig(**dict(settings.get("quiet_hours", config.quiet_hours.snapshot())))
+    if quiet.enabled and not next_wake.enabled:
+        raise ProductSettingsError("被动静默要求开启 KWS（关键词唤醒）。")
+    return replace(config, quiet_hours=quiet, wake=next_wake, agent=next_agent, shadow_agent=next_shadow,
                    speaker=next_speaker, tts=next_tts, compute=next_compute)
 
 
@@ -603,6 +622,8 @@ class ProductSettingsStore:
                 ) from exc
 
     async def save_wake(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if payload.get("enabled") is False and self._settings["quiet_hours"]["enabled"]:
+            raise ProductSettingsError("请先关闭被动静默时间，再禁用 KWS（关键词唤醒）。")
         if type(payload.get("enabled")) is not bool:
             raise ProductSettingsError("enabled 必须是布尔值。")
         raw_sensitivity = payload.get("sensitivity")
@@ -731,6 +752,24 @@ class ProductSettingsStore:
                     except OSError:
                         pass
                 raise ProductSettingsError(f"KWS 关键词文件替换失败：{type(exc).__name__}。") from exc
+
+    def save_quiet_hours(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if set(payload) != {"enabled", "start", "end"}:
+            raise ProductSettingsError("被动静默字段必须为 enabled（启用）、start（开始时间）、end（结束时间）。")
+        try:
+            quiet = QuietHoursConfig(**dict(payload))
+        except ValueError as exc:
+            raise ProductSettingsError(str(exc)) from exc
+        if quiet.enabled and not self._settings["wake"]["enabled"]:
+            raise ProductSettingsError("开启被动静默时间需要先开启 KWS（关键词唤醒）。")
+        previous = self._settings["quiet_hours"]
+        self._settings["quiet_hours"] = quiet.snapshot()
+        try:
+            self._save_settings()
+        except BaseException:
+            self._settings["quiet_hours"] = previous
+            raise
+        return self.snapshot()
 
     async def save_silence(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         raw_seconds = payload.get("seconds")
@@ -1194,6 +1233,8 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
         "wake_always_on": bool(value.get("wake_always_on")),
         "input_owner": value.get("input_owner"),
         "reasoning_mode": value.get("reasoning_mode", "balanced"),
+        "quiet_hours": {key: bool((value.get("quiet_hours") or {}).get(key))
+                        for key in ("passive_quiet", "user_interaction", "within_quiet_hours")},
         "services": dict(value.get("services") or {}),
         "latency": safe_latency,
         "conversation": {

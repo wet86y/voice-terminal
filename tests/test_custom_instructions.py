@@ -42,7 +42,13 @@ def test_session_freezes_entries_until_reset(tmp_path):
                        persona=PersonaConfig(directory=tmp_path / "config" / "persona"))
     store = ProductSettingsStore(path=tmp_path / "config" / "product-settings.json", config=config)
     store.save_custom_instructions([VOICE])
-    runtime = SessionRuntime(config, product_settings=store)
+    runtime = SessionRuntime(config, product_settings=store, runtime_data_dir=tmp_path / ".runtime")
+    from voice_terminal.handoff import OrganizedHandoff
+
+    async def organize(archive, previous, entries):
+        return OrganizedHandoff(previous, [], [], archive)
+
+    runtime._organize_archive = organize
     assert runtime._instruction_snapshot == [VOICE]
     store.save_custom_instructions([SHADOW])
     assert runtime._instruction_snapshot == [VOICE]

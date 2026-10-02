@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .env import load_env_file
+from .quiet_hours import QuietHoursConfig
 from .controller.options import InputOptions
 from .agent.options import AgentOptions
 from .kws.keywords import canonical_labels, normalize_keyword_list
@@ -503,7 +504,25 @@ class PersonaConfig:
 
 
 @dataclass(frozen=True)
+class ContinuityConfig:
+    """continuity（交接整理）：供应方为空时继承影子模型。"""
+    provider: ShadowProviderConfig | None = None  # provider（独立整理供应方）。
+    max_document_chars: int = 6000  # max_document_chars（文档字符上限）。
+    max_output_tokens: int = 16384  # max_output_tokens（输出词元预算）。
+    max_context_tokens: int = 524288  # max_context_tokens（输入上下文预算）。
+
+    def __post_init__(self) -> None:
+        if (not all(type(value) is int for value in (self.max_document_chars, self.max_output_tokens, self.max_context_tokens))
+                or self.max_document_chars < 1 or self.max_output_tokens < 1 or self.max_context_tokens < 1024):
+            raise ValueError("continuity（交接整理）预算必须为正，上下文至少1024词元。")
+        if self.max_output_tokens >= self.max_context_tokens:
+            raise ValueError("max_output_tokens（输出预算）必须小于 max_context_tokens（上下文预算）。")
+
+
+@dataclass(frozen=True)
 class AppConfig:
+    quiet_hours: QuietHoursConfig = field(default_factory=QuietHoursConfig)  # quiet_hours（被动静默时间）。
+    continuity: ContinuityConfig = field(default_factory=ContinuityConfig)  # continuity（交接整理配置）。
     smart_turn: InputOptions = field(default_factory=InputOptions)
     agent: AgentOptions = field(default_factory=AgentOptions)
     shadow_agent: ShadowAgentConfig = field(default_factory=ShadowAgentConfig)
@@ -524,6 +543,10 @@ class AppConfig:
     asr_worker: AsrWorkerConfig = field(default_factory=AsrWorkerConfig)
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     speaker_worker: SpeakerWorkerConfig = field(default_factory=SpeakerWorkerConfig)
+
+    def __post_init__(self) -> None:
+        if self.quiet_hours.enabled and not self.wake.enabled:
+            raise ValueError("quiet_hours（被动静默）要求开启 wake（关键词唤醒）。")
 
     @property
     def kws_dir(self) -> Path:
@@ -685,6 +708,12 @@ class AppConfig:
             return resolved
 
         return cls(
+            quiet_hours=QuietHoursConfig(**dict(_section(data, "quiet_hours"))),
+            continuity=ContinuityConfig(**{
+                **{key: value for key, value in _section(data, "continuity").items() if key != "provider"},
+                "provider": (ShadowProviderConfig(**dict(_section(_section(data, "continuity"), "provider")))
+                             if _section(_section(data, "continuity"), "provider") else None),
+            }),
             smart_turn=InputOptions.from_mapping(smart_turn_data, root),
             agent=AgentOptions.from_mapping(_section(data, "agent")),
             shadow_agent=ShadowAgentConfig(

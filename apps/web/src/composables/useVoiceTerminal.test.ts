@@ -26,6 +26,16 @@ function openTerminal(now?: () => number) {
 }
 
 describe('V0.6 session protocol', () => {
+  it('读取被动静默与用户交互状态并在唤醒后更新', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('runtime.snapshot', 1, { state: 'IDLE', listening: true, can_start: false, services: {}, current: {},
+      quiet_hours: { passive_quiet: true, user_interaction: false, within_quiet_hours: true } })
+    expect(terminal.quietHours.passive_quiet).toBe(true)
+    socket.push('runtime.snapshot', 2, { state: 'LISTENING', listening: true, can_start: false, services: {}, current: {},
+      quiet_hours: { passive_quiet: false, user_interaction: true, within_quiet_hours: true } })
+    expect(terminal.quietHours.user_interaction).toBe(true)
+    expect(terminal.quietHours.passive_quiet).toBe(false)
+  })
   it('subscribes and applies a server-owned session snapshot', () => {
     const { socket, terminal } = openTerminal()
     expect(JSON.parse(socket.sent[0]).command).toBe('subscribe')

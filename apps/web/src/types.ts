@@ -201,6 +201,8 @@ export interface ConversationSnapshotPayload {
 }
 
 export interface RuntimeSnapshotPayload {
+  /** quiet_hours（被动静默状态）：passive_quiet（抑制主动语音）、user_interaction（用户交互窗口）、within_quiet_hours（处于配置时段），不含待传达内容。 */
+  quiet_hours?: { passive_quiet: boolean; user_interaction: boolean; within_quiet_hours: boolean }
   agent?: AgentEpisodeSnapshot
   recent_inputs?: InputRecord[]
   conversation?: ConversationSnapshotPayload

@@ -25,6 +25,9 @@ class EpisodeController(RealtimeController):
                  custom_instructions_provider=None,
                  continuity_document_provider=None, on_user_activity=None,
                  on_silence_anchor=None, **kwargs):
+        self.quiet_policy = kwargs.pop("quiet_policy", None)
+        self.deferred_capture = kwargs.pop("deferred_capture", None)
+        self.deferred_append = kwargs.pop("deferred_append", None)
         super().__init__(**kwargs)
         self.agent_options = agent_options
         self.persona_config = persona_config
@@ -65,6 +68,9 @@ class EpisodeController(RealtimeController):
                                         on_silence_anchor=self.on_silence_anchor,
                                         on_speaker_heartbeat=self._speaker_heartbeat_pulse,
                                         admit_user_turn=self._speaker_admit_turn)
+        runtime.quiet_policy = self.quiet_policy
+        runtime.deferred_capture = self.deferred_capture
+        runtime.deferred_append = self.deferred_append
         self.output.runtime = runtime
         return runtime
 
@@ -169,6 +175,9 @@ class EpisodeController(RealtimeController):
                                       state=self.state.current["speaker_rolling"]))
 
     async def _on_kws_activated(self, source_id: str, generation: int) -> bool:
+        quiet = getattr(self, "quiet_policy", None)
+        if quiet is not None:
+            quiet.user_interaction = True
         try:
             await self.episode.schedule_system_check(
                 "kws_wake", source_id, arm_silence=True,
@@ -214,6 +223,9 @@ class EpisodeController(RealtimeController):
                 )
                 if (self.workspace is None and self.episode.user_speaking is not True
                         and not output_busy):
+                    quiet = getattr(self, "quiet_policy", None)
+                    if quiet is not None:
+                        quiet.user_interaction = False
                     await self._return_to_kws(activation_generation)
                     return
                 await asyncio.sleep(0.05)
@@ -264,6 +276,8 @@ class EpisodeController(RealtimeController):
             speech_id = str(payload.get("speech_id") or "")
             added = self.history.commit_delivery(
                 speech_id, str(payload.get("text") or ""), delivery,
+                metadata={key: payload.get(key) for key in (
+                    "conversation_id", "request_id", "turn_id", "owner_scope", "kind", "envelope_validated")},
             )
             # Every settled transaction becomes one conversation line — also a
             # failed or interrupted one, whose status is what the user needs to

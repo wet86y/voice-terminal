@@ -103,7 +103,7 @@ def test_off_plus_owner_only_preserves_selection_but_hides_marks_without_profile
             runtime = SessionRuntime(AppConfig(
                 model_dir=root / "models",
                 persona=PersonaConfig(directory=root / "persona"),
-            ))
+            ), runtime_data_dir=root / ".runtime")
             applied = await runtime.set_speaker_settings({
                 "mode": "off", "owner_only_barge_in": True,
                 "confirm_threshold": 0.6, "continuity_threshold": 0.5,
@@ -120,7 +120,7 @@ def test_owner_barge_status_separates_selected_from_current_aec_availability():
         runtime = SessionRuntime(AppConfig(
             model_dir=root / "models",
             persona=PersonaConfig(directory=root / "persona"),
-        ))
+        ), runtime_data_dir=root / ".runtime")
         runtime.config = replace(
             runtime.config,
             speaker=replace(runtime.config.speaker, owner_only_barge_in=True),

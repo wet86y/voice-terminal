@@ -26,7 +26,7 @@ const {
   shadowExpanded, modelScanState, restartState, applyImpact, dsh, openDshConsole,
   lastError, notice, noticeVisible, runtimeAction, resetSession, setReasoningMode,
   toggleProviderReasoning,
-  saveWake, saveSilence, saveShadowGate, savePersona, saveCustomInstructions, scanModels, discoverProvider, verifyCustomModel,
+  saveWake, saveSilence, quietHoursForm, quietStatus, saveQuietHours, saveShadowGate, savePersona, saveCustomInstructions, scanModels, discoverProvider, verifyCustomModel,
   addVerifiedProvider,
   requestModelApply, confirmModelApply, retry, setNotice,
   speakerForm, speakerStatus, speakerProfile, speakerTestResult, ambientContext, speakerEnrollment,
@@ -1220,6 +1220,17 @@ function pageLabel() {
             <header><p class="panel-kicker">最终静默检查</p><h2>留出恰当的等待时间</h2><p>只控制最终静默检查和回到 KWS 的窗口；Smart Turn 的约 1.4 秒短语结束判断保持只读，不会被设置页修改。</p></header>
             <div class="silence-control"><span>最终静默等待</span><div><input v-model.number="silenceSeconds" min="5" max="90" type="number"><b>秒</b></div><input v-model.number="silenceSeconds" min="5" max="90" step="1" type="range"><div class="silence-scale"><small>5 秒</small><small>默认 30 秒</small><small>90 秒</small></div></div><div class="info-callout"><span>i</span><p>Smart Turn 短语结束阈值：{{ settings.silence.smart_turn_hard_silence_ms }} ms（只读）。保存后在下一次 Episode 创建时使用新的最终静默窗口。</p></div>
             <footer><button class="save-button" type="button" :disabled="saving" @click="saveSilence">{{ saving ? '正在保存…' : '保存最终静默设置' }}</button></footer>
+            <section class="silence-control">
+              <h3>被动静默时间</h3>
+              <strong>{{ quietStatus?.passive_quiet ? '当前处于被动静默' : quietStatus?.user_interaction ? '用户交互已开启，可正常回复' : '当前按普通待机策略运行' }}</strong>
+              <p>每天按本地时间暂停待机中的主动播报，后台任务继续。通过 KWS（关键词唤醒）唤醒后可以正常对话。</p>
+              <label><input v-model="quietHoursForm.enabled" type="checkbox" :disabled="!settings.wake.enabled || saving">启用被动静默</label>
+              <label>每日开始时间 <input v-model="quietHoursForm.start" type="time" :disabled="saving"></label>
+              <label>每日结束时间 <input v-model="quietHoursForm.end" type="time" :disabled="saving"></label>
+              <p v-if="!settings.wake.enabled">请先开启 KWS（关键词唤醒），并在下一次会话使其生效。</p>
+              <p>支持跨午夜；开始时间包含、结束时间不包含。关闭后恢复普通运行，未传达内容由后续交接整理承接。</p>
+              <button class="save-button" type="button" :disabled="saving || quietHoursForm.start === quietHoursForm.end" @click="saveQuietHours">保存被动静默设置</button>
+            </section>
           </template>
 
           <template v-else-if="activeSettingsTab === 'speaker'">

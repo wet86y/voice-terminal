@@ -15,6 +15,12 @@ import { normalizeSettings, updateSettingsFromResponse } from './normalization'
 const productCssSource = readFileSync(new URL('../ui-demo/ui-demo.css', import.meta.url), 'utf8')
 
 describe('自定义语音指令', () => {
+  it('被动静默设置采用默认关闭并承接即时保存响应', () => {
+    const settings = normalizeSettings({})
+    expect(settings.quiet_hours).toEqual({ enabled: false, start: '23:00', end: '07:00' })
+    updateSettingsFromResponse(settings, { settings: { quiet_hours: { enabled: true, start: '22:30', end: '06:30' } }, effective_from: 'immediate' })
+    expect(settings.quiet_hours).toEqual({ enabled: true, start: '22:30', end: '06:30' })
+  })
   it('从服务端快照读取条目并更新保存结果', () => {
     const settings = normalizeSettings({
       custom_instructions: [{ id: 'wait', trigger: '等一下', target: 'voice', instruction: '等待用户继续说', enabled: true }],
