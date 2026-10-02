@@ -42,6 +42,8 @@ SessionLedger ──> LLMContextProjector ──> 主 LLM 请求
 - VAD 在 SmartTurn 推理时持续接收音频。若检测到再次开口，控制器立即使该次判断失效，并通过分析 WebSocket 的 `cancel`（取消消息）通知工作进程；SmartTurn 每次推理使用独立的 ONNX Runtime `RunOptions`（推理选项）请求终止。分析通道只有在原生推理实际结束后才释放，因此取消不成功时不会排队重叠推理。
 - SmartTurn 使用当前停顿前的最近 8 秒音频窗口；窗口不会因一次分析而从输入缓冲中删除。分析繁忙、失败、超时或未判定结束时继续收音，`hard_silence_ms`（硬静音封口时长）1400ms 执行兜底封口。
 - 确认封口后，Paraformer（流式语音识别）最终稿与 SenseVoiceSmall（语音精修和声学分析）并行处理。SenseVoice 的精修稿与音频线索随 `USER_INPUT_REFINED`（用户输入精修完成事件）进入对应请求尾部；线索只用于该次精修触发的请求，不写入冻结 HISTORY，也不在后续心跳重复发送。线索是模型推断，不是转写事实。
+- Paraformer（流式语音识别模型）按 `chunk_size`（流式分块尺寸）聚合音频，默认中心块为 600ms。结束消息必须让已开始推理的轮次执行 `is_final=True`（最终刷新）：即使完整分块已消费、剩余 PCM（脉冲编码音频）为空，也要刷新缓存尾字后再释放轮次资源；不重送已处理音频。纯空轮次和已清理轮次的重复结束包不启动模型推理。
+- 空的最终转写以 `empty_input`（空输入状态）结算并保留诊断记录，不提交 `USER_INPUT_FINALIZED`（用户输入定稿事件）；智能体入口再次拦截空定稿和空精修。迟到精修要求该轮已有定稿输入。排查 LLM（大语言模型）调用时按事件来源关联，不能把同轮编号下的非空分句或旁路事件请求归因为空转写。
 
 ### 语音事务
 
@@ -129,6 +131,7 @@ none → kws standby → asr active → kws standby → none
 - `/?replay=voice-shadow` 是开发环境只读回放，不应提交 reset、配置保存或模型应用请求。
 - `/ui-demo.html` 是 legacy 视觉原型，不属于真实运行时。
 - 页面只渲染服务端 conversation `seq` 和 `conversation_id + turn_id/speech_id`，不自行推断服务端顺序。
+- 产品展示层仅隐藏 `kind=user_turn`（用户消息类型）、`status=empty_input`（空输入状态）且 `text`（文本）为空或仅含空白字符的气泡。实时消息和离线快照使用相同规则；权威记录、`seq`（服务端顺序号）及诊断保持完整。非空短回答、助手消息、系统消息和其他状态记录不受此规则影响。
 - Shadow 摘要和运行轨迹只消费服务端的 `shadow.product` 权威快照与 `shadow.activity` 增量；
   增量按 `run_seq + item_id` 合并，重连先应用快照再应用 WebSocket `seq` 有序增量。前端不得
   从 status 文本推断任务终态，也不得把 status observer 摘要伪装成 `result`。

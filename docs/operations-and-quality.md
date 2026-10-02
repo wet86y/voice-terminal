@@ -18,12 +18,13 @@ git diff --check
 
 | 区域 | 测试入口 |
 | --- | --- |
+| ASR（自动语音识别）分块与最终刷新 | `tests/test_asr_worker.py`、`tests/test_asr_worker_protocol.py` |
 | Bridge 2.0（桥接协议 2.0）与 DSH（代理运行时）事件 | `tests/test_dsh_bridge.py`、`tests/test_bridge_v2_information.py`、`tests/test_durable_shadow_mailbox.py`、`tests/test_shadow_agent_harness.py` |
 | Shadow、上下文和 ledger | `tests/test_shadow_agent.py`、`tests/test_shadow_agent_harness.py`、`tests/test_session_ledger.py`、`tests/test_conversation_runtime.py` |
 | TTS、speech admission、分段发送 | `tests/test_minimax_tts.py`、`tests/test_speech_admission.py`、`tests/test_sentence_scheduling.py` |
 | 声纹 | `tests/test_speaker.py`、`tests/test_speaker_features.py` |
 | KWS、输入所有权与静默窗口 | `tests/test_kws_always_on.py`、`tests/test_scheduler_staircase.py`、`tests/test_kws_wake_window.py` |
-| Product UI | `npm test`、`npm run typecheck` |
+| Product UI（产品界面）与空输入展示 | `apps/web/src/product/useProductAdapter.test.ts`、`apps/web/src/conversation-log.test.ts`、`npm test`、`npm run typecheck` |
 
 完整回归不能只运行局部测试；协议、上下文、生命周期或公共事件变更必须运行 Python 全量、前端测试、类型检查和构建。
 
@@ -56,6 +57,19 @@ git diff --check
 停止或重置会话后旧请求不得恢复。该场景须使用重建后的插件和新语音会话。
 
 `-NoWeb` 只用于后端调试，不能作为完整 Web 语音终端验收结果。
+
+## 流式识别与空输入验收
+
+自动化回归应覆盖：完整分块后发送空结束包仍输出缓存尾字、待处理音频只消费一次、带余量的结束包正常刷新、纯空轮次不调用模型、重复结束包不重复推理、轮次缓存在结束后释放。产品展示验证同时覆盖实时连接与离线快照：隐藏 `empty_input`（空输入状态）且 `text`（文本）为空或仅含空白字符的用户气泡，保留非空短回答、助手和系统消息、其他状态记录以及原始诊断记录和顺序号。
+
+```powershell
+python -m pytest -q tests/test_asr_worker.py tests/test_asr_worker_protocol.py
+npm run test --workspace @voice-terminal/web -- src/product/useProductAdapter.test.ts src/conversation-log.test.ts
+```
+
+真实模型验证使用同一段 16kHz（16 千赫兹）单声道录音，分别取一个完整分块、多个完整分块、完整分块边界截断及含剩余音频的长度。以“最后一个含音频块设置 `is_final=True`（最终刷新）”为参考，与“音频块先传入、最后单独传空结束包”的工作进程结果比较；检查末尾文字、重复输出和跨轮缓存清理。记录实际 FunASR（语音识别工具包）版本与模型来源，结果保存在本地诊断产物中。该检查只验证识别工作进程，不等同于麦克风到播报的端到端验收；模型参数调优应另外使用固定录音对照评估。
+
+界面中有空输入记录不代表已请求 LLM（大语言模型）。按 `turn_id`（轮次编号）关联识别结果、`LLM_DISPATCHED`（模型请求派发事件）和完整请求上下文，再核对触发来源与实际文本；同轮编号的非空分句、旁路事件或系统检查不能直接归因为空转写。
 
 ## Bridge 2.0 信息观察
 

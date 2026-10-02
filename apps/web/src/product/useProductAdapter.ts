@@ -650,17 +650,20 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     const playingKeys = new Set(voice.playbackQueue.value
       .filter(item => item.state === 'playing')
       .map(item => `${item.conversation_id}\u0000${item.speech_id}`))
-    return railEntries.value.map(entry => ({
-      key: `${entry.kind === 'user_turn' ? 'turn' : 'speech'}:${entry.conversation_id}:${entry.turn_id || entry.speech_id}:${entry.seq}`,
-      role: entry.kind === 'user_turn' ? 'user' as const : 'assistant' as const,
-      kind: entry.kind,
-      text: entry.text,
-      at: entry.at,
-      status: entry.status,
-      termination: entry.termination,
-      delivery: entry.delivery,
-      speaking: entry.speech_id ? playingKeys.has(`${entry.conversation_id}\u0000${entry.speech_id}`) : false,
-    }))
+    // empty_input（空输入）：只过滤产品气泡，诊断记录与 seq（服务端顺序号）保留。
+    return railEntries.value
+      .filter(entry => !(entry.kind === 'user_turn' && entry.status === 'empty_input' && !entry.text.trim()))
+      .map(entry => ({
+        key: `${entry.kind === 'user_turn' ? 'turn' : 'speech'}:${entry.conversation_id}:${entry.turn_id || entry.speech_id}:${entry.seq}`,
+        role: entry.kind === 'user_turn' ? 'user' as const : 'assistant' as const,
+        kind: entry.kind,
+        text: entry.text,
+        at: entry.at,
+        status: entry.status,
+        termination: entry.termination,
+        delivery: entry.delivery,
+        speaking: entry.speech_id ? playingKeys.has(`${entry.conversation_id}\u0000${entry.speech_id}`) : false,
+      }))
   })
 
   // Speech that is queued or playing but has not settled into the log yet.  Its

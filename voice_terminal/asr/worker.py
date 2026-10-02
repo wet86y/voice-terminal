@@ -186,7 +186,9 @@ class AsrWorkerEngine:
                 window = bytes(pending[: self.chunk_stride_bytes])
                 del pending[: self.chunk_stride_bytes]
                 emitted_parts.append(await self._infer_window(turn_id, window, False))
-            if pending:
+            # is_final（最终刷新）：整窗音频已消费时，仍用空 PCM（脉冲编码音频）
+            # 刷新 Paraformer（流式识别模型）的缓存尾字；从未推理的空轮次不调用模型。
+            if pending or self._model_call_count_by_turn.get(turn_id, 0):
                 window = bytes(pending)
                 pending.clear()
                 emitted_parts.append(await self._infer_window(turn_id, window, True))
