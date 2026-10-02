@@ -23,7 +23,7 @@ SessionLedger ──> LLMContextProjector ──> 主 LLM 请求
 - `AgentEpisodeRuntime`：拥有唯一活动 LLM 请求和调度循环；确定性时钟、提示文本和流式语音准入由内部协作模块实现。
 - `EpisodeSpeechOutput`：维护 speak transaction、发送前沿、TTS 分段、播放和 delivery 结算。
 - `SessionLedger`：记录用户输入、已传达 assistant 文本、有效 refinement、工具结果和有语义影响的打断。
-- `ShadowRuntime`：每个 session 一个，异步执行只读工具和状态观察，不拥有语音控制权。
+- `ShadowRuntime`：每个 session 一个，异步执行只读工具和状态观察，不拥有语音控制权；DSH 根代理仅有提前静默请求这一受限例外。
 
 ## 不可破坏的不变量
 
@@ -76,7 +76,7 @@ speak 决策状态为 `speak`、`revision`、`cancel`、`wait`：
 ### Shadow 平面
 
 - 每个 session 只有一个 `ShadowRuntime`、一个活动 runner 和一份私有 committed trace。
-- Shadow 只读取 `ShadowContextProjector` 的权威语义帧，工具首版全部为 `READ_ONLY`。
+- Shadow 读取 `ShadowContextProjector` 的权威语义帧；文件与网络工具为 `READ_ONLY`（只读），DSH 根代理另可在明确授权时请求提前静默。
 - `progress` 和工具生命周期只更新产品投影。status observer（状态观察器）与根 Agent
   共用 `latest_shadow_information`（最新影子信息）单槽，严格按到达顺序覆盖。请求冻结时将最新快照
   放入 `runtime.shadow.information`，然后按 `version`（本地版本）比较清除；新版本保留给下一次请求。
@@ -94,7 +94,7 @@ none → kws standby → asr active → kws standby → none
 
 - KWS 命中不创建用户 turn，只触发唤醒确认。
 - ASR active 时 KWS worker 保留但不接收 PCM。
-- ASR→KWS 的交接只由静默窗口（`final_silence_ms`，本机产品设置为 90s）到期后的
+- ASR→KWS 的交接只由静默窗口（`final_silence_ms`，本机产品设置为 90s）到期或受限工具提前请求后的
   `final_silence` 系统检查触发；语音结算、播放结束和 LLM 输出都不改变输入所有权。
   模型主动发声触发的 KWS→ASR 轮换同样要挂这套窗口（`AgentEpisodeRuntime.arm_silence_window`）。
 - 静默窗口内，影子代理的 `progress`（进度）更新合并进入二等信箱；普通事件请求会带出其最新状态，

@@ -19,7 +19,7 @@ Voice Terminal 是 Windows 本机实时语音会话终端。浏览器负责产�
                                       └─ observation / input / result / failed → 主 LLM 400ms mailbox
 ```
 
-主语音链只有一个调度循环和一个语音事务 owner。未播放的 assistant 草稿不会写入历史；只有用户输入、实际传达的 assistant 文本、有效 refinement 和有语义影响的打断会进入会话账本。Shadow 是同一 session 的只读认知旁路，不控制语音、TTS、播放器或主调度器。status observer 摘要属于可替换的运行状态：会被 Voice 主 LLM 消费，但不追加为长期语义历史；progress 仍只更新产品 UI，不触发主 LLM。
+主语音链只有一个调度循环和一个语音事务 owner。未播放的 assistant 草稿不会写入历史；只有用户输入、实际传达的 assistant 文本、有效 refinement 和有语义影响的打断会进入会话账本。Shadow 是同一 session 的认知旁路；DSH 根代理仅可在用户明确要求或已启用的影子自定义指令明确规定时，请求提前执行静默前最终检查，其余语音、TTS、播放器和主调度控制仍由 Voice 拥有。status observer 摘要属于可替换的运行状态：会被 Voice 主 LLM 消费，但不追加为长期语义历史；progress 仍只更新产品 UI，不触发主 LLM。
 
 ## 快速开始
 
@@ -73,8 +73,8 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 - `deep`：主请求直接使用低思考。
 - KWS：`wake.enabled=true` 时进入唤醒词待机；关闭后 `session.start` 直接进入 ASR。
   唤醒命中或模型主动发声把麦克风交给 ASR 后，输入所有权只在静默窗口（`silence.seconds`，默认 90s）
-  到期时由 `final_silence` 系统检查交回 KWS；窗口内接话不需要再喊唤醒词，语音结算和播放结束都不改变所有权。
-- Shadow：默认开启，但只读、异步，不是主语音链路能够启动的必要条件；活跃期上下文更新按安全点合并，
+  到期时由 `final_silence` 系统检查交回 KWS；DSH 的 `request_early_silence` 可在输入与播报安静后提前执行同一检查。窗口内接话不需要再喊唤醒词，语音结算和播放结束都不改变所有权。
+- Shadow（影子代理）：默认开启、异步运行；文件与网络操作受只读权限约束，DSH（影子代理宿主）根代理另有明确授权下的提前静默工具。它不是主语音链路启动的必要条件；活跃期上下文更新按安全点合并，
   长推理每 20 秒通过 `inject` 发送一次不打断执行的收敛提醒（可由
   `shadow_agent.runtime_reminder_interval_ms` 调整）。
 

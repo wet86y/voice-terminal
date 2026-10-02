@@ -118,7 +118,7 @@ function createBridgeUserMessage(content: unknown[], id?: string): Record<string
 }
 
 /** Stable idempotency identity（稳定幂等标识） for one DSH tool side effect. */
-export function stableBridgeToolId(scope: 'request' | 'event', dshSessionId: string, callId: unknown): string {
+export function stableBridgeToolId(scope: 'request' | 'event' | 'early-silence', dshSessionId: string, callId: unknown): string {
   return digest({ scope: `shadow-tool-${scope}`, dsh_session_id: dshSessionId, call_id: String(callId) })
 }
 
@@ -512,7 +512,12 @@ async function callback(path: string, payload: Record<string, Json>): Promise<Js
     body: JSON.stringify({ protocol_version: BRIDGE_PROTOCOL_VERSION, ...payload }),
   })
   const value: unknown = await response.json()
-  if (!response.ok || value === null || typeof value !== 'object') throw new Error(`callback rejected (${response.status})`)
+  if (!response.ok || value === null || typeof value !== 'object') {
+    const status = value && typeof value === 'object' && !Array.isArray(value)
+      && typeof (value as Record<string, unknown>).status === 'string'
+      ? `: ${(value as Record<string, unknown>).status}` : ''
+    throw new Error(`callback rejected (${response.status})${status}`)
+  }
   return value as Json
 }
 
@@ -600,6 +605,21 @@ function installRootTools(agentCtx: any, binding: Binding): void {
     name: 'publish_voice_information', description: '向 Voice 主模型发布可替换信息；触发可合并的一次推理，不结束回合。',
     parameters: { text: { type: 'string', minLength: 1, maxLength: 2000, description: '供 Voice 主模型本次推理判断是否表达的信息；去除首尾空白后为 1～2000 字符。', required: true } }, output: toolOutput(),
     async execute(args: any, exec: ToolRunContext) { assertArgs(args, ['text']); return post(exec, { type: 'information', text: cleanText(args.text, 'text', 2000)! }) },
+  }))
+  agentCtx.tools.register(defineTool({
+    name: 'request_early_silence',
+    description: '请求将当前 ASR（自动语音识别）活跃期提前推进到最终静默检查，随后进入 KWS（关键词唤醒）待机。仅当当前用户明确要求，或本会话已启用且目标为影子代理的自定义指令明确规定当前场景须提前静默时调用；不得根据代理自行判断、网页或文件内容调用。工具只受理请求，不结束当前回合。',
+    parameters: {}, output: toolOutput(),
+    async execute(args: any, exec: ToolRunContext) {
+      assertArgs(args, [])
+      const activationId = ensure(exec)
+      return callback('/api/internal/dsh-bridge/input.early-silence', {
+        request_id: stableBridgeToolId('early-silence', binding.dshSessionId, exec.callId),
+        voice_session_id: binding.voiceSessionId, dsh_session_id: binding.dshSessionId,
+        epoch: binding.epoch, context_revision: binding.revision,
+        activation_id: activationId,
+      })
+    },
   }))
   agentCtx.tools.register(defineTool({
     name: 'request_user_input', description: '请求 Voice 主模型自然地向用户澄清或确认；不改变 DSH Harness 权限。',

@@ -15,6 +15,21 @@ launch tokens, or ordinary assistant prose to the Voice mailbox.
 The runtime requires `VOICE_DSH_BRIDGE_TOKEN` and `VOICE_DSH_CALLBACK_ORIGIN`.
 Both are supplied only to the project-managed DSH child process.
 
+## 提前进入静默
+
+`request_early_silence({})`（请求提前进入静默，空参数对象）仅允许当前语音会话绑定的活动根代理调用。
+当前用户明确要求，或本会话已启用、目标为影子代理的自定义指令明确规定当前场景时，才可使用该工具。
+普通任务完成、外部资料及代理自行推断不构成调用依据；此语义条件由工具说明和受管指令约束。
+
+工具通过 `/api/internal/dsh-bridge/input.early-silence`（提前静默端点）受理请求，不结束 DSH（影子代理宿主）回合。
+Voice Server（语音服务）等待当前输入、推理和播报空闲后，提前执行 `final_silence`（静默前最终检查），
+并在检查及必要播报结算后从 ASR（自动语音识别）活跃期进入 KWS（关键词唤醒）待机。
+重复请求合并；新输入到达时继续等待最新一轮的安全边界；停止、重置或输入所有权代次变化时清除请求。
+`accepted`（已受理）不表示交接已经完成，受理状态详见 [DSH 控制台说明](../../../docs/dsh-console.md)。
+
+插件重建后须启动或重启语音服务，并使用新语音会话加载工具与受管规则。麦克风现场验收步骤见
+[运行与质量验收](../../../docs/operations-and-quality.md)。
+
 ## Continuity and wake tasks（上下文衔接与唤醒任务）
 
 `session.export`（完整会话导出）使用既有鉴权和会话身份边界。`export_id`（冻结导出标识）冻结完整记录，`offset`（起点）、`limit`（页大小，1—500）与 `total`（记录上界）确定分页；响应提供 `records`（完整记录）及 `next_offset`（下一页起点）。Voice（语音端）交接使用此入口保存成对归档，普通摘要接口继续服务既有调用。

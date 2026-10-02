@@ -11,6 +11,7 @@ from voice_terminal.controller.turn_workspace import AudioFrame
 from voice_terminal.config import load_config
 from voice_terminal.core.event_bus import EventBus
 from voice_terminal.core.state import RuntimeState, TerminalState
+from voice_terminal.agent.scheduler import AgentDecisionScheduler
 
 
 class _IdleKws:
@@ -344,5 +345,131 @@ def test_model_initiated_speech_arms_the_same_silence_window():
         controller.activate_asr_for_model_speech = already_asr
         await controller._on_model_speech_accepted()
         assert armed == [True], "没有发生所有权轮换时不得重复挂梯子"
+
+    asyncio.run(scenario())
+
+
+def test_early_silence_waits_for_quiet_and_reuses_final_check():
+    async def scenario():
+        scheduler = AgentDecisionScheduler(SimpleNamespace(
+            scheduler_tick_ms=400, final_silence_ms=90_000,
+        ))
+        scheduler.arm()
+        dispatched = []
+        episode = SimpleNamespace(
+            closed=False, user_speaking=True, active_request=None,
+            scheduler=scheduler, _ensure_runner=lambda: dispatched.append(scheduler.generation),
+        )
+
+        async def log(*_args, **_kwargs):
+            return None
+
+        async def arm_silence_window(*_args, **_kwargs):
+            scheduler.arm()
+
+        episode.log = log
+        episode.arm_silence_window = arm_silence_window
+        controller = object.__new__(EpisodeController)
+        controller.wake_always_on = True
+        controller.kws = _IdleKws()
+        controller.state = SimpleNamespace(listening=True, input_owner="asr")
+        controller._activation_generation = 3
+        controller._early_silence_task = None
+        controller._background = set()
+        controller.workspace = SimpleNamespace(turn_id="speaking")
+        controller.output = SimpleNamespace(active=False, busy=True)
+        controller.episode = episode
+
+        assert await controller.request_early_silence() == "scheduled"
+        assert await controller.request_early_silence() == "already_pending"
+        await asyncio.sleep(0.07)
+        assert not scheduler.final_pending
+
+        controller.workspace = None
+        episode.user_speaking = False
+        controller.output.busy = False
+        await asyncio.sleep(0.07)
+        assert scheduler.final_pending
+        assert dispatched == [1]
+
+        # New input replaces the pending ladder; the early request survives.
+        scheduler.defer()
+        await asyncio.sleep(0.07)
+        assert not scheduler.final_pending
+        scheduler.activate_deferred()
+        await asyncio.sleep(0.07)
+        assert scheduler.final_pending
+        assert dispatched == [1, 2]
+
+        controller.state.input_owner = "kws"
+        await asyncio.sleep(0.07)
+        assert controller._early_silence_task is None
+
+    asyncio.run(scenario())
+
+
+def test_early_silence_rejects_non_asr_and_cancels_on_reset_boundary():
+    async def scenario():
+        controller = object.__new__(EpisodeController)
+        controller.wake_always_on = True
+        controller.kws = _IdleKws()
+        controller.state = SimpleNamespace(listening=True, input_owner="kws")
+        controller.episode = SimpleNamespace(closed=False, scheduler=SimpleNamespace(final_dispatched=False))
+        assert await controller.request_early_silence() == "not_asr"
+        controller.state.input_owner = "asr"
+        controller._early_silence_task = asyncio.create_task(asyncio.sleep(60))
+        await controller._cancel_early_silence()
+        assert controller._early_silence_task is None
+
+    asyncio.run(scenario())
+
+
+def test_early_silence_runs_final_check_before_kws_handover():
+    from tests.test_scheduler_staircase import (
+        _BlockingProvider, _speaking_runtime, _finish_blocking_request,
+    )
+
+    async def scenario():
+        provider = _BlockingProvider()
+        runtime = _speaking_runtime(provider)
+        runtime._ensure_runner = lambda: None
+        runtime.scheduler.arm()
+        anchor = runtime.scheduler.anchor_monotonic
+        runtime.scheduler.start_heartbeat(anchor)
+        controller = object.__new__(EpisodeController)
+        controller.wake_always_on = True
+        controller.kws = _IdleKws()
+        controller.state = SimpleNamespace(listening=True, input_owner="asr")
+        controller._activation_generation = 1
+        controller._early_silence_task = None
+        controller._background = set()
+        controller.workspace = None
+        controller.output = SimpleNamespace(active=False, busy=False)
+        controller.episode = runtime
+        returned = []
+
+        async def return_to_kws(generation):
+            returned.append(generation)
+            controller.state.input_owner = "kws"
+            controller._activation_generation += 1
+            return True
+
+        controller._return_to_kws = return_to_kws
+        runtime.on_final_system_check_settled = controller._final_system_check_settled
+        assert await controller.request_early_silence() == "scheduled"
+        await asyncio.sleep(0)
+        assert runtime.scheduler.final_pending
+        assert returned == []
+        await runtime._on_heartbeat(anchor + 0.4)
+        await asyncio.sleep(0)
+        assert runtime.active_dispatch_context["prompt_kind"] == "final_silence"
+        assert runtime.active_dispatch_context["silence_elapsed_ms"] < 1000
+        assert returned == []
+        await _finish_blocking_request(runtime, provider)
+        await asyncio.sleep(0.06)
+        assert returned == [1]
+        assert controller.state.input_owner == "kws"
+        assert provider.calls == 1
+        assert controller._early_silence_task is None
 
     asyncio.run(scenario())

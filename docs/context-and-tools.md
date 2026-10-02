@@ -160,6 +160,11 @@ Shadow 可用时，主模型只获得以下本地控制动作：
 - `return_shadow_result({text})`（返回最终结果）：发布自包含的唯一终态结果；
 - `finish_shadow_no_action({reason?})`（无动作结束）：结束激活但不写入语义历史。
 
+DSH（影子代理宿主）后端另提供 `request_early_silence({})`（请求提前进入静默）：仅当前用户明确要求，
+或本会话已启用的影子自定义指令明确规定当前场景时调用。工具等待语音输入及播报安静，再提前执行
+`final_silence`（静默前最终检查），检查结算后进入 KWS（关键词唤醒）待机。该非终态工具通过独立的受保护
+服务端入口执行，不进入原生 ShadowToolExecutor（影子工具执行器）的文件与网络能力目录。
+
 首版 executor 只接受 `READ_ONLY` 能力；`REVERSIBLE_WRITE`、`EXTERNAL_COMMIT` 和 `DESTRUCTIVE` 仅保留类型，不加载实现。所有路径、工具名、参数和 effect 都在本地再次校验。
 
 事件处理规则：
