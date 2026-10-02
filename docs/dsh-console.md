@@ -40,7 +40,7 @@ profile；profile patch（配置补丁）使用 `agent-preset-registry`（Agent 
 
 ## 打开 DSH 界面
 
-先启动 Voice Terminal 项目服务，再打开 `http://127.0.0.1:5173/`，使用产品顶栏的 DSH 控制台入口。
+先从[独立应用入口](application-lifecycle.md)启动 Voice Terminal，再使用自动打开网页中的产品顶栏 DSH 控制台入口。网页优先使用 `http://127.0.0.1:5173/`，占用时以应用打开的实际地址为准。
 该入口会向 Voice Server 请求一次性 launch URL（启动地址），并在 DSH 界面就绪后打开控制台。
 DSH Web Host（网页服务）固定监听 `127.0.0.1:3081`；直接访问该端口时，必须使用受管入口生成的临时访问令牌。
 不要收藏、复制给他人或写入日志带有 `?token=` 的完整地址。
@@ -218,6 +218,10 @@ revision 和 snapshot/delta。reset 会取消旧 Turn、把旧 Session 标记 re
 新 epoch 创建全新 Session；旧 activation 的迟到事件永久拒绝。
 
 ## 故障边界
+
+应用模式下，DSH 是语音服务管理器拥有的委托组件。应用宿主在语音服务开始监听后请求启动 DSH，汇总状态并统一调度退出；关闭网页或 DSH 控制台页面不会结束应用。托盘和“系统运行”页退出同一应用实例，语音服务收到命名事件后通过私有标准输入管道触发 DSH 原有正常清理流程。应用进入退出状态后禁止自动重启。
+
+“系统运行”页可手动恢复失败的 DSH；恢复会重置自动重启计数，并验证桥接与关联会话。恢复后的语音服务保持待机，不自动重播语音或重新执行旧模型动作。独立后端调试继续沿用语音服务原来的启动与关闭链路。
 
 3081 被现有进程占用时 Runtime Manager拒绝附着。DSH 异常退出只做有限自动重启，达到上限后标记
 unavailable；Voice 主链继续运行，并且不会为同一 Voice Session自动切到 native。首次 activation 无法

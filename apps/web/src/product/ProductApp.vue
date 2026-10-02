@@ -1,5 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { onMounted } from 'vue'
+import ApplicationStartup from './ApplicationStartup.vue'
+import ApplicationSystem from './ApplicationSystem.vue'
+import { useApplicationHost } from './application-host'
+import './application.css'
 import type { ReasoningMode, ShadowActivity } from '../types'
 import type { CustomInstruction } from './types'
 import {
@@ -12,6 +17,21 @@ import {
 } from './useProductAdapter'
 
 const adapter = useProductAdapter()
+const applicationHost = useApplicationHost()
+const { snapshot: applicationSnapshot } = applicationHost
+onMounted(() => {
+  void applicationHost.start()
+  if (new URLSearchParams(window.location.search).get('settings') === 'system') {
+    applicationHost.inspect()
+    adapter.page.value = 'settings'
+    adapter.settingsTab.value = 'system'
+  }
+})
+onBeforeUnmount(applicationHost.stop)
+function showApplicationSystem() {
+  adapter.page.value = 'settings'
+  adapter.settingsTab.value = 'system'
+}
 const {
   voice, page: activePage, settingsTab: activeSettingsTab, settings, loading, saving,
   connected, replayMode, replayMeta, runtimeState, current, conversationRows, pendingSpeechRows,
@@ -1060,6 +1080,7 @@ function pageLabel() {
         <span class="mock-tag">{{ replayMode ? `${replayMeta.label} · 只读` : connected ? '本机已连接' : '离线可重试' }}</span>
       </div>
     </header>
+    <div v-if="applicationSnapshot?.state === 'degraded'" class="application-degraded" role="status"><span>系统已进入降级运行，部分可选组件不可用。核心语音功能仍可使用。</span><button type="button" @click="showApplicationSystem">查看系统运行</button></div>
 
     <!-- Keep both top-level views mounted; v-show preserves state without paying for a hidden layout. -->
     <section v-show="activePage === 'home'" :class="{ 'view-hidden': activePage !== 'home' }" class="workbench workbench-reordered" aria-label="Voice Terminal 工作台">
@@ -1176,7 +1197,7 @@ function pageLabel() {
       <header class="settings-heading"><div><p class="panel-kicker">应用设置</p><h1>让助手更像你的工作方式</h1><p>设置通过 Voice Server 产品 API 保存；KWS、Persona、最终静默设置在安全边界后于下一次会话或 Episode 生效。</p></div><span class="settings-badge">{{ connected ? '实时后端已连接' : '后端离线 · 可重试' }}</span></header>
       <div v-if="settings.warnings.length" class="model-safety"><span>!</span><p>{{ settings.warnings.join(' ') }}</p></div>
       <div class="settings-layout">
-        <nav class="settings-tabs"><button type="button" :class="{ active: activeSettingsTab === 'wake' }" @click="activeSettingsTab = 'wake'"><span>◌</span><div><strong>KWS 唤醒词</strong><small>启动与待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'persona' }" @click="activeSettingsTab = 'persona'"><span>✦</span><div><strong>人格与指令</strong><small>主 LLM 与 Shadow</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'silence' }" @click="activeSettingsTab = 'silence'"><span>◷</span><div><strong>静默等待</strong><small>最终检查与回待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'speaker' }" @click="activeSettingsTab = 'speaker'"><span>♬</span><div><strong>声纹识别</strong><small>可选身份增强</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'wakes' }" @click="activeSettingsTab = 'wakes'"><span>⏱</span><div><strong>唤醒任务</strong><small>定时与循环事件</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'models' }" @click="activeSettingsTab = 'models'"><span>◇</span><div><strong>模型管理</strong><small>连接、配置与模型池</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'compute' }" @click="activeSettingsTab = 'compute'"><span>▦</span><div><strong>本地模型设备</strong><small>CPU、GPU 与资源状态</small></div></button></nav>
+        <nav class="settings-tabs"><button type="button" :class="{ active: activeSettingsTab === 'system' }" @click="activeSettingsTab = 'system'"><span>◎</span><div><strong>系统运行</strong><small>组件状态与资源</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'wake' }" @click="activeSettingsTab = 'wake'"><span>◌</span><div><strong>KWS 唤醒词</strong><small>启动与待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'persona' }" @click="activeSettingsTab = 'persona'"><span>✦</span><div><strong>人格与指令</strong><small>主 LLM 与 Shadow</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'silence' }" @click="activeSettingsTab = 'silence'"><span>◷</span><div><strong>静默等待</strong><small>最终检查与回待机</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'speaker' }" @click="activeSettingsTab = 'speaker'"><span>♬</span><div><strong>声纹识别</strong><small>可选身份增强</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'wakes' }" @click="activeSettingsTab = 'wakes'"><span>⏱</span><div><strong>唤醒任务</strong><small>定时与循环事件</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'models' }" @click="activeSettingsTab = 'models'"><span>◇</span><div><strong>模型管理</strong><small>连接、配置与模型池</small></div></button><button type="button" :class="{ active: activeSettingsTab === 'compute' }" @click="activeSettingsTab = 'compute'"><span>▦</span><div><strong>本地模型设备</strong><small>CPU、GPU 与资源状态</small></div></button></nav>
 
         <article class="settings-panel panel">
           <template v-if="activeSettingsTab === 'wake'">
@@ -1275,6 +1296,9 @@ function pageLabel() {
             </div>
           </template>
 
+          <template v-else-if="activeSettingsTab === 'system'">
+            <ApplicationSystem />
+          </template>
           <template v-else-if="activeSettingsTab === 'compute'">
             <header><p class="panel-kicker">本地模型运行设备</p><h2>在 CPU 与 GPU 间分配本地推理</h2><p>逐项设置本地模型的运行设备。保存后需要完全重启应用；TTS（语音合成）不在此页管理。</p></header>
             <section class="compute-resource-card">
@@ -1326,5 +1350,6 @@ function pageLabel() {
       <div v-if="notice" class="save-notice" :class="{ 'is-fading': !noticeVisible }" role="status"><span>✓</span>{{ notice }}<button type="button" aria-label="关闭提示" @click="setNotice('')">×</button></div>
     </Transition>
     <div v-if="showApplyConfirm" class="modal-backdrop"><section class="apply-dialog" role="dialog" aria-modal="true"><p class="panel-kicker">立即应用</p><h2>重启受影响的模型服务？</h2><p>后端将停止当前聆听和 TTS 播放，统一重建 Voice、Shadow、status observer 和 TTS。当前配置只有在重启成功后才会提交。</p><ul><li v-for="item in applyImpact" :key="item">{{ item }}</li></ul><div><button class="outline-button" type="button" @click="showApplyConfirm = false">暂不应用</button><button class="save-button" type="button" @click="confirmApply">确认并立即重启</button></div></section></div>
+    <ApplicationStartup @system="showApplicationSystem" />
   </main>
 </template>

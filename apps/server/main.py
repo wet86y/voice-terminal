@@ -17,6 +17,7 @@ if __package__ in (None, ""):
 import uvicorn  # type: ignore
 
 from voice_terminal.config import PersonaConfig, load_config
+from voice_terminal.application.managed import run_uvicorn, report as application_report
 from voice_terminal.env import load_env_file
 from voice_terminal.logging_setup import configure_logging
 from voice_terminal.model_registry import ModelRegistryService, WindowsCredentialVault
@@ -37,6 +38,7 @@ def _runtime_build_info(root: Path, effective_config: Path) -> dict[str, str | i
         completed = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True,
             text=True, timeout=2, check=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" and os.environ.get("VOICE_APP_ORIGIN") else 0,
         )
         revision = completed.stdout.strip() or revision
     except (OSError, subprocess.SubprocessError):
@@ -119,7 +121,13 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
             runtime.startup_errors.append(
                 f"model_registry_scan: {type(exc).__name__}: {str(exc)[:260]}"
             )
-        await runtime.initialize()
+        try:
+            await runtime.initialize()
+        except BaseException:
+            await runtime.close_background_services()
+            await runtime.close()
+            await runtime.dsh.close()
+            raise
         try:
             compute_status = await runtime.compute_status()
             restored_devices = await asyncio.to_thread(
@@ -136,7 +144,9 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
             runtime.startup_errors.append(
                 f"compute_status_startup: {type(exc).__name__}: {str(exc)[:240]}"
             )
-        runtime.dsh.begin_start()
+        if not os.environ.get("VOICE_APP_ORIGIN"):
+            runtime.dsh.begin_start()
+        application_report("voice", "初始化完成，等待服务监听")
         try:
             yield
         finally:
@@ -172,7 +182,8 @@ def main() -> None:
     logging.getLogger(__name__).info("server.runtime_build %s", runtime.build_info)
     host = args.host or runtime.config.server.host
     port = args.port or runtime.config.server.port
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    run_uvicorn(app, host=host, port=port, log_level="info", timeout_graceful_shutdown=10,
+        on_shutdown=runtime.begin_application_shutdown)
 
 
 if __name__ == "__main__":

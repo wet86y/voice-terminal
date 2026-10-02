@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import time
 from typing import Any, Mapping
 from urllib.parse import quote
@@ -80,6 +81,35 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     @app.get("/health")
     async def health() -> dict[str, Any]:
         return runtime.health_payload()
+
+    def authorize_application(request: Request) -> None:
+        token = os.environ.get("VOICE_APP_INTERNAL_TOKEN", "")
+        remote = request.client.host if request.client else ""
+        if not token or remote not in {"127.0.0.1", "::1"} or not secrets.compare_digest(
+            request.headers.get("authorization", ""), "Bearer " + token
+        ):
+            raise HTTPException(status_code=403, detail="仅允许本次应用宿主控制组件。")
+
+    @app.get("/internal/application/status")
+    async def application_status(request: Request) -> dict:
+        authorize_application(request)
+        return await runtime.application_delegated_status()
+
+    @app.post("/internal/application/control")
+    async def application_control(request: Request) -> dict:
+        authorize_application(request)
+        payload = await request.json()
+        if not isinstance(payload, dict) or payload.get("action") not in {
+            "pause", "dsh-start", "dsh-retry", "speaker-retry", "reinitialize"
+        }:
+            raise HTTPException(status_code=422, detail="受管操作无效。")
+        if payload["action"] == "reinitialize":
+            for field, environment in (("asr_available", "VOICE_APP_ASR_AVAILABLE"),
+                                       ("analysis_available", "VOICE_APP_ANALYSIS_AVAILABLE")):
+                if not isinstance(payload.get(field), bool):
+                    raise HTTPException(status_code=422, detail="缺少受管工作进程状态。")
+                os.environ[environment] = "1" if payload[field] else "0"
+        return await runtime.application_control(payload["action"])
 
     def registry_or_404() -> ModelRegistryService:
         if model_registry is None:

@@ -412,7 +412,8 @@ async def run(config_path: Path | None = None) -> None:
 
     async with websockets.serve(handler, config.speaker_worker.host, config.speaker_worker.port):
         logger.info("Speaker Worker listening on ws://%s:%s/speaker", config.speaker_worker.host, config.speaker_worker.port)
-        await asyncio.Future()
+        from ..application.managed import wait_for_shutdown
+        await wait_for_shutdown()
 
 
 def main() -> None:

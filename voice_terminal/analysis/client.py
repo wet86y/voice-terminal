@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 import uuid
 
 
@@ -9,12 +10,16 @@ class AnalysisClient:
         self.url = url
 
     async def health(self) -> dict:
+        if os.environ.get("VOICE_APP_ANALYSIS_AVAILABLE") == "0":
+            raise RuntimeError("应用未确认分析工作进程所有权或就绪状态")
         import websockets
         async with websockets.connect(self.url, open_timeout=2, close_timeout=0.2) as socket:
             await socket.send(json.dumps({"operation": "health"}))
             return json.loads(await asyncio.wait_for(socket.recv(), 2))
 
     async def analyze(self, operation: str, pcm: bytes, turn_id: str, generation_id: int, timeout_ms: int) -> dict:
+        if os.environ.get("VOICE_APP_ANALYSIS_AVAILABLE") == "0":
+            raise RuntimeError("应用未确认分析工作进程所有权或就绪状态")
         import websockets
         request_id = uuid.uuid4().hex
         async with websockets.connect(self.url, open_timeout=timeout_ms / 1000, close_timeout=0.1,

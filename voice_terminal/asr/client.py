@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import logging
 import time
 import uuid
@@ -39,6 +40,8 @@ class AsrWorkerClient:
         return self._socket is not None
 
     async def connect(self) -> None:
+        if os.environ.get("VOICE_APP_ASR_AVAILABLE") == "0":
+            raise AsrWorkerError("应用未确认语音识别工作进程所有权或就绪状态", code="ASR_WORKER_UNOWNED")
         if self._socket is not None:
             return
         try:

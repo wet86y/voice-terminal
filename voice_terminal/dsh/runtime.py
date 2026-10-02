@@ -89,6 +89,8 @@ class DshRuntimeManager:
         return self.status().as_dict()
 
     def begin_start(self) -> None:
+        if self._closing:
+            return
         if not self.config.enabled:
             self._state = "disabled"
             return
@@ -135,11 +137,18 @@ class DshRuntimeManager:
                 "VOICE_DSH_TASKS_ACTIVE": "1",
             })
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            managed = bool(os.environ.get("VOICE_APP_ORIGIN"))
+            node_arguments = [node]
+            if managed:
+                node_arguments += ["--require", str(self.repo_root / "scripts/managed-node.cjs")]
+                if os.name == "nt":
+                    creationflags |= subprocess.CREATE_NO_WINDOW
             self._process = await asyncio.create_subprocess_exec(
-                node, str(cli), "web", "--host", self.config.host,
+                *node_arguments, str(cli), "web", "--host", self.config.host,
                 "--port", str(self.config.port), "--no-open",
                 cwd=str(self.repo_root), env=env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE if managed else asyncio.subprocess.DEVNULL,
                 creationflags=creationflags,
             )
             assert self._process.stdout is not None and self._process.stderr is not None
@@ -358,6 +367,7 @@ class DshRuntimeManager:
         process = await asyncio.create_subprocess_exec(
             *args, cwd=str(cwd) if cwd else None,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" and os.environ.get("VOICE_APP_ORIGIN") else 0,
         )
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
@@ -421,16 +431,20 @@ class DshRuntimeManager:
             return
         if process.returncode is None:
             try:
-                if os.name == "nt" and not force:
+                if not force and os.environ.get("VOICE_APP_ORIGIN") and process.stdin:
+                    process.stdin.write(b"voice-terminal:shutdown\n")
+                    await process.stdin.drain()
+                elif os.name == "nt" and not force:
                     process.send_signal(signal.CTRL_BREAK_EVENT)
                 else:
                     process.terminate()
                 await asyncio.wait_for(process.wait(), self.config.shutdown_timeout_ms / 1000)
-            except (ProcessLookupError, asyncio.TimeoutError):
+            except (OSError, asyncio.TimeoutError):
                 if os.name == "nt":
                     killer = await asyncio.create_subprocess_exec(
                         "taskkill", "/PID", str(process.pid), "/T", "/F",
                         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
                     )
                     await killer.wait()
                 elif process.returncode is None:

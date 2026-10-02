@@ -784,6 +784,12 @@ class DshShadowAgentSession:
                  raw.from_revision if isinstance(raw, ShadowContextUpdate) else 0,
                  target, timing, relation, elapsed)
 
+    async def reconnect(self) -> None:
+        """Rebind bridge（重新绑定桥接）并同步上下文，不重新派发历史动作。"""
+        self._opened = False
+        await self._ensure_open()
+        await self._sync_context(force_snapshot=True, hold=True)
+
     async def _ensure_open(self) -> None:
         if self._opened:
             return

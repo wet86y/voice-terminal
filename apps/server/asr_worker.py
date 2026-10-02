@@ -14,6 +14,7 @@ from voice_terminal.config import load_config
 from voice_terminal.env import load_env_file
 from voice_terminal.logging_setup import configure_logging
 from voice_terminal.server.product import ProductSettingsStore
+from voice_terminal.application.managed import report, wait_for_shutdown
 
 
 async def run(config_path: Path | None = None) -> None:
@@ -41,6 +42,7 @@ async def run(config_path: Path | None = None) -> None:
     )
     # Do not open the health port until the real model is loaded.  This makes
     # start.ps1 and Voice Server readiness reflect actual ASR availability.
+    report("asr", "加载语音识别模型")
     await asyncio.to_thread(engine.load)
 
     async def handler(websocket, path=None):
@@ -56,7 +58,8 @@ async def run(config_path: Path | None = None) -> None:
             config.asr_worker.port,
             engine.device,
         )
-        await asyncio.Future()
+        report("asr", "模型已加载，语音识别接口已监听")
+        await wait_for_shutdown()
 
 
 def main() -> None:

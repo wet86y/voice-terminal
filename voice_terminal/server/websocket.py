@@ -12,6 +12,8 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from ..audio.capture import AudioCapture
+from ..application.managed import report as application_report
+from .application_runtime import ApplicationRuntimeMixin
 from ..audio.player import PcmPlayer
 from ..audio.processing import AudioPreprocessor
 from ..asr.client import AsrWorkerClient
@@ -68,7 +70,7 @@ async def _no_session_lock():
     yield
 
 
-class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin):
+class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntimeMixin):
     """The sole production runtime: a session orchestrating input, agent and speech."""
     def __init__(self, config: AppConfig, *, product_settings: ProductSettingsStore | None = None,
                  speaker_worker_config_path: Path | None = None,
@@ -244,6 +246,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin):
         logger.warning("%s", self.startup_errors[-1])
 
     async def initialize(self) -> None:
+        application_report("voice", "初始化音频设备与输入处理")
         self._restore_or_persist_voice_identity()
         loop = asyncio.get_running_loop()
         self.shadow_product.reset(available=False)
@@ -324,6 +327,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin):
             }
             self._record_error("vad", str(exc), status_service="asr")
 
+        application_report("voice", "连接语音识别并初始化声纹")
         self.asr = AsrWorkerClient(self.config.asr.worker_url)
         try:
             await self.asr.connect()
@@ -336,6 +340,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin):
 
         await self._initialize_speaker()
 
+        application_report("voice", "配置主模型、影子代理与语音合成")
         llm_key = self._api_key(self.config.llm.api_key_env)
         if llm_key:
             self.llm = DeepSeekClient(
@@ -410,7 +415,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin):
                         shadow_cfg.experimental_context_gate_enabled,
                     )
                     self.dsh.bridge_hub.register(self.shadow_session)
-                    if not self._handoff_marker.exists():
+                    if not self._handoff_marker.exists() and not os.environ.get("VOICE_APP_ORIGIN"):
                         await self.shadow_session.resume_pending_gate()
                     self.history.set_shadow_runtime_state(available=True, active=False)
                     self.shadow_product.reset(available=True)
@@ -537,6 +542,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin):
             ambient_store=self.ambient_store,
         )
         self.controller.set_reasoning_mode(self.reasoning_mode)
+        application_report("voice", "建立唯一会话调度器")
         await self.controller.initialize()
         if self._handoff_marker.exists():
             async with self._session_lock:

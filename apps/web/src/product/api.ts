@@ -20,7 +20,7 @@ export class ProductApiError extends Error implements ProductApiErrorShape {
 }
 
 function apiBaseUrl() {
-  return (import.meta.env.VITE_VOICE_API_URL || DEFAULT_API_URL).replace(/\/$/, '')
+  return ((typeof window !== 'undefined' && window.__VOICE_APPLICATION__?.voice_api_url) || import.meta.env.VITE_VOICE_API_URL || DEFAULT_API_URL).replace(/\/$/, '')
 }
 
 async function readError(response: Response): Promise<string> {
