@@ -59,6 +59,8 @@ export interface ProductComputeStatus {
 }
 
 export interface ProductRuntimeSnapshot {
+  /** quiet_hours（被动静默状态）：passive_quiet（抑制主动语音）、user_interaction（用户交互窗口）、within_quiet_hours（处于配置时段），不包含待传达正文。 */
+  quiet_hours?: { passive_quiet: boolean; user_interaction: boolean; within_quiet_hours: boolean }
   state: TerminalState
   listening: boolean
   can_start: boolean
@@ -88,6 +90,8 @@ export interface CustomInstruction {
 }
 
 export interface ProductSettingsSnapshot {
+  /** quiet_hours（每日被动静默）：enabled（启用）、start（开始时间）、end（结束时间）。 */
+  quiet_hours?: { enabled: boolean; start: string; end: string }
   schema_version: number
   /** TTS backend（语音后端）固定为 MiniMax API（在线语音接口）。 */
   tts: { backend: 'minimax' }

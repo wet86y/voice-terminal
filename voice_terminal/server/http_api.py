@@ -442,6 +442,23 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             registry_error(product_error)
             raise AssertionError("unreachable")
 
+    @app.put("/api/v1/product/settings/quiet-hours")
+    async def update_product_quiet_hours(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            store = product_store_or_404()
+            if body.get("enabled") and not runtime.config.wake.enabled:
+                raise ProductSettingsError("KWS（关键词唤醒）尚未生效，请先开启下一次会话。")
+            value = store.save_quiet_hours(body)
+            await runtime.apply_quiet_hours(value["quiet_hours"])
+            runtime.stage_product_settings(store.settings_only())
+            return {"settings": value, "effective_from": "immediate", "pending": False,
+                    "message": "被动静默时间已保存并即时生效。"}
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                raise
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
     @app.put("/api/v1/product/settings/silence")
     async def update_product_silence(body: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -840,7 +857,12 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 elif command == "session.stop":
                     await runtime.stop_listening()
                 elif command == "session.reset":
-                    await runtime.reset_session()
+                    try:
+                        await runtime.reset_session()
+                    except Exception:
+                        logger.exception("handoff.manual_reset_failed")
+                        await _send_error(websocket, sequencer, "HANDOFF_RESET_FAILED",
+                            "会话交接整理失败，原会话、归档和待传达材料已保留，可以继续交互。", None, True)
                 elif command == "session.reasoning_mode":
                     mode = _payload.get("mode")
                     if not isinstance(mode, str) or not await runtime.set_reasoning_mode(mode):

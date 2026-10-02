@@ -52,6 +52,7 @@ class SessionLedger:
         self.limit = limit
         self.entries: list[SessionLedgerEntry] = []
         self.records: list[InputRecord] = []
+        self.delivery_records: list[dict[str, Any]] = []  # delivery_records（完整语音交付归档，不参与模型注入）。
         # Client-facing, monotonically ordered view of the same conversation.
         # It is owned here because the ledger is the durable conversation of
         # record: the controller appends the terminal states it publishes.
@@ -77,6 +78,7 @@ class SessionLedger:
     def reset(self) -> None:
         self.entries.clear()
         self.records.clear()
+        self.delivery_records.clear()
         self.conversation.reset()
         self._committed_delivery_ids.clear()
         self._committed_shadow_event_ids.clear()
@@ -410,10 +412,13 @@ class SessionLedger:
             + "</voice_delivery>"
         )
 
-    def commit_delivery(self, speech_id: str, text: str, delivery: DeliveryReport) -> bool:
+    def commit_delivery(self, speech_id: str, text: str, delivery: DeliveryReport,
+                        *, metadata: dict[str, Any] | None = None) -> bool:
         if not speech_id or speech_id in self._committed_delivery_ids:
             return False
         self._committed_delivery_ids.add(speech_id)
+        self.delivery_records.append({"kind": "voice_delivery", "speech_id": speech_id,
+                                      "text": text, "delivery": asdict(delivery), **(metadata or {})})
         # The model must never treat text that never reached the user as shared knowledge.
         heard = (
             str(text or "").strip()

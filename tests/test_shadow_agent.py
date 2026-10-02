@@ -478,9 +478,9 @@ def test_disabling_context_gate_releases_deferred_authority_prefix():
     assert [frame.content["transcript"] for frame in projector.shadow_context_snapshot().frames[1:]] == ["一", "二"]
 
 
-def test_information_reaches_model_mailbox_while_progress_remains_product_only():
+def test_information_reaches_model_mailbox_while_progress_remains_product_only(tmp_path):
     async def scenario():
-        runtime = SessionRuntime(AppConfig())
+        runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / ".runtime")
         status = ShadowEvent("s", "information", "正在整理", 1)
         progress = ShadowEvent("p", "progress", "已读取文件", 1)
         await runtime._on_shadow_events([status, progress])

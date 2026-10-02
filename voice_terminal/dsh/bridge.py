@@ -344,7 +344,8 @@ class DshBridgeClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-                raw = response.read(2 * 1024 * 1024 + 1)
+                # session.export（完整会话导出）按记录数分页；单个工具结果不能按字节截断。
+                raw = response.read() if operation == "session.export" else response.read(2 * 1024 * 1024 + 1)
         except urllib.error.HTTPError as exc:
             raw = exc.read(2 * 1024 * 1024 + 1)
             if 400 <= exc.code < 500 and len(raw) <= 2 * 1024 * 1024:
@@ -367,7 +368,7 @@ class DshBridgeClient:
                 f"DSH Bridge transport failed: {type(exc).__name__}",
                 operation=operation, request_id=request_id, transport=True,
             ) from None
-        if len(raw) > 2 * 1024 * 1024:
+        if operation != "session.export" and len(raw) > 2 * 1024 * 1024:
             raise DshBridgeError("DSH Bridge response exceeds limit")
         try:
             value = json.loads(raw)
@@ -1000,13 +1001,20 @@ class DshShadowAgentSession:
         await self._stop_context_resync()
         await self._stop_observer()
         async with self._event_lock:
-            if self._opened and not self._retired:
-                try:
-                    await self.client.call("session.retire", self._envelope())
-                except DshBridgeError:
-                    if strict:
-                        raise
-                await self._save_mapping(state="retired", retired=True)
+            retire = self._opened and not self._retired
+            envelope = self._envelope()
+            self.activation_id = None
+        # whenIdle（远端结算）可能等待回传；释放事件锁，使旧回传能及时得到 stale（已过期）。
+        if retire:
+            try:
+                response = await self.client.call("session.retire", envelope)
+                if strict and response.get("result") not in {"accepted", "duplicate", "not_found"}:
+                    raise DshBridgeError("DSH（后台代理）退役未获确认，保留交接事务。")
+            except DshBridgeError:
+                if strict:
+                    raise
+            await self._save_mapping(state="retired", retired=True)
+        async with self._event_lock:
             self.dsh_session_id = f"voice-shadow-{uuid.uuid4()}"
             self.epoch = int(self.context_source.shadow_context_epoch)
             self.last_applied_revision = -1
@@ -1029,21 +1037,26 @@ class DshShadowAgentSession:
             self._observer_trace_revision = 0
             self._visible_status = ""
 
-    async def cancel(self) -> None:
+    async def cancel(self, *, strict: bool = False) -> None:
         await self._stop_handoff()
         await self._stop_context_resync()
         async with self._event_lock:
-            if self._opened and not self._retired:
-                try:
-                    await self.client.call("session.cancel", self._envelope())
-                except DshBridgeError:
-                    pass
+            cancel = self._opened and not self._retired
+            envelope = self._envelope()
             self.activation_id = None
             self._waiting_user = False
             self._deferred_revision = 0
             self._gate_requested_revision = 0
             self.last_guided_revision = self.last_applied_revision
             self._gate_generation += 1
+        if cancel:
+            try:
+                response = await self.client.call("session.cancel", envelope)
+                if strict and response.get("result") not in {"accepted", "duplicate"}:
+                    raise DshBridgeError("DSH（后台代理）取消未获确认，保留原会话。")
+            except DshBridgeError:
+                if strict:
+                    raise
         await self._activity("cancelled")
 
     async def close(self) -> None:
@@ -1051,14 +1064,16 @@ class DshShadowAgentSession:
         await self._stop_context_resync()
         await self._stop_observer()
         async with self._event_lock:
-            if self._opened and not self._retired:
-                try:
-                    await self.client.call("session.retire", self._envelope())
-                except DshBridgeError:
-                    pass
-                await self._save_mapping(state="retired", retired=True)
+            retire = self._opened and not self._retired
+            envelope = self._envelope()
             self._retired = True
             self.activation_id = None
+        if retire:
+            try:
+                await self.client.call("session.retire", envelope)
+            except DshBridgeError:
+                pass
+            await self._save_mapping(state="retired", retired=True)
         providers = [self.status_provider]
         if self.gate_provider is not self.status_provider:
             providers.append(self.gate_provider)

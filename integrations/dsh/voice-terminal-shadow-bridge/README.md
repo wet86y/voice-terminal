@@ -17,6 +17,10 @@ Both are supplied only to the project-managed DSH child process.
 
 ## Continuity and wake tasks（上下文衔接与唤醒任务）
 
+`session.export`（完整会话导出）使用既有鉴权和会话身份边界。`export_id`（冻结导出标识）冻结完整记录，`offset`（起点）、`limit`（页大小，1—500）与 `total`（记录上界）确定分页；响应提供 `records`（完整记录）及 `next_offset`（下一页起点）。Voice（语音端）交接使用此入口保存成对归档，普通摘要接口继续服务既有调用。
+
+`session.resume`（恢复会话）的 `archive_only=true`（仅为归档恢复）保留持久历史，不追加语音管理提示。`session.cancel`（取消会话）和 `session.retire`（退役会话）等待 `whenIdle`（工具与回合结算至空闲）并确认持久保存，随后才返回；重复退役返回 `duplicate`（重复确认）。`session.state`（状态查询）的 `record_count`（完整记录水位）用于提交前检测整理期间恢复活动。Voice（语音端）等待结算时释放事件锁，过时回传可以及时得到拒绝。
+
 This Bridge（插件桥接层） works with `voice-terminal-wake-tasks`（语音终端唤醒任务插件）.
 The plugin owns task persistence（任务持久化） and scheduling（任务调度）. On due delivery,
 the Bridge writes a normal `user/message`（用户消息） to the current Voice-linked

@@ -108,6 +108,7 @@ class ShadowRuntime(ShadowToolLoopMixin):
         self.committed_model_steps = 0
         self.last_status_step = 0
         self.working_trace: list[dict[str, Any]] = []
+        self.archival_trace: list[dict[str, Any]] = []  # archival_trace（不参与压缩的完整归档记录）。
         self.latest_visible_status: ShadowVisibleStatus | None = None
         self.user_input_required = False
         self.runner: asyncio.Task[None] | None = None
@@ -273,6 +274,7 @@ class ShadowRuntime(ShadowToolLoopMixin):
 
     def _append(self, item: dict[str, Any]) -> None:
         self.working_trace.append(item)
+        self.archival_trace.append(json.loads(json.dumps(item, ensure_ascii=False)))
         self.trace_revision += 1
 
     def _append_call_outputs(
@@ -1188,6 +1190,7 @@ class ShadowRuntime(ShadowToolLoopMixin):
         self.committed_model_steps = 0
         self.last_status_step = 0
         self.working_trace.clear()
+        self.archival_trace.clear()
         self.latest_visible_status = None
         self.user_input_required = False
         self.runner = None

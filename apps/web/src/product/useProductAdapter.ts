@@ -118,6 +118,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const personaDocument = ref<keyof ProductSettingsSnapshot['persona']>('personality')
   const customInstructions = ref<CustomInstruction[]>([])
   const silenceSeconds = ref(30)
+  const quietHoursForm = reactive({ enabled: false, start: '23:00', end: '07:00' })
   const modelScanState = ref<'idle' | 'scanning' | 'complete'>('idle')
   const providerStep = ref<'idle' | 'discovering' | 'select-model' | 'custom-id' | 'verified'>('idle')
   const speakerForm = reactive({ mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4, owner_only_barge_in: false })
@@ -242,6 +243,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     const nextSettings = normalizeSettings(value.settings)
     Object.assign(settings.wake, nextSettings.wake)
     Object.assign(settings.silence, nextSettings.silence)
+    settings.quiet_hours = nextSettings.quiet_hours
+    Object.assign(quietHoursForm, nextSettings.quiet_hours)
     Object.assign(settings.shadow, nextSettings.shadow)
     Object.assign(settings.speaker, nextSettings.speaker)
     Object.assign(settings.compute.devices, nextSettings.compute.devices)
@@ -628,6 +631,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const connected = computed(() => voice.connection.value === 'connected')
   const runtimeState = computed<ProductRuntimeState>(() => normalizeRuntimeState(voice.state.value, connected.value))
   const runtimeSource = computed(() => snapshot.value?.runtime)
+  const quietStatus = computed(() => connected.value ? voice.quietHours : runtimeSource.value?.quiet_hours)
   const current = computed(() => connected.value
     ? voice.current
     : snapshot.value?.conversation.current || defaultCurrent())
@@ -842,6 +846,21 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
         const result = await productApi.saveSilence({ seconds: silenceSeconds.value })
         updateSettingsFromResponse(settings, result)
         setNotice(result.message || '静默设置已保存，将在下一次 Episode 生效。')
+      } catch (error) {
+        setError(error)
+      } finally {
+        saving.value = false
+      }
+    })
+  }
+
+  async function saveQuietHours() {
+    await enqueue(async () => {
+      saving.value = true
+      try {
+        const result = await productApi.saveQuietHours({ ...quietHoursForm })
+        updateSettingsFromResponse(settings, result)
+        setNotice(result.message || '被动静默时间已即时生效。')
       } catch (error) {
         setError(error)
       } finally {
@@ -1245,6 +1264,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     toggleProviderReasoning,
     saveWake,
     saveSilence,
+    quietHoursForm,
+    quietStatus,
+    saveQuietHours,
     saveShadowGate,
     savePersona,
     saveCustomInstructions,

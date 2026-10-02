@@ -109,6 +109,8 @@ Shadow thinking+tools 的合法 `reasoning`、`function_call`、`function_call_o
 
 ## 字段准入
 
+待传达槽位及原始静默输出属于交接整理输入，不能进入主模型或 DSH（后台代理）的请求。只有已提交的 continuity document（交接文档）通过既有交接入口进入新会话。被阻止的输出不写为用户已听到的 HISTORY（历史正文）；完整输出与实际交付记录另存归档。静默文本整理复用唯一主模型循环，使用无动作的独立请求，不重放原动作。详细提交与归档规则见[跨会话交接说明](continuity-foundation.md)。
+
 新增字段前必须填写 owner、lane、持久化策略、schema 影响和测试责任：
 
 | 字段 | Owner | Lane | 是否持久化 | 必要测试 |

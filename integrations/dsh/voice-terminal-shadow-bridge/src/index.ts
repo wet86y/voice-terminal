@@ -84,6 +84,26 @@ interface Binding {
   nextReminderMs: number
   reminderTimer?: ReturnType<typeof setTimeout>
   pendingReminder?: PendingReminder
+  /** exportSnapshot（完整归档快照）：分页期间保持稳定，不受后续事件影响。 */
+  exportSnapshot?: { id: string; records: any[] }
+}
+
+/** session export（会话完整导出）；offset（起点）、limit（页大小）、total（记录上界）。 */
+export function exportSessionPage(binding: Pick<Binding, 'handle' | 'exportSnapshot'>, body: Record<string, any>): Record<string, Json> {
+  const id = body.export_id
+  if (typeof id !== 'string' || !id || id.length > 128) throw new Error('invalid export_id（导出标识）')
+  if (binding.exportSnapshot?.id !== id) {
+    binding.exportSnapshot = { id, records: JSON.parse(JSON.stringify(binding.handle.agent.session.snapshotEvents())) }
+  }
+  const events = binding.exportSnapshot.records
+  const offset = Number(body.offset ?? 0), limit = Number(body.limit ?? 100)
+  const total = body.total == null ? events.length : Number(body.total)
+  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit)
+      || limit < 1 || limit > 500 || !Number.isSafeInteger(total)
+      || total < offset || total > events.length) throw new Error('invalid export range（导出范围）')
+  const end = Math.min(offset + limit, total)
+  return { records: events.slice(offset, end) as Json, export_id: id,
+           total, next_offset: end < total ? end : null }
 }
 
 const MAX_OBSERVER_RECORDS = 512
@@ -783,10 +803,11 @@ export function apply(ctx: any, config: Config): void {
             }
           }
           binding.handle = handle
-          if (path === 'session.resume') discardResumedAuthoritativeContext(binding)
+          // archive_only（仅恢复归档）：不注入提示或启动推理，保留原始持久记录。
+          if (path === 'session.resume' && body.archive_only !== true) discardResumedAuthoritativeContext(binding)
           bindings.set(binding.dshSessionId, binding)
           ctx.sessionTitle.rename(handle.agent.session, `Voice Shadow · ${binding.voiceSessionId.slice(0, 8)} · epoch ${binding.epoch}`)
-          handle.agent.inject(createBridgeUserMessage([
+          if (body.archive_only !== true) handle.agent.inject(createBridgeUserMessage([
             { type: 'text', text: `MANAGED VOICE SHADOW INSTRUCTIONS\nSource: config/shadow_agent/instructions.md\n\n${GENERATED_SHADOW_PROMPT}` },
           ]))
           const response = result('accepted', { dsh_session_id: binding.dshSessionId })
@@ -794,6 +815,9 @@ export function apply(ctx: any, config: Config): void {
           json(res, 200, response); return
         }
         if (!existing || existing.voiceSessionId !== body.voice_session_id) { json(res, 404, result('not_found')); return }
+        if (path === 'session.retire' && existing.epoch === body.epoch && existing.state === 'retired') {
+          json(res, 200, result('duplicate')); return
+        }
         if (existing.epoch !== body.epoch || existing.state === 'retired') { json(res, 409, result('stale')); return }
         let response: Json
         if (path === 'context.snapshot' || path === 'context.update') {
@@ -887,9 +911,17 @@ export function apply(ctx: any, config: Config): void {
             response = result('accepted', { dsh_session_id: existing.dshSessionId, message_id: occurrenceId })
           }
         } else if (path === 'session.cancel') {
-          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-cancel', { keepInbox: false }); existing.pendingContext = undefined; existing.queuedMessages?.clear(); existing.heldContext = undefined; existing.deferredRevision = undefined; existing.pendingReminder = undefined; delete existing.activationId; response = result('accepted')
+          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-cancel', { keepInbox: false }); existing.pendingContext = undefined; existing.queuedMessages?.clear(); existing.heldContext = undefined; existing.deferredRevision = undefined; existing.pendingReminder = undefined; delete existing.activationId
+          // whenIdle（结算至空闲）包括工具取消与最终记录，不能只确认取消信号。
+          await existing.handle.agent.whenIdle()
+          if (!await ctx.sessions.flush(existing.handle.agent.session)) throw new Error('session cancel persistence failed')
+          response = result('accepted')
         } else if (path === 'session.retire') {
-          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-retire', { keepInbox: false }); existing.pendingContext = undefined; existing.queuedMessages?.clear(); existing.heldContext = undefined; existing.deferredRevision = undefined; existing.pendingReminder = undefined; existing.state = 'retired'; delete existing.activationId
+          stopRuntimeReminder(existing, true); existing.handle.agent.cancel('voice-terminal-retire', { keepInbox: false }); existing.pendingContext = undefined; existing.queuedMessages?.clear(); existing.heldContext = undefined; existing.deferredRevision = undefined; existing.pendingReminder = undefined; delete existing.activationId
+          await existing.handle.agent.whenIdle()
+          if (!await ctx.sessions.flush(existing.handle.agent.session)) throw new Error('session retire persistence failed')
+          existing.state = 'retired'
+          existing.exportSnapshot = undefined
           ctx.sessionTitle.rename(existing.handle.agent.session, `Voice Shadow · ${existing.voiceSessionId.slice(0, 8)} · epoch ${existing.epoch} · retired`)
           response = result('accepted')
         } else if (path === 'session.state') {
@@ -900,10 +932,14 @@ export function apply(ctx: any, config: Config): void {
             terminal: !existing.activationId,
             agent_state: existing.handle.agent.status,
             ready_for_handoff: !existing.activationId && existing.handle.agent.status === 'idle',
+            record_count: existing.handle.agent.session.snapshotEvents().length, // record_count（归档记录水位）。
             queued_revision: existing.queuedRevision ?? 0,
             claimed_revision: existing.claimedRevision ?? 0,
             deferred_revision: existing.deferredRevision ?? 0,
           })
+        } else if (path === 'session.export') {
+          if (!await ctx.sessions.flush(existing.handle.agent.session)) throw new Error('session export persistence failed')
+          response = result('accepted', exportSessionPage(existing, body as Record<string, any>))
         } else if (path === 'session.context') {
           const budget = { chars: 100_000 }
           const rows: Array<{ role: string; text: string }> = []

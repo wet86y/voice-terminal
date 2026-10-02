@@ -42,6 +42,8 @@ def common_prefix_chars(left: str, right: str) -> int:
 async def queue_streamed_speech(runtime, state: StreamedSpeechAdmissionState,
                                 decision, full_text) -> bool:
     self = runtime
+    if getattr(self, "should_defer_speech", lambda: False)():
+        return True
     identity = state.identity
     source_turn_id = state.source_turn_id
     snapshot = state.snapshot

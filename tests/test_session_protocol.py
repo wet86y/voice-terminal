@@ -44,10 +44,10 @@ def test_the_ordered_conversation_is_published_on_the_public_protocol():
     assert envelope["payload"]["turn_id"] == "input_a"
 
 
-def test_subscribe_snapshot_carries_the_ordered_conversation():
+def test_subscribe_snapshot_carries_the_ordered_conversation(tmp_path):
     """A reload restores the whole rail from one server-ordered projection."""
 
-    runtime = SessionRuntime(AppConfig())
+    runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / ".runtime")
     runtime.history.conversation.append(
         USER_TURN, conversation_id="conversation_a", turn_id="input_1", text="灵月是什么游戏？",
     )

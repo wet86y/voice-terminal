@@ -24,7 +24,7 @@ def test_legacy_local_settings_migrate_without_starting_a_worker():
         settings_path = root / "product-settings.json"
         settings_path.write_text(json.dumps({"schema_version": 5, "tts": {"backend": "cosyvoice"}}), encoding="utf-8")
         product = ProductSettingsStore(path=settings_path, config=config)
-        runtime = SessionRuntime(config, product_settings=product)
+        runtime = SessionRuntime(config, product_settings=product, runtime_data_dir=root / ".runtime")
         assert product.snapshot()["tts"]["backend"] == "minimax"
         assert json.loads(settings_path.read_text(encoding="utf-8"))["tts"]["backend"] == "minimax"
         assert not hasattr(runtime, "cosyvoice_worker")
@@ -35,7 +35,7 @@ def test_status_exposes_only_active_online_backend():
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = AppConfig(model_dir=root / "models", persona=PersonaConfig(directory=root / "persona"))
-            runtime = SessionRuntime(config)
+            runtime = SessionRuntime(config, runtime_data_dir=root / ".runtime")
             app = create_app(runtime)
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
                 status = await client.get("/api/v1/tts/status")

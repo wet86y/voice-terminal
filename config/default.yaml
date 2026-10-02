@@ -1,6 +1,19 @@
 model_dir: "D:\\模型\\voice-terminal"
 debug_audio_capture: false
 
+# quiet_hours（被动静默时间）：本地每日时间，需先启用 KWS（关键词唤醒）。
+quiet_hours:
+  enabled: false
+  start: "23:00"
+  end: "07:00"
+
+# continuity（交接整理）：provider（供应方）省略时继承 shadow_agent.provider（影子模型供应方）。
+# 固定以 reasoning_effort=high（高强度思考）调用，服务不支持时报告失败并保留材料。
+continuity:
+  max_document_chars: 6000  # 交接文档字符上限。
+  max_output_tokens: 16384  # 整理输出词元预算。
+  max_context_tokens: 524288  # 整理上下文词元预算。
+
 # The only runtime: audio input refinement is independently configurable.
 smart_turn:
   smart_turn: true

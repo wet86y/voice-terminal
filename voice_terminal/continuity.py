@@ -9,11 +9,11 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Awaitable, Callable, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 logger = logging.getLogger(__name__)
 
-CONTINUITY_MAX_CHARS = 800
+CONTINUITY_MAX_CHARS = 6000
 CONTINUITY_IDLE_SECONDS = 60 * 60
 
 
@@ -23,21 +23,27 @@ class ContinuityManager:
     def __init__(
         self,
         path: Path,
-        summarize: Callable[[Sequence[dict], str], Awaitable[str]],
+        summarize: Callable[[Sequence[dict], str], Awaitable[Any]],
         *,
         on_document_changed: Callable[[str], None] | None = None,
-        on_organized: Callable[[str, int], Awaitable[bool]] | None = None,
+        on_organized: Callable[[Any, int], Awaitable[bool]] | None = None,
+        on_failure: Callable[[Exception], Awaitable[None]] | None = None,
         idle_seconds: float = CONTINUITY_IDLE_SECONDS,
+        max_document_chars: int = CONTINUITY_MAX_CHARS,
+        retry_seconds: float = 60,
     ) -> None:
         self.path = path
         self.summarize = summarize
         self.on_document_changed = on_document_changed
         self.on_organized = on_organized
+        self.on_failure = on_failure
+        self.retry_seconds = max(.01, retry_seconds)
         self.idle_seconds = max(0.0, float(idle_seconds))
+        self.max_document_chars = max_document_chars
         self.document = self._read_document()
         self._generation = 0
         self._idle_task: asyncio.Task[None] | None = None
-        self._organizer_task: asyncio.Task[str] | None = None
+        self._organizer_task: asyncio.Task[Any] | None = None
         self._snapshot_factory: Callable[[], Sequence[dict]] | None = None
         self._captured_snapshot: list[dict] | None = None
 
@@ -50,18 +56,13 @@ class ContinuityManager:
             logger.warning("continuity.document_read_failed error=%s", type(exc).__name__)
             return ""
         text = value.get("document") if isinstance(value, dict) else ""
-        return self._bounded(text if isinstance(text, str) else "")
+        return text if isinstance(text, str) else ""
 
-    @staticmethod
-    def _bounded(value: str) -> str:
+    def _bounded(self, value: str) -> str:
         text = "\n".join(line.rstrip() for line in str(value or "").splitlines()).strip()
-        if len(text) <= CONTINUITY_MAX_CHARS:
-            return text
-        clipped = text[:CONTINUITY_MAX_CHARS]
-        boundary = max(clipped.rfind("\n"), clipped.rfind(" "))
-        if boundary >= CONTINUITY_MAX_CHARS * 0.75:
-            clipped = clipped[:boundary]
-        return clipped.rstrip()
+        if len(text) > self.max_document_chars:
+            raise ValueError("交接文档超限，保留原文档等待压缩重试。")
+        return text
 
     def user_started(self) -> None:
         """Invalidate any organizer as soon as a new user session begins."""
@@ -97,6 +98,7 @@ class ContinuityManager:
 
     async def _wait_then_organize(self, generation: int, anchor_wall_time: float) -> None:
         delay = max(0.0, anchor_wall_time + self.idle_seconds - time.time())
+        retrying = False
         try:
             await asyncio.sleep(delay)
             if generation != self._generation:
@@ -113,7 +115,7 @@ class ContinuityManager:
             updated = await organizer
             if generation != self._generation:
                 return
-            bounded = self._bounded(updated)
+            bounded = self._bounded(updated) if isinstance(updated, str) else updated
             if self.on_organized is None:
                 self._replace_document(bounded)
             elif not await self.on_organized(bounded, generation):
@@ -128,22 +130,35 @@ class ContinuityManager:
             # A provider failure is not an empty result: retain the current
             # document and allow the next idle window to retry.
             logger.warning("continuity.organizer_failed error=%s", type(exc).__name__)
+            if self.on_failure is not None:
+                await self.on_failure(exc)
+            if generation == self._generation:
+                retrying = True
+                self._idle_task = asyncio.create_task(self._wait_then_organize(
+                    generation, time.time() + self.retry_seconds - self.idle_seconds),
+                    name="continuity-organizer-retry")
         finally:
             if self._idle_task is asyncio.current_task():
                 self._idle_task = None
             if self._organizer_task is not None and self._organizer_task.done():
                 self._organizer_task = None
-            if generation == self._generation:
+            if generation == self._generation and not retrying:
                 self._snapshot_factory = None
                 self._captured_snapshot = None
 
     def _replace_document(self, text: str) -> None:
-        self.document = text
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
         payload = json.dumps({"schema_version": 1, "document": text}, ensure_ascii=False, indent=2)
-        temporary.write_text(payload, encoding="utf-8")
-        os.replace(temporary, self.path)
+        try:
+            with temporary.open("w", encoding="utf-8") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        self.document = text
         if self.on_document_changed is not None:
             self.on_document_changed(text)
 

@@ -1,5 +1,6 @@
 """Application of a validated main-agent decision to speech output."""
 from __future__ import annotations
+from hashlib import sha256
 
 from .decision_envelope import DecisionEnvelope
 from .streamed_speech import common_prefix_chars
@@ -17,6 +18,12 @@ async def apply_decision_v06(self, identity, turn_id, envelope: DecisionEnvelope
             and dispatch_context.get("prompt_kind") == "kws_wake"
             and (decision.state != "speak" or not decision.text.strip() or envelope.actions)):
         raise ProtocolError("kws_wake requires nonempty speak and actions=[]")
+    if (getattr(self, "should_defer_speech", lambda: False)()
+            and decision.text.strip()):
+        source_id = str(turn_id or identity[1]) + ":" + sha256(decision.text.encode("utf-8")).hexdigest()
+        self.defer_speech(source_id, decision.text)
+        self.current_action = "wait"
+        return
     snapshot = getattr(self.output, "speak_snapshot", {})
     queue_status = snapshot.get("queue_status", "empty") if isinstance(snapshot, dict) else "empty"
     active_same_turn = bool(

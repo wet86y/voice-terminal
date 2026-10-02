@@ -7,10 +7,11 @@ const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 export const MAX_WAKE_KEYWORDS = 5
 
 export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 7,
+  schema_version: 9,
   tts: { backend: 'minimax' },
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
+  quiet_hours: { enabled: false, start: '23:00', end: '07:00' },
   shadow: { experimental_context_gate_enabled: false },
   speaker: { mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4, owner_only_barge_in: false },
   compute: {
@@ -58,6 +59,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   if (!isRecord(value)) return structuredClone(DEFAULT_SETTINGS)
   const wake = isRecord(value.wake) ? value.wake : {}
   const silence = isRecord(value.silence) ? value.silence : {}
+  const quiet = isRecord(value.quiet_hours) ? value.quiet_hours : {}
   const shadow = isRecord(value.shadow) ? value.shadow : {}
   const tts = isRecord(value.tts) ? value.tts : {}
   const speaker = isRecord(value.speaker) ? value.speaker : {}
@@ -79,6 +81,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   const primaryKeyword = text(wake.keyword) || DEFAULT_SETTINGS.wake.keyword
   return {
     schema_version: typeof value.schema_version === 'number' ? value.schema_version : DEFAULT_SETTINGS.schema_version,
+    quiet_hours: { enabled: quiet.enabled === true, start: text(quiet.start) || '23:00', end: text(quiet.end) || '07:00' },
     tts: { backend: 'minimax' },
     wake: {
       enabled: wake.enabled === true,
@@ -159,6 +162,7 @@ export function updateSettingsFromResponse(settings: ProductSettingsSnapshot, re
   if (!isRecord(candidate)) return
   if (isRecord(candidate.wake)) Object.assign(settings.wake, candidate.wake)
   if (isRecord(candidate.silence)) Object.assign(settings.silence, candidate.silence)
+  if (isRecord(candidate.quiet_hours)) settings.quiet_hours = { ...settings.quiet_hours, ...candidate.quiet_hours } as ProductSettingsSnapshot['quiet_hours']
   if (isRecord(candidate.shadow)) Object.assign(settings.shadow, candidate.shadow)
   if (isRecord(candidate.speaker)) Object.assign(settings.speaker, candidate.speaker)
   if (isRecord(candidate.compute)) {

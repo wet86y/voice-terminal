@@ -11,6 +11,7 @@ from .speech_frontier import SpeechFrontierMixin
 from .turn_workspace import TurnWorkspace
 from ..core.state import RuntimeState
 from ..tts.alignment import DeliveryResolver
+from ..quiet_hours import PassiveQuietSuppressed
 
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,8 @@ class SpeechHandle:
         self.text = ""
         self.task = None
         self.finished = False
+        self.envelope_validated = False  # envelope_validated（完整决策已通过协议校验）。
+        self.run_started = False  # run_started（是否进入播放及结算路径）。
         # A replacement must never borrow the socket that is still flushing
         # the superseded transaction.  The pipeline binds the concrete
         # session to this handle, not to the output singleton.
@@ -98,6 +101,9 @@ class SpeechHandle:
             await asyncio.gather(put, return_exceptions=True)
 
     async def feed(self, text):
+        if self.reason == "passive_quiet":
+            self.text += text
+            return
         if self.reason or self.task.done():
             raise ValueError("speech output closed")
         self.text += text
@@ -105,6 +111,9 @@ class SpeechHandle:
         await self._put(text)
 
     async def finish(self):
+        if self.reason == "passive_quiet":
+            self.finished = True
+            return
         await self._put(None)
         self.finished = True
 
@@ -246,8 +255,18 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         h, r = self.handle, self.runtime
         return bool(h and h.workspace.token == token and not h.reason and r and not r.closed)
 
+    def deferred_remainder(self, handle, full_text):
+        """只扣除本事务已确认播放的前缀，尚不确定的部分仍作为未播放材料。"""
+        resolver = self._delivery_resolvers.get(handle.speech_id)
+        delivery = (resolver.resolve(handle.snapshot or {"started": False}, full_text,
+                    overlap_start_ms=handle.overlap_start_ms) if resolver is not None else {})
+        heard = str(delivery.get("heard_text") or "")
+        return full_text[len(heard):], heard
+
     async def _wait_for_playback_permission(self, ws, token):
         """Wait while user speech owns the pre-playback output boundary."""
+        if getattr(self.runtime, "should_defer_speech", lambda: False)():
+            raise PassiveQuietSuppressed()
         while self._valid(token):
             h = self._handle_for_workspace(ws)
             if h is None or h.workspace.playback_started or not self._playback_hold:
@@ -440,7 +459,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during cleanup")
         on_model_speech = getattr(self.controller, "_on_model_speech_accepted", None)
-        if callable(on_model_speech):
+        if callable(on_model_speech) and not getattr(self.runtime, "should_defer_speech", lambda: False)():
             await on_model_speech()
         # Keep at most one latest text candidate behind the active playback.
         # The queue stores text handles only; it never owns provider PCM.
@@ -452,6 +471,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
             self.generation += 1
         self.loop = asyncio.get_running_loop()
         h = SpeechHandle(self, identity, turn_id, self.generation, emotion, kind=kind)
+        h.envelope_validated = getattr(self.runtime, "_validated_envelope_identity", None) == identity
         if hasattr(self.tts, "bind"):
             h.tts_backend, h.tts_client = self.tts.bind()
         else:
@@ -716,6 +736,8 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         for h in items:
             if not h or h.task.done() or h.reason:
                 continue
+            if reason == "passive_quiet" and h.finished and h.envelope_validated and not h.run_started:
+                self.runtime.defer_speech(h.speech_id, h.text)
             h.reason = reason
             h.workspace.timings.setdefault("preemption_requested", time.monotonic())
             if h is not self.handle:
@@ -806,6 +828,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
             )
 
     async def _run(self, h):
+        h.run_started = True
         # Record completion even if cancellation occurs before the first delta.
         try:
             if not self._valid(h.workspace.token):
@@ -874,6 +897,8 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
                 h.workspace.timings["playback_snapshot_frozen"] = time.monotonic()
         except asyncio.CancelledError:
             h.reason = h.reason or "stopped"
+        except PassiveQuietSuppressed:
+            h.reason = "passive_quiet"
         except Exception as exc:
             h.reason = "failed"
             await self.runtime.log("SPEECH_ERROR", identity=h.identity, turn_id=h.turn_id,
@@ -975,6 +1000,9 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
                         enqueued_ms=getattr(snapshot, "enqueued_ms", None), **diagnostic,
                     )
             self.last_delivery = dict(delivery)
+            if h.reason == "passive_quiet" and h.finished and h.envelope_validated:
+                heard = str(delivery.get("heard_text") or "")
+                self.runtime.defer_speech(h.speech_id, h.text[len(heard):], heard_text=heard)
             source_timings = getattr(self.controller, "_turn_timings", {}).get(h.turn_id)
             if isinstance(source_timings, dict):
                 h.workspace.timings.update(source_timings)
@@ -1062,6 +1090,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
                        "input_id": h.turn_id,
                        "turn_id": h.turn_id, "output_generation": h.workspace.generation, "text": h.text,
                        "kind": h.kind, "queued_at": h.queued_at,
+                       "envelope_validated": h.envelope_validated,
                       "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
                       "emotion_transport": getattr(h.tts_client, "emotion_transport", "voice_setting"),
                       "emotion_status": getattr(h.tts_client, "emotion_status", "applied"),

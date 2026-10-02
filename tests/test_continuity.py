@@ -13,7 +13,7 @@ from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
 
 
-def test_continuity_replaces_document_with_bounded_result_and_clears_empty(tmp_path: Path):
+def test_continuity_keeps_complete_document_and_clears_explicit_empty(tmp_path: Path):
     async def scenario() -> None:
         changed = asyncio.Event()
         results = ["甲" * 900, ""]
@@ -29,7 +29,7 @@ def test_continuity_replaces_document_with_bounded_result_and_clears_empty(tmp_p
         manager.document = "旧文档"
         manager.arm(time.time() - 1, lambda: [{"kind": "input", "content": "新内容"}])
         await asyncio.wait_for(changed.wait(), timeout=1)
-        assert len(manager.document) == 800
+        assert len(manager.document) == 900
         assert json.loads((tmp_path / "continuity.json").read_text(encoding="utf-8"))["document"] == manager.document
 
         changed.clear()

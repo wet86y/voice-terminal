@@ -17,7 +17,7 @@ def test_wake_task_routes_cover_dsh_tools_and_settings_page(tmp_path: Path):
             persona=PersonaConfig(directory=tmp_path / "persona"),
         )
         settings = ProductSettingsStore(path=tmp_path / "settings.json", config=config)
-        runtime = SessionRuntime(config, product_settings=settings)
+        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / ".runtime")
         catalog: dict[str, dict] = {}
         frozen_reference = ""
 

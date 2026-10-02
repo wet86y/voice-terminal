@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   clearActivationIfCurrent,
+  exportSessionPage,
   deliverRuntimeReminder,
   enqueueAuthoritativeContext,
   enqueueDeferredActivation,
@@ -54,6 +55,27 @@ function envelope(revision, frames, fromRevision = undefined) {
 function textOf(message) {
   return message.content[0].text
 }
+
+test('session export（完整归档）保留长记录并冻结分页，不受后续活动影响', () => {
+  const events = Array.from({ length: 401 }, (_, seq) => ({ seq, type: 'user/message', data: { text: `记录${seq}` } }))
+  events[200].data.text = '工具结果'.repeat(40000)
+  const binding = { handle: { agent: { session: { snapshotEvents: () => events } } } }
+  const first = exportSessionPage(binding, { export_id: 'archive-a', limit: 100 })
+  events.push({ seq: 401, type: 'user/message', data: { text: '导出期间新增' } })
+  events[0].data.text = '后续修改'
+  const rows = [...first.records]
+  let offset = first.next_offset
+  while (offset != null) {
+    const page = exportSessionPage(binding, { export_id: 'archive-a', offset, limit: 100, total: first.total })
+    rows.push(...page.records)
+    offset = page.next_offset
+  }
+  assert.equal(rows.length, 401)
+  assert.equal(rows[0].data.text, '记录0')
+  assert.equal(rows[200].data.text.length, 160000)
+  assert.equal(exportSessionPage(binding, { export_id: 'archive-b', offset: 400, limit: 10 }).records.length, 2)
+  assert.throws(() => exportSessionPage(binding, { export_id: 'archive-b', offset: -1 }))
+})
 
 test('Bridge inbox 消息使用 DSH v4 接受的 source（来源字段）', () => {
   const { binding, nextStep } = fixture()

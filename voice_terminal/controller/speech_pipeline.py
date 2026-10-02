@@ -7,6 +7,7 @@ from ..tts.alignment import DeliveryResolver
 from ..tts.scheduling import DirectStreamingPolicy, PlaybackProgress, PlaybackWindowPolicy, TtsSegmentReceipt
 from ..tts.sentence_segmenter import PunctuationSentenceSegmenter, split_complete_text
 from ..tts.text_merger import BidiTextMerger
+from ..quiet_hours import PassiveQuietSuppressed
 from .speech_admission import ADMISSION_STAGING_CHARS, AdmissionState, SubmittedClause
 from .stream_buffer import FLUSH_DUE, buffered_stream
 
@@ -56,6 +57,7 @@ class SpeechPipeline:
 
     async def _play_stream(self, ws, token, deltas, *, speech_id: str | None = None,
                            handle=None) -> str:
+        await self._wait_for_playback_permission(ws, token)
         tts_client = handle.tts_client if handle is not None else self.tts
         if tts_client is None and not hasattr(self.tts, "bind"):
             tts_client = self.tts
@@ -277,6 +279,9 @@ class SpeechPipeline:
                             await asyncio.sleep(.02)
                             if not self._valid(token):
                                 return
+                        await self._wait_for_playback_permission(ws, token)
+                        if not self._valid(token):
+                            return
                         self.player.enqueue(playback_key, pcm)
                     # Bidi sentence/request boundaries do not include the
                     # sentence text, so they cannot safely close a local
@@ -627,6 +632,9 @@ class SpeechPipeline:
                     ws.timings.setdefault("first_task_continue", time.monotonic())
                     self.state.current["tts_text"] = segment
                     resolver.add_text(segment, int(playback_progress()["returned_ms"]))
+                    await self._wait_for_playback_permission(ws, token)
+                    if not self._valid(token):
+                        return
                     await session.send_text(segment)
                     # Only text the provider accepted is irreversible.
                     state.commit_segment(segment, receipt_index=before_segments)
@@ -686,6 +694,8 @@ class SpeechPipeline:
                     else:
                         await wait_for_provider_catch_up(before_bytes)
             except asyncio.CancelledError:
+                raise
+            except PassiveQuietSuppressed:
                 raise
             except Exception as exc:
                 tts_failed = exc
@@ -783,6 +793,8 @@ class SpeechPipeline:
                         if getattr(session, "generation_finished", False) and self.player is not None:
                             resolver.complete_pending(int(playback_progress()["returned_ms"]))
                     except asyncio.CancelledError:
+                        raise
+                    except PassiveQuietSuppressed:
                         raise
                     except Exception as exc:
                         tts_failed = tts_failed or exc
