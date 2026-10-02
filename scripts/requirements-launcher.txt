@@ -1,0 +1,6 @@
+# Launcher dependencies（启动程序依赖），在独立打包环境安装。
+pystray==0.19.5
+Pillow>=11,<13
+psutil>=6,<8
+websockets>=12,<16
+pyinstaller>=6.10,<7

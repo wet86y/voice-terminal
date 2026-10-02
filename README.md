@@ -1,6 +1,6 @@
 # Voice Terminal
 
-Voice Terminal 是 Windows 本机实时语音会话终端。浏览器负责产品界面和控制，Voice Server 负责音频采集、KWS、VAD、ASR、主 Agent、Shadow、TTS、播放和运行诊断。
+Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。独立应用宿主负责托盘、网页入口及整套系统的启动、监督和退出；浏览器负责产品界面，Voice Server（语音服务）负责音频采集、KWS（关键词唤醒）、VAD（语音活动检测）、ASR（自动语音识别）、主 Agent（智能体）、Shadow（影子代理）、TTS（语音合成）和播放。DSH（代理执行宿主）作为内部组件受管。
 
 当前代码包版本为 `0.7.0`。默认 LLM 路径是 DeepSeek Responses + strict `json_schema`；`voice_decision_v06` 只是冻结的协议兼容标识，不是发布版本号。
 
@@ -27,6 +27,8 @@ Voice Terminal 是 Windows 本机实时语音会话终端。浏览器负责产�
 
 ```powershell
 .\scripts\setup.ps1 -Python D:\DevTools\Python312\python.exe -Analysis
+npm ci
+npm run build
 .\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe
 ```
 
@@ -46,11 +48,22 @@ MINIMAX_API_KEY=
 - DSH 控制台：从 Product UI 顶栏的“打开 DSH 控制台”安全进入
 - 后端调试：`.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe -NoWeb`
 
-完整启动需要同时确认 Web 页面、Voice Server、ASR worker 和 analysis worker 可用；只看到 `/health` 返回成功不代表浏览器端已经准备好。
+启动结果以应用宿主的组件状态和核心能力为准：所有启用组件结束启动尝试后进入正常、降级或诊断状态。可选组件失败允许降级进入工作台；只看到 `/health`（语音服务健康检查）返回成功不代表整套应用已经准备好。启动完成后保持待机，由用户开始语音监听。
+
+普通启动由应用宿主提供网页构建产物，不在启动期间安装依赖、构建网页或启动 Vite（前端开发服务器）。网页地址优先使用 5173 端口，被占用时自动分配空闲端口，以启动程序打开的实际地址为准。关闭网页后应用继续运行；从托盘或“设置 → 系统运行”明确退出应用时，回收全部受管组件。
+
+构建可双击的无终端窗口程序：
+
+```powershell
+.\scripts\build-launcher.ps1 -Python D:\DevTools\Python312\python.exe
+```
+
+程序位于 `.runtime/launcher/VoiceTerminal/VoiceTerminal.exe`（独立应用程序），须保留整个同目录文件夹，并继续使用本机 Python（程序运行环境）、Node.js（JavaScript 运行环境）和既有模型目录。打包环境与业务环境分离。开发热更新使用 `scripts/start.ps1 -Dev`（开发启动）。启动蒙版、系统运行页、参数和诊断说明见 [独立应用启动与系统管理](docs/application-lifecycle.md)。
 
 ## 产品页面
 
 - `/`：当前真实 Product UI，连接 Product API 和 Voice Server。
+- `/?settings=system`：独立应用的“系统运行”设置页；管理状态来自应用宿主，语音服务失败时仍可诊断、重试和退出。
 - `/?replay=voice-shadow`：开发环境只读回放，用于检查长会话布局、Shadow 时间线和上下文指标；不会向后端提交操作。
 - `/ui-demo.html`：legacy 视觉原型，只使用固定模拟数据，不建立 WebSocket、不申请麦克风权限，也不读写真实设置。
 
@@ -98,6 +111,7 @@ git diff --check
 
 ## 文档入口
 
+- [独立应用启动与系统管理](docs/application-lifecycle.md)
 - [架构与生命周期](docs/architecture.md)
 - [连续性底座：上下文衔接与定时唤醒](docs/continuity-foundation.md)
 - [上下文与工具规范](docs/context-and-tools.md)

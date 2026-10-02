@@ -1,5 +1,6 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useVoiceTerminal } from '../composables/useVoiceTerminal'
+import { useApplicationHost } from './application-host'
 import type { ConversationEntry, ConversationEntryKind, ReasoningMode, ShadowProductSnapshot, TurnDelivery } from '../types'
 import { productApi, ProductApiError } from './api'
 import type {
@@ -21,7 +22,7 @@ import { isRecord } from '../record'
 import { DEFAULT_SETTINGS, DEFAULT_REGISTRY, DEFAULT_DSH, MAX_WAKE_KEYWORDS, defaultCurrent, defaultShadow, normalizeSettings, normalizeRegistry, normalizeRuntimeState, updateSettingsFromResponse } from './normalization'
 export { MAX_WAKE_KEYWORDS } from './normalization'
 
-export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models' | 'compute'
+export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models' | 'compute' | 'system'
 export type ProductPage = 'home' | 'settings'
 export type AssignmentSlot = 'voice' | 'shadow' | 'status'
 
@@ -82,6 +83,7 @@ function messageFromError(error: unknown) {
 
 
 export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
+  const application = useApplicationHost()
   const voice = useVoiceTerminal(options)
   const replayMode = import.meta.env.DEV
     && typeof window !== 'undefined'
@@ -287,7 +289,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function loadSnapshot() {
-    if (replayMode) return
+    if (replayMode || !application.businessReady.value) return
     if (snapshotRequest) return snapshotRequest
     loading.value = true
     snapshotRequest = productApi.snapshot().then(async value => {
@@ -302,7 +304,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function refreshComputeStatus() {
-    if (replayMode) return
+    if (replayMode || !application.businessReady.value) return
     try {
       computeStatus.value = await productApi.computeStatus()
     } catch (error) {
@@ -328,7 +330,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function refreshWakeTasks() {
-    if (replayMode) return
+    if (replayMode || !application.businessReady.value) return
     try {
       const result = await productApi.wakeTasks()
       wakeTasks.value = Array.isArray(result.tasks) ? result.tasks : []
@@ -429,7 +431,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function refreshSpeaker() {
-    if (replayMode) return
+    if (replayMode || !application.businessReady.value) return
     try {
       const [status, profile, ambient] = await Promise.all([
         productApi.speakerStatus(), productApi.speakerProfile(), productApi.ambientContext(),
@@ -444,7 +446,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function refreshSpeakerStatus() {
-    if (replayMode) return
+    if (replayMode || !application.businessReady.value) return
     try {
       speakerStatus.value = await productApi.speakerStatus()
     } catch (error) {
@@ -1145,6 +1147,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   function connect() {
+    if (!application.businessReady.value) return
     voice.connect()
     void loadSnapshot()
   }
@@ -1162,7 +1165,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       void loadSnapshot()
       scheduleReplay()
     }
-    if (value === 'offline') {
+    if (value === 'offline' && application.businessReady.value) {
       setError(new Error(voice.connectionError.value || 'Voice Server 连接已关闭。'))
     }
   })
@@ -1177,8 +1180,13 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
     connect()
     reconnectTimer = window.setInterval(() => {
-      if (voice.connection.value === 'offline') voice.connect()
+      if (application.businessReady.value && voice.connection.value === 'offline') voice.connect()
     }, 3000)
+  })
+
+  watch(application.businessReady, ready => {
+    if (ready && !replayMode) connect()
+    if (!ready) lastError.value = ''
   })
 
   onBeforeUnmount(() => {

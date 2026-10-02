@@ -1,0 +1,318 @@
+"""Application lifecycle tests（应用生命周期测试）：真实进程与独立网页接口。"""
+from __future__ import annotations
+
+import asyncio
+from http.cookiejar import CookieJar
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from unittest.mock import patch
+
+from voice_terminal.application.state import ApplicationState
+from voice_terminal.application.supervisor import ApplicationHost
+from voice_terminal.application.web import HostWeb
+from voice_terminal.application.windows import Job, ManagedProcess, SingleInstance, external_environment
+
+
+class ApplicationStateTests(unittest.TestCase):
+    def test_replaced_pid_clears_previous_identity_and_metrics(self):
+        state = ApplicationState()
+        state.component("dsh", state="ready", pid=10, created_at=100, memory_rss_bytes=500)
+        state.component("dsh", state="ready", pid=11)
+        row = next(c for c in state.snapshot()["components"] if c["id"] == "dsh")
+        self.assertIsNone(row["created_at"])
+        self.assertIsNone(row["memory_rss_bytes"])
+
+    def test_optional_failure_is_degraded_and_disabled_is_settled(self):
+        state = ApplicationState()
+        for row in state.snapshot()["components"]:
+            state.component(row["id"], state="ready")
+        state.component("voice", state="ready", pid=123)
+        state.component("dsh", state="failed", error="代理不可用")
+        state.component("speaker", state="disabled", enabled=False)
+        state.update(core_available=True)
+        state.finish()
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["state"], "degraded")
+        self.assertEqual(snapshot["completed_components"], snapshot["total_components"])
+        self.assertTrue(snapshot["core_available"])
+        self.assertTrue(next(c for c in snapshot["components"] if c["id"] == "dsh")["retry_allowed"])
+        state.update(stopping=True)
+        self.assertFalse(any(c["retry_allowed"] for c in state.snapshot()["components"]))
+
+    def test_core_failure_retains_diagnostic_state(self):
+        state = ApplicationState()
+        state.component("asr", state="failed", pid=42, memory_rss_bytes=1024)
+        state.update(core_available=True)
+        state.finish()
+        self.assertEqual(state.snapshot()["state"], "failed")
+        self.assertFalse(state.snapshot()["core_available"])
+
+    def test_retry_completion_cannot_overwrite_exit_state(self):
+        state = ApplicationState()
+        state.update(state="stopping", stopping=True)
+        state.finish()
+        self.assertEqual(state.snapshot()["state"], "stopping")
+
+
+class WebTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.app = ApplicationHost(Path(self.directory.name))
+        self.web = HostWeb(self.app, Path(self.directory.name), port=0)
+        self.app.origin = self.web.origin
+        self.web.start()
+        self.client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def tearDown(self):
+        self.web.close()
+        self.app.outer_job.close()
+        self.directory.cleanup()
+
+    def test_feedback_exists_before_any_business_process(self):
+        with self.client.open(self.web.origin) as response:
+            self.assertIn("启动诊断", response.read().decode())
+        with self.client.open(self.web.origin + "/api/v1/application/snapshot") as response:
+            data = json.load(response)
+        self.assertEqual(data["state"], "starting")
+        self.assertEqual(self.app.processes, {})
+
+    def test_cookie_and_origin_are_required_for_mutations(self):
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(self.web.origin + "/api/v1/application/snapshot")
+        self.assertEqual(error.exception.code, 403)
+        self.client.open(self.web.origin).close()
+        request = urllib.request.Request(self.web.origin + "/api/v1/application/exit", b"{}",
+            {"Content-Type": "application/json", "Origin": "https://other.example"})
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.client.open(request)
+        self.assertEqual(error.exception.code, 403)
+        with patch.object(self.app, "request_exit") as exit_app:
+            request = urllib.request.Request(self.web.origin + "/api/v1/application/exit", b"{}",
+                {"Content-Type": "application/json", "Origin": self.web.origin})
+            self.client.open(request).close()
+            exit_app.assert_called_once()
+
+    def test_sse_delivers_terminal_snapshot(self):
+        self.client.open(self.web.origin).close()
+        self.app.state.update(state="stopped", stopping=True)
+        with self.client.open(self.web.origin + "/api/v1/application/events", timeout=3) as response:
+            line = response.readline().decode()
+            self.assertEqual(json.loads(line[6:])["state"], "stopped")
+
+    def test_internal_reports_do_not_accept_browser_session(self):
+        self.client.open(self.web.origin).close()
+        request = urllib.request.Request(self.web.origin + "/internal/application/report", b"{}", {"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.client.open(request)
+        self.assertEqual(error.exception.code, 403)
+
+
+class SupervisorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_capability_with_live_process_retains_real_metrics(self):
+        app = ApplicationHost(Path.cwd())
+        try:
+            app.state.component("voice", state="failed", pid=os.getpid(), phase="能力不可用，进程仍在运行")
+            app.sample_metrics()
+            row = next(c for c in app.state.snapshot()["components"] if c["id"] == "voice")
+            self.assertGreater(row["memory_rss_bytes"], 0)
+            app.state.component("voice", pid=None)
+            row = next(c for c in app.state.snapshot()["components"] if c["id"] == "voice")
+            self.assertIsNone(row["memory_rss_bytes"])
+        finally:
+            app.outer_job.close()
+
+    async def test_exit_cancels_pending_control_without_waiting_for_http_thread(self):
+        app = ApplicationHost(Path.cwd())
+        blocked = threading.Event()
+        started = threading.Event()
+        def slow_request(*args, **kwargs):
+            started.set()
+            blocked.wait(30)
+            raise OSError("已取消请求")
+        try:
+            with patch("urllib.request.urlopen", slow_request):
+                task = asyncio.create_task(app.http("http://127.0.0.1:1", action="reinitialize", timeout=190))
+                app.background.add(task)
+                while not started.is_set():
+                    await asyncio.sleep(.01)
+                await asyncio.wait_for(app.shutdown(), timeout=1)
+                self.assertTrue(task.cancelled())
+                self.assertEqual(app.state.snapshot()["state"], "stopped")
+        finally:
+            blocked.set()
+            app.outer_job.close()
+
+    async def test_unowned_worker_is_never_connected(self):
+        from voice_terminal.asr.client import AsrWorkerClient, AsrWorkerError
+        from voice_terminal.analysis.client import AnalysisClient
+        with patch.dict(os.environ, {"VOICE_APP_ASR_AVAILABLE": "0", "VOICE_APP_ANALYSIS_AVAILABLE": "0"}):
+            with self.assertRaises(AsrWorkerError):
+                await AsrWorkerClient("ws://127.0.0.1:1").connect()
+            with self.assertRaisesRegex(RuntimeError, "所有权"):
+                await AnalysisClient("ws://127.0.0.1:1").health()
+
+    async def test_shared_process_metrics_are_identical_and_not_double_counted(self):
+        import psutil
+        app = ApplicationHost(Path.cwd())
+        for key in ("host", "web"):
+            app.state.component(key, state="ready", pid=os.getpid())
+        app.sample_metrics()
+        app.sample_metrics()
+        snapshot = app.state.snapshot()
+        rows = {c["id"]: c for c in snapshot["components"]}
+        self.assertEqual(rows["host"]["cpu_percent"], rows["web"]["cpu_percent"])
+        self.assertEqual(snapshot["total_memory_rss_bytes"], rows["host"]["memory_rss_bytes"])
+        app.outer_job.close()
+
+    async def test_startup_attempts_all_components_after_asr_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = ApplicationHost(Path(directory))
+            attempts = []
+            async def setup():
+                app.state.component("setup", state="ready")
+            async def start(key):
+                attempts.append(key)
+                if key == "asr":
+                    raise RuntimeError("模型缺失")
+                app.state.component(key, state="ready")
+            async def delegated():
+                app.state.component("dsh", state="failed", error="不可用")
+                app.state.component("speaker", state="disabled", enabled=False)
+            with patch.object(app, "setup", setup), patch.object(app, "start_service", start), patch.object(app, "start_delegated", delegated):
+                await app.startup()
+            self.assertEqual(attempts, ["asr", "analysis", "voice"])
+            self.assertTrue(app.state.snapshot()["startup_complete"])
+            self.assertEqual(app.state.snapshot()["state"], "failed")
+            app.outer_job.close()
+
+    async def test_duplicate_retry_is_rejected_and_exit_disables_retry(self):
+        app = ApplicationHost(Path.cwd())
+        app.state.update(startup_complete=True)
+        app.state.component("setup", state="ready")
+        app.state.component("voice", state="ready", pid=123)
+        app.state.component("dsh", state="failed")
+        with patch.object(app, "enqueue", side_effect=lambda coroutine: coroutine.close()):
+            self.assertTrue(app.request_retry("dsh"))
+            self.assertFalse(app.request_retry("dsh"))
+        app.state.update(stopping=True)
+        self.assertFalse(app.request_retry("voice"))
+        app.outer_job.close()
+
+    async def test_late_generation_report_cannot_overwrite_current_startup(self):
+        app = ApplicationHost(Path.cwd())
+        app.generations["voice"] = "current"
+        app.report({"component": "speaker", "generation": "old", "phase": "过期事件"})
+        self.assertNotEqual(next(c for c in app.state.snapshot()["components"] if c["id"] == "speaker")["phase"], "过期事件")
+        app.outer_job.close()
+
+
+@unittest.skipUnless(os.name == "nt", "Windows lifecycle（Windows 生命周期）测试")
+class WindowsProcessTests(unittest.TestCase):
+    def test_frozen_bundle_paths_are_not_inherited_by_business_environment(self):
+        root = Path.cwd()
+        bundle = root / ".runtime/fake-bundle"
+        env = {"Path": os.pathsep.join((str(bundle), str(bundle / "bin"), str(root / ".venv/Scripts")))}
+        with patch.object(sys, "frozen", True, create=True), patch.object(sys, "_MEIPASS", str(bundle), create=True):
+            clean = external_environment(env)
+        self.assertEqual(clean["Path"], str(root / ".venv/Scripts"))
+        self.assertNotEqual(clean["Path"], env["Path"])
+
+    def test_single_instance_mutex_releases_on_close(self):
+        name = "VoiceTerminal-test-" + str(time.time_ns())
+        first, second = SingleInstance(name), SingleInstance(name)
+        try:
+            self.assertTrue(first.acquired)
+            self.assertFalse(second.acquired)
+        finally:
+            second.close()
+            first.close()
+        third = SingleInstance(name)
+        self.assertTrue(third.acquired)
+        third.close()
+
+    def test_named_event_gracefully_stops_hidden_child_in_chinese_path(self):
+        with tempfile.TemporaryDirectory(prefix="应用启动测试-") as directory:
+            root = Path(directory)
+            outer = Job()
+            process = ManagedProcess([sys.executable, "-c",
+                "import asyncio; from voice_terminal.application.managed import wait_for_shutdown; asyncio.run(wait_for_shutdown()); print('closed')"],
+                cwd=Path.cwd(), env=dict(os.environ), output=root / "日志.log", outer_job=outer,
+                event_name="Local\\VoiceTerminal-test-" + str(time.time_ns()))
+            try:
+                process.request_stop()
+                deadline = time.monotonic() + 5
+                while process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.05)
+                self.assertEqual(process.poll(), 0)
+                self.assertIn("closed", (root / "日志.log").read_text())
+            finally:
+                process.kill()
+                process.close()
+                outer.close()
+
+    def test_job_close_reclaims_grandchild(self):
+        import psutil
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pid_path = root / "child.txt"
+            command = [sys.executable, "-c", "import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); Path(sys.argv[1]).write_text(str(p.pid)); time.sleep(60)", str(pid_path)]
+            outer = Job()
+            process = ManagedProcess(command, cwd=root, env=dict(os.environ), output=root / "process.log", outer_job=outer,
+                event_name="Local\\VoiceTerminal-test-" + str(time.time_ns()))
+            try:
+                deadline = time.monotonic() + 5
+                while not pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(.05)
+                child = psutil.Process(int(pid_path.read_text()))
+                self.assertTrue(child.is_running())
+                outer.close()
+                deadline = time.monotonic() + 5
+                while child.is_running() and time.monotonic() < deadline:
+                    time.sleep(.05)
+                self.assertFalse(child.is_running())
+            finally:
+                process.kill()
+                process.close()
+                outer.close()
+
+    def test_abrupt_owner_exit_reclaims_child(self):
+        import psutil
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "owner.py"
+            pid_path = root / "pid.txt"
+            script.write_text("""import os,sys,time
+from pathlib import Path
+from voice_terminal.application.windows import Job,ManagedProcess
+job=Job()
+child=ManagedProcess([sys.executable,'-c','import time; time.sleep(60)'],cwd=Path.cwd(),env=dict(os.environ),output=Path(sys.argv[1])/'child.log',outer_job=job,event_name='Local\\\\VoiceTerminal-abrupt-'+str(os.getpid()))
+Path(sys.argv[1],'pid.txt').write_text(str(child.pid))
+time.sleep(60)
+""", encoding="utf-8")
+            environment = {**os.environ, "PYTHONPATH": str(Path.cwd())}
+            owner = subprocess.Popen([sys.executable, str(script), directory], env=environment,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            try:
+                deadline = time.monotonic() + 5
+                while not pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(.05)
+                child = psutil.Process(int(pid_path.read_text()))
+                owner.kill()
+                owner.wait(timeout=5)
+                deadline = time.monotonic() + 5
+                while child.is_running() and time.monotonic() < deadline:
+                    time.sleep(.05)
+                self.assertFalse(child.is_running())
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)

@@ -3,7 +3,12 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), {
+    name: 'application-host-bootstrap',
+    transformIndexHtml() {
+      return process.env.VOICE_APP_ORIGIN ? [{ tag: 'script', attrs: { src: '/application-config.js' }, injectTo: 'head-prepend' as const }] : []
+    },
+  }],
   build: {
     rollupOptions: {
       input: {
@@ -15,6 +20,12 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5173,
     strictPort: true,
+    proxy: process.env.VOICE_APP_ORIGIN ? Object.fromEntries(
+      ['/api/v1/application', '/application-config.js'].map(path => [path, {
+        target: process.env.VOICE_APP_ORIGIN, changeOrigin: true,
+        headers: { Origin: process.env.VOICE_APP_ORIGIN },
+      }]),
+    ) : undefined,
     watch: {
       // Editors that save atomically drop a transient file next to the target
       // (for example ``.ui-demo.css.<pid>.<uuid>.tmpdir/ui-demo.css.tmp``).

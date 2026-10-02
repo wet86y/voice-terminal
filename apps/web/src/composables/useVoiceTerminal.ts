@@ -1083,7 +1083,8 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     lastSequence.value = null
 
     try {
-      const nextSocket = createSocket(webSocketUrl)
+      const runtimeUrl = typeof window !== 'undefined' ? window.__VOICE_APPLICATION__?.voice_ws_url : undefined
+      const nextSocket = createSocket(options.webSocketUrl ?? (runtimeUrl || webSocketUrl))
       socket.value = nextSocket
 
       nextSocket.onopen = () => {

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import tempfile
+import asyncio
+import os
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from voice_terminal.config import AppConfig, DshConfig
 from voice_terminal.dsh.runtime import DshRuntimeManager
@@ -106,6 +111,27 @@ class DshRuntimeTests(unittest.TestCase):
 
 
 class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(shutil.which("node"), "需要 Node.js（JavaScript 运行环境）")
+    async def test_managed_node_pipe_invokes_graceful_cleanup_without_console(self) -> None:
+        manager = DshRuntimeManager(DshConfig())
+        root = Path(__file__).resolve().parents[1]
+        with patch.dict(os.environ, {"VOICE_APP_ORIGIN": "http://127.0.0.1:5173"}):
+            process = await asyncio.create_subprocess_exec(
+                shutil.which("node"), "--require", str(root / "scripts/managed-node.cjs"), "-e",
+                "const timer=setInterval(()=>{},1000);process.on('SIGTERM',()=>{console.log('gracefully closed');clearInterval(timer)})",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            manager._process = process
+            try:
+                await asyncio.wait_for(manager.close(), timeout=5)
+                self.assertEqual(process.returncode, 0)
+                self.assertIn(b"gracefully closed", await process.stdout.read())
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+
     async def test_unknown_port_owner_is_never_attached(self) -> None:
         class OccupiedPortManager(DshRuntimeManager):
             async def _validate_installation(self):

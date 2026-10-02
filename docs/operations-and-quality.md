@@ -18,6 +18,7 @@ git diff --check
 
 | 区域 | 测试入口 |
 | --- | --- |
+| 独立应用宿主、进程树、状态接口与退出 | `tests/test_application_host.py`、`tests/test_dsh_runtime.py`、`apps/web/src/product/application-host.test.ts` |
 | ASR（自动语音识别）分块与最终刷新 | `tests/test_asr_worker.py`、`tests/test_asr_worker_protocol.py` |
 | Bridge 2.0（桥接协议 2.0）与 DSH（代理运行时）事件 | `tests/test_dsh_bridge.py`、`tests/test_bridge_v2_information.py`、`tests/test_durable_shadow_mailbox.py`、`tests/test_shadow_agent_harness.py` |
 | Shadow、上下文和 ledger | `tests/test_shadow_agent.py`、`tests/test_shadow_agent_harness.py`、`tests/test_session_ledger.py`、`tests/test_conversation_runtime.py` |
@@ -28,17 +29,22 @@ git diff --check
 
 完整回归不能只运行局部测试；协议、上下文、生命周期或公共事件变更必须运行 Python 全量、前端测试、类型检查和构建。
 
+本机全量测试仍有[已登记的挂起问题](known-issues.md)。挂起时记录受阻的全量命令及定向回归范围，不将定向通过表述为全量通过。
+
 ## 完整启动验收
 
 使用：
 
 ```powershell
+npm run build
 .\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe
 ```
 
+普通入口使用已构建的网页；成品入口与托盘规则见[独立应用启动与系统管理](application-lifecycle.md)。启动完成保持待机，以下输入所有权和语音事务检查须由用户显式开始语音监听后执行。
+
 至少确认：
 
-1. `http://127.0.0.1:5173/` 在限定时间内可访问；
+1. 启动程序打开的实际网页地址在限定时间内可访问；优先使用 `http://127.0.0.1:5173/`，占用时使用空闲端口；
 2. `http://127.0.0.1:8765/health` 返回服务快照；
 3. ASR worker（默认 8766）和 analysis worker（默认 8767）按配置启动；
 4. WebSocket `subscribe` 可以获取 `runtime.snapshot`；
@@ -57,6 +63,34 @@ git diff --check
 停止或重置会话后旧请求不得恢复。该场景须使用重建后的插件和新语音会话。
 
 `-NoWeb` 只用于后端调试，不能作为完整 Web 语音终端验收结果。
+
+## 独立应用生命周期验收
+
+在仓库根目录执行定向回归：
+
+```powershell
+python -m pytest -q tests/test_application_host.py tests/test_dsh_runtime.py tests/test_product_api.py tests/test_speaker_production.py tests/test_dsh_bridge.py tests/test_handoff.py tests/test_asr_worker.py tests/test_analysis_cancellation.py
+npm test
+npm run typecheck
+npm run build
+git diff --check
+```
+
+构建无终端窗口成品后，直接双击 `.runtime/launcher/VoiceTerminal/VoiceTerminal.exe`（独立应用程序），脱离 harness（运行支架）进行以下检查。使用真实业务运行环境和启用组件，故障注入只针对本次实例拥有的进程。
+
+| 场景 | 验收条件 |
+| --- | --- |
+| 启动反馈 | 托盘和可访问网页先于业务组件就绪，加载期间持续显示真实阶段；所有启用组件成功或明确失败后结束等待。 |
+| 缺环境、缺网页和端口冲突 | 有可见诊断，核心失败保留宿主入口；网页端口冲突使用空闲端口，业务端口冲突拒绝接管未知进程。 |
+| 单实例 | 重复启动打开既有入口，不创建第二套业务组件；退出后可以再次启动。 |
+| 系统运行页 | 状态和指标来自受管进程，创建时间与进程对应；共享进程不重复计入总量，进程退出后清除指标。能力失败而进程仍存活时仍展示实际占用。 |
+| 手动恢复 | 分别注入语音识别、分析、声纹、语音服务故障；重试去重、恢复业务连接与能力，保持待机，不重播语音或重复执行模型动作。 |
+| DSH（代理执行宿主）恢复 | 有限自动重启和手动恢复按既有上限工作，桥接与关联会话重新绑定；手动恢复重置自动重启计数。 |
+| 统一退出 | 正常运行、模型加载、恢复操作和自动重启等待期间均可退出；总退出预算 15 秒内回收组件并释放端口，强制结束宿主后也无受管子进程残留。 |
+| 网页生命周期 | 关闭网页后应用继续运行；重新打开先读快照再接收实时更新；退出状态送达已打开页面并保留提示。 |
+| 开发兼容 | `-Dev`（开发模式）的热更新、宿主管理接口代理及 SSE（服务器推送事件）可用，外部调试进程不纳入回收。 |
+
+完成一次成品启动、运行页使用、退出和再次启动。该检查验证应用生命周期；麦克风、真实供应商请求、语音播报及长会话质量仍按本文其他现场门槛执行。测量、截图与日志留在本机诊断产物中，提交说明记录验证范围和结果。
 
 ## 流式识别与空输入验收
 
@@ -145,7 +179,9 @@ python -m unittest discover -s tests -v
 
 ## 运行排障
 
-优先查：
+应用尚未就绪或语音服务失败时，先打开托盘“系统运行”，查看宿主快照中的组件错误和阶段；再从托盘打开日志目录。管理入口独立于语音服务，不必等待 `/health`（语音健康检查）可访问。
+
+语音服务已开始监听后优先查：
 
 1. `/health` 中的 `startup_errors`、`services`、`input_owner`、KWS 和 speaker 状态；
 2. `audio.capture_progress`、`audio.player_first_pcm_submitted`、`audio.player_drained`；
