@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from voice_terminal.compute import device_candidates, startup_device
 from voice_terminal.config import COMPUTE_MODEL_IDS
@@ -77,6 +77,52 @@ class ComputeDeviceTests(unittest.TestCase):
         self.assertEqual(health["device"], "cuda")
         self.assertEqual(health["internal_vad_device"], "cuda")
         self.assertIsInstance(health["process_memory_rss_bytes"], int)
+
+
+class ComputeHealthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_asr_health_uses_a_separate_connection_and_closes_it(self):
+        """停止监听关闭会话连接后，模型仍可通过只读连接正确显示。"""
+        from voice_terminal.server.websocket import SessionRuntime
+
+        runtime = SessionRuntime.__new__(SessionRuntime)
+        runtime.asr = SimpleNamespace(connected=False, url="ws://127.0.0.1:1/asr", health=AsyncMock())
+        status = {"status": "READY", "model_loaded": True, "device": "cuda"}
+        probe = SimpleNamespace(connect=AsyncMock(), health=AsyncMock(return_value=status), close=AsyncMock())
+        with patch("voice_terminal.server.websocket.AsrWorkerClient", return_value=probe) as factory:
+            self.assertEqual(await runtime._asr_compute_health(), status)
+        factory.assert_called_once_with(runtime.asr.url)
+        probe.connect.assert_awaited_once()
+        probe.health.assert_awaited_once_with(timeout_s=2.0)
+        probe.close.assert_awaited_once()
+        self.assertFalse(runtime.asr.connected)
+        runtime.asr.health.assert_not_awaited()
+
+    async def test_active_asr_health_reuses_the_session_connection(self):
+        """监听时复用会话健康请求，不额外创建连接或关闭活动输入。"""
+        from voice_terminal.server.websocket import SessionRuntime
+
+        runtime = SessionRuntime.__new__(SessionRuntime)
+        runtime.asr = SimpleNamespace(connected=True, health=AsyncMock(return_value={"status": "READY"}))
+        with patch("voice_terminal.server.websocket.AsrWorkerClient") as factory:
+            self.assertEqual(await runtime._asr_compute_health(), {"status": "READY"})
+        factory.assert_not_called()
+        runtime.asr.health.assert_awaited_once_with(timeout_s=2.0)
+
+    async def test_failed_idle_probe_is_closed_and_keeps_the_real_error(self):
+        """连接与健康检查失败均清理临时连接，真实故障不伪装为就绪。"""
+        from voice_terminal.server.websocket import SessionRuntime
+
+        runtime = SessionRuntime.__new__(SessionRuntime)
+        runtime.asr = SimpleNamespace(connected=False, url="ws://127.0.0.1:1/asr")
+        for operation in ("connect", "health"):
+            with self.subTest(operation=operation):
+                probe = SimpleNamespace(connect=AsyncMock(), health=AsyncMock(), close=AsyncMock())
+                getattr(probe, operation).side_effect = RuntimeError("识别服务未就绪")
+                with patch("voice_terminal.server.websocket.AsrWorkerClient", return_value=probe):
+                    with self.assertRaisesRegex(RuntimeError, "识别服务未就绪"):
+                        await runtime._asr_compute_health()
+                probe.close.assert_awaited_once()
+                self.assertFalse(runtime.asr.connected)
 
 
 if __name__ == "__main__":

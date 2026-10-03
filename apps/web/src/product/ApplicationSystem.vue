@@ -43,7 +43,7 @@ function date(value: number | null | undefined) {
           <div v-if="component.retry_allowed" class="application-retry"><span v-if="['asr', 'analysis', 'voice'].includes(component.id)">恢复会停止当前监听与播报，并重新连接语音业务。</span><button type="button" @click="application.retry(component.id)">重试{{ ['asr', 'analysis', 'voice'].includes(component.id) ? '并恢复语音服务' : '组件' }}</button></div>
         </article>
       </div>
-      <div v-if="snapshot" class="application-capabilities"><h3>业务能力</h3><p>在线模型与语音合成展示能力状态，进程内存归属语音服务。</p><div v-for="(state, key) in snapshot.capabilities" :key="key"><span>{{ capabilityNames[key] || key }}</span><strong>{{ ({ READY: '已就绪', DISABLED: '已停用', ERROR: '不可用', DEGRADED: '降级', OFFLINE: '离线', STARTING: '启动中', STOPPED: '已停止' } as Record<string, string>)[state] || state }}</strong></div></div>
+      <div v-if="snapshot" class="application-capabilities"><h3>业务能力</h3><p>在线模型与语音合成展示能力状态，进程内存归属语音服务。</p><div v-for="(state, key) in snapshot.capabilities" :key="key"><span>{{ capabilityNames[key] || key }}</span><strong>{{ ({ READY: '已就绪', RUNNING: '运行中', STREAMING: '流式传输中', CONNECTED: '已连接', DISABLED: '已停用', ERROR: '不可用', DEGRADED: '降级', OFFLINE: '离线', STARTING: '启动中', STOPPED: '已停止' } as Record<string, string>)[state] || state }}</strong></div></div>
       <button class="application-exit" type="button" :disabled="snapshot?.stopping" @click="application.exit">退出整个应用</button>
     </template>
   </section>

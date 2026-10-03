@@ -19,6 +19,7 @@ import uuid
 from .state import ApplicationState
 from .environment import resolve_python
 from .windows import Job, ManagedProcess
+from ..core.state import SERVICE_READY_STATES
 from ..resources import ResourcePolicy
 
 log = logging.getLogger(__name__)
@@ -230,18 +231,19 @@ class ApplicationHost:
             data = await self.http(self.state.value["voice_api_url"] + "/health")
             # HTTP readiness（接口就绪）与 core availability（核心能力可用）分别记录。
             services = data.get("services", {})
-            ready = all(services.get(name) in {"READY", "RUNNING", "CONNECTED"} for name in ("audio", "asr", "llm", "tts"))
+            names = {"audio": "音频设备", "asr": "ASR（语音识别）", "llm": "LLM（大语言模型）", "tts": "TTS（语音合成）"}
             if data.get("wake_enabled"):
-                ready = ready and services.get("kws") == "READY"
+                names["kws"] = "KWS（关键词唤醒）"
+            # 使用语音运行时的就绪契约；开始监听后的 RUNNING（运行中）以及
+            # 语音合成中的 STREAMING（流式传输中）都属于正常工作状态。
+            unavailable = [label for name, label in names.items() if services.get(name) not in SERVICE_READY_STATES]
+            ready = not unavailable
             self.state.update(core_available=ready, capabilities=services)
-            if not ready:
-                names = {"audio": "音频设备", "asr": "ASR（语音识别）", "llm": "LLM（大语言模型）", "tts": "TTS（语音合成）"}
-                if data.get("wake_enabled"):
-                    names["kws"] = "KWS（关键词唤醒）"
-                self.state.component("voice", error="核心能力未就绪：" + "、".join(label for name, label in names.items() if services.get(name) not in {"READY", "RUNNING", "CONNECTED"}))
+            error = "核心能力未就绪：" + "、".join(unavailable) if unavailable else ""
+            self.state.component("voice", error=error)
             if self.state.value["startup_complete"]:
                 self.state.component("voice", state="ready" if ready else "failed",
-                    phase="核心能力已就绪" if ready else "核心能力不可用", error="" if ready else next(c["error"] for c in self.state.value["components"] if c["id"] == "voice"))
+                    phase="核心能力已就绪" if ready else "核心能力不可用", error=error)
             return True
         return False
 

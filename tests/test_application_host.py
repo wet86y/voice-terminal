@@ -15,7 +15,7 @@ import unittest
 import urllib.error
 import urllib.request
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from voice_terminal.application.state import ApplicationState
 from voice_terminal.application.supervisor import ApplicationHost
@@ -120,6 +120,71 @@ class WebTests(unittest.TestCase):
 
 
 class SupervisorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_listening_and_streaming_remain_healthy_without_retry(self):
+        """实际监听及播报状态不能被宿主误报为核心能力故障。"""
+        app = ApplicationHost(Path.cwd())
+        try:
+            for row in app.state.snapshot()["components"]:
+                app.state.component(row["id"], state="ready")
+            app.state.component("voice", pid=123)
+            app.state.update(startup_complete=True)
+            services = dict(audio="READY", asr="READY", llm="READY", tts="READY", kws="READY")
+            for stage, changes in (
+                ("standby", {}),  # standby（待机）。
+                ("listening", dict(audio="RUNNING", kws="RUNNING")),  # listening（监听）。
+                ("speaking", dict(asr="RUNNING", llm="STREAMING", tts="STREAMING")),  # speaking（播报）。
+                ("stopped", dict(audio="READY", asr="READY", llm="READY", tts="READY", kws="READY")),
+            ):
+                with self.subTest(stage=stage):
+                    services.update(changes)
+                    with patch.object(app, "http", AsyncMock(return_value={"wake_enabled": True, "services": dict(services)})):
+                        self.assertTrue(await app.probe("voice"))
+                    app.state.finish()
+                    snapshot = app.state.snapshot()
+                    voice = next(c for c in snapshot["components"] if c["id"] == "voice")
+                    self.assertEqual(snapshot["state"], "ready")
+                    self.assertTrue(snapshot["core_available"])
+                    self.assertEqual(voice["state"], "ready")
+                    self.assertEqual(voice["error"], "")
+                    self.assertFalse(voice["retry_allowed"])
+        finally:
+            app.outer_job.close()
+
+    async def test_real_capability_failure_names_the_service_and_recovers(self):
+        """真实服务失败保留诊断名称，恢复后清除旧错误。"""
+        app = ApplicationHost(Path.cwd())
+        try:
+            app.state.update(startup_complete=True)
+            services = dict(audio="RUNNING", asr="READY", llm="READY", tts="READY", kws="RUNNING")
+            for service, label in (("kws", "KWS（关键词唤醒）"), ("asr", "ASR（语音识别）")):
+                with self.subTest(service=service):
+                    with patch.object(app, "http", AsyncMock(return_value={"wake_enabled": True, "services": {**services, service: "ERROR"}})):
+                        self.assertTrue(await app.probe("voice"))
+                    failed = app.state.snapshot()
+                    voice = next(c for c in failed["components"] if c["id"] == "voice")
+                    self.assertFalse(failed["core_available"])
+                    self.assertEqual(voice["state"], "failed")
+                    self.assertEqual(voice["error"], "核心能力未就绪：" + label)
+                    with patch.object(app, "http", AsyncMock(return_value={"wake_enabled": True, "services": services})):
+                        self.assertTrue(await app.probe("voice"))
+                    recovered = app.state.snapshot()
+                    self.assertTrue(recovered["core_available"])
+                    self.assertEqual(next(c for c in recovered["components"] if c["id"] == "voice")["error"], "")
+        finally:
+            app.outer_job.close()
+
+    async def test_disabled_wake_does_not_require_keyword_service(self):
+        """唤醒关闭时，停用的关键词服务不阻止直接语音识别。"""
+        app = ApplicationHost(Path.cwd())
+        try:
+            app.state.update(startup_complete=True)
+            with patch.object(app, "http", AsyncMock(return_value={"wake_enabled": False,
+                    "services": dict(audio="RUNNING", asr="RUNNING", llm="READY", tts="READY", kws="DISABLED")})):
+                self.assertTrue(await app.probe("voice"))
+            self.assertTrue(app.state.snapshot()["core_available"])
+        finally:
+            app.outer_job.close()
+
     async def test_failed_capability_with_live_process_retains_real_metrics(self):
         app = ApplicationHost(Path.cwd())
         try:

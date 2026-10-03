@@ -1570,6 +1570,17 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             }
         return payload
 
+    async def _asr_compute_health(self) -> dict[str, Any]:
+        """停止监听后，用独立探测连接查询识别模型，不改变会话连接。"""
+        if self.asr.connected:
+            return await self.asr.health(timeout_s=2.0)
+        probe = AsrWorkerClient(self.asr.url)
+        try:
+            await probe.connect()
+            return await probe.health(timeout_s=2.0)
+        finally:
+            await probe.close()
+
     async def compute_status(self) -> dict[str, Any]:
         """读取设备能力、模型实际设备和工作进程常驻内存。"""
         from ..resources import process_resource_status, aggregate_resource_status
@@ -1599,7 +1610,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         models["kws"]["service"] = self.state.services.get("kws", models["kws"].get("service", "UNKNOWN"))
         if self.asr is not None:
             try:
-                status = await self.asr.health(timeout_s=2.0)
+                status = await self._asr_compute_health()
                 if isinstance(status.get("resource_status"), dict):
                     resource_rows.append(status["resource_status"])
                 else:

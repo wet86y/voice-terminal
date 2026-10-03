@@ -130,7 +130,11 @@ class InputController:
             if self.wake_always_on:
                 self.state.input_owner = "kws"
                 self.state.set_service("kws", "RUNNING")
-                self.state.set_service("asr", "READY" if self.asr.connected else "ERROR")
+                # KWS（关键词唤醒）待机尚不需要 ASR（语音识别）会话连接。
+                # 停止监听会主动关闭该连接；下次唤醒才重新连接和检查模型。
+                # 保留最后确认的能力状态，不能把正常断开误报为模型故障。
+                if self.asr.connected:
+                    self.state.set_service("asr", "READY")
             else:
                 self.state.input_owner = "asr"
                 self.state.set_service("kws", "RUNNING" if self.wake_enabled else "DISABLED")
