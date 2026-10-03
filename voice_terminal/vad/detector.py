@@ -42,6 +42,22 @@ class FsmnVadDetector:
         self._model_chunk_ms = 200
         self._feed_count = 0
         self._samples = 0
+        from ..resources import ResourcePolicy, registry
+        policy = ResourcePolicy.load()
+        registry.observe(self, "vad_pending_audio", lambda value: int(
+            getattr(value._cache.get("onnx_state", {}).get("pending"), "nbytes", 0)))
+        if device == "cpu" and policy.vad_backend == "onnx":
+            try:
+                import numpy as np
+                from .onnx_backend import OnnxStreamingModel
+                self._np = np
+                self._model = OnnxStreamingModel(model_dir, threads=policy.native_threads.get("voice", 4))
+                self.backend = "onnx"
+                return
+            except Exception as exc:
+                logger.warning("轻量语音检测加载失败，保留原后端：%s", exc)
+                self.load_error = f"轻量语音检测加载失败：{type(exc).__name__}: {exc}"
+        self.backend = "funasr"
         try:
             import numpy as np  # type: ignore
             from funasr import AutoModel  # type: ignore
@@ -60,7 +76,7 @@ class FsmnVadDetector:
                     disable_pbar=True,
                 )
                 self.device = candidate
-                self.load_error = (
+                self.load_error = self.load_error or (
                     f"CUDA（图形处理器）加载失败，已回退到 {candidate}：{type(last_error).__name__}: {last_error}"
                     if last_error is not None else None
                 )

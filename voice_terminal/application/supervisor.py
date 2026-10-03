@@ -17,7 +17,9 @@ from urllib.parse import urlsplit
 import uuid
 
 from .state import ApplicationState
+from .environment import resolve_python
 from .windows import Job, ManagedProcess
+from ..resources import ResourcePolicy
 
 log = logging.getLogger(__name__)
 
@@ -82,13 +84,7 @@ class ApplicationHost:
             **({"state": "starting"} if row["state"] == "waiting" else {}))
 
     def resolve_python(self) -> str:
-        choices = [self.python_option] if self.python_option else [str(self.root / ".venv/Scripts/python.exe"), shutil.which("python") or ""]
-        for candidate in choices:
-            if candidate and Path(candidate).is_file():
-                return str(Path(candidate).resolve())
-            if candidate and shutil.which(candidate):
-                return shutil.which(candidate) or candidate
-        raise RuntimeError("未找到业务 Python（程序运行环境），请通过 --python 指定现有 Python 3.12。")
+        return resolve_python(self.root, self.python_option)
 
     def spawn(self, key: str, command: list[str]) -> ManagedProcess:
         if self.state.snapshot()["stopping"]:
@@ -99,12 +95,19 @@ class ApplicationHost:
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1",
             "VOICE_APP_ORIGIN": self.origin, "VOICE_APP_INTERNAL_TOKEN": self.internal_token,
             "VOICE_APP_SERVICE_GENERATION": generation, "VOICE_WEB_ORIGINS": self.origin}
+        env["VOICE_APP_INSTANCE_ID"] = self.state.value["instance_id"]
+        env["VOICE_RESOURCE_POLICY"] = os.environ.get("VOICE_RESOURCE_POLICY", str(self.root / "config/runtime-resources.json"))
+        model_dir = self.manifest.get("model_dir")
+        env = ResourcePolicy.load(Path(env["VOICE_RESOURCE_POLICY"])).environment(
+            key, model_dir=Path(model_dir) if model_dir else None, parent=env)
         if self.llm_provider:
             env["VOICE_LLM_PROVIDER"] = self.llm_provider
         if key == "voice":
             rows = {c["id"]: c for c in self.state.snapshot()["components"]}
             env["VOICE_APP_ASR_AVAILABLE"] = "1" if rows["asr"]["state"] in {"ready", "external"} else "0"
             env["VOICE_APP_ANALYSIS_AVAILABLE"] = "1" if rows["analysis"]["state"] == "ready" else "0"
+            if self.manifest.get("hardware_capabilities"):
+                env["VOICE_HARDWARE_CAPABILITIES"] = json.dumps(self.manifest["hardware_capabilities"])
         output = self.root / "logs" / f"application-{key}.log"
         if output.is_file() and output.stat().st_size > 5 * 1024 * 1024:
             for index in (3, 2, 1):
@@ -216,6 +219,8 @@ class ApplicationHost:
                 request_id = uuid.uuid4().hex
                 await connection.send(json.dumps({"type": "health", "request_id": request_id}))
                 data = json.loads(await asyncio.wait_for(connection.recv(), 2))
+                if isinstance(data.get("hardware_capabilities"), dict):
+                    self.manifest["hardware_capabilities"] = data["hardware_capabilities"]
                 return data.get("status") == "READY" and data.get("model_loaded") is True and data.get("request_id") == request_id
         if key == "analysis":
             url = urlsplit(self.manifest["analysis_url"])
@@ -419,7 +424,7 @@ class ApplicationHost:
                 memory, private_commit, cpu = sample_process(process, identity)
                 self.state.component(row["id"], created_at=created, uptime_seconds=max(0, now-created),
                     memory_rss_bytes=memory, memory_private_commit_bytes=private_commit,
-                    cpu_percent=cpu, sampled_at=now)
+                    cpu_percent=cpu, sampled_at=now, thread_count=process.num_threads())
                 if not row["external"]:
                     unique[identity] = (memory, private_commit)
                 # 子树仅计入整体总量，不重复加入各组件行。

@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 from importlib import metadata
+import json
+import os
+import sys
+import time
+import threading
+import copy
 import subprocess
 from typing import Any
 
@@ -17,7 +23,7 @@ def process_memory_bytes() -> int | None:
         return None
 
 
-def hardware_status() -> dict[str, Any]:
+def _backend_hardware_status() -> dict[str, Any]:
     """探测当前机器的 RAM（系统内存）、显存和各后端 GPU 支持。"""
     memory: dict[str, int | None] = {"available_bytes": None, "total_bytes": None}
     try:
@@ -114,7 +120,48 @@ def hardware_status() -> dict[str, Any]:
             "sherpa_onnx_cuda": sherpa_cuda,
         },
         "models": models,
+        "capabilities_sampled_at": time.time(),  # capabilities_sampled_at（后端能力采样时间）。
     }
+
+
+_capabilities: dict | None = None
+_capability_lock = threading.Lock()
+
+
+def hardware_status() -> dict[str, Any]:
+    """主服务使用宿主能力快照；独立入口只运行一次隔离探测，不导入重型后端。"""
+    if os.environ.get("VOICE_RESOURCE_ROLE") != "voice":
+        return _backend_hardware_status()
+    global _capabilities
+    with _capability_lock:
+        if _capabilities is None:
+            serialized = os.environ.get("VOICE_HARDWARE_CAPABILITIES")
+            if serialized:
+                _capabilities = json.loads(serialized)
+            else:
+                env = {**os.environ, "VOICE_RESOURCE_ROLE": "bootstrap"}
+                result = subprocess.run([sys.executable, "-m", "voice_terminal.hardware_probe"],
+                                        capture_output=True, text=True, timeout=60, env=env, check=True,
+                                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                _capabilities = json.loads(result.stdout.splitlines()[-1])
+    result = copy.deepcopy(_capabilities)
+    try:
+        import psutil
+        memory = psutil.virtual_memory()
+        result["system_memory"] = {"available_bytes": memory.available, "total_bytes": memory.total}
+    except Exception:
+        pass
+    # 宿主定期从已经加载的工作进程刷新显存数值；主服务不初始化 CUDA 上下文。
+    return result
+
+
+def accept_hardware_capabilities(value: dict) -> None:
+    """已加载工作进程的能力报告（校验最小结构，保留未知兼容字段）。"""
+    if not isinstance(value, dict) or not all(isinstance(value.get(k), dict) for k in ("models", "gpu", "backends", "system_memory")):
+        raise ValueError("硬件能力报告无效")
+    global _capabilities
+    with _capability_lock:
+        _capabilities = copy.deepcopy(value)
 
 
 def actual_device(mode: str, *, gpu_supported: bool) -> str:

@@ -46,6 +46,8 @@ class WeSpeakerOnnxEngine:
         self.embedding_dim = 0
         self.error: str | None = None
         self._probe: tuple[float, ...] | None = None
+        from ..resources import ResourcePolicy
+        self._managed_audio = ResourcePolicy.load().shared_audio
 
     @property
     def loaded(self) -> bool:
@@ -137,6 +139,12 @@ class WeSpeakerOnnxEngine:
         return tuple(float(x) for x in (embedding / norm))
 
     def embed_pcm(self, pcm: bytes) -> tuple[float, ...]:
+        from ..resources import registry
+        from ..audio.allocation import conversion_scope
+        with registry.lease("speaker_native_pcm", pcm, release_on="native_complete"), conversion_scope(pcm, self.sample_rate, enabled=self._managed_audio):
+            return self._embed_owned_pcm(pcm)
+
+    def _embed_owned_pcm(self, pcm: bytes) -> tuple[float, ...]:
         if not self.loaded:
             raise SpeakerModelError(self.error or "model not loaded")
         features = pcm_to_fbank(pcm, sample_rate=self.sample_rate)

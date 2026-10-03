@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .protocol import asr_result, decode_audio_chunk
-from ..compute import process_memory_bytes
+from ..compute import process_memory_bytes, hardware_status
+from ..resources import process_resource_status, registry
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,7 @@ class AsrWorkerEngine:
         self._byte_count_by_turn: dict[str, int] = {}
         self._model_call_count_by_turn: dict[str, int] = {}
         self._last_log_at_by_turn: dict[str, float] = {}
+        registry.observe(self, "asr_pending_pcm", lambda value: sum(len(p) for p in value._pending_audio_by_turn.values()))
 
     @property
     def chunk_stride_samples(self) -> int:
@@ -131,6 +134,11 @@ class AsrWorkerEngine:
         raise RuntimeError(self.load_error) from last_error
 
     def _infer_sync(self, turn_id: str, pcm: bytes, is_final: bool) -> str:
+        # 租约在原生线程内持有；异步请求取消不释放正在读取的输入。
+        with registry.lease("asr_native_pcm", pcm, release_on="native_complete"):
+            return self._infer_owned_sync(turn_id, pcm, is_final)
+
+    def _infer_owned_sync(self, turn_id: str, pcm: bytes, is_final: bool) -> str:
         self.load()
         if len(pcm) % 2:
             pcm = pcm[:-1]
@@ -269,6 +277,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                             "requested_device": getattr(engine, "requested_device", None),
                             "load_error": getattr(engine, "load_error", None),
                             "process_memory_rss_bytes": process_memory_bytes(),
+                            "resource_status": process_resource_status(),  # resource_status（资源状态）。
                         }
                     except Exception as exc:
                         # Keep the connection available long enough for the
@@ -282,6 +291,8 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                             "requested_device": getattr(engine, "requested_device", None),
                             "process_memory_rss_bytes": process_memory_bytes(),
                         }
+                    if response.get("status") == "READY" and os.environ.get("VOICE_RESOURCE_ROLE") == "asr":
+                        response["hardware_capabilities"] = hardware_status()  # hardware_capabilities（重型后端能力）。
                     if isinstance(request_id, str):
                         response["request_id"] = request_id
                     await websocket.send(json.dumps(response, ensure_ascii=False))

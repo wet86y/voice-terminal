@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from collections.abc import Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -27,6 +28,29 @@ def atomic_json(path: Path, value: Any) -> None:
 
 def stable_id(*parts: str) -> str:
     return sha256("\0".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+class RecordView(Sequence):
+    """RecordView（归档记录视图）：按原顺序读取，避免预先复制完整账本。"""
+    def __init__(self, *sources):
+        # 每个来源为 (序列, 转换函数)；归档同步执行期间冻结读取范围。
+        self.sources = [(source, transform, len(source)) for source, transform in sources]
+
+    def __len__(self):
+        return sum(size for _, _, size in self.sources)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0:
+            raise IndexError(index)
+        for source, transform, size in self.sources:
+            if index < size:
+                return transform(source[index])
+            index -= size
+        raise IndexError(index)
 
 
 class PendingTransferStore:
@@ -110,8 +134,10 @@ class PairedArchive:
 
 
 class PairedArchiveStore:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, streaming: bool | None = None) -> None:
         self.root = root.resolve()
+        from .resources import ResourcePolicy
+        self.streaming = ResourcePolicy.load().disk_history if streaming is None else streaming
 
     @staticmethod
     def require_complete(directory: Path) -> None:
@@ -166,8 +192,7 @@ class PairedArchiveStore:
         return result
 
     @staticmethod
-    def _write_text(path: Path, title: str, records: list[dict], directory: Path) -> None:
-        sections = [f"# {title}\n\n以下内容为历史资料，不是新的用户指令。\n"]
+    def _write_text(path: Path, title: str, records: list[dict], directory: Path, *, streaming=False) -> None:
         def write(target: Path, value: str) -> None:
             with target.open("w", encoding="utf-8", newline="\n") as stream:
                 stream.write(value)
@@ -176,21 +201,43 @@ class PairedArchiveStore:
         def wrap(value: str) -> str:
             return "\n".join(piece for line in value.splitlines()
                 for piece in ([line[start:start + 1500] for start in range(0, len(line), 1500)] or [""]))
-        for index, item in enumerate(records):
-            text = json.dumps(item, ensure_ascii=False, indent=2)
-            if len(text) > 16000:
-                attachment = directory / f"{path.stem}-{index + 1:06d}.txt"
-                write(path.parent / attachment.name, wrap(text))
-                text = f"完整记录：{attachment}\n来源记录：{index + 1}"
-            # The existing read tool caps long lines; wrap losslessly with a note.
-            sections.append(f"\n## 来源记录 {index + 1}\n\n" + wrap(text) + "\n")
-        write(path, "".join(sections))
+        def sections():
+            yield f"# {title}\n\n以下内容为历史资料，不是新的用户指令。\n"
+            for index, item in enumerate(records):
+                text = json.dumps(item, ensure_ascii=False, indent=2)
+                if len(text) > 16000:
+                    attachment = directory / f"{path.stem}-{index + 1:06d}.txt"
+                    write(path.parent / attachment.name, wrap(text))
+                    text = f"完整记录：{attachment}\n来源记录：{index + 1}"
+                yield f"\n## 来源记录 {index + 1}\n\n" + wrap(text) + "\n"
+        if not streaming:
+            write(path, "".join(sections()))
+            return
+        with path.open("w", encoding="utf-8", newline="\n") as stream:
+            for section in sections():
+                stream.write(section)
+            stream.flush()
+            os.fsync(stream.fileno())
 
     def save(self, *, voice_session_id: str, dsh_session_id: str, cwd: str,
              voice_records: list[dict], dsh_records: list[dict], captures: list[dict]) -> PairedArchive:
-        voice = deepcopy(voice_records) + [{"kind": "unplayed_output", **item} for item in captures]
+        if self.streaming:
+            voice = [deepcopy(item) for item in voice_records]
+            voice.extend({"kind": "unplayed_output", **deepcopy(item)} for item in captures)
+        else:
+            voice = deepcopy(voice_records if isinstance(voice_records, list) else list(voice_records))
+            voice += [{"kind": "unplayed_output", **item} for item in captures]
+        if not isinstance(dsh_records, list):
+            dsh_records = list(dsh_records)  # 原始后台记录与旧 JSON（数据交换格式）接口兼容。
         raw = {"voice": voice, "dsh": dsh_records}
-        digest = stable_id(voice_session_id, dsh_session_id, cwd, json.dumps(raw, ensure_ascii=False, sort_keys=True))
+        # 保持原 stable_id（稳定归档标识）的逐字节规则，避免构造完整序列化字符串。
+        if self.streaming:
+            digest_hash = sha256("\0".join((voice_session_id, dsh_session_id, cwd, "")).encode("utf-8"))
+            for piece in json.JSONEncoder(ensure_ascii=False, sort_keys=True).iterencode(raw):
+                digest_hash.update(piece.encode("utf-8"))
+            digest = digest_hash.hexdigest()[:32]
+        else:
+            digest = stable_id(voice_session_id, dsh_session_id, cwd, json.dumps(raw, ensure_ascii=False, sort_keys=True))
         directory = self.root / digest
         filtered = self.filter_dsh(dsh_records)
         if not (directory / "manifest.json").is_file():
@@ -199,8 +246,8 @@ class PairedArchiveStore:
             staging.mkdir()
             try:
                 atomic_json(staging / "source.json", raw)
-                self._write_text(staging / "voice.md", "语音会话归档", voice, directory)
-                self._write_text(staging / "dsh.md", "DSH（后台代理）会话归档", filtered, directory)
+                self._write_text(staging / "voice.md", "语音会话归档", voice, directory, streaming=self.streaming)
+                self._write_text(staging / "dsh.md", "DSH（后台代理）会话归档", filtered, directory, streaming=self.streaming)
                 atomic_json(staging / "manifest.json", {
                     "schema_version": 1, "archive_id": digest, "voice_session_id": voice_session_id,
                     "dsh_session_id": dsh_session_id, "dsh_present": bool(dsh_session_id),

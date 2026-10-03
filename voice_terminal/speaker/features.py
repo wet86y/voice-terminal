@@ -125,7 +125,8 @@ def pcm_to_fbank(pcm: bytes, *, sample_rate: int = 16000, num_mels: int = 80,
 
     # int16 sample values are already the (1 << 15) scaled waveform that
     # WeSpeaker feeds to kaldi.fbank, so no extra scaling is needed here.
-    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+    from ..audio.allocation import pcm_samples
+    samples = pcm_samples(pcm, sample_rate=sample_rate, precision="float64", amplitude="int16")
     frame_length = int(sample_rate * 0.025)
     frame_shift = int(sample_rate * 0.010)
     if frame_length <= 0 or frame_shift <= 0:

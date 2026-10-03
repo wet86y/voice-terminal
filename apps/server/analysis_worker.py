@@ -1,7 +1,15 @@
 import argparse
 import logging
 from pathlib import Path
+import sys
 from urllib.parse import urlparse
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from voice_terminal.resources import bootstrap_resources
+if __name__ == "__main__":
+    bootstrap_resources("analysis")
 
 from voice_terminal.config import load_config
 from voice_terminal.analysis.worker import AnalysisLane, create_analysis_app

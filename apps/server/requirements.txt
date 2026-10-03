@@ -1,4 +1,5 @@
 # Install torch and torchaudio from the CUDA wheel index in scripts/setup.ps1.
+-c runtime-constraints.txt
 numpy>=1.26,<3
 funasr>=1.4.0,<1.5
 pypinyin>=0.50,<1

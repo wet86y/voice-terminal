@@ -179,9 +179,12 @@ class SpeakerRuntimeMixin:
             sys.executable, "-m", "voice_terminal.speaker.worker",
             "--config", str(self._speaker_worker_config_path),
         ]
+        from ..resources import ResourcePolicy
+        child_env = ResourcePolicy.load().environment("speaker", model_dir=self.config.model_dir)
         with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
             process = await asyncio.create_subprocess_exec(
                 *command,
+                env=child_env,
                 cwd=str(self._project_root),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=stdout,

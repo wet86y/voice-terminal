@@ -43,6 +43,7 @@ class SpeakerWorkerClient:
         self.degraded = False
         self.last_error: str | None = None
         self.model_version = ""
+        self._shared_peer = None
 
     @property
     def connected(self) -> bool:
@@ -209,6 +210,11 @@ class SpeakerWorkerClient:
                     if waiter is not None and not waiter.done():
                         waiter.set_result(None)
                 elif kind == "error":
+                    waiter = self.pending_embed.get(message.get("request_id"))
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(message)
+                    if message.get("code") == "AUDIO_REF_REJECTED":
+                        continue  # 引用失效未产生模型错误，正文重试不影响声纹判定。
                     self.last_error = str(message.get("message") or "speaker worker error")[:300]
                     # Any worker-side protocol/model failure makes the
                     # current turn fail open.  Keep the degraded flag until
@@ -278,6 +284,7 @@ class SpeakerWorkerClient:
             if response.get("status") != "READY" or response.get("model_loaded") is not True:
                 raise SpeakerWorkerError("Speaker Worker 未就绪", code="SPEAKER_WORKER_NOT_READY")
             self.model_version = str(response.get("model_version") or self.model_version)
+            self._shared_peer = response.get("shared_audio")
             return response
         except Exception as exc:
             raise SpeakerWorkerError(str(exc), code="SPEAKER_WORKER_HEALTH_FAILED") from exc
@@ -319,12 +326,29 @@ class SpeakerWorkerClient:
         request_id = uuid.uuid4().hex
         waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self.pending_embed[request_id] = waiter
+        from ..audio.shared import SharedAudio, compatible
+        shared = None
         try:
+            if compatible(self._shared_peer):
+                try:
+                    shared = SharedAudio(pcm, self._shared_peer, request_id)
+                except (OSError, ValueError):
+                    pass
+            deadline = time.monotonic() + max(0.05, timeout_ms / 1000)
             await self._send_immediate({
                 "type": "embed", "request_id": request_id,
-                "pcm_base64": base64.b64encode(pcm).decode("ascii"),
+                **({"audio_ref": shared.reference} if shared else {"pcm_base64": base64.b64encode(pcm).decode("ascii")}),
             })
             response = await asyncio.wait_for(waiter, timeout=max(0.05, timeout_ms / 1000))
+            if shared is not None and response.get("code") == "AUDIO_REF_REJECTED":
+                self._shared_peer = None
+                waiter = asyncio.get_running_loop().create_future()
+                self.pending_embed[request_id] = waiter
+                await self._send_immediate({"type": "embed", "request_id": request_id,
+                    "pcm_base64": base64.b64encode(pcm).decode("ascii")})
+                response = await asyncio.wait_for(waiter, timeout=max(0.001, deadline - time.monotonic()))
+            if response.get("type") == "error":
+                raise SpeakerWorkerError(str(response.get("message")), code=str(response.get("code")))
             if response.get("quality") != "ready" or not isinstance(response.get("embedding"), list):
                 raise SpeakerWorkerError(
                     f"录音质量不足：{response.get('quality') or 'unknown'}",
@@ -337,6 +361,8 @@ class SpeakerWorkerClient:
             raise SpeakerWorkerError(str(exc), code="SPEAKER_WORKER_EMBED_FAILED") from exc
         finally:
             self.pending_embed.pop(request_id, None)
+            if shared is not None:
+                shared.close()
 
     def submit_frame(self, *, turn_id: str, generation: int, pcm: bytes,
                      start_sample: int, end_sample: int,

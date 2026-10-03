@@ -51,6 +51,12 @@ def run_checks(config_path: Path, *, online: bool = False, model_dir: Path | Non
     config = product_settings.effective_config()
     checks: list[Check] = []
     checks.append(_check("python", sys.version_info[:2] == (3, 12), sys.version.split()[0]))
+    from .dependencies import diagnose
+    dependencies = diagnose()
+    checks.append(_check("dependencies:lock", not dependencies["mismatches"],
+        json.dumps(dependencies["mismatches"], ensure_ascii=False) or "运行依赖与统一版本锁一致", warning=True))
+    checks.append(_check("dependencies:consistency", dependencies["dependency_check_ok"],
+        dependencies["dependency_check"], warning=True))
 
     for module in ("numpy", "yaml", "websockets", "fastapi", "uvicorn", "httpx"):
         try:

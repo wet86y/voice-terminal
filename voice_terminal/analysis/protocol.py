@@ -3,6 +3,21 @@ import base64
 MAX_PCM_BYTES = 16000 * 2 * 62
 
 
+def open_request_audio(value: dict):
+    """open_request_audio（打开请求音频）：旧正文或持有到原生完成的共享读映射。"""
+    if "audio_ref" not in value:
+        return decode_request(value), None
+    if "pcm_base64" in value:
+        raise ValueError("音频正文与引用不能同时提交")
+    if (value.get("operation") not in {"endpoint", "refine"}
+            or not isinstance(value.get("request_id"), str) or not isinstance(value.get("turn_id"), str)
+            or type(value.get("generation_id")) is not int):
+        raise ValueError("分析请求身份无效")
+    from ..audio.shared import SharedAudioReader
+    reader = SharedAudioReader(value["audio_ref"], value["request_id"], MAX_PCM_BYTES)
+    return reader.view, reader
+
+
 def decode_request(value: dict) -> bytes:
     if value.get("operation") not in {"endpoint", "refine"}:
         raise ValueError("unknown analysis operation")

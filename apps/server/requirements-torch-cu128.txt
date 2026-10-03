@@ -1,0 +1,4 @@
+# CUDA（图形处理器计算运行库）12.8 安装组合；独立模型进程保持不变。
+--index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchaudio==2.11.0+cu128

@@ -75,6 +75,10 @@ class MiniMaxTtsSession:
         # One event-loop owns the file and its independent read/write offsets.
         # Receiving never waits for playback; long answers spill to disk.
         self._audio = None
+        from ..resources import registry
+        registry.observe(self, "tts_audio_memory", lambda value:
+                         min(value._audio_bytes_received, 8 * 1024 * 1024)
+                         if value._audio is not None and not getattr(value._audio, "_rolled", False) else 0)
         self._read_offset = 0
         self._cache_peak_bytes = 0
         self._audio_available = asyncio.Event()

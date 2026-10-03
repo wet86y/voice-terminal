@@ -5,6 +5,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from ..resources import bootstrap_resources
+
+if __name__ == "__main__":
+    bootstrap_resources("bootstrap")
 
 
 def main() -> None:
@@ -21,8 +25,12 @@ def main() -> None:
     local = Path(args.config)
     config = load_config(root / "config/default.yaml", local if local.is_file() else None)
     config = ProductSettingsStore(path=root / "config/product-settings.json", config=config).effective_config()
+    from ..dependencies import diagnose
+    dependencies = diagnose(check_dependencies=False)
     print(json.dumps({
         "asr_url": config.asr.worker_url,
+        "model_dir": str(config.model_dir),  # model_dir（统一模型与下载缓存根目录）。
+        "dependency_status": dependencies,  # dependency_status（同一版本清单的检查结果，兼容现用环境）。
         "analysis_url": config.smart_turn.analysis_url,
         "analysis_enabled": config.smart_turn.smart_turn or config.smart_turn.sensevoice,
         "analysis_lanes": [name for name, enabled in (("endpoint", config.smart_turn.smart_turn),

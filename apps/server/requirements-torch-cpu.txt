@@ -1,0 +1,4 @@
+# CPU（中央处理器）安装组合；现有模型内部线程和数值精度保持不变。
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.11.0+cpu
+torchaudio==2.11.0+cpu

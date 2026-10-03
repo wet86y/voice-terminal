@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from ..resources import bootstrap_resources, process_resource_status
+if __name__ == "__main__":
+    bootstrap_resources("speaker")
+
 import argparse
 import asyncio
 import json
@@ -42,6 +46,8 @@ class SpeakerWorkerEngine:
         self.min_speech_ms = max(1, int(min_speech_ms))
         self.min_window_speech_ratio = min(1.0, max(0.0, float(min_window_speech_ratio)))
         self.buffers: dict[tuple[str, int], bytearray] = {}
+        from ..resources import registry
+        registry.observe(self, "speaker_window_pcm", lambda value: sum(len(p) for p in value.buffers.values()))
         self.starts: dict[tuple[str, int], int] = {}
         self.last_emitted: dict[tuple[str, int], int] = {}
         # Per-window VAD speech bookkeeping: absolute sample index of every
@@ -346,6 +352,7 @@ async def run(config_path: Path | None = None) -> None:
                 message = json.loads(raw) if isinstance(raw, str) else {}
                 kind = message.get("type") if isinstance(message, dict) else None
                 if kind == "health":
+                    from ..audio.shared import capabilities
                     await websocket.send(json.dumps({
                         "type": "health", "request_id": message.get("request_id"),
                         "status": "READY", "model_loaded": True,
@@ -355,6 +362,8 @@ async def run(config_path: Path | None = None) -> None:
                         "requested_device": engine.model.requested_device,
                         "load_error": engine.model.load_error,
                         "process_memory_rss_bytes": process_memory_bytes(),
+                        "resource_status": process_resource_status(),  # resource_status（资源状态）。
+                        "shared_audio": capabilities(),  # shared_audio（共享音频能力）。
                     }, ensure_ascii=False))
                 elif kind == "fingerprint":
                     # Lets Voice Server prove that the enrolled templates were
@@ -382,9 +391,26 @@ async def run(config_path: Path | None = None) -> None:
                         await websocket.send(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
                 elif kind == "embed":
                     request_id = message.get("request_id")
-                    pcm = decode_pcm(message.get("pcm_base64"))
-                    quality, speech_ms, _ = engine._quality(pcm)
-                    embedding = list(engine.model.embed_pcm(pcm)) if quality == "ready" else []
+                    from ..audio.shared import SharedAudioReader, native_audio_call
+                    reader = None
+                    try:
+                        if "audio_ref" in message:
+                            if "pcm_base64" in message:
+                                raise ValueError("共享引用不能同时带音频正文")
+                            try:
+                                reader = SharedAudioReader(message["audio_ref"], request_id, 10 * 16000 * 2)
+                            except Exception as exc:
+                                await websocket.send(json.dumps({"type": "error", "request_id": request_id,
+                                    "code": "AUDIO_REF_REJECTED", "message": str(exc)[:300]}, ensure_ascii=False))
+                                continue  # 原生推理尚未提交，允许创建方回退正文协议。
+                            pcm = reader.view
+                        else:
+                            pcm = decode_pcm(message.get("pcm_base64"))
+                        quality, speech_ms, _ = engine._quality(pcm)
+                        embedding = list(await native_audio_call(engine.model.embed_pcm, pcm, reader)) if quality == "ready" else []
+                    finally:
+                        if reader is not None and not reader.in_use:
+                            reader.close()
                     await websocket.send(json.dumps({
                         "type": "speaker.embed_result", "request_id": request_id,
                         "quality": quality, "speech_ms": speech_ms,
@@ -407,6 +433,7 @@ async def run(config_path: Path | None = None) -> None:
                 logger.exception("speaker.worker.request_failed")
                 await websocket.send(json.dumps({
                     "type": "error", "code": "SPEAKER_WORKER_ERROR",
+                    "request_id": message.get("request_id") if isinstance(message, dict) else None,
                     "message": str(exc)[:300],
                 }, ensure_ascii=False))
 

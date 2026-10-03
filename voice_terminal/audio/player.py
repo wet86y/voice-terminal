@@ -97,6 +97,8 @@ class PcmPlayer:
         self._last_callback_status: str | None = None
         self._first_rendered_at: float | None = None
         self._first_rendered_key: str | None = None
+        from ..resources import registry
+        registry.observe(self, "playback_pcm", lambda value: value._buffered_bytes)
 
     @property
     def diagnostics(self) -> dict[str, int | float | str | None]:
