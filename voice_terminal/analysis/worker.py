@@ -5,7 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 from typing import Callable
 
-from .protocol import decode_request
+from .protocol import decode_request, open_request_audio
+from ..resources import process_resource_status, registry, ResourcePolicy
 from ..compute import process_memory_bytes
 
 
@@ -24,6 +25,7 @@ class AnalysisLane:
         self.active: asyncio.Future | None = None
         self.active_request_id: str | None = None
         self.active_run_options = None
+        self._managed_audio = ResourcePolicy.load().shared_audio
 
     def health_payload(self) -> dict:
         model = self.model
@@ -36,10 +38,11 @@ class AnalysisLane:
             "internal_vad_device": getattr(model, "internal_vad_device", None),
             "load_error": getattr(model, "load_error", None),
             "process_memory_rss_bytes": process_memory_bytes(),
+            "resource_status": process_resource_status(),  # resource_status（资源状态）。
             "error": self.error,
         }
 
-    async def run(self, pcm: bytes, request_id: str) -> dict:
+    async def run(self, pcm: bytes, request_id: str, audio_owner=None) -> dict:
         if self.model is None:
             raise RuntimeError(self.error or "model unavailable")
         if self.active is not None and not self.active.done():
@@ -48,13 +51,31 @@ class AnalysisLane:
         run_options = factory() if callable(factory) else None
         self.active_request_id = request_id
         self.active_run_options = run_options
-        if run_options is None:
-            self.active = asyncio.get_running_loop().run_in_executor(self.executor, self.model, pcm)
-        else:
-            self.active = asyncio.get_running_loop().run_in_executor(self.executor, self.model, pcm, run_options)
+        lease = registry.lease(f"analysis:{request_id}", pcm, release_on="native_complete")
+        if audio_owner:
+            audio_owner.in_use = True
+        try:
+            def invoke():
+                from ..audio.allocation import conversion_scope
+                with conversion_scope(pcm, enabled=self._managed_audio):
+                    return self.model(pcm) if run_options is None else self.model(pcm, run_options)
+            if self._managed_audio:
+                self.active = asyncio.get_running_loop().run_in_executor(self.executor, invoke)
+            elif run_options is None:
+                self.active = asyncio.get_running_loop().run_in_executor(self.executor, self.model, pcm)
+            else:
+                self.active = asyncio.get_running_loop().run_in_executor(self.executor, self.model, pcm, run_options)
+        except BaseException:
+            lease.close()
+            if audio_owner:
+                audio_owner.in_use = False
+            raise
         active = self.active
         # Retrieve errors even if the requesting connection has gone away.
         def finished(f):
+            lease.close()  # 原生调用退出后释放，即使请求早已断开。
+            if audio_owner:
+                audio_owner.close()
             if not f.cancelled():
                 f.exception()
             if self.active is f:
@@ -89,7 +110,10 @@ def create_analysis_app(lanes: dict[str, AnalysisLane]):
 
     @app.get("/health")
     async def health():
-        return {name: lane.health_payload() for name, lane in lanes.items()}
+        from ..audio.shared import capabilities
+        result = {name: lane.health_payload() for name, lane in lanes.items()}
+        result["shared_audio"] = capabilities()  # shared_audio（共享音频能力）。
+        return result
 
     # FastAPI must resolve this annotation in the module namespace.
     globals()["WebSocket"] = WebSocket
@@ -100,16 +124,24 @@ def create_analysis_app(lanes: dict[str, AnalysisLane]):
         request = {}
         run_task = receive_task = None
         lane = None
+        audio_owner = None
         try:
             request = await asyncio.wait_for(socket.receive_json(), 5)
             if request.get("operation") == "health":
                 await socket.send_json(await health())
                 return
-            pcm = decode_request(request)
+            try:
+                pcm, audio_owner = open_request_audio(request)
+            except Exception as exc:
+                if isinstance(request, dict) and "audio_ref" in request:
+                    await socket.send_json({"request_id": request.get("request_id"),
+                        "error": str(exc), "code": "AUDIO_REF_REJECTED"})
+                    return  # AUDIO_REF_REJECTED（引用被拒）：仅在未提交原生任务时允许回退。
+                raise
             operation = request["operation"]
             lane = lanes[operation]
             started = time.monotonic()
-            run_task = asyncio.create_task(lane.run(pcm, request["request_id"]))
+            run_task = asyncio.create_task(lane.run(pcm, request["request_id"], audio_owner))
             receive_task = asyncio.create_task(socket.receive_json())
             done, _ = await asyncio.wait({run_task, receive_task}, return_when=asyncio.FIRST_COMPLETED)
             if run_task in done:
@@ -146,6 +178,8 @@ def create_analysis_app(lanes: dict[str, AnalysisLane]):
             pending = [task for task in (run_task, receive_task) if task is not None]
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+            if audio_owner is not None and not audio_owner.in_use:
+                audio_owner.close()
             try:
                 await socket.close()
             except Exception:

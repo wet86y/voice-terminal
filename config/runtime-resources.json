@@ -1,0 +1,7 @@
+{
+  "native_threads": {},
+  "vad_backend": "funasr",
+  "shared_audio": false,
+  "disk_history": false,
+  "history_cache_bytes": 8388608
+}

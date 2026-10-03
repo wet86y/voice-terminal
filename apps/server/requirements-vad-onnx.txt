@@ -1,0 +1,6 @@
+# ONNX VAD（轻量语音检测）候选，运行时不导入 PyTorch（张量推理框架）。
+-r requirements-analysis.txt
+funasr-onnx==0.4.3
+kaldi-native-fbank==1.22.3
+onnx==1.23.0
+ml-dtypes==0.5.4

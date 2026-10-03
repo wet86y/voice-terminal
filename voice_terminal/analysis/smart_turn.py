@@ -45,7 +45,8 @@ class SmartTurn:
         import numpy as np
         if run_options is not None and run_options.terminate:
             raise RuntimeError("analysis cancelled")
-        audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32)[-128000:] / 32768
+        from ..audio.allocation import pcm_samples
+        audio = pcm_samples(pcm, amplitude="int16")[-128000:] / 32768
         audio = np.pad(audio, (128000 - len(audio), 0))
         features = self.extractor(audio, sampling_rate=16000, return_tensors="np",
                                   padding="max_length", max_length=128000,

@@ -86,7 +86,8 @@ class SenseVoice:
 
     def __call__(self, pcm: bytes) -> dict:
         import numpy as np
-        audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
+        from ..audio.allocation import pcm_samples
+        audio = pcm_samples(pcm)
         duration = len(audio) // 16
         detected = self.vad.generate(input=audio, cache={}, is_final=True)
         if not detected or not isinstance(detected[0].get("value"), list):

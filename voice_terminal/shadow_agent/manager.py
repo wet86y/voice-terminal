@@ -109,6 +109,10 @@ class ShadowRuntime(ShadowToolLoopMixin):
         self.last_status_step = 0
         self.working_trace: list[dict[str, Any]] = []
         self.archival_trace: list[dict[str, Any]] = []  # archival_trace（不参与压缩的完整归档记录）。
+        journal = getattr(getattr(context_source, "ledger", None), "journal", None)
+        if journal is not None:
+            from ..session.storage import StoredSequence
+            self.archival_trace = StoredSequence(journal, "shadow_archival_trace")
         self.latest_visible_status: ShadowVisibleStatus | None = None
         self.user_input_required = False
         self.runner: asyncio.Task[None] | None = None

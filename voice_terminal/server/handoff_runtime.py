@@ -10,7 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from ..handoff import (ContinuityOrganizer, OrganizedHandoff, PairedArchive,
-                       PairedArchiveStore, PendingTransferStore, atomic_json, stable_id)
+                       PairedArchiveStore, PendingTransferStore, RecordView, atomic_json, stable_id)
 from ..quiet_hours import QuietHoursConfig, QuietHoursPolicy
 from ..shadow_agent.provider import DeepSeekResponsesShadowProvider
 from ..core.events import event
@@ -166,11 +166,17 @@ class HandoffRuntimeMixin:
             # Native shadow（内置后台代理）保留全部已提交记录。
             runtime = getattr(session, "runtime", None)
             if runtime is not None:
-                rows = [{"type": "assistant/message", "data": item} for item in
-                        getattr(runtime, "archival_trace", [])]
-        records = snapshot + [{"kind": entry.kind, "content": entry.content,
-                               "metadata": entry.metadata} for entry in self.history.entries]
-        records.extend(self.history.delivery_records)
+                rows = RecordView((getattr(runtime, "archival_trace", []),
+                    lambda item: {"type": "assistant/message", "data": item}))
+        if self.paired_archives.streaming:
+            records = RecordView((snapshot, lambda item: item),
+                (self.history.entries, lambda entry: {"kind": entry.kind, "content": entry.content,
+                                                      "metadata": entry.metadata}),
+                (self.history.delivery_records, lambda item: item))
+        else:
+            records = snapshot + [{"kind": entry.kind, "content": entry.content,
+                                   "metadata": entry.metadata} for entry in self.history.entries]
+            records.extend(self.history.delivery_records)
         archive = self.paired_archives.save(
             voice_session_id=self.conversation.conversation_id, dsh_session_id=dsh_id, cwd=cwd,
             voice_records=records, dsh_records=rows,

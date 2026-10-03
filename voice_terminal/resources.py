@@ -1,0 +1,174 @@
+"""Resource policy / registry（资源策略与登记）：启动前配置，按所有者计量。"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import threading
+import time
+import uuid
+import weakref
+from dataclasses import dataclass
+from typing import Callable
+from collections import Counter
+
+ROOT = Path(__file__).resolve().parents[1]
+THREAD_ENV = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+ROLES = {"bootstrap", "asr", "analysis", "voice", "speaker"}
+
+
+@dataclass(frozen=True)
+class ResourcePolicy:
+    """ResourcePolicy（资源策略）：候选须显式选择，未验收的路径保持关闭。"""
+    native_threads: dict[str, int]  # native_threads（各进程原生线程预算）。
+    vad_backend: str = "funasr"  # vad_backend（实时检测后端）。
+    shared_audio: bool = False  # shared_audio（共享音频候选开关）。
+    disk_history: bool = False  # disk_history（历史落盘候选开关）。
+    history_cache_bytes: int = 8 * 1024 * 1024  # history_cache_bytes（历史读取缓存字节预算）。
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> "ResourcePolicy":
+        path = path or Path(os.environ.get("VOICE_RESOURCE_POLICY", ROOT / "config/runtime-resources.json"))
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return cls({})
+        if not isinstance(data, dict):
+            raise ValueError("资源策略必须是对象")
+        threads = data.get("native_threads", {})
+        if not isinstance(threads, dict) or any(k not in ROLES or type(v) is not int or not 1 <= v <= 256 for k, v in threads.items()):
+            raise ValueError("原生线程预算必须是已知组件对应的 1—256 整数")
+        backend = data.get("vad_backend", "funasr")
+        if backend not in {"funasr", "onnx"}:
+            raise ValueError("语音检测后端必须是 funasr（原后端）或 onnx（轻量候选）")
+        for key in ("shared_audio", "disk_history"):
+            if type(data.get(key, False)) is not bool:
+                raise ValueError(f"{key}（候选开关）必须是布尔值")
+        budget = data.get("history_cache_bytes", 8 * 1024 * 1024)
+        if type(budget) is not int or budget < 0:
+            raise ValueError("历史读取缓存预算必须是非负整数")
+        return cls(dict(threads), backend, data.get("shared_audio", False), data.get("disk_history", False), budget)
+
+    def environment(self, role: str, *, model_dir: Path | None = None, parent=None) -> dict[str, str]:
+        env = dict(os.environ if parent is None else parent)
+        env["VOICE_RESOURCE_ROLE"] = role
+        if role in self.native_threads:
+            env.update({name: str(self.native_threads[role]) for name in THREAD_ENV})
+        if model_dir:
+            for name, folder in (("MODELSCOPE_CACHE", "modelscope"), ("HF_HOME", "huggingface"),
+                                 ("TORCH_HOME", "torch"), ("PIP_CACHE_DIR", "pip")):
+                env.setdefault(name, str(model_dir / "cache" / folder))
+        return env
+
+
+def bootstrap_resources(role: str) -> None:
+    """先于 NumPy（数值库）等导入；直接运行工作进程也应用同一策略。"""
+    os.environ.update(ResourcePolicy.load().environment(role))
+
+
+class ResourceRegistry:
+    """ResourceRegistry（资源登记）：弱引用计量，租约显式拥有数据。"""
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._gauges: dict[str, tuple[weakref.ReferenceType, Callable]] = {}
+        self._statuses: dict[str, tuple[weakref.ReferenceType, Callable]] = {}
+        self._leases: dict[str, tuple[str, object, int, str]] = {}
+
+    def observe(self, owner, purpose: str, measure: Callable) -> str:
+        key = f"{purpose}:{id(owner)}"
+        def gone(_):
+            with self._lock:
+                self._gauges.pop(key, None)
+        with self._lock:
+            self._gauges[key] = (weakref.ref(owner, gone), measure)
+        return key
+
+    def observe_status(self, owner, purpose: str, measure: Callable) -> None:
+        key = f"{purpose}:{id(owner)}"
+        def gone(_):
+            with self._lock:
+                self._statuses.pop(key, None)
+        with self._lock:
+            self._statuses[key] = (weakref.ref(owner, gone), measure)
+
+    def lease(self, owner: str, data, size: int | None = None, *, release_on="owner_close") -> "ResourceLease":
+        key = uuid.uuid4().hex
+        with self._lock:
+            self._leases[key] = (owner, data, len(data) if size is None else size, release_on)
+        return ResourceLease(self, key)
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            self._leases.pop(key, None)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            caches = {}
+            for key, (ref, measure) in list(self._gauges.items()):
+                obj = ref()
+                if obj is not None:
+                    try:
+                        caches[key] = max(0, int(measure(obj)))
+                    except (AttributeError, RuntimeError, ValueError):
+                        # 计量遇到正在关闭的所有者，不得破坏原有健康检查。
+                        continue
+            # 同一对象被多次租用时只计一次容量。
+            buffers = {id(data): size for _, data, size, _ in self._leases.values()}
+            references = Counter(id(data) for _, data, _, _ in self._leases.values())
+            statuses = {}
+            for key, (ref, measure) in list(self._statuses.items()):
+                obj = ref()
+                if obj is not None:
+                    statuses[key] = measure(obj)
+            return {"managed_cache_bytes": sum(caches.values()),  # 受管理缓存字节数。
+                    "leased_bytes": sum(buffers.values()),  # 活动租约的去重字节数。
+                    "active_leases": len(self._leases),  # 活动租约数。
+                    "caches": caches,  # 按用途的缓存计量。
+                    "owners": statuses,  # owners（持有者状态），包含存储失败与待写材料。
+                    "leases": [{"lease_id": key, "owner_pid": os.getpid(), "purpose": purpose,
+                                "capacity_bytes": size, "active_references": references[id(data)],
+                                "release_on": release_on}
+                               for key, (purpose, data, size, release_on) in self._leases.items()]}  # 租约标识、所有者、用途、容量、引用与释放条件。
+
+
+class ResourceLease:
+    """ResourceLease（资源租约）：完成事件释放，不因请求取消提前释放。"""
+    def __init__(self, registry: ResourceRegistry, key: str):
+        self.registry, self.key = registry, key
+
+    def close(self):
+        self.registry.release(self.key)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+registry = ResourceRegistry()
+
+
+def process_resource_status() -> dict:
+    import psutil
+    process = psutil.Process()
+    memory = process.memory_info()
+    return {"pid": process.pid, "created_at": process.create_time(),  # 进程身份与创建时间。
+            "private_commit_bytes": getattr(memory, "private", None),  # 私有提交，非物理内存。
+            "rss_bytes": memory.rss, "thread_count": process.num_threads(),  # 常驻字节数与线程数。
+            "sampled_at": time.time(), "role": os.environ.get("VOICE_RESOURCE_ROLE"),  # 采样时间与角色。
+            "thread_environment": {key: os.environ.get(key) for key in THREAD_ENV},  # 实际启动线程环境。
+            **registry.snapshot()}
+
+
+def aggregate_resource_status(rows: list[dict], *, missing_roles=()) -> dict:
+    processes = {(row["pid"], row["created_at"]): row for row in rows if row.get("pid") and row.get("created_at")}
+    commits = [row.get("private_commit_bytes") for row in processes.values()]
+    missing = sorted(set(missing_roles))
+    return {"processes": list(processes.values()),  # 去重进程清单。
+            "complete": not missing, "missing_roles": missing,  # complete（覆盖完整）及 missing_roles（未采样角色）。
+            "private_commit_bytes": sum(commits) if not missing and commits and all(v is not None for v in commits) else None,
+            "rss_bytes": sum(row["rss_bytes"] for row in processes.values()),
+            "thread_count": sum(row["thread_count"] for row in processes.values()),
+            "managed_cache_bytes": sum(row.get("managed_cache_bytes", 0) for row in processes.values()),
+            "active_leases": sum(row.get("active_leases", 0) for row in processes.values())}

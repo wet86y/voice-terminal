@@ -43,7 +43,39 @@ export interface ProductComputeModelStatus {
   internal_vad_device?: string | null
 }
 
+export interface ResourceProcessStatus {
+  /** pid（进程标识）与 created_at（创建时间）共同确认身份。 */
+  pid: number
+  created_at: number
+  /** private_commit_bytes（私有提交字节）：未知时为空，不等于物理内存。 */
+  private_commit_bytes: number | null
+  /** rss_bytes（物理常驻字节）及 thread_count（线程数量）。 */
+  rss_bytes: number
+  thread_count: number
+  /** managed_cache_bytes（已登记缓存字节）与 active_leases（活动租约数）。 */
+  managed_cache_bytes: number
+  active_leases: number
+}
+
+export interface ResourceStatus {
+  /** complete（采样覆盖完整）及 missing_roles（缺失的活动角色）；旧工作进程可能不提供资源指标。 */
+  complete: boolean
+  missing_roles: string[]
+  /** processes（按进程身份去重后的采样清单）。 */
+  processes: ResourceProcessStatus[]
+  /** private_commit_bytes（合计私有提交字节）：任一进程未知则为空。 */
+  private_commit_bytes: number | null
+  /** rss_bytes（合计常驻字节），共享页面可能被多个进程计入。 */
+  rss_bytes: number
+  /** thread_count（线程总数）、managed_cache_bytes（登记缓存总字节）、active_leases（活动租约总数）。 */
+  thread_count: number
+  managed_cache_bytes: number
+  active_leases: number
+}
+
 export interface ProductComputeStatus {
+  /** resource_status（资源状态）：旧服务可以省略此字段。 */
+  resource_status?: ResourceStatus
   hardware: {
     system_memory: { available_bytes: number | null; total_bytes: number | null }
     gpu: { available: boolean; name: string | null; free_bytes: number | null; total_bytes: number | null }

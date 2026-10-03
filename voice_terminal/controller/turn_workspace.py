@@ -22,12 +22,18 @@ class CurrentTurnAudioBuffer:
         self.max_samples = max_samples
         self.start_sample: int | None = None
         self.pcm = bytearray()
+        self._tail_snapshot: tuple[int, bytes] | None = None
+        from ..resources import registry, ResourcePolicy
+        self._reuse_snapshots = ResourcePolicy.load().shared_audio
+        registry.observe(self, "turn_audio", lambda value: len(value.pcm) +
+                         (len(value._tail_snapshot[1]) if value._tail_snapshot else 0))
 
     @property
     def end_sample(self) -> int:
         return (self.start_sample or 0) + len(self.pcm) // 2
 
     def append(self, frame: AudioFrame) -> None:
+        self._tail_snapshot = None
         if len(frame.pcm) % 2:
             raise ValueError("PCM must contain complete int16 samples")
         if self.start_sample is None:
@@ -46,7 +52,11 @@ class CurrentTurnAudioBuffer:
             self.start_sample += excess
 
     def tail(self, seconds: int = 8) -> bytes:
-        return bytes(self.pcm[-seconds * 16000 * 2:])
+        if not self._reuse_snapshots:
+            return bytes(self.pcm[-seconds * 16000 * 2:])
+        if self._tail_snapshot is None or self._tail_snapshot[0] != seconds:
+            self._tail_snapshot = (seconds, bytes(self.pcm[-seconds * 16000 * 2:]))
+        return self._tail_snapshot[1]
 
 
 @dataclass

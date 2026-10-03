@@ -105,6 +105,10 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         self.llm: DeepSeekClient | None = None
         project_root = runtime_data_dir.resolve().parent if runtime_data_dir else Path(__file__).resolve().parents[2]
         self._project_root = project_root
+        from ..resources import ResourcePolicy
+        resource_policy = ResourcePolicy.load()
+        if resource_policy.disk_history:
+            self.history.attach_storage(project_root / ".runtime/continuity/archives/.journals", resource_policy.history_cache_bytes)
         self._init_handoff()
         default_worker_config = project_root / "config" / "default.yaml"
         # Child config（子进程配置文件） keeps the worker on the same model and port.
@@ -1328,6 +1332,8 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             self.continuity.close(),
             return_exceptions=True,
         )
+        if not await asyncio.to_thread(self.history.close_storage):
+            logger.error("会话记录尚未完整落盘，保留待写材料：%s", self.history.journal.error)
 
     async def _wake_shadow(self) -> str:
         if self.shadow_session is None or not self.shadow_session.available:
@@ -1566,7 +1572,11 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
 
     async def compute_status(self) -> dict[str, Any]:
         """读取设备能力、模型实际设备和工作进程常驻内存。"""
-        hardware = hardware_status()
+        from ..resources import process_resource_status, aggregate_resource_status
+        from ..compute import accept_hardware_capabilities
+        resource_rows = [process_resource_status()]
+        missing_resource_roles = set()
+        hardware = await asyncio.to_thread(hardware_status)
         requests = self.config.compute.devices
         models: dict[str, dict[str, Any]] = {
             name: {
@@ -1590,6 +1600,13 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         if self.asr is not None:
             try:
                 status = await self.asr.health(timeout_s=2.0)
+                if isinstance(status.get("resource_status"), dict):
+                    resource_rows.append(status["resource_status"])
+                else:
+                    missing_resource_roles.add("asr")
+                if isinstance(status.get("hardware_capabilities"), dict):
+                    accept_hardware_capabilities(status["hardware_capabilities"])
+                    hardware = status["hardware_capabilities"]
                 models["paraformer"].update({
                     "device": status.get("device"),
                     "requested_device": status.get("requested_device", requests.get("paraformer", "auto")),
@@ -1598,6 +1615,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                     "process_memory_rss_bytes": status.get("process_memory_rss_bytes"),
                 })
             except Exception as exc:
+                missing_resource_roles.add("asr")
                 models["paraformer"].update({
                     "service": "ERROR",
                     "load_error": str(exc)[:300],
@@ -1610,6 +1628,10 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             for lane_name, model_name in (("refine", "sensevoice"), ("endpoint", "smart_turn")):
                 lane = analysis.get(lane_name, {})
                 if isinstance(lane, dict):
+                    if isinstance(lane.get("resource_status"), dict):
+                        resource_rows.append(lane["resource_status"])
+                    elif lane.get("status") != "DISABLED":
+                        missing_resource_roles.add("analysis")
                     models[model_name].update({
                         "device": lane.get("device"),
                         "requested_device": lane.get("requested_device", requests.get(model_name, "cpu")),
@@ -1620,12 +1642,18 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                     if model_name == "sensevoice":
                         models[model_name]["internal_vad_device"] = lane.get("internal_vad_device")
         except Exception as exc:
+            if self.config.smart_turn.smart_turn or self.config.smart_turn.sensevoice:
+                missing_resource_roles.add("analysis")
             for name in ("sensevoice", "smart_turn"):
                 models[name].update({"service": "UNAVAILABLE", "load_error": str(exc)[:300]})
 
         if self.speaker is not None and self.speaker.connected:
             try:
                 status = await self.speaker.health(timeout_s=2.0)
+                if isinstance(status.get("resource_status"), dict):
+                    resource_rows.append(status["resource_status"])
+                else:
+                    missing_resource_roles.add("speaker")
                 models["wespeaker"].update({
                     "device": status.get("device"),
                     "requested_device": status.get("requested_device", requests.get("wespeaker", "cpu")),
@@ -1634,11 +1662,16 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                     "process_memory_rss_bytes": status.get("process_memory_rss_bytes"),
                 })
             except Exception as exc:
+                missing_resource_roles.add("speaker")
                 models["wespeaker"].update({"service": "ERROR", "load_error": str(exc)[:300]})
         else:
             models["wespeaker"]["service"] = self.state.services.get("speaker", "DISABLED")
 
-        return {"hardware": hardware, "models": models}
+        for name, status in models.items():
+            status["gpu_available"] = bool(hardware["models"].get(name, {}).get("gpu_available"))
+            status["gpu_unavailable_reason"] = hardware["models"].get(name, {}).get("reason")
+        return {"hardware": hardware, "models": models,
+                "resource_status": aggregate_resource_status(resource_rows, missing_roles=missing_resource_roles)}  # resource_status（资源状态）。
 
 
 

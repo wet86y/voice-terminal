@@ -6,6 +6,8 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from html import escape
 from typing import Any
+from pathlib import Path
+from .storage import SessionJournal, StoredSequence, StoredSet
 
 from .contracts import DeliveryReport, ToolExchange
 from .context_frames import ContextFrame, ContextLane
@@ -48,7 +50,8 @@ class InputRecord:
 class SessionLedger:
     """One source of model context and the user-visible session history."""
 
-    def __init__(self, *, limit: int = 10) -> None:
+    def __init__(self, *, limit: int = 10, storage_dir: Path | None = None,
+                 cache_bytes: int = 8 * 1024 * 1024) -> None:
         self.limit = limit
         self.entries: list[SessionLedgerEntry] = []
         self.records: list[InputRecord] = []
@@ -74,6 +77,36 @@ class SessionLedger:
         self.shadow_available = False
         self.shadow_active = False
         self._shadow_current_turn_keys: set[tuple[str, str, str]] = set()
+        self.journal: SessionJournal | None = None
+        if storage_dir is not None:
+            self.attach_storage(storage_dir, cache_bytes)
+
+    def attach_storage(self, directory: Path, cache_bytes: int = 8 * 1024 * 1024) -> None:
+        if self.journal is not None:
+            return
+        journal = SessionJournal(directory, cache_bytes)
+        for name, decode in (("entries", lambda value: SessionLedgerEntry(**value)),
+                             ("delivery_records", lambda value: value),
+                             ("_shadow_frames", lambda value: ShadowContextFrame(**value))):
+            sequence = StoredSequence(journal, name, decode)
+            for value in getattr(self, name):
+                sequence.append(value)
+            setattr(self, name, sequence)
+        for name in ("_committed_delivery_ids", "_shadow_current_turn_keys"):
+            stored = StoredSet(journal, name)
+            for value in getattr(self, name):
+                stored.add(value)
+            setattr(self, name, stored)
+        self.journal = journal
+
+    def _find_entry(self, kind: str, identity: str):
+        if isinstance(self.entries, StoredSequence):
+            return self.entries.find(kind, identity)
+        field = "turn_id" if kind == "input" else "speech_id"
+        return next((item for item in reversed(self.entries) if item.kind == kind and item.metadata.get(field) == identity), None)
+
+    def close_storage(self) -> bool:
+        return self.journal.close() if self.journal is not None else True
 
     def reset(self) -> None:
         self.entries.clear()
@@ -129,7 +162,7 @@ class SessionLedger:
             epoch=self._shadow_context_epoch,
             from_revision=since_revision,
             to_revision=self._shadow_input_revision,
-            frames=tuple(frame for frame in self._shadow_frames if frame.revision > since_revision),
+            frames=tuple(self._shadow_frames[since_revision:]),
         )
 
     def project_shadow_current_turn(self, turn_id: str, text: str, refined_text: str = "") -> bool:
@@ -302,17 +335,14 @@ class SessionLedger:
         adjacent turns.
         """
 
-        return any(entry.kind == "input" and entry.metadata.get("turn_id") == turn_id
-                   for entry in self.entries)
+        return self._find_entry("input", turn_id) is not None
 
     def input_refinement(self, turn_id: str) -> str:
         """Return the supplemental refinement already durable for one turn."""
 
-        for entry in reversed(self.entries):
-            if entry.kind == "input" and entry.metadata.get("turn_id") == turn_id:
-                value = entry.metadata.get("refined_text")
-                return value.strip() if isinstance(value, str) else ""
-        return ""
+        entry = self._find_entry("input", turn_id)
+        value = entry.metadata.get("refined_text") if entry else None
+        return value.strip() if isinstance(value, str) else ""
 
     def update_input_refinement(self, turn_id: str, refined_text: str, *, details: dict[str, Any] | None = None) -> None:
         """Attach late ASR refinement to an existing input without duplicating it.
@@ -329,7 +359,9 @@ class SessionLedger:
         if previous == value:
             return
         stored_updates: list[dict[str, Any]] | None = None
-        for entry in reversed(self.entries):
+        for entry in [self._find_entry("input", turn_id)]:
+            if entry is None:
+                continue
             if entry.kind != "input" or entry.metadata.get("turn_id") != turn_id:
                 continue
             # Older in-memory entries can lack the field introduced above.
@@ -351,6 +383,9 @@ class SessionLedger:
             # been handed to the provider.
             entry.metadata["history_content"] = frozen_history
             stored_updates = [dict(item) for item in entry.metadata["transcript_updates"]]
+            if isinstance(self.entries, StoredSequence):
+                index = self.entries.journal.find(self.entries.bucket, "input", turn_id)
+                self.entries[index] = entry
             break
         if stored_updates is not None:
             self._commit_shadow_input("user", "asr_refinement", {
@@ -377,10 +412,7 @@ class SessionLedger:
                 break
 
     def has_speech(self, speech_id: str) -> bool:
-        return any(
-            entry.kind == "speech" and entry.metadata.get("speech_id") == speech_id
-            for entry in self.entries
-        )
+        return self._find_entry("speech", speech_id) is not None
 
     @staticmethod
     def _voice_delivery_content(text: str, delivery: DeliveryReport) -> str:
@@ -557,13 +589,7 @@ class SessionLedger:
 
     def append_record(self, record: dict[str, Any]) -> InputRecord:
         details = dict(record.get("details") or {})
-        ledger_input = next(
-            (
-                entry for entry in reversed(self.entries)
-                if entry.kind == "input" and entry.metadata.get("turn_id") == str(record["turn_id"])
-            ),
-            None,
-        )
+        ledger_input = self._find_entry("input", str(record["turn_id"]))
         if ledger_input is not None:
             if "primary_text" in ledger_input.metadata:
                 details.setdefault("primary_text", ledger_input.metadata["primary_text"])

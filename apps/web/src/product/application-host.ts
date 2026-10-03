@@ -21,6 +21,8 @@ export interface ApplicationComponent {
   memory_rss_bytes: number | null
   /** memory_private_commit_bytes（进程私有提交内存，字节）；旧宿主可能不提供。 */
   memory_private_commit_bytes?: number | null
+  /** thread_count（进程当前线程数）；旧宿主可省略。 */
+  thread_count?: number | null
   /** cpu_percent（中央处理器占用百分比）。 */
   cpu_percent: number | null
   /** sampled_at（指标采样时间，秒）。 */
