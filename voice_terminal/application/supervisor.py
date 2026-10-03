@@ -389,6 +389,21 @@ class ApplicationHost:
         now = time.time()
         unique = {}
         sampled = {}
+
+        def sample_process(process, identity):
+            if identity not in sampled:
+                memory = process.memory_info()
+                # private（Windows 私有提交量）与 rss（常驻工作集）是不同口径。
+                # 其他平台不以 vms（虚拟地址空间）冒充提交量，缺失时明确不可用。
+                private_commit = getattr(memory, "private", None)
+                times = process.cpu_times()
+                cpu_time = times.user + times.system
+                previous = self.cpu_samples.get(identity)
+                cpu = max(0., (cpu_time - previous[1]) / (now - previous[0]) * 100) if previous and now > previous[0] else None
+                self.cpu_samples[identity] = (now, cpu_time)
+                sampled[identity] = (memory.rss, private_commit, cpu)
+            return sampled[identity]
+
         for row in snapshot["components"]:
             pid = row["pid"]
             if not pid or row["state"] in {"disabled", "stopped", "blocked"}:
@@ -397,32 +412,32 @@ class ApplicationHost:
                 process = psutil.Process(pid)
                 created = process.create_time()
                 if row["created_at"] and abs(created - row["created_at"]) > 2:
-                    self.state.component(row["id"], memory_rss_bytes=None, cpu_percent=None, uptime_seconds=None, sampled_at=now)
+                    self.state.component(row["id"], memory_rss_bytes=None, memory_private_commit_bytes=None,
+                        cpu_percent=None, uptime_seconds=None, sampled_at=now)
                     continue
                 identity = (pid, created)
-                if identity not in sampled:
-                    memory = process.memory_info().rss
-                    times = process.cpu_times()
-                    cpu_time = times.user + times.system
-                    previous = self.cpu_samples.get(identity)
-                    cpu = max(0., (cpu_time - previous[1]) / (now - previous[0]) * 100) if previous and now > previous[0] else None
-                    self.cpu_samples[identity] = (now, cpu_time)
-                    sampled[identity] = (memory, cpu)
-                memory, cpu = sampled[identity]
+                memory, private_commit, cpu = sample_process(process, identity)
                 self.state.component(row["id"], created_at=created, uptime_seconds=max(0, now-created),
-                    memory_rss_bytes=memory, cpu_percent=cpu, sampled_at=now)
+                    memory_rss_bytes=memory, memory_private_commit_bytes=private_commit,
+                    cpu_percent=cpu, sampled_at=now)
                 if not row["external"]:
-                    unique[(pid, created)] = memory
+                    unique[identity] = (memory, private_commit)
                 # 子树仅计入整体总量，不重复加入各组件行。
                 if row["id"] in {"voice", "asr", "analysis"} and not row["external"]:
                     for child in process.children(recursive=True):
                         try:
-                            unique[(child.pid, child.create_time())] = child.memory_info().rss
+                            child_identity = (child.pid, child.create_time())
+                            child_memory, child_commit, _ = sample_process(child, child_identity)
+                            unique[child_identity] = (child_memory, child_commit)
                         except psutil.Error:
                             pass
             except psutil.Error:
-                self.state.component(row["id"], memory_rss_bytes=None, cpu_percent=None, uptime_seconds=None, sampled_at=now)
-        self.state.update(sampled_at=now, total_memory_rss_bytes=sum(unique.values()) if unique else None)
+                self.state.component(row["id"], memory_rss_bytes=None, memory_private_commit_bytes=None,
+                    cpu_percent=None, uptime_seconds=None, sampled_at=now)
+        commits = [value[1] for value in unique.values()]
+        self.state.update(sampled_at=now,
+            total_memory_rss_bytes=sum(value[0] for value in unique.values()) if unique else None,
+            total_memory_private_commit_bytes=sum(commits) if commits and all(value is not None for value in commits) else None)
         self.cpu_samples = {identity: value for identity, value in self.cpu_samples.items() if identity in unique}
 
     async def monitor(self):
@@ -488,4 +503,5 @@ class ApplicationHost:
         for row in self.state.snapshot()["components"]:
             self.state.component(row["id"], state="stopped", phase="已回收", pid=None)
         self.state.update(state="stopped", phase="应用已退出", core_available=False,
-            total_memory_rss_bytes=None, capabilities={key: "STOPPED" for key in self.state.value["capabilities"]})
+            total_memory_rss_bytes=None, total_memory_private_commit_bytes=None,
+            capabilities={key: "STOPPED" for key in self.state.value["capabilities"]})

@@ -17,8 +17,10 @@ export interface ApplicationComponent {
   created_at: number | null
   /** uptime_seconds（运行时长，秒）。 */
   uptime_seconds: number | null
-  /** memory_rss_bytes（进程常驻内存，字节）。 */
+  /** memory_rss_bytes（进程常驻工作集，字节，包含共享页）。 */
   memory_rss_bytes: number | null
+  /** memory_private_commit_bytes（进程私有提交内存，字节）；旧宿主可能不提供。 */
+  memory_private_commit_bytes?: number | null
   /** cpu_percent（中央处理器占用百分比）。 */
   cpu_percent: number | null
   /** sampled_at（指标采样时间，秒）。 */
@@ -60,6 +62,8 @@ export interface ApplicationSnapshot {
   sampled_at: number | null
   /** total_memory_rss_bytes（去重后的受管进程工作集之和，字节）。 */
   total_memory_rss_bytes: number | null
+  /** total_memory_private_commit_bytes（去重后的受管进程私有提交内存之和，字节）。 */
+  total_memory_private_commit_bytes?: number | null
   /** completed_components（完成启动尝试的组件数量）。 */
   completed_components: number
   /** total_components（启用组件数量）。 */

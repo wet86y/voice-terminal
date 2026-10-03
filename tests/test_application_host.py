@@ -14,7 +14,8 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from voice_terminal.application.state import ApplicationState
 from voice_terminal.application.supervisor import ApplicationHost
@@ -25,11 +26,13 @@ from voice_terminal.application.windows import Job, ManagedProcess, SingleInstan
 class ApplicationStateTests(unittest.TestCase):
     def test_replaced_pid_clears_previous_identity_and_metrics(self):
         state = ApplicationState()
-        state.component("dsh", state="ready", pid=10, created_at=100, memory_rss_bytes=500)
+        state.component("dsh", state="ready", pid=10, created_at=100,
+            memory_rss_bytes=500, memory_private_commit_bytes=2000)
         state.component("dsh", state="ready", pid=11)
         row = next(c for c in state.snapshot()["components"] if c["id"] == "dsh")
         self.assertIsNone(row["created_at"])
         self.assertIsNone(row["memory_rss_bytes"])
+        self.assertIsNone(row["memory_private_commit_bytes"])
 
     def test_optional_failure_is_degraded_and_disabled_is_settled(self):
         state = ApplicationState()
@@ -124,9 +127,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             app.sample_metrics()
             row = next(c for c in app.state.snapshot()["components"] if c["id"] == "voice")
             self.assertGreater(row["memory_rss_bytes"], 0)
+            if os.name == "nt":
+                self.assertGreater(row["memory_private_commit_bytes"], 0)
             app.state.component("voice", pid=None)
             row = next(c for c in app.state.snapshot()["components"] if c["id"] == "voice")
             self.assertIsNone(row["memory_rss_bytes"])
+            self.assertIsNone(row["memory_private_commit_bytes"])
         finally:
             app.outer_job.close()
 
@@ -147,6 +153,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(app.shutdown(), timeout=1)
                 self.assertTrue(task.cancelled())
                 self.assertEqual(app.state.snapshot()["state"], "stopped")
+                self.assertIsNone(app.state.snapshot()["total_memory_private_commit_bytes"])
         finally:
             blocked.set()
             app.outer_job.close()
@@ -171,7 +178,75 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         rows = {c["id"]: c for c in snapshot["components"]}
         self.assertEqual(rows["host"]["cpu_percent"], rows["web"]["cpu_percent"])
         self.assertEqual(snapshot["total_memory_rss_bytes"], rows["host"]["memory_rss_bytes"])
+        self.assertEqual(rows["host"]["memory_private_commit_bytes"], rows["web"]["memory_private_commit_bytes"])
+        self.assertEqual(snapshot["total_memory_private_commit_bytes"], rows["host"]["memory_private_commit_bytes"])
         app.outer_job.close()
+
+    async def test_memory_totals_deduplicate_child_components_and_exclude_external_process(self):
+        """共享进程与已列出的子组件只计一次，外部调试进程不计入总量。"""
+        app = ApplicationHost(Path.cwd())
+        processes = {}
+        for pid, rss, commit in ((10, 100, 1000), (20, 200, 2000),
+                (30, 300, 3000), (40, 400, 4000), (50, 500, 5000)):
+            process = Mock(pid=pid)
+            process.create_time.return_value = 100 + pid
+            process.memory_info.return_value = SimpleNamespace(rss=rss, private=commit)
+            process.cpu_times.return_value = SimpleNamespace(user=1., system=0.)
+            process.children.return_value = []
+            processes[pid] = process
+        processes[20].children.return_value = [processes[30], processes[40]]
+        try:
+            for key, pid in (("host", 10), ("web", 10), ("voice", 20), ("speaker", 30)):
+                app.state.component(key, state="ready", pid=pid)
+            app.state.component("asr", state="external", pid=50, external=True)
+            with patch("psutil.Process", side_effect=processes.__getitem__):
+                app.sample_metrics()
+            snapshot = app.state.snapshot()
+            rows = {c["id"]: c for c in snapshot["components"]}
+            self.assertEqual(snapshot["total_memory_rss_bytes"], 1000)
+            self.assertEqual(snapshot["total_memory_private_commit_bytes"], 10000)
+            self.assertEqual(rows["asr"]["memory_private_commit_bytes"], 5000)
+            self.assertEqual(rows["speaker"]["memory_private_commit_bytes"], 3000)
+            for process in processes.values():
+                process.memory_info.assert_called_once()
+        finally:
+            app.outer_job.close()
+
+    async def test_missing_private_counter_does_not_report_virtual_address_space_as_commit(self):
+        """缺少私有提交计数时保留空值，不能用虚拟地址空间代替。"""
+        app = ApplicationHost(Path.cwd())
+        process = Mock(pid=10)
+        process.create_time.return_value = 100
+        process.memory_info.return_value = SimpleNamespace(rss=100, vms=999999)
+        process.cpu_times.return_value = SimpleNamespace(user=0., system=0.)
+        try:
+            app.state.component("host", state="ready", pid=10)
+            with patch("psutil.Process", return_value=process):
+                app.sample_metrics()
+            snapshot = app.state.snapshot()
+            self.assertEqual(snapshot["total_memory_rss_bytes"], 100)
+            self.assertIsNone(snapshot["total_memory_private_commit_bytes"])
+            self.assertIsNone(snapshot["components"][0]["memory_private_commit_bytes"])
+        finally:
+            app.outer_job.close()
+
+    async def test_reused_pid_does_not_keep_previous_process_commit(self):
+        """进程标识复用后，旧进程的两类内存指标都必须清空。"""
+        app = ApplicationHost(Path.cwd())
+        process = Mock(pid=10)
+        process.create_time.return_value = 200
+        try:
+            app.state.component("host", state="ready", pid=10, created_at=100,
+                memory_rss_bytes=1000, memory_private_commit_bytes=5000)
+            with patch("psutil.Process", return_value=process):
+                app.sample_metrics()
+            snapshot = app.state.snapshot()
+            self.assertIsNone(snapshot["components"][0]["memory_rss_bytes"])
+            self.assertIsNone(snapshot["components"][0]["memory_private_commit_bytes"])
+            self.assertIsNone(snapshot["total_memory_private_commit_bytes"])
+            process.memory_info.assert_not_called()
+        finally:
+            app.outer_job.close()
 
     async def test_startup_attempts_all_components_after_asr_failure(self):
         with tempfile.TemporaryDirectory() as directory:
