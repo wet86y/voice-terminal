@@ -88,7 +88,7 @@ def test_always_on_can_start_protected_kws_while_asr_is_unavailable():
 
 
 def test_always_on_start_does_not_open_unready_asr_input():
-    async def scenario():
+    async def scenario(asr_status):
         class Controller(InputController):
             async def _on_asr_result(self, _message):
                 return None
@@ -126,7 +126,7 @@ def test_always_on_start_does_not_open_unready_asr_input():
 
         state = RuntimeState(state=TerminalState.IDLE)
         state.services.update(
-            audio="READY", kws="READY", asr="ERROR", llm="READY", tts="READY",
+            audio="READY", kws="READY", asr=asr_status, llm="READY", tts="READY",
         )
         capture, asr = Capture(), Asr()
         controller = Controller(
@@ -142,11 +142,21 @@ def test_always_on_start_does_not_open_unready_asr_input():
         await controller.start_listening()
         assert state.listening is True
         assert state.input_owner == "kws"
-        assert state.services["asr"] == "ERROR"
+        assert state.services["asr"] == asr_status
         assert asr.connect_calls == 0
         await controller.stop_listening()
+        # ASR（语音识别）会话正常关闭后，连续重启 KWS（关键词唤醒）监听
+        # 仍应保持就绪；真实 ASR 故障已在上面的 ERROR（错误）分支保留。
+        for _ in range(2):
+            await controller.start_listening()
+            assert state.listening is True
+            assert state.input_owner == "kws"
+            assert state.services["asr"] == "READY"
+            assert asr.connect_calls == 0
+            await controller.stop_listening()
 
-    asyncio.run(scenario())
+    for asr_status in ("ERROR", "READY"):
+        asyncio.run(scenario(asr_status))
 
 
 def test_kws_owner_short_circuits_before_vad_workspace_and_asr():
