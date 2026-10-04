@@ -397,18 +397,27 @@ pub mod windows {
         }
     }
     pub fn open(path: &Path) -> Result<(), String> {
+        shell_open(path.as_os_str()).map_err(|code| format!("无法打开目录，系统错误码：{code}"))
+    }
+    // open_url（打开网页）：交给 Windows（操作系统）的默认浏览器，不经过命令行解释器。
+    pub fn open_url(url: &str) -> Result<(), String> {
+        shell_open(OsStr::new(url)).map_err(|code| {
+            format!("无法打开系统默认浏览器，请检查默认浏览器设置，系统错误码：{code}")
+        })
+    }
+    fn shell_open(target: &OsStr) -> Result<(), isize> {
         let result = unsafe {
             ShellExecuteW(
                 ptr::null_mut(),
                 wide("open").as_ptr(),
-                wide(path).as_ptr(),
+                wide(target).as_ptr(),
                 ptr::null(),
                 ptr::null(),
                 SW_SHOWNORMAL,
             )
         } as isize;
         if result <= 32 {
-            Err(format!("无法打开目录，系统错误码：{result}"))
+            Err(result)
         } else {
             Ok(())
         }

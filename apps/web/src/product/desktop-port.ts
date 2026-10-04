@@ -3,7 +3,7 @@ export interface DesktopPort {
   available: boolean; // available（是否运行于受管桌面窗口）。
   focus(): Promise<void>;
   openLogs(): Promise<void>;
-  openConsole(url: string): Promise<void>;
+  openConsole(url: string): Promise<void>; // openConsole（在系统默认浏览器打开代理控制台）；url（带访问令牌的本机地址）。
   exit(): Promise<void>;
 }
 

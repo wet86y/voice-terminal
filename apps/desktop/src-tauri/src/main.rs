@@ -130,12 +130,18 @@ fn exit_application(
 #[tauri::command]
 fn open_console(
     window: WebviewWindow,
-    app: tauri::AppHandle,
     state: tauri::State<Arc<Desktop>>,
     url: String,
 ) -> Result<(), String> {
     trusted(&window, &state)?;
-    let url: tauri::Url = url.parse().map_err(|_| "控制台地址无效")?;
+    let url = console_url(&url)?;
+    // 通过系统默认浏览器打开 DSH（代理执行宿主）网页，使用完整令牌地址登录。
+    voice_desktop_common::windows::open_url(url.as_str())
+}
+
+// console_url（控制台地址校验）：限制桌面入口只能打开当前本机代理控制台。
+fn console_url(value: &str) -> Result<tauri::Url, String> {
+    let url: tauri::Url = value.parse().map_err(|_| "控制台地址无效")?;
     // 服务返回的短期令牌地址仅允许固定的本机 DSH（代理执行宿主）入口。
     let query: Vec<_> = url.query_pairs().collect();
     if url.scheme() != "http"
@@ -151,19 +157,7 @@ fn open_console(
     {
         return Err("控制台地址不符合本机入口约束。".into());
     }
-    if let Some(console) = app.get_webview_window("console") {
-        console.navigate(url).map_err(|e| e.to_string())?;
-        let _ = console.show();
-        let _ = console.set_focus();
-    } else {
-        WebviewWindowBuilder::new(&app, "console", WebviewUrl::External(url))
-            .title("代理控制台 · Voice Terminal")
-            .inner_size(1100., 780.)
-            .data_directory(state.context.data.join("cache/webview2-console"))
-            .build()
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    Ok(url)
 }
 fn show(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -417,5 +411,37 @@ fn run() -> Result<(), String> {
 fn main() {
     if let Err(message) = run() {
         voice_desktop_common::windows::error(&message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::console_url;
+
+    #[test]
+    fn console_url_preserves_launch_token() {
+        let address = "http://127.0.0.1:3081/?token=launch%2Btoken%2Fvalue%3D";
+        let url = console_url(address).unwrap();
+        assert_eq!(url.as_str(), address);
+        assert_eq!(url.query_pairs().next().unwrap().1, "launch+token/value=");
+    }
+
+    #[test]
+    fn console_url_rejects_untrusted_or_incomplete_addresses() {
+        for address in [
+            "not a URL",
+            "https://127.0.0.1:3081/?token=value",
+            "http://example.com:3081/?token=value",
+            "http://127.0.0.1:5173/?token=value",
+            "http://127.0.0.1:3081/other?token=value",
+            "http://user:password@127.0.0.1:3081/?token=value",
+            "http://127.0.0.1:3081/?token=value#fragment",
+            "http://127.0.0.1:3081/",
+            "http://127.0.0.1:3081/?token=",
+            "http://127.0.0.1:3081/?token=value&token=other",
+            "http://127.0.0.1:3081/?token=value&redirect=other",
+        ] {
+            assert!(console_url(address).is_err(), "应拒绝控制台地址：{address}");
+        }
     }
 }

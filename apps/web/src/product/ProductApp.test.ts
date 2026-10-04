@@ -11,6 +11,7 @@ import { settingsSections } from '../interface/settings'
 import { productApi, ProductApiError } from './api'
 import { useProductAdapter } from './useProductAdapter'
 import { useProductControls } from './useProductControls'
+import * as desktopBridge from './desktop-port'
 import type { WorkbenchModel } from '../interface/workbench'
 import type { ApplicationSnapshot } from './application-host'
 import { DEFAULT_REGISTRY, DEFAULT_SETTINGS } from './normalization'
@@ -63,6 +64,44 @@ afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
+  it('桌面控制台取得登录地址后交给浏览器入口，不预先打开空白页面', async () => {
+    const launch = deferred<{ url: string }>()
+    const openConsole = vi.fn().mockResolvedValue(undefined)
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({ available: true,
+      focus: vi.fn(), openLogs: vi.fn(), openConsole, exit: vi.fn() })
+    const openTab = vi.spyOn(window, 'open').mockReturnValue(null)
+    vi.spyOn(productApi, 'launchDsh').mockReturnValue(launch.promise)
+    const value = await adapter()
+    value.dsh.value = { ...value.dsh.value, state: 'ready', ui_origin: 'http://127.0.0.1:3081' }
+    const request = value.openDshConsole()
+    expect(openConsole).not.toHaveBeenCalled()
+    expect(openTab).not.toHaveBeenCalled()
+    const url = 'http://127.0.0.1:3081/?token=launch%2Btoken%2Fvalue%3D'
+    launch.resolve({ url }); await request
+    expect(openConsole).toHaveBeenCalledOnce()
+    expect(openConsole).toHaveBeenCalledWith(url)
+    expect(value.lastError.value).toBe('')
+  })
+
+  it('默认浏览器打开失败时显示错误，控制台入口仍可重试', async () => {
+    const openConsole = vi.fn().mockRejectedValueOnce(new Error('无法打开系统默认浏览器。'))
+      .mockResolvedValueOnce(undefined)
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({ available: true,
+      focus: vi.fn(), openLogs: vi.fn(), openConsole, exit: vi.fn() })
+    const openTab = vi.spyOn(window, 'open').mockReturnValue(null)
+    vi.spyOn(productApi, 'launchDsh').mockResolvedValue({ url: 'http://127.0.0.1:3081/?token=value' })
+    const value = await adapter()
+    const ready = { ...value.dsh.value, state: 'ready' as const, ui_origin: 'http://127.0.0.1:3081' }
+    vi.spyOn(productApi, 'dshStatus').mockResolvedValue(ready)
+    value.dsh.value = ready
+    await value.openDshConsole()
+    expect(value.lastError.value).toBe('无法打开系统默认浏览器。')
+    await value.openDshConsole()
+    expect(openConsole).toHaveBeenCalledTimes(2)
+    expect(openTab).not.toHaveBeenCalled()
+    expect(value.dsh.value.state).toBe('ready')
+  })
+
   it('宿主晚于页面就绪时更新控制台状态，迟到的启动快照不能覆盖它', async () => {
     application.managed.value = true; application.businessReady.value = true
     const response = deferred<Awaited<ReturnType<typeof productApi.snapshot>>>()

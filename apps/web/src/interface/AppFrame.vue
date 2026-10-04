@@ -68,6 +68,7 @@ onBeforeUnmount(() =>
           >{{ status }}</span
         ><button
           class="outline-button console-button"
+          title="在浏览器中打开代理控制台"
           :disabled="!consoleEnabled"
           @click="emit('console')"
         >
