@@ -20,7 +20,7 @@ class ApplicationTray:
         self.icon = pystray.Icon("VoiceTerminal", image, "Voice Terminal · 启动中", pystray.Menu(
             pystray.MenuItem("打开工作台", lambda *_: self.open(), default=True),
             pystray.MenuItem("系统运行", lambda *_: self.open(system=True)),
-            pystray.MenuItem("打开日志目录", lambda *_: os.startfile(str(application.root / "logs"))),
+            pystray.MenuItem("打开日志目录", lambda *_: os.startfile(str(application.paths.logs))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出应用", lambda *_: application.request_exit()),
         ))

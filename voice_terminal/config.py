@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .env import load_env_file
+from .paths import AppPaths
 from .quiet_hours import QuietHoursConfig
 from .controller.options import InputOptions
 from .agent.options import AgentOptions
@@ -529,6 +530,7 @@ class AppConfig:
     dsh: DshConfig = field(default_factory=DshConfig)
     persona: PersonaConfig = field(default_factory=PersonaConfig)
     model_dir: Path = Path(r"D:\模型\voice-terminal")
+    paths: AppPaths | None = None  # paths（受管应用路径上下文；源码调试兼容原布局）。
     debug_audio_capture: bool = False
     audio: AudioConfig = field(default_factory=AudioConfig)
     wake: WakeConfig = field(default_factory=WakeConfig)
@@ -590,6 +592,7 @@ class AppConfig:
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any], *, base_dir: Path | None = None) -> "AppConfig":
         root = base_dir or Path.cwd()
+        paths = AppPaths.resolve(root)
         model_dir = Path(os.environ.get("VOICE_MODEL_DIR", "").strip() or _string(data.get("model_dir"), r"D:\模型\voice-terminal"))
         if not model_dir.is_absolute():
             model_dir = root / model_dir
@@ -701,6 +704,12 @@ class AppConfig:
         def dsh_runtime_path(value: Any, default: str, field_name: str) -> Path:
             candidate = Path(_string(value, default))
             resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+            if paths.separated:
+                if field_name == "home_dir":
+                    return paths.dsh_home
+                packaged = os.environ.get("VOICE_DSH_RUNTIME")
+                if packaged:
+                    return Path(packaged).resolve() / "source"
             try:
                 resolved.relative_to(dsh_runtime_root)
             except ValueError as exc:
@@ -794,12 +803,13 @@ class AppConfig:
                 expected_commit=_string(dsh.get("expected_commit"), "477b4f420553e8a52c2fbccc464d7561b239c443"),
             ),
             persona=PersonaConfig(
-                directory=path_or_none(persona.get("directory")) or root / "config" / "persona",
+                directory=paths.persona if paths.separated else path_or_none(persona.get("directory")) or root / "config" / "persona",
                 personality_file=_string(persona.get("personality_file"), "personality.md"),
                 user_file=_string(persona.get("user_file"), "user.md"),
                 instructions_file=_string(persona.get("instructions_file"), "instructions.md"),
             ),
             model_dir=model_dir,
+            paths=paths,
             debug_audio_capture=_bool(
                 data.get("debug_audio_capture"),
                 os.environ.get("VOICE_DEBUG_AUDIO_CAPTURE", "false").lower() == "true",
@@ -840,7 +850,7 @@ class AppConfig:
                 max_active_paths=min(16, max(1, int(_number(wake.get("max_active_paths"), 4)))),
                 device=_string(wake.get("device"), "cpu"),
                 model_dir=path_or_none(kws_dir),
-                keywords_file=path_or_none(keywords_file),
+                keywords_file=paths.keywords if paths.separated else path_or_none(keywords_file),
             ),
             vad=VadConfig(
                 model=_string(vad.get("model"), "fsmn-vad"),
@@ -958,7 +968,8 @@ def load_config(default_path: Path, local_path: Path | None = None) -> AppConfig
     except ImportError as exc:
         raise RuntimeError("缺少 PyYAML，请先运行 scripts\\setup.ps1 安装后端依赖。") from exc
 
-    load_env_file(default_path.resolve().parent.parent / ".env.local")
+    paths = AppPaths.resolve(default_path.resolve().parent.parent)
+    load_env_file(paths.env_file)
     data: dict[str, Any] = {}
     for path in (default_path, local_path):
         if path is None or not path.is_file():

@@ -230,6 +230,10 @@ def generate_keywords_for(
         raise FileNotFoundError(f"KWS 词典不存在，已检查：{', '.join(str(p) for p in lexicon_candidates)}")
 
     write_raw_keywords_multi(raw_path, entries)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    from ..paths import AppPaths
+    paths = AppPaths.resolve()
+    python_cli = [sys.executable, "-X", "utf8", "-X", f"pycache_prefix={paths.cache / 'python'}", "-c", "from sherpa_onnx.cli import cli; cli()"] if paths.separated else None
     cli = shutil.which("sherpa-onnx-cli")
     if cli is None:
         scripts_dir = Path(sys.executable).parent / "Scripts"
@@ -237,7 +241,7 @@ def generate_keywords_for(
             if candidate.is_file():
                 cli = str(candidate)
                 break
-    if cli is None:
+    if cli is None and python_cli is None:
         raise RuntimeError("找不到 sherpa-onnx-cli，请确认 sherpa-onnx 已安装且 Python Scripts 在 PATH。")
 
     # The bundled CMU lexicon has ``HEY`` but not the user's transliterated
@@ -271,7 +275,7 @@ def generate_keywords_for(
             + "；请提供该模型支持的英文词条后重试。"
         )
     if missing_words:
-        temporary_lexicon = tempfile.TemporaryDirectory(prefix=".voice-terminal-lexicon-", dir=str(model_dir))
+        temporary_lexicon = tempfile.TemporaryDirectory(prefix=".voice-terminal-lexicon-", dir=str(output_path.parent))
         augmented_lines = list(lexicon_lines)
         for word in missing_words:
             source = aliases[word]
@@ -284,7 +288,7 @@ def generate_keywords_for(
         lexicon_for_cli.write_text("\n".join(augmented_lines) + "\n", encoding="utf-8")
 
     command = [
-        cli,
+        *(python_cli or [cli]),
         "text2token",
         "--tokens",
         str(tokens),

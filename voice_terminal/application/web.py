@@ -7,6 +7,7 @@ import json
 import mimetypes
 from pathlib import Path
 import secrets
+import socket
 import threading
 import time
 from urllib.parse import unquote, urlsplit
@@ -156,10 +157,19 @@ class HostWeb:
                 else:
                     self.data({"error": "接口不存在"}, 404)
 
+        class OwnedServer(ThreadingHTTPServer):
+            # Windows（操作系统）的地址复用可能允许多个监听器占据同一端口。
+            allow_reuse_address = False
+
+            def server_bind(self):
+                if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                super().server_bind()
+
         try:
-            self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            self.server = OwnedServer(("127.0.0.1", port), Handler)
         except OSError:
-            self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            self.server = OwnedServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
         self.origin = f"http://127.0.0.1:{self.server.server_port}"
         self.closed = False

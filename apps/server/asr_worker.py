@@ -15,6 +15,7 @@ if __name__ == "__main__":
 
 from voice_terminal.asr.worker import AsrWorkerEngine, handle_asr_connection
 from voice_terminal.config import load_config
+from voice_terminal.paths import AppPaths
 from voice_terminal.env import load_env_file
 from voice_terminal.logging_setup import configure_logging
 from voice_terminal.server.product import ProductSettingsStore
@@ -28,11 +29,12 @@ async def run(config_path: Path | None = None) -> None:
         raise RuntimeError("缺少 websockets，请先运行 scripts\\setup.ps1。") from exc
 
     root = Path(__file__).resolve().parents[2]
+    paths = AppPaths.resolve(root)
     default_path = root / "config" / "default.yaml"
-    local_path = config_path or root / "config" / "local.yaml"
+    local_path = config_path or paths.config / "local.yaml"
     config = load_config(default_path, local_path if local_path.is_file() else None)
     config = ProductSettingsStore(
-        path=root / "config" / "product-settings.json",
+        path=paths.config / "product-settings.json",
         config=config,
     ).effective_config()
     engine = AsrWorkerEngine(
@@ -71,8 +73,9 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=None)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
-    load_env_file(root / ".env.local")
-    configure_logging(root / "logs" / "asr-worker.log")
+    paths = AppPaths.resolve(root)
+    load_env_file(paths.env_file)
+    configure_logging(paths.logs / "asr-worker.log")
     asyncio.run(run(args.config))
 
 

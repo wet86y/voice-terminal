@@ -11,11 +11,15 @@ const DEFAULT_API_URL = 'http://127.0.0.1:8765'
 
 export class ProductApiError extends Error implements ProductApiErrorShape {
   readonly status: number
+  readonly code?: string // code（业务错误码）：声纹采集回退等业务判断使用。
+  readonly detail?: Record<string, unknown> | string // detail（服务端错误详情）。
 
-  constructor(message: string, status = 0) {
+  constructor(message: string, status = 0, detail?: Record<string, unknown> | string, code?: string) {
     super(message)
     this.name = 'ProductApiError'
     this.status = status
+    this.detail = detail
+    this.code = code || (typeof detail === 'object' && typeof detail.code === 'string' ? detail.code : undefined)
   }
 }
 
@@ -23,22 +27,24 @@ function apiBaseUrl() {
   return ((typeof window !== 'undefined' && window.__VOICE_APPLICATION__?.voice_api_url) || import.meta.env.VITE_VOICE_API_URL || DEFAULT_API_URL).replace(/\/$/, '')
 }
 
-async function readError(response: Response): Promise<string> {
+async function readError(response: Response): Promise<ProductApiError> {
   try {
     const payload: unknown = await response.json()
     if (typeof payload === 'object' && payload !== null) {
       const record = payload as Record<string, unknown>
-      if (typeof record.detail === 'string') return record.detail
+      const code = typeof record.code === 'string' ? record.code : undefined
+      if (typeof record.detail === 'string') return new ProductApiError(record.detail, response.status, record.detail, code)
       if (typeof record.detail === 'object' && record.detail !== null) {
         const detail = record.detail as Record<string, unknown>
-        if (typeof detail.message === 'string') return detail.message
+        if (typeof detail.message === 'string') return new ProductApiError(detail.message, response.status, detail, code)
+        return new ProductApiError(`请求失败（HTTP ${response.status}）。`, response.status, detail, code)
       }
-      if (typeof record.message === 'string') return record.message
+      if (typeof record.message === 'string') return new ProductApiError(record.message, response.status, undefined, code)
     }
   } catch {
     // Fall through to the stable HTTP status below.
   }
-  return `请求失败（HTTP ${response.status}）。`
+  return new ProductApiError(`请求失败（HTTP ${response.status}）。`, response.status)
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -55,7 +61,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   } catch (error) {
     throw new ProductApiError(error instanceof Error ? error.message : '无法连接 Voice Server。')
   }
-  if (!response.ok) throw new ProductApiError(await readError(response), response.status)
+  if (!response.ok) throw await readError(response)
   return await response.json() as T
 }
 
@@ -87,8 +93,8 @@ export const productApi = {
   speakerProfile: () => request<Record<string, unknown>>('/api/v1/speaker/profile'),
   startSpeakerEnrollment: () => request<Record<string, unknown>>('/api/v1/speaker/enrollment/start', { method: 'POST' }),
   addSpeakerEnrollmentSegment: (id: string, value: unknown) => request<Record<string, unknown>>(`/api/v1/speaker/enrollment/${encodeURIComponent(id)}/segment`, { method: 'POST', body: JSON.stringify(value) }),
-  captureSpeakerEnrollmentSegment: (id: string, value: unknown) => request<Record<string, unknown>>(`/api/v1/speaker/enrollment/${encodeURIComponent(id)}/capture`, { method: 'POST', body: JSON.stringify(value) }),
-  captureSpeakerTest: (value: unknown) => request<Record<string, unknown>>('/api/v1/speaker/test/capture', { method: 'POST', body: JSON.stringify(value) }),
+  captureSpeakerEnrollmentSegment: (id: string, value: unknown, signal?: AbortSignal) => request<Record<string, unknown>>(`/api/v1/speaker/enrollment/${encodeURIComponent(id)}/capture`, { method: 'POST', body: JSON.stringify(value), signal }),
+  captureSpeakerTest: (value: unknown, signal?: AbortSignal) => request<Record<string, unknown>>('/api/v1/speaker/test/capture', { method: 'POST', body: JSON.stringify(value), signal }),
   commitSpeakerEnrollment: (id: string) => request<Record<string, unknown>>(`/api/v1/speaker/enrollment/${encodeURIComponent(id)}/commit`, { method: 'POST' }),
   cancelSpeakerEnrollment: (id: string) => request<Record<string, unknown>>(`/api/v1/speaker/enrollment/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   deleteSpeakerTemplate: (id: string) => request<Record<string, unknown>>(`/api/v1/speaker/templates/${encodeURIComponent(id)}`, { method: 'DELETE' }),

@@ -19,6 +19,7 @@ import type {
 } from './types'
 import { voiceShadowReplayFixture, voiceShadowReplayMeta } from './replay-data'
 import { isRecord } from '../record'
+import { desktopPort } from './desktop-port'
 import { DEFAULT_SETTINGS, DEFAULT_REGISTRY, DEFAULT_DSH, MAX_WAKE_KEYWORDS, defaultCurrent, defaultShadow, normalizeSettings, normalizeRegistry, normalizeRuntimeState, updateSettingsFromResponse } from './normalization'
 export { MAX_WAKE_KEYWORDS } from './normalization'
 
@@ -94,8 +95,13 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const settings = reactive<ProductSettingsSnapshot>(structuredClone(DEFAULT_SETTINGS))
   const computeStatus = ref<ProductComputeStatus | null>(null)
   const registry = ref<ProductModelRegistry>(structuredClone(DEFAULT_REGISTRY))
+  let registryRevision = 0 // registryRevision（注册表响应代次）：旧快照不能覆盖已经完成的扫描或保存。
+  const initialComputeDevices = structuredClone(DEFAULT_SETTINGS.compute.devices)
   const dsh = ref<DshRuntimeStatus>(structuredClone(DEFAULT_DSH))
   const wakeTasks = ref<WakeTask[]>([])
+  let adapterDisposed = false // adapterDisposed（适配器已释放）：迟到的注册响应必须清理服务端会话。
+  let enrollmentGeneration = 0 // enrollmentGeneration（注册代次）：取消后不接纳旧请求的响应。
+  onBeforeUnmount(() => { adapterDisposed = true; void cancelSpeakerEnrollment({ notify: false }) })
   const editingWakeTaskId = ref('')
   const wakeTaskDraft = reactive({
     /** target（目标）: 唤醒哪一侧 Agent. */
@@ -178,6 +184,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   })
 
   let snapshotRequest: Promise<void> | null = null
+  let dshRevision = 0 // dshRevision（宿主状态修订号）：阻止迟到的启动快照覆盖新状态。
   let reconnectTimer: number | undefined
   let replayTimer: number | undefined
   let dshStatusTimer: number | undefined
@@ -227,29 +234,42 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     noticeVisible.value = false
   }
 
-  function applySnapshot(value: ProductSnapshot) {
+  function applySnapshot(value: ProductSnapshot, requestedRegistryRevision: number, requestedDshRevision: number) {
+    // 重连快照更新服务端基线，正在编辑的表单仍由根层持有。
+    const known = snapshot.value !== null
+    const differs = (draft: unknown, saved: unknown) => JSON.stringify(draft) !== JSON.stringify(saved)
+    const wakeDirty = differs(wakeForm, { enabled: settings.wake.enabled, keywords: settings.wake.keywords, sensitivity: settings.wake.sensitivity })
+    const silenceDirty = silenceSeconds.value !== settings.silence.seconds
+    const quietDirty = differs(quietHoursForm, settings.quiet_hours)
+    const savedSpeaker = Object.fromEntries(Object.keys(speakerForm).map(key => [key, settings.speaker[key as keyof typeof settings.speaker]]))
+    const speakerDirty = differs(speakerForm, savedSpeaker)
+    const personaDirty = differs(personaDocuments, settings.persona)
+    const computeDirty = differs(settings.compute.devices, known ? normalizeSettings(snapshot.value!.settings).compute.devices : initialComputeDevices)
+    const assignmentDirty = differs(modelAssignments, {
+      voice: registry.value.assignments.voice_llm_model_id || '', shadow: registry.value.assignments.shadow_llm_model_id || '', status: registry.value.assignments.status_llm_model_id || '',
+    })
     snapshot.value = value
-    if (isRecord(value.dsh)) {
+    if (isRecord(value.dsh) && requestedDshRevision === dshRevision) {
       const state = ['disabled', 'starting', 'ready', 'unavailable', 'exited'].includes(String(value.dsh.state))
         ? value.dsh.state as DshRuntimeStatus['state'] : 'unavailable'
-      dsh.value = {
+      applyDshStatus({
         enabled: value.dsh.enabled === true,
         state,
         version: typeof value.dsh.version === 'string' ? value.dsh.version : null,
         profile: 'web',
         ui_origin: typeof value.dsh.ui_origin === 'string' ? value.dsh.ui_origin : null,
         message: typeof value.dsh.message === 'string' ? value.dsh.message : '',
-      }
+      })
       scheduleDshStatusPoll()
     }
     const nextSettings = normalizeSettings(value.settings)
     Object.assign(settings.wake, nextSettings.wake)
     Object.assign(settings.silence, nextSettings.silence)
     settings.quiet_hours = nextSettings.quiet_hours
-    Object.assign(quietHoursForm, nextSettings.quiet_hours)
+    if (!quietDirty) Object.assign(quietHoursForm, nextSettings.quiet_hours)
     Object.assign(settings.shadow, nextSettings.shadow)
     Object.assign(settings.speaker, nextSettings.speaker)
-    Object.assign(settings.compute.devices, nextSettings.compute.devices)
+    if (!computeDirty) Object.assign(settings.compute.devices, nextSettings.compute.devices)
     Object.assign(settings.compute.fallback_devices || {}, nextSettings.compute.fallback_devices || {})
     Object.assign(settings.tts, nextSettings.tts)
     Object.assign(settings.persona, nextSettings.persona)
@@ -260,21 +280,25 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
     settings.schema_version = nextSettings.schema_version
     settings.warnings = nextSettings.warnings
-    Object.assign(wakeForm, {
+    if (!wakeDirty) Object.assign(wakeForm, {
       enabled: nextSettings.wake.enabled,
       keywords: [...nextSettings.wake.keywords],
       sensitivity: nextSettings.wake.sensitivity,
     })
-    silenceSeconds.value = nextSettings.silence.seconds
-    Object.assign(speakerForm, nextSettings.speaker)
-    Object.assign(personaDocuments, nextSettings.persona)
-    registry.value = normalizeRegistry(value.models)
-    syncAssignments(registry.value.assignments)
+    if (!silenceDirty) silenceSeconds.value = nextSettings.silence.seconds
+    if (!speakerDirty) Object.assign(speakerForm, nextSettings.speaker)
+    if (!personaDirty) Object.assign(personaDocuments, nextSettings.persona)
+    if (registryRevision === requestedRegistryRevision) {
+      registry.value = normalizeRegistry(value.models)
+      if (!assignmentDirty) syncAssignments(registry.value.assignments)
+    }
   }
 
   function applyRegistry(value: unknown) {
+    const pending = JSON.stringify(modelAssignments) !== JSON.stringify({ voice: registry.value.assignments.voice_llm_model_id || '', shadow: registry.value.assignments.shadow_llm_model_id || '', status: registry.value.assignments.status_llm_model_id || '' })
     registry.value = normalizeRegistry(value)
-    syncAssignments(registry.value.assignments)
+    registryRevision += 1
+    if (!pending) syncAssignments(registry.value.assignments)
   }
 
   function syncAssignments(assignments: ProductAssignments) {
@@ -292,8 +316,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (replayMode || !application.businessReady.value) return
     if (snapshotRequest) return snapshotRequest
     loading.value = true
+    const requestedRegistryRevision = registryRevision
+    const requestedDshRevision = dshRevision
     snapshotRequest = productApi.snapshot().then(async value => {
-      applySnapshot(value)
+      if (adapterDisposed) return
+      applySnapshot(value, requestedRegistryRevision, requestedDshRevision)
       await Promise.all([refreshSpeaker(), refreshWakeTasks(), refreshComputeStatus()])
       lastError.value = ''
     }).catch(setError).finally(() => {
@@ -316,8 +343,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     await enqueue(async () => {
       saving.value = true
       try {
-        const result = await productApi.saveCompute({ devices: { ...settings.compute.devices } })
+        const submitted = { ...settings.compute.devices }
+        const result = await productApi.saveCompute({ devices: submitted })
+        const newerDraft = JSON.stringify(settings.compute.devices) !== JSON.stringify(submitted) ? { ...settings.compute.devices } : null
         updateSettingsFromResponse(settings, result)
+        if (newerDraft) Object.assign(settings.compute.devices, newerDraft)
         setNotice(result.message || (result.restart_required
           ? '本地模型运行设备设置已保存，重新启动应用后生效。'
           : '本地模型运行设备设置已保存。'))
@@ -391,24 +421,31 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   })
 
   async function openDshConsole() {
-    const tab = window.open('about:blank', '_blank')
-    if (!tab) {
+    const desktop = desktopPort()
+    const tab = desktop.available ? null : window.open('about:blank', '_blank')
+    if (!desktop.available && !tab) {
       setError(new Error('浏览器阻止了 DSH 控制台的新标签页，请允许本站弹出窗口。'))
       return
     }
-    tab.opener = null
+    if (tab) tab.opener = null
     try {
       const result = await productApi.launchDsh()
       const launchUrl = new URL(result.url)
       if (!dsh.value.ui_origin || launchUrl.origin !== dsh.value.ui_origin || launchUrl.pathname !== '/' || !launchUrl.searchParams.has('token')) {
         throw new Error('Voice Server 返回了无效的 DSH 地址。')
       }
-      tab.location.replace(result.url)
+      if (desktop.available) await desktop.openConsole(result.url)
+      else tab?.location.replace(result.url)
     } catch (error) {
-      tab.close()
+      tab?.close()
       setError(error)
-      void productApi.dshStatus().then(value => { dsh.value = value }).catch(() => undefined)
+      void productApi.dshStatus().then(value => { if (!adapterDisposed) applyDshStatus(value) }).catch(() => undefined)
     }
+  }
+
+  function applyDshStatus(value: DshRuntimeStatus) {
+    dshRevision += 1
+    dsh.value = value
   }
 
   function scheduleDshStatusPoll() {
@@ -417,8 +454,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (replayMode || dsh.value.state !== 'starting') return
     dshStatusTimer = window.setInterval(() => {
       void productApi.dshStatus().then(value => {
+        if (adapterDisposed) return
         const wasStarting = dsh.value.state === 'starting'
-        dsh.value = value
+        applyDshStatus(value)
         if (value.state !== 'starting') {
           if (dshStatusTimer !== undefined) window.clearInterval(dshStatusTimer)
           dshStatusTimer = undefined
@@ -458,9 +496,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     await enqueue(async () => {
       saving.value = true
       try {
-        const result = await productApi.saveSpeaker({ ...speakerForm })
+        const submitted = { ...speakerForm }
+        const result = await productApi.saveSpeaker(submitted)
+        const changed = JSON.stringify(speakerForm) !== JSON.stringify(submitted)
         updateSettingsFromResponse(settings, result)
-        Object.assign(speakerForm, settings.speaker)
+        if (!changed) Object.assign(speakerForm, settings.speaker)
         await refreshSpeaker()
         setNotice(result.message || '声纹设置已保存。')
       } catch (error) {
@@ -472,10 +512,15 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function startSpeakerEnrollment() {
+    const generation = ++enrollmentGeneration
     try {
       const value = await productApi.startSpeakerEnrollment()
       const id = value.enrollment_id
       if (typeof id !== 'string') throw new Error('后端未返回录音会话。')
+      if (adapterDisposed || generation !== enrollmentGeneration) {
+        await productApi.cancelSpeakerEnrollment(id).catch(() => {})
+        return
+      }
       const prompts = Array.isArray(value.prompts)
         ? (value.prompts as Array<Record<string, unknown>>)
             .map(item => String(item?.text || '')).filter(text => text.length > 0)
@@ -491,10 +536,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
         guidance: String(value.guidance || ''),
       }
       setNotice(`录音会话已开始，请依次朗读 ${required} 段不同的句子（每段 5–10 秒）。`)
-    } catch (error) { setError(error) }
+    } catch (error) { if (!adapterDisposed && generation === enrollmentGeneration) setError(error) }
   }
 
   async function cancelSpeakerEnrollment(options: unknown = {}) {
+    enrollmentGeneration += 1
     const enrollment = speakerEnrollment.value
     speakerEnrollment.value = null
     if (enrollment) {
@@ -517,38 +563,43 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
    * processing chain the live session uses.  Browser capture stays available
    * as a fallback via `addSpeakerEnrollmentSegment`.
    */
-  async function captureSpeakerEnrollmentSegment(index: number, label: string, seconds: number) {
+  async function captureSpeakerEnrollmentSegment(index: number, label: string, seconds: number, signal?: AbortSignal) {
     const enrollment = speakerEnrollment.value
-    if (!enrollment) return false
+    if (!enrollment) return null
     try {
       const result = await productApi.captureSpeakerEnrollmentSegment(enrollment.id, {
         index, label, seconds,
-      })
+      }, signal)
+      if (adapterDisposed || signal?.aborted || speakerEnrollment.value?.id !== enrollment.id) return null
       if (!enrollment.segments.includes(index)) enrollment.segments.push(index)
       const quality = isRecord(result.quality) ? result.quality : {}
       const speech = Number(quality.speech_ms || 0) / 1000
       setNotice(`第 ${index + 1} 段已录制：有效人声 ${speech.toFixed(1)} 秒。`)
       return true
     } catch (error) {
+      if (adapterDisposed || signal?.aborted) return null
       const detail = isRecord(error) ? error : {}
       // No server-side capture device: let the caller fall back to browser
       // recording rather than blocking enrollment entirely.
       if (String(detail.code || '').includes('SPEAKER_CAPTURE_UNAVAILABLE')) return false
       setError(error)
-      return false
+      return null
     }
   }
 
-  async function captureSpeakerTest(seconds: number) {
+  async function captureSpeakerTest(seconds: number, signal?: AbortSignal) {
     try {
-      speakerTestResult.value = await productApi.captureSpeakerTest({ seconds })
+      const result = await productApi.captureSpeakerTest({ seconds }, signal)
+      if (adapterDisposed || signal?.aborted) return null
+      speakerTestResult.value = result
       setNotice('现场声纹测试已完成。')
       return true
     } catch (error) {
+      if (adapterDisposed || signal?.aborted) return null
       const detail = isRecord(error) ? error : {}
       if (String(detail.code || '').includes('SPEAKER_CAPTURE_UNAVAILABLE')) return false
       setError(error)
-      return false
+      return null
     }
   }
 
@@ -631,7 +682,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   const connected = computed(() => voice.connection.value === 'connected')
-  const runtimeState = computed<ProductRuntimeState>(() => normalizeRuntimeState(voice.state.value, connected.value))
+  const coreUnavailable = computed(() => application.managed.value && application.businessReady.value && !application.snapshot.value?.core_available)
+  const runtimeState = computed<ProductRuntimeState>(() => coreUnavailable.value && connected.value ? 'error' : normalizeRuntimeState(voice.state.value, connected.value))
   const runtimeSource = computed(() => snapshot.value?.runtime)
   const quietStatus = computed(() => connected.value ? voice.quietHours : runtimeSource.value?.quiet_hours)
   const current = computed(() => connected.value
@@ -778,6 +830,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       void loadSnapshot()
       return false
     }
+    if (coreUnavailable.value) {
+      setError(new Error('语音能力尚未就绪，请先完成模型配置或查看系统运行。'))
+      return false
+    }
     return voice.toggleListening()
   }
 
@@ -910,9 +966,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     await enqueue(async () => {
       saving.value = true
       try {
-        const result = await productApi.saveCustomInstructions({ custom_instructions: customInstructions.value })
+        const submitted = customInstructions.value.map(item => ({ ...item }))
+        const result = await productApi.saveCustomInstructions({ custom_instructions: submitted })
+        const changed = JSON.stringify(customInstructions.value) !== JSON.stringify(submitted)
         updateSettingsFromResponse(settings, result)
-        customInstructions.value = settings.custom_instructions.map(item => ({ ...item }))
+        if (!changed) customInstructions.value = settings.custom_instructions.map(item => ({ ...item }))
         setNotice(result.message || '自定义指令已保存，将在下一次会话或重置后生效。')
       } catch (error) {
         setError(error)
@@ -1058,23 +1116,27 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function updateModel(model: ProductUiModel, changes: Record<string, unknown>) {
-    await enqueue(async () => {
+    return await enqueue(async () => {
       try {
         applyRegistry(await productApi.updateModel(model.id, changes))
         setNotice(`${model.provider} · ${model.name} 的模型策略已保存。`)
+        return true
       } catch (error) {
         setError(error)
+        return false
       }
     })
   }
 
   async function deleteModel(model: ProductUiModel) {
-    await enqueue(async () => {
+    return await enqueue(async () => {
       try {
         applyRegistry(await productApi.deleteModel(model.id))
         setNotice(`${model.provider} · ${model.name} 已从模型池删除。`)
+        return true
       } catch (error) {
         setError(error)
+        return false
       }
     })
   }
@@ -1109,9 +1171,14 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
   }
 
+  // pendingApply（待确认分配）：确认时提交用户已看过影响说明的同一组模型。
+  let pendingApply: ReturnType<typeof assignmentPayload> | null = null
   async function requestModelApply() {
+    const proposed = assignmentPayload()
+    pendingApply = null
     try {
-      const result = await enqueue(() => productApi.applyAssignments(assignmentPayload(), false))
+      const result = await enqueue(() => productApi.applyAssignments(proposed, false))
+      pendingApply = proposed
       applyImpact.value = Array.isArray(result.impact) ? result.impact.filter(item => typeof item === 'string') : []
       return result
     } catch (error) {
@@ -1121,12 +1188,18 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function confirmModelApply() {
+    const proposed = pendingApply
+    if (!proposed) return null
     restartState.value = 'restarting'
     try {
-      const result = await enqueue(() => productApi.applyAssignments(assignmentPayload(), true))
+      const result = await enqueue(() => productApi.applyAssignments(proposed, true))
       if (result.applied === true) {
+        const submittedStillCurrent = JSON.stringify(assignmentPayload()) === JSON.stringify(proposed)
+        const newerDraft = { ...modelAssignments }
+        pendingApply = null
         restartState.value = 'complete'
         if (isRecord(result.assignments)) applyRegistry({ ...registry.value, assignments: result.assignments })
+        if (!submittedStillCurrent) Object.assign(modelAssignments, newerDraft)
         setNotice(typeof result.message === 'string' ? result.message : '模型服务已重启，新的配置已生效。')
         await loadSnapshot()
       } else {
@@ -1189,6 +1262,16 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (!ready) lastError.value = ''
   })
 
+  watch(() => application.snapshot.value?.components?.find(row => row.id === 'dsh')?.state, state => {
+    // 宿主晚于语音接口启动：组件就绪／重试时同步状态，不让初始 unavailable（暂不可用）停留到重载。
+    if (!state || replayMode || !application.businessReady.value) return
+    void productApi.dshStatus().then(value => {
+      if (adapterDisposed) return
+      applyDshStatus(value)
+      scheduleDshStatusPoll()
+    }).catch(() => undefined)
+  })
+
   onBeforeUnmount(() => {
     if (reconnectTimer !== undefined) window.clearInterval(reconnectTimer)
     if (replayTimer !== undefined) window.clearTimeout(replayTimer)
@@ -1217,6 +1300,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     replayMode,
     replayMeta: voiceShadowReplayMeta,
     runtimeState,
+    coreUnavailable,
     current,
     conversation,
     conversationRows,

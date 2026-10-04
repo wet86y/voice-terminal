@@ -12,6 +12,7 @@ if __name__ == "__main__":
     bootstrap_resources("analysis")
 
 from voice_terminal.config import load_config
+from voice_terminal.paths import AppPaths
 from voice_terminal.analysis.worker import AnalysisLane, create_analysis_app
 from voice_terminal.analysis.smart_turn import SmartTurn
 from voice_terminal.analysis.sensevoice import SenseVoice
@@ -23,15 +24,16 @@ from voice_terminal.application.managed import report, run_uvicorn
 def main():
     import uvicorn
     root = Path(__file__).resolve().parents[2]
+    paths = AppPaths.resolve(root)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, default=root / "config/local.yaml")
+    parser.add_argument("--config", type=Path, default=paths.config / "local.yaml")
     args = parser.parse_args()
     config = load_config(root / "config/default.yaml", args.config)
     config = ProductSettingsStore(
-        path=root / "config" / "product-settings.json",
+        path=paths.config / "product-settings.json",
         config=config,
     ).effective_config()
-    configure_logging(root / "logs/analysis-worker.log")
+    configure_logging(paths.logs / "analysis-worker.log")
     lanes = {}
     report("analysis", "加载语句结束判断与语音精修模型")
     for name, enabled, model_name, factory in (

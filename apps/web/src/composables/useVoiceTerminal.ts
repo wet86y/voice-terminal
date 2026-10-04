@@ -84,6 +84,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
   /** Mirror the log into reactive state after every mutation. */
   function syncConversation() {
+    conversationLog.pinActive(currentTurnId.value || '', activeSpeech.value?.speech_id || '')
     conversationEntries.value = conversationLog.entries()
     latestConversationSeq.value = conversationLog.latestSeq()
   }

@@ -1,0 +1,11 @@
+[package]
+name = "voice-terminal-bootstrap"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "VoiceTerminal"
+path = "src/main.rs"
+
+[dependencies]
+voice-desktop-common = { path = "../common" }

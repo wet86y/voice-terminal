@@ -5,11 +5,48 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from voice_terminal.compute import device_candidates, startup_device
+from voice_terminal.compute import device_candidates, startup_device, loaded_funasr_device
 from voice_terminal.config import COMPUTE_MODEL_IDS
 
 
 class ComputeDeviceTests(unittest.TestCase):
+    def test_loaded_device_uses_resolved_loader_options(self) -> None:
+        """加载器静默回退或指定显卡编号时，报告运行结果而非请求设备。"""
+        self.assertEqual(loaded_funasr_device(SimpleNamespace(kwargs={"device": "cpu"}), "cuda"), "cpu")
+        self.assertEqual(loaded_funasr_device(SimpleNamespace(kwargs={"device": "cuda:0"}), "cuda"), "cuda")
+        self.assertEqual(loaded_funasr_device(SimpleNamespace(), "cpu"), "cpu")
+
+    def test_asr_silent_cpu_fallback_keeps_request_and_reports_actual_device(self) -> None:
+        from voice_terminal.asr.worker import AsrWorkerEngine
+
+        engine = AsrWorkerEngine(model_dir=Path("."), device="cuda")
+        with (
+            patch("voice_terminal.compute.startup_device", return_value="cuda"),
+            patch("funasr.AutoModel", return_value=SimpleNamespace(kwargs={"device": "cpu"})),
+        ):
+            engine.load()
+        self.assertEqual(engine.requested_device, "cuda")
+        self.assertEqual(engine.device, "cpu")
+        self.assertTrue(engine.model_loaded)
+        self.assertIn("CPU", engine.load_error or "")
+
+    def test_sensevoice_and_internal_vad_report_their_own_resolved_device(self) -> None:
+        from voice_terminal.analysis.sensevoice import SenseVoice
+
+        with (
+            patch("voice_terminal.compute.device_candidates", return_value=["cuda", "cpu"]),
+            patch("funasr.AutoModel", side_effect=[
+                SimpleNamespace(kwargs={"device": "cuda:0"}),
+                SimpleNamespace(kwargs={"device": "cpu"}),
+            ]) as factory,
+        ):
+            model = SenseVoice(Path("sensevoice-model"), Path("vad-model"), device="cuda")
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual(model.requested_device, "cuda")
+        self.assertEqual(model.device, "cuda")
+        self.assertEqual(model.internal_vad_device, "cpu")
+        self.assertIn("自动回退", model.load_error or "")
+
     def hardware(self, *, supported: bool = True, free: int = 4 * 1024**3) -> dict:
         return {
             "gpu": {"available": True, "free_bytes": free, "total_bytes": 8 * 1024**3},

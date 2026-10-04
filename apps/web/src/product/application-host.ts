@@ -84,6 +84,13 @@ export function acceptApplicationSnapshot(previous: ApplicationSnapshot | null, 
   return !previous || previous.instance_id !== next.instance_id || next.revision >= previous.revision
 }
 
+/** applicationApiReady（业务接口可用）：缺少语音能力或在线凭据时仍允许打开和保存设置。 */
+export function applicationApiReady(value: ApplicationSnapshot | null): boolean {
+  if (!value || value.stopping || !value.voice_api_url) return false
+  const voice = value.components.find(component => component.id === 'voice')
+  return Boolean(voice?.pid && ['ready', 'failed', 'external'].includes(voice.state))
+}
+
 const replay = import.meta.env.DEV && typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('replay') === 'voice-shadow'
 const managed = ref(typeof window !== 'undefined' && Boolean(window.__VOICE_APPLICATION__?.managed) && !replay)
 const snapshot = ref<ApplicationSnapshot | null>(null)
@@ -197,7 +204,7 @@ function stop() {
 }
 
 export function useApplicationHost() {
-  const businessReady = computed(() => !managed.value || Boolean(snapshot.value?.startup_complete && snapshot.value.core_available && !snapshot.value.stopping))
+  const businessReady = computed(() => !managed.value || applicationApiReady(snapshot.value))
   const overlay = computed(() => managed.value && (
     !snapshot.value || ['stopping', 'stopped'].includes(snapshot.value.state)
     || ((!snapshot.value.startup_complete || snapshot.value.state === 'failed') && !inspecting.value)))

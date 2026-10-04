@@ -24,6 +24,19 @@ function labels(log: ConversationLog) {
 }
 
 describe('ConversationLog', () => {
+  it('保留 200 条历史并忽略已裁剪条目的迟到重复消息', () => {
+    const log = new ConversationLog()
+    for (let seq=1;seq<=201;seq++) log.applyEntry(entry({seq,turn_id:`turn_${seq}`}))
+    expect(log.size()).toBe(200); expect(log.entries()[0].seq).toBe(2); expect(log.latestSeq()).toBe(201)
+    expect(log.applyEntry(entry({seq:1,turn_id:'turn_1'}))).toBe(false); expect(log.size()).toBe(200)
+  })
+  it('活动轮次暂时超过历史上限，结束后收敛；重置清除旧高水位', () => {
+    const log = new ConversationLog(); log.pinActive('turn_1','')
+    for (let seq=1;seq<=201;seq++) log.applyEntry(entry({seq,turn_id:`turn_${seq}`}))
+    expect(log.size()).toBe(201); log.pinActive('',''); expect(log.size()).toBe(200)
+    log.applySnapshot({entries:[entry({seq:1,conversation_id:'new'})],latest_seq:1})
+    expect(log.latestSeq()).toBe(1); expect(log.size()).toBe(1)
+  })
   it('renders entries in server order', () => {
     const log = new ConversationLog()
     log.applyEntry(entry({ seq: 2, kind: 'system_speech', turn_id: 'wake_1', speech_id: 'speech_wake', text: '我在，请说。' }))

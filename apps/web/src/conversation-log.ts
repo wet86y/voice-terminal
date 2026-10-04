@@ -19,6 +19,25 @@ import type { ConversationEntry, ConversationSnapshotPayload } from './types'
 export class ConversationLog {
   #byKey = new Map<string, ConversationEntry>()
   #head = 0
+  #floor = 0 // floor（已清理顺序下界）：过期重复消息不能重新挤入显示列表。
+  #activeTurn = ''
+  #activeSpeech = ''
+
+  /** pinActive（保留活动身份）：只限制已结束条目，顺序高水位始终保留。 */
+  pinActive(turnId: string, speechId: string): void {
+    this.#activeTurn = turnId
+    this.#activeSpeech = speechId
+    this.#trim()
+  }
+
+  #trim(): void {
+    const finished = this.entries().filter(entry => (!this.#activeTurn || entry.turn_id !== this.#activeTurn) && (!this.#activeSpeech || entry.speech_id !== this.#activeSpeech)
+      && !['pending', 'queued', 'waiting', 'playing', 'speaking'].includes((entry.status || '').toLowerCase()))
+    for (const entry of finished.slice(0, Math.max(0, finished.length - 200))) {
+      this.#byKey.delete(ConversationLog.keyOf(entry))
+      this.#floor = Math.max(this.#floor, entry.seq)
+    }
+  }
 
   /** Server-ordered entries, oldest first. */
   entries(): ConversationEntry[] {
@@ -44,6 +63,7 @@ export class ConversationLog {
   applySnapshot(payload: ConversationSnapshotPayload | null | undefined): void {
     if (!payload || !Array.isArray(payload.entries)) return
     this.#byKey = new Map()
+    this.#floor = 0
     let highest = 0
     for (const entry of payload.entries) {
       if (!isUsable(entry)) continue
@@ -51,6 +71,7 @@ export class ConversationLog {
       highest = Math.max(highest, entry.seq)
     }
     this.#head = Math.max(highest, numberOr(payload.latest_seq, 0))
+    this.#trim()
   }
 
   /**
@@ -68,10 +89,13 @@ export class ConversationLog {
       const next = { ...existing, ...entry, seq: existing.seq }
       this.#byKey.set(key, next)
       this.#head = Math.max(this.#head, next.seq)
+      this.#trim()
       return true
     }
+    if (entry.seq <= this.#floor) return false
     this.#byKey.set(key, entry)
     this.#head = Math.max(this.#head, entry.seq)
+    this.#trim()
     return true
   }
 
@@ -95,6 +119,8 @@ export class ConversationLog {
   clear(): void {
     this.#byKey = new Map()
     this.#head = 0
+    this.#floor = 0
+    this.#activeTurn = this.#activeSpeech = ''
   }
 }
 

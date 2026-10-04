@@ -1,0 +1,23 @@
+[package]
+name = "voice-terminal-desktop"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "VoiceTerminalDesktop"
+path = "src/main.rs"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "dynamic-acl"] }
+tauri-plugin-single-instance = "2"
+serde_json = "1"
+voice-desktop-common = { path = "../common" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

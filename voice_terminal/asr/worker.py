@@ -97,7 +97,7 @@ class AsrWorkerEngine:
         self._np = np
         fallback = self.fallback_device if self.fallback_device in {"cpu", "cuda"} else "cpu"
         requested = self.requested_device
-        from ..compute import startup_device
+        from ..compute import startup_device, loaded_funasr_device
         initial = startup_device(requested, "paraformer")
         candidates = [initial]
         if initial == "cuda":
@@ -114,10 +114,12 @@ class AsrWorkerEngine:
                     disable_update=True,
                     disable_pbar=True,
                 )
-                self.device = candidate
+                self.device = loaded_funasr_device(self._model, candidate)
                 self.load_error = (
-                    f"CUDA（图形处理器）加载失败，已回退到 {candidate}：{type(last_error).__name__}: {last_error}"
-                    if last_error is not None else None
+                    f"CUDA（图形处理器）加载失败，已回退到 {self.device}：{type(last_error).__name__}: {last_error}"
+                    if last_error is not None else
+                    "FunASR（语音模型加载器）未使用请求的 CUDA（图形处理器），实际运行于 CPU（中央处理器）。"
+                    if candidate == "cuda" and self.device == "cpu" else None
                 )
                 logger.info("asr.worker.model_ready model_dir=%s device=%s", self.model_dir, self.device)
                 return

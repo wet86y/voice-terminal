@@ -6,8 +6,11 @@ import os
 import shutil
 import subprocess
 import unittest
+import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
+from voice_terminal.distribution import manifest
+from voice_terminal.paths import atomic_json
 
 from voice_terminal.config import AppConfig, DshConfig
 from voice_terminal.dsh.runtime import DshRuntimeManager
@@ -111,6 +114,34 @@ class DshRuntimeTests(unittest.TestCase):
 
 
 class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_release_checks_required_entries_without_development_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / 'runtime'
+            runtime.mkdir()
+            config = DshConfig()
+            metadata = {'schema': 1, 'version': config.expected_version, 'commit': config.expected_commit,
+                        'bridge_protocol': config.bridge_protocol_version, 'node': 'node.exe',
+                        'entry': 'runtime-bootstrap.mjs', 'schedule': 'node_modules/@deepseek-ai/dsh-schedule/lib/index.js', 'modules': 'node_modules'}
+            for name in ('node.exe', 'runtime-bootstrap.mjs', 'package.json', metadata['schedule'], 'node_modules/@deepseek-ai/dsh/lib/bin.js'):
+                file = runtime / name
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text('fixture', encoding='utf-8')
+            atomic_json(runtime / 'runtime.json', metadata)
+            atomic_json(runtime / 'manifest.json', manifest(runtime, kind='dsh', build='test'))
+            manager = DshRuntimeManager(config)
+            manager.repo_root = root
+            manager.release_runtime = runtime
+            with patch.object(manager, '_ensure_modules_link', AsyncMock()), \
+                 patch.object(manager, '_profile_patch_preserves_managed_defaults', return_value=True), \
+                 patch('voice_terminal.dsh.runtime.shutil.which', side_effect=AssertionError('发行端不得寻找开发工具')):
+                node, entry = await manager._validate_release()
+                self.assertEqual(Path(node), runtime / 'node.exe')
+                self.assertEqual(entry, runtime / 'runtime-bootstrap.mjs')
+                (runtime / 'runtime-bootstrap.mjs').write_text('tampered', encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, '校验失败'):
+                    await manager._validate_release()
+
     @unittest.skipUnless(shutil.which("node"), "需要 Node.js（JavaScript 运行环境）")
     async def test_managed_node_pipe_invokes_graceful_cleanup_without_console(self) -> None:
         manager = DshRuntimeManager(DshConfig())

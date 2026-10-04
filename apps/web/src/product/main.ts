@@ -1,5 +1,5 @@
 import { createApp } from 'vue'
 import ProductApp from './ProductApp.vue'
-import '../ui-demo/ui-demo.css'
+import '../interface/design.css'
 
 createApp(ProductApp).mount('#app')

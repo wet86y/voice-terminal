@@ -1,6 +1,6 @@
 # Voice Terminal
 
-Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。独立应用宿主负责托盘、网页入口及整套系统的启动、监督和退出；浏览器负责产品界面，Voice Server（语音服务）负责音频采集、KWS（关键词唤醒）、VAD（语音活动检测）、ASR（自动语音识别）、主 Agent（智能体）、Shadow（影子代理）、TTS（语音合成）和播放。DSH（代理执行宿主）作为内部组件受管。
+Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tauri（桌面框架）窗口承载正式界面，负责托盘、单实例及服务管理进程；应用宿主负责业务组件的启动、监督和退出，浏览器入口保留用于独立调试。Voice Server（语音服务）负责音频采集、KWS（关键词唤醒）、VAD（语音活动检测）、ASR（自动语音识别）、主 Agent（智能体）、Shadow（影子代理）、TTS（语音合成）和播放。DSH（代理执行宿主）作为内部组件受管。
 
 当前代码包版本为 `0.7.0`。默认 LLM 路径是 DeepSeek Responses + strict `json_schema`；`voice_decision_v06` 只是冻结的协议兼容标识，不是发布版本号。
 
@@ -23,7 +23,9 @@ Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。独
 
 ## 快速开始
 
-环境要求：Windows x64、Python 3.12、Node.js 22.19 或更高兼容版本（项目隔离 DSH 的最低要求）。
+完整便携候选通过解压目录内的 `VoiceTerminal.exe`（根启动程序）运行，随包收集运行环境与模型；构建和已验证范围见[桌面开发与分发说明](docs/desktop-application.md)及[实施验收记录](docs/desktop-acceptance.md)。
+
+以下为源码开发环境要求：Windows x64（64 位操作系统）、Python（后端运行环境）3.12、Node.js（脚本运行环境）22.19 或更高兼容版本（项目隔离 DSH 的最低要求）。
 
 ```powershell
 .\scripts\setup.ps1 -Python D:\DevTools\Python312\python.exe -Analysis
@@ -50,22 +52,34 @@ MINIMAX_API_KEY=
 
 启动结果以应用宿主的组件状态和核心能力为准：所有启用组件结束启动尝试后进入正常、降级或诊断状态。可选组件失败允许降级进入工作台；只看到 `/health`（语音服务健康检查）返回成功不代表整套应用已经准备好。启动完成后保持待机，由用户开始语音监听。
 
-普通启动由应用宿主提供网页构建产物，不在启动期间安装依赖、构建网页或启动 Vite（前端开发服务器）。网页地址优先使用 5173 端口，被占用时自动分配空闲端口，以启动程序打开的实际地址为准。关闭网页后应用继续运行；从托盘或“设置 → 系统运行”明确退出应用时，回收全部受管组件。
+桌面启动由应用宿主提供网页构建产物，不在启动期间安装依赖、构建网页或启动 Vite（前端开发服务器）。网页地址优先使用 5173 端口，被占用时自动分配空闲端口，以桌面实际加载地址为准。关闭桌面窗口隐藏到托盘；从应用菜单、托盘或“设置 → 系统运行”明确退出应用时，回收全部受管组件。源码浏览器调试模式中，关闭网页同样不会结束后台服务。
 
-构建可双击的无终端窗口程序：
+构建桌面程序及根目录启动入口：
+
+```powershell
+.\scripts\build-desktop.ps1
+```
+
+完整便携组装、独立运行环境构建、旧数据导入及离线校验见[桌面开发与分发说明](docs/desktop-application.md)。发布文件与用户数据分离，根入口根据便携配置及本地启用记录选择组件；终端启动不执行依赖安装。
+
+保留旧浏览器启动器供源码调试，构建方式如下：
 
 ```powershell
 .\scripts\build-launcher.ps1 -Python D:\DevTools\Python312\python.exe
 ```
 
-程序位于 `.runtime/launcher/VoiceTerminal/VoiceTerminal.exe`（独立应用程序），须保留整个同目录文件夹，并继续使用本机 Python（程序运行环境）、Node.js（JavaScript 运行环境）和既有模型目录。打包环境与业务环境分离。开发热更新使用 `scripts/start.ps1 -Dev`（开发启动）。启动蒙版、系统运行页、参数和诊断说明见 [独立应用启动与系统管理](docs/application-lifecycle.md)。
+旧启动器位于 `.runtime/launcher/VoiceTerminal/VoiceTerminal.exe`（浏览器调试启动程序），须保留整个同目录文件夹，并继续使用本机 Python（程序运行环境）、Node.js（JavaScript 运行环境）和既有模型目录；它不是完整便携桌面包。打包环境与业务环境分离。浏览器热更新使用 `scripts/start.ps1 -Dev`（开发启动），桌面热更新使用 `scripts/start-desktop.ps1 -Dev`（桌面开发启动）。启动蒙版、系统运行页和诊断说明见[独立应用启动与系统管理](docs/application-lifecycle.md)。
 
 ## 产品页面
 
 - `/`：当前真实 Product UI，连接 Product API 和 Voice Server。
 - `/?settings=system`：独立应用的“系统运行”设置页；管理状态来自应用宿主，语音服务失败时仍可诊断、重试和退出。
 - `/?replay=voice-shadow`：开发环境只读回放，用于检查长会话布局、Shadow 时间线和上下文指标；不会向后端提交操作。
-- `/ui-demo.html`：legacy 视觉原型，只使用固定模拟数据，不建立 WebSocket、不申请麦克风权限，也不读写真实设置。
+- `/ui-demo.html`：独立视觉展示页，覆盖工作台和七个设置页（唤醒词与静默设置已合并）；只使用固定样例，不连接业务后端、不申请麦克风权限，也不读写真实设置。
+
+调优外观时，在仓库根目录执行 `npm run dev:ui`（启动视觉展示服务），浏览器会自动打开 `http://127.0.0.1:5174/ui-demo.html`（本机展示入口）。无需启动后端；保存 Vue（页面组件）或 CSS（样式表）文件后自动更新。右下角工具可切换页面、正常/空白/长内容/加载/错误场景、运行状态及浮层，也可收起。展示选择保留在页面地址中，方便刷新后继续查看；表单编辑仅保留在当前页面内存，点击“重置展示”恢复初值。
+
+正式页面与展示页现在共享 `apps/web/src/interface/`（应用框架、工作台、设置导航和基础控件）及 `design.css`（设计变量与样式）。正式设置业务位于 `apps/web/src/product/panels/`，展示样例与工具位于 `apps/web/src/ui-demo/UiDemoApp.vue`、`DemoSettings.vue` 和 `demo-data.ts`。展示工具默认收起，旧 `page=silence`（静默页地址参数）映射到唤醒与静默合并页。此前的预览样式文件保留供设计参考，当前入口不再叠加旧样式。展示入口不加入正式构建产物。
 
 Product UI 只有工作台和设置两个一级页面。页面切换应保留组件状态，真实协议和会话排序以服务端事件为准，详见 [WebSocket 协议](docs/websocket-protocol.md)。
 
@@ -111,6 +125,8 @@ git diff --check
 
 ## 文档入口
 
+- [独立桌面应用、数据分离与便携构建](docs/desktop-application.md)：Tauri 2（桌面应用框架）窗口、独立预览、构建与迁移命令。
+- [桌面实施验收记录](docs/desktop-acceptance.md)：实际构建、运行、退出、迁移及待补实机检查。
 - [独立应用启动与系统管理](docs/application-lifecycle.md)
 - [架构与生命周期](docs/architecture.md)
 - [连续性底座：上下文衔接与定时唤醒](docs/continuity-foundation.md)
