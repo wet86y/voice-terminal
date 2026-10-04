@@ -46,8 +46,8 @@ profile；profile patch（配置补丁）使用 `agent-preset-registry`（Agent 
 
 ## 打开 DSH 界面
 
-先从[独立应用入口](application-lifecycle.md)启动 Voice Terminal，再使用自动打开网页中的产品顶栏 DSH 控制台入口。网页优先使用 `http://127.0.0.1:5173/`，占用时以应用打开的实际地址为准。
-该入口会向 Voice Server 请求一次性 launch URL（启动地址），并在 DSH 界面就绪后打开控制台。
+先从[独立应用入口](application-lifecycle.md)启动 Voice Terminal，再使用主界面顶栏的“代理控制台”入口。主界面网页优先使用 `http://127.0.0.1:5173/`，占用时以应用打开的实际地址为准。
+该入口会向 Voice Server（语音服务）请求带访问令牌的 launch URL（启动地址），并在 DSH（代理执行宿主）界面就绪后打开控制台。桌面应用交给系统默认浏览器打开网页；浏览器调试模式打开新标签页。DSH（代理执行宿主）仍由应用管理生命周期，关闭控制台网页不会结束后台代理服务。
 DSH Web Host（网页服务）固定监听 `127.0.0.1:3081`；直接访问该端口时，必须使用受管入口生成的临时访问令牌。
 不要收藏、复制给他人或写入日志带有 `?token=` 的完整地址。
 

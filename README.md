@@ -47,7 +47,7 @@ MINIMAX_API_KEY=
 - Voice Server：`http://127.0.0.1:8765/`
 - WebSocket：`ws://127.0.0.1:8765/ws`
 - 健康检查：`http://127.0.0.1:8765/health`
-- DSH 控制台：从 Product UI 顶栏的“打开 DSH 控制台”安全进入
+- DSH（代理执行宿主）控制台：从 Product UI（产品界面）顶栏的“代理控制台”进入；桌面应用在系统默认浏览器打开网页
 - 后端调试：`.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe -NoWeb`
 
 启动结果以应用宿主的组件状态和核心能力为准：所有启用组件结束启动尝试后进入正常、降级或诊断状态。可选组件失败允许降级进入工作台；只看到 `/health`（语音服务健康检查）返回成功不代表整套应用已经准备好。启动完成后保持待机，由用户开始语音监听。
