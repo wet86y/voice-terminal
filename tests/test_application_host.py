@@ -88,6 +88,17 @@ class WebTests(unittest.TestCase):
         self.assertEqual(data["state"], "starting")
         self.assertEqual(self.app.processes, {})
 
+    def test_occupied_host_port_uses_a_distinct_owned_listener(self):
+        second = HostWeb(self.app, Path(self.directory.name), port=self.web.server.server_port)
+        second.start()
+        try:
+            self.assertNotEqual(second.origin, self.web.origin)
+            self.assertNotEqual(second.session, self.web.session)
+            with urllib.request.urlopen(second.origin) as response:
+                self.assertEqual(response.status, 200)
+        finally:
+            second.close()
+
     def test_cookie_and_origin_are_required_for_mutations(self):
         with self.assertRaises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(self.web.origin + "/api/v1/application/snapshot")

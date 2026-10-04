@@ -1,0 +1,6 @@
+{
+  "identifier": "boot",
+  "description": "本地诊断页仅能读取启动结果和退出当前应用。",
+  "windows": ["main"],
+  "permissions": ["allow-desktop-status", "allow-exit-application"]
+}

@@ -2,10 +2,15 @@ export type DemoRuntimeState = 'offline' | 'standby' | 'listening' | 'thinking' 
 export type ReasoningMode = 'fast' | 'balanced' | 'deep'
 
 export interface RuntimePresentation {
+  /** label（状态名称）。 */
   label: string
+  /** description（状态说明）。 */
   description: string
+  /** latency（展示延迟）。 */
   latency: string
+  /** pulse（动画状态）。 */
   pulse: string
+  /** timestamp（展示时间）。 */
   timestamp: string
 }
 
@@ -65,12 +70,6 @@ export const stateChoices: Array<{ value: DemoRuntimeState; label: string }> = [
 
 export const primaryPersonaDocuments = [
   {
-    id: 'instructions',
-    label: '交互指令',
-    path: 'config/persona/instructions.md',
-    value: '# 交互指令\n\n回答自然、简洁。用户插话时立即停止当前表达，优先理解新的内容。',
-  },
-  {
     id: 'personality',
     label: '助手人格',
     path: 'config/persona/personality.md',
@@ -81,12 +80,6 @@ export const primaryPersonaDocuments = [
     label: '用户资料',
     path: 'config/persona/user.md',
     value: '# 用户资料\n\n默认使用中文交流；工作时间内优先给出可执行的结论。',
-  },
-  {
-    id: 'shadow',
-    label: 'Shadow 指令',
-    path: 'config/shadow_agent/instructions.md',
-    value: '# Shadow Agent 执行规则\n\n从权威会话上下文理解用户意图。仅执行只读工具，并持续给出简洁进度。',
   },
 ]
 
@@ -112,17 +105,27 @@ export const reasoningEffortOptions: Array<{ value: DemoReasoningEffort; label: 
 ]
 
 export interface DemoModelEntry {
+  /** id（展示条目标识）。 */
   id: string
+  /** name（模型显示名称）。 */
   name: string
+  /** modelId（模型标识）。 */
   modelId: string
+  /** capability（模型能力）。 */
   capability: DemoModelCapability
+  /** origin（条目来源）。 */
   origin: DemoModelOrigin
+  /** provider（服务商名称）。 */
   provider: string
+  /** status（展示状态）。 */
   status: DemoModelStatus
-  /** API model policy kept on the pool entry, not on a runtime assignment. */
+  /** maxContextTokens（上下文容量）：保存在展示条目上的策略。 */
   maxContextTokens?: DemoContextTokens
+  /** allowedReasoning（可用思考等级）。 */
   allowedReasoning?: DemoReasoningEffort[]
+  /** path（虚构模型路径）。 */
   path?: string
+  /** hidden（展示隐藏状态）。 */
   hidden?: boolean
 }
 
@@ -145,4 +148,138 @@ export const capabilityLabels: Record<DemoModelCapability, string> = {
 
 export const originLabels: Record<DemoModelOrigin, string> = {
   runtime_config: '现有运行时配置', product_managed: '产品托管', local_scan: '受管目录扫描',
+}
+
+/** PreviewScene（展示场景）：只改变样例内容和外观，不执行业务。 */
+export type PreviewScene = 'normal' | 'empty' | 'long' | 'loading' | 'error'
+/** PreviewOverlay（浮层展示）：启动、确认、成功和失败画面。 */
+export type PreviewOverlay = 'none' | 'startup' | 'confirm' | 'success' | 'failure'
+/** SettingsTab（展示设置页签）：唤醒词与静默合并，正式页面仍保持原入口。 */
+export type SettingsTab = 'wake' | 'persona' | 'speaker' | 'wakes' | 'models' | 'compute' | 'system'
+/** PreviewPage（展示页面）：工作台或某个设置页。 */
+export type PreviewPage = 'home' | SettingsTab
+
+export const settingsTabs: Array<{
+  /** id（页签标识）。 */ id: SettingsTab
+  /** label（中文名称）。 */ label: string
+  /** hint（辅助说明）。 */ hint: string
+  /** icon（装饰符号）。 */ icon: string
+}> = [
+  { id: 'wake', label: '唤醒与静默', hint: '唤醒词、等待与每日静默', icon: '◌' },
+  { id: 'persona', label: '人格与指令', hint: '风格与协作方式', icon: '✦' },
+  { id: 'speaker', label: '声纹设置', hint: '主人识别与模板', icon: '◎' },
+  { id: 'wakes', label: '定时唤醒', hint: '任务与触发规则', icon: '◴' },
+  { id: 'models', label: '模型管理', hint: '连接、分配与模型池', icon: '◇' },
+  { id: 'compute', label: '计算设备', hint: '设备偏好与资源', icon: '▤' },
+  { id: 'system', label: '系统运行', hint: '组件、指标与诊断', icon: '▧' },
+]
+export const sceneChoices: Array<{
+  /** value（场景标识）。 */ value: PreviewScene
+  /** label（中文名称）。 */ label: string
+}> = [
+  { value: 'normal', label: '正常' }, { value: 'empty', label: '空白' },
+  { value: 'long', label: '长内容' }, { value: 'loading', label: '加载' }, { value: 'error', label: '错误' },
+]
+export const overlayChoices: Array<{
+  /** value（浮层标识）。 */ value: PreviewOverlay
+  /** label（中文名称）。 */ label: string
+}> = [
+  { value: 'none', label: '无浮层' }, { value: 'startup', label: '启动蒙版' },
+  { value: 'confirm', label: '确认弹窗' }, { value: 'success', label: '成功提示' },
+  { value: 'failure', label: '失败提示' },
+]
+/** 固定长文与无空格文本，用于检查气泡、卡片和表单的换行。 */
+export const longText = '请将下午的安排整理为三个阶段：先核对待办事项，再保留连续的专注时间，最后集中处理需要沟通的内容。对于尚未确认的事项，请列出依赖和下一步，并保留足够的说明，让我稍后回来时能够继续阅读。'.repeat(4)
+export const longIdentifier = 'preview-only-very-long-model-and-component-identifier-'.repeat(5)
+
+export interface DemoMessage {
+  /** id（消息标识）。 */ id: string
+  /** role（发言角色）。 */ role: 'user' | 'assistant'
+  /** text（展示正文）。 */ text: string
+  /** time（固定展示时间）。 */ time: string
+}
+export const demoConversation: DemoMessage[] = [
+  { id: 'user-1', role: 'user', text: '帮我把下午的安排理一理，留出一段专注写方案的时间。', time: '14:20' },
+  { id: 'assistant-1', role: 'assistant', text: '可以。建议把 14:30 到 16:00 留作方案专注时间，之后集中处理待确认事项。', time: '14:20' },
+  { id: 'user-2', role: 'user', text: '三点之后尽量不要安排会议，先帮我列出待确认的事项。', time: '14:21' },
+  { id: 'assistant-2', role: 'assistant', text: '已记下这个偏好。我会先整理事项、依赖和下一步，等你确认后再继续。', time: '14:21' },
+]
+/** id（标识）由展示处补充；label（活动名称）、text（活动正文）、state（画面状态）。 */
+export const demoShadowActivities = [
+  { label: '读取会话上下文', text: '已确认时间偏好与当前任务。', state: 'done' },
+  { label: '整理待确认事项', text: '正在核对已有安排与依赖关系。', state: 'active' },
+  { label: '发布可读观察', text: '等待主助手继续处理。', state: 'done' },
+]
+/** id（标识）、trigger（触发语义）、target（执行位置）、instruction（目标说明）、enabled（启用）。 */
+export const demoInstructions = [
+  { id: 'instruction-1', trigger: '我说“等一下”时', target: 'voice', instruction: '暂停当前表达，等待我继续说。', enabled: true },
+  { id: 'instruction-2', trigger: '需要整理工作安排时', target: 'shadow', instruction: '先列出待确认事项与依赖关系。', enabled: true },
+]
+/** id（标识）、label（模板名称）、date（录入时间）、status（展示状态）。 */
+export const demoSpeakerTemplates = [
+  { id: 'template-01', label: '日常说话', date: '2026-10-03 10:20', status: '已纳入主中心' },
+  { id: 'template-02', label: '安静环境', date: '2026-10-03 10:25', status: '已纳入主中心' },
+]
+export const demoSpeakerPrompts = ['今天下午我会整理方案，请帮我保留一段连续的工作时间。', '需要确认的事情可以先列出来，我会逐项查看。', '先把当前安排记录下来，等我回来后再继续。']
+/** id（标识）、time（时间）、text（正文）、status（身份判断说明）。 */
+export const demoAmbientRecords = [
+  { id: 'ambient-01', time: '14:12', text: '窗外有一段远处的谈话声。', status: '非本人 · 环境记录' },
+  { id: 'ambient-02', time: '14:16', text: '稍后再确认这个安排。', status: '身份未知 · 环境记录' },
+]
+/** id（标识）、text（任务说明）、rule（重复规则）、when（触发时间）、status（状态）。 */
+export const demoWakeTasks = [
+  { id: 'wake-01', text: '整理今天的待办，提醒我确认剩余事项。', rule: '每天 18:00', when: '2026-10-03 18:00', status: '待执行' },
+  { id: 'wake-02', text: '回顾本周方案进度，并列出下周需要推进的工作。', rule: '每周五 17:30', when: '2026-10-09 17:30', status: '待执行' },
+  { id: 'wake-03', text: '检查上午的会议准备。', rule: '单次', when: '2026-10-03 09:00', status: '已归档' },
+]
+/** id（标识）、name（模型名称）、device（当前设备）、memory（常驻内存）、gpu（显卡可选）。 */
+export const demoComputeModels = [
+  { id: 'paraformer', name: 'Paraformer（流式语音识别）', device: 'cpu', memory: '420 MiB（二进制兆字节）', gpu: true },
+  { id: 'sensevoice', name: 'SenseVoiceSmall（语音识别与分析）', device: 'cuda', memory: '610 MiB（二进制兆字节）', gpu: true },
+  { id: 'voice_vad', name: 'FSMN-VAD（语音活动检测）', device: 'cpu', memory: '58 MiB（二进制兆字节）', gpu: false },
+  { id: 'kws', name: 'KWS（关键词唤醒）', device: 'cpu', memory: '96 MiB（二进制兆字节）', gpu: false },
+  { id: 'smart_turn', name: 'SmartTurn（语音结束判断）', device: 'cpu', memory: '180 MiB（二进制兆字节）', gpu: false },
+  { id: 'wespeaker', name: 'WeSpeaker（声纹识别）', device: 'cpu', memory: '110 MiB（二进制兆字节）', gpu: false },
+]
+/** id（标识）、name（组件名称）、phase（阶段）、pid（进程号）、memory（常驻内存）、commit（提交内存）、cpu（处理器占用）。 */
+export const demoSystemComponents = [
+  { id: 'web', name: '网页与应用宿主', phase: '提供网页、托盘与组件监督', pid: '21040', memory: '86 MiB', commit: '102 MiB', cpu: '0.2%' },
+  { id: 'voice', name: 'Voice Server（语音服务）', phase: '语音链路待机', pid: '21044', memory: '780 MiB', commit: '940 MiB', cpu: '1.1%' },
+  { id: 'asr', name: 'ASR（语音识别）', phase: '模型已加载', pid: '21048', memory: '420 MiB', commit: '530 MiB', cpu: '0.3%' },
+  { id: 'analysis', name: '语音分析工作进程', phase: '分析能力就绪', pid: '21052', memory: '610 MiB', commit: '730 MiB', cpu: '0.4%' },
+  { id: 'dsh', name: 'DSH（代理执行宿主）', phase: '等待后台协作任务', pid: '21056', memory: '160 MiB', commit: '205 MiB', cpu: '0.1%' },
+]
+export const demoCapabilities = ['音频设备', 'KWS（关键词唤醒）', 'ASR（语音识别）', 'LLM（大语言模型）', 'TTS（语音合成）', 'Shadow（影子代理）', '声纹识别']
+
+/** 固定样例列表：空白场景无条目；长内容场景扩展列表，标识保持唯一。 */
+export function previewRows<T extends { id: string }>(rows: readonly T[], scene: PreviewScene): T[] {
+  if (scene === 'empty') return []
+  if (scene !== 'long') return rows.map(row => ({ ...row }))
+  return Array.from({ length: 8 }, (_, batch) => rows.map(row => ({ ...row, id: `${row.id}-${batch}` }))).flat()
+}
+
+/** 表单初值；只供页面编辑和布局展示，不读取或保存真实配置。 */
+export const demoSettings = {
+  /** wakeEnabled（启用唤醒）。 */ wakeEnabled: true,
+  /** keywords（唤醒短语列表）。 */ keywords: ['嘿，小爪', '小爪同学'],
+  /** sensitivity（识别灵敏度百分比）。 */ sensitivity: 75,
+  /** silenceSeconds（最终静默等待秒数）。 */ silenceSeconds: 90,
+  /** quietEnabled（启用每日被动静默）。 */ quietEnabled: false,
+  /** quietStart（静默开始时间）。 */ quietStart: '23:00',
+  /** quietEnd（静默结束时间）。 */ quietEnd: '07:00',
+  /** speakerMode（声纹运行模式）。 */ speakerMode: 'observe',
+  /** confirmThreshold（主人确认阈值）。 */ confirmThreshold: 0.60,
+  /** continuityThreshold（非主人确认界限）。 */ continuityThreshold: 0.50,
+  /** ownerOnly（仅主人可打断）。 */ ownerOnly: false,
+  /** experimentalContextGateEnabled（实验性上下文门禁，仅展示引导时机开关）。 */ experimentalContextGateEnabled: true,
+  /** providerName（服务商名称）。 */ providerName: '我的模型连接',
+  /** providerUrl（虚构服务地址）。 */ providerUrl: 'https://api.example.com/v1',
+  /** providerProtocol（展示协议名称）。 */ providerProtocol: 'DeepSeek',
+  /** providerKey（空白密钥展示框）。 */ providerKey: '',
+  /** voiceModel（主语音模型标识）。 */ voiceModel: 'runtime-voice-llm',
+  /** shadowModel（影子代理模型标识）。 */ shadowModel: 'runtime-shadow-llm',
+  /** statusModel（状态汇报模型标识）。 */ statusModel: 'managed-reasoning',
+  /** taskText（定时任务编辑正文）。 */ taskText: '整理今天的待办，提醒我确认剩余事项。',
+  /** taskWhen（任务触发时间）。 */ taskWhen: '2026-10-03T18:00',
+  /** taskRule（任务重复规则）。 */ taskRule: '每天',
 }

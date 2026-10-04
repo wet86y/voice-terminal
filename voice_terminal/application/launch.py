@@ -16,6 +16,7 @@ import webbrowser
 from .supervisor import ApplicationHost
 from .web import HostWeb
 from .windows import SingleInstance
+from ..paths import AppPaths, atomic_json
 
 
 def find_root(explicit: str = "") -> Path:
@@ -36,6 +37,7 @@ async def run(args, root):
         no_analysis=args.no_analysis, no_web=args.no_web, llm_provider=args.llm_provider)
     app.loop = asyncio.get_running_loop()
     app.dev = args.dev
+    desktop = None
     web = HostWeb(app, root / "apps/web/dist", port=8764 if args.dev else 5173)
     app.origin = web.origin
     web.start()
@@ -44,10 +46,10 @@ async def run(args, root):
     if not args.dev and not args.no_web and not (root / "apps/web/dist/index.html").is_file():
         app.state.component("web", state="failed", phase="使用内置诊断页",
             error="缺少网页构建产物，请执行 npm run build（构建网页）。")
-    registry = root / ".runtime/application/instance.json"
+    registry = app.paths.application_state / "instance.json"
     registry.parent.mkdir(parents=True, exist_ok=True)
     browser_origin = web.origin
-    registry.write_text(json.dumps({"pid": os.getpid(), "url": browser_origin}), encoding="utf-8")
+    atomic_json(registry, {"pid": os.getpid(), "url": browser_origin, "instance_id": app.state.value["instance_id"]})
     tray = None
     try:
         if not args.no_tray:
@@ -83,9 +85,23 @@ async def run(args, root):
                 tray.origin = browser_origin
         if not args.no_browser and not args.no_web:
             webbrowser.open(browser_origin + "/")
-        app.enqueue(app.startup())
-        app.enqueue(app.monitor())
+        if getattr(args, "desktop_managed", False):
+            from .desktop import DesktopControl
+            desktop = DesktopControl(app)
+            desktop.start(browser_origin)
+            await desktop.owned.wait()
+        if not getattr(args, "diagnostic", False) and not app.exit_event.is_set():
+            app.enqueue(app.startup())
+            app.enqueue(app.monitor())
+        reported_startup = False
         while not app.exit_event.is_set():
+            status = app.state.snapshot()
+            if status["startup_complete"] and not reported_startup:
+                result = {"schema": 1, "instance_id": status["instance_id"], "state": status["state"], "core_available": status["core_available"], "pid": os.getpid(), "checked_at": time.time()}
+                atomic_json(app.paths.application_state.parent / "startup-result.json", result)
+                if desktop:
+                    desktop.send("startup_result", **result)
+                reported_startup = True
             if tray:
                 tray.refresh()
             try:
@@ -94,6 +110,8 @@ async def run(args, root):
                 pass
     finally:
         await app.shutdown()
+        if desktop:
+            desktop.send("stopped")
         await asyncio.sleep(.3)  # 让 SSE（服务器推送事件）把已退出状态送达已打开页面。
         if tray:
             tray.close()
@@ -107,15 +125,25 @@ def main():
     parser.add_argument("--python", default="", help="业务 Python（程序运行环境）路径")
     parser.add_argument("--config", default="config/local.yaml", help="本机配置路径")
     parser.add_argument("--llm-provider", choices=("deepseek", "opencode_go"), default="")
+    parser.add_argument("--desktop-managed", action="store_true", help="由桌面外壳管理，不建立第二套托盘或单实例")
+    parser.add_argument("--data-dir", type=Path, help="独立用户数据目录")
+    parser.add_argument("--diagnostic", action="store_true", help="仅验证窗口与服务入口，不启动音频和模型")
     for name in ("no-worker", "no-analysis", "no-web", "no-tray", "no-browser", "dev"):
         parser.add_argument("--" + name, action="store_true")
     args = parser.parse_args()
     root = find_root(args.root)
+    paths = AppPaths.resolve(root, data_dir=args.data_dir)
+    paths.prepare()
+    os.environ.update(paths.environment())
+    if paths.separated and args.config == "config/local.yaml":
+        args.config = str(paths.config / "local.yaml")
+    if args.desktop_managed:
+        args.no_browser = args.no_tray = True
     identity = hashlib.sha256(str(root).casefold().encode()).hexdigest()[:24]
-    mutex = SingleInstance("VoiceTerminal-" + identity)
-    if not mutex.acquired:
+    mutex = None if args.desktop_managed else SingleInstance("VoiceTerminal-" + identity)
+    if mutex and not mutex.acquired:
         try:
-            registry = root / ".runtime/application/instance.json"
+            registry = paths.application_state / "instance.json"
             for _ in range(50):
                 if registry.is_file():
                     if not args.no_browser:
@@ -125,8 +153,8 @@ def main():
             return
         finally:
             mutex.close()
-    logdir = root / "logs"
-    logdir.mkdir(exist_ok=True)
+    logdir = paths.logs
+    logdir.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(logdir / "application.log", maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
     logging.basicConfig(level=logging.INFO, handlers=[handler], format="%(asctime)s %(levelname)s %(message)s", force=True)
     try:
@@ -134,7 +162,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        mutex.close()
+        if mutex:
+            mutex.close()
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from .engine import InsufficientAudioError, WeSpeakerOnnxEngine
 from .quality import base_window_quality
 from .protocol import decode_pcm
 from ..config import load_config
+from ..paths import AppPaths
 from ..core.events import utc_now_iso
 from ..env import load_env_file
 from ..logging_setup import configure_logging
@@ -329,7 +330,7 @@ async def run(config_path: Path | None = None) -> None:
     root = Path(__file__).resolve().parents[2]
     config = load_config(root / "config" / "default.yaml", config_path if config_path and config_path.is_file() else None)
     config = ProductSettingsStore(
-        path=root / "config" / "product-settings.json",
+        path=AppPaths.resolve(root).config / "product-settings.json",
         config=config,
     ).effective_config()
     model_path = config.speaker_model_path
@@ -448,8 +449,9 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=None)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
-    load_env_file(root / ".env.local")
-    configure_logging(root / "logs" / "speaker-worker.log")
+    paths = AppPaths.resolve(root)
+    load_env_file(paths.env_file)
+    configure_logging(paths.logs / "speaker-worker.log")
     asyncio.run(run(args.config))
 
 

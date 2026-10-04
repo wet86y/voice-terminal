@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Literal
 
 from ..config import DshConfig
+from ..paths import AppPaths
+from ..distribution import safe_path, verify
 from .bridge import DshBridgeClient, DshBridgeHub, new_bridge_token
 
 logger = logging.getLogger(__name__)
@@ -49,7 +51,10 @@ class DshRuntimeManager:
 
     def __init__(self, config: DshConfig, *, callback_origin: str = "http://127.0.0.1:8765") -> None:
         self.config = config
-        self.repo_root = config.source_dir.parents[2]
+        self.paths = AppPaths.resolve()
+        self.repo_root = self.paths.program_root if self.paths.separated else config.source_dir.parents[2]
+        self.release_runtime = Path(os.environ["VOICE_DSH_RUNTIME"]).resolve() if os.environ.get("VOICE_DSH_RUNTIME") else None
+        self.release_record: dict = {}
         if not callback_origin.startswith("http://127.0.0.1:"):
             raise ValueError("DSH callback origin must be loopback HTTP")
         self._bridge_token = new_bridge_token()
@@ -132,15 +137,16 @@ class DshRuntimeManager:
                 "VOICE_DSH_CALLBACK_ORIGIN": self.callback_origin,
                 "VOICE_DSH_TASKS_PATH": str(self.config.home_dir / "storages" / "voice-terminal-wake-tasks.json"),
                 "VOICE_DSH_NATIVE_SCHEDULE_PATH": str(self.config.home_dir / "storages" / "schedule.json"),
-                "VOICE_DSH_LEGACY_WAKE_PATH": str(self.repo_root / "config" / "wake-tasks.json"),
-                "VOICE_DSH_SCHEDULE_MODULE": str(self.config.source_dir / "packages" / "schedule" / "schedule" / "lib" / "index.js"),
+                "VOICE_DSH_LEGACY_WAKE_PATH": str(self.paths.config / "wake-tasks.json"),
+                "VOICE_DSH_SCHEDULE_MODULE": str(safe_path(self.release_runtime, self.release_record["schedule"])) if self.release_runtime else str(self.config.source_dir / "packages" / "schedule" / "schedule" / "lib" / "index.js"),
                 "VOICE_DSH_TASKS_ACTIVE": "1",
             })
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             managed = bool(os.environ.get("VOICE_APP_ORIGIN"))
-            node_arguments = [node]
+            node_arguments = [node] if node else []
             if managed:
-                node_arguments += ["--require", str(self.repo_root / "scripts/managed-node.cjs")]
+                if node:
+                    node_arguments += ["--require", str(self.repo_root / "scripts/managed-node.cjs")]
                 if os.name == "nt":
                     creationflags |= subprocess.CREATE_NO_WINDOW
             self._process = await asyncio.create_subprocess_exec(
@@ -188,9 +194,11 @@ class DshRuntimeManager:
             self._message = "DSH 已随 Voice Server 关闭。"
 
     async def _validate_installation(self) -> tuple[str, Path]:
+        if self.release_runtime:
+            return await self._validate_release()
         if os.name != "nt" or os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() not in {"amd64", "x86_64"}:
             raise RuntimeError("当前 DSH 基线仅正式支持 Windows x64。")
-        node = shutil.which("node")
+        node = os.environ.get("VOICE_NODE_EXECUTABLE") or shutil.which("node")
         if not node:
             raise RuntimeError("未找到 Node.js；需要 22.19.0 或更高兼容版本。")
         version_output = await self._run_checked(node, "--version")
@@ -222,6 +230,10 @@ class DshRuntimeManager:
         cli_version = (await self._run_checked(node, str(cli), "--version", cwd=self.repo_root)).strip()
         if self.config.expected_version not in cli_version:
             raise RuntimeError(f"DSH CLI 版本不匹配：{cli_version or '无版本输出'}。")
+        if self.paths.separated:
+            from .profile import build_profile
+            build_profile(self.repo_root, self.config.source_dir.parent / "bundles", self.config.home_dir / "profiles/web")
+            await self._ensure_modules_link(self.config.source_dir / "python/sdk-runtime/node_modules")
         if not self.config.profile_patch.is_file():
             raise RuntimeError("DSH Web profile patch 缺失。")
         managed_patch = self.config.home_dir / "profiles" / "web" / "cordis.patch.yml"
@@ -322,6 +334,65 @@ class DshRuntimeManager:
         if wake_package.get("main") != "lib/plugin.js" or wake_package.get("exports", {}).get(".") != "./lib/plugin.js":
             raise RuntimeError("唤醒任务插件入口未指向 plugin.js。")
         return node, cli
+
+    async def _validate_release(self) -> tuple[str, Path]:
+        """发行端校验闭合产物；不运行 Git（源码工具）或依赖安装。"""
+        runtime = self.release_runtime
+        assert runtime is not None
+        record = json.loads((runtime / "manifest.json").read_text(encoding="utf-8-sig"))
+        metadata = json.loads((runtime / "runtime.json").read_text(encoding="utf-8-sig"))
+        if metadata.get("schema") != 1 or metadata.get("version") != self.config.expected_version or metadata.get("commit") != self.config.expected_commit:
+            raise RuntimeError("DSH（代理执行宿主）发行产物版本与程序要求不匹配。")
+        if metadata.get("bridge_protocol") != self.config.bridge_protocol_version:
+            raise RuntimeError("DSH（代理执行宿主）发行产物的桥接协议不兼容。")
+        node = safe_path(runtime, metadata["node"])
+        cli = safe_path(runtime, metadata["entry"])
+        schedule = safe_path(runtime, metadata["schedule"])
+        if not all(path.is_file() for path in (node, cli, schedule)):
+            raise RuntimeError("DSH（代理执行宿主）发行产物不完整。")
+        # 启动检查必要入口的文件摘要，避免数万依赖文件扫描占满服务启动预算。
+        # 构建、分发及手动切换组合的离线验证仍执行完整摘要和文件集合校验。
+        required = {"runtime.json", "package.json", metadata["node"], metadata["entry"], metadata["schedule"],
+                    "node_modules/@deepseek-ai/dsh/lib/bin.js"}
+        entries = [item for item in record.get("files", []) if item.get("path") in required]
+        if record.get("kind") != "dsh" or {item["path"] for item in entries} != required:
+            raise RuntimeError("DSH（代理执行宿主）发布清单缺少必要入口记录。")
+        await asyncio.to_thread(verify, runtime, {**record, "files": entries}, exact=False)
+        self.release_record = metadata
+        # 自研插件属于程序包；只补默认补丁，已迁移的用户配置继续保留。
+        template = self.repo_root / "config/dsh/profile"
+        profile = self.config.home_dir / "profiles/web"
+        for source in template.rglob("*"):
+            if not source.is_file():
+                continue
+            target = profile / source.relative_to(template)
+            if target.name == "cordis.patch.yml" and target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        # 用户区内的受管目录联接每次启动重建目标，可随整个应用搬迁。
+        # 发行运行目录自身必须没有链接；不复制开发机 pnpm（包管理器）目录联接。
+        target = safe_path(runtime, metadata["modules"])
+        await self._ensure_modules_link(target)
+        managed_patch = profile / "cordis.patch.yml"
+        if not self._profile_patch_preserves_managed_defaults(self.config.profile_patch, managed_patch):
+            raise RuntimeError("DSH（代理执行宿主）的用户配置缺少必要的受管默认项。")
+        return str(node), cli
+
+    async def _ensure_modules_link(self, target: Path) -> None:
+        target = target.resolve()
+        if not target.is_dir():
+            raise RuntimeError("DSH（代理执行宿主）受管依赖目录缺失。")
+        link = self.config.home_dir / "node_modules"
+        if link.is_junction() and link.resolve() != target:
+            link.rmdir()  # 只移除本次管理的联接，不递归删除目标。
+        if not link.exists():
+            link.parent.mkdir(parents=True, exist_ok=True)
+            script = "& { param($link,$target) New-Item -ItemType Junction -Path $link -Target $target -ErrorAction Stop | Out-Null } "
+            quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+            await self._run_checked("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script + quote(link) + " " + quote(target))
+        elif not link.is_junction() or link.resolve() != target:
+            raise RuntimeError("DSH（代理执行宿主）用户目录的受管依赖位置存在冲突。")
 
     @staticmethod
     def _profile_patch_preserves_managed_defaults(source: Path, managed: Path) -> bool:

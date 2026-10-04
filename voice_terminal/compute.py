@@ -171,6 +171,18 @@ def actual_device(mode: str, *, gpu_supported: bool) -> str:
     return "cuda" if gpu_supported else "cpu"
 
 
+def loaded_funasr_device(model: Any, attempted: str) -> str:
+    """读取 FunASR（语音模型加载器）解析后的设备，包含其内部静默回退。"""
+    options = getattr(model, "kwargs", None)
+    value = options.get("device") if isinstance(options, dict) else None
+    if isinstance(value, str):
+        backend = value.split(":", 1)[0].lower()
+        if backend in {"cpu", "cuda"}:
+            return backend
+    # 兼容未提供 kwargs（实际加载参数）的旧加载器及测试替身。
+    return attempted
+
+
 _GPU_MINIMUM_FREE_BYTES = {
     "paraformer": 1024 * 1024 * 1024,
     "sensevoice": 1536 * 1024 * 1024,

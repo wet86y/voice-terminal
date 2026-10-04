@@ -29,6 +29,8 @@ class ApplicationHost:
     def __init__(self, root: Path, *, python: str = "", config: str = "config/local.yaml",
                  no_worker=False, no_analysis=False, no_web=False, llm_provider="") -> None:
         self.root, self.config = root, config
+        from ..paths import AppPaths
+        self.paths = AppPaths.resolve(root)
         self.python_option = python
         self.no_worker, self.no_analysis, self.no_web = no_worker, no_analysis, no_web
         self.llm_provider = llm_provider
@@ -47,6 +49,8 @@ class ApplicationHost:
         self.background = set()
         self.dev = False
         self.frontend_error = ""
+        self.exit_callback = None  # exit_callback（桌面外壳的退出协调回调）。
+        self.shutdown_deadline = None  # shutdown_deadline（统一退出的单调时钟截止时间）。
 
     def enqueue(self, coroutine):
         if self.loop is None:
@@ -59,6 +63,9 @@ class ApplicationHost:
         self.loop.call_soon_threadsafe(schedule)
 
     def request_exit(self):
+        if self.exit_callback:
+            self.exit_callback()
+            return
         if self.loop:
             self.loop.call_soon_threadsafe(self.exit_event.set)
 
@@ -96,8 +103,9 @@ class ApplicationHost:
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1",
             "VOICE_APP_ORIGIN": self.origin, "VOICE_APP_INTERNAL_TOKEN": self.internal_token,
             "VOICE_APP_SERVICE_GENERATION": generation, "VOICE_WEB_ORIGINS": self.origin}
+        env.update(self.paths.environment())
         env["VOICE_APP_INSTANCE_ID"] = self.state.value["instance_id"]
-        env["VOICE_RESOURCE_POLICY"] = os.environ.get("VOICE_RESOURCE_POLICY", str(self.root / "config/runtime-resources.json"))
+        env["VOICE_RESOURCE_POLICY"] = os.environ.get("VOICE_RESOURCE_POLICY", str(self.paths.config / "runtime-resources.json"))
         model_dir = self.manifest.get("model_dir")
         env = ResourcePolicy.load(Path(env["VOICE_RESOURCE_POLICY"])).environment(
             key, model_dir=Path(model_dir) if model_dir else None, parent=env)
@@ -109,7 +117,7 @@ class ApplicationHost:
             env["VOICE_APP_ANALYSIS_AVAILABLE"] = "1" if rows["analysis"]["state"] == "ready" else "0"
             if self.manifest.get("hardware_capabilities"):
                 env["VOICE_HARDWARE_CAPABILITIES"] = json.dumps(self.manifest["hardware_capabilities"])
-        output = self.root / "logs" / f"application-{key}.log"
+        output = self.paths.logs / f"application-{key}.log"
         if output.is_file() and output.stat().st_size > 5 * 1024 * 1024:
             for index in (3, 2, 1):
                 old = output.with_name(output.name + f".{index}")
@@ -137,9 +145,10 @@ class ApplicationHost:
     async def setup(self):
         self.state.component("setup", state="starting", phase="读取有效配置与运行环境", error="")
         self.python = self.resolve_python()
-        output = self.root / "logs/application-bootstrap.log"
+        output = self.paths.logs / "application-bootstrap.log"
         output.unlink(missing_ok=True)
-        process = self.spawn("bootstrap", [self.python, "-m", "voice_terminal.application.bootstrap", "--config", self.config])
+        from ..paths import python_command
+        process = self.spawn("bootstrap", python_command(self.python, "voice_terminal.application.bootstrap", "--config", self.config, root=self.root))
         deadline = time.monotonic() + 30
         while process.poll() is None:
             if time.monotonic() >= deadline:
@@ -260,8 +269,9 @@ class ApplicationHost:
         if self.port_busy(address):
             raise RuntimeError("组件地址被未知进程占用，未接管或结束该进程：" + address)
         module = {"asr": "apps.server.asr_worker", "analysis": "apps.server.analysis_worker", "voice": "apps.server.main"}[key]
-        process = self.spawn(key, [self.python, "-m", module, "--config", self.config])
-        deadline = time.monotonic() + (60 if key == "asr" else 180)
+        from ..paths import python_command
+        process = self.spawn(key, python_command(self.python, module, "--config", self.config, root=self.root))
+        deadline = time.monotonic() + self.manifest.get("worker_timeout_seconds", 180)
         while time.monotonic() < deadline:
             if self.state.snapshot()["stopping"]:
                 return
@@ -430,7 +440,7 @@ class ApplicationHost:
                 if not row["external"]:
                     unique[identity] = (memory, private_commit)
                 # 子树仅计入整体总量，不重复加入各组件行。
-                if row["id"] in {"voice", "asr", "analysis"} and not row["external"]:
+                if row["id"] in {"voice", "asr", "analysis", "desktop"} and not row["external"]:
                     for child in process.children(recursive=True):
                         try:
                             child_identity = (child.pid, child.create_time())
@@ -489,7 +499,7 @@ class ApplicationHost:
 
     async def shutdown(self):
         # 总退出预算 15 秒，预留 1 秒发布最终状态并关闭网页、托盘及单实例锁。
-        deadline = time.monotonic() + 14
+        deadline = min(time.monotonic() + 14, self.shutdown_deadline or float("inf"))
         self.state.update(stopping=True, state="stopping", core_available=False, phase="正在退出并回收组件")
         for task in tuple(self.background):
             task.cancel()

@@ -9,6 +9,10 @@
   ],
   "scripts": {
     "dev": "npm run dev --workspace @voice-terminal/web",
+    "dev:ui": "npm run dev:ui --workspace @voice-terminal/web",
+    "desktop:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-desktop.ps1 -Dev",
+    "desktop:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-desktop.ps1",
+    "desktop:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1",
     "build": "npm run build --workspace @voice-terminal/web",
     "typecheck": "npm run typecheck --workspace @voice-terminal/web",
     "test": "npm run test --workspace @voice-terminal/web",

@@ -171,14 +171,13 @@ class SpeakerRuntimeMixin:
     async def _start_managed_speaker_worker(self) -> asyncio.subprocess.Process:
         from ..application.managed import report
         report("speaker", "加载声纹模型")
-        log_dir = self._project_root / "logs"
+        log_dir = self.paths.logs
         log_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = log_dir / "speaker-worker.out.log"
         stderr_path = log_dir / "speaker-worker.err.log"
-        command = [
-            sys.executable, "-m", "voice_terminal.speaker.worker",
-            "--config", str(self._speaker_worker_config_path),
-        ]
+        from ..paths import python_command
+        command = python_command(sys.executable, "voice_terminal.speaker.worker",
+                                 "--config", str(self._speaker_worker_config_path), root=self._project_root)
         from ..resources import ResourcePolicy
         child_env = ResourcePolicy.load().environment("speaker", model_dir=self.config.model_dir)
         with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:

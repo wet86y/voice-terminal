@@ -21,6 +21,7 @@ if __name__ == "__main__":
 import uvicorn  # type: ignore
 
 from voice_terminal.config import PersonaConfig, load_config
+from voice_terminal.paths import AppPaths
 from voice_terminal.application.managed import run_uvicorn, report as application_report
 from voice_terminal.env import load_env_file
 from voice_terminal.logging_setup import configure_logging
@@ -65,8 +66,9 @@ def _runtime_build_info(root: Path, effective_config: Path) -> dict[str, str | i
 
 def build_application(config_path: Path | None = None) -> tuple[object, SessionRuntime]:
     root = Path(__file__).resolve().parents[2]
+    paths = AppPaths.resolve(root)
     default_path = root / "config" / "default.yaml"
-    local_path = config_path or root / "config" / "local.yaml"
+    local_path = config_path or paths.config / "local.yaml"
     effective_config = local_path if local_path.is_file() else default_path
     yaml_config = load_config(default_path, local_path if local_path.is_file() else None)
     # Product Persona is a fixed, allowlisted sidecar surface.  Keep the
@@ -74,10 +76,10 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
     # a custom Persona directory or filename.
     yaml_config = replace(
         yaml_config,
-        persona=PersonaConfig(directory=root / "config" / "persona"),
+        persona=PersonaConfig(directory=paths.persona),
     )
     product_settings = ProductSettingsStore(
-        path=root / "config" / "product-settings.json",
+        path=paths.config / "product-settings.json",
         config=yaml_config,
     )
     config = product_settings.effective_config()
@@ -89,7 +91,7 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
     runtime.build_info = _runtime_build_info(root, effective_config)
     model_registry = ModelRegistryService(
         config=config,
-        registry_path=root / "config" / "model-registry.json",
+        registry_path=paths.config / "model-registry.json",
         vault=WindowsCredentialVault(),
         apply_callback=runtime.restart_model_services,
     )
@@ -180,8 +182,9 @@ def main() -> None:
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[2]
-    load_env_file(root / ".env.local")
-    configure_logging(root / "logs" / "voice-server.log")
+    paths = AppPaths.resolve(root)
+    load_env_file(paths.env_file)
+    configure_logging(paths.logs / "voice-server.log")
     app, runtime = build_application(args.config)
     logging.getLogger(__name__).info("server.runtime_build %s", runtime.build_info)
     host = args.host or runtime.config.server.host

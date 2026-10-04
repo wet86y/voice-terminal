@@ -2,11 +2,12 @@
 import { computed } from 'vue'
 import { useApplicationHost, applicationStateLabel } from './application-host'
 const application = useApplicationHost()
-const { snapshot, overlay, error, now, retryingAll } = application
-const emit = defineEmits<{ system: [] }>()
+const { snapshot, overlay, error, now, retryingAll, businessReady } = application
+const emit = defineEmits<{ system: []; models: [] }>()
 const elapsed = computed(() => snapshot.value ? Math.max(0, Math.floor(now.value / 1000 - snapshot.value.started_at)) : 0)
 const canRetry = computed(() => snapshot.value?.components.some(c => c.retry_allowed))
 function inspect() { application.inspect(); emit('system') }
+function configure() { application.inspect(); emit('models') }
 </script>
 
 <template>
@@ -19,7 +20,7 @@ function inspect() { application.inspect(); emit('system') }
       <progress :value="snapshot?.completed_components || 0" :max="snapshot?.total_components || 1" />
       <ul><li v-for="component in snapshot?.components || []" :key="component.id"><div><strong>{{ component.name }}</strong><span :class="component.state">{{ applicationStateLabel(component.state) }}</span></div><small>{{ component.phase }}</small><p v-if="component.error" class="application-error">{{ component.error }}</p></li></ul>
       <p v-if="error" class="application-error">{{ error }}</p>
-      <div v-if="snapshot?.state !== 'stopped' && !snapshot?.stopping" class="application-startup-actions"><button type="button" @click="inspect">查看系统运行</button><button v-if="canRetry" type="button" :disabled="retryingAll" @click="application.retryFailed">{{ retryingAll ? '正在恢复组件' : '重试失败组件' }}</button><button type="button" @click="application.exit">退出应用</button></div>
+      <div v-if="snapshot?.state !== 'stopped' && !snapshot?.stopping" class="application-startup-actions"><button type="button" @click="inspect">查看系统运行</button><button v-if="businessReady" type="button" @click="configure">打开模型设置</button><button v-if="canRetry" type="button" :disabled="retryingAll" @click="application.retryFailed">{{ retryingAll ? '正在恢复组件' : '重试失败组件' }}</button><button type="button" @click="application.exit">退出应用</button></div>
     </section>
   </div>
 </template>

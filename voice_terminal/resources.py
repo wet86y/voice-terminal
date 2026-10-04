@@ -11,6 +11,7 @@ import weakref
 from dataclasses import dataclass
 from typing import Callable
 from collections import Counter
+from .paths import AppPaths
 
 ROOT = Path(__file__).resolve().parents[1]
 THREAD_ENV = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
@@ -28,7 +29,7 @@ class ResourcePolicy:
 
     @classmethod
     def load(cls, path: Path | None = None) -> "ResourcePolicy":
-        path = path or Path(os.environ.get("VOICE_RESOURCE_POLICY", ROOT / "config/runtime-resources.json"))
+        path = path or Path(os.environ.get("VOICE_RESOURCE_POLICY", AppPaths.resolve(ROOT).config / "runtime-resources.json"))
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -51,6 +52,9 @@ class ResourcePolicy:
 
     def environment(self, role: str, *, model_dir: Path | None = None, parent=None) -> dict[str, str]:
         env = dict(os.environ if parent is None else parent)
+        paths = AppPaths.resolve()
+        if paths.separated:
+            env.update(paths.environment())
         env["VOICE_RESOURCE_ROLE"] = role
         if role in self.native_threads:
             env.update({name: str(self.native_threads[role]) for name in THREAD_ENV})

@@ -18,6 +18,7 @@ from ..audio.player import PcmPlayer
 from ..audio.processing import AudioPreprocessor
 from ..asr.client import AsrWorkerClient
 from ..config import AppConfig
+from ..paths import AppPaths
 from ..custom_instructions import shadow_projection
 from ..controller.episode_controller import EpisodeController
 from ..dsh import (
@@ -105,10 +106,11 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         self.llm: DeepSeekClient | None = None
         project_root = runtime_data_dir.resolve().parent if runtime_data_dir else Path(__file__).resolve().parents[2]
         self._project_root = project_root
+        self.paths = config.paths if config.paths and config.paths.separated else AppPaths(project_root, project_root)
         from ..resources import ResourcePolicy
         resource_policy = ResourcePolicy.load()
         if resource_policy.disk_history:
-            self.history.attach_storage(project_root / ".runtime/continuity/archives/.journals", resource_policy.history_cache_bytes)
+            self.history.attach_storage(self.paths.history / "archives/.journals", resource_policy.history_cache_bytes)
         self._init_handoff()
         default_worker_config = project_root / "config" / "default.yaml"
         # Child config（子进程配置文件） keeps the worker on the same model and port.
@@ -135,7 +137,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 shadow_user_profile = ""
         self._shadow_user_profile = shadow_user_profile
         self.continuity = ContinuityManager(
-            project_root / "config" / "continuity-state.json",
+            self.paths.config / "continuity-state.json",
             self._summarize_continuity,
             on_document_changed=self._continuity_document_changed,
             on_organized=self._commit_continuity_cleanup,
@@ -145,8 +147,8 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         self._dsh_busy = False
         self._voice_silence_anchor: float | None = None
         self._cleanup_in_progress = False
-        self._handoff_marker = project_root / "config" / "continuity-handoff.json"
-        self._task_delivery_path = project_root / "config" / "dsh-task-deliveries.json"
+        self._handoff_marker = self.paths.config / "continuity-handoff.json"
+        self._task_delivery_path = self.paths.config / "dsh-task-deliveries.json"
         try:
             delivered = json.loads(self._task_delivery_path.read_text(encoding="utf-8"))
             self._task_deliveries = dict(delivered.get("receipts") or {})
@@ -158,13 +160,13 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             custom_instructions=shadow_projection(self._instruction_snapshot),
         )
         self._shadow_pending = ShadowEventBuffer()
-        self._voice_mailbox = DurableVoiceMailbox(project_root / "config" / "voice-mailbox.json")
+        self._voice_mailbox = DurableVoiceMailbox(self.paths.config / "voice-mailbox.json")
         self.shadow_product = ShadowProductProjection()
         self._shadow_debug_sinks: dict[str, Any] = {}
         self.player: PcmPlayer | None = None
         self.audio_processor: AudioPreprocessor | None = None
         self.controller: EpisodeController | None = None
-        profile_root = config.persona.directory.resolve().parent / "speaker"
+        profile_root = self.paths.speaker if self.paths.separated else config.persona.directory.resolve().parent / "speaker"
         self.ambient_store = AmbientTranscriptStore()
         self.speaker_profile = SpeakerProfileStore(profile_root, model_id=config.speaker.model_id)
         self.speaker_router = SpeakerRouter(
@@ -180,8 +182,8 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         self._speaker_test_result: dict[str, Any] | None = None
         self.conversation = ConversationRuntime()
         self._voice_identity_path = (
-            project_root / ".runtime" / "continuity" / "active-voice-session.json"
-            if runtime_data_dir is not None or not config.dsh.enabled
+            self.paths.history / "active-voice-session.json"
+            if self.paths.separated or runtime_data_dir is not None or not config.dsh.enabled
             else config.dsh.home_dir.parent / "active-voice-session.json"
         )
         self._session_lock = asyncio.Lock()
@@ -401,7 +403,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                             )
                     self.shadow_session = DshShadowAgentSession(
                         client=self.dsh.bridge,
-                        mapping_store=DshMappingStore(self.config.dsh.home_dir.parent / "session-mappings.json"),
+                        mapping_store=DshMappingStore((self.paths.dsh_home if self.paths.separated else self.config.dsh.home_dir.parent) / "session-mappings.json"),
                         context_source=self.shadow_context,
                         voice_session_id=self.conversation.conversation_id,
                         workspace=self.dsh.repo_root,

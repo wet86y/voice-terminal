@@ -10,6 +10,12 @@ Voice Terminal 内置第一方 DSH Bundle `voice-terminal-shadow-bridge`。当
 Session、Tool 和事件扩展点；不得修改 `.runtime/dsh/source`、解析私有 Session 文件、依赖私有
 Web RPC，或启动第二个长期持有同一 Session 的 DSH 进程。
 
+## 发行运行与源码准备
+
+便携桌面包使用已闭合的 DSH（代理执行宿主）运行目录，附带 Node.js（脚本解释器）、物理依赖与原生运行库。发行端验证宿主版本、桥接协议及关键入口摘要，不要求 Git（源码工具）、pnpm（依赖管理工具）或源码检出；完整逐文件验证通过随包离线校验脚本执行。运行产物位于只读运行环境，用户配置与状态位于独立数据目录；应用搬迁后重建受管依赖联接。
+
+构建、组件封装和迁移见[桌面应用说明](desktop-application.md)。下面的安装与源码漂移检查用于开发机和构建机，不是在终端设备安装依赖的步骤。
+
 ## 安装与漂移校验
 
 ```powershell

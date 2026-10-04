@@ -38,7 +38,7 @@ class HandoffRuntimeMixin:
             recoverable=True))
 
     def _init_handoff(self) -> None:
-        root = self._project_root / ".runtime" / "continuity"
+        root = self.paths.history
         self.pending_transfer = PendingTransferStore(root / "pending-transfer.json")
         self.pending_transfer.recover_captures()
         self.paired_archives = PairedArchiveStore(root / "archives")

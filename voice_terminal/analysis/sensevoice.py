@@ -52,7 +52,7 @@ class SenseVoice:
         self.device = "cpu"
         self.load_error: str | None = None
         self.internal_vad_device = "cpu"
-        from ..compute import device_candidates
+        from ..compute import device_candidates, loaded_funasr_device
         last_error: Exception | None = None
         for candidate in device_candidates(device, "sensevoice", fallback_device):
             model = vad = None
@@ -66,10 +66,14 @@ class SenseVoice:
                     max_single_segment_time=30000,
                 )
                 self.model, self.vad = model, vad
-                self.device = self.internal_vad_device = candidate
+                self.device = loaded_funasr_device(model, candidate)
+                self.internal_vad_device = loaded_funasr_device(vad, candidate)
                 self.load_error = (
-                    f"CUDA（图形处理器）加载失败，已回退到 {candidate}：{type(last_error).__name__}: {last_error}"
-                    if last_error is not None else None
+                    f"CUDA（图形处理器）加载失败，已回退到 {self.device}：{type(last_error).__name__}: {last_error}"
+                    if last_error is not None else
+                    "FunASR（语音模型加载器）自动回退：语音识别实际设备为 "
+                    f"{self.device}，内部 VAD（语音活动检测）实际设备为 {self.internal_vad_device}。"
+                    if candidate == "cuda" and "cpu" in {self.device, self.internal_vad_device} else None
                 )
                 break
             except Exception as exc:

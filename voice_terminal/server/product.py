@@ -475,6 +475,8 @@ class ProductSettingsStore:
     def __init__(self, *, path: Path, config: AppConfig) -> None:
         self.path = path
         self.config = config
+        self.persona_directory = (config.paths.persona if config.paths and config.paths.separated
+                                  else path.resolve().parent / "persona")
         self.warnings: list[str] = []
         # Keep the legacy observable version for a damaged schema marker.
         # A normal load and every successful save use schema version 6;
@@ -534,7 +536,7 @@ class ProductSettingsStore:
         return deepcopy(self._settings)
 
     def read_persona(self) -> dict[str, str]:
-        directory = (self.path.resolve().parent / "persona").resolve()
+        directory = self.persona_directory.resolve()
         result: dict[str, str] = {}
         for key, filename in PERSONA_FILES.items():
             path = (directory / filename).resolve()
@@ -692,10 +694,11 @@ class ProductSettingsStore:
         labels = tuple(label for _keyword, label in entries)
         model_dir = self.config.kws_dir.resolve()
         target = self.config.kws_keywords_file.resolve()
+        allowed_root = (self.config.paths.cache / "kws" if self.config.paths and self.config.paths.separated else model_dir).resolve()
         try:
-            target.relative_to(model_dir)
+            target.relative_to(allowed_root)
         except ValueError as exc:
-            raise ProductSettingsError("KWS 关键词文件必须位于受管 KWS 模型目录内。") from exc
+            raise ProductSettingsError("KWS（关键词唤醒）文件必须位于受管生成资源目录内。") from exc
         target.parent.mkdir(parents=True, exist_ok=True)
         raw_target = target.parent / "keywords_raw.txt"
         with tempfile.TemporaryDirectory(prefix=".product-kws-", dir=str(target.parent)) as temporary_name:
@@ -897,7 +900,7 @@ class ProductSettingsStore:
         # Product writes are deliberately pinned to the repository config
         # layout.  The client never supplies a path, and a YAML override must
         # not turn this API into an arbitrary filesystem writer.
-        persona_dir = (self.path.resolve().parent / "persona").resolve()
+        persona_dir = self.persona_directory.resolve()
         paths = {key: persona_dir / filename for key, filename in PERSONA_FILES.items()}
         for path in paths.values():
             try:

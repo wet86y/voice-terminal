@@ -296,4 +296,6 @@ export interface ProductMutationResult {
 export interface ProductApiErrorShape {
   status: number
   message: string
+  code?: string // code（业务错误码）。
+  detail?: Record<string, unknown> | string // detail（服务端错误详情）。
 }

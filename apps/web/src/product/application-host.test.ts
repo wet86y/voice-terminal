@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { acceptApplicationSnapshot, applicationStateLabel, type ApplicationSnapshot } from './application-host'
+import { acceptApplicationSnapshot, applicationStateLabel, applicationApiReady, type ApplicationSnapshot } from './application-host'
 
 describe('独立应用状态投影', () => {
   const snapshot = (instance_id: string, revision: number) => ({ instance_id, revision } as ApplicationSnapshot)
@@ -12,5 +12,14 @@ describe('独立应用状态投影', () => {
     expect(applicationStateLabel('failed')).toBe('需要检查')
     expect(applicationStateLabel('blocked')).toBe('依赖不可用')
     expect(applicationStateLabel('stopped')).toBe('已退出')
+  })
+  it('接口已就绪但未配置凭据时，保留设置访问；接口退出或未启动时拒绝请求', () => {
+    const value = { state: 'failed', core_available: false, startup_complete: true, stopping: false,
+      voice_api_url: 'http://127.0.0.1:8765', components: [{ id: 'voice', pid: 123, state: 'failed' }] } as ApplicationSnapshot
+    expect(applicationApiReady(value)).toBe(true)
+    expect(applicationApiReady({ ...value, stopping: true })).toBe(false)
+    expect(applicationApiReady({ ...value, voice_api_url: '' })).toBe(false)
+    expect(applicationApiReady({ ...value, components: [{ ...value.components[0], pid: null }] })).toBe(false)
+    expect(applicationApiReady({ ...value, components: [{ ...value.components[0], state: 'starting' }] })).toBe(false)
   })
 })

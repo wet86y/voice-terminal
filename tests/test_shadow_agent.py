@@ -224,7 +224,9 @@ def test_shadow_tool_call_soft_yields_and_finishes_in_background():
         result = await executor.execute("files_search", {"query": "x"})
         assert result["status"] == "running"
         assert result["job_id"].startswith("tool-")
-        await asyncio.sleep(0.08)
+        # 按后台任务的完成信号验收，避免繁忙构建机的线程调度超过固定 80 毫秒。
+        await asyncio.wait_for(asyncio.gather(*tuple(executor._background_work)), timeout=1.0)
+        await asyncio.sleep(0)
         assert not executor._background_work
 
     asyncio.run(scenario())
