@@ -2,7 +2,7 @@
 
 本文是当前组件边界和生命周期的唯一说明。模型可见字段见[上下文与工具规范](context-and-tools.md)；WebSocket 消息见[协议文档](websocket-protocol.md)；质量门槛见[运行与质量门槛](operations-and-quality.md)。
 
-Tauri 2（桌面框架）拥有窗口、托盘、单实例与 Python（后端运行环境）服务管理进程。应用宿主直接管理语音识别、分析和语音服务，委托语音服务管理 DSH（代理执行宿主）与声纹工作进程；每个进程只有一个直接生命周期所有者。关闭桌面窗口隐藏到托盘，明确退出应用回收整棵受管进程树。源码浏览器调试入口保留。启动反馈和进程状态契约见[独立应用启动与系统管理](application-lifecycle.md)，便携路径与数据边界见[桌面应用说明](desktop-application.md)。
+Tauri 2（桌面框架）拥有窗口、托盘、单实例与 Python（后端运行环境）服务管理进程。应用宿主直接管理语音识别、分析和语音服务，委托语音服务管理 DSH（代理执行宿主）与声纹工作进程；每个进程只有一个直接生命周期所有者。关闭桌面窗口隐藏到托盘，明确退出应用回收整棵受管进程树。主产品与源码界面调试只支持桌面入口，独立样例由原生宿主管理其开发服务。启动反馈和进程状态契约见[独立应用启动与系统管理](application-lifecycle.md)，便携路径与数据边界见[桌面应用说明](desktop-application.md)。
 
 ## 总体结构
 
@@ -149,7 +149,7 @@ none → kws standby → asr active → kws standby → none
 ## Product UI 边界
 
 - `/` 是真实 Product UI，使用 Product API 和 Voice Server WebSocket。
-- `/?replay=voice-shadow` 是开发环境只读回放，不应提交 reset、配置保存或模型应用请求。
+- 语音事件回放位于桌面样例工具，仅投影固定事件数据；产品入口不再用查询参数绕过宿主管理。
 - `/ui-demo.html` 是 legacy 视觉原型，不属于真实运行时。
 - 页面只渲染服务端 conversation `seq` 和 `conversation_id + turn_id/speech_id`，不自行推断服务端顺序。
 - 产品展示层仅隐藏 `kind=user_turn`（用户消息类型）、`status=empty_input`（空输入状态）且 `text`（文本）为空或仅含空白字符的气泡。实时消息和离线快照使用相同规则；权威记录、`seq`（服务端顺序号）及诊断保持完整。非空短回答、助手消息、系统消息和其他状态记录不受此规则影响。
@@ -166,8 +166,8 @@ none → kws standby → asr active → kws standby → none
 | TTS、播放和 delivery | `voice_terminal/controller/episode_output.py`、`voice_terminal/controller/speech_frontier.py`、`voice_terminal/controller/speech_pipeline.py`、`voice_terminal/controller/speech_admission.py`、`voice_terminal/providers/` |
 | 会话账本和上下文 | `voice_terminal/session/ledger.py`、`voice_terminal/session/context.py` |
 | Shadow 合约、上下文、工具和 provider | `voice_terminal/shadow_agent/` |
-| Product UI 与适配器 | `apps/web/src/product/` |
-| 只读回放 fixture | `apps/web/src/product/replay-data.ts` |
+| Product UI 与适配器 | `apps/frontend/src/product/` |
+| 只读回放 fixture | `apps/frontend/src/ui-demo/`（桌面样例与固定回放夹具） |
 
 ## 变更要求
 

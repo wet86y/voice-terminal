@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -54,11 +55,8 @@ class ProductApiTests(unittest.TestCase):
             registry_path=self.root / "config" / "model-registry.json",
             vault=FakeVault(),
         )
-        self.app = create_app(
-            runtime,
-            model_registry=registry,
-            product_settings=settings,
-        )
+        with patch.dict(os.environ, {"VOICE_WEB_ORIGINS": "http://127.0.0.1:9123"}):
+            self.app = create_app(runtime, model_registry=registry, product_settings=settings)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -252,16 +250,23 @@ class ProductApiTests(unittest.TestCase):
             [(USER_TURN, 1, "灵月是什么游戏？"), (SYSTEM_SPEECH, 2, "我在，请说。")],
         )
 
-    def test_cors_allows_local_product_origins_but_not_wildcard(self) -> None:
+    def test_cors_only_allows_configured_desktop_origin(self) -> None:
         allowed = asyncio.run(self._request(
             "OPTIONS", "/api/v1/product/snapshot",
             headers={
-                "Origin": "http://localhost:5173",
+                "Origin": "http://127.0.0.1:9123",
                 "Access-Control-Request-Method": "GET",
             },
         ))
         self.assertEqual(allowed.status_code, 200)
-        self.assertEqual(allowed.headers.get("access-control-allow-origin"), "http://localhost:5173")
+        self.assertEqual(allowed.headers.get("access-control-allow-origin"), "http://127.0.0.1:9123")
+
+        for legacy in ("http://localhost:5173", "http://127.0.0.1:5173"):
+            denied = asyncio.run(self._request("OPTIONS", "/api/v1/product/snapshot", headers={
+                "Origin": legacy, "Access-Control-Request-Method": "GET",
+            }))
+            self.assertEqual(denied.status_code, 400)
+            self.assertNotIn("access-control-allow-origin", denied.headers)
 
         blocked = asyncio.run(self._request(
             "OPTIONS", "/api/v1/product/snapshot",
@@ -286,14 +291,14 @@ class ProductApiTests(unittest.TestCase):
 
         wrong_type = asyncio.run(self._request(
             "POST", "/api/v1/dsh/ui-launch", content="{}",
-            headers={"Origin": "http://127.0.0.1:5173", "Content-Type": "text/plain"},
+            headers={"Origin": "http://127.0.0.1:9123", "Content-Type": "text/plain"},
         ))
         self.assertEqual(wrong_type.status_code, 415)
 
         self.runtime.dsh._state = "starting"
         starting = asyncio.run(self._request(
             "POST", "/api/v1/dsh/ui-launch", json={},
-            headers={"Origin": "http://127.0.0.1:5173"},
+            headers={"Origin": "http://127.0.0.1:9123"},
         ))
         self.assertEqual(starting.status_code, 409)
 
@@ -301,7 +306,7 @@ class ProductApiTests(unittest.TestCase):
         self.runtime.dsh._launch_url = "http://127.0.0.1:3081/?token=secret-launch-token"
         ready = asyncio.run(self._request(
             "POST", "/api/v1/dsh/ui-launch", json={},
-            headers={"Origin": "http://127.0.0.1:5173"},
+            headers={"Origin": "http://127.0.0.1:9123"},
         ))
         self.assertEqual(ready.status_code, 200)
         self.assertEqual(ready.headers["cache-control"], "no-store")

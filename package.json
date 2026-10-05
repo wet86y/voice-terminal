@@ -5,18 +5,19 @@
   "description": "本地模块化实时语音终端 v0.7",
   "type": "module",
   "workspaces": [
-    "apps/web"
+    "apps/frontend"
   ],
   "scripts": {
-    "dev": "npm run dev --workspace @voice-terminal/web",
-    "dev:ui": "npm run dev:ui --workspace @voice-terminal/web",
+    "dev": "npm run desktop:dev",
+    "dev:ui": "npm run desktop:ui",
     "desktop:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-desktop.ps1 -Dev",
+    "desktop:ui": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-desktop.ps1 -UiPreview",
     "desktop:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-desktop.ps1",
     "desktop:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1",
-    "build": "npm run build --workspace @voice-terminal/web",
-    "typecheck": "npm run typecheck --workspace @voice-terminal/web",
-    "test": "npm run test --workspace @voice-terminal/web",
-    "preview": "npm run preview --workspace @voice-terminal/web"
+    "build": "npm run desktop:build",
+    "frontend:build": "npm run build --workspace @voice-terminal/frontend",
+    "typecheck": "npm run typecheck --workspace @voice-terminal/frontend",
+    "test": "npm run test --workspace @voice-terminal/frontend && node --test tests/frontend-dev.test.mjs"
   },
   "engines": {
     "node": ">=20"

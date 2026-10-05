@@ -75,11 +75,55 @@ def archive(root: Path, destination: Path, *, exclude_roots=(), include_roots=()
     return {"file": destination.name, "size": destination.stat().st_size, "sha256": digest(destination)}
 
 
+def collect_frontend(source: Path, target: Path) -> None:
+    """只收集单个产品入口的构建闭包，拒绝样例、陈旧文件及开发资源。"""
+    manifest_path = source / "desktop-manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("缺少界面产物清单，请执行 npm run frontend:build（静态界面构建）。")
+    records = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(records, dict) or not records:
+        raise ValueError("界面产物清单无效。")
+    entries = [key for key, row in records.items() if isinstance(row, dict) and row.get("isEntry")]
+    if entries != ["index.html"]:
+        raise ValueError("正式界面必须只有产品入口，不能包含样例页面。")
+    allowed = {"index.html", "desktop-manifest.json"}
+    visited = set()
+
+    def visit(key):
+        if key in visited:
+            return
+        visited.add(key)
+        row = records.get(key)
+        if not isinstance(row, dict) or any(part in key for part in ("ui-demo", "replay-data", "fixtures")):
+            raise ValueError("正式界面依赖包含样例或无效资源。")
+        values = [row.get("file"), *row.get("css", []), *row.get("assets", [])]
+        for value in values:
+            if not isinstance(value, str) or not value:
+                raise ValueError("界面资源路径无效。")
+            path = safe_path(source, value)
+            if not path.is_file():
+                raise ValueError("界面依赖文件缺失：" + value)
+            allowed.add(value)
+        for imported in [*row.get("imports", []), *row.get("dynamicImports", [])]:
+            visit(imported)
+
+    visit("index.html")
+    actual = {path.relative_to(source).as_posix() for path in files(source)}
+    if actual != allowed:
+        raise ValueError("界面产物存在缺失、样例或陈旧文件，请重新构建。")
+    for relative in sorted(allowed):
+        path = safe_path(source, relative)
+        copy = target / relative
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, copy)
+
+
 def collect_program(program: Path, desktop: Path) -> None:
     """只收集程序与默认模板；开发依赖和个人配置不进入程序目录。"""
     program.mkdir(parents=True)
     shutil.copy2(desktop / "VoiceTerminalDesktop.exe", program / "VoiceTerminalDesktop.exe")
-    for relative in ("voice_terminal", "apps/server", "apps/web/dist", "config/dsh", "config/shadow_agent", "config/templates"):
+    collect_frontend(ROOT / "apps/frontend/dist", program / "apps/frontend/dist")
+    for relative in ("voice_terminal", "apps/server", "config/dsh", "config/shadow_agent", "config/templates"):
         copy_tree(ROOT / relative, program / relative)
     (program / "scripts").mkdir()
     for name in ("backend-entry.py", "managed-node.cjs", "check-desktop-environment.py", "prepare-webview2.ps1"):

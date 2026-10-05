@@ -1,6 +1,6 @@
 # Voice Terminal
 
-Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tauri（桌面框架）窗口承载正式界面，负责托盘、单实例及服务管理进程；应用宿主负责业务组件的启动、监督和退出，浏览器入口保留用于独立调试。Voice Server（语音服务）负责音频采集、KWS（关键词唤醒）、VAD（语音活动检测）、ASR（自动语音识别）、主 Agent（智能体）、Shadow（影子代理）、TTS（语音合成）和播放。DSH（代理执行宿主）作为内部组件受管。
+Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tauri（桌面框架）窗口是主产品唯一的运行、开发和界面验收入口，负责托盘、单实例及服务管理进程；应用宿主负责业务组件的启动、监督和退出。Voice Server（语音服务）负责音频采集、KWS（关键词唤醒）、VAD（语音活动检测）、ASR（自动语音识别）、主 Agent（智能体）、Shadow（影子代理）、TTS（语音合成）和播放。DSH（代理执行宿主）作为内部组件受管，其独立管理控制台继续由系统默认浏览器打开。
 
 当前代码包版本为 `0.7.0`。默认 LLM 路径是 DeepSeek Responses + strict `json_schema`；`voice_decision_v06` 只是冻结的协议兼容标识，不是发布版本号。
 
@@ -30,11 +30,10 @@ Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tau
 ```powershell
 .\scripts\setup.ps1 -Python D:\DevTools\Python312\python.exe -Analysis
 npm ci
-npm run build
-.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe
+npm run desktop:start
 ```
 
-启动前将真实凭据放在 `.env.local` 或进程环境中，不要提交到 Git：
+源码桌面使用 `.runtime/desktop-data/.env.local`（独立开发凭据文件）；明确指定数据目录时使用该目录内的 `.env.local`（本机环境文件）。也可通过进程环境提供凭据，不要提交到 Git（源码管理工具）：
 
 ```text
 DEEPSEEK_API_KEY=
@@ -43,16 +42,16 @@ MINIMAX_API_KEY=
 
 默认入口：
 
-- Product UI：`http://127.0.0.1:5173/`
-- Voice Server：`http://127.0.0.1:8765/`
-- WebSocket：`ws://127.0.0.1:8765/ws`
+- Product UI（产品界面）：通过桌面程序打开；普通浏览器访问本机地址只显示启动说明。
+- Voice Server（语音服务）：`http://127.0.0.1:8765/`
+- WebSocket（实时通信）：`ws://127.0.0.1:8765/ws`
 - 健康检查：`http://127.0.0.1:8765/health`
 - DSH（代理执行宿主）控制台：从 Product UI（产品界面）顶栏的“代理控制台”进入；桌面应用在系统默认浏览器打开网页
-- 后端调试：`.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe -NoWeb`
+- 无界面后端调试：`.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe`
 
 启动结果以应用宿主的组件状态和核心能力为准：所有启用组件结束启动尝试后进入正常、降级或诊断状态。可选组件失败允许降级进入工作台；只看到 `/health`（语音服务健康检查）返回成功不代表整套应用已经准备好。启动完成后保持待机，由用户开始语音监听。
 
-桌面启动由应用宿主提供网页构建产物，不在启动期间安装依赖、构建网页或启动 Vite（前端开发服务器）。网页地址优先使用 5173 端口，被占用时自动分配空闲端口，以桌面实际加载地址为准。关闭桌面窗口隐藏到托盘；从应用菜单、托盘或“设置 → 系统运行”明确退出应用时，回收全部受管组件。源码浏览器调试模式中，关闭网页同样不会结束后台服务。
+便携桌面启动由应用宿主提供预构建界面，不在用户启动期间安装依赖或执行开发构建。正式界面地址优先使用 5173 端口，被占用时分配空闲端口，以桌面实际加载地址为准。私有进程管道提供一次性桌面入口凭据；界面资源、运行配置和宿主管理操作均需本实例会话。关闭产品窗口隐藏到托盘；从应用菜单、托盘或“设置 → 系统运行”明确退出时，回收全部受管组件。
 
 构建桌面程序及根目录启动入口：
 
@@ -62,24 +61,26 @@ MINIMAX_API_KEY=
 
 完整便携组装、独立运行环境构建、旧数据导入及离线校验见[桌面开发与分发说明](docs/desktop-application.md)。发布文件与用户数据分离，根入口根据便携配置及本地启用记录选择组件；终端启动不执行依赖安装。
 
-保留旧浏览器启动器供源码调试，构建方式如下：
+源码界面开发统一使用桌面命令：
 
 ```powershell
-.\scripts\build-launcher.ps1 -Python D:\DevTools\Python312\python.exe
+npm run dev       # 真实业务桌面热更新；别名 npm run desktop:dev
+npm run dev:ui    # 桌面样例热更新；别名 npm run desktop:ui
+npm run build    # 正式界面、原生主程序及根启动程序；别名 npm run desktop:build
 ```
 
-旧启动器位于 `.runtime/launcher/VoiceTerminal/VoiceTerminal.exe`（浏览器调试启动程序），须保留整个同目录文件夹，并继续使用本机 Python（程序运行环境）、Node.js（JavaScript 运行环境）和既有模型目录；它不是完整便携桌面包。打包环境与业务环境分离。浏览器热更新使用 `scripts/start.ps1 -Dev`（开发启动），桌面热更新使用 `scripts/start-desktop.ps1 -Dev`（桌面开发启动）。启动蒙版、系统运行页和诊断说明见[独立应用启动与系统管理](docs/application-lifecycle.md)。
+每次源码桌面启动都执行增量原生构建，静态启动同时构建当前界面。真实开发端口固定 5173，样例固定 5174；冲突时明确失败，不连接未知服务。真实开发默认使用 `.runtime/desktop-data`（独立开发数据），模型共用；样例只使用独立渲染缓存，不需要 Python（后端运行时）、模型或业务凭据。浏览器预览和旧网页启动器已撤销。启动诊断见[独立应用启动与系统管理](docs/application-lifecycle.md)。
 
 ## 产品页面
 
 - `/`：当前真实 Product UI，连接 Product API 和 Voice Server。
 - `/?settings=system`：独立应用的“系统运行”设置页；管理状态来自应用宿主，语音服务失败时仍可诊断、重试和退出。
-- `/?replay=voice-shadow`：开发环境只读回放，用于检查长会话布局、Shadow 时间线和上下文指标；不会向后端提交操作。
-- `/ui-demo.html`：独立视觉展示页，覆盖工作台和七个设置页（唤醒词与静默设置已合并）；只使用固定样例，不连接业务后端、不申请麦克风权限，也不读写真实设置。
+- 语音事件回放：从桌面样例工具选择固定回放场景；产品地址不再通过查询参数绕过宿主管理。
+- 桌面样例：覆盖工作台和七个设置页（唤醒词与静默设置已合并）；使用固定样例，不连接业务后端、不申请麦克风权限，也不读写真实设置。
 
-调优外观时，在仓库根目录执行 `npm run dev:ui`（启动视觉展示服务），浏览器会自动打开 `http://127.0.0.1:5174/ui-demo.html`（本机展示入口）。无需启动后端；保存 Vue（页面组件）或 CSS（样式表）文件后自动更新。右下角工具可切换页面、正常/空白/长内容/加载/错误场景、运行状态及浮层，也可收起。展示选择保留在页面地址中，方便刷新后继续查看；表单编辑仅保留在当前页面内存，点击“重置展示”恢复初值。
+调优外观时，在仓库根目录执行 `npm run dev:ui`（启动桌面样例），程序自动打开独立桌面窗口。保存 Vue（页面组件）或 CSS（样式表）后自动更新。右下角工具可切换页面、内容场景、运行状态及浮层。展示选择保留在页面地址中；表单编辑仅保留在内存，点击“重置展示”恢复初值。关闭样例窗口立即回收其开发服务，可以与正式程序同时运行。
 
-正式页面与展示页现在共享 `apps/web/src/interface/`（应用框架、工作台、设置导航和基础控件）及 `design.css`（设计变量与样式）。正式设置业务位于 `apps/web/src/product/panels/`，展示样例与工具位于 `apps/web/src/ui-demo/UiDemoApp.vue`、`DemoSettings.vue` 和 `demo-data.ts`。展示工具默认收起，旧 `page=silence`（静默页地址参数）映射到唤醒与静默合并页。此前的预览样式文件保留供设计参考，当前入口不再叠加旧样式。展示入口不加入正式构建产物。
+正式界面与样例共享 `apps/frontend/src/interface/`（应用框架、工作台、设置导航和基础控件）及 `design.css`（设计变量与样式）。正式业务位于 `apps/frontend/src/product/`（产品逻辑），样例位于 `apps/frontend/src/ui-demo/`（样例展示）。两套入口先验证原生桌面状态再动态加载对应界面；正式入口随后读取宿主运行配置。正式构建只包含产品入口，便携组装依据 `desktop-manifest.json`（界面产物清单）验证依赖闭包，拒绝样例和陈旧资源。当前收敛范围与验证状态见[第一阶段记录](docs/desktop-frontend-consolidation.md)。
 
 Product UI 只有工作台和设置两个一级页面。页面切换应保留组件状态，真实协议和会话排序以服务端事件为准，详见 [WebSocket 协议](docs/websocket-protocol.md)。
 

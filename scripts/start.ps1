@@ -1,14 +1,17 @@
-param(
+﻿param(
+  [Parameter(HelpMessage="Python（业务程序运行环境）路径")]
   [string]$Python = "",
+  [Parameter(HelpMessage="Config（本机应用配置）路径")]
   [string]$Config = "config/local.yaml",
   [ValidateSet("deepseek", "opencode_go")]
+  [Parameter(HelpMessage="LlmProvider（大语言模型服务商）")]
   [string]$LlmProvider = "",
+  [Parameter(HelpMessage="NoWorker（不启动语音识别工作进程）")]
   [switch]$NoWorker,
+  [Parameter(HelpMessage="NoAnalysis（不启动分析工作进程）")]
   [switch]$NoAnalysis,
-  [switch]$NoWeb,
-  [switch]$Dev,
-  [switch]$NoTray,
-  [switch]$NoBrowser
+  [Parameter(HelpMessage="DataDir（独立用户数据目录）")]
+  [string]$DataDir = ".runtime/desktop-data"
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,14 +29,18 @@ if (-not $Python -and (Test-Path -LiteralPath $RuntimeProfile)) {
 }
 if (-not $Python) { $Python = "python" }
 $RuntimePython = (Get-Command $Python -ErrorAction Stop).Source
-$Arguments = @("-m", "voice_terminal.application.launch", "--root", $RepoRoot, "--python", $RuntimePython, "--config", $Config)
+$ResolvedDataDir = if ([IO.Path]::IsPathRooted($DataDir)) { [IO.Path]::GetFullPath($DataDir) } else { [IO.Path]::GetFullPath((Join-Path $RepoRoot $DataDir)) }
+$Arguments = @(
+  "-m", "voice_terminal.application.launch",
+  "--root", $RepoRoot,
+  "--python", $RuntimePython,
+  "--config", $Config,
+  "--data-dir", $ResolvedDataDir,
+  "--headless"
+)
 if ($LlmProvider) { $Arguments += @("--llm-provider", $LlmProvider) }
 if ($NoWorker) { $Arguments += "--no-worker" }
 if ($NoAnalysis) { $Arguments += "--no-analysis" }
-if ($NoWeb) { $Arguments += "--no-web" }
-if ($Dev) { $Arguments += "--dev" }
-if ($NoTray) { $Arguments += "--no-tray" }
-if ($NoBrowser) { $Arguments += "--no-browser" }
 Push-Location $RepoRoot
 try {
   & $RuntimePython @Arguments

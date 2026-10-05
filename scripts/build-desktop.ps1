@@ -1,6 +1,12 @@
-﻿param([switch]$Debug, [switch]$SkipWeb)
+﻿param([switch]$Debug, [switch]$SkipFrontend)
 $ErrorActionPreference = 'Stop'
 $DesktopRepo = Split-Path -Parent $PSScriptRoot
+$ForbiddenBuildFlags = @('--ui-preview', '--dev', '--diagnostic', '--dev-server', '--frontend-dev')
+foreach ($Argument in $args) {
+  if ($ForbiddenBuildFlags -contains $Argument) {
+    throw "构建脚本不接受运行参数：$Argument"
+  }
+}
 $LocalCargo = Join-Path $DesktopRepo '.runtime/desktop-tools/cargo/bin/cargo.exe'
 $CargoCommand = if (Test-Path -LiteralPath $LocalCargo) { $LocalCargo } else { (Get-Command cargo -ErrorAction Stop).Source }
 $SavedCargoHome = $env:CARGO_HOME
@@ -14,7 +20,7 @@ try {
   }
   Push-Location $DesktopRepo
   try {
-    if (-not $SkipWeb) { & npm run build; if ($LASTEXITCODE) { throw '前端构建失败。' } }
+    if (-not $SkipFrontend) { & npm run frontend:build; if ($LASTEXITCODE) { throw '前端构建失败。' } }
     $CargoArguments = @('build', '--manifest-path', 'apps/desktop/Cargo.toml', '--package', 'voice-terminal-desktop', '--features', 'voice-terminal-desktop/custom-protocol', '--locked')
     if (-not $Debug) { $CargoArguments += '--release' }
     & $CargoCommand @CargoArguments

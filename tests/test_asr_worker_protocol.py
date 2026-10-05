@@ -215,23 +215,6 @@ class AsrWorkerConfigurationTests(unittest.TestCase):
             config = load_config(Path("config/default.yaml"))
         self.assertEqual(config.asr.worker_url, "ws://127.0.0.1:9123/custom")
 
-        script = Path("scripts/start.ps1").read_text(encoding="utf-8")
-        self.assertIn("voice_terminal.application.launch", script)
-        supervisor = Path("voice_terminal/application/supervisor.py").read_text(encoding="utf-8")
-        self.assertIn('self.manifest["asr_url"]', supervisor)
-        self.assertIn('"type": "health", "request_id": request_id', supervisor)
-        self.assertNotIn('Connect("127.0.0.1", 8766)', script)
-
-    def test_start_script_starts_and_verifies_web_frontend_by_default(self) -> None:
-        script = Path("scripts/start.ps1").read_text(encoding="utf-8")
-        self.assertIn("[switch]$NoWeb", script)
-        self.assertIn('if ($NoWeb) { $Arguments += "--no-web" }', script)
-        self.assertIn("voice_terminal.application.launch", script)
-        launcher = Path("voice_terminal/application/launch.py").read_text(encoding="utf-8")
-        self.assertIn("web.start()", launcher)
-        self.assertIn("not args.no_browser and not args.no_web", launcher)
-        self.assertIn("web.close()", launcher)
-
 
 if __name__ == "__main__":
     unittest.main()

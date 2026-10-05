@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import asyncio
 from http.cookiejar import CookieJar
+import io
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,7 +22,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from voice_terminal.application.state import ApplicationState
 from voice_terminal.application.supervisor import ApplicationHost
-from voice_terminal.application.web import HostWeb
+from voice_terminal.application.launch import _wait_for_frontend, parse_args
+from voice_terminal.application.web import FALLBACK_HTML, HostWeb
 from voice_terminal.application.windows import Job, ManagedProcess, SingleInstance, external_environment
 
 
@@ -69,6 +73,8 @@ class ApplicationStateTests(unittest.TestCase):
 class WebTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
+        (Path(self.directory.name) / "index.html").write_text("<html><head></head><body>product-ui</body></html>", encoding="utf-8")
+        (Path(self.directory.name) / "assets.js").write_text("window.product = true", encoding="utf-8")
         self.app = ApplicationHost(Path(self.directory.name))
         self.web = HostWeb(self.app, Path(self.directory.name), port=0)
         self.app.origin = self.web.origin
@@ -80,30 +86,93 @@ class WebTests(unittest.TestCase):
         self.app.outer_job.close()
         self.directory.cleanup()
 
-    def test_feedback_exists_before_any_business_process(self):
+    def test_unclaimed_root_is_static_information_and_business_resources_are_denied(self):
         with self.client.open(self.web.origin) as response:
-            self.assertIn("启动诊断", response.read().decode())
+            self.assertIn("请通过桌面程序打开", response.read().decode())
+            self.assertIsNone(response.headers.get("Set-Cookie"))
+        with urllib.request.urlopen(self.web.origin + "/index.html") as response:
+            self.assertIn("请通过桌面程序打开", response.read().decode())
+        for path in ("/assets.js", "/application-config.js", "/api/v1/application/snapshot"):
+            with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(self.web.origin + path)
+            self.assertEqual(error.exception.code, 403)
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(urllib.request.Request(self.web.origin + "/assets.js", method="HEAD"))
+        self.assertEqual(error.exception.code, 403)
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(urllib.request.Request(self.web.origin + "/api/v1/application/snapshot", method="OPTIONS"))
+        self.assertEqual(error.exception.code, 403)
+        self.assertEqual(self.app.processes, {})
+
+    def test_desktop_entry_consumes_single_use_token_and_sets_instance_cookie(self):
+        token = self.web.issue_launch_token()
+        with self.client.open(self.web.origin + "/desktop-entry?token=" + token) as response:
+            body = response.read().decode()
+            self.assertEqual(response.status, 200)
+            self.assertIn("location.replace('/')", body)
+            self.assertNotIn(token, body)
+            cookie = response.headers.get("Set-Cookie", "")
+            self.assertIn(self.web.cookie_name + "=", cookie)
+            self.assertIn(self.web.instance_id, self.web.cookie_name)
+            self.assertIn("HttpOnly", cookie)
+            self.assertIn("SameSite=Strict", cookie)
+            self.assertEqual(response.headers.get("Cache-Control"), "no-store")
+            self.assertEqual(response.headers.get("Referrer-Policy"), "no-referrer")
+        with self.client.open(self.web.origin + "/") as response:
+            body = response.read().decode()
+            self.assertIn("product-ui", body)
+            self.assertNotIn("application-config.js", body)
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(self.web.origin + "/desktop-entry?token=" + token)
+        self.assertEqual(error.exception.code, 403)
+
+    def test_launch_token_is_consumed_atomically(self):
+        from concurrent.futures import ThreadPoolExecutor
+        token = self.web.issue_launch_token()
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            accepted = list(pool.map(self.web.consume_launch_token, [token] * 32))
+        self.assertEqual(accepted.count(True), 1)
+
+    def test_expired_launch_token_cannot_establish_session(self):
+        with patch("voice_terminal.application.web.time.monotonic", side_effect=[100, 161]):
+            token = self.web.issue_launch_token()
+            self.assertFalse(self.web.consume_launch_token(token))
+
+    def test_config_requires_session_and_does_not_issue_a_cookie(self):
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(self.web.origin + "/application-config.js")
+        self.assertEqual(error.exception.code, 403)
+        self.client.open(self.web.origin + "/desktop-entry?token=" + self.web.issue_launch_token()).close()
+        with self.client.open(self.web.origin + "/application-config.js") as response:
+            self.assertIn("window.__VOICE_APPLICATION__", response.read().decode())
+            self.assertIsNone(response.headers.get("Set-Cookie"))
+
+    def test_feedback_exists_before_any_business_process(self):
+        self.client.open(self.web.origin + "/desktop-entry?token=" + self.web.issue_launch_token()).close()
         with self.client.open(self.web.origin + "/api/v1/application/snapshot") as response:
             data = json.load(response)
         self.assertEqual(data["state"], "starting")
         self.assertEqual(self.app.processes, {})
 
     def test_occupied_host_port_uses_a_distinct_owned_listener(self):
-        second = HostWeb(self.app, Path(self.directory.name), port=self.web.server.server_port)
+        second_app = ApplicationHost(Path(self.directory.name))
+        second = HostWeb(second_app, Path(self.directory.name), port=self.web.server.server_port)
         second.start()
         try:
             self.assertNotEqual(second.origin, self.web.origin)
             self.assertNotEqual(second.session, self.web.session)
+            self.assertNotEqual(second.cookie_name, self.web.cookie_name)
             with urllib.request.urlopen(second.origin) as response:
-                self.assertEqual(response.status, 200)
+                self.assertIn("请通过桌面程序打开", response.read().decode())
         finally:
             second.close()
+            second_app.outer_job.close()
 
     def test_cookie_and_origin_are_required_for_mutations(self):
         with self.assertRaises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(self.web.origin + "/api/v1/application/snapshot")
         self.assertEqual(error.exception.code, 403)
-        self.client.open(self.web.origin).close()
+        self.client.open(self.web.origin + "/desktop-entry?token=" + self.web.issue_launch_token()).close()
         request = urllib.request.Request(self.web.origin + "/api/v1/application/exit", b"{}",
             {"Content-Type": "application/json", "Origin": "https://other.example"})
         with self.assertRaises(urllib.error.HTTPError) as error:
@@ -115,19 +184,168 @@ class WebTests(unittest.TestCase):
             self.client.open(request).close()
             exit_app.assert_called_once()
 
+    def test_repeated_instance_cookie_is_rejected_even_when_values_match(self):
+        duplicate = f"{self.web.cookie_name}={self.web.session}; {self.web.cookie_name}={self.web.session}"
+        request = urllib.request.Request(self.web.origin + "/api/v1/application/snapshot", headers={"Cookie": duplicate})
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        self.assertEqual(error.exception.code, 403)
+
+    def test_dev_proxy_mutations_match_actual_frontend_origin(self):
+        self.app.frontend_origin = "http://127.0.0.1:5173"
+        self.client.open(self.web.origin + "/desktop-entry?token=" + self.web.issue_launch_token()).close()
+        with patch.object(self.app, "request_exit") as exit_app:
+            request = urllib.request.Request(self.web.origin + "/api/v1/application/exit", b"{}",
+                {"Content-Type": "application/json", "Origin": self.app.frontend_origin})
+            self.client.open(request).close()
+            exit_app.assert_called_once()
+
     def test_sse_delivers_terminal_snapshot(self):
-        self.client.open(self.web.origin).close()
+        self.client.open(self.web.origin + "/desktop-entry?token=" + self.web.issue_launch_token()).close()
         self.app.state.update(state="stopped", stopping=True)
         with self.client.open(self.web.origin + "/api/v1/application/events", timeout=3) as response:
             line = response.readline().decode()
             self.assertEqual(json.loads(line[6:])["state"], "stopped")
 
     def test_internal_reports_do_not_accept_browser_session(self):
-        self.client.open(self.web.origin).close()
+        self.client.open(self.web.origin + "/desktop-entry?token=" + self.web.issue_launch_token()).close()
         request = urllib.request.Request(self.web.origin + "/internal/application/report", b"{}", {"Content-Type": "application/json"})
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.client.open(request)
         self.assertEqual(error.exception.code, 403)
+        request = urllib.request.Request(self.web.origin + "/internal/application/report", b"{}",
+            {"Content-Type": "application/json", "Authorization": "Bearer " + self.app.internal_token})
+        with patch.object(self.app, "report") as report:
+            with self.client.open(request) as response:
+                self.assertEqual(json.load(response), {"ok": True})
+            report.assert_called_once_with({})
+
+
+class FrontendReadinessTests(unittest.TestCase):
+    def setUp(self):
+        self.app = SimpleNamespace(frontend_cookie_name="voice_application_instance1",
+            frontend_session="private-session", state=SimpleNamespace(value={"instance_id": "instance-1"}))
+        self.process = SimpleNamespace(pid=123, created_at=100.0, poll=Mock(return_value=None))
+
+    @staticmethod
+    def listener(pid, ip="127.0.0.1", port=5173):
+        import psutil
+        return SimpleNamespace(status=psutil.CONN_LISTEN,
+            laddr=SimpleNamespace(ip=ip, port=port), pid=pid)
+
+    def test_other_listener_fails_before_sending_session_cookie(self):
+        owner = Mock()
+        owner.create_time.return_value = 100.0
+        owner.net_connections.return_value = []
+        with patch("psutil.Process", return_value=owner), \
+                patch("psutil.net_connections", return_value=[self.listener(456)]), \
+                patch("urllib.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(RuntimeError, "端口 5173 已被其他进程占用"):
+                _wait_for_frontend(self.app, self.process, timeout=1)
+        urlopen.assert_not_called()
+
+    def test_unbound_owned_process_waits_without_http_request(self):
+        owner = Mock()
+        owner.create_time.return_value = 100.0
+        owner.net_connections.return_value = []
+        with patch("psutil.Process", return_value=owner), \
+                patch("psutil.net_connections", return_value=[]), \
+                patch("voice_terminal.application.launch.time.monotonic", side_effect=[0, 0, 2]), \
+                patch("voice_terminal.application.launch.time.sleep"), \
+                patch("urllib.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(RuntimeError, "开发界面未能就绪"):
+                _wait_for_frontend(self.app, self.process, timeout=1)
+        urlopen.assert_not_called()
+
+    def test_owned_loopback_listener_is_checked_before_readiness_request(self):
+        owner = Mock()
+        owner.create_time.return_value = 100.0
+        owner.net_connections.return_value = [self.listener(123)]
+        payload = json.dumps({"pid": 123, "instance_id": "instance-1",
+            "origin": "http://127.0.0.1:5173", "frontend_mode": "product"}).encode()
+        with patch("psutil.Process", return_value=owner), \
+                patch("psutil.net_connections", return_value=[self.listener(123)]), \
+                patch("urllib.request.urlopen", return_value=io.BytesIO(payload)) as urlopen:
+            result = _wait_for_frontend(self.app, self.process, timeout=1)
+        self.assertEqual(result, "http://127.0.0.1:5173")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("Cookie"), "voice_application_instance1=private-session")
+
+    def test_reused_pid_with_different_creation_time_never_receives_cookie(self):
+        owner = Mock()
+        owner.create_time.return_value = 103.0
+        owner.net_connections.return_value = [self.listener(123)]
+        with patch("psutil.Process", return_value=owner), \
+                patch("urllib.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(RuntimeError, "created_at（进程创建时间）与本实例不匹配"):
+                _wait_for_frontend(self.app, self.process, timeout=1)
+        urlopen.assert_not_called()
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js（JavaScript 运行环境）测试工具不可用")
+class FallbackDiagnosticPageTests(unittest.TestCase):
+    def run_script(self, *, bridge: bool, status=None, click_exit=False):
+        match = re.search(r"<script>(.*?)</script>", FALLBACK_HTML, re.DOTALL)
+        self.assertIsNotNone(match)
+        harness = r"""
+const vm = require('node:vm')
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+const calls = [], timers = []
+class Element {
+  constructor(id) { this.id=id; this.children=[]; this.listeners={}; this.hidden=false; this.textContent=''; }
+  addEventListener(name, callback) { this.listeners[name]=callback }
+  append(child) { this.children.push(child) }
+  replaceChildren(...children) { this.children=children }
+}
+const elements = Object.fromEntries(['phase','components','retry','exit'].map(id => [id,new Element(id)]))
+const document = { getElementById:id => elements[id], createElement:tag => new Element(tag) }
+const window = { setInterval:(callback,delay) => { timers.push(delay); return timers.length } }
+if (input.bridge) window.__TAURI_INTERNALS__ = { invoke:async command => {
+  calls.push(command)
+  if (command === 'desktop_status') return input.status
+} }
+const fetch = async url => {
+  calls.push('fetch:'+url)
+  return { ok:true, json:async()=>({ phase:'running', components:[] }) }
+}
+vm.runInNewContext(input.script,{window,document,fetch})
+setImmediate(async()=>{
+  if (input.clickExit) await elements.exit.listeners.click()
+  process.stdout.write(JSON.stringify({calls,timers,phase:elements.phase.textContent,
+    exitHidden:elements.exit.hidden,retryHidden:elements.retry.hidden}))
+})
+"""
+        result = subprocess.run([shutil.which("node"), "-e", harness],
+            input=json.dumps({"script": match.group(1), "bridge": bridge, "status": status, "clickExit": click_exit}),
+            text=True, encoding="utf-8", capture_output=True, timeout=5, check=True)
+        return json.loads(result.stdout)
+
+    def test_missing_or_invalid_native_status_never_requests_host(self):
+        missing = self.run_script(bridge=False)
+        self.assertEqual(missing["calls"], [])
+        self.assertIn("请退出并重新启动桌面程序", missing["phase"])
+        failed = self.run_script(bridge=True,
+            status={"ready": True, "error": None, "frontend_mode": "ui-preview", "development": False})
+        self.assertEqual(failed["calls"], ["desktop_status"])
+        self.assertIn("请退出并重新启动桌面程序", failed["phase"])
+        self.assertEqual(failed["timers"], [])
+        invalid_development = self.run_script(bridge=True,
+            status={"ready": True, "error": None, "frontend_mode": "product", "development": "false"})
+        self.assertEqual(invalid_development["calls"], ["desktop_status"])
+        self.assertIn("请退出并重新启动桌面程序", invalid_development["phase"])
+        self.assertEqual(invalid_development["timers"], [])
+
+    def test_valid_product_status_gates_host_reads_and_exit_uses_native_command(self):
+        ready = self.run_script(bridge=True,
+            status={"ready": True, "error": None, "frontend_mode": "product", "development": False},
+            )
+        self.assertEqual(ready["calls"], ["desktop_status", "fetch:/api/v1/application/snapshot"])
+        self.assertEqual(ready["timers"], [2000])
+        # 与状态检查分开验证退出按钮只调用原生命令，不发送 Host（宿主）HTTP 请求。
+        exited = self.run_script(bridge=True,
+            status={"ready": True, "error": None, "frontend_mode": "product", "development": True},
+            click_exit=True)
+        self.assertEqual(exited["calls"], ["desktop_status", "fetch:/api/v1/application/snapshot", "exit_application"])
 
 
 class SupervisorTests(unittest.IsolatedAsyncioTestCase):
@@ -258,6 +476,30 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["total_memory_private_commit_bytes"], rows["host"]["memory_private_commit_bytes"])
         app.outer_job.close()
 
+    async def test_dev_server_gets_cookie_handshake_but_not_internal_bearer_token(self):
+        app = ApplicationHost(Path.cwd())
+        app.origin = "http://127.0.0.1:8764"
+        app.frontend_origin = "http://127.0.0.1:5173"
+        app.frontend_cookie_name = "voice_application_instance"
+        app.frontend_session = "frontend-session-secret"
+        app.internal_token = "host-internal-secret"
+        captured = {}
+        def process(command, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(pid=123, created_at=456)
+        try:
+            with patch("voice_terminal.application.supervisor.ManagedProcess", side_effect=process):
+                app.spawn("dev", ["node", "scripts/frontend-dev.mjs"])
+            env = captured["env"]
+            self.assertEqual(env["VOICE_APP_ORIGIN"], app.origin)
+            self.assertEqual(env["VOICE_WEB_ORIGINS"], app.frontend_origin)
+            self.assertEqual(env["VOICE_FRONTEND_COOKIE_NAME"], app.frontend_cookie_name)
+            self.assertEqual(env["VOICE_FRONTEND_SESSION"], app.frontend_session)
+            self.assertEqual(env["VOICE_APP_INSTANCE_ID"], app.state.value["instance_id"])
+            self.assertNotIn("VOICE_APP_INTERNAL_TOKEN", env)
+        finally:
+            app.outer_job.close()
+
     async def test_memory_totals_deduplicate_child_components_and_exclude_external_process(self):
         """共享进程与已列出的子组件只计一次，外部调试进程不计入总量。"""
         app = ApplicationHost(Path.cwd())
@@ -364,6 +606,29 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         app.report({"component": "speaker", "generation": "old", "phase": "过期事件"})
         self.assertNotEqual(next(c for c in app.state.snapshot()["components"] if c["id"] == "speaker")["phase"], "过期事件")
         app.outer_job.close()
+
+
+class LaunchModeTests(unittest.TestCase):
+    def test_headless_mode_keeps_useful_backend_options(self):
+        args = parse_args(["--headless", "--python", "python.exe", "--config", "custom.yaml",
+            "--llm-provider", "deepseek", "--no-worker", "--no-analysis", "--data-dir", "data"])
+        self.assertTrue(args.headless)
+        self.assertFalse(args.desktop_managed)
+        self.assertTrue(args.no_worker)
+        self.assertTrue(args.no_analysis)
+        self.assertEqual(args.llm_provider, "deepseek")
+        self.assertEqual(args.data_dir, Path("data"))
+
+    def test_gui_entry_requires_desktop_owner_and_rejects_obsolete_browser_switches(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--root", "."])
+        with self.assertRaises(SystemExit):
+            parse_args(["--headless", "--no-browser"])
+        with self.assertRaises(SystemExit):
+            parse_args(["--headless", "--dev"])
+        args = parse_args(["--desktop-managed", "--dev"])
+        self.assertTrue(args.desktop_managed)
+        self.assertTrue(args.dev)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows lifecycle（Windows 生命周期）测试")

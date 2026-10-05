@@ -23,6 +23,54 @@ def script(name):
     return module
 
 
+def frontend_build(path):
+    """建立最小产品构建闭包，用于验证正式组装边界。"""
+    (path / 'assets').mkdir(parents=True)
+    (path / 'index.html').write_text('<script src="/assets/main.js"></script>', encoding='utf-8')
+    (path / 'assets/main.js').write_text('import("./product.js")', encoding='utf-8')
+    (path / 'assets/product.js').write_text('product()', encoding='utf-8')
+    (path / 'assets/product.css').write_text('body{}', encoding='utf-8')
+    atomic_json(path / 'desktop-manifest.json', {
+        'index.html': {'isEntry': True, 'file': 'assets/main.js', 'dynamicImports': ['product']},
+        'product': {'file': 'assets/product.js', 'css': ['assets/product.css']},
+    })
+
+
+def test_frontend_collection_only_copies_product_dependency_closure(tmp_path):
+    source, target = tmp_path / '构建', tmp_path / '发布'
+    frontend_build(source)
+    script('assemble-desktop').collect_frontend(source, target)
+    assert {path.relative_to(target).as_posix() for path in target.rglob('*') if path.is_file()} == {
+        'index.html', 'desktop-manifest.json', 'assets/main.js', 'assets/product.js', 'assets/product.css',
+    }
+
+
+@pytest.mark.parametrize('extra', ['ui-demo.html', 'assets/fixture.js', 'frontend-dev.mjs'])
+def test_frontend_collection_rejects_preview_or_stale_artifacts(tmp_path, extra):
+    source, target = tmp_path / '构建', tmp_path / '发布'
+    frontend_build(source)
+    (source / extra).write_text('不能进入正式包', encoding='utf-8')
+    with pytest.raises(ValueError, match='样例|陈旧'):
+        script('assemble-desktop').collect_frontend(source, target)
+    assert not target.exists()
+
+
+def test_frontend_collection_rejects_additional_entry_and_preview_dependency(tmp_path):
+    source = tmp_path / '构建'
+    frontend_build(source)
+    records = json.loads((source / 'desktop-manifest.json').read_text())
+    records['ui-demo.html'] = {'isEntry': True, 'file': 'assets/product.js'}
+    atomic_json(source / 'desktop-manifest.json', records)
+    with pytest.raises(ValueError, match='只有产品入口'):
+        script('assemble-desktop').collect_frontend(source, tmp_path / '发布')
+    records.pop('ui-demo.html')
+    records['index.html']['dynamicImports'] = ['src/ui-demo/main.ts']
+    records['src/ui-demo/main.ts'] = {'file': 'assets/product.js'}
+    atomic_json(source / 'desktop-manifest.json', records)
+    with pytest.raises(ValueError, match='样例'):
+        script('assemble-desktop').collect_frontend(source, tmp_path / '发布')
+
+
 def candidate(root):
     app = root / 'apps/current'
     app.mkdir(parents=True)

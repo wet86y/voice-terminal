@@ -1,7 +1,6 @@
-"""Host HTTP surface（宿主网页接口）：模型启动前即可使用的反馈入口。"""
+"""Host HTTP surface（宿主网页接口）：会话受限的桌面入口和启动诊断。"""
 from __future__ import annotations
 
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -10,67 +9,178 @@ import secrets
 import socket
 import threading
 import time
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
+
+
+PUBLIC_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Voice Terminal · 桌面应用</title><style>body{background:#101217;color:#edf0f6;font:16px system-ui;max-width:760px;margin:16vh auto;padding:24px}main{border:1px solid #30384b;background:#181c27;padding:32px;border-radius:18px}p{color:#aeb7c9;line-height:1.8}</style>
+<main><h1>Voice Terminal · 语音终端</h1><p>请通过桌面程序打开。此地址不提供网页业务入口。</p></main></html>"""
 
 FALLBACK_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Voice Terminal · 启动诊断</title><style>body{background:#101217;color:#edf0f6;font:16px system-ui;max-width:920px;margin:60px auto;padding:24px}button{padding:10px;margin:8px;background:#30384b;color:white;border:0;border-radius:8px}li{padding:12px;white-space:pre-wrap}small{color:#aaa}</style>
-<h1>Voice Terminal · 系统运行</h1><p>网页构建产物尚未准备好。请在项目内执行 npm run build（构建网页）。</p><p id="phase">连接启动程序…</p><ul id="components"></ul><button onclick="location.reload()">重新打开工作台</button><button id="exit">退出应用</button>
-<script>const labels={waiting:'等待启动',starting:'启动中',ready:'运行正常',disabled:'已停用',failed:'需要检查',blocked:'依赖不可用',external:'外部进程',stopping:'退出中',stopped:'已退出'};async function refresh(){try{const s=await(await fetch('/api/v1/application/snapshot')).json();document.getElementById('phase').textContent=s.phase;const list=document.getElementById('components');list.replaceChildren();for(const c of s.components){const li=document.createElement('li');li.textContent=c.name+' · '+(labels[c.state]||'不可用')+' · '+c.phase+(c.error?'\\n'+c.error:'');if(c.retry_allowed){const b=document.createElement('button');b.textContent='重试';b.onclick=()=>fetch('/api/v1/application/components/'+c.id+'/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});li.append(b)}list.append(li)}}catch{document.getElementById('phase').textContent='应用已退出或连接中断'}}refresh();setInterval(refresh,2000);document.getElementById('exit').onclick=()=>fetch('/api/v1/application/exit',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});</script></html>"""
+<h1>Voice Terminal · 系统运行</h1><p>界面服务尚未准备好，当前显示应用宿主的启动诊断。</p><p id="phase">正在验证桌面启动程序…</p><ul id="components"></ul><button id="retry" hidden>重新检查桌面程序</button><button id="exit" hidden>退出应用</button>
+<script>
+const labels={waiting:'等待启动',starting:'启动中',ready:'运行正常',disabled:'已停用',failed:'需要检查',blocked:'依赖不可用',external:'外部进程',stopping:'退出中',stopped:'已退出'};
+const bridge=window.__TAURI_INTERNALS__;
+const phase=document.getElementById('phase'),list=document.getElementById('components'),retry=document.getElementById('retry'),exit=document.getElementById('exit');
+let busy=false,monitoring=false;
+function statusError(status){
+  if(!status||typeof status!=='object'||Array.isArray(status))return '桌面启动程序返回了无效状态。';
+  if(typeof status.error==='string'&&status.error.trim())return status.error;
+  if(status.error!==null&&status.error!=='')return '桌面启动程序的错误状态无效。';
+  if(status.ready!==true)return '桌面启动程序尚未就绪。';
+  if(status.frontend_mode!=='product')return '当前窗口不是产品界面入口。';
+  if(typeof status.development!=='boolean')return '桌面启动程序的开发标识无效。';
+  return '';
+}
+async function verifyDesktop(){
+  if(!bridge||typeof bridge.invoke!=='function')throw new Error('没有检测到桌面原生命令桥。');
+  const status=await bridge.invoke('desktop_status'),problem=statusError(status);
+  if(problem)throw new Error(problem);
+}
+function restartPrompt(reason){
+  phase.textContent='请退出并重新启动桌面程序。'+(reason?' '+reason:'');
+  list.replaceChildren();
+  retry.hidden=!bridge||typeof bridge.invoke!=='function';
+  exit.hidden=!bridge||typeof bridge.invoke!=='function';
+}
+async function refresh(){
+  if(busy)return;
+  busy=true;
+  try{
+    await verifyDesktop();
+    const response=await fetch('/api/v1/application/snapshot',{cache:'no-store'});
+    if(!response.ok)throw new Error('应用状态连接不可用。');
+    const snapshot=await response.json();
+    phase.textContent=snapshot.phase;
+    list.replaceChildren();
+    for(const component of snapshot.components){
+      const item=document.createElement('li');
+      item.textContent=component.name+' · '+(labels[component.state]||'不可用')+' · '+component.phase+(component.error?'\\n'+component.error:'');
+      if(component.retry_allowed){
+        const button=document.createElement('button');
+        button.textContent='重试';
+        button.addEventListener('click',async()=>{
+          try{
+            await verifyDesktop();
+            await fetch('/api/v1/application/components/'+component.id+'/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+            await refresh();
+          }catch(error){restartPrompt(error instanceof Error?error.message:'桌面操作失败。');}
+        });
+        item.append(button);
+      }
+      list.append(item);
+    }
+    retry.hidden=true;
+    exit.hidden=false;
+    if(!monitoring){monitoring=true;window.setInterval(()=>void refresh(),2000);}
+  }catch(error){restartPrompt(error instanceof Error?error.message:'桌面启动程序不可用。');}
+  finally{busy=false;}
+}
+retry.addEventListener('click',()=>void refresh());
+exit.addEventListener('click',async()=>{
+  if(!bridge||typeof bridge.invoke!=='function')return;
+  exit.disabled=true;
+  try{await bridge.invoke('exit_application');}
+  catch(error){exit.disabled=false;restartPrompt(error instanceof Error?error.message:'无法退出桌面应用。');}
+});
+if(!bridge||typeof bridge.invoke!=='function')restartPrompt('请从桌面应用重新打开。');
+else void refresh();
+</script></html>"""
 
 
 class HostWeb:
+    """HostWeb（宿主网页）：私网 UI 会话只由一次性桌面令牌建立。"""
+
+    launch_token_lifetime_seconds = 60  # launch_token_lifetime_seconds（入口令牌有效秒数）。
+
     def __init__(self, application, directory: Path, *, port: int = 5173) -> None:
         self.application = application
         self.directory = directory.resolve()
-        self.session = secrets.token_urlsafe(32)
+        self.instance_id = str(application.state.value["instance_id"])  # instance_id（应用实例标识）。
+        self.session = secrets.token_urlsafe(32)  # session（随机浏览器会话凭据）。
+        # cookie_name（浏览器会话 Cookie 名称）：每个应用实例有各自的名字，避免旧实例 Cookie 串用。
+        self.cookie_name = "voice_application_" + "".join(c for c in self.instance_id if c.isalnum())
+        self._token_lock = threading.Lock()  # _token_lock（入口令牌原子消费锁）。
+        self._launch_tokens: dict[str, float] = {}  # _launch_tokens（入口令牌到单调时钟过期点的映射）。
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
             def log_message(self, *_args):
+                # 入口 URL 含短期启动令牌，HTTP 访问日志一律关闭。
                 pass
 
-            def send(self, data: bytes, content_type: str, status: int = 200, *, cookie: bool = False):
+            def send(self, data: bytes, content_type: str, status: int = 200, *, set_cookie: bool = False,
+                     referrer_policy: str | None = None):
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
-                if cookie:
-                    self.send_header("Set-Cookie", f"voice_application={owner.session}; Path=/; HttpOnly; SameSite=Strict")
+                if referrer_policy:
+                    self.send_header("Referrer-Policy", referrer_policy)
+                if set_cookie:
+                    # session（浏览器会话凭据）不持久化，且脚本不能读取。
+                    self.send_header("Set-Cookie", f"{owner.cookie_name}={owner.session}; Path=/; HttpOnly; SameSite=Strict")
                 self.end_headers()
-                try:
-                    self.wfile.write(data)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+                if not getattr(self, "_suppress_body", False):
+                    try:
+                        self.wfile.write(data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
 
             def data(self, value, status: int = 200):
                 self.send(json.dumps(value, ensure_ascii=False).encode(), "application/json; charset=utf-8", status)
 
+            def host_matches(self) -> bool:
+                return self.headers.get("Host") == urlsplit(owner.origin).netloc
+
+            def has_session(self) -> bool:
+                matches = []
+                for part in self.headers.get("Cookie", "").split(";"):
+                    item = part.strip()
+                    name, separator, value = item.partition("=")
+                    if name == owner.cookie_name:
+                        matches.append((bool(separator), value))
+                if len(matches) != 1 or not matches[0][0]:
+                    return False
+                try:
+                    return secrets.compare_digest(matches[0][1], owner.session)
+                except TypeError:
+                    return False
+
             def allowed(self, *, mutation=False, internal=False) -> bool:
-                if self.headers.get("Host") != urlsplit(owner.origin).netloc:
+                if not self.host_matches():
                     return False
                 if internal:
-                    return secrets.compare_digest(self.headers.get("Authorization", ""), "Bearer " + owner.application.internal_token)
-                cookie = SimpleCookie()
-                try:
-                    cookie.load(self.headers.get("Cookie", ""))
-                    valid = secrets.compare_digest(cookie["voice_application"].value, owner.session)
-                except (KeyError, ValueError):
-                    valid = False
+                    try:
+                        return secrets.compare_digest(self.headers.get("Authorization", ""), "Bearer " + owner.application.internal_token)
+                    except TypeError:
+                        return False
+                valid = self.has_session()
+                expected_origin = getattr(owner.application, "frontend_origin", "") or owner.origin
                 if mutation:
-                    valid = valid and self.headers.get("Origin") == owner.origin
+                    # origin（请求来源）既接受直连 Host，也接受受管代理改写后的 Host 来源或实际界面来源。
+                    valid = valid and self.headers.get("Origin") in {owner.origin, expected_origin}
                 return valid
 
             def do_GET(self):
-                path = urlsplit(self.path).path
-                if self.headers.get("Host") != urlsplit(owner.origin).netloc:
+                parsed = urlsplit(self.path)
+                path = parsed.path
+                if not self.host_matches():
                     self.data({"error": "网页来源不匹配"}, 403)
                     return
-                if path.startswith("/api/v1/application/"):
+                if path == "/desktop-entry":
+                    self.desktop_entry(parsed.query)
+                    return
+                if path in ("/", "/index.html") and not self.has_session():
+                    self.send(PUBLIC_HTML.encode(), "text/html; charset=utf-8", referrer_policy="no-referrer")
+                    return
+                if path == "/api/v1/application" or path.startswith("/api/v1/application/"):
                     if not self.allowed():
-                        self.data({"error": "应用会话无效，请重新打开页面"}, 403)
+                        self.data({"error": "应用会话无效，请通过桌面程序重新打开"}, 403)
                         return
                     if path == "/api/v1/application/snapshot":
                         self.data(owner.application.state.snapshot())
@@ -80,26 +190,74 @@ class HostWeb:
                         self.data({"error": "接口不存在"}, 404)
                     return
                 if path == "/application-config.js":
+                    if not self.allowed():
+                        self.data({"error": "应用会话无效，请通过桌面程序重新打开"}, 403)
+                        return
                     snapshot = owner.application.state.snapshot()
-                    config = {"managed": True, "origin": owner.origin,
+                    # config（前端连接配置）字段：managed（受管标识）、origin（界面来源）、voice_api_url（语音接口）、voice_ws_url（实时语音接口）。
+                    config = {"managed": True, "origin": getattr(owner.application, "frontend_origin", "") or owner.origin,
                         "voice_api_url": snapshot["voice_api_url"], "voice_ws_url": snapshot["voice_ws_url"]}
-                    self.send(("window.__VOICE_APPLICATION__=" + json.dumps(config) + ";").encode(), "text/javascript", cookie=True)
+                    self.send(("window.__VOICE_APPLICATION__=" + json.dumps(config) + ";").encode(), "text/javascript; charset=utf-8")
+                    return
+                # 业务资产只有在一次性桌面握手建立的会话下才可读取。
+                if not self.allowed():
+                    self.data({"error": "请通过桌面程序打开"}, 403)
                     return
                 target = (owner.directory / unquote(path).lstrip("/")).resolve()
                 if not target.is_relative_to(owner.directory):
                     self.data({"error": "路径无效"}, 404)
                     return
-                if path == "/" or not Path(path).suffix:
+                if path in ("/", "/index.html") or not Path(path).suffix:
                     target = owner.directory / "index.html"
                 if target.is_file():
-                    content = target.read_bytes()
-                    if target.name == "index.html":
-                        content = content.replace(b"<head>", b'<head><script src="/application-config.js"></script>', 1)
-                    self.send(content, mimetypes.guess_type(target.name)[0] or "application/octet-stream", cookie=target.name == "index.html")
-                elif path == "/" or not Path(path).suffix:
-                    self.send(FALLBACK_HTML.encode(), "text/html; charset=utf-8", cookie=True)
+                    self.send(target.read_bytes(), mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+                elif path in ("/", "/index.html") or not Path(path).suffix:
+                    self.send(FALLBACK_HTML.encode(), "text/html; charset=utf-8")
                 else:
                     self.data({"error": "文件不存在"}, 404)
+
+            def do_HEAD(self):
+                if not self.host_matches():
+                    self.data({"error": "网页来源不匹配"}, 403)
+                    return
+                path = urlsplit(self.path).path
+                if path == "/desktop-entry" or path == "/api/v1/application/events":
+                    self.data({"error": "不支持此接口方法"}, 405)
+                    return
+                self._suppress_body = True
+                self.do_GET()
+
+            def unsupported_method(self):
+                path = urlsplit(self.path).path
+                if not self.host_matches() or not self.allowed(mutation=True):
+                    self.data({"error": "不允许的应用操作"}, 403)
+                    return
+                self.data({"error": "不支持此接口方法"}, 405)
+
+            def do_OPTIONS(self):
+                self.unsupported_method()
+
+            def do_PUT(self):
+                self.unsupported_method()
+
+            def do_PATCH(self):
+                self.unsupported_method()
+
+            def do_DELETE(self):
+                self.unsupported_method()
+
+            def desktop_entry(self, query: str) -> None:
+                parameters = parse_qs(query, keep_blank_values=True)
+                values = parameters.get("token", [])
+                if len(parameters) != 1 or len(values) != 1 or not values[0] or not owner.consume_launch_token(values[0]):
+                    self.send("入口令牌无效或已使用，请通过桌面程序重新打开。".encode(), "text/plain; charset=utf-8", 403,
+                              referrer_policy="no-referrer")
+                    return
+                # 页面脚本只负责同源 replace，不携带令牌，也不会触发跨站 303 重定向。
+                body = ("<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\">"
+                        "<meta name=\"referrer\" content=\"no-referrer\"><title>正在打开</title>"
+                        "<body><p>正在打开 Voice Terminal…</p><script>location.replace('/')</script></body></html>")
+                self.send(body.encode(), "text/html; charset=utf-8", set_cookie=True, referrer_policy="no-referrer")
 
             def events(self):
                 self.send_response(200)
@@ -171,8 +329,24 @@ class HostWeb:
         except OSError:
             self.server = OwnedServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
-        self.origin = f"http://127.0.0.1:{self.server.server_port}"
-        self.closed = False
+        self.origin = f"http://127.0.0.1:{self.server.server_port}"  # origin（宿主内部监听地址）。
+        self.closed = False  # closed（宿主服务是否已关闭）。
+
+    def issue_launch_token(self) -> str:
+        """issue_launch_token（签发入口令牌）：生成只能兑换一次的 60 秒桌面凭据。"""
+        now = time.monotonic()
+        token = secrets.token_urlsafe(32)
+        with self._token_lock:
+            self._launch_tokens = {value: expiry for value, expiry in self._launch_tokens.items() if expiry > now}
+            self._launch_tokens[token] = now + self.launch_token_lifetime_seconds
+        return token
+
+    def consume_launch_token(self, token: str) -> bool:
+        """consume_launch_token（消费入口令牌）：锁内删除，避免并发重复兑换。"""
+        now = time.monotonic()
+        with self._token_lock:
+            expiry = self._launch_tokens.pop(token, None)
+            return expiry is not None and expiry > now
 
     def start(self):
         threading.Thread(target=self.server.serve_forever, daemon=True, name="application-web").start()

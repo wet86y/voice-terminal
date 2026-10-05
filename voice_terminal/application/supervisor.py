@@ -27,12 +27,12 @@ log = logging.getLogger(__name__)
 
 class ApplicationHost:
     def __init__(self, root: Path, *, python: str = "", config: str = "config/local.yaml",
-                 no_worker=False, no_analysis=False, no_web=False, llm_provider="") -> None:
+                 no_worker=False, no_analysis=False, llm_provider="") -> None:
         self.root, self.config = root, config
         from ..paths import AppPaths
         self.paths = AppPaths.resolve(root)
         self.python_option = python
-        self.no_worker, self.no_analysis, self.no_web = no_worker, no_analysis, no_web
+        self.no_worker, self.no_analysis = no_worker, no_analysis
         self.llm_provider = llm_provider
         self.state = ApplicationState()
         self.internal_token = secrets.token_urlsafe(48)
@@ -40,6 +40,9 @@ class ApplicationHost:
         self.generations: dict[str, str] = {}
         self.manifest = {}
         self.origin = ""
+        self.frontend_origin = ""  # frontend_origin（受管界面来源）：界面服务对业务 API 的可信来源。
+        self.frontend_cookie_name = ""  # frontend_cookie_name（实例专属会话 Cookie 名称）。
+        self.frontend_session = ""  # frontend_session（仅供开发代理握手的会话值）。
         self.python = ""
         self.loop = None
         self.outer_job = Job()
@@ -48,6 +51,7 @@ class ApplicationHost:
         self.cpu_samples = {}
         self.background = set()
         self.dev = False
+        self.headless = False  # headless（无界面模式）：保留 Host 内部报告，不要求网页构建产物。
         self.frontend_error = ""
         self.exit_callback = None  # exit_callback（桌面外壳的退出协调回调）。
         self.shutdown_deadline = None  # shutdown_deadline（统一退出的单调时钟截止时间）。
@@ -102,7 +106,15 @@ class ApplicationHost:
         self.generations[key] = generation
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1",
             "VOICE_APP_ORIGIN": self.origin, "VOICE_APP_INTERNAL_TOKEN": self.internal_token,
-            "VOICE_APP_SERVICE_GENERATION": generation, "VOICE_WEB_ORIGINS": self.origin}
+            "VOICE_APP_SERVICE_GENERATION": generation,
+            "VOICE_WEB_ORIGINS": self.frontend_origin or self.origin}
+        if key == "dev":
+            # Node（界面开发服务）只需来源、实例标识和会话转发值，不应继承内部 Bearer 凭据。
+            env.pop("VOICE_APP_INTERNAL_TOKEN", None)
+            env.pop("VOICE_APP_SERVICE_GENERATION", None)
+            env.update(VOICE_FRONTEND_COOKIE_NAME=self.frontend_cookie_name,
+                       VOICE_FRONTEND_SESSION=self.frontend_session,
+                       VOICE_APP_INSTANCE_ID=self.state.value["instance_id"])
         env.update(self.paths.environment())
         env["VOICE_APP_INSTANCE_ID"] = self.state.value["instance_id"]
         env["VOICE_RESOURCE_POLICY"] = os.environ.get("VOICE_RESOURCE_POLICY", str(self.paths.config / "runtime-resources.json"))
@@ -167,12 +179,15 @@ class ApplicationHost:
         api = f"http://127.0.0.1:{self.manifest['voice_port']}"
         self.state.update(voice_api_url=api, voice_ws_url=api.replace("http:", "ws:") + "/ws")
         self.state.component("setup", state="ready", phase="配置与运行环境已确认")
-        if self.frontend_error:
-            self.state.component("web", state="failed", phase="网页入口诊断", error=self.frontend_error)
-        elif not self.dev and not self.no_web and not (self.root / "apps/web/dist/index.html").is_file():
-            self.state.component("web", state="failed", phase="使用内置诊断页", error="缺少网页构建产物，请执行 npm run build（构建网页）。")
+        if self.headless:
+            self.state.component("web", state="ready", required=False,
+                phase="无界面模式，仅接收宿主内部报告", error="")
+        elif self.frontend_error:
+            self.state.component("web", state="failed", phase="界面入口诊断", error=self.frontend_error)
+        elif not self.dev and not (self.root / "apps/frontend/dist/index.html").is_file():
+            self.state.component("web", state="failed", phase="使用内置诊断页", error="缺少界面构建产物，请执行 npm run build（构建界面）。")
         else:
-            self.state.component("web", state="ready", phase="网页入口已就绪", error="")
+            self.state.component("web", state="ready", phase="界面入口已就绪", error="")
 
     @staticmethod
     def port_busy(address: str) -> bool:
@@ -345,10 +360,10 @@ class ApplicationHost:
                 self.state.component(key, state="starting", error="", phase="恢复组件")
                 if key == "web":
                     if self.dev:
-                        raise RuntimeError("请重启独立启动程序恢复开发网页；当前诊断入口仍可使用。")
-                    if not (self.root / "apps/web/dist/index.html").is_file():
-                        raise RuntimeError("缺少网页构建产物，请先执行 npm run build（构建网页）")
-                    self.state.component("web", state="ready", phase="网页构建产物已就绪", error="")
+                        raise RuntimeError("请重启桌面程序恢复开发界面；当前诊断入口仍可使用。")
+                    if not (self.root / "apps/frontend/dist/index.html").is_file():
+                        raise RuntimeError("缺少界面构建产物，请先执行 npm run build（构建界面）")
+                    self.state.component("web", state="ready", phase="界面构建产物已就绪", error="")
                 elif key == "setup":
                     # 已存在的组件保留所有权，重新检查后只恢复失败项。
                     await self.setup()
@@ -498,7 +513,7 @@ class ApplicationHost:
             await asyncio.sleep(2)
 
     async def shutdown(self):
-        # 总退出预算 15 秒，预留 1 秒发布最终状态并关闭网页、托盘及单实例锁。
+        # 总退出预算 15 秒，预留 1 秒发布最终状态并关闭宿主界面入口。
         deadline = min(time.monotonic() + 14, self.shutdown_deadline or float("inf"))
         self.state.update(stopping=True, state="stopping", core_available=False, phase="正在退出并回收组件")
         for task in tuple(self.background):
