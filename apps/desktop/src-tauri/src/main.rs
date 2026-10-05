@@ -14,6 +14,7 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    webview::PageLoadEvent,
     Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 use voice_desktop_common::{windows::Job, LaunchContext};
@@ -80,6 +81,7 @@ struct Desktop {
     development: bool,              // development（是否由调试构建运行）。
     instance_identifier: String,    // instance_identifier（按模式和源码根目录隔离的单实例标识）。
     service: Mutex<Option<Service>>,
+    service_requested: AtomicBool, // service_requested（主窗口已请求启动服务，刷新不重复启动）。
     origin: Mutex<Option<String>>,
     launch_token: Mutex<Option<String>>, // launch_token（当前入口的一次性启动凭据）。
     error: Mutex<Option<String>>,
@@ -156,16 +158,33 @@ impl Desktop {
     }
 }
 
+fn boot_page_url(url: &tauri::Url) -> bool {
+    ["/", "/index.html"].contains(&url.path())
+        && ((url.scheme() == "tauri" && url.host_str() == Some("localhost"))
+            || (url.scheme() == "http"
+                && url.host_str() == Some("tauri.localhost")
+                && url.port().is_none()))
+}
+
+// request_service_start（首次主页面加载后请求服务）：刷新及业务导航不会再次启动。
+fn request_service_start(
+    url: &tauri::Url,
+    event: PageLoadEvent,
+    requested: &AtomicBool,
+    stopping: &AtomicBool,
+) -> bool {
+    event == PageLoadEvent::Finished
+        && boot_page_url(url)
+        && !stopping.load(Ordering::SeqCst)
+        && !requested.swap(true, Ordering::SeqCst)
+}
+
 fn trusted(window: &WebviewWindow, state: &Desktop) -> Result<(), String> {
     if window.label() != "main" {
         return Err("此窗口没有桌面操作权限。".into());
     }
     let url = window.url().map_err(|e| e.to_string())?;
-    if (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
-        || (url.scheme() == "http"
-            && url.host_str() == Some("tauri.localhost")
-            && url.port().is_none())
-    {
+    if boot_page_url(&url) {
         return Ok(());
     }
     if !state.stopping.load(Ordering::SeqCst)
@@ -478,6 +497,11 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
         .stdout(Stdio::piped())
         .stderr(output);
     let job = Job::new()?;
+    // 与退出流程共用锁，防止主窗口提前关闭后仍建立后台服务。
+    let mut service_slot = state.service.lock().map_err(|error| error.to_string())?;
+    if state.stopping.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let mut child = command.spawn().map_err(|e| {
         format!(
             "{} 启动失败：{e}",
@@ -495,7 +519,8 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
     }
     let reader = BufReader::new(child.stdout.take().ok_or("缺少服务控制管道")?);
     let input = child.stdin.take().ok_or("缺少服务控制管道")?;
-    *state.service.lock().unwrap() = Some(Service { child, input, job });
+    *service_slot = Some(Service { child, input, job });
+    drop(service_slot);
     // protocol（私有协议版本）、kind（消息类型）；Node（脚本运行时）与 Python（后端语言）均接收 start（启动）。
     state.send(serde_json::json!({"protocol":1,"kind":"start"}))?;
     if state.mode == FrontendMode::Product {
@@ -677,6 +702,7 @@ fn run() -> Result<(), String> {
         development: cfg!(debug_assertions),
         instance_identifier,
         service: Mutex::new(None),
+        service_requested: AtomicBool::new(false),
         origin: Mutex::new(None),
         launch_token: Mutex::new(None),
         error: Mutex::new(None),
@@ -697,6 +723,7 @@ fn run() -> Result<(), String> {
         ])
         .setup(move |app| {
             let navigation_state = build_state.clone();
+            let page_state = build_state.clone();
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title(if build_state.mode == FrontendMode::UiPreview {
                     "Voice Terminal · 前端演示（无业务后端）"
@@ -712,6 +739,25 @@ fn run() -> Result<(), String> {
                             && url.host_str() == Some("tauri.localhost")
                             && url.port().is_none())
                         || navigation_state.allows_frontend_url(url)
+                })
+                .on_page_load(move |window, payload| {
+                    if !request_service_start(
+                        payload.url(),
+                        payload.event(),
+                        &page_state.service_requested,
+                        &page_state.stopping,
+                    ) {
+                        return;
+                    }
+                    // 最终主窗口的本地界面已加载，再从后台线程准备业务或演示服务。
+                    let _ = window.show();
+                    let service_app = window.app_handle().clone();
+                    let service_state = page_state.clone();
+                    std::thread::spawn(move || {
+                        if let Err(error) = start_service(service_app, service_state.clone()) {
+                            *service_state.error.lock().unwrap() = Some(error);
+                        }
+                    });
                 })
                 .build()?;
             if build_state.mode == FrontendMode::Product {
@@ -753,9 +799,6 @@ fn run() -> Result<(), String> {
                     })
                     .build(app);
                 build_state.tray.store(tray.is_ok(), Ordering::SeqCst);
-            }
-            if let Err(error) = start_service(app.handle().clone(), build_state.clone()) {
-                *build_state.error.lock().unwrap() = Some(error);
             }
             Ok(())
         })
@@ -801,9 +844,69 @@ mod tests {
     use super::{
         command_allowed, console_url, frontend_entry_url, instance_identifier,
         preview_entry_url_allowed, preview_page_url_allowed, product_entry_url_allowed,
-        product_page_url_allowed, require_command, ui_preview_context, valid_instance_id,
-        valid_launch_token, DesktopCommand, FrontendMode,
+        product_page_url_allowed, request_service_start, require_command, ui_preview_context,
+        valid_instance_id, valid_launch_token, DesktopCommand, FrontendMode,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tauri::webview::PageLoadEvent;
+
+    #[test]
+    fn services_start_only_once_after_the_final_main_window_page_loaded() {
+        for address in [
+            "http://tauri.localhost/",
+            "tauri://localhost/",
+            "http://tauri.localhost/index.html",
+            "tauri://localhost/index.html",
+        ] {
+            let url = tauri::Url::parse(address).unwrap();
+            let requested = AtomicBool::new(false);
+            let stopping = AtomicBool::new(false);
+            assert!(!request_service_start(
+                &url,
+                PageLoadEvent::Started,
+                &requested,
+                &stopping
+            ));
+            assert!(request_service_start(
+                &url,
+                PageLoadEvent::Finished,
+                &requested,
+                &stopping
+            ));
+            assert!(!request_service_start(
+                &url,
+                PageLoadEvent::Finished,
+                &requested,
+                &stopping
+            ));
+        }
+    }
+
+    #[test]
+    fn closing_main_window_and_remote_pages_never_start_services() {
+        let requested = AtomicBool::new(false);
+        let stopping = AtomicBool::new(false);
+        for address in [
+            "http://127.0.0.1:5174/ui-demo.html",
+            "http://127.0.0.1:5173/",
+            "http://tauri.localhost/other",
+        ] {
+            assert!(!request_service_start(
+                &tauri::Url::parse(address).unwrap(),
+                PageLoadEvent::Finished,
+                &requested,
+                &stopping
+            ));
+        }
+        stopping.store(true, Ordering::SeqCst);
+        assert!(!request_service_start(
+            &tauri::Url::parse("http://tauri.localhost/index.html").unwrap(),
+            PageLoadEvent::Finished,
+            &requested,
+            &stopping
+        ));
+        assert!(!requested.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn console_url_preserves_launch_token() {

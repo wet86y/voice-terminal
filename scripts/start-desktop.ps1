@@ -15,6 +15,9 @@ function Invoke-DesktopBuild {
 
 if ($MyInvocation.InvocationName -ne '.') {
   $ErrorActionPreference = 'Stop'
+  # Windows PowerShell（系统脚本环境）默认编码随系统变化；演示启动日志固定 UTF-8（统一字符编码）。
+  $OutputEncoding = [Text.UTF8Encoding]::new($false)
+  try { [Console]::OutputEncoding = $OutputEncoding } catch { }
   $DesktopRepo = Split-Path -Parent $PSScriptRoot
   $Executable = Join-Path $DesktopRepo 'apps/desktop/target/debug/VoiceTerminalDesktop.exe'
   if ($UiPreview -and ($Dev -or $Diagnostic -or $Python -or $DataDir -or $InstallRoot)) {
