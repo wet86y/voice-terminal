@@ -15,9 +15,10 @@ from pathlib import Path
 from typing import Literal
 
 from ..config import DshConfig
-from ..paths import AppPaths
+from ..paths import AppPaths, atomic_json
 from ..distribution import safe_path, verify
 from .bridge import DshBridgeClient, DshBridgeHub, new_bridge_token
+from .profile import merge_profile_package, migrate_schedule_patch, native_schedule_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,6 @@ class DshRuntimeManager:
                 "VOICE_DSH_BRIDGE_TOKEN": self._bridge_token,
                 "VOICE_DSH_CALLBACK_ORIGIN": self.callback_origin,
                 "VOICE_DSH_TASKS_PATH": str(self.config.home_dir / "storages" / "voice-terminal-wake-tasks.json"),
-                "VOICE_DSH_NATIVE_SCHEDULE_PATH": str(self.config.home_dir / "storages" / "schedule.json"),
                 "VOICE_DSH_LEGACY_WAKE_PATH": str(self.paths.config / "wake-tasks.json"),
                 "VOICE_DSH_SCHEDULE_MODULE": str(safe_path(self.release_runtime, self.release_record["schedule"])) if self.release_runtime else str(self.config.source_dir / "packages" / "schedule" / "schedule" / "lib" / "index.js"),
                 "VOICE_DSH_TASKS_ACTIVE": "1",
@@ -239,10 +239,7 @@ class DshRuntimeManager:
         managed_patch = self.config.home_dir / "profiles" / "web" / "cordis.patch.yml"
         if not self._profile_patch_preserves_managed_defaults(self.config.profile_patch, managed_patch):
             raise RuntimeError("DSH_HOME 的 Web profile patch（Web 配置补丁）缺少正式 Shadow preset（Shadow 预设）或 session-log（会话日志）设置；请运行 scripts\\setup-dsh.ps1。")
-        profile_text = managed_patch.read_text(encoding="utf-8")
-        for plugin_id in ("schedule", "ui-schedule"):
-            if not re.search(rf"(?ms)^- id: {plugin_id}\s*\n\s+disabled: true\s*(?=\n|$)", profile_text):
-                raise RuntimeError(f"DSH 原生 {plugin_id}（旧调度插件）仍启用；请运行 scripts\\setup-dsh.ps1。")
+        migrate_schedule_patch(managed_patch, native_enabled=native_schedule_enabled(managed_patch.parent))
         preset_bundle_dir = self.config.source_dir.parent / "bundles" / "voice-terminal-shadow-preset"
         source_preset = self.repo_root / "config" / "dsh" / "agent-presets" / "shadow-agent"
         preset_artifacts = (preset_bundle_dir / "package.json", preset_bundle_dir / "cordis.patch.yml")
@@ -369,7 +366,12 @@ class DshRuntimeManager:
             if target.name == "cordis.patch.yml" and target.exists():
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
+            if source.relative_to(template) == Path("package.json") and target.is_file():
+                managed = json.loads(source.read_text(encoding="utf-8-sig"))
+                existing = json.loads(target.read_text(encoding="utf-8-sig"))
+                atomic_json(target, merge_profile_package(managed, existing))
+            else:
+                shutil.copyfile(source, target)
         # 用户区内的受管目录联接每次启动重建目标，可随整个应用搬迁。
         # 发行运行目录自身必须没有链接；不复制开发机 pnpm（包管理器）目录联接。
         target = safe_path(runtime, metadata["modules"])
@@ -377,6 +379,7 @@ class DshRuntimeManager:
         managed_patch = profile / "cordis.patch.yml"
         if not self._profile_patch_preserves_managed_defaults(self.config.profile_patch, managed_patch):
             raise RuntimeError("DSH（代理执行宿主）的用户配置缺少必要的受管默认项。")
+        migrate_schedule_patch(managed_patch, native_enabled=native_schedule_enabled(profile))
         return str(node), cli
 
     async def _ensure_modules_link(self, target: Path) -> None:

@@ -176,8 +176,8 @@ function installAgentTools(agentCtx: any, agent: any, service: TaskService): () 
     },
   })))
   dispose.push(agentCtx.tools.register(defineTool({
-    name: 'schedule_create',
-    description: '创建项目级 DSH 定时任务；任务不绑定创建会话。仅提供一种时间规则。',
+    name: 'wake_task_create',
+    description: '创建 Voice（语音）链路定时任务；任务到期后进入当前语音主线，不绑定创建它的 DSH 会话。仅提供一种时间规则。DSH 会话提醒请使用官方 schedule_create（创建会话任务）。',
     parameters: {
       title: { type: 'string', required: true, description: 'title（任务名称）。' },
       prompt: { type: 'string', required: true, description: 'prompt（任务内容）。' },
@@ -192,16 +192,16 @@ function installAgentTools(agentCtx: any, agent: any, service: TaskService): () 
     async execute(args: any, exec: any) { ensureRoot(exec); return service.create(args, freezeCurrentContext(agent)) },
   })))
   dispose.push(agentCtx.tools.register(defineTool({
-    name: 'schedule_list',
-    description: '列出插件统一管理的项目定时任务。',
+    name: 'wake_task_list',
+    description: '列出项目语音链路任务；不包含官方 DSH 会话提醒。',
     parameters: {},
     output: { schema: { type: 'array', items: { type: 'object', additionalProperties: true } },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(_args: any, exec: any) { ensureRoot(exec); return service.list() },
   })))
   dispose.push(agentCtx.tools.register(defineTool({
-    name: 'schedule_update',
-    description: '更新项目定时任务的名称、内容或时间规则。',
+    name: 'wake_task_update',
+    description: '更新项目语音链路任务的名称、内容或时间规则；不修改官方 DSH 会话提醒。',
     parameters: {
       id: { type: 'string', required: true, description: 'id（任务标识）。' },
       title: { type: 'string', description: 'title（任务名称）。' },
@@ -222,8 +222,8 @@ function installAgentTools(agentCtx: any, agent: any, service: TaskService): () 
     },
   })))
   dispose.push(agentCtx.tools.register(defineTool({
-    name: 'schedule_delete',
-    description: '取消项目定时任务。',
+    name: 'wake_task_delete',
+    description: '取消项目语音链路任务；不删除官方 DSH 会话提醒。',
     parameters: { id: { type: 'string', required: true, description: 'id（任务标识）。' } },
     output: responseToolOutput(),
     async execute(args: any, exec: any) { ensureRoot(exec); return service.cancel(args.id) },

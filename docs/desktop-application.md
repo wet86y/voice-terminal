@@ -179,6 +179,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Verify-Package.ps1
   --build '20261004-desktop' --refresh-program
 ```
 
+升级 DSH（代理执行宿主）时，在同一停机刷新命令中传入 `--dsh-runtime`（新宿主运行产物路径）。
+构建器先校验新组件的完整清单、版本及提交号与新程序锁版一致，再安装到新的受管目录，
+同步新程序的 `release.components`（组件清单）、`active.json`（当前启用记录）及 `portable.json`（便携默认配置）。
+组件校验失败或选择记录提交失败时恢复旧组合；旧宿主组件保留。首次启动可能迁移宿主用户配置，
+因此应在停机后另外备份 `data/dsh`（宿主数据目录）及相关语音设置，回退涉及数据时一并恢复该快照。
+
+```powershell
+& $BuildPython -X utf8 scripts/assemble-desktop.py --output '.runtime/delivery/VoiceTerminal' `
+  --build '20261005-dsh020rc2' --refresh-program `
+  --dsh-runtime '.runtime/package-build/dsh-020rc2-20261005-v3'
+```
+
 独立封包工具只收录发布清单声明的程序、组件、根入口及使用说明。归档内的 `portable.json`（便携配置）采用经过校验的实际组合，数据位置默认为相对 `data`（数据目录）；工作目录里的外置数据位置和未知根目录文件不会成为发布内容。
 
 发布与运行记录的主要字段：

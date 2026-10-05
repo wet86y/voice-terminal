@@ -14,7 +14,6 @@ const {
 export const CALLBACK_ORIGIN = process.env.VOICE_DSH_CALLBACK_ORIGIN ?? ''
 export const TOKEN = process.env.VOICE_DSH_BRIDGE_TOKEN ?? ''
 const STORE_PATH = process.env.VOICE_DSH_TASKS_PATH ?? ''
-const NATIVE_PATH = process.env.VOICE_DSH_NATIVE_SCHEDULE_PATH ?? ''
 const LEGACY_PATH = process.env.VOICE_DSH_LEGACY_WAKE_PATH ?? ''
 const RETRY_MS = 30_000
 
@@ -107,23 +106,8 @@ export class TaskService {
 
   private importLegacy(): boolean {
     let changed = false
-    const native = readJson(NATIVE_PATH)
-    const nativeRows = native?.tables?.tasks
-    if (nativeRows !== undefined && (typeof nativeRows !== 'object' || Array.isArray(nativeRows))) throw new Error('DSH 原生任务格式无效。')
-    for (const [id, value] of Object.entries(nativeRows ?? {})) {
-      if (this.rows.has(id)) continue
-      const task: any = value
-      const record = decodeScheduleRecord(task.record)
-      const history = Array.isArray(task.deliveryHistory?.records) ? task.deliveryHistory.records : []
-      this.rows.set(id, {
-        task_id: id, target: 'shadow_agent', text: record.prompt, reference: '', record,
-        status: task.status === 'inactive' ? 'archived' : 'pending',
-        created_at: record.scheduledAt, updated_at: record.scheduledAt,
-        last_triggered_at: task.lastDelivery?.deliveredAt ?? null,
-        occurrence: history.length + 1, history,
-      })
-      changed = true
-    }
+    // Native schedule（官方会话任务）由官方存储和计时器负责，不能复制成语音链路任务。
+    // 已有项目 store（存储）的任务及历史已在 constructor（构造函数）中加载并原样保留。
     const legacy = readJson(LEGACY_PATH)
     const oldRows = legacy?.tasks
     if (oldRows !== undefined && (typeof oldRows !== 'object' || Array.isArray(oldRows))) throw new Error('旧 Voice 任务文件格式无效。')

@@ -5,10 +5,42 @@ Voice Terminal 内置第一方 DSH Bundle `voice-terminal-shadow-bridge`。当
 已经切换为 `dsh`，`native` 仅作为显式人工回滚后端保留。后端在新 Voice Session 创建时固定，同一 Session不热切换，也不在 DSH
 故障时自动转交 native。
 
-固定基线为 `dsh-v0.1.7-rc.2` / commit
-`477b4f420553e8a52c2fbccc464d7561b239c443`。Bundle 只使用该版本的公开 Cordis、Web Host、Agent、
-Session、Tool 和事件扩展点；不得修改 `.runtime/dsh/source`、解析私有 Session 文件、依赖私有
-Web RPC，或启动第二个长期持有同一 Session 的 DSH 进程。
+当前受管目标为 npm `latest`（默认发行通道）上的预发布版本 `dsh-v0.2.0-rc.2`
+（候选版），commit（提交号）`639ed015397290b3745d163aafe02ffee4aa3f84`；这不是正式稳定版。
+该版本当前部署于便携应用 `apps/20261005-dsh-task-coexist`；首次部署目录为 `apps/20261005-dsh020rc2`。Bridge（桥接插件）、
+Wake Tasks（唤醒任务插件）和 Shadow preset（影子代理预设功能包）均为 0.1.1，Bridge protocol
+（桥接协议）为 2.0。DSH component（DSH 组件）标识为 `639ed015-e7dd1315c977`；旧组件和两套备份均保留。
+`dsh-v0.1.7-rc.2`（候选版）的 9 月验收记录仅适用于该版本当时的测试范围，不能替代本次目标版本记录。
+Bundle（功能包）只使用目标版本公开的 Cordis（插件框架）、Web Host（网页宿主）、Agent（智能体）、
+Session（会话）、Tool（工具）和事件扩展点；不得修改 `.runtime/dsh/source`（运行源码）、解析私有
+Session（会话）文件、依赖私有 Web RPC（网页远程调用），或启动第二个长期持有同一 Session（会话）的 DSH 进程。
+
+## 2026-10-05 首次部署验收（共存修复前基线）
+
+以下是首次升级部署、共存修复之前的 backend tests（后端测试）结果：666 passed（通过）、17 skipped（跳过）；
+frontend tests（前端测试）64 passed（通过）；Bridge tests（桥接插件测试）22 passed（通过）；
+Wake Tasks tests（唤醒任务插件测试）3 passed（通过）；official DSH tests（DSH 官方测试）102 passed（通过）。
+这些数字和首次部署的任务、历史、会话数据核验见[本机部署验收记录](../.runtime/dsh-upgrade-20261005/acceptance.md)；数字仅代表共存修复之前的回归结果。
+
+## 2026-10-05 原生与项目定时任务共存修复（已验收）
+
+原生 DSH Schedule（会话定时任务）与项目 Wake Tasks（语音链路任务）面向不同目标，允许同时启用。原生
+`schedule_create/list/update/delete`（创建、列出、更新、删除会话任务工具）属于官方可选 Automation Bundle
+（自动化功能包）`@deepseek-ai/dsh-experimental-schedule-bundle`，默认关闭但可由用户启用；工具将任务绑定到
+所属 DSH Session（会话），由原生任务页和调度服务管理。项目 Wake Tasks 的 `wake_task_create/list/update/delete`
+（创建、列出、更新、删除语音链路任务工具）使用项目独立存储，触发后投递到当前 Voice（语音）主线关联的
+DSH 会话。两类任务不相互导入。
+
+本次修复将项目工具改为 `wake_task_*`（语音链路任务工具），只迁移旧 Voice `wake-tasks.json`（旧语音任务文件），
+保留已有项目任务和用户已启用的官方功能包。便携应用 `apps/20261005-dsh-task-coexist`（桌面程序目录）第二次正常重启后
+ready（就绪），官方 Automation Bundle（自动化功能包）的用户选择得到保留；隔离源码中的预设已实际挂载，同一根会话下两套工具的
+CRUD（增删改查）和任务存储隔离均通过验收。
+
+本次修复的 backend tests（后端测试）为 671 passed（通过）、17 skipped（跳过）；Bridge tests（桥接插件测试）22 passed（通过）；
+Wake Tasks tests（唤醒任务插件测试）4 passed（通过）。frontend tests（前端测试）64 passed（通过）、typecheck（类型检查）、
+build（构建）及 official DSH tests（DSH 官方测试）102 passed（通过）沿用首次部署基线，未在本次修复中改动。
+详细结果见[共存修复本机验收记录](../.runtime/dsh-coexist-20261005/acceptance.md)。
+本次完整修订范围及兼容边界见[DSH 会话任务与语音链路任务共存修订](dsh-task-coexistence.md)。
 
 ## 发行运行与源码准备
 
@@ -38,7 +70,7 @@ Wake Tasks Bundle（唤醒任务插件运行包）与正式 Shadow preset Bundle
 目录和 source map（源码映射）变更不会阻止启动。产物 hash（哈希值）覆盖 DSH 实际加载的包清单、Cordis patch
 （配置补丁）和 JavaScript 运行文件，不包含声明文件或文档。
 
-DSH 0.1.7-rc.2 的 Agent 预设只从 Cordis Bundle（Cordis 功能包）中的 `@deepseek-ai/dsh-agent-preset`
+DSH 0.2.0-rc.2 的 Agent 预设只从 Cordis Bundle（Cordis 功能包）中的 `@deepseek-ai/dsh-agent-preset`
 声明加载，不再扫描 DSH_HOME 的 `.agent-presets/<id>/` 目录。安装脚本从
 `config/dsh/agent-presets/shadow-agent/` 生成项目本地 preset Bundle（预设功能包），并将正式预设注册到 Web
 profile；profile patch（配置补丁）使用 `agent-preset-registry`（Agent 预设注册器）的 `default`（默认预设字段）。
@@ -58,13 +90,13 @@ DSH Web Host（网页服务）固定监听 `127.0.0.1:3081`；直接访问该端
 pwsh -NoProfile -File .\scripts\setup-dsh.ps1 -ValidateOnly
 ```
 
-该命令确认 Node Bundle（Node.js 插件运行包）和浏览器插件页与锁定版本一致。v0.1.7-rc.2 使用 `configForms`（设置表单服务）；旧版
-`settingsScope` 接口已移除。Bridge（插件桥接层）通过 `configForms.whileServed(...)`
+该命令确认 Node Bundle（Node.js 插件运行包）和浏览器插件页与锁定版本一致。v0.2.0-rc.2 使用
+`configForms`（设置表单服务）；旧版 `settingsScope`（设置作用域接口）已移除。Bridge（插件桥接层）通过 `configForms.whileServed(...)`
 （仅在设置服务可用时注册页面）延迟注册设置页，因此不应把 `settingsScope` 当作回退接口。
 
 若设置侧栏已出现 `Voice Terminal`，但右侧内容为空，并且浏览器控制台报告 React error #130
 （React 渲染错误：组件类型未定义），请检查 Bridge 使用的 UI icon export（界面图标导出）是否属于锁定 DSH 版本。
-v0.1.7-rc.2 的图标名称已更新；当前页面使用 `IconChevronDownOutlineRegular` 和
+v0.2.0-rc.2 的图标名称已更新；当前页面使用 `IconChevronDownOutlineRegular` 和
 `IconFolderCloseRegular`。修改客户端后需重新运行 `setup-dsh.ps1` 重建插件，并从 Voice Terminal 顶栏入口重新打开
 DSH，以载入新产物和新的 launch token（临时访问令牌）。
 
@@ -94,20 +126,27 @@ DSH 启动后，在设置侧栏“Agent 预设”下方打开独立的 `Voice Te
 本次语音会话启动。
 
 `setup-dsh.ps1`（DSH 插件安装脚本）也会安装独立的
-`voice-terminal-wake-tasks`（语音终端唤醒任务插件）。插件只向 DSH 正式根 Agent（正式根代理）
-提供创建、取消、读取冻结参考和投递语音事件的工具。插件负责项目任务的唯一持久化与调度；任意 DSH
-根会话均可创建任务，任务与创建会话的生命周期无关。创建时的 DSH 文本上下文快照保存在任务记录，
-默认不注入；任务模型可通过 `read_wake_reference`（读取冻结参考工具）按需读取。
+`voice-terminal-wake-tasks`（语音终端唤醒任务插件）。任意 DSH 根会话均可使用 `wake_task_create/list/update/delete`
+（创建、列出、更新、删除语音链路任务工具），或用 `schedule_wake`（创建简易唤醒任务）和
+`cancel_wake`（取消简易唤醒任务）管理项目任务。原生 DSH 的 `schedule_create/list/update/delete`
+（创建、列出、更新、删除会话任务工具）则由官方 Automation Bundle（自动化功能包）提供，名称与项目工具不同。
+项目任务与创建会话的生命周期无关。创建时的 DSH 文本上下文快照保存在项目任务记录中，默认不注入；
+任务模型可通过 `read_wake_reference`（读取冻结参考工具）按需读取。
 
-任务到期后，插件经桥接层在 Voice 会话交接锁（防止旧会话被唤醒的互斥锁）内解析当前关联的 DSH
+项目任务到期后，插件经桥接层在 Voice 会话交接锁（防止旧会话被唤醒的互斥锁）内解析当前关联的 DSH
 主线，并用普通 `user/message`（用户消息）投递任务。创建任务的会话不作为投递目标；如果旧主线已退役，
 任务转投当前主线。暂时无法解析或投递时保留任务并重试。Voice Terminal（语音终端）主设置中的
-“唤醒任务”页读取同一插件任务目录，因此能查看、修改和取消任意 DSH 会话创建的任务。
+“唤醒任务”页只读取项目任务目录。原生 DSH Schedule（会话定时任务）保存在官方调度存储并投递到所属会话，
+由 Automation Bundle（自动化功能包）的原生任务页管理；它不会经过 Voice 会话交接锁或 Voice 持久信箱。
 
-插件安装时会幂等导入 DSH 原生 `schedule.json`（原生任务文件）及旧 Voice `wake-tasks.json`
-（旧任务文件）中的可转换记录，并保留任务标识、状态和可用投递历史。安装脚本在切换调度来源前运行
-迁移预检；有效记录无法转换时中止安装。安装完成后，DSH 原生 `schedule`（调度器）与
-`ui-schedule`（原生任务页面）会停用，以免任务被两套调度器重复触发。
+Wake Tasks（唤醒任务插件）只把旧 Voice `wake-tasks.json`（旧语音任务文件）中的可转换记录迁入项目任务目录；
+已有项目任务及历史保持不变。它不读取或导入原生 Schedule（会话定时任务），两套调度器不会因为启用而重复
+投递同一任务。官方 `@deepseek-ai/dsh-experimental-schedule-bundle`（原生调度自动化功能包）默认关闭，用户可按需
+启用；启动和构建会保留该选择。
+
+旧 profile（配置档案）或 `--patch`（配置补丁）中直接针对根级 `schedule` / `ui-schedule`（原生调度服务／任务页）
+的禁用行，在默认未挂载这些条目的组合中可能产生 `patch: entry <id> not found`（补丁目标缺失警告）。需要切换
+官方功能时，请通过 Automation Bundle（自动化功能包）管理；无需为了项目 Wake Tasks（唤醒任务插件）关闭它。
 
 DSH 模型需要通知 Voice 时，必须显式调用 `publish_voice_event`（投递语音事件工具），写入 Voice
 持久信箱（可在进程重启后恢复的事件队列）。事件不要求预先存在唤醒标识或上下文版本；重复事件按
@@ -152,9 +191,10 @@ activation、打断模型或取消工具。下一个 `next-step` 安全点之前
 `deferred_revision`（暂缓版本），用于传输重试核对。结构化 `dsh.context_gate` 日志记录
 判断、版本区间、队列目标、终态交接和失败放行，不包含权威正文或访问凭据。
 
-### 真实运行验证（2026-09-30）
+### 历史真实运行验证（2026-09-30）
 
-在本机 DSH 0.1.7-rc.2（版本）与真实 DSH Agent（代理）会话中验证了插件交接链路，测试上下文由脚本生成，未启用麦克风或 ASR（语音识别）。
+以下是本机 DSH 0.1.7-rc.2（版本）与真实 DSH Agent（代理）会话的历史验收，只证明当时验证过的插件交接链路；
+目标候选版 DSH 0.2.0-rc.2 于 2026-10-05 完成首次部署验收，见上方基线记录；后续原生与项目定时任务共存修复也已通过单独验收。历史测试上下文由脚本生成，未启用麦克风或 ASR（语音识别）。
 门禁关闭时，运行中的 revision 2（上下文版本）通过普通 `context.update`（上下文更新）进入 DSH 并被领取。
 门禁开启时，revision 2/3 先以 `hold`（暂存）同步；两次真实侧载判断均返回
 `inject_now / supplement`（立即引导／补充），插件将它们合并进同一条待处理消息并报告领取。

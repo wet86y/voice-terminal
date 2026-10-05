@@ -6,6 +6,10 @@
 DSH 对话页全局空白的缺陷。本次只改代码与逻辑，不改功能：工具集合、工具描述、提示词、
 Voice 协议语义、设置页行为均未变化。
 
+> 本文是 2026-09-27 对 DSH 0.1.7-rc.2（候选版）的历史审计，不是 DSH 0.2.0-rc.2（目标候选版）的验收。
+> 下文“Wake Tasks 未调用 `concludeTurn()`（结束当前回合）”描述的是审计时的代码状态；后续 Wake Tasks
+> 已在 Voice 信箱确认接受事件后调用该接口。此更正不改变审计日的源码观察与事故证据。
+
 判定依据主要来自仓库内规范文档：`docs/cookbook/adding-a-tool.md`（工具契约）、
 `packages/AGENTS.md`（包与插件约定）、`packages/client/AGENTS.md`（Web 客户端约定）、
 `docs/architecture.md`（组合与生命周期）。
@@ -108,8 +112,8 @@ Voice 协议语义、设置页行为均未变化。
 - **自实现 `defineTool` 包装绕过类型推导。** `index.ts` 里的 `defineTool(options: any)` 让
   `args` / `exec` 退化为 `any`，失去 `InferArgs` 的编译期校验。
 - **工具名与描述为中文。** 规范未禁止；是否要有 i18n 约定需产品侧确认。
-- **Wake Tasks 未声明回合终结。** 其三个工具属普通工具，不受本次缺陷影响，但同样没有
-  `concludeTurn()`；若将来需要以工具收尾，需一并补上。
+- **截至审计日，Wake Tasks 未声明回合终结。** 当时三个工具属普通工具，不受本次缺陷影响，且没有
+  `concludeTurn()`；后续实现已在 Voice 信箱接受事件后调用该接口，因此此条只记录历史状态，不再描述当前代码。
 
 ### 4.2 Cordis 与生命周期（`packages/AGENTS.md`）
 

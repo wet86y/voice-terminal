@@ -113,7 +113,135 @@ def atomic_bytes(path: Path, value: bytes) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def refresh_program(output: Path, desktop: Path, build: str) -> None:
+def _read_dsh_lock(program: Path) -> dict:
+    """读取候选应用中的 DSH 锁版（宿主版本与源码提交号）。"""
+    lock_path = program / "config/dsh/runtime.lock.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(lock, dict):
+        raise ValueError("新程序中的 DSH 锁版无效。")
+    version, commit = lock.get("version"), lock.get("commit")
+    if (lock.get("schema_version") != 1 or not isinstance(version, str) or not version.strip()
+            or not isinstance(commit, str) or len(commit) != 40
+            or any(character not in "0123456789abcdefABCDEF" for character in commit)):
+        raise ValueError("新程序中的 DSH 锁版无效。")
+    return lock
+
+
+def _validated_dsh_source(source: Path) -> tuple[Path, dict, dict]:
+    """校验 DSH 组件清单（文件摘要）并读取 runtime 版本记录。"""
+    if source.is_symlink() or source.is_junction():
+        raise ValueError("DSH 运行目录不能是链接或重解析点。")
+    source = source.resolve(strict=True)
+    if not source.is_dir():
+        raise ValueError("DSH 运行产物必须是目录。")
+    record = json.loads((source / "manifest.json").read_text(encoding="utf-8-sig"))
+    if (not isinstance(record, dict) or record.get("schema") != 1 or record.get("kind") != "dsh"
+            or not isinstance(record.get("files"), list)
+            or any(not isinstance(item, dict) or not isinstance(item.get("path"), str)
+                   or not isinstance(item.get("size"), int) or not isinstance(item.get("sha256"), str)
+                   for item in record["files"])):
+        raise ValueError("DSH 运行产物清单无效。")
+    build = record.get("build")
+    if (not isinstance(build, str) or not build
+            or any(not (character.isascii() and (character.isalnum() or character in "-_")) for character in build)):
+        raise ValueError("DSH 运行产物构建标识无效。")
+    verify(source, record)
+    metadata = json.loads((source / "runtime.json").read_text(encoding="utf-8-sig"))
+    if not isinstance(metadata, dict) or metadata.get("schema") != 1:
+        raise ValueError("DSH 运行产物版本记录无效。")
+    return source, record, metadata
+
+
+def _dsh_component_path(output: Path, build: str) -> tuple[str, Path]:
+    """解析输出根内的 DSH 组件路径，并拒绝路径上的链接目录。"""
+    relative = f"runtimes/dsh/{build}"
+    root = output.resolve()
+    current = root
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink() or current.is_junction():
+            raise ValueError("DSH 组件路径不能经过链接或重解析点。")
+    return relative, safe_path(root, relative)
+
+
+def _reuse_dsh_component(target: Path, expected: dict, version: str, commit: str) -> dict:
+    """只复用同 build 且文件摘要和 runtime 版本完全一致的组件。"""
+    if not target.is_dir():
+        raise ValueError("同标识 DSH 组件已存在，但不是有效目录。")
+    record = json.loads((target / "manifest.json").read_text(encoding="utf-8-sig"))
+    if record != expected:
+        raise ValueError("同标识 DSH 组件与新运行产物不一致，拒绝覆盖。")
+    verify(target, record)
+    metadata = json.loads((target / "runtime.json").read_text(encoding="utf-8-sig"))
+    if (metadata.get("schema") != 1 or metadata.get("version") != version
+            or str(metadata.get("commit", "")).lower() != commit.lower()):
+        raise ValueError("同标识 DSH 组件版本与新应用锁版不一致。")
+    return record
+
+
+def _install_dsh_component(output: Path, stage: Path, source: Path, source_record: dict,
+                           metadata: dict, lock: dict) -> tuple[str, dict, bool]:
+    """把已验证 DSH 组件放入未启用目录，返回路径、清单及本次新建标记。"""
+    _validate_dsh_lock_match(source_record, metadata, lock)
+    relative, target = _dsh_component_path(output, source_record["build"])
+    if target.exists():
+        return relative, _reuse_dsh_component(target, source_record, lock["version"], lock["commit"]), False
+
+    staged = stage / "dsh-component"
+    copied_record = copy_component(source, staged, kind="dsh", build=source_record["build"])
+    if copied_record != source_record:
+        raise ValueError("DSH 复制后的组件清单与输入产物不一致。")
+    verify(staged, copied_record)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # mkdir（排他创建）先占用唯一 build 路径；回滚只会移除本次确实创建的目录。
+    target.mkdir()
+    try:
+        for source_file in files(staged):
+            relative_file = source_file.relative_to(staged)
+            destination = target / relative_file
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source_file.replace(destination)
+        verify(target, copied_record)
+    except Exception:
+        if target.exists() and not target.is_symlink() and not target.is_junction():
+            for _ in files(target):
+                pass
+            shutil.rmtree(target)
+        raise
+    return relative, copied_record, True
+
+
+def _validate_dsh_lock_match(record: dict, metadata: dict, lock: dict) -> None:
+    """检查 runtime 版本、源码提交号和 manifest build（清单构建标识）均属于锁版。"""
+    commit = lock["commit"].lower()
+    if (metadata.get("version") != lock["version"]
+            or str(metadata.get("commit", "")).lower() != commit):
+        raise ValueError("DSH 运行产物版本与新应用锁版不一致。")
+    if not record["build"].lower().startswith(commit[:8] + "-"):
+        raise ValueError("DSH 运行产物构建标识与新应用锁版不一致。")
+
+
+def _remove_new_dsh_component(output: Path, relative: str) -> None:
+    """仅移除本次新增且仍位于 output/runtimes/dsh 下的组件目录。"""
+    root = output.resolve()
+    parts = Path(relative).parts
+    if len(parts) != 3 or parts[:2] != ("runtimes", "dsh"):
+        raise ValueError("回滚 DSH 组件路径不在受管目录内。")
+    current = root
+    for part in parts[:-1]:
+        current = current / part
+        if current.is_symlink() or current.is_junction():
+            raise ValueError("回滚 DSH 组件路径不能经过链接或重解析点。")
+    target = safe_path(root, relative)
+    if target.is_symlink() or target.is_junction() or target.parent != current:
+        raise ValueError("回滚 DSH 组件路径不在受管目录内。")
+    for _ in files(target):
+        pass
+    shutil.rmtree(target)
+
+
+def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime: Path | None = None) -> None:
     """构建机停机刷新候选目录，复用已校验组件；不承接终端在线更新事务。"""
     require_stopped(ROOT, output)
     verify_install(output)
@@ -135,7 +263,35 @@ def refresh_program(output: Path, desktop: Path, build: str) -> None:
         staged_root = stage / 'root'
         staged_root.mkdir()
         collect_program(staged_program, desktop)
-        release = {**previous, **manifest(staged_program, kind="app", build=build), "root_files":root_files(staged_root, desktop)}
+        components = list(previous.get("components", []))
+        new_dsh_relative = None
+        new_dsh_created = False
+        dsh_plan = None
+        dsh_component = None
+        if dsh_runtime is not None:
+            lock = _read_dsh_lock(staged_program)
+            source, source_record, metadata = _validated_dsh_source(dsh_runtime)
+            _validate_dsh_lock_match(source_record, metadata, lock)
+            new_dsh_relative, _ = _dsh_component_path(output, source_record["build"])
+            dsh_plan = (source, source_record, metadata, lock)
+            dsh_component = {"kind":"dsh", "path":new_dsh_relative,
+                             "manifest_sha256":digest(source / "manifest.json"),
+                             "build":source_record["build"]}
+            replaced = False
+            updated = []
+            for component in components:
+                if component.get("kind") == "dsh":
+                    if not replaced:
+                        updated.append(dsh_component)
+                        replaced = True
+                else:
+                    updated.append(component)
+            if not replaced:
+                updated.append(dsh_component)
+            components = updated
+            selection["dsh"] = new_dsh_relative
+        release = {**previous, **manifest(staged_program, kind="app", build=build),
+                   "components":components, "root_files":root_files(staged_root, desktop)}
         atomic_json(staged_program / "release.json", release)
         verify(staged_program, release)
         staged = list(staged_root.iterdir())
@@ -148,6 +304,15 @@ def refresh_program(output: Path, desktop: Path, build: str) -> None:
         staged_program.resolve().relative_to(stage)
         committed_program = False
         try:
+            if dsh_plan is not None:
+                source, source_record, metadata, lock = dsh_plan
+                installed_relative, dsh_record, new_dsh_created = _install_dsh_component(
+                    output, stage, source, source_record, metadata, lock)
+                if installed_relative != new_dsh_relative or dsh_record["build"] != source_record["build"]:
+                    raise ValueError("DSH 组件路径或构建标识在提交前发生变化。")
+                dsh_component["manifest_sha256"] = digest(safe_path(output, installed_relative) / "manifest.json")
+                atomic_json(staged_program / "release.json", release)
+                verify(staged_program, release)
             staged_program.rename(program)
             committed_program = True
             for file in staged:
@@ -155,14 +320,17 @@ def refresh_program(output: Path, desktop: Path, build: str) -> None:
             if active in backups:
                 atomic_json(active, selection)
             atomic_json(output / "portable.json", {**portable, **selection})
+            verify_install(output)
         except Exception:
-            for path, content in backups.items():
-                if content is None:
-                    path.unlink(missing_ok=True)
-                else:
-                    atomic_bytes(path, content)
             if committed_program:
+                for path, content in backups.items():
+                    if content is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        atomic_bytes(path, content)
                 program.rename(staged_program)
+            if new_dsh_created and new_dsh_relative is not None:
+                _remove_new_dsh_component(output, new_dsh_relative)
             raise
     print(f"候选程序已刷新：{program}；环境、模型及用户数据保留，旧程序目录保留以供检查。")
 
@@ -197,7 +365,7 @@ def main():
     if args.refresh_program:
         if args.zip:
             raise ValueError("候选程序刷新后，使用 package-desktop.py（分发归档工具）单独校验并归档。")
-        refresh_program(output, desktop, args.build)
+        refresh_program(output, desktop, args.build, args.dsh_runtime)
         return
     if not args.models or not args.dsh_runtime:
         raise ValueError("首次组装必须提供完整模型和代理宿主运行目录。")

@@ -474,8 +474,8 @@ class DshConfig:
     bridge_protocol_version: str = "2.0"
     restart_limit: int = 2
     restart_delay_ms: int = 1000
-    expected_version: str = "0.1.7-rc.2"
-    expected_commit: str = "477b4f420553e8a52c2fbccc464d7561b239c443"
+    expected_version: str = "0.2.0-rc.2"
+    expected_commit: str = "639ed015397290b3745d163aafe02ffee4aa3f84"
 
     def __post_init__(self) -> None:
         if self.host != "127.0.0.1":
@@ -799,8 +799,8 @@ class AppConfig:
                 bridge_protocol_version=_string(dsh.get("bridge_protocol_version"), "2.0"),
                 restart_limit=int(_number(dsh.get("restart_limit"), 2)),
                 restart_delay_ms=int(_number(dsh.get("restart_delay_ms"), 1000)),
-                expected_version=_string(dsh.get("expected_version"), "0.1.7-rc.2"),
-                expected_commit=_string(dsh.get("expected_commit"), "477b4f420553e8a52c2fbccc464d7561b239c443"),
+                expected_version=_string(dsh.get("expected_version"), "0.2.0-rc.2"),
+                expected_commit=_string(dsh.get("expected_commit"), "639ed015397290b3745d163aafe02ffee4aa3f84"),
             ),
             persona=PersonaConfig(
                 directory=paths.persona if paths.separated else path_or_none(persona.get("directory")) or root / "config" / "persona",
