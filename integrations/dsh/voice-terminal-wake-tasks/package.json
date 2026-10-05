@@ -1,6 +1,6 @@
 {
   "name": "@voice-terminal/dsh-wake-tasks",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "main": "lib/plugin.js",
@@ -8,7 +8,7 @@
   "exports": { ".": "./lib/plugin.js" },
   "scripts": {
     "build": "node build.mjs",
-    "test": "npm run build && node --test test/task-service.test.mjs test/event-id.test.mjs"
+    "test": "npm run build && node --test test/task-service.test.mjs test/task-delivery.test.mjs test/event-id.test.mjs test/coexistence.test.mjs"
   },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
   "peerDependencies": {

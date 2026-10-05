@@ -775,7 +775,7 @@ export function apply(ctx: any, config: Config): void {
       if (!authorized(req)) { json(res, 401, result('unauthorized')); return }
       const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname.slice(config.routePrefix.length).replace(/^\//, '')
       if (req.method === 'GET' && path === 'health') {
-        json(res, 200, { protocol_version: BRIDGE_PROTOCOL_VERSION, status: 'ok', bundle_version: '0.1.0' }); return
+        json(res, 200, { protocol_version: BRIDGE_PROTOCOL_VERSION, status: 'ok', bundle_version: '0.1.1' }); return
       }
       if (req.method !== 'POST') { json(res, 404, result('not_found')); return }
       try {

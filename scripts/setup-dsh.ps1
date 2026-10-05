@@ -124,6 +124,68 @@ function Write-Utf8NoBom {
   [System.IO.File]::WriteAllText($Path, $Text, [System.Text.UTF8Encoding]::new($false))
 }
 
+function Assert-RuntimePath {
+  param([string]$Path)
+  $FullPath = [IO.Path]::GetFullPath($Path)
+  $FullRoot = [IO.Path]::GetFullPath($RuntimeRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+  if (-not $FullPath.StartsWith($FullRoot, [StringComparison]::OrdinalIgnoreCase)) { throw "运行目录路径越界：$FullPath" }
+}
+
+function Copy-RuntimeTree {
+  param([string]$From, [string]$To)
+  Assert-RuntimePath $From
+  Assert-RuntimePath $To
+  # /SL、/SJ（保留链接）避免把依赖目录联接的外部目标收入数据快照。
+  & robocopy $From $To /E /COPY:DAT /DCOPY:DAT /SL /SJ /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+  if ($LASTEXITCODE -ge 8) { throw "DSH 运行目录备份或恢复失败：$From → $To（退出码 $LASTEXITCODE）" }
+}
+
+function Save-RuntimeBackup {
+  param([string]$Path)
+  Assert-RuntimePath $Path
+  New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
+  $Items = foreach ($Relative in @('home', 'bundles', 'build-state.json', 'session-mappings.json', 'web.dump-config.yml')) {
+    $Original = Join-Path $RuntimeRoot $Relative
+    $Exists = Test-Path -LiteralPath $Original
+    if ($Exists) {
+      $Copy = Join-Path $Path $Relative
+      if (Test-Path -LiteralPath $Original -PathType Container) { Copy-RuntimeTree $Original $Copy }
+      else { Copy-Item -LiteralPath $Original -Destination $Copy -ErrorAction Stop }
+    }
+    @{ path = $Relative; existed = $Exists }
+  }
+  Write-Utf8NoBom (Join-Path $Path 'backup.json') ((@{
+    commit = $CurrentHead; items = @($Items)
+    fields = @{ commit = '升级前源码提交号'; items = '受管备份项目'; path = '运行根目录内的相对路径'; existed = '升级前是否存在' }
+  } | ConvertTo-Json -Depth 5) + "`n")
+  Write-Host "升级前的 DSH 数据、功能包及构建记录已备份：$Path" -ForegroundColor Yellow
+}
+
+function Restore-RuntimeBackup {
+  param([string]$Path)
+  $FailedRoot = Join-Path $RuntimeRoot ("upgrade.failed-{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+  Assert-RuntimePath $FailedRoot
+  New-Item -ItemType Directory -Path $FailedRoot -ErrorAction Stop | Out-Null
+  if ($SourceArchive -and (Test-Path -LiteralPath $SourceArchive)) {
+    Assert-RuntimePath $SourceDir
+    Assert-RuntimePath $SourceArchive
+    if (Test-Path -LiteralPath $SourceDir) { Move-Item -LiteralPath $SourceDir -Destination (Join-Path $FailedRoot 'source') -ErrorAction Stop }
+    Move-Item -LiteralPath $SourceArchive -Destination $SourceDir -ErrorAction Stop
+  }
+  $Backup = Get-Content -LiteralPath (Join-Path $Path 'backup.json') -Raw | ConvertFrom-Json
+  foreach ($Item in $Backup.items) {
+    $Target = Join-Path $RuntimeRoot $Item.path
+    Assert-RuntimePath $Target
+    if (Test-Path -LiteralPath $Target) { Move-Item -LiteralPath $Target -Destination (Join-Path $FailedRoot $Item.path) -ErrorAction Stop }
+    if ($Item.existed) {
+      $Original = Join-Path $Path $Item.path
+      if (Test-Path -LiteralPath $Original -PathType Container) { Copy-RuntimeTree $Original $Target }
+      else { Copy-Item -LiteralPath $Original -Destination $Target -ErrorAction Stop }
+    }
+  }
+  Write-Host "旧 DSH 运行组合已恢复；失败产物保留于 $FailedRoot" -ForegroundColor Yellow
+}
+
 function Get-ShadowPresetBundlePatch {
   $MetadataPath = Join-Path $PresetSource "preset.yml"
   $CompositionPath = Join-Path $PresetSource "agent.cordis.yml"
@@ -155,16 +217,16 @@ function Update-ManagedProfilePatch {
     Copy-Item -LiteralPath $PatchSource -Destination $ProfilePatchPath
   }
   $Text = Get-Content -LiteralPath $ProfilePatchPath -Raw
-  # The project plugin owns the task catalog and delivery target. The native
-  # Schedule service would otherwise dispatch to the creating Session.
-  foreach ($ScheduleId in @('schedule', 'ui-schedule')) {
-    $BlockPattern = "(?ms)^- id: $ScheduleId[ \t]*\r?\n.*?(?=^- id:|\z)"
-    $Block = [regex]::Match($Text, $BlockPattern)
-    if ($Block.Success) {
-      $Replacement = "- id: $ScheduleId`n  disabled: true`n"
-      $Text = $Text.Substring(0, $Block.Index) + $Replacement + $Text.Substring($Block.Index + $Block.Length)
-    } else {
-      $Text = $Text.TrimEnd() + "`n- id: $ScheduleId`n  disabled: true`n"
+  # 原生 Schedule（会话调度）启用时保留用户补丁；关闭时只清理旧受管禁用行。
+  if (-not (Test-NativeScheduleEnabled)) {
+    foreach ($ScheduleId in @('schedule', 'ui-schedule')) {
+      $BlockPattern = "(?ms)^- id: $ScheduleId[ \t]*\r?\n.*?(?=^- id:|\z)"
+      $Text = [regex]::Replace($Text, $BlockPattern, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($Match)
+        $Lines = @($Match.Value -split "`r?`n" | ForEach-Object { ($_ -split '#', 2)[0].TrimEnd() } | Where-Object { $_.Trim() })
+        if ($Lines.Count -eq 2 -and $Lines[1] -match '^[ \t]+disabled:[ \t]+true$') { return '' }
+        return $Match.Value
+      })
     }
   }
   # DSH 0.1.7 使用 agent-preset-registry（Agent 预设注册器）；旧 agent-presets 注册行已废弃。
@@ -189,6 +251,14 @@ function Update-ManagedProfilePatch {
     $Text = $Text.Substring(0, $Registry.Index) + $Block + $Text.Substring($Registry.Index + $Registry.Length)
   }
   Write-Utf8NoBom -Path $ProfilePatchPath -Text ($Text.TrimStart([char[]]"`r`n").TrimEnd() + "`n")
+}
+
+function Test-NativeScheduleEnabled {
+  if (Test-Path -LiteralPath $ProfilePackagePath -PathType Leaf) {
+    $ExistingProfile = Get-Content -LiteralPath $ProfilePackagePath -Raw | ConvertFrom-Json
+    return $ExistingProfile.dsh.profile.bundles -contains '@deepseek-ai/dsh-experimental-schedule-bundle'
+  }
+  return $false
 }
 
 if (-not (Test-Path -LiteralPath $LockPath)) { throw "DSH 锁文件缺失：$LockPath" }
@@ -237,16 +307,10 @@ if (-not $ValidateOnly) {
 }
 
 $SourceExisted = Test-Path -LiteralPath $SourceDir -PathType Container
-$PriorRuntimeCommit = $null
-if (Test-Path -LiteralPath $BuildStatePath) {
-  try { $PriorRuntimeCommit = (Get-Content -LiteralPath $BuildStatePath -Raw | ConvertFrom-Json).commit } catch { }
-}
-
-if (-not (Test-Path -LiteralPath $SourceDir)) {
-  if ($Offline -or $SkipInstall -or $ValidateOnly) { throw "离线/校验模式要求 DSH 源码已存在：$SourceDir" }
-  New-Item -ItemType Directory -Force -Path $RuntimeRoot | Out-Null
-  Invoke-Checked -Command git -Arguments @("clone", "--depth", "1", "--branch", $Lock.tag, "--single-branch", $Lock.repository, $SourceDir)
-} else {
+$CurrentHead = $null
+$SourceArchive = $null
+$UpgradeBackupPath = $null
+if ($SourceExisted) {
   $Dirty = @(& git -C $SourceDir status --porcelain)
   if ($LASTEXITCODE -ne 0) { throw "现有 DSH source 不是可验证的 Git checkout：$SourceDir" }
   if ($Dirty.Count -gt 0) { throw "DSH source 含本地修改，拒绝覆盖：$SourceDir" }
@@ -260,39 +324,29 @@ if (-not (Test-Path -LiteralPath $SourceDir)) {
 
   $CurrentHead = (& git -C $SourceDir rev-parse HEAD).Trim()
   if ($LASTEXITCODE -ne 0) { throw "无法读取现有 DSH source 的 HEAD：$SourceDir" }
-  if ($CurrentHead -ne $Lock.commit) {
-    if ($ValidateOnly) { throw "DSH source 版本漂移：当前 $CurrentHead，期望 $($Lock.commit)；请先运行 setup-dsh.ps1。" }
-
-    $LocalTagCommit = (& git -C $SourceDir rev-list -n 1 $Lock.tag 2>$null | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $LocalTagCommit -ne $Lock.commit) {
-      if ($Offline) { throw "离线模式下现有 DSH source 没有目标 tag（版本标签）$($Lock.tag)。" }
-      Invoke-Checked -Command git -Arguments @("-C", $SourceDir, "fetch", "--depth", "1", "origin", "refs/tags/$($Lock.tag):refs/tags/$($Lock.tag)")
-      $LocalTagCommit = (& git -C $SourceDir rev-list -n 1 $Lock.tag).Trim()
-      if ($LASTEXITCODE -ne 0) { throw "无法解析已获取的 DSH tag（版本标签）$($Lock.tag)。" }
-    }
-    if ($LocalTagCommit -ne $Lock.commit) { throw "DSH tag（版本标签）commit（提交号）不匹配：期望 $($Lock.commit)，实际 $LocalTagCommit。" }
-
-    Invoke-Checked -Command git -Arguments @("-C", $SourceDir, "checkout", "--detach", $Lock.commit)
-  }
+  if ($CurrentHead -ne $Lock.commit -and ($ValidateOnly -or $SkipInstall)) { throw "DSH source（源码）版本漂移：当前 $CurrentHead，期望 $($Lock.commit)；请运行完整安装。" }
+} elseif ($Offline -or $SkipInstall -or $ValidateOnly) {
+  throw "离线/校验模式要求 DSH 源码已存在：$SourceDir"
 }
 
-# 清除旧版本留下但被 Git 忽略的生成产物，避免干扰新版构建；干净暂存 checkout（检出）会保留旧源码以便回退。
-$LegacySettingsFileOutput = Join-Path $SourceDir "packages\settings\settings-file\lib\types\index.js"
-if (-not $ValidateOnly -and $SourceExisted -and $PriorRuntimeCommit -ne $Lock.commit -and ($CurrentHead -ne $Lock.commit -or (Test-Path -LiteralPath $LegacySettingsFileOutput))) {
-  $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+if (-not $ValidateOnly) {
+  $Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+  $UpgradeBackupPath = Join-Path $RuntimeRoot ("upgrade.backup-{0}-{1}" -f $Lock.version, $Stamp)
+  Save-RuntimeBackup $UpgradeBackupPath
+}
+
+try {
+if (-not $ValidateOnly -and -not $SkipInstall) {
+  # 干净暂存源码保留旧版本依赖与生成产物，构建失败可完整恢复。
   $StagedSource = Join-Path $RuntimeRoot ("source.staging-{0}-{1}" -f $Lock.version, $Stamp)
-  $ArchiveCommit = [string]$CurrentHead
-  $SourceArchive = Join-Path $RuntimeRoot ("source.backup-{0}-{1}" -f $ArchiveCommit.Substring(0, [Math]::Min(12, $ArchiveCommit.Length)), $Stamp)
-  foreach ($Candidate in @($StagedSource, $SourceArchive)) {
-    $CandidateFull = [System.IO.Path]::GetFullPath($Candidate)
-    $RuntimeFull = [System.IO.Path]::GetFullPath($RuntimeRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
-    if (-not $CandidateFull.StartsWith($RuntimeFull, [StringComparison]::OrdinalIgnoreCase)) { throw "DSH source staging path escaped runtime directory: $CandidateFull" }
-    if (Test-Path -LiteralPath $CandidateFull) { throw "DSH source staging destination already exists: $CandidateFull" }
+  Assert-RuntimePath $StagedSource
+  if ($Offline) {
+    Invoke-Checked -Command git -Arguments @("clone", "--no-local", "--no-checkout", $SourceDir, $StagedSource)
+    Invoke-Checked -Command git -Arguments @("-C", $StagedSource, "remote", "set-url", "origin", $Lock.repository)
+    Invoke-Checked -Command git -Arguments @("-C", $StagedSource, "checkout", "--detach", $Lock.commit)
+  } else {
+    Invoke-Checked -Command git -Arguments @("clone", "--depth", "1", "--branch", $Lock.tag, "--single-branch", $Lock.repository, $StagedSource)
   }
-  New-Item -ItemType Directory -Force -Path $RuntimeRoot | Out-Null
-  Invoke-Checked -Command git -Arguments @("clone", "--no-local", "--no-checkout", $SourceDir, $StagedSource)
-  Invoke-Checked -Command git -Arguments @("-C", $StagedSource, "remote", "set-url", "origin", $Lock.repository)
-  Invoke-Checked -Command git -Arguments @("-C", $StagedSource, "checkout", "--detach", $Lock.commit)
   $StagedHead = (& git -C $StagedSource rev-parse HEAD).Trim()
   $StagedTag = (& git -C $StagedSource describe --tags --exact-match HEAD).Trim()
   $StagedDirty = @(& git -C $StagedSource status --porcelain)
@@ -300,16 +354,14 @@ if (-not $ValidateOnly -and $SourceExisted -and $PriorRuntimeCommit -ne $Lock.co
     throw "DSH source staging checkout failed verification; original source remains at $SourceDir."
   }
 
-  Move-Item -LiteralPath $SourceDir -Destination $SourceArchive
-  try {
-    Move-Item -LiteralPath $StagedSource -Destination $SourceDir
-  } catch {
-    if (-not (Test-Path -LiteralPath $SourceDir) -and (Test-Path -LiteralPath $SourceArchive)) {
-      Move-Item -LiteralPath $SourceArchive -Destination $SourceDir
-    }
-    throw
+  if ($SourceExisted) {
+    $SourceArchive = Join-Path $RuntimeRoot ("source.backup-{0}-{1}" -f $CurrentHead.Substring(0, 12), $Stamp)
+    Assert-RuntimePath $SourceDir
+    Assert-RuntimePath $SourceArchive
+    Move-Item -LiteralPath $SourceDir -Destination $SourceArchive -ErrorAction Stop
+    Write-Host "旧 DSH source（源码）及其构建产物已留档：$SourceArchive" -ForegroundColor Yellow
   }
-  Write-Host "旧 DSH source 已完整留档：$SourceArchive" -ForegroundColor Yellow
+  Move-Item -LiteralPath $StagedSource -Destination $SourceDir -ErrorAction Stop
 }
 
 if (-not $ValidateOnly) { New-Item -ItemType Directory -Force -Path $HomeDir | Out-Null }
@@ -330,9 +382,11 @@ if (-not $SkipInstall -and -not $ValidateOnly) {
   # Corepack（Node.js 包管理器代理）先固定 pnpm（包管理器）版本；DSH 的 packageManager（包管理器版本字段）约束嵌套命令。
   Invoke-Checked -Command pnpm -Arguments $InstallArgs -WorkingDirectory $SourceDir
   Invoke-Checked -Command pnpm -Arguments @("run", "verify-third-party-notices") -WorkingDirectory $SourceDir
+  Invoke-Checked -Command pnpm -Arguments @("run", "verify-dsh-package-licenses") -WorkingDirectory $SourceDir
   # 每次构建前清理生成的 project-reference（项目引用）产物；目标版的 `clean`（清理）脚本会误拒自身桌面键盘测试的 outDir（输出目录）。
   Invoke-Checked -Command pnpm -Arguments @("exec", "tsc", "-b", "--clean") -WorkingDirectory $SourceDir
   Invoke-Checked -Command pnpm -Arguments @("run", "build") -WorkingDirectory $SourceDir
+  Invoke-Checked -Command pnpm -Arguments @("run", "verify-runtime-closure") -WorkingDirectory $SourceDir
 }
 
 if (-not (Test-Path -LiteralPath $CliPath)) { throw "DSH CLI 构建产物缺失：$CliPath" }
@@ -348,7 +402,7 @@ $PromptHash = Get-TreeHash @($CommonPromptPath, $DshRulesPath)
 $PresetText = Get-Content -LiteralPath (Join-Path $PresetSource "agent.cordis.yml") -Raw
 $ShadowPresetPackageText = ([ordered]@{
   name = $ShadowPresetPackageName
-  version = "0.1.0"
+  version = "0.1.1"
   private = $true
   type = "module"
   dsh = @{ bundle = @{ patch = "./cordis.patch.yml" } }
@@ -411,6 +465,7 @@ if ($ValidateOnly) {
   $WakeTasksArtifactPackage = Get-Content -LiteralPath $WakeTasksPackagePath -Raw | ConvertFrom-Json
   if ($WakeTasksArtifactPackage.main -ne 'lib/plugin.js' -or $WakeTasksArtifactPackage.exports.'.' -ne './lib/plugin.js') { throw "唤醒任务插件入口未指向 plugin.js。" }
   $State = Get-Content -LiteralPath $BuildStatePath -Raw | ConvertFrom-Json
+  if ($State.commit -ne $Lock.commit -or $State.version -ne $Lock.version -or $State.tag -ne $Lock.tag) { throw "DSH 构建记录与版本锁不匹配。" }
   if ($State.schema_version -ne 5) { throw "DSH build-state 格式版本已过期；请重新运行 setup-dsh.ps1。" }
   $CurrentRuntimeArtifactHash = Get-TreeHash @($BridgeRuntimeArtifactPaths)
   $CurrentBuildInputsHash = Get-TreeHash @($BridgeBuildInputPaths)
@@ -441,25 +496,10 @@ if (-not $ValidateOnly) {
   if (-not (Test-Path -LiteralPath $SessionMappingPath -PathType Leaf)) {
     Write-Utf8NoBom -Path $SessionMappingPath -Text (([ordered]@{ schema_version = 2; sessions = @{} } | ConvertTo-Json -Depth 4) + "`n")
   }
-  if ((Test-Path -LiteralPath $HomeDir -PathType Container) -and @(Get-ChildItem -Force -LiteralPath $HomeDir).Count -gt 0) {
-    $PreviousState = $null
-    if (Test-Path -LiteralPath $BuildStatePath) {
-      try { $PreviousState = Get-Content -LiteralPath $BuildStatePath -Raw | ConvertFrom-Json } catch { }
-    }
-    if (-not $PreviousState -or $PreviousState.commit -ne $Lock.commit -or $PreviousState.schema_version -ne 5) {
-      $BackupPath = Join-Path $RuntimeRoot ("home.backup-{0}-{1}" -f $Lock.version, (Get-Date -Format "yyyyMMdd-HHmmss"))
-      New-Item -ItemType Directory -Force -Path $RuntimeRoot | Out-Null
-      & robocopy $HomeDir $BackupPath /E /COPY:DAT /DCOPY:DAT /SL /SJ /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-      if ($LASTEXITCODE -ge 8) { throw "DSH_HOME 备份失败（robocopy exit $LASTEXITCODE）：$BackupPath" }
-      Write-Host "DSH_HOME 已备份到 $BackupPath" -ForegroundColor Yellow
-    }
-  }
   New-Item -ItemType Directory -Force -Path $ProfileDir, $ShadowPresetArtifactDir, $WakeTasksArtifactDir | Out-Null
   $ProfilePatchPath = Join-Path $ProfileDir "cordis.patch.yml"
   Invoke-Checked -Command node -Arguments @(
     (Join-Path $PSScriptRoot "check-dsh-wake-migration.mjs"),
-    (Join-Path $SourceDir "packages\schedule\schedule\lib\index.js"),
-    (Join-Path $HomeDir "storages\schedule.json"),
     (Join-Path $RepoRoot "config\wake-tasks.json")
   )
   Update-ManagedProfilePatch -ProfilePatchPath $ProfilePatchPath
@@ -515,3 +555,11 @@ if (-not $ValidateOnly) {
 }
 
 Write-Host "DSH $($Lock.version) 校验完成；source=$SourceDir；home=$HomeDir" -ForegroundColor Green
+} catch {
+  $InstallFailure = $_
+  if ($UpgradeBackupPath) {
+    try { Restore-RuntimeBackup $UpgradeBackupPath }
+    catch { throw "DSH 安装失败，自动恢复也失败；请保留备份 $UpgradeBackupPath。安装错误：$InstallFailure；恢复错误：$_" }
+  }
+  throw $InstallFailure
+}

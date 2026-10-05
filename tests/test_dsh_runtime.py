@@ -114,6 +114,48 @@ class DshRuntimeTests(unittest.TestCase):
 
 
 class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_release_refresh_preserves_native_task_selection_and_patch(self) -> None:
+        """更新程序默认配置时保留官方会话任务选择及其用户补丁。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            config = DshConfig(source_dir=root / "source", home_dir=root / "home")
+            metadata = {"schema": 1, "version": config.expected_version, "commit": config.expected_commit,
+                        "bridge_protocol": config.bridge_protocol_version, "node": "node.exe",
+                        "entry": "runtime-bootstrap.mjs", "schedule": "node_modules/@deepseek-ai/dsh-schedule/lib/index.js", "modules": "node_modules"}
+            for name in ("node.exe", "runtime-bootstrap.mjs", "package.json", metadata["schedule"], "node_modules/@deepseek-ai/dsh/lib/bin.js"):
+                file = runtime / name
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text("fixture", encoding="utf-8")
+            atomic_json(runtime / "runtime.json", metadata)
+            atomic_json(runtime / "manifest.json", manifest(runtime, kind="dsh", build="test"))
+            native = "@deepseek-ai/dsh-experimental-schedule-bundle"
+            template = root / "config/dsh/profile"
+            template.mkdir(parents=True)
+            atomic_json(template / "package.json", {
+                "dependencies": {"voice-plugin": "0.1.1"},
+                "dsh": {"profile": {"bundles": ["base", "voice-plugin"]}},
+            })
+            profile = config.home_dir / "profiles/web"
+            profile.mkdir(parents=True)
+            atomic_json(profile / "package.json", {
+                "dependencies": {"voice-plugin": "0.1.0", "user-plugin": "1.2.3"},
+                "dsh": {"profile": {"bundles": ["base", "voice-plugin", native, "user-plugin"]}},
+            })
+            user_patch = b"- id: schedule\n  disabled: false\n  config:\n    retention: 30\n"
+            (profile / "cordis.patch.yml").write_bytes(user_patch)
+            manager = DshRuntimeManager(config)
+            manager.repo_root, manager.release_runtime = root, runtime
+            with patch.object(manager, "_ensure_modules_link", AsyncMock()), \
+                 patch.object(manager, "_profile_patch_preserves_managed_defaults", return_value=True):
+                await manager._validate_release()
+                await manager._validate_release()
+            package = json.loads((profile / "package.json").read_text(encoding="utf-8"))
+            self.assertEqual(package["dsh"]["profile"]["bundles"], ["base", "voice-plugin", native, "user-plugin"])
+            self.assertEqual(package["dependencies"], {"voice-plugin": "0.1.1", "user-plugin": "1.2.3"})
+            self.assertEqual((profile / "cordis.patch.yml").read_bytes(), user_patch)
+
     async def test_release_checks_required_entries_without_development_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

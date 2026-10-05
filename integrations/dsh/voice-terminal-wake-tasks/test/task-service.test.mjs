@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, unlinkSync, rmdirSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync, unlinkSync, rmdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,19 +16,25 @@ process.env.VOICE_DSH_CALLBACK_ORIGIN = 'http://127.0.0.1:8765'
 process.env.VOICE_DSH_BRIDGE_TOKEN = 'test-token'
 
 const historical = {
-  id: 'schedule-old', kind: 'after', title: '旧任务', prompt: '旧任务内容',
+  id: 'schedule-old', kind: 'after', title: '已有链路任务', prompt: '旧任务内容',
   afterSeconds: 60, scheduledAt: '2026-09-26T15:13:25.574Z',
 }
-writeFileSync(native, JSON.stringify({ tables: { tasks: {
-  'schedule-old': { sessionId: 'voice-shadow-retired', record: historical,
-    status: 'inactive', deliveryHistory: { records: [{ messageId: 'old-message' }] } },
-} } }), 'utf8')
+writeFileSync(store, JSON.stringify({ schema_version: 1, tasks: [{
+  task_id: historical.id, target: 'shadow_agent', text: historical.prompt, reference: '已有上下文',
+  record: historical, status: 'archived', created_at: historical.scheduledAt, updated_at: historical.scheduledAt,
+  last_triggered_at: null, occurrence: 2, history: [{ messageId: 'old-message' }],
+}] }), 'utf8')
+const nativeContent = JSON.stringify({ tables: { tasks: {
+  'native-task': { sessionId: 'ordinary-dsh-session', record: { ...historical, id: 'native-task', scheduledAt: '2030-01-01T00:00:00Z' },
+    status: 'active', deliveryHistory: { records: [] } },
+} } })
+writeFileSync(native, nativeContent, 'utf8')
 
 const { TaskService } = await import(
   new URL('../../../../.runtime/dsh/bundles/voice-terminal-wake-tasks/lib/task-service.js', import.meta.url).href,
 )
 
-test('imports history once, persists a new task, and delivers it through the current-mainline endpoint', async () => {
+test('preserves project history, keeps native tasks separate, and delivers to the current voice mainline', async () => {
   const calls = []
   const originalFetch = globalThis.fetch
   globalThis.fetch = async (url, options) => {
@@ -39,6 +45,8 @@ test('imports history once, persists a new task, and delivers it through the cur
   try {
     service = new TaskService()
     assert.equal(service.list().find(row => row.task_id === 'schedule-old').status, 'archived')
+    assert.equal(service.list().some(row => row.task_id === 'native-task'), false)
+    assert.equal(service.reference('schedule-old').reference, '已有上下文')
     const created = await service.create({ when: '1s', text: '请检查现在的状态' }, '创建时背景')
     assert.equal(created.has_reference, true)
     assert.equal(service.reference(created.task_id).reference, '创建时背景')
@@ -56,6 +64,9 @@ test('imports history once, persists a new task, and delivers it through the cur
     await service.close()
     service = new TaskService()
     assert.equal(service.list().length, 5)
+    assert.equal(service.list().some(row => row.task_id === 'native-task'), false)
+    assert.equal(service.list().find(row => row.task_id === 'schedule-old').delivery_history[0].messageId, 'old-message')
+    assert.equal(readFileSync(native, 'utf8'), nativeContent, '官方会话任务文件保持独立且未改动')
     assert.equal(service.list().find(row => row.task_id === created.task_id).delivery_history[0].dshSessionId,
       'voice-shadow-current')
   } finally {

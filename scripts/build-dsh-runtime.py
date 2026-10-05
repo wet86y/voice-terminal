@@ -143,7 +143,13 @@ def main():
         if workspace.exists(): raise FileExistsError("独立构建工作目录已存在；请选择新的产物标识。")
         print("准备独立生产构建输入……", flush=True)
         stage_workspace(source, workspace)
-        options = ("--config.allow-unused-patches=true", "--config.node-linker=hoisted", "--config.auto-install-peers=false", "--config.link-workspace-packages=true")
+        # autoInstallPeers（自动安装同伴依赖）须沿用上游锁文件，否则冻结安装会拒绝新版本。
+        peer_setting = yaml.safe_load((workspace / "pnpm-lock.yaml").read_text(encoding="utf-8"))["settings"]["autoInstallPeers"]
+        if not isinstance(peer_setting, bool):
+            raise ValueError("上游锁文件的自动同伴依赖设置无效。")
+        # 生产收集不执行源码仓库的开发钩子；Windows（操作系统）依赖使用已发布的预编译文件。
+        options = ("--config.allow-unused-patches=true", "--config.ignore-scripts=true", "--config.node-linker=hoisted",
+                   f"--config.auto-install-peers={str(peer_setting).lower()}", "--config.link-workspace-packages=true")
         run(node, pnpm, "install", "--prod", "--frozen-lockfile", "--ignore-scripts", *options, cwd=workspace, env=env)
         print("收集生产依赖闭包……", flush=True)
         run(node, pnpm, "--filter", "dsh-python-runtime-closure", "deploy", "--legacy", "--prod", *options, deploy, cwd=workspace, env=env)
@@ -167,6 +173,14 @@ def main():
     for key in ("node", "entry", "schedule"):
         if not (output / metadata[key]).is_file():
             raise FileNotFoundError(f"运行产物缺少必要文件：{key}")
+    # Schedule（任务规则模块）来自 CLI（命令入口）的传递依赖，须在生产闭包内实际加载。
+    exports = ("createAfterScheduleRecord", "createAtScheduleRecord", "createEveryScheduleRecord",
+               "createDailyScheduleRecord", "createWeeklyScheduleRecord", "createCronScheduleRecord",
+               "decodeScheduleRecord", "isRecurringScheduleRecord", "resolveRecurringOccurrence")
+    run(output / "node.exe", "--input-type=module", "-e",
+        "const m=await import(process.argv[1]);for(const name of JSON.parse(process.argv[2]))"
+        "{if(typeof m[name]!=='function')throw new Error('任务规则模块缺少导出：'+name)}",
+        (output / metadata["schedule"]).as_uri(), json.dumps(exports), cwd=output)
     print(run(output / "node.exe", output / "runtime-bootstrap.mjs", "--version", cwd=output.parent), flush=True)
     atomic_json(output / "runtime.json", metadata)
     for path in files(output):

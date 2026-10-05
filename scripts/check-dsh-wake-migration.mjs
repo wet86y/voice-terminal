@@ -1,8 +1,5 @@
 import { readFileSync } from 'node:fs'
-import { pathToFileURL } from 'node:url'
-
-const [scheduleModulePath, nativePath, legacyPath] = process.argv.slice(2)
-const { decodeScheduleRecord } = await import(pathToFileURL(scheduleModulePath).href)
+const [legacyPath] = process.argv.slice(2) // legacyPath（旧语音链路任务路径），官方会话任务不属于迁移来源。
 
 function read(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')) }
@@ -10,14 +7,6 @@ function read(path) {
     if (error?.code === 'ENOENT') return undefined
     throw error
   }
-}
-
-const native = read(nativePath)
-const nativeRows = native?.tables?.tasks ?? {}
-if (typeof nativeRows !== 'object' || Array.isArray(nativeRows)) throw new Error('DSH 原生任务目录无效。')
-for (const [id, row] of Object.entries(nativeRows)) {
-  try { decodeScheduleRecord(row.record) }
-  catch (error) { throw new Error(`原生任务 ${id} 无法迁移：${error}`) }
 }
 
 const legacy = read(legacyPath)
@@ -33,4 +22,4 @@ for (const [id, row] of Object.entries(legacyRows)) {
     throw new Error(`旧 Voice 任务 ${id} 的重复间隔不兼容。`)
   }
 }
-process.stdout.write(`可迁移任务：DSH ${Object.keys(nativeRows).length}，Voice ${Object.keys(legacyRows).length}\n`)
+process.stdout.write(`可迁移旧 Voice（语音链路）任务：${Object.keys(legacyRows).length}；官方 DSH 会话任务保持独立。\n`)
