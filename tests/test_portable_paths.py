@@ -156,6 +156,24 @@ def test_private_pipe_honors_exit_budget_and_rejects_malformed_messages(monkeypa
         assert before + budget <= application.shutdown_deadline <= time.monotonic() + budget
 
 
+def test_desktop_ready_frame_carries_one_time_token_only_over_private_pipe(monkeypatch):
+    from voice_terminal.application import desktop
+    output = io.StringIO()
+    class DeferredThread:
+        def __init__(self, *args, **kwargs): pass
+        def start(self): pass
+    application = SimpleNamespace(loop=None, exit_event=asyncio.Event(), state=SimpleNamespace(value={"instance_id": "instance-1"}))
+    control = DesktopControl(application)
+    monkeypatch.setattr("sys.stdout", output)
+    monkeypatch.setattr(desktop.threading, "Thread", DeferredThread)
+    control.start("http://127.0.0.1:5173", "short-lived-token")
+    message = json.loads(output.getvalue())
+    assert message["kind"] == "ready"
+    assert message["origin"] == "http://127.0.0.1:5173"
+    assert message["launch_token"] == "short-lived-token"
+    assert message["instance_id"] == "instance-1"
+
+
 def test_publisher_collection_can_exclude_data_before_following_links(tmp_path):
     (tmp_path / 'data').mkdir()
     (tmp_path / 'program.txt').write_text('程序', encoding='utf-8')

@@ -8,7 +8,7 @@ import uuid
 
 TERMINAL = {"ready", "disabled", "failed", "blocked", "external", "stopped"}
 LABELS = {
-    "host": "应用宿主", "web": "网页服务", "setup": "环境与配置检查",
+    "host": "应用宿主", "web": "界面服务", "setup": "环境与配置检查",
     "asr": "ASR（语音识别）", "analysis": "分析工作进程",
     "voice": "Voice Server（语音服务）", "speaker": "声纹工作进程",
     "dsh": "DSH（代理执行宿主）",

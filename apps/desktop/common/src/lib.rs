@@ -46,7 +46,7 @@ pub struct LaunchContext {
     pub diagnostic: bool,          // diagnostic（不启动业务的入口诊断模式）。
 }
 
-fn canonical_path(path: &Path) -> Result<PathBuf, String> {
+pub fn canonical_path(path: &Path) -> Result<PathBuf, String> {
     let resolved = path
         .canonicalize()
         .map_err(|e| format!("路径不可用：{}（{e}）", path.display()))?;
@@ -335,41 +335,46 @@ impl LaunchContext {
 
     #[cfg(windows)]
     pub fn prepare_webview_access(&self) -> Result<(), String> {
-        let Some(engine) = &self.webview2 else {
-            return Ok(());
-        };
-        let marker = data_state(&self.data)?.join("webview2-access.json");
-        reject_reparse(&marker)?;
-        if let Ok(bytes) = fs::read(&marker) {
-            if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if record["path"].as_str() == engine.to_str() {
-                    return Ok(());
-                }
-            }
-        }
-        use std::os::windows::process::CommandExt;
-        let system = std::env::var_os("SystemRoot").ok_or("无法定位系统权限工具")?;
-        let tool = PathBuf::from(system).join("System32/icacls.exe");
-        for identity in ["*S-1-15-2-1:(OI)(CI)(RX)", "*S-1-15-2-2:(OI)(CI)(RX)"] {
-            let result = std::process::Command::new(&tool)
-                .arg(engine)
-                .args(["/grant", identity, "/T", "/Q"])
-                .creation_flags(0x08000000)
-                .output()
-                .map_err(|e| format!("固定网页运行时的读取／执行权限准备失败：{e}"))?;
-            if !result.status.success() {
-                return Err("固定网页运行时权限准备失败。请将应用移到当前账户可写的本地目录，或在停机后将便携配置及本地启用记录的 webview2（固定引擎）设为空并使用系统运行时。".into());
-            }
-        }
-        fs::create_dir_all(marker.parent().unwrap()).map_err(|e| e.to_string())?;
-        fs::write(
-            marker,
-            serde_json::to_vec(&serde_json::json!({"schema":1,"path":engine}))
-                .map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
+        prepare_webview_access_paths(&self.data, self.webview2.as_deref())
     }
+}
+
+#[cfg(windows)]
+pub fn prepare_webview_access_paths(data: &Path, engine: Option<&Path>) -> Result<(), String> {
+    let Some(engine) = engine else {
+        return Ok(());
+    };
+    let marker = data_state(data)?.join("webview2-access.json");
+    reject_reparse(&marker)?;
+    if let Ok(bytes) = fs::read(&marker) {
+        if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if record["path"].as_str() == engine.to_str() {
+                return Ok(());
+            }
+        }
+    }
+    use std::os::windows::process::CommandExt;
+    let system = std::env::var_os("SystemRoot").ok_or("无法定位系统权限工具")?;
+    let tool = PathBuf::from(system).join("System32/icacls.exe");
+    for identity in ["*S-1-15-2-1:(OI)(CI)(RX)", "*S-1-15-2-2:(OI)(CI)(RX)"] {
+        let result = std::process::Command::new(&tool)
+            .arg(engine)
+            .args(["/grant", identity, "/T", "/Q"])
+            .creation_flags(0x08000000)
+            .output()
+            .map_err(|e| format!("固定网页运行时的读取／执行权限准备失败：{e}"))?;
+        if !result.status.success() {
+            return Err("固定网页运行时权限准备失败。请将应用移到当前账户可写的本地目录，或在停机后将便携配置及本地启用记录的 webview2（固定引擎）设为空并使用系统运行时。".into());
+        }
+    }
+    fs::create_dir_all(marker.parent().unwrap()).map_err(|e| e.to_string())?;
+    fs::write(
+        marker,
+        serde_json::to_vec(&serde_json::json!({"schema":1,"path":engine}))
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(windows)]

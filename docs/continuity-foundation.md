@@ -107,7 +107,7 @@ Voice（语音）主线与当前关联的 DSH（后台代理执行环境）会�
 
 ```powershell
 python -m pytest -q
-cd apps/web
+cd apps/frontend
 npm run test
 npm run typecheck
 npm run build

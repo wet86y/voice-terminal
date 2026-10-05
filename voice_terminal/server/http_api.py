@@ -61,11 +61,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         item.strip() for item in os.environ.get("VOICE_WEB_ORIGINS", "").split(",")
         if item.strip() and item.strip() != "*"
     ]
-    origins = list(dict.fromkeys([
-        "http://127.0.0.1:5173",
-        "http://localhost:5173",
-        *configured_origins,
-    ]))
+    # VOICE_WEB_ORIGINS（界面允许来源）由宿主传入当前桌面实际地址，禁止浏览器默认回退。
+    origins = list(dict.fromkeys(configured_origins))
     try:
         from fastapi.middleware.cors import CORSMiddleware  # type: ignore
         app.add_middleware(

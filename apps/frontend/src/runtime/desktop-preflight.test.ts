@@ -1,0 +1,99 @@
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { runDesktopPreflight, validateDesktopStatus, type NativeCommandInvoker } from './desktop-preflight'
+
+function native(status: unknown): NativeCommandInvoker {
+  const call = vi.fn(async (command: string) => command === 'desktop_status' ? status : undefined)
+  return { invoke: call as NativeCommandInvoker['invoke'] }
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  document.body.innerHTML = '<div id="app"></div>'
+})
+
+describe('desktop preflight（桌面预检）', () => {
+  it.each([
+    [undefined, '桌面启动程序返回了无效状态'],
+    [{ ready: true, error: '宿主启动失败', frontend_mode: 'product', development: false }, '宿主启动失败'],
+    [{ ready: false, error: null, frontend_mode: 'product', development: false }, '尚未就绪'],
+    [{ ready: true, error: null, frontend_mode: 'ui-preview', development: true }, '入口不匹配'],
+    [{ ready: true, error: null, frontend_mode: 'product', development: 'yes' }, 'development（开发标识）'],
+    [{ ready: true, error: null, frontend_mode: 'product' }, 'development（开发标识）'],
+  ])('关闭无效状态下的应用导入', async (status, message) => {
+    const startApplication = vi.fn(async () => undefined)
+    const root = document.createElement('div')
+    await runDesktopPreflight({
+      expectedMode: 'product',
+      invoke: native(status),
+      startApplication,
+      root,
+    })
+    expect(startApplication).not.toHaveBeenCalled()
+    expect(root.textContent).toContain(message)
+    if (message === '入口不匹配') expect(root.textContent).toContain('product（产品）')
+    expect(root.querySelector('button')?.textContent).toBe('重试')
+  })
+
+  it('拒绝使用正式构建启动 ui-preview（样例）入口', async () => {
+    const root = document.createElement('div')
+    const startApplication = vi.fn(async () => undefined)
+    await runDesktopPreflight({
+      expectedMode: 'ui-preview',
+      invoke: native({ ready: true, error: null, frontend_mode: 'ui-preview', development: false }),
+      startApplication,
+      root,
+    })
+    expect(startApplication).not.toHaveBeenCalled()
+    expect(root.textContent).toContain('ui-preview（样例）入口只允许调试构建启动')
+  })
+
+  it('在浏览器缺少原生接口时显示说明，且不执行启动回调', async () => {
+    const startApplication = vi.fn(async () => undefined)
+    await runDesktopPreflight({ expectedMode: 'ui-preview', invoke: null, startApplication })
+    expect(startApplication).not.toHaveBeenCalled()
+    expect(document.getElementById('app')?.textContent).toContain('没有检测到桌面原生运行时')
+    expect(document.getElementById('app')?.textContent).toContain('浏览器页面不会连接语音服务')
+  })
+
+  it('只在状态完整且模式匹配时调用 Vue 应用加载器', async () => {
+    const startApplication = vi.fn(async () => undefined)
+    const invoke = native({ ready: true, error: null, frontend_mode: 'ui-preview', development: true })
+    await runDesktopPreflight({ expectedMode: 'ui-preview', invoke, startApplication })
+    expect(invoke.invoke).toHaveBeenCalledOnce()
+    expect(invoke.invoke).toHaveBeenCalledWith('desktop_status')
+    expect(startApplication).toHaveBeenCalledOnce()
+    expect(validateDesktopStatus({ ready: true, error: null, frontend_mode: 'product', development: false }, 'product')).toBeNull()
+    expect(validateDesktopStatus({ ready: true, error: null, frontend_mode: 'product', development: true }, 'product')).toBeNull()
+  })
+
+  it('状态失败时不会加载应用配置脚本或请求业务接口', async () => {
+    const startApplication = vi.fn(async () => {
+      const script = document.createElement('script')
+      script.src = '/application-config.js'
+      document.head.append(script)
+    })
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    await runDesktopPreflight({
+      expectedMode: 'product',
+      invoke: native({ ready: false, error: null, frontend_mode: 'product', development: false }),
+      startApplication,
+    })
+    expect(startApplication).not.toHaveBeenCalled()
+    expect(document.querySelector('script[src="/application-config.js"]')).toBeNull()
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('允许错误态重试，并在重试状态通过后启动一次', async () => {
+    let status: unknown = { ready: false, error: null, frontend_mode: 'product', development: false }
+    const call = vi.fn(async () => status)
+    const invoke: NativeCommandInvoker = { invoke: call as NativeCommandInvoker['invoke'] }
+    const startApplication = vi.fn(async () => undefined)
+    await runDesktopPreflight({ expectedMode: 'product', invoke, startApplication })
+    status = { ready: true, error: null, frontend_mode: 'product', development: false }
+    document.querySelector('button')?.click()
+    await vi.waitFor(() => expect(startApplication).toHaveBeenCalledOnce())
+    expect(call).toHaveBeenCalledTimes(2)
+  })
+})

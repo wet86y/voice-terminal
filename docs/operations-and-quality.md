@@ -18,7 +18,7 @@ git diff --check
 
 | 区域 | 测试入口 |
 | --- | --- |
-| 独立应用宿主、进程树、状态接口与退出 | `tests/test_application_host.py`、`tests/test_dsh_runtime.py`、`apps/web/src/product/application-host.test.ts` |
+| 独立应用宿主、进程树、状态接口与退出 | `tests/test_application_host.py`、`tests/test_dsh_runtime.py`、`apps/frontend/src/product/application-host.test.ts` |
 | 便携路径、旧数据导入、组件校验与安全归档 | `tests/test_portable_paths.py`、`tests/test_desktop_packaging.py` |
 | 桌面原生路径与启用组合 | `cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common`（原生公共模块测试） |
 | ASR（自动语音识别）分块与最终刷新 | `tests/test_asr_worker.py`、`tests/test_asr_worker_protocol.py` |
@@ -27,7 +27,7 @@ git diff --check
 | TTS、speech admission、分段发送 | `tests/test_minimax_tts.py`、`tests/test_speech_admission.py`、`tests/test_sentence_scheduling.py` |
 | 声纹 | `tests/test_speaker.py`、`tests/test_speaker_features.py` |
 | KWS、输入所有权与静默窗口 | `tests/test_kws_always_on.py`、`tests/test_scheduler_staircase.py`、`tests/test_kws_wake_window.py` |
-| Product UI（产品界面）与空输入展示 | `apps/web/src/product/useProductAdapter.test.ts`、`apps/web/src/conversation-log.test.ts`、`npm test`、`npm run typecheck` |
+| Product UI（产品界面）与空输入展示 | `apps/frontend/src/product/useProductAdapter.test.ts`、`apps/frontend/src/conversation-log.test.ts`、`npm test`、`npm run typecheck` |
 
 完整回归不能只运行局部测试；协议、上下文、生命周期或公共事件变更必须运行 Python 全量、前端测试、类型检查和构建。
 
@@ -39,14 +39,14 @@ git diff --check
 
 ```powershell
 npm run build
-.\scripts\start.ps1 -Python D:\DevTools\Python312\python.exe
+.\scripts\start-desktop.ps1 -Python D:\DevTools\Python312\python.exe
 ```
 
-普通入口使用已构建的网页；成品入口与托盘规则见[独立应用启动与系统管理](application-lifecycle.md)。启动完成保持待机，以下输入所有权和语音事务检查须由用户显式开始语音监听后执行。
+桌面入口使用当前静态界面；成品入口与托盘规则见[独立应用启动与系统管理](application-lifecycle.md)。启动完成保持待机，以下输入所有权和语音事务检查须由用户显式开始语音监听后执行。
 
 至少确认：
 
-1. 启动程序打开的实际网页地址在限定时间内可访问；优先使用 `http://127.0.0.1:5173/`，占用时使用空闲端口；
+1. 桌面窗口完成会话握手并在限定时间内加载真实界面，普通浏览器访问该地址只显示说明；优先使用 `http://127.0.0.1:5173/`，占用时使用空闲端口；
 2. `http://127.0.0.1:8765/health` 返回服务快照；
 3. ASR worker（默认 8766）和 analysis worker（默认 8767）按配置启动；
 4. WebSocket `subscribe` 可以获取 `runtime.snapshot`；
@@ -64,7 +64,7 @@ npm run build
 `input_owner=kws`（输入交给关键词唤醒）。讲话中或播报期间请求时应等待；等待期间补充新输入时仍按最新一轮收尾，
 停止或重置会话后旧请求不得恢复。该场景须使用重建后的插件和新语音会话。
 
-`-NoWeb` 只用于后端调试，不能作为完整 Web 语音终端验收结果。
+`scripts/start.ps1`（无界面后端调试）不能作为桌面界面验收结果。
 
 ## 独立应用生命周期验收
 
@@ -89,9 +89,9 @@ git diff --check
 | 手动恢复 | 分别注入语音识别、分析、声纹、语音服务故障；重试去重、恢复业务连接与能力，保持待机，不重播语音或重复执行模型动作。 |
 | DSH（代理执行宿主）恢复 | 有限自动重启和手动恢复按既有上限工作，桥接与关联会话重新绑定；手动恢复重置自动重启计数。 |
 | 统一退出 | 正常运行、模型加载、恢复操作和自动重启等待期间均可退出；总退出预算 15 秒内回收组件并释放端口，强制结束宿主后也无受管子进程残留。 |
-| 窗口与页面生命周期 | 关闭主窗口隐藏到托盘，托盘恢复和重复启动唤回已有窗口；托盘创建失败时保留窗口。页面重载先读快照再接收实时更新；源码调试关闭网页不退出后台服务。 |
+| 窗口与页面生命周期 | 关闭主窗口隐藏到托盘，托盘恢复和重复启动唤回已有窗口；托盘创建失败时保留窗口。页面重载先读快照再接收实时更新；源码调试沿用产品窗口隐藏规则，样例关闭则回收其开发服务。 |
 | 便携环境与数据 | 最终压缩包在中文、空格目录及不同工作目录启动；停机搬迁后仍使用随包运行环境和独立用户数据，运行和退出后逐文件校验只读发布文件。无预装开发环境的干净设备、无显卡设备与目标系统需另外验收。 |
-| 开发兼容 | `-Dev`（开发模式）的热更新、宿主管理接口代理及 SSE（服务器推送事件）可用，外部调试进程不纳入回收。 |
+| 开发兼容 | `-Dev`（开发模式）的热更新、宿主管理接口代理及 SSE（服务器推送事件）可用，开发服务归属被核对，样例不启动业务子进程。 |
 
 完成一次成品启动、运行页使用、退出和再次启动。该检查验证应用生命周期；麦克风、真实供应商请求、语音播报及长会话质量仍按本文其他现场门槛执行。测量、截图与日志留在本机诊断产物中，提交说明记录验证范围和结果。当前已完成的成品验证、内存测量解释及尚未完成的实机检查见[桌面实施验收记录](desktop-acceptance.md)，不能将开发机精简系统搜索路径验证表述为干净设备验收。
 
@@ -101,7 +101,7 @@ git diff --check
 
 ```powershell
 python -m pytest -q tests/test_asr_worker.py tests/test_asr_worker_protocol.py
-npm run test --workspace @voice-terminal/web -- src/product/useProductAdapter.test.ts src/conversation-log.test.ts
+npm run test --workspace @voice-terminal/frontend -- src/product/useProductAdapter.test.ts src/conversation-log.test.ts
 ```
 
 真实模型验证使用同一段 16kHz（16 千赫兹）单声道录音，分别取一个完整分块、多个完整分块、完整分块边界截断及含剩余音频的长度。以“最后一个含音频块设置 `is_final=True`（最终刷新）”为参考，与“音频块先传入、最后单独传空结束包”的工作进程结果比较；检查末尾文字、重复输出和跨轮缓存清理。记录实际 FunASR（语音识别工具包）版本与模型来源，结果保存在本地诊断产物中。该检查只验证识别工作进程，不等同于麦克风到播报的端到端验收；模型参数调优应另外使用固定录音对照评估。
@@ -138,13 +138,7 @@ npm run test --workspace @voice-terminal/web -- src/product/useProductAdapter.te
 
 ## Product UI 验收
 
-真实入口是 `/`；`/ui-demo.html` 是离线 legacy 原型。开发回放：
-
-```text
-http://127.0.0.1:5173/?replay=voice-shadow
-```
-
-外部 Edge 至少往返执行：
+真实验收使用桌面窗口，不能用外部浏览器加载产品页面替代。`npm run dev:ui`（桌面样例）提供固定场景及语音事件回放。分别在真实桌面和样例桌面往返执行：
 
 ```text
 工作台 → 设置 → 工作台 → 设置
