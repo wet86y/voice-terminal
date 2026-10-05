@@ -75,7 +75,7 @@ Python（后端运行环境）与文档转换引擎所需的微软原生运行�
 
 ## 交付位置
 
-本机可直接使用的根入口是 `.runtime/delivery/VoiceTerminal/VoiceTerminal.exe`（启动程序），该目录的 `data`（用户数据）已复制并验证旧项目的 497 个文件；源目录保持原样。
+本机可直接使用的根入口是 `.runtime/delivery/VoiceTerminal/VoiceTerminal.exe`（正式启动程序），该目录沿用原项目的完整用户数据。2026 年 10 月 5 日按当前源码更新为 `desktop-20261005-two-entry`（正式构建标识），启用前后的 5,794 个数据文件中只有 `state/active.json`（启用组合）发生变化，其他文件摘要及数据联接一致。以下压缩包及较早构建标识为历史记录，当前入口与前端演示的修正结果见[桌面唯一前端记录](desktop-frontend-consolidation.md)。
 
 首次完整包是 `.runtime/delivery/VoiceTerminal-20261004-portable.zip`（完整压缩包），大小为 2,676,390,287 字节，约 2.49 GiB（以 1024 为基数的容量单位）。其 SHA-256（文件摘要）为：
 

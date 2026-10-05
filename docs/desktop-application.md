@@ -4,6 +4,8 @@
 
 2026 年 10 月 5 日，主产品、样例预览和界面验收统一为桌面入口，旧浏览器启动器已撤销。当前范围与验证状态见[第一阶段记录](desktop-frontend-consolidation.md)，早期便携候选的历史结果见[实施验收记录](desktop-acceptance.md)。在线更新与发布签名留在后续专题。
 
+当前交付收敛为两个入口：`.runtime/delivery/VoiceTerminal/VoiceTerminal.exe`（完整数据正式程序）和 `.runtime/delivery/VoiceTerminalUIDemo.exe`（纯前端演示程序）。正式程序在原目录更新并沿用完整数据；演示程序从当前源码加载共享界面，用于下一阶段的界面修订。演示入口需要本机开发工具，不作为客户机便携包内容。
+
 ## 启动与退出
 
 便携目录通过根目录 `VoiceTerminal.exe`（精简启动程序）启动。首次启动创建独立用户目录，补齐缺失的默认模板，然后进入待机。在线语言模型与语音合成仍需用户配置网络服务和凭据。
@@ -29,15 +31,18 @@ npm run dev       # 真实业务桌面热更新；别名 desktop:dev（桌面开
 npm run dev:ui    # 独立桌面样例热更新；别名 desktop:ui（桌面样例）。
 npm run desktop:start # 静态界面桌面启动。
 npm run build     # 正式界面、原生主程序和根启动程序；别名 desktop:build（桌面构建）。
+npm run desktop:publish # 构建并更新原正式程序，同时同步可双击的演示启动程序。
 npm run frontend:build # 内部静态界面构建，不提供网页预览。
 .\scripts\start-desktop.ps1 -Dev -Python 'D:\运行环境\python.exe'
 .\scripts\start-desktop.ps1 -Diagnostic -Python 'D:\运行环境\python.exe'
 .\scripts\start.ps1 -Python 'D:\运行环境\python.exe' # 无界面后端调试。
 ```
 
-源码启动前始终执行增量原生构建，静态启动还构建当前界面。`DataDir`（业务数据目录）默认 `.runtime/desktop-data`（独立开发数据），模型继续共用。`WebView2`（固定渲染引擎目录）可明确指定包含 `msedgewebview2.exe`（渲染引擎程序）的目录，省略时用系统引擎。
+源码启动前始终执行增量原生构建，静态启动还构建当前界面。默认读取 `.runtime/delivery/VoiceTerminal/portable.json`（正式便携配置）及 `data/state/active.json`（正式启用组合），复用完整用户数据、Python（后端运行环境）、模型、DSH（代理执行宿主）和固定渲染引擎；只把程序源码切换为当前工程。`InstallRoot`（正式安装目录参数）可覆盖该安装位置；`DataDir`（业务数据目录参数）仍可显式覆盖数据位置，缺少正式安装且未指定数据时明确报错，不创建隔离产品。正式与源码业务调试使用独立渲染缓存，但共用业务数据和端口，启动调试前应退出正式程序。`WebView2`（固定渲染引擎目录参数）可明确覆盖渲染引擎。
 
 真实开发固定 5173，桌面样例固定 5174；冲突时失败，不连接未知服务。只有便携静态界面服务在冲突时选择空闲端口。样例使用 `--ui-preview`（仅调试构建的样例模式），在业务启动上下文之前分支，不解析业务解释器、模型或真实配置；缓存独立，关闭窗口回收所属服务，可与正式程序并行。页面、状态和浮层通过样例工具切换，语音事件回放也在此查看。
+
+双击 `VoiceTerminalUIDemo.exe`（演示启动程序）与 `npm run dev:ui`（演示开发）进入相同模式，启动前执行增量构建，构建输出记录到 `.runtime/desktop-ui-preview/launcher.log`（演示启动日志）。窗口标题明确显示“前端演示（无业务后端）”。在 `apps/frontend/src/interface/`（共享界面组件）和 `design.css`（共享设计样式）中修订界面，演示通过 HMR（热更新）展示；正式程序继续使用上一次构建的静态界面。确认修改后退出正式程序并关闭演示窗口，执行 `npm run desktop:publish`（更新正式程序），重新启动正式入口验证实际业务。正式组装只收集产品页面，不带演示启动程序、场景或开发服务。
 
 ### 桌面会话与界面权限
 
@@ -171,7 +176,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Verify-Package.ps1
   --output '.runtime/delivery/VoiceTerminal.zip' --components '.runtime/delivery/VoiceTerminal-components'
 ```
 
-快速开发期间可在构建机停机刷新已有候选的程序，复用已校验的运行环境和模型。刷新使用新的构建标识，先暂存和校验，再启用；可捕获的提交错误会恢复旧入口和记录。它不承担断电恢复或终端在线更新事务，也不覆盖用户数据。旧程序目录保留以便构建检查；最终完整包只收入当前启用程序和所需组件。
+本机正式程序通过 `npm run desktop:publish`（构建并更新正式目录）更新，默认覆盖原 `.runtime/delivery/VoiceTerminal`（正式安装目录）的启动入口并启用新程序，复用已校验的运行环境和模型，保留完整用户数据。该命令不会组装另一份空白数据产品。刷新使用新的构建标识，先暂存和校验，再启用；可捕获的提交错误会恢复旧入口和记录。它不承担断电恢复或终端在线更新事务。旧程序组件目录保留以便构建检查；最终完整包只收入当前启用程序和所需组件。下面是仅组装更新的底层命令：
 
 ```powershell
 & $BuildPython -X utf8 scripts/assemble-desktop.py --output '.runtime/delivery/VoiceTerminal' `

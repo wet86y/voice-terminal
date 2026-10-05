@@ -640,7 +640,13 @@ fn run() -> Result<(), String> {
             std::env::set_var(name, value);
         }
         let program = context.program.clone();
-        let data = context.data.join("cache/webview2");
+        let data = context
+            .data
+            .join(if args.iter().any(|arg| arg == "--root") {
+                "cache/webview2-source"
+            } else {
+                "cache/webview2"
+            });
         let webview2 = context.webview2.clone();
         (
             Some(context),
@@ -692,7 +698,11 @@ fn run() -> Result<(), String> {
         .setup(move |app| {
             let navigation_state = build_state.clone();
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                .title("Voice Terminal · 语音终端")
+                .title(if build_state.mode == FrontendMode::UiPreview {
+                    "Voice Terminal · 前端演示（无业务后端）"
+                } else {
+                    "Voice Terminal · 语音终端"
+                })
                 .inner_size(1380., 860.)
                 .min_inner_size(980., 640.)
                 .data_directory(build_state.data.clone())

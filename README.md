@@ -23,7 +23,7 @@ Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tau
 
 ## 快速开始
 
-完整便携候选通过解压目录内的 `VoiceTerminal.exe`（根启动程序）运行，随包收集运行环境与模型；构建和已验证范围见[桌面开发与分发说明](docs/desktop-application.md)及[实施验收记录](docs/desktop-acceptance.md)。
+本机只保留两个使用入口：`.runtime/delivery/VoiceTerminal/VoiceTerminal.exe`（正式程序）和 `.runtime/delivery/VoiceTerminalUIDemo.exe`（前端演示程序）。正式程序沿用原有完整用户数据、设置、凭据和历史记录；演示程序只加载前端，不启动业务后端。构建和已验证范围见[桌面开发与分发说明](docs/desktop-application.md)及[实施验收记录](docs/desktop-acceptance.md)。
 
 以下为源码开发环境要求：Windows x64（64 位操作系统）、Python（后端运行环境）3.12、Node.js（脚本运行环境）22.19 或更高兼容版本（项目隔离 DSH 的最低要求）。
 
@@ -33,7 +33,7 @@ npm ci
 npm run desktop:start
 ```
 
-源码桌面使用 `.runtime/desktop-data/.env.local`（独立开发凭据文件）；明确指定数据目录时使用该目录内的 `.env.local`（本机环境文件）。也可通过进程环境提供凭据，不要提交到 Git（源码管理工具）：
+正式程序及源码业务调试默认共用正式安装中 `portable.json`（便携配置）指定的完整数据，本机为 `.runtime/delivery/VoiceTerminal/data`（正式用户数据）。凭据沿用其中的 `.env.local`（本机环境文件）及已有凭据存储；明确指定数据目录时使用该目录的设置。也可通过进程环境提供凭据，不要提交到 Git（源码管理工具）：
 
 ```text
 DEEPSEEK_API_KEY=
@@ -67,9 +67,10 @@ MINIMAX_API_KEY=
 npm run dev       # 真实业务桌面热更新；别名 npm run desktop:dev
 npm run dev:ui    # 桌面样例热更新；别名 npm run desktop:ui
 npm run build    # 正式界面、原生主程序及根启动程序；别名 npm run desktop:build
+npm run desktop:publish # 退出正式程序并关闭演示后，构建并更新原正式目录，同时同步演示入口
 ```
 
-每次源码桌面启动都执行增量原生构建，静态启动同时构建当前界面。真实开发端口固定 5173，样例固定 5174；冲突时明确失败，不连接未知服务。真实开发默认使用 `.runtime/desktop-data`（独立开发数据），模型共用；样例只使用独立渲染缓存，不需要 Python（后端运行时）、模型或业务凭据。浏览器预览和旧网页启动器已撤销。启动诊断见[独立应用启动与系统管理](docs/application-lifecycle.md)。
+每次源码桌面启动都执行增量原生构建，静态启动同时构建当前界面。真实开发端口固定 5173，演示固定 5174；冲突时明确失败，不连接未知服务。真实开发默认复用正式安装的完整数据和运行组件，不再自动生成空白数据产品；与正式程序共享业务资源，启动前应退出正式实例。渲染缓存按模式分开。演示只使用独立渲染缓存，不需要 Python（后端运行时）、模型或业务凭据，可以与正式程序同时运行。浏览器预览和旧网页启动器已撤销。启动诊断见[独立应用启动与系统管理](docs/application-lifecycle.md)。
 
 ## 产品页面
 
@@ -78,7 +79,7 @@ npm run build    # 正式界面、原生主程序及根启动程序；别名 npm
 - 语音事件回放：从桌面样例工具选择固定回放场景；产品地址不再通过查询参数绕过宿主管理。
 - 桌面样例：覆盖工作台和七个设置页（唤醒词与静默设置已合并）；使用固定样例，不连接业务后端、不申请麦克风权限，也不读写真实设置。
 
-调优外观时，在仓库根目录执行 `npm run dev:ui`（启动桌面样例），程序自动打开独立桌面窗口。保存 Vue（页面组件）或 CSS（样式表）后自动更新。右下角工具可切换页面、内容场景、运行状态及浮层。展示选择保留在页面地址中；表单编辑仅保留在内存，点击“重置展示”恢复初值。关闭样例窗口立即回收其开发服务，可以与正式程序同时运行。
+调优外观时，双击 `.runtime/delivery/VoiceTerminalUIDemo.exe`（前端演示入口）或执行 `npm run dev:ui`（桌面演示），程序增量构建调试宿主后打开演示窗口。保存 Vue（页面组件）或 CSS（样式表）后自动更新。右下角工具可切换页面、内容场景、运行状态及浮层。展示选择保留在页面地址中；表单编辑仅保留在内存，点击“重置展示”恢复初值。关闭演示窗口立即回收其开发服务。界面修订在共享组件和样式中完成；验收后退出正式程序并关闭演示窗口，执行 `npm run desktop:publish`（更新正式程序），再启动正式入口验证真实业务。
 
 正式界面与样例共享 `apps/frontend/src/interface/`（应用框架、工作台、设置导航和基础控件）及 `design.css`（设计变量与样式）。正式业务位于 `apps/frontend/src/product/`（产品逻辑），样例位于 `apps/frontend/src/ui-demo/`（样例展示）。两套入口先验证原生桌面状态再动态加载对应界面；正式入口随后读取宿主运行配置。正式构建只包含产品入口，便携组装依据 `desktop-manifest.json`（界面产物清单）验证依赖闭包，拒绝样例和陈旧资源。当前收敛范围与验证状态见[第一阶段记录](docs/desktop-frontend-consolidation.md)。
 
@@ -92,7 +93,7 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 - `config/local.yaml`：本机非密钥覆盖，不提交真实凭据。
 - `config/persona/`：`personality.md`（人格风格）和 `user.md`（用户资料）在会话初始化时读取并冻结；旧 `instructions.md`（历史工作指令）仅留档，不再加载。
 - `config/shadow_agent/`：Shadow（影子代理）指令和工具策略。
-- `config/dsh/`：项目隔离 DSH（代理执行宿主）锁定至 npm `latest`（默认发行通道）的 `dsh-v0.2.0-rc.2`（候选版），commit（提交号）`639ed015397290b3745d163aafe02ffee4aa3f84`；当前便携应用位于 `apps/20261005-dsh-task-coexist`。Bridge（桥接插件）、Wake Tasks（唤醒任务插件）和 Shadow preset（影子代理预设功能包）为 0.1.1，Bridge protocol（桥接协议）为 2.0。官方 Automation Bundle（自动化功能包）默认关闭，但用户可按需启用；原生 `schedule_*`（会话定时任务工具）绑定 DSH 会话，项目 `wake_task_*`（语音链路任务工具）使用独立项目存储并投递到当前 Voice（语音）关联会话。首次部署记录见[本机验收记录](.runtime/dsh-upgrade-20261005/acceptance.md)，共存修复已完成并通过[本机验收](.runtime/dsh-coexist-20261005/acceptance.md)；修订细节见[任务共存修订记录](docs/dsh-task-coexistence.md)，安装和运行说明见[项目隔离 DSH 控制台](docs/dsh-console.md)。
+- `config/dsh/`：项目隔离 DSH（代理执行宿主）锁定至 npm `latest`（默认发行通道）的 `dsh-v0.2.0-rc.2`（候选版），commit（提交号）`639ed015397290b3745d163aafe02ffee4aa3f84`；当前便携应用位于 `apps/desktop-20261005-two-entry`（正式程序构建目录）。Bridge（桥接插件）、Wake Tasks（唤醒任务插件）和 Shadow preset（影子代理预设功能包）为 0.1.1，Bridge protocol（桥接协议）为 2.0。官方 Automation Bundle（自动化功能包）默认关闭，但用户可按需启用；原生 `schedule_*`（会话定时任务工具）绑定 DSH 会话，项目 `wake_task_*`（语音链路任务工具）使用独立项目存储并投递到当前 Voice（语音）关联会话。首次部署记录见[本机验收记录](.runtime/dsh-upgrade-20261005/acceptance.md)，共存修复已完成并通过[本机验收](.runtime/dsh-coexist-20261005/acceptance.md)；修订细节见[任务共存修订记录](docs/dsh-task-coexistence.md)，安装和运行说明见[项目隔离 DSH 控制台](docs/dsh-console.md)。
 - `config/product-settings.json`：本机产品设置，包含 KWS（关键词唤醒）、静默、Shadow（影子代理）、自定义指令和声纹设置等非密钥内容。
 - `config/speaker/`：声纹资料、模板和特征指纹；详见 [声纹增强](docs/speaker-enhancement.md)。
 
