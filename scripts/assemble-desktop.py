@@ -286,7 +286,7 @@ def _remove_new_dsh_component(output: Path, relative: str) -> None:
 
 
 def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime: Path | None = None) -> None:
-    """构建机停机刷新候选目录，复用已校验组件；不承接终端在线更新事务。"""
+    """构建机停机刷新已有正式目录，复用已校验组件并保留完整用户数据。"""
     require_stopped(ROOT, output)
     verify_install(output)
     portable = json.loads((output / "portable.json").read_text(encoding="utf-8-sig"))
@@ -376,7 +376,7 @@ def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime: Path |
             if new_dsh_created and new_dsh_relative is not None:
                 _remove_new_dsh_component(output, new_dsh_relative)
             raise
-    print(f"候选程序已刷新：{program}；环境、模型及用户数据保留，旧程序目录保留以供检查。")
+    print(f"正式程序已更新：{program}；环境、模型及完整用户数据保留，旧程序目录保留以供检查。")
 
 
 def main():
@@ -390,7 +390,7 @@ def main():
     parser.add_argument("--external-models", action="store_true", help="环境辅助包明确引用外部模型")
     parser.add_argument("--webview2", type=Path, help="包含 msedgewebview2.exe 的实际固定版本目录")
     parser.add_argument("--dsh-runtime", type=Path)
-    parser.add_argument("--refresh-program", action="store_true", help="构建机停机刷新已有候选的程序，复用环境和模型；终端更新留到后续专题")
+    parser.add_argument("--refresh-program", action="store_true", help="构建机停机更新已有正式程序，保留环境、模型及完整用户数据；终端更新留到后续专题")
     parser.add_argument("--zip", action="store_true", help="生成完整压缩包与组件压缩包，排除用户数据")
     args = parser.parse_args()
     output = args.output.resolve()

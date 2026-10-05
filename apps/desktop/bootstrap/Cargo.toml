@@ -7,5 +7,9 @@ edition.workspace = true
 name = "VoiceTerminal"
 path = "src/main.rs"
 
+[[bin]]
+name = "VoiceTerminalUIDemo"
+path = "src/ui_demo.rs"
+
 [dependencies]
 voice-desktop-common = { path = "../common" }

@@ -10,12 +10,26 @@
   [switch]$NoWorker,
   [Parameter(HelpMessage="NoAnalysis（不启动分析工作进程）")]
   [switch]$NoAnalysis,
-  [Parameter(HelpMessage="DataDir（独立用户数据目录）")]
-  [string]$DataDir = ".runtime/desktop-data"
+  [Parameter(HelpMessage="DataDir（业务数据目录，默认沿用正式程序数据）")]
+  [string]$DataDir = ""
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+$InstallRoot = Join-Path $RepoRoot '.runtime/delivery/VoiceTerminal'
+if (-not $DataDir) {
+  $PortablePath = Join-Path $InstallRoot 'portable.json'
+  if (-not (Test-Path -LiteralPath $PortablePath)) { throw '缺少正式程序数据；请先准备正式程序，或使用 -DataDir（业务数据目录）明确指定。' }
+  $Portable = Get-Content -LiteralPath $PortablePath -Raw -Encoding utf8 | ConvertFrom-Json
+  $DataDir = if ([IO.Path]::IsPathRooted($Portable.data_dir)) { $Portable.data_dir } else { Join-Path $InstallRoot $Portable.data_dir }
+  $ActivePath = Join-Path $DataDir 'state/active.json'
+  $Selected = if (Test-Path -LiteralPath $ActivePath) { Get-Content -LiteralPath $ActivePath -Raw -Encoding utf8 | ConvertFrom-Json } else { $Portable }
+  if (-not $Python) { $Python = if ($Selected.external_python) { $Selected.external_python } else { Join-Path $InstallRoot $Selected.python } }
+  $env:VOICE_INSTALL_ROOT = $InstallRoot
+  $env:VOICE_MODEL_DIR = if ($Selected.external_models) { $Selected.external_models } else { Join-Path $InstallRoot $Selected.models }
+  if ($Selected.dsh) { $env:VOICE_DSH_RUNTIME = Join-Path $InstallRoot $Selected.dsh }
+  if ($Selected.node) { $env:VOICE_NODE_EXECUTABLE = Join-Path $InstallRoot $Selected.node }
+}
 $RuntimeProfile = Join-Path $RepoRoot ".runtime\application\runtime.json"
 if (-not $Python -and (Test-Path -LiteralPath $RuntimeProfile)) {
   $Profile = Get-Content -LiteralPath $RuntimeProfile -Raw -Encoding utf8 | ConvertFrom-Json
@@ -31,7 +45,8 @@ if (-not $Python) { $Python = "python" }
 $RuntimePython = (Get-Command $Python -ErrorAction Stop).Source
 $ResolvedDataDir = if ([IO.Path]::IsPathRooted($DataDir)) { [IO.Path]::GetFullPath($DataDir) } else { [IO.Path]::GetFullPath((Join-Path $RepoRoot $DataDir)) }
 $Arguments = @(
-  "-m", "voice_terminal.application.launch",
+  "-X", "utf8", "-X", "pycache_prefix=$ResolvedDataDir/cache/python",
+  (Join-Path $RepoRoot 'scripts/backend-entry.py'), "voice_terminal.application.launch",
   "--root", $RepoRoot,
   "--python", $RuntimePython,
   "--config", $Config,

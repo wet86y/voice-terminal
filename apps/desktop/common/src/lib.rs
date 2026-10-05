@@ -213,6 +213,11 @@ impl LaunchContext {
 
     pub fn from_args() -> Result<Self, String> {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        Self::from_argument_list(&args)
+    }
+
+    // from_argument_list（解析启动参数）：源码产品默认复用正式安装的完整数据和组件。
+    fn from_argument_list(args: &[String]) -> Result<Self, String> {
         let value = |key: &str| {
             args.iter()
                 .position(|a| a == key)
@@ -221,12 +226,25 @@ impl LaunchContext {
         };
         if let Some(root) = value("--root") {
             let program = canonical_path(Path::new(&root))?;
+            let install = value("--install")
+                .map(|p| program.join(p))
+                .unwrap_or_else(|| program.join(".runtime/delivery/VoiceTerminal"));
+            let installed = if install.join("portable.json").is_file() {
+                Some(Self::portable(&install)?)
+            } else {
+                if value("--install").is_some() || value("--data-dir").is_none() {
+                    return Err("请先准备正式程序 .runtime/delivery/VoiceTerminal（正式安装目录），或用 --data-dir（数据目录）明确指定已有业务数据；不会自动创建隔离产品。".into());
+                }
+                None
+            };
             let data = value("--data-dir")
                 .map(|p| program.join(p))
-                .unwrap_or_else(|| program.join(".runtime/desktop-data"));
+                .unwrap_or_else(|| installed.as_ref().unwrap().data.clone());
             fs::create_dir_all(&data).map_err(|e| e.to_string())?;
             let python = if let Some(p) = value("--python") {
                 program.join(p)
+            } else if let Some(context) = &installed {
+                context.python.clone()
             } else {
                 let activation: serde_json::Value = serde_json::from_slice(
                     &fs::read(program.join(".runtime/application/runtime.json")).map_err(|e| {
@@ -242,19 +260,32 @@ impl LaunchContext {
             };
             let models = value("--models")
                 .map(|p| canonical_path(&program.join(p)))
-                .transpose()?;
+                .transpose()?
+                .or_else(|| {
+                    installed
+                        .as_ref()
+                        .and_then(|context| context.models.clone())
+                });
             let webview2 = value("--webview2")
                 .map(|p| canonical_path(&program.join(p)))
-                .transpose()?;
+                .transpose()?
+                .or_else(|| {
+                    installed
+                        .as_ref()
+                        .and_then(|context| context.webview2.clone())
+                });
             let context = Self {
-                install: program.clone(),
+                install: installed
+                    .as_ref()
+                    .map(|context| context.install.clone())
+                    .unwrap_or_else(|| program.clone()),
                 program,
                 data: canonical_path(&data)?,
                 python: canonical_path(&python)?,
                 models,
                 webview2,
-                dsh: None,
-                node: None,
+                dsh: installed.as_ref().and_then(|context| context.dsh.clone()),
+                node: installed.as_ref().and_then(|context| context.node.clone()),
                 dev: args.iter().any(|a| a == "--dev"),
                 diagnostic: args.iter().any(|a| a == "--diagnostic"),
             };
@@ -477,6 +508,85 @@ pub mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_product_reuses_full_installation_and_explicit_data_override() {
+        let root = std::env::temp_dir().join(format!("voice-source-data-{}", std::process::id()));
+        let install = root.join(".runtime/delivery/VoiceTerminal");
+        for path in [
+            root.join("config"),
+            root.join("scripts"),
+            install.join("apps/current/config"),
+            install.join("apps/current/scripts"),
+            install.join("runtimes/python"),
+            install.join("models/current"),
+            install.join("runtimes/dsh"),
+            install.join("runtimes/webview2"),
+            install.join("完整数据/config"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        for path in [
+            root.join("config/default.yaml"),
+            root.join("scripts/backend-entry.py"),
+            install.join("apps/current/config/default.yaml"),
+            install.join("apps/current/scripts/backend-entry.py"),
+            install.join("runtimes/python/python.exe"),
+            install.join("runtimes/webview2/msedgewebview2.exe"),
+        ] {
+            fs::write(path, b"fixture").unwrap();
+        }
+        fs::write(
+            install.join("完整数据/config/preserved.txt"),
+            b"existing-settings",
+        )
+        .unwrap();
+        fs::write(install.join("portable.json"), serde_json::to_vec(&serde_json::json!({
+            "data_dir":"完整数据", "schema":1, "app":"apps/current", "python":"runtimes/python/python.exe",
+            "models":"models/current", "dsh":"runtimes/dsh", "webview2":"runtimes/webview2", "node":null,
+            "external_python":null, "external_models":null
+        })).unwrap()).unwrap();
+        let root = canonical_path(&root).unwrap();
+        let args = vec![
+            "--root".into(),
+            root.to_str().unwrap().into(),
+            "--dev".into(),
+        ];
+        let context = LaunchContext::from_argument_list(&args).unwrap();
+        assert_eq!(
+            context.data,
+            root.join(".runtime/delivery/VoiceTerminal/完整数据")
+        );
+        assert_eq!(context.program, root);
+        assert_eq!(context.python, install.join("runtimes/python/python.exe"));
+        assert_eq!(context.dsh, Some(install.join("runtimes/dsh")));
+        assert_eq!(context.models, Some(install.join("models/current")));
+        assert!(context.dev);
+        assert!(!root.join(".runtime/desktop-data").exists());
+        let mut explicit = args;
+        explicit.extend(["--data-dir".into(), "explicit-data".into()]);
+        assert_eq!(
+            LaunchContext::from_argument_list(&explicit).unwrap().data,
+            root.join("explicit-data")
+        );
+        assert_eq!(
+            fs::read(install.join("完整数据/config/preserved.txt")).unwrap(),
+            b"existing-settings"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn missing_formal_installation_never_creates_an_isolated_product() {
+        let root = std::env::temp_dir().join(format!("voice-no-install-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let error =
+            LaunchContext::from_argument_list(&["--root".into(), root.to_str().unwrap().into()])
+                .unwrap_err();
+        assert!(error.contains("不会自动创建隔离产品"));
+        assert!(!root.join(".runtime").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
     #[test]
     fn rejects_escape_and_absolute_components() {
         for value in ["../other", "a/../../b", "/outside", "C:\\outside", ""] {
