@@ -1491,9 +1491,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             await self._voice_mailbox.acknowledge(item.event_id)
 
     async def _on_shadow_events(self, events: list[ShadowEvent]) -> None:
-        # Stop intentionally ends only the voice episode.  The independent
-        # manager continues, while its coalesced events wait for the next
-        # session.start.
+        # 停止输入后影子继续运行；普通信息和持久语义等待下一次开始，临时进度不跨停止边界。
         if (
             isinstance(getattr(self, "shadow_session", None), DshShadowAgentSession)
             and any(item.kind != "failed" for item in events)
@@ -1508,14 +1506,15 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         await self.publish_shadow_product()
         model_events = [
             item for item in events
-            if item.kind in {"information", "input_required", "result", "no_action", "failed"}
+            if item.kind in {"progress", "information", "input_required", "result", "no_action", "failed"}
         ]
         if not model_events:
             return
         controller = self.controller
         if controller is None or not self.state.listening or controller.episode.closed:
             for item in model_events:
-                self._shadow_pending.publish(item)
+                if item.kind != "progress":
+                    self._shadow_pending.publish(item)
             return
         await controller.accept_shadow_events(model_events)
 

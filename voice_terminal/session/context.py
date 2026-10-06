@@ -21,6 +21,8 @@ REQUEST_SYSTEM_CONTEXT_KINDS = frozenset({
     "runtime_state",
     "pending_tools",
     "final_silence",
+    "secondary_mailbox",  # 二等信箱专用评估提示。
+    "secondary_update",  # 本次请求携带的最新进度来源。
     "system_context",
 })
 FINAL_OUTPUT_CONSTRAINT = (
@@ -212,6 +214,16 @@ class LLMContextProjector:
                     "text": str(information.get("text") or "")[:2000],
                     "source": str(information.get("source") or "agent"),
                 }
+            progress = shadow.get("progress")
+            if isinstance(progress, list):
+                values = [
+                    {"text": str(item["text"])[:512], "source": item["source"]}
+                    for item in progress if isinstance(item, dict)
+                    and str(item.get("text") or "").strip()
+                    and item.get("source") in {"agent", "observer"}
+                ]
+                if values:
+                    payload["shadow"]["progress"] = values  # 进度列表，仅在本次请求尾部提供。
         if current.finalized:
             payload["runtime"]["input_status"] = "finalized"
         elif current.user_speaking is True:

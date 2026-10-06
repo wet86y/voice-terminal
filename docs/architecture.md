@@ -100,10 +100,14 @@ speak 决策状态为 `speak`、`revision`、`cancel`、`wait`：
 
 - 每个 session 只有一个 `ShadowRuntime`、一个活动 runner 和一份私有 committed trace。
 - Shadow 读取 `ShadowContextProjector` 的权威语义帧；文件与网络工具为 `READ_ONLY`（只读），DSH 根代理另可在明确授权时请求提前静默。
-- `progress` 和工具生命周期只更新产品投影。status observer（状态观察器）与根 Agent
+- `progress`（影子进度）更新产品投影，并把实质变化按当前 `activation_id`（激活标识）和
+  `source`（来源：`agent` 根代理、`observer` 状态观察器）合并进入二等信箱；各有效来源只保留最新状态。
+  相同正文及仅格式空白变化不反复登记。工具生命周期仍只更新产品投影。status observer（状态观察器）与根 Agent
   共用 `latest_shadow_information`（最新影子信息）单槽，严格按到达顺序覆盖。请求冻结时将最新快照
-  放入 `runtime.shadow.information`，然后按 `version`（本地版本）比较清除；新版本保留给下一次请求。
-  `input_required`、`result`、`failed` 进入语义历史，`no_action` 只结束激活。
+  放入 `runtime.shadow.information`（请求尾部影子信息），然后按 `version`（本地版本）比较清除；新版本保留给下一次请求。
+  `information`（影子信息）保持普通事件优先级，不登记为二等进度；同一激活中相同正文只从一个入口评估。
+  `input_required`（需要用户输入）、`result`（最终结果）、`failed`（失败）进入语义历史，
+  `no_action`（无需动作）只结束激活。终态和激活替换清理旧进度。
 - 新上下文到达时，运行中的 provider 和已开始的只读工具不被强行打断；尚未开始的旧工具必须标记为 `not_executed`，旧 final 不得发布。
 - `session.stop` 保留 Shadow；`session.reset` 清理 Shadow trace、状态、临时请求和 context epoch；runtime close 关闭 provider、工具和共享 HTTP client。
 
@@ -122,6 +126,12 @@ none → kws standby → asr active → kws standby → none
   模型主动发声触发的 KWS→ASR 轮换同样要挂这套窗口（`AgentEpisodeRuntime.arm_silence_window`）。
 - 静默窗口内，影子代理的 `progress`（进度）更新合并进入二等信箱；普通事件请求会带出其最新状态，
   否则系统从静默窗口起点每 4 秒检查一次，只有信箱非空且用户未讲话、模型空闲时才请求模型。
+  检查复用唯一的 400 毫秒心跳和单请求执行路径；忙碌、讲话、重试退避时保留信箱，等下一个有效检查点。
+  普通事件优先；同一检查点同时满足二等和最终静默条件时，最终检查优先。暂停后只评估当前状态，不补发历史检查。
+  普通请求和二等请求均在上下文冻结及审计成功后确认对应版本；构建失败保留状态，旧版本确认不能清除新版本。
+  二等评估及其恢复、重试都明确没有新用户输入，可选择 `wait`（保持等待），
+  只为仍相关、尚未传达且值得现在播报的新内容选择 `speak`（发声）；用户重新讲话或影子激活失效后，旧评估未播语音失效。
+  二等检查不重置静默起点、最终期限或输入所有权。最终检查结算后清理期间到达的待评估进度，并沿用原交接规则。
   TTS（语音合成）、语音活动和交付结算继续更新本地状态与会话历史，本身不触发二等请求。
 - KWS 初始化或重新接管失败时 fail-closed，不得在没有受保护状态的情况下放开输入。
 - 声纹注册/测试必须与实时采集互斥，不能重置正在工作的共享音频处理器。
@@ -131,7 +141,7 @@ none → kws standby → asr active → kws standby → none
 | 操作 | 作用 |
 | --- | --- |
 | `session.start` | 启动或恢复输入作用域；KWS 开启时先进入 standby，否则直接进入 ASR。 |
-| `session.stop` | 停止新的语音输入，释放输入作用域；已派发的 LLM、TTS 和 Shadow 工作按既有规则结算。 |
+| `session.stop`（停止输入会话） | 停止新的语音输入，释放输入作用域并清理二等进度；停止期间进度只更新界面。已派发的 LLM（大语言模型）、TTS（语音合成）和 Shadow（影子代理）工作按既有规则结算。 |
 | `session.reset` | 取消当前输入和 Shadow 工作，清空临时状态，轮换 conversation/context epoch，关闭当前 TTS 事务并建立可复用的下一轮状态。 |
 | runtime close | 关闭采集、ASR、KWS、LLM、Shadow、TTS、播放器、后台任务和共享网络资源。 |
 

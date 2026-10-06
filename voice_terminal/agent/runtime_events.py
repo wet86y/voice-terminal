@@ -28,6 +28,7 @@ class RecoverySignal:
     owner_scope: str | None = None
     dispatch_context: dict | None = None
     shadow_information: dict | None = None
+    secondary_context: dict | None = None  # 二等进度冻结快照，只供原请求的协议恢复使用。
     error_id: str = ""
     consumed: bool = False
     queued_at_monotonic: float = 0.0

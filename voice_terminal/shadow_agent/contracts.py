@@ -119,13 +119,13 @@ def shadow_control_tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "type": "function", "name": "publish_progress",
-            "description": "发布只供产品界面显示的可覆盖进度；不会触发语音主模型推理。",
+            "description": "发布可覆盖进度并更新产品界面；实质变化进入二等信箱，按 4 秒检查点或随普通请求评估，不立即唤醒语音主模型。不要再用信息入口重复发布同一进度。",
             "parameters": {
                 "type": "object", "additionalProperties": False, "required": ["text"],
                 "properties": {
                     "text": {
                         "type": "string", "minLength": 1, "maxLength": 512,
-                        "description": "仅显示在产品界面的进度文本，去除首尾空白后最多 512 字符。",
+                        "description": "供产品界面和二等信箱使用的最新进度文本，去除首尾空白后最多 512 字符。",
                     },
                 },
             },

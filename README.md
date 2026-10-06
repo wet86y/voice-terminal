@@ -15,11 +15,12 @@ Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tau
                                       ▼
                          单一 ShadowRuntime → READ_ONLY tools
                                       │
-                                      ├─ status observer → ShadowVisibleStatus → 主 LLM runtime.shadow.status
-                                      └─ observation / input / result / failed → 主 LLM 400ms mailbox
+                                      ├─ progress（进度）→ 二等信箱 → 每 4 秒检查 / 随普通请求携带
+                                      ├─ information（影子信息）→ 可替换信息槽 → 普通事件调度
+                                      └─ input_required（需用户输入）/ result（结果）/ failed（失败）→ 语义历史
 ```
 
-主语音链只有一个调度循环和一个语音事务 owner。未播放的 assistant 草稿不会写入历史；只有用户输入、实际传达的 assistant 文本、有效 refinement 和有语义影响的打断会进入会话账本。Shadow 是同一 session 的认知旁路；DSH 根代理仅可在用户明确要求或已启用的影子自定义指令明确规定时，请求提前执行静默前最终检查，其余语音、TTS、播放器和主调度控制仍由 Voice 拥有。status observer 摘要属于可替换的运行状态：会被 Voice 主 LLM 消费，但不追加为长期语义历史；progress 仍只更新产品 UI，不触发主 LLM。
+主语音链只有一个调度循环和一个语音事务 owner（所有者）。未播放的 assistant（助手）草稿不会写入历史；只有用户输入、实际传达的助手文本、有效 refinement（转写精修）和有语义影响的打断会进入会话账本。Shadow（影子代理）是同一 session（会话）的认知旁路；DSH（代理执行宿主）根代理仅可在用户明确要求或已启用的影子自定义指令明确规定时，请求提前执行静默前最终检查，其余语音、TTS（语音合成）、播放器和主调度控制仍由 Voice（语音主线）拥有。status observer（状态观察器）的 information（影子信息）摘要保持普通事件调度、单槽覆盖和版本消费，不追加为长期语义历史。progress（影子进度）继续更新产品 UI（界面），实质变化合并进入二等信箱；普通请求会携带，否则在活跃静默窗口内每 4 秒复用唯一 400 毫秒心跳检查非空信箱。上下文冻结成功后确认版本，空信箱不请求，最终静默优先，二等检查不延长最终期限。详见 [Bridge 2.0（第二版桥接协议）](docs/bridge-2.0-protocol.md)。
 
 ## 快速开始
 

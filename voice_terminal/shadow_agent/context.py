@@ -185,7 +185,8 @@ class ShadowContextProjector:
             frames=(self._environment, *frames[start:]),
         )
 
-    def set_shadow_runtime_state(self, *, available: bool | None = None, active: bool | None = None) -> None:
+    def set_shadow_runtime_state(self, *, available: bool | None = None, active: bool | None = None,
+                                 activation_id: str | None = None) -> None:
         setter = getattr(self.ledger, "set_shadow_runtime_state", None)
         if callable(setter):
-            setter(available=available, active=active)
+            setter(available=available, active=active, activation_id=activation_id)

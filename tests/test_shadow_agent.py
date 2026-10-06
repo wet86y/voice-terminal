@@ -96,7 +96,8 @@ def test_shadow_event_prompts_report_facts_without_directing_main_speech():
     assert "只陈述事实及不确定性" in publish["description"]
     assert "不得指示主模型" in publish["description"]
     progress = next(item for item in shadow_control_tool_definitions() if item["name"] == "publish_progress")
-    assert "不会触发语音主模型推理" in progress["description"]
+    assert "二等信箱" in progress["description"]
+    assert "不立即唤醒语音主模型" in progress["description"]
     assert "不得建议或指示主助手说什么" in STATUS_OBSERVER_PROMPT
     assert "下一步向用户" in STATUS_OBSERVER_PROMPT
     assert "准确区分已完成、正在进行、下一步和阻塞" not in STATUS_OBSERVER_PROMPT
@@ -480,7 +481,7 @@ def test_disabling_context_gate_releases_deferred_authority_prefix():
     assert [frame.content["transcript"] for frame in projector.shadow_context_snapshot().frames[1:]] == ["一", "二"]
 
 
-def test_information_reaches_model_mailbox_while_progress_remains_product_only(tmp_path):
+def test_stopped_input_buffers_information_and_keeps_progress_in_product_only(tmp_path):
     async def scenario():
         runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / ".runtime")
         status = ShadowEvent("s", "information", "正在整理", 1)

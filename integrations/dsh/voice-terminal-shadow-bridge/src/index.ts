@@ -597,8 +597,8 @@ function installRootTools(agentCtx: any, binding: Binding): void {
     }) },
   }))
   agentCtx.tools.register(defineTool({
-    name: 'publish_progress', description: '更新 Product UI（产品界面）进度；不触发 Voice 推理，也不结束回合。',
-    parameters: { text: { type: 'string', minLength: 1, maxLength: 512, description: '仅显示在产品界面的进度文本；去除首尾空白后为 1～512 字符。', required: true } }, output: toolOutput(),
+    name: 'publish_progress', description: '更新 Product UI（产品界面）进度；实质变化进入二等信箱，按 4 秒检查点或随普通请求评估，不立即唤醒 Voice（语音主模型），不结束回合。不要再用信息入口重复发布同一进度。',
+    parameters: { text: { type: 'string', minLength: 1, maxLength: 512, description: '供产品界面和二等信箱使用的最新进度文本；去除首尾空白后为 1～512 字符。', required: true } }, output: toolOutput(),
     async execute(args: any, exec: ToolRunContext) { assertArgs(args, ['text']); return post(exec, { type: 'progress', text: cleanText(args.text, 'text', 512)! }) },
   }))
   agentCtx.tools.register(defineTool({

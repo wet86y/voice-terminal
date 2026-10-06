@@ -9,6 +9,7 @@ import pytest
 
 from voice_terminal.agent.episode import (
     FINAL_SILENCE_PROMPT,
+    SECONDARY_MAILBOX_PROMPT,
     AgentDecisionScheduler,
     AgentEpisodeRuntime,
     EpisodeHeartbeatClock,
@@ -25,9 +26,9 @@ def scheduler() -> AgentDecisionScheduler:
     return AgentDecisionScheduler(AgentOptions(scheduler_tick_ms=400))
 
 
-async def _shadow_progress(runtime, text: str, event_id: str) -> None:
+async def _shadow_progress(runtime, text: str, event_id: str, *, source="agent", activation_id="activation-a") -> None:
     await runtime.accept_shadow_event(ShadowEvent(
-        event_id, "progress", text, 1, "passive",
+        event_id, "progress", text, 1, activation_id=activation_id, source=source,
     ))
 
 
@@ -85,6 +86,7 @@ def _speaking_runtime(provider, *, defer_silence_until_output=False):
     runtime.episode_id = runtime.conversation.conversation_id
     runtime.last_turn_id = "turn-a"
     runtime.inputs["turn-a"] = {"text": "你好", "final": False}
+    runtime.ledger.set_shadow_runtime_state(available=True, active=True, activation_id="activation-a")
     return runtime
 
 
@@ -108,7 +110,6 @@ def test_late_heartbeat_is_rebased_to_real_time_without_catch_up():
     assert value.next_heartbeat == pytest.approx(11.3)
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_secondary_checkpoints_do_not_dispatch_without_mailbox_and_final_is_single_shot():
     value = scheduler()
     value.arm(0.0, wall_time=123.0)
@@ -138,7 +139,6 @@ def test_secondary_checkpoints_do_not_dispatch_without_mailbox_and_final_is_sing
     assert value.forced_due(now=20.0) is None
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_secondary_progress_coalesces_and_only_dispatches_at_four_second_checkpoint():
     async def scenario():
         class CapturingProvider(_BlockingProvider):
@@ -156,7 +156,7 @@ def test_secondary_progress_coalesces_and_only_dispatches_at_four_second_checkpo
         await _shadow_progress(runtime, "正在查找", "progress-1")
         await _shadow_progress(runtime, "正在查找", "progress-2")
         await _shadow_progress(runtime, "正在核对", "progress-3")
-        assert runtime._secondary_pending == {"shadow_progress": 2}
+        assert runtime._secondary_pending == {"agent": 2}
         assert runtime.snapshot()["secondary_mailbox"]["enqueued"] == 2
         await runtime._on_heartbeat(3.6)
         assert provider.calls == 0
@@ -171,7 +171,10 @@ def test_secondary_progress_coalesces_and_only_dispatches_at_four_second_checkpo
         packet = json.loads(provider.messages[-2]["content"])
         entries = {item["kind"]: item["content"] for item in packet["entries"]}
         assert "secondary_mailbox" in entries
-        assert "shadow_progress" in entries["secondary_update"]
+        assert "agent" in entries["secondary_update"]
+        state = json.loads(entries["runtime_state"].split("\n工具可用性：")[0].removeprefix("当前轮运行状态："))
+        assert state["shadow"]["progress"] == [{"text": "正在核对", "source": "agent"}]
+        assert all(entry.kind != "shadow_event" for entry in runtime.ledger.entries)
         await _finish_blocking_request(runtime, provider)
         await runtime._on_heartbeat(8.0)
         assert provider.calls == 1
@@ -179,7 +182,6 @@ def test_secondary_progress_coalesces_and_only_dispatches_at_four_second_checkpo
     asyncio.run(scenario())
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_ordinary_request_carries_and_consumes_secondary_progress():
     async def scenario():
         class CapturingProvider(_BlockingProvider):
@@ -209,17 +211,17 @@ def test_ordinary_request_carries_and_consumes_secondary_progress():
     asyncio.run(scenario())
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_secondary_version_ack_keeps_updates_arriving_after_context_snapshot():
     runtime = _speaking_runtime(_BlockingProvider())
-    runtime._secondary_pending["shadow_progress"] = 2
-    assert runtime._consume_secondary({"shadow_progress": 1}, prompt_kind="normal") == []
-    assert runtime._secondary_pending == {"shadow_progress": 2}
-    assert runtime._consume_secondary({"shadow_progress": 2}, prompt_kind="normal") == ["shadow_progress"]
+    runtime.ledger.commit_shadow_event(ShadowEvent("p1", "progress", "第一版", 1, "activation-a"))
+    captured = runtime._secondary_snapshot()
+    runtime.ledger.commit_shadow_event(ShadowEvent("p2", "progress", "第二版", 1, "activation-a"))
+    assert runtime._consume_secondary(captured, prompt_kind="normal") == []
+    assert runtime._secondary_pending == {"agent": 2}
+    assert runtime._consume_secondary(runtime._secondary_snapshot(), prompt_kind="normal") == ["agent"]
     assert runtime._secondary_pending == {}
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_secondary_progress_survives_context_build_failure():
     async def scenario():
         runtime = _speaking_runtime(_BlockingProvider())
@@ -231,12 +233,11 @@ def test_secondary_progress_survives_context_build_failure():
         runtime.messages = fail_context
         with pytest.raises(RuntimeError, match="context unavailable"):
             await runtime._step((runtime.episode_id, "step-a"), {"SYSTEM_CHECK"})
-        assert runtime._secondary_pending == {"shadow_progress": 1}
+        assert runtime._secondary_pending == {"agent": 1}
 
     asyncio.run(scenario())
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_secondary_progress_arriving_during_context_build_keeps_new_version():
     async def scenario():
         provider = _BlockingProvider()
@@ -246,7 +247,7 @@ def test_secondary_progress_arriving_during_context_build_keeps_new_version():
 
         def add_new_version(*args, **kwargs):
             frames = original_messages(*args, **kwargs)
-            runtime._secondary_pending["shadow_progress"] = 2
+            runtime.ledger.commit_shadow_event(ShadowEvent("p2", "progress", "第二版", 1, "activation-a"))
             return frames
 
         runtime.messages = add_new_version
@@ -258,13 +259,12 @@ def test_secondary_progress_arriving_during_context_build_keeps_new_version():
                 break
             await asyncio.sleep(0)
         assert provider.calls == 1
-        assert runtime._secondary_pending == {"shadow_progress": 2}
+        assert runtime._secondary_pending == {"agent": 2}
         await _finish_blocking_request(runtime, provider)
 
     asyncio.run(scenario())
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_speaking_or_active_request_retains_secondary_progress_for_later_checkpoint():
     async def scenario():
         provider = _BlockingProvider()
@@ -300,7 +300,6 @@ def test_speaking_or_active_request_retains_secondary_progress_for_later_checkpo
     asyncio.run(scenario())
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_backoff_retains_secondary_progress_until_next_checkpoint():
     async def scenario():
         provider = _BlockingProvider()
@@ -311,7 +310,7 @@ def test_backoff_retains_secondary_progress_until_next_checkpoint():
         runtime.backoff_until = time.monotonic() + 60
         await runtime._on_heartbeat(4.0)
         assert provider.calls == 0
-        assert runtime._secondary_pending == {"shadow_progress": 1}
+        assert runtime._secondary_pending == {"agent": 1}
         assert runtime.snapshot()["secondary_mailbox"]["skipped_busy"] == 1
 
         runtime.backoff_until = 0
@@ -326,7 +325,6 @@ def test_backoff_retains_secondary_progress_until_next_checkpoint():
     asyncio.run(scenario())
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_ending_episode_clears_secondary_progress():
     async def scenario():
         runtime = _speaking_runtime(_BlockingProvider())
@@ -334,12 +332,11 @@ def test_ending_episode_clears_secondary_progress():
         assert runtime._secondary_pending
         await runtime.end("reset")
         assert runtime._secondary_pending == {}
-        assert runtime._secondary_seen == {}
+        assert runtime.ledger._shadow_progress_seen == {}
 
     asyncio.run(scenario())
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_final_silence_wins_over_secondary_mailbox_at_same_checkpoint():
     async def scenario():
         provider = _BlockingProvider()
@@ -362,7 +359,6 @@ def test_final_silence_wins_over_secondary_mailbox_at_same_checkpoint():
     asyncio.run(scenario())
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_final_settlement_clears_progress_arriving_during_final_request():
     async def scenario():
         provider = _BlockingProvider()
@@ -687,7 +683,6 @@ def test_no_fixed_poll_windows_are_created():
     assert value.forced_due(now=2.4) is None
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_long_pause_keeps_anchor_without_replaying_secondary_checkpoints():
     value = scheduler()
     value.arm(0.0, wall_time=100.0, turn_id="turn-a")
@@ -710,7 +705,6 @@ def test_long_pause_keeps_anchor_without_replaying_secondary_checkpoints():
     assert value.generation == old_generation
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_secondary_and_final_prompts_are_mutually_exclusive():
     class Registry:
         def action_definitions(self):
@@ -764,8 +758,8 @@ def test_secondary_and_final_prompts_are_mutually_exclusive():
     assert SECONDARY_MAILBOX_PROMPT in secondary
     assert "系统即将进入静默状态" not in secondary
     assert "actions 必须为 []" not in secondary
-    assert "没有必要的新内容时必须 wait" in secondary
-    assert "actions 与 speak 独立判断" in secondary
+    assert "没有必要的新内容时必须 wait（保持等待）" in secondary
+    assert "actions（动作列表）与 speak（语音决策）独立判断" in secondary
     assert FINAL_SILENCE_PROMPT in final
     assert SECONDARY_MAILBOX_PROMPT not in final
     assert "actions 必须为 []" in final
@@ -774,7 +768,6 @@ def test_secondary_and_final_prompts_are_mutually_exclusive():
     assert FINAL_SILENCE_PROMPT not in normal
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_secondary_mailbox_protocol_recovery_keeps_the_secondary_mailbox_request_scope():
     async def scenario():
         class Provider:
@@ -990,7 +983,6 @@ def test_speaking_semantic_mailbox_dispatches_once_and_coalesces():
     asyncio.run(scenario())
 
 
-@pytest.mark.skip(reason="Bridge 2.0 已删除 passive progress secondary mailbox（被动进度次级邮箱）")
 def test_speaking_skips_secondary_check_but_not_final_silence():
     async def scenario():
         provider = _BlockingProvider()
@@ -999,11 +991,11 @@ def test_speaking_skips_secondary_check_but_not_final_silence():
         runtime.scheduler.start_heartbeat(9.6)
 
         runtime.scheduler.arm(6.0, turn_id="turn-a")
-        runtime._secondary_pending["shadow_progress"] = 1
+        await _shadow_progress(runtime, "尚未评估", "progress-1")
         await runtime._on_heartbeat(10.0)
         await asyncio.sleep(0)
         assert provider.calls == 0
-        assert runtime._secondary_pending == {"shadow_progress": 1}
+        assert runtime._secondary_pending == {"agent": 1}
         assert runtime.snapshot()["secondary_mailbox"]["skipped_speaking"] == 1
 
         runtime.scheduler.arm(-19.61, turn_id="turn-a")
@@ -1109,7 +1101,8 @@ def test_tts_state_never_blocks_llm_dispatch_authorization():
     assert runtime._busy_reason() == "not_allowed"
 
 
-def test_system_check_keeps_system_identity_but_uses_current_speech_turn():
+@pytest.mark.parametrize("prompt_kind", ["secondary_mailbox", "final_silence"])
+def test_system_check_keeps_system_identity_but_uses_current_speech_turn(prompt_kind):
     async def scenario():
         provider = _BlockingProvider()
         runtime = _speaking_runtime(provider)
@@ -1122,8 +1115,13 @@ def test_system_check_keeps_system_identity_but_uses_current_speech_turn():
             "text": "我先说明第一点。",
         }
         runtime.scheduler.arm(0.0, turn_id="turn-a")
-        runtime.scheduler.advance(30.0)
-        candidate = runtime.scheduler.forced_due(now=30.0)
+        if prompt_kind == "secondary_mailbox":
+            await _shadow_progress(runtime, "待评估进度", "progress-1")
+            runtime.scheduler.advance(4.0)
+            candidate = runtime.scheduler.secondary_candidate(now=4.0)
+        else:
+            runtime.scheduler.advance(30.0)
+            candidate = runtime.scheduler.forced_due(now=30.0)
 
         assert await runtime._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate) is True
         await asyncio.sleep(0)
@@ -1241,7 +1239,8 @@ def test_thread_heartbeat_coalesces_while_event_loop_is_blocked():
     asyncio.run(scenario())
 
 
-def test_new_scheduler_generation_discards_late_system_check_speech():
+@pytest.mark.parametrize("prompt_kind", ["secondary_mailbox", "final_silence"])
+def test_new_scheduler_generation_discards_late_system_check_speech(prompt_kind):
     async def scenario():
         class Provider:
             transport = "responses"
@@ -1291,8 +1290,13 @@ def test_new_scheduler_generation_discards_late_system_check_speech():
         runtime.output = Output()
         runtime.emit = emit
         runtime.scheduler.arm(0.0, turn_id="turn-a")
-        runtime.scheduler.advance(30.0)
-        candidate = runtime.scheduler.forced_due(now=30.0)
+        if prompt_kind == "secondary_mailbox":
+            await _shadow_progress(runtime, "待评估进度", "progress-1")
+            runtime.scheduler.advance(4.0)
+            candidate = runtime.scheduler.secondary_candidate(now=4.0)
+        else:
+            runtime.scheduler.advance(30.0)
+            candidate = runtime.scheduler.forced_due(now=30.0)
 
         assert await runtime._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate)
         request = runtime.active_request
@@ -1314,7 +1318,8 @@ def test_new_scheduler_generation_discards_late_system_check_speech():
     asyncio.run(scenario())
 
 
-def test_user_speech_onset_discards_late_system_check_speech_before_asr_final():
+@pytest.mark.parametrize("prompt_kind", ["secondary_mailbox", "final_silence"])
+def test_user_speech_onset_discards_late_system_check_speech_before_asr_final(prompt_kind):
     async def scenario():
         class Provider:
             transport = "responses"
@@ -1368,8 +1373,13 @@ def test_user_speech_onset_discards_late_system_check_speech_before_asr_final():
         runtime.output = Output()
         runtime.emit = emit
         runtime.scheduler.arm(0.0, turn_id="turn-a")
-        runtime.scheduler.advance(30.0)
-        candidate = runtime.scheduler.forced_due(now=30.0)
+        if prompt_kind == "secondary_mailbox":
+            await _shadow_progress(runtime, "待评估进度", "progress-1")
+            runtime.scheduler.advance(4.0)
+            candidate = runtime.scheduler.secondary_candidate(now=4.0)
+        else:
+            runtime.scheduler.advance(30.0)
+            candidate = runtime.scheduler.forced_due(now=30.0)
 
         assert await runtime._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate)
         request = runtime.active_request

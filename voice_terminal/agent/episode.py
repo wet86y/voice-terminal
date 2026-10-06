@@ -18,7 +18,7 @@ from .deferred_speech import DeferredSpeechMixin
 from .runtime_events import RecoverySignal, HeartbeatPulse, EpisodeHeartbeatClock
 from .prompts import (
     PROMPT, BALANCED_THINKING_PROMPT, DEEP_THINKING_PROMPT,
-    PERSONA_DOCUMENT_POLICY,
+    PERSONA_DOCUMENT_POLICY, SECONDARY_MAILBOX_PROMPT,
     FINAL_SILENCE_PROMPT, KWS_WAKE_PROMPT,
 )
 from .options import AgentOptions
@@ -200,6 +200,13 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         }
         self._completed_speech_ids: set[str] = set()
         self.pending = set()
+        self._secondary_enqueued = 0  # 登记的实质进度变化数。
+        self._secondary_consumed_normal = 0  # 普通请求消费的来源数。
+        self._secondary_consumed_check = 0  # 二等评估消费的来源数。
+        self._secondary_cleared_final = 0  # 最终静默检查清理的来源数。
+        self._secondary_dispatched = 0  # 二等评估派发次数。
+        self._secondary_skipped_speaking = 0  # 因用户讲话跳过的检查次数。
+        self._secondary_skipped_busy = 0  # 因忙碌或退避跳过的检查次数。
         self._scheduled_wakes: list[dict] = []
         self._pending_since: float | None = None
         self._pending_transcript_turn_id: str | None = None
@@ -280,6 +287,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self._recovery_attempts_by_turn: dict[str, int] = {}
         self._transport_retry_attempts_by_turn: dict[str, int] = {}
         self._retry_shadow_information_by_turn: dict[str, dict] = {}
+        self._retry_secondary_by_turn: dict[str, dict] = {}  # 原逻辑请求冻结的二等进度。
+        self._retry_system_check: dict | None = None  # 二等评估传输重试的原始场景和所有权。
         self._frozen_action_definitions: tuple[dict, ...] | None = None
         self._frozen_tool_catalog: tuple[dict, ...] | None = None
         self._frozen_thinking_action_enabled: bool | None = None
@@ -418,6 +427,18 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                   "thinking_lease_turn": self._thinking_lease_turn,
                   "reasoning_mode": self.reasoning_mode,
                   "scheduler": self.scheduler.snapshot(),
+                  "secondary_mailbox": {  # 二等信箱诊断，不进入模型语义历史。
+                      "pending_sources": sorted(self._secondary_pending),  # 待评估来源。
+                      "pending_count": len(self._secondary_pending),  # 待评估来源数。
+                      "latest_version": self.ledger._shadow_progress_version,  # 最新本地版本。
+                      "enqueued": self._secondary_enqueued,  # 已登记变化数。
+                      "consumed_normal": self._secondary_consumed_normal,  # 普通请求消费数。
+                      "consumed_check": self._secondary_consumed_check,  # 二等请求消费数。
+                      "cleared_final": self._secondary_cleared_final,  # 最终静默清理数。
+                      "dispatched": self._secondary_dispatched,  # 二等派发次数。
+                      "skipped_speaking": self._secondary_skipped_speaking,  # 讲话跳过次数。
+                      "skipped_busy": self._secondary_skipped_busy,  # 忙碌跳过次数。
+                  },
                   "heartbeat": {
                       "episode_generation": self._heartbeat_episode_generation,
                       "generated": self._heartbeat_generated,
@@ -727,6 +748,14 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self.episode_id = self.conversation.conversation_id
         self.state = "WAITING_EVENT"
         self.inputs.clear()
+        self.ledger.clear_shadow_progress(reset_seen=True)
+        self._secondary_enqueued = 0
+        self._secondary_consumed_normal = 0
+        self._secondary_consumed_check = 0
+        self._secondary_cleared_final = 0
+        self._secondary_dispatched = 0
+        self._secondary_skipped_speaking = 0
+        self._secondary_skipped_busy = 0
         # Request correlation is local to this Episode and is never consulted
         # to cancel an in-flight call.
         self.context_chars = 0
@@ -752,6 +781,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self._recovery_attempts_by_turn.clear()
         self._transport_retry_attempts_by_turn.clear()
         self._retry_shadow_information_by_turn.clear()
+        self._retry_secondary_by_turn.clear()
+        self._retry_system_check = None
         self._heartbeat_generated = 0
         self._heartbeat_delivered = 0
         self._heartbeat_coalesced = 0
@@ -871,15 +902,20 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             return None
         if int(context.get("generation") or 0) != self.scheduler.generation:
             return "scheduler_generation_changed"
-        # Timer-only checks are allowed to run while the user is speaking so
-        # the provider scheduler remains single-flight and non-preemptive.
-        # Their speech output is nevertheless obsolete by construction: it
-        # was requested without the utterance currently in progress.
+        # 最终静默及关键词唤醒检查可在讲话时结算；二等检查派发前须确认用户未讲话。
+        # 所有系统检查的语音都受讲话代次保护，不能播出缺少新话语上下文的旧候选。
         if bool(context.get("user_speaking_at_dispatch")):
             return "user_speaking_at_dispatch"
         dispatch_epoch = context.get("user_speech_epoch")
         if dispatch_epoch is not None and int(dispatch_epoch) != self._user_speech_epoch:
             return "user_speech_started_after_dispatch"
+        progress_generation = context.get("shadow_progress_generation")
+        if progress_generation is not None and (
+            context.get("shadow_activation_id") != self.ledger.shadow_activation_id
+            or int(progress_generation) != self.ledger._shadow_progress_generation
+            or not self.ledger.shadow_active or not self.ledger.shadow_available
+        ):
+            return "shadow_activation_expired"  # 影子激活已结束或进度作用域已失效。
         return None
 
     def _system_check_is_stale(self, context) -> bool:
@@ -1103,6 +1139,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             shadow_information=(dict(self._retry_shadow_information_by_turn[source_turn or ""])
                                 if (source_turn or "") in self._retry_shadow_information_by_turn
                                 else None),
+            secondary_context=self._retry_secondary_by_turn.get(source_turn or ""),
         )
         if getattr(self.provider, "transport", "chat_completions") == "responses":
             limit = int(getattr(self.provider, "protocol_recovery_limit", 1))
@@ -1150,7 +1187,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         if not isinstance(context, dict):
             return "normal"
         value = str(context.get("origin_prompt_kind") or context.get("prompt_kind") or "normal")
-        return value if value in {"final_silence", "kws_wake"} else "normal"
+        return value if value in {"secondary_mailbox", "final_silence", "kws_wake"} else "normal"
 
     @staticmethod
     def _recovery_instruction(code: str, *, deferred: bool = False,
@@ -1190,6 +1227,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         instruction = templates.get(code, templates["SPEAK_ENVELOPE_INVALID"])
         if deferred:
             scope = "遵守本次请求当前携带的场景约束，不要把上一次失败输出当成新的会话事实。"
+        elif origin_prompt_kind == "secondary_mailbox":
+            scope = "继续原 secondary_mailbox（二等信箱）状态评估；本次没有新的用户输入，不要重新回答历史用户请求。"
         elif origin_prompt_kind == "final_silence":
             scope = "继续原 final-silence 状态评估；不要把最后一条历史用户输入当成新的请求。"
         elif origin_prompt_kind == "kws_wake":
@@ -1251,6 +1290,9 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         """
 
         self.input_scope_closed = True
+        self.ledger.clear_shadow_progress(reset_seen=True)
+        self._retry_secondary_by_turn.clear()
+        self._discard_secondary_retry()
         self.recovery_queue.clear()
         if self.delay_task is not None and not self.delay_task.done():
             self.delay_task.cancel()
@@ -1986,6 +2028,19 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 "origin_prompt_kind": origin_prompt_kind,
                 "owner_scope": "system_check",
             })
+        elif "LLM_RETRY" in kinds and self._retry_system_check is not None:
+            # 传输重试仍走原单循环；新普通事件优先，旧系统评估不能冒充新用户请求。
+            ordinary = set(kinds) - self.scheduler.NON_SEMANTIC_EVENTS - {"LLM_RETRY"}
+            if ordinary or self._system_check_stale_reason(self._retry_system_check):
+                self._discard_secondary_retry()
+                kinds = set(kinds) - {"LLM_RETRY"}
+                if not ordinary:
+                    return True  # 已消费过期重试事件，不创建请求。
+            else:
+                dispatch_context = dict(self._retry_system_check)
+                dispatch_kind = "system_check_retry"
+                prompt_kind = "secondary_mailbox"
+                dispatch_context.update(dispatch_kind=dispatch_kind, prompt_kind=prompt_kind)
 
         scheduled_wakes = []
         if candidate is None and not recovery and "SCHEDULED_WAKE" in kinds:
@@ -2043,6 +2098,9 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             dispatch_context["owner_scope"] = "system_check"
             dispatch_context["user_speech_epoch"] = self._user_speech_epoch
             dispatch_context["user_speaking_at_dispatch"] = self.user_speaking is True
+            if prompt_kind == "secondary_mailbox":
+                dispatch_context["shadow_activation_id"] = self.ledger.shadow_activation_id  # 进度所属激活。
+                dispatch_context["shadow_progress_generation"] = self.ledger._shadow_progress_generation  # 进度作用域代次。
             self._system_check_turn_ids.add(system_check_id)
             if prompt_kind == "final_silence":
                 self._final_system_checks[system_check_id] = dict(dispatch_context)
@@ -2058,6 +2116,10 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 dispatch_context.setdefault(
                     "user_speaking_at_dispatch", self.user_speaking is True,
                 )
+            self._system_check_turn_ids.add(system_check_id)
+        elif self._is_system_check_context(dispatch_context):
+            system_check_id = dispatch_context["system_check_id"]
+            source_turn_id = dispatch_context["speech_turn_id"]
             self._system_check_turn_ids.add(system_check_id)
         reasoning_effort = "low" if self.reasoning_mode == "deep" else "none"
         if prompt_kind == "kws_wake":
@@ -2166,6 +2228,20 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             self.active_dispatch_context = None
             self.state = "WAITING_EVENT" if self.episode_id else "IDLE"
             return False
+        if candidate is not None and prompt_kind == "secondary_mailbox" and (
+            self.user_speaking is True or not self._secondary_snapshot()
+            or self.scheduler.final_pending or not self.scheduler.armed
+            or self._system_check_is_stale(dispatch_context)
+        ):
+            # 日志和界面回调会让出执行权，派发前必须再次确认讲话、信箱及最终期限。
+            self._system_check_turn_ids.discard(system_check_id)
+            self._identity_turns.pop(identity, None)
+            self.active_request_identity = None
+            self.active_request_source_turn_id = None
+            self.active_request_kinds = set()
+            self.active_dispatch_context = None
+            self.state = "WAITING_EVENT"
+            return False
         self.active_request = asyncio.create_task(
             self._step(identity, kinds, recovery=recovery,
                        recovery_signal=recovery_signal,
@@ -2173,7 +2249,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                        dispatch_context=dispatch_context),
             name=f"agent-step-{identity[1]}",
         )
-        if candidate is not None and prompt_kind == "final_silence":
+        if candidate is not None and prompt_kind in {"secondary_mailbox", "final_silence"}:
             self.scheduler.mark_forced_dispatched(candidate)
         if scheduled_wakes:
             count = min(len(scheduled_wakes), len(self._scheduled_wakes))
@@ -2192,6 +2268,14 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             return False
         signal = self.recovery_queue.popleft()
         signal.consumed = True
+        if self._recovery_origin_prompt_kind(signal) == "secondary_mailbox" and self._system_check_is_stale(signal.dispatch_context):
+            self._retry_secondary_by_turn.pop(signal.source_turn_id or "", None)
+            self._retry_shadow_information_by_turn.pop(signal.source_turn_id or "", None)
+            self._system_check_turn_ids.discard(signal.system_check_id)
+            await self.log("LLM_RECOVERY_SUPERSEDED", turn_id=signal.source_turn_id,
+                           error_id=signal.error_id, reason=self._system_check_stale_reason(signal.dispatch_context),
+                           cancelled_request=False)
+            return False
         scheduler_generation = self.scheduler.generation
         recovery_queue_wait_ms = round(
             max(0.0, time.monotonic() - signal.queued_at_monotonic) * 1000, 3,
@@ -2218,10 +2302,15 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
 
     async def _on_heartbeat(self, heartbeat_at, *, pulse: HeartbeatPulse | None = None,
                             delivered_at: float | None = None):
+        if pulse is not None:
+            delivered_at = time.monotonic() if delivered_at is None else delivered_at
+            # 使用回调实际到达时间；暂停后直接跨到当前检查点，不能重放旧二等请求。
+            heartbeat_at = max(heartbeat_at, delivered_at)
         previous_window = self.scheduler.window_index
         was_final_pending = self.scheduler.final_pending
         candidate = self.scheduler.heartbeat(heartbeat_at)
         current_window = self.scheduler.window_index
+        secondary_due = self.scheduler.secondary_due(previous_window)
         if pulse is not None:
             delivered_at = time.monotonic() if delivered_at is None else delivered_at
             delivery_delay_ms = max(0.0, (delivered_at - pulse.scheduled_at) * 1000)
@@ -2272,6 +2361,11 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 return
             else:
                 return
+        if candidate is not None and self._retry_system_check is not None and not (
+            self._meaningful_pending() - {"LLM_RETRY"}
+        ):
+            # 二等评估的重试仍属系统工作；最终静默检查到期时优先结算和交接。
+            self._discard_secondary_retry()
         meaningful = self._meaningful_pending()
         if meaningful:
             if not self.scheduler.normal_due(meaningful, at_heartbeat=True):
@@ -2327,6 +2421,27 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 return
             return
 
+        if not secondary_due or not self._secondary_snapshot():
+            return
+        if self.user_speaking is True:
+            self._secondary_skipped_speaking += 1
+            await self.log("SECONDARY_MAILBOX_SKIPPED", reason="user_speaking",
+                           window_index=current_window, pending_count=len(self._secondary_pending))
+            return
+        if not self._dispatch_allowed():
+            self._secondary_skipped_busy += 1
+            await self.log("SECONDARY_MAILBOX_SKIPPED", reason=self._busy_reason(),
+                           window_index=current_window, pending_count=len(self._secondary_pending))
+            return
+        secondary_candidate = self.scheduler.secondary_candidate(now=heartbeat_at)
+        if secondary_candidate is not None and await self._start_dispatch(
+            {"SYSTEM_CHECK"}, candidate=secondary_candidate,
+        ):
+            self._secondary_dispatched += 1
+            await self.log("SECONDARY_MAILBOX_DISPATCHED", window_index=current_window,
+                           pending_count=len(self._secondary_pending),
+                           system_check_id=self.active_dispatch_context.get("system_check_id"))
+
     async def _settle_final_system_check(self, system_check_id: str) -> None:
         context = self._final_system_checks.pop(system_check_id, None)
         if context is None or system_check_id in self._settled_final_system_checks:
@@ -2334,6 +2449,11 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self._settled_final_system_checks.add(system_check_id)
         if int(context.get("generation") or 0) != self.scheduler.generation:
             return
+        cleared = self.ledger.clear_shadow_progress()
+        self._secondary_cleared_final += cleared
+        if cleared:
+            await self.log("SECONDARY_MAILBOX_CLEARED_FINAL", count=cleared,
+                           scheduler_generation=self.scheduler.generation)
         callback = self.on_final_system_check_settled
         if not callable(callback):
             return
@@ -2380,6 +2500,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             if step_outcome == "completed":
                 self._transport_retry_attempts_by_turn.pop(source_turn_id or "", None)
                 self._retry_shadow_information_by_turn.pop(source_turn_id or "", None)
+                self._retry_secondary_by_turn.pop(source_turn_id or "", None)
             elif recovery:
                 retry_snapshot = self._retry_shadow_information_by_turn.pop(source_turn_id or "", None)
                 discard_shadow_snapshot(
@@ -2395,12 +2516,15 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 self._retry_shadow_information_by_turn.pop(source_turn_id or "", None)
             )
         except Exception as exc:
-            # Timer-owned system checks are terminal at the transport layer.
-            # Retrying one as ordinary mailbox work could outlive the final
-            # settlement and speak after the controller has returned to KWS.
+            # 最终静默及关键词唤醒检查的传输失败直接结算；二等检查可限次重试，
+            # 但必须保留原系统评估作用域，不能退化为普通用户请求。
+            failed_prompt_kind = (
+                dispatch_context.get("origin_prompt_kind") or dispatch_context.get("prompt_kind")
+                if isinstance(dispatch_context, dict) else None
+            )  # 失败请求的原始场景；协议恢复失败后传输重试也必须保留。
             terminal_system_check = bool(
                 system_check_id and isinstance(dispatch_context, dict)
-                and dispatch_context.get("prompt_kind") in {"final_silence", "kws_wake"}
+                and failed_prompt_kind in {"final_silence", "kws_wake"}
             )
             retryable = bool(getattr(exc, "retryable", False)) and not terminal_system_check
             await self.log(
@@ -2441,6 +2565,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                     self.backoff_until = time.monotonic() + wait_seconds
                     await self.log("LLM_BACKOFF", seconds=wait_seconds, step=self.backoff_step)
                     self.pending.add("LLM_RETRY")
+                    if system_check_id and failed_prompt_kind == "secondary_mailbox":
+                        self._retry_system_check = dict(dispatch_context)
                     if self.queue.empty():
                         self.queue.put_nowait(True)
             else:
@@ -2454,6 +2580,16 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             if latest.get("final") and not self.output.active and not retryable:
                 await self._emit_turn_settled(identity, source_turn_id, "agent_error")
         finally:
+            secondary_retry_pending = bool(
+                self._retry_system_check and "LLM_RETRY" in self.pending
+                and self._retry_system_check.get("system_check_id") == system_check_id
+            )
+            if "LLM_RETRY" not in self.pending and not any(
+                signal.source_turn_id == source_turn_id for signal in self.recovery_queue
+            ):
+                self._retry_secondary_by_turn.pop(source_turn_id or "", None)
+                if self._retry_system_check and self._retry_system_check.get("system_check_id") == system_check_id:
+                    self._retry_system_check = None
             if settle_pending_silence:
                 await self._settle_pending_silence_after_request(
                     identity, source_turn_id,
@@ -2482,6 +2618,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             self.last_llm_completed_at = time.monotonic()
             if (system_check_id in self._system_check_turn_ids
                     and system_check_id not in self._system_check_output_turn_ids
+                    and not secondary_retry_pending
                     and not any(
                         signal.system_check_id == system_check_id
                         for signal in self.recovery_queue
@@ -2886,10 +3023,10 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         actions = envelope.actions
         if system_check is None:
             system_check = turn_id in self._system_check_turn_ids
-        # Timer-owned system checks retain their explicit no-action contract.
+        # 二等检查沿用普通动作能力；最终静默及关键词唤醒检查仍禁止动作。
         # SHADOW_INFORMATION is an ordinary dispatch and follows the normal
         # advertised-action policy.
-        if system_check and actions:
+        if system_check and system_check_prompt_kind != "secondary_mailbox" and actions:
             await self.log(
                 "SYSTEM_CHECK_ACTION_REJECTED", identity=identity, turn_id=turn_id,
                 system_check_id=system_check_id or turn_id, owner_scope="system_check",
@@ -2933,15 +3070,57 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         explicitly marked untrusted by the ledger before a later main-model
         request sees it.
         """
+        if self.closed or (event.kind == "progress" and self.input_scope_closed):
+            return
         await self.ensure_episode()
+        previous_version = self.ledger._shadow_progress_version
         if not self.ledger.commit_shadow_event(event):
             await self.log("SHADOW_EVENT_DUPLICATE", event_id=event.event_id, event_kind=event.kind)
             return
+        if self.ledger._shadow_progress_version != previous_version:
+            self._secondary_enqueued += 1
+            await self.log("SECONDARY_MAILBOX_ENQUEUED", source=event.source,
+                           version=self.ledger._shadow_progress_version,
+                           pending_count=len(self._secondary_pending))
         await self.log("SHADOW_EVENT", event_id=event.event_id, event_kind=event.kind)
         if event.kind == "information":
-            self._wake("SHADOW_INFORMATION")
+            if self.ledger.shadow_information_snapshot() is not None:
+                self._wake("SHADOW_INFORMATION")
+            else:
+                await self.log("SHADOW_INFORMATION_ALREADY_EVALUATED", event_id=event.event_id)
         elif event.kind in {"input_required", "result", "failed"}:
             self._wake("SHADOW_EVENT_PRIORITY")
+
+    @property
+    def _secondary_pending(self) -> dict[str, int]:
+        """待评估来源与 version（版本）的诊断视图；账本拥有唯一信箱状态。"""
+        return {source: state["version"] for source, state in self._secondary_snapshot().items()}
+
+    def _secondary_snapshot(self) -> dict[str, dict]:
+        return self.ledger.shadow_progress_snapshot()
+
+    def _consume_secondary(self, captured: dict[str, dict], *, prompt_kind: str) -> list[str]:
+        consumed = self.ledger.consume_shadow_progress(captured)
+        if prompt_kind == "final_silence":
+            self._secondary_cleared_final += len(consumed)
+        elif prompt_kind == "secondary_mailbox":
+            self._secondary_consumed_check += len(consumed)
+        else:
+            self._secondary_consumed_normal += len(consumed)
+        return consumed
+
+    def _discard_secondary_retry(self) -> None:
+        """丢弃已被新输入或生命周期边界替换的系统评估重试。"""
+        context = self._retry_system_check
+        self._retry_system_check = None
+        if context is None:
+            return
+        self.pending.discard("LLM_RETRY")
+        source = context.get("speech_turn_id") or ""
+        self._retry_secondary_by_turn.pop(source, None)
+        self._retry_shadow_information_by_turn.pop(source, None)
+        self._transport_retry_attempts_by_turn.pop(source, None)
+        self._system_check_turn_ids.discard(context.get("system_check_id"))
 
     async def accept_durable_voice_event(self, event: DurableVoiceEvent) -> None:
         """Commit a scheduled durable event independently of Shadow information."""
@@ -2985,15 +3164,24 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         same_turn_transcript_reassessment = bool(
             {"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"}.intersection(kinds)
         )
+        if prompt_kind == "secondary_mailbox" and self._system_check_is_stale(dispatch_context):
+            return "system_check_stale"
         retry_key = source_turn_id or ""
+        if recovery and recovery_signal is not None and recovery_signal.secondary_context is not None:
+            secondary_context = self.ledger.valid_shadow_progress(recovery_signal.secondary_context)
+        elif ("LLM_RETRY" in kinds and retry_key in self._retry_secondary_by_turn
+              and not (set(kinds) - self.scheduler.NON_SEMANTIC_EVENTS - {"LLM_RETRY"})):
+            secondary_context = self.ledger.valid_shadow_progress(self._retry_secondary_by_turn[retry_key])
+        else:
+            secondary_context = self._secondary_snapshot()
+        if prompt_kind == "secondary_mailbox" and not secondary_context and not recovery:
+            return "system_check_stale"
         if recovery and recovery_signal is not None and recovery_signal.shadow_information:
             shadow_information = dict(recovery_signal.shadow_information)
         elif "LLM_RETRY" in kinds and retry_key in self._retry_shadow_information_by_turn:
             shadow_information = dict(self._retry_shadow_information_by_turn[retry_key])
         else:
             shadow_information = self.ledger.shadow_information_snapshot()
-            if shadow_information is not None:
-                self._retry_shadow_information_by_turn[retry_key] = dict(shadow_information)
         messages = self.messages(
             kinds,
             recovery_signal=recovery_signal,
@@ -3001,6 +3189,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             force_context=dispatch_context,
             current_turn_id=source_turn_id,
             shadow_information=shadow_information,
+            secondary_context=secondary_context,
         )
         if self.closed or not self.episode_id:
             return
@@ -3050,6 +3239,17 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 source=shadow_information["source"],
                 captured_version=shadow_information["version"],
             )
+        # 冻结与审计成功后才保存和确认版本；构建失败或旧版本确认不能丢失新状态。
+        self._retry_secondary_by_turn[retry_key] = secondary_context
+        if shadow_information is not None:
+            self._retry_shadow_information_by_turn[retry_key] = dict(shadow_information)
+        consumed_secondary = self._consume_secondary(secondary_context, prompt_kind=prompt_kind)
+        if consumed_secondary:
+            await self.log("SECONDARY_MAILBOX_CONSUMED", identity=identity,
+                           turn_id=source_turn_id, prompt_kind=prompt_kind,
+                           sources=consumed_secondary,
+                           captured_version=max(state["version"] for state in secondary_context.values()),
+                           pending_count=len(self._secondary_pending))
         audit_capture_ms = round((time.perf_counter() - audit_capture_started) * 1000, 2)
         self.request_count += 1
         self.request_started_at = time.monotonic()
@@ -3745,6 +3945,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
     async def end(self, reason):
         old = self.episode_id
         self.scheduler.disarm()
+        self.ledger.clear_shadow_progress(reset_seen=True)
         await self._stop_heartbeat_clock()
         self.recovery_queue.clear()
         self.active_dispatch_context = None
@@ -3826,6 +4027,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self._recovery_attempts_by_turn.clear()
         self._transport_retry_attempts_by_turn.clear()
         self._retry_shadow_information_by_turn.clear()
+        self._retry_secondary_by_turn.clear()
+        self._retry_system_check = None
         self.deferred_recovery_feedback.clear()
         self.state = "IDLE"
         await self.emit("agent.episode", self.snapshot(include_history=False))

@@ -22,7 +22,7 @@ git diff --check
 | 便携路径、旧数据导入、组件校验与安全归档 | `tests/test_portable_paths.py`、`tests/test_desktop_packaging.py` |
 | 桌面原生路径与启用组合 | `cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common`（原生公共模块测试） |
 | ASR（自动语音识别）分块与最终刷新 | `tests/test_asr_worker.py`、`tests/test_asr_worker_protocol.py` |
-| Bridge 2.0（桥接协议 2.0）与 DSH（代理运行时）事件 | `tests/test_dsh_bridge.py`、`tests/test_bridge_v2_information.py`、`tests/test_durable_shadow_mailbox.py`、`tests/test_shadow_agent_harness.py` |
+| Bridge 2.0（第二版桥接协议）、二等信箱与 DSH（代理运行时）事件 | `tests/test_dsh_bridge.py`、`tests/test_bridge_v2_information.py`、`tests/test_secondary_mailbox.py`、`tests/test_scheduler_staircase.py`、`tests/test_durable_shadow_mailbox.py`、`tests/test_shadow_agent_harness.py` |
 | Shadow、上下文和 ledger | `tests/test_shadow_agent.py`、`tests/test_shadow_agent_harness.py`、`tests/test_session_ledger.py`、`tests/test_conversation_runtime.py` |
 | TTS、speech admission、分段发送 | `tests/test_minimax_tts.py`、`tests/test_speech_admission.py`、`tests/test_sentence_scheduling.py` |
 | 声纹 | `tests/test_speaker.py`、`tests/test_speaker_features.py` |
@@ -32,6 +32,18 @@ git diff --check
 完整回归不能只运行局部测试；协议、上下文、生命周期或公共事件变更必须运行 Python 全量、前端测试、类型检查和构建。
 
 本机全量测试仍有[已登记的挂起问题](known-issues.md)。挂起时记录受阻的全量命令及定向回归范围，不将定向通过表述为全量通过。
+
+二等信箱恢复的定向回归命令如下。覆盖空信箱、4 秒检查、进度合并与去重、普通调用消费、版本竞争、
+构建失败、讲话与忙碌时保留、最终静默优先、生命周期清理、单请求执行以及恢复重试的场景约束：
+
+```powershell
+python -X utf8 -m pytest -q tests/test_secondary_mailbox.py tests/test_scheduler_staircase.py tests/test_json_schema_shadow.py tests/test_context_cache_contract.py tests/test_bridge_v2_information.py tests/test_dsh_bridge.py tests/test_shadow_agent.py tests/test_shadow_agent_harness.py tests/test_durable_shadow_mailbox.py tests/test_product_sidecar.py tests/test_speaker_production.py
+npm --prefix integrations/dsh/voice-terminal-shadow-bridge test
+```
+
+桥接插件测试同时执行两套 TypeScript（静态类型语言）配置的类型检查。最近一次执行的结果和全量后端回归边界见
+[协议验证记录](bridge-2.0-protocol.md#本次实施与验证记录)；既有启动测试失败及尚未完成的二等现场验收已登记到
+[当前已知问题](known-issues.md)，不能把本地替身测试通过视为实际模型或播放设备验收通过。
 
 ## 完整启动验收
 
@@ -110,9 +122,9 @@ npm run test --workspace @voice-terminal/frontend -- src/product/useProductAdapt
 
 ## Bridge 2.0 信息观察
 
-`progress`（界面进度）只更新产品活动视图，不创建语音模型请求。`information`（Voice 信息）由 DSH 根 Agent 或状态观察器写入同一个内存单槽；最后到达的信息覆盖旧值，并在调度安全点合并为一次 Voice 请求。请求审计快照完成后，信息按本地版本认领并从共享槽清除；重试只能使用该逻辑请求的本地快照，不能把旧信息带入后续无关请求。是否播报由 Voice 主模型结合当前用户上下文判断。
+`progress`（影子进度）更新产品活动视图，实质变化按有效激活及来源登记到二等信箱；普通请求会携带，否则每 4 秒在单一心跳中检查非空信箱。用户讲话、模型忙碌或退避时保留状态，空信箱不发起二等请求。`information`（影子信息）由 DSH（代理运行时）根 Agent（根代理）或状态观察器写入同一个内存单槽；最后到达的信息覆盖旧值，并在普通调度安全点合并为一次 Voice（语音主模型）请求。请求审计快照完成后，两类快照均按本地版本确认消费；重试使用原逻辑请求的冻结快照，不能消费后来到达的新版本。是否播报由语音主模型结合当前用户上下文、实际传达语音和当前队列判断。
 
-现场检查 `SHADOW_INFORMATION`（影子信息事件）、`SHADOW_INFORMATION_CONSUMED`（影子信息认领）与 `LLM_DISPATCHED`（模型请求派发）的数量和版本；确认 UI 进度变化没有引发模型请求、被覆盖的信息没有进入请求上下文、静默决策不会重新消费旧信息。终态应清除尚未认领的信息，并且每次激活只接受一个终态。
+现场检查 `SECONDARY_MAILBOX_ENQUEUED`（二等状态登记）、`SECONDARY_MAILBOX_CONSUMED`（二等版本消费）、`SECONDARY_MAILBOX_DISPATCHED`（二等评估派发）、`SHADOW_INFORMATION`（影子信息事件）、`SHADOW_INFORMATION_CONSUMED`（影子信息认领）与 `LLM_DISPATCHED`（模型请求派发）的数量和版本；确认进度不立即唤醒模型，重复正文不重新登记，普通请求消费后不会随后再触发二等请求。检查讲话和退避跳过后状态保留、暂停不补发、同一内容不从两个入口重复触发、最终检查优先且二等评估不重置静默期限。终态和激活失效应清理进度，每次激活仍只接受一个终态。
 
 协议结构、会话迁移要求、本次自动化测试结果和隔离 HTTP（超文本传输协议）验收边界见 [Bridge 2.0 可替换信息协议](bridge-2.0-protocol.md)。现场端到端验收从 `SessionRuntime.start_listening()`（启动 Voice 输入会话）进入；若要验证真实模型推理，必须在启动服务后观察实际模型请求和语音端决策，不能将请求消息构造测试视为模型实测。
 
@@ -129,7 +141,7 @@ npm run test --workspace @voice-terminal/frontend -- src/product/useProductAdapt
 - 活跃期 context/wake 响应丢失时通过 `session.state` 和原 request ID 幂等恢复，不因已生效的请求发布
   假 `failed`；只有首次启动、明确拒绝或状态核对失败才记一次基础设施失败；
 - stale 工具不执行，stale final 不发布；
-- `progress`、status 和工具 lifecycle 不进入主 mailbox；只有语义事件通过唯一 heartbeat 进入主 Agent；
+- `progress`（影子进度）只登记二等信箱，`information`（影子信息）和终态走普通事件入口；工具 lifecycle（生命周期）不触发主推理，所有调度复用唯一 heartbeat（心跳）；
 - `session.stop` 保留 Shadow，`session.reset` 和 close 清理 Shadow；
 - 80% 上下文预算处换代失败时保留旧 trace，不终止主语音会话；
 - Observer 不接收原始 reasoning，不调用工具，不控制主语音。

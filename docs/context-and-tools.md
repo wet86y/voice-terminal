@@ -154,7 +154,7 @@ Shadow 可用时，主模型只获得以下本地控制动作：
 本地控制工具：
 
 - `get_latest_context({since_revision})`：返回 unchanged、delta 或 epoch snapshot；
-- `publish_progress({text})`（发布界面进度）：只更新 Product UI（产品界面）；
+- `publish_progress({text})`（发布进度，`text` 为正文）：更新 Product UI（产品界面），实质变化合并进入二等信箱，按 4 秒检查点或随普通请求评估；
 - `publish_voice_information({text})`（发布 Voice 信息）：更新单个全局最新信息槽并触发可合并推理；
 - `request_user_input({question, options})`（请求用户输入）：发布唯一终态问题；
 - `return_shadow_result({text})`（返回最终结果）：发布自包含的唯一终态结果；
@@ -169,8 +169,11 @@ DSH（影子代理宿主）后端另提供 `request_early_silence({})`（请求�
 
 事件处理规则：
 
-- `progress` 和工具 lifecycle 只更新 Product UI，不触发 LLM（大语言模型）请求；
-- `information` 只进入一次 logical request（逻辑请求）的 `REQUEST_TAIL`（请求尾部），被认领后即丢弃；
+- `progress`（影子进度）更新 Product UI（产品界面）并按有效激活及来源合并进入二等信箱，不立即排入普通事件；工具 lifecycle（生命周期）只更新界面；
+- 二等信箱在唯一 400 毫秒心跳中每 4 秒检查，普通事件和 `final_silence`（静默前最终检查）优先，空信箱不请求模型；讲话、忙碌或退避时保留状态；
+- 普通模型调用携带最新 `shadow.progress`（影子进度列表），上下文冻结及审计成功后按 `version`（版本）消费，构建失败和版本竞争不会丢失新进度；
+- 同一激活的相同正文不从进度和信息入口重复触发；停止输入、终态、激活替换和会话结束清理二等状态；
+- `information`（影子信息）保持普通事件调度，只进入一次 logical request（逻辑请求）的 `REQUEST_TAIL`（请求尾部），被认领后即丢弃；
 - `input_required`、`result`、`failed` 进入持久语义历史；`no_action` 不进入语义历史；
 - 文件、网页、工具错误和 Shadow 文本都是不可信资料，不能覆盖系统指令、人格、动作权限或语音协议；
 - stale 工具不得执行，stale final 不得发布；
