@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useProductContext } from "../product-context";
+import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
 const {
   settings,
   saving,
@@ -41,13 +42,10 @@ const {
 } = useProductContext();
 </script>
 <template>
-  <header>
-    <p class="panel-kicker">可选声纹增强</p>
-    <h2>让连续对话更自然</h2>
-    <p>
+  <SettingsPageHeader section="speaker" />
+  <p class="instruction-hint">
       声纹只在本地旁路观察和路由，不会阻塞音频采集、VAD（语音活动检测）、ASR（自动语音识别）的局部或最终转写；普通请求在未注册、超时或出错时保守放行，主人打断则必须获得确认。它不是付款、删除、门锁等高风险操作的身份认证。
-    </p>
-  </header>
+  </p>
 
   <section class="speaker-status-card">
     <div>
@@ -176,46 +174,14 @@ const {
     </p>
   </div>
 
-  <section class="speaker-enrollment-card">
+  <section class="speaker-enrollment-card" aria-labelledby="speaker-enrollment-title">
     <div class="speaker-card-heading">
-      <div>
-        <p class="section-label">VOICE PROFILE</p>
-        <h3>主人声纹模板</h3>
-        <p>
-          固定一个逻辑用户，可保存多组带标签模板。原始注册录音在提取成功后立即删除；夹嗓子等特殊说法可以用自定义标签单独测试，但不能当作防伪保证。
-        </p>
-      </div>
-      <div>
-        <button
-          v-if="!speakerEnrollment && !speakerTestRecording"
-          class="outline-button"
-          type="button"
-          @click="startSpeakerEnrollment"
-        >
-          开始录制</button
-        ><button
-          v-if="!speakerEnrollment && !speakerTestRecording"
-          class="ghost-action"
-          type="button"
-          :disabled="!speakerHasProfile"
-          @click="beginSpeakerTest"
-        >
-          现场测试</button
-        ><button
-          v-if="speakerTestRecording && speakerServerCapture"
-          class="save-button compact-save"
-          type="button"
-          disabled
-        >
-          正在录制（{{ speakerRecordingSeconds }} 秒）</button
-        ><button
-          v-else-if="speakerTestRecording"
-          class="save-button compact-save"
-          type="button"
-          @click="stopSpeakerRecording"
-        >
-          停止测试（{{ speakerRecordingSeconds }} 秒）
-        </button>
+      <div class="speaker-card-copy"><h3 id="speaker-enrollment-title">主人声纹模板</h3><p>按日常语速录制三段，每段 5–10 秒，保持设备与距离一致。</p></div>
+      <div class="speaker-card-actions">
+        <button v-if="!speakerEnrollment && !speakerTestRecording" class="outline-button speaker-compact-button" type="button" @click="startSpeakerEnrollment">开始录制</button>
+        <button v-if="!speakerEnrollment && !speakerTestRecording" class="outline-button speaker-compact-button" type="button" :disabled="!speakerHasProfile" @click="beginSpeakerTest">现场测试</button>
+        <button v-if="speakerTestRecording && speakerServerCapture" class="outline-button speaker-compact-button speaker-stop-button" type="button" disabled>正在录制（{{ speakerRecordingSeconds }} 秒）</button>
+        <button v-else-if="speakerTestRecording" class="outline-button speaker-compact-button speaker-stop-button" type="button" @click="stopSpeakerRecording">停止测试（{{ speakerRecordingSeconds }} 秒）</button>
       </div>
     </div>
     <div v-if="speakerTestResult" class="speaker-test-result">
@@ -235,126 +201,30 @@ const {
       >
     </div>
     <div v-if="speakerEnrollment" class="speaker-recording-flow">
-      <p>
-        请依次朗读下方三段<strong>不同</strong>的句子，每段 5–10
-        秒，用平时对助手说话的速度与音量；三段之间保持同一设备与距离。不要反复念同一句，也不要用拖长音的持续元音。
-      </p>
-      <p v-if="speakerEnrollment.guidance" class="speaker-guidance">
-        {{ speakerEnrollment.guidance }}
-      </p>
+      <p v-if="speakerEnrollment.guidance" class="speaker-guidance">{{ speakerEnrollment.guidance }}</p>
       <div class="speaker-segment-list">
-        <div
-          v-for="(segment, index) in ['第 1 段', '第 2 段', '第 3 段']"
-          :key="segment"
-          class="speaker-segment-row"
-        >
-          <span class="speaker-segment-index">0{{ index + 1 }}</span>
-          <div>
-            <strong>{{ segment }}</strong
-            ><small v-if="speakerPrompt(index)" class="speaker-prompt"
-              >「{{ speakerPrompt(index) }}」</small
-            ><small>{{
-              speakerEnrollment.segments.includes(index) ? "已接收" : "尚未录制"
-            }}</small>
+        <div v-for="(segment, index) in ['第 1 段', '第 2 段', '第 3 段']" :key="segment" class="speaker-segment-row" :class="{ completed: speakerEnrollment.segments.includes(index), recording: speakerRecordingSegment === index }" :data-segment="index">
+          <span class="speaker-segment-index" aria-hidden="true">0{{ index + 1 }}</span>
+          <div class="speaker-segment-copy">
+            <div class="speaker-segment-heading"><strong>{{ segment }}</strong><span class="speaker-segment-state" role="status">{{ speakerRecordingSegment === index ? '录制中 · ' + speakerRecordingSeconds + ' 秒' : speakerEnrollment.segments.includes(index) ? '已完成' : '待录制' }}</span></div>
+            <p v-if="speakerPrompt(index)" class="speaker-prompt">{{ speakerPrompt(index) }}</p>
+            <label v-if="index === 2" class="speaker-template-label"><span>模板标签</span><input :id="'speaker-label-' + index" type="text" value="自定义" aria-label="自定义模板标签" :disabled="speakerRecordingSegment !== null" /></label>
           </div>
-          <input
-            v-if="index === 2"
-            :id="`speaker-label-${index}`"
-            type="text"
-            value="自定义"
-            aria-label="自定义模板标签"
-          /><button
-            v-if="speakerRecordingSegment === index && speakerServerCapture"
-            class="save-button compact-save"
-            type="button"
-            disabled
-          >
-            正在录制（{{ speakerRecordingSeconds }} 秒）</button
-          ><button
-            v-else-if="speakerRecordingSegment === index"
-            class="save-button compact-save"
-            type="button"
-            @click="stopSpeakerRecording"
-          >
-            停止录音（{{ speakerRecordingSeconds }} 秒）</button
-          ><button
-            v-else
-            class="outline-button"
-            type="button"
-            :disabled="speakerRecordingSegment !== null"
-            @click="
-              beginSpeakerRecording(index, speakerSegmentLabel(index, segment))
-            "
-          >
-            {{
-              speakerEnrollment.segments.includes(index)
-                ? "重新录制"
-                : "开始录制"
-            }}
-          </button>
+          <button v-if="speakerRecordingSegment === index && speakerServerCapture" class="outline-button speaker-compact-button speaker-segment-action speaker-stop-button" type="button" disabled>正在录制</button>
+          <button v-else-if="speakerRecordingSegment === index" class="outline-button speaker-compact-button speaker-segment-action speaker-stop-button" type="button" @click="stopSpeakerRecording">停止录制</button>
+          <button v-else class="outline-button speaker-compact-button speaker-segment-action" type="button" :disabled="speakerRecordingSegment !== null" @click="beginSpeakerRecording(index, speakerSegmentLabel(index, segment))">{{ speakerEnrollment.segments.includes(index) ? '重新录制' : '开始录制' }}</button>
         </div>
       </div>
       <footer class="speaker-flow-footer">
-        <span>{{ speakerEnrollment.segments.length }}/3 段已完成</span>
-        <div>
-          <button
-            class="ghost-action"
-            type="button"
-            @click="cancelSpeakerEnrollment"
-          >
-            取消本次录制</button
-          ><button
-            class="save-button"
-            type="button"
-            :disabled="!speakerEnrollmentComplete || saving"
-            @click="commitSpeakerEnrollment"
-          >
-            提交声纹资料
-          </button>
-        </div>
+        <div class="speaker-flow-progress"><span role="status">已完成 {{ speakerEnrollment.segments.length }} / 3 段</span><div class="speaker-progress-marks" aria-hidden="true"><i v-for="index in 3" :key="index" :class="{ completed: index <= speakerEnrollment.segments.length }"></i></div></div>
+        <div class="speaker-flow-actions"><button class="outline-button speaker-compact-button" type="button" @click="cancelSpeakerEnrollment">取消录制</button><button class="save-button speaker-compact-button speaker-submit-button" type="button" :disabled="!speakerEnrollmentComplete || saving" @click="commitSpeakerEnrollment">保存声纹</button></div>
       </footer>
     </div>
     <div v-else-if="speakerTemplates.length" class="speaker-template-list">
-      <article
-        v-for="template in speakerTemplates"
-        :key="String(template.template_id)"
-      >
-        <div>
-          <strong>{{ String(template.label || "自定义") }}</strong
-          ><small
-            >{{ String(template.template_id).slice(0, 8) }} ·
-            {{
-              String(template.created_at || "")
-                .replace("T", " ")
-                .slice(0, 16)
-            }}</small
-          >
-        </div>
-        <span>{{
-          template.include_in_centroid === false
-            ? "未纳入主中心"
-            : "已纳入主中心"
-        }}</span
-        ><button
-          class="ghost-action"
-          type="button"
-          @click="
-            setSpeakerTemplateCentroid(
-              String(template.template_id),
-              template.include_in_centroid === false,
-            )
-          "
-        >
-          {{
-            template.include_in_centroid === false ? "纳入主中心" : "移出主中心"
-          }}</button
-        ><button
-          class="danger-action"
-          type="button"
-          @click="deleteSpeakerTemplate(String(template.template_id))"
-        >
-          删除
-        </button>
+      <article v-for="template in speakerTemplates" :key="String(template.template_id)" class="speaker-template-row">
+        <div class="speaker-template-copy"><strong :title="String(template.label || '自定义')">{{ String(template.label || '自定义') }}</strong><time>{{ String(template.created_at || '').replace('T', ' ').slice(0, 16) }}</time></div>
+        <span class="speaker-template-state" :class="{ active: template.include_in_centroid !== false }">{{ template.include_in_centroid === false ? '未纳入主中心' : '已纳入主中心' }}</span>
+        <div class="speaker-template-actions"><button class="outline-button speaker-compact-button" type="button" @click="setSpeakerTemplateCentroid(String(template.template_id), template.include_in_centroid === false)">{{ template.include_in_centroid === false ? '纳入主中心' : '移出主中心' }}</button><button class="outline-button danger-action speaker-compact-button" type="button" @click="deleteSpeakerTemplate(String(template.template_id))">删除</button></div>
       </article>
     </div>
     <div v-else class="pool-empty">还没有模板，请点击“开始录制”。</div>

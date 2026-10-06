@@ -373,9 +373,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     } else wakeTaskDraft.when = ''
     wakeTaskDraft.repeat = task.repeat || ''
     wakeTaskDraft.text = task.text
-    wakeTaskDraft.ruleKind = task.rule_kind || 'at'
+    wakeTaskDraft.ruleKind = task.rule_kind || (task.repeat ? 'every' : 'at')
     const rule = task.rule || {}
-    wakeTaskDraft.ruleText = String(rule.expression || rule.time || '')
+    wakeTaskDraft.ruleText = String(rule.expression || rule.time || wakeTaskDraft.when.slice(11, 16) || '09:00')
     wakeTaskDraft.timeZone = String(rule.timeZone || 'Asia/Hong_Kong')
     wakeTaskDraft.weekdays = Array.isArray(rule.weekdays) ? rule.weekdays.join(',') : ''
   }
@@ -393,7 +393,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
           : { cron: { expression: wakeTaskDraft.ruleText, time_zone: wakeTaskDraft.timeZone } }
       await productApi.updateWakeTask(editingWakeTaskId.value, {
         target: wakeTaskDraft.target, text: wakeTaskDraft.text,
-        ...(calendar ? { change } : { when: wakeTaskDraft.when, repeat: wakeTaskDraft.repeat }),
+        ...(calendar ? { change } : { when: wakeTaskDraft.when, repeat: wakeTaskDraft.ruleKind === 'every' ? wakeTaskDraft.repeat : '' }),
       })
       editingWakeTaskId.value = ''
       await refreshWakeTasks()
@@ -817,7 +817,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       return false
     }
     if (coreUnavailable.value) {
-      setError(new Error('语音能力尚未就绪，请先完成模型配置或查看系统运行。'))
+      setError(new Error('语音能力尚未就绪，请先完成模型配置或查看本地组件。'))
       return false
     }
     return voice.toggleListening()

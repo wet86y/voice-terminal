@@ -130,6 +130,7 @@ git diff --check
 
 - [独立桌面应用、数据分离与便携构建](docs/desktop-application.md)：Tauri 2（桌面应用框架）窗口、独立预览、构建与迁移命令。
 - [桌面实施验收记录](docs/desktop-acceptance.md)：实际构建、运行、退出、迁移及待补实机检查。
+- [前端界面阶段性交接](docs/frontend-ui-handoff.md)：已确认的界面修订、产品接入差异及正式迁移顺序。
 - [独立应用启动与系统管理](docs/application-lifecycle.md)
 - [架构与生命周期](docs/architecture.md)
 - [连续性底座：上下文衔接与定时唤醒](docs/continuity-foundation.md)

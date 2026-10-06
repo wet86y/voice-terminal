@@ -14,6 +14,7 @@
     "desktop:ui": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-desktop.ps1 -UiPreview",
     "desktop:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-desktop.ps1",
     "desktop:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1",
+    "desktop:icons": "node scripts/generate-app-icons.mjs",
     "desktop:publish": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-desktop.ps1",
     "build": "npm run desktop:build",
     "frontend:build": "npm run build --workspace @voice-terminal/frontend",

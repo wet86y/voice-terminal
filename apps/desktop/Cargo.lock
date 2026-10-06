@@ -3994,6 +3994,7 @@ dependencies = [
 name = "voice-terminal-bootstrap"
 version = "0.7.0"
 dependencies = [
+ "embed-resource",
  "voice-desktop-common",
 ]
 

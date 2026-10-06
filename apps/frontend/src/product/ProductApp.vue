@@ -12,7 +12,6 @@ import WakeSettings from "./panels/WakeSettings.vue";
 import PersonaSettings from "./panels/PersonaSettings.vue";
 import SpeakerSettings from "./panels/SpeakerSettings.vue";
 import WakeTasksSettings from "./panels/WakeTasksSettings.vue";
-import SystemSettings from "./panels/SystemSettings.vue";
 import ComputeSettings from "./panels/ComputeSettings.vue";
 import ModelSettings from "./panels/ModelSettings.vue";
 import { provideProductContext } from "./product-context";
@@ -25,7 +24,6 @@ const {
   activePage,
   activeSettingsTab,
   settings,
-  connected,
   runtimeState,
   shadowExpanded,
   restartState,
@@ -52,16 +50,7 @@ function nativeAction(action: () => Promise<void>) {
 </script>
 <template>
   <AppFrame
-    :page="activePage"
     :runtime="runtimeState"
-    :status="connected ? '本机已连接' : '等待连接'"
-    :console-enabled="dsh.state === 'ready'"
-    :console-label="dsh.state === 'starting' ? '代理启动中' : '代理控制台'"
-    :desktop="desktop.available"
-    @page="activePage = $event"
-    @console="openDshConsole"
-    @logs="nativeAction(desktop.openLogs)"
-    @exit="nativeAction(desktop.exit)"
   >
     <template #banner
       ><div
@@ -70,25 +59,28 @@ function nativeAction(action: () => Promise<void>) {
         role="status"
       >
         <span>部分组件暂不可用，核心语音功能仍可使用。</span
-        ><button @click="showApplicationSystem">查看系统运行</button>
+        ><button @click="showApplicationSystem">查看本地组件</button>
       </div></template
     >
     <Workbench
       v-show="activePage === 'home'"
       :model="workbenchModel"
+      :console-enabled="dsh.state === 'ready'"
+      :console-label="dsh.state === 'starting' ? '代理启动中' : '代理控制台'"
+      @settings="activePage = 'settings'"
+      @console="openDshConsole"
       @action="runtimeAction"
       @reset="resetSession"
       @mode="setReasoningMode"
       @expand="shadowExpanded = !shadowExpanded"
-      @models="
-        activePage = 'settings';
-        activeSettingsTab = 'models';
-      "
     />
     <SettingsFrame
       v-show="activePage === 'settings'"
       :section="activeSettingsTab"
-      :status="connected ? '已连接' : '离线 · 可重试'"
+      :desktop="desktop.available"
+      @back="activePage = 'home'"
+      @logs="nativeAction(desktop.openLogs)"
+      @exit="nativeAction(desktop.exit)"
       @section="activeSettingsTab = $event"
     >
       <template #warnings
@@ -102,8 +94,7 @@ function nativeAction(action: () => Promise<void>) {
         <PersonaSettings v-if="activeSettingsTab === 'persona'" />
         <SpeakerSettings v-if="activeSettingsTab === 'speaker'" />
         <WakeTasksSettings v-if="activeSettingsTab === 'wakes'" />
-        <SystemSettings v-if="activeSettingsTab === 'system'" />
-        <ComputeSettings v-if="activeSettingsTab === 'compute'" />
+        <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" />
         <ModelSettings v-if="activeSettingsTab === 'models'" /></article
     ></SettingsFrame>
     <template #overlays>

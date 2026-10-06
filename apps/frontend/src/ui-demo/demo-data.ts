@@ -154,8 +154,8 @@ export const originLabels: Record<DemoModelOrigin, string> = {
 export type PreviewScene = 'normal' | 'empty' | 'long' | 'loading' | 'error'
 /** PreviewOverlay（浮层展示）：启动、确认、成功和失败画面。 */
 export type PreviewOverlay = 'none' | 'startup' | 'confirm' | 'success' | 'failure'
-/** SettingsTab（展示设置页签）：唤醒词与静默合并，正式页面仍保持原入口。 */
-export type SettingsTab = 'wake' | 'persona' | 'speaker' | 'wakes' | 'models' | 'compute' | 'system'
+/** SettingsTab（展示设置页签）：本地模型设备与系统状态合并到组件页。 */
+export type SettingsTab = 'wake' | 'persona' | 'speaker' | 'wakes' | 'models' | 'compute'
 /** PreviewPage（展示页面）：工作台或某个设置页。 */
 export type PreviewPage = 'home' | SettingsTab
 
@@ -170,8 +170,7 @@ export const settingsTabs: Array<{
   { id: 'speaker', label: '声纹设置', hint: '主人识别与模板', icon: '◎' },
   { id: 'wakes', label: '定时唤醒', hint: '任务与触发规则', icon: '◴' },
   { id: 'models', label: '模型管理', hint: '连接、分配与模型池', icon: '◇' },
-  { id: 'compute', label: '计算设备', hint: '设备偏好与资源', icon: '▤' },
-  { id: 'system', label: '系统运行', hint: '组件、指标与诊断', icon: '▧' },
+  { id: 'compute', label: '本地组件', hint: '运行状态与资源', icon: '▤' },
 ]
 export const sceneChoices: Array<{
   /** value（场景标识）。 */ value: PreviewScene
@@ -226,28 +225,38 @@ export const demoAmbientRecords = [
   { id: 'ambient-01', time: '14:12', text: '窗外有一段远处的谈话声。', status: '非本人 · 环境记录' },
   { id: 'ambient-02', time: '14:16', text: '稍后再确认这个安排。', status: '身份未知 · 环境记录' },
 ]
-/** id（标识）、text（任务说明）、rule（重复规则）、when（触发时间）、status（状态）。 */
-export const demoWakeTasks = [
-  { id: 'wake-01', text: '整理今天的待办，提醒我确认剩余事项。', rule: '每天 18:00', when: '2026-10-03 18:00', status: '待执行' },
-  { id: 'wake-02', text: '回顾本周方案进度，并列出下周需要推进的工作。', rule: '每周五 17:30', when: '2026-10-09 17:30', status: '待执行' },
-  { id: 'wake-03', text: '检查上午的会议准备。', rule: '单次', when: '2026-10-03 09:00', status: '已归档' },
+/** DemoWakeTask（展示任务）：各条目保留自己的重复规则与编辑内容。 */
+export interface DemoWakeTask {
+  id: string // id（任务标识）。
+  text: string // text（任务说明）。
+  rule: string // rule（展示的重复规则）。
+  ruleKind: 'at' | 'daily' | 'weekly' // ruleKind（重复规则类型）。
+  weekdays: string // weekdays（星期，1 至 7，逗号分隔）。
+  when: string // when（下次触发日期时间）。
+  status: string // status（任务状态）。
+  hasReference: boolean // hasReference（是否保留参考上下文）。
+}
+export const demoWakeTasks: DemoWakeTask[] = [
+  { id: 'wake-01', text: '整理今天的待办，提醒我确认剩余事项。', rule: '每天 18:00', ruleKind: 'daily', weekdays: '', when: '2026-10-03 18:00', status: '待执行', hasReference: true },
+  { id: 'wake-02', text: '回顾本周方案进度，并列出下周需要推进的工作。', rule: '每周五 17:30', ruleKind: 'weekly', weekdays: '5', when: '2026-10-09 17:30', status: '待执行', hasReference: true },
+  { id: 'wake-03', text: '检查上午的会议准备。', rule: '单次', ruleKind: 'at', weekdays: '', when: '2026-10-03 09:00', status: '已归档', hasReference: true },
 ]
 /** id（标识）、name（模型名称）、device（当前设备）、memory（常驻内存）、gpu（显卡可选）。 */
 export const demoComputeModels = [
-  { id: 'paraformer', name: 'Paraformer（流式语音识别）', device: 'cpu', memory: '420 MiB（二进制兆字节）', gpu: true },
-  { id: 'sensevoice', name: 'SenseVoiceSmall（语音识别与分析）', device: 'cuda', memory: '610 MiB（二进制兆字节）', gpu: true },
-  { id: 'voice_vad', name: 'FSMN-VAD（语音活动检测）', device: 'cpu', memory: '58 MiB（二进制兆字节）', gpu: false },
-  { id: 'kws', name: 'KWS（关键词唤醒）', device: 'cpu', memory: '96 MiB（二进制兆字节）', gpu: false },
-  { id: 'smart_turn', name: 'SmartTurn（语音结束判断）', device: 'cpu', memory: '180 MiB（二进制兆字节）', gpu: false },
-  { id: 'wespeaker', name: 'WeSpeaker（声纹识别）', device: 'cpu', memory: '110 MiB（二进制兆字节）', gpu: false },
+  { id: 'paraformer', name: 'Paraformer（流式语音识别）', device: 'cpu', memory: '420 MB', gpu: true },
+  { id: 'sensevoice', name: 'SenseVoiceSmall（语音识别与分析）', device: 'cuda', memory: '610 MB', gpu: true },
+  { id: 'voice_vad', name: 'FSMN-VAD（语音活动检测）', device: 'cpu', memory: '58 MB', gpu: false },
+  { id: 'kws', name: 'KWS（关键词唤醒）', device: 'cpu', memory: '96 MB', gpu: false },
+  { id: 'smart_turn', name: 'SmartTurn（语音结束判断）', device: 'cpu', memory: '180 MB', gpu: false },
+  { id: 'wespeaker', name: 'WeSpeaker（声纹识别）', device: 'cpu', memory: '110 MB', gpu: false },
 ]
 /** id（标识）、name（组件名称）、phase（阶段）、pid（进程号）、memory（常驻内存）、commit（提交内存）、cpu（处理器占用）。 */
 export const demoSystemComponents = [
-  { id: 'web', name: '应用宿主', phase: '提供桌面界面、托盘与组件监督', pid: '21040', memory: '86 MiB', commit: '102 MiB', cpu: '0.2%' },
-  { id: 'voice', name: 'Voice Server（语音服务）', phase: '语音链路待机', pid: '21044', memory: '780 MiB', commit: '940 MiB', cpu: '1.1%' },
-  { id: 'asr', name: 'ASR（语音识别）', phase: '模型已加载', pid: '21048', memory: '420 MiB', commit: '530 MiB', cpu: '0.3%' },
-  { id: 'analysis', name: '语音分析工作进程', phase: '分析能力就绪', pid: '21052', memory: '610 MiB', commit: '730 MiB', cpu: '0.4%' },
-  { id: 'dsh', name: 'DSH（代理执行宿主）', phase: '等待后台协作任务', pid: '21056', memory: '160 MiB', commit: '205 MiB', cpu: '0.1%' },
+  { id: 'web', name: '应用宿主', phase: '提供桌面界面、托盘与组件监督', pid: '21040', memory: '86 MB', commit: '102 MB', cpu: '0.2%' },
+  { id: 'voice', name: 'Voice Server（语音服务）', phase: '语音链路待机', pid: '21044', memory: '780 MB', commit: '940 MB', cpu: '1.1%' },
+  { id: 'asr', name: 'ASR（语音识别）', phase: '模型已加载', pid: '21048', memory: '420 MB', commit: '530 MB', cpu: '0.3%' },
+  { id: 'analysis', name: '语音分析工作进程', phase: '分析能力就绪', pid: '21052', memory: '610 MB', commit: '730 MB', cpu: '0.4%' },
+  { id: 'dsh', name: 'DSH（代理执行宿主）', phase: '等待后台协作任务', pid: '21056', memory: '160 MB', commit: '205 MB', cpu: '0.1%' },
 ]
 export const demoCapabilities = ['音频设备', 'KWS（关键词唤醒）', 'ASR（语音识别）', 'LLM（大语言模型）', 'TTS（语音合成）', 'Shadow（影子代理）', '声纹识别']
 
@@ -281,5 +290,7 @@ export const demoSettings = {
   /** statusModel（状态汇报模型标识）。 */ statusModel: 'managed-reasoning',
   /** taskText（定时任务编辑正文）。 */ taskText: '整理今天的待办，提醒我确认剩余事项。',
   /** taskWhen（任务触发时间）。 */ taskWhen: '2026-10-03T18:00',
-  /** taskRule（任务重复规则）。 */ taskRule: '每天',
+  /** taskRule（任务重复规则）。 */ taskRule: 'daily' as DemoWakeTask['ruleKind'],
+  /** taskTime（每天或每周的触发时间）。 */ taskTime: '18:00',
+  /** taskWeekdays（每周触发日期）。 */ taskWeekdays: '5',
 }

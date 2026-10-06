@@ -77,7 +77,12 @@ export interface ProductComputeStatus {
   /** resource_status（资源状态）：旧服务可以省略此字段。 */
   resource_status?: ResourceStatus
   hardware: {
-    system_memory: { available_bytes: number | null; total_bytes: number | null }
+    system_memory: {
+      available_bytes: number | null
+      total_bytes: number | null
+      /** commit_limit_bytes（系统提交内存上限，字节）：未提供时保留未知，不用物理内存代替。 */
+      commit_limit_bytes?: number | null
+    }
     gpu: { available: boolean; name: string | null; free_bytes: number | null; total_bytes: number | null }
     backends: {
       pytorch_cuda: boolean

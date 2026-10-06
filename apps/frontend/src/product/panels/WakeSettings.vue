@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { useProductContext } from "../product-context";
+import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
+import TimePicker from '../../interface/TimePicker.vue';
 const {
   settings,
   saving,
@@ -16,11 +18,7 @@ const {
 } = useProductContext();
 </script>
 <template>
-  <header>
-    <p class="panel-kicker">唤醒与静默</p>
-    <h2>需要时醒来，安静时等待</h2>
-    <p>管理唤醒短语、对话等待时间与每日静默时段。</p>
-  </header>
+  <SettingsPageHeader section="wake" />
   <div class="wake-silence-layout">
     <section class="preference-card">
       <header class="preference-heading">
@@ -57,12 +55,12 @@ const {
               :placeholder="index === 0 ? '例如：七三' : '例如：你好七三'"
             /><button
               type="button"
-              class="wake-keyword-remove"
+              class="outline-button wake-keyword-remove"
               :disabled="wakeForm.keywords.length <= 1"
-              :aria-label="`删除第 ${index + 1} 个唤醒词`"
+              :aria-label="`移除第 ${index + 1} 个唤醒词`"
               @click="removeWakeKeyword(index)"
             >
-              ×
+              移除
             </button>
           </div>
           <button
@@ -189,11 +187,11 @@ const {
         >
         <label
           >每日开始时间
-          <input v-model="quietHoursForm.start" type="time" :disabled="saving"
+          <TimePicker v-model="quietHoursForm.start" label="每日开始时间" :disabled="saving"
         /></label>
         <label
           >每日结束时间
-          <input v-model="quietHoursForm.end" type="time" :disabled="saving"
+          <TimePicker v-model="quietHoursForm.end" label="每日结束时间" :disabled="saving"
         /></label>
         <p v-if="!settings.wake.enabled">
           请先开启 KWS（关键词唤醒），并在下一次会话使其生效。

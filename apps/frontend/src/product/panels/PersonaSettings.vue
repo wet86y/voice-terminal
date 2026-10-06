@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useProductContext } from "../product-context";
+import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
 const {
   voice,
   settings,
@@ -23,13 +24,7 @@ const {
 } = useProductContext();
 </script>
 <template>
-  <header>
-    <p class="panel-kicker">人格与指令</p>
-    <h2>定义助手如何与你协作</h2>
-    <p>
-      用自然语言逐条定义触发语义和执行目标。保存后将在下一次会话或重置后生效。
-    </p>
-  </header>
+  <SettingsPageHeader section="persona" />
   <section class="instruction-section" aria-label="自定义指令">
     <h3>自定义指令</h3>
     <p class="instruction-hint">
@@ -50,18 +45,20 @@ const {
           {{ item.instruction }}</small
         >
       </div>
-      <label class="instruction-enabled"
+      <label class="instruction-toggle" :title="item.enabled ? '停用这条指令' : '启用这条指令'"
         ><input
           v-model="item.enabled"
           type="checkbox"
-          :aria-label="`启用 ${item.trigger}`"
-        />启用</label
+          role="switch"
+          :aria-label="`启用指令：${item.trigger}`"
+        /><i aria-hidden="true"></i></label
       >
       <button type="button" @click="editInstruction(item)">编辑</button>
       <button type="button" @click="removeInstruction(item.id)">删除</button>
     </div>
     <div class="instruction-form">
       <h4>{{ instructionDraft.id ? "编辑指令" : "添加指令" }}</h4>
+      <div class="instruction-form-fields">
       <label class="form-field"
         ><span>触发语义</span
         ><input
@@ -69,7 +66,7 @@ const {
           type="text"
           maxlength="200"
           placeholder="例如：帮我查查明天的天气"
-        /><small>描述用户会怎样表达，不要求逐字匹配。</small></label
+        /></label
       >
       <label class="form-field"
         ><span>执行位置</span
@@ -78,7 +75,7 @@ const {
           <option value="shadow">影子代理</option>
         </select></label
       >
-      <label class="form-field"
+      <label class="form-field instruction-target-field"
         ><span>{{
           instructionDraft.target === "shadow"
             ? "影子代理执行目标"
@@ -86,6 +83,7 @@ const {
         }}</span
         ><textarea
           v-model="instructionDraft.instruction"
+          rows="1"
           maxlength="2000"
           :placeholder="
             instructionDraft.target === 'shadow'
@@ -94,6 +92,8 @@ const {
           "
         ></textarea>
       </label>
+      </div>
+      <p class="instruction-hint">描述用户会怎样表达，不要求逐字匹配。</p>
       <p v-if="instructionFormError" class="instruction-error" role="alert">
         {{ instructionFormError }}
       </p>
@@ -118,16 +118,17 @@ const {
       {{ saving ? "正在保存…" : "保存自定义指令" }}
     </button>
     <small class="instruction-hint"
-      >表单和列表中的增删改、启停会在保存后持久化。</small
+      >表单和列表中的增删改、启停会在保存后持久化，并在下一次会话或重置后生效。</small
     >
   </section>
   <div class="persona-layout">
-    <nav class="persona-nav">
+    <nav class="persona-nav persona-nav-with-note">
       <button
         v-for="document in personaItems"
         :key="document.id"
         type="button"
         :class="{ active: activePersona === document.id }"
+        :title="`${document.label} · ${document.owner}`"
         @click="activePersona = document.id"
       >
         <strong>{{ document.label }}</strong
@@ -135,9 +136,10 @@ const {
       </button>
     </nav>
     <label class="document-editor"
-      ><span>{{ currentDocument.path }}</span
+      ><span :title="currentDocument.path">{{ currentDocument.path }}（文档路径）</span
       ><textarea
         v-model="personaDocuments[currentDocument.id]"
+        :aria-label="`${currentDocument.label}文档内容`"
         spellcheck="false"
       ></textarea
       ><small>文档最多 64 KB；保存后在下一次会话生效。</small></label

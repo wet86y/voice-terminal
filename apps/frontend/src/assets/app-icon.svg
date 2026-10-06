@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <!-- 沿用工作台的 45° 圆角正方形；小图标省略外围光晕，保持轮廓清晰。 -->
+  <defs>
+    <radialGradient id="surface" cx="32%" cy="26%" r="101%">
+      <stop stop-color="#eff3fd" />
+      <stop offset=".39" stop-color="#7d9cf3" />
+      <stop offset="1" stop-color="#5065a1" />
+    </radialGradient>
+  </defs>
+  <rect x="28" y="28" width="200" height="200" rx="65.3" transform="rotate(45 128 128)" fill="url(#surface)" stroke="#c4d5fb" stroke-width="2" />
+  <!-- waveform（声波标记）：静态应用标识与主界面的五条竖向声波保持一致。 -->
+  <g id="waveform" fill="#18305f">
+    <rect x="101.5" y="114" width="5" height="28" rx="2.5" />
+    <rect x="113.5" y="102" width="5" height="52" rx="2.5" />
+    <rect x="125.5" y="92" width="5" height="72" rx="2.5" />
+    <rect x="137.5" y="102" width="5" height="52" rx="2.5" />
+    <rect x="149.5" y="114" width="5" height="28" rx="2.5" />
+  </g>
+</svg>

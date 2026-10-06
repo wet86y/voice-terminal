@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod app_icon;
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Write},
@@ -335,8 +336,12 @@ fn preview_page_url_allowed(url: &tauri::Url) -> bool {
     page_url_allowed(
         url,
         "/ui-demo.html",
-        &["page", "scene", "runtime", "overlay", "replay"],
+        &["page", "scene", "runtime", "overlay", "replay", "session"],
     )
+        // session（演示会话状态）由前端保存；允许活动状态页面刷新，仍校验固定页面与参数。
+        && url
+            .query_pairs()
+            .all(|(key, value)| key != "session" || value == "active")
 }
 
 fn frontend_entry_url(origin: &str, token: &str, mode: FrontendMode) -> Result<tauri::Url, String> {
@@ -724,14 +729,15 @@ fn run() -> Result<(), String> {
         .setup(move |app| {
             let navigation_state = build_state.clone();
             let page_state = build_state.clone();
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            let main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title(if build_state.mode == FrontendMode::UiPreview {
                     "Voice Terminal · 前端演示（无业务后端）"
                 } else {
                     "Voice Terminal · 语音终端"
                 })
-                .inner_size(1380., 860.)
-                .min_inner_size(980., 640.)
+                // inner_size（默认内容尺寸）：小窗口启动，前端按可用空间逐级收起侧栏。
+                .inner_size(1000., 640.)
+                .min_inner_size(400., 480.)
                 .data_directory(build_state.data.clone())
                 .on_navigation(move |url| {
                     (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
@@ -760,24 +766,18 @@ fn run() -> Result<(), String> {
                     });
                 })
                 .build()?;
+            app_icon::apply(main_window.hwnd()?.0)?;
             if build_state.mode == FrontendMode::Product {
                 let show_item = MenuItem::with_id(app, "show", "打开工作台", true, None::<&str>)?;
                 let exit_item = MenuItem::with_id(app, "exit", "退出应用", true, None::<&str>)?;
                 let menu = Menu::with_items(app, &[&show_item, &exit_item])?;
-                let pixels: Vec<u8> = (0..32 * 32)
-                    .flat_map(|i| {
-                        let x = i % 32;
-                        let y = i / 32;
-                        if (x as i32 - 16).pow(2) + (y as i32 - 16).pow(2) < 180 {
-                            [178, 186, 255, 255]
-                        } else {
-                            [0, 0, 0, 0]
-                        }
-                    })
-                    .collect();
+                // default_window_icon（默认窗口图标）：托盘与标题栏、任务栏使用同一份应用资源。
+                let icon = app.default_window_icon().cloned().ok_or_else(|| {
+                    std::io::Error::other("应用图标资源不可用，无法建立系统托盘。")
+                })?;
                 let exit_state = build_state.clone();
                 let tray = TrayIconBuilder::new()
-                    .icon(tauri::image::Image::new_owned(pixels, 32, 32))
+                    .icon(icon)
                     .tooltip("Voice Terminal · 语音终端")
                     .menu(&menu)
                     .on_menu_event(move |app, event| match event.id.as_ref() {
@@ -803,6 +803,12 @@ fn run() -> Result<(), String> {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::ScaleFactorChanged { .. }) {
+                if let Ok(handle) = window.hwnd() {
+                    // 跨屏幕改变显示缩放时，重新选择标题栏与任务栏的原生图标尺寸。
+                    let _ = app_icon::apply(handle.0);
+                }
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     let state = window.state::<Arc<Desktop>>();
@@ -1009,6 +1015,7 @@ mod tests {
         for address in [
             "http://127.0.0.1:5174/ui-demo.html?page=wake&scene=error&runtime=speaking&overlay=confirm",
             "http://127.0.0.1:5174/ui-demo.html?replay=voice-shadow",
+            "http://127.0.0.1:5174/ui-demo.html?page=wakes&session=active",
         ] {
             assert!(preview_page_url_allowed(&tauri::Url::parse(address).unwrap()));
         }
@@ -1017,6 +1024,8 @@ mod tests {
             "http://127.0.0.1:5174/index.html",
             "http://127.0.0.1:5174/ui-demo.html?open_console=1",
             "http://127.0.0.1:5174/ui-demo.html?page=home&page=wake",
+            "http://127.0.0.1:5174/ui-demo.html?session=inactive",
+            "http://127.0.0.1:5174/ui-demo.html?session=active&session=active",
         ] {
             assert!(!preview_page_url_allowed(
                 &tauri::Url::parse(address).unwrap()

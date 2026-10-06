@@ -21,7 +21,7 @@ function configure() { application.inspect(); emit('models') }
       <ul v-if="!sessionInvalid"><li v-for="component in snapshot?.components || []" :key="component.id"><div><strong>{{ component.name }}</strong><span :class="component.state">{{ applicationStateLabel(component.state) }}</span></div><small>{{ component.phase }}</small><p v-if="component.error" class="application-error">{{ component.error }}</p></li></ul>
       <p v-if="error" class="application-error">{{ error }}</p>
       <div v-if="sessionInvalid" class="application-startup-actions"><button type="button" @click="application.exit">退出应用并重新启动</button></div>
-      <div v-else-if="snapshot?.state !== 'stopped' && !snapshot?.stopping" class="application-startup-actions"><button type="button" @click="inspect">查看系统运行</button><button v-if="businessReady" type="button" @click="configure">打开模型设置</button><button v-if="canRetry" type="button" :disabled="retryingAll" @click="application.retryFailed">{{ retryingAll ? '正在恢复组件' : '重试失败组件' }}</button><button type="button" @click="application.exit">退出应用</button></div>
+      <div v-else-if="snapshot?.state !== 'stopped' && !snapshot?.stopping" class="application-startup-actions"><button type="button" @click="inspect">查看本地组件</button><button v-if="businessReady" type="button" @click="configure">打开模型设置</button><button v-if="canRetry" type="button" :disabled="retryingAll" @click="application.retryFailed">{{ retryingAll ? '正在恢复组件' : '重试失败组件' }}</button><button type="button" @click="application.exit">退出应用</button></div>
     </section>
   </div>
 </template>
