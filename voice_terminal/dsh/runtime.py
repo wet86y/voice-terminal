@@ -359,6 +359,10 @@ class DshRuntimeManager:
         # 自研插件属于程序包；只补默认补丁，已迁移的用户配置继续保留。
         template = self.repo_root / "config/dsh/profile"
         profile = self.config.home_dir / "profiles/web"
+        if (self.repo_root / "apps/desktop/Cargo.toml").is_file():
+            # 源码工作台复用正式运行环境时，也更新已编译自研插件，保留用户补丁。
+            from .profile import build_profile
+            build_profile(self.repo_root, self.repo_root / ".runtime/dsh/bundles", profile)
         for source in template.rglob("*"):
             if not source.is_file():
                 continue

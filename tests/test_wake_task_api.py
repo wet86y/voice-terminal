@@ -4,10 +4,42 @@ import asyncio
 from pathlib import Path
 
 import httpx
+import os
+from unittest.mock import patch
 
 from voice_terminal.config import AppConfig, PersonaConfig
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.server.websocket import SessionRuntime, create_app
+
+
+def test_manual_create_requires_host_credential_and_fixes_business_fields(tmp_path: Path):
+    async def scenario():
+        config = AppConfig(model_dir=tmp_path / 'models', persona=PersonaConfig(directory=tmp_path / 'persona'))
+        settings = ProductSettingsStore(path=tmp_path / 'settings.json', config=config)
+        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / '.runtime')
+        calls = []
+        async def task_api(method, path, payload=None):
+            calls.append((method, path, payload))
+            return {'task_id': 'manual-test', **payload}
+        runtime.dsh.bridge.task_api = task_api
+        transport = httpx.ASGITransport(app=create_app(runtime, product_settings=settings), client=('127.0.0.1', 123))
+        with patch.dict(os.environ, {'VOICE_APP_INTERNAL_TOKEN': 'test-host-secret'}):
+            async with httpx.AsyncClient(transport=transport, base_url='http://127.0.0.1') as client:
+                route = '/internal/application/wake-tasks'
+                value = {'text': '检查真实任务', 'at': '2030-01-01T00:00:00Z'}
+                assert (await client.post(route, json=value)).status_code == 403
+                headers = {'Authorization': 'Bearer test-host-secret'}
+                for extra in ({'target': 'both'}, {'creation_source': 'agent'}, {'reference': '伪造背景'}, {'daily': {}}):
+                    assert (await client.post(route, headers=headers, json={**value, **extra})).status_code == 422
+                for rule in ({'at': value['at']}, {'daily': {'time': '09:00:00', 'time_zone': 'Asia/Hong_Kong'}},
+                             {'weekly': {'time': '09:00:00', 'time_zone': 'Asia/Hong_Kong', 'weekdays': [1, 3]}}):
+                    result = await client.post(route, headers=headers, json={'text': ' 检查真实任务 ', **rule})
+                    assert result.status_code == 200
+                    assert result.json()['creation_source'] == 'manual'
+                    assert calls[-1][2] == {'text': '检查真实任务', **rule, 'target': 'shadow_agent', 'reference': '', 'creation_source': 'manual'}
+        await runtime.close_background_services()
+        await runtime.dsh.close()
+    asyncio.run(scenario())
 
 
 def test_wake_task_routes_cover_dsh_tools_and_settings_page(tmp_path: Path):

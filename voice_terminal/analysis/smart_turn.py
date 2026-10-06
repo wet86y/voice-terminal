@@ -24,6 +24,7 @@ class SmartTurn:
                 )
                 active = session.get_providers()
                 self.session = session
+                self.runtime = "ONNX Runtime（推理运行时）"  # runtime（实际加载引擎）。
                 self.device = "cuda" if "CUDAExecutionProvider" in active else "cpu"
                 self.load_error = (
                     f"CUDA（图形处理器）加载失败，已回退到 {self.device}：{type(last_error).__name__}: {last_error}"

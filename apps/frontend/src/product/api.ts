@@ -72,6 +72,14 @@ function jsonBody(value: unknown): RequestInit {
 }
 
 export const productApi = {
+  /** createWakeTask（手动创建任务）：同源宿主校验桌面会话，内部凭据不进入前端。 */
+  createWakeTask: async (value: { text: string; at?: string; daily?: { time: string; time_zone: string }; weekly?: { time: string; time_zone: string; weekdays: number[] } }) => {
+    const response = await fetch('/api/v1/application/wake-tasks', {
+      method: 'POST', credentials: 'same-origin', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(value),
+    })
+    if (!response.ok) throw await readError(response)
+    return await response.json() as WakeTask
+  },
   snapshot: () => request<ProductSnapshot>('/api/v1/product/snapshot'),
   dshStatus: () => request<DshRuntimeStatus>('/api/v1/dsh/status'),
   launchDsh: () => request<{ url: string }>('/api/v1/dsh/ui-launch', { method: 'POST', body: '{}' }),
@@ -97,6 +105,8 @@ export const productApi = {
   addSpeakerEnrollmentSegment: (id: string, value: unknown) => request<Record<string, unknown>>(`/api/v1/speaker/enrollment/${encodeURIComponent(id)}/segment`, { method: 'POST', body: JSON.stringify(value) }),
   captureSpeakerEnrollmentSegment: (id: string, value: unknown, signal?: AbortSignal) => request<Record<string, unknown>>(`/api/v1/speaker/enrollment/${encodeURIComponent(id)}/capture`, { method: 'POST', body: JSON.stringify(value), signal }),
   captureSpeakerTest: (value: unknown, signal?: AbortSignal) => request<Record<string, unknown>>('/api/v1/speaker/test/capture', { method: 'POST', body: JSON.stringify(value), signal }),
+  /** stopSpeakerCapture（停止或取消采集）：后台释放本次流，页面卸载时也尽力送达。 */
+  stopSpeakerCapture: (owner: string | null, captureId: string, cancel = false) => request<Record<string, unknown>>(owner ? `/api/v1/speaker/enrollment/${encodeURIComponent(owner)}/capture/stop` : '/api/v1/speaker/test/capture/stop', { method: 'POST', body: JSON.stringify({ capture_id: captureId, cancel }), keepalive: true }),
   commitSpeakerEnrollment: (id: string) => request<Record<string, unknown>>(`/api/v1/speaker/enrollment/${encodeURIComponent(id)}/commit`, { method: 'POST' }),
   cancelSpeakerEnrollment: (id: string) => request<Record<string, unknown>>(`/api/v1/speaker/enrollment/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   deleteSpeakerTemplate: (id: string) => request<Record<string, unknown>>(`/api/v1/speaker/templates/${encodeURIComponent(id)}`, { method: 'DELETE' }),

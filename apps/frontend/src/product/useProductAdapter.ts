@@ -90,6 +90,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const snapshot = ref<ProductSnapshot | null>(null)
   const settings = reactive<ProductSettingsSnapshot>(structuredClone(DEFAULT_SETTINGS))
   const computeStatus = ref<ProductComputeStatus | null>(null)
+  const computeSavedDevices = ref(structuredClone(DEFAULT_SETTINGS.compute.devices)) // computeSavedDevices（已持久化设备偏好）。
   const registry = ref<ProductModelRegistry>(structuredClone(DEFAULT_REGISTRY))
   let registryRevision = 0 // registryRevision（注册表响应代次）：旧快照不能覆盖已经完成的扫描或保存。
   const initialComputeDevices = structuredClone(DEFAULT_SETTINGS.compute.devices)
@@ -99,6 +100,15 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   let enrollmentGeneration = 0 // enrollmentGeneration（注册代次）：取消后不接纳旧请求的响应。
   onBeforeUnmount(() => { adapterDisposed = true; void cancelSpeakerEnrollment({ notify: false }) })
   const editingWakeTaskId = ref('')
+  const addingWakeTask = ref(false) // addingWakeTask（手动创建表单是否展开）。
+  const wakeTaskCreateDraft = reactive({
+    ruleKind: 'at' as 'at' | 'daily' | 'weekly', // ruleKind（创建排期规则）。
+    when: '', // when（本地单次日期时间）。
+    time: '', // time（每天或每周的时间）。
+    weekdays: '', // weekdays（周一至周日的 1–7 集合）。
+    timeZone: '', // timeZone（系统当前时区）。
+    text: '', // text（任务说明），没有冻结参考。
+  })
   const wakeTaskDraft = reactive({
     /** target（目标）: 唤醒哪一侧 Agent. */
     target: 'voice_llm' as WakeTask['target'],
@@ -239,7 +249,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     const savedSpeaker = Object.fromEntries(Object.keys(speakerForm).map(key => [key, settings.speaker[key as keyof typeof settings.speaker]]))
     const speakerDirty = differs(speakerForm, savedSpeaker)
     const personaDirty = differs(personaDocuments, settings.persona)
-    const computeDirty = differs(settings.compute.devices, known ? normalizeSettings(snapshot.value!.settings).compute.devices : initialComputeDevices)
+    const computeDirty = differs(settings.compute.devices, known ? computeSavedDevices.value : initialComputeDevices)
     const assignmentDirty = differs(modelAssignments, {
       voice: registry.value.assignments.voice_llm_model_id || '', shadow: registry.value.assignments.shadow_llm_model_id || '', status: registry.value.assignments.status_llm_model_id || '',
     })
@@ -258,6 +268,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       scheduleDshStatusPoll()
     }
     const nextSettings = normalizeSettings(value.settings)
+    computeSavedDevices.value = { ...nextSettings.compute.devices }
     Object.assign(settings.wake, nextSettings.wake)
     Object.assign(settings.silence, nextSettings.silence)
     settings.quiet_hours = nextSettings.quiet_hours
@@ -342,6 +353,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
         const result = await productApi.saveCompute({ devices: submitted })
         const newerDraft = JSON.stringify(settings.compute.devices) !== JSON.stringify(submitted) ? { ...settings.compute.devices } : null
         updateSettingsFromResponse(settings, result)
+        computeSavedDevices.value = { ...settings.compute.devices }
         if (newerDraft) Object.assign(settings.compute.devices, newerDraft)
         setNotice(result.message || (result.restart_required
           ? '本地模型运行设备设置已保存，重新启动应用后生效。'
@@ -365,18 +377,19 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   function editWakeTask(task: WakeTask) {
     if (task.status !== 'pending') return
     editingWakeTaskId.value = task.task_id
+    addingWakeTask.value = false
     wakeTaskDraft.target = task.target
     if (task.when) {
       const date = new Date(task.when)
       const pad = (value: number) => String(value).padStart(2, '0')
-      wakeTaskDraft.when = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+      wakeTaskDraft.when = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
     } else wakeTaskDraft.when = ''
     wakeTaskDraft.repeat = task.repeat || ''
     wakeTaskDraft.text = task.text
     wakeTaskDraft.ruleKind = task.rule_kind || (task.repeat ? 'every' : 'at')
     const rule = task.rule || {}
     wakeTaskDraft.ruleText = String(rule.expression || rule.time || wakeTaskDraft.when.slice(11, 16) || '09:00')
-    wakeTaskDraft.timeZone = String(rule.timeZone || 'Asia/Hong_Kong')
+    wakeTaskDraft.timeZone = String(rule.timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone)
     wakeTaskDraft.weekdays = Array.isArray(rule.weekdays) ? rule.weekdays.join(',') : ''
   }
 
@@ -386,9 +399,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     try {
       const calendar = ['daily', 'weekly', 'cron'].includes(wakeTaskDraft.ruleKind)
       const change = wakeTaskDraft.ruleKind === 'daily'
-        ? { daily: { time: wakeTaskDraft.ruleText, time_zone: wakeTaskDraft.timeZone } }
+        ? { daily: { time: scheduleTime(wakeTaskDraft.ruleText), time_zone: wakeTaskDraft.timeZone } }
         : wakeTaskDraft.ruleKind === 'weekly'
-          ? { weekly: { time: wakeTaskDraft.ruleText, time_zone: wakeTaskDraft.timeZone,
+          ? { weekly: { time: scheduleTime(wakeTaskDraft.ruleText), time_zone: wakeTaskDraft.timeZone,
             weekdays: wakeTaskDraft.weekdays.split(',').map(value => Number(value.trim())) } }
           : { cron: { expression: wakeTaskDraft.ruleText, time_zone: wakeTaskDraft.timeZone } }
       await productApi.updateWakeTask(editingWakeTaskId.value, {
@@ -398,6 +411,47 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       editingWakeTaskId.value = ''
       await refreshWakeTasks()
       setNotice('唤醒任务已更新。')
+    } catch (error) { setError(error) }
+    finally { saving.value = false }
+  }
+
+  // scheduleTime（调度时间）：官方接口要求秒数，界面分钟值补零，已有秒数保留。
+  function scheduleTime(value: string) { return /^\d{2}:\d{2}$/.test(value) ? `${value}:00` : value }
+
+  function addWakeTask() {
+    if (saving.value || addingWakeTask.value) return
+    const date = new Date(Date.now() + 3600000)
+    const pad = (value: number) => String(value).padStart(2, '0')
+    const when = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+    Object.assign(wakeTaskCreateDraft, { ruleKind: 'at', when, time: when.slice(11), weekdays: '', timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, text: '' })
+    editingWakeTaskId.value = ''
+    addingWakeTask.value = true
+  }
+
+  async function createWakeTask() {
+    if (saving.value || !addingWakeTask.value) return
+    const draft = { ...wakeTaskCreateDraft }
+    const text = draft.text.trim()
+    const weekdays = draft.weekdays.split(',').filter(Boolean).map(Number)
+    if (!text || text.length > 500 || (draft.ruleKind === 'weekly' && (!weekdays.length || weekdays.some(day => !Number.isInteger(day) || day < 1 || day > 7))) || (draft.ruleKind !== 'at' && !/^\d{2}:\d{2}(?::\d{2})?$/.test(draft.time))) {
+      setError(new Error('请填写有效的任务说明、触发时间与星期。'))
+      return
+    }
+    const date = new Date(draft.when)
+    if (draft.ruleKind === 'at' && (!Number.isFinite(date.getTime()) || date.getTime() <= Date.now())) {
+      setError(new Error('单次触发时间必须晚于当前时间。'))
+      return
+    }
+    saving.value = true
+    try {
+      await productApi.createWakeTask({ text,
+        ...(draft.ruleKind === 'at' ? { at: date.toISOString() }
+          : draft.ruleKind === 'daily' ? { daily: { time: scheduleTime(draft.time), time_zone: draft.timeZone } }
+          : { weekly: { time: scheduleTime(draft.time), time_zone: draft.timeZone, weekdays } }),
+      })
+      addingWakeTask.value = false
+      await refreshWakeTasks()
+      setNotice('任务已保存到 DSH（代理执行宿主），到期进入当时的后台主线。')
     } catch (error) { setError(error) }
     finally { saving.value = false }
   }
@@ -558,12 +612,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
    * processing chain the live session uses.  Browser capture stays available
    * as a fallback via `addSpeakerEnrollmentSegment`.
    */
-  async function captureSpeakerEnrollmentSegment(index: number, label: string, seconds: number, signal?: AbortSignal) {
+  async function captureSpeakerEnrollmentSegment(index: number, label: string, seconds: number, signal?: AbortSignal, captureId?: string) {
     const enrollment = speakerEnrollment.value
     if (!enrollment) return null
     try {
       const result = await productApi.captureSpeakerEnrollmentSegment(enrollment.id, {
-        index, label, seconds,
+        index, label, seconds, ...(captureId ? { capture_id: captureId } : {}),
       }, signal)
       if (adapterDisposed || signal?.aborted || speakerEnrollment.value?.id !== enrollment.id) return null
       if (!enrollment.segments.includes(index)) enrollment.segments.push(index)
@@ -582,9 +636,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
   }
 
-  async function captureSpeakerTest(seconds: number, signal?: AbortSignal) {
+  async function captureSpeakerTest(seconds: number, signal?: AbortSignal, captureId?: string) {
     try {
-      const result = await productApi.captureSpeakerTest({ seconds }, signal)
+      const result = await productApi.captureSpeakerTest({ seconds, ...(captureId ? { capture_id: captureId } : {}) }, signal)
       if (adapterDisposed || signal?.aborted) return null
       speakerTestResult.value = result
       setNotice('现场声纹测试已完成。')
@@ -605,27 +659,32 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       await productApi.addSpeakerEnrollmentSegment(enrollment.id, {
         index, label, pcm_base64: pcmBase64,
       })
+      if (adapterDisposed || speakerEnrollment.value?.id !== enrollment.id) return
       if (!enrollment.segments.includes(index)) enrollment.segments.push(index)
       setNotice(`第 ${index + 1} 段录音已接收。`)
     } catch (error) { setError(error) }
   }
 
   async function commitSpeakerEnrollment() {
+    if (saving.value) return
     const enrollment = speakerEnrollment.value
     const required = enrollment?.required && enrollment.required > 0 ? enrollment.required : 3
     if (!enrollment || enrollment.segments.length !== required) {
       setError(new Error(`请先完成${required}段录音。`))
       return
     }
+    saving.value = true
     try {
       const result = await productApi.commitSpeakerEnrollment(enrollment.id)
+      if (adapterDisposed || speakerEnrollment.value?.id !== enrollment.id) return
       speakerEnrollment.value = null
       await refreshSpeaker()
       const detail = isRecord(result.enrollment) ? result.enrollment : {}
       const weakest = Number(detail.min_similarity)
       const suffix = Number.isFinite(weakest) ? `三段最低相似度 ${weakest.toFixed(2)}。` : ''
       setNotice(`声纹资料已更新；原始录音已删除。${suffix}`)
-    } catch (error) { setError(error) }
+    } catch (error) { if (!adapterDisposed && speakerEnrollment.value?.id === enrollment.id) setError(error) }
+    finally { saving.value = false }
   }
 
   async function deleteSpeakerTemplate(id: string) {
@@ -653,8 +712,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function testSpeakerAudio(pcmBase64: string) {
+    const generation = enrollmentGeneration
     try {
-      speakerTestResult.value = await productApi.testSpeaker({ pcm_base64: pcmBase64 })
+      const result = await productApi.testSpeaker({ pcm_base64: pcmBase64 })
+      if (adapterDisposed || generation !== enrollmentGeneration) return
+      speakerTestResult.value = result
       setNotice('现场声纹测试已完成。')
     } catch (error) { setError(error) }
   }
@@ -678,7 +740,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   const connected = computed(() => voice.connection.value === 'connected')
   const coreUnavailable = computed(() => application.managed.value && application.businessReady.value && !application.snapshot.value?.core_available)
-  const runtimeState = computed<ProductRuntimeState>(() => coreUnavailable.value && connected.value ? 'error' : normalizeRuntimeState(voice.state.value, connected.value))
+  // 输入与输出独立运行；实际播放可早于输入结束判定完成。打断及错误仍优先呈现。
+  const runtimeState = computed<ProductRuntimeState>(() => coreUnavailable.value && connected.value ? 'error'
+    : connected.value && voice.listening.value && !['ERROR', 'INTERRUPTING'].includes(voice.state.value)
+      && voice.activeSpeech.value?.state === 'playing' ? 'speaking'
+      : normalizeRuntimeState(voice.state.value, connected.value))
   const runtimeSource = computed(() => snapshot.value?.runtime)
   const quietStatus = computed(() => connected.value ? voice.quietHours : runtimeSource.value?.quiet_hours)
   const current = computed(() => connected.value
@@ -1254,9 +1320,14 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     snapshot,
     settings,
     computeStatus,
+    computeSavedDevices,
     registry,
     dsh,
     wakeTasks,
+    addingWakeTask,
+    wakeTaskCreateDraft,
+    addWakeTask,
+    createWakeTask,
     editingWakeTaskId,
     wakeTaskDraft,
     loading,
@@ -1341,6 +1412,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     testSpeakerAudio,
     captureSpeakerEnrollmentSegment,
     captureSpeakerTest,
+    stopSpeakerCapture: productApi.stopSpeakerCapture,
     refreshAmbientContext,
     clearAmbientContext,
     scanModels,

@@ -89,7 +89,7 @@ function nativeAction(action: () => Promise<void>) {
           <p>{{ settings.warnings.join(" ") }}</p>
         </div></template
       >
-      <article class="settings-panel panel">
+      <article class="settings-panel panel" :class="`settings-panel-${activeSettingsTab}`">
         <WakeSettings v-if="activeSettingsTab === 'wake'" />
         <PersonaSettings v-if="activeSettingsTab === 'persona'" />
         <SpeakerSettings v-if="activeSettingsTab === 'speaker'" />

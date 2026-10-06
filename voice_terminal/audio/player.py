@@ -60,6 +60,7 @@ class PcmPlayer:
         on_playback_started: Callable[[str], None] | None = None,
         device_latency_ms: int = 0,
         on_audio_rendered: Callable[[bytes], None] | None = None,
+        on_audio_frame: Callable[[bytes], None] | None = None,  # on_audio_frame（实际输出采样），独立于回声消除。
         playback_permission: Callable[[], bool] | None = None,
         on_policy_blocked: Callable[[str], None] | None = None,
     ) -> None:
@@ -68,6 +69,7 @@ class PcmPlayer:
         self.output_device = output_device
         self.on_playback_started = on_playback_started
         self.on_audio_rendered = on_audio_rendered
+        self.on_audio_frame = on_audio_frame
         self.playback_permission = playback_permission  # playback_permission（播放器出口策略）。
         self.on_policy_blocked = on_policy_blocked  # on_policy_blocked（被策略阻止时通知事务所有者）。
         self._policy_blocked_key: str | None = None
@@ -413,6 +415,9 @@ class PcmPlayer:
 
         if blocked_key and self.on_policy_blocked is not None:
             self.on_policy_blocked(blocked_key)
+
+        if self.on_audio_frame:
+            self.on_audio_frame(bytes(target))
 
         if self.on_audio_rendered and len(target) > 0:
             # The callback receives the complete buffer submitted to the

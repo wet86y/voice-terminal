@@ -30,7 +30,7 @@ from ..shadow_agent import ShadowEvent
 
 PRODUCT_SETTINGS_SCHEMA_VERSION = 9
 MIN_SILENCE_SECONDS = 5
-MAX_SILENCE_SECONDS = 90
+MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
 MIN_KWS_SENSITIVITY = 1
 MAX_KWS_SENSITIVITY = 99
@@ -777,15 +777,20 @@ class ProductSettingsStore:
     async def save_silence(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         raw_seconds = payload.get("seconds")
         if type(raw_seconds) is not int:
-            raise ProductSettingsError("seconds 必须是整数。")
+            raise ProductSettingsError("seconds（静默秒数）必须是整数。")
         seconds = raw_seconds
         if not MIN_SILENCE_SECONDS <= seconds <= MAX_SILENCE_SECONDS:
-            raise ProductSettingsError(f"seconds 必须在 {MIN_SILENCE_SECONDS} 至 {MAX_SILENCE_SECONDS} 之间。")
+            raise ProductSettingsError(f"seconds（静默秒数）必须在 {MIN_SILENCE_SECONDS} 至 {MAX_SILENCE_SECONDS} 之间。")
+        previous = self._settings["silence"]
         self._settings["silence"] = {
             "seconds": seconds,
             "smart_turn_hard_silence_ms": int(getattr(self.config.smart_turn, "hard_silence_ms", 1400)),
         }
-        self._save_settings()
+        try:
+            self._save_settings()
+        except BaseException:
+            self._settings["silence"] = previous
+            raise
         return self.snapshot()
 
     def save_shadow(self, payload: Mapping[str, Any]) -> dict[str, Any]:

@@ -12,6 +12,8 @@ import { productApi, ProductApiError } from './api'
 import { useProductAdapter } from './useProductAdapter'
 import { useProductControls } from './useProductControls'
 import * as desktopBridge from './desktop-port'
+import ComputeSettings from './panels/ComputeSettings.vue'
+import { provideProductContext } from './product-context'
 import type { WorkbenchModel } from '../interface/workbench'
 import type { ApplicationSnapshot } from './application-host'
 import { DEFAULT_REGISTRY, DEFAULT_SETTINGS } from './normalization'
@@ -68,6 +70,7 @@ function allowBusinessReady(value: { voice: ReturnType<typeof useProductAdapter>
   application.businessReady.value = true
 }
 beforeEach(() => {
+  vi.spyOn(productApi, 'stopSpeakerCapture').mockResolvedValue({ stopped: true })
   history.replaceState({}, '', '/'); vi.useFakeTimers()
   window.__VOICE_APPLICATION__ = { managed: true, origin: 'http://127.0.0.1:42123',
     voice_api_url: 'http://127.0.0.1:43876', voice_ws_url: 'ws://127.0.0.1:43876/ws' }
@@ -80,6 +83,105 @@ afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
+  it('本地组件不把整卡已用显存当应用占用，并区分设备草稿、待生效配置和实际 CPU（中央处理器）', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    value.computeStatus.value = { hardware: { system_memory: { total_bytes: 16 * 1024 ** 3, commit_limit_bytes: null }, gpu: { available: true, total_bytes: 8 * 1024 ** 3, free_bytes: 2 * 1024 ** 3 } }, models: { paraformer: { service: 'READY', device: 'cpu', requested_device: 'cpu', gpu_available: true, runtime: 'PyTorch（推理框架）', resource_status: { pid: 12, rss_bytes: 1024 ** 3, private_commit_bytes: 2 * 1024 ** 3 } } } } as never
+    application.snapshot.value = { core_available: true, total_memory_rss_bytes: null, total_memory_private_commit_bytes: null, components: [{ id: 'asr', state: 'ready', pid: 12 }] } as unknown as ApplicationSnapshot
+    value.settings.compute.devices.paraformer = 'cuda'
+    value.computeSavedDevices.value.paraformer = 'cpu'
+    await flushPromises()
+    expect(wrapper.get('[data-resource="vram"]').text()).toContain('未提供')
+    expect(wrapper.get('[data-resource="vram"]').text()).not.toContain('6 GB')
+    expect(wrapper.get('[data-resource="commit"]').text()).toBe('提交内存未提供/ 未提供')
+    const row = wrapper.get('[data-component="paraformer"]')
+    expect(row.find('[data-metric="vram"]').exists()).toBe(false)
+    expect(row.get('[data-metric="memory"]').text()).toContain('1 GB / 2 GB')
+    await row.get('button.local-component-action').trigger('click')
+    expect(row.text()).toContain('草稿尚未保存')
+    expect(row.text()).not.toContain('已保存配置下次启动生效')
+    value.computeSavedDevices.value.paraformer = 'cuda'
+    await flushPromises()
+    expect(row.text()).not.toContain('草稿尚未保存')
+    expect(row.text()).toContain('已保存配置下次启动生效')
+    expect(row.text()).toContain('实际运行：CPU（中央处理器）')
+  })
+  it('实际播放在输入结束判定期间驱动语音主体，完成、打断和错误仍及时更新', async () => {
+    const { value } = liveControls()
+    allowBusinessReady(value)
+    application.snapshot.value = { core_available: true, components: [] } as unknown as ApplicationSnapshot
+    value.voice.listening.value = true
+    value.voice.state.value = 'FINALIZING'
+    value.voice.playbackQueue.value = [{ speech_id: 'actual-output', conversation_id: 'actual-session', state: 'playing', text: '真实播报' }] as never
+    value.voice.audioLevels.value = [0.1, 0.2, 0.3, 0.2, 0.1]
+    expect(value.workbenchModel.value.state).toBe('speaking')
+    expect(value.workbenchModel.value.audioLevels).toEqual([0.1, 0.2, 0.3, 0.2, 0.1])
+    value.voice.state.value = 'INTERRUPTING'
+    expect(value.workbenchModel.value.state).toBe('listening')
+    value.voice.state.value = 'ERROR'
+    expect(value.workbenchModel.value.state).toBe('error')
+    value.voice.state.value = 'FINALIZING'
+    value.voice.playbackQueue.value = []
+    expect(value.workbenchModel.value.state).toBe('listening')
+    expect(value.workbenchModel.value.audioLevels).toEqual([0, 0, 0, 0, 0])
+  })
+  it('用户识别条目不显示播报交付字段，助手消息保留真实已听内容', () => {
+    const { value } = liveControls()
+    value.voice.connection.value = 'connected'
+    value.voice.conversationEntries.value = [
+      { seq: 1, kind: 'user_turn', conversation_id: 'actual-session', turn_id: 'turn-1', text: '用户原话', at: '2026-10-06T12:00:00Z', status: 'completed', delivery: { status: 'pending' } },
+      { seq: 2, kind: 'assistant_speech', conversation_id: 'actual-session', turn_id: 'turn-1', speech_id: 'speech-1', text: '助手回复', at: '2026-10-06T12:00:01Z', status: 'completed', delivery: { status: 'interrupted', heard_text: '助手' } },
+    ] as never
+    expect(value.workbenchModel.value.conversation[0]?.delivered).toBe('')
+    expect(value.workbenchModel.value.conversation[1]?.delivered).toContain('助手')
+  })
+  it('三种手动任务只提交说明和排期，失败保留创建草稿', async () => {
+    const { value } = liveAdapter()
+    allowBusinessReady(value)
+    const create = vi.spyOn(productApi, 'createWakeTask').mockResolvedValue({} as never)
+    for (const kind of ['at', 'daily', 'weekly'] as const) {
+      value.addWakeTask()
+      expect(Date.parse(value.wakeTaskCreateDraft.when)).toBeGreaterThan(Date.now())
+      value.wakeTaskCreateDraft.ruleKind = kind
+      value.wakeTaskCreateDraft.time = '09:15'
+      value.wakeTaskCreateDraft.text = ' 手动检查 '
+      value.wakeTaskCreateDraft.weekdays = '1,3'
+      await value.createWakeTask()
+      const submitted = create.mock.calls.at(-1)![0]
+      expect(Object.keys(submitted).sort()).toEqual([kind, 'text'].sort())
+      expect(submitted.text).toBe('手动检查')
+      if (kind === 'daily') expect(submitted.daily?.time).toBe('09:15:00')
+      if (kind === 'weekly') expect(submitted.weekly?.time).toBe('09:15:00')
+      if (kind === 'weekly') expect(submitted.weekly?.weekdays).toEqual([1, 3])
+      expect(value.addingWakeTask.value).toBe(false)
+    }
+    create.mockRejectedValueOnce(new Error('创建失败'))
+    value.addWakeTask(); value.wakeTaskCreateDraft.text = '保留草稿'
+    await value.createWakeTask()
+    expect(value.addingWakeTask.value).toBe(true)
+    expect(value.wakeTaskCreateDraft.text).toBe('保留草稿')
+    expect(value.lastError.value).toBe('创建失败')
+  })
+  it('服务器提前停止只在五秒后提交，收起保留完成进度并拒绝迟到响应', async () => {
+    vi.spyOn(productApi, 'startSpeakerEnrollment').mockResolvedValue({ enrollment_id: 'stop-session' })
+    const response = deferred<Record<string, unknown>>()
+    vi.spyOn(productApi, 'captureSpeakerEnrollmentSegment').mockReturnValue(response.promise)
+    const { value } = liveControls()
+    allowBusinessReady(value)
+    const request = value.beginSpeakerRecording(0, '第一段')
+    await flushPromises()
+    await value.stopSpeakerRecording()
+    expect(productApi.stopSpeakerCapture).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(5000)
+    await value.stopSpeakerRecording()
+    expect(productApi.stopSpeakerCapture).toHaveBeenCalledWith('stop-session', expect.any(String), false)
+    value.speakerEnrollment.value!.segments.push(1)
+    value.cancelActiveSpeakerCapture()
+    response.resolve({ quality: { speech_ms: 5000 } }); await request
+    expect(value.speakerEnrollment.value!.segments).toEqual([1])
+    expect(value.speakerRecordingSegment.value).toBeNull()
+    expect(value.speakerEnrollmentComplete.value).toBe(false)
+  })
   it('将固定间隔任务改为单次时清除间隔，每周任务保存所选星期与原有秒数', async () => {
     const { value } = liveAdapter()
     allowBusinessReady(value)

@@ -5,6 +5,11 @@ import LocalComponents from '../interface/LocalComponents.vue'
 import SettingsPageHeader from '../interface/SettingsPageHeader.vue'
 import TimePicker from '../interface/TimePicker.vue'
 import WakeTaskSchedule from '../interface/WakeTaskSchedule.vue'
+import InstructionEditorRow from '../interface/InstructionEditorRow.vue'
+import SpeakerRecordingFlow from '../interface/SpeakerRecordingFlow.vue'
+import ModelAccordion from '../interface/ModelAccordion.vue'
+import ModelAssignmentField from '../interface/ModelAssignmentField.vue'
+import ModelPoolEntry from '../interface/ModelPoolEntry.vue'
 import { useLocalComponentsDemo } from './useLocalComponentsDemo'
 import {
   demoAmbientRecords, demoInstructions, demoModelEntries,
@@ -39,6 +44,7 @@ const templates = computed(() => previewRows(demoSpeakerTemplates, props.scene))
 const ambient = computed(() => previewRows(demoAmbientRecords, props.scene))
 const instructionRows = computed(() => props.scene === 'empty' ? [] : instructions)
 const loading = computed(() => props.scene === 'loading')
+const demoModelOptions = demoModelEntries.filter(item => item.capability === 'llm').map(item => ({ value: item.id, label: item.name }))
 function feedback(label: string) { emit('feedback', label) }
 function toggleSpeakerRecording() {
   speakerRecording.value = null
@@ -151,12 +157,7 @@ function cancelTask(item: DemoWakeTask) {
       <section class="preview-section">
         <div class="section-row"><h3>自定义语音指令</h3><button class="ghost-action" type="button" @click="feedback('添加指令入口')">添加指令</button></div>
         <div v-if="!instructionRows.length" class="pool-empty">还没有自定义指令。</div>
-        <div v-for="item in instructionRows" :key="item.id" class="instruction-row instruction-editor-row">
-          <label class="form-field"><span>触发语义</span><input v-model="item.trigger" type="text"></label>
-          <label class="form-field"><span>执行位置</span><select v-model="item.target"><option value="voice">主语音助手</option><option value="shadow">Shadow（影子代理）</option></select></label>
-          <label class="form-field instruction-target-field"><span>执行目标</span><textarea v-model="item.instruction" rows="1"></textarea></label>
-          <label class="instruction-toggle" :title="item.enabled ? '停用这条指令' : '启用这条指令'"><input v-model="item.enabled" type="checkbox" role="switch" :aria-label="`启用指令：${item.trigger}`"><i aria-hidden="true"></i></label>
-        </div>
+        <InstructionEditorRow v-for="item in instructionRows" :key="item.id" :row="item" :disabled="loading" />
       </section>
       <label class="switch-row context-gate-row"><div><strong>实验性 Shadow 上下文门禁</strong><span>Shadow（影子代理）的侧载模型只判断运行中 DSH（代理执行宿主）的新引导应进入当前步骤还是下一回合；权威上下文仍完整同步。关闭后恢复直接注入。</span></div><input v-model="form.experimentalContextGateEnabled" type="checkbox" role="switch"><i></i></label>
       <footer><button class="save-button" type="button" :disabled="loading" @click="feedback('人格与指令已保存')">{{ loading ? '正在保存…' : '保存人格与指令' }}</button></footer>
@@ -171,14 +172,14 @@ function cancelTask(item: DemoWakeTask) {
           <div class="speaker-card-copy"><h3 id="speaker-enrollment-title">主人声纹模板</h3><p>按日常语速录制三段，每段 5–10 秒，保持设备与距离一致。</p></div>
           <div class="speaker-card-actions"><button class="outline-button speaker-compact-button speaker-recording-toggle" type="button" :disabled="loading" :aria-expanded="recordingPreview" @click="toggleSpeakerRecording">{{ recordingPreview ? '收起录制' : '开始录制' }}</button><button class="outline-button speaker-compact-button" type="button" :disabled="recordingPreview || !templates.length || loading" @click="feedback('现场测试：已确认主人，相似度 0.82')">现场测试</button></div>
         </div>
-        <div v-if="recordingPreview" class="speaker-recording-flow">
+        <SpeakerRecordingFlow v-if="recordingPreview" :completed="speakerSegments.length" :total="3">
           <div class="speaker-segment-list"><div v-for="(prompt, index) in demoSpeakerPrompts" :key="prompt" class="speaker-segment-row" :class="{ completed: speakerSegments.includes(index), recording: speakerRecording === index }" :data-segment="index">
             <span class="speaker-segment-index" aria-hidden="true">0{{ index + 1 }}</span>
             <div class="speaker-segment-copy"><div class="speaker-segment-heading"><strong>第 {{ index + 1 }} 段</strong><span class="speaker-segment-state" role="status">{{ speakerRecording === index ? '录制中' : speakerSegments.includes(index) ? '已完成' : '待录制' }}</span></div><p class="speaker-prompt">{{ prompt }}</p></div>
             <button class="outline-button speaker-compact-button speaker-segment-action" :class="{ 'speaker-stop-button': speakerRecording === index }" type="button" :disabled="loading || (speakerRecording !== null && speakerRecording !== index)" @click="recordSpeakerSegment(index)">{{ speakerRecording === index ? '停止录制' : speakerSegments.includes(index) ? '重新录制' : '开始录制' }}</button>
           </div></div>
-          <footer class="speaker-flow-footer"><div class="speaker-flow-progress"><span role="status">已完成 {{ speakerSegments.length }} / 3 段</span><div class="speaker-progress-marks" aria-hidden="true"><i v-for="index in 3" :key="index" :class="{ completed: index <= speakerSegments.length }"></i></div></div><div class="speaker-flow-actions"><button class="outline-button speaker-compact-button" type="button" @click="cancelSpeakerRecording">取消录制</button><button class="save-button speaker-compact-button speaker-submit-button" type="button" :disabled="!speakerCanSubmit" @click="saveSpeakerRecording">保存声纹</button></div></footer>
-        </div>
+          <template #actions><button class="outline-button speaker-compact-button" type="button" @click="cancelSpeakerRecording">取消录制</button><button class="save-button speaker-compact-button speaker-submit-button" type="button" :disabled="!speakerCanSubmit" @click="saveSpeakerRecording">保存声纹</button></template>
+        </SpeakerRecordingFlow>
         <div v-else-if="templates.length" class="speaker-template-list"><article v-for="item in templates" :key="item.id" class="speaker-template-row">
           <div class="speaker-template-copy"><strong :title="props.scene === 'long' ? longIdentifier : item.label">{{ props.scene === 'long' ? longIdentifier : item.label }}</strong><time>{{ item.date }}</time></div><span class="speaker-template-state active">{{ item.status }}</span><div class="speaker-template-actions"><button class="outline-button speaker-compact-button" type="button" @click="feedback('声纹模板中心设置')">移出主中心</button><button class="outline-button danger-action speaker-compact-button" type="button" @click="feedback('声纹模板删除提示')">删除</button></div>
         </article></div><div v-else class="pool-empty">还没有声纹模板。</div>
@@ -223,9 +224,23 @@ function cancelTask(item: DemoWakeTask) {
     <template v-else-if="tab === 'models'">
       <SettingsPageHeader section="models"><template #actions><button class="outline-button" type="button" :disabled="loading" @click="feedback('模型扫描提示')">{{ loading ? '正在扫描…' : '扫描现有配置' }}</button></template></SettingsPageHeader>
       <div class="model-accordion-list">
-        <details class="model-accordion-card" open><summary class="preview-accordion-summary"><span class="accordion-index">01</span><strong>添加模型</strong><span>服务商连接</span></summary><div class="model-card-content"><div class="provider-fields"><label><span>连接名称</span><input v-model="form.providerName" type="text"></label><label><span>服务地址</span><input v-model="form.providerUrl" type="url"></label><label><span>协议</span><select v-model="form.providerProtocol"><option>DeepSeek</option><option>OpenAI 兼容（通用模型接口）</option><option>Responses（响应接口）</option></select></label><label><span>API Key（接口密钥）</span><input v-model="form.providerKey" type="password" autocomplete="off" placeholder="展示字段，请勿填写真实密钥"></label></div><div class="provider-actions"><button class="outline-button" type="button" @click="feedback('连接验证成功提示')">发现并验证连接</button><button class="save-button" type="button" @click="feedback('加入模型池提示')">加入模型池</button></div></div></details>
-        <details class="model-accordion-card" open><summary class="preview-accordion-summary"><span class="accordion-index">02</span><strong>模型配置</strong><span>运行角色</span></summary><div class="model-card-content"><div class="preview-assignment-grid"><label class="form-field"><span>语音交互主模型</span><select v-model="form.voiceModel"><option v-for="item in demoModelEntries.filter(item => item.capability === 'llm')" :key="item.id" :value="item.id">{{ item.name }}</option></select></label><label class="form-field"><span>Shadow（影子代理）模型</span><select v-model="form.shadowModel"><option v-for="item in demoModelEntries.filter(item => item.capability === 'llm')" :key="item.id" :value="item.id">{{ item.name }}</option></select></label><label class="form-field"><span>状态汇报模型</span><select v-model="form.statusModel"><option v-for="item in demoModelEntries.filter(item => item.capability === 'llm')" :key="item.id" :value="item.id">{{ item.name }}</option></select></label></div><div class="info-callout"><span>i</span><p>TTS（语音合成）使用固定在线服务；影子代理采用高强度思考。</p></div></div></details>
-        <details class="model-accordion-card" open><summary class="preview-accordion-summary"><span class="accordion-index">03</span><strong>模型池</strong><span>{{ models.length }} 个条目</span></summary><div class="model-card-content"><div v-if="models.length" class="pool-entry-list"><article v-for="item in models" :key="item.id" class="pool-entry-card"><div class="pool-entry-topline"><span class="provider-badge managed">{{ item.capability === 'llm' ? '语言' : item.capability === 'tts' ? '语音' : '本地' }}</span><div class="pool-entry-heading"><div class="pool-entry-title"><strong>{{ props.scene === 'long' ? longIdentifier : item.name }}</strong><span class="entry-status">{{ item.status === 'healthy' ? '已就绪' : '可用' }}</span></div><span class="pool-entry-id">{{ item.modelId }}（模型标识） · {{ originLabels[item.origin] }}</span></div></div><div class="pool-entry-policy"><span><small>服务商</small><strong>{{ item.provider }}</strong></span><span><small>用途</small><strong>{{ item.capability === 'llm' ? 'LLM（大语言模型）' : item.capability === 'tts' ? 'TTS（语音合成）' : '本地语音处理' }}</strong></span><span><small>上下文容量</small><strong>{{ item.maxContextTokens ? `${item.maxContextTokens / 1024}K` : '不适用' }}</strong></span></div><div class="pool-entry-actions"><button type="button" @click="editingModel = editingModel === item.id ? '' : item.id">{{ editingModel === item.id ? '收起' : '编辑' }}</button><button class="danger-action" type="button" @click="feedback('模型删除提示')">删除</button></div><div v-if="editingModel === item.id" class="model-edit-panel"><label class="form-field"><span>显示名称</span><input :value="item.name" type="text"></label><label class="form-field"><span>模型标识</span><input :value="item.modelId" type="text"></label><button class="save-button" type="button" @click="feedback('模型条目已保存')">保存修改</button></div></article></div><div v-else class="pool-empty">模型池中暂无条目。</div></div></details>
+        <ModelAccordion index="01" title="添加模型" hint="服务商连接"><div class="provider-fields"><label><span>连接名称</span><input v-model="form.providerName" type="text"></label><label><span>服务地址</span><input v-model="form.providerUrl" type="url"></label><label><span>协议</span><select v-model="form.providerProtocol"><option>DeepSeek</option><option>OpenAI 兼容（通用模型接口）</option><option>Responses（响应接口）</option></select></label><label><span>API Key（接口密钥）</span><input v-model="form.providerKey" type="password" autocomplete="off" placeholder="展示字段，请勿填写真实密钥"></label></div><div class="provider-actions"><button class="outline-button" type="button" @click="feedback('连接验证成功提示')">发现并验证连接</button><button class="save-button" type="button" @click="feedback('加入模型池提示')">加入模型池</button></div></ModelAccordion>
+        <ModelAccordion index="02" title="模型配置" hint="运行角色">
+          <div class="preview-assignment-grid">
+            <ModelAssignmentField v-model="form.voiceModel" label="语音交互主模型" :options="demoModelOptions" />
+            <ModelAssignmentField v-model="form.shadowModel" label="Shadow（影子代理）模型" :options="demoModelOptions" />
+            <ModelAssignmentField v-model="form.statusModel" label="状态汇报模型" :options="demoModelOptions" />
+          </div>
+          <div class="info-callout"><span>i</span><p>TTS（语音合成）使用固定在线服务；影子代理采用高强度思考。</p></div>
+        </ModelAccordion>
+        <ModelAccordion index="03" title="模型池" :hint="models.length + ' 个条目'">
+          <div v-if="models.length" class="pool-entry-list">
+            <ModelPoolEntry v-for="item in models" :key="item.id" :name="props.scene === 'long' ? longIdentifier : item.name" :identifier="item.modelId + '（模型标识） · ' + originLabels[item.origin]" :badge="item.capability === 'llm' ? '语言' : item.capability === 'tts' ? '语音' : '本地'" :status="item.status === 'healthy' ? '已就绪' : '可用'" :facts="[{ label: '服务商', value: item.provider }, { label: '用途', value: item.capability === 'llm' ? 'LLM（大语言模型）' : item.capability === 'tts' ? 'TTS（语音合成）' : '本地语音处理' }, { label: '上下文容量', value: item.maxContextTokens ? item.maxContextTokens / 1024 + 'K' : '不适用' }]">
+              <template #actions><button type="button" @click="editingModel = editingModel === item.id ? '' : item.id">{{ editingModel === item.id ? '收起' : '编辑' }}</button><button class="danger-action" type="button" @click="feedback('模型删除提示')">删除</button></template>
+              <div v-if="editingModel === item.id" class="model-edit-panel"><label class="form-field"><span>显示名称</span><input :value="item.name" type="text"></label><label class="form-field"><span>模型标识</span><input :value="item.modelId" type="text"></label><button class="save-button" type="button" @click="feedback('模型条目已保存')">保存修改</button></div>
+            </ModelPoolEntry>
+          </div><div v-else class="pool-empty">模型池中暂无条目。</div>
+        </ModelAccordion>
       </div><footer class="model-settings-footer"><div class="restart-copy">应用配置会受控重建相关模型服务。</div><button class="save-button" type="button" :disabled="loading" @click="emit('confirm', 'apply')">应用模型配置</button></footer>
     </template>
 

@@ -23,6 +23,7 @@ SERVICE_READY_STATES = {"READY", "RUNNING", "STREAMING", "CONNECTED"}
 class RuntimeState:
     state: TerminalState = TerminalState.STARTING
     listening: bool = False
+    audio_generation: int = 0  # audio_generation（音频轮代）：状态变化后拒绝旧音量帧。
     wake_always_on: bool = False
     input_owner: str = "none"
     agent: dict[str, Any] = field(default_factory=dict)
@@ -120,6 +121,8 @@ class RuntimeState:
         self.services[name] = status
 
     def set_state(self, state: TerminalState, *, listening: bool | None = None) -> None:
+        if state != self.state or (listening is not None and listening != self.listening):
+            self.audio_generation += 1
         self.state = state
         if listening is not None:
             self.listening = listening
@@ -151,6 +154,7 @@ class RuntimeState:
             "agent": dict(self.agent),
             "state": self.state.value,
             "listening": self.listening,
+            "audio_generation": self.audio_generation,
             "can_start": self.can_start,
             "wake_always_on": self.wake_always_on,
             "input_owner": self.input_owner,

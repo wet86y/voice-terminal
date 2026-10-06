@@ -32,6 +32,7 @@ export interface LocalComponentRow {
     value: string
     current: string
     pending?: boolean
+    draft?: boolean // draft（未保存设备草稿），不代表待启动生效配置。
     /** options（设备选项）：value（标识）、label（文案）、disabled（不可选）。 */
     options: Array<{ value: string; label: string; disabled?: boolean }>
     /** hint（设备限制说明）。 */

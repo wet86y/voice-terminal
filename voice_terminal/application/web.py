@@ -9,6 +9,7 @@ import secrets
 import socket
 import threading
 import time
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, unquote, urlsplit
 
 
@@ -306,6 +307,17 @@ class HostWeb:
                 elif path == "/api/v1/application/exit":
                     owner.application.request_exit()
                     self.data({"ok": True}, 202)
+                elif path == "/api/v1/application/wake-tasks":
+                    try:
+                        self.data(owner.application.create_wake_task(payload), 201)
+                    except HTTPError as exc:
+                        try:
+                            detail = json.loads(exc.read(16384)).get("detail", "任务创建失败。")
+                        except (ValueError, AttributeError):
+                            detail = "任务创建失败。"
+                        self.data({"detail": detail}, exc.code if exc.code in {400, 404, 409, 422, 503} else 503)
+                    except Exception:
+                        self.data({"detail": "任务创建未确认，请刷新列表后检查；DSH（代理执行宿主）可能暂不可用。"}, 503)
                 elif path.startswith("/api/v1/application/components/") and path.endswith("/retry"):
                     key = path.split("/")[-2]
                     if owner.application.request_retry(key):

@@ -18,6 +18,8 @@ const LEGACY_PATH = process.env.VOICE_DSH_LEGACY_WAKE_PATH ?? ''
 const RETRY_MS = 30_000
 
 type Row = {
+  /** creation_source（创建来源）：历史任务未提供时保持 unknown（未知）。 */
+  creation_source?: 'manual' | 'agent' | 'unknown';
   task_id: string; target: string; text: string; reference: string;
   record: any; status: 'pending' | 'archived' | 'cancelled';
   created_at: string; updated_at: string; last_triggered_at: string | null;
@@ -157,6 +159,7 @@ export class TaskService {
       text: row.text, status: row.status, created_at: row.created_at,
       updated_at: row.updated_at, last_triggered_at: row.last_triggered_at,
       occurrence: row.occurrence, has_reference: !!row.reference,
+      creation_source: row.creation_source ?? 'unknown',
       delivery_history: row.history,
     }
   }
@@ -184,6 +187,7 @@ export class TaskService {
       const finalRecord = initialAt ? decodeScheduleRecord({ ...record, scheduledAt: initialAt }) : record
       const stamp = new Date(now).toISOString()
       const row: Row = { task_id: id, target, text,
+        creation_source: args.creation_source === 'manual' ? 'manual' : 'agent',
         reference, record: finalRecord, status: 'pending', created_at: stamp, updated_at: stamp,
         last_triggered_at: null, occurrence: 1, history: [] }
       this.rows.set(id, row)

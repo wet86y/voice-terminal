@@ -6,18 +6,13 @@ import { useApplicationHost, type ApplicationComponent } from '../application-ho
 import { useProductContext } from '../product-context'
 import type { ComputeDeviceMode, ProductLocalModelId } from '../types'
 
-const { settings, saving, computeStatus, refreshComputeStatus, saveComputeSettings, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
+const { settings, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
 const application = useApplicationHost()
 const refreshing = ref(false)
 const retrying = ref(new Set<string>())
 /** owners（模型所属进程）：对应现有宿主组件，重试继续使用原有接口。 */
 const owners: Record<ProductLocalModelId, string> = {
   paraformer: 'asr', sensevoice: 'analysis', voice_vad: 'voice', kws: 'voice', smart_turn: 'analysis', wespeaker: 'speaker',
-}
-/** runtimes（推理引擎）：来自当前各模型的实现；不虚构版本或显存指标。 */
-const runtimes: Record<ProductLocalModelId, string> = {
-  paraformer: 'PyTorch（推理框架）', sensevoice: 'PyTorch（推理框架）', voice_vad: 'PyTorch（推理框架）',
-  kws: 'Sherpa-ONNX（唤醒引擎）', smart_turn: 'ONNX（推理引擎）', wespeaker: 'ONNX（推理引擎）',
 }
 function componentFor(id: string) { return application.snapshot.value?.components?.find(row => row.id === id) }
 function facts(component?: ApplicationComponent) {
@@ -30,6 +25,7 @@ const rows = computed<LocalComponentRow[]>(() => {
   const models = computeModelRows.map<LocalComponentRow>(item => {
     const status = computeStatus.value?.models?.[item.id]
     const owner = componentFor(owners[item.id])
+    const resource = status?.resource_status
     const busy = Boolean(owner?.retrying || retrying.value.has(owners[item.id]))
     const loading = busy || (!status && ['waiting', 'starting'].includes(owner?.state ?? 'starting')) || status?.service === 'STARTING'
     const available = !busy && !['failed', 'blocked', 'stopped', 'disabled'].includes(owner?.state ?? '') && ['READY', 'DEGRADED'].includes(status?.service ?? '')
@@ -40,15 +36,19 @@ const rows = computed<LocalComponentRow[]>(() => {
       state: available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
       status: busy ? '正在恢复' : disabled ? '已停用' : loading ? '启动中' : serviceLabel(status?.service),
       available, retryable: !available && !loading && Boolean(owner?.retry_allowed), busy,
-      runtime: runtimes[item.id],
-      residentMemory: formatComponentMemory(status?.process_memory_rss_bytes), privateMemory: formatComponentMemory(owner?.memory_private_commit_bytes),
+      runtime: status?.runtime || '未提供',
+      residentMemory: formatComponentMemory(resource?.rss_bytes), privateMemory: formatComponentMemory(resource?.private_commit_bytes),
       vram: status?.device?.startsWith('cuda') ? '未提供' : undefined,
       description: item.detail, error: !available && !loading ? status?.load_error || owner?.error : undefined,
       note: '内存为所在进程占用，共享进程不重复计入总量。' + (status?.device?.startsWith('cuda') ? '当前未提供单个模型的显存指标。' : ''),
-      facts: facts(owner),
+      facts: [
+        { label: '进程标识', value: resource?.pid == null ? '未提供' : String(resource.pid) },
+        { label: '处理器占用', value: resource?.pid === owner?.pid && owner?.cpu_percent != null ? owner.cpu_percent.toFixed(1) + '%' : '未提供' },
+      ],
       device: {
         value: settings.compute.devices[item.id], current: deviceLabel(status?.device),
-        pending: Boolean(status && settings.compute.devices[item.id] !== status.requested_device),
+        draft: settings.compute.devices[item.id] !== computeSavedDevices.value[item.id],
+        pending: Boolean(status && computeSavedDevices.value[item.id] !== status.requested_device),
         options: [
           { value: 'auto', label: '自动选择' }, { value: 'cpu', label: 'CPU（中央处理器）' },
           { value: 'cuda', label: 'GPU（图形处理器）', disabled: !gpuAvailable },
@@ -80,17 +80,15 @@ const model = computed<LocalComponentsModel>(() => {
   const hardware = computeStatus.value?.hardware
   const failed = rows.value.some(row => row.state === 'failed')
   const loading = rows.value.some(row => row.state === 'loading')
-  // usedVram（整卡已用显存）：只从有效总量与剩余量计算，不将未知数值当作零。
+  // 显卡容量来自设备；当前没有可靠的本应用显存占用指标。
   const gpu = hardware?.gpu
-  const usedVram = gpu?.available && typeof gpu.total_bytes === 'number' && typeof gpu.free_bytes === 'number'
-    ? Math.max(0, gpu.total_bytes - gpu.free_bytes) : undefined
   return {
     status: failed ? '部分组件不可用' : loading ? '组件启动中' : '运行正常', state: failed ? 'failed' : loading ? 'loading' : 'ready',
     sampledAt: snapshot?.sampled_at == null ? '—' : new Date(snapshot.sampled_at * 1000).toLocaleString('zh-CN', { hour12: false }),
     resources: [
-      { id: 'resident', label: '常驻内存', used: formatComponentMemory(snapshot?.total_memory_rss_bytes ?? computeStatus.value?.resource_status?.rss_bytes), total: formatComponentMemory(hardware?.system_memory.total_bytes) },
-      { id: 'commit', label: '提交内存', used: formatComponentMemory(snapshot?.total_memory_private_commit_bytes ?? computeStatus.value?.resource_status?.private_commit_bytes), total: formatComponentMemory(hardware?.system_memory.commit_limit_bytes) },
-      { id: 'vram', label: '显存', used: formatComponentMemory(usedVram), total: formatComponentMemory(gpu?.total_bytes) },
+      { id: 'resident', label: '常驻内存', used: formatComponentMemory(snapshot?.total_memory_rss_bytes), total: formatComponentMemory(hardware?.system_memory.total_bytes) },
+      { id: 'commit', label: '提交内存', used: formatComponentMemory(snapshot?.total_memory_private_commit_bytes), total: formatComponentMemory(hardware?.system_memory.commit_limit_bytes) },
+      { id: 'vram', label: '显存', used: '未提供', total: formatComponentMemory(gpu?.total_bytes) },
     ], rows: rows.value, error: application.error.value, refreshing: refreshing.value,
   }
 })

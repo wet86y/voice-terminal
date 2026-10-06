@@ -73,7 +73,7 @@ function invalidDevice(row: LocalComponentRow) {
           <div v-if="row.device" class="local-device-editor">
             <label :for="`local-device-${row.id}`"><span>运行位置</span><select :id="`local-device-${row.id}`" :value="row.device.value" :disabled="saving" @change="changeDevice(row.id, $event)"><option v-for="option in row.device.options" :key="option.value" :value="option.value" :disabled="option.disabled">{{ option.label }}</option></select></label>
             <button class="save-button" type="button" :disabled="saving || invalidDevice(row)" @click="emit('save', row.id)">{{ saving ? '保存中' : '保存' }}</button>
-            <small>当前：{{ row.device.current }}<span v-if="row.device.pending"> · 下次启动生效</span></small>
+            <small>实际运行：{{ row.device.current }}<span v-if="row.device.draft"> · 草稿尚未保存</span><span v-if="row.device.pending"> · 已保存配置下次启动生效</span></small>
           </div>
           <div v-else class="local-location"><span>运行位置</span><strong>{{ row.location || '本机' }}</strong></div>
           <small v-if="row.device?.hint || row.note" class="local-detail-note">{{ [row.device?.hint, row.note].filter(Boolean).join(' ') }}</small>

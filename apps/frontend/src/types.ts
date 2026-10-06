@@ -201,6 +201,7 @@ export interface ConversationSnapshotPayload {
 }
 
 export interface RuntimeSnapshotPayload {
+  audio_generation?: number // audio_generation（音频轮代），用于丢弃状态切换前的音量。
   /** quiet_hours（被动静默状态）：passive_quiet（抑制主动语音）、user_interaction（用户交互窗口）、within_quiet_hours（处于配置时段），不含待传达内容。 */
   quiet_hours?: { passive_quiet: boolean; user_interaction: boolean; within_quiet_hours: boolean }
   agent?: AgentEpisodeSnapshot
@@ -222,6 +223,7 @@ export interface RuntimeSnapshotPayload {
 }
 
 export interface SessionStatePayload {
+  audio_generation?: number // audio_generation（音频轮代）。
   state: TerminalState
   listening: boolean
   can_start: boolean
@@ -352,6 +354,7 @@ export interface ServerErrorPayload {
 }
 
 export type ServerMessageType =
+  | 'audio.levels' // audio.levels（来自麦克风或实际播放的音量事件）。
   | 'runtime.snapshot' | 'session.state' | 'metrics.snapshot'
   | 'input.started' | 'input.updated' | 'input.finalized' | 'input.completed'
   | 'agent.state' | 'agent.trace' | 'agent.reasoning' | 'context.snapshot' | 'tool.state' | 'speak.preview'

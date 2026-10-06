@@ -66,6 +66,7 @@ class SenseVoice:
                     max_single_segment_time=30000,
                 )
                 self.model, self.vad = model, vad
+                self.runtime = "PyTorch（推理框架）"  # runtime（实际加载引擎）。
                 self.device = loaded_funasr_device(model, candidate)
                 self.internal_vad_device = loaded_funasr_device(vad, candidate)
                 self.load_error = (

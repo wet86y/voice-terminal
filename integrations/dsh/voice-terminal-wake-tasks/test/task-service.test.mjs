@@ -47,16 +47,20 @@ test('preserves project history, keeps native tasks separate, and delivers to th
     assert.equal(service.list().find(row => row.task_id === 'schedule-old').status, 'archived')
     assert.equal(service.list().some(row => row.task_id === 'native-task'), false)
     assert.equal(service.reference('schedule-old').reference, '已有上下文')
+    assert.equal(service.list().find(row => row.task_id === 'schedule-old').creation_source, 'unknown')
     const created = await service.create({ when: '1s', text: '请检查现在的状态' }, '创建时背景')
     assert.equal(created.has_reference, true)
+    assert.equal(created.creation_source, 'agent')
     assert.equal(service.reference(created.task_id).reference, '创建时背景')
-    const daily = await service.create({ title: '每日检查', prompt: '检查日报',
+    const daily = await service.create({ title: '每日检查', prompt: '检查日报', creation_source: 'manual',
       daily: { time: '23:59:59', time_zone: 'Asia/Hong_Kong' } })
     const weekly = await service.create({ title: '每周检查', prompt: '检查周报',
       weekly: { time: '23:59:59', time_zone: 'Asia/Hong_Kong', weekdays: [1, 3] } })
     const cron = await service.create({ title: '工作日检查', prompt: '检查任务',
       cron: { expression: '0 9 * * 1-5', time_zone: 'Asia/Hong_Kong' } })
     assert.deepEqual([daily.rule_kind, weekly.rule_kind, cron.rule_kind], ['daily', 'weekly', 'cron'])
+    assert.equal(daily.creation_source, 'manual')
+    assert.equal(daily.has_reference, false)
     await new Promise(resolve => setTimeout(resolve, 1300))
     assert.equal(calls.length, 1)
     assert.equal(calls[0].body.task_id, created.task_id)
@@ -64,6 +68,7 @@ test('preserves project history, keeps native tasks separate, and delivers to th
     await service.close()
     service = new TaskService()
     assert.equal(service.list().length, 5)
+    assert.equal(service.list().find(row => row.task_id === daily.task_id).creation_source, 'manual')
     assert.equal(service.list().some(row => row.task_id === 'native-task'), false)
     assert.equal(service.list().find(row => row.task_id === 'schedule-old').delivery_history[0].messageId, 'old-message')
     assert.equal(readFileSync(native, 'utf8'), nativeContent, '官方会话任务文件保持独立且未改动')

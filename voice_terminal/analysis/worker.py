@@ -33,6 +33,7 @@ class AnalysisLane:
             "status": "DISABLED" if self.error == "disabled" else "READY" if self.model else "DEGRADED",
             "model": self.model_name,
             "model_loaded": self.model is not None,
+            "runtime": getattr(model, "runtime", None),  # runtime（实际加载引擎）。
             "requested_device": getattr(model, "requested_device", None),
             "device": getattr(model, "device", None),
             "internal_vad_device": getattr(model, "internal_vad_device", None),

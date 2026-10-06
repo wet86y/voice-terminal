@@ -23,7 +23,7 @@ class ProtocolSequencer:
         "speech.replaced": "speech.progress", "speech.replace_failed": "speech.progress",
         "latency.snapshot": "metrics.snapshot", "turn.latency": "metrics.snapshot",
     }
-    _PUBLIC = {"runtime.snapshot", "session.state", "metrics.snapshot", "input.started", "input.updated",
+    _PUBLIC = {"audio.levels", "runtime.snapshot", "session.state", "metrics.snapshot", "input.started", "input.updated",
                "input.finalized", "input.completed", "agent.state", "agent.trace", "context.snapshot",
                "tool.state", "agent.reasoning", "speak.preview", "speech.queued", "speech.started", "speech.delta", "speech.progress", "speech.completed", "speaker.state", "speaker.decision", "speaker.blocked", "shadow.product", "shadow.activity", "shadow.debug.wake", "shadow.debug.event", "conversation.append", "conversation.snapshot", "error"}
 
