@@ -1011,6 +1011,7 @@ class DshShadowAgentSession:
             retire = self._opened and not self._retired
             envelope = self._envelope()
             self.activation_id = None
+            self._notify_runtime_state()
         # whenIdle（远端结算）可能等待回传；释放事件锁，使旧回传能及时得到 stale（已过期）。
         if retire:
             try:
@@ -1075,6 +1076,7 @@ class DshShadowAgentSession:
             envelope = self._envelope()
             self._retired = True
             self.activation_id = None
+            self._notify_runtime_state()
         if retire:
             try:
                 await self.client.call("session.retire", envelope)
@@ -1113,6 +1115,7 @@ class DshShadowAgentSession:
                 ) else "stale"
             if not await self._callback_matches_or_reconcile(payload):
                 return "stale"
+            self._notify_runtime_state()
             previous_request = self._accepted_requests.get(request_id)
             if previous_request is not None:
                 return "duplicate" if previous_request == request_digest else "conflict"
@@ -1374,7 +1377,7 @@ class DshShadowAgentSession:
         This mirrors the native Shadow observer: ``status`` is not appended as
         durable semantic history, but ``SessionLedger`` stores it as
         ``ShadowVisibleStatus`` and schedules one ordinary Voice evaluation.
-        ``progress`` remains passive/product-only.
+        progress（影子进度）另由二等信箱按 4 秒检查点评估，不走普通信息唤醒。
         """
 
         if self.production_sink is None:
@@ -1568,7 +1571,15 @@ class DshShadowAgentSession:
             retired_at=now if retired else None,
         ))
 
+    def _notify_runtime_state(self) -> None:
+        """同步 activation_id（有效激活标识），即使没有界面活动订阅也清理旧进度。"""
+        setter = getattr(self.context_source, "set_shadow_runtime_state", None)
+        if callable(setter):
+            setter(available=self.available, active=self.activation_id is not None,
+                   activation_id=self.activation_id or "")
+
     async def _activity(self, state: str, **extra: Any) -> None:
+        self._notify_runtime_state()
         if self.activity_sink is not None:
             if state == "running":
                 stream, phase, item_id = "lifecycle", "started", f"run-{self._run_seq}"

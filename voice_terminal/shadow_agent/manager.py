@@ -180,9 +180,9 @@ class ShadowRuntime(ShadowToolLoopMixin):
             return "already_current"
         self.active = True
         self.user_input_required = False
-        self._notify_runtime_state(active=True)
         self._activation_serial += 1
         serial = self._activation_serial
+        self._notify_runtime_state(active=True)
         self._activity(
             "lifecycle", "started", item_id=f"run-{serial}",
             text="Shadow Agent 开始运行", run_seq=serial,
@@ -195,7 +195,8 @@ class ShadowRuntime(ShadowToolLoopMixin):
         setter = getattr(self.context_source, "set_shadow_runtime_state", None)
         if callable(setter):
             try:
-                setter(available=not self._closed, active=active)
+                setter(available=not self._closed, active=active,
+                       activation_id=str(self._activation_serial) if active else "")
             except Exception:
                 pass
 

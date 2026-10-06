@@ -12,6 +12,7 @@ class AgentDecisionScheduler:
     state and never creates an asyncio task of its own.
     """
 
+    SECONDARY_INTERVAL_MS = 4000  # 二等信箱检查间隔，复用单一心跳。
     FINAL_WINDOW = 75
     TTS_EVENTS = frozenset({
         "TTS_STARTED", "TTS_COMPLETED", "TTS_CANCELLED", "TTS_REPLACED",
@@ -32,6 +33,9 @@ class AgentDecisionScheduler:
             math.ceil(float(getattr(options, "final_silence_ms", 30000))
                       / max(1, int(options.scheduler_tick_ms))),
         )
+        self.secondary_interval_windows = max(1, math.ceil(
+            self.SECONDARY_INTERVAL_MS / 1000.0 / self.interval
+        ))  # 每次二等检查跨过的本地心跳窗口数。
         self.last_tick = 0.0
         self.next_heartbeat = None
         self.anchor_monotonic = None
@@ -206,6 +210,24 @@ class AgentDecisionScheduler:
                 self.final_pending_since = now
             self.final_pending = True
         return self.forced_due(now=now)
+
+    def secondary_due(self, previous_window: int) -> bool:
+        """活跃静默窗口跨过一个 4 秒检查点；暂停后只评估当前状态，不补发。"""
+        return bool(
+            self.armed and not self.final_pending
+            and self.window_index < self.FINAL_WINDOW
+            and self.window_index // self.secondary_interval_windows
+            > previous_window // self.secondary_interval_windows
+        )
+
+    def secondary_candidate(self, *, now=None):
+        """构建 secondary_mailbox（二等信箱评估）候选；最终静默优先。"""
+        if not self.armed or self.final_pending or self.window_index >= self.FINAL_WINDOW:
+            return None
+        return self._descriptor(
+            "secondary_mailbox", self.window_index,
+            time.monotonic() if now is None else float(now),
+        )
 
     def pending_checkpoint_windows(self):
         windows = []

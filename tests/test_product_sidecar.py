@@ -393,8 +393,14 @@ class ProductSidecarTests(unittest.TestCase):
         for seconds, final_window in expected.items():
             scheduler = AgentDecisionScheduler(AgentOptions(final_silence_ms=seconds * 1000))
             self.assertEqual(scheduler.FINAL_WINDOW, final_window)
-            self.assertFalse(hasattr(scheduler, "secondary_interval_windows"))
+            self.assertEqual(scheduler.secondary_interval_windows, 10)
+            scheduler.arm(0.0, turn_id="turn-a")
+            scheduler.advance(4.0)
+            self.assertTrue(scheduler.secondary_due(0))
             self.assertIsNone(scheduler.forced_due(now=4.0))
+            scheduler.advance(final_window * scheduler.interval)
+            self.assertEqual(scheduler.forced_due(now=final_window * scheduler.interval)["prompt_kind"], "final_silence")
+            self.assertIsNone(scheduler.secondary_candidate(now=final_window * scheduler.interval))
         self.assertEqual(AgentDecisionScheduler(AgentOptions()).FINAL_WINDOW, 75)
 
 

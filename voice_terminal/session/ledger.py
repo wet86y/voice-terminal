@@ -73,6 +73,15 @@ class SessionLedger:
         # activation_id（激活标识）和 context_revision（上下文修订号）只在进程内暂存。
         self.latest_shadow_information: dict[str, Any] | None = None
         self._shadow_information_version = 0
+        # 二等信箱：按 source（来源）保存当前 activation_id（激活标识）的最新进度。
+        # version（版本）和 scope_generation（作用域代次）仅在内存中比较消费，不写语义历史。
+        self._shadow_progress: dict[str, dict[str, Any]] = {}
+        self._shadow_progress_seen: dict[str, str] = {}
+        self._shadow_progress_evaluated: dict[str, str] = {}  # 各来源已经冻结评估的最新正文，防止信息入口重复唤醒。
+        self._shadow_information_seen: dict[str, str] = {}
+        self._shadow_progress_version = 0
+        self._shadow_progress_generation = 0
+        self.shadow_activation_id: str | None = None  # 当前有效影子激活标识。
         self.shadow_user_input_required = False
         self.shadow_available = False
         self.shadow_active = False
@@ -121,6 +130,8 @@ class SessionLedger:
         self._shadow_frames.clear()
         self.latest_shadow_information = None
         self._shadow_information_version = 0
+        self.clear_shadow_progress(reset_seen=True)
+        self.shadow_activation_id = None
         self.shadow_user_input_required = False
         self.shadow_active = False
         self._shadow_current_turn_keys.clear()
@@ -188,16 +199,69 @@ class SessionLedger:
         })
         return True
 
-    def set_shadow_runtime_state(self, *, available: bool | None = None, active: bool | None = None) -> None:
+    def set_shadow_runtime_state(self, *, available: bool | None = None, active: bool | None = None,
+                                 activation_id: str | None = None) -> None:
+        """更新影子运行状态及 activation_id（有效激活标识），及时清理过期进度。"""
+        if activation_id is not None and activation_id != self.shadow_activation_id:
+            self.clear_shadow_progress(reset_seen=True)
+            self.shadow_activation_id = activation_id or None
         if available is not None:
             self.shadow_available = bool(available)
         if active is not None:
             self.shadow_active = bool(active)
             if active:
                 self.shadow_user_input_required = False
+        if not self.shadow_available or not self.shadow_active:
+            self.clear_shadow_progress(reset_seen=True)
+            self.shadow_activation_id = None
+
+    def clear_shadow_progress(self, *, reset_seen: bool = False) -> int:
+        """清空待评估进度；推进作用域代次使旧请求快照无法确认新状态。"""
+        count = len(self._shadow_progress)
+        self._shadow_progress.clear()
+        self._shadow_progress_evaluated.clear()
+        self._shadow_progress_generation += 1
+        if reset_seen:
+            self._shadow_progress_seen.clear()
+            self._shadow_information_seen.clear()
+        return count
+
+    def _valid_progress_scope(self, state: dict[str, Any]) -> bool:
+        return bool(
+            self.shadow_available and self.shadow_active and self.shadow_activation_id
+            and state.get("activation_id") == self.shadow_activation_id
+            and state.get("scope_generation") == self._shadow_progress_generation
+            and state.get("source") in {"agent", "observer"}
+        )
+
+    def shadow_progress_snapshot(self) -> dict[str, dict[str, Any]]:
+        """返回各有效来源尚未评估的最新进度，复制后供单次请求冻结。"""
+        return self.valid_shadow_progress(self._shadow_progress)
+
+    def valid_shadow_progress(self, captured: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """恢复或重试只能继续使用仍处于有效激活作用域的冻结进度。"""
+        return {source: dict(state) for source, state in captured.items()
+                if self._valid_progress_scope(state)}
+
+    def consume_shadow_progress(self, captured: dict[str, dict[str, Any]]) -> list[str]:
+        """仅确认捕获的同一 version（版本）；请求构建期间到达的新版本保留。"""
+        consumed = []
+        for source, state in captured.items():
+            if self._valid_progress_scope(state):
+                self._shadow_progress_evaluated[source] = self._progress_text_key(state["text"])
+            if self._shadow_progress.get(source) == state:
+                self._shadow_progress.pop(source)
+                consumed.append(source)
+        return consumed
+
+    @staticmethod
+    def _progress_text_key(text: str) -> str:
+        # 合并格式空白；不把事件标识或上下文修订号变化当成实质进度。
+        return " ".join(text.split())
 
     def shadow_runtime_tail(
         self, *, information: dict[str, Any] | None = None,
+        progress: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         if not self.shadow_available:
             return None
@@ -211,6 +275,13 @@ class SessionLedger:
                 "text": str(information.get("text") or "")[:2000],
                 "source": str(information.get("source") or "agent"),
             }
+        if progress:
+            valid = self.valid_shadow_progress(progress)
+            if valid:
+                value["progress"] = [  # progress（进度列表）：只包含本次请求捕获的有效来源。
+                    {"text": state["text"], "source": source}
+                    for source, state in sorted(valid.items())
+                ]
         return value
 
     def shadow_information_snapshot(self) -> dict[str, Any] | None:
@@ -510,6 +581,26 @@ class SessionLedger:
                 expired = self._committed_shadow_event_order.popleft()
                 self._committed_shadow_event_ids.discard(expired)
         if event.kind == "progress":
+            text = event.text.strip()
+            state = {
+                "text": text, "source": event.source,
+                "activation_id": event.activation_id,
+                "scope_generation": self._shadow_progress_generation,
+            }
+            if not text or len(text) > 512 or not self._valid_progress_scope(state):
+                return True
+            key = self._progress_text_key(text)
+            if self._shadow_progress_seen.get(event.source) == key:
+                return True
+            self._shadow_progress_seen[event.source] = key
+            # information（影子信息）已经通过普通入口提供的相同正文不能再触发二等评估。
+            if key in self._shadow_information_seen.values():
+                self._shadow_progress.pop(event.source, None)
+                return True
+            self._shadow_progress_version += 1
+            self._shadow_progress[event.source] = {
+                **state, "version": self._shadow_progress_version,
+            }
             return True
         if event.kind == "information":
             self._shadow_information_version += 1
@@ -520,13 +611,24 @@ class SessionLedger:
                 "activation_id": event.activation_id,
                 "context_revision": event.based_on_context_revision,
             }
+            if event.activation_id == self.shadow_activation_id and event.source in {"agent", "observer"}:
+                key = self._progress_text_key(event.text)
+                self._shadow_information_seen[event.source] = key
+                for source, state in tuple(self._shadow_progress.items()):
+                    if self._progress_text_key(state["text"]) == key:
+                        self._shadow_progress.pop(source)
+                if key in self._shadow_progress_evaluated.values():
+                    # 同一激活中已随进度冻结评估的正文，不再从普通信息入口重复触发。
+                    self.latest_shadow_information = None
             return True
         self.latest_shadow_information = None
         if event.kind == "input_required":
             self.shadow_user_input_required = True
         elif event.kind in {"result", "failed"}:
             self.shadow_user_input_required = False
-        if event.kind in {"input_required", "result", "no_action", "failed"}:
+        if event.kind in {"input_required", "result", "no_action", "failed"} and (
+            self.shadow_activation_id is None or event.activation_id == self.shadow_activation_id
+        ):
             self.set_shadow_runtime_state(active=False)
         if event.kind == "no_action":
             return True

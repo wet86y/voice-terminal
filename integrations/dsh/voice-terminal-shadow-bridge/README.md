@@ -1,5 +1,11 @@
 # Voice Terminal Shadow Bridge
 
+`progress`（影子进度）继续更新产品界面，实质变化按当前 `activation_id`（激活标识）和
+`source`（来源）合并进入语音端二等信箱。它不立即唤醒主模型，在活跃静默窗口内每 4 秒复用单一
+400 毫秒心跳检查非空信箱，也可随普通请求携带。`information`（影子信息）保持普通事件调度及单槽版本消费，
+同一正文应只选择一个入口。二等状态仅为临时请求上下文，不进入语义历史；终态和激活失效清理旧进度。
+详见 [Bridge 2.0（第二版桥接协议）](../../../docs/bridge-2.0-protocol.md)。
+
 Project-owned DSH bundle for the formal Voice Terminal Shadow root Agent. It is
 the only supported integration boundary between Voice Terminal and DSH.
 

@@ -47,6 +47,7 @@ class ShadowToolLoopMixin:
             kind=kind,  # type: ignore[arg-type]
             text=str(text).strip(),
             based_on_context_revision=self.applied_context_revision,
+            activation_id=str(self._activation_serial),  # 激活标识：隔离原生影子运行的旧进度。
             source=source,  # type: ignore[arg-type]
             options=options,
             failure_code=failure_code,

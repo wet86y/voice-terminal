@@ -231,6 +231,7 @@ def test_agent_veto_consumes_pending_user_input_before_dispatch():
         agent.scheduler = SimpleNamespace(
             window_index=0, final_pending=False, interval=0.4,
             heartbeat=lambda _at: None,
+            secondary_due=lambda _previous_window: False,
             normal_due=lambda _meaningful, *, at_heartbeat: at_heartbeat,
         )
         agent._immediate_system_check = None

@@ -394,7 +394,8 @@ def test_new_input_queues_behind_active_recovery_without_cancelling_llm():
     asyncio.run(scenario())
 
 
-def test_new_final_rearms_silence_without_cancelling_active_system_check():
+@pytest.mark.parametrize("dispatch_kind", ["secondary_mailbox", "final_silence"])
+def test_new_final_rearms_silence_without_cancelling_active_system_check(dispatch_kind):
     async def scenario():
         async def emit(*_args):
             return None
@@ -410,13 +411,13 @@ def test_new_final_rearms_silence_without_cancelling_active_system_check():
         runtime.episode_id = "episode"
         runtime.state = "WAITING_EVENT"
         runtime.scheduler.arm(0.0)
-        runtime.scheduler.advance(30.0)
-        assert runtime.scheduler.final_pending is True
+        runtime.scheduler.advance(30.0 if dispatch_kind == "final_silence" else 4.0)
+        assert runtime.scheduler.final_pending is (dispatch_kind == "final_silence")
 
         request = asyncio.create_task(asyncio.sleep(60))
         runtime.active_request = request
         runtime.runner = request
-        runtime.active_dispatch_context = {"dispatch_kind": "final_silence", "generation": 1}
+        runtime.active_dispatch_context = {"dispatch_kind": dispatch_kind, "generation": 1}
 
         await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-new", text="新的用户输入")
 
@@ -1060,6 +1061,28 @@ def test_thinking_and_business_actions_release_one_barrier_after_tools():
     asyncio.run(scenario())
 
 
+def test_secondary_mailbox_actions_and_thinking_follow_normal_dispatch_rules():
+    async def scenario():
+        runtime = _runtime(SimpleNamespace(thinking_action_enabled=True))
+        shadow_wakes = []
+        runtime.shadow_waker = lambda: shadow_wakes.append("wake") or "started"
+        envelope = DecisionEnvelope(
+            SpeechDecision("speak", "calm", "有必要的新进展。"),
+            (Action(THINKING_ACTION, {"request": True}), Action("request_shadow", {"request": True})),
+        )
+        await runtime._dispatch_actions_v06(
+            (runtime.episode_id, "request-a"), "turn-a", envelope,
+            system_check=True, system_check_id="system-check-a",
+            system_check_prompt_kind="secondary_mailbox",
+        )
+        await asyncio.gather(*tuple(runtime._background_tools))
+        assert shadow_wakes == ["wake"]
+        assert any(item["kind"] == "THINKING_REQUESTED" for item in runtime.trace)
+        assert not any(item["kind"] == "SYSTEM_CHECK_ACTION_REJECTED" for item in runtime.trace)
+
+    asyncio.run(scenario())
+
+
 def test_final_silence_actions_and_thinking_are_rejected_before_execution():
     async def scenario():
         runtime = _runtime(SimpleNamespace(thinking_action_enabled=True))
@@ -1089,15 +1112,16 @@ def test_final_silence_actions_and_thinking_are_rejected_before_execution():
     asyncio.run(scenario())
 
 
-def test_system_check_recovery_signal_keeps_immutable_owner_metadata():
+@pytest.mark.parametrize("dispatch_kind", ["secondary_mailbox", "final_silence"])
+def test_system_check_recovery_signal_keeps_immutable_owner_metadata(dispatch_kind):
     async def scenario():
         runtime = _runtime(SimpleNamespace(transport="responses", protocol_recovery_limit=1))
         runtime._system_check_turn_ids.add("system-check-a")
         runtime.active_dispatch_context = {
             "system_check_id": "system-check-a",
             "speech_turn_id": "turn-a",
-            "dispatch_kind": "final_silence",
-            "prompt_kind": "final_silence",
+            "dispatch_kind": dispatch_kind,
+            "prompt_kind": dispatch_kind,
             "owner_scope": "system_check",
             "generation": 1,
             "window_index": 3,
@@ -1131,10 +1155,11 @@ def test_system_check_recovery_signal_keeps_immutable_owner_metadata():
         entries = {entry["kind"]: entry["content"] for entry in packet["entries"]}
         feedback = json.loads(entries["immediate_recovery"].removeprefix("即时恢复反馈："))
 
-        assert prompt_kind == "final_silence"
-        assert "final_silence" in entries
-        assert feedback["origin_prompt_kind"] == "final_silence"
-        assert "不要把最后一条历史用户输入当成新的请求" in feedback["instruction"]
+        assert prompt_kind == dispatch_kind
+        assert dispatch_kind in entries
+        assert feedback["origin_prompt_kind"] == dispatch_kind
+        expected = "不要重新回答历史用户请求" if dispatch_kind == "secondary_mailbox" else "不要把最后一条历史用户输入当成新的请求"
+        assert expected in feedback["instruction"]
         assert "重新处理最后一条用户输入" not in feedback["instruction"]
 
     asyncio.run(scenario())
@@ -1155,6 +1180,7 @@ def test_thinking_action_is_explicitly_present_in_tool_availability():
 @pytest.mark.parametrize(
     ("prompt_kind", "expected"),
     [
+        ("secondary_mailbox", "不要重新回答历史用户请求"),
         ("final_silence", "不要把最后一条历史用户输入当成新的请求"),
         ("kws_wake", "不要处理历史用户任务"),
     ],
