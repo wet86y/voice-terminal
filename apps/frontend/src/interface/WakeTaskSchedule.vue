@@ -29,16 +29,16 @@ const weekdays = computed({ get: () => props.weekdays, set: value => emit('updat
 const single = computed(() => !['daily', 'weekly', 'cron'].includes(props.ruleKind))
 const date = computed({
   get: () => props.when.split('T')[0] || '',
-  set: value => emit('update:when', `${value}T${singleTime.value || '09:00'}`),
+  set: value => emit('update:when', `${value}T${props.when.split('T')[1] || '09:00'}`),
 })
 const singleTime = computed({
   get: () => props.when.split('T')[1]?.slice(0, 5) || '',
-  set: value => emit('update:when', `${date.value}T${value}`),
+  set: value => emit('update:when', `${date.value}T${value}${/^\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?$/.test(props.when.split('T')[1] || '') ? props.when.split('T')[1].slice(5) : ''}`),
 })
 const recurringTime = computed({
   get: () => props.time.slice(0, 5),
   // 秒数在已有任务中保持原值；时间面板仍以小时和分钟展示。
-  set: value => emit('update:time', `${value}${/^\d{2}:\d{2}:\d{2}$/.test(props.time) ? props.time.slice(5) : ''}`),
+  set: value => emit('update:time', `${value}${/^\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?$/.test(props.time) ? props.time.slice(5) : ''}`),
 })
 function changeRule(event: Event) {
   const rule = (event.target as HTMLSelectElement).value as typeof props.ruleKind

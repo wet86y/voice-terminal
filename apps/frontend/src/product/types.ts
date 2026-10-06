@@ -25,7 +25,7 @@ export interface ProductComputeSettings {
 }
 
 export interface ProductComputeModelStatus {
-  /** requested_device（请求设备）：设置中保存的设备偏好。 */
+  /** requested_device（本次加载请求设备）：与保存但待重启的偏好分别呈现。 */
   requested_device: ComputeDeviceMode
   /** device（实际设备）：当前模型报告的运行设备。 */
   device: string | null
@@ -35,6 +35,10 @@ export interface ProductComputeModelStatus {
   load_error?: string | null
   /** process_memory_rss_bytes（进程常驻内存）：所在工作进程当前占用的 RAM。 */
   process_memory_rss_bytes?: number | null
+  /** resource_status（实际进程快照）：两种内存和进程标识来自同一次采样。 */
+  resource_status?: ResourceProcessStatus | null
+  /** runtime（实际加载引擎）：加载失败或旧工作进程不提供时为空。 */
+  runtime?: string | null
   /** gpu_available（GPU 可用性）：当前模型的 GPU 推理后端是否已安装并可用。 */
   gpu_available: boolean
   /** gpu_unavailable_reason（GPU 不可用原因）：后端未安装或设备不兼容的解释。 */
@@ -250,6 +254,8 @@ export interface DshRuntimeStatus {
 
 /** One Voice Terminal project wake task（一个语音项目定时唤醒任务）. */
 export interface WakeTask {
+  /** creation_source（创建来源）：手动、代理或来源未知的历史任务。 */
+  creation_source?: 'manual' | 'agent' | 'unknown'
   /** task_id（任务标识）. */
   task_id: string
   /** target（唤醒目标）：voice_llm、shadow_agent 或 both. */

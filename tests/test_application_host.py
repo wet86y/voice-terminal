@@ -71,6 +71,27 @@ class ApplicationStateTests(unittest.TestCase):
 
 
 class WebTests(unittest.TestCase):
+    def test_manual_task_create_checks_cookie_host_and_origin(self):
+        route = self.web.origin + '/api/v1/application/wake-tasks'
+        payload = {'text': '手动说明', 'daily': {'time': '09:00', 'time_zone': 'Asia/Hong_Kong'}}
+        def request(headers=None):
+            return urllib.request.Request(route, json.dumps(payload).encode(),
+                {'Content-Type': 'application/json', 'Origin': self.web.origin, **(headers or {})})
+        with patch.object(self.app, 'create_wake_task', return_value={'task_id': 'manual-test'}) as create:
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.client.open(request())
+            self.assertEqual(error.exception.code, 403)
+            self.client.open(self.web.origin + '/desktop-entry?token=' + self.web.issue_launch_token()).close()
+            for headers in ({'Origin': 'https://untrusted.invalid'}, {'Host': 'untrusted.invalid'}):
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    self.client.open(request(headers))
+                self.assertEqual(error.exception.code, 403)
+            create.assert_not_called()
+            with self.client.open(request()) as response:
+                self.assertEqual(response.status, 201)
+                self.assertEqual(json.load(response), {'task_id': 'manual-test'})
+            create.assert_called_once_with(payload)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         (Path(self.directory.name) / "index.html").write_text("<html><head></head><body>product-ui</body></html>", encoding="utf-8")

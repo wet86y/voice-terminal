@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import base64
 import ipaddress
 import logging
@@ -18,7 +19,7 @@ from ..compute import device_candidates
 from ..speaker.client import SpeakerWorkerClient, SpeakerWorkerError
 from ..speaker.contracts import SpeakerObservation
 from ..speaker.enrollment import ENROLLMENT_REQUIRED_SEGMENTS, EnrollmentRejectedError, centroid_of, check_segments, enrollment_prompts
-from ..speaker.enrollment_capture import MAX_SEGMENT_SECONDS, MIN_SEGMENT_SECONDS, EnrollmentCaptureError, capture_segment, speech_ms_for_pcm, voiced_ranges_for_windows
+from ..speaker.enrollment_capture import MAX_SEGMENT_SECONDS, MIN_SEGMENT_SECONDS, CaptureControl, EnrollmentCaptureError, capture_segment, speech_ms_for_pcm, voiced_ranges_for_windows
 from ..speaker.features import FRONTEND_VERSION
 from ..speaker.quality import base_window_quality
 from ..speaker.registry import ENROLLMENT_MAX_CLIPPED_RATIO
@@ -359,9 +360,7 @@ class SpeakerRuntimeMixin:
         enrollment_id = uuid4().hex
         while len(self._speaker_enrollment) >= 4:
             oldest_id = next(iter(self._speaker_enrollment))
-            stale = self._speaker_enrollment.pop(oldest_id, {})
-            if isinstance(stale, dict) and isinstance(stale.get("segments"), dict):
-                stale["segments"].clear()
+            self.cancel_speaker_enrollment(oldest_id)
         # Enrollment IDs are intentionally short-lived and single-use; raw
         # PCM exists only in this in-memory session until commit/failure.
         self._speaker_enrollment[enrollment_id] = {
@@ -386,12 +385,69 @@ class SpeakerRuntimeMixin:
     def cancel_speaker_enrollment(self, enrollment_id: str) -> bool:
         """Discard one in-progress enrollment and every raw PCM reference."""
         session = self._speaker_enrollment.pop(str(enrollment_id or ""), None)
+        for owner, control in getattr(self, "_speaker_captures", {}).values():
+            if owner == enrollment_id:
+                control.cancel.set()
         if not isinstance(session, dict):
             return False
         segments = session.get("segments")
         if isinstance(segments, dict):
             segments.clear()
         return True
+
+    @asynccontextmanager
+    async def _capture_speaker_pcm(self, *, owner: str, seconds: float, capture_id: str | None):
+        """capture_id（采集请求标识）只绑定一个有界流，取消不能复活已删除的会话。"""
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 5 <= seconds <= 10:
+            raise ValueError("录制时长必须为 5–10 秒")
+        if capture_id is not None and (not isinstance(capture_id, str) or not capture_id or len(capture_id) > 80):
+            raise ValueError("capture_id（采集请求标识）必须为 1–80 个字符")
+        captures = getattr(self, "_speaker_captures", None)
+        if captures is None:
+            self._speaker_captures = captures = {}
+        if captures or self.state.listening:
+            raise EnrollmentCaptureError("请停止语音会话或当前录音后重试。", code="SPEAKER_INPUT_BUSY")
+        session = self._speaker_enrollment.get(owner) if owner != "test" else None
+        if session and (session.get("committing") or time.monotonic() - session.get("created_at", time.monotonic()) > 15 * 60):
+            raise ValueError("注册正在保存或已过期，请结束后重试")
+        key = capture_id or uuid4().hex
+        control = CaptureControl()
+        captures[key] = (owner, control)
+        try:
+            captured = await asyncio.to_thread(
+                capture_segment, sample_rate=self.config.audio.sample_rate,
+                channels=self.config.audio.channels, input_device=self.config.audio.input_device,
+                seconds=seconds, processor=self.audio_processor, control=control,
+            )
+            if control.cancel.is_set() or (owner != "test" and owner not in self._speaker_enrollment):
+                raise EnrollmentCaptureError("本次采集已取消", code="SPEAKER_CAPTURE_CANCELLED")
+            if not 5000 <= captured.duration_ms <= 10000:
+                raise ValueError("每段录音长度必须在 5 至 10 秒之间")
+            yield captured, control
+        finally:
+            control.cancel.set()
+            captures.pop(key, None)
+
+    async def stop_speaker_capture(self, owner: str, capture_id: str, *, cancel: bool = False) -> dict[str, Any]:
+        """cancel（取消本段）丢弃采样；普通停止只接受至少五秒的真实采样。"""
+        item = getattr(self, "_speaker_captures", {}).get(capture_id)
+        if item is None or item[0] != owner:
+            return {"stopped": False}
+        control = item[1]
+        if not cancel and control.duration_ms < 5000:
+            raise ValueError("录满 5 秒后才可提前停止")
+        (control.cancel if cancel else control.stop).set()
+        closed = await asyncio.to_thread(control.closed.wait, 2)
+        if not closed:
+            raise ValueError("采集尚未释放，请稍候再试")
+        return {"stopped": True, "cancelled": cancel}
+
+    async def close_speaker_captures(self) -> None:
+        controls = [item[1] for item in getattr(self, "_speaker_captures", {}).values()]
+        for control in controls:
+            control.cancel.set()
+        for control in controls:
+            await asyncio.to_thread(control.closed.wait, 2)
 
     def add_speaker_enrollment_segment(self, enrollment_id: str, *, index: int,
                                        label: str, encoded: str) -> dict[str, Any]:
@@ -431,7 +487,7 @@ class SpeakerRuntimeMixin:
                 "received": len(session["segments"])}
 
     async def capture_speaker_enrollment_segment(self, enrollment_id: str, *, index: int,
-                                                 label: str, seconds: float) -> dict[str, Any]:
+                                                 label: str, seconds: float, capture_id: str | None = None) -> dict[str, Any]:
         """Record one segment from the runtime input device.
 
         Enrollment used to run through the browser, which selected a different
@@ -450,33 +506,26 @@ class SpeakerRuntimeMixin:
                 "语音会话正在进行，请先停止监听再录制声纹。",
                 code="SPEAKER_INPUT_BUSY",
             )
-        captured = await asyncio.to_thread(
-            capture_segment,
-            sample_rate=self.config.audio.sample_rate,
-            channels=self.config.audio.channels,
-            input_device=self.config.audio.input_device,
-            seconds=seconds,
-            processor=self.audio_processor,
-        )
-        speech_ms = captured.speech_ms
-        measured = speech_ms > 0
-        if not measured:
-            speech_ms, measured = self._speaker_speech_ms(captured.pcm)
-        if captured.rms_dbfs < -50.0:
-            raise ValueError("录音音量过低，请靠近麦克风或在安静环境中重录")
-        if captured.clipped_ratio > ENROLLMENT_MAX_CLIPPED_RATIO:
-            raise ValueError("录音存在明显削波，请降低麦克风音量后重录")
-        quality = self._segment_quality(captured.pcm, speech_ms, source="enrollment_capture",
-                                        measured=measured)
-        quality["processor_applied"] = bool(captured.processed)
-        session["segments"][index] = {
-            "label": str(label or self._prompt_label(index))[:80],
-            "pcm": captured.pcm,
-            "duration_ms": captured.duration_ms,
-            "quality": quality,
-        }
-        return {"index": index, "duration_ms": captured.duration_ms, "quality": quality,
-                "received": len(session["segments"])}
+        async with self._capture_speaker_pcm(owner=enrollment_id, seconds=seconds, capture_id=capture_id) as (captured, control):
+            speech_ms = captured.speech_ms
+            measured = speech_ms > 0
+            if not measured:
+                speech_ms, measured = self._speaker_speech_ms(captured.pcm)
+            if captured.rms_dbfs < -50.0:
+                raise ValueError("录音音量过低，请靠近麦克风或在安静环境中重录")
+            if captured.clipped_ratio > ENROLLMENT_MAX_CLIPPED_RATIO:
+                raise ValueError("录音存在明显削波，请降低麦克风音量后重录")
+            quality = self._segment_quality(captured.pcm, speech_ms, source="enrollment_capture",
+                                            measured=measured)
+            quality["processor_applied"] = bool(captured.processed)
+            session["segments"][index] = {
+                "label": str(label or self._prompt_label(index))[:80],
+                "pcm": captured.pcm,
+                "duration_ms": captured.duration_ms,
+                "quality": quality,
+            }
+            return {"index": index, "duration_ms": captured.duration_ms, "quality": quality,
+                    "received": len(session["segments"])}
 
     def _get_speaker_engine(self) -> WeSpeakerOnnxEngine:
         engine = self._speaker_engine
@@ -548,14 +597,15 @@ class SpeakerRuntimeMixin:
         return self._speaker_runtime_fingerprint(), self._speaker_runtime_probe()
 
     async def commit_speaker_enrollment(self, enrollment_id: str) -> dict[str, Any]:
-        session = self._speaker_enrollment.pop(enrollment_id, None)
+        session = self._speaker_enrollment.get(enrollment_id)
         if session is None:
             raise ValueError("录音会话不存在或已过期")
+        if session.get("committing") or any(owner == enrollment_id for owner, _ in getattr(self, "_speaker_captures", {}).values()):
+            raise ValueError("请结束正在进行的录制或保存后重试")
         segments = session.get("segments") if isinstance(session, dict) else {}
         if not isinstance(segments, dict) or len(segments) != ENROLLMENT_REQUIRED_SEGMENTS:
-            if isinstance(segments, dict):
-                segments.clear()
             raise ValueError("请完成三段引导录音")
+        session["committing"] = True
         try:
             samples: list[tuple[str, Any, Mapping[str, Any]]] = []
             quality: list[dict[str, Any]] = []
@@ -566,6 +616,8 @@ class SpeakerRuntimeMixin:
                     raise ValueError("录音段不完整")
                 pcm = item.get("pcm")
                 embedding = await self._embed_speaker_audio(pcm)
+                if self._speaker_enrollment.get(enrollment_id) is not session:
+                    raise ValueError("本次注册已取消")
                 embeddings.append(embedding)
                 quality.append(dict(item.get("quality") or {}))
                 samples.append((str(item.get("label") or self._prompt_label(index)), embedding, quality[-1]))
@@ -578,12 +630,12 @@ class SpeakerRuntimeMixin:
                     WeSpeakerOnnxEngine.similarity(embeddings[index], centroid_of(embeddings)), 4
                 )
             fingerprint, probe = await self._speaker_fingerprint()
-            result = await asyncio.to_thread(
-                self.speaker_profile.replace_templates,
-                samples,
-                fingerprint=fingerprint,
-                probe=probe,
-            )
+            if self._speaker_enrollment.get(enrollment_id) is not session:
+                raise ValueError("本次注册已取消")
+            # 嵌入提取已在工作进程完成；此处小文件事务与取消在同一循环串行化。
+            result = self.speaker_profile.replace_templates(samples, fingerprint=fingerprint, probe=probe)
+            self._speaker_enrollment.pop(enrollment_id, None)
+            segments.clear()
             if self.speaker_router is not None:
                 self.speaker_router.profile.load()
             merged = dict(result)
@@ -597,8 +649,10 @@ class SpeakerRuntimeMixin:
         except EnrollmentRejectedError:
             raise
         finally:
-            # Drop all raw PCM references as soon as extraction completes or fails.
-            segments.clear() if isinstance(segments, dict) else None
+            session["committing"] = False
+            # 失败时允许原会话重录；取消或成功后立即释放全部采样。
+            if self._speaker_enrollment.get(enrollment_id) is not session:
+                segments.clear() if isinstance(segments, dict) else None
 
     async def test_speaker_audio(self, encoded: str) -> dict[str, Any]:
         if not self.speaker_profile.available:
@@ -799,7 +853,7 @@ class SpeakerRuntimeMixin:
             "anti_spoofing": "unavailable",
         }
 
-    async def capture_speaker_test(self, *, seconds: float) -> dict[str, Any]:
+    async def capture_speaker_test(self, *, seconds: float, capture_id: str | None = None) -> dict[str, Any]:
         """Record and score a live test clip through the runtime chain.
 
         Using the same device and processing as a real turn is what makes the
@@ -816,19 +870,14 @@ class SpeakerRuntimeMixin:
                 "语音会话正在进行，请先停止监听再做现场测试。",
                 code="SPEAKER_INPUT_BUSY",
             )
-        captured = await asyncio.to_thread(
-            capture_segment,
-            sample_rate=self.config.audio.sample_rate,
-            channels=self.config.audio.channels,
-            input_device=self.config.audio.input_device,
-            seconds=seconds,
-            processor=self.audio_processor,
-        )
-        speech_ms = captured.speech_ms
-        if speech_ms <= 0:
-            speech_ms, _measured = self._speaker_speech_ms(captured.pcm)
-        result = await asyncio.to_thread(self._score_speaker_audio, captured.pcm, speech_ms)
-        result["duration_ms"] = captured.duration_ms
-        result["rms_dbfs"] = captured.rms_dbfs
-        self._speaker_test_result = dict(result)
-        return result
+        async with self._capture_speaker_pcm(owner="test", seconds=seconds, capture_id=capture_id) as (captured, control):
+            speech_ms = captured.speech_ms
+            if speech_ms <= 0:
+                speech_ms, _measured = self._speaker_speech_ms(captured.pcm)
+            result = await asyncio.to_thread(self._score_speaker_audio, captured.pcm, speech_ms)
+            result["duration_ms"] = captured.duration_ms
+            result["rms_dbfs"] = captured.rms_dbfs
+            if control.cancel.is_set():
+                raise EnrollmentCaptureError("本次采集已取消", code="SPEAKER_CAPTURE_CANCELLED")
+            self._speaker_test_result = dict(result)
+            return result

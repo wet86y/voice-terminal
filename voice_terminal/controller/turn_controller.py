@@ -75,7 +75,8 @@ class InputController:
                            turn_id: str | None = None) -> None:
         self.state.set_state(state, listening=listening)
         await self._publish(event("session.state", turn_id, state=state.value,
-                                  listening=self.state.listening, can_start=self.state.can_start))
+                                  listening=self.state.listening, can_start=self.state.can_start,
+                                  audio_generation=self.state.audio_generation))
         snapshot = self.state.snapshot()
         snapshot["recent_inputs"] = [record.to_payload() for record in self.history.records]
         await self._publish(VoiceEvent(type="runtime.snapshot", turn_id=None, payload=snapshot))

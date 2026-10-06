@@ -62,6 +62,10 @@ export function useProductControls() {
     latencyRunning,
     wakeForm,
     wakeTasks,
+    addingWakeTask,
+    wakeTaskCreateDraft,
+    addWakeTask,
+    createWakeTask,
     editingWakeTaskId,
     wakeTaskDraft,
     refreshWakeTasks,
@@ -90,6 +94,7 @@ export function useProductControls() {
     activeTtsModel,
     registry,
     computeStatus,
+    computeSavedDevices,
     refreshComputeStatus,
     saveComputeSettings,
     shadowExpanded,
@@ -261,7 +266,7 @@ export function useProductControls() {
   const expandedModelSections = reactive({
     add: true,
     config: true,
-    pool: false,
+    pool: true,
   });
   const editingModelId = ref<string | null>(null);
   const deleteCandidateId = ref<string | null>(null);
@@ -319,6 +324,9 @@ export function useProductControls() {
   });
   const instructionDraft = reactive<CustomInstruction>(emptyInstruction());
   const instructionFormError = ref("");
+  function addInstructionRow() {
+    customInstructions.value.push({ ...emptyInstruction(), id: crypto.randomUUID() });
+  }
   function editInstruction(item: CustomInstruction) {
     Object.assign(instructionDraft, item);
     instructionFormError.value = "";
@@ -354,6 +362,11 @@ export function useProductControls() {
     return true;
   }
   async function saveInstructionSettings() {
+    instructionFormError.value = "";
+    if (customInstructions.value.some(item => !item.trigger.trim() || !item.instruction.trim())) {
+      instructionFormError.value = "请填写每条指令的触发语义和执行目标。";
+      return;
+    }
     if (
       (instructionDraft.id ||
         instructionDraft.trigger.trim() ||
@@ -980,7 +993,7 @@ export function useProductControls() {
     );
   });
   const speakerEnrollmentComplete = computed(
-    () => speakerEnrollment.value?.segments.length === 3,
+    () => speakerEnrollment.value?.segments.length === 3 && speakerRecordingSegment.value === null && !speakerTestRecording.value && !enrollmentStarting,
   );
   function speakerStateLabel(value: unknown) {
     const labels: Record<string, string> = {
@@ -1224,7 +1237,7 @@ export function useProductControls() {
       }, 200);
       capture.timeout = window.setTimeout(() => {
         void stopSpeakerRecording();
-      }, 10000);
+      }, kind === "enrollment" ? 8000 : 6000);
     } catch (error) {
       acquiredStream?.getTracks().forEach((track) => track.stop());
       if (acquiredContext) void acquiredContext.close().catch(() => undefined);
@@ -1241,15 +1254,16 @@ export function useProductControls() {
   }
   const SPEAKER_ENROLLMENT_SECONDS = 8;
   const SPEAKER_TEST_SECONDS = 6;
-  let serverCapture: { controller: AbortController; ticker: number; timeout: number } | null = null;
+  let serverCapture: { controller: AbortController; ticker: number; timeout: number; id: string; owner: string | null } | null = null;
   function cancelServerCapture() {
     if (!serverCapture) return;
+    void adapter.stopSpeakerCapture(serverCapture.owner, serverCapture.id, true).catch(() => {});
     serverCapture.controller.abort();
     window.clearInterval(serverCapture.ticker);
     window.clearTimeout(serverCapture.timeout);
     serverCapture = null;
   }
-  async function cancelSpeakerEnrollment(options: unknown = {}) {
+  function cancelActiveSpeakerCapture() {
     captureGeneration += 1;
     cancelServerCapture();
     const capture = speakerCapture;
@@ -1267,6 +1281,9 @@ export function useProductControls() {
     speakerTestRecording.value = false;
     speakerServerCapture.value = false;
     speakerRecordingSeconds.value = 0;
+  }
+  async function cancelSpeakerEnrollment(options: unknown = {}) {
+    cancelActiveSpeakerCapture();
     await cancelEnrollmentSession(options);
   }
   watch(() => {
@@ -1283,6 +1300,9 @@ export function useProductControls() {
     label: string,
     seconds: number,
   ) {
+    const generation = ++captureGeneration;
+    const id = crypto.randomUUID(); // id（本次采集请求标识）。
+    const owner = kind === "enrollment" ? speakerEnrollment.value?.id ?? null : null;
     speakerRecordingSeconds.value = 0;
     speakerRecordingSegment.value = kind === "enrollment" ? index : null;
     speakerTestRecording.value = kind === "test";
@@ -1292,24 +1312,27 @@ export function useProductControls() {
       if (!controlsDisposed && !controller.signal.aborted) speakerRecordingSeconds.value += 1;
     }, 1000);
     const timeout = window.setTimeout(() => {
+      void adapter.stopSpeakerCapture(owner, id, true).catch(() => {});
       controller.abort();
       if (!controlsDisposed) adapter.setError(new Error("声纹采集等待超时，请重试。"));
     }, (seconds + 15) * 1000);
-    serverCapture = { controller, ticker, timeout };
+    serverCapture = { controller, ticker, timeout, id, owner };
     try {
       const ok =
         kind === "test"
-          ? await captureSpeakerTest(seconds, controller.signal)
-          : await captureSpeakerEnrollmentSegment(index, label, seconds, controller.signal);
-      return controlsDisposed || controller.signal.aborted ? null : ok;
+          ? await captureSpeakerTest(seconds, controller.signal, id)
+          : await captureSpeakerEnrollmentSegment(index, label, seconds, controller.signal, id);
+      return controlsDisposed || controller.signal.aborted || generation !== captureGeneration ? null : ok;
     } finally {
       window.clearInterval(ticker);
       window.clearTimeout(timeout);
       if (serverCapture?.controller === controller) serverCapture = null;
-      speakerServerCapture.value = false;
-      speakerRecordingSegment.value = null;
-      speakerTestRecording.value = false;
-      speakerRecordingSeconds.value = 0;
+      if (generation === captureGeneration) {
+        speakerServerCapture.value = false;
+        speakerRecordingSegment.value = null;
+        speakerTestRecording.value = false;
+        speakerRecordingSeconds.value = 0;
+      }
     }
   }
   async function beginSpeakerRecording(index: number, label: string) {
@@ -1370,6 +1393,12 @@ export function useProductControls() {
     return input?.value?.trim() || "自定义";
   }
   async function stopSpeakerRecording() {
+    if (speakerRecordingSeconds.value < 5) return;
+    if (serverCapture) {
+      try { await adapter.stopSpeakerCapture(serverCapture.owner, serverCapture.id, false); }
+      catch (error) { adapter.setError(error); }
+      return;
+    }
     const capture = speakerCapture;
     if (!capture) return;
     speakerCapture = null;
@@ -1407,6 +1436,10 @@ export function useProductControls() {
     // when the settings view itself is closed.
     void cancelSpeakerEnrollment({ notify: false });
   });
+  watch([activePage, activeSettingsTab], ([page, tab], [oldPage, oldTab]) => {
+    if (oldPage === "settings" && oldTab === "speaker" && (page !== "settings" || tab !== "speaker"))
+      void cancelSpeakerEnrollment({ notify: false });
+  });
   function pageLabel() {
     return activePage.value === "home" ? "工作台" : "设置";
   }
@@ -1418,7 +1451,8 @@ export function useProductControls() {
     }
     return performRuntimeAction();
   }
-  const workbenchModel = computed<WorkbenchModel>(() => {
+  // workbenchConversation（消息呈现缓存）：实时音量更新不重新映射聊天条目。
+  const workbenchConversation = computed(() => {
     const conversation: WorkbenchModel["conversation"] =
       conversationEntries.value.map((entry) => ({
         key: entry.key,
@@ -1431,7 +1465,7 @@ export function useProductControls() {
             ? turnStatusLabel(entry)
             : speechStatusLabel(entry),
         speaking: entry.speaking,
-        delivered: entry.delivery?.status
+        delivered: entry.role === 'assistant' && entry.delivery?.status
           ? deliveryStatusLabel(entry.delivery) +
             (entry.delivery.heard_text ? " · " + entry.delivery.heard_text : "")
           : "",
@@ -1462,8 +1496,12 @@ export function useProductControls() {
         status: runtimeState.value === "speaking" ? "正在播报" : "等待播报结算",
         speaking: runtimeState.value === "speaking",
       });
+    return conversation;
+  });
+  const workbenchModel = computed<WorkbenchModel>(() => {
     return {
       state: runtimeState.value,
+      audioLevels: voice.audioLevels?.value ?? [0, 0, 0, 0, 0],
       sessionActive: connected.value && listening.value, // sessionActive（真实会话开关）：等待唤醒时仍保持会话布局。
       title: runtimeMeta.value.label,
       description: runtimeMeta.value.description,
@@ -1486,7 +1524,7 @@ export function useProductControls() {
           ? "代理宿主管理"
           : modelTitle(activeModels.value.shadow),
       ttsModel: modelTitle(activeTtsModel.value),
-      conversation,
+      conversation: workbenchConversation.value,
       partial: current.value.partial_text,
       thinking:
         runtimeState.value === "thinking" && !current.value.assistant_text,
@@ -1552,6 +1590,10 @@ export function useProductControls() {
     shadow,
     wakeForm,
     wakeTasks,
+    addingWakeTask,
+    wakeTaskCreateDraft,
+    addWakeTask,
+    createWakeTask,
     editingWakeTaskId,
     wakeTaskDraft,
     refreshWakeTasks,
@@ -1574,6 +1616,7 @@ export function useProductControls() {
     hiddenPool,
     registry,
     computeStatus,
+    computeSavedDevices,
     refreshComputeStatus,
     saveComputeSettings,
     shadowExpanded,
@@ -1632,6 +1675,7 @@ export function useProductControls() {
     editInstruction,
     clearInstructionDraft,
     stageInstruction,
+    addInstructionRow,
     saveInstructionSettings,
     removeInstruction,
     modelContextOptions,
@@ -1682,6 +1726,7 @@ export function useProductControls() {
     speakerPrompt,
     speakerSegmentLabel,
     stopSpeakerRecording,
+    cancelActiveSpeakerCapture,
     workbenchModel,
   };
 }

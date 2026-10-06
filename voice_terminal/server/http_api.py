@@ -387,6 +387,27 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             raise HTTPException(status_code=422, detail="invalid activity")
         return {"result": await runtime.note_dsh_activity(payload)}
 
+    @app.post("/internal/application/wake-tasks")
+    async def create_manual_wake_task(request: Request) -> dict[str, Any]:
+        """手动创建入口：宿主身份校验后固定目标及空参考，不接受浏览器伪造来源。"""
+        authorize_application(request)
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="请求必须为有效 JSON（结构化数据）。") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=422, detail="任务必须是对象。")
+        rules = [key for key in ("at", "daily", "weekly") if key in body]
+        if len(rules) != 1 or set(body) != {"text", rules[0]}:
+            raise HTTPException(status_code=422, detail="仅允许 text（任务说明）和一种单次、每天或每周规则。")
+        text = body.get("text")
+        if not isinstance(text, str) or not 1 <= len(text.strip()) <= 500:
+            raise HTTPException(status_code=422, detail="任务说明须为 1 至 500 字。")
+        return await dsh_task_api("POST", "tasks", {
+            "text": text.strip(), rules[0]: body[rules[0]],
+            "target": "shadow_agent", "reference": "", "creation_source": "manual",
+        })
+
     @app.post("/api/internal/wake-tasks")
     async def create_wake_task_from_dsh(request: Request) -> dict[str, Any]:
         authorize_dsh_plugin(request)
@@ -658,8 +679,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     async def capture_speaker_enrollment_segment(enrollment_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """Record one enrollment segment from the runtime input device."""
         try:
-            if set(body) != {"index", "label", "seconds"}:
-                raise ValueError("录制字段必须是 index、label、seconds")
+            if set(body) - {"index", "label", "seconds", "capture_id"} or not {"index", "label", "seconds"} <= set(body):
+                raise ValueError("录制字段必须包含 index（段编号）、label（标签）、seconds（秒数），可选 capture_id（采集请求标识）")
             seconds = body.get("seconds")
             if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
                 raise ValueError("录制时长必须是数字")
@@ -668,12 +689,29 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 index=body.get("index"),
                 label=str(body.get("label") or ""),
                 seconds=float(seconds),
+                capture_id=body.get("capture_id"),
             )
         except EnrollmentCaptureError as exc:
             raise HTTPException(status_code=422,
                                 detail={"code": exc.code, "message": str(exc)}) from exc
         except Exception as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    async def stop_capture(owner: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            if set(body) - {"capture_id", "cancel"} or not isinstance(body.get("capture_id"), str) or not isinstance(body.get("cancel", False), bool):
+                raise ValueError("需要 capture_id（采集请求标识）与可选 cancel（取消本段）")
+            return await runtime.stop_speaker_capture(owner, body["capture_id"], cancel=body.get("cancel", False))
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/speaker/enrollment/{enrollment_id}/capture/stop")
+    async def stop_enrollment_capture(enrollment_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        return await stop_capture(enrollment_id, body)
+
+    @app.post("/api/v1/speaker/test/capture/stop")
+    async def stop_test_capture(body: dict[str, Any]) -> dict[str, Any]:
+        return await stop_capture("test", body)
 
     @app.post("/api/v1/speaker/enrollment/{enrollment_id}/commit")
     async def commit_speaker_enrollment(enrollment_id: str) -> dict[str, Any]:
@@ -773,9 +811,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     async def capture_speaker_test(body: dict[str, Any]) -> dict[str, Any]:
         """Record and score a live test clip through the runtime chain."""
         try:
-            if set(body) != {"seconds"}:
-                raise ValueError("录制字段必须是 seconds")
-            return await runtime.capture_speaker_test(seconds=body.get("seconds"))
+            if set(body) - {"seconds", "capture_id"} or "seconds" not in body:
+                raise ValueError("录制字段必须是 seconds（秒数），可选 capture_id（采集请求标识）")
+            return await runtime.capture_speaker_test(seconds=body.get("seconds"), capture_id=body.get("capture_id"))
         except EnrollmentCaptureError as exc:
             raise HTTPException(status_code=422,
                                 detail={"code": exc.code, "message": str(exc)}) from exc

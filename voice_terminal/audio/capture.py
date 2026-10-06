@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .devices import resolve_device
 from .ring_buffer import PcmRingBuffer
@@ -26,12 +26,14 @@ class AudioCapture:
         block_ms: int,
         input_device: str | int | None,
         ring_buffer_ms: int,
+        on_audio_frame: Callable[[bytes], None] | None = None,  # on_audio_frame（实际输入采样）。
     ) -> None:
         try:
             import sounddevice  # type: ignore  # noqa: F401
         except ImportError as exc:
             raise AudioCaptureError("缺少 sounddevice，请先运行 scripts\\setup.ps1。") from exc
         self.loop = loop
+        self.on_audio_frame = on_audio_frame
         self.sample_rate = sample_rate
         self.channels = channels
         self.block_ms = block_ms
@@ -95,6 +97,8 @@ class AudioCapture:
                 logger.warning("audio.capture_callback_status status=%s", self.last_error)
                 self._last_status = self.last_error
         chunk = bytes(indata)
+        if self.on_audio_frame:
+            self.on_audio_frame(chunk)
         frame = AudioFrame(chunk, self._sample_position, time.monotonic())
         self._sample_position += len(chunk) // 2
         self._blocks_captured += 1

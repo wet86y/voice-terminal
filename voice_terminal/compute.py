@@ -23,6 +23,28 @@ def process_memory_bytes() -> int | None:
         return None
 
 
+def system_commit_limit_bytes() -> int | None:
+    """GetPerformanceInfo（Windows 真实性能接口）提供系统提交内存上限。"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        class PerformanceInfo(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD)] + [(name, ctypes.c_size_t) for name in
+                ("CommitTotal", "CommitLimit", "CommitPeak", "PhysicalTotal", "PhysicalAvailable",
+                 "SystemCache", "KernelTotal", "KernelPaged", "KernelNonpaged", "PageSize")] + [
+                (name, wintypes.DWORD) for name in ("HandleCount", "ProcessCount", "ThreadCount")]
+        info = PerformanceInfo()
+        info.cb = ctypes.sizeof(info)
+        query = ctypes.WinDLL("psapi", use_last_error=True).GetPerformanceInfo
+        query.argtypes = [ctypes.POINTER(PerformanceInfo), wintypes.DWORD]
+        query.restype = wintypes.BOOL
+        return int(info.CommitLimit * info.PageSize) if query(ctypes.byref(info), info.cb) else None
+    except (OSError, AttributeError):
+        return None
+
+
 def _backend_hardware_status() -> dict[str, Any]:
     """探测当前机器的 RAM（系统内存）、显存和各后端 GPU 支持。"""
     memory: dict[str, int | None] = {"available_bytes": None, "total_bytes": None}
@@ -34,6 +56,7 @@ def _backend_hardware_status() -> dict[str, Any]:
     except Exception:
         pass
 
+    memory["commit_limit_bytes"] = system_commit_limit_bytes()
     torch_cuda = False
     gpu: dict[str, Any] = {
         "available": False,
@@ -148,7 +171,8 @@ def hardware_status() -> dict[str, Any]:
     try:
         import psutil
         memory = psutil.virtual_memory()
-        result["system_memory"] = {"available_bytes": memory.available, "total_bytes": memory.total}
+        result["system_memory"] = {"available_bytes": memory.available, "total_bytes": memory.total,
+                                   "commit_limit_bytes": system_commit_limit_bytes()}
     except Exception:
         pass
     # 宿主定期从已经加载的工作进程刷新显存数值；主服务不初始化 CUDA 上下文。

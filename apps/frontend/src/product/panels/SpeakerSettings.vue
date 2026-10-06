@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { useProductContext } from "../product-context";
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
+import SpeakerRecordingFlow from '../../interface/SpeakerRecordingFlow.vue';
+import { ref, watch } from 'vue';
 const {
   settings,
   saving,
@@ -39,33 +41,20 @@ const {
   speakerPrompt,
   speakerSegmentLabel,
   stopSpeakerRecording,
+  cancelActiveSpeakerCapture,
 } = useProductContext();
+const recordingExpanded = ref(false); // recordingExpanded（录制面板）：收起时保留已完成片段。
+watch(speakerEnrollment, value => { if (!value) recordingExpanded.value = false; });
+async function toggleRecording() {
+  if (recordingExpanded.value) { cancelActiveSpeakerCapture(); recordingExpanded.value = false; return; }
+  if (!speakerEnrollment.value) await startSpeakerEnrollment();
+  recordingExpanded.value = !!speakerEnrollment.value;
+}
 </script>
 <template>
   <SettingsPageHeader section="speaker" />
-  <p class="instruction-hint">
-      声纹只在本地旁路观察和路由，不会阻塞音频采集、VAD（语音活动检测）、ASR（自动语音识别）的局部或最终转写；普通请求在未注册、超时或出错时保守放行，主人打断则必须获得确认。它不是付款、删除、门锁等高风险操作的身份认证。
-  </p>
-
-  <section class="speaker-status-card">
-    <div>
-      <span class="section-label">STATUS</span
-      ><strong>{{ speakerServiceLabel }}</strong
-      ><small
-        >{{ String(speakerStatus.model_id || "WeSpeaker（中文声纹模型）") }} · CPU（中央处理器）
-        独立 Worker</small
-      ><small v-if="speakerStatus.last_error" class="speaker-last-error"
-        >最近错误：{{ String(speakerStatus.last_error) }}</small
-      >
-    </div>
-    <div class="speaker-status-detail">
-      <span>{{ speakerHasProfile ? "已注册主人声纹" : "尚未注册声纹" }}</span
-      ><span v-if="speakerStatus.worker_connected === true"
-        >Worker（工作进程）已连接</span
-      ><span v-else>Worker（工作进程）未连接</span
-      ><span v-if="speakerRollingSummary">{{ speakerRollingSummary }}</span>
-    </div>
-  </section>
+  <p class="instruction-hint" role="status">{{ speakerServiceLabel }} · {{ speakerHasProfile ? '已注册主人声纹' : '尚未注册声纹' }} · {{ speakerStatus.worker_connected === true ? '工作进程已连接' : '工作进程未连接' }}<template v-if="speakerRollingSummary"> · {{ speakerRollingSummary }}</template></p>
+  <p v-if="speakerStatus.last_error" class="instruction-error" role="alert">最近错误：{{ String(speakerStatus.last_error) }}</p>
 
   <div v-if="speakerNeedsReenrollment" class="info-callout">
     <span>!</span>
@@ -78,9 +67,9 @@ const {
     </p>
   </div>
 
-  <div class="speaker-settings-grid">
+  <div class="settings-stack">
     <label class="form-field"
-      ><span>声纹模式</span
+      ><span>运行模式</span
       ><select v-model="speakerForm.mode">
         <option value="off">关闭</option>
         <option value="observe">仅标记</option>
@@ -94,18 +83,13 @@ const {
         >仅标记只更新说话人状态；拦截会将明确非主人的转写转入环境记录。</small
       ></label
     >
-    <label class="speaker-barge-toggle"
-      ><input
+    <label class="switch-row"
+      ><div><strong>仅主人可打断</strong><span>身份未知时保留当前播放；确认是主人后停止，最多等待约 2.5 秒。关闭声纹模式时也可单独启用。</span></div><input
         v-model="speakerForm.owner_only_barge_in"
         type="checkbox"
+        role="switch"
         :disabled="!speakerHasProfile && !speakerForm.owner_only_barge_in"
-      /><span
-        ><strong>主人打断</strong
-        ><small
-          >只在当前打断候选确认是主人后停止播放；最多等待约 2.5
-          秒。关闭声纹模式时也可单独启用。</small
-        ></span
-      ></label
+      /><i aria-hidden="true"></i></label
     >
     <div
       v-if="speakerForm.owner_only_barge_in"
@@ -128,7 +112,8 @@ const {
         )
       }}</small>
     </div>
-    <details class="speaker-advanced">
+  </div>
+  <details class="speaker-advanced">
       <summary>高级设置 · 阈值基线</summary>
       <div class="speaker-thresholds">
         <label class="form-field"
@@ -165,23 +150,17 @@ const {
           恢复默认阈值（0.60 / 0.50）
         </button>
       </div>
-    </details>
-  </div>
-  <div class="info-callout">
-    <span>!</span>
-    <p>
-      阈值只是当前测试基线，不代表安全等级。阈值越宽松越容易连续对话，也越可能误认；第一版不提供防伪和变声检测（anti-spoofing：不可用）。
-    </p>
-  </div>
+      <p class="instruction-hint">{{ String(speakerStatus.model_id || 'WeSpeaker') }}（声纹模型）使用独立 CPU（中央处理器）工作进程。声纹只在本地旁路观察和路由，不阻塞 VAD（语音活动检测）及 ASR（自动语音识别）；普通请求在未注册、超时或出错时保守放行，主人打断需要确认。</p>
+      <p class="instruction-hint">阈值是当前测试基线，不代表安全等级；不提供 anti-spoofing（防伪与变声检测），不用于付款、删除或门锁等高风险操作的身份认证。</p>
+  </details>
 
   <section class="speaker-enrollment-card" aria-labelledby="speaker-enrollment-title">
     <div class="speaker-card-heading">
       <div class="speaker-card-copy"><h3 id="speaker-enrollment-title">主人声纹模板</h3><p>按日常语速录制三段，每段 5–10 秒，保持设备与距离一致。</p></div>
       <div class="speaker-card-actions">
-        <button v-if="!speakerEnrollment && !speakerTestRecording" class="outline-button speaker-compact-button" type="button" @click="startSpeakerEnrollment">开始录制</button>
-        <button v-if="!speakerEnrollment && !speakerTestRecording" class="outline-button speaker-compact-button" type="button" :disabled="!speakerHasProfile" @click="beginSpeakerTest">现场测试</button>
-        <button v-if="speakerTestRecording && speakerServerCapture" class="outline-button speaker-compact-button speaker-stop-button" type="button" disabled>正在录制（{{ speakerRecordingSeconds }} 秒）</button>
-        <button v-else-if="speakerTestRecording" class="outline-button speaker-compact-button speaker-stop-button" type="button" @click="stopSpeakerRecording">停止测试（{{ speakerRecordingSeconds }} 秒）</button>
+        <button v-if="!speakerTestRecording" class="outline-button speaker-compact-button speaker-recording-toggle" type="button" :aria-expanded="recordingExpanded" :disabled="saving" @click="toggleRecording">{{ recordingExpanded ? '收起录制' : '开始录制' }}</button>
+        <button v-if="!speakerTestRecording" class="outline-button speaker-compact-button" type="button" :disabled="recordingExpanded || !speakerHasProfile || saving" @click="beginSpeakerTest">现场测试</button>
+        <template v-else><button class="outline-button speaker-compact-button" type="button" @click="cancelActiveSpeakerCapture">取消测试</button><button class="outline-button speaker-compact-button speaker-stop-button" type="button" :disabled="speakerRecordingSeconds < 5" @click="stopSpeakerRecording">{{ speakerRecordingSeconds < 5 ? '录满 5 秒后可停止' : '停止测试' }}（{{ speakerRecordingSeconds }} 秒）</button></template>
       </div>
     </div>
     <div v-if="speakerTestResult" class="speaker-test-result">
@@ -200,7 +179,7 @@ const {
         整段聚合），本次测试不会改变运行模式。</small
       >
     </div>
-    <div v-if="speakerEnrollment" class="speaker-recording-flow">
+    <SpeakerRecordingFlow v-if="recordingExpanded && speakerEnrollment" :completed="speakerEnrollment.segments.length" :total="3">
       <p v-if="speakerEnrollment.guidance" class="speaker-guidance">{{ speakerEnrollment.guidance }}</p>
       <div class="speaker-segment-list">
         <div v-for="(segment, index) in ['第 1 段', '第 2 段', '第 3 段']" :key="segment" class="speaker-segment-row" :class="{ completed: speakerEnrollment.segments.includes(index), recording: speakerRecordingSegment === index }" :data-segment="index">
@@ -210,21 +189,17 @@ const {
             <p v-if="speakerPrompt(index)" class="speaker-prompt">{{ speakerPrompt(index) }}</p>
             <label v-if="index === 2" class="speaker-template-label"><span>模板标签</span><input :id="'speaker-label-' + index" type="text" value="自定义" aria-label="自定义模板标签" :disabled="speakerRecordingSegment !== null" /></label>
           </div>
-          <button v-if="speakerRecordingSegment === index && speakerServerCapture" class="outline-button speaker-compact-button speaker-segment-action speaker-stop-button" type="button" disabled>正在录制</button>
-          <button v-else-if="speakerRecordingSegment === index" class="outline-button speaker-compact-button speaker-segment-action speaker-stop-button" type="button" @click="stopSpeakerRecording">停止录制</button>
+          <button v-if="speakerRecordingSegment === index" class="outline-button speaker-compact-button speaker-segment-action speaker-stop-button" type="button" :disabled="speakerRecordingSeconds < 5" @click="stopSpeakerRecording">{{ speakerRecordingSeconds < 5 ? '录满 5 秒后可停止' : '停止录制' }}</button>
           <button v-else class="outline-button speaker-compact-button speaker-segment-action" type="button" :disabled="speakerRecordingSegment !== null" @click="beginSpeakerRecording(index, speakerSegmentLabel(index, segment))">{{ speakerEnrollment.segments.includes(index) ? '重新录制' : '开始录制' }}</button>
         </div>
       </div>
-      <footer class="speaker-flow-footer">
-        <div class="speaker-flow-progress"><span role="status">已完成 {{ speakerEnrollment.segments.length }} / 3 段</span><div class="speaker-progress-marks" aria-hidden="true"><i v-for="index in 3" :key="index" :class="{ completed: index <= speakerEnrollment.segments.length }"></i></div></div>
-        <div class="speaker-flow-actions"><button class="outline-button speaker-compact-button" type="button" @click="cancelSpeakerEnrollment">取消录制</button><button class="save-button speaker-compact-button speaker-submit-button" type="button" :disabled="!speakerEnrollmentComplete || saving" @click="commitSpeakerEnrollment">保存声纹</button></div>
-      </footer>
-    </div>
+      <template #actions><button class="outline-button speaker-compact-button" type="button" @click="cancelSpeakerEnrollment">取消录制</button><button class="save-button speaker-compact-button speaker-submit-button" type="button" :disabled="!speakerEnrollmentComplete || saving" @click="commitSpeakerEnrollment">保存声纹</button></template>
+    </SpeakerRecordingFlow>
     <div v-else-if="speakerTemplates.length" class="speaker-template-list">
       <article v-for="template in speakerTemplates" :key="String(template.template_id)" class="speaker-template-row">
         <div class="speaker-template-copy"><strong :title="String(template.label || '自定义')">{{ String(template.label || '自定义') }}</strong><time>{{ String(template.created_at || '').replace('T', ' ').slice(0, 16) }}</time></div>
         <span class="speaker-template-state" :class="{ active: template.include_in_centroid !== false }">{{ template.include_in_centroid === false ? '未纳入主中心' : '已纳入主中心' }}</span>
-        <div class="speaker-template-actions"><button class="outline-button speaker-compact-button" type="button" @click="setSpeakerTemplateCentroid(String(template.template_id), template.include_in_centroid === false)">{{ template.include_in_centroid === false ? '纳入主中心' : '移出主中心' }}</button><button class="outline-button danger-action speaker-compact-button" type="button" @click="deleteSpeakerTemplate(String(template.template_id))">删除</button></div>
+        <div class="speaker-template-actions"><button class="outline-button speaker-compact-button" type="button" :disabled="saving || speakerTestRecording" @click="setSpeakerTemplateCentroid(String(template.template_id), template.include_in_centroid === false)">{{ template.include_in_centroid === false ? '纳入主中心' : '移出主中心' }}</button><button class="outline-button danger-action speaker-compact-button" type="button" :disabled="saving || speakerTestRecording" @click="deleteSpeakerTemplate(String(template.template_id))">删除</button></div>
       </article>
     </div>
     <div v-else class="pool-empty">还没有模板，请点击“开始录制”。</div>
@@ -233,11 +208,11 @@ const {
   <section class="speaker-ambient-card">
     <div class="speaker-card-heading">
       <div>
-        <p class="section-label">AMBIENT CONTEXT</p>
+        <p class="section-label">AMBIENT CONTEXT（环境上下文）</p>
         <h3>当前会话环境记录</h3>
         <p>
           筛选模式拦截的非本人文本只保存在内存中，不跨会话、不保存音频，也不会自动进入主
-          Agent。
+          Agent（代理）。
         </p>
       </div>
       <div>

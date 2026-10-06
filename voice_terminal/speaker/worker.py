@@ -361,6 +361,7 @@ async def run(config_path: Path | None = None) -> None:
                         "frontend_version": engine.model.frontend_version,
                         "device": engine.model.device,
                         "requested_device": engine.model.requested_device,
+                        "runtime": "ONNX Runtime（推理运行时）",  # runtime（实际加载引擎）。
                         "load_error": engine.model.load_error,
                         "process_memory_rss_bytes": process_memory_bytes(),
                         "resource_status": process_resource_status(),  # resource_status（资源状态）。

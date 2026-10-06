@@ -53,7 +53,7 @@ from ..speaker.registry import SpeakerProfileStore
 from ..speaker.router import SpeakerRouter
 from ..speaker.engine import WeSpeakerOnnxEngine
 from ..vad.detector import FsmnVadDetector
-from ..compute import device_candidates, hardware_status, process_memory_bytes
+from ..compute import device_candidates, hardware_status
 from ..analysis.client import AnalysisClient
 from .product import (
     ProductSettingsStore,
@@ -218,6 +218,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 worker = KwsWorker(detector)
                 worker.start()
                 self._compute_models["kws"] = {
+                    "runtime": "Sherpa-ONNX（唤醒引擎）",  # runtime（实际加载引擎）。
                     "requested_device": requested,
                     "device": device,
                     "service": "READY",
@@ -252,6 +253,11 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         logger.warning("%s", self.startup_errors[-1])
 
     async def initialize(self) -> None:
+        from ..audio.levels import AudioLevelMeter
+        self.audio_meter = AudioLevelMeter(self.state, self.bus,
+            playback_active=lambda: self.state.listening and
+                getattr(getattr(self.controller, "output", None), "status", "") == "SPEAKING")
+        self.audio_meter.start()
         application_report("voice", "初始化音频设备与输入处理")
         self._restore_or_persist_voice_identity()
         loop = asyncio.get_running_loop()
@@ -264,6 +270,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 block_ms=self.config.audio.block_ms,
                 input_device=self.config.audio.input_device,
                 ring_buffer_ms=self.config.audio.ring_buffer_ms,
+                on_audio_frame=lambda pcm: self.audio_meter.feed("input", pcm, self.config.audio.sample_rate, self.config.audio.channels),
             )
             self.state.set_service("audio", "READY")
         except Exception as exc:
@@ -319,6 +326,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 end_silence_ms=self.config.vad.end_silence_ms,
             )
             self._compute_models["voice_vad"] = {
+                "runtime": "ONNX Runtime（推理运行时）" if self.vad.backend == "onnx" else "PyTorch（推理框架）",
                 "requested_device": vad_requested,
                 "device": self.vad.device,
                 "service": "READY",
@@ -487,6 +495,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 output_device=self.config.audio.output_device,
                 device_latency_ms=self.config.audio.device_latency_ms,
                 on_audio_rendered=(self.audio_processor.push_reverse if self.audio_processor else None),
+                on_audio_frame=lambda pcm: self.audio_meter.feed("playback", pcm, self.config.tts.sample_rate),
             )
             self.player.start()
             self.state.current["playback_diagnostics"] = self.player.diagnostics
@@ -1153,6 +1162,9 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
 
     async def start_listening(self) -> None:
         async with self._session_lock:
+            if getattr(self, "_speaker_captures", {}):
+                await self.bus.publish(event("error", code="SPEAKER_INPUT_BUSY", message="请结束声纹采集后再开始语音会话。", recoverable=True))
+                return
             if self._handoff_marker.exists():
                 try:
                     await self._resume_handoff()
@@ -1283,6 +1295,9 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 await bus.publish(self.snapshot())
 
     async def close(self) -> None:
+        await self.close_speaker_captures()
+        if getattr(self, "audio_meter", None) is not None:
+            await self.audio_meter.close()
         if self.controller is not None:
             await self.controller.close()
         speaker = getattr(self, "speaker", None)
@@ -1605,9 +1620,9 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
 
         models["kws"].update(self._compute_models.get("kws", {}))
         models["voice_vad"].update(self._compute_models.get("voice_vad", {}))
-        server_rss = process_memory_bytes()
         for name in ("kws", "voice_vad"):
-            models[name]["process_memory_rss_bytes"] = server_rss
+            models[name]["resource_status"] = resource_rows[0]  # resource_status（同一统计进程快照）。
+            models[name]["process_memory_rss_bytes"] = resource_rows[0]["rss_bytes"]
         models["kws"]["service"] = self.state.services.get("kws", models["kws"].get("service", "UNKNOWN"))
         if self.asr is not None:
             try:
@@ -1620,6 +1635,8 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                     accept_hardware_capabilities(status["hardware_capabilities"])
                     hardware = status["hardware_capabilities"]
                 models["paraformer"].update({
+                    "resource_status": status.get("resource_status"),
+                    "runtime": status.get("runtime"),
                     "device": status.get("device"),
                     "requested_device": status.get("requested_device", requests.get("paraformer", "auto")),
                     "service": status.get("status", "READY"),
@@ -1645,6 +1662,8 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                     elif lane.get("status") != "DISABLED":
                         missing_resource_roles.add("analysis")
                     models[model_name].update({
+                        "resource_status": lane.get("resource_status"),
+                        "runtime": lane.get("runtime"),
                         "device": lane.get("device"),
                         "requested_device": lane.get("requested_device", requests.get(model_name, "cpu")),
                         "service": lane.get("status", "UNKNOWN"),
@@ -1667,6 +1686,8 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 else:
                     missing_resource_roles.add("speaker")
                 models["wespeaker"].update({
+                    "resource_status": status.get("resource_status"),
+                    "runtime": status.get("runtime"),
                     "device": status.get("device"),
                     "requested_device": status.get("requested_device", requests.get("wespeaker", "cpu")),
                     "service": status.get("status", "READY"),

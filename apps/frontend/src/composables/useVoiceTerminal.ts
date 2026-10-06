@@ -1,4 +1,4 @@
-import { computed, reactive, ref, shallowRef } from 'vue'
+import { computed, reactive, ref, shallowRef, watch } from 'vue'
 import type {
   AgentEpisodeSnapshot,
   AgentTrace,
@@ -74,6 +74,21 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const services = reactive<ServiceStatuses>(createOfflineStatuses())
   const shadowProduct = ref<ShadowProductSnapshot>(createEmptyShadowProduct())
   const recentTurns = ref<InputRecord[]>([])
+  const audioLevels = shallowRef<readonly number[]>([0, 0, 0, 0, 0]) // audioLevels（实际五频段音量）。
+  let audioGeneration = -1 // audioGeneration（已确认的音频轮代）。
+  let audioExpiry: ReturnType<typeof setTimeout> | undefined
+  function clearAudioLevels() {
+    if (audioExpiry !== undefined) clearTimeout(audioExpiry)
+    audioExpiry = undefined
+    audioLevels.value = [0, 0, 0, 0, 0]
+  }
+  function syncAudioGeneration(payload: { audio_generation?: number }) {
+    if (Number.isInteger(payload.audio_generation) && payload.audio_generation !== audioGeneration) {
+      clearAudioLevels()
+      audioGeneration = payload.audio_generation!
+    }
+  }
+  watch([state, listening, connection], clearAudioLevels, { flush: 'sync' })
   // Server-ordered conversation log.  The rail renders this instead of merging
   // recent inputs with the output projections, so ordering never depends on
   // client-side reconstruction of the chronology.
@@ -95,6 +110,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const activeSpeech = computed(() =>
     playbackQueue.value.find(item => item.state === 'playing') ?? playbackQueue.value[0] ?? null,
   )
+  // playingSpeechId（实际播放标识）：输入仍在聆听或结束判定时，输出也可能正在播放。
+  const playingSpeechId = computed(() => playbackQueue.value.find(item => item.state === 'playing')?.speech_id ?? null)
+  watch(playingSpeechId, clearAudioLevels, { flush: 'sync' })
   const speechProgress = ref<Record<string, unknown> | null>(null)
   const reasoning = ref('')
   const speakPreview = ref<SpeakPreview | null>(null)
@@ -428,6 +446,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function resetConnectionData() {
+    clearAudioLevels()
     clearShadowActivityQueue()
     currentTurnId.value = null
     agentEpisode.value = null
@@ -734,6 +753,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function applyRuntimeSnapshot(payload: RuntimeSnapshotPayload, turnId: string | null) {
+    syncAudioGeneration(payload)
     if (payload.quiet_hours) Object.assign(quietHours, payload.quiet_hours)
     if (isTerminalState(payload.state)) state.value = payload.state
     if (typeof payload.listening === 'boolean') listening.value = payload.listening
@@ -771,6 +791,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function applySessionState(payload: SessionStatePayload, turnId: string | null) {
+    syncAudioGeneration(payload)
     if (isTerminalState(payload.state)) state.value = payload.state
     if (typeof payload.listening === 'boolean') listening.value = payload.listening
     if (typeof payload.can_start === 'boolean') canStart.value = payload.can_start
@@ -852,8 +873,20 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
     if (lastSequence.value !== null && message.seq <= lastSequence.value) return
     lastSequence.value = message.seq
-    lastServerTimestamp.value = message.timestamp
     const payload = isRecord(message.payload) ? message.payload : {}
+    if (message.type === 'audio.levels') {
+      // source（来源）、levels（音量值）、generation（轮代）必须与实际状态一致。
+      const eligible = listening.value && (
+        (state.value === 'LISTENING' && !playingSpeechId.value && payload.source === 'input')
+        || ((playingSpeechId.value !== null || state.value === 'SPEAKING') && payload.source === 'playback'))
+      if (!eligible || payload.generation !== audioGeneration || !Array.isArray(payload.levels)
+        || payload.levels.length !== 5 || !payload.levels.every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1)) return
+      if (audioExpiry !== undefined) clearTimeout(audioExpiry)
+      audioLevels.value = [...payload.levels]
+      audioExpiry = setTimeout(clearAudioLevels, 300)
+      return
+    }
+    lastServerTimestamp.value = message.timestamp
     if (message.type === 'conversation.snapshot') {
       conversationLog.applySnapshot(payload as ConversationSnapshotPayload)
       syncConversation()
@@ -1171,6 +1204,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
   return {
     connection,
+    audioLevels,
     connectionError,
     connectionLabel,
     state,

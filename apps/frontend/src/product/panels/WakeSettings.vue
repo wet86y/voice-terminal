@@ -2,6 +2,7 @@
 import { useProductContext } from "../product-context";
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
 import TimePicker from '../../interface/TimePicker.vue';
+import SilenceTimeoutControl from '../../interface/SilenceTimeoutControl.vue';
 const {
   settings,
   saving,
@@ -20,7 +21,7 @@ const {
 <template>
   <SettingsPageHeader section="wake" />
   <div class="wake-silence-layout">
-    <section class="preference-card">
+    <section class="preference-card wake-preference">
       <header class="preference-heading">
         <span class="preference-index">01</span>
         <div>
@@ -36,7 +37,7 @@ const {
               >开启后本次语音会话持续监听唤醒词；关闭后直接进入语音识别</span
             >
           </div>
-          <input v-model="wakeForm.enabled" type="checkbox" /><i></i
+          <input v-model="wakeForm.enabled" type="checkbox" role="switch" /><i></i
         ></label>
         <div class="form-field">
           <span
@@ -51,6 +52,7 @@ const {
             <input
               v-model="wakeForm.keywords[index]"
               type="text"
+              :aria-label="`唤醒词 ${index + 1}`"
               autocomplete="off"
               :placeholder="index === 0 ? '例如：七三' : '例如：你好七三'"
             /><button
@@ -108,7 +110,7 @@ const {
         </button>
       </footer>
     </section>
-    <section class="preference-card">
+    <section class="preference-card silence-preference">
       <header class="preference-heading">
         <span class="preference-index">02</span>
         <div>
@@ -116,27 +118,7 @@ const {
           <p>长期无有效输入后回到待机</p>
         </div>
       </header>
-      <div class="silence-control">
-        <span>最终静默等待</span>
-        <div>
-          <input
-            v-model.number="silenceSeconds"
-            min="5"
-            max="90"
-            type="number"
-          /><b>秒</b>
-        </div>
-        <input
-          v-model.number="silenceSeconds"
-          min="5"
-          max="90"
-          step="1"
-          type="range"
-        />
-        <div class="silence-scale">
-          <small>5 秒</small><small>默认 30 秒</small><small>90 秒</small>
-        </div>
-      </div>
+      <SilenceTimeoutControl v-model="silenceSeconds" :disabled="saving" />
       <div class="info-callout">
         <span>i</span>
         <p>
@@ -157,7 +139,7 @@ const {
         </button>
       </footer>
     </section>
-    <section class="preference-card">
+    <section class="preference-card quiet-preference">
       <header class="preference-heading">
         <span class="preference-index">03</span>
         <div>
@@ -165,8 +147,7 @@ const {
           <p>按你的作息减少主动发声</p>
         </div>
       </header>
-      <section class="silence-control">
-        <h3>被动静默时间</h3>
+      <div class="settings-stack">
         <strong>{{
           quietStatus?.passive_quiet
             ? "当前处于被动静默"
@@ -178,36 +159,23 @@ const {
           每天按本地时间暂停待机中的主动播报，后台任务继续。通过
           KWS（关键词唤醒）唤醒后可以正常对话。
         </p>
-        <label
-          ><input
-            v-model="quietHoursForm.enabled"
-            type="checkbox"
-            :disabled="!settings.wake.enabled || saving"
-          />启用被动静默</label
-        >
-        <label
-          >每日开始时间
-          <TimePicker v-model="quietHoursForm.start" label="每日开始时间" :disabled="saving"
-        /></label>
-        <label
-          >每日结束时间
-          <TimePicker v-model="quietHoursForm.end" label="每日结束时间" :disabled="saving"
-        /></label>
+        <label class="switch-row"><div><strong>每日被动静默</strong><span>时段内抑制主动发声，保留用户主动交互</span></div><input v-model="quietHoursForm.enabled" type="checkbox" role="switch" :disabled="!settings.wake.enabled || saving" /><i></i></label>
+        <div class="provider-fields"><label><span>开始时间</span><TimePicker v-model="quietHoursForm.start" label="开始时间" :disabled="saving" /></label><label><span>结束时间</span><TimePicker v-model="quietHoursForm.end" label="结束时间" :disabled="saving" /></label></div>
         <p v-if="!settings.wake.enabled">
           请先开启 KWS（关键词唤醒），并在下一次会话使其生效。
         </p>
         <p>
           支持跨午夜；开始时间包含、结束时间不包含。关闭后恢复普通运行，未传达内容由后续交接整理承接。
         </p>
-        <button
+      </div>
+      <footer><button
           class="save-button"
           type="button"
           :disabled="saving || quietHoursForm.start === quietHoursForm.end"
           @click="saveQuietHours"
         >
           保存被动静默设置
-        </button>
-      </section>
+        </button></footer>
     </section>
   </div>
 </template>

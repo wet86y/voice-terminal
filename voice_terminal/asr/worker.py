@@ -275,6 +275,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                             "type": "health",
                             "status": "READY",
                             "model_loaded": engine.model_loaded,
+                            "runtime": "PyTorch（推理框架）" if engine.model_loaded else None,  # runtime（实际加载引擎）。
                             "device": getattr(engine, "device", None),
                             "requested_device": getattr(engine, "requested_device", None),
                             "load_error": getattr(engine, "load_error", None),

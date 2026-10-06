@@ -22,7 +22,8 @@ class AppPaths:
         value = data_dir or os.environ.get("VOICE_DATA_DIR")
         data = (install / value).resolve() if value else None
         if data:
-            development_data = install == program and data.is_relative_to(program) and data.relative_to(program).parts[:1] in [(".runtime",), ("data",)]
+            source_checkout = (program / "apps/desktop/Cargo.toml").is_file()
+            development_data = (install == program or source_checkout) and data.is_relative_to(program) and data.relative_to(program).parts[:1] in [(".runtime",), ("data",)]
             if (data == program or program.is_relative_to(data) or data.is_relative_to(program)) and not development_data:
                 raise ValueError("用户数据目录不能与程序包重叠；源码模式仅允许独立的 data（数据）或 .runtime（本地运行）子目录。")
         return cls(program, install, data)

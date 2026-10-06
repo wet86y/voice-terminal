@@ -26,6 +26,42 @@ function openTerminal(now?: () => number) {
 }
 
 describe('V0.6 session protocol', () => {
+  it('实际播放可与输入结束判定并行，完成后立即清空音量', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('session.state', 1, { state: 'FINALIZING', listening: true, audio_generation: 1 })
+    socket.push('speech.started', 2, { speech_id: 'speech-live', conversation_id: 'episode-live', text: '实际播放', status: 'playing' })
+    socket.push('audio.levels', 3, { source: 'playback', generation: 1, levels: [0.2, 0.4, 0.3, 0.5, 0.6] })
+    expect(terminal.audioLevels.value[4]).toBe(0.6)
+    socket.push('speech.completed', 4, { speech_id: 'speech-live', conversation_id: 'episode-live', status: 'completed', text: '实际播放' })
+    expect(terminal.audioLevels.value).toEqual([0, 0, 0, 0, 0])
+    socket.push('audio.levels', 5, { source: 'playback', generation: 1, levels: [1, 1, 1, 1, 1] })
+    expect(terminal.audioLevels.value).toEqual([0, 0, 0, 0, 0])
+    terminal.dispose()
+  })
+  it('实际音量帧不改变消息缓存，过期、轮代切换、打断及断线立即安静', () => {
+    vi.useFakeTimers()
+    const { socket, terminal } = openTerminal()
+    try {
+      socket.push('session.state', 1, { state: 'LISTENING', listening: true, audio_generation: 5 })
+      const entries = terminal.conversationEntries.value
+      socket.push('audio.levels', 2, { source: 'input', levels: [0.2, 0.4, 0.6, 0.8, 1], generation: 5 })
+      expect(terminal.audioLevels.value[4]).toBe(1)
+      expect(terminal.conversationEntries.value).toBe(entries)
+      vi.advanceTimersByTime(301)
+      expect(terminal.audioLevels.value).toEqual([0, 0, 0, 0, 0])
+      socket.push('audio.levels', 3, { source: 'input', levels: [1, 1, 1, 1, 1], generation: 4 })
+      expect(terminal.audioLevels.value).toEqual([0, 0, 0, 0, 0])
+      socket.push('session.state', 4, { state: 'SPEAKING', listening: true, audio_generation: 6 })
+      socket.push('audio.levels', 5, { source: 'playback', levels: [1, 1, 1, 1, 1], generation: 6 })
+      expect(terminal.audioLevels.value[0]).toBe(1)
+      socket.push('session.state', 6, { state: 'INTERRUPTING', listening: true, audio_generation: 7 })
+      expect(terminal.audioLevels.value).toEqual([0, 0, 0, 0, 0])
+      socket.push('session.state', 7, { state: 'SPEAKING', listening: true, audio_generation: 8 })
+      socket.push('audio.levels', 8, { source: 'playback', levels: [1, 1, 1, 1, 1], generation: 8 })
+      terminal.disconnect()
+      expect(terminal.audioLevels.value).toEqual([0, 0, 0, 0, 0])
+    } finally { terminal.dispose(); vi.useRealTimers() }
+  })
   it('没有 Host WebSocket 地址时拒绝本地默认回退', () => {
     const createSocket = vi.fn(() => new FakeSocket())
     const terminal = useVoiceTerminal({ webSocketFactory: createSocket })

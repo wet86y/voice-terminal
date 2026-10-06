@@ -198,10 +198,13 @@ class ApplicationHost:
         except OSError:
             return False
 
-    async def http(self, url: str, *, action: str | None = None, timeout=3):
+    async def http(self, url: str, *, action: str | None = None, payload: dict | None = None, timeout=3):
         def request():
             headers = {"Authorization": "Bearer " + self.internal_token}
             data = None
+            if payload is not None:
+                data = json.dumps(payload).encode()
+                headers["Content-Type"] = "application/json"
             if action is not None:
                 rows = {c["id"]: c for c in self.state.snapshot()["components"]}
                 data = json.dumps({"action": action,
@@ -236,6 +239,20 @@ class ApplicationHost:
 
     async def voice_control(self, action, *, timeout=190):
         return await self.http(self.state.value["voice_api_url"] + "/internal/application/control", action=action, timeout=timeout)
+
+    def create_wake_task(self, payload: dict) -> dict:
+        """create_wake_task（手动创建任务）：仅由已校验桌面会话的网页线程调用。"""
+        snapshot = self.state.snapshot()
+        if self.loop is None or snapshot.get("stopping") or not snapshot.get("voice_api_url"):
+            raise RuntimeError("语音业务尚未就绪，不能创建任务。")
+        future = asyncio.run_coroutine_threadsafe(self.http(
+            snapshot["voice_api_url"] + "/internal/application/wake-tasks",
+            payload=payload, timeout=20), self.loop)
+        try:
+            return future.result(timeout=22)
+        except TimeoutError:
+            future.cancel()
+            raise RuntimeError("创建结果尚未确认，请先刷新任务列表，避免重复提交。")
 
     async def probe(self, key):
         if key == "asr":
@@ -421,6 +438,7 @@ class ApplicationHost:
         now = time.time()
         unique = {}
         sampled = {}
+        complete = True  # complete（受管进程采样覆盖完整）。
 
         def sample_process(process, identity):
             if identity not in sampled:
@@ -444,6 +462,8 @@ class ApplicationHost:
                 process = psutil.Process(pid)
                 created = process.create_time()
                 if row["created_at"] and abs(created - row["created_at"]) > 2:
+                    if not row["external"]:
+                        complete = False
                     self.state.component(row["id"], memory_rss_bytes=None, memory_private_commit_bytes=None,
                         cpu_percent=None, uptime_seconds=None, sampled_at=now)
                     continue
@@ -462,14 +482,17 @@ class ApplicationHost:
                             child_memory, child_commit, _ = sample_process(child, child_identity)
                             unique[child_identity] = (child_memory, child_commit)
                         except psutil.Error:
-                            pass
+                            complete = False
             except psutil.Error:
+                if not row["external"]:
+                    complete = False
                 self.state.component(row["id"], memory_rss_bytes=None, memory_private_commit_bytes=None,
                     cpu_percent=None, uptime_seconds=None, sampled_at=now)
         commits = [value[1] for value in unique.values()]
         self.state.update(sampled_at=now,
-            total_memory_rss_bytes=sum(value[0] for value in unique.values()) if unique else None,
-            total_memory_private_commit_bytes=sum(commits) if commits and all(value is not None for value in commits) else None)
+            metrics_complete=complete,  # metrics_complete（指标覆盖完整）。
+            total_memory_rss_bytes=sum(value[0] for value in unique.values()) if complete and unique else None,
+            total_memory_private_commit_bytes=sum(commits) if complete and commits and all(value is not None for value in commits) else None)
         self.cpu_samples = {identity: value for identity, value in self.cpu_samples.items() if identity in unique}
 
     async def monitor(self):

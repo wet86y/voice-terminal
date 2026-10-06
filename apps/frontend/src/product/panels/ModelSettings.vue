@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { useProductContext } from "../product-context";
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
+import ModelAccordion from '../../interface/ModelAccordion.vue';
+import ModelAssignmentField from '../../interface/ModelAssignmentField.vue';
+import ModelPoolEntry from '../../interface/ModelPoolEntry.vue';
 const {
   settings,
   providerForm,
@@ -47,6 +50,7 @@ const {
   openApplyDialog,
   selectDiscoveredModel,
 } = useProductContext();
+function originLabel(origin: string) { return origin === 'product_managed' ? '产品托管' : origin === 'local_scan' ? '受管目录扫描' : origin === 'runtime_config' ? '运行时配置导入' : '现有配置导入'; }
 </script>
 <template>
   <SettingsPageHeader section="models">
@@ -71,37 +75,7 @@ const {
     </p>
   </div>
   <div class="model-accordion-list">
-    <section
-      class="model-accordion-card"
-      :class="{ open: expandedModelSections.add }"
-    >
-      <button
-        class="model-accordion-toggle"
-        type="button"
-        :aria-expanded="expandedModelSections.add"
-        @click="toggleModelSection('add')"
-      >
-        <span class="accordion-index">01</span
-        ><span class="accordion-copy"
-          ><strong>添加模型</strong
-          ><small>连接供应商并完成一次最小能力验证</small></span
-        ><span class="accordion-status">{{
-          providerStep === "verified" ? "已验证" : "真实 API 流程"
-        }}</span
-        ><span
-          class="accordion-chevron"
-          :class="{ open: expandedModelSections.add }"
-          >⌄</span
-        ></button
-      ><transition name="model-accordion"
-        ><div v-if="expandedModelSections.add" class="model-card-content">
-          <div class="card-section-heading">
-            <div>
-              <p class="section-label">添加模型</p>
-              <h3>添加 API 供应商连接</h3>
-            </div>
-            <span>自动发现 + 自定义兜底</span>
-          </div>
+    <ModelAccordion v-model:open="expandedModelSections.add" index="01" title="添加模型" :hint="providerStep === 'verified' ? '服务商连接 · 已验证' : '服务商连接'">
           <div class="provider-fields">
             <label
               ><span>连接名称</span
@@ -244,101 +218,16 @@ const {
           >
             验证成功，加入模型池
           </button>
-        </div></transition
-      >
-    </section>
+    </ModelAccordion>
 
-    <section
-      class="model-accordion-card"
-      :class="{ open: expandedModelSections.config }"
-    >
-      <button
-        class="model-accordion-toggle"
-        type="button"
-        :aria-expanded="expandedModelSections.config"
-        @click="toggleModelSection('config')"
-      >
-        <span class="accordion-index">02</span
-        ><span class="accordion-copy"
-          ><strong>模型配置</strong
-          ><small>为各角色选择模型；语音合成沿用已保存的服务配置</small></span
-        ><span class="accordion-status">{{ modelPoolSummary }}</span
-        ><span
-          class="accordion-chevron"
-          :class="{ open: expandedModelSections.config }"
-          >⌄</span
-        ></button
-      ><transition name="model-accordion"
-        ><div v-if="expandedModelSections.config" class="model-card-content">
-          <div class="config-callout">
-            <span class="callout-icon">i</span>
-            <p>
-              主语音模型须支持 off（关闭思考）和 low（低强度）；影子代理使用所选模型支持的思考等级；状态汇报固定关闭思考。应用配置时会确认受影响的服务并按需重启。
-            </p>
+    <ModelAccordion v-model:open="expandedModelSections.config" index="02" title="模型配置" hint="运行角色">
+          <div class="preview-assignment-grid">
+            <ModelAssignmentField v-for="role in llmAssignmentSlots" :key="role" v-model="modelAssignments[role]" :label="roleLabels[role].title" :disabled="restartState === 'restarting'" :hint="modelPolicySummary(selectedModel(role))" :status="modelStatusLabel(selectedModel(role))" :options="[{ value: '', label: '选择一个已验证模型' }, ...availableLlmModels.map(item => ({ value: item.id, label: `${item.provider} · ${item.name}（${item.modelId}）` }))]" />
           </div>
-          <div class="assignment-grid assignment-grid-three">
-            <article
-              v-for="role in llmAssignmentSlots"
-              :key="role"
-              class="assignment-slot"
-            >
-              <div class="slot-heading">
-                <span class="slot-kind">{{ roleLabels[role].kind }}</span
-                ><span class="slot-check">{{
-                  selectedModel(role) ? "✓ 已选择" : "待选择"
-                }}</span>
-              </div>
-              <div class="slot-copy">
-                <h3>{{ roleLabels[role].title }}</h3>
-                <p>{{ roleLabels[role].hint }}</p>
-              </div>
-              <label class="model-select-field"
-                ><span>选择模型</span
-                ><select v-model="modelAssignments[role]" :disabled="restartState === 'restarting'">
-                  <option value="">选择一个已验证模型</option>
-                  <option
-                    v-for="item in availableLlmModels"
-                    :key="item.id"
-                    :value="item.id"
-                  >
-                    {{ item.provider }} · {{ item.name }}（{{ item.modelId }}）
-                  </option>
-                </select></label
-              >
-              <div class="slot-policy">
-                <span>{{ modelPolicySummary(selectedModel(role)) }}</span
-                ><small>{{ modelStatusLabel(selectedModel(role)) }}</small>
-              </div>
-            </article>
-          </div>
-        </div></transition
-      >
-    </section>
+          <div class="info-callout"><span>i</span><p>TTS（语音合成）沿用已保存的在线服务。主语音模型须支持 off（关闭思考）和 low（低强度）；影子代理使用所选模型支持的思考等级；状态汇报固定关闭思考。应用配置时确认受影响的服务并按需重启。</p></div>
+    </ModelAccordion>
 
-    <section
-      class="model-accordion-card"
-      :class="{ open: expandedModelSections.pool }"
-    >
-      <button
-        class="model-accordion-toggle"
-        type="button"
-        :aria-expanded="expandedModelSections.pool"
-        @click="toggleModelSection('pool')"
-      >
-        <span class="accordion-index">03</span
-        ><span class="accordion-copy"
-          ><strong>模型池</strong
-          ><small
-            >编辑产品托管 API 的名称、上下文上限和允许思考等级</small
-          ></span
-        ><span class="accordion-status">{{ modelPoolSummary }}</span
-        ><span
-          class="accordion-chevron"
-          :class="{ open: expandedModelSections.pool }"
-          >⌄</span
-        ></button
-      ><transition name="model-accordion"
-        ><div v-if="expandedModelSections.pool" class="model-card-content">
+    <ModelAccordion v-model:open="expandedModelSections.pool" index="03" title="模型池" :hint="`${apiModelPool.length} 个条目`">
           <div class="pool-intro">
             <div>
               <p class="section-label">模型池</p>
@@ -371,46 +260,8 @@ const {
               v-if="apiModelPool.some((item) => item.capability === 'llm')"
               class="pool-entry-list"
             >
-              <article
-                v-for="item in apiModelPool.filter(
-                  (entry) => entry.capability === 'llm',
-                )"
-                :key="item.id"
-                class="pool-entry"
-                :class="{
-                  editing: editingModelId === item.id,
-                  'delete-pending': deleteCandidateId === item.id,
-                }"
-              >
-                <div class="pool-entry-main">
-                  <span class="provider-badge" :class="providerClass(item)">{{
-                    item.provider.slice(0, 1)
-                  }}</span>
-                  <div class="pool-entry-copy">
-                    <div class="pool-entry-title">
-                      <strong>{{ item.provider }} · {{ item.name }}</strong
-                      ><span class="capability-tag" title="LLM（大语言模型）">语言</span
-                      ><span class="entry-status" :class="item.status">{{
-                        modelStatusLabel(item)
-                      }}</span>
-                    </div>
-                    <span class="pool-entry-id"
-                      >{{ item.modelId }} · {{ item.origin }}</span
-                    >
-                  </div>
-                </div>
-                <div class="pool-entry-policy">
-                  <span
-                    ><small>最大上下文</small
-                    ><strong>{{
-                      formatContext(item.maxContextTokens)
-                    }}</strong></span
-                  ><span
-                    ><small>允许思考</small
-                    ><strong>{{ reasoningSummary(item) }}</strong></span
-                  >
-                </div>
-                <div v-if="isEditableApiModel(item)" class="pool-entry-actions">
+            <ModelPoolEntry v-for="item in apiModelPool.filter(entry => entry.capability === 'llm')" :key="item.id" :class="{ editing: editingModelId === item.id, 'delete-pending': deleteCandidateId === item.id }" :name="item.name" :identifier="item.modelId + '（模型标识） · ' + originLabel(item.origin)" badge="语言" :status="modelStatusLabel(item)" :status-class="item.status" :facts="[{ label: '服务商', value: item.provider }, { label: '用途', value: 'LLM（大语言模型）' }, { label: '上下文容量', value: formatContext(item.maxContextTokens) }, { label: '允许思考', value: reasoningSummary(item) }]">
+                <template #actions><template v-if="isEditableApiModel(item)">
                   <button
                     type="button"
                     @click="
@@ -427,8 +278,7 @@ const {
                   >
                     删除
                   </button>
-                </div>
-                <span v-else class="readonly-tag">运行时导入</span>
+                </template><span v-else class="readonly-tag">运行时导入</span></template>
                 <div v-if="editingModelId === item.id" class="model-edit-panel">
                   <div class="edit-fields">
                     <label
@@ -509,7 +359,7 @@ const {
                     </button>
                   </div>
                 </div>
-              </article>
+            </ModelPoolEntry>
             </div>
             <div v-else class="pool-empty">暂无语言模型条目。</div>
           </section>
@@ -534,45 +384,9 @@ const {
               v-if="apiModelPool.some((item) => item.capability === 'tts')"
               class="pool-entry-list"
             >
-              <article
-                v-for="item in apiModelPool.filter(
-                  (entry) => entry.capability === 'tts',
-                )"
-                :key="item.id"
-                class="pool-entry"
-              >
-                <div class="pool-entry-main">
-                  <span class="provider-badge" :class="providerClass(item)">{{
-                    item.provider.slice(0, 1)
-                  }}</span>
-                  <div class="pool-entry-copy">
-                    <div class="pool-entry-title">
-                      <strong>{{ item.provider }} · {{ item.name }}</strong
-                      ><span class="capability-tag tts-capability" title="TTS（语音合成）">语音</span
-                      ><span class="entry-status" :class="item.status">{{
-                        modelStatusLabel(item)
-                      }}</span>
-                    </div>
-                    <span class="pool-entry-id"
-                      >{{ item.modelId }} · {{ item.origin }}</span
-                    >
-                  </div>
-                </div>
-                <div class="pool-entry-policy tts-policy">
-                  <span><small>用途</small><strong>语音合成</strong></span
-                  ><span
-                    ><small>语音配置</small
-                    ><strong>{{
-                      registry.tts_profiles.find(
-                        (profile) => profile.model_id === item.id,
-                      )?.name || "—"
-                    }}</strong></span
-                  >
-                </div>
-                <span class="readonly-tag">{{
-                  item.origin === "product_managed" ? "产品托管" : "运行时导入"
-                }}</span>
-              </article>
+            <ModelPoolEntry v-for="item in apiModelPool.filter(entry => entry.capability === 'tts')" :key="item.id" :name="item.name" :identifier="item.modelId + '（模型标识） · ' + originLabel(item.origin)" badge="语音" :status="modelStatusLabel(item)" :status-class="item.status" :facts="[{ label: '服务商', value: item.provider }, { label: '用途', value: 'TTS（语音合成）' }, { label: '语音配置', value: registry.tts_profiles.find(profile => profile.model_id === item.id)?.name || '未提供' }]">
+              <template #actions><span class="readonly-tag">{{ item.origin === 'product_managed' ? '产品托管' : '运行时导入' }}</span></template>
+            </ModelPoolEntry>
             </div>
             <div v-else class="pool-empty">暂无语音合成模型条目。</div>
           </section>
@@ -632,9 +446,7 @@ const {
               </article>
             </div>
           </details>
-        </div></transition
-      >
-    </section>
+    </ModelAccordion>
   </div>
   <footer class="model-settings-footer">
     <div class="restart-copy">
