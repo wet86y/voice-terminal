@@ -26,6 +26,7 @@ import {
   type ReasoningMode,
 } from "./demo-data";
 import { voiceShadowReplayDemo } from './voice-shadow-replay'
+import { useVoiceSessionDemo } from './useVoiceSessionDemo'
 
 // URL（页面地址）只记录展示选择，方便刷新和热更新后继续查看同一画面。
 const query = new URLSearchParams(window.location.search);
@@ -39,9 +40,9 @@ function validChoice<T extends string>(
 ): T {
   return values.includes(value as T) ? (value as T) : fallback;
 }
-// 旧 silence（静默页）地址继续打开合并页，避免已有预览书签失效。
+// 旧 silence（静默页）与 system（系统页）地址继续打开对应合并页。
 const requestedPage =
-  query.get("page") === "silence" ? "wake" : query.get("page");
+  query.get("page") === "silence" ? "wake" : query.get("page") === "system" ? "compute" : query.get("page");
 const page = ref<PreviewPage>(
   validChoice(
     requestedPage,
@@ -63,6 +64,7 @@ const runtimeState = ref<DemoRuntimeState>(
     replayMode.value ? 'speaking' : 'standby',
   ),
 );
+const voiceSession = useVoiceSessionDemo(runtimeState, query.get('session') === 'active');
 const overlay = ref<PreviewOverlay>(
   validChoice(
     query.get("overlay"),
@@ -124,12 +126,14 @@ const layoutScene = computed(() =>
       : "当前内容读取失败，可以重试。",
 );
 
-watch([page, scene, runtimeState, overlay, replayMode], () => {
+watch([page, scene, runtimeState, overlay, replayMode, voiceSession.active], () => {
   const url = new URL(window.location.href);
   url.searchParams.set("page", page.value);
   url.searchParams.set("scene", scene.value);
   url.searchParams.set("runtime", runtimeState.value);
   url.searchParams.set("overlay", overlay.value);
+  if (voiceSession.active.value) url.searchParams.set('session', 'active');
+  else url.searchParams.delete('session');
   if (replayMode.value) url.searchParams.set("replay", "voice-shadow");
   else url.searchParams.delete("replay");
   window.history.replaceState(null, "", url);
@@ -150,6 +154,7 @@ function showConfirm(purpose: "apply" | "exit") {
   overlay.value = "confirm";
 }
 function resetPreview() {
+  voiceSession.stop();
   replayMode.value = false;
   page.value = "home";
   scene.value = "normal";
@@ -159,36 +164,54 @@ function resetPreview() {
   closeOverlays();
   resetKey.value += 1;
 }
+function toggleVoiceSession() {
+  if (replayMode.value || scene.value === 'loading') return;
+  if (voiceSession.active.value) voiceSession.stop();
+  else voiceSession.start();
+}
 function handleEscape(event: KeyboardEvent) {
   if (event.key === "Escape") closeOverlays();
 }
 onMounted(() => window.addEventListener("keydown", handleEscape));
 onBeforeUnmount(() => window.removeEventListener("keydown", handleEscape));
 
+// conversationModel（会话条目）、traceModel（活动条目）不随音量帧重建，避免动效期间反复滚动列表。
+const conversationModel = computed<WorkbenchModel['conversation']>(() => messages.value.map((item) => ({
+  key: item.id,
+  role: item.role,
+  text: item.text,
+  time: item.time,
+  status: item.role === "assistant" ? replayMode.value ? '固定日志回放' : "已完成播报" : "已完成识别",
+  speaking: item.role === "assistant" && effectiveRuntimeState.value === "speaking"
+    && (!replayMode.value || item.id === replaySpeakingMessageId.value),
+})));
+const traceModel = computed<WorkbenchModel['shadow']['trace']>(() => activities.value.map((item) => ({
+  key: item.id,
+  title: item.label,
+  text: scene.value === "long" ? longIdentifier : item.text,
+  status: item.state === "active" ? "处理中" : item.state === 'failed' ? '失败' : "已完成",
+  time: "刚刚",
+})));
 const workbenchModel = computed<WorkbenchModel>(() => ({
   state: effectiveRuntimeState.value,
+  sessionActive: replayMode.value || voiceSession.active.value,
+  audioLevels: replayMode.value || effectiveRuntimeState.value === 'error' ? [] : voiceSession.audioLevels.value,
   title: currentRuntime.value.label,
   description: currentRuntime.value.description,
-  action: replayMode.value ? '日志回放 · 只读' : ["listening", "thinking", "speaking"].includes(effectiveRuntimeState.value)
+  action: replayMode.value ? '日志回放 · 只读' : voiceSession.active.value
     ? "停止当前会话"
     : "开始语音会话",
   disabled: replayMode.value || scene.value === "loading",
   modeDisabled: replayMode.value,
-  canReset: !replayMode.value && effectiveRuntimeState.value === "standby",
+  canReset: !replayMode.value && !voiceSession.active.value && effectiveRuntimeState.value === "standby",
   mode: reasoningMode.value,
-  latency: replayMode.value && effectiveRuntimeState.value === "speaking" ? voiceShadowReplayDemo.latency : currentRuntime.value.latency,
-  latencyPending: effectiveRuntimeState.value === "thinking",
+  latency: replayMode.value ? voiceShadowReplayDemo.latency : voiceSession.active.value
+    ? voiceSession.latencyMs.value === null ? '—' : `${voiceSession.latencyMs.value} ms`
+    : currentRuntime.value.latency,
+  latencyPending: !replayMode.value && voiceSession.latencyPending.value,
   voiceModel: "DeepSeek Flash",
   shadowModel: replayMode.value ? '历史活动回放' : "代理宿主管理",
-  conversation: messages.value.map((item) => ({
-    key: item.id,
-    role: item.role,
-    text: item.text,
-    time: item.time,
-    status: item.role === "assistant" ? replayMode.value ? '固定日志回放' : "已完成播报" : "已完成识别",
-    speaking: item.role === "assistant" && effectiveRuntimeState.value === "speaking"
-      && (!replayMode.value || item.id === replaySpeakingMessageId.value),
-  })),
+  conversation: conversationModel.value,
   partial: effectiveRuntimeState.value === "listening" ? "我想整理一下今天的安排…" : "",
   thinking: effectiveRuntimeState.value === "thinking",
   conversationHint: replayMode.value ? '日志回放 · 只读固定样例' : effectiveRuntimeState.value === "standby" ? "等待你的语音" : "本地语音交互",
@@ -205,46 +228,34 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
     focus: replayMode.value ? '根据本地记录查看对话与影子活动，不会连接真实服务。' : scene.value === "long" ? longText : "正在整理待确认事项与依赖关系。",
     context: replayMode.value ? voiceShadowReplayDemo.context : "86K / 256K",
     cache: replayMode.value ? voiceShadowReplayDemo.cache : "76%",
-    trace: activities.value.map((item) => ({
-      key: item.id,
-      title: item.label,
-      text: scene.value === "long" ? longIdentifier : item.text,
-      status: item.state === "active" ? "处理中" : item.state === 'failed' ? '失败' : "已完成",
-      time: "刚刚",
-    })),
+    trace: traceModel.value,
     event: replayMode.value ? '本机固定日志样例，无业务连接。' : scene.value === "empty" ? "" : "已识别时间偏好，等待下一步确认。",
   },
 }));
 </script>
 <template>
   <AppFrame
-    :page="page === 'home' ? 'home' : 'settings'"
     :runtime="effectiveRuntimeState"
-    :status="replayMode ? '日志回放 · 固定样例' : '视觉展示 · 固定样例'"
     preview
-    console-enabled
-    @page="page = $event === 'home' ? 'home' : page === 'home' ? 'wake' : page"
-    @console="notify('控制台入口')"
   >
     <Workbench
       v-show="page === 'home'"
       :model="workbenchModel"
-      @action="
-        notify('语音会话操作');
-        runtimeState = runtimeState === 'standby' ? 'listening' : 'standby';
-      "
+      console-enabled
+      @settings="page = 'wake'"
+      @console="notify('控制台入口')"
+      @action="toggleVoiceSession"
       @reset="notify('会话已重置')"
       @mode="reasoningMode = $event"
       @expand="shadowExpanded = !shadowExpanded"
-      @models="page = 'models'"
     />
     <SettingsFrame
       v-show="page !== 'home'"
       :section="page"
-      status="展示样例"
+      @back="page = 'home'"
       @section="page = $event"
       ><div
-        v-if="scene === 'loading' || scene === 'error'"
+        v-if="page !== 'compute' && (scene === 'loading' || scene === 'error')"
         class="info-callout"
         :role="scene === 'error' ? 'alert' : 'status'"
       >
@@ -345,11 +356,11 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
             <button
               type="button"
               @click="
-                page = 'system';
+                page = 'compute';
                 overlay = 'none';
               "
             >
-              查看系统运行</button
+              查看本地组件</button
             ><button
               type="button"
               @click="
@@ -394,7 +405,7 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
           </select></label
         ><label
           ><span>运行状态</span
-          ><select v-model="runtimeState">
+          ><select v-model="runtimeState" @change="voiceSession.selectState(runtimeState)">
             <option
               v-for="choice in stateChoices"
               :key="choice.value"

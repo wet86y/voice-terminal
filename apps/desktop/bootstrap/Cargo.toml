@@ -13,3 +13,6 @@ path = "src/ui_demo.rs"
 
 [dependencies]
 voice-desktop-common = { path = "../common" }
+
+[build-dependencies]
+embed-resource = "3"

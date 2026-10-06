@@ -80,6 +80,19 @@ afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
+  it('将固定间隔任务改为单次时清除间隔，每周任务保存所选星期与原有秒数', async () => {
+    const { value } = liveAdapter()
+    allowBusinessReady(value)
+    const update = vi.spyOn(productApi, 'updateWakeTask').mockResolvedValue({} as never)
+    value.editWakeTask({ task_id: 'task-existing', target: 'voice_llm', status: 'pending', when: '2026-10-12T18:00:00+08:00', text: '原有任务', repeat: '1d', rule_kind: 'every' } as never)
+    value.wakeTaskDraft.ruleKind = 'at'
+    await value.saveWakeTask()
+    expect(update).toHaveBeenLastCalledWith('task-existing', expect.objectContaining({ repeat: '' }))
+    value.editWakeTask({ task_id: 'task-weekly', target: 'voice_llm', status: 'pending', when: '2026-10-12T18:00:00+08:00', text: '每周检查', repeat: null, rule_kind: 'weekly', rule: { time: '18:00:30', weekdays: [1, 3], timeZone: 'Asia/Hong_Kong' } } as never)
+    await value.saveWakeTask()
+    expect(update).toHaveBeenLastCalledWith('task-weekly', expect.objectContaining({ change: { weekly: { time: '18:00:30', time_zone: 'Asia/Hong_Kong', weekdays: [1, 3] } } }))
+  })
+
   it('桌面控制台取得登录地址后由原生 open_console（打开控制台）处理', async () => {
     const launch = deferred<{ url: string }>()
     const openConsole = vi.fn().mockResolvedValue(undefined)
@@ -190,11 +203,11 @@ describe('正式界面的真实控件交互', () => {
     const start = vi.spyOn(value.voice, 'toggleListening')
     expect(value.workbenchModel.value.state).toBe('error')
     expect(value.workbenchModel.value.description).toBe('在线模型未配置')
-    expect(value.workbenchModel.value.action).toBe('查看系统运行')
+    expect(value.workbenchModel.value.action).toBe('查看本地组件')
     value.runtimeAction()
-    expect(value.activeSettingsTab.value).toBe('system'); expect(start).not.toHaveBeenCalled()
+    expect(value.activeSettingsTab.value).toBe('compute'); expect(start).not.toHaveBeenCalled()
   })
-  it('七项导航都有页面，切换后保留根层持有的唤醒词草稿', async () => {
+  it('合并后的导航都有页面，切换后保留根层持有的唤醒词草稿', async () => {
     const wrapper = render(ProductApp)
     await button(wrapper, '设置').trigger('click')
     await wrapper.find('.wake-keyword-row input').setValue('你好，新助手')
@@ -374,13 +387,21 @@ describe('共享呈现与展示隔离', () => {
     }
     expect(request).not.toHaveBeenCalled()
   })
-  it('工作台保留顺序、交付与合成模型，离线模式停用', async () => {
+  it('工作台保留会话顺序与交付，移除模型摘要且离线模式停用', async () => {
     const model: WorkbenchModel = { state:'offline',title:'离线',description:'等待连接',action:'重试',mode:'fast',modeDisabled:true,latency:'—',voiceModel:'语音模型',shadowModel:'协作模型',ttsModel:'合成模型',conversationHint:'等待',conversation:[{key:'server-2',role:'assistant',text:'第二条',status:'已打断',time:'现在',delivered:'已听到前半句'},{key:'server-3',role:'user',text:'第三条',status:'已完成',time:'现在'}],shadow:{title:'待机',status:'待机',expanded:false,context:'—',cache:'—',trace:[]} }
     const wrapper = render(Workbench, {props:{model}})
     expect(wrapper.findAll('.message').map(item=>item.text())).toEqual([expect.stringContaining('第二条'),expect.stringContaining('第三条')])
-    expect(wrapper.text()).toContain('已听到前半句'); expect(wrapper.text()).toContain('合成模型'); expect(wrapper.text()).toContain('High（高强度）')
+    expect(wrapper.text()).toContain('已听到前半句')
+    expect(wrapper.find('.model-summary').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('合成模型'); expect(wrapper.text()).not.toContain('High（高强度）')
     expect(wrapper.findAll('.mode-options button').every(item=>item.attributes('disabled') !== undefined)).toBe(true)
-    await wrapper.find('.model-summary').trigger('click'); expect(wrapper.emitted('models')).toHaveLength(1)
+    const consoleButton = wrapper.get('.shadow-panel-footer .console-button')
+    expect(consoleButton.attributes('disabled')).toBeDefined()
+    await consoleButton.trigger('click'); expect(wrapper.emitted('console')).toBeUndefined()
+    await wrapper.setProps({ consoleEnabled: true })
+    await consoleButton.trigger('click'); expect(wrapper.emitted('console')).toHaveLength(1)
+    await wrapper.get('.conversation-column .workbench-settings-button').trigger('click')
+    expect(wrapper.emitted('settings')).toHaveLength(1)
   })
   it('确认对话框在应用期间不允许 Escape（退出键）关闭', async () => {
     const wrapper = render(UiDialog, {props:{open:true,title:'确认',busy:true}})

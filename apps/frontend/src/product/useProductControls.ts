@@ -29,17 +29,17 @@ export function useProductControls() {
       adapter.settingsTab.value = "wake";
     }
     if (
-      new URLSearchParams(window.location.search).get("settings") === "system"
+      ['system', 'compute'].includes(query.get('settings') ?? query.get('page') ?? '')
     ) {
       applicationHost.inspect();
       adapter.page.value = "settings";
-      adapter.settingsTab.value = "system";
+      adapter.settingsTab.value = "compute";
     }
   });
   onBeforeUnmount(applicationHost.stop);
   function showApplicationSystem() {
     adapter.page.value = "settings";
-    adapter.settingsTab.value = "system";
+    adapter.settingsTab.value = "compute";
   }
   const {
     voice,
@@ -154,23 +154,23 @@ export function useProductControls() {
     },
     {
       id: "voice_vad",
-      title: "Voice Server FSMN-VAD（语音活动检测）",
+      title: "FSMN-VAD（语音活动检测）",
       detail: "实时语音输入与分段检测。",
     },
     {
       id: "kws",
       title: "KWS（关键字唤醒）",
-      detail: "Sherpa-ONNX 关键字唤醒模型。",
+      detail: "Sherpa-ONNX（唤醒引擎）关键字唤醒模型。",
     },
     {
       id: "smart_turn",
       title: "SmartTurn（语音结束判断）",
-      detail: "ONNX Runtime 语音轮次结束分类。",
+      detail: "ONNX Runtime（推理引擎）语音轮次结束分类。",
     },
     {
       id: "wespeaker",
       title: "WeSpeaker（声纹识别）",
-      detail: "本地 ONNX 声纹向量提取。",
+      detail: "本地 ONNX（推理引擎）声纹向量提取。",
     },
   ] as const;
   function formatComputeBytes(value: number | null | undefined) {
@@ -187,7 +187,7 @@ export function useProductControls() {
   }
   function deviceLabel(value: string | null | undefined) {
     if (value === "cpu") return "CPU（中央处理器）";
-    if (value?.startsWith("cuda")) return "GPU（CUDA）";
+    if (value?.startsWith("cuda")) return "GPU（图形处理器）";
     return "未运行";
   }
   function requestedDeviceLabel(value: string | null | undefined) {
@@ -374,7 +374,7 @@ export function useProductControls() {
   const runtimeMeta = computed(() => {
     if (coreUnavailable.value) return {
       label: "需要检查",
-      description: applicationSnapshot.value?.components.find(component => component.id === 'voice')?.error || "语音能力尚未就绪，可以先配置模型或查看系统运行。",
+      description: applicationSnapshot.value?.components.find(component => component.id === 'voice')?.error || "语音能力尚未就绪，可以先配置模型或查看本地组件。",
       chip: "ERROR（不可用）",
       timestamp: "本机接口已连接",
     };
@@ -1464,10 +1464,11 @@ export function useProductControls() {
       });
     return {
       state: runtimeState.value,
+      sessionActive: connected.value && listening.value, // sessionActive（真实会话开关）：等待唤醒时仍保持会话布局。
       title: runtimeMeta.value.label,
       description: runtimeMeta.value.description,
       action: coreUnavailable.value
-        ? "查看系统运行"
+        ? "查看本地组件"
         : connected.value
           ? listening.value
             ? "停止当前会话"

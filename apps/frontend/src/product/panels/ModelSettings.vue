@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useProductContext } from "../product-context";
+import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
 const {
   settings,
   providerForm,
@@ -48,23 +49,20 @@ const {
 } = useProductContext();
 </script>
 <template>
-  <header class="model-header">
-    <div>
-      <p class="panel-kicker">模型管理</p>
-      <h2>为每个角色选择合适的模型</h2>
-      <p>连接服务、验证模型，再分配给语音与协作角色。</p>
-    </div>
-    <button
-      class="outline-button"
-      type="button"
-      :disabled="modelScanState === 'scanning'"
-      @click="scanModels"
-    >
-      {{
-        modelScanState === "scanning" ? "正在扫描…" : "扫描现有配置与受管目录"
-      }}
-    </button>
-  </header>
+  <SettingsPageHeader section="models">
+    <template #actions>
+      <button
+        class="outline-button"
+        type="button"
+        :disabled="modelScanState === 'scanning'"
+        @click="scanModels"
+      >
+        {{
+          modelScanState === "scanning" ? "正在扫描…" : "扫描现有配置与受管目录"
+        }}
+      </button>
+    </template>
+  </SettingsPageHeader>
   <div class="model-safety">
     <span>✓</span>
     <p>

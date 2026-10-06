@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { useProductContext } from "../product-context";
+import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
+import WakeTaskSchedule from '../../interface/WakeTaskSchedule.vue';
 const {
   settings,
   saving,
@@ -14,28 +16,19 @@ const {
 } = useProductContext();
 </script>
 <template>
-  <header>
-    <p class="panel-kicker">项目级唤醒</p>
-    <h2>定时唤醒任务</h2>
-    <p>
-      任意 DSH（影子代理宿主）会话都可创建任务；DSH
-      插件统一保存和调度，到期投递至当前语音关联会话。冻结的参考上下文供模型按需读取。
-    </p>
-  </header>
+  <SettingsPageHeader section="wakes" />
   <div class="settings-stack">
-    <div class="speaker-card-heading">
-      <div>
-        <span class="section-label">定时任务</span>
-        <p>
+    <p class="instruction-hint">
+      任意 DSH（影子代理宿主）会话都可创建任务；DSH（影子代理宿主）插件统一保存和调度，到期投递至当前语音关联会话。冻结的参考上下文供模型按需读取。
+    </p>
+    <div class="wake-task-toolbar">
+        <span>
           待执行
           {{ wakeTasks.filter((task) => task.status === "pending").length }} 项
           · 已归档
           {{ wakeTasks.filter((task) => task.status === "archived").length }} 项
-        </p>
-      </div>
-      <button class="ghost-action" type="button" @click="refreshWakeTasks">
-        刷新
-      </button>
+        </span>
+      <div class="wake-task-toolbar-actions"><button class="outline-button wake-task-button" type="button" :disabled="saving" @click="refreshWakeTasks"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 6.1a8 8 0 0 1 13 3M4.9 14.9a8 8 0 0 0 13 3" /></svg>刷新</button></div>
     </div>
     <div v-if="wakeTasks.length" class="wake-task-list">
       <article
@@ -81,7 +74,10 @@ const {
           <div class="pool-entry-actions">
             <button
               v-if="task.status === 'pending'"
+              class="outline-button wake-task-button"
               type="button"
+              :aria-expanded="editingWakeTaskId === task.task_id"
+              :disabled="saving"
               @click="
                 editingWakeTaskId === task.task_id
                   ? (editingWakeTaskId = '')
@@ -91,66 +87,24 @@ const {
               {{ editingWakeTaskId === task.task_id ? "收起" : "修改" }}</button
             ><button
               v-if="task.status === 'pending'"
-              class="danger-action"
+              class="outline-button wake-task-button danger-action"
               type="button"
+              :disabled="saving"
               @click="removeWakeTask(task)"
             >
-              取消
+              取消任务
             </button>
           </div>
         </div>
-        <div v-if="editingWakeTaskId === task.task_id" class="model-edit-panel">
-          <div class="provider-fields">
-            <label
-              v-if="
-                !['daily', 'weekly', 'cron'].includes(wakeTaskDraft.ruleKind)
-              "
-              ><span>触发时间（项目本地时间）</span
-              ><input
-                v-model="wakeTaskDraft.when"
-                type="datetime-local" /></label
-            ><label
-              v-if="
-                !['daily', 'weekly', 'cron'].includes(wakeTaskDraft.ruleKind)
-              "
-              ><span>固定重复间隔</span
-              ><input
-                v-model="wakeTaskDraft.repeat"
-                placeholder="留空表示一次性，例如 1h、1d"
-                type="text" /></label
-            ><label
-              v-if="
-                ['daily', 'weekly', 'cron'].includes(wakeTaskDraft.ruleKind)
-              "
-              ><span>{{
-                wakeTaskDraft.ruleKind === "cron"
-                  ? "Cron（定时表达式）"
-                  : "本地时间 HH:mm:ss"
-              }}</span
-              ><input v-model="wakeTaskDraft.ruleText" type="text" /></label
-            ><label
-              v-if="
-                ['daily', 'weekly', 'cron'].includes(wakeTaskDraft.ruleKind)
-              "
-              ><span>时区</span
-              ><input v-model="wakeTaskDraft.timeZone" type="text" /></label
-            ><label v-if="wakeTaskDraft.ruleKind === 'weekly'"
-              ><span>星期（1 至 7，逗号分隔）</span
-              ><input v-model="wakeTaskDraft.weekdays" type="text" /></label
-            ><label class="wake-task-text-field"
-              ><span>任务说明</span
-              ><textarea
-                v-model="wakeTaskDraft.text"
-                maxlength="500"
-                rows="3"
-              ></textarea>
-            </label>
-          </div>
-          <div class="edit-panel-footer">
-            <span>冻结参考上下文保持不变。</span>
-            <div>
+        <div v-if="editingWakeTaskId === task.task_id" class="model-edit-panel wake-task-editor">
+          <WakeTaskSchedule v-model:rule-kind="wakeTaskDraft.ruleKind" v-model:when="wakeTaskDraft.when" v-model:time="wakeTaskDraft.ruleText" v-model:weekdays="wakeTaskDraft.weekdays" :disabled="saving" advanced>
+            <template #cron><label class="form-field"><span>定时表达式</span><input v-model="wakeTaskDraft.ruleText" type="text" :disabled="saving" /></label></template>
+            <template #interval><label class="form-field task-interval-field"><span>固定重复间隔</span><input v-model="wakeTaskDraft.repeat" placeholder="例如 1h（1 小时）、1d（1 天）" type="text" :disabled="saving" /></label></template>
+          </WakeTaskSchedule>
+          <label class="form-field wake-task-text-field"><span>任务说明</span><textarea v-model="wakeTaskDraft.text" maxlength="500" rows="2" :disabled="saving"></textarea></label>
+          <div class="wake-task-editor-actions">
               <button
-                class="ghost-action"
+                class="outline-button wake-task-button"
                 type="button"
                 @click="editingWakeTaskId = ''"
               >
@@ -163,13 +117,14 @@ const {
                   !wakeTaskDraft.text.trim() ||
                   (['daily', 'weekly', 'cron'].includes(wakeTaskDraft.ruleKind)
                     ? !wakeTaskDraft.ruleText.trim()
-                    : !wakeTaskDraft.when)
+                    : !wakeTaskDraft.when) ||
+                  (wakeTaskDraft.ruleKind === 'weekly' && !wakeTaskDraft.weekdays) ||
+                  (wakeTaskDraft.ruleKind === 'every' && !wakeTaskDraft.repeat)
                 "
                 @click="saveWakeTask"
               >
                 保存修改
               </button>
-            </div>
           </div>
         </div>
       </article>

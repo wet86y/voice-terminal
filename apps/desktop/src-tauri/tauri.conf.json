@@ -5,5 +5,5 @@
   "identifier": "com.voiceterminal.desktop",
   "build": { "frontendDist": "../boot" },
   "app": { "windows": [], "withGlobalTauri": true, "security": { "capabilities": ["boot"] } },
-  "bundle": { "active": false }
+  "bundle": { "active": false, "icon": ["icons/icon.ico", "icons/icon.png"] }
 }
