@@ -109,7 +109,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         self.vad: FsmnVadDetector | None = None
         self.asr: AsrWorkerClient | None = None
         self.llm: DeepSeekClient | None = None
-        project_root = runtime_data_dir.resolve().parent if runtime_data_dir else Path(__file__).resolve().parents[2]
+        project_root = runtime_data_dir.resolve().parent if runtime_data_dir else next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
         self._project_root = project_root
         self.paths = config.paths if config.paths and config.paths.separated else AppPaths(project_root, project_root)
         from ..resources import ResourcePolicy

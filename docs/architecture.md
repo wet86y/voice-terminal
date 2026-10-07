@@ -4,8 +4,8 @@
 
 Tauri 2（桌面框架）拥有窗口、托盘、单实例与 Python（后端运行环境）服务管理进程。应用宿主直接管理语音识别、分析和语音服务，委托语音服务管理 DSH（代理执行宿主）与声纹工作进程；每个进程只有一个直接生命周期所有者。关闭桌面窗口隐藏到托盘，明确退出应用回收整棵受管进程树。主产品与源码界面调试只支持桌面入口，独立样例由原生宿主管理其开发服务。启动反馈和进程状态契约见[独立应用启动与系统管理](application-lifecycle.md)，便携路径与数据边界见[桌面应用说明](desktop-application.md)。
 
-语音当前会话始终持久化到用户历史目录的 `archives/.journals/active-session.sqlite3`（当前会话数据库）；源码布局使用
-`.runtime/continuity/`（历史数据目录），便携布局使用独立数据目录的 `history/`（历史目录）。启动先恢复会话身份、日期基准、
+语音当前会话始终持久化到用户历史目录的 `archives/.journals/active-session.sqlite3`（当前会话数据库）；正式和源码布局共用
+`.local/data/history/`（唯一历史数据目录）。启动先恢复会话身份、日期基准、
 模型语义历史、已播出回复、转写精修、聊天顺序和后台上下文代次，再创建业务组件。仅保存旧身份文件不足以恢复聊天。
 聊天列表继续保留最近 200 条，完整模型历史及交付归档按原顺序保存在数据库，有界读取缓存不会截断正文。
 当前会话持久化不依赖 `disk_history`（其他历史落盘候选开关）。检查点与待写正文在同一数据库事务提交，损坏或缺失时报告恢复失败，
@@ -17,7 +17,7 @@ Tauri 2（桌面框架）拥有窗口、托盘、单实例与 Python（后端运
 
 ```mermaid
 flowchart TD
-    R[根启动入口：解析启用组合，启动后退出] --> T[Tauri 桌面：窗口、托盘、单实例]
+    R[根启动入口：读取唯一便携配置，启动后退出] --> T[Tauri 桌面：窗口、托盘、单实例]
     T --> A[Python 应用宿主：网页服务、管理接口、业务监督]
     T --> W[网页渲染进程：正式页面]
     A --> B[语音识别工作进程]
@@ -173,7 +173,7 @@ none → kws standby → asr active → kws standby → none
 - Shadow 摘要和运行轨迹只消费服务端的 `shadow.product` 权威快照与 `shadow.activity` 增量；
   增量按 `run_seq + item_id` 合并，重连先应用快照再应用 WebSocket `seq` 有序增量。前端不得
   从 status 文本推断任务终态，也不得把 status observer 摘要伪装成 `result`。
-- 工作台“运行轨迹”使用固定单槽，只显示当前 DSH（代理执行宿主）根代理的最新思考块或工具动作；新动作覆盖当前项，同一思考块累加增量，空闲及运行结束时清空。卡片保持既有高度、字号与颜色变量，长正文内部滚动并跟随最新增量。内部回调、迟到事件拒收和重连规则见[桥接实时活动协议](bridge-2.0-protocol.md)，构建及项目安装结果见[插件维护记录](dsh-plugin-maintenance.md#2026-10-07-实时运行轨迹协议修订与构建)。
+- 工作台“运行轨迹”使用固定单槽，只显示当前 DSH（代理执行宿主）根代理的最新思考块或工具动作；新动作覆盖当前项，同一思考块累加增量，空闲及运行结束时清空。卡片保持既有高度、字号与颜色变量，长正文内部滚动并跟随最新增量。内部回调、迟到事件拒收和重连规则见[桥接实时活动协议](bridge-2.0-protocol.md)，构建及项目安装结果见[插件维护记录](dsh-plugin-maintenance.md#2026-10-07-实时运行轨迹协议修订与构建历史记录)。
 
 ## 主要代码归属
 
@@ -205,4 +205,4 @@ none → kws standby → asr active → kws standby → none
 | Shadow | `ShadowRuntime` 是单一运行实例；`projection.py` 共享只读上下文与状态观察投影，`tool_loop.py` 实现工具调用、结果入账与事件发布，供原生 Shadow 和 DSH 桥接使用。 |
 | 前端 | `voiceTerminalProjection.ts` 负责服务端消息解析和快照投影，`normalization.ts` 负责产品设置与模型列表归一化；两处重复的 `isRecord`（对象类型收窄函数）已统一到 `record.ts`。语音与 Shadow 的上下文投影语义不同，不能合并。 |
 | DSH | `protocol.ts` 负责桥接协议校验、鉴权和响应；`index.ts` 继续负责会话绑定、观察者和工具注册。 |
-| 本地 TTS | CosyVoice（本地语音合成）实现与脚本归档到 `archive/cosyvoice/`，当前产品仅实例化 MiniMax 在线客户端；`tts/router.py` 保留未来接入本地后端的事务兼容层。历史本地设置继续归一化为在线模式，旧 `tts_worker` 状态字段固定报告 `stopped`（已停止）。 |
+| 本地 TTS | CosyVoice（本地语音合成）实现与脚本归档到 Git（版本控制）的已退休本地语音历史，当前产品仅实例化 MiniMax 在线客户端；`tts/router.py` 保留未来接入本地后端的事务兼容层。历史本地设置继续归一化为在线模式，旧 `tts_worker` 状态字段固定报告 `stopped`（已停止）。 |

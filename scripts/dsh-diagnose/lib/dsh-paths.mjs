@@ -6,19 +6,24 @@
  * The decoder is imported from the pinned DSH build so every script reads logs
  * exactly the way the running host does.
  */
-import { readdirSync, readFileSync } from 'node:fs'
+import { readdirSync, readFileSync, existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { zstdDecompressSync } from 'node:zlib'
 
 /** Repository root, derived from this module's location (`scripts/dsh-diagnose/lib/`). */
-export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
-
-/** Project DSH runtime root (`.runtime/dsh`). */
-export const DSH_ROOT = join(REPO_ROOT, '.runtime', 'dsh')
-
-/** Project DSH data directory (`DSH_HOME`). */
-export const DSH_HOME = join(DSH_ROOT, 'home')
+let located = dirname(fileURLToPath(import.meta.url))
+while (!existsSync(join(located, 'pyproject.toml'))) {
+  const parent = dirname(located)
+  if (parent === located) throw new Error('无法定位工程根目录')
+  located = parent
+}
+export const REPO_ROOT = located
+const install = join(REPO_ROOT, '.local') // install（本机安装上下文）。
+const selection = JSON.parse(readFileSync(join(install, 'portable.json'), 'utf8'))
+if (selection.schema !== 2) throw new Error('需要第二版便携配置')
+export const DSH_ROOT = join(install, selection.dsh) // DSH_ROOT（生产宿主目录）。
+export const DSH_HOME = join(install, selection.data_dir, 'dsh') // DSH_HOME（唯一持久代理状态）。
 
 /** Stored session transcripts root. */
 export const SESSIONS_ROOT = join(DSH_HOME, 'sessions')
@@ -30,13 +35,13 @@ export const PROJ_CACHE_DIR = join(DSH_HOME, 'storages', 'session_projcache', 's
 export const WORKSPACE_STORE = join(DSH_HOME, 'storages', 'workspace.json')
 
 /** Voice↔DSH session binding store. */
-export const SESSION_MAPPINGS = join(DSH_ROOT, 'session-mappings.json')
+export const SESSION_MAPPINGS = join(DSH_HOME, 'session-mappings.json')
 
 /** Project DSH build audit file. */
-export const BUILD_STATE = join(DSH_ROOT, 'build-state.json')
+export const BUILD_STATE = join(install, 'app/release.json')
 
 // 单一安装产物；组件别名只用于兼容现有诊断调用。
-export const PLUGIN_BUNDLE = join(DSH_ROOT, 'bundles', 'voice-terminal')
+export const PLUGIN_BUNDLE = join(install, 'app/config/dsh/profile/node_modules/@voice-terminal/dsh-plugin')
 export const PLUGIN_SOURCE = join(REPO_ROOT, 'integrations', 'dsh', 'voice-terminal')
 export const BUNDLE_DIRS = { plugin: PLUGIN_BUNDLE, bridge: PLUGIN_BUNDLE, wakeTasks: PLUGIN_BUNDLE, preset: PLUGIN_BUNDLE }
 export const PLUGIN_DIRS = {
@@ -51,7 +56,8 @@ let cachedDecoder
 /** Import the pinned DSH session-persistence frame decoder. */
 export async function loadDecoder() {
   if (cachedDecoder !== undefined) return cachedDecoder
-  const lib = join(DSH_ROOT, 'source', 'packages', 'session', 'session-persistence-jsonl', 'lib', 'types', 'zstd.js')
+  // 私有帧扫描器只随上游构建缓存提供；生产组件只公开打包后的业务入口。
+  const lib = join(install, 'build/dsh/source/packages/session/session-persistence-jsonl/lib/types/zstd.js')
   cachedDecoder = await import(pathToFileURL(lib).href)
   return cachedDecoder
 }
@@ -74,12 +80,13 @@ export function* sessionFiles(root = SESSIONS_ROOT, depth = 0) {
  * @returns parsed records, header first; unparsable rows are skipped.
  */
 export async function readSessionRecords(path) {
+  if (!path.endsWith('.zstd')) return readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line))
   const decoder = await loadDecoder()
   const raw = readFileSync(path)
   const scan = decoder.scanZstdFrames(raw)
   const parts = []
   try {
-    for (const chunk of decoder.decode(raw, scan.frames)) parts.push(Buffer.from(chunk).toString('utf8'))
+    for (const chunk of decoder.createZstdFrameDecoder().decode(raw, scan.frames)) parts.push(Buffer.from(chunk).toString('utf8'))
   } catch {
     parts.push(decodeFramesIndependently(raw))
   }

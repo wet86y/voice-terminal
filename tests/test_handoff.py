@@ -28,8 +28,8 @@ from voice_terminal.session.runtime import ConversationRuntime
 
 def make_runtime(root: Path) -> SessionRuntime:
     cfg = AppConfig(persona=PersonaConfig(directory=root / "config" / "persona"),
-                    dsh=replace(DshConfig(), home_dir=root / ".runtime" / "dsh" / "home"))
-    runtime = SessionRuntime(cfg, runtime_data_dir=root / ".runtime")
+                    dsh=replace(DshConfig(), home_dir=root / ".local" / "dsh" / "home"))
+    runtime = SessionRuntime(cfg, runtime_data_dir=root / ".local")
     runtime._restore_or_persist_voice_identity()  # 模拟 initialize（初始化）的身份恢复，不启动设备。
     return runtime
 

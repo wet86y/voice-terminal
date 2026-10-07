@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { randomUUID } from 'node:crypto'
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../../../../..')
-const source = join(repo, '.runtime/dsh/source')
+const source = join(repo, '.local/build/dsh/source')
 const temporary = await mkdtemp(join(tmpdir(), 'voice-dsh-loader-'))
 const profile = join(temporary, 'home/profiles/test')
 const token = randomUUID()
@@ -35,7 +35,7 @@ try {
   process.chdir(temporary)
   await mkdir(join(profile, 'node_modules/@voice-terminal'), { recursive: true })
   await symlink(join(source, 'python/sdk-runtime/node_modules/@deepseek-ai'), join(profile, 'node_modules/@deepseek-ai'), process.platform === 'win32' ? 'junction' : 'dir')
-  const built = join(repo, '.runtime/dsh/bundles/voice-terminal-test')
+  const built = join(repo, '.local/build/dsh/bundles/voice-terminal-test')
   const installed = join(profile, 'node_modules/@voice-terminal/dsh-plugin')
   await cp(built, installed, { recursive: true, filter: path => path !== join(built, 'node_modules') })
   await writeFile(join(profile, 'package.json'), JSON.stringify({

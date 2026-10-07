@@ -227,7 +227,7 @@ def hardware_status(*, refresh: bool = False) -> dict[str, Any]:
             else:
                 env = {**os.environ, "VOICE_RESOURCE_ROLE": "bootstrap"}
                 from .paths import python_command
-                command = python_command(sys.executable, "voice_terminal.hardware_probe", root=Path(__file__).resolve().parents[1])
+                command = python_command(sys.executable, "voice_terminal.hardware_probe", root=next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file()))
                 result = subprocess.run(command,
                                         capture_output=True, text=True, timeout=60, env=env, check=True,
                                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
@@ -292,7 +292,7 @@ def _isolated_onnx_model_probe(name: str, path: Path, capability_time: Any) -> d
             if key not in _model_probe_cache:
                 from .paths import python_command
                 command = python_command(sys.executable, "voice_terminal.hardware_probe", "--model", name,
-                    "--model-path", str(path), root=Path(__file__).resolve().parents[1])
+                    "--model-path", str(path), root=next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file()))
                 env = {**os.environ, "VOICE_RESOURCE_ROLE": "bootstrap", "PYTHONDONTWRITEBYTECODE": "1"}
                 response = subprocess.run(command, env=env, capture_output=True, text=True, timeout=45, check=True,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)

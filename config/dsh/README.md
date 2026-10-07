@@ -6,12 +6,12 @@ Voice Terminal 选定的 DeepSeek Harness（DSH，代理执行宿主）目标版
 不追踪浮动版本。当前源码将 Bridge（桥接）、Wake Tasks（项目唤醒任务）和 Shadow preset（影子代理预设）合并为
 `@voice-terminal/dsh-plugin`（统一功能包）0.2.0，Bridge protocol（桥接协议）仍为 2.0。组件职责、兼容契约和维护门槛见
 [DSH 插件维护手册](../../docs/dsh-plugin-maintenance.md)。2026-10-07 已完成项目内统一包安装迁移，
-构建记录格式为 6，117 个原有数据文件摘要核对一致；完整结果见[本轮安装与验证](../../docs/dsh-plugin-maintenance.md#2026-10-07-插件合并与项目安装验收)。
+构建记录格式为 6，117 个原有数据文件摘要核对一致；完整结果见[本轮安装与验证](../../docs/dsh-plugin-maintenance.md#2026-10-07-插件合并与项目安装验收历史记录)。
 桌面发行目录仍按独立发布流程管理，本轮没有重新发布便携程序。
 
 该宿主版本于 2026-10-05 完成首次源码及便携桌面部署，并完成共存修复部署；当时三个项目功能包均为 0.1.1。
 当次便携应用位于 `apps/20261005-dsh-task-coexist`；首次部署目录为 `apps/20261005-dsh020rc2`。DSH component（DSH 组件）标识为
-`639ed015-e7dd1315c977`；旧组件和两套备份均保留。首次部署的验收范围、任务与会话数据核验见[本机部署验收记录](../../.runtime/dsh-upgrade-20261005/acceptance.md)；共存修复已完成部署并通过[本机验收](../../.runtime/dsh-coexist-20261005/acceptance.md)。
+`639ed015-e7dd1315c977`；构建编号仅保留在清单；当前运行目录固定，重要用户数据最多保留一份滚动备份。首次部署的验收范围、任务与会话数据核验见[本机部署验收记录](../../docs/local-layout.md)；共存修复已完成部署并通过[本机验收](../../docs/local-layout.md)。
 共存修订细节见[DSH 会话任务与语音链路任务修订文档](../../docs/dsh-task-coexistence.md)。
 
 首次部署、共存修复前的测试结果：backend（后端）666 passed（通过）、17 skipped（跳过）；frontend（前端）64 passed（通过）；
@@ -20,7 +20,7 @@ Bridge（桥接插件）22 passed（通过）；Wake Tasks（唤醒任务插件�
 
 使用 PowerShell 7 的 `pwsh -NoProfile -File scripts/setup-dsh.ps1` 安装或修复项目运行时，使用
 `pwsh -NoProfile -File scripts/setup-dsh.ps1 -ValidateOnly` 检查安装状态。官方源码和项目专属 DSH_HOME（DSH 数据目录）
-位于 Git 忽略的 `.runtime/dsh/`；该数据目录与用户级 `~/.dsh` 隔离。升级时保留项目设置和会话数据，
+位于 Git 忽略的 `.local/build/dsh/`；该数据目录与用户级 `~/.dsh` 隔离。升级时保留项目设置和会话数据，
 并按安装脚本流程备份后再启动新版本。
 
 正式 `shadow-agent`（影子执行代理）由 `integrations/dsh/voice-terminal/preset/shadow-agent/` 维护。

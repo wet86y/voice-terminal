@@ -1,8 +1,10 @@
+import { resolve } from 'node:path'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
 // UI preview（视觉展示服务）：独立配置，不注入应用宿主脚本，也不代理业务接口。
 export default defineConfig({
+  cacheDir: resolve(__dirname, '../../.local/cache/vite-demo'), // cacheDir（演示界面开发缓存）。
   plugins: [vue(), {
     name: 'desktop-owned-preview',
     configureServer(server) {

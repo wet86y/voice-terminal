@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { registerSessionEvents, stopRuntimeActivity } from '../../../../../.runtime/dsh/bundles/voice-terminal-test/lib/bridge/events.js'
-import { clearActivationIfCurrent } from '../../../../../.runtime/dsh/bundles/voice-terminal-test/lib/bridge/messages.js'
+import { registerSessionEvents, stopRuntimeActivity } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/events.js'
+import { clearActivationIfCurrent } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/messages.js'
 
 function fixture(t) {
   const listeners = new Map()

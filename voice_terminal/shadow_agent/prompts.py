@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
-DEFAULT_INSTRUCTIONS_PATH = Path(__file__).resolve().parents[2] / "config" / "shadow_agent" / "instructions.md"
+DEFAULT_INSTRUCTIONS_PATH = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file()) / "config" / "shadow_agent" / "instructions.md"
 
 INTENT_REASSESSMENT_PROMPT = """\
 收到新的权威会话上下文后，第一要务是重新判断用户当前意图。

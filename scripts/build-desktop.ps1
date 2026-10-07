@@ -1,25 +1,33 @@
 ﻿param([switch]$Debug, [switch]$SkipFrontend)
 $ErrorActionPreference = 'Stop'
-$DesktopRepo = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'local-context.ps1')
+$DesktopRepo = Get-ProjectRoot
 $ForbiddenBuildFlags = @('--ui-preview', '--dev', '--diagnostic', '--dev-server', '--frontend-dev')
 foreach ($Argument in $args) {
   if ($ForbiddenBuildFlags -contains $Argument) {
     throw "构建脚本不接受运行参数：$Argument"
   }
 }
-$LocalCargo = Join-Path $DesktopRepo '.runtime/desktop-tools/cargo/bin/cargo.exe'
+$LocalCargo = Join-Path $DesktopRepo '.local/tools/rust/cargo/bin/cargo.exe'
 $CargoCommand = if (Test-Path -LiteralPath $LocalCargo) { $LocalCargo } else { (Get-Command cargo -ErrorAction Stop).Source }
+$SavedTargetDir = $env:CARGO_TARGET_DIR
+$env:CARGO_TARGET_DIR = Join-Path $DesktopRepo '.local/build/desktop'
 $SavedCargoHome = $env:CARGO_HOME
 $SavedRustupHome = $env:RUSTUP_HOME
 $SavedRustFlags = $env:RUSTFLAGS
 $SavedEncodedRustFlags = $env:CARGO_ENCODED_RUSTFLAGS
 try {
   if ($CargoCommand -eq $LocalCargo) {
-    $env:CARGO_HOME = Join-Path $DesktopRepo '.runtime/desktop-tools/cargo'
-    $env:RUSTUP_HOME = Join-Path $DesktopRepo '.runtime/desktop-tools/rustup'
+    $env:CARGO_HOME = Join-Path $DesktopRepo '.local/tools/rust/cargo'
+    $env:RUSTUP_HOME = Join-Path $DesktopRepo '.local/tools/rust/rustup'
   }
   Push-Location $DesktopRepo
   try {
+    $Context = Get-LocalContext
+    Set-LocalEnvironment $Context $DesktopRepo
+    $Toolchain = (& $CargoCommand -V) + ' / ' + (& (Join-Path (Split-Path $CargoCommand) 'rustc.exe') -V)
+    & $Context.Python '-B' '-X' 'utf8' (Join-Path $PSScriptRoot 'prepare-build-cache.py') 'desktop' '--toolchain' $Toolchain
+    if ($LASTEXITCODE) { throw '原生构建缓存检查失败。' }
     if (-not $SkipFrontend) { & npm run frontend:build; if ($LASTEXITCODE) { throw '前端构建失败。' } }
     $CargoArguments = @('build', '--manifest-path', 'apps/desktop/Cargo.toml', '--package', 'voice-terminal-desktop', '--features', 'voice-terminal-desktop/custom-protocol', '--locked')
     if (-not $Debug) { $CargoArguments += '--release' }
@@ -36,9 +44,10 @@ try {
     & $CargoCommand @BootstrapArguments
     if ($LASTEXITCODE) { throw '独立根入口构建失败。' }
     $Profile = if ($Debug) { 'debug' } else { 'release' }
-    Write-Host "桌面产物：$DesktopRepo/apps/desktop/target/$Profile" -ForegroundColor Green
+    Write-Host "桌面产物：$DesktopRepo/.local/build/desktop/$Profile" -ForegroundColor Green
   } finally { Pop-Location }
 } finally {
+  $env:CARGO_TARGET_DIR = $SavedTargetDir
   $env:CARGO_HOME = $SavedCargoHome; $env:RUSTUP_HOME = $SavedRustupHome
   $env:RUSTFLAGS = $SavedRustFlags; $env:CARGO_ENCODED_RUSTFLAGS = $SavedEncodedRustFlags
 }

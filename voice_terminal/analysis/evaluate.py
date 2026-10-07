@@ -86,8 +86,8 @@ async def evaluate(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=Path("logs/evaluation/report.json"))
-    parser.add_argument("--model-dir", type=Path, default=Path(r"D:\模型\voice-terminal"))
+    parser.add_argument("--output", type=Path, default=Path(".local/cache/evaluation/report.json"))
+    parser.add_argument("--model-dir", type=Path, default=__import__('voice_terminal.paths', fromlist=['AppPaths']).AppPaths.resolve().install_root / 'models')
     parser.add_argument("--url", default="ws://127.0.0.1:8767/analysis")
     parser.add_argument("--allow-over-max", action="store_true",
                         help="仅离线分段验证时允许处理 60-62 秒输入；运行时仍限制为 60 秒")

@@ -7,10 +7,11 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const repo = resolve(here, '../../..')
-const sourceRoot = resolve(repo, '.runtime/dsh/source')
-const outputRoot = resolve(process.argv[2] ?? resolve(repo, '.runtime/dsh/bundles/voice-terminal'))
-const runtimeBundles = resolve(repo, '.runtime/dsh/bundles')
+import { projectRoot } from '../../../scripts/project-root.mjs'
+const repo = projectRoot(import.meta.url)
+const sourceRoot = resolve(repo, '.local/build/dsh/source')
+const outputRoot = resolve(process.argv[2] ?? resolve(repo, '.local/build/dsh/bundles/voice-terminal'))
+const runtimeBundles = resolve(repo, '.local/build/dsh/bundles')
 const rel = relative(runtimeBundles, outputRoot)
 if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
   throw new Error(`构建产物必须位于项目 bundles（功能包）目录：${outputRoot}`)

@@ -6,17 +6,15 @@
  * render path, and one bad row blanks the 对话 pane for every session. Sessions
  * are discovered by scanning the transcripts, not from a fixed list.
  *
- * Everything removed is copied to `logs/incident-<stamp>/` first (transcripts,
- * projection-cache entries, and snapshots of both JSON stores), so the operation
- * is reversible. Other sessions, unrelated cache entries, and settings are left
- * alone.
+ * 清理前停机并验证唯一用户数据备份，不生成按时间累积的诊断备份。
  *
  * Usage:
  *   node scripts/dsh-diagnose/purge-poisoned-sessions.mjs          # dry run
  *   node scripts/dsh-diagnose/purge-poisoned-sessions.mjs apply    # delete
  */
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { cp, mkdir, rm } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
+import { rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import {
   PROJ_CACHE_DIR, REPO_ROOT, SESSION_MAPPINGS, SESSIONS_ROOT, WORKSPACE_STORE,
@@ -50,13 +48,10 @@ console.log(`poisoned sessions: ${poisoned.size}`)
 for (const [id, info] of poisoned) console.log(`  ${id}  (${info.rows} poisoned rows)`)
 
 // ---- 2. back up ----
-const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-const backupDir = join(REPO_ROOT, 'logs', `incident-${stamp}`)
+const backupDir = join(REPO_ROOT, '.local/backups/user-data/dsh') // backupDir（唯一滚动持久数据备份内的代理状态）。
 if (apply) {
-  await mkdir(join(backupDir, 'sessions'), { recursive: true })
-  await mkdir(join(backupDir, 'projcache'), { recursive: true })
-  await cp(WORKSPACE_STORE, join(backupDir, 'workspace.json'))
-  if (existsSync(SESSION_MAPPINGS)) await cp(SESSION_MAPPINGS, join(backupDir, 'session-mappings.json'))
+  const saved = spawnSync(join(REPO_ROOT, '.local/runtimes/python/python.exe'), ['-B', '-X', 'utf8', join(REPO_ROOT, 'scripts/local-admin.py'), 'backup'], { stdio: 'inherit' })
+  if (saved.status !== 0) throw new Error('请先正常退出业务；唯一数据备份未成功，取消清理')
 }
 console.log(`\nbackup -> ${backupDir}`)
 
@@ -65,13 +60,11 @@ let removedSessions = 0
 let removedCache = 0
 for (const [id, info] of poisoned) {
   if (existsSync(info.sessionDir)) {
-    if (apply) await cp(info.sessionDir, join(backupDir, 'sessions', id), { recursive: true })
     if (apply) await rm(info.sessionDir, { recursive: true, force: true })
     removedSessions += 1
   }
   const cache = join(PROJ_CACHE_DIR, `${id}.json`)
   if (existsSync(cache)) {
-    if (apply) await cp(cache, join(backupDir, 'projcache', `${id}.json`))
     if (apply) await rm(cache, { force: true })
     removedCache += 1
   }

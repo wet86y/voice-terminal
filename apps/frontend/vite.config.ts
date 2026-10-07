@@ -3,6 +3,7 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
 export default defineConfig({
+  cacheDir: resolve(__dirname, '../../.local/cache/vite-product'), // cacheDir（产品界面开发缓存）。
   plugins: [vue(), {
     name: 'desktop-owned-development',
     configureServer(server) {
@@ -14,6 +15,8 @@ export default defineConfig({
     },
   }],
   build: {
+    outDir: resolve(__dirname, '../../.local/build/frontend'), // outDir（固定界面构建目录）。
+    emptyOutDir: true,
     manifest: 'desktop-manifest.json', // manifest（界面产物清单）：便携组装按产品依赖闭包验证。
     rollupOptions: {
       input: {

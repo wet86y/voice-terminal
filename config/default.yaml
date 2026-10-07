@@ -1,4 +1,4 @@
-model_dir: "D:\\模型\\voice-terminal"
+model_dir: .local/models # model_dir（模型目录）：启动上下文统一传入实际位置。
 debug_audio_capture: false
 
 # quiet_hours（被动静默时间）：本地每日时间，需先启用 KWS（关键词唤醒）。
@@ -62,8 +62,8 @@ shadow_agent:
 dsh:
   enabled: true
   auto_start: true
-  source_dir: .runtime/dsh/source
-  home_dir: .runtime/dsh/home
+  source_dir: .local/build/dsh/source # source_dir（上游源码缓存）：业务启动不从源码选择运行环境。
+  home_dir: .local/data/dsh # home_dir（代理持久状态）：实际位置由唯一安装上下文解析。
   profile: web
   host: 127.0.0.1
   port: 3081

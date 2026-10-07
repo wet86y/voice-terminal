@@ -13,7 +13,7 @@ from typing import Callable
 from collections import Counter
 from .paths import AppPaths
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 THREAD_ENV = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
 ROLES = {"bootstrap", "asr", "analysis", "voice", "speaker"}
 

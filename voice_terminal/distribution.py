@@ -98,45 +98,38 @@ def verify(root: Path, record: dict, *, exact=True) -> None:
     expected = set()
     for item in record["files"]:
         relative = item["path"]
+        if not relative or Path(relative).is_absolute() or '..' in Path(relative).parts or ':' in relative or '\\' in relative:
+            raise ValueError(f'文件记录包含不安全路径：{relative}')
         if relative.casefold() in expected:
             raise ValueError(f"组件清单含重复文件：{relative}")
         expected.add(relative.casefold())
+    actual_paths = None
+    if exact:
+        # 先遍历并拒绝所有重解析点，再按已枚举的物理文件核对；避免每项重复规范化根路径。
+        actual_paths = {p.relative_to(root).as_posix().casefold(): p for p in files(root)
+                        if p.relative_to(root).as_posix().casefold() not in {'manifest.json', 'release.json'}}
+        if set(actual_paths) != expected:
+            raise ValueError('组件文件集合与发布清单不一致')
     def validate_file(item):
         relative = item["path"]
-        path = safe_path(root, relative)
+        path = actual_paths[relative.casefold()] if actual_paths is not None else safe_path(root, relative)
         if not path.is_file() or path.stat().st_size != item["size"] or digest(path) != item["sha256"]:
             raise ValueError(f"文件校验失败：{relative}")
     with ThreadPoolExecutor(max_workers=4, thread_name_prefix="release-verify") as workers:
         for _ in workers.map(validate_file, record["files"]):
             pass
-    if exact:
-        actual = {p.relative_to(root).as_posix().casefold() for p in files(root)} - {"manifest.json", "release.json"}
-        if actual != expected:
-            raise ValueError("组件文件集合与发布清单不一致")
 
 
 def verify_install(root: Path) -> None:
-    """验证当前组合；发布清单与本地启用记录分别读取，不将用户数据纳入发布文件。"""
+    """验证唯一便携配置与当前组件组合，不将用户数据纳入发布文件。"""
     root = root.resolve()
-    portable = json.loads((root / "portable.json").read_text(encoding="utf-8-sig"))
-    data = Path(portable["data_dir"])
-    data = data if data.is_absolute() else root / data
-    active = data / "state/active.json"
-    selected = json.loads(active.read_text(encoding="utf-8-sig")) if active.is_file() else portable
-    if selected.get("schema") != 1:
-        raise ValueError("不支持的本地启用记录")
+    from .local_layout import read_portable
+    selected = read_portable(root)
     program = safe_path(root, selected["app"])
     release = json.loads((program / "release.json").read_text(encoding="utf-8-sig"))
     verify(program, release)
-    requirements = release.get("external_requirements", {})
-    for kind, must_be_file in (("python", True), ("models", False)):
-        value = selected.get("external_" + kind)
-        if bool(value) != bool(requirements.get(kind)):
-            raise ValueError(f"外部运行需求与启用记录不符：{kind}")
-        if value:
-            external = Path(value)
-            if not external.is_absolute() or not (external.is_file() if must_be_file else external.is_dir()):
-                raise ValueError(f"外部运行路径不可用：{kind}")
+    if {item['kind'] for item in release['components']} != {'python', 'models', 'dsh', 'webview2'}:
+        raise ValueError('发行组合必须包含全部四个必要组件')
     for component in release["components"]:
         directory = safe_path(root, component["path"])
         metadata = directory / "manifest.json"
@@ -149,7 +142,7 @@ def verify_install(root: Path) -> None:
         if component["kind"] == "python":
             selected_path = str(Path(selected_path).parent).replace("\\", "/") if selected_path else None
         if selected_path != component["path"]:
-            raise ValueError(f"启用记录不符合程序所需组合：{component['kind']}")
+            raise ValueError(f"便携配置不符合程序所需组合：{component['kind']}")
         verify(directory, record)
     for item in release.get("root_files", []):
         path = safe_path(root, item["path"])

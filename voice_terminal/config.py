@@ -464,8 +464,8 @@ class ShadowAgentConfig:
 class DshConfig:
     enabled: bool = True
     auto_start: bool = True
-    source_dir: Path = Path(".runtime/dsh/source")
-    home_dir: Path = Path(".runtime/dsh/home")
+    source_dir: Path = Path(".local/build/dsh/source")
+    home_dir: Path = Path(".local/data/dsh")
     profile_patch: Path = Path("config/dsh/web-profile.patch.yml")
     profile: str = "web"
     host: str = "127.0.0.1"
@@ -531,7 +531,7 @@ class AppConfig:
     shadow_agent: ShadowAgentConfig = field(default_factory=ShadowAgentConfig)
     dsh: DshConfig = field(default_factory=DshConfig)
     persona: PersonaConfig = field(default_factory=PersonaConfig)
-    model_dir: Path = Path(r"D:\模型\voice-terminal")
+    model_dir: Path = Path(".local/models")
     paths: AppPaths | None = None  # paths（受管应用路径上下文；源码调试兼容原布局）。
     debug_audio_capture: bool = False
     audio: AudioConfig = field(default_factory=AudioConfig)
@@ -595,7 +595,7 @@ class AppConfig:
     def from_mapping(cls, data: Mapping[str, Any], *, base_dir: Path | None = None) -> "AppConfig":
         root = base_dir or Path.cwd()
         paths = AppPaths.resolve(root)
-        model_dir = Path(os.environ.get("VOICE_MODEL_DIR", "").strip() or _string(data.get("model_dir"), r"D:\模型\voice-terminal"))
+        model_dir = Path(os.environ.get("VOICE_MODEL_DIR", "").strip() or _string(data.get("model_dir"), ".local/models"))
         if not model_dir.is_absolute():
             model_dir = root / model_dir
 
@@ -701,22 +701,10 @@ class AppConfig:
             path if path.is_absolute() else (root / path).resolve()
             for path in (Path(item) for item in raw_shadow_roots)
         )
-        dsh_runtime_root = (root / ".runtime" / "dsh").resolve()
-
         def dsh_runtime_path(value: Any, default: str, field_name: str) -> Path:
-            candidate = Path(_string(value, default))
-            resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
-            if paths.separated:
-                if field_name == "home_dir":
-                    return paths.dsh_home
-                packaged = os.environ.get("VOICE_DSH_RUNTIME")
-                if packaged:
-                    return Path(packaged).resolve() / "source"
-            try:
-                resolved.relative_to(dsh_runtime_root)
-            except ValueError as exc:
-                raise ValueError(f"dsh.{field_name} must remain inside {dsh_runtime_root}") from exc
-            return resolved
+            if field_name == "home_dir":
+                return paths.dsh_home
+            return paths.install_root / 'runtimes/dsh'
 
         return cls(
             quiet_hours=QuietHoursConfig(**dict(_section(data, "quiet_hours"))),
@@ -789,8 +777,8 @@ class AppConfig:
             dsh=DshConfig(
                 enabled=_bool(dsh.get("enabled"), True),
                 auto_start=_bool(dsh.get("auto_start"), True),
-                source_dir=dsh_runtime_path(dsh.get("source_dir"), ".runtime/dsh/source", "source_dir"),
-                home_dir=dsh_runtime_path(dsh.get("home_dir"), ".runtime/dsh/home", "home_dir"),
+                source_dir=dsh_runtime_path(dsh.get("source_dir"), ".local/build/dsh/source", "source_dir"),
+                home_dir=dsh_runtime_path(dsh.get("home_dir"), ".local/data/dsh", "home_dir"),
                 profile_patch=(root / "config" / "dsh" / "web-profile.patch.yml").resolve(),
                 profile=_string(dsh.get("profile"), "web"),
                 host=_string(dsh.get("host"), "127.0.0.1"),

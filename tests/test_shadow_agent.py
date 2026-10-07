@@ -483,7 +483,7 @@ def test_disabling_context_gate_releases_deferred_authority_prefix():
 
 def test_stopped_input_buffers_information_and_keeps_progress_in_product_only(tmp_path):
     async def scenario():
-        runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / ".runtime")
+        runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / ".local")
         status = ShadowEvent("s", "information", "正在整理", 1)
         progress = ShadowEvent("p", "progress", "已读取文件", 1)
         await runtime._on_shadow_events([status, progress])

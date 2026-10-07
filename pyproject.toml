@@ -9,6 +9,8 @@ description = "Windows native modular real-time voice terminal backend"
 requires-python = ">=3.12,<3.13"
 
 [tool.pytest.ini_options]
+cache_dir = ".local/cache/pytest" # cache_dir（测试缓存）。
+asyncio_default_fixture_loop_scope = "function" # 异步夹具循环生命周期。
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 filterwarnings = [

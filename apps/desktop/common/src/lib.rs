@@ -8,15 +8,12 @@ use std::{
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Selection {
-    pub schema: u32,                      // schema（本地记录格式）。
-    pub app: String,                      // app（程序包的相对目录）。
-    pub python: String,                   // python（解释器的相对路径）。
-    pub models: String,                   // models（模型包的相对目录）。
-    pub webview2: Option<String>,         // webview2（固定网页运行时的相对目录）。
-    pub dsh: Option<String>,              // dsh（代理宿主发行目录）。
-    pub node: Option<String>,             // node（宿主使用的独立运行环境）。
-    pub external_python: Option<PathBuf>, // external_python（手动指定外部解释器的退路）。
-    pub external_models: Option<PathBuf>, // external_models（手动指定外部模型的退路）。
+    pub schema: u32,              // schema（本地记录格式）。
+    pub app: String,              // app（程序包的相对目录）。
+    pub python: String,           // python（解释器的相对路径）。
+    pub models: String,           // models（模型包的相对目录）。
+    pub webview2: Option<String>, // webview2（固定网页运行时的相对目录）。
+    pub dsh: Option<String>,      // dsh（代理宿主发行目录）。
 }
 
 #[derive(Deserialize)]
@@ -41,7 +38,7 @@ pub struct LaunchContext {
     pub models: Option<PathBuf>,   // models（只读模型目录）。
     pub webview2: Option<PathBuf>, // webview2（固定网页渲染引擎）。
     pub dsh: Option<PathBuf>,      // dsh（代理宿主的完整运行产物）。
-    pub node: Option<PathBuf>,     // node（可选的独立宿主解释器）。
+    pub node: Option<PathBuf>,     // node（宿主清单内的脚本解释器）。
     pub dev: bool,                 // dev（前端开发服务器模式）。
     pub diagnostic: bool,          // diagnostic（不启动业务的入口诊断模式）。
 }
@@ -114,6 +111,9 @@ fn data_state(data: &Path) -> Result<PathBuf, String> {
 impl LaunchContext {
     pub fn portable(root: &Path) -> Result<Self, String> {
         let install = canonical_path(root)?;
+        if install.join("tmp/update-transaction.json").exists() {
+            return Err("存在未完成更新；先执行 npm run desktop:publish（覆盖发布）恢复或收尾，再启动应用。".into());
+        }
         let root_text = install.to_string_lossy().to_ascii_lowercase();
         if root_text.starts_with(r"\\?\unc\")
             || (root_text.starts_with(r"\\") && !root_text.starts_with(r"\\?\"))
@@ -121,57 +121,34 @@ impl LaunchContext {
             return Err("请先将应用解压到本地磁盘；不支持网络共享路径。".into());
         }
         let portable: Portable = read_json(&install.join("portable.json"))?;
-        let data = if portable.data_dir.is_absolute() {
-            portable.data_dir
-        } else {
-            install.join(portable.data_dir)
-        };
-        fs::create_dir_all(&data).map_err(|e| format!("用户数据目录不可用：{e}"))?;
-        let data = canonical_path(&data)?;
-        let active = data_state(&data)?.join("active.json");
-        reject_reparse(&active)?;
-        let selection: Selection = if active.is_file() {
-            read_json(&active)?
-        } else {
-            portable.selection
-        };
-        if selection.schema != 1 {
-            return Err("不支持的本地启用记录格式。".into());
-        }
-        let initial_selection = selection.clone();
-        let program = component(&install, &selection.app)?;
-        if data.starts_with(&program) || program.starts_with(&data) {
-            return Err("用户数据目录不能与程序包重叠。".into());
-        }
-        let python = match selection.external_python {
-            Some(p) if p.is_absolute() && p.is_file() => canonical_path(&p)?,
-            Some(_) => return Err("外部解释器必须指定存在的绝对路径。".into()),
-            None => component(&install, &selection.python)?,
-        };
-        let models = Some(match selection.external_models {
-            Some(p) if p.is_absolute() && p.is_dir() => canonical_path(&p)?,
-            Some(_) => return Err("外部模型必须指定存在的绝对目录。".into()),
-            None => component(&install, &selection.models)?,
-        });
-        let optional = |value: Option<String>| value.map(|p| component(&install, &p)).transpose();
-        let webview2 = optional(selection.webview2)?;
-        let dsh = optional(selection.dsh)?;
-        let node = optional(selection.node)?;
-        for component_path in [
-            &Some(program.clone()),
-            &Some(python.clone()),
-            &models,
-            &webview2,
-            &dsh,
-            &node,
-        ]
-        .into_iter()
-        .flatten()
+        let selection = portable.selection;
+        if selection.schema != 2
+            || portable.data_dir != PathBuf::from("data")
+            || selection.app != "app"
+            || selection.python != "runtimes/python/python.exe"
+            || selection.models != "models"
+            || selection.dsh.as_deref() != Some("runtimes/dsh")
+            || selection.webview2.as_deref() != Some("runtimes/webview2")
         {
-            if data.starts_with(component_path) || component_path.starts_with(&data) {
-                return Err("用户数据不能与程序、运行环境或模型目录重叠。".into());
-            }
+            return Err("需要 schema=2（第二版）固定便携配置，请先执行布局迁移。".into());
         }
+        let data = install.join("data");
+        reject_reparse(&data)?;
+        fs::create_dir_all(&data).map_err(|e| e.to_string())?;
+        let data = canonical_path(&data)?;
+        data_state(&data)?;
+        let program = component(&install, &selection.app)?;
+        let python = component(&install, &selection.python)?;
+        let models = Some(component(&install, &selection.models)?);
+        let webview2 = Some(component(&install, selection.webview2.as_ref().unwrap())?);
+        let runtime = component(&install, selection.dsh.as_ref().unwrap())?;
+        let metadata: serde_json::Value = read_json(&runtime.join("runtime.json"))?;
+        let node = Some(component(
+            &runtime,
+            metadata["node"]
+                .as_str()
+                .ok_or("宿主清单缺少 node（脚本解释器）")?,
+        )?);
         let context = Self {
             install,
             program,
@@ -179,35 +156,12 @@ impl LaunchContext {
             python,
             models,
             webview2,
-            dsh,
+            dsh: Some(runtime),
             node,
             dev: false,
             diagnostic: false,
         };
         context.validate()?;
-        if !active.is_file() {
-            fs::create_dir_all(active.parent().unwrap()).map_err(|e| e.to_string())?;
-            let temporary = active.with_extension(format!("new-{}", std::process::id()));
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(|e| e.to_string())?;
-            use std::io::Write;
-            file.write_all(
-                &serde_json::to_vec_pretty(&initial_selection).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-            file.sync_all().map_err(|e| e.to_string())?;
-            drop(file);
-            match fs::rename(&temporary, &active) {
-                Ok(()) => {}
-                Err(_) if active.is_file() => {
-                    let _ = fs::remove_file(temporary);
-                }
-                Err(error) => return Err(format!("无法写入本地启用记录：{error}")),
-            }
-        }
         Ok(context)
     }
 
@@ -216,7 +170,7 @@ impl LaunchContext {
         Self::from_argument_list(&args)
     }
 
-    // from_argument_list（解析启动参数）：源码产品默认复用正式安装的完整数据和组件。
+    // from_argument_list（解析启动参数）：源码产品默认复用正式安装的data和组件。
     fn from_argument_list(args: &[String]) -> Result<Self, String> {
         let value = |key: &str| {
             args.iter()
@@ -228,64 +182,30 @@ impl LaunchContext {
             let program = canonical_path(Path::new(&root))?;
             let install = value("--install")
                 .map(|p| program.join(p))
-                .unwrap_or_else(|| program.join(".runtime/delivery/VoiceTerminal"));
-            let installed = if install.join("portable.json").is_file() {
-                Some(Self::portable(&install)?)
-            } else {
-                if value("--install").is_some() || value("--data-dir").is_none() {
-                    return Err("请先准备正式程序 .runtime/delivery/VoiceTerminal（正式安装目录），或用 --data-dir（数据目录）明确指定已有业务数据；不会自动创建隔离产品。".into());
-                }
-                None
-            };
+                .unwrap_or_else(|| program.join(".local"));
+            let installed = Self::portable(&install)?;
+            if value("--python").is_some()
+                || value("--models").is_some()
+                || value("--webview2").is_some()
+            {
+                return Err("业务组件路径统一由 portable.json（便携配置）管理。".into());
+            }
             let data = value("--data-dir")
                 .map(|p| program.join(p))
-                .unwrap_or_else(|| installed.as_ref().unwrap().data.clone());
+                .unwrap_or_else(|| installed.data.clone());
             fs::create_dir_all(&data).map_err(|e| e.to_string())?;
-            let python = if let Some(p) = value("--python") {
-                program.join(p)
-            } else if let Some(context) = &installed {
-                context.python.clone()
-            } else {
-                let activation: serde_json::Value = serde_json::from_slice(
-                    &fs::read(program.join(".runtime/application/runtime.json")).map_err(|e| {
-                        format!("请先准备业务环境或用 --python（解释器路径）明确指定：{e}")
-                    })?,
-                )
-                .map_err(|e| e.to_string())?;
-                program.join(
-                    activation["python"]
-                        .as_str()
-                        .ok_or("业务环境记录缺少解释器路径")?,
-                )
-            };
-            let models = value("--models")
-                .map(|p| canonical_path(&program.join(p)))
-                .transpose()?
-                .or_else(|| {
-                    installed
-                        .as_ref()
-                        .and_then(|context| context.models.clone())
-                });
-            let webview2 = value("--webview2")
-                .map(|p| canonical_path(&program.join(p)))
-                .transpose()?
-                .or_else(|| {
-                    installed
-                        .as_ref()
-                        .and_then(|context| context.webview2.clone())
-                });
+            let python = installed.python.clone();
+            let models = installed.models.clone();
+            let webview2 = installed.webview2.clone();
             let context = Self {
-                install: installed
-                    .as_ref()
-                    .map(|context| context.install.clone())
-                    .unwrap_or_else(|| program.clone()),
+                install: installed.install.clone(),
                 program,
                 data: canonical_path(&data)?,
                 python: canonical_path(&python)?,
                 models,
                 webview2,
-                dsh: installed.as_ref().and_then(|context| context.dsh.clone()),
-                node: installed.as_ref().and_then(|context| context.node.clone()),
+                dsh: installed.dsh.clone(),
+                node: installed.node.clone(),
                 dev: args.iter().any(|a| a == "--dev"),
                 diagnostic: args.iter().any(|a| a == "--diagnostic"),
             };
@@ -356,7 +276,7 @@ impl LaunchContext {
         values.insert("PYTHONUTF8".into(), "1".into());
         values.insert(
             "PYTHONPYCACHEPREFIX".into(),
-            self.data
+            self.install
                 .join("cache/python")
                 .to_string_lossy()
                 .into_owned(),
@@ -401,7 +321,7 @@ pub fn prepare_webview_access_paths(data: &Path, engine: Option<&Path>) -> Resul
     fs::create_dir_all(marker.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::write(
         marker,
-        serde_json::to_vec(&serde_json::json!({"schema":1,"path":engine}))
+        serde_json::to_vec(&serde_json::json!({"schema":2,"path":engine}))
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
@@ -512,38 +432,44 @@ mod tests {
     #[test]
     fn source_product_reuses_full_installation_and_explicit_data_override() {
         let root = std::env::temp_dir().join(format!("voice-source-data-{}", std::process::id()));
-        let install = root.join(".runtime/delivery/VoiceTerminal");
+        let install = root.join(".local");
         for path in [
             root.join("config"),
             root.join("scripts"),
-            install.join("apps/current/config"),
-            install.join("apps/current/scripts"),
+            install.join("app/config"),
+            install.join("app/scripts"),
             install.join("runtimes/python"),
-            install.join("models/current"),
+            install.join("models"),
             install.join("runtimes/dsh"),
             install.join("runtimes/webview2"),
-            install.join("完整数据/config"),
+            install.join("data/config"),
         ] {
             fs::create_dir_all(path).unwrap();
         }
         for path in [
             root.join("config/default.yaml"),
             root.join("scripts/backend-entry.py"),
-            install.join("apps/current/config/default.yaml"),
-            install.join("apps/current/scripts/backend-entry.py"),
+            install.join("app/config/default.yaml"),
+            install.join("app/scripts/backend-entry.py"),
             install.join("runtimes/python/python.exe"),
             install.join("runtimes/webview2/msedgewebview2.exe"),
+            install.join("runtimes/dsh/node.exe"),
         ] {
             fs::write(path, b"fixture").unwrap();
         }
         fs::write(
-            install.join("完整数据/config/preserved.txt"),
+            install.join("data/config/preserved.txt"),
             b"existing-settings",
         )
         .unwrap();
+        fs::write(
+            install.join("runtimes/dsh/runtime.json"),
+            b"{\"node\":\"node.exe\"}",
+        )
+        .unwrap();
         fs::write(install.join("portable.json"), serde_json::to_vec(&serde_json::json!({
-            "data_dir":"完整数据", "schema":1, "app":"apps/current", "python":"runtimes/python/python.exe",
-            "models":"models/current", "dsh":"runtimes/dsh", "webview2":"runtimes/webview2", "node":null,
+            "data_dir":"data", "schema":2, "app":"app", "python":"runtimes/python/python.exe",
+            "models":"models", "dsh":"runtimes/dsh", "webview2":"runtimes/webview2", "node":null,
             "external_python":null, "external_models":null
         })).unwrap()).unwrap();
         let root = canonical_path(&root).unwrap();
@@ -553,16 +479,13 @@ mod tests {
             "--dev".into(),
         ];
         let context = LaunchContext::from_argument_list(&args).unwrap();
-        assert_eq!(
-            context.data,
-            root.join(".runtime/delivery/VoiceTerminal/完整数据")
-        );
+        assert_eq!(context.data, root.join(".local/data"));
         assert_eq!(context.program, root);
         assert_eq!(context.python, install.join("runtimes/python/python.exe"));
         assert_eq!(context.dsh, Some(install.join("runtimes/dsh")));
-        assert_eq!(context.models, Some(install.join("models/current")));
+        assert_eq!(context.models, Some(install.join("models")));
         assert!(context.dev);
-        assert!(!root.join(".runtime/desktop-data").exists());
+        assert!(!root.join(".local/isolated-data").exists());
         let mut explicit = args;
         explicit.extend(["--data-dir".into(), "explicit-data".into()]);
         assert_eq!(
@@ -570,9 +493,21 @@ mod tests {
             root.join("explicit-data")
         );
         assert_eq!(
-            fs::read(install.join("完整数据/config/preserved.txt")).unwrap(),
+            fs::read(install.join("data/config/preserved.txt")).unwrap(),
             b"existing-settings"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pending_update_never_initializes_business_data() {
+        let root =
+            std::env::temp_dir().join(format!("voice-pending-update-{}", std::process::id()));
+        fs::create_dir_all(root.join("tmp")).unwrap();
+        fs::write(root.join("tmp/update-transaction.json"), b"{}").unwrap();
+        let error = LaunchContext::portable(&root).unwrap_err();
+        assert!(error.contains("未完成更新"));
+        assert!(!root.join("data").exists());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -583,8 +518,8 @@ mod tests {
         let error =
             LaunchContext::from_argument_list(&["--root".into(), root.to_str().unwrap().into()])
                 .unwrap_err();
-        assert!(error.contains("不会自动创建隔离产品"));
-        assert!(!root.join(".runtime").exists());
+        assert!(error.contains(".local"));
+        assert!(!root.join(".local").exists());
         fs::remove_dir_all(&root).unwrap();
     }
     #[test]

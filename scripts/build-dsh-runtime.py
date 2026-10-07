@@ -14,10 +14,11 @@ import tarfile
 import urllib.request
 import yaml
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 sys.path.insert(0, str(ROOT))
 from voice_terminal.distribution import digest, files, manifest, safe_path, verify, collect_vc_runtime
 from voice_terminal.paths import atomic_json
+from voice_terminal.local_files import remove_tree
 
 
 def run(*arguments, cwd=None, env=None) -> str:
@@ -94,11 +95,12 @@ def collect_office_engine(output: Path, cache: Path) -> None:
                 shutil.copyfileobj(incoming, outgoing)
     if not (target / "prebuilds.json").is_file():
         raise FileNotFoundError("原生文档转换组件缺少预编译清单")
+    archive.unlink()  # archive（安装归档）展开及校验后回收。
 
 
 def main():
     parser = argparse.ArgumentParser(description="构建 DSH（代理执行宿主）生产运行目录")
-    parser.add_argument("--source", type=Path, default=ROOT / ".runtime/dsh/source")
+    parser.add_argument("--source", type=Path, default=ROOT / ".local/build/dsh/source")
     parser.add_argument("--node", type=Path, required=True, help="明确的 Node.js（脚本运行环境）可执行文件")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--pnpm", type=Path, help="明确的 pnpm（依赖构建工具）入口文件；仅构建机需要")
@@ -106,14 +108,16 @@ def main():
     parser.add_argument('--vc-redist', type=Path, required=True, help='已授权 MSVC（微软构建工具）的 Redist（可再分发）版本下 x64（64 位）目录')
     args = parser.parse_args()
     source, output, node = args.source.resolve(), args.output.resolve(), args.node.resolve()
+    if not output.is_relative_to(ROOT / ".local/tmp"):
+        raise ValueError("新代理组件必须在项目临时区构建")
     if output.exists():
-        raise FileExistsError("输出目录已存在；请选择新的产物标识。")
+        raise FileExistsError("输出目录已存在；请先检查并回收旧候选暂存。")
     lock = json.loads((ROOT / "config/dsh/runtime.lock.json").read_text(encoding="utf-8-sig"))
     commit = run("git", "-C", source, "rev-parse", "HEAD")
     version = json.loads((source / "package.json").read_text(encoding="utf-8"))["version"]
     if commit != lock["commit"] or version != lock["version"]:
         raise ValueError("宿主源码提交或版本与锁定记录不一致。")
-    pnpm = args.pnpm or Path(shutil.which("pnpm.cmd") or "")
+    pnpm = args.pnpm or ROOT / '.local/tools/pnpm/node_modules/pnpm/bin/pnpm.cjs'
     if not pnpm.is_file():
         raise FileNotFoundError("构建机缺少 pnpm（依赖构建工具）。")
     # 通过 Node（脚本运行环境）运行真正的包管理器入口，避免 cmd（命令解释器）再解释路径。
@@ -123,6 +127,7 @@ def main():
             raise FileNotFoundError("请使用 --pnpm 指定 pnpm.cjs（包管理器脚本入口）。")
         pnpm = entry
     env = {**os.environ, "PATH": str(node.parent) + os.pathsep + os.environ.get("PATH", "")}
+    env.update(npm_config_store_dir=str(ROOT / '.local/cache/pnpm'), npm_config_cache=str(ROOT / '.local/cache/npm'))
     if run(node, pnpm, "--version", cwd=source, env=env) != lock["package_manager"].split("@")[1]:
         raise ValueError("构建机包管理器版本与宿主锁定记录不一致。")
     print(run(node, pnpm, "run", "verify-runtime-closure", cwd=source, env=env), flush=True)
@@ -140,7 +145,7 @@ def main():
         shutil.copytree(previous, output)
     else:
         workspace = output.with_name(output.name + ".workspace")
-        if workspace.exists(): raise FileExistsError("独立构建工作目录已存在；请选择新的产物标识。")
+        if workspace.exists(): raise FileExistsError("独立构建工作目录已存在；请先检查并回收旧候选暂存。")
         print("准备独立生产构建输入……", flush=True)
         stage_workspace(source, workspace)
         # autoInstallPeers（自动安装同伴依赖）须沿用上游锁文件，否则冻结安装会拒绝新版本。
@@ -163,7 +168,7 @@ def main():
         for name in closure["dependencies"]:
             if not (modules / name).is_dir():
                 materialize(workspace / "python/sdk-runtime/node_modules" / name, modules / name, omit_nested_modules=True)
-    collect_office_engine(output, ROOT / ".runtime/package-build/downloads")
+    collect_office_engine(output, ROOT / ".local/build/runtime/downloads")
     vc_runtime = collect_vc_runtime(output / 'node_modules/@deepseek-ai/libreoffice-kit-win32-x64/bin', args.vc_redist.resolve(strict=True))
     shutil.copyfile(node, output / "node.exe")
     protocol = yaml.safe_load((ROOT / "config/default.yaml").read_text(encoding="utf-8-sig"))["dsh"]["bridge_protocol_version"]
@@ -193,7 +198,9 @@ def main():
     record["build"] = commit[:8] + "-" + hashlib.sha256(json.dumps(record["files"], sort_keys=True).encode()).hexdigest()[:12]
     atomic_json(output / "manifest.json", record)
     verify(output, record)
-    print(f"DSH（代理执行宿主）生产目录收集、版本和逐文件校验通过：{output}")
+    remove_tree(deploy, ROOT / ".local")
+    remove_tree(output.with_name(output.name + ".workspace"), ROOT / ".local")
+    print(f"DSH（代理执行宿主）生产目录收集、版本和逐文件校验通过：{output}；生产构建暂存已回收。")
 
 
 if __name__ == "__main__":

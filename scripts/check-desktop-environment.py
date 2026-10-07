@@ -5,6 +5,13 @@ import json
 import os
 import platform
 import subprocess
+import sys
+
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
+sys.path.insert(0, str(ROOT))
+from voice_terminal.local_layout import local_root, read_portable
+INSTALL = local_root()
+SELECTED = read_portable(INSTALL)
 
 PROBE = """
 import importlib,json,platform,sys
@@ -26,11 +33,14 @@ print('VOICE_ENVIRONMENT_RESULT='+json.dumps(value))
 """
 
 parser = argparse.ArgumentParser(description="桌面应用环境检测：实际导入、原生库、音频枚举和模型文件，不安装依赖")
-parser.add_argument('--python', type=Path, required=True, help='明确指定业务解释器')
-parser.add_argument('--models', type=Path, required=True, help='明确指定模型目录')
-parser.add_argument('--webview2', type=Path, help='固定版本网页运行时目录')
-parser.add_argument('--dsh', type=Path, help='DSH（代理执行宿主）闭合运行目录')
+parser.add_argument('--python', type=Path, default=INSTALL / SELECTED['python'], help='python（便携配置指定的解释器）')
+parser.add_argument('--models', type=Path, default=INSTALL / SELECTED['models'], help='models（便携配置指定的模型）')
+parser.add_argument('--webview2', type=Path, default=INSTALL / SELECTED['webview2'], help='webview2（固定网页引擎）')
+parser.add_argument('--dsh', type=Path, default=INSTALL / SELECTED['dsh'], help='dsh（闭合代理宿主）')
 args = parser.parse_args()
+for name in ('python', 'models', 'webview2', 'dsh'):
+    if getattr(args, name).resolve() != (INSTALL / SELECTED[name]).resolve():
+        raise ValueError('环境检测组件必须符合唯一便携配置：' + name)
 result = subprocess.run([str(args.python.resolve()), '-B', '-X', 'utf8', '-c', PROBE],
                         env={**os.environ, 'CUDA_VISIBLE_DEVICES': '-1', 'PYTHONNOUSERSITE': '1'},
                         cwd=args.python.resolve().parent, capture_output=True, text=True, encoding='utf-8', timeout=180)
@@ -46,7 +56,8 @@ value['fixed_webview2'] = bool(args.webview2 and (args.webview2 / 'msedgewebview
 value['dsh_cli'] = None
 if args.dsh:
     try:
-        command = subprocess.run([str((args.dsh / 'node.exe').resolve()), str((args.dsh / 'runtime-bootstrap.mjs').resolve()), '--version'],
+        metadata = json.loads((args.dsh / 'runtime.json').read_text(encoding='utf-8-sig'))
+        command = subprocess.run([str((args.dsh / metadata['node']).resolve()), str((args.dsh / metadata['entry']).resolve()), '--version'],
                                  cwd=args.dsh.resolve(), capture_output=True, text=True, encoding='utf-8', timeout=30, check=True)
         value['dsh_cli'] = command.stdout.strip()
     except (OSError, subprocess.SubprocessError) as error:

@@ -35,7 +35,7 @@ def _port_in_use(host: str, port: int) -> bool:
 
 
 def run_checks(config_path: Path, *, online: bool = False, model_dir: Path | None = None) -> list[Check]:
-    root = Path(__file__).resolve().parents[1]
+    root = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
     default_path = root / "config" / "default.yaml"
     config = load_config(default_path, config_path if config_path.is_file() else None)
     if model_dir is not None:
@@ -45,7 +45,7 @@ def run_checks(config_path: Path, *, online: bool = False, model_dir: Path | Non
     # effective runtime config as Voice Server, otherwise a custom (including
     # Chinese) keyword is reported against the stale YAML/default label.
     product_settings = ProductSettingsStore(
-        path=root / "config" / "product-settings.json",
+        path=config.paths.config / "product-settings.json",
         config=config,
     )
     config = product_settings.effective_config()

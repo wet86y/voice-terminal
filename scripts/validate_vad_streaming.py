@@ -6,14 +6,14 @@ import logging
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())))
 
 
 def main():
     parser = argparse.ArgumentParser(description="流式检测功能对照（不访问麦克风）")
     parser.add_argument("--backend", choices=("funasr", "onnx"), required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
-    parser.add_argument("--model-root", type=Path, default=Path(r"D:\模型\voice-terminal"))
+    parser.add_argument("--model-root", type=Path, default=__import__('voice_terminal.paths', fromlist=['AppPaths']).AppPaths.resolve().install_root / 'models')
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     logging.disable(logging.CRITICAL)

@@ -203,6 +203,7 @@ def test_audio_range_reuse_remains_bounded_and_invalidates_on_append(tmp_path, m
 
 @pytest.mark.parametrize("crash", [False, True])
 def test_shared_mapping_survives_owner_close_until_receiver_finishes_or_dies(tmp_path, monkeypatch, crash):
+    monkeypatch.setenv('VOICE_TEST_REPO_ROOT', str(Path(__file__).resolve().parents[1]))
     if os.name != "nt":
         pytest.skip("Windows（操作系统）共享映射生命周期")
     path = tmp_path / "policy.json"; path.write_text('{"shared_audio":true}')
@@ -211,6 +212,7 @@ def test_shared_mapping_survives_owner_close_until_receiver_finishes_or_dies(tmp
         monkeypatch.setenv(key, value)
     child_code = """
 import json, sys
+sys.path.insert(0, __import__('os').environ['VOICE_TEST_REPO_ROOT'])
 from voice_terminal.audio.shared import SharedAudioReader, capabilities
 print(json.dumps(capabilities()), flush=True)
 reader = SharedAudioReader(json.loads(sys.stdin.readline()), 'request', 1024)

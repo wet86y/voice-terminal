@@ -25,7 +25,10 @@ pub fn tray() -> tauri::image::Image<'static> {
         (40, include_bytes!("../icons/tray-40.rgba")),
         (48, include_bytes!("../icons/tray-48.rgba")),
     ];
-    let (width, rgba) = frames.into_iter().min_by_key(|(width, _)| (*width as i32 - size).abs()).unwrap();
+    let (width, rgba) = frames
+        .into_iter()
+        .min_by_key(|(width, _)| (*width as i32 - size).abs())
+        .unwrap();
     tauri::image::Image::new(rgba, width, width)
 }
 

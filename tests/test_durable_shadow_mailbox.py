@@ -33,7 +33,7 @@ def test_dsh_event_waits_for_manual_voice_start(tmp_path):
         runtime = SessionRuntime(AppConfig(
             model_dir=tmp_path / "models",
             persona=PersonaConfig(directory=tmp_path / "persona"),
-        ), runtime_data_dir=tmp_path / ".runtime")
+        ), runtime_data_dir=tmp_path / ".local")
         runtime._voice_mailbox = DurableVoiceMailbox(tmp_path / "mailbox.json")
         runtime.shadow_session = SimpleNamespace(
             dsh_session_id="voice-shadow-current", last_applied_revision=0,

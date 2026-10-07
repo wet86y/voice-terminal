@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import test from 'node:test'
 
 const repo = resolve(fileURLToPath(new URL('../../../../../', import.meta.url)))
-const dshSource = join(repo, '.runtime/dsh/source')
+const dshSource = join(repo, '.local/build/dsh/source')
 const scheduleDir = join(dshSource, 'packages/schedule/schedule')
 const scheduleRequire = createRequire(join(scheduleDir, 'package.json'))
 const toolsRequire = createRequire(join(dshSource, 'packages/core/tools/package.json'))
@@ -56,7 +56,7 @@ test('官方 schedule_*（会话任务工具）与项目 wake_task_*（语音链
 
   try {
     mkdirSync(bundleLib, { recursive: true })
-    const builtBundle = join(repo, '.runtime/dsh/bundles/voice-terminal-test')
+    const builtBundle = join(repo, '.local/build/dsh/bundles/voice-terminal-test')
     for (const file of ['package.json', 'lib']) cpSync(join(builtBundle, file), join(bundleDir, file), { recursive: true })
     const scopedModules = join(bundleDir, 'node_modules/@deepseek-ai')
     mkdirSync(scopedModules, { recursive: true })

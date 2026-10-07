@@ -17,15 +17,20 @@ class AppPaths:
 
     @classmethod
     def resolve(cls, program_root: Path | None = None, *, data_dir: Path | None = None) -> "AppPaths":
-        program = Path(os.environ.get("VOICE_PROGRAM_ROOT") or program_root or Path(__file__).resolve().parents[1]).resolve()
-        install = Path(os.environ.get("VOICE_INSTALL_ROOT") or program).resolve()
+        from .local_layout import project_root, read_portable, assert_launch_ready
+        program = Path(os.environ.get("VOICE_PROGRAM_ROOT") or program_root or project_root()).resolve()
+        default_install = program / '.local' if (program / 'apps/desktop/Cargo.toml').is_file() else program.parent
+        install = Path(os.environ.get("VOICE_INSTALL_ROOT") or default_install).resolve()
+        assert_launch_ready(install)
         value = data_dir or os.environ.get("VOICE_DATA_DIR")
+        if not value and (install / 'portable.json').is_file():
+            value = read_portable(install)['data_dir']
         data = (install / value).resolve() if value else None
         if data:
             source_checkout = (program / "apps/desktop/Cargo.toml").is_file()
-            development_data = (install == program or source_checkout) and data.is_relative_to(program) and data.relative_to(program).parts[:1] in [(".runtime",), ("data",)]
+            development_data = (install == program or source_checkout) and data.is_relative_to(program) and data.relative_to(program).parts[:1] in [(".local",), ("data",)]
             if (data == program or program.is_relative_to(data) or data.is_relative_to(program)) and not development_data:
-                raise ValueError("用户数据目录不能与程序包重叠；源码模式仅允许独立的 data（数据）或 .runtime（本地运行）子目录。")
+                raise ValueError("用户数据目录不能与程序包重叠；源码模式仅允许独立的 data（数据）或 .local（本机资源）子目录。")
         return cls(program, install, data)
 
     @property
@@ -50,19 +55,19 @@ class AppPaths:
 
     @property
     def history(self) -> Path:
-        return self.data_root / "history" if self.data_root else self.program_root / ".runtime/continuity"
+        return (self.data_root or self.install_root / 'data') / 'history'
 
     @property
     def logs(self) -> Path:
-        return (self.data_root or self.program_root) / "logs"
+        return self.cache / 'logs'
 
     @property
     def cache(self) -> Path:
-        return self.data_root / "cache" if self.data_root else self.program_root / ".runtime/cache"
+        return self.install_root / 'cache'
 
     @property
     def application_state(self) -> Path:
-        return self.data_root / "state/application" if self.data_root else self.program_root / ".runtime/application"
+        return (self.data_root or self.install_root / 'data') / 'state/application'
 
     @property
     def env_file(self) -> Path:
@@ -70,7 +75,7 @@ class AppPaths:
 
     @property
     def dsh_home(self) -> Path:
-        return self.data_root / "dsh" if self.data_root else self.program_root / ".runtime/dsh/home"
+        return (self.data_root or self.install_root / 'data') / 'dsh'
 
     @property
     def keywords(self) -> Path:
@@ -78,6 +83,15 @@ class AppPaths:
 
     def environment(self) -> dict[str, str]:
         values = {"VOICE_PROGRAM_ROOT": str(self.program_root), "VOICE_INSTALL_ROOT": str(self.install_root)}
+        if (self.install_root / 'portable.json').is_file():
+            from .local_layout import read_portable
+            selected = read_portable(self.install_root)
+            runtime = self.install_root / selected['dsh']
+            metadata = json.loads((runtime / 'runtime.json').read_text(encoding='utf-8-sig'))
+            from .distribution import safe_path
+            values.update(VOICE_MODEL_DIR=str(self.install_root / selected['models']), VOICE_DSH_RUNTIME=str(runtime),
+                          VOICE_NODE_EXECUTABLE=str(safe_path(runtime, metadata['node'])),
+                          WEBVIEW2_BROWSER_EXECUTABLE_FOLDER=str(self.install_root / selected['webview2']))
         if self.data_root:
             values.update(VOICE_DATA_DIR=str(self.data_root), VOICE_RESOURCE_POLICY=str(self.config / "runtime-resources.json"),
                           PYTHONPYCACHEPREFIX=str(self.cache / "python"), PYTHONNOUSERSITE="1")
@@ -92,7 +106,7 @@ class AppPaths:
             return
         for directory in (self.config, self.persona, self.speaker, self.history, self.logs, self.cache,
                           self.application_state, self.data_root / "imports", self.dsh_home, self.keywords.parent):
-            if not directory.resolve().is_relative_to(self.data_root):
+            if not directory.resolve().is_relative_to(self.data_root) and not directory.resolve().is_relative_to(self.cache):
                 raise ValueError(f"用户数据子目录指向数据根目录之外：{directory.name}")
             directory.mkdir(parents=True, exist_ok=True)
         # 真实写入测试同时覆盖权限与只读盘，不能仅凭 os.access（权限推断）判断。

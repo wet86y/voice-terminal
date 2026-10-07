@@ -61,7 +61,7 @@ def install(root: Path, *, smart_turn_gpu: bool = False) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", type=Path, default=Path(r"D:\模型\voice-terminal"))
+    parser.add_argument("--model-dir", type=Path, default=__import__('voice_terminal.paths', fromlist=['AppPaths']).AppPaths.resolve().install_root / 'models')
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--no-proxy", action="store_true", help="Disable proxy only inside this download process")
     parser.add_argument("--smart-turn-gpu", action="store_true", help="同时下载并验证 SmartTurn（语音结束判断）显卡模型，保留中央处理器回退模型")

@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.duration is not None and args.duration <= 0:
         parser.error("--duration must be greater than zero")
 
-    root = Path(__file__).resolve().parents[2]
+    root = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
     config = load_config(root / "config" / "default.yaml", args.config if args.config.is_file() else None)
     config = ProductSettingsStore(
         path=root / "config" / "product-settings.json",

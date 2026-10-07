@@ -75,7 +75,7 @@ Voice（语音）主线与当前关联的 DSH（后台代理执行环境）会�
 
 ## 完整成对归档
 
-项目本地 `.runtime/continuity/archives/<archive_id>/`（成对会话归档目录）包含：
+项目本地 `.local/data/history/archives/<archive_id>/`（成对会话归档目录）包含：
 
 | 文件 | 内容 |
 | --- | --- |
@@ -101,7 +101,7 @@ Voice（语音）主线与当前关联的 DSH（后台代理执行环境）会�
 
 提交在既有会话交接锁内按顺序完成：成对归档 → 新提取材料 → 文档保存 → 明确消费 → 旧会话退役与成对身份轮换。恢复标记固定目标身份并记录 `phase`（提交阶段）：`prepared`（准备提交）、`document_saved`（文档已保存）、`consumed`（消费已确认）。重复恢复幂等；文档落盘失败不消费，后续失败则继续原事务。归档缺失会阻止提交，避免文档产生缺失文件引用。
 
-当前活动会话使用 `history/archives/.journals/active-session.sqlite3`（当前会话数据库）持续保存完整模型语义历史、有界聊天视图、上下文代次和语音身份，重启恢复同一会话，不重新播放语音或执行旧动作。`active-voice-session.json`（当前语音身份镜像）继续用于旧版本身份迁移和交接事务关联，同时兼容既有两种会话标识格式。启用 DSH 时沿用其运行数据目录中的身份镜像；没有启用 DSH 时保存到 `.runtime/continuity/`（交接运行目录），未创建后台会话也能继续原交接。数据库检查点先提交依赖正文，再更新身份镜像；恢复检查点损坏时报告错误并保留数据，禁止回退到空历史。
+当前活动会话使用 `history/archives/.journals/active-session.sqlite3`（当前会话数据库）持续保存完整模型语义历史、有界聊天视图、上下文代次和语音身份，重启恢复同一会话，不重新播放语音或执行旧动作。`active-voice-session.json`（当前语音身份镜像）继续用于旧版本身份迁移和交接事务关联，同时兼容既有两种会话标识格式。无论是否启用 DSH（代理执行宿主），正式和源码业务均使用 `.local/data/history/`（唯一历史目录），未创建后台会话也能继续原交接。数据库检查点先提交依赖正文，再更新身份镜像；恢复检查点损坏时报告错误并保留数据，禁止回退到空历史。
 
 ### 验证命令
 
@@ -120,7 +120,7 @@ npm run build
 
 ## DSH 原生定时任务与项目唤醒任务
 
-两套定时任务分别服务于 DSH 会话和 Voice（语音）链路，使用不同工具名、存储及投递目标，可以同时启用，互不导入。2026-10-05 共存修复已在便携应用 `apps/20261005-dsh-task-coexist`（桌面程序目录）完成重启和实际验收；详细结果见[本机共存验收记录](../.runtime/dsh-coexist-20261005/acceptance.md)。
+两套定时任务分别服务于 DSH 会话和 Voice（语音）链路，使用不同工具名、存储及投递目标，可以同时启用，互不导入。2026-10-05 共存修复已在便携应用 `apps/20261005-dsh-task-coexist`（桌面程序目录）完成重启和实际验收；详细结果见[本机共存验收记录](local-layout.md)。
 
 DSH 原生 Schedule（会话定时任务）由可选官方 Automation Bundle（自动化功能包）
 `@deepseek-ai/dsh-experimental-schedule-bundle` 提供。该 Bundle（功能包）默认关闭，用户可在 Web（网页）侧栏的
@@ -155,4 +155,4 @@ Plugins（插件）页面启用；启用后提供 `schedule_create/list/update/d
 
 ## 安装
 
-停止当前 Voice Server（语音服务端）及其受管 DSH 进程后，运行 `scripts/setup-dsh.ps1`（DSH 安装脚本），然后按项目日常方式重新启动 Voice Server。安装脚本会备份现有 DSH home、预检旧 Voice（语音）任务、构建两个项目插件并更新 Web profile（网页配置）；用户已启用的官方 Automation Bundle（自动化功能包）会保留。
+停止当前 Voice Server（语音服务端）及其受管 DSH 进程后，运行 `scripts/setup-dsh.ps1`（DSH 安装脚本），然后按项目日常方式重新启动 Voice Server。安装脚本复用生产运行目录与唯一代理数据目录，构建统一插件并同步 Web profile（网页配置）；重要持久数据按唯一滚动备份规则保护；用户已启用的官方 Automation Bundle（自动化功能包）会保留。

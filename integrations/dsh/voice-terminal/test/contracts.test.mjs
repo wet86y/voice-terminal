@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 process.env.VOICE_DSH_CALLBACK_ORIGIN = 'http://127.0.0.1:18765'
 process.env.VOICE_DSH_BRIDGE_TOKEN = 'isolated-test-token'
-const root = new URL('../../../../.runtime/dsh/bundles/voice-terminal-test/lib/', import.meta.url)
+const root = new URL('../../../../.local/build/dsh/bundles/voice-terminal-test/lib/', import.meta.url)
 const { CallbackScope } = await import(new URL('shared/callback.js', root))
 const { installRootTools } = await import(new URL('bridge/tools.js', root))
 

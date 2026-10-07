@@ -1,6 +1,6 @@
 """Speaker-verification regression benchmark.
 
-Produces a report under ``logs/evaluation/`` with the numbers the redesign is
+Produces a report under ``.local/cache/evaluation/`` with the numbers the redesign is
 accepted against:
 
 * frontend equivalence to the WeSpeaker reference frontend (A1)
@@ -21,9 +21,10 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 sys.path.insert(0, str(ROOT))
 
+from voice_terminal.paths import AppPaths
 from voice_terminal.config import load_config                       # noqa: E402
 from voice_terminal.speaker.engine import WeSpeakerOnnxEngine       # noqa: E402
 from voice_terminal.speaker.features import pcm_to_fbank            # noqa: E402
@@ -32,7 +33,7 @@ SR = 16000
 
 CORPUS_NOTE = """\
 语料局限（必须连同数字一起读）：
-  * `logs/evaluation/audio/` 是 Microsoft Huihui Desktop 合成语音，不是真人录音
+  * `.local/cache/evaluation/audio/` 是 Microsoft Huihui Desktop 合成语音，不是真人录音
     （见 docs/known-issues.md）。
   * 该目录中 8 个文件是同一次 60 秒录音的不同截断（首 20 秒字节相同），
     因此"同一说话人"的窗口高度相关，不能当作独立试对数量。
@@ -90,7 +91,8 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
-    config = load_config(args.config, ROOT / "config" / "local.yaml")
+    paths = AppPaths.resolve(ROOT)
+    config = load_config(args.config, paths.config / "local.yaml")
     model_path = config.speaker_model_path
     if not model_path.is_file():
         print(f"声纹模型不存在：{model_path}", file=sys.stderr)
@@ -99,11 +101,11 @@ def main() -> int:
     engine = WeSpeakerOnnxEngine(model_path, sample_rate=SR)
     engine.load()
 
-    audio_dir = ROOT / "logs" / "evaluation" / "audio"
-    impostor_files = sorted(Path(r"D:\模型\voice-terminal\kws\sherpa-onnx-kws-zipformer-zh-en-3M\test_wavs").glob("*.wav"))
+    audio_dir = ROOT / ".local/cache/evaluation" / "audio"
+    impostor_files = sorted((paths.install / "models/kws/sherpa-onnx-kws-zipformer-zh-en-3M/test_wavs").glob("*.wav"))
     impostor_files += [
-        Path(r"D:\模型\voice-terminal\funasr\fsmn-vad\example\vad_example.wav"),
-        Path(r"D:\模型\voice-terminal\funasr\paraformer-zh-streaming\example\asr_example.wav"),
+        (paths.install / "models/funasr/fsmn-vad/example/vad_example.wav"),
+        (paths.install / "models/funasr/paraformer-zh-streaming/example/asr_example.wav"),
     ]
 
     # A single 60 s recording, split by time: enroll on the first 30 s, test on
@@ -205,7 +207,7 @@ def main() -> int:
     ]
 
     report = "\n".join(lines)
-    out = args.out or (ROOT / "logs" / "evaluation" / "speaker-verification-latest.md")
+    out = args.out or (ROOT / ".local/cache/evaluation" / "speaker-verification-latest.md")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
     print(report)

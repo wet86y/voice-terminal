@@ -32,7 +32,7 @@ const nativeContent = JSON.stringify({ tables: { tasks: {
 writeFileSync(native, nativeContent, 'utf8')
 
 const { TaskService } = await import(
-  new URL('../../../../../.runtime/dsh/bundles/voice-terminal-test/lib/wake-tasks/task-service.js', import.meta.url).href,
+  new URL('../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/wake-tasks/task-service.js', import.meta.url).href,
 )
 
 test('preserves project history, keeps native tasks separate, and delivers to the current voice mainline', async () => {

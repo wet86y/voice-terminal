@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())))
 
 from .engine import InsufficientAudioError, WeSpeakerOnnxEngine
 from .quality import base_window_quality
@@ -327,7 +327,7 @@ async def run(config_path: Path | None = None) -> None:
         import websockets  # type: ignore
     except ImportError as exc:
         raise RuntimeError("缺少 websockets，请先运行安装脚本。") from exc
-    root = Path(__file__).resolve().parents[2]
+    root = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
     config = load_config(root / "config" / "default.yaml", config_path if config_path and config_path.is_file() else None)
     config = ProductSettingsStore(
         path=AppPaths.resolve(root).config / "product-settings.json",
@@ -449,7 +449,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Voice Terminal Speaker Worker")
     parser.add_argument("--config", type=Path, default=None)
     args = parser.parse_args()
-    root = Path(__file__).resolve().parents[2]
+    root = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
     paths = AppPaths.resolve(root)
     load_env_file(paths.env_file)
     configure_logging(paths.logs / "speaker-worker.log")

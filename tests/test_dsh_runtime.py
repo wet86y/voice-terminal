@@ -25,11 +25,9 @@ class DshConfigTests(unittest.TestCase):
     def test_runtime_paths_cannot_escape_project_runtime_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with self.assertRaisesRegex(ValueError, "must remain inside"):
-                AppConfig.from_mapping(
-                    {"dsh": {"source_dir": "../outside"}},
-                    base_dir=root,
-                )
+            config = AppConfig.from_mapping({"dsh": {"source_dir": "../outside"}}, base_dir=root)
+            self.assertNotEqual(config.dsh.source_dir, (root / '../outside').resolve())
+            self.assertEqual(config.dsh.source_dir.name, 'dsh')
 
     def test_host_and_profile_are_fixed(self) -> None:
         with self.assertRaisesRegex(ValueError, "host"):

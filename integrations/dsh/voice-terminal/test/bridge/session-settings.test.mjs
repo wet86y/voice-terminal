@@ -4,8 +4,8 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { inject } from '../../../../../.runtime/dsh/bundles/voice-terminal-test/lib/bridge/index.js'
-import { createAttachedVoiceSession, initializeVoiceTerminalSettings } from '../../../../../.runtime/dsh/bundles/voice-terminal-test/lib/bridge/settings.js'
+import { inject } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/index.js'
+import { createAttachedVoiceSession, initializeVoiceTerminalSettings } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/settings.js'
 
 test('Bridge 的 inject（依赖注入声明）包含设置代码调用的 llm（模型服务）', () => {
   assert.ok(inject.includes('llm'))

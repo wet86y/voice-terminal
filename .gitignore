@@ -24,6 +24,7 @@ config/speaker/
 *.part
 
 # Runtime artifacts (always local; do not version generated logs or reports)
+/.local/
 /logs/
 /reports/
 /.runtime/

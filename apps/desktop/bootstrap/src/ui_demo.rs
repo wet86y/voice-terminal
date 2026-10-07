@@ -12,7 +12,7 @@ fn source_root(executable: &Path) -> Result<PathBuf, String> {
         directory.join("apps/frontend/package.json").is_file()
             && directory.join("scripts/start-desktop.ps1").is_file()
     }).map(Path::to_path_buf).ok_or_else(||
-        "无法定位前端源码。请将 VoiceTerminalUIDemo.exe（演示入口）放在项目目录或其 .runtime/delivery（本机交付目录）中。".into())
+        "无法定位前端源码。请将 VoiceTerminalUIDemo.exe（演示入口）放在项目目录或其 .local（本机交付目录）中。".into())
 }
 
 fn start() -> Result<(), String> {
@@ -22,11 +22,11 @@ fn start() -> Result<(), String> {
     let root = voice_desktop_common::canonical_path(&source_root(
         &std::env::current_exe().map_err(|e| e.to_string())?,
     )?)?;
-    let desktop = root.join("apps/desktop/target/debug/VoiceTerminalDesktop.exe");
+    let desktop = root.join(".local/build/desktop/debug/VoiceTerminalDesktop.exe");
     if !desktop.is_file() {
         return Err("演示主程序尚未构建。请先执行 npm run dev:ui（演示开发）或 npm run desktop:publish（构建并更新两入口），再双击演示入口。".into());
     }
-    let logs = root.join(".runtime/desktop-ui-preview");
+    let logs = root.join(".local/cache/ui-demo");
     fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
     let log = fs::OpenOptions::new()
         .create(true)
@@ -76,10 +76,15 @@ mod tests {
         fs::write(root.join("apps/frontend/package.json"), b"{}").unwrap();
         fs::write(root.join("scripts/start-desktop.ps1"), b"").unwrap();
         assert_eq!(
-            source_root(&root.join(".runtime/delivery/VoiceTerminalUIDemo.exe")).unwrap(),
+            source_root(&root.join(".local/VoiceTerminalUIDemo.exe")).unwrap(),
             root
         );
         fs::remove_dir_all(&root).unwrap();
-        assert!(source_root(&root.join("VoiceTerminalUIDemo.exe")).is_err());
+        assert_ne!(
+            source_root(&root.join("VoiceTerminalUIDemo.exe"))
+                .ok()
+                .as_deref(),
+            Some(root.as_path())
+        );
     }
 }

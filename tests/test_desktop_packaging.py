@@ -16,6 +16,229 @@ DSH_VERSION = '0.2.0-rc.2'  # DSH（代理宿主）版本。
 DSH_COMMIT = '639ed015397290b3745d163aafe02ffee4aa3f84'  # commit（源码提交号）。
 
 
+@pytest.fixture
+def publisher(tmp_path, monkeypatch):
+    from voice_terminal.local_layout import default_portable
+    module = script('assemble-desktop')
+    root, desktop = tmp_path / '本机', tmp_path / '原生构建'
+    desktop.mkdir()
+    for name in ('VoiceTerminal.exe', 'VoiceTerminalUIDemo.exe', 'VoiceTerminalDesktop.exe'):
+        (desktop / name).write_bytes(b'new-native')
+    for kind, relative in (('python', 'runtimes/python'), ('dsh', 'runtimes/dsh'), ('webview2', 'runtimes/webview2'), ('models', 'models')):
+        component = root / relative
+        component.mkdir(parents=True)
+        (component / 'content.bin').write_bytes(kind.encode())
+        if kind == 'dsh':
+            atomic_json(component / 'runtime.json', {'schema': 1, 'version': DSH_VERSION, 'commit': DSH_COMMIT, 'node': 'node.exe'})
+        atomic_json(component / 'manifest.json', manifest(component, kind=kind, build='current'))
+    atomic_json(root / 'portable.json', default_portable())
+    (root / 'data').mkdir()
+    (root / 'data/private.txt').write_text('真实用户数据', encoding='utf-8')
+    def collect(program, _desktop):
+        program.mkdir(parents=True)
+        (program / 'business.py').write_text('current-business', encoding='utf-8')
+        atomic_json(program / 'config/dsh/runtime.lock.json', {'version': DSH_VERSION, 'commit': DSH_COMMIT})
+    monkeypatch.setattr(module, 'collect_program', collect)
+    monkeypatch.setattr(module, 'require_stopped', lambda *_: None)
+    module.refresh_program(root, desktop, 'first')
+    return module, root, desktop
+
+
+def test_two_overwrite_updates_remove_stale_files_and_keep_one_combination(publisher):
+    module, root, desktop = publisher
+    (root / 'app/obsolete.py').write_text('old', encoding='utf-8')
+    private = (root / 'data/private.txt').read_bytes()
+    manifests = {p: (root / p / 'manifest.json').read_bytes() for p in ('runtimes/python', 'runtimes/dsh', 'runtimes/webview2', 'models')}
+    for build in ('second', 'third'):
+        module.refresh_program(root, desktop, build)
+        verify_install(root)
+        assert not (root / 'app/obsolete.py').exists()
+        assert (root / 'data/private.txt').read_bytes() == private
+        assert all((root / p / 'manifest.json').read_bytes() == content for p, content in manifests.items())
+        assert sorted(p.name for p in (root / 'runtimes').iterdir()) == ['dsh', 'python', 'webview2']
+        assert not (root / 'tmp/publish').exists()
+        assert not (root / 'tmp/update-transaction.json').exists()
+
+
+def test_build_failure_keeps_original_program_and_configuration(publisher, monkeypatch):
+    module, root, desktop = publisher
+    before = (root / 'app/release.json').read_bytes(), (root / 'portable.json').read_bytes()
+    def broken(*_): raise RuntimeError('构建失败')
+    monkeypatch.setattr(module, 'collect_program', broken)
+    with pytest.raises(RuntimeError, match='构建失败'):
+        module.refresh_program(root, desktop, 'failed')
+    assert before == ((root / 'app/release.json').read_bytes(), (root / 'portable.json').read_bytes())
+    assert not (root / 'tmp/publish').exists()
+
+
+def test_invalid_component_fails_before_swap(publisher, tmp_path):
+    import shutil
+    module, root, desktop = publisher
+    incoming = tmp_path / '候选环境'
+    shutil.copytree(root / 'runtimes/python', incoming)
+    (incoming / 'content.bin').write_bytes(b'corrupted')
+    before = (root / 'app/release.json').read_bytes()
+    with pytest.raises(ValueError, match='校验失败'):
+        module.refresh_program(root, desktop, 'bad', python_runtime=incoming)
+    assert (root / 'app/release.json').read_bytes() == before
+    verify_install(root)
+
+
+def test_component_update_replaces_whole_file_set(publisher, tmp_path):
+    module, root, desktop = publisher
+    incoming = tmp_path / '新环境'
+    incoming.mkdir()
+    (incoming / 'new.bin').write_bytes(b'new-python')
+    atomic_json(incoming / 'manifest.json', manifest(incoming, kind='python', build='new'))
+    module.refresh_program(root, desktop, 'updated', python_runtime=incoming)
+    assert not (root / 'runtimes/python/content.bin').exists()
+    assert (root / 'runtimes/python/new.bin').is_file()
+    verify_install(root)
+
+
+def test_project_candidate_moves_without_retaining_a_second_copy(publisher):
+    module, root, desktop = publisher
+    incoming = root / 'tmp/python-candidate'
+    incoming.mkdir(parents=True)
+    (incoming / 'new.bin').write_bytes(b'new-runtime')
+    atomic_json(incoming / 'manifest.json', manifest(incoming, kind='python', build='new'))
+    module.refresh_program(root, desktop, 'moved', python_runtime=incoming)
+    assert not incoming.exists()
+    assert (root / 'runtimes/python/new.bin').read_bytes() == b'new-runtime'
+    assert not (root / 'tmp/publish').exists()
+    verify_install(root)
+
+
+@pytest.mark.parametrize('failure', ['renamed:app', 'installed:app', 'installed:portable.json', 'verified'])
+def test_failed_swap_restores_full_combination(publisher, monkeypatch, failure):
+    from voice_terminal import local_update
+    module, root, desktop = publisher
+    before = (root / 'app/release.json').read_bytes(), (root / 'portable.json').read_bytes(), (root / 'VoiceTerminal.exe').read_bytes()
+    original = local_update.install
+    def install(*args, **kwargs):
+        def checkpoint(step):
+            if step == failure: raise OSError('模拟换入失败')
+        return original(*args, **kwargs, checkpoint=checkpoint)
+    monkeypatch.setattr(local_update, 'install', install)
+    with pytest.raises(OSError): module.refresh_program(root, desktop, 'failed')
+    assert before == ((root / 'app/release.json').read_bytes(), (root / 'portable.json').read_bytes(), (root / 'VoiceTerminal.exe').read_bytes())
+    verify_install(root)
+    assert not (root / 'tmp/publish').exists()
+
+
+@pytest.mark.parametrize('failure', ['renamed:app', 'installed:app', 'installed:portable.json'])
+def test_interrupted_update_recovers_before_next_publish(publisher, monkeypatch, failure):
+    from voice_terminal import local_update
+    module, root, desktop = publisher
+    before = (root / 'app/release.json').read_bytes()
+    original = local_update.install
+    def install(*args, **kwargs):
+        def checkpoint(step):
+            if step == failure: raise SystemExit('模拟进程中断')
+        return original(*args, **kwargs, checkpoint=checkpoint)
+    monkeypatch.setattr(local_update, 'install', install)
+    with pytest.raises(SystemExit): module.refresh_program(root, desktop, 'interrupted')
+    assert (root / 'tmp/update-transaction.json').exists()
+    with local_update.update_lock(root):
+        assert local_update.recover(root) == 'restored'
+    assert (root / 'app/release.json').read_bytes() == before
+    verify_install(root)
+    monkeypatch.setattr(local_update, 'install', original)
+    module.refresh_program(root, desktop, 'recovered')
+    verify_install(root)
+
+
+def test_export_only_current_declared_files_and_overwrites_latest(publisher):
+    _, root, _ = publisher
+    (root / 'cache').mkdir()
+    (root / 'cache/private.log').write_text('不交付', encoding='utf-8')
+    destination = root / 'releases/VoiceTerminal-latest.zip'
+    export = script('package-desktop').export
+    for _ in range(2):
+        export(root, destination)
+        with zipfile.ZipFile(destination) as archive:
+            assert archive.testzip() is None
+            assert all(not name.startswith(('data/', 'cache/', 'tmp/', 'build/', 'backups/', 'tools/', 'releases/')) for name in archive.namelist())
+            assert json.loads(archive.read('portable.json'))['schema'] == 2
+    assert {p.name for p in destination.parent.iterdir()} == {'VoiceTerminal-latest.zip', 'downloads.json'}
+
+
+def test_backup_restores_important_data_without_dependencies_or_cache(tmp_path):
+    from voice_terminal.local_files import backup_user_data
+    root = tmp_path / '本机'
+    for name in ('config/local.yaml', 'persona/user.md', 'speaker/user.npy', 'history/session.json', 'dsh/storages/tasks.json', '.env.local'):
+        path = root / 'data' / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(name.encode())
+    for name in ('cache/large.bin', 'logs/runtime.log', 'dsh/node_modules/large.bin'):
+        path = root / 'data' / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'exclude')
+    for _ in range(2):
+        record = backup_user_data(root)
+        assert len(record['files']) == 6
+        restored = tmp_path / '隔离恢复'
+        import shutil
+        shutil.copytree(root / 'backups/user-data', restored, dirs_exist_ok=True)
+        assert all(digest(restored / row['path']) == row['sha256'] for row in record['files'])
+    assert not (root / 'tmp/user-backup.old').exists()
+
+
+def test_native_cache_reused_until_lock_changes(tmp_path, monkeypatch):
+    module = script('prepare-build-cache')
+    monkeypatch.setattr(module, 'ROOT', tmp_path)
+    lock = tmp_path / 'apps/desktop/Cargo.lock'
+    lock.parent.mkdir(parents=True)
+    lock.write_text('version-1')
+    cached = tmp_path / '.local/build/desktop/old.bin'
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b'cached')
+    module.prepare('desktop', 'compiler-1')
+    module.prepare('desktop', 'compiler-1')
+    assert cached.exists()
+    lock.write_text('version-2')
+    module.prepare('desktop', 'compiler-1')
+    assert not cached.exists()
+
+
+def test_dsh_cache_refresh_preserves_tracked_sources(tmp_path, monkeypatch):
+    module = script('prepare-build-cache')
+    monkeypatch.setattr(module, 'ROOT', tmp_path)
+    source = tmp_path / '.local/build/dsh/source'
+    for relative in ('config/dsh/runtime.lock.json', '.local/build/dsh/source/pnpm-lock.yaml',
+                     '.local/build/dsh/source/packages/a/lib/tracked.js',
+                     '.local/build/dsh/source/packages/b/lib/generated.js',
+                     '.local/build/dsh/source/node_modules/old.js'):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('content')
+    monkeypatch.setattr(module.subprocess, 'check_output', lambda _: b'packages/a/lib/tracked.js\0')
+    module.prepare('dsh', 'node-1')
+    module.prepare('dsh', 'node-2')
+    assert (source / 'packages/a/lib/tracked.js').is_file()
+    assert not (source / 'packages/b/lib').exists()
+    assert not (source / 'node_modules').exists()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows（操作系统）文件占用验收')
+def test_real_file_lock_rolls_back_without_mixed_version(publisher):
+    import ctypes
+    module, root, desktop = publisher
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    handle = kernel.CreateFileW(str(root / 'VoiceTerminal.exe'), 0x80000000, 1, None, 3, 0, None)
+    assert handle != ctypes.c_void_p(-1).value
+    before = (root / 'app/release.json').read_bytes()
+    try:
+        with pytest.raises(OSError): module.refresh_program(root, desktop, 'locked')
+        assert (root / 'app/release.json').read_bytes() == before
+        verify_install(root)
+    finally:
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel.CloseHandle(handle)
+
+
 def script(name):
     specification = importlib.util.spec_from_file_location(name.replace('-', '_'), ROOT / 'scripts' / (name + '.py'))
     module = importlib.util.module_from_spec(specification)
@@ -71,333 +294,6 @@ def test_frontend_collection_rejects_additional_entry_and_preview_dependency(tmp
         script('assemble-desktop').collect_frontend(source, tmp_path / '发布')
 
 
-def candidate(root):
-    app = root / 'apps/current'
-    app.mkdir(parents=True)
-    (app / 'business.py').write_text('旧程序', encoding='utf-8')
-    (root / 'VoiceTerminal.exe').write_bytes(b'old-launcher')
-    (root / 'Verify-Package.ps1').write_bytes(b'old-verifier')
-    release = manifest(app, kind='app', build='current')
-    release.update(components=[], root_files=[{'path':name,'size':(root/name).stat().st_size,'sha256':digest(root/name)}
-                   for name in ('VoiceTerminal.exe','Verify-Package.ps1')])
-    atomic_json(app / 'release.json', release)
-    selection = {'schema':1,'app':'apps/current','external_python':None,'external_models':None}
-    atomic_json(root / 'portable.json', {'data_dir':'data', **selection})
-    atomic_json(root / 'data/state/active.json', selection)
-    (root / 'data/private.txt').write_text('用户内容不得进入包', encoding='utf-8')
-    return selection
-
-
-def dsh_runtime(path, *, build='639ed015-bundle', version=DSH_VERSION, commit=DSH_COMMIT, extra=None):
-    """生成测试用 DSH（代理宿主）运行目录、版本记录和逐文件清单。"""
-    path.mkdir(parents=True)
-    atomic_json(path / 'runtime.json', {
-        'schema':1, 'version':version, 'commit':commit, 'bridge_protocol':'2.0',
-        'node':'node.exe', 'entry':'runtime-bootstrap.mjs', 'schedule':'schedule.mjs',
-    })
-    (path / 'node.exe').write_bytes(b'node runtime')
-    (path / 'runtime-bootstrap.mjs').write_text('bootstrap', encoding='utf-8')
-    (path / 'schedule.mjs').write_text('schedule', encoding='utf-8')
-    if extra is not None:
-        (path / 'extra.bin').write_bytes(extra)
-    atomic_json(path / 'manifest.json', manifest(path, kind='dsh', build=build))
-    return path
-
-
-def collect_locked_program(module, *, version=DSH_VERSION, commit=DSH_COMMIT):
-    """替换程序收集器，并写入 runtime lock（运行时锁版）。"""
-    def collect(target, _desktop):
-        target.mkdir(parents=True)
-        (target / 'business.py').write_text('新程序', encoding='utf-8')
-        atomic_json(target / 'config/dsh/runtime.lock.json', {
-            'schema_version':1, 'version':version, 'commit':commit,
-        })
-    module.collect_program = collect
-
-
-@pytest.mark.parametrize('private_in_active', (False, True))
-def test_package_only_publishes_declared_files_and_verified_default(tmp_path, monkeypatch, private_in_active):
-    root = tmp_path / '应用'
-    selected = candidate(root)
-    atomic_json(root / 'portable.json', {'data_dir':'data', **selected,'app':'apps/missing','private':'不能发布'})
-    if private_in_active:
-        atomic_json(root / 'data/state/active.json', {**selected,'private':'不能发布'})
-    (root / '.env.local').write_text('PRIVATE=不能发布', encoding='utf-8')
-    module = script('package-desktop')
-    archive, components = tmp_path / '完整包.zip', tmp_path / '组件'
-    monkeypatch.setattr(sys, 'argv', ['package-desktop', '--root', str(root), '--output',str(archive),'--components',str(components)])
-    module.main()
-    with zipfile.ZipFile(archive) as content:
-        assert set(content.namelist()) == {'apps/current/business.py','apps/current/release.json','VoiceTerminal.exe','Verify-Package.ps1','portable.json'}
-        assert json.loads(content.read('portable.json')) == {'data_dir':'data', **selected}
-        assert b'PRIVATE' not in b''.join(content.read(name) for name in content.namelist())
-    assert (root / '.env.local').is_file() and (root / 'data/private.txt').is_file()
-
-
-@pytest.mark.skipif(os.name != 'nt', reason='Windows（操作系统）目录联接验证')
-def test_archive_rejects_ancestor_junction_before_portable_override(tmp_path):
-    root = tmp_path / '包'
-    data = root / 'data'
-    data.mkdir(parents=True)
-    atomic_json(data / 'private.json', {'schema':1,'private':'不能发布'})
-    link = root / 'alias'
-    subprocess.run(['powershell.exe','-NoProfile','-Command',
-        'New-Item -ItemType Junction -Path $env:VOICE_TEST_LINK -Value $env:VOICE_TEST_TARGET -ErrorAction Stop | Out-Null'],
-        env={**os.environ,'VOICE_TEST_LINK':str(link),'VOICE_TEST_TARGET':str(data)},check=True,capture_output=True)
-    try:
-        module = script('assemble-desktop')
-        with pytest.raises(ValueError, match='链接|重解析'):
-            module.archive(root,tmp_path/'unsafe.zip',include_roots=('alias/private.json',),overrides={'alias/private.json':b'{}'})
-        assert not (tmp_path/'unsafe.zip').exists()
-    finally:
-        link.rmdir()  # 仅移除本测试创建的联接，保留数据目标。
-
-
-def test_refresh_rolls_back_failed_selection_and_can_retry_same_build(tmp_path, monkeypatch):
-    root, desktop = tmp_path / '包', tmp_path / '构建'
-    candidate(root)
-    desktop.mkdir()
-    (desktop / 'VoiceTerminal.exe').write_bytes(b'new-launcher')
-    runtime = dsh_runtime(tmp_path / 'DSH')
-    module = script('assemble-desktop')
-    collect_locked_program(module)
-    monkeypatch.setattr(module,'require_stopped',lambda *_:None)
-    originals = {name:(root/name).read_bytes() for name in ('VoiceTerminal.exe','Verify-Package.ps1','portable.json','data/state/active.json','data/private.txt')}
-    writer = module.atomic_json
-    def fail_once(path,value):
-        if path == root / 'portable.json':
-            raise OSError('模拟磁盘提交失败')
-        return writer(path,value)
-    monkeypatch.setattr(module,'atomic_json',fail_once)
-    with pytest.raises(OSError, match='模拟'):
-        module.refresh_program(root,desktop,'next',runtime)
-    assert not (root / 'apps/next').exists()
-    assert not (root / 'runtimes/dsh/639ed015-bundle').exists()
-    assert all((root/name).read_bytes() == content for name,content in originals.items())
-    monkeypatch.setattr(module,'atomic_json',writer)
-    module.refresh_program(root,desktop,'next',runtime)
-    assert json.loads((root/'data/state/active.json').read_text(encoding='utf-8'))['app'] == 'apps/next'
-    assert json.loads((root/'data/state/active.json').read_text(encoding='utf-8'))['dsh'] == 'runtimes/dsh/639ed015-bundle'
-    assert (root/'data/private.txt').read_bytes() == originals['data/private.txt']
-    verify_install(root)
-
-
-def test_refresh_validation_failure_leaves_original_selection(tmp_path, monkeypatch):
-    root, desktop = tmp_path / '包', tmp_path / '构建'
-    candidate(root)
-    desktop.mkdir(); (desktop/'VoiceTerminal.exe').write_bytes(b'new-launcher')
-    module = script('assemble-desktop')
-    def failed_copy(target,_desktop):
-        target.mkdir(parents=True); (target/'partial').write_text('部分副本')
-        raise OSError('模拟源码收集失败')
-    monkeypatch.setattr(module,'collect_program',failed_copy)
-    monkeypatch.setattr(module,'require_stopped',lambda *_:None)
-    with pytest.raises(OSError, match='模拟'):
-        module.refresh_program(root,desktop,'next')
-    assert not (root/'apps/next').exists()
-    assert (root/'VoiceTerminal.exe').read_bytes() == b'old-launcher'
-    assert json.loads((root/'data/state/active.json').read_text(encoding='utf-8'))['app'] == 'apps/current'
-
-
-def test_refresh_replaces_dsh_and_verify_install_accepts_new_selection(tmp_path, monkeypatch):
-    """切换 DSH（代理宿主）组件后，新程序清单与启用路径必须一致。"""
-    root, desktop = tmp_path / '包', tmp_path / '构建'
-    candidate(root)
-    desktop.mkdir()
-    (desktop / 'VoiceTerminal.exe').write_bytes(b'new-launcher')
-    runtime = dsh_runtime(tmp_path / 'DSH')
-    module = script('assemble-desktop')
-    collect_locked_program(module)
-    monkeypatch.setattr(module, 'require_stopped', lambda *_:None)
-
-    module.refresh_program(root, desktop, 'next', runtime)
-
-    expected = 'runtimes/dsh/639ed015-bundle'
-    active = json.loads((root / 'data/state/active.json').read_text(encoding='utf-8'))
-    portable = json.loads((root / 'portable.json').read_text(encoding='utf-8'))
-    release = json.loads((root / 'apps/next/release.json').read_text(encoding='utf-8'))
-    component = next(item for item in release['components'] if item['kind'] == 'dsh')
-    assert active['dsh'] == portable['dsh'] == expected
-    assert component == {
-        'kind':'dsh', 'path':expected,
-        'manifest_sha256':digest(root / expected / 'manifest.json'),
-        'build':'639ed015-bundle',
-    }
-    assert (root / 'apps/current/business.py').read_text(encoding='utf-8') == '旧程序'
-    assert (root / 'runtimes/dsh/639ed015-bundle/runtime.json').is_file()
-    verify_install(root)
-
-
-@pytest.mark.parametrize('invalid', ('manifest', 'version'))
-def test_refresh_rejects_bad_dsh_manifest_or_version_without_selection_changes(tmp_path, monkeypatch, invalid):
-    """坏 manifest（文件清单）或 runtime version（宿主版本）不得改变启用选择。"""
-    root, desktop = tmp_path / '包', tmp_path / '构建'
-    candidate(root)
-    desktop.mkdir()
-    (desktop / 'VoiceTerminal.exe').write_bytes(b'new-launcher')
-    kwargs = {'version': '0.1.7-rc.2'} if invalid == 'version' else {}
-    runtime = dsh_runtime(tmp_path / 'DSH', **kwargs)
-    if invalid == 'manifest':
-        record = json.loads((runtime / 'manifest.json').read_text(encoding='utf-8'))
-        record['kind'] = 'python'
-        atomic_json(runtime / 'manifest.json', record)
-    module = script('assemble-desktop')
-    collect_locked_program(module)
-    monkeypatch.setattr(module, 'require_stopped', lambda *_:None)
-    originals = {name:(root / name).read_bytes() for name in (
-        'VoiceTerminal.exe', 'Verify-Package.ps1', 'portable.json',
-        'data/state/active.json', 'data/private.txt',
-    )}
-
-    with pytest.raises(ValueError):
-        module.refresh_program(root, desktop, 'next', runtime)
-
-    assert all((root / name).read_bytes() == content for name, content in originals.items())
-    assert not (root / 'apps/next').exists()
-    assert not (root / 'runtimes/dsh').exists()
-    assert json.loads((root / 'data/state/active.json').read_text(encoding='utf-8'))['app'] == 'apps/current'
-
-
-def test_refresh_reuses_matching_dsh_build_and_rejects_same_build_mismatch(tmp_path, monkeypatch):
-    """同 build（构建标识）的 DSH 组件仅在完整清单一致时复用。"""
-    root, desktop = tmp_path / '包', tmp_path / '构建'
-    candidate(root)
-    desktop.mkdir()
-    (desktop / 'VoiceTerminal.exe').write_bytes(b'new-launcher')
-    runtime = dsh_runtime(tmp_path / 'DSH', extra=b'original bundle')
-    different = dsh_runtime(tmp_path / 'DSH-different', extra=b'different bundle')
-    module = script('assemble-desktop')
-    collect_locked_program(module)
-    monkeypatch.setattr(module, 'require_stopped', lambda *_:None)
-    copier = module.copy_component
-    copies = []
-    def count_copies(*args, **kwargs):
-        copies.append(args[1])
-        return copier(*args, **kwargs)
-    monkeypatch.setattr(module, 'copy_component', count_copies)
-
-    module.refresh_program(root, desktop, 'first', runtime)
-    installed = root / 'runtimes/dsh/639ed015-bundle'
-    original_files = {path.relative_to(installed).as_posix():path.read_bytes() for path in installed.rglob('*') if path.is_file()}
-    module.refresh_program(root, desktop, 'second', runtime)
-    assert len(copies) == 1
-    assert {path.relative_to(installed).as_posix():path.read_bytes() for path in installed.rglob('*') if path.is_file()} == original_files
-    assert json.loads((root / 'data/state/active.json').read_text(encoding='utf-8'))['app'] == 'apps/second'
-    verify_install(root)
-
-    with pytest.raises(ValueError, match='不一致'):
-        module.refresh_program(root, desktop, 'third', different)
-    assert json.loads((root / 'data/state/active.json').read_text(encoding='utf-8'))['app'] == 'apps/second'
-    assert not (root / 'apps/third').exists()
-    assert {path.relative_to(installed).as_posix():path.read_bytes() for path in installed.rglob('*') if path.is_file()} == original_files
-    verify_install(root)
-
-
-def test_main_forwards_dsh_runtime_during_program_refresh(tmp_path, monkeypatch):
-    """main（命令行入口）必须把 --dsh-runtime 参数传给刷新流程。"""
-    root, desktop, runtime = tmp_path / '包', tmp_path / '构建', tmp_path / 'DSH'
-    candidate(root)
-    desktop.mkdir()
-    (desktop / 'VoiceTerminal.exe').write_bytes(b'launcher')
-    (desktop / 'VoiceTerminalDesktop.exe').write_bytes(b'desktop')
-    module = script('assemble-desktop')
-    received = []
-    monkeypatch.setattr(module, 'refresh_program', lambda *args:received.append(args))
-    monkeypatch.setattr(sys, 'argv', [
-        'assemble-desktop', '--output', str(root), '--desktop', str(desktop),
-        '--build', 'next', '--refresh-program', '--dsh-runtime', str(runtime),
-    ])
-
-    module.main()
-
-    assert received == [(root.resolve(), desktop.resolve(), 'next', runtime, None, None)]
-
-
-def python_runtime(path, *, profile='cu128', content=b'embedded-python'):
-    """生成解释器组件夹具，用于验证设备组合切换与事务回滚。"""
-    path.mkdir()
-    (path / 'python.exe').write_bytes(content)
-    atomic_json(path / 'runtime.json', {'schema':1, 'python':'3.12.10', 'profile':profile})
-    atomic_json(path / 'manifest.json', manifest(path, kind='python', build='cuda-runtime'))
-    return path
-
-
-def test_refresh_switches_python_runtime_and_keeps_user_data(tmp_path, monkeypatch):
-    root, desktop = tmp_path / '包', tmp_path / '构建'
-    candidate(root)
-    desktop.mkdir()
-    (desktop / 'VoiceTerminal.exe').write_bytes(b'launcher')
-    runtime = python_runtime(tmp_path / 'CUDA')
-    module = script('assemble-desktop')
-    collect_locked_program(module)
-    monkeypatch.setattr(module, 'require_stopped', lambda *_:None)
-    original = (root / 'data/private.txt').read_bytes()
-    module.refresh_program(root, desktop, 'cuda-app', python_runtime=runtime)
-    active = json.loads((root / 'data/state/active.json').read_text(encoding='utf-8'))
-    portable = json.loads((root / 'portable.json').read_text(encoding='utf-8'))
-    assert active['python'] == portable['python'] == 'runtimes/python/cuda-runtime/python.exe'
-    assert active['external_python'] is None
-    assert (root / 'data/private.txt').read_bytes() == original
-    verify_install(root)
-
-
-def test_python_switch_failure_rolls_back_only_the_new_component(tmp_path, monkeypatch):
-    root, desktop = tmp_path / '包', tmp_path / '构建'
-    candidate(root)
-    desktop.mkdir()
-    (desktop / 'VoiceTerminal.exe').write_bytes(b'launcher')
-    runtime = python_runtime(tmp_path / 'CUDA')
-    module = script('assemble-desktop')
-    collect_locked_program(module)
-    monkeypatch.setattr(module, 'require_stopped', lambda *_:None)
-    originals = {name:(root / name).read_bytes() for name in ('portable.json', 'data/state/active.json', 'VoiceTerminal.exe')}
-    writer = module.atomic_json
-    def fail_selection(path, value):
-        if path == root / 'portable.json':
-            raise OSError('模拟启用记录写入失败')
-        writer(path, value)
-    monkeypatch.setattr(module, 'atomic_json', fail_selection)
-    with pytest.raises(OSError, match='模拟'):
-        module.refresh_program(root, desktop, 'cuda-app', python_runtime=runtime)
-    assert not (root / 'apps/cuda-app').exists()
-    assert not (root / 'runtimes/python/cuda-runtime').exists()
-    assert all((root / name).read_bytes() == data for name, data in originals.items())
-    verify_install(root)
-
-
-def test_python_switch_reuses_same_component_and_rejects_conflicting_build(tmp_path, monkeypatch):
-    root, desktop = tmp_path / '包', tmp_path / '构建'
-    candidate(root)
-    desktop.mkdir()
-    (desktop / 'VoiceTerminal.exe').write_bytes(b'launcher')
-    runtime = python_runtime(tmp_path / 'CUDA')
-    different = python_runtime(tmp_path / 'CUDA-other', content=b'different')
-    module = script('assemble-desktop')
-    collect_locked_program(module)
-    monkeypatch.setattr(module, 'require_stopped', lambda *_:None)
-    module.refresh_program(root, desktop, 'first', python_runtime=runtime)
-    module.refresh_program(root, desktop, 'second', python_runtime=runtime)
-    with pytest.raises(ValueError, match='不一致'):
-        module.refresh_program(root, desktop, 'third', python_runtime=different)
-    assert json.loads((root / 'data/state/active.json').read_text(encoding='utf-8'))['app'] == 'apps/second'
-    verify_install(root)
-
-
-def test_main_forwards_python_component_during_refresh(tmp_path, monkeypatch):
-    root, desktop, runtime = tmp_path / '包', tmp_path / '构建', tmp_path / 'CUDA'
-    candidate(root)
-    desktop.mkdir()
-    for name in ('VoiceTerminal.exe', 'VoiceTerminalDesktop.exe'):
-        (desktop / name).write_bytes(b'launcher')
-    module = script('assemble-desktop')
-    received = []
-    monkeypatch.setattr(module, 'refresh_program', lambda *args:received.append(args))
-    monkeypatch.setattr(sys, 'argv', ['assemble-desktop', '--output', str(root), '--desktop', str(desktop),
-                                   '--build', 'next', '--refresh-program', '--python-runtime', str(runtime)])
-    module.main()
-    assert received == [(root.resolve(), desktop.resolve(), 'next', None, runtime, None)]
-
-
 def test_cuda_probe_requires_a_real_successful_calculation(monkeypatch, tmp_path):
     from types import SimpleNamespace
     module = script('build-runtime')
@@ -431,66 +327,3 @@ def core_model_source(path):
     (smart / 'smart-turn-v3.2-gpu.onnx').write_bytes(b'gpu weights')
     (path / module.CORE_MODELS[0] / 'keywords.txt').write_bytes(b'user keywords')
     return path
-
-
-def test_refresh_switches_both_model_variants_and_reuses_component_without_user_data_changes(tmp_path, monkeypatch):
-    root, desktop = tmp_path / '包', tmp_path / '构建'
-    candidate(root)
-    desktop.mkdir()
-    (desktop / 'VoiceTerminal.exe').write_bytes(b'launcher')
-    models = core_model_source(tmp_path / '模型来源')
-    module = script('assemble-desktop')
-    collect_locked_program(module)
-    monkeypatch.setattr(module, 'require_stopped', lambda *_:None)
-    original = (root / 'data/private.txt').read_bytes()
-    module.refresh_program(root, desktop, 'first', models=models)
-    active = json.loads((root / 'data/state/active.json').read_text())
-    installed = root / active['models']
-    assert (installed / 'analysis/smart-turn/smart-turn-v3.2-gpu.onnx').read_bytes() == b'gpu weights'
-    assert (installed / 'analysis/smart-turn/smart-turn-v3.2-cpu.onnx').read_bytes() == b'cpu weights'
-    assert not (installed / module.CORE_MODELS[0] / 'keywords.txt').exists()
-    assert (root / 'data/private.txt').read_bytes() == original
-    module.refresh_program(root, desktop, 'second', models=models)
-    assert json.loads((root / 'data/state/active.json').read_text())['models'] == active['models']
-    assert len(list((root / 'models').iterdir())) == 1
-    verify_install(root)
-
-
-def test_model_switch_failure_rolls_back_new_component_and_selection(tmp_path, monkeypatch):
-    root, desktop = tmp_path / '包', tmp_path / '构建'
-    candidate(root)
-    desktop.mkdir()
-    (desktop / 'VoiceTerminal.exe').write_bytes(b'launcher')
-    models = core_model_source(tmp_path / '模型来源')
-    module = script('assemble-desktop')
-    collect_locked_program(module)
-    monkeypatch.setattr(module, 'require_stopped', lambda *_:None)
-    originals = {name:(root / name).read_bytes() for name in ('portable.json', 'data/state/active.json', 'VoiceTerminal.exe')}
-    writer = module.atomic_json
-    def fail_selection(path, value):
-        if path == root / 'portable.json':
-            raise OSError('模拟启用记录写入失败')
-        writer(path, value)
-    monkeypatch.setattr(module, 'atomic_json', fail_selection)
-    with pytest.raises(OSError, match='模拟'):
-        module.refresh_program(root, desktop, 'first', models=models)
-    assert not (root / 'apps/first').exists()
-    assert list((root / 'models').iterdir()) == []
-    assert all((root / name).read_bytes() == content for name,content in originals.items())
-    verify_install(root)
-
-
-def test_main_forwards_model_source_during_refresh(tmp_path, monkeypatch):
-    root, desktop = tmp_path / '包', tmp_path / '构建'
-    candidate(root)
-    desktop.mkdir()
-    for name in ('VoiceTerminal.exe', 'VoiceTerminalDesktop.exe'):
-        (desktop / name).write_bytes(b'launcher')
-    module = script('assemble-desktop')
-    received = []
-    monkeypatch.setattr(module, 'refresh_program', lambda *args:received.append(args))
-    models = tmp_path / '模型来源'
-    monkeypatch.setattr(sys, 'argv', ['assemble-desktop', '--output', str(root), '--desktop', str(desktop),
-                                   '--build', 'next', '--refresh-program', '--models', str(models)])
-    module.main()
-    assert received == [(root.resolve(), desktop.resolve(), 'next', None, None, models)]
