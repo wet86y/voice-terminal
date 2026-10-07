@@ -500,14 +500,14 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         && incoming.phase !== current.phase) return
       const merged: ShadowActivity = { ...current, ...incoming }
       if (incoming.phase === 'delta') {
-        if (incoming.delta) merged.text = `${current.text || ''}${incoming.delta}`.slice(0, 4000)
+        if (incoming.delta) merged.text = `${current.text || ''}${incoming.delta}`.slice(-4000)
         delete merged.delta
       }
       activities[index] = merged
     } else {
       const item = { ...incoming }
       if (item.phase === 'delta' && item.delta) {
-        item.text = item.delta.slice(0, 4000)
+        item.text = item.delta.slice(-4000)
         delete item.delta
       }
       activities.push(item)

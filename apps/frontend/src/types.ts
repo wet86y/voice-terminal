@@ -278,7 +278,9 @@ export interface ShadowActivity {
 }
 
 export interface ShadowProductSnapshot {
+  /** backend（后台活动来源）：区分 DSH 实时轨迹与原生代理状态。 */
   backend?: 'native' | 'dsh'
+  /** model_management（模型管理来源）：说明当前模型配置由哪个运行端管理。 */
   model_management?: 'voice_terminal' | 'dsh_harness'
   available: boolean
   active: boolean

@@ -173,6 +173,7 @@ none → kws standby → asr active → kws standby → none
 - Shadow 摘要和运行轨迹只消费服务端的 `shadow.product` 权威快照与 `shadow.activity` 增量；
   增量按 `run_seq + item_id` 合并，重连先应用快照再应用 WebSocket `seq` 有序增量。前端不得
   从 status 文本推断任务终态，也不得把 status observer 摘要伪装成 `result`。
+- 工作台“运行轨迹”使用固定单槽，只显示当前 DSH（代理执行宿主）根代理的最新思考块或工具动作；新动作覆盖当前项，同一思考块累加增量，空闲及运行结束时清空。卡片保持既有高度、字号与颜色变量，长正文内部滚动并跟随最新增量。内部回调、迟到事件拒收和重连规则见[桥接实时活动协议](bridge-2.0-protocol.md)，构建及项目安装结果见[插件维护记录](dsh-plugin-maintenance.md#2026-10-07-实时运行轨迹协议修订与构建)。
 
 ## 主要代码归属
 

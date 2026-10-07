@@ -122,25 +122,26 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
       </section>
       <section class="trace-section shadow-region">
         <header class="shadow-region-heading">
-          <span>运行轨迹</span
-          ><small>{{ model.shadow.trace.length }} 项活动</small>
+          <span>运行轨迹</span>
         </header>
         <div
           ref="trace"
           class="shadow-trace-box"
           @scroll="followTrace = atTail(trace)"
         >
-          <p v-if="!model.shadow.trace.length" class="shadow-region-placeholder">对话开始后，协作进展会显示在这里。</p>
-          <ol v-else class="timeline">
-            <li v-for="item in model.shadow.trace" :key="item.key">
-              <i></i>
-              <div>
-                <strong>{{ item.title }}</strong>
-                <p v-if="item.text">{{ item.text }}</p>
-                <small>{{ item.status }} · {{ item.time }}</small>
-              </div>
-            </li>
-          </ol>
+          <p v-if="!model.shadow.trace.length" class="shadow-region-placeholder">
+            {{ model.shadow.status === "运行中" ? "等待 DSH 动作输出" : "等待 DSH 运行" }}
+          </p>
+          <div v-else class="trace-current-activity">
+            <header class="trace-current-heading">
+              <i class="trace-current-mark" aria-hidden="true"></i>
+              <strong>{{ model.shadow.trace[0]?.title }}</strong>
+              <small>{{ model.shadow.trace[0]?.status }}</small>
+            </header>
+            <p v-if="model.shadow.trace[0]?.text" class="trace-current-text">
+              {{ model.shadow.trace[0]?.text }}
+            </p>
+          </div>
         </div>
       </section>
       <section class="shadow-event shadow-region">

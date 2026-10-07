@@ -142,7 +142,9 @@ Shadow UI 使用：
 - `shadow.activity`：当前运行中的 lifecycle、thinking、tool 和公开事件增量。DSH status observer
   摘要通过 Voice 侧 `status` 投影更新 summary，不作为 event 输出区域中的终态事件。
 
-活动 item 使用 `run_seq + item_id` 标识，状态为 `started`、`delta`、`completed` 或 `failed`，并且必须带有服务端生成的 `timestamp`。provider request、trace ID、私有 reasoning 和内部工具参数不得进入公共协议。重连时先应用 `shadow.product`，再按 WebSocket `seq` 应用增量；旧 `run_seq` 的迟到事件直接丢弃。浏览器在应用快照前冲刷同一帧内的增量，不能让旧 activity 覆盖新 summary。
+活动 item（活动项）使用 `run_seq + item_id`（运行序号与条目标识）标识，状态为 `started`、`delta`、`completed` 或 `failed`（开始、增量、完成或失败），并且必须带有服务端生成的 `timestamp`（时间戳）。绑定 DSH 根 Agent（后台代理主智能体）的插件可将运行时 `reasoning-delta`（思考增量）和 `tool/call`、`tool/result`（工具开始与结果状态）投影到 `shadow.activity`，仅供“运行轨迹”固定单槽即时显示；同一思考项累加增量，新思考块或工具动作覆盖当前项。该界面投影只保存在有界的运行时活动快照中，不追加 Voice 对话或产品长期活动历史，也不新增 DSH 归档写入；DSH runtime（运行时）原有会话存档行为保持不变，Bridge（桥接层）不会额外复制该单槽正文。`action_seq`（动作序号）在每次激活内递增，Voice 侧只接收当前会话、代次、激活及序号有效的动作。工具活动只包含工具名称与状态，不包含参数或结果正文。DSH 根 Agent（后台代理主智能体）空闲或运行结束后，单槽清空；重连先应用 `shadow.product`（产品快照）恢复最新运行项，再按 WebSocket `seq`（消息序号）应用增量；旧 `run_seq`（运行序号）的迟到事件直接丢弃。除该单槽专用增量外，provider request（供应商请求）、trace ID（追踪标识）、其他私有 reasoning（思考内容）、凭据和内部工具参数不得进入公共协议。浏览器在应用快照前冲刷同一帧内的增量，不能让旧 activity（活动）覆盖新 summary（摘要）。
+
+插件内部回调的 `action_seq`（动作序号）同时约束思考、工具和空闲状态，统一串行发送；乱序空闲状态不能清空新动作。该序号在桥接接收端校验，前端继续使用 WebSocket `seq`（消息序号）及 `run_seq + item_id`（运行序号与活动标识）应用活动。完整输入字段、错误回执及取消规则见 [Bridge 2.0（桥接协议）](bridge-2.0-protocol.md)。
 
 调试协议只有在 `shadow_agent.debug_websocket_enabled=true` 时可用：
 

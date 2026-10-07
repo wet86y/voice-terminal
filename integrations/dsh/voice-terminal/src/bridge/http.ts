@@ -16,6 +16,7 @@ import { createUserMessage, createBridgeUserMessage } from './messages.js'
 import { enqueueAuthoritativeContext, holdAuthoritativeContext, releaseHeldContext, enqueueDeferredActivation, armRuntimeReminder, stopRuntimeReminder, discardResumedAuthoritativeContext } from './context.js'
 import { exportSessionPage, readSessionTelemetry } from './observer.js'
 import type { Binding, Config } from './contracts.js'
+import { stopRuntimeActivity } from './events.js'
 
 export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<string, Binding>, settingsReady: ReturnType<typeof import('./settings.js').initializeVoiceTerminalSettings>, startupError: () => unknown) {
   return {
@@ -40,7 +41,7 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           const requestedReminderMs = Number(body.runtime_reminder_interval_ms)
           const reminderIntervalMs = Number.isSafeInteger(requestedReminderMs) && requestedReminderMs > 0
             ? requestedReminderMs : 20000
-          const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map(), queuedMessages: new Map(), reminderIntervalMs, nextReminderMs: reminderIntervalMs, queuedRevision: 0, claimedRevision: 0 }
+          const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map(), pendingToolActivations: new Map(), actionSeq: 0, actionQueue: Promise.resolve(), assistantStreamRevision: 0, pendingThinkingDelta: '', queuedMessages: new Map(), reminderIntervalMs, nextReminderMs: reminderIntervalMs, queuedRevision: 0, claimedRevision: 0 }
           const preset = await ctx.agentPresets.resolve('shadow-agent')
           const modelSelection = ctx.agentDefaultModel.currentSelection()
           const setup = async (agentCtx: Context) => { await ctx.agentPresets.mount(agentCtx, preset.id); installRootTools(agentCtx, binding) }
@@ -148,6 +149,11 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           if (revision !== existing.revision) response = revision < existing.revision ? result('stale') : result('resync_required')
           else {
             existing.activationId = String(body.activation_id ?? '')
+            existing.actionSeq = 0
+            existing.terminalActivationId = undefined
+            existing.pendingTools.clear()
+            existing.pendingToolActivations.clear()
+            stopRuntimeActivity(existing)
             existing.protocolRecoveryAttempted = false
             existing.protocolRecoveryPending = false
             existing.traceRevision += 1
@@ -183,18 +189,21 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
             response = result('accepted', { dsh_session_id: existing.dshSessionId, message_id: occurrenceId })
           }
         } else if (path === 'session.cancel') {
+          stopRuntimeActivity(existing)
           stopRuntimeReminder(existing, true); existing.handle!.agent.cancel({ kind: 'hook', reason: 'voice-terminal-cancel' }, { keepInbox: false }); existing.pendingContext = undefined; existing.queuedMessages?.clear(); existing.heldContext = undefined; existing.deferredRevision = undefined; existing.pendingReminder = undefined; delete existing.activationId
           // whenIdle（结算至空闲）包括工具取消与最终记录，不能只确认取消信号。
           await existing.handle!.agent.whenIdle()
           if (!await ctx.sessions.flush(existing.handle!.agent.session)) throw new Error('session cancel persistence failed')
           response = result('accepted')
         } else if (path === 'session.retire') {
+          stopRuntimeActivity(existing)
           stopRuntimeReminder(existing, true); existing.handle!.agent.cancel({ kind: 'hook', reason: 'voice-terminal-retire' }, { keepInbox: false }); existing.pendingContext = undefined; existing.queuedMessages?.clear(); existing.heldContext = undefined; existing.deferredRevision = undefined; existing.pendingReminder = undefined; delete existing.activationId
           await existing.handle!.agent.whenIdle()
           if (!await ctx.sessions.flush(existing.handle!.agent.session)) throw new Error('session retire persistence failed')
           existing.state = 'retired'
           // Retire（解绑归档）后的后台回执不再属于活跃会话，取消并等待释放。
           await existing.callbacks?.dispose()
+          await existing.actionQueue
           existing.exportSnapshot = undefined
           const voiceLabel = existing.voiceSessionId.replace(/^conversation[-_]/, '').slice(0, 8)
           ctx.sessionTitle.rename(existing.handle!.agent.session, `Voice Shadow · ${voiceLabel} · epoch ${existing.epoch} · retired`)

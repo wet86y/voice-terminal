@@ -36,6 +36,18 @@ export interface PendingContext {
   deferredThrough?: number | undefined
 }
 export interface PendingReminder { messageId: string }
+
+/**
+ * RuntimeActivity（实时活动）：仅供运行轨迹单槽使用，不包含工具参数或结果正文。
+ * stream（活动流）区分 thinking（思考）和 tool（工具）；phase（阶段）与 tool_status（工具状态）必须对应。
+ */
+export type RuntimeActivity =
+  | { stream: 'thinking'; phase: 'delta'; /** item_id（思考块标识）。 */ item_id: string; /** delta（思考文本增量）：保留空白，最多 2000 字符。 */ delta: string }
+  | { stream: 'thinking'; phase: 'completed'; /** item_id（已结束思考块标识）。 */ item_id: string }
+  | { stream: 'tool'; phase: 'started'; /** item_id（工具调用标识）。 */ item_id: string; /** tool_name（工具名称）。 */ tool_name: string; tool_status: 'running' }
+  | { stream: 'tool'; phase: 'completed'; /** item_id（工具调用标识）。 */ item_id: string; /** tool_name（工具名称）。 */ tool_name: string; tool_status: 'completed' }
+  | { stream: 'tool'; phase: 'failed'; /** item_id（工具调用标识）。 */ item_id: string; /** tool_name（工具名称）。 */ tool_name: string; tool_status: 'failed' }
+
 export interface Binding {
   voiceSessionId: string
   dshSessionId: string
@@ -55,6 +67,26 @@ export interface Binding {
   agentState: string
   committedSteps: number
   pendingTools: Map<string, string>
+  /** action_seq（动作序号）：当前根 Agent 激活内实时动作的递增序号。 */
+  actionSeq: number
+  /** actionQueue（动作回调队列）：按发生顺序发送实时动作回调。 */
+  actionQueue: Promise<void>
+  /** assistantStreamRevision（实时流修订水位）：在根 Agent 生命周期内递增，拒收旧帧。 */
+  assistantStreamRevision: number
+  /** currentThinkingItemId（当前思考项）：将同一思考块的增量合并。 */
+  currentThinkingItemId?: string | undefined
+  /** currentThinkingAttemptId（当前推理尝试）：用于结束当前思考项。 */
+  currentThinkingAttemptId?: string | undefined
+  /** currentThinkingActivationId（当前思考激活）：迟到刷新仍绑定原运行。 */
+  currentThinkingActivationId?: string | undefined
+  /** pendingThinkingDelta（待发送思考增量）：短暂合并高频流片段。 */
+  pendingThinkingDelta: string
+  /** thinkingTimer（思考刷新定时器）：合并短时间内连续到达的片段。 */
+  thinkingTimer?: ReturnType<typeof setTimeout> | undefined
+  /** terminalActivationId（已结束激活标识）：接收终态工具的最终结果。 */
+  terminalActivationId?: string | undefined
+  /** pendingToolActivations（工具激活映射）：工具结果仍绑定工具开始时的运行。 */
+  pendingToolActivations: Map<string, string>
   pendingContext?: PendingContext | undefined
   /** 排队消息标识到上下文版本的映射，用于记录实际领取水位。 */
   queuedMessages?: Map<string, number> | undefined

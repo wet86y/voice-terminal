@@ -27,8 +27,9 @@ export function stableBridgeToolId(scope: 'request' | 'event' | 'early-silence',
 }
 
 /** Clear only the activation that initiated an asynchronous terminal callback（仅清理发起异步终态回调的激活）. */
-export function clearActivationIfCurrent(binding: { activationId?: string | undefined }, activationId: string): boolean {
+export function clearActivationIfCurrent(binding: { activationId?: string | undefined; terminalActivationId?: string | undefined }, activationId: string): boolean {
   if (binding.activationId !== activationId) return false
+  binding.terminalActivationId = activationId
   delete binding.activationId
   return true
 }

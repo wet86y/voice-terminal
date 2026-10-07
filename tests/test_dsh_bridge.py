@@ -252,6 +252,99 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
     async def _events(self, values) -> None:
         self.events.extend(values)
 
+    def _runtime_activity_payload(self, action_seq: int = 1) -> dict[str, Any]:
+        """Runtime activity envelope（实时活动信封），使用当前有效绑定。"""
+        return {
+            "protocol_version": "2.0", "request_id": f"runtime-action-{action_seq}",
+            "voice_session_id": self.session.voice_session_id,
+            "dsh_session_id": self.session.dsh_session_id, "epoch": self.session.epoch,
+            "context_revision": self.session.last_applied_revision,
+            "activation_id": self.session.activation_id, "action_seq": action_seq,
+            "activity": {"stream": "thinking", "phase": "delta", "item_id": "thinking-a", "delta": " 思考\n"},
+        }
+
+    async def test_runtime_activity_orders_thinking_tools_and_idle_without_voice_events(self) -> None:
+        await self.session.request_wake()
+        received: list[dict[str, Any]] = []
+
+        async def sink(values) -> None:
+            received.extend(values)
+
+        self.session.activity_sink = sink
+        first = self._runtime_activity_payload()
+        self.assertEqual(await self.session.accept_activity(first), "accepted")
+        self.assertEqual(received[-1]["delta"], " 思考\n")
+        self.assertIn("timestamp", received[-1])
+        self.assertEqual(await self.session.accept_activity(first), "stale")
+        tool = {**first, "action_seq": 2, "activity": {
+            "stream": "tool", "phase": "started", "item_id": "tool-a",
+            "tool_name": "read_file", "tool_status": "running",
+        }}
+        self.assertEqual(await self.session.accept_activity(tool), "accepted")
+        settled = {**tool, "action_seq": 3, "activity": {
+            **tool["activity"], "phase": "completed", "tool_status": "completed",
+        }}
+        self.assertEqual(await self.session.accept_activity(settled), "accepted")
+        idle = {key: value for key, value in first.items() if key != "activity"}
+        self.assertEqual(await self.session.accept_activity({**idle, "action_seq": 4, "state": "idle"}), "accepted")
+        self.assertEqual(received[-1]["phase"], "completed")
+        self.assertEqual(await self.session.accept_activity({**idle, "action_seq": 5, "state": "running"}), "accepted")
+        before = list(received)
+        self.assertEqual(await self.session.accept_activity({**idle, "action_seq": 4, "state": "idle"}), "stale")
+        self.assertEqual(received, before, "旧空闲回调不能清空更新的动作")
+        self.assertEqual(self.events, [], "实时活动不进入语音事件路径")
+        mapping = json.loads(self.mapping_store.path.read_text(encoding="utf-8"))
+        self.assertNotIn("思考", json.dumps(mapping, ensure_ascii=False), "实时正文不写入会话映射")
+
+    async def test_runtime_activity_rejects_invalid_fields_without_advancing_sequence(self) -> None:
+        await self.session.request_wake()
+        payload = self._runtime_activity_payload()
+        invalid = [
+            {**payload, "action_seq": value} for value in (None, True, 0, -1, 1.5, 2**53)
+        ]
+        invalid.extend([
+            {key: value for key, value in payload.items() if key != "action_seq"},
+            {**payload, "activity": None},
+            {**payload, "activity": {**payload["activity"], "arguments": "不能透传"}},
+            {**payload, "activity": {**payload["activity"], "delta": "x" * 2001}},
+            {**payload, "activity": {**payload["activity"], "item_id": " "}},
+            {**payload, "activity": {"stream": "tool", "phase": "completed", "item_id": "tool-a", "tool_name": "read", "tool_status": "running"}},
+            {**payload, "activity": {"stream": "tool", "phase": "started", "item_id": "tool-a", "tool_name": "x" * 161, "tool_status": "running"}},
+            {**payload, "activity": {"stream": "tool", "phase": "completed", "item_id": "tool-a", "tool_name": "read", "tool_status": "completed", "result": "不能透传"}},
+        ])
+        for body in invalid:
+            with self.subTest(body=body):
+                self.assertEqual(await self.session.accept_activity(body), "conflict")
+        self.assertEqual(await self.session.accept_activity(payload), "accepted", "非法正文不能占用合法动作序号")
+
+    async def test_runtime_activity_rejects_old_bindings_and_accepts_new_activation_sequence(self) -> None:
+        await self.session.request_wake()
+        payload = self._runtime_activity_payload()
+        for field, value in (("voice_session_id", "foreign"), ("dsh_session_id", "foreign"),
+                             ("epoch", 99), ("activation_id", "old-activation"), ("protocol_version", "1.0")):
+            with self.subTest(field=field):
+                self.assertEqual(await self.session.accept_activity({**payload, field: value}), "stale")
+        self.assertEqual(await self.session.accept_activity(payload), "accepted")
+        await self.session.cancel()
+        await self.session.request_wake()
+        self.assertNotEqual(self.session.activation_id, payload["activation_id"])
+        self.assertEqual(await self.session.accept_activity({**payload, "action_seq": 100}), "stale")
+        self.assertEqual(await self.session.accept_activity(self._runtime_activity_payload()), "accepted")
+
+    async def test_terminal_runtime_activity_only_settles_tool_before_final_idle(self) -> None:
+        await self.session.request_wake()
+        payload = self._runtime_activity_payload()
+        terminal = {key: value for key, value in payload.items() if key not in {"activity", "action_seq"}}
+        terminal.update(event_id="runtime-terminal-event", event={"type": "result", "text": "正式终态"})
+        self.assertEqual(await self.session.accept_event(terminal), "accepted")
+        self.assertEqual(await self.session.accept_activity(payload), "stale", "终态后不能重新建立思考项")
+        tool = {**payload, "activity": {"stream": "tool", "phase": "completed", "item_id": "tool-terminal", "tool_name": "return_shadow_result", "tool_status": "completed"}}
+        self.assertEqual(await self.session.accept_activity(tool), "accepted")
+        idle = {key: value for key, value in payload.items() if key != "activity"}
+        self.assertEqual(await self.session.accept_activity({**idle, "action_seq": 2, "state": "idle"}), "accepted")
+        self.assertEqual(await self.session.accept_activity({**tool, "action_seq": 3}), "stale", "最终空闲后不能恢复旧工具项")
+        self.assertEqual(await self.session.accept_activity({**payload, "activation_id": None, "action_seq": 4}), "stale", "空激活不能创建新的思考项")
+
     async def test_plugin_telemetry_keeps_latest_watermark_and_rejects_foreign_session(self) -> None:
         await self.session.request_wake()
         payload = {"protocol_version": "2.0", "voice_session_id": "voice-session",
@@ -887,7 +980,7 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("timeout_ms", request)
         self.assertNotIn("retry", request)
 
-    async def test_status_observer_projects_summary_as_valid_ui_activity(self) -> None:
+    async def test_status_observer_updates_summary_without_entering_runtime_slot(self) -> None:
         provider = RecordingStatusProvider()
         activities: list[dict[str, Any]] = []
         events = []
@@ -913,14 +1006,8 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
 
         await session._run_observer()  # noqa: SLF001
 
-        status = activities[-1]
-        self.assertEqual(status["state"], "observer_status")
-        self.assertEqual(status["stream"], "thinking")
-        self.assertEqual(status["phase"], "delta")
-        self.assertEqual(status["agent_state"], "running")
-        self.assertIsInstance(status["timestamp"], str)
-        self.assertTrue(status["timestamp"])
-        self.assertIn("已提交", status["text"])
+        self.assertEqual(activities, [], "状态摘要不能伪装成 DSH 实时思考")
+        self.assertIn("已提交", session.snapshot()["status"])
         self.assertEqual(session.snapshot()["trace_revision"], 3)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].kind, "information")

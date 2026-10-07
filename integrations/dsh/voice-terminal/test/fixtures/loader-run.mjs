@@ -69,9 +69,13 @@ try {
     async *stream() {
       requests++
       const id = llm.ToolCallId(`terminal-${requests}`)
-      yield { type: 'block-start', index: 0, blockType: 'tool-call' }
-      yield { type: 'tool-call-delta', index: 0, id, name: 'return_shadow_result', argumentsDelta: '{"text":"组合测试完成"}' }
-      yield { type: 'block-end', index: 0, block: { type: 'tool-call', id, name: 'return_shadow_result', arguments: '{"text":"组合测试完成"}' } }
+      yield { type: 'block-start', index: 0, blockType: 'reasoning' }
+      yield { type: 'reasoning-delta', index: 0, text: '正在分析' }
+      yield { type: 'reasoning-delta', index: 0, text: '当前任务' }
+      yield { type: 'block-end', index: 0, block: { type: 'reasoning', text: '正在分析当前任务' } }
+      yield { type: 'block-start', index: 1, blockType: 'tool-call' }
+      yield { type: 'tool-call-delta', index: 1, id, name: 'return_shadow_result', argumentsDelta: '{"text":"组合测试完成"}' }
+      yield { type: 'block-end', index: 1, block: { type: 'tool-call', id, name: 'return_shadow_result', arguments: '{"text":"组合测试完成"}' } }
       yield { type: 'finish', reason: { kind: 'tool-calls' } }
     }
   }()
@@ -99,6 +103,12 @@ try {
   assert.equal(task.status, 'pending')
   assert.equal((await api('/api/voice-terminal-wake/v1/tasks')).tasks.length, 1)
   assert.equal((await api(prefix + 'session.retire', envelope())).result, 'accepted', '根代理取消、持久化与回调释放后确认解绑')
+  const activities = received.filter(value => value.path.endsWith('/shadow.activity')).map(value => value.body)
+  assert.ok(activities.every((value, index) => index === 0 || value.action_seq > activities[index - 1].action_seq), '真实加载器中的活动及状态回调按序发送')
+  assert.equal(activities.filter(value => value.activity?.delta).map(value => value.activity.delta).join(''), '正在分析当前任务')
+  assert.deepEqual(activities.filter(value => value.activity?.stream === 'tool').map(value => value.activity.tool_status), ['running', 'completed'])
+  assert.equal(activities.at(-1).state, 'idle')
+  assert.equal(JSON.stringify(activities).includes('组合测试完成'), false, '工具参数和结果正文不进入实时活动回调')
   assert.equal((await api(prefix + 'session.retire', envelope())).result, 'duplicate', '重复解绑保持幂等')
   const entries = []
   function walk(tree) { for (const entry of Object.values(tree.store)) { entries.push(entry); if (entry.subtree) walk(entry.subtree) } }
