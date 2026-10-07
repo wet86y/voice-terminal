@@ -258,11 +258,14 @@ async function main() {
     const { Context } = cordis
 
     const tempModules = join(tempData, 'node_modules') // tempModules（本次测试专属的 Node 模块查找目录）
-    const tempBridgeRoot = join(tempModules, '@voice-terminal', 'dsh-shadow-bridge') // tempBridgeRoot（临时只读副本的 Bridge 包目录）
+    const tempBridgeRoot = join(tempModules, '@voice-terminal', 'dsh-plugin') // tempBridgeRoot（临时只读副本的 Bridge 包目录）
     await mkdir(join(tempModules, '@voice-terminal'), { recursive: true })
-    await symlink(join(sourceRoot, 'apps', 'cli', 'node_modules', '@deepseek-ai'), join(tempModules, '@deepseek-ai'), 'junction')
-    await cp(join(dshRoot, 'bundles', 'voice-terminal-shadow-bridge'), tempBridgeRoot, { recursive: true })
-    const bridgePluginPath = join(tempBridgeRoot, 'lib', 'plugin.js') // bridgePluginPath（Bridge 编译后宿主入口）
+    await symlink(join(sourceRoot, 'python', 'sdk-runtime', 'node_modules', '@deepseek-ai'), join(tempModules, '@deepseek-ai'), 'junction')
+    // 手工 Context（上下文）不启用官方配置启动的依赖解析回退；测试副本显式链接公开工作区包。
+    await mkdir(join(tempBridgeRoot, 'node_modules', '@deepseek-ai'), { recursive: true })
+    await symlink(join(sourceRoot, 'packages', 'workspace', 'workspace'), join(tempBridgeRoot, 'node_modules', '@deepseek-ai', 'dsh-workspace'), 'junction')
+    await cp(join(dshRoot, 'bundles', 'voice-terminal'), tempBridgeRoot, { recursive: true })
+    const bridgePluginPath = join(tempBridgeRoot, 'lib', 'bridge', 'plugin.js') // bridgePluginPath（Bridge 编译后宿主入口）
     const bridgeModule = await import(pathToFileURL(bridgePluginPath).href)
 
     const adapter = createScriptedMockAdapter(llm.LlmAdapter, [
@@ -350,7 +353,7 @@ async function main() {
 
     const health = await smokeFetch('health') // health（Bridge 健康状态响应）
     assert.equal(health.status, 'ok')
-    assert.equal(health.bundle_version, '0.1.1', '确认运行的是 Bridge 0.1.1 构建产物')
+    assert.equal(health.bundle_version, '0.2.0', '确认运行的是统一插件构建产物')
     assert.equal(health.protocol_version, '2.0')
 
     const voiceSessionId = `voice-${randomUUID()}` // voiceSessionId（合成 Voice 会话标识）
@@ -418,8 +421,8 @@ async function main() {
       '@deepseek-ai/dsh-client-ui-settings', clientRequireMap,
     )
     const bridgeClientBundle = await loadBrowserBundle(
-      join(dshRoot, 'bundles', 'voice-terminal-shadow-bridge', 'lib', 'client.js'),
-      '@voice-terminal/dsh-shadow-bridge', clientRequireMap,
+      join(dshRoot, 'bundles', 'voice-terminal', 'lib', 'client.js'),
+      '@voice-terminal/dsh-plugin', clientRequireMap,
     )
     const configFormsResult = await testConfigFormsWhileServed(Context, uiSettingsBundle, bridgeClientBundle)
 

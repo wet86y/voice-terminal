@@ -1,0 +1,61 @@
+{
+  "extends": "../../../.runtime/dsh/source/tsconfig.base.client.json",
+  "compilerOptions": {
+    "typeRoots": [
+      "../../../.runtime/dsh/source/scripts/types",
+      "../../../.runtime/dsh/source/node_modules/@types",
+      "../../../.runtime/dsh/source/packages/client/ui-settings/node_modules/@types"
+    ],
+    "types": [
+      "client-build-environment",
+      "react"
+    ],
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  },
+  "include": [
+    "src/client/**/*.ts",
+    "src/client/**/*.tsx"
+  ],
+  "references": [
+    {
+      "path": "../../../.runtime/dsh/source/vendor/cordis"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/api/remotes/tsconfig.client.json"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/api/session-controller/tsconfig.client.json"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/api/workspace-controller/tsconfig.client.json"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/client/locale/tsconfig.client.json"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/client/ui-primitives"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/client/ui-renderer"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/client/ui-settings/tsconfig.client.json"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/client/ui-conversation/tsconfig.client.json"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/client/ui-chat/tsconfig.client.json"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/client/ui-slots"
+    }
+  ]
+}

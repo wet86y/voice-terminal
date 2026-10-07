@@ -111,7 +111,7 @@ cd apps/frontend
 npm run test
 npm run typecheck
 npm run build
-cd ../../integrations/dsh/voice-terminal-shadow-bridge
+cd ../../integrations/dsh/voice-terminal
 npm run test
 npm run build
 ```
@@ -128,7 +128,7 @@ Plugins（插件）页面启用；启用后提供 `schedule_create/list/update/d
 每项原生任务绑定创建它的 DSH Session（会话），由官方调度器在该会话中投递；其数据留在 DSH 自己的 Schedule
 存储中，不进入项目唤醒任务目录。
 
-`voice-terminal-wake-tasks`（语音终端唤醒任务插件）独立保存并调度项目任务。任意 DSH 根会话均可用
+统一插件中的 `voice-terminal-wake-tasks`（保留的唤醒任务加载行）组件独立保存并调度项目任务。任意 DSH 根会话均可用
 `wake_task_create/list/update/delete`（创建、列出、更新、删除语音链路任务工具）管理项目任务，快捷工具
 `schedule_wake`（创建简易唤醒任务）和 `cancel_wake`（取消简易唤醒任务）仍可用。任务与创建会话的存活状态无关，
 保存在 DSH home（DSH 用户数据目录）的 `storages/voice-terminal-wake-tasks.json`（项目任务文件）。插件在创建时

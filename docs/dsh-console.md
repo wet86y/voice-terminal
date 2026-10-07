@@ -1,15 +1,19 @@
 # 项目隔离 DSH Shadow 执行端
 
-Voice Terminal 内置第一方 DSH Bundle `voice-terminal-shadow-bridge`。当
+Voice Terminal 的项目插件源码使用第一方 DSH Bundle（功能包）`@voice-terminal/dsh-plugin`，
+桥接、项目唤醒任务、浏览器界面和影子预设按组件维护，见[插件维护手册](dsh-plugin-maintenance.md)。当
 `shadow_agent.backend: dsh` 时，项目 DSH Web Host 中的正式根 Agent承担 Shadow 任务；当前默认值
 已经切换为 `dsh`，`native` 仅作为显式人工回滚后端保留。后端在新 Voice Session 创建时固定，同一 Session不热切换，也不在 DSH
 故障时自动转交 native。
 
-当前受管目标为 npm `latest`（默认发行通道）上的预发布版本 `dsh-v0.2.0-rc.2`
+当前受管目标为固定的预发布版本 `dsh-v0.2.0-rc.2`
 （候选版），commit（提交号）`639ed015397290b3745d163aafe02ffee4aa3f84`；这不是正式稳定版。
-该版本当前部署于便携应用 `apps/20261005-dsh-task-coexist`；首次部署目录为 `apps/20261005-dsh020rc2`。Bridge（桥接插件）、
-Wake Tasks（唤醒任务插件）和 Shadow preset（影子代理预设功能包）均为 0.1.1，Bridge protocol
-（桥接协议）为 2.0。DSH component（DSH 组件）标识为 `639ed015-e7dd1315c977`；旧组件和两套备份均保留。
+该版本的 2026-10-05 部署目录为 `apps/20261005-dsh-task-coexist`；首次部署目录为 `apps/20261005-dsh020rc2`。
+当次 Bridge（桥接插件）、Wake Tasks（唤醒任务插件）和 Shadow preset（影子代理预设功能包）均为 0.1.1。
+当前统一插件版本为 0.2.0，Bridge protocol（桥接协议）仍为 2.0。2026-10-07 已完成项目内安装迁移及数据核对，
+项目下次启动使用统一包；桌面发行程序须经过独立发布流程才采用新包。本轮验收与现场测试边界见
+[安装与验证记录](dsh-plugin-maintenance.md#2026-10-07-插件合并与项目安装验收)。
+DSH component（DSH 组件）的历史部署标识为 `639ed015-e7dd1315c977`；旧组件和两套备份均保留。
 `dsh-v0.1.7-rc.2`（候选版）的 9 月验收记录仅适用于该版本当时的测试范围，不能替代本次目标版本记录。
 Bundle（功能包）只使用目标版本公开的 Cordis（插件框架）、Web Host（网页宿主）、Agent（智能体）、
 Session（会话）、Tool（工具）和事件扩展点；不得修改 `.runtime/dsh/source`（运行源码）、解析私有
@@ -57,24 +61,23 @@ pwsh -NoProfile -File .\scripts\setup-dsh.ps1 -ValidateOnly
 
 脚本使用 UTF-8（统一字符编码）源码，须由 PowerShell 7 的 `pwsh` 运行。修改 Bridge（集成桥接）的构建输入后，先重建产物、运行 `-ValidateOnly`（仅校验模式），再重启 Voice Server（语音服务）；否则运行时会因构建指纹漂移而拒绝启动 DSH。
 
-setup 会验证固定 source/tag/commit、Node、pnpm 和 CLI，构建 TypeScript Bridge Bundle（插件运行包）、
-Wake Tasks Bundle（唤醒任务插件运行包）与正式 Shadow preset Bundle（Shadow 预设功能包），
+安装脚本会验证固定 source/tag/commit（源码、版本标签、提交号）、Node.js（解释器）、pnpm（依赖管理器）和 CLI（命令行程序），
+构建一个包含桥接、任务、浏览器及正式影子预设的统一 Bundle（插件运行包），
 用官方 `dsh plugin --profile web add` 安装到项目 profile，
-运行 `dump-config`，并记录 Node Bundle（Node.js 插件运行包）、浏览器插件页、预设功能包的 hash（哈希值）、
+移除旧的三个功能包登记并保留原设置，运行 `dump-config`（展开配置），记录完整运行包与构建输入的 hash（哈希值）、
 协议版本、公共提示词哈希和受管配置哈希。浏览器插件构建会
 使用临时 staging directory（暂存目录），结束后移除，不保留对固定 DSH source（源码）的修改。`-ValidateOnly`
 会检查 Node Bundle（Node.js 插件运行包）、浏览器入口、插件页 manifest（清单）、Shadow preset 声明和安装状态；发现缺失或漂移即拒绝通过校验。
 
-运行时 freshness check（新鲜度校验）覆盖 Bridge 的 `src/`、`package.json`、`build.mjs`、`cordis.patch.yml`、
-`scripts/build-dsh-client.mjs`（浏览器构建脚本）和正式 Shadow preset（Shadow 预设）源文件；README、`test/`
-目录和 source map（源码映射）变更不会阻止启动。产物 hash（哈希值）覆盖 DSH 实际加载的包清单、Cordis patch
-（配置补丁）和 JavaScript 运行文件，不包含声明文件或文档。
+运行时 freshness check（新鲜度校验）覆盖统一插件的全部源码、预设、包清单、组件声明、构建与检查脚本、
+宿主补丁、两套类型配置及 `scripts/build-dsh-client.mjs`（浏览器构建脚本）。文档和测试不参与启动检查。
+产物 hash（哈希值）覆盖实际加载的包清单、Cordis patch（配置补丁）、组件声明和完整编译目录，包括 source map（源码映射）。
 
 DSH 0.2.0-rc.2 的 Agent 预设只从 Cordis Bundle（Cordis 功能包）中的 `@deepseek-ai/dsh-agent-preset`
 声明加载，不再扫描 DSH_HOME 的 `.agent-presets/<id>/` 目录。安装脚本从
-`config/dsh/agent-presets/shadow-agent/` 生成项目本地 preset Bundle（预设功能包），并将正式预设注册到 Web
+`integrations/dsh/voice-terminal/preset/shadow-agent/` 生成统一功能包中的预设声明，并将正式预设注册到 Web
 profile；profile patch（配置补丁）使用 `agent-preset-registry`（Agent 预设注册器）的 `default`（默认预设字段）。
-旧目录保留供回滚和数据核对，不再参与新版本加载。
+旧运行数据目录保留供回滚和数据核对，不再参与新版本加载。
 
 ## 打开 DSH 界面
 
@@ -84,7 +87,7 @@ DSH Web Host（网页服务）固定监听 `127.0.0.1:3081`；直接访问该端
 不要收藏、复制给他人或写入日志带有 `?token=` 的完整地址。
 
 若界面显示 `Failed to load plugins`（插件加载失败），并提示
-`@voice-terminal/dsh-shadow-bridge: pending`（插件等待服务），先确认 DSH 设置页服务已经就绪，再执行以下校验：
+`@voice-terminal/dsh-plugin: pending`（插件等待服务），先确认 DSH 设置页服务已经就绪，再执行以下校验：
 
 ```powershell
 pwsh -NoProfile -File .\scripts\setup-dsh.ps1 -ValidateOnly
@@ -295,4 +298,4 @@ null (reading 'kind')`。该报错说明存储中存在 `turn/end` 的 `reason` 
 `node scripts/dsh-diagnose/purge-poisoned-sessions.mjs` 从活动目录移出并重新建立 Voice（语音）绑定，
 不要直接改写 DSH JSONL（逐行 JSON 日志）。插件通过 `exec.concludeTurn`（结束当前回合）在产生端
 处理终端工具回合，细节见
-`integrations/dsh/voice-terminal-shadow-bridge/README.md` 的「终端工具与回合终结」。
+[插件维护手册](dsh-plugin-maintenance.md)的「必须保持的兼容契约」。

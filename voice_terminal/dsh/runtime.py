@@ -18,7 +18,7 @@ from ..config import DshConfig
 from ..paths import AppPaths, atomic_json
 from ..distribution import safe_path, verify
 from .bridge import DshBridgeClient, DshBridgeHub, new_bridge_token
-from .profile import merge_profile_package, migrate_schedule_patch, native_schedule_enabled
+from .profile import merge_profile_package, migrate_plugin_patch, migrate_schedule_patch, native_schedule_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,6 @@ class DshRuntimeManager:
                 "VOICE_DSH_CALLBACK_ORIGIN": self.callback_origin,
                 "VOICE_DSH_TASKS_PATH": str(self.config.home_dir / "storages" / "voice-terminal-wake-tasks.json"),
                 "VOICE_DSH_LEGACY_WAKE_PATH": str(self.paths.config / "wake-tasks.json"),
-                "VOICE_DSH_SCHEDULE_MODULE": str(safe_path(self.release_runtime, self.release_record["schedule"])) if self.release_runtime else str(self.config.source_dir / "packages" / "schedule" / "schedule" / "lib" / "index.js"),
                 "VOICE_DSH_TASKS_ACTIVE": "1",
             })
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -240,96 +239,52 @@ class DshRuntimeManager:
         if not self._profile_patch_preserves_managed_defaults(self.config.profile_patch, managed_patch):
             raise RuntimeError("DSH_HOME 的 Web profile patch（Web 配置补丁）缺少正式 Shadow preset（Shadow 预设）或 session-log（会话日志）设置；请运行 scripts\\setup-dsh.ps1。")
         migrate_schedule_patch(managed_patch, native_enabled=native_schedule_enabled(managed_patch.parent))
-        preset_bundle_dir = self.config.source_dir.parent / "bundles" / "voice-terminal-shadow-preset"
-        source_preset = self.repo_root / "config" / "dsh" / "agent-presets" / "shadow-agent"
-        preset_artifacts = (preset_bundle_dir / "package.json", preset_bundle_dir / "cordis.patch.yml")
-        if any(not item.is_file() for item in preset_artifacts):
-            raise RuntimeError("Shadow preset Bundle（Shadow 预设功能包）构建产物缺失；请运行 scripts\\setup-dsh.ps1。")
+        from .profile import LEGACY_PACKAGES, PLUGIN_PACKAGE
+        bundle = self.config.source_dir.parent / "bundles" / "voice-terminal"
+        source = self.repo_root / "integrations" / "dsh" / "voice-terminal"
         try:
-            profile_manifest = json.loads((self.config.home_dir / "profiles" / "web" / "package.json").read_text(encoding="utf-8"))
+            profile_manifest = json.loads((self.config.home_dir / "profiles/web/package.json").read_text(encoding="utf-8-sig"))
+            package = json.loads((bundle / "package.json").read_text(encoding="utf-8-sig"))
+            state = json.loads((self.config.source_dir.parent / "build-state.json").read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as exc:
-            raise RuntimeError("DSH Web profile package.json（配置清单）缺失或无效。") from exc
-        preset_package_name = "@voice-terminal/dsh-shadow-agent-preset"
-        wake_package_name = "@voice-terminal/dsh-wake-tasks"
-        if not profile_manifest.get("dependencies", {}).get(preset_package_name):
-            raise RuntimeError("Shadow preset Bundle（Shadow 预设功能包）未安装到 Web profile（网页配置）。")
-        if preset_package_name not in profile_manifest.get("dsh", {}).get("profile", {}).get("bundles", []):
-            raise RuntimeError("Shadow preset Bundle（Shadow 预设功能包）未注册到 Web profile（网页配置）。")
-        if not profile_manifest.get("dependencies", {}).get(wake_package_name):
-            raise RuntimeError("唤醒任务插件未安装到 Web profile（网页配置）。")
-        if wake_package_name not in profile_manifest.get("dsh", {}).get("profile", {}).get("bundles", []):
-            raise RuntimeError("唤醒任务插件未注册到 Web profile（网页配置）。")
-        build_state = self.config.source_dir.parent / "build-state.json"
-        try:
-            state = json.loads(build_state.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("DSH build-state.json 缺失或无效。") from exc
-        if state.get("schema_version") != 5:
-            raise RuntimeError("DSH build-state 格式版本不受支持；请重新运行 scripts\\setup-dsh.ps1。")
+            raise RuntimeError("DSH 插件包、网页配置或构建记录缺失或无效。") from exc
+        dependencies = profile_manifest.get("dependencies", {})
+        selected = profile_manifest.get("dsh", {}).get("profile", {}).get("bundles", [])
+        if not dependencies.get(PLUGIN_PACKAGE) or selected.count(PLUGIN_PACKAGE) != 1:
+            raise RuntimeError("DSH 统一功能包未正确安装到项目 Web profile（网页配置）。")
+        if LEGACY_PACKAGES.intersection(dependencies) or LEGACY_PACKAGES.intersection(selected):
+            raise RuntimeError("DSH 旧功能包仍注册，可能重复加载；请重新运行 setup-dsh.ps1。")
+        if state.get("schema_version") != 6:
+            raise RuntimeError("DSH build-state（构建记录）格式已过期；请重新运行 scripts\\setup-dsh.ps1。")
         if state.get("bridge_protocol_version") != self.config.bridge_protocol_version:
-            raise RuntimeError("DSH Bridge build-state 协议版本漂移；请重新运行 setup-dsh.ps1。")
-        bridge_bundle_dir = self.config.source_dir.parent / "bundles" / "voice-terminal-shadow-bridge"
-        bridge_source = self.repo_root / "integrations" / "dsh" / "voice-terminal-shadow-bridge"
-        bridge_build_inputs = (
-            bridge_source / "src",
-            bridge_source / "package.json",
-            bridge_source / "build.mjs",
-            bridge_source / "cordis.patch.yml",
-            self.repo_root / "scripts" / "build-dsh-client.mjs",
+            raise RuntimeError("DSH 桥接协议版本漂移；请重新运行 setup-dsh.ps1。")
+        if state.get("plugin_bundle_version") != package.get("version"):
+            raise RuntimeError("DSH 统一插件版本漂移；请重新运行 setup-dsh.ps1。")
+        runtime_artifacts = (bundle / "package.json", bundle / "cordis.patch.yml", bundle / "components.json", bundle / "lib")
+        build_inputs = (
+            source / "src", source / "preset", source / "package.json", source / "components.json",
+            source / "build.mjs", source / "check.mjs", source / "host.patch.yml", source / "tsconfig.json",
+            source / "tsconfig.host.json", source / "tsconfig.client.json", self.repo_root / "scripts/build-dsh-client.mjs",
         )
-        bridge_runtime_artifacts = (
-            bridge_bundle_dir / "package.json",
-            bridge_bundle_dir / "cordis.patch.yml",
-            bridge_bundle_dir / "lib" / "index.js",
-            bridge_bundle_dir / "lib" / "plugin.js",
-            bridge_bundle_dir / "lib" / "settings.js",
-            bridge_bundle_dir / "lib" / "settings-contract.js",
-            bridge_bundle_dir / "lib" / "generated-prompt.js",
-            bridge_bundle_dir / "lib" / "client.js",
-        )
-        wake_bundle_dir = self.config.source_dir.parent / "bundles" / "voice-terminal-wake-tasks"
-        wake_source = self.repo_root / "integrations" / "dsh" / "voice-terminal-wake-tasks"
-        wake_build_inputs = (
-            wake_source / "src",
-            wake_source / "package.json",
-            wake_source / "build.mjs",
-            wake_source / "cordis.patch.yml",
-        )
-        wake_runtime_artifacts = (
-            wake_bundle_dir / "package.json",
-            wake_bundle_dir / "cordis.patch.yml",
-            wake_bundle_dir / "lib" / "event-id.js",
-            wake_bundle_dir / "lib" / "index.js",
-            wake_bundle_dir / "lib" / "task-service.js",
-            wake_bundle_dir / "lib" / "plugin.js",
-        )
-        common_prompt = self.repo_root / "config" / "shadow_agent" / "instructions.md"
-        dsh_rules = self.repo_root / "config" / "dsh" / "shadow-agent.rules.md"
-        preset_runtime_artifacts = (preset_bundle_dir / "package.json", preset_bundle_dir / "cordis.patch.yml")
         checks = (
-            ("bridge_runtime_artifacts_sha256", self._tree_hash(*bridge_runtime_artifacts), "Bridge 运行产物"),
-            ("bridge_build_inputs_sha256", self._tree_hash(*bridge_build_inputs), "Bridge 构建输入"),
-            ("shadow_preset_runtime_artifacts_sha256", self._tree_hash(*preset_runtime_artifacts), "Shadow preset Bundle 运行产物"),
-            ("shadow_preset_build_inputs_sha256", self._tree_hash(source_preset), "Shadow preset Bundle 构建输入"),
-            ("shadow_prompt_sha256", self._tree_hash(common_prompt, dsh_rules), "Shadow 提示词"),
-            ("wake_tasks_runtime_artifacts_sha256", self._tree_hash(*wake_runtime_artifacts), "唤醒任务插件运行产物"),
-            ("wake_tasks_build_inputs_sha256", self._tree_hash(*wake_build_inputs), "唤醒任务插件构建输入"),
+            ("plugin_runtime_artifacts_sha256", self._tree_hash(*runtime_artifacts), "插件运行产物"),
+            ("plugin_build_inputs_sha256", self._tree_hash(*build_inputs), "插件构建输入"),
+            ("shadow_prompt_sha256", self._tree_hash(self.repo_root / "config/shadow_agent/instructions.md", self.repo_root / "config/dsh/shadow-agent.rules.md"), "影子代理提示词"),
         )
         for key, actual, label in checks:
             if state.get(key) != actual:
-                raise RuntimeError(f"DSH {label} hash 漂移；请重新运行 setup-dsh.ps1。")
-        try:
-            bridge_package = json.loads((bridge_bundle_dir / "package.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("DSH Bridge package.json 缺失或无效。") from exc
-        if bridge_package.get("main") != "lib/plugin.js" or bridge_package.get("exports", {}).get(".") != "./lib/plugin.js":
-            raise RuntimeError("DSH Bridge 插件包入口未指向带配置模式的 plugin.js。")
-        try:
-            wake_package = json.loads((wake_bundle_dir / "package.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("唤醒任务插件 package.json 缺失或无效。") from exc
-        if wake_package.get("main") != "lib/plugin.js" or wake_package.get("exports", {}).get(".") != "./lib/plugin.js":
-            raise RuntimeError("唤醒任务插件入口未指向 plugin.js。")
+                raise RuntimeError(f"DSH {label} hash（摘要）漂移；请重新运行 setup-dsh.ps1。")
+        exports = package.get("exports", {})
+        if package.get("name") != PLUGIN_PACKAGE or package.get("main") != "lib/bridge/plugin.js" or exports.get(".") != "./lib/bridge/plugin.js":
+            raise RuntimeError("DSH 桥接组件的配置入口错误。")
+        if exports.get("./wake-tasks") != "./lib/wake-tasks/plugin.js" or exports.get("./client") != "./lib/client.js":
+            raise RuntimeError("DSH 唤醒任务或浏览器组件入口错误。")
+        if package.get("dsh", {}).get("client", {}).get("platform") != "web":
+            raise RuntimeError("DSH 浏览器组件平台声明错误。")
+        for entry in ("lib/bridge/plugin.js", "lib/wake-tasks/plugin.js", "lib/client.js"):
+            if not (bundle / entry).is_file():
+                raise RuntimeError(f"DSH 组件产物缺失：{entry}")
+        migrate_plugin_patch(managed_patch)
         return node, cli
 
     async def _validate_release(self) -> tuple[str, Path]:
@@ -383,6 +338,7 @@ class DshRuntimeManager:
         managed_patch = profile / "cordis.patch.yml"
         if not self._profile_patch_preserves_managed_defaults(self.config.profile_patch, managed_patch):
             raise RuntimeError("DSH（代理执行宿主）的用户配置缺少必要的受管默认项。")
+        migrate_plugin_patch(managed_patch)
         migrate_schedule_patch(managed_patch, native_enabled=native_schedule_enabled(profile))
         return str(node), cli
 

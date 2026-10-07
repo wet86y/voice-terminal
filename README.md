@@ -94,7 +94,7 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 - `config/local.yaml`：本机非密钥覆盖，不提交真实凭据。
 - `config/persona/`：`personality.md`（人格风格）和 `user.md`（用户资料）在会话初始化时读取并冻结；旧 `instructions.md`（历史工作指令）仅留档，不再加载。
 - `config/shadow_agent/`：Shadow（影子代理）指令和工具策略。
-- `config/dsh/`：项目隔离 DSH（代理执行宿主）锁定至 npm `latest`（默认发行通道）的 `dsh-v0.2.0-rc.2`（候选版），commit（提交号）`639ed015397290b3745d163aafe02ffee4aa3f84`；当前便携应用位于 `apps/desktop-20261005-window-first`（正式程序构建目录）。Bridge（桥接插件）、Wake Tasks（唤醒任务插件）和 Shadow preset（影子代理预设功能包）为 0.1.1，Bridge protocol（桥接协议）为 2.0。官方 Automation Bundle（自动化功能包）默认关闭，但用户可按需启用；原生 `schedule_*`（会话定时任务工具）绑定 DSH 会话，项目 `wake_task_*`（语音链路任务工具）使用独立项目存储并投递到当前 Voice（语音）关联会话。首次部署记录见[本机验收记录](.runtime/dsh-upgrade-20261005/acceptance.md)，共存修复已完成并通过[本机验收](.runtime/dsh-coexist-20261005/acceptance.md)；修订细节见[任务共存修订记录](docs/dsh-task-coexistence.md)，安装和运行说明见[项目隔离 DSH 控制台](docs/dsh-console.md)。
+- `config/dsh/`：项目隔离 DSH（代理执行宿主）锁定 `dsh-v0.2.0-rc.2`（候选版），commit（提交号）`639ed015397290b3745d163aafe02ffee4aa3f84`。项目插件源码统一为 `integrations/dsh/voice-terminal/` 下的 `@voice-terminal/dsh-plugin`（统一功能包）0.2.0，包含桥接、项目唤醒任务、浏览器和影子预设组件；Bridge protocol（桥接协议）保留 2.0。组件、依赖、安装迁移与新增功能要求见[DSH 插件维护手册](docs/dsh-plugin-maintenance.md)。官方 Automation Bundle（自动化功能包）的用户选择得到保留；原生 `schedule_*`（会话定时任务工具）绑定 DSH 会话，项目 `wake_task_*`（语音链路任务工具）保持独立存储和投递目标。2026-10-07 已完成项目内统一插件安装，已有便携发行程序仍按独立发布流程管理。历史部署见[首次验收](.runtime/dsh-upgrade-20261005/acceptance.md)和[共存修复验收](.runtime/dsh-coexist-20261005/acceptance.md)，运行说明见[项目隔离 DSH 控制台](docs/dsh-console.md)。
 - `config/product-settings.json`：本机产品设置，包含 KWS（关键词唤醒）、静默、Shadow（影子代理）、自定义指令和声纹设置等非密钥内容。
 - `config/speaker/`：声纹资料、模板和特征指纹；详见 [声纹增强](docs/speaker-enhancement.md)。
 

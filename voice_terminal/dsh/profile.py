@@ -12,8 +12,33 @@ import tempfile
 from ..distribution import files
 from ..paths import atomic_json
 
-BUNDLES = ("voice-terminal-shadow-bridge", "voice-terminal-shadow-preset", "voice-terminal-wake-tasks")
+BUNDLES = ("voice-terminal",)
+PLUGIN_PACKAGE = "@voice-terminal/dsh-plugin"
+LEGACY_PACKAGES = frozenset(("@voice-terminal/dsh-shadow-bridge", "@voice-terminal/dsh-shadow-agent-preset", "@voice-terminal/dsh-wake-tasks"))
 NATIVE_SCHEDULE_BUNDLE = "@deepseek-ai/dsh-experimental-schedule-bundle"
+
+
+def migrate_plugin_patch(path: Path) -> None:
+    """仅迁移旧插件名称；稳定行标识与保存的工作区、模型等配置原样保留。"""
+    if not path.is_file():
+        return
+    original = path.read_text(encoding="utf-8-sig")
+    text = original
+    for previous, current in (("@voice-terminal/dsh-shadow-bridge", PLUGIN_PACKAGE),
+                              ("@voice-terminal/dsh-wake-tasks", PLUGIN_PACKAGE + "/wake-tasks")):
+        pattern = rf"(?m)^([ \t]+name:[ \t]+)(['\"]?){re.escape(previous)}\2([ \t]*(?:#.*)?)$"
+        text = re.sub(pattern, lambda match: f"{match[1]}{match[2]}{current}{match[2]}{match[3]}", text)
+    if text == original:
+        return
+    descriptor, temporary = tempfile.mkstemp(prefix=".plugin-migration-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def native_schedule_enabled(profile: Path) -> bool:
@@ -30,10 +55,11 @@ def merge_profile_package(managed: dict, existing: dict) -> dict:
     """更新受管包版本，同时保留用户选择的可选 Bundle（功能包）和其他清单设置。"""
     result = deepcopy(existing)
     result.update({key: value for key, value in managed.items() if key not in ("dependencies", "dsh")})
-    result["dependencies"] = {**existing.get("dependencies", {}), **managed.get("dependencies", {})}
+    previous_dependencies = {key: value for key, value in existing.get("dependencies", {}).items() if key not in LEGACY_PACKAGES}
+    result["dependencies"] = {**previous_dependencies, **managed.get("dependencies", {})}
     current_dsh, managed_dsh = existing.get("dsh", {}), managed.get("dsh", {})
     current_profile, managed_profile = current_dsh.get("profile", {}), managed_dsh.get("profile", {})
-    selected = [*managed_profile.get("bundles", []), *current_profile.get("bundles", [])]
+    selected = [name for name in [*managed_profile.get("bundles", []), *current_profile.get("bundles", [])] if name not in LEGACY_PACKAGES]
     profile = {**current_profile, **managed_profile, "bundles": list(dict.fromkeys(selected))}
     result["dsh"] = {**current_dsh, **managed_dsh, "profile": profile}
     return result
@@ -91,4 +117,5 @@ def build_profile(program: Path, bundles: Path, destination: Path) -> None:
     patch = destination / "cordis.patch.yml"
     if not patch.exists():
         patch.write_text(text, encoding="utf-8")
+    migrate_plugin_patch(patch)
     migrate_schedule_patch(patch, native_enabled=native_schedule_enabled(destination))

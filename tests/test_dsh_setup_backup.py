@@ -58,7 +58,11 @@ def test_setup_patch_respects_native_task_selection(tmp_path: Path, native_enabl
     native = "@deepseek-ai/dsh-experimental-schedule-bundle"
     (tmp_path / "package.json").write_text(json.dumps({"dsh": {"profile": {"bundles": [native] if native_enabled else []}}}), encoding="utf-8")
     selected = "- id: schedule\n  disabled: true\n- id: ui-schedule\n  disabled: true\n"
-    preserved = "- id: agent-preset-registry\n  config:\n    default: shadow-agent\n- id: llm\n  config:\n    model: saved-model\n"
+    preserved = ("- id: agent-preset-registry\n  config:\n    default: shadow-agent\n"
+                 "- id: llm\n  config:\n    model: saved-model\n"
+                 "- id: voice-terminal-shadow-bridge\n  name: \"@voice-terminal/dsh-shadow-bridge\" # 用户设置\n"
+                 "  config:\n    workspaceId: saved-workspace\n    provider: saved-provider\n"
+                 "- id: voice-terminal-wake-tasks\n  name: '@voice-terminal/dsh-wake-tasks'\n")
     target = tmp_path / "cordis.patch.yml"
     target.write_text(preserved + selected, encoding="utf-8")
     command = r"""
@@ -69,10 +73,16 @@ foreach ($taskFunction in $taskAst.FindAll({ param($node) $node -is [Management.
 }
 $ProfilePackagePath = Join-Path $env:VOICE_TEST_PROFILE 'package.json'
 $ProfilePatchPath = Join-Path $env:VOICE_TEST_PROFILE 'cordis.patch.yml'
+$PluginPackageName = '@voice-terminal/dsh-plugin'
 Update-ManagedProfilePatch $ProfilePatchPath
+$taskOnce = [IO.File]::ReadAllText($ProfilePatchPath)
+Update-ManagedProfilePatch $ProfilePatchPath
+if ([IO.File]::ReadAllText($ProfilePatchPath) -cne $taskOnce) { throw '重复迁移改变用户配置' }
 """
     result = subprocess.run([shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command", command],
                             env={**os.environ, "VOICE_TEST_PROFILE": str(tmp_path), "VOICE_TEST_SETUP": str(setup)},
                             text=True, encoding="utf-8", capture_output=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert target.read_text(encoding="utf-8") == preserved + (selected if native_enabled else "")
+    expected = preserved.replace("@voice-terminal/dsh-shadow-bridge", "@voice-terminal/dsh-plugin").replace(
+        "@voice-terminal/dsh-wake-tasks", "@voice-terminal/dsh-plugin/wake-tasks")
+    assert target.read_text(encoding="utf-8") == expected + (selected if native_enabled else "")

@@ -1,0 +1,72 @@
+{
+  "extends": "../../../.runtime/dsh/source/tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  },
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "src/client/**"
+  ],
+  "references": [
+    {
+      "path": "../../../.runtime/dsh/source/vendor/cordis"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/vendor/schemastery"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/core/tools"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/schedule/schedule"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/core/agent"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/core/agent-loop"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/core/session"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/preset/agent-preset-registry"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/core/agent-default-model"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/host/webserver"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/llm/llm"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/session/session-title"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/settings/settings"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/workspace/workspace"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/llm/token-meter"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/vendor/loader"
+    },
+    {
+      "path": "../../../.runtime/dsh/source/packages/compaction/compaction"
+    }
+  ]
+}

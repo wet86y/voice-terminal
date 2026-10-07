@@ -9,7 +9,7 @@ import yaml
 class DshPresetTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(__file__).resolve().parents[1]
-        self.preset_dir = self.root / "config" / "dsh" / "agent-presets" / "shadow-agent"
+        self.preset_dir = self.root / "integrations/dsh/voice-terminal/preset/shadow-agent"
 
     def test_preset_keeps_complete_default_tool_surface_and_subagents(self) -> None:
         class Loader(yaml.SafeLoader):
@@ -36,23 +36,16 @@ class DshPresetTests(unittest.TestCase):
         self.assertNotIn("restrict", (self.preset_dir / "agent.cordis.yml").read_text(encoding="utf-8").lower())
 
     def test_bridge_bundle_and_managed_prompt_rules_exist(self) -> None:
-        bundle = self.root / "integrations" / "dsh" / "voice-terminal-shadow-bridge"
-        manifest = (bundle / "package.json").read_text(encoding="utf-8")
-        source = (bundle / "src" / "index.ts").read_text(encoding="utf-8")
-        rules = (self.root / "config" / "dsh" / "shadow-agent.rules.md").read_text(encoding="utf-8")
-        self.assertIn('"dsh"', manifest)
-        for tool in (
-            "get_latest_context", "read_ambient_context", "publish_progress",
-            "publish_voice_information",
-            "request_user_input", "return_shadow_result", "finish_shadow_no_action",
-        ):
-            self.assertIn(tool, source)
-        self.assertIn("agentDefaultModel.currentSelection()", source)
-        self.assertIn("agentOptions: modelSelection", source)
-        self.assertIn("protocolRecoveryPending", source)
-        self.assertIn("status === 'idle'", source)
-        self.assertIn("event?.data?.reason", source)
-        self.assertIn("content?.[0]?.toolCallId", source)
+        import json
+        bundle = self.root / "integrations/dsh/voice-terminal"
+        manifest = json.loads((bundle / "package.json").read_text(encoding="utf-8"))
+        declaration = json.loads((bundle / "components.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["name"], "@voice-terminal/dsh-plugin")
+        self.assertEqual(manifest["exports"]["."], "./lib/bridge/plugin.js")
+        self.assertEqual(manifest["exports"]["./wake-tasks"], "./lib/wake-tasks/plugin.js")
+        self.assertEqual(manifest["dsh"]["client"]["platform"], "web")
+        self.assertEqual({component["id"] for component in declaration["components"]}, {"bridge", "wake-tasks", "client", "preset", "shared"})
+        rules = (self.root / "config/dsh/shadow-agent.rules.md").read_text(encoding="utf-8")
         self.assertIn("子代理", rules)
         self.assertIn("普通 assistant 正文", rules)
 

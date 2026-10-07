@@ -29,10 +29,13 @@ git diff --check
 | KWS、输入所有权与静默窗口 | `tests/test_kws_always_on.py`、`tests/test_scheduler_staircase.py`、`tests/test_kws_wake_window.py` |
 | Product UI（产品界面）与空输入展示 | `apps/frontend/src/product/useProductAdapter.test.ts`、`apps/frontend/src/conversation-log.test.ts`、`npm test`、`npm run typecheck` |
 | 组件内存、进程显存与设备环境 | `tests/test_gpu_environment.py`（真实计算门禁）、`tests/test_runtime_resources.py`（去重指标）、`tests/test_application_host.py`（受管进程树）、`tests/test_product_api.py`（设备保存与重新检测）、`apps/frontend/src/product/ProductApp.test.ts`（未知指标隐藏与设备选项） |
-| 唤醒归档持久删除与旧任务迁移 | `tests/test_wake_task_api.py`（取消与归档删除接口）、`integrations/dsh/voice-terminal-wake-tasks/test/task-service.test.mjs`（持久化失败、重启与旧存储导入）、`apps/frontend/src/product/ProductApp.test.ts`（删除回执与错误展示） |
+| 唤醒归档持久删除与旧任务迁移 | `tests/test_wake_task_api.py`（取消与归档删除接口）、`integrations/dsh/voice-terminal/test/wake-tasks/task-service.test.mjs`（持久化失败、重启与旧存储导入）、`apps/frontend/src/product/ProductApp.test.ts`（删除回执与错误展示） |
+| DSH 统一插件、组件依赖与加载生命周期 | `npm --prefix integrations/dsh/voice-terminal test`（含类型、依赖与真实加载器组合测试）、`tests/test_dsh_profile.py`（单包迁移）、`tests/test_dsh_setup_backup.py`（安装事务与配置保留）；维护要求见[DSH 插件维护手册](dsh-plugin-maintenance.md) |
 | 快速／深度模式与均衡归档 | `tests/test_reasoning_modes.py`（双模式验收）、`tests/test_reasoning_policy.py`（思考策略）、`apps/frontend/src/composables/useVoiceTerminal.test.ts`（前端会话协议）、`apps/frontend/src/ui-demo/UiDemoApp.test.ts`（演示界面） |
 
 完整回归不能只运行局部测试；协议、上下文、生命周期或公共事件变更必须运行 Python 全量、前端测试、类型检查和构建。
+
+2026-10-07 的 DSH（代理执行宿主）插件合并已完成项目内安装和数据核对。当次工作区后端全量为 855 项通过、1 项跳过，前端为 164 项界面测试及 3 项启动脚本测试通过；统一插件 33 项回归、真实加载器组合、隔离安装和当前项目安装校验均通过。结果及真实模型、设备和桌面发行的验收边界见[插件安装与验证记录](dsh-plugin-maintenance.md#2026-10-07-插件合并与项目安装验收)。
 
 历史常驻运行期间曾出现[已登记的全量挂起问题](known-issues.md)。2026-10-07 的双模式源码回归完成，780 项通过、1 项跳过；随后界面与固定服务密钥修订全量回归为 815 项通过、1 项跳过；组件与归档删除修复全量回归为 825 项通过、1 项跳过，隔离解释器入口最终 40 项定向检查通过，均未重现挂起；历史原因仍待定位。再次挂起时记录受阻的全量命令及定向回归范围，不将定向通过表述为全量通过。
 
@@ -43,7 +46,7 @@ git diff --check
 
 ```powershell
 python -X utf8 -m pytest -q tests/test_secondary_mailbox.py tests/test_scheduler_staircase.py tests/test_json_schema_shadow.py tests/test_context_cache_contract.py tests/test_bridge_v2_information.py tests/test_dsh_bridge.py tests/test_shadow_agent.py tests/test_shadow_agent_harness.py tests/test_durable_shadow_mailbox.py tests/test_product_sidecar.py tests/test_speaker_production.py
-npm --prefix integrations/dsh/voice-terminal-shadow-bridge test
+npm --prefix integrations/dsh/voice-terminal test
 ```
 
 桥接插件测试同时执行两套 TypeScript（静态类型语言）配置的类型检查。最近一次执行的结果和全量后端回归边界见
