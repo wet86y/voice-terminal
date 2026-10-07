@@ -11,6 +11,7 @@ import threading
 import copy
 import subprocess
 from typing import Any
+from pathlib import Path
 
 
 def process_memory_bytes() -> int | None:
@@ -45,6 +46,52 @@ def system_commit_limit_bytes() -> int | None:
         return None
 
 
+def _torch_cuda_probe(torch: Any) -> bool:
+    """验证 PyTorch（张量框架）显卡计算，不能只读取编译或设备声明。"""
+    try:
+        if not torch.cuda.is_available():
+            return False
+        matrix = torch.ones((8, 8), device="cuda")
+        result = (matrix @ matrix).sum().item()
+        torch.cuda.synchronize()
+        return result == 512.0
+    except Exception:
+        return False
+
+
+def _onnx_cuda_probe(ort: Any) -> bool:
+    """验证 ONNX Runtime（模型推理运行时）实际执行显卡节点，拒绝静默回退。"""
+    try:
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            return False
+        import tempfile
+        import base64
+        import numpy as np
+        ort.preload_dlls()
+        with tempfile.TemporaryDirectory(prefix="voice-gpu-check-") as folder:
+            # probe_model（探测模型）：两个 8×8 单精度输入执行 MatMul（矩阵乘法），
+            # IR 10（模型格式版本）和 opset 17（算子版本）；不额外依赖 ONNX（模型编辑库）。
+            probe_model = base64.b64decode('CAo6XQoRCgFhCgFiEgFjIgZNYXRNdWwSCWdwdS1jaGVja1oTCgFhEg4KDAgBEggKAggICgIICFoTCgFiEg4KDAgBEggKAggICgIICGITCgFjEg4KDAgBEggKAggICgIICEIECgAQEQ==')
+            options = ort.SessionOptions()
+            options.enable_profiling = True
+            options.log_severity_level = 3
+            options.intra_op_num_threads = 1
+            options.profile_file_prefix = str(Path(folder) / "profile")
+            session = ort.InferenceSession(probe_model, sess_options=options,
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+            session.disable_fallback()
+            if "CUDAExecutionProvider" not in session.get_providers():
+                return False
+            matrix = np.ones((8, 8), dtype=np.float32)
+            result = float(session.run(None, {"a": matrix, "b": matrix})[0].sum())
+            trace = json.loads(Path(session.end_profiling()).read_text(encoding="utf-8"))
+            return result == 512.0 and any(item.get("args", {}).get("provider") == "CUDAExecutionProvider"
+                and item.get("args", {}).get("op_name") == "MatMul" for item in trace)
+    except Exception:
+        return False
+
+
+
 def _backend_hardware_status() -> dict[str, Any]:
     """探测当前机器的 RAM（系统内存）、显存和各后端 GPU 支持。"""
     memory: dict[str, int | None] = {"available_bytes": None, "total_bytes": None}
@@ -67,7 +114,7 @@ def _backend_hardware_status() -> dict[str, Any]:
     try:
         import torch  # type: ignore
 
-        torch_cuda = bool(torch.cuda.is_available())
+        torch_cuda = _torch_cuda_probe(torch)
         if torch_cuda:
             free, total = torch.cuda.mem_get_info(0)
             gpu.update({
@@ -105,10 +152,12 @@ def _backend_hardware_status() -> dict[str, Any]:
             pass
 
     ort_providers: list[str] = []
+    onnx_cuda = False
     try:
         import onnxruntime as ort  # type: ignore
 
         ort_providers = [str(item) for item in ort.get_available_providers()]
+        onnx_cuda = _onnx_cuda_probe(ort)
     except Exception:
         pass
 
@@ -122,16 +171,15 @@ def _backend_hardware_status() -> dict[str, Any]:
             sherpa_version = str(getattr(sherpa_onnx, "__version__", "")) or None
         except Exception:
             pass
-    sherpa_cuda = bool(sherpa_version and "cuda" in sherpa_version.lower())
-    onnx_cuda = "CUDAExecutionProvider" in ort_providers
+    sherpa_cuda = bool(gpu["available"] and sherpa_version and "cuda" in sherpa_version.lower())
 
     models = {
-        "paraformer": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "未检测到可用的 PyTorch CUDA 后端。"},
-        "sensevoice": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "未检测到可用的 PyTorch CUDA 后端。"},
-        "voice_vad": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "未检测到可用的 PyTorch CUDA 后端。"},
-        "kws": {"gpu_available": sherpa_cuda, "reason": None if sherpa_cuda else "未安装 Sherpa-ONNX CUDA 版本。"},
-        "smart_turn": {"gpu_available": onnx_cuda, "reason": None if onnx_cuda else "ONNX Runtime 未提供 CUDAExecutionProvider（CUDA 执行提供程序）。"},
-        "wespeaker": {"gpu_available": onnx_cuda, "reason": None if onnx_cuda else "ONNX Runtime 未提供 CUDAExecutionProvider（CUDA 执行提供程序）。"},
+        "paraformer": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "PyTorch（张量框架）显卡后端缺失或实际计算检查未通过。"},
+        "sensevoice": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "PyTorch（张量框架）显卡后端缺失或实际计算检查未通过。"},
+        "voice_vad": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "PyTorch（张量框架）显卡后端缺失或实际计算检查未通过。"},
+        "kws": {"gpu_available": sherpa_cuda, "reason": None if sherpa_cuda else "Sherpa-ONNX（语音模型运行时）显卡后端或可用显卡缺失。"},
+        "smart_turn": {"gpu_available": onnx_cuda, "reason": None if onnx_cuda else "ONNX Runtime（模型推理运行时）显卡后端缺失或实际计算检查未通过。"},
+        "wespeaker": {"gpu_available": onnx_cuda, "reason": None if onnx_cuda else "ONNX Runtime（模型推理运行时）显卡后端缺失或实际计算检查未通过。"},
     }
     return {
         "system_memory": memory,
@@ -139,6 +187,7 @@ def _backend_hardware_status() -> dict[str, Any]:
         "backends": {
             "pytorch_cuda": torch_cuda,
             "onnxruntime_providers": ort_providers,
+            "onnxruntime_cuda_verified": onnx_cuda,  # onnxruntime_cuda_verified（显卡实际计算检查通过）。
             "sherpa_onnx_version": sherpa_version,
             "sherpa_onnx_cuda": sherpa_cuda,
         },
@@ -151,15 +200,15 @@ _capabilities: dict | None = None
 _capability_lock = threading.Lock()
 
 
-def hardware_status() -> dict[str, Any]:
+def hardware_status(*, refresh: bool = False) -> dict[str, Any]:
     """主服务使用宿主能力快照；独立入口只运行一次隔离探测，不导入重型后端。"""
-    if os.environ.get("VOICE_RESOURCE_ROLE") != "voice":
-        return _backend_hardware_status()
     global _capabilities
     with _capability_lock:
-        if _capabilities is None:
+        if _capabilities is None or refresh:
             serialized = os.environ.get("VOICE_HARDWARE_CAPABILITIES")
-            if serialized:
+            if os.environ.get("VOICE_RESOURCE_ROLE") != "voice":
+                _capabilities = _backend_hardware_status()
+            elif serialized and not refresh:
                 _capabilities = json.loads(serialized)
             else:
                 env = {**os.environ, "VOICE_RESOURCE_ROLE": "bootstrap"}
@@ -176,6 +225,27 @@ def hardware_status() -> dict[str, Any]:
     except Exception:
         pass
     # 宿主定期从已经加载的工作进程刷新显存数值；主服务不初始化 CUDA 上下文。
+    return result
+
+
+def model_hardware_status(hardware: dict[str, Any], config: Any) -> dict[str, Any]:
+    """结合实际模型资源校验可选设备；框架可用不代表模型显卡文件齐全。"""
+    result = copy.deepcopy(hardware)
+    required = {
+        "paraformer": config.asr_model_dir / "model.pt",
+        "sensevoice": config.model_dir / "analysis/sensevoice/model.pt",
+        "voice_vad": config.vad_model_dir / "model.pt",
+        "smart_turn": config.model_dir / "analysis/smart-turn/smart-turn-v3.2-gpu.onnx",
+        "wespeaker": config.speaker_model_path,
+    }
+    for name, path in required.items():
+        status = result.get("models", {}).get(name)
+        if status and status.get("gpu_available") and not path.is_file():
+            status.update(gpu_available=False, reason="当前模型的显卡推理资源未配置完整。")
+    kws = result.get("models", {}).get("kws")
+    if kws and kws.get("gpu_available") and not all(any(config.kws_dir.glob(pattern))
+            for pattern in ("tokens.txt", "encoder*.onnx", "decoder*.onnx", "joiner*.onnx")):
+        kws.update(gpu_available=False, reason="关键词唤醒模型的显卡推理资源未配置完整。")
     return result
 
 

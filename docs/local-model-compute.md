@@ -8,13 +8,17 @@
 - **仅 CPU**：强制在 CPU 上运行。
 - **GPU（CUDA）**：请求在 GPU 上运行。启动失败时回到保存设备选择时记录的上次成功设备，并在设置页显示原因。
 
-更改保存到 config/product-settings.json，需要重新启动整个应用后生效。显存和系统内存是机器级实时数据；当前后端不报告每个模型的精确显存占用。每个模型显示其工作进程的常驻内存。
+更改保存到 config/product-settings.json（设备偏好文件），需要重新启动整个应用后生效。页面资源摘要显示受管进程去重后的常驻内存、私有提交内存和专用显存；模型行显示所在进程的占用，共享进程不能解读为某一个模型的独占资源。未取得有效测量时直接隐藏该指标；合法的零占用保留。
 
 ## 后端接入与状态读取
 
 设备设置已接入后端：`PUT /api/v1/product/settings/compute`（保存本地模型设备偏好）写入设备选择并返回 `restart_required`（需要重启）；`GET /api/v1/product/compute-status`（读取硬件与运行状态）读取 GPU 能力、工作进程健康状态、实际设备和进程常驻内存。ASR（自动语音识别）、分析、Voice Server（语音服务）及声纹工作进程从同一份产品设置加载设备偏好。
 
 设备偏好保存后，当前存活的模型不会热迁移；必须完整重启应用，所有工作进程才会按新偏好重新加载。重启前，设置中的“保存后的运行偏好”和“当前实际设备”可能不同。以健康状态返回的 `device`（实际运行设备）与 `service`（服务状态）判断是否已切换，不能只看保存的偏好。
+
+本地组件页的刷新会通过 `GET /api/v1/product/compute-status?refresh=true`（重新检测设备环境）重新运行隔离探测。PyTorch（张量框架）执行实际显卡矩阵运算；ONNX Runtime（模型推理运行时）还核对节点执行记录，拒绝静默回退。关键词唤醒检查专用显卡运行库与物理显卡。逐模型再检查所需模型资源，尤其是 SmartTurn（语音结束判断）的显卡模型文件；未通过时不提供可选显卡项，接口也拒绝保存显卡偏好。历史已保存但现已不可用的显卡偏好显示为禁用项，允许改回自动或中央处理器。
+
+`gpu_dedicated_bytes`（进程专用显存字节）从 Windows（操作系统）GPU Process Memory（显卡进程内存）性能计数器读取，不初始化推理框架；多适配器按进程合并，共享进程与子进程按进程标识、创建时间去重。读取失败保留未知，不能用整张显卡已用量代替应用占用。接口实现依据 [PdhAddEnglishCounterW（加入性能计数器）](https://learn.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhaddenglishcounterw) 与 [PdhGetFormattedCounterArrayW（读取实例计数数组）](https://learn.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhgetformattedcounterarrayw)。
 
 本机 RTX 4060 于 2026-09-26 完整重启后的检查结果：SenseVoiceSmall（语音识别与分析）请求设备和实际设备均为 `cuda`，服务为 `READY`（就绪），内部 FSMN-VAD（语音活动检测）也报告 `cuda`；Paraformer（流式语音识别）同样报告 `cuda` 和 `READY`。因此后端设置接口、应用启动配置及分析工作进程的 GPU 加载路径已实际连通。Voice Server FSMN-VAD 的 PyTorch CUDA（深度学习框架的 GPU 后端）可用，但当前保存偏好为 CPU；KWS（关键字唤醒）、SmartTurn（语音结束判断）和 WeSpeaker（声纹识别）因相应 GPU 执行后端未安装而保持 CPU。可用能力以状态 API 的逐模型结果为准。
 

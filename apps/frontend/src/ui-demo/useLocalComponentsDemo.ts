@@ -41,8 +41,8 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
       status: busy ? '正在恢复' : loading ? '启动中' : failed ? '不可用' : '运行中',
       available, retryable: failed && !loading, busy: loading,
       runtime: runtimes[baseId],
-      residentMemory: available ? item.memory : '—', privateMemory: available ? item.commit : '—',
-      vram: item.device === 'cuda' ? available ? '740 MB' : '—' : undefined,
+      residentMemory: available ? item.memory : undefined, privateMemory: available ? item.commit : undefined,
+      vram: item.device === 'cuda' && available ? '740 MB' : undefined,
       description: item.description,
       error: failed ? baseId === 'dsh' ? '代理执行宿主未启动，请重试。' : '模型加载失败，请重试。' : undefined,
       note: '同一进程可承载多个模型，内存总量按进程去重。',
@@ -57,7 +57,7 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
         pending: (savedDevices[item.id] ?? model.device) !== model.device,
         options: [
           { value: 'auto', label: '自动选择' }, { value: 'cpu', label: 'CPU（中央处理器）' },
-          { value: 'cuda', label: 'GPU（图形处理器）', disabled: !model.gpu },
+          ...(model.gpu ? [{ value: 'cuda', label: 'GPU（图形处理器）' }] : []),
         ],
       } : undefined,
     }
@@ -71,9 +71,9 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
       state: empty ? 'disabled' : failed ? 'failed' : loading ? 'loading' : 'ready',
       sampledAt: empty ? '—' : sampledAt.value,
       resources: [
-        { id: 'resident', label: '常驻内存', used: empty ? '未提供' : '2.01 GB', total: empty ? '未提供' : '32 GB' },
-        { id: 'commit', label: '提交内存', used: empty ? '未提供' : '2.45 GB', total: empty ? '未提供' : '48 GB' },
-        { id: 'vram', label: '显存', used: empty ? '未提供' : '2.2 GB', total: empty ? '未提供' : '8 GB' },
+        { id: 'resident', label: '常驻内存', used: empty ? undefined : '2.01 GB', total: empty ? undefined : '32 GB' },
+        { id: 'commit', label: '提交内存', used: empty ? undefined : '2.45 GB', total: empty ? undefined : '48 GB' },
+        { id: 'vram', label: '显存', used: empty ? undefined : '2.2 GB', total: empty ? undefined : '8 GB' },
       ],
       rows: rows.value,
     }

@@ -110,12 +110,38 @@ describe('正式界面的真实控件交互', () => {
     expect(wrapper.findAll('.wake-task-list article')).toHaveLength(1)
     await wrapper.get('.wake-task-tabs button:last-child').trigger('click')
     expect(wrapper.findAll('.wake-task-list article')).toHaveLength(2)
-    const remove = vi.spyOn(productApi, 'deleteWakeTask').mockResolvedValue({} as never)
+    const remove = vi.spyOn(productApi, 'deleteWakeTask').mockResolvedValue({ deleted: true })
     vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: tasks.filter(task => task.task_id !== 'archive-1') } as never)
     await wrapper.get('.wake-task-list .danger-action').trigger('click'); await flushPromises()
     expect(remove).toHaveBeenCalledWith('archive-1')
     expect(wrapper.findAll('.wake-task-list article')).toHaveLength(1)
     expect(wrapper.get('.wake-task-list').text()).toContain('取消测试')
+  })
+  it.each([false, true])('归档删除没有成功回执或请求失败时，保留原记录并显示错误（请求失败：%s）', async failed => {
+    const value = await adapter()
+    const task = { task_id: 'failed-delete', status: 'archived', text: '保留归档', has_reference: false } as const
+    value.wakeTasks.value = [task] as never
+    const remove = vi.spyOn(productApi, 'deleteWakeTask')
+    if (failed) remove.mockRejectedValue(new Error('插件存储失败'))
+    else remove.mockResolvedValue({ deleted: false } as never)
+    await value.removeWakeTask(task as never)
+    expect(value.wakeTasks.value).toHaveLength(1)
+    expect(value.notice.value).not.toContain('已删除')
+    expect(value.lastError.value).toContain(failed ? '插件存储失败' : '归档删除未成功')
+  })
+  it('待执行任务调用取消接口并保留归档记录，不能直接走归档删除', async () => {
+    const value = await adapter()
+    const task = { task_id: 'cancel-pending', status: 'pending', text: '取消测试', has_reference: false } as const
+    value.wakeTasks.value = [task] as never
+    const cancel = vi.spyOn(productApi, 'cancelWakeTask').mockResolvedValue({ ...task, status: 'cancelled' } as never)
+    const remove = vi.spyOn(productApi, 'deleteWakeTask')
+    vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [{ ...task, status: 'cancelled' }] } as never)
+    application.businessReady.value = true
+    await value.removeWakeTask(task as never)
+    expect(cancel).toHaveBeenCalledWith('cancel-pending')
+    expect(remove).not.toHaveBeenCalled()
+    expect(value.wakeTasks.value[0]?.status).toBe('cancelled')
+    expect(value.notice.value).toContain('保存在归档中')
   })
   it('本地组件不把整卡已用显存当应用占用，并区分设备草稿、待生效配置和实际 CPU（中央处理器）', async () => {
     let value!: ReturnType<typeof useProductControls>
@@ -125,9 +151,9 @@ describe('正式界面的真实控件交互', () => {
     value.settings.compute.devices.paraformer = 'cuda'
     value.computeSavedDevices.value.paraformer = 'cpu'
     await flushPromises()
-    expect(wrapper.get('[data-resource="vram"]').text()).toContain('未提供')
-    expect(wrapper.get('[data-resource="vram"]').text()).not.toContain('6 GB')
-    expect(wrapper.get('[data-resource="commit"]').text()).toBe('提交内存未提供/ 未提供')
+    expect(wrapper.find('[data-resource="vram"]').exists()).toBe(false)
+    expect(wrapper.find('[data-resource="commit"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('未提供')
     const row = wrapper.get('[data-component="paraformer"]')
     expect(row.find('[data-metric="vram"]').exists()).toBe(false)
     expect(row.get('[data-metric="memory"]').text()).toContain('1 GB / 2 GB')
@@ -139,6 +165,34 @@ describe('正式界面的真实控件交互', () => {
     expect(row.text()).not.toContain('草稿尚未保存')
     expect(row.text()).toContain('已保存配置下次启动生效')
     expect(row.text()).toContain('实际运行：CPU（中央处理器）')
+  })
+  it('显存摘要使用去重进程计量，未知指标不显示，缺失后端不能选择显卡，刷新重新检测环境', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    value.computeStatus.value = { hardware: { system_memory: {}, gpu: { total_bytes: 8 * 1024 ** 3 } }, models: {
+      paraformer: { service: 'READY', device: 'cuda', requested_device: 'cuda', gpu_available: true, runtime: 'PyTorch（推理框架）', resource_status: { gpu_dedicated_bytes: 512 * 1024 ** 2 } },
+      wespeaker: { service: 'READY', device: 'cpu', requested_device: 'cpu', gpu_available: false, gpu_unavailable_reason: '显卡运行库缺失' },
+    } } as never
+    application.snapshot.value = { total_gpu_dedicated_bytes: 768 * 1024 ** 2, components: [
+      { id: 'setup', name: '环境与配置检查', state: 'ready', memory_rss_bytes: null, memory_private_commit_bytes: null },
+    ] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    expect(wrapper.get('[data-resource="vram"]').text()).toBe('显存768 MB/ 8 GB')
+    expect(wrapper.get('[data-component="paraformer"] [data-metric="vram"]').text()).toContain('512 MB')
+    expect(wrapper.find('[data-component="setup"] [data-metric="memory"]').exists()).toBe(false)
+    expect(wrapper.get('[data-component="setup"] .local-state').text()).toBe('已通过')
+    const row = wrapper.get('[data-component="wespeaker"]')
+    await row.get('button.local-component-action').trigger('click')
+    expect(row.findAll('option').map(option => option.attributes('value'))).toEqual(['auto', 'cpu'])
+    expect(row.text()).toContain('显卡运行库缺失')
+    value.settings.compute.devices.wespeaker = 'cuda'
+    await flushPromises()
+    expect(row.get('option[value="cuda"]').attributes('disabled')).toBeDefined()
+    expect(row.get('.save-button').attributes('disabled')).toBeDefined()
+    const probe = vi.spyOn(productApi, 'computeStatus').mockResolvedValue({} as never)
+    application.businessReady.value = true
+    await wrapper.get('.local-refresh').trigger('click'); await flushPromises()
+    expect(probe).toHaveBeenCalledWith(true)
   })
   it.each(['failed', 'blocked', 'stopped'] as const)('所属进程为 %s（不可用）时，旧模型就绪采样不能继续显示运行中', async state => {
     let value!: ReturnType<typeof useProductControls>

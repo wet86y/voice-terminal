@@ -17,8 +17,8 @@ const owners: Record<ProductLocalModelId, string> = {
 function componentFor(id: string) { return application.snapshot.value?.components?.find(row => row.id === id) }
 function facts(component?: ApplicationComponent) {
   return [
-    { label: '进程标识', value: component?.pid == null ? '未提供' : String(component.pid) },
-    { label: '处理器占用', value: component?.cpu_percent == null ? '未提供' : component.cpu_percent.toFixed(1) + '%' },
+    ...(component?.pid == null ? [] : [{ label: '进程标识', value: String(component.pid) }]),
+    ...(component?.cpu_percent == null ? [] : [{ label: '处理器占用', value: component.cpu_percent.toFixed(1) + '%' }]),
   ]
 }
 const rows = computed<LocalComponentRow[]>(() => {
@@ -41,12 +41,12 @@ const rows = computed<LocalComponentRow[]>(() => {
       available, retryable: !available && !loading && Boolean(owner?.retry_allowed), busy,
       runtime: status?.runtime || '未提供',
       residentMemory: formatComponentMemory(resource?.rss_bytes), privateMemory: formatComponentMemory(resource?.private_commit_bytes),
-      vram: status?.device?.startsWith('cuda') ? '未提供' : undefined,
+      vram: status?.device?.startsWith('cuda') ? formatComponentMemory(resource?.gpu_dedicated_bytes) : undefined,
       description: item.detail, error: !available && !loading ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
-      note: '内存为所在进程占用，共享进程不重复计入总量。' + (status?.device?.startsWith('cuda') ? '当前未提供单个模型的显存指标。' : ''),
+      note: '内存和显存为所在进程占用，共享进程不重复计入总量。',
       facts: [
-        { label: '进程标识', value: resource?.pid == null ? '未提供' : String(resource.pid) },
-        { label: '处理器占用', value: resource?.pid === owner?.pid && owner?.cpu_percent != null ? owner.cpu_percent.toFixed(1) + '%' : '未提供' },
+        ...(resource?.pid == null ? [] : [{ label: '进程标识', value: String(resource.pid) }]),
+        ...(resource?.pid === owner?.pid && owner?.cpu_percent != null ? [{ label: '处理器占用', value: owner.cpu_percent.toFixed(1) + '%' }] : []),
       ],
       device: {
         value: settings.compute.devices[item.id], current: deviceLabel(status?.device),
@@ -54,7 +54,7 @@ const rows = computed<LocalComponentRow[]>(() => {
         pending: Boolean(status && computeSavedDevices.value[item.id] !== status.requested_device),
         options: [
           { value: 'auto', label: '自动选择' }, { value: 'cpu', label: 'CPU（中央处理器）' },
-          { value: 'cuda', label: 'GPU（图形处理器）', disabled: !gpuAvailable },
+          ...(gpuAvailable ? [{ value: 'cuda', label: 'GPU（图形处理器）' }] : settings.compute.devices[item.id] === 'cuda' ? [{ value: 'cuda', label: 'GPU（当前不可用）', disabled: true }] : []),
         ],
         hint: status?.load_error && available ? status.load_error : !gpuAvailable ? status?.gpu_unavailable_reason || '当前推理环境不支持显卡运行。' : undefined,
       },
@@ -67,10 +67,11 @@ const rows = computed<LocalComponentRow[]>(() => {
     return {
       id: component.id, name: component.name,
       state: available ? 'ready' : component.state === 'disabled' ? 'disabled' : loading ? 'loading' : 'failed',
-      status: busy ? '正在恢复' : available ? '运行中' : component.state === 'disabled' ? '已停用' : loading ? '启动中' : '不可用',
+      status: busy ? '正在恢复' : available ? component.id === 'setup' ? '已通过' : '运行中' : component.state === 'disabled' ? '已停用' : loading ? '启动中' : '不可用',
       available, retryable: component.retry_allowed && !busy, busy,
       runtime: component.id === 'dsh' ? 'Node.js（执行环境）' : component.id === 'voice' ? 'Python（语音进程）' : component.id === 'web' ? '桌面宿主' : '本地进程',
       residentMemory: formatComponentMemory(component.memory_rss_bytes), privateMemory: formatComponentMemory(component.memory_private_commit_bytes),
+      vram: component.gpu_dedicated_bytes != null && component.gpu_dedicated_bytes > 0 ? formatComponentMemory(component.gpu_dedicated_bytes) : undefined,
       description: component.phase, error: component.error,
       location: '本机', facts: facts(component),
       note: component.shared_with ? '与应用宿主共享进程，内存总量只计一次。' : component.external ? '此组件使用外部调试进程。' : undefined,
@@ -83,7 +84,7 @@ const model = computed<LocalComponentsModel>(() => {
   const hardware = computeStatus.value?.hardware
   const failed = rows.value.some(row => row.state === 'failed')
   const loading = rows.value.some(row => row.state === 'loading')
-  // 显卡容量来自设备；当前没有可靠的本应用显存占用指标。
+  // 总显存取自受管进程的去重计数，不把整卡占用当作应用占用。
   const gpu = hardware?.gpu
   return {
     status: failed ? '部分组件不可用' : loading ? '组件启动中' : '运行正常', state: failed ? 'failed' : loading ? 'loading' : 'ready',
@@ -91,14 +92,14 @@ const model = computed<LocalComponentsModel>(() => {
     resources: [
       { id: 'resident', label: '常驻内存', used: formatComponentMemory(snapshot?.total_memory_rss_bytes), total: formatComponentMemory(hardware?.system_memory.total_bytes) },
       { id: 'commit', label: '提交内存', used: formatComponentMemory(snapshot?.total_memory_private_commit_bytes), total: formatComponentMemory(hardware?.system_memory.commit_limit_bytes) },
-      { id: 'vram', label: '显存', used: '未提供', total: formatComponentMemory(gpu?.total_bytes) },
+      { id: 'vram', label: '显存', used: formatComponentMemory(snapshot?.total_gpu_dedicated_bytes), total: formatComponentMemory(gpu?.total_bytes) },
     ], rows: rows.value, error: application.error.value, refreshing: refreshing.value,
   }
 })
 async function refresh() {
   if (refreshing.value) return
   refreshing.value = true
-  try { await Promise.all([application.refresh(), refreshComputeStatus()]) }
+  try { await Promise.all([application.refresh(), refreshComputeStatus(true)]) }
   finally { refreshing.value = false }
 }
 async function retry(id: string) {
@@ -110,6 +111,7 @@ async function retry(id: string) {
 }
 function device(id: string, value: string) {
   if (computeModelRows.some(row => row.id === id) && ['auto', 'cpu', 'cuda'].includes(value)) {
+    if (value === 'cuda' && computeStatus.value?.models?.[id as ProductLocalModelId]?.gpu_available !== true) return
     settings.compute.devices[id as ProductLocalModelId] = value as ComputeDeviceMode
   }
 }

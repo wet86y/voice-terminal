@@ -42,6 +42,28 @@ def test_manual_create_requires_host_credential_and_fixes_business_fields(tmp_pa
     asyncio.run(scenario())
 
 
+def test_archive_delete_rejects_cancel_receipt_instead_of_reporting_success(tmp_path: Path):
+    async def scenario():
+        config = AppConfig(model_dir=tmp_path / 'models', persona=PersonaConfig(directory=tmp_path / 'persona'))
+        settings = ProductSettingsStore(path=tmp_path / 'settings.json', config=config)
+        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / '.runtime')
+        calls = []
+        async def task_api(method, path, payload=None):
+            calls.append((method, path))
+            return {'task_id': 'old-plugin', 'status': 'cancelled'}
+        runtime.dsh.bridge.task_api = task_api
+        transport = httpx.ASGITransport(app=create_app(runtime, product_settings=settings))
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+                result = await client.delete('/api/v1/wake-tasks/old-plugin')
+                assert result.status_code == 409
+                assert calls == [('DELETE', 'tasks/old-plugin/archive')]
+        finally:
+            await runtime.close_background_services()
+            await runtime.dsh.close()
+    asyncio.run(scenario())
+
+
 def test_wake_task_routes_cover_dsh_tools_and_settings_page(tmp_path: Path):
     async def scenario() -> None:
         config = AppConfig(
@@ -65,6 +87,9 @@ def test_wake_task_routes_cover_dsh_tools_and_settings_page(tmp_path: Path):
                 return row
             if path.endswith("/reference"):
                 return {"task_id": "schedule-test", "reference": frozen_reference}
+            if method == "DELETE" and path.endswith("/archive"):
+                catalog.pop("schedule-test")
+                return {"task_id": "schedule-test", "deleted": True}
             row = catalog["schedule-test"]
             if method == "PATCH":
                 row.update(payload or {})
@@ -119,9 +144,15 @@ def test_wake_task_routes_cover_dsh_tools_and_settings_page(tmp_path: Path):
             assert cancelled.status_code == 200
             assert cancelled.json()["status"] == "cancelled"
 
+            cancelled_public = await client.post(f"/api/v1/wake-tasks/{task_id}/cancel")
+            assert cancelled_public.status_code == 200
+            assert cancelled_public.json()["status"] == "cancelled"
+            assert len((await client.get("/api/v1/wake-tasks")).json()["tasks"]) == 1
+
             removed = await client.delete(f"/api/v1/wake-tasks/{task_id}")
             assert removed.status_code == 200
-            assert (await client.get("/api/v1/wake-tasks")).json()["tasks"][0]["status"] == "cancelled"
+            assert removed.json() == {"deleted": True}
+            assert (await client.get("/api/v1/wake-tasks")).json()["tasks"] == []
 
         await runtime.close_background_services()
         await runtime.dsh.close()

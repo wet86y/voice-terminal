@@ -26,6 +26,7 @@ class ApplicationState:
             "voice_api_url": "", "voice_ws_url": "", "capabilities": {},
             "sampled_at": None, "total_memory_rss_bytes": None,
             "total_memory_private_commit_bytes": None,  # 去重后的受管进程私有提交内存（字节）。
+            "total_gpu_dedicated_bytes": None,  # total_gpu_dedicated_bytes（受管进程专用显存字节总量）。
             "components": [self.new_component(key) for key in LABELS],
         }
 
@@ -37,6 +38,7 @@ class ApplicationState:
             "pid": None, "created_at": None, "uptime_seconds": None,
             "memory_rss_bytes": None, "cpu_percent": None, "sampled_at": None,
             "memory_private_commit_bytes": None,  # 进程私有提交内存（字节），不等于物理占用。
+            "gpu_dedicated_bytes": None,  # gpu_dedicated_bytes（进程专用显存字节）。
             "shared_with": "host" if key == "web" else None,
             "retry_allowed": False, "retrying": False, "external": False,
         }
@@ -66,11 +68,11 @@ class ApplicationState:
         with self.condition:
             row = next(c for c in self.value["components"] if c["id"] == key)
             if "pid" in values and values["pid"] != row["pid"]:
-                row.update(created_at=None, memory_rss_bytes=None, memory_private_commit_bytes=None,
+                row.update(created_at=None, memory_rss_bytes=None, memory_private_commit_bytes=None, gpu_dedicated_bytes=None,
                     cpu_percent=None, uptime_seconds=None, sampled_at=None)
             row.update(values)
             if row["state"] in {"blocked", "disabled", "stopped"} or row["pid"] is None:
-                row.update(memory_rss_bytes=None, memory_private_commit_bytes=None,
+                row.update(memory_rss_bytes=None, memory_private_commit_bytes=None, gpu_dedicated_bytes=None,
                     cpu_percent=None, uptime_seconds=None)
             self.value["revision"] += 1
             self.condition.notify_all()

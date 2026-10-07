@@ -157,7 +157,9 @@ def process_resource_status() -> dict:
     import psutil
     process = psutil.Process()
     memory = process.memory_info()
+    from .gpu_memory import process_vram_bytes, process_vram_snapshot
     return {"pid": process.pid, "created_at": process.create_time(),  # 进程身份与创建时间。
+            "gpu_dedicated_bytes": process_vram_bytes(process.pid, snapshot=process_vram_snapshot()),  # gpu_dedicated_bytes（进程专用显存字节）。
             "private_commit_bytes": getattr(memory, "private", None),  # 私有提交，非物理内存。
             "rss_bytes": memory.rss, "thread_count": process.num_threads(),  # 常驻字节数与线程数。
             "sampled_at": time.time(), "role": os.environ.get("VOICE_RESOURCE_ROLE"),  # 采样时间与角色。
@@ -168,10 +170,12 @@ def process_resource_status() -> dict:
 def aggregate_resource_status(rows: list[dict], *, missing_roles=()) -> dict:
     processes = {(row["pid"], row["created_at"]): row for row in rows if row.get("pid") and row.get("created_at")}
     commits = [row.get("private_commit_bytes") for row in processes.values()]
+    vram = [row.get("gpu_dedicated_bytes") for row in processes.values()]
     missing = sorted(set(missing_roles))
     return {"processes": list(processes.values()),  # 去重进程清单。
             "complete": not missing, "missing_roles": missing,  # complete（覆盖完整）及 missing_roles（未采样角色）。
             "private_commit_bytes": sum(commits) if not missing and commits and all(v is not None for v in commits) else None,
+            "gpu_dedicated_bytes": sum(vram) if not missing and vram and all(v is not None for v in vram) else None,  # 按进程去重的专用显存字节。
             "rss_bytes": sum(row["rss_bytes"] for row in processes.values()),
             "thread_count": sum(row["thread_count"] for row in processes.values()),
             "managed_cache_bytes": sum(row.get("managed_cache_bytes", 0) for row in processes.values()),

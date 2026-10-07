@@ -86,6 +86,7 @@ export const productApi = {
   wakeTasks: () => request<{ tasks: WakeTask[] }>('/api/v1/wake-tasks'),
   updateWakeTask: (id: string, value: unknown) => request<WakeTask>(`/api/v1/wake-tasks/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(value) }),
   deleteWakeTask: (id: string) => request<{ deleted: boolean }>(`/api/v1/wake-tasks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  cancelWakeTask: (id: string) => request<WakeTask>(`/api/v1/wake-tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST', body: '{}' }),
   saveWake: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/wake', jsonBody(value)),
   saveSilence: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/silence', jsonBody(value)),
   saveQuietHours: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/quiet-hours', jsonBody(value)),
@@ -94,7 +95,7 @@ export const productApi = {
   saveCustomInstructions: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/custom-instructions', jsonBody(value)),
   saveSpeaker: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/speaker', jsonBody(value)),
   /** 获取本地模型设备、硬件能力与工作进程资源状态。 */
-  computeStatus: () => request<ProductComputeStatus>('/api/v1/product/compute-status'),
+  computeStatus: (refresh = false) => request<ProductComputeStatus>(`/api/v1/product/compute-status${refresh ? '?refresh=true' : ''}`),
   /** 保存本地模型设备偏好；返回值会标明需要重启应用。 */
   saveCompute: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/compute', jsonBody(value)),
   /** 读取 TTS（语音合成）固定在线 API（程序接口）的只读状态。 */

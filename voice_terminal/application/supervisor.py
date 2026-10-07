@@ -439,6 +439,8 @@ class ApplicationHost:
         unique = {}
         sampled = {}
         complete = True  # complete（受管进程采样覆盖完整）。
+        from ..gpu_memory import process_vram_bytes, process_vram_snapshot
+        gpu_memory = process_vram_snapshot()
 
         def sample_process(process, identity):
             if identity not in sampled:
@@ -464,13 +466,14 @@ class ApplicationHost:
                 if row["created_at"] and abs(created - row["created_at"]) > 2:
                     if not row["external"]:
                         complete = False
-                    self.state.component(row["id"], memory_rss_bytes=None, memory_private_commit_bytes=None,
+                    self.state.component(row["id"], memory_rss_bytes=None, memory_private_commit_bytes=None, gpu_dedicated_bytes=None,
                         cpu_percent=None, uptime_seconds=None, sampled_at=now)
                     continue
                 identity = (pid, created)
                 memory, private_commit, cpu = sample_process(process, identity)
                 self.state.component(row["id"], created_at=created, uptime_seconds=max(0, now-created),
                     memory_rss_bytes=memory, memory_private_commit_bytes=private_commit,
+                    gpu_dedicated_bytes=process_vram_bytes(pid, snapshot=gpu_memory),
                     cpu_percent=cpu, sampled_at=now, thread_count=process.num_threads())
                 if not row["external"]:
                     unique[identity] = (memory, private_commit)
@@ -486,12 +489,14 @@ class ApplicationHost:
             except psutil.Error:
                 if not row["external"]:
                     complete = False
-                self.state.component(row["id"], memory_rss_bytes=None, memory_private_commit_bytes=None,
+                self.state.component(row["id"], memory_rss_bytes=None, memory_private_commit_bytes=None, gpu_dedicated_bytes=None,
                     cpu_percent=None, uptime_seconds=None, sampled_at=now)
         commits = [value[1] for value in unique.values()]
+        vram = [process_vram_bytes(pid, snapshot=gpu_memory) for pid, _ in unique]
         self.state.update(sampled_at=now,
             metrics_complete=complete,  # metrics_complete（指标覆盖完整）。
             total_memory_rss_bytes=sum(value[0] for value in unique.values()) if complete and unique else None,
+            total_gpu_dedicated_bytes=sum(vram) if complete and vram and all(v is not None for v in vram) else None,
             total_memory_private_commit_bytes=sum(commits) if complete and commits and all(value is not None for value in commits) else None)
         self.cpu_samples = {identity: value for identity, value in self.cpu_samples.items() if identity in unique}
 
@@ -558,5 +563,5 @@ class ApplicationHost:
         for row in self.state.snapshot()["components"]:
             self.state.component(row["id"], state="stopped", phase="已回收", pid=None)
         self.state.update(state="stopped", phase="应用已退出", core_available=False,
-            total_memory_rss_bytes=None, total_memory_private_commit_bytes=None,
+            total_memory_rss_bytes=None, total_memory_private_commit_bytes=None, total_gpu_dedicated_bytes=None,
             capabilities={key: "STOPPED" for key in self.state.value["capabilities"]})
