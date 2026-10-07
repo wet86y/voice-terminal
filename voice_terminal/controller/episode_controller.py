@@ -126,7 +126,7 @@ class EpisodeController(RealtimeController):
                 self._early_silence_task = None
 
     def _make_episode(self):
-        mode = getattr(self, "reasoning_mode", "balanced")
+        mode = getattr(self, "reasoning_mode", "fast")
         runtime = AgentEpisodeRuntime(self.llm, self.registry, self.output, self._agent_event,
                                       conversation=self.conversation, ledger=self.history,
                                       options=self.agent_options, tools_enabled=True,
@@ -308,6 +308,8 @@ class EpisodeController(RealtimeController):
         self._track(task)
 
     def set_reasoning_mode(self, mode: str) -> None:
+        if mode not in {"fast", "deep"}:
+            raise ValueError("reasoning_mode（运行模式）必须是 fast（快速）或 deep（深度）")
         self.reasoning_mode = mode
         # Before the first user input there is no frozen schema yet, so make
         # the staged selection effective immediately without touching work.

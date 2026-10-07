@@ -188,7 +188,7 @@ class LlmConfig:
     model: str = "deepseek-flash"
     api_key_env: str = "DEEPSEEK_API_KEY"
     stream: bool = True
-    reasoning_mode: str = "balanced"
+    reasoning_mode: str = "fast"  # reasoning_mode（运行模式）：默认快速，仅支持快速和深度。
     thinking: str = "enabled"
     reasoning_effort: str = "low"
     # Direct programmatic construction keeps the provider-compatible full
@@ -198,7 +198,6 @@ class LlmConfig:
     timeout_ms: int = 15000
     transport: str = "chat_completions"
     max_output_tokens: int = 393216
-    thinking_action_enabled: bool = False
     protocol_recovery_limit: int = 1
     transport_retry_limit: int = 2
 
@@ -209,8 +208,8 @@ class LlmConfig:
             raise ValueError("llm.transport must be chat_completions or responses")
         if self.thinking not in {"disabled", "enabled"}:
             raise ValueError("llm.thinking must be disabled or enabled")
-        if self.reasoning_mode not in {"fast", "balanced", "deep"}:
-            raise ValueError("llm.reasoning_mode must be fast, balanced, or deep")
+        if self.reasoning_mode not in {"fast", "deep"}:
+            raise ValueError("llm.reasoning_mode（运行模式）必须是 fast（快速）或 deep（深度）")
         if self.reasoning_effort not in REASONING_EFFORTS:
             raise ValueError("llm.reasoning_effort must be off, low, medium, high, or max")
         object.__setattr__(self, "allowed_reasoning", _reasoning_levels(self.allowed_reasoning, REASONING_EFFORTS))
@@ -887,7 +886,7 @@ class AppConfig:
                 model=llm_model,
                 api_key_env=llm_api_key_env,
                 stream=_bool(llm.get("stream"), True),
-                reasoning_mode=_string(llm.get("reasoning_mode"), "balanced"),
+                reasoning_mode=_string(llm.get("reasoning_mode"), "fast"),
                 thinking=_string(llm.get("thinking"), "enabled"),
                 reasoning_effort=_string(llm.get("reasoning_effort"), "low"),
                 allowed_reasoning=_reasoning_levels(
@@ -896,7 +895,6 @@ class AppConfig:
                 timeout_ms=int(_number(llm.get("timeout_ms"), 15000)),
                 transport=_string(llm.get("transport"), "chat_completions"),
                 max_output_tokens=int(_number(llm.get("max_output_tokens"), 393216)),
-                thinking_action_enabled=_bool(llm.get("thinking_action_enabled"), False),
                 protocol_recovery_limit=max(0, int(_number(llm.get("protocol_recovery_limit"), 1))),
                 transport_retry_limit=max(0, int(_number(llm.get("transport_retry_limit"), 2))),
             ),

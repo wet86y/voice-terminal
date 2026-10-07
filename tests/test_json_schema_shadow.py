@@ -13,7 +13,7 @@ from voice_terminal.agent.decision_envelope import (
     json_structure_fingerprint, parse_compatible_decision_envelope,
     provider_schema_diagnostics,
 )
-from voice_terminal.agent.decision_schema import THINKING_ACTION, decision_schema
+from voice_terminal.agent.decision_schema import decision_schema
 from voice_terminal.agent.episode import AgentEpisodeRuntime, PROMPT
 from voice_terminal.providers.deepseek import DeepSeekClient, DeepSeekHttpError, DeepSeekTransportError
 from voice_terminal.providers.deepseek import DeepSeekError
@@ -32,7 +32,7 @@ def static(content: str) -> dict[str, str]:
     return ContextFrame.make(ContextLane.STATIC_INSTRUCTIONS, "system", content)
 
 
-def test_decision_schema_keeps_wire_shape_and_reserves_thinking_action():
+def test_decision_schema_keeps_wire_shape_without_extra_control_actions():
     schema = decision_schema([{
         "name": "web_search",
         "parameters": {
@@ -41,13 +41,13 @@ def test_decision_schema_keeps_wire_shape_and_reserves_thinking_action():
             "required": ["query"],
             "additionalProperties": False,
         },
-    }], allow_thinking=True)
+    }])
     assert schema["required"] == ["speak", "actions"]
     assert schema["additionalProperties"] is False
     item = schema["properties"]["actions"]["items"]
     assert item["required"] == ["name", "arguments"]
-    assert item["properties"]["name"]["enum"] == ["web_search", THINKING_ACTION]
-    assert item["properties"]["arguments"]["properties"]["request"] == {"type": "boolean", "const": True}
+    assert item["properties"]["name"]["enum"] == ["web_search"]
+    assert item["properties"]["arguments"]["properties"] == {"query": {"type": "string"}}
 
 
 def test_prompt_matches_required_responses_wire_contract_and_has_short_examples():
@@ -184,7 +184,6 @@ def test_runtime_aborts_prose_stream_at_ten_effective_chars_and_starts_recovery(
         class Provider:
             supports_decision_schema = True
             transport = "responses"
-            thinking_action_enabled = False
             protocol_recovery_limit = 1
 
             def __init__(self):
@@ -239,7 +238,6 @@ def test_runtime_does_not_early_abort_fragmented_json_or_bounded_wrappers():
         class Provider:
             supports_decision_schema = True
             transport = "responses"
-            thinking_action_enabled = False
             protocol_recovery_limit = 1
 
             def __init__(self):
@@ -437,7 +435,7 @@ def test_responses_payload_separates_instructions_and_enables_strict_schema():
         base_url="https://example.invalid", model="deepseek-v4-flash", api_key="key",
         transport="responses", thinking="disabled",
     )
-    schema = decision_schema([], allow_thinking=False)
+    schema = decision_schema([])
     payload = client._responses_payload(
         [static("rules"), history("user", "hello")],
         model=client.model, schema=schema, schema_name="voice_decision_v06",
@@ -456,7 +454,7 @@ def test_context_audit_captures_full_wire_payload_and_manifest():
         base_url="https://example.invalid", model="deepseek-v4-flash", api_key="secret-key",
         transport="responses", thinking="disabled", max_output_tokens=512,
     )
-    schema = decision_schema([], allow_thinking=False)
+    schema = decision_schema([])
     messages = [static("exact rules"), history("user", "exact user context")]
     snapshot = build_context_snapshot(
         client,
@@ -706,7 +704,6 @@ def test_runtime_gives_max_output_incomplete_the_single_protocol_recovery():
         class Provider:
             supports_decision_schema = True
             transport = "responses"
-            thinking_action_enabled = False
             protocol_recovery_limit = 1
 
             def stream_events(self, _messages, **_kwargs):
@@ -741,7 +738,6 @@ def test_runtime_does_not_ask_model_to_correct_content_filter():
         class Provider:
             supports_decision_schema = True
             transport = "responses"
-            thinking_action_enabled = False
             protocol_recovery_limit = 1
 
             def stream_events(self, _messages, **_kwargs):
@@ -784,7 +780,6 @@ def test_responses_runtime_commits_bounded_json_repair_without_recovery(monkeypa
         class Provider:
             supports_decision_schema = True
             transport = "responses"
-            thinking_action_enabled = False
             protocol_recovery_limit = 1
 
             def stream_events(self, _messages, **_kwargs):
@@ -864,7 +859,6 @@ def test_cancelled_request_audit_retains_reason_and_partial_output(monkeypatch):
         class Provider:
             supports_decision_schema = True
             transport = "responses"
-            thinking_action_enabled = False
 
             def stream_events(self, _messages, **_kwargs):
                 async def stream():
@@ -1026,49 +1020,16 @@ def test_shadow_chain_validates_without_touching_output_or_ledger():
     asyncio.run(scenario())
 
 
-@pytest.mark.skip(reason="voice business tools were replaced by the content-free Shadow wake")
-def test_thinking_and_business_actions_release_one_barrier_after_tools():
+
+
+def test_secondary_mailbox_shadow_actions_follow_normal_dispatch_rules():
     async def scenario():
-        provider = SimpleNamespace(thinking_action_enabled=True)
-        runtime = _runtime(provider)
-        released = asyncio.Event()
-        wakes = []
-
-        async def execute(_identity, _turn_id, actions, *, wake=True):
-            assert [action.name for action in actions] == ["web_search"]
-            assert wake is True
-            await released.wait()
-            return True
-
-        runtime._execute_actions_v06 = execute
-        runtime._wake = wakes.append
-        envelope = DecisionEnvelope(
-            SpeechDecision("speak", "calm", "让我想一想。"),
-            (
-                Action(THINKING_ACTION, {"request": True}),
-                Action("web_search", {"query": "current weather"}),
-            ),
-        )
-        await runtime._dispatch_actions_v06((runtime.episode_id, "request"), "turn-a", envelope)
-        await asyncio.sleep(0)
-        assert wakes == [] and runtime._thinking_lease_turn is None
-        released.set()
-        await asyncio.gather(*tuple(runtime._background_tools))
-        assert wakes == ["THINKING_READY"]
-        assert runtime._thinking_lease_turn == "turn-a"
-        assert runtime._thinking_prefix_by_turn["turn-a"] == "让我想一想。"
-
-    asyncio.run(scenario())
-
-
-def test_secondary_mailbox_actions_and_thinking_follow_normal_dispatch_rules():
-    async def scenario():
-        runtime = _runtime(SimpleNamespace(thinking_action_enabled=True))
+        runtime = _runtime(SimpleNamespace())
         shadow_wakes = []
         runtime.shadow_waker = lambda: shadow_wakes.append("wake") or "started"
         envelope = DecisionEnvelope(
             SpeechDecision("speak", "calm", "有必要的新进展。"),
-            (Action(THINKING_ACTION, {"request": True}), Action("request_shadow", {"request": True})),
+            (Action("request_shadow", {"request": True}),),
         )
         await runtime._dispatch_actions_v06(
             (runtime.episode_id, "request-a"), "turn-a", envelope,
@@ -1077,22 +1038,20 @@ def test_secondary_mailbox_actions_and_thinking_follow_normal_dispatch_rules():
         )
         await asyncio.gather(*tuple(runtime._background_tools))
         assert shadow_wakes == ["wake"]
-        assert any(item["kind"] == "THINKING_REQUESTED" for item in runtime.trace)
         assert not any(item["kind"] == "SYSTEM_CHECK_ACTION_REJECTED" for item in runtime.trace)
 
     asyncio.run(scenario())
 
 
-def test_final_silence_actions_and_thinking_are_rejected_before_execution():
+def test_final_silence_shadow_actions_are_rejected_before_execution():
     async def scenario():
-        runtime = _runtime(SimpleNamespace(thinking_action_enabled=True))
+        runtime = _runtime(SimpleNamespace())
         runtime._system_check_turn_ids.add("system-check-a")
         shadow_wakes = []
         runtime.shadow_waker = lambda: shadow_wakes.append("wake") or "started"
         envelope = DecisionEnvelope(
             SpeechDecision("speak", "calm", "系统检查播报。"),
             (
-                Action(THINKING_ACTION, {"request": True}),
                 Action("request_shadow", {"request": True}),
             ),
         )
@@ -1106,7 +1065,7 @@ def test_final_silence_actions_and_thinking_are_rejected_before_execution():
         assert shadow_wakes == []
         assert runtime._background_tools == set()
         rejected = [item for item in runtime.trace if item["kind"] == "SYSTEM_CHECK_ACTION_REJECTED"]
-        assert rejected and rejected[0]["action_names"] == [THINKING_ACTION, "request_shadow"]
+        assert rejected and rejected[0]["action_names"] == ["request_shadow"]
         assert rejected[0]["prompt_kind"] == "final_silence"
 
     asyncio.run(scenario())
@@ -1165,16 +1124,6 @@ def test_system_check_recovery_signal_keeps_immutable_owner_metadata(dispatch_ki
     asyncio.run(scenario())
 
 
-def test_thinking_action_is_explicitly_present_in_tool_availability():
-    balanced = _runtime(SimpleNamespace(thinking_action_enabled=True))
-    balanced.reasoning_mode = "balanced"
-    balanced._frozen_thinking_action_enabled = True
-    assert balanced._tool_availability()[THINKING_ACTION] == "ready"
-
-    fast = _runtime(SimpleNamespace(thinking_action_enabled=False))
-    fast.reasoning_mode = "fast"
-    fast._frozen_thinking_action_enabled = False
-    assert THINKING_ACTION not in fast._tool_availability()
 
 
 @pytest.mark.parametrize(
@@ -1196,20 +1145,3 @@ def test_system_check_recovery_instruction_preserves_original_scope(prompt_kind,
 def test_normal_recovery_still_reprocesses_the_latest_user_input():
     instruction = AgentEpisodeRuntime._recovery_instruction("SPEAK_ENVELOPE_INVALID")
     assert "重新处理最后一条用户输入" in instruction
-
-
-def test_new_user_turn_invalidates_pending_thinking_barrier():
-    async def scenario():
-        provider = SimpleNamespace(thinking_action_enabled=True)
-        runtime = _runtime(provider)
-        runtime._wake = lambda _kind: None
-        runtime._thinking_lease_turn = "turn-a"
-        runtime._thinking_prefix_by_turn["turn-a"] = "让我想想。"
-        generation = runtime._thinking_barrier_generation
-        await runtime.observe("USER_SEGMENT_UPDATED", turn_id="turn-b", text="new input")
-        assert runtime.last_turn_id == "turn-b"
-        assert runtime._thinking_lease_turn is None
-        assert "turn-a" not in runtime._thinking_prefix_by_turn
-        assert runtime._thinking_barrier_generation == generation + 1
-
-    asyncio.run(scenario())

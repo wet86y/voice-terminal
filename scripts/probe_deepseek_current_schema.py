@@ -41,9 +41,8 @@ async def main() -> None:
                             api_key=config.api_key(config.llm.api_key_env), provider="deepseek",
                             api_key_env=config.llm.api_key_env, transport="responses", thinking="disabled")
     rows = [
-        await probe("no_actions", decision_schema([], allow_thinking=False), client),
-        await probe("thinking_only_request_true", decision_schema([], allow_thinking=True), client),
-        await probe("thinking_plus_web_search", decision_schema([WEB], allow_thinking=True), client),
+        await probe("no_actions", decision_schema([]), client),
+        await probe("web_search", decision_schema([WEB]), client),
     ]
     await client.close()
     output = {"probe": "deepseek-current-strict-schema", "provider": "deepseek",

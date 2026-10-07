@@ -76,7 +76,7 @@ const overlay = ref<PreviewOverlay>(
 const confirmPurpose = ref<"apply" | "exit">("apply");
 const toolsOpen = ref(false);
 const shadowExpanded = ref(false);
-const reasoningMode = ref<ReasoningMode>("balanced");
+const reasoningMode = ref<ReasoningMode>("fast"); // reasoningMode（运行模式）：默认快速。
 const feedback = ref("");
 const feedbackError = ref(false);
 const resetKey = ref(0);
@@ -159,7 +159,7 @@ function resetPreview() {
   page.value = "home";
   scene.value = "normal";
   runtimeState.value = "standby";
-  reasoningMode.value = "balanced";
+  reasoningMode.value = "fast";
   shadowExpanded.value = false;
   closeOverlays();
   resetKey.value += 1;

@@ -206,7 +206,7 @@ def test_context_guard_rejects_any_frame_after_output_constraint():
         episode._guard_context_contract(messages)
 
 
-def test_runtime_classifies_recovery_pending_tools_and_runtime_without_loss():
+def test_runtime_classifies_recovery_and_runtime_without_loss():
     class Registry:
         def action_definitions(self):
             return []
@@ -224,7 +224,6 @@ def test_runtime_classifies_recovery_pending_tools_and_runtime_without_loss():
     runtime.episode_id = runtime.conversation.conversation_id
     runtime.last_turn_id = "turn-a"
     runtime.inputs["turn-a"] = {"text": "当前输入", "final": False}
-    runtime._thinking_pending_by_turn["turn-a"] = [{"name": "search"}]
     signal = RecoverySignal("SPEAK_ENVELOPE_INVALID", "bad", source_request_id="request-a")
 
     messages = runtime.messages({"EXCEPTION_RECOVERY"}, recovery_signal=signal)
@@ -232,13 +231,11 @@ def test_runtime_classifies_recovery_pending_tools_and_runtime_without_loss():
 
     assert messages[-1]["content"] == FINAL_OUTPUT_CONSTRAINT
     assert [entry["kind"] for entry in packet["entries"]] == [
-        "immediate_recovery", "runtime_state", "pending_tools",
+        "immediate_recovery", "runtime_state",
     ]
     assert "SPEAK_ENVELOPE_INVALID" in packet["entries"][0]["content"]
     assert "当前轮运行状态" in packet["entries"][1]["content"]
-    assert "search" in packet["entries"][2]["content"]
 
-    runtime._thinking_pending_by_turn.clear()
     runtime.minor_protocol_feedback.append({"field": "emotion"})
     minor = json.loads(runtime.messages({"USER_INPUT_FINALIZED"})[-2]["content"])
     assert [entry["kind"] for entry in minor["entries"]] == [

@@ -28,13 +28,18 @@ llm:
 
 ## 思考模式
 
+本节描述当前源码的双模式契约；2026-10-07 已完成回归和独立构建，正式目录更新待与其他修订合并处理，见[源码修订与验收记录](frontend-ui-business-migration.md#2026-10-07-双模式源码修订待统一发布)。
+
 | 模式 | 基础请求 | 额外行为 |
 | --- | --- | --- |
-| `fast` | `reasoning.effort=none` | 不暴露 thinking action |
-| `balanced` | `none` | 允许一次本地 `request_thinking({"request":true})`，触发低思考续请求 |
-| `deep` | `low` | 直接使用低思考 |
+| `fast`（快速，默认） | `reasoning.effort=none`（关闭思考） | 不追加思考请求 |
+| `deep`（深度） | `reasoning.effort=low`（低强度思考） | 基础请求直接使用低强度思考 |
 
-`request_thinking` 是本地控制动作，不是 provider native tool。新用户输入、stop、reset、supersession 或适用的取消边界会使待处理的 thinking 请求失效。
+均衡模式及 `request_thinking`（请求追加思考）已移至 [均衡模式归档](../archive/balanced-mode/README.md)。当前配置、会话命令与主代理仅支持快速和深度；历史本机配置若显式设置 `llm.reasoning_mode: balanced`（均衡），应改为 `fast`（快速）或 `deep`（深度）。历史 `thinking_action_enabled`（追加思考开关）不再读取。
+
+前端初值、缺省配置与运行快照均使用快速。模式在代理轮次创建时确定：尚未创建轮次时切换立即影响新轮次，已有轮次时暂存到下一轮次，不取消当前请求。关键词唤醒确认请求继续使用 `reasoning.effort=none`（关闭思考）。主代理目录只保留现有 `request_shadow`（唤醒影子代理）能力，不再注入或执行均衡的追加思考动作；注册已归档动作会被拒绝。
+
+`session.reasoning_mode`（设置运行模式命令）的 `mode`（运行模式）若为均衡或其他非法值，返回 `INVALID_REASONING_MODE`（运行模式无效），保持现有选择和连接。客户端收到旧快照中的均衡值时不会覆盖本地快速或深度选择。
 
 ## 输出校验与恢复
 
@@ -88,7 +93,7 @@ llm:
 - 最近 100 次无 schema/local disagreement；
 - 无空白 completed response；
 - 无超过一次的协议恢复链；
-- `fast`、`balanced`、`deep` 和标注 action case 全部符合预期；
+- `fast`（快速）、`deep`（深度）和标注 action case（动作用例）全部符合预期；
 - p95 首段安全语音文本延迟不劣化超过 200ms；
 - 至少 50 条代表性决策通过人工语义复核。
 

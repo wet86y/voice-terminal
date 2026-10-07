@@ -198,6 +198,8 @@ describe('桌面样例回放交互', () => {
     vi.useFakeTimers()
     const request = vi.spyOn(globalThis, 'fetch')
     const wrapper = renderDemo()
+    expect(wrapper.findAll('.mode-options button').map(button => button.text())).toEqual(['快速', '深度'])
+    expect(wrapper.get('.mode-options button.selected').text()).toBe('快速')
     await wrapper.get('.mode-options button:last-child').trigger('click')
     expect(wrapper.get('.voice-runtime-state').text()).toBe('等待中')
     await wrapper.get('.voice-session-action').trigger('click')

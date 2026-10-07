@@ -320,9 +320,8 @@ class ModelRegistryService:
                 if len(assigned_roles) > 1:
                     allowed.append("off")
                 if "voice" in assigned_roles:
-                    # The main voice product modes need both fast/off and
-                    # balanced/deep low, even when v1 stored only the last
-                    # selected effort.
+                    # 主语音模式需要 fast/off（快速／关闭思考）和 deep/low
+                    # （深度／低强度思考），历史版本可能只保存最后选择的等级。
                     allowed.extend(("off", "low"))
                 if not allowed:
                     allowed = ["off", "low"]

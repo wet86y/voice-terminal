@@ -362,7 +362,8 @@ export type ServerMessageType =
   | 'conversation.append' | 'conversation.snapshot'
   | 'shadow.product' | 'shadow.activity' | 'error'
 
-export type ReasoningMode = 'fast' | 'balanced' | 'deep'
+/** ReasoningMode（运行模式）：快速不思考，深度直接使用低强度思考。 */
+export type ReasoningMode = 'fast' | 'deep'
 export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset' | 'session.reasoning_mode'
 
 export interface MessageEnvelope<TType extends string = string, TPayload = unknown> {

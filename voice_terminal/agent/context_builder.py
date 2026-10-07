@@ -5,9 +5,9 @@ import hashlib
 import json
 
 from .decision_envelope import Action, DecisionEnvelope
-from .decision_schema import THINKING_ACTION, decision_schema
+from .decision_schema import decision_schema
 from .prompts import (
-    PROMPT, BALANCED_THINKING_PROMPT, DEEP_THINKING_PROMPT,
+    PROMPT, DEEP_THINKING_PROMPT,
     CONVERSATION_BEHAVIOR_PROMPT, PERSONA_DOCUMENT_POLICY, SECONDARY_MAILBOX_PROMPT,
     FINAL_SILENCE_PROMPT, KWS_WAKE_PROMPT,
 )
@@ -136,12 +136,6 @@ class AgentContextMixin:
             return [dict(item) for item in self._frozen_tool_catalog]
         return self._tool_catalog(self._session_action_definitions())
 
-    def _thinking_visible(self) -> bool:
-        frozen = self._frozen_thinking_action_enabled
-        if frozen is not None:
-            return frozen
-        return self.reasoning_mode == "balanced"
-
     @staticmethod
     def _canonical_digest(value) -> str:
         serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -252,8 +246,6 @@ class AgentContextMixin:
             if not isinstance(name, str):
                 continue
             status[name] = service_status(name).lower() if callable(service_status) else "ready"
-        if self._thinking_visible():
-            status[THINKING_ACTION] = "ready"
         return status
 
     def messages(self, kinds, recovery_signal=None, *, prompt_kind="normal", force_context=None,
@@ -277,21 +269,13 @@ class AgentContextMixin:
         )
         # The ledger is the complete V0.6 history.  Native tool-call protocol
         # groups are intentionally never replayed to the provider.
-        mode_prompt = BALANCED_THINKING_PROMPT if self.reasoning_mode == "balanced" else (
-            DEEP_THINKING_PROMPT if self.reasoning_mode == "deep" else ""
-        )
+        mode_prompt = DEEP_THINKING_PROMPT if self.reasoning_mode == "deep" else ""
         messages = [ContextFrame.make(
             ContextLane.STATIC_INSTRUCTIONS, "system", "\n".join(
                 item for item in (PROMPT, CONVERSATION_BEHAVIOR_PROMPT, mode_prompt,
                                   self.conversation.calendar_baseline) if item),
         )]
         catalog = self._session_tool_catalog()
-        if self._thinking_visible():
-            catalog.append({
-                "name": THINKING_ACTION,
-                "description": "Request one local low-effort reasoning pass when it is necessary to answer well.",
-                "parameters": ["request"],
-            })
         if catalog:
             messages.append(ContextFrame.make(
                 ContextLane.STATIC_INSTRUCTIONS, "system",
@@ -396,14 +380,6 @@ class AgentContextMixin:
             ) + "\n工具可用性：" + json.dumps(self._tool_availability(), ensure_ascii=False, separators=(",", ":")),
             context_kind="runtime_state",
         ))
-        pending = self._thinking_pending_by_turn.get(model_turn_id)
-        if pending:
-            messages.append(ContextFrame.make(
-                ContextLane.REQUEST_TAIL, "system",
-                "工具状态：以下工具仍在处理中，尚无结果：" + json.dumps(pending, ensure_ascii=False)
-                + "。本轮请基于已知信息及时回应，不得虚构工具结果；减少继续推理，等待后续普通事件提供资料。",
-                context_kind="pending_tools",
-            ))
         if prompt_kind in {"secondary_mailbox", "final_silence"}:
             context = force_context if isinstance(force_context, dict) else {}
             details = {
@@ -454,8 +430,7 @@ class AgentContextMixin:
 
     def _decision_schema(self) -> dict:
         definitions = self._session_action_definitions()
-        allow_thinking = self._thinking_visible()
-        return decision_schema(definitions, allow_thinking=allow_thinking)
+        return decision_schema(definitions)
 
     def _normalize_schema_envelope(self, envelope: DecisionEnvelope) -> DecisionEnvelope:
         """Remove strict-schema filler fields without weakening local validation."""
@@ -470,7 +445,7 @@ class AgentContextMixin:
             allowed[definition["name"]] = set(properties) if isinstance(properties, dict) else set()
         normalized: list[Action] = []
         for action in envelope.actions:
-            keys = {"request"} if action.name == THINKING_ACTION else allowed.get(action.name)
+            keys = allowed.get(action.name)
             if keys is None:
                 normalized.append(action)
                 continue

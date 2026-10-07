@@ -1240,7 +1240,7 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
         "can_start": bool(value.get("can_start")),
         "wake_always_on": bool(value.get("wake_always_on")),
         "input_owner": value.get("input_owner"),
-        "reasoning_mode": value.get("reasoning_mode", "balanced"),
+        "reasoning_mode": value.get("reasoning_mode", "fast"),  # reasoning_mode（运行模式）：缺省为快速。
         "quiet_hours": {key: bool((value.get("quiet_hours") or {}).get(key))
                         for key in ("passive_quiet", "user_interaction", "within_quiet_hours")},
         "services": dict(value.get("services") or {}),

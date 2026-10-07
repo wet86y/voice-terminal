@@ -17,7 +17,7 @@ from .context_builder import AgentContextMixin
 from .deferred_speech import DeferredSpeechMixin
 from .runtime_events import RecoverySignal, HeartbeatPulse, EpisodeHeartbeatClock
 from .prompts import (
-    PROMPT, BALANCED_THINKING_PROMPT, DEEP_THINKING_PROMPT,
+    PROMPT, DEEP_THINKING_PROMPT,
     PERSONA_DOCUMENT_POLICY, SECONDARY_MAILBOX_PROMPT,
     FINAL_SILENCE_PROMPT, KWS_WAKE_PROMPT,
 )
@@ -28,7 +28,6 @@ from .decision_envelope import (
     envelope_error_diagnostics, json_structure_fingerprint,
     parse_compatible_decision_envelope, provider_schema_diagnostics,
 )
-from .decision_schema import THINKING_ACTION
 from .persona import PersonaDocumentLoader, PersonaDocuments
 from .sentences import map_refinement
 from ..session.context import (
@@ -148,7 +147,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
     CONTEXT_ASSISTANT_CONTENT_CHARS = 4000
 
     def __init__(self, provider, registry, output, emit, *, conversation: ConversationRuntime, ledger,
-                 options=None, tools_enabled=True, reasoning_mode="balanced", persona_config=None,
+                 options=None, tools_enabled=True, reasoning_mode="fast", persona_config=None,
                  custom_instructions_provider=None,
                  shadow_waker=None, on_final_system_check_settled=None,
                  defer_silence_until_output=False, continuity_document_provider=None,
@@ -162,7 +161,9 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self._deferred_seen = set()
         self.options = options or AgentOptions()
         self.tools_enabled = tools_enabled
-        self.reasoning_mode = reasoning_mode
+        if reasoning_mode not in {"fast", "deep"}:
+            raise ValueError("reasoning_mode（运行模式）必须是 fast（快速）或 deep（深度）")
+        self.reasoning_mode = reasoning_mode  # reasoning_mode（运行模式）：本轮冻结的快速或深度选择。
         self.conversation = conversation
         self.ledger = ledger
         self.shadow_waker = shadow_waker
@@ -280,10 +281,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self._history_prefix: list[dict] = []
         self._background_tools: set[asyncio.Task] = set()
         self._tokenizer_prewarm_task: asyncio.Task | None = None
-        self._thinking_lease_turn: str | None = None
-        self._thinking_prefix_by_turn: dict[str, str] = {}
-        self._thinking_barrier_generation = 0
-        self._thinking_pending_by_turn: dict[str, list[str]] = {}
         self._recovery_attempts_by_turn: dict[str, int] = {}
         self._transport_retry_attempts_by_turn: dict[str, int] = {}
         self._retry_shadow_information_by_turn: dict[str, dict] = {}
@@ -291,7 +288,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self._retry_system_check: dict | None = None  # 二等评估传输重试的原始场景和所有权。
         self._frozen_action_definitions: tuple[dict, ...] | None = None
         self._frozen_tool_catalog: tuple[dict, ...] | None = None
-        self._frozen_thinking_action_enabled: bool | None = None
 
     def _ensure_runner(self) -> None:
         if self.closed or self.episode_id is None:
@@ -424,7 +420,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                  "speak_snapshot": getattr(self.output, "speak_snapshot", {"queue_status": "empty", "text_only_queue": True}),
                  "recovery_pending": len(self.recovery_queue),
                  "reasoning": self.last_reasoning,
-                  "thinking_lease_turn": self._thinking_lease_turn,
                   "reasoning_mode": self.reasoning_mode,
                   "scheduler": self.scheduler.snapshot(),
                   "secondary_mailbox": {  # 二等信箱诊断，不进入模型语义历史。
@@ -537,8 +532,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             "SPEAK_REPLACEMENT_INTERCEPTED",
             "OUTPUT_CANCELLED", "OUTPUT_REPLACED",
             "LLM_RECOVERY_EXHAUSTED", "LLM_TRANSPORT_RETRY_EXHAUSTED",
-            "THINKING_REQUESTED", "THINKING_BARRIER_READY",
-            "THINKING_BARRIER_STALE", "THINKING_PREFIX_DIVERGED",
         }:
             logger.info(
                 "agent.trace kind=%s episode_id=%s request_id=%s turn=%s events=%s reason=%s "
@@ -772,12 +765,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self.history_context_digest = None
         self.schema_digest = None
         self._history_prefix = []
-        self._frozen_thinking_action_enabled = None
         self.minor_protocol_feedback.clear()
         self.deferred_recovery_feedback.clear()
-        self._thinking_lease_turn = None
-        self._thinking_prefix_by_turn.clear()
-        self._thinking_pending_by_turn.clear()
         self._recovery_attempts_by_turn.clear()
         self._transport_retry_attempts_by_turn.clear()
         self._retry_shadow_information_by_turn.clear()
@@ -791,7 +780,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         # request prefix cacheable. Live backend availability is a tail fact.
         self._frozen_action_definitions = tuple(json.loads(json.dumps(item)) for item in definitions if isinstance(item, dict))
         self._frozen_tool_catalog = tuple(self._tool_catalog(self._frozen_action_definitions))
-        self._frozen_thinking_action_enabled = self.reasoning_mode == "balanced"
         self._start_tokenizer_prewarm()
         self.registry.begin_turn(self.episode_id)
         if turn_id and text and text.strip():
@@ -1667,13 +1655,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             self.last_turn_id = turn_id
             await self.log(kind, **({"text": text} if text is not None else {}), **payload)
             return
-        if (turn_id and self.last_turn_id and turn_id != self.last_turn_id
-                and kind in {"USER_SEGMENT_UPDATED", "USER_INPUT_FINALIZED", "USER_INPUT_REFINED"}):
-            old_turn = self.last_turn_id
-            self._thinking_barrier_generation += 1
-            self._thinking_lease_turn = None
-            self._thinking_prefix_by_turn.pop(old_turn, None)
-            self._thinking_pending_by_turn.pop(old_turn, None)
         late_refinement = bool(
             turn_id and self.last_turn_id and turn_id != self.last_turn_id
             and kind == "USER_INPUT_REFINED"
@@ -1928,10 +1909,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             hold = getattr(self.output, "hold_unplayed", None)
             if callable(hold):
                 hold()
-            # Passive speech onset must not invalidate the active model
-            # request or its thinking lease.  The transcript will arrive via
-            # USER_SEGMENT_UPDATED/FINALIZED/REFINED and be coalesced by the
-            # normal 400 ms scheduler window.
+            # 被动开始讲话不使当前模型请求失效；转写更新仍进入普通 400 毫秒调度窗口。
             if self.voice_activation_task:
                 self.voice_activation_task.cancel()
             async def activate_voice():
@@ -1946,13 +1924,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                     pass
             self.voice_activation_task = asyncio.create_task(activate_voice(), name="agent-voice-activation")
         elif explicit_interrupt:
-            # Onset after an explicit boundary invalidates actions and the
-            # thinking lease before cancelling Agent-side work.
+            # 显式打断边界使动作失效，再取消 Agent（代理）侧工作。
             self.current_action = None
-            self._thinking_barrier_generation += 1
-            self._thinking_lease_turn = None
-            self._thinking_prefix_by_turn.clear()
-            self._thinking_pending_by_turn.clear()
             self.cancel_active_request(interrupt_reason)
             # The controller owns USER_INTERRUPTED.  This callback is invoked
             # after that boundary and only invalidates Agent-side work.
@@ -2124,9 +2097,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         reasoning_effort = "low" if self.reasoning_mode == "deep" else "none"
         if prompt_kind == "kws_wake":
             reasoning_effort = "none"
-        if "THINKING_READY" in kinds and self._thinking_lease_turn == source_turn_id:
-            reasoning_effort = "low"
-            self._thinking_lease_turn = None
         self._identity_turns[identity] = source_turn_id
         self.active_request_identity = identity
         self.active_request_source_turn_id = source_turn_id
@@ -3002,21 +2972,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self._background_tools.add(task)
         task.add_done_callback(self._background_tools.discard)
 
-    async def _thinking_barrier(self, identity, turn_id, generation: int) -> None:
-        """Grant the normal thinking lease without owning Shadow work.
-
-        Shadow wake is intentionally independent from this barrier: the
-        runtime can begin its read-only work while the voice response is
-        still in its balanced thinking phase.
-        """
-        if generation != self._thinking_barrier_generation or self.last_turn_id != turn_id or not self.episode_id:
-            await self.log("THINKING_BARRIER_STALE", identity=identity, turn_id=turn_id)
-            return
-        self._thinking_lease_turn = turn_id
-        await self.log("THINKING_BARRIER_READY", identity=identity, turn_id=turn_id,
-                       business_action_count=0, timed_out=False)
-        self._wake("THINKING_READY")
-
     async def _dispatch_actions_v06(self, identity, turn_id, envelope: DecisionEnvelope,
                                     *, system_check=None, system_check_id=None,
                                     system_check_prompt_kind=None) -> None:
@@ -3035,9 +2990,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 action_count=len(actions),
             )
             return
-        thinking = tuple(action for action in actions if action.name == THINKING_ACTION)
         shadow_actions = tuple(action for action in actions if action.name == "request_shadow")
-        invalid = tuple(action for action in actions if action.name not in {THINKING_ACTION, "request_shadow"})
+        invalid = tuple(action for action in actions if action.name != "request_shadow")
         if invalid:
             raise ProtocolError("unsupported action: " + ", ".join(action.name for action in invalid))
         if shadow_actions:
@@ -3045,23 +2999,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 self._submit_shadow_actions(identity, turn_id, shadow_actions),
                 name=f"shadow-wake-{turn_id}",
             ))
-        if not thinking:
-            return
-        if not self._thinking_visible():
-            raise ProtocolError("action request_thinking is not enabled")
-        if len(thinking) != 1 or thinking[0].arguments != {"request": True}:
-            raise ProtocolError("action request_thinking requires arguments.request=true")
-        if envelope.speak.state != "speak" or not envelope.speak.text.strip():
-            raise ProtocolError("action request_thinking requires a nonempty speak transition")
-        self._thinking_prefix_by_turn[turn_id] = envelope.speak.text
-        self._thinking_barrier_generation += 1
-        generation = self._thinking_barrier_generation
-        await self.log("THINKING_REQUESTED", identity=identity, turn_id=turn_id,
-                       business_action_count=0, shadow_action_count=len(shadow_actions), generation=generation)
-        self._track_background_tool(asyncio.create_task(
-            self._thinking_barrier(identity, turn_id, generation),
-            name=f"thinking-barrier-{turn_id}",
-        ))
 
     async def accept_shadow_event(self, event: ShadowEvent) -> None:
         """Project a Bridge event into the Voice ledger and scheduler.
@@ -3542,14 +3479,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                     actions_executed=0,
                 )
                 return "system_check_stale"
-            if reasoning_effort == "low" and source_turn_id:
-                expected_prefix = self._thinking_prefix_by_turn.pop(source_turn_id, "")
-                if (expected_prefix and envelope.speak.state == "speak"
-                        and not envelope.speak.text.startswith(expected_prefix)):
-                    await self.log("THINKING_PREFIX_DIVERGED", identity=identity,
-                                   turn_id=source_turn_id,
-                                   expected_chars=len(expected_prefix),
-                                   received_chars=len(envelope.speak.text))
             await self._record_emotion_normalizations(parser, identity=identity, turn_id=source_turn_id)
             self._validated_envelope_identity = identity
             if admission.speech_handle is not None:
@@ -4020,10 +3949,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self.history_context_digest = None
         self.schema_digest = None
         self._history_prefix = []
-        self._frozen_thinking_action_enabled = None
-        self._thinking_lease_turn = None
-        self._thinking_prefix_by_turn.clear()
-        self._thinking_pending_by_turn.clear()
         self._recovery_attempts_by_turn.clear()
         self._transport_retry_attempts_by_turn.clear()
         self._retry_shadow_information_by_turn.clear()

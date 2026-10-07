@@ -370,7 +370,6 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 allowed_reasoning=self.config.llm.allowed_reasoning,
                 transport=self.config.llm.transport,
                 max_output_tokens=self.config.llm.max_output_tokens,
-                thinking_action_enabled=self.config.llm.thinking_action_enabled,
                 protocol_recovery_limit=self.config.llm.protocol_recovery_limit,
                 transport_retry_limit=self.config.llm.transport_retry_limit,
             )
@@ -831,7 +830,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             return False
 
     async def set_reasoning_mode(self, mode: str) -> bool:
-        if mode not in {"fast", "balanced", "deep"}:
+        if mode not in {"fast", "deep"}:
             return False
         async with self._session_lock:
             self.reasoning_mode = mode

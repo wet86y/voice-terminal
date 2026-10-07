@@ -100,9 +100,14 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 
 ### 运行模式
 
-- `fast`：主 LLM 使用 `reasoning.effort=none`。
-- `balanced`：基础请求不思考，必要时通过本地 `request_thinking` 触发一次低思考续请求。
-- `deep`：主请求直接使用低思考。
+当前源码已收敛为两个运行模式。这项修订已完成回归和构建，正式安装目录仍沿用此前发布的程序，待与其他修订合并后统一更新；状态与验收结果见[双模式源码修订记录](docs/frontend-ui-business-migration.md#2026-10-07-双模式源码修订待统一发布)。
+
+- `fast`（快速，默认）：主 LLM（大语言模型）使用 `reasoning.effort=none`（关闭思考）。
+- `deep`（深度）：主请求直接使用 `reasoning.effort=low`（低强度思考）。
+- 均衡模式的实现、测试及探测脚本保存在 [均衡模式归档](archive/balanced-mode/README.md)，不参与当前启动和默认测试。
+
+`llm.reasoning_mode`（运行模式配置）和 `session.reasoning_mode`（会话模式命令）仅允许 `fast`（快速）与 `deep`（深度）。升级前将显式使用 `balanced`（均衡）的本机配置改为其中一种；历史 `thinking_action_enabled`（追加思考开关）不再读取。参数及恢复说明见[思考模式说明](docs/llm-json-schema-migration.md#思考模式)。
+
 - KWS：`wake.enabled=true` 时进入唤醒词待机；关闭后 `session.start` 直接进入 ASR。
   唤醒命中或模型主动发声把麦克风交给 ASR 后，输入所有权只在静默窗口（`silence.seconds`，默认 90s）
   到期时由 `final_silence` 系统检查交回 KWS；DSH 的 `request_early_silence` 可在输入与播报安静后提前执行同一检查。窗口内接话不需要再喊唤醒词，语音结算和播放结束都不改变所有权。
@@ -131,6 +136,7 @@ git diff --check
 - [独立桌面应用、数据分离与便携构建](docs/desktop-application.md)：Tauri 2（桌面应用框架）窗口、独立预览、构建与迁移命令。
 - [桌面实施验收记录](docs/desktop-acceptance.md)：实际构建、运行、退出、迁移及待补实机检查。
 - [前端界面阶段性交接](docs/frontend-ui-handoff.md)：已确认的界面修订、产品接入差异及正式迁移顺序。
+- [真实业务验收与后续源码修订](docs/frontend-ui-business-migration.md)：已发布界面的验收证据、双模式归档与待统一发布状态。
 - [独立应用启动与系统管理](docs/application-lifecycle.md)
 - [架构与生命周期](docs/architecture.md)
 - [连续性底座：上下文衔接与定时唤醒](docs/continuity-foundation.md)
