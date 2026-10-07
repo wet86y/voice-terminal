@@ -37,7 +37,7 @@ def main():
     lanes = {}
     report("analysis", "加载语句结束判断与语音精修模型")
     for name, enabled, model_name, factory in (
-        ("endpoint", config.smart_turn.smart_turn, "smart-turn-v3.2-cpu.onnx",
+        ("endpoint", config.smart_turn.smart_turn, "SmartTurn v3.2（语音结束判断）",
          lambda: SmartTurn(
              config.model_dir / "analysis/smart-turn",
              device=config.compute.devices.get("smart_turn", "cpu"),
@@ -51,12 +51,15 @@ def main():
              fallback_device=config.compute.fallback_devices.get("sensevoice", "cpu"),
          )),
     ):
+        lane = AnalysisLane(error=None if enabled else "disabled", model_name=model_name)
+        lanes[name] = lane
         try:
-            lanes[name] = AnalysisLane(factory() if enabled else None, None if enabled else "disabled",
-                                        model_name=model_name)
+            if enabled:
+                lane.prepare(factory)
+                logging.info("analysis.ready operation=%s health=%s", name, lane.health_payload())
         except Exception as exc:
             logging.exception("analysis.load_failed operation=%s", name)
-            lanes[name] = AnalysisLane(error=str(exc), model_name=model_name)
+            lane.error = str(exc)
     address = urlparse(config.smart_turn.analysis_url)
     run_uvicorn(create_analysis_app(lanes), host=address.hostname or "127.0.0.1", port=address.port or 8767,
                 ws_max_size=3 * 1024 * 1024, timeout_graceful_shutdown=3)

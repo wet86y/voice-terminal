@@ -8,6 +8,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 from .protocol import AudioChunk
 
@@ -26,6 +27,7 @@ ResultCallback = Callable[[dict[str, Any]], Awaitable[None]]
 class AsrWorkerClient:
     def __init__(self, url: str, *, on_result: ResultCallback | None = None) -> None:
         self.url = url
+        self._local_worker = urlsplit(url).hostname in {"localhost", "127.0.0.1", "::1"}  # local_worker（本机工作进程）。
         self.on_result = on_result
         self._socket: Any = None
         self._receive_task: asyncio.Task[None] | None = None
@@ -115,11 +117,12 @@ class AsrWorkerClient:
                         continue
                 if self.on_result is not None and isinstance(message, dict):
                     logger.info(
-                        "asr.client.received type=%s turn_id=%s text_len=%d text=%r",
+                        "asr.client.received type=%s turn_id=%s text_len=%d text=%r latency=%s",
                         message.get("type"),
                         message.get("turn_id"),
                         len(message.get("text", "")) if isinstance(message.get("text"), str) else 0,
                         message.get("text", "")[:120] if isinstance(message.get("text"), str) else "",
+                        json.dumps(message.get("latency"), ensure_ascii=False),  # latency（识别分段耗时）。
                     )
                     try:
                         await self.on_result(message)
@@ -163,6 +166,9 @@ class AsrWorkerClient:
             raise AsrWorkerError("ASR Worker 尚未连接", code="ASR_WORKER_UNAVAILABLE")
         try:
             async with self._send_lock:
+                if payload.get("type") == "audio.chunk" and self._local_worker:
+                    # 在获得发送锁后记录本机时间，排队指标不混入客户端锁等待。
+                    payload["sent_at_monotonic_ns"] = time.monotonic_ns()
                 await socket.send(json.dumps(payload, ensure_ascii=False))
         except asyncio.CancelledError:
             raise

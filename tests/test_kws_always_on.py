@@ -359,7 +359,7 @@ def test_model_initiated_speech_arms_the_same_silence_window():
     asyncio.run(scenario())
 
 
-def test_early_silence_waits_for_quiet_and_reuses_final_check():
+def test_early_silence_marks_immediately_and_survives_new_ladder():
     async def scenario():
         scheduler = AgentDecisionScheduler(SimpleNamespace(
             scheduler_tick_ms=400, final_silence_ms=90_000,
@@ -367,7 +367,7 @@ def test_early_silence_waits_for_quiet_and_reuses_final_check():
         scheduler.arm()
         dispatched = []
         episode = SimpleNamespace(
-            closed=False, user_speaking=True, active_request=None,
+            closed=False, user_speaking=True, active_request=object(),
             scheduler=scheduler, _ensure_runner=lambda: dispatched.append(scheduler.generation),
         )
 
@@ -391,18 +391,12 @@ def test_early_silence_waits_for_quiet_and_reuses_final_check():
         controller.episode = episode
 
         assert await controller.request_early_silence() == "scheduled"
-        assert await controller.request_early_silence() == "already_pending"
-        await asyncio.sleep(0.07)
-        assert not scheduler.final_pending
-
-        controller.workspace = None
-        episode.user_speaking = False
-        controller.output.busy = False
-        await asyncio.sleep(0.07)
         assert scheduler.final_pending
         assert dispatched == [1]
+        assert await controller.request_early_silence() == "already_pending"
 
-        # New input replaces the pending ladder; the early request survives.
+        # New input defers/replaces the ladder; the early request survives and
+        # marks the newly activated generation without waiting for idle gates.
         scheduler.defer()
         await asyncio.sleep(0.07)
         assert not scheduler.final_pending
@@ -424,12 +418,19 @@ def test_early_silence_rejects_non_asr_and_cancels_on_reset_boundary():
         controller.wake_always_on = True
         controller.kws = _IdleKws()
         controller.state = SimpleNamespace(listening=True, input_owner="kws")
-        controller.episode = SimpleNamespace(closed=False, scheduler=SimpleNamespace(final_dispatched=False))
+        scheduler = AgentDecisionScheduler(SimpleNamespace(
+            scheduler_tick_ms=400, final_silence_ms=90_000,
+        ))
+        scheduler.arm()
+        scheduler.mark_final_pending()
+        controller.episode = SimpleNamespace(closed=False, scheduler=scheduler)
         assert await controller.request_early_silence() == "not_asr"
         controller.state.input_owner = "asr"
         controller._early_silence_task = asyncio.create_task(asyncio.sleep(60))
         await controller._cancel_early_silence()
         assert controller._early_silence_task is None
+        assert not scheduler.final_pending
+        assert not scheduler.armed
 
     asyncio.run(scenario())
 
@@ -453,8 +454,10 @@ def test_early_silence_runs_final_check_before_kws_handover():
         controller._activation_generation = 1
         controller._early_silence_task = None
         controller._background = set()
-        controller.workspace = None
-        controller.output = SimpleNamespace(active=False, busy=False)
+        controller.workspace = SimpleNamespace(turn_id="current-input")
+        controller.output = runtime.output
+        runtime.output.active = True
+        runtime.output.busy = True
         controller.episode = runtime
         returned = []
 
@@ -466,14 +469,29 @@ def test_early_silence_runs_final_check_before_kws_handover():
 
         controller._return_to_kws = return_to_kws
         runtime.on_final_system_check_settled = controller._final_system_check_settled
+        runtime.can_dispatch_final_silence = controller._final_silence_dispatch_ready
         assert await controller.request_early_silence() == "scheduled"
-        await asyncio.sleep(0)
         assert runtime.scheduler.final_pending
+        assert runtime.output.active and runtime.output.busy, "排队请求不能取消当前播报"
         assert returned == []
         await runtime._on_heartbeat(anchor + 0.4)
         await asyncio.sleep(0)
+        assert provider.calls == 0, "活动输入和播报时不能派发最终静默轮"
+        assert runtime.scheduler.final_pending
+
+        controller.workspace = None
+        runtime.user_speaking = False
+        runtime.output.active = False
+        runtime.output.busy = False
+        # A cancelled queue entry is stale bookkeeping, not active playback.
+        runtime.output._pending = [SimpleNamespace(
+            reason="superseded", task=SimpleNamespace(done=lambda: True),
+        )]
+        await runtime._on_heartbeat(anchor + 0.8)
+        await asyncio.sleep(0)
         assert runtime.active_dispatch_context["prompt_kind"] == "final_silence"
         assert runtime.active_dispatch_context["silence_elapsed_ms"] < 1000
+        assert provider.calls == 1
         assert returned == []
         await _finish_blocking_request(runtime, provider)
         await asyncio.sleep(0.06)

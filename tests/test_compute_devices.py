@@ -23,13 +23,42 @@ class ComputeDeviceTests(unittest.TestCase):
         engine = AsrWorkerEngine(model_dir=Path("."), device="cuda")
         with (
             patch("voice_terminal.compute.startup_device", return_value="cuda"),
-            patch("funasr.AutoModel", return_value=SimpleNamespace(kwargs={"device": "cpu"})),
+            patch("funasr.AutoModel", return_value=SimpleNamespace(kwargs={"device": "cpu"}, generate=lambda **_: [])),
         ):
             engine.load()
         self.assertEqual(engine.requested_device, "cuda")
         self.assertEqual(engine.device, "cpu")
         self.assertTrue(engine.model_loaded)
         self.assertIn("CPU", engine.load_error or "")
+        self.assertTrue(engine.model_warmed)
+        engine.close()
+
+    def test_asr_gpu_warmup_failure_falls_back_before_becoming_ready(self) -> None:
+        """权重加载成功但 CUDA（图形处理器加速）真实推理失败时回退。"""
+        from voice_terminal.asr.worker import AsrWorkerEngine
+        calls = []
+        def factory(**options):
+            device = options["device"]
+            calls.append(device)
+            def generate(**kwargs):
+                if device == "cuda":
+                    raise RuntimeError("CUDA kernel unavailable")
+                self.assertEqual(len(kwargs["input"]), 0 if kwargs["is_final"] else 9600)
+                return []
+            return SimpleNamespace(kwargs={"device": device}, generate=generate)
+        engine = AsrWorkerEngine(model_dir=Path("."), device="cuda")
+        try:
+            with (patch("voice_terminal.compute.startup_device", return_value="cuda"),
+                  patch("funasr.AutoModel", side_effect=factory), patch("torch.cuda.empty_cache")):
+                engine.load()
+            self.assertEqual(calls, ["cuda", "cpu"])
+            self.assertEqual(engine.device, "cpu")
+            self.assertTrue(engine.model_warmed)
+            self.assertIn("kernel unavailable", engine.load_error)
+            self.assertEqual(engine._cache_by_turn, {})
+            self.assertEqual(engine._model_call_count_by_turn, {})
+        finally:
+            engine.close()
 
     def test_sensevoice_and_internal_vad_report_their_own_resolved_device(self) -> None:
         from voice_terminal.analysis.sensevoice import SenseVoice

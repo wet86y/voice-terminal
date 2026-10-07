@@ -150,6 +150,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                  options=None, tools_enabled=True, reasoning_mode="fast", persona_config=None,
                  custom_instructions_provider=None,
                  shadow_waker=None, on_final_system_check_settled=None,
+                 can_dispatch_final_silence=None,
                  defer_silence_until_output=False, continuity_document_provider=None,
                  on_user_activity=None, on_silence_anchor=None,
                  on_speaker_heartbeat=None, admit_user_turn=None):
@@ -168,6 +169,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self.ledger = ledger
         self.shadow_waker = shadow_waker
         self.on_final_system_check_settled = on_final_system_check_settled
+        self.can_dispatch_final_silence = can_dispatch_final_silence
         self.continuity_document_provider = continuity_document_provider
         self.on_user_activity = on_user_activity
         self.on_silence_anchor = on_silence_anchor
@@ -2377,6 +2379,15 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self.pending.clear()
         self._pending_since = None
         if candidate is not None:
+            if candidate.get("prompt_kind") == "final_silence":
+                readiness = self.can_dispatch_final_silence
+                if callable(readiness):
+                    try:
+                        if not readiness():
+                            return
+                    except Exception:
+                        logger.exception("agent.final_silence_readiness_check_failed")
+                        return
             if not self._dispatch_allowed():
                 return
             if await self._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate):

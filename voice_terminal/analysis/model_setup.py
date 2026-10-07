@@ -13,15 +13,18 @@ MODELS = {
     "sensevoice": ("FunAudioLLM/SenseVoiceSmall", "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7",
                   ["model.pt", "config.yaml", "configuration.json", "am.mvn", "chn_jpn_yue_eng_ko_spectok.bpe.model"]),
 }
+SMART_TURN_GPU = "smart-turn-v3.2-gpu.onnx"  # SMART_TURN_GPU（可选显卡模型文件）。
 
 
-def validate(root: Path) -> list[str]:
+def validate(root: Path, *, smart_turn_gpu: bool = False) -> list[str]:
     errors = []
     for name, (_, revision, files) in MODELS.items():
         folder = root / "analysis" / name
         try:
             manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
             required = files + (["preprocessor_config.json"] if name == "smart-turn" else [])
+            if name == "smart-turn" and (smart_turn_gpu or SMART_TURN_GPU in manifest.get("sha256", {})):
+                required = [*required, SMART_TURN_GPU]
             if manifest["revision"] != revision:
                 raise ValueError("revision mismatch")
             for filename in required:
@@ -32,14 +35,15 @@ def validate(root: Path) -> list[str]:
     return errors
 
 
-def install(root: Path) -> None:
+def install(root: Path, *, smart_turn_gpu: bool = False) -> None:
     from huggingface_hub import hf_hub_download
     from transformers import WhisperFeatureExtractor
     for name, (repo, revision, files) in MODELS.items():
         folder = root / "analysis" / name
         folder.mkdir(parents=True, exist_ok=True)
         checksums = {}
-        for filename in files:
+        selected = [*files, SMART_TURN_GPU] if name == "smart-turn" and (smart_turn_gpu or (folder / SMART_TURN_GPU).is_file()) else files
+        for filename in selected:
             print(f"Downloading {name}/{filename} revision={revision}", flush=True)
             cached = hf_hub_download(repo, filename, revision=revision, cache_dir=str(root / "cache/huggingface"))
             destination = folder / filename
@@ -60,6 +64,7 @@ def main():
     parser.add_argument("--model-dir", type=Path, default=Path(r"D:\模型\voice-terminal"))
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--no-proxy", action="store_true", help="Disable proxy only inside this download process")
+    parser.add_argument("--smart-turn-gpu", action="store_true", help="同时下载并验证 SmartTurn（语音结束判断）显卡模型，保留中央处理器回退模型")
     args = parser.parse_args()
     if args.no_proxy:
         for key in list(os.environ):
@@ -67,8 +72,8 @@ def main():
                 os.environ.pop(key)
         os.environ["NO_PROXY"] = "*"
     if not args.offline:
-        install(args.model_dir)
-    errors = validate(args.model_dir)
+        install(args.model_dir, smart_turn_gpu=args.smart_turn_gpu)
+    errors = validate(args.model_dir, smart_turn_gpu=args.smart_turn_gpu)
     print("\n".join(errors) if errors else "PASS: pinned analysis models validated", flush=True)
     raise SystemExit(bool(errors))
 

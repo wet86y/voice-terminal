@@ -4,10 +4,33 @@ import argparse
 from importlib import metadata
 import json
 from pathlib import Path
-import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+ONNX_GPU_VERSION = "1.24.4"  # ONNX_GPU_VERSION（已验证的显卡推理运行库版本）。
+
+
+def dependency_errors(directory: Path | None = None) -> list[str]:
+    """dependency_errors（依赖闭包错误）：显卡运行库提供相同的 ONNX（模型格式）模块。"""
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+    options = {"path": [str(directory)]} if directory is not None else {}
+    installed = {canonicalize_name(item.metadata["Name"]): item for item in metadata.distributions(**options)}
+    failures = []
+    if "onnxruntime" in installed and "onnxruntime-gpu" in installed:
+        failures.append("ONNX Runtime（模型推理运行时）中央处理器版与显卡版不能同时安装，模块文件会相互覆盖")
+    for package in installed.values():
+        for raw in package.requires or []:
+            requirement = Requirement(raw)
+            if requirement.marker and not requirement.marker.evaluate({"extra": ""}):
+                continue
+            name = canonicalize_name(requirement.name)
+            dependency = installed.get(name)
+            if dependency is None and name == "onnxruntime":
+                dependency = installed.get("onnxruntime-gpu")
+            if dependency is None or dependency.version not in requirement.specifier:
+                failures.append(f"{package.metadata['Name']} 需要 {requirement}")
+    return failures
 
 
 def diagnose(*, candidate=False, check_dependencies=True) -> dict:
@@ -32,6 +55,7 @@ def diagnose(*, candidate=False, check_dependencies=True) -> dict:
             if name == "onnxruntime" and actual is None:
                 try:
                     actual = metadata.version("onnxruntime-gpu")
+                    version = ONNX_GPU_VERSION
                 except metadata.PackageNotFoundError:
                     pass
         if actual != version:
@@ -49,12 +73,20 @@ def diagnose(*, candidate=False, check_dependencies=True) -> dict:
             actual = None
         if actual not in allowed:
             mismatches.append({"package": name, "expected": " / ".join(sorted(allowed)), "actual": actual})
-    check = subprocess.run([sys.executable, "-m", "pip", "check"], capture_output=True, text=True,
-                           timeout=30) if check_dependencies else None
+    try:
+        metadata.version("onnxruntime")
+        metadata.version("onnxruntime-gpu")
+    except metadata.PackageNotFoundError:
+        pass
+    else:
+        mismatches.append({"package": "onnxruntime / onnxruntime-gpu", "expected": "仅安装一种模型推理运行库", "actual": "两者同时存在"})
+    # funasr-onnx（语音推理包装）元数据只声明中央处理器包名；同模块的显卡发行包是有效替代。
+    # 不能同时安装两个发行包来让 pip check（包名依赖检查）表面通过。
+    failures = dependency_errors() if check_dependencies else None
     return {"python": sys.version, "executable": sys.executable, "python_compatible": sys.version_info[:2] == (3, 12),
             "isolated": sys.prefix != sys.base_prefix, "mismatches": mismatches,
-            "dependency_check_ok": check.returncode == 0 if check else None,
-            "dependency_check": check.stdout.strip() if check else "启动只做版本检查，完整一致性检查由安装器与诊断工具执行"}
+            "dependency_check_ok": not failures if failures is not None else None,
+            "dependency_check": "\n".join(failures) if failures is not None else "启动只做版本检查，完整一致性检查由安装器与诊断工具执行"}
 
 
 def main():

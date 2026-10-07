@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,7 @@ class AsrInferenceResult:
 
     text: str
     emitted: bool
+    latency: dict[str, float | int] | None = None  # latency（本次识别分段耗时，毫秒）。
 
 
 class AsrWorkerEngine:
@@ -59,6 +62,13 @@ class AsrWorkerEngine:
         self._byte_count_by_turn: dict[str, int] = {}
         self._model_call_count_by_turn: dict[str, int] = {}
         self._last_log_at_by_turn: dict[str, float] = {}
+        # executor（专用执行线程）：模型加载、预热和推理使用同一条原生通道。
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr-inference")
+        self._inference_lock = asyncio.Lock()  # inference_lock（识别通道锁）：保护共享模型与轮次状态。
+        self._load_lock = threading.RLock()
+        self._timing = threading.local()  # timing（线程内计时）：不把线程排队算进模型调用。
+        self._call_latency: dict[str, float | int] = {}
+        self.model_warmed = False  # model_warmed（已完成真实推理预热）。
         registry.observe(self, "asr_pending_pcm", lambda value: sum(len(p) for p in value._pending_audio_by_turn.values()))
 
     @property
@@ -85,6 +95,10 @@ class AsrWorkerEngine:
         return self.chunk_stride_samples * 2
 
     def load(self) -> None:
+        with self._load_lock:
+            self._load_model()
+
+    def _load_model(self) -> None:
         if self._model is not None:
             return
         try:
@@ -115,6 +129,9 @@ class AsrWorkerEngine:
                     disable_pbar=True,
                 )
                 self.device = loaded_funasr_device(self._model, candidate)
+                # 首次原生算子／CUDA（图形处理器加速）初始化在开放接口前完成；
+                # 实际推理失败也进入设备回退，不能只凭权重加载宣称 GPU（图形处理器）可用。
+                self._warm_up_model()
                 self.load_error = (
                     f"CUDA（图形处理器）加载失败，已回退到 {self.device}：{type(last_error).__name__}: {last_error}"
                     if last_error is not None else
@@ -125,6 +142,8 @@ class AsrWorkerEngine:
                 return
             except Exception as exc:
                 last_error = exc
+                self._model = None
+                self.model_warmed = False
                 if candidate == "cuda":
                     try:
                         import torch  # type: ignore
@@ -134,6 +153,46 @@ class AsrWorkerEngine:
         self._model = None
         self.load_error = str(last_error) if last_error else "模型加载失败"
         raise RuntimeError(self.load_error) from last_error
+
+    def _warm_up_model(self) -> None:
+        """用独立的静音缓存预热完整窗和空最终刷新，不进入用户转写状态。"""
+        started = time.perf_counter()
+        cache: dict[str, Any] = {}
+        for final in (False, False, True):
+            audio = self._np.zeros(0 if final else self.chunk_stride_samples, dtype=self._np.float32)
+            self._model.generate(
+                input=audio, cache=cache, is_final=final, chunk_size=list(self.chunk_size),
+                encoder_chunk_look_back=self.encoder_chunk_look_back,
+                decoder_chunk_look_back=self.decoder_chunk_look_back,
+            )
+        self.model_warmed = True
+        logger.info("asr.worker.warmed device=%s elapsed_ms=%.1f", self.device, (time.perf_counter() - started) * 1000)
+
+    async def prepare(self) -> None:
+        """prepare（准备）：在识别专用线程完成加载和预热。"""
+        future = asyncio.get_running_loop().run_in_executor(self._executor, self.load)
+        await self._await_native(future)
+
+    def close(self) -> None:
+        """close（关闭）：工作进程结束时回收专用通道。"""
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+    @staticmethod
+    async def _await_native(future: asyncio.Future) -> Any:
+        # shield（取消屏障）：缓存和租约只能在原生调用完成之后清理。
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if future.done() and not future.cancelled():
+                future.exception()
+            raise
 
     def _infer_sync(self, turn_id: str, pcm: bytes, is_final: bool) -> str:
         # 租约在原生线程内持有；异步请求取消不释放正在读取的输入。
@@ -146,6 +205,7 @@ class AsrWorkerEngine:
             pcm = pcm[:-1]
         audio = self._np.frombuffer(pcm, dtype=self._np.int16).astype(self._np.float32) / 32768.0
         cache = self._cache_by_turn.setdefault(turn_id, {})
+        started = time.perf_counter_ns()
         result = self._model.generate(
             input=audio,
             cache=cache,
@@ -154,6 +214,7 @@ class AsrWorkerEngine:
             encoder_chunk_look_back=self.encoder_chunk_look_back,
             decoder_chunk_look_back=self.decoder_chunk_look_back,
         )
+        self._timing.model_ms = (time.perf_counter_ns() - started) / 1_000_000
         text = ""
         if isinstance(result, list) and result and isinstance(result[0], dict):
             value = result[0].get("text")
@@ -177,9 +238,39 @@ class AsrWorkerEngine:
         """Run one model window and return the text emitted by that window."""
 
         self._model_call_count_by_turn[turn_id] = self._model_call_count_by_turn.get(turn_id, 0) + 1
-        return await asyncio.to_thread(self._infer_sync, turn_id, pcm, is_final)
+        submitted = time.perf_counter_ns()
+
+        def run() -> tuple[str, float, float, float]:
+            started = time.perf_counter_ns()
+            self._timing.model_ms = 0.0
+            text = self._infer_sync(turn_id, pcm, is_final)
+            return (text, (started - submitted) / 1_000_000,
+                    (time.perf_counter_ns() - started) / 1_000_000, self._timing.model_ms)
+
+        future = asyncio.get_running_loop().run_in_executor(self._executor, run)
+        text, executor_wait_ms, native_ms, model_ms = await self._await_native(future)
+        for key, value in (("executor_wait_ms", executor_wait_ms), ("native_ms", native_ms), ("model_ms", model_ms)):
+            self._call_latency[key] = self._call_latency.get(key, 0.0) + value
+        self._call_latency["model_calls"] = self._call_latency.get("model_calls", 0) + 1
+        logger.info(
+            "asr.worker.window turn_id=%s final=%s audio_ms=%.1f executor_wait_ms=%.1f native_ms=%.1f model_ms=%.1f",
+            turn_id, is_final, len(pcm) / (self.sample_rate * 2) * 1000,
+            executor_wait_ms, native_ms, model_ms,
+        )
+        return text
 
     async def infer(self, turn_id: str, pcm: bytes, is_final: bool) -> AsrInferenceResult:
+        submitted = time.perf_counter_ns()
+        async with self._inference_lock:
+            self._call_latency = {"lane_wait_ms": (time.perf_counter_ns() - submitted) / 1_000_000,
+                                  "executor_wait_ms": 0.0, "native_ms": 0.0, "model_ms": 0.0, "model_calls": 0}
+            try:
+                return await self._infer_serial(turn_id, pcm, is_final)
+            except BaseException:
+                self._clear_turn(turn_id)
+                raise
+
+    async def _infer_serial(self, turn_id: str, pcm: bytes, is_final: bool) -> AsrInferenceResult:
         started = time.perf_counter()
         self._chunk_count_by_turn[turn_id] = self._chunk_count_by_turn.get(turn_id, 0) + 1
         self._byte_count_by_turn[turn_id] = self._byte_count_by_turn.get(turn_id, 0) + len(pcm)
@@ -247,7 +338,7 @@ class AsrWorkerEngine:
             # Return the final cumulative text before releasing per-turn
             # model cache and aggregation state.
             self._clear_turn(turn_id)
-        return AsrInferenceResult(text=text, emitted=bool(emitted_text))
+        return AsrInferenceResult(text=text, emitted=bool(emitted_text), latency=dict(self._call_latency))
 
 
 async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None:
@@ -275,6 +366,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                             "type": "health",
                             "status": "READY",
                             "model_loaded": engine.model_loaded,
+                            "model_warmed": getattr(engine, "model_warmed", None),  # model_warmed（真实推理预热完成）。
                             "runtime": "PyTorch（推理框架）" if engine.model_loaded else None,  # runtime（实际加载引擎）。
                             "device": getattr(engine, "device", None),
                             "requested_device": getattr(engine, "requested_device", None),
@@ -316,6 +408,13 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                 if message_type != "audio.chunk":
                     raise ValueError(f"不支持的 ASR 消息类型：{message_type}")
                 chunk = decode_audio_chunk(message)
+                received_at = time.monotonic_ns()
+                queue_wait_ms = None  # queue_wait_ms（本机传输及此前音频积压耗时，毫秒）。
+                if chunk.sent_at_monotonic_ns is not None:
+                    delta_ns = received_at - chunk.sent_at_monotonic_ns
+                    # 仅本机工作进程共享单调时钟；跨主机或无效时间不参与统计。
+                    if 0 <= delta_ns <= 600 * 1_000_000_000:
+                        queue_wait_ms = delta_ns / 1_000_000
                 owned_turns.add(chunk.turn_id)
                 logger.debug(
                     "asr.worker.audio_chunk turn_id=%s bytes=%d final=%s",
@@ -324,6 +423,14 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                     chunk.is_final,
                 )
                 inference = await engine.infer(chunk.turn_id, chunk.pcm, chunk.is_final)
+                worker_service_ms = (time.monotonic_ns() - received_at) / 1_000_000
+                latency = None
+                if inference.latency is not None:
+                    latency = {**inference.latency, "queue_wait_ms": queue_wait_ms,
+                               "worker_service_ms": worker_service_ms}  # worker_service_ms（取包后的识别处理耗时）。
+                    if chunk.is_final or inference.latency.get("model_calls", 0):
+                        logger.info("asr.worker.latency turn_id=%s final=%s latency=%s",
+                                    chunk.turn_id, chunk.is_final, json.dumps(latency, ensure_ascii=False))
                 if chunk.is_final:
                     owned_turns.discard(chunk.turn_id)
                 # A final message is a protocol acknowledgement even when the
@@ -331,8 +438,11 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                 # until its timeout and cannot decide whether to continue.
                 if inference.emitted or chunk.is_final:
                     result_type = "asr.final" if chunk.is_final else "asr.partial"
+                    response = asr_result(result_type, chunk.turn_id, inference.text)
+                    if latency is not None:
+                        response["latency"] = latency  # latency（分段耗时）：旧接收端可以忽略。
                     await websocket.send(
-                        json.dumps(asr_result(result_type, chunk.turn_id, inference.text), ensure_ascii=False)
+                        json.dumps(response, ensure_ascii=False)
                     )
                     logger.info(
                         "asr.worker.result turn_id=%s type=%s text_len=%d text=%r",

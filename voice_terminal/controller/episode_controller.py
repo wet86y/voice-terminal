@@ -55,7 +55,7 @@ class EpisodeController(RealtimeController):
         self._early_silence_task: asyncio.Task | None = None  # 提前静默请求：保留到进入 KWS（关键词唤醒）待机。
 
     async def request_early_silence(self) -> str:
-        """Advance the current ASR silence ladder at its next safe boundary."""
+        """Queue the final check now; dispatch and KWS handover remain boundary-safe."""
         if not self.wake_always_on or self.kws is None:
             return "kws_disabled"
         if self.kws.error is not None or not self.kws.running:
@@ -75,14 +75,26 @@ class EpisodeController(RealtimeController):
             self._advance_early_silence(), name="early-silence-request",
         )
         self._track(self._early_silence_task)
+        # Let the task immediately mark an active ladder before acknowledging.
+        # The background task remains alive to carry the request across later
+        # input generations until KWS (关键词唤醒) owns the microphone again.
+        await asyncio.sleep(0)
         return "scheduled"
 
     async def _cancel_early_silence(self) -> None:
         task = getattr(self, "_early_silence_task", None)
         self._early_silence_task = None
-        if task is not None and task is not asyncio.current_task() and not task.done():
+        was_pending = task is not None and task is not asyncio.current_task() and not task.done()
+        if was_pending:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        if was_pending:
+            # Stopping/resetting input must not leave an early final check
+            # behind to fire if the same Episode is later resumed.
+            scheduler = getattr(getattr(self, "episode", None), "scheduler", None)
+            if (scheduler is not None and scheduler.final_pending
+                    and not scheduler.final_dispatched):
+                scheduler.disarm()
 
     async def _advance_early_silence(self) -> None:
         activation_generation = self._activation_generation
@@ -96,30 +108,28 @@ class EpisodeController(RealtimeController):
                 if scheduler.final_dispatched:
                     await asyncio.sleep(0.05)
                     continue
-                output = self.output
-                output_busy = bool(
-                    getattr(output, "busy", False)
-                    or getattr(output, "active", False)
-                    or getattr(output, "_settling_speech_ids", None)
-                    or getattr(output, "_pending", None)
-                )
-                if (self.workspace is None and episode.user_speaking is not True
-                        and not output_busy and episode.active_request is None):
-                    if not scheduler.armed and not scheduler.is_deferred():
-                        await episode.arm_silence_window(
-                            f"early-silence-{uuid4().hex}", anchor_source="early_silence",
-                        )
-                    if scheduler.armed and not scheduler.anchor_turn_id:
-                        # System checks need a source even before the first user turn.
-                        scheduler.anchor_turn_id = f"early-silence-{uuid4().hex}"
-                    if (marked_generation != scheduler.generation
-                            and (scheduler.mark_final_pending() or scheduler.final_pending)):
-                        episode._ensure_runner()
-                        marked_generation = scheduler.generation
-                        await episode.log(
-                            "SCHEDULER_FINAL_PENDING", window_index=scheduler.FINAL_WINDOW,
-                            reason="early_silence_request", scheduler_generation=scheduler.generation,
-                        )
+                if not scheduler.armed and not scheduler.is_deferred():
+                    await episode.arm_silence_window(
+                        f"early-silence-{uuid4().hex}", anchor_source="early_silence",
+                    )
+                # Marking the final check is immediate and independent of
+                # live ASR (语音识别), Agent (代理) or TTS (语音合成) work.
+                # Actual dispatch is separately gated by the runtime so no
+                # current user input or playback is interrupted.
+                if not scheduler.armed:
+                    await asyncio.sleep(0.05)
+                    continue
+                if not scheduler.anchor_turn_id:
+                    # System checks need a source even before the first user turn.
+                    scheduler.anchor_turn_id = f"early-silence-{uuid4().hex}"
+                if (marked_generation != scheduler.generation
+                        and (scheduler.mark_final_pending() or scheduler.final_pending)):
+                    episode._ensure_runner()
+                    marked_generation = scheduler.generation
+                    await episode.log(
+                        "SCHEDULER_FINAL_PENDING", window_index=scheduler.FINAL_WINDOW,
+                        reason="early_silence_request", scheduler_generation=scheduler.generation,
+                    )
                 await asyncio.sleep(0.05)
         finally:
             if self._early_silence_task is asyncio.current_task():
@@ -135,6 +145,7 @@ class EpisodeController(RealtimeController):
                                        custom_instructions_provider=self.custom_instructions_provider,
                                        defer_silence_until_output=self.wake_always_on,
                                        on_final_system_check_settled=self._final_system_check_settled,
+                                       can_dispatch_final_silence=self._final_silence_dispatch_ready,
                                        continuity_document_provider=self.continuity_document_provider,
                                        on_user_activity=self.on_user_activity,
                                         on_silence_anchor=self.on_silence_anchor,
@@ -286,13 +297,7 @@ class EpisodeController(RealtimeController):
                    and activation_generation == self._activation_generation):
                 if scheduler_generation != self.episode.scheduler.generation:
                     return
-                output = getattr(self, "output", None)
-                output_busy = bool(
-                    getattr(output, "busy", False)
-                    or getattr(output, "active", False)
-                    or getattr(output, "_settling_speech_ids", None)
-                    or getattr(output, "_pending", None)
-                )
+                output_busy = self._output_is_busy()
                 if (self.workspace is None and self.episode.user_speaking is not True
                         and not output_busy):
                     quiet = getattr(self, "quiet_policy", None)
@@ -306,6 +311,37 @@ class EpisodeController(RealtimeController):
             return_when_input_is_idle(), name="final-system-check-kws-return",
         )
         self._track(task)
+
+    def _output_is_busy(self) -> bool:
+        episode = getattr(self, "episode", None)
+        checker = getattr(episode, "_output_is_busy", None)
+        if callable(checker):
+            return bool(checker())
+        output = getattr(self, "output", None)
+        if (bool(getattr(output, "busy", False))
+                or bool(getattr(output, "active", False))
+                or bool(getattr(output, "_settling_speech_ids", None))):
+            return True
+        pending = getattr(output, "_pending", None)
+        if not pending:
+            return False
+        return any(
+            item is not None
+            and not getattr(item, "reason", None)
+            and not getattr(getattr(item, "task", None), "done", lambda: False)()
+            for item in pending
+        )
+
+    def _final_silence_dispatch_ready(self) -> bool:
+        """Whether a final system check may start without racing live input/output."""
+
+        episode = getattr(self, "episode", None)
+        state = getattr(self, "state", None)
+        if (episode is None or state is None or not state.listening
+                or state.input_owner != "asr" or self.workspace is not None
+                or episode.user_speaking is True):
+            return False
+        return not self._output_is_busy()
 
     def set_reasoning_mode(self, mode: str) -> None:
         if mode not in {"fast", "deep"}:

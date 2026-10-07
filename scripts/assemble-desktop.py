@@ -46,6 +46,20 @@ def copy_component(source: Path, target: Path, *, kind: str, build: str) -> dict
     return record
 
 
+def collect_models(source: Path, target: Path) -> dict:
+    """collect_models（收集核心模型）：包含结束判断的显卡模型与中央处理器回退模型。"""
+    for relative in CORE_MODELS:
+        folder = source / relative
+        if not folder.is_dir():
+            raise FileNotFoundError(f"缺少本轮运行所需模型：{relative}")
+        copy_tree(folder, target / relative, excludes=("keywords.txt", "keywords.raw.txt", "keywords_raw.txt"))
+    record = manifest(target, kind="models", build="core")
+    record["build"] = hashlib.sha256(json.dumps(record["files"], sort_keys=True).encode()).hexdigest()[:16]
+    atomic_json(target / "manifest.json", record)
+    verify(target, record)
+    return record
+
+
 def archive(root: Path, destination: Path, *, exclude_roots=(), include_roots=(), overrides=None) -> dict:
     if include_roots:
         candidates = []
@@ -285,7 +299,101 @@ def _remove_new_dsh_component(output: Path, relative: str) -> None:
     shutil.rmtree(target)
 
 
-def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime: Path | None = None) -> None:
+def _validated_python_source(source: Path) -> tuple[Path, dict]:
+    """校验 Python（程序运行环境）组件闭包与计算组合。"""
+    if source.is_symlink() or source.is_junction():
+        raise ValueError("Python（程序运行环境）来源不能是链接或重解析点。")
+    source = source.resolve(strict=True)
+    record = json.loads((source / "manifest.json").read_text(encoding="utf-8-sig"))
+    identifier = record.get("build")
+    if (record.get("kind") != "python" or not isinstance(identifier, str) or not identifier
+            or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in identifier)):
+        raise ValueError("Python（程序运行环境）组件标识无效。")
+    verify(source, record)
+    metadata = json.loads((source / "runtime.json").read_text(encoding="utf-8-sig"))
+    if (metadata.get("schema") != 1 or metadata.get("profile") not in {"cpu", "cu128"}
+            or not str(metadata.get("python", "")).startswith("3.12.") or not (source / "python.exe").is_file()):
+        raise ValueError("Python（程序运行环境）组件版本或计算组合无效。")
+    return source, record
+
+
+def _python_component_path(output: Path, build: str) -> tuple[str, Path]:
+    """Python（程序运行环境）目标必须保持在受管根内，路径不能经过链接。"""
+    relative = f"runtimes/python/{build}"
+    current = output.resolve()
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink() or current.is_junction():
+            raise ValueError("Python（程序运行环境）组件路径不能经过链接或重解析点。")
+    return relative, safe_path(output, relative)
+
+
+def _install_python_component(output: Path, stage: Path, source: Path, expected: dict) -> tuple[str, bool]:
+    """先校验未启用副本；同构建标识仅能复用完整一致的组件。"""
+    relative, target = _python_component_path(output, expected["build"])
+    if target.exists():
+        record = json.loads((target / "manifest.json").read_text(encoding="utf-8-sig"))
+        if record != expected:
+            raise ValueError("同标识 Python（程序运行环境）组件不一致，拒绝覆盖。")
+        verify(target, record)
+        return relative, False
+    staged = stage / "python-component"
+    copied = copy_component(source, staged, kind="python", build=expected["build"])
+    if copied != expected:
+        raise ValueError("Python（程序运行环境）复制后清单不一致。")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged.rename(target)
+    return relative, True
+
+
+def _remove_new_python_component(output: Path, relative: str) -> None:
+    """回滚只删除本次新增、仍位于明确受管根内的解释器组件。"""
+    parts = Path(relative).parts
+    if len(parts) != 3 or parts[:2] != ("runtimes", "python"):
+        raise ValueError("回滚 Python（程序运行环境）路径不在受管目录内。")
+    _, target = _python_component_path(output, parts[2])
+    for _ in files(target):
+        pass
+    shutil.rmtree(target)
+
+
+def _models_component_path(output: Path, build: str) -> tuple[str, Path]:
+    """模型组件路径不得离开受管目录或经过链接。"""
+    relative = f"models/{build}"
+    current = output.resolve()
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink() or current.is_junction():
+            raise ValueError("模型组件路径不能经过链接或重解析点。")
+    return relative, safe_path(output, relative)
+
+
+def _install_models_component(output: Path, staged: Path, expected: dict) -> tuple[str, bool]:
+    relative, target = _models_component_path(output, expected["build"])
+    if target.exists():
+        record = json.loads((target / "manifest.json").read_text(encoding="utf-8-sig"))
+        if record != expected:
+            raise ValueError("同标识模型组件不一致，拒绝覆盖。")
+        verify(target, record)
+        return relative, False
+    verify(staged, expected)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged.rename(target)
+    return relative, True
+
+
+def _remove_new_models_component(output: Path, relative: str) -> None:
+    parts = Path(relative).parts
+    if len(parts) != 2 or parts[0] != "models":
+        raise ValueError("回滚模型组件路径不在受管目录内。")
+    _, target = _models_component_path(output, parts[1])
+    for _ in files(target):
+        pass
+    shutil.rmtree(target)
+
+
+def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime: Path | None = None,
+                    python_runtime: Path | None = None, models: Path | None = None) -> None:
     """构建机停机刷新已有正式目录，复用已校验组件并保留完整用户数据。"""
     require_stopped(ROOT, output)
     verify_install(output)
@@ -308,6 +416,33 @@ def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime: Path |
         staged_root.mkdir()
         collect_program(staged_program, desktop)
         components = list(previous.get("components", []))
+        models_plan = None
+        new_models_relative = None
+        new_models_created = False
+        if models is not None:
+            staged_models = stage / "model-component"
+            model_record = collect_models(models.resolve(strict=True), staged_models)
+            new_models_relative, _ = _models_component_path(output, model_record["build"])
+            models_plan = staged_models, model_record
+            components = [row for row in components if row.get("kind") != "models"] + [{
+                "kind":"models", "path":new_models_relative,
+                "manifest_sha256":digest(staged_models / "manifest.json"), "build":model_record["build"],
+            }]
+            selection["models"] = new_models_relative
+            selection["external_models"] = None
+        python_plan = None
+        new_python_relative = None
+        new_python_created = False
+        if python_runtime is not None:
+            source, source_record = _validated_python_source(python_runtime)
+            new_python_relative, _ = _python_component_path(output, source_record["build"])
+            python_plan = source, source_record
+            components = [row for row in components if row.get("kind") != "python"] + [{
+                "kind":"python", "path":new_python_relative,
+                "manifest_sha256":digest(source / "manifest.json"), "build":source_record["build"],
+            }]
+            selection["python"] = new_python_relative + "/python.exe"
+            selection["external_python"] = None
         new_dsh_relative = None
         new_dsh_created = False
         dsh_plan = None
@@ -336,6 +471,10 @@ def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime: Path |
             selection["dsh"] = new_dsh_relative
         release = {**previous, **manifest(staged_program, kind="app", build=build),
                    "components":components, "root_files":root_files(staged_root, desktop)}
+        if python_plan is not None:
+            release["external_requirements"] = {**release.get("external_requirements", {}), "python":False}
+        if models_plan is not None:
+            release["external_requirements"] = {**release.get("external_requirements", {}), "models":False}
         atomic_json(staged_program / "release.json", release)
         verify(staged_program, release)
         staged = list(staged_root.iterdir())
@@ -348,6 +487,14 @@ def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime: Path |
         staged_program.resolve().relative_to(stage)
         committed_program = False
         try:
+            if models_plan is not None:
+                installed, new_models_created = _install_models_component(output, *models_plan)
+                if installed != new_models_relative:
+                    raise ValueError("模型组件路径在提交前发生变化。")
+            if python_plan is not None:
+                installed, new_python_created = _install_python_component(output, stage, *python_plan)
+                if installed != new_python_relative:
+                    raise ValueError("Python（程序运行环境）组件路径在提交前发生变化。")
             if dsh_plan is not None:
                 source, source_record, metadata, lock = dsh_plan
                 installed_relative, dsh_record, new_dsh_created = _install_dsh_component(
@@ -375,8 +522,12 @@ def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime: Path |
                 program.rename(staged_program)
             if new_dsh_created and new_dsh_relative is not None:
                 _remove_new_dsh_component(output, new_dsh_relative)
+            if new_python_created and new_python_relative is not None:
+                _remove_new_python_component(output, new_python_relative)
+            if new_models_created and new_models_relative is not None:
+                _remove_new_models_component(output, new_models_relative)
             raise
-    print(f"正式程序已更新：{program}；环境、模型及完整用户数据保留，旧程序目录保留以供检查。")
+    print(f"正式程序已更新：{program}；启用组合已校验，完整用户数据与旧程序、旧组件目录保留。")
 
 
 def main():
@@ -409,7 +560,7 @@ def main():
     if args.refresh_program:
         if args.zip:
             raise ValueError("候选程序刷新后，使用 package-desktop.py（分发归档工具）单独校验并归档。")
-        refresh_program(output, desktop, args.build, args.dsh_runtime)
+        refresh_program(output, desktop, args.build, args.dsh_runtime, args.python_runtime, args.models)
         return
     if not args.models or not args.dsh_runtime:
         raise ValueError("首次组装必须提供完整模型和代理宿主运行目录。")
@@ -440,13 +591,7 @@ def main():
         selection["external_models"] = str(args.models.resolve(strict=True))
     else:
         model_target = output / "models/core"
-        for relative in CORE_MODELS:
-            source = args.models / relative
-            if not source.is_dir():
-                raise FileNotFoundError(f"缺少本轮运行所需模型：{relative}")
-            copy_tree(source, model_target / relative, excludes=("keywords.txt", "keywords.raw.txt", "keywords_raw.txt"))
-        record = manifest(model_target, kind="models", build="core")
-        record["build"] = hashlib.sha256(json.dumps(record["files"], sort_keys=True).encode()).hexdigest()[:16]
+        record = collect_models(args.models, model_target)
         resource_path = f"models/{record['build']}"
         model_target.rename(output / resource_path)
         model_target = output / resource_path
