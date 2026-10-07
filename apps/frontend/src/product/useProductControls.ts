@@ -226,7 +226,7 @@ export function useProductControls() {
         {
           READY: "运行中",
           DEGRADED: "降级运行",
-          ERROR: "启动错误",
+          ERROR: "运行异常",
           UNAVAILABLE: "无法连接",
           DISABLED: "已停用",
           STARTING: "启动中",

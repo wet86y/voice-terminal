@@ -27,19 +27,22 @@ const rows = computed<LocalComponentRow[]>(() => {
     const owner = componentFor(owners[item.id])
     const resource = status?.resource_status
     const busy = Boolean(owner?.retrying || retrying.value.has(owners[item.id]))
-    const loading = busy || (!status && ['waiting', 'starting'].includes(owner?.state ?? 'starting')) || status?.service === 'STARTING'
-    const available = !busy && !['failed', 'blocked', 'stopped', 'disabled'].includes(owner?.state ?? '') && ['READY', 'DEGRADED'].includes(status?.service ?? '')
-    const disabled = status?.service === 'DISABLED' || owner?.state === 'disabled'
+    // ownerFailed（所属进程故障）优先于上一次模型采样，文案和操作采用同一判定。
+    const ownerFailed = ['failed', 'blocked', 'stopped'].includes(owner?.state ?? '')
+    const disabled = !ownerFailed && (status?.service === 'DISABLED' || owner?.state === 'disabled')
+    const loading = busy || (!ownerFailed && !disabled && (['waiting', 'starting', 'stopping'].includes(owner?.state ?? (!status ? 'starting' : '')) || status?.service === 'STARTING'))
+    const available = !loading && !ownerFailed && !disabled && ['READY', 'DEGRADED'].includes(status?.service ?? '')
+    const ownerError = ownerFailed ? owner?.error || status?.runtime_error || (owner?.state === 'blocked' ? '组件依赖不可用，请检查所属进程。' : owner?.state === 'stopped' ? '组件进程已退出。' : '组件运行异常，请查看日志并重试。') : undefined
     const gpuAvailable = status?.gpu_available === true
     return {
       id: item.id, name: item.title,
       state: available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
-      status: busy ? '正在恢复' : disabled ? '已停用' : loading ? '启动中' : serviceLabel(status?.service),
+      status: busy ? '正在恢复' : ownerFailed ? '不可用' : disabled ? '已停用' : loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : serviceLabel(status?.service),
       available, retryable: !available && !loading && Boolean(owner?.retry_allowed), busy,
       runtime: status?.runtime || '未提供',
       residentMemory: formatComponentMemory(resource?.rss_bytes), privateMemory: formatComponentMemory(resource?.private_commit_bytes),
       vram: status?.device?.startsWith('cuda') ? '未提供' : undefined,
-      description: item.detail, error: !available && !loading ? status?.load_error || owner?.error : undefined,
+      description: item.detail, error: !available && !loading ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
       note: '内存为所在进程占用，共享进程不重复计入总量。' + (status?.device?.startsWith('cuda') ? '当前未提供单个模型的显存指标。' : ''),
       facts: [
         { label: '进程标识', value: resource?.pid == null ? '未提供' : String(resource.pid) },

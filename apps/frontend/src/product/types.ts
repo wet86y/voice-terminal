@@ -33,6 +33,8 @@ export interface ProductComputeModelStatus {
   service: string
   /** load_error（加载诊断）：启动回退原因或当前加载错误。 */
   load_error?: string | null
+  /** runtime_error（运行故障）：通信或推理失败的原因，与设备加载回退诊断分开。 */
+  runtime_error?: string | null
   /** process_memory_rss_bytes（进程常驻内存）：所在工作进程当前占用的 RAM。 */
   process_memory_rss_bytes?: number | null
   /** resource_status（实际进程快照）：两种内存和进程标识来自同一次采样。 */

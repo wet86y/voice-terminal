@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
+
+from .client import SpeakerWorkerError
+
+logger = logging.getLogger(__name__)
 
 
 class RollingSpeakerIdentity(StrEnum):
@@ -306,7 +311,17 @@ class RollingSpeakerSensor:
                     else "non_owner_confirmed" if identity == RollingSpeakerIdentity.NON_OWNER
                     else "ambiguous_score",
                 )
-            except Exception:
+            except Exception as exc:
+                if isinstance(exc, SpeakerWorkerError) and exc.code == "SPEAKER_AUDIO_QUALITY":
+                    quality = exc.quality or "insufficient_audio"
+                    logger.info("speaker.rolling_audio_rejected start_sample=%s end_sample=%s quality=%s",
+                                start, end, quality)
+                    return self._unknown(start=start, end=end, candidate_start=candidate_start_sample,
+                                         candidate_end=candidate_end_sample, analyzed_at=analyzed_at,
+                                         reason="audio_quality_rejected", quality=quality)
+                logger.warning("speaker.rolling_inference_failed start_sample=%s end_sample=%s code=%s error=%s: %s",
+                               start, end, getattr(exc, "code", "INFERENCE_ERROR"), type(exc).__name__, str(exc)[:300],
+                               exc_info=True)
                 return self._unknown(start=start, end=end, candidate_start=candidate_start_sample,
                                      candidate_end=candidate_end_sample, analyzed_at=analyzed_at,
                                      reason="inference_failed", quality="unavailable")

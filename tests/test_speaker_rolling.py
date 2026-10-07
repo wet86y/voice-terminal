@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from voice_terminal.speaker.client import SpeakerWorkerError
 from voice_terminal.speaker.rolling import RollingSpeakerIdentity, RollingSpeakerSensor
 
 
@@ -107,10 +108,25 @@ class RollingSpeakerSensorTests(unittest.IsolatedAsyncioTestCase):
 
         self.sensor.embed_pcm = fail
         self.sensor.submit_frame(pcm(SR * 2), start_sample=0, speech=True)
-        result = await self.sensor.analyze(completed_at=10.0)
+        with self.assertLogs("voice_terminal.speaker.rolling", level="WARNING") as logs:
+            result = await self.sensor.analyze(completed_at=10.0)
+        self.assertIn("RuntimeError: private exception details", "\n".join(logs.output))
+        self.assertIn("start_sample=0 end_sample=32000", "\n".join(logs.output))
         self.assertEqual(result.identity, RollingSpeakerIdentity.UNKNOWN)
         self.assertEqual(result.reason, "inference_failed")
         self.assertFalse(result.is_fresh(now=11.0, max_age_ms=800))
+
+    async def test_audio_quality_rejection_is_not_an_inference_failure(self) -> None:
+        """音频质量不满足条件保留具体标签，不误报为模型或通信故障。"""
+        async def reject(_payload: bytes) -> tuple[float, ...]:
+            raise SpeakerWorkerError("录音音量过低", code="SPEAKER_AUDIO_QUALITY", quality="too_quiet")
+
+        self.sensor.embed_pcm = reject
+        self.sensor.submit_frame(pcm(SR * 2), start_sample=0, speech=True)
+        result = await self.sensor.analyze()
+        self.assertEqual(result.identity, RollingSpeakerIdentity.UNKNOWN)
+        self.assertEqual(result.quality, "too_quiet")
+        self.assertEqual(result.reason, "audio_quality_rejected")
 
     async def test_missing_vad_does_not_authorize_identity(self) -> None:
         self.sensor.submit_frame(pcm(SR * 2), start_sample=0, speech=None)

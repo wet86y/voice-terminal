@@ -1611,6 +1611,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 "device": None,
                 "service": "UNKNOWN",
                 "load_error": None,
+                "runtime_error": None,  # runtime_error（运行故障）：与加载回退原因分开。
                 "process_memory_rss_bytes": None,
                 "gpu_available": bool(hardware["models"].get(name, {}).get("gpu_available")),
                 "gpu_unavailable_reason": hardware["models"].get(name, {}).get("reason"),
@@ -1681,6 +1682,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         if self.speaker is not None and self.speaker.connected:
             try:
                 status = await self.speaker.health(timeout_s=2.0)
+                speaker_runtime = self.speaker_status()
                 if isinstance(status.get("resource_status"), dict):
                     resource_rows.append(status["resource_status"])
                 else:
@@ -1690,15 +1692,20 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                     "runtime": status.get("runtime"),
                     "device": status.get("device"),
                     "requested_device": status.get("requested_device", requests.get("wespeaker", "cpu")),
-                    "service": status.get("status", "READY"),
+                    "service": "ERROR" if speaker_runtime["service"] == "DEGRADED" else speaker_runtime["service"],
                     "load_error": status.get("load_error"),
+                    "runtime_error": speaker_runtime["last_error"] if speaker_runtime["service"] == "DEGRADED" else None,
                     "process_memory_rss_bytes": status.get("process_memory_rss_bytes"),
                 })
             except Exception as exc:
                 missing_resource_roles.add("speaker")
-                models["wespeaker"].update({"service": "ERROR", "load_error": str(exc)[:300]})
+                models["wespeaker"].update({"service": "ERROR", "runtime_error": str(exc)[:300] or f"声纹健康检查失败：{type(exc).__name__}"})
         else:
-            models["wespeaker"]["service"] = self.state.services.get("speaker", "DISABLED")
+            speaker_runtime = self.speaker_status()
+            models["wespeaker"].update({
+                "service": "ERROR" if speaker_runtime["service"] == "DEGRADED" else speaker_runtime["service"],
+                "runtime_error": speaker_runtime["last_error"] if speaker_runtime["service"] == "DEGRADED" else None,
+            })
 
         for name, status in models.items():
             status["gpu_available"] = bool(hardware["models"].get(name, {}).get("gpu_available"))

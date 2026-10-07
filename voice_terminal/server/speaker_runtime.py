@@ -75,7 +75,13 @@ class SpeakerRuntimeMixin:
             if (self.speaker is not None and self.speaker.connected
                     and not self.speaker.degraded
                     and self.state.services.get("speaker") == "READY"):
-                return True
+                # 就绪缓存不能代替本次恢复的健康检查。
+                try:
+                    await self.speaker.health(timeout_s=1.5)
+                    if not self.speaker.degraded:
+                        return True
+                except SpeakerWorkerError:
+                    pass
 
             stale = self.speaker
             self.speaker = None
@@ -162,6 +168,11 @@ class SpeakerRuntimeMixin:
 
         self.speaker = client
         self.state.set_service("speaker", "READY")
+        controller = getattr(self, "controller", None)
+        if controller is not None:
+            # 组件重试同样必须更新实时声纹采样器，避免继续使用已经关闭的旧连接。
+            controller.speaker_client = client
+            controller.configure_speaker_runtime()
         self.startup_errors = [
             item for item in self.startup_errors if not str(item).startswith("speaker:")
         ]
@@ -230,17 +241,17 @@ class SpeakerRuntimeMixin:
     def speaker_status(self) -> dict[str, Any]:
         profile = self.speaker_profile.snapshot()
         service = self.state.services.get("speaker", "DISABLED")
-        # The receive loop marks a disconnected socket locally so the next
-        # turn can fail open immediately.  Reflect that edge in the public
-        # health/status projection as well; otherwise a READY value could be
-        # displayed after the worker has already gone away.
+        # 通信或推理故障必须同步至状态接口；仅模型仍加载不能证明声纹功能可用。
         if ((self.config.speaker.mode != "off" or self.config.speaker.owner_only_barge_in)
-                and self.speaker is not None and not self.speaker.connected
-                and service == "READY"):
+                and service == "READY" and (self.speaker is None or not self.speaker.connected
+                                           or getattr(self.speaker, "degraded", False))):
             service = "DEGRADED"
             self.state.set_service("speaker", service)
         startup_error = next((item for item in reversed(self.startup_errors)
                               if str(item).startswith("speaker:")), None)
+        last_error = self.speaker.last_error if self.speaker is not None else None
+        if not last_error:
+            last_error = startup_error or ("声纹工作进程不可用，请查看日志并重试组件。" if service == "DEGRADED" else profile.get("warning"))
         owner_selected = bool(self.config.speaker.owner_only_barge_in)
         processor = getattr(self, "audio_processor", None)
         controller = getattr(self, "controller", None)
@@ -274,10 +285,7 @@ class SpeakerRuntimeMixin:
             "filter_allowed": bool(profile.get("available")) and service == "READY"
             and bool(self.speaker is not None and self.speaker.connected),
             "profile": profile,
-            "last_error": (
-                self.speaker.last_error if self.speaker is not None and self.speaker.last_error
-                else startup_error or profile.get("warning")
-            ),
+            "last_error": last_error,
             "test": dict(self._speaker_test_result or {}),
             "anti_spoofing": "unavailable",
             "owner_only_barge_in_selected": owner_selected,
