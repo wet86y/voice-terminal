@@ -111,15 +111,15 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
         <h2 id="shadow-panel-title" class="panel-kicker">后台协作</h2>
       </header>
       <div class="shadow-regions">
-      <section class="shadow-summary-card" aria-label="当前协作状态">
-        <span class="status-pill">{{ model.shadow.status }}</span>
+      <section class="shadow-summary-card shadow-region" aria-label="当前协作状态">
+        <header class="shadow-region-heading"><span>当前协作</span><small>{{ model.shadow.status }}</small></header>
         <div class="shadow-summary-content">
-        <h3>{{ model.shadow.title }}</h3>
+        <p>{{ model.shadow.title }}</p>
         <p v-if="model.shadow.focus">{{ model.shadow.focus }}</p>
         </div>
       </section>
-      <section class="trace-section">
-        <header>
+      <section class="trace-section shadow-region">
+        <header class="shadow-region-heading">
           <span>运行轨迹</span
           ><small>{{ model.shadow.trace.length }} 项活动</small>
         </header>
@@ -128,7 +128,8 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
           class="shadow-trace-box"
           @scroll="followTrace = atTail(trace)"
         >
-          <ol class="timeline">
+          <p v-if="!model.shadow.trace.length" class="shadow-region-placeholder">对话开始后，协作进展会显示在这里。</p>
+          <ol v-else class="timeline">
             <li v-for="item in model.shadow.trace" :key="item.key">
               <i></i>
               <div>
@@ -137,14 +138,11 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
                 <small>{{ item.status }} · {{ item.time }}</small>
               </div>
             </li>
-            <li v-if="!model.shadow.trace.length" class="empty-state">
-              对话开始后，协作进展会显示在这里。
-            </li>
           </ol>
         </div>
       </section>
-      <section class="shadow-event">
-        <p class="section-label">最新进展</p>
+      <section class="shadow-event shadow-region">
+        <header class="shadow-region-heading"><span>最新进展</span></header>
         <div class="shadow-event-content"><p>{{ model.shadow.event || "等待新的进展" }}</p></div>
       </section>
       </div>

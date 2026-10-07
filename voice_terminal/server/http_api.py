@@ -469,7 +469,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             # and test hooks observe the same hardware probe.
             from . import websocket as session_module
             from ..compute import model_hardware_status
-            hardware = model_hardware_status(session_module.hardware_status(), runtime.config)
+            hardware = await asyncio.to_thread(session_module.hardware_status, refresh=True) if any(mode == "cuda" for mode in body["devices"].values()) else await asyncio.to_thread(session_module.hardware_status)
+            hardware = await asyncio.to_thread(model_hardware_status, hardware, runtime.config, verify=True)
             for name, mode in body["devices"].items():
                 if mode == "cuda" and not hardware.get("models", {}).get(name, {}).get("gpu_available"):
                     reason = hardware.get("models", {}).get(name, {}).get("reason") or "GPU 后端不可用。"

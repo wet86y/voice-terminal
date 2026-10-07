@@ -63,7 +63,8 @@ try {
       const image = new Image(); image.src = url; await image.decode();
       const canvas = document.createElement('canvas'); canvas.width = canvas.height = size;
       const context = canvas.getContext('2d'); context.drawImage(image,0,0,size,size);
-      result.push({size, png:canvas.toDataURL('image/png').split(',')[1]});
+      result.push({size, png:canvas.toDataURL('image/png').split(',')[1],
+        rgba:size <= 48 ? btoa(String.fromCharCode(...context.getImageData(0,0,size,size).data)) : null});
       URL.revokeObjectURL(url);
     }
     return result;
@@ -79,7 +80,7 @@ try {
     socket.send(JSON.stringify({id:1, method:'Runtime.evaluate', params:{expression, returnByValue:true, awaitPromise:true}}))
   })
   assert.ok(!response.exceptionDetails, JSON.stringify(response.exceptionDetails))
-  const frames = response.result.value.map(frame => ({size:frame.size, data:Buffer.from(frame.png, 'base64')}))
+  const frames = response.result.value.map(frame => ({size:frame.size, data:Buffer.from(frame.png, 'base64'), rgba:frame.rgba ? Buffer.from(frame.rgba, 'base64') : null}))
   // ICO（Windows 多尺寸图标文件）：为每种缩放比例保留独立的透明 PNG（位图）帧。
   const header = Buffer.alloc(6 + frames.length * 16)
   header.writeUInt16LE(1, 2); header.writeUInt16LE(frames.length, 4)
@@ -95,6 +96,8 @@ try {
   const icon = Buffer.concat([header, ...frames.map(frame => frame.data)])
   await writeFile(join(directory, 'icon.ico'), icon)
   await writeFile(join(directory, 'icon.png'), frames.at(-1).data)
+  // RGBA（红绿蓝与透明度像素）：托盘直接选择同一小尺寸帧，避免从大图缩小造成声波失真。
+  for (const frame of frames.filter(frame => frame.rgba)) await writeFile(join(directory, `tray-${frame.size}.rgba`), frame.rgba)
   await writeFile(join(root, 'apps/frontend/src/assets/favicon.ico'), icon)
   await copyFile(source, join(root, 'apps/desktop/boot/app-icon.svg'))
   const previews = join(runtime, 'app-icon-preview')

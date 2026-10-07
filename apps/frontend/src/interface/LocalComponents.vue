@@ -62,7 +62,13 @@ function invalidDevice(row: LocalComponentRow) {
         <div class="local-component-summary">
           <div class="local-component-body">
             <div class="local-component-identity"><h4 :title="row.name">{{ row.name }}</h4><span class="local-state" :class="row.state"><i aria-hidden="true"></i>{{ row.status }}</span></div>
-            <dl class="local-component-metrics"><div v-if="row.runtime && row.runtime !== '未提供'" data-metric="runtime"><dt>运行时</dt><dd>{{ row.runtime }}</dd></div><div v-if="row.residentMemory !== undefined || row.privateMemory !== undefined" data-metric="memory"><dt>{{ row.residentMemory !== undefined && row.privateMemory !== undefined ? '常驻内存／提交内存' : row.residentMemory !== undefined ? '常驻内存' : '提交内存' }}</dt><dd>{{ [row.residentMemory, row.privateMemory].filter(value => value !== undefined).join(' / ') }}</dd></div><div v-if="row.vram !== undefined" data-metric="vram"><dt>进程显存</dt><dd>{{ row.vram }}</dd></div></dl>
+            <dl class="local-component-metrics">
+              <div v-if="row.runtime && row.runtime !== '未提供'" class="local-runtime-metric" data-metric="runtime"><dt>运行时</dt><dd>{{ row.runtime }}</dd></div>
+              <div class="local-resource-metrics">
+                <div v-if="row.residentMemory !== undefined || row.privateMemory !== undefined" data-metric="memory"><dt>{{ row.residentMemory !== undefined && row.privateMemory !== undefined ? '常驻内存／提交内存' : row.residentMemory !== undefined ? '常驻内存' : '提交内存' }}</dt><dd>{{ [row.residentMemory, row.privateMemory].filter(value => value !== undefined).join(' / ') }}</dd></div>
+                <div v-if="row.vram !== undefined" data-metric="vram"><dt>显存</dt><dd>{{ row.vram }}</dd></div>
+              </div>
+            </dl>
             <p v-if="row.error && !row.busy" class="local-error">{{ row.error }}</p>
           </div>
           <button class="local-component-action" :class="{ 'retry-action': !row.available }" type="button" :disabled="row.busy || (!row.available && !row.retryable)" :aria-label="`${row.name}：${row.available ? expanded.has(row.id) ? '收起详情' : '详情' : '重试'}`" :aria-expanded="row.available ? expanded.has(row.id) : undefined" :aria-controls="row.available ? `local-detail-${row.id}` : undefined" @click="activate(row)">
@@ -74,8 +80,8 @@ function invalidDevice(row: LocalComponentRow) {
           <p>{{ row.description }}</p>
           <dl v-if="row.facts.length" class="local-detail-facts"><div v-for="fact in row.facts" :key="fact.label"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div></dl>
           <div v-if="row.device" class="local-device-editor">
-            <label :for="`local-device-${row.id}`"><span>运行位置</span><select :id="`local-device-${row.id}`" :value="row.device.value" :disabled="saving" @change="changeDevice(row.id, $event)"><option v-for="option in row.device.options" :key="option.value" :value="option.value" :disabled="option.disabled">{{ option.label }}</option></select></label>
-            <button class="save-button" type="button" :disabled="saving || invalidDevice(row)" @click="emit('save', row.id)">{{ saving ? '保存中' : '保存' }}</button>
+            <label :for="`local-device-${row.id}`"><span>运行位置</span><select :id="`local-device-${row.id}`" :value="row.device.value" :disabled="saving || row.device.locked" @change="changeDevice(row.id, $event)"><option v-for="option in row.device.options" :key="option.value" :value="option.value" :disabled="option.disabled">{{ option.label }}</option></select></label>
+            <button class="save-button" type="button" :disabled="saving || row.device.locked || invalidDevice(row)" @click="emit('save', row.id)">{{ saving ? '保存中' : '保存' }}</button>
             <small>实际运行：{{ row.device.current }}<span v-if="row.device.draft"> · 草稿尚未保存</span><span v-if="row.device.pending"> · 已保存配置下次启动生效</span></small>
           </div>
           <div v-else class="local-location"><span>运行位置</span><strong>{{ row.location || '本机' }}</strong></div>
@@ -112,14 +118,14 @@ small,dt{font-size:var(--font-caption)}
 .local-component-summary{--local-action-width:64px;display:grid;grid-template-columns:minmax(0,1fr) var(--local-action-width);gap:12px;align-items:center;padding:12px 16px}
 .local-component-body{min-width:0}
 /* name column（名称列）：统一预留宽度，使状态不随名称长度移动。 */
-.local-component-identity{display:grid;grid-template-columns:minmax(0,min(280px,calc(100% - 68px))) 56px;gap:12px;align-items:start;margin-bottom:8px}
+.local-component-identity{display:flex;justify-content:space-between;gap:12px;align-items:start;margin-bottom:8px}
 .local-component-identity h4{font-size:var(--font-body);line-height:1.5;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
-.local-component-identity>.local-state{line-height:18px}
+.local-component-identity>.local-state{line-height:18px;flex:none;justify-content:flex-end;text-align:right}
 dl,dd{margin:0}
-.local-component-metrics{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);align-items:start;gap:8px 20px}
-.local-component-metrics>div{min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:3px;max-width:100%}
-.local-component-metrics>[data-metric="memory"]{grid-column:2}
-.local-component-metrics>[data-metric="vram"]{grid-column:2}
+.local-component-metrics{display:grid;grid-template-columns:minmax(100px,1fr) auto;align-items:start;gap:8px 16px}
+.local-runtime-metric,.local-resource-metrics>div{min-width:0;display:flex;flex-direction:column;gap:3px}
+.local-resource-metrics{display:flex;justify-content:flex-end;gap:16px;text-align:right;min-width:0}
+.local-resource-metrics dd{white-space:nowrap}
 .local-component-metrics dt{white-space:nowrap}
 .local-detail-facts>div{min-width:0;display:flex;flex-direction:column;gap:4px}
 dt{color:var(--subtle)}
@@ -142,7 +148,6 @@ dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:an
 .local-detail-note{overflow-wrap:anywhere}
 .local-location{display:flex;gap:12px;align-items:center;font-size:var(--font-body)}
 @container (max-width:440px){.local-memory-summary{grid-template-columns:1fr;gap:8px}.local-memory-summary article{flex-direction:row;align-items:center;justify-content:space-between;padding:12px;gap:8px}.local-component-summary{--local-action-width:58px;padding:12px;gap:8px}.local-component-metrics{gap:6px}.local-component-detail{padding:12px}.local-component-action{padding-inline:8px}}
-@container (max-width:520px){.local-component-metrics{grid-template-columns:1fr}.local-component-metrics>[data-metric]{grid-column:1}}
-@container (min-width:800px){.local-component-metrics{grid-template-columns:minmax(0,240px) minmax(0,1fr) minmax(0,130px)}.local-component-metrics>[data-metric="vram"]{grid-column:3}}
+@container (max-width:520px){.local-component-metrics{grid-template-columns:1fr}.local-resource-metrics{gap:12px}.local-resource-metrics dt,.local-resource-metrics dd{font-size:var(--font-caption)}}
 @media (prefers-reduced-motion:reduce){.local-component-action svg{transition:none}}
 </style>

@@ -1,5 +1,5 @@
 import { computed, onBeforeUnmount, reactive, ref, watch, type Ref } from 'vue'
-import type { LocalComponentRow, LocalComponentsModel } from '../interface/local-components'
+import { formatComponentMemory, type LocalComponentRow, type LocalComponentsModel } from '../interface/local-components'
 import { demoComputeModels, demoSystemComponents, longIdentifier, previewRows, type PreviewScene } from './demo-data'
 
 /** useLocalComponentsDemo（本地组件样例）：状态、重试与保存均在展示内存中完成。 */
@@ -17,7 +17,8 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
   }
   const sourceRows = [
     ...demoComputeModels.map(item => ({ ...item, description: '本地语音处理模型。', pid: item.id === 'paraformer' ? '21048' : item.id === 'sensevoice' ? '21052' : '21044', commit: `${Math.round(Number.parseInt(item.memory) * 1.25)} MB`, cpu: '0.3%' })),
-    ...demoSystemComponents.filter(item => ['dsh', 'voice', 'web'].includes(item.id)).sort((a, b) => ['dsh', 'voice', 'web'].indexOf(a.id) - ['dsh', 'voice', 'web'].indexOf(b.id)).map(item => ({ ...item, device: 'local', gpu: false, description: item.phase })),
+    ...demoSystemComponents.filter(item => ['dsh', 'voice'].includes(item.id)).sort((a, b) => ['dsh', 'voice'].indexOf(a.id) - ['dsh', 'voice'].indexOf(b.id)).map(item => ({ ...item, memory: item.id === 'voice' ? '866 MB' : item.memory, commit: item.id === 'voice' ? '1042 MB' : item.commit,
+      device: 'local', gpu: false, description: item.id === 'voice' ? '统一管理桌面窗口、界面服务、应用宿主、环境检查与语音服务。' : item.phase })),
   ]
   function cancelRetries() {
     timers.forEach(timer => clearTimeout(timer))
@@ -34,6 +35,7 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
     const failed = scene.value === 'error' && ['sensevoice', 'dsh'].includes(baseId) && !recovered.has(item.id)
     const available = !loading && !failed
     const model = demoComputeModels.find(row => row.id === baseId)
+    const countedHere = !['voice_vad', 'kws', 'smart_turn'].includes(baseId)
     return {
       id: item.id,
       name: scene.value === 'long' ? `${item.name} · ${longIdentifier}` : item.name,
@@ -41,11 +43,11 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
       status: busy ? '正在恢复' : loading ? '启动中' : failed ? '不可用' : '运行中',
       available, retryable: failed && !loading, busy: loading,
       runtime: runtimes[baseId],
-      residentMemory: available ? item.memory : undefined, privateMemory: available ? item.commit : undefined,
+      residentMemory: available && countedHere ? item.memory : undefined, privateMemory: available && countedHere ? item.commit : undefined,
       vram: item.device === 'cuda' && available ? '740 MB' : undefined,
       description: item.description,
       error: failed ? baseId === 'dsh' ? '代理执行宿主未启动，请重试。' : '模型加载失败，请重试。' : undefined,
-      note: '同一进程可承载多个模型，内存总量按进程去重。',
+      note: countedHere ? '同一进程可承载多个模型，内存总量按进程去重。' : baseId === 'smart_turn' ? '与 SenseVoice（语音识别与分析）共享进程，资源计入该条目。' : '与 Voice Server（语音服务）共享进程，资源计入语音服务条目。',
       location: '本机',
       facts: [
         { label: '进程标识', value: available ? item.pid : '未运行' },
@@ -53,6 +55,7 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
       ],
       device: model ? {
         value: selectedDevices[item.id] ?? savedDevices[item.id] ?? model.device,
+        locked: !available,
         current: model.device === 'cuda' ? 'GPU（图形处理器）' : 'CPU（中央处理器）',
         pending: (savedDevices[item.id] ?? model.device) !== model.device,
         options: [
@@ -66,14 +69,16 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
     const failed = rows.value.some(row => row.state === 'failed')
     const loading = rows.value.some(row => row.state === 'loading')
     const empty = scene.value === 'empty'
+    const sumMetric = (key: 'residentMemory' | 'privateMemory' | 'vram') => empty ? undefined
+      : formatComponentMemory(rows.value.reduce((sum, row) => sum + (row[key] ? Number.parseFloat(row[key]) * 1024 ** 2 : 0), 0))
     return {
       status: empty ? '暂无数据' : failed ? '部分组件不可用' : loading ? '组件启动中' : '运行正常',
       state: empty ? 'disabled' : failed ? 'failed' : loading ? 'loading' : 'ready',
       sampledAt: empty ? '—' : sampledAt.value,
       resources: [
-        { id: 'resident', label: '常驻内存', used: empty ? undefined : '2.01 GB', total: empty ? undefined : '32 GB' },
-        { id: 'commit', label: '提交内存', used: empty ? undefined : '2.45 GB', total: empty ? undefined : '48 GB' },
-        { id: 'vram', label: '显存', used: empty ? undefined : '2.2 GB', total: empty ? undefined : '8 GB' },
+        { id: 'resident', label: '常驻内存', used: sumMetric('residentMemory'), total: empty ? undefined : '32 GB' },
+        { id: 'commit', label: '提交内存', used: sumMetric('privateMemory'), total: empty ? undefined : '48 GB' },
+        { id: 'vram', label: '显存', used: sumMetric('vram'), total: empty ? undefined : '8 GB' },
       ],
       rows: rows.value,
     }
