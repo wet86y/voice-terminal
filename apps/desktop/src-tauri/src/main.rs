@@ -35,6 +35,7 @@ enum FrontendMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DesktopCommand {
     Status,      // status（桌面状态读取）。
+    SkipStartup, // skip startup（跳过加载画面，服务继续启动）。
     OpenLogs,    // open logs（打开产品日志）。
     OpenConsole, // open console（打开产品控制台）。
     Exit,        // exit（退出当前桌面实例）。
@@ -43,7 +44,7 @@ enum DesktopCommand {
 
 fn command_allowed(mode: FrontendMode, command: DesktopCommand) -> bool {
     match command {
-        DesktopCommand::Status | DesktopCommand::Exit => true,
+        DesktopCommand::Status | DesktopCommand::SkipStartup | DesktopCommand::Exit => true,
         DesktopCommand::OpenLogs | DesktopCommand::OpenConsole | DesktopCommand::FocusMain => {
             mode == FrontendMode::Product
         }
@@ -56,6 +57,7 @@ fn require_command(mode: FrontendMode, command: DesktopCommand) -> Result<(), St
     }
     let name = match command {
         DesktopCommand::Status => "状态读取",
+        DesktopCommand::SkipStartup => "跳过加载画面",
         DesktopCommand::OpenLogs => "产品日志",
         DesktopCommand::OpenConsole => "产品控制台",
         DesktopCommand::Exit => "退出应用",
@@ -83,6 +85,7 @@ struct Desktop {
     instance_identifier: String,    // instance_identifier（按模式和源码根目录隔离的单实例标识）。
     service: Mutex<Option<Service>>,
     service_requested: AtomicBool, // service_requested（主窗口已请求启动服务，刷新不重复启动）。
+    startup_skipped: AtomicBool,   // startup_skipped（当前窗口跳过加载画面的选择）。
     origin: Mutex<Option<String>>,
     launch_token: Mutex<Option<String>>, // launch_token（当前入口的一次性启动凭据）。
     error: Mutex<Option<String>>,
@@ -212,10 +215,21 @@ fn desktop_status(
     // ready（是否就绪）、error（错误信息）、frontend_mode（前端模式）、development（是否调试构建）。
     Ok(serde_json::json!({
         "ready": state.origin.lock().unwrap().is_some(),
+        "startup_skipped": state.startup_skipped.load(Ordering::Acquire),
         "error": *state.error.lock().unwrap(),
         "frontend_mode": state.mode.label(),
         "development": state.development
     }))
+}
+#[tauri::command]
+fn skip_startup(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<(), String> {
+    require_command(state.mode, DesktopCommand::SkipStartup)?;
+    trusted(&window, &state)?;
+    if state.stopping.load(Ordering::Acquire) {
+        return Err("应用正在退出。".into());
+    }
+    state.startup_skipped.store(true, Ordering::Release);
+    Ok(())
 }
 #[tauri::command]
 fn open_logs(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<(), String> {
@@ -579,9 +593,9 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
                     };
                     let normalized_origin = entry.origin().ascii_serialization();
                     let capability = if read_state.mode == FrontendMode::UiPreview {
-                        serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-exit-application"]})
+                        serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
                     } else {
-                        serde_json::json!({"identifier":"owned-main", "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main"]})
+                        serde_json::json!({"identifier":"owned-main", "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main"]})
                     };
                     if let Err(error) = read_app.add_capability(capability.to_string()) {
                         *read_state.error.lock().unwrap() =
@@ -708,6 +722,7 @@ fn run() -> Result<(), String> {
         instance_identifier,
         service: Mutex::new(None),
         service_requested: AtomicBool::new(false),
+        startup_skipped: AtomicBool::new(false),
         origin: Mutex::new(None),
         launch_token: Mutex::new(None),
         error: Mutex::new(None),
@@ -721,6 +736,7 @@ fn run() -> Result<(), String> {
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
             desktop_status,
+            skip_startup,
             open_logs,
             open_console,
             exit_application,
@@ -1070,10 +1086,11 @@ mod tests {
     }
 
     #[test]
-    fn preview_exposes_only_status_and_exit_commands() {
-        for command in [DesktopCommand::Status, DesktopCommand::Exit] {
+    fn preview_exposes_only_loading_status_and_exit_commands() {
+        for command in [DesktopCommand::Status, DesktopCommand::SkipStartup, DesktopCommand::Exit] {
             assert!(command_allowed(FrontendMode::UiPreview, command));
             assert!(require_command(FrontendMode::UiPreview, command).is_ok());
+            assert!(command_allowed(FrontendMode::Product, command));
         }
         for command in [
             DesktopCommand::OpenLogs,

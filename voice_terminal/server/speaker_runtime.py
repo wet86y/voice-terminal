@@ -72,6 +72,8 @@ class SpeakerRuntimeMixin:
     async def ensure_speaker_worker(self) -> bool:
         """Connect to or launch the local sidecar before enabling speaker modes."""
         async with self._speaker_worker_lock:
+            if getattr(self, "_application_stopping", False):
+                return False
             if (self.speaker is not None and self.speaker.connected
                     and not self.speaker.degraded
                     and self.state.services.get("speaker") == "READY"):
@@ -181,6 +183,8 @@ class SpeakerRuntimeMixin:
         return True, None
 
     async def _start_managed_speaker_worker(self) -> asyncio.subprocess.Process:
+        if getattr(self, "_application_stopping", False):
+            raise RuntimeError("应用正在退出，不能启动声纹进程。")
         from ..application.managed import report
         report("speaker", "加载声纹模型")
         log_dir = self.paths.logs

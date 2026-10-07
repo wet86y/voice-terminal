@@ -13,7 +13,7 @@ from typing import Any
 
 from .protocol import asr_result, decode_audio_chunk
 from ..compute import process_memory_bytes, hardware_status
-from ..resources import process_resource_status, registry
+from ..resources import model_thread_budget, process_resource_status, registry
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,7 @@ class AsrWorkerEngine:
         self._timing = threading.local()  # timing（线程内计时）：不把线程排队算进模型调用。
         self._call_latency: dict[str, float | int] = {}
         self.model_warmed = False  # model_warmed（已完成真实推理预热）。
+        self.startup_timings_ms = {}  # startup_timings_ms（各启动阶段耗时，毫秒）。
         registry.observe(self, "asr_pending_pcm", lambda value: sum(len(p) for p in value._pending_audio_by_turn.values()))
 
     @property
@@ -101,18 +102,23 @@ class AsrWorkerEngine:
     def _load_model(self) -> None:
         if self._model is not None:
             return
+        if not self.model_dir.is_dir():
+            raise FileNotFoundError(f"Paraformer（流式识别）模型目录不存在：{self.model_dir}")
+        started = time.perf_counter()
         try:
             import numpy as np  # type: ignore
-            from funasr import AutoModel  # type: ignore
+            from .model_loader import auto_model_class
+            AutoModel = auto_model_class(self.model_dir)
         except ImportError as exc:
-            raise RuntimeError("缺少 numpy/funasr，请先运行 scripts\\setup.ps1。") from exc
-        if not self.model_dir.is_dir():
-            raise FileNotFoundError(f"Paraformer 模型目录不存在：{self.model_dir}")
+            raise RuntimeError("缺少 NumPy（数值计算库）或 FunASR（语音框架），请先运行 scripts\\setup.ps1（环境安装脚本）。") from exc
+        self.startup_timings_ms["imports"] = (time.perf_counter() - started) * 1000  # imports（依赖导入）。
         self._np = np
         fallback = self.fallback_device if self.fallback_device in {"cpu", "cuda"} else "cpu"
         requested = self.requested_device
         from ..compute import startup_device, loaded_funasr_device
+        started = time.perf_counter()
         initial = startup_device(requested, "paraformer")
+        self.startup_timings_ms["hardware"] = (time.perf_counter() - started) * 1000  # hardware（设备探测）。
         candidates = [initial]
         if initial == "cuda":
             if fallback != initial:
@@ -122,12 +128,15 @@ class AsrWorkerEngine:
         last_error: Exception | None = None
         for candidate in candidates:
             try:
+                started = time.perf_counter()
                 self._model = AutoModel(
                     model=str(self.model_dir),
                     device=candidate,
                     disable_update=True,
                     disable_pbar=True,
+                    ncpu=model_thread_budget(),
                 )
+                self.startup_timings_ms["model"] = (time.perf_counter() - started) * 1000  # model（模型构造与权重加载）。
                 self.device = loaded_funasr_device(self._model, candidate)
                 # 首次原生算子／CUDA（图形处理器加速）初始化在开放接口前完成；
                 # 实际推理失败也进入设备回退，不能只凭权重加载宣称 GPU（图形处理器）可用。
@@ -139,6 +148,9 @@ class AsrWorkerEngine:
                     if candidate == "cuda" and self.device == "cpu" else None
                 )
                 logger.info("asr.worker.model_ready model_dir=%s device=%s", self.model_dir, self.device)
+                logger.info("识别启动阶段（毫秒）：依赖导入=%.1f，设备探测=%.1f，模型加载=%.1f，真实预热=%.1f",
+                    self.startup_timings_ms["imports"], self.startup_timings_ms["hardware"],
+                    self.startup_timings_ms["model"], self.startup_timings_ms["warmup"])
                 return
             except Exception as exc:
                 last_error = exc
@@ -166,6 +178,7 @@ class AsrWorkerEngine:
                 decoder_chunk_look_back=self.decoder_chunk_look_back,
             )
         self.model_warmed = True
+        self.startup_timings_ms["warmup"] = (time.perf_counter() - started) * 1000  # warmup（真实推理预热）。
         logger.info("asr.worker.warmed device=%s elapsed_ms=%.1f", self.device, (time.perf_counter() - started) * 1000)
 
     async def prepare(self) -> None:

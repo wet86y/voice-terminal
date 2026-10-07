@@ -24,8 +24,8 @@ def process_memory_bytes() -> int | None:
         return None
 
 
-def system_commit_limit_bytes() -> int | None:
-    """GetPerformanceInfo（Windows 真实性能接口）提供系统提交内存上限。"""
+def _system_commit_bytes() -> tuple[int, int] | None:
+    """GetPerformanceInfo（Windows 性能接口）提供提交内存上限和剩余预算。"""
     if os.name != "nt":
         return None
     try:
@@ -41,9 +41,23 @@ def system_commit_limit_bytes() -> int | None:
         query = ctypes.WinDLL("psapi", use_last_error=True).GetPerformanceInfo
         query.argtypes = [ctypes.POINTER(PerformanceInfo), wintypes.DWORD]
         query.restype = wintypes.BOOL
-        return int(info.CommitLimit * info.PageSize) if query(ctypes.byref(info), info.cb) else None
+        if query(ctypes.byref(info), info.cb):
+            return int(info.CommitLimit * info.PageSize), int(max(0, info.CommitLimit - info.CommitTotal) * info.PageSize)
+        return None
     except (OSError, AttributeError):
         return None
+
+
+def system_commit_limit_bytes() -> int | None:
+    """system_commit_limit_bytes（系统提交内存上限字节数）。"""
+    values = _system_commit_bytes()
+    return values[0] if values else None
+
+
+def system_commit_available_bytes() -> int | None:
+    """system_commit_available_bytes（系统剩余提交内存字节数），未知时不猜测。"""
+    values = _system_commit_bytes()
+    return values[1] if values else None
 
 
 def _torch_cuda_probe(torch: Any) -> bool:

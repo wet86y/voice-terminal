@@ -12,19 +12,25 @@ import time
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .startup_page import loading_page, render_startup_page
+
 
 PUBLIC_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Voice Terminal · 桌面应用</title><style>body{background:#101217;color:#edf0f6;font:16px system-ui;max-width:760px;margin:16vh auto;padding:24px}main{border:1px solid #30384b;background:#181c27;padding:32px;border-radius:18px}p{color:#aeb7c9;line-height:1.8}</style>
 <main><h1>Voice Terminal · 语音终端</h1><p>请通过桌面程序打开。此地址不提供网页业务入口。</p></main></html>"""
 
-FALLBACK_HTML = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Voice Terminal · 启动诊断</title><style>body{background:#101217;color:#edf0f6;font:16px system-ui;max-width:920px;margin:60px auto;padding:24px}button{padding:10px;margin:8px;background:#30384b;color:white;border:0;border-radius:8px}li{padding:12px;white-space:pre-wrap}small{color:#aaa}</style>
-<h1>Voice Terminal · 系统运行</h1><p>界面服务尚未准备好，当前显示应用宿主的启动诊断。</p><p id="phase">正在验证桌面启动程序…</p><ul id="components"></ul><button id="retry" hidden>重新检查桌面程序</button><button id="exit" hidden>退出应用</button>
+FALLBACK_HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Voice Terminal · 语音终端</title><style>html,body{margin:0;background:#0e1118}__STARTUP_STYLE__ .startup-components{max-height:45vh;overflow:auto;margin:20px 0;padding:0;list-style:none;text-align:left;font-size:12px;line-height:1.65}.startup-components li{padding:10px 0;border-bottom:1px solid #ffffff12;white-space:pre-wrap}.startup-components button{display:block;margin-top:6px}</style></head><body>
+<main class="startup-screen" role="status"><section class="startup-content"><div class="startup-icon" role="img" aria-label="语音终端">__STARTUP_ICON__</div>
+<h1 class="startup-title" id="title">应用启动中</h1><p class="startup-status" id="phase">正在加载应用界面</p>
+<div class="startup-progress" id="progress" data-indeterminate="true" role="progressbar" aria-label="应用启动进度"><span class="startup-progress-fill" id="fill"></span></div>
+<ul class="startup-components" id="components" hidden></ul><div class="startup-actions"><button class="startup-button" id="skip">跳过</button><button class="startup-button" id="retry" hidden>重试</button><button class="startup-button" id="exit" hidden>退出应用</button></div></section></main>
 <script>
 const labels={waiting:'等待启动',starting:'启动中',ready:'运行正常',disabled:'已停用',failed:'需要检查',blocked:'依赖不可用',external:'外部进程',stopping:'退出中',stopped:'已退出'};
 const bridge=window.__TAURI_INTERNALS__;
 const phase=document.getElementById('phase'),list=document.getElementById('components'),retry=document.getElementById('retry'),exit=document.getElementById('exit');
-let busy=false,monitoring=false;
+const heading=document.getElementById('title'),progress=document.getElementById('progress'),fill=document.getElementById('fill'),skip=document.getElementById('skip');
+let busy=false,monitoring=false,inspecting=false;
 function statusError(status){
   if(!status||typeof status!=='object'||Array.isArray(status))return '桌面启动程序返回了无效状态。';
   if(typeof status.error==='string'&&status.error.trim())return status.error;
@@ -38,10 +44,13 @@ async function verifyDesktop(){
   if(!bridge||typeof bridge.invoke!=='function')throw new Error('没有检测到桌面原生命令桥。');
   const status=await bridge.invoke('desktop_status'),problem=statusError(status);
   if(problem)throw new Error(problem);
+  if(status.startup_skipped===true)inspecting=true;
 }
 function restartPrompt(reason){
+  heading.textContent='启动遇到问题';
   phase.textContent='请退出并重新启动桌面程序。'+(reason?' '+reason:'');
   list.replaceChildren();
+  progress.hidden=true;skip.hidden=true;
   retry.hidden=!bridge||typeof bridge.invoke!=='function';
   exit.hidden=!bridge||typeof bridge.invoke!=='function';
 }
@@ -53,13 +62,21 @@ async function refresh(){
     const response=await fetch('/api/v1/application/snapshot',{cache:'no-store'});
     if(!response.ok)throw new Error('应用状态连接不可用。');
     const snapshot=await response.json();
-    phase.textContent=snapshot.phase;
+    const active=snapshot.components.filter(component=>component.state==='starting');
+    heading.textContent=inspecting?'本地组件':snapshot.startup_complete?'界面加载失败':'应用启动中';
+    phase.textContent=snapshot.startup_complete?'应用界面资源不可用，请退出并重新启动。':active.length?'正在启动 '+active.map(component=>component.name).join('、'):'正在加载应用界面';
+    progress.hidden=inspecting||snapshot.startup_complete===true;
+    list.hidden=!inspecting;skip.hidden=inspecting;
+    const total=Number(snapshot.total_components)||0,complete=Number(snapshot.completed_components)||0;
+    progress.dataset.indeterminate=String(total<=0);
+    fill.style.width=total>0?Math.min(100,Math.max(0,complete/total*100))+'%':'';
     list.replaceChildren();
     for(const component of snapshot.components){
       const item=document.createElement('li');
       item.textContent=component.name+' · '+(labels[component.state]||'不可用')+' · '+component.phase+(component.error?'\\n'+component.error:'');
       if(component.retry_allowed){
         const button=document.createElement('button');
+        button.className='startup-button';
         button.textContent='重试';
         button.addEventListener('click',async()=>{
           try{
@@ -78,6 +95,7 @@ async function refresh(){
   }catch(error){restartPrompt(error instanceof Error?error.message:'桌面启动程序不可用。');}
   finally{busy=false;}
 }
+skip.addEventListener('click',async()=>{inspecting=true;progress.hidden=true;list.hidden=false;skip.hidden=true;await refresh();});
 retry.addEventListener('click',()=>void refresh());
 exit.addEventListener('click',async()=>{
   if(!bridge||typeof bridge.invoke!=='function')return;
@@ -87,7 +105,7 @@ exit.addEventListener('click',async()=>{
 });
 if(!bridge||typeof bridge.invoke!=='function')restartPrompt('请从桌面应用重新打开。');
 else void refresh();
-</script></html>"""
+</script></body></html>"""
 
 
 class HostWeb:
@@ -213,7 +231,7 @@ class HostWeb:
                 if target.is_file():
                     self.send(target.read_bytes(), mimetypes.guess_type(target.name)[0] or "application/octet-stream")
                 elif path in ("/", "/index.html") or not Path(path).suffix:
-                    self.send(FALLBACK_HTML.encode(), "text/html; charset=utf-8")
+                    self.send(render_startup_page(owner.application.root, FALLBACK_HTML).encode(), "text/html; charset=utf-8")
                 else:
                     self.data({"error": "文件不存在"}, 404)
 
@@ -255,9 +273,7 @@ class HostWeb:
                               referrer_policy="no-referrer")
                     return
                 # 页面脚本只负责同源 replace，不携带令牌，也不会触发跨站 303 重定向。
-                body = ("<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\">"
-                        "<meta name=\"referrer\" content=\"no-referrer\"><title>正在打开</title>"
-                        "<body><p>正在打开 Voice Terminal…</p><script>location.replace('/')</script></body></html>")
+                body = loading_page(owner.application.root)
                 self.send(body.encode(), "text/html; charset=utf-8", set_cookie=True, referrer_policy="no-referrer")
 
             def events(self):

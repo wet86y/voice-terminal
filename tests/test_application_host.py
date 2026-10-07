@@ -130,7 +130,7 @@ class WebTests(unittest.TestCase):
         with self.client.open(self.web.origin + "/desktop-entry?token=" + token) as response:
             body = response.read().decode()
             self.assertEqual(response.status, 200)
-            self.assertIn("location.replace('/')", body)
+            self.assertIn('location.replace("/")', body)
             self.assertNotIn(token, body)
             cookie = response.headers.get("Set-Cookie", "")
             self.assertIn(self.web.cookie_name + "=", cookie)
@@ -305,7 +305,7 @@ class FrontendReadinessTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("node"), "Node.js（JavaScript 运行环境）测试工具不可用")
 class FallbackDiagnosticPageTests(unittest.TestCase):
-    def run_script(self, *, bridge: bool, status=None, click_exit=False):
+    def run_script(self, *, bridge: bool, status=None, click_exit=False, click_skip=False, snapshot=None):
         match = re.search(r"<script>(.*?)</script>", FALLBACK_HTML, re.DOTALL)
         self.assertIsNotNone(match)
         harness = r"""
@@ -313,12 +313,12 @@ const vm = require('node:vm')
 const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
 const calls = [], timers = []
 class Element {
-  constructor(id) { this.id=id; this.children=[]; this.listeners={}; this.hidden=false; this.textContent=''; }
+  constructor(id) { this.id=id; this.children=[]; this.listeners={}; this.hidden=false; this.textContent=''; this.style={}; this.dataset={}; }
   addEventListener(name, callback) { this.listeners[name]=callback }
   append(child) { this.children.push(child) }
   replaceChildren(...children) { this.children=children }
 }
-const elements = Object.fromEntries(['phase','components','retry','exit'].map(id => [id,new Element(id)]))
+const elements = Object.fromEntries(['title','phase','components','retry','exit','skip','progress','fill'].map(id => [id,new Element(id)]))
 const document = { getElementById:id => elements[id], createElement:tag => new Element(tag) }
 const window = { setInterval:(callback,delay) => { timers.push(delay); return timers.length } }
 if (input.bridge) window.__TAURI_INTERNALS__ = { invoke:async command => {
@@ -327,17 +327,22 @@ if (input.bridge) window.__TAURI_INTERNALS__ = { invoke:async command => {
 } }
 const fetch = async url => {
   calls.push('fetch:'+url)
-  return { ok:true, json:async()=>({ phase:'running', components:[] }) }
+  return { ok:true, json:async()=>input.snapshot }
 }
 vm.runInNewContext(input.script,{window,document,fetch})
 setImmediate(async()=>{
   if (input.clickExit) await elements.exit.listeners.click()
+  if (input.clickSkip) await elements.skip.listeners.click()
   process.stdout.write(JSON.stringify({calls,timers,phase:elements.phase.textContent,
+    title:elements.title.textContent,listHidden:elements.components.hidden,
+    progressHidden:elements.progress.hidden,progressWidth:elements.fill.style.width,
     exitHidden:elements.exit.hidden,retryHidden:elements.retry.hidden}))
 })
 """
         result = subprocess.run([shutil.which("node"), "-e", harness],
-            input=json.dumps({"script": match.group(1), "bridge": bridge, "status": status, "clickExit": click_exit}),
+            input=json.dumps({"script": match.group(1), "bridge": bridge, "status": status,
+                "clickExit": click_exit, "clickSkip": click_skip,
+                "snapshot": snapshot or {"phase": "running", "components": []}}),
             text=True, encoding="utf-8", capture_output=True, timeout=5, check=True)
         return json.loads(result.stdout)
 
@@ -367,6 +372,20 @@ setImmediate(async()=>{
             status={"ready": True, "error": None, "frontend_mode": "product", "development": True},
             click_exit=True)
         self.assertEqual(exited["calls"], ["desktop_status", "fetch:/api/v1/application/snapshot", "exit_application"])
+
+    def test_fallback_loading_keeps_details_hidden_until_skip_without_starting_services(self):
+        status = {"ready": True, "error": None, "frontend_mode": "product", "development": False}
+        snapshot = {"startup_complete": False, "total_components": 8, "completed_components": 4,
+            "components": [{"id": "asr", "name": "语音识别", "state": "starting", "phase": "加载模型"}]}
+        loading = self.run_script(bridge=True, status=status, snapshot=snapshot)
+        self.assertTrue(loading["listHidden"])
+        self.assertFalse(loading["progressHidden"])
+        self.assertEqual(loading["progressWidth"], "50%")
+        inspected = self.run_script(bridge=True, status=status, snapshot=snapshot, click_skip=True)
+        self.assertFalse(inspected["listHidden"])
+        self.assertTrue(inspected["progressHidden"])
+        self.assertEqual(inspected["title"], "本地组件")
+        self.assertEqual(inspected["calls"], ["desktop_status", "fetch:/api/v1/application/snapshot"] * 2)
 
 
 class SupervisorTests(unittest.IsolatedAsyncioTestCase):
@@ -610,12 +629,25 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 if key == "asr":
                     raise RuntimeError("模型缺失")
                 app.state.component(key, state="ready")
+            async def entry():
+                attempts.append("voice-entry")
+                app.voice_entry_ready = True
+            async def local():
+                attempts.append("voice-local")
+                app.voice_local_ready = True
+            async def session():
+                attempts.append("voice-session")
+                self.assertEqual(next(c for c in app.state.snapshot()["components"] if c["id"] == "asr")["state"], "failed")
+                app.state.component("voice", state="failed", error="语音识别尚未就绪")
             async def delegated():
                 app.state.component("dsh", state="failed", error="不可用")
                 app.state.component("speaker", state="disabled", enabled=False)
-            with patch.object(app, "setup", setup), patch.object(app, "start_service", start), patch.object(app, "start_delegated", delegated):
+            with patch.object(app, "setup", setup), patch.object(app, "start_service", start), \
+                 patch.object(app, "start_voice_entry", entry), patch.object(app, "start_voice_local", local), \
+                 patch.object(app, "finish_voice_startup", session), patch.object(app, "start_delegated", delegated), \
+                 patch.object(app, "watch_delegated_startup", new=AsyncMock()):
                 await app.startup()
-            self.assertEqual(attempts, ["asr", "analysis", "voice"])
+            self.assertEqual(attempts, ["voice-entry", "asr", "analysis", "voice-local", "voice-session"])
             self.assertTrue(app.state.snapshot()["startup_complete"])
             self.assertEqual(app.state.snapshot()["state"], "failed")
             app.outer_job.close()

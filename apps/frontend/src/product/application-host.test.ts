@@ -22,4 +22,15 @@ describe('独立应用状态投影', () => {
     expect(applicationApiReady({ ...value, components: [{ ...value.components[0], pid: null }] })).toBe(false)
     expect(applicationApiReady({ ...value, components: [{ ...value.components[0], state: 'starting' }] })).toBe(false)
   })
+  it('轻量接口监听后允许设置访问，模型与完整启动仍保持加载状态', () => {
+    const value = { startup_complete: false, core_available: false, stopping: false,
+      voice_api_url: 'http://127.0.0.1:8765', voice_api_ready: true,
+      components: [{ id: 'voice', pid: 123, state: 'waiting' }] } as ApplicationSnapshot
+    expect(applicationApiReady(value)).toBe(true)
+    expect(applicationApiReady({ ...value, voice_api_ready: false })).toBe(false)
+    expect(applicationApiReady({ ...value, stopping: true })).toBe(false)
+    expect(applicationApiReady({ ...value, components: [{ ...value.components[0], pid: null }] })).toBe(false)
+    expect(value.startup_complete).toBe(false)
+    expect(value.core_available).toBe(false)
+  })
 })

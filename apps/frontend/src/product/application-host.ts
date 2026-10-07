@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue'
 import { locateNativeInvoker } from '../runtime/desktop-preflight'
+import { startupWasSkipped, rememberStartupSkip } from '../runtime/startup-choice'
 
 export interface ApplicationComponent {
   /** id（组件标识）。 */
@@ -61,6 +62,8 @@ export interface ApplicationSnapshot {
   stopping: boolean
   /** voice_api_url（语音服务接口地址）。 */
   voice_api_url: string
+  /** voice_api_ready（轻量业务接口已监听，模型仍可继续加载）。 */
+  voice_api_ready?: boolean
   /** voice_ws_url（语音实时通信地址）。 */
   voice_ws_url: string
   /** capabilities（业务能力状态）。 */
@@ -95,14 +98,14 @@ export function acceptApplicationSnapshot(previous: ApplicationSnapshot | null, 
 export function applicationApiReady(value: ApplicationSnapshot | null): boolean {
   if (!value || value.stopping || !value.voice_api_url) return false
   const voice = value.components.find(component => component.id === 'voice')
-  return Boolean(voice?.pid && ['ready', 'failed', 'external'].includes(voice.state))
+  return Boolean(voice?.pid && (value.voice_api_ready === true || ['ready', 'failed', 'external'].includes(voice.state)))
 }
 
 // product/main（产品入口）只会在 Host 配置通过预检后加载，因此产品永远由宿主管理。
 const managed = ref(true)
 const snapshot = ref<ApplicationSnapshot | null>(null)
 const error = ref('')
-const inspecting = ref(false)
+const inspecting = ref(startupWasSkipped())
 const connected = ref(false)
 const now = ref(Date.now())
 const retryingAll = ref(false)
@@ -310,9 +313,9 @@ function stop() {
 export function useApplicationHost() {
   const businessReady = computed(() => applicationApiReady(snapshot.value))
   const overlay = computed(() => sessionInvalid.value || managed.value && (
-    !snapshot.value || ['stopping', 'stopped'].includes(snapshot.value.state)
-    || ((!snapshot.value.startup_complete || snapshot.value.state === 'failed') && !inspecting.value)))
+    ['stopping', 'stopped'].includes(snapshot.value?.state ?? '')
+    || ((!snapshot.value || !snapshot.value.startup_complete || snapshot.value.state === 'failed') && !inspecting.value)))
   return { managed, snapshot, error, inspecting, connected, now, retryingAll, sessionInvalid,
     businessReady, overlay, start, stop, retry, retryFailed, exit,
-    inspect: () => { inspecting.value = true }, refresh }
+    inspect: () => { inspecting.value = true; rememberStartupSkip() }, refresh }
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-skip-startup"
+description = "Enables the skip_startup command without any pre-configured scope."
+commands.allow = ["skip_startup"]
+
+[[permission]]
+identifier = "deny-skip-startup"
+description = "Denies the skip_startup command without any pre-configured scope."
+commands.deny = ["skip_startup"]

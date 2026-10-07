@@ -42,6 +42,15 @@ def main() -> None:
         "analysis_enabled": config.smart_turn.smart_turn or config.smart_turn.sensevoice,
         "analysis_lanes": [name for name, enabled in (("endpoint", config.smart_turn.smart_turn),
             ("refine", config.smart_turn.sensevoice)) if enabled],
+        "startup_gpu_roles": [role for role, enabled, models in (
+            ("asr", True, ("paraformer",)),
+            ("analysis", config.smart_turn.smart_turn or config.smart_turn.sensevoice,
+             tuple(name for name, selected in (("smart_turn", config.smart_turn.smart_turn),
+                                               ("sensevoice", config.smart_turn.sensevoice)) if selected)),
+            ("voice", True, ("voice_vad", "kws") +
+             (("wespeaker",) if config.speaker.mode != "off" or config.speaker.owner_only_barge_in else ())),
+        ) if enabled and any(config.compute.devices.get(name, "auto") != "cpu" for name in models)],
+        # startup_gpu_roles（启动时可能使用显卡的组件）：仅用于并行资源预留，不更改模型设备选择。
         "worker_timeout_seconds": 240 if paths.separated else 180,  # worker_timeout_seconds（模型进程启动预算）：首次解压的导入与缓存初始化较慢。
         "voice_host": config.server.host, "voice_port": config.server.port,
         "speaker_enabled": config.speaker.mode != "off" or config.speaker.owner_only_barge_in,

@@ -41,6 +41,8 @@ export function useProductControls() {
     adapter.page.value = "settings";
     adapter.settingsTab.value = "compute";
   }
+  // inspecting（已跳过加载画面）：最早原生页面的选择也直接进入本地组件。
+  if (applicationHost.inspecting.value) showApplicationSystem();
   const {
     voice,
     page: activePage,
@@ -384,6 +386,12 @@ export function useProductControls() {
   const modelContextOptions = [32768, 65536, 131072, 262144, 524288];
   const reasoningOptions = ["off", "low", "medium", "high", "max"];
   const runtimeMeta = computed(() => {
+    if (applicationSnapshot.value?.startup_complete === false) return {
+      label: "应用启动中",
+      description: "本地组件正在启动，可以先调整设置，启动完成后再开始语音会话。",
+      chip: "STARTING（启动中）",
+      timestamp: "本地组件准备中",
+    };
     if (coreUnavailable.value) return {
       label: "需要检查",
       description: applicationSnapshot.value?.components.find(component => component.id === 'voice')?.error || "语音能力尚未就绪，可以先配置模型或查看本地组件。",
@@ -1335,7 +1343,7 @@ export function useProductControls() {
     }
   }
   async function beginSpeakerRecording(index: number, label: string) {
-    if (!applicationHost.businessReady.value) {
+    if (!applicationHost.businessReady.value || applicationSnapshot.value?.startup_complete === false) {
       adapter.setError(new Error("语音服务尚未就绪，不能开始声纹录音。"));
       return;
     }
@@ -1362,7 +1370,7 @@ export function useProductControls() {
     }
   }
   async function beginSpeakerTest() {
-    if (!applicationHost.businessReady.value) {
+    if (!applicationHost.businessReady.value || applicationSnapshot.value?.startup_complete === false) {
       adapter.setError(new Error("语音服务尚未就绪，不能开始声纹测试。"));
       return;
     }
@@ -1503,16 +1511,18 @@ export function useProductControls() {
       sessionActive: connected.value && listening.value, // sessionActive（真实会话开关）：等待唤醒时仍保持会话布局。
       title: runtimeMeta.value.label,
       description: runtimeMeta.value.description,
-      action: coreUnavailable.value
+      action: applicationSnapshot.value?.startup_complete === false
+        ? "组件启动中"
+        : coreUnavailable.value
         ? "查看本地组件"
         : connected.value
           ? listening.value
             ? "停止当前会话"
             : "开始语音会话"
           : "重试连接",
-      disabled: loading.value,
-      modeDisabled: !connected.value,
-      canReset: connected.value && !listening.value,
+      disabled: loading.value || applicationSnapshot.value?.startup_complete === false,
+      modeDisabled: !connected.value || applicationSnapshot.value?.startup_complete === false,
+      canReset: connected.value && !listening.value && applicationSnapshot.value?.startup_complete !== false,
       mode: reasoningMode.value,
       latency: formatResponseLatency(latencyMs.value),
       latencyPending: latencyRunning.value,

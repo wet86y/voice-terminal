@@ -78,6 +78,7 @@ beforeEach(() => {
     voice_api_url: 'http://127.0.0.1:43876', voice_ws_url: 'ws://127.0.0.1:43876/ws' }
   application.managed.value = true; application.snapshot.value = null; application.businessReady.value = false
   application.overlay.value = false; application.inspect.mockClear()
+  application.inspecting.value = false
 })
 afterEach(() => {
   mounted.splice(0).forEach(wrapper => wrapper.unmount())
@@ -85,6 +86,49 @@ afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
+  it('加载页只展示当前组件，跳过后进入本地组件且继续等待完整启动', async () => {
+    application.overlay.value = true
+    application.snapshot.value = { state: 'starting', startup_complete: false, core_available: false,
+      total_components: 9, completed_components: 3,
+      components: [{ id: 'asr', name: 'ASR（语音识别）', state: 'starting', phase: '加载语音识别模型' },
+        { id: 'dsh', name: 'DSH（代理执行宿主）', state: 'waiting', phase: '等待启动' }] } as ApplicationSnapshot
+    application.inspect.mockImplementationOnce(() => { application.inspecting.value = true; application.overlay.value = false })
+    const wrapper = render(ProductApp)
+    const loading = wrapper.get('.application-startup')
+    expect(loading.text()).toContain('应用启动中')
+    expect(loading.text()).toContain('正在启动语音识别')
+    expect(loading.find('ul').exists()).toBe(false)
+    expect(loading.text()).not.toContain('已耗时')
+    await loading.get('button').trigger('click')
+    expect(wrapper.find('.application-startup').exists()).toBe(false)
+    expect(wrapper.get('.local-components').text()).toContain('本地组件')
+    expect(wrapper.get('[data-component="paraformer"]').text()).toContain('加载语音识别模型')
+    expect(wrapper.get('[data-component="dsh"]').text()).toContain('等待启动')
+    expect(application.snapshot.value.startup_complete).toBe(false)
+  })
+
+  it('语音接口已连接但代理仍启动时，设置可访问，语音开始、重置和模式切换仍受保护', async () => {
+    const { value } = liveControls()
+    allowBusinessReady(value)
+    application.snapshot.value = { state: 'starting', startup_complete: false, core_available: true,
+      components: [{ id: 'voice', name: '语音服务', state: 'ready' }, { id: 'dsh', name: '代理服务', state: 'starting' }] } as ApplicationSnapshot
+    const start = vi.spyOn(value.voice, 'toggleListening')
+    const reset = vi.spyOn(value.voice, 'resetSession')
+    const mode = vi.spyOn(value.voice, 'setReasoningMode')
+    const enrollment = vi.spyOn(productApi, 'startSpeakerEnrollment')
+    const speakerTest = vi.spyOn(productApi, 'captureSpeakerTest')
+    expect(value.workbenchModel.value.disabled).toBe(true)
+    expect(value.workbenchModel.value.action).toBe('组件启动中')
+    value.runtimeAction(); value.resetSession(); value.setReasoningMode('deep')
+    expect(start).not.toHaveBeenCalled(); expect(reset).not.toHaveBeenCalled(); expect(mode).not.toHaveBeenCalled()
+    await value.beginSpeakerRecording(0, '第一段'); await value.beginSpeakerTest()
+    expect(enrollment).not.toHaveBeenCalled(); expect(speakerTest).not.toHaveBeenCalled()
+    value.showApplicationSystem()
+    expect(value.activeSettingsTab.value).toBe('compute')
+    application.snapshot.value = { ...application.snapshot.value, startup_complete: true, state: 'ready' }
+    await flushPromises()
+    expect(value.workbenchModel.value.action).toBe('开始语音会话')
+  })
   it('固定供应商密钥只提交输入字段，失败保留草稿，成功清空输入', async () => {
     vi.spyOn(productApi, 'fixedCredentials').mockResolvedValue({ providers: { deepseek: { configured: true }, minimax: { configured: true } }, vault_available: true })
     const save = vi.spyOn(productApi, 'saveFixedCredentials').mockRejectedValueOnce(new Error('保存失败'))

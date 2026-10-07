@@ -6,10 +6,12 @@
     <meta name="theme-color" content="#0a1020" />
     <link rel="icon" type="image/svg+xml" href="/src/assets/app-icon.svg" />
     <link rel="alternate icon" href="/src/assets/favicon.ico" />
+    <link rel="stylesheet" href="../desktop/boot/startup.css" />
+    <style>html,body{margin:0;background:#0e1118}</style>
     <title>Voice Terminal · 视觉展示</title>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app"><section class="startup-screen" role="status"><div class="startup-content"><img class="startup-icon" src="../desktop/boot/app-icon.svg" alt="语音终端" width="72" height="72"><h1 class="startup-title">应用启动中</h1><p class="startup-status">正在加载应用界面</p><div class="startup-progress" data-indeterminate="true" role="progressbar" aria-label="应用启动进度"><span class="startup-progress-fill"></span></div><div class="startup-actions"><button class="startup-button" type="button" onclick="document.getElementById('app').dataset.startupSkipped='true';this.disabled=true;this.textContent='正在打开界面';window.__TAURI_INTERNALS__?.invoke('skip_startup').catch(()=>{})">跳过</button></div></div></section></div>
     <script type="module" src="/src/ui-demo/main.ts"></script>
   </body>
 </html>

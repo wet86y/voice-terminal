@@ -1,4 +1,16 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Voice Terminal · 语音终端</title><link rel="icon" type="image/svg+xml" href="app-icon.svg">
-<style>html{color-scheme:dark;background:#0e1118;color:#edf0f7;font:15px/1.7 system-ui}body{margin:0;display:grid;place-items:center;height:100vh}main{width:min(540px,80vw)}small{color:#929baf}h1{font-size:30px;letter-spacing:-1px}pre{white-space:pre-wrap;color:#eeadb8;font:inherit}button{background:#b2baff;color:#101222;border:0;border-radius:12px;padding:12px 20px;cursor:pointer}.symbol{display:block;width:64px;height:64px;margin-bottom:16px}</style>
-<main><img class="symbol" src="app-icon.svg" alt="" width="64" height="64"><small id="mode">桌面宿主启动中</small><h1 id="title">正在建立桌面工作台</h1><p id="message">窗口已就绪，正在等待本机页面。</p><pre id="error"></pre><button id="exit" hidden>退出应用</button></main>
-<script>const invoke=(name,args)=>window.__TAURI__.core.invoke(name,args);async function refresh(){try{const state=await invoke('desktop_status');const mode=state.frontend_mode==='ui-preview'?'桌面样例':'产品工作台';document.getElementById('mode').textContent=mode+' · '+(state.development?'调试构建':'正式构建');if(state.error){document.getElementById('title').textContent='启动需要处理';document.getElementById('message').textContent=state.frontend_mode==='ui-preview'?'请检查 Node（脚本运行时）、5174 端口及样例服务日志。':'请检查产品运行环境与服务入口日志。';document.getElementById('error').textContent=state.error;document.getElementById('exit').hidden=false;return;}if(!state.ready)setTimeout(refresh,300);}catch(error){document.getElementById('error').textContent=String(error);}}document.getElementById('exit').onclick=()=>invoke('exit_application');refresh();</script></html>
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Voice Terminal · 语音终端</title><link rel="icon" type="image/svg+xml" href="app-icon.svg"><link rel="stylesheet" href="startup.css"><style>html,body{margin:0;background:#0e1118}</style></head>
+<body><main class="startup-screen" role="status"><section class="startup-content">
+<img class="startup-icon" src="app-icon.svg" alt="语音终端" width="72" height="72">
+<h1 class="startup-title" id="title">应用启动中</h1>
+<p class="startup-status" id="message" aria-live="polite">正在启动界面服务</p>
+<div class="startup-progress" id="progress" data-indeterminate="true" role="progressbar" aria-label="应用启动进度"><span class="startup-progress-fill"></span></div>
+<div class="startup-actions"><button class="startup-button" id="skip" type="button">跳过</button><button class="startup-button" id="exit" type="button" hidden>退出应用</button></div>
+</section></main><script>
+const invoke=(name)=>window.__TAURI__.core.invoke(name);
+const title=document.getElementById('title'),message=document.getElementById('message'),skip=document.getElementById('skip'),exit=document.getElementById('exit');
+function showError(error){title.textContent='启动遇到问题';message.textContent=String(error);message.classList.add('is-error');document.getElementById('progress').hidden=true;skip.hidden=true;exit.hidden=false;}
+async function refresh(){try{const state=await invoke('desktop_status');if(state.error){showError(state.error);return;}if(state.startup_skipped){skip.disabled=true;skip.textContent='正在打开设置';}if(!state.ready)setTimeout(refresh,300);}catch(error){showError(error);}}
+skip.onclick=async()=>{skip.disabled=true;try{await invoke('skip_startup');skip.textContent='正在打开设置';}catch(error){skip.disabled=false;showError(error);}};
+exit.onclick=()=>invoke('exit_application');refresh();
+</script></body></html>

@@ -14,7 +14,7 @@ function localSources(entry: string, visited = new Map<string, string>()) {
   const imports = source.matchAll(/(?:\bfrom\s*|\bimport\s*|@import\s*)['"](\.[^'"]+)['"]|\bimport\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g)
   for (const match of imports) {
     const path = resolve(dirname(entry), match[1] || match[2])
-    localSources(/\.(?:ts|vue|css)$/.test(path) ? path : `${path}.ts`, visited)
+    localSources(/\.(?:ts|vue|css|svg)$/.test(path) ? path : `${path}.ts`, visited)
   }
   return visited
 }

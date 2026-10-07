@@ -24,6 +24,7 @@ class ApplicationState:
             "state": "starting", "phase": "建立应用入口", "started_at": time.time(),
             "startup_complete": False, "core_available": False, "stopping": False,
             "voice_api_url": "", "voice_ws_url": "", "capabilities": {},
+            "voice_api_ready": False,  # voice_api_ready（轻量业务接口已监听，独立于模型与会话就绪）。
             "sampled_at": None, "total_memory_rss_bytes": None,
             "total_memory_private_commit_bytes": None,  # 去重后的受管进程私有提交内存（字节）。
             "total_gpu_dedicated_bytes": None,  # total_gpu_dedicated_bytes（受管进程专用显存字节总量）。
