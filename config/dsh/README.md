@@ -1,11 +1,16 @@
 # 项目 DSH 基线
 
-Voice Terminal 本次选定的 DeepSeek Harness（DSH，代理执行宿主）目标版本为官方 npm `latest`
-（默认发行通道）指向的预发布版 `dsh-v0.2.0-rc.2`，提交号为
+Voice Terminal 选定的 DeepSeek Harness（DSH，代理执行宿主）目标版本为预发布版
+`dsh-v0.2.0-rc.2`，提交号为
 `639ed015397290b3745d163aafe02ffee4aa3f84`。这不是稳定版；升级必须显式更新锁定文件、许可证快照和回归检查，
-不追踪浮动版本。该版本于 2026-10-05 完成首次源码及便携桌面部署，并完成共存修复部署。Bridge（桥接插件）、Wake Tasks
-（唤醒任务插件）和 Shadow preset（影子代理预设功能包）均为 0.1.1，Bridge protocol（桥接协议）为 2.0。
-当前便携应用位于 `apps/20261005-dsh-task-coexist`；首次部署目录为 `apps/20261005-dsh020rc2`。DSH component（DSH 组件）标识仍为
+不追踪浮动版本。当前源码将 Bridge（桥接）、Wake Tasks（项目唤醒任务）和 Shadow preset（影子代理预设）合并为
+`@voice-terminal/dsh-plugin`（统一功能包）0.2.0，Bridge protocol（桥接协议）仍为 2.0。组件职责、兼容契约和维护门槛见
+[DSH 插件维护手册](../../docs/dsh-plugin-maintenance.md)。2026-10-07 已完成项目内统一包安装迁移，
+构建记录格式为 6，117 个原有数据文件摘要核对一致；完整结果见[本轮安装与验证](../../docs/dsh-plugin-maintenance.md#2026-10-07-插件合并与项目安装验收)。
+桌面发行目录仍按独立发布流程管理，本轮没有重新发布便携程序。
+
+该宿主版本于 2026-10-05 完成首次源码及便携桌面部署，并完成共存修复部署；当时三个项目功能包均为 0.1.1。
+当次便携应用位于 `apps/20261005-dsh-task-coexist`；首次部署目录为 `apps/20261005-dsh020rc2`。DSH component（DSH 组件）标识为
 `639ed015-e7dd1315c977`；旧组件和两套备份均保留。首次部署的验收范围、任务与会话数据核验见[本机部署验收记录](../../.runtime/dsh-upgrade-20261005/acceptance.md)；共存修复已完成部署并通过[本机验收](../../.runtime/dsh-coexist-20261005/acceptance.md)。
 共存修订细节见[DSH 会话任务与语音链路任务修订文档](../../docs/dsh-task-coexistence.md)。
 
@@ -18,8 +23,8 @@ Bridge（桥接插件）22 passed（通过）；Wake Tasks（唤醒任务插件�
 位于 Git 忽略的 `.runtime/dsh/`；该数据目录与用户级 `~/.dsh` 隔离。升级时保留项目设置和会话数据，
 并按安装脚本流程备份后再启动新版本。
 
-正式 `shadow-agent`（Shadow 执行 Agent）由 `config/dsh/agent-presets/shadow-agent/` 维护。
-安装脚本会把该配置包装成项目本地 `voice-terminal-shadow-preset` Bundle（预设功能包），安装到 Web
+正式 `shadow-agent`（影子执行代理）由 `integrations/dsh/voice-terminal/preset/shadow-agent/` 维护。
+插件构建将该配置合入统一 Bundle（功能包）的组合补丁，安装到 Web
 profile（网页配置），并通过 `agent-preset-registry`（Agent 预设注册器）的 `default`（部署默认预设字段）
 设为默认项。DSH 0.2.0-rc.2 不再读取 DSH_HOME（数据目录）中旧版 `.agent-presets/` 目录；该目录即使为回退保留，也不会注册预设。
 
@@ -28,7 +33,7 @@ profile（网页配置），并通过 `agent-preset-registry`（Agent 预设注�
 直接访问 3081 不带 launch token（临时访问令牌）时不能完成网页授权。不要收藏、记录或分享带
 `?token=` 的完整地址。
 
-`voice-terminal-shadow-bridge`（语音终端插件桥接层）使用 DSH v0.2.0-rc.2 的公开插件接口。
+`voice-terminal-shadow-bridge`（保留的桥接加载行与设置命名空间）使用 DSH v0.2.0-rc.2 的公开插件接口。
 设置页面继续使用 `configForms`（设置表单服务）；旧的 `settingsScope` 接口已移除。页面注册受服务
 生命周期控制，避免服务尚未就绪时插件启动失败。
 

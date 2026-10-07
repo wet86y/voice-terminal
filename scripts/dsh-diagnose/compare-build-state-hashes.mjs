@@ -43,33 +43,19 @@ function treeHash(paths) {
   return createHash('sha256').update(rows.join('\n'), 'utf8').digest('hex')
 }
 
+const source = PLUGIN_DIRS.plugin
+const artifact = BUNDLE_DIRS.plugin
 const expected = {
-  bridge_runtime_artifacts_sha256: treeHash([
-    join(BUNDLE_DIRS.bridge, 'package.json'), join(BUNDLE_DIRS.bridge, 'cordis.patch.yml'),
-    join(BUNDLE_DIRS.bridge, 'lib', 'index.js'), join(BUNDLE_DIRS.bridge, 'lib', 'plugin.js'),
-    join(BUNDLE_DIRS.bridge, 'lib', 'settings.js'), join(BUNDLE_DIRS.bridge, 'lib', 'settings-contract.js'),
-    join(BUNDLE_DIRS.bridge, 'lib', 'generated-prompt.js'), join(BUNDLE_DIRS.bridge, 'lib', 'client.js'),
+  plugin_runtime_artifacts_sha256: treeHash([
+    join(artifact, 'package.json'), join(artifact, 'cordis.patch.yml'), join(artifact, 'components.json'), join(artifact, 'lib'),
   ]),
-  bridge_build_inputs_sha256: treeHash([
-    join(PLUGIN_DIRS.bridge, 'src'), join(PLUGIN_DIRS.bridge, 'package.json'),
-    join(PLUGIN_DIRS.bridge, 'build.mjs'), join(PLUGIN_DIRS.bridge, 'cordis.patch.yml'),
-    join(REPO_ROOT, 'scripts', 'build-dsh-client.mjs'),
+  plugin_build_inputs_sha256: treeHash([
+    join(source, 'src'), join(source, 'preset'), join(source, 'package.json'), join(source, 'components.json'),
+    join(source, 'build.mjs'), join(source, 'check.mjs'), join(source, 'host.patch.yml'), join(source, 'tsconfig.json'),
+    join(source, 'tsconfig.host.json'), join(source, 'tsconfig.client.json'), join(REPO_ROOT, 'scripts/build-dsh-client.mjs'),
   ]),
-  shadow_preset_runtime_artifacts_sha256: treeHash([
-    join(BUNDLE_DIRS.preset, 'package.json'), join(BUNDLE_DIRS.preset, 'cordis.patch.yml'),
-  ]),
-  shadow_preset_build_inputs_sha256: treeHash([PLUGIN_DIRS.preset]),
   shadow_prompt_sha256: treeHash([
-    join(REPO_ROOT, 'config', 'shadow_agent', 'instructions.md'),
-    join(REPO_ROOT, 'config', 'dsh', 'shadow-agent.rules.md'),
-  ]),
-  wake_tasks_runtime_artifacts_sha256: treeHash([
-    join(BUNDLE_DIRS.wakeTasks, 'package.json'), join(BUNDLE_DIRS.wakeTasks, 'cordis.patch.yml'),
-    join(BUNDLE_DIRS.wakeTasks, 'lib', 'index.js'), join(BUNDLE_DIRS.wakeTasks, 'lib', 'plugin.js'),
-  ]),
-  wake_tasks_build_inputs_sha256: treeHash([
-    join(PLUGIN_DIRS.wakeTasks, 'src'), join(PLUGIN_DIRS.wakeTasks, 'package.json'),
-    join(PLUGIN_DIRS.wakeTasks, 'build.mjs'), join(PLUGIN_DIRS.wakeTasks, 'cordis.patch.yml'),
+    join(REPO_ROOT, 'config/shadow_agent/instructions.md'), join(REPO_ROOT, 'config/dsh/shadow-agent.rules.md'),
   ]),
 }
 

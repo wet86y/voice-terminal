@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "description": "组件职责声明：英文标识仅用于代码，中文说明用于维护。安装单位始终为一个功能包。",
+  "components": [
+    {
+      "id": "bridge",
+      "description": "桥接：会话绑定、上下文门禁、工具回执、观察与设置。",
+      "entry": "src/bridge/plugin.ts",
+      "loader_id": "voice-terminal-shadow-bridge",
+      "depends_on": [
+        "shared"
+      ],
+      "runtime_entry": "lib/bridge/plugin.js"
+    },
+    {
+      "id": "wake-tasks",
+      "description": "唤醒任务：项目任务存储、规则、触发与普通事件发布。",
+      "entry": "src/wake-tasks/plugin.ts",
+      "loader_id": "voice-terminal-wake-tasks",
+      "depends_on": [
+        "shared"
+      ],
+      "runtime_entry": "lib/wake-tasks/plugin.js"
+    },
+    {
+      "id": "client",
+      "description": "浏览器：设置页与上下文消息渲染；通过宿主服务注入。",
+      "entry": "src/client/index.ts",
+      "depends_on": [
+        "shared"
+      ],
+      "runtime_entry": "lib/client.js"
+    },
+    {
+      "id": "preset",
+      "description": "代理预设：影子代理的官方工具与能力组合。",
+      "entry": "preset/shadow-agent/agent.cordis.yml",
+      "loader_id": "preset-shadow-agent",
+      "depends_on": [],
+      "runtime_entry": "cordis.patch.yml"
+    },
+    {
+      "id": "shared",
+      "description": "共享：通信、鉴权、协议、稳定标识、生成提示词和设置契约。",
+      "entry": "src/shared/protocol.ts",
+      "depends_on": [],
+      "runtime_entry": "lib/shared/protocol.js"
+    }
+  ]
+}

@@ -1,6 +1,0 @@
-- insert:
-    - id: voice-terminal-shadow-bridge
-      name: '@voice-terminal/dsh-shadow-bridge'
-      config:
-        routePrefix: /api/voice-terminal-shadow/v1
-        maxBodyBytes: 2097152

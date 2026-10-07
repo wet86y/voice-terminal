@@ -1,5 +1,7 @@
 # DSH 插件代码结构与雷区审计（2026-09-27）
 
+当前源码已统一到 `integrations/dsh/voice-terminal/`（项目插件目录），维护规范见[DSH 插件维护手册](dsh-plugin-maintenance.md)。本文保留审计当日的旧目录、版本和事故证据。
+
 对照 DSH `dsh-v0.1.7-rc.2`（commit `477b4f420553e8a52c2fbccc464d7561b239c443`）的官方插件规范，
 审计项目自有插件 `integrations/dsh/voice-terminal-shadow-bridge`（以下简称 Bridge）与
 `integrations/dsh/voice-terminal-wake-tasks`（以下简称 Wake Tasks），并修复其中一个会导致

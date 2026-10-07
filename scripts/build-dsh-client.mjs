@@ -5,10 +5,10 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const bridgeDir = resolve(process.argv[2] ?? resolve(repoRoot, 'integrations/dsh/voice-terminal-shadow-bridge'))
-const artifactDir = resolve(process.argv[3] ?? resolve(repoRoot, '.runtime/dsh/bundles/voice-terminal-shadow-bridge'))
+const bridgeDir = resolve(process.argv[2] ?? resolve(repoRoot, 'integrations/dsh/voice-terminal'))
+const artifactDir = resolve(process.argv[3] ?? resolve(repoRoot, '.runtime/dsh/bundles/voice-terminal'))
 const sourceDir = resolve(process.argv[4] ?? resolve(repoRoot, '.runtime/dsh/source'))
-const stageRoot = resolve(sourceDir, 'packages/client/voice-terminal-shadow-bridge-build')
+const stageRoot = resolve(sourceDir, 'packages/client/voice-terminal-build')
 
 function assertContained(parent, target) {
   const rel = relative(parent, target)
@@ -22,7 +22,7 @@ if (existsSync(stageRoot)) {
   throw new Error(`temporary DSH client build directory already exists; refusing to overwrite it: ${stageRoot}`)
 }
 const manifest = JSON.parse(await readFile(resolve(bridgeDir, 'package.json'), 'utf8'))
-if (manifest.name !== '@voice-terminal/dsh-shadow-bridge') {
+if (manifest.name !== '@voice-terminal/dsh-plugin') {
   throw new Error(`unexpected DSH Bridge package name: ${manifest.name}`)
 }
 
@@ -30,9 +30,13 @@ try {
   await mkdir(stageRoot, { recursive: true })
   await cp(resolve(bridgeDir, 'src'), resolve(stageRoot, 'src'), { recursive: true })
   await copyFile(resolve(bridgeDir, 'package.json'), resolve(stageRoot, 'package.json'))
+  // 官方 hostPhase（宿主构建阶段）也读取宿主入口；生成值须在临时源码内可用。
+  for (const name of ['version', 'generated-prompt']) {
+    await copyFile(resolve(artifactDir, `lib/shared/${name}.js`), resolve(stageRoot, `src/shared/${name}.ts`))
+  }
   await writeFile(resolve(stageRoot, 'tsdown.config.ts'), [
     "import { clientBundle } from '../tsdown.client.ts'",
-    "export default clientBundle('@voice-terminal/dsh-shadow-bridge', ['src/index.ts'], { hostPhase: true })",
+    `export default clientBundle(${JSON.stringify(manifest.name)}, ['src/bridge/plugin.ts'], { hostPhase: true })`,
     '',
   ].join('\n'), 'utf8')
 

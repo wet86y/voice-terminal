@@ -17,8 +17,8 @@ DSH Session Schedule（会话定时任务）和 Voice Terminal Wake Tasks（语�
 
 ## 实施修订
 
-- [项目唤醒任务插件注册入口](../integrations/dsh/voice-terminal-wake-tasks/src/index.ts)：将项目 CRUD 工具更名为 `wake_task_*`，保留其他语音事件工具及全部根会话挂载行为。未保留旧项目 CRUD 别名，因为它们会再次占用官方工具名。
-- [项目任务服务](../integrations/dsh/voice-terminal-wake-tasks/src/task-service.ts)：删除官方 `schedule.json` 到项目任务表的导入逻辑。项目服务继续读取和迁移旧 Voice `wake-tasks.json`（旧语音链路任务文件），并原样恢复已有项目任务及历史。
+- [项目唤醒任务组件注册入口](../integrations/dsh/voice-terminal/src/wake-tasks/index.ts)：将项目 CRUD（增删改查）工具更名为 `wake_task_*`（项目任务工具），保留其他语音事件工具及全部根会话挂载行为。未保留旧项目工具别名，因为它们会再次占用官方工具名。
+- [项目任务服务](../integrations/dsh/voice-terminal/src/wake-tasks/task-service.ts)：删除官方 `schedule.json`（原生任务文件）到项目任务表的导入逻辑。项目服务继续读取和迁移旧 Voice `wake-tasks.json`（旧语音链路任务文件），并原样恢复已有项目任务及历史。
 - [DSH profile 生成与运行时](../voice_terminal/dsh/profile.py) 和 [运行管理器](../voice_terminal/dsh/runtime.py)：保留 profile package（配置清单）中用户选择的官方及其他可选 Bundle（功能包），同时更新受管插件版本；根据官方 Bundle 选择维护补丁，不再因官方功能启用而拒绝启动。
 - [安装、构建及迁移脚本](../scripts/setup-dsh.ps1)、[发行 profile 初始化](../scripts/check-dsh-wake-migration.mjs)：移除原先把两类任务合并的迁移检查；仅保留旧 Voice 项目任务迁移。官方任务存储不作为项目导入来源。
 - [便携桌面组装脚本](../scripts/assemble-desktop.py)：保留停机刷新、组件校验和提交失败恢复行为，部署新的程序目录，同时复用已验证的 DSH 组件。
@@ -29,7 +29,7 @@ DSH Session Schedule（会话定时任务）和 Voice Terminal Wake Tasks（语�
 
 ## 部署组合与兼容边界
 
-本次延续已选定的 DSH `dsh-v0.2.0-rc.2`（候选版），提交号 `639ed015397290b3745d163aafe02ffee4aa3f84`。桥接、唤醒任务和影子预设功能包仍为 `0.1.1`，Bridge（桥接协议）仍为 `2.0`。
+本次共存修订使用 DSH `dsh-v0.2.0-rc.2`（候选版），提交号 `639ed015397290b3745d163aafe02ffee4aa3f84`，当次桥接、唤醒任务和影子预设功能包为 `0.1.1`，Bridge（桥接协议）为 `2.0`。后续三个功能包已在源码层合并为 `@voice-terminal/dsh-plugin`（统一功能包）`0.2.0`，本页共存行为保持，维护入口见[DSH 插件维护手册](dsh-plugin-maintenance.md)。
 
 便携应用为 `.runtime/delivery/VoiceTerminal/apps/20261005-dsh-task-coexist/VoiceTerminalDesktop.exe`（本机桌面程序）；DSH 组件仍为 `runtimes/dsh/639ed015-e7dd1315c977`。官方 DSH 组件与依赖闭包没有改版重建。本次重建项目包后刷新桌面程序及组件选择清单，正常退出并重启；第二次启动中桌面、DSH 宿主、官方功能选择、插件状态和桥接健康检查均通过。Node.js（脚本运行环境）实际版本为 `24.19.0`。
 

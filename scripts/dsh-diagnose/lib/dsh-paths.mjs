@@ -35,18 +35,15 @@ export const SESSION_MAPPINGS = join(DSH_ROOT, 'session-mappings.json')
 /** Project DSH build audit file. */
 export const BUILD_STATE = join(DSH_ROOT, 'build-state.json')
 
-/** Artifact directories of the three project-owned bundles. */
-export const BUNDLE_DIRS = {
-  bridge: join(DSH_ROOT, 'bundles', 'voice-terminal-shadow-bridge'),
-  preset: join(DSH_ROOT, 'bundles', 'voice-terminal-shadow-preset'),
-  wakeTasks: join(DSH_ROOT, 'bundles', 'voice-terminal-wake-tasks'),
-}
-
-/** Source directories of the two project-owned plugins. */
+// 单一安装产物；组件别名只用于兼容现有诊断调用。
+export const PLUGIN_BUNDLE = join(DSH_ROOT, 'bundles', 'voice-terminal')
+export const PLUGIN_SOURCE = join(REPO_ROOT, 'integrations', 'dsh', 'voice-terminal')
+export const BUNDLE_DIRS = { plugin: PLUGIN_BUNDLE, bridge: PLUGIN_BUNDLE, wakeTasks: PLUGIN_BUNDLE, preset: PLUGIN_BUNDLE }
 export const PLUGIN_DIRS = {
-  bridge: join(REPO_ROOT, 'integrations', 'dsh', 'voice-terminal-shadow-bridge'),
-  wakeTasks: join(REPO_ROOT, 'integrations', 'dsh', 'voice-terminal-wake-tasks'),
-  preset: join(REPO_ROOT, 'config', 'dsh', 'agent-presets', 'shadow-agent'),
+  plugin: PLUGIN_SOURCE,
+  bridge: join(PLUGIN_SOURCE, 'src/bridge'),
+  wakeTasks: join(PLUGIN_SOURCE, 'src/wake-tasks'),
+  preset: join(PLUGIN_SOURCE, 'preset/shadow-agent'),
 }
 
 let cachedDecoder
