@@ -787,7 +787,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         return False
 
     async def _notify_playback_completed(self, h):
-        """Notify Agent at the player-drained boundary, before append wait."""
+        """在播放器输出完成时通知 Agent（代理），先于历史结算。"""
 
         if h.reason or h.workspace.timings.get("playback_completion_notified"):
             return
@@ -889,9 +889,8 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
             provider_missing = h.tts_client is None and (self.tts is None or hasattr(self.tts, "bind"))
             if self.state.current.get("tts_status") == "DEGRADED" or provider_missing or self.player is None:
                 h.reason = "failed"
-            # The player has confirmed that its local PCM queue and device
-            # tail are drained.  Freeze that fact before the append window can
-            # admit another input/output generation and overwrite player state.
+            # PCM（原始音频采样）队列及设备尾部已经输出完毕。
+            # 在交接前冻结播放快照，防止下一代输出覆盖上一句的送达事实。
             if not h.reason and h.snapshot is None and self.player is not None:
                 h.snapshot = self.player.stop_and_snapshot(h.workspace.playback_key)
                 h.workspace.timings["playback_snapshot_frozen"] = time.monotonic()
@@ -908,26 +907,9 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
             # A same-prefix successor may be released only when this handle
             # was still the active generation at the cleanup boundary.
             was_active = self.handle is h
-            # The provider generation and local PCM are now drained, but a
-            # refined ASR decision often arrives immediately afterwards.
-            # Retain the logical speech briefly so a verified suffix can wait
-            # behind this handle instead of becoming a replacement.  This is
-            # internal bookkeeping only: the listener never waits for silence
-            # before hearing already available audio.
-            if not h.reason and self.handle is h:
-                opened_at = time.monotonic()
-                h.workspace.timings["append_window_opened"] = opened_at
-                await self._emit_handle_progress(h, "append_window_opened", wait_ms=1000)
-                try:
-                    await asyncio.sleep(1.0)
-                except asyncio.CancelledError:
-                    h.reason = h.reason or "stopped"
-                finally:
-                    h.workspace.timings["append_window_wait_ms"] = round(
-                        (time.monotonic() - opened_at) * 1000
-                    )
-                    await self._emit_handle_progress(h, "append_window_expired",
-                                                     wait_ms=h.workspace.timings["append_window_wait_ms"])
+            # 播放完成后立即结算，已排队的续句无需等待固定宽限期。
+            # delivered（已送达文字边界）与 last_completed_speech（最近完成语音）
+            # 会在释放旧句柄前保存，迟到的续句仍可剥离已播放前缀。
             # Session ownership is transaction-scoped.  At this point
             # ``self._tts_session`` may already belong to a replacement.
             session = h.tts_session
