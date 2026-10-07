@@ -88,7 +88,7 @@ class ApplicationRuntimeMixin:
             "dsh": {"state": dsh_state, "enabled": enabled, "phase": "桥接已就绪，等待语音会话绑定" if binding_pending else dsh.message or ("桥接就绪" if dsh_state == "ready" else "等待启动"),
                 "error": binding_error or dsh.message if dsh_state == "failed" else "", "pid": process.pid if process and process.returncode is None else None},
             "speaker": {"state": speaker_state, "enabled": speaker_enabled or speaker_process is not None,
-                "phase": "声纹连接已就绪" if speaker_state == "ready" else "按配置停用" if speaker_state == "disabled" else "声纹工作进程不可用",
+                "phase": "声纹连接已就绪" if speaker_state == "ready" else "按配置停用" if speaker_state == "disabled" else "加载声纹工作进程" if speaker_state == "starting" else "声纹工作进程不可用",
                 "error": str(speaker_service.get("last_error") or "") if speaker_state == "failed" else "",
                 "pid": speaker_process.pid if speaker_process and speaker_process.returncode is None else None},
         }

@@ -104,7 +104,8 @@ export interface ProductComputeStatus {
     }
     models: Record<ProductLocalModelId, { gpu_available: boolean; reason: string | null }>
   }
-  models: Record<ProductLocalModelId, ProductComputeModelStatus>
+  /** models（模型采样）：所属进程切换状态时，暂时移除旧采样，等待重新读取。 */
+  models: Partial<Record<ProductLocalModelId, ProductComputeModelStatus>>
 }
 
 export interface ProductRuntimeSnapshot {

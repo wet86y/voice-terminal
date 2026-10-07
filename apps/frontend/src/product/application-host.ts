@@ -247,6 +247,8 @@ async function post(path: string) {
     const value = await response.json().catch(() => ({})) as { error?: string }
     throw new Error(value.error || '应用操作失败')
   }
+  // 已发送的旧状态请求可以完成，操作后的确认必须重新读取，避免把重试误判为仍然失败。
+  if (refreshRequest) await refreshRequest
   await refresh()
 }
 

@@ -72,8 +72,8 @@ function invalidDevice(row: LocalComponentRow) {
             </dl>
             <p v-if="row.error && !row.busy" class="local-error">{{ row.error }}</p>
           </div>
-          <button class="local-component-action" :class="{ 'retry-action': !row.available }" type="button" :disabled="row.busy || (!row.available && !row.retryable)" :aria-label="`${row.name}：${row.available ? expanded.has(row.id) ? '收起详情' : '详情' : '重试'}`" :aria-expanded="row.available ? expanded.has(row.id) : undefined" :aria-controls="row.available ? `local-detail-${row.id}` : undefined" @click="activate(row)">
-            {{ row.available ? expanded.has(row.id) ? '收起' : '详情' : '重试' }}
+          <button class="local-component-action" :class="{ 'retry-action': row.state === 'failed' }" type="button" :disabled="row.busy || row.state === 'loading' || (!row.available && !row.retryable)" :aria-label="`${row.name}：${row.state === 'loading' ? row.status : row.available ? expanded.has(row.id) ? '收起详情' : '详情' : row.state === 'disabled' ? '已停用' : '重试'}`" :aria-expanded="row.available ? expanded.has(row.id) : undefined" :aria-controls="row.available ? `local-detail-${row.id}` : undefined" @click="activate(row)">
+            {{ row.state === 'loading' ? row.status : row.available ? expanded.has(row.id) ? '收起' : '详情' : row.state === 'disabled' ? '已停用' : '重试' }}
             <svg v-if="row.available" viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expanded.has(row.id) }"><path d="m6 9 6 6 6-6" /></svg>
           </button>
         </div>
