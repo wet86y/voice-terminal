@@ -50,6 +50,8 @@ export interface ProductComputeModelStatus {
 }
 
 export interface ResourceProcessStatus {
+  /** gpu_dedicated_bytes（所在进程专用显存字节）：未知时为空。 */
+  gpu_dedicated_bytes?: number | null
   /** pid（进程标识）与 created_at（创建时间）共同确认身份。 */
   pid: number
   created_at: number
@@ -64,6 +66,8 @@ export interface ResourceProcessStatus {
 }
 
 export interface ResourceStatus {
+  /** gpu_dedicated_bytes（按进程去重的专用显存总量）。 */
+  gpu_dedicated_bytes?: number | null
   /** complete（采样覆盖完整）及 missing_roles（缺失的活动角色）；旧工作进程可能不提供资源指标。 */
   complete: boolean
   missing_roles: string[]
@@ -93,6 +97,8 @@ export interface ProductComputeStatus {
     backends: {
       pytorch_cuda: boolean
       onnxruntime_providers: string[]
+      /** onnxruntime_cuda_verified（模型推理运行时的实际显卡计算检查是否通过）。 */
+      onnxruntime_cuda_verified?: boolean
       sherpa_onnx_version: string | null
       sherpa_onnx_cuda: boolean
     }

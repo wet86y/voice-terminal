@@ -1596,13 +1596,14 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         finally:
             await probe.close()
 
-    async def compute_status(self) -> dict[str, Any]:
+    async def compute_status(self, *, refresh_capabilities: bool = False) -> dict[str, Any]:
         """读取设备能力、模型实际设备和工作进程常驻内存。"""
         from ..resources import process_resource_status, aggregate_resource_status
-        from ..compute import accept_hardware_capabilities
+        from ..compute import model_hardware_status
         resource_rows = [process_resource_status()]
         missing_resource_roles = set()
-        hardware = await asyncio.to_thread(hardware_status)
+        hardware = await asyncio.to_thread(hardware_status, refresh=True) if refresh_capabilities else await asyncio.to_thread(hardware_status)
+        hardware = model_hardware_status(hardware, self.config)
         requests = self.config.compute.devices
         models: dict[str, dict[str, Any]] = {
             name: {
@@ -1631,9 +1632,6 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                     resource_rows.append(status["resource_status"])
                 else:
                     missing_resource_roles.add("asr")
-                if isinstance(status.get("hardware_capabilities"), dict):
-                    accept_hardware_capabilities(status["hardware_capabilities"])
-                    hardware = status["hardware_capabilities"]
                 models["paraformer"].update({
                     "resource_status": status.get("resource_status"),
                     "runtime": status.get("runtime"),

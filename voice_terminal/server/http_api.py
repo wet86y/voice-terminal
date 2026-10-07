@@ -441,8 +441,14 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
 
     @app.delete("/api/v1/wake-tasks/{task_id}")
     async def delete_wake_task(task_id: str) -> dict[str, bool]:
-        await dsh_task_api("DELETE", f"tasks/{quote(task_id, safe='')}")
+        result = await dsh_task_api("DELETE", f"tasks/{quote(task_id, safe='')}/archive")
+        if result.get("deleted") is not True:
+            raise HTTPException(status_code=409, detail="插件未确认归档删除，请刷新后重试。")
         return {"deleted": True}
+
+    @app.post("/api/v1/wake-tasks/{task_id}/cancel")
+    async def cancel_wake_task(task_id: str) -> dict[str, Any]:
+        return await dsh_task_api("DELETE", f"tasks/{quote(task_id, safe='')}")
 
     def product_store_or_404() -> ProductSettingsStore:
         if product_settings is None:
@@ -450,8 +456,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         return product_settings
 
     @app.get("/api/v1/product/compute-status")
-    async def get_product_compute_status() -> dict[str, Any]:
-        return await runtime.compute_status()
+    async def get_product_compute_status(refresh: bool = False) -> dict[str, Any]:
+        return await runtime.compute_status(refresh_capabilities=True) if refresh else await runtime.compute_status()
 
     @app.put("/api/v1/product/settings/compute")
     async def update_product_compute(body: dict[str, Any]) -> dict[str, Any]:
@@ -462,7 +468,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             # Resolve through the historical module so existing diagnostics
             # and test hooks observe the same hardware probe.
             from . import websocket as session_module
-            hardware = session_module.hardware_status()
+            from ..compute import model_hardware_status
+            hardware = model_hardware_status(session_module.hardware_status(), runtime.config)
             for name, mode in body["devices"].items():
                 if mode == "cuda" and not hardware.get("models", {}).get(name, {}).get("gpu_available"):
                     reason = hardware.get("models", {}).get(name, {}).get("reason") or "GPU 后端不可用。"

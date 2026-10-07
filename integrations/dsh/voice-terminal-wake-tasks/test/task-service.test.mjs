@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, writeFileSync, unlinkSync, rmdirSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync, unlinkSync, rmdirSync, renameSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -9,9 +9,11 @@ const repo = resolve(fileURLToPath(new URL('../../../../', import.meta.url)))
 const temporary = mkdtempSync(join(tmpdir(), 'voice-dsh-task-test-'))
 const store = join(temporary, 'tasks.json')
 const native = join(temporary, 'schedule.json')
+const legacy = join(temporary, 'legacy.json')
 process.env.VOICE_DSH_SCHEDULE_MODULE = join(repo, '.runtime/dsh/source/packages/schedule/schedule/lib/index.js')
 process.env.VOICE_DSH_TASKS_PATH = store
 process.env.VOICE_DSH_NATIVE_SCHEDULE_PATH = native
+process.env.VOICE_DSH_LEGACY_WAKE_PATH = legacy
 process.env.VOICE_DSH_CALLBACK_ORIGIN = 'http://127.0.0.1:8765'
 process.env.VOICE_DSH_BRIDGE_TOKEN = 'test-token'
 
@@ -74,10 +76,40 @@ test('preserves project history, keeps native tasks separate, and delivers to th
     assert.equal(readFileSync(native, 'utf8'), nativeContent, '官方会话任务文件保持独立且未改动')
     assert.equal(service.list().find(row => row.task_id === created.task_id).delivery_history[0].dshSessionId,
       'voice-shadow-current')
+    await assert.rejects(service.removeArchive(daily.task_id), /先取消/u)
+    assert.equal(service.list().find(row => row.task_id === daily.task_id).status, 'pending')
+    const beforeFailure = readFileSync(store, 'utf8')
+    renameSync(store, `${store}.backup`)
+    mkdirSync(store) // 用目录模拟持久化失败；不能先报成功或丢失内存中的任务。
+    try {
+      await assert.rejects(service.removeArchive('schedule-old'))
+      assert.equal(service.list().find(row => row.task_id === 'schedule-old').status, 'archived')
+      assert.equal(readFileSync(`${store}.backup`, 'utf8'), beforeFailure)
+    } finally { rmdirSync(store); renameSync(`${store}.backup`, store) }
+    writeFileSync(legacy, JSON.stringify({ tasks: { 'legacy-cancelled': {
+      text: '旧存储取消任务', scheduled_at: 1700000000, status: 'cancelled',
+    } } }), 'utf8')
+    await service.close()
+    service = new TaskService()
+    assert.equal(service.list().some(row => row.task_id === 'legacy-cancelled'), true)
+    await service.removeArchive('legacy-cancelled')
+    await service.removeArchive('schedule-old')
+    assert.deepEqual(await service.removeArchive('schedule-old'), { task_id: 'schedule-old', deleted: true })
+    await service.cancel(daily.task_id)
+    assert.equal(service.list().find(row => row.task_id === daily.task_id).status, 'cancelled')
+    await service.removeArchive(daily.task_id)
+    await service.close()
+    service = new TaskService()
+    for (const id of ['legacy-cancelled', 'schedule-old', daily.task_id]) {
+      assert.equal(service.list().some(row => row.task_id === id), false, '重启或旧存储导入不能恢复已删除的归档')
+      assert.equal(JSON.parse(readFileSync(store, 'utf8')).deleted_task_ids.includes(id), true)
+    }
+    assert.equal(service.list().some(row => row.task_id === created.task_id), true, '保留未删除的交付历史')
+    assert.equal(readFileSync(native, 'utf8'), nativeContent, '归档删除不修改官方会话任务')
   } finally {
     if (service) await service.close()
     globalThis.fetch = originalFetch
-    for (const path of [store, native]) {
+    for (const path of [store, native, legacy]) {
       try { unlinkSync(path) } catch (error) { if (error?.code !== 'ENOENT') throw error }
     }
     rmdirSync(temporary)

@@ -335,10 +335,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     return snapshotRequest
   }
 
-  async function refreshComputeStatus() {
+  async function refreshComputeStatus(refreshCapabilities = false) {
     if (!application.businessReady.value) return
     try {
-      computeStatus.value = await productApi.computeStatus()
+      computeStatus.value = await productApi.computeStatus(refreshCapabilities)
     } catch (error) {
       setError(error)
     }
@@ -459,11 +459,15 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (saving.value) return
     saving.value = true
     try {
-      await productApi.deleteWakeTask(task.task_id)
+      if (task.status === 'pending') await productApi.cancelWakeTask(task.task_id)
+      else {
+        const result = await productApi.deleteWakeTask(task.task_id)
+        if (result.deleted !== true) throw new Error('归档删除未成功，请刷新后重试。')
+      }
       wakeTasks.value = wakeTasks.value.filter(item => item.task_id !== task.task_id)
       if (editingWakeTaskId.value === task.task_id) editingWakeTaskId.value = ''
       await refreshWakeTasks()
-      setNotice(task.status === 'pending' ? '唤醒任务已取消并移除。' : '归档任务已移除。')
+      setNotice(task.status === 'pending' ? '唤醒任务已取消，记录保存在归档中。' : '归档任务已删除。')
     } catch (error) { setError(error) }
     finally { saving.value = false }
   }

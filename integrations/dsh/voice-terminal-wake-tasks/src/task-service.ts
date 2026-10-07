@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs'
+import { readFileSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -87,6 +87,7 @@ export async function voiceApi(path: string, method: string, body?: unknown): Pr
 
 export class TaskService {
   private rows = new Map<string, Row>()
+  private deletedIds = new Set<string>() // deletedIds（已删除任务标识）：防止旧存储再次导入。
   private timer: ReturnType<typeof setTimeout> | undefined
   private chain: Promise<unknown> = Promise.resolve()
   private closed = false
@@ -96,7 +97,10 @@ export class TaskService {
     const stored = readJson(STORE_PATH)
     if (stored !== undefined) {
       if (stored.schema_version !== 1 || !Array.isArray(stored.tasks)) throw new Error('DSH 任务存储文件格式无效。')
+      if (stored.deleted_task_ids !== undefined && (!Array.isArray(stored.deleted_task_ids) || stored.deleted_task_ids.some((id: unknown) => typeof id !== 'string'))) throw new Error('已删除任务记录格式无效。')
+      this.deletedIds = new Set(stored.deleted_task_ids ?? [])
       for (const row of stored.tasks) {
+        if (this.deletedIds.has(row.task_id)) continue
         row.record = decodeScheduleRecord(row.record)
         this.rows.set(row.task_id, row)
       }
@@ -114,7 +118,7 @@ export class TaskService {
     const oldRows = legacy?.tasks
     if (oldRows !== undefined && (typeof oldRows !== 'object' || Array.isArray(oldRows))) throw new Error('旧 Voice 任务文件格式无效。')
     for (const [id, value] of Object.entries(oldRows ?? {})) {
-      if (this.rows.has(id)) continue
+      if (this.rows.has(id) || this.deletedIds.has(id)) continue
       const task: any = value
       const due = Number(task.scheduled_at)
       if (!Number.isFinite(due) || !String(task.text ?? '').trim()) throw new Error(`旧任务 ${id} 无法转换。`)
@@ -140,8 +144,13 @@ export class TaskService {
   private save(): void {
     mkdirSync(dirname(STORE_PATH), { recursive: true })
     const temporary = `${STORE_PATH}.${randomUUID()}.tmp`
-    writeFileSync(temporary, JSON.stringify({ schema_version: 1, tasks: [...this.rows.values()] }, null, 2), 'utf8')
-    renameSync(temporary, STORE_PATH)
+    try {
+      writeFileSync(temporary, JSON.stringify({ schema_version: 1, tasks: [...this.rows.values()], deleted_task_ids: [...this.deletedIds] }, null, 2), 'utf8')
+      renameSync(temporary, STORE_PATH)
+    } catch (error) {
+      try { unlinkSync(temporary) } catch { /* temporary（临时存储）可能尚未创建。 */ }
+      throw error
+    }
   }
 
   private serialized<T>(work: () => Promise<T> | T): Promise<T> {
@@ -232,6 +241,25 @@ export class TaskService {
       row.status = 'cancelled'; row.updated_at = new Date().toISOString()
       this.save(); this.arm()
       return this.view(row)
+    })
+  }
+
+  removeArchive(id: string): Promise<{ task_id: string; deleted: true }> {
+    return this.serialized(() => {
+      const row = this.rows.get(id)
+      if (row?.status === 'pending') throw new Error('待执行任务请先取消，再删除归档记录。')
+      if (!row && this.deletedIds.has(id)) return { task_id: id, deleted: true }
+      if (!row) throw new Error('任务不存在。')
+      this.rows.delete(id)
+      this.deletedIds.add(id)
+      try { this.save() }
+      catch (error) {
+        this.rows.set(id, row)
+        this.deletedIds.delete(id)
+        throw error
+      }
+      this.arm()
+      return { task_id: id, deleted: true }
     })
   }
 

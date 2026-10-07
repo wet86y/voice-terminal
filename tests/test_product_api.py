@@ -129,6 +129,21 @@ class ProductApiTests(unittest.TestCase):
             "cpu",
         )
 
+    def test_compute_refresh_requests_new_environment_check(self) -> None:
+        with patch.object(self.runtime, "compute_status", new=AsyncMock(return_value={"models": {}, "hardware": {}})) as probe:
+            response = asyncio.run(self._request("GET", "/api/v1/product/compute-status?refresh=true"))
+        self.assertEqual(response.status_code, 200)
+        probe.assert_awaited_once_with(refresh_capabilities=True)
+
+    def test_compute_rejects_gpu_when_framework_exists_but_model_file_is_missing(self) -> None:
+        devices = {name: "cuda" if name == "smart_turn" else "cpu" for name in COMPUTE_MODEL_IDS}
+        hardware = {"models": {name: {"gpu_available": True} for name in COMPUTE_MODEL_IDS}}
+        with patch("voice_terminal.server.websocket.hardware_status", return_value=hardware):
+            response = asyncio.run(self._request("PUT", "/api/v1/product/settings/compute", json={"devices": devices}))
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("资源未配置完整", response.json()["detail"])
+        self.assertEqual(self.runtime.product_settings.snapshot()["compute"]["devices"]["smart_turn"], "cpu")
+
     def test_owner_only_barge_in_requires_profile_and_worker_even_when_mode_off(self) -> None:
         payload = {
             "mode": "off", "confirm_threshold": 0.5,

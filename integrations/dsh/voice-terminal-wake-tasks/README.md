@@ -13,4 +13,8 @@ DSH 原生 `schedule_create/list/update/delete`（创建、列出、更新、删
 
 项目任务存储位于 DSH home（用户数据目录）的 `storages/voice-terminal-wake-tasks.json`（项目任务文件）。插件启动时只迁移旧 Voice `wake-tasks.json`（旧语音任务文件）中的可转换记录，已有项目任务及历史保持不变；它不会读取或导入官方 Schedule（会话定时任务）数据。用户启用的 Automation Bundle（自动化功能包）由安装与构建流程保留。Voice Terminal（语音终端）的任务设置页通过插件的受管本机接口读取和修改项目任务目录。
 
+待执行任务的取消与归档删除分别处理：插件 `DELETE tasks/{id}`（取消项目任务）保留取消记录，`DELETE tasks/{id}/archive`（删除归档）仅移除已归档或已取消的记录。存储文件的 `deleted_task_ids`（已删除任务标识）防止旧任务迁移在重启后恢复已删除记录。删除写入失败时恢复内存中的原记录并返回错误；重复删除已删除记录返回 `deleted: true`（已确认删除）。官方会话任务不受影响。
+
+产品页使用 `POST /api/v1/wake-tasks/{id}/cancel`（取消待执行任务）与 `DELETE /api/v1/wake-tasks/{id}`（删除归档），删除接口必须收到插件的成功回执才报告成功。
+
 安装与会话清理的操作说明见 [连续性基础能力](../../../docs/continuity-foundation.md)。

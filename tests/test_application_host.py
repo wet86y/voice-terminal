@@ -538,12 +538,16 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             for key, pid in (("host", 10), ("web", 10), ("voice", 20), ("speaker", 30)):
                 app.state.component(key, state="ready", pid=pid)
             app.state.component("asr", state="external", pid=50, external=True)
-            with patch("psutil.Process", side_effect=processes.__getitem__):
+            with (patch("psutil.Process", side_effect=processes.__getitem__),
+                  patch("voice_terminal.gpu_memory.process_vram_snapshot", return_value={pid: pid * 10 for pid in processes})):
                 app.sample_metrics()
             snapshot = app.state.snapshot()
             rows = {c["id"]: c for c in snapshot["components"]}
             self.assertEqual(snapshot["total_memory_rss_bytes"], 1000)
             self.assertEqual(snapshot["total_memory_private_commit_bytes"], 10000)
+            self.assertEqual(snapshot["total_gpu_dedicated_bytes"], 1000)
+            self.assertEqual(rows["host"]["gpu_dedicated_bytes"], rows["web"]["gpu_dedicated_bytes"])
+            self.assertEqual(rows["asr"]["gpu_dedicated_bytes"], 500)
             self.assertEqual(rows["asr"]["memory_private_commit_bytes"], 5000)
             self.assertEqual(rows["speaker"]["memory_private_commit_bytes"], 3000)
             for process in processes.values():
@@ -576,13 +580,15 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         process.create_time.return_value = 200
         try:
             app.state.component("host", state="ready", pid=10, created_at=100,
-                memory_rss_bytes=1000, memory_private_commit_bytes=5000)
+                memory_rss_bytes=1000, memory_private_commit_bytes=5000, gpu_dedicated_bytes=6000)
             with patch("psutil.Process", return_value=process):
                 app.sample_metrics()
             snapshot = app.state.snapshot()
             self.assertIsNone(snapshot["components"][0]["memory_rss_bytes"])
             self.assertIsNone(snapshot["components"][0]["memory_private_commit_bytes"])
             self.assertIsNone(snapshot["total_memory_private_commit_bytes"])
+            self.assertIsNone(snapshot["components"][0]["gpu_dedicated_bytes"])
+            self.assertIsNone(snapshot["total_gpu_dedicated_bytes"])
             process.memory_info.assert_not_called()
         finally:
             app.outer_job.close()

@@ -46,13 +46,16 @@ def test_leases_count_shared_bytes_once_and_release_idempotently():
 
 def test_two_analysis_lanes_do_not_double_count_the_process():
     row = {"pid": 12, "created_at": 123.0, "private_commit_bytes": 100,
-           "rss_bytes": 50, "thread_count": 4, "managed_cache_bytes": 10, "active_leases": 2}
+           "rss_bytes": 50, "thread_count": 4, "managed_cache_bytes": 10, "active_leases": 2,
+           "gpu_dedicated_bytes": 200}
     result = aggregate_resource_status([row, dict(row)])
     assert result["private_commit_bytes"] == 100
+    assert result["gpu_dedicated_bytes"] == 200
     assert result["active_leases"] == 2
     assert len(result["processes"]) == 1
     partial = aggregate_resource_status([row], missing_roles=["analysis"])
     assert partial["private_commit_bytes"] is None
+    assert partial["gpu_dedicated_bytes"] is None
     assert partial["complete"] is False and partial["missing_roles"] == ["analysis"]
 
 

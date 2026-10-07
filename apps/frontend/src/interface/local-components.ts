@@ -15,9 +15,9 @@ export interface LocalComponentRow {
   busy?: boolean
   /** runtime（推理或执行环境）、residentMemory（常驻内存）与 privateMemory（提交内存）。 */
   runtime: string
-  residentMemory: string
-  privateMemory: string
-  /** vram（显存占用）：仅显卡推理组件提供，处理器推理时省略。 */
+  residentMemory?: string
+  privateMemory?: string
+  /** vram（进程专用显存占用）：没有有效测量时省略。 */
   vram?: string
   /** description（详情说明）、error（异常原因）与 note（指标说明）。 */
   description: string
@@ -47,7 +47,7 @@ export interface LocalComponentsModel {
   state: LocalComponentState
   sampledAt: string
   /** resources（资源摘要）：id（标识）、label（名称）、used（已用）与 total（全部）。 */
-  resources: Array<{ id: string; label: string; used: string; total: string }>
+  resources: Array<{ id: string; label: string; used?: string; total?: string }>
   /** rows（组件列表）、error（页面异常）与 refreshing（正在刷新）。 */
   rows: LocalComponentRow[]
   error?: string
@@ -55,8 +55,8 @@ export interface LocalComponentsModel {
 }
 
 /** formatComponentMemory（内存格式）：界面仅使用 MB／GB，保留现有字节换算口径。 */
-export function formatComponentMemory(value: number | null | undefined): string {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '未提供'
+export function formatComponentMemory(value: number | null | undefined): string | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined
   return value >= 1024 ** 3
     ? `${Number((value / 1024 ** 3).toFixed(2))} GB`
     : `${Number((value / 1024 ** 2).toFixed(1))} MB`

@@ -264,6 +264,7 @@ export function apply(ctx: any): void {
         else if (req.method === 'GET' && /^tasks\/[^/]+\/reference$/u.test(path)) value = service.reference(decodeURIComponent(path.split('/')[1]))
         else if (req.method === 'POST' && path === 'tasks') value = await service.create(body, String(body.reference ?? ''))
         else if (req.method === 'PATCH' && /^tasks\/[^/]+$/u.test(path)) value = await service.update(decodeURIComponent(path.split('/')[1]), body)
+        else if (req.method === 'DELETE' && /^tasks\/[^/]+\/archive$/u.test(path)) value = await service.removeArchive(decodeURIComponent(path.split('/')[1]))
         else if (req.method === 'DELETE' && /^tasks\/[^/]+$/u.test(path)) value = await service.cancel(decodeURIComponent(path.split('/')[1]))
         else { res.statusCode = 404; res.end('{}'); return }
         res.setHeader('content-type', 'application/json; charset=utf-8')

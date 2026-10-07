@@ -22,6 +22,8 @@ export interface ApplicationComponent {
   memory_rss_bytes: number | null
   /** memory_private_commit_bytes（进程私有提交内存，字节）；旧宿主可能不提供。 */
   memory_private_commit_bytes?: number | null
+  /** gpu_dedicated_bytes（进程专用显存字节）：计数器不可用时为空。 */
+  gpu_dedicated_bytes?: number | null
   /** thread_count（进程当前线程数）；旧宿主可省略。 */
   thread_count?: number | null
   /** cpu_percent（中央处理器占用百分比）。 */
@@ -67,6 +69,8 @@ export interface ApplicationSnapshot {
   total_memory_rss_bytes: number | null
   /** total_memory_private_commit_bytes（去重后的受管进程私有提交内存之和，字节）。 */
   total_memory_private_commit_bytes?: number | null
+  /** total_gpu_dedicated_bytes（按进程去重的应用专用显存字节）。 */
+  total_gpu_dedicated_bytes?: number | null
   /** completed_components（完成启动尝试的组件数量）。 */
   completed_components: number
   /** total_components（启用组件数量）。 */

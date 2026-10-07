@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import SettingsPageHeader from './SettingsPageHeader.vue'
 import type { LocalComponentRow, LocalComponentsModel } from './local-components'
 
-defineProps<{
+const props = defineProps<{
   /** model（页面状态与指标）与 saving（保存中）。 */
   model: LocalComponentsModel
   saving?: boolean
 }>()
+const visibleResources = computed(() => props.model.resources.filter(resource => resource.used !== undefined))
 const emit = defineEmits<{
   /** refresh（刷新指标）与 retry（重试指定组件）。 */
   refresh: []
@@ -26,7 +27,9 @@ function activate(row: LocalComponentRow) {
   else expanded.value.add(row.id)
 }
 function changeDevice(id: string, event: Event) {
-  emit('device', id, (event.target as HTMLSelectElement).value)
+  const value = (event.target as HTMLSelectElement).value
+  const option = props.model.rows.find(row => row.id === id)?.device?.options.find(option => option.value === value)
+  if (option && !option.disabled) emit('device', id, value)
 }
 function invalidDevice(row: LocalComponentRow) {
   return row.device?.options.find(option => option.value === row.device?.value)?.disabled
@@ -46,8 +49,8 @@ function invalidDevice(row: LocalComponentRow) {
 
     <div class="local-overview">
       <div class="local-overview-line"><span class="local-state" :class="model.state"><i aria-hidden="true"></i>{{ model.status }}</span><small>最近采样：{{ model.sampledAt }}</small></div>
-      <div class="local-memory-summary">
-        <article v-for="resource in model.resources" :key="resource.id" :data-resource="resource.id"><span>{{ resource.label }}</span><div class="local-resource-value" :aria-label="`${resource.label}，已用 ${resource.used}，全部 ${resource.total}`"><strong>{{ resource.used }}</strong><span class="local-resource-total">/ {{ resource.total }}</span></div></article>
+      <div v-if="visibleResources.length" class="local-memory-summary">
+        <article v-for="resource in visibleResources" :key="resource.id" :data-resource="resource.id"><span>{{ resource.label }}</span><div class="local-resource-value" :aria-label="`${resource.label}，已用 ${resource.used}${resource.total ? `，全部 ${resource.total}` : ''}`"><strong>{{ resource.used }}</strong><span v-if="resource.total" class="local-resource-total">/ {{ resource.total }}</span></div></article>
       </div>
     </div>
 
@@ -59,7 +62,7 @@ function invalidDevice(row: LocalComponentRow) {
         <div class="local-component-summary">
           <div class="local-component-body">
             <div class="local-component-identity"><h4 :title="row.name">{{ row.name }}</h4><span class="local-state" :class="row.state"><i aria-hidden="true"></i>{{ row.status }}</span></div>
-            <dl class="local-component-metrics"><div data-metric="runtime"><dt>运行时：</dt><dd>{{ row.runtime }}</dd></div><div data-metric="memory"><dt>常驻内存／提交内存：</dt><dd>{{ row.residentMemory }} / {{ row.privateMemory }}</dd></div><div v-if="row.vram !== undefined" data-metric="vram"><dt>显存：</dt><dd>{{ row.vram }}</dd></div></dl>
+            <dl class="local-component-metrics"><div v-if="row.runtime && row.runtime !== '未提供'" data-metric="runtime"><dt>运行时</dt><dd>{{ row.runtime }}</dd></div><div v-if="row.residentMemory !== undefined || row.privateMemory !== undefined" data-metric="memory"><dt>{{ row.residentMemory !== undefined && row.privateMemory !== undefined ? '常驻内存／提交内存' : row.residentMemory !== undefined ? '常驻内存' : '提交内存' }}</dt><dd>{{ [row.residentMemory, row.privateMemory].filter(value => value !== undefined).join(' / ') }}</dd></div><div v-if="row.vram !== undefined" data-metric="vram"><dt>进程显存</dt><dd>{{ row.vram }}</dd></div></dl>
             <p v-if="row.error && !row.busy" class="local-error">{{ row.error }}</p>
           </div>
           <button class="local-component-action" :class="{ 'retry-action': !row.available }" type="button" :disabled="row.busy || (!row.available && !row.retryable)" :aria-label="`${row.name}：${row.available ? expanded.has(row.id) ? '收起详情' : '详情' : '重试'}`" :aria-expanded="row.available ? expanded.has(row.id) : undefined" :aria-controls="row.available ? `local-detail-${row.id}` : undefined" @click="activate(row)">
@@ -95,7 +98,7 @@ small,dt{font-size:var(--font-caption)}
 .local-state.ready{color:var(--mint)}
 .local-state.loading{color:var(--accent)}
 .local-state.failed{color:var(--danger)}
-.local-memory-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.local-memory-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
 .local-memory-summary article{display:flex;flex-direction:column;gap:10px;padding:14px 16px;border:1px solid var(--line-strong);border-radius:12px;background:#ffffff02;min-width:0}
 .local-memory-summary article>span{font-size:var(--font-caption);color:var(--muted);line-height:1.5}
 .local-resource-value{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;font-variant-numeric:tabular-nums}
@@ -113,8 +116,10 @@ small,dt{font-size:var(--font-caption)}
 .local-component-identity h4{font-size:var(--font-body);line-height:1.5;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
 .local-component-identity>.local-state{line-height:18px}
 dl,dd{margin:0}
-.local-component-metrics{display:flex;align-items:baseline;flex-wrap:wrap;gap:6px 16px}
-.local-component-metrics>div{min-width:0;display:flex;align-items:baseline;flex-wrap:wrap;gap:3px;max-width:100%}
+.local-component-metrics{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);align-items:start;gap:8px 20px}
+.local-component-metrics>div{min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:3px;max-width:100%}
+.local-component-metrics>[data-metric="memory"]{grid-column:2}
+.local-component-metrics>[data-metric="vram"]{grid-column:2}
 .local-component-metrics dt{white-space:nowrap}
 .local-detail-facts>div{min-width:0;display:flex;flex-direction:column;gap:4px}
 dt{color:var(--subtle)}
@@ -137,5 +142,7 @@ dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:an
 .local-detail-note{overflow-wrap:anywhere}
 .local-location{display:flex;gap:12px;align-items:center;font-size:var(--font-body)}
 @container (max-width:440px){.local-memory-summary{grid-template-columns:1fr;gap:8px}.local-memory-summary article{flex-direction:row;align-items:center;justify-content:space-between;padding:12px;gap:8px}.local-component-summary{--local-action-width:58px;padding:12px;gap:8px}.local-component-metrics{gap:6px}.local-component-detail{padding:12px}.local-component-action{padding-inline:8px}}
+@container (max-width:520px){.local-component-metrics{grid-template-columns:1fr}.local-component-metrics>[data-metric]{grid-column:1}}
+@container (min-width:800px){.local-component-metrics{grid-template-columns:minmax(0,240px) minmax(0,1fr) minmax(0,130px)}.local-component-metrics>[data-metric="vram"]{grid-column:3}}
 @media (prefers-reduced-motion:reduce){.local-component-action svg{transition:none}}
 </style>
