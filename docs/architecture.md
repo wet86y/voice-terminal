@@ -80,7 +80,7 @@ SessionLedger ──> LLMContextProjector ──> 主 LLM 请求
 - `received`：模型返回的完整文本；
 - `sent`：已经交给 TTS provider 的前缀。
 
-只有 `sent` 之后的内容不可撤回。默认 `tts.scheduling=sentence_window`：本地按朗读标点切短句，首块没有标点时最多等待约 400ms；播放器距离当前块边界约 2000ms 时最多预取一个下一块。其他短句留在本地，允许同轮改写 `revisable_tail`。
+`sent`（语音合成已接受）前缀不可撤回，其后的内容仍可修改。默认 `tts.scheduling=sentence_window`（短句窗口调度）：本地按朗读标点分段，提交前依次合并至 `tts.sentence_min_effective_chars`（锁定文本块最少有效字符，默认 10），中文、字母和数字计数，标点、空白与符号不计；生成结束时不足下限的尾块也正常提交。首段没有标点时约 400 毫秒释放分段缓冲，但提交仍遵守有效字符下限。播放器距离当前块边界约 2000 毫秒时最多预取一个下一块。LLM（大语言模型）可见的不可修改前缀以实际提交的合并块为边界，其后文本留在本地，允许同轮改写 `revisable_tail`（可改尾巴）。
 
 模型只看到以下四段，不直接看到 PCM、provider session、播放时间或内部 ID：
 

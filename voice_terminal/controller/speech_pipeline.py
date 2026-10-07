@@ -118,6 +118,9 @@ class SpeechPipeline:
         prefetch_miss_boundary_ms: int | None = None
         sentence_prefetch_ms = max(1, int(getattr(tts_client, "sentence_prefetch_ms", 2000)))
         sentence_tick_seconds = max(0.001, int(getattr(tts_client, "sentence_tick_ms", 50)) / 1000)
+        sentence_min_effective_chars = max(
+            1, int(getattr(tts_client, "sentence_min_effective_chars", 10))
+        )  # sentence_min_effective_chars（每个锁定文本块最少有效字符）。
         progress_lock = asyncio.Lock()
         last_progress: tuple[int, int, int, int, int] | None = None
         last_progress_at = 0.0
@@ -444,15 +447,18 @@ class SpeechPipeline:
 
         async def next_segment() -> str | None:
             while True:
-                segment = state.pop()
+                segment = (
+                    state.pop_sentence_block(
+                        min_effective_chars=sentence_min_effective_chars,
+                        allow_short=producer_done,
+                    ) if sentence_window_enabled else state.pop()
+                )
                 if segment is not None:
                     return segment
                 if producer_done or tts_disabled or not self._valid(token):
                     state.close()
                     return None
                 state.signal.clear()
-                if state.staged:
-                    continue
                 await state.signal.wait()
 
         async def tts_sender() -> None:

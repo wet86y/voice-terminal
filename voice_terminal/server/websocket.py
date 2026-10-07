@@ -475,6 +475,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 admission_lead_ms=self.config.tts.admission_lead_ms,
                 sentence_prefetch_ms=self.config.tts.sentence_prefetch_ms,
                 sentence_tick_ms=self.config.tts.sentence_tick_ms,
+                sentence_min_effective_chars=self.config.tts.sentence_min_effective_chars,
                 first_clause_timeout_ms=self.config.tts.first_clause_timeout_ms,
             )
         self.tts = remote_tts

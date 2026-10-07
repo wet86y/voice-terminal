@@ -6,10 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.controller.episode_output import EpisodeSpeechOutput, SpeechHandle
 from voice_terminal.controller.speech_pipeline import AdmissionState
-from voice_terminal.config import load_config
+from voice_terminal.config import TtsConfig, load_config
 from voice_terminal.providers.minimax_tts import MiniMaxTtsClient, MiniMaxTtsSession
 from voice_terminal.tts.scheduling import TtsSegmentReceipt
 from voice_terminal.tts.sentence_segmenter import (
@@ -33,8 +35,75 @@ def test_default_config_selects_standard_sentence_window() -> None:
     assert config.tts.scheduling == "sentence_window"
     assert config.tts.sentence_prefetch_ms == 2000
     assert config.tts.sentence_tick_ms == 50
+    assert config.tts.sentence_min_effective_chars == 10
     assert config.tts.first_clause_timeout_ms == 400
     assert config.tts.subtitle_enable is False
+
+
+def test_lock_block_minimum_is_loaded_and_passed_to_tts_client(tmp_path) -> None:
+    local = tmp_path / "local.yaml"
+    local.write_text("tts:\n  sentence_min_effective_chars: 14\n", encoding="utf-8")
+    config = load_config(Path("config/default.yaml"), local)
+    client = MiniMaxTtsClient(
+        base_url="https://example.invalid", websocket_path="/ws",
+        model="speech-2.8-hd", api_key="test",
+        sentence_min_effective_chars=config.tts.sentence_min_effective_chars,
+    )
+    assert client.sentence_min_effective_chars == 14
+
+
+@pytest.mark.parametrize("minimum", [0, -1])
+def test_lock_block_minimum_rejects_nonpositive_configuration(minimum) -> None:
+    with pytest.raises(ValueError, match="sentence_min_effective_chars"):
+        TtsConfig(sentence_min_effective_chars=minimum)
+    with pytest.raises(ValueError, match="sentence_min_effective_chars"):
+        MiniMaxTtsClient(
+            base_url="https://example.invalid", websocket_path="/ws",
+            model="speech-2.8-hd", api_key="test",
+            sentence_min_effective_chars=minimum,
+        )
+
+
+def test_lock_block_counts_content_and_preserves_punctuation_at_exact_minimum() -> None:
+    """恰好 10 个有效字符可提交，标点、空白和符号不提前凑齐下限。"""
+    state = AdmissionState(lead_ms=0, sentence_window=True)
+    segments = [" 你好，", "？！🦊 \n", "abc123。"]
+    for segment in segments:
+        state.push(segment)
+    assert state.pop_sentence_block(min_effective_chars=10) is None
+    assert list(state.staged) == segments
+    state.push("甲乙。")
+    state.push("尾巴。")
+    assert state.pop_sentence_block(min_effective_chars=10) == "".join(segments) + "甲乙。"
+    assert list(state.staged) == ["尾巴。"]
+    assert state.staged_chars == len("尾巴。")
+    assert state.sent_chars == 0  # 取候选块不等于语音合成已接受。
+
+
+def test_incomplete_lock_block_remains_visible_as_revisable_tail() -> None:
+    state = AdmissionState(lead_ms=0, sentence_window=True, restage=split_complete_text)
+    locked = "前文已经完整送出。"
+    state.commit_segment(locked, receipt_index=0)
+    state.push("旧的，")
+    state.push("内容。")
+    assert state.pop_sentence_block(min_effective_chars=10) is None
+    parts, valid = state.model_text_parts(locked + "旧的，内容。")
+    assert valid is True
+    assert parts["current_clause"] == locked
+    assert parts["revisable_tail"] == "旧的，内容。"
+
+    replacement = "新的完整内容，可以正常播报。"
+    assert state.replace_unsent(replacement) == len("旧的，内容。")
+    assert state.pop_sentence_block(min_effective_chars=10) == replacement
+    assert state.sent_chars == len(locked)
+
+
+def test_short_final_lock_block_is_released_only_when_generation_finishes() -> None:
+    state = AdmissionState(lead_ms=0, sentence_window=True)
+    state.push("好的。")
+    assert state.pop_sentence_block(min_effective_chars=10) is None
+    assert state.pop_sentence_block(min_effective_chars=10, allow_short=True) == "好的。"
+    assert state.staged_chars == 0
 
 
 def test_sentence_segmenter_keeps_consecutive_punctuation_and_ignores_blank_block() -> None:
@@ -129,7 +198,7 @@ def test_model_speak_projection_uses_parts_without_legacy_text_fields() -> None:
         assert removed not in serialized
 
 
-def _sentence_output_harness():
+def _sentence_output_harness(*, min_effective_chars=10):
     class Session:
         bidi = False
         reusable = False
@@ -186,6 +255,7 @@ def _sentence_output_harness():
         effective_scheduling = "sentence_window"
         sentence_prefetch_ms = 2000
         sentence_tick_ms = 10
+        sentence_min_effective_chars = min_effective_chars
         first_clause_timeout_ms = 400
 
         def __init__(self):
@@ -255,7 +325,7 @@ def _sentence_output_harness():
 
 def test_sentence_window_keeps_only_current_and_one_prefetched_block() -> None:
     async def scenario():
-        output, handle, session, player = _sentence_output_harness()
+        output, handle, session, player = _sentence_output_harness(min_effective_chars=1)
         handle.text = "第一句。第二句。第三句。"
 
         async def deltas():
@@ -304,6 +374,157 @@ def test_sentence_window_keeps_only_current_and_one_prefetched_block() -> None:
         assert handle.admission.sent_chars == len("第一句。第二句。第三句。")
 
     asyncio.run(scenario())
+
+
+def test_sentence_window_merges_lock_blocks_and_projects_the_same_model_frontier() -> None:
+    """合并块仍只占当前或预取的一个位置，第三块保持可改。"""
+    async def scenario():
+        output, handle, session, player = _sentence_output_harness()
+        first = "明白，老大。我这边一切正常，"
+        second = "运行稳定，随时听你调度。"
+        third = "这些剩余内容，暂时保留可改。"
+        handle.text = first + second + third
+        handle.finished = True
+
+        async def deltas():
+            for segment in split_complete_text(handle.text):
+                yield segment
+            yield None
+
+        running = asyncio.create_task(output._play_stream(
+            handle.workspace, handle.workspace.token, deltas(),
+            speech_id=handle.speech_id, handle=handle,
+        ))
+        try:
+            await asyncio.sleep(0.08)
+            assert session.sent == [first]
+            player.played_ms = 1000
+            await asyncio.sleep(0.08)
+            assert session.sent == [first, second]
+            snapshot = output.speak_snapshot
+            projected = AgentEpisodeRuntime._model_speak_state(
+                snapshot, conversation_id="episode", turn_id="turn",
+            )
+            assert projected["text_parts"] == {
+                "committed_prefix": "", "current_clause": first,
+                "prefetched_clause": second, "revisable_tail": third,
+            }
+            assert snapshot["sent_chars"] == len(first + second)
+            player.played_ms = 4000
+            await asyncio.wait_for(running, 2)
+            assert session.sent == [first, second, third]
+        finally:
+            if not running.done():
+                running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_streaming_lock_block_waits_for_later_segments_without_advancing_prefix() -> None:
+    async def scenario():
+        output, handle, session, player = _sentence_output_harness()
+        handle.text = "明白，老大。"
+        short_ready = asyncio.Event()
+        release = asyncio.Event()
+
+        async def deltas():
+            yield "明白，"
+            yield "老大。"
+            short_ready.set()
+            await release.wait()
+            handle.text += "我这边一切正常。"
+            yield "我这边一切正常。"
+            yield None
+
+        running = asyncio.create_task(output._play_stream(
+            handle.workspace, handle.workspace.token, deltas(),
+            speech_id=handle.speech_id, handle=handle,
+        ))
+        try:
+            await asyncio.wait_for(short_ready.wait(), 1)
+            await asyncio.sleep(0)
+            assert session.sent == []
+            snapshot = output.speak_snapshot
+            assert snapshot["sent_chars"] == 0
+            assert snapshot["_model_text_parts"]["current_clause"] == ""
+            assert snapshot["_model_text_parts"]["revisable_tail"] == handle.text
+            player.played_ms = 1000  # 允许固定 3 秒测试音频的下一次窗口检查完成。
+            release.set()
+            await asyncio.wait_for(running, 2)
+            assert session.sent == ["明白，老大。我这边一切正常。"]
+        finally:
+            release.set()
+            if not running.done():
+                running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_rewrite_replaces_short_segments_waiting_for_lock_minimum() -> None:
+    async def scenario():
+        output, handle, session, player = _sentence_output_harness()
+        handle.text = "旧的，内容。"
+        handle.finished = True
+        short_ready = asyncio.Event()
+        release = asyncio.Event()
+
+        async def deltas():
+            yield "旧的，内容。"
+            short_ready.set()
+            await release.wait()
+            yield None
+
+        running = asyncio.create_task(output._play_stream(
+            handle.workspace, handle.workspace.token, deltas(),
+            speech_id=handle.speech_id, handle=handle,
+        ))
+        try:
+            await asyncio.wait_for(short_ready.wait(), 1)
+            await asyncio.sleep(0)
+            replacement = "新的完整内容，可以正常播报。"
+            rewritten = await output.rewrite_unsent(
+                ("episode", "revision"), "turn", speech_id=handle.speech_id,
+                text=replacement,
+            )
+            assert rewritten is handle
+            await asyncio.sleep(0.08)
+            assert session.sent == [replacement]
+            assert handle.admission.sent_chars == len(replacement)
+            player.played_ms = 1000
+            release.set()
+            await asyncio.wait_for(running, 2)
+            assert handle.text == replacement
+        finally:
+            release.set()
+            if not running.done():
+                running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_short_answer_and_short_final_tail_do_not_wait_for_more_text() -> None:
+    async def scenario(text, expected):
+        output, handle, session, player = _sentence_output_harness()
+        handle.text = text
+        player.played_ms = 10 ** 9
+
+        async def deltas():
+            yield text
+            yield None
+
+        await asyncio.wait_for(output._play_stream(
+            handle.workspace, handle.workspace.token, deltas(),
+            speech_id=handle.speech_id, handle=handle,
+        ), 2)
+        assert session.sent == expected
+        assert handle.admission.sent_chars == len(text)
+
+    asyncio.run(scenario("好的。", ["好的。"]))
+    first = "明白，老大。我这边一切正常，"
+    asyncio.run(scenario(first + "谢谢。", [first, "谢谢。"]))
 
 
 def test_standard_websocket_prewarm_is_turn_scoped_and_start_is_not_repeated() -> None:

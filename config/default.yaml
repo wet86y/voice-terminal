@@ -176,6 +176,8 @@ tts:
   scheduling: sentence_window
   sentence_prefetch_ms: 2000
   sentence_tick_ms: 50
+  # sentence_min_effective_chars（锁定文本块最少有效字符）：合并完整短句，中文、字母和数字计数，标点与空白不计；结束尾段允许不足。
+  sentence_min_effective_chars: 10
   first_clause_timeout_ms: 400
   # Retained for the legacy playback_window compatibility mode.
   admission_lead_ms: 2500

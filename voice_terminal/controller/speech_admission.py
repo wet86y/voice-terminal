@@ -74,6 +74,29 @@ class AdmissionState:
         self.staged_chars -= len(segment)
         return segment
 
+    def pop_sentence_block(self, *, min_effective_chars: int,
+                           allow_short: bool = False) -> str | None:
+        """pop_sentence_block（取锁定候选块）：累加完整段，达到有效字符下限。
+
+        中文、字母和数字计数，标点、空白与符号不计。未凑齐的段留在
+        staged（可改队列）中，尾巴改写仍能全部替换；只有生成结束时
+        allow_short（允许不足下限的最后一块）才释放剩余段。
+        """
+        if min_effective_chars <= 0:
+            raise ValueError("min_effective_chars（最少有效字符）必须为正整数")
+        segments = []
+        effective_chars = 0
+        for segment in self.staged:
+            segments.append(segment)
+            effective_chars += sum(char.isalnum() for char in segment)
+            if effective_chars >= min_effective_chars:
+                break
+        if not segments or (effective_chars < min_effective_chars and not allow_short):
+            return None
+        for _ in segments:
+            self.pop()
+        return "".join(segments)
+
     def close(self) -> None:
         self.closed = True
         self.signal.set()
