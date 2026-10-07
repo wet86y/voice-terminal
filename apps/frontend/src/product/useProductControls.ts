@@ -1457,8 +1457,7 @@ export function useProductControls() {
         key: entry.key,
         role: entry.role,
         text: entry.text || "（没有可显示的转写）",
-        time:
-          entry.kind === "system_speech" ? "系统播报" : formatTime(entry.at),
+        time: formatTime(entry.at),
         status:
           entry.role === "user"
             ? turnStatusLabel(entry)
