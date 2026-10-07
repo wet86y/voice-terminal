@@ -433,10 +433,18 @@ class ApplicationHost:
                 self.state.finish()
 
     def sample_metrics(self):
+        # 同一采样中的组件、进程明细和总量一起发布，避免界面混用两次测量。
+        with self.state.condition:
+            self._sample_metrics()
+
+    def _sample_metrics(self):
         import psutil
         snapshot = self.state.snapshot()
         now = time.time()
         unique = {}
+        process_owners = {}  # process_owners（资源进程所属组件）。
+        direct_owners = {row["pid"]: row["id"] for row in reversed(snapshot["components"])
+                         if row["pid"] and not row["external"]}
         sampled = {}
         complete = True  # complete（受管进程采样覆盖完整）。
         from ..gpu_memory import process_vram_bytes, process_vram_snapshot
@@ -477,6 +485,7 @@ class ApplicationHost:
                     cpu_percent=cpu, sampled_at=now, thread_count=process.num_threads())
                 if not row["external"]:
                     unique[identity] = (memory, private_commit)
+                    process_owners[identity] = direct_owners[pid]
                 # 子树仅计入整体总量，不重复加入各组件行。
                 if row["id"] in {"voice", "asr", "analysis", "desktop"} and not row["external"]:
                     for child in process.children(recursive=True):
@@ -484,6 +493,7 @@ class ApplicationHost:
                             child_identity = (child.pid, child.create_time())
                             child_memory, child_commit, _ = sample_process(child, child_identity)
                             unique[child_identity] = (child_memory, child_commit)
+                            process_owners.setdefault(child_identity, direct_owners.get(child.pid, row["id"]))
                         except psutil.Error:
                             complete = False
             except psutil.Error:
@@ -495,6 +505,11 @@ class ApplicationHost:
         vram = [process_vram_bytes(pid, snapshot=gpu_memory) for pid, _ in unique]
         self.state.update(sampled_at=now,
             metrics_complete=complete,  # metrics_complete（指标覆盖完整）。
+            resource_processes=[{  # 所有数值来自同一去重集合；没有独立进程的检查项不占内存。
+                "pid": pid, "created_at": created, "component_id": process_owners[(pid, created)],
+                "memory_rss_bytes": values[0], "memory_private_commit_bytes": values[1],
+                "gpu_dedicated_bytes": process_vram_bytes(pid, snapshot=gpu_memory),
+            } for (pid, created), values in unique.items()],
             total_memory_rss_bytes=sum(value[0] for value in unique.values()) if complete and unique else None,
             total_gpu_dedicated_bytes=sum(vram) if complete and vram and all(v is not None for v in vram) else None,
             total_memory_private_commit_bytes=sum(commits) if complete and commits and all(value is not None for value in commits) else None)
@@ -563,5 +578,5 @@ class ApplicationHost:
         for row in self.state.snapshot()["components"]:
             self.state.component(row["id"], state="stopped", phase="已回收", pid=None)
         self.state.update(state="stopped", phase="应用已退出", core_available=False,
-            total_memory_rss_bytes=None, total_memory_private_commit_bytes=None, total_gpu_dedicated_bytes=None,
+            total_memory_rss_bytes=None, total_memory_private_commit_bytes=None, total_gpu_dedicated_bytes=None, resource_processes=[],
             capabilities={key: "STOPPED" for key in self.state.value["capabilities"]})

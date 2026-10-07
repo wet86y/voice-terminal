@@ -109,8 +109,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         self.paths = config.paths if config.paths and config.paths.separated else AppPaths(project_root, project_root)
         from ..resources import ResourcePolicy
         resource_policy = ResourcePolicy.load()
-        if resource_policy.disk_history:
-            self.history.attach_storage(self.paths.history / "archives/.journals", resource_policy.history_cache_bytes)
+        self._history_cache_bytes = resource_policy.history_cache_bytes
         self._init_handoff()
         default_worker_config = project_root / "config" / "default.yaml"
         # Child config（子进程配置文件） keeps the worker on the same model and port.
@@ -851,6 +850,16 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             projector.set_continuity_document(document)
 
     def _restore_or_persist_voice_identity(self) -> None:
+        if self.history.journal is None:
+            self.history.attach_storage(self.paths.history / "archives/.journals",
+                                        self._history_cache_bytes, resume=True)
+        saved = self.history.session_state
+        if saved.get("voice") is not None:
+            self.conversation.restore(saved["voice"])
+            if saved.get("shadow_environment") is not None:
+                self.shadow_context.restore_environment(saved["shadow_environment"])
+            self._persist_voice_identity()
+            return
         try:
             value = json.loads(self._voice_identity_path.read_text(encoding="utf-8"))
             session_id = value.get("voice_session_id") if isinstance(value, dict) else None
@@ -867,6 +876,11 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         if config is None or not hasattr(self, "_voice_identity_path"):
             return
         path = self._voice_identity_path
+        self.history.session_state = {"voice": self.conversation.persistence_snapshot(),
+                                      "shadow_environment": self.shadow_context.environment_snapshot()}
+        self.history.persist_state()
+        if self.history.journal is not None and not self.history.journal.flush():
+            raise OSError("当前语音会话尚未完整落盘，保留原会话和恢复状态")
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         temporary.write_text(json.dumps({
@@ -1603,7 +1617,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         resource_rows = [process_resource_status()]
         missing_resource_roles = set()
         hardware = await asyncio.to_thread(hardware_status, refresh=True) if refresh_capabilities else await asyncio.to_thread(hardware_status)
-        hardware = model_hardware_status(hardware, self.config)
+        hardware = await asyncio.to_thread(model_hardware_status, hardware, self.config, verify=True)
         requests = self.config.compute.devices
         models: dict[str, dict[str, Any]] = {
             name: {

@@ -27,6 +27,7 @@ class ApplicationState:
             "sampled_at": None, "total_memory_rss_bytes": None,
             "total_memory_private_commit_bytes": None,  # 去重后的受管进程私有提交内存（字节）。
             "total_gpu_dedicated_bytes": None,  # total_gpu_dedicated_bytes（受管进程专用显存字节总量）。
+            "resource_processes": [],  # resource_processes（本次采样的去重进程明细，供界面分组）。
             "components": [self.new_component(key) for key in LABELS],
         }
 

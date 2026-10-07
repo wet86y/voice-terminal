@@ -546,6 +546,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot["total_memory_rss_bytes"], 1000)
             self.assertEqual(snapshot["total_memory_private_commit_bytes"], 10000)
             self.assertEqual(snapshot["total_gpu_dedicated_bytes"], 1000)
+            ledger = snapshot["resource_processes"]
+            self.assertEqual(len(ledger), 4)
+            self.assertEqual(sum(row["memory_rss_bytes"] for row in ledger), snapshot["total_memory_rss_bytes"])
+            self.assertEqual(sum(row["memory_private_commit_bytes"] for row in ledger), snapshot["total_memory_private_commit_bytes"])
+            self.assertEqual(sum(row["gpu_dedicated_bytes"] for row in ledger), snapshot["total_gpu_dedicated_bytes"])
+            self.assertEqual({row["pid"]: row["component_id"] for row in ledger}, {10: "host", 20: "voice", 30: "speaker", 40: "voice"})
             self.assertEqual(rows["host"]["gpu_dedicated_bytes"], rows["web"]["gpu_dedicated_bytes"])
             self.assertEqual(rows["asr"]["gpu_dedicated_bytes"], 500)
             self.assertEqual(rows["asr"]["memory_private_commit_bytes"], 5000)

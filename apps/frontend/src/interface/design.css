@@ -840,34 +840,18 @@ time {
   background: #ffffff03;
   overflow: hidden;
 }
-.shadow-summary-card > .status-pill { align-self: flex-start; flex: none; }
 .shadow-summary-content,
 .shadow-event-content { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
-.shadow-summary-content { margin-top: 8px; }
-.shadow-event > .section-label { flex: none; margin-bottom: 10px; }
-.shadow-summary-card h3 {
-  margin: 0 0 5px;
-  font-size: var(--font-body);
-  line-height: 1.5;
-  overflow-wrap: anywhere;
-}
-.shadow-summary-card p {
-  font-size: var(--font-caption);
-  color: var(--muted);
-  overflow-wrap: anywhere;
-}
+.shadow-region-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex: none; margin-bottom: 8px; font-size: var(--font-caption); color: var(--subtle); }
+.shadow-region-heading small { font-size: inherit; }
+.shadow-region p { font-size: var(--font-caption); line-height: 1.5; overflow-wrap: anywhere; }
+.shadow-summary-content p + p { margin-top: 6px; color: var(--muted); }
+.shadow-region-placeholder { color: var(--muted); }
 .trace-section {
   display: flex;
   flex-direction: column;
   min-height: 0;
   flex: 1;
-}
-.trace-section > header {
-  display: flex;
-  justify-content: space-between;
-  font-size: 10px;
-  margin-bottom: clamp(6px, 1.5dvh, 14px);
-  flex: none;
 }
 .trace-section small {
   font-size: var(--font-caption);
@@ -917,13 +901,6 @@ time {
 .timeline small {
   font-size: var(--font-caption);
   color: var(--subtle);
-}
-.shadow-event {
-  font-size: 10px;
-  overflow-wrap: anywhere;
-}
-.shadow-event > .section-label {
-  margin-bottom: 7px;
 }
 .panel-resource-footer {
   display: flex;

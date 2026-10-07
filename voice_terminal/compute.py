@@ -230,7 +230,7 @@ def hardware_status(*, refresh: bool = False) -> dict[str, Any]:
     return result
 
 
-def model_hardware_status(hardware: dict[str, Any], config: Any) -> dict[str, Any]:
+def model_hardware_status(hardware: dict[str, Any], config: Any, *, verify: bool = False) -> dict[str, Any]:
     """结合实际模型资源校验可选设备；框架可用不代表模型显卡文件齐全。"""
     result = copy.deepcopy(hardware)
     required = {
@@ -248,7 +248,86 @@ def model_hardware_status(hardware: dict[str, Any], config: Any) -> dict[str, An
     if kws and kws.get("gpu_available") and not all(any(config.kws_dir.glob(pattern))
             for pattern in ("tokens.txt", "encoder*.onnx", "decoder*.onnx", "joiner*.onnx")):
         kws.update(gpu_available=False, reason="关键词唤醒模型的显卡推理资源未配置完整。")
+    if verify:
+        smart_turn = result.get("models", {}).get("smart_turn")
+        if smart_turn and smart_turn.get("gpu_available") and not (required["smart_turn"].parent / "preprocessor_config.json").is_file():
+            smart_turn.update(gpu_available=False, reason="语音结束判断模型的音频特征配置缺失。")
+        # 单个矩阵运算能通过，不代表卷积、模型算子或相应动态库可以执行。
+        for name in ("smart_turn", "wespeaker"):
+            status = result.get("models", {}).get(name)
+            if status and status.get("gpu_available"):
+                verified = _isolated_onnx_model_probe(name, required[name], hardware.get("capabilities_sampled_at"))
+                status.update(gpu_available=verified["ready"], reason=verified.get("reason"))
+        for name in ("paraformer", "sensevoice", "voice_vad"):
+            status = result.get("models", {}).get(name)
+            if status and status.get("gpu_available") and not (required[name].parent / "config.yaml").is_file():
+                status.update(gpu_available=False, reason="当前模型的推理配置文件缺失。")
     return result
+
+
+_model_probe_cache: dict[tuple, dict] = {}  # _model_probe_cache（模型文件与能力采样对应的检查缓存）。
+_model_probe_lock = threading.Lock()
+
+
+def _isolated_onnx_model_probe(name: str, path: Path, capability_time: Any) -> dict:
+    """在独立解释器中执行真实模型；主服务不会因环境检查占用显卡。"""
+    try:
+        file = path.stat()
+        key = (name, str(path.resolve()), file.st_size, file.st_mtime_ns, capability_time)
+        with _model_probe_lock:
+            if key not in _model_probe_cache:
+                from .paths import python_command
+                command = python_command(sys.executable, "voice_terminal.hardware_probe", "--model", name,
+                    "--model-path", str(path), root=Path(__file__).resolve().parents[1])
+                env = {**os.environ, "VOICE_RESOURCE_ROLE": "bootstrap", "PYTHONDONTWRITEBYTECODE": "1"}
+                response = subprocess.run(command, env=env, capture_output=True, text=True, timeout=45, check=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                value = json.loads(response.stdout.splitlines()[-1])
+                if not isinstance(value, dict) or not isinstance(value.get("ready"), bool):
+                    raise ValueError("模型环境检查未返回有效结果")
+                _model_probe_cache[key] = value
+                if len(_model_probe_cache) > 24:
+                    _model_probe_cache.clear()
+                    _model_probe_cache[key] = value
+            return dict(_model_probe_cache[key])
+    except Exception:
+        return {"ready": False, "reason": "模型的显卡推理检查未完成或失败，请刷新后重试。"}
+
+
+def onnx_model_cuda_probe(name: str, path: Path) -> dict:
+    """检查实际模型的显卡算子，包括所需卷积库；静默中央处理器回退无效。"""
+    import tempfile
+    try:
+        import numpy as np
+        import onnxruntime as ort
+        ort.preload_dlls()
+        with tempfile.TemporaryDirectory(prefix="voice-model-gpu-") as folder:
+            options = ort.SessionOptions()
+            options.enable_profiling = True
+            options.profile_file_prefix = str(Path(folder) / "profile")
+            options.log_severity_level = 3
+            options.intra_op_num_threads = 1
+            session = ort.InferenceSession(str(path), sess_options=options,
+                providers=[("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC", "cudnn_conv_use_max_workspace": "0"}), "CPUExecutionProvider"])
+            session.disable_fallback()
+            if "CUDAExecutionProvider" not in session.get_providers():
+                raise RuntimeError("显卡执行后端未能加载")
+            inputs = session.get_inputs()
+            if len(inputs) != 1 or inputs[0].type != "tensor(float)" or len(inputs[0].shape) != 3:
+                raise ValueError("模型输入格式未通过检查")
+            # SmartTurn（结束判断）使用八秒特征；WeSpeaker（声纹识别）使用完整特征帧。
+            defaults = (1, 80, 800) if name == "smart_turn" else (1, 160, 80)
+            shape = [axis if isinstance(axis, int) and axis > 0 else defaults[index] for index, axis in enumerate(inputs[0].shape)]
+            result = session.run(None, {inputs[0].name: np.zeros(shape, dtype=np.float32)})
+            trace = json.loads(Path(session.end_profiling()).read_text(encoding="utf-8"))
+            executed = any(row.get("args", {}).get("provider") == "CUDAExecutionProvider"
+                and row.get("args", {}).get("op_name") in {"Conv", "FusedConv", "MatMul", "Gemm", "Attention"} for row in trace)
+            if not executed or not result or not all(np.isfinite(value).all() for value in result):
+                raise RuntimeError("模型没有完成有效的显卡推理")
+            return {"ready": True, "reason": None}
+    except Exception as exc:
+        # 不输出文件位置或运行环境内容，只返回可用于设置页的简短诊断。
+        return {"ready": False, "reason": f"实际模型的显卡推理检查失败（{type(exc).__name__}），请检查模型算子与显卡运行库。"}
 
 
 def accept_hardware_capabilities(value: dict) -> None:

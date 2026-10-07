@@ -5,6 +5,7 @@ import { formatComponentMemory, type LocalComponentRow, type LocalComponentsMode
 import { useApplicationHost, type ApplicationComponent } from '../application-host'
 import { useProductContext } from '../product-context'
 import type { ComputeDeviceMode, ProductLocalModelId } from '../types'
+import { componentResources } from '../component-resources'
 
 const { settings, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
 const application = useApplicationHost()
@@ -15,6 +16,8 @@ const owners: Record<ProductLocalModelId, string> = {
   paraformer: 'asr', sensevoice: 'analysis', voice_vad: 'voice', kws: 'voice', smart_turn: 'analysis', wespeaker: 'speaker',
 }
 function componentFor(id: string) { return application.snapshot.value?.components?.find(row => row.id === id) }
+const resources = computed(() => componentResources(application.snapshot.value))
+const systemComponents = computed(() => (application.snapshot.value?.components ?? []).filter(row => !['asr', 'analysis', 'speaker', 'dsh'].includes(row.id)))
 function facts(component?: ApplicationComponent) {
   return [
     ...(component?.pid == null ? [] : [{ label: '进程标识', value: String(component.pid) }]),
@@ -26,6 +29,9 @@ const rows = computed<LocalComponentRow[]>(() => {
     const status = computeStatus.value?.models?.[item.id]
     const owner = componentFor(owners[item.id])
     const resource = status?.resource_status
+    const countedHere = ['paraformer', 'sensevoice', 'wespeaker'].includes(item.id)
+    const metrics = resources.value.get(owners[item.id])
+    const legacyResource = application.snapshot.value?.resource_processes === undefined ? resource : undefined
     const busy = Boolean(owner?.retrying || retrying.value.has(owners[item.id]))
     // ownerFailed（所属进程故障）优先于上一次模型采样，文案和操作采用同一判定。
     const ownerFailed = ['failed', 'blocked', 'stopped'].includes(owner?.state ?? '')
@@ -33,23 +39,25 @@ const rows = computed<LocalComponentRow[]>(() => {
     const loading = busy || (!ownerFailed && !disabled && (['waiting', 'starting', 'stopping'].includes(owner?.state ?? (!status ? 'starting' : '')) || status?.service === 'STARTING'))
     const available = !loading && !ownerFailed && !disabled && ['READY', 'DEGRADED'].includes(status?.service ?? '')
     const ownerError = ownerFailed ? owner?.error || status?.runtime_error || (owner?.state === 'blocked' ? '组件依赖不可用，请检查所属进程。' : owner?.state === 'stopped' ? '组件进程已退出。' : '组件运行异常，请查看日志并重试。') : undefined
-    const gpuAvailable = status?.gpu_available === true
+    const gpuAvailable = available && !refreshing.value && status?.gpu_available === true
     return {
       id: item.id, name: item.title,
       state: available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
       status: busy ? '正在恢复' : ownerFailed ? '不可用' : disabled ? '已停用' : loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : serviceLabel(status?.service),
       available, retryable: !available && !loading && Boolean(owner?.retry_allowed), busy,
       runtime: status?.runtime || '未提供',
-      residentMemory: formatComponentMemory(resource?.rss_bytes), privateMemory: formatComponentMemory(resource?.private_commit_bytes),
-      vram: status?.device?.startsWith('cuda') ? formatComponentMemory(resource?.gpu_dedicated_bytes) : undefined,
+      residentMemory: countedHere ? formatComponentMemory(metrics?.memory_rss_bytes ?? legacyResource?.rss_bytes) : undefined,
+      privateMemory: countedHere ? formatComponentMemory(metrics?.memory_private_commit_bytes ?? legacyResource?.private_commit_bytes) : undefined,
+      vram: countedHere && status?.device?.startsWith('cuda') ? formatComponentMemory(metrics?.gpu_dedicated_bytes ?? legacyResource?.gpu_dedicated_bytes) : undefined,
       description: item.detail, error: !available && !loading ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
-      note: '内存和显存为所在进程占用，共享进程不重复计入总量。',
+      note: countedHere ? '资源来自宿主同次采样，包含该进程及其子进程。' : item.id === 'smart_turn' ? '与 SenseVoice（语音识别与分析）共享进程，资源计入该条目。' : '与 Voice Server（语音服务）共享进程，资源计入语音服务条目。',
       facts: [
         ...(resource?.pid == null ? [] : [{ label: '进程标识', value: String(resource.pid) }]),
         ...(resource?.pid === owner?.pid && owner?.cpu_percent != null ? [{ label: '处理器占用', value: owner.cpu_percent.toFixed(1) + '%' }] : []),
       ],
       device: {
         value: settings.compute.devices[item.id], current: deviceLabel(status?.device),
+        locked: !available || refreshing.value,
         draft: settings.compute.devices[item.id] !== computeSavedDevices.value[item.id],
         pending: Boolean(status && computeSavedDevices.value[item.id] !== status.requested_device),
         options: [
@@ -60,7 +68,8 @@ const rows = computed<LocalComponentRow[]>(() => {
       },
     }
   })
-  const components = (application.snapshot.value?.components ?? []).filter(row => !['asr', 'analysis', 'speaker'].includes(row.id)).map<LocalComponentRow>(component => {
+  const components = (application.snapshot.value?.components ?? []).filter(row => row.id === 'dsh').map<LocalComponentRow>(component => {
+    const metrics = resources.value.get(component.id)
     const busy = component.retrying || retrying.value.has(component.id)
     const available = !busy && ['ready', 'external'].includes(component.state)
     const loading = busy || ['starting', 'waiting'].includes(component.state)
@@ -70,13 +79,33 @@ const rows = computed<LocalComponentRow[]>(() => {
       status: busy ? '正在恢复' : available ? component.id === 'setup' ? '已通过' : '运行中' : component.state === 'disabled' ? '已停用' : loading ? '启动中' : '不可用',
       available, retryable: component.retry_allowed && !busy, busy,
       runtime: component.id === 'dsh' ? 'Node.js（执行环境）' : component.id === 'voice' ? 'Python（语音进程）' : component.id === 'web' ? '桌面宿主' : '本地进程',
-      residentMemory: formatComponentMemory(component.memory_rss_bytes), privateMemory: formatComponentMemory(component.memory_private_commit_bytes),
-      vram: component.gpu_dedicated_bytes != null && component.gpu_dedicated_bytes > 0 ? formatComponentMemory(component.gpu_dedicated_bytes) : undefined,
+      residentMemory: formatComponentMemory(metrics?.memory_rss_bytes), privateMemory: formatComponentMemory(metrics?.memory_private_commit_bytes),
+      vram: metrics?.gpu_dedicated_bytes != null && metrics.gpu_dedicated_bytes > 0 ? formatComponentMemory(metrics.gpu_dedicated_bytes) : undefined,
       description: component.phase, error: component.error,
       location: '本机', facts: facts(component),
       note: component.shared_with ? '与应用宿主共享进程，内存总量只计一次。' : component.external ? '此组件使用外部调试进程。' : undefined,
     }
-  }).sort((a, b) => Number(b.id === 'dsh') - Number(a.id === 'dsh'))
+  })
+  const system = systemComponents.value
+  if (system.length) {
+    const metrics = resources.value.get('voice-system')
+    const failure = system.find(row => ['failed', 'blocked', 'stopped'].includes(row.state))
+    const busy = system.some(row => row.retrying || retrying.value.has(row.id))
+    const loading = busy || system.some(row => ['waiting', 'starting', 'stopping'].includes(row.state))
+    components.push({
+      id: 'voice-system', name: 'Voice Server（语音服务）',
+      state: failure ? 'failed' : loading ? 'loading' : 'ready',
+      status: busy ? '正在恢复' : failure ? '部分不可用' : loading ? '启动中' : '运行中',
+      available: !failure && !loading, retryable: system.some(row => row.retry_allowed), busy,
+      runtime: '本地系统服务', location: '本机',
+      residentMemory: formatComponentMemory(metrics?.memory_rss_bytes), privateMemory: formatComponentMemory(metrics?.memory_private_commit_bytes),
+      vram: metrics?.gpu_dedicated_bytes != null && metrics.gpu_dedicated_bytes > 0 ? formatComponentMemory(metrics.gpu_dedicated_bytes) : undefined,
+      description: '统一管理桌面窗口、界面服务、应用宿主、环境检查与语音服务。',
+      error: failure ? `${failure.name}：${failure.error || failure.phase}` : undefined,
+      facts: system.map(row => ({ label: row.name, value: ['ready', 'external'].includes(row.state) ? row.id === 'setup' ? '已通过' : '运行中' : row.phase })),
+      note: '包含系统进程及其子进程；模型工作进程和代理执行宿主单独计量，共享进程只计一次。',
+    })
+  }
   return [...models, ...components]
 })
 const model = computed<LocalComponentsModel>(() => {
@@ -103,6 +132,11 @@ async function refresh() {
   finally { refreshing.value = false }
 }
 async function retry(id: string) {
+  if (id === 'voice-system') {
+    const component = ['setup', 'web', 'voice', 'desktop'].map(componentFor).find(row => row?.retry_allowed)
+    if (component) await retry(component.id)
+    return
+  }
   const owner = owners[id as ProductLocalModelId] ?? id
   if (retrying.value.has(owner)) return
   retrying.value.add(owner)
@@ -110,6 +144,7 @@ async function retry(id: string) {
   finally { retrying.value.delete(owner) }
 }
 function device(id: string, value: string) {
+  if (refreshing.value || rows.value.find(row => row.id === id)?.device?.locked) return
   if (computeModelRows.some(row => row.id === id) && ['auto', 'cpu', 'cuda'].includes(value)) {
     if (value === 'cuda' && computeStatus.value?.models?.[id as ProductLocalModelId]?.gpu_available !== true) return
     settings.compute.devices[id as ProductLocalModelId] = value as ComputeDeviceMode

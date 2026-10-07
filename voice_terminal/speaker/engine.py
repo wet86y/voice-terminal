@@ -71,6 +71,8 @@ class WeSpeakerOnnxEngine:
             session = None
             for candidate in device_candidates(self.requested_device, "wespeaker", self.fallback_device):
                 try:
+                    if candidate == "cuda":
+                        ort.preload_dlls()  # preload_dlls（预加载显卡运行库）：独立声纹进程也必须执行。
                     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if candidate == "cuda" else ["CPUExecutionProvider"]
                     session = ort.InferenceSession(str(self.model_path), providers=providers)
                     if candidate == "cuda" and "CUDAExecutionProvider" not in session.get_providers():

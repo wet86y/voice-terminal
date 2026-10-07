@@ -179,8 +179,11 @@ describe('正式界面的真实控件交互', () => {
     await flushPromises()
     expect(wrapper.get('[data-resource="vram"]').text()).toBe('显存768 MB/ 8 GB')
     expect(wrapper.get('[data-component="paraformer"] [data-metric="vram"]').text()).toContain('512 MB')
-    expect(wrapper.find('[data-component="setup"] [data-metric="memory"]').exists()).toBe(false)
-    expect(wrapper.get('[data-component="setup"] .local-state').text()).toBe('已通过')
+    expect(wrapper.find('[data-component="setup"]').exists()).toBe(false)
+    const system = wrapper.get('[data-component="voice-system"]')
+    expect(system.find('[data-metric="memory"]').exists()).toBe(false)
+    await system.get('.local-component-action').trigger('click')
+    expect(system.text()).toContain('环境与配置检查已通过')
     const row = wrapper.get('[data-component="wespeaker"]')
     await row.get('button.local-component-action').trigger('click')
     expect(row.findAll('option').map(option => option.attributes('value'))).toEqual(['auto', 'cpu'])
@@ -193,6 +196,34 @@ describe('正式界面的真实控件交互', () => {
     application.businessReady.value = true
     await wrapper.get('.local-refresh').trigger('click'); await flushPromises()
     expect(probe).toHaveBeenCalledWith(true)
+  })
+  it('系统组件合并，同次进程明细覆盖旧模型采样，共享模型不重复展示内存', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    const mb = 1024 ** 2
+    value.computeStatus.value = { hardware: { system_memory: {}, gpu: {} }, models: Object.fromEntries(
+      ['paraformer', 'sensevoice', 'voice_vad', 'kws', 'smart_turn', 'wespeaker'].map(id => [id, {
+        service: 'READY', device: 'cpu', requested_device: 'cpu', gpu_available: false,
+        resource_status: { rss_bytes: 999 * mb, private_commit_bytes: 9999 * mb },
+      }])) } as never
+    const processes = [ ['asr', 100], ['analysis', 200], ['voice', 300], ['speaker', 80], ['dsh', 40], ['desktop', 60], ['host', 50], ['voice', 30] ] as const
+    application.snapshot.value = {
+      total_memory_rss_bytes: 860 * mb, total_memory_private_commit_bytes: 8600 * mb,
+      resource_processes: processes.map(([component_id, size], index) => ({ component_id, pid: index + 1, created_at: 10,
+        memory_rss_bytes: size * mb, memory_private_commit_bytes: size * 10 * mb, gpu_dedicated_bytes: 0 })),
+      components: ['asr', 'analysis', 'voice', 'speaker', 'dsh', 'desktop', 'host', 'web', 'setup'].map(id => ({ id, name: id, state: 'ready', phase: '已就绪' })),
+    } as unknown as ApplicationSnapshot
+    await flushPromises()
+    expect(wrapper.findAll('.local-component-card')).toHaveLength(8)
+    expect(wrapper.findAll('[data-metric="memory"]')).toHaveLength(5)
+    expect(wrapper.get('[data-component="paraformer"] [data-metric="memory"]').text()).toContain('100 MB / 1000 MB')
+    expect(wrapper.get('[data-component="sensevoice"] [data-metric="memory"]').text()).toContain('200 MB')
+    expect(wrapper.get('[data-component="voice-system"] [data-metric="memory"]').text()).toContain('440 MB')
+    for (const id of ['voice_vad', 'kws', 'smart_turn']) expect(wrapper.find(`[data-component="${id}"] [data-metric="memory"]`).exists()).toBe(false)
+    for (const id of ['voice', 'host', 'desktop', 'web', 'setup']) expect(wrapper.find(`[data-component="${id}"]`).exists()).toBe(false)
+    application.snapshot.value!.resource_processes![0]!.memory_private_commit_bytes = null
+    await flushPromises()
+    expect(wrapper.get('[data-component="paraformer"] [data-metric="memory"]').text()).toBe('常驻内存100 MB')
   })
   it.each(['failed', 'blocked', 'stopped'] as const)('所属进程为 %s（不可用）时，旧模型就绪采样不能继续显示运行中', async state => {
     let value!: ReturnType<typeof useProductControls>

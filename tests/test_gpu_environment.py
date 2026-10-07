@@ -81,3 +81,51 @@ def test_refresh_replaces_host_snapshot_through_an_isolated_probe(monkeypatch):
         assert any(argument.endswith('backend-entry.py') for argument in command), '隔离解释器必须使用正式显式模块入口'
         assert command[-1] == 'voice_terminal.hardware_probe'
         assert compute.hardware_status()['models']['smart_turn']['gpu_available'] is False
+
+
+@pytest.mark.parametrize('provider', ['CPUExecutionProvider', 'CUDAExecutionProvider'])
+def test_actual_model_requires_cuda_nodes_even_if_session_advertises_gpu(monkeypatch, provider, tmp_path):
+    class Session:
+        def __init__(self, _model, *, sess_options, providers):
+            self.profile = Path(sess_options.profile_file_prefix + '.json')
+        def disable_fallback(self): pass
+        def get_providers(self): return ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        def get_inputs(self): return [SimpleNamespace(name='feats', type='tensor(float)', shape=['B', 'T', 80])]
+        def run(self, _, inputs):
+            assert inputs['feats'].shape == (1, 160, 80)
+            return [np.ones((1, 256), dtype=np.float32)]
+        def end_profiling(self):
+            self.profile.write_text(json.dumps([{'args': {'provider': provider, 'op_name': 'Conv'}}]), encoding='utf-8')
+            return str(self.profile)
+    backend = SimpleNamespace(preload_dlls=Mock(), SessionOptions=SimpleNamespace, InferenceSession=Session)
+    monkeypatch.setitem(__import__('sys').modules, 'onnxruntime', backend)
+    assert compute.onnx_model_cuda_probe('wespeaker', tmp_path / 'model.onnx')['ready'] is (provider == 'CUDAExecutionProvider')
+    backend.preload_dlls.assert_called_once()
+
+
+def test_model_checks_are_isolated_cached_by_file_and_refreshed_with_backend_snapshot(tmp_path, monkeypatch):
+    model = tmp_path / 'model.onnx'
+    model.write_bytes(b'first')
+    monkeypatch.setattr(compute, '_model_probe_cache', {})
+    with patch.object(compute.subprocess, 'run', return_value=SimpleNamespace(stdout='{"ready":false,"reason":"卷积库缺失"}')) as probe:
+        assert not compute._isolated_onnx_model_probe('wespeaker', model, 1)['ready']
+        assert not compute._isolated_onnx_model_probe('wespeaker', model, 1)['ready']
+        assert probe.call_count == 1
+        assert probe.call_args.kwargs['env']['PYTHONDONTWRITEBYTECODE'] == '1'
+        assert any(argument.endswith('backend-entry.py') for argument in probe.call_args.args[0])
+        compute._isolated_onnx_model_probe('wespeaker', model, 2)
+        assert probe.call_count == 2
+        model.write_bytes(b'changed-size')
+        compute._isolated_onnx_model_probe('wespeaker', model, 2)
+        assert probe.call_count == 3
+
+
+def test_present_model_file_and_framework_do_not_override_failed_actual_model_probe(tmp_path):
+    config = AppConfig(model_dir=tmp_path)
+    config.speaker_model_path.parent.mkdir(parents=True)
+    config.speaker_model_path.touch()
+    hardware = {'models': {'wespeaker': {'gpu_available': True, 'reason': None}}}
+    with patch.object(compute, '_isolated_onnx_model_probe', return_value={'ready': False, 'reason': '模型算子无法执行'}):
+        status = compute.model_hardware_status(hardware, config, verify=True)['models']['wespeaker']
+    assert not status['gpu_available']
+    assert status['reason'] == '模型算子无法执行'

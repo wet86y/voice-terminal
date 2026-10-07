@@ -771,12 +771,9 @@ fn run() -> Result<(), String> {
                 let show_item = MenuItem::with_id(app, "show", "打开工作台", true, None::<&str>)?;
                 let exit_item = MenuItem::with_id(app, "exit", "退出应用", true, None::<&str>)?;
                 let menu = Menu::with_items(app, &[&show_item, &exit_item])?;
-                // default_window_icon（默认窗口图标）：托盘与标题栏、任务栏使用同一份应用资源。
-                let icon = app.default_window_icon().cloned().ok_or_else(|| {
-                    std::io::Error::other("应用图标资源不可用，无法建立系统托盘。")
-                })?;
+                let icon = app_icon::tray();
                 let exit_state = build_state.clone();
-                let tray = TrayIconBuilder::new()
+                let tray = TrayIconBuilder::with_id("voice-terminal")
                     .icon(icon)
                     .tooltip("Voice Terminal · 语音终端")
                     .menu(&menu)
@@ -807,6 +804,9 @@ fn run() -> Result<(), String> {
                 if let Ok(handle) = window.hwnd() {
                     // 跨屏幕改变显示缩放时，重新选择标题栏与任务栏的原生图标尺寸。
                     let _ = app_icon::apply(handle.0);
+                    if let Some(tray) = window.app_handle().tray_by_id("voice-terminal") {
+                        let _ = tray.set_icon(Some(app_icon::tray()));
+                    }
                 }
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
