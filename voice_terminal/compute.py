@@ -212,7 +212,9 @@ def hardware_status(*, refresh: bool = False) -> dict[str, Any]:
                 _capabilities = json.loads(serialized)
             else:
                 env = {**os.environ, "VOICE_RESOURCE_ROLE": "bootstrap"}
-                result = subprocess.run([sys.executable, "-m", "voice_terminal.hardware_probe"],
+                from .paths import python_command
+                command = python_command(sys.executable, "voice_terminal.hardware_probe", root=Path(__file__).resolve().parents[1])
+                result = subprocess.run(command,
                                         capture_output=True, text=True, timeout=60, env=env, check=True,
                                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                 _capabilities = json.loads(result.stdout.splitlines()[-1])

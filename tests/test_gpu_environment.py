@@ -77,4 +77,7 @@ def test_refresh_replaces_host_snapshot_through_an_isolated_probe(monkeypatch):
         probe.assert_not_called()
         assert compute.hardware_status(refresh=True)['models']['smart_turn']['gpu_available'] is False
         probe.assert_called_once()
+        command = probe.call_args.args[0]
+        assert any(argument.endswith('backend-entry.py') for argument in command), '隔离解释器必须使用正式显式模块入口'
+        assert command[-1] == 'voice_terminal.hardware_probe'
         assert compute.hardware_status()['models']['smart_turn']['gpu_available'] is False
