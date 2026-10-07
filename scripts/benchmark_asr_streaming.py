@@ -12,7 +12,7 @@ import statistics
 import sys
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 sys.dont_write_bytecode = True  # 不向待测只读程序或随包运行环境写入编译缓存。
 
 
@@ -30,7 +30,7 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--program-root", type=Path, default=ROOT, help="待测源码／正式程序目录")
     parser.add_argument("--model-dir", type=Path, required=True, help="Paraformer（流式识别）本地模型目录")
-    parser.add_argument("--audio", type=Path, default=ROOT / "reports/asr-finalization-sample-20261002.wav", help="16 千赫兹单声道录音")
+    parser.add_argument("--audio", type=Path, default=ROOT / ".local/cache/evaluation/audio/asr-finalization-sample.wav", help="16 千赫兹单声道录音")
     parser.add_argument("--device", choices=("cpu", "cuda"), required=True, help="实际请求的计算设备")
     parser.add_argument("--iterations", type=int, default=6, help="顺序回放次数")
     parser.add_argument("--output", type=Path, required=True, help="原始结果与统计文件")

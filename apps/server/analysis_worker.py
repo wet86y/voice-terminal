@@ -5,7 +5,11 @@ import sys
 from urllib.parse import urlparse
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    program = next(parent for parent in Path(__file__).resolve().parents
+                   if (parent / "pyproject.toml").is_file() and (parent / "voice_terminal").is_dir())
+    sys.path.insert(0, str(program))
+
+from voice_terminal.local_layout import project_root
 
 from voice_terminal.resources import bootstrap_resources
 if __name__ == "__main__":
@@ -23,7 +27,7 @@ from voice_terminal.application.managed import report, run_uvicorn
 
 def main():
     import uvicorn
-    root = Path(__file__).resolve().parents[2]
+    root = project_root(Path(__file__))
     paths = AppPaths.resolve(root)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=paths.config / "local.yaml")

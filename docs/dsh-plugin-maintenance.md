@@ -2,7 +2,7 @@
 
 本手册维护项目内 DeepSeek Harness（DSH，代理执行宿主）集成。唯一安装包为 `@voice-terminal/dsh-plugin`（语音终端功能包），项目插件版本为 `0.2.0`，桥接协议版本为 `2.0`。上游宿主锁定 `dsh-v0.2.0-rc.2`（候选版），提交号 `639ed015397290b3745d163aafe02ffee4aa3f84`；三种版本分别管理，不以插件版本推断宿主或协议版本。
 
-源码唯一入口是 [`integrations/dsh/voice-terminal/`](../integrations/dsh/voice-terminal/README.md)。运行源码、产物和数据分别位于项目 `.runtime/dsh/source`（官方源码）、`.runtime/dsh/bundles/voice-terminal`（统一插件产物）及 `.runtime/dsh/home`（项目数据目录）。本流程不安装或维护用户级 DSH，不变更语音端的后端选择，也不发布桌面程序。
+源码唯一入口是 [`integrations/dsh/voice-terminal/`](../integrations/dsh/voice-terminal/README.md)。运行源码、产物和数据分别位于项目 `.local/build/dsh/source`（官方源码）、`.local/build/dsh/bundles/voice-terminal`（统一插件产物）及 `.local/data/dsh`（项目数据目录）。本流程不安装或维护用户级 DSH，不变更语音端的后端选择，也不发布桌面程序。
 
 ## 组件职责与边界
 
@@ -38,7 +38,7 @@ graph LR
 | 预设标识 | `shadow-agent`（影子代理预设）；保持原有官方默认工具、压缩、子代理及工作流能力 |
 | 网络接口 | `/api/voice-terminal-shadow/v1`（桥接接口）、`/api/voice-terminal-wake/v1`（任务接口）、`/api/internal/dsh-bridge/`（语音回调前缀） |
 | 任务存储 | `storages/voice-terminal-wake-tasks.json`（项目任务文件）；`schema_version: 1`（存储格式版本）、`tasks`（任务记录）、`deleted_task_ids`（删除确认标识） |
-| 会话映射 | `.runtime/dsh/session-mappings.json`（语音与 DSH 会话映射）；`schema_version: 2`（映射格式版本） |
+| 会话映射 | `.local/build/dsh/session-mappings.json`（语音与 DSH 会话映射）；`schema_version: 2`（映射格式版本） |
 | 桥接信封 | `protocol_version`（协议版本）、`request_id`（幂等请求标识）、`voice_session_id`（语音会话标识）、`dsh_session_id`（DSH 会话标识）、`epoch`（会话世代） |
 | 激活与上下文 | `activation_id`（激活标识）、`context_revision`（上下文版本）；过期调用必须保持拒绝，不能用新激活替代旧请求水位 |
 | 实时运行轨迹 | `shadow.activity`（内部活动回调）的 `action_seq`（动作序号）在激活内递增，思考、工具和运行状态串行发送；`activity`（实时活动正文）只使用绑定根代理的公开实时流及工具事件，字段与拒收规则见 [桥接活动协议](bridge-2.0-protocol.md) |
@@ -97,14 +97,14 @@ graph LR
 
 ```powershell
 npm --prefix integrations/dsh/voice-terminal test
-python -X utf8 -m pytest -q tests/test_dsh_profile.py tests/test_dsh_preset.py tests/test_dsh_runtime.py tests/test_dsh_setup_backup.py
+.local/runtimes/python/python.exe -B -X utf8 scripts/test-backend.py -q tests/test_dsh_profile.py tests/test_dsh_preset.py tests/test_dsh_runtime.py tests/test_dsh_setup_backup.py
 node integrations/dsh/voice-terminal/build.mjs
 git diff --check
 ```
 
-插件测试包含宿主和浏览器类型检查、组件与依赖检查、官方浏览器构建、原有桥接及任务回归，以及真实官方加载器的隔离组合测试。组合测试使用独占临时数据目录、随机回环端口和本地模型替身，不访问真实模型供应方，不读写生产任务。测试产物在 `.runtime/dsh/bundles/voice-terminal-test`（隔离测试包）；正式构建不包含测试专用依赖链接。
+插件测试包含宿主和浏览器类型检查、组件与依赖检查、官方浏览器构建、原有桥接及任务回归，以及真实官方加载器的隔离组合测试。组合测试使用独占临时数据目录、随机回环端口和本地模型替身，不访问真实模型供应方，不读写生产任务。测试产物在 `.local/build/dsh/bundles/voice-terminal-test`（隔离测试包）；正式构建不包含测试专用依赖链接。
 
-修改安装、配置迁移或摘要规则时，另执行 `python -X utf8 scripts/dsh-diagnose/plugin-install-smoke.py`（真实安装隔离检查）。它创建独立项目副本，执行旧三包迁移、重复安装和校验，并核对用户插件、原生自动化、设置、任务、映射及三端摘要。检查日志保留在项目 `.runtime/plugin-install-check-*`（隔离检查目录），不使用现有项目数据。
+修改安装、配置迁移或摘要规则时，另执行 `python -X utf8 scripts/dsh-diagnose/plugin-install-smoke.py`（真实安装隔离检查）。它由现用解释器加载隔离测试夹具，验证受管补丁保留、生产宿主闭包及覆盖更新恢复。成功后自动回收测试夹具，不创建项目或环境副本。
 
 涉及协议、上下文、生命周期或公共事件时，另运行后端全量及前端测试、类型检查和构建，入口见[运行与质量门槛](operations-and-quality.md)。自动化通过不等同于真实模型、麦克风和播放设备的现场验收。
 
@@ -119,7 +119,7 @@ node scripts/dsh-diagnose/upgrade-smoke.mjs
 
 `-Offline`（离线模式）使用已存在的固定宿主和依赖缓存；`-SkipInstall`（跳过宿主依赖安装）仍构建并安装项目插件；`-ValidateOnly`（仅校验）不部署。缺少宿主依赖或需要升级宿主时使用完整安装流程，见[项目 DSH 基线](../config/dsh/README.md)。完成校验后按项目流程启动语音服务，并从受管入口打开控制台。
 
-安装在修改前备份项目的配置、功能包、构建状态和会话映射；失败时恢复原组合。迁移用官方插件命令移除旧的桥接、任务和预设安装记录，再登记统一包。已有加载行仅更新 `name`（包名称）指向，保留 `config`（用户设置），预设默认项保持 `shadow-agent`（影子代理）。旧任务和会话文件不改名、不清空；原生自动化选择保留。备份和失败产物都保留在项目运行目录，确认验收后再依项目数据归档流程处理。
+安装复用生产宿主，仅同步受管插件，保留用户补丁和官方任务选择。程序与环境升级通过覆盖发布事务换入，短期旧组件在验证成功后删除；重要数据只保留一份滚动备份。
 
 `build-state.json`（构建记录）格式更新为 `schema_version: 6`（格式版本），记录 `plugin_bundle_version`（统一插件版本）、`plugin_runtime_artifacts_sha256`（运行产物摘要）、`plugin_build_inputs_sha256`（构建输入摘要）、`shadow_prompt_sha256`（提示词摘要）及宿主身份。源码新鲜度检查覆盖全部组件源码、预设、清单、声明、构建和检查脚本、宿主补丁及两套类型配置；运行摘要覆盖包清单、生成补丁、组件声明和完整编译目录，包括源码映射。文档与测试不参与运行新鲜度判断。
 
@@ -135,13 +135,13 @@ node scripts/dsh-diagnose/upgrade-smoke.mjs
 
 排障先检查构建状态、完整摘要和展开配置，再检查公开接口回执与加载器状态。日志只记录必要标识和错误；不得输出访问令牌、模型密钥、鉴权头或带令牌的控制台地址。历史审计中的旧目录和旧版本属于当时证据，当前维护以本手册和统一源码目录为准。
 
-## 2026-10-07 插件合并与项目安装验收
+## 2026-10-07 插件合并与项目安装验收（历史记录）
 
 桥接、项目唤醒任务及影子预设的三个安装包已合并为 `@voice-terminal/dsh-plugin`（统一功能包）`0.2.0`。原来分散的插件源码及预设配置已迁入统一目录；安装单位为一个功能包，内部保留三个稳定加载行和一个浏览器模块。共享协议、鉴权、网络传输与取消作用域只维护一份。
 
 本轮按锁定宿主的公开契约调整工具定义、类型配置、浏览器状态钩子和生命周期释放，并修正代理释放接口、取消原因结构及工具参数边界声明。解绑后取消并等待后台回调；终态回执与工具名保持原语义。迁移测试还覆盖 Windows（操作系统）换行、重复迁移，以及离线移除旧包时包管理器的参数兼容。
 
-项目 `.runtime/dsh/home`（项目数据目录）中的网页配置已通过正式安装脚本迁移，旧三个包的登记全部移除。`build-state.json`（构建记录）为格式版本 6，插件版本 0.2.0，桥接协议 2.0；上游宿主提交及版本未变化。安装前后核对的 117 个原有任务、工作区、会话及映射文件摘要一致。隔离项目另验证了原生自动化和自定义插件选择的保留。
+项目 `.local/data/dsh`（项目数据目录）中的网页配置已通过正式安装脚本迁移，旧三个包的登记全部移除。`build-state.json`（构建记录）为格式版本 6，插件版本 0.2.0，桥接协议 2.0；上游宿主提交及版本未变化。安装前后核对的 117 个原有任务、工作区、会话及映射文件摘要一致。隔离项目另验证了原生自动化和自定义插件选择的保留。
 
 | 验证范围 | 本轮结果 |
 | --- | --- |
@@ -154,13 +154,13 @@ node scripts/dsh-diagnose/upgrade-smoke.mjs
 | 当前项目实际安装校验 | 安装脚本仅校验模式、Python（运行校验）及三端摘要一致性检查通过 |
 | 差异与上游源码 | 差异格式检查通过，锁定官方源码工作区无修改 |
 
-上述结果属于自动化与隔离验收。真实模型、麦克风和播报设备未进行现场验收。桌面发行包仍按独立发布流程管理；本轮完成项目内安装，没有重新发布便携程序。安装备份、测试日志和运行数据保留在项目忽略的运行目录，不纳入 Git（版本控制）提交。
+上述结果属于自动化与隔离验收。真实模型、麦克风和播报设备未进行现场验收。桌面发行包仍按独立发布流程管理；本轮完成项目内安装，没有重新发布便携程序。当次安装材料属于历史验收证据；本次目录治理后只保留当前组件及一份滚动用户数据备份。
 
-## 2026-10-07 实时运行轨迹协议修订与构建
+## 2026-10-07 实时运行轨迹协议修订与构建（历史记录）
 
 桥接活动端点已补充固定单槽的字段、拒收、取消和恢复规则，见 [Bridge 2.0（桥接协议）](bridge-2.0-protocol.md)。思考、工具和运行状态使用同一 `action_seq`（动作序号）与串行队列；公开实时流按修订号、模型尝试与原激活过滤迟到帧。激活替换、取消、解绑及卸载清理待发思考，解绑和卸载等待回调队列结束。工具只发送名称和状态，状态观察器摘要继续更新摘要及原有信息路径，不作为单槽思考正文。
 
-已重新生成 `.runtime/dsh/bundles/voice-terminal`（统一插件产物），确认配置的 Voice Server（语音服务）端口无监听后执行 `setup-dsh.ps1 -Offline -SkipInstall`（离线安装且跳过宿主依赖安装），同步项目安装登记及构建记录。插件版本为 0.2.0，桥接协议为 2.0，构建记录格式为 6，锁定上游宿主版本和提交保持原值。
+已重新生成 `.local/build/dsh/bundles/voice-terminal`（统一插件产物），确认配置的 Voice Server（语音服务）端口无监听后执行 `setup-dsh.ps1 -Offline -SkipInstall`（离线安装且跳过宿主依赖安装），同步项目安装登记及构建记录。插件版本为 0.2.0，桥接协议为 2.0，构建记录格式为 6，锁定上游宿主版本和提交保持原值。
 
 | 验证范围 | 本轮结果 |
 | --- | --- |
@@ -174,4 +174,4 @@ node scripts/dsh-diagnose/upgrade-smoke.mjs
 | 原有数据及锁定上游源码 | 安装前后 115 个会话、存储和映射文件摘要一致，上游源码无修改 |
 | 差异格式 | 通过 |
 
-安装备份保留在 `.runtime/dsh/upgrade.backup-0.2.0-rc.2-20261007-195537-304`（安装前备份目录）。本轮完成项目内插件安装及前端构建，未发布桌面发行包；真实模型实时流、麦克风及播报设备仍待现场验收。新插件在项目 DSH（代理执行宿主）下次启动时加载。
+当次安装备份已在本次目录治理中清退；当前按[固定目录及唯一数据备份规则](local-layout.md)维护。本轮完成项目内插件安装及前端构建，未发布桌面发行包；真实模型实时流、麦克风及播报设备仍待现场验收。新插件在项目 DSH（代理执行宿主）下次启动时加载。

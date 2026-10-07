@@ -32,7 +32,7 @@
 & 'D:/DevTools/Python312/python.exe' -B -X utf8 scripts/build-runtime.py `
   --profile cu128 --verify-cuda `
   --vc-redist 'D:/Program Files/Microsoft Visual Studio/18/Community/VC/Redist/MSVC/14.51.36231/x64' `
-  --output '.runtime/package-build/python-cuda-onnx-20261007'
+  --output '.local/build/runtime/python-cuda-onnx-20261007'
 
 # 下载同一固定修订的显卡结束判断模型，并保留中央处理器量化模型。
 & 'D:/DevTools/Python312/python.exe' -B -m voice_terminal.analysis.model_setup `
@@ -40,7 +40,7 @@
 
 # 后续完整退出正式应用后，再统一更新程序、运行库和模型；保留完整用户数据与旧组件。
 .\scripts\publish-desktop.ps1 `
-  -PythonRuntime '.runtime/package-build/python-cuda-onnx-20261007' `
+  -PythonRuntime '.local/build/runtime/python-cuda-onnx-20261007' `
   -ModelsRoot 'D:/模型/voice-terminal'
 ```
 
@@ -71,10 +71,10 @@ CPU（中央处理器）推理仍用两个内部线程，显卡会话用一个�
 `scripts/benchmark_asr_streaming.py`（真实流式识别回放工具）使用本地录音，通过本机网络连接按 20 毫秒实际时钟持续发送。收包与模型执行独立，结束包会真实排在此前音频之后。工具输出逐轮结果、首字时间、最终等待和窗口统计，不开启麦克风、不访问在线模型。
 
 ```powershell
-& '.runtime/package-build/python-cuda-onnx-20261007/python.exe' -B -X utf8 `
+& '.local/build/runtime/python-cuda-onnx-20261007/python.exe' -B -X utf8 `
   scripts/benchmark_asr_streaming.py `
-  --model-dir '.runtime/delivery/VoiceTerminal/models/50572b6fee9f6900/funasr/paraformer-zh-streaming' `
-  --device cuda --iterations 6 --output '.runtime/asr-cuda-replay.json'
+  --model-dir '.local/models/50572b6fee9f6900/funasr/paraformer-zh-streaming' `
+  --device cuda --iterations 6 --output '.local/cache/reports/asr-cuda-replay.json'
 ```
 
 `--program-root`（待测源码目录）可指定旧正式程序；`--device`（请求设备）必须与实际设备一致，回退会使基准失败。比较时应固定录音摘要、模型、发送节奏与测量环境。单模型回放不能替代整套应用并发及麦克风现场验收。
@@ -82,12 +82,12 @@ CPU（中央处理器）推理仍用两个内部线程，显卡会话用一个�
 `scripts/benchmark_smart_turn.py`（语音结束判断回放工具）使用同一录音的两秒片段、完整语音、语音加静音及纯静音，通过独立本机分析服务请求。每个片段默认十次，记录完整请求、线程等待、预处理、模型计算和结束概率；显卡模式可保存实际模型的运算节点追踪。
 
 ```powershell
-& '.runtime/package-build/python-cuda-onnx-20261007/python.exe' -B -X utf8 `
+& '.local/build/runtime/python-cuda-onnx-20261007/python.exe' -B -X utf8 `
   scripts/benchmark_smart_turn.py `
   --model-dir 'D:/模型/voice-terminal/analysis/smart-turn' `
   --device cuda --iterations 10 `
-  --profile-output '.runtime/smart-turn-cuda-kernels.json' `
-  --output '.runtime/smart-turn-cuda-replay.json'
+  --profile-output '.local/cache/reports/smart-turn-cuda-kernels.json' `
+  --output '.local/cache/reports/smart-turn-cuda-replay.json'
 ```
 
 CPU（中央处理器）量化模型与显卡单精度模型的概率允许不同。回放中须比较阈值两侧的判断，并在正式切换后验证实际会话；有限样本一致不能证明所有录音都得到相同概率或判断。

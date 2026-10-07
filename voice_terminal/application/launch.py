@@ -138,8 +138,16 @@ async def run(args, root):
     app.loop = asyncio.get_running_loop()
     app.dev = args.dev
     app.headless = args.headless
+    if args.headless and os.environ.get("VOICE_APP_SHUTDOWN_EVENT"):
+        async def stop_headless():
+            # Shutdown event（正常退出事件）：无界面宿主复用受管服务的退出约定。
+            from .managed import wait_for_shutdown
+            await wait_for_shutdown()
+            app.request_exit()
+        app.enqueue(stop_headless())
     desktop = None
-    host = HostWeb(app, root / "apps/frontend/dist", port=8764 if args.dev else 5173)
+    frontend = root / ".local/build/frontend" if (root / "apps/desktop/Cargo.toml").is_file() else root / "apps/frontend/dist"
+    host = HostWeb(app, frontend, port=8764 if args.dev else 5173)
     app.origin = host.origin  # origin（宿主内部地址）：业务组件报告与内部 Bearer 校验使用此地址。
     app.frontend_origin = host.origin  # frontend_origin（实际界面地址）：启动后更新为 Node 开发界面地址。
     host.start()
@@ -148,14 +156,14 @@ async def run(args, root):
         app.state.component(key, state="ready", phase="入口已就绪", pid=os.getpid(), created_at=host_created_at)
     if args.headless:
         app.state.component("web", state="ready", required=False, phase="无界面模式，仅保留宿主内部报告", error="")
-    elif not args.dev and not (root / "apps/frontend/dist/index.html").is_file():
+    elif not args.dev and not (frontend / "index.html").is_file():
         missing_ui = "缺少界面构建产物，请执行 npm run build（构建界面）。"
         app.frontend_error = missing_ui
         app.state.component("web", state="failed", phase="使用内置诊断页", error=missing_ui)
 
     if args.dev:
         try:
-            node = shutil.which("node")
+            node = os.environ.get("VOICE_NODE_EXECUTABLE")
             helper = root / "scripts/frontend-dev.mjs"
             if not node:
                 raise RuntimeError("开发模式缺少 Node.js（JavaScript 运行环境）")

@@ -31,8 +31,7 @@ def app_layout(root: Path, data: Path, portable: dict, record: dict):
             or address.username or address.password or address.query or address.fragment
             or not address.port or not 1 <= address.port <= 65535):
         raise ValueError("实例登记不是本地界面地址")
-    active = data / "state/active.json"
-    selected = json.loads(active.read_text(encoding="utf-8-sig")) if active.is_file() else portable
+    selected = portable
     program = (root / selected["app"]).resolve(strict=True)
     program.relative_to(root)
     manager = psutil.Process(record["pid"])

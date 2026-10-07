@@ -7,7 +7,11 @@ import sys
 from pathlib import Path
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    program = next(parent for parent in Path(__file__).resolve().parents
+                   if (parent / "pyproject.toml").is_file() and (parent / "voice_terminal").is_dir())
+    sys.path.insert(0, str(program))
+
+from voice_terminal.local_layout import project_root
 
 from voice_terminal.resources import bootstrap_resources
 if __name__ == "__main__":
@@ -28,7 +32,7 @@ async def run(config_path: Path | None = None) -> None:
     except ImportError as exc:
         raise RuntimeError("缺少 websockets，请先运行 scripts\\setup.ps1。") from exc
 
-    root = Path(__file__).resolve().parents[2]
+    root = project_root(Path(__file__))
     paths = AppPaths.resolve(root)
     default_path = root / "config" / "default.yaml"
     local_path = config_path or paths.config / "local.yaml"
@@ -74,7 +78,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Voice Terminal ASR Worker")
     parser.add_argument("--config", type=Path, default=None)
     args = parser.parse_args()
-    root = Path(__file__).resolve().parents[2]
+    root = project_root(Path(__file__))
     paths = AppPaths.resolve(root)
     load_env_file(paths.env_file)
     configure_logging(paths.logs / "asr-worker.log")

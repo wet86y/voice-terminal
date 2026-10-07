@@ -16,7 +16,7 @@ def test_manual_create_requires_host_credential_and_fixes_business_fields(tmp_pa
     async def scenario():
         config = AppConfig(model_dir=tmp_path / 'models', persona=PersonaConfig(directory=tmp_path / 'persona'))
         settings = ProductSettingsStore(path=tmp_path / 'settings.json', config=config)
-        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / '.runtime')
+        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / '.local')
         calls = []
         async def task_api(method, path, payload=None):
             calls.append((method, path, payload))
@@ -46,7 +46,7 @@ def test_archive_delete_rejects_cancel_receipt_instead_of_reporting_success(tmp_
     async def scenario():
         config = AppConfig(model_dir=tmp_path / 'models', persona=PersonaConfig(directory=tmp_path / 'persona'))
         settings = ProductSettingsStore(path=tmp_path / 'settings.json', config=config)
-        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / '.runtime')
+        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / '.local')
         calls = []
         async def task_api(method, path, payload=None):
             calls.append((method, path))
@@ -71,7 +71,7 @@ def test_wake_task_routes_cover_dsh_tools_and_settings_page(tmp_path: Path):
             persona=PersonaConfig(directory=tmp_path / "persona"),
         )
         settings = ProductSettingsStore(path=tmp_path / "settings.json", config=config)
-        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / ".runtime")
+        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=tmp_path / ".local")
         catalog: dict[str, dict] = {}
         frozen_reference = ""
 

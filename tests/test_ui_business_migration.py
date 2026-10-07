@@ -27,7 +27,7 @@ def test_source_checkout_reuses_formal_data_without_relaxing_program_overlap(tmp
     manifest = tmp_path / 'apps/desktop/Cargo.toml'
     manifest.parent.mkdir(parents=True)
     manifest.write_text('[workspace]', encoding='utf-8')
-    install = tmp_path / '.runtime/delivery/VoiceTerminal'
+    install = tmp_path / '.local'
     data = install / 'data'
     with patch.dict(os.environ, {'VOICE_PROGRAM_ROOT': str(tmp_path), 'VOICE_INSTALL_ROOT': str(install)}):
         assert AppPaths.resolve(data_dir=data).data_root == data.resolve()

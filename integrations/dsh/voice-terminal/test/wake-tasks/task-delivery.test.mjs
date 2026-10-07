@@ -15,7 +15,7 @@ process.env.VOICE_DSH_CALLBACK_ORIGIN = 'http://127.0.0.1:8765'
 process.env.VOICE_DSH_BRIDGE_TOKEN = 'test-token'
 
 const { TaskService } = await import(
-  new URL('../../../../../.runtime/dsh/bundles/voice-terminal-test/lib/wake-tasks/task-service.js', import.meta.url).href,
+  new URL('../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/wake-tasks/task-service.js', import.meta.url).href,
 )
 
 test('实际 DSH 规则投递一次性与重复任务，并在失败重试及重启后复用触发标识', async t => {

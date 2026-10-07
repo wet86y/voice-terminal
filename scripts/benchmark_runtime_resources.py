@@ -13,7 +13,7 @@ import statistics
 import sys
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 sys.path.insert(0, str(ROOT))
 
 
@@ -21,9 +21,8 @@ def main():
     parser = argparse.ArgumentParser(description="真实模型运行资源对照（不访问麦克风或云端）")
     parser.add_argument("--role", choices=("vad", "speaker", "asr", "refine", "endpoint"), required=True)
     parser.add_argument("--threads", type=int)
-    parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--onnx", action="store_true")
-    parser.add_argument("--model-root", type=Path, default=Path(r"D:\模型\voice-terminal"))
+    parser.add_argument("--model-root", type=Path, default=__import__('voice_terminal.paths', fromlist=['AppPaths']).AppPaths.resolve().install_root / 'models')
     parser.add_argument("--vad-dir", type=Path)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--soak-seconds", type=int, default=0)
@@ -32,9 +31,6 @@ def main():
     if args.threads:
         for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
             os.environ[name] = str(args.threads)
-    if args.baseline:
-        import voice_terminal
-        voice_terminal.__path__.insert(0, str(ROOT / ".runtime/resource-baseline/voice_terminal"))
     logging.disable(logging.CRITICAL)
     import psutil
     process = psutil.Process()
@@ -128,7 +124,7 @@ def main():
             time.sleep(max(0, start + frames * .02 - time.monotonic()))
         soak = {"elapsed_seconds": time.monotonic()-start, "frames": frames, "rounds": rounds,
                 "event_digest": events_digest.hexdigest(), "latency_ms": percentile(list(latency)), "memory_samples": memory_history}
-    payload = {"role": args.role, "baseline_source": args.baseline, "onnx": args.onnx,
+    payload = {"role": args.role, "baseline_source": False, "onnx": args.onnx,
                "thread_budget": args.threads, "python": sys.executable, "load_ms": load_ms,
                "latency_ms": percentile(samples), "samples_ms": samples, "results": results,
                "memory_samples": memory_samples, "soak": soak, "torch_imported": "torch" in sys.modules}

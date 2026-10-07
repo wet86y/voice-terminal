@@ -8,15 +8,15 @@ Voice Terminal 的项目插件源码使用第一方 DSH Bundle（功能包）`@v
 
 当前受管目标为固定的预发布版本 `dsh-v0.2.0-rc.2`
 （候选版），commit（提交号）`639ed015397290b3745d163aafe02ffee4aa3f84`；这不是正式稳定版。
-该版本的 2026-10-05 部署目录为 `apps/20261005-dsh-task-coexist`；首次部署目录为 `apps/20261005-dsh020rc2`。
+2026-10-05 的部署编号只保留为历史记录；当前程序固定为 `.local/app`（正式程序）。
 当次 Bridge（桥接插件）、Wake Tasks（唤醒任务插件）和 Shadow preset（影子代理预设功能包）均为 0.1.1。
 当前统一插件版本为 0.2.0，Bridge protocol（桥接协议）仍为 2.0。2026-10-07 已完成项目内安装迁移及数据核对，
-项目下次启动使用统一包；桌面发行程序须经过独立发布流程才采用新包。本轮验收与现场测试边界见
-[安装与验证记录](dsh-plugin-maintenance.md#2026-10-07-插件合并与项目安装验收)。
-DSH component（DSH 组件）的历史部署标识为 `639ed015-e7dd1315c977`；旧组件和两套备份均保留。
+当前正式程序已经通过覆盖发布采用统一包；目录与发布规则见[本地目录规范](local-layout.md)。本轮验收与现场测试边界见
+[安装与验证记录](dsh-plugin-maintenance.md#2026-10-07-插件合并与项目安装验收历史记录)。
+DSH component（DSH 组件）的历史部署标识为 `639ed015-e7dd1315c977`；构建编号仅保留在清单；当前运行目录固定，重要用户数据最多保留一份滚动备份。
 `dsh-v0.1.7-rc.2`（候选版）的 9 月验收记录仅适用于该版本当时的测试范围，不能替代本次目标版本记录。
 Bundle（功能包）只使用目标版本公开的 Cordis（插件框架）、Web Host（网页宿主）、Agent（智能体）、
-Session（会话）、Tool（工具）和事件扩展点；不得修改 `.runtime/dsh/source`（运行源码）、解析私有
+Session（会话）、Tool（工具）和事件扩展点；不得修改 `.local/build/dsh/source`（运行源码）、解析私有
 Session（会话）文件、依赖私有 Web RPC（网页远程调用），或启动第二个长期持有同一 Session（会话）的 DSH 进程。
 
 ## 2026-10-05 首次部署验收（共存修复前基线）
@@ -24,7 +24,7 @@ Session（会话）文件、依赖私有 Web RPC（网页远程调用），或�
 以下是首次升级部署、共存修复之前的 backend tests（后端测试）结果：666 passed（通过）、17 skipped（跳过）；
 frontend tests（前端测试）64 passed（通过）；Bridge tests（桥接插件测试）22 passed（通过）；
 Wake Tasks tests（唤醒任务插件测试）3 passed（通过）；official DSH tests（DSH 官方测试）102 passed（通过）。
-这些数字和首次部署的任务、历史、会话数据核验见[本机部署验收记录](../.runtime/dsh-upgrade-20261005/acceptance.md)；数字仅代表共存修复之前的回归结果。
+这些数字和首次部署的任务、历史、会话数据核验见[本机部署验收记录](local-layout.md)；数字仅代表共存修复之前的回归结果。
 
 ## 2026-10-05 原生与项目定时任务共存修复（已验收）
 
@@ -43,7 +43,7 @@ CRUD（增删改查）和任务存储隔离均通过验收。
 本次修复的 backend tests（后端测试）为 671 passed（通过）、17 skipped（跳过）；Bridge tests（桥接插件测试）22 passed（通过）；
 Wake Tasks tests（唤醒任务插件测试）4 passed（通过）。frontend tests（前端测试）64 passed（通过）、typecheck（类型检查）、
 build（构建）及 official DSH tests（DSH 官方测试）102 passed（通过）沿用首次部署基线，未在本次修复中改动。
-详细结果见[共存修复本机验收记录](../.runtime/dsh-coexist-20261005/acceptance.md)。
+详细结果见[共存修复本机验收记录](local-layout.md)。
 本次完整修订范围及兼容边界见[DSH 会话任务与语音链路任务共存修订](dsh-task-coexistence.md)。
 
 ## 发行运行与源码准备
@@ -77,7 +77,7 @@ DSH 0.2.0-rc.2 的 Agent 预设只从 Cordis Bundle（Cordis 功能包）中的 
 声明加载，不再扫描 DSH_HOME 的 `.agent-presets/<id>/` 目录。安装脚本从
 `integrations/dsh/voice-terminal/preset/shadow-agent/` 生成统一功能包中的预设声明，并将正式预设注册到 Web
 profile；profile patch（配置补丁）使用 `agent-preset-registry`（Agent 预设注册器）的 `default`（默认预设字段）。
-旧运行数据目录保留供回滚和数据核对，不再参与新版本加载。
+旧运行数据中的唯一内容已保全到迁移导入区；旧目录验收后回收。
 
 ## 打开 DSH 界面
 
@@ -107,7 +107,7 @@ DSH，以载入新产物和新的 launch token（临时访问令牌）。
 
 DSH 启动后，在设置侧栏“Agent 预设”下方打开独立的 `Voice Terminal` 页面。Bridge（插件桥接层）优先复用已保存且有效的工作区，
 不会额外登记运行目录下的空工作区。没有有效选择时，便携程序在 `VOICE_DATA_DIR`（用户数据目录）下确保
-`workspace`（工作目录）存在；源码布局沿用项目根目录的同名文件夹。程序版本目录变化不会再产生新的默认登记。之后可为语音新会话选择 DSH 已注册的工作区，
+`workspace`（工作目录）存在；源码与正式业务统一使用 `.local/data/workspace`（持久工作区），不再按程序版本生成工作区登记。之后可为语音新会话选择 DSH 已注册的工作区，
 工作区菜单使用 DSH 原生控件且不会切换当前工作区或会话。也可选择一个专用模型与该模型支持的推理强度；
 模型默认设置是跟随 DSH 全局模型。设置保存在 DSH 的 settings document（设置文档）中，
 更改会作用于下一次新建的语音 DSH 会话，无需重启。
@@ -164,7 +164,7 @@ Voice 停止监听时，事件保留到下次手动启动处理，不会自动�
 普通 DSH 助手正文不会自动转成语音事件。完整工具字段、规则格式和交接恢复行为见
 [跨会话衔接与 DSH 定时任务](continuity-foundation.md)。
 
-项目私有运行数据位于 `.runtime/dsh`：
+项目私有运行数据位于 `.local/build/dsh`：
 
 - `source`：固定上游源码和构建物；
 - `home`：项目 DSH_HOME、正式/retired Session、Harness 设置和凭据；

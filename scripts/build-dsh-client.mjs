@@ -4,10 +4,11 @@ import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+import { projectRoot } from './project-root.mjs'
+const repoRoot = projectRoot(import.meta.url)
 const bridgeDir = resolve(process.argv[2] ?? resolve(repoRoot, 'integrations/dsh/voice-terminal'))
-const artifactDir = resolve(process.argv[3] ?? resolve(repoRoot, '.runtime/dsh/bundles/voice-terminal'))
-const sourceDir = resolve(process.argv[4] ?? resolve(repoRoot, '.runtime/dsh/source'))
+const artifactDir = resolve(process.argv[3] ?? resolve(repoRoot, '.local/build/dsh/bundles/voice-terminal'))
+const sourceDir = resolve(process.argv[4] ?? resolve(repoRoot, '.local/build/dsh/source'))
 const stageRoot = resolve(sourceDir, 'packages/client/voice-terminal-build')
 
 function assertContained(parent, target) {

@@ -13,10 +13,11 @@ import urllib.request
 import zipfile
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 sys.path.insert(0, str(ROOT))
 from voice_terminal.distribution import manifest, verify, digest, unpack, collect_vc_runtime
 from voice_terminal.paths import atomic_json
+from voice_terminal.local_files import remove_tree
 from voice_terminal.dependencies import dependency_errors, ONNX_GPU_VERSION
 
 PROBE = """
@@ -120,11 +121,12 @@ def wheel_builder(cache: Path) -> Path:
 
 
 def main():
+    os.environ['PIP_CACHE_DIR'] = str(ROOT / '.local/cache/pip')  # PIP_CACHE_DIR（依赖安装缓存）。
     parser = argparse.ArgumentParser(description="构建可移动 Python（程序运行环境）组件")
     parser.add_argument("--profile", choices=("cu128", "cpu"), default="cu128", help="先验证现用组合，必要时改中央处理器组合")
     parser.add_argument("--onnx-profile", choices=("cpu", "cuda"), help="ONNX（模型格式）计算组合：加速张量组合默认同时包含显卡运行库")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--wheelhouse", type=Path, default=ROOT / ".runtime/package-build/wheels")
+    parser.add_argument("--wheelhouse", type=Path, default=ROOT / ".local/build/runtime/wheels")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--verify-cuda", action="store_true", help="在本机显卡上验证搬迁后实际 CUDA（图形处理器加速）计算；需要 cu128（加速依赖组合）")
     parser.add_argument("--constraints", type=Path, default=ROOT / "config/runtime/python-312.constraints.txt", help="来自已验证业务环境的依赖版本约束")
@@ -138,11 +140,13 @@ def main():
     if sys.version_info[:2] != (3,12) or os.name != "nt":
         raise RuntimeError("构建机需要 Windows x64 与 Python（程序运行环境）3.12。")
     output = args.output.resolve()
+    if not output.is_relative_to(ROOT / ".local/tmp"):
+        raise ValueError("新运行组件必须在项目临时区构建")
     if output.exists():
-        raise FileExistsError("运行环境输出目录已经存在，请选择新的构建标识。")
+        raise FileExistsError("运行环境输出目录已经存在，请先检查并回收旧候选暂存。")
     wheels = args.wheelhouse.resolve() / (args.profile + "-onnx-cuda" if onnx_profile == "cuda" else args.profile)
     wheels.mkdir(parents=True, exist_ok=True)
-    cache = ROOT / ".runtime/package-build/downloads"
+    cache = ROOT / ".local/build/runtime/downloads"
     cache.mkdir(parents=True, exist_ok=True)
     archive = cache / "python-3.12.10-embed-amd64.zip"
     if not archive.is_file():
@@ -202,7 +206,7 @@ def main():
             shutil.rmtree(generated)
     check_dependencies(stage / "Lib/site-packages")
     vc_runtime = collect_vc_runtime(stage, args.vc_redist.resolve(strict=True))
-    probe_env = {**os.environ,"CUDA_VISIBLE_DEVICES":"-1","PYTHONPYCACHEPREFIX":str(ROOT / ".runtime/package-build/bytecode"),"PYTHONNOUSERSITE":"1"}
+    probe_env = {**os.environ,"CUDA_VISIBLE_DEVICES":"-1","PYTHONPYCACHEPREFIX":str(ROOT / ".local/build/runtime/bytecode"),"PYTHONNOUSERSITE":"1"}
     run(stage / "python.exe","-B","-X","utf8","-c",PROBE,env=probe_env,cwd=ROOT)
     # 移动后再次执行真实导入；不保留虚拟环境和开发机基础解释器路径。
     moved = output.with_name(output.name + " 中文搬迁验证")
@@ -226,6 +230,8 @@ def main():
     record["build"] = hashlib.sha256(json.dumps(record["files"], sort_keys=True).encode()).hexdigest()[:16]
     atomic_json(output / "manifest.json",record)
     verify(output,record)
-    print(f"运行环境构建与搬迁导入检查通过：{output}")
+    remove_tree(wheels, ROOT / ".local")
+    archive.unlink()
+    print(f"运行环境构建与搬迁导入检查通过：{output}；已回收离线安装资源。")
 
 if __name__ == "__main__": main()

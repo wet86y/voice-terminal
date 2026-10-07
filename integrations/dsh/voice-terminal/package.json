@@ -18,9 +18,9 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "typecheck": "node ../../../.runtime/dsh/source/node_modules/typescript/bin/tsc -p tsconfig.host.json && node ../../../.runtime/dsh/source/node_modules/typescript/bin/tsc -p tsconfig.client.json",
+    "typecheck": "node ../../../.local/build/dsh/source/node_modules/typescript/bin/tsc -p tsconfig.host.json && node ../../../.local/build/dsh/source/node_modules/typescript/bin/tsc -p tsconfig.client.json",
     "build": "node build.mjs",
-    "test": "node build.mjs ../../../.runtime/dsh/bundles/voice-terminal-test --test && node --test test/bridge/*.test.mjs test/wake-tasks/*.test.mjs test/*.test.mjs"
+    "test": "node test-runner.mjs"
   },
   "dsh": {
     "bundle": {

@@ -118,28 +118,38 @@ def test_archive_rejects_windows_aliases(tmp_path, name):
         unpack(archive, tmp_path / 'stage')
 
 
-def test_install_checks_enabled_combination_and_ignores_user_files(tmp_path):
-    app, runtime = tmp_path / 'apps/build', tmp_path / 'runtimes/python/env'
-    app.mkdir(parents=True); runtime.mkdir(parents=True)
-    (app / 'business.py').write_text('pass', encoding='utf-8')
-    (runtime / 'python.exe').write_bytes(b'interpreter')
-    component = manifest(runtime, kind='python', build='env')
-    atomic_json(runtime / 'manifest.json', component)
-    release = manifest(app, kind='app', build='build')
-    release['components'] = [{'kind': 'python', 'build': 'env', 'path': 'runtimes/python/env',
-                              'manifest_sha256': digest(runtime / 'manifest.json')}]
-    atomic_json(app / 'release.json', release)
-    selected = {'schema': 1, 'app': 'apps/build', 'python': 'runtimes/python/env/python.exe'}
-    atomic_json(tmp_path / 'portable.json', {'data_dir': 'data', **selected})
-    atomic_json(tmp_path / 'data/config/user.json', {'custom': '用户内容'})
-    verify_install(tmp_path)
-    atomic_json(tmp_path / 'data/state/active.json', {**selected, 'python': 'runtimes/python/other/python.exe'})
-    with pytest.raises(ValueError, match='所需组合'):
-        verify_install(tmp_path)
-    atomic_json(tmp_path / 'data/state/active.json', selected)
-    (app / 'business.py').write_text('tampered', encoding='utf-8')
-    with pytest.raises(ValueError, match='校验失败'):
-        verify_install(tmp_path)
+def test_portable_fixed_schema_rejects_other_paths_and_selections(tmp_path):
+    from voice_terminal.local_layout import read_portable, default_portable
+    selected = default_portable()
+    atomic_json(tmp_path / 'portable.json', selected)
+    assert read_portable(tmp_path) == selected
+    # 用户数据里的旧启用副本不能影响正常路径选择。
+    atomic_json(tmp_path / 'data/state/active.json', {'app': 'invalid'})
+    assert read_portable(tmp_path) == selected
+    atomic_json(tmp_path / 'portable.json', {**selected, 'python': '../outside/python.exe'})
+    with pytest.raises(ValueError, match='固定组件路径'):
+        read_portable(tmp_path)
+
+
+@pytest.mark.parametrize('state', ['prepared', 'installing', 'committed'])
+def test_pending_update_blocks_source_and_headless_before_data_preparation(tmp_path, monkeypatch, state):
+    from voice_terminal.application.environment import activated_python
+    from voice_terminal.local_layout import default_portable
+    program = tmp_path / 'source'
+    install = program / '.local'
+    (program / 'apps/desktop').mkdir(parents=True)
+    (program / 'apps/desktop/Cargo.toml').write_text('fixture', encoding='utf-8')
+    atomic_json(install / 'portable.json', default_portable())
+    atomic_json(install / 'tmp/update-transaction.json', {'schema': 1, 'state': state, 'items': []})
+    monkeypatch.setenv('VOICE_PROGRAM_ROOT', str(program))
+    monkeypatch.setenv('VOICE_INSTALL_ROOT', str(install))
+    monkeypatch.setenv('VOICE_DATA_DIR', str(install / 'data'))
+    for start in (lambda: AppPaths.resolve(program), lambda: activated_python(program)):
+        with pytest.raises(RuntimeError, match='未完成更新'):
+            start()
+    assert not (install / 'data').exists()
+    (install / 'tmp/update-transaction.json').unlink()
+    assert AppPaths.resolve(program).data_root == install / 'data'
 
 
 def test_private_pipe_honors_exit_budget_and_rejects_malformed_messages(monkeypatch):

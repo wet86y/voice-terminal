@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { access, copyFile, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { access, copyFile, mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
 
 // icon generation（图标生成）：系统网页引擎渲染同一份矢量标识，无须安装图片处理依赖。
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+import { projectRoot } from './project-root.mjs'
+const root = projectRoot(import.meta.url)
 const source = join(root, 'apps/frontend/src/assets/app-icon.svg')
 const directory = join(root, 'apps/desktop/src-tauri/icons')
 const sizes = [16, 20, 24, 32, 40, 48, 64, 128, 256] // sizes（Windows 常用图标像素尺寸）。
@@ -20,7 +21,7 @@ for (const candidate of candidates) {
   try { await access(candidate); browser = candidate; break } catch { }
 }
 assert.ok(browser, '未找到图标渲染引擎，请设置 VOICE_TERMINAL_ICON_BROWSER（图标渲染浏览器路径）。')
-const runtime = join(root, '.runtime')
+const runtime = join(root, '.local/tmp')
 await mkdir(runtime, { recursive: true })
 const profile = await mkdtemp(join(runtime, 'app-icon-render-'))
 const child = spawn(browser, [
@@ -100,12 +101,15 @@ try {
   for (const frame of frames.filter(frame => frame.rgba)) await writeFile(join(directory, `tray-${frame.size}.rgba`), frame.rgba)
   await writeFile(join(root, 'apps/frontend/src/assets/favicon.ico'), icon)
   await copyFile(source, join(root, 'apps/desktop/boot/app-icon.svg'))
-  const previews = join(runtime, 'app-icon-preview')
+  const previews = join(root, '.local/cache/app-icon-preview')
   await mkdir(previews, {recursive:true})
   for (const frame of frames) await writeFile(join(previews, `${frame.size}.png`), frame.data)
   console.log(`已生成统一应用图标，尺寸：${sizes.join('、')} 像素。`)
 } finally {
   socket?.close()
   // 只结束本次独立的无界面渲染进程，不影响用户已打开的浏览器。
+  const finished = new Promise(done => child.once('exit', done))
   child.kill()
+  await Promise.race([finished, delay(5000)])
+  await rm(profile, { recursive: true, force: true })
 }

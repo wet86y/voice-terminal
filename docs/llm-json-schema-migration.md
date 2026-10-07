@@ -28,14 +28,14 @@ llm:
 
 ## 思考模式
 
-本节描述当前源码的双模式契约；2026-10-07 已完成回归和独立构建，正式目录更新待与其他修订合并处理，见[源码修订与验收记录](frontend-ui-business-migration.md#2026-10-07-双模式源码修订待统一发布)。
+本节描述当前源码的双模式契约；2026-10-07 已完成回归和独立构建，正式目录更新待与其他修订合并处理，见[源码修订与验收记录](desktop-acceptance.md)。
 
 | 模式 | 基础请求 | 额外行为 |
 | --- | --- | --- |
 | `fast`（快速，默认） | `reasoning.effort=none`（关闭思考） | 不追加思考请求 |
 | `deep`（深度） | `reasoning.effort=low`（低强度思考） | 基础请求直接使用低强度思考 |
 
-均衡模式及 `request_thinking`（请求追加思考）已移至 [均衡模式归档](../archive/balanced-mode/README.md)。当前配置、会话命令与主代理仅支持快速和深度；历史本机配置若显式设置 `llm.reasoning_mode: balanced`（均衡），应改为 `fast`（快速）或 `deep`（深度）。历史 `thinking_action_enabled`（追加思考开关）不再读取。
+均衡模式及 `request_thinking`（请求追加思考）已移至 Git（版本控制）中的均衡模式历史。当前配置、会话命令与主代理仅支持快速和深度；历史本机配置若显式设置 `llm.reasoning_mode: balanced`（均衡），应改为 `fast`（快速）或 `deep`（深度）。历史 `thinking_action_enabled`（追加思考开关）不再读取。
 
 前端初值、缺省配置与运行快照均使用快速。模式在代理轮次创建时确定：尚未创建轮次时切换立即影响新轮次，已有轮次时暂存到下一轮次，不取消当前请求。关键词唤醒确认请求继续使用 `reasoning.effort=none`（关闭思考）。主代理目录只保留现有 `request_shadow`（唤醒影子代理）能力，不再注入或执行均衡的追加思考动作；注册已归档动作会被拒绝。
 

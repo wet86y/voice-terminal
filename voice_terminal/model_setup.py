@@ -239,7 +239,7 @@ def write_manifest(model_dir: Path, entries: list[dict[str, Any]]) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download and validate Voice Terminal models")
-    parser.add_argument("--model-dir", type=Path, default=Path(r"D:\模型\voice-terminal"))
+    parser.add_argument("--model-dir", type=Path, default=__import__('voice_terminal.paths', fromlist=['AppPaths']).AppPaths.resolve().install_root / 'models')
     parser.add_argument("--offline", action="store_true")
     args = parser.parse_args()
     model_dir = args.model_dir.resolve()

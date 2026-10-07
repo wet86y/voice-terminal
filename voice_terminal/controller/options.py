@@ -27,7 +27,7 @@ class InputOptions:
     # This is the native PCM queue cap, distinct from the legacy text pacing
     # window.  Bidi uses direct text streaming but still needs a bounded player.
     tts_local_buffer_ms: int = 2000
-    allowed_roots: tuple[Path, ...] = field(default_factory=lambda: (Path(__file__).resolve().parents[2] / "docs",))
+    allowed_roots: tuple[Path, ...] = field(default_factory=lambda: (next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file()) / "docs",))
 
     @classmethod
     def from_mapping(cls, data: dict, root: Path) -> "InputOptions":

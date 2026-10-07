@@ -1,10 +1,10 @@
 {
-  "extends": "../../../.runtime/dsh/source/tsconfig.base.client.json",
+  "extends": "../../../.local/build/dsh/source/tsconfig.base.client.json",
   "compilerOptions": {
     "typeRoots": [
-      "../../../.runtime/dsh/source/scripts/types",
-      "../../../.runtime/dsh/source/node_modules/@types",
-      "../../../.runtime/dsh/source/packages/client/ui-settings/node_modules/@types"
+      "../../../.local/build/dsh/source/scripts/types",
+      "../../../.local/build/dsh/source/node_modules/@types",
+      "../../../.local/build/dsh/source/packages/client/ui-settings/node_modules/@types"
     ],
     "types": [
       "client-build-environment",
@@ -25,37 +25,37 @@
   ],
   "references": [
     {
-      "path": "../../../.runtime/dsh/source/vendor/cordis"
+      "path": "../../../.local/build/dsh/source/vendor/cordis"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/api/remotes/tsconfig.client.json"
+      "path": "../../../.local/build/dsh/source/packages/api/remotes/tsconfig.client.json"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/api/session-controller/tsconfig.client.json"
+      "path": "../../../.local/build/dsh/source/packages/api/session-controller/tsconfig.client.json"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/api/workspace-controller/tsconfig.client.json"
+      "path": "../../../.local/build/dsh/source/packages/api/workspace-controller/tsconfig.client.json"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/client/locale/tsconfig.client.json"
+      "path": "../../../.local/build/dsh/source/packages/client/locale/tsconfig.client.json"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/client/ui-primitives"
+      "path": "../../../.local/build/dsh/source/packages/client/ui-primitives"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/client/ui-renderer"
+      "path": "../../../.local/build/dsh/source/packages/client/ui-renderer"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/client/ui-settings/tsconfig.client.json"
+      "path": "../../../.local/build/dsh/source/packages/client/ui-settings/tsconfig.client.json"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/client/ui-conversation/tsconfig.client.json"
+      "path": "../../../.local/build/dsh/source/packages/client/ui-conversation/tsconfig.client.json"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/client/ui-chat/tsconfig.client.json"
+      "path": "../../../.local/build/dsh/source/packages/client/ui-chat/tsconfig.client.json"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/client/ui-slots"
+      "path": "../../../.local/build/dsh/source/packages/client/ui-slots"
     }
   ]
 }

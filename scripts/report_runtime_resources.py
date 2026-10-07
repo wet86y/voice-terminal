@@ -3,8 +3,8 @@ import json
 from pathlib import Path
 import statistics
 
-ROOT = Path(__file__).resolve().parents[1]
-REPORTS = ROOT / "reports"
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
+REPORTS = ROOT / ".local/cache/reports"
 
 
 def read(name):

@@ -1,11 +1,16 @@
-param(
-  [string]$Python = "python",
+﻿param(
+  [string]$Python = "",
   [switch]$Online,
   [switch]$Json
 )
 
 $ErrorActionPreference = "Stop"
-$RepoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'local-context.ps1')
+$RepoRoot = Get-ProjectRoot
+$Context = Get-LocalContext
+Set-LocalEnvironment $Context $RepoRoot
+if (-not $Python) { $Python = $Context.Python }
+if ([IO.Path]::GetFullPath($Python) -ne $Context.Python) { throw '环境检查必须使用唯一便携配置所选解释器。' }
 Push-Location $RepoRoot
 try {
   $DshExit = 0
@@ -22,7 +27,7 @@ try {
       $DshChecks += [pscustomobject]@{
         name = "dsh:isolation"
         status = "PASS"
-        message = ".runtime/dsh/source; .runtime/dsh/home"
+        message = ".local/build/dsh/source; .local/data/dsh"
       }
       $Listener = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 3081 -State Listen -ErrorAction SilentlyContinue
       $DshChecks += [pscustomobject]@{
@@ -56,7 +61,7 @@ try {
       Write-Host "DSH check failed: $($_.Exception.Message)" -ForegroundColor Red
     }
   }
-  $arguments = @("-m", "voice_terminal.doctor")
+  $arguments = @('-B', '-X', 'utf8', (Join-Path $PSScriptRoot 'backend-entry.py'), 'voice_terminal.doctor')
   if ($Online) { $arguments += "--online" }
   if ($Json) { $arguments += "--json" }
   if ($Json) {

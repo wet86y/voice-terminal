@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 sys.path.insert(0, str(ROOT))
 sys.dont_write_bytecode = True
 
@@ -20,7 +20,7 @@ sys.dont_write_bytecode = True
 async def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, required=True, help="本地流式识别模型目录")
-    parser.add_argument("--audio", type=Path, default=ROOT / "reports/asr-finalization-sample-20261002.wav", help="固定的单声道录音")
+    parser.add_argument("--audio", type=Path, default=ROOT / ".local/cache/evaluation/audio/asr-finalization-sample.wav", help="固定的单声道录音")
     parser.add_argument("--device", choices=("cpu", "cuda"), required=True, help="请求计算设备")
     parser.add_argument("--import-mode", choices=("full", "selective"), required=True, help="完整导入或按需导入")
     parser.add_argument("--threads", type=int, default=4, help="两种导入路径使用相同的计算线程预算")

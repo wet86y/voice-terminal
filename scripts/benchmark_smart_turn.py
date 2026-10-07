@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 sys.dont_write_bytecode = True  # 保持待测正式程序与运行环境只读。
 
 
@@ -75,7 +75,7 @@ async def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--program-root", type=Path, default=ROOT, help="待测源码／正式程序目录")
     parser.add_argument("--model-dir", type=Path, required=True, help="SmartTurn（语音结束判断）本地模型目录")
-    parser.add_argument("--audio", type=Path, default=ROOT / "reports/asr-finalization-sample-20261002.wav", help="16千赫兹单声道录音")
+    parser.add_argument("--audio", type=Path, default=ROOT / ".local/cache/evaluation/audio/asr-finalization-sample.wav", help="16千赫兹单声道录音")
     parser.add_argument("--device", choices=("cpu", "cuda"), required=True, help="请求的推理设备；实际回退会使基准失败")
     parser.add_argument("--iterations", type=int, default=10, help="每个录音片段的请求次数")
     parser.add_argument("--torch-threads", type=int, default=2, help="PyTorch（张量框架）预处理线程数，比较时保持一致")

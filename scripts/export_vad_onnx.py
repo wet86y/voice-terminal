@@ -8,7 +8,7 @@ import shutil
 import sys
 import tempfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())))
 from voice_terminal.vad.onnx_backend import file_hash
 
 

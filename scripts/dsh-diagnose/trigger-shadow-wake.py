@@ -8,7 +8,7 @@ it emits, so the DSH-backed lane can be verified end to end.
 After the activation settles, inspect what it wrote:
 
     node scripts/dsh-diagnose/find-null-kind-rows.mjs
-    node scripts/dsh-diagnose/inspect-session.mjs ".runtime/dsh/home/sessions/<project>/<session>"
+    node scripts/dsh-diagnose/inspect-session.mjs ".local/data/dsh/sessions/<project>/<session>"
 
 Usage: python scripts/dsh-diagnose/trigger-shadow-wake.py [timeout-seconds]
 """
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import websockets
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 URL = "ws://127.0.0.1:8765/ws"
 TIMEOUT_S = float(sys.argv[1]) if len(sys.argv) > 1 else 300.0
 

@@ -48,7 +48,7 @@ class ProductApiTests(unittest.TestCase):
             path=self.root / "config" / "product-settings.json",
             config=config,
         )
-        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=self.root / ".runtime")
+        runtime = SessionRuntime(config, product_settings=settings, runtime_data_dir=self.root / ".local")
         self.runtime = runtime
         registry = ModelRegistryService(
             config=config,

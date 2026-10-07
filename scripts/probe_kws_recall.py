@@ -24,7 +24,7 @@ Three modes exist on purpose:
 Example::
 
     python scripts/probe_kws_recall.py --mode official
-    python scripts/probe_kws_recall.py --mode as-shipped --wav logs/evaluation/kws-probe/qisan_plain.wav
+    python scripts/probe_kws_recall.py --mode as-shipped --wav .local/cache/evaluation/kws-probe/qisan_plain.wav
     python scripts/probe_kws_recall.py --mode wake --sweep-score 1.0,2.0,3.0
 """
 
@@ -38,11 +38,11 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-PROBE_DIR = ROOT / "logs" / "evaluation" / "kws-probe"
+PROBE_DIR = ROOT / ".local/cache/evaluation" / "kws-probe"
 
 
 def product_config():
@@ -389,7 +389,7 @@ def mode_as_shipped(args) -> int:
           f"blanks={config.wake.num_trailing_blanks} beam={config.wake.max_active_paths}")
     print(f"keywords file content: {config.kws_keywords_file.read_text(encoding='utf-8').strip()!r}")
     wavs = [Path(item) for item in args.wav] if args.wav else sorted(
-        (ROOT / "logs" / "evaluation" / "kws-probe").glob("*.wav"))
+        (ROOT / ".local/cache/evaluation" / "kws-probe").glob("*.wav"))
     preprocess = preprocessor_factory() if args.preprocess else None
     hits = 0
     for wav in wavs:
@@ -412,7 +412,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="离线 KWS 召回/延迟探针")
     parser.add_argument("--mode", choices=("as-shipped", "wake", "official", "generate"),
                         default="as-shipped")
-    parser.add_argument("--wav", action="append", default=None, help="可重复；默认用 logs/evaluation/kws-probe/*.wav")
+    parser.add_argument("--wav", action="append", default=None, help="可重复；默认用 .local/cache/evaluation/kws-probe/*.wav")
     parser.add_argument("--block-ms", type=int, default=20)
     parser.add_argument("--threshold", type=float, default=None,
                         help="显式阈值；缺省时 wake 模式用产品配置、official 模式用 0.25")

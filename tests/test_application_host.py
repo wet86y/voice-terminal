@@ -700,7 +700,7 @@ class LaunchModeTests(unittest.TestCase):
 class WindowsProcessTests(unittest.TestCase):
     def test_frozen_bundle_paths_are_not_inherited_by_business_environment(self):
         root = Path.cwd()
-        bundle = root / ".runtime/fake-bundle"
+        bundle = root / ".local/fake-bundle"
         env = {"Path": os.pathsep.join((str(bundle), str(bundle / "bin"), str(root / ".venv/Scripts")))}
         with patch.object(sys, "frozen", True, create=True), patch.object(sys, "_MEIPASS", str(bundle), create=True):
             clean = external_environment(env)
@@ -725,7 +725,7 @@ class WindowsProcessTests(unittest.TestCase):
             root = Path(directory)
             outer = Job()
             process = ManagedProcess([sys.executable, "-c",
-                "import asyncio; from voice_terminal.application.managed import wait_for_shutdown; asyncio.run(wait_for_shutdown()); print('closed')"],
+                "import sys; sys.path.insert(0, " + repr(str(Path(__file__).resolve().parents[1])) + "); import asyncio; from voice_terminal.application.managed import wait_for_shutdown; asyncio.run(wait_for_shutdown()); print('closed')"],
                 cwd=Path.cwd(), env=dict(os.environ), output=root / "日志.log", outer_job=outer,
                 event_name="Local\\VoiceTerminal-test-" + str(time.time_ns()))
             try:
@@ -745,7 +745,7 @@ class WindowsProcessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pid_path = root / "child.txt"
-            command = [sys.executable, "-c", "import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); Path(sys.argv[1]).write_text(str(p.pid)); time.sleep(60)", str(pid_path)]
+            command = [sys.executable, "-c", "import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable,'-B','-c','import time; time.sleep(60)']); Path(sys.argv[1]).write_text(str(p.pid)); time.sleep(60)", str(pid_path)]
             outer = Job()
             process = ManagedProcess(command, cwd=root, env=dict(os.environ), output=root / "process.log", outer_job=outer,
                 event_name="Local\\VoiceTerminal-test-" + str(time.time_ns()))
@@ -775,7 +775,7 @@ class WindowsProcessTests(unittest.TestCase):
 from pathlib import Path
 from voice_terminal.application.windows import Job,ManagedProcess
 job=Job()
-child=ManagedProcess([sys.executable,'-c','import time; time.sleep(60)'],cwd=Path.cwd(),env=dict(os.environ),output=Path(sys.argv[1])/'child.log',outer_job=job,event_name='Local\\\\VoiceTerminal-abrupt-'+str(os.getpid()))
+child=ManagedProcess([sys.executable,'-B','-c','import time; time.sleep(60)'],cwd=Path.cwd(),env=dict(os.environ),output=Path(sys.argv[1])/'child.log',outer_job=job,event_name='Local\\\\VoiceTerminal-abrupt-'+str(os.getpid()))
 Path(sys.argv[1],'pid.txt').write_text(str(child.pid))
 time.sleep(60)
 """, encoding="utf-8")

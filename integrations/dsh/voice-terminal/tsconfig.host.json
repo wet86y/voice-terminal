@@ -1,5 +1,5 @@
 {
-  "extends": "../../../.runtime/dsh/source/tsconfig.base.json",
+  "extends": "../../../.local/build/dsh/source/tsconfig.base.json",
   "compilerOptions": {
     "noEmit": true,
     "composite": false,
@@ -18,55 +18,55 @@
   ],
   "references": [
     {
-      "path": "../../../.runtime/dsh/source/vendor/cordis"
+      "path": "../../../.local/build/dsh/source/vendor/cordis"
     },
     {
-      "path": "../../../.runtime/dsh/source/vendor/schemastery"
+      "path": "../../../.local/build/dsh/source/vendor/schemastery"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/core/tools"
+      "path": "../../../.local/build/dsh/source/packages/core/tools"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/schedule/schedule"
+      "path": "../../../.local/build/dsh/source/packages/schedule/schedule"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/core/agent"
+      "path": "../../../.local/build/dsh/source/packages/core/agent"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/core/agent-loop"
+      "path": "../../../.local/build/dsh/source/packages/core/agent-loop"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/core/session"
+      "path": "../../../.local/build/dsh/source/packages/core/session"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/preset/agent-preset-registry"
+      "path": "../../../.local/build/dsh/source/packages/preset/agent-preset-registry"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/core/agent-default-model"
+      "path": "../../../.local/build/dsh/source/packages/core/agent-default-model"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/host/webserver"
+      "path": "../../../.local/build/dsh/source/packages/host/webserver"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/llm/llm"
+      "path": "../../../.local/build/dsh/source/packages/llm/llm"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/session/session-title"
+      "path": "../../../.local/build/dsh/source/packages/session/session-title"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/settings/settings"
+      "path": "../../../.local/build/dsh/source/packages/settings/settings"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/workspace/workspace"
+      "path": "../../../.local/build/dsh/source/packages/workspace/workspace"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/llm/token-meter"
+      "path": "../../../.local/build/dsh/source/packages/llm/token-meter"
     },
     {
-      "path": "../../../.runtime/dsh/source/vendor/loader"
+      "path": "../../../.local/build/dsh/source/vendor/loader"
     },
     {
-      "path": "../../../.runtime/dsh/source/packages/compaction/compaction"
+      "path": "../../../.local/build/dsh/source/packages/compaction/compaction"
     }
   ]
 }

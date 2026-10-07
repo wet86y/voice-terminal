@@ -53,7 +53,7 @@ class DshRuntimeManager:
     def __init__(self, config: DshConfig, *, callback_origin: str = "http://127.0.0.1:8765") -> None:
         self.config = config
         self.paths = AppPaths.resolve()
-        self.repo_root = self.paths.program_root if self.paths.separated else config.source_dir.parents[2]
+        self.repo_root = self.paths.program_root
         self.release_runtime = Path(os.environ["VOICE_DSH_RUNTIME"]).resolve() if os.environ.get("VOICE_DSH_RUNTIME") else None
         self.release_record: dict = {}
         if not callback_origin.startswith("http://127.0.0.1:"):
@@ -193,99 +193,11 @@ class DshRuntimeManager:
             self._message = "DSH 已随 Voice Server 关闭。"
 
     async def _validate_installation(self) -> tuple[str, Path]:
-        if self.release_runtime:
-            return await self._validate_release()
-        if os.name != "nt" or os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() not in {"amd64", "x86_64"}:
-            raise RuntimeError("当前 DSH 基线仅正式支持 Windows x64。")
-        node = os.environ.get("VOICE_NODE_EXECUTABLE") or shutil.which("node")
-        if not node:
-            raise RuntimeError("未找到 Node.js；需要 22.19.0 或更高兼容版本。")
-        version_output = await self._run_checked(node, "--version")
-        match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", version_output)
-        node_version = tuple(map(int, match.groups())) if match else (0, 0, 0)
-        supported_node = (
-            node_version[0] == 22 and node_version >= (22, 19, 0)
-        ) or node_version[0] >= 24
-        if not supported_node:
-            raise RuntimeError(f"Node.js 版本不满足 22.19.0 最低要求（当前 {version_output.strip()}）。")
-        package_file = self.config.source_dir / "package.json"
-        cli = self.config.source_dir / "apps" / "cli" / "lib" / "bin.js"
-        if not package_file.is_file():
-            raise RuntimeError("DSH 源码缺失；请运行 scripts\\setup-dsh.ps1。")
-        try:
-            package_version = str(json.loads(package_file.read_text(encoding="utf-8"))["version"])
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise RuntimeError("无法读取 DSH 根 package.json 版本。") from exc
-        if package_version != self.config.expected_version:
-            raise RuntimeError(f"DSH 源码版本不匹配：期望 {self.config.expected_version}，实际 {package_version}。")
-        if not cli.is_file():
-            raise RuntimeError("DSH CLI 构建产物缺失；请重新运行 scripts\\setup-dsh.ps1。")
-        git = shutil.which("git")
-        if not git:
-            raise RuntimeError("未找到 Git，无法验证 DSH commit。")
-        head = (await self._run_checked(git, "-C", str(self.config.source_dir), "rev-parse", "HEAD")).strip()
-        if head.lower() != self.config.expected_commit.lower():
-            raise RuntimeError(f"DSH commit 不匹配：期望 {self.config.expected_commit}，实际 {head}。")
-        cli_version = (await self._run_checked(node, str(cli), "--version", cwd=self.repo_root)).strip()
-        if self.config.expected_version not in cli_version:
-            raise RuntimeError(f"DSH CLI 版本不匹配：{cli_version or '无版本输出'}。")
-        if self.paths.separated:
-            from .profile import build_profile
-            build_profile(self.repo_root, self.config.source_dir.parent / "bundles", self.config.home_dir / "profiles/web")
-            await self._ensure_modules_link(self.config.source_dir / "python/sdk-runtime/node_modules")
-        if not self.config.profile_patch.is_file():
-            raise RuntimeError("DSH Web profile patch 缺失。")
-        managed_patch = self.config.home_dir / "profiles" / "web" / "cordis.patch.yml"
-        if not self._profile_patch_preserves_managed_defaults(self.config.profile_patch, managed_patch):
-            raise RuntimeError("DSH_HOME 的 Web profile patch（Web 配置补丁）缺少正式 Shadow preset（Shadow 预设）或 session-log（会话日志）设置；请运行 scripts\\setup-dsh.ps1。")
-        migrate_schedule_patch(managed_patch, native_enabled=native_schedule_enabled(managed_patch.parent))
-        from .profile import LEGACY_PACKAGES, PLUGIN_PACKAGE
-        bundle = self.config.source_dir.parent / "bundles" / "voice-terminal"
-        source = self.repo_root / "integrations" / "dsh" / "voice-terminal"
-        try:
-            profile_manifest = json.loads((self.config.home_dir / "profiles/web/package.json").read_text(encoding="utf-8-sig"))
-            package = json.loads((bundle / "package.json").read_text(encoding="utf-8-sig"))
-            state = json.loads((self.config.source_dir.parent / "build-state.json").read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("DSH 插件包、网页配置或构建记录缺失或无效。") from exc
-        dependencies = profile_manifest.get("dependencies", {})
-        selected = profile_manifest.get("dsh", {}).get("profile", {}).get("bundles", [])
-        if not dependencies.get(PLUGIN_PACKAGE) or selected.count(PLUGIN_PACKAGE) != 1:
-            raise RuntimeError("DSH 统一功能包未正确安装到项目 Web profile（网页配置）。")
-        if LEGACY_PACKAGES.intersection(dependencies) or LEGACY_PACKAGES.intersection(selected):
-            raise RuntimeError("DSH 旧功能包仍注册，可能重复加载；请重新运行 setup-dsh.ps1。")
-        if state.get("schema_version") != 6:
-            raise RuntimeError("DSH build-state（构建记录）格式已过期；请重新运行 scripts\\setup-dsh.ps1。")
-        if state.get("bridge_protocol_version") != self.config.bridge_protocol_version:
-            raise RuntimeError("DSH 桥接协议版本漂移；请重新运行 setup-dsh.ps1。")
-        if state.get("plugin_bundle_version") != package.get("version"):
-            raise RuntimeError("DSH 统一插件版本漂移；请重新运行 setup-dsh.ps1。")
-        runtime_artifacts = (bundle / "package.json", bundle / "cordis.patch.yml", bundle / "components.json", bundle / "lib")
-        build_inputs = (
-            source / "src", source / "preset", source / "package.json", source / "components.json",
-            source / "build.mjs", source / "check.mjs", source / "host.patch.yml", source / "tsconfig.json",
-            source / "tsconfig.host.json", source / "tsconfig.client.json", self.repo_root / "scripts/build-dsh-client.mjs",
-        )
-        checks = (
-            ("plugin_runtime_artifacts_sha256", self._tree_hash(*runtime_artifacts), "插件运行产物"),
-            ("plugin_build_inputs_sha256", self._tree_hash(*build_inputs), "插件构建输入"),
-            ("shadow_prompt_sha256", self._tree_hash(self.repo_root / "config/shadow_agent/instructions.md", self.repo_root / "config/dsh/shadow-agent.rules.md"), "影子代理提示词"),
-        )
-        for key, actual, label in checks:
-            if state.get(key) != actual:
-                raise RuntimeError(f"DSH {label} hash（摘要）漂移；请重新运行 setup-dsh.ps1。")
-        exports = package.get("exports", {})
-        if package.get("name") != PLUGIN_PACKAGE or package.get("main") != "lib/bridge/plugin.js" or exports.get(".") != "./lib/bridge/plugin.js":
-            raise RuntimeError("DSH 桥接组件的配置入口错误。")
-        if exports.get("./wake-tasks") != "./lib/wake-tasks/plugin.js" or exports.get("./client") != "./lib/client.js":
-            raise RuntimeError("DSH 唤醒任务或浏览器组件入口错误。")
-        if package.get("dsh", {}).get("client", {}).get("platform") != "web":
-            raise RuntimeError("DSH 浏览器组件平台声明错误。")
-        for entry in ("lib/bridge/plugin.js", "lib/wake-tasks/plugin.js", "lib/client.js"):
-            if not (bundle / entry).is_file():
-                raise RuntimeError(f"DSH 组件产物缺失：{entry}")
-        migrate_plugin_patch(managed_patch)
-        return node, cli
+        if self.release_runtime is None:
+            from ..local_layout import read_portable
+            selected = read_portable(self.paths.install_root)
+            self.release_runtime = self.paths.install_root / selected['dsh']
+        return await self._validate_release()
 
     async def _validate_release(self) -> tuple[str, Path]:
         """发行端校验闭合产物；不运行 Git（源码工具）或依赖安装。"""
@@ -317,7 +229,7 @@ class DshRuntimeManager:
         if (self.repo_root / "apps/desktop/Cargo.toml").is_file():
             # 源码工作台复用正式运行环境时，也更新已编译自研插件，保留用户补丁。
             from .profile import build_profile
-            build_profile(self.repo_root, self.repo_root / ".runtime/dsh/bundles", profile)
+            build_profile(self.repo_root, self.repo_root / ".local/build/dsh/bundles", profile)
         for source in template.rglob("*"):
             if not source.is_file():
                 continue

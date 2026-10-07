@@ -236,7 +236,7 @@ fn open_logs(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result
     require_command(state.mode, DesktopCommand::OpenLogs)?;
     trusted(&window, &state)?;
     let context = state.context.as_ref().ok_or("桌面样例没有产品日志目录。")?;
-    voice_desktop_common::windows::open(&context.data.join("logs"))
+    voice_desktop_common::windows::open(&context.install.join("cache/logs"))
 }
 #[tauri::command]
 fn focus_main(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<(), String> {
@@ -430,26 +430,20 @@ fn ui_preview_context(args: &[String]) -> Result<(PathBuf, Option<PathBuf>, Path
     }
     let root = arg_value(args, "--root")?.ok_or("桌面样例必须指定 --root（项目根目录）。")?;
     let program = voice_desktop_common::canonical_path(Path::new(root))?;
-    let data = program.join(".runtime/desktop-ui-preview");
+    let data = program.join(".local/cache/ui-demo");
     fs::create_dir_all(&data).map_err(|e| format!("桌面样例缓存目录不可用：{e}"))?;
     let data = voice_desktop_common::canonical_path(&data)?;
     if !data.starts_with(&program) {
         return Err("桌面样例缓存必须位于独立的项目运行目录。".into());
     }
-    let webview2 = arg_value(args, "--webview2")?
-        .map(|path| voice_desktop_common::canonical_path(&program.join(path)))
-        .transpose()?;
-    if let Some(engine) = &webview2 {
-        if !engine.join("msedgewebview2.exe").is_file() {
-            return Err("指定的 WebView2（网页运行时）缺少 msedgewebview2.exe。".into());
-        }
-    }
+    let shared = LaunchContext::portable(&program.join(".local"))?;
+    let webview2 = shared.webview2;
     Ok((program, webview2, data))
 }
 
 fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), String> {
     let logs = if let Some(context) = &state.context {
-        context.data.join("logs")
+        context.install.join("cache/logs")
     } else {
         state.data.clone()
     };
@@ -470,7 +464,8 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
         if !helper.is_file() {
             return Err("缺少桌面样例启动器 scripts/frontend-dev.mjs。".into());
         }
-        command = Command::new("node");
+        let shared = LaunchContext::portable(&state.program.join(".local"))?;
+        command = Command::new(shared.node.ok_or("宿主清单缺少 Node（脚本解释器）")?);
         command
             .arg(helper)
             .arg("--root")
@@ -490,7 +485,7 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
             .args(["-X", "utf8", "-X"])
             .arg(format!(
                 "pycache_prefix={}",
-                context.data.join("cache/python").display()
+                context.install.join("cache/python").display()
             ))
             .arg(context.program.join("scripts/backend-entry.py"))
             .arg("voice_terminal.application.launch")
@@ -685,7 +680,7 @@ fn run() -> Result<(), String> {
         }
         let program = context.program.clone();
         let data = context
-            .data
+            .install
             .join(if args.iter().any(|arg| arg == "--root") {
                 "cache/webview2-source"
             } else {
@@ -745,43 +740,44 @@ fn run() -> Result<(), String> {
         .setup(move |app| {
             let navigation_state = build_state.clone();
             let page_state = build_state.clone();
-            let main_window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                .title(if build_state.mode == FrontendMode::UiPreview {
-                    "Voice Terminal · 前端演示（无业务后端）"
-                } else {
-                    "Voice Terminal · 语音终端"
-                })
-                // inner_size（默认内容尺寸）：小窗口启动，前端按可用空间逐级收起侧栏。
-                .inner_size(1000., 640.)
-                .min_inner_size(400., 480.)
-                .data_directory(build_state.data.clone())
-                .on_navigation(move |url| {
-                    (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
-                        || (url.scheme() == "http"
-                            && url.host_str() == Some("tauri.localhost")
-                            && url.port().is_none())
-                        || navigation_state.allows_frontend_url(url)
-                })
-                .on_page_load(move |window, payload| {
-                    if !request_service_start(
-                        payload.url(),
-                        payload.event(),
-                        &page_state.service_requested,
-                        &page_state.stopping,
-                    ) {
-                        return;
-                    }
-                    // 最终主窗口的本地界面已加载，再从后台线程准备业务或演示服务。
-                    let _ = window.show();
-                    let service_app = window.app_handle().clone();
-                    let service_state = page_state.clone();
-                    std::thread::spawn(move || {
-                        if let Err(error) = start_service(service_app, service_state.clone()) {
-                            *service_state.error.lock().unwrap() = Some(error);
+            let main_window =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title(if build_state.mode == FrontendMode::UiPreview {
+                        "Voice Terminal · 前端演示（无业务后端）"
+                    } else {
+                        "Voice Terminal · 语音终端"
+                    })
+                    // inner_size（默认内容尺寸）：小窗口启动，前端按可用空间逐级收起侧栏。
+                    .inner_size(1000., 640.)
+                    .min_inner_size(400., 480.)
+                    .data_directory(build_state.data.clone())
+                    .on_navigation(move |url| {
+                        (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
+                            || (url.scheme() == "http"
+                                && url.host_str() == Some("tauri.localhost")
+                                && url.port().is_none())
+                            || navigation_state.allows_frontend_url(url)
+                    })
+                    .on_page_load(move |window, payload| {
+                        if !request_service_start(
+                            payload.url(),
+                            payload.event(),
+                            &page_state.service_requested,
+                            &page_state.stopping,
+                        ) {
+                            return;
                         }
-                    });
-                })
-                .build()?;
+                        // 最终主窗口的本地界面已加载，再从后台线程准备业务或演示服务。
+                        let _ = window.show();
+                        let service_app = window.app_handle().clone();
+                        let service_state = page_state.clone();
+                        std::thread::spawn(move || {
+                            if let Err(error) = start_service(service_app, service_state.clone()) {
+                                *service_state.error.lock().unwrap() = Some(error);
+                            }
+                        });
+                    })
+                    .build()?;
             app_icon::apply(main_window.hwnd()?.0)?;
             if build_state.mode == FrontendMode::Product {
                 let show_item = MenuItem::with_id(app, "show", "打开工作台", true, None::<&str>)?;
@@ -1087,7 +1083,11 @@ mod tests {
 
     #[test]
     fn preview_exposes_only_loading_status_and_exit_commands() {
-        for command in [DesktopCommand::Status, DesktopCommand::SkipStartup, DesktopCommand::Exit] {
+        for command in [
+            DesktopCommand::Status,
+            DesktopCommand::SkipStartup,
+            DesktopCommand::Exit,
+        ] {
             assert!(command_allowed(FrontendMode::UiPreview, command));
             assert!(require_command(FrontendMode::UiPreview, command).is_ok());
             assert!(command_allowed(FrontendMode::Product, command));

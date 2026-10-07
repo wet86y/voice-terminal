@@ -2,7 +2,7 @@
 
 一个项目内 Bundle（功能包）`@voice-terminal/dsh-plugin`，包含桥接、项目唤醒任务、浏览器界面和影子代理预设。组件职责及依赖见 [`components.json`](components.json)（组件声明），完整维护流程见[DSH 插件维护手册](../../../docs/dsh-plugin-maintenance.md)。
 
-安装只操作项目 `.runtime/dsh`。工具名、HTTP（网络接口）路径、Loader（加载器）行标识、设置命名空间、消息来源和任务存储格式保留历史契约。
+安装只操作项目 `.local/build/dsh`。工具名、HTTP（网络接口）路径、Loader（加载器）行标识、设置命名空间、消息来源和任务存储格式保留历史契约。
 
 - 根入口：桥接 `voice-terminal-shadow-bridge`（语音会话桥接）。
 - 子入口 `./wake-tasks`：`voice-terminal-wake-tasks`（项目唤醒任务）。

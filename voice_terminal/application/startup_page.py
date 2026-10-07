@@ -9,7 +9,7 @@ def render_startup_page(root: Path, document: str) -> str:
     """render_startup_page（渲染入口页）：替换统一样式与图标占位符。"""
     assets = root / "apps/desktop/boot"  # assets（统一加载画面的源资源目录）。
     if not (assets / "startup.css").is_file():
-        assets = Path(__file__).resolve().parents[2] / "apps/desktop/boot"
+        assets = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file()) / "apps/desktop/boot"
     style = (assets / "startup.css").read_text(encoding="utf-8")
     icon = (assets / "app-icon.svg").read_text(encoding="utf-8")
     return document.replace("__STARTUP_STYLE__", style).replace("__STARTUP_ICON__", icon)

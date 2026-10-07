@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 ONNX_GPU_VERSION = "1.24.4"  # ONNX_GPU_VERSION（已验证的显卡推理运行库版本）。
 
 

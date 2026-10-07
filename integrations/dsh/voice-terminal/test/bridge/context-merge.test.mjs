@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { clearActivationIfCurrent, stableBridgeToolId } from '../../../../../.runtime/dsh/bundles/voice-terminal-test/lib/bridge/messages.js'
-import { exportSessionPage, readSessionTelemetry } from '../../../../../.runtime/dsh/bundles/voice-terminal-test/lib/bridge/observer.js'
-import { deliverRuntimeReminder, enqueueAuthoritativeContext, enqueueDeferredActivation, holdAuthoritativeContext, releaseHeldContext, stopRuntimeReminder } from '../../../../../.runtime/dsh/bundles/voice-terminal-test/lib/bridge/context.js'
-import { assertV4MessageSources } from '../../../../../.runtime/dsh/source/packages/session/session-format-v3-to-v4/src/message-sources.ts'
+import { clearActivationIfCurrent, stableBridgeToolId } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/messages.js'
+import { exportSessionPage, readSessionTelemetry } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/observer.js'
+import { deliverRuntimeReminder, enqueueAuthoritativeContext, enqueueDeferredActivation, holdAuthoritativeContext, releaseHeldContext, stopRuntimeReminder } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/context.js'
+import { assertV4MessageSources } from '../../../../../.local/build/dsh/source/packages/session/session-format-v3-to-v4/src/message-sources.ts'
 
 function fixture() {
   const nextStep = []

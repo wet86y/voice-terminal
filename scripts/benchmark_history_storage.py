@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())))
 
 
 def main():

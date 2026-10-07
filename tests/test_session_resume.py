@@ -29,8 +29,8 @@ def resume_ledger(root: Path) -> SessionLedger:
 
 def make_runtime(root: Path) -> SessionRuntime:
     config = AppConfig(persona=PersonaConfig(directory=root / "config/persona"),
-                       dsh=replace(DshConfig(), home_dir=root / ".runtime/dsh/home"))
-    runtime = SessionRuntime(config, runtime_data_dir=root / ".runtime")
+                       dsh=replace(DshConfig(), home_dir=root / ".local/data/dsh"))
+    runtime = SessionRuntime(config, runtime_data_dir=root / ".local")
     runtime._restore_or_persist_voice_identity()
     runtime.state.wake_always_on = False
     return runtime

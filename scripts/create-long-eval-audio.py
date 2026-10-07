@@ -6,10 +6,12 @@ import argparse
 from pathlib import Path
 
 
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").is_file())
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, default=Path("logs/evaluation/audio/long.wav"))
-    parser.add_argument("--output-dir", type=Path, default=Path("logs/evaluation/audio"))
+    parser.add_argument("--source", type=Path, default=(ROOT / ".local/cache/evaluation/audio/long.wav"))
+    parser.add_argument("--output-dir", type=Path, default=(ROOT / ".local/cache/evaluation/audio"))
     parser.add_argument(
         "--durations",
         nargs="*",

@@ -1,6 +1,8 @@
-param([string]$OutputDir = "logs/evaluation/audio")
+﻿param([string]$OutputDir = "")
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Speech
+. (Join-Path $PSScriptRoot "local-context.ps1")
+if (-not $OutputDir) { $OutputDir = Join-Path (Get-ProjectRoot) ".local/cache/evaluation/audio" }
 $root = [System.IO.Path]::GetFullPath($OutputDir)
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
