@@ -87,26 +87,92 @@ class SessionLedger:
         self.shadow_active = False
         self._shadow_current_turn_keys: set[tuple[str, str, str]] = set()
         self.journal: SessionJournal | None = None
+        self.session_state: dict[str, Any] = {}  # session_state（语音身份及固定上下文的恢复状态）。
+        self._storage_restoring = False
         if storage_dir is not None:
             self.attach_storage(storage_dir, cache_bytes)
 
-    def attach_storage(self, directory: Path, cache_bytes: int = 8 * 1024 * 1024) -> None:
+    def attach_storage(self, directory: Path, cache_bytes: int = 8 * 1024 * 1024, *, resume: bool = False) -> None:
         if self.journal is not None:
             return
-        journal = SessionJournal(directory, cache_bytes)
-        for name, decode in (("entries", lambda value: SessionLedgerEntry(**value)),
-                             ("delivery_records", lambda value: value),
-                             ("_shadow_frames", lambda value: ShadowContextFrame(**value))):
-            sequence = StoredSequence(journal, name, decode)
-            for value in getattr(self, name):
-                sequence.append(value)
-            setattr(self, name, sequence)
-        for name in ("_committed_delivery_ids", "_shadow_current_turn_keys"):
-            stored = StoredSet(journal, name)
-            for value in getattr(self, name):
-                stored.add(value)
-            setattr(self, name, stored)
+        journal = SessionJournal(directory, cache_bytes, resume=resume)
+        try:
+            state = journal.restore_state() if resume else None
+            required = {"entries", "delivery_records", "_shadow_frames", "_committed_delivery_ids", "_shadow_current_turn_keys"}
+            if state is not None and (state.get("schema_version") != 1
+                    or not isinstance(state.get("sequences"), dict) or set(state["sequences"]) != required
+                    or type(state.get("shadow_context_epoch")) is not int or state["shadow_context_epoch"] < 1
+                    or type(state.get("shadow_input_revision")) is not int or state["shadow_input_revision"] < 0
+                    or not isinstance(state.get("records"), list) or not isinstance(state.get("conversation"), dict)
+                    or not isinstance(state.get("committed_shadow_event_ids"), list)
+                    or any(not isinstance(item, str) for item in state["committed_shadow_event_ids"])
+                    or not isinstance(state.get("session_state"), dict)
+                    or type(state.get("shadow_user_input_required")) is not bool):
+                raise RuntimeError("当前会话恢复检查点版本或命名空间无效，保留原始记录")
+            namespaces = state["sequences"] if state else {}
+            self._storage_restoring = True
+            prepared = {}  # prepared（通过验证后再交给台账的持久序列）。
+            for name, decode in (("entries", lambda value: SessionLedgerEntry(**value)),
+                                 ("delivery_records", lambda value: value),
+                                 ("_shadow_frames", lambda value: ShadowContextFrame(**value))):
+                prepared[name] = StoredSequence(journal, name, decode, restored=namespaces.get(name))
+            for name in ("_committed_delivery_ids", "_shadow_current_turn_keys"):
+                prepared[name] = StoredSet(journal, name, restored=namespaces.get(name))
+            if state:
+                frames = prepared["_shadow_frames"]
+                restored_revision = max(state["shadow_input_revision"], frames[-1].revision if frames else 0)
+                restored_records = [InputRecord(**item) for item in state["records"]][:self.limit]
+                restored_conversation = ConversationLog(limit=self.conversation.limit)
+                restored_conversation.restore(state["conversation"])
+                restored_events = deque(state["committed_shadow_event_ids"][-4096:])
+            for name, sequence in prepared.items():
+                for value in getattr(self, name):
+                    if isinstance(sequence, StoredSet):
+                        sequence.add(value)
+                    else:
+                        sequence.append(value)
+        except Exception:
+            self._storage_restoring = False
+            journal.close(export_document=False)
+            raise
         self.journal = journal
+        for name, sequence in prepared.items():
+            setattr(self, name, sequence)
+        if state:
+            self._shadow_context_epoch = state["shadow_context_epoch"]
+            self._shadow_input_revision = restored_revision
+            self.records = restored_records
+            self.conversation.restore(restored_conversation.snapshot())
+            self._committed_shadow_event_order = restored_events
+            self._committed_shadow_event_ids = set(restored_events)
+            self.shadow_user_input_required = state["shadow_user_input_required"]
+            self.session_state = dict(state["session_state"])
+        for name in ("entries", "delivery_records", "_shadow_frames"):
+            getattr(self, name).on_change = self.persist_state
+        for name in ("_committed_delivery_ids", "_shadow_current_turn_keys"):
+            getattr(self, name).values.on_change = self.persist_state
+        self.conversation.on_change = self.persist_state
+        self._storage_restoring = False
+        self.persist_state()
+
+    def persist_state(self) -> None:
+        """persist_state（保存恢复检查点）：正文保留在日志，仅复制有界界面与身份状态。"""
+        if self.journal is None or self._storage_restoring:
+            return
+        sequences = {name: getattr(self, name).checkpoint()
+                     for name in ("entries", "delivery_records", "_shadow_frames")}
+        sequences.update({name: getattr(self, name).values.checkpoint()
+                          for name in ("_committed_delivery_ids", "_shadow_current_turn_keys")})
+        self.journal.write(self.journal.STATE_KEY, {
+            "schema_version": 1, "sequences": sequences,  # 结构版本、正文序列命名空间。
+            "shadow_context_epoch": self._shadow_context_epoch,  # 后台上下文代次。
+            "shadow_input_revision": self._shadow_input_revision,  # 后台上下文修订号。
+            "records": [asdict(item) for item in self.records],  # 有界近期转写投影。
+            "conversation": self.conversation.snapshot(),  # 聊天列表与服务端顺序号。
+            "committed_shadow_event_ids": list(self._committed_shadow_event_order),  # 后台回传去重窗口。
+            "shadow_user_input_required": self.shadow_user_input_required,  # 等待用户状态。
+            "session_state": self.session_state,  # 语音身份与固定环境。
+        })
 
     def _find_entry(self, kind: str, identity: str):
         if isinstance(self.entries, StoredSequence):
@@ -118,6 +184,7 @@ class SessionLedger:
         return self.journal.close() if self.journal is not None else True
 
     def reset(self) -> None:
+        self._storage_restoring = True
         self.entries.clear()
         self.records.clear()
         self.delivery_records.clear()
@@ -135,6 +202,8 @@ class SessionLedger:
         self.shadow_user_input_required = False
         self.shadow_active = False
         self._shadow_current_turn_keys.clear()
+        self._storage_restoring = False
+        self.persist_state()
 
     @property
     def shadow_input_revision(self) -> int:
@@ -472,6 +541,8 @@ class SessionLedger:
                 record.details["transcript_updates"] = stored_updates
             break
 
+        self.persist_state()
+
     def update_turn_latency(self, turn_id: str, latency: dict[str, Any]) -> None:
         """Attach the settled speech timing snapshot to the input record."""
 
@@ -480,6 +551,7 @@ class SessionLedger:
         for record in self.records:
             if record.turn_id == turn_id:
                 record.details["latency"] = dict(latency)
+                self.persist_state()
                 break
 
     def has_speech(self, speech_id: str) -> bool:
@@ -631,6 +703,7 @@ class SessionLedger:
         ):
             self.set_shadow_runtime_state(active=False)
         if event.kind == "no_action":
+            self.persist_state()
             return True
         self.entries.append(SessionLedgerEntry("shadow_event", {
             "event_id": event.event_id, "kind": event.kind, "text": str(event.text)[:8000],
@@ -710,4 +783,5 @@ class SessionLedger:
         self.records = [existing for existing in self.records if existing.turn_id != item.turn_id]
         self.records.insert(0, item)
         del self.records[self.limit:]
+        self.persist_state()
         return item

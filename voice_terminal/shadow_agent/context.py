@@ -60,6 +60,15 @@ class ShadowContextProjector:
         if callable(commit):
             commit("continuity_document", {"document": text})
 
+    def environment_snapshot(self) -> dict[str, Any]:
+        """environment_snapshot（固定会话环境）：随当前语音会话保存。"""
+        return dict(self._environment.content)
+
+    def restore_environment(self, content: dict[str, Any]) -> None:
+        """restore_environment（恢复固定环境）：重启不改变既有上下文前缀。"""
+        self._environment = ShadowContextFrame(revision=0, origin="runtime", kind="session_environment", content=dict(content))
+        self._continuity_document = str(content.get("continuity_document") or "")
+
     @property
     def shadow_input_revision(self) -> int:
         self._sync_epoch()

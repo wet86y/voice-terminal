@@ -174,7 +174,7 @@ class DshSessionMapping:
     schema_version: int  # 映射结构版本：固定为 2，不读取旧结构。
     voice_session_id: str  # Voice 会话标识：本地语音会话的主键。
     backend: str  # 后端类型：当前固定为 dsh。
-    dsh_session_id: str  # DSH 会话标识：本进程创建的新绑定。
+    dsh_session_id: str  # DSH 会话标识：同一语音会话跨进程复用的绑定。
     epoch: int  # 会话代次：与 Voice 权威上下文一致。
     state: str  # 映射状态：active、idle、waiting_user、failed 或 retired。
     last_applied_revision: int  # 已应用修订号：DSH 已同步的最新 Voice 上下文版本。
@@ -444,6 +444,8 @@ class DshShadowAgentSession:
         self._waiting_user = False
         self._created_at = time.time()
         self._mapping_checked = False
+        self._binding_restore_checked = False  # 绑定恢复检查：独立于终态回执的加载。
+        self._resume_existing = False  # 已有会话恢复：重连使用持久身份而非再次创建。
         self._observer_trace_revision = 0
         self._observer_task: asyncio.Task[None] | None = None
         self._observer_target_revision = 0
@@ -789,27 +791,24 @@ class DshShadowAgentSession:
 
     async def reconnect(self) -> None:
         """Rebind bridge（重新绑定桥接）并同步上下文，不重新派发历史动作。"""
-        self._opened = False
-        await self._ensure_open()
-        await self._sync_context(force_snapshot=True, hold=True)
+        async with self._wake_lock:
+            self._resume_existing = self._opened or self._resume_existing
+            self._opened = False
+            await self._ensure_open()
+            await self._sync_context(force_snapshot=True, hold=True)
 
     async def _ensure_open(self) -> None:
         if self._opened:
             return
         operation = "session.open"
-        if not self._mapping_checked:
-            self._mapping_checked = True
+        if not self._binding_restore_checked:
             mapping = await self.mapping_store.load(self.voice_session_id)
             if mapping is not None and mapping.backend == "dsh" and mapping.epoch == self.epoch:
-                if mapping.gate_deferred_revision > 0 and mapping.state != "retired" and mapping.dsh_session_id != self.dsh_session_id:
-                    retired = await self.client.call("session.retire", {
-                        "request_id": str(uuid.uuid4()),
-                        "voice_session_id": self.voice_session_id,
-                        "dsh_session_id": mapping.dsh_session_id,
-                        "epoch": self.epoch,
-                    })
-                    if retired.get("result") not in {"accepted", "duplicate", "not_found", "stale"}:
-                        raise DshBridgeError("previous DSH activation could not be retired before gate recovery")
+                if mapping.state != "retired":
+                    self.dsh_session_id = mapping.dsh_session_id
+                    self._created_at = mapping.created_at
+                    self._resume_existing = True
+                    self._waiting_user = mapping.state == "waiting_user"
                 self._last_terminal_activation_id = mapping.last_terminal_activation_id
                 self._last_terminal_dsh_session_id = mapping.last_terminal_dsh_session_id
                 self._last_terminal_event_id = mapping.last_terminal_event_id
@@ -818,6 +817,24 @@ class DshShadowAgentSession:
                 if mapping.gate_deferred_revision:
                     self.last_guided_revision = mapping.gate_queued_revision
                     self.last_claimed_revision = mapping.gate_claimed_revision
+            elif mapping is not None and mapping.backend == "dsh" and mapping.state != "retired":
+                raise DshBridgeError("DSH（后台代理）会话代次与语音恢复状态不一致，保留旧绑定")
+            self._binding_restore_checked = True
+            self._mapping_checked = True
+        if self._resume_existing:
+            state = await self.client.call("session.state", self._envelope())
+            if state.get("result") in {"accepted", "duplicate"}:
+                if state.get("state") == "retired":
+                    raise DshBridgeError("DSH（后台代理）旧绑定已经退役，不能恢复为活动会话")
+                self.last_applied_revision = int(state.get("context_revision", 0))
+                self.activation_id = state.get("activation_id") or None
+                self._opened = True
+                self._notify_runtime_state()
+                await self._save_mapping(state="active" if self.activation_id else "waiting_user" if self._waiting_user else "idle")
+                return
+            if state.get("result") != "not_found":
+                raise DshBridgeError(f"DSH（后台代理）绑定恢复状态异常：{state.get('result')}")
+            operation = "session.resume"
         response = await self._call_reconciled(
             operation,
             self._envelope(
@@ -829,7 +846,12 @@ class DshShadowAgentSession:
         if response.get("result") not in {"accepted", "duplicate"}:
             raise DshBridgeError(f"DSH session open rejected: {response.get('result')}")
         self._opened = True
-        await self._save_mapping(state="active")
+        self._resume_existing = True
+        # 新宿主只恢复持久历史；旧进程的激活和上下文水位不能沿用。
+        self.activation_id = None
+        self.last_applied_revision = -1
+        self._notify_runtime_state()
+        await self._save_mapping(state="waiting_user" if self._waiting_user else "idle")
 
     async def _sync_context(self, *, force_snapshot: bool = False, hold: bool = False) -> None:
         current_epoch = int(self.context_source.shadow_context_epoch)
@@ -1039,6 +1061,8 @@ class DshShadowAgentSession:
             self.activation_id = None
             self._opened = False
             self._mapping_checked = True
+            self._binding_restore_checked = True
+            self._resume_existing = False
             self._retired = False
             self._waiting_user = False
             self._accepted_events.clear()
@@ -1077,17 +1101,18 @@ class DshShadowAgentSession:
         await self._stop_context_resync()
         await self._stop_observer()
         async with self._event_lock:
-            retire = self._opened and not self._retired
+            suspend = self._opened and not self._retired
             envelope = self._envelope()
             self._retired = True
             self.activation_id = None
             self._notify_runtime_state()
-        if retire:
+        if suspend:
             try:
-                await self.client.call("session.retire", envelope)
+                await self.client.call("session.cancel", envelope)
             except DshBridgeError:
                 pass
-            await self._save_mapping(state="retired", retired=True)
+            # 关闭进程／重建组件仅暂停执行；退役由显式重置和一小时交接拥有。
+            await self._save_mapping(state="waiting_user" if self._waiting_user else "idle")
         providers = [self.status_provider]
         if self.gate_provider is not self.status_provider:
             providers.append(self.gate_provider)

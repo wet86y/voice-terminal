@@ -870,7 +870,8 @@ export function apply(ctx: any, config: Config): void {
           // archive_only（仅恢复归档）：不注入提示或启动推理，保留原始持久记录。
           if (path === 'session.resume' && body.archive_only !== true) discardResumedAuthoritativeContext(binding)
           bindings.set(binding.dshSessionId, binding)
-          ctx.sessionTitle.rename(handle.agent.session, `Voice Shadow · ${binding.voiceSessionId.slice(0, 8)} · epoch ${binding.epoch}`)
+          const voiceLabel = binding.voiceSessionId.replace(/^conversation[-_]/, '').slice(0, 8)
+          ctx.sessionTitle.rename(handle.agent.session, `Voice Shadow · ${voiceLabel} · epoch ${binding.epoch}`)
           if (body.archive_only !== true) handle.agent.inject(createBridgeUserMessage([
             { type: 'text', text: `MANAGED VOICE SHADOW INSTRUCTIONS\nSource: config/shadow_agent/instructions.md\n\n${GENERATED_SHADOW_PROMPT}` },
           ]))
@@ -986,7 +987,8 @@ export function apply(ctx: any, config: Config): void {
           if (!await ctx.sessions.flush(existing.handle.agent.session)) throw new Error('session retire persistence failed')
           existing.state = 'retired'
           existing.exportSnapshot = undefined
-          ctx.sessionTitle.rename(existing.handle.agent.session, `Voice Shadow · ${existing.voiceSessionId.slice(0, 8)} · epoch ${existing.epoch} · retired`)
+          const voiceLabel = existing.voiceSessionId.replace(/^conversation[-_]/, '').slice(0, 8)
+          ctx.sessionTitle.rename(existing.handle.agent.session, `Voice Shadow · ${voiceLabel} · epoch ${existing.epoch} · retired`)
           response = result('accepted')
         } else if (path === 'session.state') {
           response = result('accepted', {
