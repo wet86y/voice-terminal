@@ -902,7 +902,20 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     }
     // Agent/output generations are independent of the currently displayed input turn.
     if (message.type === 'agent.state') { applyAgent(payload); return }
-    if (message.type === 'agent.trace') { applyAgentTrace(payload); return }
+    if (message.type === 'agent.trace') {
+      if (!isAgentTrace(payload)) return
+      applyAgentTrace(payload)
+      const traceTurnId = readString(payload, 'turn_id')
+      if (traceTurnId && (
+        (payload.kind === 'SPEAK_STATE_CHANGED' && payload.state === 'wait')
+        || payload.kind === 'SPEAK_CANCELLED'
+      )) {
+        // wait（等待）和纯停止 cancel（取消）是本轮计时终点；替换式 cancel（取消）
+        // 继续计时，直到 speech.started（语音开始播放）确认替换音频已起播。
+        stopPerceptualLatency(traceTurnId)
+      }
+      return
+    }
     if (message.type === 'agent.reasoning') { if (typeof payload.text === 'string') reasoning.value = payload.text; return }
     if (message.type === 'shadow.product') {
       const shadow = readShadowProduct(payload)

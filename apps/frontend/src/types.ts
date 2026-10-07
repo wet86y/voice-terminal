@@ -406,6 +406,8 @@ export interface AgentTrace {
   trace_id?: string | null
   request_id?: string | null
   turn_id?: string | null
+  /** state（决策状态）：播报状态变更事件中的 LLM 输出决策。 */
+  state?: string
   text?: string
   reason?: string
   name?: string

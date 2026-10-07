@@ -171,6 +171,115 @@ describe('V0.6 session protocol', () => {
     }
   })
 
+  it('freezes perceptual latency on a same-turn wait decision', () => {
+    vi.useFakeTimers()
+    try {
+      let clock = 1000
+      const { socket, terminal } = openTerminal(() => clock)
+      socket.push('input.started', 1, {}, { turn_id: 'input_a' })
+      socket.push('session.state', 2, { state: 'FINALIZING', listening: true, can_start: false }, { turn_id: 'input_a' })
+
+      clock = 1640
+      socket.push('agent.trace', 3, {
+        trace_seq: 1, kind: 'SPEAK_STATE_CHANGED', conversation_id: 'episode_a', turn_id: 'input_a', state: 'wait',
+      }, { turn_id: 'input_a' })
+
+      expect(terminal.perceptualLatencyRunning.value).toBe(false)
+      expect(terminal.perceptualLatencyMs.value).toBe(640)
+      clock = 1900
+      vi.advanceTimersByTime(50)
+      expect(terminal.perceptualLatencyMs.value).toBe(640)
+      terminal.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('freezes perceptual latency on a same-turn stop-only cancel', () => {
+    vi.useFakeTimers()
+    try {
+      let clock = 2000
+      const { socket, terminal } = openTerminal(() => clock)
+      socket.push('input.started', 1, {}, { turn_id: 'input_a' })
+      socket.push('session.state', 2, { state: 'FINALIZING', listening: true, can_start: false }, { turn_id: 'input_a' })
+
+      clock = 2475
+      socket.push('agent.trace', 3, {
+        trace_seq: 1, kind: 'SPEAK_CANCELLED', conversation_id: 'episode_a', turn_id: 'input_a',
+      }, { turn_id: 'input_a' })
+
+      expect(terminal.perceptualLatencyRunning.value).toBe(false)
+      expect(terminal.perceptualLatencyMs.value).toBe(475)
+      clock = 3000
+      vi.advanceTimersByTime(50)
+      expect(terminal.perceptualLatencyMs.value).toBe(475)
+      terminal.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('continues perceptual latency through cancel-with-replacement until its audio starts', () => {
+    vi.useFakeTimers()
+    try {
+      let clock = 3000
+      const { socket, terminal } = openTerminal(() => clock)
+      socket.push('input.started', 1, {}, { turn_id: 'input_a' })
+      socket.push('session.state', 2, { state: 'FINALIZING', listening: true, can_start: false }, { turn_id: 'input_a' })
+
+      clock = 3500
+      socket.push('agent.trace', 3, {
+        trace_seq: 1, kind: 'SPEAK_STATE_CHANGED', conversation_id: 'episode_a', turn_id: 'input_a', state: 'cancel',
+      }, { turn_id: 'input_a' })
+      socket.push('agent.trace', 4, {
+        trace_seq: 2, kind: 'SPEAK_CANCELLED_WITH_REPLACEMENT', conversation_id: 'episode_a', turn_id: 'input_a',
+      }, { turn_id: 'input_a' })
+      expect(terminal.perceptualLatencyRunning.value).toBe(true)
+
+      clock = 3780
+      socket.push('speech.started', 5, {
+        speech_id: 'speech_a', conversation_id: 'episode_a', turn_id: 'input_a', text: '替换播报', status: 'playing',
+      }, { turn_id: 'input_a', speech_id: 'speech_a' })
+
+      expect(terminal.perceptualLatencyRunning.value).toBe(false)
+      expect(terminal.perceptualLatencyMs.value).toBe(780)
+      terminal.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('ignores late, mismatched, or turnless agent decisions for perceptual latency', () => {
+    vi.useFakeTimers()
+    try {
+      let clock = 4000
+      const { socket, terminal } = openTerminal(() => clock)
+      socket.push('input.started', 1, {}, { turn_id: 'input_old' })
+      socket.push('session.state', 2, { state: 'FINALIZING', listening: true, can_start: false }, { turn_id: 'input_old' })
+      socket.push('input.started', 3, {}, { turn_id: 'input_current' })
+      socket.push('session.state', 4, { state: 'FINALIZING', listening: true, can_start: false }, { turn_id: 'input_current' })
+
+      clock = 4530
+      socket.push('agent.trace', 5, {
+        trace_seq: 1, kind: 'SPEAK_STATE_CHANGED', conversation_id: 'episode_a', turn_id: 'input_old', state: 'wait',
+      }, { turn_id: 'input_old' })
+      socket.push('agent.trace', 6, {
+        trace_seq: 2, kind: 'SPEAK_CANCELLED', conversation_id: 'episode_a',
+      })
+      expect(terminal.perceptualLatencyRunning.value).toBe(true)
+
+      clock = 4700
+      socket.push('agent.trace', 7, {
+        trace_seq: 3, kind: 'SPEAK_STATE_CHANGED', conversation_id: 'episode_a', turn_id: 'input_current', state: 'wait',
+      }, { turn_id: 'input_current' })
+      expect(terminal.perceptualLatencyRunning.value).toBe(false)
+      expect(terminal.perceptualLatencyMs.value).toBe(700)
+      terminal.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('renders only authorized speech deltas and complete delivery', () => {
     const { socket, terminal } = openTerminal()
     socket.push('agent.state', 1, { conversation_id: 'episode_a', request_id: 'decision_a', agent_busy: true })
