@@ -117,34 +117,19 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
                 f"model_registry_scan: {type(exc).__name__}: {str(exc)[:260]}"
             )
         try:
-            await runtime.initialize()
-        except BaseException:
-            await runtime.close_background_services()
-            await runtime.close()
-            await runtime.dsh.close()
-            raise
-        try:
-            compute_status = await runtime.compute_status()
-            restored_devices = await asyncio.to_thread(
-                product_settings.revert_failed_compute_devices,
-                compute_status.get("models", {}),
-            )
-            if restored_devices:
-                runtime.startup_errors.append(
-                    "compute_device_restore: CUDA 加载失败后已恢复为上次成功设备（"
-                    + ", ".join(f"{name}={device}" for name, device in sorted(restored_devices.items()))
-                    + ")."
-                )
-        except Exception as exc:
-            runtime.startup_errors.append(
-                f"compute_status_startup: {type(exc).__name__}: {str(exc)[:240]}"
-            )
-        if not os.environ.get("VOICE_APP_ORIGIN"):
-            runtime.dsh.begin_start()
-        application_report("voice", "初始化完成，等待服务监听")
-        try:
+            if runtime._application_phased_startup:
+                # 接口先监听；凭据已恢复，DSH（代理执行宿主）可以与三路模型加载重叠。
+                runtime.begin_dsh_start()
+                application_report("voice", "轻量接口已建立，等待本地模型加载放行")
+            else:
+                await runtime.initialize()
+                await runtime.restore_startup_compute()
+                if not os.environ.get("VOICE_APP_ORIGIN"):
+                    runtime.begin_dsh_start()
+                application_report("voice", "初始化完成，等待服务监听")
             yield
         finally:
+            runtime.begin_application_shutdown()
             try:
                 await runtime.close_background_services()
             finally:

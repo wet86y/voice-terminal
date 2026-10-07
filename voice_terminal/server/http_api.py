@@ -79,6 +79,15 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     async def health() -> dict[str, Any]:
         return runtime.health_payload()
 
+    @app.middleware("http")
+    async def startup_gate(request: Request, call_next):
+        """startup_gate（启动门禁）：允许设置与查询，声纹采集等待模型加载结束。"""
+        if (getattr(runtime, "application_initializing", False) is True
+                and request.method not in {"GET", "OPTIONS"}
+                and request.url.path.startswith("/api/v1/speaker/")):
+            return JSONResponse({"detail": "组件仍在加载，请等待启动完成后采集或测试声纹。"}, status_code=503)
+        return await call_next(request)
+
     def authorize_application(request: Request) -> None:
         token = os.environ.get("VOICE_APP_INTERNAL_TOKEN", "")
         remote = request.client.host if request.client else ""
@@ -97,14 +106,17 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         authorize_application(request)
         payload = await request.json()
         if not isinstance(payload, dict) or payload.get("action") not in {
-            "pause", "dsh-start", "dsh-retry", "speaker-retry", "reinitialize"
+            "pause", "dsh-start", "dsh-retry", "dsh-wait", "speaker-retry", "reinitialize",
+            "initialize-local", "initialize-session"
         }:
             raise HTTPException(status_code=422, detail="受管操作无效。")
-        if payload["action"] == "reinitialize":
-            for field, environment in (("asr_available", "VOICE_APP_ASR_AVAILABLE"),
-                                       ("analysis_available", "VOICE_APP_ANALYSIS_AVAILABLE")):
-                if not isinstance(payload.get(field), bool):
-                    raise HTTPException(status_code=422, detail="缺少受管工作进程状态。")
+        if payload["action"] in {"reinitialize", "initialize-session"}:
+            fields = (("asr_available", "VOICE_APP_ASR_AVAILABLE"),
+                      ("analysis_available", "VOICE_APP_ANALYSIS_AVAILABLE"))
+            # 全部字段验证成功后再更新环境，避免无效请求留下半份依赖状态。
+            if any(type(payload.get(field)) is not bool for field, _ in fields):
+                raise HTTPException(status_code=422, detail="缺少受管工作进程状态。")
+            for field, environment in fields:
                 os.environ[environment] = "1" if payload[field] else "0"
         return await runtime.application_control(payload["action"])
 
@@ -625,6 +637,13 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     async def update_product_speaker(body: dict[str, Any]) -> dict[str, Any]:
         try:
             store = product_store_or_404()
+            if getattr(runtime, "application_initializing", False) is True:
+                if (body.get("mode") == "filter" or body.get("owner_only_barge_in") is True) and not runtime.speaker_profile.available:
+                    raise HTTPException(status_code=422, detail="未注册主人声纹前不能启用拦截或主人打断")
+                value = await asyncio.to_thread(store.save_speaker, body)
+                runtime.stage_product_settings(store.settings_only())
+                return {"settings": {"speaker": value}, "effective_from": "next_session", "pending": True,
+                        "message": "声纹设置已保存，组件加载完成后的下一次会话生效。"}
             previous_speaker = store.settings_only().get("speaker", {
                 "mode": "off",
                 "confirm_threshold": runtime.config.speaker.confirm_threshold,
@@ -949,6 +968,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     continue
                 command, _payload = parsed
                 logger.info("websocket.command peer=%s command=%s", websocket.client, command)
+                if (getattr(runtime, "application_initializing", False) is True
+                        and command in {"session.start", "session.reset", "shadow.debug.wake"}):
+                    await _send_error(websocket, sequencer, "RUNTIME_STARTING", "组件仍在加载，请等待启动完成。", None, True)
+                    continue
                 if command == "subscribe":
                     await websocket.send_json(sequencer.envelope(runtime.snapshot()))
                 elif command == "session.start":

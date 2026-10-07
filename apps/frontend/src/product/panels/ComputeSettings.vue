@@ -37,19 +37,20 @@ const rows = computed<LocalComponentRow[]>(() => {
     const ownerFailed = ['failed', 'blocked', 'stopped'].includes(owner?.state ?? '')
     const disabled = !ownerFailed && (status?.service === 'DISABLED' || owner?.state === 'disabled')
     const loading = busy || (!ownerFailed && !disabled && (['waiting', 'starting', 'stopping'].includes(owner?.state ?? (!status ? 'starting' : '')) || status?.service === 'STARTING'))
-    const available = !loading && !ownerFailed && !disabled && ['READY', 'DEGRADED'].includes(status?.service ?? '')
+    // 模型详情接口尚未开放时，以宿主已通过的工作进程健康检查呈现就绪状态。
+    const available = !loading && !ownerFailed && !disabled && (status ? ['READY', 'DEGRADED'].includes(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
     const ownerError = ownerFailed ? owner?.error || status?.runtime_error || (owner?.state === 'blocked' ? '组件依赖不可用，请检查所属进程。' : owner?.state === 'stopped' ? '组件进程已退出。' : '组件运行异常，请查看日志并重试。') : undefined
     const gpuAvailable = available && !refreshing.value && status?.gpu_available === true
     return {
       id: item.id, name: item.title,
       state: available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
-      status: busy ? '正在恢复' : ownerFailed ? '不可用' : disabled ? '已停用' : loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : serviceLabel(status?.service),
+      status: busy ? '正在恢复' : ownerFailed ? '不可用' : disabled ? '已停用' : loading ? owner?.state === 'waiting' ? '等待启动' : owner?.state === 'stopping' ? '退出中' : '启动中' : !status && available ? '已就绪' : serviceLabel(status?.service),
       available, retryable: !available && !loading && Boolean(owner?.retry_allowed), busy,
       runtime: status?.runtime || '未提供',
       residentMemory: countedHere ? formatComponentMemory(metrics?.memory_rss_bytes ?? legacyResource?.rss_bytes) : undefined,
       privateMemory: countedHere ? formatComponentMemory(metrics?.memory_private_commit_bytes ?? legacyResource?.private_commit_bytes) : undefined,
       vram: countedHere && status?.device?.startsWith('cuda') ? formatComponentMemory(metrics?.gpu_dedicated_bytes ?? legacyResource?.gpu_dedicated_bytes) : undefined,
-      description: item.detail, error: !available && !loading ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
+      description: loading ? owner?.phase || '等待组件启动' : item.detail, error: !available && !loading ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
       note: countedHere ? '资源来自宿主同次采样，包含该进程及其子进程。' : item.id === 'smart_turn' ? '与 SenseVoice（语音识别与分析）共享进程，资源计入该条目。' : '与 Voice Server（语音服务）共享进程，资源计入语音服务条目。',
       facts: [
         ...(resource?.pid == null ? [] : [{ label: '进程标识', value: String(resource.pid) }]),
@@ -57,7 +58,7 @@ const rows = computed<LocalComponentRow[]>(() => {
       ],
       device: {
         value: settings.compute.devices[item.id], current: deviceLabel(status?.device),
-        locked: !available || refreshing.value,
+        locked: !available || !status || refreshing.value,
         draft: settings.compute.devices[item.id] !== computeSavedDevices.value[item.id],
         pending: Boolean(status && computeSavedDevices.value[item.id] !== status.requested_device),
         options: [
@@ -76,7 +77,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     return {
       id: component.id, name: component.name,
       state: available ? 'ready' : component.state === 'disabled' ? 'disabled' : loading ? 'loading' : 'failed',
-      status: busy ? '正在恢复' : available ? component.id === 'setup' ? '已通过' : '运行中' : component.state === 'disabled' ? '已停用' : loading ? '启动中' : '不可用',
+      status: busy ? '正在恢复' : available ? component.id === 'setup' ? '已通过' : '运行中' : component.state === 'disabled' ? '已停用' : loading ? component.state === 'waiting' ? '等待启动' : '启动中' : '不可用',
       available, retryable: component.retry_allowed && !busy, busy,
       runtime: component.id === 'dsh' ? 'Node.js（执行环境）' : component.id === 'voice' ? 'Python（语音进程）' : component.id === 'web' ? '桌面宿主' : '本地进程',
       residentMemory: formatComponentMemory(metrics?.memory_rss_bytes), privateMemory: formatComponentMemory(metrics?.memory_private_commit_bytes),

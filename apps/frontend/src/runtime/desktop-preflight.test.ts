@@ -13,6 +13,43 @@ afterEach(() => {
 })
 
 describe('desktop preflight（桌面预检）', () => {
+  it('等待原生权限验证时可以跳过画面，仍然等验证成功后才加载界面', async () => {
+    let resolve!: (value: unknown) => void
+    const pending = new Promise<unknown>(done => { resolve = done })
+    const call = vi.fn((command: string) => command === 'desktop_status' ? pending : Promise.resolve())
+    const startApplication = vi.fn(async () => undefined)
+    const onSkip = vi.fn()
+    const root = document.createElement('div')
+    const running = runDesktopPreflight({ expectedMode: 'product', invoke: { invoke: call as NativeCommandInvoker['invoke'] }, startApplication, onSkip, root })
+    const skip = root.querySelector<HTMLButtonElement>('.startup-button')!
+    expect(skip.textContent).toBe('跳过')
+    skip.click()
+    expect(onSkip).toHaveBeenCalledOnce()
+    expect(startApplication).not.toHaveBeenCalled()
+    resolve({ ready: true, error: null, frontend_mode: 'product', development: false })
+    await running
+    expect(startApplication).toHaveBeenCalledWith(expect.objectContaining({ startup_skipped: true }))
+    expect(call).toHaveBeenCalledWith('skip_startup')
+  })
+
+  it('接力原生等待页的跳过选择', async () => {
+    const onSkip = vi.fn()
+    const startApplication = vi.fn(async () => undefined)
+    await runDesktopPreflight({ expectedMode: 'product', invoke: native({ ready: true, error: null, frontend_mode: 'product', development: false, startup_skipped: true }), startApplication, onSkip })
+    expect(onSkip).toHaveBeenCalledOnce()
+    expect(startApplication).toHaveBeenCalledWith(expect.objectContaining({ startup_skipped: true }))
+  })
+
+  it('首屏按钮在模块加载前选择跳过，桌面验证后仍进入设置', async () => {
+    const root = document.createElement('div')
+    root.dataset.startupSkipped = 'true'
+    const startApplication = vi.fn(async () => undefined)
+    const onSkip = vi.fn()
+    await runDesktopPreflight({ expectedMode: 'product', invoke: native({ ready: true, error: null, frontend_mode: 'product', development: false }), startApplication, onSkip, root })
+    expect(onSkip).toHaveBeenCalledOnce()
+    expect(startApplication).toHaveBeenCalledWith(expect.objectContaining({ startup_skipped: true }))
+  })
+
   it.each([
     [undefined, '桌面启动程序返回了无效状态'],
     [{ ready: true, error: '宿主启动失败', frontend_mode: 'product', development: false }, '宿主启动失败'],

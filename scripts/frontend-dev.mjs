@@ -1,5 +1,6 @@
 /** Desktop development server（桌面开发服务）：统一验证资源、配置和热更新连接。 */
 import http from 'node:http'
+import { readFileSync } from 'node:fs'
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -7,7 +8,9 @@ import { createInterface } from 'node:readline'
 import { createServer as createViteServer } from 'vite'
 
 const ENTRY_HINT = '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Voice Terminal · 桌面入口</title><style>body{font:16px system-ui;background:#101217;color:#edf0f6;margin:10vh auto;max-width:720px;padding:24px}</style><h1>请通过桌面程序打开</h1><p>主产品和样例预览均使用桌面窗口。开发请在项目中执行 npm run dev（真实业务）或 npm run dev:ui（样例展示）。</p><p>如果此说明出现在桌面窗口中，会话已失效，请退出应用后重新启动。</p></html>'
-const bootstrap = destination => `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>进入桌面界面</title><script>location.replace(${JSON.stringify(destination)})</script></html>`
+const startupStyle = readFileSync(new URL('../apps/desktop/boot/startup.css', import.meta.url), 'utf8') // startupStyle（共用加载样式）。
+const startupIcon = readFileSync(new URL('../apps/desktop/boot/app-icon.svg', import.meta.url), 'utf8') // startupIcon（共用应用图标）。
+const bootstrap = destination => `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Voice Terminal · 语音终端</title><style>html,body{margin:0;background:#0e1118}${startupStyle}</style><main class="startup-screen" role="status"><section class="startup-content"><div class="startup-icon" role="img" aria-label="语音终端">${startupIcon}</div><h1 class="startup-title">应用启动中</h1><p class="startup-status">正在加载应用界面</p><div class="startup-progress" data-indeterminate="true" role="progressbar" aria-label="应用启动进度"><span class="startup-progress-fill"></span></div><div class="startup-actions"><button class="startup-button" type="button" onclick="window.__TAURI_INTERNALS__?.invoke('skip_startup')">跳过</button></div></section></main><script>location.replace(${JSON.stringify(destination)})</script></html>`
 
 function equal(left, right) {
   const a = Buffer.from(left || ''), b = Buffer.from(right || '')

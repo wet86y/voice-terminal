@@ -97,6 +97,11 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         # runtime owns the publication that follows every append.
         self.history.conversation.set_sink(self._publish_conversation_entry)
         self.startup_errors: list[str] = []
+        # phased_startup（分阶段启动）：轻量接口先监听，本地模型和会话分别由宿主放行。
+        self._application_phased_startup = os.environ.get("VOICE_APP_PHASED_STARTUP") == "1"
+        self._application_local_ready = False
+        self._application_session_ready = False
+        self._application_startup_lock = asyncio.Lock()
         # compute_status（计算状态）记录 Voice Server 内 KWS 与 FSMN-VAD 的实际设备。
         self._compute_models: dict[str, dict[str, Any]] = {}
         self.capture: AudioCapture | None = None
@@ -252,6 +257,31 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         logger.warning("%s", self.startup_errors[-1])
 
     async def initialize(self) -> None:
+        """initialize（完整初始化）：独立服务与恢复操作继续使用同一完整路径。"""
+        await self.initialize_local()
+        await self.initialize_session()
+
+    async def _load_native(self, factory, *args, **kwargs):
+        """_load_native（后台原生加载）：保持接口响应，取消时等加载结束后回收结果。"""
+        task = asyncio.create_task(asyncio.to_thread(factory, *args, **kwargs))
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # 原生构造不能强行中断；避免退出清理后再产生遗漏的关键词线程。
+            result = await task
+            close = getattr(result, "close", None)
+            if close:
+                close()
+            raise
+        if getattr(self, "_application_stopping", False):
+            close = getattr(result, "close", None)
+            if close:
+                close()
+            raise asyncio.CancelledError
+        return result
+
+    async def initialize_local(self) -> None:
+        """initialize_local（本地模型初始化）：无需识别或分析进程已就绪。"""
         from ..audio.levels import AudioLevelMeter
         self.audio_meter = AudioLevelMeter(self.state, self.bus,
             playback_active=lambda: self.state.listening and
@@ -301,7 +331,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
 
         if self.config.wake.enabled:
             try:
-                self.kws = self._build_kws_worker()
+                self.kws = await self._load_native(self._build_kws_worker)
                 self.state.set_service("kws", "READY")
             except Exception as exc:
                 self._record_error("kws", str(exc))
@@ -317,7 +347,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
 
         try:
             vad_requested = self.config.compute.devices.get("voice_vad", "cpu")
-            self.vad = FsmnVadDetector(
+            self.vad = await self._load_native(FsmnVadDetector,
                 model_dir=self.config.vad_model_dir,
                 device=vad_requested,
                 fallback_device=self.config.compute.fallback_devices.get("voice_vad", "cpu"),
@@ -340,7 +370,13 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             }
             self._record_error("vad", str(exc), status_service="asr")
 
-        application_report("voice", "连接语音识别并初始化声纹")
+        application_report("voice", "初始化声纹工作进程")
+        await self._initialize_speaker()
+        self._application_local_ready = True
+
+    async def initialize_session(self) -> None:
+        """initialize_session（会话依赖汇合）：只在模型分支结束后连接并建立调度器。"""
+        application_report("voice", "连接语音识别与分析服务")
         self.asr = AsrWorkerClient(self.config.asr.worker_url)
         try:
             await self.asr.connect()
@@ -350,8 +386,6 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         except Exception as exc:
             code = getattr(exc, "code", "ASR_WORKER_UNAVAILABLE")
             self._record_error("asr", f"{code}: {exc}")
-
-        await self._initialize_speaker()
 
         application_report("voice", "配置主模型、影子代理与语音合成")
         llm_key = self._api_key(self.config.llm.api_key_env)
@@ -563,6 +597,8 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 await self._resume_handoff()
         if self._quiet_clock_task is None or self._quiet_clock_task.done():
             self._quiet_clock_task = asyncio.create_task(self._quiet_clock(), name="quiet-hours-policy")
+        self._application_bound_dsh_pid = None
+        self._application_session_ready = True
 
     async def _initialize_native_shadow(self, shadow_cfg: Any, shadow_key: str) -> None:
         try:
@@ -1176,6 +1212,9 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         self.state.set_state(TerminalState.STARTING, listening=False)
 
     async def start_listening(self) -> None:
+        if self.application_initializing:
+            await self.bus.publish(event("error", code="RUNTIME_STARTING", message="组件仍在加载，请等待启动完成。", recoverable=True))
+            return
         async with self._session_lock:
             if getattr(self, "_speaker_captures", {}):
                 await self.bus.publish(event("error", code="SPEAKER_INPUT_BUSY", message="请结束声纹采集后再开始语音会话。", recoverable=True))
@@ -1310,6 +1349,8 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                 await bus.publish(self.snapshot())
 
     async def close(self) -> None:
+        self._application_session_ready = False
+        self._application_local_ready = False
         await self.close_speaker_captures()
         if getattr(self, "audio_meter", None) is not None:
             await self.audio_meter.close()

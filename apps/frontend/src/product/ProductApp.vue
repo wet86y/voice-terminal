@@ -107,7 +107,7 @@ function nativeAction(action: () => Promise<void>) {
           }}<button aria-label="关闭提示" @click="setNotice('')">×</button>
         </div></Transition
       >
-      <ApplicationStartup @system="showApplicationSystem" @models="activePage = 'settings'; activeSettingsTab = 'models'"
+      <ApplicationStartup @system="showApplicationSystem"
     /></template>
   </AppFrame>
 </template>

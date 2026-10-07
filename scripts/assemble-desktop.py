@@ -137,6 +137,11 @@ def collect_program(program: Path, desktop: Path) -> None:
     program.mkdir(parents=True)
     shutil.copy2(desktop / "VoiceTerminalDesktop.exe", program / "VoiceTerminalDesktop.exe")
     collect_frontend(ROOT / "apps/frontend/dist", program / "apps/frontend/dist")
+    # 原生入口已内嵌资源；网页握手入口复用同一份加载画面。
+    startup_assets = program / "apps/desktop/boot"
+    startup_assets.mkdir(parents=True)
+    for name in ("startup.css", "app-icon.svg"):
+        shutil.copy2(ROOT / "apps/desktop/boot" / name, startup_assets / name)
     for relative in ("voice_terminal", "apps/server", "config/dsh", "config/shadow_agent", "config/templates"):
         copy_tree(ROOT / relative, program / relative)
     (program / "scripts").mkdir()

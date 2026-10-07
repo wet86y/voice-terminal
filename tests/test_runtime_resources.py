@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from voice_terminal.resources import ResourcePolicy, ResourceRegistry, aggregate_resource_status, registry
+from voice_terminal.resources import ResourcePolicy, ResourceRegistry, aggregate_resource_status, model_thread_budget, registry
 from voice_terminal.analysis.worker import AnalysisLane
 from voice_terminal.audio.shared import SharedAudio, SharedAudioReader, capabilities
 
@@ -23,6 +23,19 @@ def test_policy_does_not_change_legacy_threads_and_overrides_only_selected_role(
     assert policy.environment("speaker", parent=original)["OMP_NUM_THREADS"] == "2"
     assert policy.environment("asr", parent=original)["OPENBLAS_NUM_THREADS"] == "20"
     assert original == {"OPENBLAS_NUM_THREADS": "20", "KEEP": "value"}
+
+
+def test_explicit_model_thread_budget_matches_native_libraries(monkeypatch):
+    env = ResourcePolicy({"asr": 2}).environment("asr", parent={})
+    monkeypatch.setenv("VOICE_MODEL_THREADS", env["VOICE_MODEL_THREADS"])
+    assert model_thread_budget() == 2
+    assert all(env[name] == "2" for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"))
+
+
+def test_invalid_model_thread_budget_keeps_original_default(monkeypatch):
+    for value in ("0", "bad", "1000"):
+        monkeypatch.setenv("VOICE_MODEL_THREADS", value)
+        assert model_thread_budget() == 4
 
 
 @pytest.mark.parametrize("data", [{"native_threads": {"voice": True}}, {"native_threads": {"bad": 4}},

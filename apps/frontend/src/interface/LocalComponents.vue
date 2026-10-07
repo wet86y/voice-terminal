@@ -62,6 +62,7 @@ function invalidDevice(row: LocalComponentRow) {
         <div class="local-component-summary">
           <div class="local-component-body">
             <div class="local-component-identity"><h4 :title="row.name">{{ row.name }}</h4><span class="local-state" :class="row.state"><i aria-hidden="true"></i>{{ row.status }}</span></div>
+            <p v-if="row.state === 'loading'" class="local-component-phase" aria-live="polite">{{ row.description }}</p>
             <dl class="local-component-metrics">
               <div v-if="row.runtime && row.runtime !== '未提供'" class="local-runtime-metric" data-metric="runtime"><dt>运行时</dt><dd>{{ row.runtime }}</dd></div>
               <div class="local-resource-metrics">
@@ -93,6 +94,7 @@ function invalidDevice(row: LocalComponentRow) {
 </template>
 
 <style scoped>
+.local-component-phase{margin:6px 0 0;color:var(--muted);font-size:var(--font-caption);line-height:1.6}
 .local-components{display:flex;flex-direction:column;gap:20px;min-width:0;container-type:inline-size}
 .local-refresh{display:inline-flex;align-items:center;gap:6px;flex-shrink:0;min-height:var(--compact-control-height);padding:6px 10px;font-size:var(--font-body)}
 svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}

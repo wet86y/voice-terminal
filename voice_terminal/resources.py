@@ -56,8 +56,10 @@ class ResourcePolicy:
         if paths.separated:
             env.update(paths.environment())
         env["VOICE_RESOURCE_ROLE"] = role
+        env.pop("VOICE_MODEL_THREADS", None)
         if role in self.native_threads:
             env.update({name: str(self.native_threads[role]) for name in THREAD_ENV})
+            env["VOICE_MODEL_THREADS"] = str(self.native_threads[role])  # VOICE_MODEL_THREADS（模型计算线程预算）。
         if model_dir:
             for name, folder in (("MODELSCOPE_CACHE", "modelscope"), ("HF_HOME", "huggingface"),
                                  ("TORCH_HOME", "torch"), ("PIP_CACHE_DIR", "pip")):
@@ -68,6 +70,15 @@ class ResourcePolicy:
 def bootstrap_resources(role: str) -> None:
     """先于 NumPy（数值库）等导入；直接运行工作进程也应用同一策略。"""
     os.environ.update(ResourcePolicy.load().environment(role))
+
+
+def model_thread_budget(default: int = 4) -> int:
+    """model_thread_budget（模型线程预算）：防止模型加载器覆盖明确选择的原生线程数。"""
+    try:
+        value = int(os.environ.get("VOICE_MODEL_THREADS", str(default)))
+        return value if 1 <= value <= 256 else default
+    except ValueError:
+        return default
 
 
 class ResourceRegistry:

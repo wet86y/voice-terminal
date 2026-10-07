@@ -1,6 +1,6 @@
 {
   "identifier": "boot",
-  "description": "本地诊断页仅能读取启动结果和退出当前应用。",
+  "description": "本地加载页只允许读取状态、跳过加载画面和退出当前应用。",
   "windows": ["main"],
-  "permissions": ["allow-desktop-status", "allow-exit-application"]
+  "permissions": ["allow-desktop-status", "allow-skip-startup", "allow-exit-application"]
 }

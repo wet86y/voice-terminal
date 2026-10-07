@@ -564,7 +564,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function startSpeakerEnrollment() {
-    if (!application.businessReady.value) {
+    if (!application.businessReady.value || application.snapshot.value?.startup_complete === false) {
       setError(new Error('语音服务尚未就绪，不能开始声纹录音。'))
       return
     }
@@ -620,6 +620,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
    * as a fallback via `addSpeakerEnrollmentSegment`.
    */
   async function captureSpeakerEnrollmentSegment(index: number, label: string, seconds: number, signal?: AbortSignal, captureId?: string) {
+    if (application.snapshot.value?.startup_complete === false) return null
     const enrollment = speakerEnrollment.value
     if (!enrollment) return null
     try {
@@ -644,6 +645,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function captureSpeakerTest(seconds: number, signal?: AbortSignal, captureId?: string) {
+    if (application.snapshot.value?.startup_complete === false) {
+      setError(new Error('组件仍在启动，请稍后再进行声纹测试。'))
+      return null
+    }
     try {
       const result = await productApi.captureSpeakerTest({ seconds, ...(captureId ? { capture_id: captureId } : {}) }, signal)
       if (adapterDisposed || signal?.aborted) return null
@@ -884,6 +889,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   function runtimeAction() {
     if (!application.businessReady.value) return false
+    if (application.snapshot.value?.startup_complete === false) return false
     if (!connected.value) {
       voice.connect()
       void loadSnapshot()
@@ -897,12 +903,12 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   function resetSession() {
-    if (!connected.value) return false
+    if (!connected.value || application.snapshot.value?.startup_complete === false) return false
     return voice.resetSession()
   }
 
   function setReasoningMode(mode: ReasoningMode) {
-    if (!connected.value) return false
+    if (!connected.value || application.snapshot.value?.startup_complete === false) return false
     return voice.setReasoningMode(mode)
   }
 

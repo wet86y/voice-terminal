@@ -39,6 +39,9 @@ class ApplicationHost:
         self.processes: dict[str, ManagedProcess] = {}
         self.generations: dict[str, str] = {}
         self.manifest = {}
+        self.voice_entry_ready = False  # voice_entry_ready（轻量语音入口已监听）。
+        self.voice_local_ready = False  # voice_local_ready（第三路本地模型加载已结束）。
+        self.voice_entry_only = False  # voice_entry_only（本次生成采用分阶段启动）。
         self.origin = ""
         self.frontend_origin = ""  # frontend_origin（受管界面来源）：界面服务对业务 API 的可信来源。
         self.frontend_cookie_name = ""  # frontend_cookie_name（实例专属会话 Cookie 名称）。
@@ -124,6 +127,7 @@ class ApplicationHost:
         if self.llm_provider:
             env["VOICE_LLM_PROVIDER"] = self.llm_provider
         if key == "voice":
+            env["VOICE_APP_PHASED_STARTUP"] = "1" if self.voice_entry_only else "0"
             rows = {c["id"]: c for c in self.state.snapshot()["components"]}
             env["VOICE_APP_ASR_AVAILABLE"] = "1" if rows["asr"]["state"] in {"ready", "external"} else "0"
             env["VOICE_APP_ANALYSIS_AVAILABLE"] = "1" if rows["analysis"]["state"] == "ready" else "0"
@@ -279,7 +283,7 @@ class ApplicationHost:
             # 语音合成中的 STREAMING（流式传输中）都属于正常工作状态。
             unavailable = [label for name, label in names.items() if services.get(name) not in SERVICE_READY_STATES]
             ready = not unavailable
-            self.state.update(core_available=ready, capabilities=services)
+            self.state.update(core_available=ready, capabilities=services, voice_api_ready=True)
             error = "核心能力未就绪：" + "、".join(unavailable) if unavailable else ""
             self.state.component("voice", error=error)
             if self.state.value["startup_complete"]:
@@ -288,7 +292,7 @@ class ApplicationHost:
             return True
         return False
 
-    async def start_service(self, key):
+    async def start_service(self, key, *, entry_only=False):
         if key == "analysis" and (self.no_analysis or not self.manifest["analysis_enabled"]):
             self.state.component(key, state="disabled", enabled=False, phase="配置已停用")
             return
@@ -301,6 +305,10 @@ class ApplicationHost:
         if self.port_busy(address):
             raise RuntimeError("组件地址被未知进程占用，未接管或结束该进程：" + address)
         module = {"asr": "apps.server.asr_worker", "analysis": "apps.server.analysis_worker", "voice": "apps.server.main"}[key]
+        if key == "voice":
+            self.voice_entry_only = entry_only
+            self.voice_entry_ready = self.voice_local_ready = False
+            self.state.update(voice_api_ready=False, core_available=False)
         from ..paths import python_command
         process = self.spawn(key, python_command(self.python, module, "--config", self.config, root=self.root))
         deadline = time.monotonic() + self.manifest.get("worker_timeout_seconds", 180)
@@ -311,7 +319,10 @@ class ApplicationHost:
                 raise RuntimeError(f"组件启动中退出（退出码 {process.poll()}），请查看 application-{key}.log（组件启动日志）。")
             try:
                 if await self.probe(key):
-                    if key == "voice" and not self.state.value["core_available"]:
+                    if key == "voice" and entry_only:
+                        self.state.component(key, state="waiting", phase="接口已监听，等待本地模型加载", error="")
+                        self.voice_entry_ready = True
+                    elif key == "voice" and not self.state.value["core_available"]:
                         self.state.component(key, state="failed", phase="接口就绪，核心能力不可用")
                     else:
                         self.state.component(key, state="ready", phase="应用层健康检查通过", error="")
@@ -322,8 +333,51 @@ class ApplicationHost:
         self.stop_group(key)
         raise RuntimeError("组件启动等待超时；请查看对应组件日志。")
 
-    async def delegated_status(self):
-        data = await self.http(self.state.value["voice_api_url"] + "/internal/application/status")
+    async def start_voice_entry(self):
+        """start_voice_entry（提前建立轻量入口）：让同一所有者立即并行启动代理宿主。"""
+        self.voice_entry_ready = self.voice_local_ready = False
+        try:
+            await self.start_service("voice", entry_only=True)
+        except Exception as exc:
+            self.state.component("voice", state="failed", phase="语音入口启动失败", error=str(exc))
+            for key in ("speaker", "dsh"):
+                self.state.component(key, state="blocked", phase="依赖语音入口", error="语音入口未就绪")
+
+    async def start_voice_local(self):
+        """start_voice_local（第三路模型加载）：复用已监听的受管语音进程。"""
+        self.state.component("voice", state="starting", phase="加载关键词唤醒、语音检测与声纹", error="")
+        response = await self.voice_control("initialize-local", timeout=self.manifest.get("worker_timeout_seconds", 180) + 10)
+        if not response.get("ok"):
+            raise RuntimeError(response.get("message", "语音本地模型加载失败"))
+        self.voice_local_ready = True
+        self.state.component("voice", state="starting", phase="本地模型已加载，等待识别与分析服务汇合")
+
+    async def finish_voice_startup(self):
+        """finish_voice_startup（完整就绪屏障）：依赖汇合后才建立唯一会话调度器。"""
+        if not self.voice_local_ready or self.state.snapshot()["stopping"]:
+            return
+        try:
+            response = await self.voice_control("initialize-session", timeout=self.manifest.get("worker_timeout_seconds", 180) + 10)
+            await self.probe("voice")
+            ready = response.get("ok") and self.state.value["core_available"]
+            self.state.component("voice", state="ready" if ready else "failed",
+                phase="核心能力已就绪" if ready else "接口就绪，核心能力不可用",
+                error="" if ready else response.get("message", "核心能力尚未完整就绪"))
+        except Exception as exc:
+            self.state.update(core_available=False)
+            self.state.component("voice", state="failed", phase="会话初始化失败", error=str(exc))
+
+    async def watch_delegated_startup(self):
+        """watch_delegated_startup（启动状态同步）：模型加载期间持续呈现代理与声纹进度。"""
+        while not self.state.snapshot()["stopping"]:
+            try:
+                await self.delegated_status()
+            except Exception:
+                pass  # 接口短暂繁忙由最终健康检查统一判定，保留当前加载状态。
+            await asyncio.sleep(.5)
+
+    async def delegated_status(self, *, timeout=3):
+        data = await self.http(self.state.value["voice_api_url"] + "/internal/application/status", timeout=timeout)
         for key in ("speaker", "dsh"):
             item = data[key]
             row = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
@@ -337,11 +391,119 @@ class ApplicationHost:
             for key in ("speaker", "dsh"):
                 self.state.component(key, state="blocked", phase="依赖语音服务", error="语音服务未运行")
             return
-        await self.delegated_status()
+        data = await self.delegated_status(timeout=self.manifest.get("dsh_timeout_seconds", 120) + 10)
         if self.manifest["dsh_enabled"]:
-            self.state.component("dsh", state="starting", phase="启动代理与任务运行环境")
+            if self.voice_entry_only:
+                if not data.get("startup", {}).get("session_ready"):
+                    self.state.component("dsh", state="blocked", phase="等待恢复语音会话", error="语音会话初始化未完成")
+                    return
+                # 内存达到 95% 时排队不计入代理实际启动超时；启动后的限时仍由原管理器执行。
+                while data["dsh"]["state"] in {"waiting", "starting"}:
+                    if self.state.snapshot()["stopping"]:
+                        return
+                    await asyncio.sleep(.5)
+                    data = await self.delegated_status(timeout=self.manifest.get("dsh_timeout_seconds", 120) + 10)
+                return
+            self.state.component("dsh", state="starting", phase="等待代理运行环境与会话绑定")
             await self.voice_control("dsh-start", timeout=self.manifest["dsh_timeout_seconds"] + 10)
         await self.delegated_status()
+
+    async def start_component(self, key):
+        """start_component（独立组件启动）：失败不取消其他独立加载分支。"""
+        if self.state.snapshot()["stopping"]:
+            return
+        self.state.update(phase="启动" + next(c["name"] for c in self.state.snapshot()["components"] if c["id"] == key))
+        try:
+            if key == "voice" and self.voice_entry_ready:
+                await self.start_voice_local()
+            else:
+                await self.start_service(key)
+        except Exception as exc:
+            self.state.component(key, state="failed", phase="启动失败", error=str(exc), pid=None)
+
+    def loading_usage(self, keys):
+        """loading_usage（加载中已使用的内存）：校验受管进程身份，采样缺失时保留完整预算。"""
+        import psutil
+        result = {}
+        for key in keys:
+            resident, commit = 0, 0
+            owned = self.processes.get(key)
+            if owned:
+                try:
+                    process = psutil.Process(owned.pid)
+                    if abs(process.create_time() - owned.created_at) < 2:
+                        memory = process.memory_info()
+                        resident, commit = memory.rss, getattr(memory, "private", 0) or 0
+                        if key == "voice":
+                            self.state.update(voice_api_ready=False)
+                            # 声纹与代理子树都属于语音进程，预算只扣除实际已使用部分。
+                            for child in process.children(recursive=True):
+                                try:
+                                    child_memory = child.memory_info()
+                                    resident += child_memory.rss
+                                    commit += getattr(child_memory, "private", 0) or 0
+                                except psutil.Error:
+                                    pass
+                except (OSError, psutil.Error):
+                    pass
+            result[key] = (resident, commit)
+        return result
+
+    async def start_model_services(self, keys=("asr", "analysis")):
+        """start_model_services（模型启动调度）：识别优先，实时预算下最多同时加载三路。"""
+        from .startup_budget import parallel_admission, sample_startup_resources
+        policy = ResourcePolicy.load(Path(os.environ.get("VOICE_RESOURCE_POLICY", str(self.paths.config / "runtime-resources.json"))))
+        pending = list(keys)
+        active = {}  # active（加载中的任务及其组件）。
+        gpu_roles = set(self.manifest.get("startup_gpu_roles", ("asr", "analysis")))
+        threads = dict(policy.native_threads)
+        if self.manifest.get("speaker_enabled"):
+            threads["voice"] = threads.get("voice", 4) + threads.get("speaker", 4)
+        sampled_at = 0.0
+        reason = "优先加载语音识别组件"
+        try:
+            while pending or active:
+                if self.state.snapshot()["stopping"]:
+                    return
+                finished = [task for task in active if task.done()]
+                for task in finished:
+                    active.pop(task)
+                    await task
+                if pending:
+                    key = pending[0]
+                    # 停用组件及外部识别的健康检查不占用重型模型加载通道。
+                    heavy = [role for task, role in active.items() if not task.done()
+                             and not (role == "asr" and self.no_worker)]
+                    enabled = key != "analysis" or not (self.no_analysis or not self.manifest.get("analysis_enabled", True))
+                    allowed = not heavy or not enabled
+                    now = time.monotonic()
+                    if not allowed and now - sampled_at >= 1:
+                        sampled_at = now
+                        if os.environ.get("VOICE_STARTUP_PARALLEL") == "0":
+                            reason = "已选择串行加载"
+                        else:
+                            resources = await asyncio.to_thread(sample_startup_resources,
+                                check_gpu=key in gpu_roles and any(role in gpu_roles for role in heavy))
+                            allowed, reason = parallel_admission(resources, key, self.loading_usage(heavy),
+                                gpu_roles=gpu_roles, threads=threads)
+                    if self.state.snapshot()["stopping"]:
+                        return
+                    if allowed:
+                        pending.pop(0)
+                        task = asyncio.create_task(self.start_component(key))
+                        active[task] = key
+                        log.info("启动调度：组件=%s，策略=%s", key, "并行加载" if heavy else "单路加载")
+                        await asyncio.sleep(0)
+                    else:
+                        self.state.component(key, state="waiting", phase="等待资源：" + reason)
+                if active:
+                    await asyncio.wait(active, timeout=.25, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in active:
+                if not task.done():
+                    task.cancel()
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
 
     async def startup(self):
         async with self.operation_lock:
@@ -354,12 +516,17 @@ class ApplicationHost:
                     self.state.component(key, state="blocked", phase="依赖启动检查", error="请先修复启动环境或配置")
                 self.state.finish()
                 return
-            for key in ("asr", "analysis", "voice"):
-                self.state.update(phase="启动" + next(c["name"] for c in self.state.value["components"] if c["id"] == key))
-                try:
-                    await self.start_service(key)
-                except Exception as exc:
-                    self.state.component(key, state="failed", phase="启动失败", error=str(exc), pid=None)
+            await self.start_voice_entry()
+            watcher = asyncio.create_task(self.watch_delegated_startup()) if self.voice_entry_ready else None
+            try:
+                await self.start_model_services(("asr", "analysis", "voice") if self.voice_entry_ready else ("asr", "analysis"))
+                await self.finish_voice_startup()
+            finally:
+                if watcher:
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
+            if self.state.snapshot()["stopping"]:
+                return
             try:
                 await self.start_delegated()
             except Exception as exc:
@@ -384,12 +551,20 @@ class ApplicationHost:
                 elif key == "setup":
                     # 已存在的组件保留所有权，重新检查后只恢复失败项。
                     await self.setup()
-                    for name in ("asr", "analysis", "voice"):
-                        if name not in self.processes:
-                            try:
-                                await self.start_service(name)
-                            except Exception as exc:
-                                self.state.component(name, state="failed", phase="启动失败", error=str(exc), pid=None)
+                    if "voice" not in self.processes:
+                        await self.start_voice_entry()
+                    keys = [name for name in ("asr", "analysis") if name not in self.processes]
+                    if self.voice_entry_ready and not self.voice_local_ready:
+                        keys.append("voice")
+                    watcher = asyncio.create_task(self.watch_delegated_startup()) if self.voice_entry_ready else None
+                    try:
+                        await self.start_model_services(keys)
+                        if self.voice_entry_ready:
+                            await self.finish_voice_startup()
+                    finally:
+                        if watcher:
+                            watcher.cancel()
+                            await asyncio.gather(watcher, return_exceptions=True)
                     try:
                         await self.start_delegated()
                     except Exception as exc:
@@ -534,7 +709,7 @@ class ApplicationHost:
                         await self.probe("voice")
                         await self.delegated_status()
                     except Exception:
-                        self.state.update(core_available=False)
+                        self.state.update(core_available=False, voice_api_ready=False)
                         self.state.component("voice", state="failed", phase="语音接口不可用", error="语音服务健康检查失败，请查看组件日志")
                 for key in ("asr", "analysis"):
                     row = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
@@ -558,7 +733,7 @@ class ApplicationHost:
     async def shutdown(self):
         # 总退出预算 15 秒，预留 1 秒发布最终状态并关闭宿主界面入口。
         deadline = min(time.monotonic() + 14, self.shutdown_deadline or float("inf"))
-        self.state.update(stopping=True, state="stopping", core_available=False, phase="正在退出并回收组件")
+        self.state.update(stopping=True, state="stopping", core_available=False, voice_api_ready=False, phase="正在退出并回收组件")
         for task in tuple(self.background):
             task.cancel()
         await asyncio.gather(*tuple(self.background), return_exceptions=True)
