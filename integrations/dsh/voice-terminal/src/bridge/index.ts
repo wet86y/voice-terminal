@@ -4,7 +4,7 @@ import { TOKEN } from '../shared/protocol.js'
 import { CALLBACK_ORIGIN } from '../shared/environment.js'
 import { BRIDGE_NAME } from '../shared/identity.js'
 import { initializeVoiceTerminalSettings } from './settings.js'
-import { registerSessionEvents } from './events.js'
+import { registerSessionEvents, stopRuntimeActivity } from './events.js'
 import { createBridgeRoute } from './http.js'
 import { stopRuntimeReminder } from './context.js'
 import type { Binding, Config } from './contracts.js'
@@ -35,9 +35,11 @@ export function apply(ctx: Context, config: Config): void {
       for (const binding of bindings.values()) {
         binding.state = 'retired'
         stopRuntimeReminder(binding, true)
+        stopRuntimeActivity(binding)
       }
       if (typeof dispose === 'function') dispose()
       await Promise.all([...bindings.values()].map(binding => binding.callbacks?.dispose()))
+      await Promise.all([...bindings.values()].map(binding => binding.actionQueue))
       bindings.clear()
     }
   }, `voice-terminal-shadow-bridge: ${config.routePrefix}`)

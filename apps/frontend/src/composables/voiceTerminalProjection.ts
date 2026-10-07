@@ -185,6 +185,10 @@ export function readShadowProduct(value: unknown): ShadowProductSnapshot | null 
     context: readTelemetry(value.context, ['used_tokens', 'limit_tokens', 'usage_percent']),
     provider: readTelemetry(value.provider, ['input_tokens', 'cached_tokens', 'cache_hit_ratio']),
   }
+  if (value.backend === 'native' || value.backend === 'dsh') result.backend = value.backend
+  if (value.model_management === 'voice_terminal' || value.model_management === 'dsh_harness') {
+    result.model_management = value.model_management
+  }
   if (activities !== undefined) result.activities = activities
   if (value.last_activity_at === null || typeof value.last_activity_at === 'string') {
     result.last_activity_at = value.last_activity_at

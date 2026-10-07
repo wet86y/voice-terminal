@@ -1062,7 +1062,7 @@ class ShadowProductProjection:
             if phase == "delta":
                 delta = item.get("delta")
                 if isinstance(delta, str) and delta:
-                    merged["text"] = f"{current.get('text', '')}{delta}"[:4000]
+                    merged["text"] = f"{current.get('text', '')}{delta}"[-4000:]
                 merged.pop("delta", None)
             elif "text" not in item and "text" in current:
                 merged["text"] = current["text"]

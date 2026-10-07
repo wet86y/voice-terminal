@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
@@ -88,6 +89,17 @@ def _safe_identifier(value: str, *, field: str) -> str:
     if value != raw:
         raise DshBridgeError(f"invalid {field}")
     return value
+
+
+def _safe_activity_text(value: Any, *, limit: int) -> str:
+    """Sanitize bounded activity text（净化并限制单槽活动文本长度）。"""
+    if not isinstance(value, str):
+        return ""
+    cleaned = "".join(
+        char if char in "\n\r\t" or ord(char) >= 32 else " "
+        for char in value
+    )
+    return cleaned[:limit]
 
 
 def _strict_text(value: Any, *, field: str, maximum: int) -> str:
@@ -452,6 +464,8 @@ class DshShadowAgentSession:
         self._observer_force = False
         self._visible_status = ""
         self._run_seq = 0
+        self._last_action_seq = 0  # action_seq（动作序号）：当前激活内已接收的实时动作水位。
+        self._pending_terminal_state: str | None = None  # terminal state（终态状态）：等待 DSH 根 Agent 真正空闲后清槽。
         self._observer_committed_steps = 0
         self._context_resync_task: asyncio.Task[None] | None = None
         self._telemetry: dict[str, int | float] = {}  # telemetry（桥接插件会话用量）：不包含正文或凭据。
@@ -609,6 +623,8 @@ class DshShadowAgentSession:
                         return "already_current"
                     raise DshBridgeError(f"DSH wake rejected: {code}")
                 self.activation_id = activation
+                self._last_action_seq = 0
+                self._pending_terminal_state = None
                 if deferred_handoff:
                     log.info("dsh.context_gate handoff voice_session_id=%s old_activation_id=%s new_activation_id=%s queued_revision=%s",
                              self.voice_session_id, self._last_terminal_activation_id,
@@ -828,6 +844,8 @@ class DshShadowAgentSession:
                     raise DshBridgeError("DSH（后台代理）旧绑定已经退役，不能恢复为活动会话")
                 self.last_applied_revision = int(state.get("context_revision", 0))
                 self.activation_id = state.get("activation_id") or None
+                self._last_action_seq = 0
+                self._pending_terminal_state = None
                 self._opened = True
                 self._notify_runtime_state()
                 await self._save_mapping(state="active" if self.activation_id else "waiting_user" if self._waiting_user else "idle")
@@ -1195,7 +1213,8 @@ class DshShadowAgentSession:
                 state = "waiting_user" if self._waiting_user else (
                     "failed" if event_type == "failed" else "idle"
                 )
-                await self._activity(state, terminal=event_type)
+                self._pending_terminal_state = state
+                self._notify_runtime_state()
                 await self._save_mapping(state=state)
                 if self._deferred_revision > 0:
                     self._schedule_handoff()
@@ -1250,8 +1269,43 @@ class DshShadowAgentSession:
                     and payload.get("context_revision") == self.last_applied_revision
                     and not self._retired):
                 self._update_telemetry(payload)
-            if not await self._callback_matches_or_reconcile(payload):
+            matched = await self._callback_matches_or_reconcile(payload)
+            terminal_match = self._matches_pending_terminal_callback(payload)
+            if not matched and not terminal_match:
                 return "stale"
+            raw_activity = payload.get("activity")
+            normalized = None
+            if "activity" in payload:
+                if not isinstance(raw_activity, Mapping):
+                    return "conflict"
+                normalized = self._normalize_runtime_activity(raw_activity)
+                if normalized is None:
+                    return "conflict"
+                if self.activation_id is None and (
+                        not terminal_match or normalized["stream"] != "tool"
+                        or normalized["phase"] not in {"completed", "failed"}):
+                    return "stale"
+            # action_seq（动作序号）也约束空闲状态，避免旧状态清空新动作。
+            if "action_seq" in payload or normalized is not None:
+                action_seq = payload.get("action_seq")
+                if (not isinstance(action_seq, int) or isinstance(action_seq, bool)
+                        or not 1 <= action_seq <= 2**53 - 1):
+                    return "conflict"
+                if action_seq <= self._last_action_seq:
+                    return "stale"
+                self._last_action_seq = action_seq
+            if normalized is not None:
+                if self.activity_sink is not None:
+                    await self.activity_sink([{
+                        "backend": "dsh", "state": "running",
+                        "run_seq": self._run_seq,
+                        "timestamp": utc_now_iso(),
+                        "voice_session_id": self.voice_session_id,
+                        "dsh_session_id": self.dsh_session_id,
+                        "epoch": self.epoch,
+                        **normalized,
+                    }])
+                return "accepted"
             claimed = payload.get("claimed_revision")
             if isinstance(claimed, int) and not isinstance(claimed, bool) and claimed >= self.last_claimed_revision:
                 if claimed > self.last_claimed_revision:
@@ -1260,8 +1314,11 @@ class DshShadowAgentSession:
                         log.info("dsh.context_gate claimed voice_session_id=%s activation_id=%s claimed_revision=%s",
                                  self.voice_session_id, self.activation_id, claimed)
                     await self._save_mapping(state="active")
-            await self._activity(str(payload.get("state") or "running"),
-                                 trace_revision=payload.get("trace_revision"))
+            callback_state = str(payload.get("state") or "running")
+            if terminal_match and callback_state in {"idle", "cancelled", "waiting_user", "failed"}:
+                callback_state = self._pending_terminal_state or callback_state
+                self._pending_terminal_state = None
+            await self._activity(callback_state, trace_revision=payload.get("trace_revision"))
             trace_revision = payload.get("trace_revision")
             committed_steps = payload.get("committed_steps")
             if isinstance(trace_revision, int) and not isinstance(trace_revision, bool):
@@ -1271,6 +1328,64 @@ class DshShadowAgentSession:
                     self._observer_committed_steps = committed_steps
                     self._schedule_observer()
             return "accepted"
+
+    def _matches_pending_terminal_callback(self, payload: Mapping[str, Any]) -> bool:
+        """Accept only late results from this run's terminal tool（只接收本次终态工具的迟到结果）。"""
+        return (
+            self.activation_id is None
+            and self._pending_terminal_state is not None
+            and not self._retired
+            and payload.get("protocol_version") == BRIDGE_PROTOCOL_VERSION
+            and payload.get("voice_session_id") == self.voice_session_id
+            and payload.get("dsh_session_id") == self._last_terminal_dsh_session_id == self.dsh_session_id
+            and payload.get("epoch") == self.epoch
+            and payload.get("activation_id") == self._last_terminal_activation_id
+            and payload.get("context_revision") == self.last_applied_revision
+        )
+
+    @staticmethod
+    def _normalize_runtime_activity(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Validate the UI-only DSH action shape（校验仅供界面显示的 DSH 动作结构）。"""
+        stream = raw.get("stream")
+        phase = raw.get("phase")
+        item_id = raw.get("item_id")
+        if (not isinstance(stream, str) or not isinstance(phase, str)
+                or not isinstance(item_id, str) or not item_id.strip() or len(item_id) > 160):
+            return None
+        if stream == "thinking":
+            if phase == "delta":
+                if set(raw) != {"stream", "phase", "item_id", "delta"}:
+                    return None
+                delta = raw.get("delta")
+                if not isinstance(delta, str) or not delta or len(delta) > 2000:
+                    return None
+                return {
+                    "item_id": item_id.strip(), "stream": stream, "phase": phase,
+                    "delta": _safe_activity_text(delta, limit=2000),
+                }
+            if phase == "completed":
+                if set(raw) != {"stream", "phase", "item_id"}:
+                    return None
+                return {"item_id": item_id.strip(), "stream": stream, "phase": phase}
+            return None
+        if stream == "tool" and phase in {"started", "completed", "failed"}:
+            if set(raw) != {"stream", "phase", "item_id", "tool_name", "tool_status"}:
+                return None
+            raw_name = raw.get("tool_name")
+            if not isinstance(raw_name, str) or not raw_name.strip() or len(raw_name) > 160:
+                return None
+            tool_name = _safe_activity_text(raw_name, limit=160).strip()
+            tool_status = raw.get("tool_status")
+            if (not tool_name or not isinstance(tool_status, str)
+                    or tool_status not in {"running", "completed", "failed"}):
+                return None
+            if tool_status != phase and not (phase == "started" and tool_status == "running"):
+                return None
+            return {
+                "item_id": item_id.strip(), "stream": stream, "phase": phase,
+                "tool_name": tool_name, "tool_status": tool_status,
+            }
+        return None
 
     def _update_telemetry(self, payload: dict[str, Any]) -> None:
         """telemetry（插件用量）只允许有限的非负计数及缓存比例。"""
@@ -1650,7 +1765,7 @@ class DshShadowAgentSession:
             elif state == "failed":
                 stream, phase, item_id = "lifecycle", "failed", f"run-{self._run_seq}"
             else:
-                stream, phase, item_id = "thinking", "delta", f"observer-{self._run_seq}"
+                return
             await self.activity_sink([{
                 "backend": "dsh", "state": state,
                 "run_seq": self._run_seq,

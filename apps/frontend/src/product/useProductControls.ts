@@ -596,14 +596,22 @@ export function useProductControls() {
       timestamp: item.timestamp,
     }));
   }
-  const shadowRunningTrace = computed(() =>
-    shadowActivities.value.filter(
-      (item) =>
-        item.stream === "thinking" ||
-        item.stream === "lifecycle" ||
-        item.stream === "tool",
-    ),
-  );
+  const shadowRunningTrace = computed(() => {
+    if (shadow.value.backend !== "dsh") return [];
+    const latestRun = shadowActivities.value.reduce<number | null>(
+      (current, item) => current === null ? item.run_seq : Math.max(current, item.run_seq),
+      null,
+    );
+    if (latestRun === null) return [];
+    const currentRun = shadowActivities.value.filter((item) => item.run_seq === latestRun);
+    const lifecycle = [...currentRun].reverse().find((item) => item.stream === "lifecycle");
+    if (!lifecycle || lifecycle.phase === "completed" || lifecycle.phase === "failed") return [];
+    const currentAction = currentRun.filter(
+      (item) => (item.stream === "thinking" || item.stream === "tool")
+        && !item.item_id.startsWith("observer-"),
+    ).at(-1);
+    return currentAction ? [currentAction] : [];
+  });
   const shadowEventActivities = computed(() => {
     const values = shadowActivities.value.filter(
       (item) => item.stream === "event",
@@ -1569,11 +1577,10 @@ export function useProductControls() {
             : Math.round(shadowCacheHitRatio.value * 100) + "%",
         trace: shadowRunningTrace.value.map((item) => ({
           key: item.run_seq + "-" + item.item_id,
-          title:
-            item.stream === "tool"
-              ? item.tool_name || "工具调用"
-              : shadowActivityText(item),
-          text: item.stream === "tool" ? shadowActivityText(item) : "",
+          title: item.stream === "tool"
+            ? (item.tool_name ? `工具 · ${item.tool_name}` : "工具调用")
+            : "DSH 思考",
+          text: item.stream === "thinking" ? item.text || "" : "",
           status: shadowActivityPhaseLabel(item),
           time: formatTime(item.timestamp),
         })),
