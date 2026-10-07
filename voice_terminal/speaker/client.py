@@ -18,9 +18,11 @@ ObservationCallback = Callable[[SpeakerObservation], Awaitable[None]]
 
 
 class SpeakerWorkerError(RuntimeError):
-    def __init__(self, message: str, *, code: str = "SPEAKER_WORKER_UNAVAILABLE") -> None:
+    def __init__(self, message: str, *, code: str = "SPEAKER_WORKER_UNAVAILABLE",
+                 quality: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.quality = quality  # quality（音频质量）：普通拒绝不代表工作进程故障。
 
 
 class SpeakerWorkerClient:
@@ -58,8 +60,11 @@ class SpeakerWorkerClient:
         lets the next health/reconnect cycle recover the service.
         """
 
+        error = str(reason or "声纹工作进程协议异常")[:300]
+        if not self.degraded or self.last_error != error:
+            logger.warning("speaker.client.degraded error=%s", error)
         self.degraded = True
-        self.last_error = str(reason or "speaker worker protocol error")[:300]
+        self.last_error = error
 
     async def connect(self) -> None:
         if self.socket is not None:
@@ -73,7 +78,7 @@ class SpeakerWorkerClient:
             self.degraded = False
         except Exception as exc:
             self.socket = None
-            self.last_error = str(exc)[:300]
+            self._mark_degraded(f"声纹工作进程连接失败：{type(exc).__name__}: {exc}")
             raise SpeakerWorkerError(f"Speaker Worker 连接失败：{exc}") from exc
 
     async def _receive_loop(self) -> None:
@@ -215,21 +220,17 @@ class SpeakerWorkerClient:
                         waiter.set_result(message)
                     if message.get("code") == "AUDIO_REF_REJECTED":
                         continue  # 引用失效未产生模型错误，正文重试不影响声纹判定。
-                    self.last_error = str(message.get("message") or "speaker worker error")[:300]
-                    # Any worker-side protocol/model failure makes the
-                    # current turn fail open.  Keep the degraded flag until
-                    # an explicit reconnect/health check so a later finish
-                    # cannot accidentally treat a partial result as a safe
-                    # non-owner decision.
-                    self.degraded = True
+                    # 工作进程协议或模型故障持续降级至重新连接，模型加载健康
+                    # 本身不能证明推理已恢复，也不能授权当前轮的非主人判定。
+                    self._mark_degraded(str(message.get("message") or "声纹工作进程返回错误"))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.last_error = str(exc)[:300]
-            logger.info("speaker.client.receive_failed error=%s", self.last_error)
+            self._mark_degraded(f"声纹工作进程接收失败：{type(exc).__name__}: {exc}")
         finally:
             if self.socket is socket:
                 self.socket = None
+                self._mark_degraded(self.last_error or "声纹工作进程连接已断开，请重试组件。")
                 error = SpeakerWorkerError("Speaker Worker 连接已断开", code="SPEAKER_WORKER_DISCONNECTED")
                 for waiter in self.pending_finish.values():
                     if not waiter.done():
@@ -260,8 +261,7 @@ class SpeakerWorkerClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.last_error = str(exc)[:300]
-                logger.info("speaker.client.send_failed error=%s", self.last_error)
+                self._mark_degraded(f"声纹工作进程发送失败：{type(exc).__name__}: {exc}")
             finally:
                 self.queue.task_done()
 
@@ -275,6 +275,7 @@ class SpeakerWorkerClient:
     async def health(self, timeout_s: float = 1.5) -> dict[str, Any]:
         request_id = uuid.uuid4().hex
         if self.socket is None:
+            self._mark_degraded("声纹工作进程尚未连接，请重试组件。")
             raise SpeakerWorkerError("Speaker Worker 尚未连接")
         waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self.pending_health[request_id] = waiter
@@ -287,7 +288,10 @@ class SpeakerWorkerClient:
             self._shared_peer = response.get("shared_audio")
             return response
         except Exception as exc:
-            raise SpeakerWorkerError(str(exc), code="SPEAKER_WORKER_HEALTH_FAILED") from exc
+            reason = (f"声纹健康检查超时（{timeout_s:g} 秒）" if isinstance(exc, TimeoutError)
+                      else f"声纹健康检查失败：{type(exc).__name__}: {exc}")
+            self._mark_degraded(reason)
+            raise SpeakerWorkerError(reason, code="SPEAKER_WORKER_HEALTH_FAILED") from exc
         finally:
             self.pending_health.pop(request_id, None)
 
@@ -322,6 +326,7 @@ class SpeakerWorkerClient:
 
     async def embed_pcm(self, pcm: bytes, *, timeout_ms: int = 2500) -> tuple[float, ...]:
         if self.socket is None:
+            self._mark_degraded("声纹工作进程尚未连接，请重试组件。")
             raise SpeakerWorkerError("Speaker Worker 尚未连接")
         request_id = uuid.uuid4().hex
         waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -349,16 +354,30 @@ class SpeakerWorkerClient:
                 response = await asyncio.wait_for(waiter, timeout=max(0.001, deadline - time.monotonic()))
             if response.get("type") == "error":
                 raise SpeakerWorkerError(str(response.get("message")), code=str(response.get("code")))
-            if response.get("quality") != "ready" or not isinstance(response.get("embedding"), list):
+            quality = response.get("quality")
+            quality_labels = {"insufficient_audio": "有效音频不足", "too_quiet": "音量过低",
+                              "clipped": "音频削波", "not_speech": "缺少有效人声"}
+            if isinstance(quality, str) and quality in quality_labels:
                 raise SpeakerWorkerError(
-                    f"录音质量不足：{response.get('quality') or 'unknown'}",
+                    f"录音质量不足：{quality}（{quality_labels[quality]}）",
                     code="SPEAKER_AUDIO_QUALITY",
+                    quality=quality,
                 )
-            return tuple(float(item) for item in response["embedding"])
-        except SpeakerWorkerError:
+            if quality != "ready" or not isinstance(response.get("embedding"), list):
+                raise SpeakerWorkerError("声纹工作进程返回的嵌入结果无效", code="SPEAKER_WORKER_PROTOCOL_ERROR")
+            embedding = tuple(float(item) for item in response["embedding"])
+            if not embedding or not all(math.isfinite(item) for item in embedding):
+                raise SpeakerWorkerError("声纹工作进程返回的嵌入向量无效", code="SPEAKER_WORKER_PROTOCOL_ERROR")
+            return embedding
+        except SpeakerWorkerError as exc:
+            if exc.code != "SPEAKER_AUDIO_QUALITY":
+                self._mark_degraded(str(exc))
             raise
         except Exception as exc:
-            raise SpeakerWorkerError(str(exc), code="SPEAKER_WORKER_EMBED_FAILED") from exc
+            reason = (f"声纹推理请求超时（{timeout_ms} 毫秒）" if isinstance(exc, TimeoutError)
+                      else f"声纹推理请求失败：{type(exc).__name__}: {exc}")
+            self._mark_degraded(reason)
+            raise SpeakerWorkerError(reason, code="SPEAKER_WORKER_EMBED_FAILED") from exc
         finally:
             self.pending_embed.pop(request_id, None)
             if shared is not None:
@@ -451,6 +470,8 @@ class SpeakerWorkerClient:
             self.pending_finish.pop(key, None)
 
     async def close(self) -> None:
+        # 主动关闭先解除连接所有权，接收循环不会将退出误记为故障。
+        socket, self.socket = self.socket, None
         tasks = [task for task in (self.send_task, self.receive_task) if task is not None]
         for task in tasks:
             if task is not None and not task.done():
@@ -458,7 +479,6 @@ class SpeakerWorkerClient:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.send_task = self.receive_task = None
-        socket, self.socket = self.socket, None
         if socket is not None:
             try:
                 await socket.close()

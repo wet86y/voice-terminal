@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -117,6 +118,46 @@ class ComputeDeviceTests(unittest.TestCase):
 
 
 class ComputeHealthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_speaker_compute_status_keeps_runtime_faults_despite_ready_model_health(self):
+        """模型仍加载时，声纹通信或推理故障仍投影为不可用，并保留原因。"""
+        from voice_terminal.config import AppConfig
+        from voice_terminal.core.state import RuntimeState
+        from voice_terminal.server.websocket import SessionRuntime
+
+        for client_state in ("degraded", "disconnected", "missing", "ready"):
+            with self.subTest(client_state=client_state):
+                runtime = SessionRuntime.__new__(SessionRuntime)
+                config = AppConfig()
+                runtime.config = replace(config, speaker=replace(config.speaker, mode="observe"))
+                runtime.state = RuntimeState()
+                runtime.state.set_service("speaker", "READY")
+                runtime.asr = None
+                runtime._compute_models = {}
+                runtime.startup_errors = []
+                runtime.speaker_profile = SimpleNamespace(snapshot=lambda: {"available": True})
+                runtime._speaker_test_result = {}
+                runtime.speaker = None if client_state == "missing" else SimpleNamespace(
+                    connected=client_state != "disconnected", degraded=client_state == "degraded",
+                    last_error="声纹推理请求超时" if client_state == "degraded" else None,
+                    health=AsyncMock(return_value={"status": "READY", "model_loaded": True,
+                        "device": "cpu", "runtime": "ONNX Runtime（推理运行时）"}),
+                )
+                hardware = {"models": {name: {"gpu_available": False} for name in COMPUTE_MODEL_IDS}}
+                analysis = SimpleNamespace(health=AsyncMock(return_value={
+                    "refine": {"status": "DISABLED"}, "endpoint": {"status": "DISABLED"},
+                }))
+                with (patch("voice_terminal.server.websocket.hardware_status", return_value=hardware),
+                      patch("voice_terminal.server.websocket.AnalysisClient", return_value=analysis)):
+                    result = (await runtime.compute_status())["models"]["wespeaker"]
+                self.assertEqual(result["service"], "READY" if client_state == "ready" else "ERROR")
+                if client_state == "ready":
+                    self.assertIsNone(result["runtime_error"])
+                else:
+                    self.assertTrue(result["runtime_error"])
+                    self.assertFalse(runtime.speaker_status()["filter_allowed"])
+                if client_state == "degraded":
+                    self.assertEqual(result["runtime_error"], "声纹推理请求超时")
+
     async def test_idle_asr_health_uses_a_separate_connection_and_closes_it(self):
         """停止监听关闭会话连接后，模型仍可通过只读连接正确显示。"""
         from voice_terminal.server.websocket import SessionRuntime

@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.controller.episode_controller import EpisodeController
@@ -18,6 +18,8 @@ from voice_terminal.controller.turn_workspace import AudioFrame
 from voice_terminal.controller.turn_controller import InputController
 from voice_terminal.speaker.rolling import RollingSpeakerIdentity, RollingSpeakerSnapshot
 from voice_terminal.config import AppConfig, PersonaConfig
+from voice_terminal.core.state import RuntimeState
+from voice_terminal.speaker.client import SpeakerWorkerError
 from voice_terminal.server.websocket import SessionRuntime
 
 
@@ -148,6 +150,66 @@ def test_owner_barge_status_separates_selected_from_current_aec_availability():
         assert status["owner_only_barge_in_selected"] is True
         assert status["owner_only_barge_in_effective"] is False
         assert "工作进程" in status["owner_only_barge_in_reason"]
+
+
+def test_worker_reconnect_rebinds_live_sensor_and_invalidates_old_owner_proof():
+    """从本地组件重试入口重连时，实时采样器也必须使用新客户端。"""
+    async def scenario():
+        old_client = SimpleNamespace(embed_pcm=AsyncMock(return_value=(1.0,)))
+        new_client = SimpleNamespace(
+            embed_pcm=AsyncMock(return_value=(0.0, 1.0)), connect=AsyncMock(),
+            health=AsyncMock(), fingerprint=AsyncMock(return_value={}),
+        )
+        controller = object.__new__(RealtimeController)
+        controller.speaker_mode = "observe"
+        controller.owner_only_barge_in = False
+        controller.speaker_client = old_client
+        controller.speaker_router = SimpleNamespace(
+            score_embedding=lambda _embedding: 0.8,
+            state_config=SimpleNamespace(confirm_threshold=0.6, continuity_threshold=0.5),
+        )
+        controller.speaker_window_ms = 2000
+        controller.speaker_min_speech_ms = 700
+        controller.speaker_min_turn_speech_ms = 2000
+        controller.speaker_min_window_speech_ratio = 0.4
+        controller.speaker_sensor = None
+        controller.configure_speaker_runtime()
+        old_sensor = controller.speaker_sensor
+        controller._speaker_snapshot = _snapshot(RollingSpeakerIdentity.OWNER)
+        runtime = SessionRuntime.__new__(SessionRuntime)
+        runtime.config = AppConfig()
+        runtime.state = RuntimeState()
+        runtime.controller = controller
+        runtime.speaker_profile = SimpleNamespace(stale=False, set_runtime_fingerprint=Mock())
+        runtime.startup_errors = ["speaker: 连接已断开"]
+        with patch("voice_terminal.server.speaker_runtime.SpeakerWorkerClient", return_value=new_client):
+            ready, error = await runtime._connect_speaker_worker()
+        assert ready and error is None
+        assert controller.speaker_client is new_client
+        assert controller.speaker_sensor is not old_sensor
+        assert await controller.speaker_sensor.embed_pcm(b"pcm") == (0.0, 1.0)
+        old_client.embed_pcm.assert_not_awaited()
+        assert controller._speaker_snapshot is None
+        assert not runtime.startup_errors
+    asyncio.run(scenario())
+
+
+def test_worker_retry_validates_cached_readiness_before_accepting_it():
+    async def scenario():
+        runtime = SessionRuntime.__new__(SessionRuntime)
+        runtime._speaker_worker_lock = asyncio.Lock()
+        runtime._speaker_worker_process = SimpleNamespace(returncode=None)
+        runtime.state = RuntimeState()
+        runtime.state.set_service("speaker", "READY")
+        stale = SimpleNamespace(connected=True, degraded=False, close=AsyncMock(),
+            health=AsyncMock(side_effect=SpeakerWorkerError("声纹健康检查超时")))
+        runtime.speaker = stale
+        runtime._connect_speaker_worker = AsyncMock(return_value=(True, None))
+        assert await runtime.ensure_speaker_worker()
+        stale.health.assert_awaited_once()
+        stale.close.assert_awaited_once()
+        runtime._connect_speaker_worker.assert_awaited_once()
+    asyncio.run(scenario())
 
 
 def test_request_veto_requires_matching_fresh_candidate_and_filter_mode():

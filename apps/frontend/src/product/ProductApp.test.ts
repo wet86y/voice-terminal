@@ -106,6 +106,56 @@ describe('正式界面的真实控件交互', () => {
     expect(row.text()).toContain('已保存配置下次启动生效')
     expect(row.text()).toContain('实际运行：CPU（中央处理器）')
   })
+  it.each(['failed', 'blocked', 'stopped'] as const)('所属进程为 %s（不可用）时，旧模型就绪采样不能继续显示运行中', async state => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    value.computeStatus.value = { models: { wespeaker: { service: 'READY', device: 'cpu', requested_device: 'cpu', runtime: 'ONNX Runtime（推理运行时）', gpu_available: false } } } as never
+    application.snapshot.value = { core_available: true, components: [{ id: 'speaker', state, retry_allowed: state !== 'stopped', error: '' }] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    const row = wrapper.get('[data-component="wespeaker"]')
+    expect(row.get('.local-component-identity > .local-state').text()).toBe('不可用')
+    expect(row.classes()).toContain('failed')
+    expect(row.get('.local-error').text()).not.toBe('')
+    expect(row.text()).not.toContain('运行中')
+    if (state !== 'stopped') {
+      await row.get('.retry-action').trigger('click')
+      expect(application.retry).toHaveBeenCalledWith('speaker')
+    }
+  })
+  it('模型就绪采样与组件故障冲突时显示宿主原因，恢复期间和完成后同步更新文案与按钮', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    value.computeStatus.value = { models: { wespeaker: { service: 'READY', device: 'cpu', requested_device: 'cpu', gpu_available: false } } } as never
+    application.snapshot.value = { core_available: true, components: [{ id: 'speaker', state: 'failed', retry_allowed: true, error: '声纹连接已断开' }] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    const row = wrapper.get('[data-component="wespeaker"]')
+    expect(row.get('.local-error').text()).toBe('声纹连接已断开')
+    application.snapshot.value!.components[0]!.state = 'starting'
+    await flushPromises()
+    expect(row.get('.local-state').text()).toBe('启动中')
+    expect(row.get('.retry-action').attributes('disabled')).toBeDefined()
+    application.snapshot.value!.components[0]!.state = 'ready'
+    await flushPromises()
+    expect(row.get('.local-state').text()).toBe('运行中')
+    expect(row.classes()).toContain('ready')
+    expect(row.find('.retry-action').exists()).toBe(false)
+    expect(row.find('.local-error').exists()).toBe(false)
+  })
+  it('模型运行故障单独显示原因，加载回退诊断不覆盖运行异常', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    value.computeStatus.value = { models: { wespeaker: { service: 'ERROR', device: 'cpu', requested_device: 'cpu', gpu_available: false, runtime_error: '声纹推理请求超时（2500 毫秒）', load_error: 'CUDA（图形处理器）加载失败，已回退' } } } as never
+    application.snapshot.value = { core_available: true, components: [{ id: 'speaker', state: 'ready' }] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    const row = wrapper.get('[data-component="wespeaker"]')
+    expect(row.get('.local-state').text()).toBe('运行异常')
+    expect(row.get('.local-error').text()).toBe('声纹推理请求超时（2500 毫秒）')
+    expect(row.text()).not.toContain('运行中')
+    application.snapshot.value!.components[0]!.state = 'failed'
+    await flushPromises()
+    expect(row.get('.local-state').text()).toBe('不可用')
+    expect(row.get('.local-error').text()).toBe('声纹推理请求超时（2500 毫秒）')
+  })
   it('实际播放在输入结束判定期间驱动语音主体，完成、打断和错误仍及时更新', async () => {
     const { value } = liveControls()
     allowBusinessReady(value)
