@@ -46,9 +46,8 @@ ACTION_DEFINITIONS = [
 
 
 def cases():
-    no_actions = decision_schema([], allow_thinking=False)
-    tools = decision_schema(ACTION_DEFINITIONS, allow_thinking=False)
-    thinking = decision_schema(ACTION_DEFINITIONS, allow_thinking=True)
+    no_actions = decision_schema([])
+    tools = decision_schema(ACTION_DEFINITIONS)
     union = copy.deepcopy(tools)
     union["properties"]["speak"] = {
         "oneOf": [
@@ -61,7 +60,6 @@ def cases():
     return {
         "production_no_actions": no_actions,
         "production_tools": tools,
-        "production_tools_and_thinking": thinking,
         "diagnostic_discriminated_union": union,
     }
 

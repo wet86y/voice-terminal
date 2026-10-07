@@ -948,7 +948,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 elif command == "session.reasoning_mode":
                     mode = _payload.get("mode")
                     if not isinstance(mode, str) or not await runtime.set_reasoning_mode(mode):
-                        await _send_error(websocket, sequencer, "INVALID_REASONING_MODE", "思考模式必须是 fast、balanced 或 deep。", None, True)
+                        await _send_error(websocket, sequencer, "INVALID_REASONING_MODE", "运行模式必须是 fast（快速）或 deep（深度）。", None, True)
                 elif command == "shadow.debug.wake":
                     async def debug_sink(items: list[ShadowEvent]) -> None:
                         for item in items:

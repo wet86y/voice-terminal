@@ -63,10 +63,8 @@ async def request(client: httpx.AsyncClient, *, provider: DeepSeekClient, name: 
 async def main() -> None:
     config = load_config(ROOT / "config/default.yaml", ROOT / "config/local.yaml")
     open_key = os.environ.get("OPENCODE_GO_API_KEY", "").strip()
-    cases = [("no_actions", decision_schema([], allow_thinking=False)),
-             ("thinking", decision_schema([], allow_thinking=True)),
-             ("web", decision_schema([WEB], allow_thinking=False)),
-             ("web_and_thinking", decision_schema([WEB], allow_thinking=True))]
+    cases = [("no_actions", decision_schema([])),
+             ("web", decision_schema([WEB]))]
     targets = [("deepseek", DeepSeekClient(base_url=config.llm.base_url, model=config.llm.model,
                                               api_key=config.api_key(config.llm.api_key_env), provider="deepseek")),
                ("opencode_go", DeepSeekClient(base_url="https://opencode.ai/zen/go/v1", model=config.llm.model,

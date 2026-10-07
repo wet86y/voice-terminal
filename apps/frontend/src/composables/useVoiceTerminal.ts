@@ -66,7 +66,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const wakeAlwaysOn = ref(false)
   const inputOwner = ref<'none' | 'kws' | 'asr'>('none')
   const quietHours = reactive({ passive_quiet: false, user_interaction: false, within_quiet_hours: false })
-  const reasoningMode = ref<ReasoningMode>('balanced')
+  const reasoningMode = ref<ReasoningMode>('fast') // reasoningMode（运行模式）：默认快速。
   const currentTurnId = ref<string | null>(null)
   const current = reactive<CurrentTurnSnapshot>(createEmptyCurrentTurn())
   const currentLatency = reactive<LatencyValues>(createEmptyLatency())
@@ -555,7 +555,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     canStart.value = fixture.canStart ?? true
     wakeAlwaysOn.value = fixture.wakeAlwaysOn ?? false
     inputOwner.value = fixture.inputOwner ?? 'none'
-    reasoningMode.value = fixture.reasoningMode ?? 'balanced'
+    reasoningMode.value = fixture.reasoningMode ?? 'fast'
     currentTurnId.value = fixture.current.turn_id ?? null
     Object.assign(current, createEmptyCurrentTurn(), fixture.current)
     Object.assign(currentLatency, createEmptyLatency(), fixture.currentLatency || {})
@@ -762,7 +762,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (payload.input_owner === 'none' || payload.input_owner === 'kws' || payload.input_owner === 'asr') {
       inputOwner.value = payload.input_owner
     }
-    if (payload.reasoning_mode === 'fast' || payload.reasoning_mode === 'balanced' || payload.reasoning_mode === 'deep') reasoningMode.value = payload.reasoning_mode
+    if (payload.reasoning_mode === 'fast' || payload.reasoning_mode === 'deep') reasoningMode.value = payload.reasoning_mode
     applyServices(payload.services)
     const hasCurrentTurnId = isRecord(payload.current)
       && Object.prototype.hasOwnProperty.call(payload.current, 'turn_id')

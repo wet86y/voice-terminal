@@ -26,6 +26,21 @@ function openTerminal(now?: () => number) {
 }
 
 describe('V0.6 session protocol', () => {
+  it('默认快速，仅接收快速和深度模式，并发送对应的模式命令', () => {
+    const { socket, terminal } = openTerminal()
+    expect(terminal.reasoningMode.value).toBe('fast')
+    socket.push('runtime.snapshot', 1, { reasoning_mode: 'deep' })
+    expect(terminal.reasoningMode.value).toBe('deep')
+    socket.push('runtime.snapshot', 2, { reasoning_mode: 'balanced' })
+    expect(terminal.reasoningMode.value).toBe('deep')
+    terminal.setReasoningMode('fast')
+    expect(terminal.reasoningMode.value).toBe('fast')
+    expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({ command: 'session.reasoning_mode', payload: { mode: 'fast' } })
+    terminal.setReasoningMode('deep')
+    expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({ command: 'session.reasoning_mode', payload: { mode: 'deep' } })
+    terminal.dispose()
+  })
+
   it('实际播放可与输入结束判定并行，完成后立即清空音量', () => {
     const { socket, terminal } = openTerminal()
     socket.push('session.state', 1, { state: 'FINALIZING', listening: true, audio_generation: 1 })

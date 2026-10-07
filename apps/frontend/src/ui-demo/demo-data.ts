@@ -1,5 +1,5 @@
 export type DemoRuntimeState = 'offline' | 'standby' | 'listening' | 'thinking' | 'speaking' | 'error'
-export type ReasoningMode = 'fast' | 'balanced' | 'deep'
+export type { ReasoningMode } from '../types' // ReasoningMode（运行模式）：与正式界面共用类型。
 
 export interface RuntimePresentation {
   /** label（状态名称）。 */

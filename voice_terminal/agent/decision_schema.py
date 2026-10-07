@@ -10,10 +10,9 @@ from typing import Any, Iterable
 
 
 EMOTIONS = ["calm", "happy", "sad", "angry", "fearful", "disgusted", "surprised"]
-THINKING_ACTION = "request_thinking"
 
 
-def decision_schema(action_definitions: Iterable[dict[str, Any]], *, allow_thinking: bool = False) -> dict[str, Any]:
+def decision_schema(action_definitions: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Build a stable, provider-compatible schema from the local action catalog.
 
     DeepSeek currently rejects the discriminated unions which would normally
@@ -51,15 +50,8 @@ def decision_schema(action_definitions: Iterable[dict[str, Any]], *, allow_think
                         # parser still enforces any action-specific constraint.
                         existing.pop("const", None)
 
-    if THINKING_ACTION in names:
-        raise ValueError(f"{THINKING_ACTION} is reserved for the local Agent control plane")
-    if allow_thinking:
-        names.append(THINKING_ACTION)
-        # Strict Responses implementations reject an empty object.  This is a
-        # local control-plane acknowledgement, not a provider effort choice.
-        request = argument_properties.setdefault("request", {"type": "boolean", "const": True})
-        if request.get("type") == "boolean":
-            request["const"] = True
+    if "request_thinking" in names:
+        raise ValueError("request_thinking（追加思考动作）已归档，不能用于当前动作目录。")
 
     # JSON Schema requires a non-empty enum.  With no actions available, an
     # impossible sentinel plus maxItems=0 keeps the public envelope stable.

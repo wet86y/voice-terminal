@@ -233,7 +233,7 @@ export const voiceShadowReplayFixture: VoiceReplayFixture = {
   canStart: true,
   wakeAlwaysOn: false,
   inputOwner: 'none',
-  reasoningMode: 'balanced',
+  reasoningMode: 'fast', // reasoningMode（运行模式）：回放默认快速。
   services: {
     audio: 'READY',
     kws: 'DISABLED',

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { WorkbenchModel } from "./workbench";
+import type { ReasoningMode } from "../types";
 import UiButton from "./UiButton.vue";
 import ConversationMessage from "./ConversationMessage.vue";
 const props = defineProps<{
@@ -11,7 +12,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   action: [];
   reset: [];
-  mode: [value: "fast" | "balanced" | "deep"];
+  mode: [value: ReasoningMode]; // mode（切换运行模式）。
   expand: [];
   settings: []; // settings（打开设置页面）。
   console: []; // console（打开代理控制台）。
@@ -238,13 +239,12 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
                 <button
                   v-for="mode in [
                     { id: 'fast', label: '快速' },
-                    { id: 'balanced', label: '均衡' },
                     { id: 'deep', label: '深度' },
                   ]"
                   :key="mode.id"
                   :class="{ selected: model.mode === mode.id }"
                   :disabled="model.modeDisabled ?? model.disabled"
-                  @click="emit('mode', mode.id as 'fast' | 'balanced' | 'deep')"
+                  @click="emit('mode', mode.id as ReasoningMode)"
                 >
                   {{ mode.label }}
                 </button>

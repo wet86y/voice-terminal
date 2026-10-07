@@ -69,7 +69,7 @@ class ActionRunner:
         if self.search is not None:
             schemas.extend(self.search.action_definitions())
         if any(item.get("name") == "request_thinking" for item in schemas if isinstance(item, dict)):
-            raise RuntimeError("request_thinking is reserved for the local Agent control plane")
+            raise RuntimeError("request_thinking（追加思考动作）已归档，不能用于当前动作目录。")
         return schemas
 
     def is_available(self, name: str) -> bool:

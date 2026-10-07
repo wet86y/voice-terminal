@@ -56,7 +56,9 @@ class RuntimeActivationTests(unittest.TestCase):
         directory.mkdir()
         script = directory / "select.ps1"
         script.write_text(selection + '\n[Console]::OutputEncoding = [Text.UTF8Encoding]::new()\nWrite-Output $RuntimePython\n', encoding="utf-8-sig")
-        result = subprocess.run([shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+        # -DataDir（业务数据目录）：开发夹具没有正式便携包，应显式指定隔离测试目录。
+        result = subprocess.run([shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                                 "-DataDir", str(self.root / "data")],
                                 capture_output=True, encoding="utf-8-sig", timeout=15,
                                 creationflags=subprocess.CREATE_NO_WINDOW)
         self.assertEqual(result.returncode, 0, result.stderr)

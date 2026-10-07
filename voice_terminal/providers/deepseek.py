@@ -99,7 +99,6 @@ class DeepSeekClient:
         allowed_reasoning: Sequence[str] | None = None,
         transport: str = "chat_completions",
         max_output_tokens: int = 393216,
-        thinking_action_enabled: bool = False,
         protocol_recovery_limit: int = 1,
         transport_retry_limit: int = 2,
     ) -> None:
@@ -130,7 +129,6 @@ class DeepSeekClient:
             raise ValueError("max_output_tokens must be positive")
         self.transport = transport
         self.max_output_tokens = max_output_tokens
-        self.thinking_action_enabled = thinking_action_enabled
         self.protocol_recovery_limit = max(0, protocol_recovery_limit)
         self.transport_retry_limit = max(0, transport_retry_limit)
         self.supports_decision_schema = True

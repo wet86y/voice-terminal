@@ -137,7 +137,7 @@ def test_subscription_snapshot_uses_live_episode_without_rewriting_cached_agent(
     live = {"conversation_id": "live", "speak_snapshot": {"queue_status": "empty"}}
     runtime.controller = SimpleNamespace(episode=SimpleNamespace(snapshot=lambda **_: live))
     runtime.history = SimpleNamespace(records=[])
-    runtime.reasoning_mode = "balanced"
+    runtime.reasoning_mode = "fast"
 
     payload = runtime.snapshot().payload
 
@@ -151,7 +151,7 @@ def test_subscription_snapshot_keeps_cached_agent_without_controller():
     runtime.state.agent = {"conversation_id": "cached"}
     runtime.controller = None
     runtime.history = SimpleNamespace(records=[])
-    runtime.reasoning_mode = "balanced"
+    runtime.reasoning_mode = "fast"
 
     assert runtime.snapshot().payload["agent"] == {"conversation_id": "cached"}
 
@@ -166,7 +166,7 @@ def test_subscription_snapshot_falls_back_when_live_episode_snapshot_fails():
 
     runtime.controller = SimpleNamespace(episode=SimpleNamespace(snapshot=failing_snapshot))
     runtime.history = SimpleNamespace(records=[])
-    runtime.reasoning_mode = "balanced"
+    runtime.reasoning_mode = "fast"
 
     assert runtime.snapshot().payload["agent"] == {"conversation_id": "cached"}
 
@@ -250,7 +250,7 @@ def test_scheduler_defaults_and_removed_prediction_configuration():
         AppConfig.from_mapping({"smart_turn": {"predictions": True}})
 
 
-def test_passive_speech_activity_keeps_llm_and_thinking_state_alive():
+def test_passive_speech_activity_keeps_llm_state_alive():
     async def scenario():
         class Registry:
             def begin_turn(self, _): pass
@@ -287,7 +287,6 @@ def test_passive_speech_activity_keeps_llm_and_thinking_state_alive():
         runtime.episode_id = conversation.conversation_id
         runtime.last_turn_id = "turn_a"
         runtime.current_action = "speak"
-        runtime._thinking_barrier_generation = 7
         runtime._wake = lambda _kind: None
         request = asyncio.create_task(asyncio.sleep(60))
         runtime.active_request = request
@@ -298,7 +297,6 @@ def test_passive_speech_activity_keeps_llm_and_thinking_state_alive():
             assert output.cancelled == []
             assert not request.cancelled()
             assert runtime.current_action == "speak"
-            assert runtime._thinking_barrier_generation == 7
 
             await runtime.speech_activity(False)
             assert runtime.user_speaking is False

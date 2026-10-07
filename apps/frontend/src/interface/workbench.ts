@@ -1,3 +1,5 @@
+import type { ReasoningMode } from "../types";
+
 /** WorkbenchModel（工作台呈现数据）：样例数据和业务状态使用同一模板。 */
 export interface WorkbenchModel {
   state: string; // state（运行状态）。
@@ -9,7 +11,7 @@ export interface WorkbenchModel {
   disabled?: boolean;
   modeDisabled?: boolean; // modeDisabled（离线时禁止切换运行模式，仍可重试连接）。
   canReset?: boolean;
-  mode: string; // mode（下一轮使用的运行模式）。
+  mode: ReasoningMode; // mode（下一轮使用的运行模式，仅快速或深度）。
   latency: string; // latency（真实首音延迟或样例值）。
   latencyPending?: boolean;
   voiceModel: string;

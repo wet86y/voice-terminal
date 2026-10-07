@@ -28,10 +28,13 @@ git diff --check
 | 声纹 | `tests/test_speaker.py`、`tests/test_speaker_features.py` |
 | KWS、输入所有权与静默窗口 | `tests/test_kws_always_on.py`、`tests/test_scheduler_staircase.py`、`tests/test_kws_wake_window.py` |
 | Product UI（产品界面）与空输入展示 | `apps/frontend/src/product/useProductAdapter.test.ts`、`apps/frontend/src/conversation-log.test.ts`、`npm test`、`npm run typecheck` |
+| 快速／深度模式与均衡归档 | `tests/test_reasoning_modes.py`（双模式验收）、`tests/test_reasoning_policy.py`（思考策略）、`apps/frontend/src/composables/useVoiceTerminal.test.ts`（前端会话协议）、`apps/frontend/src/ui-demo/UiDemoApp.test.ts`（演示界面） |
 
 完整回归不能只运行局部测试；协议、上下文、生命周期或公共事件变更必须运行 Python 全量、前端测试、类型检查和构建。
 
-本机全量测试仍有[已登记的挂起问题](known-issues.md)。挂起时记录受阻的全量命令及定向回归范围，不将定向通过表述为全量通过。
+历史常驻运行期间曾出现[已登记的全量挂起问题](known-issues.md)。2026-10-07 的双模式源码回归完成，780 项通过、1 项跳过，本轮未重现挂起；历史原因仍待定位。再次挂起时记录受阻的全量命令及定向回归范围，不将定向通过表述为全量通过。
+
+需要只验证源码、暂缓更新正式程序时，执行 `python -X utf8 -m pytest -q`（后端全量测试）、`npm test`（前端测试）、`npm run frontend:build`（类型检查及前端构建）和 `scripts/build-desktop.ps1 -Debug -SkipFrontend`（沿用前端产物的桌面调试构建），随后检查差异格式；正式目录发布作为后续独立步骤。双模式本轮结果见[源码验收记录](frontend-ui-business-migration.md#2026-10-07-双模式源码修订待统一发布)。`archive/balanced-mode`（均衡归档目录）只保留历史材料，不加入默认测试或产品构建输入。
 
 二等信箱恢复的定向回归命令如下。覆盖空信箱、4 秒检查、进度合并与去重、普通调用消费、版本竞争、
 构建失败、讲话与忙碌时保留、最终静默优先、生命周期清理、单请求执行以及恢复重试的场景约束：
@@ -42,7 +45,7 @@ npm --prefix integrations/dsh/voice-terminal-shadow-bridge test
 ```
 
 桥接插件测试同时执行两套 TypeScript（静态类型语言）配置的类型检查。最近一次执行的结果和全量后端回归边界见
-[协议验证记录](bridge-2.0-protocol.md#本次实施与验证记录)；既有启动测试失败及尚未完成的二等现场验收已登记到
+[协议验证记录](bridge-2.0-protocol.md#本次实施与验证记录)。既有启动测试夹具失败已于 2026-10-07 修正并通过全量回归；尚未完成的二等现场验收仍登记在
 [当前已知问题](known-issues.md)，不能把本地替身测试通过视为实际模型或播放设备验收通过。
 
 ## 完整启动验收
