@@ -28,11 +28,13 @@ git diff --check
 | 声纹 | `tests/test_speaker.py`、`tests/test_speaker_features.py` |
 | KWS、输入所有权与静默窗口 | `tests/test_kws_always_on.py`、`tests/test_scheduler_staircase.py`、`tests/test_kws_wake_window.py` |
 | Product UI（产品界面）与空输入展示 | `apps/frontend/src/product/useProductAdapter.test.ts`、`apps/frontend/src/conversation-log.test.ts`、`npm test`、`npm run typecheck` |
+| 组件内存、进程显存与设备环境 | `tests/test_gpu_environment.py`（真实计算门禁）、`tests/test_runtime_resources.py`（去重指标）、`tests/test_application_host.py`（受管进程树）、`tests/test_product_api.py`（设备保存与重新检测）、`apps/frontend/src/product/ProductApp.test.ts`（未知指标隐藏与设备选项） |
+| 唤醒归档持久删除与旧任务迁移 | `tests/test_wake_task_api.py`（取消与归档删除接口）、`integrations/dsh/voice-terminal-wake-tasks/test/task-service.test.mjs`（持久化失败、重启与旧存储导入）、`apps/frontend/src/product/ProductApp.test.ts`（删除回执与错误展示） |
 | 快速／深度模式与均衡归档 | `tests/test_reasoning_modes.py`（双模式验收）、`tests/test_reasoning_policy.py`（思考策略）、`apps/frontend/src/composables/useVoiceTerminal.test.ts`（前端会话协议）、`apps/frontend/src/ui-demo/UiDemoApp.test.ts`（演示界面） |
 
 完整回归不能只运行局部测试；协议、上下文、生命周期或公共事件变更必须运行 Python 全量、前端测试、类型检查和构建。
 
-历史常驻运行期间曾出现[已登记的全量挂起问题](known-issues.md)。2026-10-07 的双模式源码回归完成，780 项通过、1 项跳过；随后界面与固定服务密钥修订全量回归为 815 项通过、1 项跳过，均未重现挂起；历史原因仍待定位。再次挂起时记录受阻的全量命令及定向回归范围，不将定向通过表述为全量通过。
+历史常驻运行期间曾出现[已登记的全量挂起问题](known-issues.md)。2026-10-07 的双模式源码回归完成，780 项通过、1 项跳过；随后界面与固定服务密钥修订全量回归为 815 项通过、1 项跳过；组件与归档删除修复全量回归为 825 项通过、1 项跳过，隔离解释器入口最终 40 项定向检查通过，均未重现挂起；历史原因仍待定位。再次挂起时记录受阻的全量命令及定向回归范围，不将定向通过表述为全量通过。
 
 需要只验证源码、暂缓更新正式程序时，执行 `python -X utf8 -m pytest -q`（后端全量测试）、`npm test`（前端测试）、`npm run frontend:build`（类型检查及前端构建）和 `scripts/build-desktop.ps1 -Debug -SkipFrontend`（沿用前端产物的桌面调试构建），随后检查差异格式；正式目录发布作为后续独立步骤。本轮双模式及后续界面修订已完成统一发布，结果见[统一发布与验收记录](frontend-ui-business-migration.md#2026-10-07-界面精简与统一发布)。`archive/balanced-mode`（均衡归档目录）只保留历史材料，不加入默认测试或产品构建输入。
 
