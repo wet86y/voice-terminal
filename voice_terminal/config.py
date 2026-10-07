@@ -253,6 +253,7 @@ class TtsConfig:
     admission_lead_ms: int = 2500
     sentence_prefetch_ms: int = 2000
     sentence_tick_ms: int = 50
+    sentence_min_effective_chars: int = 10  # sentence_min_effective_chars（锁定文本块最少有效字符）。
     first_clause_timeout_ms: int = 400
 
     def __post_init__(self) -> None:
@@ -273,6 +274,8 @@ class TtsConfig:
             raise ValueError("tts.sentence_prefetch_ms must be positive")
         if self.sentence_tick_ms <= 0:
             raise ValueError("tts.sentence_tick_ms must be positive")
+        if self.sentence_min_effective_chars <= 0:
+            raise ValueError("tts.sentence_min_effective_chars（锁定文本块最少有效字符）必须为正整数")
         if self.first_clause_timeout_ms <= 0:
             raise ValueError("tts.first_clause_timeout_ms must be positive")
         if self.subtitle_type not in {"sentence", "word", "word_streaming"}:
@@ -924,6 +927,7 @@ class AppConfig:
                 admission_lead_ms=int(_number(tts.get("admission_lead_ms"), 2500)),
                 sentence_prefetch_ms=int(_number(tts.get("sentence_prefetch_ms"), 2000)),
                 sentence_tick_ms=int(_number(tts.get("sentence_tick_ms"), 50)),
+                sentence_min_effective_chars=int(_number(tts.get("sentence_min_effective_chars"), 10)),
                 first_clause_timeout_ms=int(_number(tts.get("first_clause_timeout_ms"), 400)),
             ),
             text_bridge=TextBridgeConfig(

@@ -917,6 +917,7 @@ class MiniMaxTtsClient:
         admission_lead_ms: int = 2500,
         sentence_prefetch_ms: int = 2000,
         sentence_tick_ms: int = 50,
+        sentence_min_effective_chars: int = 10,  # sentence_min_effective_chars（锁定文本块最少有效字符）。
         first_clause_timeout_ms: int = 400,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -930,6 +931,8 @@ class MiniMaxTtsClient:
             raise ValueError("tts.admission_lead_ms must be positive")
         if sentence_prefetch_ms <= 0 or sentence_tick_ms <= 0 or first_clause_timeout_ms <= 0:
             raise ValueError("TTS sentence scheduling values must be positive")
+        if sentence_min_effective_chars <= 0:
+            raise ValueError("tts.sentence_min_effective_chars（锁定文本块最少有效字符）必须为正整数")
         if audio_cache_max_bytes <= 0 or cancel_timeout_ms <= 0 or keepalive_seconds <= 0:
             raise ValueError("TTS cache, cancel timeout, and keepalive values must be positive")
         if emotion_mode not in {"off", "agent"}:
@@ -941,6 +944,7 @@ class MiniMaxTtsClient:
         self.admission_lead_ms = admission_lead_ms
         self.sentence_prefetch_ms = sentence_prefetch_ms
         self.sentence_tick_ms = sentence_tick_ms
+        self.sentence_min_effective_chars = sentence_min_effective_chars  # 锁定文本块最少有效字符。
         self.first_clause_timeout_ms = first_clause_timeout_ms
         if transport == "websocket_bidi" and websocket_path.rstrip("/") == "/ws/v1/t2a_v2":
             websocket_path = "/ws/v1/t2a_v2_bidi"

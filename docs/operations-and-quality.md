@@ -191,6 +191,8 @@ python -m unittest discover -s tests -v
 
 确认 flush/close、cancel/close 并发时不会出现 `NoneType` 内部异常；关闭后不存在继续运行的 provider receiver、后台任务或旧 playback key。
 
+修改短句窗口的锁定边界时，执行 `tests/test_sentence_scheduling.py`（短句调度测试）、`tests/test_speech_admission.py`（文本提交测试）和 `tests/test_speak_revision.py`（播报改写测试）。最少有效字符规则应覆盖：恰好达到下限、多个短句合并、标点与空白不计数、生成中不足下限继续等待、等待期间整段仍可改写、生成结束释放短回答与短尾块。核对 LLM（大语言模型）可见的当前块、预取块与可改尾巴使用实际提交边界，并确认预取仍最多一块。
+
 声纹注册/测试与实时音频必须互斥，尤其要验证 KWS standby 下设备和 `AudioPreprocessor` 的占用；具体门槛见[声纹增强](speaker-enhancement.md)。
 
 ## 运行排障

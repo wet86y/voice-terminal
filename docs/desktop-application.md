@@ -193,6 +193,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Verify-Package.ps1
   --build '20261004-desktop' --refresh-program
 ```
 
+默认配置来自当前启用程序的 `config/default.yaml`（程序配置模板），本机覆盖来自原 `data/config/local.yaml`（用户本地配置）。短句窗口新增 `tts.sentence_min_effective_chars`（锁定文本块最少有效字符），默认 10；未显式覆盖的已有安装更新后也采用此默认值，修改本地覆盖后需重新启动。有效字符计数、短句合并、结束尾块及模型可见边界的规则见[语音合成运行模式](tts-runtime.md#锁定文本块的最小长度)。
+
 升级 DSH（代理执行宿主）时，在同一停机刷新命令中传入 `--dsh-runtime`（新宿主运行产物路径）。
 构建器先校验新组件的完整清单、版本及提交号与新程序锁版一致，再安装到新的受管目录，
 同步新程序的 `release.components`（组件清单）、`active.json`（当前启用记录）及 `portable.json`（便携默认配置）。
