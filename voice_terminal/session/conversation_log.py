@@ -51,6 +51,7 @@ class ConversationLog:
         self._index: dict[str, dict[str, Any]] = {}
         self._seq = 0
         self._sink: EntrySink | None = None
+        self.on_change: Callable[[], None] | None = None  # on_change（持久化检查点通知）。
 
     @property
     def latest_seq(self) -> int:
@@ -127,6 +128,8 @@ class ConversationLog:
                 entry["conversation_id"] = conversation_id
         published = dict(entry)
         published["delivery"] = dict(entry.get("delivery") or {})
+        if self.on_change is not None:
+            self.on_change()
         sink = self._sink
         if sink is not None:
             sink(published)
@@ -154,6 +157,29 @@ class ConversationLog:
         self.entries.clear()
         self._index.clear()
         self._seq = 0
+        if self.on_change is not None:
+            self.on_change()
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        """restore（恢复聊天顺序）：沿用服务端序号，不重新发布历史消息。"""
+        entries = snapshot["entries"]
+        latest_seq = snapshot["latest_seq"]
+        if not isinstance(entries, list) or not isinstance(latest_seq, int) or latest_seq < 0:
+            raise ValueError("聊天记录恢复检查点无效")
+        previous = 0
+        index = {}
+        restored = []
+        for value in entries:
+            entry = {**value, "delivery": dict(value.get("delivery") or {})}
+            seq = entry["seq"]
+            key = self.key_of(entry["kind"], entry["conversation_id"], entry["turn_id"], entry["speech_id"])
+            if not isinstance(seq, int) or not previous < seq <= latest_seq or key in index:
+                raise ValueError("聊天记录恢复顺序无效")
+            previous = seq
+            restored.append(entry)
+            index[key] = entry
+        self.entries, self._index, self._seq = restored, index, latest_seq
+        self._trim()
 
     def _trim(self) -> None:
         while len(self.entries) > self.limit:

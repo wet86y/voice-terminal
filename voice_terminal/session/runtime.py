@@ -89,3 +89,17 @@ class ConversationRuntime:
         self._calendar_baseline = self._calendar_text()
         self._calendar_baseline_day = self._calendar_date()
         self._calendar_day = self._calendar_baseline_day
+
+    def persistence_snapshot(self) -> dict[str, str]:
+        """保留 conversation_id（会话标识）、calendar_baseline（日期基准）、calendar_baseline_day（基准日期）；取消作用域重新生成。"""
+        return {"conversation_id": self.conversation_id, "calendar_baseline": self._calendar_baseline,
+                "calendar_baseline_day": self._calendar_baseline_day}
+
+    def restore(self, snapshot: dict[str, str]) -> None:
+        conversation_id = snapshot["conversation_id"]
+        if not isinstance(conversation_id, str) or not conversation_id.startswith(("conversation-", "conversation_")):
+            raise ValueError("语音会话恢复标识无效")
+        self.conversation_id = conversation_id
+        self._calendar_baseline = snapshot["calendar_baseline"]
+        self._calendar_baseline_day = snapshot["calendar_baseline_day"]
+        self._calendar_day = self._calendar_date()

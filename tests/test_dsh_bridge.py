@@ -777,8 +777,7 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual(await self.session.accept_event(payload), "accepted")
 
-        # A new process never resumes the old DSH session, but can acknowledge
-        # its one persisted terminal receipt before the new binding opens.
+        # 进程恢复前先确认旧回执；打开绑定时再接回同一个持久会话。
         second = DshShadowAgentSession(
             client=self.client,  # type: ignore[arg-type]
             mapping_store=self.mapping_store,
@@ -797,8 +796,9 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second.matches_last_terminal_identity(conflicting_replay))
         self.assertEqual(await second.accept_event(conflicting_replay), "conflict")
 
-        # Opening a fresh DSH session preserves the receipt for another restart.
+        # 恢复已有 DSH（后台代理）会话后，终态回执继续可用于下次重启。
         await second.request_wake()
+        self.assertEqual(second.dsh_session_id, old_dsh_session)
         third = DshShadowAgentSession(
             client=self.client,  # type: ignore[arg-type]
             mapping_store=self.mapping_store,

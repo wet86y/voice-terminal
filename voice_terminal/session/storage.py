@@ -39,9 +39,11 @@ def object_size(value) -> int:
 
 
 class SessionJournal:
-    def __init__(self, directory: Path, cache_bytes: int = 8 * 1024 * 1024):
+    STATE_KEY = ("session-state", 0)  # STATE_KEY（当前会话恢复检查点）。
+
+    def __init__(self, directory: Path, cache_bytes: int = 8 * 1024 * 1024, *, resume: bool = False):
         directory.mkdir(parents=True, exist_ok=True)
-        self.path = directory / f"ledger-{uuid.uuid4().hex}.sqlite3"
+        self.path = directory / ("active-session.sqlite3" if resume else f"ledger-{uuid.uuid4().hex}.sqlite3")
         self.budget = cache_bytes
         self.cache: OrderedDict[tuple, tuple[object, int]] = OrderedDict()
         self.cache_size = 0
@@ -55,8 +57,8 @@ class SessionJournal:
         self._closed = False
         connection = sqlite3.connect(self.path)
         connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("CREATE TABLE records(bucket TEXT, position INTEGER, body TEXT, kind TEXT, identity TEXT, PRIMARY KEY(bucket, position))")
-        connection.execute("CREATE INDEX identity_index ON records(bucket, kind, identity)")
+        connection.execute("CREATE TABLE IF NOT EXISTS records(bucket TEXT, position INTEGER, body TEXT, kind TEXT, identity TEXT, PRIMARY KEY(bucket, position))")
+        connection.execute("CREATE INDEX IF NOT EXISTS identity_index ON records(bucket, kind, identity)")
         connection.commit()
         connection.close()
         self._reader = sqlite3.connect(self.path, check_same_thread=False)
@@ -127,21 +129,32 @@ class SessionJournal:
                     break
                 key = job
                 with self._lock:
-                    body, _, kind, identity = self.pending[key]
-                try:
-                    connection.execute("INSERT INTO records VALUES(?,?,?,?,?) ON CONFLICT(bucket, position) "
-                                       "DO UPDATE SET body=excluded.body, kind=excluded.kind, identity=excluded.identity",
-                                       (*key, body, kind, identity))  # 保留行的首次提交顺序，迟到精修只更新正文。
-                    connection.commit()
+                    row = self.pending.get(key)
+                    # 检查点会连同依赖正文原子提交，其他已排队键可能已经写完。
+                    batch = (dict(self.pending) if key == self.STATE_KEY else {key: row}) if row else {}
+                if not batch:
                     with self._lock:
-                        latest = self.pending.get(key)
-                        if latest and latest[0] == body:
-                            self.pending.pop(key)
-                            self.pending_bytes -= self._pending_sizes.pop(key)
-                            # 字节预算计入对象图和读取缓存项本身的开销。
-                            self._remember(key, latest[1], object_size(latest[1]) + object_size(key) + 96)
-                            if not self.pending:
-                                self.error = None
+                        self._scheduled.discard(key)
+                        if key in self.pending:
+                            self._schedule(key)
+                    self._queue.task_done()
+                    continue
+                committed = False  # committed（本次事务已提交），用于合并写入后的再次调度。
+                try:
+                    connection.executemany("INSERT INTO records VALUES(?,?,?,?,?) ON CONFLICT(bucket, position) "
+                                           "DO UPDATE SET body=excluded.body, kind=excluded.kind, identity=excluded.identity",
+                                           [(*item_key, item[0], item[2], item[3]) for item_key, item in batch.items()])
+                    connection.commit()
+                    committed = True
+                    with self._lock:
+                        for item_key, item in batch.items():
+                            latest = self.pending.get(item_key)
+                            if latest and latest[0] == item[0]:
+                                self.pending.pop(item_key)
+                                self.pending_bytes -= self._pending_sizes.pop(item_key)
+                                self._remember(item_key, latest[1], object_size(latest[1]) + object_size(item_key) + 96)
+                        if not self.pending:
+                            self.error = None
                 except (sqlite3.Error, OSError) as exc:
                     connection.rollback()
                     self.error = f"{type(exc).__name__}: {exc}"
@@ -150,11 +163,31 @@ class SessionJournal:
                     with self._lock:
                         self._scheduled.discard(key)
                         latest = self.pending.get(key)
-                        if latest and latest[0] != body:
+                        if latest and (committed or latest[0] != batch[key][0]):
                             self._schedule(key)
                     self._queue.task_done()
         finally:
             connection.close()
+
+    def restore_state(self) -> dict | None:
+        """restore_state（恢复检查点）：读取完整命名空间和会话身份，损坏时拒绝空历史回退。"""
+        with self._lock:
+            row = self._reader.execute("SELECT body FROM records WHERE bucket=? AND position=?", self.STATE_KEY).fetchone()
+            if row is None:
+                if self._reader.execute("SELECT 1 FROM records LIMIT 1").fetchone():
+                    raise RuntimeError("当前会话恢复检查点缺失，保留已落盘正文")
+                return None
+            value = json.loads(row[0])
+            if not isinstance(value, dict):
+                raise RuntimeError("当前会话恢复检查点无效，保留已落盘正文")
+            return value
+
+    def sequence_length(self, bucket: str) -> int:
+        with self._lock:
+            count, last = self._reader.execute("SELECT count(*), max(position) FROM records WHERE bucket=?", (bucket,)).fetchone()
+            if count and last != count - 1:
+                raise RuntimeError("会话记录顺序不完整，禁止用空历史替代")
+            return count
 
     def read(self, key, decode):
         with self._lock:
@@ -204,13 +237,14 @@ class SessionJournal:
             stream.flush(); os.fsync(stream.fileno())
         os.replace(temporary, target)
 
-    def close(self) -> bool:
+    def close(self, *, export_document: bool = True) -> bool:
         if self._closed:
             return True
         if not self.flush():
             return False  # 保留失败记录与存储对象；不得静默丢弃。
         try:
-            self.export_document()
+            if export_document:
+                self.export_document()
         except OSError as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             log.error("完整会话文档保存失败，原始记录已保留：%s", self.error)
@@ -229,11 +263,26 @@ class SessionJournal:
 
 class StoredSequence(Sequence):
     """StoredSequence（存储序列）：按原顺序读取；清空只切换命名空间，不删除旧资料。"""
-    def __init__(self, journal: SessionJournal, name: str, decode=lambda value: value):
+    def __init__(self, journal: SessionJournal, name: str, decode=lambda value: value, *, restored: dict | None = None):
         self.journal, self.decode = journal, decode
         self.name = name
-        self.bucket = f"{name}-{uuid.uuid4().hex}"
-        self.count = 0
+        if restored is not None and (not isinstance(restored, dict)
+                or not isinstance(restored.get("bucket"), str) or not restored["bucket"].startswith(f"{name}-")
+                or type(restored.get("count")) is not int or restored["count"] < 0):
+            raise RuntimeError("会话记录命名空间无效，保留原始记录")
+        self.bucket = restored["bucket"] if restored else f"{name}-{uuid.uuid4().hex}"
+        self.count = journal.sequence_length(self.bucket) if restored else 0
+        if restored and self.count < restored["count"]:
+            raise RuntimeError("会话检查点引用的正文缺失，禁止用空历史替代")
+        self.on_change = None  # on_change（序列修改后的检查点通知）。
+
+    def checkpoint(self) -> dict:
+        """bucket（正文命名空间）、count（已提交条数）。"""
+        return {"bucket": self.bucket, "count": self.count}
+
+    def _changed(self):
+        if self.on_change is not None:
+            self.on_change()
 
     def __len__(self):
         return self.count
@@ -253,14 +302,17 @@ class StoredSequence(Sequence):
         if not 0 <= index < self.count:
             raise IndexError(index)
         self.journal.write((self.bucket, index), value)
+        self._changed()
 
     def append(self, value):
         self.journal.write((self.bucket, self.count), value)
         self.count += 1
+        self._changed()
 
     def clear(self):
         self.bucket = f"{self.name}-{uuid.uuid4().hex}"
         self.count = 0
+        self._changed()
 
     def find(self, kind, identity):
         index = self.journal.find(self.bucket, kind, identity)
@@ -272,8 +324,8 @@ class StoredSequence(Sequence):
 
 class StoredSet:
     """StoredSet（落盘去重集合）：完整身份保留，避免随会话增长的内存集合。"""
-    def __init__(self, journal, name):
-        self.values = StoredSequence(journal, name)
+    def __init__(self, journal, name, *, restored=None):
+        self.values = StoredSequence(journal, name, restored=restored)
 
     def __contains__(self, value):
         return self.values.find("identity", json.dumps(value, ensure_ascii=False)) is not None

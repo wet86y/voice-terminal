@@ -4,9 +4,9 @@ import type { Config } from './index.js'
 import type { VoiceTerminalSettings } from './settings-contract.js'
 import { VOICE_TERMINAL_SETTINGS_NAMESPACE } from './settings-contract.js'
 
-/** Resolve the project's existing `workspace` folder and register it with DSH. */
+/** Stable fallback workspace（稳定备用工作区）：便携程序使用用户数据目录，避免跟随版本目录。 */
 async function ensureProjectWorkspace(ctx: any): Promise<any> {
-  const path = resolve(process.cwd(), 'workspace')
+  const path = resolve(process.env.VOICE_DATA_DIR || process.cwd(), 'workspace')
   await mkdir(path, { recursive: true })
   const existing = await ctx.workspaceRegistry.resolveByPath(path)
   return existing ?? await ctx.workspaceRegistry.create(path, 'Voice Terminal')
@@ -46,8 +46,10 @@ export async function initializeVoiceTerminalSettings(ctx: any, config: Config):
   readonly defaultWorkspace: any
 }> {
   const settings = createSettingsAdapter(ctx, config)
-  const defaultWorkspace = await ensureProjectWorkspace(ctx)
   const current = settings.get() as VoiceTerminalSettings
+  const selected = current.workspaceId ? ctx.workspaceRegistry.get(current.workspaceId) : undefined
+  const defaultWorkspace = selected !== undefined && await selected.status() === 'ok'
+    ? selected : await ensureProjectWorkspace(ctx)
   const patch: Record<string, string> = {}
   if (current.workspaceId === undefined || current.workspaceId === '') {
     patch.workspaceId = String(defaultWorkspace.id)
@@ -74,15 +76,15 @@ async function recordFallback(settings: any, notice: FallbackNotice, detail: str
 
 /** Pick a still-usable workspace, recovering to the project workspace when necessary. */
 async function resolveVoiceWorkspace(ctx: any, settings: any): Promise<any> {
-  const defaultWorkspace = await ensureProjectWorkspace(ctx)
   const current = settings.get() as VoiceTerminalSettings
-  if (current.defaultWorkspaceId !== String(defaultWorkspace.id)) {
-    await settings.update({ defaultWorkspaceId: String(defaultWorkspace.id) })
-  }
-
   const selectedId = current.workspaceId
   const selected = selectedId ? ctx.workspaceRegistry.get(selectedId) : undefined
   if (selected !== undefined && await selected.status() === 'ok') return selected
+
+  const defaultWorkspace = await ensureProjectWorkspace(ctx)
+  if (current.defaultWorkspaceId !== String(defaultWorkspace.id)) {
+    await settings.update({ defaultWorkspaceId: String(defaultWorkspace.id) })
+  }
 
   if (selectedId !== undefined && selectedId !== '' && selectedId !== String(defaultWorkspace.id)) {
     await recordFallback(settings, 'workspace-unavailable', `workspace id ${selectedId} is missing or its directory is unavailable`)

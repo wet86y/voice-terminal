@@ -52,12 +52,14 @@ Both are supplied only to the project-managed DSH child process.
 重复请求合并；新输入重置静默窗口时请求保留，并在新窗口重新标记；停止、重置或会话/激活替换时清除请求。
 `accepted`（已受理）不表示交接已经完成，受理状态详见 [DSH 控制台说明](../../../docs/dsh-console.md)。
 
-插件重建后须启动或重启语音服务，并使用新语音会话加载工具与受管规则。麦克风现场验收步骤见
+插件重建后须启动或重启语音服务；已有会话继续恢复，工具与受管规则按恢复流程加载。麦克风现场验收步骤见
 [运行与质量验收](../../../docs/operations-and-quality.md)。
 
 ## Continuity and wake tasks（上下文衔接与唤醒任务）
 
 `session.export`（完整会话导出）使用既有鉴权和会话身份边界。`export_id`（冻结导出标识）冻结完整记录，`offset`（起点）、`limit`（页大小，1—500）与 `total`（记录上界）确定分页；响应提供 `records`（完整记录）及 `next_offset`（下一页起点）。Voice（语音端）交接使用此入口保存成对归档，普通摘要接口继续服务既有调用。
+
+普通组件关闭与程序退出调用 `session.cancel`（取消执行），持久会话仍可复用；重启先通过 `session.state`（会话状态查询）复用已有运行绑定，宿主也已重启时调用 `session.resume`（恢复已有持久会话）。恢复只同步上下文，不重新唤醒旧任务。手动重置和一小时整理才切换会话并调用 `session.retire`（退役会话）。
 
 `session.resume`（恢复会话）的 `archive_only=true`（仅为归档恢复）保留持久历史，不追加语音管理提示。`session.cancel`（取消会话）和 `session.retire`（退役会话）等待 `whenIdle`（工具与回合结算至空闲）并确认持久保存，随后才返回；重复退役返回 `duplicate`（重复确认）。`session.state`（状态查询）的 `record_count`（完整记录水位）用于提交前检测整理期间恢复活动。Voice（语音端）等待结算时释放事件锁，过时回传可以及时得到拒绝。
 
@@ -76,12 +78,14 @@ workspace menu（工作区菜单） lists registered DSH workspaces and does not
 change the active workspace or session. The settings document（设置文档） persists
 `workspaceId`（所选工作区标识）, `defaultWorkspaceId`（项目默认工作区标识）,
 `provider`（模型供应方）, `model`（模型标识）, `reasoningEffort`（推理强度）, and
-`fallbackNotice`（回退提示状态）. The first Bridge（插件桥接层） startup
-creates or registers the project-root `workspace` directory and uses its stable
-workspace id as the default. These choices apply only to new voice-triggered
-sessions; manual DSH sessions and resumed Voice sessions keep their existing
-settings. An unavailable saved workspace or model falls back to the project
-workspace or current DSH global model, records a diagnostic（诊断日志）, and
+`fallbackNotice`（回退提示状态）. Bridge（插件桥接层） startup first reuses a
+valid saved workspace（已保存工作区） and makes it the default, without registering
+another directory. Only a missing or unavailable selection creates or registers
+`VOICE_DATA_DIR/workspace`（稳定用户数据目录下的工作区）；没有用户数据目录配置时才使用
+`process.cwd()/workspace`（当前工作目录下的工作区）。便携版的程序版本目录不再成为默认工作区根目录。
+These choices apply only to new voice-triggered sessions; manual DSH sessions
+and resumed Voice sessions keep their existing settings. An unavailable saved
+model falls back to the current DSH global model, records a diagnostic（诊断日志）, and
 shows a notice（提示） on the settings page.
 
 The settings page uses the DSH `Menu`（菜单控件） and `Button`（按钮控件） primitives
