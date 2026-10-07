@@ -128,7 +128,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const lastError = ref('')
   const notice = ref('')
   const noticeVisible = ref(false)
-  const shadowExpanded = ref(false)
   const personaDocument = ref<keyof ProductSettingsSnapshot['persona']>('personality')
   const customInstructions = ref<CustomInstruction[]>([])
   const silenceSeconds = ref(30)
@@ -457,12 +456,16 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function removeWakeTask(task: WakeTask) {
+    if (saving.value) return
+    saving.value = true
     try {
       await productApi.deleteWakeTask(task.task_id)
+      wakeTasks.value = wakeTasks.value.filter(item => item.task_id !== task.task_id)
       if (editingWakeTaskId.value === task.task_id) editingWakeTaskId.value = ''
       await refreshWakeTasks()
       setNotice(task.status === 'pending' ? '唤醒任务已取消并移除。' : '归档任务已移除。')
     } catch (error) { setError(error) }
+    finally { saving.value = false }
   }
 
   watch(settingsTab, value => {
@@ -1373,7 +1376,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     selectedModels,
     activeModels,
     activeTtsModel,
-    shadowExpanded,
     modelScanState,
     restartState,
     applyImpact,

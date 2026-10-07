@@ -66,6 +66,16 @@ class ProductApiTests(unittest.TestCase):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             return await client.request(method, path, **kwargs)
 
+    def test_fixed_model_api_rejects_runtime_model_switching(self) -> None:
+        original_config = self.runtime.config
+        response = asyncio.run(self._request(
+            "POST", "/api/v1/models/assignments/apply",
+            json={"assignments": {"main_llm": "other-model"}, "confirmed": True},
+        ))
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("本地固定", response.json()["detail"])
+        self.assertIs(self.runtime.config, original_config)
+
     def test_compute_api_saves_device_choices_for_full_application_restart(self) -> None:
         devices = {
             name: ("auto" if name == "paraformer" else "cpu")

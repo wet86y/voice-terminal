@@ -20,6 +20,8 @@
   --danger: #efa0b1;
   --radius: 18px;
   --duration: 160ms;
+  --scrollbar-thumb: #a3adbf38; /* scrollbar-thumb（滚动滑块）：浅灰蓝，保持低对比。 */
+  --scrollbar-hover: #a3adbf66; /* scrollbar-hover（悬停滑块）：提高操作辨识度。 */
   /* type scale（字号层级）：rem（根元素字号单位）响应用户字体设置，不绑定窗口宽高。 */
   --font-caption: 0.625rem; /* font-caption（辅助文字）：默认 10 像素。 */
   --font-body: 0.75rem; /* font-body（正文与主要操作）：默认 12 像素。 */
@@ -31,6 +33,16 @@
 }
 * {
   box-sizing: border-box;
+}
+/* 统一页面、弹窗及输入区滚动条，透明轨道不占据视觉层级。 */
+*::-webkit-scrollbar { width: 6px; height: 6px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { border: 1px solid transparent; border-radius: 999px; background: var(--scrollbar-thumb); background-clip: padding-box; }
+*::-webkit-scrollbar-thumb:hover { background-color: var(--scrollbar-hover); }
+*::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+*::-webkit-scrollbar-corner { background: transparent; }
+@supports not selector(::-webkit-scrollbar) {
+  * { scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) transparent; }
 }
 html,
 body,
@@ -359,29 +371,6 @@ select option {
   padding-block: 64px;
   overflow-y: auto;
   overscroll-behavior: contain;
-}
-.time-picker-options::-webkit-scrollbar {
-  width: 4px;
-}
-.time-picker-options::-webkit-scrollbar-track {
-  background: transparent;
-}
-.time-picker-options::-webkit-scrollbar-thumb {
-  border-radius: 99px;
-  background: var(--line-strong);
-}
-.time-picker-options::-webkit-scrollbar-thumb:hover {
-  background: #b2baff60;
-}
-.time-picker-options::-webkit-scrollbar-button {
-  display: none;
-  height: 0;
-}
-@supports not selector(::-webkit-scrollbar) {
-  .time-picker-options {
-    scrollbar-width: thin;
-    scrollbar-color: var(--line-strong) transparent;
-  }
 }
 .time-picker-options button {
   display: block;
@@ -832,23 +821,33 @@ time {
   align-items: center;
   gap: 8px;
 }
-.shadow-column > .info-callout {
-  max-height: clamp(40px, 10dvh, 80px);
-  overflow: auto;
-  flex: none;
-  font-size: var(--font-caption);
-  overscroll-behavior: contain;
+.shadow-regions {
+  display: grid;
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+  gap: var(--panel-gap);
+  flex: 1;
+  min-height: 0;
 }
-.shadow-summary-card {
+.shadow-summary-card,
+.trace-section,
+.shadow-event {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   border: 1px solid var(--line);
   border-radius: 13px;
-  padding: clamp(10px, 2dvh, 18px);
+  padding: clamp(10px, 1.8dvh, 16px);
   background: #ffffff03;
-  flex: none;
+  overflow: hidden;
 }
+.shadow-summary-card > .status-pill { align-self: flex-start; flex: none; }
+.shadow-summary-content,
+.shadow-event-content { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.shadow-summary-content { margin-top: 8px; }
+.shadow-event > .section-label { flex: none; margin-bottom: 10px; }
 .shadow-summary-card h3 {
-  margin: 8px 0 5px;
-  font-size: var(--font-section);
+  margin: 0 0 5px;
+  font-size: var(--font-body);
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
@@ -856,13 +855,6 @@ time {
   font-size: var(--font-caption);
   color: var(--muted);
   overflow-wrap: anywhere;
-}
-.shadow-summary-card h3,
-.shadow-summary-card p {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  overflow: hidden;
 }
 .trace-section {
   display: flex;
@@ -884,7 +876,6 @@ time {
   overflow: auto;
   flex: 1;
   min-height: 0;
-  scrollbar-width: thin;
   overscroll-behavior: contain;
 }
 .timeline {
@@ -929,12 +920,7 @@ time {
 }
 .shadow-event {
   font-size: 10px;
-  border-top: 1px solid var(--line);
-  padding-top: clamp(8px, 1.8dvh, 16px);
   overflow-wrap: anywhere;
-  max-height: clamp(48px, 12dvh, 110px);
-  overflow: auto;
-  flex: none;
 }
 .shadow-event > .section-label {
   margin-bottom: 7px;
@@ -1252,7 +1238,6 @@ time {
   flex: 1;
   margin: var(--panel-gap) -6px 0;
   padding: 0 6px;
-  scrollbar-width: thin;
   overscroll-behavior: contain;
 }
 .conversation-stream {
@@ -1407,13 +1392,7 @@ time {
 .message.speaking {
   --message-line: #88dbc345;
 }
-.message p.delivery-copy {
-  color: var(--subtle);
-  white-space: pre-wrap;
-  font-size: var(--font-caption);
-  line-height: 1.6;
-  margin-top: 7px;
-}
+
 .conversation-footer {
   padding: clamp(8px, 1.8dvh, 16px) 0;
   border-top: 1px solid var(--line);
@@ -1485,7 +1464,6 @@ time {
   min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-width: thin;
 }
 .settings-sidebar {
   display: flex;
@@ -1532,7 +1510,6 @@ time {
   min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-width: thin;
 }
 .settings-sidebar-actions {
   display: flex;
@@ -3418,13 +3395,6 @@ time {
   .shadow-summary-card h3 {
     margin-top: 5px;
   }
-  .shadow-summary-card p {
-    -webkit-line-clamp: 1;
-  }
-  .shadow-column > .info-callout {
-    max-height: 48px;
-    overflow: auto;
-  }
 }
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -3435,3 +3405,18 @@ time {
     scroll-behavior: auto !important;
   }
 }
+
+/* fixed credentials（固定供应商凭据）：两项输入与同一套设置卡片、操作层级一致。 */
+.fixed-model-credentials { display: grid; gap: 18px; }
+.fixed-provider-card { display: grid; gap: 20px; padding: 22px; border: 1px solid var(--line); border-radius: 13px; background: #ffffff03; }
+.fixed-provider-card > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.fixed-provider-card h3 { font-size: var(--font-section); font-weight: 600; }
+.fixed-provider-card header p { margin-top: 5px; font-size: var(--font-caption); color: var(--subtle); }
+.fixed-provider-card .configured { color: var(--mint); border-color: #88dbc32c; background: #88dbc308; }
+.fixed-provider-card .form-field input { width: 100%; }
+.fixed-credentials-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; border-top: 1px solid var(--line); padding-top: 20px; }
+.fixed-credentials-footer p { color: var(--subtle); font-size: var(--font-caption); line-height: 1.7; }
+.wake-task-tabs { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); background: #ffffff02; padding: 4px; border-radius: 10px; }
+.wake-task-tabs button { min-height: var(--compact-control-height); padding: 5px 12px; border: 1px solid transparent; border-radius: 7px; color: var(--muted); font-size: var(--font-body); }
+.wake-task-tabs button:hover { background: #ffffff06; color: var(--text); }
+.wake-task-tabs button.active { color: var(--accent); background: #b2baff12; border-color: #b2baff20; }

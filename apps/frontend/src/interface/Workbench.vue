@@ -13,7 +13,6 @@ const emit = defineEmits<{
   action: [];
   reset: [];
   mode: [value: ReasoningMode]; // mode（切换运行模式）。
-  expand: [];
   settings: []; // settings（打开设置页面）。
   console: []; // console（打开代理控制台）。
 }>();
@@ -110,19 +109,15 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
     <aside class="shadow-column panel" aria-labelledby="shadow-panel-title">
       <header class="column-heading">
         <h2 id="shadow-panel-title" class="panel-kicker">后台协作</h2>
-        <button
-          class="ghost-action"
-          :aria-expanded="model.shadow.expanded"
-          @click="emit('expand')"
-        >
-          {{ model.shadow.expanded ? "收起" : "展开" }}
-        </button>
       </header>
-      <div class="shadow-summary-card">
+      <div class="shadow-regions">
+      <section class="shadow-summary-card" aria-label="当前协作状态">
         <span class="status-pill">{{ model.shadow.status }}</span>
+        <div class="shadow-summary-content">
         <h3>{{ model.shadow.title }}</h3>
         <p v-if="model.shadow.focus">{{ model.shadow.focus }}</p>
-      </div>
+        </div>
+      </section>
       <section class="trace-section">
         <header>
           <span>运行轨迹</span
@@ -150,17 +145,15 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
       </section>
       <section class="shadow-event">
         <p class="section-label">最新进展</p>
-        <p>{{ model.shadow.event || "等待新的进展" }}</p>
+        <div class="shadow-event-content"><p>{{ model.shadow.event || "等待新的进展" }}</p></div>
       </section>
-      <div v-if="model.shadow.expanded" class="info-callout">
-        {{ model.shadow.status }} · {{ model.shadow.focus || "暂无待处理事项" }}
       </div>
       <footer class="shadow-panel-footer">
         <div class="panel-resource-footer">
           <span
             >上下文 <strong>{{ model.shadow.context }}</strong></span
           ><span
-            >缓存 <strong>{{ model.shadow.cache }}</strong></span
+            >缓存命中 <strong>{{ model.shadow.cache }}</strong></span
           >
         </div>
         <button

@@ -75,7 +75,6 @@ const overlay = ref<PreviewOverlay>(
 /** confirmPurpose（确认画面用途）：只决定文案，不执行退出或重启。 */
 const confirmPurpose = ref<"apply" | "exit">("apply");
 const toolsOpen = ref(false);
-const shadowExpanded = ref(false);
 const reasoningMode = ref<ReasoningMode>("fast"); // reasoningMode（运行模式）：默认快速。
 const feedback = ref("");
 const feedbackError = ref(false);
@@ -160,7 +159,6 @@ function resetPreview() {
   scene.value = "normal";
   runtimeState.value = "standby";
   reasoningMode.value = "fast";
-  shadowExpanded.value = false;
   closeOverlays();
   resetKey.value += 1;
 }
@@ -224,7 +222,6 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
           ? "后台协作暂时不可用"
           : "整理下午安排并保留专注时间",
     status: replayMode.value ? '日志回放 · 只读' : scene.value === "loading" ? "处理中" : "随时可协作",
-    expanded: shadowExpanded.value,
     focus: replayMode.value ? '根据本地记录查看对话与影子活动，不会连接真实服务。' : scene.value === "long" ? longText : "正在整理待确认事项与依赖关系。",
     context: replayMode.value ? voiceShadowReplayDemo.context : "86K / 256K",
     cache: replayMode.value ? voiceShadowReplayDemo.cache : "76%",
@@ -247,7 +244,6 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
       @action="toggleVoiceSession"
       @reset="notify('会话已重置')"
       @mode="reasoningMode = $event"
-      @expand="shadowExpanded = !shadowExpanded"
     />
     <SettingsFrame
       v-show="page !== 'home'"

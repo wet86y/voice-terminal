@@ -252,6 +252,30 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
     async def _events(self, values) -> None:
         self.events.extend(values)
 
+    async def test_plugin_telemetry_keeps_latest_watermark_and_rejects_foreign_session(self) -> None:
+        await self.session.request_wake()
+        payload = {"protocol_version": "2.0", "voice_session_id": "voice-session",
+                   "dsh_session_id": self.session.dsh_session_id, "epoch": self.session.epoch,
+                   "context_revision": self.session.last_applied_revision,
+                   "activation_id": self.session.activation_id, "trace_revision": 8,
+                   "state": "running", "telemetry": {"context_token_estimate": 12000,
+                   "context_limit_tokens": 100000, "context_usage_percent": 12,
+                   "provider_input_tokens": 10000, "provider_cached_tokens": 8000,
+                   "provider_cache_hit_ratio": 0.8, "api_key": "do-not-export"}}
+        self.assertEqual(await self.session.accept_activity(payload), "accepted")
+        self.assertEqual(self.session.snapshot()["provider_cache_hit_ratio"], 0.8)
+        self.assertNotIn("api_key", self.session.snapshot())
+        self.session._update_telemetry({"trace_revision": 7, "telemetry": {"provider_cache_hit_ratio": 0}})
+        self.assertEqual(self.session.snapshot()["provider_cache_hit_ratio"], 0.8)
+        await self.session.accept_activity({**payload, "dsh_session_id": "foreign", "trace_revision": 9, "telemetry": {"provider_cache_hit_ratio": 0}})
+        self.assertEqual(self.session.snapshot()["provider_cache_hit_ratio"], 0.8)
+        # 终态后相同会话的最终用量仍可接收，但不恢复已结束的激活。
+        self.session.activation_id = None
+        await self.session.accept_activity({**payload, "activation_id": "", "trace_revision": 10,
+                                           "telemetry": {"provider_cache_hit_ratio": 0.9}})
+        self.assertEqual(self.session.snapshot()["provider_cache_hit_ratio"], 0.9)
+        self.assertIsNone(self.session.activation_id)
+
     async def test_wake_opens_injects_snapshot_then_sends_content_free_activation(self) -> None:
         self.assertEqual(await self.session.request_wake(), "started")
         self.assertEqual([name for name, _ in self.client.calls], [

@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import secrets
 import time
@@ -451,6 +452,8 @@ class DshShadowAgentSession:
         self._run_seq = 0
         self._observer_committed_steps = 0
         self._context_resync_task: asyncio.Task[None] | None = None
+        self._telemetry: dict[str, int | float] = {}  # telemetry（桥接插件会话用量）：不包含正文或凭据。
+        self._telemetry_trace_revision = -1  # telemetry_trace_revision（用量水位）：防止迟到快照覆盖新用量。
 
     @property
     def available(self) -> bool:
@@ -1024,6 +1027,8 @@ class DshShadowAgentSession:
             await self._save_mapping(state="retired", retired=True)
         async with self._event_lock:
             self.dsh_session_id = f"voice-shadow-{uuid.uuid4()}"
+            self._telemetry.clear()
+            self._telemetry_trace_revision = -1
             self.epoch = int(self.context_source.shadow_context_epoch)
             self.last_applied_revision = -1
             self.last_guided_revision = 0
@@ -1212,6 +1217,14 @@ class DshShadowAgentSession:
 
     async def accept_activity(self, payload: dict[str, Any]) -> BridgeResult:
         async with self._event_lock:
+            # 用量属于绑定会话；终态工具结算后仍接收最终供应商计数，不改变激活状态。
+            if (payload.get("protocol_version") == BRIDGE_PROTOCOL_VERSION
+                    and payload.get("voice_session_id") == self.voice_session_id
+                    and payload.get("dsh_session_id") == self.dsh_session_id
+                    and payload.get("epoch") == self.epoch
+                    and payload.get("context_revision") == self.last_applied_revision
+                    and not self._retired):
+                self._update_telemetry(payload)
             if not await self._callback_matches_or_reconcile(payload):
                 return "stale"
             claimed = payload.get("claimed_revision")
@@ -1233,6 +1246,28 @@ class DshShadowAgentSession:
                     self._observer_committed_steps = committed_steps
                     self._schedule_observer()
             return "accepted"
+
+    def _update_telemetry(self, payload: dict[str, Any]) -> None:
+        """telemetry（插件用量）只允许有限的非负计数及缓存比例。"""
+        revision = payload.get("trace_revision")
+        value = payload.get("telemetry")
+        if (not isinstance(value, dict) or type(revision) is not int
+                or revision < 0 or revision < self._telemetry_trace_revision):
+            return
+        counts = ("context_token_estimate", "context_limit_tokens",
+                  "provider_input_tokens", "provider_cached_tokens")
+        safe: dict[str, int | float] = {}
+        for key in counts:
+            count = value.get(key)
+            if type(count) is int and 0 <= count <= 2**53 - 1:
+                safe[key] = count
+        for key in ("context_usage_percent", "provider_cache_hit_ratio"):
+            count = value.get(key)
+            if (type(count) in (int, float) and math.isfinite(count) and count >= 0
+                    and (key != "provider_cache_hit_ratio" or count <= 1)):
+                safe[key] = count
+        self._telemetry = safe
+        self._telemetry_trace_revision = revision
 
     def _schedule_observer(self, *, force: bool = False) -> None:
         if self.status_provider is None:
@@ -1310,6 +1345,7 @@ class DshShadowAgentSession:
                 continue
             if response.get("result") not in {"accepted", "duplicate"}:
                 return
+            self._update_telemetry(response)
             target = int(response.get("trace_revision") or self._observer_trace_revision)
             records = response.get("records")
             if response.get("mode") != "unchanged" or force:
@@ -1422,6 +1458,7 @@ class DshShadowAgentSession:
 
     def snapshot(self) -> dict[str, Any]:
         return {
+            **self._telemetry,
             "backend": "dsh",
             "available": self.available,
             "active": self.activation_id is not None and not self._waiting_user,

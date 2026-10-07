@@ -269,6 +269,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     async def dsh_shadow_activity(request: Request) -> JSONResponse:
         payload, session = await dsh_callback_body(request)
         code = await session.accept_activity(payload)
+        if isinstance(payload.get("telemetry"), dict):
+            await runtime.publish_shadow_product()
         return JSONResponse(
             {"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": code},
             status_code=200 if code == "accepted" else 409,
@@ -837,6 +839,22 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             registry_error(exc)
             raise AssertionError("unreachable")
 
+    @app.get("/api/v1/models/credentials")
+    async def get_fixed_model_credentials() -> dict[str, Any]:
+        try:
+            return await registry_or_404().fixed_credentials_snapshot()
+        except Exception as exc:
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.put("/api/v1/models/credentials")
+    async def save_fixed_model_credentials(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await registry_or_404().save_fixed_credentials(body)
+        except Exception as exc:
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
     @app.post("/api/v1/models/scan")
     async def scan_models() -> dict[str, Any]:
         try:
@@ -895,19 +913,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
 
     @app.post("/api/v1/models/assignments/apply")
     async def apply_model_assignments(body: dict[str, Any]) -> dict[str, Any]:
-        assignments = body.get("assignments")
-        if not isinstance(assignments, dict):
-            raise HTTPException(status_code=422, detail="assignments 必须是对象。")
-        try:
-            result = await registry_or_404().apply_assignments(
-                assignments, confirmed=body.get("confirmed") is True,
-            )
-            if result.get("applied") is True:
-                registry_or_404().config = runtime.config
-            return result
-        except Exception as exc:
-            registry_error(exc)
-            raise AssertionError("unreachable")
+        raise HTTPException(
+            status_code=409,
+            detail="当前版本使用本地固定的 DeepSeek（语言模型）和 MiniMax（语音合成）配置，仅支持更新接口密钥。",
+        )
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

@@ -107,6 +107,48 @@ export function exportSessionPage(binding: Pick<Binding, 'handle' | 'exportSnaps
 }
 
 const MAX_OBSERVER_RECORDS = 512
+
+/** readSessionTelemetry（会话用量）：仅导出插件获得的上下文词元和供应商缓存计数。 */
+export function readSessionTelemetry(binding: Pick<Binding, 'handle'>, meter?: any): Record<string, Json> {
+  const session = binding.handle.agent.session
+  const count = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+  const events = session.snapshotEvents()
+  let usage: any
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]
+    if (!['assistant/message', 'assistant/attempt'].includes(event.type)) continue
+    // stream（持久流记录）的 usage（供应商用量）以原始 chunk（数据块）保存。
+    const stream = Array.isArray(event.data?.stream) ? event.data.stream : []
+    usage = event.data?.usage ?? stream.findLast((record: any) => record.type === 'chunk' && record.chunk?.type === 'usage')?.chunk.usage
+    if (usage) break
+  }
+  const telemetry: Record<string, Json> = {}
+  // DSH 的 inputTokens（未缓存输入词元）与 cacheReadTokens（缓存读取词元）分开计数。
+  if (usage && count(usage.inputTokens)) {
+    const cached = count(usage.cacheReadTokens) ? usage.cacheReadTokens : undefined
+    const written = count(usage.cacheWriteTokens) ? usage.cacheWriteTokens : 0
+    const total = usage.inputTokens + (cached ?? 0) + written
+    if (count(total)) {
+      telemetry.provider_input_tokens = total // provider_input_tokens（最近请求的全部输入词元）。
+      telemetry.context_token_estimate = total // context_token_estimate（供应商测得的最近上下文用量）。
+      if (cached !== undefined) {
+        telemetry.provider_cached_tokens = cached // provider_cached_tokens（最近请求的缓存命中词元）。
+        if (total > 0) telemetry.provider_cache_hit_ratio = cached / total // provider_cache_hit_ratio（缓存命中比例）。
+      }
+    }
+  }
+  try {
+    const measurement = meter?.measure(session)
+    if (count(measurement?.totalTokens)) telemetry.context_token_estimate = measurement.totalTokens
+  } catch { /* 用量采样失败不能影响代理执行，继续使用最近供应商样本。 */ }
+  const limit = session.requestContext?.()?.contextWindow
+  if (count(limit) && limit > 0) {
+    telemetry.context_limit_tokens = limit // context_limit_tokens（插件当前模型的上下文容量）。
+    const used = telemetry.context_token_estimate
+    if (typeof used === 'number') telemetry.context_usage_percent = used / limit * 100 // context_usage_percent（上下文占用百分比）。
+  }
+  return telemetry
+}
 const CALLBACK_ORIGIN = process.env.VOICE_DSH_CALLBACK_ORIGIN ?? ''
 
 function createUserMessage(input: { content: unknown[]; source: Record<string, unknown> }, id: string = randomUUID()): Record<string, unknown> {
@@ -689,6 +731,7 @@ export function apply(ctx: any, config: Config): void {
         dsh_session_id: binding.dshSessionId, epoch: binding.epoch,
         context_revision: binding.revision, activation_id: binding.activationId ?? '',
         trace_revision: binding.traceRevision, committed_steps: binding.committedSteps,
+        telemetry: readSessionTelemetry(binding, ctx.get('tokenMeter')),
         state: binding.agentState,
       }).catch(() => undefined)
     }
@@ -760,6 +803,7 @@ export function apply(ctx: any, config: Config): void {
       dsh_session_id: binding.dshSessionId, epoch: binding.epoch,
       context_revision: binding.revision, activation_id: binding.activationId ?? '',
       trace_revision: binding.traceRevision, claimed_revision: binding.claimedRevision ?? 0,
+      telemetry: readSessionTelemetry(binding, ctx.get('tokenMeter')),
       state: String(status ?? ''),
     }).catch(() => undefined)
     void callback('/api/internal/dsh-bridge/mainline.activity', {
@@ -987,6 +1031,7 @@ export function apply(ctx: any, config: Config): void {
               trace_revision: existing.traceRevision,
               agent_state: existing.agentState,
               committed_model_steps: existing.committedSteps,
+              telemetry: readSessionTelemetry(existing, ctx.get('tokenMeter')),
               pending_tools: [...existing.pendingTools.entries()].map(([call_id, name]) => ({ call_id, name })) as unknown as Json,
               pending_subagents: [...existing.pendingTools.entries()]
                 .filter(([, name]) => name.includes('subagent'))

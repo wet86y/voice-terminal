@@ -21,6 +21,24 @@ launch tokens, or ordinary assistant prose to the Voice mailbox.
 The runtime requires `VOICE_DSH_BRIDGE_TOKEN` and `VOICE_DSH_CALLBACK_ORIGIN`.
 Both are supplied only to the project-managed DSH child process.
 
+## 产品界面的上下文与缓存用量
+
+后台协作栏通过 Bridge（插件桥接层）的 `observer.snapshot`（观察快照接口）和
+`shadow.activity`（后台活动回传）获取真实用量。`tokenMeter.measure(session)`（会话上下文计量）
+提供当前上下文，最近一次助手调用的 `usage`（供应商用量）提供缓存计数；尚无有效样本时显示“—”。
+
+| 字段 | 中文说明与来源 |
+| --- | --- |
+| `context_token_estimate` | 当前上下文的令牌估算数，来自宿主上下文计量服务。 |
+| `context_limit_tokens` | 当前模型上下文令牌上限，来自会话请求上下文。 |
+| `context_usage_percent` | 当前上下文占模型上限的百分比。 |
+| `provider_input_tokens` | 本次调用总输入令牌数，为未缓存输入、缓存读取和缓存写入三部分之和。 |
+| `provider_cached_tokens` | 本次调用命中的缓存读取令牌数。 |
+| `provider_cache_hit_ratio` | 缓存读取令牌数占本次总输入令牌数的比例。 |
+
+语音端只接受同一会话、协议和上下文版本的有界数值，按 `trace_revision`（轨迹版本）拒绝旧样本。
+终态之后的合法用量回传只刷新界面，不重新激活代理。产品页面不读取插件内部日志或展开长正文。
+
 ## 提前进入静默
 
 `request_early_silence({})`（请求提前进入静默，空参数对象）仅允许当前语音会话绑定的活动根代理调用。

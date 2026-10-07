@@ -97,7 +97,6 @@ export function useProductControls() {
     computeSavedDevices,
     refreshComputeStatus,
     saveComputeSettings,
-    shadowExpanded,
     modelScanState,
     restartState,
     applyImpact,
@@ -1550,7 +1549,6 @@ export function useProductControls() {
           (shadow.value.available ? "等待本轮协作摘要" : "后台协作暂不可用"),
         status: shadowDisplayStatus.value,
         focus: shadowFocusText.value,
-        expanded: shadowExpanded.value,
         context: shadowContext.value
           ? formatTokens(shadowContext.value.used_tokens) +
             " / " +
@@ -1619,7 +1617,6 @@ export function useProductControls() {
     computeSavedDevices,
     refreshComputeStatus,
     saveComputeSettings,
-    shadowExpanded,
     modelScanState,
     restartState,
     applyImpact,
@@ -1643,6 +1640,7 @@ export function useProductControls() {
     verifyCustomModel,
     addVerifiedProvider,
     setNotice,
+    setError: adapter.setError,
     speakerForm,
     speakerStatus,
     speakerTestResult,

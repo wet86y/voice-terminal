@@ -98,24 +98,13 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
 
     @asynccontextmanager
     async def lifespan(_app):
-        # Restore the last explicitly committed product assignment before any
-        # audio, KWS, LLM, Shadow or TTS component is constructed.  A stale or
-        # unavailable assignment is non-fatal: YAML remains the safe fallback
-        # and the warning is visible through /health and Product snapshot.
+        # 固定模型从项目本地配置加载；只恢复接口密钥，旧模型池不再改变正式运行模型。
         try:
-            assignment = await model_registry.runtime_assignment_payload()
-            if assignment is not None:
-                restored = await runtime.restore_model_services(assignment)
-                if not restored.get("ok"):
-                    runtime.startup_errors.append(
-                        "model_assignment_restore: "
-                        + str(restored.get("message") or "恢复失败")[:300]
-                    )
-                else:
-                    model_registry.config = runtime.config
+            # 固定模型由本地配置确定；凭据在 DSH（代理执行宿主）启动前加载，供两条链路共用。
+            os.environ.update(await model_registry.runtime_fixed_credentials())
         except Exception as exc:
             runtime.startup_errors.append(
-                f"model_assignment_restore: {type(exc).__name__}: {str(exc)[:260]}"
+                f"fixed_credentials_restore（接口密钥恢复）: {type(exc).__name__}"
             )
         # Populate the product snapshot with the current runtime projection
         # and local model inventory before the first Web UI request.  This is

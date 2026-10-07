@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   clearActivationIfCurrent,
   exportSessionPage,
+  readSessionTelemetry,
   deliverRuntimeReminder,
   enqueueAuthoritativeContext,
   enqueueDeferredActivation,
@@ -55,6 +56,23 @@ function envelope(revision, frames, fromRevision = undefined) {
 function textOf(message) {
   return message.content[0].text
 }
+
+test('插件会话用量包含缓存词元且不重复计算，缺失缓存样本保持空值', () => {
+  const events = [{ type: 'assistant/message', data: { usage: { inputTokens: 2000, cacheReadTokens: 8000, cacheWriteTokens: 0 } } }]
+  const binding = { handle: { agent: { session: { snapshotEvents: () => events, requestContext: () => ({ contextWindow: 100000 }) } } } }
+  const telemetry = readSessionTelemetry(binding, { measure: () => ({ totalTokens: 12000 }) })
+  assert.equal(telemetry.context_token_estimate, 12000)
+  assert.equal(telemetry.context_usage_percent, 12)
+  assert.equal(telemetry.provider_input_tokens, 10000)
+  assert.equal(telemetry.provider_cache_hit_ratio, 0.8)
+  events[0].data = { stream: [{ type: 'chunk', chunk: { type: 'usage', usage: { inputTokens: 4000, cacheReadTokens: 0 } } }] }
+  assert.equal(readSessionTelemetry(binding).provider_cache_hit_ratio, 0)
+  events[0].data = { usage: { inputTokens: 4000 } }
+  assert.equal(readSessionTelemetry(binding).provider_cache_hit_ratio, undefined)
+  events.length = 0
+  assert.equal(readSessionTelemetry(binding).context_token_estimate, undefined)
+  assert.equal(readSessionTelemetry(binding).provider_cache_hit_ratio, undefined)
+})
 
 test('session export（完整归档）保留长记录并冻结分页，不受后续活动影响', () => {
   const events = Array.from({ length: 401 }, (_, seq) => ({ seq, type: 'user/message', data: { text: `记录${seq}` } }))
