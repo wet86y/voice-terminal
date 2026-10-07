@@ -98,6 +98,7 @@ class ModelRegistryService:
     def _empty(self) -> dict[str, Any]:
         return {
             "schema_version": REGISTRY_SCHEMA_VERSION,
+            "fixed_credentials": {},  # fixed_credentials（固定供应商凭据引用）：不保存密钥正文。
             "providers": [], "models": [], "tts_profiles": [],
             "assignments": {
                 "voice_llm_model_id": None, "shadow_llm_model_id": None,
@@ -377,6 +378,89 @@ class ModelRegistryService:
     async def snapshot(self) -> dict[str, Any]:
         async with self._lock:
             return self._snapshot(self._load())
+
+    def _fixed_secret(self, registry: Mapping[str, Any], provider: str) -> str | None:
+        """fixed secret（固定服务密钥）：兼容已有的托管凭据，不引入模型选择。"""
+        reference = registry.get("fixed_credentials", {}).get(provider)
+        if reference:
+            if not self.vault.available:
+                raise CredentialVaultUnavailable("本机凭据存储不可用。")
+            secret = self.vault.get(str(reference))
+            if not secret:
+                raise ModelRegistryError("已保存的接口密钥不可用，请重新填写。")
+            return secret
+        environment = "DEEPSEEK_API_KEY" if provider == "deepseek" else "MINIMAX_API_KEY"
+        if self.config.api_key(environment):
+            return None  # 现有环境密钥继续由应用宿主加载。
+        # 仅沿用旧分配中相同供应商的凭据，不恢复旧模型分配。
+        slot = "voice_llm_model_id" if provider == "deepseek" else "tts_profile_id"
+        selected = registry.get("assignments", {}).get(slot)
+        if provider == "minimax":
+            selected = next((row.get("model_id") for row in registry.get("tts_profiles", []) if row.get("id") == selected), None)
+        model = next((row for row in registry.get("models", []) if row.get("id") == selected), {})
+        source = next((row for row in registry.get("providers", []) if row.get("id") == model.get("provider_id") and row.get("protocol") == provider), {})
+        reference = source.get("credential_ref")
+        return self.vault.get(str(reference)) if reference and self.vault.available else None
+
+    def _fixed_credentials_snapshot(self, registry: Mapping[str, Any]) -> dict[str, Any]:
+        states = {}
+        for provider, environment in (("deepseek", "DEEPSEEK_API_KEY"), ("minimax", "MINIMAX_API_KEY")):
+            try:
+                configured = bool(self._fixed_secret(registry, provider) or self.config.api_key(environment))
+            except (CredentialVaultUnavailable, ModelRegistryError):
+                configured = False
+            states[provider] = {"configured": configured}  # configured（是否已配置接口密钥）。
+        return {"providers": states, "vault_available": self.vault.available}  # vault_available（本机凭据存储是否可用）。
+
+    async def fixed_credentials_snapshot(self) -> dict[str, Any]:
+        async with self._lock:
+            return self._fixed_credentials_snapshot(self._load())
+
+    async def runtime_fixed_credentials(self) -> dict[str, str]:
+        """runtime_fixed_credentials（启动凭据）：只供本机进程加载，不返回前端。"""
+        async with self._lock:
+            registry = self._load()
+            credentials = {}
+            for provider, environment in (("deepseek", "DEEPSEEK_API_KEY"), ("minimax", "MINIMAX_API_KEY")):
+                secret = self._fixed_secret(registry, provider)
+                if secret:
+                    credentials[environment] = secret
+            return credentials
+
+    async def save_fixed_credentials(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        allowed = {"deepseek_api_key", "minimax_api_key"}  # allowed（唯一可写字段）：两家固定服务的接口密钥。
+        if set(request) - allowed:
+            raise ModelRegistryError("只允许填写 DeepSeek（语言模型服务）与 MiniMax（语音合成服务）的接口密钥。")
+        updates = {}
+        for field in allowed:
+            value = request.get(field, "")
+            if not isinstance(value, str):
+                raise ModelRegistryError(f"{field}（接口密钥）必须是文本。")
+            if value.strip():
+                updates[field.split("_", 1)[0]] = _clean_text(value, "API Key（接口密钥）", max_length=4096)
+        if not updates:
+            raise ModelRegistryError("请至少填写一个接口密钥。")
+        if not self.vault.available:
+            raise CredentialVaultUnavailable("本机凭据存储不可用，无法保存接口密钥。")
+        async with self._lock:
+            registry = self._load()
+            previous = dict(registry["fixed_credentials"])
+            staged: dict[str, str] = {}
+            try:
+                for provider, secret in updates.items():
+                    reference = _stable_id("credential", f"{self.registry_path.resolve()}/fixed/{provider}/{os.urandom(16).hex()}")
+                    staged[provider] = reference
+                    self.vault.put(reference, secret)
+                registry["fixed_credentials"] = {**previous, **staged}
+                self._write(registry)
+            except Exception:
+                for reference in staged.values():
+                    self.vault.delete(reference)
+                raise
+            for provider in staged:
+                if previous.get(provider):
+                    self.vault.delete(previous[provider])
+            return {**self._fixed_credentials_snapshot(registry), "message": "接口密钥已保存，重启应用后生效。"}
 
     def _runtime_imports(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         llm = self.config.llm

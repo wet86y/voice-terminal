@@ -7,14 +7,13 @@ import TimePicker from '../interface/TimePicker.vue'
 import WakeTaskSchedule from '../interface/WakeTaskSchedule.vue'
 import InstructionEditorRow from '../interface/InstructionEditorRow.vue'
 import SpeakerRecordingFlow from '../interface/SpeakerRecordingFlow.vue'
-import ModelAccordion from '../interface/ModelAccordion.vue'
-import ModelAssignmentField from '../interface/ModelAssignmentField.vue'
-import ModelPoolEntry from '../interface/ModelPoolEntry.vue'
+import WakeTaskTabs from '../interface/WakeTaskTabs.vue'
+import FixedModelCredentials from '../interface/FixedModelCredentials.vue'
 import { useLocalComponentsDemo } from './useLocalComponentsDemo'
 import {
-  demoAmbientRecords, demoInstructions, demoModelEntries,
+  demoAmbientRecords, demoInstructions,
   demoSettings, demoSpeakerPrompts, demoSpeakerTemplates, demoWakeTasks,
-  longIdentifier, longText, originLabels, previewRows, primaryPersonaDocuments,
+  longIdentifier, longText, previewRows, primaryPersonaDocuments,
   type DemoWakeTask, type PreviewScene, type SettingsTab,
 } from './demo-data'
 
@@ -37,14 +36,17 @@ const speakerRecording = ref<number | null>(null) // speakerRecording（当前�
 const speakerCanSubmit = computed(() => speakerSegments.value.length === demoSpeakerPrompts.length && speakerRecording.value === null && !loading.value) // speakerCanSubmit（录制完成后允许保存）。
 const editingTask = ref('')
 const addingTask = ref(false) // addingTask（添加表单是否展开）。
-const editingModel = ref('')
-const models = computed(() => previewRows(demoModelEntries, props.scene))
+const deepseekKey = ref('') // deepseekKey（演示语言服务密钥草稿）。
+const minimaxKey = ref('') // minimaxKey（演示语音合成密钥草稿）。
+const taskView = ref<'pending' | 'archived'>('pending') // taskView（当前演示任务分类）。
 const tasks = ref(previewRows(demoWakeTasks, props.scene))
 const templates = computed(() => previewRows(demoSpeakerTemplates, props.scene))
 const ambient = computed(() => previewRows(demoAmbientRecords, props.scene))
 const instructionRows = computed(() => props.scene === 'empty' ? [] : instructions)
 const loading = computed(() => props.scene === 'loading')
-const demoModelOptions = demoModelEntries.filter(item => item.capability === 'llm').map(item => ({ value: item.id, label: item.name }))
+const pendingTasks = computed(() => tasks.value.filter(item => item.status === '待执行'))
+const archivedTasks = computed(() => tasks.value.filter(item => item.status !== '待执行'))
+const visibleTasks = computed(() => taskView.value === 'pending' ? pendingTasks.value : archivedTasks.value)
 function feedback(label: string) { emit('feedback', label) }
 function toggleSpeakerRecording() {
   speakerRecording.value = null
@@ -80,6 +82,7 @@ function editTask(item: DemoWakeTask) {
   Object.assign(form, { taskRule: item.ruleKind, taskWhen: item.when.replace(' ', 'T'), taskTime: item.when.slice(-5), taskWeekdays: item.weekdays, taskText: item.text })
 }
 function addTask() {
+  taskView.value = 'pending'
   if (addingTask.value) return
   const next = new Date(Date.now() + 60 * 60 * 1000), pad = (value: number) => String(value).padStart(2, '0')
   const when = `${next.getFullYear()}-${pad(next.getMonth() + 1)}-${pad(next.getDate())}T${pad(next.getHours())}:${pad(next.getMinutes())}`
@@ -112,6 +115,14 @@ function saveTask() {
   feedback(addingTask.value ? '定时任务已添加' : '定时任务修改已保存')
   addingTask.value = false
   editingTask.value = ''
+}
+function deleteTask(item: DemoWakeTask) {
+  tasks.value = tasks.value.filter(task => task.id !== item.id)
+  feedback('归档任务已删除')
+}
+function saveKeys() {
+  deepseekKey.value = ''; minimaxKey.value = ''
+  feedback('接口密钥已保存，重启应用后生效。')
 }
 function cancelTask(item: DemoWakeTask) {
   item.status = '已取消'
@@ -191,7 +202,7 @@ function cancelTask(item: DemoWakeTask) {
     <template v-else-if="tab === 'wakes'">
       <SettingsPageHeader section="wakes" />
       <div class="wake-task-toolbar">
-        <span>待执行 {{ tasks.filter(item => item.status === '待执行').length }} 项</span>
+        <WakeTaskTabs v-model="taskView" :pending="pendingTasks.length" :archived="archivedTasks.length" />
         <div class="wake-task-toolbar-actions">
           <button class="outline-button wake-task-button" type="button" :aria-expanded="addingTask" :disabled="loading" @click="addTask"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>添加</button>
           <button class="outline-button wake-task-button" type="button" :disabled="loading" @click="feedback('任务列表已刷新')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 6.1a8 8 0 0 1 13 3M4.9 14.9a8 8 0 0 0 13 3" /></svg>刷新</button>
@@ -205,11 +216,11 @@ function cancelTask(item: DemoWakeTask) {
           <div class="wake-task-editor-actions"><button class="outline-button wake-task-button" type="button" @click="addingTask = false">取消</button><button class="save-button compact-save" type="button" :disabled="loading || !taskCanSave" @click="saveTask">添加任务</button></div>
         </div>
       </section>
-      <div v-if="tasks.length" class="wake-task-list">
-        <article v-for="item in tasks" :key="item.id" class="model-accordion-card wake-task-card" :data-task="item.id">
+      <div v-if="visibleTasks.length" class="wake-task-list">
+        <article v-for="item in visibleTasks" :key="item.id" class="model-accordion-card wake-task-card" :data-task="item.id">
           <div class="wake-task-summary">
             <div><div class="pool-entry-title"><strong>{{ props.scene === 'long' ? longText : item.text }}</strong><span class="entry-status">{{ item.status }}</span></div><small>规则：{{ item.rule }} · 下次：{{ item.when }}</small><small>参考上下文：{{ item.hasReference ? '已冻结，可按需读取' : '无' }}</small></div>
-            <div v-if="item.status !== '已取消'" class="pool-entry-actions"><button class="outline-button wake-task-button" type="button" :aria-expanded="editingTask === item.id" :disabled="loading" @click="editTask(item)">{{ editingTask === item.id ? '收起' : '修改' }}</button><button class="outline-button wake-task-button danger-action" type="button" :disabled="loading" @click="cancelTask(item)">取消任务</button></div>
+            <div class="pool-entry-actions"><button v-if="item.status === '待执行'" class="outline-button wake-task-button" type="button" :aria-expanded="editingTask === item.id" :disabled="loading" @click="editTask(item)">{{ editingTask === item.id ? '收起' : '修改' }}</button><button class="outline-button wake-task-button danger-action" type="button" :disabled="loading" @click="item.status === '待执行' ? cancelTask(item) : deleteTask(item)">{{ item.status === '待执行' ? '取消任务' : '删除' }}</button></div>
           </div>
           <div v-if="editingTask === item.id" class="model-edit-panel wake-task-editor">
             <WakeTaskSchedule v-model:rule-kind="form.taskRule" v-model:when="form.taskWhen" v-model:time="form.taskTime" v-model:weekdays="form.taskWeekdays" :disabled="loading" />
@@ -218,30 +229,12 @@ function cancelTask(item: DemoWakeTask) {
           </div>
         </article>
       </div>
-      <div v-else-if="!addingTask" class="pool-empty">还没有定时唤醒任务。</div>
+      <div v-else-if="!addingTask" class="pool-empty">{{ taskView === 'pending' ? '还没有待执行任务。' : '还没有已归档任务。' }}</div>
     </template>
 
     <template v-else-if="tab === 'models'">
-      <SettingsPageHeader section="models"><template #actions><button class="outline-button" type="button" :disabled="loading" @click="feedback('模型扫描提示')">{{ loading ? '正在扫描…' : '扫描现有配置' }}</button></template></SettingsPageHeader>
-      <div class="model-accordion-list">
-        <ModelAccordion index="01" title="添加模型" hint="服务商连接"><div class="provider-fields"><label><span>连接名称</span><input v-model="form.providerName" type="text"></label><label><span>服务地址</span><input v-model="form.providerUrl" type="url"></label><label><span>协议</span><select v-model="form.providerProtocol"><option>DeepSeek</option><option>OpenAI 兼容（通用模型接口）</option><option>Responses（响应接口）</option></select></label><label><span>API Key（接口密钥）</span><input v-model="form.providerKey" type="password" autocomplete="off" placeholder="展示字段，请勿填写真实密钥"></label></div><div class="provider-actions"><button class="outline-button" type="button" @click="feedback('连接验证成功提示')">发现并验证连接</button><button class="save-button" type="button" @click="feedback('加入模型池提示')">加入模型池</button></div></ModelAccordion>
-        <ModelAccordion index="02" title="模型配置" hint="运行角色">
-          <div class="preview-assignment-grid">
-            <ModelAssignmentField v-model="form.voiceModel" label="语音交互主模型" :options="demoModelOptions" />
-            <ModelAssignmentField v-model="form.shadowModel" label="Shadow（影子代理）模型" :options="demoModelOptions" />
-            <ModelAssignmentField v-model="form.statusModel" label="状态汇报模型" :options="demoModelOptions" />
-          </div>
-          <div class="info-callout"><span>i</span><p>TTS（语音合成）使用固定在线服务；影子代理采用高强度思考。</p></div>
-        </ModelAccordion>
-        <ModelAccordion index="03" title="模型池" :hint="models.length + ' 个条目'">
-          <div v-if="models.length" class="pool-entry-list">
-            <ModelPoolEntry v-for="item in models" :key="item.id" :name="props.scene === 'long' ? longIdentifier : item.name" :identifier="item.modelId + '（模型标识） · ' + originLabels[item.origin]" :badge="item.capability === 'llm' ? '语言' : item.capability === 'tts' ? '语音' : '本地'" :status="item.status === 'healthy' ? '已就绪' : '可用'" :facts="[{ label: '服务商', value: item.provider }, { label: '用途', value: item.capability === 'llm' ? 'LLM（大语言模型）' : item.capability === 'tts' ? 'TTS（语音合成）' : '本地语音处理' }, { label: '上下文容量', value: item.maxContextTokens ? item.maxContextTokens / 1024 + 'K' : '不适用' }]">
-              <template #actions><button type="button" @click="editingModel = editingModel === item.id ? '' : item.id">{{ editingModel === item.id ? '收起' : '编辑' }}</button><button class="danger-action" type="button" @click="feedback('模型删除提示')">删除</button></template>
-              <div v-if="editingModel === item.id" class="model-edit-panel"><label class="form-field"><span>显示名称</span><input :value="item.name" type="text"></label><label class="form-field"><span>模型标识</span><input :value="item.modelId" type="text"></label><button class="save-button" type="button" @click="feedback('模型条目已保存')">保存修改</button></div>
-            </ModelPoolEntry>
-          </div><div v-else class="pool-empty">模型池中暂无条目。</div>
-        </ModelAccordion>
-      </div><footer class="model-settings-footer"><div class="restart-copy">应用配置会受控重建相关模型服务。</div><button class="save-button" type="button" :disabled="loading" @click="emit('confirm', 'apply')">应用模型配置</button></footer>
+      <SettingsPageHeader section="models" />
+      <FixedModelCredentials v-model:deepseek="deepseekKey" v-model:minimax="minimaxKey" :configured="{ deepseek: props.scene !== 'empty', minimax: props.scene !== 'empty' }" :disabled="loading" :saving="loading" @save="saveKeys" />
     </template>
 
     <template v-else-if="tab === 'compute'">

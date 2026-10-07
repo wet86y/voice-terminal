@@ -183,6 +183,13 @@ export interface ProductProvider {
   [key: string]: unknown
 }
 
+/** FixedModelCredentials（固定供应商密钥状态）：前端只接收是否已配置。 */
+export interface FixedModelCredentials {
+  providers: { deepseek: { configured: boolean }; minimax: { configured: boolean } }; // providers（两家固定服务的配置状态）。
+  vault_available: boolean; // vault_available（本机凭据存储是否可用）。
+  message?: string; // message（保存结果说明）。
+}
+
 export interface ProductModel {
   id: string
   name: string

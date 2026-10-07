@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from voice_terminal.config import AppConfig
@@ -55,6 +56,29 @@ class ModelRegistryTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_fixed_credentials_preserve_blank_input_and_never_echo_secrets(self) -> None:
+        first = asyncio.run(self.service.save_fixed_credentials({"deepseek_api_key": "test-deepseek", "minimax_api_key": "test-minimax"}))
+        self.assertTrue(first["providers"]["deepseek"]["configured"])
+        self.assertNotIn("test-deepseek", json.dumps(first))
+        self.assertNotIn("test-minimax", self.service.registry_path.read_text(encoding="utf-8"))
+        asyncio.run(self.service.save_fixed_credentials({"deepseek_api_key": "updated-deepseek", "minimax_api_key": ""}))
+        restored = asyncio.run(self.service.runtime_fixed_credentials())
+        self.assertEqual(restored, {"DEEPSEEK_API_KEY": "updated-deepseek", "MINIMAX_API_KEY": "test-minimax"})
+        self.assertEqual(self.applied, [])
+        self.assertEqual(len(self.service.vault.values), 2)
+        with self.assertRaises(ModelRegistryError):
+            asyncio.run(self.service.save_fixed_credentials({"deepseek_api_key": "new", "model_id": "other-model"}))
+
+    def test_failed_fixed_credential_write_preserves_previous_vault_and_registry(self) -> None:
+        asyncio.run(self.service.save_fixed_credentials({"deepseek_api_key": "original"}))
+        before = self.service.registry_path.read_bytes()
+        with patch.object(self.service, "_write", side_effect=OSError("test write failure")):
+            with self.assertRaises(OSError):
+                asyncio.run(self.service.save_fixed_credentials({"deepseek_api_key": "replacement", "minimax_api_key": "new"}))
+        self.assertEqual(self.service.registry_path.read_bytes(), before)
+        self.assertEqual(asyncio.run(self.service.runtime_fixed_credentials()), {"DEEPSEEK_API_KEY": "original"})
+        self.assertEqual(len(self.service.vault.values), 1)
 
     def test_scan_is_scoped_and_hiding_persists_across_scan(self) -> None:
         first = asyncio.run(self.service.scan())

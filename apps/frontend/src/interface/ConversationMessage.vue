@@ -1,5 +1,6 @@
 <script setup lang="ts">
-defineProps<{
+import { computed } from "vue";
+const props = defineProps<{
   role: "user" | "assistant"; // role（消息发送方）：用户或语音助手。
   text: string; // text（消息正文）。
   time?: string; // time（消息时间）。
@@ -9,6 +10,11 @@ defineProps<{
   partial?: boolean; // partial（正在识别的临时消息）。
   pending?: boolean; // pending（等待助手回复的临时消息）。
 }>();
+// visibleStatus（可见消息状态）：只保留识别中、异常等需要用户关注的提示。
+const visibleStatus = computed(() => {
+  const status = props.status || "";
+  return /^(已完成识别|已完成播报|已完整传达|正在播报|等待播放|等待播报结算|固定日志回放|已记录)/.test(status) ? "" : status;
+});
 </script>
 
 <template>
@@ -40,11 +46,10 @@ defineProps<{
           <span>{{ text }}</span>
         </div>
         <p v-else class="message-text">{{ text }}</p>
-        <p v-if="delivered" class="delivery-copy">{{ delivered }}</p>
       </div>
-      <small v-if="status" class="message-status">
+      <small v-if="visibleStatus" class="message-status">
         <span v-if="partial" class="live-dot" aria-hidden="true"></span>
-        {{ status }}
+        {{ visibleStatus }}
       </small>
     </div>
   </article>

@@ -24,7 +24,6 @@ const { saving, settings, activePersona, personaDocuments, customInstructions, s
     <footer class="instruction-save-actions"><small class="instruction-hint">增删改与启停在保存后持久化，下一次会话或重置后生效。</small><button class="save-button" type="button" :disabled="saving" @click="saveInstructionSettings">{{ saving ? '正在保存…' : '保存自定义指令' }}</button></footer>
   </section>
   <label class="switch-row context-gate-row"><div><strong>实验性 Shadow 上下文门禁</strong><span>Shadow（影子代理）的侧载模型只判断运行中 DSH（代理执行宿主）的新引导应进入当前步骤还是下一回合；权威上下文仍完整同步。关闭后恢复直接注入。</span></div><input v-model="settings.shadow.experimental_context_gate_enabled" type="checkbox" role="switch" :disabled="saving" @change="saveShadowGate" /><i></i></label>
-  <details class="speaker-advanced"><summary>门禁说明 · 实验能力</summary><p class="instruction-hint">DSH（代理执行宿主）的执行模型与工具由 Harness（执行环境）管理。一次暂缓仅对当次请求有效；暂缓正文在当前激活结束后，按原版本顺序进入下一次激活。</p></details>
 </template>
 <style scoped>
 .instruction-save-actions{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:10px;padding-top:18px;border-top:1px solid var(--line)}

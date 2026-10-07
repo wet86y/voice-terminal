@@ -21,6 +21,8 @@ $Running = Get-CimInstance Win32_Process | Where-Object {
 }
 if ($Running) { throw '请先从正式程序中执行“退出应用”，并关闭前端演示窗口，再更新正式程序。' }
 # 先构建正式产物和演示使用的调试宿主，再停机校验、更新原正式目录。
+& node (Join-Path $DesktopRepo 'integrations/dsh/voice-terminal-shadow-bridge/build.mjs')
+if ($LASTEXITCODE) { throw 'DSH（代理执行宿主）协作桥接插件构建失败。' }
 & node (Join-Path $DesktopRepo 'integrations/dsh/voice-terminal-wake-tasks/build.mjs')
 if ($LASTEXITCODE) { throw 'DSH（代理执行宿主）任务插件构建失败。' }
 & (Join-Path $PSScriptRoot 'build-desktop.ps1')

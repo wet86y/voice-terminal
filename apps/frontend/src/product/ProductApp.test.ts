@@ -13,6 +13,8 @@ import { useProductAdapter } from './useProductAdapter'
 import { useProductControls } from './useProductControls'
 import * as desktopBridge from './desktop-port'
 import ComputeSettings from './panels/ComputeSettings.vue'
+import ModelSettings from './panels/ModelSettings.vue'
+import WakeTasksSettings from './panels/WakeTasksSettings.vue'
 import { provideProductContext } from './product-context'
 import type { WorkbenchModel } from '../interface/workbench'
 import type { ApplicationSnapshot } from './application-host'
@@ -83,6 +85,38 @@ afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
+  it('固定供应商密钥只提交输入字段，失败保留草稿，成功清空输入', async () => {
+    vi.spyOn(productApi, 'fixedCredentials').mockResolvedValue({ providers: { deepseek: { configured: true }, minimax: { configured: true } }, vault_available: true })
+    const save = vi.spyOn(productApi, 'saveFixedCredentials').mockRejectedValueOnce(new Error('保存失败'))
+    const wrapper = render({ setup() { const value = useProductControls(); provideProductContext(value); return () => h(ModelSettings) } })
+    await flushPromises()
+    expect(wrapper.findAll('select')).toHaveLength(0)
+    expect(wrapper.findAll('input')).toHaveLength(2)
+    expect(wrapper.text()).not.toContain('模型池')
+    await wrapper.get('input').setValue('test-deepseek-key')
+    await wrapper.get('form').trigger('submit'); await flushPromises()
+    expect(wrapper.get('input').element).toHaveProperty('value', 'test-deepseek-key')
+    save.mockResolvedValue({ providers: { deepseek: { configured: true }, minimax: { configured: true } }, vault_available: true })
+    await wrapper.get('form').trigger('submit'); await flushPromises()
+    expect(save).toHaveBeenLastCalledWith({ deepseek_api_key: 'test-deepseek-key', minimax_api_key: '' })
+    expect(wrapper.get('input').element).toHaveProperty('value', '')
+  })
+  it('唤醒任务按分类切换，归档与取消记录均可删除且不混入待执行列表', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(WakeTasksSettings) } })
+    const tasks = [{ task_id: 'pending-1', status: 'pending', text: '待执行测试', has_reference: false }, { task_id: 'archive-1', status: 'archived', text: '归档测试', has_reference: false }, { task_id: 'cancel-1', status: 'cancelled', text: '取消测试', has_reference: false }]
+    value.wakeTasks.value = tasks as never
+    await flushPromises()
+    expect(wrapper.findAll('.wake-task-list article')).toHaveLength(1)
+    await wrapper.get('.wake-task-tabs button:last-child').trigger('click')
+    expect(wrapper.findAll('.wake-task-list article')).toHaveLength(2)
+    const remove = vi.spyOn(productApi, 'deleteWakeTask').mockResolvedValue({} as never)
+    vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: tasks.filter(task => task.task_id !== 'archive-1') } as never)
+    await wrapper.get('.wake-task-list .danger-action').trigger('click'); await flushPromises()
+    expect(remove).toHaveBeenCalledWith('archive-1')
+    expect(wrapper.findAll('.wake-task-list article')).toHaveLength(1)
+    expect(wrapper.get('.wake-task-list').text()).toContain('取消测试')
+  })
   it('本地组件不把整卡已用显存当应用占用，并区分设备草稿、待生效配置和实际 CPU（中央处理器）', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
@@ -539,11 +573,11 @@ describe('共享呈现与展示隔离', () => {
     }
     expect(request).not.toHaveBeenCalled()
   })
-  it('工作台保留会话顺序与交付，移除模型摘要且离线模式停用', async () => {
-    const model: WorkbenchModel = { state:'offline',title:'离线',description:'等待连接',action:'重试',mode:'fast',modeDisabled:true,latency:'—',voiceModel:'语音模型',shadowModel:'协作模型',ttsModel:'合成模型',conversationHint:'等待',conversation:[{key:'server-2',role:'assistant',text:'第二条',status:'已打断',time:'现在',delivered:'已听到前半句'},{key:'server-3',role:'user',text:'第三条',status:'已完成',time:'现在'}],shadow:{title:'待机',status:'待机',expanded:false,context:'—',cache:'—',trace:[]} }
+  it('工作台保留会话顺序与播放变色，隐藏完成标记和重复交付文本', async () => {
+    const model: WorkbenchModel = { state:'offline',title:'离线',description:'等待连接',action:'重试',mode:'fast',modeDisabled:true,latency:'—',voiceModel:'语音模型',shadowModel:'协作模型',ttsModel:'合成模型',conversationHint:'等待',conversation:[{key:'server-2',role:'assistant',text:'第二条',status:'已打断',time:'现在',delivered:'已听到前半句'},{key:'server-3',role:'user',text:'第三条',status:'已完成',time:'现在'}],shadow:{title:'待机',status:'待机',context:'—',cache:'—',trace:[]} }
     const wrapper = render(Workbench, {props:{model}})
     expect(wrapper.findAll('.message').map(item=>item.text())).toEqual([expect.stringContaining('第二条'),expect.stringContaining('第三条')])
-    expect(wrapper.text()).toContain('已听到前半句')
+    expect(wrapper.text()).not.toContain('已听到前半句')
     expect(wrapper.find('.model-summary').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('合成模型'); expect(wrapper.text()).not.toContain('High（高强度）')
     expect(wrapper.findAll('.mode-options button').every(item=>item.attributes('disabled') !== undefined)).toBe(true)

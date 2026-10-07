@@ -35,7 +35,6 @@ export interface WorkbenchModel {
     title: string;
     status: string;
     focus?: string;
-    expanded: boolean;
     context: string;
     cache: string;
     trace: Array<{

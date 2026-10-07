@@ -4,8 +4,6 @@ import ApplicationStartup from "./ApplicationStartup.vue";
 import AppFrame from "../interface/AppFrame.vue";
 import SettingsFrame from "../interface/SettingsFrame.vue";
 import Workbench from "../interface/Workbench.vue";
-import UiDialog from "../interface/UiDialog.vue";
-import UiButton from "../interface/UiButton.vue";
 import { desktopPort } from "./desktop-port";
 import "./application.css";
 import WakeSettings from "./panels/WakeSettings.vue";
@@ -25,9 +23,6 @@ const {
   activeSettingsTab,
   settings,
   runtimeState,
-  shadowExpanded,
-  restartState,
-  applyImpact,
   dsh,
   openDshConsole,
   lastError,
@@ -37,8 +32,6 @@ const {
   resetSession,
   setReasoningMode,
   setNotice,
-  showApplyConfirm,
-  confirmApply,
   workbenchModel,
 } = controls;
 const desktop = desktopPort();
@@ -72,7 +65,6 @@ function nativeAction(action: () => Promise<void>) {
       @action="runtimeAction"
       @reset="resetSession"
       @mode="setReasoningMode"
-      @expand="shadowExpanded = !shadowExpanded"
     />
     <SettingsFrame
       v-show="activePage === 'settings'"
@@ -114,23 +106,6 @@ function nativeAction(action: () => Promise<void>) {
           <span>✓</span>{{ notice
           }}<button aria-label="关闭提示" @click="setNotice('')">×</button>
         </div></Transition
-      >
-      <UiDialog
-        :open="showApplyConfirm"
-        title="应用新的模型配置？"
-        :busy="restartState === 'restarting'"
-        @close="showApplyConfirm = false"
-        ><p>
-          将结束当前语音交互并重启受影响的服务。重启成功后，新配置才会生效。
-        </p>
-        <ul>
-          <li v-for="item in applyImpact" :key="item">{{ item }}</li>
-        </ul>
-        <template #actions
-          ><UiButton variant="quiet" :disabled="restartState === 'restarting'" @click="showApplyConfirm = false"
-            >暂不应用</UiButton
-          ><UiButton :disabled="restartState === 'restarting'" @click="confirmApply">确认并应用</UiButton></template
-        ></UiDialog
       >
       <ApplicationStartup @system="showApplicationSystem" @models="activePage = 'settings'; activeSettingsTab = 'models'"
     /></template>
