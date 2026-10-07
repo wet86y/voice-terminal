@@ -37,3 +37,5 @@
 安装或替换推理后端时请关闭应用。CUDA 依赖版本必须与本机 NVIDIA 驱动和 Python 运行环境兼容；可参考 [ONNX Runtime CUDA 执行提供程序要求](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html) 和 [Sherpa-ONNX Windows CUDA 安装指南](https://k2-fsa.github.io/sherpa/onnx/install/windows/build-cuda.html)。
 
 SenseVoiceSmall 及其内部 FSMN-VAD（语音活动检测）始终使用同一设备。FunASR（语音识别工具包）通过 device="cuda" 或 device="cpu" 选择运行位置，具体以加载结果和设置页健康状态为准。
+
+正式便携程序使用随包解释器，不能通过修改外部开发环境的依赖获得加速。SmartTurn（语音结束判断）显卡模式还需要同修订的单精度显卡模型，安装分析资源时添加 `--smart-turn-gpu`（同时下载显卡结束判断模型）；安装脚本使用 `-Gpu -Analysis`（显卡后端与分析模型）会自动添加。运行库版本、真实显卡验证、程序与模型组件统一切换及分段计时见[流式识别延迟与图形处理器支持](asr-latency-and-cuda.md)。

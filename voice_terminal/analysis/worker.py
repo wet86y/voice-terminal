@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import logging
 import time
 from typing import Callable
 
@@ -27,23 +28,42 @@ class AnalysisLane:
         self.active_run_options = None
         self._managed_audio = ResourcePolicy.load().shared_audio
 
+    def prepare(self, factory: Callable) -> None:
+        """prepare（准备）：在独立推理线程加载、预热，完成后才报告服务就绪。"""
+        def load():
+            model = factory()
+            warmup = getattr(model, "warmup", None)
+            if callable(warmup):
+                warmup()
+            return model
+        self.model = self.executor.submit(load).result()
+        self.model_name = getattr(self.model, "model_file", self.model_name)
+
     def health_payload(self) -> dict:
         model = self.model
         return {
             "status": "DISABLED" if self.error == "disabled" else "READY" if self.model else "DEGRADED",
             "model": self.model_name,
             "model_loaded": self.model is not None,
+            "model_warmed": getattr(model, "warmed", None),  # model_warmed（是否完成真实推理预热）。
+            "model_file": getattr(model, "model_file", None),  # model_file（实际模型文件）。
+            "providers": getattr(model, "providers", None),  # providers（实际推理后端）。
             "runtime": getattr(model, "runtime", None),  # runtime（实际加载引擎）。
-            "requested_device": getattr(model, "requested_device", None),
-            "device": getattr(model, "device", None),
-            "internal_vad_device": getattr(model, "internal_vad_device", None),
-            "load_error": getattr(model, "load_error", None),
+            "requested_device": getattr(model, "requested_device", None),  # requested_device（请求设备）。
+            "device": getattr(model, "device", None),  # device（实际设备）。
+            "internal_vad_device": getattr(model, "internal_vad_device", None),  # internal_vad_device（内部语音检测设备）。
+            "load_error": getattr(model, "load_error", None),  # load_error（加载或回退原因）。
             "process_memory_rss_bytes": process_memory_bytes(),
             "resource_status": process_resource_status(),  # resource_status（资源状态）。
             "error": self.error,
         }
 
     async def run(self, pcm: bytes, request_id: str, audio_owner=None) -> dict:
+        result, _ = await self.run_measured(pcm, request_id, audio_owner)
+        return result
+
+    async def run_measured(self, pcm: bytes, request_id: str, audio_owner=None) -> tuple[dict, dict]:
+        """run_measured（带耗时执行）：计时绑定本次请求，避免下一次调用覆盖它。"""
         if self.model is None:
             raise RuntimeError(self.error or "model unavailable")
         if self.active is not None and not self.active.done():
@@ -55,17 +75,20 @@ class AnalysisLane:
         lease = registry.lease(f"analysis:{request_id}", pcm, release_on="native_complete")
         if audio_owner:
             audio_owner.in_use = True
+        submitted = time.perf_counter()
         try:
             def invoke():
+                started = time.perf_counter()
                 from ..audio.allocation import conversion_scope
                 with conversion_scope(pcm, enabled=self._managed_audio):
-                    return self.model(pcm) if run_options is None else self.model(pcm, run_options)
-            if self._managed_audio:
-                self.active = asyncio.get_running_loop().run_in_executor(self.executor, invoke)
-            elif run_options is None:
-                self.active = asyncio.get_running_loop().run_in_executor(self.executor, self.model, pcm)
-            else:
-                self.active = asyncio.get_running_loop().run_in_executor(self.executor, self.model, pcm, run_options)
+                    result = self.model(pcm) if run_options is None else self.model(pcm, run_options)
+                latency = dict(getattr(self.model, "last_latency", {}))
+                latency.update({
+                    "executor_wait_ms": (started - submitted) * 1000,  # executor_wait_ms（推理线程调度等待毫秒）。
+                    "native_ms": (time.perf_counter() - started) * 1000,  # native_ms（原生调用总耗时毫秒）。
+                })
+                return result, latency
+            self.active = asyncio.get_running_loop().run_in_executor(self.executor, invoke)
         except BaseException:
             lease.close()
             if audio_owner:
@@ -141,17 +164,21 @@ def create_analysis_app(lanes: dict[str, AnalysisLane]):
                 raise
             operation = request["operation"]
             lane = lanes[operation]
-            started = time.monotonic()
-            run_task = asyncio.create_task(lane.run(pcm, request["request_id"], audio_owner))
+            started = time.perf_counter()
+            run_task = asyncio.create_task(lane.run_measured(pcm, request["request_id"], audio_owner))
             receive_task = asyncio.create_task(socket.receive_json())
             done, _ = await asyncio.wait({run_task, receive_task}, return_when=asyncio.FIRST_COMPLETED)
             if run_task in done:
                 receive_task.cancel()
                 await asyncio.gather(receive_task, return_exceptions=True)
-                result = await run_task
+                result, latency = await run_task
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                logging.info("analysis.result operation=%s request_id=%s device=%s elapsed_ms=%.2f latency=%s",
+                             operation, request["request_id"], getattr(lane.model, "device", None), elapsed_ms, latency)
                 await socket.send_json({"request_id": request["request_id"], "turn_id": request["turn_id"],
                                         "generation_id": request["generation_id"], "result": result,
-                                        "elapsed_ms": (time.monotonic() - started) * 1000})
+                                        "elapsed_ms": elapsed_ms,
+                                        "latency": latency})  # latency（本次请求的分阶段耗时）。
                 return
             try:
                 control = receive_task.result()

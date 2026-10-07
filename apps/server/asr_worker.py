@@ -49,23 +49,25 @@ async def run(config_path: Path | None = None) -> None:
     # Do not open the health port until the real model is loaded.  This makes
     # start.ps1 and Voice Server readiness reflect actual ASR availability.
     report("asr", "加载语音识别模型")
-    await asyncio.to_thread(engine.load)
-
     async def handler(websocket, path=None):
         if path not in (None, "/asr"):
             await websocket.close(code=1008, reason="unknown path")
             return
         await handle_asr_connection(websocket, engine)
 
-    async with websockets.serve(handler, config.asr_worker.host, config.asr_worker.port):
-        logging.getLogger(__name__).info(
-            "ASR Worker listening on ws://%s:%s/asr (device=%s)",
-            config.asr_worker.host,
-            config.asr_worker.port,
-            engine.device,
-        )
-        report("asr", "模型已加载，语音识别接口已监听")
-        await wait_for_shutdown()
+    try:
+        await engine.prepare()
+        async with websockets.serve(handler, config.asr_worker.host, config.asr_worker.port):
+            logging.getLogger(__name__).info(
+                "ASR Worker listening on ws://%s:%s/asr (device=%s)",
+                config.asr_worker.host,
+                config.asr_worker.port,
+                engine.device,
+            )
+            report("asr", "模型已加载并预热，语音识别接口已监听")
+            await wait_for_shutdown()
+    finally:
+        engine.close()
 
 
 def main() -> None:

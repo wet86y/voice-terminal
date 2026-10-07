@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from voice_terminal.asr.client import AsrWorkerClient, AsrWorkerError
 from voice_terminal.asr.probe import probe
-from voice_terminal.asr.protocol import AudioChunk
+from voice_terminal.asr.protocol import AudioChunk, decode_audio_chunk
 from voice_terminal.asr.worker import AsrInferenceResult, handle_asr_connection
 from voice_terminal.config import load_config
 
@@ -199,6 +199,29 @@ class AsrWorkerProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages, [{"type": "asr.final", "turn_id": "turn-empty", "text": ""}])
         await client.close()
 
+    async def test_final_reports_audio_backlog_separately_from_model_time(self) -> None:
+        """前一音频包阻塞时，结束包报告积压，不能把等待全记成模型执行。"""
+        final = asyncio.get_running_loop().create_future()
+        async def infer(turn_id, pcm, is_final):
+            if not is_final:
+                await asyncio.sleep(0.08)
+            return AsrInferenceResult("你好", True, {"model_ms": 7.0, "executor_wait_ms": 3.0})
+        self.engine.infer = infer
+        async def on_result(message):
+            if message.get("type") == "asr.final":
+                final.set_result(message)
+        client = AsrWorkerClient(self.url, on_result=on_result)
+        try:
+            await client.connect()
+            await client.send_audio(AudioChunk("backlog", b"\x00\x00"))
+            await client.send_audio(AudioChunk("backlog", b"", is_final=True))
+            result = await asyncio.wait_for(final, 1)
+            self.assertGreaterEqual(result["latency"]["queue_wait_ms"], 40)
+            self.assertEqual(result["latency"]["model_ms"], 7)
+            self.assertEqual(result["latency"]["executor_wait_ms"], 3)
+        finally:
+            await client.close()
+
     async def test_non_object_message_returns_protocol_error(self) -> None:
         import websockets  # type: ignore
 
@@ -210,6 +233,14 @@ class AsrWorkerProtocolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AsrWorkerConfigurationTests(unittest.TestCase):
+    def test_audio_timestamp_is_optional_and_round_trips(self) -> None:
+        for timestamp in (None, 123456789):
+            chunk = AudioChunk("turn", b"\x00\x00", sent_at_monotonic_ns=timestamp)
+            self.assertEqual(decode_audio_chunk(chunk.to_dict()), chunk)
+        for invalid in (True, "123", -1, 0):
+            with self.assertRaises(ValueError):
+                decode_audio_chunk({**AudioChunk("turn", b"").to_dict(), "sent_at_monotonic_ns": invalid})
+
     def test_worker_url_can_be_overridden_without_hardcoded_probe_endpoint(self) -> None:
         with patch.dict(os.environ, {"ASR_WORKER_URL": "ws://127.0.0.1:9123/custom"}, clear=False):
             config = load_config(Path("config/default.yaml"))

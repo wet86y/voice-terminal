@@ -65,12 +65,15 @@ if (-not $Offline -and -not $SkipInstall) {
   if ($Gpu) {
     Write-Host "Installing optional ONNX Runtime and Sherpa-ONNX CUDA backends..." -ForegroundColor Cyan
     Invoke-Python -m pip uninstall -y onnxruntime onnxruntime-gpu sherpa-onnx
-    Invoke-Python -m pip install onnxruntime-gpu==1.24.3
+    Invoke-Python -m pip install onnxruntime-gpu==1.24.4
     Invoke-Python -m pip install --find-links https://k2-fsa.github.io/sherpa/onnx/cuda.html "sherpa-onnx==1.13.8+cuda12.cudnn9"
   }
 }
 
-if (-not $SkipInstall) { Invoke-Python -m pip check }
+if (-not $SkipInstall) {
+  # dependency_errors（依赖闭包检查）识别同模块的显卡替代包，同时拒绝重叠安装。
+  Invoke-Python -c "from voice_terminal.dependencies import dependency_errors; errors=dependency_errors(); print('\n'.join(errors) if errors else '依赖闭包校验通过'); raise SystemExit(bool(errors))"
+}
 
 $env:MODELSCOPE_CACHE = Join-Path $ModelDir "cache\modelscope"
 $env:HF_HOME = Join-Path $ModelDir "cache\huggingface"
@@ -92,6 +95,7 @@ if ($Analysis -or $OnnxVad) {
   $analysisArgs = @("-m", "voice_terminal.analysis.model_setup", "--model-dir", $ModelDir)
   if ($Offline) { $analysisArgs += "--offline" }
   if ($NoDownloadProxy) { $analysisArgs += "--no-proxy" }
+  if ($Gpu) { $analysisArgs += "--smart-turn-gpu" }
   Invoke-Python @analysisArgs
 }
 

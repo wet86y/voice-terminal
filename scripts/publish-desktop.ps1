@@ -1,4 +1,4 @@
-﻿param([string]$InstallRoot = '', [string]$Build = '')
+﻿param([string]$InstallRoot = '', [string]$Build = '', [string]$PythonRuntime = '', [string]$ModelsRoot = '')
 $ErrorActionPreference = 'Stop'
 $DesktopRepo = Split-Path -Parent $PSScriptRoot
 if (-not $InstallRoot) { $InstallRoot = Join-Path $DesktopRepo '.runtime/delivery/VoiceTerminal' }
@@ -27,7 +27,10 @@ if ($LASTEXITCODE) { throw 'DSH（代理执行宿主）任务插件构建失败�
 & (Join-Path $PSScriptRoot 'build-desktop.ps1') -Debug -SkipFrontend
 Push-Location $DesktopRepo
 try {
-  & $BuildPython -B -X utf8 scripts/assemble-desktop.py --output $InstallRoot --build $Build --refresh-program
+  $AssembleArgs = @('-B', '-X', 'utf8', 'scripts/assemble-desktop.py', '--output', $InstallRoot, '--build', $Build, '--refresh-program')
+  if ($PythonRuntime) { $AssembleArgs += @('--python-runtime', $PythonRuntime) } # PythonRuntime（新程序运行环境组件）。
+  if ($ModelsRoot) { $AssembleArgs += @('--models', $ModelsRoot) } # ModelsRoot（含显卡与中央处理器模型的完整资源目录）。
+  & $BuildPython @AssembleArgs
   if ($LASTEXITCODE) { throw '正式程序更新失败；请查看组装诊断。' }
   Copy-Item -LiteralPath (Join-Path $DesktopRepo 'apps/desktop/target/release/VoiceTerminalUIDemo.exe') -Destination $Demo -Force
   Write-Host "正式程序：$InstallRoot/VoiceTerminal.exe" -ForegroundColor Green
