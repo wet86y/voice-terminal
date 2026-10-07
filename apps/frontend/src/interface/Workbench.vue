@@ -9,6 +9,8 @@ const props = defineProps<{
   consoleEnabled?: boolean; // consoleEnabled（代理控制台是否可用）。
   consoleLabel?: string; // consoleLabel（代理控制台按钮文案）。
 }>();
+// initialMessageKeys（进入工作台时已有记录）：历史消息不重新播放逐字动效。
+const initialMessageKeys = new Set(props.model.conversation.map(entry => entry.key));
 const emit = defineEmits<{
   action: [];
   reset: [];
@@ -279,6 +281,7 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
             :role="entry.role"
             :text="entry.text"
             :time="entry.time"
+            :animate-on-mount="!initialMessageKeys.has(entry.key)"
             :status="entry.status"
             :speaking="entry.speaking"
             :delivered="entry.delivered"
