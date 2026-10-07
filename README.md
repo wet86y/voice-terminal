@@ -100,7 +100,7 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 
 ### 运行模式
 
-当前源码已收敛为两个运行模式。这项修订已完成回归和构建，正式安装目录仍沿用此前发布的程序，待与其他修订合并后统一更新；状态与验收结果见[双模式源码修订记录](docs/frontend-ui-business-migration.md#2026-10-07-双模式源码修订待统一发布)。
+当前程序使用两个运行模式，已与界面精简、连续播放衔接、识别优化和显卡支持一起更新原正式目录；构建标识、数据核对与现场验收边界见[统一发布记录](docs/frontend-ui-business-migration.md#2026-10-07-界面精简与统一发布)。
 
 - `fast`（快速，默认）：主 LLM（大语言模型）使用 `reasoning.effort=none`（关闭思考）。
 - `deep`（深度）：主请求直接使用 `reasoning.effort=low`（低强度思考）。
@@ -136,7 +136,7 @@ git diff --check
 - [独立桌面应用、数据分离与便携构建](docs/desktop-application.md)：Tauri 2（桌面应用框架）窗口、独立预览、构建与迁移命令。
 - [桌面实施验收记录](docs/desktop-acceptance.md)：实际构建、运行、退出、迁移及待补实机检查。
 - [前端界面阶段性交接](docs/frontend-ui-handoff.md)：已确认的界面修订、产品接入差异及正式迁移顺序。
-- [真实业务验收与后续源码修订](docs/frontend-ui-business-migration.md)：已发布界面的验收证据、双模式归档与待统一发布状态。
+- [真实业务验收与统一发布](docs/frontend-ui-business-migration.md)：已发布界面的验收证据、双模式归档、固定服务密钥与最新正式组件。
 - [独立应用启动与系统管理](docs/application-lifecycle.md)
 - [架构与生命周期](docs/architecture.md)
 - [连续性底座：上下文衔接与定时唤醒](docs/continuity-foundation.md)
