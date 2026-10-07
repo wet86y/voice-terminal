@@ -70,6 +70,11 @@ let adapter: ReturnType<typeof useProductAdapter>
 
 beforeEach(() => {
   vi.useFakeTimers()
+  host = useApplicationHost()
+  host.stop()
+  host.snapshot.value = null
+  host.error.value = ''
+  host.sessionInvalid.value = false
   FakeEventSource.instances = []
   FakeWebSocket.instances = []
   window.__VOICE_APPLICATION__ = {
@@ -96,6 +101,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  host.stop()
   app?.unmount()
   app = undefined
   Reflect.deleteProperty(window, '__VOICE_APPLICATION__')
@@ -107,6 +113,29 @@ afterEach(() => {
 })
 
 describe('Host 会话失效处理', () => {
+  it('重试确认重新读取状态，不复用操作之前已发出的失败快照请求', async () => {
+    const failed = { ...readySnapshot, components: [...readySnapshot.components,
+      { ...readySnapshot.components[0]!, id: 'speaker', state: 'failed', error: '旧故障', retry_allowed: true }],
+    }
+    let resolveOld!: (value: Response) => void
+    const old = new Promise<Response>(resolve => { resolveOld = resolve })
+    const retrying = { ...failed, revision: 2, components: [failed.components[0]!,
+      { ...failed.components[1]!, retrying: true, phase: '等待恢复操作' }],
+    }
+    const response = (value: unknown) => ({ status: 200, ok: true, json: async () => value }) as Response
+    const fetchMock = vi.fn().mockResolvedValueOnce(response(failed)).mockReturnValueOnce(old)
+      .mockResolvedValueOnce(response({ ok: true })).mockResolvedValueOnce(response(retrying))
+    vi.stubGlobal('fetch', fetchMock)
+    await host.start(); await flushPromises()
+    const beforeRetry = host.refresh()
+    const requested = host.retry('speaker')
+    await flushPromises()
+    resolveOld(response(failed))
+    await Promise.all([beforeRetry, requested]); await flushPromises()
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(host.snapshot.value?.components.find(row => row.id === 'speaker')?.retrying).toBe(true)
+    expect(host.snapshot.value?.revision).toBe(2)
+  })
   it('ready 后遇到 403 终止 Host 重试并断开已有语音连接；5xx 保持可恢复', async () => {
     const responses = [
       { status: 200, ok: true, json: async () => readySnapshot },

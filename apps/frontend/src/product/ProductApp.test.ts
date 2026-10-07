@@ -296,7 +296,8 @@ describe('正式界面的真实控件交互', () => {
     application.snapshot.value!.components[0]!.state = 'starting'
     await flushPromises()
     expect(row.get('.local-state').text()).toBe('启动中')
-    expect(row.get('.retry-action').attributes('disabled')).toBeDefined()
+    expect(row.get('.local-component-action').attributes('disabled')).toBeDefined()
+    expect(row.find('.retry-action').exists()).toBe(false)
     application.snapshot.value!.components[0]!.state = 'ready'
     await flushPromises()
     expect(row.get('.local-state').text()).toBe('运行中')
@@ -318,6 +319,106 @@ describe('正式界面的真实控件交互', () => {
     await flushPromises()
     expect(row.get('.local-state').text()).toBe('不可用')
     expect(row.get('.local-error').text()).toBe('声纹推理请求超时（2500 毫秒）')
+  })
+  it.each(['waiting', 'starting'])('启动阶段的 %s（加载过程）覆盖临时模型错误，所有组件采用正常加载样式', async state => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    value.computeStatus.value = { models: Object.fromEntries(
+      ['paraformer', 'sensevoice', 'voice_vad', 'kws', 'smart_turn', 'wespeaker'].map((id, index) => [id, {
+        service: ['ERROR', 'UNAVAILABLE', 'DISABLED', 'UNKNOWN'][index % 4], load_error: '组件尚未就绪', runtime_error: '旧采样错误',
+      }])) } as never
+    application.snapshot.value = { state: 'starting', startup_complete: false, components: [
+      ...['asr', 'analysis', 'voice', 'speaker', 'dsh'].map(id => ({ id, name: id, state, phase: '正在加载组件', error: '旧错误' })),
+      { id: 'host', name: '应用宿主', state: 'ready' },
+    ] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    expect(wrapper.findAll('.local-component-card')).toHaveLength(8)
+    expect(wrapper.get('.local-overview .local-state').text()).toBe('组件启动中')
+    expect(wrapper.find('.local-error').exists()).toBe(false)
+    expect(wrapper.find('.retry-action').exists()).toBe(false)
+    for (const row of wrapper.findAll('.local-component-card')) {
+      expect(row.classes()).toContain('loading')
+      expect(row.get('.local-state').text()).toBe('启动中')
+      expect(row.get('.local-component-action').text()).toBe('启动中')
+      expect(row.get('.local-component-action').attributes('disabled')).toBeDefined()
+      expect(row.get('.local-component-phase').text()).toBe('正在加载组件')
+    }
+  })
+  it.each(['wespeaker', 'dsh', 'voice-system'])('%s（本地组件）点击重试立即进入加载状态，后台接管后持续加载并保留真正失败结果', async id => {
+    const owner = id === 'wespeaker' ? 'speaker' : id === 'voice-system' ? 'voice' : 'dsh'
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    value.computeStatus.value = { models: { wespeaker: { service: 'READY', device: 'cpu' } } } as never
+    application.snapshot.value = { startup_complete: true, components: [
+      { id: owner, name: owner, state: 'failed', phase: '旧启动失败', retry_allowed: true, error: '旧错误' },
+    ] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    const row = wrapper.get(`[data-component="${id}"]`)
+    const requested = deferred<void>()
+    application.retry.mockReturnValueOnce(requested.promise)
+    await row.get('.local-component-action').trigger('click')
+    expect(application.retry).toHaveBeenCalledWith(owner)
+    expect(row.classes()).toContain('loading')
+    expect(row.classes()).not.toContain('failed')
+    expect(row.get('.local-state').text()).toBe('启动中')
+    expect(row.get('.local-component-phase').text()).toBe('正在重新启动组件')
+    expect(row.find('.local-error').exists()).toBe(false)
+    expect(row.find('.retry-action').exists()).toBe(false)
+    expect(row.get('.local-component-action').attributes('disabled')).toBeDefined()
+    application.snapshot.value!.components[0]!.retrying = true
+    application.snapshot.value!.components[0]!.phase = '等待恢复操作'
+    requested.resolve(); await flushPromises()
+    expect(row.classes()).toContain('loading')
+    expect(row.get('.local-state').text()).toBe('启动中')
+    expect(row.find('.local-error').exists()).toBe(false)
+    application.snapshot.value!.components[0]!.retrying = false
+    application.snapshot.value!.components[0]!.error = '本次启动失败'
+    await flushPromises()
+    expect(row.classes()).toContain('failed')
+    expect(row.get('.local-error').text()).toContain('本次启动失败')
+    expect(row.get('.retry-action').text()).toBe('重试')
+  })
+  it('所属进程已就绪但完整启动尚未结束时，旧的未就绪采样不能显示错误；明确失败和停用仍正常显示', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    value.computeStatus.value = { models: {
+      paraformer: { service: 'ERROR', load_error: '旧未就绪错误' },
+      sensevoice: { service: 'UNAVAILABLE', load_error: '尚未连接' },
+      wespeaker: { service: 'DISABLED' },
+    } } as never
+    application.snapshot.value = { startup_complete: false, components: [
+      { id: 'asr', state: 'ready', phase: '健康检查通过' },
+      { id: 'analysis', state: 'failed', error: '分析模型缺失' },
+      { id: 'speaker', state: 'disabled' },
+    ] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    expect(wrapper.get('[data-component="paraformer"] .local-state').text()).toBe('启动中')
+    expect(wrapper.find('[data-component="paraformer"] .local-error').exists()).toBe(false)
+    expect(wrapper.get('[data-component="sensevoice"] .local-error').text()).toBe('分析模型缺失')
+    expect(wrapper.get('[data-component="wespeaker"] .local-state').text()).toBe('已停用')
+    application.snapshot.value!.startup_complete = true
+    await flushPromises()
+    expect(wrapper.get('[data-component="paraformer"] .local-error').text()).toBe('旧未就绪错误')
+  })
+  it('组件完成启动立即重新采样，启动前的迟到错误响应不能覆盖新的就绪结果', async () => {
+    const { value } = liveControls()
+    allowBusinessReady(value)
+    application.snapshot.value = { startup_complete: false, components: [{ id: 'asr', state: 'starting', pid: 12 }] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    const pending = deferred<Awaited<ReturnType<typeof productApi.computeStatus>>>()
+    const probe = vi.mocked(productApi.computeStatus)
+    probe.mockReturnValueOnce(pending.promise).mockResolvedValue({ models: { paraformer: { service: 'READY', device: 'cpu' } } } as never)
+    const stale = value.refreshComputeStatus()
+    application.snapshot.value = { startup_complete: true, components: [{ id: 'asr', state: 'ready', pid: 12 }] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    expect(value.computeStatus.value?.models.paraformer?.service).toBe('READY')
+    pending.resolve({ models: { paraformer: { service: 'ERROR', load_error: '启动时尚未就绪' } } } as never)
+    await stale; await flushPromises()
+    expect(value.computeStatus.value?.models.paraformer?.service).toBe('READY')
+    const count = probe.mock.calls.length
+    application.snapshot.value!.components[0]!.phase = '采样说明更新'
+    await flushPromises()
+    expect(probe).toHaveBeenCalledTimes(count)
   })
   it('实际播放在输入结束判定期间驱动语音主体，完成、打断和错误仍及时更新', async () => {
     const { value } = liveControls()

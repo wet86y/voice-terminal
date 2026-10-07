@@ -1,4 +1,10 @@
 import type { ApplicationComponent, ApplicationSnapshot } from './application-host'
+import type { ProductLocalModelId } from './types'
+
+/** modelComponentOwners（模型所属进程）：状态、资源和重试使用同一所有者。 */
+export const modelComponentOwners: Record<ProductLocalModelId, string> = {
+  paraformer: 'asr', sensevoice: 'analysis', voice_vad: 'voice', kws: 'voice', smart_turn: 'analysis', wespeaker: 'speaker',
+}
 
 /** ComponentResources（组件资源分组）：与宿主总量共用同一采样，按进程身份只计一次。 */
 export type ComponentResources = Pick<ApplicationComponent, 'memory_rss_bytes' | 'memory_private_commit_bytes' | 'gpu_dedicated_bytes'>

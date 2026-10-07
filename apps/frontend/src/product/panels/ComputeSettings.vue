@@ -5,16 +5,12 @@ import { formatComponentMemory, type LocalComponentRow, type LocalComponentsMode
 import { useApplicationHost, type ApplicationComponent } from '../application-host'
 import { useProductContext } from '../product-context'
 import type { ComputeDeviceMode, ProductLocalModelId } from '../types'
-import { componentResources } from '../component-resources'
+import { componentResources, modelComponentOwners as owners } from '../component-resources'
 
 const { settings, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
 const application = useApplicationHost()
 const refreshing = ref(false)
 const retrying = ref(new Set<string>())
-/** owners（模型所属进程）：对应现有宿主组件，重试继续使用原有接口。 */
-const owners: Record<ProductLocalModelId, string> = {
-  paraformer: 'asr', sensevoice: 'analysis', voice_vad: 'voice', kws: 'voice', smart_turn: 'analysis', wespeaker: 'speaker',
-}
 function componentFor(id: string) { return application.snapshot.value?.components?.find(row => row.id === id) }
 const resources = computed(() => componentResources(application.snapshot.value))
 const systemComponents = computed(() => (application.snapshot.value?.components ?? []).filter(row => !['asr', 'analysis', 'speaker', 'dsh'].includes(row.id)))
@@ -33,10 +29,12 @@ const rows = computed<LocalComponentRow[]>(() => {
     const metrics = resources.value.get(owners[item.id])
     const legacyResource = application.snapshot.value?.resource_processes === undefined ? resource : undefined
     const busy = Boolean(owner?.retrying || retrying.value.has(owners[item.id]))
-    // ownerFailed（所属进程故障）优先于上一次模型采样，文案和操作采用同一判定。
-    const ownerFailed = ['failed', 'blocked', 'stopped'].includes(owner?.state ?? '')
-    const disabled = !ownerFailed && (status?.service === 'DISABLED' || owner?.state === 'disabled')
-    const loading = busy || (!ownerFailed && !disabled && (['waiting', 'starting', 'stopping'].includes(owner?.state ?? (!status ? 'starting' : '')) || status?.service === 'STARTING'))
+    // busy（正在重试）先覆盖旧故障；宿主加载状态优先于启动期间的临时健康检查结果。
+    const ownerFailed = !busy && ['failed', 'blocked', 'stopped'].includes(owner?.state ?? '')
+    const ownerLoading = ['waiting', 'starting', 'stopping'].includes(owner?.state ?? '')
+    const disabled = !busy && !ownerFailed && (owner?.state === 'disabled' || (!ownerLoading && application.snapshot.value?.startup_complete !== false && status?.service === 'DISABLED'))
+    const awaitingStartup = application.snapshot.value?.startup_complete === false && !['READY', 'DEGRADED'].includes(status?.service ?? '')
+    const loading = busy || (!ownerFailed && !disabled && (ownerLoading || awaitingStartup || (!owner && !status) || status?.service === 'STARTING'))
     // 模型详情接口尚未开放时，以宿主已通过的工作进程健康检查呈现就绪状态。
     const available = !loading && !ownerFailed && !disabled && (status ? ['READY', 'DEGRADED'].includes(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
     const ownerError = ownerFailed ? owner?.error || status?.runtime_error || (owner?.state === 'blocked' ? '组件依赖不可用，请检查所属进程。' : owner?.state === 'stopped' ? '组件进程已退出。' : '组件运行异常，请查看日志并重试。') : undefined
@@ -44,13 +42,13 @@ const rows = computed<LocalComponentRow[]>(() => {
     return {
       id: item.id, name: item.title,
       state: available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
-      status: busy ? '正在恢复' : ownerFailed ? '不可用' : disabled ? '已停用' : loading ? owner?.state === 'waiting' ? '等待启动' : owner?.state === 'stopping' ? '退出中' : '启动中' : !status && available ? '已就绪' : serviceLabel(status?.service),
-      available, retryable: !available && !loading && Boolean(owner?.retry_allowed), busy,
+      status: loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : ownerFailed ? '不可用' : disabled ? '已停用' : !status && available ? '运行中' : serviceLabel(status?.service),
+      available, retryable: !available && !loading && !disabled && Boolean(owner?.retry_allowed), busy: loading,
       runtime: status?.runtime || '未提供',
       residentMemory: countedHere ? formatComponentMemory(metrics?.memory_rss_bytes ?? legacyResource?.rss_bytes) : undefined,
       privateMemory: countedHere ? formatComponentMemory(metrics?.memory_private_commit_bytes ?? legacyResource?.private_commit_bytes) : undefined,
       vram: countedHere && status?.device?.startsWith('cuda') ? formatComponentMemory(metrics?.gpu_dedicated_bytes ?? legacyResource?.gpu_dedicated_bytes) : undefined,
-      description: loading ? owner?.phase || '等待组件启动' : item.detail, error: !available && !loading ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
+      description: loading ? busy && !owner?.retrying ? '正在重新启动组件' : owner?.phase || '等待组件启动' : item.detail, error: !available && !loading && !disabled ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
       note: countedHere ? '资源来自宿主同次采样，包含该进程及其子进程。' : item.id === 'smart_turn' ? '与 SenseVoice（语音识别与分析）共享进程，资源计入该条目。' : '与 Voice Server（语音服务）共享进程，资源计入语音服务条目。',
       facts: [
         ...(resource?.pid == null ? [] : [{ label: '进程标识', value: String(resource.pid) }]),
@@ -72,17 +70,17 @@ const rows = computed<LocalComponentRow[]>(() => {
   const components = (application.snapshot.value?.components ?? []).filter(row => row.id === 'dsh').map<LocalComponentRow>(component => {
     const metrics = resources.value.get(component.id)
     const busy = component.retrying || retrying.value.has(component.id)
-    const available = !busy && ['ready', 'external'].includes(component.state)
-    const loading = busy || ['starting', 'waiting'].includes(component.state)
+    const loading = busy || ['starting', 'waiting', 'stopping'].includes(component.state)
+    const available = !loading && ['ready', 'external'].includes(component.state)
     return {
       id: component.id, name: component.name,
-      state: available ? 'ready' : component.state === 'disabled' ? 'disabled' : loading ? 'loading' : 'failed',
-      status: busy ? '正在恢复' : available ? component.id === 'setup' ? '已通过' : '运行中' : component.state === 'disabled' ? '已停用' : loading ? component.state === 'waiting' ? '等待启动' : '启动中' : '不可用',
-      available, retryable: component.retry_allowed && !busy, busy,
+      state: loading ? 'loading' : available ? 'ready' : component.state === 'disabled' ? 'disabled' : 'failed',
+      status: loading ? component.state === 'stopping' ? '退出中' : '启动中' : available ? '运行中' : component.state === 'disabled' ? '已停用' : '不可用',
+      available, retryable: !loading && component.retry_allowed, busy: loading,
       runtime: component.id === 'dsh' ? 'Node.js（执行环境）' : component.id === 'voice' ? 'Python（语音进程）' : component.id === 'web' ? '桌面宿主' : '本地进程',
       residentMemory: formatComponentMemory(metrics?.memory_rss_bytes), privateMemory: formatComponentMemory(metrics?.memory_private_commit_bytes),
       vram: metrics?.gpu_dedicated_bytes != null && metrics.gpu_dedicated_bytes > 0 ? formatComponentMemory(metrics.gpu_dedicated_bytes) : undefined,
-      description: component.phase, error: component.error,
+      description: busy && !component.retrying ? '正在重新启动组件' : component.phase, error: !loading && !available && component.state !== 'disabled' ? component.error : undefined,
       location: '本机', facts: facts(component),
       note: component.shared_with ? '与应用宿主共享进程，内存总量只计一次。' : component.external ? '此组件使用外部调试进程。' : undefined,
     }
@@ -90,18 +88,19 @@ const rows = computed<LocalComponentRow[]>(() => {
   const system = systemComponents.value
   if (system.length) {
     const metrics = resources.value.get('voice-system')
-    const failure = system.find(row => ['failed', 'blocked', 'stopped'].includes(row.state))
+    const failure = system.find(row => !row.retrying && !retrying.value.has(row.id) && ['failed', 'blocked', 'stopped'].includes(row.state))
     const busy = system.some(row => row.retrying || retrying.value.has(row.id))
     const loading = busy || system.some(row => ['waiting', 'starting', 'stopping'].includes(row.state))
+    const active = system.find(row => row.retrying || retrying.value.has(row.id) || ['waiting', 'starting', 'stopping'].includes(row.state))
     components.push({
       id: 'voice-system', name: 'Voice Server（语音服务）',
       state: failure ? 'failed' : loading ? 'loading' : 'ready',
-      status: busy ? '正在恢复' : failure ? '部分不可用' : loading ? '启动中' : '运行中',
-      available: !failure && !loading, retryable: system.some(row => row.retry_allowed), busy,
+      status: failure ? '部分不可用' : loading ? '启动中' : '运行中',
+      available: !failure && !loading, retryable: !loading && system.some(row => row.retry_allowed), busy: loading && !failure,
       runtime: '本地系统服务', location: '本机',
       residentMemory: formatComponentMemory(metrics?.memory_rss_bytes), privateMemory: formatComponentMemory(metrics?.memory_private_commit_bytes),
       vram: metrics?.gpu_dedicated_bytes != null && metrics.gpu_dedicated_bytes > 0 ? formatComponentMemory(metrics.gpu_dedicated_bytes) : undefined,
-      description: '统一管理桌面窗口、界面服务、应用宿主、环境检查与语音服务。',
+      description: loading && !failure ? active && retrying.value.has(active.id) && !active.retrying ? '正在重新启动组件' : active?.phase || '等待系统服务启动' : '统一管理桌面窗口、界面服务、应用宿主、环境检查与语音服务。',
       error: failure ? `${failure.name}：${failure.error || failure.phase}` : undefined,
       facts: system.map(row => ({ label: row.name, value: ['ready', 'external'].includes(row.state) ? row.id === 'setup' ? '已通过' : '运行中' : row.phase })),
       note: '包含系统进程及其子进程；模型工作进程和代理执行宿主单独计量，共享进程只计一次。',

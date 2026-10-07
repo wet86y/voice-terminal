@@ -19,6 +19,7 @@ import type {
 } from './types'
 import { isRecord } from '../record'
 import { desktopPort } from './desktop-port'
+import { modelComponentOwners } from './component-resources'
 import { DEFAULT_SETTINGS, DEFAULT_REGISTRY, DEFAULT_DSH, MAX_WAKE_KEYWORDS, defaultCurrent, defaultShadow, normalizeSettings, normalizeRegistry, normalizeRuntimeState, updateSettingsFromResponse } from './normalization'
 export { MAX_WAKE_KEYWORDS } from './normalization'
 
@@ -90,6 +91,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const snapshot = ref<ProductSnapshot | null>(null)
   const settings = reactive<ProductSettingsSnapshot>(structuredClone(DEFAULT_SETTINGS))
   const computeStatus = ref<ProductComputeStatus | null>(null)
+  let computeStatusRevision = 0 // computeStatusRevision（组件状态代次）：旧进程的采样不能覆盖新状态。
+  let computeStatusRequest = 0 // computeStatusRequest（采样请求代次）：并发请求只接纳最新结果。
   const computeSavedDevices = ref(structuredClone(DEFAULT_SETTINGS.compute.devices)) // computeSavedDevices（已持久化设备偏好）。
   const registry = ref<ProductModelRegistry>(structuredClone(DEFAULT_REGISTRY))
   let registryRevision = 0 // registryRevision（注册表响应代次）：旧快照不能覆盖已经完成的扫描或保存。
@@ -337,10 +340,13 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   async function refreshComputeStatus(refreshCapabilities = false) {
     if (!application.businessReady.value) return
+    const revision = computeStatusRevision
+    const request = ++computeStatusRequest
     try {
-      computeStatus.value = await productApi.computeStatus(refreshCapabilities)
+      const value = await productApi.computeStatus(refreshCapabilities)
+      if (!adapterDisposed && revision === computeStatusRevision && request === computeStatusRequest) computeStatus.value = value
     } catch (error) {
-      setError(error)
+      if (!adapterDisposed && revision === computeStatusRevision && request === computeStatusRequest) setError(error)
     }
   }
 
@@ -1316,6 +1322,29 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       scheduleDshStatusPoll()
     }).catch(() => undefined)
   })
+
+  watch(() => application.snapshot.value?.components?.filter(row => Object.values(modelComponentOwners).includes(row.id))
+    .map(row => ({ id: row.id, state: row.state, retrying: row.retrying, pid: row.pid, created_at: row.created_at })), (current, previous) => {
+    const changed = current?.filter(row => {
+      const before = previous?.find(item => item.id === row.id)
+      return before && (before.state !== row.state || before.retrying !== row.retrying || before.pid !== row.pid || before.created_at !== row.created_at)
+    }) ?? []
+    if (!changed.length) return
+    computeStatusRevision++
+    if (computeStatus.value) {
+      const models = { ...computeStatus.value.models }
+      const invalidated = changed.filter(row => {
+        const before = previous!.find(item => item.id === row.id)!
+        return row.retrying || before.retrying || ['waiting', 'starting', 'ready', 'external'].includes(row.state)
+          || ['waiting', 'starting'].includes(before.state) || before.pid !== row.pid || before.created_at !== row.created_at
+      })
+      for (const [id, owner] of Object.entries(modelComponentOwners)) {
+        if (invalidated.some(row => row.id === owner)) delete models[id as ProductLocalModelId]
+      }
+      computeStatus.value = { ...computeStatus.value, models }
+    }
+    if (changed.some(row => !row.retrying && ['ready', 'external', 'disabled', 'failed', 'blocked', 'stopped'].includes(row.state))) void refreshComputeStatus()
+  }, { flush: 'sync' })
 
   onBeforeUnmount(() => {
     if (reconnectTimer !== undefined) window.clearInterval(reconnectTimer)

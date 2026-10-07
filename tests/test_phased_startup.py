@@ -98,6 +98,14 @@ def test_early_bridge_does_not_bind_or_report_ready_until_session_exists(runtime
     asyncio.run(run())
 
 
+def test_loading_speaker_reports_startup_phase_without_an_unavailable_error(runtime):
+    runtime.state.set_service("speaker", "STARTING")
+    speaker = runtime.application_component_status()["speaker"]
+    assert speaker["state"] == "starting"
+    assert speaker["phase"] == "加载声纹工作进程"
+    assert speaker["error"] == ""
+
+
 def test_binding_failure_is_reported_and_start_does_not_claim_full_readiness(runtime):
     runtime.dsh._state = "ready"
     runtime.dsh._process = SimpleNamespace(pid=123, returncode=None)
