@@ -33,7 +33,7 @@ def test_default_config_selects_standard_sentence_window() -> None:
     config = load_config(Path("config/default.yaml"))
     assert config.tts.transport == "websocket"
     assert config.tts.scheduling == "sentence_window"
-    assert config.tts.sentence_prefetch_ms == 2000
+    assert config.tts.sentence_prefetch_ms == 3000
     assert config.tts.sentence_tick_ms == 50
     assert config.tts.sentence_min_effective_chars == 10
     assert config.tts.first_clause_timeout_ms == 400
@@ -462,7 +462,7 @@ def test_streaming_lock_block_waits_for_later_segments_without_advancing_prefix(
     asyncio.run(scenario())
 
 
-def test_rewrite_replaces_short_segments_waiting_for_lock_minimum() -> None:
+def test_revision_rejects_short_segments_before_staging_finishes() -> None:
     async def scenario():
         output, handle, session, player = _sentence_output_harness()
         handle.text = "旧的，内容。"
@@ -484,18 +484,24 @@ def test_rewrite_replaces_short_segments_waiting_for_lock_minimum() -> None:
             await asyncio.wait_for(short_ready.wait(), 1)
             await asyncio.sleep(0)
             replacement = "新的完整内容，可以正常播报。"
+            snapshot = output.speak_snapshot  # snapshot（原子修订的确认边界）。
             rewritten = await output.rewrite_unsent(
                 ("episode", "revision"), "turn", speech_id=handle.speech_id,
                 text=replacement,
+                expected_generation=snapshot["output_generation"],
+                expected_sent_chars=snapshot["sent_chars"], expected_text=snapshot["text"],
+                expected_text_revision=snapshot.get("text_revision", 0),
             )
-            assert rewritten is handle
-            await asyncio.sleep(0.08)
-            assert session.sent == [replacement]
-            assert handle.admission.sent_chars == len(replacement)
+            # handle.finished（模型已结束）不代表本地分段已经确认完成。
+            assert rewritten is None
+            assert not handle.rewritable
+            assert session.sent == []
+            assert handle.admission.sent_chars == 0
             player.played_ms = 1000
             release.set()
             await asyncio.wait_for(running, 2)
-            assert handle.text == replacement
+            assert handle.text == "旧的，内容。"
+            assert session.sent == ["旧的，内容。"]
         finally:
             release.set()
             if not running.done():

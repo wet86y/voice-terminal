@@ -366,8 +366,13 @@ class AgentContextMixin:
                 }, ensure_ascii=False),
                 context_kind="deferred_recovery",
             ))
+        # 冻结原始快照；后续受理必须核对模型实际看到的边界。
+        raw_snapshot = getattr(self.output, "speak_snapshot", None)
+        self._last_model_speak_snapshot = (dict(raw_snapshot) if isinstance(raw_snapshot, dict)
+                                           else {"queue_status": "empty", "text_only_queue": True})
+        self._last_model_speak_snapshot["_output_busy"] = bool(getattr(self.output, "busy", False))
         speak_state = self._model_speak_state(
-            getattr(self.output, "speak_snapshot", {"queue_status": "empty", "text_only_queue": True}),
+            self._last_model_speak_snapshot,
             conversation_id=self.episode_id,
             turn_id=model_turn_id,
         )

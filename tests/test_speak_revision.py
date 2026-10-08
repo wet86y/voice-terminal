@@ -76,7 +76,7 @@ class _Output:
             "begin": _Handle("fresh", self.feeds),
         }
 
-    async def rewrite_unsent(self, identity, turn_id, *, speech_id, text):
+    async def rewrite_unsent(self, identity, turn_id, *, speech_id, text, **confirmation):
         self.calls.append(("rewrite", speech_id, text))
         return None if self.rewrite_unavailable else _Handle(speech_id)
 
@@ -144,8 +144,8 @@ def test_revision_carries_only_the_new_tail_and_is_stitched_locally():
     asyncio.run(scenario())
 
 
-def test_revision_window_closed_appends_without_interrupting_playback():
-    """A late revision degrades to a successor; it never cuts audible audio."""
+def test_revision_window_closed_is_rejected_without_fallback():
+    """关闭的修订窗口拒绝请求，不能追加、替换或新建。"""
 
     async def scenario():
         output = _Output({
@@ -160,15 +160,16 @@ def test_revision_window_closed_appends_without_interrupting_playback():
         envelope = DecisionEnvelope(SpeechDecision("revision", "calm", "补充一句。"), ())
         await runtime._apply_decision_v06(identity, "turn-a", envelope)
 
-        assert output.calls == [("append", "live", "补充一句。")]
+        assert output.calls == []
+        assert runtime.minor_protocol_feedback[-1]["reason"] == "revision_window_closed"
         assert not any(call[0] == "replace" for call in output.calls)
-        assert output.feeds == ["补充一句。"]
+        assert output.feeds == []
 
     asyncio.run(scenario())
 
 
-def test_revision_without_a_live_transaction_becomes_new_content():
-    """With nothing to revise the tail simply is the new content."""
+def test_revision_without_a_live_transaction_is_rejected():
+    """没有目标事务时修订不能变成新播报。"""
 
     async def scenario():
         output = _Output({"queue_status": "empty", "text_only_queue": True})
@@ -177,8 +178,9 @@ def test_revision_without_a_live_transaction_becomes_new_content():
         envelope = DecisionEnvelope(SpeechDecision("revision", "calm", "新的一句。"), ())
         await runtime._apply_decision_v06(identity, "turn-a", envelope)
 
-        assert output.calls == [("begin", None, None)]
-        assert output.feeds == ["新的一句。"]
+        assert output.calls == []
+        assert output.feeds == []
+        assert runtime.minor_protocol_feedback[-1]["reason"] == "no_owned_transaction"
 
     asyncio.run(scenario())
 
@@ -492,4 +494,147 @@ def test_minor_feedback_rides_the_request_tail_and_keeps_the_cache_envelope():
         assert not any("minor_protocol_feedback" in json.dumps(item, ensure_ascii=False)
                        for item in history)
 
+    asyncio.run(scenario())
+
+
+def test_revision_rejects_changed_request_boundary_without_any_fallback():
+    async def scenario():
+        for changed in (
+            {"sent_chars": 5},
+            {"text": "前缀新尾巴"},
+            {"text_revision": 1},
+            {"speech_id": "another"},
+            {"output_generation": 2},
+            {"rewritable": False},
+        ):
+            output = _Output({
+                "queue_status": "speaking", "speech_id": "live",
+                "conversation_id": "conversation", "turn_id": "turn-a",
+                "output_generation": 1, "text": "前缀旧尾巴",
+                "sent_chars": 2, "rewritable": True, "text_revision": 0,
+            })
+            runtime, identity = _runtime(output)
+            output.speak_snapshot["conversation_id"] = identity[0]
+            frozen = dict(output.speak_snapshot)
+            output.speak_snapshot.update(changed)
+            result = await runtime._apply_revision_tail(
+                identity, "turn-a", frozen, "新尾巴", emotion="calm")
+            assert result is None
+            assert output.calls == [] and output.feeds == []
+            assert runtime.minor_protocol_feedback[-1]["applied"] == "rejected_boundary_changed"
+    asyncio.run(scenario())
+
+
+def test_revision_rejects_a_different_turn_and_failed_final_confirmation():
+    async def scenario():
+        output = _Output({
+            "queue_status": "speaking", "speech_id": "live",
+            "conversation_id": "conversation", "turn_id": "turn-a",
+            "output_generation": 1, "text": "前缀旧尾巴",
+            "sent_chars": 2, "rewritable": True, "text_revision": 0,
+        })
+        runtime, identity = _runtime(output)
+        output.speak_snapshot["conversation_id"] = identity[0]
+        envelope = DecisionEnvelope(SpeechDecision("revision", "calm", "新尾巴"), ())
+        await runtime._apply_decision_v06(identity, "turn-b", envelope)
+        assert output.calls == []
+        output.rewrite_unavailable = True
+        await runtime._apply_decision_v06(identity, "turn-a", envelope)
+        assert output.calls == [("rewrite", "live", "新尾巴")]
+        assert runtime.current_action == "wait"
+        assert output.feeds == []
+    asyncio.run(scenario())
+
+
+def test_model_request_freezes_revision_boundary_before_frontier_advances():
+    async def scenario():
+        output = _Output({
+            "queue_status": "speaking", "speech_id": "live",
+            "conversation_id": "conversation", "turn_id": "turn-a",
+            "output_generation": 1, "text": "前缀旧尾巴",
+            "sent_chars": 2, "rewritable": True, "text_revision": 0,
+        })
+        runtime, identity = _runtime(output)
+        output.speak_snapshot["conversation_id"] = identity[0]
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    output.speak_snapshot["sent_chars"] = 5
+                    yield {"type": "content", "text": '{"speak":{"state":"revision","emotion":"calm","text":"新尾巴"},"actions":[]}'}
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+        runtime.provider = Provider()
+        runtime.inputs = {"turn-a": {"text": "继续", "final": True}}
+        runtime.agent_step_id = identity[1]
+        runtime._identity_turns[identity] = "turn-a"
+        assert await runtime._step(identity, {"USER_INPUT_REFINED"}) == "completed"
+        assert runtime._last_model_speak_snapshot["sent_chars"] == 2
+        assert output.calls == []
+        assert runtime.minor_protocol_feedback[-1]["reason"] == "request_boundary_changed"
+    asyncio.run(scenario())
+
+
+def test_busy_speak_is_not_deferred_by_passive_quiet():
+    async def scenario():
+        output = _Output({"queue_status": "speaking", "text": "正在播放"})
+        runtime, identity = _runtime(output)
+        runtime.should_defer_speech = lambda: True
+        deferred = []
+        runtime.defer_speech = lambda *args: deferred.append(args)
+        envelope = DecisionEnvelope(SpeechDecision("speak", "calm", "不能追加"), ())
+        await runtime._apply_decision_v06(identity, "turn-a", envelope)
+        assert deferred == [] and output.calls == []
+    asyncio.run(scenario())
+
+
+def test_ignored_busy_speak_does_not_block_validated_actions():
+    async def scenario():
+        output = _Output({"queue_status": "speaking", "speech_id": "live", "text": "正在播放"})
+        runtime, identity = _runtime(output)
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","emotion":"calm","text":"不能追加"},"actions":[{"name":"request_shadow","arguments":{"request":true}}]}'}
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+        dispatched = []
+        async def dispatch(_identity, _turn, envelope):
+            dispatched.extend(envelope.actions)
+        runtime.provider = Provider()
+        runtime._dispatch_actions_v06 = dispatch
+        runtime.inputs = {"turn-a": {"text": "继续查资料", "final": True}}
+        runtime.agent_step_id = identity[1]
+        runtime._identity_turns[identity] = "turn-a"
+        assert await runtime._step(identity, {"USER_INPUT_FINALIZED"}) == "completed"
+        assert output.calls == [] and output.feeds == []
+        assert [action.name for action in dispatched] == ["request_shadow"]
+    asyncio.run(scenario())
+
+
+def test_passive_quiet_mid_stream_keeps_the_entire_unplayed_proposal():
+    async def scenario():
+        output = _Output({"queue_status": "empty"})
+        runtime, identity = _runtime(output)
+        handle = output.handles["begin"]
+        original_feed = handle.feed
+        async def feed(value):
+            await original_feed(value)
+            handle.reason = "passive_quiet"
+        handle.feed = feed
+        output.deferred_remainder = lambda _handle, text: (text, "")
+        class Provider:
+            def stream_events(self, _messages, *, json_mode=False):
+                async def stream():
+                    yield {"type": "content", "text": '{"speak":{"state":"speak","emotion":"calm","text":"完整'}
+                    yield {"type": "content", "text": '回答尾巴"},"actions":[]}'}
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+        deferred = []
+        runtime.provider = Provider()
+        runtime.defer_speech = lambda _source, text, **_kwargs: deferred.append(text)
+        runtime.inputs = {"turn-a": {"text": "继续", "final": True}}
+        runtime.agent_step_id = identity[1]
+        runtime._identity_turns[identity] = "turn-a"
+        assert await runtime._step(identity, {"USER_INPUT_FINALIZED"}) == "completed"
+        assert deferred == ["完整回答尾巴"]
     asyncio.run(scenario())

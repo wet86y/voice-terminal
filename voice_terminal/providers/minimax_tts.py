@@ -915,7 +915,7 @@ class MiniMaxTtsClient:
         emotion_transport: str = "voice_setting",
         session_reuse: bool = True,
         admission_lead_ms: int = 2500,
-        sentence_prefetch_ms: int = 2000,
+        sentence_prefetch_ms: int = 3000,  # sentence_prefetch_ms（短句预取缓冲目标）。
         sentence_tick_ms: int = 50,
         sentence_min_effective_chars: int = 10,  # sentence_min_effective_chars（锁定文本块最少有效字符）。
         first_clause_timeout_ms: int = 400,

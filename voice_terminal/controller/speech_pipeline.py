@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import nullcontext
 from ..stream.text_bridge import TextBridge
 from ..tts.alignment import DeliveryResolver
 from ..tts.scheduling import DirectStreamingPolicy, PlaybackProgress, PlaybackWindowPolicy, TtsSegmentReceipt
@@ -116,7 +117,8 @@ class SpeechPipeline:
         audio_returned_bytes = 0
         tts_text_sent = False
         prefetch_miss_boundary_ms: int | None = None
-        sentence_prefetch_ms = max(1, int(getattr(tts_client, "sentence_prefetch_ms", 2000)))
+        sentence_prefetch_ms = max(1, int(getattr(tts_client, "sentence_prefetch_ms", 3000)))
+        inference_boundary = getattr(self, "inference_boundary", None)  # inference_boundary（请求期间提交闸门）。
         sentence_tick_seconds = max(0.001, int(getattr(tts_client, "sentence_tick_ms", 50)) / 1000)
         sentence_min_effective_chars = max(
             1, int(getattr(tts_client, "sentence_min_effective_chars", 10))
@@ -437,6 +439,9 @@ class SpeechPipeline:
                     await asyncio.sleep(sentence_tick_seconds)
                     continue
                 remaining_ms = max(0, current_end_ms - output_ms)
+                if (inference_boundary is not None and inference_boundary.prefilling(handle)
+                        and len(active) == 1):
+                    return
                 if len(active) == 1 and remaining_ms <= sentence_prefetch_ms:
                     return
                 await emit_progress(
@@ -467,6 +472,12 @@ class SpeechPipeline:
             sent_any = False
             try:
                 while True:
+                    if inference_boundary is not None:
+                        ready = await inference_boundary.wait_ready(
+                            handle, lambda: self._valid(token) and not tts_disabled,
+                        )
+                        if not ready:
+                            return
                     if sent_any and producer_done and not state.staged:
                         state.close()
                         return
@@ -632,18 +643,34 @@ class SpeechPipeline:
                         # A replacement invalidated this frame while we held
                         # it.  It was never sent, so drop it silently.
                         continue
-                    before_bytes = audio_returned_bytes
-                    before_segments = getattr(session, "completed_segments", 0)
-                    ws.timings.setdefault("first_tts_text", time.monotonic())
-                    ws.timings.setdefault("first_task_continue", time.monotonic())
-                    self.state.current["tts_text"] = segment
-                    resolver.add_text(segment, int(playback_progress()["returned_ms"]))
                     await self._wait_for_playback_permission(ws, token)
                     if not self._valid(token):
                         return
-                    await session.send_text(segment)
-                    # Only text the provider accepted is irreversible.
-                    state.commit_segment(segment, receipt_index=before_segments)
+                    if state.epoch != epoch:
+                        continue
+                    submission = (inference_boundary.submission(
+                        handle, lambda: self._valid(token) and not tts_disabled,
+                    ) if inference_boundary is not None else nullcontext(True))
+                    async with submission as allowed:
+                        if not allowed:
+                            return
+                        if state.epoch != epoch:
+                            # 推理期间已改写：丢弃手中尚未发送的旧块。
+                            continue
+                        before_bytes = audio_returned_bytes
+                        before_segments = getattr(session, "completed_segments", 0)
+                        ws.timings.setdefault("first_tts_text", time.monotonic())
+                        ws.timings.setdefault("first_task_continue", time.monotonic())
+                        self.state.current["tts_text"] = segment
+                        state.sending = True  # sending（提交中，禁止修订）。
+                        resolver.add_text(segment, int(playback_progress()["returned_ms"]))
+                        try:
+                            await session.send_text(segment)
+                            state.commit_segment(segment, receipt_index=before_segments)
+                            if inference_boundary is not None:
+                                inference_boundary.committed(handle)
+                        finally:
+                            state.sending = False
                     tts_text_sent = True
                     await emit_progress(
                         status="QUEUED",
@@ -730,6 +757,7 @@ class SpeechPipeline:
         async def finish_send_queue() -> None:
             nonlocal producer_done
             producer_done = True
+            state.producer_done = True
             state.signal.set()
 
         stream = buffered_stream(deltas, bridge)

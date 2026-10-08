@@ -22,6 +22,7 @@ class SpeechFrontierMixin:
                  "speech_id": h.speech_id, "output_generation": h.workspace.generation,
                  "conversation_id": h.identity[0], "turn_id": h.turn_id,
                  "emotion": h.emotion_requested,
+                 "text_revision": getattr(h, "text_revision", 0),  # text_revision（尾巴修订版本）。
                  # Admission frontiers.  ``text`` stays the accepted response;
                  # only ``sent_chars`` delimits what can no longer be replaced.
                  # A handle shape without them is legacy/collaborator input:
@@ -199,43 +200,46 @@ class SpeechFrontierMixin:
         value["_model_text_parts"] = parts
         value["_model_text_parts_valid"] = valid
 
-    async def rewrite_unsent(self, identity, turn_id, *, speech_id, text):
-        """Replace a live transaction's not-yet-synthesised tail in place.
+    async def rewrite_unsent(self, identity, turn_id, *, speech_id, text,
+                             expected_generation, expected_sent_chars, expected_text,
+                             expected_text_revision=0):
+        """revision（尾巴修订）的原子确认：事务、版本、文本、提交边界必须全部匹配。
 
-        This is the third output primitive, between ``append_successor`` (which
-        waits behind audible playback) and ``replace_current`` (which stops
-        it).  It is valid only while the provider has not yet received the
-        tail: the already-sent prefix stays audible, nothing is cancelled, and
-        the transaction keeps its speech id, generation and playback key.
-
-        ``text`` is the **new tail only**, never the complete answer: the
-        caller no longer has to reproduce the locked prefix, so no string
-        comparison decides the model's intent any more.  The prefix is read
-        here from the transaction's own irreversible frontier, which means a
-        racing ``sent_chars`` advance can never splice the wrong offset.
-        ``None`` means the replacement window has closed and the caller must
-        degrade to a successor transaction or a fresh one.
+        None（未受理）表示确认边界失效，调用方不得降级为追加或新建事务。
+        校验与修改之间没有 await（异步让出），提交中的文本也不能被改写。
+        expected_generation（期望输出代数）、expected_sent_chars（期望已提交字符数）、
+        expected_text（期望原计划文本）、expected_text_revision（期望文本修订版本）
+        都来自模型生成请求时的本地快照，不能用落地时的新边界代替。
         """
-
         h = self.handle
-        if h is None or h.speech_id != speech_id or h.reason or h.task.done():
+        if (h is None or h.speech_id != speech_id or h.reason or h.task.done()
+                or h.identity[0] != identity[0] or h.turn_id != turn_id):
             return None
         state = h.admission
-        if state is None or not state.rewritable or not h.finished:
+        if state is None or not h.rewritable:
+            return None
+        snapshot = self.speak_snapshot
+        if (h.workspace.generation != expected_generation
+                or snapshot.get("sent_chars") != expected_sent_chars
+                or snapshot.get("text") != expected_text
+                or getattr(h, "text_revision", 0) != expected_text_revision):
             return None
         baseline = h.text[:state.sent_chars]
-        suffix = text
-        dropped = state.replace_unsent(suffix)
+        dropped = state.replace_unsent(text)
         if dropped < 0:
             return None
-        h.text = baseline + suffix
+        h.text = baseline + text
+        h.text_revision = getattr(h, "text_revision", 0) + 1
+        # 分段器已结束，权威文本同时用于事务结算及本地状态快照。
+        h.workspace.staged_response = h.text.strip()
+        self.state.current["assistant_text"] = h.text
         await self.runtime.emit("speech.tail_rewritten", {
             "speech_id": h.speech_id, "conversation_id": h.identity[0],
-            "turn_id": h.turn_id,
-            "output_generation": h.workspace.generation,
+            "turn_id": h.turn_id, "output_generation": h.workspace.generation,
+            "text_revision": h.text_revision,  # text_revision（单事务文本版本）。
+            "text": h.text,  # text（该播报事务修订后的完整权威文本）。
             "sent_chars": state.sent_chars,
-            "dropped_chars": dropped, "staged_chars": len(suffix),
-            "cumulative_chars": len(h.text),
-            "provider": h.tts_backend,
+            "dropped_chars": dropped, "staged_chars": len(text),
+            "cumulative_chars": len(h.text), "provider": h.tts_backend,
         })
         return h

@@ -280,6 +280,30 @@ describe('V0.6 session protocol', () => {
     }
   })
 
+  it('尾巴修订直接替换权威文本，并拒绝旧版本、错误代数及已结束事务', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('input.started', 1, {}, { turn_id: 'input_a' })
+    socket.push('agent.state', 2, { conversation_id: 'episode_a', request_id: 'decision_a' })
+    const ids = { speech_id: 'speech_a', conversation_id: 'episode_a', turn_id: 'input_a', output_generation: 3 }
+    socket.push('speech.queued', 3, { ...ids, text: '' })
+    socket.push('speech.delta', 4, { ...ids, text_delta: '已提交旧尾巴' })
+    socket.push('speech.started', 5, { ...ids, text: '已提交旧尾巴' })
+    socket.push('speech.tail_rewritten', 6, { ...ids, text: '已提交新尾巴', text_revision: 1 })
+    expect(terminal.playbackQueue.value[0].text).toBe('已提交新尾巴')
+    expect(terminal.playbackQueue.value[0].state).toBe('playing')
+    expect(terminal.current.assistant_text).toBe('已提交新尾巴')
+    socket.push('speech.tail_rewritten', 7, { ...ids, text: '过期尾巴', text_revision: 1 })
+    socket.push('speech.tail_rewritten', 8, { ...ids, output_generation: 2, text: '错误代数', text_revision: 2 })
+    socket.push('speech.tail_rewritten', 9, { ...ids, conversation_id: 'other', text: '其他会话', text_revision: 2 })
+    socket.push('speech.started', 10, { ...ids, text: '已提交旧尾巴' })
+    expect(terminal.playbackQueue.value[0].text).toBe('已提交新尾巴')
+    socket.push('speech.completed', 11, { ...ids, text: '已提交新尾巴', status: 'completed' })
+    socket.push('speech.tail_rewritten', 12, { ...ids, text: '迟到修订', text_revision: 2 })
+    expect(terminal.playbackQueue.value).toEqual([])
+    expect(terminal.lastPlayback.value?.text).toBe('已提交新尾巴')
+    terminal.dispose()
+  })
+
   it('renders only authorized speech deltas and complete delivery', () => {
     const { socket, terminal } = openTerminal()
     socket.push('agent.state', 1, { conversation_id: 'episode_a', request_id: 'decision_a', agent_busy: true })

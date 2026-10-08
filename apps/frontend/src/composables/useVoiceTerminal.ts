@@ -211,6 +211,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       request_id: readString(value, 'request_id') ?? readString(value, 'trace_id') ?? undefined,
       turn_id: readString(value, 'turn_id') ?? '',
       output_generation: isNonNegativeInteger(value.output_generation) ? value.output_generation : undefined,
+      text_revision: isNonNegativeInteger(value.text_revision) ? value.text_revision : 0,
       text: readString(value, 'text') ?? '',
       state: stateValue,
       emotion_requested: readString(value, 'emotion_requested') ?? readString(value, 'emotion') ?? undefined,
@@ -231,7 +232,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     const next = {
       ...currentItem,
       ...incoming,
-      text: incoming.text || currentItem.text,
+      text: (incoming.text_revision ?? 0) < (currentItem.text_revision ?? 0)
+        ? currentItem.text : incoming.text || currentItem.text,
+      text_revision: Math.max(currentItem.text_revision ?? 0, incoming.text_revision ?? 0),
       state: currentItem.state === 'playing' ? 'playing' as const : incoming.state,
     }
     playbackQueue.value = playbackQueue.value.map((item, itemIndex) => itemIndex === index ? next : item)
@@ -956,6 +959,28 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         } else if (conversationId && speechId) {
           removePlaybackItem(conversationId, speechId)
         }
+      }
+      return
+    }
+    if (message.type === 'speech.tail_rewritten') {
+      // speech.tail_rewritten（尾巴修订）：以服务端权威文本替换，禁止追加或复活已结束播报。
+      const item = readPlaybackItem(payload, 'waiting')
+      const text = readString(payload, 'text')
+      const version = payload.text_revision
+      if (!item || text === null || !isNonNegativeInteger(version)) return
+      if (agentEpisode.value?.conversation_id && item.conversation_id !== agentEpisode.value.conversation_id) return
+      const key = speechKey(item.conversation_id, item.speech_id)
+      if (terminalPlaybackKeys.has(key)) return
+      const existing = playbackQueue.value.find(candidate => speechKey(candidate.conversation_id, candidate.speech_id) === key)
+      if (!existing || existing.output_generation !== item.output_generation
+        || version <= (existing.text_revision ?? 0)) return
+      playbackQueue.value = playbackQueue.value.map(candidate =>
+        candidate === existing ? { ...existing, text, text_revision: version } : candidate)
+      if (acceptsCurrentTurn(message.turn_id ?? item.turn_id)) {
+        // 同一轮可能已播放过前一个事务，只替换当前事务对应的展示片段。
+        const prefix = current.assistant_text.endsWith(existing.text)
+          ? current.assistant_text.slice(0, current.assistant_text.length - existing.text.length) : ''
+        current.assistant_text = prefix + text
       }
       return
     }
