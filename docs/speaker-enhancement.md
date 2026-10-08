@@ -36,12 +36,12 @@
 
 ## 资料指纹
 
-资料文件包含 `feature_fingerprint` 和确定性 `probe.npy`：
+资料文件包含 `feature_fingerprint`（特征指纹）和确定性 `probe.npy`（特征检查样本），统一保存于当前用户数据目录：
 
 ```text
-config/speaker/registry.json
-config/speaker/templates/*.npy
-config/speaker/probe.npy
+.local/data/speaker/registry.json
+.local/data/speaker/templates/*.npy
+.local/data/speaker/probe.npy
 ```
 
 特征前端、模型 ID、schema 或数值实现发生变化时，旧模板必须标记为 `stale`，停止参与判定并提示重新注册。不能让旧模板在新坐标系中继续工作，否则“前端变化”和“阈值太高”无法区分。
@@ -155,7 +155,7 @@ DELETE /api/v1/ambient-context
 自动化：
 
 ```powershell
-python -m pytest tests/test_speaker.py tests/test_speaker_features.py tests/test_speaker_rolling.py tests/test_speaker_production.py -q
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py tests/test_speaker.py tests/test_speaker_features.py tests/test_speaker_rolling.py tests/test_speaker_production.py -q
 ```
 
 现场验收：

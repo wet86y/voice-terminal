@@ -100,7 +100,7 @@ llm:
 同时执行：
 
 ```powershell
-python -m pytest -q
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q
 npm test
 npm run typecheck
 npm run build
@@ -110,6 +110,6 @@ npm run build
 
 ## 排障记录要求
 
-LLM context audit 默认写入 `logs/voice-server-llm-context.jsonl`，通过 `conversation_id + request_id + turn_id + wire_sha256` 关联请求和终态。日志可以包含真实会话文本，不能提交到仓库；API key 和 Authorization header 永远不得写入。
+LLM context audit（大语言模型上下文审计）默认写入 `.local/cache/logs/voice-server-llm-context.jsonl`（本机上下文日志），通过 `conversation_id`（会话标识）、`request_id`（请求标识）、`turn_id`（轮次标识）和 `wire_sha256`（请求正文摘要）关联请求和终态。日志可以包含真实会话文本，不能提交到仓库；API key（接口密钥）和 Authorization header（鉴权请求头）永远不得写入。
 
 非法 JSON、恢复耗尽、缺少 terminal event 或 provider capability 变化，统一先更新[当前已知问题](known-issues.md)，再决定是否修改本 runbook。不要重新建立一份按日期命名的长期调查文档。

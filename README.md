@@ -30,7 +30,7 @@ Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tau
 
 本机只保留两个使用入口：`.local/VoiceTerminal.exe`（正式程序）和 `.local/VoiceTerminalUIDemo.exe`（前端演示程序）。正式程序沿用原有完整用户数据、设置、凭据和历史记录；演示程序只加载前端，不启动业务后端。构建和已验证范围见[桌面开发与分发说明](docs/desktop-application.md)及[实施验收记录](docs/desktop-acceptance.md)。
 
-以下为源码开发使用当前正式业务环境；构建工具要求：Windows x64（64 位操作系统）、Python（后端运行环境）3.12、Node.js（脚本运行环境）22.19 或更高兼容版本（项目隔离 DSH 的最低要求）。
+源码开发复用 `.local/portable.json`（便携配置）指定的正式业务环境：Python（后端解释器）位于 `.local/runtimes/python/`，Node.js（脚本解释器）从 `.local/runtimes/dsh/runtime.json`（代理宿主运行清单）解析。开发依赖由 npm（包管理器）安装在根目录 `node_modules/`；原生构建工具保存在 `.local/tools/`（本机工具目录），构建输出统一进入 `.local/build/`（受控构建缓存）。
 
 ```powershell
 .\scripts\setup.ps1 -SkipInstall -SkipDsh
@@ -51,7 +51,7 @@ MINIMAX_API_KEY=
 - Voice Server（语音服务）：`http://127.0.0.1:8765/`
 - WebSocket（实时通信）：`ws://127.0.0.1:8765/ws`
 - 健康检查：`http://127.0.0.1:8765/health`
-- DSH（代理执行宿主）控制台：从 Product UI（产品界面）顶栏的“代理控制台”进入；桌面应用在系统默认浏览器打开网页
+- DSH（代理执行宿主）控制台：从工作台“后台协作”面板底部的“代理控制台”进入；桌面应用在系统默认浏览器打开网页。
 - 无界面后端调试：`.\scripts\start.ps1`
 
 启动结果以应用宿主的组件状态和核心能力为准：所有启用组件结束启动尝试后进入正常、降级或诊断状态。可选组件失败允许降级进入工作台；只看到 `/health`（语音服务健康检查）返回成功不代表整套应用已经准备好。启动完成后保持待机，由用户开始语音监听。
@@ -66,7 +66,7 @@ MINIMAX_API_KEY=
 .\scripts\build-desktop.ps1
 ```
 
-完整便携组装、独立运行环境构建、旧数据导入及离线校验见[桌面开发与分发说明](docs/desktop-application.md)。发布文件与用户数据分离，根入口根据便携配置选择组件；终端启动不执行依赖安装。
+覆盖发布、组件候选换入、用户数据备份及交付导出见[本地目录与覆盖发布](docs/local-layout.md)。发布文件与用户数据分离，根入口根据便携配置选择组件；终端启动不执行依赖安装。
 
 源码界面开发统一使用桌面命令：
 
@@ -74,7 +74,7 @@ MINIMAX_API_KEY=
 npm run dev       # 真实业务桌面热更新；别名 npm run desktop:dev
 npm run dev:ui    # 桌面样例热更新；别名 npm run desktop:ui
 npm run build    # 正式界面、原生主程序及根启动程序；别名 npm run desktop:build
-npm run desktop:publish # 退出正式程序并关闭演示后，构建并更新原正式目录，同时同步演示入口
+npm run desktop:publish # 退出业务实例并关闭演示后，事务更新固定程序目录及两入口
 ```
 
 源码开发命令启动前执行增量原生构建，静态开发命令同时构建当前界面；双击正式或演示入口都会直接打开最终主窗口，再在同一窗口显示加载状态并启动对应服务，不会另开过渡窗口。正式入口启动业务后端，演示入口只启动前端服务。真实开发端口固定 5173，演示固定 5174；冲突时明确失败，不连接未知服务。真实开发默认复用正式安装的完整数据和运行组件，不再自动生成空白数据产品；与正式程序共享业务资源，启动前应退出正式实例。渲染缓存按模式分开。演示只使用独立渲染缓存，不启动 Python（后端运行时）业务服务，不读取业务凭据，可以与正式程序同时运行。浏览器预览和旧网页启动器已撤销。启动诊断见[独立应用启动与系统管理](docs/application-lifecycle.md)。
@@ -96,13 +96,15 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 
 ## 主要配置
 
-- `config/default.yaml`：默认运行参数、端口、模型、KWS（关键词唤醒）、音频和 Shadow（影子代理）配置。
-- `config/local.yaml`：本机非密钥覆盖，不提交真实凭据。
-- `config/persona/`：`personality.md`（人格风格）和 `user.md`（用户资料）在会话初始化时读取并冻结；旧 `instructions.md`（历史工作指令）仅留档，不再加载。
+- `config/default.yaml`（默认配置模板）：默认运行参数、端口、模型、KWS（关键词唤醒）、音频和 Shadow（影子代理）配置；正式程序使用 `.local/app/config/default.yaml`（随程序发布的模板）。
+- `.local/data/config/local.yaml`（本机配置覆盖）：保存当前非密钥运行参数，不提交真实凭据。
+- `.local/data/persona/`（当前人格资料）：`personality.md`（人格风格）和 `user.md`（用户资料）在会话初始化时读取并冻结；旧 `instructions.md`（历史工作指令）仅留档，不再加载。源码 `config/templates/persona/`（人格模板）只用于补齐缺失资料。
 - `config/shadow_agent/`：Shadow（影子代理）指令和工具策略。
-- `config/dsh/`：项目隔离 DSH（代理执行宿主）锁定 `dsh-v0.2.0-rc.2`（候选版），commit（提交号）`639ed015397290b3745d163aafe02ffee4aa3f84`。项目插件源码统一为 `integrations/dsh/voice-terminal/` 下的 `@voice-terminal/dsh-plugin`（统一功能包）0.2.0，包含桥接、项目唤醒任务、浏览器和影子预设组件；Bridge protocol（桥接协议）保留 2.0。组件、依赖、安装迁移与新增功能要求见[DSH 插件维护手册](docs/dsh-plugin-maintenance.md)。官方 Automation Bundle（自动化功能包）的用户选择得到保留；原生 `schedule_*`（会话定时任务工具）绑定 DSH 会话，项目 `wake_task_*`（语音链路任务工具）保持独立存储和投递目标。2026-10-07 已完成项目内统一插件安装，已有便携发行程序仍按独立发布流程管理。历史部署见[首次验收](docs/local-layout.md)和[共存修复验收](docs/local-layout.md)，运行说明见[项目隔离 DSH 控制台](docs/dsh-console.md)。
-- `config/product-settings.json`：本机产品设置，包含 KWS（关键词唤醒）、静默、Shadow（影子代理）、自定义指令和声纹设置等非密钥内容。
-- `config/speaker/`：声纹资料、模板和特征指纹；详见 [声纹增强](docs/speaker-enhancement.md)。
+- `config/dsh/`（代理宿主基线）：锁定 DSH（代理执行宿主）`dsh-v0.2.0-rc.2`（候选版），commit（提交号）`639ed015397290b3745d163aafe02ffee4aa3f84`。项目插件源码统一为 `integrations/dsh/voice-terminal/` 下的 `@voice-terminal/dsh-plugin`（统一功能包）0.2.0，包含桥接、项目唤醒任务、浏览器和影子预设组件；Bridge protocol（桥接协议）保留 2.0。生产宿主位于 `.local/runtimes/dsh/`，持久状态只存放在 `.local/data/dsh/`。官方 Automation Bundle（自动化功能包）的用户选择得到保留；原生 `schedule_*`（会话定时任务工具）绑定 DSH 会话，项目 `wake_task_*`（语音链路任务工具）保持独立存储和投递目标。维护要求见[DSH 插件维护手册](docs/dsh-plugin-maintenance.md)，当前安装与数据验收见[本地整理验收](docs/local-layout-acceptance-20261008.md)，运行说明见[项目隔离 DSH 控制台](docs/dsh-console.md)。
+- `.local/data/config/product-settings.json`（本机产品设置）：包含 KWS（关键词唤醒）、静默、Shadow（影子代理）、自定义指令和声纹设置等非密钥内容。
+- `.local/data/speaker/`（当前声纹资料）：保存注册资料、模板和特征指纹；详见 [声纹增强](docs/speaker-enhancement.md)。
+
+配置模板随代码更新，已有用户设置由数据目录保存。普通覆盖发布复用模型与运行环境，不覆盖 `.local/data/`（真实用户数据）；重要数据的唯一滚动备份和显式交付导出命令见[本地目录与覆盖发布](docs/local-layout.md)。
 
 ### 运行模式
 
@@ -128,18 +130,20 @@ KWS 和声纹是独立能力。KWS 负责输入所有权和唤醒待机，声纹
 在仓库根目录执行：
 
 ```powershell
-python -m pytest -q
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q
 npm test
 npm run typecheck
 npm run build
 git diff --check
 ```
 
-需要真实设备或 provider 的验收时，按照 [运行与质量门槛](docs/operations-and-quality.md) 执行；本地 `.local/cache/logs/` 和 `.local/cache/reports/` 只作为诊断产物，不属于项目文档。
+后端测试使用正式解释器，测试入口加载 `.local/tools/testing/`（轻量测试工具）并在成功后回收临时夹具。文档修改可执行 `.local/runtimes/python/python.exe -B -X utf8 scripts/check-doc-links.py`（工程内文档链接检查）；安装摘要校验执行 `.local/Verify-Package.ps1`（完整发行校验）。需要真实设备或 provider（模型供应方）的验收时，按照 [运行与质量门槛](docs/operations-and-quality.md) 执行；本地 `.local/cache/logs/` 和 `.local/cache/reports/` 只作为诊断产物，不属于项目文档。
 
 ## 文档入口
 
 - [独立桌面应用、数据分离与便携构建](docs/desktop-application.md)：Tauri 2（桌面应用框架）窗口、独立预览、构建与迁移命令。
+- [本地目录与覆盖发布](docs/local-layout.md)：唯一资源路径、日常更新、用户数据备份与最新交付导出。
+- [本地目录整理验收](docs/local-layout-acceptance-20261008.md)：2026-10-08 迁移、清退体积、数据完整性、实机启动与失败恢复结果。
 - [桌面实施验收记录](docs/desktop-acceptance.md)：实际构建、运行、退出、迁移及待补实机检查。
 - [前端界面阶段性交接](docs/frontend-ui-handoff.md)：已确认的界面修订、产品接入差异及正式迁移顺序。
 - [真实业务验收与统一发布](docs/desktop-acceptance.md)：已发布界面的验收证据、双模式归档、固定服务密钥与最新正式组件。

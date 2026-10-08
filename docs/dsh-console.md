@@ -81,7 +81,7 @@ profile；profile patch（配置补丁）使用 `agent-preset-registry`（Agent 
 
 ## 打开 DSH 界面
 
-先从[独立应用入口](application-lifecycle.md)启动 Voice Terminal，再使用主界面顶栏的“代理控制台”入口。主界面网页优先使用 `http://127.0.0.1:5173/`，占用时以应用打开的实际地址为准。
+先从[独立应用入口](application-lifecycle.md)启动 Voice Terminal，再使用工作台“后台协作”面板底部的“代理控制台”入口。主界面网页优先使用 `http://127.0.0.1:5173/`，占用时以应用打开的实际地址为准。
 该入口会向 Voice Server（语音服务）请求带访问令牌的 launch URL（启动地址），并在 DSH（代理执行宿主）界面就绪后打开控制台。主产品只支持桌面窗口，控制台统一交给系统默认浏览器打开。DSH（代理执行宿主）仍由应用管理生命周期，关闭控制台网页不会结束后台代理服务。
 DSH Web Host（网页服务）固定监听 `127.0.0.1:3081`；直接访问该端口时，必须使用受管入口生成的临时访问令牌。
 不要收藏、复制给他人或写入日志带有 `?token=` 的完整地址。
@@ -100,7 +100,7 @@ pwsh -NoProfile -File .\scripts\setup-dsh.ps1 -ValidateOnly
 若设置侧栏已出现 `Voice Terminal`，但右侧内容为空，并且浏览器控制台报告 React error #130
 （React 渲染错误：组件类型未定义），请检查 Bridge 使用的 UI icon export（界面图标导出）是否属于锁定 DSH 版本。
 v0.2.0-rc.2 的图标名称已更新；当前页面使用 `IconChevronDownOutlineRegular` 和
-`IconFolderCloseRegular`。修改客户端后需重新运行 `setup-dsh.ps1` 重建插件，并从 Voice Terminal 顶栏入口重新打开
+`IconFolderCloseRegular`。修改客户端后需重新运行 `setup-dsh.ps1` 重建插件，并从 Voice Terminal 工作台的“代理控制台”入口重新打开
 DSH，以载入新产物和新的 launch token（临时访问令牌）。
 
 ## Voice Terminal 插件设置
