@@ -19,15 +19,17 @@ export interface WorkbenchModel {
   shadowModel: string;
   ttsModel?: string; // ttsModel（当前语音合成模型）。
   conversation: Array<{
-    key: string;
-    role: "user" | "assistant";
-    text: string;
-    time: string;
-    status: string;
-    speaking?: boolean;
-    delivered?: string;
+    key: string; // key（贯穿流式与结算阶段的气泡标识）。
+    role: "user" | "assistant"; // role（消息发送方）。
+    text: string; // text（最新完整正文）。
+    time: string; // time（消息显示时间）。
+    status: string; // status（识别或播报状态文案）。
+    speaking?: boolean; // speaking（是否实际播放中）。
+    delivered?: string; // delivered（实际播报交付说明）。
+    partial?: boolean; // partial（是否为正在识别的用户文本）。
   }>; // conversation（保持服务端顺序的呈现条目）。
   partial?: string; // partial（实时识别的未完成文本）。
+  partialKey?: string; // partialKey（识别气泡标识）：与最终用户条目保持一致。
   thinking?: boolean;
   conversationHint: string;
   voiceContext?: string;

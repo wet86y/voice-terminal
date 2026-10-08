@@ -11,6 +11,23 @@ const props = defineProps<{
 }>();
 // initialMessageKeys（进入工作台时已有记录）：历史消息不重新播放逐字动效。
 const initialMessageKeys = new Set(props.model.conversation.map(entry => entry.key));
+// presentedConversation（统一气泡列表）：识别稿与最终记录在同一组键控组件内接续。
+const presentedConversation = computed(() => {
+  if (!props.model.partial) return props.model.conversation;
+  const key = props.model.partialKey || "live-user";
+  const index = props.model.conversation.findIndex(entry => entry.key === key && entry.role === "user");
+  const draft: WorkbenchModel["conversation"][number] = {
+    key,
+    role: "user",
+    text: props.model.partial,
+    time: index >= 0 ? props.model.conversation[index].time : "本轮",
+    status: "正在识别",
+    partial: true,
+  };
+  return index < 0
+    ? [...props.model.conversation, draft]
+    : props.model.conversation.map((entry, position) => position === index ? draft : entry);
+});
 const emit = defineEmits<{
   action: [];
   reset: [];
@@ -20,6 +37,7 @@ const emit = defineEmits<{
   console: []; // console（打开代理控制台）。
 }>();
 const conversation = ref<HTMLElement | null>(null);
+const conversationStream = ref<HTMLElement | null>(null); // conversationStream（气泡内容容器）：观察内容高度而非只观察视口。
 const trace = ref<HTMLElement | null>(null);
 const voiceColumn = ref<HTMLElement | null>(null);
 const sessionActive = computed(() => props.model.sessionActive ?? ['listening', 'thinking', 'speaking'].includes(props.model.state));
@@ -73,39 +91,69 @@ watch(sessionActive, async () => {
 const followConversation = ref(true),
   followTrace = ref(true);
 let observer: ResizeObserver | null = null;
+let scrollFrame: number | undefined; // scrollFrame（当前待执行的滚动帧）：同帧文字与尺寸变化只滚动一次。
+let conversationScrollPending = false, traceScrollPending = false;
 function atTail(element: HTMLElement | null) {
   return (
     !element ||
     element.scrollHeight - element.clientHeight - element.scrollTop < 30
   );
 }
-function scroll() {
-  if (followConversation.value && conversation.value)
-    conversation.value.scrollTop = conversation.value.scrollHeight;
-  if (followTrace.value && trace.value)
-    trace.value.scrollTop = trace.value.scrollHeight;
+function scrollToTail(element: HTMLElement | null, follow: boolean) {
+  if (!follow || !element) return;
+  const top = Math.max(0, element.scrollHeight - element.clientHeight);
+  if (element.scrollTop !== top) element.scrollTop = top;
 }
+function flushScroll() {
+  scrollFrame = undefined;
+  if (conversationScrollPending) scrollToTail(conversation.value, followConversation.value);
+  if (traceScrollPending) scrollToTail(trace.value, followTrace.value);
+  conversationScrollPending = traceScrollPending = false;
+}
+function scheduleScroll(target: "conversation" | "trace") {
+  const element = target === "conversation" ? conversation.value : trace.value;
+  const follow = target === "conversation" ? followConversation.value : followTrace.value;
+  if (!follow || !element || element.scrollTop === Math.max(0, element.scrollHeight - element.clientHeight)) return;
+  if (target === "conversation") conversationScrollPending = true;
+  else traceScrollPending = true;
+  if (scrollFrame !== undefined) return;
+  if (typeof requestAnimationFrame === "function") scrollFrame = requestAnimationFrame(flushScroll);
+  else flushScroll();
+}
+// 只跟随条目身份和正文变化；结算状态、播放变色或后台协作更新不强制滚动会话。
 watch(
-  () => [
-    props.model.conversation,
-    props.model.partial,
-    props.model.shadow.trace,
-  ],
-  async () => {
-    await nextTick();
-    scroll();
-  },
-  { deep: true },
+  () => JSON.stringify(presentedConversation.value.map(entry => [entry.key, entry.text])),
+  () => scheduleScroll("conversation"),
+  { flush: "post" },
+);
+watch(
+  () => props.model.shadow.trace,
+  () => scheduleScroll("trace"),
+  { deep: true, flush: "post" },
 );
 onMounted(() => {
-  scroll();
+  scrollToTail(conversation.value, followConversation.value);
+  scrollToTail(trace.value, followTrace.value);
   if (typeof ResizeObserver !== "undefined") {
-    observer = new ResizeObserver(scroll);
+    observer = new ResizeObserver(entries => {
+      for (const entry of entries) {
+        scheduleScroll(entry.target === conversation.value || entry.target === conversationStream.value ? "conversation" : "trace");
+      }
+    });
     if (conversation.value) observer.observe(conversation.value);
-    if (trace.value) observer.observe(trace.value);
+    if (conversationStream.value) observer.observe(conversationStream.value);
+    if (trace.value) {
+      observer.observe(trace.value);
+      if (trace.value.firstElementChild) observer.observe(trace.value.firstElementChild);
+    }
   }
 });
-onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLayoutAnimations(); });
+onBeforeUnmount(() => {
+  observer?.disconnect();
+  if (scrollFrame !== undefined) cancelAnimationFrame(scrollFrame);
+  motionGeneration += 1;
+  cancelLayoutAnimations();
+});
 </script>
 <template>
   <section class="workbench" aria-label="语音工作台">
@@ -267,7 +315,7 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
         class="conversation-scroll"
         @scroll="followConversation = atTail(conversation)"
       >
-        <div class="conversation-stream">
+        <div ref="conversationStream" class="conversation-stream">
           <div
             v-if="!model.conversation.length && !model.partial"
             class="conversation-empty"
@@ -277,7 +325,7 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
             <p>开始语音会话后，直接说出你的想法。</p>
           </div>
           <ConversationMessage
-            v-for="entry in model.conversation"
+            v-for="entry in presentedConversation"
             :key="entry.key"
             :role="entry.role"
             :text="entry.text"
@@ -286,13 +334,7 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
             :status="entry.status"
             :speaking="entry.speaking"
             :delivered="entry.delivered"
-          />
-          <ConversationMessage
-            v-if="model.partial"
-            role="user"
-            :text="model.partial"
-            status="正在识别"
-            partial
+            :partial="entry.partial"
           />
           <ConversationMessage
             v-if="model.thinking"
