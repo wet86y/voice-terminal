@@ -136,7 +136,7 @@ def test_dynamic_speak_parts_change_only_request_tail_and_keep_cache_prefix_froz
     assert runtime.history_context_digest == history_digest
     packet = json.loads(after[-2]["content"])
     runtime_entry = next(item for item in packet["entries"] if item["kind"] == "runtime_state")
-    assert '"continuation_mode":"append_only"' in runtime_entry["content"]
+    assert '"continuation_mode":"none"' in runtime_entry["content"]
     assert '"text_parts"' in runtime_entry["content"]
     assert "target_text" not in runtime_entry["content"]
     assert "第一句。" not in "".join(item["content"] for item in static_before)

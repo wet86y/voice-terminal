@@ -163,6 +163,56 @@ def test_exact_three_seconds_needs_no_prefill_and_long_answer_resumes_after_wait
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("proposal", [NEW_TAIL, FIRST + SECOND + NEW_TAIL])
+def test_busy_speak_cannot_change_or_append_tail_during_inference_freeze(proposal):
+    """speak（新播报）不能通过尾巴文本或完整计划绕过推理冻结后的受理边界。"""
+    async def scenario():
+        output, handle, session, player, pipeline = await start_pipeline()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class Provider:
+            transport = "responses"  # transport（与产品一致的响应协议）。
+
+            def stream_events(self, _messages, **_kwargs):
+                async def stream():
+                    entered.set()
+                    await release.wait()
+                    yield {"type": "content", "text": json.dumps({
+                        "speak": {"state": "speak", "emotion": "calm", "text": proposal},
+                        "actions": [],
+                    }, ensure_ascii=False)}
+                    yield {"type": "finish", "reason": "stop"}
+                return stream()
+
+        runtime, identity = runtime_for(output, Provider())
+        handle.identity = (identity[0], "old-request")
+        original = output.speak_snapshot  # original（请求前的事务确认字段）。
+        step = asyncio.create_task(runtime._step(identity, {"USER_INPUT_REFINED"}))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert output.inference_boundary.frozen
+            player.played_ms = 9000  # 已合成音频耗尽，旧尾巴仍然受冻结保护。
+            await asyncio.sleep(0.08)
+            assert session.sent == [FIRST]
+            release.set()
+            assert await asyncio.wait_for(step, 2) == "completed"
+            assert handle.text == FIRST + SECOND + OLD_TAIL
+            current = output.speak_snapshot  # current（结果应用后的事务确认字段）。
+            for field in ("speech_id", "output_generation", "text_revision"):
+                assert current[field] == original[field]
+            assert any(item.get("applied") == "ignored_output_busy"
+                       for item in runtime.minor_protocol_feedback)
+            assert not output.inference_boundary.frozen
+            await asyncio.wait_for(pipeline, 2)
+            assert session.sent == [FIRST, SECOND, OLD_TAIL]
+        finally:
+            step.cancel()
+            pipeline.cancel()
+            await asyncio.gather(step, pipeline, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_request_waits_for_send_and_character_commit_to_finish():
     async def scenario():
         handle = SimpleNamespace(sent_chars=0, speech_id="speech")

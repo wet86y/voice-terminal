@@ -57,20 +57,20 @@ def test_prompt_matches_required_responses_wire_contract_and_has_short_examples(
     assert '{"speak":{"state":"speak","emotion":"calm","text":"好的。"},"actions":[]}' in PROMPT
     assert '{"speak":{"state":"revision","emotion":"calm","text":"另外，明早可能堵车。"},"actions":[]}' in PROMPT
     assert '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}' in PROMPT
-    assert "state=wait 表示判断无需变更当前语音队列" in PROMPT
-    assert "任何正常调用都可以使用 wait" in PROMPT
-    assert "单纯无需新增播报、队列无需变化或队列为空时必须 wait，不能 cancel" in PROMPT
-    assert "绝不能把拼接后的计划文本原样作为新的 speak.text" in PROMPT
-    assert "committed_prefix、current_clause、prefetched_clause、revisable_tail" in PROMPT
+    assert "state=wait（等待）表示不变更语音队列" in PROMPT
+    assert "无需新增播报或修改时必须 wait" in PROMPT
+    assert "不能追加、修订或替换，也不会等播放结束后补执行" in PROMPT
+    assert "不能用 speak（新播报）重复完整计划来改尾巴" in PROMPT
+    assert "committed_prefix（已提交前缀）、current_clause（当前短句）、prefetched_clause（预取短句）、revisable_tail（可改尾巴）" in PROMPT
     assert "continuation_mode=rewrite_tail" in PROMPT
-    assert "优先用 state=revision 只写新的尾巴" in PROMPT
+    assert "只使用 state=revision（尾巴修订）更新" in PROMPT
     assert "不表示必须 speak" in PROMPT
     assert "相关性、时效性、是否已经表达" in PROMPT
     assert 'HISTORY 中 assistant 角色的 <voice_delivery>' in PROMPT
     assert 'status="full"' in PROMPT
     assert "调度器触发、shadow.active" in PROMPT
-    assert "只有更新提供了当前回答尚未覆盖、仍需向用户传达的新信息" in PROMPT
-    assert "若没有确需补充的新后缀则 wait" in PROMPT
+    assert "确有必要补充且尾巴可改时" in PROMPT
+    assert "不降级为追加、新播报或硬替换" in PROMPT
     assert "回答仍正确但缺少新信息" not in PROMPT
     assert "emotion 可省略" not in PROMPT
     assert "不得带 text" not in PROMPT

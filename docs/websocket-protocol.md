@@ -84,7 +84,7 @@ HTTP API 和 WebSocket 事件都应尽量保留结构化错误码：
 - `speech.delta`：追加正式输出文本；
 - `speech.started`：播放器第一次实际消费该事务 PCM；
 - `speech.progress`：缓冲、播放、替换和结算诊断；`trigger=playback_finished` 表示物理播放结束；
-- `speech.tail_rewritten`：只改写同一事务的未发送尾巴，`speech_id` 和播放键不变；
+- `speech.tail_rewritten`（尾巴修订事件）：只改写同一事务的未发送尾巴，`speech_id`（播报标识）和播放键不变。`text`（该事务修订后的完整权威文本）直接替换展示；`text_revision`（单事务递增修订版本）及 `output_generation`（输出代数）用于拒绝过期事件；已结束或其他会话的事务不被恢复；
 - `speech.completed`：delivery 和最终事务状态结算完成。
 
 物理播放结束和服务端结算不是同一边界：

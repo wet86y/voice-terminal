@@ -194,7 +194,7 @@ Product UI 的会话排序只信任服务端 `conversation.append` / `conversati
 
 确认 flush/close、cancel/close 并发时不会出现 `NoneType` 内部异常；关闭后不存在继续运行的 provider receiver、后台任务或旧 playback key。
 
-修改短句窗口的锁定边界时，执行 `tests/test_sentence_scheduling.py`（短句调度测试）、`tests/test_speech_admission.py`（文本提交测试）和 `tests/test_speak_revision.py`（播报改写测试）。最少有效字符规则应覆盖：恰好达到下限、多个短句合并、标点与空白不计数、生成中不足下限继续等待、等待期间整段仍可改写、生成结束释放短回答与短尾块。核对 LLM（大语言模型）可见的当前块、预取块与可改尾巴使用实际提交边界，并确认预取仍最多一块。
+修改短句窗口的锁定边界时，执行 `tests/test_sentence_scheduling.py`（短句调度测试）、`tests/test_speech_admission.py`（文本提交测试）、`tests/test_speak_revision.py`（播报改写测试）和 `tests/test_speech_inference.py`（推理冻结组合测试）。最少有效字符规则应覆盖：恰好达到下限、多个短句合并、标点与空白不计数、生成中不足下限继续等待、原始文本分段入队完成后未提交部分仍可修订、生成结束释放短回答与短尾块。核对 LLM（大语言模型）可见的当前块、预取块与可改尾巴使用实际提交边界，并确认预取仍最多一块。
 
 声纹注册/测试与实时音频必须互斥，尤其要验证 KWS standby 下设备和 `AudioPreprocessor` 的占用；具体门槛见[声纹增强](speaker-enhancement.md)。
 
@@ -207,7 +207,7 @@ Product UI 的会话排序只信任服务端 `conversation.append` / `conversati
 1. `/health` 中的 `startup_errors`、`services`、`input_owner`、KWS 和 speaker 状态；
 2. `audio.capture_progress`、`audio.player_first_pcm_submitted`、`audio.player_drained`；
 3. `speech_id`、`turn_id`、`owner_scope`、`continuation_mode` 和 speech 结算事件；
-4. 重复播报类问题按这些锚点定位：`SPEECH_PREFIX_RECONCILED`（`baseline_chars` 是否在事务换头时缩短）、`SPEECH_REVISED`（`path=rewrite|append|begin`）、`SPEECH_REVISION_NOOP`、`SPEECH_TAIL_REWRITE_UNAVAILABLE`、`SPEAK_CANCELLED_WITH_REPLACEMENT`、`SPEECH_IDENTICAL_IGNORED`，以及 `LLM_SPEAK_CONTEXT` 的 `heard_chars`；
+4. 重复播报类问题按这些锚点定位：`SPEAK_BUSY_IGNORED`（忙碌新播报被拒绝）、`SPEECH_REVISED`（尾巴修订成功，`path=rewrite` 仅表示改写）、`SPEECH_REVISION_REJECTED`（确认边界失效）、`SPEECH_REVISION_NOOP`（新尾巴已经锁定）、`SPEAK_CANCELLED_WITH_REPLACEMENT`（停止并替换）、`SPEECH_IDENTICAL_IGNORED`（重复文本被忽略），以及 `LLM_SPEAK_CONTEXT`（模型语音上下文日志）的 `heard_chars`（已听字符数）；同时核对 `speech.inference_frozen`（提交边界已冻结）与 `speech.inference_released`（本次请求已释放）是否配对；
 5. LLM context audit 中的 `conversation_id + request_id + turn_id + wire_sha256`；
 6. `.local/cache/logs/`（运行日志）及 `.local/cache/reports/`（本地诊断产物）。
 
@@ -221,3 +221,20 @@ Product UI 的会话排序只信任服务端 `conversation.append` / `conversati
 2. 哪个行为测试证明新 owner 已覆盖原边界？
 3. 旧配置或旧协议是明确失败，还是有兼容迁移？
 4. 是否同步更新 README、公共协议和当前已知问题？
+
+### 语音控制入口回归
+
+修改 speak（新播报）、revision（尾巴修订）或 cancel（取消）时，回归
+tests/test_speak_revision.py（决策职责）、tests/test_speech_admission.py（提交确认）、
+tests/test_speech_continuation.py（真实播放器边界）、tests/test_speech_inference.py（推理冻结组合）、
+tests/test_v06_contracts.py（完整与流式契约）、tests/test_context_cache_contract.py（缓存分区），
+tests/test_json_schema_shadow.py（模型提示与结构契约），
+以及 apps/frontend/src/composables/useVoiceTerminal.test.ts（展示文本同步）。
+
+必须确认：排队、播放、设备输出尾音及结算期间拒绝新 speak（新播报）；忙碌请求在推理期间等到空闲也不能补执行；
+revision（尾巴修订）只能修改快照仍匹配的未提交尾巴，发送中、跨轮、版本过期及窗口关闭全部拒绝且不追加；
+cancel（取消）带文本仍可硬替换并拒绝旧 PCM（原始音频）；修订事件以权威全文替换展示，拒绝迟到版本。
+
+推理准备必须覆盖：剩余已返回音频恰好 3 秒时不补块、不足时最多补一块、当前块与预取块最多两块、等待期间已有音频足够时撤销补块、2 秒准备超时、正在发送的块与字符计数一起结算。推理中播放耗尽不能推进提交；revision（尾巴修订）后丢弃已取出的旧块，wait（等待）后恢复旧文本调度，speak（新播报）不能改尾巴或追加。失败和取消释放各自票据，旧请求释放不能解锁新请求；空二等信箱及过期恢复不冻结，有效重试仍使用匹配的信箱快照。
+
+测试替身和真实播放器队列通过后，真实供应商与设备仍需要现场试听验收。

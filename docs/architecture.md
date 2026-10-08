@@ -77,29 +77,32 @@ SessionLedger ──> LLMContextProjector ──> 主 LLM 请求
 
 语音文本有两个边界：
 
-- `received`：模型返回的完整文本；
-- `sent`：已经交给 TTS provider 的前缀。
+- `received`（已接收文本）：模型返回的完整文本；
+- `sent`（已提交文本）：已经交给 TTS provider（语音合成供应商）的前缀。
 
-`sent`（语音合成已接受）前缀不可撤回，其后的内容仍可修改。默认 `tts.scheduling=sentence_window`（短句窗口调度）：本地按朗读标点分段，提交前依次合并至 `tts.sentence_min_effective_chars`（锁定文本块最少有效字符，默认 10），中文、字母和数字计数，标点、空白与符号不计；生成结束时不足下限的尾块也正常提交。首段没有标点时约 400 毫秒释放分段缓冲，但提交仍遵守有效字符下限。播放器距离当前块边界约 2000 毫秒时最多预取一个下一块。LLM（大语言模型）可见的不可修改前缀以实际提交的合并块为边界，其后文本留在本地，允许同轮改写 `revisable_tail`（可改尾巴）。
+`sent`（语音合成已接受）前缀不可撤回，其后的内容仍可修改。默认 `tts.scheduling=sentence_window`（短句窗口调度）：本地按朗读标点分段，提交前依次合并至 `tts.sentence_min_effective_chars`（锁定文本块最少有效字符，默认 10），中文、字母和数字计数，标点、空白与符号不计；生成结束时不足下限的尾块也正常提交。首段没有标点时约 400 毫秒释放分段缓冲，但提交仍遵守有效字符下限。播放器距离当前块边界约 3000 毫秒时最多预取一个下一块。LLM（大语言模型）可见的不可修改前缀以实际提交的合并块为边界，其后文本留在本地，允许同轮改写 `revisable_tail`（可改尾巴）。
 
-模型只看到以下四段，不直接看到 PCM、provider session、播放时间或内部 ID：
+有效模型请求先通过 `SpeechInferenceBoundary`（推理语音边界）结算正在发送的文本。剩余已返回音频不足 3 秒且窗口允许时，可以补交旧事务的一个本地文本块；随后冻结提交边界，再生成请求上下文。冻结持续到结果应用完成，音频接收和播放继续，未提交文本等待释放后恢复调度。补交只推进已有文本的提交，不赋予模型追加或替换权限。准备上限、两块窗口、取消与重试的完整规则见 [TTS 运行模式](tts-runtime.md#模型推理期间的提交边界)。
+
+模型只看到 `committed_prefix`（已提交前缀）、`current_clause`（当前锁定块）、`prefetched_clause`（预取锁定块）和 `revisable_tail`（可改尾巴）四段，不直接看到 PCM（原始音频）、provider session（供应商会话）、播放时间或内部 ID（标识）：
 
 ```text
 committed_prefix + current_clause + prefetched_clause + revisable_tail
 ```
 
-`continuation_mode` 为：
+`continuation_mode`（尾巴修订权限）为：
 
-- `rewrite_tail`：只允许改写尚未发送的尾巴，此时模型用 `state=revision` 只输出新尾巴，本地把锁定前缀与新尾巴拼成完整文本；
-- `append_only`：保留原计划后追加；
-- `none`：不把上一轮内容当作当前轮续写目标。
+- `rewrite_tail`（允许尾巴修订）：只允许改写尚未发送的尾巴，此时模型用 `state=revision`（尾巴修订状态）只输出新尾巴，本地把锁定前缀与新尾巴拼成完整文本；
+- `none`（禁止尾巴修订）：禁止修订当前尾巴；上一轮内容也不能作为本轮修订目标。
 
-speak 决策状态为 `speak`、`revision`、`cancel`、`wait`：
+`speak.state`（语音决策状态）为 `speak`（新播报）、`revision`（尾巴修订）、`cancel`（取消）、`wait`（等待）：
 
-- `speak`：`text` 是完整文本，只提交尚未交付的部分进行合成；
-- `revision`：`text` 只是新的尾巴，仅在 `rewrite_tail` 可用；本地负责拼接，任何情况下都不会重播已交付内容；
-- `cancel`：`text` 为空表示立即停止；`text` 非空表示停止并替换，替换文本直接播给用户；
-- `wait`：不改变语音队列。
+- `speak`（新播报）：`text`（播报文本）是新的完整播报，仅输出空闲时可新建事务；排队、播放和结算期间拒绝其他新播报请求，不追加、不替换、不延迟重放；
+- `revision`（尾巴修订）：`text`（新尾巴文本）只承载新的尾巴，仅在 `rewrite_tail`（允许尾巴修订）可用；本地负责拼接，请求快照的事务、文本版本和提交边界必须仍匹配，失效则拒绝；不降级为追加或新建；
+- `cancel`（取消）：`text`（替换文本）为空表示立即停止；非空表示停止并替换，替换文本直接播给用户；
+- `wait`（等待）：不改变语音队列。
+
+完整响应与流式响应共用唯一的新播报入口；已受理的同一请求可继续向自己的事务写入文本，输出层在异步准备后再次确认空闲。尾巴修订要求原播报的模型文本生成结束且本地原始文本全部分段入队，发送中关闭修订窗口；应用时再次确认 `speech_id`（事务标识）、`output_generation`（输出代数）、`sent_chars`（已提交字符数）、`text`（原计划文本）和 `text_revision`（修订版本）仍匹配请求快照。成功修订通过 `speech.tail_rewritten`（尾巴修订事件）同步该事务的完整权威文本与版本，前端直接替换展示文本。
 
 队列为空时，`runtime.speak.delivery.heard_text` 是最近一次确认听到的前沿；被打断的投递会标记为不可续写（`delivered_resumable=false`），只允许作为"已听过前缀"的重复基线。
 
@@ -181,7 +184,7 @@ none → kws standby → asr active → kws standby → none
 | --- | --- |
 | session、HTTP、WebSocket、产品设置 | `voice_terminal/server/websocket.py`、`voice_terminal/server/http_api.py`、`voice_terminal/server/speaker_runtime.py`、`voice_terminal/server/product.py` |
 | 主 Agent 与调度 | `voice_terminal/agent/episode.py`、`voice_terminal/agent/scheduler.py`、`voice_terminal/agent/context_builder.py`、`voice_terminal/agent/decision_application.py`、`voice_terminal/agent/streamed_speech.py`、`voice_terminal/controller/episode_controller.py` |
-| TTS、播放和 delivery | `voice_terminal/controller/episode_output.py`、`voice_terminal/controller/speech_frontier.py`、`voice_terminal/controller/speech_pipeline.py`、`voice_terminal/controller/speech_admission.py`、`voice_terminal/providers/` |
+| TTS（语音合成）、播放和 delivery（交付结算） | `voice_terminal/controller/episode_output.py`、`voice_terminal/controller/speech_frontier.py`、`voice_terminal/controller/speech_pipeline.py`、`voice_terminal/controller/speech_admission.py`、`voice_terminal/controller/speech_inference.py`、`voice_terminal/providers/` |
 | 会话账本和上下文 | `voice_terminal/session/ledger.py`、`voice_terminal/session/context.py` |
 | Shadow 合约、上下文、工具和 provider | `voice_terminal/shadow_agent/` |
 | Product UI 与适配器 | `apps/frontend/src/product/` |
