@@ -106,14 +106,12 @@ Voice（语音）主线与当前关联的 DSH（后台代理执行环境）会�
 ### 验证命令
 
 ```powershell
-python -m pytest -q
-cd apps/frontend
-npm run test
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q
+npm test
 npm run typecheck
-npm run build
-cd ../../integrations/dsh/voice-terminal
-npm run test
-npm run build
+npm run frontend:build
+npm --prefix integrations/dsh/voice-terminal test
+npm --prefix integrations/dsh/voice-terminal run build
 ```
 
 新增边界测试位于 `tests/test_handoff.py`（待传达与交接测试）。实际麦克风、扬声器和远端供应方的高强度服务兼容性仍需在部署环境进行现场验证。

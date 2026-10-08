@@ -143,14 +143,14 @@ Shadow thinking+tools 的合法 `reasoning`、`function_call`、`function_call_o
 单元测试：
 
 ```powershell
-python -m pytest tests/test_session_ledger.py tests/test_conversation_runtime.py tests/test_v06_contracts.py -q
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py tests/test_session_ledger.py tests/test_conversation_runtime.py tests/test_v06_contracts.py -q
 ```
 
 需要真实 provider 时使用无用户数据的缓存探针：
 
 ```powershell
-python .\scripts\probe_context_cache.py --model deepseek-flash
-python .\scripts\probe_context_cache.py --model deepseek-flash --dynamic-speak
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/probe_context_cache.py --model deepseek-flash
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/probe_context_cache.py --model deepseek-flash --dynamic-speak
 ```
 
 第二、第三轮的 `cached_tokens` 应随稳定 HISTORY 增长；provider 不提供 usage 时只记录“不可观测”。不要把真实 prompt、用户内容或密钥写入探针输出。

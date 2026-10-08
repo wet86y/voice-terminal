@@ -20,8 +20,10 @@ Bridge（桥接插件）22 passed（通过）；Wake Tasks（唤醒任务插件�
 
 使用 PowerShell 7 的 `pwsh -NoProfile -File scripts/setup-dsh.ps1` 安装或修复项目运行时，使用
 `pwsh -NoProfile -File scripts/setup-dsh.ps1 -ValidateOnly` 检查安装状态。官方源码和项目专属 DSH_HOME（DSH 数据目录）
-位于 Git 忽略的 `.local/build/dsh/`；该数据目录与用户级 `~/.dsh` 隔离。升级时保留项目设置和会话数据，
-并按安装脚本流程备份后再启动新版本。
+分别位于 Git（版本控制）忽略的 `.local/build/dsh/source/`（唯一上游源码缓存）和 `.local/data/dsh/`（唯一代理持久数据）。
+实际业务只使用 `.local/runtimes/dsh/`（生产宿主），不在源码缓存内保留第二套代理状态。
+项目插件随 `.local/app/`（当前程序）更新；运行组件升级先构建候选，经覆盖发布换入固定位置，成功后回收事务旧组件。
+升级不制作源码、模型或环境备份；重要用户数据只保留一份滚动备份，规则见[本地目录与覆盖发布](../../docs/local-layout.md)。
 
 正式 `shadow-agent`（影子执行代理）由 `integrations/dsh/voice-terminal/preset/shadow-agent/` 维护。
 插件构建将该配置合入统一 Bundle（功能包）的组合补丁，安装到 Web
@@ -29,7 +31,7 @@ profile（网页配置），并通过 `agent-preset-registry`（Agent 预设注�
 设为默认项。DSH 0.2.0-rc.2 不再读取 DSH_HOME（数据目录）中旧版 `.agent-presets/` 目录；该目录即使为回退保留，也不会注册预设。
 
 项目 DSH Web Host（DSH 网页服务）仅监听 `127.0.0.1:3081`，由 Voice Server（语音服务）管理。
-打开 Voice Terminal 页面 `http://127.0.0.1:5173/`，再使用顶栏的 DSH 控制台入口取得一次性访问地址；
+从桌面程序打开 Voice Terminal，再使用工作台“后台协作”面板底部的“代理控制台”入口取得一次性访问地址；
 直接访问 3081 不带 launch token（临时访问令牌）时不能完成网页授权。不要收藏、记录或分享带
 `?token=` 的完整地址。
 

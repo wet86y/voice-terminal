@@ -8,7 +8,7 @@
 - **仅 CPU**：强制在 CPU 上运行。
 - **GPU（CUDA）**：请求在 GPU 上运行。启动失败时回到保存设备选择时记录的上次成功设备，并在设置页显示原因。
 
-更改保存到 config/product-settings.json（设备偏好文件），需要重新启动整个应用后生效。页面资源摘要和组件行使用宿主同一次采样的 `resource_processes`（去重进程资源明细）。流式识别、语音分析、声纹与代理工作进程各自计量；桌面窗口、渲染进程、应用宿主、界面、环境检查和主语音服务合并为 Voice Server（语音服务）。主语音检测、唤醒模型共享语音服务进程；结束判断共享语音分析进程，只注明资源计入位置，避免重复展示占用。
+更改保存到 `.local/data/config/product-settings.json`（设备偏好文件），需要重新启动整个应用后生效。页面资源摘要和组件行使用宿主同一次采样的 `resource_processes`（去重进程资源明细）。流式识别、语音分析、声纹与代理工作进程各自计量；桌面窗口、渲染进程、应用宿主、界面、环境检查和主语音服务合并为 Voice Server（语音服务）。主语音检测、唤醒模型共享语音服务进程；结束判断共享语音分析进程，只注明资源计入位置，避免重复展示占用。
 
 列表分组的原始字节数之和与顶部总量严格一致，显示为 MB（兆字节）／GB（吉字节）后可能有四舍五入差异。常驻内存是进程当前在物理内存中的工作集；提交内存是进程私有提交量，两者不能混作同一种物理占用。未取得有效测量时直接隐藏该指标；合法的零占用保留。模型行的资源包含所属进程及其子进程，不能解读为模型权重独占大小。
 
@@ -28,22 +28,22 @@
 
 ## 安装 GPU 推理后端
 
-默认依赖安装 CPU 版 PyTorch（深度学习框架）、ONNX Runtime（ONNX 推理运行时）和 Sherpa-ONNX（语音模型运行时）。在 Windows、Python 3.12 环境中，使用可选 GPU 安装配置：
+当前后端唯一环境位于 `.local/runtimes/python/`（正式运行组件），由 `.local/portable.json`（便携配置）引用。已验证的本机组合包含 PyTorch CUDA 12.8（张量框架的显卡计算运行库）及 ONNX Runtime CUDA（模型推理运行库的显卡执行后端）；每个模型能否使用显卡仍以设备页的实际检测为准。校验现有依赖使用：
 
-~~~powershell
-.\scripts\setup.ps1 -Python "D:\DevTools\Python312\python.exe" -Gpu
-~~~
+```powershell
+.\scripts\setup.ps1 -SkipInstall -SkipDsh
+```
 
--Gpu 会安装 PyTorch CUDA 12.8、ONNX Runtime CUDA（CUDA 执行提供程序）和 Sherpa-ONNX CUDA 12/cuDNN 9（CUDA 深度学习库）版本。Paraformer、SenseVoiceSmall 和 FSMN-VAD 使用 PyTorch CUDA。设备选择页只有在对应的运行后端已安装并检测到 GPU 后，才会开放该模型的 GPU 选项。
+替换依赖时，先使用 `scripts/build-runtime.py`（后端组件构建工具）在 `.local/tmp/python-candidate/`（组件候选目录）构建并验证完整环境。`--profile cu128`（显卡依赖组合）与 `--profile cpu`（中央处理器依赖组合）选择张量框架版本，`--onnx-profile`（模型格式运行库计算组合）选择对应推理后端，`--verify-cuda`（真实显卡验证）用于有显卡的构建机。构建必须提供 `--vc-redist`（已授权的微软原生运行库来源）；具体依赖锁与构建要求见[流式识别延迟与图形处理器支持](asr-latency-and-cuda.md)。
 
-若要回到默认 CPU 推理依赖，再运行不带 -Gpu 的安装命令：
+候选通过校验后，退出所有业务实例并关闭演示窗口，在项目根目录执行：
 
-~~~powershell
-.\scripts\setup.ps1 -Python "D:\DevTools\Python312\python.exe"
-~~~
+```powershell
+.\scripts\publish-desktop.ps1 -PythonRuntime .\.local\tmp\python-candidate
+```
 
-安装或替换推理后端时请关闭应用。CUDA 依赖版本必须与本机 NVIDIA 驱动和 Python 运行环境兼容；可参考 [ONNX Runtime CUDA 执行提供程序要求](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html) 和 [Sherpa-ONNX Windows CUDA 安装指南](https://k2-fsa.github.io/sherpa/onnx/install/windows/build-cuda.html)。
+`PythonRuntime`（后端组件候选参数）经同一发布事务换入固定位置，失败恢复原组合，成功后回收旧环境。切换中央处理器组合也采用同一流程。CUDA（显卡计算运行库）依赖必须与本机 NVIDIA（显卡厂商）驱动和 Python（后端解释器）版本兼容；运行组件及模型都只保留当前必要组合，完整规则见[本地目录与覆盖发布](local-layout.md)。
 
 SenseVoiceSmall 及其内部 FSMN-VAD（语音活动检测）始终使用同一设备。FunASR（语音识别工具包）通过 device="cuda" 或 device="cpu" 选择运行位置，具体以加载结果和设置页健康状态为准。
 
-正式便携程序使用随包解释器，不能通过修改外部开发环境的依赖获得加速。SmartTurn（语音结束判断）显卡模式还需要同修订的单精度显卡模型，安装分析资源时添加 `--smart-turn-gpu`（同时下载显卡结束判断模型）；安装脚本使用 `-Gpu -Analysis`（显卡后端与分析模型）会自动添加。运行库版本、真实显卡验证、程序与模型组件统一切换及分段计时见[流式识别延迟与图形处理器支持](asr-latency-and-cuda.md)。
+正式程序和源码业务共用上述后端组件与 `.local/models/`（当前模型集合）。SmartTurn（语音结束判断）显卡模式还需要同修订的单精度显卡模型；模型变化先在项目临时区构建完整候选，再通过 `ModelsRoot`（模型组件候选参数）与相应环境一起发布。运行库版本、真实显卡验证、程序与模型组件统一切换及分段计时见[流式识别延迟与图形处理器支持](asr-latency-and-cuda.md)。

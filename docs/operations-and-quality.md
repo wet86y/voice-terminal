@@ -4,15 +4,17 @@
 
 ## 自动化门槛
 
-仓库根目录执行：
+仓库根目录执行。后端测试复用正式 Python（后端解释器），由测试入口加载 `.local/tools/testing/`（轻量测试工具），成功后自动回收夹具；无需另建完整业务测试环境。
 
 ```powershell
-python -m pytest -q
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q
 npm test
 npm run typecheck
 npm run build
 git diff --check
 ```
+
+仅修改文档时执行 `.local/runtimes/python/python.exe -B -X utf8 scripts/check-doc-links.py`（工程内链接与标题锚点检查）和 `git diff --check`（差异格式检查）。当前安装的完整摘要校验执行 `.local/Verify-Package.ps1`（发行文件校验）。目录、数据和事务更新最近一次完整验收见[2026-10-08 本地整理验收](local-layout-acceptance-20261008.md)。
 
 修改以下区域时优先运行对应测试：
 
@@ -39,13 +41,13 @@ git diff --check
 
 历史常驻运行期间曾出现[已登记的全量挂起问题](known-issues.md)。2026-10-07 的双模式源码回归完成，780 项通过、1 项跳过；随后界面与固定服务密钥修订全量回归为 815 项通过、1 项跳过；组件与归档删除修复全量回归为 825 项通过、1 项跳过，隔离解释器入口最终 40 项定向检查通过，均未重现挂起；历史原因仍待定位。再次挂起时记录受阻的全量命令及定向回归范围，不将定向通过表述为全量通过。
 
-需要只验证源码、暂缓更新正式程序时，执行 `python -X utf8 -m pytest -q`（后端全量测试）、`npm test`（前端测试）、`npm run frontend:build`（类型检查及前端构建）和 `scripts/build-desktop.ps1 -Debug -SkipFrontend`（沿用前端产物的桌面调试构建），随后检查差异格式；正式目录发布作为后续独立步骤。本轮双模式及后续界面修订已完成统一发布，结果见[统一发布与验收记录](desktop-acceptance.md)。均衡模式历史由 Git（版本控制）保存，不保留工作目录副本。
+需要只验证源码、暂缓更新正式程序时，执行上方后端全量命令、`npm test`（前端测试）、`npm run frontend:build`（类型检查及前端构建）和 `scripts/build-desktop.ps1 -Debug -SkipFrontend`（沿用前端产物的桌面调试构建），随后检查差异格式；正式目录发布作为后续独立步骤。双模式及界面修订的历史验收见[统一发布记录](desktop-acceptance.md)，当前覆盖发布规则见[本地目录与覆盖发布](local-layout.md)。均衡模式历史由 Git（版本控制）保存，不保留工作目录副本。
 
 二等信箱恢复的定向回归命令如下。覆盖空信箱、4 秒检查、进度合并与去重、普通调用消费、版本竞争、
 构建失败、讲话与忙碌时保留、最终静默优先、生命周期清理、单请求执行以及恢复重试的场景约束：
 
 ```powershell
-python -X utf8 -m pytest -q tests/test_secondary_mailbox.py tests/test_scheduler_staircase.py tests/test_json_schema_shadow.py tests/test_context_cache_contract.py tests/test_bridge_v2_information.py tests/test_dsh_bridge.py tests/test_shadow_agent.py tests/test_shadow_agent_harness.py tests/test_durable_shadow_mailbox.py tests/test_product_sidecar.py tests/test_speaker_production.py
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q tests/test_secondary_mailbox.py tests/test_scheduler_staircase.py tests/test_json_schema_shadow.py tests/test_context_cache_contract.py tests/test_bridge_v2_information.py tests/test_dsh_bridge.py tests/test_shadow_agent.py tests/test_shadow_agent_harness.py tests/test_durable_shadow_mailbox.py tests/test_product_sidecar.py tests/test_speaker_production.py
 npm --prefix integrations/dsh/voice-terminal test
 ```
 
@@ -58,8 +60,7 @@ npm --prefix integrations/dsh/voice-terminal test
 使用：
 
 ```powershell
-npm run build
-.\scripts\start-desktop.ps1 -Python D:\DevTools\Python312\python.exe
+npm run desktop:start
 ```
 
 桌面入口使用当前静态界面；成品入口与托盘规则见[独立应用启动与系统管理](application-lifecycle.md)。启动完成保持待机，以下输入所有权和语音事务检查须由用户显式开始语音监听后执行。
@@ -93,14 +94,14 @@ npm run build
 在仓库根目录执行定向回归：
 
 ```powershell
-python -m pytest -q tests/test_application_host.py tests/test_dsh_runtime.py tests/test_product_api.py tests/test_speaker_production.py tests/test_dsh_bridge.py tests/test_handoff.py tests/test_asr_worker.py tests/test_analysis_cancellation.py
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q tests/test_application_host.py tests/test_dsh_runtime.py tests/test_product_api.py tests/test_speaker_production.py tests/test_dsh_bridge.py tests/test_handoff.py tests/test_asr_worker.py tests/test_analysis_cancellation.py
 npm test
 npm run typecheck
 npm run build
 git diff --check
 ```
 
-构建并组装便携桌面成品后，直接双击解压根目录的 `VoiceTerminal.exe`（桌面启动程序），脱离 harness（运行支架）进行以下检查；构建命令见[桌面应用说明](desktop-application.md)。使用真实业务运行环境和启用组件，故障注入只针对本次实例拥有的进程。旧 `.runtime/launcher`（浏览器调试启动器目录）不作为完整桌面成品验收入口。
+通过 `npm run desktop:publish`（覆盖发布）换入当前正式程序后，直接双击 `.local/VoiceTerminal.exe`（桌面启动程序），脱离 harness（运行支架）进行以下检查；独立交付包使用解压根目录同名入口。构建命令见[桌面应用说明](desktop-application.md)。使用真实业务运行环境和启用组件，故障注入只针对本次实例拥有的进程。
 
 | 场景 | 验收条件 |
 | --- | --- |
@@ -122,7 +123,7 @@ git diff --check
 自动化回归应覆盖：完整分块后发送空结束包仍输出缓存尾字、待处理音频只消费一次、带余量的结束包正常刷新、纯空轮次不调用模型、重复结束包不重复推理、轮次缓存在结束后释放。产品展示验证同时覆盖实时连接与离线快照：隐藏 `empty_input`（空输入状态）且 `text`（文本）为空或仅含空白字符的用户气泡，保留非空短回答、助手和系统消息、其他状态记录以及原始诊断记录和顺序号。
 
 ```powershell
-python -m pytest -q tests/test_asr_worker.py tests/test_asr_worker_protocol.py
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q tests/test_asr_worker.py tests/test_asr_worker_protocol.py
 npm run test --workspace @voice-terminal/frontend -- src/product/useProductAdapter.test.ts src/conversation-log.test.ts
 ```
 
@@ -188,8 +189,7 @@ Product UI 的会话排序只信任服务端 `conversation.append` / `conversati
 修改 MiniMax Bidi、播放、flush、cancel、replacement 或 reset 时，至少覆盖：
 
 ```powershell
-python -m unittest tests.test_minimax_tts tests.test_tts_features.BidiLifecycleTests -v
-python -m unittest discover -s tests -v
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q tests/test_minimax_tts.py tests/test_tts_features.py
 ```
 
 确认 flush/close、cancel/close 并发时不会出现 `NoneType` 内部异常；关闭后不存在继续运行的 provider receiver、后台任务或旧 playback key。
@@ -209,7 +209,7 @@ python -m unittest discover -s tests -v
 3. `speech_id`、`turn_id`、`owner_scope`、`continuation_mode` 和 speech 结算事件；
 4. 重复播报类问题按这些锚点定位：`SPEECH_PREFIX_RECONCILED`（`baseline_chars` 是否在事务换头时缩短）、`SPEECH_REVISED`（`path=rewrite|append|begin`）、`SPEECH_REVISION_NOOP`、`SPEECH_TAIL_REWRITE_UNAVAILABLE`、`SPEAK_CANCELLED_WITH_REPLACEMENT`、`SPEECH_IDENTICAL_IGNORED`，以及 `LLM_SPEAK_CONTEXT` 的 `heard_chars`；
 5. LLM context audit 中的 `conversation_id + request_id + turn_id + wire_sha256`；
-6. `logs/`、`reports/` 的本地诊断产物。
+6. `.local/cache/logs/`（运行日志）及 `.local/cache/reports/`（本地诊断产物）。
 
 不要把本地日志路径或一次性 probe 结果写进当前规范文档。日志可能包含真实会话内容，不能提交到仓库；API key 和 Authorization header 永远不得出现在日志中。
 
