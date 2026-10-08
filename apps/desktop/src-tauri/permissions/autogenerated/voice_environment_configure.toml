@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-voice-environment-configure"
+description = "Enables the voice_environment_configure command without any pre-configured scope."
+commands.allow = ["voice_environment_configure"]
+
+[[permission]]
+identifier = "deny-voice-environment-configure"
+description = "Denies the voice_environment_configure command without any pre-configured scope."
+commands.deny = ["voice_environment_configure"]

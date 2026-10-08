@@ -16,4 +16,13 @@
 .startup-button:disabled{opacity:.45;cursor:default}
 .startup-screen [hidden]{display:none!important}
 @keyframes startup-travel{0%{transform:translateX(-100%)}100%{transform:translateX(413%)}}
+/* Exit motion（退出动效）：先淡出整个界面，图标缩放入场，文字与滚动条在一秒内淡入。 */
+.startup-screen.is-exiting{pointer-events:none;animation:startup-exit-cover var(--application-motion-duration,1000ms) ease both}
+.startup-screen.is-exiting .startup-icon{animation:startup-exit-logo var(--application-motion-duration,1000ms) cubic-bezier(.22,1,.36,1) both}
+.startup-screen.is-exiting .startup-title,.startup-screen.is-exiting .startup-status,.startup-screen.is-exiting .startup-progress{animation:startup-exit-detail var(--application-motion-duration,1000ms) ease both}
+.startup-screen.is-exiting .startup-actions{visibility:hidden}
+@keyframes startup-exit-cover{0%{background:transparent}40%,100%{background:var(--bg,#0e1118)}}
+@keyframes startup-exit-logo{0%,25%{opacity:0;transform:scale(.55)}80%,100%{opacity:1;transform:scale(1)}}
+@keyframes startup-exit-detail{0%,50%{opacity:0}100%{opacity:1}}
 @media(prefers-reduced-motion:reduce){.startup-progress-fill{transition:none}.startup-progress[data-indeterminate="true"] .startup-progress-fill{animation:none;margin:0 auto}}
+@media(prefers-reduced-motion:reduce){.startup-screen.is-exiting,.startup-screen.is-exiting .startup-icon,.startup-screen.is-exiting .startup-title,.startup-screen.is-exiting .startup-status,.startup-screen.is-exiting .startup-progress{animation:none}}

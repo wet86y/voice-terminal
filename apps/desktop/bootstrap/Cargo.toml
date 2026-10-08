@@ -13,6 +13,11 @@ path = "src/ui_demo.rs"
 
 [dependencies]
 voice-desktop-common = { path = "../common" }
+serde_json = "1"
+
+[features]
+distribution = ["voice-desktop-common/distribution"]
+qualification = ["distribution", "voice-desktop-common/qualification"]
 
 [build-dependencies]
 embed-resource = "3"

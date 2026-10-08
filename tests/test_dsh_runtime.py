@@ -39,6 +39,36 @@ class DshConfigTests(unittest.TestCase):
 
 
 class DshRuntimeTests(unittest.TestCase):
+    def test_official_environment_redirects_windows_home_to_dsh_workspace(self) -> None:
+        """官方 Node（脚本运行时）与 Electron（桌面框架）主目录都留在 DSH_HOME（代理数据目录）。"""
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "workspace" / "data" / "dsh"
+            manager = object.__new__(DshRuntimeManager)
+            manager.config = DshConfig(home_dir=home)
+            env = {
+                "USERPROFILE": r"C:\Users\unrelated",
+                "HOMEDRIVE": "C:",
+                "HOMEPATH": r"\Users\unrelated",
+            }
+
+            manager._prepare_official_environment(env)
+
+            resolved_home = home.resolve()
+            self.assertEqual(Path(env["USERPROFILE"]), resolved_home)
+            self.assertEqual(Path(env["HOME"]), resolved_home)
+            self.assertEqual(Path(env["TEMP"]), resolved_home / "tmp")
+            self.assertEqual(Path(env["APPDATA"]), resolved_home / "appdata")
+            self.assertEqual(Path(env["LOCALAPPDATA"]), resolved_home / "local-appdata")
+            self.assertEqual(Path(env["PNPM_HOME"]), resolved_home / "pnpm" / "bin")
+            self.assertEqual(Path(env["NPM_CONFIG_USERCONFIG"]), resolved_home / "config" / "npmrc")
+            self.assertEqual(Path(env["NPM_CONFIG_STORE_DIR"]), resolved_home / "pnpm" / "store")
+            if os.name == "nt":
+                drive, tail = os.path.splitdrive(str(resolved_home))
+                if not tail.startswith(("\\", "/")):
+                    tail = "\\" + tail.lstrip("\\/")
+                self.assertEqual(env["HOMEDRIVE"], drive)
+                self.assertEqual(env["HOMEPATH"], tail)
+
     def test_launch_token_is_extracted_but_redacted_from_logs(self) -> None:
         line = "Open http://127.0.0.1:3081/?token=top-secret now"
         self.assertEqual(

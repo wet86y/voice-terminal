@@ -19,9 +19,7 @@ def prepare(kind, toolchain):
     marker = local / f'build/{kind}-cache.json'
     before = json.loads(marker.read_text(encoding='utf-8')) if marker.is_file() else None
     if before and before['fingerprint'] != stamp:
-        if kind == 'desktop':
-            remove_tree(local / 'build/desktop', local)
-        else:
+        if kind != 'desktop':
             source = local / 'build/dsh/source'
             # 保留上游检出及用户源码修改，只回收未跟踪的依赖和编译输出。
             tracked = subprocess.check_output(['git', '-C', str(source), 'ls-files', '-z']).decode('utf-8').split('\0')
@@ -37,7 +35,7 @@ def prepare(kind, toolchain):
                     else:
                         pending.append(path)
             remove_tree(local / 'build/dsh/bundles', local)
-        print('已替换旧构建缓存：' + kind, flush=True)
+        print('已登记更新的构建依赖：' + kind, flush=True)
     marker.parent.mkdir(parents=True, exist_ok=True)
     atomic_json(marker, {'fingerprint': stamp, 'fields': {'fingerprint': '当前依赖锁和工具链摘要'}})
 

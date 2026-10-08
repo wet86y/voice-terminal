@@ -247,7 +247,8 @@ onBeforeUnmount(() => {
         <div class="voice-presentation">
           <div class="orb-stage" :class="`orb-${model.state}`" :style="{ '--voice-energy': voiceEnergy }" aria-hidden="true">
             <span class="orb-ring"></span><span class="orb-ring second"></span>
-            <div class="voice-orb">
+            <!-- data-home-logo（主页图标定位标记）：启动动画读取中央主体的实际位置。 -->
+            <div class="voice-orb" data-home-logo>
               <span class="voice-waveform">
                 <i v-for="(level, index) in waveformLevels" :key="index" :style="{ '--voice-level': level }"></i>
               </span>

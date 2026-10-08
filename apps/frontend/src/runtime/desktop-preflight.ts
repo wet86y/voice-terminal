@@ -20,10 +20,18 @@ export interface DesktopStatus {
 /** NativeCommandInvoker（原生命令调用器）：受控调用 Tauri（桌面运行时）命令。 */
 export interface NativeCommandInvoker {
   invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>
+  /** transformCallback（转换回调）：Tauri event（桌面事件）订阅的官方 IPC 回调注册入口。 */
+  transformCallback?<T>(callback?: (response: T) => void, once?: boolean): number
+  /** unregisterCallback（注销回调）：释放已注册的 Tauri IPC 回调。 */
+  unregisterCallback?(id: number): void
 }
 
 type NativeWindow = Window & {
   __TAURI_INTERNALS__?: NativeCommandInvoker
+  /** __TAURI_EVENT_PLUGIN_INTERNALS__（桌面事件插件内部接口）：同步移除本地事件回调。 */
+  __TAURI_EVENT_PLUGIN_INTERNALS__?: {
+    unregisterListener(event: string, eventId: number): void
+  }
 }
 
 /** locateNativeInvoker（查找原生命令调用器）：浏览器运行时不提供替代实现。 */
@@ -92,7 +100,7 @@ export async function runDesktopPreflight(options: DesktopPreflightOptions): Pro
   let skipRequested = root?.dataset.startupSkipped === 'true' // startupSkipped（首屏已选择跳过）：跨模块加载保留本次选择。
 
   function show(title: string, detail: string, retryable: boolean, error = false) {
-    if (!root || typeof document === 'undefined') return
+    if (!root || typeof document === 'undefined' || root.dataset.applicationExiting === 'true') return
     const section = makeElement('section', '', 'startup-screen desktop-preflight')
     section.setAttribute('role', error ? 'alert' : 'status')
     const content = makeElement('div', '', 'startup-content')
@@ -116,14 +124,14 @@ export async function runDesktopPreflight(options: DesktopPreflightOptions): Pro
     }
     const actions = makeElement('div', '', 'startup-actions')
     if (!error && invoke) {
-      const skip = makeElement('button', skipRequested ? '正在打开设置' : '跳过', 'startup-button')
+      const skip = makeElement('button', skipRequested ? '正在打开主页' : '跳过', 'startup-button')
       skip.type = 'button'
       skip.disabled = skipRequested
       skip.addEventListener('click', () => {
         skipRequested = true
         options.onSkip?.()
         skip.disabled = true
-        skip.textContent = '正在打开设置'
+        skip.textContent = '正在打开主页'
         // 只保存画面选择；原生权限检查和应用加载仍继续完成。
         void invoke.invoke<void>('skip_startup').catch(() => undefined)
       })
@@ -167,6 +175,7 @@ export async function runDesktopPreflight(options: DesktopPreflightOptions): Pro
     try {
       if (!invoke) throw new Error('没有检测到桌面原生运行时。')
       const status = await invoke.invoke<unknown>('desktop_status')
+      if (root?.dataset.applicationExiting === 'true') return
       const problem = validateDesktopStatus(status, options.expectedMode)
       if (problem) throw new Error(problem)
       if (skipRequested || (status as DesktopStatus).startup_skipped === true) {

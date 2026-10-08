@@ -80,6 +80,106 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertEqual(asyncio.run(self.service.runtime_fixed_credentials()), {"DEEPSEEK_API_KEY": "original"})
         self.assertEqual(len(self.service.vault.values), 1)
 
+    def test_managed_provider_credentials_are_scoped_to_data_root(self) -> None:
+        request = {
+            "name": "Shared test connection",
+            "base_url": "https://provider.example/v1",
+            "protocol": "manual",
+            "capability": "llm",
+            "api_key": "fake-secret-one",
+            "model_id": "test-model",
+        }
+        vaults = [FakeVault(), FakeVault()]
+        services = []
+        for index, vault in enumerate(vaults):
+            data_root = self.root / f"data-root-{index}"
+            service = ModelRegistryService(
+                config=AppConfig(model_dir=self.model_dir),
+                registry_path=data_root / "config" / "model-registry.json",
+                vault=vault,
+            )
+
+            async def successful_probe(_request: dict) -> dict:
+                return {"ok": True, "discovery": "custom", "models": ["test-model"]}
+
+            service._probe = successful_probe  # type: ignore[method-assign]
+            services.append(service)
+
+        asyncio.run(services[0].create_verified_provider(request))
+        asyncio.run(services[1].create_verified_provider({**request, "api_key": "fake-secret-two"}))
+
+        references = [service._load()["providers"][0]["credential_ref"] for service in services]
+        self.assertNotEqual(references[0], references[1])
+        self.assertEqual(vaults[0].get(references[0]), "fake-secret-one")
+        self.assertEqual(vaults[1].get(references[1]), "fake-secret-two")
+
+    def test_managed_provider_reuses_existing_credential_reference(self) -> None:
+        request = {
+            "name": "Existing test connection",
+            "base_url": "https://existing.example/v1",
+            "protocol": "manual",
+            "capability": "llm",
+            "api_key": "fake-secret-replacement",
+            "model_id": "test-model",
+        }
+
+        async def successful_probe(_request: dict) -> dict:
+            return {"ok": True, "discovery": "custom", "models": ["test-model"]}
+
+        self.service._probe = successful_probe  # type: ignore[method-assign]
+        asyncio.run(self.service.create_verified_provider(request))
+        first_provider = self.service._load()["providers"][0]
+        first_reference = first_provider["credential_ref"]
+        self.assertEqual(self.service.vault.get(first_reference), "fake-secret-replacement")
+
+        asyncio.run(self.service.create_verified_provider({**request, "api_key": "fake-secret-updated"}))
+        second_provider = self.service._load()["providers"][0]
+        self.assertEqual(second_provider["credential_ref"], first_reference)
+        self.assertEqual(self.service.vault.get(first_reference), "fake-secret-updated")
+        self.assertEqual(len(self.service.vault.values), 1)
+
+    def test_moved_registry_reuses_existing_credential_reference(self) -> None:
+        request = {
+            "name": "Migrated test connection",
+            "base_url": "https://migrated.example/v1",
+            "protocol": "manual",
+            "capability": "llm",
+            "api_key": "fake-secret-migrated",
+            "model_id": "test-model",
+        }
+        vault = FakeVault()
+
+        async def successful_probe(_request: dict) -> dict:
+            return {"ok": True, "discovery": "custom", "models": ["test-model"]}
+
+        old_root = self.root / "old-data-root"
+        old_service = ModelRegistryService(
+            config=AppConfig(model_dir=self.model_dir),
+            registry_path=old_root / "config" / "model-registry.json",
+            vault=vault,
+        )
+        old_service._probe = successful_probe  # type: ignore[method-assign]
+        asyncio.run(old_service.create_verified_provider(request))
+        old_provider = old_service._load()["providers"][0]
+        old_reference = old_provider["credential_ref"]
+
+        new_root = self.root / "new-data-root"
+        new_registry_path = new_root / "config" / "model-registry.json"
+        new_registry_path.parent.mkdir(parents=True)
+        new_registry_path.write_bytes(old_service.registry_path.read_bytes())
+        moved_service = ModelRegistryService(
+            config=AppConfig(model_dir=self.model_dir),
+            registry_path=new_registry_path,
+            vault=vault,
+        )
+        moved_service._probe = successful_probe  # type: ignore[method-assign]
+
+        asyncio.run(moved_service.create_verified_provider({**request, "api_key": "fake-secret-after-move"}))
+        moved_provider = moved_service._load()["providers"][0]
+        self.assertEqual(moved_provider["credential_ref"], old_reference)
+        self.assertEqual(vault.get(old_reference), "fake-secret-after-move")
+        self.assertEqual(len(vault.values), 1)
+
     def test_scan_is_scoped_and_hiding_persists_across_scan(self) -> None:
         first = asyncio.run(self.service.scan())
         local = next(item for item in first["models"] if item["capability"] == "local_kws")

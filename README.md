@@ -2,7 +2,7 @@
 
 Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tauri（桌面框架）窗口是主产品唯一的运行、开发和界面验收入口，负责托盘、单实例及服务管理进程；应用宿主负责业务组件的启动、监督和退出。Voice Server（语音服务）负责音频采集、KWS（关键词唤醒）、VAD（语音活动检测）、ASR（自动语音识别）、主 Agent（智能体）、Shadow（影子代理）、TTS（语音合成）和播放。DSH（代理执行宿主）作为内部组件受管，其独立管理控制台继续由系统默认浏览器打开。
 
-当前代码包版本为 `0.7.0`。默认 LLM 路径是 DeepSeek Responses + strict `json_schema`；`voice_decision_v06` 只是冻结的协议兼容标识，不是发布版本号。
+当前代码包版本为 `0.9.0`。默认 LLM（大语言模型）路径是 DeepSeek Responses（响应接口）与 strict `json_schema`（严格结构化输出）；`voice_decision_v06`（语音决策协议兼容标识）保持冻结，不是发布版本号。
 
 > 安全边界：默认服务只绑定 `127.0.0.1`。当前管理 API、WebSocket 和模型探测接口不适合直接暴露到局域网或公网；需要远程部署时，先完成 [当前已知问题](docs/known-issues.md) 中的认证和 SSRF 防护工作。
 
@@ -28,9 +28,9 @@ Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tau
 
 已实施的目录、清退体积、备份恢复和启动验证见[本地整理验收](docs/local-layout-acceptance-20261008.md)。
 
-本机只保留两个使用入口：`.local/VoiceTerminal.exe`（正式程序）和 `.local/VoiceTerminalUIDemo.exe`（前端演示程序）。正式程序沿用原有完整用户数据、设置、凭据和历史记录；演示程序只加载前端，不启动业务后端。构建和已验证范围见[桌面开发与分发说明](docs/desktop-application.md)及[实施验收记录](docs/desktop-acceptance.md)。
+本机项目入口为 `.local/VoiceTerminal.exe`（本机开发程序）和 `.local/VoiceTerminalUIDemo.exe`（前端演示程序）。开发程序使用项目内数据、设置和历史；演示程序只加载前端。对外分发入口独立生成在 `.local/releases/distribution-single-exe/VoiceTerminal.exe`（分发启动程序），通过系统定位记录链接用户选择的工作区。当前渠道与交付说明见[0.9.0 独立启动实现](docs/desktop-independent-implementation.md)；[下载与分发规划](docs/download-distribution-plan.md)保留平台来源和固定资源版本核验记录。
 
-源码开发复用 `.local/portable.json`（便携配置）指定的正式业务环境：Python（后端解释器）位于 `.local/runtimes/python/`，Node.js（脚本解释器）从 `.local/runtimes/dsh/runtime.json`（代理宿主运行清单）解析。开发依赖由 npm（包管理器）安装在根目录 `node_modules/`；原生构建工具保存在 `.local/tools/`（本机工具目录），构建输出统一进入 `.local/build/`（受控构建缓存）。
+源码开发复用项目 `.local/portable.json`（布局配置）指定的开发业务环境：Python（后端解释器）位于 `.local/runtimes/python/`，Node.js（脚本解释器）从 `.local/runtimes/dsh/runtime.json`（代理宿主运行清单）解析。开发依赖由 npm（包管理器）安装在根目录 `node_modules/`；原生构建工具保存在 `.local/tools/`（本机工具目录），构建输出统一进入 `.local/build/`（受控构建缓存）。
 
 ```powershell
 .\scripts\setup.ps1 -SkipInstall -SkipDsh
@@ -38,7 +38,7 @@ npm ci
 npm run desktop:start
 ```
 
-正式程序及源码业务调试默认共用正式安装中 `portable.json`（便携配置）指定的完整数据，本机为 `.local/data`（正式用户数据）。凭据沿用其中的 `.env.local`（本机环境文件）及已有凭据存储；明确指定数据目录时使用该目录的设置。也可通过进程环境提供凭据，不要提交到 Git（源码管理工具）：
+开发渠道固定读取项目 `.local/data`（开发数据），不读取或修改正式定位记录。分发渠道读取 `%LOCALAPPDATA%/VoiceTerminal/workspace.json`（系统应用数据中的工作区定位记录），使用所选工作区的 `data`（用户数据）。设置、历史、声纹、DSH（代理执行宿主）状态及凭据引用分别按数据目录加载；凭据继续使用 Windows Credential Manager（系统凭据管理器）。开发环境也可通过进程环境提供凭据，不要提交到 Git（源码管理工具）：
 
 ```text
 DEEPSEEK_API_KEY=
@@ -48,9 +48,9 @@ MINIMAX_API_KEY=
 默认入口：
 
 - Product UI（产品界面）：通过桌面程序打开；普通浏览器访问本机地址只显示启动说明。
-- Voice Server（语音服务）：`http://127.0.0.1:8765/`
-- WebSocket（实时通信）：`ws://127.0.0.1:8765/ws`
-- 健康检查：`http://127.0.0.1:8765/health`
+- Voice Server（语音服务）：使用宿主 `endpoints.voice`（语音服务实际端点），首选端口 8765 被占用时由系统分配。
+- WebSocket（实时通信）：使用实际语音服务地址的 `/ws`（实时通信路径）。
+- 健康检查：使用实际语音服务地址的 `/health`（健康检查路径）。
 - DSH（代理执行宿主）控制台：从工作台“后台协作”面板底部的“代理控制台”进入；桌面应用在系统默认浏览器打开网页。
 - 无界面后端调试：`.\scripts\start.ps1`
 
@@ -66,18 +66,19 @@ MINIMAX_API_KEY=
 .\scripts\build-desktop.ps1
 ```
 
-覆盖发布、组件候选换入、用户数据备份及交付导出见[本地目录与覆盖发布](docs/local-layout.md)。发布文件与用户数据分离，根入口根据便携配置选择组件；终端启动不执行依赖安装。
+本机开发程序覆盖发布、组件候选换入及数据备份见[本地目录与覆盖发布](docs/local-layout.md)。对外分发交付单个 `VoiceTerminal.exe`（程序入口），本体已内嵌；使用系统 WebView2 Evergreen Runtime（自动更新网页引擎）。没有 Python（后端环境）也可进入组件管理和关于页，语音环境、模型及 DSH（代理执行宿主）分别配置，详见[桌面独立启动与按需语音环境实现](docs/desktop-independent-implementation.md)。
 
 源码界面开发统一使用桌面命令：
 
 ```powershell
 npm run dev       # 真实业务桌面热更新；别名 npm run desktop:dev
 npm run dev:ui    # 桌面样例热更新；别名 npm run desktop:ui
-npm run build    # 正式界面、原生主程序及根启动程序；别名 npm run desktop:build
+npm run build    # 开发渠道界面、原生主程序及根启动程序；别名 npm run desktop:build
 npm run desktop:publish # 退出业务实例并关闭演示后，事务更新固定程序目录及两入口
+npm run desktop:dist # 分发渠道单 EXE（程序入口），内含本体；首次展开无需发布地址
 ```
 
-源码开发命令启动前执行增量原生构建，静态开发命令同时构建当前界面；双击正式或演示入口都会直接打开最终主窗口，再在同一窗口显示加载状态并启动对应服务，不会另开过渡窗口。正式入口启动业务后端，演示入口只启动前端服务。真实开发端口固定 5173，演示固定 5174；冲突时明确失败，不连接未知服务。真实开发默认复用正式安装的完整数据和运行组件，不再自动生成空白数据产品；与正式程序共享业务资源，启动前应退出正式实例。渲染缓存按模式分开。演示只使用独立渲染缓存，不启动 Python（后端运行时）业务服务，不读取业务凭据，可以与正式程序同时运行。浏览器预览和旧网页启动器已撤销。启动诊断见[独立应用启动与系统管理](docs/application-lifecycle.md)。
+源码开发命令启动前执行增量原生构建，静态开发命令同时构建当前界面。开发业务入口启动项目内后端，演示入口只启动前端；首选端口占用时回退到实际可绑定的回环端口，以宿主端点表为准。开发、分发和分发验收分别使用独立定位来源、实例登记及服务控制范围，可以同时运行；开发入口只使用项目 `.local`（本机开发资源）目录，分发入口使用用户选择的工作区。渲染缓存按渠道和模式保存。演示不启动 Python（后端运行时）业务服务、不读取业务凭据。浏览器预览和旧网页启动器已撤销。启动诊断见[独立应用启动与系统管理](docs/application-lifecycle.md)，当前渠道和分发行为以[0.9.0 实现记录](docs/desktop-independent-implementation.md)为准。
 
 ## 产品页面
 
@@ -88,7 +89,7 @@ npm run desktop:publish # 退出业务实例并关闭演示后，事务更新固
 
 调优外观时，双击 `.local/VoiceTerminalUIDemo.exe`（前端演示入口）直接打开演示主窗口，随后在同一窗口内加载界面服务；重复双击唤回已有主窗口。该入口直接运行已构建的宿主，不执行源码构建。修改原生宿主源码后，执行 `npm run dev:ui`（构建并启动演示开发）或 `npm run desktop:publish`（构建并更新两入口）。保存 Vue（页面组件）或 CSS（样式表）后自动更新。右下角工具可切换页面、内容场景、运行状态及浮层。展示选择保留在页面地址中；表单编辑仅保留在内存，点击“重置展示”恢复初值。关闭演示窗口立即回收其开发服务。界面修订在共享组件和样式中完成；验收后退出正式程序并关闭演示窗口，执行 `npm run desktop:publish`（更新正式程序），再启动正式入口验证真实业务。
 
-正式界面与样例共享 `apps/frontend/src/interface/`（应用框架、工作台、设置导航和基础控件）及 `design.css`（设计变量与样式）。正式业务位于 `apps/frontend/src/product/`（产品逻辑），样例位于 `apps/frontend/src/ui-demo/`（样例展示）。两套入口先验证原生桌面状态再动态加载对应界面；正式入口随后读取宿主运行配置。正式构建只包含产品入口，便携组装依据 `desktop-manifest.json`（界面产物清单）验证依赖闭包，拒绝样例和陈旧资源。当前收敛范围与验证状态见[第一阶段记录](docs/desktop-frontend-consolidation.md)。
+正式界面与样例共享 `apps/frontend/src/interface/`（应用框架、工作台、设置导航和基础控件）及 `design.css`（设计变量与样式）。正式业务位于 `apps/frontend/src/product/`（产品逻辑），无后端管理界面位于 `apps/frontend/src/management/`（原生组件管理），样例位于 `apps/frontend/src/ui-demo/`（样例展示）。入口先验证原生桌面状态再动态加载对应界面；正式业务入口随后读取宿主运行配置。正式构建包含产品和原生管理入口，便携组装依据 `desktop-manifest.json`（界面产物清单）验证依赖闭包，拒绝样例和陈旧资源。当前收敛范围与验证状态见[第一阶段记录](docs/desktop-frontend-consolidation.md)及[独立启动实现](docs/desktop-independent-implementation.md)。
 
 Product UI 只有工作台和设置两个一级页面。页面切换应保留组件状态，真实协议和会话排序以服务端事件为准，详见 [WebSocket 协议](docs/websocket-protocol.md)。
 
@@ -96,11 +97,13 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 
 ## 主要配置
 
-- `config/default.yaml`（默认配置模板）：默认运行参数、端口、模型、KWS（关键词唤醒）、音频和 Shadow（影子代理）配置；正式程序使用 `.local/app/config/default.yaml`（随程序发布的模板）。
+下列 `.local/data`（开发数据）路径描述开发渠道；分发渠道的对应位置为所选工作区的 `data`（用户数据）。
+
+- `config/default.yaml`（默认配置模板）：默认运行参数、首选端口、模型、KWS（关键词唤醒）、音频和 Shadow（影子代理）配置；分发程序使用工作区 `app/config/default.yaml`（随本体发布的模板）。
 - `.local/data/config/local.yaml`（本机配置覆盖）：保存当前非密钥运行参数，不提交真实凭据。
 - `.local/data/persona/`（当前人格资料）：`personality.md`（人格风格）和 `user.md`（用户资料）在会话初始化时读取并冻结；旧 `instructions.md`（历史工作指令）仅留档，不再加载。源码 `config/templates/persona/`（人格模板）只用于补齐缺失资料。
 - `config/shadow_agent/`：Shadow（影子代理）指令和工具策略。
-- `config/dsh/`（代理宿主基线）：锁定 DSH（代理执行宿主）`dsh-v0.2.0-rc.2`（候选版），commit（提交号）`639ed015397290b3745d163aafe02ffee4aa3f84`。项目插件源码统一为 `integrations/dsh/voice-terminal/` 下的 `@voice-terminal/dsh-plugin`（统一功能包）0.2.0，包含桥接、项目唤醒任务、浏览器和影子预设组件；Bridge protocol（桥接协议）保留 2.0。生产宿主位于 `.local/runtimes/dsh/`，持久状态只存放在 `.local/data/dsh/`。官方 Automation Bundle（自动化功能包）的用户选择得到保留；原生 `schedule_*`（会话定时任务工具）绑定 DSH 会话，项目 `wake_task_*`（语音链路任务工具）保持独立存储和投递目标。维护要求见[DSH 插件维护手册](docs/dsh-plugin-maintenance.md)，当前安装与数据验收见[本地整理验收](docs/local-layout-acceptance-20261008.md)，运行说明见[项目隔离 DSH 控制台](docs/dsh-console.md)。
+- `config/dsh/`（代理宿主基线）：新分发资源锁定官方 DSH（代理执行宿主）`0.2.0-rc.2`（候选版）安装器；现有开发物理运行包继续匹配 commit（提交号）`639ed015397290b3745d163aafe02ffee4aa3f84`。项目插件源码为 `integrations/dsh/voice-terminal/` 下的 `@voice-terminal/dsh-plugin`（统一功能包）0.2.0，包含桥接、项目唤醒任务、浏览器和影子预设；Bridge protocol（桥接协议）保留 2.0。开发宿主位于 `.local/runtimes/dsh/`，状态存放在 `.local/data/dsh/`；分发宿主与状态分别使用工作区 `runtimes/dsh`（运行资源）及 `data/dsh`（代理数据）。官方 Automation Bundle（自动化功能包）的用户选择得到保留；原生 `schedule_*`（会话定时任务工具）绑定 DSH 会话，项目 `wake_task_*`（语音链路任务工具）保持独立存储和投递目标。维护要求见[DSH 插件维护手册](docs/dsh-plugin-maintenance.md)，分发和当前验收见[0.9.0 独立启动实现](docs/desktop-independent-implementation.md)，上游版本来源见[下载与分发规划](docs/download-distribution-plan.md)。
 - `.local/data/config/product-settings.json`（本机产品设置）：包含 KWS（关键词唤醒）、静默、Shadow（影子代理）、自定义指令和声纹设置等非密钥内容。
 - `.local/data/speaker/`（当前声纹资料）：保存注册资料、模板和特征指纹；详见 [声纹增强](docs/speaker-enhancement.md)。
 

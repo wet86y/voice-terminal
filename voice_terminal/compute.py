@@ -233,6 +233,24 @@ def hardware_status(*, refresh: bool = False) -> dict[str, Any]:
                                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                 _capabilities = json.loads(result.stdout.splitlines()[-1])
     result = copy.deepcopy(_capabilities)
+    if not os.environ.get("VOICE_GPU_PROBE") and not os.environ.get("VOICE_GPU_FALLBACK"):
+        from .gpu_environment import registered
+        install = Path(os.environ.get("VOICE_INSTALL_ROOT", ".local"))
+        data = Path(os.environ.get("VOICE_DATA_DIR", str(install / "data")))
+        registration = registered(install, data)
+        if registration:
+            result["models"] = registration.get("models", {})
+            if isinstance(registration.get("gpu_hardware"),dict):result["gpu"]=registration["gpu_hardware"]
+            result["registered_environment"] = registration["path"]  # registered_environment（已验证的显卡解释器目录）。
+        elif os.environ.get("VOICE_LAUNCH_CHANNEL") == "distribution":
+            try: legacy=json.loads((install/'runtimes/python/runtime.json').read_text('utf-8')).get('profile')=='cu128'
+            except (OSError,ValueError): legacy=False
+            if not legacy or (data/'config/gpu-environment.json').is_file():
+                for capability in result.get('models',{}).values():
+                    capability.update(gpu_available=False,reason='显卡环境未登记或版本已变化，请在组件页面重新检测。')
+    if os.environ.get("VOICE_GPU_FALLBACK"):
+        for capability in result.get("models", {}).values():
+            capability.update(gpu_available=False, reason="显卡环境进程启动失败，当前使用中央处理器。")
     try:
         import psutil
         memory = psutil.virtual_memory()
@@ -262,7 +280,7 @@ def model_hardware_status(hardware: dict[str, Any], config: Any, *, verify: bool
     if kws and kws.get("gpu_available") and not all(any(config.kws_dir.glob(pattern))
             for pattern in ("tokens.txt", "encoder*.onnx", "decoder*.onnx", "joiner*.onnx")):
         kws.update(gpu_available=False, reason="关键词唤醒模型的显卡推理资源未配置完整。")
-    if verify:
+    if verify and not hardware.get("registered_environment"):
         smart_turn = result.get("models", {}).get("smart_turn")
         if smart_turn and smart_turn.get("gpu_available") and not (required["smart_turn"].parent / "preprocessor_config.json").is_file():
             smart_turn.update(gpu_available=False, reason="语音结束判断模型的音频特征配置缺失。")
@@ -355,7 +373,7 @@ def accept_hardware_capabilities(value: dict) -> None:
 
 def actual_device(mode: str, *, gpu_supported: bool) -> str:
     """将 auto（自动）/cpu（中央处理器）/cuda（图形处理器）解析成启动设备。"""
-    if mode == "cpu":
+    if mode == "cpu" or os.environ.get("VOICE_GPU_FALLBACK"):
         return "cpu"
     return "cuda" if gpu_supported else "cpu"
 
@@ -384,7 +402,7 @@ _GPU_MINIMUM_FREE_BYTES = {
 
 def startup_device(mode: str, model_id: str, *, status: dict[str, Any] | None = None) -> str:
     """按当前内存能力解析启动设备；显式 CUDA 仍交给加载器尝试并回退。"""
-    if mode == "cpu":
+    if mode == "cpu" or os.environ.get("VOICE_GPU_FALLBACK"):
         return "cpu"
     hardware = status or hardware_status()
     gpu = hardware.get("models", {}).get(model_id, {})

@@ -1,7 +1,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useVoiceTerminal } from '../composables/useVoiceTerminal'
 import { useApplicationHost } from './application-host'
-import type { ConversationEntry, ConversationEntryKind, ReasoningMode, ShadowProductSnapshot, TurnDelivery } from '../types'
+import type { ConversationEntry, ConversationEntryKind, CurrentTurnSnapshot, ReasoningMode, ShadowProductSnapshot, TurnDelivery } from '../types'
 import { productApi, ProductApiError } from './api'
 import type {
   CustomInstruction,
@@ -24,7 +24,7 @@ import { speechMessageKey, userMessageKey } from './conversation-identity'
 import { DEFAULT_SETTINGS, DEFAULT_REGISTRY, DEFAULT_DSH, MAX_WAKE_KEYWORDS, defaultCurrent, defaultShadow, normalizeSettings, normalizeRegistry, normalizeRuntimeState, updateSettingsFromResponse } from './normalization'
 export { MAX_WAKE_KEYWORDS } from './normalization'
 
-export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models' | 'compute' | 'system'
+export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models' | 'compute' | 'system' | 'workspace'
 export type ProductPage = 'home' | 'settings'
 export type AssignmentSlot = 'voice' | 'shadow' | 'status'
 
@@ -375,6 +375,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   async function refreshWakeTasks() {
     if (!application.businessReady.value) return
+    // 唤醒任务由 DSH（代理执行宿主）提供；缺失资源或正在启动时先等待组件就绪。
+    const dsh = application.snapshot.value?.components.find(component => component.id === 'dsh')
+    if (!dsh || !['ready', 'external'].includes(dsh.state)) return
     try {
       const result = await productApi.wakeTasks()
       wakeTasks.value = Array.isArray(result.tasks) ? result.tasks : []
@@ -767,10 +770,10 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       : normalizeRuntimeState(voice.state.value, connected.value))
   const runtimeSource = computed(() => snapshot.value?.runtime)
   const quietStatus = computed(() => connected.value ? voice.quietHours : runtimeSource.value?.quiet_hours)
-  const current = computed(() => connected.value
+  const current = computed<Partial<CurrentTurnSnapshot>>(() => connected.value
     ? voice.current
-    : snapshot.value?.conversation.current || defaultCurrent())
-  const conversation = computed(() => connected.value ? voice.recentTurns.value : snapshot.value?.conversation.recent || [])
+    : snapshot.value?.conversation?.current || defaultCurrent())
+  const conversation = computed(() => connected.value ? voice.recentTurns.value : snapshot.value?.conversation?.recent || [])
 
   // The rail renders the server-ordered conversation log directly.  Ordering is
   // the server's ``seq``, so a system-owned line (the KWS wake acknowledgement)
@@ -779,7 +782,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   // offline bootstrap exposes the same projection from the product API.
   const railEntries = computed<ConversationEntry[]>(() => connected.value
     ? voice.conversationEntries.value
-    : snapshot.value?.conversation.entries || [])
+    : snapshot.value?.conversation?.entries || [])
 
   const recordedMessageKeys = new Set<string>() // recordedMessageKeys（已入账的消息身份）：历史清空或裁剪后不从当前稿、结束缓存恢复旧气泡。
   watch(() => railEntries.value.map(entry => entry.kind === 'user_turn'
@@ -1349,6 +1352,23 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       if (wasReady) voice.disconnect()
       lastError.value = ''
     }
+  }, { flush: 'sync' })
+
+  // endpoint_revision（端点版本）可覆盖“地址未变但宿主重启”的情况；同时监视两个 URL，
+  // 让 Voice（语音服务）动态改绑端口时立即关闭旧 WebSocket 并连接新地址。
+  watch([
+    () => application.snapshot.value?.endpoint_revision,
+    () => application.snapshot.value?.voice_api_url,
+    () => application.snapshot.value?.voice_ws_url,
+  ], (current, previous) => {
+    if (!previous.some(value => value !== undefined && value !== '')) return
+    if (!application.businessReady.value) {
+      voice.disconnect()
+      return
+    }
+    voice.disconnect()
+    voice.connect()
+    void loadSnapshot()
   }, { flush: 'sync' })
 
   watch(() => application.snapshot.value?.components?.find(row => row.id === 'dsh')?.state, state => {

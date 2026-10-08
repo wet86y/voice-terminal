@@ -1,5 +1,5 @@
 import { computed, onBeforeUnmount, reactive, ref, watch, type Ref } from 'vue'
-import { formatComponentMemory, type LocalComponentRow, type LocalComponentsModel } from '../interface/local-components'
+import { formatComponentMemory, type LocalComponentRow, type LocalComponentsModel, type ManagedResourceRow } from '../interface/local-components'
 import { demoComputeModels, demoSystemComponents, longIdentifier, previewRows, type PreviewScene } from './demo-data'
 
 /** useLocalComponentsDemo（本地组件样例）：状态、重试与保存均在展示内存中完成。 */
@@ -10,6 +10,14 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
   const retrying = reactive(new Set<string>())
   const timers = new Set<ReturnType<typeof setTimeout>>()
   const sampledAt = ref('2026-10-03 14:20:00')
+  const resourceSamples: ManagedResourceRow[] = [
+    { id: 'paraformer', label: 'Paraformer（流式语音识别）', state: 'installed', status: '已安装' },
+    { id: 'sensevoice', label: 'SenseVoiceSmall（语音识别与分析）', state: 'incomplete', status: '安装不完整', error: '缺少配置文件，可重新下载或导入。' },
+    { id: 'kws', label: 'KWS（关键字唤醒）', state: 'installed', status: '已安装' },
+    { id: 'smart_turn', label: 'SmartTurn（语音结束判断）', state: 'missing', status: '未安装' },
+    { id: 'wespeaker', label: 'WeSpeaker（声纹识别）', state: 'installed', status: '已安装' },
+    { id: 'dsh', label: 'DSH（代理执行宿主）', state: 'missing', status: '未安装' },
+  ]
   const runtimes: Record<string, string> = {
     paraformer: 'PyTorch（推理框架）', sensevoice: 'PyTorch（推理框架）', voice_vad: 'PyTorch（推理框架）',
     kws: 'Sherpa-ONNX（唤醒引擎）', smart_turn: 'ONNX（推理引擎）', wespeaker: 'ONNX（推理引擎）',
@@ -80,6 +88,19 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
         { id: 'commit', label: '提交内存', used: sumMetric('privateMemory'), total: empty ? undefined : '48 GB' },
         { id: 'vram', label: '显存', used: sumMetric('vram'), total: empty ? undefined : '8 GB' },
       ],
+      managedResources: empty ? [] : resourceSamples,
+      managedResourceJobs: scene.value === 'loading' ? [{
+        id: 'sample-resource-job', resourceId: 'dsh', label: 'DSH（代理执行宿主）', state: 'running',
+        phase: '正在校验固定版本安装包', completedBytes: 164_000_000, totalBytes: 289_000_000, canCancel: true,
+      }] : scene.value === 'error' ? [{
+        id: 'sample-resource-failure', resourceId: 'sensevoice', label: 'SenseVoiceSmall（语音识别与分析）', state: 'failed',
+        phase: '导入已停止，原有安装保持不变', error: '压缩包校验失败，可重试导入或下载。', canCancel: false,
+      }] : [],
+      resourceManagement: true,
+      resourceLoading: scene.value === 'loading',
+      resourceError: scene.value === 'error' ? '最近的资源校验未通过。' : undefined,
+      resourceEventError: undefined,
+      resourceBatchBusy: false,
       rows: rows.value,
     }
   })

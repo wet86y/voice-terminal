@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resource-import"
+description = "Enables the resource_import command without any pre-configured scope."
+commands.allow = ["resource_import"]
+
+[[permission]]
+identifier = "deny-resource-import"
+description = "Denies the resource_import command without any pre-configured scope."
+commands.deny = ["resource_import"]

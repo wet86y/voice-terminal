@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gpu-environment-register"
+description = "Enables the gpu_environment_register command without any pre-configured scope."
+commands.allow = ["gpu_environment_register"]
+
+[[permission]]
+identifier = "deny-gpu-environment-register"
+description = "Denies the gpu_environment_register command without any pre-configured scope."
+commands.deny = ["gpu_environment_register"]

@@ -128,11 +128,18 @@ def verify_install(root: Path) -> None:
     program = safe_path(root, selected["app"])
     release = json.loads((program / "release.json").read_text(encoding="utf-8-sig"))
     verify(program, release)
-    if {item['kind'] for item in release['components']} != {'python', 'models', 'dsh', 'webview2'}:
-        raise ValueError('发行组合必须包含全部四个必要组件')
+    required = set(release.get('required_components', ['python', 'models', 'dsh', 'webview2']))
+    optional = set(release.get('optional_components', []))
+    kinds = {item['kind'] for item in release['components']}
+    if not required.issubset(kinds) or kinds - (required | optional):
+        raise ValueError('发行组合与必要／可选组件定义不符')
+    if required | optional != {'python', 'models', 'dsh', 'webview2'}:
+        raise ValueError('发行组合必须定义全部四类组件')
     for component in release["components"]:
         directory = safe_path(root, component["path"])
         metadata = directory / "manifest.json"
+        if component['kind'] in optional and not metadata.is_file():
+            continue
         if digest(metadata) != component["manifest_sha256"]:
             raise ValueError(f"组件清单摘要不符：{component['kind']}")
         record = json.loads(metadata.read_text(encoding="utf-8-sig"))

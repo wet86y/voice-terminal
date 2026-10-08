@@ -19,6 +19,7 @@ import { provideProductContext } from './product-context'
 import type { WorkbenchModel } from '../interface/workbench'
 import type { ApplicationSnapshot } from './application-host'
 import { DEFAULT_REGISTRY, DEFAULT_SETTINGS } from './normalization'
+import { APPLICATION_EXIT_EVENT } from '../runtime/application-motion'
 const application = {
   managed: ref(false), snapshot: ref<ApplicationSnapshot | null>(null), businessReady: ref(false), overlay: ref(false),
   error: ref(''), now: ref(0), retryingAll: ref(false), connected: ref(false), inspecting: ref(false),
@@ -86,7 +87,7 @@ afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
-  it('加载页只展示当前组件，跳过后进入本地组件且继续等待完整启动', async () => {
+  it('加载页只展示当前组件，跳过后用一秒动画进入主页且继续等待完整启动', async () => {
     application.overlay.value = true
     application.snapshot.value = { state: 'starting', startup_complete: false, core_available: false,
       total_components: 9, completed_components: 3,
@@ -100,11 +101,47 @@ describe('正式界面的真实控件交互', () => {
     expect(loading.find('ul').exists()).toBe(false)
     expect(loading.text()).not.toContain('已耗时')
     await loading.get('button').trigger('click')
+    expect(wrapper.get('.application-presentation').attributes('data-motion')).toBe('entering')
+    await vi.advanceTimersByTimeAsync(1000)
     expect(wrapper.find('.application-startup').exists()).toBe(false)
+    expect(wrapper.get('.workbench').attributes('style') ?? '').not.toContain('display: none')
+    expect(wrapper.get('.voice-session-action').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('.settings-page').attributes('style')).toContain('display: none')
+    await wrapper.get('.compact-settings-button').trigger('click')
+    await button(wrapper, '本地组件').trigger('click')
     expect(wrapper.get('.local-components').text()).toContain('本地组件')
     expect(wrapper.get('[data-component="paraformer"]').text()).toContain('加载语音识别模型')
     expect(wrapper.get('[data-component="dsh"]').text()).toContain('等待启动')
     expect(application.snapshot.value.startup_complete).toBe(false)
+  })
+
+  it('首屏已跳过时进入主页，完整启动后不重复播放入场动画', async () => {
+    application.inspecting.value = true
+    application.snapshot.value = { state: 'starting', startup_complete: false, components: [] } as unknown as ApplicationSnapshot
+    const wrapper = render(ProductApp)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(wrapper.get('.workbench').attributes('style') ?? '').not.toContain('display: none')
+    expect(wrapper.get('.voice-session-action').attributes('disabled')).toBeDefined()
+    application.snapshot.value = { ...application.snapshot.value, state: 'ready', startup_complete: true }
+    await flushPromises()
+    expect(wrapper.get('.application-presentation').attributes('data-motion')).toBe('shown')
+  })
+
+  it('原生退出通知立即显示退出滚动条，旧错误不遮挡退出画面', async () => {
+    application.error.value = '上一轮连接错误'
+    const wrapper = render(ProductApp)
+    await vi.advanceTimersByTimeAsync(1000)
+    window.dispatchEvent(new Event(APPLICATION_EXIT_EVENT))
+    await flushPromises()
+    const screen = wrapper.get('.application-startup')
+    expect(screen.classes()).toContain('is-exiting')
+    expect(screen.text()).toContain('正在退出应用')
+    expect(screen.text()).not.toContain('上一轮连接错误')
+    expect(screen.get('.startup-progress').attributes('data-indeterminate')).toBe('true')
+    expect(screen.get('.startup-progress').attributes('aria-label')).toBe('应用退出进度')
+    expect(screen.get('.startup-progress').attributes('aria-valuenow')).toBeUndefined()
+    expect(screen.findAll('button')).toHaveLength(0)
+    application.error.value = ''
   })
 
   it('语音接口已连接但代理仍启动时，设置可访问，语音开始、重置和模式切换仍受保护', async () => {
@@ -179,11 +216,13 @@ describe('正式界面的真实控件交互', () => {
     value.wakeTasks.value = [task] as never
     const cancel = vi.spyOn(productApi, 'cancelWakeTask').mockResolvedValue({ ...task, status: 'cancelled' } as never)
     const remove = vi.spyOn(productApi, 'deleteWakeTask')
-    vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [{ ...task, status: 'cancelled' }] } as never)
+    const list = vi.spyOn(productApi, 'wakeTasks').mockResolvedValue({ tasks: [{ ...task, status: 'cancelled' }] } as never)
+    application.snapshot.value = { components: [{ id: 'dsh', name: '代理服务', state: 'ready' }] } as unknown as ApplicationSnapshot
     application.businessReady.value = true
     await value.removeWakeTask(task as never)
     expect(cancel).toHaveBeenCalledWith('cancel-pending')
     expect(remove).not.toHaveBeenCalled()
+    expect(list).toHaveBeenCalledOnce()
     expect(value.wakeTasks.value[0]?.status).toBe('cancelled')
     expect(value.notice.value).toContain('保存在归档中')
   })
@@ -304,6 +343,80 @@ describe('正式界面的真实控件交互', () => {
     expect(row.classes()).toContain('ready')
     expect(row.find('.retry-action').exists()).toBe(false)
     expect(row.find('.local-error').exists()).toBe(false)
+  })
+  it('Voice（语音服务）进程仍运行但核心能力未就绪时，VAD（语音活动检测）/KWS（关键词唤醒）按自身状态呈现', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    const modelStatuses = {
+      voice_vad: { service: 'READY', device: 'cpu', runtime: 'PyTorch（推理框架）' },
+      kws: { service: 'READY', device: 'cpu', runtime: 'Sherpa-ONNX（唤醒引擎）' },
+    }
+    value.computeStatus.value = { models: modelStatuses } as never
+    application.snapshot.value = { startup_complete: true, voice_api_ready: true, components: [
+      { id: 'voice', name: '语音服务', state: 'failed', pid: 4321, retry_allowed: true,
+        error: '核心能力未就绪：LLM（大语言模型）、TTS（语音合成）', external: false },
+    ] } as unknown as ApplicationSnapshot
+    await flushPromises()
+
+    for (const id of ['voice_vad', 'kws']) {
+      const row = wrapper.get(`[data-component="${id}"]`)
+      expect(row.classes()).toContain('ready')
+      expect(row.get('.local-state').text()).toBe('运行中')
+      expect(row.find('.retry-action').exists()).toBe(false)
+    }
+
+    value.computeStatus.value = { models: {
+      ...modelStatuses,
+      kws: { service: 'DISABLED', device: null },
+    } } as never
+    await flushPromises()
+    const kws = wrapper.get('[data-component="kws"]')
+    expect(kws.classes()).toContain('disabled')
+    expect(kws.get('.local-state').text()).toBe('已停用')
+    expect(kws.find('.retry-action').exists()).toBe(false)
+  })
+  it('Voice（语音服务）模型自身错误仍可重试，宿主确认所属进程退出时拒绝沿用 READY（就绪）快照', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    value.computeStatus.value = { models: {
+      voice_vad: { service: 'READY', device: 'cpu' },
+      kws: { service: 'ERROR', load_error: 'KWS（关键词唤醒）模型加载失败' },
+    } } as never
+    application.snapshot.value = { startup_complete: true, voice_api_ready: true, components: [
+      { id: 'voice', name: '语音服务', state: 'failed', pid: 4321, retry_allowed: true,
+        error: '核心能力未就绪：LLM（大语言模型）、TTS（语音合成）', external: false },
+    ] } as unknown as ApplicationSnapshot
+    await flushPromises()
+
+    const kws = wrapper.get('[data-component="kws"]')
+    expect(kws.classes()).toContain('failed')
+    expect(kws.get('.local-state').text()).toBe('运行异常')
+    expect(kws.get('.local-error').text()).toBe('KWS（关键词唤醒）模型加载失败')
+    await kws.get('.retry-action').trigger('click')
+    expect(application.retry).toHaveBeenCalledWith('voice')
+
+    application.snapshot.value!.components[0]!.state = 'stopped'
+    application.snapshot.value!.components[0]!.pid = null
+    await flushPromises()
+    for (const id of ['voice_vad', 'kws']) {
+      const row = wrapper.get(`[data-component="${id}"]`)
+      expect(row.classes()).toContain('failed')
+      expect(row.get('.local-state').text()).toBe('不可用')
+      expect(row.get('.local-error').text()).not.toBe('')
+      expect(row.text()).not.toContain('运行中')
+    }
+  })
+  it('外部 Voice（语音服务）组件即使没有 pid（进程编号）也不因缺少 pid 被误判为退出', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    value.computeStatus.value = { models: { kws: { service: 'READY', device: 'cpu' } } } as never
+    application.snapshot.value = { startup_complete: true, components: [
+      { id: 'voice', name: '语音服务', state: 'external', pid: null, external: true },
+    ] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    const kws = wrapper.get('[data-component="kws"]')
+    expect(kws.classes()).toContain('ready')
+    expect(kws.get('.local-state').text()).toBe('运行中')
   })
   it('模型运行故障单独显示原因，加载回退诊断不覆盖运行异常', async () => {
     let value!: ReturnType<typeof useProductControls>

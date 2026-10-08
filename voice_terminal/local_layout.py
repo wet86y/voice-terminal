@@ -51,6 +51,8 @@ def read_portable(root: Path) -> dict:
     if value.get("schema") != SCHEMA:
         raise ValueError("需要 schema=2（第二版）便携配置；旧布局请先执行迁移")
     for key, relative in {"data_dir": "data", **COMPONENTS}.items():
+        if key == "webview2" and value.get(key) is None:
+            continue  # webview2（网页引擎）为空表示使用系统 Evergreen（自动更新版）。
         if value.get(key) != relative:
             raise ValueError(f"固定组件路径不符：{key}（路径字段）")
         path = root / relative

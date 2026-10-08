@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resource-open-source"
+description = "Enables the resource_open_source command without any pre-configured scope."
+commands.allow = ["resource_open_source"]
+
+[[permission]]
+identifier = "deny-resource-open-source"
+description = "Denies the resource_open_source command without any pre-configured scope."
+commands.deny = ["resource_open_source"]

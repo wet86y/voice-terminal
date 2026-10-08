@@ -1,0 +1,18 @@
+/* Application motion（界面启动与退出动效）：全部阶段共用一秒的时间轴。 */
+.application-presentation{height:100%;min-height:0}
+.application-logo-flight{position:fixed;z-index:1002;display:block;pointer-events:none;transform-origin:0 0;will-change:transform,opacity}
+.application-presentation[data-motion="entering"] .app-shell>:not(.application-startup){animation:application-reveal var(--application-motion-duration) cubic-bezier(.22,1,.36,1) both}
+.application-presentation[data-motion="entering"] .orb-stage{animation:application-logo-handoff var(--application-motion-duration) linear both}
+.application-presentation[data-motion="entering"] .application-startup{pointer-events:none;animation:application-startup-clear var(--application-motion-duration) linear both}
+.application-presentation[data-motion="entering"] .application-startup .startup-icon{visibility:hidden}
+.application-presentation[data-motion="entering"] .application-startup .startup-content>:not(.startup-icon){animation:application-startup-detail-clear var(--application-motion-duration) linear both}
+.application-presentation[data-motion="exiting"] .app-shell>:not(.application-startup){animation:application-dismiss var(--application-motion-duration) ease both}
+@keyframes application-reveal{0%,18%{opacity:0}100%{opacity:1}}
+@keyframes application-logo-handoff{0%,80%{opacity:0}100%{opacity:1}}
+@keyframes application-startup-clear{0%{background:var(--bg,#0e1118)}65%,100%{background:transparent}}
+@keyframes application-startup-detail-clear{0%{opacity:1}24%,100%{opacity:0}}
+@keyframes application-dismiss{0%{opacity:1}40%,100%{opacity:0}}
+@media(prefers-reduced-motion:reduce){
+  .application-presentation[data-motion] .app-shell>:not(.application-startup),
+  .application-presentation[data-motion="entering"] .orb-stage{animation:none}
+}

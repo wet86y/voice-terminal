@@ -36,14 +36,17 @@ export function useProductControls() {
       adapter.page.value = "settings";
       adapter.settingsTab.value = "compute";
     }
+    if (['workspace', 'about'].includes(query.get('settings') ?? query.get('page') ?? '')) {
+      adapter.page.value = 'settings'
+      adapter.settingsTab.value = 'workspace'
+    }
   });
   onBeforeUnmount(applicationHost.stop);
   function showApplicationSystem() {
     adapter.page.value = "settings";
     adapter.settingsTab.value = "compute";
   }
-  // inspecting（已跳过加载画面）：最早原生页面的选择也直接进入本地组件。
-  if (applicationHost.inspecting.value) showApplicationSystem();
+  // inspecting（已跳过加载画面）只开放主页；未就绪的业务操作仍由宿主状态禁用。
   const {
     voice,
     page: activePage,

@@ -1,19 +1,48 @@
 <script setup lang="ts">
+import VoiceEnvironmentPanel from "./VoiceEnvironmentPanel.vue";
+import ResourceInstallDialog from './ResourceInstallDialog.vue';
 import { computed, ref } from 'vue'
 import LocalComponents from '../../interface/LocalComponents.vue'
-import { formatComponentMemory, type LocalComponentRow, type LocalComponentsModel } from '../../interface/local-components'
+import { formatComponentMemory, type LocalComponentRow, type LocalComponentsModel, type ManagedResourceRow } from '../../interface/local-components'
 import { useApplicationHost, type ApplicationComponent } from '../application-host'
 import { useProductContext } from '../product-context'
 import type { ComputeDeviceMode, ProductLocalModelId } from '../types'
 import { componentResources, modelComponentOwners as owners } from '../component-resources'
+import type { useWorkspaceResources } from '../useWorkspaceResources'
 
+const props = defineProps<{ resourceController?: ReturnType<typeof useWorkspaceResources> }>()
 const { settings, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
 const application = useApplicationHost()
 const refreshing = ref(false)
 const retrying = ref(new Set<string>())
+// modelResourceIds（模型资源编号映射）：与 catalog.resource_id（资源清单编号）一致。
+const modelResourceIds: Record<ProductLocalModelId, string> = {
+  kws: 'kws-sherpa-onnx',
+  paraformer: 'paraformer-streaming',
+  voice_vad: 'fsmn-vad',
+  wespeaker: 'wespeaker-cnceleb-resnet34',
+  smart_turn: 'smart-turn',
+  sensevoice: 'sensevoice-small',
+}
 function componentFor(id: string) { return application.snapshot.value?.components?.find(row => row.id === id) }
 const resources = computed(() => componentResources(application.snapshot.value))
 const systemComponents = computed(() => (application.snapshot.value?.components ?? []).filter(row => !['asr', 'analysis', 'speaker', 'dsh'].includes(row.id)))
+function managedResource(resourceId: string): ManagedResourceRow | undefined {
+  const resource = props.resourceController?.resources.value.find(row => row.resource_id === resourceId)
+  if (!resource) return undefined
+  const jobs = props.resourceController?.resourceJobs.value.filter(job => job.resource_id === resourceId) ?? []
+  const active = jobs.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))
+  const failed = jobs.some(job => job.state === 'failed')
+  return {
+    id: resource.resource_id,
+    label: resource.label,
+    state: resource.installation_state,
+    status: resource.installation_state === 'installed' ? '已安装' : resource.installation_state === 'incomplete' ? '不完整' : '缺失',
+    error: resource.error || jobs.find(job => job.state === 'failed')?.error || undefined,
+    retryable: failed,
+    busy: Boolean(active || props.resourceController?.startingResources.value.has(resourceId)),
+  }
+}
 function facts(component?: ApplicationComponent) {
   return [
     ...(component?.pid == null ? [] : [{ label: '进程标识', value: String(component.pid) }]),
@@ -25,24 +54,29 @@ const rows = computed<LocalComponentRow[]>(() => {
     const status = computeStatus.value?.models?.[item.id]
     const owner = componentFor(owners[item.id])
     const resource = status?.resource_status
+    const managed = managedResource(modelResourceIds[item.id])
     const countedHere = ['paraformer', 'sensevoice', 'wespeaker'].includes(item.id)
     const metrics = resources.value.get(owners[item.id])
     const legacyResource = application.snapshot.value?.resource_processes === undefined ? resource : undefined
     const busy = Boolean(owner?.retrying || retrying.value.has(owners[item.id]))
+    // ownerUnavailable（所属进程不可用）：停止、阻塞或无进程编号的失败会使旧模型快照失效；
+    // 仍有 pid（进程编号）的 failed（失败）表示宿主仍报告进程存在，Voice（语音服务）核心门禁也会这样标记，模型状态应独立展示。
+    // external（外部进程）由外部管理，不用缺少 pid 推断其退出。
+    const ownerUnavailable = !busy && Boolean(owner) && owner?.external !== true && owner?.state !== 'external' &&
+      (['blocked', 'stopped'].includes(owner?.state ?? '') || (owner?.state === 'failed' && owner.pid == null))
     // busy（正在重试）先覆盖旧故障；宿主加载状态优先于启动期间的临时健康检查结果。
-    const ownerFailed = !busy && ['failed', 'blocked', 'stopped'].includes(owner?.state ?? '')
     const ownerLoading = ['waiting', 'starting', 'stopping'].includes(owner?.state ?? '')
-    const disabled = !busy && !ownerFailed && (owner?.state === 'disabled' || (!ownerLoading && application.snapshot.value?.startup_complete !== false && status?.service === 'DISABLED'))
+    const disabled = !busy && !ownerUnavailable && (owner?.state === 'disabled' || (!ownerLoading && application.snapshot.value?.startup_complete !== false && status?.service === 'DISABLED'))
     const awaitingStartup = application.snapshot.value?.startup_complete === false && !['READY', 'DEGRADED'].includes(status?.service ?? '')
-    const loading = busy || (!ownerFailed && !disabled && (ownerLoading || awaitingStartup || (!owner && !status) || status?.service === 'STARTING'))
+    const loading = busy || (!ownerUnavailable && !disabled && (ownerLoading || awaitingStartup || (!owner && !status) || status?.service === 'STARTING'))
     // 模型详情接口尚未开放时，以宿主已通过的工作进程健康检查呈现就绪状态。
-    const available = !loading && !ownerFailed && !disabled && (status ? ['READY', 'DEGRADED'].includes(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
-    const ownerError = ownerFailed ? owner?.error || status?.runtime_error || (owner?.state === 'blocked' ? '组件依赖不可用，请检查所属进程。' : owner?.state === 'stopped' ? '组件进程已退出。' : '组件运行异常，请查看日志并重试。') : undefined
+    const available = !loading && !ownerUnavailable && !disabled && (status ? ['READY', 'DEGRADED'].includes(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
+    const ownerError = ownerUnavailable ? owner?.error || status?.runtime_error || (owner?.state === 'blocked' ? '组件依赖不可用，请检查所属进程。' : owner?.state === 'stopped' ? '组件进程已退出。' : '组件运行异常，请查看日志并重试。') : undefined
     const gpuAvailable = available && !refreshing.value && status?.gpu_available === true
     return {
       id: item.id, name: item.title,
       state: available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
-      status: loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : ownerFailed ? '不可用' : disabled ? '已停用' : !status && available ? '运行中' : serviceLabel(status?.service),
+      status: loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : ownerUnavailable ? '不可用' : disabled ? '已停用' : !status && available ? '运行中' : serviceLabel(status?.service),
       available, retryable: !available && !loading && !disabled && Boolean(owner?.retry_allowed), busy: loading,
       runtime: status?.runtime || '未提供',
       residentMemory: countedHere ? formatComponentMemory(metrics?.memory_rss_bytes ?? legacyResource?.rss_bytes) : undefined,
@@ -54,6 +88,7 @@ const rows = computed<LocalComponentRow[]>(() => {
         ...(resource?.pid == null ? [] : [{ label: '进程标识', value: String(resource.pid) }]),
         ...(resource?.pid === owner?.pid && owner?.cpu_percent != null ? [{ label: '处理器占用', value: owner.cpu_percent.toFixed(1) + '%' }] : []),
       ],
+      resource: managed,
       device: {
         value: settings.compute.devices[item.id], current: deviceLabel(status?.device),
         locked: !available || !status || refreshing.value,
@@ -82,6 +117,7 @@ const rows = computed<LocalComponentRow[]>(() => {
       vram: metrics?.gpu_dedicated_bytes != null && metrics.gpu_dedicated_bytes > 0 ? formatComponentMemory(metrics.gpu_dedicated_bytes) : undefined,
       description: busy && !component.retrying ? '正在重新启动组件' : component.phase, error: !loading && !available && component.state !== 'disabled' ? component.error : undefined,
       location: '本机', facts: facts(component),
+      resource: managedResource('dsh'),
       note: component.shared_with ? '与应用宿主共享进程，内存总量只计一次。' : component.external ? '此组件使用外部调试进程。' : undefined,
     }
   })
@@ -122,13 +158,32 @@ const model = computed<LocalComponentsModel>(() => {
       { id: 'resident', label: '常驻内存', used: formatComponentMemory(snapshot?.total_memory_rss_bytes), total: formatComponentMemory(hardware?.system_memory.total_bytes) },
       { id: 'commit', label: '提交内存', used: formatComponentMemory(snapshot?.total_memory_private_commit_bytes), total: formatComponentMemory(hardware?.system_memory.commit_limit_bytes) },
       { id: 'vram', label: '显存', used: formatComponentMemory(snapshot?.total_gpu_dedicated_bytes), total: formatComponentMemory(gpu?.total_bytes) },
-    ], rows: rows.value, error: application.error.value, refreshing: refreshing.value,
+    ],
+    managedResourceJobs: props.resourceController?.resourceJobs.value.map(job => ({
+      id: job.job_id,
+      resourceId: job.resource_id,
+      label: job.resource_id === 'batch' ? '批量资源导入' : props.resourceController?.resources.value.find(resource => resource.resource_id === job.resource_id)?.label || job.resource_id,
+      state: job.state,
+      phase: job.phase,
+      completedBytes: job.completed_bytes,
+      totalBytes: job.total_bytes,
+      error: job.error || undefined,
+      canCancel: job.can_cancel !== false,
+    })),
+    resourceActionsAvailable: props.resourceController?.resourcesCanManage.value ?? false,
+    resourceLoading: Boolean(props.resourceController?.loading.value || props.resourceController?.refreshing.value),
+    resourceError: props.resourceController?.resourceError.value || undefined,
+    resourceEventError: props.resourceController?.eventError.value || undefined,
+    resourceTasksBusy: Boolean(props.resourceController?.startingResources.value.size
+      || props.resourceController?.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))),
+    resourceBatchRetry: props.resourceController?.resourceJobs.value.some(job => job.resource_id === 'batch' && job.state === 'failed') ?? false,
+    rows: rows.value, error: application.error.value, refreshing: refreshing.value,
   }
 })
 async function refresh() {
   if (refreshing.value) return
   refreshing.value = true
-  try { await Promise.all([application.refresh(), refreshComputeStatus(true)]) }
+  try { await Promise.allSettled([application.refresh(), refreshComputeStatus(true), props.resourceController?.refresh()]) }
   finally { refreshing.value = false }
 }
 async function retry(id: string) {
@@ -150,7 +205,14 @@ function device(id: string, value: string) {
     settings.compute.devices[id as ProductLocalModelId] = value as ComputeDeviceMode
   }
 }
+function resourceDownload(id: string) { void props.resourceController?.downloadResource(id) }
+function resourceImport(id: string) { void props.resourceController?.importResource(id) }
+function resourceImportAll() { void props.resourceController?.importResource() }
+function openResourceSource(id: string) { void props.resourceController?.openResourceSource(id) }
+function cancelResource(id: string) { void props.resourceController?.cancelJob(id) }
 </script>
 <template>
-  <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" />
+  <VoiceEnvironmentPanel />
+  <ResourceInstallDialog v-if="resourceController" :controller="resourceController" />
+  <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" />
 </template>

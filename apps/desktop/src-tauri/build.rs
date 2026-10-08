@@ -4,12 +4,15 @@ fn main() {
     println!("cargo:rerun-if-changed=icons/icon.png");
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "desktop_initialize", "desktop_manage", "desktop_start_service", "desktop_cancel_init", "voice_environment_status", "voice_environment_plan", "resource_install_plan", "voice_environment_configure", "voice_environment_import", "gpu_environment_register", "gpu_environment_probe", "environment_guide",
             "desktop_status",
             "skip_startup",
             "open_logs",
             "open_console",
             "exit_application",
             "focus_main",
+            "workspace_info", "workspace_choose", "workspace_link", "workspace_migrate",
+            "resource_inventory", "resource_download", "resource_import", "resource_import_confirm", "resource_open_source", "resource_cancel",
         ]),
     ))
     .expect("桌面权限清单构建失败");

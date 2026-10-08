@@ -12,6 +12,8 @@ import time
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .ports import is_address_in_use
+
 from .startup_page import loading_page, render_startup_page
 
 
@@ -62,6 +64,7 @@ async function refresh(){
     const response=await fetch('/api/v1/application/snapshot',{cache:'no-store'});
     if(!response.ok)throw new Error('应用状态连接不可用。');
     const snapshot=await response.json();
+    if(snapshot.startup_skipped===true)inspecting=true;
     const active=snapshot.components.filter(component=>component.state==='starting');
     heading.textContent=inspecting?'本地组件':snapshot.startup_complete?'界面加载失败':'应用启动中';
     phase.textContent=snapshot.startup_complete?'应用界面资源不可用，请退出并重新启动。':active.length?'正在启动 '+active.map(component=>component.name).join('、'):'正在加载应用界面';
@@ -194,6 +197,14 @@ class HostWeb:
                 if path == "/desktop-entry":
                     self.desktop_entry(parsed.query)
                     return
+                if path == "/internal/application/endpoints":
+                    if not self.allowed(internal=True):
+                        self.data({"error": "仅允许本次应用宿主读取组件端点"}, 403)
+                        return
+                    snapshot = owner.application.state.snapshot()
+                    self.data({"endpoints": snapshot["endpoints"],
+                        "endpoint_revision": snapshot["endpoint_revision"]})
+                    return
                 if path in ("/", "/index.html") and not self.has_session():
                     self.send(PUBLIC_HTML.encode(), "text/html; charset=utf-8", referrer_policy="no-referrer")
                     return
@@ -213,9 +224,10 @@ class HostWeb:
                         self.data({"error": "应用会话无效，请通过桌面程序重新打开"}, 403)
                         return
                     snapshot = owner.application.state.snapshot()
-                    # config（前端连接配置）字段：managed（受管标识）、origin（界面来源）、voice_api_url（语音接口）、voice_ws_url（实时语音接口）。
+                    # config（前端连接配置）字段含端点表（endpoints）与端点版本（endpoint_revision）。
                     config = {"managed": True, "origin": getattr(owner.application, "frontend_origin", "") or owner.origin,
-                        "voice_api_url": snapshot["voice_api_url"], "voice_ws_url": snapshot["voice_ws_url"]}
+                        "voice_api_url": snapshot["voice_api_url"], "voice_ws_url": snapshot["voice_ws_url"],
+                        "endpoints": snapshot["endpoints"], "endpoint_revision": snapshot["endpoint_revision"]}
                     self.send(("window.__VOICE_APPLICATION__=" + json.dumps(config) + ";").encode(), "text/javascript; charset=utf-8")
                     return
                 # 业务资产只有在一次性桌面握手建立的会话下才可读取。
@@ -318,8 +330,7 @@ class HostWeb:
                     self.data({"error": "请求内容无效"}, 400)
                     return
                 if internal:
-                    owner.application.report(payload)
-                    self.data({"ok": True})
+                    self.data({"ok": owner.application.report(payload)})
                 elif path == "/api/v1/application/exit":
                     owner.application.request_exit()
                     self.data({"ok": True}, 202)
@@ -354,7 +365,11 @@ class HostWeb:
 
         try:
             self.server = OwnedServer(("127.0.0.1", port), Handler)
-        except OSError:
+        except OSError as exc:
+            if not is_address_in_use(exc):
+                raise
+            # The bind itself arbitrates availability; keep the selected
+            # socket open so no other process can claim the returned port.
             self.server = OwnedServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
         self.origin = f"http://127.0.0.1:{self.server.server_port}"  # origin（宿主内部监听地址）。

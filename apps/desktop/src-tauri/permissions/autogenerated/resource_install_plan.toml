@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resource-install-plan"
+description = "Enables the resource_install_plan command without any pre-configured scope."
+commands.allow = ["resource_install_plan"]
+
+[[permission]]
+identifier = "deny-resource-install-plan"
+description = "Denies the resource_install_plan command without any pre-configured scope."
+commands.deny = ["resource_install_plan"]

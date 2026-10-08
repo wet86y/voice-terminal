@@ -238,7 +238,19 @@ function cancelTask(item: DemoWakeTask) {
     </template>
 
     <template v-else-if="tab === 'compute'">
-      <LocalComponents :model="localComponents.model.value" @refresh="localComponents.refresh" @retry="localComponents.retry" @device="localComponents.device" @save="localComponents.save" />
+      <LocalComponents :model="localComponents.model.value" @refresh="localComponents.refresh" @retry="localComponents.retry" @device="localComponents.device" @save="localComponents.save" @resource-download="feedback('模拟资源下载任务已开始')" @resource-import="feedback('模拟资源导入任务已开始')" @resource-import-all="feedback('模拟批量导入任务已开始')" @open-resource-source="feedback('样例不会打开外部来源页面')" @cancel-resource="feedback('模拟资源任务已取消')" />
+    </template>
+
+    <template v-else-if="tab === 'workspace'">
+      <SettingsPageHeader section="workspace" />
+      <section class="preference-card workspace-preview-card" aria-labelledby="workspace-preview-title">
+        <header class="preference-heading"><span class="preference-index" aria-hidden="true">01</span><div><h3 id="workspace-preview-title">开发运行工作区</h3><p>开发模式只显示项目路径，不提供迁移操作。</p></div></header>
+        <dl class="workspace-preview-path"><div><dt>项目路径</dt><dd>由桌面启动器提供的项目工作区</dd></div></dl>
+      </section>
+      <section class="preference-card workspace-preview-card" aria-labelledby="workspace-update-preview-title">
+        <header class="preference-heading"><span class="preference-index" aria-hidden="true">02</span><div><h3 id="workspace-update-preview-title">应用更新</h3><p>更新检查暂未启用。</p></div></header>
+        <button class="outline-button" type="button" disabled>检查更新</button>
+      </section>
     </template>
   </article>
 </template>

@@ -41,8 +41,8 @@ def _process_created_at() -> float:
         return time.time()
 
 
-def _frontend_listener_ready(process) -> bool:
-    """确认 5173 的 TCP（传输控制协议）监听确属本次受管 Node 进程。"""
+def _frontend_listener_port(process) -> int | None:
+    """Return the unique loopback listener port owned by this Node process."""
     try:
         import psutil
     except ImportError as exc:
@@ -73,45 +73,48 @@ def _frontend_listener_ready(process) -> bool:
         except AttributeError:
             return local[0], local[1]
 
-    def is_listener(connection):
-        return connection.status == psutil.CONN_LISTEN and address(connection)[1] == 5173
-
-    own_listeners = [connection for connection in owned_connections if is_listener(connection)]
-    own_loopback_listener = any(address(connection)[0] == "127.0.0.1" for connection in own_listeners)
-    if own_listeners and not own_loopback_listener:
-        raise RuntimeError("开发界面受管进程未按要求监听 127.0.0.1:5173（回环地址与端口）")
+    own_listeners = [connection for connection in owned_connections
+                     if connection.status == psutil.CONN_LISTEN and address(connection)[1] > 0]
+    if any(address(connection)[0] != "127.0.0.1" for connection in own_listeners):
+        raise RuntimeError("开发界面受管进程未按要求监听本机回环地址。")
+    own_ports = {address(connection)[1] for connection in own_listeners}
+    if not own_ports:
+        return None
+    if len(own_ports) != 1:
+        raise RuntimeError("开发界面受管进程存在多个监听端口，无法验证唯一入口。")
+    actual_port = next(iter(own_ports))
 
     # 检查系统监听表，确保端口没有第二个所有者或地址错误的监听器。
     try:
         all_connections = psutil.net_connections(kind="tcp")
     except psutil.Error as exc:
-        raise RuntimeError(f"无法核验开发界面端口 5173 的监听归属：{exc}") from exc
-    confirmed_owned_listener = own_loopback_listener
+        raise RuntimeError(f"无法核验开发界面端口 {actual_port} 的监听归属：{exc}") from exc
     for connection in all_connections:
-        if not is_listener(connection):
+        if (connection.status != psutil.CONN_LISTEN
+                or address(connection)[1] != actual_port):
             continue
         address_ip, _ = address(connection)
         if connection.pid != expected_pid:
             pid_text = str(connection.pid) if connection.pid is not None else "未知"
-            raise RuntimeError(f"开发界面端口 5173 已被其他进程占用（PID {pid_text}）")
+            raise RuntimeError(f"开发界面端口 {actual_port} 已被其他进程占用（PID {pid_text}）")
         if address_ip != "127.0.0.1":
-            raise RuntimeError("开发界面受管进程未按要求监听 127.0.0.1:5173（回环地址与端口）")
-        confirmed_owned_listener = True
-    return confirmed_owned_listener
+            raise RuntimeError("开发界面受管进程未按要求监听本机回环地址。")
+    return actual_port
 
 
 def _wait_for_frontend(app: ApplicationHost, process, *, timeout: float = 20) -> str:
     """只接受带本实例 Cookie 的 Node 就绪握手，不以端口可连接代替服务就绪。"""
-    expected_origin = "http://127.0.0.1:5173"
     deadline = time.monotonic() + timeout
     last_error = "开发界面尚未报告就绪"
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"开发界面提前退出，退出码 {process.poll()}；请查看 application-dev.log（开发界面日志）。")
-        # 先确认 5173 监听 PID 和创建时间都属于本次进程；未知服务绝不会收到本实例 Cookie。
-        if not _frontend_listener_ready(process):
+        # 先从受管 PID 的唯一监听 socket（套接字）取得端口，避免向未知服务发送 Cookie。
+        port = _frontend_listener_port(process)
+        if port is None:
             time.sleep(.15)
             continue
+        expected_origin = f"http://127.0.0.1:{port}"
         request = urllib.request.Request(expected_origin + "/__desktop_ready", headers={
             "Cookie": f"{app.frontend_cookie_name}={app.frontend_session}",
             "Cache-Control": "no-store",
@@ -147,11 +150,17 @@ async def run(args, root):
         app.enqueue(stop_headless())
     desktop = None
     frontend = root / ".local/build/frontend" if (root / "apps/desktop/Cargo.toml").is_file() else root / "apps/frontend/dist"
-    host = HostWeb(app, frontend, port=8764 if args.dev else 5173)
+    host_preferred_port = 8764 if args.dev else 5173
+    host = HostWeb(app, frontend, port=host_preferred_port)
     app.origin = host.origin  # origin（宿主内部地址）：业务组件报告与内部 Bearer 校验使用此地址。
     app.frontend_origin = host.origin  # frontend_origin（实际界面地址）：启动后更新为 Node 开发界面地址。
-    host.start()
     host_created_at = _process_created_at()
+    app.state.set_endpoint("host", host.origin, preferred_url=f"http://127.0.0.1:{host_preferred_port}",
+        generation=app.state.value["instance_id"], pid=os.getpid(), created_at=host_created_at)
+    app.state.set_endpoint("web", None,
+        preferred_url=f"http://127.0.0.1:{5173 if args.dev else host_preferred_port}",
+        generation=app.state.value["instance_id"], pid=os.getpid(), created_at=host_created_at)
+    host.start()
     for key in ("host", "web"):
         app.state.component(key, state="ready", phase="入口已就绪", pid=os.getpid(), created_at=host_created_at)
     if args.headless:
@@ -173,6 +182,9 @@ async def run(args, root):
             app.frontend_session = host.session
             process = app.spawn("dev", [node, str(helper), "--root", str(root), "--mode", "product"])
             app.frontend_origin = _wait_for_frontend(app, process)
+            app.state.set_endpoint("web", app.frontend_origin,
+                preferred_url="http://127.0.0.1:5173", generation=app.state.value["instance_id"],
+                pid=process.pid, created_at=process.created_at)
             app.state.component("web", state="ready", phase="开发界面已完成本实例握手",
                 pid=process.pid, created_at=process.created_at, shared_with=None, error="")
         except Exception as exc:
@@ -180,7 +192,15 @@ async def run(args, root):
             app.frontend_error = str(exc)
             # 开发界面失败时保持本实例 Host（宿主）的会话受控诊断页。
             app.frontend_origin = host.origin
+            app.state.set_endpoint("web", host.origin,
+                preferred_url=f"http://127.0.0.1:{host_preferred_port}", generation=app.state.value["instance_id"],
+                pid=os.getpid(), created_at=host_created_at)
             app.state.component("web", state="failed", phase="开发界面启动失败", error=str(exc), pid=os.getpid())
+
+    if not args.dev:
+        app.state.set_endpoint("web", host.origin,
+            preferred_url=f"http://127.0.0.1:{host_preferred_port}", generation=app.state.value["instance_id"],
+            pid=os.getpid(), created_at=host_created_at)
 
     registry = app.paths.application_state / "instance.json"
     registry.parent.mkdir(parents=True, exist_ok=True)
@@ -197,8 +217,13 @@ async def run(args, root):
             app.enqueue(app.startup())
             app.enqueue(app.monitor())
         reported_startup = False
+        reported_endpoints = -1  # reported_endpoints（已发送给桌面的端点版本）。
         while not app.exit_event.is_set():
             status = app.state.snapshot()
+            if desktop and status["endpoint_revision"] != reported_endpoints:
+                # 端点均由宿主核验过进程归属；私有管道只传不含令牌的来源。
+                desktop.send("endpoints", endpoints=status["endpoints"], endpoint_revision=status["endpoint_revision"])
+                reported_endpoints = status["endpoint_revision"]
             if status["startup_complete"] and not reported_startup:
                 # startup-result（启动快照）字段带同一进程身份，供磁盘状态核对，不作为实时状态来源。
                 result = {"schema": 1, "instance_id": status["instance_id"], "state": status["state"],

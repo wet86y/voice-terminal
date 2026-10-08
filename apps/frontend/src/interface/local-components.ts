@@ -23,6 +23,8 @@ export interface LocalComponentRow {
   description: string
   error?: string
   note?: string
+  /** resource（固定资源状态）：安装操作独立于组件健康状态。 */
+  resource?: ManagedResourceRow
   /** location（当前运行位置）：没有可调整设备选项时显示。 */
   location?: string
   /** facts（补充指标）：label（名称）与 value（数值）。 */
@@ -41,6 +43,38 @@ export interface LocalComponentRow {
   }
 }
 
+/** ManagedResourceRow（受管独立资源）：文件安装状态与进程健康分开呈现。 */
+export interface ManagedResourceRow {
+  /** id（固定资源编号）、label（显示名称）与状态中文文案。 */
+  id: string
+  label: string
+  state: 'missing' | 'incomplete' | 'installed'
+  status: string
+  /** error（最近下载、导入或完整性检查错误）。 */
+  error?: string
+  /** retryable（最近一次资源任务失败，可重新下载或导入）。 */
+  retryable?: boolean
+  /** busy（该资源正被任务处理）。 */
+  busy?: boolean
+}
+
+/** ManagedResourceJob（资源任务进度）：前端从桌面事件投影出的展示信息。 */
+export interface ManagedResourceJob {
+  /** id（任务标识）、resourceId（当前资源或批量导入）及 label（任务名称）。 */
+  id: string
+  resourceId: string
+  label: string
+  /** state（任务状态）与 phase（当前阶段）。 */
+  state: string
+  phase: string
+  /** completedBytes（已处理字节）与 totalBytes（总字节）。 */
+  completedBytes?: number | null
+  totalBytes?: number | null
+  /** error（失败原因）与 canCancel（当前是否允许取消）。 */
+  error?: string
+  canCancel: boolean
+}
+
 /** LocalComponentsModel（本地组件页面数据）：统一呈现总量、硬件与组件。 */
 export interface LocalComponentsModel {
   /** status（整体状态）、state（状态类别）与 sampledAt（采样时间）。 */
@@ -49,6 +83,20 @@ export interface LocalComponentsModel {
   sampledAt: string
   /** resources（资源摘要）：id（标识）、label（名称）、used（已用）与 total（全部）。 */
   resources: Array<{ id: string; label: string; used?: string; total?: string }>
+  /** managedResourceJobs（资源下载、导入任务进度）。 */
+  managedResourceJobs?: ManagedResourceJob[]
+  /** resourceActionsAvailable（桌面入口是否允许资源下载与导入）。 */
+  resourceActionsAvailable?: boolean
+  /** resourceLoading（是否正在读取独立资源清单）。 */
+  resourceLoading?: boolean
+  /** resourceError（资源任务或原生清单错误）。 */
+  resourceError?: string
+  /** resourceEventError（桌面进度事件订阅错误）。 */
+  resourceEventError?: string
+  /** resourceTasksBusy（是否已有资源任务运行，防止重复导入覆盖）。 */
+  resourceTasksBusy?: boolean
+  /** resourceBatchRetry（最近一次批量导入失败）。 */
+  resourceBatchRetry?: boolean
   /** rows（组件列表）、error（页面异常）与 refreshing（正在刷新）。 */
   rows: LocalComponentRow[]
   error?: string

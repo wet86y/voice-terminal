@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-desktop-manage"
+description = "Enables the desktop_manage command without any pre-configured scope."
+commands.allow = ["desktop_manage"]
+
+[[permission]]
+identifier = "deny-desktop-manage"
+description = "Denies the desktop_manage command without any pre-configured scope."
+commands.deny = ["desktop_manage"]

@@ -1,5 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app_icon;
+mod resource_commands;
+mod initialization;
+#[cfg(feature="qualification")] mod qualification;
+mod environment_commands;
+use initialization::{desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init};
+use environment_commands::{resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide};
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Write},
@@ -7,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -16,9 +22,10 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::PageLoadEvent,
-    Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
-use voice_desktop_common::{windows::Job, LaunchContext};
+use voice_desktop_common::{windows::Job, LaunchChannel, LaunchContext, workspace::{self, Locator}};
+use resource_commands::{ResourceManager,resource_import_confirm,resource_inventory,resource_download,resource_import,resource_open_source,resource_cancel};
 
 struct Service {
     child: Child,
@@ -76,7 +83,9 @@ impl FrontendMode {
 }
 
 struct Desktop {
-    context: Option<LaunchContext>, // context（产品模式的业务启动上下文）；预览模式不读取。
+    context: Mutex<Option<LaunchContext>>, // context（产品模式的业务启动上下文）；预览模式不读取。
+    initialization:Mutex<serde_json::Value>, // initialization（启动画面状态）。
+    initialization_cancel:Arc<AtomicBool>, // initialization_cancel（本体展开取消信号）。
     program: PathBuf,               // program（当前前端项目根目录）。
     data: PathBuf,                  // data（当前模式隔离的 WebView2 缓存目录）。
     webview2: Option<PathBuf>,      // webview2（可选的固定网页运行时）。
@@ -84,9 +93,13 @@ struct Desktop {
     development: bool,              // development（是否由调试构建运行）。
     instance_identifier: String,    // instance_identifier（按模式和源码根目录隔离的单实例标识）。
     service: Mutex<Option<Service>>,
+    service_epoch: AtomicU64, // service_epoch（后台服务代次，防止旧读取线程控制新进程）。
+    locator: Option<Locator>, // locator（分发工作区记录；开发版本不读取）。
+    workspace_busy: AtomicBool, // workspace_busy（防止并行切换或迁移）。
     service_requested: AtomicBool, // service_requested（主窗口已请求启动服务，刷新不重复启动）。
     startup_skipped: AtomicBool,   // startup_skipped（当前窗口跳过加载画面的选择）。
     origin: Mutex<Option<String>>,
+    dsh_origin: Mutex<Option<String>>, // dsh_origin（当前受管 DSH 的实际来源，不含令牌）。
     launch_token: Mutex<Option<String>>, // launch_token（当前入口的一次性启动凭据）。
     error: Mutex<Option<String>>,
     stopping: AtomicBool,
@@ -95,6 +108,21 @@ struct Desktop {
 }
 
 impl Desktop {
+    fn context(&self) -> Option<LaunchContext> { self.context.lock().unwrap().clone() }
+
+    fn stop_service(&self) -> Result<(),String> {
+        self.service_epoch.fetch_add(1,Ordering::SeqCst);
+        let _=self.send(serde_json::json!({"protocol":1,"kind":"shutdown","budget_ms":14000}));
+        let deadline=Instant::now()+Duration::from_secs(15);
+        loop {
+            let exited=self.service.lock().map_err(|e|e.to_string())?.as_mut().map(|v|v.child.try_wait().ok().flatten().is_some()).unwrap_or(true);
+            if exited||Instant::now()>=deadline{break;}
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        if let Some(mut service)=self.service.lock().map_err(|e|e.to_string())?.take(){service.job.terminate();let _=service.child.kill();let _=service.child.wait();}
+        if let Some(context)=self.context(){let _=fs::remove_file(context.data.join("state/workspace-ready.json"));}
+        Ok(())
+    }
     fn allows_frontend_url(&self, url: &tauri::Url) -> bool {
         if self.origin.lock().unwrap().as_deref()
             != Some(url.origin().ascii_serialization().as_str())
@@ -132,29 +160,24 @@ impl Desktop {
         if self.stopping.swap(true, Ordering::SeqCst) {
             return;
         }
+        // exit motion（退出动画）：所有原生退出入口通知同一页面，后台回收同时进行。
+        let motion_started = Instant::now(); // motion_started（一秒过渡的起始时刻）。
+        let has_window = app.get_webview_window("main").or_else(|| app.get_webview_window("startup"))
+            .map(|window| {
+                let _ = window.eval("window.dispatchEvent(new Event('voice-terminal:exiting'))");
+                true
+            }).unwrap_or(false);
         *self.origin.lock().unwrap() = None;
         let state = self.clone();
         let app = app.clone();
         std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(15);
-            let _ =
-                state.send(serde_json::json!({"protocol":1,"kind":"shutdown","budget_ms":14000}));
-            while Instant::now() < deadline {
-                let exited = state
-                    .service
-                    .lock()
-                    .unwrap()
-                    .as_mut()
-                    .map(|s| s.child.try_wait().ok().flatten().is_some())
-                    .unwrap_or(true);
-                if exited {
-                    break;
+            if let Some(resources)=app.try_state::<Arc<ResourceManager>>(){let _=resources.pause_and_wait();}
+            let _=state.stop_service();
+            // 清理较快时补足窗口展示时间；较慢时保留退出滚动条，不能提前切断后台进程回收。
+            if has_window {
+                if let Some(remaining) = Duration::from_millis(1000).checked_sub(motion_started.elapsed()) {
+                    std::thread::sleep(remaining);
                 }
-                std::thread::sleep(Duration::from_millis(80));
-            }
-            if let Some(mut service) = state.service.lock().unwrap().take() {
-                service.job.terminate();
-                let _ = service.child.kill();
             }
             state.stopped.store(true, Ordering::SeqCst);
             app.exit(0);
@@ -163,7 +186,7 @@ impl Desktop {
 }
 
 fn boot_page_url(url: &tauri::Url) -> bool {
-    ["/", "/index.html"].contains(&url.path())
+    ["/", "/index.html", "/startup.html", "/management.html"].contains(&url.path())
         && ((url.scheme() == "tauri" && url.host_str() == Some("localhost"))
             || (url.scheme() == "http"
                 && url.host_str() == Some("tauri.localhost")
@@ -184,7 +207,7 @@ fn request_service_start(
 }
 
 fn trusted(window: &WebviewWindow, state: &Desktop) -> Result<(), String> {
-    if window.label() != "main" {
+    if !["main","startup"].contains(&window.label()) {
         return Err("此窗口没有桌面操作权限。".into());
     }
     let url = window.url().map_err(|e| e.to_string())?;
@@ -218,7 +241,12 @@ fn desktop_status(
         "startup_skipped": state.startup_skipped.load(Ordering::Acquire),
         "error": *state.error.lock().unwrap(),
         "frontend_mode": state.mode.label(),
-        "development": state.development
+        "development": state.development,
+        "workspace_ready":state.context().is_some(),
+        "workspace_busy":state.workspace_busy.load(Ordering::Acquire),
+        "initialization_failed":state.initialization.lock().unwrap()["failed"]==true,
+        "initialization":*state.initialization.lock().unwrap(),
+        "runtime":state.context().and_then(|context|voice_desktop_common::runtime::status(&context).ok())
     }))
 }
 #[tauri::command]
@@ -235,7 +263,7 @@ fn skip_startup(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Res
 fn open_logs(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<(), String> {
     require_command(state.mode, DesktopCommand::OpenLogs)?;
     trusted(&window, &state)?;
-    let context = state.context.as_ref().ok_or("桌面样例没有产品日志目录。")?;
+    let context = state.context().ok_or("桌面样例没有产品日志目录。")?;
     voice_desktop_common::windows::open(&context.install.join("cache/logs"))
 }
 #[tauri::command]
@@ -265,6 +293,9 @@ fn open_console(
     require_command(state.mode, DesktopCommand::OpenConsole)?;
     trusted(&window, &state)?;
     let url = console_url(&url)?;
+    if state.dsh_origin.lock().unwrap().as_deref()!=Some(url.origin().ascii_serialization().as_str()){
+        return Err("控制台端口不属于当前工作区的受管 DSH（代理宿主）。".into());
+    }
     // 通过系统默认浏览器打开 DSH（代理执行宿主）网页，使用完整令牌地址登录。
     voice_desktop_common::windows::open_url(url.as_str())
 }
@@ -272,11 +303,11 @@ fn open_console(
 // console_url（控制台地址校验）：限制桌面入口只能打开当前本机代理控制台。
 fn console_url(value: &str) -> Result<tauri::Url, String> {
     let url: tauri::Url = value.parse().map_err(|_| "控制台地址无效")?;
-    // 服务返回的短期令牌地址仅允许固定的本机 DSH（代理执行宿主）入口。
+    // 服务返回的短期令牌地址允许动态分配的本机 DSH（代理执行宿主）端口。
     let query: Vec<_> = url.query_pairs().collect();
     if url.scheme() != "http"
         || url.host_str() != Some("127.0.0.1")
-        || url.port() != Some(3081)
+        || url.port().filter(|v|*v>0).is_none()
         || url.path() != "/"
         || !url.username().is_empty()
         || url.password().is_some()
@@ -289,8 +320,61 @@ fn console_url(value: &str) -> Result<tauri::Url, String> {
     }
     Ok(url)
 }
+#[tauri::command]
+fn workspace_info(window:WebviewWindow,state:tauri::State<Arc<Desktop>>)->Result<serde_json::Value,String>{
+    require_command(state.mode,DesktopCommand::FocusMain)?;trusted(&window,&state)?;
+    let context=state.context().ok_or("缺少产品工作区")?;
+    Ok(serde_json::json!({"channel":context.channel.label(),"root":context.install,"data_dir":context.data,
+        "project_root":if context.channel==LaunchChannel::Development{context.install.parent().map(Path::to_path_buf)}else{None},
+        "version":env!("CARGO_PKG_VERSION"),"can_manage":context.channel==LaunchChannel::Distribution,
+        "fields":{"channel":"启动渠道","root":"工作区或项目资源目录","data_dir":"用户数据目录","project_root":"开发项目根目录；分发渠道为空","version":"程序版本","can_manage":"允许管理工作区"}}))
+}
+fn require_workspace(window:&WebviewWindow,state:&Desktop)->Result<(),String>{
+    trusted(window,state)?;require_command(state.mode,DesktopCommand::FocusMain)?;
+    if LaunchChannel::current()!=LaunchChannel::Distribution{return Err("开发版本固定使用项目内资源，工作区选择与迁移只在分发版本开放。".into());}
+    if state.stopping.load(Ordering::Acquire){return Err("应用正在退出。".into());}Ok(())
+}
+#[tauri::command]
+async fn workspace_choose(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>)->Result<Option<serde_json::Value>,String>{
+    require_workspace(&window,&state)?;
+    let locator=state.locator.clone().ok_or("缺少分发定位")?;
+    tauri::async_runtime::spawn_blocking(move||{
+        let chosen=voice_desktop_common::native_ui::choose_folder("选择工作区（新工作区须为空，可使用中文文件夹）")?;
+        if let Some(root)=&chosen{locator.validate_target(root)?;}Ok(chosen.map(|root|serde_json::json!({"root":root})))
+    }).await.map_err(|e|e.to_string())?
+}
+async fn workspace_operation(window:WebviewWindow,state:Arc<Desktop>,app:tauri::AppHandle,target_root:String,kind:&'static str)->Result<serde_json::Value,String>{
+    require_workspace(&window,&state)?;
+    if state.workspace_busy.swap(true,Ordering::SeqCst){return Err("已有工作区操作正在执行。".into());}
+    let operation_state=state.clone();
+    let result=tauri::async_runtime::spawn_blocking(move||{
+        let context=operation_state.context().ok_or("缺少工作区上下文")?;
+        let locator=operation_state.locator.as_ref().ok_or("缺少分发定位")?;
+        let target=PathBuf::from(target_root);locator.validate_target(&target)?;
+        if let Some(manager)=app.try_state::<Arc<ResourceManager>>(){manager.pause_and_wait()?;}
+        operation_state.stop_service()?;
+        let prepared=workspace::prepare_task(&context.install,&target,kind,std::process::id(),locator);
+        let journal=match prepared{Ok(journal)=>journal,Err(error)=>{let _=start_service(app.clone(),operation_state.clone());return Err(error);}};
+        let record:serde_json::Value=serde_json::from_slice(&fs::read(&journal).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        let job_id=record["job_id"].as_str().ok_or("工作区事务缺少编号")?.to_string();
+        let helper=journal.parent().unwrap().join("workspace-helper.exe");
+        let mut command=Command::new(helper);context.configure_command(&mut command);
+        let spawn=command.arg("--workspace-task").arg(&journal).args(locator.child_args()).creation_flags(0x08000000).current_dir(journal.parent().unwrap()).spawn();
+        if let Err(error)=spawn{let _=start_service(app.clone(),operation_state.clone());return Err(format!("无法启动工作区事务：{error}"));}
+        let _=app.emit("desktop://workspace-progress",serde_json::json!({"job_id":job_id,"state":"running","phase":"原生迁移窗口已打开，正在退出当前工作区","can_cancel":false,"completed_bytes":0,"total_bytes":0}));
+        let exit_state=operation_state.clone();let exit_app=app.clone();
+        std::thread::spawn(move||{std::thread::sleep(Duration::from_millis(350));exit_state.shutdown(&exit_app);});
+        Ok(serde_json::json!({"job_id":job_id}))
+    }).await.map_err(|e|e.to_string()).and_then(|v|v);
+    if result.is_err(){state.workspace_busy.store(false,Ordering::Release);}result
+}
+#[tauri::command(rename_all = "snake_case")]
+async fn workspace_link(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>,app:tauri::AppHandle,target_root:String)->Result<serde_json::Value,String>{workspace_operation(window,state.inner().clone(),app,target_root,"link").await}
+#[tauri::command(rename_all = "snake_case")]
+async fn workspace_migrate(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>,app:tauri::AppHandle,target_root:String)->Result<serde_json::Value,String>{workspace_operation(window,state.inner().clone(),app,target_root,"migrate").await}
+
 fn show(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_webview_window("main").or_else(||app.get_webview_window("startup")) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -358,7 +442,7 @@ fn preview_page_url_allowed(url: &tauri::Url) -> bool {
             .all(|(key, value)| key != "session" || value == "active")
 }
 
-fn frontend_entry_url(origin: &str, token: &str, mode: FrontendMode) -> Result<tauri::Url, String> {
+fn frontend_entry_url(origin: &str, token: &str, _mode: FrontendMode) -> Result<tauri::Url, String> {
     if !valid_launch_token(token) {
         return Err("服务入口启动凭据无效。".into());
     }
@@ -367,13 +451,12 @@ fn frontend_entry_url(origin: &str, token: &str, mode: FrontendMode) -> Result<t
         .map_err(|_| "服务入口地址无效。".to_string())?;
     if url.scheme() != "http"
         || url.host_str() != Some("127.0.0.1")
-        || url.port().is_none()
+        || url.port().filter(|v|*v>0).is_none()
         || url.path() != "/"
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || (mode == FrontendMode::UiPreview && url.port() != Some(5174))
     {
         return Err("服务入口地址不符合本机页面约束。".into());
     }
@@ -442,7 +525,12 @@ fn ui_preview_context(args: &[String]) -> Result<(PathBuf, Option<PathBuf>, Path
 }
 
 fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), String> {
-    let logs = if let Some(context) = &state.context {
+    if state.stopping.load(Ordering::Acquire){return Err("桌面正在退出。".into());}
+    if state.mode==FrontendMode::Product {
+        let Some(context)=state.context() else {return Ok(());};
+        if voice_desktop_common::runtime::status(&context)?["service_ready"]!=true{return Ok(());}
+    }
+    let logs = if let Some(context) = state.context() {
         context.install.join("cache/logs")
     } else {
         state.data.clone()
@@ -476,11 +564,10 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
             command.env("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", engine);
         }
     } else {
-        let context = state
-            .context
-            .as_ref()
+        let context = state.context()
             .ok_or("产品服务缺少桌面启动上下文。")?;
         command = Command::new(&context.python);
+        context.configure_command(&mut command);
         command
             .args(["-X", "utf8", "-X"])
             .arg(format!(
@@ -496,8 +583,7 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
             .arg("--data-dir")
             .arg(&context.data)
             .arg("--desktop-managed")
-            .current_dir(&context.program)
-            .envs(context.environment());
+            .current_dir(&context.program);
         if context.dev {
             command.arg("--dev");
         }
@@ -516,6 +602,11 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
     if state.stopping.load(Ordering::SeqCst) {
         return Ok(());
     }
+    if service_slot.as_mut().is_some_and(|service|service.child.try_wait().ok().flatten().is_some()){service_slot.take();}
+    if service_slot.is_some(){return Ok(());}
+    let epoch=state.service_epoch.fetch_add(1,Ordering::SeqCst)+1;
+    *state.origin.lock().unwrap()=None;*state.error.lock().unwrap()=None;
+    *state.dsh_origin.lock().unwrap()=None;
     let mut child = command.spawn().map_err(|e| {
         format!(
             "{} 启动失败：{e}",
@@ -549,6 +640,7 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
     let read_app = app.clone();
     std::thread::spawn(move || {
         for line in reader.lines() {
+            if read_state.service_epoch.load(Ordering::Acquire)!=epoch{return;}
             let Ok(line) = line else { break };
             if line.len() > 16384 {
                 *read_state.error.lock().unwrap() = Some("服务入口协议消息过长。".into());
@@ -590,7 +682,7 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
                     let capability = if read_state.mode == FrontendMode::UiPreview {
                         serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
                     } else {
-                        serde_json::json!({"identifier":"owned-main", "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main"]})
+                        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","core:event:allow-listen","core:event:allow-unlisten"]})
                     };
                     if let Err(error) = read_app.add_capability(capability.to_string()) {
                         *read_state.error.lock().unwrap() =
@@ -606,11 +698,15 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
                     }
                 }
                 Some("exit_requested") => read_state.shutdown(&read_app),
+                Some("endpoints")=>{
+                    let origin=message["endpoints"]["dsh"]["url"].as_str().and_then(|value|value.parse::<tauri::Url>().ok()).filter(|url|url.scheme()=="http"&&url.host_str()==Some("127.0.0.1")&&url.port().filter(|v|*v>0).is_some()&&url.query().is_none()&&url.username().is_empty()&&url.password().is_none()).map(|url|url.origin().ascii_serialization());
+                    *read_state.dsh_origin.lock().unwrap()=origin;
+                },
                 Some("stopped") => {}
                 _ => {}
             }
         }
-        if !read_state.stopping.load(Ordering::SeqCst) {
+        if read_state.service_epoch.load(Ordering::Acquire)==epoch && !read_state.stopping.load(Ordering::SeqCst) {
             *read_state.origin.lock().unwrap() = None;
             *read_state.launch_token.lock().unwrap() = None;
             read_state.error.lock().unwrap().get_or_insert_with(|| {
@@ -621,7 +717,7 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
                 }
             });
             if let Some(window) = read_app.get_webview_window("main") {
-                let _ = window.navigate("tauri://localhost/index.html".parse().unwrap());
+                let _ = window.navigate("http://tauri.localhost/management.html".parse().unwrap());
                 let _ = window.show();
             }
             if let Some(service) = read_state.service.lock().unwrap().as_mut() {
@@ -632,12 +728,12 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
     let timeout_state = state.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(30));
-        if timeout_state.origin.lock().unwrap().is_none()
+        if timeout_state.service_epoch.load(Ordering::Acquire)==epoch && timeout_state.origin.lock().unwrap().is_none()
             && !timeout_state.stopping.load(Ordering::SeqCst)
         {
             timeout_state.error.lock().unwrap().get_or_insert_with(|| {
                 if timeout_state.mode == FrontendMode::UiPreview {
-                    "等待桌面样例页面超时，请检查 5174 端口及 Node（脚本运行时）服务。".into()
+                    "等待桌面样例页面超时，请检查 Node（脚本运行时）服务日志。".into()
                 } else {
                     "等待服务入口超时。请检查业务环境与端口占用。".into()
                 }
@@ -650,6 +746,67 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
     Ok(())
 }
 
+// create_window（统一窗口）：选定工作区后销毁临时窗口，将网页缓存切换到工作区。
+fn create_window(app:&tauri::AppHandle,build_state:Arc<Desktop>,management:bool)->Result<WebviewWindow,String>{
+    let pending=build_state.mode==FrontendMode::Product&&build_state.context().is_none();
+            let navigation_state = build_state.clone();
+            let page_state = build_state.clone();
+            let main_window =
+                WebviewWindowBuilder::new(app, if pending {"startup"}else{"main"}, WebviewUrl::App(if management {"management.html".into()}else{"startup.html".into()}))
+                    .title(if build_state.mode == FrontendMode::UiPreview {
+                        "Voice Terminal · 前端演示（无业务后端）"
+                    } else {
+                        "Voice Terminal · 语音终端"
+                    })
+                    // inner_size（默认内容尺寸）：小窗口启动，前端按可用空间逐级收起侧栏。
+                    .inner_size(1000., 640.)
+                    .min_inner_size(400., 480.)
+                    .data_directory(build_state.context().map(|context|context.install.join("cache/webview2")).unwrap_or_else(||build_state.data.clone()))
+                    .incognito(build_state.context().is_none())
+                    .on_navigation(move |url| {
+                        (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
+                            || (url.scheme() == "http"
+                                && url.host_str() == Some("tauri.localhost")
+                                && url.port().is_none())
+                            || navigation_state.allows_frontend_url(url)
+                    })
+                    .on_page_load(move |window, payload| {
+                        #[cfg(feature="qualification")]
+                        qualification::page_loaded(&window,&page_state,payload.event(),payload.url());
+                        if payload.event()==PageLoadEvent::Finished&&page_state.mode==FrontendMode::Product&&((payload.url().path()=="/management.html"&&boot_page_url(payload.url()))||(page_state.is_settled_frontend_url(payload.url())&&page_state.allows_frontend_url(payload.url()))){
+                            if let Some(context)=page_state.context(){
+                                let _=workspace::atomic_json(&context.data.join("state/workspace-ready.json"),&serde_json::json!({"schema":1,"pid":std::process::id(),"workspace_id":context.workspace_id,"channel":context.channel.label(),"ready":true,"management_ready":payload.url().path()=="/management.html","fields":{"pid":"桌面进程编号","workspace_id":"工作区编号","ready":"界面已就绪"}}));
+                            }
+                        }
+                        if !request_service_start(
+                            payload.url(),
+                            payload.event(),
+                            &page_state.service_requested,
+                            &page_state.stopping,
+                        ) {
+                            return;
+                        }
+                        // 最终主窗口的本地界面已加载，再从后台线程准备业务或演示服务。
+                        let _ = window.show();
+                        let service_app = window.app_handle().clone();
+                        let service_state = page_state.clone();
+                        std::thread::spawn(move || {
+                            if let Err(error) = initialization::auto_start(service_app, service_state.clone()) {
+                                *service_state.error.lock().unwrap() = Some(error);
+                            }
+                        });
+                    })
+                    .build().map_err(|e|e.to_string())?;
+            app_icon::apply(main_window.hwnd().map_err(|e|e.to_string())?.0).map_err(|e|e.to_string())?;
+    Ok(main_window)
+}
+fn cleanup_initialization_cache(path:&Path){
+    if !path.file_name().is_some_and(|name|name.to_string_lossy().starts_with("voice-initialization-")){return;}
+    for _ in 0..25 {if !path.exists()||voice_desktop_common::workspace::remove_owned(path,path.parent().unwrap()).is_ok(){break;}std::thread::sleep(Duration::from_millis(200));}
+}
+
+#[cfg(feature="qualification")]
+fn locator_for_check(args:&[String])->Result<Locator,String>{Locator::from_args(args)}
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let preview_count = args
@@ -660,18 +817,27 @@ fn run() -> Result<(), String> {
         return Err("--ui-preview 不能重复。".into());
     }
     let preview = preview_count == 1;
-    if !cfg!(debug_assertions)
+    if LaunchChannel::current()==LaunchChannel::Distribution
         && args
             .iter()
-            .any(|arg| ["--ui-preview", "--dev", "--diagnostic"].contains(&arg.as_str()))
+            .any(|arg| ["--ui-preview", "--dev", "--diagnostic", "--root", "--python", "--install", "--data-dir", "--models", "--webview2"].contains(&arg.as_str()))
     {
         return Err(
-            "正式桌面程序不接受 --ui-preview、--dev 或 --diagnostic（调试启动参数）。".into(),
+            "分发桌面程序不接受 --ui-preview、--dev 或 --diagnostic（开发启动参数）。".into(),
         );
     }
     let (context, mode, program, data, webview2) = if preview {
         let (program, webview2, data) = ui_preview_context(&args)?;
         (None, FrontendMode::UiPreview, program, data, webview2)
+    } else if LaunchChannel::current()==LaunchChannel::Distribution {
+        let locator=Locator::from_args(&args)?;
+        let context=LaunchContext::from_args().ok();
+        let program=context.as_ref().map(|v|v.program.clone()).unwrap_or(std::env::current_exe().map_err(|e|e.to_string())?.parent().unwrap().to_path_buf());
+        let data=context.as_ref().map(|v|v.install.join("cache/webview2")).unwrap_or_else(||
+            locator.qualification.as_ref().and_then(|p|p.parent()).map(Path::to_path_buf)
+                .unwrap_or_else(||PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join("Temp"))
+                .join(format!("voice-initialization-{}",std::process::id())));
+        (context,FrontendMode::Product,program,data,None)
     } else {
         let context = LaunchContext::from_args()?;
         context.prepare_webview_access()?;
@@ -701,33 +867,68 @@ fn run() -> Result<(), String> {
     if let Some(engine) = &webview2 {
         std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", engine);
     }
-    let source_root = if preview || args.iter().any(|arg| arg == "--root") {
+    if LaunchChannel::current()==LaunchChannel::Distribution {
+        std::env::remove_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER");
+        #[cfg(feature="qualification")]
+        if qualification::simulate_missing_webview(&locator_for_check(&args)?)?{return Ok(());}
+        if voice_desktop_common::webview::version().is_none(){
+            voice_desktop_common::webview::guide("未检测到可用的系统网页引擎。");return Ok(());
+        }
+    }
+    let source_root = if preview {
         Some(program.as_path())
+    }else if LaunchChannel::current()==LaunchChannel::Development{
+        context.as_ref().map(|value|value.install.as_path())
     } else {
         None
     };
-    let instance_identifier = instance_identifier(mode, source_root);
+    let locator=if LaunchChannel::current()==LaunchChannel::Distribution{Some(Locator::from_args(&args)?)}else{None};
+    let instance_identifier = if let Some(locator)=&locator{
+        // 同一定位来源只运行一个桌面入口，首次目录选择前后标识保持稳定；服务仍按工作区编号控制。
+        let seed=PathBuf::from(format!("{}:{}",locator.path.display(),locator.instance_tag));
+        instance_identifier(mode,Some(&seed)).replace(".source.",".distribution.")
+    }else{instance_identifier(mode, source_root)};
     let state = Arc::new(Desktop {
-        context,
+        context:Mutex::new(context),
+        initialization:Mutex::new(serde_json::json!({"phase":"正在检查工作区","completed_bytes":0,"total_bytes":0})),
+        initialization_cancel:Arc::new(AtomicBool::new(false)),
         program,
         data,
         webview2,
         mode,
-        development: cfg!(debug_assertions),
+        development: LaunchChannel::current()==LaunchChannel::Development,
         instance_identifier,
         service: Mutex::new(None),
+        service_epoch: AtomicU64::new(0),
+        locator,
+        workspace_busy: AtomicBool::new(false),
         service_requested: AtomicBool::new(false),
         startup_skipped: AtomicBool::new(false),
         origin: Mutex::new(None),
+        dsh_origin: Mutex::new(None),
         launch_token: Mutex::new(None),
         error: Mutex::new(None),
         stopping: AtomicBool::new(false),
         stopped: AtomicBool::new(false),
         tray: AtomicBool::new(false),
     });
+    // qualification-exit（验收正常退出）只接受独立验收配置，沿用实例自己的退出流程。
+    let qualification_control = cfg!(feature = "qualification")
+        && state.locator.as_ref().is_some_and(|value| value.qualification.is_some());
+    let qualification_exit = qualification_control
+        && args.iter().any(|value| value == "--qualification-exit");
+    let instance_state = state.clone();
     let build_state = state.clone();
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
+        .plugin(tauri_plugin_single_instance::init(move |app, arguments, _| {
+            if qualification_control
+                && arguments.iter().any(|value| value == "--qualification-exit")
+            {
+                instance_state.shutdown(app);
+            } else {
+                show(app);
+            }
+        }))
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
             desktop_status,
@@ -735,50 +936,21 @@ fn run() -> Result<(), String> {
             open_logs,
             open_console,
             exit_application,
-            focus_main
+            focus_main,
+            desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init,
+            resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
+            workspace_info,workspace_choose,workspace_link,workspace_migrate,
+            resource_inventory,resource_download,resource_import,resource_import_confirm,resource_open_source,resource_cancel
         ])
         .setup(move |app| {
-            let navigation_state = build_state.clone();
-            let page_state = build_state.clone();
-            let main_window =
-                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                    .title(if build_state.mode == FrontendMode::UiPreview {
-                        "Voice Terminal · 前端演示（无业务后端）"
-                    } else {
-                        "Voice Terminal · 语音终端"
-                    })
-                    // inner_size（默认内容尺寸）：小窗口启动，前端按可用空间逐级收起侧栏。
-                    .inner_size(1000., 640.)
-                    .min_inner_size(400., 480.)
-                    .data_directory(build_state.data.clone())
-                    .on_navigation(move |url| {
-                        (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
-                            || (url.scheme() == "http"
-                                && url.host_str() == Some("tauri.localhost")
-                                && url.port().is_none())
-                            || navigation_state.allows_frontend_url(url)
-                    })
-                    .on_page_load(move |window, payload| {
-                        if !request_service_start(
-                            payload.url(),
-                            payload.event(),
-                            &page_state.service_requested,
-                            &page_state.stopping,
-                        ) {
-                            return;
-                        }
-                        // 最终主窗口的本地界面已加载，再从后台线程准备业务或演示服务。
-                        let _ = window.show();
-                        let service_app = window.app_handle().clone();
-                        let service_state = page_state.clone();
-                        std::thread::spawn(move || {
-                            if let Err(error) = start_service(service_app, service_state.clone()) {
-                                *service_state.error.lock().unwrap() = Some(error);
-                            }
-                        });
-                    })
-                    .build()?;
-            app_icon::apply(main_window.hwnd()?.0)?;
+            if qualification_exit {
+                build_state.shutdown(app.handle());
+                return Ok(());
+            }
+            if let Some(context)=build_state.context(){
+                initialization::install_manager(app.handle(),build_state.clone(),&context).map_err(std::io::Error::other)?;
+            }
+            create_window(app.handle(),build_state.clone(),false).map_err(std::io::Error::other)?;
             if build_state.mode == FrontendMode::Product {
                 let show_item = MenuItem::with_id(app, "show", "打开工作台", true, None::<&str>)?;
                 let exit_item = MenuItem::with_id(app, "exit", "退出应用", true, None::<&str>)?;
@@ -841,6 +1013,7 @@ fn run() -> Result<(), String> {
             context
         })
         .map_err(|e| format!("桌面运行时不可用：{e}。请检查 WebView2（网页运行时）配置。"))?;
+    let initialization_cache=state.data.clone();
     app.run(move |app, event| {
         if let tauri::RunEvent::ExitRequested { api, .. } = event {
             if !state.stopped.load(Ordering::SeqCst) {
@@ -849,11 +1022,23 @@ fn run() -> Result<(), String> {
             }
         }
     });
+    cleanup_initialization_cache(&initialization_cache);
     Ok(())
 }
 fn main() {
+    if let Some(result) = voice_desktop_common::windows::run_url_helper_if_requested() {
+        if result.is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(feature="qualification")]
+    if qualification::run_if_requested().is_some(){return;}
+    if let Some(result)=initialization::helper_if_requested(){if let Err(error)=result{voice_desktop_common::windows::error(&error);}return;}
     if let Err(message) = run() {
-        voice_desktop_common::windows::error(&message);
+        if message.contains("WebView2") || message.contains("webview") || message.contains("网页引擎") {
+            voice_desktop_common::webview::guide(&message);
+        } else {voice_desktop_common::windows::error(&message);}
     }
 }
 
@@ -940,7 +1125,7 @@ mod tests {
             "not a URL",
             "https://127.0.0.1:3081/?token=value",
             "http://example.com:3081/?token=value",
-            "http://127.0.0.1:5173/?token=value",
+            "http://127.0.0.1:0/?token=value",
             "http://127.0.0.1:3081/other?token=value",
             "http://user:password@127.0.0.1:3081/?token=value",
             "http://127.0.0.1:3081/?token=value#fragment",
@@ -967,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn frontend_entry_uses_fixed_preview_origin_and_encoded_token() {
+    fn frontend_entry_accepts_dynamic_loopback_port_and_encoded_token() {
         let token = "a".repeat(42) + "_";
         let entry =
             frontend_entry_url("http://127.0.0.1:5174/", &token, FrontendMode::UiPreview).unwrap();
@@ -976,8 +1161,9 @@ mod tests {
         assert_eq!(query.len(), 1);
         assert_eq!(query[0].0, "token");
         assert_eq!(query[0].1, token);
+        assert!(frontend_entry_url("http://127.0.0.1:45001/", &token, FrontendMode::UiPreview).is_ok());
         for origin in [
-            "http://127.0.0.1:5173/",
+            "http://127.0.0.1:0/",
             "http://localhost:5174/",
             "https://127.0.0.1:5174/",
             "http://example.com:5174/",

@@ -8,6 +8,7 @@ import time
 
 from .client import AnalysisClient
 from ..asr.worker import AsrWorkerEngine
+from ..paths import AppPaths
 
 
 def cer(reference: str, hypothesis: str) -> float:
@@ -83,15 +84,34 @@ async def evaluate(args):
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def main():
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse evaluation options（评测选项）and resolve the channel cache only when needed."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=Path(".local/cache/evaluation/report.json"))
-    parser.add_argument("--model-dir", type=Path, default=__import__('voice_terminal.paths', fromlist=['AppPaths']).AppPaths.resolve().install_root / 'models')
+    parser.add_argument(
+        "--output", type=Path, default=None,
+        help="评测报告输出路径；省略时使用当前渠道 cache/evaluation/report.json（缓存目录/评测报告）",
+    )
+    parser.add_argument(
+        "--model-dir", type=Path, default=None,
+        help="模型目录；省略时使用当前安装目录下的 models（模型）",
+    )
     parser.add_argument("--url", default="ws://127.0.0.1:8767/analysis")
     parser.add_argument("--allow-over-max", action="store_true",
                         help="仅离线分段验证时允许处理 60-62 秒输入；运行时仍限制为 60 秒")
-    asyncio.run(evaluate(parser.parse_args()))
+    args = parser.parse_args(argv)
+    paths = None
+    if args.output is None or args.model_dir is None:
+        paths = AppPaths.resolve()
+    if args.output is None:
+        args.output = paths.cache / "evaluation/report.json"
+    if args.model_dir is None:
+        args.model_dir = paths.install_root / "models"
+    return args
+
+
+def main():
+    asyncio.run(evaluate(parse_args()))
 
 
 if __name__ == "__main__":

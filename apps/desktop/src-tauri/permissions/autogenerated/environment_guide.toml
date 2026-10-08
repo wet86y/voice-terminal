@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-environment-guide"
+description = "Enables the environment_guide command without any pre-configured scope."
+commands.allow = ["environment_guide"]
+
+[[permission]]
+identifier = "deny-environment-guide"
+description = "Denies the environment_guide command without any pre-configured scope."
+commands.deny = ["environment_guide"]

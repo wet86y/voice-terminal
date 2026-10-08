@@ -419,15 +419,19 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
                         status_cfg = shadow_cfg.status_observer.provider or shadow_cfg.provider
                         status_key = self._api_key(status_cfg.api_key_env)
                         if not status_key:
-                            raise RuntimeError(f"未配置状态汇报模型凭据 {status_cfg.api_key_env}")
-                        status_provider = DeepSeekResponsesShadowProvider(
-                            base_url=status_cfg.base_url,
-                            model=status_cfg.model,
-                            api_key=status_key,
-                            timeout_ms=status_cfg.timeout_ms,
-                            session_id=(self.conversation.conversation_id
-                                        if self.config.llm.provider == "opencode_go" else None),
-                        )
+                            logger.warning(
+                                "DSH 状态观察器未启动：缺少凭据环境变量 %s；本地代理桥接仍继续初始化",
+                                status_cfg.api_key_env,
+                            )
+                        else:
+                            status_provider = DeepSeekResponsesShadowProvider(
+                                base_url=status_cfg.base_url,
+                                model=status_cfg.model,
+                                api_key=status_key,
+                                timeout_ms=status_cfg.timeout_ms,
+                                session_id=(self.conversation.conversation_id
+                                            if self.config.llm.provider == "opencode_go" else None),
+                            )
                     gate_provider = status_provider
                     if gate_provider is None:
                         gate_cfg = shadow_cfg.status_observer.provider or shadow_cfg.provider

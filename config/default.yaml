@@ -66,7 +66,7 @@ dsh:
   home_dir: .local/data/dsh # home_dir（代理持久状态）：实际位置由唯一安装上下文解析。
   profile: web
   host: 127.0.0.1
-  port: 3081
+  port: 0 # 0 表示由系统分配空闲端口；DSH 会将实际端口报告给统一宿主。
   startup_timeout_ms: 120000
   shutdown_timeout_ms: 5000
   bridge_timeout_ms: 15000
