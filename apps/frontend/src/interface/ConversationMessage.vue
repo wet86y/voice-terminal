@@ -12,7 +12,10 @@ const props = withDefaults(defineProps<{
   pending?: boolean; // pending（等待助手回复的临时消息）。
   animateOnMount?: boolean; // animateOnMount（新增消息首次逐字出现）：已存在的记录直接呈现，更新仍逐字续写。
 }>(), { animateOnMount: true });
-const displayedText = useProgressiveText(() => props.text, props.animateOnMount !== false, () => Boolean(props.pending));
+const displayedText = useProgressiveText(() => props.text, props.animateOnMount !== false, () => Boolean(props.pending), {
+  correctInPlace: () => props.role === 'user', // correctInPlace（识别改字）：更新已有正文，不清空后缀。
+  streaming: () => Boolean(props.partial), // streaming（识别批次渐显）：完成后继续沿用显示进度。
+});
 // visibleStatus（可见消息状态）：只保留识别中、异常等需要用户关注的提示。
 const visibleStatus = computed(() => {
   const status = props.status || "";

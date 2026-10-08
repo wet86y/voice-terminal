@@ -12,6 +12,7 @@ import {
   type ProductUiModel,
 } from "./useProductAdapter";
 import type { WorkbenchModel } from "../interface/workbench";
+import { userMessageKey } from "./conversation-identity";
 
 /** useProductControls（页面控件组合逻辑）：复用业务适配器并集中保留表单和录音生命周期。 */
 export function useProductControls() {
@@ -447,10 +448,23 @@ export function useProductControls() {
   const liveUserText = computed(() =>
     currentTurnLogged.value ? "" : current.value.final_text,
   );
+  // latestUserFinal（尚未由正式用户条目接管的最终稿）。
+  const latestUserFinal = ref<{
+    turnId: string; // turnId（该最终稿所属的用户轮次）。
+    text: string; // text（继续输入后的最新最终正文）。
+  } | null>(null);
+  watch(() => [voice.currentTurnId.value, current.value.final_text] as const, ([turnId, text]) => {
+    latestUserFinal.value = turnId && text ? { turnId, text } : null;
+  }, { flush: "sync" });
+  watch(() => voice.conversationEntries.value.find(entry => entry.kind === "user_turn"
+    && entry.turn_id === voice.currentTurnId.value), entry => {
+    if (entry) latestUserFinal.value = null;
+  }, { flush: "sync" });
   const liveAssistantText = computed(() =>
     current.value.assistant_text &&
     !currentTurnSpeechLogged.value &&
-    !currentTurnSpeechPending.value
+    !currentTurnSpeechPending.value &&
+    !voice.speechOutputs.value.some(item => item.turn_id === voice.currentTurnId.value && item.text?.trim())
       ? current.value.assistant_text
       : "",
   );
@@ -745,7 +759,7 @@ export function useProductControls() {
       "已记录"
     );
   }
-  function speechStatusLabel(row: ConversationRow) {
+  function speechStatusLabel(row: Pick<ConversationRow, "status">) {
     const labels: Record<string, string> = {
       completed: "已完成播报",
       failed: "播报失败",
@@ -764,6 +778,7 @@ export function useProductControls() {
     return row.status ? row.status.toLowerCase() : "recorded";
   }
   function pendingSpeechStatusLabel(row: PendingSpeechRow) {
+    if (row.state === "settling") return speechStatusLabel({ status: row.status || "completed" });
     return row.state === "playing" ? "正在播报" : "等待播放";
   }
   function deliveryStatusLabel(
@@ -1473,7 +1488,10 @@ export function useProductControls() {
       conversationEntries.value.map((entry) => ({
         key: entry.key,
         role: entry.role,
-        text: entry.text || "（没有可显示的转写）",
+        // 同轮继续输入时，最终稿先于正式记录到达也不短暂退回旧正文。
+        text: (entry.role === "user" && latestUserFinal.value
+          && entry.key === userMessageKey(latestUserFinal.value.turnId)
+          ? latestUserFinal.value.text : entry.text) || "（没有可显示的转写）",
         time: formatTime(entry.at),
         status:
           entry.role === "user"
@@ -1496,7 +1514,7 @@ export function useProductControls() {
       });
     if (liveUserText.value)
       conversation.push({
-        key: "current-user",
+        key: userMessageKey(voice.currentTurnId.value || "current"),
         role: "user",
         text: liveUserText.value,
         time: "本轮",
@@ -1504,7 +1522,7 @@ export function useProductControls() {
       });
     if (liveAssistantText.value)
       conversation.push({
-        key: "current-assistant",
+        key: `current-assistant:${voice.currentTurnId.value || "current"}`,
         role: "assistant",
         text: liveAssistantText.value,
         time: "本轮",
@@ -1544,6 +1562,7 @@ export function useProductControls() {
       ttsModel: modelTitle(activeTtsModel.value),
       conversation: workbenchConversation.value,
       partial: current.value.partial_text,
+      partialKey: userMessageKey(voice.currentTurnId.value || "current"),
       thinking:
         runtimeState.value === "thinking" && !current.value.assistant_text,
       conversationHint: waitingForWake.value

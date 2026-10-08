@@ -172,6 +172,8 @@ none → kws standby → asr active → kws standby → none
 - 语音事件回放位于桌面样例工具，仅投影固定事件数据；产品入口不再用查询参数绕过宿主管理。
 - `/ui-demo.html` 是 legacy 视觉原型，不属于真实运行时。
 - 页面只渲染服务端 conversation `seq` 和 `conversation_id + turn_id/speech_id`，不自行推断服务端顺序。
+- 会话气泡使用稳定 `key`（组件复用标识）：用户 `turn_id`（用户轮次标识）与助手 `conversation_id + speech_id`（会话及播报事务标识）在流式、播放、结算和正式记录阶段保持一致。用户 `partial`（识别中的临时文本）进入同一用户气泡，最终正文接管原气泡，避免完成时重复挂载或刷新；`progressive-text.ts`（渐进文本呈现逻辑）在原位平滑追加或修订识别结果。
+- 会话自动滚动只观察消息 `key`（组件复用标识）和 `text`（显示正文）的变化，并用 `requestAnimationFrame`（浏览器动画帧）合并同帧更新；`ResizeObserver`（尺寸变化观察器）观察消息内容尺寸。用户离开底部后暂停跟随，状态结算或播放状态变化不触发额外会话滚动。以上仅是前端呈现规则，不改变服务端协议或业务状态。
 - 产品展示层仅隐藏 `kind=user_turn`（用户消息类型）、`status=empty_input`（空输入状态）且 `text`（文本）为空或仅含空白字符的气泡。实时消息和离线快照使用相同规则；权威记录、`seq`（服务端顺序号）及诊断保持完整。非空短回答、助手消息、系统消息和其他状态记录不受此规则影响。
 - Shadow 摘要和运行轨迹只消费服务端的 `shadow.product` 权威快照与 `shadow.activity` 增量；
   增量按 `run_seq + item_id` 合并，重连先应用快照再应用 WebSocket `seq` 有序增量。前端不得

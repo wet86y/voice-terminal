@@ -20,6 +20,7 @@ import type {
 import { isRecord } from '../record'
 import { desktopPort } from './desktop-port'
 import { modelComponentOwners } from './component-resources'
+import { speechMessageKey, userMessageKey } from './conversation-identity'
 import { DEFAULT_SETTINGS, DEFAULT_REGISTRY, DEFAULT_DSH, MAX_WAKE_KEYWORDS, defaultCurrent, defaultShadow, normalizeSettings, normalizeRegistry, normalizeRuntimeState, updateSettingsFromResponse } from './normalization'
 export { MAX_WAKE_KEYWORDS } from './normalization'
 
@@ -50,28 +51,29 @@ export interface ProviderFormState {
   voiceId: string
 }
 
-/** One rendered rail line, projected from the server-ordered conversation. */
+/** ConversationRow（会话显示条目）：保持服务端顺序，消息身份不包含结算阶段。 */
 export interface ConversationRow {
-  key: string
-  role: 'user' | 'assistant'
-  kind: ConversationEntryKind
-  text: string
-  at: string
-  status: string
-  termination: string
-  delivery: TurnDelivery
-  speaking: boolean
+  key: string // key（贯穿显示阶段的气泡身份）。
+  role: 'user' | 'assistant' // role（消息发送方）。
+  kind: ConversationEntryKind // kind（用户、助手或系统播报类型）。
+  text: string // text（最新完整正文）。
+  at: string // at（服务端记录时间）。
+  status: string // status（识别或播报状态）。
+  termination: string // termination（结束原因）。
+  delivery: TurnDelivery // delivery（实际播报交付结果）。
+  speaking: boolean // speaking（是否实际播放中）。
 }
 
-/** Speech that is queued or playing but has not settled into the log yet. */
+/** PendingSpeechRow（未入账的播报显示条目）：队列、播放与结算间隙持续显示同一事务。 */
 export interface PendingSpeechRow {
-  key: string
-  conversationId: string
-  speechId: string
-  turnId: string
-  text: string
-  state: 'waiting' | 'playing'
-  speaking: boolean
+  key: string // key（与正式记录一致的气泡身份）。
+  conversationId: string // conversationId（播报所属会话）。
+  speechId: string // speechId（独立播报事务标识）。
+  turnId: string // turnId（对应用户轮次）。
+  text: string // text（该事务的最新正文）。
+  state: 'waiting' | 'playing' | 'settling' // state（显示阶段）：播放结束后继续保留，直到正式记录接管。
+  status?: string // status（结算结果）：完成、失败或被替换等实际状态。
+  speaking: boolean // speaking（是否实际播放中）。
 }
 
 /** One wake word, up to five accepted spellings; the server enforces the same cap. */
@@ -779,6 +781,14 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     ? voice.conversationEntries.value
     : snapshot.value?.conversation.entries || [])
 
+  const recordedMessageKeys = new Set<string>() // recordedMessageKeys（已入账的消息身份）：历史清空或裁剪后不从当前稿、结束缓存恢复旧气泡。
+  watch(() => railEntries.value.map(entry => entry.kind === 'user_turn'
+    ? userMessageKey(entry.turn_id || `${entry.conversation_id}:${entry.seq}`)
+    : speechMessageKey(entry.conversation_id, entry.speech_id || String(entry.seq))), keys => {
+    for (const key of keys) recordedMessageKeys.add(key)
+    while (recordedMessageKeys.size > 256) recordedMessageKeys.delete(recordedMessageKeys.values().next().value!)
+  }, { immediate: true, flush: 'sync' })
+
   const conversationRows = computed<ConversationRow[]>(() => {
     const playingKeys = new Set(voice.playbackQueue.value
       .filter(item => item.state === 'playing')
@@ -787,7 +797,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     return railEntries.value
       .filter(entry => !(entry.kind === 'user_turn' && entry.status === 'empty_input' && !entry.text.trim()))
       .map(entry => ({
-        key: `${entry.kind === 'user_turn' ? 'turn' : 'speech'}:${entry.conversation_id}:${entry.turn_id || entry.speech_id}:${entry.seq}`,
+        key: entry.kind === 'user_turn'
+          ? userMessageKey(entry.turn_id || `${entry.conversation_id}:${entry.seq}`)
+          : speechMessageKey(entry.conversation_id, entry.speech_id || String(entry.seq)),
         role: entry.kind === 'user_turn' ? 'user' as const : 'assistant' as const,
         kind: entry.kind,
         text: entry.text,
@@ -799,30 +811,51 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       }))
   })
 
-  // Speech that is queued or playing but has not settled into the log yet.  Its
-  // identity is the same ``conversation_id + speech_id``, so a transaction moves
-  // from this tail into the ordered log exactly once.
+  // pendingSpeechRows（尚未进入顺序记录的播报）：复用现有输出记录桥接物理播放结束与正式结算的间隙。
+  // 播放队列、结束记录与正式记录的 key（渲染标识）一致，切换来源不重建气泡。
   const pendingSpeechRows = computed<PendingSpeechRow[]>(() => {
     const settled = new Set(railEntries.value
       .map(entry => `${entry.conversation_id}\u0000${entry.speech_id}`))
-    return voice.playbackQueue.value
-      .filter(item => typeof item.text === 'string' && item.text.trim().length > 0)
-      .filter(item => !settled.has(`${item.conversation_id}\u0000${item.speech_id}`))
-      .map(item => ({
-        key: `pending:${item.conversation_id}:${item.speech_id}`,
+    const rows = new Map<string, PendingSpeechRow>() // rows（按事务身份去重的显示条目）。
+    for (const item of voice.speechOutputs.value) {
+      if (voice.agentEpisode.value?.conversation_id && item.conversation_id !== voice.agentEpisode.value.conversation_id) continue
+      if (!item.text?.trim() || settled.has(`${item.conversation_id}\u0000${item.speech_id}`)) continue
+      const key = speechMessageKey(item.conversation_id, item.speech_id)
+      if (recordedMessageKeys.has(key)) continue
+      rows.set(key, {
+        key,
+        conversationId: item.conversation_id,
+        speechId: item.speech_id,
+        turnId: item.turn_id,
+        text: item.text,
+        state: 'settling',
+        status: item.status,
+        speaking: false,
+      })
+    }
+    for (const item of voice.playbackQueue.value) {
+      if (!item.text?.trim() || settled.has(`${item.conversation_id}\u0000${item.speech_id}`)) continue
+      const key = speechMessageKey(item.conversation_id, item.speech_id)
+      if (recordedMessageKeys.has(key)) continue
+      rows.set(key, {
+        key,
         conversationId: item.conversation_id,
         speechId: item.speech_id,
         turnId: item.turn_id,
         text: item.text,
         state: item.state,
         speaking: item.state === 'playing',
-      }))
+      })
+    }
+    return [...rows.values()]
   })
 
   const currentTurnId = computed(() => voice.currentTurnId.value)
   const currentTurnLogged = computed(() => {
     const turnId = currentTurnId.value
-    return Boolean(turnId) && railEntries.value.some(entry => entry.turn_id === turnId)
+    if (!turnId) return false
+    return recordedMessageKeys.has(userMessageKey(turnId))
+      || railEntries.value.some(entry => entry.kind === 'user_turn' && entry.turn_id === turnId)
   })
   const currentTurnSpeechLogged = computed(() => {
     const turnId = currentTurnId.value
