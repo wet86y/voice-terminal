@@ -1362,7 +1362,7 @@ def test_runtime_keeps_queued_speak_on_truncated_envelope():
     asyncio.run(scenario())
 
 
-def test_complete_playing_speak_replaces_directly_without_llm_recovery():
+def test_complete_playing_speak_is_ignored_without_recovery():
     async def scenario():
         seen = {"replace": [], "feeds": [], "recoveries": []}
 
@@ -1393,14 +1393,14 @@ def test_complete_playing_speak_replaces_directly_without_llm_recovery():
         runtime._queue_recovery = lambda *args, **kwargs: seen["recoveries"].append(args[0])
         envelope = DecisionEnvelope(SpeechDecision("speak", "calm", "新的完整播报"), ())
         await runtime._apply_decision_v06(identity, "turn", envelope)
-        assert seen["replace"] == [{"emotion": "calm"}]
-        assert seen["feeds"] == ["新的完整播报"] and seen["finished"]
+        assert seen["replace"] == []
+        assert seen["feeds"] == [] and "finished" not in seen
         assert not seen["recoveries"]
         assert "cancel" not in seen
     asyncio.run(scenario())
 
 
-def test_stream_prefix_replaces_playing_speak_and_only_feeds_new_handle():
+def test_stream_prefix_cannot_replace_playing_speech():
     async def scenario():
         seen = {"replace": 0, "feeds": [], "recoveries": []}
 
@@ -1444,19 +1444,14 @@ def test_stream_prefix_replaces_playing_speak_and_only_feeds_new_handle():
         async def recovery(*args, **_kwargs): seen["recoveries"].append(args[0])
         runtime._queue_recovery = recovery
         await runtime._step(identity, {"USER_INPUT_FINALIZED"})
-        assert seen["replace"] == 1
-        assert seen["feeds"] == ["新", "内容"] and seen["finished"]
+        assert seen["replace"] == 0
+        assert seen["feeds"] == [] and "finished" not in seen
         assert not seen["recoveries"]
     asyncio.run(scenario())
 
 
-def test_streamed_prefix_divergence_replaces_with_undelivered_text_only():
-    """A streamed replacement never re-synthesises what was already accepted.
-
-    The snapshot accepts "已有播报" with nothing sent yet, so the divergent
-    answer must still contribute only the part that is not already queued; the
-    old behaviour fed the complete accumulated text and replayed it.
-    """
+def test_streamed_prefix_divergence_is_ignored_while_busy():
+    """流式新播报的前缀分歧不能触发硬替换。"""
 
     async def scenario():
         seen = {"replace": 0, "feeds": []}
@@ -1509,8 +1504,8 @@ def test_streamed_prefix_divergence_replaces_with_undelivered_text_only():
         await runtime._step(identity, {"USER_INPUT_REFINED"})
         # The accepted text is fully irreversible, so nothing of it may reach
         # the replacement transaction; only the genuinely new remainder does.
-        assert seen["replace"] == 1
-        assert seen["feeds"] == ["改", "正"]
+        assert seen["replace"] == 0
+        assert seen["feeds"] == []
     asyncio.run(scenario())
 
 
@@ -1535,7 +1530,7 @@ def test_model_speak_state_separates_knowledge_from_continuation_authority():
     )
     assert current == {
         "state": "speaking", "owner_scope": "current_turn",
-        "continuation_mode": "append_only",
+        "continuation_mode": "none",
         "text_parts": {
             "committed_prefix": "上一轮仍在播放", "current_clause": "",
             "prefetched_clause": "", "revisable_tail": "",
@@ -1589,7 +1584,7 @@ def test_completed_prefix_guard_is_conversation_scoped_and_requires_full_deliver
     assert runtime._completed_speech_guard(("conversation", "request"), "new_turn")["text"] == "已经播放"
 
 
-def test_active_previous_turn_prefix_is_replaced_with_suffix_not_appended():
+def test_active_previous_turn_also_blocks_new_speak():
     async def scenario():
         seen = {"feeds": [], "replace": 0, "append": 0}
 
@@ -1638,13 +1633,9 @@ def test_active_previous_turn_prefix_is_replaced_with_suffix_not_appended():
 
         await runtime._step(identity, {"USER_INPUT_FINALIZED"})
 
-        assert seen["replace"] == 1 and seen["append"] == 0
-        assert seen["feeds"] == ["这是当前轮的新回答。"] and seen["finished"]
-        traces = [payload for kind, payload in events if kind == "agent.trace"]
-        stripped = next(item for item in traces
-                        if item["kind"] == "CROSS_TURN_SPEECH_PREFIX_STRIPPED")
-        assert stripped["baseline_source"] == "active_previous_guard"
-
+        assert seen["replace"] == 0 and seen["append"] == 0
+        assert seen["feeds"] == [] and "finished" not in seen
+        assert runtime.minor_protocol_feedback[-1]["applied"] == "ignored_output_busy"
     asyncio.run(scenario())
 
 
@@ -1823,9 +1814,7 @@ def test_completed_same_turn_identical_speak_is_ignored_only_for_transcript_reas
 
         assert not begun
         assert runtime.current_action == "wait"
-        assert any(kind == "speech.append_ignored"
-                   and payload["reason"] == "completed_same_turn_identical"
-                   for kind, payload in events)
+        assert runtime.minor_protocol_feedback[-1]["applied"] == "ignored_identical_to_delivered"
 
     asyncio.run(scenario())
 
@@ -1904,7 +1893,7 @@ def test_exact_previous_completed_text_remains_a_valid_explicit_replay():
     asyncio.run(scenario())
 
 
-def test_streamed_full_text_prefix_queues_only_suffix_without_replacement():
+def test_streamed_full_text_cannot_append_to_active_speech():
     async def scenario():
         seen = {"replace": 0, "suffixes": [], "feeds": []}
         class Provider:
@@ -1940,9 +1929,9 @@ def test_streamed_full_text_prefix_queues_only_suffix_without_replacement():
         identity = (runtime.episode_id, "request"); runtime.agent_step_id = "request"
         runtime._identity_turns[identity] = "turn"
         await runtime._step(identity, {"USER_INPUT_REFINED"})
-        assert seen["replace"] == 0 and seen["suffixes"] == ["，新增句子"]
-        assert seen["feeds"] == [] and seen["finished"]
-        assert any(kind == "speech.append_waiting_prefix" for kind, _ in events)
+        assert seen["replace"] == 0 and seen["suffixes"] == []
+        assert seen["feeds"] == [] and "finished" not in seen
+        assert runtime.minor_protocol_feedback[-1]["applied"] == "ignored_output_busy"
     asyncio.run(scenario())
 
 

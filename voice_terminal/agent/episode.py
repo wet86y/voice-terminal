@@ -11,7 +11,7 @@ from threading import Lock
 from uuid import uuid4
 
 from .scheduler import AgentDecisionScheduler
-from .streamed_speech import StreamedSpeechAdmissionState, queue_streamed_speech, common_prefix_chars
+from .streamed_speech import StreamedSpeechAdmissionState, queue_streamed_speech
 from .decision_application import ProtocolError, apply_decision_v06
 from .context_builder import AgentContextMixin
 from .deferred_speech import DeferredSpeechMixin
@@ -198,6 +198,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self.inputs = {}
         self.trace = deque(maxlen=self.options.trace_limit)
         self.outputs = deque(maxlen=self.options.output_limit)
+        self._last_model_speak_snapshot = {}  # 原始输出边界快照，仅本地确认使用。
+        self._applying_speech_admission = None  # 当前请求的播报受理状态。
         self._last_model_speak_state = {
             "state": "empty", "owner_scope": "none", "continuation_mode": "none",
         }
@@ -524,14 +526,13 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             "SCHEDULER_HEARTBEAT_STALE", "SCHEDULER_HEARTBEAT_THREAD_STARTED",
             "SCHEDULER_HEARTBEAT_THREAD_STOPPED", "SCHEDULER_HEARTBEAT_THREAD_ERROR",
             "SYSTEM_CHECK_ACTION_REJECTED",
-            "SPEECH_APPEND_ELIGIBLE", "SPEECH_APPEND_SUCCEEDED",
-            "SPEECH_IDENTICAL_IGNORED", "SPEECH_DECISION_REPLACED",
+            "SPEAK_BUSY_IGNORED", "SPEECH_REVISED", "SPEECH_REVISION_REJECTED", "SPEECH_REVISION_NOOP",
+            "SPEECH_IDENTICAL_IGNORED",
             "SENTENCE_CREATED", "SENTENCE_REVISED", "SPEAK_STATE_CHANGED",
             "ACTION_STARTED", "ACTION_COMPLETED", "SPEAK_ENVELOPE_INVALID", "EMOTION_NORMALIZED",
             "LLM_EMPTY_OUTPUT", "LLM_OUTPUT_COMPAT_RECOVERED", "LLM_CONTEXT_CAPTURED",
             "LLM_REQUEST_COMPLETED", "SSE_STREAM_INTEGRITY",
             "RESPONSES_INCOMPLETE", "LLM_OUTPUT_FILTERED", "LLM_PROVIDER_UNAVAILABLE",
-            "SPEAK_REPLACEMENT_INTERCEPTED",
             "OUTPUT_CANCELLED", "OUTPUT_REPLACED",
             "LLM_RECOVERY_EXHAUSTED", "LLM_TRANSPORT_RETRY_EXHAUSTED",
         }:
@@ -875,10 +876,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             return "scope_closed"
         return None
 
-    async def _begin_output(self, identity, input_id, emotion):
-        """Authorise one V0.6 text speech item through the unified queue."""
-        return await self.output.begin(identity, input_id, emotion=emotion)
-
     @staticmethod
     def _is_system_check_context(context) -> bool:
         return bool(
@@ -925,36 +922,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             speech_context["prompt_kind"] = context.get("prompt_kind")
         self._system_check_speeches[speech_id] = speech_context
         self._system_check_output_turn_ids.add(system_check_id)
-
-    async def _begin_speech(self, identity, input_id, emotion, *, replace_current=False):
-        """Begin ordinary or explicitly replacing speech after the gate."""
-
-        if replace_current:
-            replace = getattr(self.output, "replace_current", None)
-            if not callable(replace):
-                raise ValueError("speech replacement is unavailable")
-            return await replace(identity, input_id, emotion=emotion)
-        return await self._begin_output(identity, input_id, emotion)
-
-    async def _replace_failed(self, identity, turn_id, error, *, speech_id=None):
-        reason = str(error)[:300] or "replacement rejected"
-        replacement = getattr(self.output, "last_replacement", {})
-        old_speech_id = replacement.get("old_speech_id") if isinstance(replacement, dict) else None
-        new_speech_id = replacement.get("new_speech_id") if isinstance(replacement, dict) else None
-        if speech_id and not new_speech_id:
-            new_speech_id = speech_id
-        if not old_speech_id:
-            active = getattr(self.output, "active_snapshot", None)
-            if isinstance(active, dict):
-                old_speech_id = active.get("speech_id")
-        ids = {"old_speech_id": old_speech_id, "new_speech_id": new_speech_id}
-        await self.log("TTS_REPLACE_FAILED", identity=identity, turn_id=turn_id,
-                       reason=reason, **ids)
-        await self.emit("speech.replace_failed", {
-            "conversation_id": identity[0], "request_id": identity[1], "turn_id": turn_id,
-            "event": "speech.replace_failed", "status": "replace_failed", "reason": reason,
-            **ids,
-        })
 
     def _wake(self, kind, *, turn_id=None):
         if self.context_limited:
@@ -2755,7 +2722,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         continuation_mode = (
             "rewrite_tail"
             if same_turn and parts_valid and bool(snapshot.get("rewritable"))
-            else "append_only" if same_turn
             else "none"
         )
         value = {
@@ -2771,127 +2737,69 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 value["delivery"] = {"heard_text": heard}
         return value
 
-    @staticmethod
-    def _snapshot_progress(decision, snapshot):
-        """Return what a full-text decision still adds beyond what is locked.
-
-        The snapshot's ``text`` is the turn's accepted response and
-        ``sent_chars`` its irreversible frontier, so the remainder is the only
-        part that may open a transaction.  Returning ``None`` means the
-        decision carries no new audible content and must not create one.
-        """
-
-        proposal = str(getattr(decision, "text", "") or "")
-        if not proposal:
-            return None
-        if not isinstance(snapshot, dict):
-            return proposal
-        accepted = str(snapshot.get("text") or "")
-        if not accepted:
-            return proposal
-        sent_chars = snapshot.get("sent_chars")
-        if not isinstance(sent_chars, int):
-            sent_chars = len(accepted)
-        sent_chars = max(0, min(len(accepted), sent_chars))
-        locked = accepted[:sent_chars]
-        if proposal.startswith(locked):
-            return proposal[len(locked):] or None
-        # A real correction can still legitimately replace unwritten text.
-        # Only text the provider already received is irreversibly locked, so
-        # strip the longest common prefix and never replay it.
-        index = common_prefix_chars(locked, proposal)
-        return proposal[index:] or None
-
     async def _apply_revision_tail(self, identity, turn_id, snapshot, tail, *, emotion,
                                    dispatch_context=None):
-        """Stitch one revision tail onto the locked prefix of the transaction.
-
-        ``revision`` deliberately carries only the new tail, so no string
-        comparison decides the model's intent here.  The order of the attempts
-        preserves the two audible invariants: never replay delivered text and
-        never interrupt audio that the listener is already hearing, which is
-        why a revision never escalates to ``replace_current``.
-        """
-
+        """revision（尾巴修订）只修改请求快照仍匹配的活动事务，拒绝过期边界。"""
         proposal = str(tail or "")
         if not proposal.strip():
             return None
-        speech_id = snapshot.get("speech_id") if isinstance(snapshot, dict) else None
-        generation = snapshot.get("output_generation") if isinstance(snapshot, dict) else None
-        active = str(snapshot.get("text") or "") if isinstance(snapshot, dict) else ""
-        sent_chars = snapshot.get("sent_chars") if isinstance(snapshot, dict) else None
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        current = getattr(self.output, "speak_snapshot", {})
+        current = current if isinstance(current, dict) else {}
+        speech_id = snapshot.get("speech_id")
+        reason = None
+        if (not speech_id or snapshot.get("conversation_id") != identity[0]
+                or snapshot.get("turn_id") != turn_id):
+            reason = "no_owned_transaction"
+        elif any(current.get(key) != snapshot.get(key) for key in (
+                "speech_id", "output_generation", "sent_chars", "text", "text_revision")):
+            reason = "request_boundary_changed"
+        elif not snapshot.get("rewritable") or not current.get("rewritable"):
+            reason = "revision_window_closed"
+        active = str(snapshot.get("text") or "")
+        sent_chars = snapshot.get("sent_chars")
         if not isinstance(sent_chars, int):
+            reason = reason or "missing_confirmation_boundary"
             sent_chars = len(active)
-        sent_chars = max(0, min(len(active), sent_chars))
         locked = active[:sent_chars]
         system_check_id = (dispatch_context.get("system_check_id")
                            if isinstance(dispatch_context, dict) else None)
-        if locked.endswith(proposal):
+        if reason is None and locked.endswith(proposal):
+            self.minor_protocol_feedback.append({
+                "field": "speak.revision", "provided_chars": len(proposal),
+                "applied": "noop_tail_already_locked",
+                "hint": "该尾巴已锁定无需修订；没有新内容时使用 wait（等待）。",
+            })
             await self.log("SPEECH_REVISION_NOOP", identity=identity, turn_id=turn_id,
                            speech_id=speech_id, locked_chars=len(locked),
                            new_tail_chars=len(proposal), reason="tail_already_locked",
                            system_check_id=system_check_id)
-            self.minor_protocol_feedback.append({
-                "field": "speak.revision",
-                "provided_chars": len(proposal),
-                "applied": "noop_tail_already_locked",
-                "hint": "该尾巴已经锁定无需修订；没有新内容时使用 wait",
-            })
             return "noop"
         rewrite = getattr(self.output, "rewrite_unsent", None)
-        if (speech_id and snapshot.get("rewritable") and callable(rewrite)):
-            try:
-                rewritten = await rewrite(identity, turn_id, speech_id=speech_id, text=proposal)
-            except Exception:
-                rewritten = None
+        if reason is None and callable(rewrite):
+            rewritten = await rewrite(
+                identity, turn_id, speech_id=speech_id, text=proposal,
+                expected_generation=snapshot.get("output_generation"),
+                expected_sent_chars=sent_chars, expected_text=active,
+                expected_text_revision=snapshot.get("text_revision", 0),
+            )
             if rewritten is not None:
                 await self.log("SPEECH_REVISED", identity=identity, turn_id=turn_id,
                                path="rewrite", speech_id=rewritten.speech_id,
                                locked_chars=len(locked), new_tail_chars=len(proposal),
                                system_check_id=system_check_id)
                 return rewritten
-            await self.log("SPEECH_TAIL_REWRITE_UNAVAILABLE", identity=identity,
-                           turn_id=turn_id, baseline_source="revision",
-                           reason="revision_window_closed", baseline_chars=len(locked),
-                           new_chars=len(proposal), sent_chars=sent_chars,
-                           speech_id=speech_id, system_check_id=system_check_id)
-        append = getattr(self.output, "append_successor", None)
-        if speech_id and callable(append):
-            try:
-                successor = await append(identity, turn_id, baseline_speech_id=speech_id,
-                                         baseline_generation=generation,
-                                         suffix=proposal, emotion=emotion)
-            except Exception:
-                successor = None
-            if successor is not None:
-                self._track_system_check_speech(successor, dispatch_context)
-                try:
-                    await successor.finish()
-                except ValueError:
-                    # A successor that already settled is not a protocol error.
-                    pass
-                await self.log("SPEECH_REVISED", identity=identity, turn_id=turn_id,
-                               path="append", speech_id=successor.speech_id,
-                               baseline_speech_id=speech_id,
-                               locked_chars=len(locked), new_tail_chars=len(proposal),
-                               system_check_id=system_check_id)
-                return successor
-        # Nothing is playable to revise any more: the tail is simply new
-        # content, so it opens a fresh transaction without cancelling output
-        # that has already settled.  The delivered frontier stays authoritative
-        # through ``speak_snapshot`` regardless of which handle is active.
-        begin = getattr(self.output, "begin", None)
-        if not callable(begin):
-            return None
-        handle = await begin(identity, turn_id, emotion=emotion)
-        self._track_system_check_speech(handle, dispatch_context)
-        await handle.feed(proposal)
-        await handle.finish()
-        await self.log("SPEECH_REVISED", identity=identity, turn_id=turn_id,
-                       path="begin", speech_id=handle.speech_id,
-                       locked_chars=len(locked), new_tail_chars=len(proposal),
+        reason = reason or "confirmation_boundary_changed"
+        self.minor_protocol_feedback.append({
+            "field": "speak.revision", "applied": "rejected_boundary_changed",
+            "reason": reason,
+            "hint": "修订未受理：请求中的尾巴边界已失效或不可修订。核对最新输出状态；硬替换使用带文本的 cancel（取消）。",
+        })
+        await self.log("SPEECH_REVISION_REJECTED", identity=identity, turn_id=turn_id,
+                       speech_id=speech_id, reason=reason, context_locked_chars=sent_chars,
+                       apply_locked_chars=current.get("sent_chars"),
                        system_check_id=system_check_id)
-        return handle
+        return None
 
     def _completed_speech_guard(self, identity, turn_id, *, allow_same_turn=False):
         """Return a settled delivery usable as an exact-text baseline.
@@ -3089,8 +2997,53 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             self, identity, turn_id, envelope, dispatch_context=dispatch_context,
         )
 
+    @staticmethod
+    def _request_prompt_kind(dispatch_context, *, recovery=False):
+        """_request_prompt_kind（请求场景）：恢复请求沿用原始评估场景。"""
+        if not isinstance(dispatch_context, dict):
+            return "normal"
+        selected = (dispatch_context.get("origin_prompt_kind")
+                    if recovery else dispatch_context.get("prompt_kind"))
+        return str(selected or "normal")
+
+    def _request_secondary_context(self, source_turn_id, kinds, *, recovery=False,
+                                   recovery_signal=None):
+        """_request_secondary_context（有效二等上下文）：重试保留原请求快照。"""
+        retry_key = source_turn_id or ""
+        if recovery and recovery_signal is not None and recovery_signal.secondary_context is not None:
+            return self.ledger.valid_shadow_progress(recovery_signal.secondary_context)
+        if ("LLM_RETRY" in kinds and retry_key in self._retry_secondary_by_turn
+                and not (set(kinds) - self.scheduler.NON_SEMANTIC_EVENTS - {"LLM_RETRY"})):
+            return self.ledger.valid_shadow_progress(self._retry_secondary_by_turn[retry_key])
+        return self._secondary_snapshot()
+
     async def _step(self, identity, kinds, *, recovery=False, recovery_signal=None,
                     reasoning_effort=None, dispatch_context=None):
+        """有效请求才冻结语音提交；输出应用及所有退出路径均释放边界。"""
+        if kinds != {"DEFERRED_OUTPUT"} and (self.closed or not self.episode_id):
+            return
+        source_turn_id = self._identity_turns.get(identity, self.last_turn_id)
+        prompt_kind = self._request_prompt_kind(dispatch_context, recovery=recovery)
+        if prompt_kind == "secondary_mailbox" and (
+                self._system_check_is_stale(dispatch_context)
+                or (not recovery and not self._request_secondary_context(
+                    source_turn_id, kinds, recovery=recovery, recovery_signal=recovery_signal))):
+            return "system_check_stale"
+        boundary = getattr(self.output, "inference_boundary", None)
+        if boundary is None or kinds == {"DEFERRED_OUTPUT"}:
+            return await self._step_with_speech_boundary(
+                identity, kinds, recovery=recovery, recovery_signal=recovery_signal,
+                reasoning_effort=reasoning_effort, dispatch_context=dispatch_context,
+            )
+        async with boundary.request(identity):
+            return await self._step_with_speech_boundary(
+                identity, kinds, recovery=recovery, recovery_signal=recovery_signal,
+                reasoning_effort=reasoning_effort, dispatch_context=dispatch_context,
+            )
+
+    async def _step_with_speech_boundary(self, identity, kinds, *, recovery=False,
+                                       recovery_signal=None, reasoning_effort=None,
+                                       dispatch_context=None):
         """The V0.6 content-envelope request path (no native provider tools)."""
         if kinds == {"DEFERRED_OUTPUT"}:
             await self._normalize_deferred_outputs()
@@ -3102,26 +3055,16 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         system_check_id = (
             str(dispatch_context.get("system_check_id")) if system_check else None
         )
-        prompt_kind = "normal"
-        if isinstance(dispatch_context, dict):
-            selected_prompt_kind = (
-                dispatch_context.get("origin_prompt_kind")
-                if recovery else dispatch_context.get("prompt_kind")
-            )
-            prompt_kind = str(selected_prompt_kind or "normal")
+        prompt_kind = self._request_prompt_kind(dispatch_context, recovery=recovery)
         same_turn_transcript_reassessment = bool(
             {"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"}.intersection(kinds)
         )
         if prompt_kind == "secondary_mailbox" and self._system_check_is_stale(dispatch_context):
             return "system_check_stale"
         retry_key = source_turn_id or ""
-        if recovery and recovery_signal is not None and recovery_signal.secondary_context is not None:
-            secondary_context = self.ledger.valid_shadow_progress(recovery_signal.secondary_context)
-        elif ("LLM_RETRY" in kinds and retry_key in self._retry_secondary_by_turn
-              and not (set(kinds) - self.scheduler.NON_SEMANTIC_EVENTS - {"LLM_RETRY"})):
-            secondary_context = self.ledger.valid_shadow_progress(self._retry_secondary_by_turn[retry_key])
-        else:
-            secondary_context = self._secondary_snapshot()
+        secondary_context = self._request_secondary_context(
+            source_turn_id, kinds, recovery=recovery, recovery_signal=recovery_signal,
+        )
         if prompt_kind == "secondary_mailbox" and not secondary_context and not recovery:
             return "system_check_stale"
         if recovery and recovery_signal is not None and recovery_signal.shadow_information:
@@ -3139,6 +3082,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             shadow_information=shadow_information,
             secondary_context=secondary_context,
         )
+        request_speak_snapshot = dict(self._last_model_speak_snapshot)
+        request_speak_context = dict(self._last_model_speak_state)
         if self.closed or not self.episode_id:
             return
         messages, compacted = self._fit_context(messages, [])
@@ -3219,11 +3164,11 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             context_compacted=self.context_compacted,
             audit_capture_ms=audit_capture_ms,
         )
-        speak_context = dict(self._last_model_speak_state)
+        speak_context = request_speak_context
         # One request-scoped view of the accepted transaction.  ``messages``
         # already projected it, so the streaming fallbacks must judge against
         # the same frontier the model was shown.
-        snapshot = getattr(self.output, "speak_snapshot", {})
+        snapshot = request_speak_snapshot
         speak_parts = speak_context.get("text_parts")
         if not isinstance(speak_parts, dict):
             speak_parts = {}
@@ -3234,27 +3179,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         context_locked_chars = len(committed_prefix) + len(current_clause) + len(prefetched_clause)
         delivery = speak_context.get("delivery")
         heard_text = str(delivery.get("heard_text") or "") if isinstance(delivery, dict) else ""
-
-        def delivered_remainder(value):
-            """Return the part of ``value`` beyond the accepted frontier.
-
-            Every fallback that opens a transaction from accumulated model text
-            must strip what the provider already received; otherwise a
-            replacement replays audio the listener has already heard.
-            """
-
-            if not value:
-                return value
-            accepted = str(snapshot.get("text") or "") if isinstance(snapshot, dict) else ""
-            sent = snapshot.get("sent_chars") if isinstance(snapshot, dict) else None
-            if not isinstance(sent, int):
-                sent = len(accepted)
-            locked = accepted[:max(0, min(len(accepted), sent))]
-            if not locked:
-                return value
-            if value.startswith(locked):
-                return value[len(locked):]
-            return value[common_prefix_chars(locked, value):]
 
         await self.log(
             "LLM_SPEAK_CONTEXT", identity=identity, turn_id=source_turn_id,
@@ -3293,10 +3217,6 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             system_check_id, same_turn_transcript_reassessment, dispatch_context,
         )
         speech_handle_finished = False
-        # Set once a live transaction's unsent tail is being replaced in place:
-        # every further delta then extends that same replacement.
-        # How much of the accepted streamed text has already been handed to
-        # ``rewrite_unsent``; later deltas only carry the extension.
         validation = "strict_valid"
         audit_outcome_recorded = False
         stale_reported = False
@@ -3417,23 +3337,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                                 continue
                             prefix = parser.speak_prefix()
                             if prefix is not None and prefix.state == "speak":
-                                consumed = await queue_streamed_speech(self, admission, prefix, provisional)
-                                if (admission.speech_handle is not None and not consumed
-                                        and getattr(admission.speech_handle, "reason", None) != "passive_quiet"):
-                                    # On a divergence the new transaction must
-                                    # receive the complete accumulated target;
-                                    # on append only the first suffix was
-                                    # already fed by append_successor.  Either
-                                    # way the accepted frontier is removed so a
-                                    # replacement never re-synthesises delivered
-                                    # text.
-                                    if admission.speech_fed_chars == 0:
-                                        value = delivered_remainder(provisional)
-                                    else:
-                                        value = text_delta
-                                    if value:
-                                        await admission.speech_handle.feed(value)
-                                        admission.speech_fed_chars += len(value)
+                                await queue_streamed_speech(self, admission, prefix, provisional)
                             # Keep this event as a model-stream diagnostic for
                             # existing clients.  The actual queue truth is
                             # speech.queued/speech.delta.
@@ -3497,7 +3401,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             if (admission.speech_handle is not None
                     and getattr(admission.speech_handle, "reason", None) == "passive_quiet"):
                 handle = admission.speech_handle
-                handle.text = delivered_remainder(envelope.speak.text)
+                handle.text = envelope.speak.text[admission.prefix_chars_stripped:]
                 handle.finished = True
                 remainder, heard = self.output.deferred_remainder(handle, handle.text)
                 self.defer_speech(admission.speech_handle.speech_id,
@@ -3510,6 +3414,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                                action_count=len(envelope.actions))
             else:
                 previous_reassessment = self._applying_transcript_reassessment
+                previous_admission = getattr(self, "_applying_speech_admission", None)
+                self._applying_speech_admission = admission
                 self._applying_transcript_reassessment = same_turn_transcript_reassessment
                 try:
                     if system_check:
@@ -3520,6 +3426,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                         await self._apply_decision_v06(identity, source_turn_id, envelope)
                 finally:
                     self._applying_transcript_reassessment = previous_reassessment
+                    self._applying_speech_admission = previous_admission
             if system_check:
                 await self._dispatch_actions_v06(
                     identity, source_turn_id, envelope,

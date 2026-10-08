@@ -277,6 +277,7 @@ def test_rewrite_unsent_splices_the_tail_and_truncates_accepted_text():
     async def scenario():
         output, handle, _tts, _player = _output_harness("playback_window", 500)
         state = AdmissionState(lead_ms=500)
+        state.producer_done = True
         handle.admission = state
         handle.finished = True
         handle.text = "前半句还会继续"
@@ -286,7 +287,10 @@ def test_rewrite_unsent_splices_the_tail_and_truncates_accepted_text():
         # ``text`` is the new tail only: the caller never reproduces the
         # locked prefix, so the runtime stitches it locally.
         rewritten = await output.rewrite_unsent(
-            ("episode", "request"), "turn", speech_id=handle.speech_id, text="改了口",
+            ("episode", "request"), "turn", speech_id=handle.speech_id,
+            expected_generation=handle.workspace.generation,
+            expected_sent_chars=output.speak_snapshot["sent_chars"],
+            expected_text=output.speak_snapshot["text"], text="改了口",
         )
         assert rewritten is handle
         assert handle.text == "前半句改了口"
@@ -304,6 +308,7 @@ def test_rewrite_unsent_replaces_the_tail_without_comparing_prefixes():
     async def scenario():
         output, handle, _tts, _player = _output_harness("playback_window", 500)
         state = AdmissionState(lead_ms=500)
+        state.producer_done = True
         handle.admission = state
         handle.finished = True
         handle.text = "已经送出的内容"
@@ -313,7 +318,10 @@ def test_rewrite_unsent_replaces_the_tail_without_comparing_prefixes():
         # A tail that does not extend the locked prefix is still a legal
         # revision: only the unsent remainder is dropped and replaced.
         rewritten = await output.rewrite_unsent(
-            ("episode", "request"), "turn", speech_id=handle.speech_id, text="完全改口了",
+            ("episode", "request"), "turn", speech_id=handle.speech_id,
+            expected_generation=handle.workspace.generation,
+            expected_sent_chars=output.speak_snapshot["sent_chars"],
+            expected_text=output.speak_snapshot["text"], text="完全改口了",
         )
         assert rewritten is handle
         assert handle.text == "已经送出" + "完全改口了"
@@ -331,22 +339,29 @@ def test_rewrite_unsent_requires_an_open_unfinished_transaction():
         handle.text = "旧内容"
         assert handle.sent_chars == len("旧内容")
         assert await output.rewrite_unsent(
-            ("episode", "request"), "turn", speech_id=handle.speech_id, text="旧内容续写",
+            ("episode", "request"), "turn", speech_id=handle.speech_id,
+            expected_generation=handle.workspace.generation,
+            expected_sent_chars=output.speak_snapshot["sent_chars"],
+            expected_text=output.speak_snapshot["text"], text="旧内容续写",
         ) is None
 
         state = AdmissionState(lead_ms=500)
+        state.producer_done = True
         handle.admission = state
         handle.finished = False
         assert handle.rewritable is False
         assert await output.rewrite_unsent(
-            ("episode", "request"), "turn", speech_id=handle.speech_id, text="旧内容续写",
+            ("episode", "request"), "turn", speech_id=handle.speech_id,
+            expected_generation=handle.workspace.generation,
+            expected_sent_chars=output.speak_snapshot["sent_chars"],
+            expected_text=output.speak_snapshot["text"], text="旧内容续写",
         ) is None
 
     asyncio.run(scenario())
 
 
-def test_streamed_decision_extends_one_in_place_rewrite():
-    """Every further delta extends the same replacement, not a new one."""
+def test_streamed_speak_cannot_rewrite_existing_tail():
+    """流式 speak（新播报）不能接管现有事务的尾巴。"""
 
     async def scenario():
         seen = {"rewrite": [], "replace": 0}
@@ -410,10 +425,9 @@ def test_streamed_decision_extends_one_in_place_rewrite():
 
         await runtime._step(identity, {"USER_INPUT_REFINED"})
 
-        assert seen["rewrite"] == [
-            ("live_speech", "改"),
-            ("live_speech", "正"),
-        ]
+        assert seen["rewrite"] == []
+        assert "feeds" not in seen
+        assert runtime.minor_protocol_feedback[-1]["applied"] == "ignored_output_busy"
         assert seen["replace"] == 0
 
     asyncio.run(scenario())
@@ -435,8 +449,8 @@ def _runtime_with_output(output):
     return runtime, (runtime.episode_id, "request")
 
 
-def test_complete_decision_rewrites_the_unsent_tail_instead_of_replacing():
-    """A live response whose tail is still local must not be cut in half."""
+def test_complete_speak_cannot_rewrite_existing_tail():
+    """完整 speak（新播报）即使有未提交尾巴也必须拒绝。"""
 
     async def scenario():
         seen = {"rewrite": [], "replace": [], "cancel": []}
@@ -478,13 +492,13 @@ def test_complete_decision_rewrites_the_unsent_tail_instead_of_replacing():
         await runtime._apply_decision_v06(identity, "turn", envelope)
 
         # Only the part beyond the four locked characters is offered.
-        assert seen["rewrite"] == [("live_speech", "修正内容")]
+        assert seen["rewrite"] == []
         assert seen["replace"] == [] and seen["cancel"] == []
 
     asyncio.run(scenario())
 
 
-def test_complete_decision_replaces_when_the_sent_prefix_contradicts():
+def test_divergent_speak_cannot_hard_replace():
     """Content the provider already received cannot be rewritten in place."""
 
     async def scenario():
@@ -518,6 +532,134 @@ def test_complete_decision_replaces_when_the_sent_prefix_contradicts():
         # Divergence falls inside the irreversible prefix, so the decision
         # never even offers a rewrite and keeps the existing replacement path.
         assert seen["rewrite"] == []
-        assert seen["replace"] == [{"emotion": "calm"}]
+        assert seen["replace"] == []
+        assert "feeds" not in seen
 
+    asyncio.run(scenario())
+
+
+def test_controller_revision_confirms_boundary_and_emits_authoritative_text():
+    async def scenario():
+        output, handle, _tts, _player = _output_harness("playback_window", 500)
+        handle.finished = True
+        handle.text = "前缀旧尾巴"
+        state = AdmissionState(lead_ms=500)
+        state.producer_done = True
+        state.sent_chars = 2
+        state.push("旧尾巴")
+        handle.admission = state
+        events = []
+        async def emit(kind, payload):
+            events.append((kind, payload))
+        output.runtime.emit = emit
+        frozen = dict(output.speak_snapshot)
+        state.commit_segment("旧")
+        assert await output.rewrite_unsent(
+            handle.identity, handle.turn_id, speech_id=handle.speech_id,
+            text="新尾巴", expected_generation=0, expected_sent_chars=frozen["sent_chars"],
+            expected_text=frozen["text"]) is None
+        assert handle.text == "前缀旧尾巴" and not events
+        frozen = dict(output.speak_snapshot)
+        assert await output.rewrite_unsent(
+            handle.identity, handle.turn_id, speech_id=handle.speech_id,
+            text="改正", expected_generation=0, expected_sent_chars=frozen["sent_chars"],
+            expected_text=frozen["text"]) is handle
+        assert handle.text == "前缀旧改正"
+        assert output.state.current["assistant_text"] == handle.text
+        assert handle.workspace.staged_response == handle.text
+        assert events[0][0] == "speech.tail_rewritten"
+        assert events[0][1]["text"] == handle.text
+        assert events[0][1]["text_revision"] == 1
+        # 相同提交前缀也不能接受针对旧版本生成的第二次修订。
+        assert await output.rewrite_unsent(
+            handle.identity, handle.turn_id, speech_id=handle.speech_id,
+            text="再次修改", expected_generation=0, expected_sent_chars=frozen["sent_chars"],
+            expected_text=handle.text, expected_text_revision=0) is None
+    asyncio.run(scenario())
+
+
+def test_tts_send_in_flight_closes_revision_window_until_commit():
+    async def scenario():
+        output, handle, tts, player = _output_harness("direct", 0)
+        handle.finished = True
+        handle.text = "原句。"
+        entered, release = asyncio.Event(), asyncio.Event()
+        session = tts.session_instance
+        original_send = session.send_text
+        async def blocked_send(text):
+            entered.set()
+            await release.wait()
+            await original_send(text)
+        session.send_text = blocked_send
+        async def text_stream():
+            yield handle.text
+        task = asyncio.create_task(output._play_stream(handle.workspace, handle.workspace.token, text_stream(),
+                                                       speech_id=handle.speech_id, handle=handle))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert handle.admission.sending
+            assert not handle.rewritable
+            frozen = output.speak_snapshot
+            assert await output.rewrite_unsent(
+                handle.identity, handle.turn_id, speech_id=handle.speech_id,
+                text="不能抢改", expected_generation=0,
+                expected_sent_chars=frozen["sent_chars"], expected_text=frozen["text"]) is None
+            release.set()
+            session.finish_requested.set()
+            await asyncio.wait_for(task, 5)
+            assert session.sent == ["原句。"]
+            assert handle.admission.sent_chars == len("原句。")
+            assert not handle.admission.sending
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(scenario())
+
+
+def test_rewrite_event_is_part_of_public_session_protocol():
+    from voice_terminal.core.events import VoiceEvent
+    from voice_terminal.server.snapshot import ProtocolSequencer
+    event = VoiceEvent(type="speech.tail_rewritten", turn_id="turn",
+                       payload={"speech_id": "live", "text": "新文本", "text_revision": 1})
+    sequencer = ProtocolSequencer("conversation")
+    assert sequencer.public(event)
+    assert sequencer.envelope(event)["payload"]["text"] == "新文本"
+
+
+def test_revision_waits_until_old_local_text_has_finished_staging():
+    async def scenario():
+        output, handle, tts, _player = _output_harness("direct", 0)
+        handle.finished = True
+        handle.text = "旧尾巴仍在本地分段。"
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def detail(kind, **_payload):
+            if kind == "assistant.delta":
+                entered.set()
+                await release.wait()
+        output._detail = detail
+        async def text_stream():
+            yield handle.text
+        task = asyncio.create_task(output._play_stream(
+            handle.workspace, handle.workspace.token, text_stream(),
+            speech_id=handle.speech_id, handle=handle))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert handle.finished and not handle.admission.producer_done
+            assert not handle.rewritable
+            frozen = output.speak_snapshot
+            assert await output.rewrite_unsent(
+                handle.identity, handle.turn_id, speech_id=handle.speech_id,
+                text="新尾巴", expected_generation=0,
+                expected_sent_chars=frozen["sent_chars"], expected_text=frozen["text"]) is None
+            release.set()
+            tts.session_instance.finish_requested.set()
+            await asyncio.wait_for(task, 5)
+            assert tts.session_instance.sent == ["旧尾巴仍在本地分段。"]
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
     asyncio.run(scenario())

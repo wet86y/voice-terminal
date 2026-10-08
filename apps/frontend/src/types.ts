@@ -438,6 +438,7 @@ export interface SpeechOutputRecord {
 export type PlaybackQueueState = 'waiting' | 'playing'
 
 export interface PlaybackQueueItem {
+  text_revision?: number // text_revision（当前播报事务的尾巴修订版本）。
   speech_id: string
   conversation_id: string
   request_id?: string

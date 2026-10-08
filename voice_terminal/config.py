@@ -251,7 +251,7 @@ class TtsConfig:
     # while the returned-but-unplayed audio stays below this value, so the tail
     # of a live response stays locally replaceable for as long as possible.
     admission_lead_ms: int = 2500
-    sentence_prefetch_ms: int = 2000
+    sentence_prefetch_ms: int = 3000  # sentence_prefetch_ms（短句预取缓冲目标）。
     sentence_tick_ms: int = 50
     sentence_min_effective_chars: int = 10  # sentence_min_effective_chars（锁定文本块最少有效字符）。
     first_clause_timeout_ms: int = 400
@@ -913,7 +913,7 @@ class AppConfig:
                 emotion_transport=_string(tts.get("emotion_transport"), "voice_setting"),
                 session_reuse=_bool(tts.get("session_reuse"), True),
                 admission_lead_ms=int(_number(tts.get("admission_lead_ms"), 2500)),
-                sentence_prefetch_ms=int(_number(tts.get("sentence_prefetch_ms"), 2000)),
+                sentence_prefetch_ms=int(_number(tts.get("sentence_prefetch_ms"), 3000)),
                 sentence_tick_ms=int(_number(tts.get("sentence_tick_ms"), 50)),
                 sentence_min_effective_chars=int(_number(tts.get("sentence_min_effective_chars"), 10)),
                 first_clause_timeout_ms=int(_number(tts.get("first_clause_timeout_ms"), 400)),

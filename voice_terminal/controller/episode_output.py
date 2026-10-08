@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from .speech_pipeline import SpeechPipeline
 from .speech_frontier import SpeechFrontierMixin
+from .speech_inference import SpeechInferenceBoundary
 from .turn_workspace import TurnWorkspace
 from ..core.state import RuntimeState
 from ..tts.alignment import DeliveryResolver
@@ -84,7 +85,7 @@ class SpeechHandle:
         """Whether a later decision may still replace this tail in place."""
 
         state = self.admission
-        return bool(state is not None and state.rewritable and self.finished)
+        return bool(state is not None and state.rewritable and state.producer_done and self.finished)
 
     async def _put(self, value):
         if self.reason or self.task.done():
@@ -166,6 +167,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         # as the snapshot's accepted text, so a continuation baseline can never
         # shrink behind what the listener already has.
         self.delivered = {"turn_id": None, "text": ""}
+        self.inference_boundary = SpeechInferenceBoundary(self)  # inference_boundary（模型推理提交边界）。
 
     @property
     def active(self):
@@ -202,6 +204,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
             return None
         return {"speech_id": h.speech_id, "conversation_id": h.identity[0], "trace_id": h.identity[1],
                 "turn_id": h.turn_id, "output_generation": h.workspace.generation, "text": h.text,
+                "text_revision": getattr(h, "text_revision", 0),
                 "status": self.status, "kind": h.kind, "speech_state": h.state, "emotion_requested": h.emotion_requested,
                 "emotion_applied": h.emotion_applied}
 
@@ -210,7 +213,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         return [{"speech_id": item.speech_id, "kind": item.kind, "text": item.text,
                  "conversation_id": item.identity[0], "trace_id": item.identity[1],
                  "turn_id": item.turn_id, "output_generation": item.workspace.generation,
-                 "status": "QUEUED"}
+                 "text_revision": getattr(item, "text_revision", 0), "status": "QUEUED"}
                 for item in self._pending if not item.reason and not item.task.done()]
 
     def record_delivery(self, record):
@@ -407,6 +410,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         await self.runtime.emit("speech.text_delta", {
             "speech_id": h.speech_id, "conversation_id": h.identity[0], "turn_id": h.turn_id,
             "output_generation": h.workspace.generation, "text_delta": text,
+            "text_revision": getattr(h, "text_revision", 0),
             "emotion_requested": h.emotion_requested, "emotion_applied": h.emotion_applied,
             "provider": h.tts_backend,
         })
@@ -455,18 +459,20 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
                 self.loop.call_soon_threadsafe(lambda: self.controller._track(asyncio.create_task(publish())))
 
     async def begin(self, identity, turn_id, *, emotion="calm", kind="formal",
-                    _generation_advanced=False, _fresh_session=False, _defer_activation=False):
+                    _generation_advanced=False, _fresh_session=False):
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during cleanup")
+        # speak（新播报）只有空闲时可创建；显式 cancel（取消）替换由专用入口授权。
+        if not _generation_advanced and self.busy:
+            return None
         on_model_speech = getattr(self.controller, "_on_model_speech_accepted", None)
         if callable(on_model_speech) and not getattr(self.runtime, "should_defer_speech", lambda: False)():
             await on_model_speech()
-        # Keep at most one latest text candidate behind the active playback.
-        # The queue stores text handles only; it never owns provider PCM.
-        for pending in list(self._pending):
-            if pending is not self.handle and not pending.reason and not pending.task.done():
-                pending.reason = "superseded"
-                pending.task.cancel()
+        # 异步准备后再次确认；检查与注册之间没有让出事件循环。
+        if self.runtime.gate(identity):
+            raise ValueError("speech authorization expired during preparation")
+        if not _generation_advanced and self.busy:
+            return None
         if not _generation_advanced:
             self.generation += 1
         self.loop = asyncio.get_running_loop()
@@ -482,7 +488,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         if callable(register):
             register(h)
         if (getattr(self.runtime, "user_speaking", False) is False
-                and not self._playback_hold and not _defer_activation):
+                and not self._playback_hold):
             h.playback_ready.set()
             h.state = "READY"
         else:
@@ -516,46 +522,6 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
                                  "provider": h.tts_backend})
         await asyncio.sleep(0)
         return h
-
-    async def append_successor(self, identity, turn_id, *, baseline_speech_id, baseline_generation,
-                               suffix, emotion="calm"):
-        """Queue a verified suffix without withdrawing the audible speech.
-
-        A completed MiniMax Bidi generation cannot safely accept another
-        ``task_continue`` through the old worker.  Keep the public operation
-        at the output boundary so callers never need to know that detail: the
-        successor waits behind the active playback, synthesises only ``suffix``
-        and therefore never repeats the already accepted prefix.  A future
-        same-session continuation can replace this implementation without
-        changing the agent reconciliation contract.
-        """
-        if not suffix:
-            return None
-        active = self.handle
-        same_active = bool(
-            active and not active.reason and not active.task.done()
-            and active.speech_id == baseline_speech_id
-            and active.workspace.generation == baseline_generation
-        )
-        handle = await self.begin(
-            identity, turn_id, emotion=(active.emotion_requested if same_active else emotion),
-            kind="append", _defer_activation=same_active,
-        )
-        await handle.feed(suffix)
-        event = "speech.appended" if same_active else "speech.append_successor"
-        await self.runtime.emit(event, {
-            "speech_id": active.speech_id if same_active else handle.speech_id,
-            "successor_speech_id": handle.speech_id,
-            "conversation_id": handle.identity[0], "turn_id": turn_id,
-            "output_generation": handle.workspace.generation,
-            "baseline_speech_id": baseline_speech_id,
-            "baseline_generation": baseline_generation,
-            "baseline_chars": len(active.text) if same_active else 0, "appended_chars": len(suffix),
-            "cumulative_chars": (len(active.text) + len(suffix)) if same_active else len(suffix),
-            "provider_generation": handle.workspace.generation,
-            "provider": handle.tts_backend,
-        })
-        return handle
 
     async def replace_current(self, identity, turn_id, *, emotion="calm"):
         """Replace all output based on the current decision in one tool call.
@@ -700,6 +666,8 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
 
     async def enqueue_text(self, identity, turn_id, text, *, emotion="calm", kind="formal"):
         h = await self.begin(identity, turn_id, emotion=emotion, kind=kind)
+        if h is None:
+            return None
         await h.feed(text)
         await h.finish()
         return h

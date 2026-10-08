@@ -153,16 +153,6 @@ class ContinuationHarness:
         await self.wait_for_drain(handle)
         return handle
 
-    async def append(self, first):
-        handle = await self.output.append_successor(
-            self.identity, self.turn_id,
-            baseline_speech_id=first.speech_id,
-            baseline_generation=first.workspace.generation,
-            suffix=SUFFIX_TEXT,
-        )
-        await handle.finish()
-        return handle
-
     async def wait_for_drain(self, handle, timeout=READY_TIMEOUT_SECONDS):
         key = await asyncio.wait_for(self.player.drain_started.get(), timeout)
         assert key == handle.workspace.playback_key
@@ -180,116 +170,122 @@ class ContinuationHarness:
             await asyncio.gather(*self.background, return_exceptions=True)
 
 
-def test_queued_suffix_starts_promptly_after_previous_pcm_drains():
+def _agent(harness):
+    conversation = ConversationRuntime()
+    conversation.begin_turn(harness.turn_id)
+    harness.identity = (conversation.conversation_id, "request")
+    registry = SimpleNamespace(begin_turn=lambda _turn: None, action_definitions=lambda: [])
+    runtime = AgentEpisodeRuntime(None, registry, harness.output, harness.runtime.emit,
+                                  conversation=conversation, ledger=SessionLedger())
+    runtime.episode_id = conversation.conversation_id
+    runtime.last_turn_id = harness.turn_id
+    return runtime
+
+
+def test_new_speak_is_rejected_until_actual_pcm_playback_completes():
     async def scenario():
         harness = ContinuationHarness()
+        runtime = _agent(harness)
         try:
             first = await harness.first()
-            successor = await harness.append(first)
+            decision = DecisionEnvelope(SpeechDecision("speak", "calm", SUFFIX_TEXT), ())
+            await runtime._apply_decision_v06(harness.identity, harness.turn_id, decision)
+            assert await harness.output.begin(harness.identity, harness.turn_id) is None
+            assert harness.output.handle is first
             assert len(harness.tts.sessions) == 1
-            assert harness.player.buffered_ms == 80
             assert harness.render() == b"\x01\x00" * 80
-
-            await harness.wait_for_drain(successor, HANDOFF_TIMEOUT_SECONDS)
-            assert harness.tts.sessions[0].sent == [FIRST_TEXT]
+            await asyncio.wait_for(asyncio.shield(first.task), HANDOFF_TIMEOUT_SECONDS)
+            assert not harness.output.busy
+            # 同轮次的新请求仍携带已交付前缀；准入时只提交新增尾巴。
+            decision = DecisionEnvelope(SpeechDecision("speak", "calm", FIRST_TEXT + SUFFIX_TEXT), ())
+            await runtime._apply_decision_v06(harness.identity, harness.turn_id, decision)
+            second = harness.output.handle
+            await harness.wait_for_drain(second)
             assert harness.tts.sessions[1].sent == [SUFFIX_TEXT]
-            assert first.snapshot.enqueued_ms == first.snapshot.output_estimated_ms == 80
-            assert harness.records[0]["delivery"]["heard_text"] == FIRST_TEXT
-            assert harness.output.speak_snapshot["text"] == FIRST_TEXT + SUFFIX_TEXT
-
-            settled = harness.events.index(("transaction_settled", first.speech_id))
-            allowed = harness.events.index(("player_allowed", successor.workspace.playback_key))
-            assert settled < allowed
-            assert harness.render() == b"\x02\x00" * 80
-            await asyncio.wait_for(asyncio.shield(successor.task), HANDOFF_TIMEOUT_SECONDS)
-            assert harness.output.delivered["text"] == FIRST_TEXT + SUFFIX_TEXT
-            assert [record["status"] for record in harness.records] == ["completed", "completed"]
+            harness.render()
+            await asyncio.wait_for(asyncio.shield(second.task), HANDOFF_TIMEOUT_SECONDS)
         finally:
             await harness.close()
-
     asyncio.run(scenario())
 
 
-def test_suffix_still_waits_for_device_output_after_local_queue_is_empty():
+def test_empty_local_audio_queue_does_not_open_device_output_boundary():
     async def scenario():
         harness = ContinuationHarness(device_latency_ms=40)
         try:
             first = await harness.first()
-            successor = await harness.append(first)
             harness.render()
             progress = harness.player.progress(first.workspace.playback_key)
             assert progress["buffered_ms"] == 0
             assert progress["output_estimated_ms"] < progress["enqueued_ms"]
-            assert first.snapshot is None
+            assert await harness.output.begin(harness.identity, harness.turn_id) is None
             assert len(harness.tts.sessions) == 1
-
-            await harness.wait_for_drain(successor, HANDOFF_TIMEOUT_SECONDS)
+            await asyncio.wait_for(asyncio.shield(first.task), HANDOFF_TIMEOUT_SECONDS)
             assert first.snapshot.output_estimated_ms == first.snapshot.enqueued_ms
-            harness.render()
-            await asyncio.wait_for(asyncio.shield(successor.task), HANDOFF_TIMEOUT_SECONDS)
+            assert not harness.output.busy
         finally:
             await harness.close()
-
     asyncio.run(scenario())
 
 
-def test_suffix_preserves_settlement_boundary_and_user_speech_hold():
+def test_settlement_stays_busy_and_rejected_request_is_never_replayed():
     async def scenario():
         harness = ContinuationHarness()
+        runtime = _agent(harness)
         try:
             first = await harness.first()
-            successor = await harness.append(first)
             harness.settlement_gate = asyncio.Event()
             harness.render()
             await asyncio.wait_for(harness.settlement_started.wait(), HANDOFF_TIMEOUT_SECONDS)
             assert harness.output.busy
-            assert first.snapshot.buffered_ms == 0
-            assert len(harness.tts.sessions) == 1
-
-            harness.runtime.user_speaking = True
-            assert harness.output.hold_unplayed() == successor.speech_id
+            assert harness.output.speak_snapshot["queue_status"] == "empty"
+            state = StreamedSpeechAdmissionState(
+                harness.identity, harness.turn_id, dict(harness.output.speak_snapshot),
+                0, None, False, None)
+            decision = SpeechDecision("speak", "calm", SUFFIX_TEXT)
+            await queue_streamed_speech(runtime, state, decision, SUFFIX_TEXT[:1])
+            assert state.rejected
+            assert await harness.output.begin(harness.identity, harness.turn_id) is None
             harness.settlement_gate.set()
             await asyncio.wait_for(asyncio.shield(first.task), HANDOFF_TIMEOUT_SECONDS)
+            await queue_streamed_speech(runtime, state, decision, SUFFIX_TEXT, final=True)
+            assert state.speech_handle is None
             assert len(harness.tts.sessions) == 1
-            assert not successor.playback_ready.is_set()
-
+            # 新请求可以空闲创建，但仍遵守用户讲话的播放保持。
+            harness.runtime.user_speaking = True
+            fresh = await harness.output.begin(harness.identity, harness.turn_id)
+            await fresh.feed(SUFFIX_TEXT)
+            await fresh.finish()
+            assert not fresh.playback_ready.is_set()
+            assert await harness.output.begin(harness.identity, harness.turn_id) is None
             harness.runtime.user_speaking = False
-            assert harness.output.release_held() == successor.speech_id
-            await harness.wait_for_drain(successor, HANDOFF_TIMEOUT_SECONDS)
+            harness.output.release_held()
+            await harness.wait_for_drain(fresh)
             harness.render()
-            await asyncio.wait_for(asyncio.shield(successor.task), HANDOFF_TIMEOUT_SECONDS)
+            await asyncio.wait_for(asyncio.shield(fresh.task), HANDOFF_TIMEOUT_SECONDS)
         finally:
             await harness.close()
-
     asyncio.run(scenario())
 
 
-def test_barge_in_cancels_queued_suffix_and_rejects_retired_audio():
+def test_cancel_with_text_replaces_busy_output_and_rejects_old_audio():
     async def scenario():
         harness = ContinuationHarness()
+        runtime = _agent(harness)
         try:
             first = await harness.first()
-            successor = await harness.append(first)
             assert harness.render(20) == b"\x01\x00" * 20
-            harness.output.cancel_all("interrupted")
-            await asyncio.wait_for(
-                asyncio.gather(first.task, successor.task, return_exceptions=True),
-                READY_TIMEOUT_SECONDS,
-            )
-            assert first.reason == successor.reason == "interrupted"
-            assert len(harness.tts.sessions) == 1
-
-            replacement = await harness.output.replace_current(harness.identity, "new-turn")
-            await replacement.feed("改口后的句子。")
-            await replacement.finish()
+            decision = DecisionEnvelope(SpeechDecision("cancel", "calm", "我刚才听错了，改口。"), ())
+            await runtime._apply_decision_v06(harness.identity, harness.turn_id, decision)
+            replacement = harness.output.handle
             await harness.wait_for_drain(replacement)
             harness.player.enqueue(first.workspace.playback_key, b"\x09\x00" * 80)
             assert harness.render() == b"\x02\x00" * 80
             await asyncio.wait_for(asyncio.shield(replacement.task), HANDOFF_TIMEOUT_SECONDS)
-            assert harness.records[-1]["text"] == "改口后的句子。"
+            assert first.reason == "replaced"
+            assert harness.records[-1]["text"] == "我刚才听错了，改口。"
         finally:
             await harness.close()
-
     asyncio.run(scenario())
 
 
@@ -328,43 +324,54 @@ def test_late_same_turn_decision_uses_settled_prefix_without_replaying_it():
     asyncio.run(scenario())
 
 
-def test_cached_active_prefix_survives_completion_during_model_stream():
+def test_request_created_while_busy_cannot_start_after_playback_finishes():
     async def scenario():
         harness = ContinuationHarness()
+        runtime = _agent(harness)
         try:
-            conversation = ConversationRuntime()
-            conversation.begin_turn(harness.turn_id)
-            harness.identity = (conversation.conversation_id, "request")
-            registry = SimpleNamespace(begin_turn=lambda _turn: None, action_definitions=lambda: [])
-            runtime = AgentEpisodeRuntime(
-                None, registry, harness.output, harness.runtime.emit,
-                conversation=conversation, ledger=SessionLedger(),
-            )
-            runtime.episode_id = conversation.conversation_id
-            runtime.last_turn_id = harness.turn_id
-
             first = await harness.first()
-            harness.render(20)
             state = StreamedSpeechAdmissionState(
-                identity=harness.identity, source_turn_id=harness.turn_id,
-                snapshot=harness.output.speak_snapshot,
-                context_locked_chars=len(FIRST_TEXT), system_check_id=None,
-                same_turn_transcript_reassessment=True, dispatch_context=None,
-            )
-            decision = SpeechDecision("speak", "calm", FIRST_TEXT + SUFFIX_TEXT)
-            assert not await queue_streamed_speech(runtime, state, decision, FIRST_TEXT[:1])
-            assert state.prefix_baseline["source"] == "active_same_turn"
-
-            harness.render(60)
-            await asyncio.wait_for(asyncio.shield(first.task), HANDOFF_TIMEOUT_SECONDS)
-            assert await queue_streamed_speech(runtime, state, decision, FIRST_TEXT + SUFFIX_TEXT)
-            successor = state.speech_handle
-            await successor.finish()
-            await harness.wait_for_drain(successor, HANDOFF_TIMEOUT_SECONDS)
-            assert harness.tts.sessions[1].sent == [SUFFIX_TEXT]
+                harness.identity, harness.turn_id, dict(harness.output.speak_snapshot),
+                len(FIRST_TEXT), None, True, None)
+            # 模型尚未返回文本，旧播报已播放并结算；仍按请求时的忙碌边界拒绝。
             harness.render()
-            await asyncio.wait_for(asyncio.shield(successor.task), HANDOFF_TIMEOUT_SECONDS)
+            await asyncio.wait_for(asyncio.shield(first.task), HANDOFF_TIMEOUT_SECONDS)
+            decision = SpeechDecision("speak", "calm", FIRST_TEXT + SUFFIX_TEXT)
+            await queue_streamed_speech(runtime, state, decision, decision.text, final=True)
+            assert state.rejected and state.speech_handle is None
+            assert len(harness.tts.sessions) == 1
         finally:
             await harness.close()
+    asyncio.run(scenario())
 
+
+def test_concurrent_begin_confirms_idle_after_async_preparation():
+    async def scenario():
+        harness = ContinuationHarness()
+        entered = 0
+        both_entered = asyncio.Event()
+        release = asyncio.Event()
+        async def prepare():
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                both_entered.set()
+            await release.wait()
+        harness.output.controller._on_model_speech_accepted = prepare
+        try:
+            tasks = [asyncio.create_task(harness.output.begin(harness.identity, harness.turn_id))
+                     for _ in range(2)]
+            await asyncio.wait_for(both_entered.wait(), READY_TIMEOUT_SECONDS)
+            release.set()
+            handles = await asyncio.gather(*tasks)
+            assert sum(handle is not None for handle in handles) == 1
+            accepted = next(handle for handle in handles if handle is not None)
+            await accepted.feed(FIRST_TEXT)
+            await accepted.finish()
+            await harness.wait_for_drain(accepted)
+            harness.render()
+            await asyncio.wait_for(asyncio.shield(accepted.task), HANDOFF_TIMEOUT_SECONDS)
+            assert len(harness.tts.sessions) == 1
+        finally:
+            await harness.close()
     asyncio.run(scenario())

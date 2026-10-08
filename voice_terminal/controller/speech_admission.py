@@ -46,6 +46,8 @@ class AdmissionState:
         self.sent_chars = 0
         self.epoch = 0
         self.closed = False
+        self.producer_done = False  # producer_done（本地原始文本已全部分段入队）。
+        self.sending = False  # sending（正在向服务端提交，确认完成前禁止修订）。
         self.overrun_reported = False
         self._restage = restage or (lambda value: [value] if value else [])
         self.signal = asyncio.Event()
@@ -54,7 +56,7 @@ class AdmissionState:
     def rewritable(self) -> bool:
         """Whether an unsent tail still exists that a replacement can reach."""
 
-        return not self.closed
+        return not self.closed and not self.sending
 
     @property
     def overrun(self) -> bool:
@@ -226,7 +228,7 @@ class AdmissionState:
         transaction can no longer accept a replacement.
         """
 
-        if self.closed:
+        if not self.rewritable:
             return -1
         dropped = self.staged_chars
         self.staged.clear()

@@ -1133,7 +1133,7 @@ def test_system_check_keeps_system_identity_but_uses_current_speech_turn(prompt_
         assert runtime._last_model_speak_state == {
             "state": "speaking",
             "owner_scope": "current_turn",
-            "continuation_mode": "append_only",
+            "continuation_mode": "none",
             "text_parts": {
                 "committed_prefix": "我先说明第一点。",
                 "current_clause": "",
@@ -1196,16 +1196,9 @@ def test_system_check_extension_uses_existing_append_transaction():
             dispatch_context=context,
         )
 
-        assert len(runtime.output.appended) == 1
-        identity, turn_id, kwargs = runtime.output.appended[0]
-        assert identity == ("conversation-a", "request-a")
-        assert turn_id == "turn-a"
-        assert kwargs["suffix"] == "，补充一点。"
-        assert runtime._system_check_speeches["speech-suffix"] == {
-            "system_check_id": "system-check-a",
-            "speech_turn_id": "turn-a",
-            "scheduler_generation": 1,
-        }
+        assert runtime.output.appended == []
+        assert runtime._system_check_speeches == {}
+        assert runtime.minor_protocol_feedback[-1]["applied"] == "ignored_output_busy"
 
     asyncio.run(scenario())
 
