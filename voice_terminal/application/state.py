@@ -6,6 +6,8 @@ import threading
 import time
 import uuid
 
+from .ports import validate_endpoint_url
+
 TERMINAL = {"ready", "disabled", "failed", "blocked", "external", "stopped"}
 LABELS = {
     "host": "应用宿主", "web": "界面服务", "setup": "环境与配置检查",
@@ -22,8 +24,10 @@ class ApplicationState:
             "instance_id": uuid.uuid4().hex,  # instance_id（应用实例标识）。
             "revision": 0,  # revision（状态版本）。
             "state": "starting", "phase": "建立应用入口", "started_at": time.time(),
-            "startup_complete": False, "core_available": False, "stopping": False,
+            "startup_complete": False, "startup_skipped": False, "core_available": False, "stopping": False,
             "voice_api_url": "", "voice_ws_url": "", "capabilities": {},
+            "endpoints": {},  # endpoints（端点表）：url（实际地址）、preferred_url（首选地址）、scheme（协议）、host（主机）、port（端口）、path（路径）、generation（代次）、pid（进程编号）、created_at（创建时间）。
+            "endpoint_revision": 0,  # endpoint_revision（端点版本）：每次地址或代次变化时递增。
             "voice_api_ready": False,  # voice_api_ready（轻量业务接口已监听，独立于模型与会话就绪）。
             "sampled_at": None, "total_memory_rss_bytes": None,
             "total_memory_private_commit_bytes": None,  # 去重后的受管进程私有提交内存（字节）。
@@ -78,6 +82,58 @@ class ApplicationState:
                     cpu_percent=None, uptime_seconds=None)
             self.value["revision"] += 1
             self.condition.notify_all()
+
+    def set_endpoint(self, component: str, endpoint_url: str | None, *,
+                     preferred_url: str | None = None, generation: str | None = None,
+                     pid: int | None = None, created_at: float | None = None) -> None:
+        """Publish one endpoint row（端点记录）as part of the host snapshot."""
+        actual = validate_endpoint_url(component, endpoint_url) if endpoint_url else None
+        preferred = validate_endpoint_url(component, preferred_url) if preferred_url else None
+        with self.condition:
+            endpoints = self.value["endpoints"]
+            previous = endpoints.get(component, {})
+            row = {
+                **previous,
+                **(actual or {}),
+                "url": actual["url"] if actual else previous.get("url", ""),
+                "preferred_url": preferred["url"] if preferred else previous.get("preferred_url", ""),
+                "generation": generation if generation is not None else previous.get("generation"),
+                "pid": pid if pid is not None else previous.get("pid"),
+                "created_at": created_at if created_at is not None else previous.get("created_at"),
+            }
+            changed = any(previous.get(name) != row.get(name)
+                          for name in ("url", "preferred_url", "generation", "pid", "created_at",
+                                       "scheme", "host", "port", "path"))
+            endpoints[component] = row
+            if component == "voice":
+                self.value["voice_api_url"] = row["url"]
+                self.value["voice_ws_url"] = row["url"].replace("http://", "ws://") + "/ws" if row["url"] else ""
+            if changed:
+                self.value["endpoint_revision"] += 1
+                self.value["revision"] += 1
+                self.condition.notify_all()
+
+    def clear_endpoint(self, component: str, *, generation: str | None = None) -> None:
+        """Mark a previous listener address unavailable before replacing it."""
+        with self.condition:
+            previous = self.value["endpoints"].get(component, {})
+            if not previous and component != "voice":
+                return
+            row = dict(previous)
+            row.update(url="", generation=generation, pid=None, created_at=None)
+            for field in ("scheme", "host", "port", "path"):
+                row.pop(field, None)
+            changed = (not previous or any(previous.get(name) != row.get(name)
+                for name in ("url", "generation", "pid", "created_at", "scheme", "host", "port", "path")))
+            self.value["endpoints"][component] = row
+            if component == "voice":
+                self.value["voice_api_url"] = ""
+                self.value["voice_ws_url"] = ""
+                self.value["voice_api_ready"] = False
+            if changed:
+                self.value["endpoint_revision"] += 1
+                self.value["revision"] += 1
+                self.condition.notify_all()
 
     def finish(self) -> None:
         snapshot = self.snapshot()

@@ -48,6 +48,8 @@ export interface ApplicationSnapshot {
   instance_id: string
   /** revision（状态版本）。 */
   revision: number
+  /** endpoint_revision（语音端点版本）：地址不变但服务进程重启时仍触发重连。 */
+  endpoint_revision?: number
   /** state（应用整体状态）。 */
   state: string
   /** phase（当前启动或运行阶段）。 */
@@ -56,6 +58,8 @@ export interface ApplicationSnapshot {
   started_at: number
   /** startup_complete（全部组件结束启动尝试）。 */
   startup_complete: boolean
+  /** startup_skipped（缺少本地模型时直接开放产品设置）。 */
+  startup_skipped?: boolean
   /** core_available（核心语音能力可用）。 */
   core_available: boolean
   /** stopping（正在退出）。 */
@@ -143,6 +147,7 @@ function clearHostConfiguration() {
   configuration.origin = ''
   configuration.voice_api_url = ''
   configuration.voice_ws_url = ''
+  delete configuration.endpoint_revision
   configuration.business_ready = false
 }
 
@@ -167,10 +172,16 @@ function apply(value: ApplicationSnapshot) {
   if (window.__VOICE_APPLICATION__) {
     window.__VOICE_APPLICATION__.voice_api_url = value.voice_api_url
     window.__VOICE_APPLICATION__.voice_ws_url = value.voice_ws_url
+    if (value.endpoint_revision === undefined) delete window.__VOICE_APPLICATION__.endpoint_revision
+    else window.__VOICE_APPLICATION__.endpoint_revision = value.endpoint_revision
     window.__VOICE_APPLICATION__.business_ready = applicationApiReady(value)
   }
   // Publish Host-provided addresses and permission before the synchronous
   // businessReady watcher can start product requests or the voice socket.
+  if (value.startup_skipped === true) {
+    inspecting.value = true
+    rememberStartupSkip()
+  }
   snapshot.value = value
   if (value.state === 'stopped' && clock !== undefined) {
     now.value = Date.now()

@@ -1,16 +1,23 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Voice Terminal · 语音终端</title><link rel="icon" type="image/svg+xml" href="app-icon.svg"><link rel="stylesheet" href="startup.css"><style>html,body{margin:0;background:#0e1118}</style></head>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Voice Terminal · 语音终端</title><link rel="icon" type="image/svg+xml" href="app-icon.svg"><link rel="stylesheet" href="startup.css"><style>html,body{margin:0;background:#0e1118}button[hidden]{display:none!important}</style></head>
 <body><main class="startup-screen" role="status"><section class="startup-content">
 <img class="startup-icon" src="app-icon.svg" alt="语音终端" width="72" height="72">
 <h1 class="startup-title" id="title">应用启动中</h1>
 <p class="startup-status" id="message" aria-live="polite">正在启动界面服务</p>
 <div class="startup-progress" id="progress" data-indeterminate="true" role="progressbar" aria-label="应用启动进度"><span class="startup-progress-fill"></span></div>
-<div class="startup-actions"><button class="startup-button" id="skip" type="button">跳过</button><button class="startup-button" id="exit" type="button" hidden>退出应用</button></div>
+<div class="startup-actions" style="flex-wrap:wrap;justify-content:center"><button class="startup-button" id="choose" hidden>选择工作区</button><button class="startup-button" id="reselect" hidden>重选目录</button><button class="startup-button" id="retry" hidden>重试</button><button class="startup-button" id="cancel" hidden>取消展开</button><button class="startup-button" id="manage" hidden>进入组件管理</button><button class="startup-button" id="skip" hidden>跳过</button><button class="startup-button" id="exit">退出</button></div>
 </section></main><script>
-const invoke=(name)=>window.__TAURI__.core.invoke(name);
-const title=document.getElementById('title'),message=document.getElementById('message'),skip=document.getElementById('skip'),exit=document.getElementById('exit');
-function showError(error){title.textContent='启动遇到问题';message.textContent=String(error);message.classList.add('is-error');document.getElementById('progress').hidden=true;skip.hidden=true;exit.hidden=false;}
-async function refresh(){try{const state=await invoke('desktop_status');if(state.error){showError(state.error);return;}if(state.startup_skipped){skip.disabled=true;skip.textContent='正在打开设置';}if(!state.ready)setTimeout(refresh,300);}catch(error){showError(error);}}
-skip.onclick=async()=>{skip.disabled=true;try{await invoke('skip_startup');skip.textContent='正在打开设置';}catch(error){skip.disabled=false;showError(error);}};
-exit.onclick=()=>invoke('exit_application');refresh();
+// Startup state（启动状态）：选择、展开、失败和管理均复用当前画面。
+const invoke=(name,args)=>window.__TAURI__.core.invoke(name,args),element=id=>document.getElementById(id);
+let busy=false,lastState,exiting=false;
+window.addEventListener('voice-terminal:exiting',()=>{exiting=true;document.querySelector('.startup-screen').classList.add('is-exiting');element('title').textContent='正在退出应用';element('message').textContent='正在关闭本地组件';element('message').classList.remove('is-error');element('progress').dataset.indeterminate='true';element('progress').setAttribute('aria-label','应用退出进度');document.querySelector('.startup-progress-fill').removeAttribute('style');});
+function showError(failure){if(exiting)return;element('title').textContent='初始化尚未完成';element('message').textContent=String(failure);element('message').classList.add('is-error');element('retry').hidden=false;element('reselect').hidden=false;}
+async function initialize(reselect){busy=true;element('message').classList.remove('is-error');try{await invoke('desktop_initialize',{reselect});}catch(failure){showError(failure);}finally{busy=false;}}
+async function refresh(){if(exiting)return;try{const state=await invoke('desktop_status');if(exiting)return;lastState=state;
+const init=state.initialization||{},runtime=state.runtime||{},preparing=busy||state.workspace_busy;
+element('choose').hidden=state.workspace_ready||preparing||state.development;element('reselect').hidden=state.development||(!state.error&&!preparing);element('retry').hidden=!state.error;element('cancel').hidden=!preparing||init.can_cancel===false;element('manage').hidden=!state.workspace_ready;element('skip').hidden=!state.workspace_ready||!runtime.service_ready;
+if(state.error)showError(state.error);else{element('title').textContent=preparing?'正在准备工作区':'应用启动中';element('message').textContent=preparing?init.phase||'正在展开程序本体':!state.workspace_ready?'请选择文件夹作为整个工作区':runtime.service_ready?'正在启动语音服务':'本体已就绪，可进入组件管理配置语音环境';}
+const total=init.total_bytes||0,done=init.completed_bytes||0;element('progress').dataset.indeterminate=String(!total);if(total){const fill=document.querySelector('.startup-progress-fill');fill.style.animation='none';fill.style.width=Math.min(100,done*100/total)+'%';}
+}catch(failure){if(!exiting)showError(failure);}if(!exiting)setTimeout(refresh,300);}
+element('choose').onclick=()=>initialize(true);element('reselect').onclick=()=>initialize(true);element('retry').onclick=()=>lastState?.workspace_ready&&!lastState?.initialization_failed?invoke('desktop_start_service').catch(showError):initialize(false);element('cancel').onclick=()=>invoke('desktop_cancel_init').catch(showError);element('manage').onclick=()=>invoke('desktop_manage').catch(showError);element('skip').onclick=()=>invoke('skip_startup').catch(showError);element('exit').onclick=()=>invoke('exit_application').catch(showError);refresh();
 </script></body></html>

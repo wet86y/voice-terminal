@@ -1,6 +1,39 @@
 {
   "identifier": "boot",
-  "description": "本地加载页只允许读取状态、跳过加载画面和退出当前应用。",
-  "windows": ["main"],
-  "permissions": ["allow-desktop-status", "allow-skip-startup", "allow-exit-application"]
+  "description": "受控本地启动与组件管理页面；原生端检查渠道与窗口来源。",
+  "windows": [
+    "main",
+    "startup"
+  ],
+  "permissions": [
+    "allow-desktop-status",
+    "allow-skip-startup",
+    "allow-exit-application",
+    "allow-desktop-initialize",
+    "allow-desktop-manage",
+    "allow-desktop-start-service",
+    "allow-desktop-cancel-init",
+    "allow-voice-environment-status",
+    "allow-voice-environment-plan",
+    "allow-voice-environment-configure",
+    "allow-voice-environment-import",
+    "allow-gpu-environment-register",
+    "allow-gpu-environment-probe",
+    "allow-environment-guide",
+    "allow-open-logs",
+    "allow-focus-main",
+    "allow-workspace-info",
+    "allow-workspace-choose",
+    "allow-workspace-link",
+    "allow-workspace-migrate",
+    "allow-resource-inventory",
+    "allow-resource-download",
+    "allow-resource-import",
+    "allow-resource-import-confirm",
+    "allow-resource-open-source",
+    "allow-resource-cancel",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-resource-install-plan"
+  ]
 }

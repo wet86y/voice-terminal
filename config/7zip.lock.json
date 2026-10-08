@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "version": "26.04",
+  "repository": "https://github.com/ip7z/7zip.git",
+  "commit": "9128b80e3a471108678e2b3ec3c985861c8d7b0f",
+  "fields": {"schema":"构建依赖锁定格式","version":"完整压缩工具版本","repository":"官方源码仓库","commit":"固定源码提交"}
+}

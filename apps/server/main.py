@@ -27,6 +27,8 @@ import uvicorn  # type: ignore
 from voice_terminal.config import PersonaConfig, load_config
 from voice_terminal.paths import AppPaths
 from voice_terminal.application.managed import run_uvicorn, report as application_report
+from voice_terminal.application.managed import report_endpoint
+from voice_terminal.application.ports import bind_loopback, endpoint_url
 from voice_terminal.env import load_env_file
 from voice_terminal.logging_setup import configure_logging
 from voice_terminal.model_registry import ModelRegistryService, WindowsCredentialVault
@@ -68,7 +70,9 @@ def _runtime_build_info(root: Path, effective_config: Path) -> dict[str, str | i
     return info
 
 
-def build_application(config_path: Path | None = None) -> tuple[object, SessionRuntime]:
+def build_application(config_path: Path | None = None, *, bind_listener: bool = False,
+                      preferred_host: str | None = None,
+                      preferred_port: int | None = None) -> tuple[object, SessionRuntime]:
     root = project_root(Path(__file__))
     paths = AppPaths.resolve(root)
     default_path = root / "config" / "default.yaml"
@@ -87,11 +91,21 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
         config=yaml_config,
     )
     config = product_settings.effective_config()
+    bound_socket = None
+    if bind_listener:
+        # listener（监听套接字）先于 SessionRuntime（会话运行时）和模型初始化绑定，防止端口探测后再绑定的竞态。
+        bound_socket, actual_port = bind_loopback(
+            preferred_port if preferred_port is not None else config.server.port,
+            host=preferred_host or config.server.host,
+        )
+        config = replace(config, server=replace(config.server, host="127.0.0.1", port=actual_port))
+        report_endpoint("voice", endpoint_url("voice", actual_port))
     runtime = SessionRuntime(
         config,
         product_settings=product_settings,
         speaker_worker_config_path=effective_config,
     )
+    runtime._application_listener_socket = bound_socket
     runtime.build_info = _runtime_build_info(root, effective_config)
     model_registry = ModelRegistryService(
         config=config,
@@ -123,12 +137,14 @@ def build_application(config_path: Path | None = None) -> tuple[object, SessionR
         try:
             if runtime._application_phased_startup:
                 # 接口先监听；凭据已恢复，DSH（代理执行宿主）可以与三路模型加载重叠。
-                runtime.begin_dsh_start()
+                if os.environ.get("VOICE_APP_SKIP_DSH_STARTUP") != "1":
+                    runtime.begin_dsh_start()
                 application_report("voice", "轻量接口已建立，等待本地模型加载放行")
             else:
                 await runtime.initialize()
                 await runtime.restore_startup_compute()
-                if not os.environ.get("VOICE_APP_ORIGIN"):
+                if (os.environ.get("VOICE_APP_SKIP_DSH_STARTUP") != "1"
+                        and not os.environ.get("VOICE_APP_ORIGIN")):
                     runtime.begin_dsh_start()
                 application_report("voice", "初始化完成，等待服务监听")
             yield
@@ -163,12 +179,17 @@ def main() -> None:
     paths = AppPaths.resolve(root)
     load_env_file(paths.env_file)
     configure_logging(paths.logs / "voice-server.log")
-    app, runtime = build_application(args.config)
+    app, runtime = build_application(args.config, bind_listener=True,
+        preferred_host=args.host, preferred_port=args.port)
     logging.getLogger(__name__).info("server.runtime_build %s", runtime.build_info)
-    host = args.host or runtime.config.server.host
-    port = args.port or runtime.config.server.port
-    run_uvicorn(app, host=host, port=port, log_level="info", timeout_graceful_shutdown=10,
-        on_shutdown=runtime.begin_application_shutdown)
+    bound_socket = runtime._application_listener_socket
+    try:
+        run_uvicorn(app, sock=bound_socket, host=runtime.config.server.host,
+            port=runtime.config.server.port, log_level="info", timeout_graceful_shutdown=10,
+            on_shutdown=runtime.begin_application_shutdown)
+    finally:
+        if bound_socket is not None:
+            bound_socket.close()
 
 
 if __name__ == "__main__":

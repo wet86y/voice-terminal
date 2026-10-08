@@ -22,7 +22,8 @@ from voice_terminal.analysis.smart_turn import SmartTurn
 from voice_terminal.analysis.sensevoice import SenseVoice
 from voice_terminal.logging_setup import configure_logging
 from voice_terminal.server.product import ProductSettingsStore
-from voice_terminal.application.managed import report, run_uvicorn
+from voice_terminal.application.managed import report, report_endpoint, run_uvicorn
+from voice_terminal.application.ports import bind_loopback, endpoint_url
 
 
 def main():
@@ -37,6 +38,9 @@ def main():
         path=paths.config / "product-settings.json",
         config=config,
     ).effective_config()
+    address = urlparse(config.smart_turn.analysis_url)
+    listener, actual_port = bind_loopback(address.port or 8767, host=address.hostname or "127.0.0.1")
+    report_endpoint("analysis", endpoint_url("analysis", actual_port))
     configure_logging(paths.logs / "analysis-worker.log")
     lanes = {}
     report("analysis", "加载语句结束判断与语音精修模型")
@@ -64,9 +68,12 @@ def main():
         except Exception as exc:
             logging.exception("analysis.load_failed operation=%s", name)
             lane.error = str(exc)
-    address = urlparse(config.smart_turn.analysis_url)
-    run_uvicorn(create_analysis_app(lanes), host=address.hostname or "127.0.0.1", port=address.port or 8767,
-                ws_max_size=3 * 1024 * 1024, timeout_graceful_shutdown=3)
+    try:
+        run_uvicorn(create_analysis_app(lanes), sock=listener,
+            host="127.0.0.1", port=actual_port,
+            ws_max_size=3 * 1024 * 1024, timeout_graceful_shutdown=3)
+    finally:
+        listener.close()
 
 
 if __name__ == "__main__":

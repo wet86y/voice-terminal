@@ -2,11 +2,11 @@
 . (Join-Path $PSScriptRoot 'start-desktop.ps1')
 
 $BuildStub = {
-  # Debug（调试构建）、SkipFrontend（跳过静态界面构建）；Bound 字段表示参数是否显式传入。
-  param([switch]$Debug, [switch]$SkipFrontend)
+  # LaunchChannel（启动渠道）、OptimizationLevel（优化级别）、SkipFrontend（跳过静态界面构建）。
+  param([string]$LaunchChannel, [string]$OptimizationLevel, [switch]$SkipFrontend)
   [pscustomobject]@{
-    DebugBound = $PSBoundParameters.ContainsKey('Debug')
-    Debug = [bool]$Debug
+    LaunchChannel = $LaunchChannel
+    OptimizationLevel = $OptimizationLevel
     SkipFrontendBound = $PSBoundParameters.ContainsKey('SkipFrontend')
     SkipFrontend = [bool]$SkipFrontend
   }
@@ -19,7 +19,7 @@ $Cases = @(
 )
 foreach ($Case in $Cases) {
   $Bound = Invoke-DesktopBuild -BuildScript $BuildStub -Dev:$Case.Dev -UiPreview:$Case.UiPreview
-  if (-not $Bound.DebugBound -or -not $Bound.Debug -or
+  if ($Bound.LaunchChannel -ne 'development' -or $Bound.OptimizationLevel -ne 'debug' -or
       -not $Bound.SkipFrontendBound -or $Bound.SkipFrontend -ne $Case.SkipFrontend) {
     throw "构建开关绑定失败：$($Case.Name)。"
   }

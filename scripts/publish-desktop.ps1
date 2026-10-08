@@ -19,10 +19,16 @@ if ($LASTEXITCODE) { throw '临时更新工具准备失败。' }
 & $UpdatePython '-B' '-X' 'utf8' (Join-Path $PSScriptRoot 'local-admin.py') 'recover'
 if ($LASTEXITCODE) { throw '上一次更新事务恢复失败。' }
 # 先构建正式产物和演示使用的调试宿主，再停机校验、更新原正式目录。
-& $Context.Node (Join-Path $DesktopRepo 'integrations/dsh/voice-terminal/build.mjs')
+& (Join-Path $PSScriptRoot 'prepare-7zip.ps1')
+if ($LASTEXITCODE) { throw '完整 7-Zip（压缩工具）准备失败。' }
+$Node = $Context.Node
+if (-not $Node) { $Node = (Get-Command node -ErrorAction Stop).Source }
+& $Node (Join-Path $DesktopRepo 'integrations/dsh/voice-terminal/build.mjs')
 if ($LASTEXITCODE) { throw 'DSH（代理执行宿主）统一插件构建失败。' }
-& (Join-Path $PSScriptRoot 'build-desktop.ps1')
-& (Join-Path $PSScriptRoot 'build-desktop.ps1') -Debug -SkipFrontend
+& (Join-Path $PSScriptRoot 'build-desktop.ps1') -LaunchChannel development -OptimizationLevel release
+if ($LASTEXITCODE) { throw '开发渠道正式优化构建失败。' }
+& (Join-Path $PSScriptRoot 'build-desktop.ps1') -LaunchChannel development -OptimizationLevel debug -SkipFrontend
+if ($LASTEXITCODE) { throw '开发渠道调试构建失败。' }
 Push-Location $DesktopRepo
 try {
   $AssembleArgs = @('-B', '-X', 'utf8', 'scripts/assemble-desktop.py', '--output', $InstallRoot, '--build', $Build, '--refresh-program')

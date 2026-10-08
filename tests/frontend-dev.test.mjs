@@ -28,6 +28,7 @@ function upgrade(origin, headers = {}, path = '/') {
 
 test('浏览器无会话只见说明，桌面凭据单次消费，热更新连接也校验会话', async () => {
   const server = await createDesktopServer({ root, mode: 'ui-preview', port: 0 })
+  let fallbackServer
   try {
     const hint = await request(server.origin, '/')
     assert.equal(hint.status, 200)
@@ -62,8 +63,19 @@ test('浏览器无会话只见说明，桌面凭据单次消费，热更新连�
     assert.equal(await upgrade(server.origin, { Cookie }, `/?token=${token}`), 101)
     assert.equal((await request(server.origin, '/ui-demo.html', { Cookie: Cookie + '; ' + Cookie })).status, 200)
     assert.match((await request(server.origin, '/ui-demo.html', { Cookie: Cookie + '; ' + Cookie })).body, /请通过桌面程序打开/)
-    await assert.rejects(createDesktopServer({ root, mode: 'ui-preview', port: Number(new URL(server.origin).port) }), /端口.*被占用/)
-  } finally { await server.close() }
+    const firstAddress = new URL(server.origin)
+    fallbackServer = await createDesktopServer({ root, mode: 'ui-preview', port: Number(firstAddress.port) })
+    const fallbackAddress = new URL(fallbackServer.origin)
+    assert.equal(firstAddress.hostname, '127.0.0.1')
+    assert.equal(fallbackAddress.hostname, '127.0.0.1')
+    const fallbackPort = Number(fallbackAddress.port)
+    assert.ok(Number.isInteger(fallbackPort) && fallbackPort >= 1 && fallbackPort <= 65535)
+    assert.notEqual(fallbackPort, Number(firstAddress.port))
+    assert.equal((await request(fallbackServer.origin, '/')).status, 200)
+  } finally {
+    try { await fallbackServer?.close() }
+    finally { await server.close() }
+  }
 })
 
 test('样例入口凭据超过60秒不能建立会话', async () => {

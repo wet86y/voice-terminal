@@ -1,4 +1,5 @@
 import { resolve } from 'node:path'
+import { copyFileSync } from 'node:fs'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
@@ -6,6 +7,12 @@ export default defineConfig({
   cacheDir: resolve(__dirname, '../../.local/cache/vite-product'), // cacheDir（产品界面开发缓存）。
   plugins: [vue(), {
     name: 'desktop-owned-development',
+    closeBundle() {
+      const output = resolve(__dirname, '../../.local/build/frontend')
+      for (const name of ['startup.css', 'app-icon.svg', 'index.html']) {
+        copyFileSync(resolve(__dirname, '../desktop/boot', name), resolve(output, name === 'index.html' ? 'startup.html' : name))
+      }
+    },
     configureServer(server) {
       // middlewareMode（中间件模式）：外层服务验证请求，禁止直接开网页。
       if (!server.config.server.middlewareMode) throw new Error('请执行 npm run dev（桌面开发），不支持直接启动网页服务。')
@@ -21,6 +28,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         index: resolve(__dirname, 'index.html'),
+        management: resolve(__dirname, 'management.html'), // management（无后端的本地组件管理入口）。
       },
     },
   },

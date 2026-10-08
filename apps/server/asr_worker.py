@@ -23,7 +23,8 @@ from voice_terminal.paths import AppPaths
 from voice_terminal.env import load_env_file
 from voice_terminal.logging_setup import configure_logging
 from voice_terminal.server.product import ProductSettingsStore
-from voice_terminal.application.managed import report, wait_for_shutdown
+from voice_terminal.application.managed import report, report_endpoint, wait_for_shutdown
+from voice_terminal.application.ports import bind_loopback, endpoint_url
 
 
 async def run(config_path: Path | None = None) -> None:
@@ -41,6 +42,8 @@ async def run(config_path: Path | None = None) -> None:
         path=paths.config / "product-settings.json",
         config=config,
     ).effective_config()
+    listener, actual_port = bind_loopback(config.asr_worker.port, host=config.asr_worker.host)
+    report_endpoint("asr", endpoint_url("asr", actual_port))
     engine = AsrWorkerEngine(
         model_dir=config.asr_model_dir,
         device=config.compute.devices.get("paraformer", "auto"),
@@ -50,8 +53,8 @@ async def run(config_path: Path | None = None) -> None:
         encoder_chunk_look_back=config.asr.encoder_chunk_look_back,
         decoder_chunk_look_back=config.asr.decoder_chunk_look_back,
     )
-    # Do not open the health port until the real model is loaded.  This makes
-    # start.ps1 and Voice Server readiness reflect actual ASR availability.
+    # Bind the listener before loading so the host can publish the selected port;
+    # health readiness still waits for the fully loaded model below.
     report("asr", "加载语音识别模型")
     async def handler(websocket, path=None):
         if path not in (None, "/asr"):
@@ -61,17 +64,18 @@ async def run(config_path: Path | None = None) -> None:
 
     try:
         await engine.prepare()
-        async with websockets.serve(handler, config.asr_worker.host, config.asr_worker.port):
+        async with websockets.serve(handler, sock=listener):
             logging.getLogger(__name__).info(
                 "ASR Worker listening on ws://%s:%s/asr (device=%s)",
-                config.asr_worker.host,
-                config.asr_worker.port,
+                "127.0.0.1",
+                actual_port,
                 engine.device,
             )
             report("asr", "模型已加载并预热，语音识别接口已监听")
             await wait_for_shutdown()
     finally:
         engine.close()
+        listener.close()
 
 
 def main() -> None:

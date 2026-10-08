@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resource-download"
+description = "Enables the resource_download command without any pre-configured scope."
+commands.allow = ["resource_download"]
+
+[[permission]]
+identifier = "deny-resource-download"
+description = "Denies the resource_download command without any pre-configured scope."
+commands.deny = ["resource_download"]

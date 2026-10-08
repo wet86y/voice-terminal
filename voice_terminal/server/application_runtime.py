@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from ..application.managed import report as application_report
 
 
@@ -93,7 +94,27 @@ class ApplicationRuntimeMixin:
                 "pid": speaker_process.pid if speaker_process and speaker_process.returncode is None else None},
         }
 
-    async def application_control(self, action: str) -> dict:
+    def _apply_managed_endpoints(self, endpoint_table: dict | None) -> None:
+        """Apply the host's current endpoint table（宿主当前端点表）before reconnecting clients."""
+        if not isinstance(endpoint_table, dict):
+            return
+        from ..application.ports import validate_endpoint_url
+        asr_url = endpoint_table.get("asr")
+        analysis_url = endpoint_table.get("analysis")
+        speaker_url = endpoint_table.get("speaker")
+        config = self.config
+        if isinstance(asr_url, str):
+            asr_url = validate_endpoint_url("asr", asr_url)["url"]
+            config = replace(config, asr=replace(config.asr, worker_url=asr_url))
+        if isinstance(analysis_url, str):
+            analysis_url = validate_endpoint_url("analysis", analysis_url)["url"]
+            config = replace(config, smart_turn=replace(config.smart_turn, analysis_url=analysis_url))
+        if isinstance(speaker_url, str):
+            speaker_url = validate_endpoint_url("speaker", speaker_url)["url"]
+            config = replace(config, speaker_worker=replace(config.speaker_worker, worker_url=speaker_url))
+        self.config = config
+
+    async def application_control(self, action: str, endpoint_table: dict | None = None) -> dict:
         if getattr(self, "_application_stopping", False):
             return {"ok": False, "message": "应用正在退出，不能启动或恢复组件。"}
         if action in {"initialize-local", "initialize-session"}:
@@ -110,6 +131,7 @@ class ApplicationRuntimeMixin:
                 if not self._application_local_ready:
                     return {"ok": False, "message": "本地模型尚未完成加载。"}
                 if not self._application_session_ready:
+                    self._apply_managed_endpoints(endpoint_table)
                     await self.initialize_session()
                     await self.restore_startup_compute()
                     await self.bus.publish(self.snapshot())
@@ -141,11 +163,19 @@ class ApplicationRuntimeMixin:
             async with self._session_lock:
                 await self.close()
                 self._prepare_for_reinitialize()
+                self._apply_managed_endpoints(endpoint_table)
                 self.startup_errors.clear()
                 await self.initialize()
                 await self.bus.publish(self.snapshot())
                 health = self.health_payload()
                 services = health["services"]
                 ready = all(services.get(key) == "READY" for key in ("audio", "asr", "llm", "tts"))
-                return {"ok": ready, "message": "语音业务未完整恢复，请查看核心组件状态" if not ready else ""}
+                # session_initialized（语音会话初始化流程已完成）与 ok（全部 Voice 核心能力就绪）分开报告，
+                # asr_ready（语音服务中的识别会话实际健康就绪）确认本地工作进程重连，同时仍保留缺少 LLM/TTS（大语言模型/语音合成）凭据时的 Voice 不就绪状态。
+                return {
+                    "ok": ready,
+                    "session_initialized": True,
+                    "asr_ready": services.get("asr") == "READY",
+                    "message": "语音业务未完整恢复，请查看核心组件状态" if not ready else "",
+                }
         raise ValueError("未知受管操作")

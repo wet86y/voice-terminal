@@ -25,6 +25,8 @@ from ..env import load_env_file
 from ..logging_setup import configure_logging
 from ..server.product import ProductSettingsStore
 from ..compute import process_memory_bytes
+from ..application.managed import report_endpoint, wait_for_shutdown
+from ..application.ports import bind_loopback, endpoint_url
 
 logger = logging.getLogger(__name__)
 
@@ -333,6 +335,8 @@ async def run(config_path: Path | None = None) -> None:
         path=AppPaths.resolve(root).config / "product-settings.json",
         config=config,
     ).effective_config()
+    listener, actual_port = bind_loopback(config.speaker_worker.port, host=config.speaker_worker.host)
+    report_endpoint("speaker", endpoint_url("speaker", actual_port))
     model_path = config.speaker_model_path
     engine = SpeakerWorkerEngine(
         model_path, sample_rate=config.audio.sample_rate,
@@ -439,10 +443,12 @@ async def run(config_path: Path | None = None) -> None:
                     "message": str(exc)[:300],
                 }, ensure_ascii=False))
 
-    async with websockets.serve(handler, config.speaker_worker.host, config.speaker_worker.port):
-        logger.info("Speaker Worker listening on ws://%s:%s/speaker", config.speaker_worker.host, config.speaker_worker.port)
-        from ..application.managed import wait_for_shutdown
-        await wait_for_shutdown()
+    try:
+        async with websockets.serve(handler, sock=listener):
+            logger.info("Speaker Worker listening on ws://%s:%s/speaker", "127.0.0.1", actual_port)
+            await wait_for_shutdown()
+    finally:
+        listener.close()
 
 
 def main() -> None:

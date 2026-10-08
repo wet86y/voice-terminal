@@ -7,7 +7,8 @@ function Invoke-DesktopBuild {
     [switch]$UiPreview
   )
   $BuildArguments = @{
-    Debug = $true
+    LaunchChannel = 'development'
+    OptimizationLevel = 'debug'
     SkipFrontend = ($Dev -or $UiPreview)
   }
   & $BuildScript @BuildArguments
@@ -20,7 +21,7 @@ if ($MyInvocation.InvocationName -ne '.') {
   try { [Console]::OutputEncoding = $OutputEncoding } catch { }
   . (Join-Path $PSScriptRoot 'local-context.ps1')
 $DesktopRepo = Get-ProjectRoot
-  $Executable = Join-Path $DesktopRepo '.local/build/desktop/debug/VoiceTerminalDesktop.exe'
+  $Executable = Join-Path $DesktopRepo '.local/build/desktop/development/debug/VoiceTerminalDesktop.exe'
   if ($UiPreview -and ($Dev -or $Diagnostic -or $Python -or $DataDir -or $InstallRoot)) {
     throw '桌面样例不接受 -Dev、-Diagnostic、-Python、-DataDir 或 -InstallRoot（产品启动参数）。'
   }

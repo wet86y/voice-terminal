@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { useProductControls } from "./useProductControls";
 import ApplicationStartup from "./ApplicationStartup.vue";
+import ApplicationMotion from './ApplicationMotion.vue';
+import { useApplicationHost } from './application-host';
 import AppFrame from "../interface/AppFrame.vue";
 import SettingsFrame from "../interface/SettingsFrame.vue";
 import Workbench from "../interface/Workbench.vue";
@@ -11,11 +13,15 @@ import PersonaSettings from "./panels/PersonaSettings.vue";
 import SpeakerSettings from "./panels/SpeakerSettings.vue";
 import WakeTasksSettings from "./panels/WakeTasksSettings.vue";
 import ComputeSettings from "./panels/ComputeSettings.vue";
+import WorkspaceSettings from "./panels/WorkspaceSettings.vue";
 import ModelSettings from "./panels/ModelSettings.vue";
 import { provideProductContext } from "./product-context";
+import { useWorkspaceResources } from './useWorkspaceResources'
 
 const controls = useProductControls();
+const application = useApplicationHost();
 provideProductContext(controls);
+const workspaceResources = useWorkspaceResources();
 const {
   applicationSnapshot,
   showApplicationSystem,
@@ -43,6 +49,7 @@ function nativeAction(action: () => Promise<void>) {
 }
 </script>
 <template>
+  <ApplicationMotion v-slot="{ entering, exiting }" :blocked="application.overlay.value" :stopping="Boolean(applicationSnapshot?.stopping || ['stopping', 'stopped'].includes(applicationSnapshot?.state ?? ''))">
   <AppFrame
     :runtime="runtimeState"
   >
@@ -88,8 +95,9 @@ function nativeAction(action: () => Promise<void>) {
         <PersonaSettings v-if="activeSettingsTab === 'persona'" />
         <SpeakerSettings v-if="activeSettingsTab === 'speaker'" />
         <WakeTasksSettings v-if="activeSettingsTab === 'wakes'" />
-        <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" />
-        <ModelSettings v-if="activeSettingsTab === 'models'" /></article
+        <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" :resource-controller="workspaceResources" />
+        <ModelSettings v-if="activeSettingsTab === 'models'" />
+        <WorkspaceSettings v-if="activeSettingsTab === 'workspace'" :controller="workspaceResources" /></article
     ></SettingsFrame>
     <template #overlays>
       <Transition name="save-notice"
@@ -109,7 +117,7 @@ function nativeAction(action: () => Promise<void>) {
           }}<button aria-label="关闭提示" @click="setNotice('')">×</button>
         </div></Transition
       >
-      <ApplicationStartup @system="showApplicationSystem"
-    /></template>
+      <ApplicationStartup :entering="entering" :exiting="exiting" /></template>
   </AppFrame>
+  </ApplicationMotion>
 </template>

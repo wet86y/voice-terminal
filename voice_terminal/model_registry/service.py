@@ -784,9 +784,31 @@ class ModelRegistryService:
         capability = _clean_text(request.get("capability"), "能力类型", max_length=80)
         api_key = _clean_text(request.get("api_key"), "API Key", max_length=4096)
         provider_id = _stable_id("provider", f"managed/{capability}/{name}/{base_url}")
-        credential_ref = _stable_id("credential", provider_id)
         async with self._lock:
             registry = self._load()
+            existing_provider = next(
+                (
+                    item for item in registry["providers"]
+                    if isinstance(item, Mapping) and item.get("id") == provider_id
+                ),
+                None,
+            )
+            existing_ref = (
+                existing_provider.get("credential_ref")
+                if isinstance(existing_provider, Mapping)
+                else None
+            )
+            if isinstance(existing_ref, str) and existing_ref:
+                # Reuse existing references so migrated and older registries
+                # keep their current Credential Manager（系统凭据管理器） item.
+                credential_ref = existing_ref
+            else:
+                # Scope new references to this data root; identical provider
+                # metadata in development and distribution must not collide.
+                credential_ref = _stable_id(
+                    "credential",
+                    f"{self.registry_path.resolve()}/managed/{provider_id}",
+                )
             previous_secret = self.vault.get(credential_ref)
             self.vault.put(credential_ref, api_key)
             try:

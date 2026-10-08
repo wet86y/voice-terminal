@@ -1,0 +1,416 @@
+{
+  "schema_version": 1,
+  "generated_from": {
+    "models_manifest_build": "0d4c9e5c220748d4",
+    "resource_baseline": "current-local-models-manifest"
+  },
+  "resources": [
+    {
+      "resource_id": "kws-sherpa-onnx",
+      "kind": "model",
+      "title": "Sherpa-ONNX 唤醒词模型",
+      "destination": "kws/sherpa-onnx-kws-zipformer-zh-en-3M",
+      "version": "2025-12-20",
+      "required": false,
+      "source": {
+        "platform": "github",
+        "repo_id": "k2-fsa/sherpa-onnx",
+        "revision": "kws-models",
+        "page_url": "https://github.com/k2-fsa/sherpa-onnx/releases/tag/kws-models",
+        "transfer": {
+          "kind": "archive_http",
+          "artifact": {
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
+            "filename": "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
+            "size_bytes": 32885699,
+            "sha256": "68447f4fbc67e70eee3a93961f36e81e98f47aef73ce7e7ca00885c6cd3616a6"
+          }
+        },
+        "license_url": "https://github.com/k2-fsa/sherpa-onnx/blob/master/LICENSE"
+      },
+      "files": [
+        {
+          "path": "decoder-epoch-13-avg-2-chunk-16-left-64.onnx",
+          "size_bytes": 759829,
+          "sha256": "63a22dd60f40fff082ac3e09afa507f6787da36df76ded2fbe145fa233e22c21"
+        },
+        {
+          "path": "decoder-epoch-13-avg-2-chunk-8-left-64.onnx",
+          "size_bytes": 759829,
+          "sha256": "63a22dd60f40fff082ac3e09afa507f6787da36df76ded2fbe145fa233e22c21"
+        },
+        {
+          "path": "en.phone",
+          "size_bytes": 3330061,
+          "sha256": "f7000ec3a90544c0c7c16090d8951779c2b322e14dad5006290f498567d439ea"
+        },
+        {
+          "path": "encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
+          "size_bytes": 4599656,
+          "sha256": "408bbd740838c42d5bf6d1c5b80b3c88b616c7860b92d980328b5b068c76ae48"
+        },
+        {
+          "path": "encoder-epoch-13-avg-2-chunk-16-left-64.onnx",
+          "size_bytes": 11976272,
+          "sha256": "540ff509ed89bd22afe04bf7049a54bb1c95c6d8a18742ea9691910cdb5f859e"
+        },
+        {
+          "path": "encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx",
+          "size_bytes": 4600657,
+          "sha256": "2ca84d6bfe73e1ea3c9c49f600f7cad1c9ddd423c53c906b8bfe802444dd78d5"
+        },
+        {
+          "path": "encoder-epoch-13-avg-2-chunk-8-left-64.onnx",
+          "size_bytes": 11976951,
+          "sha256": "307e2f5e87e9d6df4fd058239f4437b6236db7699b9c61decb490f89fb4226d0"
+        },
+        {
+          "path": "joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
+          "size_bytes": 86629,
+          "sha256": "190d4067b4cc20b72a42a1916e69d92052000fb7051a427ebb1bc72a69207dc1"
+        },
+        {
+          "path": "joiner-epoch-13-avg-2-chunk-16-left-64.onnx",
+          "size_bytes": 338154,
+          "sha256": "76f7a24ed0c08633af14b2ee377f747af880d3b65eeba2cd3f31f3380fb73e8d"
+        },
+        {
+          "path": "joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx",
+          "size_bytes": 86629,
+          "sha256": "190d4067b4cc20b72a42a1916e69d92052000fb7051a427ebb1bc72a69207dc1"
+        },
+        {
+          "path": "joiner-epoch-13-avg-2-chunk-8-left-64.onnx",
+          "size_bytes": 338154,
+          "sha256": "76f7a24ed0c08633af14b2ee377f747af880d3b65eeba2cd3f31f3380fb73e8d"
+        },
+        {
+          "path": "test_wavs/en_0.wav",
+          "size_bytes": 212044,
+          "sha256": "6bc58a4efdf20daac252b6b1502632601a71efe0308f6757dc1eda34891a7e4f"
+        },
+        {
+          "path": "test_wavs/en_1.wav",
+          "size_bytes": 534924,
+          "sha256": "5143a6ba93c4b274e2c4ac22deb75c2c48936c853f0519add1de828b6c79cc5a"
+        },
+        {
+          "path": "test_wavs/en_trans.txt",
+          "size_bytes": 367,
+          "sha256": "55ca91f3ee53c324b2f802f63c50cacc8931da846c4aaa35f115680201ff904b"
+        },
+        {
+          "path": "test_wavs/zh_0.wav",
+          "size_bytes": 179646,
+          "sha256": "668bf8df51a10027b84d5d8816a1ce11ae93545538dc05cfe2aa6811d399c250"
+        },
+        {
+          "path": "test_wavs/zh_1.wav",
+          "size_bytes": 164976,
+          "sha256": "30edbabea84ca4c076f5b43bb44495f436f6711319c32a200d3fc5c67c1fee1d"
+        },
+        {
+          "path": "test_wavs/zh_2.wav",
+          "size_bytes": 144856,
+          "sha256": "04a579c23bdd6de049814f1cbfb470d735d7747ba37eb0a92d813c89da942706"
+        },
+        {
+          "path": "test_wavs/zh_3.wav",
+          "size_bytes": 257006,
+          "sha256": "710e79fb3450042be50bb2f6432a2a549b53577aea041a577e53a926fcabb614"
+        },
+        {
+          "path": "test_wavs/zh_4.wav",
+          "size_bytes": 147216,
+          "sha256": "d46ca3a2ce52b5059f3d84e2cfdc62907e8579faa7078b1becaea614dd41b35d"
+        },
+        {
+          "path": "test_wavs/zh_5.wav",
+          "size_bytes": 132938,
+          "sha256": "55321b6d1ab4bd9a16928957a52cf943b2ae864543cca7f39e9844b4889e9bb8"
+        },
+        {
+          "path": "test_wavs/zh_6.wav",
+          "size_bytes": 113518,
+          "sha256": "f5da5689f1960431a53855d7fbe78c9ab0b73e5495ffba631cd43458225d9039"
+        },
+        {
+          "path": "tokens.txt",
+          "size_bytes": 1928,
+          "sha256": "2d3f32311f9b692b964da3c90e830258d3e78e013cb0c992dbfb15cd5a1a71b0"
+        }
+      ]
+    },
+    {
+      "resource_id": "paraformer-streaming",
+      "kind": "model",
+      "title": "Paraformer 流式语音识别模型",
+      "destination": "funasr/paraformer-zh-streaming",
+      "version": "v2.0.5",
+      "required": false,
+      "source": {
+        "platform": "modelscope",
+        "repo_id": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+        "revision": "v2.0.5",
+        "page_url": "https://modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+        "transfer": {
+          "kind": "modelscope_sdk"
+        },
+        "license_url": "https://modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
+      },
+      "files": [
+        {
+          "path": "am.mvn",
+          "size_bytes": 11203,
+          "sha256": "29b3c740a2c0cfc6b308126d31d7f265fa2be74f3bb095cd2f143ea970896ae5"
+        },
+        {
+          "path": "config.yaml",
+          "size_bytes": 2940,
+          "sha256": "35e6bf41f8c7eaf9a0f787af7fdc8fc5ed75fa8009ade7d3c2f3ef5bce20c648"
+        },
+        {
+          "path": "configuration.json",
+          "size_bytes": 472,
+          "sha256": "1aae0f45e3e503f52512eee4798d241611a44cc732a7a91d2e2d2f65dd9755be"
+        },
+        {
+          "path": "model.pt",
+          "size_bytes": 880716041,
+          "sha256": "4fdfb48ed4471777c9a511e96a2acae17f77cac9d709cc756634622769192a64"
+        },
+        {
+          "path": "seg_dict",
+          "size_bytes": 8287834,
+          "sha256": "59a2ef803a3f1648ad03a2e1480db1c1ee0c0d7dc4ef4dbd16cea33944329022"
+        },
+        {
+          "path": "tokens.json",
+          "size_bytes": 93676,
+          "sha256": "2b20c2b12572d682afff84ce1c8d560f67b8b32a4c1f21567411d141ed352127"
+        }
+      ]
+    },
+    {
+      "resource_id": "fsmn-vad",
+      "kind": "model",
+      "title": "FSMN-VAD 语音活动检测模型",
+      "destination": "funasr/fsmn-vad",
+      "version": "v2.0.4",
+      "required": false,
+      "source": {
+        "platform": "modelscope",
+        "repo_id": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        "revision": "v2.0.4",
+        "page_url": "https://modelscope.cn/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        "transfer": {
+          "kind": "modelscope_sdk"
+        },
+        "license_url": "https://modelscope.cn/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+      },
+      "files": [
+        {
+          "path": "am.mvn",
+          "size_bytes": 8040,
+          "sha256": "6820fef9687708c4fc3fab2530179c8fcea6262daa25514380056cd8f6eb1754"
+        },
+        {
+          "path": "config.yaml",
+          "size_bytes": 1215,
+          "sha256": "486861ca26ddb79081663b6179cb204c6bfae71c52f04aafc48a9e9d8dde1e93"
+        },
+        {
+          "path": "configuration.json",
+          "size_bytes": 365,
+          "sha256": "7bce8867e37d55c3dd8f672695ced18077a2be199ea529a5d432d5350fc0acba"
+        },
+        {
+          "path": "model.pt",
+          "size_bytes": 1721366,
+          "sha256": "b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5"
+        }
+      ]
+    },
+    {
+      "resource_id": "wespeaker-cnceleb-resnet34",
+      "kind": "model",
+      "title": "WeSpeaker 中文声纹模型",
+      "destination": "speaker/wespeaker-cnceleb-resnet34",
+      "version": "c2c6282460dd5958d8eec16785f035d92e4a2d77",
+      "required": false,
+      "source": {
+        "platform": "huggingface",
+        "repo_id": "Wespeaker/wespeaker-cnceleb-resnet34",
+        "revision": "c2c6282460dd5958d8eec16785f035d92e4a2d77",
+        "page_url": "https://huggingface.co/Wespeaker/wespeaker-cnceleb-resnet34",
+        "transfer": {
+          "kind": "fixed_resolve_http"
+        },
+        "license_url": "https://huggingface.co/Wespeaker/wespeaker-cnceleb-resnet34"
+      },
+      "files": [
+        {
+          "path": "cnceleb_resnet34.onnx",
+          "size_bytes": 26534127,
+          "sha256": "78817ca21a9707ad886d50745162231027a09c997fbf2ecf741c5d8ff4db1bf8"
+        }
+      ]
+    },
+    {
+      "resource_id": "smart-turn",
+      "kind": "model",
+      "title": "SmartTurn 语音结束判断模型",
+      "destination": "analysis/smart-turn",
+      "version": "f766f81d3cfdf7737ac64aad813d91bbfd56bf93",
+      "required": false,
+      "source": {
+        "platform": "huggingface",
+        "repo_id": "pipecat-ai/smart-turn-v3",
+        "revision": "f766f81d3cfdf7737ac64aad813d91bbfd56bf93",
+        "page_url": "https://huggingface.co/pipecat-ai/smart-turn-v3",
+        "transfer": {
+          "kind": "fixed_resolve_http"
+        },
+        "license_url": "https://huggingface.co/pipecat-ai/smart-turn-v3"
+      },
+      "files": [
+        {
+          "path": "smart-turn-v3.2-cpu.onnx",
+          "size_bytes": 8679182,
+          "sha256": "2bb026316b14a660486a75b1733cd3fbab8c2fd0314dc9af7be49f8cca967e4f"
+        },
+        {
+          "path": "smart-turn-v3.2-gpu.onnx",
+          "size_bytes": 32411198,
+          "sha256": "ab8dc64b88713f90b571c15b714bd1330e6c883cad8763dacf65c9376dc539be",
+          "optional": true
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size_bytes": 327,
+          "sha256": "89773a42fe808aa61454d35d7183156ff3a1b01ce15146d1ba0580f0a8f82236",
+          "asset": "assets/smart-turn/preprocessor_config.json"
+        }
+      ],
+      "generated_assets": [
+        {
+          "path": "preprocessor_config.json",
+          "generator": "WhisperFeatureExtractor(chunk_length=8)",
+          "description": "本项目随包固定的 Whisper 特征预处理配置"
+        }
+      ]
+    },
+    {
+      "resource_id": "sensevoice-small",
+      "kind": "model",
+      "title": "SenseVoiceSmall 整句语音精修模型",
+      "destination": "analysis/sensevoice",
+      "version": "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7",
+      "required": false,
+      "source": {
+        "platform": "huggingface",
+        "repo_id": "FunAudioLLM/SenseVoiceSmall",
+        "revision": "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7",
+        "page_url": "https://huggingface.co/FunAudioLLM/SenseVoiceSmall",
+        "transfer": {
+          "kind": "fixed_resolve_http"
+        },
+        "license_url": "https://huggingface.co/FunAudioLLM/SenseVoiceSmall"
+      },
+      "files": [
+        {
+          "path": "model.pt",
+          "size_bytes": 936291369,
+          "sha256": "833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea"
+        },
+        {
+          "path": "config.yaml",
+          "size_bytes": 1855,
+          "sha256": "f71e239ba36705564b5bf2d2ffd07eece07b8e3f2bbf6d2c99d8df856339ac19"
+        },
+        {
+          "path": "configuration.json",
+          "size_bytes": 396,
+          "sha256": "02810a7f8e9e8aee10370a265f7e799728ce25b4c00cdbf4602b303ee395a38e"
+        },
+        {
+          "path": "am.mvn",
+          "size_bytes": 11203,
+          "sha256": "29b3c740a2c0cfc6b308126d31d7f265fa2be74f3bb095cd2f143ea970896ae5"
+        },
+        {
+          "path": "chn_jpn_yue_eng_ko_spectok.bpe.model",
+          "size_bytes": 377341,
+          "sha256": "aa87f86064c3730d799ddf7af3c04659151102cba548bce325cf06ba4da4e6a8"
+        }
+      ]
+    },
+    {
+      "resource_id": "dsh",
+      "kind": "dsh",
+      "title": "DeepSeek Harness 官方桌面客户端",
+      "destination": "runtimes/dsh",
+      "version": "0.2.0-rc.2",
+      "required": false,
+      "origin": "official_installer",
+      "source": {
+        "platform": "deepseek_official",
+        "repo_id": "deepseek-ai/deepseek-harness",
+        "revision": "dsh-v0.2.0-rc.2",
+        "page_url": "https://github.com/deepseek-ai/deepseek-harness/releases/expanded_assets/dsh-v0.2.0-rc.2",
+        "transfer": {
+          "kind": "native_official_installer",
+          "artifact": {
+            "url": "https://download.deepseek.com/dsh-desk/bin/win-x64/deepseek-harness-0.2.0-rc.2-win-x64.exe",
+            "filename": "deepseek-harness-0.2.0-rc.2-win-x64.exe",
+            "size_bytes": 289313640,
+            "sha512_base64": "raIlxMQd9ESXgktmViW7QwVLcjBR5JIsrNOu+SpelY8kskdSr2H51/f+ey1EqFI/eIIrKQCuRANMeb5SptRZcg=="
+          }
+        },
+        "license_url": "https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/LICENSE"
+      },
+      "files": [],
+      "legacy_export": {
+        "supported": true,
+        "trust_level": "legacy_compatibility_only",
+        "version_source": "runtime.json",
+        "manifest_sha256": "885416e87b45264649da50b8b79d3f31b07a0b8ffab90e2b01c25c7cfa4cb960"
+      }
+    }
+  ],
+  "fields": {
+    "schema_version": "资源清单格式版本",
+    "resource_id": "稳定资源编号",
+    "kind": "资源类别：model（模型）或 dsh（代理宿主）",
+    "title": "界面显示名称",
+    "destination": "安装根目录下的固定相对路径",
+    "version": "项目认可的固定版本或提交号",
+    "source": "平台、仓库、来源说明与传输适配信息",
+    "platform": "下载来源平台",
+    "repo_id": "上游模型仓库编号",
+    "revision": "上游完整提交号或固定版本标签",
+    "files": "运行必需文件及可选文件的白名单",
+    "path": "来源和安装目录内的相对文件路径",
+    "size_bytes": "预期文件字节数",
+    "sha256": "文件 SHA-256（摘要）十六进制值",
+    "optional": "是否为可选文件",
+    "asset": "程序随包携带的生成文件相对路径",
+    "required": "是否为基础安装必需资源",
+    "generated_assets": "由程序本身提供或生成的文件说明",
+    "transfer": "下载任务使用的固定传输适配器",
+    "artifact": "固定远端安装文件说明",
+    "filename": "下载暂存时使用的文件名",
+    "url": "固定公开下载地址",
+    "sha512_base64": "SHA-512（摘要）Base64 编码值",
+    "license_url": "上游许可证说明链接",
+    "origin": "来源类型；DSH legacy_runtime（旧运行包）只作兼容资源，不代表官方二进制验证",
+    "legacy_export": "仅用于兼容测试的旧 DSH 运行目录导出规则",
+    "supported": "是否允许导出旧兼容资源包",
+    "version_source": "旧运行版本读取字段",
+    "manifest_sha256": "旧运行目录根清单 SHA-256（摘要）",
+    "trust_level": "资源来源可信等级",
+    "repository": "旧运行目录对应的源码仓库",
+    "tag": "对应的源码版本标签",
+    "commit": "对应的源码提交号"
+  }
+}

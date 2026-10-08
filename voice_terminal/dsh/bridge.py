@@ -10,6 +10,7 @@ import os
 import secrets
 import time
 import urllib.error
+from urllib.parse import urlsplit
 import urllib.request
 import uuid
 from collections.abc import Mapping
@@ -251,13 +252,31 @@ class DshBridgeClient:
     """Small strict client; every DSH operation stays behind the plugin route."""
 
     def __init__(self, *, origin: str, token: str, timeout_ms: int = 15000) -> None:
-        if origin != "http://127.0.0.1:3081":
-            raise ValueError("DSH Bridge origin must be http://127.0.0.1:3081")
         if len(token) < 32:
             raise ValueError("DSH Bridge token is too short")
-        self.origin = origin
         self._token = token
         self.timeout_s = timeout_ms / 1000
+        self._origin = ""
+        self.set_origin(origin)
+
+    @property
+    def origin(self) -> str:
+        """origin（桥接服务来源）：实际端口由受管 DSH 子进程启动行确定。"""
+        return self._origin
+
+    def set_origin(self, origin: str) -> None:
+        """Update the authenticated loopback origin（更新受认证的回环来源）after port binding."""
+        try:
+            address = urlsplit(origin)
+            port = address.port
+        except ValueError as exc:
+            raise ValueError("DSH Bridge origin is invalid") from exc
+        if (address.scheme != "http" or address.hostname != "127.0.0.1"
+                or port is None or not 1 <= port <= 65535
+                or address.username or address.password or address.path not in ("", "/")
+                or address.query or address.fragment):
+            raise ValueError("DSH Bridge origin must be a loopback HTTP origin with a bound port")
+        self._origin = f"http://127.0.0.1:{port}"
 
     async def health(self) -> dict[str, Any]:
         return await self._request("GET", "health", None)

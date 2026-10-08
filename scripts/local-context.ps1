@@ -20,9 +20,17 @@ function Get-LocalContext {
   if ($Selection.schema -ne 2) { throw '需要 schema=2（第二版）便携配置；请先迁移旧布局。' }
   foreach ($Key in $Fixed.Keys) { if ($Selection.$Key -ne $Fixed[$Key]) { throw "固定路径字段不符：$Key（组件位置）" } }
   $Runtime = Join-Path $Root $Selection.dsh
-  $Metadata = Get-Content -LiteralPath (Join-Path $Runtime 'runtime.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-  $Node = [IO.Path]::GetFullPath((Join-Path $Runtime $Metadata.node))
-  if (-not $Node.StartsWith($Runtime + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw '宿主解释器路径越界。' }
+  $Node = ''
+  $MetadataPath = Join-Path $Runtime 'runtime.json'
+  if (Test-Path -LiteralPath $MetadataPath -PathType Leaf) {
+    $Metadata = Get-Content -LiteralPath $MetadataPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    # node（Node.js 解释器字段）仅属于源码闭包；官方 Electron（桌面框架）运行包只有 executable（应用入口）。
+    if ($Metadata.node -is [string] -and $Metadata.node) {
+      $NodeCandidate = [IO.Path]::GetFullPath((Join-Path $Runtime $Metadata.node))
+      if (-not $NodeCandidate.StartsWith($Runtime + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw '宿主解释器路径越界。' }
+      if (Test-Path -LiteralPath $NodeCandidate -PathType Leaf) { $Node = $NodeCandidate }
+    }
+  }
   return @{ Root=$Root; Program=(Join-Path $Root $Selection.app); Python=(Join-Path $Root $Selection.python); Models=(Join-Path $Root $Selection.models); Data=(Join-Path $Root $Selection.data_dir); Dsh=$Runtime; Node=$Node; WebView2=(Join-Path $Root $Selection.webview2) }
 }
 function Set-LocalEnvironment {
@@ -42,4 +50,13 @@ function Set-LocalEnvironment {
   $env:TORCH_HOME = Join-Path $Context.Root 'cache/torch'
   $env:COREPACK_HOME = Join-Path $Context.Root 'cache/corepack'
   $env:npm_config_cache = Join-Path $Context.Root 'cache/npm'
+}
+
+# Get-Sha256File（文件摘要）：使用系统 .NET（程序运行库），不依赖命令模块的自动加载。
+function Get-Sha256File {
+  param([string]$LiteralPath)
+  $TaskStream = [IO.File]::OpenRead([IO.Path]::GetFullPath($LiteralPath))
+  $TaskHasher = [Security.Cryptography.SHA256]::Create()
+  try { return [BitConverter]::ToString($TaskHasher.ComputeHash($TaskStream)).Replace('-', '').ToLowerInvariant() }
+  finally { $TaskStream.Dispose(); $TaskHasher.Dispose() }
 }

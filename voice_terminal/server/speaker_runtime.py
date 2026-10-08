@@ -9,7 +9,6 @@ import logging
 import sys
 import time
 import os
-import socket
 import subprocess
 from typing import Any
 from urllib.parse import urlsplit
@@ -94,15 +93,11 @@ class SpeakerRuntimeMixin:
                     logger.debug("speaker.stale_client_cleanup_failed", exc_info=True)
 
             self.state.set_service("speaker", "STARTING")
-            if os.environ.get("VOICE_APP_ORIGIN") and (self._speaker_worker_process is None
-                    or self._speaker_worker_process.returncode is not None):
-                address = urlsplit(self.config.speaker_worker_url)
-                try:
-                    with socket.create_connection((address.hostname, address.port), timeout=.2):
-                        return self._speaker_start_failed("声纹端口被未知进程占用；应用未接管该进程。")
-                except OSError:
-                    pass
-            connected, last_error = await self._connect_speaker_worker()
+            managed = bool(os.environ.get("VOICE_APP_ORIGIN"))
+            process = self._speaker_worker_process
+            process_running = process is not None and process.returncode is None
+            # 受管模式只连接本次 Voice 进程实际启动的 sidecar（附属进程），不附着到占用首选端口的未知服务。
+            connected, last_error = (False, None) if managed and not process_running else await self._connect_speaker_worker()
             if connected:
                 return True
 
@@ -129,7 +124,11 @@ class SpeakerRuntimeMixin:
             while time.monotonic() < deadline:
                 if process.returncode is not None:
                     break
-                connected, current_error = await self._connect_speaker_worker()
+                worker_url = await self._speaker_worker_url_for_process(process)
+                if not worker_url:
+                    await asyncio.sleep(0.25)
+                    continue
+                connected, current_error = await self._connect_speaker_worker(worker_url=worker_url)
                 if connected:
                     return True
                 if current_error:
@@ -153,9 +152,43 @@ class SpeakerRuntimeMixin:
             return False
         return address.is_loopback or address.is_unspecified
 
-    async def _connect_speaker_worker(self) -> tuple[bool, str | None]:
+    async def _speaker_worker_url_for_process(self, process: asyncio.subprocess.Process) -> str | None:
+        """Resolve the port reported for this child, with PID-owned socket fallback."""
+        if os.environ.get("VOICE_APP_ORIGIN"):
+            try:
+                from ..application.managed import current_endpoint_table
+                table = await asyncio.to_thread(current_endpoint_table)
+                row = table.get("speaker", {}) if isinstance(table, dict) else {}
+                if isinstance(row, dict) and row.get("pid") == process.pid and isinstance(row.get("url"), str):
+                    return str(row["url"])
+            except Exception:
+                pass
+        try:
+            import psutil
+            owner = psutil.Process(process.pid)
+            expected_created = getattr(self, "_speaker_worker_created_at", None)
+            actual_created = float(owner.create_time())
+            if expected_created is not None and abs(actual_created - expected_created) > 2:
+                return None
+            listeners = [connection for connection in owner.net_connections(kind="tcp")
+                         if connection.status == psutil.CONN_LISTEN and connection.laddr]
+            addresses = []
+            for connection in listeners:
+                local = connection.laddr
+                host, port = (local.ip, local.port) if hasattr(local, "ip") else (local[0], local[1])
+                if host != "127.0.0.1":
+                    return None
+                addresses.append(port)
+            ports = set(addresses)
+            if len(ports) == 1:
+                return f"ws://127.0.0.1:{next(iter(ports))}/speaker"
+        except Exception:
+            pass
+        return None
+
+    async def _connect_speaker_worker(self, *, worker_url: str | None = None) -> tuple[bool, str | None]:
         client = SpeakerWorkerClient(
-            self.config.speaker_worker_url,
+            worker_url or self.config.speaker_worker_url,
             on_observation=self._on_speaker_observation,
         )
         try:
@@ -169,6 +202,7 @@ class SpeakerRuntimeMixin:
             return False, f"{type(exc).__name__}: {str(exc)[:200]}"
 
         self.speaker = client
+        self._speaker_worker_active_url = worker_url or self.config.speaker_worker_url
         self.state.set_service("speaker", "READY")
         controller = getattr(self, "controller", None)
         if controller is not None:
@@ -179,7 +213,7 @@ class SpeakerRuntimeMixin:
             item for item in self.startup_errors if not str(item).startswith("speaker:")
         ]
         await self._sync_speaker_fingerprint(client)
-        logger.info("speaker.worker_ready url=%s", self.config.speaker_worker_url)
+        logger.info("speaker.worker_ready url=%s", self._speaker_worker_active_url)
         return True, None
 
     async def _start_managed_speaker_worker(self) -> asyncio.subprocess.Process:
@@ -207,6 +241,11 @@ class SpeakerRuntimeMixin:
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" and os.environ.get("VOICE_APP_ORIGIN") else 0,
             )
         self._speaker_worker_process = process
+        try:
+            import psutil
+            self._speaker_worker_created_at = float(psutil.Process(process.pid).create_time())
+        except Exception:
+            self._speaker_worker_created_at = None
         logger.info(
             "speaker.worker_started pid=%s config=%s",
             process.pid, self._speaker_worker_config_path,
@@ -226,6 +265,7 @@ class SpeakerRuntimeMixin:
 
     async def _stop_managed_speaker_worker(self) -> None:
         process, self._speaker_worker_process = self._speaker_worker_process, None
+        self._speaker_worker_created_at = None
         if process is None or process.returncode is not None:
             return
         try:

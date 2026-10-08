@@ -6,5 +6,6 @@ export const settingsSections = [
   { id: "wakes", label: "唤醒任务", hint: "定时与循环提醒", description: "定时唤醒与循环提醒", icon: "◷" },
   { id: "models", label: "模型管理", hint: "接口密钥", description: "DeepSeek（语言模型）与 MiniMax（语音合成）接口密钥", icon: "◇" },
   { id: "compute", label: "本地组件", hint: "运行状态与资源", description: "运行状态与资源占用", icon: "▦" },
+  { id: "workspace", label: "关于与工作区", hint: "版本与数据位置", description: "应用版本、工作区位置与迁移", icon: "⌂" },
 ] as const;
 export type SettingsSection = (typeof settingsSections)[number]["id"];

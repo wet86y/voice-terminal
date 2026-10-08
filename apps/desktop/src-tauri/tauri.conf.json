@@ -1,9 +1,25 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Voice Terminal",
-  "version": "0.7.0",
+  "version": "0.9.0",
   "identifier": "com.voiceterminal.desktop",
-  "build": { "frontendDist": "../boot" },
-  "app": { "windows": [], "withGlobalTauri": true, "security": { "capabilities": ["boot"] } },
-  "bundle": { "active": false, "icon": ["icons/icon.ico", "icons/icon.png"] }
+  "build": {
+    "frontendDist": "../../../.local/build/frontend"
+  },
+  "app": {
+    "windows": [],
+    "withGlobalTauri": true,
+    "security": {
+      "capabilities": [
+        "boot"
+      ]
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
+  }
 }

@@ -4,8 +4,10 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from .env import load_env_file
+from .application.ports import endpoint_from_environment
 from .paths import AppPaths
 from .quiet_hours import QuietHoursConfig
 from .controller.options import InputOptions
@@ -353,6 +355,7 @@ class SpeakerWorkerConfig:
     # Keep the speaker sidecar separate from the analysis worker, which uses
     # the legacy 8767 endpoint by default.
     port: int = 8768
+    worker_url: str = ""  # worker_url（声纹工作进程的实际连接地址）。
 
 
 @dataclass(frozen=True)
@@ -469,7 +472,7 @@ class DshConfig:
     profile_patch: Path = Path("config/dsh/web-profile.patch.yml")
     profile: str = "web"
     host: str = "127.0.0.1"
-    port: int = 3081
+    port: int = 0
     startup_timeout_ms: int = 120000
     shutdown_timeout_ms: int = 5000
     bridge_timeout_ms: int = 15000
@@ -484,8 +487,8 @@ class DshConfig:
             raise ValueError("dsh.host must be 127.0.0.1")
         if self.profile != "web":
             raise ValueError("dsh.profile must be web")
-        if self.port != 3081:
-            raise ValueError("dsh.port must be 3081")
+        if type(self.port) is not int or not 0 <= self.port <= 65535:
+            raise ValueError("DSH 端口必须为 0（系统分配）或 1–65535 的有效 TCP（传输控制协议）端口。")
         if self.startup_timeout_ms <= 0 or self.shutdown_timeout_ms <= 0 or self.bridge_timeout_ms <= 0:
             raise ValueError("dsh timeouts must be positive")
         if self.bridge_protocol_version != "2.0":
@@ -574,7 +577,7 @@ class AppConfig:
 
     @property
     def speaker_worker_url(self) -> str:
-        return f"ws://{self.speaker_worker.host}:{self.speaker_worker.port}/speaker"
+        return self.speaker_worker.worker_url or f"ws://{self.speaker_worker.host}:{self.speaker_worker.port}/speaker"
 
     @property
     def resolved_asr_device(self) -> str:
@@ -651,10 +654,17 @@ class AppConfig:
 
         worker_host = os.environ.get("ASR_WORKER_HOST", "").strip() or _string(worker.get("host"), "127.0.0.1")
         worker_port = int(os.environ.get("ASR_WORKER_PORT", "").strip() or _number(worker.get("port"), 8766))
+        asr_bind_url = endpoint_from_environment("asr", preferred=True)
+        if asr_bind_url:
+            asr_address = urlsplit(asr_bind_url)
+            worker_host, worker_port = asr_address.hostname or "127.0.0.1", asr_address.port or worker_port
         configured_worker_url = os.environ.get("ASR_WORKER_URL", "").strip()
         worker_url = configured_worker_url or _string(asr.get("worker_url"), f"ws://{worker_host}:{worker_port}/asr")
         if os.environ.get("ASR_WORKER_HOST", "").strip() or os.environ.get("ASR_WORKER_PORT", "").strip():
             worker_url = f"ws://{worker_host}:{worker_port}/asr"
+        managed_asr_url = endpoint_from_environment("asr")
+        if managed_asr_url:
+            worker_url = managed_asr_url
 
         wake_enabled = _env_bool("VOICE_WAKE_ENABLED", _bool(wake.get("enabled"), False))
         keyword = _string(wake.get("keyword"), "hei claw")
@@ -688,6 +698,18 @@ class AppConfig:
 
         smart_turn_data = dict(_section(data, "smart_turn"))
         smart_turn_data["enabled"] = True
+        managed_analysis_url = endpoint_from_environment("analysis")
+        if managed_analysis_url:
+            smart_turn_data["analysis_url"] = managed_analysis_url
+
+        speaker_worker_host = _string(speaker_worker.get("host"), "127.0.0.1")
+        speaker_worker_port = int(_number(speaker_worker.get("port"), 8768))
+        speaker_bind_url = endpoint_from_environment("speaker", preferred=True)
+        if speaker_bind_url:
+            speaker_address = urlsplit(speaker_bind_url)
+            speaker_worker_host = speaker_address.hostname or "127.0.0.1"
+            speaker_worker_port = speaker_address.port or speaker_worker_port
+        speaker_connect_url = endpoint_from_environment("speaker") or ""
 
         shadow_provider = _section(shadow, "provider")
         shadow_tools = _section(shadow, "tools")
@@ -782,7 +804,7 @@ class AppConfig:
                 profile_patch=(root / "config" / "dsh" / "web-profile.patch.yml").resolve(),
                 profile=_string(dsh.get("profile"), "web"),
                 host=_string(dsh.get("host"), "127.0.0.1"),
-                port=int(_number(dsh.get("port"), 3081)),
+                port=int(_number(dsh.get("port"), 0)),
                 startup_timeout_ms=int(_number(dsh.get("startup_timeout_ms"), 120000)),
                 shutdown_timeout_ms=int(_number(dsh.get("shutdown_timeout_ms"), 5000)),
                 bridge_timeout_ms=int(_number(dsh.get("bridge_timeout_ms"), 15000)),
@@ -946,8 +968,9 @@ class AppConfig:
                 model_id=_string(speaker.get("model_id"), "wespeaker-cnceleb-resnet34"),
             ),
             speaker_worker=SpeakerWorkerConfig(
-                host=_string(speaker_worker.get("host"), "127.0.0.1"),
-                port=int(_number(speaker_worker.get("port"), 8768)),
+                host=speaker_worker_host,
+                port=speaker_worker_port,
+                worker_url=speaker_connect_url,
             ),
         )
 

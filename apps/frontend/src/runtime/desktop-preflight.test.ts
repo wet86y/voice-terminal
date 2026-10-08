@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { runDesktopPreflight, validateDesktopStatus, type NativeCommandInvoker } from './desktop-preflight'
+import { APPLICATION_EXIT_EVENT } from './application-motion'
 
 function native(status: unknown): NativeCommandInvoker {
   const call = vi.fn(async (command: string) => command === 'desktop_status' ? status : undefined)
@@ -13,6 +14,24 @@ afterEach(() => {
 })
 
 describe('desktop preflight（桌面预检）', () => {
+  it('核验尚未完成时收到原生退出通知，保留退出动效并拒绝迟到的产品挂载', async () => {
+    document.body.innerHTML = '<div id="app"></div>'
+    const root = document.getElementById('app')!
+    let resolve!: (value: unknown) => void
+    const pending = new Promise<unknown>(done => { resolve = done })
+    const startApplication = vi.fn(async () => undefined)
+    const running = runDesktopPreflight({ expectedMode: 'product', root,
+      invoke: { invoke: vi.fn(() => pending) as NativeCommandInvoker['invoke'] }, startApplication })
+    window.dispatchEvent(new Event(APPLICATION_EXIT_EVENT))
+    expect(root.querySelector('.startup-screen')?.classList.contains('is-exiting')).toBe(true)
+    expect(root.querySelector('.startup-title')?.textContent).toBe('正在退出应用')
+    expect(root.querySelector('.startup-progress')?.getAttribute('aria-label')).toBe('应用退出进度')
+    resolve({ ready: true, error: null, frontend_mode: 'product', development: false })
+    await running
+    expect(startApplication).not.toHaveBeenCalled()
+    expect(root.querySelector('.startup-title')?.textContent).toBe('正在退出应用')
+  })
+
   it('等待原生权限验证时可以跳过画面，仍然等验证成功后才加载界面', async () => {
     let resolve!: (value: unknown) => void
     const pending = new Promise<unknown>(done => { resolve = done })

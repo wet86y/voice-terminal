@@ -268,3 +268,29 @@ def test_direct_voice_start_and_retries_do_not_bypass_loading_or_shutdown(runtim
             with pytest.raises(RuntimeError, match="退出"):
                 await runtime._start_managed_speaker_worker()
     asyncio.run(run())
+
+
+def test_reinitialize_reports_asr_session_when_other_voice_core_services_are_missing(runtime):
+    """本地 ASR 会话可恢复时，不把缺少 LLM/TTS 凭据误作工作进程重连失败。"""
+    async def initialize_with_missing_remote_services():
+        for name, status in (("audio", "READY"), ("asr", "READY"),
+                             ("llm", "ERROR"), ("tts", "ERROR")):
+            runtime.state.set_service(name, status)
+
+    async def run():
+        runtime._application_local_ready = True
+        runtime._application_session_ready = True
+        with patch.object(runtime, "close", new=AsyncMock()), \
+             patch.object(runtime, "initialize", new=AsyncMock(side_effect=initialize_with_missing_remote_services)), \
+             patch.object(runtime, "snapshot", return_value={}):
+            response = await runtime.application_control("reinitialize", endpoint_table={})
+
+        assert response["ok"] is False
+        assert response["session_initialized"] is True
+        assert response["asr_ready"] is True
+        assert response["message"]
+        services = runtime.health_payload()["services"]
+        assert services["llm"] == "ERROR"
+        assert services["tts"] == "ERROR"
+
+    asyncio.run(run())

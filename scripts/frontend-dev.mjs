@@ -133,10 +133,23 @@ export async function createDesktopServer({ root, mode, cookieName, session, ins
     if (server.listening) await new Promise(resolveClose => server.close(resolveClose))
   }
   try {
-    await new Promise((resolveListen, rejectListen) => {
-      server.once('error', rejectListen)
-      server.listen({ host: '127.0.0.1', port: port ?? (preview ? 5174 : 5173), exclusive: true }, resolveListen)
+    const preferredPort = port ?? (preview ? 5174 : 5173)
+    const listen = selectedPort => new Promise((resolveListen, rejectListen) => {
+      const onError = error => rejectListen(error)
+      server.once('error', onError)
+      server.listen({ host: '127.0.0.1', port: selectedPort, exclusive: true }, () => {
+        server.off('error', onError)
+        resolveListen()
+      })
     })
+    try {
+      await listen(preferredPort)
+    } catch (error) {
+      // The bind itself is authoritative; on a collision ask the OS for an
+      // available ephemeral port instead of probing and racing another process.
+      if (error.code !== 'EADDRINUSE') throw error
+      await listen(0)
+    }
     const actualPort = server.address().port
     origin = `http://127.0.0.1:${actualPort}`
     vite = await createViteServer({
@@ -153,7 +166,7 @@ export async function createDesktopServer({ root, mode, cookieName, session, ins
     return { origin, instanceId, launchToken, close }
   } catch (error) {
     await close()
-    throw error.code === 'EADDRINUSE' ? new Error(`桌面开发端口 ${port ?? (preview ? 5174 : 5173)} 被占用，未连接或接管其他服务。`) : error
+    throw error.code === 'EADDRINUSE' ? new Error('桌面开发界面无法绑定首选端口或系统动态端口。') : error
   }
 }
 

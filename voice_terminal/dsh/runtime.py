@@ -13,11 +13,13 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from ..config import DshConfig
 from ..paths import AppPaths, atomic_json
 from ..distribution import safe_path, verify
 from .bridge import DshBridgeClient, DshBridgeHub, new_bridge_token
+from .official import OFFICIAL_SOURCE_KIND, load_official_artifact, validate_official_runtime
 from .profile import merge_profile_package, migrate_plugin_patch, migrate_schedule_patch, native_schedule_enabled
 
 logger = logging.getLogger(__name__)
@@ -56,11 +58,15 @@ class DshRuntimeManager:
         self.repo_root = self.paths.program_root
         self.release_runtime = Path(os.environ["VOICE_DSH_RUNTIME"]).resolve() if os.environ.get("VOICE_DSH_RUNTIME") else None
         self.release_record: dict = {}
+        self._official_executable: Path | None = None
+        self._actual_host: str | None = None
+        self._actual_port: int | None = None
+        self._actual_origin: str | None = None
         if not callback_origin.startswith("http://127.0.0.1:"):
             raise ValueError("DSH callback origin must be loopback HTTP")
         self._bridge_token = new_bridge_token()
         self.bridge = DshBridgeClient(
-            origin=f"http://{config.host}:{config.port}",
+            origin=f"http://{config.host}:{config.port or 1}",
             token=self._bridge_token,
             timeout_ms=config.bridge_timeout_ms,
         )
@@ -74,6 +80,7 @@ class DshRuntimeManager:
         self._monitor_task: asyncio.Task[None] | None = None
         self._launch_url: str | None = None
         self._launch_event = asyncio.Event()
+        self._launch_error: str | None = None
         self._closing = False
         self._restart_count = 0
 
@@ -87,7 +94,10 @@ class DshRuntimeManager:
             state=self._state,
             version=self.config.expected_version if self.config.enabled else None,
             profile=self.config.profile,
-            ui_origin=(f"http://{self.config.host}:{self.config.port}" if self.config.enabled else None),
+            ui_origin=(self._actual_origin or (
+                f"http://{self.config.host}:{self.config.port}"
+                if self.config.enabled and self.config.port > 0 else None
+            )),
             message=self._message,
         )
 
@@ -122,11 +132,16 @@ class DshRuntimeManager:
         self._state = "starting"
         self._message = "DSH 控制台正在启动。"
         self._launch_url = None
+        self._launch_error = None
+        self._actual_host = None
+        self._actual_port = None
+        self._actual_origin = None
+        self.bridge.set_origin(f"http://{self.config.host}:{self.config.port or 1}")
         self._launch_event.clear()
         self._closing = False
         try:
             node, cli = await self._validate_installation()
-            if self._port_in_use():
+            if self.config.port > 0 and self._port_in_use():
                 raise RuntimeError(f"端口 {self.config.port} 已被未知进程占用；拒绝附着。")
             self.config.home_dir.mkdir(parents=True, exist_ok=True)
             env = os.environ.copy()
@@ -142,15 +157,28 @@ class DshRuntimeManager:
             })
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             managed = bool(os.environ.get("VOICE_APP_ORIGIN"))
-            node_arguments = [node] if node else []
-            if managed:
-                if node:
-                    node_arguments += ["--require", str(self.repo_root / "scripts/managed-node.cjs")]
-                if os.name == "nt":
-                    creationflags |= subprocess.CREATE_NO_WINDOW
+            if os.name == "nt" and managed:
+                creationflags |= subprocess.CREATE_NO_WINDOW
+            env.pop("ELECTRON_RUN_AS_NODE", None)
+            # 两种 DSH（代理宿主）格式的包管理器与临时数据均进入当前工作区。
+            self._prepare_official_environment(env)
+            if self._official_executable is not None:
+                env["ELECTRON_RUN_AS_NODE"] = "1"
+                command = [str(self._official_executable), "--expose-internals"]
+                if managed:
+                    command += ["--require", str(self.repo_root / "scripts/managed-node.cjs")]
+                command += [str(cli), "web", "--host", self.config.host,
+                            "--port", str(self.config.port), "--no-open"]
+            else:
+                if node is None:
+                    raise RuntimeError("DSH 物理运行目录缺少 Node.js（脚本运行环境）。")
+                command = [node]
+                if managed:
+                    command += ["--require", str(self.repo_root / "scripts/managed-node.cjs")]
+                command += [str(cli), "web", "--host", self.config.host,
+                            "--port", str(self.config.port), "--no-open"]
             self._process = await asyncio.create_subprocess_exec(
-                *node_arguments, str(cli), "web", "--host", self.config.host,
-                "--port", str(self.config.port), "--no-open",
+                *command,
                 cwd=str(self.repo_root), env=env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.PIPE if managed else asyncio.subprocess.DEVNULL,
@@ -192,19 +220,32 @@ class DshRuntimeManager:
             self._state = "disabled"
             self._message = "DSH 已随 Voice Server 关闭。"
 
-    async def _validate_installation(self) -> tuple[str, Path]:
+    async def _validate_installation(self) -> tuple[str | None, Path]:
         if self.release_runtime is None:
             from ..local_layout import read_portable
             selected = read_portable(self.paths.install_root)
             self.release_runtime = self.paths.install_root / selected['dsh']
         return await self._validate_release()
 
-    async def _validate_release(self) -> tuple[str, Path]:
+    async def _validate_release(self) -> tuple[str | None, Path]:
         """发行端校验闭合产物；不运行 Git（源码工具）或依赖安装。"""
         runtime = self.release_runtime
         assert runtime is not None
         record = json.loads((runtime / "manifest.json").read_text(encoding="utf-8-sig"))
         metadata = json.loads((runtime / "runtime.json").read_text(encoding="utf-8-sig"))
+        if metadata.get("source_kind") == OFFICIAL_SOURCE_KIND:
+            artifact = load_official_artifact(self.repo_root)
+            if (artifact.version != self.config.expected_version
+                    or artifact.compatibility_commit != self.config.expected_commit):
+                raise RuntimeError("官方 DSH（代理执行宿主）版本与应用兼容锁不匹配。")
+            official = validate_official_runtime(runtime, artifact)
+            self.release_record = metadata
+            self._official_executable = official.executable
+            await self._prepare_profile(modules_target=None)
+            return None, official.cli_entry
+        if metadata.get("source_kind") not in (None, "physical_closure"):
+            raise RuntimeError("DSH（代理执行宿主）运行类型不受支持。")
+        self._official_executable = None
         if metadata.get("schema") != 1 or metadata.get("version") != self.config.expected_version or metadata.get("commit") != self.config.expected_commit:
             raise RuntimeError("DSH（代理执行宿主）发行产物版本与程序要求不匹配。")
         if metadata.get("bridge_protocol") != self.config.bridge_protocol_version:
@@ -223,6 +264,14 @@ class DshRuntimeManager:
             raise RuntimeError("DSH（代理执行宿主）发布清单缺少必要入口记录。")
         await asyncio.to_thread(verify, runtime, {**record, "files": entries}, exact=False)
         self.release_record = metadata
+        node = safe_path(runtime, metadata["node"])
+        cli = safe_path(runtime, metadata["entry"])
+        modules = safe_path(runtime, metadata["modules"])
+        await self._prepare_profile(modules_target=modules)
+        return str(node), cli
+
+    async def _prepare_profile(self, *, modules_target: Path | None) -> None:
+        """Prepare profile plugins（配置档插件）without linking into an ASAR archive."""
         # 自研插件属于程序包；只补默认补丁，已迁移的用户配置继续保留。
         template = self.repo_root / "config/dsh/profile"
         profile = self.config.home_dir / "profiles/web"
@@ -243,16 +292,47 @@ class DshRuntimeManager:
                 atomic_json(target, merge_profile_package(managed, existing))
             else:
                 shutil.copyfile(source, target)
-        # 用户区内的受管目录联接每次启动重建目标，可随整个应用搬迁。
-        # 发行运行目录自身必须没有链接；不复制开发机 pnpm（包管理器）目录联接。
-        target = safe_path(runtime, metadata["modules"])
-        await self._ensure_modules_link(target)
+        # 物理闭包使用用户区联接；官方 Desktop（桌面版）模块留在 ASAR（Electron 归档），不建立目录联接。
+        if modules_target is not None:
+            await self._ensure_modules_link(modules_target)
         managed_patch = profile / "cordis.patch.yml"
         if not self._profile_patch_preserves_managed_defaults(self.config.profile_patch, managed_patch):
             raise RuntimeError("DSH（代理执行宿主）的用户配置缺少必要的受管默认项。")
         migrate_plugin_patch(managed_patch)
         migrate_schedule_patch(managed_patch, native_enabled=native_schedule_enabled(profile))
-        return str(node), cli
+
+    def _prepare_official_environment(self, env: dict[str, str]) -> None:
+        """Keep Electron Node caches and temporary files（临时文件）inside DSH_HOME."""
+        home = self.config.home_dir.resolve()
+        managed_paths = {
+            "TEMP": home / "tmp",
+            "TMP": home / "tmp",
+            "TMPDIR": home / "tmp",
+            "APPDATA": home / "appdata",
+            "LOCALAPPDATA": home / "local-appdata",
+            "HOME": home,
+            "USERPROFILE": home,
+            "XDG_CACHE_HOME": home / "cache",
+            "XDG_CONFIG_HOME": home / "config",
+            "XDG_DATA_HOME": home / "data",
+            "NPM_CONFIG_USERCONFIG": home / "config/npmrc",
+            "NPM_CONFIG_STORE_DIR": home / "pnpm/store",
+            "PNPM_HOME": home / "pnpm/bin",
+            "NPM_CONFIG_CACHE": home / "cache/npm",
+        }
+        for name, path in managed_paths.items():
+            directory = path.parent if name == "NPM_CONFIG_USERCONFIG" else path
+            directory.mkdir(parents=True, exist_ok=True)
+            env[name] = str(path)
+        if os.name == "nt":
+            # HOMEDRIVE/HOMEPATH（Windows 主目录驱动器/路径）与 USERPROFILE（用户主目录）需指向同一工作区目录。
+            drive, home_path = os.path.splitdrive(str(home))
+            if not drive:
+                raise RuntimeError("DSH_HOME（代理数据目录）没有有效的 Windows 驱动器或共享路径。")
+            if not home_path.startswith(("\\", "/")):
+                home_path = "\\" + home_path.lstrip("\\/")
+            env["HOMEDRIVE"] = drive
+            env["HOMEPATH"] = home_path
 
     async def _ensure_modules_link(self, target: Path) -> None:
         target = target.resolve()
@@ -324,16 +404,63 @@ class DshRuntimeManager:
     async def _read_stream(self, stream: asyncio.StreamReader, name: str) -> None:
         while line := await stream.readline():
             decoded = line.decode(errors="replace").rstrip()
-            launch = self.extract_launch_url(decoded)
-            if launch:
-                self._launch_url = launch
-                self._launch_event.set()
+            launch = self.extract_launch_url(decoded) if name == "stdout" else None
+            if launch and not self._launch_event.is_set():
+                try:
+                    self._accept_launch_url(launch)
+                except Exception as exc:
+                    self._launch_error = self._safe_message(exc)
+                    self._launch_event.set()
             safe = self.redact_line(decoded)
             if safe:
                 logger.info("DSH[%s] %s", name, safe)
 
+    def _accept_launch_url(self, launch_url: str) -> None:
+        """Read the bound origin from the child's stdout（从子进程标准输出读取实端口）."""
+        try:
+            address = urlsplit(launch_url)
+            port = address.port
+        except ValueError as exc:
+            raise RuntimeError("DSH 启动地址格式无效。") from exc
+        if (address.scheme != "http" or address.hostname not in {"127.0.0.1", "localhost"}
+                or port is None or not 1 <= port <= 65535 or address.path not in ("", "/")
+                or address.username or address.password or not address.query.startswith("token=")):
+            raise RuntimeError("DSH 启动地址未绑定有效的本机端口。")
+        if self.config.port > 0 and port != self.config.port:
+            raise RuntimeError("DSH 标准输出端口与请求的固定端口不一致。")
+        host = self.config.host
+        origin = f"http://{host}:{port}"
+        self._actual_host = host
+        self._actual_port = port
+        self._actual_origin = origin
+        self._launch_url = launch_url
+        self.bridge.set_origin(origin)
+        if os.environ.get("VOICE_APP_ORIGIN"):
+            if self._process is None:
+                raise RuntimeError("DSH 子进程尚未登记，无法报告实际端口。")
+            try:
+                import psutil
+                created_at = float(psutil.Process(self._process.pid).create_time())
+            except Exception as exc:
+                raise RuntimeError("无法核验 DSH 子进程身份，未登记其端口。") from exc
+            from ..application.managed import report
+            accepted = report("dsh", "本机端口已绑定", endpoint={
+                "host": host,
+                "port": port,
+                "base_url": origin,
+                "pid": self._process.pid,
+                "created_at": created_at,
+            })
+            if accepted is not True:
+                raise RuntimeError("应用宿主拒绝登记 DSH 的实际端口。")
+        self._launch_event.set()
+
     async def _wait_until_ready(self, process: asyncio.subprocess.Process) -> None:
         await self._launch_event.wait()
+        if self._launch_error:
+            raise RuntimeError(self._launch_error)
+        if self._actual_port is None:
+            raise RuntimeError("DSH 标准输出没有提供已绑定的实际端口。")
         for _ in range(100):
             if process.returncode is not None:
                 raise RuntimeError(f"DSH 在就绪前退出（exit {process.returncode}）。")
@@ -348,6 +475,10 @@ class DshRuntimeManager:
             self._state = "exited"
             self._message = f"DSH 进程已退出（exit {returncode}）。"
             self._launch_url = None
+            self._actual_host = None
+            self._actual_port = None
+            self._actual_origin = None
+            self.bridge.set_origin(f"http://{self.config.host}:{self.config.port or 1}")
             logger.warning("%s", self._message)
             self._process = None
             readers, self._reader_tasks = self._reader_tasks, []
@@ -367,9 +498,12 @@ class DshRuntimeManager:
             await self.start()
 
     def _port_in_use(self) -> bool:
+        port = self._actual_port or self.config.port
+        if not port:
+            return False
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(0.15)
-            return sock.connect_ex((self.config.host, self.config.port)) == 0
+            return sock.connect_ex((self.config.host, port)) == 0
 
     async def _stop_child(self, *, force: bool) -> None:
         process = self._process
@@ -403,6 +537,10 @@ class DshRuntimeManager:
         self._reader_tasks.clear()
         self._process = None
         self._launch_url = None
+        self._actual_host = None
+        self._actual_port = None
+        self._actual_origin = None
+        self.bridge.set_origin(f"http://{self.config.host}:{self.config.port or 1}")
 
     @staticmethod
     def extract_launch_url(line: str) -> str | None:

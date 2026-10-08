@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import secrets
 import shutil
-import socket
 import sys
 import threading
 import time
@@ -21,6 +20,8 @@ from .environment import resolve_python
 from .windows import Job, ManagedProcess
 from ..core.state import SERVICE_READY_STATES
 from ..resources import ResourcePolicy
+from .resource_readiness import inspect_model_resources, inspect_dsh_runtime
+from .ports import validate_endpoint_report
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class ApplicationHost:
         self.processes: dict[str, ManagedProcess] = {}
         self.generations: dict[str, str] = {}
         self.manifest = {}
+        self.resource_issues: dict[str, str] = {}  # resource_issues（各组件缺失本地资源的说明）。
         self.voice_entry_ready = False  # voice_entry_ready（轻量语音入口已监听）。
         self.voice_local_ready = False  # voice_local_ready（第三路本地模型加载已结束）。
         self.voice_entry_only = False  # voice_entry_only（本次生成采用分阶段启动）。
@@ -56,6 +58,7 @@ class ApplicationHost:
         self.dev = False
         self.headless = False  # headless（无界面模式）：保留 Host 内部报告，不要求网页构建产物。
         self.frontend_error = ""
+        self.gpu_fallback_roles: set[str] = set()  # gpu_fallback_roles（显卡进程启动失败后使用中央处理器的组件）。
         self.exit_callback = None  # exit_callback（桌面外壳的退出协调回调）。
         self.shutdown_deadline = None  # shutdown_deadline（统一退出的单调时钟截止时间）。
 
@@ -87,16 +90,61 @@ class ApplicationHost:
         return True
 
     def report(self, payload):
+        if not isinstance(payload, dict):
+            return False
         key = payload.get("component")
         generation = payload.get("generation")
-        if key not in {"voice", "speaker", "dsh", "asr", "analysis"} or self.state.snapshot()["stopping"]:
-            return
+        if not isinstance(key, str) or key not in {"voice", "speaker", "dsh", "asr", "analysis"} or self.state.snapshot()["stopping"]:
+            return False
         owner = "voice" if key in {"speaker", "dsh"} else key
         if generation != self.generations.get(owner):
-            return
+            return False
+        endpoint = payload.get("endpoint")
+        endpoint_url = payload.get("endpoint_url")
+        if endpoint_url is not None or endpoint is not None:
+            try:
+                detail = validate_endpoint_report(key, payload)
+            except (TypeError, ValueError):
+                return False
+            if not self._endpoint_pid_is_owned(key, int(detail["pid"]), detail.get("created_at")):
+                return False
+            preferred = self.state.snapshot().get("endpoints", {}).get(key, {}).get("preferred_url")
+            self.state.set_endpoint(key, str(detail["url"]), preferred_url=preferred,
+                generation=generation, pid=int(detail["pid"]),
+                created_at=detail.get("created_at"))
+            if key == "asr":
+                self.manifest["asr_url"] = detail["url"]
+            elif key == "analysis":
+                self.manifest["analysis_url"] = detail["url"]
+            elif key == "voice":
+                self.manifest["voice_port"] = detail["port"]
+            elif key == "speaker":
+                self.manifest["speaker_url"] = detail["url"]
+            elif key == "dsh":
+                self.manifest["dsh_url"] = detail["url"]
         row = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
         self.state.component(key, phase=str(payload.get("phase", ""))[:200],
             **({"state": "starting"} if row["state"] == "waiting" else {}))
+        return True
+
+    def _endpoint_pid_is_owned(self, key: str, pid: int, created_at: float | None) -> bool:
+        """Confirm a reporting PID belongs to this service generation's process tree."""
+        process_key = "voice" if key in {"speaker", "dsh"} else key
+        owner = self.processes.get(process_key)
+        if owner is None or owner.poll() is not None:
+            return False
+        try:
+            import psutil
+            reporter = psutil.Process(pid)
+            current_created_at = float(reporter.create_time())
+            if created_at is not None and abs(current_created_at - created_at) > 2.0:
+                return False
+            if key in {"speaker", "dsh"}:
+                descendants = psutil.Process(owner.pid).children(recursive=True)
+                return any(child.pid == pid for child in descendants)
+            return pid == owner.pid
+        except Exception:
+            return False
 
     def resolve_python(self) -> str:
         return resolve_python(self.root, self.python_option)
@@ -107,10 +155,23 @@ class ApplicationHost:
         self.stop_group(key)
         generation = uuid.uuid4().hex
         self.generations[key] = generation
+        if key in {"voice", "asr", "analysis"}:
+            self.state.clear_endpoint(key, generation=generation)
+        if key == "voice":
+            for dependent in ("speaker", "dsh"):
+                self.state.clear_endpoint(dependent, generation=generation)
+        snapshot = self.state.snapshot()
+        endpoint_table = {
+            name: {"url": row.get("url", ""),  # url（实际端点地址）。
+                "preferred_url": row.get("preferred_url", "")}  # preferred_url（首选端点地址）。
+            for name, row in snapshot.get("endpoints", {}).items()
+            if name in {"voice", "asr", "analysis", "speaker", "dsh"}
+        }
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1",
             "VOICE_APP_ORIGIN": self.origin, "VOICE_APP_INTERNAL_TOKEN": self.internal_token,
             "VOICE_APP_SERVICE_GENERATION": generation,
-            "VOICE_WEB_ORIGINS": self.frontend_origin or self.origin}
+            "VOICE_WEB_ORIGINS": self.frontend_origin or self.origin,
+            "VOICE_APP_ENDPOINTS": json.dumps(endpoint_table, separators=(",", ":"))}
         if key == "dev":
             # Node（界面开发服务）只需来源、实例标识和会话转发值，不应继承内部 Bearer 凭据。
             env.pop("VOICE_APP_INTERNAL_TOKEN", None)
@@ -119,6 +180,8 @@ class ApplicationHost:
                        VOICE_FRONTEND_SESSION=self.frontend_session,
                        VOICE_APP_INSTANCE_ID=self.state.value["instance_id"])
         env.update(self.paths.environment())
+        if key in self.gpu_fallback_roles:
+            env["VOICE_GPU_FALLBACK"] = "1"  # VOICE_GPU_FALLBACK（当前进程强制中央处理器回退）。
         env["VOICE_APP_INSTANCE_ID"] = self.state.value["instance_id"]
         env["VOICE_RESOURCE_POLICY"] = os.environ.get("VOICE_RESOURCE_POLICY", str(self.paths.config / "runtime-resources.json"))
         model_dir = self.manifest.get("model_dir")
@@ -128,6 +191,8 @@ class ApplicationHost:
             env["VOICE_LLM_PROVIDER"] = self.llm_provider
         if key == "voice":
             env["VOICE_APP_PHASED_STARTUP"] = "1" if self.voice_entry_only else "0"
+            # 缺少 DSH 时仍启动轻量 VoiceEntry（语音入口），但不解析不存在的运行包。
+            env["VOICE_APP_SKIP_DSH_STARTUP"] = "1" if self.resource_issues.get("dsh") else "0"
             rows = {c["id"]: c for c in self.state.snapshot()["components"]}
             env["VOICE_APP_ASR_AVAILABLE"] = "1" if rows["asr"]["state"] in {"ready", "external"} else "0"
             env["VOICE_APP_ANALYSIS_AVAILABLE"] = "1" if rows["analysis"]["state"] == "ready" else "0"
@@ -175,13 +240,26 @@ class ApplicationHost:
         lines = output.read_text(encoding="utf-8", errors="replace").splitlines()
         self.manifest = json.loads(next(line for line in reversed(lines) if line.startswith('{"asr_url"')))
         self.stop_group("bootstrap")
+        self._refresh_resource_issues()
+        if self.resource_issues:
+            # startup_skipped（跳过模型启动页）让用户先进入产品设置并下载或导入资源。
+            self.state.update(startup_skipped=True)
         for address in (self.manifest["asr_url"], self.manifest["analysis_url"]):
             if urlsplit(address).hostname not in {"127.0.0.1", "localhost"}:
                 raise RuntimeError("应用模式只管理本机回环组件；远程工作进程请使用调试入口。")
         if self.manifest["voice_host"] not in {"127.0.0.1", "localhost"}:
             raise RuntimeError("应用模式的语音服务必须绑定本机回环地址。")
         api = f"http://127.0.0.1:{self.manifest['voice_port']}"
-        self.state.update(voice_api_url=api, voice_ws_url=api.replace("http:", "ws:") + "/ws")
+        self.state.set_endpoint("voice", None, preferred_url=api)
+        self.state.set_endpoint("asr", None, preferred_url=self.manifest["asr_url"])
+        self.state.set_endpoint("analysis", None, preferred_url=self.manifest["analysis_url"])
+        self.state.set_endpoint("speaker", None, preferred_url=self.manifest.get("speaker_url", ""))
+        dsh_url = self.manifest.get("dsh_url")
+        if dsh_url:
+            self.state.set_endpoint("dsh", None, preferred_url=dsh_url)
+        else:
+            # DSH（代理执行宿主）使用 --port 0 时，绑定前不发布无效端口。
+            self.state.set_endpoint("dsh", None)
         self.state.component("setup", state="ready", phase="配置与运行环境已确认")
         if self.headless:
             self.state.component("web", state="ready", required=False,
@@ -193,14 +271,39 @@ class ApplicationHost:
         else:
             self.state.component("web", state="ready", phase="界面入口已就绪", error="")
 
-    @staticmethod
-    def port_busy(address: str) -> bool:
-        url = urlsplit(address)
-        try:
-            with socket.create_connection((url.hostname, url.port or 80), timeout=.3):
-                return True
-        except OSError:
-            return False
+    def _refresh_resource_issues(self) -> dict[str, str]:
+        """Recheck fixed local files（重新检查固定本地文件）before every model start."""
+        requirements = self.manifest.get("resource_requirements", {})
+        if not isinstance(requirements, dict):
+            requirements = {}
+        requirements = {
+            str(role): [item for item in resource_ids if isinstance(item, str)]
+            for role, resource_ids in requirements.items()
+            if isinstance(resource_ids, list)
+        }
+        if self.no_worker:
+            requirements.pop("asr", None)
+        if self.no_analysis:
+            requirements.pop("analysis", None)
+        issues = inspect_model_resources(
+            self.root,
+            Path(self.manifest.get("model_dir", self.root / ".local" / "models")),
+            requirements,
+        )
+        if self.manifest.get("dsh_enabled"):
+            from ..local_layout import read_portable
+            dsh_runtime = self.paths.install_root / read_portable(self.paths.install_root)["dsh"]
+            issue = inspect_dsh_runtime(
+                self.root,
+                dsh_runtime,
+                expected_version=str(self.manifest.get("dsh_expected_version", "")),
+                expected_commit=str(self.manifest.get("dsh_expected_commit", "")),
+                expected_bridge=str(self.manifest.get("dsh_expected_bridge", "")),
+            )
+            if issue:
+                issues["dsh"] = issue
+        self.resource_issues = issues
+        return issues
 
     async def http(self, url: str, *, action: str | None = None, payload: dict | None = None, timeout=3):
         def request():
@@ -211,9 +314,14 @@ class ApplicationHost:
                 headers["Content-Type"] = "application/json"
             if action is not None:
                 rows = {c["id"]: c for c in self.state.snapshot()["components"]}
-                data = json.dumps({"action": action,
+                body = {"action": action,
                     "asr_available": rows["asr"]["state"] in {"ready", "external"},
-                    "analysis_available": rows["analysis"]["state"] == "ready"}).encode()
+                    "analysis_available": rows["analysis"]["state"] == "ready"}
+                if action in {"initialize-session", "reinitialize"}:
+                    endpoints = self.state.snapshot().get("endpoints", {})
+                    body["endpoints"] = {key: row.get("url") or row.get("preferred_url")
+                        for key, row in endpoints.items() if key in {"asr", "analysis", "speaker"}}
+                data = json.dumps(body).encode()
                 headers["Content-Type"] = "application/json"
             req = urllib.request.Request(url, data=data, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -292,7 +400,7 @@ class ApplicationHost:
             return True
         return False
 
-    async def start_service(self, key, *, entry_only=False):
+    async def start_service(self, key, *, entry_only=False, force_cpu=False):
         if key == "analysis" and (self.no_analysis or not self.manifest["analysis_enabled"]):
             self.state.component(key, state="disabled", enabled=False, phase="配置已停用")
             return
@@ -301,36 +409,64 @@ class ApplicationHost:
                 raise RuntimeError("外部语音识别工作进程未就绪")
             self.state.component(key, state="external", external=True, phase="使用外部进程，不负责回收")
             return
-        address = {"asr": self.manifest["asr_url"], "analysis": self.manifest["analysis_url"], "voice": self.state.value["voice_api_url"]}[key]
-        if self.port_busy(address):
-            raise RuntimeError("组件地址被未知进程占用，未接管或结束该进程：" + address)
         module = {"asr": "apps.server.asr_worker", "analysis": "apps.server.analysis_worker", "voice": "apps.server.main"}[key]
         if key == "voice":
             self.voice_entry_only = entry_only
             self.voice_entry_ready = self.voice_local_ready = False
             self.state.update(voice_api_ready=False, core_available=False)
         from ..paths import python_command
-        process = self.spawn(key, python_command(self.python, module, "--config", self.config, root=self.root))
+        from ..gpu_environment import worker_python
+        interpreter = worker_python(self.paths.install_root, self.paths.data_root or self.paths.install_root / "data", key, self.python,
+                                    self.manifest.get("compute_devices", {}))
+        if force_cpu:
+            interpreter = self.python
+            self.gpu_fallback_roles.add(key)
+        else:
+            self.gpu_fallback_roles.discard(key)
+        try:
+            process = self.spawn(key, python_command(interpreter, module, "--config", self.config, root=self.root))
+        except OSError:
+            if interpreter != self.python and not force_cpu:
+                log.warning("显卡解释器无法建立进程，%s（组件）恢复中央处理器环境。", key)
+                return await self.start_service(key, entry_only=entry_only, force_cpu=True)
+            raise
+        generation = self.generations[key]
         deadline = time.monotonic() + self.manifest.get("worker_timeout_seconds", 180)
         while time.monotonic() < deadline:
             if self.state.snapshot()["stopping"]:
                 return
             if process.poll() is not None:
+                self.state.clear_endpoint(key, generation=generation)
+                if key == "voice":
+                    for dependent in ("speaker", "dsh"):
+                        self.state.clear_endpoint(dependent, generation=generation)
+                if interpreter != self.python and not force_cpu:
+                    log.warning("显卡解释器启动失败，%s（组件）恢复中央处理器环境。", key)
+                    self.stop_group(key)
+                    return await self.start_service(key, entry_only=entry_only, force_cpu=True)
                 raise RuntimeError(f"组件启动中退出（退出码 {process.poll()}），请查看 application-{key}.log（组件启动日志）。")
             try:
-                if await self.probe(key):
+                endpoint = self.state.snapshot().get("endpoints", {}).get(key, {})
+                endpoint_registered = endpoint.get("generation") == generation and bool(endpoint.get("url"))
+                if endpoint_registered and await self.probe(key):
                     if key == "voice" and entry_only:
                         self.state.component(key, state="waiting", phase="接口已监听，等待本地模型加载", error="")
                         self.voice_entry_ready = True
                     elif key == "voice" and not self.state.value["core_available"]:
                         self.state.component(key, state="failed", phase="接口就绪，核心能力不可用")
                     else:
-                        self.state.component(key, state="ready", phase="应用层健康检查通过", error="")
+                        self.state.component(key, state="ready", phase="应用层健康检查通过", error="显卡环境启动失败，当前使用中央处理器环境。" if force_cpu else "")
                     return
             except Exception:
                 pass
             await asyncio.sleep(.5)
         self.stop_group(key)
+        self.state.clear_endpoint(key, generation=generation)
+        if key == "voice":
+            for dependent in ("speaker", "dsh"):
+                self.state.clear_endpoint(dependent, generation=generation)
+        if interpreter != self.python and not force_cpu:
+            return await self.start_service(key, entry_only=entry_only, force_cpu=True)
         raise RuntimeError("组件启动等待超时；请查看对应组件日志。")
 
     async def start_voice_entry(self):
@@ -383,16 +519,27 @@ class ApplicationHost:
             row = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
             if row["retrying"]:
                 continue
+            if item.get("state") in {"failed", "disabled", "blocked", "stopped"}:
+                self.state.clear_endpoint(key, generation=self.generations.get("voice"))
             self.state.component(key, **item)
         return data
 
     async def start_delegated(self):
+        issues = self._refresh_resource_issues()
         if "voice" not in self.processes or self.processes["voice"].poll() is not None:
             for key in ("speaker", "dsh"):
-                self.state.component(key, state="blocked", phase="依赖语音服务", error="语音服务未运行")
+                issue = issues.get(key)
+                self.state.component(key, state="failed" if issue else "blocked",
+                    phase="本地资源缺失" if issue else "依赖语音服务",
+                    error=issue or "语音服务未运行")
             return
         data = await self.delegated_status(timeout=self.manifest.get("dsh_timeout_seconds", 120) + 10)
+        if issues.get("speaker"):
+            self.state.component("speaker", state="failed", phase="本地资源缺失", error=issues["speaker"], pid=None)
         if self.manifest["dsh_enabled"]:
+            if issues.get("dsh"):
+                self.state.component("dsh", state="failed", phase="本地资源缺失", error=issues["dsh"], pid=None)
+                return
             if self.voice_entry_only:
                 if not data.get("startup", {}).get("session_ready"):
                     self.state.component("dsh", state="blocked", phase="等待恢复语音会话", error="语音会话初始化未完成")
@@ -414,6 +561,10 @@ class ApplicationHost:
             return
         self.state.update(phase="启动" + next(c["name"] for c in self.state.snapshot()["components"] if c["id"] == key))
         try:
+            issue = self._refresh_resource_issues().get(key)
+            if issue:
+                self.state.component(key, state="failed", phase="本地资源缺失", error=issue, pid=None)
+                return
             if key == "voice" and self.voice_entry_ready:
                 await self.start_voice_local()
             else:
@@ -542,6 +693,9 @@ class ApplicationHost:
                 return
             try:
                 self.state.component(key, state="starting", error="", phase="恢复组件")
+                issue = self._refresh_resource_issues().get(key)
+                if issue:
+                    raise RuntimeError(issue)
                 if key == "web":
                     if self.dev:
                         raise RuntimeError("请重启桌面程序恢复开发界面；当前诊断入口仍可使用。")
@@ -573,6 +727,7 @@ class ApplicationHost:
                             if row["state"] not in {"ready", "disabled"}:
                                 self.state.component(name, state="failed", phase="组件启动失败", error=str(exc))
                 elif key in {"speaker", "dsh"}:
+                    self.state.clear_endpoint(key, generation=self.generations.get("voice"))
                     response = await self.voice_control(key + "-retry", timeout=self.manifest.get("dsh_timeout_seconds", 120) + 70)
                     if not response.get("ok"):
                         raise RuntimeError(response.get("message", "组件恢复失败"))
@@ -591,7 +746,13 @@ class ApplicationHost:
                         await self.start_delegated()
                     elif "voice" in self.processes and self.processes["voice"].poll() is None:
                         response = await self.voice_control("reinitialize")
-                        if not response.get("ok"):
+                        # reinitialize 的 ok（核心就绪）还包含 LLM/TTS（大语言模型/语音合成）；
+                        # 局部 ASR/Analysis（语音识别/分析）重试以实际会话初始化与 ASR 就绪为成功条件。
+                        session_ready = (
+                            response.get("session_initialized") is True
+                            and response.get("asr_ready") is True
+                        )
+                        if not response.get("ok") and not session_ready:
                             raise RuntimeError(response.get("message", "语音业务重新连接失败"))
                         await self.probe("voice")
                         await self.delegated_status()
@@ -698,11 +859,16 @@ class ApplicationHost:
                         continue
                     if process.poll() is not None:
                         self.stop_group(key)
+                        endpoint_key = "web" if key == "dev" else key
+                        endpoint_owner_generation = self.generations.get(
+                            "voice" if endpoint_key in {"speaker", "dsh"} else endpoint_key)
+                        self.state.clear_endpoint(endpoint_key, generation=endpoint_owner_generation)
                         self.state.component("web" if key == "dev" else key, state="failed", phase="进程已退出", error="运行中进程退出，请查看组件日志", pid=None)
                         if key in {"voice", "asr"}:
                             self.state.update(core_available=False)
                         if key == "voice":
                             for name in ("dsh", "speaker"):
+                                self.state.clear_endpoint(name, generation=self.generations.get("voice"))
                                 self.state.component(name, state="blocked", phase="语音服务已退出", pid=None)
                 if "voice" in self.processes:
                     try:

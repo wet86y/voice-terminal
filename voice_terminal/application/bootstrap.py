@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from ..resources import bootstrap_resources
 from ..paths import AppPaths
+from .resource_readiness import inspect_startup_resources, required_model_resources
+from ..local_layout import read_portable
 
 if __name__ == "__main__":
     bootstrap_resources("bootstrap")
@@ -27,7 +29,19 @@ def main() -> None:
     local = Path(args.config)
     config = load_config(root / "config/default.yaml", local if local.is_file() else None)
     config = ProductSettingsStore(path=paths.config / "product-settings.json", config=config).effective_config()
-    if paths.separated and not config.kws_keywords_file.is_file():
+    resource_requirements = required_model_resources(config)
+    resource_issues = inspect_startup_resources(
+        root,
+        config.model_dir,
+        resource_requirements,
+        dsh_enabled=config.dsh.enabled and config.dsh.auto_start,
+        dsh_runtime=paths.install_root / read_portable(paths.install_root)["dsh"],
+        dsh_version=config.dsh.expected_version,
+        dsh_commit=config.dsh.expected_commit,
+        dsh_bridge=config.dsh.bridge_protocol_version,
+    )
+    from importlib.util import find_spec
+    if paths.separated and find_spec("sherpa_onnx") and (config.kws_dir / "tokens.txt").is_file() and not config.kws_keywords_file.is_file():
         from ..kws.keywords import generate_keywords_for
         keywords = config.wake.keywords or (config.wake.keyword,)
         generate_keywords_for(model_dir=config.kws_dir, raw_path=paths.cache / "kws/keywords.raw.txt",
@@ -36,9 +50,13 @@ def main() -> None:
     dependencies = diagnose(check_dependencies=False)
     print(json.dumps({
         "asr_url": config.asr.worker_url,
+        "compute_devices": config.compute.devices,  # compute_devices（逐模型运行设备）：宿主按登记环境选择解释器。
         "model_dir": str(config.model_dir),  # model_dir（统一模型与下载缓存根目录）。
         "dependency_status": dependencies,  # dependency_status（同一版本清单的检查结果，兼容现用环境）。
         "analysis_url": config.smart_turn.analysis_url,
+        "speaker_url": config.speaker_worker_url,
+        # port=0（系统分配端口）在 DSH（代理执行宿主）完成绑定前没有可发布的首选地址。
+        "dsh_url": f"http://{config.dsh.host}:{config.dsh.port}" if config.dsh.port > 0 else "",
         "analysis_enabled": config.smart_turn.smart_turn or config.smart_turn.sensevoice,
         "analysis_lanes": [name for name, enabled in (("endpoint", config.smart_turn.smart_turn),
             ("refine", config.smart_turn.sensevoice)) if enabled],
@@ -56,6 +74,11 @@ def main() -> None:
         "speaker_enabled": config.speaker.mode != "off" or config.speaker.owner_only_barge_in,
         "dsh_enabled": config.dsh.enabled and config.dsh.auto_start,
         "dsh_timeout_seconds": config.dsh.startup_timeout_ms / 1000,
+        "resource_requirements": resource_requirements,  # resource_requirements（本次配置会加载的固定模型资源编号）。
+        "resource_issues": resource_issues,  # resource_issues（本地缺失或大小不符的资源与组件说明）。
+        "dsh_expected_version": config.dsh.expected_version,  # dsh_expected_version（锁定的代理版本）。
+        "dsh_expected_commit": config.dsh.expected_commit,  # dsh_expected_commit（锁定的代理兼容提交）。
+        "dsh_expected_bridge": config.dsh.bridge_protocol_version,  # dsh_expected_bridge（锁定的代理桥接协议）。
     }, ensure_ascii=False))
 
 

@@ -33,7 +33,7 @@ def test_paths_independent_of_working_directory(tmp_path, monkeypatch):
     paths.prepare()
     assert user.read_text(encoding="utf-8") == "用户修改"
     config = load_config(paths.default_config)
-    assert config.kws_keywords_file == paths.cache / "kws/keywords.txt"
+    assert config.kws_keywords_file == paths.config / "kws/keywords.txt"
     assert config.persona.directory == paths.persona
     assert paths.environment()["HF_HOME"].startswith(str(paths.cache))
 
@@ -92,7 +92,7 @@ def test_kws_alias_lexicon_and_generated_files_stay_in_data(tmp_path, monkeypatc
     monkeypatch.setenv('VOICE_PROGRAM_ROOT', str(program))
     monkeypatch.setenv('VOICE_INSTALL_ROOT', str(tmp_path))
     monkeypatch.setenv('VOICE_DATA_DIR', str(data))
-    output = data / 'cache/kws/keywords.txt'
+    output = data / 'config/kws/keywords.txt'
     observed = []
     def token_command(command, **_kwargs):
         lexicon = Path(command[command.index('--lexicon') + 1])
