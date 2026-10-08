@@ -26,6 +26,63 @@ function openTerminal(now?: () => number) {
 }
 
 describe('V0.6 session protocol', () => {
+  it('重置立即锁定，保留旧记录，直到后端回执与完成快照均到达', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('runtime.snapshot', 1, { can_start: true, session_operation: null,
+      conversation: { entries: [{ seq: 1, kind: 'user_turn', conversation_id: 'conversation_a',
+        turn_id: 'input-a', speech_id: '', text: '需要保留的对话', status: '', delivery: {}, termination: '', at: '' }], latest_seq: 1 } })
+    expect(terminal.resetSession()).toBe(true)
+    const request = JSON.parse(socket.sent.at(-1)!)
+    expect(request.command).toBe('session.reset')
+    expect(terminal.sessionOperation.value).toBe('reset')
+    expect(terminal.conversationEntries.value[0]?.text).toBe('需要保留的对话')
+    expect(terminal.toggleListening()).toBe(false)
+    expect(terminal.resetSession()).toBe(false)
+    expect(terminal.clearSession()).toBe(false)
+    expect(terminal.setReasoningMode('deep')).toBe(false)
+    socket.push('runtime.snapshot', 2, { session_operation: null, can_start: true })
+    expect(terminal.sessionOperation.value).toBe('reset')
+    socket.push('runtime.snapshot', 3, { session_operation: 'reset', can_start: false })
+    socket.push('session.operation', 4, { request_id: request.request_id, operation: 'reset', status: 'completed' })
+    expect(terminal.sessionOperation.value).toBe('reset')
+    socket.push('runtime.snapshot', 5, { session_operation: null, can_start: true,
+      conversation: { entries: [], latest_seq: 0 } })
+    expect(terminal.sessionOperation.value).toBeNull()
+    expect(terminal.conversationEntries.value).toEqual([])
+    expect(terminal.toggleListening()).toBe(true)
+    terminal.dispose()
+  })
+
+  it('清除使用独立命令，错误回执只解除对应请求，失败后可重试', () => {
+    const { socket, terminal } = openTerminal()
+    expect(terminal.clearSession()).toBe(true)
+    const request = JSON.parse(socket.sent.at(-1)!)
+    expect(request.command).toBe('session.clear')
+    socket.push('error', 1, { request_id: 'other-request', message: '其他操作错误' })
+    expect(terminal.sessionOperation.value).toBe('clear')
+    socket.push('error', 2, { request_id: request.request_id, code: 'SESSION_CLEAR_FAILED', message: '归档失败' })
+    expect(terminal.sessionOperation.value).toBeNull()
+    expect(terminal.connectionError.value).toBe('归档失败')
+    expect(terminal.clearSession()).toBe(true)
+    socket.close()
+    expect(terminal.sessionOperation.value).toBeNull()
+    terminal.dispose()
+  })
+
+  it('重连快照恢复操作锁定，发送失败不留下加载状态', () => {
+    const { socket, terminal } = openTerminal()
+    socket.push('runtime.snapshot', 1, { session_operation: 'reset', can_start: false })
+    expect(terminal.sessionOperation.value).toBe('reset')
+    expect(terminal.toggleListening()).toBe(false)
+    expect(terminal.clearSession()).toBe(false)
+    socket.push('runtime.snapshot', 2, { session_operation: null, can_start: true })
+    vi.spyOn(socket, 'send').mockImplementationOnce(() => { throw new Error('连接中断') })
+    expect(terminal.resetSession()).toBe(false)
+    expect(terminal.sessionOperation.value).toBeNull()
+    expect(terminal.connectionError.value).toBe('连接中断')
+    terminal.dispose()
+  })
+
   it('默认快速，仅接收快速和深度模式，并发送对应的模式命令', () => {
     const { socket, terminal } = openTerminal()
     expect(terminal.reasoningMode.value).toBe('fast')

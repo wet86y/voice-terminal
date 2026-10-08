@@ -6,6 +6,7 @@ import Workbench from "../interface/Workbench.vue";
 import UiDialog from "../interface/UiDialog.vue";
 import UiButton from "../interface/UiButton.vue";
 import type { WorkbenchModel } from "../interface/workbench";
+import type { SessionOperation } from "../types";
 import DemoSettings from "./DemoSettings.vue";
 import {
   demoConversation,
@@ -79,6 +80,22 @@ const reasoningMode = ref<ReasoningMode>("fast"); // reasoningMode（运行模�
 const feedback = ref("");
 const feedbackError = ref(false);
 const resetKey = ref(0);
+const sessionOperation = ref<SessionOperation | null>(null); // sessionOperation（会话操作加载状态样例）。
+let sessionOperationTimer: ReturnType<typeof setTimeout> | undefined; // sessionOperationTimer（样例完成计时器）。
+function cancelSessionOperation() {
+  if (sessionOperationTimer !== undefined) clearTimeout(sessionOperationTimer);
+  sessionOperationTimer = undefined;
+  sessionOperation.value = null;
+}
+function performSessionOperation(operation: SessionOperation) {
+  if (sessionOperation.value || voiceSession.active.value || replayMode.value || scene.value === 'loading') return;
+  sessionOperation.value = operation;
+  sessionOperationTimer = setTimeout(() => {
+    sessionOperationTimer = undefined;
+    sessionOperation.value = null;
+    notify(operation === 'reset' ? '上下文整理完成，会话已重置' : '旧会话已归档，全新会话已就绪');
+  }, operation === 'reset' ? 1800 : 350);
+}
 // effectiveRuntimeState（有效运行状态）：错误场景优先，其次固定回放状态。
 const effectiveRuntimeState = computed<DemoRuntimeState>(() =>
   scene.value === "error"
@@ -153,6 +170,7 @@ function showConfirm(purpose: "apply" | "exit") {
   overlay.value = "confirm";
 }
 function resetPreview() {
+  cancelSessionOperation();
   voiceSession.stop();
   replayMode.value = false;
   page.value = "home";
@@ -163,7 +181,7 @@ function resetPreview() {
   resetKey.value += 1;
 }
 function toggleVoiceSession() {
-  if (replayMode.value || scene.value === 'loading') return;
+  if (replayMode.value || scene.value === 'loading' || sessionOperation.value) return;
   if (voiceSession.active.value) voiceSession.stop();
   else voiceSession.start();
 }
@@ -171,7 +189,7 @@ function handleEscape(event: KeyboardEvent) {
   if (event.key === "Escape") closeOverlays();
 }
 onMounted(() => window.addEventListener("keydown", handleEscape));
-onBeforeUnmount(() => window.removeEventListener("keydown", handleEscape));
+onBeforeUnmount(() => { cancelSessionOperation(); window.removeEventListener("keydown", handleEscape); });
 
 // conversationModel（会话条目）、traceModel（活动条目）不随音量帧重建，避免动效期间反复滚动列表。
 const conversationModel = computed<WorkbenchModel['conversation']>(() => messages.value.map((item) => ({
@@ -193,14 +211,15 @@ const traceModel = computed<WorkbenchModel['shadow']['trace']>(() => activities.
 const workbenchModel = computed<WorkbenchModel>(() => ({
   state: effectiveRuntimeState.value,
   sessionActive: replayMode.value || voiceSession.active.value,
+  sessionOperation: sessionOperation.value,
   audioLevels: replayMode.value || effectiveRuntimeState.value === 'error' ? [] : voiceSession.audioLevels.value,
   title: currentRuntime.value.label,
   description: currentRuntime.value.description,
   action: replayMode.value ? '日志回放 · 只读' : voiceSession.active.value
     ? "停止当前会话"
     : "开始语音会话",
-  disabled: replayMode.value || scene.value === "loading",
-  modeDisabled: replayMode.value,
+  disabled: replayMode.value || scene.value === "loading" || Boolean(sessionOperation.value),
+  modeDisabled: replayMode.value || Boolean(sessionOperation.value),
   canReset: !replayMode.value && !voiceSession.active.value && effectiveRuntimeState.value === "standby",
   mode: reasoningMode.value,
   latency: replayMode.value ? voiceShadowReplayDemo.latency : voiceSession.active.value
@@ -242,7 +261,8 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
       @settings="page = 'wake'"
       @console="notify('控制台入口')"
       @action="toggleVoiceSession"
-      @reset="notify('会话已重置')"
+      @reset="performSessionOperation('reset')"
+      @clear="performSessionOperation('clear')"
       @mode="reasoningMode = $event"
     />
     <SettingsFrame

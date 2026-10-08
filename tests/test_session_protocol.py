@@ -3,6 +3,9 @@ from voice_terminal.core.events import event
 from voice_terminal.server.snapshot import ProtocolSequencer
 from voice_terminal.server.websocket import SessionRuntime
 from voice_terminal.session.conversation_log import USER_TURN
+from unittest.mock import AsyncMock
+
+import pytest
 
 
 def test_v5_envelope_has_conversation_and_resource_identities():
@@ -60,3 +63,29 @@ def test_subscribe_snapshot_carries_the_ordered_conversation(tmp_path):
     }
     # The legacy projections stay published for existing consumers.
     assert payload["recent_inputs"] == []
+
+
+@pytest.mark.parametrize("operation", ["reset", "clear"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_manual_session_commands_return_correlated_completion_or_failure(tmp_path, operation, fails):
+    from fastapi.testclient import TestClient
+    from voice_terminal.server.http_api import create_app
+
+    runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "runtime")
+    action = AsyncMock(side_effect=RuntimeError("archive unavailable") if fails else None)
+    setattr(runtime, f"{operation}_session", action)
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json({"type": "command", "request_id": "operation-request",
+                              "command": f"session.{operation}", "payload": {}})
+            response = socket.receive_json()
+            assert response["payload"]["request_id"] == "operation-request"
+            if fails:
+                assert response["type"] == "error"
+                assert response["payload"]["code"] == (
+                    "HANDOFF_RESET_FAILED" if operation == "reset" else "SESSION_CLEAR_FAILED")
+            else:
+                assert response["type"] == "session.operation"
+                assert response["payload"]["operation"] == operation
+                assert response["payload"]["status"] == "completed"
+    action.assert_awaited_once()
