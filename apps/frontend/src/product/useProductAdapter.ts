@@ -913,6 +913,11 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     return voice.resetSession()
   }
 
+  function clearSession() {
+    if (!connected.value || application.snapshot.value?.startup_complete === false) return false
+    return voice.clearSession()
+  }
+
   function setReasoningMode(mode: ReasoningMode) {
     if (!connected.value || application.snapshot.value?.startup_complete === false) return false
     return voice.setReasoningMode(mode)
@@ -1430,6 +1435,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     refreshRegistry,
     runtimeAction,
     resetSession,
+    clearSession,
     setReasoningMode,
     toggleProviderReasoning,
     saveWake,

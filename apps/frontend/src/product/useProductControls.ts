@@ -109,6 +109,7 @@ export function useProductControls() {
     noticeVisible,
     runtimeAction: performRuntimeAction,
     resetSession,
+    clearSession,
     setReasoningMode,
     toggleProviderReasoning,
     saveWake,
@@ -1517,6 +1518,7 @@ export function useProductControls() {
       state: runtimeState.value,
       audioLevels: voice.audioLevels?.value ?? [0, 0, 0, 0, 0],
       sessionActive: connected.value && listening.value, // sessionActive（真实会话开关）：等待唤醒时仍保持会话布局。
+      sessionOperation: voice.sessionOperation.value,
       title: runtimeMeta.value.label,
       description: runtimeMeta.value.description,
       action: applicationSnapshot.value?.startup_complete === false
@@ -1528,8 +1530,8 @@ export function useProductControls() {
             ? "停止当前会话"
             : "开始语音会话"
           : "重试连接",
-      disabled: loading.value || applicationSnapshot.value?.startup_complete === false,
-      modeDisabled: !connected.value || applicationSnapshot.value?.startup_complete === false,
+      disabled: loading.value || Boolean(voice.sessionOperation.value) || applicationSnapshot.value?.startup_complete === false,
+      modeDisabled: !connected.value || Boolean(voice.sessionOperation.value) || applicationSnapshot.value?.startup_complete === false,
       canReset: connected.value && !listening.value && applicationSnapshot.value?.startup_complete !== false,
       mode: reasoningMode.value,
       latency: formatResponseLatency(latencyMs.value),
@@ -1643,6 +1645,7 @@ export function useProductControls() {
     noticeVisible,
     runtimeAction,
     resetSession,
+    clearSession,
     setReasoningMode,
     saveWake,
     saveSilence,

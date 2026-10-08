@@ -674,6 +674,9 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
 
     def snapshot(self) -> VoiceEvent:
         value = snapshot_event(self.state)
+        value.payload["session_operation"] = getattr(self, "_session_operation", None)  # session_operation（手动会话操作）。
+        if value.payload["session_operation"]:
+            value.payload["can_start"] = False
         if hasattr(self, "quiet_policy"):
             value.payload["quiet_hours"] = self.quiet_policy.snapshot()
         controller = self.controller
@@ -1530,9 +1533,6 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
     async def publish_voice_event(self, payload: dict[str, Any]) -> str:
         """Accept an ordinary DSH event without a Voice-initiated activation."""
         source = str(payload.get("source_session_id") or "")
-        current = getattr(self.shadow_session, "dsh_session_id", "")
-        if source.startswith("voice-shadow-") and source != current:
-            return "stale"
         event_id = str(payload.get("event_id") or "")
         message = payload.get("text")
         if not event_id or not isinstance(message, str) or not message.strip():
@@ -1547,6 +1547,10 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             payload=dict(extra or {}),
         )
         async with self._session_lock:
+            # 在清除或重置结束后重新核对，阻止等待锁的旧 DSH（后台代理）事件进入新会话。
+            current = getattr(self.shadow_session, "dsh_session_id", "")
+            if source.startswith("voice-shadow-") and source != current:
+                return "stale"
             code = await self._voice_mailbox.publish(voice_event)
             if code == "accepted":
                 self.continuity.user_started()

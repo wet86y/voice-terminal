@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from ..core.events import VoiceEvent, event
 from ..dsh import BRIDGE_PROTOCOL_VERSION, DshBridgeError, DshShadowAgentSession
+from ..application.ports import validate_endpoint_url
 from ..speaker.enrollment import EnrollmentRejectedError
 from ..speaker.enrollment_capture import EnrollmentCaptureError
 from ..model_registry.service import ModelRegistryError, ModelRegistryService
@@ -118,7 +119,20 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 raise HTTPException(status_code=422, detail="缺少受管工作进程状态。")
             for field, environment in fields:
                 os.environ[environment] = "1" if payload[field] else "0"
-        return await runtime.application_control(payload["action"])
+        endpoint_table = None
+        if "endpoints" in payload:
+            if payload["action"] not in {"reinitialize", "initialize-session"} or not isinstance(payload["endpoints"], dict):
+                raise HTTPException(status_code=422, detail="受管端点表无效。")
+            endpoint_table = {}
+            for component in ("asr", "analysis", "speaker"):
+                value = payload["endpoints"].get(component)
+                if value is None:
+                    continue
+                try:
+                    endpoint_table[component] = str(validate_endpoint_url(component, value)["url"])
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail="受管端点表包含无效地址。") from exc
+        return await runtime.application_control(payload["action"], endpoint_table=endpoint_table)
 
     def registry_or_404() -> ModelRegistryService:
         if model_registry is None:
@@ -969,8 +983,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 command, _payload = parsed
                 logger.info("websocket.command peer=%s command=%s", websocket.client, command)
                 if (getattr(runtime, "application_initializing", False) is True
-                        and command in {"session.start", "session.reset", "shadow.debug.wake"}):
-                    await _send_error(websocket, sequencer, "RUNTIME_STARTING", "组件仍在加载，请等待启动完成。", None, True)
+                        and command in {"session.start", "session.reset", "session.clear", "shadow.debug.wake"}):
+                    await _send_error(websocket, sequencer, "RUNTIME_STARTING", "组件仍在加载，请等待启动完成。", None, True,
+                                      request_id=message["request_id"])
                     continue
                 if command == "subscribe":
                     await websocket.send_json(sequencer.envelope(runtime.snapshot()))
@@ -978,13 +993,21 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     await runtime.start_listening()
                 elif command == "session.stop":
                     await runtime.stop_listening()
-                elif command == "session.reset":
+                elif command in {"session.reset", "session.clear"}:
+                    operation = "reset" if command == "session.reset" else "clear"
                     try:
-                        await runtime.reset_session()
+                        if operation == "reset":
+                            await runtime.reset_session()
+                        else:
+                            await runtime.clear_session()
+                        await websocket.send_json(sequencer.envelope(event("session.operation",
+                            request_id=message["request_id"], operation=operation, status="completed")))
                     except Exception:
-                        logger.exception("handoff.manual_reset_failed")
-                        await _send_error(websocket, sequencer, "HANDOFF_RESET_FAILED",
-                            "会话交接整理失败，原会话、归档和待传达材料已保留，可以继续交互。", None, True)
+                        logger.exception("handoff.manual_%s_failed", operation)
+                        await _send_error(websocket, sequencer,
+                            "HANDOFF_RESET_FAILED" if operation == "reset" else "SESSION_CLEAR_FAILED",
+                            "会话操作未完成，已保存的材料与归档已保留，可重试以完成会话切换。", None, True,
+                            request_id=message["request_id"])
                 elif command == "session.reasoning_mode":
                     mode = _payload.get("mode")
                     if not isinstance(mode, str) or not await runtime.set_reasoning_mode(mode):
@@ -1010,7 +1033,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                                           code if code in {"SHADOW_DEBUG_DISABLED", "SHADOW_UNAVAILABLE"} else "INVALID_SHADOW_DEBUG_WAKE",
                                           "影子调试唤醒不可受理。", None, True)
                 else:
-                    await _send_error(websocket, sequencer, "UNKNOWN_COMMAND", f"不支持的命令：{command}", None, True)
+                    await _send_error(websocket, sequencer, "UNKNOWN_COMMAND", f"不支持的命令：{command}", None, True,
+                                      request_id=message["request_id"])
         except WebSocketDisconnect:
             pass
         except Exception as exc:
@@ -1064,7 +1088,10 @@ async def _send_error(
     message: str,
     turn_id: str | None,
     recoverable: bool,
+    *,
+    request_id: str | None = None,  # request_id（失败操作的请求标识，供前端解除对应锁定）。
 ) -> None:
     await websocket.send_json(
-        sequencer.envelope(event("error", turn_id, code=code, message=message, recoverable=recoverable))
+        sequencer.envelope(event("error", turn_id, code=code, message=message, recoverable=recoverable,
+                                 **({"request_id": request_id} if request_id else {})))
     )

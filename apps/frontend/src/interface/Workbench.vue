@@ -14,6 +14,7 @@ const initialMessageKeys = new Set(props.model.conversation.map(entry => entry.k
 const emit = defineEmits<{
   action: [];
   reset: [];
+  clear: []; // clear（归档旧会话并开启全新会话）。
   mode: [value: ReasoningMode]; // mode（切换运行模式）。
   settings: []; // settings（打开设置页面）。
   console: []; // console（打开代理控制台）。
@@ -209,16 +210,15 @@ onBeforeUnmount(() => { observer?.disconnect(); motionGeneration += 1; cancelLay
           </div>
         </div>
         <div class="voice-controls">
-          <UiButton class="voice-session-action" :class="{ 'voice-stop-button': sessionActive }" :disabled="model.disabled" @click="emit('action')">
-            <i v-if="sessionActive" class="voice-stop-icon" aria-hidden="true"></i>{{ model.action }}
+          <UiButton class="voice-session-action" :class="{ 'voice-stop-button': sessionActive }" :disabled="model.disabled" :busy="Boolean(model.sessionOperation)" @click="emit('action')">
+            <i v-if="model.sessionOperation" class="voice-session-spinner" aria-hidden="true"></i>
+            <i v-else-if="sessionActive" class="voice-stop-icon" aria-hidden="true"></i>
+            <span role="status" aria-live="polite">{{ model.sessionOperation === 'reset' ? '上下文整理中' : model.sessionOperation === 'clear' ? '会话清除中' : model.action }}</span>
           </UiButton>
-          <button
-            v-if="model.canReset && !sessionActive"
-            class="ghost-action"
-            @click="emit('reset')"
-          >
-            重置当前会话
-          </button>
+          <div v-if="model.canReset && !sessionActive" class="voice-session-options">
+            <button type="button" class="ghost-action" :disabled="Boolean(model.sessionOperation)" title="归档当前会话并整理上下文，保留需要延续的信息" @click="emit('reset')">重置当前会话</button>
+            <button type="button" class="ghost-action" :disabled="Boolean(model.sessionOperation)" title="归档语音与后台会话，清除旧上下文并开启全新会话" @click="emit('clear')">清除会话</button>
+          </div>
           <div
             class="metric-card"
             :title="model.latencyPending ? '等待开始播报' : '从说完到开口的响应时间'"

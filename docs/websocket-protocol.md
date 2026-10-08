@@ -4,7 +4,7 @@
 
 ## 连接和安全边界
 
-运行快照新增 `quiet_hours`（被动静默状态），包含 `passive_quiet`（当前抑制主动语音）、`user_interaction`（用户交互窗口开启）、`within_quiet_hours`（当前处于配置时段）三个布尔值。旧客户端可以忽略。待传达槽位没有正文事件或读取命令；逻辑会话重置先完成成对归档和交接，失败返回 `HANDOFF_RESET_FAILED`（交接重置失败）并保留旧会话。设置接口与恢复规则见[交接说明](continuity-foundation.md)。
+运行快照新增 `quiet_hours`（被动静默状态），包含 `passive_quiet`（当前抑制主动语音）、`user_interaction`（用户交互窗口开启）、`within_quiet_hours`（当前处于配置时段）三个布尔值。旧客户端可以忽略。待传达槽位没有正文事件或读取命令；`session.reset`（重置会话）先完成成对归档和交接整理，失败返回 `HANDOFF_RESET_FAILED`（会话重置失败）并保留旧会话；`session.clear`（清除会话）将旧衔接材料随会话归档，失败返回 `SESSION_CLEAR_FAILED`（会话清除失败）并通过原有恢复标记继续提交。设置接口与恢复规则见[交接说明](continuity-foundation.md)。
 
 默认连接：
 
@@ -68,13 +68,16 @@ HTTP API 和 WebSocket 事件都应尽量保留结构化错误码：
 
 - `runtime.snapshot`：重连或订阅后的全量运行快照；
 - `session.state`：`IDLE`、`LISTENING`、`FINALIZING`、`ERROR` 等会话状态；
+- `session.operation`（会话操作完成回执）：携带 `request_id`（请求标识）、`operation`（`reset` 重置整理或 `clear` 清除归档）和 `status=completed`（操作完成）；失败通过同一请求标识的 `error`（错误事件）返回；
 - `input.partial` / `input.finalized`：ASR partial 和最终用户输入；
 - `metrics.snapshot`：后端诊断指标，不覆盖前端本地感知延迟计时；
 - `conversation.append`：服务端会话顺序流；
 - `conversation.snapshot`：当前 conversation 的权威全量列表；
 - `error`：当前命令或运行链路的结构化错误。
 
-`session.stop` 只关闭输入作用域。已经派发的 LLM、TTS 和 Shadow 工作按既有生命周期继续结算；需要跨会话清理时使用 `session.reset`。
+`session.stop`（停止监听）只关闭输入作用域。已经派发的 LLM（语言模型）、TTS（语音合成）和 Shadow（后台代理）工作按既有生命周期继续结算。`session.reset`（重置会话）归档两侧记录并整理衔接文档；`session.clear`（清除会话）归档旧语音和关联后台会话，并将旧衔接文档与待传达材料归档后停止带入新会话，跳过模型整理。新的逻辑会话等待 `session.start`（开始监听）。
+
+`runtime.snapshot`（全量运行快照）中的 `session_operation`（当前手动会话操作）为 `reset`（上下文整理）、`clear`（清除归档）或 `null`（无操作）。操作期间 `can_start=false`（禁止开始监听）。前端本地发出请求后立即锁定，等待完成或失败回执，并同步后端快照；重连依赖后端快照恢复锁定状态。
 
 ## Speech 事件
 

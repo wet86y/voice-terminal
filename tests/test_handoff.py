@@ -542,6 +542,167 @@ def test_private_slot_does_not_enter_voice_or_dsh_projection(tmp_path):
     assert "PRIVATE_SLOT_SENTINEL" not in json.dumps(sanitize_runtime_snapshot(runtime.snapshot().payload))
 
 
+def test_clear_archives_both_sessions_and_context_without_organizer_or_later_revival(tmp_path):
+    from voice_terminal.shadow_agent.contracts import DurableVoiceEvent
+
+    async def scenario():
+        runtime = make_runtime(tmp_path)
+        runtime.continuity._replace_document("旧衔接文档")
+        runtime.history.commit_input("old-input", "旧会话正文")
+        old_voice_id = runtime.conversation.conversation_id
+        runtime.pending_transfer.capture("old-slot", "旧待传达材料", voice_session_id=old_voice_id, source_ref="old-output")
+        runtime.pending_transfer.recover_captures()
+        backlog = await runtime._export_paired_archive(runtime._continuity_snapshot())
+        rows = [{"type": "assistant/message", "data": {"text": "完整后台记录"}}]
+        operations = []
+
+        async def call(operation, payload):
+            operations.append(operation)
+            if operation == "session.export":
+                return {"result": "accepted", "records": rows, "total": 1, "next_offset": None}
+            return {"result": "accepted"}
+
+        session = DshShadowAgentSession(client=SimpleNamespace(call=call),
+            mapping_store=DshMappingStore(tmp_path / "mapping.json"), context_source=runtime.shadow_context,
+            voice_session_id=old_voice_id, workspace=tmp_path)
+        session._opened = True
+        old_dsh_id = session.dsh_session_id
+        runtime.shadow_session = session
+        await runtime._voice_mailbox.publish(DurableVoiceEvent("old-event", "旧后台待投递", old_dsh_id))
+        await runtime._voice_mailbox.publish(DurableVoiceEvent("other-event", "其他会话通知", "other-dsh"))
+        runtime._organize_archive = AsyncMock(side_effect=AssertionError("清除不能调用模型"))
+
+        await runtime.clear_session()
+
+        runtime._organize_archive.assert_not_called()
+        assert "session.export" in operations and "session.retire" in operations
+        assert runtime.conversation.conversation_id != old_voice_id
+        assert session.dsh_session_id != old_dsh_id
+        assert not session._opened
+        assert not runtime.history.entries and not runtime.history.conversation.entries
+        assert runtime.continuity.document == ""
+        assert runtime.pending_transfer.snapshot() == []
+        runtime.pending_transfer.recover_captures()
+        assert runtime.pending_transfer.snapshot() == []
+        assert [item.event_id for item in await runtime._voice_mailbox.pending()] == ["other-event"]
+        assert not runtime._archive_backlog
+        assert backlog.archive_id in runtime._archive_consumed
+        assert runtime.snapshot().payload["session_operation"] is None
+        cleared = next(item for item in runtime.paired_archives.root.iterdir()
+                       if (item / "source.json").is_file()
+                       and "cleared_session_context" in (item / "source.json").read_text(encoding="utf-8"))
+        raw = json.loads((cleared / "source.json").read_text(encoding="utf-8"))
+        context = next(item for item in raw["voice"] if item.get("kind") == "cleared_session_context")
+        assert context["continuity_document"] == "旧衔接文档"
+        assert context["pending_transfers"][0]["text"] == "旧待传达材料"
+        assert context["voice_events"][0]["event_id"] == "old-event"
+        assert raw["dsh"] == rows
+        assert await runtime.publish_voice_event({"source_session_id": old_dsh_id,
+            "event_id": "late-event", "text": "旧会话的迟到内容"}) == "stale"
+        recovered = make_runtime(tmp_path)
+        assert recovered.continuity.document == "" and not recovered._archive_backlog
+        assert not recovered.pending_transfer.snapshot()
+    asyncio.run(scenario())
+
+
+def test_clear_retirement_failure_resumes_saved_transaction_without_reviving_old_context(tmp_path):
+    async def scenario():
+        runtime = make_runtime(tmp_path)
+        runtime.continuity._replace_document("旧文档")
+        runtime.pending_transfer.append("old-slot", "旧材料", voice_session_id="old", source_ref="old")
+        original_rotate = runtime._rotate_session
+        runtime._rotate_session = AsyncMock(side_effect=RuntimeError("retire unavailable"))
+        runtime._organize_archive = AsyncMock(side_effect=AssertionError("清除不调用整理模型"))
+        with pytest.raises(RuntimeError, match="retire unavailable"):
+            await runtime.clear_session()
+        assert runtime._handoff_marker.exists()
+        marker = json.loads(runtime._handoff_marker.read_text(encoding="utf-8"))
+        assert marker["document"] == "" and marker["phase"] == "consumed"
+        runtime._rotate_session = original_rotate
+        # start listening（开始监听）原有的恢复流程即可完成清除事务。
+        async with runtime._session_lock:
+            await runtime._resume_handoff()
+        assert not runtime._handoff_marker.exists()
+        assert runtime.conversation.conversation_id == marker["target_voice_session_id"]
+        assert runtime.continuity.document == "" and not runtime.pending_transfer.snapshot()
+        assert not runtime._archive_backlog
+        runtime._organize_archive.assert_not_called()
+    asyncio.run(scenario())
+
+
+def test_clear_mailbox_write_failure_can_retry_without_redelivering_archived_event(tmp_path):
+    from voice_terminal.shadow_agent.contracts import DurableVoiceEvent
+    from voice_terminal.shadow_agent.durable_mailbox import DurableVoiceMailbox
+
+    async def scenario():
+        runtime = make_runtime(tmp_path)
+        # 后台会话未打开，也可能持有停止监听前已经接受的持久事件。
+        runtime.shadow_session = DshShadowAgentSession(client=SimpleNamespace(),
+            mapping_store=DshMappingStore(tmp_path / "mapping.json"), context_source=runtime.shadow_context,
+            voice_session_id=runtime.conversation.conversation_id, workspace=tmp_path)
+        old_dsh_id = runtime.shadow_session.dsh_session_id
+        await runtime._voice_mailbox.publish(DurableVoiceEvent("old-event", "旧待投递材料", old_dsh_id))
+        original_save = runtime._voice_mailbox._save
+        def failed_save():
+            raise OSError("disk")
+        runtime._voice_mailbox._save = failed_save
+        with pytest.raises(OSError):
+            await runtime.clear_session()
+        assert runtime._handoff_marker.exists()
+        assert [item.event_id for item in await runtime._voice_mailbox.pending()] == ["old-event"]
+        runtime._voice_mailbox._save = original_save
+        async with runtime._session_lock:
+            await runtime._resume_handoff()
+        assert not await runtime._voice_mailbox.pending()
+        recovered = DurableVoiceMailbox(runtime._voice_mailbox.path)
+        assert not await recovered.pending()
+    asyncio.run(scenario())
+
+
+def test_clear_archive_failure_preserves_original_identity_document_and_pending_material(tmp_path):
+    async def scenario():
+        runtime = make_runtime(tmp_path)
+        original_id = runtime.conversation.conversation_id
+        runtime.history.commit_input("old-input", "保留原会话")
+        runtime.continuity._replace_document("原衔接文档")
+        runtime.pending_transfer.append("old-slot", "待传达", voice_session_id=original_id, source_ref="old")
+        runtime._export_paired_archive = AsyncMock(side_effect=OSError("disk unavailable"))
+        with pytest.raises(OSError):
+            await runtime.clear_session()
+        assert runtime.conversation.conversation_id == original_id
+        assert runtime.continuity.document == "原衔接文档"
+        assert runtime.pending_transfer.snapshot()[0]["id"] == "old-slot"
+        assert runtime.history.entries
+        assert runtime.snapshot().payload["session_operation"] is None
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["reset", "clear"])
+def test_manual_operation_snapshot_blocks_start_until_transaction_finishes(tmp_path, operation):
+    async def scenario():
+        runtime = make_runtime(tmp_path)
+        reached, release = asyncio.Event(), asyncio.Event()
+        runtime._organize_archive = AsyncMock(side_effect=AssertionError("本测试不调用模型"))
+
+        async def settle():
+            reached.set()
+            await release.wait()
+
+        runtime._settle_session_for_archive = settle
+        task = asyncio.create_task(runtime.reset_session() if operation == "reset" else runtime.clear_session())
+        await reached.wait()
+        snapshot = runtime.snapshot().payload
+        assert snapshot["session_operation"] == operation and snapshot["can_start"] is False
+        release.set()
+        if operation == "reset":
+            with pytest.raises(AssertionError):
+                await task
+        else:
+            await task
+        assert runtime.snapshot().payload["session_operation"] is None
+    asyncio.run(scenario())
+
+
 def test_archive_catalog_recovers_commit_gap_and_does_not_revive_consumed_material(tmp_path):
     async def scenario():
         runtime = make_runtime(tmp_path)

@@ -201,6 +201,7 @@ export interface ConversationSnapshotPayload {
 }
 
 export interface RuntimeSnapshotPayload {
+  session_operation?: SessionOperation | null // session_operation（后端正在执行的会话操作）。
   audio_generation?: number // audio_generation（音频轮代），用于丢弃状态切换前的音量。
   /** quiet_hours（被动静默状态）：passive_quiet（抑制主动语音）、user_interaction（用户交互窗口）、within_quiet_hours（处于配置时段），不含待传达内容。 */
   quiet_hours?: { passive_quiet: boolean; user_interaction: boolean; within_quiet_hours: boolean }
@@ -358,6 +359,7 @@ export interface ServerErrorPayload {
 export type ServerMessageType =
   | 'audio.levels' // audio.levels（来自麦克风或实际播放的音量事件）。
   | 'runtime.snapshot' | 'session.state' | 'metrics.snapshot'
+  | 'session.operation' // session.operation（会话操作完成回执）。
   | 'input.started' | 'input.updated' | 'input.finalized' | 'input.completed'
   | 'agent.state' | 'agent.trace' | 'agent.reasoning' | 'context.snapshot' | 'tool.state' | 'speak.preview'
   | 'speech.queued' | 'speech.started' | 'speech.delta' | 'speech.progress' | 'speech.completed'
@@ -366,7 +368,9 @@ export type ServerMessageType =
 
 /** ReasoningMode（运行模式）：快速不思考，深度直接使用低强度思考。 */
 export type ReasoningMode = 'fast' | 'deep'
-export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset' | 'session.reasoning_mode'
+/** SessionOperation（会话操作）：重置整理上下文，清除归档并开启全新会话。 */
+export type SessionOperation = 'reset' | 'clear'
+export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset' | 'session.clear' | 'session.reasoning_mode'
 
 export interface MessageEnvelope<TType extends string = string, TPayload = unknown> {
   type: TType

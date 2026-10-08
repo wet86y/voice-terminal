@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from contextlib import asynccontextmanager
+from dataclasses import asdict, replace
 import json
 import logging
 import time
@@ -293,7 +294,7 @@ class HandoffRuntimeMixin:
                 if was_listening and self.controller is not None and not self._handoff_marker.exists():
                     await self.controller.start_listening()
 
-    async def _commit_handoff(self, result: OrganizedHandoff) -> None:
+    async def _commit_handoff(self, result: OrganizedHandoff, *, cleared_voice_event_ids: list[str] | None = None) -> None:
         marker = {"schema_version": 2, "phase": "prepared",
                   "target_voice_session_id": f"conversation-{uuid4().hex}",
                   "target_dsh_session_id": f"voice-shadow-{uuid4()}",
@@ -305,6 +306,9 @@ class HandoffRuntimeMixin:
                   "extracted_items": result.extracted_items,
                   "related_archive_ids": list(result.related_archive_ids),
                   "consumed_entry_ids": result.consumed_entry_ids}
+        if cleared_voice_event_ids:
+            # cleared_voice_event_ids（归档后停止投递的旧后台会话事件）：纳入同一恢复事务。
+            marker["cleared_voice_event_ids"] = cleared_voice_event_ids
         atomic_json(self._handoff_marker, marker)
         await self._resume_handoff()
 
@@ -343,6 +347,8 @@ class HandoffRuntimeMixin:
                 atomic_json(self._archive_backlog_path, {"pending": remaining, "consumed": completed})
                 self._archive_backlog = remaining
                 self._archive_consumed = completed
+                for event_id in marker.get("cleared_voice_event_ids", []):
+                    await self._voice_mailbox.acknowledge(event_id)
             if self.conversation.conversation_id == marker["voice_session_id"]:
                 session = self.shadow_session
                 if isinstance(session, DshShadowAgentSession) and not session._opened and marker.get("dsh_session_id"):
@@ -376,34 +382,55 @@ class HandoffRuntimeMixin:
         finally:
             self._cleanup_in_progress = False
 
+    @asynccontextmanager
+    async def _session_operation_scope(self, operation: str, *, _lock_held: bool = False):
+        """session operation（手动会话操作）：完整事务期间向所有前端发布锁定状态。"""
+        if not _lock_held:
+            async with self._session_lock:
+                async with self._session_operation_scope(operation, _lock_held=True):
+                    yield
+            return
+        self._session_operation = operation  # _session_operation（正在执行的重置或清除）。
+        try:
+            await self.bus.publish(self.snapshot())
+            yield
+        finally:
+            self._session_operation = None
+            await self.bus.publish(self.snapshot())
+
+    async def _settle_session_for_archive(self) -> None:
+        """归档前沿用现有结算和取消逻辑，等待语音与后台记录稳定。"""
+        if self.controller is not None:
+            await self.controller.stop_listening()
+            await self.controller.reset_session()
+        await self._prepare_archive_session()
+        if self.shadow_session is not None:
+            cancel = getattr(self.shadow_session, "cancel", None)
+            if cancel is not None:
+                await cancel(strict=True)
+            else:
+                runtime = self.shadow_session.runtime
+                tasks = [task for task in (runtime.runner, runtime.observer_task) if task is not None]
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                runtime.active = False
+
     async def reset_session(self, *, _lock_held: bool = False, _strict_shadow: bool = False) -> None:
         # Legacy embedding（旧嵌入调用）不创建新的私有存储。
         if not hasattr(self, "pending_transfer"):
             return await self._rotate_session(_lock_held=_lock_held, _strict_shadow=_strict_shadow)
-        if not _lock_held:
-            async with self._session_lock:
-                return await self.reset_session(_lock_held=True, _strict_shadow=True)
+        async with self._session_operation_scope("reset", _lock_held=_lock_held):
+            await self._reset_session()
+
+    async def _reset_session(self) -> None:
         if self._handoff_marker.exists():
             return await self._resume_handoff()
         self.continuity.user_started()
         self._cleanup_in_progress = True
         was_listening = bool(self.state.listening)
         try:
-            if self.controller is not None:
-                await self.controller.stop_listening()
-                await self.controller.reset_session()
-            await self._prepare_archive_session()
-            if self.shadow_session is not None:
-                cancel = getattr(self.shadow_session, "cancel", None)
-                if cancel is not None:
-                    await cancel(strict=True)
-                else:
-                    runtime = self.shadow_session.runtime
-                    tasks = [task for task in (runtime.runner, runtime.observer_task) if task is not None]
-                    for task in tasks:
-                        task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    runtime.active = False
+            await self._settle_session_for_archive()
             self.history.commit_semantic_event("manual_reset_boundary", {
                 "text": "手动重置已结束本轮运行；已取消的工作不自动重跑，未完成事项需核对当前用户意图。"})
             self.quiet_policy.user_interaction = False
@@ -414,3 +441,37 @@ class HandoffRuntimeMixin:
             if was_listening and self.controller is not None and not self._handoff_marker.exists():
                 self.controller.set_reasoning_mode(self.reasoning_mode)
                 await self.controller.start_listening()
+
+    async def clear_session(self) -> None:
+        """clear session（清除会话）：完整归档后开启无旧衔接材料的新会话，跳过模型整理。"""
+        async with self._session_operation_scope("clear"):
+            if self._handoff_marker.exists():
+                await self._resume_handoff()
+            self.continuity.user_started()
+            self._cleanup_in_progress = True
+            was_listening = bool(self.state.listening)
+            try:
+                await self._settle_session_for_archive()
+                self._flush_deferred_storage()
+                self.pending_transfer.recover_captures()
+                entries = self.pending_transfer.snapshot()  # entries（清除前的全部待传达材料）。
+                dsh_id = getattr(self.shadow_session, "dsh_session_id", "")
+                voice_events = [item for item in await self._voice_mailbox.pending()
+                                if dsh_id and item.source_session_id == dsh_id]
+                # 旧文档、私有槽位和后台信箱也先归档；后续自动整理不再读取这些材料。
+                archived_context = {"kind": "cleared_session_context",
+                    "continuity_document": self.continuity.document,  # continuity_document（旧衔接文档）。
+                    "pending_transfers": entries,  # pending_transfers（旧待传达槽位）。
+                    "voice_events": [asdict(item) for item in voice_events],  # voice_events（旧后台待投递事件）。
+                    "related_archive_ids": list(self._archive_backlog)}  # related_archive_ids（旧待整理归档引用）。
+                archive = await self._export_paired_archive([*self._continuity_snapshot(), archived_context])
+                result = OrganizedHandoff("", [], [item["id"] for item in entries], archive,
+                                          tuple(self._archive_backlog))
+                await self._commit_handoff(result, cleared_voice_event_ids=[item.event_id for item in voice_events])
+                self.quiet_policy.user_interaction = False
+                self._voice_silence_anchor = None
+            finally:
+                self._cleanup_in_progress = False
+                if was_listening and self.controller is not None and not self._handoff_marker.exists():
+                    self.controller.set_reasoning_mode(self.reasoning_mode)
+                    await self.controller.start_listening()

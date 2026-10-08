@@ -55,7 +55,13 @@ class DurableVoiceMailbox:
 
     async def acknowledge(self, event_id: str) -> None:
         async with self._lock:
+            previous_pending = dict(self._pending)  # previous_pending（落盘失败时恢复的待投递事件）。
+            previous_delivered = list(self._delivered)  # previous_delivered（原有已确认事件标识）。
             if self._pending.pop(event_id, None) is not None:
                 self._delivered.append(event_id)
                 self._delivered = self._delivered[-4096:]
-                self._save()
+                try:
+                    self._save()
+                except BaseException:
+                    self._pending, self._delivered = previous_pending, previous_delivered
+                    raise

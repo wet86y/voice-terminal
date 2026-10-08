@@ -968,9 +968,34 @@ time {
   gap: 8px;
   white-space: nowrap;
 }
-.voice-controls > .ghost-action {
+.voice-session-options {
   grid-area: reset;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.voice-session-options > .ghost-action {
+  width: 100%;
   padding: 4px 8px;
+}
+.voice-session-options > .ghost-action:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+.voice-session-spinner {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: voice-session-spin .8s linear infinite;
+}
+@keyframes voice-session-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .voice-session-spinner { animation: none; }
 }
 .voice-controls > .mode-picker {
   grid-area: mode;

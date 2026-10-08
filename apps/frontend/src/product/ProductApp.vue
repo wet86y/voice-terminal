@@ -30,6 +30,7 @@ const {
   noticeVisible,
   runtimeAction,
   resetSession,
+  clearSession,
   setReasoningMode,
   setNotice,
   workbenchModel,
@@ -64,6 +65,7 @@ function nativeAction(action: () => Promise<void>) {
       @console="openDshConsole"
       @action="runtimeAction"
       @reset="resetSession"
+      @clear="clearSession"
       @mode="setReasoningMode"
     />
     <SettingsFrame

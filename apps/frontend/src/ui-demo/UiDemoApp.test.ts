@@ -38,6 +38,28 @@ afterEach(() => {
 })
 
 describe('桌面样例回放交互', () => {
+  it('重置和清除左右并列，操作时开始按钮显示圆盘、提示并锁定所有会话按钮', async () => {
+    vi.useFakeTimers()
+    const wrapper = renderDemo()
+    const options = wrapper.findAll('.voice-session-options button')
+    expect(options.map(button => button.text())).toEqual(['重置当前会话', '清除会话'])
+    await options[0]!.trigger('click')
+    expect(wrapper.get('.voice-session-action').text()).toBe('上下文整理中')
+    expect(wrapper.get('.voice-session-action').attributes('aria-busy')).toBe('true')
+    expect(wrapper.find('.voice-session-spinner').exists()).toBe(true)
+    expect(wrapper.get('.voice-session-action').attributes('disabled')).toBeDefined()
+    expect(options.every(button => button.attributes('disabled') !== undefined)).toBe(true)
+    await vi.advanceTimersByTimeAsync(1800)
+    expect(wrapper.get('.voice-session-action').text()).toBe('开始语音会话')
+    expect(wrapper.find('.voice-session-spinner').exists()).toBe(false)
+    await options[1]!.trigger('click')
+    expect(wrapper.get('.voice-session-action').text()).toBe('会话清除中')
+    expect(wrapper.get('.voice-session-action').attributes('disabled')).toBeDefined()
+    await vi.advanceTimersByTimeAsync(350)
+    expect(wrapper.get('.voice-session-action').attributes('disabled')).toBeUndefined()
+    expect(wrapper.text()).toContain('旧会话已归档，全新会话已就绪')
+  })
+
   it('声纹录制同步片段状态与完成计数，录制期间禁止其他片段和保存，收起后保留进度', async () => {
     const request = vi.spyOn(globalThis, 'fetch')
     const wrapper = renderDemo('?page=speaker')
@@ -213,7 +235,7 @@ describe('桌面样例回放交互', () => {
     expect(wrapper.get('.system-column').classes()).toContain('session-active')
     expect(wrapper.get('.voice-session-action').text()).toBe('停止当前会话')
     expect(wrapper.find('.mode-picker').exists()).toBe(false)
-    expect(wrapper.find('.voice-controls > .ghost-action').exists()).toBe(false)
+    expect(wrapper.find('.voice-session-options').exists()).toBe(false)
     expect(wrapper.get('.metric-card').text()).toContain('首音延迟')
 
     await vi.advanceTimersByTimeAsync(500)
@@ -239,7 +261,10 @@ describe('桌面样例回放交互', () => {
     expect(wrapper.get('.system-column').classes()).not.toContain('session-active')
     expect(wrapper.get('.voice-session-action').text()).toBe('开始语音会话')
     expect(wrapper.get('.mode-options button.selected').text()).toBe('深度')
-    expect(wrapper.get('.voice-controls > .ghost-action').text()).toBe('重置当前会话')
+    expect(wrapper.get('.voice-session-options button:first-child').text()).toBe('重置当前会话')
+    expect(wrapper.get('.voice-session-options button:last-child').text()).toBe('清除会话')
+    // 消息逐字显示可能仍有待完成帧；结算后确认会话定时器已释放。
+    await vi.advanceTimersByTimeAsync(700)
     expect(vi.getTimerCount()).toBe(0)
     expect(request).not.toHaveBeenCalled()
     request.mockRestore()

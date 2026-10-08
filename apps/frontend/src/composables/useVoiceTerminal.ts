@@ -22,6 +22,7 @@ import type {
   ShadowProductSnapshot,
   ShadowTimelineItem,
   SessionStatePayload,
+  SessionOperation,
   TerminalState,
   TurnDelivery,
   TtsStatusPayload,
@@ -63,6 +64,14 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const state = ref<TerminalState>('STARTING')
   const listening = ref(false)
   const canStart = ref(false)
+  const serverSessionOperation = ref<SessionOperation | null>(null) // serverSessionOperation（后端会话操作，重连时从快照恢复）。
+  const pendingSessionOperation = ref<SessionOperation | null>(null) // pendingSessionOperation（本机等待回执的会话操作）。
+  let sessionOperationRequestId: string | null = null // sessionOperationRequestId（当前操作请求标识）。
+  const sessionOperation = computed(() => serverSessionOperation.value ?? pendingSessionOperation.value)
+  function clearSessionOperation() {
+    serverSessionOperation.value = pendingSessionOperation.value = null
+    sessionOperationRequestId = null
+  }
   const wakeAlwaysOn = ref(false)
   const inputOwner = ref<'none' | 'kws' | 'asr'>('none')
   const quietHours = reactive({ passive_quiet: false, user_interaction: false, within_quiet_hours: false })
@@ -756,6 +765,9 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function applyRuntimeSnapshot(payload: RuntimeSnapshotPayload, turnId: string | null) {
+    if (payload.session_operation === 'reset' || payload.session_operation === 'clear' || payload.session_operation === null) {
+      serverSessionOperation.value = payload.session_operation
+    }
     syncAudioGeneration(payload)
     if (payload.quiet_hours) Object.assign(quietHours, payload.quiet_hours)
     if (isTerminalState(payload.state)) state.value = payload.state
@@ -1116,10 +1128,20 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         applyCompletedTurn(payload as unknown as TurnCompletedPayload, message.turn_id ?? null)
         break
       case 'error': {
+        if (sessionOperationRequestId && payload.request_id === sessionOperationRequestId) {
+          pendingSessionOperation.value = null
+          sessionOperationRequestId = null
+        }
         const messageText = readString(payload, 'message')
         connectionError.value = messageText ?? '后端报告了未知错误。'
         break
       }
+      case 'session.operation':
+        if (sessionOperationRequestId && payload.request_id === sessionOperationRequestId && payload.status === 'completed') {
+          pendingSessionOperation.value = null
+          sessionOperationRequestId = null
+        }
+        break
       default:
         break
     }
@@ -1130,13 +1152,18 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (!activeSocket || activeSocket.readyState !== OPEN_READY_STATE) return false
 
     requestSequence += 1
-    activeSocket.send(JSON.stringify({
-      type: 'command' as const,
-      request_id: `req_${String(requestSequence).padStart(6, '0')}`,
-      command,
-      payload,
-    }))
-    return true
+    try {
+      activeSocket.send(JSON.stringify({
+        type: 'command' as const,
+        request_id: `req_${String(requestSequence).padStart(6, '0')}`,
+        command,
+        payload,
+      }))
+      return true
+    } catch (error) {
+      connectionError.value = error instanceof Error ? error.message : '会话命令发送失败。'
+      return false
+    }
   }
 
   function connect() {
@@ -1146,6 +1173,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       return
     }
 
+    clearSessionOperation()
     resetConnectionData()
     connection.value = 'connecting'
     connectionError.value = ''
@@ -1178,6 +1206,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       }
       nextSocket.onclose = () => {
         if (socket.value !== nextSocket) return
+        clearSessionOperation()
         socket.value = null
         connection.value = 'offline'
         canStart.value = false
@@ -1195,37 +1224,39 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   }
 
   function toggleListening() {
-    if (connection.value !== 'connected') return false
+    if (connection.value !== 'connected' || sessionOperation.value) return false
     if (listening.value) return sendCommand('session.stop')
     if (!canStart.value) return false
     return sendCommand('session.start')
   }
 
+  function performSessionOperation(operation: SessionOperation) {
+    if (connection.value !== 'connected' || listening.value || sessionOperation.value) return false
+    pendingSessionOperation.value = operation
+    sessionOperationRequestId = `req_${String(requestSequence + 1).padStart(6, '0')}`
+    connectionError.value = ''
+    if (sendCommand(operation === 'reset' ? 'session.reset' : 'session.clear')) return true
+    pendingSessionOperation.value = null
+    sessionOperationRequestId = null
+    return false
+  }
+
   function resetSession() {
-    if (connection.value !== 'connected') return false
-    clearShadowActivityQueue()
-    shadowProduct.value = createEmptyShadowProduct()
-    resetCurrentTurn()
-    speechOutputs.value = []
-    playbackQueue.value = []
-    lastPlayback.value = null
-    speechProgress.value = null
-    terminalPlaybackKeys.clear()
-    llmContext.value = []
-    llmContextTurnId.value = null
-    // The server publishes the empty conversation right after a reset; clear it
-    // locally as well so the rail cannot show a superseded session meanwhile.
-    conversationLog.clear()
-    syncConversation()
-    return sendCommand('session.reset')
+    return performSessionOperation('reset')
+  }
+
+  function clearSession() {
+    return performSessionOperation('clear')
   }
 
   function setReasoningMode(mode: ReasoningMode) {
+    if (sessionOperation.value) return false
     reasoningMode.value = mode
     return sendCommand('session.reasoning_mode', { mode })
   }
 
   function disconnect() {
+    clearSessionOperation()
     const activeSocket = socket.value
     socket.value = null
     activeSocket?.close()
@@ -1248,6 +1279,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     state,
     listening,
     canStart,
+    sessionOperation,
     wakeAlwaysOn,
     inputOwner,
     quietHours,
@@ -1281,6 +1313,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     injectReplay,
     toggleListening,
     resetSession,
+    clearSession,
     setReasoningMode,
     dispose,
   }
