@@ -15,6 +15,7 @@ import * as desktopBridge from './desktop-port'
 import ComputeSettings from './panels/ComputeSettings.vue'
 import ModelSettings from './panels/ModelSettings.vue'
 import WakeTasksSettings from './panels/WakeTasksSettings.vue'
+import SpeakerSettings from './panels/SpeakerSettings.vue'
 import { provideProductContext } from './product-context'
 import type { WorkbenchModel } from '../interface/workbench'
 import type { ApplicationSnapshot } from './application-host'
@@ -401,6 +402,24 @@ describe('正式界面的真实控件交互', () => {
     expect(kws.get('.local-state').text()).toBe('已停用')
     expect(kws.find('.retry-action').exists()).toBe(false)
   })
+  it.each(['RUNNING', 'STREAMING', 'CONNECTED'])('将 %s（正常工作状态）的 KWS（关键词唤醒）呈现为可用', async (service) => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    value.computeStatus.value = { models: { kws: { service, device: 'cpu' } } } as never
+    application.snapshot.value = { startup_complete: false, components: [
+      { id: 'voice', name: '语音服务', state: 'ready', pid: 4321, retry_allowed: false },
+    ] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    const kws = wrapper.get('[data-component="kws"]')
+    expect(kws.classes()).toContain('ready')
+    expect(kws.get('.local-state').text()).toBe('运行中')
+    expect(kws.find('.local-error').exists()).toBe(false)
+    expect(kws.find('.retry-action').exists()).toBe(false)
+    application.snapshot.value!.startup_complete = true
+    await flushPromises()
+    expect(kws.classes()).toContain('ready')
+    expect(kws.get('.local-state').text()).toBe('运行中')
+  })
   it('Voice（语音服务）模型自身错误仍可重试，宿主确认所属进程退出时拒绝沿用 READY（就绪）快照', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
@@ -616,6 +635,50 @@ describe('正式界面的真实控件交互', () => {
     expect(value.addingWakeTask.value).toBe(true)
     expect(value.wakeTaskCreateDraft.text).toBe('保留草稿')
     expect(value.lastError.value).toBe('创建失败')
+  })
+  it('三段服务端录音完成后立即允许保存，失败保留片段并可重试，成功显示已注册模板', async () => {
+    vi.spyOn(productApi, 'startSpeakerEnrollment').mockResolvedValue({
+      enrollment_id: 'complete-session', required_segments: 3,
+      prompts: [{ text: '第一句' }, { text: '第二句' }, { text: '第三句' }],
+    })
+    const capture = vi.spyOn(productApi, 'captureSpeakerEnrollmentSegment')
+    const commit = vi.spyOn(productApi, 'commitSpeakerEnrollment')
+      .mockRejectedValueOnce(new Error('保存暂时失败'))
+      .mockResolvedValue({ enrollment: { min_similarity: 0.8 } })
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
+    allowBusinessReady(value)
+    await flushPromises()
+    await button(wrapper, '开始录制').trigger('click')
+    expect(wrapper.find('input[aria-label="自定义模板标签"]').exists()).toBe(false)
+    const save = button(wrapper, '保存声纹')
+    for (let index = 0; index < 3; index += 1) {
+      const response = deferred<Record<string, unknown>>()
+      capture.mockReturnValueOnce(response.promise)
+      const row = wrapper.get(`[data-segment="${index}"]`)
+      await row.get('button').trigger('click')
+      await flushPromises()
+      expect(save.attributes('disabled')).toBeDefined()
+      response.resolve({ quality: { speech_ms: 6000 } })
+      await flushPromises()
+      expect(row.get('.speaker-segment-state').text()).toBe('已完成')
+      expect(capture).toHaveBeenLastCalledWith('complete-session', expect.objectContaining({ index, label: `第 ${index + 1} 段` }), expect.any(AbortSignal))
+    }
+    expect(value.speakerEnrollmentComplete.value).toBe(true)
+    expect(save.attributes('disabled')).toBeUndefined()
+    await save.trigger('click'); await flushPromises()
+    expect(commit).toHaveBeenCalledWith('complete-session')
+    expect(value.speakerEnrollment.value?.segments).toEqual([0, 1, 2])
+    expect(value.lastError.value).toBe('保存暂时失败')
+    expect(save.attributes('disabled')).toBeUndefined()
+    const templates = [0, 1, 2].map(index => ({ template_id: `template-${index}`, label: `第 ${index + 1} 段`, include_in_centroid: true }))
+    vi.mocked(productApi.speakerProfile).mockResolvedValue({ available: true, templates })
+    vi.mocked(productApi.speakerStatus).mockResolvedValue({ registered: true, service: 'READY', worker_connected: true })
+    await save.trigger('click'); await flushPromises()
+    expect(commit).toHaveBeenCalledTimes(2)
+    expect(value.speakerEnrollment.value).toBeNull()
+    expect(wrapper.findAll('.speaker-template-row')).toHaveLength(3)
+    expect(value.notice.value).toContain('声纹资料已更新')
   })
   it('服务器提前停止只在五秒后提交，收起保留完成进度并拒绝迟到响应', async () => {
     vi.spyOn(productApi, 'startSpeakerEnrollment').mockResolvedValue({ enrollment_id: 'stop-session' })

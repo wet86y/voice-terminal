@@ -23,6 +23,9 @@ const modelResourceIds: Record<ProductLocalModelId, string> = {
   smart_turn: 'smart-turn',
   sensevoice: 'sensevoice-small',
 }
+// availableModelServices（可用模型状态）：与后端就绪契约一致，工作中的状态同样可用。
+// READY（就绪）、RUNNING（运行中）、STREAMING（流式传输）、CONNECTED（已连接）；DEGRADED（降级）沿用原有可用规则。
+const availableModelServices = new Set(['READY', 'RUNNING', 'STREAMING', 'CONNECTED', 'DEGRADED'])
 function componentFor(id: string) { return application.snapshot.value?.components?.find(row => row.id === id) }
 const resources = computed(() => componentResources(application.snapshot.value))
 const systemComponents = computed(() => (application.snapshot.value?.components ?? []).filter(row => !['asr', 'analysis', 'speaker', 'dsh'].includes(row.id)))
@@ -66,10 +69,10 @@ const rows = computed<LocalComponentRow[]>(() => {
     // busy（正在重试）先覆盖旧故障；宿主加载状态优先于启动期间的临时健康检查结果。
     const ownerLoading = ['waiting', 'starting', 'stopping'].includes(owner?.state ?? '')
     const disabled = !busy && !ownerUnavailable && (owner?.state === 'disabled' || (!ownerLoading && application.snapshot.value?.startup_complete !== false && status?.service === 'DISABLED'))
-    const awaitingStartup = application.snapshot.value?.startup_complete === false && !['READY', 'DEGRADED'].includes(status?.service ?? '')
+    const awaitingStartup = application.snapshot.value?.startup_complete === false && !availableModelServices.has(status?.service ?? '')
     const loading = busy || (!ownerUnavailable && !disabled && (ownerLoading || awaitingStartup || (!owner && !status) || status?.service === 'STARTING'))
     // 模型详情接口尚未开放时，以宿主已通过的工作进程健康检查呈现就绪状态。
-    const available = !loading && !ownerUnavailable && !disabled && (status ? ['READY', 'DEGRADED'].includes(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
+    const available = !loading && !ownerUnavailable && !disabled && (status ? availableModelServices.has(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
     const ownerError = ownerUnavailable ? owner?.error || status?.runtime_error || (owner?.state === 'blocked' ? '组件依赖不可用，请检查所属进程。' : owner?.state === 'stopped' ? '组件进程已退出。' : '组件运行异常，请查看日志并重试。') : undefined
     const gpuAvailable = available && !refreshing.value && status?.gpu_available === true
     return {

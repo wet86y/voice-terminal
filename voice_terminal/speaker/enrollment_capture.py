@@ -3,9 +3,9 @@
 The previous enrollment path recorded through the browser: a different device
 selection, WebRTC echo cancellation / noise suppression / automatic gain
 control all enabled, and a hand-written 48 kHz -> 16 kHz linear decimation with
-no anti-alias filter.  Runtime audio instead comes from ``sounddevice`` pinned
-to ``audio.input_device`` at a native 16 kHz with ``automatic_gain_control:
-false``.  Because the feature frontend turns out to be channel-sensitive, that
+no anti-alias filter.  Runtime audio instead comes from ``sounddevice``（音频库）
+using the system default microphone at a native 16 kHz with
+``automatic_gain_control: false``（关闭自动增益）.  Because the feature frontend turns out to be channel-sensitive, that
 mismatch put the enrolled templates in a different acoustic domain from the
 audio they were later compared against.
 
