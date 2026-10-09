@@ -59,7 +59,7 @@ describe('Host application configuration（宿主运行配置）', () => {
     const pending = runDesktopPreflight({
       expectedMode: 'product',
       root,
-      invoke: { invoke: async <T>() => ({ ready: true, error: null, frontend_mode: 'product', development: false } as T) },
+      invoke: { invoke: async <T>() => ({ ready: true, error: null, role: 'product', frontend_mode: 'product', development: false } as T) },
       startApplication: async () => {
         await loadProductApplicationConfig()
         mountProductApplication()

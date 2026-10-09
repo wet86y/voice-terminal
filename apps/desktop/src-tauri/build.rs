@@ -5,7 +5,7 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "desktop_initialize", "desktop_manage", "desktop_start_service", "desktop_cancel_init", "voice_environment_status", "voice_environment_plan", "resource_install_plan", "voice_environment_configure", "voice_environment_import", "gpu_environment_register", "gpu_environment_probe", "environment_guide",
-            "desktop_status",
+            "desktop_status", "desktop_page_ready",
             "skip_startup",
             "open_logs",
             "open_console",

@@ -9,7 +9,7 @@ pub struct Progress {
 }
 impl Progress {
     pub fn update(&self,phase:&str,current:u64,total:u64){
-        self.can_cancel.store(!phase.starts_with("启动目标")&&!phase.starts_with("目标已启动")&&!phase.starts_with("切换定位")&&!phase.starts_with("启用基础组件"),Ordering::Release);
+        self.can_cancel.store(!phase.starts_with("启动目标")&&!phase.starts_with("目标已启动")&&!phase.starts_with("切换定位")&&!phase.starts_with("启用基础组件")&&!phase.starts_with("启用程序本体"),Ordering::Release);
         let text=if total>0 {format!("{phase}\n{:.1}%  ·  {:.2} / {:.2} MiB（兆二进制字节）", current as f64*100.0/total as f64,current as f64/1048576.0,total as f64/1048576.0)}else{phase.into()};
         *self.message.lock().unwrap()=text;
     }

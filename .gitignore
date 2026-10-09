@@ -31,6 +31,7 @@ config/speaker/
 /data/
 /apps/desktop/target/
 /apps/desktop/src-tauri/gen/schemas/
+/apps/desktop/installer/gen/schemas/
 # Local scratch: one-off analysis scripts and timeline dumps from debugging
 /workspace/
 *.log

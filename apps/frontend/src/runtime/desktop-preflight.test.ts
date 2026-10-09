@@ -26,7 +26,7 @@ describe('desktop preflight（桌面预检）', () => {
     expect(root.querySelector('.startup-screen')?.classList.contains('is-exiting')).toBe(true)
     expect(root.querySelector('.startup-title')?.textContent).toBe('正在退出应用')
     expect(root.querySelector('.startup-progress')?.getAttribute('aria-label')).toBe('应用退出进度')
-    resolve({ ready: true, error: null, frontend_mode: 'product', development: false })
+    resolve({ ready: true, error: null, role: 'product', frontend_mode: 'product', development: false })
     await running
     expect(startApplication).not.toHaveBeenCalled()
     expect(root.querySelector('.startup-title')?.textContent).toBe('正在退出应用')
@@ -45,7 +45,7 @@ describe('desktop preflight（桌面预检）', () => {
     skip.click()
     expect(onSkip).toHaveBeenCalledOnce()
     expect(startApplication).not.toHaveBeenCalled()
-    resolve({ ready: true, error: null, frontend_mode: 'product', development: false })
+    resolve({ ready: true, error: null, role: 'product', frontend_mode: 'product', development: false })
     await running
     expect(startApplication).toHaveBeenCalledWith(expect.objectContaining({ startup_skipped: true }))
     expect(call).toHaveBeenCalledWith('skip_startup')
@@ -54,7 +54,7 @@ describe('desktop preflight（桌面预检）', () => {
   it('接力原生等待页的跳过选择', async () => {
     const onSkip = vi.fn()
     const startApplication = vi.fn(async () => undefined)
-    await runDesktopPreflight({ expectedMode: 'product', invoke: native({ ready: true, error: null, frontend_mode: 'product', development: false, startup_skipped: true }), startApplication, onSkip })
+    await runDesktopPreflight({ expectedMode: 'product', invoke: native({ ready: true, error: null, role: 'product', frontend_mode: 'product', development: false, startup_skipped: true }), startApplication, onSkip })
     expect(onSkip).toHaveBeenCalledOnce()
     expect(startApplication).toHaveBeenCalledWith(expect.objectContaining({ startup_skipped: true }))
   })
@@ -64,18 +64,18 @@ describe('desktop preflight（桌面预检）', () => {
     root.dataset.startupSkipped = 'true'
     const startApplication = vi.fn(async () => undefined)
     const onSkip = vi.fn()
-    await runDesktopPreflight({ expectedMode: 'product', invoke: native({ ready: true, error: null, frontend_mode: 'product', development: false }), startApplication, onSkip, root })
+    await runDesktopPreflight({ expectedMode: 'product', invoke: native({ ready: true, error: null, role: 'product', frontend_mode: 'product', development: false }), startApplication, onSkip, root })
     expect(onSkip).toHaveBeenCalledOnce()
     expect(startApplication).toHaveBeenCalledWith(expect.objectContaining({ startup_skipped: true }))
   })
 
   it.each([
     [undefined, '桌面启动程序返回了无效状态'],
-    [{ ready: true, error: '宿主启动失败', frontend_mode: 'product', development: false }, '宿主启动失败'],
-    [{ ready: false, error: null, frontend_mode: 'product', development: false }, '尚未就绪'],
-    [{ ready: true, error: null, frontend_mode: 'ui-preview', development: true }, '入口不匹配'],
-    [{ ready: true, error: null, frontend_mode: 'product', development: 'yes' }, 'development（开发标识）'],
-    [{ ready: true, error: null, frontend_mode: 'product' }, 'development（开发标识）'],
+    [{ ready: true, error: '宿主启动失败', role: 'product', frontend_mode: 'product', development: false }, '宿主启动失败'],
+    [{ ready: false, error: null, role: 'product', frontend_mode: 'product', development: false }, '尚未就绪'],
+    [{ ready: true, error: null, role: 'ui-preview', frontend_mode: 'ui-preview', development: true }, '入口不匹配'],
+    [{ ready: true, error: null, role: 'product', frontend_mode: 'product', development: 'yes' }, 'development（开发标识）'],
+    [{ ready: true, error: null, role: 'product', frontend_mode: 'product' }, 'development（开发标识）'],
   ])('关闭无效状态下的应用导入', async (status, message) => {
     const startApplication = vi.fn(async () => undefined)
     const root = document.createElement('div')
@@ -96,7 +96,7 @@ describe('desktop preflight（桌面预检）', () => {
     const startApplication = vi.fn(async () => undefined)
     await runDesktopPreflight({
       expectedMode: 'ui-preview',
-      invoke: native({ ready: true, error: null, frontend_mode: 'ui-preview', development: false }),
+      invoke: native({ ready: true, error: null, role: 'ui-preview', frontend_mode: 'ui-preview', development: false }),
       startApplication,
       root,
     })
@@ -114,13 +114,13 @@ describe('desktop preflight（桌面预检）', () => {
 
   it('只在状态完整且模式匹配时调用 Vue 应用加载器', async () => {
     const startApplication = vi.fn(async () => undefined)
-    const invoke = native({ ready: true, error: null, frontend_mode: 'ui-preview', development: true })
+    const invoke = native({ ready: true, error: null, role: 'ui-preview', frontend_mode: 'ui-preview', development: true })
     await runDesktopPreflight({ expectedMode: 'ui-preview', invoke, startApplication })
     expect(invoke.invoke).toHaveBeenCalledOnce()
     expect(invoke.invoke).toHaveBeenCalledWith('desktop_status')
     expect(startApplication).toHaveBeenCalledOnce()
-    expect(validateDesktopStatus({ ready: true, error: null, frontend_mode: 'product', development: false }, 'product')).toBeNull()
-    expect(validateDesktopStatus({ ready: true, error: null, frontend_mode: 'product', development: true }, 'product')).toBeNull()
+    expect(validateDesktopStatus({ ready: true, error: null, role: 'product', frontend_mode: 'product', development: false }, 'product')).toBeNull()
+    expect(validateDesktopStatus({ ready: true, error: null, role: 'product', frontend_mode: 'product', development: true }, 'product')).toBeNull()
   })
 
   it('状态失败时不会加载应用配置脚本或请求业务接口', async () => {
@@ -133,7 +133,7 @@ describe('desktop preflight（桌面预检）', () => {
     vi.stubGlobal('fetch', fetchSpy)
     await runDesktopPreflight({
       expectedMode: 'product',
-      invoke: native({ ready: false, error: null, frontend_mode: 'product', development: false }),
+      invoke: native({ ready: false, error: null, role: 'product', frontend_mode: 'product', development: false }),
       startApplication,
     })
     expect(startApplication).not.toHaveBeenCalled()
@@ -142,12 +142,12 @@ describe('desktop preflight（桌面预检）', () => {
   })
 
   it('允许错误态重试，并在重试状态通过后启动一次', async () => {
-    let status: unknown = { ready: false, error: null, frontend_mode: 'product', development: false }
+    let status: unknown = { ready: false, error: null, role: 'product', frontend_mode: 'product', development: false }
     const call = vi.fn(async () => status)
     const invoke: NativeCommandInvoker = { invoke: call as NativeCommandInvoker['invoke'] }
     const startApplication = vi.fn(async () => undefined)
     await runDesktopPreflight({ expectedMode: 'product', invoke, startApplication })
-    status = { ready: true, error: null, frontend_mode: 'product', development: false }
+    status = { ready: true, error: null, role: 'product', frontend_mode: 'product', development: false }
     document.querySelector('button')?.click()
     await vi.waitFor(() => expect(startApplication).toHaveBeenCalledOnce())
     expect(call).toHaveBeenCalledTimes(2)

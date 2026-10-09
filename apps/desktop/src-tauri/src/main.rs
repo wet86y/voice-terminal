@@ -24,7 +24,7 @@ use tauri::{
     webview::PageLoadEvent,
     Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
-use voice_desktop_common::{windows::Job, LaunchChannel, LaunchContext, workspace::{self, Locator}};
+use voice_desktop_common::{windows::Job, LaunchContext, workspace::{self, Locator}};
 use resource_commands::{ResourceManager,resource_import_confirm,resource_inventory,resource_download,resource_import,resource_open_source,resource_cancel};
 
 struct Service {
@@ -90,11 +90,12 @@ struct Desktop {
     data: PathBuf,                  // data（当前模式隔离的 WebView2 缓存目录）。
     webview2: Option<PathBuf>,      // webview2（可选的固定网页运行时）。
     mode: FrontendMode,             // mode（前端模式：产品或桌面样例）。
-    development: bool,              // development（是否由调试构建运行）。
-    instance_identifier: String,    // instance_identifier（按模式和源码根目录隔离的单实例标识）。
+    development: bool,              // development（是否显式源码调试）。
+    instance_identifier: String,    // instance_identifier（工作区单实例标识；演示单独隔离）。
     service: Mutex<Option<Service>>,
     service_epoch: AtomicU64, // service_epoch（后台服务代次，防止旧读取线程控制新进程）。
-    locator: Option<Locator>, // locator（分发工作区记录；开发版本不读取）。
+    locator: Option<Locator>, // locator（当前工作区本地身份，不读写系统定位）。
+    workspace_guard: Mutex<Option<voice_desktop_common::installation::WorkspaceGuard>>, // workspace_guard（程序运行期间的本体互斥锁）。
     workspace_busy: AtomicBool, // workspace_busy（防止并行切换或迁移）。
     service_requested: AtomicBool, // service_requested（主窗口已请求启动服务，刷新不重复启动）。
     startup_skipped: AtomicBool,   // startup_skipped（当前窗口跳过加载画面的选择）。
@@ -235,19 +236,31 @@ fn desktop_status(
             state.launch_token.lock().unwrap().take();
         }
     }
-    // ready（是否就绪）、error（错误信息）、frontend_mode（前端模式）、development（是否调试构建）。
+    // ready（是否就绪）、error（错误信息）、frontend_mode（前端模式）、development（是否显式源码调试）。
     Ok(serde_json::json!({
         "ready": state.origin.lock().unwrap().is_some(),
         "startup_skipped": state.startup_skipped.load(Ordering::Acquire),
         "error": *state.error.lock().unwrap(),
+        "role": state.mode.label(), // role（入口职责）：product（正式程序）或 ui-preview（界面演示）。
         "frontend_mode": state.mode.label(),
         "development": state.development,
         "workspace_ready":state.context().is_some(),
         "workspace_busy":state.workspace_busy.load(Ordering::Acquire),
         "initialization_failed":state.initialization.lock().unwrap()["failed"]==true,
         "initialization":*state.initialization.lock().unwrap(),
-        "runtime":state.context().and_then(|context|voice_desktop_common::runtime::status(&context).ok())
+        "runtime":state.context().and_then(|context|voice_desktop_common::runtime::status(&context).ok()),
+        "fields":{"role":"product（正式程序）或 ui-preview（隔离演示）","frontend_mode":"被授权的界面入口","development":"是否显式源码调试","ready":"界面业务来源已建立","startup_skipped":"已选择跳过加载画面","error":"启动失败原因","workspace_ready":"正式工作区已解析","workspace_busy":"正在切换或迁移","initialization_failed":"初始化失败标识","initialization":"启动阶段与进度","runtime":"本地语音环境状态"}
     }))
+}
+// desktop_page_ready（真实页面就绪）：界面挂载后确认；迁移不使用缓存启动状态。
+#[tauri::command]
+fn desktop_page_ready(window:WebviewWindow,state:tauri::State<Arc<Desktop>>)->Result<(),String>{
+    trusted(&window,&state)?;require_command(state.mode,DesktopCommand::FocusMain)?;
+    let url=window.url().map_err(|e|e.to_string())?;
+    let management=url.path()=="/management.html"&&boot_page_url(&url);
+    if !management&&!(state.is_settled_frontend_url(&url)&&state.allows_frontend_url(&url)){return Err("页面尚未进入管理界面或产品界面。".into());}
+    let context=state.context().ok_or("缺少正式工作区")?;
+    workspace::atomic_json(&context.data.join("state/workspace-ready.json"),&serde_json::json!({"schema":1,"pid":std::process::id(),"workspace_id":context.workspace_id,"role":"product","ready":true,"management_ready":management,"development":context.dev,"fields":{"schema":"页面就绪记录格式","pid":"桌面进程编号","workspace_id":"工作区编号","role":"product（正式程序）","ready":"界面已真实挂载","management_ready":"组件管理页已挂载","development":"显式源码调试"}}))
 }
 #[tauri::command]
 fn skip_startup(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<(), String> {
@@ -324,20 +337,18 @@ fn console_url(value: &str) -> Result<tauri::Url, String> {
 fn workspace_info(window:WebviewWindow,state:tauri::State<Arc<Desktop>>)->Result<serde_json::Value,String>{
     require_command(state.mode,DesktopCommand::FocusMain)?;trusted(&window,&state)?;
     let context=state.context().ok_or("缺少产品工作区")?;
-    Ok(serde_json::json!({"channel":context.channel.label(),"root":context.install,"data_dir":context.data,
-        "project_root":if context.channel==LaunchChannel::Development{context.install.parent().map(Path::to_path_buf)}else{None},
-        "version":env!("CARGO_PKG_VERSION"),"can_manage":context.channel==LaunchChannel::Distribution,
-        "fields":{"channel":"启动渠道","root":"工作区或项目资源目录","data_dir":"用户数据目录","project_root":"开发项目根目录；分发渠道为空","version":"程序版本","can_manage":"允许管理工作区"}}))
+    Ok(serde_json::json!({"root":context.install,"data_dir":context.data,
+        "version":env!("CARGO_PKG_VERSION"),"can_manage":true,
+        "fields":{"root":"当前工作区根目录","data_dir":"用户数据目录","version":"程序版本","can_manage":"允许管理工作区"}}))
 }
 fn require_workspace(window:&WebviewWindow,state:&Desktop)->Result<(),String>{
     trusted(window,state)?;require_command(state.mode,DesktopCommand::FocusMain)?;
-    if LaunchChannel::current()!=LaunchChannel::Distribution{return Err("开发版本固定使用项目内资源，工作区选择与迁移只在分发版本开放。".into());}
     if state.stopping.load(Ordering::Acquire){return Err("应用正在退出。".into());}Ok(())
 }
 #[tauri::command]
 async fn workspace_choose(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>)->Result<Option<serde_json::Value>,String>{
     require_workspace(&window,&state)?;
-    let locator=state.locator.clone().ok_or("缺少分发定位")?;
+    let locator=state.locator.clone().ok_or("缺少本地工作区身份")?;
     tauri::async_runtime::spawn_blocking(move||{
         let chosen=voice_desktop_common::native_ui::choose_folder("选择工作区（新工作区须为空，可使用中文文件夹）")?;
         if let Some(root)=&chosen{locator.validate_target(root)?;}Ok(chosen.map(|root|serde_json::json!({"root":root})))
@@ -349,7 +360,7 @@ async fn workspace_operation(window:WebviewWindow,state:Arc<Desktop>,app:tauri::
     let operation_state=state.clone();
     let result=tauri::async_runtime::spawn_blocking(move||{
         let context=operation_state.context().ok_or("缺少工作区上下文")?;
-        let locator=operation_state.locator.as_ref().ok_or("缺少分发定位")?;
+        let locator=operation_state.locator.as_ref().ok_or("缺少本地工作区身份")?;
         let target=PathBuf::from(target_root);locator.validate_target(&target)?;
         if let Some(manager)=app.try_state::<Arc<ResourceManager>>(){manager.pause_and_wait()?;}
         operation_state.stop_service()?;
@@ -506,7 +517,7 @@ fn arg_value<'a>(args: &'a [String], key: &str) -> Result<Option<&'a str>, Strin
 fn ui_preview_context(args: &[String]) -> Result<(PathBuf, Option<PathBuf>, PathBuf), String> {
     for arg in args {
         if arg.starts_with("--")
-            && !["--ui-preview", "--root", "--webview2"].contains(&arg.as_str())
+            && !["--ui-preview", "--root", "--exit"].contains(&arg.as_str())
         {
             return Err(format!("桌面样例不接受产品启动参数：{arg}"));
         }
@@ -682,7 +693,7 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
                     let capability = if read_state.mode == FrontendMode::UiPreview {
                         serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
                     } else {
-                        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","core:event:allow-listen","core:event:allow-unlisten"]})
+                        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","core:event:allow-listen","core:event:allow-unlisten"]})
                     };
                     if let Err(error) = read_app.add_capability(capability.to_string()) {
                         *read_state.error.lock().unwrap() =
@@ -773,10 +784,11 @@ fn create_window(app:&tauri::AppHandle,build_state:Arc<Desktop>,management:bool)
                     .on_page_load(move |window, payload| {
                         #[cfg(feature="qualification")]
                         qualification::page_loaded(&window,&page_state,payload.event(),payload.url());
-                        if payload.event()==PageLoadEvent::Finished&&page_state.mode==FrontendMode::Product&&((payload.url().path()=="/management.html"&&boot_page_url(payload.url()))||(page_state.is_settled_frontend_url(payload.url())&&page_state.allows_frontend_url(payload.url()))){
-                            if let Some(context)=page_state.context(){
-                                let _=workspace::atomic_json(&context.data.join("state/workspace-ready.json"),&serde_json::json!({"schema":1,"pid":std::process::id(),"workspace_id":context.workspace_id,"channel":context.channel.label(),"ready":true,"management_ready":payload.url().path()=="/management.html","fields":{"pid":"桌面进程编号","workspace_id":"工作区编号","ready":"界面已就绪"}}));
-                            }
+                        // 首个受控窗口即可交接，管理页与产品页共用确认，不等待业务服务。
+                        if payload.event()==PageLoadEvent::Finished&&!page_state.stopping.load(Ordering::Acquire)&&
+                            (boot_page_url(payload.url())||page_state.allows_frontend_url(payload.url())) {
+                            let _=window.show();
+                            if let Some(context)=page_state.context(){let arguments=std::env::args().skip(1).collect::<Vec<_>>();let _=voice_desktop_common::installation::acknowledge(&context.install,&arguments);}
                         }
                         if !request_service_start(
                             payload.url(),
@@ -787,7 +799,6 @@ fn create_window(app:&tauri::AppHandle,build_state:Arc<Desktop>,management:bool)
                             return;
                         }
                         // 最终主窗口的本地界面已加载，再从后台线程准备业务或演示服务。
-                        let _ = window.show();
                         let service_app = window.app_handle().clone();
                         let service_state = page_state.clone();
                         std::thread::spawn(move || {
@@ -817,77 +828,23 @@ fn run() -> Result<(), String> {
         return Err("--ui-preview 不能重复。".into());
     }
     let preview = preview_count == 1;
-    if LaunchChannel::current()==LaunchChannel::Distribution
-        && args
-            .iter()
-            .any(|arg| ["--ui-preview", "--dev", "--diagnostic", "--root", "--python", "--install", "--data-dir", "--models", "--webview2"].contains(&arg.as_str()))
-    {
-        return Err(
-            "分发桌面程序不接受 --ui-preview、--dev 或 --diagnostic（开发启动参数）。".into(),
-        );
-    }
+    let exit_requested=args.iter().any(|arg|arg=="--exit");
     let (context, mode, program, data, webview2) = if preview {
-        let (program, webview2, data) = ui_preview_context(&args)?;
-        (None, FrontendMode::UiPreview, program, data, webview2)
-    } else if LaunchChannel::current()==LaunchChannel::Distribution {
-        let locator=Locator::from_args(&args)?;
-        let context=LaunchContext::from_args().ok();
-        let program=context.as_ref().map(|v|v.program.clone()).unwrap_or(std::env::current_exe().map_err(|e|e.to_string())?.parent().unwrap().to_path_buf());
-        let data=context.as_ref().map(|v|v.install.join("cache/webview2")).unwrap_or_else(||
-            locator.qualification.as_ref().and_then(|p|p.parent()).map(Path::to_path_buf)
-                .unwrap_or_else(||PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join("Temp"))
-                .join(format!("voice-initialization-{}",std::process::id())));
-        (context,FrontendMode::Product,program,data,None)
-    } else {
-        let context = LaunchContext::from_args()?;
+        let (program, _, data) = ui_preview_context(&args)?;
+        voice_desktop_common::prepare_webview_access_paths(&data,None)?;
+        (None,FrontendMode::UiPreview,program,data,None)
+    }else{
+        let context=LaunchContext::from_args()?;
         context.prepare_webview_access()?;
-        for (name, value) in context.environment() {
-            std::env::set_var(name, value);
-        }
-        let program = context.program.clone();
-        let data = context
-            .install
-            .join(if args.iter().any(|arg| arg == "--root") {
-                "cache/webview2-source"
-            } else {
-                "cache/webview2"
-            });
-        let webview2 = context.webview2.clone();
-        (
-            Some(context),
-            FrontendMode::Product,
-            program,
-            data,
-            webview2,
-        )
+        for (name,value) in context.environment(){std::env::set_var(name,value);}
+        let program=context.program.clone();let data=context.install.join("cache/webview2");
+        (Some(context),FrontendMode::Product,program,data,None)
     };
-    if preview {
-        voice_desktop_common::prepare_webview_access_paths(&data, webview2.as_deref())?;
-    }
-    if let Some(engine) = &webview2 {
-        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", engine);
-    }
-    if LaunchChannel::current()==LaunchChannel::Distribution {
-        std::env::remove_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER");
-        #[cfg(feature="qualification")]
-        if qualification::simulate_missing_webview(&locator_for_check(&args)?)?{return Ok(());}
-        if voice_desktop_common::webview::version().is_none(){
-            voice_desktop_common::webview::guide("未检测到可用的系统网页引擎。");return Ok(());
-        }
-    }
-    let source_root = if preview {
-        Some(program.as_path())
-    }else if LaunchChannel::current()==LaunchChannel::Development{
-        context.as_ref().map(|value|value.install.as_path())
-    } else {
-        None
-    };
-    let locator=if LaunchChannel::current()==LaunchChannel::Distribution{Some(Locator::from_args(&args)?)}else{None};
-    let instance_identifier = if let Some(locator)=&locator{
-        // 同一定位来源只运行一个桌面入口，首次目录选择前后标识保持稳定；服务仍按工作区编号控制。
-        let seed=PathBuf::from(format!("{}:{}",locator.path.display(),locator.instance_tag));
-        instance_identifier(mode,Some(&seed)).replace(".source.",".distribution.")
-    }else{instance_identifier(mode, source_root)};
+    std::env::remove_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER");
+    if voice_desktop_common::webview::version().is_none(){voice_desktop_common::webview::guide("未检测到系统 WebView2（网页运行引擎）。");return Ok(());}
+    let locator=context.as_ref().map(|value|Locator::local(&value.install));
+    let instance_identifier=instance_identifier(mode,if preview{Some(program.as_path())}else{context.as_ref().map(|value|value.install.as_path())});
+    let development=preview||context.as_ref().is_some_and(|value|value.dev);
     let state = Arc::new(Desktop {
         context:Mutex::new(context),
         initialization:Mutex::new(serde_json::json!({"phase":"正在检查工作区","completed_bytes":0,"total_bytes":0})),
@@ -896,11 +853,12 @@ fn run() -> Result<(), String> {
         data,
         webview2,
         mode,
-        development: LaunchChannel::current()==LaunchChannel::Development,
+        development,
         instance_identifier,
         service: Mutex::new(None),
         service_epoch: AtomicU64::new(0),
         locator,
+        workspace_guard:Mutex::new(None),
         workspace_busy: AtomicBool::new(false),
         service_requested: AtomicBool::new(false),
         startup_skipped: AtomicBool::new(false),
@@ -921,17 +879,21 @@ fn run() -> Result<(), String> {
     let build_state = state.clone();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(move |app, arguments, _| {
-            if qualification_control
+            if arguments.iter().any(|value|value=="--exit")||qualification_control
                 && arguments.iter().any(|value| value == "--qualification-exit")
             {
                 instance_state.shutdown(app);
+            } else if instance_state.mode==FrontendMode::Product&&arguments.iter().any(|value|value=="--dev")!=instance_state.development {
+                if let Some(context)=instance_state.context(){let _=workspace::atomic_json(&context.data.join("state/instance-conflict.json"),&serde_json::json!({"pid":std::process::id(),"existing_development":instance_state.development,"requested_development":arguments.iter().any(|value|value=="--dev"),"fields":{"pid":"已有正式进程编号","existing_development":"当前显式调试模式","requested_development":"请求的显式调试模式"}}));}
+                std::thread::spawn(||voice_desktop_common::windows::error("当前工作区已运行另一种业务模式，请退出已有实例后重新启动。"));
             } else {
                 show(app);
+                if let Some(context)=instance_state.context(){let _=voice_desktop_common::installation::acknowledge(&context.install,&arguments);}
             }
         }))
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
-            desktop_status,
+            desktop_status,desktop_page_ready,
             skip_startup,
             open_logs,
             open_console,
@@ -943,11 +905,12 @@ fn run() -> Result<(), String> {
             resource_inventory,resource_download,resource_import,resource_import_confirm,resource_open_source,resource_cancel
         ])
         .setup(move |app| {
-            if qualification_exit {
+            if qualification_exit||exit_requested {
                 build_state.shutdown(app.handle());
                 return Ok(());
             }
             if let Some(context)=build_state.context(){
+                *build_state.workspace_guard.lock().unwrap()=Some(voice_desktop_common::installation::WorkspaceGuard::acquire(&context.install).map_err(std::io::Error::other)?);
                 initialization::install_manager(app.handle(),build_state.clone(),&context).map_err(std::io::Error::other)?;
             }
             create_window(app.handle(),build_state.clone(),false).map_err(std::io::Error::other)?;
@@ -1034,7 +997,6 @@ fn main() {
     }
     #[cfg(feature="qualification")]
     if qualification::run_if_requested().is_some(){return;}
-    if let Some(result)=initialization::helper_if_requested(){if let Err(error)=result{voice_desktop_common::windows::error(&error);}return;}
     if let Err(message) = run() {
         if message.contains("WebView2") || message.contains("webview") || message.contains("网页引擎") {
             voice_desktop_common::webview::guide(&message);

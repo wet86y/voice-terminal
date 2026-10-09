@@ -7,6 +7,7 @@
   ],
   "permissions": [
     "allow-desktop-status",
+    "allow-desktop-page-ready",
     "allow-skip-startup",
     "allow-exit-application",
     "allow-desktop-initialize",

@@ -9,24 +9,26 @@ use std::{
 pub mod download;
 pub mod native_ui;
 pub mod workspace;
-pub mod embedded; // embedded（内嵌本体）：首次展开不需要网络或 Python。
 pub mod runtime; // runtime（私有语音环境）：安装计划、校验及事务启用。
 pub mod resources; // resources（原生资源管理）：不依赖业务后端。
 pub mod webview; // webview（系统网页引擎）：Evergreen（自动更新版）检测与引导。
+pub mod installation; // installation（本体安装）：正式程序包校验、重装与启动交接。
+pub mod shortcuts; // shortcuts（桌面快捷方式）：仅维护本程序创建的入口。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LaunchChannel {
-    Development, // Development（开发）：仅使用项目内资源和数据。
-    Distribution, // Distribution（分发）：通过用户工作区定位记录启动。
+    Product, // Product（统一正式程序）：工作区由可执行文件位置确定。
+    Development, // Development（历史开发标签）：仅用于兼容旧记录。
+    Distribution, // Distribution（历史分发标签）：仅用于兼容旧记录。
 }
 
 impl LaunchChannel {
     pub fn current() -> Self {
-        if cfg!(feature = "distribution") { Self::Distribution } else { Self::Development }
+        Self::Product
     }
     pub fn label(self) -> &'static str {
-        match self { Self::Development => "development", Self::Distribution => "distribution" }
+        match self { Self::Product => "product", Self::Development => "development", Self::Distribution => "distribution" }
     }
 }
 
@@ -146,6 +148,7 @@ impl LaunchContext {
         {
             return Err("请先将应用解压到本地磁盘；不支持网络共享路径。".into());
         }
+        workspace::normalize_layout(&install)?;
         let portable: Portable = read_json(&install.join("portable.json"))?;
         let selection = portable.selection;
         if selection.schema != 2
@@ -166,9 +169,7 @@ impl LaunchContext {
         let program = component(&install, &selection.app)?;
         let python = workspace::safe_path(&install, &selection.python)?;
         let models = Some(install.join(&selection.models));
-        let webview2 = if LaunchChannel::current() == LaunchChannel::Development {
-            selection.webview2.as_deref().and_then(|path| component(&install, path).ok())
-        } else { None }; // 分发始终使用系统 Evergreen（自动更新网页引擎）。
+        let webview2 = None; // 所有正式实例统一使用系统 Evergreen（自动更新网页引擎）。
         let runtime = install.join(selection.dsh.as_ref().unwrap());
         let node = if runtime.join("runtime.json").is_file() {
             let metadata: serde_json::Value = read_json(&runtime.join("runtime.json"))?;
@@ -177,7 +178,7 @@ impl LaunchContext {
         let identity: serde_json::Value = read_json(&install.join("portable.json"))?;
         let context = Self {
             channel: LaunchChannel::current(),
-            workspace_id: identity["workspace_id"].as_str().unwrap_or("development").to_string(),
+            workspace_id: identity["workspace_id"].as_str().ok_or("工作区缺少稳定编号")?.to_string(),
             install,
             program,
             data,
@@ -198,71 +199,49 @@ impl LaunchContext {
         Self::from_argument_list(&args)
     }
 
-    // from_argument_list（解析启动参数）：开发固定使用项目资源，分发只使用定位记录。
     fn from_argument_list(args: &[String]) -> Result<Self, String> {
+        Self::from_executable(&std::env::current_exe().map_err(|e|e.to_string())?, args)
+    }
+
+    // from_executable（统一入口解析）：只允许根入口或 app（程序本体）内的宿主。
+    pub fn from_executable(executable: &Path, args: &[String]) -> Result<Self, String> {
         let value = |key: &str| {
             args.iter()
                 .position(|a| a == key)
                 .and_then(|i| args.get(i + 1))
                 .cloned()
         };
-        if LaunchChannel::current() == LaunchChannel::Distribution {
-            if args.iter().any(|arg| ["--root", "--install", "--data-dir", "--python", "--models", "--webview2", "--dev", "--diagnostic", "--ui-preview"].contains(&arg.as_str())) {
-                return Err("分发版本不接受开发路径或调试启动参数。".into());
-            }
-            let locator = workspace::Locator::from_args(args)?;
-            let root = if let Some(journal)=value("--workspace-handoff"){locator.handoff_root(Path::new(&journal))?}else{locator.resolve()?};
-            let mut context = Self::portable(&root)?;
-            context.channel = LaunchChannel::Distribution;
-            return Ok(context);
+        if args.iter().any(|arg|["--root","--install","--data-dir","--python","--models","--webview2","--ui-preview"].contains(&arg.as_str())) {
+            return Err("正式入口不接受外部路径覆盖；调试请使用 --dev 和 --source-root（源码目录）。".into());
         }
-        if let Some(root) = value("--root") {
-            let program = canonical_path(Path::new(&root))?;
-            if !program.join("pyproject.toml").is_file() || !program.join("apps/desktop/Cargo.toml").is_file() {
-                return Err("开发入口必须明确传入当前项目根目录。".into());
-            }
-            if value("--install").is_some() || value("--data-dir").is_some() {
-                return Err("开发渠道的数据与组件固定保存在项目 .local（本机资源），不接受外部路径。".into());
-            }
-            let install = program.join(".local");
-            let installed = Self::portable(&install)?;
-            if value("--python").is_some()
-                || value("--models").is_some()
-                || value("--webview2").is_some()
-            {
-                return Err("业务组件路径统一由 portable.json（便携配置）管理。".into());
-            }
-            let data = installed.data.clone();
-            fs::create_dir_all(&data).map_err(|e| e.to_string())?;
-            let python = installed.python.clone();
-            let models = installed.models.clone();
-            let webview2 = installed.webview2.clone();
-            let context = Self {
-                channel: LaunchChannel::Development,
-                workspace_id: installed.workspace_id.clone(),
-                install: installed.install.clone(),
-                program,
-                data: canonical_path(&data)?,
-                python,
-                models,
-                webview2,
-                dsh: installed.dsh.clone(),
-                node: installed.node.clone(),
-                dev: args.iter().any(|a| a == "--dev"),
-                diagnostic: args.iter().any(|a| a == "--diagnostic"),
-            };
+        let mut seen=std::collections::HashSet::new();let mut i=0;
+        while i<args.len(){let arg=&args[i];if !seen.insert(arg){return Err(format!("启动参数重复：{arg}"));}
+            match arg.as_str(){"--dev"|"--diagnostic"|"--exit"=>{},"--source-root"|"--startup-handoff"|"--workspace-handoff"=>{i+=1;if args.get(i).is_none_or(|value|value.starts_with("--")){return Err(format!("启动参数缺少值：{arg}"));}},_=>return Err(format!("不支持的正式启动参数：{arg}"))}i+=1;
+        }
+        let parent=executable.parent().ok_or("无法定位正式程序目录")?;
+        let root=if parent.join("portable.json").is_file(){parent}
+            else if parent.file_name().is_some_and(|name|name=="app")&&parent.parent().is_some_and(|root|root.join("portable.json").is_file()){
+                parent.parent().unwrap()
+            }else{return Err("正式程序旁缺少 portable.json（工作区布局）；请使用分发安装器重装。".into());};
+        if let Some(journal)=value("--workspace-handoff"){
+            let path=Path::new(&journal);let locator=workspace::Locator::for_task(path)?;
+            if locator.handoff_root(path)?!=canonical_path(root)?{return Err("工作区交接目标与正式入口位置不一致。".into());}
+        }else if workspace::pending_task(root)?.is_some(){return Err("存在未完成工作区事务，请通过工作区根目录正式入口恢复。".into());}
+        let mut context=Self::portable(root)?;
+        context.dev=args.iter().any(|arg|arg=="--dev");
+        context.diagnostic=args.iter().any(|arg|arg=="--diagnostic");
+        let source=value("--source-root");
+        if context.dev!=source.is_some(){return Err("--dev（源码热更新）与 --source-root（源码目录）必须同时提供。".into());}
+        if let Some(source)=source {
+            let source=canonical_path(Path::new(&source))?;
+            if !source.join("pyproject.toml").is_file()||!source.join("apps/desktop/Cargo.toml").is_file(){return Err("显式调试目录不是有效源码项目。".into());}
+            context.program=source;
             context.validate()?;
-            data_state(&context.data)?;
-            return Ok(context);
         }
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let mut root = exe.parent().ok_or("无法定位启动程序")?;
-        while !(root.join("pyproject.toml").is_file() && root.join("apps/desktop/Cargo.toml").is_file()) {
-            root = root.parent().ok_or("开发版本无法定位项目根目录，请从项目开发入口启动。")?;
-        }
-        let mut explicit=args.to_vec();explicit.push("--root".into());explicit.push(root.to_string_lossy().into_owned());
-        Self::from_argument_list(&explicit)
+        Ok(context)
     }
+
+    pub fn installed_program(&self)->PathBuf {self.install.join("app")} // installed_program（正式资源清单目录）。
 
     fn validate(&self) -> Result<(), String> {
         if self.data == self.program || self.program.starts_with(&self.data) {
@@ -298,6 +277,7 @@ impl LaunchContext {
         let mut values = BTreeMap::new();
         values.insert("VOICE_LAUNCH_CHANNEL".into(), self.channel.label().into());
         values.insert("VOICE_WORKSPACE_ID".into(), self.workspace_id.clone());
+        if self.dev {values.insert("VOICE_SOURCE_DEBUG".into(), "1".into());}
         for (name, path) in [
             ("VOICE_INSTALL_ROOT", &self.install),
             ("VOICE_PROGRAM_ROOT", &self.program),
@@ -973,78 +953,17 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    #[cfg(not(feature = "distribution"))] // development（开发渠道）：允许项目根目录参数。
     #[test]
-    fn development_uses_project_data_and_rejects_external_override() {
-        let root = std::env::temp_dir().join(format!("voice-source-data-{}", std::process::id()));
-        let install = root.join(".local");
-        for path in [
-            root.join("config"),
-            root.join("scripts"),
-            root.join("apps/desktop"),
-            install.join("app/config"),
-            install.join("app/scripts"),
-            install.join("runtimes/python"),
-            install.join("models"),
-            install.join("runtimes/dsh"),
-            install.join("runtimes/webview2"),
-            install.join("data/config"),
-        ] {
-            fs::create_dir_all(path).unwrap();
-        }
-        for path in [
-            root.join("config/default.yaml"),
-            root.join("scripts/backend-entry.py"),
-            root.join("pyproject.toml"),
-            root.join("apps/desktop/Cargo.toml"),
-            install.join("app/config/default.yaml"),
-            install.join("app/scripts/backend-entry.py"),
-            install.join("runtimes/python/python.exe"),
-            install.join("runtimes/webview2/msedgewebview2.exe"),
-            install.join("runtimes/dsh/node.exe"),
-        ] {
-            fs::write(path, b"fixture").unwrap();
-        }
-        fs::write(
-            install.join("data/config/preserved.txt"),
-            b"existing-settings",
-        )
-        .unwrap();
-        fs::write(
-            install.join("runtimes/dsh/runtime.json"),
-            b"{\"node\":\"node.exe\"}",
-        )
-        .unwrap();
-        fs::write(install.join("portable.json"), serde_json::to_vec(&serde_json::json!({
-            "data_dir":"data", "schema":2, "app":"app", "python":"runtimes/python/python.exe",
-            "models":"models", "dsh":"runtimes/dsh", "webview2":"runtimes/webview2", "node":null,
-            "external_python":null, "external_models":null
-        })).unwrap()).unwrap();
-        let root = canonical_path(&root).unwrap();
-        let args = vec![
-            "--root".into(),
-            root.to_str().unwrap().into(),
-            "--dev".into(),
-        ];
-        let context = LaunchContext::from_argument_list(&args).unwrap();
-        assert_eq!(context.data, root.join(".local/data"));
-        assert_eq!(context.program, root);
-        assert_eq!(context.python, install.join("runtimes/python/python.exe"));
-        assert_eq!(context.dsh, Some(install.join("runtimes/dsh")));
-        assert_eq!(context.models, Some(install.join("models")));
-        assert!(context.dev);
-        assert!(!root.join(".local/isolated-data").exists());
-        let mut explicit = args;
-        explicit.extend(["--data-dir".into(), "explicit-data".into()]);
-        assert!(LaunchContext::from_argument_list(&explicit).unwrap_err().contains("不接受外部路径"));
-        assert!(!root.join("explicit-data").exists());
-        assert_eq!(
-            fs::read(install.join("data/config/preserved.txt")).unwrap(),
-            b"existing-settings"
-        );
-        fs::remove_dir_all(&root).unwrap();
+    fn explicit_source_debug_shares_formal_workspace_and_resources(){
+        let root=std::env::temp_dir().join(format!("voice-source-中文 空格-{}",workspace::new_id()));let install=root.join(".local");
+        for parent in [root.join("apps/desktop"),root.join("config"),root.join("scripts"),install.join("app/config"),install.join("app/scripts"),install.join("runtimes/webview2")]{fs::create_dir_all(parent).unwrap();}
+        for path in [root.join("pyproject.toml"),root.join("apps/desktop/Cargo.toml"),root.join("config/default.yaml"),root.join("scripts/backend-entry.py"),install.join("app/config/default.yaml"),install.join("app/scripts/backend-entry.py"),install.join("runtimes/webview2/preserved.bin")]{fs::write(path,b"fixture").unwrap();}
+        fs::write(install.join("portable.json"),serde_json::to_vec(&serde_json::json!({"schema":2,"app":"app","python":"runtimes/python/python.exe","models":"models","dsh":"runtimes/dsh","webview2":"runtimes/webview2","data_dir":"data"})).unwrap()).unwrap();
+        let exe=install.join("VoiceTerminal.exe");let normal=LaunchContext::from_executable(&exe,&[]).unwrap();let debug=LaunchContext::from_executable(&exe,&["--dev".into(),"--source-root".into(),root.to_str().unwrap().into()]).unwrap();
+        assert_eq!(normal.program,canonical_path(&install.join("app")).unwrap());assert_eq!(debug.program,canonical_path(&root).unwrap());assert_eq!(normal.install,debug.install);assert_eq!(normal.data,debug.data);assert_eq!(normal.python,debug.python);assert_eq!(normal.models,debug.models);assert_eq!(normal.workspace_id,debug.workspace_id);assert_eq!(debug.installed_program(),normal.program);assert!(debug.dev);assert!(normal.webview2.is_none());assert!(install.join("runtimes/webview2/preserved.bin").is_file());
+        assert!(LaunchContext::from_executable(&exe,&["--dev".into()]).is_err());assert!(LaunchContext::from_executable(&exe,&["--source-root".into()]).is_err());assert!(LaunchContext::from_executable(&exe,&["--data-dir".into(),root.to_str().unwrap().into()]).is_err());
+        assert!(LaunchContext::from_executable(&root.join("nested/VoiceTerminal.exe"),&[]).is_err());fs::remove_dir_all(root).unwrap();
     }
-
     #[test]
     fn pending_update_never_initializes_business_data() {
         let root =
@@ -1057,27 +976,6 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    #[cfg(not(feature = "distribution"))] // development（开发渠道）：检查项目安装定位。
-    #[test]
-    fn missing_formal_installation_never_creates_an_isolated_product() {
-        let root = std::env::temp_dir().join(format!("voice-no-install-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let error =
-            LaunchContext::from_argument_list(&["--root".into(), root.to_str().unwrap().into()])
-                .unwrap_err();
-        assert!(error.contains("项目根目录"));
-        assert!(!root.join(".local").exists());
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[cfg(feature = "distribution")] // distribution（分发渠道）：拒绝开发路径与调试参数。
-    #[test]
-    fn distribution_rejects_development_paths_before_workspace_resolution() {
-        for argument in ["--root", "--install", "--data-dir", "--python", "--models", "--webview2", "--dev", "--diagnostic", "--ui-preview"] {
-            let error = LaunchContext::from_argument_list(&[argument.into()]).unwrap_err();
-            assert!(error.contains("分发版本不接受开发路径或调试启动参数"), "{argument}: {error}");
-        }
-    }
     #[test]
     fn rejects_escape_and_absolute_components() {
         for value in ["../other", "a/../../b", "/outside", "C:\\outside", ""] {

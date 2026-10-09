@@ -24,7 +24,7 @@ fn start() -> Result<(), String> {
     )?)?;
     let desktop = root.join(".local/build/desktop/debug/VoiceTerminalDesktop.exe");
     if !desktop.is_file() {
-        return Err("演示主程序尚未构建。请先执行 npm run dev:ui（演示开发）或 npm run desktop:publish（构建并更新两入口），再双击演示入口。".into());
+        return Err("演示主程序尚未构建。请先执行 npm run dev:ui（演示开发），再双击演示入口。".into());
     }
     let logs = root.join(".local/cache/ui-demo");
     fs::create_dir_all(&logs).map_err(|e| e.to_string())?;

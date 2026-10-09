@@ -58,6 +58,7 @@ class ApplicationHost:
         self.dev = False
         self.headless = False  # headless（无界面模式）：保留 Host 内部报告，不要求网页构建产物。
         self.frontend_error = ""
+        self.frontend_directory = root / "apps/frontend/dist"  # frontend_directory（唯一静态界面目录）：启动入口解析后供检查与重试共用。
         self.gpu_fallback_roles: set[str] = set()  # gpu_fallback_roles（显卡进程启动失败后使用中央处理器的组件）。
         self.exit_callback = None  # exit_callback（桌面外壳的退出协调回调）。
         self.shutdown_deadline = None  # shutdown_deadline（统一退出的单调时钟截止时间）。
@@ -266,8 +267,8 @@ class ApplicationHost:
                 phase="无界面模式，仅接收宿主内部报告", error="")
         elif self.frontend_error:
             self.state.component("web", state="failed", phase="界面入口诊断", error=self.frontend_error)
-        elif not self.dev and not (self.root / "apps/frontend/dist/index.html").is_file():
-            self.state.component("web", state="failed", phase="使用内置诊断页", error="缺少界面构建产物，请执行 npm run build（构建界面）。")
+        elif not self.dev and not (self.frontend_directory / "index.html").is_file():
+            self.state.component("web", state="failed", phase="使用内置诊断页", error="正式程序界面文件不完整，请修复程序本体。")
         else:
             self.state.component("web", state="ready", phase="界面入口已就绪", error="")
 
@@ -699,8 +700,8 @@ class ApplicationHost:
                 if key == "web":
                     if self.dev:
                         raise RuntimeError("请重启桌面程序恢复开发界面；当前诊断入口仍可使用。")
-                    if not (self.root / "apps/frontend/dist/index.html").is_file():
-                        raise RuntimeError("缺少界面构建产物，请先执行 npm run build（构建界面）")
+                    if not (self.frontend_directory / "index.html").is_file():
+                        raise RuntimeError("正式程序界面文件不完整，请修复程序本体。")
                     self.state.component("web", state="ready", phase="界面构建产物已就绪", error="")
                 elif key == "setup":
                     # 已存在的组件保留所有权，重新检查后只恢复失败项。

@@ -150,6 +150,7 @@ async def run(args, root):
         app.enqueue(stop_headless())
     desktop = None
     frontend = root / ".local/build/frontend" if (root / "apps/desktop/Cargo.toml").is_file() else root / "apps/frontend/dist"
+    app.frontend_directory = frontend  # frontend_directory（界面路径）：服务、状态和重试共用。
     host_preferred_port = 8764 if args.dev else 5173
     host = HostWeb(app, frontend, port=host_preferred_port)
     app.origin = host.origin  # origin（宿主内部地址）：业务组件报告与内部 Bearer 校验使用此地址。
@@ -166,7 +167,7 @@ async def run(args, root):
     if args.headless:
         app.state.component("web", state="ready", required=False, phase="无界面模式，仅保留宿主内部报告", error="")
     elif not args.dev and not (frontend / "index.html").is_file():
-        missing_ui = "缺少界面构建产物，请执行 npm run build（构建界面）。"
+        missing_ui = "正式程序界面文件不完整，请修复程序本体。"
         app.frontend_error = missing_ui
         app.state.component("web", state="failed", phase="使用内置诊断页", error=missing_ui)
 

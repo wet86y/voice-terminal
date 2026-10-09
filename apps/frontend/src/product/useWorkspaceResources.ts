@@ -37,8 +37,8 @@ export function useWorkspaceResources() {
   let unlistenRequests: Promise<void>[] = []
   let refreshRequest: Promise<void> | null = null
 
-  // canManage（工作区管理权限）仅对分发版开放；资源准备在开发和分发入口都可用。
-  const canManage = computed(() => port.available && workspace.value?.channel === 'distribution' && workspace.value.can_manage)
+  // canManage（工作区管理权限）统一由正式程序提供；源码调试使用相同权限。
+  const canManage = computed(() => port.available && workspace.value?.can_manage)
   const resourcesCanManage = computed(() => port.available)
   const activeWorkspaceJob = computed(() => [...workspaceJobs.value].reverse().find(job => !TERMINAL_JOB_STATES.has(job.state)))
   const latestWorkspaceJob = computed(() => workspaceJobs.value.at(-1) ?? null)

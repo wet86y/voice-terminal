@@ -242,7 +242,7 @@ def hardware_status(*, refresh: bool = False) -> dict[str, Any]:
             result["models"] = registration.get("models", {})
             if isinstance(registration.get("gpu_hardware"),dict):result["gpu"]=registration["gpu_hardware"]
             result["registered_environment"] = registration["path"]  # registered_environment（已验证的显卡解释器目录）。
-        elif os.environ.get("VOICE_LAUNCH_CHANNEL") == "distribution":
+        elif os.environ.get("VOICE_LAUNCH_CHANNEL") in {"product", "distribution"}:
             try: legacy=json.loads((install/'runtimes/python/runtime.json').read_text('utf-8')).get('profile')=='cu128'
             except (OSError,ValueError): legacy=False
             if not legacy or (data/'config/gpu-environment.json').is_file():

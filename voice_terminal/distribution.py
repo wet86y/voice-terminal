@@ -148,6 +148,8 @@ def verify_install(root: Path) -> None:
         selected_path = selected.get(component["kind"])
         if component["kind"] == "python":
             selected_path = str(Path(selected_path).parent).replace("\\", "/") if selected_path else None
+        if component['kind'] == 'webview2' and selected_path is None and component['kind'] in optional:
+            continue  # 系统网页引擎不使用旧私有组件，登记与原文件继续保留。
         if selected_path != component["path"]:
             raise ValueError(f"便携配置不符合程序所需组合：{component['kind']}")
         verify(directory, record)

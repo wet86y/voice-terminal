@@ -28,7 +28,7 @@ Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tau
 
 已实施的目录、清退体积、备份恢复和启动验证见[本地整理验收](docs/local-layout-acceptance-20261008.md)。
 
-本机项目入口为 `.local/VoiceTerminal.exe`（本机开发程序）和 `.local/VoiceTerminalUIDemo.exe`（前端演示程序）。开发程序使用项目内数据、设置和历史；演示程序只加载前端。对外分发入口独立生成在 `.local/releases/distribution-single-exe/VoiceTerminal.exe`（分发启动程序），通过系统定位记录链接用户选择的工作区。当前渠道与交付说明见[0.9.0 独立启动实现](docs/desktop-independent-implementation.md)；[下载与分发规划](docs/download-distribution-plan.md)保留平台来源和固定资源版本核验记录。
+本地开发和用户使用同一套正式程序。本机正式入口是 `.local/VoiceTerminal.exe`（正式启动程序）；对外分发 `.local/releases/installer/VoiceTerminalSetup.exe`（安装器），只负责选择工作区、展开或重装同一正式程序包、创建桌面快捷方式与启动交接。组件下载、导入、配置及维护全部由正式程序承担。详见[统一正式程序与分发安装器](docs/unified-product-installer.md)及[当前交付](docs/current-release.md)。`.local/VoiceTerminalUIDemo.exe`（前端演示入口）继续使用隔离缓存。
 
 源码开发复用项目 `.local/portable.json`（布局配置）指定的开发业务环境：Python（后端解释器）位于 `.local/runtimes/python/`，Node.js（脚本解释器）从 `.local/runtimes/dsh/runtime.json`（代理宿主运行清单）解析。开发依赖由 npm（包管理器）安装在根目录 `node_modules/`；原生构建工具保存在 `.local/tools/`（本机工具目录），构建输出统一进入 `.local/build/`（受控构建缓存）。
 
@@ -38,7 +38,9 @@ npm ci
 npm run desktop:start
 ```
 
-开发渠道固定读取项目 `.local/data`（开发数据），不读取或修改正式定位记录。分发渠道读取 `%LOCALAPPDATA%/VoiceTerminal/workspace.json`（系统应用数据中的工作区定位记录），使用所选工作区的 `data`（用户数据）。设置、历史、声纹、DSH（代理执行宿主）状态及凭据引用分别按数据目录加载；凭据继续使用 Windows Credential Manager（系统凭据管理器）。开发环境也可通过进程环境提供凭据，不要提交到 Git（源码管理工具）：
+普通无参数启动从可执行文件位置确定工作区，读取已发布 `app`（程序本体）内的业务和静态界面；不查找源码祖先，也不读取或更新系统用户目录中的工作区定位记录。`npm run desktop:start`（正式启动）与本地双击完全一致。`npm run dev`（源码热更新）通过同一正式入口显式传入 `--dev`（调试开关）及 `--source-root`（源码目录），沿用正式工作区、组件管理、单实例及退出流程。`npm run desktop:publish`（本地发布）使用统一程序包事务替换本体，保留用户数据与组件。
+
+设置、历史、声纹、DSH（代理宿主）状态及凭据引用按当前工作区的 `data`（用户数据）目录加载；凭据继续使用 Windows Credential Manager（系统凭据管理器）。不要将开发凭据提交到 Git（源码管理工具）：
 
 ```text
 DEEPSEEK_API_KEY=
@@ -66,19 +68,19 @@ MINIMAX_API_KEY=
 .\scripts\build-desktop.ps1
 ```
 
-本机开发程序覆盖发布、组件候选换入及数据备份见[本地目录与覆盖发布](docs/local-layout.md)。对外分发交付单个 `VoiceTerminal.exe`（程序入口），本体已内嵌；使用系统 WebView2 Evergreen Runtime（自动更新网页引擎）。没有 Python（后端环境）也可进入组件管理和关于页，语音环境、模型及 DSH（代理执行宿主）分别配置，详见[桌面独立启动与按需语音环境实现](docs/desktop-independent-implementation.md)。
+正式程序发布与数据备份见[本地目录与覆盖发布](docs/local-layout.md)。对外交付单个 `VoiceTerminalSetup.exe`（分发安装器），内嵌同一正式程序包。使用系统 WebView2 Evergreen Runtime（自动更新网页引擎）；没有 Python（后端环境）也能由正式程序进入组件管理和关于页。组件由正式程序维护，详见[统一正式程序与分发安装器](docs/unified-product-installer.md)。
 
 源码界面开发统一使用桌面命令：
 
 ```powershell
 npm run dev       # 真实业务桌面热更新；别名 npm run desktop:dev
 npm run dev:ui    # 桌面样例热更新；别名 npm run desktop:ui
-npm run build    # 开发渠道界面、原生主程序及根启动程序；别名 npm run desktop:build
-npm run desktop:publish # 退出业务实例并关闭演示后，事务更新固定程序目录及两入口
-npm run desktop:dist # 分发渠道单 EXE（程序入口），内含本体；首次展开无需发布地址
+npm run build    # 统一正式界面、原生宿主及根入口；别名 npm run desktop:build
+npm run desktop:publish # 退出业务实例后，事务更新固定本体及正式入口
+npm run desktop:dist # 独立 EXE（安装器），嵌入同一正式程序包
 ```
 
-源码开发命令启动前执行增量原生构建，静态开发命令同时构建当前界面。开发业务入口启动项目内后端，演示入口只启动前端；首选端口占用时回退到实际可绑定的回环端口，以宿主端点表为准。开发、分发和分发验收分别使用独立定位来源、实例登记及服务控制范围，可以同时运行；开发入口只使用项目 `.local`（本机开发资源）目录，分发入口使用用户选择的工作区。渲染缓存按渠道和模式保存。演示不启动 Python（后端运行时）业务服务、不读取业务凭据。浏览器预览和旧网页启动器已撤销。启动诊断见[独立应用启动与系统管理](docs/application-lifecycle.md)，当前渠道和分发行为以[0.9.0 实现记录](docs/desktop-independent-implementation.md)为准。
+正式启动直接读取已发布本体。源码调试使用同一正式入口和工作区，显式切换业务源码与前端输入；普通模式与调试模式共享单实例，冲突时提示退出后重启。前端演示使用隔离缓存，只启动界面服务，可与正式程序同时运行。实际端点以宿主端点表为准。启动诊断见[独立应用启动与系统管理](docs/application-lifecycle.md)，入口、安装与恢复规则见[统一正式程序与分发安装器](docs/unified-product-installer.md)。
 
 ## 产品页面
 
@@ -87,9 +89,9 @@ npm run desktop:dist # 分发渠道单 EXE（程序入口），内含本体；�
 - 语音事件回放：从桌面样例工具选择固定回放场景；产品地址不再通过查询参数绕过宿主管理。
 - 桌面样例：覆盖工作台和七个设置页（唤醒词与静默设置已合并）；使用固定样例，不连接业务后端、不申请麦克风权限，也不读写真实设置。
 
-调优外观时，双击 `.local/VoiceTerminalUIDemo.exe`（前端演示入口）直接打开演示主窗口，随后在同一窗口内加载界面服务；重复双击唤回已有主窗口。该入口直接运行已构建的宿主，不执行源码构建。修改原生宿主源码后，执行 `npm run dev:ui`（构建并启动演示开发）或 `npm run desktop:publish`（构建并更新两入口）。保存 Vue（页面组件）或 CSS（样式表）后自动更新。右下角工具可切换页面、内容场景、运行状态及浮层。展示选择保留在页面地址中；表单编辑仅保留在内存，点击“重置展示”恢复初值。关闭演示窗口立即回收其开发服务。界面修订在共享组件和样式中完成；验收后退出正式程序并关闭演示窗口，执行 `npm run desktop:publish`（更新正式程序），再启动正式入口验证真实业务。
+调优外观时，双击 `.local/VoiceTerminalUIDemo.exe`（前端演示入口）直接打开演示主窗口，随后在同一窗口内加载界面服务；重复双击唤回已有主窗口。该入口直接运行已构建的宿主，不执行源码构建。修改原生宿主源码后，执行 `npm run dev:ui`（构建并启动演示开发）。保存 Vue（页面组件）或 CSS（样式表）后自动更新。右下角工具可切换页面、内容场景、运行状态及浮层。展示选择保留在页面地址中；表单编辑仅保留在内存，点击“重置展示”恢复初值。关闭演示窗口立即回收其开发服务。界面修订在共享组件和样式中完成；验收后退出正式程序并关闭演示窗口，执行 `npm run desktop:publish`（更新正式程序），再启动正式入口验证真实业务。
 
-正式界面与样例共享 `apps/frontend/src/interface/`（应用框架、工作台、设置导航和基础控件）及 `design.css`（设计变量与样式）。正式业务位于 `apps/frontend/src/product/`（产品逻辑），无后端管理界面位于 `apps/frontend/src/management/`（原生组件管理），样例位于 `apps/frontend/src/ui-demo/`（样例展示）。入口先验证原生桌面状态再动态加载对应界面；正式业务入口随后读取宿主运行配置。正式构建包含产品和原生管理入口，便携组装依据 `desktop-manifest.json`（界面产物清单）验证依赖闭包，拒绝样例和陈旧资源。当前收敛范围与验证状态见[第一阶段记录](docs/desktop-frontend-consolidation.md)及[独立启动实现](docs/desktop-independent-implementation.md)。
+正式界面与样例共享 `apps/frontend/src/interface/`（应用框架、工作台、设置导航和基础控件）及 `design.css`（设计变量与样式）。正式业务位于 `apps/frontend/src/product/`（产品逻辑），无后端管理界面位于 `apps/frontend/src/management/`（原生组件管理），样例位于 `apps/frontend/src/ui-demo/`（样例展示）。入口先验证原生桌面状态再动态加载对应界面；正式业务入口随后读取宿主运行配置。正式构建包含产品和原生管理入口，便携组装依据 `desktop-manifest.json`（界面产物清单）验证依赖闭包，拒绝样例和陈旧资源。当前收敛范围与验证状态见[第一阶段记录](docs/desktop-frontend-consolidation.md)及[统一启动实现](docs/unified-product-installer.md)。
 
 Product UI 只有工作台和设置两个一级页面。页面切换应保留组件状态，真实协议和会话排序以服务端事件为准，详见 [WebSocket 协议](docs/websocket-protocol.md)。
 

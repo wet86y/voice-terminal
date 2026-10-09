@@ -4010,6 +4010,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "windows",
  "windows-sys 0.61.2",
  "zip",
 ]
@@ -4031,6 +4032,17 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",
+ "voice-desktop-common",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "voice-terminal-installer"
+version = "0.9.0"
+dependencies = [
+ "serde_json",
+ "tauri",
+ "tauri-build",
  "voice-desktop-common",
  "windows-sys 0.61.2",
 ]

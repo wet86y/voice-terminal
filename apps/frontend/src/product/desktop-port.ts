@@ -2,14 +2,11 @@ import { locateNativeInvoker } from '../runtime/desktop-preflight'
 
 /** WorkspaceInfo（工作区信息）：由原生启动器返回的当前数据归属。 */
 export interface WorkspaceInfo {
-  /** channel（运行渠道）：development（开发）或 distribution（分发）。 */
-  channel: 'development' | 'distribution'
-  /** root（工作区根路径）与 data_dir（资源数据目录）。 */
+  /** root（当前工作区根目录）。 */
   root: string
+  /** data_dir（用户数据目录）。 */
   data_dir: string
-  /** project_root（开发项目根目录）：仅开发渠道返回；旧原生版本可能未提供。 */
-  project_root?: string | null
-  /** version（应用版本）与 can_manage（是否开放分发资源管理）。 */
+  /** version（应用版本）与 can_manage（是否开放工作区管理）。 */
   version: string
   can_manage: boolean
 }

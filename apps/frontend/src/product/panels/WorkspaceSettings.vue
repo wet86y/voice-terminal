@@ -73,12 +73,12 @@ function formatBytes(value: number | null | undefined) {
     <p v-if="controller.workspaceError.value" class="workspace-error" role="alert">{{ controller.workspaceError.value }}</p>
 
     <section v-if="workspace" class="workspace-card" aria-labelledby="workspace-location-title">
-      <div class="workspace-card-heading"><div><p class="section-label">WORKSPACE（工作区）</p><h3 id="workspace-location-title">当前存储位置</h3></div><span class="workspace-channel">{{ workspace.channel === 'development' ? '开发运行' : '分发版本' }}</span></div>
+      <div class="workspace-card-heading"><div><p class="section-label">WORKSPACE（工作区）</p><h3 id="workspace-location-title">当前存储位置</h3></div><span class="workspace-channel">正式程序</span></div>
       <dl class="workspace-paths">
-        <div><dt>{{ workspace.channel === 'development' ? '项目根目录' : '工作区根目录' }}</dt><dd :title="workspace.channel === 'development' ? (workspace.project_root || workspace.root) : workspace.root">{{ workspace.channel === 'development' ? (workspace.project_root || workspace.root) : workspace.root }}</dd></div>
+        <div><dt>工作区根目录</dt><dd :title="workspace.root">{{ workspace.root }}</dd></div>
         <div><dt>数据目录</dt><dd :title="workspace.data_dir">{{ workspace.data_dir }}</dd></div>
       </dl>
-      <p v-if="workspace.channel === 'development'" class="workspace-hint">开发运行固定使用项目的 .local（本机资源）目录；工作区选择与迁移仅适用于分发版本。</p>
+
       <small class="workspace-version">应用版本：{{ workspace.version || '未知' }}</small>
 
       <template v-if="canManage">

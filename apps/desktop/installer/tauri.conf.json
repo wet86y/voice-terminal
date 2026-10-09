@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Voice Terminal Setup",
+  "version": "0.9.0",
+  "identifier": "com.voiceterminal.installer",
+  "build": {"frontendDist": "../boot"},
+  "app": {"windows": [], "withGlobalTauri": true, "security": {"capabilities": ["installer"]}},
+  "bundle": {"active": false, "icon": ["../src-tauri/icons/icon.ico", "../src-tauri/icons/icon.png"]}
+}

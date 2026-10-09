@@ -11,7 +11,9 @@ export interface DesktopStatus {
   error: string | null
   /** frontend_mode（前端模式）：本窗口被授权加载的入口。 */
   frontend_mode: DesktopFrontendMode
-  /** development（开发标识）：是否由调试构建启动；样例入口必须为 true。 */
+  /** role（入口职责）：正式程序或隔离演示。 */
+  role: DesktopFrontendMode
+  /** development（开发标识）：是否显式启用源码调试；样例入口必须为 true。 */
   development: boolean
   /** startup_skipped（原生等待页已选择跳过）：旧桌面程序可以省略。 */
   startup_skipped?: boolean
@@ -57,6 +59,7 @@ export function validateDesktopStatus(value: unknown, expectedMode: DesktopFront
   if (status.frontend_mode !== expectedMode) {
     return `桌面启动程序授权的前端模式与当前入口不匹配（需要 ${frontendModeLabel(expectedMode)}）。`
   }
+  if (status.role !== expectedMode) return '桌面入口职责不匹配，安装器不能启动业务界面。'
   if (typeof status.development !== 'boolean') {
     return '桌面启动程序没有提供有效的 development（开发标识）。'
   }

@@ -1,27 +1,8 @@
-﻿$ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'start-desktop.ps1')
-
-$BuildStub = {
-  # LaunchChannel（启动渠道）、OptimizationLevel（优化级别）、SkipFrontend（跳过静态界面构建）。
-  param([string]$LaunchChannel, [string]$OptimizationLevel, [switch]$SkipFrontend)
-  [pscustomobject]@{
-    LaunchChannel = $LaunchChannel
-    OptimizationLevel = $OptimizationLevel
-    SkipFrontendBound = $PSBoundParameters.ContainsKey('SkipFrontend')
-    SkipFrontend = [bool]$SkipFrontend
-  }
-}
-
-$Cases = @(
-  @{ Name = 'static（静态桌面）'; Dev = $false; UiPreview = $false; SkipFrontend = $false },
-  @{ Name = 'dev（真实桌面开发）'; Dev = $true; UiPreview = $false; SkipFrontend = $true },
-  @{ Name = 'ui-preview（桌面样例）'; Dev = $false; UiPreview = $true; SkipFrontend = $true }
-)
-foreach ($Case in $Cases) {
-  $Bound = Invoke-DesktopBuild -BuildScript $BuildStub -Dev:$Case.Dev -UiPreview:$Case.UiPreview
-  if ($Bound.LaunchChannel -ne 'development' -or $Bound.OptimizationLevel -ne 'debug' -or
-      -not $Bound.SkipFrontendBound -or $Bound.SkipFrontend -ne $Case.SkipFrontend) {
-    throw "构建开关绑定失败：$($Case.Name)。"
-  }
-  Write-Output "构建开关绑定通过：$($Case.Name)。"
-}
+﻿$ErrorActionPreference='Stop'
+$TaskRepo=Split-Path $PSScriptRoot -Parent
+$TaskStart=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'start-desktop.ps1') -Raw -Encoding UTF8
+if ($TaskStart -notmatch "\.local'" -or $TaskStart -notmatch 'VoiceTerminal.exe' -or $TaskStart -notmatch '--source-root' -or $TaskStart -notmatch '--dev') {throw '正式启动及显式调试参数未收敛。'}
+if ($TaskStart -match 'LaunchChannel|--install|--data-dir|--python|--webview2') {throw '正式入口仍存在开发路径覆盖。'}
+$TaskBuild=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'build-desktop.ps1') -Raw -Encoding UTF8
+if ($TaskBuild -notmatch "ValidateSet\('product','installer'\)" -or $TaskBuild -match 'LaunchChannel') {throw '构建职责尚未分离。'}
+Write-Host '正式入口、显式调试、构建职责参数检查通过。'
