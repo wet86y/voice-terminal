@@ -87,8 +87,12 @@ def request_shadow_action_definition() -> dict[str, Any]:
     return {
         "name": "request_shadow",
         "description": (
-            "让独立影子 Agent 在后台同步最新完整会话上下文并推进当前仍需处理的工作。"
-            "调用此动作不表示当前必须向用户说话；主语音状态仍需独立选择 wait、speak 或 cancel。"
+            "请求同一助手的后台执行环节读取最新完整会话上下文并执行用户要求。"
+            "实际操作、外部资料查询和所有定时任务的创建、查询、修改、取消必须调用本动作；"
+            "缺少参数也先请求后台，不因语音端工具少而拒绝。"
+            "后台正在工作时，新的操作、补充、修改、撤销或必要答复仍须调用。"
+            "只传固定请求标记，不传任务文本；调用此动作不表示当前必须向用户说话，也不表示任务已经完成；"
+            "语音状态仍按 speak（新播报）、revision（尾巴修订）、cancel（取消）或 wait（等待）规则选择。"
         ),
         "parameters": {
             "type": "object",
@@ -96,7 +100,7 @@ def request_shadow_action_definition() -> dict[str, Any]:
             "required": ["request"],
             "properties": {"request": {
                 "type": "boolean", "const": True,
-                "description": "必须为 true，表示请求后台影子代理继续处理。",
+                "description": "request（请求标记）：必须为 true（启用），请求同一助手的后台执行环节处理用户原话。",
             }},
         },
     }
