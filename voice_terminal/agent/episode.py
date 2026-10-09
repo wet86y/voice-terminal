@@ -712,6 +712,18 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             result.append(item)
         return result
 
+    def refresh_prompt_settings(self, documents, instructions) -> None:
+        """refresh_prompt_settings（显式刷新）：仅授权保存操作可更新固定指令前缀。"""
+        if (self.persona_documents.personality == documents.personality
+                and self.persona_documents.user == documents.user
+                and self.custom_instructions == instructions):
+            return
+        self.persona_documents = documents
+        self.custom_instructions = [dict(item) for item in instructions]
+        # 后续请求重新计算前缀摘要；已经派发的请求保留其独立消息副本。
+        # 历史前缀与动作目录的稳定性校验继续保留。
+        self.static_context_digest = None
+
     async def ensure_episode(self, *, turn_id=None, text=None, **payload):
         """Create the Episode/input association without scheduling a request.
 
@@ -729,9 +741,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         # the scheduler's only activation authority.
         if text is not None and not isinstance(text, str):
             return None
-        # Read the configured Markdown documents exactly once for this Agent
-        # episode. Subsequent requests use this immutable snapshot, so editing
-        # a file cannot invalidate the static prompt prefix mid-conversation.
+        # 首次激活加载文档；显式保存通过 refresh_prompt_settings（刷新提示设置）更新快照。
         self.persona_documents = (
             self.persona_loader.load()
             if self.persona_loader is not None

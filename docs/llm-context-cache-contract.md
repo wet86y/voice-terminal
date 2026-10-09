@@ -4,7 +4,7 @@
 
 ## 缓存原则
 
-- `STATIC_INSTRUCTIONS` 在 episode 内冻结；
+- `STATIC_INSTRUCTIONS`（固定指令）在 episode（会话）内保持稳定；用户显式保存人格、资料或自定义指令时更新后续请求快照并重新建立前缀摘要，已派发请求保留原副本；
 - `HISTORY` 只追加，不改写、不重排；
 - `REQUEST_TAIL` 只放当前请求动态信息；
 - 深度模式提示随本次冻结的 `reasoning.effort`（推理强度）放入 `REQUEST_TAIL`（请求尾部）；暂停后切换模式不修改 `STATIC_INSTRUCTIONS`（固定指令）或 `HISTORY`（语义历史）；
@@ -16,7 +16,7 @@
 
 | Lane | 可放内容 | 生命周期 | 禁止内容 |
 | --- | --- | --- | --- |
-| `STATIC_INSTRUCTIONS` | 固定协议、输出 schema 说明、动作目录、人格/用户文档快照、日期基准 | episode 内不变 | 秒级时间、播放状态、工具可用性、恢复反馈 |
+| `STATIC_INSTRUCTIONS`（固定指令） | 固定协议、输出 schema（结构）说明、动作目录、人格/用户文档快照、日期基准 | episode（会话）内稳定；用户设置显式保存后更新其快照 | 秒级时间、播放状态、工具可用性、恢复反馈 |
 | `HISTORY` | 最终用户输入、冻结 `voice_delivery`、有效 refinement、完成工具资料、有语义打断 | 只在末尾追加 | 未结算文本、运行时 ID、重排后的摘要 |
 | `REQUEST_TAIL` | 当前输入、时间、日期 epoch、活动 speak、工具状态、恢复反馈 | 当前请求有效 | 固定规则和未来要复用的事实 |
 

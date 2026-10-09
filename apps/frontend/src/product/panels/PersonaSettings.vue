@@ -12,7 +12,7 @@ const { saving, settings, activePersona, personaDocuments, customInstructions, s
     <nav class="persona-nav persona-nav-with-note" aria-label="人格文档">
       <button v-for="document in personaItems" :key="document.id" type="button" :class="{ active: activePersona === document.id }" :title="`${document.label} · ${document.owner}`" @click="activePersona = document.id"><strong>{{ document.label }}</strong><small>{{ document.owner }}</small></button>
     </nav>
-    <label class="document-editor"><span :title="currentDocument.path">{{ currentDocument.path }}（文档路径）</span><textarea v-model="personaDocuments[currentDocument.id]" :aria-label="`${currentDocument.label}文档内容`" spellcheck="false"></textarea><small>文档最多 64 KB；保存后在下一次会话生效。</small></label>
+    <label class="document-editor"><span :title="currentDocument.path">{{ currentDocument.path }}（文档路径）</span><textarea v-model="personaDocuments[currentDocument.id]" :aria-label="`${currentDocument.label}文档内容`" spellcheck="false"></textarea><small>文档最多 64 KB；保存后，当前会话的后续模型请求立即使用新内容。</small></label>
   </div>
   <footer><button class="save-button" type="button" :disabled="saving" @click="savePersona">{{ saving ? '正在保存…' : '保存人格与用户资料' }}</button></footer>
   <section class="preview-section instruction-section" aria-label="自定义指令">
@@ -21,7 +21,7 @@ const { saving, settings, activePersona, personaDocuments, customInstructions, s
     <div v-if="!customInstructions.length" class="pool-empty">还没有自定义指令。</div>
     <InstructionEditorRow v-for="item in customInstructions" :key="item.id" :row="item" :disabled="saving" removable @remove="removeInstruction(item.id)" />
     <p v-if="instructionFormError" class="instruction-error" role="alert">{{ instructionFormError }}</p>
-    <footer class="instruction-save-actions"><small class="instruction-hint">增删改与启停在保存后持久化，下一次会话或重置后生效。</small><button class="save-button" type="button" :disabled="saving" @click="saveInstructionSettings">{{ saving ? '正在保存…' : '保存自定义指令' }}</button></footer>
+    <footer class="instruction-save-actions"><small class="instruction-hint">增删改与启停在保存后持久化，当前会话的后续模型请求立即使用新内容。</small><button class="save-button" type="button" :disabled="saving" @click="saveInstructionSettings">{{ saving ? '正在保存…' : '保存自定义指令' }}</button></footer>
   </section>
   <label class="switch-row context-gate-row"><div><strong>实验性 Shadow 上下文门禁</strong><span>Shadow（影子代理）的侧载模型只判断运行中 DSH（代理执行宿主）的新引导应进入当前步骤还是下一回合；权威上下文仍完整同步。关闭后恢复直接注入。</span></div><input v-model="settings.shadow.experimental_context_gate_enabled" type="checkbox" role="switch" :disabled="saving" @change="saveShadowGate" /><i></i></label>
 </template>

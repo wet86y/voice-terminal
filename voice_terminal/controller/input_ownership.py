@@ -16,6 +16,33 @@ logger = logging.getLogger(__name__)
 
 
 class InputOwnershipMixin:
+    async def set_wake_settings(self, worker, settings) -> None:
+        """set_wake_settings（热更新唤醒）：保留正在处理的语句，关闭待机时交给识别。"""
+        previously_enabled = self.wake_always_on
+        if (not settings.enabled and self.state.listening and self.state.input_owner == "kws"):
+            self.state.input_owner = "none"
+            self._activation_generation += 1
+            await self._reset_owner_boundary()
+            self.state.input_owner = "asr"
+            self.state.set_service("asr", "RUNNING")
+        elif worker is not self.kws and self.state.input_owner == "kws":
+            # 旧检测结果在换入后不能再触发输入归属切换。
+            self._activation_generation += 1
+        self.kws = worker
+        self.wake_enabled = bool(settings.enabled)
+        self.wake_always_on = bool(settings.enabled)
+        self.state.wake_always_on = bool(settings.enabled)
+        self.wake_keyword = settings.keyword
+        self.wake_keywords = settings.keywords
+        episode = getattr(self, "episode", None)
+        if episode is not None:
+            episode.defer_silence_until_output = self.wake_always_on
+        # 开启关键词时保留正在进行的识别；空闲输入立即转入待机。
+        if (settings.enabled and not previously_enabled and self.state.listening and self.state.input_owner == "asr"
+                and self.workspace is None and not self._output_is_busy()
+                and getattr(episode, "user_speaking", False) is not True):
+            await self._return_to_kws(self._activation_generation)
+
     async def start_listening(self) -> None:
         # Analysis is optional and never becomes a mandatory start prerequisite.
         status = self.state.services.pop("analysis", "DISABLED")

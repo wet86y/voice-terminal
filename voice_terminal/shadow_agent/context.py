@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from .contracts import ShadowContextFrame, ShadowContextSnapshot, ShadowContextUpdate
+from ..custom_instructions import shadow_projection
 
 
 class ShadowContextProjector:
@@ -59,6 +60,26 @@ class ShadowContextProjector:
         commit = getattr(self.ledger, "commit_runtime_context", None)
         if callable(commit):
             commit("continuity_document", {"document": text})
+
+    def set_product_context(self, user_profile: str, instructions: list[dict]) -> None:
+        """set_product_context（设置上下文）：修改当前环境并向已连接后台发布修订。"""
+        profile = str(user_profile or "").strip()
+        rules = shadow_projection(instructions)
+        content = dict(self._environment.content)
+        if content.get("user_profile", "") == profile and content.get("custom_instructions", []) == rules:
+            return
+        content["user_profile"] = profile
+        if rules:
+            content["custom_instructions"] = rules
+        else:
+            content.pop("custom_instructions", None)
+        self._environment = ShadowContextFrame(
+            revision=0, origin="runtime", kind="session_environment", content=content,
+        )
+        self.ledger.commit_runtime_context("product_settings", {
+            "user_profile": profile,  # 用户资料：替换此前已保存资料。
+            "custom_instructions": rules,  # 自定义指令：完整列表，空列表表示清除。
+        })
 
     def environment_snapshot(self) -> dict[str, Any]:
         """environment_snapshot（固定会话环境）：随当前语音会话保存。"""

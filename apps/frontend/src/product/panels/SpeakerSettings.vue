@@ -11,6 +11,7 @@ const {
   speakerTestResult,
   speakerEnrollment,
   saveSpeaker,
+  saveSpeakerControls,
   startSpeakerEnrollment,
   commitSpeakerEnrollment,
   cancelSpeakerEnrollment,
@@ -69,7 +70,7 @@ async function toggleRecording() {
   <div class="settings-stack">
     <label class="form-field"
       ><span>运行模式</span
-      ><select v-model="speakerForm.mode">
+      ><select v-model="speakerForm.mode" :disabled="saving" @change="saveSpeakerControls">
         <option value="off">关闭</option>
         <option value="observe">仅标记</option>
         <option value="filter" :disabled="!speakerFilterAllowed">
@@ -87,19 +88,21 @@ async function toggleRecording() {
         v-model="speakerForm.owner_only_barge_in"
         type="checkbox"
         role="switch"
-        :disabled="!speakerHasProfile && !speakerForm.owner_only_barge_in"
+        :disabled="saving || (!speakerHasProfile && !speakerForm.owner_only_barge_in)"
+        @change="saveSpeakerControls"
       /><i aria-hidden="true"></i></label
     >
     <div
       v-if="speakerForm.owner_only_barge_in"
       class="speaker-barge-status"
       :class="{
-        effective: speakerStatus.owner_only_barge_in_effective === true,
+        effective: speakerStatus.owner_only_barge_in_ready === true || speakerStatus.owner_only_barge_in_effective === true,
       }"
     >
       <strong>{{
-        speakerStatus.owner_only_barge_in_effective === true
+        saving ? "正在应用主人打断设置…" : speakerStatus.owner_only_barge_in_effective === true
           ? "主人打断已生效"
+          : speakerStatus.owner_only_barge_in_ready === true ? "主人打断已启用"
           : "主人打断当前不可用"
       }}</strong
       ><small v-if="speakerStatus.owner_only_barge_in_effective !== true">{{
@@ -257,7 +260,7 @@ async function toggleRecording() {
       "
       @click="saveSpeaker"
     >
-      {{ saving ? "正在保存…" : "保存声纹设置" }}
+      {{ saving ? "正在保存…" : "保存声纹阈值" }}
     </button>
   </footer>
 </template>

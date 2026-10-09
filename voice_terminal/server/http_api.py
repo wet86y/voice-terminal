@@ -525,17 +525,26 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     async def get_tts_status() -> dict[str, Any]:
         return {"backend": "minimax", "worker": {"state": "stopped"}}
 
+    async def apply_saved_product_settings(store, label: str) -> dict[str, Any]:
+        """保存接口统一报告实际应用结果，加载期自动补应用而不等待对话。"""
+        applied = await runtime.apply_product_settings(store.settings_only())
+        loading = runtime.application_initializing
+        return {
+            "effective_from": "immediate" if applied else "components_ready" if loading else "retry_required",  # 生效时机。
+            "pending": not applied,  # 尚未应用：只在组件加载或应用失败时为真。
+            "message": (f"{label}已保存并立即生效。" if applied else
+                        f"{label}已保存，组件加载完成后自动生效。" if loading else
+                        f"{label}已保存，但即时应用失败，请检查组件状态后重新保存。"),
+        }
+
     @app.put("/api/v1/product/settings/wake")
     async def update_product_wake(body: dict[str, Any]) -> dict[str, Any]:
         try:
             store = product_store_or_404()
             value = await store.save_wake(body)
-            runtime.stage_product_settings(store.settings_only())
             return {
                 "settings": value,
-                "effective_from": "next_session",
-                "pending": True,
-                "message": "KWS 设置已保存，将在下一次会话生效。",
+                **await apply_saved_product_settings(store, "KWS（关键词唤醒）设置"),
             }
         except Exception as exc:
             product_error = exc
@@ -549,10 +558,11 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         try:
             store = product_store_or_404()
             if body.get("enabled") and not runtime.config.wake.enabled:
-                raise ProductSettingsError("KWS（关键词唤醒）尚未生效，请先开启下一次会话。")
+                raise ProductSettingsError("请先开启并保存 KWS（关键词唤醒）设置；组件加载完成后即可启用被动静默。")
             value = store.save_quiet_hours(body)
             await runtime.apply_quiet_hours(value["quiet_hours"])
-            runtime.stage_product_settings(store.settings_only())
+            if runtime._pending_product_settings is not None:
+                runtime.stage_product_settings(store.settings_only())
             return {"settings": value, "effective_from": "immediate", "pending": False,
                     "message": "被动静默时间已保存并即时生效。"}
         except Exception as exc:
@@ -566,12 +576,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         try:
             store = product_store_or_404()
             value = await store.save_silence(body)
-            runtime.stage_product_settings(store.settings_only())
             return {
                 "settings": value,
-                "effective_from": "next_episode",
-                "pending": True,
-                "message": "静默设置已保存，将在下一次 Episode 生效。",
+                **await apply_saved_product_settings(store, "静默设置"),
             }
         except Exception as exc:
             if isinstance(exc, HTTPException):
@@ -617,11 +624,12 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         try:
             store = product_store_or_404()
             value = await asyncio.to_thread(store.save_persona, body)
+            await runtime.refresh_prompt_settings()
             return {
                 "settings": {"persona": value.get("persona", {})},
-                "effective_from": "next_episode",
-                "pending": True,
-                "message": "Persona 已保存，将在下一次 Episode/会话生效。",
+                "effective_from": "next_request",
+                "pending": False,
+                "message": "人格与用户资料已保存，当前会话的后续模型请求立即使用新内容。",
             }
         except Exception as exc:
             if isinstance(exc, HTTPException):
@@ -636,11 +644,12 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 raise ProductSettingsError("请求字段必须是 custom_instructions（自定义指令列表）。")
             store = product_store_or_404()
             value = await asyncio.to_thread(store.save_custom_instructions, body["custom_instructions"])
+            await runtime.refresh_prompt_settings()
             return {
                 "settings": {"custom_instructions": value["custom_instructions"]},
-                "effective_from": "next_session",
-                "pending": True,
-                "message": "自定义指令已保存，将在下一次会话或重置后生效。",
+                "effective_from": "next_request",
+                "pending": False,
+                "message": "自定义指令已保存，当前会话的后续模型请求立即使用新内容。",
             }
         except Exception as exc:
             if isinstance(exc, HTTPException):
@@ -656,9 +665,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 if (body.get("mode") == "filter" or body.get("owner_only_barge_in") is True) and not runtime.speaker_profile.available:
                     raise HTTPException(status_code=422, detail="未注册主人声纹前不能启用拦截或主人打断")
                 value = await asyncio.to_thread(store.save_speaker, body)
-                runtime.stage_product_settings(store.settings_only())
-                return {"settings": {"speaker": value}, "effective_from": "next_session", "pending": True,
-                        "message": "声纹设置已保存，组件加载完成后的下一次会话生效。"}
+                return {"settings": {"speaker": value}, **await apply_saved_product_settings(store, "声纹设置")}
             previous_speaker = store.settings_only().get("speaker", {
                 "mode": "off",
                 "confirm_threshold": runtime.config.speaker.confirm_threshold,
@@ -672,7 +679,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     raise HTTPException(status_code=422, detail="声纹 Worker（工作进程）不可用，暂时不能启用拦截或主人打断")
             value = await asyncio.to_thread(store.save_speaker, body)
             try:
-                applied = await runtime.set_speaker_settings(value)
+                async with runtime._session_lock:
+                    applied = await runtime.set_speaker_settings(value)
+                    if runtime._pending_product_settings is not None:
+                        runtime.stage_product_settings(store.settings_only())
             except Exception:
                 # Runtime availability is part of the filter-mode contract;
                 # restore the previous persisted mode when live application

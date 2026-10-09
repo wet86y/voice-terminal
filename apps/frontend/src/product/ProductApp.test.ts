@@ -88,6 +88,73 @@ afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
+  it('主人打断开关直接保存，待机时显示已启用并保留未保存的阈值', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
+    allowBusinessReady(value)
+    vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({ available: true, templates: [] })
+    vi.spyOn(productApi, 'ambientContext').mockResolvedValue({})
+    vi.spyOn(productApi, 'speakerStatus').mockResolvedValue({ registered: true, owner_only_barge_in_selected: true, owner_only_barge_in_ready: true,
+      owner_only_barge_in_effective: false, owner_only_barge_in_reason: '已启用，等待播放期间验证回声保护' })
+    value.speakerForm.confirm_threshold = 0.85
+    const saved = { ...value.settings.speaker, owner_only_barge_in: true }
+    const save = vi.spyOn(productApi, 'saveSpeaker').mockResolvedValue({ settings: { speaker: saved } } as never)
+    await flushPromises()
+    await wrapper.get('input[role="switch"]').setValue(true)
+    await flushPromises()
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(save).toHaveBeenCalledWith(saved)
+    expect(value.settings.speaker.owner_only_barge_in).toBe(true)
+    expect(value.speakerForm.confirm_threshold).toBe(0.85)
+    expect(wrapper.get('.speaker-barge-status strong').text()).toBe('主人打断已启用')
+    expect(wrapper.get('.speaker-barge-status').text()).not.toContain('不可用')
+  })
+
+  it('主人打断自动保存失败恢复开关，并显示服务端原因', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
+    allowBusinessReady(value)
+    vi.spyOn(productApi, 'speakerProfile').mockResolvedValue({ available: true, templates: [] })
+    vi.spyOn(productApi, 'saveSpeaker').mockRejectedValue(new Error('声纹工作进程启动失败'))
+    await flushPromises()
+    await wrapper.get('input[role="switch"]').setValue(true)
+    await flushPromises()
+    expect(value.speakerForm.owner_only_barge_in).toBe(false)
+    expect(value.settings.speaker.owner_only_barge_in).toBe(false)
+    expect(value.lastError.value).toContain('声纹工作进程启动失败')
+    expect(wrapper.get('input[role="switch"]').element).toHaveProperty('checked', false)
+  })
+
+  it('声纹运行模式选择直接应用，无需再次点击页面底部保存', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
+    allowBusinessReady(value)
+    const save = vi.spyOn(productApi, 'saveSpeaker').mockResolvedValue({ settings: { speaker: { ...DEFAULT_SETTINGS.speaker, mode: 'observe' } } } as never)
+    await flushPromises()
+    await wrapper.get('select').setValue('observe')
+    await flushPromises()
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(save.mock.calls[0]![0]).toMatchObject({ mode: 'observe', owner_only_barge_in: false })
+    expect(value.settings.speaker.mode).toBe('observe')
+  })
+
+  it('保存开关前的迟到声纹状态不能覆盖保存后的就绪结果', async () => {
+    const { value } = liveAdapter()
+    allowBusinessReady(value)
+    await flushPromises()
+    const stale = deferred<Record<string, unknown>>()
+    vi.mocked(productApi.speakerStatus).mockReturnValueOnce(stale.promise)
+      .mockResolvedValue({ owner_only_barge_in_selected: true, owner_only_barge_in_ready: true })
+    const oldRefresh = value.refreshSpeaker()
+    vi.spyOn(productApi, 'saveSpeaker').mockResolvedValue({ settings: { speaker: { ...DEFAULT_SETTINGS.speaker, owner_only_barge_in: true } } } as never)
+    value.speakerForm.owner_only_barge_in = true
+    await value.saveSpeakerControls()
+    stale.resolve({ owner_only_barge_in_selected: false, owner_only_barge_in_ready: false })
+    await oldRefresh
+    expect(value.speakerStatus.value.owner_only_barge_in_ready).toBe(true)
+    expect(value.settings.speaker.owner_only_barge_in).toBe(true)
+  })
+
   it('加载页只展示当前组件，跳过后用一秒动画进入主页且继续等待完整启动', async () => {
     application.overlay.value = true
     application.snapshot.value = { state: 'starting', startup_complete: false, core_available: false,

@@ -26,8 +26,7 @@ class AgentDecisionScheduler:
     def __init__(self, options):
         self.options = options
         self.interval = max(0.001, float(options.scheduler_tick_ms) / 1000.0)
-        # Product settings can stage a different final-silence boundary for
-        # the next episode.
+        # final_silence_ms（最终静默时长）可由产品设置在当前会话中更新。
         self.FINAL_WINDOW = max(
             1,
             math.ceil(float(getattr(options, "final_silence_ms", 30000))
@@ -58,6 +57,19 @@ class AgentDecisionScheduler:
         # kinds still enter the same mailbox; the runtime filters
         # speech-activity-only entries before choosing a dispatch.
         return not (isinstance(_kind, str) and _kind.startswith("TTS_"))
+
+    def set_options(self, options, *, now=None) -> None:
+        """set_options（即时设置）：保留静默起点和单一心跳，重新计算到期边界。"""
+        if options == self.options:
+            return
+        self.options = options
+        self.FINAL_WINDOW = max(1, math.ceil(float(options.final_silence_ms) / (self.interval * 1000)))
+        if not self.armed or self.anchor_monotonic is None or self.final_dispatched:
+            return
+        now = time.monotonic() if now is None else float(now)
+        self.window_index = max(0, int(math.floor((max(0.0, now - self.anchor_monotonic) + 1e-9) / self.interval)))
+        self.final_pending = self.window_index >= self.FINAL_WINDOW
+        self.final_pending_since = now if self.final_pending else None
 
     def delay(self):
         if not self.last_tick:
