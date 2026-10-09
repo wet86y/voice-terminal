@@ -14,6 +14,8 @@
     "allow-desktop-manage",
     "allow-desktop-start-service",
     "allow-desktop-cancel-init",
+    "allow-model-credentials-status",
+    "allow-model-credentials-save",
     "allow-voice-environment-status",
     "allow-voice-environment-plan",
     "allow-voice-environment-configure",

@@ -638,6 +638,7 @@ class ProductSettingsStore:
             MAX_WAKE_KEYWORDS,
             canonical_labels,
             normalize_keyword_list,
+            validate_keywords_file,
         )
 
         # ``keywords`` (a list) is the current contract; ``keyword`` (a string)
@@ -670,8 +671,14 @@ class ProductSettingsStore:
             )
         except ValueError:
             previous_keywords = ()
-        changed_keyword = keywords != previous_keywords
-        if changed_keyword:
+        compile_required = keywords != previous_keywords
+        if payload["enabled"] and not compile_required:
+            # 首次启用、迁移或文件损坏时，即使唤醒词未改动也需重新生成。
+            try:
+                validate_keywords_file(self.config.kws_keywords_file, labels)
+            except (OSError, UnicodeError, ValueError):
+                compile_required = True
+        if compile_required:
             await asyncio.to_thread(self._compile_keyword, tuple(zip(keywords, labels)))
         self._settings["wake"] = {
             "enabled": payload["enabled"],
@@ -694,8 +701,12 @@ class ProductSettingsStore:
         labels = tuple(label for _keyword, label in entries)
         model_dir = self.config.kws_dir.resolve()
         target = self.config.kws_keywords_file.resolve()
-        allowed_root = (self.config.paths.cache / "kws" if self.config.paths and self.config.paths.separated else model_dir).resolve()
+        paths = self.config.paths
+        # KWS（关键词唤醒）生成文件随用户配置迁移，唯一受管目录由 AppPaths（路径契约）决定。
+        allowed_root = (paths.keywords.parent if paths and paths.separated else model_dir).resolve()
         try:
+            if paths and paths.separated:
+                allowed_root.relative_to(paths.data_root.resolve())
             target.relative_to(allowed_root)
         except ValueError as exc:
             raise ProductSettingsError("KWS（关键词唤醒）文件必须位于受管生成资源目录内。") from exc

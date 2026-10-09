@@ -8,6 +8,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <cstring>
+#include <chrono>
+#include <functional>
+#include <thread>
 
 using Progress = int (*)(void*, std::uint64_t, std::uint64_t); // Progress（进度回调）：非零表示取消。
 static std::string hash_file(const std::filesystem::path& path, bool sha512) {
@@ -33,6 +36,25 @@ static std::string hash_file(const std::filesystem::path& path, bool sha512) {
     std::ostringstream value; value << std::hex << std::setfill('0');
     for (auto byte : digest) value << std::setw(2) << static_cast<int>(byte);
     return value.str();
+}
+
+// promote_download（启用已校验下载）：短暂共享冲突可重试，失败保留断点与原缓存。
+static void promote_download(const std::filesystem::path& part, const std::filesystem::path& output,
+    const std::function<void()>& cancelled) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5); // deadline（文件占用重试上限）。
+    for (;;) {
+        cancelled();
+        // MOVEFILE_REPLACE_EXISTING（直接替换目标）避免先删除缓存再重命名的空档。
+        if (MoveFileExW(part.c_str(), output.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return;
+        const DWORD code = GetLastError(); // code（Windows 系统错误码，不包含可能乱码的文件路径）。
+        const bool retryable = code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION || code == ERROR_ACCESS_DENIED; // retryable（文件占用或短暂访问拒绝）。
+        if (!retryable)
+            throw std::runtime_error("下载文件启用失败（系统错误码：" + std::to_string(code) + "），下载断点已保留。");
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error(std::string(code == ERROR_ACCESS_DENIED ? "系统仍拒绝启用下载文件" : "下载文件仍被其他进程占用") +
+                "（系统错误码：" + std::to_string(code) + "），断点已保留，请稍后重试下载。");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
 extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t size,
@@ -102,10 +124,13 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
             if (!stream) throw std::runtime_error("下载文件写入失败"); offset += length; cancelled(offset);
         }
         stream.close();
+        if (!stream) throw std::runtime_error("下载暂存文件关闭失败，断点已保留。");
         if (offset != size || hash_file(part, sha512 != 0) != expected) {
             std::filesystem::remove(part); throw std::runtime_error("下载文件摘要不符");
         }
-        std::filesystem::remove(output); std::filesystem::rename(part, output); std::filesystem::remove(checkpoint);
+        promote_download(part, output, [&] { cancelled(size); });
+        // cleanup_error（断点清理错误）：已启用完整文件后，辅助记录占用不应使下载变成失败。
+        std::error_code cleanup_error; std::filesystem::remove(checkpoint, cleanup_error);
         return 0;
     } catch (const std::exception& exc) {
         if (error && error_size) { std::strncpy(error, exc.what(), error_size - 1); error[error_size - 1] = 0; }

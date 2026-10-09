@@ -85,9 +85,9 @@ persona:
   instructions_file: instructions.md
 
 audio:
-  input_device: "麦克风阵列 (适用于数字麦克风的英特尔® 智音技术)"
-  # Let Windows select the active default device. This avoids pinning an MME
-  # endpoint that may advertise support but fail when PortAudio opens it.
+  # input_device（麦克风）、output_device（扬声器）始终跟随系统默认设备。
+  # null（未指定设备）不绑定本机名称或设备编号；旧配置的指定值不再生效。
+  input_device: null
   output_device: null
   sample_rate: 16000
   channels: 1

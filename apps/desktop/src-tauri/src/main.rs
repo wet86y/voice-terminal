@@ -84,6 +84,15 @@ impl FrontendMode {
     }
 }
 
+/// frontend_capability（业务页面权限）：只授权当前实例的主窗口与实际页面来源。
+fn frontend_capability(mode: FrontendMode, normalized_origin: &str, epoch: u64) -> serde_json::Value {
+    if mode == FrontendMode::UiPreview {
+        serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
+    } else {
+        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","core:event:allow-listen","core:event:allow-unlisten"]})
+    }
+}
+
 struct Desktop {
     context: Mutex<Option<LaunchContext>>, // context（产品模式的业务启动上下文）；预览模式不读取。
     initialization:Mutex<serde_json::Value>, // initialization（启动画面状态）。
@@ -714,11 +723,7 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
                         }
                     };
                     let normalized_origin = entry.origin().ascii_serialization();
-                    let capability = if read_state.mode == FrontendMode::UiPreview {
-                        serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
-                    } else {
-                        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","core:event:allow-listen","core:event:allow-unlisten"]})
-                    };
+                    let capability = frontend_capability(read_state.mode, &normalized_origin, epoch);
                     if let Err(error) = read_app.add_capability(capability.to_string()) {
                         *read_state.error.lock().unwrap() =
                             Some(format!("页面权限配置失败：{error}"));
@@ -1033,13 +1038,45 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_allowed, console_url, frontend_entry_url, instance_identifier,
+        command_allowed, console_url, frontend_capability, frontend_entry_url, instance_identifier,
         preview_entry_url_allowed, preview_page_url_allowed, product_entry_url_allowed,
         product_page_url_allowed, request_service_start, require_command, ui_preview_context,
         valid_instance_id, valid_launch_token, DesktopCommand, FrontendMode,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tauri::webview::PageLoadEvent;
+
+    #[test]
+    fn startup_credentials_are_authorized_only_for_owned_local_windows() {
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let authority = context.runtime_authority_mut(); // authority（实际编译的桌面权限解析器）。
+        for command in ["model_credentials_status", "model_credentials_save"] {
+            for window in ["main", "startup"] {
+                assert!(authority.resolve_access(command, window, window, &tauri::ipc::Origin::Local).is_some(), "启动前密钥命令缺少权限：{command}");
+            }
+            assert!(authority.resolve_access(command, "foreign", "foreign", &tauri::ipc::Origin::Local).is_none());
+            let origin = tauri::ipc::Origin::Remote { url: tauri::Url::parse("http://127.0.0.1:45001/").unwrap() }; // origin（尚未授权的业务页面来源）。
+            assert!(authority.resolve_access(command, "main", "main", &origin).is_none());
+        }
+    }
+
+    #[test]
+    fn product_credentials_remain_scoped_to_current_origin_and_preview_cannot_use_them() {
+        for mode in [FrontendMode::Product, FrontendMode::UiPreview] {
+            let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+            let authority = context.runtime_authority_mut();
+            authority.add_capability(frontend_capability(mode, "http://127.0.0.1:45001", 7).to_string()).unwrap();
+            for command in ["model_credentials_status", "model_credentials_save"] {
+                let owned = tauri::ipc::Origin::Remote { url: tauri::Url::parse("http://127.0.0.1:45001/").unwrap() }; // owned（当前实例业务页面）。
+                assert_eq!(authority.resolve_access(command, "main", "main", &owned).is_some(), mode == FrontendMode::Product);
+                assert!(authority.resolve_access(command, "startup", "startup", &owned).is_none());
+                for address in ["http://127.0.0.1:45002/", "https://example.com/"] {
+                    let foreign = tauri::ipc::Origin::Remote { url: tauri::Url::parse(address).unwrap() }; // foreign（其他实例或外部页面）。
+                    assert!(authority.resolve_access(command, "main", "main", &foreign).is_none());
+                }
+            }
+        }
+    }
 
     #[test]
     fn services_start_only_once_after_the_final_main_window_page_loaded() {

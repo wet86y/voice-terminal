@@ -6,6 +6,8 @@ from voice_terminal.config import load_config
 from voice_terminal.distribution import manifest, verify, verify_install, migrate, unpack, digest, files, require_stopped
 from voice_terminal.paths import atomic_json
 from voice_terminal.kws.keywords import generate_keywords_for
+from voice_terminal.server.product import ProductSettingsError, ProductSettingsStore
+from dataclasses import replace
 from voice_terminal.application.desktop import DesktopControl
 import asyncio
 import io
@@ -128,6 +130,78 @@ def test_kws_alias_lexicon_and_generated_files_stay_in_data(tmp_path, monkeypatc
                           entries=[('hei claw', 'HEI_CLAW')])
     assert output.is_file() and observed and not observed[0].exists()
     assert {file.name: file.read_bytes() for file in model.iterdir()} == original
+
+
+@pytest.fixture
+def managed_kws(tmp_path, monkeypatch):
+    """managed_kws（受管唤醒词）：使用与正式安装相同的程序、模型、数据分离布局。"""
+    program = tmp_path / "中文 程序"
+    (program / "config").mkdir(parents=True)
+    (program / "config/default.yaml").write_text("wake:\n  keyword: 'hei claw'\n", encoding="utf-8")
+    monkeypatch.setenv("VOICE_PROGRAM_ROOT", str(program))
+    monkeypatch.setenv("VOICE_INSTALL_ROOT", str(tmp_path))
+    monkeypatch.setenv("VOICE_DATA_DIR", str(tmp_path / "用户 数据"))
+    monkeypatch.setenv("VOICE_MODEL_DIR", str(tmp_path / "models"))
+    paths = AppPaths.resolve()
+    paths.prepare()
+    config = load_config(paths.default_config)
+    config.kws_dir.mkdir(parents=True)
+    for name in ("tokens.txt", "encoder.onnx", "decoder.onnx", "joiner.onnx"):
+        (config.kws_dir / name).write_bytes(b"model fixture")
+    calls = []
+
+    def compile_tokens(*, raw_path, output_path, entries, **_kwargs):
+        assert output_path.resolve().is_relative_to(paths.keywords.parent.resolve())
+        calls.append(tuple(entries))
+        raw_path.write_text("".join(f"{keyword} @{label}\n" for keyword, label in entries), encoding="utf-8")
+        output_path.write_text("".join(f"phones @{label}\n" for _keyword, label in entries), encoding="utf-8")
+
+    monkeypatch.setattr("voice_terminal.kws.keywords.generate_keywords_for", compile_tokens)
+    store = ProductSettingsStore(path=paths.config / "product-settings.json", config=config)
+    return config, store, calls
+
+
+def test_product_wake_compiles_in_current_data_and_preserves_models(managed_kws):
+    config, store, calls = managed_kws
+    original_models = {p.name: p.read_bytes() for p in config.kws_dir.iterdir()}
+    saved = asyncio.run(store.save_wake({"enabled": True, "keywords": ["你好七三", "七三七三"], "sensitivity": 75}))
+    assert saved["wake"]["keywords"] == ["你好七三", "七三七三"]
+    assert calls == [(('你好七三', '你好七三'), ('七三七三', '七三七三'))]
+    assert config.kws_keywords_file == config.paths.keywords
+    assert "@你好七三" in config.paths.keywords.read_text("utf-8")
+    assert "七三七三" in config.paths.keywords.with_name("keywords_raw.txt").read_text("utf-8")
+    reloaded = ProductSettingsStore(path=store.path, config=config)
+    assert reloaded.effective_config().wake.keywords == ("你好七三", "七三七三")
+    assert {p.name: p.read_bytes() for p in config.kws_dir.iterdir()} == original_models
+    assert not list(config.paths.keywords.parent.glob(".product-kws-*"))
+
+
+@pytest.mark.parametrize("existing", [None, b"", b"phones @WRONG\n", b"\xff"])
+def test_enabling_unchanged_wake_repairs_missing_or_invalid_file(managed_kws, existing):
+    config, store, calls = managed_kws
+    if existing is not None:
+        config.paths.keywords.write_bytes(existing)
+    payload = {"enabled": True, "keywords": ["hei claw"], "sensitivity": 75}
+    asyncio.run(store.save_wake(payload))
+    assert calls == [(('hei claw', 'HEI_CLAW'),)]
+    assert "@HEI_CLAW" in config.paths.keywords.read_text("utf-8")
+    # 已有效的文件可继续复用，调节灵敏度不会重复生成。
+    asyncio.run(store.save_wake({**payload, "sensitivity": 70}))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("destination", ["outside", "cache", "models"])
+def test_product_wake_rejects_files_outside_managed_data(managed_kws, destination):
+    config, store, calls = managed_kws
+    directories = {"outside": config.paths.install_root / "other", "cache": config.paths.cache / "kws", "models": config.kws_dir}
+    target = directories[destination] / "keywords.txt"
+    invalid = replace(config, wake=replace(config.wake, keywords_file=target))
+    store = ProductSettingsStore(path=store.path, config=invalid)
+    before = store.settings_only()
+    with pytest.raises(ProductSettingsError, match="受管生成资源目录"):
+        asyncio.run(store.save_wake({"enabled": True, "keywords": ["你好七三"], "sensitivity": 75}))
+    assert not calls and not target.exists()
+    assert store.settings_only() == before
 
 
 @pytest.mark.parametrize('name', ['CON.txt', 'directory./file', 'path/../other', 'C:/absolute', 'path\\file'])

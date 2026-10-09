@@ -2,8 +2,10 @@
 # API keys belong in .env.local or the process environment.
 
 audio:
-  input_device: "麦克风阵列 (适用于数字麦克风的英特尔® 智音技术)"
-  output_device: "扬声器 (Realtek(R) Audio)"
+  # input_device（麦克风）、output_device（扬声器）由系统默认设备决定。
+  # null（未指定设备）不绑定机器；旧配置中的名称或编号会自动忽略。
+  input_device: null
+  output_device: null
   # AEC is enabled by default. When protection is unavailable raw VAD is
   # never allowed to cancel TTS.
   processing_enabled: true

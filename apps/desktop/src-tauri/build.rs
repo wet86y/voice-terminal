@@ -6,6 +6,8 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "desktop_initialize", "desktop_manage", "desktop_start_service", "desktop_cancel_init", "voice_environment_status", "voice_environment_plan", "resource_install_plan", "voice_environment_configure", "voice_environment_import", "gpu_environment_register", "gpu_environment_probe", "environment_guide",
             "desktop_status", "desktop_page_ready",
+            // model_credentials（模型接口凭据）：业务服务与组件未就绪时也要生成读写权限。
+            "model_credentials_status", "model_credentials_save",
             "skip_startup",
             "open_logs",
             "open_console",

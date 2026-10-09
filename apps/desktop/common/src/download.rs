@@ -66,6 +66,96 @@ mod tests {
     use super::*;
     use std::{fs, io::{Read, Write}, net::TcpListener};
     use sha2::{Digest, Sha256};
+    use std::{os::windows::fs::OpenOptionsExt, time::Duration};
+
+    /// download_with_temporary_lock（短暂占用下载夹具）：覆盖分片和已有缓存的共享冲突。
+    fn download_with_temporary_lock(lock_target: bool) { // lock_target（占用最终文件；否则占用下载分片）。
+        let body = b"verified dependency wheel";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];socket.read(&mut request).unwrap();
+            write!(socket, "HTTP/1.1 206 OK\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n", body.len(), body.len() - 1, body.len()).unwrap();
+            socket.write_all(body).unwrap();
+        });
+        let root = std::env::temp_dir().join(format!("voice-download-占用测试-{}", crate::workspace::new_id()));
+        fs::create_dir_all(&root).unwrap();let target = root.join("依赖 文件.whl");
+        fs::write(&target, b"old incomplete cache").unwrap();
+        let part = target.with_extension("whl.part"); // part（下载暂存文件）。
+        let checkpoint = target.with_extension("whl.part.identity"); // checkpoint（固定大小及摘要断点）。
+        let file = DownloadFile { url: format!("http://{address}/dependency.whl"), size: body.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "dependency.whl".into() };
+        let mut release = None; // release（模拟其他进程短暂占用后释放句柄）。
+        let result = download(&file, &target, Arc::new(AtomicBool::new(false)), &mut |done, _| {
+            if done == file.size && release.is_none() {
+                // share_mode（共享模式）允许读写，但禁止其他句柄删除或重命名。
+                let held = fs::OpenOptions::new().read(true).share_mode(3).open(if lock_target { &target } else { &part }).unwrap();
+                release = Some(std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(350));drop(held); }));
+            }
+        }, 0);
+        server.join().unwrap();release.unwrap().join().unwrap();
+        let installed = fs::read(&target).ok(); // installed（最终缓存内容）。
+        let clean = !part.exists() && !checkpoint.exists(); // clean（完成后断点已清理）。
+        fs::remove_dir_all(&root).unwrap();
+        assert!(result.is_ok(), "短暂文件占用不应中断依赖下载：{result:?}");
+        assert_eq!(installed.as_deref(), Some(body.as_slice()));assert!(clean);
+    }
+
+    #[test]
+    fn native_download_retries_temporary_file_locks_without_losing_verified_bytes() {
+        // 不同下载同时遇到文件占用，仍须各自完成校验、替换与断点清理。
+        std::thread::scope(|scope| {
+            for lock_target in [false, true] {
+                scope.spawn(move || download_with_temporary_lock(lock_target));
+            }
+        });
+    }
+
+    #[test]
+    fn native_download_cancels_locked_promotion_and_resumes_without_network() {
+        let body = b"completed dependency wheel";
+        let root = std::env::temp_dir().join(format!("voice-download-断点测试-{}", crate::workspace::new_id()));
+        fs::create_dir_all(&root).unwrap();let target = root.join("dependency.whl");
+        let part = target.with_extension("whl.part");let checkpoint = target.with_extension("whl.part.identity");
+        let file = DownloadFile { url: "http://127.0.0.1:1/dependency.whl".into(), size: body.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "dependency.whl".into() };
+        fs::write(&part, body).unwrap();fs::write(&checkpoint, format!("{}:sha256:{}", file.size, file.sha256)).unwrap();
+        fs::write(&target, b"keep previous cache").unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(3).open(&part).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));let mut samples = 0;
+        let result = download(&file, &target, cancel.clone(), &mut |_, _| {
+            samples += 1;if samples >= 3 { cancel.store(true, Ordering::Release); }
+        }, 0);
+        let preserved = fs::read(&part).unwrap() == body && checkpoint.exists() && fs::read(&target).ok().as_deref() == Some(b"keep previous cache".as_slice()); // preserved（取消后保留完整断点与旧缓存）。
+        drop(held);
+        let resumed = download(&file, &target, Arc::new(AtomicBool::new(false)), &mut |_, _| {}, 0);
+        let complete = fs::read(&target).unwrap() == body && !part.exists() && !checkpoint.exists();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(result.unwrap_err().contains("任务已取消"));assert!(preserved);
+        assert!(resumed.is_ok());assert!(complete);
+    }
+
+    #[test]
+    fn native_download_bounds_file_lock_wait_and_preserves_previous_cache() {
+        let body = b"verified replacement wheel";
+        let root = std::env::temp_dir().join(format!("voice-download-超时测试-{}", crate::workspace::new_id()));
+        fs::create_dir_all(&root).unwrap();let target = root.join("dependency.whl");
+        let part = target.with_extension("whl.part");let checkpoint = target.with_extension("whl.part.identity");
+        let file = DownloadFile { url: "http://127.0.0.1:1/dependency.whl".into(), size: body.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "dependency.whl".into() };
+        fs::write(&part, body).unwrap();fs::write(&checkpoint, format!("{}:sha256:{}", file.size, file.sha256)).unwrap();
+        fs::write(&target, b"keep previous cache").unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(3).open(&target).unwrap();
+        let started = std::time::Instant::now(); // started（文件占用等待的开始时间）。
+        let result = download(&file, &target, Arc::new(AtomicBool::new(false)), &mut |_, _| {}, 0);
+        let elapsed = started.elapsed(); // elapsed（实际等待时长，避免无限重试）。
+        let preserved = fs::read(&part).unwrap() == body && checkpoint.exists() && fs::read(&target).unwrap() == b"keep previous cache";
+        drop(held);fs::remove_dir_all(&root).unwrap();
+        // Windows（系统）对已存在的占用目标也可能返回访问拒绝，两种结果都要限时保留断点。
+        let error = result.unwrap_err();assert!(error.contains("下载文件仍被其他进程占用") || error.contains("系统仍拒绝启用下载文件"), "{error}");assert!(error.contains("断点已保留"));
+        assert!(elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(10));assert!(preserved);
+    }
 
     #[test]
     fn native_download_accepts_success_with_exact_range_and_rejects_wrong_range() {

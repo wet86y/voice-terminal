@@ -2697,21 +2697,6 @@ time {
 .speaker-segment-action {
   min-width: 96px;
 }
-.speaker-template-label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  color: var(--subtle);
-  font-size: var(--font-caption);
-}
-.speaker-template-label input {
-  width: 180px;
-  max-width: 100%;
-  height: var(--compact-control-height);
-  padding: 6px 10px;
-  font-size: var(--font-body);
-}
 .speaker-recording-flow > p {
   font-size: 10px;
   color: var(--muted);
@@ -2853,11 +2838,6 @@ time {
   }
   .speaker-flow-actions {
     width: 100%;
-  }
-  .speaker-template-label {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 4px;
   }
 }
 .speaker-test-result {

@@ -66,6 +66,46 @@ class ProductApiTests(unittest.TestCase):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             return await client.request(method, path, **kwargs)
 
+    def test_speaker_capture_commit_and_reload_keep_three_templates_without_raw_audio(self) -> None:
+        """声纹完整接口链路：替代硬件采样和推理，实际提交、存储并重新加载资料。"""
+        from types import SimpleNamespace
+        from voice_terminal.speaker.features import FRONTEND_VERSION
+        from voice_terminal.speaker.registry import SpeakerProfileStore
+
+        pcm = b"\x00\x10" * (16000 * 8)
+        fingerprint = {"frontend_version": FRONTEND_VERSION,
+                       "model_id": self.runtime.config.speaker.model_id, "embedding_dim": 3}
+
+        def captured_segment(**kwargs):
+            kwargs["control"].closed.set()
+            return SimpleNamespace(pcm=pcm, speech_ms=7200, duration_ms=8000,
+                                   rms_dbfs=-18.0, clipped_ratio=0.0, processed=False)
+
+        async def run():
+            start = await self._request("POST", "/api/v1/speaker/enrollment/start")
+            self.assertEqual(start.status_code, 200)
+            enrollment_id = start.json()["enrollment_id"]
+            for index in range(3):
+                recorded = await self._request("POST", f"/api/v1/speaker/enrollment/{enrollment_id}/capture", json={
+                    "index": index, "label": f"第 {index + 1} 段", "seconds": 8, "capture_id": f"capture-{index}",
+                })
+                self.assertEqual(recorded.status_code, 200, recorded.text)
+                self.assertEqual(recorded.json()["received"], index + 1)
+            committed = await self._request("POST", f"/api/v1/speaker/enrollment/{enrollment_id}/commit")
+            self.assertEqual(committed.status_code, 200, committed.text)
+            self.assertEqual(len(committed.json()["templates"]), 3)
+            self.assertNotIn(enrollment_id, self.runtime._speaker_enrollment)
+            reloaded = SpeakerProfileStore(self.runtime.speaker_profile.root, model_id=self.runtime.config.speaker.model_id)
+            reloaded.set_runtime_fingerprint(fingerprint, (1.0, 0.0, 0.0))
+            self.assertTrue(reloaded.available)
+            self.assertEqual({item.label for item in reloaded.templates.values()}, {"第 1 段", "第 2 段", "第 3 段"})
+            self.assertFalse(any(p.suffix in {".wav", ".pcm"} for p in reloaded.root.rglob("*")))
+
+        with patch("voice_terminal.server.speaker_runtime.capture_segment", captured_segment), \
+             patch.object(self.runtime, "_embed_speaker_audio", new=AsyncMock(return_value=(1.0, 0.0, 0.0))), \
+             patch.object(self.runtime, "_speaker_fingerprint", new=AsyncMock(return_value=(fingerprint, (1.0, 0.0, 0.0)))):
+            asyncio.run(run())
+
     def test_fixed_model_api_rejects_runtime_model_switching(self) -> None:
         original_config = self.runtime.config
         response = asyncio.run(self._request(
@@ -201,6 +241,9 @@ class ProductApiTests(unittest.TestCase):
         ))
         self.assertEqual(invalid_persona.status_code, 422)
 
+        keywords_file = self.runtime.config.kws_keywords_file
+        keywords_file.parent.mkdir(parents=True, exist_ok=True)
+        keywords_file.write_text("phones @HEI_CLAW\n", encoding="utf-8")
         valid_wake = asyncio.run(self._request(
             "PUT", "/api/v1/product/settings/wake",
             json={

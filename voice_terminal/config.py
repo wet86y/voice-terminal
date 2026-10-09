@@ -70,6 +70,7 @@ def _deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, 
 
 @dataclass(frozen=True)
 class AudioConfig:
+    # input_device（麦克风）、output_device（扬声器）：业务配置始终使用系统默认值。
     input_device: str | int | None = None
     output_device: str | int | None = None
     sample_rate: int = 16000
@@ -827,8 +828,10 @@ class AppConfig:
                 os.environ.get("VOICE_DEBUG_AUDIO_CAPTURE", "false").lower() == "true",
             ),
             audio=AudioConfig(
-                input_device=audio.get("input_device"),
-                output_device=audio.get("output_device"),
+                # 兼容旧 YAML（配置文件）的字段，但忽略设备名称和编号，
+                # 避免工作区迁移后绑定原机器；None（未指定）交由系统选择。
+                input_device=None,
+                output_device=None,
                 sample_rate=int(_number(audio.get("sample_rate"), 16000)),
                 channels=int(_number(audio.get("channels"), 1)),
                 sample_format=_string(audio.get("sample_format"), "int16"),

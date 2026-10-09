@@ -231,6 +231,9 @@ export function useProductControls() {
       (
         {
           READY: "运行中",
+          RUNNING: "运行中",
+          STREAMING: "运行中",
+          CONNECTED: "运行中",
           DEGRADED: "降级运行",
           ERROR: "运行异常",
           UNAVAILABLE: "无法连接",
@@ -935,7 +938,7 @@ export function useProductControls() {
   let speakerCapture: SpeakerCapture | null = null;
   let captureGeneration = 0; // captureGeneration（录音请求代次）：拒绝已取消请求的迟到设备授权。
   let controlsDisposed = false; // controlsDisposed（页面生命周期结束）：禁止卸载后启用采集。
-  let enrollmentStarting = false; // enrollmentStarting（注册请求未完成）：防止快速重复创建会话。
+  const enrollmentStarting = ref(false); // enrollmentStarting（录制请求未完成）：响应式解锁保存按钮，并防止快速重复创建会话。
   const speakerServiceLabel = computed(() => {
     if (speakerStatus.value.model_present === false) return "未安装";
     const profile = speakerStatus.value.profile;
@@ -1027,7 +1030,7 @@ export function useProductControls() {
     );
   });
   const speakerEnrollmentComplete = computed(
-    () => speakerEnrollment.value?.segments.length === 3 && speakerRecordingSegment.value === null && !speakerTestRecording.value && !enrollmentStarting,
+    () => speakerEnrollment.value?.segments.length === 3 && speakerRecordingSegment.value === null && !speakerTestRecording.value && !enrollmentStarting.value,
   );
   function speakerStateLabel(value: unknown) {
     const labels: Record<string, string> = {
@@ -1375,12 +1378,12 @@ export function useProductControls() {
       return;
     }
     if (
-      enrollmentStarting ||
+      enrollmentStarting.value ||
       speakerRecordingSegment.value !== null ||
       speakerTestRecording.value
     )
       return;
-    enrollmentStarting = true;
+    enrollmentStarting.value = true;
     try {
       if (!speakerEnrollment.value) await startSpeakerEnrollment();
       if (!speakerEnrollment.value || controlsDisposed) return;
@@ -1393,7 +1396,7 @@ export function useProductControls() {
       if (started === false)
         await openSpeakerCapture(index, label, "enrollment");
     } finally {
-      enrollmentStarting = false;
+      enrollmentStarting.value = false;
     }
   }
   async function beginSpeakerTest() {
@@ -1418,13 +1421,6 @@ export function useProductControls() {
   function speakerPrompt(index: number) {
     const prompts = speakerEnrollment.value?.prompts || [];
     return prompts[index] || "";
-  }
-  function speakerSegmentLabel(index: number, fallback: string) {
-    if (index !== 2 || typeof document === "undefined") return fallback;
-    const input = document.getElementById(
-      `speaker-label-${index}`,
-    ) as HTMLInputElement | null;
-    return input?.value?.trim() || "自定义";
   }
   async function stopSpeakerRecording() {
     if (speakerRecordingSeconds.value < 5) return;
@@ -1763,7 +1759,6 @@ export function useProductControls() {
     beginSpeakerRecording,
     beginSpeakerTest,
     speakerPrompt,
-    speakerSegmentLabel,
     stopSpeakerRecording,
     cancelActiveSpeakerCapture,
     workbenchModel,

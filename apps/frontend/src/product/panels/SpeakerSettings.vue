@@ -39,7 +39,6 @@ const {
   beginSpeakerRecording,
   beginSpeakerTest,
   speakerPrompt,
-  speakerSegmentLabel,
   stopSpeakerRecording,
   cancelActiveSpeakerCapture,
 } = useProductContext();
@@ -187,10 +186,9 @@ async function toggleRecording() {
           <div class="speaker-segment-copy">
             <div class="speaker-segment-heading"><strong>{{ segment }}</strong><span class="speaker-segment-state" role="status">{{ speakerRecordingSegment === index ? '录制中 · ' + speakerRecordingSeconds + ' 秒' : speakerEnrollment.segments.includes(index) ? '已完成' : '待录制' }}</span></div>
             <p v-if="speakerPrompt(index)" class="speaker-prompt">{{ speakerPrompt(index) }}</p>
-            <label v-if="index === 2" class="speaker-template-label"><span>模板标签</span><input :id="'speaker-label-' + index" type="text" value="自定义" aria-label="自定义模板标签" :disabled="speakerRecordingSegment !== null" /></label>
           </div>
           <button v-if="speakerRecordingSegment === index" class="outline-button speaker-compact-button speaker-segment-action speaker-stop-button" type="button" :disabled="speakerRecordingSeconds < 5" @click="stopSpeakerRecording">{{ speakerRecordingSeconds < 5 ? '录满 5 秒后可停止' : '停止录制' }}</button>
-          <button v-else class="outline-button speaker-compact-button speaker-segment-action" type="button" :disabled="speakerRecordingSegment !== null" @click="beginSpeakerRecording(index, speakerSegmentLabel(index, segment))">{{ speakerEnrollment.segments.includes(index) ? '重新录制' : '开始录制' }}</button>
+          <button v-else class="outline-button speaker-compact-button speaker-segment-action" type="button" :disabled="speakerRecordingSegment !== null" @click="beginSpeakerRecording(index, segment)">{{ speakerEnrollment.segments.includes(index) ? '重新录制' : '开始录制' }}</button>
         </div>
       </div>
       <template #actions><button class="outline-button speaker-compact-button" type="button" @click="cancelSpeakerEnrollment">取消录制</button><button class="save-button speaker-compact-button speaker-submit-button" type="button" :disabled="!speakerEnrollmentComplete || saving" @click="commitSpeakerEnrollment">保存声纹</button></template>
