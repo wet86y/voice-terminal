@@ -8,21 +8,13 @@ fn allowed(window:&WebviewWindow,desktop:&Desktop)->Result<(),String>{super::tru
 pub async fn resource_install_plan(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,manager:State<'_,Arc<ResourceManager>>,resource_id:String)->Result<Value,String>{
     allowed(&window,&desktop)?;let context=manager.context();
     tauri::async_runtime::spawn_blocking(move||{
+        if resource_id=="voice-server"{return Ok(json!({"resource_id":resource_id,"title":"Voice Server（语音服务）运行环境","model_bytes":0,"environment":runtime::plan(&context,"all")?,
+            "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型文件下载字节数","environment":"完整语音运行环境安装计划"}}));}
         let spec=resources::spec(&context,&resource_id)?;let artifact=&spec["source"]["transfer"]["artifact"];
         let model_bytes=artifact["size_bytes"].as_u64().unwrap_or_else(||spec["files"].as_array().into_iter().flatten().filter(|v|v["optional"]!=true&&!v["asset"].is_string()).map(|v|v["size_bytes"].as_u64().unwrap_or(0)).sum());
-        let mut environment=if resource_id=="dsh" {Value::Null}else{runtime::plan(&context,runtime::model_group(&resource_id))?};
-        if spec["source"]["transfer"]["kind"]=="modelscope_sdk" {
-            let sdk=runtime::plan(&context,"modelscope-download")?;
-            if sdk["already_ready"]!=true {
-                let rows=environment["wheels"].as_array_mut().ok_or("依赖安装计划无效")?;
-                for item in sdk["wheels"].as_array().ok_or("下载依赖计划无效")? {if !rows.iter().any(|row|row["name"]==item["name"]){rows.push(item.clone());}}
-                let size=rows.iter().map(|row|row["size"].as_u64().unwrap_or(0)).sum::<u64>()+environment["python"]["size"].as_u64().unwrap_or(0);
-                environment["total_bytes"]=json!(size);environment["already_ready"]=json!(false);
-                environment["additional_groups"]=json!(["modelscope-download"]);
-            }
-        }
+        let environment=if resource_id=="dsh" {Value::Null}else{runtime::plan(&context,"all")?};
         Ok(json!({"resource_id":resource_id,"title":spec["title"],"model_bytes":model_bytes,"environment":environment,
-            "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型或组件最大下载字节数","environment":"解释器及中央处理器依赖计划"}}))
+            "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型或组件最大下载字节数","environment":"完整语音运行环境安装计划"}}))
     }).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]
@@ -42,7 +34,7 @@ pub async fn voice_environment_status(window:WebviewWindow,desktop:State<'_,Arc<
 }
 #[tauri::command(rename_all="snake_case")]
 pub async fn voice_environment_plan(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,manager:State<'_,Arc<ResourceManager>>,group:String)->Result<Value,String>{
-    allowed(&window,&desktop)?;let context=manager.context();tauri::async_runtime::spawn_blocking(move||runtime::plan(&context,&group)).await.map_err(|e|e.to_string())?
+    allowed(&window,&desktop)?;let _=group;let context=manager.context();tauri::async_runtime::spawn_blocking(move||runtime::plan(&context,"all")).await.map_err(|e|e.to_string())?
 }
 #[tauri::command(rename_all="snake_case")]
 pub fn voice_environment_configure(window:WebviewWindow,desktop:State<Arc<Desktop>>,manager:State<Arc<ResourceManager>>,group:String)->Result<Value,String>{allowed(&window,&desktop)?;manager.inner().configure_runtime(group)}

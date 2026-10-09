@@ -204,6 +204,7 @@ impl ResourceManager {
 
     /// Download（下载）：run a fixed plan, retaining a stable task ID for resuming files.
     pub fn download(self: &Arc<Self>, resource_id: String) -> Result<Value, String> {
+        if resource_id=="voice-server"{return self.configure_runtime("all".into());}
         if !valid_resource_id(&resource_id) {
             return Err("资源编号格式无效。".into());
         }
@@ -220,6 +221,7 @@ impl ResourceManager {
 
     /// Import（导入）：open the native picker on a worker thread and install selected sources.
     pub fn import(self: &Arc<Self>, resource_id: Option<String>) -> Result<Value, String> {
+        if resource_id.as_deref()==Some("voice-server"){return self.import_runtime();}
         if let Some(id) = &resource_id {
             if !valid_resource_id(id) {
                 return Err("资源编号格式无效。".into());
@@ -239,6 +241,12 @@ impl ResourceManager {
 
     /// OpenSource（打开来源）：read only the locally pinned URL from the packaged catalog.
     pub fn open_source(&self, resource_id: &str) -> Result<(), String> {
+        if resource_id=="voice-server"{
+            #[cfg(windows)]
+            return voice_desktop_common::windows::open_url("https://www.python.org/downloads/release/python-31210/").map_err(|_|"无法打开 Python（后端解释器）官方来源。".into());
+            #[cfg(not(windows))]
+            return Err("打开资源来源仅支持 Windows（操作系统）。".into());
+        }
         if !valid_resource_id(resource_id) {
             return Err("资源编号格式无效。".into());
         }
@@ -336,16 +344,11 @@ impl ResourceManager {
             else{self.set_phase(job_id,phase,true,done,Some(total));}
         };
         if resource_id!="dsh" {
-            let group=voice_desktop_common::runtime::model_group(resource_id);
-            voice_desktop_common::runtime::configure(&self.context,group,cancel.clone(),&mut progress)
+            voice_desktop_common::runtime::configure(&self.context,"all",cancel.clone(),&mut progress)
                 .map_err(|message|JobError::Failed{message,installed:vec![]})?;
         }
         let spec=voice_desktop_common::resources::spec(&self.context,resource_id).map_err(|message|JobError::Failed{message,installed:vec![]})?;
         let result=if spec["source"]["transfer"]["kind"]=="modelscope_sdk" {
-            {
-                voice_desktop_common::runtime::configure(&self.context,"modelscope-download",cancel,&mut progress)
-                    .map_err(|message|JobError::Failed{message,installed:vec![]})?;
-            }
             // 工作进程只负责 SDK（平台开发库）下载；原生宿主负责验证与启用。
             let args=self.cli_args("download-modelscope",&["--resource-id".into(),resource_id.into(),"--task-id".into(),job_id.into(),"--download-only".into()]);
             let payload=self.run_stream_cli(Some(job_id),"manage-resources.py",&args,|phase,done,total|{self.set_phase(job_id,localized_phase(phase),true,done,Some(total));Ok(())})

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import subprocess
 import sys
 import zipfile
 
@@ -91,8 +92,24 @@ def install(wheels,site):
             records.append(path.name)
     return {'installed':records}
 
+def defender_injected_module(path):
+    """Defender module（系统防护注入模块）：核验固定系统位置和微软有效签名。"""
+    program_data=os.environ.get('ProgramData')
+    if not program_data or path.name.lower()!='mpoav.dll': return False
+    platform_root=(Path(program_data)/'Microsoft/Windows Defender/Platform').resolve()
+    if not path.is_relative_to(platform_root): return False
+    powershell_root=Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0'
+    script="Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -ErrorAction Stop; $signature=Get-AuthenticodeSignature -LiteralPath $env:VOICE_SYSTEM_MODULE_PATH; if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -match '^CN=Microsoft Windows, O=Microsoft Corporation(?:,|$)') { exit 0 }; exit 1"
+    try:
+        result=subprocess.run([str(powershell_root/'powershell.exe'),'-NoProfile','-NonInteractive','-Command',script],
+            env={**os.environ,'PSModulePath':str(powershell_root/'Modules'),'VOICE_SYSTEM_MODULE_PATH':str(path)},stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=20,
+            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        return result.returncode==0
+    except (OSError,subprocess.TimeoutExpired): return False
+
 def dynamic_library_closure():
-    """DLL closure（动态库闭包）：运行库只接受私有目录或 Windows（系统）目录。"""
+    """DLL closure（动态库闭包）：私有运行库、系统目录及已签名系统防护模块。"""
     if os.name!='nt': return
     import ctypes
     from ctypes import wintypes
@@ -108,9 +125,38 @@ def dynamic_library_closure():
         text=ctypes.create_unicode_buffer(32768)
         if not kernel.GetModuleFileNameW(module,text,len(text)):raise OSError('无法定位运行动态库')
         path=Path(text.value).resolve()
-        if not any(path.is_relative_to(root) for root in roots):raise ValueError('运行依赖仍引用私有环境之外的动态库：'+path.name)
+        if not any(path.is_relative_to(root) for root in roots) and not defender_injected_module(path):raise ValueError('运行依赖仍引用私有环境之外的动态库：'+path.name)
 
-def check(names, lock=None):
+def installed_version(name, lock=None, compatible_gpu=False):
+    """installed_version（已安装版本）：复用现用环境时接受项目已验证的显卡组合。"""
+    distribution=name
+    try:
+        version=metadata.version(name)
+    except metadata.PackageNotFoundError:
+        if name!='onnxruntime' or (lock and not compatible_gpu): raise
+        distribution='onnxruntime-gpu'
+        version=metadata.version(distribution)
+    if lock:
+        expected=next(item['version'] for item in lock['wheels'] if item['name']==name)
+        gpu_match=compatible_gpu and (
+            (name in {'torch','torchaudio'} and version==expected.replace('+cpu','+cu128')) or
+            (name=='onnxruntime' and distribution=='onnxruntime-gpu' and version=='1.24.4')
+        )
+        if (version!=expected or distribution!=name) and not gpu_match: raise ValueError('固定版本或兼容构建类型不匹配')
+    return version
+
+def inventory(names, lock, compatible_gpu=False):
+    """inventory（依赖复用清单）：只复用文件清单已验证环境中的兼容依赖。"""
+    reused=[]
+    rejected={}
+    for name in names:
+        try:
+            installed_version(name,lock,compatible_gpu)
+            reused.append(name)
+        except Exception as error: rejected[name]=str(error)[:300]
+    return {'reused':reused,'rejected':rejected}
+
+def check(names, lock=None, compatible_gpu=False):
     errors={}
     modules={'fastapi':'fastapi','pyyaml':'yaml','pydantic':'pydantic','numpy':'numpy','psutil':'psutil',
              'httpx':'httpx','uvicorn':'uvicorn','sounddevice':'sounddevice','soundfile':'soundfile',
@@ -118,14 +164,7 @@ def check(names, lock=None):
              'torch':'torch','torchaudio':'torchaudio','funasr':'funasr','onnxruntime':'onnxruntime','sherpa-onnx':'sherpa_onnx'}
     for name in names:
         try:
-            try:
-                version=metadata.version(name)
-                if lock:
-                    expected=next(item['version'] for item in lock['wheels'] if item['name']==name)
-                    if version!=expected: raise ValueError('固定版本或中央处理器构建类型不匹配')
-            except metadata.PackageNotFoundError:
-                if name == 'onnxruntime' and not lock: metadata.version('onnxruntime-gpu')
-                else: raise
+            installed_version(name,lock,compatible_gpu)
             if name in modules: importlib.import_module(modules[name])
         except Exception as error: errors[name]=f'{type(error).__name__}: {error}'[:300]
     if lock and not errors:
@@ -134,11 +173,13 @@ def check(names, lock=None):
     return {'ready':not errors,'errors':errors}
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['interpreter','reuse','install','check','gpu'])
+    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['interpreter','reuse','inventory','install','check','gpu'])
+    parser.add_argument('--compatible-gpu',action='store_true') # compatible_gpu（允许复用项目已验证的显卡组合）。
     parser.add_argument('--lock');parser.add_argument('--names',default='[]');parser.add_argument('--target');parser.add_argument('--wheels',default='[]');parser.add_argument('--model');parser.add_argument('--program');parser.add_argument('--install-root');args=parser.parse_args()
     names=json.loads(args.names)
     if args.operation=='interpreter': result=interpreter()
     elif args.operation=='reuse': result=reuse(json.loads(Path(args.lock).read_text('utf-8')),names,Path(args.target))
+    elif args.operation=='inventory': result=inventory(names,json.loads(Path(args.lock).read_text('utf-8')),args.compatible_gpu)
     elif args.operation=='install': result=install([Path(path) for path in json.loads(args.wheels)],Path(args.target))
     elif args.operation=='gpu':
         sys.path.insert(0,args.program)
@@ -151,7 +192,7 @@ def main():
             except Exception as error: result.update(gpu_available=False,reason=f'{type(error).__name__}: {error}'[:400])
         else:result.update(gpu_available=False,reason='共享工作进程所需依赖缺失：'+str(result['errors']))
         result.update(environment_fingerprint=fingerprint(Path(sys.executable).parent),models_fingerprint=fingerprint(root/'models'))
-    else: result=check(names,json.loads(Path(args.lock).read_text('utf-8')) if args.lock else None)
+    else: result=check(names,json.loads(Path(args.lock).read_text('utf-8')) if args.lock else None,args.compatible_gpu)
     emit({'ok':True,'result':result})
 
 if __name__=='__main__':
