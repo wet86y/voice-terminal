@@ -297,7 +297,7 @@ describe('正式界面的真实控件交互', () => {
       components: ['asr', 'analysis', 'voice', 'speaker', 'dsh', 'desktop', 'host', 'web', 'setup'].map(id => ({ id, name: id, state: 'ready', phase: '已就绪' })),
     } as unknown as ApplicationSnapshot
     await flushPromises()
-    expect(wrapper.find('.voice-environment').exists()).toBe(true)
+    expect(wrapper.find('.voice-environment').exists()).toBe(false)
     expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(8)
     expect(wrapper.findAll('[data-metric="memory"]')).toHaveLength(5)
     expect(wrapper.get('[data-component="paraformer"] [data-metric="memory"]').text()).toContain('100 MB / 1000 MB')
@@ -446,7 +446,7 @@ describe('正式界面的真实控件交互', () => {
       { id: 'host', name: '应用宿主', state: 'ready' },
     ] } as unknown as ApplicationSnapshot
     await flushPromises()
-    expect(wrapper.find('.voice-environment').exists()).toBe(true)
+    expect(wrapper.find('.voice-environment').exists()).toBe(false)
     expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(8)
     expect(wrapper.get('.local-overview .local-state').text()).toBe('组件启动中')
     // 模型启动状态与独立原生环境管理卡片的接口错误分别核对。

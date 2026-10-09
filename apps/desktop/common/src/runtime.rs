@@ -2,6 +2,8 @@
 use std::{fs, path::{Path,PathBuf}, process::{Command,Stdio}, sync::{Arc,atomic::AtomicBool}, time::{Duration,Instant}};
 use serde_json::{Value,json};
 use crate::{LaunchContext,download::{DownloadFile,download},resources::{self,Progress},workspace::{safe_path,atomic_json,file_hash,remove_owned}};
+// ENVIRONMENT_GROUPS（完整语音环境）：一次准备业务、全部本地模型及模型下载所需依赖。
+const ENVIRONMENT_GROUPS: [&str; 5] = ["voice-core", "torch-cpu", "onnx-cpu", "sherpa-cpu", "modelscope-download"];
 pub fn model_group(id:&str)->&'static str {match id {
     "paraformer-streaming"|"fsmn-vad"|"sensevoice-small"=>"torch-cpu",
     "kws-sherpa-onnx"=>"sherpa-cpu",_=>"onnx-cpu"
@@ -20,7 +22,8 @@ pub fn fingerprint(root:&Path)->Result<String,String>{
 }
 fn requested(lock:&Value,group:&str)->Result<Vec<String>,String>{
     let mut names=std::collections::BTreeSet::new();
-    for key in ["voice-core",group] {for name in lock["groups"][key].as_array().ok_or("未锁定的依赖组")?{names.insert(name.as_str().ok_or("依赖名称错误")?.to_string());}}
+    let groups=if group=="all" {ENVIRONMENT_GROUPS.to_vec()} else {vec!["voice-core",group]};
+    for key in groups {for name in lock["groups"][key].as_array().ok_or("未锁定的依赖组")?{names.insert(name.as_str().ok_or("依赖名称错误")?.to_string());}}
     Ok(names.into_iter().collect())
 }
 pub fn status(context:&LaunchContext)->Result<Value,String>{
@@ -28,7 +31,7 @@ pub fn status(context:&LaunchContext)->Result<Value,String>{
     let installed=context.python.is_file();let mut groups=serde_json::Map::new();
     let current=lock(context).ok();
     let legacy=record["schema"]==1&&record["profile"].is_string()&&record["python"]=="3.12.10";
-    for key in ["voice-core","torch-cpu","onnx-cpu","sherpa-cpu","modelscope-download"] {
+    for key in ENVIRONMENT_GROUPS {
         let digest=current.as_ref().and_then(|_|file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json")).ok());
         let legacy_files=match key {
             "voice-core"=>vec!["fastapi/__init__.py","psutil/__init__.py","yaml/__init__.py","sounddevice.py"],
@@ -40,8 +43,9 @@ pub fn status(context:&LaunchContext)->Result<Value,String>{
         let ready=installed&&(legacy_ready||(record["groups"].as_array().is_some_and(|g|g.iter().any(|v|v==key))&&record["lock_sha256"].as_str()==digest.as_deref()));
         groups.insert(key.into(),json!({"ready":ready,"reason":if ready{None}else{Some("解释器或固定依赖尚未配置")}}));
     }
-    Ok(json!({"interpreter_ready":installed,"service_ready":groups["voice-core"]["ready"],"python":context.python,"version":record["python"],"legacy_compatible":legacy,"groups":groups,
-        "fields":{"interpreter_ready":"私有解释器存在","service_ready":"基础语音依赖已验证","python":"私有解释器路径","version":"解释器版本","legacy_compatible":"兼容现用完整环境","groups":"共享依赖组","ready":"该组就绪","reason":"未就绪原因"}}))
+    let full_ready=ENVIRONMENT_GROUPS.iter().all(|key|groups[*key]["ready"]==true);
+    Ok(json!({"interpreter_ready":installed,"service_ready":groups["voice-core"]["ready"],"full_ready":full_ready,"python":context.python,"version":record["python"],"legacy_compatible":legacy,"groups":groups,
+        "fields":{"interpreter_ready":"私有解释器存在","service_ready":"基础语音依赖已验证","full_ready":"全部语音及下载依赖已就绪","python":"私有解释器路径","version":"解释器版本","legacy_compatible":"兼容现用完整环境","groups":"内部共享依赖组","ready":"该组就绪","reason":"未就绪原因"}}))
 }
 pub fn system_candidates()->Vec<PathBuf>{
     // qualification（隔离验收）允许检查纯下载路线，正式构建不接受此开关。
@@ -88,7 +92,7 @@ pub fn plan(context:&LaunchContext,group:&str)->Result<Value,String>{
         candidates.push(json!({"path":path,"accepted":result.as_ref().is_ok_and(|v|v["official"]==true),"result":result.unwrap_or_else(|e|json!({"reason":e}))}));
     }
     let wheels:Vec<_>=lock["wheels"].as_array().ok_or("缺少依赖锁")?.iter().filter(|v|names.iter().any(|n|v["name"]==*n)).cloned().collect();
-    Ok(json!({"group":group,"already_ready":state["groups"][group]["ready"],"python":lock["python"],"wheels":wheels,"system_candidates":candidates,
+    Ok(json!({"group":group,"already_ready":if group=="all"{state["full_ready"].clone()}else{state["groups"][group]["ready"].clone()},"python":lock["python"],"wheels":wheels,"system_candidates":candidates,
         "total_bytes":wheels.iter().map(|v|v["size"].as_u64().unwrap_or(0)).sum::<u64>()+lock["python"]["size"].as_u64().unwrap_or(0),
         "fields":{"group":"安装依赖组","already_ready":"完整匹配可跳过","system_candidates":"可复用的官方解释器候选","accepted":"筛选通过","wheels":"固定依赖包","total_bytes":"未扣除复用的最大下载大小"}}))
 }
@@ -102,16 +106,25 @@ fn copy_interpreter(source:&Path,target:&Path,cancel:&AtomicBool)->Result<(),Str
     }Ok(())
 }
 pub fn configure(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<Vec<String>,String>{
-    configure_inner(context,group,cancel,progress,true)
+    let _=group; // group（历史分组参数）仅保留接口兼容，配置始终检查完整环境。
+    configure_inner(context,"all",cancel,progress,true)
 }
 fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,allow_reuse:bool)->Result<Vec<String>,String>{
     resources::recover(context)?;let lock=lock(context)?;let mut requested=requested(&lock,group)?;
-    if status(context)?["groups"][group]["ready"]==true&&crate::workspace::verify_tree(&context.install.join("runtimes/python"),"manifest.json").is_ok(){return Ok(vec!["voice-server".into()]);}
+    let state=status(context)?;
+    let old=context.install.join("runtimes/python");
+    let existing=resources::load(&old.join("runtime.json")).unwrap_or(Value::Null);
+    let compatible_gpu=allow_reuse&&(state["legacy_compatible"]==true||existing["compatible_gpu"]==true);
+    let mut check_args=vec!["--names".into(),serde_json::to_string(&requested).unwrap(),"--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned()];
+    if compatible_gpu{check_args.push("--compatible-gpu".into());}
+    if allow_reuse&&state["full_ready"]==true&&crate::workspace::verify_tree(&old,"manifest.json").is_ok(){
+        progress("检测完整语音运行依赖",0,0);
+        if worker(context,&context.python,"check",&check_args,&cancel)?["ready"]==true{progress("复用已校验完整环境",1,1);return Ok(vec!["voice-server".into()]);}
+    }
     let stage=safe_path(&context.install,"tmp/voice-environment/stage")?;remove_owned(&stage,&context.install)?;fs::create_dir_all(&stage).map_err(|e|e.to_string())?;
     let site=stage.join("Lib/site-packages");fs::create_dir_all(&site).map_err(|e|e.to_string())?;
-    let old=context.install.join("runtimes/python");let mut groups=std::collections::BTreeSet::from(["voice-core".to_string(),group.to_string()]);
+    let mut groups:std::collections::BTreeSet<String>=ENVIRONMENT_GROUPS.iter().map(|key|(*key).to_string()).collect();
     let mut reused=vec![];let mut official=None;
-    let existing=resources::load(&old.join("runtime.json")).unwrap_or(Value::Null);
     if !allow_reuse {
         if let Some(values)=existing["groups"].as_array(){for value in values{if let Some(text)=value.as_str(){groups.insert(text.into());}}}
         for installed_group in &groups {requested.extend(self::requested(&lock,installed_group)?);}
@@ -119,10 +132,11 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
     }
     let maximum=lock["wheels"].as_array().ok_or("依赖锁无效")?.iter().filter(|item|requested.iter().any(|name|item["name"]==*name)).map(|item|item["size"].as_u64().unwrap_or(0)).sum::<u64>()+lock["python"]["size"].as_u64().unwrap_or(0);
     if crate::workspace::available_space(&context.install)?<maximum.saturating_mul(3){return Err("下载、展开和事务备份空间不足".into());}
-    if allow_reuse&&crate::workspace::verify_tree(&old,"manifest.json").is_ok()&&existing["lock_sha256"].as_str()==Some(&file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))?)&&context.python.is_file(){
+    if allow_reuse&&crate::workspace::verify_tree(&old,"manifest.json").is_ok()&&(state["legacy_compatible"]==true||existing["lock_sha256"].as_str()==Some(&file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))?))&&context.python.is_file(){
         progress("复用已校验私有环境",0,0);resources::copy_verified(&old,&stage,&cancel,progress)?;
         if let Some(values)=existing["groups"].as_array(){for value in values{if let Some(text)=value.as_str(){groups.insert(text.into());}}}
-        if let Some(values)=existing["packages"].as_array(){for value in values{if let Some(text)=value.as_str(){reused.push(text.to_owned());}}}
+        let inventory=worker(context,&stage.join("python.exe"),"inventory",&check_args,&cancel)?;
+        reused.extend(inventory["reused"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned));
     }else{
         for path in if allow_reuse{system_candidates()}else{vec![]}{if worker(context,&path,"interpreter",&[],&cancel).is_ok_and(|v|v["official"]==true){official=Some(path);break;}}
         if let Some(path)=&official{
@@ -156,8 +170,7 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
     }
     let args=vec!["--target".into(),site.to_string_lossy().into_owned(),"--wheels".into(),serde_json::to_string(&downloaded).unwrap()];
     progress("组装固定运行依赖",0,0);worker(context,&interpreter,"install",&args,&cancel)?;
-    let names_arg=vec!["--names".into(),serde_json::to_string(&requested).unwrap(),"--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned()];
-    let checked=worker(context,&interpreter,"check",&names_arg,&cancel)?;
+    let checked=worker(context,&interpreter,"check",&check_args,&cancel)?;
     if checked["ready"]!=true && !reused.is_empty(){
         // DLL（动态链接库）闭包或本机路径失败：自动从固定包重新组装，缓存继续复用。
         remove_owned(&stage,&context.install)?;
@@ -167,8 +180,8 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
     if checked["ready"]!=true{return Err(format!("运行依赖加载失败：{}",checked["errors"]));}
     resources::check_cancel(&cancel)?;
     let mut packages:std::collections::BTreeSet<String>=reused.into_iter().collect();packages.extend(requested);
-    atomic_json(&stage.join("runtime.json"),&json!({"schema":2,"python":"3.12.10","profile":"cpu-private","groups":groups,"packages":packages,"lock_sha256":file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))?,
-        "fields":{"schema":"运行环境记录格式","python":"解释器版本","profile":"中央处理器私有环境","groups":"已完成检查的共享依赖组","packages":"已安装依赖名称","lock_sha256":"固定运行依赖清单摘要"}}))?;
+    atomic_json(&stage.join("runtime.json"),&json!({"schema":2,"python":"3.12.10","profile":if compatible_gpu{"compatible-private"}else{"cpu-private"},"compatible_gpu":compatible_gpu,"groups":groups,"packages":packages,"lock_sha256":file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))?,
+        "fields":{"schema":"运行环境记录格式","python":"解释器版本","profile":"私有环境组合","compatible_gpu":"保留已安装的兼容显卡依赖","groups":"已完成检查的内部共享依赖组","packages":"已安装依赖名称","lock_sha256":"固定运行依赖清单摘要"}}))?;
     atomic_json(&stage.join("manifest.json"),&resources::manifest(&stage,"python",&crate::workspace::new_id())?)?;
     progress("启用私有语音环境",1,1);resources::check_cancel(&cancel)?;resources::activate(context,&stage,"runtimes/python")?;
     Ok(vec!["voice-server".into()])
@@ -179,16 +192,36 @@ pub fn import(context:&LaunchContext,source:&Path,cancel:Arc<AtomicBool>,progres
     crate::workspace::verify_tree(&candidate,"manifest.json")?;
     let identity=worker(context,&candidate.join("python.exe"),"interpreter",&[],&cancel)?;
     if identity["version"]!="3.12.10"||identity["official"]!=true{return Err("解释器版本或架构不匹配".into());}
-    let record=resources::load(&candidate.join("runtime.json"))?;
-    let mut names=requested(&lock(context)?,"voice-core")?;
-    let mut check_args=vec![];
+    let mut record=resources::load(&candidate.join("runtime.json"))?;
+    let mut names=requested(&lock(context)?,"all")?;
+    let mut check_args=vec!["--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned()];
+    if record["schema"]==1||record["compatible_gpu"]==true{check_args.push("--compatible-gpu".into());}
     if record["schema"]==2 {
         if record["lock_sha256"].as_str()!=Some(&file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))?){return Err("导入环境与当前固定依赖清单不匹配".into());}
         for group in record["groups"].as_array().ok_or("导入环境缺少已验证依赖组")?{names.extend(requested(&lock(context)?,group.as_str().ok_or("依赖组名称无效")?)?);}
         names.sort();names.dedup();
-        check_args.extend(["--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned()]);
     }
     check_args.extend(["--names".into(),serde_json::to_string(&names).unwrap()]);
-    if worker(context,&candidate.join("python.exe"),"check",&check_args,&cancel)?["ready"]!=true{return Err("导入环境基础依赖无法加载".into());}
+    if worker(context,&candidate.join("python.exe"),"check",&check_args,&cancel)?["ready"]!=true{return Err("导入环境的完整语音依赖无法加载".into());}
+    if record["schema"]==2{
+        record["groups"]=json!(ENVIRONMENT_GROUPS);
+        atomic_json(&candidate.join("runtime.json"),&record)?;
+        atomic_json(&candidate.join("manifest.json"),&resources::manifest(&candidate,"python",&crate::workspace::new_id())?)?;
+    }
     resources::check_cancel(&cancel)?;progress("启用导入的语音环境",1,1);resources::check_cancel(&cancel)?;resources::activate(context,&candidate,"runtimes/python")?;Ok(vec!["voice-server".into()])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_environment_includes_all_model_and_download_dependencies() {
+        let lock:Value=serde_json::from_str(include_str!("../../../../config/runtime/voice-runtime.lock.json")).unwrap();
+        let names=requested(&lock,"all").unwrap();
+        for name in ["fastapi","torch","torchaudio","funasr","onnxruntime","sherpa-onnx","modelscope"] {
+            assert!(names.iter().any(|item|item==name),"完整环境缺少 {name}（依赖）");
+        }
+        assert_eq!(names.len(),names.iter().collect::<std::collections::BTreeSet<_>>().len());
+    }
 }

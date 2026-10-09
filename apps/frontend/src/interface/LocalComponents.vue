@@ -9,6 +9,8 @@ const props = defineProps<{
   saving?: boolean
 }>()
 const visibleResources = computed(() => props.model.resources.filter(resource => resource.used !== undefined))
+// batchImportAvailable（批量导入入口）：仅在仍有组件安装内容缺失时展示。
+const batchImportAvailable = computed(() => props.model.resourceActionsAvailable && props.model.rows.some(needsResource))
 const emit = defineEmits<{
   /** refresh（刷新指标）与 retry（重试指定组件）。 */
   refresh: []
@@ -92,7 +94,7 @@ function invalidDevice(row: LocalComponentRow) {
     <p v-if="model.resourceEventError" class="local-error" role="status">{{ model.resourceEventError }}</p>
     <div class="local-list-heading local-managed-heading">
       <div><h3>模型与组件</h3><small>{{ model.rows.length }} 项；安装状态独立于语音服务健康状态</small></div>
-      <button v-if="model.resourceActionsAvailable" class="outline-button resource-batch-import" type="button" :disabled="model.resourceTasksBusy || model.resourceLoading" @click="emit('resourceImportAll')">{{ model.resourceTasksBusy ? '资源任务处理中…' : model.resourceBatchRetry ? '重试批量导入' : '批量导入资源包' }}</button>
+      <button v-if="batchImportAvailable" class="outline-button resource-batch-import" type="button" :disabled="model.resourceTasksBusy || model.resourceLoading" @click="emit('resourceImportAll')">{{ model.resourceTasksBusy ? '资源任务处理中…' : model.resourceBatchRetry ? '重试批量导入' : '批量导入资源包' }}</button>
     </div>
     <div v-if="model.resourceLoading && !model.rows.some(row => row.resource)" class="resource-empty" role="status">正在读取固定资源状态…</div>
     <div v-if="!model.rows.length" class="pool-empty">暂无本地组件信息。</div>

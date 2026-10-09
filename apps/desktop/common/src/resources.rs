@@ -59,7 +59,11 @@ fn validate_model_files(context:&LaunchContext,spec:&Value,source:&Path,fill_ass
 }
 pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
     let runtime=crate::runtime::status(context)?;let groups=runtime["groups"].clone();
-    let mut rows=vec![];
+    let ready=runtime["full_ready"]==true;
+    let mut rows=vec![json!({"resource_id":"voice-server","label":"Voice Server（语音服务）","installation_state":if ready{"installed"}else if runtime["interpreter_ready"]==true{"incomplete"}else{"missing"},
+        "files_installed":runtime["interpreter_ready"],"runtime_ready":ready,"can_start":ready,"runtime_group":"all","python":runtime["python"],"version":runtime["version"],
+        "source_url":"https://www.python.org/downloads/release/python-31210/","error":if ready{Value::Null}else{json!("请下载或导入完整 Python（后端运行环境），程序将一次检测并补齐全部语音依赖。")},
+        "fields":{"files_installed":"私有解释器已安装","runtime_ready":"全部语音依赖已就绪","can_start":"具备启动条件","runtime_group":"完整语音依赖","python":"私有解释器路径","version":"解释器版本"}})];
     for item in specs(context)? {
         let root=destination(context,&item)?;
         // 状态查询只检查大小，完整摘要在导入、安装及显卡检测时校验。

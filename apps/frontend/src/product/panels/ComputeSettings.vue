@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import VoiceEnvironmentPanel from "./VoiceEnvironmentPanel.vue";
 import ResourceInstallDialog from './ResourceInstallDialog.vue';
 import { computed, ref } from 'vue'
 import LocalComponents from '../../interface/LocalComponents.vue'
@@ -122,7 +121,8 @@ const rows = computed<LocalComponentRow[]>(() => {
     }
   })
   const system = systemComponents.value
-  if (system.length) {
+  const environment = props.resourceController?.resources.value.find(row => row.resource_id === 'voice-server')
+  if (system.length || environment) {
     const metrics = resources.value.get('voice-system')
     const failure = system.find(row => !row.retrying && !retrying.value.has(row.id) && ['failed', 'blocked', 'stopped'].includes(row.state))
     const busy = system.some(row => row.retrying || retrying.value.has(row.id))
@@ -130,15 +130,20 @@ const rows = computed<LocalComponentRow[]>(() => {
     const active = system.find(row => row.retrying || retrying.value.has(row.id) || ['waiting', 'starting', 'stopping'].includes(row.state))
     components.push({
       id: 'voice-system', name: 'Voice Server（语音服务）',
-      state: failure ? 'failed' : loading ? 'loading' : 'ready',
-      status: failure ? '部分不可用' : loading ? '启动中' : '运行中',
-      available: !failure && !loading, retryable: !loading && system.some(row => row.retry_allowed), busy: loading && !failure,
+      state: failure ? 'failed' : loading ? 'loading' : !system.length && !environment?.can_start ? 'disabled' : 'ready',
+      status: failure ? '部分不可用' : loading ? '启动中' : system.length ? '运行中' : environment?.can_start ? '已配置' : '待配置',
+      available: !failure && !loading && Boolean(system.length || environment?.can_start), retryable: !loading && system.some(row => row.retry_allowed), busy: loading && !failure,
       runtime: '本地系统服务', location: '本机',
       residentMemory: formatComponentMemory(metrics?.memory_rss_bytes), privateMemory: formatComponentMemory(metrics?.memory_private_commit_bytes),
       vram: metrics?.gpu_dedicated_bytes != null && metrics.gpu_dedicated_bytes > 0 ? formatComponentMemory(metrics.gpu_dedicated_bytes) : undefined,
       description: loading && !failure ? active && retrying.value.has(active.id) && !active.retrying ? '正在重新启动组件' : active?.phase || '等待系统服务启动' : '统一管理桌面窗口、界面服务、应用宿主、环境检查与语音服务。',
       error: failure ? `${failure.name}：${failure.error || failure.phase}` : undefined,
-      facts: system.map(row => ({ label: row.name, value: ['ready', 'external'].includes(row.state) ? row.id === 'setup' ? '已通过' : '运行中' : row.phase })),
+      resource: managedResource('voice-server'),
+      facts: [
+        ...(environment?.python ? [{ label: 'Python（后端解释器）', value: environment.python }] : []),
+        ...(environment?.version ? [{ label: '解释器版本', value: environment.version }] : []),
+        ...system.map(row => ({ label: row.name, value: ['ready', 'external'].includes(row.state) ? row.id === 'setup' ? '已通过' : '运行中' : row.phase })),
+      ],
       note: '包含系统进程及其子进程；模型工作进程和代理执行宿主单独计量，共享进程只计一次。',
     })
   }
@@ -212,7 +217,6 @@ function openResourceSource(id: string) { void props.resourceController?.openRes
 function cancelResource(id: string) { void props.resourceController?.cancelJob(id) }
 </script>
 <template>
-  <VoiceEnvironmentPanel />
   <ResourceInstallDialog v-if="resourceController" :controller="resourceController" />
   <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" />
 </template>

@@ -24,6 +24,9 @@ export interface ResourceStatus {
   can_start?: boolean
   /** runtime_group（所需共享依赖组）。 */
   runtime_group?: string
+  /** python（私有解释器路径）与 version（解释器版本），仅语音环境资源提供。 */
+  python?: string
+  version?: string | null
   /** resource_id（固定资源标识）与 label（界面名称）。 */
   resource_id: string
   label: string
