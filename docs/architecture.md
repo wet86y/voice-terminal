@@ -38,7 +38,7 @@ flowchart TD
                                       └─> Speech transaction ──> TTS / Player
 
 SessionLedger ──> LLMContextProjector ──> 主 LLM 请求
-             └─> ShadowContextProjector ──> 单一 ShadowRuntime ──> READ_ONLY tools
+             └─> ShadowContextProjector ──> 单一 ShadowRuntime ──> 当前后端已授予的工具
                                                                      ├─ Product UI
                                                                      └─ 主 LLM 400ms mailbox
 ```
@@ -51,7 +51,7 @@ SessionLedger ──> LLMContextProjector ──> 主 LLM 请求
 - `AgentEpisodeRuntime`：拥有唯一活动 LLM 请求和调度循环；确定性时钟、提示文本和流式语音准入由内部协作模块实现。
 - `EpisodeSpeechOutput`：维护 speak transaction、发送前沿、TTS 分段、播放和 delivery 结算。
 - `SessionLedger`：记录用户输入、已传达 assistant 文本、有效 refinement、工具结果和有语义影响的打断。
-- `ShadowRuntime`：每个 session 一个，异步执行只读工具和状态观察，不拥有语音控制权；DSH 根代理仅有提前静默请求这一受限例外。
+- `ShadowRuntime`（后台运行实例）：每个 session（会话）一个，与语音交互共同构成同一助手；异步执行当前后端已授予的工具和状态观察。原生业务工具保持只读，DSH（后台执行宿主）使用实际执行环境权限；后台不拥有语音控制权，DSH 根执行环节仅有提前静默请求这一受限例外。
 
 ## 不可破坏的不变量
 
@@ -109,7 +109,7 @@ committed_prefix + current_clause + prefetched_clause + revisable_tail
 ### Shadow 平面
 
 - 每个 session 只有一个 `ShadowRuntime`、一个活动 runner 和一份私有 committed trace。
-- Shadow 读取 `ShadowContextProjector` 的权威语义帧；文件与网络工具为 `READ_ONLY`（只读），DSH 根代理另可在明确授权时请求提前静默。
+- Shadow（后台执行环节）读取 `ShadowContextProjector`（后台上下文投影器）的权威语义帧；原生文件与网络工具为 `READ_ONLY`（只读），DSH（后台执行宿主）按执行环境实际权限处理用户操作、查询和定时请求，根执行环节另可在明确授权时请求提前静默。
 - `progress`（影子进度）更新产品投影，并把实质变化按当前 `activation_id`（激活标识）和
   `source`（来源：`agent` 根代理、`observer` 状态观察器）合并进入二等信箱；各有效来源只保留最新状态。
   相同正文及仅格式空白变化不反复登记。工具生命周期仍只更新产品投影。status observer（状态观察器）与根 Agent

@@ -121,6 +121,26 @@ node scripts/dsh-diagnose/upgrade-smoke.mjs
 
 安装复用生产宿主，仅同步受管插件，保留用户补丁和官方任务选择。程序与环境升级通过覆盖发布事务换入，短期旧组件在验证成功后删除；重要数据只保留一份滚动备份。
 
+## 一体化助手提示词
+
+语音交互链路与 DSH（后台执行宿主）共同呈现同一 Voice Terminal（语音终端）助手。主语音模型的身份和动作路由写在
+`voice_terminal/agent/prompts.py`（语音系统提示词）；共享后台规则写在
+`config/shadow_agent/instructions.md`（公共后台提示词），DSH 专属规则写在
+`config/dsh/shadow-agent.rules.md`（后台任务提示词）。
+`preset/shadow-agent/agent.cordis.yml`（后台代理预设）中的身份说明须保持一致；不得恢复“独立影子助手”或要求用户改向另一端下达任务。
+
+实际操作、外部查询和所有定时请求由语音动作 `request_shadow`（请求后台执行）进入后台，
+只发送固定参数 `request`（请求标记）。语音会话创建、查询、修改和取消提醒时使用项目
+`wake_task_*`（语音链路任务工具），仅当用户明确要求提醒只留在 DSH 会话时使用官方
+`schedule_*`（后台会话任务工具）。使用现有回执确认任务状态；任务到期需要提醒用户时，
+由 `publish_voice_event`（投递语音事件）发送回语音链路。不得重复创建任务或用等待、口头答应代替任务操作。
+
+公共提示词与 DSH 专属规则由构建脚本按这个顺序生成唯一受管提示词：
+`config/shadow_agent/instructions.md`（公共规则）后接 `config/dsh/shadow-agent.rules.md`（DSH 规则）。
+保持 `shadow_prompt_sha256`（后台提示词摘要）纳入构建状态核验；只修改源码规则后必须重建插件、
+运行 DSH（后台执行宿主）验证并安装，再按项目维护流程重启 Voice Server（语音服务）和 DSH（后台执行宿主）。
+通过这些步骤后新会话使用新提示词；已经开始的语音会话继续使用它原有的冻结提示词。
+
 `build-state.json`（构建记录）格式更新为 `schema_version: 6`（格式版本），记录 `plugin_bundle_version`（统一插件版本）、`plugin_runtime_artifacts_sha256`（运行产物摘要）、`plugin_build_inputs_sha256`（构建输入摘要）、`shadow_prompt_sha256`（提示词摘要）及宿主身份。源码新鲜度检查覆盖全部组件源码、预设、清单、声明、构建和检查脚本、宿主补丁及两套类型配置；运行摘要覆盖包清单、生成补丁、组件声明和完整编译目录，包括源码映射。文档与测试不参与运行新鲜度判断。
 
 公共提示词仍由 `config/shadow_agent/instructions.md`（公共指令）与 `config/dsh/shadow-agent.rules.md`（DSH 专属规则）按原顺序连接生成，不维护另一份手写运行提示词。新增运行文件必须进入编译目录或显式加入构建输入和运行摘要；PowerShell（安装脚本）、Python（运行校验）及 Node.js（诊断脚本）三处摘要算法必须一致。
