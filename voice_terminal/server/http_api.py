@@ -11,6 +11,7 @@ from typing import Any, Mapping
 from urllib.parse import quote
 from uuid import uuid4
 
+from .. import __version__  # __version__（后端源码版本）：接口元数据与发布记录共用。
 from ..core.events import VoiceEvent, event
 from ..dsh import BRIDGE_PROTOCOL_VERSION, DshBridgeError, DshShadowAgentSession
 from ..application.ports import validate_endpoint_url
@@ -57,7 +58,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     if FastAPI is None:
         raise RuntimeError("缺少 fastapi，请先运行 scripts\\setup.ps1。")
 
-    app = FastAPI(title="Voice Terminal Server", version="0.8.0", lifespan=lifespan)
+    app = FastAPI(title="Voice Terminal Server", version=__version__, lifespan=lifespan)
     configured_origins = [
         item.strip() for item in os.environ.get("VOICE_WEB_ORIGINS", "").split(",")
         if item.strip() and item.strip() != "*"

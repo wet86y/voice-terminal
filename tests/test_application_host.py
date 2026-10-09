@@ -236,7 +236,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 403)
         request = urllib.request.Request(self.web.origin + "/internal/application/report", b"{}",
             {"Content-Type": "application/json", "Authorization": "Bearer " + self.app.internal_token})
-        with patch.object(self.app, "report") as report:
+        with patch.object(self.app, "report", return_value=True) as report:
             with self.client.open(request) as response:
                 self.assertEqual(json.load(response), {"ok": True})
             report.assert_called_once_with({})
@@ -257,7 +257,8 @@ class FrontendReadinessTests(unittest.TestCase):
     def test_other_listener_fails_before_sending_session_cookie(self):
         owner = Mock()
         owner.create_time.return_value = 100.0
-        owner.net_connections.return_value = []
+        # 受管进程报告实际监听端口后，系统监听表中的不同所有者必须被拒绝。
+        owner.net_connections.return_value = [self.listener(123)]
         with patch("psutil.Process", return_value=owner), \
                 patch("psutil.net_connections", return_value=[self.listener(456)]), \
                 patch("urllib.request.urlopen") as urlopen:

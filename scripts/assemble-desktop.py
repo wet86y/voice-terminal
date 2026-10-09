@@ -16,6 +16,7 @@ import zipfile
 
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 sys.path.insert(0, str(ROOT))
+from voice_terminal import __version__  # __version__（源码版本）：避免发布清单显示旧版本。
 from voice_terminal.distribution import digest, files, manifest, require_stopped, safe_path, verify, verify_install
 from voice_terminal.dsh.profile import build_profile
 from voice_terminal.dsh.official import OFFICIAL_SOURCE_KIND, load_official_artifact, validate_official_runtime
@@ -331,8 +332,8 @@ def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime=None, p
                 components.append({'kind': kind, 'path': relative, 'build': record['build'], 'manifest_sha256': digest(effective / 'manifest.json')})
             roots = root_files(candidate, desktop)
             release = manifest(program, kind='app', build=build)
-            release.update(display_version='0.8.0', compatibility={'desktop_protocol': 1, 'data_format': 1}, components=components, root_files=roots,
-                           fields={'build': '构建编号，仅作记录', 'components': '固定组件清单', 'root_files': '根启动入口摘要'})
+            release.update(display_version=__version__, compatibility={'desktop_protocol': 1, 'data_format': 1}, components=components, root_files=roots,
+                           fields={'build': '构建编号，仅作记录', 'display_version': '与源码一致的程序显示版本', 'components': '固定组件清单', 'root_files': '根启动入口摘要'})
             atomic_json(program / 'release.json', release)
             atomic_json(candidate / 'portable.json', default_portable())
             verify(program, release)

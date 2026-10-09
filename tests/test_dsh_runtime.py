@@ -29,13 +29,16 @@ class DshConfigTests(unittest.TestCase):
             self.assertNotEqual(config.dsh.source_dir, (root / '../outside').resolve())
             self.assertEqual(config.dsh.source_dir.name, 'dsh')
 
-    def test_host_and_profile_are_fixed(self) -> None:
+    def test_host_and_profile_are_fixed_and_port_supports_dynamic_assignment(self) -> None:
         with self.assertRaisesRegex(ValueError, "host"):
             DshConfig(host="0.0.0.0")
         with self.assertRaisesRegex(ValueError, "profile"):
             DshConfig(profile="sdk")
-        with self.assertRaisesRegex(ValueError, "port"):
-            DshConfig(port=3080)
+        self.assertEqual(DshConfig().port, 0)
+        self.assertEqual(DshConfig(port=3080).port, 3080)
+        for port in (-1, 65536, True):
+            with self.subTest(port=port), self.assertRaisesRegex(ValueError, "端口"):
+                DshConfig(port=port)
 
 
 class DshRuntimeTests(unittest.TestCase):
@@ -241,7 +244,8 @@ class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
             def _port_in_use(self):
                 return True
 
-        manager = OccupiedPortManager(DshConfig())
+        # 显式指定端口才执行既有占用拒绝路径；默认 0（系统分配）不附着首选端口。
+        manager = OccupiedPortManager(DshConfig(port=3080))
         await manager.start()
         self.assertEqual(manager.status().state, "unavailable")
         self.assertIn("未知进程", manager.status().message)

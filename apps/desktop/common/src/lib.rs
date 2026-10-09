@@ -973,6 +973,7 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    #[cfg(not(feature = "distribution"))] // development（开发渠道）：允许项目根目录参数。
     #[test]
     fn development_uses_project_data_and_rejects_external_override() {
         let root = std::env::temp_dir().join(format!("voice-source-data-{}", std::process::id()));
@@ -1056,6 +1057,7 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    #[cfg(not(feature = "distribution"))] // development（开发渠道）：检查项目安装定位。
     #[test]
     fn missing_formal_installation_never_creates_an_isolated_product() {
         let root = std::env::temp_dir().join(format!("voice-no-install-{}", std::process::id()));
@@ -1066,6 +1068,15 @@ mod tests {
         assert!(error.contains("项目根目录"));
         assert!(!root.join(".local").exists());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(feature = "distribution")] // distribution（分发渠道）：拒绝开发路径与调试参数。
+    #[test]
+    fn distribution_rejects_development_paths_before_workspace_resolution() {
+        for argument in ["--root", "--install", "--data-dir", "--python", "--models", "--webview2", "--dev", "--diagnostic", "--ui-preview"] {
+            let error = LaunchContext::from_argument_list(&[argument.into()]).unwrap_err();
+            assert!(error.contains("分发版本不接受开发路径或调试启动参数"), "{argument}: {error}");
+        }
     }
     #[test]
     fn rejects_escape_and_absolute_components() {
