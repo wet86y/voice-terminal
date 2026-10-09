@@ -164,7 +164,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self.tools_enabled = tools_enabled
         if reasoning_mode not in {"fast", "deep"}:
             raise ValueError("reasoning_mode（运行模式）必须是 fast（快速）或 deep（深度）")
-        self.reasoning_mode = reasoning_mode  # reasoning_mode（运行模式）：本轮冻结的快速或深度选择。
+        self.reasoning_mode = reasoning_mode  # reasoning_mode（运行模式）：后续请求使用的快速或深度选择。
         self.conversation = conversation
         self.ledger = ledger
         self.shadow_waker = shadow_waker
@@ -2063,6 +2063,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             system_check_id = dispatch_context["system_check_id"]
             source_turn_id = dispatch_context["speech_turn_id"]
             self._system_check_turn_ids.add(system_check_id)
+        # reasoning_effort（推理强度）：冻结本次请求参数，后续模式切换不修改本次派发。
         reasoning_effort = "low" if self.reasoning_mode == "deep" else "none"
         if prompt_kind == "kws_wake":
             reasoning_effort = "none"
@@ -3081,6 +3082,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             current_turn_id=source_turn_id,
             shadow_information=shadow_information,
             secondary_context=secondary_context,
+            reasoning_effort=reasoning_effort,
         )
         request_speak_snapshot = dict(self._last_model_speak_snapshot)
         request_speak_context = dict(self._last_model_speak_state)

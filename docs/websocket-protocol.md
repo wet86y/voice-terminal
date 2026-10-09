@@ -40,7 +40,7 @@ ws://127.0.0.1:8765/ws
 | `session.start` | 对象，可为空 | 启动输入作用域；KWS 开启时先进入 KWS standby。 |
 | `session.stop` | 对象，可为空 | 停止新的麦克风输入，不自动取消已经进入 Agent/TTS 队列的输出。 |
 | `session.reset` | 对象，可为空 | 清理当前会话临时状态、Shadow trace、TTS 事务和 conversation epoch。 |
-| `session.reasoning_mode`（设置运行模式） | `{"mode":"fast\|deep"}`，`mode`（运行模式） | 修改后续主 Agent（主代理）模式：`fast`（快速）或 `deep`（深度），默认快速。 |
+| `session.reasoning_mode`（设置运行模式） | `{"mode":"fast\|deep"}`，`mode`（运行模式） | 修改后续主 Agent（主代理）请求模式：`fast`（快速）或 `deep`（深度），默认快速。暂停后切换并恢复无需重置会话；已经派发的请求保留原推理强度。 |
 
 未知命令返回结构化错误，不应关闭主 session。
 

@@ -249,7 +249,8 @@ class AgentContextMixin:
         return status
 
     def messages(self, kinds, recovery_signal=None, *, prompt_kind="normal", force_context=None,
-                 current_turn_id=None, shadow_information=None, secondary_context=None):
+                 current_turn_id=None, shadow_information=None, secondary_context=None,
+                 reasoning_effort=None):
         model_turn_id = current_turn_id or self.last_turn_id or ""
         current = self.inputs.get(model_turn_id, {})
         primary = str(current.get("text") or "")
@@ -269,10 +270,9 @@ class AgentContextMixin:
         )
         # The ledger is the complete V0.6 history.  Native tool-call protocol
         # groups are intentionally never replayed to the provider.
-        mode_prompt = DEEP_THINKING_PROMPT if self.reasoning_mode == "deep" else ""
         messages = [ContextFrame.make(
             ContextLane.STATIC_INSTRUCTIONS, "system", "\n".join(
-                item for item in (PROMPT, CONVERSATION_BEHAVIOR_PROMPT, mode_prompt,
+                item for item in (PROMPT, CONVERSATION_BEHAVIOR_PROMPT,
                                   self.conversation.calendar_baseline) if item),
         )]
         catalog = self._session_tool_catalog()
@@ -292,6 +292,15 @@ class AgentContextMixin:
                 "语音运行协议。条目：" + custom_rules,
             ))
         messages.extend(self.context_projector.project(self.ledger, semantic))
+        # reasoning_effort（本次冻结的推理强度）优先于后续可能变化的模式选择。
+        # 模式提示放在 REQUEST_TAIL（请求尾部），切换时保持 STATIC_INSTRUCTIONS（固定指令）不变。
+        deep_thinking = (reasoning_effort == "low" if reasoning_effort is not None
+                         else self.reasoning_mode == "deep")
+        if deep_thinking and prompt_kind != "kws_wake":
+            messages.append(ContextFrame.make(
+                ContextLane.REQUEST_TAIL, "system", DEEP_THINKING_PROMPT,
+                context_kind="reasoning_mode",  # context_kind（上下文类型）：本次深度模式提示。
+            ))
         if secondary_context:
             messages.append(ContextFrame.make(
                 ContextLane.REQUEST_TAIL, "system",
