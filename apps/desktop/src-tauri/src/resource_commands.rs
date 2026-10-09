@@ -22,7 +22,8 @@ const PROGRESS_EVENT: &str = "desktop://resource-progress";
 const MAX_PERSISTED_JOBS: usize = 128;
 static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
 
-pub type ServiceControl = Arc<dyn Fn(bool) -> Result<(), String> + Send + Sync>;
+// ServiceControl（服务控制）：返回是否存在需要恢复的服务，管理页下载不自动启动后台。
+pub type ServiceControl = Arc<dyn Fn(bool) -> Result<bool, String> + Send + Sync>;
 
 #[derive(Clone)]
 struct JobSnapshot {
@@ -93,7 +94,7 @@ pub struct ResourceManager {
     jobs_changed: Condvar, // jobs_changed（资源任务状态变化通知）。
     jobs_path: PathBuf,
     reviews: Mutex<HashMap<String,bool>>, // reviews（用户对导入内容的选择）。
-    activation: Mutex<()>, // activation（串行化服务停机与资源激活）。
+    activation: Mutex<()>, // activation（仅串行化资源启用；下载、解包与校验不占锁）。
 }
 
 impl ResourceManager {
@@ -180,14 +181,12 @@ impl ResourceManager {
             let _=lease.finish();Ok(vec!["gpu-environment".into()])
         })?;Ok(json!({"job_id":job_id}))
     }
-    pub fn snapshots(&self)->Vec<Value>{self.jobs.lock().unwrap().values().map(|job|event_value(&job.snapshot)).collect()}
+    pub fn snapshots(&self)->Vec<Value>{let mut rows=self.jobs.lock().unwrap().values().map(|job|event_value(&job.snapshot)).collect::<Vec<_>>();rows.sort_by_key(|row|row["created_at"].as_u64().unwrap_or(0));rows}
     pub fn configure_runtime(self:&Arc<Self>,group:String)->Result<Value,String>{
         let job_id=format!("env-{group}");
         self.start_job(job_id.clone(),"voice-server".into(),"正在配置语音环境".into(),true,move|manager,id|{
-            let lease=manager.pause_service().map_err(|message|JobError::Failed{message,installed:vec![]})?;
             let cancel=manager.cancel_signal(&id)?;
-            let result=voice_desktop_common::runtime::configure(&manager.context,&group,cancel,&mut|phase,done,total|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total)));
-            let _=lease.finish();
+            let result=voice_desktop_common::runtime::configure_with_activation(&manager.context,&group,cancel,&mut|phase,done,total|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total)),&mut|stage,relative|manager.activate_resource(&id,stage,relative));
             result.map_err(|message|JobError::Failed{message,installed:vec![]})
         })?;Ok(json!({"job_id":job_id}))
     }
@@ -196,9 +195,8 @@ impl ResourceManager {
         self.start_job(job_id.clone(),"voice-server".into(),"选择语音环境目录".into(),true,move|manager,id|{
             let source=voice_desktop_common::native_ui::choose_folder("选择已准备的程序私有 Python（后端环境）目录")
                 .map_err(|message|JobError::Failed{message,installed:vec![]})?.ok_or(JobError::Cancelled)?;
-            let lease=manager.pause_service().map_err(|message|JobError::Failed{message,installed:vec![]})?;
-            let result=voice_desktop_common::runtime::import(&manager.context,&source,manager.cancel_signal(&id)?,&mut|phase,done,total|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total)));
-            let _=lease.finish();result.map_err(|message|JobError::Failed{message,installed:vec![]})
+            let result=voice_desktop_common::runtime::import_with_activation(&manager.context,&source,manager.cancel_signal(&id)?,&mut|phase,done,total|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total)),&mut|stage,relative|manager.activate_resource(&id,stage,relative));
+            result.map_err(|message|JobError::Failed{message,installed:vec![]})
         })?;Ok(json!({"job_id":job_id}))
     }
 
@@ -337,42 +335,29 @@ impl ResourceManager {
 
     fn run_download(self: &Arc<Self>, job_id: &str, resource_id: &str) -> Result<Vec<String>, JobError> {
         if self.cancelled(job_id){return Err(JobError::Cancelled);}
-        let lease=self.pause_service().map_err(|message|JobError::Failed{message,installed:vec![]})?;
         let cancel=self.cancel_signal(job_id)?;
         let mut progress=|phase:&str,done:u64,total:u64|{
             if phase.starts_with("启用")||phase.starts_with("正在启用"){let _=self.begin_non_cancellable_phase(job_id,phase,done,Some(total));}
             else{self.set_phase(job_id,phase,true,done,Some(total));}
         };
-        if resource_id!="dsh" {
-            voice_desktop_common::runtime::configure(&self.context,"all",cancel.clone(),&mut progress)
-                .map_err(|message|JobError::Failed{message,installed:vec![]})?;
-        }
-        let spec=voice_desktop_common::resources::spec(&self.context,resource_id).map_err(|message|JobError::Failed{message,installed:vec![]})?;
-        let result=if spec["source"]["transfer"]["kind"]=="modelscope_sdk" {
-            // 工作进程只负责 SDK（平台开发库）下载；原生宿主负责验证与启用。
-            let args=self.cli_args("download-modelscope",&["--resource-id".into(),resource_id.into(),"--task-id".into(),job_id.into(),"--download-only".into()]);
-            let payload=self.run_stream_cli(Some(job_id),"manage-resources.py",&args,|phase,done,total|{self.set_phase(job_id,localized_phase(phase),true,done,Some(total));Ok(())})
-                .map_err(|failure|if failure.cancelled{JobError::Cancelled}else{JobError::Failed{message:failure.message,installed:failure.installed}})?;
-            let source=PathBuf::from(payload["staged_path"].as_str().ok_or_else(||JobError::Failed{message:"下载暂存目录缺失".into(),installed:vec![]})?);
-            voice_desktop_common::resources::import(&self.context,&source,Some(resource_id),self.cancel_signal(job_id)?,&mut progress)
-        }else{voice_desktop_common::resources::download_resource(&self.context,resource_id,self.cancel_signal(job_id)?,&mut progress)};
-        let _=lease.finish();result.map_err(|message|JobError::Failed{message,installed:vec![]})
+        // 模型任务只下载、校验及启用模型文件；共享 Python（语音依赖）由语音服务入口配置。
+        let result=voice_desktop_common::resources::download_resource_with_activation(&self.context,resource_id,cancel,&mut progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative));
+        result.map_err(|message|JobError::Failed{message,installed:vec![]})
     }
 
     fn run_import(self: &Arc<Self>, job_id: &str, resource_id: Option<String>) -> Result<Vec<String>, JobError> {
         let sources=voice_desktop_common::native_ui::choose_resource(resource_id.as_deref()).map_err(|message|JobError::Failed{message,installed:vec![]})?;
         if sources.is_empty(){return Err(JobError::Cancelled);}
-        let lease=self.pause_service().map_err(|message|JobError::Failed{message,installed:vec![]})?;
         let mut installed=vec![];
         for source in sources {
-            let result=voice_desktop_common::resources::import_review(&self.context,&source,resource_id.as_deref(),self.cancel_signal(job_id)?,&mut|phase,done,total|{
+            let result=voice_desktop_common::resources::import_review_with_activation(&self.context,&source,resource_id.as_deref(),self.cancel_signal(job_id)?,&mut|phase,done,total|{
                 if phase.starts_with("正在启用"){let _=self.begin_non_cancellable_phase(job_id,phase,done,Some(total));}
                 else{self.set_phase(job_id,phase,true,done,Some(total));}
-            },&mut|items|self.review_import(job_id,items))
+            },&mut|items|self.review_import(job_id,items),&mut|stage,relative|self.activate_resource(job_id,stage,relative))
                 .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
             installed.extend(result);
         }
-        let _=lease.finish();Ok(installed)
+        Ok(installed)
     }
 
     fn review_import(&self,job_id:&str,items:&[Value])->Result<(),String>{
@@ -504,8 +489,15 @@ impl ResourceManager {
 
     fn pause_service(&self) -> Result<ServiceLease<'_>, String> {
         let guard = self.activation.lock().map_err(|_| "资源激活锁不可用。")?;
-        (self.service_control)(false).map_err(|_| "无法暂停语音服务以安全激活资源。")?;
-        Ok(ServiceLease { manager: self, _guard: guard, active: true })
+        ServiceLease::pause(&self.service_control, guard)
+    }
+
+    fn activate_resource(&self,job_id:&str,stage:&Path,relative:&str)->Result<(),String>{
+        let lease=self.pause_service()?;
+        let cancel=self.cancel_signal(job_id).map_err(|_|"资源任务已丢失")?;
+        voice_desktop_common::resources::check_cancel(&cancel)?;
+        let result=voice_desktop_common::resources::activate(&self.context,stage,relative);
+        let _=lease.finish();result
     }
 
     fn start_job<F>(self: &Arc<Self>, job_id: String, resource_id: String, phase: String, can_cancel: bool, worker: F) -> Result<(), String>
@@ -514,6 +506,9 @@ impl ResourceManager {
             let mut jobs = self.jobs.lock().map_err(|_| "资源任务状态不可用。")?;
             if jobs.get(&job_id).is_some_and(|job| !terminal(&job.snapshot.state)) {
                 return Ok(());
+            }
+            if jobs.values().any(|job|job.snapshot.resource_id==resource_id&&!terminal(&job.snapshot.state)){
+                return Err("此组件已有下载或导入任务，请等待该任务完成。".into());
             }
             let snapshot = JobSnapshot { job_id: job_id.clone(), resource_id, state: "queued".into(), phase,
                 completed_bytes: 0, total_bytes: None, error: None, can_cancel, installed_resources: vec![],
@@ -656,21 +651,28 @@ impl ResourceManager {
 }
 
 struct ServiceLease<'a> {
-    manager: &'a ResourceManager,
+    control: &'a ServiceControl, // control（服务控制回调）：启用结束后只恢复原先运行的服务。
     _guard: MutexGuard<'a, ()>,
     active: bool,
+    resume: bool, // resume（恢复标识）：只恢复此前实际运行的服务。
 }
 
-impl ServiceLease<'_> {
+impl<'a> ServiceLease<'a> {
+    fn pause(control: &'a ServiceControl, guard: MutexGuard<'a, ()>) -> Result<Self, String> {
+        let resume = control(false).map_err(|_| "无法暂停语音服务以安全激活资源。")?;
+        Ok(Self { control, _guard: guard, active: true, resume })
+    }
+
     fn finish(mut self) -> Result<(), String> {
         self.active = false;
-        (self.manager.service_control)(true).map_err(|_| "资源已切换，但语音服务未能恢复。".into())
+        if self.resume {(self.control)(true).map_err(|_| "资源已切换，但语音服务未能恢复。".to_string())?;}
+        Ok(())
     }
 }
 
 impl Drop for ServiceLease<'_> {
     fn drop(&mut self) {
-        if self.active { let _ = (self.manager.service_control)(true); }
+        if self.active&&self.resume { let _ = (self.control)(true); }
     }
 }
 
@@ -799,4 +801,38 @@ pub async fn resource_cancel(
 #[tauri::command(rename_all="snake_case")]
 pub fn resource_import_confirm(window:WebviewWindow,desktop:State<Arc<super::Desktop>>,manager:State<Arc<ResourceManager>>,job_id:String,accepted:bool)->Result<(),String>{
     super::trusted(&window,&desktop)?;manager.confirm_import(&job_id,accepted)
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+
+    fn control(running: bool) -> (ServiceControl, Arc<Mutex<Vec<bool>>>) {
+        let calls=Arc::new(Mutex::new(vec![]));let log=calls.clone();
+        let state=Arc::new(AtomicBool::new(running));
+        (Arc::new(move|start|{log.lock().unwrap().push(start);Ok(state.swap(start,Ordering::AcqRel))}),calls)
+    }
+
+    #[test]
+    fn component_management_does_not_start_service_after_install() {
+        let (control,calls)=control(false);let lock=Mutex::new(());
+        ServiceLease::pause(&control,lock.lock().unwrap()).unwrap().finish().unwrap();
+        assert_eq!(*calls.lock().unwrap(),vec![false]);
+    }
+
+    #[test]
+    fn activation_restores_running_service_exactly_once() {
+        let (control,calls)=control(true);let lock=Mutex::new(());
+        ServiceLease::pause(&control,lock.lock().unwrap()).unwrap().finish().unwrap();
+        assert_eq!(*calls.lock().unwrap(),vec![false,true]);
+    }
+
+    #[test]
+    fn cancelled_activation_restores_only_previously_running_service() {
+        for running in [false,true] {
+            let (control,calls)=control(running);let lock=Mutex::new(());
+            drop(ServiceLease::pause(&control,lock.lock().unwrap()).unwrap());
+            assert_eq!(*calls.lock().unwrap(),if running{vec![false,true]}else{vec![false]});
+        }
+    }
 }

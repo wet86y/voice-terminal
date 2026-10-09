@@ -1,5 +1,5 @@
 //! Voice runtime（语音运行环境）：共享依赖计划、可移动解释器、事务启用。
-use std::{fs, path::{Path,PathBuf}, process::{Command,Stdio}, sync::{Arc,atomic::AtomicBool}, time::{Duration,Instant}};
+use std::{fs, path::{Path,PathBuf}, process::{Command,ExitStatus,Stdio}, sync::{Arc,atomic::AtomicBool}, time::{Duration,Instant}};
 use serde_json::{Value,json};
 use crate::{LaunchContext,download::{DownloadFile,download},resources::{self,Progress},workspace::{safe_path,atomic_json,file_hash,remove_owned}};
 // ENVIRONMENT_GROUPS（完整语音环境）：一次准备业务、全部本地模型及模型下载所需依赖。
@@ -68,21 +68,36 @@ pub fn worker(context:&LaunchContext,python:&Path,operation:&str,args:&[String],
     let output_path=safe_path(&context.install,&format!("tmp/process/worker-{}.json",crate::workspace::new_id()))?;
     fs::create_dir_all(output_path.parent().unwrap()).map_err(|e|e.to_string())?;
     let output=fs::File::create(&output_path).map_err(|e|e.to_string())?;
+    let error_path=output_path.with_extension("stderr");
+    let diagnostic=fs::File::create(&error_path).map_err(|e|e.to_string())?;
     let mut command=Command::new(python);context.configure_command(&mut command);
     command.args(["-I","-B","-X","utf8"]).arg(context.program.join("scripts/voice-environment-worker.py")).arg(operation).args(args)
-        .stdin(Stdio::null()).stdout(output).stderr(Stdio::null()).current_dir(&context.program);
+        .stdin(Stdio::null()).stdout(output).stderr(diagnostic).current_dir(&context.program);
     #[cfg(windows)] command.creation_flags(0x08000000);
     let mut child=command.spawn().map_err(|e|format!("解释器工作进程无法启动：{e}"))?;
     #[cfg(windows)] let job=crate::windows::Job::new()?;
     #[cfg(windows)] job.assign(child.as_raw_handle())?;
-    let deadline=Instant::now()+Duration::from_secs(180);
-    loop {if resources::check_cancel(cancel).is_err()||Instant::now()>deadline{let _=child.kill();let _=child.wait();let _=fs::remove_file(output_path);return Err("工作进程已取消或超时".into());}
-        if child.try_wait().map_err(|e|e.to_string())?.is_some(){break;}
-        std::thread::sleep(Duration::from_millis(80));}
-    let bytes=fs::read(&output_path).map_err(|e|e.to_string())?;let _=fs::remove_file(output_path);
-    let line=bytes.split(|v|*v==b'\n').rev().find(|line|!line.is_empty()).ok_or("解释器没有返回诊断")?;
-    let record:Value=serde_json::from_slice(line).map_err(|_|"解释器诊断格式错误")?;
-    if record["ok"]!=true{return Err(record["error"].as_str().unwrap_or("依赖工作进程失败").into());}Ok(record["result"].clone())
+    // 完整语音依赖首次加载在测试机接近三分钟，单独放宽检查预算并继续响应取消。
+    let timeout=if matches!(operation,"check"|"gpu"){600}else{180};
+    let deadline=Instant::now()+Duration::from_secs(timeout);
+    let status=loop {if resources::check_cancel(cancel).is_err()||Instant::now()>deadline{let _=child.kill();let _=child.wait();let _=fs::remove_file(&output_path);let _=fs::remove_file(&error_path);return Err("工作进程已取消或超时".into());}
+        if let Some(status)=child.try_wait().map_err(|e|e.to_string())?{break status;}
+        std::thread::sleep(Duration::from_millis(80));};
+    let bytes=fs::read(&output_path);let diagnostic=fs::read(&error_path).unwrap_or_default();
+    let _=fs::remove_file(output_path);let _=fs::remove_file(error_path);
+    worker_result(&bytes.map_err(|e|e.to_string())?,&diagnostic,status,operation)
+}
+/// worker_result（工作进程结果）：保留启动阶段错误与退出码，标准错误不再被丢弃。
+fn worker_result(bytes:&[u8],diagnostic:&[u8],status:ExitStatus,operation:&str)->Result<Value,String>{
+    let record=bytes.split(|v|*v==b'\n').rev().filter(|line|!line.iter().all(u8::is_ascii_whitespace))
+        .find_map(|line|serde_json::from_slice::<Value>(line).ok().filter(|value|value.get("ok").is_some()));
+    if let Some(record)=record {
+        if record["ok"]!=true{return Err(record["error"].as_str().unwrap_or("依赖工作进程失败").into());}
+        if status.success(){return Ok(record["result"].clone());}
+    }
+    let text=String::from_utf8_lossy(diagnostic);
+    let detail=text.lines().rev().find(|line|!line.trim().is_empty()).unwrap_or("解释器没有返回有效诊断").chars().take(500).collect::<String>();
+    Err(format!("Python（运行环境）检查失败，步骤 {operation}（工作进程操作），退出码 {}：{detail}",status.code().map(|code|format!("{code} / 0x{:08X}",code as u32)).unwrap_or_else(||"未知".into())))
 }
 pub fn plan(context:&LaunchContext,group:&str)->Result<Value,String>{
     let lock=lock(context)?;let names=requested(&lock,group)?;let state=status(context)?;let mut candidates=vec![];
@@ -98,6 +113,32 @@ pub fn plan(context:&LaunchContext,group:&str)->Result<Value,String>{
 }
 fn spec(value:&Value)->Result<DownloadFile,String>{Ok(DownloadFile{url:value["url"].as_str().ok_or("依赖来源缺失")?.into(),size:value["size"].as_u64().ok_or("大小缺失")?,sha256:value["sha256"].as_str().ok_or("摘要缺失")?.into(),sha512:String::new(),path:value["file"].as_str().unwrap_or("python.zip").into()})}
 fn valid_cached(path:&Path,item:&Value)->bool{path.metadata().ok().map(|v|v.len())==item["size"].as_u64()&&file_hash(path).ok().as_deref()==item["sha256"].as_str()}
+/// prepare_search_paths（私有解释器搜索路径）：同时兼容系统安装与嵌入式包。
+fn prepare_search_paths(root:&Path)->Result<(),String>{
+    // DLLs（标准扩展库目录）是系统解释器中 _socket（网络）、_ssl（加密）等模块的位置。
+    fs::write(root.join("python312._pth"),"python312.zip\n.\nDLLs\nLib\nLib/site-packages\nimport site\n").map_err(|e|e.to_string())
+}
+struct RuntimeWheel {
+    file: Option<DownloadFile>, // file（需要网络下载的固定依赖；有效缓存或内置包为空）。
+    target: PathBuf, // target（已校验的缓存路径）。
+}
+#[derive(Default)]
+struct DownloadTotals {
+    total_bytes: u64, // total_bytes（本次全部待下载文件的总字节）。
+    completed_bytes: u64, // completed_bytes（此前已下载文件的累计字节）。
+    current_bytes: u64, // current_bytes（当前文件的最高已下载字节，重试不使进度倒退）。
+}
+impl DownloadTotals {
+    fn report(&mut self,progress:&mut Progress,phase:&str,current:u64){
+        self.current_bytes=self.current_bytes.max(current);
+        progress(phase,self.completed_bytes.saturating_add(self.current_bytes).min(self.total_bytes),self.total_bytes);
+    }
+    fn transfer(&mut self,file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress,phase:&str)->Result<(),String>{
+        download(file,target,cancel,&mut|done,_|self.report(progress,phase,done.min(file.size)),0)?;
+        self.completed_bytes=self.completed_bytes.saturating_add(file.size);self.current_bytes=0;
+        self.report(progress,phase,0);Ok(())
+    }
+}
 fn copy_interpreter(source:&Path,target:&Path,cancel:&AtomicBool)->Result<(),String>{
     let root=source.parent().ok_or("解释器目录无效")?;
     for path in resources::walk(root)? {let relative=path.strip_prefix(root).unwrap().to_string_lossy().replace('\\',"/");
@@ -106,11 +147,15 @@ fn copy_interpreter(source:&Path,target:&Path,cancel:&AtomicBool)->Result<(),Str
     }Ok(())
 }
 pub fn configure(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<Vec<String>,String>{
-    let _=group; // group（历史分组参数）仅保留接口兼容，配置始终检查完整环境。
-    configure_inner(context,"all",cancel,progress,true)
+    resources::recover(context)?; // 单独调用时先恢复；并行宿主在启动及串行启用时恢复事务。
+    configure_with_activation(context,group,cancel,progress,&mut|stage,relative|resources::activate(context,stage,relative))
 }
-fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,allow_reuse:bool)->Result<Vec<String>,String>{
-    resources::recover(context)?;let lock=lock(context)?;let mut requested=requested(&lock,group)?;
+pub fn configure_with_activation(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut resources::Activation)->Result<Vec<String>,String>{
+    let _=group; // group（历史分组参数）仅保留接口兼容，配置始终检查完整环境。
+    configure_inner(context,"all",cancel,progress,true,enable)
+}
+fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,allow_reuse:bool,enable:&mut resources::Activation)->Result<Vec<String>,String>{
+    let lock=lock(context)?;let mut requested=requested(&lock,group)?;
     let state=status(context)?;
     let old=context.install.join("runtimes/python");
     let existing=resources::load(&old.join("runtime.json")).unwrap_or(Value::Null);
@@ -124,7 +169,7 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
     let stage=safe_path(&context.install,"tmp/voice-environment/stage")?;remove_owned(&stage,&context.install)?;fs::create_dir_all(&stage).map_err(|e|e.to_string())?;
     let site=stage.join("Lib/site-packages");fs::create_dir_all(&site).map_err(|e|e.to_string())?;
     let mut groups:std::collections::BTreeSet<String>=ENVIRONMENT_GROUPS.iter().map(|key|(*key).to_string()).collect();
-    let mut reused=vec![];let mut official=None;
+    let mut reused=vec![];let mut official=None;let mut embedded=false;
     if !allow_reuse {
         if let Some(values)=existing["groups"].as_array(){for value in values{if let Some(text)=value.as_str(){groups.insert(text.into());}}}
         for installed_group in &groups {requested.extend(self::requested(&lock,installed_group)?);}
@@ -134,6 +179,7 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
     if crate::workspace::available_space(&context.install)?<maximum.saturating_mul(3){return Err("下载、展开和事务备份空间不足".into());}
     if allow_reuse&&crate::workspace::verify_tree(&old,"manifest.json").is_ok()&&(state["legacy_compatible"]==true||existing["lock_sha256"].as_str()==Some(&file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))?))&&context.python.is_file(){
         progress("复用已校验私有环境",0,0);resources::copy_verified(&old,&stage,&cancel,progress)?;
+        prepare_search_paths(&stage)?;
         if let Some(values)=existing["groups"].as_array(){for value in values{if let Some(text)=value.as_str(){groups.insert(text.into());}}}
         let inventory=worker(context,&stage.join("python.exe"),"inventory",&check_args,&cancel)?;
         reused.extend(inventory["reused"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned));
@@ -141,52 +187,74 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
         for path in if allow_reuse{system_candidates()}else{vec![]}{if worker(context,&path,"interpreter",&[],&cancel).is_ok_and(|v|v["official"]==true){official=Some(path);break;}}
         if let Some(path)=&official{
             progress("复用官方系统解释器",0,0);copy_interpreter(path,&stage,&cancel)?;
-        }else {
-            progress("准备程序私有解释器",0,0);let cache=safe_path(&context.install,"cache/dependencies/python-3.12.10.zip")?;fs::create_dir_all(cache.parent().unwrap()).map_err(|e|e.to_string())?;
-            if !valid_cached(&cache,&lock["python"]){download(&spec(&lock["python"])?,&cache,cancel.clone(),&mut|done,total|progress("正在下载官方解释器",done,total),0)?;}
-            resources::unpack_zip(&cache,&stage,&cancel,progress)?;
-        }
+        }else {embedded=true;}
     }
-    // ._pth（解释器搜索路径）只写相对目录，禁止继承系统或开发环境路径。
-    fs::write(stage.join("python312._pth"),"python312.zip\n.\nLib\nLib/site-packages\nimport site\n").map_err(|e|e.to_string())?;
-    // 应用本地 CRT（C++ 运行库）随本体携带，仅释放到私有解释器旁。
-    let crt=context.program.join("tools/python-crt");
-    if crt.is_dir(){for path in resources::walk(&crt)?{let name=path.file_name().ok_or("运行库文件名无效")?;resources::copy_file(&path,&stage.join(name),&cancel,progress)?;}}
-    let interpreter=stage.join("python.exe");
     if let Some(path)=official{progress("核验本机依赖复用条件",0,0);let response=worker(context,&path,"reuse",&["--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned(),"--names".into(),serde_json::to_string(&requested).unwrap(),"--target".into(),site.to_string_lossy().into_owned()],&cancel)?;
         reused.extend(response["reused"].as_array().unwrap_or(&vec![]).iter().filter_map(Value::as_str).map(str::to_owned));
     }
+    progress("计算本次依赖总下载量",0,0);
     let cache=safe_path(&context.install,"cache/dependencies/wheels")?;fs::create_dir_all(&cache).map_err(|e|e.to_string())?;
-    let mut downloaded=vec![];
+    let mut wheels=vec![];
     for item in lock["wheels"].as_array().ok_or("依赖锁无效")? {
         let name=item["name"].as_str().ok_or("依赖名称缺失")?;
         if !requested.iter().any(|v|v==name)||reused.iter().any(|v|v==name){continue;}
         let file=item["file"].as_str().ok_or("依赖文件名缺失")?;let target=safe_path(&cache,file)?;
+        let mut needs_download=false;
         if !valid_cached(&target,item){
             if let Some(bundled)=item["bundled"].as_str(){let source=safe_path(&context.program,bundled)?;fs::copy(source,&target).map_err(|e|e.to_string())?;if !valid_cached(&target,item){return Err("内置预编译包摘要错误".into());}}
-            else{download(&spec(item)?,&target,cancel.clone(),&mut|done,total|progress(&format!("下载 {name}（依赖）"),done,total),0)?;}
+            else{needs_download=true;}
         }
-        downloaded.push(target.to_string_lossy().into_owned());
+        resources::check_cancel(&cancel)?;
+        wheels.push(RuntimeWheel{file:if needs_download{Some(spec(item)?)}else{None},target});
+    }
+    let python_cache=safe_path(&context.install,"cache/dependencies/python-3.12.10.zip")?;
+    let python_download=embedded&&!valid_cached(&python_cache,&lock["python"]);
+    let mut totals=DownloadTotals{total_bytes:wheels.iter().filter_map(|item|item.file.as_ref()).map(|file|file.size).sum::<u64>()+
+        if python_download{lock["python"]["size"].as_u64().ok_or("解释器大小缺失")?}else{0},..Default::default()};
+    totals.report(progress,"本次总下载量已确认",0);
+    if embedded {
+        fs::create_dir_all(python_cache.parent().unwrap()).map_err(|e|e.to_string())?;
+        if python_download{totals.transfer(&spec(&lock["python"])?,&python_cache,cancel.clone(),progress,"正在下载官方解释器")?;}
+        resources::unpack_zip(&python_cache,&stage,&cancel,&mut|phase,_,_|totals.report(progress,phase,0))?;
+    }
+    // ._pth（解释器搜索路径）只写相对目录，禁止继承系统或开发环境路径。
+    prepare_search_paths(&stage)?;
+    // 应用本地 CRT（C++ 运行库）随本体携带，仅释放到私有解释器旁。
+    let crt=context.program.join("tools/python-crt");
+    if crt.is_dir(){for path in resources::walk(&crt)?{let name=path.file_name().ok_or("运行库文件名无效")?;resources::copy_file(&path,&stage.join(name),&cancel,&mut|phase,_,_|totals.report(progress,phase,0))?;}}
+    let interpreter=stage.join("python.exe");
+    totals.report(progress,"核验私有解释器",0);worker(context,&interpreter,"interpreter",&[],&cancel)?;
+    let mut downloaded=vec![];
+    for item in wheels {
+        resources::check_cancel(&cancel)?;
+        if let Some(file)=item.file {totals.transfer(&file,&item.target,cancel.clone(),progress,"正在下载语音运行依赖")?;}
+        downloaded.push(item.target.to_string_lossy().into_owned());
     }
     let args=vec!["--target".into(),site.to_string_lossy().into_owned(),"--wheels".into(),serde_json::to_string(&downloaded).unwrap()];
-    progress("组装固定运行依赖",0,0);worker(context,&interpreter,"install",&args,&cancel)?;
+    totals.report(progress,"组装固定运行依赖",0);worker(context,&interpreter,"install",&args,&cancel)?;
+    totals.report(progress,"核验全部语音运行依赖",0);
     let checked=worker(context,&interpreter,"check",&check_args,&cancel)?;
     if checked["ready"]!=true && !reused.is_empty(){
         // DLL（动态链接库）闭包或本机路径失败：自动从固定包重新组装，缓存继续复用。
         remove_owned(&stage,&context.install)?;
         progress("本机复用未通过加载检查，改用固定下载包",0,0);
-        return configure_inner(context,group,cancel,progress,false);
+        return configure_inner(context,group,cancel,progress,false,enable);
     }
     if checked["ready"]!=true{return Err(format!("运行依赖加载失败：{}",checked["errors"]));}
     resources::check_cancel(&cancel)?;
     let mut packages:std::collections::BTreeSet<String>=reused.into_iter().collect();packages.extend(requested);
     atomic_json(&stage.join("runtime.json"),&json!({"schema":2,"python":"3.12.10","profile":if compatible_gpu{"compatible-private"}else{"cpu-private"},"compatible_gpu":compatible_gpu,"groups":groups,"packages":packages,"lock_sha256":file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))?,
         "fields":{"schema":"运行环境记录格式","python":"解释器版本","profile":"私有环境组合","compatible_gpu":"保留已安装的兼容显卡依赖","groups":"已完成检查的内部共享依赖组","packages":"已安装依赖名称","lock_sha256":"固定运行依赖清单摘要"}}))?;
+    totals.report(progress,"校验语音环境文件清单",0);
     atomic_json(&stage.join("manifest.json"),&resources::manifest(&stage,"python",&crate::workspace::new_id())?)?;
-    progress("启用私有语音环境",1,1);resources::check_cancel(&cancel)?;resources::activate(context,&stage,"runtimes/python")?;
+    totals.report(progress,"启用私有语音环境",0);resources::check_cancel(&cancel)?;enable(&stage,"runtimes/python")?;
     Ok(vec!["voice-server".into()])
 }
 pub fn import(context:&LaunchContext,source:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<Vec<String>,String>{
+    resources::recover(context)?;
+    import_with_activation(context,source,cancel,progress,&mut|stage,relative|resources::activate(context,stage,relative))
+}
+pub fn import_with_activation(context:&LaunchContext,source:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut resources::Activation)->Result<Vec<String>,String>{
     let candidate=safe_path(&context.install,"tmp/voice-import")?;remove_owned(&candidate,&context.install)?;
     if source.is_file(){resources::unpack_zip(source,&candidate,&cancel,progress)?;}else{resources::copy_verified(source,&candidate,&cancel,progress)?;}
     crate::workspace::verify_tree(&candidate,"manifest.json")?;
@@ -208,7 +276,7 @@ pub fn import(context:&LaunchContext,source:&Path,cancel:Arc<AtomicBool>,progres
         atomic_json(&candidate.join("runtime.json"),&record)?;
         atomic_json(&candidate.join("manifest.json"),&resources::manifest(&candidate,"python",&crate::workspace::new_id())?)?;
     }
-    resources::check_cancel(&cancel)?;progress("启用导入的语音环境",1,1);resources::check_cancel(&cancel)?;resources::activate(context,&candidate,"runtimes/python")?;Ok(vec!["voice-server".into()])
+    resources::check_cancel(&cancel)?;progress("启用导入的语音环境",1,1);resources::check_cancel(&cancel)?;enable(&candidate,"runtimes/python")?;Ok(vec!["voice-server".into()])
 }
 
 #[cfg(test)]
@@ -223,5 +291,53 @@ mod tests {
             assert!(names.iter().any(|item|item==name),"完整环境缺少 {name}（依赖）");
         }
         assert_eq!(names.len(),names.iter().collect::<std::collections::BTreeSet<_>>().len());
+    }
+
+    fn exit_status(code:u32)->ExitStatus {
+        #[cfg(windows)] {use std::os::windows::process::ExitStatusExt;ExitStatus::from_raw(code)}
+        #[cfg(not(windows))] {use std::os::unix::process::ExitStatusExt;ExitStatus::from_raw((code as i32)<<8)}
+    }
+
+    #[test]
+    fn startup_failure_reports_real_exception_and_exit_code() {
+        let diagnostic=b"Traceback (most recent call last):\r\nModuleNotFoundError: No module named '_socket'\r\n";
+        let error=worker_result(b"",diagnostic,exit_status(1),"check").unwrap_err();
+        assert!(error.contains("_socket"));assert!(error.contains("退出码 1"));assert!(error.contains("check"));
+        assert!(worker_result(br#"{"ok":true,"result":{"ready":true}}"#,diagnostic,exit_status(1),"check").is_err());
+    }
+
+    #[test]
+    fn worker_accepts_json_after_library_logs_and_blank_lines() {
+        let output=b"library output\r\n{\"ok\":true,\"result\":{\"ready\":true}}\r\n\r\n";
+        assert_eq!(worker_result(output,b"",exit_status(0),"check").unwrap()["ready"],true);
+    }
+
+    #[test]
+    fn dependency_progress_accumulates_across_files_and_does_not_rewind_on_retry() {
+        let mut totals=DownloadTotals{total_bytes:300,..Default::default()};let mut samples=vec![];
+        let mut progress=|_:&str,done,total|samples.push((done,total));
+        totals.report(&mut progress,"下载第一项",60);totals.report(&mut progress,"重试第一项",20);
+        totals.completed_bytes=100;totals.current_bytes=0;
+        totals.report(&mut progress,"下载第二项",0);totals.report(&mut progress,"下载第二项",50);totals.report(&mut progress,"下载第二项",200);
+        assert_eq!(samples,vec![(60,300),(60,300),(100,300),(150,300),(300,300)]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "手动验收：会在指定测试工作区下载并启用完整语音运行环境"]
+    fn configure_test_workspace() {
+        let root=PathBuf::from(std::env::var_os("VOICE_RUNTIME_TEST_ROOT").expect("请提供 VOICE_RUNTIME_TEST_ROOT（测试工作区）"));
+        let context=LaunchContext::portable(&root).unwrap();
+        let mut previous=String::new();let mut expected_total=0;let mut last_percent=0;
+        let installed=configure(&context,"all",Arc::new(AtomicBool::new(false)),&mut|phase,done,total|{
+            if phase=="本次总下载量已确认"{expected_total=total;last_percent=0;}
+            let percent=if total>0{done*100/total}else{0};
+            if phase.starts_with("正在下载"){assert_eq!(total,expected_total);assert!(percent>=last_percent);last_percent=percent;}
+            if previous!=phase{println!("{phase}：{done} / {total}（字节）");previous=phase.into();}
+        }).unwrap();
+        assert_eq!(installed,vec!["voice-server"]);assert_eq!(status(&context).unwrap()["full_ready"],true);
+        let names=requested(&lock(&context).unwrap(),"all").unwrap();
+        let checked=worker(&context,&context.python,"check",&["--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned(),"--names".into(),serde_json::to_string(&names).unwrap()],&AtomicBool::new(false)).unwrap();
+        assert_eq!(checked["ready"],true);println!("完整语音环境已在测试工作区启用并复核通过");
     }
 }

@@ -242,7 +242,8 @@ class DshRuntimeManager:
             self.release_record = metadata
             self._official_executable = official.executable
             await self._prepare_profile(modules_target=None)
-            return None, official.cli_entry
+            # 官方桌面入口注入随包 pnpm（包管理器），插件操作不依赖全局安装。
+            return None, official.desktop_cli_entry
         if metadata.get("source_kind") not in (None, "physical_closure"):
             raise RuntimeError("DSH（代理执行宿主）运行类型不受支持。")
         self._official_executable = None
@@ -303,6 +304,19 @@ class DshRuntimeManager:
     def _prepare_official_environment(self, env: dict[str, str]) -> None:
         """Keep Electron Node caches and temporary files（临时文件）inside DSH_HOME."""
         home = self.config.home_dir.resolve()
+        paths = getattr(self, "paths", None)
+        if paths is not None:
+            from ..local_layout import read_portable
+            selected = read_portable(paths.install_root)
+            python = safe_path(paths.install_root, selected["python"])
+            if not python.is_file():
+                raise RuntimeError("项目内 Python（运行环境）未就绪，请先配置 Voice Server（语音服务）。")
+            # PATH（可执行文件搜索路径）让代理终端优先调用本项目维护的 Python（运行环境）。
+            prefixes = [str(python.parent), str(python.parent / "Scripts")]
+            env["PATH"] = os.pathsep.join([*prefixes, env.get("PATH", "")])
+            env["VOICE_PYTHON_EXECUTABLE"] = str(python)
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONNOUSERSITE"] = "1"
         managed_paths = {
             "TEMP": home / "tmp",
             "TMP": home / "tmp",
@@ -532,6 +546,17 @@ class DshRuntimeManager:
                         creationflags=subprocess.CREATE_NO_WINDOW,
                     )
                     await killer.wait()
+                    # taskkill（系统进程回收）返回后仍需等解释器收到退出通知并关闭管道。
+                    # 避免退出流程过早结束，残留的动态库句柄阻止工作区清理。
+                    try:
+                        await asyncio.wait_for(process.wait(), 3.0)
+                    except asyncio.TimeoutError:
+                        if process.returncode is None:
+                            try:
+                                process.kill()
+                            except ProcessLookupError:
+                                pass
+                        await asyncio.wait_for(process.wait(), 3.0)
                 elif process.returncode is None:
                     process.kill()
                     await process.wait()

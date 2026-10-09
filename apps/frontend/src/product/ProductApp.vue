@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from 'vue';
 import { useProductControls } from "./useProductControls";
 import ApplicationStartup from "./ApplicationStartup.vue";
 import ApplicationMotion from './ApplicationMotion.vue';
@@ -42,6 +43,9 @@ const {
   workbenchModel,
 } = controls;
 const desktop = desktopPort();
+// resourceMaintenance（资源维护）：服务停机不等于应用退出，组件操作和下载进度继续可用。
+const resourceMaintenance = computed(() => workspaceResources.startingResources.value.size > 0
+  || workspaceResources.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state)));
 function nativeAction(action: () => Promise<void>) {
   void action().catch((error) => {
     lastError.value = String(error);
@@ -49,7 +53,8 @@ function nativeAction(action: () => Promise<void>) {
 }
 </script>
 <template>
-  <ApplicationMotion v-slot="{ entering, exiting }" :blocked="application.overlay.value" :stopping="Boolean(applicationSnapshot?.stopping || ['stopping', 'stopped'].includes(applicationSnapshot?.state ?? ''))">
+  <!-- 桌面应用退出只接受原生退出事件，后台服务停止不能触发不可恢复的退出动画。 -->
+  <ApplicationMotion v-slot="{ entering, exiting }" :blocked="application.overlay.value && !resourceMaintenance" :stopping="!desktop.available && !resourceMaintenance && Boolean(applicationSnapshot?.stopping || ['stopping', 'stopped'].includes(applicationSnapshot?.state ?? ''))">
   <AppFrame
     :runtime="runtimeState"
   >
@@ -117,7 +122,7 @@ function nativeAction(action: () => Promise<void>) {
           }}<button aria-label="关闭提示" @click="setNotice('')">×</button>
         </div></Transition
       >
-      <ApplicationStartup :entering="entering" :exiting="exiting" /></template>
+      <ApplicationStartup v-if="!resourceMaintenance || entering || exiting" :entering="entering" :exiting="exiting" /></template>
   </AppFrame>
   </ApplicationMotion>
 </template>

@@ -23,6 +23,8 @@ fn main() {
     cc::Build::new().cpp(true).std("c++20").static_crt(static_crt)
         .define("UNICODE", None).define("_UNICODE", None).define("NOMINMAX", None)
         .define("WIN32_LEAN_AND_MEAN", None).flag_if_supported("/utf-8")
+        // /EHsc（标准异常展开）：下载失败或取消时释放文件和网络句柄，允许立即重试。
+        .flag_if_supported("/EHsc")
         .include(kit.join("include")).include(kit.join("src"))
         .file(patched).file(kit.join("src/Json.cpp"))
         .file(repo.join("integrations/downloader/resource_download.cpp"))

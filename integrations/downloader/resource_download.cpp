@@ -93,7 +93,9 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
                 if (final_response.status != 200 || offset != size) throw std::runtime_error("完整下载响应不匹配");
                 break;
             }
-            if (response.status != 206 || !response.content_range || response.content_range->first != offset ||
+            // ModelScope（魔搭）小文件可返回 HTTP 200（成功）及精确 Content-Range（字节范围）。
+            // 两种成功状态都必须匹配固定范围、总大小与实际字节数，完整文件仍需摘要校验。
+            if ((response.status != 206 && response.status != 200) || !response.content_range || response.content_range->first != offset ||
                 response.content_range->last != offset + length - 1 || response.content_range->total != size || buffer.size() != length)
                 throw std::runtime_error("范围响应与固定资源清单不匹配");
             stream.write(reinterpret_cast<const char*>(buffer.data()), buffer.size()); stream.flush();

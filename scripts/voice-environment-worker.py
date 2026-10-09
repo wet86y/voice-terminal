@@ -1,5 +1,10 @@
 """私有解释器工作进程：复用检查、离线 wheel（预编译包）组装、能力检测。仅使用标准库。"""
 from __future__ import annotations
+import sys
+# UTF-8（统一字符编码）显式应用于标准流，兼容中文路径及 ._pth（隔离搜索路径）解释器。
+if __name__ == '__main__':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 import argparse
 import base64
 import csv
@@ -12,7 +17,6 @@ from pathlib import Path
 import platform
 import shutil
 import subprocess
-import sys
 import zipfile
 
 def emit(value):

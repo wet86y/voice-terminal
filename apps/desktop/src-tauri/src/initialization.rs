@@ -7,8 +7,15 @@ use super::{Desktop,ResourceManager};
 
 pub fn install_manager(app:&tauri::AppHandle,state:Arc<Desktop>,context:&LaunchContext)->Result<(),String>{
     let control_state=state.clone();let control_app=app.clone();
-    let control:Arc<dyn Fn(bool)->Result<(),String>+Send+Sync>=Arc::new(move|start|{
-        if start {super::start_service(control_app.clone(),control_state.clone())}else{control_state.stop_service()}
+    let control:super::resource_commands::ServiceControl=Arc::new(move|start|{
+        if start {super::start_service(control_app.clone(),control_state.clone())?;return Ok(control_state.service.lock().unwrap().is_some());}
+        let running=control_state.service.lock().unwrap().is_some();
+        if running {
+            // 资源维护先进入独立管理页，再关闭后台，避免旧业务页停留在服务停止状态。
+            if !control_state.stopping.load(Ordering::Acquire){manage(&control_app,&control_state)?;}
+            control_state.stop_service()?;
+        }
+        Ok(running)
     });
     voice_desktop_common::resources::recover(context)?;
     app.manage(Arc::new(ResourceManager::new(context.clone(),app.clone(),control)?));
@@ -17,10 +24,9 @@ pub fn install_manager(app:&tauri::AppHandle,state:Arc<Desktop>,context:&LaunchC
 }
 pub fn auto_start(app:tauri::AppHandle,state:Arc<Desktop>)->Result<(),String>{
     if state.mode==super::FrontendMode::UiPreview{return super::start_service(app,state);}
-    let context=state.context().ok_or("正式工作区不可用")?;
-    if voice_desktop_common::runtime::status(&context)?["service_ready"]==true{super::start_service(app,state)?;}else{manage(&app,&state)?;}Ok(())
+    super::start_service(app,state)
 }
-fn manage(app:&tauri::AppHandle,state:&Arc<Desktop>)->Result<(),String>{
+pub(super) fn manage(app:&tauri::AppHandle,state:&Arc<Desktop>)->Result<(),String>{
     if state.context().is_none(){return Err("请先选择工作区并完成本体展开。".into());}
     if let Some(startup)=app.get_webview_window("startup"){
         let target_app=app.clone();let target_state=state.clone();

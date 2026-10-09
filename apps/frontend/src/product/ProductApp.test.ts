@@ -144,6 +144,31 @@ describe('正式界面的真实控件交互', () => {
     application.error.value = ''
   })
 
+  it('桌面下载期间后台服务停止不会触发应用退出动画或阻断组件操作', async () => {
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      available: true,
+      workspaceInfo: async () => ({ can_manage: true }),
+      resourceInventory: async () => [],
+      environmentStatus: async () => ({ jobs: [{ job_id: 'dl-streaming', resource_id: 'paraformer-streaming',
+        state: 'running', phase: '正在下载模型文件', completed_bytes: 350098353, total_bytes: 889112166, can_cancel: true }] }),
+      listen: async () => () => undefined,
+    } as unknown as ReturnType<typeof desktopBridge.desktopPort>)
+    const wrapper = render(ProductApp)
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(1000)
+    application.snapshot.value = { state: 'stopping', stopping: true, components: [] } as unknown as ApplicationSnapshot
+    application.overlay.value = true
+    await flushPromises()
+    expect(wrapper.get('.application-presentation').attributes('data-motion')).toBe('shown')
+    expect(wrapper.get('.application-presentation').attributes('inert')).toBeUndefined()
+    expect(wrapper.find('.application-startup').exists()).toBe(false)
+    await wrapper.get('.compact-settings-button').trigger('click')
+    expect(wrapper.get('.settings-page').attributes('style') ?? '').not.toContain('display: none')
+    window.dispatchEvent(new Event(APPLICATION_EXIT_EVENT))
+    await flushPromises()
+    expect(wrapper.get('.application-presentation').attributes('data-motion')).toBe('exiting')
+  })
+
   it('语音接口已连接但代理仍启动时，设置可访问，语音开始、重置和模式切换仍受保护', async () => {
     const { value } = liveControls()
     allowBusinessReady(value)

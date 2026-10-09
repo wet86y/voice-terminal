@@ -5,6 +5,7 @@ import {
   WORKSPACE_PROGRESS_EVENT,
   type DesktopPort,
   type DesktopWorkspacePort,
+  type DesktopEnvironmentPort,
   type ResourceJob,
   type ResourceStatus,
   type ResourceInstallPlan,
@@ -17,7 +18,7 @@ const TERMINAL_JOB_STATES = new Set(['complete', 'completed', 'failed', 'cancell
 
 /** useWorkspaceResources（工作区与资源控制器）：原生操作不依赖 Voice（语音服务）接口。 */
 export function useWorkspaceResources() {
-  const port = desktopPort() as DesktopPort & DesktopWorkspacePort
+  const port = desktopPort() as DesktopPort & DesktopWorkspacePort & DesktopEnvironmentPort
   const workspace = ref<WorkspaceInfo | null>(null)
   const resources = ref<ResourceStatus[]>([])
   const resourceJobs = ref<ResourceJob[]>([])
@@ -36,6 +37,7 @@ export function useWorkspaceResources() {
   let unlistenWorkspace: (() => void) | undefined
   let unlistenRequests: Promise<void>[] = []
   let refreshRequest: Promise<void> | null = null
+  let restoredNativeJobs = false // restoredNativeJobs（已恢复任务）：每个页面只读取一次原生任务快照。
 
   // canManage（工作区管理权限）统一由正式程序提供；源码调试使用相同权限。
   const canManage = computed(() => port.available && workspace.value?.can_manage)
@@ -43,13 +45,15 @@ export function useWorkspaceResources() {
   const activeWorkspaceJob = computed(() => [...workspaceJobs.value].reverse().find(job => !TERMINAL_JOB_STATES.has(job.state)))
   const latestWorkspaceJob = computed(() => workspaceJobs.value.at(-1) ?? null)
 
-  function upsertResourceJob(incoming: ResourceJob) {
+  function upsertResourceJob(incoming: ResourceJob, refreshAfterUpdate = true) {
     const index = resourceJobs.value.findIndex(job => job.job_id === incoming.job_id)
-    const next = index < 0
-      ? [...resourceJobs.value, incoming]
-      : resourceJobs.value.map((job, at) => at === index ? { ...job, ...incoming } : job)
+    // 最近事件移到末尾，同一资源重新下载时不会继续展示旧任务。
+    const next = [
+      ...resourceJobs.value.filter(job => job.job_id !== incoming.job_id),
+      index < 0 ? incoming : { ...resourceJobs.value[index], ...incoming },
+    ]
     resourceJobs.value = next.slice(-MAX_VISIBLE_JOBS)
-    if (incoming.installed_resources?.length || TERMINAL_JOB_STATES.has(incoming.state)) {
+    if (refreshAfterUpdate && (incoming.installed_resources?.length || TERMINAL_JOB_STATES.has(incoming.state))) {
       void refreshInventory()
     }
   }
@@ -76,7 +80,18 @@ export function useWorkspaceResources() {
   async function refreshInventory() {
     if (!port.available) return
     try {
-      resources.value = await port.resourceInventory()
+      const [inventory, environment] = await Promise.all([
+        port.resourceInventory(),
+        !restoredNativeJobs && typeof port.environmentStatus === 'function' ? port.environmentStatus().catch(() => null) : null,
+      ])
+      resources.value = inventory
+      if (environment) restoredNativeJobs = true
+      // 维护时切换到管理页仍恢复活动任务，已经结束的历史任务不覆盖现有安装状态。
+      for (const job of environment?.jobs ?? []) {
+        if (!TERMINAL_JOB_STATES.has(job.state) && !resourceJobs.value.some(current => current.job_id === job.job_id)) {
+          upsertResourceJob(job, false)
+        }
+      }
       resourceError.value = ''
     } catch (error) {
       resourceError.value = error instanceof Error ? error.message : '无法读取资源清单。'
@@ -199,7 +214,8 @@ export function useWorkspaceResources() {
   }
 
   async function startResourceJob(resourceKey: string, operation: 'download' | 'import', resourceId?: string) {
-    if (!resourcesCanManage.value || startingResources.value.has(resourceKey)) return
+    if (!resourcesCanManage.value || startingResources.value.has(resourceKey)
+      || resourceJobs.value.some(job => job.resource_id === resourceKey && !TERMINAL_JOB_STATES.has(job.state))) return
     startingResources.value = new Set(startingResources.value).add(resourceKey)
     resourceError.value = ''
     try {
