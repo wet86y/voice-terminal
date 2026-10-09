@@ -3,6 +3,7 @@ defineProps<{
   configured?: { deepseek: boolean; minimax: boolean }; // configured（两家服务是否已有密钥）。
   disabled?: boolean; // disabled（加载或保存期间禁用操作）。
   saving?: boolean; // saving（正在保存密钥）。
+  startup?: boolean; // startup（启动前配置）：保存后即可启动，无需先运行后端。
 }>();
 const deepseek = defineModel<string>('deepseek', { required: true }); // deepseek（DeepSeek 语言模型服务的接口密钥草稿）。
 const minimax = defineModel<string>('minimax', { required: true }); // minimax（MiniMax 语音合成服务的接口密钥草稿）。
@@ -20,6 +21,6 @@ const emit = defineEmits<{ save: [] }>();
         <input v-else v-model="minimax" type="password" autocomplete="new-password" spellcheck="false" :disabled="disabled" :placeholder="configured?.minimax ? '已配置，填写可更新' : '填写接口密钥'" />
       </label>
     </section>
-    <footer class="fixed-credentials-footer"><p>使用项目内固定模型。留空保留已有密钥，保存后重启应用生效。</p><button class="save-button" type="submit" :disabled="disabled || (!deepseek.trim() && !minimax.trim())">{{ saving ? '正在保存…' : '保存接口密钥' }}</button></footer>
+    <footer class="fixed-credentials-footer"><p>{{ startup ? '组件下载期间也可保存接口密钥。留空保留已有密钥，启动程序时生效。' : '使用项目内固定模型。留空保留已有密钥，保存后重启应用生效。' }}</p><button class="save-button" type="submit" :disabled="disabled || (!deepseek.trim() && !minimax.trim())">{{ saving ? '正在保存…' : '保存接口密钥' }}</button></footer>
   </form>
 </template>

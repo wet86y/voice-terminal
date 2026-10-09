@@ -60,3 +60,42 @@ pub fn download(file: &DownloadFile, target: &Path, cancel: Arc<AtomicBool>,
     }
     #[cfg(not(windows))] { let _=(target,cancel,callback,url,hash); Err("原生下载仅支持 Windows（操作系统）。".into()) }
 }
+
+#[cfg(all(test, windows, feature = "qualification"))]
+mod tests {
+    use super::*;
+    use std::{fs, io::{Read, Write}, net::TcpListener};
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn native_download_accepts_success_with_exact_range_and_rejects_wrong_range() {
+        for (status, valid) in [(200, true), (206, true), (200, false)] {
+            let body = b"fixed model file";
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];socket.read(&mut request).unwrap();
+                let last = if valid { body.len() - 1 } else { body.len() - 2 };
+                write!(socket, "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Range: bytes 0-{last}/{}\r\nConnection: close\r\n\r\n", body.len(), body.len()).unwrap();
+                socket.write_all(body).unwrap();
+            });
+            let root = std::env::temp_dir().join(format!("voice-download-{}", crate::workspace::new_id()));
+            fs::create_dir_all(&root).unwrap();let target = root.join("model.bin");
+            let file = DownloadFile { url: format!("http://{address}/model.bin"), size: body.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(body)), sha512: String::new(), path: "model.bin".into() };
+            let mut samples = vec![];
+            let result = download(&file, &target, Arc::new(AtomicBool::new(false)), &mut |done, total| samples.push((done, total)), 0);
+            assert_eq!(result.is_ok(), valid);
+            if valid { assert_eq!(fs::read(&target).unwrap(), body);assert_eq!(samples.last(), Some(&(file.size, file.size))); }
+            server.join().unwrap();
+            // 失败返回后也必须释放分片文件句柄，否则同一进程无法清理或重试下载。
+            for path in [target.clone(), target.with_extension("bin.part"), target.with_extension("bin.part.identity")] {
+                if let Err(error) = fs::remove_file(&path) {
+                    assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "下载测试文件未释放：{}：{error}", path.display());
+                }
+            }
+            fs::remove_dir(&root).expect("下载测试的暂存目录未释放");
+        }
+    }
+}

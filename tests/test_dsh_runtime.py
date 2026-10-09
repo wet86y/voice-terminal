@@ -8,9 +8,10 @@ import subprocess
 import unittest
 import json
 from pathlib import Path
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, Mock
 from voice_terminal.distribution import manifest
 from voice_terminal.paths import atomic_json
+from voice_terminal.paths import AppPaths
 
 from voice_terminal.config import AppConfig, DshConfig
 from voice_terminal.dsh.runtime import DshRuntimeManager
@@ -122,6 +123,27 @@ class DshRuntimeTests(unittest.TestCase):
                     tail = "\\" + tail.lstrip("\\/")
                 self.assertEqual(env["HOMEDRIVE"], drive)
                 self.assertEqual(env["HOMEPATH"], tail)
+
+    def test_dsh_child_uses_workspace_python_before_system_python(self) -> None:
+        """PATH（搜索路径）优先使用项目解释器，兼容无全局 Python（运行环境）的分发机器。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            python = root / "runtimes/python/python.exe"
+            python.parent.mkdir(parents=True)
+            python.write_bytes(b"managed interpreter")
+            atomic_json(root / "portable.json", {"schema": 2, "workspace_id": "python-check", "app": "app", "python": "runtimes/python/python.exe", "dsh": "runtimes/dsh", "models": "models", "data_dir": "data", "webview2": None})
+            manager = object.__new__(DshRuntimeManager)
+            manager.config = DshConfig(home_dir=root / "data/dsh")
+            manager.paths = AppPaths(root / "app", root, root / "data")
+            env = {"PATH": os.pathsep.join([str(root / "global-python"), str(root / "system-tools")])}
+            manager._prepare_official_environment(env)
+            self.assertEqual(Path(env["PATH"].split(os.pathsep)[0]), python.parent.resolve())
+            self.assertEqual(Path(env["VOICE_PYTHON_EXECUTABLE"]), python.resolve())
+            self.assertEqual(env["PYTHONUTF8"], "1")
+            self.assertEqual(env["PYTHONNOUSERSITE"], "1")
+            python.unlink()
+            with self.assertRaisesRegex(RuntimeError, "Python（运行环境）未就绪"):
+                manager._prepare_official_environment({"PATH": ""})
 
     def test_launch_token_is_extracted_but_redacted_from_logs(self) -> None:
         line = "Open http://127.0.0.1:3081/?token=top-secret now"
@@ -301,6 +323,34 @@ class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.status().state, "unavailable")
         self.assertIn("未知进程", manager.status().message)
         self.assertIsNone(manager.launch_url)
+
+
+    @unittest.skipUnless(os.name == "nt", "需要 Windows（操作系统）的进程树回收")
+    async def test_forced_windows_shutdown_waits_for_actual_child_exit(self) -> None:
+        manager = object.__new__(DshRuntimeManager)
+        manager.config = DshConfig(shutdown_timeout_ms=1000)
+        process = Mock(returncode=None)
+        waits = 0
+
+        async def wait():
+            nonlocal waits
+            waits += 1
+            if waits == 1:
+                raise asyncio.TimeoutError
+            process.returncode = 0
+            return 0
+
+        process.wait = AsyncMock(side_effect=wait)
+        killer = Mock(wait=AsyncMock(return_value=0))
+        manager._process = process
+        manager._reader_tasks = []
+        manager.bridge = Mock()
+        with patch.dict(os.environ, {"VOICE_APP_ORIGIN": ""}), patch("voice_terminal.dsh.runtime.asyncio.create_subprocess_exec", AsyncMock(return_value=killer)) as spawn:
+            await manager._stop_child(force=False)
+        self.assertEqual(process.wait.await_count, 2)
+        self.assertEqual(process.returncode, 0)
+        self.assertIsNone(manager._process)
+        self.assertEqual(spawn.call_args.args[:3], ("taskkill", "/PID", str(process.pid)))
 
 
 if __name__ == "__main__":

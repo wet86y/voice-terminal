@@ -1,6 +1,10 @@
 """完整语音环境：本地依赖复用与已验证显卡构建兼容。"""
 import importlib.util
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,6 +16,19 @@ _spec.loader.exec_module(worker)
 
 LOCK = {'wheels': [{'name': 'torch', 'version': '2.11.0+cpu'}, {'name': 'torchaudio', 'version': '2.11.0+cpu'},
                    {'name': 'onnxruntime', 'version': '1.24.3'}, {'name': 'funasr', 'version': '1.4.14'}]}
+
+
+def test_worker_diagnostics_remain_utf8_when_system_stream_uses_gbk():
+    result = subprocess.run(
+        [sys.executable, '-B', str(Path(worker.__file__)), 'check', '--names', json.dumps(['缺失的测试依赖'])],
+        env={**os.environ, 'PYTHONIOENCODING': 'gbk'}, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=30, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+    )
+    assert result.returncode == 0
+    record = json.loads(result.stdout.decode('utf-8'))
+    assert record['ok']
+    assert not record['result']['ready']
+    assert '缺失的测试依赖' in record['result']['errors']
 
 
 def versions(name):

@@ -5,6 +5,7 @@ use sha2::{Digest, Sha512};
 use base64::Engine;
 use crate::{LaunchContext, download::{DownloadFile, download}, workspace::{safe_path, file_hash, atomic_json, remove_owned}};
 pub type Progress<'a> = dyn FnMut(&str,u64,u64) + 'a; // Progress（阶段与字节进度回调）。
+pub type Activation<'a> = dyn FnMut(&Path,&str)->Result<(),String> + 'a; // Activation（启用回调）：候选目录与固定目标，宿主在此短暂停机并串行替换。
 
 pub fn load(path:&Path)->Result<Value,String>{
     let bytes=fs::read(path).map_err(|e|e.to_string())?;
@@ -79,6 +80,18 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
             "fields":{"files_installed":"模型或组件文件已安装","runtime_ready":"共享运行依赖已就绪","can_start":"具备启动条件","runtime_group":"共享依赖组"}}));
     }Ok(rows)
 }
+/// startup_readiness（启动组件检查）：只读取本地清单与文件，不启动解释器、服务或下载。
+pub fn startup_readiness(context:&LaunchContext)->Result<Value,String>{
+    Ok(readiness_from_inventory(&inventory(context)?))
+}
+fn readiness_from_inventory(rows:&[Value])->Value{
+    let missing=rows.iter().filter(|row|row["can_start"]!=true).map(|row|json!({
+        "resource_id":row["resource_id"],"label":row["label"],
+        "reason":row["error"].as_str().unwrap_or("组件文件或共享运行依赖尚未完备")
+    })).collect::<Vec<_>>();
+    json!({"ready":!rows.is_empty()&&missing.is_empty(),"missing":missing,"checked_components":rows.len(),
+        "fields":{"ready":"全部组件具备启动条件","missing":"待用户手动补齐的组件","checked_components":"已检查组件数量","resource_id":"组件编号","label":"组件名称","reason":"缺失原因"}})
+}
 pub fn unpack_zip(source:&Path,target:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
     let mut archive=zip::ZipArchive::new(fs::File::open(source).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
     let mut total=0u64;let mut names=std::collections::HashSet::new();
@@ -147,7 +160,11 @@ pub fn import(context:&LaunchContext,source:&Path,id:Option<&str>,cancel:Arc<Ato
     import_review(context,source,id,cancel,progress,&mut|_|Ok(()))
 }
 pub fn import_review(context:&LaunchContext,source:&Path,id:Option<&str>,cancel:Arc<AtomicBool>,progress:&mut Progress,review:&mut dyn FnMut(&[Value])->Result<(),String>)->Result<Vec<String>,String>{
-    let task=safe_path(&context.install,"tmp/native-resources")?;remove_owned(&task,&context.install)?;fs::create_dir_all(&task).map_err(|e|e.to_string())?;
+    import_review_with_activation(context,source,id,cancel,progress,review,&mut|stage,relative|activate(context,stage,relative))
+}
+pub fn import_review_with_activation(context:&LaunchContext,source:&Path,id:Option<&str>,cancel:Arc<AtomicBool>,progress:&mut Progress,review:&mut dyn FnMut(&[Value])->Result<(),String>,enable:&mut Activation)->Result<Vec<String>,String>{
+    // 每个下载或导入任务独立暂存，网络传输、解包和校验可以并行。
+    let task=safe_path(&context.install,&format!("tmp/native-resources-{}",crate::workspace::new_id()))?;fs::create_dir_all(&task).map_err(|e|e.to_string())?;
     let mut inputs=vec![];
     if source.is_file()&&source.extension().is_some_and(|v|v.eq_ignore_ascii_case("zip")) {
         let unpacked=task.join("bundle");unpack_zip(source,&unpacked,&cancel,progress)?;
@@ -194,7 +211,7 @@ pub fn import_review(context:&LaunchContext,source:&Path,id:Option<&str>,cancel:
             model_validate(context,&resource,&candidate)?;
         }
         check_cancel(&cancel)?;progress("正在启用资源",1,1);check_cancel(&cancel)?;
-        let relative=destination(context,&resource)?.strip_prefix(&context.install).unwrap().to_string_lossy().replace('\\',"/");activate(context,&candidate,&relative)?;
+        let relative=destination(context,&resource)?.strip_prefix(&context.install).unwrap().to_string_lossy().replace('\\',"/");enable(&candidate,&relative)?;
         installed.push(key);
     }
     remove_owned(&task,&context.install)?;Ok(installed)
@@ -203,28 +220,49 @@ fn refresh_models(context:&LaunchContext)->Result<(),String>{
     let root=context.install.join("models");let record=manifest(&root,"models",&crate::workspace::new_id())?;atomic_json(&root.join("manifest.json"),&record)?;bind_component(context,"models","models",&root)
 }
 pub fn download_resource(context:&LaunchContext,id:&str,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<Vec<String>,String>{
+    download_resource_with_activation(context,id,cancel,progress,&mut|stage,relative|activate(context,stage,relative))
+}
+pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut Activation)->Result<Vec<String>,String>{
     let item=spec(context,id)?;
     let installed=destination(context,&item)?;
     if (id=="dsh"&&dsh_validate(context,&installed,false).is_ok())||(id!="dsh"&&model_validate(context,&item,&installed).is_ok()) {progress("复用已校验资源",1,1);return Ok(vec![id.into()]);}
     let root=safe_path(&context.install,&format!("tmp/resource-downloads/{id}"))?;fs::create_dir_all(&root).map_err(|e|e.to_string())?;
-    if item["source"]["transfer"]["kind"]=="modelscope_sdk" {return Err("ModelScope（魔搭）任务需要下载工作进程。".into());}
     if let Some(artifact)=item["source"]["transfer"]["artifact"].as_object(){
         let value=Value::Object(artifact.clone());let spec=file_spec(&value,value["url"].as_str().ok_or("缺少下载来源")?.into())?;let path=safe_path(&root,&spec.path)?;
         download(&spec,&path,cancel.clone(),&mut|done,total|progress("正在下载固定附件",done,total),0)?;
-        if id=="dsh"{return import(context,&path,Some(id),cancel,progress);}
+        if id=="dsh"{return import_review_with_activation(context,&path,Some(id),cancel,progress,&mut|_|Ok(()),enable);}
         let seven=context.program.join("tools/7zip/7z.exe");let out=root.join("extracted");run_seven(&seven,&path,&out,&cancel)?;
         let tar=walk(&out)?.into_iter().find(|p|p.extension().is_some_and(|v|v=="tar")).ok_or("模型归档缺少 tar（内层归档）")?;
         let model=root.join("model");run_seven(&seven,&tar,&model,&cancel)?;
         let folder=walk(&model)?.into_iter().find(|p|p.file_name().is_some_and(|v|v=="tokens.txt")).ok_or("唤醒词归档不完整")?.parent().unwrap().to_path_buf();
-        return import(context,&folder,Some(id),cancel,progress);
+        return import_review_with_activation(context,&folder,Some(id),cancel,progress,&mut|_|Ok(()),enable);
     }
-    for row in item["files"].as_array().ok_or("下载文件清单缺失")? {
+    let files=item["files"].as_array().ok_or("下载文件清单缺失")?;
+    let total=files.iter().filter(|row|row["optional"]!=true&&!row["asset"].is_string()).map(|row|row["size_bytes"].as_u64().unwrap_or(0)).sum::<u64>();
+    let mut completed=0u64;
+    for row in files {
         if row["optional"]==true||row["asset"].is_string(){continue;}
-        let url=format!("https://huggingface.co/{}/resolve/{}/{}",item["source"]["repo_id"].as_str().ok_or("仓库缺失")?,item["source"]["revision"].as_str().ok_or("版本缺失")?,row["path"].as_str().ok_or("文件名缺失")?);
+        let url=model_file_url(&item,row)?;
         let file=file_spec(row,url)?;let path=safe_path(&root,&file.path)?;fs::create_dir_all(path.parent().unwrap()).map_err(|e|e.to_string())?;
-        download(&file,&path,cancel.clone(),&mut|done,total|progress("正在下载模型文件",done,total),0)?;
+        let mut current=0;
+        download(&file,&path,cancel.clone(),&mut|done,_|{current=current.max(done.min(file.size));progress("正在下载模型文件",completed.saturating_add(current),total);},0)?;
+        completed+=file.size;
     }
-    import(context,&root,Some(id),cancel,progress)
+    import_review_with_activation(context,&root,Some(id),cancel,progress,&mut|_|Ok(()),enable)
+}
+/// model_file_url（模型文件来源）：直接访问固定版本，下载过程不调用 Python（运行环境）。
+fn model_file_url(item:&Value,row:&Value)->Result<String,String>{
+    let repo=item["source"]["repo_id"].as_str().ok_or("仓库缺失")?;
+    let revision=item["source"]["revision"].as_str().ok_or("版本缺失")?;
+    let path=row["path"].as_str().ok_or("文件名缺失")?;
+    let encode=|text:&str,slash:bool|text.bytes().map(|byte|{
+        if byte.is_ascii_alphanumeric()||b"-._~".contains(&byte)||(slash&&byte==b'/'){(byte as char).to_string()}else{format!("%{byte:02X}")}
+    }).collect::<String>();
+    match item["source"]["platform"].as_str(){
+        Some("modelscope")=>Ok(format!("https://modelscope.cn/api/v1/models/{}/repo?Revision={}&FilePath={}",encode(repo,true),encode(revision,false),encode(path,false))),
+        Some("huggingface")=>Ok(format!("https://huggingface.co/{}/resolve/{}/{}",encode(repo,true),encode(revision,false),encode(path,true))),
+        _=>Err("该模型缺少受支持的直接文件来源".into()),
+    }
 }
 fn verify_installer(context:&LaunchContext,path:&Path)->Result<String,String>{
     let item=spec(context,"dsh")?;let artifact=&item["source"]["transfer"]["artifact"];
@@ -288,4 +326,140 @@ pub fn bind_component(context:&LaunchContext,kind:&str,relative:&str,root:&Path)
     let entries=release["components"].as_array_mut().unwrap();entries.retain(|v|v["kind"]!=kind);
     entries.push(json!({"kind":kind,"path":relative,"build":manifest["build"],"manifest_sha256":file_hash(&root.join("manifest.json"))?,"optional":true}));
     atomic_json(&path,&release)
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    fn startup_requires_complete_files_and_shared_dependencies() {
+        let complete=json!({"resource_id":"voice-server","label":"语音服务","can_start":true});
+        let missing=json!({"resource_id":"paraformer-streaming","label":"流式识别模型","files_installed":false,"can_start":false,"error":"模型文件不完整"});
+        let missing_runtime=json!({"resource_id":"sensevoice-small","label":"精修模型","files_installed":true,"runtime_ready":false,"can_start":false});
+        let readiness=readiness_from_inventory(&[complete.clone(),missing,missing_runtime]);
+        assert_eq!(readiness["ready"],false);
+        assert_eq!(readiness["checked_components"],3);
+        assert_eq!(readiness["missing"][0]["resource_id"],"paraformer-streaming");
+        assert_eq!(readiness["missing"][0]["reason"],"模型文件不完整");
+        assert_eq!(readiness["missing"][1]["reason"],"组件文件或共享运行依赖尚未完备");
+        assert_eq!(readiness_from_inventory(&[complete])["ready"],true);
+        assert_eq!(readiness_from_inventory(&[])["ready"],false);
+    }
+
+    #[test]
+    fn parallel_imports_keep_independent_stages_and_both_installed_models() {
+        use std::{sync::{Mutex,Condvar},time::Duration};
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();
+        let root=owner.join(format!("voice-parallel-resources-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();
+        fs::create_dir_all(root.join("app/config/resources")).unwrap();
+        fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();
+        fs::write(root.join("app/scripts/backend-entry.py"),"# 测试启动上下文，不运行此脚本").unwrap();
+        let mut entries=vec![];
+        for (id,marker) in [("first-model",1u8),("second-model",2u8)] {
+            let source=root.join(format!("tmp/source-{id}"));fs::create_dir_all(&source).unwrap();
+            let file=source.join("model.bin");fs::write(&file,vec![marker;256*1024]).unwrap();
+            entries.push(json!({"resource_id":id,"title":"并行验收模型","kind":"model","version":"1","destination":id,
+                "files":[{"path":"model.bin","size_bytes":256*1024,"sha256":file_hash(&file).unwrap()}]}));
+        }
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":entries})).unwrap();
+        let context=LaunchContext::portable(&root).unwrap();
+        let copying=(Mutex::new(0usize),Condvar::new());
+        let activation=Mutex::new(());let stages=Mutex::new(vec![]);
+        std::thread::scope(|scope| {
+            let context=&context;let root=&root;let copying=&copying;let activation=&activation;let stages=&stages;
+            let threads=["first-model","second-model"].map(|id|scope.spawn(move|| {
+                let mut reached=false;
+                let installed=import_review_with_activation(&context,&root.join(format!("tmp/source-{id}")),Some(id),Arc::new(AtomicBool::new(false)),
+                    &mut|phase,_,_|{
+                        if !reached&&phase=="正在复制并校验" {
+                            reached=true;let mut count=copying.0.lock().unwrap();*count+=1;copying.1.notify_all();
+                            let (count,timeout)=copying.1.wait_timeout_while(count,Duration::from_secs(5),|count|*count<2).unwrap();
+                            assert!(!timeout.timed_out()&&*count==2,"两个任务必须同时进入复制阶段");
+                        }
+                    },&mut|_|Ok(()),&mut|stage,relative|{
+                        let _guard=activation.lock().unwrap();stages.lock().unwrap().push(stage.parent().unwrap().to_path_buf());
+                        activate(&context,stage,relative)
+                    }).unwrap();
+                assert_eq!(installed,vec![id]);
+            }));
+            for thread in threads{thread.join().unwrap();}
+        });
+        let stages=stages.into_inner().unwrap();assert_eq!(stages.len(),2);assert_ne!(stages[0],stages[1]);
+        for id in ["first-model","second-model"] {model_validate(&context,&spec(&context,id).unwrap(),&root.join(format!("models/{id}"))).unwrap();}
+        assert_eq!(load(&root.join("models/manifest.json")).unwrap()["files"].as_array().unwrap().len(),2);
+        assert!(!root.join("tmp/native-install.json").exists());
+        // 清理仅限本测试创建的独立子目录。
+        assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "手动验收：在指定工作区同时下载流式识别和精修模型，保留原有数据与下载缓存"]
+    fn download_streaming_and_refinement_in_parallel_without_python() {
+        use std::{sync::{Mutex,Condvar},time::Duration};
+        let root=PathBuf::from(std::env::var_os("VOICE_RUNTIME_TEST_ROOT").expect("请提供 VOICE_RUNTIME_TEST_ROOT（测试工作区）"));
+        let mut context=LaunchContext::portable(&root).unwrap();context.python=root.join("不存在的解释器/python.exe");
+        let before=crate::runtime::fingerprint(&root.join("runtimes")).unwrap();
+        let transfers=(Mutex::new(0usize),Condvar::new());let activation=Mutex::new(());let barrier_failed=AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let context=&context;let transfers=&transfers;let activation=&activation;let barrier_failed=&barrier_failed;
+            let threads=["paraformer-streaming","sensevoice-small"].map(|id|scope.spawn(move|| {
+                let mut entered=false;let mut previous=String::new();let mut milestone=0;
+                let installed=download_resource_with_activation(&context,id,Arc::new(AtomicBool::new(false)),&mut|phase,done,total|{
+                    if phase=="正在下载模型文件"&&!entered {
+                        entered=true;let mut count=transfers.0.lock().unwrap();*count+=1;transfers.1.notify_all();
+                        let (count,timeout)=transfers.1.wait_timeout_while(count,Duration::from_secs(30),|count|*count<2).unwrap();
+                        if timeout.timed_out()||*count!=2{barrier_failed.store(true,Ordering::Release);}
+                    }
+                    if previous!=phase||done/(50*1024*1024)>milestone {
+                        println!("{id}（模型编号）：{phase}，{done} / {total}（字节）");previous=phase.into();milestone=done/(50*1024*1024);
+                    }
+                },&mut|stage,relative|{let _guard=activation.lock().unwrap();activate(&context,stage,relative)}).unwrap();
+                assert_eq!(installed,vec![id]);
+                model_validate(&context,&spec(&context,id).unwrap(),&destination(&context,&spec(&context,id).unwrap()).unwrap()).unwrap();
+            }));
+            for thread in threads{thread.join().unwrap();}
+        });
+        assert_eq!(*transfers.0.lock().unwrap(),2);
+        assert!(!barrier_failed.load(Ordering::Acquire),"两项模型下载必须同时进入传输阶段");
+        assert_eq!(before,crate::runtime::fingerprint(&root.join("runtimes")).unwrap());
+        assert!(!context.python.exists());println!("两项模型并行下载、独立校验和串行启用通过，Python（运行环境）未被调用或修改");
+    }
+
+    #[test]
+    fn modelscope_uses_pinned_direct_file_url_with_encoded_query() {
+        let model=json!({"source":{"platform":"modelscope","repo_id":"iic/example","revision":"v2.0.4"}});
+        let row=json!({"path":"目录/config & data.json"});
+        assert_eq!(model_file_url(&model,&row).unwrap(),"https://modelscope.cn/api/v1/models/iic/example/repo?Revision=v2.0.4&FilePath=%E7%9B%AE%E5%BD%95%2Fconfig%20%26%20data.json");
+    }
+
+    #[test]
+    fn all_pinned_model_files_have_native_download_sources() {
+        let catalog:Value=serde_json::from_str(include_str!("../../../../config/resources/catalog.json")).unwrap();
+        for model in catalog["resources"].as_array().unwrap().iter().filter(|item|item["kind"]=="model"&&!item["source"]["transfer"]["artifact"].is_object()) {
+            for row in model["files"].as_array().unwrap().iter().filter(|row|row["optional"]!=true&&!row["asset"].is_string()) {
+                let file=file_spec(row,model_file_url(model,row).unwrap()).unwrap();
+                assert!(file.size>0);assert_eq!(file.sha256.len(),64);assert!(file.url.starts_with("https://"));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "手动验收：只在指定测试工作区下载固定 FSMN-VAD（语音活动检测）模型文件"]
+    fn download_model_without_python() {
+        let root=PathBuf::from(std::env::var_os("VOICE_RUNTIME_TEST_ROOT").expect("请提供 VOICE_RUNTIME_TEST_ROOT（测试工作区）"));
+        let mut context=LaunchContext::portable(&root).unwrap();context.python=root.join("不存在的解释器/python.exe");
+        let runtime_before=crate::runtime::fingerprint(&root.join("runtimes")).unwrap();let mut previous=String::new();
+        let installed=download_resource(&context,"fsmn-vad",Arc::new(AtomicBool::new(false)),&mut|phase,done,total|{
+            if previous!=phase{println!("{phase}：{done} / {total}（字节）");previous=phase.into();}
+        }).unwrap();
+        assert_eq!(installed,vec!["fsmn-vad"]);
+        model_validate(&context,&spec(&context,"fsmn-vad").unwrap(),&destination(&context,&spec(&context,"fsmn-vad").unwrap()).unwrap()).unwrap();
+        assert_eq!(runtime_before,crate::runtime::fingerprint(&root.join("runtimes")).unwrap());
+        assert!(!context.python.exists());println!("模型下载与校验通过，未调用或修改 Python（运行环境）");
+    }
 }

@@ -4,6 +4,8 @@ mod resource_commands;
 mod initialization;
 #[cfg(feature="qualification")] mod qualification;
 mod environment_commands;
+mod credential_commands;
+use credential_commands::{model_credentials_status,model_credentials_save};
 use initialization::{desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init};
 use environment_commands::{resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide};
 use std::{
@@ -93,6 +95,7 @@ struct Desktop {
     development: bool,              // development（是否显式源码调试）。
     instance_identifier: String,    // instance_identifier（工作区单实例标识；演示单独隔离）。
     service: Mutex<Option<Service>>,
+    credentials_guard: Mutex<()>, // credentials_guard（接口配置互斥锁）：保存与启动共用。
     service_epoch: AtomicU64, // service_epoch（后台服务代次，防止旧读取线程控制新进程）。
     locator: Option<Locator>, // locator（当前工作区本地身份，不读写系统定位）。
     workspace_guard: Mutex<Option<voice_desktop_common::installation::WorkspaceGuard>>, // workspace_guard（程序运行期间的本体互斥锁）。
@@ -536,10 +539,31 @@ fn ui_preview_context(args: &[String]) -> Result<(PathBuf, Option<PathBuf>, Path
 }
 
 fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), String> {
+    let _credentials_guard=state.credentials_guard.lock().map_err(|_|"接口配置锁不可用。")?;
     if state.stopping.load(Ordering::Acquire){return Err("桌面正在退出。".into());}
     if state.mode==FrontendMode::Product {
         let Some(context)=state.context() else {return Ok(());};
-        if voice_desktop_common::runtime::status(&context)?["service_ready"]!=true{return Ok(());}
+        *state.initialization.lock().unwrap()=serde_json::json!({"phase":"正在校验本地组件","can_cancel":false});
+        let readiness=voice_desktop_common::resources::startup_readiness(&context)?;
+        *state.initialization.lock().unwrap()=serde_json::json!({
+            "phase":if readiness["ready"]==true{"组件校验通过，正在启动服务"}else{"组件尚未完备，请手动下载或导入缺失组件"},
+            "components_ready":readiness["ready"],"missing_components":readiness["missing"],"can_cancel":false,
+            "fields":{"phase":"启动阶段","components_ready":"所有组件具备启动条件","missing_components":"待手动补齐的组件","can_cancel":"当前阶段是否可取消"}
+        });
+        if readiness["ready"]!=true{initialization::manage(&app,&state)?;return Ok(());}
+        let credentials=match voice_desktop_common::credentials::status(&context.data){
+            Ok(value)=>value,
+            Err(error)=>{
+                *state.initialization.lock().unwrap()=serde_json::json!({"phase":"接口密钥配置需要处理，请进入模型管理页","components_ready":true,"credentials_ready":false,"credentials_error":error,"can_cancel":false,
+                    "fields":{"phase":"启动阶段","components_ready":"所有组件具备启动条件","credentials_ready":"固定服务接口密钥已配置","credentials_error":"接口配置读取错误","can_cancel":"当前阶段是否可取消"}});
+                initialization::manage(&app,&state)?;return Ok(());
+            }
+        };
+        if !voice_desktop_common::credentials::ready(&credentials){
+            *state.initialization.lock().unwrap()=serde_json::json!({"phase":"请先在模型管理页填写接口密钥","components_ready":true,"credentials_ready":false,"can_cancel":false,
+                "fields":{"phase":"启动阶段","components_ready":"所有组件具备启动条件","credentials_ready":"固定服务接口密钥已配置","can_cancel":"当前阶段是否可取消"}});
+            initialization::manage(&app,&state)?;return Ok(());
+        }
     }
     let logs = if let Some(context) = state.context() {
         context.install.join("cache/logs")
@@ -856,6 +880,7 @@ fn run() -> Result<(), String> {
         development,
         instance_identifier,
         service: Mutex::new(None),
+        credentials_guard: Mutex::new(()),
         service_epoch: AtomicU64::new(0),
         locator,
         workspace_guard:Mutex::new(None),
@@ -900,6 +925,7 @@ fn run() -> Result<(), String> {
             exit_application,
             focus_main,
             desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init,
+            model_credentials_status,model_credentials_save,
             resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
             workspace_info,workspace_choose,workspace_link,workspace_migrate,
             resource_inventory,resource_download,resource_import,resource_import_confirm,resource_open_source,resource_cancel

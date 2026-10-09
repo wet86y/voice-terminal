@@ -24,6 +24,7 @@ OFFICIAL_EXECUTABLE = "DeepSeek Harness.exe"
 OFFICIAL_ASAR = "resources/app.asar"
 OFFICIAL_ASAR_UNPACKED = "resources/app.asar.unpacked/dsh"
 OFFICIAL_CLI = "resources/app.asar/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"
+OFFICIAL_DESKTOP_CLI = "resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js"  # OFFICIAL_DESKTOP_CLI（官方桌面命令入口）：接入随包 pnpm（包管理器）。
 OFFICIAL_SCHEDULE = "resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-schedule/lib/index.js"
 OFFICIAL_OFFICE_CLI = (
     "resources/app.asar.unpacked/dsh/node_modules/@deepseek-ai/libreoffice-kit/lib/cli.js"
@@ -54,6 +55,7 @@ class OfficialRuntimePaths:
 
     executable: Path
     cli_entry: Path
+    desktop_cli_entry: Path  # desktop_cli_entry（官方桌面命令入口）：与普通命令入口共用已校验归档。
     asar: Path
     schedule_entry: str
     office_cli: Path
@@ -221,6 +223,7 @@ def validate_official_runtime(runtime: Path, artifact: OfficialArtifact,
     return OfficialRuntimePaths(
         executable=executable,
         cli_entry=cli_entry,
+        desktop_cli_entry=runtime.joinpath(*PurePosixPath(OFFICIAL_DESKTOP_CLI).parts),
         asar=asar,
         schedule_entry=schedule_entry,
         office_cli=office_cli,

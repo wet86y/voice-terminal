@@ -1,0 +1,52 @@
+<script setup lang="ts">
+import { computed } from 'vue'
+import type { ManagedResourceJob } from './local-components'
+
+const props = defineProps<{
+  /** job（当前资源任务）与 label（对应组件的中文名称）。 */
+  job: ManagedResourceJob
+  label: string
+}>()
+const active = computed(() => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(props.job.state))
+const percent = computed(() => {
+  const { totalBytes, completedBytes } = props.job
+  if (typeof totalBytes !== 'number' || !Number.isFinite(totalBytes) || totalBytes <= 0
+    || typeof completedBytes !== 'number' || !Number.isFinite(completedBytes)) return undefined
+  return Math.max(0, Math.min(100, Math.round(completedBytes / totalBytes * 100)))
+})
+function formatBytes(value: number | null | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return ''
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB`
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${Math.round(value)} B`
+}
+</script>
+
+<template>
+  <section class="managed-resource-progress" :data-job="job.id" :aria-label="`${label}任务进度`">
+    <p class="managed-job-phase" role="status">{{ job.phase }}</p>
+    <div v-if="active || percent !== undefined" class="managed-job-progress-wrap">
+      <div class="managed-job-progress" :class="{ indeterminate: percent === undefined }" role="progressbar" :aria-label="`${label}进度`" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="percent">
+        <span :style="percent !== undefined ? { width: `${percent}%` } : undefined"></span>
+      </div>
+      <small v-if="percent !== undefined">{{ formatBytes(job.completedBytes) }} / {{ formatBytes(job.totalBytes) }} · {{ percent }}%</small>
+      <small v-else>请稍候…</small>
+    </div>
+    <p v-if="job.error" class="managed-job-error" role="alert">{{ job.error }}</p>
+  </section>
+</template>
+
+<style scoped>
+.managed-resource-progress{display:grid;gap:8px;min-width:0}
+.managed-job-phase,.managed-job-error{margin:0;font-size:var(--font-caption);color:var(--muted);overflow-wrap:anywhere;white-space:pre-wrap}
+.managed-job-error{color:var(--danger)}
+.managed-job-progress-wrap{display:grid;grid-template-columns:minmax(60px,1fr) auto;align-items:center;gap:10px}
+.managed-job-progress-wrap small{white-space:nowrap;font-size:var(--font-caption);font-variant-numeric:tabular-nums;color:var(--muted)}
+.managed-job-progress{height:7px;border-radius:999px;background:var(--line-strong);overflow:hidden}
+.managed-job-progress span{display:block;height:100%;background:var(--accent);transition:width 150ms ease}
+.managed-job-progress.indeterminate span{width:30%;animation:resource-progress 1.5s ease-in-out infinite alternate}
+@keyframes resource-progress{from{transform:translateX(0)}to{transform:translateX(230%)}}
+@container (max-width:440px){.managed-job-progress-wrap{grid-template-columns:1fr;gap:6px}.managed-job-progress-wrap small{text-align:right}}
+@media (prefers-reduced-motion:reduce){.managed-job-progress span{transition:none;animation:none}}
+</style>

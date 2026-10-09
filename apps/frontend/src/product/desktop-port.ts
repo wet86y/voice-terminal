@@ -1,4 +1,5 @@
 import { locateNativeInvoker } from '../runtime/desktop-preflight'
+import type { FixedModelCredentials } from './types'
 
 /** WorkspaceInfo（工作区信息）：由原生启动器返回的当前数据归属。 */
 export interface WorkspaceInfo {
@@ -166,6 +167,14 @@ export interface DesktopEnvironmentPort {
   showManagement(): Promise<void>
 }
 
+/** DesktopCredentialsPort（原生接口密钥设置）：不需要 Python（后端运行环境）。 */
+export interface DesktopCredentialsPort {
+  /** fixedCredentials（读取配置状态）：只返回是否已配置，不返回密钥正文。 */
+  fixedCredentials(): Promise<FixedModelCredentials>
+  /** saveFixedCredentials（保存固定服务密钥）：空白保留已有值，系统凭据库保存正文。 */
+  saveFixedCredentials(request: { deepseek_api_key: string; minimax_api_key: string }): Promise<FixedModelCredentials>
+}
+
 export function desktopPort(): DesktopPort {
   const native = locateNativeInvoker()
   const call = <T = void>(command: string, args?: Record<string, unknown>): Promise<T> =>
@@ -175,7 +184,7 @@ export function desktopPort(): DesktopPort {
         throw error instanceof Error ? error : new Error(typeof error === 'string' ? error : '原生命令执行失败。')
       })
       : Promise.reject(new Error('此操作需要桌面窗口。'))
-  const port: DesktopPort & DesktopWorkspacePort & DesktopEnvironmentPort = {
+  const port: DesktopPort & DesktopWorkspacePort & DesktopEnvironmentPort & DesktopCredentialsPort = {
     available: Boolean(native),
     focus: () => call('focus_main'),
     openLogs: () => call('open_logs'),
@@ -201,6 +210,8 @@ export function desktopPort(): DesktopPort {
     environmentGuide: () => call('environment_guide'),
     startVoiceService: () => call('desktop_start_service'),
     showManagement: () => call('desktop_manage'),
+    fixedCredentials: () => call('model_credentials_status'),
+    saveFixedCredentials: request => call('model_credentials_save', { request }),
     listen: async <T>(eventName: string, handler: (event: DesktopEvent<T>) => void) => {
       const eventWindow = typeof window === 'undefined' ? undefined : window as NativeEventWindow
       const eventRuntime = eventWindow?.__TAURI_INTERNALS__

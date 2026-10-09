@@ -51,4 +51,82 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(wrapper.find('.resource-batch-import').exists()).toBe(false)
     wrapper.unmount()
   })
+
+  it('下载进度与取消入口直接呈现在原组件卡片，开始前显示不确定进度', async () => {
+    const value = model()
+    value.rows[0].resource!.state = 'missing'
+    value.rows[0].resource!.error = '旧安装错误'
+    value.managedResourceJobs = [{ id: 'env-all', resourceId: 'voice-server', label: '语音环境', state: 'running', phase: '计算本次依赖总下载量', canCancel: true }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = wrapper.get('[data-component="voice-system"]')
+    expect(card.get('[data-job="env-all"]').text()).toContain('计算本次依赖总下载量')
+    expect(card.get('[role="progressbar"]').attributes('aria-valuenow')).toBeUndefined()
+    expect(card.text()).not.toContain('旧安装错误')
+    expect(wrapper.find('.managed-resource-jobs').exists()).toBe(false)
+    expect(card.find('.local-install-actions').exists()).toBe(false)
+    await card.get('button[aria-label="Voice Server（语音服务）：取消任务"]').trigger('click')
+    expect(wrapper.emitted('cancelResource')).toEqual([['env-all']])
+    await wrapper.setProps({ model: { ...value, managedResourceJobs: [{ ...value.managedResourceJobs[0], completedBytes: 150, totalBytes: 300 }] } })
+    expect(card.get('[role="progressbar"]').attributes('aria-valuenow')).toBe('50')
+    expect(card.get('[data-job="env-all"]').text()).toContain('150 B / 300 B · 50%')
+    wrapper.unmount()
+  })
+
+  it('同一组件运行中的新任务覆盖旧失败，完成后恢复详情入口', async () => {
+    const value = model()
+    value.rows[0].resource!.state = 'missing'
+    const active = { id: 'env-new', resourceId: 'voice-server', label: '语音环境', state: 'running', phase: '正在下载语音运行依赖', completedBytes: 50, totalBytes: 100, canCancel: true }
+    value.managedResourceJobs = [active, { ...active, id: 'env-old', state: 'failed', error: '旧失败' }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    expect(wrapper.findAll('[data-job]')).toHaveLength(1)
+    expect(wrapper.get('[data-job]').attributes('data-job')).toBe('env-new')
+    expect(wrapper.text()).not.toContain('旧失败')
+    await wrapper.setProps({ model: { ...model(), managedResourceJobs: [{ ...active, state: 'complete', canCancel: false }] } })
+    expect(wrapper.find('[data-job]').exists()).toBe(false)
+    expect(wrapper.find('.local-install-actions').exists()).toBe(false)
+    await wrapper.get('.local-component-action').trigger('click')
+    expect(wrapper.get('.local-component-detail').text()).toContain('完整语音运行环境')
+    wrapper.unmount()
+  })
+
+  it('失败原因与重试操作保留在所属组件卡片中', async () => {
+    const value = model()
+    value.rows[0].resource!.state = 'missing'
+    value.managedResourceJobs = [{ id: 'env-all', resourceId: 'voice-server', label: '语音环境', state: 'failed', phase: '资源处理失败', error: '_socket（网络基础扩展）无法加载', canCancel: false }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = wrapper.get('[data-component="voice-system"]')
+    expect(card.get('[role="alert"]').text()).toContain('_socket（网络基础扩展）无法加载')
+    expect(card.get('button[aria-label="Voice Server（语音服务）：下载"]').text()).toBe('重试下载')
+    await card.get('button[aria-label="Voice Server（语音服务）：下载"]').trigger('click')
+    expect(wrapper.emitted('resourceDownload')).toEqual([['voice-server']])
+    wrapper.unmount()
+  })
+
+  it('批量导入进度复用批量入口所在区域，提交时关闭取消按钮', () => {
+    const value = model()
+    value.managedResourceJobs = [{ id: 'import-all', resourceId: 'batch', label: '批量资源导入', state: 'running', phase: '正在启用资源', canCancel: false }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const heading = wrapper.get('.local-managed-heading')
+    expect(heading.get('[data-job="import-all"]').text()).toContain('正在启用资源')
+    expect(heading.get('button').attributes('disabled')).toBeDefined()
+    expect(wrapper.find('.managed-resource-jobs').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('一个组件正在下载时仍允许启动其他组件下载', async () => {
+    const value = model()
+    value.rows[0].resource!.state = 'missing'
+    value.resourceTasksBusy = true
+    value.rows.push({ ...value.rows[0], id: 'paraformer', name: 'Paraformer（流式语音识别）',
+      resource: { id: 'paraformer-streaming', label: '流式识别模型', state: 'missing', status: '待安装' } })
+    value.managedResourceJobs = [{ id: 'env-all', resourceId: 'voice-server', label: '语音环境',
+      state: 'running', phase: '正在下载语音运行依赖', canCancel: true }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const button = wrapper.get('button[aria-label="Paraformer（流式语音识别）：下载"]')
+    expect(button.attributes('disabled')).toBeUndefined()
+    await button.trigger('click')
+    expect(wrapper.emitted('resourceDownload')).toEqual([['paraformer-streaming']])
+    expect(wrapper.get('[data-component="voice-system"]').find('.local-install-actions').exists()).toBe(false)
+    wrapper.unmount()
+  })
 })

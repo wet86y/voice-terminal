@@ -11,6 +11,7 @@ pub mod native_ui;
 pub mod workspace;
 pub mod runtime; // runtime（私有语音环境）：安装计划、校验及事务启用。
 pub mod resources; // resources（原生资源管理）：不依赖业务后端。
+pub mod credentials; // credentials（原生接口密钥）：组件未就绪时也能配置。
 pub mod webview; // webview（系统网页引擎）：Evergreen（自动更新版）检测与引导。
 pub mod installation; // installation（本体安装）：正式程序包校验、重装与启动交接。
 pub mod shortcuts; // shortcuts（桌面快捷方式）：仅维护本程序创建的入口。
