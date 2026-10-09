@@ -14,6 +14,8 @@ if __name__ == '__main__':
     scratch.mkdir(parents=True, exist_ok=True)
     tempfile.tempdir = str(scratch)
     os.environ.update(TEMP=str(scratch), TMP=str(scratch))
+    # TIKTOKEN_CACHE_DIR（分词器缓存目录）持久留在可回收缓存，避免每轮测试重复下载。
+    os.environ.setdefault('TIKTOKEN_CACHE_DIR', str(ROOT / '.local/cache/tiktoken'))
     temporary = ROOT / '.local/tmp/pytest'
     if '--child' in sys.argv:
         import pytest

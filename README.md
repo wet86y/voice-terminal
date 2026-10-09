@@ -144,6 +144,7 @@ git diff --check
 
 ## 文档入口
 
+- [当前开发与分发交付](docs/current-release.md)：两个测试入口、重建命令、过期产物清理和最近一次构建核对结果。
 - [独立桌面应用、数据分离与便携构建](docs/desktop-application.md)：Tauri 2（桌面应用框架）窗口、独立预览、构建与迁移命令。
 - [本地目录与覆盖发布](docs/local-layout.md)：唯一资源路径、日常更新、用户数据备份与最新交付导出。
 - [本地目录整理验收](docs/local-layout-acceptance-20261008.md)：2026-10-08 迁移、清退体积、数据完整性、实机启动与失败恢复结果。

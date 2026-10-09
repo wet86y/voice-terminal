@@ -184,7 +184,7 @@ def test_backup_restores_important_data_without_dependencies_or_cache(tmp_path):
     assert not (root / 'tmp/user-backup.old').exists()
 
 
-def test_native_cache_reused_until_lock_changes(tmp_path, monkeypatch):
+def test_native_cache_records_lock_changes_without_deleting_channel_outputs(tmp_path, monkeypatch):
     module = script('prepare-build-cache')
     monkeypatch.setattr(module, 'ROOT', tmp_path)
     lock = tmp_path / 'apps/desktop/Cargo.lock'
@@ -196,9 +196,13 @@ def test_native_cache_reused_until_lock_changes(tmp_path, monkeypatch):
     module.prepare('desktop', 'compiler-1')
     module.prepare('desktop', 'compiler-1')
     assert cached.exists()
+    marker = tmp_path / '.local/build/desktop-cache.json'
+    previous = json.loads(marker.read_text(encoding='utf-8'))['fingerprint']
     lock.write_text('version-2')
     module.prepare('desktop', 'compiler-1')
-    assert not cached.exists()
+    # Cargo（原生包管理器）按依赖重新编译，各渠道固定输出不因登记新锁而整体删除。
+    assert cached.exists()
+    assert json.loads(marker.read_text(encoding='utf-8'))['fingerprint'] != previous
 
 
 def test_dsh_cache_refresh_preserves_tracked_sources(tmp_path, monkeypatch):
@@ -250,11 +254,16 @@ def frontend_build(path):
     """建立最小产品构建闭包，用于验证正式组装边界。"""
     (path / 'assets').mkdir(parents=True)
     (path / 'index.html').write_text('<script src="/assets/main.js"></script>', encoding='utf-8')
+    (path / 'management.html').write_text('<script src="/assets/management.js"></script>', encoding='utf-8')
+    (path / 'assets/management.js').write_text('management()', encoding='utf-8')
+    for name in ('startup.html', 'startup.css', 'app-icon.svg'):
+        (path / name).write_text('fixture', encoding='utf-8')
     (path / 'assets/main.js').write_text('import("./product.js")', encoding='utf-8')
     (path / 'assets/product.js').write_text('product()', encoding='utf-8')
     (path / 'assets/product.css').write_text('body{}', encoding='utf-8')
     atomic_json(path / 'desktop-manifest.json', {
         'index.html': {'isEntry': True, 'file': 'assets/main.js', 'dynamicImports': ['product']},
+        'management.html': {'isEntry': True, 'file': 'assets/management.js'},
         'product': {'file': 'assets/product.js', 'css': ['assets/product.css']},
     })
 
@@ -265,6 +274,7 @@ def test_frontend_collection_only_copies_product_dependency_closure(tmp_path):
     script('assemble-desktop').collect_frontend(source, target)
     assert {path.relative_to(target).as_posix() for path in target.rglob('*') if path.is_file()} == {
         'index.html', 'desktop-manifest.json', 'assets/main.js', 'assets/product.js', 'assets/product.css',
+        'management.html', 'assets/management.js', 'startup.html', 'startup.css', 'app-icon.svg',
     }
 
 

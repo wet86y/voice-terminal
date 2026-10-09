@@ -12,6 +12,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 spec=importlib.util.spec_from_file_location('assembler',ROOT/'scripts/assemble-desktop.py')
 assembler=importlib.util.module_from_spec(spec);spec.loader.exec_module(assembler)
+from voice_terminal import __version__ # __version__（源码版本）：与开发清单和接口元数据一致。
 from voice_terminal.distribution import manifest,verify
 from voice_terminal.paths import atomic_json
 
@@ -31,11 +32,12 @@ if __name__=='__main__':
             shutil.copy2(ROOT/'.local/build/runtime-lock'/row['file'],destination)
             if hashlib.sha256(destination.read_bytes()).hexdigest()!=row['sha256']:raise ValueError('内置依赖摘要不一致')
     record=manifest(stage,kind='app',build='embedded-'+json.loads((ROOT/'package.json').read_text())['version'])
+    record['display_version']=__version__ # display_version（与源码一致的程序显示版本）。
     record['launch_channel']='distribution'
     record['required_components']=[] # required_components（必要组件）：桌面不依赖后端或模型。
     record['optional_components']=['python','models','dsh','webview2'] # optional_components（按需组件）。
     record['components']=[] # components（可选组件绑定）：原生安装后补记运行环境与资源摘要。
-    record['fields']={'launch_channel':'分发渠道；内嵌清单排除程序自身，启用后补齐实际入口','files':'本体固定文件','path':'相对路径','size':'字节数','sha256':'SHA-256 文件摘要'}
+    record['fields']={'display_version':'与源码一致的程序显示版本','launch_channel':'分发渠道；内嵌清单排除程序自身，启用后补齐实际入口','files':'本体固定文件','path':'相对路径','size':'字节数','sha256':'SHA-256 文件摘要'}
     atomic_json(stage/'release.json',record);verify(stage,record)
     archive=cache/'app.zip'
     with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as output:

@@ -1,6 +1,23 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use std::{fs, path::Path, process::Command, sync::{Arc, atomic::AtomicBool}};
+use std::{fs, path::{Path, PathBuf}, process::Command, sync::{Arc, atomic::AtomicBool}};
 use voice_desktop_common::{LaunchChannel, LaunchContext, native_ui, workspace::{self, Locator}};
+
+// desktop_executable（桌面程序定位）：开发源码目录与已发布的原生程序目录不同。
+fn desktop_executable(context: &LaunchContext, executable: &Path) -> Result<PathBuf, String> {
+    let sibling = executable.parent().ok_or("启动程序缺少目录")?.join("VoiceTerminalDesktop.exe");
+    let desktop = if context.channel == LaunchChannel::Development && sibling.is_file() {
+        sibling
+    } else if context.channel == LaunchChannel::Development {
+        // install（安装根目录）保留发布本体；program（业务源码目录）仍供开发后端使用。
+        context.install.join("app/VoiceTerminalDesktop.exe")
+    } else {
+        context.program.join("VoiceTerminalDesktop.exe")
+    };
+    if !desktop.is_file() {
+        return Err(format!("程序包缺少 VoiceTerminalDesktop.exe（桌面主程序）：{}", desktop.display()));
+    }
+    Ok(desktop)
+}
 
 fn value<'a>(args:&'a [String],key:&str)->Option<&'a str>{args.iter().position(|v|v==key).and_then(|i|args.get(i+1)).map(String::as_str)}
 fn run_workspace_task(task:&Path,locator:&Locator,title:&str)->Result<(),String>{
@@ -79,11 +96,8 @@ fn start() -> Result<(), String> {
         return Err("桌面样例请通过开发桌面主程序启动。".into());
     }
     let context = LaunchContext::from_args()?;
-    let sibling=std::env::current_exe().map_err(|e|e.to_string())?.parent().ok_or("启动程序缺少目录")?.join("VoiceTerminalDesktop.exe");
-    let desktop = if context.channel==LaunchChannel::Development&&sibling.is_file(){sibling}else{context.program.join("VoiceTerminalDesktop.exe")};
-    if !desktop.is_file() {
-        return Err("程序包缺少 VoiceTerminalDesktop.exe（桌面主程序）。".into());
-    }
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let desktop = desktop_executable(&context, &executable)?;
     let mut command=Command::new(desktop);context.configure_command(&mut command);
     command.current_dir(&context.program).args(args).spawn().map_err(|e|format!("无法建立桌面窗口：{e}"))?;
     Ok(()) // 根入口不保留第二套托盘／服务管理进程。
@@ -96,5 +110,62 @@ fn main() {
             if !qualification&&!message.contains("已取消")&&native_ui::retry(&message){continue;}
             std::process::exit(1);
         }}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str, channel: LaunchChannel) -> (PathBuf, LaunchContext) {
+        let root = std::env::temp_dir().join(format!("voice-bootstrap-中文 空格-{name}-{}", std::process::id()));
+        let install = root.join(".local");
+        fs::create_dir_all(install.join("app")).unwrap();
+        fs::write(install.join("app/VoiceTerminalDesktop.exe"), b"installed-desktop").unwrap();
+        let program = if channel == LaunchChannel::Development { root.clone() } else { install.join("app") };
+        let context = LaunchContext {
+            channel, workspace_id: "test".into(), install: install.clone(), program,
+            data: install.join("data"), python: install.join("runtimes/python/python.exe"),
+            models: None, webview2: None, dsh: None, node: None, dev: false, diagnostic: false,
+        };
+        (root, context)
+    }
+
+    #[test]
+    fn published_development_entry_uses_installed_desktop_with_source_context() {
+        let (root, context) = fixture("published", LaunchChannel::Development);
+        assert!(!context.program.join("VoiceTerminalDesktop.exe").exists());
+        let desktop = desktop_executable(&context, &context.install.join("VoiceTerminal.exe")).unwrap();
+        assert_eq!(desktop, context.install.join("app/VoiceTerminalDesktop.exe"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn development_build_entry_prefers_its_compiled_sibling() {
+        let (root, context) = fixture("build", LaunchChannel::Development);
+        let output = context.install.join("build/desktop/development/release");
+        fs::create_dir_all(&output).unwrap();
+        fs::write(output.join("VoiceTerminalDesktop.exe"), b"compiled-desktop").unwrap();
+        assert_eq!(desktop_executable(&context, &output.join("VoiceTerminal.exe")).unwrap(), output.join("VoiceTerminalDesktop.exe"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distribution_entry_uses_workspace_program_even_with_a_sibling() {
+        let (root, context) = fixture("distribution", LaunchChannel::Distribution);
+        fs::write(context.install.join("VoiceTerminalDesktop.exe"), b"unrelated-sibling").unwrap();
+        assert_eq!(desktop_executable(&context, &context.install.join("VoiceTerminal.exe")).unwrap(), context.program.join("VoiceTerminalDesktop.exe"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_development_desktop_reports_the_actual_install_path() {
+        let (root, context) = fixture("missing", LaunchChannel::Development);
+        let expected = context.install.join("app/VoiceTerminalDesktop.exe");
+        fs::remove_file(&expected).unwrap();
+        let error = desktop_executable(&context, &context.install.join("VoiceTerminal.exe")).unwrap_err();
+        assert!(error.contains(expected.to_str().unwrap()));
+        assert!(!context.data.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }
