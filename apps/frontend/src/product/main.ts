@@ -1,4 +1,4 @@
-import { runDesktopPreflight } from '../runtime/desktop-preflight'
+import { locateNativeInvoker, runDesktopPreflight } from '../runtime/desktop-preflight'
 import { loadProductApplicationConfig } from './application-config'
 import { rememberStartupSkip, clearStartupSkip } from '../runtime/startup-choice'
 
@@ -12,5 +12,6 @@ void runDesktopPreflight({
     await loadProductApplicationConfig()
     const application = await import('./application')
     application.mountProductApplication()
+    await locateNativeInvoker()?.invoke('desktop_page_ready') // desktop_page_ready（产品页真实挂载确认）。
   },
 })

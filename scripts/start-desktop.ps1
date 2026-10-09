@@ -1,43 +1,25 @@
-﻿param([switch]$Dev, [switch]$Diagnostic, [switch]$UiPreview, [string]$Python = '', [string]$DataDir = '', [string]$WebView2 = '', [string]$InstallRoot = '')
-
-function Invoke-DesktopBuild {
-  param(
-    [Parameter(Mandatory = $true)]$BuildScript,
-    [switch]$Dev,
-    [switch]$UiPreview
-  )
-  $BuildArguments = @{
-    LaunchChannel = 'development'
-    OptimizationLevel = 'debug'
-    SkipFrontend = ($Dev -or $UiPreview)
-  }
-  & $BuildScript @BuildArguments
-}
-
-if ($MyInvocation.InvocationName -ne '.') {
-  $ErrorActionPreference = 'Stop'
-  # Windows PowerShell（系统脚本环境）默认编码随系统变化；演示启动日志固定 UTF-8（统一字符编码）。
-  $OutputEncoding = [Text.UTF8Encoding]::new($false)
-  try { [Console]::OutputEncoding = $OutputEncoding } catch { }
-  . (Join-Path $PSScriptRoot 'local-context.ps1')
-$DesktopRepo = Get-ProjectRoot
-  $Executable = Join-Path $DesktopRepo '.local/build/desktop/development/debug/VoiceTerminalDesktop.exe'
-  if ($UiPreview -and ($Dev -or $Diagnostic -or $Python -or $DataDir -or $InstallRoot)) {
-    throw '桌面样例不接受 -Dev、-Diagnostic、-Python、-DataDir 或 -InstallRoot（产品启动参数）。'
-  }
-  Invoke-DesktopBuild -BuildScript (Join-Path $PSScriptRoot 'build-desktop.ps1') -Dev:$Dev -UiPreview:$UiPreview
-  $Arguments = @('--root', $DesktopRepo)
-  if ($WebView2) { $Arguments += @('--webview2', $WebView2) }
-  if ($UiPreview) {
-    $Arguments += '--ui-preview'
-  } else {
-    if ($InstallRoot) { $Arguments += @('--install', $InstallRoot) }
-    if ($Python) { $Arguments += @('--python', $Python) }
-    if ($DataDir) { $Arguments += @('--data-dir', $DataDir) }
-    if ($Dev) { $Arguments += '--dev' }
-    if ($Diagnostic) { $Arguments += '--diagnostic' }
-  }
-  # 直接调用避免 Start-Process（进程启动工具）的字符串参数二次拆分。
-  & $Executable @Arguments
+﻿param([switch]$Dev,[switch]$Diagnostic,[switch]$UiPreview,[string]$InstallRoot='')
+if ($MyInvocation.InvocationName -eq '.') { return }
+$ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'local-context.ps1')
+$DesktopRepo=Get-ProjectRoot
+if ($UiPreview) {
+  if ($Dev -or $Diagnostic -or $InstallRoot) {throw '演示使用隔离缓存，不接受业务运行参数。'}
+  & (Join-Path $PSScriptRoot 'build-desktop.ps1') -BuildTarget product -OptimizationLevel debug -SkipFrontend
+  if ($LASTEXITCODE) {throw '演示宿主构建失败。'}
+  Copy-Item -LiteralPath (Join-Path $DesktopRepo '.local/build/desktop/product/debug/VoiceTerminalUIDemo.exe') -Destination (Join-Path $DesktopRepo '.local/VoiceTerminalUIDemo.exe') -Force
+  & (Join-Path $DesktopRepo '.local/build/desktop/product/debug/VoiceTerminalDesktop.exe') '--root' $DesktopRepo '--ui-preview'
   exit $LASTEXITCODE
 }
+if (-not $InstallRoot) {$InstallRoot=Join-Path $DesktopRepo '.local'}
+$Executable=Join-Path $InstallRoot 'VoiceTerminal.exe'
+if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {throw '缺少正式入口，请先执行 npm run desktop:publish（本地发布）。'}
+$Arguments=@()
+if ($Dev) {$Arguments+=@('--dev','--source-root',$DesktopRepo)}
+if ($Diagnostic) {$Arguments+='--diagnostic'}
+# PowerShell（命令环境）的直接调用会等待后代进程；只等待根入口完成交接。
+$LaunchOptions=@{FilePath=$Executable;WorkingDirectory=$InstallRoot;WindowStyle='Normal';PassThru=$true}
+if ($Arguments.Count) {$LaunchOptions.ArgumentList=($Arguments | ForEach-Object {'"'+$_+'"'}) -join ' '}
+$EntryProcess=Start-Process @LaunchOptions
+$EntryProcess.WaitForExit()
+exit $EntryProcess.ExitCode

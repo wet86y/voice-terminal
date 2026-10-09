@@ -32,10 +32,10 @@ def local_root() -> Path:
 
 
 def default_portable() -> dict:
-    return {"schema": SCHEMA, "data_dir": "data", **COMPONENTS,
+    return {"schema": SCHEMA, "data_dir": "data", **COMPONENTS, "webview2": None,
             "fields": {"schema": "便携配置格式", "data_dir": "唯一用户数据目录", "app": "正式程序目录",
                        "python": "后端解释器", "models": "必要模型集合", "dsh": "代理生产宿主",
-                       "webview2": "固定网页渲染引擎"}}
+                       "webview2": "系统网页运行引擎；旧私有引擎文件可以保留"}}
 
 
 def assert_launch_ready(root: Path) -> None:

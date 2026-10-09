@@ -292,9 +292,8 @@ class DshRuntimeManager:
                 atomic_json(target, merge_profile_package(managed, existing))
             else:
                 shutil.copyfile(source, target)
-        # 物理闭包使用用户区联接；官方 Desktop（桌面版）模块留在 ASAR（Electron 归档），不建立目录联接。
-        if modules_target is not None:
-            await self._ensure_modules_link(modules_target)
+        # 运行包的安装锚点和配置档解析器负责依赖定位；用户数据目录不再建立依赖联接。
+        self._remove_legacy_modules_link(modules_target)
         managed_patch = profile / "cordis.patch.yml"
         if not self._profile_patch_preserves_managed_defaults(self.config.profile_patch, managed_patch):
             raise RuntimeError("DSH（代理执行宿主）的用户配置缺少必要的受管默认项。")
@@ -334,20 +333,26 @@ class DshRuntimeManager:
             env["HOMEDRIVE"] = drive
             env["HOMEPATH"] = home_path
 
-    async def _ensure_modules_link(self, target: Path) -> None:
-        target = target.resolve()
-        if not target.is_dir():
-            raise RuntimeError("DSH（代理执行宿主）受管依赖目录缺失。")
+    def _remove_legacy_modules_link(self, target: Path | None) -> None:
+        """Remove legacy managed junction（解除旧受管联接），保留实际依赖与用户内容。"""
         link = self.config.home_dir / "node_modules"
-        if link.is_junction() and link.resolve() != target:
-            link.rmdir()  # 只移除本次管理的联接，不递归删除目标。
-        if not link.exists():
-            link.parent.mkdir(parents=True, exist_ok=True)
-            script = "& { param($link,$target) New-Item -ItemType Junction -Path $link -Target $target -ErrorAction Stop | Out-Null } "
-            quote = lambda value: "'" + str(value).replace("'", "''") + "'"
-            await self._run_checked("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script + quote(link) + " " + quote(target))
-        elif not link.is_junction() or link.resolve() != target:
-            raise RuntimeError("DSH（代理执行宿主）用户目录的受管依赖位置存在冲突。")
+        if not link.is_junction() and not link.is_symlink():
+            return
+        expected = target
+        if expected is None and self.release_runtime is not None:
+            metadata = self.release_runtime / "runtime.json"
+            if metadata.is_file():
+                record = json.loads(metadata.read_text(encoding="utf-8-sig"))
+                relative = record.get("modules")
+                if isinstance(relative, str):
+                    from ..distribution import safe_path
+                    expected = safe_path(self.release_runtime, relative)
+        if expected is None or link.resolve() != expected.resolve():
+            raise RuntimeError("旧代理依赖联接的目标不能确认为当前运行包，已保留该联接与用户配置。")
+        if link.is_junction():
+            link.rmdir()
+        else:
+            link.unlink()
 
     @staticmethod
     def _profile_patch_preserves_managed_defaults(source: Path, managed: Path) -> bool:

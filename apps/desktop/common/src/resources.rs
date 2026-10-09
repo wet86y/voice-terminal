@@ -11,7 +11,7 @@ pub fn load(path:&Path)->Result<Value,String>{
     serde_json::from_slice(bytes.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(&bytes)).map_err(|e|e.to_string())
 }
 pub fn specs(context:&LaunchContext)->Result<Vec<Value>,String>{
-    Ok(load(&context.program.join("config/resources/catalog.json"))?["resources"].as_array().ok_or("资源目录格式无效")?.clone())
+    Ok(load(&context.installed_program().join("config/resources/catalog.json"))?["resources"].as_array().ok_or("资源目录格式无效")?.clone())
 }
 pub fn spec(context:&LaunchContext,id:&str)->Result<Value,String>{specs(context)?.into_iter().find(|v|v["resource_id"]==id).ok_or("不支持的资源编号".into())}
 fn destination(context:&LaunchContext,spec:&Value)->Result<PathBuf,String>{

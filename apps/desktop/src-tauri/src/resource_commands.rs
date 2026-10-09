@@ -335,14 +335,14 @@ impl ResourceManager {
             if phase.starts_with("启用")||phase.starts_with("正在启用"){let _=self.begin_non_cancellable_phase(job_id,phase,done,Some(total));}
             else{self.set_phase(job_id,phase,true,done,Some(total));}
         };
-        if resource_id!="dsh" && self.context.channel==voice_desktop_common::LaunchChannel::Distribution {
+        if resource_id!="dsh" {
             let group=voice_desktop_common::runtime::model_group(resource_id);
             voice_desktop_common::runtime::configure(&self.context,group,cancel.clone(),&mut progress)
                 .map_err(|message|JobError::Failed{message,installed:vec![]})?;
         }
         let spec=voice_desktop_common::resources::spec(&self.context,resource_id).map_err(|message|JobError::Failed{message,installed:vec![]})?;
         let result=if spec["source"]["transfer"]["kind"]=="modelscope_sdk" {
-            if self.context.channel==voice_desktop_common::LaunchChannel::Distribution {
+            {
                 voice_desktop_common::runtime::configure(&self.context,"modelscope-download",cancel,&mut progress)
                     .map_err(|message|JobError::Failed{message,installed:vec![]})?;
             }

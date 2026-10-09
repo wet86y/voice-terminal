@@ -145,7 +145,10 @@ def collect_desktop_crt(program: Path) -> None:
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
     runtime_record = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-    verify(runtime, runtime_record)
+    # 此包只收集 C++ 运行库。逐个核对下方双重清单与实际文件，
+    # 不为组装固定本体重复扫描未随包交付的数万代理依赖。
+    if runtime_record.get("schema") != 1 or runtime_record.get("kind") != "dsh":
+        raise ValueError("DSH（代理宿主）运行基线清单格式无效。")
     lock = json.loads((ROOT / "config/dsh/runtime.lock.json").read_text(encoding="utf-8-sig"))
     if (metadata.get("schema") != 1
             or metadata.get("version") != lock.get("version")
@@ -236,23 +239,21 @@ def collect_program(program: Path, desktop: Path, *, include_desktop: bool = Tru
 
 def root_files(output: Path, desktop: Path) -> list[dict]:
     output.mkdir(parents=True, exist_ok=True)
-    for name in ("VoiceTerminal.exe", "VoiceTerminalUIDemo.exe"):
-        shutil.copy2(desktop / name, output / name)
-    shutil.copy2(ROOT / "scripts/verify-package.ps1", output / "Verify-Package.ps1")
-    # 交付说明必须自包含，不能复制依赖源码文档相对链接的页面。
-    (output / '使用与环境说明.md').write_text('''# 使用与环境说明
+    shutil.copy2(desktop / 'VoiceTerminal.exe', output / 'VoiceTerminal.exe')
+    shutil.copy2(ROOT / 'scripts/verify-package.ps1', output / 'Verify-Package.ps1')
+    (output / '使用与环境说明.md').write_text("""# 使用与环境说明
 
-双击 VoiceTerminal.exe（正式入口）启动。应用关闭窗口后隐藏到托盘；使用菜单或托盘的退出操作，才能正常回收所属服务。Verify-Package.ps1（整包校验）使用随包解释器核对当前程序和组件摘要。
+双击 VoiceTerminal.exe（正式入口）启动。正式入口从自身位置解析工作区，使用 app（已发布本体）内的业务与静态界面，无须源码仓库。系统 WebView2（网页运行引擎）由安装器引导安装。关闭窗口隐藏到托盘；请通过应用或托盘的退出操作回收服务。
 
-portable.json（便携配置）是唯一组件路径来源：schema=2（第二版），app=app（程序），python=runtimes/python/python.exe（后端解释器），models=models（模型），dsh=runtimes/dsh（代理宿主，含脚本解释器），webview2=runtimes/webview2（网页引擎），data_dir=data（用户数据）。请整体移动安装根目录，不单独改变组件相对位置。
+首次安装和保留数据的重装使用 VoiceTerminalSetup.exe（分发安装器）。安装器只展开程序本体，不下载语音环境、模型或代理宿主。进入正式程序的组件管理页面完成下载、导入与配置。重装保留 data（用户数据）、工作区编号、models（模型）、runtimes（运行环境）及其登记。Verify-Package.ps1（本体校验）不依赖后端环境。
 
-用户配置、人格、声纹、会话、任务、工作区与凭据保存在 data（持久数据）中。首次启动只补缺失模板。backups/user-data（唯一滚动备份）只收集持久数据，先核对新备份摘要再替换旧备份；模型、依赖、日志、浏览器缓存及字节码不备份。恢复先在隔离目录核对 backup.json（备份清单），停机后再恢复所需数据。系统凭据存储保持原状。
+portable.json（工作区布局）使用 schema=2（第二版）：app（程序本体）、runtimes/python（后端环境）、runtimes/dsh（代理宿主）、models（模型）、data（用户数据）、cache（缓存）、tmp（临时区）、backups（备份）。请整体移动工作区；移动后可直接双击正式入口，不使用系统用户目录定位记录。应用提供工作区切换与整体迁移。
 
-在完整源码工程中维护时，npm run desktop:publish（覆盖发布）构建并校验候选，停机后同盘重命名换入固定目录；成功回收旧组件，失败原位恢复，中断记录在下次发布前处理。程序更新不覆盖 data（用户数据），没有变化的模型及运行依赖直接复用。明确导出时执行 scripts/package-desktop.py（最新交付导出），不自动制作整包备份。
+正式程序的“应用更新”页面保留，在线更新后续接入 GitHub（代码与发布托管平台），并使用同一正式程序包与本体替换事务。分发安装器承担首次安装及重装。
 
-VoiceTerminalUIDemo.exe（演示入口）面向完整源码工程，使用固定调试宿主及前端源码；交付设备使用正式入口。演示不启动语音业务。源码业务、正式业务和无界面后端共用同一环境、模型及数据。
-''', encoding='utf-8')
-    return [{"path":name,"size":(output / name).stat().st_size,"sha256":digest(output / name)} for name in ("VoiceTerminal.exe", "VoiceTerminalUIDemo.exe", "Verify-Package.ps1", "使用与环境说明.md")]
+源码项目的 npm run desktop:start（正式启动）与双击共用正式入口。npm run desktop:publish（本地发布）构建并事务替换程序本体；npm run dev（源码热更新）通过同一正式入口显式传入 --dev（调试开关）与 --source-root（源码目录）。源码调试保持同一工作区、组件和退出逻辑。同一工作区不能同时启动普通模式与源码调试模式。界面演示使用独立缓存。
+""", encoding='utf-8')
+    return [{"path":name,"size":(output / name).stat().st_size,"sha256":digest(output / name)} for name in ('VoiceTerminal.exe','Verify-Package.ps1','使用与环境说明.md')]
 
 
 def atomic_bytes(path: Path, value: bytes) -> None:
@@ -332,10 +333,12 @@ def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime=None, p
                 components.append({'kind': kind, 'path': relative, 'build': record['build'], 'manifest_sha256': digest(effective / 'manifest.json')})
             roots = root_files(candidate, desktop)
             release = manifest(program, kind='app', build=build)
-            release.update(display_version=__version__, compatibility={'desktop_protocol': 1, 'data_format': 1}, components=components, root_files=roots,
+            release.update(display_version=__version__, role='product', required_components=[], optional_components=['python','models','dsh','webview2'], compatibility={'desktop_protocol': 1, 'data_format': 1}, components=components, root_files=roots,
                            fields={'build': '构建编号，仅作记录', 'display_version': '与源码一致的程序显示版本', 'components': '固定组件清单', 'root_files': '根启动入口摘要'})
             atomic_json(program / 'release.json', release)
-            atomic_json(candidate / 'portable.json', default_portable())
+            portable = read_portable(output) if (output / 'portable.json').is_file() else default_portable()
+            portable['webview2'] = None
+            atomic_json(candidate / 'portable.json', portable)
             verify(program, release)
             print('待换入程序已校验，开始停机检查与更新事务。', flush=True)
             changed += [item['path'] for item in roots] + ['portable.json']
@@ -352,7 +355,7 @@ def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime=None, p
 def main():
     parser = argparse.ArgumentParser(description='固定目录覆盖发布，不自动生成交付压缩包')
     parser.add_argument('--output', type=Path, default=ROOT / '.local', help='output（本机安装根目录）')
-    parser.add_argument('--desktop', type=Path, default=ROOT / '.local/build/desktop/development/release', help='desktop（development 开发渠道的原生构建目录）')
+    parser.add_argument('--desktop', type=Path, default=ROOT / '.local/build/desktop/product/release', help='desktop（统一正式程序构建目录）')
     parser.add_argument('--build', default=datetime.now(timezone.utc).strftime('desktop-%Y%m%d-%H%M%S'), help='build（清单构建编号）')
     parser.add_argument('--refresh-program', action='store_true', help='保留公开命令参数，发布始终采用覆盖更新')
     parser.add_argument('--dsh-runtime', type=Path, help='dsh-runtime（新的闭合代理运行组件）')

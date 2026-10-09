@@ -14,7 +14,7 @@ class AppPaths:
     program_root: Path  # program_root（当前程序包或源码目录）。
     install_root: Path  # install_root（应用安装／解压根目录）。
     data_root: Path | None = None  # data_root（独立用户数据目录；为空时兼容源码布局）。
-    channel: str = "development"  # channel（启动渠道，独立于优化构建级别）。
+    channel: str = "product"  # channel（兼容记录字段）：正式入口统一为 product（产品）。
 
     @classmethod
     def resolve(cls, program_root: Path | None = None, *, data_dir: Path | None = None) -> "AppPaths":
@@ -22,13 +22,17 @@ class AppPaths:
         program = Path(os.environ.get("VOICE_PROGRAM_ROOT") or program_root or project_root()).resolve()
         default_install = program / '.local' if (program / 'apps/desktop/Cargo.toml').is_file() else program.parent
         install = Path(os.environ.get("VOICE_INSTALL_ROOT") or default_install).resolve()
-        channel = os.environ.get("VOICE_LAUNCH_CHANNEL", "development")
-        if channel not in {"development", "distribution"}:
+        channel = os.environ.get("VOICE_LAUNCH_CHANNEL", "product")
+        if channel not in {"product", "development", "distribution"}:
             raise ValueError("未知启动渠道。")
+        if channel == "product" and os.environ.get("VOICE_LAUNCH_CHANNEL"):
+            source_debug = os.environ.get("VOICE_SOURCE_DEBUG") == "1"
+            if (not source_debug and program != install / "app") or (data_dir and data_dir.resolve() != install / "data"):
+                raise ValueError("正式子进程必须使用桌面宿主解析的工作区路径。")
         if channel == "distribution":
             if program != install / "app" or (data_dir and data_dir.resolve() != install / "data"):
                 raise ValueError("分发子进程必须使用桌面宿主解析的工作区路径。")
-        elif (program / "apps/desktop/Cargo.toml").is_file() and install != program / ".local":
+        elif channel == "development" and (program / "apps/desktop/Cargo.toml").is_file() and install != program / ".local":
             raise ValueError("开发程序只能使用当前项目 .local（本机资源）目录。")
         assert_launch_ready(install)
         value = data_dir or os.environ.get("VOICE_DATA_DIR")
@@ -50,6 +54,8 @@ class AppPaths:
                 raise ValueError("用户数据目录不能与程序包重叠；源码模式仅允许独立的 data（数据）或 .local（本机资源）子目录。")
         if channel == "distribution" and data != install / "data":
             raise ValueError("分发用户数据必须位于当前工作区 data（数据目录）。")
+        if channel == "product" and os.environ.get("VOICE_LAUNCH_CHANNEL") and data != install / "data":
+            raise ValueError("正式用户数据必须位于当前工作区 data（数据目录）。")
         return cls(program, install, data, channel)
 
     @property
@@ -109,8 +115,7 @@ class AppPaths:
             selected = read_portable(self.install_root)
             runtime = self.install_root / selected['dsh']
             from .distribution import safe_path
-            values.update(VOICE_MODEL_DIR=str(self.install_root / selected['models']), VOICE_DSH_RUNTIME=str(runtime),
-                          WEBVIEW2_BROWSER_EXECUTABLE_FOLDER=str(self.install_root / selected['webview2']))
+            values.update(VOICE_MODEL_DIR=str(self.install_root / selected['models']), VOICE_DSH_RUNTIME=str(runtime))
             if (runtime / 'runtime.json').is_file():
                 metadata = json.loads((runtime / 'runtime.json').read_text(encoding='utf-8-sig'))
                 if relative := metadata.get('node') or metadata.get('executable'):

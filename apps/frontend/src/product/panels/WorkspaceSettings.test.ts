@@ -22,14 +22,12 @@ function controller(workspace: NonNullable<ReturnType<typeof useWorkspaceResourc
   } as unknown as ReturnType<typeof useWorkspaceResources>
 }
 
-describe('WorkspaceSettings（工作区设置）渠道路径投影', () => {
-  it('开发渠道展示项目根与数据目录，且不显示工作区管理操作', () => {
+describe('WorkspaceSettings（工作区设置）统一正式路径', () => {
+  it('本地正式程序展示工作区根与数据目录', () => {
     const wrapper = mount(WorkspaceSettings, {
       props: {
         controller: controller({
-          channel: 'development',
           root: 'D:\\项目开发\\语音前端\\.local',
-          project_root: 'D:\\项目开发\\语音前端',
           data_dir: 'D:\\项目开发\\语音前端\\.local\\data',
           version: '0.8.0',
           can_manage: false,
@@ -39,21 +37,20 @@ describe('WorkspaceSettings（工作区设置）渠道路径投影', () => {
 
     const paths = wrapper.findAll('.workspace-paths > div')
     expect(paths).toHaveLength(2)
-    expect(paths[0].find('dt').text()).toBe('项目根目录')
-    expect(paths[0].find('dd').text()).toBe('D:\\项目开发\\语音前端')
+    expect(paths[0].find('dt').text()).toBe('工作区根目录')
+    expect(paths[0].find('dd').text()).toBe('D:\\项目开发\\语音前端\\.local')
     expect(paths[1].find('dt').text()).toBe('数据目录')
     expect(paths[1].find('dd').text()).toBe('D:\\项目开发\\语音前端\\.local\\data')
-    expect(wrapper.text()).toContain('开发运行固定使用项目的 .local')
+    expect(wrapper.text()).toContain('正式程序')
     expect(wrapper.find('.workspace-actions').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('选择工作区位置')
     wrapper.unmount()
   })
 
-  it('分发渠道展示工作区根与数据目录，并保留工作区管理操作', () => {
+  it('用户正式程序保留相同工作区管理操作', () => {
     const wrapper = mount(WorkspaceSettings, {
       props: {
         controller: controller({
-          channel: 'distribution',
           root: 'D:\\测试\\语音工作区',
           data_dir: 'D:\\测试\\语音工作区\\data',
           version: '0.8.0',

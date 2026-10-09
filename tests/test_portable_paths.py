@@ -50,6 +50,29 @@ def test_component_integrity_and_escape(tmp_path):
         verify(tmp_path, record)
 
 
+def test_explicit_source_debug_keeps_an_independent_formal_workspace(tmp_path, monkeypatch):
+    """Source debug（源码调试）只替换业务输入，工作区不被强制改回源码目录。"""
+    from voice_terminal.local_layout import default_portable
+    source = tmp_path / "源码 项目"
+    install = tmp_path / "已安装 中文工作区"
+    (source / "apps/desktop").mkdir(parents=True)
+    (source / "apps/desktop/Cargo.toml").write_text("", "utf-8")
+    install.mkdir()
+    atomic_json(install / "portable.json", default_portable())
+    monkeypatch.setenv("VOICE_PROGRAM_ROOT", str(source))
+    monkeypatch.setenv("VOICE_INSTALL_ROOT", str(install))
+    monkeypatch.setenv("VOICE_DATA_DIR", str(install / "data"))
+    monkeypatch.setenv("VOICE_LAUNCH_CHANNEL", "product")
+    monkeypatch.setenv("VOICE_SOURCE_DEBUG", "1")
+    paths = AppPaths.resolve(source)
+    assert paths.program_root == source
+    assert paths.install_root == install
+    assert paths.data_root == install / "data"
+    monkeypatch.delenv("VOICE_SOURCE_DEBUG")
+    with pytest.raises(ValueError, match="正式子进程"):
+        AppPaths.resolve(source)
+
+
 def test_migration_preserves_source_and_refuses_conflicts(tmp_path):
     old, data = tmp_path / "原 项目", tmp_path / "新 数据"
     (old / "config/persona").mkdir(parents=True)

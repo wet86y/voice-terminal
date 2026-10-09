@@ -1,0 +1,6 @@
+{
+  "identifier": "installer",
+  "description": "共享安装页面，仅允许本体安装、状态、取消和退出，不开放组件命令。",
+  "windows": ["startup"],
+  "permissions": ["allow-desktop-status", "allow-desktop-initialize", "allow-desktop-cancel-init", "allow-exit-application"]
+}

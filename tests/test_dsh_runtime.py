@@ -42,6 +42,57 @@ class DshConfigTests(unittest.TestCase):
 
 
 class DshRuntimeTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "需要 Windows（操作系统）的目录联接")
+    def test_legacy_junction_removal_keeps_physical_dependencies_and_user_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            modules = root / "runtime/node_modules"
+            home = root / "data/dsh"
+            modules.mkdir(parents=True)
+            home.mkdir(parents=True)
+            (modules / "dependency.js").write_bytes(b"physical dependency")
+            (home / "user-profile.yml").write_bytes(b"user configuration")
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(home / "node_modules"), str(modules)], check=True, capture_output=True)
+            manager = object.__new__(DshRuntimeManager)
+            manager.config = DshConfig(home_dir=home)
+            manager.release_runtime = root / "runtime"
+            manager._remove_legacy_modules_link(modules)
+            self.assertFalse((home / "node_modules").exists())
+            self.assertEqual((modules / "dependency.js").read_bytes(), b"physical dependency")
+            self.assertEqual((home / "user-profile.yml").read_bytes(), b"user configuration")
+
+    @unittest.skipUnless(os.name == "nt", "需要 Windows（操作系统）的目录联接")
+    def test_unknown_junction_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, external = root / "data/dsh", root / "external"
+            home.mkdir(parents=True)
+            external.mkdir()
+            link = home / "node_modules"
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(external)], check=True, capture_output=True)
+            manager = object.__new__(DshRuntimeManager)
+            manager.config = DshConfig(home_dir=home)
+            manager.release_runtime = None
+            try:
+                with self.assertRaisesRegex(RuntimeError, "不能确认"):
+                    manager._remove_legacy_modules_link(root / "runtime/node_modules")
+                self.assertTrue(link.is_junction())
+                self.assertEqual(link.resolve(), external.resolve())
+            finally:
+                link.rmdir()
+
+    def test_physical_user_dependencies_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "data/dsh"
+            modules = home / "node_modules"
+            modules.mkdir(parents=True)
+            (modules / "custom.js").write_bytes(b"user dependency")
+            manager = object.__new__(DshRuntimeManager)
+            manager.config = DshConfig(home_dir=home)
+            manager.release_runtime = None
+            manager._remove_legacy_modules_link(None)
+            self.assertEqual((modules / "custom.js").read_bytes(), b"user dependency")
+
     def test_official_environment_redirects_windows_home_to_dsh_workspace(self) -> None:
         """官方 Node（脚本运行时）与 Electron（桌面框架）主目录都留在 DSH_HOME（代理数据目录）。"""
         with tempfile.TemporaryDirectory() as directory:
@@ -178,7 +229,7 @@ class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
             (profile / "cordis.patch.yml").write_bytes(user_patch)
             manager = DshRuntimeManager(config)
             manager.repo_root, manager.release_runtime = root, runtime
-            with patch.object(manager, "_ensure_modules_link", AsyncMock()), \
+            with patch.object(manager, "_remove_legacy_modules_link"), \
                  patch.object(manager, "_profile_patch_preserves_managed_defaults", return_value=True):
                 await manager._validate_release()
                 await manager._validate_release()
@@ -205,7 +256,7 @@ class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
             manager = DshRuntimeManager(config)
             manager.repo_root = root
             manager.release_runtime = runtime
-            with patch.object(manager, '_ensure_modules_link', AsyncMock()), \
+            with patch.object(manager, '_remove_legacy_modules_link'), \
                  patch.object(manager, '_profile_patch_preserves_managed_defaults', return_value=True), \
                  patch('voice_terminal.dsh.runtime.shutil.which', side_effect=AssertionError('发行端不得寻找开发工具')):
                 node, entry = await manager._validate_release()

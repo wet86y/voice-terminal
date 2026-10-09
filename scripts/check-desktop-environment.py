@@ -35,10 +35,10 @@ print('VOICE_ENVIRONMENT_RESULT='+json.dumps(value))
 parser = argparse.ArgumentParser(description="桌面应用环境检测：实际导入、原生库、音频枚举和模型文件，不安装依赖")
 parser.add_argument('--python', type=Path, default=INSTALL / SELECTED['python'], help='python（便携配置指定的解释器）')
 parser.add_argument('--models', type=Path, default=INSTALL / SELECTED['models'], help='models（便携配置指定的模型）')
-parser.add_argument('--webview2', type=Path, default=INSTALL / SELECTED['webview2'], help='webview2（固定网页引擎）')
+parser.add_argument('--webview2', type=Path, default=None, help='webview2（已统一为系统网页引擎，参数仅供旧诊断兼容）')
 parser.add_argument('--dsh', type=Path, default=INSTALL / SELECTED['dsh'], help='dsh（闭合代理宿主）')
 args = parser.parse_args()
-for name in ('python', 'models', 'webview2', 'dsh'):
+for name in ('python', 'models', 'dsh'):
     if getattr(args, name).resolve() != (INSTALL / SELECTED[name]).resolve():
         raise ValueError('环境检测组件必须符合唯一便携配置：' + name)
 result = subprocess.run([str(args.python.resolve()), '-B', '-X', 'utf8', '-c', PROBE],
@@ -52,7 +52,8 @@ required = ['kws/sherpa-onnx-kws-zipformer-zh-en-3M/tokens.txt',
             'analysis/smart-turn/smart-turn-v3.2-cpu.onnx', 'speaker/wespeaker-cnceleb-resnet34/cnceleb_resnet34.onnx']
 value['missing_models'] = [path for path in required if not (args.models / path).is_file()]
 value['system'] = platform.platform()
-value['fixed_webview2'] = bool(args.webview2 and (args.webview2 / 'msedgewebview2.exe').is_file())
+value['fixed_webview2'] = False
+value['system_webview2'] = True # system_webview2（运行策略：系统网页引擎），可用性由原生宿主实际启动核验。
 value['dsh_cli'] = None
 if args.dsh:
     try:

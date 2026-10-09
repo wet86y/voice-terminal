@@ -3,17 +3,6 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     let repo = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../..");
     let output = PathBuf::from(env::var("OUT_DIR").unwrap());
-    println!("cargo:rerun-if-env-changed=VOICE_DISTRIBUTION_CATALOG");
-    let catalog = env::var_os("VOICE_DISTRIBUTION_CATALOG")
-        .map(PathBuf::from).unwrap_or_else(|| repo.join("config/distribution.json"));
-    println!("cargo:rerun-if-changed={}", catalog.display());
-    fs::copy(&catalog, output.join("distribution.json")).expect("复制分发清单失败");
-    println!("cargo:rerun-if-env-changed=VOICE_EMBEDDED_APP");
-    let payload = env::var_os("VOICE_EMBEDDED_APP").map(PathBuf::from);
-    if let Some(path) = payload {
-        println!("cargo:rerun-if-changed={}", path.display());
-        fs::copy(path, output.join("app.zip")).expect("复制内嵌程序本体失败");
-    } else { fs::write(output.join("app.zip"), []).unwrap(); }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") { return; }
     let kit = repo.join(".local/build/update-kit/native");
     let transport_path = kit.join("src/UpdateKit.cpp");

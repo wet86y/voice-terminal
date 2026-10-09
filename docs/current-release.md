@@ -1,101 +1,62 @@
-# 当前开发与分发交付
+# 当前正式程序与分发安装器交付
 
-本文集中记录当前两个测试入口、重建命令、清理范围及本次核对结果。渠道实现以[桌面独立启动与按需语音环境实现](desktop-independent-implementation.md)为准；开发环境的目录和事务更新以[本地目录与覆盖发布](local-layout.md)为准。历史验收中的构建编号、文件大小和摘要只代表当时产物。
+产品版本沿用 `0.9.0`，以 `build`（构建编号）区分产物。开发和用户日常使用同一套正式程序；分发入口改为只负责展开及重装的独立安装器。架构与恢复规则见[统一正式程序与分发安装器](unified-product-installer.md)，本轮实测见[统一程序验收记录](unified-product-acceptance.md)。
 
-## 两个测试入口
+## 测试入口
 
-| 渠道 | 入口 | 环境与数据 | 构建及发布命令 |
-| --- | --- | --- | --- |
-| Development（开发） | `.local/VoiceTerminal.exe`（开发启动程序） | 项目 `.local`（本机资源目录）中的运行环境、模型和数据 | `npm run desktop:publish`（构建并覆盖发布） |
-| Distribution（分发） | `.local/releases/distribution-single-exe/VoiceTerminal.exe`（分发启动程序） | 系统定位记录指向的用户工作区；首次使用可选择文件夹 | `npm run desktop:dist`（构建内嵌本体的单入口程序） |
+| 入口或命令 | 中文说明 |
+| --- | --- |
+| `.local/VoiceTerminal.exe` | 本地正式入口，无参数读取已发布本体 |
+| `npm run desktop:start` | 与双击同一正式启动流程 |
+| `npm run dev` | 正式入口显式传入 `--dev`（源码调试开关）及 `--source-root`（源码目录），使用当前业务源码和界面热更新 |
+| `.local/VoiceTerminalUIDemo.exe` | 前端演示入口，使用隔离缓存，不启动业务服务 |
+| `npm run dev:ui` | 重新构建并运行前端演示 |
+| `.local/releases/installer/VoiceTerminalSetup.exe` | 正常分发安装器，内嵌统一正式程序包；只负责安装及重装 |
+| `.local/build/program-package/program.zip` | 本地发布、安装器及后续正式更新共用的程序包 |
 
-`.local/VoiceTerminalUIDemo.exe`（前端演示程序）由开发发布同步更新，加载项目当前前端源码并使用同步构建的原生调试宿主，仅用于界面展示。演示实际调用的 `.local/build/desktop/debug/VoiceTerminalDesktop.exe`（演示宿主兼容路径）也须与 `.local/build/desktop/development/debug/VoiceTerminalDesktop.exe`（本轮开发调试宿主）一致。`npm run desktop:build`（开发构建）只更新编译缓存，不能代替开发发布。
+同一工作区只允许一个业务实例。测试普通启动与源码调试时，先从应用内退出当前业务实例，再切换模式。另一工作区的正式程序、界面演示和安装器可以同时打开。
 
-分发版只需交付一个 `VoiceTerminal.exe`（可执行程序）；同目录中的 `build-stamp.json`（构建记录）和 `delivery.json`（交付记录）用于核对。分发入口使用系统 WebView2 Evergreen Runtime（自动更新网页引擎），内嵌界面、业务源码、默认配置与少量固定依赖；Python（后端环境）、模型和 DSH（代理执行宿主）按需配置。开发入口复用已安装的项目环境。
+命令行正式启动只等待根启动器完成交接；正式桌面进程随后独立运行，不会让 PowerShell 一直等待产品窗口退出。
+
+安装器退出后，用户日常启动所选工作区根目录的 `VoiceTerminal.exe`（正式入口），桌面快捷方式也直接指向该入口。安装器不配置或下载组件；缺少环境或模型的正式程序进入组件管理页。再次选择已有工作区执行保留数据、模型、运行环境和登记的重装。
+
+旧 `.local/releases/distribution-single-exe/VoiceTerminal.exe`（历史分发入口）不属于本轮测试及交付。旧系统工作区定位记录和旧私有网页引擎文件保留，但当前入口不再使用。所有正式实例统一使用系统 WebView2（网页运行引擎）。
 
 ## 重建与核对
 
-先通过应用菜单或托盘退出开发业务实例，关闭演示窗口，再在仓库根目录执行：
+通过应用内退出业务实例，关闭演示窗口，再执行：
 
 ```powershell
-.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q # 后端全量测试
-npm test                     # 前端与受管开发服务测试
-npm --prefix integrations/dsh/voice-terminal test # 代理插件测试及类型检查
-npm run desktop:publish      # 开发版与演示入口覆盖发布，含前端类型检查
-npm run desktop:dist         # 分发版单入口构建，含前端类型检查
-.\.local\Verify-Package.ps1  # 开发安装目录的完整摘要校验
-.\.local\runtimes\python\python.exe -B -X utf8 scripts/check-doc-links.py # 工程文档链接检查
-git diff --check             # 差异格式检查
+npm run desktop:publish # 构建、组装并事务发布正式本体，保留数据与组件
+./scripts/distribute-desktop.ps1 -SkipProductBuild # 将刚发布的同一包嵌入正常安装器
+./.local/Verify-Package.ps1 # 原生验证正式入口、宿主、业务、界面与支持文件
+./.local/runtimes/python/python.exe -B -X utf8 scripts/test-backend.py -q # 后端测试
+npm test # 前端与受管开发服务测试
+npm run typecheck # 前端类型检查
+npm --prefix integrations/dsh/voice-terminal test # 代理插件测试与类型检查
+./.local/runtimes/python/python.exe -B -X utf8 scripts/check-doc-links.py # 文档链接检查
+git diff --check # 差异格式检查
 ```
 
-分发版还需核对交付记录中的 `sha256`（入口内容摘要）、`embedded_app_sha256`（内嵌本体摘要）、`launch_channel`（启动渠道）和 `qualification`（隔离验收标记）。本次提供给用户测试的是分发渠道正常产物，隔离验收标记应为 `false`（未启用）。
+`npm run desktop:dist`（完整分发构建）可以独立重建正式包和安装器。若需要核验本地正式包与安装器逐文件一致，先发布，再使用 `-SkipProductBuild`（复用已发布程序包开关），避免比较不同构建。
 
-文件完整性核对后，还必须实际无参数启动 `.local/VoiceTerminal.exe`（已发布开发入口）。确认 `.local/data/state/workspace-ready.json`（真实界面加载就绪记录）为本轮新记录，其中 `pid`（桌面进程编号）对应现用桌面程序、`channel`（渠道）为 `development`（开发）且 `ready`（界面已就绪）为 `true`（已就绪）。原生入口定位回归覆盖安装目录与源码目录不同、编译目录同级宿主、分发工作区及缺失文件提示；中文空格隔离项目另验证实际入口启动子进程及环境传递。
+安装器交付目录包含 `delivery.json`（交付记录）与 `build-stamp.json`（构建记录）。核对 `role=installer`（入口职责为安装器）、`qualification=false`（未开放自动验收参数）以及两份记录的 `program_package_sha256`（内嵌统一程序包摘要）与当前包一致。安装器的 `sha256`（可执行文件摘要）应与交付记录一致。
 
-## 清理与保留规则
+隔离自动验收另行构建，不能作为正常交付：
 
-当前仅保留开发安装目录和正常分发单入口。旧版多包发布目录、旧隔离验收发布目录、失败分发暂存和旧验收渠道编译输出不属于当前两个测试入口。确认没有业务数据或运行实例后，可回收这些过期产物。
+```powershell
+./scripts/distribute-desktop.ps1 -SkipProductBuild -Qualification # 构建隔离验收安装器，正式程序包不变
+./.local/runtimes/python/python.exe -B -X utf8 scripts/qualify-unified-product.py --setup .local/releases/installer-qualification/VoiceTerminalSetup.exe # 验收安装、重装、切换、迁移及恢复
+```
 
-用户数据、滚动数据备份、现用模型、运行环境、工具链及开发／分发固定编译缓存继续保留。`.local/releases/fixtures/voice-resources-0.8.0.zip`（离线模型资源测试包）仍由 `scripts/qualify-resources.py`（资源验收工具）使用，文件名中的旧版本号不代表模型文件已经过期，因此保留供资源导入测试使用。尚未核实来源的补丁和临时源码副本不作为发布产物删除。
-
-## 2026-10-09 开发启动入口修复
-
-用户实际双击开发入口时发现“程序包缺少桌面主程序”的路径回归。文件存在且摘要正确，入口误用业务源码目录查找原生程序。经用户确认，已将开发安装入口定位到 `.local/app/VoiceTerminalDesktop.exe`（已发布桌面主程序），编译目录中的入口继续使用同级宿主，分发入口继续使用工作区程序目录；业务源码、环境和数据路径规则保持一致。
-
-修复已覆盖发布，版本仍为 `0.9.0`，开发发布编号为 `desktop-20261009-003702-launch-fix`（协调世界时编号）。新入口通过开发和分发两种编译模式各 4 项定位回归及 1 项演示定位测试；中文空格隔离项目的实际可执行链路复现旧入口失败，并验证修复候选无参数成功启动已安装的桌面测试进程。修复基于 `0f91bd7`（本地最新提交），包含此前已确认的版本标识修正，当前工作区尚未提交。
-
-完整事务已核对 56,067 个安装清单条目并回收旧本体、暂存及临时更新工具。192 个业务源码与配置文件、17 个前端文件及 31 个代理插件文件与当前工程／本轮构建一致。开发版及演示宿主的最新摘要如下；分发程序继续使用下方 2026-10-08 的交付摘要。
-
-| 程序 | 字节数 | SHA-256（文件内容摘要） |
-| --- | ---: | --- |
-| 开发入口 `.local/VoiceTerminal.exe` | 617,984 | `30fa8db0e6a006e4e31ad10ab2372553f0c046ca01c845c7c410e16ccc938e3a` |
-| 开发宿主 `.local/app/VoiceTerminalDesktop.exe` | 13,979,648 | `5e400ae199be4aca2303b3fc801b4d7c336ca82ce4366fa33f0526d2e16bd5a8` |
-| 演示入口 `.local/VoiceTerminalUIDemo.exe` | 412,160 | `318d87a75fec2ceea6bcd490bb22f297d9d89de63cb060d8b48f417b10673188` |
-| 演示实际宿主 `.local/build/desktop/debug/VoiceTerminalDesktop.exe` | 22,604,800 | `6b3de6d55460534f02215d8648a04acac16f710cee1118f488d03841094d6eb5` |
-
-2026-10-09 08:42:00（香港时间）已直接无参数启动已发布开发入口，约 3.49 秒后核对到新建的实际产品窗口，标题为“Voice Terminal · 语音终端”。实际桌面进程路径、窗口句柄及新页面就绪记录匹配：`channel=development`（开发渠道）、`ready=true`（产品页面已加载）、`management_ready=false`（已进入产品页面）。后续只读实时健康核对确认音频、关键词唤醒、语音识别、大语言模型、语音合成、声纹、分析和代理宿主全部 `READY`（已就绪），`can_start=true`（允许开始语音），本地模型与会话均已就绪，初始化错误列表为空。真实设备交互按用户测试顺序另行核对。
-
-`startup-result.json`（一次性启动历史快照）在本轮初始化阶段曾记录 `failed`（失败）及 `core_available=false`（核心未就绪）；此记录只写一次，后续监控更新的实时健康状态已正常。窗口、当前受管进程和实时健康接口共同用于现场判断，不把历史快照当作当前状态。
-
-发布前后的 455 个用户文件数量、大小与内容摘要完全一致。真实启动正常生成唤醒词表、代理原生扩展缓存、会话及运行状态，并更新代理会话映射、工作区状态和启动历史快照；现用模型、运行环境清单及既有分发程序保持原摘要。机器核对记录位于 `.local/cache/reports/development-launch-20261009/`（本轮可回收报告目录）：`publication-verification.json`（成品与源码核对）、`real-launch-result.json`（真实窗口启动结果）、`voice-health-result.json`（实时语音健康结果）、`preservation-after-publish.json`（发布保留核对）及 `preservation-after-launch.json`（运行文件核对）。
-
-## 2026-10-08 两渠道重建记录（历史）
-
-以下为上轮文件完整性记录，不代表当时已验证开发入口的实际双击启动；当前开发入口和宿主以本页上方修复记录为准。
-
-源码基线为本地 `main`（主分支）的最新提交 `0f91bd7d26e88e352458abb695cb4899892c4bd2`（2026-10-08 22:37:38，香港时间），该提交实现桌面独立分发与按需语音环境。仓库没有配置远程来源；本次“最新提交”指当前本地完整提交历史。构建期间提交号保持一致，并包含本轮已确认的接口／发布显示版本修正。当前代码包、接口元数据与两渠道显示版本均为 `0.9.0`。
-
-开发发布编号为 `desktop-20261008-152305`（编号使用协调世界时），两个业务渠道均为 release（优化构建），演示实际使用本轮 debug（调试构建）宿主。2026-10-08 23:44:01（香港时间）的逐项核对结果如下：
-
-| 核对对象 | 结果 |
-| --- | --- |
-| 最新原生、前端、代理插件与下载组件生产输入 | 213 个文件与上述提交逐项一致；本轮原生测试调整仅在 `cfg(test)`（测试编译条件）内，不进入业务程序 |
-| 开发／分发业务源码和固定配置 | 每个渠道 192 个文件与当前工程逐项一致 |
-| 静态前端 | 从当前源码再次构建后，17 个文件与两个成品逐项一致 |
-| 运行脚本、代理配置、默认配置和启动资源 | 每个渠道 20 个文件匹配当前工程；默认配置首行按既有发布规则改为相对模型路径 |
-| 代理插件 | 从当前源码再次编译后，31 个交付文件与两个成品逐项一致 |
-| 分发内嵌本体 | 287 个文件集合及内容与校验后的本体一致，完整压缩本体实际存在于分发程序内 |
-| 开发入口、开发宿主、演示入口与演示实际宿主 | 均与对应渠道的本轮编译输出摘要一致 |
-| 完整开发安装 | 发布事务已校验本体、根入口及 56,067 个清单文件条目，完成换入及暂存回收 |
-
-| 程序 | 字节数 | SHA-256（文件内容摘要） |
-| --- | ---: | --- |
-| 开发入口 `.local/VoiceTerminal.exe` | 618,496 | `1ed0cfde4d7c877b3a468cf7703d14cf64d58128a0b4736172f4234aab9c5cf9` |
-| 开发宿主 `.local/app/VoiceTerminalDesktop.exe` | 13,979,648 | `474733d259ed51c64d28059a69fe70392557344737b78cc3f5392d068c589ff2` |
-| 分发入口 `.local/releases/distribution-single-exe/VoiceTerminal.exe` | 36,871,680 | `b15e3d574ad007a5c8985bdf11bfbb918f9621ae51eab3b523edb3c095ba69ac` |
-| 演示入口 `.local/VoiceTerminalUIDemo.exe` | 412,160 | `afa1c3228e309a028078fd93a55ab9890d297c20b08b2b0c5856ea0223468625` |
-| 演示实际宿主 `.local/build/desktop/debug/VoiceTerminalDesktop.exe` | 22,604,800 | `acc8348b91e58d98d9b65d4f101d46335122f9f4dc3c9893f8d226b66260f831` |
-
-分发本体的 `embedded_app_sha256`（内嵌压缩包摘要）为 `4c380c624922ba591f03710f1b0947e6dcea1dd5a4907dfa246fae45a005a3e1`。分发入口约 35.16 MiB（兆二进制字节），按需环境和模型须在测试工作区中另行配置。
-
-自动化检查已通过：后端全量 966 项通过、1 项跳过；前端 210 项及受管开发服务 3 项通过；代理插件 40 项通过；原生公共库开发渠道 15 项、分发渠道 14 项通过。版本元数据修改后另有接口和打包回归 35 项通过，实际 OpenAPI（接口文档规范）输出的版本也为 `0.9.0`。后端测试缓存改为持久分词器缓存，避免每轮临时目录触发重复下载；动态端口、组件卡片与两渠道原生测试的旧假设已修正。
-
-本轮清理了 7 个已核实目录、102,248 个普通文件，合计 46,360,579,636 字节，约 43.18 GiB（二进制吉字节）的逻辑大小。清理对象包括旧多包分发、旧验收发布、失败分发暂存、旧验收编译输出及旧启动预览；此数字不作为磁盘实际释放量。清理后 `.local/releases`（发布目录）只保留当前正常分发单入口及仍使用的资源测试包。455 个用户数据文件数量和内容摘要均未变化，模型与三个现用运行组件的清单摘要保持一致。
-
-机器上的完整日志和逐文件核对记录位于 `.local/cache/reports/rebuild-20261008/`（本次可回收检查目录），其中 `build-verification.json`（构建与最新提交一致性记录）包含最新八项提交、生产输入摘要及成品摘要；`cleanup.json`（清理记录）和 `data-comparison.json`（用户数据核对）登记最终清理及保留结果。个人资料仅记录摘要，不写入本文或源码管理。本轮工作区修改尚未提交。
+隔离目录位于仓库外的同级 `测试`（现场验收目录）中，包含中文及空格。逐文件记录与启动报告保留在相应验收目录。自动验收只清理自己创建且目标匹配的受管快捷方式，不处理其他桌面文件。
 
 ## 用户测试顺序
 
-1. 启动开发入口，核对启动画面、本地组件状态、原有设置与历史，再测试语音监听、打断、快速／深度模式及后台协作。
-2. 使用退出操作结束开发实例，再启动分发入口；选择独立测试工作区，先验证无后端环境时的组件管理界面，再按需配置或导入运行环境、模型和代理宿主。
-3. 核对分发工作区保存、退出后重新启动、资源错误提示与重试。真实语音质量、完整组件下载、显卡推理和工作区迁移需要现场测试；自动化或编译结果不替代这些结论。
+1. 在本地正式程序检查原有设置与历史、组件管理、服务状态和正常退出；退出后用 `npm run dev`（源码热更新）检查同一工作区和组件位置。
+2. 在演示入口核对界面交互。演示使用独立缓存，不操作正式用户数据。
+3. 在正常安装器选择空目录，检查原有动画、进度与按钮；安装完成后确认安装器退出、正式组件管理页可以独立使用及再次启动。
+4. 退出目标正式实例，再次选择该工作区重装，核对原有用户内容、模型、运行环境和组件登记；运行中的目标应提示退出后重试。
+5. 在正式程序中验证已有工作区切换、空工作区初始化、整体迁移及失败恢复。完成搬迁后直接启动目标根目录的正式入口。
+
+“应用更新”页面继续保留；在线更新按后续 GitHub（代码与发布托管平台）分发方案接入。本轮交付的安装器用于首次安装和保留用户数据的重装。

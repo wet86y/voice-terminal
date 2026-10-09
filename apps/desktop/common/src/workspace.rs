@@ -1,43 +1,21 @@
-//! Workspace（工作区）：分发定位、基础安装与可恢复迁移。
+//! Workspace（工作区）：本地身份、已发布本体初始化与可恢复迁移。
 use std::{fs, io::{Read, Write}, path::{Path, PathBuf}, sync::{mpsc, Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}}, thread, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use crate::{canonical_path, LaunchContext, download::{DownloadFile, download}};
+use crate::{canonical_path, LaunchContext};
 
-pub const EMBEDDED_CATALOG: &str = include_str!(concat!(env!("OUT_DIR"), "/distribution.json"));
 const MIGRATION_COPY_WORKERS: usize = 4; // MIGRATION_COPY_WORKERS（迁移文件复制的有界工作线程数）。
 const MIGRATION_COPY_BUFFER: usize = 1024 * 1024; // MIGRATION_COPY_BUFFER（每个复制线程复用的缓冲区字节数）。
 
 #[derive(Clone, Debug)]
 pub struct Locator {
-    pub path: PathBuf, // path（定位记录文件）。
+    pub local_root: Option<PathBuf>, // local_root（直接工作区）：无需外部定位记录。
+    pub path: PathBuf, // path（本地事务身份；历史事务兼容原标识，不读取定位文件）。
     pub source_base: Option<String>, // source_base（验收发布源覆盖）。
     pub instance_tag: String, // instance_tag（隔离实例标识）。
     pub initial_root: Option<PathBuf>, // initial_root（仅验收配置允许的自动目录选择）。
     pub headless: bool, // headless（验收无窗口入口）。
     pub qualification: Option<PathBuf>, // qualification（验收配置位置）。
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct Registry {
-    schema: u32, // schema（定位格式）。
-    workspace_id: String, // workspace_id（稳定编号）。
-    workspace_root: PathBuf, // workspace_root（工作区绝对路径）。
-}
-
-#[derive(Deserialize)]
-struct Catalog {
-    schema: u32, // schema（分发格式）。
-    source_base: String, // source_base（固定发布源）。
-    packages: Vec<Package>, // packages（基础组件包）。
-}
-#[derive(Deserialize)]
-struct Package {
-    kind: String, // kind（组件类别）。
-    archive: DownloadFile, // archive（完整归档大小与摘要）。
-    #[serde(default)] parts: Vec<DownloadFile>, // parts（独立分片）。
-    #[serde(default)] unpacked_size: u64, // unpacked_size（展开字节数）。
 }
 
 pub fn atomic_json(path: &Path, value: &Value) -> Result<(), String> {
@@ -104,10 +82,22 @@ pub fn safe_path(root:&Path,relative:&str)->Result<PathBuf,String> {
 }
 
 impl Locator {
+    pub fn local(root:&Path)->Self {
+        Self{local_root:Some(root.to_path_buf()),path:root.join("tmp/workspace-identity.json"),
+            source_base:None,instance_tag:"product".into(),initial_root:Some(root.to_path_buf()),headless:false,qualification:None}
+    }
+    pub fn for_task(journal:&Path)->Result<Self,String>{
+        let record=load(journal)?;
+        let source=Path::new(record["source_root"].as_str().ok_or("工作区事务缺少原位置")?);
+        let mut local=Self::local(source);
+        // 旧事务只保留身份匹配，禁止再读取或写入系统定位文件。
+        if let Some(path)=record["registry_path"].as_str(){local.path=PathBuf::from(path);}
+        Ok(local)
+    }
     pub fn validate_target(&self,root:&Path)->Result<(),String>{
         if !root.is_absolute(){return Err("工作区必须使用绝对路径。".into());}
         let root = normalized_target(root)?;
-        if root.file_name().is_some_and(|v|v==".local")&&root.parent().is_some_and(|parent|parent.join("apps/desktop/Cargo.toml").is_file()){
+        if self.local_root.is_none()&&root.file_name().is_some_and(|v|v==".local")&&root.parent().is_some_and(|parent|parent.join("apps/desktop/Cargo.toml").is_file()){
             return Err("分发工作区不能复用开发仓库的 .local（本机资源）。".into());
         }
         if self.qualification.is_some(){
@@ -115,41 +105,10 @@ impl Locator {
             if !root.starts_with(&sandbox) || root == sandbox {return Err("验收工作区操作必须限定在测试目录的独立子目录内。".into());}
         }Ok(())
     }
-    pub fn from_args(args:&[String])->Result<Self,String> {
-        let mut locator=Self {path:PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("无法定位系统应用数据目录")?).join("VoiceTerminal/workspace.json"),
-            source_base:None,instance_tag:"distribution".into(),initial_root:None,headless:false,qualification:None};
-        if let Some(index)=args.iter().position(|v|v=="--qualification-config") {
-            if !cfg!(feature="qualification"){return Err("此分发构建不接受验收配置。".into());}
-            let path=canonical_path(Path::new(args.get(index+1).ok_or("验收配置缺少路径")?))?;
-            let qualification=load(&path)?;
-            let registry=PathBuf::from(qualification["registry"].as_str().ok_or("验收配置缺少独立定位文件")?);
-            let sandbox=canonical_path(Path::new("D:/项目开发/测试"))?;
-            if !registry.is_absolute()||!registry.starts_with(&sandbox){return Err("验收定位记录必须在指定测试目录内。".into());}
-            locator.path=registry;
-            locator.source_base=qualification["source_base"].as_str().map(str::to_owned);
-            locator.instance_tag=qualification["instance_tag"].as_str().unwrap_or("qualification").to_owned();
-            locator.initial_root=qualification["workspace_root"].as_str().map(PathBuf::from);
-            locator.headless=qualification["headless"].as_bool().unwrap_or(false);
-            locator.qualification=Some(path);
-            if let Some(root)=&locator.initial_root {if !root.starts_with(&sandbox){return Err("验收工作区必须在指定测试目录内。".into());}}
-        }
-        Ok(locator)
-    }
-    pub fn resolve(&self)->Result<PathBuf,String> {
-        let record:Registry=serde_json::from_value(load(&self.path)?).map_err(|e|e.to_string())?;
-        if record.schema!=1 {return Err("工作区定位记录格式不支持。".into());}
-        let root=canonical_path(&record.workspace_root)?;
-        self.validate_target(&root)?;
-        if load(&root.join("portable.json"))?["workspace_id"].as_str()!=Some(&record.workspace_id) {return Err("工作区编号与定位记录不一致。".into());}
-        Ok(root)
-    }
-    pub fn link(&self,root:&Path)->Result<(),String> {
-        let root=canonical_path(root)?; let record=load(&root.join("portable.json"))?;
-        self.validate_target(&root)?;
-        let id=record["workspace_id"].as_str().ok_or("目标目录缺少工作区编号")?;
-        atomic_json(&self.path,&json!({"schema":1,"workspace_id":id,"workspace_root":root,
-            "fields":{"schema":"定位格式","workspace_id":"工作区编号","workspace_root":"用户所选工作区"}}))
-    }
+    // 历史外部工具不再使用系统定位；明确拒绝，要求正式入口或工作区事务。
+    pub fn from_args(_args:&[String])->Result<Self,String>{Err("工作区由正式入口位置确定；不再接受系统定位或分发渠道参数。".into())}
+    pub fn resolve(&self)->Result<PathBuf,String>{canonical_path(self.local_root.as_deref().ok_or("正式程序缺少本地工作区身份")?)}
+    pub fn link(&self,root:&Path)->Result<(),String>{self.validate_target(root)?;normalize_layout(root)}
     pub fn child_args(&self)->Vec<String> {
         self.qualification.as_ref().map(|v|vec!["--qualification-config".into(),v.to_string_lossy().into_owned()]).unwrap_or_default()
     }
@@ -157,92 +116,16 @@ impl Locator {
         let record=load(journal)?;
         let target=canonical_path(Path::new(record["target_root"].as_str().ok_or("切换记录缺少目标")?))?;
         self.validate_target(&target)?;
-        if canonical_path(journal)?!=canonical_path(&target.join("tmp/workspace-task.json"))?||record["registry_path"].as_str()!=Some(self.path.to_string_lossy().as_ref())||record["state"]!="starting"{return Err("内部工作区切换记录无效。".into());}
-        let current=self.resolve()?;
+        if canonical_path(journal)?!=canonical_path(&target.join("tmp/workspace-task.json"))?||record["registry_path"].as_str()!=Some(self.path.to_string_lossy().as_ref())||!["starting","committed"].contains(&record["state"].as_str().unwrap_or("")){return Err("内部工作区切换记录无效。".into());}
+        let current=normalized_target(self.local_root.as_deref().ok_or("事务缺少本地工作区身份")?)?;
         let source=Path::new(record["source_root"].as_str().ok_or("切换记录缺少来源")?);
-        if current!=canonical_path(source)?{return Err("切换来源与当前定位不一致。".into());}
+        if current!=normalized_target(source)?{return Err("切换来源与当前事务身份不一致。".into());}
         if record["kind"]=="migrate"&&load(&target.join("portable.json"))?["workspace_id"]!=record["workspace_id"]{return Err("目标工作区编号无效。".into());}
         Ok(target)
     }
-    pub fn ensure(&self,cancel:Arc<AtomicBool>,progress:&mut dyn FnMut(&str,u64,u64))->Result<PathBuf,String> {
-        let root=match self.resolve() {Ok(root)=>root,Err(_)=>{
-            let selection=if let Some(root)=&self.initial_root {Some(root.clone())}else{crate::native_ui::choose_folder("选择语音终端工作区（可使用中文文件夹）")?};
-            let root=selection.ok_or("已取消工作区选择。")?;
-            self.validate_target(&root)?;
-            initialize(&root)?; self.link(&root)?; canonical_path(&root)?
-        }};
-        recover_install(&root)?;
-        recover_base(&root)?;
-        self.prepare(&root,cancel,progress)?;
-        Ok(root)
-    }
-    pub fn prepare(&self,root:&Path,cancel:Arc<AtomicBool>,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String> {
-        if crate::embedded::available() { return crate::embedded::prepare(root,cancel,progress); }
-        let catalog:Catalog=serde_json::from_str(EMBEDDED_CATALOG).map_err(|e|e.to_string())?;
-        if catalog.schema!=1{return Err("基础分发清单格式不支持。".into());}
-        let base=self.source_base.as_deref().unwrap_or(&catalog.source_base);
-        let needed= ["app","python","webview2"];
-        for kind in needed {
-            let relative=component_root(kind)?;
-            let check=match kind {"app"=>"app/VoiceTerminalDesktop.exe","python"=>"runtimes/python/python.exe",_=>"runtimes/webview2/msedgewebview2.exe"};
-            let manifest_name=if kind=="app"{"release.json"}else{"manifest.json"};
-            if root.join(check).is_file() && root.join(relative).join(manifest_name).is_file(){
-                // 大型组件只在安装及迁移时完整校验；启动检查布局与入口，资源库存单独校验。
-                continue;
-            }
-            let package=catalog.packages.iter().find(|v|v.kind==kind).ok_or_else(||format!("分发清单缺少 {kind}（基础组件），请配置固定发布来源后重新组装。"))?;
-            let archive=root.join("tmp/downloads").join(format!("{kind}.zip"));
-            fs::create_dir_all(archive.parent().unwrap()).map_err(|e|e.to_string())?;
-            let required=package.archive.size.saturating_add(package.unpacked_size);
-            if available_space(root)?<required {return Err(format!("工作区空间不足，{kind}（基础组件）需要约 {required} 字节。"));}
-            let resolve=|file:&DownloadFile|->Result<DownloadFile,String>{
-                let mut file=file.clone(); if !file.url.contains("://") {
-                    if base.is_empty(){return Err("未配置本体发布来源。".into());}
-                    file.url=format!("{}/{}",base.trim_end_matches('/'),file.url.trim_start_matches('/'));
-                } Ok(file)
-            };
-            if package.parts.is_empty(){
-                let spec=resolve(&package.archive)?;
-                download(&spec,&archive,cancel.clone(),&mut |current,total|progress(&format!("下载 {kind}（基础组件）"),current,total),0)?;
-            }else{
-                for (index,part) in package.parts.iter().enumerate(){
-                    let path=archive.with_extension(format!("zip.part{index:03}"));
-                    download(&resolve(part)?,&path,cancel.clone(),&mut |current,total|progress(&format!("下载 {kind}（基础组件）分片 {}",index+1),current,total),0)?;
-                }
-                let merged=archive.with_extension("merging"); let mut outgoing=fs::File::create(&merged).map_err(|e|e.to_string())?;
-                for index in 0..package.parts.len(){
-                    if cancel.load(Ordering::Acquire){return Err("任务已取消，分片已保留。".into());}
-                    let mut incoming=fs::File::open(archive.with_extension(format!("zip.part{index:03}"))).map_err(|e|e.to_string())?;
-                    std::io::copy(&mut incoming,&mut outgoing).map_err(|e|e.to_string())?;
-                }
-                outgoing.sync_all().map_err(|e|e.to_string())?;drop(outgoing);
-                if file_hash(&merged)?!=package.archive.sha256||fs::metadata(&merged).map_err(|e|e.to_string())?.len()!=package.archive.size{return Err("基础包合并摘要不符。".into());}
-                // 解包取消后可能留有已校验归档；Windows 重命名不会覆盖已有文件。
-                if archive.exists(){remove_owned(&archive,root)?;}
-                fs::rename(&merged,&archive).map_err(|e|e.to_string())?;
-            }
-            progress(&format!("释放 {kind}（基础组件）"),0,package.unpacked_size);
-            let stage=root.join("tmp/bootstrap").join(kind);
-            remove_owned(&stage,root)?;fs::create_dir_all(&stage).map_err(|e|e.to_string())?;
-            unpack(&archive,&stage,relative,package.unpacked_size,cancel.clone(),progress)?;
-            let incoming=stage.join(relative);
-            verify_tree_progress(&incoming,if kind=="app"{"release.json"}else{"manifest.json"},Some(cancel.clone()),&mut|current,total|progress("校验基础组件",current,total))?;
-            if cancel.load(Ordering::Acquire){return Err("基础安装已取消，已下载归档保留以便重试。".into());}
-            progress("启用基础组件",1,1);
-            let target=root.join(relative);let old=root.join("tmp/bootstrap-old").join(kind);
-            remove_owned(&old,root)?;fs::create_dir_all(old.parent().unwrap()).map_err(|e|e.to_string())?;
-            let journal=root.join("tmp/bootstrap-transaction.json");
-            atomic_json(&journal,&json!({"schema":1,"kind":kind,"state":"prepared","original":target.exists()}))?;
-            if target.exists(){fs::rename(&target,&old).map_err(|e|e.to_string())?;}
-            fs::create_dir_all(target.parent().unwrap()).map_err(|e|e.to_string())?;
-            if let Err(error)=fs::rename(&incoming,&target){if old.exists(){let _=fs::rename(&old,&target);}return Err(error.to_string());}
-            atomic_json(&journal,&json!({"schema":1,"kind":kind,"state":"committed","original":old.exists()}))?;
-            remove_owned(&old,root)?;remove_owned(&stage,root)?;
-            fs::remove_file(journal).map_err(|e|e.to_string())?;
-            let _=fs::remove_file(&archive);
-            for index in 0..package.parts.len(){let _=fs::remove_file(archive.with_extension(format!("zip.part{index:03}")));}
-        }
-        Ok(())
+    pub fn prepare(&self,root:&Path,cancel:Arc<AtomicBool>,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
+        if root.join("VoiceTerminal.exe").is_file()&&root.join("app/VoiceTerminalDesktop.exe").is_file(){return Ok(());}
+        crate::installation::copy_program(self.local_root.as_deref().ok_or("缺少当前已发布本体")?,root,cancel,progress)
     }
 }
 
@@ -274,13 +157,14 @@ pub fn prepare_task(source:&Path,target:&Path,kind:&str,parent:u32,locator:&Loca
     fs::create_dir_all(target).map_err(|e|e.to_string())?;let target=canonical_path(target)?;
     if source==target||source.starts_with(&target)||target.starts_with(&source){return Err("迁移或切换目标须与当前工作区互不包含。".into());}
     if kind=="migrate"&&fs::read_dir(&target).map_err(|e|e.to_string())?.next().is_some(){return Err("迁移目标必须为空。".into());}
+    crate::installation::ensure_idle(&target)?;
     initialize(&target)?;
     if kind=="migrate"{
         let old=load(&source.join("portable.json"))?;
         atomic_json(&target.join("portable.json"),&old)?;
     }
     let helper=target.join("tmp/workspace-helper.exe");fs::create_dir_all(helper.parent().unwrap()).map_err(|e|e.to_string())?;
-    fs::copy(source.join("VoiceTerminal.exe"),&helper).map_err(|e|format!("工作区缺少分发启动入口：{e}"))?;
+    fs::copy(source.join("VoiceTerminal.exe"),&helper).map_err(|e|format!("工作区缺少正式启动入口：{e}"))?;
     let journal=target.join("tmp/workspace-task.json");
     if !["migrate","link"].contains(&kind){return Err("工作区操作类型无效。".into());}
     let record=json!({
@@ -293,12 +177,12 @@ pub fn prepare_task(source:&Path,target:&Path,kind:&str,parent:u32,locator:&Loca
         "source_root":source,
         "target_root":target,
         "workspace_id":load(&source.join("portable.json"))?["workspace_id"],
-        "previous_locator":load(&locator.path).unwrap_or(Value::Null),
+        "previous_locator":Value::Null,
         "registry_path":locator.path,
         "fields":{
             "schema":"工作区事务记录格式",
             "job_id":"本次工作区操作的唯一编号",
-            "kind":"操作类型：link（链接）或 migrate（迁移）",
+            "kind":"操作类型：link（切换）或 migrate（迁移）",
             "state":"事务阶段",
             "parent_pid":"提交任务前需要退出的原桌面进程编号",
             "helper_pid":"执行恢复或迁移的辅助进程编号",
@@ -310,8 +194,8 @@ pub fn prepare_task(source:&Path,target:&Path,kind:&str,parent:u32,locator:&Loca
             "source_root":"原工作区根目录",
             "target_root":"新工作区根目录",
             "workspace_id":"迁移前后保持一致的工作区编号",
-            "previous_locator":"操作前的工作区定位记录快照",
-            "registry_path":"工作区定位记录文件路径",
+            "previous_locator":"历史兼容字段；新事务不读取系统定位记录",
+            "registry_path":"本地事务身份；历史事务保留原标识",
             "expected_core":"目标工作区验收是否要求核心服务就绪",
             "cleanup_started":"是否已经开始清理原工作区",
             "cleanup_finished":"是否已经完成清理原工作区",
@@ -601,6 +485,7 @@ fn start_candidate(root:&Path,locator:&Locator,journal:Option<&Path>)->Result<st
     let context=LaunchContext::portable(root)?;
     let mut command=std::process::Command::new(root.join("app/VoiceTerminalDesktop.exe"));
     context.configure_command(&mut command);
+    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     command.args(locator.child_args()).current_dir(root.join("app")).creation_flags(0x08000000);
     if let Some(journal)=journal{command.arg("--workspace-handoff").arg(journal);}
     command.spawn().map_err(|e|format!("目标桌面启动失败：{e}"))
@@ -608,7 +493,7 @@ fn start_candidate(root:&Path,locator:&Locator,journal:Option<&Path>)->Result<st
 
 // Process identity（进程身份）同时核对创建时间和可执行文件，恢复时不按复用的 PID 杀进程。
 #[cfg(windows)]
-fn process_identity(pid:u32)->Result<Option<(u64,PathBuf)>,String>{
+pub fn process_identity(pid:u32)->Result<Option<(u64,PathBuf)>,String>{
     use windows_sys::Win32::{Foundation::{CloseHandle,FILETIME},System::Threading::{OpenProcess,GetProcessTimes,QueryFullProcessImageNameW,GetExitCodeProcess}};
     unsafe {
         let handle=OpenProcess(0x1000,0,pid);if handle.is_null(){return Ok(None);}
@@ -623,7 +508,7 @@ fn process_identity(pid:u32)->Result<Option<(u64,PathBuf)>,String>{
     }
 }
 #[cfg(not(windows))]
-fn process_identity(_pid:u32)->Result<Option<(u64,PathBuf)>,String>{Ok(None)}
+pub fn process_identity(_pid:u32)->Result<Option<(u64,PathBuf)>,String>{Ok(None)}
 
 fn recorded_process(record:&Value,prefix:&str)->Result<Option<u32>,String>{
     let pid=record[format!("{prefix}_pid")].as_u64().unwrap_or(0) as u32;if pid==0{return Ok(None);}
@@ -652,7 +537,7 @@ fn wait_ready(root:&Path,pid:u32,id:&Value,expected_core:bool)->Result<(),String
     let deadline=std::time::Instant::now()+Duration::from_secs(300);
     loop{
         if process_identity(pid)?.is_none(){return Err("目标桌面在验收前退出。".into());}
-        let ready=load(&root.join("data/state/workspace-ready.json")).ok().map(|v|v["pid"].as_u64()==Some(pid as u64)&&v["workspace_id"]==*id).unwrap_or(false);
+        let ready=load(&root.join("data/state/workspace-ready.json")).ok().map(|v|v["pid"].as_u64()==Some(pid as u64)&&v["workspace_id"]==*id&&v["ready"]==true).unwrap_or(false);
         let core=load(&root.join("data/state/startup-result.json")).ok().map(|v|v["core_available"]==true).unwrap_or(false);
         if ready&&(!expected_core||core){return Ok(());}
         if std::time::Instant::now()>=deadline{return Err("目标工作区启动校验超时。".into());}
@@ -680,7 +565,6 @@ pub fn run_task(journal:&Path,locator:&Locator,cancel:Arc<AtomicBool>,progress:&
         if !committed {
             // 中断可能发生在目标已启动或定位已写入之后；先停止已登记的候选，再从原工作区恢复事务。
             stop_recorded_target(&record)?;
-            if record["previous_locator"].is_object(){atomic_json(&locator.path,&record["previous_locator"])?;}
             record["state"]=json!("copying");atomic_json(journal,&record)?;
             if migration{copy_files(&source,&target,cancel.clone(),progress)?;rewrite_managed_paths(&source,&target)?;}
             locator.prepare(&target,cancel.clone(),progress)?;
@@ -691,19 +575,19 @@ pub fn run_task(journal:&Path,locator:&Locator,cancel:Arc<AtomicBool>,progress:&
             progress("启动目标工作区并校验",0,0);
             target_process=Some(start_candidate(&target,locator,Some(journal))?);
             let process=target_process.as_mut().unwrap();remember_process(&mut record,"target",process.id())?;
-            let expected_core=load(&source.join("data/state/startup-result.json")).ok().and_then(|v|v["core_available"].as_bool()).unwrap_or(false);
+            let expected_core=false; // 只认可当前进程的真实管理页或产品页，不读取上次模型启动结果。
             record["expected_core"]=json!(migration&&expected_core);atomic_json(journal,&record)?;
             let target_id=load(&target.join("portable.json"))?["workspace_id"].clone();
             wait_ready(&target,process.id(),&target_id,migration&&expected_core)?;
-            // 目标就绪之后才切换定位；中断前原定位始终有效。
+            // 目标真实页面就绪后更新快捷方式；不更新系统定位记录。
             locator.link(&target)?;
+            crate::shortcuts::create(&target,if migration{Some(source.as_path())}else{None})?;
             record["state"]=json!("committed");atomic_json(journal,&record)?;
         }else{
-            // 已切换定位、尚未清理完的事务在重启后必须先恢复目标桌面，再继续清理。
-            if locator.resolve()?!=target{return Err("已提交事务的定位记录发生变化，停止清理。".into());}
+            // 已提交、尚未清理完的事务先恢复目标桌面，再继续清理。
             let pid=match recorded_process(&record,"target")?{Some(pid)=>pid,None=>{
                 let _=fs::remove_file(target.join("data/state/workspace-ready.json"));
-                target_process=Some(start_desktop(&target,locator)?);
+                target_process=Some(start_candidate(&target,locator,Some(journal))?);
                 let pid=target_process.as_ref().unwrap().id();remember_process(&mut record,"target",pid)?;atomic_json(journal,&record)?;pid
             }};
             let target_id=load(&target.join("portable.json"))?["workspace_id"].clone();
@@ -722,11 +606,14 @@ pub fn run_task(journal:&Path,locator:&Locator,cancel:Arc<AtomicBool>,progress:&
             }else if record["cleanup_finished"]!=true{return Err("原工作区布局丢失，停止清理并保留剩余内容。".into());}
             if source.is_dir()&&fs::read_dir(&source).map_err(|e|e.to_string())?.next().is_none(){fs::remove_dir(&source).map_err(|e|e.to_string())?;}
         }
-        record["state"]=json!("completed");atomic_json(journal,&record)?;Ok(())
+        record["state"]=json!("completed");atomic_json(journal,&record)?;
+        // 切换后原工作区仍可直接启动；目标随后搬迁也不能留下失效的定位引用。
+        let marker=source.join("data/state/workspace-task.json");
+        if load(&marker).ok().is_some_and(|reference|reference["job_id"]==record["job_id"]){fs::remove_file(marker).map_err(|e|e.to_string())?;}
+        Ok(())
     })();
     if result.is_err()&&record["state"]!="committed" {
         if let Some(process)=target_process.as_mut(){let _=process.kill();let _=process.wait();}
-        if record["previous_locator"].is_object(){let _=atomic_json(&locator.path,&record["previous_locator"]);}
         // 中断后的再次启动以原位置为权威；完整副本保留用于重新尝试，避免删除未知用户文件。
         record["state"]=json!("failed");let _=atomic_json(journal,&record);
         let _=start_desktop(&source,locator);
@@ -738,6 +625,8 @@ pub fn pending_task(root:&Path)->Result<Option<PathBuf>,String>{
         let marker=root.join(relative);
         if !marker.is_file(){continue;}
         let reference=load(&marker)?;
+        // 终态记录不再定位旧目标；整体文件夹搬迁后，历史路径可以不存在。
+        if ["completed","failed"].contains(&reference["state"].as_str().unwrap_or("")){continue;}
         let target=Path::new(reference["target_root"].as_str().ok_or("迁移恢复记录缺少目标")?);
         let journal=target.join("tmp/workspace-task.json");
         let record=load(&journal)?;
@@ -751,6 +640,38 @@ pub fn pending_task(root:&Path)->Result<Option<PathBuf>,String>{
 #[cfg(test)]
 mod migration_copy_tests{
     use super::*;
+
+    #[test]
+    fn terminal_task_records_allow_direct_folder_relocation(){
+        let base=std::env::temp_dir().join(format!("voice-relocated-{}",new_id()));let root=base.join("relocated workspace");initialize(&root).unwrap();
+        for state in ["completed","failed"]{
+            atomic_json(&root.join("tmp/workspace-task.json"),&json!({"state":state,"target_root":base.join("old missing path")})).unwrap();
+            assert!(pending_task(&root).unwrap().is_none());
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn switch_preparation_uses_formal_helper_and_never_creates_external_locator(){
+        let base=std::env::temp_dir().join(format!("voice-workspace-{}",new_id()));let source=base.join("source");let target=base.join("target");
+        initialize(&source).unwrap();fs::write(source.join("VoiceTerminal.exe"),b"formal entry").unwrap();
+        let locator=Locator::local(&source);let journal=prepare_task(&source,&target,"link",0,&locator).unwrap();let record=load(&journal).unwrap();
+        assert_eq!(fs::read(target.join("tmp/workspace-helper.exe")).unwrap(),b"formal entry");assert_eq!(record["registry_path"],json!(locator.path));assert!(record["previous_locator"].is_null());assert!(!locator.path.exists());
+        assert_ne!(load(&source.join("portable.json")).unwrap()["workspace_id"],load(&target.join("portable.json")).unwrap()["workspace_id"]);fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn committed_handoff_remains_valid_after_source_cleanup(){
+        let base=std::env::temp_dir().join(format!("voice-recovery-{}",new_id()));let source=base.join("removed source");let target=base.join("target");initialize(&target).unwrap();
+        let id=load(&target.join("portable.json")).unwrap()["workspace_id"].clone();let locator=Locator::local(&source);let journal=target.join("tmp/workspace-task.json");
+        atomic_json(&journal,&json!({"schema":1,"kind":"migrate","state":"committed","source_root":source,"target_root":target,"workspace_id":id,"registry_path":locator.path})).unwrap();
+        assert_eq!(Locator::for_task(&journal).unwrap().handoff_root(&journal).unwrap(),canonical_path(&target).unwrap());fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn migration_preparation_preserves_identity_and_rejects_nonempty_target(){
+        let base=std::env::temp_dir().join(format!("voice-migrate-{}",new_id()));let source=base.join("source");let target=base.join("target");initialize(&source).unwrap();fs::write(source.join("VoiceTerminal.exe"),b"formal entry").unwrap();
+        let locator=Locator::local(&source);prepare_task(&source,&target,"migrate",0,&locator).unwrap();assert_eq!(load(&source.join("portable.json")).unwrap()["workspace_id"],load(&target.join("portable.json")).unwrap()["workspace_id"]);
+        let occupied=base.join("occupied");fs::create_dir_all(&occupied).unwrap();fs::write(occupied.join("user.txt"),b"user data").unwrap();assert!(prepare_task(&source,&occupied,"migrate",0,&locator).is_err());assert_eq!(fs::read(occupied.join("user.txt")).unwrap(),b"user data");fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn parallel_copy_commits_verified_files_and_reports_progress_on_caller_thread(){
@@ -796,22 +717,46 @@ mod migration_copy_tests{
     }
 }
 
-pub fn initialize(root:&Path)->Result<(),String> {
+pub fn initialize(root:&Path)->Result<(),String> { initialize_layout(root,false) }
+// initialize_guarded（持锁初始化）：仅允许本轮创建的空暂存区与互斥文件。
+pub fn initialize_guarded(root:&Path,_guard:&crate::installation::WorkspaceGuard)->Result<(),String>{initialize_layout(root,true)}
+fn initialize_layout(root:&Path,guarded:bool)->Result<(),String> {
     if root.as_os_str().to_string_lossy().starts_with("\\\\"){return Err("工作区须位于本地磁盘。".into());}
     if reparse(root){return Err("工作区根目录不能是联接。".into());}
     fs::create_dir_all(root).map_err(|e|e.to_string())?;
     if root.join("portable.json").exists(){
-        let mut value=load(&root.join("portable.json"))?;
-        if value["schema"]!=2||value["app"]!="app"||value["data_dir"]!="data"{return Err("目标不是兼容工作区。".into());}
-        if value["workspace_id"].as_str().is_none(){value["workspace_id"]=json!(new_id());atomic_json(&root.join("portable.json"),&value)?;}
-        return Ok(());
+        return normalize_layout(root);
     }
-    if fs::read_dir(root).map_err(|e|e.to_string())?.next().is_some(){return Err("新工作区必须为空；已有工作区须包含兼容布局配置。".into());}
+    for entry in fs::read_dir(root).map_err(|e|e.to_string())?{
+        let path=entry.map_err(|e|e.to_string())?.path();
+        if !guarded||path!=root.join("tmp")||reparse(&path)||!path.is_dir(){return Err("新工作区必须为空；已有工作区须包含兼容布局配置。".into());}
+        for item in fs::read_dir(path).map_err(|e|e.to_string())?{
+            let item=item.map_err(|e|e.to_string())?.path();
+            if item!=root.join("tmp/program.lock")||reparse(&item)||!item.is_file()||fs::metadata(item).map_err(|e|e.to_string())?.len()!=0{return Err("新工作区暂存区含有未确认内容。".into());}
+        }
+    }
     for relative in ["data/state","data/config","models","cache/logs","tmp/process","backups","releases"]{
         fs::create_dir_all(root.join(relative)).map_err(|e|e.to_string())?;
     }
     atomic_json(&root.join("portable.json"),&json!({"schema":2,"workspace_id":new_id(),"app":"app","python":"runtimes/python/python.exe","models":"models","dsh":"runtimes/dsh","webview2":null,"data_dir":"data",
         "fields":{"schema":"固定布局格式","workspace_id":"工作区编号","app":"程序","python":"后端解释器","models":"模型","dsh":"代理宿主","webview2":"网页引擎","data_dir":"用户数据"}}))
+}
+// normalize_layout（原位兼容转换）：保留编号、用户内容和旧私有引擎文件。
+pub fn normalize_layout(root:&Path)->Result<(),String>{
+    let path=safe_path(root,"portable.json")?;
+    let mut value=load(&path)?;
+    if value["schema"]!=2||value["app"]!="app"||value["data_dir"]!="data"||
+       value["python"]!="runtimes/python/python.exe"||value["models"]!="models"||value["dsh"]!="runtimes/dsh"||
+       !(value["webview2"].is_null()||value["webview2"]=="runtimes/webview2"){
+        return Err("目标不是第二版固定布局工作区。".into());
+    }
+    let original=value.clone();
+    if value["workspace_id"].as_str().is_none_or(|id|id.is_empty()){value["workspace_id"]=json!(new_id());}
+    value["webview2"]=Value::Null;
+    if !value["fields"].is_object(){value["fields"]=json!({});}
+    value["fields"]["webview2"]=json!("使用系统 WebView2（网页运行引擎），旧私有文件保留");
+    value["fields"]["workspace_id"]=json!("迁移及重装时保留的工作区编号");
+    if value!=original{atomic_json(&path,&value)?;}Ok(())
 }
 pub fn new_id()->String {format!("{:x}-{:x}",SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),std::process::id())}
 fn component_root(kind:&str)->Result<&'static str,String>{match kind{"app"=>Ok("app"),"python"=>Ok("runtimes/python"),"webview2"=>Ok("runtimes/webview2"),_=>Err("未知基础组件。".into())}}
@@ -862,32 +807,13 @@ fn verify_tree_progress(root:&Path,manifest_name:&str,cancel:Option<Arc<AtomicBo
     let mut present=std::collections::HashSet::new();actual(root,root,&mut present)?;
     if expected!=present{return Err("组件文件集合与发布清单不一致。".into());}Ok(())
 }
-fn unpack(archive:&Path,target:&Path,prefix:&str,total:u64,cancel:Arc<AtomicBool>,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
-    let mut source=zip::ZipArchive::new(fs::File::open(archive).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
-    let mut seen=std::collections::HashSet::new();let mut completed=0u64;
-    for index in 0..source.len(){
-        if cancel.load(Ordering::Acquire){return Err("已取消解包。".into());}
-        let mut entry=source.by_index(index).map_err(|e|e.to_string())?;
-        let relative=entry.name().trim_end_matches('/').to_string();
-        if relative!=prefix&&!relative.starts_with(&format!("{prefix}/")){return Err("基础归档包含组件目录之外的文件。".into());}
-        if !seen.insert(relative.to_lowercase())||entry.unix_mode().map(|v|v&0o170000==0o120000).unwrap_or(false){return Err("归档包含重复路径或链接。".into());}
-        let destination=safe_path(target,&relative)?;
-        if entry.is_dir(){fs::create_dir_all(&destination).map_err(|e|e.to_string())?;}else{
-            fs::create_dir_all(destination.parent().unwrap()).map_err(|e|e.to_string())?;
-            let mut outgoing=fs::OpenOptions::new().write(true).create_new(true).open(&destination).map_err(|e|e.to_string())?;
-            let mut buffer=vec![0;1024*1024];loop{if cancel.load(Ordering::Acquire){return Err("已取消解包，未启用暂存内容。".into());}let count=entry.read(&mut buffer).map_err(|e|e.to_string())?;if count==0{break;}outgoing.write_all(&buffer[..count]).map_err(|e|e.to_string())?;completed+=count as u64;progress("释放基础组件",completed,total);}
-        }
-        progress("释放基础组件",completed,total);
-    }Ok(())
-}
-
 pub fn recover_install(root:&Path)->Result<(),String>{
     let journal=root.join("tmp/update-transaction.json");if !journal.is_file(){return Ok(());}
     let record=load(&journal)?;let committed=record["state"]=="committed";
     let rows=record["items"].as_array().ok_or("更新恢复记录无效")?;
     for row in rows {
         let relative=row["path"].as_str().ok_or("恢复路径缺失")?;
-        if !(relative=="app"||relative.starts_with("models/")||relative.starts_with("runtimes/")||["models","portable.json","VoiceTerminal.exe","app/release.json","models/manifest.json"].contains(&relative)) {return Err("更新恢复路径不在受管范围。".into());}
+        if !(relative=="app"||relative.starts_with("models/")||relative.starts_with("runtimes/")||["models","portable.json","VoiceTerminal.exe","VoiceTerminalUIDemo.exe","Verify-Package.ps1","使用与环境说明.md","app/release.json","models/manifest.json"].contains(&relative)) {return Err("更新恢复路径不在受管范围。".into());}
         safe_path(root,relative)?;
     }
     if !committed {for row in rows.iter().rev(){
