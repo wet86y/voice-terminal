@@ -125,7 +125,7 @@ const {
           SmartTurn（语音结束判断）的短语结束阈值：{{
             settings.silence.smart_turn_hard_silence_ms
           }}
-          毫秒（只读）。保存后，新的最终静默窗口将在下一次会话生效。
+          毫秒（只读）。保存后，当前最终静默窗口立即采用新时长。
         </p>
       </div>
       <footer>
@@ -162,7 +162,7 @@ const {
         <label class="switch-row"><div><strong>每日被动静默</strong><span>时段内抑制主动发声，保留用户主动交互</span></div><input v-model="quietHoursForm.enabled" type="checkbox" role="switch" :disabled="!settings.wake.enabled || saving" /><i></i></label>
         <div class="provider-fields"><label><span>开始时间</span><TimePicker v-model="quietHoursForm.start" label="开始时间" :disabled="saving" /></label><label><span>结束时间</span><TimePicker v-model="quietHoursForm.end" label="结束时间" :disabled="saving" /></label></div>
         <p v-if="!settings.wake.enabled">
-          请先开启 KWS（关键词唤醒），并在下一次会话使其生效。
+          请先开启并保存 KWS（关键词唤醒）设置。
         </p>
         <p>
           支持跨午夜；开始时间包含、结束时间不包含。关闭后恢复普通运行，未传达内容由后续交接整理承接。

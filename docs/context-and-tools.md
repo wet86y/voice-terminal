@@ -8,11 +8,11 @@
 
 主 Agent 的请求由三层组成：
 
-1. `STATIC_INSTRUCTIONS`：episode 内冻结的协议、人格、用户资料、动作目录和日期基准；
+1. `STATIC_INSTRUCTIONS`（固定指令）：协议、动作目录和日期基准在会话内冻结；人格、用户资料和自定义指令使用显式保存后的快照；
 2. `HISTORY`：已提交用户输入、已结算 `voice_delivery`、有效 refinement、工具结果和有语义影响的打断；
 3. `REQUEST_TAIL`：当前未提交输入、运行时间、恢复反馈、工具状态和活动 speak。
 
-产品设置中的 `custom_instructions`（自定义指令）在新会话或 `session.reset`（会话重置）时冻结。
+产品设置中的 `custom_instructions`（自定义指令）保存后更新当前会话快照，后续请求立即采用；已派发的请求继续使用派发时的独立副本。
 主模型的静态层包含启用条目的触发语义和执行位置；仅语音链路条目包含执行目标。
 影子条目的目标不进入主模型上下文。触发采用完整语义判断，不做关键词硬匹配。
 旧 `config/persona/instructions.md`（历史工作指令文档）留在磁盘供查阅，不再加载；
@@ -137,7 +137,7 @@ Shadow 使用独立的 `ShadowContextProjector`，来源仍是 `SessionLedger`�
 }
 ```
 
-保存响应中的 `effective_from`（生效时机）为 `next_session`（下一次会话），`pending`（当前会话仍使用旧版本）为 `true`。正在进行的会话继续使用创建时冻结的条目快照；`session.reset`（会话重置）后，语音模型与影子代理共同切换到最新版本。
+人格与自定义指令保存响应中的 `effective_from`（生效时机）为 `next_request`（当前会话后续模型请求），`pending`（尚未应用）为 `false`。保存操作显式更新语音模型的当前提示快照与影子代理的权威环境，并追加 `product_settings`（产品设置修订），供已连接的后台同步读取。会话编号、历史和正在派发的请求保留。固定指令的稳定性检查仅在这次显式保存时重新建立基线，直接编辑磁盘文件仍不自动修改已激活的快照。
 
 语音模型能看到启用条目的 `trigger`（触发语义）和 `target`（执行位置），但只会看到 `target: "voice"`（语音链路）的 `instruction`（执行目标）。对于 `target: "shadow"`（影子代理）的条目，语音模型只根据语义发出既有的 `request_shadow`（请求影子代理）信号，不传递用户编写的执行目标，也不获得新的工具权限。
 
@@ -217,7 +217,7 @@ KWS（关键词唤醒）待机。该非终态工具通过独立的受保护
 
 Shadow 的活动状态只保留当前运行的有限产品投影；完整 trace 由 runtime 管理。上下文缓存的基本原则是：
 
-- instructions、工具顺序和 schema 在 session 内冻结；
+- instructions（内置指令）、工具顺序和 schema（输出结构）在 session（会话）内冻结；用户显式保存的人格、资料和自定义指令更新后续请求快照；
 - HISTORY 只追加、不重排、不回写；
 - 动态时间、revision、run ID、nonce 和服务状态不进入固定前缀；
 - 达到上下文预算约 80% 时，在安全边界生成摘要并切换 cache epoch；

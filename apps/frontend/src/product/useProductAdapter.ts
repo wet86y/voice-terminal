@@ -195,6 +195,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   let snapshotRequest: Promise<void> | null = null
   let dshRevision = 0 // dshRevision（宿主状态修订号）：阻止迟到的启动快照覆盖新状态。
+  let speakerStatusRevision = 0 // speakerStatusRevision（声纹状态修订号）：保存后忽略迟到的旧状态。
   let reconnectTimer: number | undefined
   let dshStatusTimer: number | undefined
   let computeStatusTimer: number | undefined
@@ -533,25 +534,29 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
 
   async function refreshSpeaker() {
     if (!application.businessReady.value) return
+    const revision = ++speakerStatusRevision
     try {
       const [status, profile, ambient] = await Promise.all([
         productApi.speakerStatus(), productApi.speakerProfile(), productApi.ambientContext(),
       ])
-      speakerStatus.value = status
+      if (adapterDisposed) return
+      if (revision === speakerStatusRevision) speakerStatus.value = status
       speakerProfile.value = profile
       ambientContext.value = ambient
     } catch (error) {
       // The sidecar is optional; do not make the main product snapshot fail.
-      speakerStatus.value = { service: 'UNAVAILABLE', last_error: messageFromError(error) }
+      if (!adapterDisposed && revision === speakerStatusRevision) speakerStatus.value = { service: 'UNAVAILABLE', last_error: messageFromError(error) }
     }
   }
 
   async function refreshSpeakerStatus() {
     if (!application.businessReady.value) return
+    const revision = ++speakerStatusRevision
     try {
-      speakerStatus.value = await productApi.speakerStatus()
+      const status = await productApi.speakerStatus()
+      if (!adapterDisposed && revision === speakerStatusRevision) speakerStatus.value = status
     } catch (error) {
-      speakerStatus.value = { service: 'UNAVAILABLE', last_error: messageFromError(error) }
+      if (!adapterDisposed && revision === speakerStatusRevision) speakerStatus.value = { service: 'UNAVAILABLE', last_error: messageFromError(error) }
     }
   }
 
@@ -571,6 +576,24 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       } finally {
         saving.value = false
       }
+    })
+  }
+
+  async function saveSpeakerControls() {
+    // 模式与开关直接保存；未保存的阈值草稿继续由底部按钮提交。
+    const submitted = { ...settings.speaker, mode: speakerForm.mode, owner_only_barge_in: speakerForm.owner_only_barge_in }
+    await enqueue(async () => {
+      saving.value = true
+      try {
+        const result = await productApi.saveSpeaker(submitted)
+        updateSettingsFromResponse(settings, result)
+        await refreshSpeaker()
+        setNotice(result.message || '声纹模式与主人打断设置已立即生效。')
+      } catch (error) {
+        if (speakerForm.mode === submitted.mode) speakerForm.mode = settings.speaker.mode
+        if (speakerForm.owner_only_barge_in === submitted.owner_only_barge_in) speakerForm.owner_only_barge_in = settings.speaker.owner_only_barge_in
+        setError(error)
+      } finally { saving.value = false }
     })
   }
 
@@ -995,7 +1018,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
           sensitivity: wakeForm.sensitivity,
         })
         updateSettingsFromResponse(settings, result)
-        setNotice(result.message || 'KWS 设置已保存，将在下一次会话生效。')
+        setNotice(result.message || 'KWS（关键词唤醒）设置已保存并立即生效。')
       } catch (error) {
         setError(error)
       } finally {
@@ -1010,7 +1033,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       try {
         const result = await productApi.saveSilence({ seconds: silenceSeconds.value })
         updateSettingsFromResponse(settings, result)
-        setNotice(result.message || '静默设置已保存，将在下一次 Episode 生效。')
+        setNotice(result.message || '静默设置已保存，当前计时窗口立即采用新时长。')
       } catch (error) {
         setError(error)
       } finally {
@@ -1057,7 +1080,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       try {
         const result = await productApi.savePersona({ ...personaDocuments })
         updateSettingsFromResponse(settings, result)
-        setNotice(result.message || 'Persona 已保存，将在下一次 Episode 生效。')
+        setNotice(result.message || '人格与用户资料已保存，后续模型请求立即使用新内容。')
       } catch (error) {
         setError(error)
       } finally {
@@ -1075,7 +1098,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
         const changed = JSON.stringify(customInstructions.value) !== JSON.stringify(submitted)
         updateSettingsFromResponse(settings, result)
         if (!changed) customInstructions.value = settings.custom_instructions.map(item => ({ ...item }))
-        setNotice(result.message || '自定义指令已保存，将在下一次会话或重置后生效。')
+        setNotice(result.message || '自定义指令已保存，后续模型请求立即使用新内容。')
       } catch (error) {
         setError(error)
       } finally {
@@ -1500,6 +1523,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     savePersona,
     saveCustomInstructions,
     saveSpeaker,
+    saveSpeakerControls,
     refreshComputeStatus,
     saveComputeSettings,
     refreshSpeaker,

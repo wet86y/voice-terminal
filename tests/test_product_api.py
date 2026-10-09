@@ -244,17 +244,14 @@ class ProductApiTests(unittest.TestCase):
         keywords_file = self.runtime.config.kws_keywords_file
         keywords_file.parent.mkdir(parents=True, exist_ok=True)
         keywords_file.write_text("phones @HEI_CLAW\n", encoding="utf-8")
-        valid_wake = asyncio.run(self._request(
-            "PUT", "/api/v1/product/settings/wake",
-            json={
-                "enabled": True,
-                "keyword": "hei claw",
-                "sensitivity": 75,
-            },
-        ))
+        with patch.object(self.runtime, "_build_kws_worker"):
+            valid_wake = asyncio.run(self._request(
+                "PUT", "/api/v1/product/settings/wake",
+                json={"enabled": True, "keyword": "hei claw", "sensitivity": 75},
+            ))
         self.assertEqual(valid_wake.status_code, 200)
-        self.assertEqual(valid_wake.json()["effective_from"], "next_session")
-        self.assertTrue(valid_wake.json()["pending"])
+        self.assertEqual(valid_wake.json()["effective_from"], "immediate")
+        self.assertFalse(valid_wake.json()["pending"])
 
         invalid_shadow = asyncio.run(self._request(
             "PUT", "/api/v1/product/settings/shadow",
@@ -278,7 +275,7 @@ class ProductApiTests(unittest.TestCase):
             },
         ))
         self.assertEqual(valid_persona.status_code, 200)
-        self.assertEqual(valid_persona.json()["effective_from"], "next_episode")
+        self.assertEqual(valid_persona.json()["effective_from"], "next_request")
         entry = {
             "id": "search", "trigger": "帮我查查", "target": "shadow",
             "instruction": "查询用户所问的资料。", "enabled": True,
@@ -288,7 +285,7 @@ class ProductApiTests(unittest.TestCase):
             json={"custom_instructions": [entry]},
         ))
         self.assertEqual(saved.status_code, 200)
-        self.assertEqual(saved.json()["effective_from"], "next_session")
+        self.assertEqual(saved.json()["effective_from"], "next_request")
         self.assertEqual(saved.json()["settings"]["custom_instructions"], [entry])
         invalid = asyncio.run(self._request(
             "PUT", "/api/v1/product/settings/custom-instructions",

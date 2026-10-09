@@ -312,7 +312,7 @@ export interface ProductSnapshot {
 
 export interface ProductMutationResult {
   settings?: ProductSettingsSnapshot | Record<string, unknown>
-  effective_from?: 'next_session' | 'next_episode' | string
+  effective_from?: 'immediate' | 'components_ready' | 'next_request' | 'retry_required' | 'application_restart' | string // 生效时机：即时、加载结束、后续请求、重试或重启。
   pending?: boolean
   /** restart_required（需要重启）：修改计算设备后必须重启整个应用。 */
   restart_required?: boolean

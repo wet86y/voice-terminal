@@ -58,11 +58,11 @@ from ..analysis.client import AnalysisClient
 from .product import (
     ProductSettingsStore,
     ShadowProductProjection,
-    apply_settings_to_config,
 )
 from .snapshot import snapshot_event
 from .speaker_runtime import SpeakerRuntimeMixin
 from .handoff_runtime import HandoffRuntimeMixin
+from .settings_runtime import ProductSettingsRuntimeMixin
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ async def _no_session_lock():
     yield
 
 
-class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntimeMixin):
+class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntimeMixin):
     """The sole production runtime: a session orchestrating input, agent and speech."""
     def __init__(self, config: AppConfig, *, product_settings: ProductSettingsStore | None = None,
                  speaker_worker_config_path: Path | None = None,
@@ -89,6 +89,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             if product_settings is not None else []
         )
         self._pending_product_settings: dict[str, Any] | None = None
+        self._product_settings_lock = asyncio.Lock()  # 产品设置应用互斥，防止并行换入模型。
         self.state = RuntimeState()
         self.bus = EventBus()
         self.history = SessionLedger(limit=10)
@@ -202,22 +203,23 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
         )
 
 
-    def _build_kws_worker(self) -> KwsWorker:
-        requested = self.config.compute.devices.get("kws", "cpu")
-        fallback = self.config.compute.fallback_devices.get("kws", "cpu")
+    def _build_kws_worker(self, config: AppConfig | None = None) -> KwsWorker:
+        config = config or self.config
+        requested = config.compute.devices.get("kws", "cpu")
+        fallback = config.compute.fallback_devices.get("kws", "cpu")
         last_error: Exception | None = None
         for device in device_candidates(requested, "kws", fallback):
             try:
                 detector = KwsDetector(
-                    model_dir=self.config.kws_dir,
-                    keywords_file=self.config.kws_keywords_file,
-                    keyword_label=self.config.wake.keyword_labels,
-                    threshold=self.config.wake.threshold,
-                    keywords_score=self.config.wake.keywords_score,
-                    num_trailing_blanks=self.config.wake.num_trailing_blanks,
-                    max_active_paths=self.config.wake.max_active_paths,
+                    model_dir=config.kws_dir,
+                    keywords_file=config.kws_keywords_file,
+                    keyword_label=config.wake.keyword_labels,
+                    threshold=config.wake.threshold,
+                    keywords_score=config.wake.keywords_score,
+                    num_trailing_blanks=config.wake.num_trailing_blanks,
+                    max_active_paths=config.wake.max_active_paths,
                     provider=device,
-                    sample_rate=self.config.audio.sample_rate,
+                    sample_rate=config.audio.sample_rate,
                 )
                 worker = KwsWorker(detector)
                 worker.start()
@@ -603,6 +605,8 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             self._quiet_clock_task = asyncio.create_task(self._quiet_clock(), name="quiet-hours-policy")
         self._application_bound_dsh_pid = None
         self._application_session_ready = True
+        async with self._product_settings_lock:
+            await self._apply_pending_product_settings()
 
     async def _initialize_native_shadow(self, shadow_cfg: Any, shadow_key: str) -> None:
         try:
@@ -785,92 +789,6 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
 
     def stage_product_settings(self, settings: Mapping[str, Any]) -> None:
         self._pending_product_settings = dict(settings)
-
-    async def _apply_pending_product_settings(self) -> bool:
-        """Apply staged product settings at the next safe start boundary."""
-
-        pending = self._pending_product_settings
-        if pending is None or self.state.listening:
-            return True
-        previous_config = self.config
-        next_config = apply_settings_to_config(self.config, pending)
-        wake_changed = next_config.wake != previous_config.wake
-        try:
-            if wake_changed and self.kws is not None:
-                self.kws.close()
-                self.kws = None
-            self.config = next_config
-            if hasattr(self, "quiet_policy"):
-                self.quiet_policy.config = next_config.quiet_hours
-            if next_config.speaker != previous_config.speaker:
-                await self.set_speaker_settings({
-                    "mode": next_config.speaker.mode,
-                    "confirm_threshold": next_config.speaker.confirm_threshold,
-                    "continuity_threshold": next_config.speaker.continuity_threshold,
-                    "owner_only_barge_in": next_config.speaker.owner_only_barge_in,
-                })
-            self.state.wake_always_on = bool(self.config.wake.enabled)
-            if self.controller is not None:
-                set_agent_options = getattr(self.controller, "set_agent_options", None)
-                if callable(set_agent_options):
-                    set_agent_options(self.config.agent)
-                else:
-                    # Compatibility fixtures may expose only the old public
-                    # attribute; live EpisodeController has the boundary
-                    # aware setter above.
-                    self.controller.agent_options = self.config.agent
-                self.controller.wake_enabled = self.config.wake.enabled
-                self.controller.wake_always_on = self.state.wake_always_on
-                self.controller.state.wake_always_on = self.state.wake_always_on
-                self.controller.wake_keyword = self.config.wake.keyword
-                self.controller.wake_keywords = self.config.wake.keywords
-            if wake_changed:
-                if self.config.wake.enabled:
-                    self.kws = self._build_kws_worker()
-                    self.state.set_service("kws", "READY")
-                else:
-                    self.state.set_service("kws", "DISABLED")
-                if self.controller is not None:
-                    self.controller.kws = self.kws
-            self._pending_product_settings = None
-            return True
-        except Exception as exc:
-            logger.exception("product.settings_apply_failed")
-            # Restore the previous in-memory config and leave the persisted
-            # setting pending so the next start can retry after the asset or
-            # model problem has been corrected.
-            self.config = previous_config
-            if hasattr(self, "quiet_policy"):
-                self.quiet_policy.config = previous_config.quiet_hours
-            self.state.wake_always_on = bool(previous_config.wake.enabled)
-            if self.controller is not None:
-                set_agent_options = getattr(self.controller, "set_agent_options", None)
-                if callable(set_agent_options):
-                    set_agent_options(previous_config.agent)
-                else:
-                    self.controller.agent_options = previous_config.agent
-                self.controller.wake_enabled = previous_config.wake.enabled
-                self.controller.wake_always_on = self.state.wake_always_on
-                self.controller.state.wake_always_on = self.state.wake_always_on
-                self.controller.wake_keyword = previous_config.wake.keyword
-                self.controller.wake_keywords = previous_config.wake.keywords
-            if wake_changed:
-                try:
-                    if previous_config.wake.enabled:
-                        self.kws = self._build_kws_worker()
-                        self.state.set_service("kws", "READY")
-                    else:
-                        self.kws = None
-                        self.state.set_service("kws", "DISABLED")
-                    if self.controller is not None:
-                        self.controller.kws = self.kws
-                except Exception as restore_exc:
-                    self.kws = None
-                    if self.controller is not None:
-                        self.controller.kws = None
-                    self._record_error("kws", str(restore_exc))
-            self.startup_errors.append(f"product_settings: {str(exc)[:300]}")
-            return False
 
     async def set_reasoning_mode(self, mode: str) -> bool:
         if mode not in {"fast", "deep"}:
@@ -1530,6 +1448,7 @@ class SessionRuntime(HandoffRuntimeMixin, SpeakerRuntimeMixin, ApplicationRuntim
             "continuity_threshold": continuity,
             "owner_only_barge_in": owner_only,
             "owner_only_barge_in_selected": status["owner_only_barge_in_selected"],
+            "owner_only_barge_in_ready": status["owner_only_barge_in_ready"],  # 配置及组件就绪。
             "owner_only_barge_in_effective": status["owner_only_barge_in_effective"],
             "owner_only_barge_in_reason": status["owner_only_barge_in_reason"],
         }

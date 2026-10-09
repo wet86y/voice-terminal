@@ -21,8 +21,10 @@ if ($Build) {$PackageArgs+=@('--build',$Build)}
 & $Context.Python '-B' '-X' 'utf8' '-c' 'import sys; sys.path.insert(0,sys.argv[2]); from pathlib import Path; from voice_terminal.distribution import require_stopped; root=Path(sys.argv[1]); require_stopped(root, root)' $InstallRoot $DesktopRepo
 if ($LASTEXITCODE) {throw '现有正式程序未能安全退出。'}
 $Helper=Join-Path $DesktopRepo '.local/build/desktop/product/release/VoiceTerminal.exe'
-& $Helper '--install-package' (Join-Path $DesktopRepo '.local/build/program-package/program.zip') '--target-root' $InstallRoot
-if ($LASTEXITCODE) {throw '正式本体事务替换失败；原程序已恢复或保留恢复日志。'}
+$InstallArguments=@('--install-package',('"'+(Join-Path $DesktopRepo '.local/build/program-package/program.zip')+'"'),'--target-root',('"'+$InstallRoot+'"'))
+# Native GUI（原生图形入口）必须等待退出并检查自身退出码；$LASTEXITCODE（上一命令退出码）不能确认替换已完成。
+$InstallProcess=Start-Process -FilePath $Helper -ArgumentList $InstallArguments -WindowStyle Hidden -Wait -PassThru
+if ($InstallProcess.ExitCode) {throw '正式本体事务替换失败；原程序已恢复或保留恢复日志。'}
 if ($InstallRoot -eq (Join-Path $DesktopRepo '.local')) {
   Copy-Item -LiteralPath (Join-Path $DesktopRepo '.local/build/desktop/product/release/VoiceTerminalUIDemo.exe') -Destination (Join-Path $InstallRoot 'VoiceTerminalUIDemo.exe') -Force
 }

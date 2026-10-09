@@ -132,7 +132,7 @@ const noticeText = computed(
     feedback.value ||
     (overlay.value === "failure"
       ? "设置保存失败，请稍后重试。"
-      : "设置已保存，将在下一次对话生效。"),
+      : "设置已保存并立即生效。"),
 );
 const layoutScene = computed(() =>
   scene.value === "empty"

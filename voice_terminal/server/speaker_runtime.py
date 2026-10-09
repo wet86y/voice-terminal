@@ -301,6 +301,7 @@ class SpeakerRuntimeMixin:
         controller = getattr(self, "controller", None)
         protected = getattr(controller, "_barge_in_protected_available", None)
         owner_reason = ""
+        owner_ready = False  # 主人打断已完成配置与组件准备；播放验证单独报告。
         if owner_selected:
             if not profile.get("available"):
                 owner_reason = "主人声纹资料不可用"
@@ -308,14 +309,18 @@ class SpeakerRuntimeMixin:
                 owner_reason = "声纹工作进程不可用"
             elif processor is None or not processor.enabled:
                 owner_reason = "回声消除未启用"
+            elif not self.config.audio.echo_cancellation or not getattr(processor, "available", True):
+                owner_reason = "回声消除组件不可用"
             elif controller is None or getattr(controller, "speaker_sensor", None) is None:
                 owner_reason = "声纹采样链未就绪"
-            elif not getattr(getattr(controller, "output", None), "active", False):
-                # The reverse-reference freshness check can degrade the AEC
-                # processor; do not probe it while playback is idle.
-                owner_reason = "等待播放期间的回声保护验证"
-            elif not callable(protected) or not protected():
-                owner_reason = "播放期间回声保护不可用"
+            else:
+                owner_ready = True
+                if not getattr(getattr(controller, "output", None), "active", False):
+                    # 待机期间没有反向播放参考音频，不能将正常等待当成组件故障。
+                    owner_reason = "已启用，等待播放期间验证回声保护"
+                elif not callable(protected) or not protected():
+                    owner_ready = False
+                    owner_reason = "播放期间回声保护不可用"
         owner_effective = owner_selected and not owner_reason
         rolling = getattr(controller, "_speaker_snapshot", None)
         return {
@@ -333,6 +338,7 @@ class SpeakerRuntimeMixin:
             "test": dict(self._speaker_test_result or {}),
             "anti_spoofing": "unavailable",
             "owner_only_barge_in_selected": owner_selected,
+            "owner_only_barge_in_ready": owner_ready,  # 主人打断配置及采样链已就绪。
             "owner_only_barge_in_effective": owner_effective,
             "owner_only_barge_in_reason": owner_reason,
             "rolling_state": (
@@ -690,6 +696,16 @@ class SpeakerRuntimeMixin:
             segments.clear()
             if self.speaker_router is not None:
                 self.speaker_router.profile.load()
+            # 保存新模板后失效旧身份结论；已选择的声纹功能立即恢复采样。
+            if self.controller is not None:
+                await self.controller._stop_speaker_sensor()
+                self.controller.configure_speaker_runtime()
+            if self.config.speaker.mode != "off" or self.config.speaker.owner_only_barge_in:
+                await self.set_speaker_settings({
+                    "mode": self.config.speaker.mode,
+                    "owner_only_barge_in": self.config.speaker.owner_only_barge_in,
+                })
+            await self.bus.publish(self.snapshot())
             merged = dict(result)
             merged["enrollment"] = {
                 "min_similarity": detail.get("min_similarity"),

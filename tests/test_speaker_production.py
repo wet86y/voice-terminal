@@ -140,11 +140,17 @@ def test_owner_barge_status_separates_selected_from_current_aec_availability():
         status = runtime.speaker_status()
         assert status["owner_only_barge_in_selected"] is True
         assert status["owner_only_barge_in_effective"] is False
+        assert status["owner_only_barge_in_ready"] is True
         assert "等待播放" in status["owner_only_barge_in_reason"]
         output.active = True
         status = runtime.speaker_status()
         assert status["owner_only_barge_in_effective"] is False
         assert "回声保护不可用" in status["owner_only_barge_in_reason"]
+        assert status["owner_only_barge_in_ready"] is False
+        runtime.controller._barge_in_protected_available = lambda: True
+        status = runtime.speaker_status()
+        assert status["owner_only_barge_in_ready"] is True
+        assert status["owner_only_barge_in_effective"] is True
         runtime.state.set_service("speaker", "DEGRADED")
         status = runtime.speaker_status()
         assert status["owner_only_barge_in_selected"] is True
