@@ -19,6 +19,7 @@ REQUEST_SYSTEM_CONTEXT_KINDS = frozenset({
     "immediate_recovery",
     "deferred_recovery",
     "runtime_state",
+    "reasoning_mode",  # reasoning_mode（本次推理模式提示）：与冻结的接口推理强度一致。
     "pending_tools",
     "final_silence",
     "secondary_mailbox",  # 二等信箱专用评估提示。

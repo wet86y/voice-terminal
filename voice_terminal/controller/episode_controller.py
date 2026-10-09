@@ -347,10 +347,9 @@ class EpisodeController(RealtimeController):
         if mode not in {"fast", "deep"}:
             raise ValueError("reasoning_mode（运行模式）必须是 fast（快速）或 deep（深度）")
         self.reasoning_mode = mode
-        # Before the first user input there is no frozen schema yet, so make
-        # the staged selection effective immediately without touching work.
-        if self.episode.episode_id is None and not self.episode.closed:
-            self.episode = self._make_episode()
+        # episode（代理会话）跨暂停保留，后续请求必须读取最新选择。
+        # reasoning_effort（请求推理强度）在派发时已复制；更新模式不会改变当前请求。
+        self.episode.reasoning_mode = mode
 
     def set_agent_options(self, options) -> None:
         """Stage Agent options for the next Episode without touching live work.

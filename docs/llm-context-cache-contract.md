@@ -7,6 +7,7 @@
 - `STATIC_INSTRUCTIONS` 在 episode 内冻结；
 - `HISTORY` 只追加，不改写、不重排；
 - `REQUEST_TAIL` 只放当前请求动态信息；
+- 深度模式提示随本次冻结的 `reasoning.effort`（推理强度）放入 `REQUEST_TAIL`（请求尾部）；暂停后切换模式不修改 `STATIC_INSTRUCTIONS`（固定指令）或 `HISTORY`（语义历史）；
 - 动态时间、可用性、revision、run ID、nonce、播放器和 provider 状态不能污染固定前缀；
 - provider 未返回 usage 时显示“不可观测”，不能解释成零命中；
 - 每次请求记录 `input_tokens`、`cached_tokens`、`miss_tokens` 和 `hit_ratio`，用于诊断而不是业务判断。
@@ -61,7 +62,7 @@ assistant 历史只记录播放结算后的传达事实，不记录尚未发送�
 {"type":"current_user_input","version":1,"content":"原始完整文本"}
 ```
 
-运行时状态、恢复反馈、待处理工具和强制调度提示统一进入 `voice_request_context.entries`，不得在最终输出约束之后追加消息。原始 content 不能被摘要或重新解释；只有请求副本的超限处理可以截取，语义 ledger 不变。
+运行时状态、恢复反馈、待处理工具和强制调度提示统一进入 `voice_request_context.entries`，不得在最终输出约束之后追加消息。深度模式提示使用 `kind=reasoning_mode`（条目类型为本次推理模式提示），与本次请求冻结的接口推理强度一致；快速和唤醒确认请求不携带该提示。原始 content 不能被摘要或重新解释；只有请求副本的超限处理可以截取，语义 ledger 不变。
 
 ### 活动 Speak 四段投影
 
