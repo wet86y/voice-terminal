@@ -9,7 +9,7 @@ from .decision_schema import decision_schema
 from .prompts import (
     PROMPT, DEEP_THINKING_PROMPT,
     CONVERSATION_BEHAVIOR_PROMPT, PERSONA_DOCUMENT_POLICY, SECONDARY_MAILBOX_PROMPT,
-    FINAL_SILENCE_PROMPT, KWS_WAKE_PROMPT,
+    FINAL_SILENCE_PROMPT, KWS_WAKE_PROMPT, SPEECH_QUEUE_DECISION_PROMPT,
 )
 from ..custom_instructions import voice_projection
 from ..session.context import (
@@ -413,6 +413,10 @@ class AgentContextMixin:
                 ContextLane.REQUEST_TAIL, "system", KWS_WAKE_PROMPT,
                 context_kind=prompt_kind,
             ))
+        messages.append(ContextFrame.make(
+            ContextLane.REQUEST_TAIL, "system", SPEECH_QUEUE_DECISION_PROMPT,
+            context_kind="speech_queue_policy",  # speech_queue_policy（语音队列决策核对）。
+        ))
         messages = consolidate_request_tail(messages)
         self._guard_context_contract(messages)
         self._update_context_metrics(messages)

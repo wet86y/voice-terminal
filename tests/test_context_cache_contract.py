@@ -8,6 +8,7 @@ import pytest
 from voice_terminal.agent.decision_schema import decision_schema
 from voice_terminal.agent.episode import AgentEpisodeRuntime, RecoverySignal
 from voice_terminal.agent.options import AgentOptions
+from voice_terminal.agent.prompts import SPEECH_QUEUE_DECISION_PROMPT
 from voice_terminal.providers.deepseek import DeepSeekClient
 from voice_terminal.session.context import (
     FINAL_OUTPUT_CONSTRAINT, CurrentInput, LLMContextProjector,
@@ -231,7 +232,7 @@ def test_runtime_classifies_recovery_and_runtime_without_loss():
 
     assert messages[-1]["content"] == FINAL_OUTPUT_CONSTRAINT
     assert [entry["kind"] for entry in packet["entries"]] == [
-        "immediate_recovery", "runtime_state",
+        "immediate_recovery", "runtime_state", "speech_queue_policy",
     ]
     assert "SPEAK_ENVELOPE_INVALID" in packet["entries"][0]["content"]
     assert "当前轮运行状态" in packet["entries"][1]["content"]
@@ -239,18 +240,63 @@ def test_runtime_classifies_recovery_and_runtime_without_loss():
     runtime.minor_protocol_feedback.append({"field": "emotion"})
     minor = json.loads(runtime.messages({"USER_INPUT_FINALIZED"})[-2]["content"])
     assert [entry["kind"] for entry in minor["entries"]] == [
-        "minor_protocol_feedback", "runtime_state",
+        "minor_protocol_feedback", "runtime_state", "speech_queue_policy",
     ]
     assert "emotion" in minor["entries"][0]["content"]
 
     runtime.deferred_recovery_feedback.append(signal)
     deferred = json.loads(runtime.messages({"USER_INPUT_FINALIZED"})[-2]["content"])
     assert [entry["kind"] for entry in deferred["entries"]] == [
-        "deferred_recovery", "runtime_state",
+        "deferred_recovery", "runtime_state", "speech_queue_policy",
     ]
     assert "SPEAK_ENVELOPE_INVALID" in deferred["entries"][0]["content"]
     assert "已回到普通事件调度" not in deferred["entries"][0]["content"]
     assert "重新处理最后一条用户输入" not in deferred["entries"][0]["content"]
+
+
+@pytest.mark.parametrize("prompt_kind", ["normal", "secondary_mailbox", "final_silence", "kws_wake"])
+@pytest.mark.parametrize("recovering", [False, True])
+def test_queue_policy_survives_context_fit_and_is_last_before_output_guard(prompt_kind, recovering):
+    """真实消息组装、裁剪及供应商投影都必须保留请求末尾的队列规则。"""
+    class Registry:
+        def action_definitions(self):
+            return []
+
+    output = SimpleNamespace(speak_snapshot={"queue_status": "empty", "text_only_queue": True})
+    runtime = AgentEpisodeRuntime(
+        None, Registry(), output, lambda *_args: None,
+        options=AgentOptions(max_context_tokens=128),
+        conversation=ConversationRuntime(), ledger=SessionLedger(),
+    )
+    runtime.episode_id = runtime.conversation.conversation_id
+    runtime.last_turn_id = "turn-a"
+    runtime.inputs["turn-a"] = {"text": "需要回答的新问题" * 512, "final": True}
+    signal = (RecoverySignal(
+        "SPEAK_ENVELOPE_INVALID", "bad", source_request_id="request-a",
+        dispatch_context={"origin_prompt_kind": prompt_kind},
+    ) if recovering else None)
+    messages = runtime.messages(
+        {"EXCEPTION_RECOVERY"} if recovering else {"USER_INPUT_FINALIZED"},
+        recovery_signal=signal, prompt_kind=prompt_kind, reasoning_effort="low",
+    )
+    fitted, changes = runtime._fit_context(messages, [])
+    assert changes["truncated_current_input"]
+    payload = DeepSeekClient._responses_payload(
+        fitted, model="deepseek-flash", schema=decision_schema([]),
+        schema_name="voice_decision_v06", reasoning_effort="low", max_output_tokens=100,
+    )
+    assert SPEECH_QUEUE_DECISION_PROMPT not in payload["instructions"]
+    packet = json.loads(payload["input"][-2]["content"][0]["text"])
+    policies = [entry for entry in packet["entries"] if entry["kind"] == "speech_queue_policy"]
+    assert len(policies) == 1
+    assert packet["entries"][-1] == policies[0]
+    assert policies[0]["content"] == SPEECH_QUEUE_DECISION_PROMPT
+    assert any(entry["kind"] == "runtime_state" for entry in packet["entries"][:-1])
+    if prompt_kind != "normal":
+        assert any(entry["kind"] == prompt_kind for entry in packet["entries"][:-1])
+    if recovering:
+        assert any(entry["kind"] == "immediate_recovery" for entry in packet["entries"][:-1])
+    assert payload["input"][-1]["content"][0]["text"] == FINAL_OUTPUT_CONSTRAINT
 
 
 def test_fit_context_locates_typed_current_input_before_final_constraint():
