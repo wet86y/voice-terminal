@@ -63,7 +63,7 @@ async function toggleRecording() {
       >{{
         speakerStaleReason
       }}
-      特征管线更换后，旧模板与新的分数不再处于同一坐标，系统已停止用它们判定身份（不确定状态一律放行）。请重新录制三段。
+      特征管线更换后，旧模板已停止参与身份判断。拦截模式会暂停放行输入，请重新录制三段。
     </p>
   </div>
 
@@ -74,13 +74,13 @@ async function toggleRecording() {
         <option value="off">关闭</option>
         <option value="observe">仅标记</option>
         <option value="filter" :disabled="!speakerFilterAllowed">
-          拦截明确非主人
+          拦截 · 仅确认主人时放行
         </option></select
       ><small v-if="!speakerFilterAllowed"
         >注册主人声纹且
-        Worker（工作进程）就绪后才能启用拦截；不确定状态始终放行。</small
+        Worker（工作进程）就绪后才能启用拦截。</small
       ><small v-else
-        >仅标记只更新说话人状态；拦截会将明确非主人的转写转入环境记录。</small
+        >拦截会等待本段身份判定；只有确认的主人输入进入对话，未知、非主人及服务不可用时的输入进入环境记录。短句可能因人声证据不足被拦截。</small
       ></label
     >
     <label class="switch-row"

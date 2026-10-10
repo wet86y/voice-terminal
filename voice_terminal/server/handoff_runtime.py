@@ -234,10 +234,15 @@ class HandoffRuntimeMixin:
                        for item in self.paired_archives.filter_dsh(raw["dsh"]))
         material = PairedArchive(archive.archive_id, archive.directory, voice, dsh)
         try:
-            result = await ContinuityOrganizer(
-                provider, max_document_chars=cfg.max_document_chars,
-                max_output_tokens=cfg.max_output_tokens,
-                max_context_tokens=cfg.max_context_tokens).organize(material, previous, entries)
+            try:
+                # organize_timeout_ms（整理整体期限）不继承后台任务的无期限策略。
+                async with asyncio.timeout(cfg.organize_timeout_ms / 1000):
+                    result = await ContinuityOrganizer(
+                        provider, max_document_chars=cfg.max_document_chars,
+                        max_output_tokens=cfg.max_output_tokens,
+                        max_context_tokens=cfg.max_context_tokens).organize(material, previous, entries)
+            except TimeoutError as exc:
+                raise RuntimeError("上下文整理超过等待上限，已保留原会话、完整归档和待传达材料，可重试。") from exc
             return replace(result, archive=archive, related_archive_ids=archive_ids)
         finally:
             await provider.close()
@@ -254,7 +259,12 @@ class HandoffRuntimeMixin:
                     raw["voice"], self.paired_archives.filter_dsh(raw["dsh"]))
                 return OrganizedHandoff(marker["document"], marker["extracted_items"],
                     marker["consumed_entry_ids"], archive, tuple(marker.get("related_archive_ids", [])))
+        started = time.monotonic()
+        logger.info("continuity.archive_started voice_session_id=%s snapshot_records=%s",
+                    self.conversation.conversation_id, len(snapshot))
         archive = await self._export_paired_archive(snapshot)
+        logger.info("continuity.archive_finished archive_id=%s elapsed_ms=%.1f backlog=%s",
+                    archive.archive_id, (time.monotonic() - started) * 1000, len(self._archive_backlog))
         entries = self.pending_transfer.snapshot()
         return await self._organize_archive(archive, previous_document, entries)
 

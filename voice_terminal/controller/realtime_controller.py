@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 import logging
 import time
+from dataclasses import replace
 
 from .turn_controller import InputController
 from .input_ownership import InputOwnershipMixin
@@ -127,11 +128,12 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self._speaker_snapshot_barge_id = None
 
     def speaker_vetoes_turn(self, turn_id: str) -> bool:
-        if getattr(self, "speaker_mode", "off") != "filter":
-            return False
         ws = self.workspace
+        mode = getattr(ws, "speaker_mode", getattr(self, "speaker_mode", "off"))
+        if mode != "filter":
+            return False
         snapshot = self._speaker_snapshot
-        return bool(
+        rolling_veto = bool(
             ws is not None and ws.turn_id == turn_id
             and snapshot is not None and snapshot.identity == RollingSpeakerIdentity.NON_OWNER
             and snapshot.is_fresh()
@@ -139,6 +141,14 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             and self._speaker_snapshot_turn_id == turn_id
             and self._speaker_snapshot_generation == ws.generation
         )
+        if rolling_veto:
+            return True
+        router = getattr(self, "speaker_router", None)
+        if ws is None or ws.turn_id != turn_id or router is None:
+            return False
+        decision = router.decision()
+        return bool(decision.turn_id == turn_id and decision.generation == ws.generation
+                    and decision.state == SpeakerState.NON_OWNER_CONFIRMED)
 
     async def _stop_speaker_sensor(self) -> None:
         timer = getattr(self, "_speaker_timer_handle", None)
@@ -187,13 +197,23 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                                       observation=enriched.to_payload(include_embedding=False)))
 
     async def _speaker_decision(self, ws: TurnWorkspace) -> SpeakerDecision | None:
+        token = ws.token  # token（开始判定时冻结的输入轮次与代次）。
         mode = str(getattr(ws, "speaker_mode", getattr(self, "speaker_mode", "off")))
         speaker_router = getattr(self, "speaker_router", None)
-        if mode == SpeakerMode.OFF or speaker_router is None:
+        if mode == SpeakerMode.OFF:
             return None
         router = speaker_router
         speaker_client = getattr(self, "speaker_client", None)
-        if speaker_client is None or not speaker_client.connected:
+        if router is None:
+            if mode == SpeakerMode.OBSERVE:
+                return None
+            decision = SpeakerDecision(
+                turn_id=ws.turn_id, generation=ws.generation, user_id=None,
+                state=SpeakerState.UNAVAILABLE, similarity=None, threshold_used=None,
+                speech_ms=0, observation_count=0, continuity_source=None,
+                route="ambient", reason="speaker_router_unavailable", degraded=True,
+            )
+        elif speaker_client is None or not speaker_client.connected:
             router.mark_unavailable("speaker_worker_unavailable")
             decision = router.decision(
                 route="main" if mode == SpeakerMode.OBSERVE else "passthrough",
@@ -204,15 +224,23 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                 ws.turn_id, ws.generation,
                 timeout_ms=getattr(self, "speaker_wait_ms", 150),
             )
+            if ws.token != token or self.workspace is not ws:
+                return None
             if not finished or speaker_client.degraded:
                 reason = "speaker_queue_overflow" if speaker_client.degraded else "speaker_timeout"
-                # A timeout is itself a degraded observation boundary.  Mark
-                # the optional service accordingly while still fail-opening
-                # the semantic route; a later reconnect/health check can
-                # return it to READY.
+                # 最终回执超时将服务标记为 DEGRADED（降级），后续健康检查可恢复。
+                # filter（拦截模式）在下方统一拒绝所有降级身份，观察模式保持放行。
                 self.state.set_service("speaker", "DEGRADED")
+                evidence = router.decision()
+                # speaker_timeout（最终回执超时）不撤销此前已经收到的有效本轮证据。
+                # 保留已有非主人状态，避免最终刷新慢一步就丢失拦截原因。
+                confirmed_non_owner = (
+                    evidence.turn_id == ws.turn_id and evidence.generation == ws.generation
+                    and evidence.state == SpeakerState.NON_OWNER_CONFIRMED
+                )
                 decision = router.decision(
-                    route="main" if mode == SpeakerMode.OBSERVE else "passthrough",
+                    route=("ambient" if mode == SpeakerMode.FILTER and confirmed_non_owner
+                           else "main" if mode == SpeakerMode.OBSERVE else "passthrough"),
                     degraded=True, reason=reason,
                 )
             else:
@@ -231,6 +259,13 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                     )
                 else:
                     decision = router.decision(route="main")
+        if mode == SpeakerMode.FILTER:
+            # filter（拦截模式）仅确认本轮主人可放行；未知、延续身份、降级均不授权。
+            owner_confirmed = (
+                decision.turn_id == ws.turn_id and decision.generation == ws.generation
+                and decision.state == SpeakerState.OWNER_CONFIRMED and not decision.degraded
+            )
+            decision = replace(decision, route="main" if owner_confirmed else "ambient")
         ws.speaker_decision = decision.to_payload()
         ws.speaker_state = decision.state.value
         ws.speaker_degraded_reason = decision.reason if decision.degraded else ""
@@ -238,6 +273,13 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         await self._publish(event("speaker.decision", ws.turn_id,
                                   output_generation=ws.generation,
                                   decision=decision.to_payload()))
+        logger.info(
+            "speaker.turn_route turn_id=%s generation=%s mode=%s state=%s route=%s "
+            "reason=%s similarity=%s speech_ms=%s observations=%s degraded=%s",
+            ws.turn_id, ws.generation, mode, decision.state.value, decision.route,
+            decision.reason, decision.similarity, decision.speech_ms,
+            decision.observation_count, decision.degraded,
+        )
         return decision
 
     def _track(self, task: asyncio.Task | None) -> None:
@@ -685,7 +727,11 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         for name, details in self.analysis_health.items():
             if isinstance(details, dict):
                 ws.analysis[name] = dict(details)
-        if self.player:
+        # busy（有效输出事务忙碌）或 playback_hold_active（播放前被动暂停）
+        # 均表示输出仍拥有许可与音频队列；只有明确取消或打断才停止该输出。
+        output = getattr(self, "output", None)
+        owns_playback = bool(getattr(output, "busy", False) or getattr(output, "playback_hold_active", False))
+        if self.player and not owns_playback:
             self.player.block()
         await self._detail("turn.started")
         await self._state_event(TerminalState.LISTENING, listening=True, turn_id=turn_id)

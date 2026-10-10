@@ -136,7 +136,7 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
   长推理每 20 秒通过 `inject` 发送一次不打断执行的收敛提醒（可由
   `shadow_agent.runtime_reminder_interval_ms` 调整）。
 
-KWS 和声纹是独立能力。KWS 负责输入所有权和唤醒待机，声纹负责 ASR final 后的可选路由增强；任一旁路发生故障，都不能默默改变另一条链路的语义。
+KWS（关键词唤醒）和声纹是独立能力。前者负责输入所有权和唤醒待机；声纹拦截模式在身份结算前暂缓流式输入派发，最终仅放行本段已确认的主人，未知及服务异常均拦截。仅标记模式继续允许普通输入；主人打断采用独立开关。详见[声纹增强](docs/speaker-enhancement.md)。
 
 ## 验证命令
 
@@ -179,6 +179,7 @@ git diff --check
 - [LLM 上下文缓存契约](docs/llm-context-cache-contract.md)
 - [LLM JSON Schema 迁移与回滚 Runbook](docs/llm-json-schema-migration.md)
 - [可选声纹增强](docs/speaker-enhancement.md)
+- [环境声、严格声纹拦截与重置修复](docs/voice-reliability-fixes-20261010.md)：输出许可、整理材料构造及当前验证边界。
 - [项目隔离 DSH 控制台](docs/dsh-console.md)
 - [运行与质量门槛](docs/operations-and-quality.md)
 - [当前已知问题](docs/known-issues.md)

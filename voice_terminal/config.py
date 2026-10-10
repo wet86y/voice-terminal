@@ -517,6 +517,7 @@ class ContinuityConfig:
     max_document_chars: int = 6000  # max_document_chars（文档字符上限）。
     max_output_tokens: int = 16384  # max_output_tokens（输出词元预算）。
     max_context_tokens: int = 524288  # max_context_tokens（输入上下文预算）。
+    organize_timeout_ms: int = 90000  # organize_timeout_ms（整个整理流程的等待上限，毫秒）。
 
     def __post_init__(self) -> None:
         if (not all(type(value) is int for value in (self.max_document_chars, self.max_output_tokens, self.max_context_tokens))
@@ -524,6 +525,8 @@ class ContinuityConfig:
             raise ValueError("continuity（交接整理）预算必须为正，上下文至少1024词元。")
         if self.max_output_tokens >= self.max_context_tokens:
             raise ValueError("max_output_tokens（输出预算）必须小于 max_context_tokens（上下文预算）。")
+        if type(self.organize_timeout_ms) is not int or self.organize_timeout_ms < 1:
+            raise ValueError("organize_timeout_ms（整个整理流程的等待上限）必须为正整数。")
 
 
 @dataclass(frozen=True)

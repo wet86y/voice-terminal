@@ -153,7 +153,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                  can_dispatch_final_silence=None,
                  defer_silence_until_output=False, continuity_document_provider=None,
                  on_user_activity=None, on_silence_anchor=None,
-                 on_speaker_heartbeat=None, admit_user_turn=None):
+                 on_speaker_heartbeat=None, admit_user_turn=None, defer_user_turn=None):
         self.provider, self.registry, self.output, self.emit = provider, registry, output, emit
         self.quiet_policy = None
         self.deferred_capture = None
@@ -175,6 +175,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self.on_silence_anchor = on_silence_anchor
         self.on_speaker_heartbeat = on_speaker_heartbeat
         self.admit_user_turn = admit_user_turn
+        self.defer_user_turn = defer_user_turn  # defer_user_turn（身份待定时保留输入、暂缓派发）。
         # This is enabled only for the resident-KWS product mode.  Ordinary
         # sessions retain the historical behavior where the finalized input
         # itself arms the silence window.
@@ -2331,6 +2332,10 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 "USER_SEGMENT_UPDATED", "USER_INPUT_FINALIZED", "USER_INPUT_REFINED",
             })
             source_turn_id = self._pending_transcript_turn_id or self.last_turn_id
+            defer = getattr(self, "defer_user_turn", None)
+            if user_kinds and source_turn_id and callable(defer) and defer(source_turn_id):
+                # 身份尚未结算不等于否决，保留正文和事件供下一心跳或最终稿使用。
+                return
             if user_kinds and source_turn_id and callable(self.admit_user_turn):
                 try:
                     admitted = bool(self.admit_user_turn(source_turn_id))

@@ -2,14 +2,20 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 import json
+import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+
+logger = logging.getLogger(__name__)
 
 
 def atomic_json(path: Path, value: Any) -> None:
@@ -150,6 +156,21 @@ class PairedArchiveStore:
         result = []
         noise_calls: set[str] = set()
         noise_names = {"publish_progress", "get_latest_context"}
+        # DSH（后台执行宿主）使用 tool-call（工具调用块）和 source.callId（结果关联标识）。
+        # 先收集标识，结果排序变化也不会把上下文读取正文再次送入交接模型。
+        for item in records:
+            data = item.get("data") or {}
+            if not isinstance(data, dict):
+                continue
+            if (data.get("name") or data.get("tool")) in noise_names:
+                noise_calls.add(str(data.get("callId") or ""))
+            message = data.get("message", data)
+            if isinstance(message, dict) and isinstance(message.get("content"), list):
+                for block in message["content"]:
+                    if (isinstance(block, dict) and block.get("type") in {"tool_call", "tool-call"}
+                            and block.get("name") in noise_names):
+                        noise_calls.add(str(block.get("id") or block.get("callId") or ""))
+        noise_calls.discard("")
         for index, item in enumerate(records):
             item = deepcopy(item)
             kind = str(item.get("type") or "")
@@ -161,9 +182,12 @@ class PairedArchiveStore:
             source = source if isinstance(source, dict) else {}
             if kind == "agent/inbox/spliced" and isinstance(data, dict):
                 inserted = data.get("inserted", [])
-                if inserted and all(isinstance(row, dict) and (row.get("source") or {}).get("kind")
-                                    == "plugin:voice-terminal-shadow-bridge" for row in inserted):
+                inserted = [row for row in inserted if not (isinstance(row, dict)
+                            and isinstance(row.get("source"), dict)
+                            and row["source"].get("kind") == "plugin:voice-terminal-shadow-bridge")]
+                if not inserted:
                     continue
+                data["inserted"] = inserted
             if kind == "user/message" and source.get("kind") == "plugin:voice-terminal-shadow-bridge":
                 continue
             name = (data.get("name") or data.get("tool")) if isinstance(data, dict) else ""
@@ -173,7 +197,8 @@ class PairedArchiveStore:
             content = message.get("content", []) if isinstance(message, dict) else []
             if kind == "assistant/message" and isinstance(content, list):
                 content = [block for block in content if not (isinstance(block, dict)
-                           and block.get("type") == "tool_call" and block.get("name") in noise_names)]
+                           and block.get("type") in {"tool_call", "tool-call"}
+                           and block.get("name") in noise_names)]
                 if not content and message.get("content"):
                     continue
                 if "content" in message:
@@ -181,6 +206,7 @@ class PairedArchiveStore:
             if kind == "tool/result" and isinstance(content, list):
                 call_ids = {str(block["toolCallId"]) for block in content
                             if isinstance(block, dict) and block.get("toolCallId")}
+                call_ids.update(str(value) for value in (source.get("callId"), data.get("callId")) if value)
                 failed = message.get("isError") or data.get("error") or any(
                     isinstance(block, dict) and block.get("isError") for block in content)
                 if call_ids and call_ids <= noise_calls and not failed:
@@ -188,8 +214,66 @@ class PairedArchiveStore:
             if (kind == "assistant/message" and result
                     and result[-1].get("type") == kind and result[-1].get("data") == data):
                 continue
-            result.append({**item, "source_record_index": index})
+            result.append({**item, "source_record_index": item.get("source_record_index", index)})
         return result
+
+    @staticmethod
+    def organizer_records(archive: PairedArchive) -> list[dict]:
+        """organizer_records（整理输入投影）：原始归档不变，只去掉重复和执行机械资料。"""
+        def unwrap(item):
+            if isinstance(item.get("archive"), dict) and isinstance(item.get("record"), dict):
+                return item["record"], item["archive"]
+            return item, None
+
+        def group(reference):
+            return reference.get("archive_id") if reference else archive.archive_id
+
+        voice_rows = [unwrap(item) for item in archive.voice_records]
+        ledger_groups = {group(ref) for row, ref in voice_rows
+                         if row.get("kind") in {"input", "speech", "tool", "event", "shadow_event", "delivery_notice"}}
+        records = []
+        for row, reference in voice_rows:
+            if row.get("context_lane") == "history" and group(reference) in ledger_groups:
+                # 同一账本已完整归档，模型 HISTORY（历史投影）是重复表达。
+                continue
+            row = deepcopy(row)
+            if isinstance(row.get("metadata"), dict):
+                row["metadata"].pop("model_content", None)
+                row["metadata"].pop("model_history_format", None)
+            records.append({"origin": "voice", "record": row,
+                            **({"archive": reference} if reference else {})})
+
+        dsh_groups: dict[str, tuple[dict | None, list[dict]]] = {}
+        for item in archive.dsh_records:
+            row, reference = unwrap(item)
+            dsh_groups.setdefault(group(reference), (reference, []))[1].append(row)
+        for reference, rows in dsh_groups.values():
+            rows = PairedArchiveStore.filter_dsh(rows)
+            standalone_calls = {str((row.get("data") or {}).get("callId")) for row in rows
+                                if row.get("type") == "tool/call"}
+            for row in rows:
+                data = row.get("data") or {}
+                if not isinstance(data, dict):
+                    continue
+                data.pop("usage", None)
+                data.pop("stream", None)
+                message = data.get("message", data)
+                if isinstance(message, dict):
+                    source = message.get("source")
+                    if isinstance(source, dict):
+                        source.pop("replayState", None)
+                    if row.get("type") == "assistant/message" and isinstance(message.get("content"), list):
+                        content = [block for block in message["content"] if not (
+                            isinstance(block, dict) and (block.get("type") == "reasoning"
+                            or (block.get("type") in {"tool_call", "tool-call"}
+                                and str(block.get("id") or block.get("callId")) in standalone_calls)))]
+                        if not content:
+                            continue
+                        message["content"] = content
+                # source_record_index（来源记录索引）仍指向完整归档，思考原文可按需读取。
+                records.append({"origin": "dsh", "record": row,
+                                **({"archive": reference} if reference else {})})
+        return records
 
     @staticmethod
     def _write_text(path: Path, title: str, records: list[dict], directory: Path, *, streaming=False) -> None:
@@ -325,25 +409,51 @@ class ContinuityOrganizer:
         self.max_output_tokens = max_output_tokens
         self.max_context_tokens = max_context_tokens
 
-    async def _request(self, payload: dict, *, compact: bool = False) -> dict:
+    async def _request(self, payload: dict, *, compact: bool = False, phase: str = "final") -> dict:
         instructions = ORGANIZER_INSTRUCTIONS + f"\ndocument最多{self.max_document_chars}字符。"
         if compact:
             instructions += "\n上次文档超长。压缩措辞并使用归档引用，不可截断问题、事实或路径。"
-        response = await self.provider.complete(
-            instructions=instructions,
-            input_items=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            tools=[], reasoning_effort="high", text_schema=HANDOFF_SCHEMA,
-            max_output_tokens=self.max_output_tokens,
-        )
-        return response_json(response)
+        content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        started = time.monotonic()
+        logger.info("continuity.request_started phase=%s input_chars=%s records=%s notes=%s",
+                    phase, len(content), len(payload.get("records", [])), len(payload.get("segment_notes", [])))
+        try:
+            response = await self.provider.complete(
+                instructions=instructions,
+                input_items=[{"role": "user", "content": content}],
+                tools=[], reasoning_effort="high", text_schema=HANDOFF_SCHEMA,
+                max_output_tokens=self.max_output_tokens,
+            )
+            return response_json(response)
+        finally:
+            logger.info("continuity.request_finished phase=%s elapsed_ms=%.1f",
+                        phase, (time.monotonic() - started) * 1000)
+
+    async def _request_many(self, payloads: list[dict], *, phase: str) -> list[dict]:
+        """独立分段最多三路并发，结果维持原始顺序，失败时先回收所有子请求。"""
+        semaphore = asyncio.Semaphore(3)
+        async def request(payload):
+            async with semaphore:
+                return await self._request(payload, phase=phase)
+        tasks = [asyncio.create_task(request(payload)) for payload in payloads]
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     async def organize(self, archive: PairedArchive, previous: str, entries: list[dict]) -> OrganizedHandoff:
-        records = ([{"origin": "voice", "record": item} for item in archive.voice_records]
-                   + [{"origin": "dsh", "record": item} for item in archive.dsh_records])
+        records = PairedArchiveStore.organizer_records(archive)
         # Conservative character budgeting keeps complete records; no tail truncation.
         budget = max(1024, int(self.max_context_tokens * .8) - self.max_output_tokens) // 2
         baseline = {"previous_document": previous, "pending_entries": entries, "archive": archive.reference()}
-        serialized = json.dumps({**baseline, "records": records}, ensure_ascii=False)
+        serialized = json.dumps({**baseline, "records": records}, ensure_ascii=False, separators=(",", ":"))
+        logger.info("continuity.material_built archive_id=%s voice_records=%s dsh_records=%s "
+                    "projected_records=%s input_chars=%s budget_chars=%s",
+                    archive.archive_id, len(archive.voice_records), len(archive.dsh_records),
+                    len(records), len(serialized), budget)
         if len(serialized) > budget:
             # 槽位正文也参加连续分段；最终请求只携带冻结标识及分段提取结果。
             records.extend({"origin": "pending_transfer", "record": entry} for entry in entries)
@@ -372,15 +482,16 @@ class ContinuityOrganizer:
                     size += length
             if current:
                 chunks.append(current)
-            notes = []
+            partial_payloads = []
             for chunk in chunks:
                 entry_ids = list(dict.fromkeys(item.get("pending_entry_id") or item["record"]["id"]
                     for item in chunk if item["origin"] == "pending_transfer"))
-                partial = await self._request({"archive": archive.reference(), "records": chunk,
+                partial_payloads.append({"archive": archive.reference(), "records": chunk,
                                                "pending_entries": [{"id": entry_id} for entry_id in entry_ids],
                                                "previous_document": "",
                                                "instruction": "分段提取：保留任务证据、未完成事项及槽位原始标识，最终会再次合并。"})
-                notes.append(partial)
+            logger.info("continuity.segmented archive_id=%s chunks=%s", archive.archive_id, len(chunks))
+            notes = await self._request_many(partial_payloads, phase="extract")
             while len(json.dumps(notes, ensure_ascii=False)) > budget // 2:
                 groups, current, size = [], [], 0
                 for note in notes:
@@ -396,13 +507,14 @@ class ContinuityOrganizer:
                     groups.append(current)
                 if len(groups) >= len(notes):
                     raise ValueError("分段整理未能收敛，保留原材料。")
-                notes = [await self._request({"archive": archive.reference(), "segment_notes": group,
-                                              "pending_entries": [], "previous_document": ""}) for group in groups]
+                notes = await self._request_many([
+                    {"archive": archive.reference(), "segment_notes": group,
+                     "pending_entries": [], "previous_document": ""} for group in groups], phase="merge")
             payload = {**baseline, "segment_notes": notes}
         else:
             payload = {**baseline, "records": records}
         for attempt in range(2):
-            result = await self._request(payload, compact=bool(attempt))
+            result = await self._request(payload, compact=bool(attempt), phase="compact" if attempt else "final")
             document = result.get("document")
             extracted = result.get("extracted_items")
             consumed = result.get("consumed_entry_ids")
@@ -416,4 +528,8 @@ class ContinuityOrganizer:
                 raise ValueError("交接文档未承接新提取信息。")
             if len(document) <= self.max_document_chars:
                 return OrganizedHandoff(document.strip(), extracted, list(dict.fromkeys(consumed)), archive)
+            # 已经提取完事实，只压缩草稿；不再次读取完整语音及后台会话。
+            payload = {"archive": archive.reference(), "previous_document": document,
+                       "draft_result": result, "pending_entries": [{"id": item["id"]} for item in entries],
+                       "instruction": "仅压缩草稿措辞，保留未完成事项及提取、消费标识，不重新提取原会话。"}
         raise ValueError("交接文档超长，保留材料等待下次整理。")
