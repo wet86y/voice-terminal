@@ -1,7 +1,7 @@
 //! Initialization（桌面初始化）：统一启动画面，管理能力不要求 Python。
 use std::{sync::{Arc,atomic::Ordering},thread,time::{Duration,Instant}};
 use tauri::{Manager,WebviewWindow};
-use serde_json::Value;
+use serde_json::{Value,json};
 use voice_desktop_common::LaunchContext;
 use super::{Desktop,ResourceManager};
 
@@ -77,9 +77,25 @@ pub async fn desktop_initialize(window:WebviewWindow,state:tauri::State<'_,Arc<D
 #[tauri::command]
 pub fn desktop_manage(window:WebviewWindow,app:tauri::AppHandle,state:tauri::State<Arc<Desktop>>)->Result<(),String>{super::trusted(&window,&state)?;manage(&app,state.inner())}
 #[tauri::command]
-pub fn desktop_cancel_init(window:WebviewWindow,state:tauri::State<Arc<Desktop>>)->Result<(),String>{super::trusted(&window,&state)?;state.initialization_cancel.store(true,Ordering::Release);Ok(())}
+pub fn desktop_cancel_init(window:WebviewWindow,state:tauri::State<Arc<Desktop>>)->Result<(),String>{
+    super::trusted(&window,&state)?;
+    if state.initialization.lock().map_err(|_|"启动状态不可用。")?["can_cancel"]!=true{return Err("当前启动阶段已结束校验，请进入组件管理或正常退出。".into());}
+    state.initialization_cancel.store(true,Ordering::Release);Ok(())
+}
 #[tauri::command]
 pub async fn desktop_start_service(window:WebviewWindow,app:tauri::AppHandle,state:tauri::State<'_,Arc<Desktop>>)->Result<(),String>{
     super::trusted(&window,&state)?;let state=state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move||super::start_service(app,state)).await.map_err(|e|e.to_string())?
+    if state.service_starting.load(Ordering::Acquire){return Ok(());}
+    if tauri::Manager::try_state::<Arc<ResourceManager>>(&app).is_some_and(|manager|manager.has_active_jobs()){
+        return Err("组件下载、复制或启用任务尚未结束，请等待全部组件就绪后启动。".into());
+    }
+    state.initialization_cancel.store(false,Ordering::Release);state.startup_skipped.store(false,Ordering::Release);
+    state.service_requested.store(true,Ordering::Release);*state.error.lock().unwrap()=None;
+    *state.initialization.lock().unwrap()=json!({"phase":"正在准备启动并校验本地组件","can_cancel":true,"completed_bytes":0,"total_bytes":0});
+    // 先导航到随包加载画面，再在线程中校验和启动；用户不必等待后台建立入口才看到响应。
+    window.navigate("http://tauri.localhost/startup.html".parse().map_err(|_|"启动画面地址无效。")?).map_err(|e|e.to_string())?;
+    let error_state=state.clone();
+    let result=tauri::async_runtime::spawn_blocking(move||super::start_service(app,state)).await.map_err(|e|e.to_string())?;
+    if let Err(error)=&result{*error_state.error.lock().unwrap()=Some(error.clone());}
+    result
 }

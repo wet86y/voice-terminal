@@ -14,7 +14,7 @@ fn main() {
             "exit_application",
             "focus_main",
             "workspace_info", "workspace_choose", "workspace_link", "workspace_migrate",
-            "resource_inventory", "resource_download", "resource_import", "resource_import_confirm", "resource_open_source", "resource_cancel",
+            "resource_inventory", "resource_jobs", "resource_download", "resource_import", "resource_import_confirm", "resource_open_source", "resource_cancel",
         ]),
     ))
     .expect("桌面权限清单构建失败");

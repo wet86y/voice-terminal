@@ -6,6 +6,7 @@ import LocalComponents from '../interface/LocalComponents.vue'
 import FixedModelCredentials from '../interface/FixedModelCredentials.vue'
 import SettingsPageHeader from '../interface/SettingsPageHeader.vue'
 import { useStartupCredentials } from './useStartupCredentials'
+import { startupIcon } from '../runtime/startup-screen'
 import type { LocalComponentsModel } from '../interface/local-components'
 import ResourceInstallDialog from '../product/panels/ResourceInstallDialog.vue'
 import WorkspaceSettings from '../product/panels/WorkspaceSettings.vue'
@@ -15,6 +16,7 @@ const section = ref('compute')
 const resources = useWorkspaceResources()
 const port = desktopPort() as DesktopPort & DesktopEnvironmentPort & DesktopCredentialsPort
 const credentials = useStartupCredentials(port)
+const starting = ref(false) // starting（已请求启动）：原生导航完成前防止重复点击。
 const updatesRequired = computed(() => resources.resources.value.some(item => item.update_available === true))
 const componentsReady = computed(() => resources.resources.value.length > 0
   && resources.resources.value.every(item => item.can_start && item.update_available !== true))
@@ -35,6 +37,7 @@ watch([componentsReady, credentials.loading], ([complete, loading]) => {
   if (complete && !loading && !credentials.ready.value && section.value === 'compute') section.value = 'models'
 })
 async function startProgram() {
+  if (starting.value) return
   if (!componentsReady.value || tasksBusy.value) {
     resources.resourceError.value = updatesRequired.value
       ? '有组件需更新并通过校验后才能启动语音服务。'
@@ -47,11 +50,13 @@ async function startProgram() {
     section.value = 'models'
     return
   }
+  starting.value = true
   try { await port.startVoiceService() }
   catch (failure) { resources.resourceError.value = String(failure) }
+  finally { starting.value = false }
 }
 const model = computed<LocalComponentsModel>(() => ({
-  status: '本地组件管理可用', state: 'ready', sampledAt: '原生资源清单', resources: [],
+  status: '本地组件管理可用', state: 'ready', sampledAt: resources.inventoryUpdatedAt.value ? new Date(resources.inventoryUpdatedAt.value).toLocaleTimeString('zh-CN', { hour12: false }) + ' 更新' : '正在读取组件清单', resources: [],
   resourceActionsAvailable: resources.resourcesCanManage.value,
   resourceLoading: resources.loading.value || resources.refreshing.value || resources.inventoryRefreshing.value,
   resourceTasksBusy: Boolean(resources.startingResources.value.size || resources.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))),
@@ -62,7 +67,7 @@ const model = computed<LocalComponentsModel>(() => ({
       id: item.resource_id === 'voice-server' ? 'voice-system' : item.resource_id,
       name: item.label,
       state: item.update_available ? 'disabled' : item.can_start ? 'ready' : 'disabled',
-      status: item.update_available ? '需更新' : item.files_installed ? item.runtime_ready ? '已就绪' : '运行环境待配置' : '资源未安装',
+      status: item.update_available ? '需更新' : item.installation_state === 'incomplete' ? '待修复' : item.files_installed ? item.runtime_ready ? '已就绪' : '运行环境待配置' : '资源未安装',
       available: item.files_installed === true,
       runtime: '工作区独立组件',
       description: item.update_available ? '此组件需更新并通过校验后才能启动。' : item.resource_id === 'voice-server' ? '统一准备全部语音运行依赖。' : item.resource_id === 'dsh' ? '下载或导入代理组件后使用。' : item.files_installed ? item.runtime_ready ? '模型文件和运行依赖已就绪。' : '模型文件已安装，请在 Voice Server（语音服务）配置运行依赖后启动。' : '下载或导入模型文件；运行依赖由 Voice Server（语音服务）统一配置。',
@@ -104,9 +109,12 @@ const model = computed<LocalComponentsModel>(() => ({
 }))
 </script>
 <template>
+  <main v-if="starting" class="startup-screen" role="status" aria-label="应用启动画面">
+    <section class="startup-content"><img class="startup-icon" :src="startupIcon" alt="语音终端" width="72" height="72"><h1 class="startup-title">应用启动中</h1><p class="startup-status" aria-live="polite">正在准备启动并校验本地组件</p><div class="startup-progress" data-indeterminate="true" role="progressbar" aria-label="应用启动进度"><span class="startup-progress-fill"></span></div></section>
+  </main>
   <AppFrame runtime="standby"><SettingsFrame :section="section" desktop @section="section = $event" @back="startProgram" @logs="port.openLogs()" @exit="port.exit()">
-    <article class="settings-panel panel"><template v-if="section === 'compute' || section === 'system'"><div class="management-start"><p>{{ componentsReady ? credentials.ready.value ? '组件和接口密钥已完备，可以启动程序。' : '全部组件已完备，请先配置接口密钥再启动。' : componentBlockMessage }}</p><div class="management-actions"><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value" @click="startProgram">启动程序</button><button class="outline-button" @click="section = 'models'">配置接口密钥</button></div></div><LocalComponents :model="model" @refresh="resources.refresh" @resource-download="resources.downloadResource" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" /></template>
-      <section v-else-if="section === 'models'" class="startup-models"><SettingsPageHeader section="models"><template #actions><button class="outline-button" @click="section = 'compute'">查看组件下载</button><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value" @click="startProgram">启动程序</button></template></SettingsPageHeader><p class="startup-models-hint">组件未就绪时也可以提前填写。组件和接口密钥完备后再启动程序。</p><p v-if="credentials.error.value" class="startup-credentials-error" role="alert">{{ credentials.error.value }}</p><p v-if="credentials.notice.value" class="startup-credentials-notice" role="status">{{ credentials.notice.value }}</p><FixedModelCredentials v-model:deepseek="credentials.deepseek.value" v-model:minimax="credentials.minimax.value" :configured="credentials.configured.value" :disabled="credentials.disabled.value" :saving="credentials.saving.value" startup @save="credentials.save" /></section>
+    <article class="settings-panel panel"><template v-if="section === 'compute' || section === 'system'"><div class="management-start"><p>{{ componentsReady ? credentials.ready.value ? '组件和接口密钥已完备，可以启动程序。' : '全部组件已完备，请先配置接口密钥再启动。' : componentBlockMessage }}</p><div class="management-actions"><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value || resources.inventoryRefreshing.value || starting" @click="startProgram">启动程序</button><button class="outline-button" @click="section = 'models'">配置接口密钥</button></div></div><LocalComponents :model="model" @refresh="resources.refresh" @resource-download="resources.downloadResource" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" /></template>
+      <section v-else-if="section === 'models'" class="startup-models"><SettingsPageHeader section="models"><template #actions><button class="outline-button" @click="section = 'compute'">查看组件下载</button><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value || resources.inventoryRefreshing.value || starting" @click="startProgram">启动程序</button></template></SettingsPageHeader><p class="startup-models-hint">组件未就绪时也可以提前填写。组件和接口密钥完备后再启动程序。</p><p v-if="credentials.error.value" class="startup-credentials-error" role="alert">{{ credentials.error.value }}</p><p v-if="credentials.notice.value" class="startup-credentials-notice" role="status">{{ credentials.notice.value }}</p><FixedModelCredentials v-model:deepseek="credentials.deepseek.value" v-model:minimax="credentials.minimax.value" :configured="credentials.configured.value" :disabled="credentials.disabled.value" :saving="credentials.saving.value" startup @save="credentials.save" /></section>
       <WorkspaceSettings v-else-if="section === 'workspace'" :controller="resources" />
       <section v-else class="environment-required"><h2>请先补齐本地组件</h2><p>全部组件和接口密钥准备好后可以启动语音与业务服务。组件下载、导入、模型接口设置和关于页现在可以使用。</p><button class="outline-button" @click="section = 'compute'">进入组件管理</button></section>
     </article>

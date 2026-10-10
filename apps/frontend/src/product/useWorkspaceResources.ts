@@ -15,6 +15,8 @@ import {
 
 const MAX_VISIBLE_JOBS = 8
 const TERMINAL_JOB_STATES = new Set(['complete', 'completed', 'failed', 'cancelled', 'canceled'])
+const ACTIVE_REFRESH_MS = 2000 // ACTIVE_REFRESH_MS（活动任务补查间隔）：事件之外每两秒确认状态。
+const IDLE_REFRESH_MS = 10000 // IDLE_REFRESH_MS（空闲清单刷新间隔）。
 
 /** useWorkspaceResources（工作区与资源控制器）：原生操作不依赖 Voice（语音服务）接口。 */
 export function useWorkspaceResources() {
@@ -26,6 +28,7 @@ export function useWorkspaceResources() {
   const loading = ref(false)
   const refreshing = ref(false)
   const inventoryRefreshing = ref(false)
+  const inventoryUpdatedAt = ref<number | null>(null) // inventoryUpdatedAt（最近成功刷新时间，毫秒）。
   const resourceError = ref('')
   const workspaceError = ref('')
   const eventError = ref('')
@@ -39,7 +42,13 @@ export function useWorkspaceResources() {
   let unlistenRequests: Promise<void>[] = []
   let refreshRequest: Promise<void> | null = null
   let inventoryRefreshRequest: Promise<void> | null = null
-  let restoredNativeJobs = false // restoredNativeJobs（已恢复任务）：每个页面只读取一次原生任务快照。
+  let inventoryRevision = 0 // inventoryRevision（刷新请求代次）：完成事件要求再读一次最新清单。
+  let pollTimer: ReturnType<typeof setTimeout> | undefined
+  let pollDueAt = 0 // pollDueAt（下次补查时刻）：持续进度事件不能把两秒计时不断推迟。
+  let pollRunning = false // pollRunning（补查正在读取）：慢磁盘期间不叠加下一轮或使旧结果不断失效。
+  let snapshotRequest: Promise<void> | null = null
+  let eventRevision = 0 // eventRevision（页面事件代次）：兼容没有任务修订号的测试接口。
+  const receivedEvents = new Map<string, number>()
 
   // canManage（工作区管理权限）统一由正式程序提供；源码调试使用相同权限。
   const canManage = computed(() => port.available && workspace.value?.can_manage)
@@ -49,16 +58,70 @@ export function useWorkspaceResources() {
 
   function upsertResourceJob(incoming: ResourceJob, refreshAfterUpdate = true) {
     const index = resourceJobs.value.findIndex(job => job.job_id === incoming.job_id)
+    const previous = resourceJobs.value[index]
+    if (previous && incoming.created_at !== undefined && previous.created_at !== undefined) {
+      if (incoming.created_at < previous.created_at) return
+      if (incoming.created_at === previous.created_at && incoming.revision !== undefined && previous.revision !== undefined
+        && incoming.revision <= previous.revision) return
+    }
     // 最近事件移到末尾，同一资源重新下载时不会继续展示旧任务。
     const next = [
       ...resourceJobs.value.filter(job => job.job_id !== incoming.job_id),
-      index < 0 ? incoming : { ...resourceJobs.value[index], ...incoming },
+      index < 0 || (incoming.created_at !== undefined && incoming.created_at !== previous?.created_at)
+        ? incoming : { ...previous, ...incoming },
     ]
-    resourceJobs.value = next.slice(-MAX_VISIBLE_JOBS)
-    if (refreshAfterUpdate && (incoming.installed_resources?.length || TERMINAL_JOB_STATES.has(incoming.state))) {
+    resourceJobs.value = next.filter(job => !TERMINAL_JOB_STATES.has(job.state))
+      .concat(next.filter(job => TERMINAL_JOB_STATES.has(job.state)).slice(-MAX_VISIBLE_JOBS))
+    const completed = TERMINAL_JOB_STATES.has(incoming.state)
+    const installedChanged = incoming.installed_resources?.some(id => !previous?.installed_resources?.includes(id))
+    if (refreshAfterUpdate && (incoming.installed_resources?.length || completed)
+      && (installedChanged || !previous || previous.state !== incoming.state || previous.created_at !== incoming.created_at)) {
       void refreshInventory()
     }
   }
+
+  function refreshJobSnapshots() {
+    if (!port.available || snapshotRequest) return snapshotRequest ?? Promise.resolve()
+    const startedAt = eventRevision
+    const request = (async () => {
+      try {
+        const jobs = typeof port.resourceJobSnapshots === 'function'
+          ? await port.resourceJobSnapshots()
+          : typeof port.environmentStatus === 'function' ? (await port.environmentStatus()).jobs ?? [] : []
+        if (!mounted) return
+        for (const job of jobs) {
+          const known = resourceJobs.value.some(current => current.job_id === job.job_id)
+          // 只恢复活动任务；已知任务则接收完成/失败快照，补救丢失的终态事件。
+          if (!known && TERMINAL_JOB_STATES.has(job.state)) continue
+          if ((receivedEvents.get(job.job_id) ?? 0) > startedAt && (job.created_at === undefined || job.revision === undefined)) continue
+          upsertResourceJob(job)
+        }
+      } catch (error) {
+        if (mounted) eventError.value = error instanceof Error ? error.message : '任务进度补查失败，将自动重试。'
+      }
+    })()
+    const tracked = request.finally(() => { if (snapshotRequest === tracked) snapshotRequest = null })
+    snapshotRequest = tracked
+    return tracked
+  }
+
+  function schedulePoll(delay?: number) {
+    if (!mounted || !port.available || pollRunning) return
+    const active = startingResources.value.size > 0 || resourceJobs.value.some(job => !TERMINAL_JOB_STATES.has(job.state))
+    const wait = delay ?? (active ? ACTIVE_REFRESH_MS : IDLE_REFRESH_MS)
+    const due = Date.now() + wait
+    if (pollTimer !== undefined && pollDueAt <= due) return
+    if (pollTimer !== undefined) clearTimeout(pollTimer)
+    pollDueAt = due
+    pollTimer = setTimeout(() => {
+      pollTimer = undefined
+      pollDueAt = 0
+      pollRunning = true
+      // 不叠加定时请求；快照完成后刷新安装状态，再开始下一次计时。
+      void refreshJobSnapshots().then(() => refreshInventory()).finally(() => { pollRunning = false; schedulePoll() })
+    }, wait)
+  }
+  function refreshOnFocus() { schedulePoll(0) }
 
   function upsertWorkspaceJob(incoming: WorkspaceJob) {
     const index = workspaceJobs.value.findIndex(job => job.job_id === incoming.job_id)
@@ -81,26 +144,26 @@ export function useWorkspaceResources() {
 
   function refreshInventory() {
     if (!port.available) return Promise.resolve()
+    inventoryRevision += 1
     if (inventoryRefreshRequest) return inventoryRefreshRequest
     inventoryRefreshing.value = true
     const request = (async () => {
-      try {
-        const [inventory, environment] = await Promise.all([
-          port.resourceInventory(),
-          !restoredNativeJobs && typeof port.environmentStatus === 'function' ? port.environmentStatus().catch(() => null) : null,
-        ])
-        resources.value = inventory
-        if (environment) restoredNativeJobs = true
-        // 维护时切换到管理页仍恢复活动任务，已经结束的历史任务不覆盖现有安装状态。
-        for (const job of environment?.jobs ?? []) {
-          if (!TERMINAL_JOB_STATES.has(job.state) && !resourceJobs.value.some(current => current.job_id === job.job_id)) {
-            upsertResourceJob(job, false)
+      let checkedRevision: number
+      do {
+        checkedRevision = inventoryRevision
+        try {
+          const inventory = await port.resourceInventory()
+          if (!mounted) return
+          // 请求途中组件完成启用时，丢弃旧结果并在同一等待链中重新读取。
+          if (checkedRevision === inventoryRevision) {
+            resources.value = inventory
+            inventoryUpdatedAt.value = Date.now()
+            resourceError.value = ''
           }
+        } catch (error) {
+          if (mounted) resourceError.value = error instanceof Error ? error.message : '无法读取资源清单。'
         }
-        resourceError.value = ''
-      } catch (error) {
-        resourceError.value = error instanceof Error ? error.message : '无法读取资源清单。'
-      }
+      } while (mounted && checkedRevision !== inventoryRevision)
     })()
     const tracked = request.finally(() => {
       if (inventoryRefreshRequest === tracked) inventoryRefreshRequest = null
@@ -130,7 +193,12 @@ export function useWorkspaceResources() {
     try {
       resourceUnlisten = await port.listen<ResourceJob>(
         RESOURCE_PROGRESS_EVENT,
-        event => upsertResourceJob(event.payload),
+        event => {
+          if (!mounted) return
+          receivedEvents.set(event.payload.job_id, ++eventRevision)
+          upsertResourceJob(event.payload)
+          schedulePoll()
+        },
       )
       workspaceUnlisten = await port.listen<WorkspaceJob>(
         WORKSPACE_PROGRESS_EVENT,
@@ -154,12 +222,17 @@ export function useWorkspaceResources() {
     mounted = true
     if (!port.available) return
     loading.value = true
-    unlistenRequests = [subscribe(), refresh().then(() => undefined)]
-    void Promise.all(unlistenRequests).finally(() => { loading.value = false })
+    window.addEventListener('focus', refreshOnFocus)
+    unlistenRequests = [subscribe(), refreshJobSnapshots(), refresh().then(() => undefined)]
+    void Promise.all(unlistenRequests).finally(() => { loading.value = false; schedulePoll() })
   })
 
   onBeforeUnmount(() => {
     mounted = false
+    if (pollTimer !== undefined) clearTimeout(pollTimer)
+    pollTimer = undefined
+    pollDueAt = 0
+    window.removeEventListener('focus', refreshOnFocus)
     unlistenResource?.()
     unlistenWorkspace?.()
     unlistenResource = undefined
@@ -252,6 +325,9 @@ export function useWorkspaceResources() {
           can_cancel: true,
         })
       }
+      // 同一编号重试也补查新一轮快照，避免终态事件早于命令响应时遗留排队状态。
+      void refreshJobSnapshots()
+      schedulePoll(ACTIVE_REFRESH_MS)
     } catch (error) {
       resourceError.value = error instanceof Error ? error.message : '资源任务启动失败。'
     } finally {
@@ -302,6 +378,7 @@ export function useWorkspaceResources() {
     loading,
     refreshing,
     inventoryRefreshing,
+    inventoryUpdatedAt,
     resourceError,
     workspaceError,
     eventError,

@@ -30,6 +30,7 @@
     "allow-workspace-link",
     "allow-workspace-migrate",
     "allow-resource-inventory",
+    "allow-resource-jobs",
     "allow-resource-download",
     "allow-resource-import",
     "allow-resource-import-confirm",

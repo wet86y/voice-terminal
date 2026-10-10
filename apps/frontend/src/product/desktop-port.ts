@@ -45,6 +45,9 @@ export interface ResourceStatus {
 
 /** ResourceJob（资源任务）：下载、导入及取消状态的桌面事件负载。 */
 export interface ResourceJob {
+  /** created_at（本次任务创建时间，毫秒）与 revision（状态修订号）：拒绝迟到的快照和旧重试事件。 */
+  created_at?: number
+  revision?: number
   /** job_id（任务标识）与 resource_id（当前处理资源）。 */
   job_id: string
   resource_id: string
@@ -116,6 +119,8 @@ export interface DesktopWorkspacePort {
   migrateWorkspace(targetRoot: string): Promise<{ job_id: string }>
   /** resource_inventory（资源清单）：返回固定模型与 DSH（代理执行宿主）的独立安装状态。 */
   resourceInventory(): Promise<ResourceStatus[]>
+  /** resourceJobSnapshots（轻量任务快照）：定时补查进度，不执行环境扫描。 */
+  resourceJobSnapshots?(): Promise<ResourceJob[]>
   /** resource_download（下载资源）：启动固定版本资源下载任务。 */
   downloadResource(resourceId: string): Promise<{ job_id: string }>
   /** resource_import（导入资源）：带 id 选择单资源；省略 id 时选择批量压缩包。 */
@@ -200,6 +205,7 @@ export function desktopPort(): DesktopPort {
     linkWorkspace: targetRoot => call<{ job_id: string }>('workspace_link', { target_root: targetRoot }),
     migrateWorkspace: targetRoot => call<{ job_id: string }>('workspace_migrate', { target_root: targetRoot }),
     resourceInventory: () => call<ResourceStatus[]>('resource_inventory'),
+    resourceJobSnapshots: () => call<ResourceJob[]>('resource_jobs'),
     confirmImport: (jobId, accepted) => call('resource_import_confirm', { job_id: jobId, accepted }),
     resourceInstallPlan: resourceId => call('resource_install_plan', { resource_id: resourceId }),
     downloadResource: resourceId => call<{ job_id: string }>('resource_download', { resource_id: resourceId }),

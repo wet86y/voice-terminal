@@ -58,7 +58,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     } as unknown as ReturnType<typeof desktop.desktopPort>)
   })
 
-  afterEach(() => { wrapper?.unmount(); wrapper = undefined; resourceEvent = undefined; vi.restoreAllMocks() })
+  afterEach(() => { wrapper?.unmount(); wrapper = undefined; resourceEvent = undefined; vi.restoreAllMocks(); vi.useRealTimers() })
 
   it('组件不完整时保持管理页，返回操作也不能启动服务', async () => {
     wrapper = mount(ManagementApp)
@@ -80,6 +80,148 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     await button.trigger('click')
     await flushPromises()
     expect(start).toHaveBeenCalledTimes(1)
+  })
+
+  it('首次下载完成赶上旧清单请求时，再读最新状态并可直接启动加载画面', async () => {
+    const previous = inventory.map(item => ({ ...item }))
+    let resolveInventory: (rows: ResourceStatus[]) => void = () => undefined
+    inventoryRead.mockImplementationOnce(() => new Promise(resolve => { resolveInventory = resolve }))
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    inventory = inventory.map(item => ({ ...item, installation_state: 'installed', files_installed: true, runtime_ready: true, can_start: true }))
+    resourceEvent?.({ payload: { job_id: 'first-install', resource_id: 'voice-server', state: 'complete', phase: '就绪', created_at: 100, revision: 3, installed_resources: ['voice-server'] } })
+    resolveInventory(previous)
+    await flushPromises()
+    expect(inventoryRead).toHaveBeenCalledTimes(2)
+    const button = wrapper.get('.start-program')
+    expect(button.attributes('disabled')).toBeUndefined()
+    let finishStart: () => void = () => undefined
+    start.mockImplementationOnce(() => new Promise<void>(resolve => { finishStart = resolve }))
+    await button.trigger('click')
+    expect(wrapper.get('[aria-label="应用启动画面"]').text()).toContain('正在准备启动并校验本地组件')
+    expect(wrapper.get('.startup-progress').attributes('data-indeterminate')).toBe('true')
+    await button.trigger('click')
+    expect(start).toHaveBeenCalledOnce()
+    finishStart()
+    await flushPromises()
+  })
+
+  it('丢失完成事件时两秒补查终态和组件就绪，卸载后停止计时', async () => {
+    vi.useFakeTimers()
+    jobs = [{ job_id: 'first-install', resource_id: 'voice-server', state: 'running', phase: '下载中', created_at: 100, revision: 2 }]
+    const snapshots = vi.fn(async () => jobs)
+    Object.assign(desktop.desktopPort(), { resourceJobSnapshots: snapshots })
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+    inventory = inventory.map(item => ({ ...item, installation_state: 'installed', files_installed: true, runtime_ready: true, can_start: true }))
+    jobs = [{ ...jobs[0], state: 'complete', phase: '下载就绪', revision: 3, installed_resources: ['voice-server'] }]
+    await vi.advanceTimersByTimeAsync(2000)
+    await flushPromises()
+    expect(snapshots).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
+    expect(wrapper.find('[data-job="first-install"]').exists()).toBe(false)
+    await wrapper.get('.start-program').trigger('click')
+    expect(start).toHaveBeenCalledOnce()
+    wrapper.unmount(); wrapper = undefined
+    const count = snapshots.mock.calls.length
+    await vi.advanceTimersByTimeAsync(20000)
+    expect(snapshots).toHaveBeenCalledTimes(count)
+  })
+
+  it('共享环境启用后立即刷新对应卡片，后续模型下载仍阻止整体启动', async () => {
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    resourceEvent?.({ payload: { job_id: 'shared-install', resource_id: 'paraformer-streaming', state: 'running', phase: '配置共享环境', created_at: 100, revision: 2 } })
+    expect(inventoryRead).toHaveBeenCalledOnce()
+    inventory = [ { ...row('voice-server', 'Voice Server（语音服务）', true), can_start: false }, ...inventory.slice(1) ]
+    resourceEvent?.({ payload: { job_id: 'shared-install', resource_id: 'paraformer-streaming', state: 'running', phase: '下载模型文件', created_at: 100, revision: 3, installed_resources: ['voice-server'] } })
+    await flushPromises()
+    expect(inventoryRead).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('[data-component="voice-system"] .local-state').text()).toBe('已就绪')
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+  })
+
+  it('旧修订事件和上一轮下载不会覆盖完成状态，新一轮仍可恢复活动进度', async () => {
+    inventory = inventory.map(item => ({ ...item, can_start: true }))
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    const send = (state: string, created_at: number, revision: number) => resourceEvent?.({ payload: {
+      job_id: 'same-download', resource_id: 'voice-server', state, phase: state === 'complete' ? '就绪' : '下载中', created_at, revision,
+    } })
+    send('complete', 100, 4)
+    send('running', 100, 3)
+    await flushPromises()
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
+    send('running', 200, 1)
+    send('complete', 100, 10)
+    await flushPromises()
+    expect(wrapper.get('[data-job="same-download"]').text()).toContain('下载中')
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+    send('complete', 200, 2)
+    await flushPromises()
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
+  })
+
+  it('空闲时十秒自动刷新，刷新请求串行且页面聚焦立即补查', async () => {
+    vi.useFakeTimers()
+    const snapshots = vi.fn(async () => jobs)
+    Object.assign(desktop.desktopPort(), { resourceJobSnapshots: snapshots })
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(9999)
+    expect(inventoryRead).toHaveBeenCalledOnce()
+    inventory = inventory.map(item => ({ ...item, can_start: true }))
+    await vi.advanceTimersByTimeAsync(1)
+    await flushPromises()
+    expect(inventoryRead).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
+    window.dispatchEvent(new Event('focus'))
+    await vi.advanceTimersByTimeAsync(0)
+    await flushPromises()
+    expect(inventoryRead).toHaveBeenCalledTimes(3)
+  })
+
+  it('其他组件持续发进度时仍按两秒补查，不推迟丢失终态的恢复', async () => {
+    vi.useFakeTimers()
+    jobs = [ { job_id: 'environment', resource_id: 'voice-server', state: 'running', phase: '下载环境', created_at: 100, revision: 1 },
+      { job_id: 'model', resource_id: 'paraformer-streaming', state: 'running', phase: '下载模型', created_at: 100, revision: 1 } ]
+    const snapshots = vi.fn(async () => jobs)
+    Object.assign(desktop.desktopPort(), { resourceJobSnapshots: snapshots })
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(1000)
+    resourceEvent?.({ payload: { ...jobs[1], revision: 2 } })
+    jobs = [ { ...jobs[0], state: 'complete', revision: 2 }, { ...jobs[1], revision: 2 } ]
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+    expect(snapshots).toHaveBeenCalledTimes(2)
+    expect(wrapper.find('[data-job="environment"]').exists()).toBe(false)
+    expect(wrapper.find('[data-job="model"]').exists()).toBe(true)
+  })
+
+  it('磁盘清单读取超过两秒时，持续进度不叠加补查或不断丢弃当前结果', async () => {
+    vi.useFakeTimers()
+    jobs = [{ job_id: 'slow-disk', resource_id: 'paraformer-streaming', state: 'running', phase: '下载模型', created_at: 100, revision: 1 }]
+    const snapshots = vi.fn(async () => jobs)
+    Object.assign(desktop.desktopPort(), { resourceJobSnapshots: snapshots })
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    let finishRead!: (rows: ResourceStatus[]) => void
+    inventoryRead.mockImplementationOnce(() => new Promise<ResourceStatus[]>(resolve => { finishRead = resolve }))
+    await vi.advanceTimersByTimeAsync(2000)
+    await flushPromises()
+    for (let revision = 2; revision <= 4; revision += 1) {
+      await vi.advanceTimersByTimeAsync(1000)
+      resourceEvent?.({ payload: { ...jobs[0], revision } })
+    }
+    expect(snapshots).toHaveBeenCalledTimes(2)
+    expect(inventoryRead).toHaveBeenCalledTimes(2)
+    inventory = inventory.map(item => ({ ...item, can_start: true, files_installed: true, runtime_ready: true, installation_state: 'installed' }))
+    finishRead(inventory)
+    await flushPromises()
+    expect(inventoryRead).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('[data-component="voice-system"] .local-state').text()).toBe('已就绪')
   })
 
   it('待更新模型显示卡片更新操作并阻止启动，校验通过并刷新清单后才可启动', async () => {
@@ -211,7 +353,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(download.mock.calls.map(call => call[0])).toEqual(['paraformer-streaming', 'sensevoice-small'])
     expect(wrapper.findAll('[data-job]')).toHaveLength(3)
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
-    expect(environment).toHaveBeenCalledTimes(1)
+    expect(environment).toHaveBeenCalledTimes(3) // 初始恢复和两次启动任务均补查；正式宿主使用轻量任务接口。
     expect(start).not.toHaveBeenCalled()
   })
 
