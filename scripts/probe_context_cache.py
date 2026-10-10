@@ -2,8 +2,8 @@
 
 Run against the official endpoint only.  It sends three sequential requests
 with a deliberately long stable prefix, append-only input history and a
-changing request-tail clock.  ``--dynamic-speak`` also advances the four-part
-Speak projection in that tail.  The delay between rounds gives DeepSeek's
+changing request-tail clock.  ``--dynamic-speak``（动态语音）also advances the
+locked_text/editable_text（锁定文本／可改文本）projection. The delay gives DeepSeek's
 best-effort cache time to persist prefix units before usage is inspected.
 """
 
@@ -31,24 +31,21 @@ def tail(round_number: int, *, dynamic_speak: bool = False) -> str:
         "clock": {"local_time": now, "precision": "second"},
         "probe_round": round_number,
     }
+    snapshot = {"type": "voice_request_context", "version": 2, "runtime": runtime}
     if dynamic_speak:
         parts = (
             ("", "第一句。", "", "第二句。第三句。"),
             ("第一句。", "第二句。", "", "第三句。"),
             ("第一句。", "第二句。", "第三句。", ""),
         )[min(2, max(0, round_number - 1))]
-        runtime["speak"] = {
+        snapshot["speech"] = {  # speech（当前语音状态）：与正式第2版输入投影一致。
             "state": "speaking",
             "owner_scope": "current_turn",
-            "continuation_mode": "rewrite_tail" if parts[3] else "append_only",
-            "text_parts": {
-                "committed_prefix": parts[0],
-                "current_clause": parts[1],
-                "prefetched_clause": parts[2],
-                "revisable_tail": parts[3],
-            },
+            "continuation_mode": "rewrite_tail" if parts[3] else "none",
+            "locked_text": "".join(parts[:3]),  # 完整锁定文本。
+            "editable_text": parts[3],  # 完整可改尾巴。
         }
-    return json.dumps({"runtime": runtime}, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
 
 
 def digest(value: object) -> str:
@@ -63,7 +60,7 @@ def main() -> int:
     parser.add_argument("--dynamic-instructions", action="store_true",
                         help="counterexample: put the changing clock into instructions")
     parser.add_argument("--dynamic-speak", action="store_true",
-                        help="vary the four-part active Speak only in the request tail")
+                        help="vary locked_text/editable_text（锁定文本／可改文本）only in the request tail（请求尾部）")
     parser.add_argument("--settle-seconds", type=float, default=2.0,
                         help="wait for best-effort cache persistence between rounds")
     args = parser.parse_args()

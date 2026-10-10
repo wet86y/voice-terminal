@@ -26,6 +26,24 @@ def scheduler() -> AgentDecisionScheduler:
     return AgentDecisionScheduler(AgentOptions(scheduler_tick_ms=400))
 
 
+def _request_tail_by_kind(messages):
+    """按 context_kind（上下文类型）读取独立请求尾部帧。"""
+    return {
+        item["context_kind"]: item["content"]
+        for item in messages
+        if item.get("context_lane") == "request_tail" and item.get("context_kind")
+    }
+
+
+def _request_snapshot(messages):
+    """读取 voice_request_context（请求快照，第2版原生 JSON）。"""
+    return json.loads(_request_tail_by_kind(messages)["voice_request_context"])
+
+
+def _request_tail_text(messages):
+    return "\n".join(_request_tail_by_kind(messages).values())
+
+
 async def _shadow_progress(runtime, text: str, event_id: str, *, source="agent", activation_id="activation-a") -> None:
     await runtime.accept_shadow_event(ShadowEvent(
         event_id, "progress", text, 1, activation_id=activation_id, source=source,
@@ -168,12 +186,11 @@ def test_secondary_progress_coalesces_and_only_dispatches_at_four_second_checkpo
         assert provider.calls == 1
         assert runtime.active_dispatch_context["prompt_kind"] == "secondary_mailbox"
         assert runtime._secondary_pending == {}
-        packet = json.loads(provider.messages[-2]["content"])
-        entries = {item["kind"]: item["content"] for item in packet["entries"]}
-        assert "secondary_mailbox" in entries
-        assert "agent" in entries["secondary_update"]
-        state = json.loads(entries["runtime_state"].split("\n工具可用性：")[0].removeprefix("当前轮运行状态："))
-        assert state["shadow"]["progress"] == [{"text": "正在核对", "source": "agent"}]
+        tail = _request_tail_by_kind(provider.messages)
+        snapshot = _request_snapshot(provider.messages)
+        assert "secondary_mailbox" in tail
+        assert "agent" in tail["secondary_update"]
+        assert snapshot["shadow"]["progress"] == [{"text": "正在核对", "source": "agent"}]
         assert all(entry.kind != "shadow_event" for entry in runtime.ledger.entries)
         await _finish_blocking_request(runtime, provider)
         await runtime._on_heartbeat(8.0)
@@ -204,8 +221,7 @@ def test_ordinary_request_carries_and_consumes_secondary_progress():
         assert runtime.active_dispatch_context is None
         assert runtime._secondary_pending == {}
         assert runtime.snapshot()["secondary_mailbox"]["consumed_normal"] == 1
-        packet = json.loads(provider.messages[-2]["content"])
-        assert "secondary_update" in {item["kind"] for item in packet["entries"]}
+        assert "secondary_update" in _request_tail_by_kind(provider.messages)
         await _finish_blocking_request(runtime, provider)
 
     asyncio.run(scenario())
@@ -745,16 +761,15 @@ def test_secondary_and_final_prompts_are_mutually_exclusive():
         },
     )
 
-    def tail_contents(messages):
-        packet = json.loads(messages[-2]["content"])
-        return "\n".join(entry["content"] for entry in packet["entries"])
+    secondary = _request_tail_text(secondary_messages)
+    final = _request_tail_text(final_messages)
+    normal_messages = runtime.messages({"USER_INPUT_FINALIZED"})
+    normal = _request_tail_text(normal_messages)
 
-    secondary = tail_contents(secondary_messages)
-    final = tail_contents(final_messages)
-    normal = tail_contents(runtime.messages({"USER_INPUT_FINALIZED"}))
-
-    assert json.loads(secondary_messages[-2]["content"])["entries"][-1]["kind"] == "secondary_mailbox"
-    assert json.loads(final_messages[-2]["content"])["entries"][-1]["kind"] == "final_silence"
+    assert "secondary_mailbox" in _request_tail_by_kind(secondary_messages)
+    assert "final_silence" in _request_tail_by_kind(final_messages)
+    assert "secondary_mailbox" not in _request_tail_by_kind(final_messages)
+    assert "final_silence" not in _request_tail_by_kind(secondary_messages)
     assert SECONDARY_MAILBOX_PROMPT in secondary
     assert "系统即将进入静默状态" not in secondary
     assert "actions 必须为 []" not in secondary
@@ -819,12 +834,11 @@ def test_secondary_mailbox_protocol_recovery_keeps_the_secondary_mailbox_request
         assert await asyncio.wait_for(request, timeout=1) == "completed"
         await runtime._finish_active_request(request)
 
-        packet = json.loads(provider.messages[-2]["content"])
-        entries = {entry["kind"]: entry["content"] for entry in packet["entries"]}
-        assert "secondary_mailbox" in entries
-        assert SECONDARY_MAILBOX_PROMPT in entries["secondary_mailbox"]
-        assert "本次没有新的用户输入" in entries["immediate_recovery"]
-        assert "重新处理最后一条用户输入" not in entries["immediate_recovery"]
+        tail = _request_tail_by_kind(provider.messages)
+        assert "secondary_mailbox" in tail
+        assert SECONDARY_MAILBOX_PROMPT in tail["secondary_mailbox"]
+        assert "本次没有新的用户输入" in tail["immediate_recovery"]
+        assert "重新处理最后一条用户输入" not in tail["immediate_recovery"]
 
     asyncio.run(scenario())
 

@@ -480,14 +480,20 @@ def test_minor_feedback_rides_the_request_tail_and_keeps_the_cache_envelope():
 
         messages = runtime.messages({"USER_SEGMENT_UPDATED"}, current_turn_id="turn-a")
 
-        # The final JSON emphasis stays last and the tail is still a single
-        # voice_request_context envelope: the cache contract is untouched.
+        # The final JSON emphasis stays last; the v2 snapshot and task retain
+        # their fixed order while unrelated dynamic frames stay independent.
         assert messages[-1]["content"] == FINAL_OUTPUT_CONSTRAINT
         assert messages[-1]["context_kind"] == "output_constraint"
-        packet = json.loads(messages[-2]["content"])
+        assert messages[-2]["context_kind"] == "speech_queue_task"
+        packet = json.loads(next(
+            item["content"] for item in messages
+            if item.get("context_kind") == "voice_request_context"
+        ))
         assert packet["type"] == "voice_request_context"
-        kinds = [entry["kind"] for entry in packet["entries"]]
-        assert kinds.count("minor_protocol_feedback") == 1
+        assert packet["version"] == 2
+        dynamic_kinds = [item.get("context_kind") for item in messages
+                         if item.get("context_lane") == "request_tail"]
+        assert dynamic_kinds.count("minor_protocol_feedback") == 1
 
         history = [item for item in messages
                    if ContextFrame.lane_of(item) == ContextLane.HISTORY]

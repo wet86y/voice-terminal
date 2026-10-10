@@ -83,9 +83,9 @@ describe('V0.6 session protocol', () => {
     terminal.dispose()
   })
 
-  it('默认快速，仅接收快速和深度模式，并发送对应的模式命令', () => {
+  it('默认深度，仅接收快速和深度模式，并发送对应的模式命令', () => {
     const { socket, terminal } = openTerminal()
-    expect(terminal.reasoningMode.value).toBe('fast')
+    expect(terminal.reasoningMode.value).toBe('deep')
     socket.push('runtime.snapshot', 1, { reasoning_mode: 'deep' })
     expect(terminal.reasoningMode.value).toBe('deep')
     socket.push('runtime.snapshot', 2, { reasoning_mode: 'balanced' })
