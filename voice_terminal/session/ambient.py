@@ -9,7 +9,7 @@ from ..core.events import utc_now_iso
 
 
 class AmbientTranscriptStore:
-    """Session-scoped bounded text side channel for non-owner speech."""
+    """AmbientTranscriptStore（环境文字区）：保存本会话未获身份准入的有界转写。"""
 
     def __init__(self, *, max_records: int = 100, max_bytes: int = 64 * 1024) -> None:
         self.max_records = max(1, int(max_records))

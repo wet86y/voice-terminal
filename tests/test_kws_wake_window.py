@@ -26,11 +26,8 @@ from types import SimpleNamespace
 
 from voice_terminal.controller.episode_controller import EpisodeController
 from voice_terminal.controller.realtime_controller import RealtimeController
-from voice_terminal.controller.turn_workspace import AudioFrame
+from voice_terminal.controller.turn_workspace import AudioFrame, TurnWorkspace
 from voice_terminal.kws.keywords import strip_wake_prefix
-
-TOKEN = ("sub-1", 1)
-
 
 class _RecordingKws:
     running = True
@@ -158,13 +155,14 @@ def test_wake_word_only_utterance_is_settled_silently_as_empty_input():
         stripped = strip_wake_prefix(raw_text, controller.wake_keywords)
         assert stripped == "", "裸唤醒词会被完整剥离成空串"
 
-        workspace = SimpleNamespace(
+        workspace = TurnWorkspace(
             turn_id="input_1", final_text=stripped, paraformer_final=raw_text,
             refined_text="", audio_cues=[], analysis={}, segments=[],
             speaker_decision={}, transcript_updates=[], speaker_blocked=False,
             generation=1, timings={}, episode_id=None, refinement_available=False,
         )
-        assert await controller._input_committed(workspace, TOKEN) is True
+        controller.workspace = workspace
+        assert await controller._input_committed(workspace, workspace.token) is True
 
         assert calls["observe"] == [], "不应派发任何 Agent/LLM 回合"
         assert calls["settled"] == [("input_1", "empty_input")]
@@ -192,13 +190,14 @@ def test_wake_word_with_a_command_is_still_delivered():
             "七三同学，帮我查下天气", controller.wake_keywords,
         ) == "帮我查下天气"
 
-        workspace = SimpleNamespace(
+        workspace = TurnWorkspace(
             turn_id="input_2", final_text=stripped, paraformer_final="七三，帮我查下天气",
             refined_text="", audio_cues=[], analysis={}, segments=[],
             speaker_decision={}, transcript_updates=[], speaker_blocked=False,
             generation=1, timings={}, episode_id=None, refinement_available=False,
         )
-        assert await controller._input_committed(workspace, TOKEN) is True
+        controller.workspace = workspace
+        assert await controller._input_committed(workspace, workspace.token) is True
 
         assert calls["observe"] == ["USER_INPUT_FINALIZED"]
         assert calls["settled"] == []

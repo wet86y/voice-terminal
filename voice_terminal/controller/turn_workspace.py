@@ -103,6 +103,7 @@ class TurnWorkspace:
     speaker_state: str = "unknown"
     speaker_degraded_reason: str = ""
     speaker_blocked: bool = False
+    speaker_routing_finalized: bool = False  # speaker_routing_finalized（本段声纹路由已结算）。
     # Capture the routing mode at turn start.  Product mode changes can then
     # take effect on the next speech segment without rewriting a turn that is
     # already being finalized.
@@ -142,6 +143,7 @@ class TurnWorkspace:
         self.speaker_state = "unknown"
         self.speaker_degraded_reason = ""
         self.speaker_blocked = False
+        self.speaker_routing_finalized = False
 
     def snapshot(self) -> dict:
         return {

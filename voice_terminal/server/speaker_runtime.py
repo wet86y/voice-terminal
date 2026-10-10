@@ -47,10 +47,9 @@ class SpeakerRuntimeMixin:
         """Verify that stored templates belong to the running frontend.
 
         The sidecar already holds the ONNX session, so ask it for the probe
-        embedding instead of loading a second session here.  A mismatch marks
-        the profile stale, which makes ``available`` false and keeps every
-        route fail-open — far safer than silently scoring templates in a
-        different coordinate system.
+        embedding instead of loading a second session here. A mismatch marks
+        the profile stale and makes ``available`` false; filter（拦截模式）
+        closes input admission while observe（仅标记模式）keeps input available.
         """
         try:
             response = await client.fingerprint(timeout_s=5.0)

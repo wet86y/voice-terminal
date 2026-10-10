@@ -71,6 +71,7 @@ SessionLedger ──> LLMContextProjector ──> 主 LLM 请求
 - `wait` 表示不改变语音队列；`speak` 只表达仍相关且尚未传达的新内容；`revision` 只改尚未发送的尾巴且只写新尾巴；`cancel` 空文本用于必须立即停止、`cancel` 带文本用于停止并替换。
 - 未播放的 assistant 草稿不进入 HISTORY；实际传达内容在结算时通过冻结的 `voice_delivery` 追加。
 - ASR refinement 更新当前输入和诊断，不回写已经提交的用户 HISTORY。
+- 新输入创建不撤销有效输出事务的播放许可，播放前暂停必须保留队列；恢复失败按取消结算，不得报告可播放。声纹拦截模式下未准入声音继续识别，但不能暂停有效待播回复。实现与验证见[语音可靠性修复](voice-reliability-fixes-20261010.md)。
 
 #### 语音端点与分析模型
 

@@ -63,6 +63,7 @@ class SpeechHandle:
         self.queued_at = time.monotonic()
         self.started = asyncio.Event()
         self.playback_ready = asyncio.Event()
+        self.player_held = False  # player_held（该事务是否实际暂停了播放器）。
         self.state = "CREATING"
         # Bound by ``_play_stream`` for the duration of this transaction.  It
         # owns the boundary between text the provider already received and
@@ -314,7 +315,9 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
 
         if self.player is not None:
             hold = getattr(self.player, "hold", None)
-            if callable(hold) and not hold(h.workspace.playback_key):
+            held = hold(h.workspace.playback_key) if callable(hold) else False
+            h.player_held = bool(held)
+            if callable(hold) and not held:
                 has_started = getattr(self.player, "has_started", None)
                 if callable(has_started) and has_started(h.workspace.playback_key):
                     # The player won the race and has already crossed the
@@ -622,7 +625,6 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
 
     def release_held(self):
         """Grant playback to the latest candidate after local endpointing."""
-        was_held = self._playback_hold
         self._playback_hold = False
         self._playback_release.set()
         candidates = ([self.handle] if self.handle else []) + list(self._pending)
@@ -632,8 +634,18 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
             if (h and not h.reason and not h.task.done()
                     and not h.workspace.playback_started):
                 resume = getattr(self.player, "resume", None) if self.player is not None else None
-                if callable(resume) and (was_held or "playback_hold_started" in h.workspace.timings):
-                    resume(h.workspace.playback_key)
+                if callable(resume) and getattr(h, "player_held", False):
+                    if resume(h.workspace.playback_key) is False:
+                        # playback_resume_failed（播放器恢复失败）：不能发布成功释放，
+                        # 也不能重新授权已失效的代次，让该事务按取消路径结算。
+                        h.player_held = False
+                        self._schedule_output_event(
+                            h, "TTS_RESUME_FAILED", "tts_resume_failed",
+                            reason="playback_resume_failed",
+                        )
+                        self.cancel(h.speech_id, "playback_resume_failed")
+                        return None
+                    h.player_held = False
                 hold_started = h.workspace.timings.get("playback_hold_started")
                 if hold_started is not None and "playback_hold_released" not in h.workspace.timings:
                     released_at = time.monotonic()

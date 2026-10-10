@@ -15,6 +15,7 @@ from ..core.state import TerminalState
 from ..session.contracts import DeliveryReport
 from ..session.conversation_log import USER_TURN, speech_kind
 from ..speaker.rolling import RollingSpeakerIdentity
+from ..speaker.contracts import SpeakerState
 
 
 logger = logging.getLogger(__name__)
@@ -150,7 +151,8 @@ class EpisodeController(RealtimeController):
                                        on_user_activity=self.on_user_activity,
                                         on_silence_anchor=self.on_silence_anchor,
                                         on_speaker_heartbeat=self._speaker_heartbeat_pulse,
-                                        admit_user_turn=self._speaker_admit_turn)
+                                        admit_user_turn=self._speaker_admit_turn,
+                                        defer_user_turn=self._speaker_defer_turn)
         runtime.quiet_policy = self.quiet_policy
         runtime.deferred_capture = self.deferred_capture
         runtime.deferred_append = self.deferred_append
@@ -165,6 +167,16 @@ class EpisodeController(RealtimeController):
             late = getattr(self.episode, "active_request_source_turn_id", None) == turn_id
             logger.info("speaker.request_veto turn_id=%s reason=rolling_non_owner late=%s",
                         turn_id, late)
+            return False
+        return True
+
+    def _speaker_defer_turn(self, turn_id: str) -> bool:
+        """filter（拦截模式）等本段最终身份，禁止用尚未结算的转写唤起主模型。"""
+        ws = self.workspace
+        if (ws is None or ws.turn_id != turn_id or ws.speaker_mode != "filter"
+                or ws.speaker_routing_finalized or turn_id in self._speaker_vetoed_turns):
+            return False
+        if self.speaker_vetoes_turn(turn_id):
             return False
         return True
 
@@ -494,7 +506,7 @@ class EpisodeController(RealtimeController):
         if not ws:
             return
         if kind == "transcript.segment":
-            if not self._speaker_admit_turn(ws.turn_id):
+            if not self._speaker_admit_turn(ws.turn_id) or self._speaker_defer_turn(ws.turn_id):
                 # Final text still reaches the environment store at commit;
                 # provisional text must not wake the model meanwhile.
                 return
@@ -507,6 +519,20 @@ class EpisodeController(RealtimeController):
             if key != self._endpoint_context:
                 self._endpoint_context = key
                 await self.episode.observe("ENDPOINT_CANDIDATE", turn_id=ws.turn_id)
+
+    def _admitted_passive_speech(self, activity) -> bool:
+        """只让已准入的讲话改变待播输出的暂停状态，原始检测仍继续识别。"""
+        ws = getattr(self, "workspace", None)
+        mode = getattr(ws, "speaker_mode", getattr(self, "speaker_mode", "off"))
+        if mode != "filter":
+            return bool(activity.is_speech)
+        decision = getattr(ws, "speaker_decision", {}) or {}
+        return bool(
+            activity.is_speech and ws is not None
+            and ws.speaker_routing_finalized and not ws.speaker_blocked
+            and decision.get("state") == "owner_confirmed" and decision.get("route") == "main"
+            and not decision.get("degraded", False)
+        )
 
     async def _observe_activity(self, activity, frame):
         if not self.state.listening or self.episode.closed:
@@ -526,7 +552,7 @@ class EpisodeController(RealtimeController):
                 self._owner_barge_expired = False
                 self.barge_in_gate.reset()
                 self._barge_trace_state = None
-                await self.episode.speech_activity(bool(activity.is_speech))
+                await self.episode.speech_activity(self._admitted_passive_speech(activity))
                 return activity
             protected = self._barge_in_protected_available()
             if not protected:
@@ -584,7 +610,7 @@ class EpisodeController(RealtimeController):
             self.barge_in_gate.reset()
             self._barge_trace_state = None
         else:
-            await self.episode.speech_activity(bool(activity.is_speech))
+            await self.episode.speech_activity(self._admitted_passive_speech(activity))
         return activity
 
     def _clear_owner_barge_candidate(self) -> None:
@@ -755,10 +781,16 @@ class EpisodeController(RealtimeController):
 
     async def _input_committed(self, ws, token):
         speaker_decision = await self._speaker_decision(ws)
+        if ws.token != token or self.workspace is not ws:
+            return True
+        ws.speaker_routing_finalized = True
         rolling_veto = (ws.turn_id in getattr(self, "_speaker_vetoed_turns", set())
                         or self.speaker_vetoes_turn(ws.turn_id))
-        final_veto = speaker_decision is not None and speaker_decision.route == "ambient"
         mode = str(getattr(ws, "speaker_mode", getattr(self, "speaker_mode", "off")))
+        final_veto = mode == "filter" and (
+            speaker_decision is None or speaker_decision.route != "main"
+            or speaker_decision.state != SpeakerState.OWNER_CONFIRMED
+        )
         if mode == "filter" and (rolling_veto or final_veto) and ws.final_text:
             self._speaker_vetoed_turns.add(ws.turn_id)
             decision_payload = (speaker_decision.to_payload() if speaker_decision is not None else {})

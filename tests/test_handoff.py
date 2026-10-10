@@ -149,6 +149,9 @@ def test_organizer_high_snapshot_validation_and_compress_retry(tmp_path):
         assert provider.complete.await_count == 2
         assert all(call.kwargs["reasoning_effort"] == "high" and call.kwargs["max_output_tokens"] == 16384
                    for call in provider.complete.await_args_list)
+        compact_payload = json.loads(provider.complete.await_args_list[1].kwargs["input_items"][0]["content"])
+        assert "records" not in compact_payload
+        assert compact_payload["draft_result"]["consumed_entry_ids"] == ["a"]
         provider.complete = AsyncMock(return_value=response({"document":"内容","extracted_items":[],"consumed_entry_ids":["not-in-snapshot"]}))
         with pytest.raises(ValueError, match="快照"):
             await ContinuityOrganizer(provider).organize(make_archive(tmp_path), "", [])

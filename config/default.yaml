@@ -13,6 +13,7 @@ continuity:
   max_document_chars: 6000  # 交接文档字符上限。
   max_output_tokens: 16384  # 整理输出词元预算。
   max_context_tokens: 524288  # 整理上下文词元预算。
+  organize_timeout_ms: 90000  # 整个整理流程的等待上限（毫秒），独立于影子模型请求超时。
 
 # The only runtime: audio input refinement is independently configurable.
 smart_turn:

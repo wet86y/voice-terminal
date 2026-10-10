@@ -948,7 +948,8 @@ export function useProductControls() {
     const service = String(speakerStatus.value.service || "").toUpperCase();
     if (service === "READY") return "就绪";
     if (service === "STARTING") return "启动中";
-    if (service === "DEGRADED") return "降级直通";
+    if (service === "DEGRADED")
+      return speakerForm.mode === "filter" ? "降级 · 输入已拦截" : "降级 · 不拦截输入";
     if (service === "ERROR") return "错误";
     return service === "DISABLED" ? "已关闭" : "不可用";
   });
