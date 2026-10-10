@@ -29,6 +29,16 @@ def history(role: str, content: str) -> dict[str, str]:
     return ContextFrame.make(ContextLane.HISTORY, role, content)
 
 
+def request_tail_by_kind(messages):
+    """按 context_kind（上下文类型）读取独立动态尾部帧。"""
+    return {
+        item["context_kind"]: item["content"]
+        for item in messages
+        if item.get("context_lane") == ContextLane.REQUEST_TAIL
+        and item.get("context_kind")
+    }
+
+
 def static(content: str) -> dict[str, str]:
     return ContextFrame.make(ContextLane.STATIC_INSTRUCTIONS, "system", content)
 
@@ -61,7 +71,9 @@ def test_prompt_matches_required_responses_wire_contract_and_has_short_examples(
         parser = SpeechDecisionEnvelopeStream(allow_empty_control_text=True)
         parser.feed(example)
         states.add(parser.finish().speak.state)
-    assert states == {"speak", "revision", "wait"}
+    # Revision（尾巴修订）仍受协议允许，但不再用静态示例诱发重播。
+    assert states == {"speak", "wait"}
+    assert "state 只能是 speak、revision、cancel、wait" in PROMPT
     assert "emotion 可省略" not in PROMPT
     assert "不得带 text" not in PROMPT
 
@@ -1100,12 +1112,11 @@ def test_system_check_recovery_signal_keeps_immutable_owner_metadata(dispatch_ki
             force_context=signal.dispatch_context,
             current_turn_id="turn-a",
         )
-        packet = json.loads(messages[-2]["content"])
-        entries = {entry["kind"]: entry["content"] for entry in packet["entries"]}
-        feedback = json.loads(entries["immediate_recovery"].removeprefix("即时恢复反馈："))
+        tail = request_tail_by_kind(messages)
+        feedback = json.loads(tail["immediate_recovery"].removeprefix("即时恢复反馈："))
 
         assert prompt_kind == dispatch_kind
-        assert dispatch_kind in entries
+        assert dispatch_kind in tail
         assert feedback["origin_prompt_kind"] == dispatch_kind
         expected = "不要重新回答历史用户请求" if dispatch_kind == "secondary_mailbox" else "不要把最后一条历史用户输入当成新的请求"
         assert expected in feedback["instruction"]

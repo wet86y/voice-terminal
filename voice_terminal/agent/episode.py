@@ -147,7 +147,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
     CONTEXT_ASSISTANT_CONTENT_CHARS = 4000
 
     def __init__(self, provider, registry, output, emit, *, conversation: ConversationRuntime, ledger,
-                 options=None, tools_enabled=True, reasoning_mode="fast", persona_config=None,
+                 options=None, tools_enabled=True, reasoning_mode="deep", persona_config=None,
                  custom_instructions_provider=None,
                  shadow_waker=None, on_final_system_check_settled=None,
                  can_dispatch_final_silence=None,
@@ -487,13 +487,22 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 "agent.speak_context episode_id=%s request_id=%s turn=%s state=%s owner_scope=%s "
                 "continuation_mode=%s committed_prefix_chars=%s current_clause_chars=%s "
                 "prefetched_clause_chars=%s revisable_tail_chars=%s planned_chars=%s locked_chars=%s "
-                "heard_chars=%s active_same_turn=%s",
+                "heard_chars=%s active_same_turn=%s speech_id=%s",
                 source[0], source[1], item["turn_id"], payload.get("speak_state"),
                 payload.get("owner_scope"), payload.get("continuation_mode"),
                 payload.get("committed_prefix_chars"), payload.get("current_clause_chars"),
                 payload.get("prefetched_clause_chars"), payload.get("revisable_tail_chars"),
                 payload.get("planned_chars"), payload.get("locked_chars"), payload.get("heard_chars"),
-                payload.get("active_same_turn"),
+                payload.get("active_same_turn"), payload.get("speech_id"),
+            )
+        elif kind in {"SPEECH_REVISED", "SPEECH_REVISION_REJECTED", "SPEECH_REVISION_NOOP"}:
+            # 字符数均为 Unicode（统一字符编码）码点数，不输出实际语音文本。
+            logger.info(
+                "agent.speech_revision kind=%s episode_id=%s request_id=%s turn=%s speech_id=%s "
+                "context_locked_chars=%s apply_locked_chars=%s new_tail_chars=%s reason=%s",
+                kind, source[0], source[1], item["turn_id"], payload.get("speech_id"),
+                payload.get("context_locked_chars"), payload.get("apply_locked_chars"),
+                payload.get("new_tail_chars"), payload.get("reason"),
             )
         elif kind in {"SPEECH_PREFIX_RECONCILED", "CROSS_TURN_SPEECH_PREFIX_STRIPPED"}:
             logger.info(
@@ -2784,12 +2793,13 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                            if isinstance(dispatch_context, dict) else None)
         if reason is None and locked.endswith(proposal):
             self.minor_protocol_feedback.append({
-                "field": "speak.revision", "provided_chars": len(proposal),
+                "field": "speak.text", "provided_chars": len(proposal),
                 "applied": "noop_tail_already_locked",
                 "hint": "该尾巴已锁定无需修订；没有新内容时使用 wait（等待）。",
             })
             await self.log("SPEECH_REVISION_NOOP", identity=identity, turn_id=turn_id,
                            speech_id=speech_id, locked_chars=len(locked),
+                           context_locked_chars=sent_chars, apply_locked_chars=current.get("sent_chars"),
                            new_tail_chars=len(proposal), reason="tail_already_locked",
                            system_check_id=system_check_id)
             return "noop"
@@ -2805,18 +2815,21 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 await self.log("SPEECH_REVISED", identity=identity, turn_id=turn_id,
                                path="rewrite", speech_id=rewritten.speech_id,
                                locked_chars=len(locked), new_tail_chars=len(proposal),
+                               context_locked_chars=sent_chars,
+                               apply_locked_chars=getattr(rewritten, "sent_chars", sent_chars),
                                system_check_id=system_check_id)
                 return rewritten
         reason = reason or "confirmation_boundary_changed"
         self.minor_protocol_feedback.append({
-            "field": "speak.revision", "applied": "rejected_boundary_changed",
+            "field": "speak.text", "applied": "rejected_boundary_changed",
             "reason": reason,
-            "hint": "修订未受理：请求中的尾巴边界已失效或不可修订。核对最新输出状态并遵守末尾队列规则；"
+            "hint": "修订未受理：请求中的尾巴边界已失效或不可修订。核对最新输出状态并遵守固定队列规则；"
                     "边界变化不构成取消理由，不得为此取消重讲，没有允许的必要变更时 wait（等待）。",
         })
         await self.log("SPEECH_REVISION_REJECTED", identity=identity, turn_id=turn_id,
                        speech_id=speech_id, reason=reason, context_locked_chars=sent_chars,
                        apply_locked_chars=current.get("sent_chars"),
+                       new_tail_chars=len(proposal),
                        system_check_id=system_check_id)
         return None
 
@@ -3202,6 +3215,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
 
         await self.log(
             "LLM_SPEAK_CONTEXT", identity=identity, turn_id=source_turn_id,
+            speech_id=snapshot.get("speech_id"),
             speak_state=speak_context.get("state"),
             owner_scope=speak_context.get("owner_scope"),
             continuation_mode=speak_context.get("continuation_mode"),

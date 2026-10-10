@@ -47,25 +47,22 @@ DSH（后台执行宿主）与 LLM（大语言模型）语音交互链路向用�
 当前项目工具不提供暂停/恢复，不能把暂停请求直接当作取消。
 业务工具的成功回执确认实际操作完成，桥接回执只确认结果提交；没有成功回执不得报告定时或操作成功。
 
-未播放的 assistant 草稿、播放器进度和 TTS 连接状态不是历史事实。活动 speak 只按以下四段投影，正文不得重复：
+未播放的 assistant（助手）草稿、播放器进度和 TTS（语音合成）连接状态不是历史事实。活动语音事务在第2版当前快照的 `speech`（语音状态）中直接投影完整锁定文本和可改文本：
 
 ```json
 {
   "owner_scope": "current_turn",
   "continuation_mode": "rewrite_tail",
-  "text_parts": {
-    "committed_prefix": "",
-    "current_clause": "",
-    "prefetched_clause": "",
-    "revisable_tail": ""
-  },
-  "delivery": {"heard_text": "", "status": "partial", "termination": "interrupted"}
+  "locked_text": "会议地点是会议室甲，",
+  "editable_text": "三点开始，记得带上笔记本。"
 }
 ```
 
-`text_parts` 描述的是**本轮已接受文本**：当空闲后创建的同轮新播报成为队头时，本地会把本轮此前已交付的前沿还原到它前面，因此 `committed_prefix` 不会在事务换头时缩短。
+`locked_text`（锁定文本）是本地已提交前缀、当前短句和预取短句的无损拼接；`editable_text`（可改文本）是尚未提交的尾巴。内部仍保留四段调度边界；同轮事务换头时，此前已交付前沿仍进入模型看到的锁定文本。锁定不等于用户已经听到。
 
-`delivery` 只在队列为空（`state=empty`）时出现，且只含 `heard_text`、`status`、`termination` 三个键：它是"用户实际听到的前沿"，与 `text_parts` 的"已发送"不是同一件事，也不携带任何 speech/turn/request ID。队列非空时不投影 `delivery`，避免与当前事务的 `text_parts` 争夺"说到哪"的解释权。
+`speech.delivery`（语音传达事实）只在 `state=empty`（队列空闲）时出现，只含 `heard_text`（确认已听文本）、`status`（传达状态）、`termination`（终止原因），不携带播报、轮次或请求标识。活动队列不投影该字段。完整传达历史继续以 `voice_delivery`（实际传达记录）在历史区追加，不把待播文本写成已经听到的事实。
+
+固定队列规则在稳定指令区只保留一份；当前用户输入、背景和恢复／调度信息在当前快照之前独立呈现，快照后是本次决策任务和最终输出约束。`state=revision`（尾巴修订）时，`speak.text`（播报文本）是从锁定边界续写的完整替换尾巴，保留原尾巴仍有效的要点。输出协议字段及本地受理逻辑保持不变，详见[缓存契约](llm-context-cache-contract.md)。
 
 ### SenseVoice 精修线索
 
@@ -232,4 +229,4 @@ Shadow 的活动状态只保留当前运行的有限产品投影；完整 trace 
 - cancel（取消）：空文本只停止，非空文本停止并创建替换播报。
 - wait（等待）：不变更输出。忙碌时忽略播报不影响通过独立校验的 actions（动作列表）执行。
 
-请求快照在推理准备阶段补交旧事务文本、结算正在发送的块之后生成，并在结果应用完成前冻结后续提交。补交来自已有本地文本，不是 speak（新播报）的追加入口。修订还要求原播报的模型文本生成与本地分段入队都已结束、没有正在发送的块。上述确认字段仅用于执行层核验，不进入模型可见文本；模型只按 `continuation_mode`（尾巴修订权限）和 `text_parts`（语音文本四段）选择决策。完整调度规则见 [TTS 运行模式](tts-runtime.md#模型推理期间的提交边界)。
+请求快照在推理准备阶段补交旧事务文本、结算正在发送的块之后生成，并在结果应用完成前冻结后续提交。补交来自已有本地文本，不是 speak（新播报）的追加入口。修订还要求原播报的模型文本生成与本地分段入队都已结束、没有正在发送的块。上述确认字段仅用于执行层核验，不进入模型可见文本；模型按 `continuation_mode`（尾巴修订权限）、`locked_text`（锁定文本）和 `editable_text`（可改文本）选择决策。完整调度规则见 [TTS 运行模式](tts-runtime.md#模型推理期间的提交边界)。

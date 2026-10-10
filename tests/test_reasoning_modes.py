@@ -58,14 +58,14 @@ def _episode(provider=None, *, conversation=None, ledger=None, **options):
     return runtime
 
 
-def test_config_runtime_and_public_snapshot_default_to_fast(tmp_path):
+def test_config_runtime_and_public_snapshot_default_to_deep(tmp_path):
     default_yaml = Path(__file__).resolve().parents[1] / "config/default.yaml"
-    assert load_config(default_yaml).llm.reasoning_mode == "fast"
-    assert AppConfig.from_mapping({}).llm.reasoning_mode == "fast"
-    assert _episode().reasoning_mode == "fast"
+    assert load_config(default_yaml).llm.reasoning_mode == "deep"
+    assert AppConfig.from_mapping({}).llm.reasoning_mode == "deep"
+    assert _episode().reasoning_mode == "deep"
     session = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "runtime")
-    assert session.snapshot().payload["reasoning_mode"] == "fast"
-    assert sanitize_runtime_snapshot({})["reasoning_mode"] == "fast"
+    assert session.snapshot().payload["reasoning_mode"] == "deep"
+    assert sanitize_runtime_snapshot({})["reasoning_mode"] == "deep"
 
 
 @pytest.mark.parametrize("mode", ["fast", "deep"])
@@ -88,7 +88,7 @@ def test_retired_and_invalid_modes_are_rejected_at_config_and_agent_boundaries(m
 
 def test_legacy_thinking_switch_cannot_enable_an_archived_action():
     config = AppConfig.from_mapping({"llm": {"thinking_action_enabled": True}})
-    assert config.llm.reasoning_mode == "fast"
+    assert config.llm.reasoning_mode == "deep"
     assert not hasattr(config.llm, "thinking_action_enabled")
     with pytest.raises(ValueError, match="已归档"):
         decision_schema([{"name": "request_thinking", "parameters": {}}])
@@ -167,9 +167,8 @@ def test_pause_switch_resume_updates_provider_effort_without_replacing_live_work
             assert payload["reasoning"]["effort"] == ("low" if mode == "deep" else "none")
             assert payload["instructions"] == requests[0]["instructions"]
             assert DEEP_THINKING_PROMPT not in payload["instructions"]
-            packet = json.loads(payload["input"][-2]["content"][0]["text"])
-            mode_prompts = [entry["content"] for entry in packet["entries"]
-                            if entry["kind"] == "reasoning_mode"]
+            mode_prompts = [frame["content"][0]["text"] for frame in payload["input"]
+                            if frame["content"][0]["text"] == DEEP_THINKING_PROMPT]
             assert mode_prompts == ([DEEP_THINKING_PROMPT] if mode == "deep" else [])
 
         async def stream_responses(messages, *, schema, schema_name, reasoning_effort, **_kwargs):

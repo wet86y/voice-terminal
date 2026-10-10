@@ -11,13 +11,41 @@ from voice_terminal.agent.options import AgentOptions
 from voice_terminal.agent.prompts import SPEECH_QUEUE_DECISION_PROMPT
 from voice_terminal.providers.deepseek import DeepSeekClient
 from voice_terminal.session.context import (
-    FINAL_OUTPUT_CONSTRAINT, CurrentInput, LLMContextProjector,
-    consolidate_request_tail,
+    CURRENT_USER_INPUT_TYPE, FINAL_OUTPUT_CONSTRAINT, SPEECH_QUEUE_TASK,
+    SPEECH_QUEUE_TASK_KIND, VOICE_REQUEST_CONTEXT_TYPE, CurrentInput,
+    LLMContextProjector, consolidate_request_tail,
 )
 from voice_terminal.session.context_frames import ContextFrame, ContextLane
 from voice_terminal.session.contracts import DeliveryReport
 from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
+
+
+def _runtime_state_frame(snapshot):
+    # runtime_state（运行状态）必须是带有 runtime（运行信息）与 speech（语音状态）的 JSON 对象。
+    return ContextFrame.make(
+        ContextLane.REQUEST_TAIL, "system",
+        "当前轮运行状态：" + json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
+        context_kind="runtime_state",
+    )
+
+
+def _request_packet(messages):
+    # voice_request_context（语音请求上下文）现在直接承载根级原生 JSON。
+    frame = next(
+        item for item in messages
+        if ContextFrame.kind_of(item) == VOICE_REQUEST_CONTEXT_TYPE
+    )
+    return json.loads(frame["content"])
+
+
+def _current_input(messages):
+    # current_user_input（当前用户输入）单独保留为动态用户帧。
+    frame = next(
+        item for item in messages
+        if ContextFrame.kind_of(item) == CURRENT_USER_INPUT_TYPE
+    )
+    return json.loads(frame["content"])
 
 
 def test_responses_projects_only_static_frames_to_instructions_and_hides_lanes():
@@ -57,8 +85,7 @@ def test_runtime_tail_is_after_current_user_and_time_is_not_static():
     messages = [ContextFrame.make(ContextLane.STATIC_INSTRUCTIONS, "system", runtime.calendar_baseline)]
     messages.extend(projector.project(ledger, current))
     messages.append(ContextFrame.make(
-        ContextLane.REQUEST_TAIL, "system",
-        projector.runtime_tail(current=current, speak_state={
+        ContextLane.REQUEST_TAIL, "system", projector.runtime_tail(current=current, speak_state={
             "state": "speaking", "owner_scope": "current_turn",
             "continuation_mode": "rewrite_tail",
             "text_parts": {
@@ -69,22 +96,87 @@ def test_runtime_tail_is_after_current_user_and_time_is_not_static():
         context_kind="runtime_state",
     ))
     messages = consolidate_request_tail(messages)
-    assert messages[-3]["role"] == "user"
-    assert json.loads(messages[-3]["content"])["content"] == "现在精确到秒是多少"
-    assert messages[-2]["context_kind"] == "voice_request_context"
+    assert _current_input(messages) == {
+        "type": CURRENT_USER_INPUT_TYPE, "version": 1, "content": "现在精确到秒是多少",
+    }
+    assert messages[-3]["context_kind"] == VOICE_REQUEST_CONTEXT_TYPE
+    assert messages[-2]["context_kind"] == SPEECH_QUEUE_TASK_KIND
+    assert messages[-2]["content"] == SPEECH_QUEUE_TASK
     assert messages[-1]["content"] == FINAL_OUTPUT_CONSTRAINT
     assert '"local_time"' not in messages[0]["content"]
-    packet = json.loads(messages[-2]["content"])
-    assert '"local_time"' in packet["entries"][0]["content"]
+    packet = _request_packet(messages)
+    assert packet["type"] == VOICE_REQUEST_CONTEXT_TYPE
+    assert packet["version"] == 2
+    assert packet["runtime"]["clock"]["local_time"]
+    assert packet["speech"]["locked_text"] == "正在播报"
+    assert packet["speech"]["editable_text"] == ""
+
+
+def test_runtime_snapshot_projects_full_long_locked_and_editable_text():
+    locked = ("已经锁定的完整上下文。" * 90) + "当前未结束的半句"
+    editable = ("后续仍有效的队列内容；" * 70) + "请继续。"
+    current = CurrentInput(text="补充一个事实", primary_transcript="补充一个事实")
+    rendered = LLMContextProjector.runtime_tail(
+        current=current,
+        speak_state={
+            "state": "speaking",
+            "text_parts": {
+                "committed_prefix": locked[:-7],
+                "current_clause": locked[-7:],
+                "prefetched_clause": "",
+                "revisable_tail": editable,
+            },
+        },
+    )
+    messages = consolidate_request_tail([
+        ContextFrame.make(ContextLane.REQUEST_TAIL, "user", current.text,
+                          context_kind=CURRENT_USER_INPUT_TYPE),
+        ContextFrame.make(ContextLane.REQUEST_TAIL, "system", rendered,
+                          context_kind="runtime_state"),
+    ])
+
+    packet = _request_packet(messages)
+    assert packet["speech"]["locked_text"] == locked
+    assert packet["speech"]["editable_text"] == editable
+    assert "text_parts" not in packet["speech"]
+    assert packet["speech"]["locked_text"] + packet["speech"]["editable_text"] == locked + editable
+
+
+def test_half_sentence_current_input_and_snapshot_continuation_are_verbatim():
+    current_text = "我想把预算提高到五千，然后先等等"
+    locked = "安排已确认，先保留这句尚未结束的说明，"
+    editable = "后续再补上地点和时间。"
+    current = CurrentInput(text=current_text, primary_transcript=current_text)
+    messages = consolidate_request_tail([
+        *LLMContextProjector().project(SessionLedger(), current),
+        _runtime_state_frame({
+            "runtime": {"clock": {"local_time": "12:00:00", "precision": "second"}},
+            "speech": {"state": "speaking", "locked_text": locked, "editable_text": editable},
+        }),
+    ])
+
+    assert _current_input(messages)["content"] == current_text
+    packet = _request_packet(messages)
+    assert packet["speech"]["locked_text"] == locked
+    assert packet["speech"]["editable_text"] == editable
 
 
 def test_dynamic_speak_parts_change_only_request_tail_and_keep_cache_prefix_frozen():
     class Registry:
+        status = "READY"
+
         def action_definitions(self):
-            return []
+            return [{
+                "name": "lookup", "description": "读取信息",
+                "parameters": {"type": "object", "properties": {}, "required": [],
+                               "additionalProperties": False},
+            }]
 
         def begin_turn(self, _turn_id):
             return None
+
+        def service_status(self, _name):
+            return self.status
 
     async def emit(*_args):
         return None
@@ -104,9 +196,11 @@ def test_dynamic_speak_parts_change_only_request_tail_and_keep_cache_prefix_froz
     })
     conversation = ConversationRuntime()
     conversation.begin_turn("turn-a")
+    ledger = SessionLedger()
+    registry = Registry()
     runtime = AgentEpisodeRuntime(
-        None, Registry(), output, emit,
-        conversation=conversation, ledger=SessionLedger(),
+        None, registry, output, emit,
+        conversation=conversation, ledger=ledger, reasoning_mode="fast",
     )
     runtime.episode_id = "conversation"
     runtime.last_turn_id = "turn-a"
@@ -128,18 +222,34 @@ def test_dynamic_speak_parts_change_only_request_tail_and_keep_cache_prefix_froz
             "prefetched_clause": "第三句。", "revisable_tail": "",
         },
     }
-    after = runtime.messages({"TOOL_COMPLETED"}, current_turn_id="turn-a")
+    runtime.reasoning_mode = "deep"  # reasoning_mode（推理模式）变化也只能追加动态帧。
+    registry.status = "BUSY"
+    ledger.set_shadow_runtime_state(available=True, active=True)
+    after = runtime.messages(
+        {"TOOL_COMPLETED"}, current_turn_id="turn-a",
+        shadow_information={"text": "后台发现新的来源", "source": "observer"},
+    )
     runtime._guard_context_contract(after)
-
     assert [item for item in after if ContextFrame.lane_of(item) == ContextLane.STATIC_INSTRUCTIONS] == static_before
     assert [item for item in after if ContextFrame.lane_of(item) == ContextLane.HISTORY] == history_before
     assert runtime.static_context_digest == static_digest
     assert runtime.history_context_digest == history_digest
-    packet = json.loads(after[-2]["content"])
-    runtime_entry = next(item for item in packet["entries"] if item["kind"] == "runtime_state")
-    assert '"continuation_mode":"none"' in runtime_entry["content"]
-    assert '"text_parts"' in runtime_entry["content"]
-    assert "target_text" not in runtime_entry["content"]
+    assert any(ContextFrame.kind_of(item) == "reasoning_mode" for item in after)
+    packet_before = _request_packet(before)
+    packet = _request_packet(after)
+    assert packet_before["speech"]["locked_text"] == "第一句。第二句。"
+    assert packet_before["speech"]["editable_text"] == "第三句。"
+    assert packet["speech"]["locked_text"] == "第一句。第二句。第三句。"
+    assert packet["speech"]["editable_text"] == ""
+    assert packet["speech"]["continuation_mode"] == "none"
+    assert "text_parts" not in packet["speech"]
+    assert packet_before["tool_availability"] == {"lookup": "ready"}
+    assert packet["tool_availability"] == {"lookup": "busy"}
+    assert packet["shadow"]["active"] is True
+    assert packet["shadow"]["information"] == {
+        "text": "后台发现新的来源", "source": "observer",
+    }
+    assert packet["runtime"]["clock"]["local_time"]
     assert "第一句。" not in "".join(item["content"] for item in static_before)
     assert "第三句。" not in "".join(item["content"] for item in history_before)
 
@@ -155,25 +265,27 @@ def test_request_tail_consolidation_is_lossless_ordered_and_final():
         ContextFrame.make(
             ContextLane.REQUEST_TAIL, "system", "恢复原文", context_kind="immediate_recovery",
         ),
-        ContextFrame.make(
-            ContextLane.REQUEST_TAIL, "system", "状态原文", context_kind="runtime_state",
-        ),
+        _runtime_state_frame({"runtime": {"clock": {"local_time": "12:00:00"}},
+                              "speech": {"state": "empty"}}),
     ]
 
     messages = consolidate_request_tail(source)
 
     assert messages[:2] == source[:2]
-    assert json.loads(messages[-3]["content"]) == {
+    assert _current_input(messages) == {
         "type": "current_user_input", "version": 1, "content": "  用户原文\n第二行  ",
     }
-    packet = json.loads(messages[-2]["content"])
+    kinds = [ContextFrame.kind_of(frame) for frame in messages]
+    assert kinds[-5:] == [
+        CURRENT_USER_INPUT_TYPE, "immediate_recovery", VOICE_REQUEST_CONTEXT_TYPE,
+        SPEECH_QUEUE_TASK_KIND, "output_constraint",
+    ]
+    packet = _request_packet(messages)
     assert packet == {
-        "type": "voice_request_context",
-        "version": 1,
-        "entries": [
-            {"index": 0, "kind": "immediate_recovery", "content": "恢复原文"},
-            {"index": 1, "kind": "runtime_state", "content": "状态原文"},
-        ],
+        "type": VOICE_REQUEST_CONTEXT_TYPE,
+        "version": 2,
+        "runtime": {"clock": {"local_time": "12:00:00"}},
+        "speech": {"state": "empty"},
     }
     assert messages[-1]["content"] == FINAL_OUTPUT_CONSTRAINT
     assert messages[-1]["context_kind"] == "output_constraint"
@@ -182,23 +294,22 @@ def test_request_tail_consolidation_is_lossless_ordered_and_final():
 def test_request_tail_without_current_user_does_not_invent_one():
     messages = consolidate_request_tail([
         ContextFrame.make(ContextLane.HISTORY, "user", "committed"),
-        ContextFrame.make(
-            ContextLane.REQUEST_TAIL, "system", "state", context_kind="runtime_state",
-        ),
+        _runtime_state_frame({"runtime": {}, "speech": {"state": "empty"}}),
     ])
-    assert [frame["role"] for frame in messages] == ["user", "system", "system"]
-    assert json.loads(messages[-2]["content"])["entries"][0]["content"] == "state"
+    assert [frame["role"] for frame in messages] == ["user", "system", "system", "system"]
+    assert not any(ContextFrame.kind_of(frame) == CURRENT_USER_INPUT_TYPE for frame in messages)
+    assert _request_packet(messages)["speech"] == {"state": "empty"}
+    assert messages[-2]["content"] == SPEECH_QUEUE_TASK
+    assert messages[-1]["content"] == FINAL_OUTPUT_CONSTRAINT
 
 
 def test_context_guard_rejects_any_frame_after_output_constraint():
     episode = AgentEpisodeRuntime(
         None, object(), object(), lambda *_args: None,
-        conversation=ConversationRuntime(), ledger=SessionLedger(),
+        conversation=ConversationRuntime(), ledger=SessionLedger(), reasoning_mode="fast",
     )
     messages = consolidate_request_tail([
-        ContextFrame.make(
-            ContextLane.REQUEST_TAIL, "system", "state", context_kind="runtime_state",
-        ),
+        _runtime_state_frame({"runtime": {}, "speech": {"state": "empty"}}),
     ])
     messages.append(ContextFrame.make(
         ContextLane.REQUEST_TAIL, "system", "late", context_kind="system_context",
@@ -220,38 +331,43 @@ def test_runtime_classifies_recovery_and_runtime_without_loss():
     )
     runtime = AgentEpisodeRuntime(
         None, Registry(), output, lambda *_args: None,
-        conversation=ConversationRuntime(), ledger=SessionLedger(),
+        conversation=ConversationRuntime(), ledger=SessionLedger(), reasoning_mode="fast",
     )
     runtime.episode_id = runtime.conversation.conversation_id
     runtime.last_turn_id = "turn-a"
+    runtime.user_speaking = True
     runtime.inputs["turn-a"] = {"text": "当前输入", "final": False}
     signal = RecoverySignal("SPEAK_ENVELOPE_INVALID", "bad", source_request_id="request-a")
 
     messages = runtime.messages({"EXCEPTION_RECOVERY"}, recovery_signal=signal)
-    packet = json.loads(messages[-2]["content"])
+    packet = _request_packet(messages)
+    recovery = next(frame for frame in messages
+                    if ContextFrame.kind_of(frame) == "immediate_recovery")
 
     assert messages[-1]["content"] == FINAL_OUTPUT_CONSTRAINT
-    assert [entry["kind"] for entry in packet["entries"]] == [
-        "immediate_recovery", "runtime_state", "speech_queue_policy",
-    ]
-    assert "SPEAK_ENVELOPE_INVALID" in packet["entries"][0]["content"]
-    assert "当前轮运行状态" in packet["entries"][1]["content"]
+    assert ContextFrame.kind_of(messages[-2]) == SPEECH_QUEUE_TASK_KIND
+    assert packet["version"] == 2
+    assert packet["runtime"]["clock"]["local_time"]
+    assert packet["speech"]["state"] == "empty"
+    assert packet["speech"]["locked_text"] == ""
+    assert packet["speech"]["editable_text"] == ""
+    assert "SPEAK_ENVELOPE_INVALID" in recovery["content"]
 
     runtime.minor_protocol_feedback.append({"field": "emotion"})
-    minor = json.loads(runtime.messages({"USER_INPUT_FINALIZED"})[-2]["content"])
-    assert [entry["kind"] for entry in minor["entries"]] == [
-        "minor_protocol_feedback", "runtime_state", "speech_queue_policy",
-    ]
-    assert "emotion" in minor["entries"][0]["content"]
+    minor_messages = runtime.messages({"USER_INPUT_FINALIZED"})
+    minor = next(frame for frame in minor_messages
+                 if ContextFrame.kind_of(frame) == "minor_protocol_feedback")
+    assert _request_packet(minor_messages)["runtime"]["input_status"] == "speaking"
+    assert "emotion" in minor["content"]
 
     runtime.deferred_recovery_feedback.append(signal)
-    deferred = json.loads(runtime.messages({"USER_INPUT_FINALIZED"})[-2]["content"])
-    assert [entry["kind"] for entry in deferred["entries"]] == [
-        "deferred_recovery", "runtime_state", "speech_queue_policy",
-    ]
-    assert "SPEAK_ENVELOPE_INVALID" in deferred["entries"][0]["content"]
-    assert "已回到普通事件调度" not in deferred["entries"][0]["content"]
-    assert "重新处理最后一条用户输入" not in deferred["entries"][0]["content"]
+    deferred_messages = runtime.messages({"USER_INPUT_FINALIZED"})
+    deferred = next(frame for frame in deferred_messages
+                    if ContextFrame.kind_of(frame) == "deferred_recovery")
+    assert _request_packet(deferred_messages)["version"] == 2
+    assert "SPEAK_ENVELOPE_INVALID" in deferred["content"]
+    assert "已回到普通事件调度" not in deferred["content"]
+    assert "重新处理最后一条用户输入" not in deferred["content"]
 
 
 @pytest.mark.parametrize("prompt_kind", ["normal", "secondary_mailbox", "final_silence", "kws_wake"])
@@ -266,7 +382,7 @@ def test_queue_policy_survives_context_fit_and_is_last_before_output_guard(promp
     runtime = AgentEpisodeRuntime(
         None, Registry(), output, lambda *_args: None,
         options=AgentOptions(max_context_tokens=128),
-        conversation=ConversationRuntime(), ledger=SessionLedger(),
+        conversation=ConversationRuntime(), ledger=SessionLedger(), reasoning_mode="fast",
     )
     runtime.episode_id = runtime.conversation.conversation_id
     runtime.last_turn_id = "turn-a"
@@ -285,17 +401,21 @@ def test_queue_policy_survives_context_fit_and_is_last_before_output_guard(promp
         fitted, model="deepseek-flash", schema=decision_schema([]),
         schema_name="voice_decision_v06", reasoning_effort="low", max_output_tokens=100,
     )
-    assert SPEECH_QUEUE_DECISION_PROMPT not in payload["instructions"]
-    packet = json.loads(payload["input"][-2]["content"][0]["text"])
-    policies = [entry for entry in packet["entries"] if entry["kind"] == "speech_queue_policy"]
-    assert len(policies) == 1
-    assert packet["entries"][-1] == policies[0]
-    assert policies[0]["content"] == SPEECH_QUEUE_DECISION_PROMPT
-    assert any(entry["kind"] == "runtime_state" for entry in packet["entries"][:-1])
+    assert SPEECH_QUEUE_DECISION_PROMPT in payload["instructions"]
+    packet_item = next(item for item in payload["input"]
+                       if VOICE_REQUEST_CONTEXT_TYPE in item["content"][0]["text"])
+    packet = json.loads(packet_item["content"][0]["text"])
+    assert packet["type"] == VOICE_REQUEST_CONTEXT_TYPE and packet["version"] == 2
+    assert isinstance(packet["runtime"], dict) and isinstance(packet["speech"], dict)
+    assert payload["input"][-2]["content"][0]["text"] == SPEECH_QUEUE_TASK
+    details = [ContextFrame.kind_of(frame) for frame in fitted
+               if ContextFrame.lane_of(frame) == ContextLane.REQUEST_TAIL]
+    assert SPEECH_QUEUE_TASK_KIND in details
+    assert "runtime_state" not in details  # runtime_state（运行状态）已原生投影为 JSON 快照。
     if prompt_kind != "normal":
-        assert any(entry["kind"] == prompt_kind for entry in packet["entries"][:-1])
+        assert prompt_kind in details
     if recovering:
-        assert any(entry["kind"] == "immediate_recovery" for entry in packet["entries"][:-1])
+        assert "immediate_recovery" in details
     assert payload["input"][-1]["content"][0]["text"] == FINAL_OUTPUT_CONSTRAINT
 
 
@@ -303,24 +423,24 @@ def test_fit_context_locates_typed_current_input_before_final_constraint():
     episode = AgentEpisodeRuntime(
         None, object(), object(), lambda *_args: None,
         options=AgentOptions(max_context_tokens=128),
-        conversation=ConversationRuntime(), ledger=SessionLedger(),
+        conversation=ConversationRuntime(), ledger=SessionLedger(), reasoning_mode="fast",
     )
     messages = consolidate_request_tail([
         ContextFrame.make(
             ContextLane.REQUEST_TAIL, "user", "x" * 4096,
             context_kind="current_user_input",
         ),
-        ContextFrame.make(
-            ContextLane.REQUEST_TAIL, "system", "state", context_kind="runtime_state",
-        ),
+        _runtime_state_frame({"runtime": {}, "speech": {"state": "empty"}}),
     ])
 
     fitted, changes = episode._fit_context(messages, [])
 
-    current = json.loads(fitted[-3]["content"])
+    current = _current_input(fitted)
     assert changes["truncated_current_input"] is True
     assert current["content"].startswith("…[truncated]")
     assert len(current["content"]) <= 1024
+    assert fitted[-3]["context_kind"] == VOICE_REQUEST_CONTEXT_TYPE
+    assert fitted[-2]["content"] == SPEECH_QUEUE_TASK
     assert fitted[-1]["content"] == FINAL_OUTPUT_CONSTRAINT
 
 
@@ -357,13 +477,12 @@ def test_context_guards_reject_history_rewrite_and_static_drift():
         return None
 
     episode = AgentEpisodeRuntime(None, Registry(), object(), emit,
-                                  conversation=ConversationRuntime(), ledger=SessionLedger())
+                                  conversation=ConversationRuntime(), ledger=SessionLedger(),
+                                  reasoning_mode="fast")
     initial = consolidate_request_tail([
         ContextFrame.make(ContextLane.STATIC_INSTRUCTIONS, "system", "rules"),
         ContextFrame.make(ContextLane.HISTORY, "user", "one"),
-        ContextFrame.make(
-            ContextLane.REQUEST_TAIL, "system", "tail", context_kind="runtime_state",
-        ),
+        _runtime_state_frame({"runtime": {}, "speech": {"state": "empty"}}),
     ])
     episode._guard_context_contract(initial)
     extended = initial[:2] + [ContextFrame.make(ContextLane.HISTORY, "assistant", "heard")] + initial[2:]
@@ -394,7 +513,7 @@ def test_late_refinement_does_not_rewrite_cached_history_prefix():
     projector = LLMContextProjector()
     episode = AgentEpisodeRuntime(
         None, Registry(), object(), emit,
-        conversation=ConversationRuntime(), ledger=ledger,
+        conversation=ConversationRuntime(), ledger=ledger, reasoning_mode="fast",
     )
     before_current = CurrentInput(
         text="初始转录", primary_transcript="初始转录",
@@ -447,8 +566,8 @@ def test_late_refinement_does_not_rewrite_cached_history_prefix():
         '<voice_delivery status="full">已经完整播出的回答</voice_delivery>'
     )
     assert '"refinement":"晚到精修转录"' not in after_history[0]["content"]
-    packet = json.loads(after[-2]["content"])
-    runtime_content = packet["entries"][0]["content"]
+    packet = _request_packet(after)
+    runtime_content = json.dumps(packet["runtime"], ensure_ascii=False, separators=(",", ":"))
     assert '"kind":"refinement"' in runtime_content
     assert '"text":"晚到精修转录"' in runtime_content
     assert '"triggered_by":["refinement"]' in runtime_content
@@ -466,3 +585,44 @@ def test_late_refinement_does_not_rewrite_cached_history_prefix():
         turn_id="turn-a", transcript_updates=after_current.transcript_updates,
     ))
     assert '"audio_cues"' not in json.dumps(later, ensure_ascii=False)
+
+
+def test_context_fit_preserves_oversized_locked_and_editable_snapshot_atomically():
+    locked = ("不可更改的锁定正文。" * 900) + "尚未结束，"
+    editable = ("仍然有效的旧尾巴；" * 800) + "最后一句。"
+    text = locked + editable
+    output = SimpleNamespace(speak_snapshot={
+        "queue_status": "speaking",
+        "conversation_id": "conversation",
+        "turn_id": "turn-a",
+        "text": text,
+        "sent_chars": len(locked),
+        "rewritable": True,
+        "_model_text_parts_valid": True,
+        "_model_text_parts": {
+            "committed_prefix": locked[:len(locked) // 3],
+            "current_clause": locked[len(locked) // 3:2 * len(locked) // 3],
+            "prefetched_clause": locked[2 * len(locked) // 3:],
+            "revisable_tail": editable,
+        },
+    })
+    conversation = ConversationRuntime()
+    conversation.begin_turn("turn-a")
+    episode = AgentEpisodeRuntime(
+        None, object(), output, lambda *_args: None,
+        options=AgentOptions(max_context_tokens=128), conversation=conversation,
+        ledger=SessionLedger(), reasoning_mode="fast",
+    )
+    episode.episode_id = "conversation"
+    episode.last_turn_id = "turn-a"
+    episode.inputs["turn-a"] = {"text": "请保留上下文", "final": False}
+    messages = episode.messages({"USER_SEGMENT_UPDATED"}, current_turn_id="turn-a")
+
+    fitted, changes = episode._fit_context(messages, [])
+
+    packet = _request_packet(fitted)
+    assert changes["over_budget_base"] is True
+    assert changes["truncated_current_input"] is False
+    assert packet["speech"]["locked_text"] == locked
+    assert packet["speech"]["editable_text"] == editable
+    assert packet["speech"]["locked_text"] + packet["speech"]["editable_text"] == text

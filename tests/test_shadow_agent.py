@@ -307,6 +307,7 @@ def test_main_action_passes_only_wake_and_projects_current_dispatch_input():
         runtime = AgentEpisodeRuntime(
             None, Registry(), SimpleNamespace(status="IDLE"), emit,
             conversation=ConversationRuntime(), ledger=ledger, shadow_waker=wake,
+            reasoning_mode="fast",
         )
         runtime.inputs["u1"] = {"text": "当前仍在说的查询原文", "final": False}
         envelope = DecisionEnvelope(

@@ -32,6 +32,14 @@ from voice_terminal.session.ledger import SessionLedger
 from voice_terminal.session.runtime import ConversationRuntime
 
 
+def request_snapshot(messages):
+    """读取 voice_request_context（请求快照，第2版原生 JSON）。"""
+    return json.loads(next(
+        item["content"] for item in messages
+        if item.get("context_kind") == "voice_request_context"
+    ))
+
+
 def test_json_mode_and_low_thinking_payload_are_explicit():
     client = DeepSeekClient(base_url="https://example.invalid", model="deepseek-v4-flash", api_key="key", thinking="enabled")
     payload = client._request_payload([{"role": "user", "content": "你好"}])
@@ -224,8 +232,10 @@ def test_model_context_keeps_speech_semantics_but_drops_scheduler_diagnostics():
 
     messages = runtime.messages({"USER_SEGMENT_UPDATED"})
     rendered = "\n".join(message["content"] for message in messages)
-    assert "当前轮运行状态" in rendered
-    assert "已经播出的开头" in rendered and "已经播出" in rendered
+    packet = request_snapshot(messages)
+    assert packet["speech"]["state"] == "speaking"
+    assert packet["speech"]["locked_text"] == "已经播出的开头"
+    assert "已经播出" in rendered
     assert "local_speech_id" not in rendered
     assert "output_generation" not in rendered
     assert "internal_uuid" not in rendered
@@ -794,13 +804,14 @@ def test_refinement_is_supplemental_and_never_changes_cancellation_scope():
     assert conversation.scope_id == scope and wakes[-1] == "USER_INPUT_REFINED"
     assert runtime.inputs["turn_a"]["transcript_updates"][-1]["audio_cues"][0]["emotion"] == "HAPPY"
     context = runtime.messages({"USER_INPUT_REFINED"}, current_turn_id="turn_a")
-    packet = json.loads(context[-2]["content"])
-    current_tail = next(item["content"] for item in packet["entries"] if item["kind"] == "runtime_state")
-    assert '"emotion":"HAPPY"' in current_tail and '"events":["BGM"]' in current_tail
+    packet = request_snapshot(context)
+    current_update = packet["runtime"]["transcript_updates"]["available"][-1]
+    assert current_update["audio_cues"] == [{
+        "start_ms": 0, "end_ms": 800, "emotion": "HAPPY", "events": ["BGM"],
+    }]
     later = runtime.messages(set(), current_turn_id="turn_a")
-    later_packet = json.loads(later[-2]["content"])
-    later_tail = next(item["content"] for item in later_packet["entries"] if item["kind"] == "runtime_state")
-    assert '"audio_cues"' not in later_tail
+    later_updates = request_snapshot(later)["runtime"]["transcript_updates"]["available"]
+    assert all("audio_cues" not in update for update in later_updates)
 
 
 def test_late_refinement_keeps_newest_turn_current_but_targets_original_turn_for_dispatch():
@@ -924,8 +935,10 @@ def test_changed_asr_final_keeps_full_text_without_local_relation_classification
         assert current["transcript_updates"][0]["streamed_text"] == "帮我查明天"
         assert wakes == ["USER_INPUT_FINALIZED"]
         messages = runtime.messages({"USER_INPUT_FINALIZED"})
-        packet = json.loads(messages[-2]["content"])
-        rendered = "\n".join(entry["content"] for entry in packet["entries"])
+        packet = request_snapshot(messages)
+        rendered = json.dumps(packet, ensure_ascii=False) + "\n" + "\n".join(
+            message["content"] for message in messages
+        )
         assert '"triggered_by":["asr_final"]' in rendered
         assert "帮我查明天上海天气" in rendered
 
@@ -1706,14 +1719,12 @@ def test_streamed_cross_turn_completed_prefix_is_stripped_before_tts():
         assert assistant_history == [
             '<voice_delivery status="full">能听到，你说吧，我在。</voice_delivery>'
         ]
-        packet = next(json.loads(item["content"]) for item in context
-                      if item.get("context_kind") == "voice_request_context")
-        runtime_tail = next(entry["content"] for entry in packet["entries"]
-                            if entry["kind"] == "runtime_state")
-        assert '"state":"empty"' in runtime_tail
-        assert '"continuation_mode":"none"' in runtime_tail
-        assert "target_text" not in runtime_tail
-        assert "observed_text" not in runtime_tail
+        packet = request_snapshot(context)
+        speech_context = json.dumps(packet["speech"], ensure_ascii=False)
+        assert packet["speech"]["state"] == "empty"
+        assert packet["speech"]["continuation_mode"] == "none"
+        assert "target_text" not in speech_context
+        assert "observed_text" not in speech_context
 
     asyncio.run(scenario())
 

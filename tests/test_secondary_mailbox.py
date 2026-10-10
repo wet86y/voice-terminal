@@ -35,13 +35,21 @@ class CapturingProvider(_BlockingProvider):
 
 
 def tail_entries(messages):
-    packet = json.loads(messages[-2]["content"])
-    return {entry["kind"]: entry["content"] for entry in packet["entries"]}
+    """读取独立动态帧；context_kind（上下文类型）保留原始来源。"""
+    return {
+        item["context_kind"]: item["content"]
+        for item in messages
+        if item.get("context_lane") == "request_tail" and item.get("context_kind")
+    }
+
+
+def request_snapshot(messages):
+    """读取 voice_request_context（请求快照）的版本2原生 JSON。"""
+    return json.loads(tail_entries(messages)["voice_request_context"])
 
 
 def shadow_state(messages):
-    content = tail_entries(messages)["runtime_state"].split("\n工具可用性：")[0]
-    return json.loads(content.removeprefix("当前轮运行状态："))["shadow"]
+    return request_snapshot(messages)["shadow"]
 
 
 async def wait_for_calls(provider, count):

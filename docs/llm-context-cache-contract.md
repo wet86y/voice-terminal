@@ -50,11 +50,13 @@ assistant 历史只记录播放结算后的传达事实，不记录尚未发送�
 
 主 Agent 请求顺序固定为：
 
-1. 静态 instructions；
-2. 追加 HISTORY；
-3. 可选 `current_user_input`；
-4. 恰好一个 `voice_request_context`；
-5. 恰好一条最终 JSON 输出约束，并位于整个请求末尾。
+1. 静态 `instructions`（指令），包含唯一一份固定语音队列规则；
+2. 追加 `HISTORY`（完整历史上下文）；
+3. 可选 `current_user_input`（当前未提交用户输入）；
+4. 独立的恢复反馈、推理模式、会话背景及调度场景消息，保留原正文和来源；
+5. 恰好一个 `voice_request_context`（当前快照，第2版）；
+6. `speech_queue_task`（本次决策任务），明确按快照判断并从锁定边界续写；
+7. 恰好一条最终 JSON（结构化输出）约束，位于整个请求末尾。
 
 当前输入：
 
@@ -62,37 +64,36 @@ assistant 历史只记录播放结算后的传达事实，不记录尚未发送�
 {"type":"current_user_input","version":1,"content":"原始完整文本"}
 ```
 
-运行时状态、恢复反馈、待处理工具和强制调度提示统一进入 `voice_request_context.entries`，不得在最终输出约束之后追加消息。深度模式提示使用 `kind=reasoning_mode`（条目类型为本次推理模式提示），与本次请求冻结的接口推理强度一致；快速和唤醒确认请求不携带该提示。原始 content 不能被摘要或重新解释；只有请求副本的超限处理可以截取，语义 ledger 不变。
+第2版将状态直接放入原生 JSON（结构化数据），不再使用 `entries.content`（条目正文字符串）嵌套另一层 JSON。`runtime`（本轮运行信息）、`speech`（当前语音事务）、`shadow`（后台状态）与 `tool_availability`（工具可用性）相互独立。恢复反馈和强制调度提示保持单独的动态系统消息，不得在最终输出约束之后追加消息。深度模式提示使用内部 `context_kind=reasoning_mode`（上下文类型为本次推理模式），与冻结的接口强度一致；快速和唤醒确认请求不携带该提示。
 
-### 活动 Speak 四段投影
+原始正文不能被摘要或重新解释。预算处理仅可截短过长的当前未提交输入；完整历史、当前锁定文本、可改尾巴和必要状态作为整体保留。固定字段说明不随可选动态字段的出现而改变，模式切换也只改变请求尾部。修改固定指令后的首批请求需建立新的缓存前缀；后续请求仍可复用稳定指令与追加历史，实际命中率以服务端用量为准。
+
+### 当前语音事务投影
 
 ```json
 {
-  "runtime": {
-    "speak": {
-      "state": "speaking",
-      "owner_scope": "current_turn",
-      "continuation_mode": "rewrite_tail",
-      "text_parts": {
-        "committed_prefix": "已经发送且离开活动窗口的前缀",
-        "current_clause": "当前短句",
-        "prefetched_clause": "最多一个预取短句",
-        "revisable_tail": "仍在本地、尚未发送的尾巴"
-      }
-    }
+  "type": "voice_request_context",
+  "version": 2,
+  "runtime": {"input_status": "finalized"},
+  "speech": {
+    "state": "speaking",
+    "owner_scope": "current_turn",
+    "continuation_mode": "rewrite_tail",
+    "locked_text": "会议地点是会议室甲，",
+    "editable_text": "三点开始，记得带上笔记本。"
   }
 }
 ```
 
 规则：
 
-- 非 `empty` 状态必须包含四个 `text_parts` 键，空内容使用 `""`，不能使用 `null` 或随机省略；
-- `committed_prefix`、`current_clause`、`prefetched_clause` 都已经锁定；只有 `revisable_tail` 可重写；
-- 输出空闲后创建的同轮新播报成为队头时，`committed_prefix`（已提交前缀）必须包含本轮此前已交付的前沿，不得比上一次请求更短；
+- 活动状态必须提供 `locked_text`（完整锁定文本）和 `editable_text`（完整可改文本），空段用 `""`（空字符串）；
+- 锁定文本由本地 `committed_prefix`（已提交前缀）、`current_clause`（当前短句）与 `prefetched_clause`（预取短句）按原顺序拼接；可改文本来自 `revisable_tail`（未提交尾巴）。这些内部段名不再发送给模型；
+- 同轮事务换头时，本地仍保留此前已交付前沿，模型投影不能丢失这段锁定内容；
 - `owner_scope` 取 `current_turn`、`previous_turn` 或 `none`，只表达所有权；
 - `continuation_mode`（尾巴修订权限）取 `rewrite_tail`（允许尾巴修订）或 `none`（禁止尾巴修订），表达修改权限；
 - `delivery.heard_text` 是独立的传达事实，不等于 TTS 已发送或播放器已播放；
-- `delivery` 只在队列为空（`state=empty`）时出现，只含 `heard_text`、`status`、`termination`；队列非空时不出现，避免与 `text_parts` 争夺"说到哪"的解释权；
+- `delivery`（传达事实）只在队列为空（`state=empty`，输出空闲）时出现，只含 `heard_text`（已听文本）、`status`（传达状态）、`termination`（终止原因）；活动队列的锁定文本不能被当作确认已听；
 - `sent_chars`、`played_ms`、PCM 边界、provider session、TTS 状态、speech ID 和 generation 永远留在执行层。
 
 ### 决策状态
@@ -100,7 +101,7 @@ assistant 历史只记录播放结算后的传达事实，不记录尚未发送�
 `speak.state` 取 `speak`、`revision`、`cancel`、`wait`：
 
 - `speak`（新播报）：`text`（播报文本）是完整文本，仅输出空闲时新建事务，并保留已交付前缀的去重保护；忙碌时拒绝，不追加、不替换、不延迟重放；
-- `revision`（尾巴修订）：`text`（新尾巴文本）只承载新的尾巴，仅在 `continuation_mode=rewrite_tail`（允许尾巴修订）时可用；本地把锁定前缀与新尾巴拼成完整文本，模型不再复述前缀；
+- `revision`（尾巴修订）：`speak.text`（新尾巴文本）承载完整替换尾巴，仅在 `continuation_mode=rewrite_tail`（允许尾巴修订）且有实质纠错或必要补充理由时可用；直接续接锁定边界，包括边界落在句中的情况，保留原尾巴仍有效的后续要点，不能重新作答或复述锁定内容；
 - `cancel`：`text` 为空表示只停止，非空表示停止并替换；
 - `wait`：`text` 必须为空。
 
@@ -123,7 +124,7 @@ Shadow thinking+tools 的合法 `reasoning`、`function_call`、`function_call_o
 | 已完成 speech 的传达事实 | Speech/ledger | HISTORY | 是 | delivery/order |
 | `transcript_updates.available.audio_cues`（可用精修更新中的情绪与声学事件线索） | LLMContextProjector（LLM 上下文投影器） | 仅由 USER_INPUT_REFINED（用户输入精修完成事件）触发的 REQUEST_TAIL（请求尾部） | 否 | 字段筛选/单次发送/缓存前缀 |
 | 当前未提交输入 | Context projector | REQUEST_TAIL | 否 | wrapper/order |
-| 活动 speak（语音事务）四段 | Speech runtime（语音运行时） | REQUEST_TAIL（请求尾部） | 否 | 创建／修订／取消替换 |
+| `speech.locked_text/editable_text`（语音锁定文本与可改文本） | Speech runtime（语音运行时） | REQUEST_TAIL（请求尾部） | 否 | 无损投影／原子保留／创建／修订／取消替换 |
 | 最近一次传达前沿 `delivery`（仅 `state=empty`） | Speech runtime | REQUEST_TAIL | 否 | delivery/order |
 | revision（尾巴修订）拒绝的轻度反馈 | Agent runtime | REQUEST_TAIL | 否 | placement/final-position |
 | 时间、工具可用性、恢复反馈 | Runtime | REQUEST_TAIL | 否 | placement/final-position |
@@ -140,6 +141,8 @@ Shadow thinking+tools 的合法 `reasoning`、`function_call`、`function_call_o
 - 静态 instructions、schema/action catalog 的 canonical digest 在同一 session 内不得变化；新的 HISTORY 必须以前一次 HISTORY 为前缀。
 
 ## 验证
+
+诊断闭环使用本地 `episode_id`（会话阶段标识）、`request_id`（模型请求标识）、`turn_id`（用户轮次标识）和 `speech_id`（播报标识）关联，不将这些标识发给模型。`agent.speak_context`（请求语音状态日志）记录锁定和可改长度；`agent.speech_revision`（修订结果日志）记录 `context_locked_chars`（请求锁定长度）、`apply_locked_chars`（应用时锁定长度）和 `new_tail_chars`（提议尾巴长度）。`episode.speech_final`（最终播报结算日志）记录 `text_chars`（全文长度）、`heard_chars`（确认已听长度）、`uncertain_chars`（不确定长度）和 `unheard_chars`（确认未听长度），同时记录传达状态、终止原因与精度。这些长度按 Unicode（统一字符编码）码点计数；不确定部分不能解释为未听，日志不包含语音正文。
 
 单元测试：
 

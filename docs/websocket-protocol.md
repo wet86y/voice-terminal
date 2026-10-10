@@ -40,13 +40,13 @@ ws://127.0.0.1:8765/ws
 | `session.start` | 对象，可为空 | 启动输入作用域；KWS 开启时先进入 KWS standby。 |
 | `session.stop` | 对象，可为空 | 停止新的麦克风输入，不自动取消已经进入 Agent/TTS 队列的输出。 |
 | `session.reset` | 对象，可为空 | 清理当前会话临时状态、Shadow trace、TTS 事务和 conversation epoch。 |
-| `session.reasoning_mode`（设置运行模式） | `{"mode":"fast\|deep"}`，`mode`（运行模式） | 修改后续主 Agent（主代理）请求模式：`fast`（快速）或 `deep`（深度），默认快速。暂停后切换并恢复无需重置会话；已经派发的请求保留原推理强度。 |
+| `session.reasoning_mode`（设置运行模式） | `{"mode":"fast\|deep"}`，`mode`（运行模式） | 修改后续主 Agent（主代理）请求模式：`fast`（快速，关闭思考）或 `deep`（深度，低强度思考），默认深度。用户仍可选择快速；暂停后切换并恢复无需重置会话，已经派发的请求保留原推理强度。 |
 
 未知命令返回结构化错误，不应关闭主 session。
 
 已归档的 `balanced`（均衡）及其他非法模式返回 `INVALID_REASONING_MODE`（运行模式无效），保持当前模式和连接。
 
-上述双模式契约对应当前源码，正式目录更新待与其他修订合并处理；本轮回归和构建证据见[双模式源码验收](desktop-acceptance.md)。
+上述双模式契约对应当前源码和正式程序；本轮上下文回归与开发程序、分发安装器构建记录见[尾巴修订上下文接入记录](llm-tail-context-rollout-20261010.md)，当前产品构建编号和交付摘要见[正式程序与分发安装器交付记录](current-release.md)。
 
 ## 错误格式
 

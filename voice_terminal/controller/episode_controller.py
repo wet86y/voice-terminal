@@ -137,7 +137,7 @@ class EpisodeController(RealtimeController):
                 self._early_silence_task = None
 
     def _make_episode(self):
-        mode = getattr(self, "reasoning_mode", "fast")
+        mode = getattr(self, "reasoning_mode", "deep")
         runtime = AgentEpisodeRuntime(self.llm, self.registry, self.output, self._agent_event,
                                       conversation=self.conversation, ledger=self.history,
                                       options=self.agent_options, tools_enabled=True,
@@ -412,6 +412,9 @@ class EpisodeController(RealtimeController):
                 speech_id=speech_id,
                 added=added,
                 history_present=self.history.has_speech(speech_id),
+                delivery_status=delivery.status, termination=delivery.termination, precision=delivery.precision,
+                text_chars=len(str(payload.get("text") or "")), heard_chars=len(delivery.heard_text),
+                uncertain_chars=len(delivery.uncertain_text), unheard_chars=len(delivery.unheard_text),
             )
             logger.info(
                 "speech.history_committed speech_id=%s turn_id=%s added=%s history_present=%s",

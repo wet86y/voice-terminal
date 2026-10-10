@@ -191,7 +191,7 @@ class LlmConfig:
     model: str = "deepseek-flash"
     api_key_env: str = "DEEPSEEK_API_KEY"
     stream: bool = True
-    reasoning_mode: str = "fast"  # reasoning_mode（运行模式）：默认快速，仅支持快速和深度。
+    reasoning_mode: str = "deep"  # reasoning_mode（运行模式）：默认深度，仍可切换快速。
     thinking: str = "enabled"
     reasoning_effort: str = "low"
     # Direct programmatic construction keeps the provider-compatible full
@@ -905,7 +905,7 @@ class AppConfig:
                 model=llm_model,
                 api_key_env=llm_api_key_env,
                 stream=_bool(llm.get("stream"), True),
-                reasoning_mode=_string(llm.get("reasoning_mode"), "fast"),
+                reasoning_mode=_string(llm.get("reasoning_mode"), "deep"),
                 thinking=_string(llm.get("thinking"), "enabled"),
                 reasoning_effort=_string(llm.get("reasoning_effort"), "low"),
                 allowed_reasoning=_reasoning_levels(

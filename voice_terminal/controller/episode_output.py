@@ -1080,10 +1080,15 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
             }
             self.record_delivery(record)
             logger.info(
-                "episode.speech_final speech_id=%s conversation_id=%s request_id=%s turn_id=%s status=%s delivery=%s tts_text_sent=%s tts_audio_bytes=%s playback_started=%s",
+                "episode.speech_final speech_id=%s conversation_id=%s request_id=%s turn_id=%s "
+                "status=%s delivery=%s tts_text_sent=%s tts_audio_bytes=%s playback_started=%s "
+                "text_chars=%s heard_chars=%s uncertain_chars=%s unheard_chars=%s termination=%s precision=%s",
                 h.speech_id, h.identity[0], h.identity[1], h.turn_id,
                 record["status"], delivery.get("status"), timings.get("tts_text_sent"),
                 timings.get("tts_audio_bytes"), h.workspace.playback_started,
+                len(h.text), len(str(delivery.get("heard_text") or "")),
+                len(str(delivery.get("uncertain_text") or "")), len(str(delivery.get("unheard_text") or "")),
+                delivery.get("termination"), delivery.get("precision"),
             )
             self._settling_speech_ids.add(h.speech_id)
             logger.info(
