@@ -233,30 +233,73 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
 pub fn startup_readiness(context:&LaunchContext)->Result<Value,String>{
     startup_readiness_with_progress(context,&AtomicBool::new(false),&mut|_,_,_|{})
 }
-/// startup_readiness_with_progress（启动校验进度）：每次启动完整复核，文件集合和摘要不以缓存代替。
+/// startup_readiness_with_progress（启动校验进度）：语音环境核对清单和大小，其余已安装组件完整摘要复核。
 pub fn startup_readiness_with_progress(context:&LaunchContext,cancel:&AtomicBool,progress:&mut Progress)->Result<Value,String>{
-    check_cancel(cancel)?;progress("盘点必需组件及版本",0,0);
+    check_cancel(cancel)?;progress("正在校验：Voice Server（语音服务）",0,0);
     let mut rows=inventory(context)?;
     check_cancel(cancel)?;
     // 已有缺失、待更新或依赖未就绪时直接进入管理页，不反复读取不能运行的旧组件。
-    // 全部组件满足当前清单后，启动和服务恢复仍执行完整 SHA-256（文件摘要）复核。
+    // 语音环境启动时快速核对文件集合和大小；模型与代理组件仍逐文件复核 SHA-256（文件摘要）。
     if rows.iter().any(|row|row["can_start"]!=true){return Ok(readiness_from_inventory(&rows));}
     validate_inventory_hashes(context,&mut rows,cancel,progress)?;
     Ok(readiness_from_inventory(&rows))
 }
 fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
     let environment=context.install.join("runtimes/python");
-    let result=crate::workspace::verify_tree_with_progress(&environment,"manifest.json",cancel,&mut|phase,done,total|progress(&format!("校验 Voice Server（语音服务）：{phase}"),done,total));
-    check_cancel(cancel)?;
-    if let Err(error)=result{if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);server["installation_state"]=json!("incomplete");server["error"]=json!(format!("语音环境完整摘要复核失败：{error}"));}}
-    for row in rows.iter_mut().skip(1){
-        check_cancel(cancel)?;
+    let runtime_budget:Result<(u64,u64),String>=(||{
+        let manifest=load(&environment.join("manifest.json"))?;
+        let records=manifest["files"].as_array().ok_or("组件清单缺少文件集合")?;
+        let total=records.iter().try_fold(0u64,|sum,file|sum.checked_add(file["size"].as_u64().ok_or("清单大小无效")?).ok_or("清单大小溢出"))?;
+        Ok((total,records.len() as u64))
+    })();
+    let (runtime_total,runtime_files)=match runtime_budget{
+        Ok(value)=>value,
+        Err(error)=>{if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);server["installation_state"]=json!("incomplete");server["error"]=json!(format!("语音环境文件清单无效：{error}"));}return Ok(());}
+    };
+
+    let mut plans=Vec::new();
+    for index in 1..rows.len(){
+        let row=&rows[index];
         if row["files_installed"]!=true{continue;}
         let Some(id)=row["resource_id"].as_str()else{continue;};
-        let result=(||{
+        let label=row["label"].as_str().unwrap_or(id).to_owned();
+        let budget:Result<u64,String>=(||{
             let item=spec(context,id)?;let root=destination(context,&item)?;
-            let label=row["label"].as_str().unwrap_or(id);
-            let mut report=|phase:&str,done,total|progress(&format!("校验 {label}：{phase}"),done,total);
+            let records=if item["kind"]=="model"{
+                inspect_installed_model(context,&item,false)?.files.into_iter()
+                    .filter(|file|file["optional"]!=true||root.join(file["path"].as_str().unwrap_or("")).is_file())
+                    .collect::<Vec<_>>()
+            }else{
+                load(&root.join("manifest.json"))?["files"].as_array().ok_or("组件清单缺少文件集合")?.clone()
+            };
+            Ok(records.iter().try_fold(0u64,|sum,file|sum.checked_add(file["size"].as_u64().ok_or("清单大小无效")?).ok_or("清单大小溢出"))?)
+        })();
+        match budget{
+            Ok(total)=>plans.push((index,id.to_owned(),label,total)),
+            Err(error)=>{
+                let row=&mut rows[index];row["files_installed"]=json!(false);row["installation_state"]=json!("incomplete");row["can_start"]=json!(false);
+                row["error"]=json!(format!("无法准备组件摘要复核：{error}"));
+            }
+        }
+    }
+    let total=plans.iter().try_fold(runtime_total,|sum,(_,_,_,size)|sum.checked_add(*size).ok_or("组件校验总大小溢出"))?;
+    let result=crate::workspace::verify_tree_sizes_with_progress(&environment,"manifest.json",cancel,&mut|_,done,files|{
+        let checked=if runtime_files==0||files==0{0}else{((runtime_total as u128)*(done as u128)/(files as u128)) as u64};
+        progress("正在校验：Voice Server（语音服务）",checked.min(runtime_total),total);
+    });
+    check_cancel(cancel)?;
+    if let Err(error)=result{
+        if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);server["installation_state"]=json!("incomplete");server["error"]=json!(format!("语音环境文件清单或大小校验失败：{error}"));}
+        return Ok(());
+    }
+    if runtime_total>0{progress("正在校验：Voice Server（语音服务）",runtime_total,total);}
+    let mut completed=runtime_total;
+    for (index,id,label,component_total) in plans{
+        check_cancel(cancel)?;
+        progress(&format!("正在校验：{label}"),completed,total);
+        let result=(||{
+            let item=spec(context,&id)?;let root=destination(context,&item)?;
+            let mut report=|_:&str,done:u64,_:u64|progress(&format!("正在校验：{label}"),completed.saturating_add(done.min(component_total)).min(total),total);
             if item["kind"]=="model"{
                 let installed=inspect_installed_model(context,&item,false)?;
                 let files=installed.files.into_iter().filter(|file|file["optional"]!=true||root.join(file["path"].as_str().unwrap()).is_file()).collect::<Vec<_>>();
@@ -265,10 +308,12 @@ fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&At
         })();
         check_cancel(cancel)?;
         if let Err(error)=result{
-            row["files_installed"]=json!(false);row["installation_state"]=json!("incomplete");row["can_start"]=json!(false);
+            let row=&mut rows[index];row["files_installed"]=json!(false);row["installation_state"]=json!("incomplete");row["can_start"]=json!(false);
             row["error"]=json!(format!("已安装组件完整摘要复核失败：{error}"));
         }
+        completed=completed.saturating_add(component_total).min(total);
     }
+    if total>0{progress("组件校验完成",total,total);}
     if rows.iter().skip(1).any(|row|row["can_start"]!=true){
         if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);server["error"]=json!("有组件文件损坏、尚未就绪或需要更新，请完成修复后再启动。");}
     }
@@ -774,18 +819,21 @@ mod download_tests {
     }
 
     #[test]
-    fn startup_rechecks_runtime_hash_and_cancellation_preserves_components(){
+    fn startup_quickly_checks_runtime_inventory_and_cancellation_preserves_components(){
         let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();let root=owner.join(format!("voice-startup-完整校验-{}",crate::workspace::new_id()));
         crate::workspace::initialize(&root).unwrap();fs::create_dir_all(root.join("app/config/resources")).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();
         fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();fs::write(root.join("app/scripts/backend-entry.py"),b"# not executed").unwrap();
         atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[]})).unwrap();ready_test_runtime(&root);let context=LaunchContext::portable(&root).unwrap();
         assert_eq!(startup_readiness(&context).unwrap()["ready"],true);let before=file_hash(&root.join("runtimes/python/manifest.json")).unwrap();
         let cancel=AtomicBool::new(false);let caller=std::thread::current().id();
-        let result=startup_readiness_with_progress(&context,&cancel,&mut|phase,_,_|{assert_eq!(std::thread::current().id(),caller);if phase.contains("校验组件文件内容"){cancel.store(true,Ordering::Release);}});
+        let mut component_reports=0;let result=startup_readiness_with_progress(&context,&cancel,&mut|phase,_,_|{assert_eq!(std::thread::current().id(),caller);if phase=="正在校验：Voice Server（语音服务）"{component_reports+=1;if component_reports==2{cancel.store(true,Ordering::Release);}}});
         assert!(result.unwrap_err().contains("取消"));assert_eq!(file_hash(&root.join("runtimes/python/manifest.json")).unwrap(),before);
         fs::write(root.join("runtimes/python/python.exe"),b"same-length!").unwrap();
         assert_eq!(inventory(&context).unwrap()[0]["can_start"],true);let readiness=startup_readiness(&context).unwrap();
-        assert_eq!(readiness["ready"],false);assert!(readiness["missing"][0]["reason"].as_str().unwrap().contains("摘要"));crate::workspace::remove_owned(&root,&owner).unwrap();
+        assert_eq!(readiness["ready"],true);
+        fs::write(root.join("runtimes/python/python.exe"),b"different-size").unwrap();
+        let readiness=startup_readiness(&context).unwrap();
+        assert_eq!(readiness["ready"],false);assert!(readiness["missing"][0]["reason"].as_str().unwrap().contains("文件清单或大小"));crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 
     #[test]

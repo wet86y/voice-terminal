@@ -884,10 +884,17 @@ pub fn verify_records_with_progress(root:&Path,records:&[Value],exact:bool,cance
     hash_validation_files(&files,cancel,progress).map(|_|())
 }
 
-/// verify_tree_sizes（快速盘点）：只读取文件集合、路径和字节数，正式启动仍需完整摘要复核。
+/// verify_tree_sizes（快速盘点）：检查文件集合、路径和字节数，不读取文件内容。
 pub fn verify_tree_sizes(root:&Path,manifest_name:&str)->Result<(),String>{
+    verify_tree_sizes_with_progress(root,manifest_name,&AtomicBool::new(false),&mut|_,_,_|{})
+}
+/// verify_tree_sizes_with_progress（快速组件盘点）：检查文件集合与大小，不读取文件内容。
+pub fn verify_tree_sizes_with_progress(root:&Path,manifest_name:&str,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
+    validation_cancel(cancel)?;
+    if metadata_reparse(&fs::symlink_metadata(root).map_err(|e|e.to_string())?){return Err("组件目录不能是链接。".into());}
+    progress("核对组件文件清单",0,0);validation_cancel(cancel)?;
     let value=load(&safe_path(root,manifest_name)?)?;
-    prepare_validation_files(root,value["files"].as_array().ok_or("组件清单缺少文件集合")?,true,&AtomicBool::new(false),&mut|_,_,_|{}).map(|_|())
+    prepare_validation_files(root,value["files"].as_array().ok_or("组件清单缺少文件集合")?,true,cancel,progress).map(|_|())
 }
 
 fn prepare_validation_files(root:&Path,records:&[Value],exact:bool,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<Vec<ValidationFile>,String>{
