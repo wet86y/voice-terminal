@@ -569,7 +569,7 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
         *state.initialization.lock().unwrap()=serde_json::json!({"phase":"正在校验本地组件","can_cancel":true});
         let readiness=voice_desktop_common::resources::startup_readiness_with_progress(&context,&state.initialization_cancel,&mut|phase,done,total|{
             *state.initialization.lock().unwrap()=serde_json::json!({"phase":phase,"completed_bytes":done,"total_bytes":total,"can_cancel":true,
-                "fields":{"phase":"启动组件校验阶段","completed_bytes":"当前阶段已核验字节","total_bytes":"当前阶段总字节","can_cancel":"是否可取消校验"}});
+                "fields":{"phase":"启动组件校验阶段","completed_bytes":"全组件累计进度量（语音环境按文件数折算）","total_bytes":"全组件清单字节权重总量","can_cancel":"是否可取消校验"}});
         });
         if state.initialization_cancel.load(Ordering::Acquire){
             *state.initialization.lock().unwrap()=serde_json::json!({"phase":"启动校验已取消，可以重新启动","can_cancel":false});
