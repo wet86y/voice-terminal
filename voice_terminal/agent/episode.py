@@ -1178,7 +1178,9 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             ),
             "SPEAK_ENVELOPE_INVALID": (
                 "上一次输出未通过语音信封校验。只输出完整 JSON，顶层只能有 speak 和 actions。"
-                "state=speak 时 text 必须非空；state=wait 或 cancel 时 text 必须为空字符串。"
+                "state=speak（新播报）或 revision（尾巴修订）时 text（文本）必须非空；"
+                "state=wait（等待）时文本必须为空；state=cancel（取消）的空文本只停止，"
+                "非空文本停止并替换，允许条件仍须遵守本次请求的语音队列决策规则。"
                 "不要输出 JSON 外文本。"
             ),
             "TOOL_PROTOCOL_ERROR": (
@@ -1201,7 +1203,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         elif origin_prompt_kind == "kws_wake":
             scope = "只重新生成原唤醒确认；不要处理历史用户任务。"
         else:
-            scope = "重新处理最后一条用户输入。"
+            scope = "依据最新上下文重新评估本轮用户意图和当前队列，不重播已覆盖的回答；场景及队列规则仍有效。"
         return prefix + instruction + scope
 
     async def _record_emotion_normalizations(self, parser, *, identity, turn_id) -> None:
@@ -1232,7 +1234,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             "baseline_source": str(baseline_source),
             "applied": "ignored_identical_to_delivered",
             "hint": "该内容与已交付语音一致，本地未重播；没有新内容时使用 wait，"
-                    "需要改写尚未播出的尾巴时使用 revision",
+                    "确有实质不符或必要补充且尾巴可改时才使用 revision（尾巴修订），不要为语气润色修改队列。",
         })
 
     def cancel_active_request(self, reason: str = "cancelled") -> None:
@@ -2804,7 +2806,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self.minor_protocol_feedback.append({
             "field": "speak.revision", "applied": "rejected_boundary_changed",
             "reason": reason,
-            "hint": "修订未受理：请求中的尾巴边界已失效或不可修订。核对最新输出状态；硬替换使用带文本的 cancel（取消）。",
+            "hint": "修订未受理：请求中的尾巴边界已失效或不可修订。核对最新输出状态并遵守末尾队列规则；"
+                    "边界变化不构成取消理由，不得为此取消重讲，没有允许的必要变更时 wait（等待）。",
         })
         await self.log("SPEECH_REVISION_REJECTED", identity=identity, turn_id=turn_id,
                        speech_id=speech_id, reason=reason, context_locked_chars=sent_chars,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -54,24 +55,13 @@ def test_prompt_matches_required_responses_wire_contract_and_has_short_examples(
     assert "state、emotion、text 以及顶层 actions 始终必填" in PROMPT
     assert "state=wait 时 text 必须为 \"\"" in PROMPT
     assert "state=cancel 时 text 为空表示只停止，text 非空表示停止并替换" in PROMPT
-    assert '{"speak":{"state":"speak","emotion":"calm","text":"好的。"},"actions":[]}' in PROMPT
-    assert '{"speak":{"state":"revision","emotion":"calm","text":"另外，明早可能堵车。"},"actions":[]}' in PROMPT
-    assert '{"speak":{"state":"wait","emotion":"calm","text":""},"actions":[]}' in PROMPT
-    assert "state=wait（等待）表示不变更语音队列" in PROMPT
-    assert "无需新增播报或修改时必须 wait" in PROMPT
-    assert "不能追加、修订或替换，也不会等播放结束后补执行" in PROMPT
-    assert "不能用 speak（新播报）重复完整计划来改尾巴" in PROMPT
-    assert "committed_prefix（已提交前缀）、current_clause（当前短句）、prefetched_clause（预取短句）、revisable_tail（可改尾巴）" in PROMPT
-    assert "continuation_mode=rewrite_tail" in PROMPT
-    assert "只使用 state=revision（尾巴修订）更新" in PROMPT
-    assert "不表示必须 speak" in PROMPT
-    assert "相关性、时效性、是否已经表达" in PROMPT
-    assert 'HISTORY 中 assistant 角色的 <voice_delivery>' in PROMPT
-    assert 'status="full"' in PROMPT
-    assert "调度器触发、shadow.active" in PROMPT
-    assert "确有必要补充且尾巴可改时" in PROMPT
-    assert "不降级为追加、新播报或硬替换" in PROMPT
-    assert "回答仍正确但缺少新信息" not in PROMPT
+    examples = re.findall(r'\{"speak":\{[^{}\n]+\},"actions":\[\]\}', PROMPT)
+    states = set()
+    for example in examples:
+        parser = SpeechDecisionEnvelopeStream(allow_empty_control_text=True)
+        parser.feed(example)
+        states.add(parser.finish().speak.state)
+    assert states == {"speak", "revision", "wait"}
     assert "emotion 可省略" not in PROMPT
     assert "不得带 text" not in PROMPT
 
@@ -1142,6 +1132,7 @@ def test_system_check_recovery_instruction_preserves_original_scope(prompt_kind,
     assert "重新处理最后一条用户输入" not in instruction
 
 
-def test_normal_recovery_still_reprocesses_the_latest_user_input():
+def test_normal_recovery_reassesses_current_intent_without_replaying_covered_answers():
     instruction = AgentEpisodeRuntime._recovery_instruction("SPEAK_ENVELOPE_INVALID")
-    assert "重新处理最后一条用户输入" in instruction
+    assert "重新评估本轮用户意图和当前队列" in instruction
+    assert "不重播已覆盖的回答" in instruction

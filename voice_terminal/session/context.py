@@ -22,9 +22,11 @@ REQUEST_SYSTEM_CONTEXT_KINDS = frozenset({
     "reasoning_mode",  # reasoning_mode（本次推理模式提示）：与冻结的接口推理强度一致。
     "pending_tools",
     "final_silence",
+    "kws_wake",  # kws_wake（唤醒确认）：保留本次场景类型。
     "secondary_mailbox",  # 二等信箱专用评估提示。
     "secondary_update",  # 本次请求携带的最新进度来源。
     "system_context",
+    "speech_queue_policy",  # speech_queue_policy（语音队列决策核对）：位于请求包末尾。
 })
 FINAL_OUTPUT_CONSTRAINT = (
     "输出约束：最终 output_text 必须且只能是一个符合 voice_decision_v06 的完整 JSON 对象。"
