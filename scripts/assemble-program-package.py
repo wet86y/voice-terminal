@@ -45,7 +45,7 @@ def assemble(desktop: Path, build: str = '') -> Path:
     release = manifest(stage / 'app', kind='app', build=build)
     release.update(display_version=__version__, role='product', required_components=[], optional_components=['python', 'models', 'dsh', 'webview2'], components=[], root_files=roots,
                    compatibility={'desktop_protocol': 1, 'data_format': 1},
-                   fields={'build': '构建编号，产品版本保持原值', 'role': 'product（统一正式程序）', 'display_version': '产品显示版本', 'files': '本体固定文件', 'path': '相对路径', 'size': '字节数', 'sha256': 'SHA-256（文件摘要）', 'components': '工作区可选组件登记', 'root_files': '正式入口及固定支持文件', 'required_components': '进入管理页不需要额外组件', 'optional_components': '正式程序维护的组件', 'compatibility': '接口及数据格式兼容版本'})
+                   fields={'build': '构建编号，产品版本保持原值', 'role': 'product（统一正式程序）', 'display_version': '产品显示版本', 'files': '本体固定文件', 'path': '相对路径', 'size': '字节数', 'sha256': 'SHA-256（文件摘要）', 'components': '外置组件登记；整体语音服务启动时逐项校验', 'root_files': '正式入口及固定支持文件', 'required_components': '管理页启动所需组件，独立于整体语音服务就绪门槛', 'optional_components': '由管理页安装的外置组件；整体语音服务运行必需', 'compatibility': '接口及数据格式兼容版本'})
     atomic_json(stage / 'app/release.json', release)
     verify(stage / 'app', release)
     record = {'schema': 1, 'role': 'product', 'version': __version__, 'build': build,

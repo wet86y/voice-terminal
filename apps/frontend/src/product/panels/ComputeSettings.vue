@@ -40,9 +40,13 @@ function managedResource(resourceId: string): ManagedResourceRow | undefined {
     label: resource.label,
     state: resource.installation_state,
     status: resource.installation_state === 'installed' ? '已安装' : resource.installation_state === 'incomplete' ? '不完整' : '缺失',
+    updateAvailable: resource.update_available === true,
+    installedVersion: resource.installed_version,
+    targetVersion: resource.resource_id === 'voice-server' || resource.resource_id === 'dsh' ? undefined : resource.version,
     error: resource.error || jobs.find(job => job.state === 'failed')?.error || undefined,
     retryable: failed,
-    busy: Boolean(active || props.resourceController?.startingResources.value.has(resourceId)),
+    busy: Boolean(active || props.resourceController?.startingResources.value.has(resourceId)
+      || props.resourceController?.pendingDownloadPlan.value?.resource_id === resourceId),
   }
 }
 function facts(component?: ApplicationComponent) {
@@ -72,19 +76,20 @@ const rows = computed<LocalComponentRow[]>(() => {
     const awaitingStartup = application.snapshot.value?.startup_complete === false && !availableModelServices.has(status?.service ?? '')
     const loading = busy || (!ownerUnavailable && !disabled && (ownerLoading || awaitingStartup || (!owner && !status) || status?.service === 'STARTING'))
     // 模型详情接口尚未开放时，以宿主已通过的工作进程健康检查呈现就绪状态。
-    const available = !loading && !ownerUnavailable && !disabled && (status ? availableModelServices.has(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
+    const updateRequired = managed?.updateAvailable === true
+    const available = !updateRequired && !loading && !ownerUnavailable && !disabled && (status ? availableModelServices.has(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
     const ownerError = ownerUnavailable ? owner?.error || status?.runtime_error || (owner?.state === 'blocked' ? '组件依赖不可用，请检查所属进程。' : owner?.state === 'stopped' ? '组件进程已退出。' : '组件运行异常，请查看日志并重试。') : undefined
     const gpuAvailable = available && !refreshing.value && status?.gpu_available === true
     return {
       id: item.id, name: item.title,
-      state: available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
-      status: loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : ownerUnavailable ? '不可用' : disabled ? '已停用' : !status && available ? '运行中' : serviceLabel(status?.service),
-      available, retryable: !available && !loading && !disabled && Boolean(owner?.retry_allowed), busy: loading,
+      state: updateRequired ? 'failed' : available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
+      status: updateRequired ? '需更新' : loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : ownerUnavailable ? '不可用' : disabled ? '已停用' : !status && available ? '运行中' : serviceLabel(status?.service),
+      available, retryable: !updateRequired && !available && !loading && !disabled && Boolean(owner?.retry_allowed), busy: loading,
       runtime: status?.runtime || '未提供',
       residentMemory: countedHere ? formatComponentMemory(metrics?.memory_rss_bytes ?? legacyResource?.rss_bytes) : undefined,
       privateMemory: countedHere ? formatComponentMemory(metrics?.memory_private_commit_bytes ?? legacyResource?.private_commit_bytes) : undefined,
       vram: countedHere && status?.device?.startsWith('cuda') ? formatComponentMemory(metrics?.gpu_dedicated_bytes ?? legacyResource?.gpu_dedicated_bytes) : undefined,
-      description: loading ? busy && !owner?.retrying ? '正在重新启动组件' : owner?.phase || '等待组件启动' : item.detail, error: !available && !loading && !disabled ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
+      description: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : loading ? busy && !owner?.retrying ? '正在重新启动组件' : owner?.phase || '等待组件启动' : item.detail, error: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : !available && !loading && !disabled ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
       note: countedHere ? '资源来自宿主同次采样，包含该进程及其子进程。' : item.id === 'smart_turn' ? '与 SenseVoice（语音识别与分析）共享进程，资源计入该条目。' : '与 Voice Server（语音服务）共享进程，资源计入语音服务条目。',
       facts: [
         ...(resource?.pid == null ? [] : [{ label: '进程标识', value: String(resource.pid) }]),
@@ -93,14 +98,14 @@ const rows = computed<LocalComponentRow[]>(() => {
       resource: managed,
       device: {
         value: settings.compute.devices[item.id], current: deviceLabel(status?.device),
-        locked: !available || !status || refreshing.value,
+        locked: updateRequired || !available || !status || refreshing.value,
         draft: settings.compute.devices[item.id] !== computeSavedDevices.value[item.id],
         pending: Boolean(status && computeSavedDevices.value[item.id] !== status.requested_device),
         options: [
           { value: 'auto', label: '自动选择' }, { value: 'cpu', label: 'CPU（中央处理器）' },
           ...(gpuAvailable ? [{ value: 'cuda', label: 'GPU（图形处理器）' }] : settings.compute.devices[item.id] === 'cuda' ? [{ value: 'cuda', label: 'GPU（当前不可用）', disabled: true }] : []),
         ],
-        hint: status?.load_error && available ? status.load_error : !gpuAvailable ? status?.gpu_unavailable_reason || '当前推理环境不支持显卡运行。' : undefined,
+        hint: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : status?.load_error && available ? status.load_error : !gpuAvailable ? status?.gpu_unavailable_reason || '当前推理环境不支持显卡运行。' : undefined,
       },
     }
   })
@@ -167,19 +172,25 @@ const model = computed<LocalComponentsModel>(() => {
       { id: 'commit', label: '提交内存', used: formatComponentMemory(snapshot?.total_memory_private_commit_bytes), total: formatComponentMemory(hardware?.system_memory.commit_limit_bytes) },
       { id: 'vram', label: '显存', used: formatComponentMemory(snapshot?.total_gpu_dedicated_bytes), total: formatComponentMemory(gpu?.total_bytes) },
     ],
-    managedResourceJobs: props.resourceController?.resourceJobs.value.map(job => ({
-      id: job.job_id,
-      resourceId: job.resource_id,
-      label: job.resource_id === 'batch' ? '批量资源导入' : props.resourceController?.resources.value.find(resource => resource.resource_id === job.resource_id)?.label || job.resource_id,
-      state: job.state,
-      phase: job.phase,
-      completedBytes: job.completed_bytes,
-      totalBytes: job.total_bytes,
-      error: job.error || undefined,
-      canCancel: job.can_cancel !== false,
-    })),
+    managedResourceJobs: props.resourceController?.resourceJobs.value.map(job => {
+      const resource = props.resourceController?.resources.value.find(item => item.resource_id === job.resource_id)
+      return {
+        id: job.job_id,
+        resourceId: job.resource_id,
+        label: job.resource_id === 'batch' ? '批量资源导入'
+          : resource?.installation_state === 'installed' && resource.update_available ? `更新 ${resource.label}`
+            : resource?.label || job.resource_id,
+        state: job.state,
+        phase: job.phase,
+        completedBytes: job.completed_bytes,
+        totalBytes: job.total_bytes,
+        error: job.error || undefined,
+        canCancel: job.can_cancel !== false,
+      }
+    }),
     resourceActionsAvailable: props.resourceController?.resourcesCanManage.value ?? false,
-    resourceLoading: Boolean(props.resourceController?.loading.value || props.resourceController?.refreshing.value),
+    resourceLoading: Boolean(props.resourceController?.loading.value || props.resourceController?.refreshing.value
+      || props.resourceController?.inventoryRefreshing.value),
     resourceError: props.resourceController?.resourceError.value || undefined,
     resourceEventError: props.resourceController?.eventError.value || undefined,
     resourceTasksBusy: Boolean(props.resourceController?.startingResources.value.size
@@ -214,6 +225,7 @@ function device(id: string, value: string) {
   }
 }
 function resourceDownload(id: string) { void props.resourceController?.downloadResource(id) }
+function resourceRefresh() { void props.resourceController?.refreshInventory() }
 function resourceImport(id: string) { void props.resourceController?.importResource(id) }
 function resourceImportAll() { void props.resourceController?.importResource() }
 function openResourceSource(id: string) { void props.resourceController?.openResourceSource(id) }
@@ -221,5 +233,5 @@ function cancelResource(id: string) { void props.resourceController?.cancelJob(i
 </script>
 <template>
   <ResourceInstallDialog v-if="resourceController" :controller="resourceController" />
-  <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" />
+  <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" />
 </template>

@@ -46,7 +46,7 @@ class FsmnVadDetector:
         policy = ResourcePolicy.load()
         registry.observe(self, "vad_pending_audio", lambda value: int(
             getattr(value._cache.get("onnx_state", {}).get("pending"), "nbytes", 0)))
-        if device == "cpu" and policy.vad_backend == "onnx":
+        if device == "cpu" and policy.vad_backend in {"auto", "onnx"}:
             try:
                 import numpy as np
                 from .onnx_backend import OnnxStreamingModel
@@ -60,7 +60,8 @@ class FsmnVadDetector:
         self.backend = "funasr"
         try:
             import numpy as np  # type: ignore
-            from funasr import AutoModel  # type: ignore
+            from ..asr.model_loader import auto_model_class
+            AutoModel = auto_model_class(model_dir)
         except ImportError as exc:
             raise VadError("缺少 numpy/funasr，请先运行 scripts\\setup.ps1。") from exc
 

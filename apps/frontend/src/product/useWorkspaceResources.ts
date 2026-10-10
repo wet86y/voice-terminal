@@ -25,6 +25,7 @@ export function useWorkspaceResources() {
   const workspaceJobs = ref<WorkspaceJob[]>([])
   const loading = ref(false)
   const refreshing = ref(false)
+  const inventoryRefreshing = ref(false)
   const resourceError = ref('')
   const workspaceError = ref('')
   const eventError = ref('')
@@ -37,6 +38,7 @@ export function useWorkspaceResources() {
   let unlistenWorkspace: (() => void) | undefined
   let unlistenRequests: Promise<void>[] = []
   let refreshRequest: Promise<void> | null = null
+  let inventoryRefreshRequest: Promise<void> | null = null
   let restoredNativeJobs = false // restoredNativeJobs（已恢复任务）：每个页面只读取一次原生任务快照。
 
   // canManage（工作区管理权限）统一由正式程序提供；源码调试使用相同权限。
@@ -77,25 +79,35 @@ export function useWorkspaceResources() {
     }
   }
 
-  async function refreshInventory() {
-    if (!port.available) return
-    try {
-      const [inventory, environment] = await Promise.all([
-        port.resourceInventory(),
-        !restoredNativeJobs && typeof port.environmentStatus === 'function' ? port.environmentStatus().catch(() => null) : null,
-      ])
-      resources.value = inventory
-      if (environment) restoredNativeJobs = true
-      // 维护时切换到管理页仍恢复活动任务，已经结束的历史任务不覆盖现有安装状态。
-      for (const job of environment?.jobs ?? []) {
-        if (!TERMINAL_JOB_STATES.has(job.state) && !resourceJobs.value.some(current => current.job_id === job.job_id)) {
-          upsertResourceJob(job, false)
+  function refreshInventory() {
+    if (!port.available) return Promise.resolve()
+    if (inventoryRefreshRequest) return inventoryRefreshRequest
+    inventoryRefreshing.value = true
+    const request = (async () => {
+      try {
+        const [inventory, environment] = await Promise.all([
+          port.resourceInventory(),
+          !restoredNativeJobs && typeof port.environmentStatus === 'function' ? port.environmentStatus().catch(() => null) : null,
+        ])
+        resources.value = inventory
+        if (environment) restoredNativeJobs = true
+        // 维护时切换到管理页仍恢复活动任务，已经结束的历史任务不覆盖现有安装状态。
+        for (const job of environment?.jobs ?? []) {
+          if (!TERMINAL_JOB_STATES.has(job.state) && !resourceJobs.value.some(current => current.job_id === job.job_id)) {
+            upsertResourceJob(job, false)
+          }
         }
+        resourceError.value = ''
+      } catch (error) {
+        resourceError.value = error instanceof Error ? error.message : '无法读取资源清单。'
       }
-      resourceError.value = ''
-    } catch (error) {
-      resourceError.value = error instanceof Error ? error.message : '无法读取资源清单。'
-    }
+    })()
+    const tracked = request.finally(() => {
+      if (inventoryRefreshRequest === tracked) inventoryRefreshRequest = null
+      inventoryRefreshing.value = false
+    })
+    inventoryRefreshRequest = tracked
+    return tracked
   }
 
   function refresh() {
@@ -198,9 +210,18 @@ export function useWorkspaceResources() {
   }
 
   async function downloadResource(resourceId: string) {
+    if (!resourcesCanManage.value || startingResources.value.has(resourceId)
+      || resourceJobs.value.some(job => job.resource_id === resourceId && !TERMINAL_JOB_STATES.has(job.state))
+      || pendingDownloadPlan.value?.resource_id === resourceId) return
+    startingResources.value = new Set(startingResources.value).add(resourceId)
     resourceError.value = ''
     try { pendingDownloadPlan.value = await port.resourceInstallPlan(resourceId) }
     catch (error) { resourceError.value = String(error) }
+    finally {
+      const next = new Set(startingResources.value)
+      next.delete(resourceId)
+      startingResources.value = next
+    }
   }
   async function confirmDownload() {
     const plan = pendingDownloadPlan.value
@@ -280,12 +301,14 @@ export function useWorkspaceResources() {
     resourcesCanManage,
     loading,
     refreshing,
+    inventoryRefreshing,
     resourceError,
     workspaceError,
     eventError,
     startingResources,
     workspaceOperationStarting,
     refresh,
+    refreshInventory,
     chooseWorkspace,
     linkWorkspace,
     migrateWorkspace,

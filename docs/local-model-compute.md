@@ -1,6 +1,6 @@
 # 本地模型运行设备
 
-设置页中的“本地模型设备”可以分别配置 Paraformer（流式语音识别）、SenseVoiceSmall（语音识别与分析）、Voice Server FSMN-VAD（语音活动检测）、KWS（关键字唤醒）、SmartTurn（语音结束判断）和 WeSpeaker（声纹识别）。
+设置页中的“本地模型设备”可以分别配置 Paraformer（流式语音识别）、SenseVoiceSmall（语音识别与分析）、Voice Server FSMN-VAD（语音活动检测）、KWS（关键字唤醒）、SmartTurn（语音结束判断）和 WeSpeaker（声纹识别）。这些运行资源均为正式程序必需组件；新安装按当前随包清单安装，已安装的旧版本须更新后才能启动整体语音服务。组件缺失、损坏、待更新或完整文件摘要检查失败时，程序进入本地组件管理页。版本和恢复规则见[程序升级与必需组件更新](model-resource-updates.md)。
 
 每个模型可选择：
 
@@ -24,25 +24,17 @@
 
 `gpu_dedicated_bytes`（进程专用显存字节）从 Windows（操作系统）GPU Process Memory（显卡进程内存）性能计数器读取，不初始化推理框架；多适配器按进程合并，共享进程与子进程按进程标识、创建时间去重。读取失败保留未知，不能用整张显卡已用量代替应用占用。接口实现依据 [PdhAddEnglishCounterW（加入性能计数器）](https://learn.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhaddenglishcounterw) 与 [PdhGetFormattedCounterArrayW（读取实例计数数组）](https://learn.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhgetformattedcounterarrayw)。
 
-本机 RTX 4060 于 2026-09-26 完整重启后的检查结果：SenseVoiceSmall（语音识别与分析）请求设备和实际设备均为 `cuda`，服务为 `READY`（就绪），内部 FSMN-VAD（语音活动检测）也报告 `cuda`；Paraformer（流式语音识别）同样报告 `cuda` 和 `READY`。因此后端设置接口、应用启动配置及分析工作进程的 GPU 加载路径已实际连通。Voice Server FSMN-VAD 的 PyTorch CUDA（深度学习框架的 GPU 后端）可用，但当前保存偏好为 CPU；KWS（关键字唤醒）、SmartTurn（语音结束判断）和 WeSpeaker（声纹识别）因相应 GPU 执行后端未安装而保持 CPU。可用能力以状态 API 的逐模型结果为准。
+历史 GPU 通路验收于 2026-09-26 完成：当时 RTX 4060 上 SenseVoiceSmall（语音识别与分析）、内部 FSMN-VAD（语音活动检测）及 Paraformer（流式语音识别）实际报告 `cuda`（显卡计算设备）和 `READY`（就绪）。2026-10-10 的模型测量及运行资源口径见[内存优化报告](memory-optimization-20261010.md)；当前每个模型的可用后端仍以状态接口逐模型结果为准。CPU 模式的 FSMN-VAD 可按策略使用已校验的轻量 ONNX（开放神经网络交换格式）模型；GPU 请求继续使用原 PyTorch（深度学习框架）后端，不将量化的 SenseVoice ONNX（开放神经网络交换格式）候选作为默认模型。
 
-## 安装 GPU 推理后端
+## GPU 推理后端与环境更新
 
-当前后端唯一环境位于 `.local/runtimes/python/`（正式运行组件），由 `.local/portable.json`（便携配置）引用。已验证的本机组合包含 PyTorch CUDA 12.8（张量框架的显卡计算运行库）及 ONNX Runtime CUDA（模型推理运行库的显卡执行后端）；每个模型能否使用显卡仍以设备页的实际检测为准。校验现有依赖使用：
+语音运行环境由“本地组件”页中的 Voice Server（语音服务）条目统一管理，更新会覆盖六组运行依赖并在独立目录验证。系统保留已登记且校验通过的 GPU（图形处理器）构建；PyTorch（深度学习框架）、torchaudio（音频扩展）和 ONNX Runtime（模型推理运行时）的版本、文件摘要及加载检查不通过时，更新失败并保留原环境，不以 CPU（中央处理器）依赖覆盖已验证的 GPU 依赖。独立的 `runtimes/python-gpu`（专用显卡环境）也不作为 CPU 运行环境的替换目标。用户可在组件卡片中选择“更新”“导入”或“跳转”到固定来源，不能通过旧版依赖继续启动服务。
 
-```powershell
-.\scripts\setup.ps1 -SkipInstall -SkipDsh
-```
+完整依赖分组和事务规则见[运行资源管理与内存优化](runtime-resource-management.md)及[统一正式程序与分发安装器](unified-product-installer.md)。更新本身不保证所有模型都能用 GPU；应用对每个模型执行隔离的实际设备检查，未通过时不会保存 GPU 偏好，也不静默将 GPU 请求报告为 GPU 成功。
 
-替换依赖时，先使用 `scripts/build-runtime.py`（后端组件构建工具）在 `.local/tmp/python-candidate/`（组件候选目录）构建并验证完整环境。`--profile cu128`（显卡依赖组合）与 `--profile cpu`（中央处理器依赖组合）选择张量框架版本，`--onnx-profile`（模型格式运行库计算组合）选择对应推理后端，`--verify-cuda`（真实显卡验证）用于有显卡的构建机。构建必须提供 `--vc-redist`（已授权的微软原生运行库来源）；具体依赖锁与构建要求见[流式识别延迟与图形处理器支持](asr-latency-and-cuda.md)。
+`CUDA_MODULE_LOADING=LAZY`（CUDA 模块延迟加载策略）属于 CUDA（显卡计算平台）运行库的模块加载行为，不是本轮新增的模型权重迁移或独立可叠加的内存优化收益。是否生效取决于实际运行库与进程环境；显存计量以状态接口和基准工具提供的逐进程指标为准。
 
-候选通过校验后，退出所有业务实例并关闭演示窗口，在项目根目录执行：
-
-```powershell
-.\scripts\publish-desktop.ps1 -PythonRuntime .\.local\tmp\python-candidate
-```
-
-`PythonRuntime`（后端组件候选参数）经同一发布事务换入固定位置，失败恢复原组合，成功后回收旧环境。切换中央处理器组合也采用同一流程。CUDA（显卡计算运行库）依赖必须与本机 NVIDIA（显卡厂商）驱动和 Python（后端解释器）版本兼容；运行组件及模型都只保留当前必要组合，完整规则见[本地目录与覆盖发布](local-layout.md)。
+本轮已采用的四项内存相关实现是：PyTorch（深度学习框架）匹配版本下的权重 `mmap`（文件内存映射）加载、FunASR（语音模型框架）匹配源码下的按需模块导入、声纹任务边界释放临时引擎引用，以及 CPU（中央处理器）模式中经数值校验的轻量 ONNX FSMN-VAD（语音活动检测）模型。SenseVoice 量化候选的输出出现差异，未启用为默认；有限原生线程候选也未成为默认。逐模型输入、输出和内存对照见[内存优化报告](memory-optimization-20261010.md)。
 
 SenseVoiceSmall 及其内部 FSMN-VAD（语音活动检测）始终使用同一设备。FunASR（语音识别工具包）通过 device="cuda" 或 device="cpu" 选择运行位置，具体以加载结果和设置页健康状态为准。
 

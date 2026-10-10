@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -38,8 +39,56 @@ def test_invalid_model_thread_budget_keeps_original_default(monkeypatch):
         assert model_thread_budget() == 4
 
 
+def test_vad_backend_defaults_to_auto_and_managed_pre_schema_policy_uses_it_without_writing(tmp_path, monkeypatch):
+    import voice_terminal.resources as resources
+
+    path = tmp_path / "runtime-resources.json"
+    legacy = {"native_threads": {"voice": 4}, "vad_backend": "funasr", "shared_audio": True,
+              "disk_history": False, "history_cache_bytes": 8 * 1024 * 1024}
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    monkeypatch.setattr(resources.AppPaths, "resolve", lambda root=None: SimpleNamespace(config=tmp_path))
+    monkeypatch.setenv("VOICE_RESOURCE_POLICY", str(path))
+
+    assert ResourcePolicy({}).vad_backend == "auto"
+    loaded = ResourcePolicy.load()
+    assert loaded.vad_backend == "auto"
+    assert loaded.native_threads == {"voice": 4} and loaded.shared_audio is True
+    assert json.loads(path.read_text(encoding="utf-8")) == legacy
+
+
+@pytest.mark.parametrize("backend", ["funasr", "onnx"])
+def test_current_managed_policy_schema_preserves_explicit_backend(tmp_path, monkeypatch, backend):
+    import voice_terminal.resources as resources
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    path = managed / "runtime-resources.json"
+    current = {"policy_schema": 2, "native_threads": {}, "vad_backend": backend, "shared_audio": False,
+              "disk_history": False, "history_cache_bytes": 8 * 1024 * 1024}
+    path.write_text(json.dumps(current), encoding="utf-8")
+    monkeypatch.setattr(resources.AppPaths, "resolve", lambda root=None: SimpleNamespace(config=managed))
+    monkeypatch.setenv("VOICE_RESOURCE_POLICY", str(path))
+
+    assert ResourcePolicy.load().vad_backend == backend
+
+
+def test_custom_policy_path_without_schema_preserves_explicit_backend(tmp_path, monkeypatch):
+    import voice_terminal.resources as resources
+
+    managed = tmp_path / "managed"
+    custom = tmp_path / "custom"
+    managed.mkdir(); custom.mkdir()
+    path = custom / "runtime-resources.json"
+    path.write_text(json.dumps({"vad_backend": "funasr", "native_threads": {"voice": 3}}), encoding="utf-8")
+    monkeypatch.setattr(resources.AppPaths, "resolve", lambda root=None: SimpleNamespace(config=managed))
+    monkeypatch.setenv("VOICE_RESOURCE_POLICY", str(path))
+
+    assert ResourcePolicy.load().vad_backend == "funasr"
+
+
 @pytest.mark.parametrize("data", [{"native_threads": {"voice": True}}, {"native_threads": {"bad": 4}},
-                                  {"shared_audio": "yes"}, {"history_cache_bytes": -1}, {"vad_backend": "unknown"}])
+                                  {"shared_audio": "yes"}, {"history_cache_bytes": -1}, {"vad_backend": "unknown"},
+                                  {"policy_schema": True}, {"policy_schema": 3}])
 def test_policy_rejects_invalid_budget(tmp_path, data):
     path = tmp_path / "policy.json"; path.write_text(json.dumps(data))
     with pytest.raises(ValueError):

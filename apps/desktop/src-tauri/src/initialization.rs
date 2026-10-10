@@ -1,5 +1,5 @@
 //! Initialization（桌面初始化）：统一启动画面，管理能力不要求 Python。
-use std::sync::{Arc,atomic::Ordering};
+use std::{sync::{Arc,atomic::Ordering},thread,time::{Duration,Instant}};
 use tauri::{Manager,WebviewWindow};
 use serde_json::Value;
 use voice_desktop_common::LaunchContext;
@@ -8,7 +8,31 @@ use super::{Desktop,ResourceManager};
 pub fn install_manager(app:&tauri::AppHandle,state:Arc<Desktop>,context:&LaunchContext)->Result<(),String>{
     let control_state=state.clone();let control_app=app.clone();
     let control:super::resource_commands::ServiceControl=Arc::new(move|start|{
-        if start {super::start_service(control_app.clone(),control_state.clone())?;return Ok(control_state.service.lock().unwrap().is_some());}
+        if start {
+            super::start_service(control_app.clone(),control_state.clone())?;
+            // ready（入口握手就绪）只证明后端入口进程建立了受信来源，不代表模型已推理或云端已连通。
+            let deadline=Instant::now()+Duration::from_secs(35);
+            loop {
+                if let Some(error)=control_state.error.lock().map_err(|e|e.to_string())?.clone(){
+                    let _=control_state.stop_service();return Err(format!("恢复语音服务失败：{error}"));
+                }
+                if control_state.origin.lock().map_err(|e|e.to_string())?.is_some(){
+                    let running=control_state.service.lock().map_err(|e|e.to_string())?.as_mut()
+                        .is_some_and(|service|matches!(service.child.try_wait(),Ok(None)));
+                    if running{return Ok(true);}
+                    let _=control_state.stop_service();return Err("服务入口在握手就绪前退出。".into());
+                }
+                let running=control_state.service.lock().map_err(|e|e.to_string())?.as_mut()
+                    .is_some_and(|service|matches!(service.child.try_wait(),Ok(None)));
+                if !running{
+                    let _=control_state.stop_service();return Err("服务进程未能保持运行到入口握手。".into());
+                }
+                if Instant::now()>=deadline{
+                    let _=control_state.stop_service();return Err("等待语音服务入口握手超时；已停止未就绪进程。".into());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
         let running=control_state.service.lock().unwrap().is_some();
         if running {
             // 资源维护先进入独立管理页，再关闭后台，避免旧业务页停留在服务停止状态。

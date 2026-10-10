@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -74,7 +75,16 @@ class WeSpeakerOnnxEngine:
                     if candidate == "cuda":
                         ort.preload_dlls()  # preload_dlls（预加载显卡运行库）：独立声纹进程也必须执行。
                     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if candidate == "cuda" else ["CPUExecutionProvider"]
-                    session = ort.InferenceSession(str(self.model_path), providers=providers)
+                    # VOICE_SPEAKER_SESSION_MODE（声纹会话策略）：保留原策略供真实资源对照。
+                    session_mode = os.environ.get("VOICE_SPEAKER_SESSION_MODE", "original")
+                    options = ort.SessionOptions()
+                    if session_mode == "bounded":
+                        options.intra_op_num_threads = 1 if candidate == "cuda" else 2
+                        options.inter_op_num_threads = 1
+                        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+                    elif session_mode != "original":
+                        raise SpeakerModelError("声纹会话策略必须为 original（原策略）或 bounded（有限线程）。")
+                    session = ort.InferenceSession(str(self.model_path), sess_options=options, providers=providers)
                     if candidate == "cuda" and "CUDAExecutionProvider" not in session.get_providers():
                         raise SpeakerModelError("ONNX Runtime did not activate CUDAExecutionProvider")
                     break

@@ -25,14 +25,19 @@ export interface ResourceStatus {
   can_start?: boolean
   /** runtime_group（所需共享依赖组）。 */
   runtime_group?: string
-  /** python（私有解释器路径）与 version（解释器版本），仅语音环境资源提供。 */
+  /** python（私有解释器路径）。 */
   python?: string
+  /** version（版本号）：model（模型）资源表示随包目标模型版本；voice-server（语音服务）仍表示解释器版本。 */
   version?: string | null
   /** resource_id（固定资源标识）与 label（界面名称）。 */
   resource_id: string
   label: string
   /** installation_state（安装状态）：缺失、不完整或已安装。 */
   installation_state: 'missing' | 'incomplete' | 'installed'
+  /** update_available（是否有必须处理的随包更新）；独立于 installation_state（安装状态），为真时前端阻止启动。旧宿主省略时按无更新处理。 */
+  update_available?: boolean
+  /** installed_version（已安装版本）；尚未安装或旧宿主未知时为空。 */
+  installed_version?: string | null
   /** source_url（上游来源页面）与 error（最近校验或安装错误）。 */
   source_url?: string | null
   error?: string | null

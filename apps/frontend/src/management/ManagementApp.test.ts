@@ -18,6 +18,8 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
   let resourceEvent: ((event: { payload: ResourceJob }) => void) | undefined
   const start = vi.fn()
   const download = vi.fn()
+  const resourcePlan = vi.fn()
+  const inventoryRead = vi.fn()
   const environment = vi.fn()
   const saveCredentials = vi.fn()
 
@@ -31,13 +33,19 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     })
     start.mockReset().mockResolvedValue(undefined)
     download.mockReset().mockImplementation(async (id: string) => ({ job_id: `download-${id}` }))
+    resourcePlan.mockReset().mockImplementation(async (id: string) => ({ resource_id: id,
+      title: inventory.find(item => item.resource_id === id)?.label || id, model_bytes: 100,
+      environment: id === 'voice-server'
+        ? { group: 'all', already_ready: false, total_bytes: 300, wheels: [], system_candidates: [] }
+        : null }))
+    inventoryRead.mockReset().mockImplementation(async () => inventory)
     environment.mockReset().mockImplementation(async () => ({ interpreter_ready: false, service_ready: false, python: '', groups: {}, jobs }))
     vi.spyOn(desktop, 'desktopPort').mockReturnValue({
       available: true,
       workspaceInfo: async () => ({ root: 'D:/测试/测试123', data_dir: 'D:/测试/测试123/data', version: '0.9.0', can_manage: true }),
-      resourceInventory: async () => inventory,
+      resourceInventory: inventoryRead,
       environmentStatus: environment,
-      resourceInstallPlan: async (id: string) => ({ resource_id: id, title: id, model_bytes: 100 }),
+      resourceInstallPlan: resourcePlan,
       downloadResource: download,
       startVoiceService: start,
       fixedCredentials: async () => ({ providers: { deepseek: { configured: configured.deepseek }, minimax: { configured: configured.minimax } }, vault_available: true }),
@@ -55,7 +63,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
   it('组件不完整时保持管理页，返回操作也不能启动服务', async () => {
     wrapper = mount(ManagementApp)
     await flushPromises()
-    expect(wrapper.get('.management-start').text()).toContain('请手动下载或导入缺失组件')
+    expect(wrapper.get('.management-start').text()).toContain('请先下载或导入缺失组件')
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
     await wrapper.get('button[aria-label="返回工作台"]').trigger('click')
     expect(wrapper.text()).toContain('全部组件完备后再启动')
@@ -72,6 +80,117 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     await button.trigger('click')
     await flushPromises()
     expect(start).toHaveBeenCalledTimes(1)
+  })
+
+  it('待更新模型显示卡片更新操作并阻止启动，校验通过并刷新清单后才可启动', async () => {
+    inventory = [
+      row('voice-server', 'Voice Server（语音服务）', true),
+      row('paraformer-streaming', 'Paraformer（流式识别）', true),
+      { ...row('sensevoice-small', 'SenseVoice（精修模型）', true), update_available: true,
+        installed_version: '1.0.0', version: '1.1.0', can_start: true },
+    ]
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('.management-start').text()).toContain('有组件需更新并通过校验后才能启动语音服务')
+    const card = wrapper.get('[data-component="sensevoice-small"]')
+    expect(card.get('.local-state').text()).toBe('需更新')
+    expect(card.get('button[aria-label="SenseVoice（精修模型）：更新"]').text()).toBe('更新')
+    expect(card.get('button[aria-label="SenseVoice（精修模型）：导入"]').text()).toBe('导入')
+    expect(card.get('button[aria-label="SenseVoice（精修模型）：跳转官方来源"]').text()).toBe('跳转')
+    await card.get('button[aria-label="SenseVoice（精修模型）：更新"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('#install-plan-title').text()).toContain('准备更新 SenseVoice')
+    expect(wrapper.get('.install-plan-actions button').text()).toBe('开始更新')
+    await wrapper.get('.install-plan-actions button').trigger('click')
+    await flushPromises()
+    expect(download).toHaveBeenCalledWith('sensevoice-small')
+    expect(wrapper.get('[data-job="download-sensevoice-small"]').text()).toContain('正在准备下载')
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+
+    inventory = inventory.map(item => item.resource_id === 'sensevoice-small'
+      ? { ...item, update_available: false, can_start: true, installed_version: '1.1.0' }
+      : item)
+    resourceEvent?.({ payload: { job_id: 'download-sensevoice-small', resource_id: 'sensevoice-small', state: 'complete', phase: '更新校验通过', can_cancel: false } })
+    await flushPromises()
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
+    await wrapper.get('.start-program').trigger('click')
+    await flushPromises()
+    expect(start).toHaveBeenCalledOnce()
+    wrapper.unmount()
+    wrapper = undefined
+  })
+
+  it('首次缺失模型仍显示下载并通过固定资源下载计划安装当前目标版本', async () => {
+    inventory = [row('voice-server', 'Voice Server（语音服务）', true),
+      { ...row('paraformer-streaming', 'Paraformer（流式识别）'), version: '2.0.0' },
+      row('sensevoice-small', 'SenseVoice（精修模型）', true)]
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    const card = wrapper.get('[data-component="paraformer-streaming"]')
+    const button = card.get('button[aria-label="Paraformer（流式识别）：下载"]')
+    expect(button.text()).toBe('下载')
+    await button.trigger('click')
+    await flushPromises()
+    expect(wrapper.get('#install-plan-title').text()).toContain('准备下载 Paraformer')
+    expect(wrapper.text()).toContain('本次下载将安装当前目标模型版本：2.0.0')
+    await wrapper.get('.install-plan-actions button').trigger('click')
+    await flushPromises()
+    expect(download).toHaveBeenCalledWith('paraformer-streaming')
+    wrapper.unmount()
+    wrapper = undefined
+  })
+
+  it('模型更新校验失败仍阻止服务启动并保留重试更新操作', async () => {
+    inventory = [row('voice-server', 'Voice Server（语音服务）', true),
+      row('paraformer-streaming', 'Paraformer（流式识别）', true),
+      { ...row('sensevoice-small', 'SenseVoice（精修模型）', true), update_available: true,
+        installed_version: '1.0.0', version: '1.1.0', can_start: false }]
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+    resourceEvent?.({ payload: { job_id: 'failed-update', resource_id: 'sensevoice-small', state: 'failed',
+      phase: '更新校验失败', error: '更新校验失败', can_cancel: false } })
+    await flushPromises()
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('.management-start').text()).toContain('有组件需更新并通过校验后才能启动语音服务')
+    const card = wrapper.get('[data-component="sensevoice-small"]')
+    expect(card.get('.local-state').text()).toBe('需更新')
+    expect(card.get('button[aria-label="SenseVoice（精修模型）：更新"]').text()).toBe('重试更新')
+    expect(start).not.toHaveBeenCalled()
+    wrapper.unmount()
+    wrapper = undefined
+  })
+
+  it('语音运行环境旧依赖锁显示更新入口，弹窗说明依赖更新且不称模型', async () => {
+    inventory = [
+      { ...row('voice-server', 'Voice Server（语音服务）', true), update_available: true,
+        version: '3.12.10', can_start: true },
+      row('paraformer-streaming', 'Paraformer（流式识别）', true),
+      row('sensevoice-small', 'SenseVoice（精修模型）', true),
+    ]
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+    const card = wrapper.get('[data-component="voice-system"]')
+    expect(card.get('.local-state').text()).toBe('需更新')
+    expect(card.get('button[aria-label="Voice Server（语音服务）：更新"]').text()).toBe('更新')
+    expect(card.get('button[aria-label="Voice Server（语音服务）：导入"]').text()).toBe('导入')
+    expect(card.get('button[aria-label="Voice Server（语音服务）：跳转官方来源"]').text()).toBe('跳转')
+    await card.get('button[aria-label="Voice Server（语音服务）：更新"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('#install-plan-title').text()).toBe('准备更新 Voice Server（语音服务）')
+    expect(wrapper.text()).toContain('更新语音运行环境')
+    expect(wrapper.text()).not.toContain('更新模型文件')
+    expect(wrapper.text()).not.toContain('目标模型版本')
+    expect(wrapper.get('.install-plan-actions button').text()).toBe('开始更新并配置')
+    await wrapper.get('.install-plan-actions button').trigger('click')
+    await flushPromises()
+    expect(resourcePlan).toHaveBeenCalledWith('voice-server')
+    expect(download).toHaveBeenCalledWith('voice-server')
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+    wrapper = undefined
   })
 
   it('恢复正在下载的任务，同时允许启动两项不同模型的下载', async () => {

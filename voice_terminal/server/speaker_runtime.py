@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 import base64
 import ipaddress
 import logging
@@ -80,6 +80,7 @@ class SpeakerRuntimeMixin:
                 try:
                     await self.speaker.health(timeout_s=1.5)
                     if not self.speaker.degraded:
+                        await asyncio.to_thread(self._release_speaker_engine)
                         return True
                 except SpeakerWorkerError:
                     pass
@@ -99,6 +100,7 @@ class SpeakerRuntimeMixin:
             # 受管模式只连接本次 Voice 进程实际启动的 sidecar（附属进程），不附着到占用首选端口的未知服务。
             connected, last_error = (False, None) if managed and not process_running else await self._connect_speaker_worker()
             if connected:
+                await asyncio.to_thread(self._release_speaker_engine)
                 return True
 
             if not self.config.speaker_model_path.is_file():
@@ -130,6 +132,7 @@ class SpeakerRuntimeMixin:
                     continue
                 connected, current_error = await self._connect_speaker_worker(worker_url=worker_url)
                 if connected:
+                    await asyncio.to_thread(self._release_speaker_engine)
                     return True
                 if current_error:
                     last_error = current_error
@@ -586,18 +589,25 @@ class SpeakerRuntimeMixin:
                     "received": len(session["segments"])}
 
     def _get_speaker_engine(self) -> WeSpeakerOnnxEngine:
-        engine = self._speaker_engine
-        if engine is None or engine.model_path != self.config.speaker_model_path:
-            engine = WeSpeakerOnnxEngine(
-                self.config.speaker_model_path,
-                sample_rate=self.config.audio.sample_rate,
-                device=self.config.compute.devices.get("wespeaker", "cpu"),
-                fallback_device=self.config.compute.fallback_devices.get("wespeaker", "cpu"),
-            )
-            self._speaker_engine = engine
-        if not engine.loaded:
-            engine.load()
-        return engine
+        with getattr(self, "_speaker_engine_lock", nullcontext()):
+            engine = self._speaker_engine
+            if engine is None or engine.model_path != self.config.speaker_model_path:
+                engine = WeSpeakerOnnxEngine(
+                    self.config.speaker_model_path,
+                    sample_rate=self.config.audio.sample_rate,
+                    device=self.config.compute.devices.get("wespeaker", "cpu"),
+                    fallback_device=self.config.compute.fallback_devices.get("wespeaker", "cpu"),
+                )
+                self._speaker_engine = engine
+            if not engine.loaded:
+                engine.load()
+            return engine
+
+    def _release_speaker_engine(self) -> None:
+        """释放本地缓存引用；正在执行的原生调用仍由线程局部引用持有实例。"""
+        with getattr(self, "_speaker_engine_lock", nullcontext()):
+            # 不强制清空 session（推理会话），避免取消或边车恢复提前释放原生输入。
+            self._speaker_engine = None
 
     async def _embed_speaker_audio(self, pcm: bytes) -> tuple[float, ...]:
         """Use the sidecar for embeddings; keep a local fallback for setup/offline enrollment."""
@@ -718,6 +728,7 @@ class SpeakerRuntimeMixin:
             raise
         finally:
             session["committing"] = False
+            await asyncio.to_thread(self._release_speaker_engine)
             # 失败时允许原会话重录；取消或成功后立即释放全部采样。
             if self._speaker_enrollment.get(enrollment_id) is not session:
                 segments.clear() if isinstance(segments, dict) else None
@@ -740,6 +751,13 @@ class SpeakerRuntimeMixin:
         return scored
 
     def _score_speaker_audio(self, pcm: bytes, speech_ms: int) -> dict[str, Any]:
+        """设置页测试结束即释放临时声纹缓存，异常路径也不会保留第二份模型。"""
+        try:
+            return self._score_speaker_audio_owned(pcm, speech_ms)
+        finally:
+            self._release_speaker_engine()
+
+    def _score_speaker_audio_owned(self, pcm: bytes, speech_ms: int) -> dict[str, Any]:
         """Aggregate-slide a test clip exactly like the live turn pipeline.
 
         The previous implementation reported ``max`` over the centroid and

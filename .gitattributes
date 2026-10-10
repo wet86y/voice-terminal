@@ -1,0 +1,2 @@
+# 固定摘要的模型资产按原始字节保存，防止 Git（版本管理）自动换行改变内容摘要。
+/config/resources/assets/** binary

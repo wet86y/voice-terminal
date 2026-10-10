@@ -50,6 +50,10 @@ export interface ManagedResourceRow {
   label: string
   state: 'missing' | 'incomplete' | 'installed'
   status: string
+  /** updateAvailable（存在必须处理的随包更新）、installedVersion（已安装版本）及 targetVersion（目标模型版本）。 */
+  updateAvailable?: boolean
+  installedVersion?: string | null
+  targetVersion?: string | null
   /** error（最近下载、导入或完整性检查错误）。 */
   error?: string
   /** retryable（最近一次资源任务失败，可重新下载或导入）。 */

@@ -1,8 +1,11 @@
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from voice_terminal.vad.detector import FsmnVadDetector
+from voice_terminal.resources import ResourcePolicy
 
 
 class _FakeVadModel:
@@ -58,6 +61,52 @@ class VadTests(unittest.TestCase):
         self.assertFalse(ongoing.speech_ended)
         self.assertFalse(ended.is_speech)
         self.assertTrue(ended.speech_ended)
+
+    def test_auto_uses_onnx_when_cpu_asset_and_backend_are_available(self) -> None:
+        with patch("voice_terminal.resources.ResourcePolicy.load",
+                   return_value=ResourcePolicy({}, vad_backend="auto")), \
+             patch("voice_terminal.vad.onnx_backend.OnnxStreamingModel", return_value=_FakeVadModel()) as onnx:
+            detector = FsmnVadDetector(model_dir=Path("unused"), device="cpu")
+
+        self.assertEqual(detector.backend, "onnx")
+        onnx.assert_called_once()
+
+    def test_auto_falls_back_to_funasr_when_onnx_dependency_is_missing(self) -> None:
+        fallback_factory = lambda **_kwargs: _FakeVadModel()
+        with patch("voice_terminal.resources.ResourcePolicy.load",
+                   return_value=ResourcePolicy({}, vad_backend="auto")), \
+             patch("voice_terminal.vad.onnx_backend.OnnxStreamingModel", side_effect=ImportError("not installed")), \
+             patch("voice_terminal.asr.model_loader.auto_model_class", return_value=fallback_factory), \
+             patch("voice_terminal.compute.device_candidates", return_value=["cpu"]):
+            detector = FsmnVadDetector(model_dir=Path("unused"), device="cpu")
+
+        self.assertEqual(detector.backend, "funasr")
+        self.assertIn("ImportError", detector.load_error or "")
+
+    def test_auto_keeps_gpu_request_on_funasr(self) -> None:
+        fallback_factory = lambda **_kwargs: _FakeVadModel()
+        with patch("voice_terminal.resources.ResourcePolicy.load",
+                   return_value=ResourcePolicy({}, vad_backend="auto")), \
+             patch("voice_terminal.vad.onnx_backend.OnnxStreamingModel") as onnx, \
+             patch("voice_terminal.asr.model_loader.auto_model_class", return_value=fallback_factory), \
+             patch("voice_terminal.compute.device_candidates", return_value=["cuda"]):
+            detector = FsmnVadDetector(model_dir=Path("unused"), device="cuda")
+
+        self.assertEqual(detector.backend, "funasr")
+        self.assertEqual(detector.device, "cuda")
+        onnx.assert_not_called()
+
+    def test_explicit_funasr_policy_skips_onnx_even_on_cpu(self) -> None:
+        fallback_factory = lambda **_kwargs: _FakeVadModel()
+        with patch("voice_terminal.resources.ResourcePolicy.load",
+                   return_value=ResourcePolicy({}, vad_backend="funasr")), \
+             patch("voice_terminal.vad.onnx_backend.OnnxStreamingModel") as onnx, \
+             patch("voice_terminal.asr.model_loader.auto_model_class", return_value=fallback_factory), \
+             patch("voice_terminal.compute.device_candidates", return_value=["cpu"]):
+            detector = FsmnVadDetector(model_dir=Path("unused"), device="cpu")
+
+        self.assertEqual(detector.backend, "funasr")
+        onnx.assert_not_called()
 
 
 if __name__ == "__main__":
