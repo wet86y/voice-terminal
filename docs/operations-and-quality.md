@@ -16,7 +16,11 @@ git diff --check
 
 仅修改文档时执行 `.local/runtimes/python/python.exe -B -X utf8 scripts/check-doc-links.py`（工程内链接与标题锚点检查）和 `git diff --check`（差异格式检查）。当前安装的完整摘要校验执行 `.local/Verify-Package.ps1`（发行文件校验）。目录、数据和事务更新最近一次完整验收见[2026-10-08 本地整理验收](local-layout-acceptance-20261008.md)。
 
-2026-10-10 的完整前端为 248 项通过，原生公共模块为 45 项通过，桌面宿主为 18 项通过；完整后端为 1058 项通过、1 项跳过、1 项失败。唯一失败是冻结基线已复现的 `test_secondary_and_final_prompts_are_mutually_exclusive`（次级与最终提示互斥用例），不能将本次结果写为全量通过。组件资源针对性检查 51 项通过，正式处理器语音检测 42 组流式输入通过，36 组黄金对照事件一致。真实模型更新、损坏候选拒绝、原生下载及保留数据重装的证据见[组件更新验收](model-resource-updates.md)。
+2026-10-10 内存优化与必需组件更新首轮的完整前端为 248 项通过，原生公共模块为 45 项通过，桌面宿主为 18 项通过；完整后端为 1058 项通过、1 项跳过、1 项失败。唯一失败是冻结基线已复现的 `test_secondary_and_final_prompts_are_mutually_exclusive`（次级与最终提示互斥用例），不能将该轮结果写为全量通过。组件资源针对性检查 51 项通过，正式处理器语音检测 42 组流式输入通过，36 组黄金对照事件一致。真实模型更新、损坏候选拒绝、原生下载及保留数据重装的证据见[组件更新验收](model-resource-updates.md)。
+
+随后语音环境校验与下载、首次启动修复的前端回归为 255 项通过，原生公共模块 57 项及桌面宿主 20 项通过；带隔离下载验收的公共模块共 65 项通过，其中额外八项是下载专项检查，不能与 57 项重复相加。类型检查、前端构建、原生正式与调试构建及普通安装器构建通过。开发、用户测试及全新中文空格工作区分别通过 297 项固定程序文件核对，开发与用户测试目录的 423 项及 45 项保护文件摘要保持原值。详情见[下载与首次启动修复](download-startup-flow-20261010.md)及[当前交付记录](current-release.md)。
+
+提交前再次执行完整后端回归，结果为 1058 项通过、1 项跳过、1 项失败，耗时约 149 秒。失败仍为上述提示互斥基线用例：最后一条提示记录是 `speech_queue_policy`（语音队列策略），用例预期为 `secondary_mailbox`（次级信箱）。本轮未修改对应后端业务源码或测试，不能将该结果表述为全量通过。本机日志位于 `.local/cache/download-flow-20261010/backend-precommit.log`（提交前全量回归日志），基线问题继续登记在[当前已知问题](known-issues.md)。
 
 发布验证须同时核验源码、统一程序包、本机已发布本体和安装器。重新构建后仍须执行本体发布；仅生成 `.local/build`（构建缓存）不能证明日常启动程序已更新。固定文件与统一包逐项比较，组件登记按工作区保留内容单独核对，用户设置、历史、模型及运行环境保持原值。组件管理页就绪与模型实际推理、麦克风采样、云端连接是不同验收项目。
 
@@ -27,6 +31,7 @@ git diff --check
 | 独立应用宿主、进程树、状态接口与退出 | `tests/test_application_host.py`、`tests/test_dsh_runtime.py`、`apps/frontend/src/product/application-host.test.ts` |
 | 便携路径、旧数据导入、组件校验与安全归档 | `tests/test_portable_paths.py`、`tests/test_desktop_packaging.py` |
 | 桌面原生路径与启用组合 | `cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common`（原生公共模块测试） |
+| 资源下载、复制、完整摘要与首次安装后的启动 | `apps/frontend/src/management/ManagementApp.test.ts`（刷新竞态、计时、终态补查和启动动画）；`cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common -p voice-terminal-desktop --locked`（资源与宿主回归）；公共模块增加 `--features qualification`（隔离下载验收）时验证本机测试服务器、缓存、断点及全局并发。正式构建不开放该测试来源。 |
 | ASR（自动语音识别）分块与最终刷新 | `tests/test_asr_worker.py`、`tests/test_asr_worker_protocol.py` |
 | Bridge 2.0（第二版桥接协议）、二等信箱与 DSH（代理运行时）事件 | `tests/test_dsh_bridge.py`、`tests/test_bridge_v2_information.py`、`tests/test_secondary_mailbox.py`、`tests/test_scheduler_staircase.py`、`tests/test_durable_shadow_mailbox.py`、`tests/test_shadow_agent_harness.py` |
 | Shadow、上下文和 ledger | `tests/test_shadow_agent.py`、`tests/test_shadow_agent_harness.py`、`tests/test_session_ledger.py`、`tests/test_conversation_runtime.py` |

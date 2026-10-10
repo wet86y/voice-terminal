@@ -1,11 +1,13 @@
 //! Workspace（工作区）：本地身份、已发布本体初始化与可恢复迁移。
-use std::{fs, io::{Read, Write}, path::{Path, PathBuf}, sync::{mpsc, Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}}, thread, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{fs, io::{Read, Write}, path::{Path, PathBuf}, sync::{mpsc, Arc, Mutex, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}, thread, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use crate::{canonical_path, LaunchContext};
 
 const MIGRATION_COPY_WORKERS: usize = 4; // MIGRATION_COPY_WORKERS（迁移文件复制的有界工作线程数）。
 const MIGRATION_COPY_BUFFER: usize = 1024 * 1024; // MIGRATION_COPY_BUFFER（每个复制线程复用的缓冲区字节数）。
+const VALIDATION_WORKERS: usize = 4; // VALIDATION_WORKERS（组件摘要校验的有界线程数）。
+const VALIDATION_BUFFER: usize = 1024 * 1024; // VALIDATION_BUFFER（每个校验线程复用的读取缓冲区）。
 
 #[derive(Clone, Debug)]
 pub struct Locator {
@@ -69,16 +71,22 @@ fn reparse(path:&Path)->bool {
     }).unwrap_or(false)
 }
 pub fn safe_path(root:&Path,relative:&str)->Result<PathBuf,String> {
+    let path=relative_path(relative)?;
+    let mut current=root.to_path_buf();
+    for part in path.components() {
+        current.push(part.as_os_str()); if reparse(&current){return Err("受管路径不能经过目录联接。".into());}
+    } Ok(current)
+}
+// relative_path（清单相对路径）：集中保留路径规则，目录遍历另行检查每个重解析点。
+pub(crate) fn relative_path(relative:&str)->Result<&Path,String>{
     let path=Path::new(relative);
     if relative.is_empty()||relative.contains(':')||relative.contains('\\')||path.is_absolute()||
         path.components().any(|part|!matches!(part,std::path::Component::Normal(_))) {return Err("资源路径越界。".into());}
-    let mut current=root.to_path_buf();
     for part in path.components() {
         let name=part.as_os_str().to_string_lossy(); let stem=name.split('.').next().unwrap_or("").to_ascii_lowercase();
         if name.ends_with(' ')||name.ends_with('.')||["con","prn","aux","nul"].contains(&stem.as_str())||
             (stem.len()==4&&(stem.starts_with("com")||stem.starts_with("lpt"))&&stem.as_bytes()[3].is_ascii_digit()) {return Err("资源路径包含系统保留名称。".into());}
-        current.push(part.as_os_str()); if reparse(&current){return Err("受管路径不能经过目录联接。".into());}
-    } Ok(current)
+    } Ok(path)
 }
 
 impl Locator {
@@ -780,9 +788,10 @@ pub fn remove_owned(path:&Path,root:&Path)->Result<(),String>{
     Ok(())
 }
 pub fn verify_tree(root:&Path,manifest_name:&str)->Result<(),String>{
-    verify_tree_progress(root,manifest_name,None,&mut|_,_|{})
+    verify_tree_with_progress(root,manifest_name,&AtomicBool::new(false),&mut|_,_,_|{})
 }
-fn verify_tree_progress(root:&Path,manifest_name:&str,cancel:Option<Arc<AtomicBool>>,progress:&mut dyn FnMut(u64,u64))->Result<(),String>{
+#[cfg(test)] // legacy_verify_tree（只读性能对照）：正式程序不包含旧的串行实现。
+fn legacy_verify_tree(root:&Path,manifest_name:&str,cancel:Option<Arc<AtomicBool>>,progress:&mut dyn FnMut(u64,u64))->Result<(),String>{
     let value=load(&root.join(manifest_name))?;
     let records=value["files"].as_array().ok_or("组件清单缺少文件集合")?;
     let total=records.iter().try_fold(0u64,|sum,item|sum.checked_add(item["size"].as_u64().ok_or("清单大小无效")?).ok_or("清单大小溢出"))?;
@@ -807,6 +816,162 @@ fn verify_tree_progress(root:&Path,manifest_name:&str,cancel:Option<Arc<AtomicBo
     let mut present=std::collections::HashSet::new();actual(root,root,&mut present)?;
     if expected!=present{return Err("组件文件集合与发布清单不一致。".into());}Ok(())
 }
+fn validation_cancel(cancel:&AtomicBool)->Result<(),String>{
+    if cancel.load(Ordering::Acquire){Err("组件校验已取消，原组件保持不变。".into())}else{Ok(())}
+}
+struct ValidationFile {
+    path: PathBuf, // path（已经过目录链接和文件集合检查的实际文件）。
+    size: u64, // size（清单中的完整文件字节数）。
+    sha256: String, // sha256（必须逐字节匹配的文件摘要）。
+}
+pub(crate) fn metadata_reparse(metadata:&fs::Metadata)->bool{
+    #[cfg(windows)] {use std::os::windows::fs::MetadataExt;metadata.file_attributes()&0x400!=0}
+    #[cfg(not(windows))] {metadata.file_type().is_symlink()}
+}
+// collect_validation_files（单次目录核对）：每个目录和文件检查一次，避免重复查询共同父目录。
+fn collect_validation_files(root:&Path,path:&Path,files:&mut std::collections::HashMap<String,(PathBuf,u64)>,
+    cancel:&AtomicBool,total:usize,last_report:&mut Instant,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
+    for entry in fs::read_dir(path).map_err(|e|e.to_string())?{
+        validation_cancel(cancel)?;
+        let entry=entry.map_err(|e|e.to_string())?;let path=entry.path();
+        let metadata=entry.metadata().map_err(|e|e.to_string())?;
+        if metadata_reparse(&metadata){return Err("组件含链接。".into());}
+        let relative=path.strip_prefix(root).map_err(|e|e.to_string())?.to_string_lossy().replace('\\',"/");
+        relative_path(&relative)?;
+        if metadata.is_dir(){collect_validation_files(root,&path,files,cancel,total,last_report,progress)?;}
+        else if metadata.is_file(){
+            let key=relative.to_lowercase();
+            if !["manifest.json","release.json"].contains(&key.as_str())&&files.insert(key,(path,metadata.len())).is_some(){
+                return Err("组件包含大小写冲突路径。".into());
+            }
+        }else{return Err("组件含非普通文件。".into());}
+        if last_report.elapsed()>=Duration::from_millis(100){
+            progress(&format!("核对组件文件清单（{} / {total} 个文件）",files.len()),0,0);*last_report=Instant::now();
+        }
+    }Ok(())
+}
+fn hash_validation_file(item:&ValidationFile,buffer:&mut [u8],cancel:&AtomicBool,stop:&AtomicBool,completed:&AtomicU64)->Result<String,String>{
+    validation_cancel(cancel)?;
+    let mut options=fs::OpenOptions::new();options.read(true);
+    #[cfg(windows)] {use std::os::windows::fs::OpenOptionsExt;options.custom_flags(0x00200000);} // FILE_FLAG_OPEN_REPARSE_POINT（不跟随文件链接）。
+    let mut stream=options.open(&item.path).map_err(|e|e.to_string())?;
+    let metadata=stream.metadata().map_err(|e|e.to_string())?;
+    if metadata_reparse(&metadata)||!metadata.is_file()||metadata.len()!=item.size{return Err(format!("组件文件校验失败：{}",item.path.display()));}
+    let mut hash=Sha256::new();let mut read_bytes=0u64;
+    loop{
+        validation_cancel(cancel)?;
+        if stop.load(Ordering::Acquire){return Ok(String::new());}
+        let count=stream.read(buffer).map_err(|e|e.to_string())?;
+        if count==0{break;}
+        hash.update(&buffer[..count]);read_bytes+=count as u64;completed.fetch_add(count as u64,Ordering::Relaxed);
+    }
+    let digest=format!("{:x}",hash.finalize());
+    if read_bytes!=item.size||(!item.sha256.is_empty()&&digest!=item.sha256){return Err(format!("组件文件校验失败：{}",item.path.display()));}
+    Ok(digest)
+}
+/// verify_tree_with_progress（完整组件校验）：清单、文件集合及全部摘要均检查，取消与进度在调用线程处理。
+pub fn verify_tree_with_progress(root:&Path,manifest_name:&str,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
+    validation_cancel(cancel)?;progress("读取组件文件清单",0,0);validation_cancel(cancel)?;
+    if metadata_reparse(&fs::symlink_metadata(root).map_err(|e|e.to_string())?){return Err("组件目录不能是链接。".into());}
+    let value=load(&safe_path(root,manifest_name)?)?;
+    let records=value["files"].as_array().ok_or("组件清单缺少文件集合")?;
+    verify_records_with_progress(root,records,true,cancel,progress)
+}
+
+/// verify_records_with_progress（固定文件内容校验）：模型允许清单外辅助文件，运行环境要求完整文件集合。
+pub fn verify_records_with_progress(root:&Path,records:&[Value],exact:bool,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
+    let files=prepare_validation_files(root,records,exact,cancel,progress)?;
+    hash_validation_files(&files,cancel,progress).map(|_|())
+}
+
+/// verify_tree_sizes（快速盘点）：只读取文件集合、路径和字节数，正式启动仍需完整摘要复核。
+pub fn verify_tree_sizes(root:&Path,manifest_name:&str)->Result<(),String>{
+    let value=load(&safe_path(root,manifest_name)?)?;
+    prepare_validation_files(root,value["files"].as_array().ok_or("组件清单缺少文件集合")?,true,&AtomicBool::new(false),&mut|_,_,_|{}).map(|_|())
+}
+
+fn prepare_validation_files(root:&Path,records:&[Value],exact:bool,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<Vec<ValidationFile>,String>{
+    validation_cancel(cancel)?;
+    if metadata_reparse(&fs::symlink_metadata(root).map_err(|e|e.to_string())?){return Err("组件目录不能是链接。".into());}
+    let mut expected=std::collections::HashSet::new();
+    for item in records{
+        validation_cancel(cancel)?;
+        let relative=item["path"].as_str().ok_or("清单路径无效")?;relative_path(relative)?;
+        if !expected.insert(relative.to_lowercase()){return Err("组件清单包含重复路径。".into());}
+    }
+    let mut present=std::collections::HashMap::new();let mut last_report=Instant::now();
+    progress("核对组件文件清单",0,0);
+    collect_validation_files(root,root,&mut present,cancel,records.len(),&mut last_report,progress)?;
+    if (exact&&expected.len()!=present.len())||!expected.iter().all(|path|present.contains_key(path)){return Err("组件文件集合与发布清单不一致。".into());}
+    let mut files=Vec::with_capacity(records.len());
+    for item in records{
+        validation_cancel(cancel)?;
+        let (path,size)=present.remove(&item["path"].as_str().unwrap().to_lowercase()).unwrap();
+        if size!=item["size"].as_u64().unwrap(){return Err(format!("组件文件校验失败：{}",path.display()));}
+        let sha256=item["sha256"].as_str().ok_or("清单摘要无效")?;
+        if sha256.len()!=64||!sha256.bytes().all(|byte|byte.is_ascii_hexdigit()){return Err("清单摘要无效".into());}
+        files.push(ValidationFile{path,size,sha256:sha256.to_lowercase()});
+    }
+    Ok(files)
+}
+
+/// manifest_with_progress（生成完整文件摘要清单）：一次遍历、有界并行读取，并在调用线程报告进度。
+pub fn manifest_with_progress(root:&Path,kind:&str,build:&str,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<Value,String>{
+    validation_cancel(cancel)?;
+    if metadata_reparse(&fs::symlink_metadata(root).map_err(|e|e.to_string())?){return Err("组件目录不能是链接。".into());}
+    let mut present=std::collections::HashMap::new();let mut last_report=Instant::now();
+    progress("扫描组件文件清单",0,0);
+    collect_validation_files(root,root,&mut present,cancel,0,&mut last_report,progress)?;
+    let mut files:Vec<_>=present.into_values().map(|(path,size)|ValidationFile{path,size,sha256:String::new()}).collect();
+    files.sort_by(|a,b|a.path.cmp(&b.path));
+    let hashes=hash_validation_files(&files,cancel,progress)?;
+    let records=files.iter().zip(hashes).map(|(file,sha256)|json!({"path":file.path.strip_prefix(root).unwrap().to_string_lossy().replace('\\',"/"),"size":file.size,"sha256":sha256})).collect::<Vec<_>>();
+    Ok(json!({"schema":1,"kind":kind,"build":build,"files":records,"fields":{"schema":"清单格式","kind":"资源类别","build":"版本标识","files":"文件列表","path":"相对路径","size":"字节数","sha256":"文件摘要"}}))
+}
+
+fn hash_validation_files(files:&[ValidationFile],cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<Vec<String>,String>{
+    let total=files.iter().try_fold(0u64,|sum,item|sum.checked_add(item.size).ok_or("清单大小溢出"))?;
+    let hashes=Mutex::new(vec![String::new();files.len()]);let mut last_report=Instant::now();
+    let completed=AtomicU64::new(0);let checked=AtomicUsize::new(0);let next=AtomicUsize::new(0);let stop=AtomicBool::new(false);
+    let failure=Mutex::new(None::<String>);let worker_count=files.len().min(VALIDATION_WORKERS);
+    let (sender,receiver)=mpsc::channel();progress("校验组件文件内容",0,total);validation_cancel(cancel)?;
+    thread::scope(|scope|{
+        let mut workers=vec![];
+        for _ in 0..worker_count{
+            let sender=sender.clone();let next=&next;let stop=&stop;let completed=&completed;let checked=&checked;let failure=&failure;let hashes=&hashes;
+            workers.push(scope.spawn(move||{
+                let outcome=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{
+                    let mut buffer=vec![0;VALIDATION_BUFFER];
+                    loop{
+                        validation_cancel(cancel)?;if stop.load(Ordering::Acquire){break;}
+                        let index=next.fetch_add(1,Ordering::Relaxed);if index>=files.len(){break;}
+                        let digest=hash_validation_file(&files[index],&mut buffer,cancel,stop,completed)?;
+                        hashes.lock().map_err(|_|"组件摘要状态不可用。")?[index]=digest;checked.fetch_add(1,Ordering::Relaxed);
+                    }Ok::<(),String>(())
+                })).unwrap_or_else(|_|Err("组件校验工作线程异常退出。".into()));
+                if let Err(error)=outcome{let mut record=failure.lock().unwrap();if record.is_none(){*record=Some(error);}stop.store(true,Ordering::Release);}
+                let _=sender.send(());
+            }));
+        }
+        drop(sender);let mut finished=0;
+        while finished<worker_count{
+            match receiver.recv_timeout(Duration::from_millis(100)){
+                Ok(())=>finished+=1,
+                Err(mpsc::RecvTimeoutError::Timeout)=>{},
+                Err(mpsc::RecvTimeoutError::Disconnected)=>break,
+            }
+            if last_report.elapsed()>=Duration::from_millis(100)&&!stop.load(Ordering::Acquire){
+                progress(&format!("校验组件文件内容（{} / {} 个文件）",checked.load(Ordering::Relaxed),files.len()),completed.load(Ordering::Relaxed).min(total),total);
+                last_report=Instant::now();
+            }
+        }
+        for worker in workers{if worker.join().is_err(){*failure.lock().unwrap()=Some("组件校验工作线程异常退出。".into());}}
+    });
+    validation_cancel(cancel)?;
+    if let Some(error)=failure.into_inner().map_err(|_|"组件校验状态不可用。")?{return Err(error);}
+    progress("组件文件校验完成",total,total);validation_cancel(cancel)?;
+    hashes.into_inner().map_err(|_|"组件摘要状态不可用。".into())
+}
 pub fn recover_install(root:&Path)->Result<(),String>{
     let journal=root.join("tmp/update-transaction.json");if !journal.is_file(){return Ok(());}
     let record=load(&journal)?;let committed=record["state"]=="committed";
@@ -822,4 +987,132 @@ pub fn recover_install(root:&Path)->Result<(),String>{
         else if row["original"]==false&&target.exists()&&!incoming.exists(){remove_owned(&target,root)?;}
     }}
     remove_owned(&root.join("tmp/publish"),root)?;fs::remove_file(journal).map_err(|e|e.to_string())?;Ok(())
+}
+
+/// file_hash_with_progress（单文件摘要）：大文件的每个读取块均响应取消。
+pub fn file_hash_with_progress(path:&Path,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<String,String>{
+    let size=fs::metadata(path).map_err(|e|e.to_string())?.len();
+    hash_validation_files(&[ValidationFile{path:path.to_path_buf(),size,sha256:String::new()}],cancel,progress).map(|mut hashes|hashes.remove(0))
+}
+
+#[cfg(test)]
+mod component_validation_tests {
+    use super::*;
+    fn fixture()->PathBuf{
+        let root=std::env::temp_dir().join(format!("voice-validation-{}",new_id()));
+        fs::create_dir_all(root.join("中文 目录/nested")).unwrap();
+        for index in 0..32{fs::write(root.join(format!("中文 目录/nested/{index:03}.bin")),vec![index as u8;4096]).unwrap();}
+        fs::write(root.join("empty.bin"),b"").unwrap();
+        atomic_json(&root.join("manifest.json"),&crate::resources::manifest(&root,"fixture","1").unwrap()).unwrap();root
+    }
+    #[test]
+    fn complete_hashes_report_progress_on_caller_and_accept_empty_unicode_files(){
+        let root=fixture();let caller=thread::current().id();let mut bytes=vec![];let mut phases=vec![];
+        verify_tree_with_progress(&root,"manifest.json",&AtomicBool::new(false),&mut|phase,done,total|{
+            assert_eq!(thread::current().id(),caller);assert!(done<=total);if total>0{bytes.push(done);}phases.push(phase.to_string());
+        }).unwrap();
+        assert_eq!(bytes.first(),Some(&0));assert_eq!(bytes.last(),Some(&(32*4096)));
+        assert!(bytes.windows(2).all(|pair|pair[0]<=pair[1]));assert_eq!(phases.last().unwrap(),"组件文件校验完成");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn detects_same_size_corruption_missing_and_extra_files(){
+        let root=fixture();let target=root.join("中文 目录/nested/004.bin");
+        fs::write(&target,vec![99;4096]).unwrap();assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("校验失败"));
+        fs::write(&target,vec![4;4096]).unwrap();fs::write(root.join("extra.bin"),b"extra").unwrap();
+        assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("文件集合"));fs::remove_file(root.join("extra.bin")).unwrap();
+        fs::remove_file(&target).unwrap();assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("文件集合"));fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn rejects_duplicates_traversal_and_reserved_names(){
+        let root=fixture();let original=load(&root.join("manifest.json")).unwrap();
+        let mut value=original.clone();let duplicate=value["files"][0].clone();value["files"].as_array_mut().unwrap().push(duplicate);
+        atomic_json(&root.join("manifest.json"),&value).unwrap();assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("重复"));
+        for name in ["../escape.bin","C:/escape.bin","中文 目录\\escape.bin","NUL.bin"]{
+            let mut value=original.clone();value["files"][0]["path"]=json!(name);atomic_json(&root.join("manifest.json"),&value).unwrap();
+            assert!(verify_tree(&root,"manifest.json").is_err(),"应拒绝 {name}（非法路径）");
+        }fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cancellation_during_inventory_and_before_hash_preserves_all_files(){
+        let root=fixture();let original=file_hash(&root.join("manifest.json")).unwrap();
+        for target in ["读取组件文件清单","核对组件文件清单","校验组件文件内容"]{
+            let cancel=AtomicBool::new(false);
+            let error=verify_tree_with_progress(&root,"manifest.json",&cancel,&mut|phase,_,_|{
+                if phase==target{cancel.store(true,Ordering::Release);}
+            }).unwrap_err();assert!(error.contains("取消"));assert_eq!(file_hash(&root.join("manifest.json")).unwrap(),original);
+        }verify_tree(&root,"manifest.json").unwrap();fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cancellation_interrupts_reading_inside_large_file(){
+        let root=fixture();let path=root.join("large.bin");fs::write(&path,vec![7;32*1024*1024]).unwrap();
+        let item=ValidationFile{path:path.clone(),size:32*1024*1024,sha256:file_hash(&path).unwrap()};
+        let cancel=AtomicBool::new(false);let completed=AtomicU64::new(0);let stopped=AtomicBool::new(false);
+        thread::scope(|scope|{
+            let handle=scope.spawn(||{
+                let mut buffer=vec![0;VALIDATION_BUFFER];hash_validation_file(&item,&mut buffer,&cancel,&stopped,&completed)
+            });
+            while completed.load(Ordering::Acquire)==0&&!handle.is_finished(){thread::yield_now();}
+            cancel.store(true,Ordering::Release);assert!(handle.join().unwrap().unwrap_err().contains("取消"));
+        });
+        assert!(completed.load(Ordering::Acquire)<item.size);assert_eq!(file_hash(&path).unwrap(),item.sha256);fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(windows)]
+    fn rejects_junction_without_touching_external_directory(){
+        use std::os::windows::process::CommandExt;
+        let root=fixture();let external=fixture();let linked=root.join("linked");
+        let status=std::process::Command::new("cmd.exe").args(["/D","/C","mklink","/J"])
+            .arg(&linked).arg(&external).creation_flags(0x08000000).stdout(std::process::Stdio::null()).status().unwrap();
+        assert!(status.success());assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("链接"));
+        assert!(external.join("manifest.json").is_file());fs::remove_dir(&linked).unwrap();fs::remove_dir_all(root).unwrap();fs::remove_dir_all(external).unwrap();
+    }
+    #[test]
+    #[ignore="手动只读验收：对指定真实组件目录测量完整摘要校验与取消延迟"]
+    fn benchmark_existing_component_read_only(){
+        let root=PathBuf::from(std::env::var_os("VOICE_VALIDATION_TEST_ROOT").expect("需要 VOICE_VALIDATION_TEST_ROOT（只读组件目录）"));
+        let report=PathBuf::from(std::env::var_os("VOICE_VALIDATION_REPORT").expect("需要 VOICE_VALIDATION_REPORT（测试报告路径）"));
+        let input=load(&root.join("manifest.json")).unwrap();let count=input["files"].as_array().unwrap().len();
+        let total=input["files"].as_array().unwrap().iter().map(|row|row["size"].as_u64().unwrap()).sum::<u64>();
+        let original=file_hash(&root.join("manifest.json")).unwrap();let mut runs=vec![];
+        // 两轮反转执行顺序；旧实现最多运行 30 秒，完整结果与截断结果分别记录。
+        for (round,order) in [(1,["legacy","optimized"]),(2,["optimized","legacy"])]{
+            for mode in order{
+                let started=Instant::now();let mut bytes=0;let mut calls=0;let mut phase=String::new();let mut report_clock=Instant::now();
+                let signal=Arc::new(AtomicBool::new(false));
+                let result=if mode=="legacy"{
+                    legacy_verify_tree(&root,"manifest.json",Some(signal.clone()),&mut|done,_|{
+                        bytes=done;calls+=1;if started.elapsed()>=Duration::from_secs(30){signal.store(true,Ordering::Release);}
+                    })
+                }else{
+                    verify_tree_with_progress(&root,"manifest.json",&signal,&mut|current,done,total|{
+                        bytes=done;calls+=1;
+                        if phase!=current&&report_clock.elapsed()>=Duration::from_secs(5){println!("第 {round} 轮 {mode}（校验模式）：{current}，{done} / {total} 字节");report_clock=Instant::now();}phase=current.into();
+                    })
+                };
+                let elapsed=started.elapsed().as_secs_f64();println!("第 {round} 轮 {mode}（校验模式）：{elapsed:.3} 秒，{bytes} / {total} 字节，完整完成={}",result.is_ok());
+                if mode=="optimized"{assert!(result.is_ok(),"优化校验失败：{result:?}");}
+                else if result.is_err(){assert!(signal.load(Ordering::Acquire),"旧校验异常：{result:?}");}
+                runs.push(json!({"round":round,"mode":mode,"seconds":elapsed,"complete":result.is_ok(),"verified_bytes":bytes,"progress_calls":calls,"error":result.err()}));
+            }
+        }
+        let cancel=AtomicBool::new(false);let started=Instant::now();let mut requested=None;
+        let result=verify_tree_with_progress(&root,"manifest.json",&cancel,&mut|phase,_,_|{
+            if phase.starts_with("校验组件文件内容（")&&requested.is_none(){requested=Some(Instant::now());cancel.store(true,Ordering::Release);}
+        });assert!(result.unwrap_err().contains("取消"));assert!(requested.is_some());
+        let cancel_latency=requested.unwrap().elapsed().as_secs_f64();assert!(cancel_latency<2.0);assert_eq!(file_hash(&root.join("manifest.json")).unwrap(),original);
+        let cancelled_test_seconds=started.elapsed().as_secs_f64();
+        let mut runtime_cancel_verified=false;
+        if root.file_name().is_some_and(|name|name=="python")&&root.parent().is_some_and(|path|path.file_name().is_some_and(|name|name=="runtimes")){
+            let workspace=root.parent().unwrap().parent().unwrap();let context=LaunchContext::portable(workspace).unwrap();
+            let signal=Arc::new(AtomicBool::new(false));let mut activated=false;let mut phases=vec![];
+            let result=crate::runtime::configure_with_activation(&context,"all",signal.clone(),&mut|phase,_,_|{
+                phases.push(phase.to_string());if phase=="校验现有语音环境：校验组件文件内容"{signal.store(true,Ordering::Release);}
+            },&mut|_,_|{activated=true;Ok(())});
+            assert!(result.unwrap_err().contains("取消"));assert!(!activated);assert!(phases.iter().all(|phase|!phase.contains("下载")));
+            assert_eq!(file_hash(&root.join("manifest.json")).unwrap(),original);runtime_cancel_verified=true;
+        }
+        atomic_json(&report,&json!({"success":true,"files":count,"total_bytes":total,"runs":runs,"cancellation_seconds":cancel_latency,"cancelled_test_seconds":cancelled_test_seconds,"runtime_cancel_verified":runtime_cancel_verified,"manifest_preserved":true,
+            "fields":{"success":"两轮完整校验及取消验收通过","files":"实际组件文件数","total_bytes":"清单文件总字节数","runs":"两轮反转顺序的旧串行与优化校验","round":"测量轮次","mode":"legacy（旧串行）或 optimized（优化校验）","seconds":"该轮耗时秒数","complete":"是否完成全部内容及文件集合校验","verified_bytes":"该轮校验完的字节数；旧实现可能因30秒预算截断","progress_calls":"进度回调次数","error":"截断或校验错误","cancellation_seconds":"发出取消后到返回的秒数","cancelled_test_seconds":"含目录扫描在内的取消测试总秒数","runtime_cancel_verified":"真实配置入口取消后没有下载或启用环境","manifest_preserved":"原组件清单摘要不变"}})).unwrap();
+    }
 }

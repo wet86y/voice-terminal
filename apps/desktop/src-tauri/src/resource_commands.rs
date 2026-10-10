@@ -38,12 +38,15 @@ struct JobSnapshot {
     installed_resources: Vec<String>, // installed_resources（本次安装资源编号）。
     import_preview: Option<Value>, // import_preview（预校验通过的导入识别结果）。
     created_at: u64, // created_at（任务创建时间，Unix 毫秒）。
+    revision: u64, // revision（任务状态修订号）：事件与补查快照使用同一顺序。
 }
 
 struct JobControl {
     snapshot: JobSnapshot,
     cancel: Arc<AtomicBool>, // cancel（受控线程取消信号）。
     child: Option<Arc<Mutex<ControlledProcess>>>, // child（仅用于可取消阶段的受控进程）。
+    last_event: Instant, // last_event（最近进度广播时刻）。
+    last_persist: Instant, // last_persist（最近状态持久化时刻）。
 }
 
 struct ControlledProcess {
@@ -85,6 +88,17 @@ struct ProcessError {
     cancelled: bool,
 }
 
+#[derive(Clone,PartialEq,Eq)]
+struct PreparedEnvironment {
+    manifest_sha256:String, // manifest_sha256（已完整验证的环境清单摘要）。
+    fingerprint:String, // fingerprint（全部文件的路径、大小及修改时间指纹）。
+}
+impl PreparedEnvironment{
+    fn read(root:&Path)->Result<Self,String>{
+        Ok(Self{manifest_sha256:voice_desktop_common::workspace::file_hash(&root.join("manifest.json"))?,fingerprint:voice_desktop_common::runtime::fingerprint(root)?})
+    }
+}
+
 /// ResourceManager（资源管理器）：owns resource jobs and talks only to fixed local tools.
 pub struct ResourceManager {
     context: LaunchContext,
@@ -97,6 +111,8 @@ pub struct ResourceManager {
     activation: Mutex<()>, // activation（仅串行化资源启用；下载、解包与校验不占锁）。
     environment: Mutex<()>, // environment（串行化完整语音环境的复制、组装与导入；模型下载仍可并行）。
     resume_pending: Mutex<bool>, // resume_pending（先前运行服务的延迟恢复意图；全部资源更新完成后才恢复）。
+    validation_failures:Mutex<HashMap<String,String>>, // validation_failures（本次启动的完整校验失败）：管理页不能以字节数盘点掩盖同长度损坏。
+    prepared_environment:Mutex<Option<PreparedEnvironment>>, // prepared_environment（本次任务已验证的共享环境）：启动仍做全量摘要复核。
 }
 
 impl ResourceManager {
@@ -123,6 +139,8 @@ impl ResourceManager {
             environment: Mutex::new(()),
             reviews: Mutex::new(HashMap::new()),
             resume_pending: Mutex::new(false),
+            validation_failures:Mutex::new(HashMap::new()),
+            prepared_environment:Mutex::new(None),
         };
         manager.persist_jobs()?;
         Ok(manager)
@@ -130,7 +148,22 @@ impl ResourceManager {
 
     /// Inventory（资源清单）：normalize the Python resource result for the frontend.
     pub fn inventory(&self) -> Result<Vec<Value>, String> {
-        voice_desktop_common::resources::inventory(&self.context)
+        let mut rows=voice_desktop_common::resources::inventory(&self.context)?;
+        let failures=self.validation_failures.lock().map_err(|_|"组件校验状态不可用。")?;
+        for row in &mut rows{if let Some(reason)=row["resource_id"].as_str().and_then(|id|failures.get(id)){
+            row["can_start"]=json!(false);row["files_installed"]=json!(false);row["installation_state"]=json!("incomplete");row["error"]=json!(reason);
+        }}
+        if rows.iter().skip(1).any(|row|row["can_start"]!=true){if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);}}
+        Ok(rows)
+    }
+    pub fn record_validation(&self,readiness:&Value){
+        if let Ok(mut failures)=self.validation_failures.lock(){failures.clear();
+            for row in readiness["missing"].as_array().into_iter().flatten(){
+                if let (Some(id),Some(reason))=(row["resource_id"].as_str(),row["reason"].as_str()){
+                    if reason.contains("完整摘要复核失败"){failures.insert(id.to_owned(),reason.to_owned());}
+                }
+            }
+        }
     }
 
     pub fn context(&self)->LaunchContext {self.context.clone()}
@@ -186,13 +219,14 @@ impl ResourceManager {
         })?;Ok(json!({"job_id":job_id}))
     }
     pub fn snapshots(&self)->Vec<Value>{let mut rows=self.jobs.lock().unwrap().values().map(|job|event_value(&job.snapshot)).collect::<Vec<_>>();rows.sort_by_key(|row|row["created_at"].as_u64().unwrap_or(0));rows}
+    pub fn has_active_jobs(&self)->bool{self.jobs.lock().map(|jobs|jobs.values().any(|job|!terminal(&job.snapshot.state))).unwrap_or(true)}
     pub fn configure_runtime(self:&Arc<Self>,group:String)->Result<Value,String>{
         let job_id=format!("env-{group}");
         self.start_job(job_id.clone(),"voice-server".into(),"正在配置语音环境".into(),true,move|manager,id|{
             let cancel=manager.cancel_signal(&id)?;
             let mut progress=|phase:&str,done:u64,total:u64|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total));
             let _environment=acquire_environment_lock(&manager.environment,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:vec![]})?;
-            let result=voice_desktop_common::runtime::configure_with_activation(&manager.context,&group,cancel,&mut progress,&mut|stage,relative|manager.activate_resource(&id,stage,relative));
+            let result=manager.prepare_environment(&id,&group,cancel,&mut progress);
             result.map_err(|message|JobError::Failed{message,installed:vec![]})
         })?;Ok(json!({"job_id":job_id}))
     }
@@ -291,6 +325,7 @@ impl ResourceManager {
             job.snapshot.state = "cancelling".into();
             job.snapshot.phase = "正在取消当前阶段".into();
             job.snapshot.can_cancel = false;
+            job.snapshot.revision = job.snapshot.revision.saturating_add(1);
             let child = job.child.clone();
             let event = event_value(&job.snapshot);
             self.persist_locked(&jobs)?;
@@ -317,6 +352,7 @@ impl ResourceManager {
                 job.snapshot.state = "cancelling".into();
                 job.snapshot.phase = "工作区切换前正在停止可取消阶段".into();
                 job.snapshot.can_cancel = false;
+                job.snapshot.revision=job.snapshot.revision.saturating_add(1);
                 if let Some(child) = job.child.clone() { children.push(child); }
                 events.push(event_value(&job.snapshot));
             }
@@ -519,8 +555,8 @@ impl ResourceManager {
     fn pending_service_resume(&self)->Result<bool,String>{Ok(*self.resume_pending.lock().map_err(|_|"服务恢复意图不可用。")?)}
 
     fn all_resources_ready(&self)->Result<bool,String>{
-        let readiness=voice_desktop_common::resources::startup_readiness(&self.context)?;
-        Ok(readiness["ready"]==true)
+        // 服务入口随后执行全量校验；这里仅判定能否进入该入口，避免恢复时连续读取两遍全部组件。
+        Ok(voice_desktop_common::resources::inventory(&self.context)?.iter().all(|row|row["can_start"]==true))
     }
 
     fn maybe_resume_service(&self,lease:&mut ServiceLease<'_>)->Result<bool,String>{
@@ -578,6 +614,8 @@ impl ResourceManager {
         match voice_desktop_common::resources::commit_activation(&self.context,&mut transaction){
             Ok(())=>{
                 clear_resume_intent_if_resumed(&self.resume_pending,resumed);
+                if relative=="runtimes/python"{*self.prepared_environment.lock().map_err(|_|"环境复用状态不可用。")?=None;}
+                self.publish_installed(job_id,relative);
                 Ok(())
             },
             Err(error) if transaction.is_committed()=>{
@@ -587,6 +625,38 @@ impl ResourceManager {
             }
             Err(error)=>Err(self.rollback_failed_activation(&mut lease,&mut transaction,&error)),
         }
+    }
+
+    fn publish_installed(&self,job_id:&str,relative:&str){
+        let resource_id=if relative=="runtimes/python"{Some("voice-server".to_string())}else if relative=="runtimes/dsh"{Some("dsh".to_string())}
+            else{voice_desktop_common::resources::specs(&self.context).ok().into_iter().flatten().find(|item|item["destination"].as_str().is_some_and(|path|relative==format!("models/{path}")))
+                .and_then(|item|item["resource_id"].as_str().map(str::to_owned))};
+        if let Some(id)=resource_id{
+            if let Ok(mut failures)=self.validation_failures.lock(){failures.remove(&id);}
+            self.update_job(job_id,|snapshot|{if !snapshot.installed_resources.contains(&id){snapshot.installed_resources.push(id);}});
+        }
+    }
+
+    fn current_environment_identity(&self)->Result<PreparedEnvironment,String>{
+        let root=self.context.install.join("runtimes/python");
+        PreparedEnvironment::read(&root)
+    }
+    fn prepare_environment(&self,job_id:&str,group:&str,cancel:Arc<AtomicBool>,progress:&mut voice_desktop_common::resources::Progress<'_>)->Result<Vec<String>,String>{
+        voice_desktop_common::resources::check_cancel(&cancel)?;
+        let ready=voice_desktop_common::runtime::status(&self.context)?["full_ready"]==true;
+        let verified=self.prepared_environment.lock().map_err(|_|"环境复用状态不可用。")?.clone();
+        if ready&&verified.is_some(){
+            progress("核对本次已验证共享环境是否变化",0,0);
+            let current=self.current_environment_identity();voice_desktop_common::resources::check_cancel(&cancel)?;
+            if current.as_ref().ok()==verified.as_ref(){
+                progress("复用本次已验证完整语音环境",1,1);return Ok(vec!["voice-server".into()]);
+            }
+            *self.prepared_environment.lock().map_err(|_|"环境复用状态不可用。")?=None;
+        }
+        let result=voice_desktop_common::runtime::configure_with_activation(&self.context,group,cancel.clone(),progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative))?;
+        voice_desktop_common::resources::check_cancel(&cancel)?;
+        *self.prepared_environment.lock().map_err(|_|"环境复用状态不可用。")?=Some(self.current_environment_identity()?);
+        Ok(result)
     }
 
     fn start_job<F>(self: &Arc<Self>, job_id: String, resource_id: String, phase: String, can_cancel: bool, worker: F) -> Result<(), String>
@@ -599,10 +669,12 @@ impl ResourceManager {
             if jobs.values().any(|job|job.snapshot.resource_id==resource_id&&!terminal(&job.snapshot.state)){
                 return Err("此组件已有下载或导入任务，请等待该任务完成。".into());
             }
+            let created_at=unix_millis().max(jobs.get(&job_id).map(|job|job.snapshot.created_at.saturating_add(1)).unwrap_or(0));
             let snapshot = JobSnapshot { job_id: job_id.clone(), resource_id, state: "queued".into(), phase,
                 completed_bytes: 0, total_bytes: None, error: None, can_cancel, installed_resources: vec![],
-                import_preview: None, created_at: unix_millis() };
-            jobs.insert(job_id.clone(), JobControl { snapshot: snapshot.clone(), cancel: Arc::new(AtomicBool::new(false)), child: None });
+                import_preview: None, created_at, revision: 1 };
+            jobs.insert(job_id.clone(), JobControl { snapshot: snapshot.clone(), cancel: Arc::new(AtomicBool::new(false)), child: None,
+                last_event:Instant::now(),last_persist:Instant::now() });
             self.persist_locked(&jobs)?;
             let _ = self.app.emit(PROGRESS_EVENT, event_value(&snapshot));
         }
@@ -631,6 +703,7 @@ impl ResourceManager {
             Err(JobError::Cancelled) => ("cancelled", "任务已取消；临时下载可供重试", None, vec![]),
             Err(JobError::Failed { message, installed }) => ("failed", "资源处理失败", Some(message), installed),
         };
+        if let Ok(mut failures)=self.validation_failures.lock(){for id in &installed{failures.remove(id);}}
         self.update_job(job_id, |snapshot| {
             snapshot.state = state.into(); snapshot.phase = phase.into(); snapshot.error = error;
             snapshot.can_cancel = false; snapshot.installed_resources = installed;snapshot.import_preview=None;
@@ -658,6 +731,8 @@ impl ResourceManager {
             job.snapshot.can_cancel = false;
             job.snapshot.completed_bytes = done;
             job.snapshot.total_bytes = total;
+            job.snapshot.revision = job.snapshot.revision.saturating_add(1);
+            job.last_event=Instant::now();job.last_persist=Instant::now();
             let event = event_value(&job.snapshot);
             self.persist_locked(&jobs)?;
             event
@@ -671,12 +746,18 @@ impl ResourceManager {
         let event = {
             let Ok(mut jobs) = self.jobs.lock() else { return; };
             let Some(job) = jobs.get_mut(job_id) else { return; };
+            let previous_state=job.snapshot.state.clone();let previous_phase=job.snapshot.phase.clone();
+            let previous_installed=job.snapshot.installed_resources.clone();
             update(&mut job.snapshot);
-            let value = event_value(&job.snapshot);
-            let _ = self.persist_locked(&jobs);
+            job.snapshot.revision=job.snapshot.revision.saturating_add(1);
+            let boundary=previous_state!=job.snapshot.state||previous_phase.split('（').next()!=job.snapshot.phase.split('（').next()||previous_installed!=job.snapshot.installed_resources;
+            let publish=boundary||terminal(&job.snapshot.state)||job.last_event.elapsed()>=Duration::from_millis(100);
+            let persist=boundary||terminal(&job.snapshot.state)||job.last_persist.elapsed()>=Duration::from_secs(1);
+            let value=if publish{job.last_event=Instant::now();Some(event_value(&job.snapshot))}else{None};
+            if persist{job.last_persist=Instant::now();let _=self.persist_locked(&jobs);}
             value
         };
-        let _ = self.app.emit(PROGRESS_EVENT, event);
+        if let Some(event)=event{let _ = self.app.emit(PROGRESS_EVENT, event);}
         self.jobs_changed.notify_all();
     }
 
@@ -711,8 +792,9 @@ impl ResourceManager {
             let installed_resources = value["installed_resources"].as_array().map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
             let snapshot = JobSnapshot { job_id: job_id.into(), resource_id: resource_id.into(), state, phase,
                 completed_bytes: value["completed_bytes"].as_u64().unwrap_or(0), total_bytes: value["total_bytes"].as_u64(),
-                error, can_cancel, installed_resources, import_preview: None, created_at: value["created_at"].as_u64().unwrap_or(0) };
-            jobs.insert(snapshot.job_id.clone(), JobControl { snapshot, cancel: Arc::new(AtomicBool::new(false)), child: None });
+                error, can_cancel, installed_resources, import_preview: None, created_at: value["created_at"].as_u64().unwrap_or(0),revision:value["revision"].as_u64().unwrap_or(0).saturating_add(1) };
+            jobs.insert(snapshot.job_id.clone(), JobControl { snapshot, cancel: Arc::new(AtomicBool::new(false)), child: None,
+                last_event:Instant::now(),last_persist:Instant::now() });
         }
         Ok(jobs)
     }
@@ -743,7 +825,7 @@ impl ResourceManager {
         let Some(group)=spec["dependency_group"].as_str() else{return Ok(vec![])};
         let _environment=acquire_environment_lock(&self.environment,&cancel,progress)?;
         let activation_job=job_id.to_owned();
-        voice_desktop_common::runtime::configure_with_activation(&self.context,group,cancel,progress,&mut|stage,relative|self.activate_resource(&activation_job,stage,relative))
+        self.prepare_environment(&activation_job,group,cancel,progress)
     }
 }
 
@@ -832,7 +914,9 @@ fn event_value(snapshot: &JobSnapshot) -> Value {
         "can_cancel": snapshot.can_cancel,
         "installed_resources": snapshot.installed_resources,
         "created_at": snapshot.created_at,
+        "revision": snapshot.revision,
         "import_preview": snapshot.import_preview,
+        "fields":{"created_at":"本次任务创建时间，Unix 毫秒","revision":"状态修订号，拒绝迟到事件","job_id":"任务编号","resource_id":"组件编号","state":"任务状态","phase":"当前阶段","completed_bytes":"已处理字节数","total_bytes":"总字节数","error":"失败说明","can_cancel":"是否允许取消","installed_resources":"本次启用的组件编号","import_preview":"导入确认内容"},
     })
 }
 
@@ -869,6 +953,11 @@ fn localized_phase(value: &str) -> &'static str {
 fn command_allowed(window: &WebviewWindow, desktop: &State<'_, Arc<super::Desktop>>) -> Result<(), String> {
     super::require_command(desktop.mode, super::DesktopCommand::FocusMain)?;
     super::trusted(window, desktop)
+}
+
+#[tauri::command]
+pub fn resource_jobs(window:WebviewWindow,desktop:State<'_,Arc<super::Desktop>>,manager:State<'_,Arc<ResourceManager>>)->Result<Vec<Value>,String>{
+    command_allowed(&window,&desktop)?;Ok(manager.snapshots())
 }
 
 #[tauri::command]
@@ -937,6 +1026,27 @@ pub fn resource_import_confirm(window:WebviewWindow,desktop:State<Arc<super::Des
 #[cfg(test)]
 mod service_tests {
     use super::*;
+
+    #[test]
+    fn prepared_environment_identity_rejects_changed_manifest_and_file_collection(){
+        let root=std::env::temp_dir().join(format!("voice-environment-reuse-{}",voice_desktop_common::workspace::new_id()));fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("python.exe"),b"fixture").unwrap();voice_desktop_common::workspace::atomic_json(&root.join("manifest.json"),&json!({"files":[]})).unwrap();
+        let original=PreparedEnvironment::read(&root).unwrap();assert!(PreparedEnvironment::read(&root).unwrap()==original);
+        voice_desktop_common::workspace::atomic_json(&root.join("manifest.json"),&json!({"files":[],"build":"changed"})).unwrap();assert!(PreparedEnvironment::read(&root).unwrap()!=original);
+        let current=PreparedEnvironment::read(&root).unwrap();fs::write(root.join("changed.dll"),b"new file").unwrap();assert!(PreparedEnvironment::read(&root).unwrap()!=current);
+        fs::remove_file(root.join("manifest.json")).unwrap();assert!(PreparedEnvironment::read(&root).is_err());fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_jobs_keep_revision_order_and_interrupted_tasks_become_terminal(){
+        let root=std::env::temp_dir().join(format!("voice-job-revision-{}",voice_desktop_common::workspace::new_id()));fs::create_dir_all(&root).unwrap();let path=root.join("jobs.json");
+        voice_desktop_common::workspace::atomic_json(&path,&json!({"schema":1,"jobs":[{
+            "job_id":"dl-model","resource_id":"model","state":"running","phase":"正在下载","created_at":100,"revision":7,"completed_bytes":50,"total_bytes":100
+        }]})).unwrap();
+        let jobs=ResourceManager::load_jobs(&path).unwrap();let event=event_value(&jobs["dl-model"].snapshot);
+        assert_eq!(event["state"],"failed");assert_eq!(event["revision"],8);assert_eq!(event["created_at"],100);assert_eq!(event["can_cancel"],false);
+        assert!(event["fields"]["revision"].as_str().unwrap().contains("修订号"));fs::remove_dir_all(root).unwrap();
+    }
 
     fn control(running: bool) -> (ServiceControl, Arc<Mutex<Vec<bool>>>) {
         let calls=Arc::new(Mutex::new(vec![]));let log=calls.clone();

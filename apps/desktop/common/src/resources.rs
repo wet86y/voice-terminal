@@ -1,9 +1,9 @@
 //! Native resources（原生资源）：模型文件与 DSH 安装不需要 Python（后端解释器）。
-use std::{fs, io::{Read, Write}, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, Ordering}}, process::{Command, Stdio}};
+use std::{fs, io::{Read, Write}, path::{Path, PathBuf}, sync::{mpsc,Arc,Mutex, atomic::{AtomicBool,AtomicU64,AtomicUsize, Ordering}}, process::{Command, Stdio},time::{Duration,Instant}};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use base64::Engine;
-use crate::{LaunchContext, download::{DownloadFile, download}, workspace::{safe_path, file_hash, atomic_json, remove_owned}};
+use crate::{LaunchContext, download::DownloadFile, workspace::{safe_path, file_hash, atomic_json, remove_owned}};
 pub type Progress<'a> = dyn FnMut(&str,u64,u64) + 'a; // Progress（阶段与字节进度回调）。
 pub type Activation<'a> = dyn FnMut(&Path,&str)->Result<(),String> + 'a; // Activation（启用回调）：候选目录与固定目标，宿主在此短暂停机并串行替换。
 
@@ -41,25 +41,21 @@ fn file_spec(value:&Value,url:String)->Result<DownloadFile,String>{
 pub fn walk(root:&Path)->Result<Vec<PathBuf>,String>{
     fn visit(base:&Path,folder:&Path,out:&mut Vec<PathBuf>)->Result<(),String>{
         for entry in fs::read_dir(folder).map_err(|e|e.to_string())? {
-            let path=entry.map_err(|e|e.to_string())?.path();
+            let entry=entry.map_err(|e|e.to_string())?;let path=entry.path();let metadata=entry.metadata().map_err(|e|e.to_string())?;
             let relative=path.strip_prefix(base).map_err(|e|e.to_string())?.to_string_lossy().replace('\\',"/");
-            safe_path(base,&relative)?;
-            if path.is_dir(){visit(base,&path,out)?;}else if path.is_file(){out.push(path);}
+            crate::workspace::relative_path(&relative)?;
+            if crate::workspace::metadata_reparse(&metadata){return Err("组件包含目录联接或文件链接。".into());}
+            if metadata.is_dir(){visit(base,&path,out)?;}else if metadata.is_file(){out.push(path);}else{return Err("组件包含非普通文件。".into());}
         }Ok(())
     }
+    if crate::workspace::metadata_reparse(&fs::symlink_metadata(root).map_err(|e|e.to_string())?){return Err("组件根目录不能是链接。".into());}
     let mut out=Vec::new();visit(root,root,&mut out)?;out.sort();Ok(out)
 }
 pub fn manifest(root:&Path,kind:&str,build:&str)->Result<Value,String>{
-    let mut files=vec![];
-    for path in walk(root)?{if path==root.join("manifest.json"){continue;}
-        files.push(json!({"path":path.strip_prefix(root).unwrap().to_string_lossy().replace('\\',"/"),"size":path.metadata().map_err(|e|e.to_string())?.len(),"sha256":file_hash(&path)?}));}
-    Ok(json!({"schema":1,"kind":kind,"build":build,"files":files,"fields":{"schema":"清单格式","kind":"资源类别","build":"版本标识","files":"文件列表","path":"相对路径","size":"字节数","sha256":"文件摘要"}}))
+    crate::workspace::manifest_with_progress(root,kind,build,&AtomicBool::new(false),&mut|_,_,_|{})
 }
 pub fn model_validate(context:&LaunchContext,spec:&Value,source:&Path)->Result<(),String>{
     validate_model_files(context,spec,source,false)
-}
-fn model_validate_source(context:&LaunchContext,spec:&Value,source:&Path)->Result<(),String>{
-    validate_model_files(context,spec,source,true)
 }
 fn resource_asset(context:&LaunchContext,asset:&str)->Result<PathBuf,String>{
     let current=safe_path(&context.program.join("config/resources"),asset)?;
@@ -68,15 +64,24 @@ fn resource_asset(context:&LaunchContext,asset:&str)->Result<PathBuf,String>{
     safe_path(&context.program,asset)
 }
 fn validate_model_files(context:&LaunchContext,spec:&Value,source:&Path,fill_assets:bool)->Result<(),String>{
+    validate_model_files_with_progress(context,spec,source,fill_assets,&AtomicBool::new(false),&mut|_,_,_|{})
+}
+fn validate_model_files_with_progress(context:&LaunchContext,spec:&Value,source:&Path,fill_assets:bool,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
+    let mut records=vec![];
     for file in spec["files"].as_array().ok_or("模型文件清单无效")? {
+        check_cancel(cancel)?;
         let name=file["path"].as_str().ok_or("缺少模型文件名称")?;
         let path=if fill_assets&&file["asset"].is_string(){resource_asset(context,file["asset"].as_str().unwrap())?}else{safe_path(source,name)?};
         if !path.is_file()&&file["optional"]==true{continue;}
         if !path.is_file(){return Err(format!("缺少文件：{name}"));}
-        if path.metadata().map_err(|e|e.to_string())?.len()!=file["size_bytes"].as_u64().ok_or("锁定大小缺失")? || file_hash(&path)?!=file["sha256"].as_str().ok_or("锁定摘要缺失")? {
+        if path.metadata().map_err(|e|e.to_string())?.len()!=file["size_bytes"].as_u64().ok_or("锁定大小缺失")? {
             return Err(format!("版本、大小或摘要不匹配：{name}"));
         }
-    }Ok(())
+        if fill_assets&&file["asset"].is_string(){
+            if crate::workspace::file_hash_with_progress(&path,cancel,progress)?!=file["sha256"].as_str().ok_or("锁定摘要缺失")?{return Err(format!("随包模型资产摘要不匹配：{name}"));}
+        }else{records.push(json!({"path":name,"size":file["size_bytes"],"sha256":file["sha256"]}));}
+    }
+    crate::workspace::verify_records_with_progress(source,&records,false,cancel,progress)
 }
 const MODEL_RECEIPT: &str = "resource-install.json"; // MODEL_RECEIPT（模型安装收据文件名）。
 
@@ -106,16 +111,10 @@ fn receipt_digest(resource_id:&str,files:&[Value])->Result<String,String>{
     use sha2::Sha256;let mut hash=Sha256::new();hash.update(encoded);Ok(format!("{:x}",hash.finalize()))
 }
 
-fn write_model_receipt(stage:&Path,spec:&Value)->Result<(),String>{
+fn write_model_receipt(stage:&Path,spec:&Value,mut files:Vec<Value>)->Result<(),String>{
     let resource_id=spec["resource_id"].as_str().ok_or("模型编号缺失")?;
     let version=spec["version"].as_str().ok_or("模型版本缺失")?;
-    let mut files=vec![];
-    for item in spec["files"].as_array().ok_or("模型文件清单无效")?{
-        let path=item["path"].as_str().ok_or("模型文件路径缺失")?;let actual=safe_path(stage,path)?;
-        if !actual.is_file(){if item["optional"]==true{continue;}return Err(format!("安装收据缺少必需模型文件：{path}"));}
-        let row=json!({"path":path,"size":actual.metadata().map_err(|e|e.to_string())?.len(),"sha256":file_hash(&actual)?,"optional":item["optional"]==true});
-        files.push(row);
-    }
+    // 文件记录来自复制时的源摘要及目标读回复核，不再为签发收据重读全部权重。
     files.sort_by(|a,b|a["path"].as_str().unwrap_or("").cmp(b["path"].as_str().unwrap_or("")));
     let digest=receipt_digest(resource_id,&files)?;
     atomic_json(&stage.join(MODEL_RECEIPT),&json!({"schema":1,"resource_id":resource_id,"version":version,
@@ -170,7 +169,7 @@ fn installed_model_content_matches(spec:&Value,installed:&InstalledModel)->bool{
         let Some(old)=prior.get(path) else{if item["optional"]==true{continue;}return false;};
         if old["size"].as_u64()!=item["size_bytes"].as_u64()||old["sha256"]!=item["sha256"]{return false;}
     }
-    !installed.files.iter().any(|row|row["optional"]==true&&row["path"].as_str().is_some_and(|path|!target_paths.contains(path)))
+    !installed.files.iter().any(|row|row["path"].as_str().is_some_and(|path|!target_paths.contains(path)))
 }
 
 fn model_update_available(spec:&Value,installed:&InstalledModel)->bool{
@@ -191,9 +190,7 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
         let (result,installed_version,update_available)=if item["kind"]=="model"{
             match inspect_installed_model(context,&item,false){
                 Ok(installed)=>{
-                    let changed=!installed_model_content_matches(&item,&installed);
-                    let verified=if changed{inspect_installed_model(context,&item,true)}else{Ok(installed.clone())};
-                    match verified{Ok(valid)=>{let update=model_update_available(&item,&valid);(Ok(()),valid.version,update)},Err(error)=>(Err(error),None,false)}
+                    let update=model_update_available(&item,&installed);(Ok(()),installed.version,update)
                 }
                 Err(error)=>(Err(error),None,false)
             }
@@ -234,22 +231,39 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
 }
 /// startup_readiness（启动组件检查）：只读取本地清单与文件，不启动解释器、服务或下载。
 pub fn startup_readiness(context:&LaunchContext)->Result<Value,String>{
+    startup_readiness_with_progress(context,&AtomicBool::new(false),&mut|_,_,_|{})
+}
+/// startup_readiness_with_progress（启动校验进度）：每次启动完整复核，文件集合和摘要不以缓存代替。
+pub fn startup_readiness_with_progress(context:&LaunchContext,cancel:&AtomicBool,progress:&mut Progress)->Result<Value,String>{
+    check_cancel(cancel)?;progress("盘点必需组件及版本",0,0);
     let mut rows=inventory(context)?;
+    check_cancel(cancel)?;
     // 已有缺失、待更新或依赖未就绪时直接进入管理页，不反复读取不能运行的旧组件。
     // 全部组件满足当前清单后，启动和服务恢复仍执行完整 SHA-256（文件摘要）复核。
     if rows.iter().any(|row|row["can_start"]!=true){return Ok(readiness_from_inventory(&rows));}
-    validate_inventory_hashes(context,&mut rows);
+    validate_inventory_hashes(context,&mut rows,cancel,progress)?;
     Ok(readiness_from_inventory(&rows))
 }
-fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value]){
+fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
+    let environment=context.install.join("runtimes/python");
+    let result=crate::workspace::verify_tree_with_progress(&environment,"manifest.json",cancel,&mut|phase,done,total|progress(&format!("校验 Voice Server（语音服务）：{phase}"),done,total));
+    check_cancel(cancel)?;
+    if let Err(error)=result{if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);server["installation_state"]=json!("incomplete");server["error"]=json!(format!("语音环境完整摘要复核失败：{error}"));}}
     for row in rows.iter_mut().skip(1){
+        check_cancel(cancel)?;
         if row["files_installed"]!=true{continue;}
         let Some(id)=row["resource_id"].as_str()else{continue;};
         let result=(||{
             let item=spec(context,id)?;let root=destination(context,&item)?;
-            if item["kind"]=="model"{inspect_installed_model(context,&item,true).map(|_|())}
-            else{inspect_dsh_installed(context,&root,true).map(|_|())}
+            let label=row["label"].as_str().unwrap_or(id);
+            let mut report=|phase:&str,done,total|progress(&format!("校验 {label}：{phase}"),done,total);
+            if item["kind"]=="model"{
+                let installed=inspect_installed_model(context,&item,false)?;
+                let files=installed.files.into_iter().filter(|file|file["optional"]!=true||root.join(file["path"].as_str().unwrap()).is_file()).collect::<Vec<_>>();
+                crate::workspace::verify_records_with_progress(&root,&files,false,cancel,&mut report)
+            }else{crate::workspace::verify_tree_with_progress(&root,"manifest.json",cancel,&mut report)}
         })();
+        check_cancel(cancel)?;
         if let Err(error)=result{
             row["files_installed"]=json!(false);row["installation_state"]=json!("incomplete");row["can_start"]=json!(false);
             row["error"]=json!(format!("已安装组件完整摘要复核失败：{error}"));
@@ -258,6 +272,7 @@ fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value]){
     if rows.iter().skip(1).any(|row|row["can_start"]!=true){
         if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);server["error"]=json!("有组件文件损坏、尚未就绪或需要更新，请完成修复后再启动。");}
     }
+    Ok(())
 }
 fn readiness_from_inventory(rows:&[Value])->Value{
     let missing=rows.iter().filter(|row|row["can_start"]!=true).map(|row|json!({
@@ -288,20 +303,70 @@ pub fn unpack_zip(source:&Path,target:&Path,cancel:&AtomicBool,progress:&mut Pro
 }
 pub fn check_cancel(cancel:&AtomicBool)->Result<(),String>{if cancel.load(Ordering::Acquire){Err("操作已取消；下载缓存保留。".into())}else{Ok(())}}
 pub fn copy_file(source:&Path,target:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
+    copy_file_buffered(source,target,cancel,&AtomicBool::new(false),None,&mut vec![0;1024*1024],progress).map(|_|())
+}
+
+fn copy_file_buffered(source:&Path,target:&Path,cancel:&AtomicBool,stop:&AtomicBool,expected:Option<&str>,buffer:&mut[u8],progress:&mut Progress)->Result<String,String>{
+    check_cancel(cancel)?;
     fs::create_dir_all(target.parent().ok_or("复制目标缺少父目录")?).map_err(|e|e.to_string())?;
-    let total=source.metadata().map_err(|e|e.to_string())?.len();let mut done=0u64;
-    let mut input=fs::File::open(source).map_err(|e|e.to_string())?;let mut output=fs::File::create(target).map_err(|e|e.to_string())?;
-    let mut buffer=vec![0u8;65536];
-    loop {check_cancel(cancel)?;let count=input.read(&mut buffer).map_err(|e|e.to_string())?;if count==0{break;}
-        output.write_all(&buffer[..count]).map_err(|e|e.to_string())?;done+=count as u64;progress("正在复制并校验",done,total);}
+    let mut options=fs::OpenOptions::new();options.read(true);
+    #[cfg(windows)] {use std::os::windows::fs::OpenOptionsExt;options.custom_flags(0x00200000).share_mode(1);} // 读取期间不允许修改源文件或跟随链接。
+    let mut input=options.open(source).map_err(|e|e.to_string())?;let metadata=input.metadata().map_err(|e|e.to_string())?;
+    if !metadata.is_file()||crate::workspace::metadata_reparse(&metadata){return Err("复制源必须是普通文件。".into());}
+    let total=metadata.len().checked_mul(2).ok_or("复制大小溢出")?;let mut done=0u64;
+    let mut output=fs::File::create(target).map_err(|e|e.to_string())?;let mut source_hash=Sha256::new();let mut last_report=Instant::now();
+    progress("正在复制并校验",0,total);
+    loop {check_cancel(cancel)?;if stop.load(Ordering::Acquire){return Err("另一复制文件失败，候选组件保持未启用。".into());}
+        let count=input.read(buffer).map_err(|e|e.to_string())?;if count==0{break;}
+        output.write_all(&buffer[..count]).map_err(|e|e.to_string())?;source_hash.update(&buffer[..count]);done+=count as u64;
+        if last_report.elapsed()>=Duration::from_millis(100){progress("正在复制并校验",done,total);last_report=Instant::now();}}
+    if done!=metadata.len(){return Err("复制期间源文件大小发生变化。".into());}
     output.sync_all().map_err(|e|e.to_string())?;drop(output);
-    check_cancel(cancel)?;if file_hash(source)?!=file_hash(target)?{return Err("复制校验失败".into());}Ok(())
+    let digest=format!("{:x}",source_hash.finalize());
+    if expected.is_some_and(|expected|expected!=digest){return Err("复制源文件与固定摘要不符。".into());}
+    let mut output=options.open(target).map_err(|e|e.to_string())?;
+    let metadata=output.metadata().map_err(|e|e.to_string())?;
+    if !metadata.is_file()||crate::workspace::metadata_reparse(&metadata)||metadata.len()!=total/2{return Err("复制目标文件大小或类型不符。".into());}
+    let mut target_hash=Sha256::new();
+    loop {check_cancel(cancel)?;if stop.load(Ordering::Acquire){return Err("另一复制文件失败，候选组件保持未启用。".into());}
+        let count=output.read(buffer).map_err(|e|e.to_string())?;if count==0{break;}target_hash.update(&buffer[..count]);done+=count as u64;
+        if last_report.elapsed()>=Duration::from_millis(100){progress("正在复制并校验",done,total);last_report=Instant::now();}}
+    if done!=total||format!("{:x}",target_hash.finalize())!=digest{return Err("复制校验失败".into());}
+    progress("正在复制并校验",total,total);check_cancel(cancel)?;Ok(digest)
 }
 pub fn copy_verified(source:&Path,target:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
-    let files=walk(source)?;let total=files.iter().map(|p|p.metadata().map(|v|v.len()).unwrap_or(0)).sum();let mut done=0u64;
-    for file in files {check_cancel(cancel)?;let relative=file.strip_prefix(source).unwrap().to_string_lossy().replace('\\',"/");let out=safe_path(target,&relative)?;
-        copy_file(&file,&out,cancel,&mut|phase,bytes,_|progress(phase,done+bytes,total))?;done+=file.metadata().map_err(|e|e.to_string())?.len();}
-    Ok(())
+    check_cancel(cancel)?;progress("扫描待复制组件文件",0,0);
+    let files=walk(source)?;copy_selected_verified(source,target,files,cancel,progress)
+}
+/// copy_selected_verified（复制固定文件集合）：解释器筛选与组件完整复制共用相同目标摘要复核。
+pub(crate) fn copy_selected_verified(source:&Path,target:&Path,files:Vec<PathBuf>,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
+    let mut tasks=vec![];let mut total=0u64;
+    for file in files{check_cancel(cancel)?;let size=file.metadata().map_err(|e|e.to_string())?.len();
+        total=total.checked_add(size.checked_mul(2).ok_or("复制大小溢出")?).ok_or("复制大小溢出")?;
+        let relative=file.strip_prefix(source).unwrap().to_string_lossy().replace('\\',"/");tasks.push((file,safe_path(target,&relative)?));}
+    let next=AtomicUsize::new(0);let done=AtomicU64::new(0);let stop=AtomicBool::new(false);let failure=Mutex::new(None::<String>);
+    let count=tasks.len().min(4);let(sender,receiver)=mpsc::channel();progress("正在复制并校验",0,total);
+    std::thread::scope(|scope|{
+        let mut workers=vec![];
+        for _ in 0..count{let sender=sender.clone();let tasks=&tasks;let next=&next;let done=&done;let stop=&stop;let failure=&failure;
+            workers.push(scope.spawn(move||{
+                let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{
+                    let mut buffer=vec![0;1024*1024];
+                    loop{check_cancel(cancel)?;if stop.load(Ordering::Acquire){break;}
+                        let index=next.fetch_add(1,Ordering::Relaxed);let Some((input,output))=tasks.get(index)else{break;};let mut reported=0;
+                        copy_file_buffered(input,output,cancel,stop,None,&mut buffer,&mut|_,bytes,_|{done.fetch_add(bytes.saturating_sub(reported),Ordering::Relaxed);reported=bytes;})?;
+                    }Ok::<(),String>(())
+                })).unwrap_or_else(|_|Err("组件复制工作线程异常退出。".into()));
+                if let Err(error)=result{let mut failure=failure.lock().unwrap();if failure.is_none(){*failure=Some(error);}stop.store(true,Ordering::Release);}let _=sender.send(());
+            }));
+        }
+        drop(sender);let mut finished=0;let mut last_report=Instant::now();
+        while finished<count{match receiver.recv_timeout(Duration::from_millis(100)){Ok(())=>finished+=1,Err(mpsc::RecvTimeoutError::Timeout)=>{},Err(mpsc::RecvTimeoutError::Disconnected)=>break}
+            if last_report.elapsed()>=Duration::from_millis(100){progress("正在复制并校验",done.load(Ordering::Relaxed).min(total),total);last_report=Instant::now();}}
+        for worker in workers{if worker.join().is_err(){*failure.lock().unwrap()=Some("组件复制工作线程异常退出。".into());}}
+    });
+    check_cancel(cancel)?;if let Some(error)=failure.into_inner().map_err(|_|"复制状态不可用。")?{return Err(error);}
+    progress("复制与摘要复核完成",total,total);check_cancel(cancel)?;Ok(())
 }
 fn refresh_target_binding(context:&LaunchContext,relative:&str,target:&Path)->Result<(),String>{
     if relative.starts_with("models/"){refresh_models(context)}
@@ -412,8 +477,8 @@ pub fn import_review_with_activation(context:&LaunchContext,source:&Path,id:Opti
     if inputs.is_empty(){return Err("没有识别到可导入资源".into());}
     // 整包预校验在替换任何现有资源之前完成。
     for (key,path) in &inputs {progress(&format!("预校验 {key}（资源编号）"),0,0);
-        if key=="dsh" {if path.is_dir(){dsh_validate(context,path,true)?;}else{verify_installer(context,path)?;}}
-        else{model_validate_source(context,&spec(context,key)?,path)?;}}
+        if key=="dsh" {if path.is_dir(){dsh_validate_with_progress(context,path,true,&cancel,progress)?;}else{verify_installer(context,path,&cancel,progress)?;}}
+        else{validate_model_files_with_progress(context,&spec(context,key)?,path,true,&cancel,progress)?;}}
     let review_items=inputs.iter().map(|(key,_)|{
         let resource=spec(context,key)?;
         Ok(json!({"resource_id":key,"title":resource["title"],"version":resource["version"],"files_verified":true,
@@ -423,18 +488,22 @@ pub fn import_review_with_activation(context:&LaunchContext,source:&Path,id:Opti
     let mut installed=vec![];
     for (key,path) in inputs {check_cancel(&cancel)?;let resource=spec(context,&key)?;let candidate=task.join(format!("install-{key}"));
         let current=destination(context,&resource)?;
-        let identical=if key=="dsh" {path.is_dir()&&file_hash(&path.join("manifest.json")).ok()==file_hash(&current.join("manifest.json")).ok()&&dsh_validate(context,&current,true).is_ok()}
-            else{model_validate(context,&resource,&current).is_ok()&&inspect_installed_model(context,&resource,false).is_ok_and(|installed|!model_update_available(&resource,&installed))&&resource["files"].as_array().unwrap().iter().filter(|v|v["optional"]==true).all(|v|{
+        let identical=if key=="dsh" {path.is_dir()&&file_hash(&path.join("manifest.json")).ok()==file_hash(&current.join("manifest.json")).ok()&&dsh_validate_with_progress(context,&current,true,&cancel,progress).is_ok()}
+            else{validate_model_files_with_progress(context,&resource,&current,false,&cancel,progress).is_ok()&&inspect_installed_model(context,&resource,false).is_ok_and(|installed|!model_update_available(&resource,&installed))&&resource["files"].as_array().unwrap().iter().filter(|v|v["optional"]==true).all(|v|{
                 let name=v["path"].as_str().unwrap_or("");!path.join(name).is_file()||current.join(name).is_file()
             })};
+        check_cancel(&cancel)?;
         if identical{progress(&format!("跳过相同完整资源：{key}（编号）"),1,1);installed.push(key);continue;}
         if key=="dsh"&&path.is_file(){extract_dsh(context,&path,&candidate,&cancel,progress)?;}
-        else if key=="dsh"{copy_verified(&path,&candidate,&cancel,progress)?;dsh_validate(context,&candidate,true)?;}
+        else if key=="dsh"{copy_verified(&path,&candidate,&cancel,progress)?;dsh_validate_with_progress(context,&candidate,true,&cancel,progress)?;}
         else {
+            let mut verified=vec![];let mut buffer=vec![0;1024*1024];
             for row in resource["files"].as_array().unwrap(){let name=row["path"].as_str().unwrap();let from=if let Some(asset)=row["asset"].as_str(){resource_asset(context,asset)?}else{safe_path(&path,name)?};
-                if !from.is_file()&&row["optional"]==true{continue;}check_cancel(&cancel)?;let to=safe_path(&candidate,name)?;copy_file(&from,&to,&cancel,progress)?;}
-            write_model_receipt(&candidate,&resource)?;
-            model_validate(context,&resource,&candidate)?;
+                if !from.is_file()&&row["optional"]==true{continue;}check_cancel(&cancel)?;let to=safe_path(&candidate,name)?;
+                if from.metadata().map_err(|e|e.to_string())?.len()!=row["size_bytes"].as_u64().ok_or("模型大小缺失")?{return Err("模型源文件大小不匹配。".into());}
+                let digest=copy_file_buffered(&from,&to,&cancel,&AtomicBool::new(false),Some(row["sha256"].as_str().ok_or("模型摘要缺失")?),&mut buffer,progress)?;
+                verified.push(json!({"path":name,"size":row["size_bytes"],"sha256":digest,"optional":row["optional"]==true}));}
+            write_model_receipt(&candidate,&resource,verified)?;
         }
         check_cancel(&cancel)?;progress("正在启用资源",1,1);check_cancel(&cancel)?;
         let relative=destination(context,&resource)?.strip_prefix(&context.install).unwrap().to_string_lossy().replace('\\',"/");enable(&candidate,&relative)?;
@@ -443,7 +512,25 @@ pub fn import_review_with_activation(context:&LaunchContext,source:&Path,id:Opti
     remove_owned(&task,&context.install)?;Ok(installed)
 }
 fn refresh_models(context:&LaunchContext)->Result<(),String>{
-    let root=context.install.join("models");let record=manifest(&root,"models",&crate::workspace::new_id())?;atomic_json(&root.join("manifest.json"),&record)?;bind_component(context,"models","models",&root)
+    let root=context.install.join("models");let mut known=std::collections::HashMap::<String,Value>::new();
+    // 启用时复用已签发清单与新组件的复制校验结果；正式启动始终再次核验全部文件内容。
+    if let Ok(record)=load(&root.join("manifest.json")){for row in record["files"].as_array().into_iter().flatten(){
+        if let Some(path)=row["path"].as_str(){if row["sha256"].as_str().is_some_and(valid_sha256){known.insert(path.to_owned(),row.clone());}}
+    }}
+    for resource in specs(context)?.iter().filter(|item|item["kind"]=="model"){
+        if let Ok(installed)=inspect_installed_model(context,resource,false){let prefix=resource["destination"].as_str().ok_or("模型目录缺失")?;
+            for row in installed.files{let path=format!("{prefix}/{}",row["path"].as_str().unwrap());known.insert(path.clone(),json!({"path":path,"size":row["size"],"sha256":row["sha256"]}));}
+        }
+    }
+    let mut files=vec![];
+    for path in walk(&root)?{if path==root.join("manifest.json"){continue;}
+        let relative=path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\',"/");let size=path.metadata().map_err(|e|e.to_string())?.len();
+        let digest=match known.get(&relative){Some(row)if row["size"].as_u64()==Some(size)=>row["sha256"].clone(),_=>json!(file_hash(&path)?)};
+        files.push(json!({"path":relative,"size":size,"sha256":digest}));
+    }
+    atomic_json(&root.join("manifest.json"),&json!({"schema":1,"kind":"models","build":crate::workspace::new_id(),"files":files,
+        "fields":{"schema":"清单格式","kind":"资源类别","build":"启用登记编号","files":"已校验的安装文件记录","path":"相对路径","size":"字节数","sha256":"文件摘要；启动前再次完整核验"}}))?;
+    bind_component(context,"models","models",&root)
 }
 pub fn download_resource(context:&LaunchContext,id:&str,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<Vec<String>,String>{
     download_resource_with_activation(context,id,cancel,progress,&mut|stage,relative|activate(context,stage,relative))
@@ -451,13 +538,16 @@ pub fn download_resource(context:&LaunchContext,id:&str,cancel:Arc<AtomicBool>,p
 pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut Activation)->Result<Vec<String>,String>{
     let item=spec(context,id)?;
     let installed=destination(context,&item)?;
-    let model_current=if id=="dsh"{false}else{inspect_installed_model(context,&item,false).is_ok_and(|current|
-        !model_update_available(&item,&current)&&model_validate(context,&item,&installed).is_ok())};
-    if (id=="dsh"&&dsh_validate(context,&installed,false).is_ok())||model_current {progress("复用已校验资源",1,1);return Ok(vec![id.into()]);}
+    check_cancel(&cancel)?;progress("检查现有组件能否复用",0,0);
+    let current=if id=="dsh"{dsh_validate_with_progress(context,&installed,true,&cancel,progress).is_ok()}
+        else{inspect_installed_model(context,&item,false).is_ok_and(|current|
+            !model_update_available(&item,&current)&&validate_model_files_with_progress(context,&item,&installed,false,&cancel,progress).is_ok())};
+    check_cancel(&cancel)?;
+    if current {progress("复用已校验资源",1,1);return Ok(vec![id.into()]);}
     let root=safe_path(&context.install,&format!("tmp/resource-downloads/{id}"))?;fs::create_dir_all(&root).map_err(|e|e.to_string())?;
     if let Some(artifact)=item["source"]["transfer"]["artifact"].as_object(){
         let value=Value::Object(artifact.clone());let spec=file_spec(&value,value["url"].as_str().ok_or("缺少下载来源")?.into())?;let path=safe_path(&root,&spec.path)?;
-        download(&spec,&path,cancel.clone(),&mut|done,total|progress("正在下载固定附件",done,total),0)?;
+        crate::download::download_with_progress(&spec,&path,cancel.clone(),&mut|phase,done,total|progress(&format!("固定附件：{phase}"),done,total),0)?;
         if id=="dsh"{return import_review_with_activation(context,&path,Some(id),cancel,progress,&mut|_|Ok(()),enable);}
         let seven=context.program.join("tools/7zip/7z.exe");let out=root.join("extracted");run_seven(&seven,&path,&out,&cancel)?;
         let tar=walk(&out)?.into_iter().find(|p|p.extension().is_some_and(|v|v=="tar")).ok_or("模型归档缺少 tar（内层归档）")?;
@@ -466,16 +556,22 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
         return import_review_with_activation(context,&folder,Some(id),cancel,progress,&mut|_|Ok(()),enable);
     }
     let files=item["files"].as_array().ok_or("下载文件清单缺失")?;
-    let total=files.iter().filter(|row|row["optional"]!=true&&!row["asset"].is_string()).map(|row|row["size_bytes"].as_u64().unwrap_or(0)).sum::<u64>();
-    let mut completed=0u64;
+    let mut downloads=vec![];
+    let old=inspect_installed_model(context,&item,false).ok();
     for row in files {
         if row["optional"]==true||row["asset"].is_string(){continue;}
         let url=model_file_url(&item,row)?;
         let file=file_spec(row,url)?;let path=safe_path(&root,&file.path)?;fs::create_dir_all(path.parent().unwrap()).map_err(|e|e.to_string())?;
-        let mut current=0;
-        download(&file,&path,cancel.clone(),&mut|done,_|{current=current.max(done.min(file.size));progress("正在下载模型文件",completed.saturating_add(current),total);},0)?;
-        completed+=file.size;
+        // 版本更新只改变少量资产时，优先复用旧组件里摘要相同的文件；源与目标都核验。
+        if !path.is_file()&&old.as_ref().is_some_and(|old|old.files.iter().any(|row|row["path"]==file.path&&row["size"].as_u64()==Some(file.size)&&row["sha256"]==file.sha256)){
+            let source=safe_path(&installed,&file.path)?;
+            let result=copy_file_buffered(&source,&path,&cancel,&AtomicBool::new(false),Some(&file.sha256),&mut vec![0;1024*1024],&mut|phase,done,total|progress(&format!("复用现有模型：{phase}"),done,total));
+            check_cancel(&cancel)?;
+            if result.is_err(){let _=fs::remove_file(&path);}
+        }
+        downloads.push((file,path));
     }
+    crate::download::download_batch(&downloads,cancel.clone(),&mut|phase,done,total|progress(&format!("模型文件：{phase}"),done,total))?;
     import_review_with_activation(context,&root,Some(id),cancel,progress,&mut|_|Ok(()),enable)
 }
 /// model_file_url（模型文件来源）：直接访问固定版本，下载过程不调用 Python（运行环境）。
@@ -492,11 +588,14 @@ fn model_file_url(item:&Value,row:&Value)->Result<String,String>{
         _=>Err("该模型缺少受支持的直接文件来源".into()),
     }
 }
-fn verify_installer(context:&LaunchContext,path:&Path)->Result<String,String>{
+fn verify_installer(context:&LaunchContext,path:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result<String,String>{
     let item=spec(context,"dsh")?;let artifact=&item["source"]["transfer"]["artifact"];
     if path.metadata().map_err(|e|e.to_string())?.len()!=artifact["size_bytes"].as_u64().unwrap_or(0){return Err("DSH 官方安装器大小不匹配".into());}
-    let mut stream=fs::File::open(path).map_err(|e|e.to_string())?;let mut digest=Sha512::new();let mut buffer=vec![0;65536];
-    loop {let count=stream.read(&mut buffer).map_err(|e|e.to_string())?;if count==0{break;}digest.update(&buffer[..count]);}
+    let total=path.metadata().map_err(|e|e.to_string())?.len();let mut done=0;let mut last_report=Instant::now();progress("校验官方安装器摘要",0,total);
+    let mut stream=fs::File::open(path).map_err(|e|e.to_string())?;let mut digest=Sha512::new();let mut buffer=vec![0;1024*1024];
+    loop {check_cancel(cancel)?;let count=stream.read(&mut buffer).map_err(|e|e.to_string())?;if count==0{break;}digest.update(&buffer[..count]);done+=count as u64;
+        if last_report.elapsed()>=Duration::from_millis(100){progress("校验官方安装器摘要",done,total);last_report=Instant::now();}}
+    progress("校验官方安装器摘要",done,total);check_cancel(cancel)?;
     let value=digest.finalize();if base64::engine::general_purpose::STANDARD.encode(value)!=artifact["sha512_base64"].as_str().unwrap_or(""){return Err("DSH 官方安装器摘要不匹配".into());}Ok(format!("{value:x}"))
 }
 fn run_seven(exe:&Path,source:&Path,target:&Path,cancel:&AtomicBool)->Result<(),String>{
@@ -513,7 +612,7 @@ fn run_seven(exe:&Path,source:&Path,target:&Path,cancel:&AtomicBool)->Result<(),
     walk(target)?;Ok(())
 }
 fn extract_dsh(context:&LaunchContext,source:&Path,target:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
-    let sha=verify_installer(context,source)?;let seven=context.program.join("tools/7zip/7z.exe");let staging=target.with_extension("extract");let outer=staging.join("nsis");
+    let sha=verify_installer(context,source,cancel,progress)?;let seven=context.program.join("tools/7zip/7z.exe");let staging=target.with_extension("extract");let outer=staging.join("nsis");
     progress("正在提取官方安装器",0,0);run_seven(&seven,source,&outer,cancel)?;
     let matches:Vec<_>=walk(&outer)?.into_iter().filter(|p|p.file_name().is_some_and(|n|n=="app-64.7z")).collect();if matches.len()!=1{return Err("官方安装器中无法唯一识别应用负载".into());}
     let inner=staging.join("payload");run_seven(&seven,&matches[0],&inner,cancel)?;
@@ -525,10 +624,14 @@ fn extract_dsh(context:&LaunchContext,source:&Path,target:&Path,cancel:&AtomicBo
         "schedule":"resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-schedule/lib/index.js",
         "office_cli":"resources/app.asar.unpacked/dsh/node_modules/@deepseek-ai/libreoffice-kit/lib/cli.js",
         "office_engine":"resources/app.asar.unpacked/dsh/node_modules/@deepseek-ai/libreoffice-kit-win32-x64","asar_unpacked_root":"resources/app.asar.unpacked/dsh"}))?;
-    atomic_json(&target.join("manifest.json"),&manifest(target,"dsh",&format!("official-{}-{}",lock["version"].as_str().unwrap_or(""),&sha[..16]))?)?;
+    atomic_json(&target.join("manifest.json"),&crate::workspace::manifest_with_progress(target,"dsh",&format!("official-{}-{}",lock["version"].as_str().unwrap_or(""),&sha[..16]),cancel,progress)?)?;
     remove_owned(&staging,&context.install)?;Ok(())
 }
 fn inspect_dsh_installed(context:&LaunchContext,source:&Path,full:bool)->Result<Value,String>{
+    inspect_dsh_with_progress(context,source,full,&AtomicBool::new(false),&mut|_,_,_|{})
+}
+fn inspect_dsh_with_progress(context:&LaunchContext,source:&Path,full:bool,cancel:&AtomicBool,progress:&mut Progress)->Result<Value,String>{
+    check_cancel(cancel)?;
     let metadata=load(&source.join("runtime.json"))?;let digest=file_hash(&source.join("manifest.json"))?;let item=spec(context,"dsh")?;
     if metadata["source_kind"]=="official_desktop" {
         let version=metadata["version"].as_str().ok_or("DSH 安装版本缺失")?;
@@ -540,12 +643,15 @@ fn inspect_dsh_installed(context:&LaunchContext,source:&Path,full:bool)->Result<
     }else if item["legacy_export"]["supported"]!=true||item["legacy_export"]["manifest_sha256"]!=digest||metadata["version"].as_str().is_none(){
         return Err("旧 DSH 目录与兼容清单不匹配".into());
     }
-    if full{crate::workspace::verify_tree(source,"manifest.json")?;}else{for row in load(&source.join("manifest.json"))?["files"].as_array().ok_or("DSH 清单无效")?{
-        if safe_path(source,row["path"].as_str().ok_or("DSH 文件缺少路径")?)?.metadata().ok().map(|v|v.len())!=row["size"].as_u64(){return Err("DSH 运行文件不完整".into());}}}
+    if full{crate::workspace::verify_tree_with_progress(source,"manifest.json",cancel,progress)?;}else{crate::workspace::verify_tree_sizes(source,"manifest.json")?;}
+    check_cancel(cancel)?;
     Ok(metadata)
 }
 fn dsh_validate(context:&LaunchContext,source:&Path,full:bool)->Result<(),String>{
-    let metadata=inspect_dsh_installed(context,source,full)?;let item=spec(context,"dsh")?;
+    dsh_validate_with_progress(context,source,full,&AtomicBool::new(false),&mut|_,_,_|{})
+}
+fn dsh_validate_with_progress(context:&LaunchContext,source:&Path,full:bool,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
+    let metadata=inspect_dsh_with_progress(context,source,full,cancel,progress)?;let item=spec(context,"dsh")?;
     if metadata["source_kind"]!="official_desktop"{return Err("旧版 DSH 代理宿主需要从官方来源更新后才能启动".into());}
     let expected=base64::engine::general_purpose::STANDARD.decode(item["source"]["transfer"]["artifact"]["sha512_base64"].as_str().ok_or("官方摘要缺失")?).map_err(|e|e.to_string())?;
     let expected=expected.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
@@ -569,6 +675,36 @@ pub fn bind_component(context:&LaunchContext,kind:&str,relative:&str,root:&Path)
 #[cfg(test)]
 mod download_tests {
     use super::*;
+
+    #[test]
+    #[ignore="手动验收：只读真实环境并在指定缓存中复制样本、对照旧流程和优化流程"]
+    fn benchmark_resource_copy_and_validation(){
+        let source=PathBuf::from(std::env::var_os("VOICE_PIPELINE_TEST_ROOT").expect("需要只读源组件目录"));
+        let report=PathBuf::from(std::env::var_os("VOICE_PIPELINE_REPORT").expect("需要缓存报告路径"));let owner=report.parent().unwrap();fs::create_dir_all(owner).unwrap();
+        let run=owner.join(format!("复制 真实样本-{}",crate::workspace::new_id()));let sample=run.join("source");fs::create_dir_all(&sample).unwrap();
+        let original_manifest=file_hash(&source.join("manifest.json")).unwrap();
+        let all=walk(&source).unwrap();let mut selected=all.iter().filter(|path|path.metadata().is_ok_and(|metadata|metadata.len()>0&&metadata.len()<=64*1024)).take(1000).cloned().collect::<Vec<_>>();
+        let mut large=all.iter().filter(|path|path.metadata().is_ok_and(|metadata|metadata.len()>1024*1024&&metadata.len()<=8*1024*1024)).cloned().collect::<Vec<_>>();large.sort_by_key(|path|std::cmp::Reverse(path.metadata().unwrap().len()));selected.extend(large.into_iter().take(4));
+        for path in selected{let relative=path.strip_prefix(&source).unwrap();let output=sample.join(relative);fs::create_dir_all(output.parent().unwrap()).unwrap();fs::copy(path,output).unwrap();}
+        let manifest=manifest(&sample,"sample","benchmark").unwrap();let files=walk(&sample).unwrap();let sample_bytes=files.iter().map(|file|file.metadata().unwrap().len()).sum::<u64>();let mut rounds=vec![];
+        for (round,order) in [["legacy","optimized"],["optimized","legacy"]].into_iter().enumerate(){for mode in order{
+            let target=run.join(format!("{round}-{mode}"));fs::create_dir_all(&target).unwrap();let started=Instant::now();let caller=std::thread::current().id();let mut callbacks=0;
+            if mode=="optimized"{copy_verified(&sample,&target,&AtomicBool::new(false),&mut|_,_,_|{assert_eq!(std::thread::current().id(),caller);callbacks+=1;}).unwrap();}
+            else{for input in &files{let relative=input.strip_prefix(&sample).unwrap();let output=target.join(relative);fs::create_dir_all(output.parent().unwrap()).unwrap();
+                let mut reader=fs::File::open(input).unwrap();let mut writer=fs::File::create(&output).unwrap();let mut buffer=vec![0;65536];
+                loop{let count=reader.read(&mut buffer).unwrap();if count==0{break;}writer.write_all(&buffer[..count]).unwrap();callbacks+=1;}
+                writer.sync_all().unwrap();drop(writer);assert_eq!(file_hash(input).unwrap(),file_hash(&output).unwrap());
+            }}
+            let elapsed=started.elapsed().as_secs_f64();atomic_json(&target.join("manifest.json"),&manifest).unwrap();crate::workspace::verify_tree(&target,"manifest.json").unwrap();
+            rounds.push(json!({"round":round+1,"mode":mode,"seconds":elapsed,"callbacks":callbacks,"full_target_validation":true}));
+        }}
+        let cancel=AtomicBool::new(false);let started=Instant::now();let result=copy_verified(&sample,&run.join("cancelled"),&cancel,&mut|phase,_,_|{if phase=="正在复制并校验"{cancel.store(true,Ordering::Release);}});let cancel_seconds=started.elapsed().as_secs_f64();assert!(result.unwrap_err().contains("取消"));
+        let mut validation_callbacks=0;let started=Instant::now();crate::workspace::verify_tree_with_progress(&source,"manifest.json",&AtomicBool::new(false),&mut|_,_,_|validation_callbacks+=1).unwrap();let full_validation_seconds=started.elapsed().as_secs_f64();
+        assert_eq!(file_hash(&source.join("manifest.json")).unwrap(),original_manifest);
+        atomic_json(&report,&json!({"success":true,"source":source,"sample_files":files.len(),"sample_bytes":sample_bytes,"rounds":rounds,"cancel_seconds":cancel_seconds,"full_source_validation_seconds":full_validation_seconds,"validation_callbacks":validation_callbacks,"source_manifest_preserved":true,
+            "fields":{"source":"只读真实运行环境","sample_files":"实测样本文件数","sample_bytes":"样本字节数","rounds":"反转执行顺序的两轮完整复制对照","mode":"旧实现或优化实现","seconds":"完整复制并读回复核的秒数","callbacks":"进度回调次数","full_target_validation":"复制后再次独立完整复核","cancel_seconds":"取消样本复制并收集线程的秒数","full_source_validation_seconds":"真实源组件的完整集合及摘要核验秒数","source_manifest_preserved":"原组件清单摘要保持不变"}})).unwrap();
+        crate::workspace::remove_owned(&run,owner).unwrap();
+    }
 
     #[test]
     fn receipt_digest_matches_python_sorted_utf8_json_with_chinese_paths() {
@@ -634,6 +770,50 @@ mod download_tests {
         fs::write(runtime.join("python.exe"),b"not-executed").unwrap();
         atomic_json(&runtime.join("runtime.json"),&json!({"schema":2,"python":"3.12.10","lock_sha256":file_hash(&lock).unwrap(),
             "groups":["voice-core","torch-cpu","onnx-cpu","sherpa-cpu","modelscope-download","onnx-vad"]})).unwrap();
+        atomic_json(&runtime.join("manifest.json"),&manifest(&runtime,"python","test-runtime").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn startup_rechecks_runtime_hash_and_cancellation_preserves_components(){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();let root=owner.join(format!("voice-startup-完整校验-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();fs::create_dir_all(root.join("app/config/resources")).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();fs::write(root.join("app/scripts/backend-entry.py"),b"# not executed").unwrap();
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[]})).unwrap();ready_test_runtime(&root);let context=LaunchContext::portable(&root).unwrap();
+        assert_eq!(startup_readiness(&context).unwrap()["ready"],true);let before=file_hash(&root.join("runtimes/python/manifest.json")).unwrap();
+        let cancel=AtomicBool::new(false);let caller=std::thread::current().id();
+        let result=startup_readiness_with_progress(&context,&cancel,&mut|phase,_,_|{assert_eq!(std::thread::current().id(),caller);if phase.contains("校验组件文件内容"){cancel.store(true,Ordering::Release);}});
+        assert!(result.unwrap_err().contains("取消"));assert_eq!(file_hash(&root.join("runtimes/python/manifest.json")).unwrap(),before);
+        fs::write(root.join("runtimes/python/python.exe"),b"same-length!").unwrap();
+        assert_eq!(inventory(&context).unwrap()[0]["can_start"],true);let readiness=startup_readiness(&context).unwrap();
+        assert_eq!(readiness["ready"],false);assert!(readiness["missing"][0]["reason"].as_str().unwrap().contains("摘要"));crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
+    fn component_copy_reuses_buffers_verifies_targets_and_cancels_before_activation(){
+        let root=std::env::temp_dir().join(format!("voice-copy-组件-{}",crate::workspace::new_id()));let source=root.join("源 目录");let target=root.join("目标 目录");fs::create_dir_all(&source).unwrap();
+        for index in 0..80{fs::write(source.join(format!("{index}.bin")),vec![index as u8;index*64]).unwrap();}fs::write(source.join("large.bin"),vec![21u8;8*1024*1024]).unwrap();
+        let cancel=AtomicBool::new(false);let caller=std::thread::current().id();let mut samples=vec![];
+        copy_verified(&source,&target,&cancel,&mut|_,done,total|{assert_eq!(std::thread::current().id(),caller);assert!(done<=total);if total>0{samples.push(done);}}).unwrap();
+        assert!(samples.windows(2).all(|pair|pair[0]<=pair[1]));assert_eq!(walk(&source).unwrap().len(),walk(&target).unwrap().len());
+        for path in walk(&source).unwrap(){assert_eq!(file_hash(&path).unwrap(),file_hash(&target.join(path.file_name().unwrap())).unwrap());}
+        let cancelled=root.join("取消候选");let result=copy_verified(&source,&cancelled,&cancel,&mut|phase,_,_|{if phase=="正在复制并校验"{cancel.store(true,Ordering::Release);}});
+        assert!(result.unwrap_err().contains("取消"));assert_eq!(file_hash(&source.join("large.bin")).unwrap(),file_hash(&target.join("large.bin")).unwrap());fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_update_reuses_unchanged_weights_without_network_and_removes_old_files(){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();let root=owner.join(format!("voice-update-复用-{}",crate::workspace::new_id()));crate::workspace::initialize(&root).unwrap();
+        fs::create_dir_all(root.join("app/config/resources/assets")).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();fs::write(root.join("app/scripts/backend-entry.py"),b"# not executed").unwrap();
+        let source=root.join("tmp/source");fs::create_dir_all(&source).unwrap();fs::write(source.join("model.bin"),vec![13u8;1024*1024]).unwrap();
+        let mut resource=json!({"resource_id":"reuse-model","title":"复用测试模型","kind":"model","version":"1","destination":"reuse-model",
+            "source":{"platform":"huggingface","repo_id":"offline-fixture/must-use-verified-cache","revision":"fixed"},"files":[{"path":"model.bin","size_bytes":1024*1024,"sha256":file_hash(&source.join("model.bin")).unwrap()}]});
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[resource.clone()]})).unwrap();let context=LaunchContext::portable(&root).unwrap();
+        import_review_with_activation(&context,&source,Some("reuse-model"),Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},&mut|_|Ok(()),&mut|stage,relative|activate(&context,stage,relative)).unwrap();
+        let old=root.join("models/reuse-model/obsolete.bin");fs::write(&old,b"removed by new version").unwrap();let asset=root.join("app/config/resources/assets/new.json");fs::write(&asset,b"{\"new\":true}").unwrap();resource["version"]=json!("2");resource["files"].as_array_mut().unwrap().push(json!({"path":"new.json","asset":"assets/new.json","size_bytes":asset.metadata().unwrap().len(),"sha256":file_hash(&asset).unwrap()}));
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[resource]})).unwrap();let mut reused=false;
+        let installed=download_resource(&context,"reuse-model",Arc::new(AtomicBool::new(false)),&mut|phase,_,_|{if phase.starts_with("复用现有模型"){reused=true;}}).unwrap();
+        assert_eq!(installed,vec!["reuse-model"]);assert!(reused);assert!(!old.exists());assert_eq!(load(&root.join("models/reuse-model/resource-install.json")).unwrap()["version"],"2");
+        model_validate(&context,&spec(&context,"reuse-model").unwrap(),&root.join("models/reuse-model")).unwrap();crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 
     #[test]
@@ -667,6 +847,38 @@ mod download_tests {
     }
 
     #[test]
+    fn dsh_cache_reuse_requires_full_hashes_and_supports_cancel() {
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();
+        let root=owner.join(format!("voice-dsh-cache-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();
+        fs::create_dir_all(root.join("app/config/resources")).unwrap();
+        fs::create_dir_all(root.join("app/config/dsh")).unwrap();
+        fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();
+        fs::write(root.join("app/scripts/backend-entry.py"),"# 只测试缓存校验，不启动服务").unwrap();
+        let installed=root.join("runtimes/dsh");fs::create_dir_all(&installed).unwrap();
+        let executable=installed.join("test.exe");fs::write(&executable,vec![0x41;4*1024*1024]).unwrap();
+        let sha512="00".repeat(64);
+        atomic_json(&installed.join("runtime.json"),&json!({"source_kind":"official_desktop","version":"test","source_sha512":sha512})).unwrap();
+        atomic_json(&installed.join("manifest.json"),&manifest(&installed,"dsh","test").unwrap()).unwrap();
+        atomic_json(&root.join("app/config/dsh/official-runtime.lock.json"),&json!({"version":"test","source_sha512":sha512,"manifest_sha256":file_hash(&installed.join("manifest.json")).unwrap()})).unwrap();
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[{"resource_id":"dsh","kind":"dsh","destination":"runtimes/dsh","version":"test","source":{"transfer":{"artifact":{
+            "path":"test.exe","url":"file://blocked-test-source","size_bytes":1,"sha512_base64":base64::engine::general_purpose::STANDARD.encode([0u8;64])
+        }}}}]})).unwrap();
+        let context=LaunchContext::portable(&root).unwrap();let mut content_progress=false;
+        assert_eq!(download_resource(&context,"dsh",Arc::new(AtomicBool::new(false)),&mut|phase,_,_|{content_progress|=phase=="校验组件文件内容";}).unwrap(),vec!["dsh"]);
+        assert!(content_progress);
+        let cancel=AtomicBool::new(false);
+        let error=dsh_validate_with_progress(&context,&installed,true,&cancel,&mut|phase,_,_|{if phase=="校验组件文件内容"{cancel.store(true,Ordering::Release);}}).unwrap_err();
+        assert!(error.contains("取消"));assert!(executable.is_file());
+        fs::write(&executable,vec![0x42;4*1024*1024]).unwrap();
+        dsh_validate(&context,&installed,false).unwrap();
+        // 同长度损坏不能被当成缓存命中；无效来源让该用例立即失败，不发出网络请求。
+        assert!(download_resource(&context,"dsh",Arc::new(AtomicBool::new(false)),&mut|_,_,_|{}).is_err());
+        crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
     fn legacy_dsh_is_installed_but_requires_update() {
         let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();
         let root=owner.join(format!("voice-dsh-update-{}",crate::workspace::new_id()));
@@ -677,9 +889,9 @@ mod download_tests {
         fs::write(root.join("app/scripts/backend-entry.py"),"# 测试启动上下文，不运行此脚本").unwrap();
         let installed=root.join("runtimes/dsh");fs::create_dir_all(&installed).unwrap();
         fs::write(installed.join("legacy.exe"),b"old-dsh").unwrap();
+        atomic_json(&installed.join("runtime.json"),&json!({"source_kind":"legacy_export","version":"0.1.0"})).unwrap();
         atomic_json(&installed.join("manifest.json"),&manifest(&installed,"dsh","legacy").unwrap()).unwrap();
         let digest=file_hash(&installed.join("manifest.json")).unwrap();
-        atomic_json(&installed.join("runtime.json"),&json!({"source_kind":"legacy_export","version":"0.1.0"})).unwrap();
         atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[{
             "resource_id":"dsh","title":"代理宿主","kind":"dsh","version":"0.2.0-rc.2","destination":"runtimes/dsh",
             "source":{"transfer":{"artifact":{"sha512_base64":base64::engine::general_purpose::STANDARD.encode([0u8;64])}}},

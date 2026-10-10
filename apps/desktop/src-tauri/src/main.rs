@@ -27,7 +27,7 @@ use tauri::{
     Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 use voice_desktop_common::{windows::Job, LaunchContext, workspace::{self, Locator}};
-use resource_commands::{ResourceManager,resource_import_confirm,resource_inventory,resource_download,resource_import,resource_open_source,resource_cancel};
+use resource_commands::{ResourceManager,resource_import_confirm,resource_inventory,resource_jobs,resource_download,resource_import,resource_open_source,resource_cancel};
 
 struct Service {
     child: Child,
@@ -89,7 +89,7 @@ fn frontend_capability(mode: FrontendMode, normalized_origin: &str, epoch: u64) 
     if mode == FrontendMode::UiPreview {
         serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
     } else {
-        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","core:event:allow-listen","core:event:allow-unlisten"]})
+        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","core:event:allow-listen","core:event:allow-unlisten"]})
     }
 }
 
@@ -110,6 +110,7 @@ struct Desktop {
     workspace_guard: Mutex<Option<voice_desktop_common::installation::WorkspaceGuard>>, // workspace_guard（程序运行期间的本体互斥锁）。
     workspace_busy: AtomicBool, // workspace_busy（防止并行切换或迁移）。
     service_requested: AtomicBool, // service_requested（主窗口已请求启动服务，刷新不重复启动）。
+    service_starting: AtomicBool, // service_starting（本次启动正在校验或建立入口）：拒绝重复启动。
     startup_skipped: AtomicBool,   // startup_skipped（当前窗口跳过加载画面的选择）。
     origin: Mutex<Option<String>>,
     dsh_origin: Mutex<Option<String>>, // dsh_origin（当前受管 DSH 的实际来源，不含令牌）。
@@ -548,12 +549,34 @@ fn ui_preview_context(args: &[String]) -> Result<(PathBuf, Option<PathBuf>, Path
 }
 
 fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), String> {
+    if state.service_starting.swap(true,Ordering::AcqRel){return Ok(());}
+    struct StartingGuard<'a>(&'a AtomicBool); // StartingGuard（启动生命周期标记）：成功、失败及取消均释放。
+    impl Drop for StartingGuard<'_>{fn drop(&mut self){self.0.store(false,Ordering::Release);}}
+    let _starting=StartingGuard(&state.service_starting);
     let _credentials_guard=state.credentials_guard.lock().map_err(|_|"接口配置锁不可用。")?;
     if state.stopping.load(Ordering::Acquire){return Err("桌面正在退出。".into());}
+    {
+        let mut service=state.service.lock().map_err(|_|"服务状态不可用。")?;
+        if service.as_mut().is_some_and(|value|matches!(value.child.try_wait(),Ok(None))){
+            if let Some(origin)=state.origin.lock().unwrap().clone(){if let Some(window)=app.get_webview_window("main"){window.navigate(format!("{origin}/").parse().map_err(|_|"服务入口地址无效。")?).map_err(|e|e.to_string())?;}}
+            return Ok(());
+        }
+    }
     if state.mode==FrontendMode::Product {
         let Some(context)=state.context() else {return Ok(());};
-        *state.initialization.lock().unwrap()=serde_json::json!({"phase":"正在校验本地组件","can_cancel":false});
-        let readiness=voice_desktop_common::resources::startup_readiness(&context)?;
+        let context=context.refreshed_components()?;*state.context.lock().unwrap()=Some(context.clone());
+        *state.error.lock().unwrap()=None;
+        *state.initialization.lock().unwrap()=serde_json::json!({"phase":"正在校验本地组件","can_cancel":true});
+        let readiness=voice_desktop_common::resources::startup_readiness_with_progress(&context,&state.initialization_cancel,&mut|phase,done,total|{
+            *state.initialization.lock().unwrap()=serde_json::json!({"phase":phase,"completed_bytes":done,"total_bytes":total,"can_cancel":true,
+                "fields":{"phase":"启动组件校验阶段","completed_bytes":"当前阶段已核验字节","total_bytes":"当前阶段总字节","can_cancel":"是否可取消校验"}});
+        });
+        if state.initialization_cancel.load(Ordering::Acquire){
+            *state.initialization.lock().unwrap()=serde_json::json!({"phase":"启动校验已取消，可以重新启动","can_cancel":false});
+            initialization::manage(&app,&state)?;return Ok(());
+        }
+        let readiness=readiness?;
+        if let Some(manager)=app.try_state::<Arc<ResourceManager>>(){manager.record_validation(&readiness);}
         *state.initialization.lock().unwrap()=serde_json::json!({
             "phase":if readiness["ready"]==true{"组件校验通过，正在启动服务"}else{"组件尚未完备，请手动下载或导入缺失组件"},
             "components_ready":readiness["ready"],"missing_components":readiness["missing"],"can_cancel":false,
@@ -891,6 +914,7 @@ fn run() -> Result<(), String> {
         workspace_guard:Mutex::new(None),
         workspace_busy: AtomicBool::new(false),
         service_requested: AtomicBool::new(false),
+        service_starting: AtomicBool::new(false),
         startup_skipped: AtomicBool::new(false),
         origin: Mutex::new(None),
         dsh_origin: Mutex::new(None),
@@ -933,7 +957,7 @@ fn run() -> Result<(), String> {
             model_credentials_status,model_credentials_save,
             resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
             workspace_info,workspace_choose,workspace_link,workspace_migrate,
-            resource_inventory,resource_download,resource_import,resource_import_confirm,resource_open_source,resource_cancel
+            resource_inventory,resource_jobs,resource_download,resource_import,resource_import_confirm,resource_open_source,resource_cancel
         ])
         .setup(move |app| {
             if qualification_exit||exit_requested {

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resource-jobs"
+description = "Enables the resource_jobs command without any pre-configured scope."
+commands.allow = ["resource_jobs"]
+
+[[permission]]
+identifier = "deny-resource-jobs"
+description = "Denies the resource_jobs command without any pre-configured scope."
+commands.deny = ["resource_jobs"]

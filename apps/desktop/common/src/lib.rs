@@ -244,6 +244,14 @@ impl LaunchContext {
 
     pub fn installed_program(&self)->PathBuf {self.install.join("app")} // installed_program（正式资源清单目录）。
 
+    /// refreshed_components（重读组件路径）：首次安装和替换组件后不沿用进程启动时的空路径。
+    pub fn refreshed_components(&self)->Result<Self,String>{
+        let mut current=Self::portable(&self.install)?;
+        if current.workspace_id!=self.workspace_id{return Err("工作区身份已变化，请重新打开正式入口。".into());}
+        current.program=self.program.clone();current.dev=self.dev;current.diagnostic=self.diagnostic;current.channel=self.channel;
+        current.validate()?;Ok(current)
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.data == self.program || self.program.starts_with(&self.data) {
             return Err("用户数据位置不能包含程序包。".into());
@@ -920,6 +928,19 @@ pub mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_component_install_refreshes_paths_without_losing_source_debug_settings(){
+        let root=std::env::temp_dir().join(format!("voice-context-首次安装-{}",workspace::new_id()));let install=root.join("工作区");workspace::initialize(&install).unwrap();
+        for path in [root.join("config"),root.join("scripts"),install.join("app/config"),install.join("app/scripts")]{fs::create_dir_all(path).unwrap();}
+        for path in [root.join("config/default.yaml"),root.join("scripts/backend-entry.py"),install.join("app/config/default.yaml"),install.join("app/scripts/backend-entry.py")]{fs::write(path,b"fixture").unwrap();}
+        let mut original=LaunchContext::portable(&install).unwrap();assert!(original.node.is_none());
+        original.program=canonical_path(&root).unwrap();original.dev=true;original.diagnostic=true;
+        let dsh=install.join("runtimes/dsh");fs::create_dir_all(&dsh).unwrap();fs::write(dsh.join("DeepSeek Harness.exe"),b"not executed").unwrap();
+        workspace::atomic_json(&dsh.join("runtime.json"),&serde_json::json!({"source_kind":"official_desktop","executable":"DeepSeek Harness.exe"})).unwrap();
+        let current=original.refreshed_components().unwrap();assert_eq!(current.node,Some(canonical_path(&dsh.join("DeepSeek Harness.exe")).unwrap()));
+        assert_eq!(current.workspace_id,original.workspace_id);assert_eq!(current.program,original.program);assert!(current.dev&&current.diagnostic);assert!(original.node.is_none());fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn pending_task_skips_terminal_marker_and_finds_new_active_migration() {
