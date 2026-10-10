@@ -22,6 +22,7 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(wrapper.find('.local-install-actions').exists()).toBe(false)
     await wrapper.get('[data-component="voice-system"] .local-component-action').trigger('click')
     expect(wrapper.get('.local-managed-resource').text()).toContain('已配置')
+    expect(wrapper.emitted('resourceRefresh')).toEqual([[]])
     wrapper.unmount()
   })
 
@@ -113,6 +114,66 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     wrapper.unmount()
   })
 
+  it('已安装模型有随包更新时作为必需资源显示更新、导入和跳转操作', async () => {
+    const value = model()
+    value.rows.push({ ...value.rows[0]!, id: 'paraformer', name: 'Paraformer（流式识别）',
+      state: 'ready', status: '运行中', available: true, retryable: false,
+      resource: { id: 'paraformer-streaming', label: 'Paraformer（流式识别）', state: 'installed', status: '已安装',
+        updateAvailable: true, installedVersion: '1.0.0', targetVersion: '1.1.0' } })
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = wrapper.get('[data-component="paraformer"]')
+    expect(wrapper.find('.resource-batch-import').exists()).toBe(true)
+    expect(card.get('.local-state').text()).toBe('需更新')
+    expect(card.get('button[aria-label="Paraformer（流式识别）：更新"]').text()).toBe('更新')
+    expect(card.get('button[aria-label="Paraformer（流式识别）：导入"]').text()).toBe('导入')
+    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').text()).toBe('跳转')
+    expect(card.find('.local-component-action').exists()).toBe(false)
+    expect(card.text()).not.toContain('可更新')
+    await card.get('button[aria-label="Paraformer（流式识别）：更新"]').trigger('click')
+    await card.get('button[aria-label="Paraformer（流式识别）：导入"]').trigger('click')
+    await card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').trigger('click')
+    expect(wrapper.emitted('resourceDownload')).toEqual([['paraformer-streaming']])
+    expect(wrapper.emitted('resourceImport')).toEqual([['paraformer-streaming']])
+    expect(wrapper.emitted('openResourceSource')).toEqual([['paraformer-streaming']])
+    wrapper.unmount()
+  })
+
+  it('更新任务沿用进度和取消入口，运行期间隐藏重复资源操作', async () => {
+    const value = model()
+    const resource = { id: 'paraformer-streaming', label: 'Paraformer（流式识别）', state: 'installed' as const,
+      status: '已安装', updateAvailable: true, installedVersion: '1.0.0', targetVersion: '1.1.0' }
+    value.rows.push({ ...value.rows[0]!, id: 'paraformer', name: 'Paraformer（流式识别）', resource })
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = wrapper.get('[data-component="paraformer"]')
+    await card.get('button[aria-label="Paraformer（流式识别）：更新"]').trigger('click')
+    await wrapper.setProps({ model: { ...value, managedResourceJobs: [{ id: 'update-1', resourceId: resource.id,
+      label: '更新 Paraformer', state: 'running', phase: '正在安装新模型', completedBytes: 50, totalBytes: 100, canCancel: true }],
+      rows: value.rows.map(row => row.id === 'paraformer' ? { ...row, resource: { ...resource, busy: true } } : row) } })
+    expect(card.get('[data-job="update-1"]').text()).toContain('50%')
+    expect(card.find('.local-install-actions').exists()).toBe(false)
+    await card.get('button.local-resource-cancel').trigger('click')
+    expect(wrapper.emitted('cancelResource')).toEqual([['update-1']])
+    wrapper.unmount()
+  })
+
+  it('更新失败保留需更新状态并提供重试更新、导入和来源操作', async () => {
+    const value = model()
+    value.rows.push({ ...value.rows[0]!, id: 'paraformer', name: 'Paraformer（流式识别）',
+      state: 'ready', status: '运行中', available: true,
+      resource: { id: 'paraformer-streaming', label: 'Paraformer（流式识别）', state: 'installed', status: '已安装',
+        updateAvailable: true, installedVersion: '1.0.0', targetVersion: '1.1.0', error: '更新校验失败' } })
+    value.managedResourceJobs = [{ id: 'update-failed', resourceId: 'paraformer-streaming', label: '更新 Paraformer',
+      state: 'failed', phase: '更新失败', error: '更新校验失败', canCancel: false }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = wrapper.get('[data-component="paraformer"]')
+    expect(card.get('.local-state').text()).toBe('需更新')
+    expect(card.get('button[aria-label="Paraformer（流式识别）：更新"]').text()).toBe('重试更新')
+    expect(card.get('button[aria-label="Paraformer（流式识别）：导入"]').text()).toBe('导入')
+    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').text()).toBe('跳转')
+    expect(card.text()).toContain('更新校验失败')
+    wrapper.unmount()
+  })
+
   it('一个组件正在下载时仍允许启动其他组件下载', async () => {
     const value = model()
     value.rows[0].resource!.state = 'missing'
@@ -124,6 +185,7 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     const wrapper = mount(LocalComponents, { props: { model: value } })
     const button = wrapper.get('button[aria-label="Paraformer（流式语音识别）：下载"]')
     expect(button.attributes('disabled')).toBeUndefined()
+    expect(button.text()).toBe('下载')
     await button.trigger('click')
     expect(wrapper.emitted('resourceDownload')).toEqual([['paraformer-streaming']])
     expect(wrapper.get('[data-component="voice-system"]').find('.local-install-actions').exists()).toBe(false)

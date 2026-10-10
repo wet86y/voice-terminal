@@ -17,6 +17,7 @@ import ModelSettings from './panels/ModelSettings.vue'
 import WakeTasksSettings from './panels/WakeTasksSettings.vue'
 import SpeakerSettings from './panels/SpeakerSettings.vue'
 import { provideProductContext } from './product-context'
+import { useWorkspaceResources } from './useWorkspaceResources'
 import type { WorkbenchModel } from '../interface/workbench'
 import type { ApplicationSnapshot } from './application-host'
 import { DEFAULT_REGISTRY, DEFAULT_SETTINGS } from './normalization'
@@ -341,6 +342,45 @@ describe('正式界面的真实控件交互', () => {
     expect(row.text()).not.toContain('草稿尚未保存')
     expect(row.text()).toContain('已保存配置下次启动生效')
     expect(row.text()).toContain('实际运行：CPU（中央处理器）')
+  })
+  it('运行中的组件页把随包更新显示为必需更新操作，并复用既有下载计划', async () => {
+    const inventoryRead = vi.fn(async () => [{ resource_id: 'paraformer-streaming', label: 'Paraformer（流式识别）',
+      installation_state: 'installed' as const, files_installed: true, runtime_ready: true, can_start: true,
+      update_available: true, installed_version: '1.0.0', version: '1.1.0' }])
+    const resourcePlan = vi.fn(async (id: string) => ({ resource_id: id, title: 'Paraformer（流式识别）', model_bytes: 100 }))
+    const download = vi.fn(async (id: string) => ({ job_id: `download-${id}` }))
+    vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({
+      available: true,
+      resourceInventory: inventoryRead,
+      workspaceInfo: async () => ({ root: 'D:/测试', data_dir: 'D:/测试/data', version: '1.0', can_manage: true }),
+      environmentStatus: async () => ({ jobs: [] }),
+      resourceInstallPlan: resourcePlan,
+      downloadResource: download,
+      listen: async () => () => undefined,
+    } as unknown as ReturnType<typeof desktopBridge.desktopPort>)
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() {
+      value = useProductControls()
+      provideProductContext(value)
+      const resourceController = useWorkspaceResources()
+      return () => h(ComputeSettings, { resourceController })
+    } })
+    value.computeStatus.value = { models: { paraformer: { service: 'READY', device: 'cpu', requested_device: 'cpu', gpu_available: false } } } as never
+    application.snapshot.value = { startup_complete: true, components: [{ id: 'asr', state: 'ready', pid: 12 }] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    const card = wrapper.get('[data-component="paraformer"]')
+    expect(card.get('.local-state').text()).toBe('需更新')
+    expect(card.get('button[aria-label="Paraformer（流式语音识别）：更新"]').text()).toBe('更新')
+    expect(card.get('button[aria-label="Paraformer（流式语音识别）：导入"]').text()).toBe('导入')
+    expect(card.get('button[aria-label="Paraformer（流式语音识别）：跳转官方来源"]').text()).toBe('跳转')
+    expect(card.find('.local-component-action').exists()).toBe(false)
+    await card.get('button[aria-label="Paraformer（流式语音识别）：更新"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('#install-plan-title').text()).toContain('准备更新 Paraformer')
+    await wrapper.get('.install-plan-actions button').trigger('click')
+    await flushPromises()
+    expect(resourcePlan).toHaveBeenCalledWith('paraformer-streaming')
+    expect(download).toHaveBeenCalledWith('paraformer-streaming')
   })
   it('显存摘要使用去重进程计量，未知指标不显示，缺失后端不能选择显卡，刷新重新检测环境', async () => {
     let value!: ReturnType<typeof useProductControls>

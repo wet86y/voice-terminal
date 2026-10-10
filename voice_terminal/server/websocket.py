@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -183,6 +184,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         )
         self.speaker: SpeakerWorkerClient | None = None
         self._speaker_engine: WeSpeakerOnnxEngine | None = None
+        self._speaker_engine_lock = threading.RLock()  # 本地声纹实例的构造与缓存释放锁。
         self._speaker_enrollment: dict[str, dict[str, Any]] = {}
         self._speaker_test_result: dict[str, Any] | None = None
         self.conversation = ConversationRuntime()
@@ -1431,6 +1433,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 await self.speaker.close()
             self.speaker = None
             await self._stop_managed_speaker_worker()
+            await asyncio.to_thread(self._release_speaker_engine)
             self.state.set_service("speaker", "DISABLED")
             if self.controller is not None:
                 self.controller.speaker_client = None

@@ -15,15 +15,30 @@ const section = ref('compute')
 const resources = useWorkspaceResources()
 const port = desktopPort() as DesktopPort & DesktopEnvironmentPort & DesktopCredentialsPort
 const credentials = useStartupCredentials(port)
-const componentsReady = computed(() => resources.resources.value.length > 0 && resources.resources.value.every(item => item.can_start))
+const updatesRequired = computed(() => resources.resources.value.some(item => item.update_available === true))
+const componentsReady = computed(() => resources.resources.value.length > 0
+  && resources.resources.value.every(item => item.can_start && item.update_available !== true))
+const componentBlockMessage = computed(() => updatesRequired.value
+  ? '有组件需更新并通过校验后才能启动语音服务。'
+  : '启动前组件校验未通过，请先下载或导入缺失组件。')
 const tasksBusy = computed(() => resources.startingResources.value.size > 0
   || resources.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state)))
+const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'fsmn-vad', 'wespeaker-cnceleb-resnet34', 'smart-turn', 'sensevoice-small'])
+function resourceJobsFor(resourceId: string) { return resources.resourceJobs.value.filter(job => job.resource_id === resourceId) }
+function resourceIsBusy(resourceId: string) {
+  return resources.startingResources.value.has(resourceId)
+    || resources.pendingDownloadPlan.value?.resource_id === resourceId
+    || resourceJobsFor(resourceId).some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))
+}
+function resourceFailure(resourceId: string) { return resourceJobsFor(resourceId).find(job => job.state === 'failed') }
 watch([componentsReady, credentials.loading], ([complete, loading]) => {
   if (complete && !loading && !credentials.ready.value && section.value === 'compute') section.value = 'models'
 })
 async function startProgram() {
   if (!componentsReady.value || tasksBusy.value) {
-    resources.resourceError.value = '请先下载或导入缺失组件，全部组件完备后再启动。'
+    resources.resourceError.value = updatesRequired.value
+      ? '有组件需更新并通过校验后才能启动语音服务。'
+      : '请先下载或导入缺失组件，全部组件完备后再启动。'
     section.value = 'compute'
     return
   }
@@ -37,22 +52,60 @@ async function startProgram() {
 }
 const model = computed<LocalComponentsModel>(() => ({
   status: '本地组件管理可用', state: 'ready', sampledAt: '原生资源清单', resources: [],
-  resourceActionsAvailable: resources.resourcesCanManage.value, resourceLoading: resources.loading.value,
+  resourceActionsAvailable: resources.resourcesCanManage.value,
+  resourceLoading: resources.loading.value || resources.refreshing.value || resources.inventoryRefreshing.value,
   resourceTasksBusy: Boolean(resources.startingResources.value.size || resources.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))),
   resourceError: resources.resourceError.value, resourceEventError: resources.eventError.value,
-  rows: resources.resources.value.map(item => ({ id: item.resource_id === 'voice-server' ? 'voice-system' : item.resource_id, name: item.label,
-    state: item.can_start ? 'ready' : 'disabled', status: item.files_installed ? item.runtime_ready ? '已就绪' : '运行环境待配置' : '资源未安装',
-    available: item.files_installed === true, runtime: '工作区独立组件', description: item.resource_id === 'voice-server' ? '统一准备全部语音运行依赖。' : item.resource_id === 'dsh' ? '下载或导入代理组件后使用。' : item.files_installed ? item.runtime_ready ? '模型文件和运行依赖已就绪。' : '模型文件已安装，请在 Voice Server（语音服务）配置运行依赖后启动。' : '下载或导入模型文件；运行依赖由 Voice Server（语音服务）统一配置。',
-    facts: [{label:'文件状态',value:item.installation_state === 'installed' ? '完整' : '待安装'}, ...(item.python ? [{ label: 'Python（后端解释器）', value: item.python }] : []), ...(item.version ? [{ label: '解释器版本', value: item.version }] : [])],
-    resource: {id:item.resource_id,label:item.label,state:item.installation_state,status:item.installation_state === 'installed' ? '已安装' : '缺失或不完整',error:item.error || undefined,
-      busy:resources.startingResources.value.has(item.resource_id)},
-  })),
-  managedResourceJobs: resources.resourceJobs.value.map(job => ({id:job.job_id,resourceId:job.resource_id,label:job.resource_id === 'batch' ? '批量资源导入' : resources.resources.value.find(item => item.resource_id === job.resource_id)?.label || '资源任务',state:job.state,phase:job.phase,completedBytes:job.completed_bytes,totalBytes:job.total_bytes,error:job.error || undefined,canCancel:job.can_cancel === true})),
+  rows: resources.resources.value.map(item => {
+    const failedJob = resourceFailure(item.resource_id)
+    return {
+      id: item.resource_id === 'voice-server' ? 'voice-system' : item.resource_id,
+      name: item.label,
+      state: item.update_available ? 'disabled' : item.can_start ? 'ready' : 'disabled',
+      status: item.update_available ? '需更新' : item.files_installed ? item.runtime_ready ? '已就绪' : '运行环境待配置' : '资源未安装',
+      available: item.files_installed === true,
+      runtime: '工作区独立组件',
+      description: item.update_available ? '此组件需更新并通过校验后才能启动。' : item.resource_id === 'voice-server' ? '统一准备全部语音运行依赖。' : item.resource_id === 'dsh' ? '下载或导入代理组件后使用。' : item.files_installed ? item.runtime_ready ? '模型文件和运行依赖已就绪。' : '模型文件已安装，请在 Voice Server（语音服务）配置运行依赖后启动。' : '下载或导入模型文件；运行依赖由 Voice Server（语音服务）统一配置。',
+      facts: [
+        { label: '文件状态', value: item.installation_state === 'installed' ? '完整' : '待安装' },
+        ...(item.python ? [{ label: 'Python（后端解释器）', value: item.python }] : []),
+        ...(item.resource_id === 'voice-server' && item.version ? [{ label: '解释器版本', value: item.version }] : []),
+      ],
+      resource: {
+        id: item.resource_id,
+        label: item.label,
+        state: item.installation_state,
+        status: item.update_available ? '需更新' : item.installation_state === 'installed' ? '已安装' : item.installation_state === 'incomplete' ? '不完整' : '缺失',
+        updateAvailable: item.update_available === true,
+        installedVersion: item.installed_version,
+        targetVersion: modelResourceIds.has(item.resource_id) ? item.version : undefined,
+        error: item.error || failedJob?.error || undefined,
+        retryable: Boolean(failedJob),
+        busy: resourceIsBusy(item.resource_id),
+      },
+    }
+  }),
+  managedResourceJobs: resources.resourceJobs.value.map(job => {
+    const resource = resources.resources.value.find(item => item.resource_id === job.resource_id)
+    return {
+      id: job.job_id,
+      resourceId: job.resource_id,
+      label: job.resource_id === 'batch' ? '批量资源导入'
+        : resource?.installation_state === 'installed' && resource.update_available ? `更新 ${resource.label}`
+          : resource?.label || '资源任务',
+      state: job.state,
+      phase: job.phase,
+      completedBytes: job.completed_bytes,
+      totalBytes: job.total_bytes,
+      error: job.error || undefined,
+      canCancel: job.can_cancel === true,
+    }
+  }),
 }))
 </script>
 <template>
   <AppFrame runtime="standby"><SettingsFrame :section="section" desktop @section="section = $event" @back="startProgram" @logs="port.openLogs()" @exit="port.exit()">
-    <article class="settings-panel panel"><template v-if="section === 'compute' || section === 'system'"><div class="management-start"><p>{{ componentsReady ? credentials.ready.value ? '组件和接口密钥已完备，可以启动程序。' : '全部组件已完备，请先配置接口密钥再启动。' : '启动前组件校验未通过，请手动下载或导入缺失组件。下载可以并行进行。' }}</p><div class="management-actions"><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value" @click="startProgram">启动程序</button><button class="outline-button" @click="section = 'models'">配置接口密钥</button></div></div><LocalComponents :model="model" @refresh="resources.refresh" @resource-download="resources.downloadResource" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" /></template>
+    <article class="settings-panel panel"><template v-if="section === 'compute' || section === 'system'"><div class="management-start"><p>{{ componentsReady ? credentials.ready.value ? '组件和接口密钥已完备，可以启动程序。' : '全部组件已完备，请先配置接口密钥再启动。' : componentBlockMessage }}</p><div class="management-actions"><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value" @click="startProgram">启动程序</button><button class="outline-button" @click="section = 'models'">配置接口密钥</button></div></div><LocalComponents :model="model" @refresh="resources.refresh" @resource-download="resources.downloadResource" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" /></template>
       <section v-else-if="section === 'models'" class="startup-models"><SettingsPageHeader section="models"><template #actions><button class="outline-button" @click="section = 'compute'">查看组件下载</button><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value" @click="startProgram">启动程序</button></template></SettingsPageHeader><p class="startup-models-hint">组件未就绪时也可以提前填写。组件和接口密钥完备后再启动程序。</p><p v-if="credentials.error.value" class="startup-credentials-error" role="alert">{{ credentials.error.value }}</p><p v-if="credentials.notice.value" class="startup-credentials-notice" role="status">{{ credentials.notice.value }}</p><FixedModelCredentials v-model:deepseek="credentials.deepseek.value" v-model:minimax="credentials.minimax.value" :configured="credentials.configured.value" :disabled="credentials.disabled.value" :saving="credentials.saving.value" startup @save="credentials.save" /></section>
       <WorkspaceSettings v-else-if="section === 'workspace'" :controller="resources" />
       <section v-else class="environment-required"><h2>请先补齐本地组件</h2><p>全部组件和接口密钥准备好后可以启动语音与业务服务。组件下载、导入、模型接口设置和关于页现在可以使用。</p><button class="outline-button" @click="section = 'compute'">进入组件管理</button></section>

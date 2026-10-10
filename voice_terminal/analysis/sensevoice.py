@@ -37,7 +37,8 @@ def bounded_segments(segments: list, duration_ms: int) -> list[tuple[int, int]]:
 class SenseVoice:
     def __init__(self, model_dir: Path, vad_dir: Path, *,
                  device: str = "cpu", fallback_device: str = "cpu") -> None:
-        from funasr import AutoModel
+        from ..asr.model_loader import auto_model_class
+        AutoModel = auto_model_class(model_dir, additional_model_dirs=(vad_dir,))
         from funasr.tokenizer.sentencepiece_tokenizer import SentencepiecesTokenizer
         from funasr.register import tables
         import sentencepiece

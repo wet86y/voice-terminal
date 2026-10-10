@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from ..resource_distribution import ResourceCatalog, ResourceError
+from ..model_installation import inspect_installed_model, model_update_available
 
 
 def required_model_resources(config: Any) -> dict[str, list[str]]:
@@ -67,7 +68,7 @@ def inspect_model_resources(
     model_root: Path,
     requirements: Mapping[str, list[str]],
 ) -> dict[str, str]:
-    """Check only fixed required paths and sizes（仅检查固定必需路径与大小）。"""
+    """Check current resources（核验当前资源）：待更新组件阻止所有模型角色启动。"""
     if not requirements:
         return {}
     try:
@@ -76,9 +77,35 @@ def inspect_model_resources(
         issue = "程序内固定模型资源清单缺失或无效，请修复应用安装后再启动模型组件。"
         return {role: issue for role in requirements}
 
+    # Pending updates（待更新组件）对整体语音服务生效，包括本次配置未启用的模型。
+    pending_updates: dict[str, str] = {}
+    for spec in catalog.specs.values():
+        if spec.kind == "model" and model_update_available(
+                spec, inspect_installed_model(model_root, spec.destination, spec.resource_id)):
+            pending_updates[spec.resource_id] = spec.title
+
+    runtime_issue = None
+    runtime_path = model_root.parent / "runtimes/python/runtime.json"
+    if runtime_path.is_file():
+        try:
+            import hashlib
+            runtime_record = json.loads(runtime_path.read_text("utf-8-sig"))
+            digest = hashlib.sha256((program_root / "config/runtime/voice-runtime.lock.json").read_bytes()).hexdigest()
+            groups = {"voice-core", "torch-cpu", "onnx-cpu", "sherpa-cpu", "modelscope-download", "onnx-vad"}
+            if (not isinstance(runtime_record, dict) or runtime_record.get("schema") != 2
+                    or runtime_record.get("lock_sha256") != digest
+                    or not isinstance(runtime_record.get("groups"), list)
+                    or not groups.issubset(runtime_record["groups"])):
+                runtime_issue = "语音运行环境需要更新，请在组件管理完成全部当前运行依赖的配置。"
+        except (OSError, UnicodeError, ValueError, TypeError):
+            runtime_issue = "语音运行环境登记缺失或无效，请在组件管理完成当前运行依赖的配置。"
+
     issues: dict[str, str] = {}
     for role, resource_ids in requirements.items():
-        details: list[str] = []
+        details = [f"{title}：组件有更新，请先更新或导入当前版本后再启动整体语音服务。"
+                   for title in pending_updates.values()]
+        if runtime_issue:
+            details.append(runtime_issue)
         for resource_id in resource_ids:
             try:
                 spec = catalog.get(resource_id)
@@ -88,22 +115,12 @@ def inspect_model_resources(
             if spec.kind != "model":
                 details.append(f"固定资源 {resource_id} 不是模型资源。")
                 continue
+            if resource_id in pending_updates:
+                continue
             for item in spec.required_files:
                 problem = _check_model_file(model_root, spec.destination, item.path, item.size_bytes)
                 if problem:
                     details.append(f"{spec.title}：{problem}")
-        # Runtime group（共享运行依赖组）缺失时不尝试加载已导入的模型。
-        install = model_root.parent
-        try:
-            runtime_record=json.loads((install/'runtimes/python/runtime.json').read_text('utf-8'))
-            if runtime_record.get('schema') == 2:
-                import hashlib
-                digest=hashlib.sha256((program_root/'config/runtime/voice-runtime.lock.json').read_bytes()).hexdigest()
-                for resource_id in resource_ids:
-                    group='torch-cpu' if resource_id in {'paraformer-streaming','fsmn-vad','sensevoice-small'} else 'sherpa-cpu' if resource_id=='kws-sherpa-onnx' else 'onnx-cpu'
-                    if group not in runtime_record.get('groups',[]) or runtime_record.get('lock_sha256')!=digest:
-                        details.append(f'{group}（共享中央处理器依赖）尚未配置，请进入组件管理。')
-        except (OSError,ValueError): pass  # 原有完整运行包继续使用兼容检查。
         if details:
             labels = "；".join(details)
             issues[role] = f"请下载或导入所需本地模型资源后再启动。{labels}"

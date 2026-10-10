@@ -10,7 +10,7 @@ const props = defineProps<{
   saving?: boolean
 }>()
 const visibleResources = computed(() => props.model.resources.filter(resource => resource.used !== undefined))
-// batchImportAvailable（批量导入入口）：仅在仍有组件安装内容缺失时展示。
+// batchImportAvailable（批量导入入口）：缺失、不完整或存在必须处理的更新时展示。
 const batchImportAvailable = computed(() => props.model.resourceActionsAvailable && props.model.rows.some(needsResource))
 const emit = defineEmits<{
   /** refresh（刷新指标）与 retry（重试指定组件）。 */
@@ -18,6 +18,8 @@ const emit = defineEmits<{
   retry: [id: string]
   /** resourceDownload/resourceImport（下载或导入资源）、openResourceSource（打开上游）、cancelResource（取消任务）。 */
   resourceDownload: [id: string]
+  /** resourceRefresh（展开资源详情后刷新一次资源清单）。 */
+  resourceRefresh: []
   resourceImport: [id: string]
   resourceImportAll: []
   openResourceSource: [id: string]
@@ -45,8 +47,8 @@ const batchJob = computed(() => visibleJob(latestJobs.value.get('batch')))
 function visibleJob(job: ManagedResourceJob | undefined) {
   return job && !['complete', 'completed'].includes(job.state) ? job : undefined
 }
-function jobIsActive(job: ManagedResourceJob) {
-  return !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state)
+function jobIsActive(job?: ManagedResourceJob) {
+  return Boolean(job && !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))
 }
 function jobStateLabel(job: ManagedResourceJob) {
   if (job.state === 'failed') return '失败'
@@ -61,15 +63,21 @@ function resourceStateLabel(state: string) {
   return state === 'installed' ? '已安装' : state === 'incomplete' ? '不完整' : '缺失'
 }
 function needsResource(row: LocalComponentRow) {
-  return Boolean(row.resource && row.resource.state !== 'installed')
+  return Boolean(row.resource && (row.resource.state !== 'installed' || row.resource.updateAvailable))
+}
+function canExpand(row: LocalComponentRow) {
+  return row.available && !needsResource(row)
 }
 function activate(row: LocalComponentRow) {
-  if (!row.available) {
+  if (!canExpand(row)) {
     if (row.retryable && !row.busy) emit('retry', row.id)
     return
   }
   if (expanded.value.has(row.id)) expanded.value.delete(row.id)
-  else expanded.value.add(row.id)
+  else {
+    expanded.value.add(row.id)
+    if (row.resource && props.model.resourceActionsAvailable) emit('resourceRefresh')
+  }
 }
 function changeDevice(id: string, event: Event) {
   const value = (event.target as HTMLSelectElement).value
@@ -114,7 +122,7 @@ function invalidDevice(row: LocalComponentRow) {
       <article v-for="{ row, job } in componentCards" :key="row.id" class="local-component-card" :class="job ? jobState(job) : row.state" :data-component="row.id">
         <div class="local-component-summary" :class="{ 'resource-needed': needsResource(row) }">
           <div class="local-component-body">
-            <div class="local-component-identity"><h4 :title="row.name">{{ row.name }}</h4><span class="local-state" :class="job ? jobState(job) : needsResource(row) ? 'failed' : row.state"><i aria-hidden="true"></i>{{ job ? jobStateLabel(job) : needsResource(row) && row.resource ? resourceStateLabel(row.resource.state) : row.status }}</span></div>
+            <div class="local-component-identity"><h4 :title="row.name">{{ row.name }}</h4><span class="local-state" :class="job ? jobState(job) : needsResource(row) ? 'failed' : row.state"><i aria-hidden="true"></i>{{ job?.state === 'failed' && row.resource?.updateAvailable ? '需更新' : job ? jobStateLabel(job) : needsResource(row) && row.resource ? row.resource.updateAvailable ? '需更新' : resourceStateLabel(row.resource.state) : row.status }}</span></div>
             <p v-if="row.state === 'loading' && !needsResource(row)" class="local-component-phase" aria-live="polite">{{ row.description }}</p>
             <dl class="local-component-metrics">
               <div v-if="row.runtime && row.runtime !== '未提供'" class="local-runtime-metric" data-metric="runtime"><dt>运行时</dt><dd>{{ row.runtime }}</dd></div>
@@ -123,26 +131,27 @@ function invalidDevice(row: LocalComponentRow) {
                 <div v-if="row.vram !== undefined" data-metric="vram"><dt>显存</dt><dd>{{ row.vram }}</dd></div>
               </div>
             </dl>
-            <p v-if="!job && needsResource(row) && row.resource" class="local-error" role="status">{{ row.resource.error || '请下载或导入此组件。' }}</p>
+            <p v-if="!job && needsResource(row) && row.resource" class="local-error" role="status">{{ row.resource.error || (row.resource.updateAvailable ? '此组件需更新并通过校验后才能启动。' : '请下载或导入此组件。') }}</p>
             <p v-else-if="!job && row.error && !row.busy" class="local-error">{{ row.error }}</p>
           </div>
           <button v-if="job && jobIsActive(job)" class="outline-button local-resource-cancel" type="button" :disabled="!job.canCancel" :aria-label="`${row.name}：取消任务`" @click="emit('cancelResource', job.id)">{{ job.canCancel ? '取消任务' : '处理中…' }}</button>
           <div v-else-if="row.resource && needsResource(row) && model.resourceActionsAvailable" class="managed-resource-actions local-install-actions" :data-resource="row.resource.id" :aria-label="`${row.name}资源操作`">
-            <button class="outline-button" type="button" :disabled="row.resource.busy || model.resourceLoading" :aria-label="`${row.name}：下载`" @click="emit('resourceDownload', row.resource.id)">{{ row.resource.busy ? '处理中…' : row.resource.retryable || job?.state === 'failed' ? '重试下载' : '下载' }}</button>
-            <button class="outline-button" type="button" :disabled="row.resource.busy || model.resourceLoading" :aria-label="`${row.name}：导入`" @click="emit('resourceImport', row.resource.id)">{{ row.resource.busy ? '处理中…' : row.resource.retryable || job?.state === 'failed' ? '重试导入' : '导入' }}</button>
+            <button class="outline-button" type="button" :disabled="row.resource.busy || model.resourceLoading" :aria-label="`${row.name}：${row.resource.updateAvailable ? '更新' : '下载'}`" @click="emit('resourceDownload', row.resource.id)">{{ row.resource.busy ? '处理中…' : row.resource.updateAvailable ? row.resource.retryable || job?.state === 'failed' ? '重试更新' : '更新' : row.resource.retryable || job?.state === 'failed' ? '重试下载' : '下载' }}</button>
+            <button class="outline-button" type="button" :disabled="row.resource.busy || model.resourceLoading" :aria-label="`${row.name}：导入`" @click="emit('resourceImport', row.resource.id)">{{ row.resource.busy ? '处理中…' : row.resource.updateAvailable ? '导入' : row.resource.retryable || job?.state === 'failed' ? '重试导入' : '导入' }}</button>
             <button class="outline-button" type="button" :disabled="model.resourceLoading" :aria-label="`${row.name}：跳转官方来源`" title="打开官方来源页面" @click="emit('openResourceSource', row.resource.id)">跳转</button>
           </div>
-          <button v-else-if="!needsResource(row)" class="local-component-action" :class="{ 'retry-action': row.state === 'failed' }" type="button" :disabled="row.busy || row.state === 'loading' || (!row.available && !row.retryable)" :aria-label="`${row.name}：${row.state === 'loading' ? row.status : row.available ? expanded.has(row.id) ? '收起详情' : '详情' : row.state === 'disabled' ? '已停用' : '重试'}`" :aria-expanded="row.available ? expanded.has(row.id) : undefined" :aria-controls="row.available ? `local-detail-${row.id}` : undefined" @click="activate(row)">
-            {{ row.state === 'loading' ? row.status : row.available ? expanded.has(row.id) ? '收起' : '详情' : row.state === 'disabled' ? '已停用' : '重试' }}
-            <svg v-if="row.available" viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expanded.has(row.id) }"><path d="m6 9 6 6 6-6" /></svg>
+          <button v-else-if="!needsResource(row)" class="local-component-action" :class="{ 'retry-action': row.state === 'failed' }" type="button" :disabled="row.busy || row.state === 'loading' || (!canExpand(row) && !row.retryable)" :aria-label="`${row.name}：${row.state === 'loading' ? row.status : canExpand(row) ? expanded.has(row.id) ? '收起详情' : '详情' : row.state === 'disabled' ? '已停用' : '重试'}`" :aria-expanded="canExpand(row) ? expanded.has(row.id) : undefined" :aria-controls="canExpand(row) ? `local-detail-${row.id}` : undefined" @click="activate(row)">
+            {{ row.state === 'loading' ? row.status : canExpand(row) ? expanded.has(row.id) ? '收起' : '详情' : row.state === 'disabled' ? '已停用' : '重试' }}
+            <svg v-if="canExpand(row)" viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expanded.has(row.id) }"><path d="m6 9 6 6 6-6" /></svg>
           </button>
         </div>
         <ManagedResourceProgress v-if="job" class="local-resource-progress" :job="job" :label="row.name" />
         <section v-if="row.resource && !needsResource(row) && expanded.has(row.id)" class="local-managed-resource" :data-resource="row.resource.id" :aria-label="`${row.resource.label}安装状态`">
           <div class="local-managed-resource-heading"><span>{{ row.resource.label }}</span><span class="resource-install-state" :class="row.resource.state">{{ row.resource.state === 'installed' ? '✓' : '!' }} {{ row.resource.status || resourceStateLabel(row.resource.state) }}</span></div>
+          <dl v-if="row.resource.installedVersion || row.resource.targetVersion" class="local-resource-versions"><div v-if="row.resource.installedVersion"><dt>已安装版本</dt><dd>{{ row.resource.installedVersion }}</dd></div><div v-if="row.resource.targetVersion"><dt>目标模型版本</dt><dd>{{ row.resource.targetVersion }}</dd></div></dl>
           <p v-if="row.resource.error" class="local-error" role="status">{{ row.resource.error }}</p>
         </section>
-        <div v-if="row.available && expanded.has(row.id)" :id="`local-detail-${row.id}`" class="local-component-detail">
+        <div v-if="canExpand(row) && expanded.has(row.id)" :id="`local-detail-${row.id}`" class="local-component-detail">
           <p>{{ row.description }}</p>
           <dl v-if="row.facts.length" class="local-detail-facts"><div v-for="fact in row.facts" :key="fact.label"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div></dl>
           <div v-if="row.device" class="local-device-editor">
@@ -168,6 +177,7 @@ function invalidDevice(row: LocalComponentRow) {
 .local-managed-resource{display:grid;gap:8px;padding:10px 16px;border-top:1px solid var(--line);background:#00000008}
 .local-managed-resource-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0;font-size:var(--font-caption);color:var(--muted)}
 .local-managed-resource-heading>span:first-child{min-width:0;overflow-wrap:anywhere}
+.local-resource-versions{display:flex;gap:18px;flex-wrap:wrap}.local-resource-versions>div{display:flex;gap:6px;align-items:baseline}.local-resource-versions dd{font-size:var(--font-caption)}
 .resource-install-state{flex:none;display:inline-flex;align-items:center;gap:4px;font-size:var(--font-caption);color:var(--muted);white-space:nowrap}
 .resource-install-state.installed{color:var(--mint)}
 .resource-install-state.missing,.resource-install-state.incomplete{color:var(--accent)}

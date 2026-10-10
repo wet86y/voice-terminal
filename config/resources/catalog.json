@@ -11,7 +11,7 @@
       "title": "Sherpa-ONNX 唤醒词模型",
       "destination": "kws/sherpa-onnx-kws-zipformer-zh-en-3M",
       "version": "2025-12-20",
-      "required": false,
+      "required": true,
       "source": {
         "platform": "github",
         "repo_id": "k2-fsa/sherpa-onnx",
@@ -147,7 +147,7 @@
       "title": "Paraformer 流式语音识别模型",
       "destination": "funasr/paraformer-zh-streaming",
       "version": "v2.0.5",
-      "required": false,
+      "required": true,
       "source": {
         "platform": "modelscope",
         "repo_id": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
@@ -196,8 +196,9 @@
       "kind": "model",
       "title": "FSMN-VAD 语音活动检测模型",
       "destination": "funasr/fsmn-vad",
-      "version": "v2.0.4",
-      "required": false,
+      "version": "v2.0.4-onnx-443ac237",
+      "dependency_group": "onnx-vad",
+      "required": true,
       "source": {
         "platform": "modelscope",
         "repo_id": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
@@ -228,6 +229,56 @@
           "path": "model.pt",
           "size_bytes": 1721366,
           "sha256": "b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5"
+        },
+        {
+          "path": "onnx/model.onnx",
+          "size_bytes": 1730427,
+          "sha256": "443ac237b4a33ea22b5ae5a6527888bc237d460fa7a20de7b632727a2c7db56f",
+          "optional": false,
+          "asset": "assets/fsmn-vad/onnx/model.onnx"
+        },
+        {
+          "path": "onnx/config.yaml",
+          "size_bytes": 1215,
+          "sha256": "486861ca26ddb79081663b6179cb204c6bfae71c52f04aafc48a9e9d8dde1e93",
+          "optional": false,
+          "asset": "assets/fsmn-vad/onnx/config.yaml"
+        },
+        {
+          "path": "onnx/am.mvn",
+          "size_bytes": 8040,
+          "sha256": "6820fef9687708c4fc3fab2530179c8fcea6262daa25514380056cd8f6eb1754",
+          "optional": false,
+          "asset": "assets/fsmn-vad/onnx/am.mvn"
+        },
+        {
+          "path": "onnx/manifest.json",
+          "size_bytes": 2237,
+          "sha256": "a40b3a414a2b2ad1112d4bb6f202021432579f3f92b04c698ed68fe2bf0a2bad",
+          "optional": false,
+          "asset": "assets/fsmn-vad/onnx/manifest.json"
+        }
+      ],
+      "generated_assets": [
+        {
+          "path": "onnx/model.onnx",
+          "generator": "FunASR 1.4.14 FSMN-VAD exporter",
+          "description": "从固定 v2.0.4 model.pt 导出的未量化 ONNX；与原权重 SHA-256 绑定并通过流式数值校验。"
+        },
+        {
+          "path": "onnx/config.yaml",
+          "generator": "固定 FSMN-VAD 源模型配置副本",
+          "description": "与源 model.pt 对应的原始 ONNX 运行时配置。"
+        },
+        {
+          "path": "onnx/am.mvn",
+          "generator": "固定 FSMN-VAD 源模型特征统计副本",
+          "description": "与源模型对应的原始特征均值方差。"
+        },
+        {
+          "path": "onnx/manifest.json",
+          "generator": "本项目 ONNX 导出校验流程",
+          "description": "绑定源权重 SHA-256（摘要）、未量化状态与派生文件摘要。"
         }
       ]
     },
@@ -237,7 +288,7 @@
       "title": "WeSpeaker 中文声纹模型",
       "destination": "speaker/wespeaker-cnceleb-resnet34",
       "version": "c2c6282460dd5958d8eec16785f035d92e4a2d77",
-      "required": false,
+      "required": true,
       "source": {
         "platform": "huggingface",
         "repo_id": "Wespeaker/wespeaker-cnceleb-resnet34",
@@ -262,7 +313,7 @@
       "title": "SmartTurn 语音结束判断模型",
       "destination": "analysis/smart-turn",
       "version": "f766f81d3cfdf7737ac64aad813d91bbfd56bf93",
-      "required": false,
+      "required": true,
       "source": {
         "platform": "huggingface",
         "repo_id": "pipecat-ai/smart-turn-v3",
@@ -306,7 +357,7 @@
       "title": "SenseVoiceSmall 整句语音精修模型",
       "destination": "analysis/sensevoice",
       "version": "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7",
-      "required": false,
+      "required": true,
       "source": {
         "platform": "huggingface",
         "repo_id": "FunAudioLLM/SenseVoiceSmall",
@@ -351,7 +402,7 @@
       "title": "DeepSeek Harness 官方桌面客户端",
       "destination": "runtimes/dsh",
       "version": "0.2.0-rc.2",
-      "required": false,
+      "required": true,
       "origin": "official_installer",
       "source": {
         "platform": "deepseek_official",
@@ -395,7 +446,8 @@
     "sha256": "文件 SHA-256（摘要）十六进制值",
     "optional": "是否为可选文件",
     "asset": "程序随包携带的生成文件相对路径",
-    "required": "是否为基础安装必需资源",
+    "dependency_group": "安装或更新该资源前配置的专用运行依赖组",
+    "required": "是否为整体语音服务必需资源；管理页可先运行以完成安装或更新",
     "generated_assets": "由程序本身提供或生成的文件说明",
     "transfer": "下载任务使用的固定传输适配器",
     "artifact": "固定远端安装文件说明",

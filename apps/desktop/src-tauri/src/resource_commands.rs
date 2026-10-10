@@ -95,6 +95,8 @@ pub struct ResourceManager {
     jobs_path: PathBuf,
     reviews: Mutex<HashMap<String,bool>>, // reviews（用户对导入内容的选择）。
     activation: Mutex<()>, // activation（仅串行化资源启用；下载、解包与校验不占锁）。
+    environment: Mutex<()>, // environment（串行化完整语音环境的复制、组装与导入；模型下载仍可并行）。
+    resume_pending: Mutex<bool>, // resume_pending（先前运行服务的延迟恢复意图；全部资源更新完成后才恢复）。
 }
 
 impl ResourceManager {
@@ -118,7 +120,9 @@ impl ResourceManager {
             jobs_changed: Condvar::new(),
             jobs_path,
             activation: Mutex::new(()),
+            environment: Mutex::new(()),
             reviews: Mutex::new(HashMap::new()),
+            resume_pending: Mutex::new(false),
         };
         manager.persist_jobs()?;
         Ok(manager)
@@ -186,7 +190,9 @@ impl ResourceManager {
         let job_id=format!("env-{group}");
         self.start_job(job_id.clone(),"voice-server".into(),"正在配置语音环境".into(),true,move|manager,id|{
             let cancel=manager.cancel_signal(&id)?;
-            let result=voice_desktop_common::runtime::configure_with_activation(&manager.context,&group,cancel,&mut|phase,done,total|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total)),&mut|stage,relative|manager.activate_resource(&id,stage,relative));
+            let mut progress=|phase:&str,done:u64,total:u64|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total));
+            let _environment=acquire_environment_lock(&manager.environment,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:vec![]})?;
+            let result=voice_desktop_common::runtime::configure_with_activation(&manager.context,&group,cancel,&mut progress,&mut|stage,relative|manager.activate_resource(&id,stage,relative));
             result.map_err(|message|JobError::Failed{message,installed:vec![]})
         })?;Ok(json!({"job_id":job_id}))
     }
@@ -195,7 +201,10 @@ impl ResourceManager {
         self.start_job(job_id.clone(),"voice-server".into(),"选择语音环境目录".into(),true,move|manager,id|{
             let source=voice_desktop_common::native_ui::choose_folder("选择已准备的程序私有 Python（后端环境）目录")
                 .map_err(|message|JobError::Failed{message,installed:vec![]})?.ok_or(JobError::Cancelled)?;
-            let result=voice_desktop_common::runtime::import_with_activation(&manager.context,&source,manager.cancel_signal(&id)?,&mut|phase,done,total|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total)),&mut|stage,relative|manager.activate_resource(&id,stage,relative));
+            let cancel=manager.cancel_signal(&id)?;
+            let mut progress=|phase:&str,done:u64,total:u64|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total));
+            let _environment=acquire_environment_lock(&manager.environment,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:vec![]})?;
+            let result=voice_desktop_common::runtime::import_with_activation(&manager.context,&source,cancel,&mut progress,&mut|stage,relative|manager.activate_resource(&id,stage,relative));
             result.map_err(|message|JobError::Failed{message,installed:vec![]})
         })?;Ok(json!({"job_id":job_id}))
     }
@@ -340,20 +349,30 @@ impl ResourceManager {
             if phase.starts_with("启用")||phase.starts_with("正在启用"){let _=self.begin_non_cancellable_phase(job_id,phase,done,Some(total));}
             else{self.set_phase(job_id,phase,true,done,Some(total));}
         };
-        // 模型任务只下载、校验及启用模型文件；共享 Python（语音依赖）由语音服务入口配置。
-        let result=voice_desktop_common::resources::download_resource_with_activation(&self.context,resource_id,cancel,&mut progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative));
-        result.map_err(|message|JobError::Failed{message,installed:vec![]})
+        // dependency_group（依赖组）模型先校验并配置完整运行环境，再下载自身模型文件。
+        let mut installed=self.configure_resource_dependencies(job_id,resource_id,cancel.clone(),&mut progress)
+            .map_err(|message|JobError::Failed{message,installed:vec![]})?;
+        let result=voice_desktop_common::resources::download_resource_with_activation(&self.context,resource_id,cancel,&mut progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative))
+            .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+        installed.extend(result);Ok(installed)
     }
 
     fn run_import(self: &Arc<Self>, job_id: &str, resource_id: Option<String>) -> Result<Vec<String>, JobError> {
         let sources=voice_desktop_common::native_ui::choose_resource(resource_id.as_deref()).map_err(|message|JobError::Failed{message,installed:vec![]})?;
         if sources.is_empty(){return Err(JobError::Cancelled);}
         let mut installed=vec![];
+        let mut progress=|phase:&str,done:u64,total:u64|{
+            if phase.starts_with("正在启用")||phase.starts_with("启用"){let _=self.begin_non_cancellable_phase(job_id,phase,done,Some(total));}
+            else{self.set_phase(job_id,phase,true,done,Some(total));}
+        };
+        if let Some(id)=resource_id.as_deref(){
+            let dependencies=self.configure_resource_dependencies(job_id,id,self.cancel_signal(job_id)?,&mut progress)
+                .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+            installed.extend(dependencies);
+        }
         for source in sources {
-            let result=voice_desktop_common::resources::import_review_with_activation(&self.context,&source,resource_id.as_deref(),self.cancel_signal(job_id)?,&mut|phase,done,total|{
-                if phase.starts_with("正在启用"){let _=self.begin_non_cancellable_phase(job_id,phase,done,Some(total));}
-                else{self.set_phase(job_id,phase,true,done,Some(total));}
-            },&mut|items|self.review_import(job_id,items),&mut|stage,relative|self.activate_resource(job_id,stage,relative))
+            let result=voice_desktop_common::resources::import_review_with_activation(&self.context,&source,resource_id.as_deref(),self.cancel_signal(job_id)?,&mut progress,
+                &mut|items|self.review_import(job_id,items),&mut|stage,relative|self.activate_resource(job_id,stage,relative))
                 .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
             installed.extend(result);
         }
@@ -492,12 +511,82 @@ impl ResourceManager {
         ServiceLease::pause(&self.service_control, guard)
     }
 
+    fn remember_service_was_running(&self,was_running:bool)->Result<(),String>{
+        if was_running{*self.resume_pending.lock().map_err(|_|"服务恢复意图不可用。")?=true;}
+        Ok(())
+    }
+
+    fn pending_service_resume(&self)->Result<bool,String>{Ok(*self.resume_pending.lock().map_err(|_|"服务恢复意图不可用。")?)}
+
+    fn all_resources_ready(&self)->Result<bool,String>{
+        let readiness=voice_desktop_common::resources::startup_readiness(&self.context)?;
+        Ok(readiness["ready"]==true)
+    }
+
+    fn maybe_resume_service(&self,lease:&mut ServiceLease<'_>)->Result<bool,String>{
+        if !self.pending_service_resume()?{lease.keep_stopped();return Ok(false);}
+        match self.all_resources_ready(){
+            Ok(false)=>{lease.keep_stopped();return Ok(false);}
+            Err(error)=>{lease.keep_stopped();return Err(format!("无法确认全部组件已就绪，语音服务保持停止：{error}"));}
+            Ok(true)=>{}
+        }
+        lease.resume_service()?;
+        Ok(true)
+    }
+
+    fn rollback_failed_activation(&self,lease:&mut ServiceLease<'_>,transaction:&mut voice_desktop_common::resources::PendingActivation,reason:&str)->String{
+        if let Err(error)=lease.stop_partial(){
+            lease.keep_stopped();
+            return format!("{reason}；无法确认新服务已停止，资源回滚留待下次启动恢复：{error}");
+        }
+        if let Err(error)=voice_desktop_common::resources::rollback_activation(&self.context,transaction){
+            lease.keep_stopped();
+            return format!("{reason}；恢复原组件失败：{error}");
+        }
+        match self.maybe_resume_service(lease){
+            Ok(resumed)=>{
+                // prior-running intent（更新前正在运行的服务恢复意图）只有在旧状态恢复且服务确实重新启动后才能清除；
+                // 若后续 transaction commit（事务提交）失败，仍需保留它以重新启动回滚后的旧服务。
+                clear_resume_intent_if_resumed(&self.resume_pending,resumed);
+                reason.to_owned()
+            },
+            Err(error)=>format!("{reason}；原组件已恢复，但语音服务未恢复：{error}"),
+        }
+    }
+
+    fn settle_before_activation(&self,lease:&mut ServiceLease<'_>,reason:&str)->String{
+        match self.maybe_resume_service(lease){
+            Ok(resumed)=>{clear_resume_intent_if_resumed(&self.resume_pending,resumed);reason.to_owned()},
+            Err(error)=>format!("{reason}；语音服务未恢复：{error}")
+        }
+    }
+
     fn activate_resource(&self,job_id:&str,stage:&Path,relative:&str)->Result<(),String>{
-        let lease=self.pause_service()?;
-        let cancel=self.cancel_signal(job_id).map_err(|_|"资源任务已丢失")?;
-        voice_desktop_common::resources::check_cancel(&cancel)?;
-        let result=voice_desktop_common::resources::activate(&self.context,stage,relative);
-        let _=lease.finish();result
+        let mut lease=self.pause_service()?;
+        if let Err(error)=self.remember_service_was_running(lease.was_running()){lease.keep_stopped();return Err(error);}
+        let cancel=match self.cancel_signal(job_id){Ok(value)=>value,Err(_)=>return Err(self.settle_before_activation(&mut lease,"资源任务已丢失"))};
+        if let Err(error)=voice_desktop_common::resources::check_cancel(&cancel){return Err(self.settle_before_activation(&mut lease,&error));}
+        let mut transaction=match voice_desktop_common::resources::begin_activation(&self.context,stage,relative){
+            Ok(value)=>value,Err(error)=>return Err(self.settle_before_activation(&mut lease,&error)),
+        };
+        let pending=match self.pending_service_resume(){Ok(value)=>value,Err(error)=>return Err(self.rollback_failed_activation(&mut lease,&mut transaction,&error))};
+        let resumed=if pending {
+            match self.maybe_resume_service(&mut lease){
+                Ok(value)=>value,Err(error)=>return Err(self.rollback_failed_activation(&mut lease,&mut transaction,&error)),
+            }
+        }else{lease.keep_stopped();false};
+        match voice_desktop_common::resources::commit_activation(&self.context,&mut transaction){
+            Ok(())=>{
+                clear_resume_intent_if_resumed(&self.resume_pending,resumed);
+                Ok(())
+            },
+            Err(error) if transaction.is_committed()=>{
+                lease.keep_stopped();
+                clear_resume_intent_if_resumed(&self.resume_pending,resumed);
+                Err(format!("资源已提交并启用，但旧备份清理失败：{error}"))
+            }
+            Err(error)=>Err(self.rollback_failed_activation(&mut lease,&mut transaction,&error)),
+        }
     }
 
     fn start_job<F>(self: &Arc<Self>, job_id: String, resource_id: String, phase: String, can_cancel: bool, worker: F) -> Result<(), String>
@@ -648,6 +737,33 @@ impl ResourceManager {
     fn cancelled(&self, job_id: &str) -> bool {
         self.jobs.lock().ok().and_then(|jobs| jobs.get(job_id).map(|job| job.cancel.load(Ordering::Acquire))).unwrap_or(false)
     }
+
+    fn configure_resource_dependencies(&self,job_id:&str,resource_id:&str,cancel:Arc<AtomicBool>,progress:&mut voice_desktop_common::resources::Progress<'_>)->Result<Vec<String>,String>{
+        let spec=voice_desktop_common::resources::spec(&self.context,resource_id)?;
+        let Some(group)=spec["dependency_group"].as_str() else{return Ok(vec![])};
+        let _environment=acquire_environment_lock(&self.environment,&cancel,progress)?;
+        let activation_job=job_id.to_owned();
+        voice_desktop_common::runtime::configure_with_activation(&self.context,group,cancel,progress,&mut|stage,relative|self.activate_resource(&activation_job,stage,relative))
+    }
+}
+
+fn clear_resume_intent_if_resumed(resume_pending:&Mutex<bool>,resumed:bool){
+    if resumed{if let Ok(mut pending)=resume_pending.lock(){*pending=false;}}
+}
+
+fn acquire_environment_lock<'a>(environment:&'a Mutex<()>,cancel:&AtomicBool,progress:&mut voice_desktop_common::resources::Progress<'_>)->Result<MutexGuard<'a,()>,String>{
+    let mut reported_wait=false;
+    loop{
+        voice_desktop_common::resources::check_cancel(cancel)?;
+        match environment.try_lock(){
+            Ok(guard)=>return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_))=>return Err("语音环境配置锁不可用。".into()),
+            Err(std::sync::TryLockError::WouldBlock)=>{
+                if !reported_wait{progress("等待语音运行环境专用更新锁",0,0);reported_wait=true;}
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 struct ServiceLease<'a> {
@@ -663,10 +779,25 @@ impl<'a> ServiceLease<'a> {
         Ok(Self { control, _guard: guard, active: true, resume })
     }
 
+    fn was_running(&self)->bool{self.resume}
+
+    fn resume_service(&mut self)->Result<(),String>{
+        match (self.control)(true){
+            Ok(true)=>{self.active=false;Ok(())}
+            Ok(false)=>{self.active=false;Err("语音服务启动命令已返回，但服务入口未报告就绪。".into())}
+            Err(error)=>{self.active=false;Err(format!("语音服务未能恢复：{error}"))}
+        }
+    }
+
+    fn stop_partial(&mut self)->Result<(),String>{
+        (self.control)(false).map_err(|error|format!("无法停止恢复失败后可能残留的新服务：{error}"))?;
+        self.active=false;Ok(())
+    }
+
+    fn keep_stopped(&mut self){self.active=false;}
+
     fn finish(mut self) -> Result<(), String> {
-        self.active = false;
-        if self.resume {(self.control)(true).map_err(|_| "资源已切换，但语音服务未能恢复。".to_string())?;}
-        Ok(())
+        if self.resume{self.resume_service()}else{self.keep_stopped();Ok(())}
     }
 }
 
@@ -810,7 +941,7 @@ mod service_tests {
     fn control(running: bool) -> (ServiceControl, Arc<Mutex<Vec<bool>>>) {
         let calls=Arc::new(Mutex::new(vec![]));let log=calls.clone();
         let state=Arc::new(AtomicBool::new(running));
-        (Arc::new(move|start|{log.lock().unwrap().push(start);Ok(state.swap(start,Ordering::AcqRel))}),calls)
+        (Arc::new(move|start|{log.lock().unwrap().push(start);if start{state.store(true,Ordering::Release);Ok(true)}else{Ok(state.swap(false,Ordering::AcqRel))}}),calls)
     }
 
     #[test]
@@ -834,5 +965,40 @@ mod service_tests {
             drop(ServiceLease::pause(&control,lock.lock().unwrap()).unwrap());
             assert_eq!(*calls.lock().unwrap(),if running{vec![false,true]}else{vec![false]});
         }
+    }
+
+    #[test]
+    fn pending_update_keeps_previously_running_service_stopped(){
+        let (control,calls)=control(true);let lock=Mutex::new(());
+        let mut lease=ServiceLease::pause(&control,lock.lock().unwrap()).unwrap();
+        assert!(lease.was_running());lease.keep_stopped();drop(lease);
+        assert_eq!(*calls.lock().unwrap(),vec![false]);
+    }
+
+    #[test]
+    fn preparation_failure_clears_resume_intent_only_when_service_restarts(){
+        let pending=Mutex::new(true);
+        clear_resume_intent_if_resumed(&pending,false);assert!(*pending.lock().unwrap());
+        clear_resume_intent_if_resumed(&pending,true);assert!(!*pending.lock().unwrap());
+    }
+
+    #[test]
+    fn environment_preparation_lock_serializes_and_wait_is_cancellable(){
+        let environment=Mutex::new(());let held=environment.lock().unwrap();
+        let waiting=Arc::new(AtomicBool::new(false));let cancel=Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope|{
+            let observed=waiting.clone();let cancel_waiter=cancel.clone();let gate=&environment;
+            let worker=scope.spawn(move||{
+                let mut progress=|phase:&str,_,_|{if phase.contains("等待"){observed.store(true,Ordering::Release);}};
+                let error=acquire_environment_lock(gate,&cancel_waiter,&mut progress).unwrap_err();
+                assert!(error.contains("取消"));
+            });
+            for _ in 0..100{if waiting.load(Ordering::Acquire){break;}thread::sleep(Duration::from_millis(10));}
+            assert!(waiting.load(Ordering::Acquire),"第二个环境准备任务必须显示等待锁阶段");
+            cancel.store(true,Ordering::Release);worker.join().unwrap();
+        });
+        drop(held);
+        let mut progress=|_:&str,_,_|{};
+        assert!(acquire_environment_lock(&environment,&AtomicBool::new(false),&mut progress).is_ok());
     }
 }

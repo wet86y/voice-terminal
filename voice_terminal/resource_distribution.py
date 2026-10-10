@@ -515,21 +515,36 @@ class ResourceManager:
                                and next(check["valid"] for check in checks if check["path"] == item.path))
         required_errors = [check["error"] for check in checks if check["path"] in {item.path for item in spec.required_files} and check["error"]]
         optional_errors = [check["error"] for check in checks if check["path"] not in {item.path for item in spec.required_files} and check["error"]]
+        from .model_installation import inspect_installed_model, model_update_available
+        target_verified = state == "installed"
+        installed = inspect_installed_model(self.models_root, spec.destination, spec.resource_id,
+                                            verify_hashes=state != "installed")
+        update_available = model_update_available(spec, installed)
+        if installed.error is None:
+            # 已安装内容按自身收据核验；随包目标新增文件不会强迫用户先更新再启动。
+            state = "installed"
+        elif (target / "resource-install.json").is_file():
+            state = "incomplete"
+        installed_error = None if installed.error is None else (required_errors or optional_errors or [installed.error])[0]
         return {
             "resource_id": spec.resource_id,
             "kind": spec.kind,
             "title": spec.title,
             "version": spec.version,
             "state": state,
+            "installed_version": installed.version,
+            "update_available": update_available,
+            "files_installed": target_verified,
+            "can_start": target_verified and not update_available and installed.error is None,
             "required_files_present": required_present,
             "required_files_total": len(spec.required_files),
             "optional_files_present": optional_present,
-            "error": (required_errors or optional_errors or ([manifest_error] if manifest_error else [None]))[0],
+            "error": installed_error,
             "installed_path": str(target),
             "source": {key: value for key, value in spec.source.items() if key in {"platform", "repo_id", "revision", "url", "page_url"}},
             "verification_level": "manifest_and_sha256",
             "checks": checks,
-            "available_actions": ["download", "import", "open_source"],
+            "available_actions": ["download", "import", "open_source"] + (["update"] if update_available else []),
         }
 
     def _dsh_state(self, spec: ResourceSpec) -> dict[str, Any]:
@@ -676,7 +691,9 @@ class ResourceManager:
             return {"resources": resources, "fields": {
                 "resource_id": "资源稳定编号", "state": "安装状态：missing（缺失）、incomplete（不完整）、installed（已安装）",
                 "kind": "资源类别", "title": "资源显示名称", "version": "资源锁定版本",
-                "installed_version": "当前运行版本", "origin": "当前资源来源类型",
+                "installed_version": "已安装版本；旧模型未登记版本时为空", "origin": "当前资源来源类型",
+                "update_available": "模型必须更新到随包目标版本，更新完成前阻止启动语音服务",
+                "files_installed": "随包目标模型的必需文件已校验", "can_start": "模型符合当前版本且无待更新内容",
                 "source_sha512": "固定官方安装器 SHA-512（摘要）", "manifest_sha256": "本机程序签发并绑定的运行清单 SHA-256（摘要）",
                 "required_files_present": "已通过清单核验的必需文件数", "required_files_total": "必需文件总数",
                 "optional_files_present": "已安装的可选文件数", "installed_path": "本机安装路径",
@@ -771,7 +788,8 @@ class ResourceManager:
     def prepare(self, resource_id: str, task_id: str) -> dict[str, Any]:
         current = self.status(resource_id)["resources"][0]
         plan = self.download_plan(resource_id, task_id)
-        applicable = current["state"] == "installed" and (current.get("origin") != "legacy_runtime")
+        applicable = (current["state"] == "installed" and not current.get("update_available", False)
+                      and current.get("origin") != "legacy_runtime")
         return {"already_installed": applicable, "current": current, "download_plan": plan,
                 "fields": {"already_installed": "固定版本是否已适用于当前安装流程",
                            "current": "当前资源状态", "download_plan": "固定资源传输计划"}}
@@ -905,6 +923,16 @@ class ResourceManager:
             if (self.root / "tmp" / "update-transaction.json").exists():
                 raise ResourceError("update_in_progress", "应用组件更新期间不能安装资源。")
             if spec.kind == "model":
+                from .model_installation import RECEIPT_NAME, model_receipt
+                receipt_files = []
+                for item in spec.files:
+                    path = _under(candidate, item.path)
+                    if item.optional and not path.is_file():
+                        continue
+                    self._check_source_file(path, item)
+                    receipt_files.append({"path": item.path, "size": item.size_bytes,
+                                          "sha256": item.sha256, "optional": item.optional})
+                _atomic_write(candidate / RECEIPT_NAME, _json_bytes(model_receipt(spec.resource_id, spec.version, receipt_files)))
                 model_manifest = self._model_manifest_after_swap(spec, candidate)
                 model_bytes = _json_bytes(model_manifest)
                 release_rel, release_bytes = self._release_after_swap("models", model_manifest, model_bytes)
@@ -1267,7 +1295,8 @@ class ResourceManager:
     def _same_installed_resource(self, spec: ResourceSpec, candidate: Path) -> bool:
         """Skip only when the destination already passes full locked integrity checks."""
         if spec.kind == "model":
-            return self._model_state(spec)["state"] == "installed"
+            current = self._model_state(spec)
+            return current["state"] == "installed" and not current.get("update_available", False)
         current = self._dsh_state(spec)
         if current["state"] != "installed":
             return False
@@ -1503,7 +1532,8 @@ class ResourceManager:
                 self._check_source_file(_under(self.program, f"config/resources/{item.asset}"), item)
             else:
                 self._check_source_file(self._source_file(source_root, item), item)
-        if self._model_state(spec)["state"] == "installed":
+        current = self._model_state(spec)
+        if current["state"] == "installed" and not current.get("update_available", False):
             shutil.rmtree(task_dir, ignore_errors=True)
             return {"installed_resource_ids": [], "skipped_resources": [resource_id],
                     "fields": {"installed_resource_ids": "本次事务实际安装的资源编号数组",

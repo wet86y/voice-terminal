@@ -20,6 +20,7 @@ GROUPS = {
                    'sounddevice', 'soundfile', 'webrtcvad-wheels', 'aec-audio-processing', 'pypinyin'],
     'torch-cpu': ['torch', 'torchaudio', 'funasr'],
     'onnx-cpu': ['onnxruntime', 'transformers', 'librosa', 'kaldi-native-fbank'],
+    'onnx-vad': ['funasr-onnx'],
     'sherpa-cpu': ['sherpa-onnx', 'sherpa-onnx-core'],
     'modelscope-download': ['modelscope', 'modelscope-hub'],
 }
@@ -103,7 +104,7 @@ if __name__=='__main__':
             'sha256':'4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3'},
             'groups':resolved_groups,'wheels':wheels,
             'fields':{'schema':'运行环境锁定格式','python':'官方可嵌入解释器','architecture':'64 位架构',
-            'groups':'按组件共享的依赖组','wheels':'固定版本的预编译包','name':'依赖名称','version':'锁定版本',
+            'groups':'按组件共享的依赖组；onnx-vad（轻量语音活动检测）为独立运行组','wheels':'固定版本的预编译包','name':'依赖名称','version':'锁定版本',
             'file':'固定文件名','url':'原始下载地址','size':'预期字节数','sha256':'SHA-256 文件摘要',
             'bundled':'随本体携带的小型预编译包','provenance':'构建来源','group':'所需共享依赖组'}}
     OUT.write_text(json.dumps(record,ensure_ascii=False,indent=2)+'\n','utf-8')

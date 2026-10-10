@@ -187,6 +187,45 @@
       "typing-extensions",
       "urllib3"
     ],
+    "onnx-vad": [
+      "audioread",
+      "certifi",
+      "cffi",
+      "charset-normalizer",
+      "cloudpickle",
+      "decorator",
+      "flatbuffers",
+      "funasr-onnx",
+      "idna",
+      "jieba",
+      "joblib",
+      "kaldi-native-fbank",
+      "lazy-loader",
+      "librosa",
+      "llvmlite",
+      "mpmath",
+      "msgpack",
+      "narwhals",
+      "numba",
+      "numpy",
+      "onnxruntime",
+      "packaging",
+      "platformdirs",
+      "pooch",
+      "protobuf",
+      "pycparser",
+      "pyyaml",
+      "requests",
+      "scikit-learn",
+      "scipy",
+      "sentencepiece",
+      "soundfile",
+      "soxr",
+      "sympy",
+      "threadpoolctl",
+      "typing-extensions",
+      "urllib3"
+    ],
     "sherpa-cpu": [
       "sherpa-onnx",
       "sherpa-onnx-core"
@@ -301,7 +340,8 @@
       "version": "3.1.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -315,6 +355,7 @@
         "voice-core",
         "torch-cpu",
         "onnx-cpu",
+        "onnx-vad",
         "modelscope-download"
       ]
     },
@@ -329,6 +370,7 @@
         "voice-core",
         "torch-cpu",
         "onnx-cpu",
+        "onnx-vad",
         "modelscope-download"
       ]
     },
@@ -342,6 +384,7 @@
       "groups": [
         "torch-cpu",
         "onnx-cpu",
+        "onnx-vad",
         "modelscope-download"
       ]
     },
@@ -367,7 +410,8 @@
       "version": "3.1.2",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -418,7 +462,8 @@
       "version": "5.3.1",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -453,7 +498,8 @@
       "name": "flatbuffers",
       "version": "25.12.19",
       "groups": [
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -477,6 +523,17 @@
       "version": "1.4.14",
       "groups": [
         "torch-cpu"
+      ]
+    },
+    {
+      "file": "funasr_onnx-0.4.3-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/27/17/e19a180c97e916e058b5fc5eecfa431d46cd8673c995699dcba6d978b728/funasr_onnx-0.4.3-py3-none-any.whl",
+      "size": 41230,
+      "sha256": "7dd65d6a506dc171a53e87eb55faf0a3e478f2531f90671246f43c2c56023fe6",
+      "name": "funasr-onnx",
+      "version": "0.4.3",
+      "groups": [
+        "onnx-vad"
       ]
     },
     {
@@ -564,6 +621,7 @@
         "voice-core",
         "torch-cpu",
         "onnx-cpu",
+        "onnx-vad",
         "modelscope-download"
       ]
     },
@@ -632,7 +690,8 @@
       "name": "jieba",
       "version": "0.42.1",
       "groups": [
-        "torch-cpu"
+        "torch-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -666,7 +725,8 @@
       "version": "1.6.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -677,7 +737,8 @@
       "name": "kaldi-native-fbank",
       "version": "1.22.3",
       "groups": [
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -711,7 +772,8 @@
       "version": "0.5",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -723,7 +785,8 @@
       "version": "0.11.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -735,7 +798,8 @@
       "version": "0.49.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -817,7 +881,8 @@
       "version": "1.3.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -829,7 +894,8 @@
       "version": "1.2.2",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -841,7 +907,8 @@
       "version": "2.25.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -864,7 +931,8 @@
       "version": "0.67.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -877,7 +945,8 @@
       "groups": [
         "voice-core",
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -899,7 +968,8 @@
       "name": "onnxruntime",
       "version": "1.24.3",
       "groups": [
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -925,6 +995,7 @@
       "groups": [
         "torch-cpu",
         "onnx-cpu",
+        "onnx-vad",
         "modelscope-download"
       ]
     },
@@ -937,7 +1008,8 @@
       "version": "4.11.7",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -949,7 +1021,8 @@
       "version": "1.9.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -961,7 +1034,8 @@
       "version": "7.36.1",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -986,6 +1060,7 @@
         "voice-core",
         "torch-cpu",
         "onnx-cpu",
+        "onnx-vad",
         "modelscope-download"
       ]
     },
@@ -1077,7 +1152,8 @@
       "groups": [
         "voice-core",
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -1113,6 +1189,7 @@
       "groups": [
         "torch-cpu",
         "onnx-cpu",
+        "onnx-vad",
         "modelscope-download"
       ]
     },
@@ -1149,7 +1226,8 @@
       "version": "1.9.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -1161,7 +1239,8 @@
       "version": "1.17.1",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -1172,7 +1251,8 @@
       "name": "sentencepiece",
       "version": "0.2.2",
       "groups": [
-        "torch-cpu"
+        "torch-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -1253,7 +1333,8 @@
       "groups": [
         "voice-core",
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -1265,7 +1346,8 @@
       "version": "1.1.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -1288,7 +1370,8 @@
       "version": "1.14.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -1311,7 +1394,8 @@
       "version": "3.6.0",
       "groups": [
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -1417,7 +1501,8 @@
       "groups": [
         "voice-core",
         "torch-cpu",
-        "onnx-cpu"
+        "onnx-cpu",
+        "onnx-vad"
       ]
     },
     {
@@ -1441,6 +1526,7 @@
       "groups": [
         "torch-cpu",
         "onnx-cpu",
+        "onnx-vad",
         "modelscope-download"
       ]
     },
@@ -1483,7 +1569,7 @@
     "schema": "运行环境锁定格式",
     "python": "官方可嵌入解释器",
     "architecture": "64 位架构",
-    "groups": "按组件共享的依赖组",
+    "groups": "按组件共享的依赖组；onnx-vad（轻量语音活动检测）为独立运行组",
     "wheels": "固定版本的预编译包",
     "name": "依赖名称",
     "version": "锁定版本",

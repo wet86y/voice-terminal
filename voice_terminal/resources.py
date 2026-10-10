@@ -20,28 +20,53 @@ ROLES = {"bootstrap", "asr", "analysis", "voice", "speaker"}
 
 @dataclass(frozen=True)
 class ResourcePolicy:
-    """ResourcePolicy（资源策略）：候选须显式选择，未验收的路径保持关闭。"""
+    """ResourcePolicy（资源策略）：auto（自动选择）仅在本地候选可用时启用。"""
     native_threads: dict[str, int]  # native_threads（各进程原生线程预算）。
-    vad_backend: str = "funasr"  # vad_backend（实时检测后端）。
+    vad_backend: str = "auto"  # vad_backend（实时检测后端：自动、FunASR 或 ONNX）。
     shared_audio: bool = False  # shared_audio（共享音频候选开关）。
     disk_history: bool = False  # disk_history（历史落盘候选开关）。
     history_cache_bytes: int = 8 * 1024 * 1024  # history_cache_bytes（历史读取缓存字节预算）。
 
     @classmethod
     def load(cls, path: Path | None = None) -> "ResourcePolicy":
-        path = path or Path(os.environ.get("VOICE_RESOURCE_POLICY", AppPaths.resolve(ROOT).config / "runtime-resources.json"))
+        managed_paths = None
+        if path is None:
+            configured = os.environ.get("VOICE_RESOURCE_POLICY")
+            if configured:
+                path = Path(configured)
+            else:
+                managed_paths = AppPaths.resolve(ROOT)
+                path = managed_paths.config / "runtime-resources.json"
+        if managed_paths is None:
+            try:
+                managed_paths = AppPaths.resolve(ROOT)
+            except (OSError, RuntimeError, ValueError):
+                # Policy reads with explicit paths must remain independent of
+                # portable-layout discovery when that metadata is unavailable.
+                managed_paths = None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return cls({})
         if not isinstance(data, dict):
             raise ValueError("资源策略必须是对象")
+        policy_schema = data.get("policy_schema")  # policy_schema（资源策略格式版本）。
+        if policy_schema is not None and (type(policy_schema) is not int or policy_schema not in {1, 2}):
+            raise ValueError("policy_schema（资源策略格式版本）必须是受支持的整数版本")
         threads = data.get("native_threads", {})
         if not isinstance(threads, dict) or any(k not in ROLES or type(v) is not int or not 1 <= v <= 256 for k, v in threads.items()):
             raise ValueError("原生线程预算必须是已知组件对应的 1—256 整数")
-        backend = data.get("vad_backend", "funasr")
-        if backend not in {"funasr", "onnx"}:
-            raise ValueError("语音检测后端必须是 funasr（原后端）或 onnx（轻量候选）")
+        backend = data.get("vad_backend", "auto")
+        managed_policy = (managed_paths is not None
+                          and path.resolve(strict=False)
+                          == (managed_paths.config / "runtime-resources.json").resolve(strict=False))
+        if managed_policy and policy_schema != 2:
+            # A managed file without the current policy schema has no reliable
+            # explicit backend selection. Use the current CPU default without
+            # rewriting user data; non-backend fields remain effective.
+            backend = "auto"
+        if backend not in {"auto", "funasr", "onnx"}:
+            raise ValueError("语音检测后端必须是 auto（自动选择）、funasr（原后端）或 onnx（轻量后端）")
         for key in ("shared_audio", "disk_history"):
             if type(data.get(key, False)) is not bool:
                 raise ValueError(f"{key}（候选开关）必须是布尔值")
