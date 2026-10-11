@@ -6,5 +6,49 @@
   "version": "0.2.0-rc.2",
   "package_manager": "pnpm@11.7.0",
   "minimum_node_version": "22.19.0",
-  "supported_platforms": ["win32-x64"]
+  "supported_platforms": [
+    "win32-x64"
+  ],
+  "distribution": {
+    "source_kind": "npm_package",
+    "adapter": "npm_cli_v1",
+    "package_name": "@deepseek-ai/dsh",
+    "registry_url": "https://registry.npmjs.org",
+    "node_version_range": "^22.19.0 || >=24.0.0",
+    "bridge_protocol": "2.0",
+    "entry": "dsh-bootstrap.mjs",
+    "modules": "node_modules",
+    "cli_entry": "node_modules/@deepseek-ai/dsh/lib/bin.js",
+    "pnpm_entry": "node_modules/pnpm/bin/pnpm.mjs",
+    "schedule": "node_modules/@deepseek-ai/dsh-schedule/lib/index.js",
+    "required_files": [
+      "node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html",
+      "node_modules/pnpm/bin/pnpm.mjs"
+    ],
+    "plugin_record": "config/dsh/profile/node_modules/@voice-terminal/dsh-plugin/dsh-compatibility.json"
+  },
+  "fields": {
+    "schema_version": "宿主配置格式",
+    "repository": "维护者源码仓库",
+    "tag": "维护者源码标签",
+    "commit": "维护者源码提交，不用于 npm（包管理器）运行校验",
+    "version": "项目适配的目标 DSH（代理宿主）精确版本",
+    "package_manager": "插件包管理器版本",
+    "minimum_node_version": "旧接口保留的最低运行环境版本",
+    "supported_platforms": "支持的操作系统和架构",
+    "distribution": "分发与运行适配声明",
+    "source_kind": "组件来源",
+    "adapter": "兼容适配器",
+    "package_name": "上游包名",
+    "registry_url": "包注册表",
+    "node_version_range": "支持的 Node.js（运行环境）版本范围",
+    "bridge_protocol": "桥接协议",
+    "entry": "启动包装入口",
+    "modules": "依赖目录",
+    "cli_entry": "上游命令入口",
+    "pnpm_entry": "明确传给宿主的插件包管理入口",
+    "schedule": "调度入口",
+    "required_files": "必须具备的资源文件",
+    "plugin_record": "项目插件适配记录"
+  }
 }

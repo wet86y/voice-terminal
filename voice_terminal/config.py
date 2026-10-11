@@ -464,6 +464,13 @@ class ShadowAgentConfig:
             raise ValueError("shadow_agent.runtime_reminder_interval_ms must be positive")
 
 
+def _dsh_default(key: str) -> str:
+    """读取随程序配置，保留 DshConfig（宿主配置）现有字段接口。"""
+    import json
+    lock = json.loads((Path(__file__).resolve().parents[1] / "config/dsh/runtime.lock.json").read_text(encoding="utf-8-sig"))
+    return str(lock.get(key, ""))
+
+
 @dataclass(frozen=True)
 class DshConfig:
     enabled: bool = True
@@ -480,8 +487,8 @@ class DshConfig:
     bridge_protocol_version: str = "2.0"
     restart_limit: int = 2
     restart_delay_ms: int = 1000
-    expected_version: str = "0.2.0-rc.2"
-    expected_commit: str = "639ed015397290b3745d163aafe02ffee4aa3f84"
+    expected_version: str = field(default_factory=lambda: _dsh_default("version"))
+    expected_commit: str = field(default_factory=lambda: _dsh_default("commit"))
 
     def __post_init__(self) -> None:
         if self.host != "127.0.0.1":
@@ -496,8 +503,8 @@ class DshConfig:
             raise ValueError("unsupported dsh.bridge_protocol_version")
         if self.restart_limit < 0 or self.restart_delay_ms < 0:
             raise ValueError("dsh restart policy must be non-negative")
-        if not self.expected_version.strip() or len(self.expected_commit) != 40:
-            raise ValueError("dsh expected version and full commit are required")
+        if not self.expected_version.strip() or self.expected_commit and len(self.expected_commit) != 40:
+            raise ValueError("DSH（代理宿主）需要目标版本；旧接口源码提交如提供须为完整值。")
 
 
 @dataclass(frozen=True)
@@ -820,8 +827,8 @@ class AppConfig:
                 bridge_protocol_version=_string(dsh.get("bridge_protocol_version"), "2.0"),
                 restart_limit=int(_number(dsh.get("restart_limit"), 2)),
                 restart_delay_ms=int(_number(dsh.get("restart_delay_ms"), 1000)),
-                expected_version=_string(dsh.get("expected_version"), "0.2.0-rc.2"),
-                expected_commit=_string(dsh.get("expected_commit"), "639ed015397290b3745d163aafe02ffee4aa3f84"),
+                expected_version=_string(dsh.get("expected_version"), _dsh_default("version")),
+                expected_commit=_string(dsh.get("expected_commit"), _dsh_default("commit")),
             ),
             persona=PersonaConfig(
                 directory=paths.persona if paths.separated else path_or_none(persona.get("directory")) or root / "config" / "persona",
@@ -1002,4 +1009,11 @@ def load_config(default_path: Path, local_path: Path | None = None) -> AppConfig
         if not isinstance(loaded, Mapping):
             raise ValueError(f"配置文件必须是 YAML 对象：{path}")
         _deep_merge(data, dict(loaded))
+    lock_path = default_path.parent / "dsh/runtime.lock.json"
+    if lock_path.is_file():
+        import json
+        lock = json.loads(lock_path.read_text(encoding="utf-8-sig"))
+        data.setdefault("dsh", {}).update(expected_version=lock["version"], expected_commit=lock.get("commit", ""))
+        if "distribution" in lock:
+            data["dsh"]["bridge_protocol_version"] = lock["distribution"]["bridge_protocol"]
     return AppConfig.from_mapping(data, base_dir=default_path.parent.parent)

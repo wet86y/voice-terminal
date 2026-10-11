@@ -51,7 +51,12 @@ async function compile(directory) {
     await writeFile(`${target}.map`, result.sourceMapText ?? '{}', 'utf8')
   }
 }
+const hostLock = JSON.parse((await readFile(resolve(repo, 'config/dsh/runtime.lock.json'), 'utf8')).replace(/^\uFEFF/u, ''))
+const sourcePackage = JSON.parse(await readFile(resolve(sourceRoot, 'package.json'), 'utf8'))
+if (sourcePackage.version !== hostLock.version || Object.entries({ ...manifest.dependencies, ...manifest.peerDependencies }).some(([name, version]) => name.startsWith('@deepseek-ai/dsh-') && version !== hostLock.version)) throw new Error('插件或源码版本尚未同步至目标 DSH（代理宿主）版本')
 await compile(resolve(here, 'src'))
+await rm(resolve(outputRoot, 'dsh-compatibility.json'), { force: true })
+
 const prompt = `${await readFile(resolve(repo, 'config/shadow_agent/instructions.md'), 'utf8')}\n\n${await readFile(resolve(repo, 'config/dsh/shadow-agent.rules.md'), 'utf8')}`
 await writeFile(resolve(outputRoot, 'lib/shared/generated-prompt.js'), `export const GENERATED_SHADOW_PROMPT = ${JSON.stringify(prompt)}\n`)
 await writeFile(resolve(outputRoot, 'lib/shared/version.js'), `export const BUNDLE_VERSION = ${JSON.stringify(manifest.version)}\n`)
@@ -91,4 +96,5 @@ if (process.argv.includes('--test')) {
     }
   }
 }
+await writeFile(resolve(outputRoot, 'dsh-compatibility.json'), JSON.stringify({ schema: 1, dsh_version: hostLock.version, bridge_protocol: hostLock.distribution.bridge_protocol, adapter: hostLock.distribution.adapter, plugin_version: manifest.version, fields: { schema: '适配记录格式', dsh_version: '已适配宿主版本', bridge_protocol: '桥接协议', adapter: '运行适配器', plugin_version: '项目插件版本' } }, null, 2) + '\n')
 console.log(`DSH 统一功能包已构建：${outputRoot}`)

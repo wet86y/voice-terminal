@@ -1,6 +1,6 @@
 // Managed Node.js shutdown（受管 JavaScript 运行环境退出）：由语音服务的命名事件转发。
 // 私有 stdin（标准输入）管道触发 DSH（代理执行宿主）原有的正常资源清理流程。
-if (process.env.VOICE_APP_ORIGIN) {
+if (process.env.VOICE_APP_ORIGIN || process.env.VOICE_DSH_MANAGED_SHUTDOWN === '1') {
   let pending = ''
   let stopping = false
   process.stdin.setEncoding('utf8')

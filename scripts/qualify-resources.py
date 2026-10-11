@@ -37,7 +37,8 @@ RESOURCE_IDS = (
     "sensevoice-small",
     "dsh",
 )
-OFFICIAL_DSH_FILENAME = "deepseek-harness-0.2.0-rc.2-win-x64.exe"
+_DSH_RESOURCE = next(row for row in json.loads((REPO_ROOT / 'config/resources/catalog.json').read_text('utf-8-sig'))['resources'] if row['resource_id'] == 'dsh')
+OFFICIAL_DSH_FILENAME = _DSH_RESOURCE['source'].get('official_transfer', _DSH_RESOURCE['source']['transfer'])['artifact']['filename']  # OFFICIAL_DSH_FILENAME（历史官方安装器文件名）。
 
 
 class QualificationError(RuntimeError):
@@ -763,8 +764,15 @@ def qualify(args: argparse.Namespace) -> tuple[dict, int]:
             if not official or official.get("state") != "installed":
                 raise QualificationError("官方 DSH 安装后库存未达到 installed（已安装）状态。")
             passed("official_dsh_fixed_install", install_details)
-            launch_details = _official_full_launch(python, program, workspace, args.startup_timeout_seconds)
-            passed("official_dsh_full_launch", launch_details)
+            lock = json.loads((program / 'config/dsh/runtime.lock.json').read_text('utf-8-sig'))
+            if lock.get('distribution', {}).get('source_kind') == 'npm_package':
+                if not official.get('update_available') or official.get('can_start'):
+                    raise QualificationError('旧官方 DSH（代理宿主）导入绕过了新程序的迁移门禁。')
+                launch_details = {'migration_required': True, 'fields': {'migration_required': '旧来源识别成功，更新后方可启动'}}
+                passed('official_dsh_migration_gate', launch_details)
+            else:
+                launch_details = _official_full_launch(python, program, workspace, args.startup_timeout_seconds)
+                passed("official_dsh_full_launch", launch_details)
             official_status = {"status": "passed", "filename": installer.name,
                                "full_launch": launch_details}
     except Exception as exc:

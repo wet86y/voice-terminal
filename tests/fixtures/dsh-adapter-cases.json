@@ -1,0 +1,15 @@
+{
+  "fields": {"name": "兼容判定场景", "installed": "实际运行记录变更", "target": "目标配置变更", "matches": "是否允许按目标启动"},
+  "cases": [
+    {"name": "相同目标", "installed": {}, "target": {}, "matches": true},
+    {"name": "旧安装版本", "installed": {"version": "0.1.0"}, "target": {"version": "1.0.0"}, "matches": false},
+    {"name": "高于目标版本", "installed": {"version": "2.0.0"}, "target": {"version": "1.0.0"}, "matches": false},
+    {"name": "旧桌面来源", "installed": {"source_kind": "official_desktop"}, "target": {}, "matches": false},
+    {"name": "旧物理来源", "installed": {"source_kind": "physical_closure"}, "target": {}, "matches": false},
+    {"name": "工具要求变化", "installed": {}, "target": {"package_manager": "pnpm@12.0.0"}, "matches": false},
+    {"name": "入口要求变化", "installed": {}, "target": {"cli_entry": "node_modules/example/new-entry.js"}, "matches": false},
+    {"name": "插件管理入口变化", "installed": {"pnpm_entry": "node_modules/example/incorrect.js"}, "target": {}, "matches": false},
+    {"name": "协议要求变化", "installed": {}, "target": {"bridge_protocol": "3.0"}, "matches": false},
+    {"name": "必要资源缺失", "installed": {"required_files": []}, "target": {}, "matches": false}
+  ]
+}

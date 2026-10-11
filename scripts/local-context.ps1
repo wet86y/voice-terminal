@@ -31,6 +31,11 @@ function Get-LocalContext {
       if (Test-Path -LiteralPath $NodeCandidate -PathType Leaf) { $Node = $NodeCandidate }
     }
   }
+  # npm（包管理器）宿主使用系统 Node.js（运行环境）；维护者构建也可在无宿主时运行。
+  if (-not $Node -or $Metadata.source_kind -eq 'npm_package') {
+    $NodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+    if ($NodeCommand) { $Node = $NodeCommand.Source }
+  }
   return @{ Root=$Root; Program=(Join-Path $Root $Selection.app); Python=(Join-Path $Root $Selection.python); Models=(Join-Path $Root $Selection.models); Data=(Join-Path $Root $Selection.data_dir); Dsh=$Runtime; Node=$Node; WebView2=$null }
 }
 function Set-LocalEnvironment {

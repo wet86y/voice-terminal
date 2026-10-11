@@ -134,6 +134,16 @@ def main():
     release = load(root / 'app/release.json')
     bindings = [{'kind':'python','path':'runtimes/python','build':'preserved','manifest_sha256':'qualification'}]
     release['components'] = bindings;write(root / 'app/release.json', release)
+    # 模拟用户退出未完成迁移后，目标目录已移除；原目录引用保留供诊断，不能阻止重装。
+    abandoned_target = sandbox/'已移除的 迁移目标'
+    abandoned_marker = root/'data/state/workspace-task.json'
+    write(abandoned_marker, {'schema':1, 'job_id':uuid.uuid4().hex, 'kind':'migrate', 'state':'prepared',
+                            'source_root':str(root), 'target_root':str(abandoned_target), 'workspace_id':workspace_id,
+                            'helper_pid':0, 'registry_path':str(root/'tmp/workspace-identity.json'),
+                            'fields':{'schema':'事务格式','job_id':'残留迁移编号','kind':'迁移操作','state':'退出后未提交',
+                                      'source_root':'有效原目录','target_root':'已移除目标','workspace_id':'原工作区编号',
+                                      'helper_pid':'没有运行中的辅助程序','registry_path':'原事务身份'}})
+    abandoned_hash = digest(abandoned_marker)
     # 同版本主动损坏本体：安装器必须重新释放，不依赖构建编号是否相同。
     (root / 'app/config/default.yaml').write_bytes(b'broken-body')
     pid = install()
@@ -141,7 +151,9 @@ def main():
     assert load(root / 'portable.json')['workspace_id'] == workspace_id
     assert load(root / 'app/release.json')['components'] == bindings
     for relative, expected in hashes.items(): assert digest(root / relative) == expected, relative
+    assert digest(abandoned_marker) == abandoned_hash and not abandoned_target.exists()
     results['checks'].append('同版本损坏修复保留工作区编号、用户设置、会话、模型、运行环境和组件登记')
+    results['checks'].append('退出迁移后目标事务已移除，原目录可重装和启动，旧引用及用户数据保留且不重建旧目标')
     stop(root, pid)
     # 从另一个启动工作目录再次启动正式入口。
     (root / 'data/state/workspace-ready.json').unlink(missing_ok=True)

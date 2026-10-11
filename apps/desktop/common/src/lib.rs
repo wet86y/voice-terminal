@@ -11,6 +11,7 @@ pub mod native_ui;
 pub mod workspace;
 pub mod runtime; // runtime（私有语音环境）：安装计划、校验及事务启用。
 pub mod resources; // resources（原生资源管理）：不依赖业务后端。
+pub mod dsh; // dsh（宿主分发适配）：版本声明、运行依赖和组件安装。
 pub mod credentials; // credentials（原生接口密钥）：组件未就绪时也能配置。
 pub mod webview; // webview（系统网页引擎）：Evergreen（自动更新版）检测与引导。
 pub mod installation; // installation（本体安装）：正式程序包校验、重装与启动交接。
@@ -174,7 +175,7 @@ impl LaunchContext {
         let runtime = install.join(selection.dsh.as_ref().unwrap());
         let node = if runtime.join("runtime.json").is_file() {
             let metadata: serde_json::Value = read_json(&runtime.join("runtime.json"))?;
-            metadata["node"].as_str().or(metadata["executable"].as_str()).and_then(|relative| component(&runtime, relative).ok())
+            if metadata["source_kind"]=="npm_package" { dsh::target(&program).ok().and_then(|spec|dsh::discover(&spec,false).ok().map(|v|v.0)) } else {metadata["node"].as_str().or(metadata["executable"].as_str()).and_then(|relative| component(&runtime, relative).ok())}
         } else { None };
         let identity: serde_json::Value = read_json(&install.join("portable.json"))?;
         let context = Self {

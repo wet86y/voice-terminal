@@ -55,20 +55,39 @@ value['system'] = platform.platform()
 value['fixed_webview2'] = False
 value['system_webview2'] = True # system_webview2（运行策略：系统网页引擎），可用性由原生宿主实际启动核验。
 value['dsh_cli'] = None
+value['dsh_update_required'] = False
 if args.dsh:
     try:
         metadata = json.loads((args.dsh / 'runtime.json').read_text(encoding='utf-8-sig'))
-        command = subprocess.run([str((args.dsh / metadata['node']).resolve()), str((args.dsh / metadata['entry']).resolve()), '--version'],
+        value['dsh_source'] = metadata.get('source_kind', 'physical_closure')
+        lock = json.loads((INSTALL / 'app/config/dsh/runtime.lock.json').read_text('utf-8-sig'))
+        value['dsh_target_version'] = lock['version']
+        if lock.get('distribution', {}).get('source_kind') == 'npm_package':
+            from voice_terminal.dsh.distribution import is_current, target_spec
+            value['dsh_update_required'] = not is_current(metadata, target_spec(INSTALL / 'app'))
+        if metadata.get('source_kind') == 'npm_package':
+            from voice_terminal.dsh.distribution import validate_runtime
+            metadata, node = validate_runtime(INSTALL / 'app', args.dsh)
+            arguments = [str(node), str((args.dsh / metadata['entry']).resolve()), '--version']
+        elif metadata.get('source_kind') == 'official_desktop':
+            from voice_terminal.dsh.official import load_official_artifact, validate_official_runtime
+            legacy = validate_official_runtime(args.dsh, load_official_artifact(INSTALL / 'app'))
+            arguments = [str(legacy.executable), str(legacy.desktop_cli_entry), '--version']
+        else:
+            arguments = [str((args.dsh / metadata['node']).resolve()), str((args.dsh / metadata['entry']).resolve()), '--version']
+        command = subprocess.run(arguments,
+                                 env={**os.environ, **({'ELECTRON_RUN_AS_NODE': '1'} if metadata.get('source_kind') == 'official_desktop' else {})},
                                  cwd=args.dsh.resolve(), capture_output=True, text=True, encoding='utf-8', timeout=30, check=True)
         value['dsh_cli'] = command.stdout.strip()
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
         value['import_errors']['dsh'] = str(error)
 value['verified'] = (result.returncode == 0 and value.get('python', '').startswith('3.12.')
                      and value.get('architecture', '').lower() in {'amd64', 'x86_64'}
-                     and value.get('cpu_tensor') == 3.0 and not value['import_errors'] and not value['missing_models'])
+                     and value.get('cpu_tensor') == 3.0 and not value['import_errors'] and not value['missing_models'] and not value['dsh_update_required'])
 value['fields'] = {'import_errors': '实际导入或原生依赖错误', 'cpu_tensor': '中央处理器张量计算结果',
                    'onnx_providers': '推理后端', 'audio_devices': '可枚举音频设备数量', 'missing_models': '缺少的核心模型文件',
-                   'fixed_webview2': '固定网页运行时入口存在', 'dsh_cli': '代理宿主入口版本', 'verified': '本次环境检测通过'}
+                   'fixed_webview2': '固定网页运行时入口存在', 'dsh_cli': '代理宿主入口版本', 'verified': '本次环境检测通过',
+                   'dsh_source': '已安装宿主来源', 'dsh_target_version': '随包目标宿主版本', 'dsh_update_required': '需要更新或迁移至当前目标组合'}
 value['notes'] = '本检测不替代真实模型加载、搬迁、无显卡机器、Windows 10 或实际语音验收；网页运行时还需桌面启动验证。'
 print(json.dumps(value, ensure_ascii=False, indent=2))
 raise SystemExit(0 if value['verified'] else 1)
