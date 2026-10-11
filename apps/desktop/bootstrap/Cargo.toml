@@ -14,10 +14,15 @@ path = "src/ui_demo.rs"
 [dependencies]
 voice-desktop-common = { path = "../common" }
 serde_json = "1"
+tauri = { version = "2", features = [] }
 
 [features]
+custom-protocol = ["tauri/custom-protocol"] # custom-protocol（内嵌页面协议）：迁移辅助进程直接复用启动页。
 distribution = ["voice-desktop-common/distribution"]
 qualification = ["distribution", "voice-desktop-common/qualification"]
 
 [build-dependencies]
-embed-resource = "3"
+tauri-build = { version = "2", features = [] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }

@@ -51,7 +51,7 @@ fn file_hash_with_buffer(path:&Path,buffer:&mut [u8])->Result<String,String>{
     loop {let count=stream.read(buffer).map_err(|e|e.to_string())?;if count==0{break;}hash.update(&buffer[..count]);}
     Ok(format!("{:x}",hash.finalize()))
 }
-fn file_hash_for_copy(path:&Path,buffer:&mut [u8],cancel:&AtomicBool,stop:&AtomicBool)->Result<String,String>{
+fn file_hash_for_copy(path:&Path,buffer:&mut [u8],cancel:&AtomicBool,stop:&AtomicBool,events:&mpsc::Sender<CopyEvent>)->Result<String,String>{
     let mut stream=fs::File::open(path).map_err(|error|error.to_string())?;
     let mut hash=Sha256::new();
     loop{
@@ -60,6 +60,7 @@ fn file_hash_for_copy(path:&Path,buffer:&mut [u8],cancel:&AtomicBool,stop:&Atomi
         let count=stream.read(buffer).map_err(|error|error.to_string())?;
         if count==0{break;}
         hash.update(&buffer[..count]);
+        events.send(CopyEvent::Bytes(count as u64)).map_err(|_|"迁移进度通道已关闭。")?;
     }
     Ok(format!("{:x}",hash.finalize()))
 }
@@ -226,7 +227,7 @@ fn wait_parent(pid:u32)->Result<(),String>{
 }
 #[derive(Clone, Copy)]
 enum CopyEvent {
-    Bytes(u64), // bytes（工作线程已复制并摘要的字节数）。
+    Bytes(u64), // bytes（已处理字节数）：源文件复制和目标内容复核分别计入。
     WorkerDone, // worker_done（一个复制工作线程已退出）。
 }
 
@@ -334,8 +335,7 @@ fn copy_one_file(index:usize,path:&Path,source:&Path,target:&Path,staging:&Path,
     let relative=path.strip_prefix(source).map_err(|error|error.to_string())?;
     let relative_text=relative.to_string_lossy().replace('\\',"/");
     let destination=safe_path(target,&relative_text)?;
-    let parent=destination.parent().ok_or("迁移目标文件缺少父目录。")?;
-    ensure_directory_no_reparse(target,parent)?;
+    // 父目录在派发前集中创建；safe_path（安全路径）仍逐文件复核目录联接。
     if reparse(&destination){return Err("迁移目标文件不能是重解析链接。".into());}
     let incoming=staging.join(format!("{index:08}.part"));
     if reparse(&incoming){return Err("迁移临时文件不能是重解析链接。".into());}
@@ -356,20 +356,19 @@ fn copy_one_file(index:usize,path:&Path,source:&Path,target:&Path,staging:&Path,
     if cancel.load(Ordering::Acquire){return Err("迁移已取消，原工作区保留。".into());}
     if stop.load(Ordering::Acquire){return Err("迁移复制已因其他文件失败而停止。".into());}
     let expected=format!("{:x}",expected.finalize());
-    if file_hash_for_copy(&incoming,buffer,cancel,stop)?!=expected{return Err("迁移文件校验失败。".into());}
+    if file_hash_for_copy(&incoming,buffer,cancel,stop,events)?!=expected{return Err("迁移文件校验失败。".into());}
     if cancel.load(Ordering::Acquire){return Err("迁移已取消，原工作区保留。".into());}
     if stop.load(Ordering::Acquire){return Err("迁移复制已因其他文件失败而停止。".into());}
     verify_copy_staging(target,staging,token)?;
     let destination=safe_path(target,&relative_text)?;
-    let parent=destination.parent().ok_or("迁移目标文件缺少父目录。")?;
-    ensure_directory_no_reparse(target,parent)?;
     if reparse(&destination){return Err("迁移目标文件不能是重解析链接。".into());}
     if destination.exists(){remove_owned(&destination,target)?;}
     fs::rename(incoming,destination).map_err(|error|error.to_string())
 }
 
 fn copy_files(source:&Path,target:&Path,cancel:Arc<AtomicBool>,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
-    fn collect(root:&Path,path:&Path,result:&mut Vec<PathBuf>)->Result<(),String>{
+    fn collect(root:&Path,path:&Path,result:&mut Vec<PathBuf>,cancel:&AtomicBool)->Result<(),String>{
+        if cancel.load(Ordering::Acquire){return Err("迁移已取消，原工作区保留。".into());}
         let relative=path.strip_prefix(root).map_err(|e|e.to_string())?.to_string_lossy().replace('\\',"/");
         if relative.starts_with("data/state/application")||relative.starts_with("cache/webview2")||relative.starts_with("tmp/process")||is_copy_staging_path(&relative)||["data/state/startup-result.json","data/state/workspace-ready.json","data/state/workspace-task.json","tmp/workspace-task.json","tmp/workspace-helper.exe"].contains(&relative.as_str()){return Ok(());}
         if relative=="data/dsh/node_modules"&&reparse(path){
@@ -380,15 +379,30 @@ fn copy_files(source:&Path,target:&Path,cancel:Arc<AtomicBool>,progress:&mut dyn
             return Err("代理依赖链接不属于当前运行环境，停止迁移以保留内容。".into());
         }
         if reparse(path){return Err(format!("迁移遇到非受管链接：{relative}"));}
-        if path.is_dir(){for entry in fs::read_dir(path).map_err(|e|e.to_string())?{collect(root,&entry.map_err(|e|e.to_string())?.path(),result)?;}}
+        if path.is_dir(){for entry in fs::read_dir(path).map_err(|e|e.to_string())?{collect(root,&entry.map_err(|e|e.to_string())?.path(),result,cancel)?;}}
         else if path.is_file(){result.push(path.to_path_buf());}Ok(())
     }
     let mut paths=vec![];
-    for relative in OWNED_ITEMS{let path=source.join(relative);if path.exists(){collect(source,&path,&mut paths)?;}}
-    if source.join("tmp").is_dir(){collect(source,&source.join("tmp"),&mut paths)?;}
+    for relative in OWNED_ITEMS{let path=source.join(relative);if path.exists(){collect(source,&path,&mut paths,&cancel)?;}}
+    if source.join("tmp").is_dir(){collect(source,&source.join("tmp"),&mut paths,&cancel)?;}
     let total=paths.iter().try_fold(0u64,|sum,path|fs::metadata(path).map(|v|sum+v.len()).map_err(|e|e.to_string()))?;
     if available_space(target)?<total{return Err("迁移目标空间不足。".into());}
     if paths.is_empty(){return Ok(());}
+    if cancel.load(Ordering::Acquire){return Err("迁移已取消，原工作区保留。".into());}
+    // 每个唯一父目录只创建一次，避免大量小文件重复执行系统目录操作。
+    let mut parents=std::collections::BTreeSet::new();
+    for path in &paths{
+        if cancel.load(Ordering::Acquire){return Err("迁移已取消，原工作区保留。".into());}
+        let relative=path.strip_prefix(source).map_err(|error|error.to_string())?;
+        parents.insert(target.join(relative).parent().ok_or("迁移目标文件缺少父目录。")?.to_path_buf());
+    }
+    for parent in parents{
+        if cancel.load(Ordering::Acquire){return Err("迁移已取消，原工作区保留。".into());}
+        ensure_directory_no_reparse(target,&parent)?;
+    }
+    // progress_total（处理总量）：复制一次、回读校验一次，100% 对应两者均完成。
+    let progress_total=total.saturating_mul(2);
+    progress("复制并校验工作区",0,progress_total);
     if cancel.load(Ordering::Acquire){return Err("迁移已取消，原工作区保留。".into());}
     let (staging,token)=create_copy_staging(target)?;
     let paths=paths;
@@ -440,22 +454,22 @@ fn copy_files(source:&Path,target:&Path,cancel:Arc<AtomicBool>,progress:&mut dyn
             if cancel.load(Ordering::Acquire){record_copy_failure(&failure,&stop,"迁移已取消，原工作区保留。".into());}
             match events_rx.recv_timeout(Duration::from_millis(100)){
                 Ok(CopyEvent::Bytes(count))=>{
-                    completed=completed.saturating_add(count).min(total);
+                    completed=completed.saturating_add(count).min(progress_total);
                     pending_progress=pending_progress.saturating_add(count);
                 },
                 Ok(CopyEvent::WorkerDone)=>finished+=1,
                 Err(mpsc::RecvTimeoutError::Timeout)=>{},
                 Err(mpsc::RecvTimeoutError::Disconnected)=>break,
             }
-            if pending_progress>0&&(pending_progress>=MIGRATION_COPY_BUFFER as u64||last_progress.elapsed()>=Duration::from_millis(100)||finished==worker_count){
-                progress("复制并校验工作区",completed,total);
+            if pending_progress>0&&(last_progress.elapsed()>=Duration::from_millis(100)||finished==worker_count){
+                progress("复制并校验工作区",completed,progress_total);
                 pending_progress=0;
                 last_progress=Instant::now();
             }
         }
         for worker in workers{if worker.join().is_err(){record_copy_failure(&failure,&stop,"迁移复制工作线程异常退出。".into());}}
     });
-    if pending_progress>0{progress("复制并校验工作区",completed,total);}
+    if pending_progress>0{progress("复制并校验工作区",completed,progress_total);}
     let result=failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let cleanup=cleanup_copy_staging(target,&staging,&token,paths.len());
     match (result,cleanup){
@@ -574,11 +588,17 @@ pub fn run_task(journal:&Path,locator:&Locator,cancel:Arc<AtomicBool>,progress:&
             // 中断可能发生在目标已启动或定位已写入之后；先停止已登记的候选，再从原工作区恢复事务。
             stop_recorded_target(&record)?;
             record["state"]=json!("copying");atomic_json(journal,&record)?;
-            if migration{copy_files(&source,&target,cancel.clone(),progress)?;rewrite_managed_paths(&source,&target)?;}
+            if migration{
+                progress("正在统计迁移文件并准备目录",0,0);
+                copy_files(&source,&target,cancel.clone(),progress)?;
+                progress("正在更新工作区路径",0,0);
+                rewrite_managed_paths(&source,&target)?;
+            }
             locator.prepare(&target,cancel.clone(),progress)?;
             if migration{rewrite_extended_paths(&source,&target)?;}
             let ready=target.join("data/state/workspace-ready.json");let startup=target.join("data/state/startup-result.json");
             let _=fs::remove_file(&ready);let _=fs::remove_file(&startup);
+            if cancel.load(Ordering::Acquire){return Err("迁移已取消，原工作区保留。".into());}
             record["state"]=json!("starting");atomic_json(journal,&record)?;
             progress("启动目标工作区并校验",0,0);
             target_process=Some(start_candidate(&target,locator,Some(journal))?);

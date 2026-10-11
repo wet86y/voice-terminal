@@ -1,0 +1,6 @@
+{
+  "identifier": "workspace-task",
+  "description": "工作区迁移复用启动页，仅允许读取进度、请求取消和退出辅助窗口。",
+  "windows": ["startup"],
+  "permissions": ["allow-desktop-status", "allow-desktop-cancel-init", "allow-exit-application"]
+}

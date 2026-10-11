@@ -32,6 +32,7 @@ config/speaker/
 /apps/desktop/target/
 /apps/desktop/src-tauri/gen/schemas/
 /apps/desktop/installer/gen/schemas/
+/apps/desktop/bootstrap/gen/schemas/
 # Local scratch: one-off analysis scripts and timeline dumps from debugging
 /workspace/
 *.log
