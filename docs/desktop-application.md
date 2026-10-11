@@ -26,4 +26,6 @@ npm run desktop:dist         # 构建内嵌同一正式包的独立安装器
 
 正式程序通过已构建界面运行；源码开发由受管前端服务提供热更新。网页资源、启动凭据和管理操作绑定本实例；普通浏览器访问服务地址只显示桌面入口说明。服务默认使用回环地址。
 
+启动检查超时预算、工作进程首条日志、声纹模型就绪握手及本轮发布构建核验见[启动超时与声纹就绪修订](startup-timeout-speaker-20261011.md)。
+
 组件协议、模型选择和业务功能保持现有边界。组件启动结论与历史性能记录见[桌面验收](desktop-acceptance.md)、[启动调度](startup-optimization-plan.md)和[应用生命周期](application-lifecycle.md)。最新目录、更新和数据验收见[本地整理验收](local-layout-acceptance-20261008.md)。

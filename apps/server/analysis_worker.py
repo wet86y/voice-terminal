@@ -11,9 +11,9 @@ if __package__ in (None, ""):
 
 from voice_terminal.local_layout import project_root
 
-from voice_terminal.resources import bootstrap_resources
+from voice_terminal.startup_logging import initialize_worker_logging, worker_imports_ready, startup_stage
 if __name__ == "__main__":
-    bootstrap_resources("analysis")
+    initialize_worker_logging("analysis", "analysis-worker.log")
 
 from voice_terminal.config import load_config
 from voice_terminal.paths import AppPaths
@@ -25,6 +25,9 @@ from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.application.managed import report, report_endpoint, run_uvicorn
 from voice_terminal.application.ports import bind_loopback, endpoint_url
 
+if __name__ == "__main__":
+    worker_imports_ready("analysis")
+
 
 def main():
     import uvicorn
@@ -33,15 +36,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=paths.config / "local.yaml")
     args = parser.parse_args()
-    config = load_config(root / "config/default.yaml", args.config)
-    config = ProductSettingsStore(
-        path=paths.config / "product-settings.json",
-        config=config,
-    ).effective_config()
+    with startup_stage("读取语音分析有效配置"):
+        config = load_config(root / "config/default.yaml", args.config)
+        config = ProductSettingsStore(
+            path=paths.config / "product-settings.json",
+            config=config,
+        ).effective_config()
     address = urlparse(config.smart_turn.analysis_url)
     listener, actual_port = bind_loopback(address.port or 8767, host=address.hostname or "127.0.0.1")
     report_endpoint("analysis", endpoint_url("analysis", actual_port))
-    configure_logging(paths.logs / "analysis-worker.log")
+    if __name__ != "__main__":
+        configure_logging(paths.logs / "analysis-worker.log")
     lanes = {}
     report("analysis", "加载语句结束判断与语音精修模型")
     for name, enabled, model_name, factory in (
@@ -63,7 +68,8 @@ def main():
         lanes[name] = lane
         try:
             if enabled:
-                lane.prepare(factory)
+                with startup_stage("加载分析模型：" + model_name):
+                    lane.prepare(factory)
                 logging.info("analysis.ready operation=%s health=%s", name, lane.health_payload())
         except Exception as exc:
             logging.exception("analysis.load_failed operation=%s", name)

@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 
 from ..distribution import safe_path, verify, files, digest
 
@@ -100,6 +101,9 @@ def discover_node(spec: dict, *, require_npm: bool = False) -> tuple[Path, Path 
 
 
 def inspect_runtime(program: Path, root: Path, *, full: bool = False) -> dict:
+    from ..startup_logging import startup_event
+    started = time.perf_counter()
+    startup_event("代理组件文件盘点")
     if root.is_symlink() or root.is_junction():
         raise ValueError("DSH（代理宿主）运行目录不能是链接。")
     metadata = read_json(root / "runtime.json")
@@ -130,16 +134,21 @@ def inspect_runtime(program: Path, root: Path, *, full: bool = False) -> dict:
         actual = {path.relative_to(root).as_posix(): path for path in files(root) if path != root / "manifest.json"}
         if actual.keys() != entries or len(entries) != len(manifest["files"]):
             raise ValueError("DSH（代理宿主）文件集合与清单不一致。")
-        for row in manifest["files"]:
+        for index, row in enumerate(manifest["files"], 1):
             path = actual[row["path"]]
             info = path.lstat()
             if (not stat.S_ISREG(info.st_mode)
                     or getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
                     or info.st_size != row["size"]):
                 raise ValueError("DSH（代理宿主）文件缺失或大小不符。")
+            if index % 5000 == 0:
+                startup_event("代理组件文件盘点", event="progress", files_checked=index,
+                              elapsed_ms=(time.perf_counter() - started) * 1000)
     spec = target_spec(program)
     if is_current(metadata, spec):
         check_plugin(program, spec)
+    startup_event("代理组件文件盘点", event="completed", files_checked=len(entries),
+                  elapsed_ms=(time.perf_counter() - started) * 1000)
     return metadata
 
 
@@ -155,10 +164,13 @@ def check_binding(root: Path) -> None:
 
 
 def validate_runtime(program: Path, root: Path, *, full: bool = False) -> tuple[dict, Path]:
+    from ..startup_logging import startup_stage
     metadata = inspect_runtime(program, root, full=full)
-    check_binding(root)
+    with startup_stage("核验代理组件安装绑定"):
+        check_binding(root)
     spec = target_spec(program)
     if not is_current(metadata, spec):
         raise ValueError("DSH（代理宿主）版本或适配要求已更新，请在组件管理页更新。")
-    node, _ = discover_node(spec)
+    with startup_stage("检测 Node.js（代理运行环境）"):
+        node, _ = discover_node(spec)
     return metadata, node

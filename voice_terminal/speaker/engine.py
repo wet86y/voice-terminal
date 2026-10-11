@@ -81,10 +81,15 @@ class WeSpeakerOnnxEngine:
             from ..compute import device_candidates
             last_error: Exception | None = None
             session = None
-            for candidate in device_candidates(self.requested_device, self.device_model_key, self.fallback_device):
+            from ..startup_logging import startup_stage
+            with startup_stage("声纹运行设备选择"):
+                candidates = device_candidates(self.requested_device, self.device_model_key,
+                                               self.fallback_device, onnx_only=True)
+            for candidate in candidates:
                 try:
                     if candidate == "cuda":
                         ort.preload_dlls()  # preload_dlls（预加载显卡运行库）：独立声纹进程也必须执行。
+                    logger.info("声纹模型加载尝试：设备=%s，后端=ONNX Runtime（模型推理运行时）", candidate)
                     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if candidate == "cuda" else ["CPUExecutionProvider"]
                     # VOICE_SPEAKER_SESSION_MODE（声纹会话策略）：保留原策略供真实资源对照。
                     session_mode = os.environ.get("VOICE_SPEAKER_SESSION_MODE", "original")

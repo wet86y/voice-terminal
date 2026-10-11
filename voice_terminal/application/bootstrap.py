@@ -5,13 +5,15 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from ..startup_logging import startup_stage, startup_event
 from ..resources import bootstrap_resources
 from ..paths import AppPaths
 from .resource_readiness import inspect_startup_resources, required_model_resources
 from ..local_layout import read_portable
 
 if __name__ == "__main__":
-    bootstrap_resources("bootstrap")
+    with startup_stage("启动检查资源策略"):
+        bootstrap_resources("bootstrap")
 
 
 def main() -> None:
@@ -22,13 +24,15 @@ def main() -> None:
         raise RuntimeError("业务运行环境要求 Python 3.12")
     root = Path.cwd()
     paths = AppPaths.resolve(root)
-    from voice_terminal.config import load_config
-    from voice_terminal.env import load_env_file
-    from voice_terminal.server.product import ProductSettingsStore
-    load_env_file(paths.env_file)
-    local = Path(args.config)
-    config = load_config(root / "config/default.yaml", local if local.is_file() else None)
-    config = ProductSettingsStore(path=paths.config / "product-settings.json", config=config).effective_config()
+    with startup_stage("读取启动配置"):
+        from voice_terminal.config import load_config
+        from voice_terminal.env import load_env_file
+        load_env_file(paths.env_file)
+        local = Path(args.config)
+        config = load_config(root / "config/default.yaml", local if local.is_file() else None)
+    with startup_stage("读取产品有效设置"):
+        from voice_terminal.server.product import ProductSettingsStore
+        config = ProductSettingsStore(path=paths.config / "product-settings.json", config=config).effective_config()
     resource_requirements = required_model_resources(config)
     resource_issues = inspect_startup_resources(
         root,
@@ -42,12 +46,15 @@ def main() -> None:
     )
     from importlib.util import find_spec
     if paths.separated and find_spec("sherpa_onnx") and (config.kws_dir / "tokens.txt").is_file() and not config.kws_keywords_file.is_file():
-        from ..kws.keywords import generate_keywords_for
-        keywords = config.wake.keywords or (config.wake.keyword,)
-        generate_keywords_for(model_dir=config.kws_dir, raw_path=paths.cache / "kws/keywords.raw.txt",
-                              output_path=config.kws_keywords_file, entries=list(zip(keywords, config.wake.keyword_labels)))
-    from ..dependencies import diagnose
-    dependencies = diagnose(check_dependencies=False)
+        with startup_stage("生成唤醒词文件"):
+            from ..kws.keywords import generate_keywords_for
+            keywords = config.wake.keywords or (config.wake.keyword,)
+            generate_keywords_for(model_dir=config.kws_dir, raw_path=paths.cache / "kws/keywords.raw.txt",
+                                  output_path=config.kws_keywords_file, entries=list(zip(keywords, config.wake.keyword_labels)))
+    with startup_stage("检查运行依赖版本"):
+        from ..dependencies import diagnose
+        dependencies = diagnose(check_dependencies=False)
+    startup_event("启动检查清单已生成", event="completed")
     print(json.dumps({
         "asr_url": config.asr.worker_url,
         "compute_devices": config.compute.devices,  # compute_devices（逐模型运行设备）：宿主按登记环境选择解释器。
@@ -79,7 +86,7 @@ def main() -> None:
         "dsh_expected_version": config.dsh.expected_version,  # dsh_expected_version（锁定的代理版本）。
         "dsh_expected_commit": config.dsh.expected_commit,  # dsh_expected_commit（锁定的代理兼容提交）。
         "dsh_expected_bridge": config.dsh.bridge_protocol_version,  # dsh_expected_bridge（锁定的代理桥接协议）。
-    }, ensure_ascii=False))
+    }, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":

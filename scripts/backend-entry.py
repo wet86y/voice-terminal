@@ -13,4 +13,6 @@ if len(sys.argv) < 2 or not sys.argv[1].startswith(("voice_terminal.", "apps.ser
     raise SystemExit("需要指定受管后端模块")
 module = sys.argv.pop(1)
 sys.argv[0] = module
+from voice_terminal.startup_logging import startup_event
+startup_event("后端入口已执行，开始导入模块", module=module)
 runpy.run_module(module, run_name="__main__")

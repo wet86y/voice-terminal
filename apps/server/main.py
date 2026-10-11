@@ -18,9 +18,9 @@ if __package__ in (None, ""):
 
 from voice_terminal.local_layout import project_root
 
-from voice_terminal.resources import bootstrap_resources
+from voice_terminal.startup_logging import initialize_worker_logging, worker_imports_ready, startup_stage
 if __name__ == "__main__":
-    bootstrap_resources("voice")
+    initialize_worker_logging("voice", "voice-server.log")
 
 import uvicorn  # type: ignore
 
@@ -34,6 +34,9 @@ from voice_terminal.logging_setup import configure_logging
 from voice_terminal.model_registry import ModelRegistryService, WindowsCredentialVault
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.server.websocket import SessionRuntime, create_app
+
+if __name__ == "__main__":
+    worker_imports_ready("voice")
 
 
 def _runtime_build_info(root: Path, effective_config: Path) -> dict[str, str | int]:
@@ -178,9 +181,11 @@ def main() -> None:
     root = project_root(Path(__file__))
     paths = AppPaths.resolve(root)
     load_env_file(paths.env_file)
-    configure_logging(paths.logs / "voice-server.log")
-    app, runtime = build_application(args.config, bind_listener=True,
-        preferred_host=args.host, preferred_port=args.port)
+    if __name__ != "__main__":
+        configure_logging(paths.logs / "voice-server.log")
+    with startup_stage("创建语音服务与读取有效配置"):
+        app, runtime = build_application(args.config, bind_listener=True,
+            preferred_host=args.host, preferred_port=args.port)
     logging.getLogger(__name__).info("server.runtime_build %s", runtime.build_info)
     bound_socket = runtime._application_listener_socket
     try:

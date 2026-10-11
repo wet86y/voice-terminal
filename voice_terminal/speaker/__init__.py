@@ -5,11 +5,11 @@ import sys
 # -m（模块入口）会先执行父包；线程预算必须在父包导入数值库前设置。
 # 主服务导入声纹工具时，不改变主服务的资源角色。
 _arguments = getattr(sys, "orig_argv", ())
-if any(value == "-m" and index + 1 < len(_arguments)
+if sys.argv[0] == "voice_terminal.speaker.worker" or any(value == "-m" and index + 1 < len(_arguments)
        and _arguments[index + 1] == "voice_terminal.speaker.worker"
        for index, value in enumerate(_arguments)):
-    from ..resources import bootstrap_resources
-    bootstrap_resources("speaker")
+    from ..startup_logging import initialize_worker_logging
+    initialize_worker_logging("speaker", "speaker-worker.log")
 
 from .contracts import SpeakerDecision, SpeakerObservation, SpeakerMode, SpeakerState
 from .client import SpeakerWorkerClient, SpeakerWorkerError
@@ -18,9 +18,16 @@ from .enrollment import ENROLLMENT_PROMPTS, EnrollmentRejectedError, check_segme
 from .features import FRONTEND_VERSION, InsufficientAudioError, pcm_to_fbank
 from .registry import SpeakerProfileStore
 from .state import SpeakerStateMachine
-from .worker import SpeakerWorkerEngine
 from .rolling import RollingSpeakerIdentity, RollingSpeakerSensor, RollingSpeakerSnapshot
 from .factory import CAMPPLUS_MODEL_ID, WESPEAKER_MODEL_ID, create_speaker_engine
+
+
+def __getattr__(name: str):
+    # SpeakerWorkerEngine（声纹工作进程引擎）按需导入，避免模块入口被父包提前执行两遍。
+    if name == "SpeakerWorkerEngine":
+        from .worker import SpeakerWorkerEngine
+        return SpeakerWorkerEngine
+    raise AttributeError(name)
 
 __all__ = [
     "ENROLLMENT_PROMPTS",

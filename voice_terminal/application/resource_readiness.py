@@ -223,15 +223,18 @@ def inspect_startup_resources(
     dsh_bridge: str,
 ) -> dict[str, str]:
     """Return role-specific local startup issues（各组件的本地资源缺失说明）。"""
-    issues = inspect_model_resources(program_root, model_root, requirements)
+    from ..startup_logging import startup_stage
+    with startup_stage("核验本地模型资源"):
+        issues = inspect_model_resources(program_root, model_root, requirements)
     if dsh_enabled:
-        issue = inspect_dsh_runtime(
-            program_root,
-            dsh_runtime,
-            expected_version=dsh_version,
-            expected_commit=dsh_commit,
-            expected_bridge=dsh_bridge,
-        )
+        with startup_stage("核验代理执行宿主组件"):
+            issue = inspect_dsh_runtime(
+                program_root,
+                dsh_runtime,
+                expected_version=dsh_version,
+                expected_commit=dsh_commit,
+                expected_bridge=dsh_bridge,
+            )
         if issue:
             issues["dsh"] = issue
     return issues
