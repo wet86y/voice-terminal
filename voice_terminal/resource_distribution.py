@@ -74,7 +74,7 @@ class ResourceSpec:
     version: str
     source: dict[str, Any]
     files: tuple[ResourceFile, ...]
-    required: bool = False
+    required: bool = True  # required（是否必需）：只有显式 false（可选）不参与整体启动门槛。
     generated_assets: tuple[dict[str, Any], ...] = ()
     legacy_export: dict[str, Any] | None = None
     legacy: bool = False
@@ -176,7 +176,7 @@ class ResourceCatalog:
             version=version,
             source=source,
             files=tuple(files),
-            required=bool(raw.get("required", False)),
+            required=raw.get("required") is not False,
             generated_assets=tuple(item for item in raw.get("generated_assets", []) if isinstance(item, dict)),
             legacy_export=legacy_export,
             legacy=False,

@@ -69,7 +69,7 @@ def inspect_model_resources(
     model_root: Path,
     requirements: Mapping[str, list[str]],
 ) -> dict[str, str]:
-    """Check current resources（核验当前资源）：待更新组件阻止所有模型角色启动。"""
+    """Check current resources（核验当前资源）：仅校验各角色实际使用的模型。"""
     if not requirements:
         return {}
     try:
@@ -78,12 +78,17 @@ def inspect_model_resources(
         issue = "程序内固定模型资源清单缺失或无效，请修复应用安装后再启动模型组件。"
         return {role: issue for role in requirements}
 
-    # Pending updates（待更新组件）对整体语音服务生效，包括本次配置未启用的模型。
+    # Pending updates（待更新组件）：必需组件保持整体门槛，可选组件仅约束选用它的角色。
     pending_updates: dict[str, str] = {}
     for spec in catalog.specs.values():
         if spec.kind == "model" and model_update_available(
                 spec, inspect_installed_model(model_root, spec.destination, spec.resource_id)):
             pending_updates[spec.resource_id] = spec.title
+    required_updates = [title for resource_id, title in pending_updates.items()
+                        if catalog.get(resource_id).required]
+    if required_updates:
+        issue = "组件有更新，请先更新或导入当前版本：" + "、".join(required_updates) + "。"
+        return {role: issue for role in requirements}
 
     runtime_issue = None
     runtime_path = model_root.parent / "runtimes/python/runtime.json"
@@ -103,8 +108,8 @@ def inspect_model_resources(
 
     issues: dict[str, str] = {}
     for role, resource_ids in requirements.items():
-        details = [f"{title}：组件有更新，请先更新或导入当前版本后再启动整体语音服务。"
-                   for title in pending_updates.values()]
+        details = [f"{pending_updates[resource_id]}：组件有更新，请先更新或导入当前版本。"
+                   for resource_id in resource_ids if resource_id in pending_updates]
         if runtime_issue:
             details.append(runtime_issue)
         for resource_id in resource_ids:

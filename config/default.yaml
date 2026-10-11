@@ -214,12 +214,12 @@ speaker:
   # Optional sidecar.  off | observe | filter
   mode: off
   owner_only_barge_in: false # 主人专属打断开关；与声纹模式独立
-  # confirm_threshold（确认阈值）和 continuity_threshold（连续保持阈值）使用
+  # confirm_threshold（主人确认阈值）使用
   # 注册质心上的原始余弦分数。最终分数是整轮聚合向量与质心的余弦值；
   # 现场测试使用相同口径。参考语料同人 p05≈0.86、异人 p95≈0.19，
   # 但该语料不能替代真实用户校准。
   confirm_threshold: 0.60
-  continuity_threshold: 0.50
+  continuity_relaxation: 0.10 # 连续主人阈值放宽量：0–0.20，实际阈值不低于 0。
   # min_speech_ms（单窗最低人声时长）和 min_window_speech_ratio（单窗最低人声占比）
   # 同时门控；必须满足后才会提取 embedding（说话人向量）。
   window_ms: 2000 # 分析窗长度（毫秒）
@@ -227,8 +227,8 @@ speaker:
   min_speech_ms: 700
   min_window_speech_ratio: 0.40
   # min_turn_speech_ms（整轮最低不重复人声时长）：按 VAD 区间并集计数，
-  # 不累加重叠滑窗中重复的语音；低于门槛时状态为 "unknown"（未知）。
-  # observe（仅标记）放行未知，filter（拦截）仍要求本轮主人已确认。
+  # 不累加重叠滑窗中重复的语音；低于门槛时判非主人。
+  # observe（仅标记）保留输入，filter（拦截）要求本轮主人已确认。
   # 2 s 的有效人声通常需要约 2.5-3 s 实际录音。提高该值会减少可判定的短语句，
   # 但可降低误接受风险；
   min_turn_speech_ms: 2000

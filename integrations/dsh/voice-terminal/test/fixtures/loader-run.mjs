@@ -108,7 +108,7 @@ try {
   assert.equal(activities.filter(value => value.activity?.delta).map(value => value.activity.delta).join(''), '正在分析当前任务')
   assert.deepEqual(activities.filter(value => value.activity?.stream === 'tool').map(value => value.activity.tool_status), ['running', 'completed'])
   assert.equal(activities.at(-1).state, 'idle')
-  assert.equal(JSON.stringify(activities).includes('组合测试完成'), false, '工具参数和结果正文不进入实时活动回调')
+  assert.equal(JSON.stringify(activities).includes('组合测试完成'), true, '可展开的工具参数和结果正文进入实时轨迹')
   assert.equal((await api(prefix + 'session.retire', envelope())).result, 'duplicate', '重复解绑保持幂等')
   const entries = []
   function walk(tree) { for (const entry of Object.values(tree.store)) { entries.push(entry); if (entry.subtree) walk(entry.subtree) } }

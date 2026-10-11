@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.agent.persona import PersonaDocumentLoader
 from voice_terminal.config import AppConfig, PersonaConfig
+from voice_terminal.paths import AppPaths
 from voice_terminal.providers.deepseek import DeepSeekClient
 from voice_terminal.session.context_frames import ContextLane
 from voice_terminal.session.ledger import SessionLedger
@@ -21,7 +22,9 @@ def _write_documents(directory: Path, *, suffix: str = "") -> None:
     (directory / "user.md").write_bytes(f"# 用户{suffix}\n称呼：小林。\n".encode("utf-8"))
 
 
-def test_persona_config_resolves_relative_directory_from_project_root(tmp_path):
+def test_persona_config_resolves_relative_directory_from_project_root(tmp_path, monkeypatch):
+    # 本用例验证源码相对路径，以没有 portable.json（工作区布局）的独立路径上下文执行。
+    monkeypatch.setattr(AppPaths, "resolve", staticmethod(lambda _root: AppPaths(tmp_path, tmp_path)))
     config = AppConfig.from_mapping(
         {"persona": {"directory": "profiles", "user_file": "current.md"}},
         base_dir=tmp_path,

@@ -17,9 +17,9 @@ const resources = useWorkspaceResources()
 const port = desktopPort() as DesktopPort & DesktopEnvironmentPort & DesktopCredentialsPort
 const credentials = useStartupCredentials(port)
 const starting = ref(false) // starting（已请求启动）：原生导航完成前防止重复点击。
-const updatesRequired = computed(() => resources.resources.value.some(item => item.update_available === true))
+const updatesRequired = computed(() => resources.resources.value.some(item => item.required !== false && item.update_available === true))
 const componentsReady = computed(() => resources.resources.value.length > 0
-  && resources.resources.value.every(item => item.can_start && item.update_available !== true))
+  && resources.resources.value.filter(item => item.required !== false).every(item => item.can_start && item.update_available !== true))
 const componentBlockMessage = computed(() => updatesRequired.value
   ? '有组件需更新并通过校验后才能启动语音服务。'
   : '启动前组件校验未通过，请先下载或导入缺失组件。')
@@ -70,8 +70,9 @@ const model = computed<LocalComponentsModel>(() => ({
       status: item.update_available ? '需更新' : item.installation_state === 'incomplete' ? '待修复' : item.files_installed ? item.runtime_ready ? '已就绪' : '运行环境待配置' : '资源未安装',
       available: item.files_installed === true,
       runtime: '工作区独立组件',
-      description: item.update_available ? '此组件需更新并通过校验后才能启动。' : item.resource_id === 'voice-server' ? '统一准备全部语音运行依赖。' : item.resource_id === 'dsh' ? '下载或导入代理组件后使用。' : item.files_installed ? item.runtime_ready ? '模型文件和运行依赖已就绪。' : '模型文件已安装，请在 Voice Server（语音服务）配置运行依赖后启动。' : '下载或导入模型文件；运行依赖由 Voice Server（语音服务）统一配置。',
+      description: item.required === false ? '可选组件，缺失或待更新不阻塞启动；启用相关功能前需准备就绪。' : item.update_available ? '此组件需更新并通过校验后才能启动。' : item.resource_id === 'voice-server' ? '统一准备全部语音运行依赖。' : item.resource_id === 'dsh' ? '下载或导入代理组件后使用。' : item.files_installed ? item.runtime_ready ? '模型文件和运行依赖已就绪。' : '模型文件已安装，请在 Voice Server（语音服务）配置运行依赖后启动。' : '下载或导入模型文件；运行依赖由 Voice Server（语音服务）统一配置。',
       facts: [
+        { label: '组件要求', value: item.required === false ? '可选 · 不阻塞启动' : '必需' },
         { label: '文件状态', value: item.installation_state === 'installed' ? '完整' : '待安装' },
         ...(item.python ? [{ label: 'Python（后端解释器）', value: item.python }] : []),
         ...(item.resource_id === 'voice-server' && item.version ? [{ label: '解释器版本', value: item.version }] : []),
@@ -82,6 +83,7 @@ const model = computed<LocalComponentsModel>(() => ({
         state: item.installation_state,
         status: item.update_available ? '需更新' : item.installation_state === 'installed' ? '已安装' : item.installation_state === 'incomplete' ? '不完整' : '缺失',
         updateAvailable: item.update_available === true,
+        required: item.required !== false,
         installedVersion: item.installed_version,
         targetVersion: modelResourceIds.has(item.resource_id) ? item.version : undefined,
         error: item.error || failedJob?.error || undefined,

@@ -72,6 +72,12 @@ function jsonBody(value: unknown): RequestInit {
 }
 
 export const productApi = {
+  /** decideDshApproval（权限答复）：经桌面同源宿主转发，仅允许本次操作。 */
+  decideDshApproval: async (value: { approval_id: string; decision: 'allowed-once' | 'rejected'; run_seq: number }) => {
+    const response = await fetch('/api/v1/application/dsh-approval', { method: 'POST', credentials: 'same-origin', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
+    if (!response.ok) throw await readError(response)
+    return await response.json() as { result: string }
+  },
   /** createWakeTask（手动创建任务）：同源宿主校验桌面会话，内部凭据不进入前端。 */
   createWakeTask: async (value: { text: string; at?: string; daily?: { time: string; time_zone: string }; weekly?: { time: string; time_zone: string; weekdays: number[] } }) => {
     const response = await fetch('/api/v1/application/wake-tasks', {

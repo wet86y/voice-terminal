@@ -82,6 +82,17 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(start).toHaveBeenCalledTimes(1)
   })
 
+  it('可选 CAM++（声纹模型）缺失或待更新不禁用启动按钮', async () => {
+    inventory = inventory.map(item => ({ ...item, installation_state: 'installed', files_installed: true, runtime_ready: true, can_start: true }))
+    inventory.push({ ...row('campplus-zh-cn-common', 'CAM++（可选声纹模型）'), required: false, update_available: true })
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
+    expect(wrapper.text()).toContain('可选组件，缺失或待更新不阻塞启动')
+    await wrapper.get('.start-program').trigger('click')
+    expect(start).toHaveBeenCalledOnce()
+  })
+
   it('首次下载完成赶上旧清单请求时，再读最新状态并可直接启动加载画面', async () => {
     const previous = inventory.map(item => ({ ...item }))
     let resolveInventory: (rows: ResourceStatus[]) => void = () => undefined

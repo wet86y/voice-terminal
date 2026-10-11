@@ -7,13 +7,13 @@ const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 export const MAX_WAKE_KEYWORDS = 5
 
 export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 9,
+  schema_version: 10,
   tts: { backend: 'minimax' },
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
   quiet_hours: { enabled: false, start: '23:00', end: '07:00' },
   shadow: { experimental_context_gate_enabled: false },
-  speaker: { mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4, owner_only_barge_in: false },
+  speaker: { mode: 'off', confirm_threshold: 0.6, continuity_threshold: 0.5, continuity_relaxation: 0.1, owner_only_barge_in: false },
   compute: {
     devices: {
       paraformer: 'auto', sensevoice: 'cpu', voice_vad: 'cpu',
@@ -103,8 +103,9 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
     speaker: {
       mode: typeof speaker.mode === 'string' && ['off', 'observe', 'filter'].includes(speaker.mode)
         ? speaker.mode as ProductSettingsSnapshot['speaker']['mode'] : 'off',
-      confirm_threshold: typeof speaker.confirm_threshold === 'number' ? speaker.confirm_threshold : 0.5,
-      continuity_threshold: typeof speaker.continuity_threshold === 'number' ? speaker.continuity_threshold : 0.4,
+      confirm_threshold: typeof speaker.confirm_threshold === 'number' ? speaker.confirm_threshold : 0.6,
+      continuity_threshold: typeof speaker.continuity_threshold === 'number' ? speaker.continuity_threshold : 0.5,
+      continuity_relaxation: typeof speaker.continuity_relaxation === 'number' ? speaker.continuity_relaxation : Math.max(0, Math.min(0.2, Number(speaker.confirm_threshold ?? 0.6) - Number(speaker.continuity_threshold ?? 0.5))),
       owner_only_barge_in: speaker.owner_only_barge_in === true,
     },
     compute: {

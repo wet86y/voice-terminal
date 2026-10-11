@@ -4,6 +4,16 @@ import { isRecord } from '../record'
 
 export const MAX_SHADOW_ACTIVITIES = 96
 
+/** trimShadowActivities（裁剪运行轨迹）：保留待决权限的答复入口。 */
+export function trimShadowActivities(items: ShadowActivity[]): ShadowActivity[] {
+  const values = [...items]
+  while (values.length > MAX_SHADOW_ACTIVITIES) {
+    const index = values.findIndex(item => item.stream !== 'approval' || item.phase !== 'started')
+    values.splice(index < 0 ? 0 : index, 1)
+  }
+  return values
+}
+
 export function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && Number.isFinite(value) && value >= 0
 }
@@ -115,18 +125,18 @@ export function readShadowActivity(value: unknown): ShadowActivity | null {
     || !isNonNegativeInteger(value.run_seq)
     || typeof value.item_id !== 'string'
     || !value.item_id.trim()
-    || (value.stream !== 'lifecycle' && value.stream !== 'thinking' && value.stream !== 'tool' && value.stream !== 'event')
+    || !['lifecycle', 'thinking', 'tool', 'event', 'output', 'approval'].includes(String(value.stream))
     || (value.phase !== 'started' && value.phase !== 'delta' && value.phase !== 'completed' && value.phase !== 'failed')
     || typeof value.timestamp !== 'string') return null
   const result: ShadowActivity = {
     run_seq: value.run_seq,
     item_id: value.item_id.slice(0, 160),
-    stream: value.stream,
+    stream: value.stream as ShadowActivity['stream'],
     phase: value.phase,
     timestamp: value.timestamp,
   }
-  for (const key of ['text', 'delta', 'tool_name', 'tool_status'] as const) {
-    if (typeof value[key] === 'string') result[key] = value[key].slice(0, key === 'delta' ? 2000 : 4000)
+  for (const key of ['text', 'delta', 'tool_name', 'tool_status', 'approval_id'] as const) {
+    if (typeof value[key] === 'string') result[key] = value[key].slice(0, key === 'delta' ? 2000 : key === 'approval_id' ? 160 : 12000)
   }
   if (value.event_kind === 'progress' || value.event_kind === 'information'
     || value.event_kind === 'input_required' || value.event_kind === 'result'
@@ -161,7 +171,7 @@ export function readShadowProduct(value: unknown): ShadowProductSnapshot | null 
     })
   }
   const activities = Array.isArray(value.activities)
-    ? value.activities.map(readShadowActivity).filter((item): item is ShadowActivity => item !== null).slice(-MAX_SHADOW_ACTIVITIES)
+    ? trimShadowActivities(value.activities.map(readShadowActivity).filter((item): item is ShadowActivity => item !== null))
     : undefined
   const readTelemetry = (candidate: unknown, keys: string[]) => {
     if (!isRecord(candidate)) return {}

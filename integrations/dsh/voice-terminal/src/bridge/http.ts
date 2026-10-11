@@ -93,7 +93,12 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
         }
         if (existing.epoch !== body.epoch || existing.state === 'retired') { json(res, 409, result('stale')); return }
         let response: Json
-        if (path === 'context.snapshot' || path === 'context.update') {
+        if (path === 'approval.decide') {
+          const pending = existing.pendingApprovals?.get(String(body.approval_id ?? ''))
+          if (!pending || pending.activationId !== existing.activationId || body.activation_id !== pending.activationId) response = result('stale')
+          else if (body.decision !== 'allowed-once' && body.decision !== 'rejected') response = result('conflict')
+          else { pending.settle(body.decision); response = result('accepted') }
+        } else if (path === 'context.snapshot' || path === 'context.update') {
           const revision = Number(body.context_revision)
           const isSnapshot = path.endsWith('snapshot')
           const contextDigest = digest({ revision, from_revision: body.from_revision, frames: body.frames })

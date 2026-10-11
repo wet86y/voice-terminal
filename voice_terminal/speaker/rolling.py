@@ -103,7 +103,7 @@ class RollingSpeakerSensor:
             raise ValueError("decision speech duration must be at least the window gate")
         if not 0.0 <= min_window_speech_ratio <= 1.0:
             raise ValueError("speech ratio must be in [0, 1]")
-        if not -1.0 <= non_owner_threshold < confirm_threshold <= 1.0:
+        if not -1.0 <= non_owner_threshold <= confirm_threshold <= 1.0:
             raise ValueError("non-owner threshold must be below owner threshold")
         self.embed_pcm = embed_pcm
         self.score_embedding = score_embedding
@@ -119,6 +119,9 @@ class RollingSpeakerSensor:
         self._chunks: deque[_PcmChunk] = deque()
         self._latest_sample: int | None = None
         self._inference_lock = asyncio.Lock()
+        self._last_owner_confirmed_at: float | None = None  # 最近一次达到主人基准阈值的时间。
+        self._owner_continuity = False  # 当前有效判断是否处于连续主人窗口。
+        self._last_confirmed_end_sample: int | None = None  # 已确认音频末端：重复分析不延长信任期限。
 
     @property
     def buffered_samples(self) -> int:
@@ -133,6 +136,9 @@ class RollingSpeakerSensor:
     def clear(self) -> None:
         self._chunks.clear()
         self._latest_sample = None
+        self._last_owner_confirmed_at = None
+        self._owner_continuity = False
+        self._last_confirmed_end_sample = None
 
     def submit_frame(self, pcm: bytes, *, start_sample: int,
                      speech: bool | None = None) -> bool:
@@ -241,7 +247,7 @@ class RollingSpeakerSensor:
         return RollingSpeakerSnapshot(
             start, end, candidate_start, candidate_end, analyzed_at,
             time.monotonic() if completed_at is None else completed_at,
-            quality, RollingSpeakerIdentity.UNKNOWN, None, reason,
+            quality, RollingSpeakerIdentity.NON_OWNER, None, reason,
         )
 
     async def analyze(self, *, candidate_start_sample: int | None = None,
@@ -298,18 +304,26 @@ class RollingSpeakerSensor:
                                          candidate_end=candidate_end_sample, analyzed_at=analyzed_at,
                                          reason="profile_unavailable", quality="ready")
                 score = max(-1.0, min(1.0, float(score)))
-                identity = (
-                    RollingSpeakerIdentity.OWNER if score >= self.confirm_threshold
-                    else RollingSpeakerIdentity.NON_OWNER if score < self.non_owner_threshold
-                    else RollingSpeakerIdentity.UNKNOWN
-                )
                 completed = time.monotonic() if completed_at is None else float(completed_at)
+                threshold = self.confirm_threshold  # threshold（本窗实际主人阈值）。
+                if self._last_owner_confirmed_at is not None:
+                    limit = 10.0 if self._owner_continuity else 5.0
+                    if 0 <= completed - self._last_owner_confirmed_at <= limit:
+                        threshold = self.non_owner_threshold
+                identity = RollingSpeakerIdentity.OWNER if score >= threshold else RollingSpeakerIdentity.NON_OWNER
+                self._owner_continuity = identity == RollingSpeakerIdentity.OWNER and score < self.confirm_threshold
+                if score >= self.confirm_threshold:
+                    if end != self._last_confirmed_end_sample:
+                        self._last_owner_confirmed_at = completed
+                        self._last_confirmed_end_sample = end
+                elif identity == RollingSpeakerIdentity.NON_OWNER:
+                    self._last_owner_confirmed_at = None
                 return RollingSpeakerSnapshot(
                     start, end, candidate_start_sample, candidate_end_sample,
                     analyzed_at, completed, "ready", identity, score,
                     "owner_confirmed" if identity == RollingSpeakerIdentity.OWNER
                     else "non_owner_confirmed" if identity == RollingSpeakerIdentity.NON_OWNER
-                    else "ambiguous_score",
+                    else "non_owner_confirmed",
                 )
             except Exception as exc:
                 if isinstance(exc, SpeakerWorkerError) and exc.code == "SPEAKER_AUDIO_QUALITY":

@@ -52,6 +52,8 @@ export interface ManagedResourceRow {
   status: string
   /** updateAvailable（存在必须处理的随包更新）、installedVersion（已安装版本）及 targetVersion（目标模型或组件版本）。 */
   updateAvailable?: boolean
+  /** required（是否必需）：false（可选）不阻塞整体启动。 */
+  required?: boolean
   installedVersion?: string | null
   targetVersion?: string | null
   /** error（最近下载、导入或完整性检查错误）。 */

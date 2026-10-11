@@ -99,11 +99,23 @@ class InputController:
     async def start_listening(self) -> None:
         if self.state.listening:
             return
+        # 手动激活先连接并检查 ASR（语音识别）；错误时不打开麦克风。
+        if self.asr is not None:
+            try:
+                if not self.asr.connected:
+                    await self.asr.connect()
+                health = getattr(self.asr, "health", None)
+                if callable(health):
+                    await health()
+                self.state.set_service("asr", "READY")
+            except Exception as exc:
+                self.state.set_service("asr", "ERROR")
+                await self._error("ASR_WORKER_NOT_READY", str(exc), recoverable=True)
+                return
         required = ("audio", "kws", "asr", "llm", "tts")
         missing = [name for name in required if self.state.services.get(name) not in {"READY", "RUNNING", "STREAMING", "CONNECTED"}
                    and not (name == "kws" and self.state.services.get(name) == "DISABLED")
-                   and not (self.wake_always_on and name == "asr"
-                            and self.state.services.get(name) == "ERROR")]
+                   ]
         if missing:
             await self._error("RUNTIME_NOT_READY", f"后端服务尚未就绪：{', '.join(missing)}", recoverable=True)
             return
@@ -121,25 +133,16 @@ class InputController:
             )
             return
         try:
-            if not self.wake_always_on and not self.asr.connected:
+            if not self.asr.connected:
                 await self.asr.connect()
             await self.capture.start()
             if self.audio_processor is not None:
                 self.audio_processor.reset()
             self.vad.reset()
             self.state.set_service("audio", "RUNNING")
-            if self.wake_always_on:
-                self.state.input_owner = "kws"
-                self.state.set_service("kws", "RUNNING")
-                # KWS（关键词唤醒）待机尚不需要 ASR（语音识别）会话连接。
-                # 停止监听会主动关闭该连接；下次唤醒才重新连接和检查模型。
-                # 保留最后确认的能力状态，不能把正常断开误报为模型故障。
-                if self.asr.connected:
-                    self.state.set_service("asr", "READY")
-            else:
-                self.state.input_owner = "asr"
-                self.state.set_service("kws", "RUNNING" if self.wake_enabled else "DISABLED")
-                self.state.set_service("asr", "RUNNING")
+            self.state.input_owner = "asr"
+            self.state.set_service("kws", "READY" if self.wake_enabled else "DISABLED")
+            self.state.set_service("asr", "RUNNING")
             self._listen_task = asyncio.create_task(self._listen_loop(), name="voice-input-loop")
             await self._state_event(TerminalState.IDLE, listening=True)
         except Exception as exc:

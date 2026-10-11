@@ -1384,12 +1384,14 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         owner_only = bool(settings.get("owner_only_barge_in", self.config.speaker.owner_only_barge_in))
         confirm = float(settings.get("confirm_threshold", self.config.speaker.confirm_threshold))
         continuity = float(settings.get("continuity_threshold", self.config.speaker.continuity_threshold))
+        relaxation = float(settings.get("continuity_relaxation", min(0.20, max(0.0, confirm - continuity))))
         next_speaker = replace(
             self.config.speaker,
             mode=mode,
             owner_only_barge_in=owner_only,
             confirm_threshold=confirm,
             continuity_threshold=continuity,
+            continuity_relaxation=relaxation,
         )
         if mode == "filter":
             if not self.speaker_profile.available:
@@ -1404,7 +1406,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         if self.speaker_router is not None:
             self.speaker_router.configure(
                 confirm_threshold=confirm,
-                continuity_threshold=continuity,
+                continuity_threshold=next_speaker.continuity_threshold,
             )
         if self.controller is not None:
             self.controller.speaker_mode = mode
@@ -1448,7 +1450,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         return {
             "mode": mode,
             "confirm_threshold": confirm,
-            "continuity_threshold": continuity,
+            "continuity_threshold": next_speaker.continuity_threshold,
+            "continuity_relaxation": relaxation,
             "owner_only_barge_in": owner_only,
             "owner_only_barge_in_selected": status["owner_only_barge_in_selected"],
             "owner_only_barge_in_ready": status["owner_only_barge_in_ready"],  # 配置及组件就绪。

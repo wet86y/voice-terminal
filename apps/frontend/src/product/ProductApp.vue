@@ -41,6 +41,7 @@ const {
   setReasoningMode,
   setNotice,
   workbenchModel,
+  decideDshApproval,
 } = controls;
 const desktop = desktopPort();
 // resourceMaintenance（资源维护）：服务停机不等于应用退出，组件操作和下载进度继续可用。
@@ -79,6 +80,7 @@ function nativeAction(action: () => Promise<void>) {
       @reset="resetSession"
       @clear="clearSession"
       @mode="setReasoningMode"
+      @approval="decideDshApproval"
     />
     <SettingsFrame
       v-show="activePage === 'settings'"

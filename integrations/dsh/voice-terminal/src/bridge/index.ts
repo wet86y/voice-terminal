@@ -7,10 +7,11 @@ import { initializeVoiceTerminalSettings } from './settings.js'
 import { registerSessionEvents, stopRuntimeActivity } from './events.js'
 import { createBridgeRoute } from './http.js'
 import { stopRuntimeReminder } from './context.js'
+import { registerExtendedActivity } from './runtime-details.js'
 import type { Binding, Config } from './contracts.js'
 export type { Config } from './contracts.js'
 export const name = BRIDGE_NAME
-export const inject = ['webServer', 'agents', 'sessions', 'agentPresets', 'agentDefaultModel', 'llm', 'sessionTitle', 'settings', 'workspaceRegistry', 'loader']
+export const inject = ['webServer', 'agents', 'sessions', 'agentPresets', 'agentDefaultModel', 'llm', 'sessionTitle', 'settings', 'workspaceRegistry', 'loader', 'approval', 'jobs']
 
 export function apply(ctx: Context, config: Config): void {
   if (!TOKEN) throw new Error('VOICE_DSH_BRIDGE_TOKEN is required')
@@ -28,6 +29,7 @@ export function apply(ctx: Context, config: Config): void {
   void settingsReady.catch(() => undefined)
 
   registerSessionEvents(ctx, bindings)
+  registerExtendedActivity(ctx, bindings)
   const route = createBridgeRoute(ctx, config, bindings, settingsReady, () => startupError)
   ctx.effect(() => {
     const dispose = ctx.webServer.register(route)

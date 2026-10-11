@@ -4,6 +4,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from dataclasses import replace
 
 from voice_terminal.session.ambient import AmbientTranscriptStore
 from voice_terminal.speaker.contracts import SpeakerObservation, SpeakerState
@@ -43,6 +45,39 @@ class SpeakerStateTests(unittest.TestCase):
         self.machine = SpeakerStateMachine()
         self.machine.reset(turn_id="turn", generation=1)
 
+    def test_binary_boundaries_and_unavailable_never_authorize_owner(self) -> None:
+        self.assertEqual(self.machine.decision().state, SpeakerState.NON_OWNER_CONFIRMED)
+        self.machine.observe(observation(0.60))
+        self.assertEqual(self.machine.decision().state, SpeakerState.OWNER_CONFIRMED)
+        self.machine.mark_unavailable("model_failure")
+        decision = self.machine.decision()
+        self.assertEqual(decision.state, SpeakerState.NON_OWNER_CONFIRMED)
+        self.assertEqual(decision.route, "ambient")
+        self.assertTrue(decision.degraded)
+        self.assertEqual(decision.reason, "model_failure")
+        self.assertIsNone(self.machine._last_owner_confirmed_at)
+
+    def test_continuity_clock_only_refreshes_for_new_eligible_evidence(self) -> None:
+        with patch("voice_terminal.speaker.state.time.monotonic", return_value=100.0):
+            self.machine.observe(observation(0.8))
+        with patch("voice_terminal.speaker.state.time.monotonic", return_value=103.0):
+            self.machine.decision()
+            self.machine.observe(observation(None, quality="insufficient_speech"))
+        self.assertEqual(self.machine._last_owner_confirmed_at, 100.0)
+        self.machine.reset(turn_id="next", generation=2)
+        with patch("voice_terminal.speaker.state.time.monotonic", return_value=106.0):
+            self.machine.observe(observation(0.55, turn_id="next", generation=2))
+            self.assertEqual(self.machine.decision().state, SpeakerState.NON_OWNER_CONFIRMED)
+
+    def test_new_valid_evidence_refreshes_after_observation_tail_is_full(self) -> None:
+        with patch("voice_terminal.speaker.state.time.monotonic", return_value=100.0):
+            for index in range(64):
+                self.machine.observe(replace(observation(0.8), window_ended_sample=24000 + index * 8000))
+        with patch("voice_terminal.speaker.state.time.monotonic", return_value=103.0):
+            self.machine.observe(replace(observation(0.8), window_ended_sample=600000))
+        self.assertEqual(len(self.machine.observations), 64)
+        self.assertEqual(self.machine._last_owner_confirmed_at, 103.0)
+
     def test_owner_confirmed_when_the_turn_aggregate_clears_the_threshold(self) -> None:
         self.assertEqual(self.machine.observe(observation(0.72)), SpeakerState.OWNER_CONFIRMED)
         self.assertEqual(self.machine.observe(observation(0.68)), SpeakerState.OWNER_CONFIRMED)
@@ -53,9 +88,9 @@ class SpeakerStateTests(unittest.TestCase):
         self.assertEqual(decision.aggregated_windows, 2)
 
     def test_ambiguous_turn_never_confirms_on_its_own(self) -> None:
-        # 0.55 sits between the continuity and confirm thresholds.
-        self.assertEqual(self.machine.observe(observation(0.55)), SpeakerState.UNKNOWN)
-        self.assertEqual(self.machine.decision().route, "passthrough")
+        # 低于主人阈值且没有连续主人证据，二分判断为非主人。
+        self.assertEqual(self.machine.observe(observation(0.55)), SpeakerState.NON_OWNER_CONFIRMED)
+        self.assertEqual(self.machine.decision().route, "ambient")
 
     def test_continuity_requires_a_previous_owner_confirmation(self) -> None:
         self.machine.observe(observation(0.80))
@@ -67,7 +102,7 @@ class SpeakerStateTests(unittest.TestCase):
         self.assertEqual(self.machine.decision().route, "main")
         # ...but only while the confirmation is recent.
         self.machine.clear_continuity()
-        self.assertEqual(self.machine.decision().state, SpeakerState.UNKNOWN)
+        self.assertEqual(self.machine.decision().state, SpeakerState.NON_OWNER_CONFIRMED)
 
     def test_low_aggregate_rejects_and_clears_continuity(self) -> None:
         self.machine.observe(observation(0.80))
@@ -79,22 +114,22 @@ class SpeakerStateTests(unittest.TestCase):
         # cannot inherit continuity from the older confirmation.
         self.machine.reset(turn_id="turn-3", generation=3)
         self.assertEqual(self.machine.observe(observation(0.55, turn_id="turn-3", generation=3)),
-                         SpeakerState.UNKNOWN)
+                         SpeakerState.NON_OWNER_CONFIRMED)
 
     def test_minimum_turn_speech_gates_every_decision(self) -> None:
         # A perfect score over too little speech must not authorise the owner.
-        self.assertEqual(self.machine.observe(observation(0.99, speech_ms=400)), SpeakerState.UNKNOWN)
+        self.assertEqual(self.machine.observe(observation(0.99, speech_ms=400)), SpeakerState.NON_OWNER_CONFIRMED)
         decision = self.machine.decision()
-        self.assertEqual(decision.state, SpeakerState.UNKNOWN)
-        self.assertEqual(decision.route, "passthrough")
+        self.assertEqual(decision.state, SpeakerState.NON_OWNER_CONFIRMED)
+        self.assertEqual(decision.route, "ambient")
         self.assertEqual(decision.aggregated_windows, 0)
 
     def test_short_or_stale_observations_never_confirm(self) -> None:
         machine = SpeakerStateMachine()
         machine.reset(turn_id="turn", generation=3)
         self.assertEqual(machine.observe(observation(0.99, generation=3, quality="not_speech")),
-                         SpeakerState.UNKNOWN)
-        self.assertEqual(machine.observe(observation(0.99, generation=2)), SpeakerState.UNKNOWN)
+                         SpeakerState.NON_OWNER_CONFIRMED)
+        self.assertEqual(machine.observe(observation(0.99, generation=2)), SpeakerState.NON_OWNER_CONFIRMED)
         self.assertEqual(machine.decision().observation_count, 1)
 
     def test_speech_weighted_aggregate_prefers_the_longer_window(self) -> None:

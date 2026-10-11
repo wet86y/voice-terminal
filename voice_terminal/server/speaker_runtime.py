@@ -906,7 +906,7 @@ class SpeakerRuntimeMixin:
                 else "speaker_test_no_usable_window"
             )
             return {
-                "state": "unknown",
+                "state": "non_owner_confirmed",
                 "similarity": None,
                 "threshold_used": None,
                 "speech_ms": 0,

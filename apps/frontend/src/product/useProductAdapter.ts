@@ -139,7 +139,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const quietHoursForm = reactive({ enabled: false, start: '23:00', end: '07:00' })
   const modelScanState = ref<'idle' | 'scanning' | 'complete'>('idle')
   const providerStep = ref<'idle' | 'discovering' | 'select-model' | 'custom-id' | 'verified'>('idle')
-  const speakerForm = reactive({ mode: 'off', confirm_threshold: 0.5, continuity_threshold: 0.4, owner_only_barge_in: false })
+  const speakerForm = reactive({ mode: 'off', confirm_threshold: 0.6, continuity_threshold: 0.5, continuity_relaxation: 0.1, owner_only_barge_in: false })
   const speakerStatus = ref<Record<string, unknown>>({})
   const speakerProfile = ref<Record<string, unknown>>({})
   const speakerTestResult = ref<Record<string, unknown> | null>(null)
@@ -564,9 +564,9 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     await enqueue(async () => {
       saving.value = true
       try {
-        const submitted = { ...speakerForm }
+        const submitted = { ...speakerForm, continuity_threshold: Math.max(0, speakerForm.confirm_threshold - speakerForm.continuity_relaxation) }
         const result = await productApi.saveSpeaker(submitted)
-        const changed = JSON.stringify(speakerForm) !== JSON.stringify(submitted)
+        const changed = speakerForm.confirm_threshold !== submitted.confirm_threshold || speakerForm.continuity_relaxation !== submitted.continuity_relaxation || speakerForm.mode !== submitted.mode || speakerForm.owner_only_barge_in !== submitted.owner_only_barge_in
         updateSettingsFromResponse(settings, result)
         if (!changed) Object.assign(speakerForm, settings.speaker)
         await refreshSpeaker()

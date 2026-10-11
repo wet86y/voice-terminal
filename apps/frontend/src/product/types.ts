@@ -163,8 +163,9 @@ export interface ProductSettingsSnapshot {
   }
   speaker: {
     mode: 'off' | 'observe' | 'filter' | string
-    confirm_threshold: number
-    continuity_threshold: number
+    confirm_threshold: number // confirm_threshold（主人判断阈值）。
+    continuity_threshold: number // continuity_threshold（兼容旧配置的连续绝对阈值）。
+    continuity_relaxation?: number // continuity_relaxation（连续主人放宽量）：0–0.20。
       /** owner_only_barge_in（主人打断开关）：仅主人确认后允许停止播放。 */
       owner_only_barge_in: boolean
   }

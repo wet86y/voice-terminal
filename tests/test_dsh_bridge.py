@@ -263,6 +263,21 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
             "activity": {"stream": "thinking", "phase": "delta", "item_id": "thinking-a", "delta": " 思考\n"},
         }
 
+    async def test_approval_activity_and_decision_keep_the_original_activation(self) -> None:
+        await self.session.request_wake()
+        payload = self._runtime_activity_payload()
+        payload["activity"] = {"stream": "approval", "phase": "started", "item_id": "approval-demo",
+                               "approval_id": "request-demo", "tool_name": "bash", "text": "echo demo\n需要授权"}
+        self.assertEqual(await self.session.accept_activity(payload), "accepted")
+        reply = await self.session.decide_approval("request-demo", "allowed-once", self.session._run_seq)
+        self.assertEqual(reply["result"], "accepted")
+        operation, body = self.client.calls[-1]
+        self.assertEqual(operation, "approval.decide")
+        self.assertEqual(body["activation_id"], payload["activation_id"])
+        self.assertEqual(body["approval_id"], "request-demo")
+        with self.assertRaises(DshBridgeError):
+            await self.session.decide_approval("request-demo", "rejected", self.session._run_seq - 1)
+
     async def test_runtime_activity_orders_thinking_tools_and_idle_without_voice_events(self) -> None:
         await self.session.request_wake()
         received: list[dict[str, Any]] = []

@@ -94,7 +94,7 @@ export function digest(value: unknown): string {
 export function redactSensitive(value: string): string {
   return value
     .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
-    .replace(/\b(authorization|api[_-]?key|cookie|bridge[_-]?token|launch[_-]?token)\b\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
+    .replace(/\b(authorization|api[_-]?key|cookie|bridge[_-]?token|launch[_-]?token|password|secret|access[_-]?token)\b["']?\s*[:=]\s*(?:"[^"\n]*"|'[^'\n]*'|[^\s,;}]+)/gi, '$1=[REDACTED]')
 }
 
 export function assertEnvelope(body: Record<string, unknown>): asserts body is Envelope {

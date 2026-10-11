@@ -159,7 +159,7 @@ none → kws standby → asr active → kws standby → none
 
 | 操作 | 作用 |
 | --- | --- |
-| `session.start` | 启动或恢复输入作用域；KWS 开启时先进入 standby，否则直接进入 ASR。 |
+| `session.start` | 用户手动开始语音会话时直接启动 ASR（自动语音识别）；静默最终检查完成后仍可交回 KWS（关键词唤醒）待机。 |
 | `session.stop`（停止输入会话） | 停止新的语音输入，释放输入作用域并清理二等进度；停止期间进度只更新界面。已派发的 LLM（大语言模型）、TTS（语音合成）和 Shadow（影子代理）工作按既有规则结算。 |
 | `session.reset` | 取消当前输入和 Shadow 工作，清空临时状态，轮换 conversation/context epoch，关闭当前 TTS 事务并建立可复用的下一轮状态。 |
 | runtime close | 关闭采集、ASR、KWS、LLM、Shadow、TTS、播放器、后台任务和共享网络资源。 |
@@ -187,7 +187,7 @@ none → kws standby → asr active → kws standby → none
 - Shadow 摘要和运行轨迹只消费服务端的 `shadow.product` 权威快照与 `shadow.activity` 增量；
   增量按 `run_seq + item_id` 合并，重连先应用快照再应用 WebSocket `seq` 有序增量。前端不得
   从 status 文本推断任务终态，也不得把 status observer 摘要伪装成 `result`。
-- 工作台“运行轨迹”使用固定单槽，只显示当前 DSH（代理执行宿主）根代理的最新思考块或工具动作；新动作覆盖当前项，同一思考块累加增量，空闲及运行结束时清空。卡片保持既有高度、字号与颜色变量，长正文内部滚动并跟随最新增量。内部回调、迟到事件拒收和重连规则见[桥接实时活动协议](bridge-2.0-protocol.md)，构建及项目安装结果见[插件维护记录](dsh-plugin-maintenance.md#2026-10-07-实时运行轨迹协议修订与构建历史记录)。
+- 工作台“运行轨迹”以可展开列表展示根代理及所属子代理思考、工具参数和结果、后台作业进度与输出，以及待决权限请求；同一活动标识合并增量，权限结果回到原始请求。界面最多保留 96 项、单项正文最多 12,000 字符，并始终保留待决权限请求。绑定、迟到事件拒收、授权和重连规则见[桥接实时活动协议](bridge-2.0-protocol.md)与[WebSocket（双向通信）协议](websocket-protocol.md#shadow-产品事件)。
 
 ## 主要代码归属
 

@@ -153,7 +153,7 @@ impl ResourceManager {
         for row in &mut rows{if let Some(reason)=row["resource_id"].as_str().and_then(|id|failures.get(id)){
             row["can_start"]=json!(false);row["files_installed"]=json!(false);row["installation_state"]=json!("incomplete");row["error"]=json!(reason);
         }}
-        if rows.iter().skip(1).any(|row|row["can_start"]!=true){if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);}}
+        if rows.iter().skip(1).any(|row|row["required"]!=false&&row["can_start"]!=true){if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);}}
         Ok(rows)
     }
     pub fn record_validation(&self,readiness:&Value){
@@ -562,7 +562,7 @@ impl ResourceManager {
 
     fn all_resources_ready(&self)->Result<bool,String>{
         // 服务入口随后执行全量校验；这里仅判定能否进入该入口，避免恢复时连续读取两遍全部组件。
-        Ok(voice_desktop_common::resources::inventory(&self.context)?.iter().all(|row|row["can_start"]==true))
+        Ok(voice_desktop_common::resources::inventory(&self.context)?.iter().filter(|row|row["required"]!=false).all(|row|row["can_start"]==true))
     }
 
     fn maybe_resume_service(&self,lease:&mut ServiceLease<'_>)->Result<bool,String>{

@@ -92,7 +92,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         """Apply mode and worker changes without another periodic scheduler."""
         enabled = self.speaker_mode != "off" or self.owner_only_barge_in
         client = self.speaker_client
-        router = self.speaker_router
+        router = getattr(self, "speaker_router", None)
         if not enabled or client is None or router is None:
             self.speaker_sensor = None
             self._speaker_snapshot = None
@@ -205,13 +205,12 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         router = speaker_router
         speaker_client = getattr(self, "speaker_client", None)
         if router is None:
-            if mode == SpeakerMode.OBSERVE:
-                return None
             decision = SpeakerDecision(
                 turn_id=ws.turn_id, generation=ws.generation, user_id=None,
-                state=SpeakerState.UNAVAILABLE, similarity=None, threshold_used=None,
+                state=SpeakerState.NON_OWNER_CONFIRMED, similarity=None, threshold_used=None,
                 speech_ms=0, observation_count=0, continuity_source=None,
-                route="ambient", reason="speaker_router_unavailable", degraded=True,
+                route="main" if mode == SpeakerMode.OBSERVE else "ambient",
+                reason="speaker_router_unavailable", degraded=True,
             )
         elif speaker_client is None or not speaker_client.connected:
             router.mark_unavailable("speaker_worker_unavailable")
@@ -260,10 +259,11 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                 else:
                     decision = router.decision(route="main")
         if mode == SpeakerMode.FILTER:
-            # filter（拦截模式）仅确认本轮主人可放行；未知、延续身份、降级均不授权。
+            # filter（拦截模式）允许本轮主人及有效连续主人；降级身份不授权。
             owner_confirmed = (
                 decision.turn_id == ws.turn_id and decision.generation == ws.generation
-                and decision.state == SpeakerState.OWNER_CONFIRMED and not decision.degraded
+                and decision.state in {SpeakerState.OWNER_CONFIRMED, SpeakerState.OWNER_CONTINUITY}
+                and not decision.degraded
             )
             decision = replace(decision, route="main" if owner_confirmed else "ambient")
         ws.speaker_decision = decision.to_payload()

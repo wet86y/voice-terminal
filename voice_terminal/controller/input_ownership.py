@@ -47,23 +47,12 @@ class InputOwnershipMixin:
         # Analysis is optional and never becomes a mandatory start prerequisite.
         status = self.state.services.pop("analysis", "DISABLED")
         try:
-            if not self.wake_always_on and not await self._ensure_asr_ready():
-                return
             await super().start_listening()
         finally:
             self.state.services["analysis"] = status
         if self.state.listening and (self._asr_sender is None or self._asr_sender.done()):
             self._asr_sender = asyncio.create_task(self._send_asr_loop())
-        if self.state.listening and self.wake_always_on and self.kws is not None:
-            self.state.input_owner = "none"
-            self.kws.reset()
-            try:
-                await self._reset_owner_boundary()
-            except Exception as exc:
-                await self._fail_kws_closed(f"KWS standby initialization failed: {exc}")
-                return
-            self.state.input_owner = "kws"
-            await self._state_event(TerminalState.IDLE, listening=True)
+        # 手动开始直接进入 ASR（语音识别）；KWS（关键词唤醒）由静默调度重新接管。
 
     async def _reset_owner_boundary(self) -> None:
         self._drain_asr_queue()

@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { useVoiceTerminal, type VoiceSocket } from './useVoiceTerminal'
 import { voiceShadowReplayFixture } from '../ui-demo/voice-shadow-replay-data'
+import { trimShadowActivities } from './voiceTerminalProjection'
+import type { ShadowActivity } from '../types'
 
 class FakeSocket implements VoiceSocket {
   readyState = 0
@@ -26,6 +28,14 @@ function openTerminal(now?: () => number) {
 }
 
 describe('V0.6 session protocol', () => {
+  it('持续输出裁剪旧轨迹时保留待决授权', () => {
+    const items: ShadowActivity[] = [{ run_seq: 1, item_id: 'approval', stream: 'approval', phase: 'started', approval_id: 'request', timestamp: '' }]
+    for (let index = 0; index < 120; index++) items.push({ run_seq: 1, item_id: `output-${index}`, stream: 'output', phase: 'completed', timestamp: '' })
+    const retained = trimShadowActivities(items)
+    expect(retained).toHaveLength(96)
+    expect(retained[0]?.approval_id).toBe('request')
+    expect(retained.at(-1)?.item_id).toBe('output-119')
+  })
   it('重置立即锁定，保留旧记录，直到后端回执与完成快照均到达', () => {
     const { socket, terminal } = openTerminal()
     socket.push('runtime.snapshot', 1, { can_start: true, session_operation: null,

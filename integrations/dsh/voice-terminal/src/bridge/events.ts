@@ -42,7 +42,7 @@ function queueActivityCallback(binding: Binding, activationId: string, payload: 
   }, activationId || undefined)
 }
 
-function sendRuntimeActivity(binding: Binding, activationId: string, activity: RuntimeActivity): void {
+export function sendRuntimeActivity(binding: Binding, activationId: string, activity: RuntimeActivity): void {
   if (binding.state !== 'active' || !activationId
     || (binding.activationId !== activationId && binding.terminalActivationId !== activationId)) return
   void queueActivityCallback(binding, activationId, { activity }).catch(() => undefined)
@@ -64,7 +64,8 @@ function flushThinking(binding: Binding): void {
 }
 
 function clearCurrentThinking(binding: Binding): void {
-  flushThinking(binding)
+  if (binding.currentThinkingAttemptId) finishThinking(binding, binding.currentThinkingAttemptId)
+  else flushThinking(binding)
   binding.currentThinkingItemId = undefined
   binding.currentThinkingAttemptId = undefined
   binding.currentThinkingActivationId = undefined
@@ -89,6 +90,9 @@ function finishThinking(binding: Binding, attemptId: string): void {
  * @param binding - Bound root Agent（已绑定根代理）。
  */
 export function stopRuntimeActivity(binding: Binding): void {
+  for (const pending of binding.pendingApprovals?.values() ?? []) pending.settle('cancelled')
+  binding.pendingApprovals?.clear()
+  binding.toolArguments?.clear()
   if (binding.thinkingTimer) clearTimeout(binding.thinkingTimer)
   binding.thinkingTimer = undefined
   binding.pendingThinkingDelta = ''
@@ -117,7 +121,7 @@ function onAssistantStream(binding: Binding, frame: AssistantStreamFrame): void 
     const itemId = `thinking-${attemptId}-${frame.chunk.index}`.slice(0, 160)
     if (binding.currentThinkingItemId !== itemId
       || binding.currentThinkingActivationId !== activationId) {
-      flushThinking(binding)
+      clearCurrentThinking(binding)
       binding.currentThinkingItemId = itemId
       binding.currentThinkingAttemptId = attemptId
       binding.currentThinkingActivationId = activationId
@@ -156,12 +160,16 @@ export function registerSessionEvents(ctx: Context, bindings: Map<string, Bindin
       const callId = String(data.callId ?? binding.traceRevision).slice(0, 120)
       const name = redactSensitive(String(data.name ?? '工具调用')).slice(0, 160)
       const activationId = binding.activationId
+      const argumentsText = redactSensitive(JSON.stringify(data.arguments ?? {}, null, 2)).slice(0, 12000)
+      binding.toolArguments ??= new Map()
+      binding.toolArguments.set(callId, argumentsText)
+      if (binding.toolArguments.size > 96) binding.toolArguments.delete(binding.toolArguments.keys().next().value!)
       binding.pendingTools.set(callId, name)
       if (activationId) {
         binding.pendingToolActivations.set(callId, activationId)
         sendRuntimeActivity(binding, activationId, {
           stream: 'tool', phase: 'started', item_id: `tool-${callId}`.slice(0, 160),
-          tool_name: name, tool_status: 'running',
+          tool_name: name, tool_status: 'running', text: argumentsText,
         })
       }
     }
@@ -177,10 +185,12 @@ export function registerSessionEvents(ctx: Context, bindings: Map<string, Bindin
         sendRuntimeActivity(binding, activationId, {
           stream: 'tool', ...settlement, item_id: `tool-${callId}`.slice(0, 160),
           tool_name: name,
+          text: redactSensitive(`参数：\n${binding.toolArguments?.get(callId) ?? ''}\n\n结果：\n${JSON.stringify(message.content ?? data, null, 2)}`).slice(-12000),
         })
       }
       binding.pendingTools.delete(callId)
       binding.pendingToolActivations.delete(callId)
+      binding.toolArguments?.delete(callId)
     }
     if (type === 'step/end') {
       binding.committedSteps += 1

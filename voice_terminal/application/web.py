@@ -334,6 +334,17 @@ class HostWeb:
                 elif path == "/api/v1/application/exit":
                     owner.application.request_exit()
                     self.data({"ok": True}, 202)
+                elif path == "/api/v1/application/dsh-approval":
+                    try:
+                        self.data(owner.application.decide_dsh_approval(payload))
+                    except HTTPError as exc:
+                        try:
+                            detail = json.loads(exc.read(16384)).get("detail", "权限决定未确认。")
+                        except (ValueError, AttributeError):
+                            detail = "权限决定未确认。"
+                        self.data({"detail": detail}, exc.code if exc.code in {400, 403, 409, 422, 503} else 503)
+                    except Exception:
+                        self.data({"detail": "权限决定未确认，请等待请求状态刷新。"}, 503)
                 elif path == "/api/v1/application/wake-tasks":
                     try:
                         self.data(owner.application.create_wake_task(payload), 201)

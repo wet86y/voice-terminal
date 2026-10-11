@@ -82,7 +82,7 @@ npm run desktop:start
 2. `http://127.0.0.1:8765/health` 返回服务快照；
 3. ASR worker（默认 8766）和 analysis worker（默认 8767）按配置启动；
 4. WebSocket `subscribe` 可以获取 `runtime.snapshot`；
-5. KWS 开启时 `input_owner=kws`，关闭时可以直接进入 ASR；
+5. 点击“开始语音会话”时，即使开启 KWS 也直接进入 ASR（自动语音识别）；静默最终检查完成后再交回 KWS（关键词唤醒）待机；
 6. 唤醒确认播完后麦克风仍归 ASR：窗口内接话不需要再喊唤醒词，静默窗口到期后由 `final_silence`
    检查交回 `input_owner=kws`（日志依次出现 `SCHEDULER_FINAL_PENDING window_index=225`、
    `prompt_kind=final_silence`（最终静默检查请求类型），且交接完成后调度器不再派发检查请求）；
