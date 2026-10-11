@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use std::{path::{Path,PathBuf},process::{Command,Stdio},sync::{Arc,atomic::AtomicBool}};
-use voice_desktop_common::{LaunchContext,native_ui,workspace::{self,Locator},installation};
+use voice_desktop_common::{LaunchContext,workspace::{self,Locator},installation};
+mod workspace_ui;
 fn value<'a>(args:&'a [String],key:&str)->Option<&'a str>{args.iter().position(|v|v==key).and_then(|i|args.get(i+1)).map(String::as_str)}
 fn run_task(path:&Path)->Result<(),String>{
     // 根入口恢复时先交给目标暂存区的正式辅助程序，避免原入口被自身占用。
@@ -23,7 +24,7 @@ fn run_task(path:&Path)->Result<(),String>{
         command.spawn().map_err(|e|format!("无法启动正式恢复辅助程序：{e}"))?;return Ok(());
     }
     let locator=Locator::for_task(path)?;let task=path.to_path_buf();
-    native_ui::run("工作区切换／迁移",move|progress|workspace::run_task(&task,&locator,progress.cancel.clone(),&mut|phase,done,total|progress.update(phase,done,total)))
+    workspace_ui::run(task,locator)
 }
 fn desktop_executable(context:&LaunchContext)->Result<PathBuf,String>{
     let desktop=context.installed_program().join("VoiceTerminalDesktop.exe");

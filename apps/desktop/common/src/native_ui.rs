@@ -1,19 +1,6 @@
-//! Native setup UI（原生初始化界面）：无需 Python（后端环境）或 WebView2（网页运行时）。
-use std::{path::PathBuf,sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};
+//! Native dialogs（系统选择与提示对话框）：加载进度统一由共享启动页显示。
+use std::path::PathBuf;
 
-#[derive(Clone)]
-pub struct Progress {
-    pub cancel:Arc<AtomicBool>, // cancel（任务取消信号）。
-    message:Arc<Mutex<String>>, // message（窗口当前阶段和字节进度）。
-    can_cancel:Arc<AtomicBool>, // can_cancel（原子切换及清理阶段禁止取消）。
-}
-impl Progress {
-    pub fn update(&self,phase:&str,current:u64,total:u64){
-        self.can_cancel.store(!phase.starts_with("启动目标")&&!phase.starts_with("目标已启动")&&!phase.starts_with("切换定位")&&!phase.starts_with("启用基础组件")&&!phase.starts_with("启用程序本体"),Ordering::Release);
-        let text=if total>0 {format!("{phase}\n{:.1}%  ·  {:.2} / {:.2} MiB（兆二进制字节）", current as f64*100.0/total as f64,current as f64/1048576.0,total as f64/1048576.0)}else{phase.into()};
-        *self.message.lock().unwrap()=text;
-    }
-}
 #[cfg(windows)] fn wide(value:&str)->Vec<u16>{value.encode_utf16().chain(Some(0)).collect()}
 
 pub fn choose_folder(title:&str)->Result<Option<PathBuf>,String>{
@@ -67,39 +54,4 @@ pub fn retry(message:&str)->bool{
         MessageBoxW(std::ptr::null_mut(),wide(&format!("{message}\n\n重试将保留已选工作区并恢复下载；取消后可再次打开启动程序。")).as_ptr(),wide("工作区初始化未完成").as_ptr(),MB_RETRYCANCEL|MB_ICONERROR)==IDRETRY
     }
     #[cfg(not(windows))]{let _=message;false}
-}
-
-pub fn run<T:Send+'static,F:FnOnce(Progress)->Result<T,String>+Send+'static>(title:&str,task:F)->Result<T,String>{
-    let progress=Progress {cancel:Arc::new(AtomicBool::new(false)),message:Arc::new(Mutex::new("正在准备工作区…".into())),can_cancel:Arc::new(AtomicBool::new(true))};
-    let result=Arc::new(Mutex::new(None));
-    #[cfg(windows)] unsafe {
-        use windows_sys::Win32::{System::LibraryLoader::GetModuleHandleW,UI::WindowsAndMessaging::*};
-        unsafe extern "system" fn procedure(window:windows_sys::Win32::Foundation::HWND,message:u32,wparam:usize,lparam:isize)->isize{
-            if message==WM_COMMAND||message==WM_CLOSE {
-                let state=unsafe{GetWindowLongPtrW(window,GWLP_USERDATA)} as *const Progress;
-                if !state.is_null()&&unsafe{(*state).can_cancel.load(Ordering::Acquire)}{unsafe{(*state).cancel.store(true,Ordering::Release)};}return 0;
-            }unsafe{DefWindowProcW(window,message,wparam,lparam)}
-        }
-        let class=wide("VoiceTerminalSetupProgress");let instance=GetModuleHandleW(std::ptr::null());
-        let mut registration:WNDCLASSW=std::mem::zeroed();registration.lpfnWndProc=Some(procedure);registration.hInstance=instance;registration.lpszClassName=class.as_ptr();
-        RegisterClassW(&registration);
-        let window=CreateWindowExW(0,class.as_ptr(),wide(title).as_ptr(),WS_CAPTION|WS_SYSMENU|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,560,205,std::ptr::null_mut(),std::ptr::null_mut(),instance,std::ptr::null());
-        if window.is_null(){return Err("无法建立原生初始化窗口。".into());}
-        SetWindowLongPtrW(window,GWLP_USERDATA,&progress as *const Progress as isize);
-        let text=CreateWindowExW(0,wide("STATIC").as_ptr(),wide("正在准备工作区…").as_ptr(),WS_CHILD|WS_VISIBLE,22,22,510,80,window,std::ptr::null_mut(),instance,std::ptr::null());
-        let button=CreateWindowExW(0,wide("BUTTON").as_ptr(),wide("取消").as_ptr(),WS_CHILD|WS_VISIBLE,426,112,100,32,window,1usize as _,instance,std::ptr::null());
-        let worker_progress=progress.clone();let worker_result=result.clone();
-        std::thread::spawn(move||{let value=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||task(worker_progress))).unwrap_or_else(|_|Err("初始化任务异常退出。".into()));*worker_result.lock().unwrap()=Some(value);});
-        let mut message:MSG=std::mem::zeroed();
-        while result.lock().unwrap().is_none(){
-            while PeekMessageW(&mut message,std::ptr::null_mut(),0,0,PM_REMOVE)!=0{TranslateMessage(&message);DispatchMessageW(&message);}
-            #[link(name="user32")]
-            unsafe extern "system"{fn EnableWindow(window:windows_sys::Win32::Foundation::HWND,enable:i32)->i32;}
-            EnableWindow(button,if progress.can_cancel.load(Ordering::Acquire){1}else{0});
-            SetWindowTextW(text,wide(&progress.message.lock().unwrap()).as_ptr());std::thread::sleep(std::time::Duration::from_millis(80));
-        }
-        DestroyWindow(window);
-    }
-    #[cfg(not(windows))] {let _=title;*result.lock().unwrap()=Some(task(progress));}
-    let value=result.lock().unwrap().take().ok_or("初始化任务未返回结果")?;value
 }

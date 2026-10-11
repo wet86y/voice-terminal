@@ -39,7 +39,7 @@ try {
         if ($LASTEXITCODE) {throw '统一正式宿主构建失败。'};$Built+='desktop'
       }
       if (-not $DesktopOnly) {
-        & $CargoCommand build --manifest-path apps/desktop/Cargo.toml -p voice-terminal-bootstrap --locked @ProfileArgs
+        & $CargoCommand build --manifest-path apps/desktop/Cargo.toml -p voice-terminal-bootstrap --features voice-terminal-bootstrap/custom-protocol --locked @ProfileArgs
         if ($LASTEXITCODE) {throw '统一正式入口构建失败。'};$Built+='bootstrap'
       }
       if ($OptimizationLevel -eq 'debug' -and -not $BootstrapOnly) {
