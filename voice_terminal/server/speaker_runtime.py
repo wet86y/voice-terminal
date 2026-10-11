@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from ..compute import device_candidates
 from ..speaker.client import SpeakerWorkerClient, SpeakerWorkerError
+from ..speaker.probe import probe as probe_speaker_worker
 from ..speaker.contracts import SpeakerObservation
 from ..speaker.enrollment import ENROLLMENT_REQUIRED_SEGMENTS, EnrollmentRejectedError, centroid_of, check_segments, enrollment_prompts
 from ..speaker.enrollment_capture import MAX_SEGMENT_SECONDS, MIN_SEGMENT_SECONDS, CaptureControl, EnrollmentCaptureError, capture_segment, speech_ms_for_pcm, voiced_ranges_for_windows
@@ -96,9 +97,9 @@ class SpeakerRuntimeMixin:
             self.state.set_service("speaker", "STARTING")
             managed = bool(os.environ.get("VOICE_APP_ORIGIN"))
             process = self._speaker_worker_process
-            process_running = process is not None and process.returncode is None
             # 受管模式只连接本次 Voice 进程实际启动的 sidecar（附属进程），不附着到占用首选端口的未知服务。
-            connected, last_error = (False, None) if managed and not process_running else await self._connect_speaker_worker()
+            # 受管子进程统一先通过应用层就绪探测，再创建有降级状态的业务客户端。
+            connected, last_error = (False, None) if managed else await self._connect_speaker_worker()
             if connected:
                 await asyncio.to_thread(self._release_speaker_engine)
                 return True
@@ -122,25 +123,51 @@ class SpeakerRuntimeMixin:
                         f"启动 Speaker Worker 失败：{type(exc).__name__}: {exc}"
                     )
 
-            deadline = time.monotonic() + 60.0
+            started = time.monotonic()
+            startup_timeout = 120.0 if getattr(getattr(self, "paths", None), "separated", False) else 60.0
+            deadline = started + startup_timeout
+            next_progress = started
+            logger.info("声纹服务等待就绪：进程编号=%s，预算秒数=%s", process.pid, startup_timeout)
             while time.monotonic() < deadline:
+                if getattr(self, "_application_stopping", False):
+                    await self._stop_managed_speaker_worker()
+                    return False
                 if process.returncode is not None:
                     break
                 worker_url = await self._speaker_worker_url_for_process(process)
-                if not worker_url:
-                    await asyncio.sleep(0.25)
-                    continue
-                connected, current_error = await self._connect_speaker_worker(worker_url=worker_url)
-                if connected:
-                    await asyncio.to_thread(self._release_speaker_engine)
-                    return True
-                if current_error:
-                    last_error = current_error
-                await asyncio.sleep(0.5)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if worker_url:
+                    try:
+                        ready, health = await asyncio.wait_for(
+                            probe_speaker_worker(worker_url, timeout_s=min(3.0, remaining)), timeout=remaining)
+                        if ready:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            connected, current_error = await asyncio.wait_for(
+                                self._connect_speaker_worker(worker_url=worker_url), timeout=remaining)
+                            if connected:
+                                await asyncio.to_thread(self._release_speaker_engine)
+                                logger.info("声纹服务启动完成：进程编号=%s，耗时毫秒=%.1f", process.pid,
+                                            (time.monotonic() - started) * 1000)
+                                return True
+                            last_error = current_error or last_error
+                        else:
+                            last_error = health.get("error") or "声纹服务尚未通过应用层健康检查"
+                    except asyncio.TimeoutError:
+                        last_error = "声纹服务就绪检查超过剩余启动预算"
+                if time.monotonic() >= next_progress:
+                    logger.info("声纹服务仍在加载：进程编号=%s，耗时秒数=%.1f，阶段=%s",
+                                process.pid, time.monotonic() - started,
+                                last_error or "等待工作进程发布监听端点")
+                    next_progress = time.monotonic() + 5
+                await asyncio.sleep(min(0.5, max(0, deadline - time.monotonic())))
 
             if process.returncode is None:
                 await self._stop_managed_speaker_worker()
-                reason = f"Speaker Worker 启动等待超时（60 秒）：{last_error or '无 health 响应'}"
+                reason = f"Speaker Worker（声纹工作进程）启动等待超时（{startup_timeout:g} 秒）：{last_error or '无健康检查响应'}"
             else:
                 reason = f"Speaker Worker 已退出（exit code {process.returncode}）：{last_error or '无 health 响应'}"
             return self._speaker_start_failed(reason)
@@ -196,12 +223,15 @@ class SpeakerRuntimeMixin:
         )
         try:
             await client.connect()
-            await client.health(timeout_s=1.5)
-        except Exception as exc:
+            await client.health(timeout_s=5.0)
+            await self._sync_speaker_fingerprint(client)
+        except BaseException as exc:
             try:
                 await client.close()
             except Exception:
                 logger.debug("speaker.client_cleanup_failed", exc_info=True)
+            if not isinstance(exc, Exception):
+                raise
             return False, f"{type(exc).__name__}: {str(exc)[:200]}"
 
         self.speaker = client
@@ -215,7 +245,6 @@ class SpeakerRuntimeMixin:
         self.startup_errors = [
             item for item in self.startup_errors if not str(item).startswith("speaker:")
         ]
-        await self._sync_speaker_fingerprint(client)
         logger.info("speaker.worker_ready url=%s", self._speaker_worker_active_url)
         return True, None
 
@@ -233,6 +262,8 @@ class SpeakerRuntimeMixin:
                                  "--config", str(self._speaker_worker_config_path), root=self._project_root)
         from ..resources import ResourcePolicy
         child_env = ResourcePolicy.load().environment("speaker", model_dir=self.config.model_dir)
+        child_env["VOICE_PROCESS_STARTED_AT"] = str(time.time())  # 子进程入口日志的统一时间起点。
+        child_env["PYTHONUNBUFFERED"] = "1"
         with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
             process = await asyncio.create_subprocess_exec(
                 *command,

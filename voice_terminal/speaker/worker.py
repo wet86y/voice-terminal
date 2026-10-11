@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from ..resources import bootstrap_resources, process_resource_status
+from ..startup_logging import initialize_worker_logging, worker_imports_ready, startup_stage
 if __name__ == "__main__":
-    bootstrap_resources("speaker")
+    initialize_worker_logging("speaker", "speaker-worker.log")
+from ..resources import process_resource_status
 
 import argparse
 import asyncio
@@ -31,6 +32,9 @@ from ..application.managed import report_endpoint, wait_for_shutdown
 from ..application.ports import bind_loopback, endpoint_url
 
 logger = logging.getLogger(__name__)
+
+if __name__ == "__main__":
+    worker_imports_ready("speaker")
 
 
 class SpeakerWorkerEngine:
@@ -339,13 +343,13 @@ async def run(config_path: Path | None = None) -> None:
     except ImportError as exc:
         raise RuntimeError("缺少 websockets，请先运行安装脚本。") from exc
     root = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
-    config = load_config(root / "config" / "default.yaml", config_path if config_path and config_path.is_file() else None)
-    config = ProductSettingsStore(
-        path=AppPaths.resolve(root).config / "product-settings.json",
-        config=config,
-    ).effective_config()
+    with startup_stage("读取声纹有效配置"):
+        config = load_config(root / "config" / "default.yaml", config_path if config_path and config_path.is_file() else None)
+        config = ProductSettingsStore(
+            path=AppPaths.resolve(root).config / "product-settings.json",
+            config=config,
+        ).effective_config()
     listener, actual_port = bind_loopback(config.speaker_worker.port, host=config.speaker_worker.host)
-    report_endpoint("speaker", endpoint_url("speaker", actual_port))
     model_path = config.speaker_model_path
     engine = SpeakerWorkerEngine(
         model_path, sample_rate=config.audio.sample_rate,
@@ -356,7 +360,12 @@ async def run(config_path: Path | None = None) -> None:
         device=config.compute.devices.get("wespeaker", "cpu"),
         fallback_device=config.compute.fallback_devices.get("wespeaker", "cpu"),
     )
-    await asyncio.to_thread(engine.load)
+    try:
+        with startup_stage("加载声纹模型"):
+            await asyncio.to_thread(engine.load)
+    except BaseException:
+        listener.close()
+        raise
 
     async def handler(websocket, path=None):
         if path not in (None, "/speaker"):
@@ -455,6 +464,8 @@ async def run(config_path: Path | None = None) -> None:
 
     try:
         async with websockets.serve(handler, sock=listener):
+            # 只有模型已加载且握手服务已运行，才发布声纹业务端点。
+            report_endpoint("speaker", endpoint_url("speaker", actual_port))
             logger.info("Speaker Worker listening on ws://%s:%s/speaker", "127.0.0.1", actual_port)
             await wait_for_shutdown()
     finally:
@@ -468,7 +479,8 @@ def main() -> None:
     root = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
     paths = AppPaths.resolve(root)
     load_env_file(paths.env_file)
-    configure_logging(paths.logs / "speaker-worker.log")
+    if __name__ != "__main__":
+        configure_logging(paths.logs / "speaker-worker.log")
     asyncio.run(run(args.config))
 
 

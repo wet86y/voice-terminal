@@ -29,8 +29,9 @@ class SpeakerWorkerClient:
     """Bounded, fail-open client for the optional Speaker Worker."""
 
     def __init__(self, url: str, *, on_observation: ObservationCallback | None = None,
-                 queue_size: int = 64) -> None:
+                 queue_size: int = 64, open_timeout: float = 10.0) -> None:
         self.url = url
+        self.open_timeout = open_timeout  # open_timeout（连接握手超时秒数）：覆盖进程刚完成加载时的调度延迟。
         self.on_observation = on_observation
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(4, queue_size))
         self.socket: Any = None
@@ -71,7 +72,7 @@ class SpeakerWorkerClient:
             return
         try:
             import websockets  # type: ignore
-            self.socket = await websockets.connect(self.url, open_timeout=2, ping_interval=20)
+            self.socket = await websockets.connect(self.url, open_timeout=self.open_timeout, close_timeout=0.5, ping_interval=20)
             self.receive_task = asyncio.create_task(self._receive_loop(), name="speaker-worker-receive")
             self.send_task = asyncio.create_task(self._send_loop(), name="speaker-worker-send")
             self.last_error = None

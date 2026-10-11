@@ -41,6 +41,8 @@ class ApplicationHost:
         self.generations: dict[str, str] = {}
         self.manifest = {}
         self.resource_issues: dict[str, str] = {}  # resource_issues（各组件缺失本地资源的说明）。
+        self._dsh_resource_checked = False  # 本次启动已完成代理组件盘点，显式恢复时重新检查。
+        self._dsh_resource_issue: str | None = None
         self.voice_entry_ready = False  # voice_entry_ready（轻量语音入口已监听）。
         self.voice_local_ready = False  # voice_local_ready（第三路本地模型加载已结束）。
         self.voice_entry_only = False  # voice_entry_only（本次生成采用分阶段启动）。
@@ -184,6 +186,7 @@ class ApplicationHost:
         if key in self.gpu_fallback_roles:
             env["VOICE_GPU_FALLBACK"] = "1"  # VOICE_GPU_FALLBACK（当前进程强制中央处理器回退）。
         env["VOICE_APP_INSTANCE_ID"] = self.state.value["instance_id"]
+        env["VOICE_PROCESS_STARTED_AT"] = str(time.time())  # VOICE_PROCESS_STARTED_AT（宿主创建进程的时间）。
         env["VOICE_RESOURCE_POLICY"] = os.environ.get("VOICE_RESOURCE_POLICY", str(self.paths.config / "runtime-resources.json"))
         model_dir = self.manifest.get("model_dir")
         env = ResourcePolicy.load(Path(env["VOICE_RESOURCE_POLICY"])).environment(
@@ -209,10 +212,14 @@ class ApplicationHost:
                     else:
                         old.replace(output.with_name(output.name + f".{index + 1}"))
             output.replace(output.with_name(output.name + ".1"))
+        started = time.perf_counter()
+        log.info("创建工作进程：组件=%s，解释器=%s，日志=%s", key, command[0], output)
         process = ManagedProcess(command, cwd=self.root, env=env,
             output=output, outer_job=self.outer_job,
             event_name=f"Local\\VoiceTerminal-{self.state.value['instance_id']}-{key}-{generation}")
         self.processes[key] = process
+        log.info("工作进程已创建：组件=%s，进程编号=%s，创建耗时毫秒=%.1f",
+                 key, process.pid, (time.perf_counter() - started) * 1000)
         if key not in {"bootstrap", "dev"}:
             self.state.component(key, state="starting", phase="启动进程，等待应用层就绪", error="",
                 pid=process.pid, created_at=process.created_at)
@@ -231,17 +238,41 @@ class ApplicationHost:
         output.unlink(missing_ok=True)
         from ..paths import python_command
         process = self.spawn("bootstrap", python_command(self.python, "voice_terminal.application.bootstrap", "--config", self.config, root=self.root))
-        deadline = time.monotonic() + 30
+        started = time.monotonic()
+        timeout = 180 if self.paths.separated else 120  # 冷启动预算覆盖依赖导入与本地组件盘点。
+        deadline = started + timeout
+        next_progress = started + 5
+        log.info("启动检查开始：进程编号=%s，超时秒数=%s，日志=%s", process.pid, timeout, output)
         while process.poll() is None:
-            if time.monotonic() >= deadline:
-                raise RuntimeError("环境与配置检查超过 30 秒，请查看 application-bootstrap.log（启动检查日志）。")
+            now = time.monotonic()
+            if self.state.snapshot()["stopping"]:
+                self.stop_group("bootstrap")
+                raise RuntimeError("启动检查已取消：应用正在退出。")
+            if now >= deadline or now >= next_progress:
+                phase = self._bootstrap_phase(output)
+            if now >= deadline:
+                log.error("启动检查超时：进程编号=%s，耗时秒数=%.1f，最后阶段=%s", process.pid, now - started, phase)
+                raise RuntimeError(f"环境与配置检查超过 {timeout} 秒，最后阶段：{phase}；请查看 application-bootstrap.log（启动检查日志）。")
+            if now >= next_progress:
+                self.state.component("setup", phase=phase)
+                log.info("启动检查进行中：进程编号=%s，耗时秒数=%.1f，阶段=%s", process.pid, now - started, phase)
+                next_progress = now + 10
             await asyncio.sleep(.1)
         if process.poll() != 0:
-            raise RuntimeError("环境与配置检查失败，请查看 application-bootstrap.log（启动检查日志）。")
+            phase = self._bootstrap_phase(output)
+            log.error("启动检查进程退出：退出码=%s，最后阶段=%s", process.poll(), phase)
+            raise RuntimeError(f"环境与配置检查失败（退出码 {process.poll()}，阶段：{phase}），请查看 application-bootstrap.log（启动检查日志）。")
         lines = output.read_text(encoding="utf-8", errors="replace").splitlines()
-        self.manifest = json.loads(next(line for line in reversed(lines) if line.startswith('{"asr_url"')))
+        try:
+            self.manifest = json.loads(next(line for line in reversed(lines) if line.startswith('{"asr_url"')))
+        except (StopIteration, ValueError) as exc:
+            raise RuntimeError("启动检查未返回有效清单，请查看 application-bootstrap.log（启动检查日志）。") from exc
         self.stop_group("bootstrap")
+        # 子进程已检查代理目录；同一次启动的模型分支只重查各自本地模型资源。
+        self._dsh_resource_checked = True
+        self._dsh_resource_issue = self.manifest.get("resource_issues", {}).get("dsh")
         self._refresh_resource_issues()
+        log.info("启动检查完成：耗时秒数=%.1f，资源问题数量=%s", time.monotonic() - started, len(self.resource_issues))
         if self.resource_issues:
             # startup_skipped（跳过模型启动页）让用户先进入产品设置并下载或导入资源。
             self.state.update(startup_skipped=True)
@@ -272,7 +303,23 @@ class ApplicationHost:
         else:
             self.state.component("web", state="ready", phase="界面入口已就绪", error="")
 
-    def _refresh_resource_issues(self) -> dict[str, str]:
+    @staticmethod
+    def _bootstrap_phase(output: Path) -> str:
+        """读取日志末尾的阶段记录；不把配置或凭据内容带入界面错误。"""
+        try:
+            with output.open("rb") as stream:
+                stream.seek(max(0, output.stat().st_size - 16384))
+                lines = stream.read().decode("utf-8", errors="replace").splitlines()
+            for line in reversed(lines):
+                if " startup.progress " in line:
+                    value = json.loads(line.split(" startup.progress ", 1)[1])
+                    if isinstance(value.get("stage"), str):
+                        return value["stage"][:160]
+        except (OSError, ValueError, AttributeError):
+            pass
+        return "等待检查进程进入启动入口"
+
+    def _refresh_resource_issues(self, *, recheck_dsh: bool = False) -> dict[str, str]:
         """Recheck fixed local files（重新检查固定本地文件）before every model start."""
         requirements = self.manifest.get("resource_requirements", {})
         if not isinstance(requirements, dict):
@@ -292,17 +339,18 @@ class ApplicationHost:
             requirements,
         )
         if self.manifest.get("dsh_enabled"):
-            from ..local_layout import read_portable
-            dsh_runtime = self.paths.install_root / read_portable(self.paths.install_root)["dsh"]
-            issue = inspect_dsh_runtime(
-                self.root,
-                dsh_runtime,
-                expected_version=str(self.manifest.get("dsh_expected_version", "")),
-                expected_commit=str(self.manifest.get("dsh_expected_commit", "")),
-                expected_bridge=str(self.manifest.get("dsh_expected_bridge", "")),
-            )
-            if issue:
-                issues["dsh"] = issue
+            if recheck_dsh or not getattr(self, "_dsh_resource_checked", False):
+                from ..local_layout import read_portable
+                dsh_runtime = self.paths.install_root / read_portable(self.paths.install_root)["dsh"]
+                self._dsh_resource_issue = inspect_dsh_runtime(
+                    self.root, dsh_runtime,
+                    expected_version=str(self.manifest.get("dsh_expected_version", "")),
+                    expected_commit=str(self.manifest.get("dsh_expected_commit", "")),
+                    expected_bridge=str(self.manifest.get("dsh_expected_bridge", "")),
+                )
+                self._dsh_resource_checked = True
+            if self._dsh_resource_issue:
+                issues["dsh"] = self._dsh_resource_issue
         self.resource_issues = issues
         return issues
 
@@ -694,7 +742,8 @@ class ApplicationHost:
                 return
             try:
                 self.state.component(key, state="starting", error="", phase="恢复组件")
-                issue = self._refresh_resource_issues().get(key)
+                issues = await asyncio.to_thread(self._refresh_resource_issues, recheck_dsh=key in {"dsh", "voice"})
+                issue = issues.get(key)
                 if issue:
                     raise RuntimeError(issue)
                 if key == "web":

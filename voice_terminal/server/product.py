@@ -18,14 +18,16 @@ from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig
 from ..custom_instructions import validate_entries
 from ..quiet_hours import QuietHoursConfig
 from ..core.events import utc_now_iso
 from ..kws.keywords import MAX_WAKE_KEYWORDS
-from ..shadow_agent import ShadowEvent
+if TYPE_CHECKING:
+    # ShadowEvent（代理事件）只用于类型标注；配置读取不加载整个代理运行环境。
+    from ..shadow_agent.contracts import ShadowEvent
 
 
 PRODUCT_SETTINGS_SCHEMA_VERSION = 9

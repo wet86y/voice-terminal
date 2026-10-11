@@ -13,9 +13,9 @@ if __package__ in (None, ""):
 
 from voice_terminal.local_layout import project_root
 
-from voice_terminal.resources import bootstrap_resources
+from voice_terminal.startup_logging import initialize_worker_logging, worker_imports_ready, startup_stage
 if __name__ == "__main__":
-    bootstrap_resources("asr")
+    initialize_worker_logging("asr", "asr-worker.log")
 
 from voice_terminal.asr.worker import AsrWorkerEngine, handle_asr_connection
 from voice_terminal.config import load_config
@@ -25,6 +25,9 @@ from voice_terminal.logging_setup import configure_logging
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.application.managed import report, report_endpoint, wait_for_shutdown
 from voice_terminal.application.ports import bind_loopback, endpoint_url
+
+if __name__ == "__main__":
+    worker_imports_ready("asr")
 
 
 async def run(config_path: Path | None = None) -> None:
@@ -37,11 +40,12 @@ async def run(config_path: Path | None = None) -> None:
     paths = AppPaths.resolve(root)
     default_path = root / "config" / "default.yaml"
     local_path = config_path or paths.config / "local.yaml"
-    config = load_config(default_path, local_path if local_path.is_file() else None)
-    config = ProductSettingsStore(
-        path=paths.config / "product-settings.json",
-        config=config,
-    ).effective_config()
+    with startup_stage("读取语音识别有效配置"):
+        config = load_config(default_path, local_path if local_path.is_file() else None)
+        config = ProductSettingsStore(
+            path=paths.config / "product-settings.json",
+            config=config,
+        ).effective_config()
     listener, actual_port = bind_loopback(config.asr_worker.port, host=config.asr_worker.host)
     report_endpoint("asr", endpoint_url("asr", actual_port))
     engine = AsrWorkerEngine(
@@ -63,7 +67,8 @@ async def run(config_path: Path | None = None) -> None:
         await handle_asr_connection(websocket, engine)
 
     try:
-        await engine.prepare()
+        with startup_stage("加载并预热语音识别模型"):
+            await engine.prepare()
         async with websockets.serve(handler, sock=listener):
             logging.getLogger(__name__).info(
                 "ASR Worker listening on ws://%s:%s/asr (device=%s)",
@@ -85,7 +90,8 @@ def main() -> None:
     root = project_root(Path(__file__))
     paths = AppPaths.resolve(root)
     load_env_file(paths.env_file)
-    configure_logging(paths.logs / "asr-worker.log")
+    if __name__ != "__main__":
+        configure_logging(paths.logs / "asr-worker.log")
     asyncio.run(run(args.config))
 
 

@@ -106,7 +106,7 @@ def _onnx_cuda_probe(ort: Any) -> bool:
 
 
 
-def _backend_hardware_status() -> dict[str, Any]:
+def _backend_hardware_status(*, onnx_only: bool = False) -> dict[str, Any]:
     """探测当前机器的 RAM（系统内存）、显存和各后端 GPU 支持。"""
     memory: dict[str, int | None] = {"available_bytes": None, "total_bytes": None}
     try:
@@ -125,20 +125,21 @@ def _backend_hardware_status() -> dict[str, Any]:
         "free_bytes": None,
         "total_bytes": None,
     }
-    try:
-        import torch  # type: ignore
+    if not onnx_only:
+        try:
+            import torch  # type: ignore
 
-        torch_cuda = _torch_cuda_probe(torch)
-        if torch_cuda:
-            free, total = torch.cuda.mem_get_info(0)
-            gpu.update({
-                "available": True,
-                "name": torch.cuda.get_device_name(0),
-                "free_bytes": int(free),
-                "total_bytes": int(total),
-            })
-    except Exception:
-        torch_cuda = False
+            torch_cuda = _torch_cuda_probe(torch)
+            if torch_cuda:
+                free, total = torch.cuda.mem_get_info(0)
+                gpu.update({
+                    "available": True,
+                    "name": torch.cuda.get_device_name(0),
+                    "free_bytes": int(free),
+                    "total_bytes": int(total),
+                })
+        except Exception:
+            torch_cuda = False
     if not gpu["available"]:
         try:
             result = subprocess.run(
@@ -176,15 +177,16 @@ def _backend_hardware_status() -> dict[str, Any]:
         pass
 
     sherpa_version: str | None = None
-    try:
-        sherpa_version = metadata.version("sherpa-onnx")
-    except metadata.PackageNotFoundError:
+    if not onnx_only:
         try:
-            import sherpa_onnx  # type: ignore
+            sherpa_version = metadata.version("sherpa-onnx")
+        except metadata.PackageNotFoundError:
+            try:
+                import sherpa_onnx  # type: ignore
 
-            sherpa_version = str(getattr(sherpa_onnx, "__version__", "")) or None
-        except Exception:
-            pass
+                sherpa_version = str(getattr(sherpa_onnx, "__version__", "")) or None
+            except Exception:
+                pass
     sherpa_cuda = bool(gpu["available"] and sherpa_version and "cuda" in sherpa_version.lower())
 
     models = {
@@ -211,14 +213,22 @@ def _backend_hardware_status() -> dict[str, Any]:
 
 
 _capabilities: dict | None = None
+_onnx_capabilities: dict | None = None  # _onnx_capabilities（轻量推理后端的独立能力缓存）。
 _capability_lock = threading.Lock()
 
 
-def hardware_status(*, refresh: bool = False) -> dict[str, Any]:
+def hardware_status(*, refresh: bool = False, onnx_only: bool = False) -> dict[str, Any]:
     """主服务使用宿主能力快照；独立入口只运行一次隔离探测，不导入重型后端。"""
-    global _capabilities
+    global _capabilities, _onnx_capabilities
+    onnx_only = onnx_only or os.environ.get("VOICE_RESOURCE_ROLE") == "speaker"
     with _capability_lock:
-        if _capabilities is None or refresh:
+        if onnx_only:
+            if _onnx_capabilities is None or refresh:
+                _onnx_capabilities = _backend_hardware_status(onnx_only=True)
+            cached = _onnx_capabilities
+        else:
+            cached = _capabilities
+        if not onnx_only and (_capabilities is None or refresh):
             serialized = os.environ.get("VOICE_HARDWARE_CAPABILITIES")
             if os.environ.get("VOICE_RESOURCE_ROLE") != "voice":
                 _capabilities = _backend_hardware_status()
@@ -232,7 +242,8 @@ def hardware_status(*, refresh: bool = False) -> dict[str, Any]:
                                         capture_output=True, text=True, timeout=60, env=env, check=True,
                                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                 _capabilities = json.loads(result.stdout.splitlines()[-1])
-    result = copy.deepcopy(_capabilities)
+            cached = _capabilities
+    result = copy.deepcopy(cached)
     if not os.environ.get("VOICE_GPU_PROBE") and not os.environ.get("VOICE_GPU_FALLBACK"):
         from .gpu_environment import registered
         install = Path(os.environ.get("VOICE_INSTALL_ROOT", ".local"))
@@ -414,6 +425,9 @@ def startup_device(mode: str, model_id: str, *, status: dict[str, Any] | None = 
     """按当前内存能力解析启动设备；显式 CUDA 仍交给加载器尝试并回退。"""
     if mode == "cpu" or os.environ.get("VOICE_GPU_FALLBACK"):
         return "cpu"
+    if mode == "cuda":
+        # 显式设备交给实际模型加载器验证并回退，无需先加载无关框架。
+        return "cuda"
     hardware = status or hardware_status()
     gpu = hardware.get("models", {}).get(model_id, {})
     if mode == "auto":
@@ -423,9 +437,11 @@ def startup_device(mode: str, model_id: str, *, status: dict[str, Any] | None = 
     return "cuda"
 
 
-def device_candidates(mode: str, model_id: str, fallback_device: str = "cpu") -> list[str]:
+def device_candidates(mode: str, model_id: str, fallback_device: str = "cpu", *,
+                      onnx_only: bool = False) -> list[str]:
     """返回加载尝试顺序：自动优先 GPU，失败时回退到最近成功设备和 CPU。"""
-    initial = startup_device(mode, model_id)
+    status = hardware_status(onnx_only=True) if onnx_only and mode == "auto" and not os.environ.get("VOICE_GPU_FALLBACK") else None
+    initial = startup_device(mode, model_id, status=status)
     candidates = [initial]
     if initial == "cuda":
         if fallback_device in {"cpu", "cuda"} and fallback_device not in candidates:
