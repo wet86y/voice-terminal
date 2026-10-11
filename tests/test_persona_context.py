@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.agent.persona import PersonaDocumentLoader
+from voice_terminal.agent.prompts import PERSONA_DOCUMENT_POLICY
 from voice_terminal.config import AppConfig, PersonaConfig
 from voice_terminal.paths import AppPaths
 from voice_terminal.providers.deepseek import DeepSeekClient
@@ -107,7 +108,7 @@ def test_persona_documents_are_static_and_projected_into_responses_in_order(tmp_
         assert "# 人格" in first_rendered
         assert "# 用户" in first_rendered
         assert first_rendered.index("人格主体文档") < first_rendered.index("用户资料文档")
-        assert "内置协议规则 > 用户自定义指令 > 人格主体 > 用户资料" in first_rendered
+        assert PERSONA_DOCUMENT_POLICY in first_static
 
         payload = DeepSeekClient._responses_payload(
             first,

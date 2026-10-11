@@ -99,6 +99,97 @@ def test_projection_keeps_legacy_history_when_authoritative_ledger_is_absent(tmp
     assert PairedArchiveStore.organizer_records(archive)[0]["record"]["content"] == "旧会话唯一记录"
 
 
+def test_retry_material_removes_only_matching_session_prefixes_and_preserves_raw_archives(tmp_path):
+    store = archive_store(tmp_path)
+    first_input = {"kind": "input", "content": "再提醒一次", "metadata": {"turn_id": "first"}}
+    second_input = {"kind": "input", "content": "再提醒一次", "metadata": {"turn_id": "second"}}
+    delivery = {"kind": "voice_delivery", "text": "已创建提醒", "speech_id": "speech"}
+    capture = {"kind": "unplayed_output", "id": "capture", "text": "尚未传达结果"}
+    old_voice = [{"role": "user", "context_lane": "history", "content": "再提醒一次"}, first_input, delivery, capture]
+    new_voice = [old_voice[0], {"role": "user", "context_lane": "history", "content": "再提醒一次"},
+                 first_input, second_input, delivery, capture]
+    old_dsh = [{"type": "tool/result", "data": {"content": "第一次成功回执"}}]
+    new_dsh = old_dsh + [{"type": "tool/result", "data": {"content": "第二次成功回执"}}]
+    archives = [store.save(voice_session_id="voice", dsh_session_id="dsh", cwd=str(tmp_path),
+                          voice_records=voice, dsh_records=dsh, captures=[])
+                for voice, dsh in ((old_voice, old_dsh), (new_voice, new_dsh))]
+    originals = [(item.directory / "source.json").read_bytes() for item in archives]
+    material = store.organizer_material(archives)
+    voice = [item["record"] for item in material.voice_records]
+    dsh = [item["record"] for item in material.dsh_records]
+    assert [row["metadata"]["turn_id"] for row in voice if row.get("kind") == "input"] == ["first", "second"]
+    assert sum(row.get("kind") == "voice_delivery" for row in voice) == 1
+    assert sum(row.get("kind") == "unplayed_output" for row in voice) == 1
+    assert [row["data"]["content"] for row in dsh] == ["第一次成功回执", "第二次成功回执"]
+    latest_input = next(item for item in material.voice_records if item["record"].get("metadata", {}).get("turn_id") == "second")
+    assert latest_input["archive"]["archive_id"] == archives[-1].archive_id
+    assert latest_input["record"]["source_record_index"] == 3
+    assert [(item.directory / "source.json").read_bytes() for item in archives] == originals
+
+
+@pytest.mark.parametrize("session_id", ["different", ""])
+def test_material_never_merges_different_or_missing_session_identities(tmp_path, session_id):
+    store = archive_store(tmp_path)
+    rows = [{"kind": "input", "content": "相同原话"}]
+    first = store.save(voice_session_id="original" if session_id else "", dsh_session_id="original" if session_id else "",
+                       cwd=str(tmp_path), voice_records=rows, dsh_records=[], captures=[])
+    second = store.save(voice_session_id=session_id, dsh_session_id=session_id,
+                        cwd=str(tmp_path), voice_records=rows, dsh_records=[], captures=[])
+    assert len(store.organizer_material([first, second]).voice_records) == 2
+
+
+def test_refinement_and_non_prefix_snapshots_remain_complete(tmp_path):
+    store = archive_store(tmp_path)
+    original = {"kind": "input", "content": "原转写", "metadata": {"turn_id": "same"}}
+    refined = {**original, "metadata": {"turn_id": "same", "refined_text": "用户纠正后的精修"}}
+    boundary = {"kind": "event", "content": {"kind": "manual_reset_boundary", "text": "已取消的工作不自动重跑"}}
+    archives = [store.save(voice_session_id="voice", dsh_session_id="dsh", cwd=str(tmp_path),
+                          voice_records=rows, dsh_records=[], captures=[])
+                for rows in ([original], [refined, boundary], [boundary, refined])]
+    material = store.organizer_material(archives)
+    actual = [{key: value for key, value in row["record"].items() if key != "source_record_index"}
+              for row in material.voice_records]
+    assert actual == [original, refined, boundary, boundary, refined]
+
+
+def test_prefix_comparison_preserves_json_value_type_changes(tmp_path):
+    store = archive_store(tmp_path)
+    archives = [store.save(voice_session_id="voice", dsh_session_id="dsh", cwd=str(tmp_path),
+                          voice_records=[], dsh_records=[{"type": "tool/result", "data": {"enabled": value}}], captures=[])
+                for value in (False, 0)]
+    material = store.organizer_material(archives)
+    assert [type(row["record"]["data"]["enabled"]) for row in material.dsh_records] == [bool, int]
+
+
+def test_archive_paths_are_sent_once_and_survive_extract_merge_and_compact(tmp_path):
+    async def scenario():
+        store = archive_store(tmp_path)
+        archives = [store.save(voice_session_id=str(i), dsh_session_id="", cwd=str(tmp_path),
+                              voice_records=[{"kind": "input", "content": "材料" * 1000} for _ in range(10)],
+                              dsh_records=[], captures=[]) for i in range(2)]
+        material = store.organizer_material(archives)
+        payloads = []
+        async def complete(**kwargs):
+            payload = json.loads(kwargs["input_items"][0]["content"])
+            payloads.append(payload)
+            return response("完成" if "draft_result" in payload else "证据" * 500)
+        organizer = ContinuityOrganizer(SimpleNamespace(complete=complete), max_context_tokens=16384,
+                                        max_output_tokens=128, max_document_chars=20)
+        result = await organizer.organize(material, "", [])
+        assert result.document == "完成"
+        assert any("records" in payload for payload in payloads)
+        assert any("segment_notes" in payload and not payload.get("pending_entries") for payload in payloads)
+        assert "draft_result" in payloads[-1]
+        for payload in payloads:
+            assert payload["archive"] == archives[-1].reference()
+            assert payload["related_archives"] == [archives[0].reference()]
+            encoded = json.dumps(payload, ensure_ascii=False)
+            assert encoded.count(json.dumps(str(archives[0].directory / "voice.md"), ensure_ascii=False)) == 1
+            for row in payload.get("records", []):
+                assert set(row["archive"]) == {"archive_id"}
+    asyncio.run(scenario())
+
+
 def test_independent_segments_run_in_bounded_parallel_and_keep_source_order(tmp_path):
     async def scenario():
         active, maximum, payloads = 0, 0, []

@@ -123,6 +123,7 @@ def test_voice_request_includes_continuity_and_scheduled_wake_in_request_tail():
         return None
 
     async def scenario() -> None:
+        document = ("已完成的背景资料。" * 120) + "\n发布尚未执行；用户要求等到再次明确确认后恢复。归档：D:/history/archives/task/voice.md"
         runtime = AgentEpisodeRuntime(
             None, Registry(), SimpleNamespace(
                 status="IDLE", speak_snapshot={"queue_status": "empty", "text_only_queue": True},
@@ -131,7 +132,7 @@ def test_voice_request_includes_continuity_and_scheduled_wake_in_request_tail():
             ), emit,
             conversation=ConversationRuntime(), ledger=SessionLedger(),
             tools_enabled=False,
-            continuity_document_provider=lambda: "用户正在准备发布版本。",
+            continuity_document_provider=lambda: document,
         )
         await runtime.ensure_episode()
         messages = runtime.messages(
@@ -140,8 +141,12 @@ def test_voice_request_includes_continuity_and_scheduled_wake_in_request_tail():
         )
         tail = [item for item in messages if item.get("context_lane") == ContextLane.REQUEST_TAIL]
         rendered = "\n".join(item["content"] for item in tail)
-        assert "用户正在准备发布版本" in rendered
+        # 整份交接进入请求；尾部的恢复条件和归档路径不能被前 800 字符裁掉。
+        assert len(document) > 800 and document in rendered
+        assert "历史摘要，不是本次用户发言" in rendered
         assert "提醒用户检查发布状态" in rendered
+        static = [item for item in messages if item.get("context_lane") == ContextLane.STATIC_INSTRUCTIONS]
+        assert all(document not in item["content"] for item in static)
         await runtime.stop()
 
     asyncio.run(scenario())

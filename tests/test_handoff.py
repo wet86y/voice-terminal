@@ -329,20 +329,22 @@ def test_dsh_full_export_accepts_large_single_record_without_changing_other_limi
 def test_paired_export_pages_all_records_and_refuses_partial_reads(tmp_path):
     async def scenario():
         runtime = make_runtime(tmp_path)
-        rows = [{"type":"assistant/message", "data":{"text":str(i)}} for i in range(401)]
+        rows = [{"type":"assistant/message", "data":{"text":str(i)}} for i in range(1201)]
         export_ids = []
         async def call(operation, payload):
             if operation == "session.state":
                 return {"result":"accepted", "ready_for_handoff":True}
             export_ids.append(payload["export_id"])
             offset = payload["offset"]
-            return {"result":"accepted", "records":rows[offset:offset+100], "total":len(rows),
-                    "next_offset":offset+100 if offset+100<len(rows) else None}
+            limit = payload["limit"]  # limit（单页记录上限）：复用桥接允许的 500 条。
+            assert limit == 500
+            return {"result":"accepted", "records":rows[offset:offset+limit], "total":len(rows),
+                    "next_offset":offset+limit if offset+limit<len(rows) else None}
         runtime.shadow_session = SimpleNamespace(_opened=True, dsh_session_id="dsh-old", workspace=tmp_path,
             client=SimpleNamespace(call=call), _envelope=lambda **kwargs: kwargs)
         archive = await runtime._export_paired_archive([])
-        assert len(archive.dsh_records) == 401
-        assert len(export_ids) == 5 and len(set(export_ids)) == 1
+        assert len(archive.dsh_records) == 1201
+        assert len(export_ids) == 3 and len(set(export_ids)) == 1
         runtime.shadow_session.client.call = AsyncMock(return_value={"result":"not_found"})
         with pytest.raises(RuntimeError, match="保留"):
             await runtime._export_paired_archive([])
