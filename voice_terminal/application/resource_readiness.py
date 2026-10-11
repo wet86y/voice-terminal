@@ -151,6 +151,15 @@ def inspect_dsh_runtime(
         return "DSH（代理执行宿主）runtime.json（运行元数据）格式无效，请下载或导入官方 DSH 资源。"
 
     try:
+        lock_path = program_root / "config/dsh/runtime.lock.json"
+        if lock_path.is_file():
+            lock = json.loads(lock_path.read_text(encoding="utf-8-sig"))
+            if lock.get("distribution", {}).get("source_kind") == "npm_package" and metadata.get("source_kind") != "npm_package":
+                return "旧 DSH（代理宿主）需要迁移，请在组件管理页点击更新。"
+        if metadata.get("source_kind") == "npm_package":
+            from ..dsh.distribution import validate_runtime
+            validate_runtime(program_root, runtime_root)
+            return None
         if metadata.get("source_kind") == "official_desktop":
             from ..dsh.official import load_official_artifact, validate_official_runtime
             artifact = load_official_artifact(program_root)
@@ -196,7 +205,9 @@ def inspect_dsh_runtime(
         if _is_reparse(modules_path) or not modules_path.is_dir():
             raise ValueError("运行组件依赖目录缺失")
         return None
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError, KeyError):
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError, KeyError) as exc:
+        if metadata.get("source_kind") == "npm_package":
+            return f"DSH（代理宿主）尚未就绪：{exc}"
         return "DSH（代理执行宿主）运行入口或兼容元数据不完整，请下载或导入官方 DSH 资源后再启动。"
 
 

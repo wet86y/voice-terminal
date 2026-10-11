@@ -1,6 +1,7 @@
 """Data acceptance（数据完整性验收）：迁移摘要、身份与隔离备份恢复。"""
 from pathlib import Path
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -74,7 +75,17 @@ for(const p of sessionFiles()){const r=await readSessionRecords(p);sessions++;re
 console.log(JSON.stringify({sessions,records,original_records:before.length,appended_records:after.length-before.length}));
 """, encoding='utf-8')
     try:
-        result = subprocess.run([str(local / 'runtimes/dsh/node.exe'), str(probe), active_log], cwd=ROOT,
+        metadata = json.loads((local / 'runtimes/dsh/runtime.json').read_text('utf-8-sig'))
+        environment = os.environ.copy()
+        if metadata.get('source_kind') == 'npm_package':
+            from voice_terminal.dsh.distribution import discover_node, target_spec
+            node, _ = discover_node(target_spec(local / 'app'))
+        elif metadata.get('source_kind') == 'official_desktop':
+            node = local / 'runtimes/dsh' / metadata['executable']
+            environment['ELECTRON_RUN_AS_NODE'] = '1'
+        else:
+            node = local / 'runtimes/dsh' / metadata['node']
+        result = subprocess.run([str(node), str(probe), active_log], cwd=ROOT, env=environment,
                                 capture_output=True, text=True, encoding='utf-8', check=True)
         sessions = json.loads(result.stdout)
     finally:

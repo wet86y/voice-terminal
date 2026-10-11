@@ -648,6 +648,35 @@ pub fn run_task(journal:&Path,locator:&Locator,cancel:Arc<AtomicBool>,progress:&
     }result
 }
 
+fn abandoned_source_reference(root:&Path,relative:&str,reference:&Value)->Result<bool,String>{
+    // abandoned reference（失效来源引用）：只放行未提交且原目录身份仍有效的记录，原文件保留供诊断。
+    if relative!="data/state/workspace-task.json"||reference["schema"]!=1||reference["kind"]!="migrate"
+        ||!["prepared","copying","starting"].contains(&reference["state"].as_str().unwrap_or(""))
+        ||reference["cleanup_started"]==true||reference["cleanup_finished"]==true
+        ||reference["job_id"].as_str().is_none_or(str::is_empty){return Ok(false);}
+    let Some(source)=reference["source_root"].as_str() else{return Ok(false);};
+    let source=normalized_target(Path::new(source))?;let current=canonical_path(root)?;
+    if source!=current{return Ok(false);}
+    let Some(target)=reference["target_root"].as_str() else{return Ok(false);};
+    let target=normalized_target(Path::new(target))?;
+    if source==target||source.starts_with(&target)||target.starts_with(&source){return Ok(false);}
+    // 来源记录不随目标进度刷新；目标仍存在时不能凭旧的零进程编号推断事务已退出。
+    match fs::symlink_metadata(&target){
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},
+        Ok(_)=>return Ok(false),
+        Err(error)=>return Err(format!("无法确认迁移目标是否已移除：{error}")),
+    }
+    let layout=load(&safe_path(root,"portable.json")?)?;
+    if layout["schema"]!=2||layout["app"]!="app"||layout["data_dir"]!="data"
+        ||layout["workspace_id"].as_str().is_none_or(str::is_empty)||layout["workspace_id"]!=reference["workspace_id"]{return Ok(false);}
+    // 原目录清理先删除 app（程序本体）；缺少本体时不能把可能已提交的迁移当成退出残留。
+    for relative in ["VoiceTerminal.exe","app/VoiceTerminalDesktop.exe","app/release.json"]{
+        if !safe_path(root,relative)?.is_file(){return Ok(false);}
+    }
+    for prefix in ["helper","target"]{if recorded_process(reference,prefix)?.is_some(){return Ok(false);}}
+    Ok(true)
+}
+
 pub fn pending_task(root:&Path)->Result<Option<PathBuf>,String>{
     for relative in ["tmp/workspace-task.json","data/state/workspace-task.json"]{
         let marker=root.join(relative);
@@ -657,7 +686,11 @@ pub fn pending_task(root:&Path)->Result<Option<PathBuf>,String>{
         if ["completed","failed"].contains(&reference["state"].as_str().unwrap_or("")){continue;}
         let target=Path::new(reference["target_root"].as_str().ok_or("迁移恢复记录缺少目标")?);
         let journal=target.join("tmp/workspace-task.json");
-        let record=load(&journal)?;
+        let record=match fs::read(&journal){
+            Ok(content)=>serde_json::from_slice::<Value>(content.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(&content)).map_err(|e|e.to_string())?,
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound&&abandoned_source_reference(root,relative,&reference)?=>continue,
+            Err(error)=>return Err(format!("无法读取 {}：{error}",journal.display())),
+        };
         if ["completed","failed"].contains(&record["state"].as_str().unwrap_or("")){continue;}
         if recorded_process(&record,"helper")?.is_some_and(|pid|pid!=std::process::id()){return Err("工作区事务正在运行，请等待完成。".into());}
         return Ok(Some(journal));
@@ -676,6 +709,36 @@ mod migration_copy_tests{
             atomic_json(&root.join("tmp/workspace-task.json"),&json!({"state":state,"target_root":base.join("old missing path")})).unwrap();
             assert!(pending_task(&root).unwrap().is_none());
         }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn abandoned_migration_reference_preserves_original_workspace_and_allows_upgrade(){
+        let base=std::env::temp_dir().join(format!("voice-abandoned-{}",new_id()));let source=base.join("source");let target=base.join("missing target");initialize(&source).unwrap();
+        for relative in ["VoiceTerminal.exe","app/VoiceTerminalDesktop.exe","app/release.json"]{let path=safe_path(&source,relative).unwrap();fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,b"original").unwrap();}
+        let marker=source.join("data/state/workspace-task.json");
+        let record=json!({"schema":1,"kind":"migrate","state":"prepared","job_id":new_id(),"source_root":source,"target_root":target,"workspace_id":load(&source.join("portable.json")).unwrap()["workspace_id"],"helper_pid":0});
+        atomic_json(&marker,&record).unwrap();let before=fs::read(&marker).unwrap();
+        assert_eq!(pending_task(&source).unwrap(),None);crate::installation::validate_target(&source).unwrap();
+        assert_eq!(fs::read(&marker).unwrap(),before);assert!(!target.exists());
+        for state in ["prepared","copying","starting"]{let mut current=record.clone();current["state"]=json!(state);atomic_json(&marker,&current).unwrap();assert_eq!(pending_task(&source).unwrap(),None);}
+        for patch in [json!({"state":"committed"}),json!({"cleanup_started":true}),json!({"workspace_id":"other"}),json!({"source_root":base.join("other")}),json!({"kind":"unknown"}),json!({"job_id":""})]{
+            let mut invalid=record.clone();for(key,value)in patch.as_object().unwrap(){invalid[key]=value.clone();}atomic_json(&marker,&invalid).unwrap();assert!(pending_task(&source).is_err());
+        }
+        #[cfg(windows)] {let mut active=record.clone();remember_process(&mut active,"helper",std::process::id()).unwrap();atomic_json(&marker,&active).unwrap();assert!(pending_task(&source).is_err());}
+        atomic_json(&marker,&record).unwrap();fs::remove_file(source.join("app/VoiceTerminalDesktop.exe")).unwrap();assert!(pending_task(&source).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn existing_or_invalid_target_journal_is_never_treated_as_abandoned(){
+        let base=std::env::temp_dir().join(format!("voice-active-reference-{}",new_id()));let source=base.join("source");let target=base.join("target");initialize(&source).unwrap();
+        for relative in ["VoiceTerminal.exe","app/VoiceTerminalDesktop.exe","app/release.json"]{let path=safe_path(&source,relative).unwrap();fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,b"original").unwrap();}
+        let record=json!({"schema":1,"kind":"migrate","state":"prepared","job_id":new_id(),"source_root":source,"target_root":target,"workspace_id":load(&source.join("portable.json")).unwrap()["workspace_id"],"helper_pid":0});
+        atomic_json(&source.join("data/state/workspace-task.json"),&record).unwrap();let journal=target.join("tmp/workspace-task.json");atomic_json(&journal,&record).unwrap();
+        assert_eq!(pending_task(&source).unwrap(),Some(journal.clone()));assert!(crate::installation::validate_target(&source).is_err());
+        fs::write(&journal,b"broken").unwrap();assert!(pending_task(&source).is_err());
+        fs::remove_file(&journal).unwrap();assert!(target.is_dir());assert!(pending_task(&source).is_err());assert!(crate::installation::validate_target(&source).is_err());
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -917,6 +980,7 @@ pub fn verify_tree_sizes_with_progress(root:&Path,manifest_name:&str,cancel:&Ato
     let value=load(&safe_path(root,manifest_name)?)?;
     prepare_validation_files(root,value["files"].as_array().ok_or("组件清单缺少文件集合")?,true,value["kind"]=="python",cancel,progress).map(|_|())
 }
+
 /// verify_cached_tree_with_progress（复用近期内容复核）：每次盘点文件，内容结果最多复用七天。
 pub fn verify_cached_tree_with_progress(root:&Path,manifest_name:&str,cache:&Path,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
     verify_tree_sizes_with_progress(root,manifest_name,cancel,&mut|_,_,_|progress("核对组件文件清单",0,0))?;
@@ -926,7 +990,7 @@ pub fn verify_cached_tree_with_progress(root:&Path,manifest_name:&str,cache:&Pat
     let now=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e|e.to_string())?.as_secs();
     let record=load(cache).unwrap_or(Value::Null);
     let fresh=record["verified_at"].as_u64().is_some_and(|time|time<=now&&now-time<7*24*60*60);
-    if record["schema"]==1&&record["root"]==root.to_string_lossy().as_ref()&&record["manifest_sha256"]==manifest_sha256&&record["files_fingerprint"]==files_fingerprint&&fresh{
+    if record["schema"]==1&&record["root"].as_str().is_some_and(|path|Path::new(path)==root)&&record["manifest_sha256"]==manifest_sha256&&record["files_fingerprint"]==files_fingerprint&&fresh{
         let value=load(&manifest)?;
         let total=value["files"].as_array().ok_or("组件清单缺少文件集合")?.iter()
             .try_fold(0u64,|sum,file|sum.checked_add(file["size"].as_u64().ok_or("清单大小无效")?).ok_or("组件校验大小溢出"))?;
@@ -947,6 +1011,8 @@ pub fn verify_cached_tree_with_progress(root:&Path,manifest_name:&str,cache:&Pat
 fn startup_content_fingerprint(root:&Path,cancel:&AtomicBool)->Result<String,String>{
     let mut digest=Sha256::new();
     for path in crate::resources::walk(root)?{
+        // manifest.json（文件摘要清单）单独核对摘要，不重复纳入文件元数据指纹。
+        if path==root.join("manifest.json"){continue;}
         validation_cancel(cancel)?;let metadata=path.metadata().map_err(|e|e.to_string())?;
         let modified=metadata.modified().map_err(|e|e.to_string())?.duration_since(UNIX_EPOCH).map_err(|e|e.to_string())?.as_nanos();
         let created=metadata.created().ok().and_then(|time|time.duration_since(UNIX_EPOCH).ok()).map(|time|time.as_nanos()).unwrap_or(0);
@@ -955,6 +1021,31 @@ fn startup_content_fingerprint(root:&Path,cancel:&AtomicBool)->Result<String,Str
     }Ok(format!("{:x}",digest.finalize()))
 }
 
+/// manifest_with_verified_cache（安装内容复核）：完整摘要成功且文件未变化后签发可复用记录。
+pub(crate) fn manifest_with_verified_cache(root:&Path,kind:&str,build:&str,cache:&Path,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
+    validation_cancel(cancel)?;
+    let verified_at=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e|e.to_string())?.as_secs();
+    let before=startup_content_fingerprint(root,cancel)?;
+    let manifest=manifest_with_progress(root,kind,build,cancel,progress)?;
+    if startup_content_fingerprint(root,cancel)?!=before{return Err("安装组件在内容校验期间发生变化，请重试。".into());}
+    validation_cancel(cancel)?;atomic_json(&root.join("manifest.json"),&manifest)?;
+    let proof=json!({"schema":1,"root":root,"manifest_sha256":file_hash(&root.join("manifest.json"))?,"files_fingerprint":before,"verified_at":verified_at,
+        "fields":{"schema":"安装内容复核记录格式","root":"已完整复核的候选目录","manifest_sha256":"完整文件清单摘要","files_fingerprint":"文件路径、大小、创建及修改时间指纹","verified_at":"完整校验开始时间"}});
+    validation_cancel(cancel)?;atomic_json(cache,&proof)
+}
+
+/// seed_verified_tree_cache（启用复核结果）：移动候选后核对未变化，避免首次启动重复读取全部内容。
+pub(crate) fn seed_verified_tree_cache(root:&Path,cache:&Path,proof:&Value,cancel:&AtomicBool)->Result<bool,String>{
+    validation_cancel(cancel)?;
+    let now=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e|e.to_string())?.as_secs();
+    let fresh=proof["verified_at"].as_u64().is_some_and(|time|time<=now&&now-time<7*24*60*60);
+    if proof["schema"]!=1||!fresh||proof["manifest_sha256"].as_str()!=Some(file_hash(&root.join("manifest.json"))?.as_str()){
+        return Ok(false);
+    }
+    if proof["files_fingerprint"].as_str()!=Some(startup_content_fingerprint(root,cancel)?.as_str()){return Ok(false);}
+    validation_cancel(cancel)?;
+    let mut record=proof.clone();record["root"]=json!(root);atomic_json(cache,&record)?;Ok(true)
+}
 
 /// python_bytecode_source（缓存对应源码）：只识别 Python 3.12（后端解释器）的标准缓存命名。
 fn python_bytecode_source(relative:&str)->Option<String>{
@@ -1081,6 +1172,26 @@ pub fn file_hash_with_progress(path:&Path,cancel:&AtomicBool,progress:&mut dyn F
 #[cfg(test)]
 mod component_validation_tests {
     use super::*;
+    #[test]
+    fn installed_candidate_handoff_reuses_hashes_but_rejects_changed_content(){
+        let root=fixture();let proof_path=root.with_extension("verified.json");let moved=root.with_extension("activated");let cache=root.with_extension("startup.json");let cancel=AtomicBool::new(false);
+        manifest_with_verified_cache(&root,"dsh","candidate",&proof_path,&cancel,&mut|_,_,_|{}).unwrap();
+        let proof=load(&proof_path).unwrap();fs::rename(&root,&moved).unwrap();
+        assert!(seed_verified_tree_cache(&moved,&cache,&proof,&cancel).unwrap());
+        let mut hashed=false;verify_cached_tree_with_progress(&moved,"manifest.json",&cache,&cancel,&mut|phase,_,_|hashed|=phase=="校验组件文件内容").unwrap();assert!(!hashed);
+        let alternate=PathBuf::from(moved.to_string_lossy().replace('\\',"/"));
+        verify_cached_tree_with_progress(&alternate,"manifest.json",&cache,&cancel,&mut|phase,_,_|hashed|=phase=="校验组件文件内容").unwrap();assert!(!hashed);
+        fs::write(moved.join("中文 目录/nested/004.bin"),vec![99;4096]).unwrap();fs::remove_file(&cache).unwrap();
+        assert!(!seed_verified_tree_cache(&moved,&cache,&proof,&cancel).unwrap());assert!(!cache.exists());
+        assert!(verify_cached_tree_with_progress(&moved,"manifest.json",&cache,&cancel,&mut|_,_,_|{}).is_err());
+        fs::remove_file(proof_path).unwrap();fs::remove_dir_all(moved).unwrap();
+    }
+    #[test]
+    fn cancelled_install_verification_never_issues_a_reusable_record(){
+        let root=fixture();let cache=root.with_extension("verified.json");let cancel=AtomicBool::new(false);
+        let result=manifest_with_verified_cache(&root,"dsh","candidate",&cache,&cancel,&mut|phase,_,_|{if phase=="校验组件文件内容"{cancel.store(true,Ordering::Release);}});
+        assert!(result.unwrap_err().contains("取消"));assert!(!cache.exists());fs::remove_dir_all(root).unwrap();
+    }
     fn fixture()->PathBuf{
         let root=std::env::temp_dir().join(format!("voice-validation-{}",new_id()));
         fs::create_dir_all(root.join("中文 目录/nested")).unwrap();

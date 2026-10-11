@@ -33,6 +33,7 @@ pub fn specs(context:&LaunchContext)->Result<Vec<Value>,String>{
     let device=settings["compute"]["devices"]["smart_turn"].as_str().unwrap_or("auto");
     let gpu_environment=runtime["compatible_gpu"]==true||runtime["profile"]=="cu128"||registration["models"]["smart_turn"]["gpu_available"]==true;
     for item in &mut items{
+        if item["kind"]=="dsh" && item["origin"]=="npm_package" {let target=crate::dsh::target(&context.installed_program())?;item["version"]=target["version"].clone();item["source"]["distribution"]=target;continue;}
         if item["kind"]!="model"{continue;}
         let installed=destination(context,item)?;let smart_turn=item["resource_id"]=="smart-turn";
         if let Some(files)=item["files"].as_array_mut(){for file in files{
@@ -213,21 +214,28 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
         }else{
             match inspect_dsh_installed(context,&root,false){
                 Ok(metadata)=>{
-                    let target=item["source"]["transfer"]["artifact"]["sha512_base64"].as_str().and_then(|value|base64::engine::general_purpose::STANDARD.decode(value).ok())
-                        .map(|bytes|bytes.iter().map(|byte|format!("{byte:02x}")).collect::<String>());
-                    let current=metadata["source_kind"]=="official_desktop"&&metadata["version"]==item["version"]&&target.as_deref()==metadata["source_sha512"].as_str();
+                    let current=if item["origin"]=="npm_package"{crate::dsh::current(&metadata,&crate::dsh::target(&context.installed_program())?)}else{
+                        let target=item["source"]["transfer"]["artifact"]["sha512_base64"].as_str().and_then(|value|base64::engine::general_purpose::STANDARD.decode(value).ok()).map(|bytes|bytes.iter().map(|byte|format!("{byte:02x}")).collect::<String>());
+                        metadata["source_kind"]=="official_desktop"&&metadata["version"]==item["version"]&&target.as_deref()==metadata["source_sha512"].as_str()
+                    };
                     (Ok(()),metadata["version"].as_str().map(str::to_owned),!current)
                 }
-                Err(error)=>(Err(error),None,false)
+                Err(error)=>{
+                    let metadata=load(&root.join("runtime.json")).unwrap_or(Value::Null);
+                    let version=metadata["version"].as_str().map(str::to_owned);
+                    let update=metadata.is_object()&&item["origin"]=="npm_package"&&!crate::dsh::current(&metadata,&crate::dsh::target(&context.installed_program())?);
+                    (Err(error),version,update)
+                }
             }
         };
         let group=item["dependency_group"].as_str().unwrap_or_else(||crate::runtime::model_group(item["resource_id"].as_str().unwrap_or("")));
-        let dependencies=if item["kind"]=="dsh"{true}else{groups[group]["ready"]==true};
+        let node_status=if item["kind"]=="dsh"&&item["origin"]=="npm_package"{crate::dsh::discover(&crate::dsh::target(&context.installed_program())?,false).map(|_|())}else{Ok(())};
+        let dependencies=if item["kind"]=="dsh"{node_status.is_ok()}else{groups[group]["ready"]==true};
         let can_start=result.is_ok()&&dependencies&&!update_available;
-        let error=result.as_ref().err().cloned().or_else(||if update_available{Some("该组件的模型版本或内容有更新，请先完成更新。".into())}else{None});
+        let error=result.as_ref().err().cloned().or_else(||node_status.err()).or_else(||if update_available{Some("该组件的版本或适配要求有更新，请先完成更新。".into())}else{None});
         rows.push(json!({"resource_id":item["resource_id"],"label":item["title"],"installation_state":if result.is_ok(){"installed"}else if root.exists(){"incomplete"}else{"missing"},
             "files_installed":result.is_ok(),"runtime_ready":dependencies,"can_start":can_start,
-            "source_url":item["source"]["page_url"],"error":error,"runtime_group":group,
+            "source_url":if item["kind"]=="dsh"&&!dependencies{json!("https://nodejs.org/en/download")}else{item["source"]["page_url"].clone()},"error":error,"runtime_group":group,
             "version":item["version"],"installed_version":installed_version,"update_available":update_available,
             "fields":{"files_installed":"模型或组件文件已安装","runtime_ready":"共享运行依赖已就绪","can_start":"具备启动条件","runtime_group":"启动所需共享依赖组",
                 "version":"随程序提供的目标模型或组件版本","installed_version":"实际安装的模型或组件版本；旧清单未知时为空","update_available":"目标模型或组件内容、版本可更新"}}));
@@ -455,6 +463,7 @@ pub fn recover(context:&LaunchContext)->Result<(),String>{
 }
 
 pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Result<PendingActivation,String>{
+    let dsh_proof=if relative=="runtimes/dsh"{load(&stage.with_extension("verified.json")).ok().filter(|record|record["root"].as_str().is_some_and(|path|Path::new(path)==stage))}else{None};
     recover(context)?;let target=safe_path(&context.install,relative)?;let old=safe_path(&context.install,"tmp/native-old")?;
     if old.exists(){return Err("上次资源备份尚未清理，无法开始新的激活。".into());}
     let journal=context.install.join("tmp/native-install.json");let original=target.exists();
@@ -474,6 +483,10 @@ pub fn begin_activation(context:&LaunchContext,stage:&Path,relative:&str)->Resul
     if let Err(error)=refresh_target_binding(context,relative,&target){
         let recovery=rollback_activation(context,&mut transaction);
         return Err(match recovery{Ok(())=>error,Err(rollback)=>format!("{error}；恢复旧资源失败：{rollback}")});
+    }
+    if let Some(proof)=dsh_proof{
+        // cache handoff（复核结果交接）：不匹配就留待启动完整复核，不绕过任何兼容门禁。
+        let _=crate::workspace::seed_verified_tree_cache(&target,&context.install.join("cache/component-validation/dsh.json"),&proof,&AtomicBool::new(false));
     }
     Ok(transaction)
 }
@@ -541,7 +554,7 @@ pub fn import_review_with_activation(context:&LaunchContext,source:&Path,id:Opti
     if inputs.is_empty(){return Err("没有识别到可导入资源".into());}
     // 整包预校验在替换任何现有资源之前完成。
     for (key,path) in &inputs {progress(&format!("预校验 {key}（资源编号）"),0,0);
-        if key=="dsh" {if path.is_dir(){dsh_validate_with_progress(context,path,true,&cancel,progress)?;}else{verify_installer(context,path,&cancel,progress)?;}}
+        if key=="dsh" {if path.is_dir(){inspect_dsh_with_progress(context,path,true,&cancel,progress)?;}else{verify_installer(context,path,&cancel,progress)?;}}
         else{validate_model_files_with_progress(context,&spec(context,key)?,path,true,&cancel,progress)?;}}
     let review_items=inputs.iter().map(|(key,_)|{
         let resource=spec(context,key)?;
@@ -559,7 +572,7 @@ pub fn import_review_with_activation(context:&LaunchContext,source:&Path,id:Opti
         check_cancel(&cancel)?;
         if identical{progress(&format!("跳过相同完整资源：{key}（编号）"),1,1);installed.push(key);continue;}
         if key=="dsh"&&path.is_file(){extract_dsh(context,&path,&candidate,&cancel,progress)?;}
-        else if key=="dsh"{copy_verified(&path,&candidate,&cancel,progress)?;dsh_validate_with_progress(context,&candidate,true,&cancel,progress)?;}
+        else if key=="dsh"{copy_verified(&path,&candidate,&cancel,progress)?;inspect_dsh_with_progress(context,&candidate,true,&cancel,progress)?;}
         else {
             let mut verified=vec![];let mut buffer=vec![0;1024*1024];
             for row in resource["files"].as_array().unwrap(){let name=row["path"].as_str().unwrap();let from=if let Some(asset)=row["asset"].as_str(){resource_asset(context,asset)?}else{safe_path(&path,name)?};
@@ -603,11 +616,23 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
     let item=spec(context,id)?;
     let installed=destination(context,&item)?;
     check_cancel(&cancel)?;progress("检查现有组件能否复用",0,0);
-    let current=if id=="dsh"{dsh_validate_with_progress(context,&installed,true,&cancel,progress).is_ok()}
+    let current=if id=="dsh"{
+        // target gate（目标门禁）：需要迁移的旧来源或版本不必先完整读取其文件内容。
+        let matches=if item["origin"]=="npm_package"{load(&installed.join("runtime.json")).is_ok_and(|metadata|
+            crate::dsh::target(&context.installed_program()).is_ok_and(|target|crate::dsh::current(&metadata,&target)))}else{true};
+        matches&&dsh_validate_with_progress(context,&installed,true,&cancel,progress).is_ok()
+    }
         else{inspect_installed_model(context,&item,false).is_ok_and(|current|
             !model_update_available(&item,&current)&&validate_model_files_with_progress(context,&item,&installed,false,&cancel,progress).is_ok())};
     check_cancel(&cancel)?;
     if current {progress("复用已校验资源",1,1);return Ok(vec![id.into()]);}
+    if id=="dsh"&&item["origin"]=="npm_package"{
+        let root=safe_path(&context.install,"tmp/resource-downloads/dsh")?;fs::create_dir_all(&root).map_err(|e|e.to_string())?;
+        let candidate=root.join(crate::dsh::candidate_name(&crate::dsh::target(&context.installed_program())?)?);
+        let result=(||{crate::dsh::install(context,&candidate,&cancel,progress)?;check_cancel(&cancel)?;progress("正在启用 DSH（代理宿主）组件",1,1);enable(&candidate,"runtimes/dsh")?;Ok(vec![id.into()])})();
+        // retry candidate（重试候选）：中断或失败保留候选及归档缓存，重试仍核对相同目标。
+        return result;
+    }
     let root=safe_path(&context.install,&format!("tmp/resource-downloads/{id}"))?;fs::create_dir_all(&root).map_err(|e|e.to_string())?;
     if let Some(artifact)=item["source"]["transfer"]["artifact"].as_object(){
         let value=Value::Object(artifact.clone());let spec=file_spec(&value,value["url"].as_str().ok_or("缺少下载来源")?.into())?;let path=safe_path(&root,&spec.path)?;
@@ -653,7 +678,7 @@ fn model_file_url(item:&Value,row:&Value)->Result<String,String>{
     }
 }
 fn verify_installer(context:&LaunchContext,path:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result<String,String>{
-    let item=spec(context,"dsh")?;let artifact=&item["source"]["transfer"]["artifact"];
+    let item=spec(context,"dsh")?;let artifact=if item["origin"]=="npm_package"{&item["source"]["official_transfer"]["artifact"]}else{&item["source"]["transfer"]["artifact"]};
     if path.metadata().map_err(|e|e.to_string())?.len()!=artifact["size_bytes"].as_u64().unwrap_or(0){return Err("DSH 官方安装器大小不匹配".into());}
     let total=path.metadata().map_err(|e|e.to_string())?.len();let mut done=0;let mut last_report=Instant::now();progress("校验官方安装器摘要",0,total);
     let mut stream=fs::File::open(path).map_err(|e|e.to_string())?;let mut digest=Sha512::new();let mut buffer=vec![0;1024*1024];
@@ -682,7 +707,8 @@ fn extract_dsh(context:&LaunchContext,source:&Path,target:&Path,cancel:&AtomicBo
     let inner=staging.join("payload");run_seven(&seven,&matches[0],&inner,cancel)?;
     let candidates:Vec<_>=walk(&inner)?.into_iter().filter(|p|p.file_name().is_some_and(|n|n=="DeepSeek Harness.exe")&&p.parent().unwrap().join("resources/app.asar").is_file()).collect();
     if candidates.len()!=1{return Err("官方应用目录无法唯一识别".into());}copy_verified(candidates[0].parent().unwrap(),target,cancel,progress)?;
-    let lock=load(&context.program.join("config/dsh/runtime.lock.json"))?;
+    let item=spec(context,"dsh")?;
+    let lock=if item["source"]["official_compatibility"].is_object(){item["source"]["official_compatibility"].clone()}else{load(&context.program.join("config/dsh/runtime.lock.json"))?};
     atomic_json(&target.join("runtime.json"),&json!({"schema":2,"kind":"official_desktop","source_kind":"official_desktop","version":lock["version"],"bridge_protocol":"2.0","compat_expected_commit":lock["commit"],"source_sha512":sha,
         "executable":"DeepSeek Harness.exe","app_asar":"resources/app.asar","entry":"resources/app.asar/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js",
         "schedule":"resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-schedule/lib/index.js",
@@ -697,7 +723,15 @@ fn inspect_dsh_installed(context:&LaunchContext,source:&Path,full:bool)->Result<
 fn inspect_dsh_with_progress(context:&LaunchContext,source:&Path,full:bool,cancel:&AtomicBool,progress:&mut Progress)->Result<Value,String>{
     check_cancel(cancel)?;
     let metadata=load(&source.join("runtime.json"))?;let digest=file_hash(&source.join("manifest.json"))?;let item=spec(context,"dsh")?;
-    if metadata["source_kind"]=="official_desktop" {
+    if metadata["source_kind"]=="npm_package" {
+        crate::dsh::inspect(&context.installed_program(),source)?;
+        if source==context.install.join("runtimes/dsh"){
+            let release=load(&context.installed_program().join("release.json"))?;let manifest=load(&source.join("manifest.json"))?;
+            if !release["components"].as_array().is_some_and(|rows|rows.iter().any(|row|row["kind"]=="dsh"&&row["path"]=="runtimes/dsh"&&row["build"]==manifest["build"]&&row["manifest_sha256"]==digest)){
+                return Err("DSH（代理宿主）安装清单绑定不一致，请修复组件。".into());
+            }
+        }
+    }else if metadata["source_kind"]=="official_desktop" {
         let version=metadata["version"].as_str().ok_or("DSH 安装版本缺失")?;
         let source_sha=metadata["source_sha512"].as_str().ok_or("DSH 官方来源摘要缺失")?;
         if source_sha.len()!=128||!source_sha.bytes().all(|byte|byte.is_ascii_hexdigit()){return Err("DSH 官方来源摘要格式无效".into());}
@@ -711,11 +745,16 @@ fn inspect_dsh_with_progress(context:&LaunchContext,source:&Path,full:bool,cance
     check_cancel(cancel)?;
     Ok(metadata)
 }
+#[cfg(test)]
 fn dsh_validate(context:&LaunchContext,source:&Path,full:bool)->Result<(),String>{
     dsh_validate_with_progress(context,source,full,&AtomicBool::new(false),&mut|_,_,_|{})
 }
 fn dsh_validate_with_progress(context:&LaunchContext,source:&Path,full:bool,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
     let metadata=inspect_dsh_with_progress(context,source,full,cancel,progress)?;let item=spec(context,"dsh")?;
+    if item["origin"]=="npm_package"{
+        if !crate::dsh::current(&metadata,&crate::dsh::target(&context.installed_program())?){return Err("DSH（代理宿主）版本或来源需要更新，请使用组件下载流程迁移。".into());}
+        crate::dsh::check_plugin(&context.installed_program(),&crate::dsh::target(&context.installed_program())?)?;return Ok(());
+    }
     if metadata["source_kind"]!="official_desktop"{return Err("旧版 DSH 代理宿主需要从官方来源更新后才能启动".into());}
     let expected=base64::engine::general_purpose::STANDARD.decode(item["source"]["transfer"]["artifact"]["sha512_base64"].as_str().ok_or("官方摘要缺失")?).map_err(|e|e.to_string())?;
     let expected=expected.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
@@ -724,7 +763,7 @@ fn dsh_validate_with_progress(context:&LaunchContext,source:&Path,full:bool,canc
 }
 fn bind_dsh(context:&LaunchContext)->Result<(),String>{
     let root=context.install.join("runtimes/dsh");let metadata=load(&root.join("runtime.json"))?;
-    if metadata["source_kind"]=="official_desktop"{atomic_json(&context.data.join("state/native-dsh-binding.json"),&json!({"version":metadata["version"],"source_sha512":metadata["source_sha512"],"manifest_sha256":file_hash(&root.join("manifest.json"))?,"fields":{"version":"固定 DSH 版本","source_sha512":"已核验官方安装器摘要","manifest_sha256":"程序签发的提取目录清单摘要"}}))?;}
+    if metadata["source_kind"]=="npm_package"{crate::dsh::bind(context,&root)?;}else if metadata["source_kind"]=="official_desktop"{atomic_json(&context.data.join("state/native-dsh-binding.json"),&json!({"version":metadata["version"],"source_sha512":metadata["source_sha512"],"manifest_sha256":file_hash(&root.join("manifest.json"))?,"fields":{"version":"固定 DSH 版本","source_sha512":"已核验官方安装器摘要","manifest_sha256":"程序签发的提取目录清单摘要"}}))?;}
     bind_component(context,"dsh","runtimes/dsh",&root)
 }
 pub fn bind_component(context:&LaunchContext,kind:&str,relative:&str,root:&Path)->Result<(),String>{
@@ -970,6 +1009,23 @@ mod download_tests {
         // 同长度损坏不能被当成缓存命中；无效来源让该用例立即失败，不发出网络请求。
         assert!(download_resource(&context,"dsh",Arc::new(AtomicBool::new(false)),&mut|_,_,_|{}).is_err());
         crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
+    fn npm_migration_does_not_hash_known_incompatible_old_component(){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();let root=owner.join(format!("voice-dsh-target-first-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();fs::create_dir_all(root.join("app/config")).unwrap();fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();
+        fs::write(root.join("app/scripts/backend-entry.py"),"# 只测试更新前检查").unwrap();
+        let installed=root.join("runtimes/dsh");fs::create_dir_all(&installed).unwrap();fs::write(installed.join("old.exe"),vec![0x41;1024]).unwrap();
+        let sha512="00".repeat(64);atomic_json(&installed.join("runtime.json"),&json!({"source_kind":"official_desktop","version":"old","source_sha512":sha512})).unwrap();
+        atomic_json(&installed.join("manifest.json"),&manifest(&installed,"dsh","old").unwrap()).unwrap();let old_hash=file_hash(&installed.join("manifest.json")).unwrap();
+        atomic_json(&root.join("app/config/dsh/official-runtime.lock.json"),&json!({"version":"old","source_sha512":sha512,"manifest_sha256":old_hash})).unwrap();
+        let lock:Value=serde_json::from_str(include_str!("../../../../config/dsh/runtime.lock.json")).unwrap();atomic_json(&root.join("app/config/dsh/runtime.lock.json"),&lock).unwrap();
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[{"resource_id":"dsh","kind":"dsh","destination":"runtimes/dsh","origin":"npm_package","version":lock["version"]}]})).unwrap();
+        // 缺少项目插件记录在安装前失败，不发出网络请求；此前逻辑会先完整读取旧组件。
+        let context=LaunchContext::portable(&root).unwrap();let mut hashed=false;
+        assert!(download_resource(&context,"dsh",Arc::new(AtomicBool::new(false)),&mut|phase,_,_|hashed|=phase=="校验组件文件内容").is_err());
+        assert!(!hashed);assert_eq!(file_hash(&installed.join("manifest.json")).unwrap(),old_hash);crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 
     #[test]

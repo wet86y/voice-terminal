@@ -148,7 +148,7 @@ function invalidDevice(row: LocalComponentRow) {
         <ManagedResourceProgress v-if="job" class="local-resource-progress" :job="job" :label="row.name" />
         <section v-if="row.resource && !needsResource(row) && expanded.has(row.id)" class="local-managed-resource" :data-resource="row.resource.id" :aria-label="`${row.resource.label}安装状态`">
           <div class="local-managed-resource-heading"><span>{{ row.resource.label }}</span><span class="resource-install-state" :class="row.resource.state">{{ row.resource.state === 'installed' ? '✓' : '!' }} {{ row.resource.status || resourceStateLabel(row.resource.state) }}</span></div>
-          <dl v-if="row.resource.installedVersion || row.resource.targetVersion" class="local-resource-versions"><div v-if="row.resource.installedVersion"><dt>已安装版本</dt><dd>{{ row.resource.installedVersion }}</dd></div><div v-if="row.resource.targetVersion"><dt>目标模型版本</dt><dd>{{ row.resource.targetVersion }}</dd></div></dl>
+          <dl v-if="row.resource.installedVersion || row.resource.targetVersion" class="local-resource-versions"><div v-if="row.resource.installedVersion"><dt>已安装版本</dt><dd>{{ row.resource.installedVersion }}</dd></div><div v-if="row.resource.targetVersion"><dt>目标版本</dt><dd>{{ row.resource.targetVersion }}</dd></div></dl>
           <p v-if="row.resource.error" class="local-error" role="status">{{ row.resource.error }}</p>
         </section>
         <div v-if="canExpand(row) && expanded.has(row.id)" :id="`local-detail-${row.id}`" class="local-component-detail">

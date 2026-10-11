@@ -82,7 +82,8 @@ def load_official_artifact(program_root: Path) -> OfficialArtifact:
     resource = next((row for row in rows if isinstance(row, dict) and row.get("resource_id") == "dsh"), None) if isinstance(rows, list) else None
     source_value = resource.get("source", {}) if isinstance(resource, dict) else {}
     source = source_value if isinstance(source_value, dict) else {}
-    transfer = source.get("transfer", {}) if isinstance(source, dict) else {}
+    lock = source.get("official_compatibility", lock)
+    transfer = source.get("official_transfer", source.get("transfer", {})) if isinstance(source, dict) else {}
     if not isinstance(transfer, dict):
         transfer = {}
     artifact = transfer.get("artifact", {}) if isinstance(transfer, dict) else {}
@@ -104,7 +105,8 @@ def load_official_artifact(program_root: Path) -> OfficialArtifact:
     if (not isinstance(version, str) or not version
             or repository != "https://github.com/deepseek-ai/deepseek-harness.git"
             or tag != f"dsh-v{version}"
-            or resource is None or resource.get("kind") != "dsh" or resource.get("version") != version
+            or resource is None or resource.get("kind") != "dsh"
+            or (resource.get("origin") != "npm_package" and resource.get("version") != version)
             or source.get("platform") != "deepseek_official"
             or source.get("repo_id") != "deepseek-ai/deepseek-harness"
             or source.get("revision") != tag

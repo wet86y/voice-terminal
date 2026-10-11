@@ -75,6 +75,7 @@ class DshRuntimeManager:
         self._state: DshRuntimeState = "disabled" if not config.enabled else "unavailable"
         self._message = "" if config.enabled else "DSH 已禁用。"
         self._process: asyncio.subprocess.Process | None = None
+        self._managed_shutdown = False  # _managed_shutdown（私有管道正常退出已接入）。
         self._start_task: asyncio.Task[None] | None = None
         self._reader_tasks: list[asyncio.Task[None]] = []
         self._monitor_task: asyncio.Task[None] | None = None
@@ -157,6 +158,9 @@ class DshRuntimeManager:
             })
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             managed = bool(os.environ.get("VOICE_APP_ORIGIN"))
+            self._managed_shutdown = managed or self.release_record.get("source_kind") == "npm_package"
+            if self._managed_shutdown:
+                env["VOICE_DSH_MANAGED_SHUTDOWN"] = "1"  # VOICE_DSH_MANAGED_SHUTDOWN（宿主私有退出通道）。
             if os.name == "nt" and managed:
                 creationflags |= subprocess.CREATE_NO_WINDOW
             env.pop("ELECTRON_RUN_AS_NODE", None)
@@ -165,15 +169,15 @@ class DshRuntimeManager:
             if self._official_executable is not None:
                 env["ELECTRON_RUN_AS_NODE"] = "1"
                 command = [str(self._official_executable), "--expose-internals"]
-                if managed:
+                if self._managed_shutdown:
                     command += ["--require", str(self.repo_root / "scripts/managed-node.cjs")]
                 command += [str(cli), "web", "--host", self.config.host,
                             "--port", str(self.config.port), "--no-open"]
             else:
                 if node is None:
-                    raise RuntimeError("DSH 物理运行目录缺少 Node.js（脚本运行环境）。")
+                    raise RuntimeError("DSH 运行目录缺少 Node.js（脚本运行环境）。")
                 command = [node]
-                if managed:
+                if self._managed_shutdown:
                     command += ["--require", str(self.repo_root / "scripts/managed-node.cjs")]
                 command += [str(cli), "web", "--host", self.config.host,
                             "--port", str(self.config.port), "--no-open"]
@@ -181,7 +185,7 @@ class DshRuntimeManager:
                 *command,
                 cwd=str(self.repo_root), env=env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.PIPE if managed else asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE if self._managed_shutdown else asyncio.subprocess.DEVNULL,
                 creationflags=creationflags,
             )
             assert self._process.stdout is not None and self._process.stderr is not None
@@ -233,6 +237,18 @@ class DshRuntimeManager:
         assert runtime is not None
         record = json.loads((runtime / "manifest.json").read_text(encoding="utf-8-sig"))
         metadata = json.loads((runtime / "runtime.json").read_text(encoding="utf-8-sig"))
+        lock_path = self.repo_root / "config/dsh/runtime.lock.json"
+        if lock_path.is_file():
+            target = json.loads(lock_path.read_text(encoding="utf-8-sig"))
+            if target.get("distribution", {}).get("source_kind") == "npm_package" and metadata.get("source_kind") != "npm_package":
+                raise RuntimeError("旧 DSH（代理宿主）需要迁移，请在组件管理页点击更新。")
+        if metadata.get("source_kind") == "npm_package":
+            from .distribution import validate_runtime
+            metadata, node = await asyncio.to_thread(validate_runtime, self.repo_root, runtime)
+            self.release_record = metadata
+            self._official_executable = None
+            await self._prepare_profile(modules_target=safe_path(runtime, metadata["modules"]))
+            return str(node), safe_path(runtime, metadata["entry"])
         if metadata.get("source_kind") == OFFICIAL_SOURCE_KIND:
             artifact = load_official_artifact(self.repo_root)
             if (artifact.version != self.config.expected_version
@@ -530,7 +546,7 @@ class DshRuntimeManager:
             return
         if process.returncode is None:
             try:
-                if not force and os.environ.get("VOICE_APP_ORIGIN") and process.stdin:
+                if not force and (getattr(self, "_managed_shutdown", False) or os.environ.get("VOICE_APP_ORIGIN")) and process.stdin:
                     process.stdin.write(b"voice-terminal:shutdown\n")
                     await process.stdin.drain()
                 elif os.name == "nt" and not force:

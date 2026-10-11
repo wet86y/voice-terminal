@@ -107,6 +107,7 @@ def _export_dsh_legacy(manager, spec) -> dict:
         lock = json.loads((manager.program / "config" / "dsh" / "runtime.lock.json").read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("当前 DSH 兼容运行目录缺少有效清单。") from exc
+    lock = spec.source.get("official_compatibility", lock)
     if (manifest.get("schema") != 1 or manifest.get("kind") != "dsh" or not manifest.get("files")
             or runtime.get("version") != lock.get("version") or runtime.get("commit") != lock.get("commit")):
         raise ValueError("当前 DSH 运行目录与本项目保留的兼容版本不匹配。")
@@ -174,6 +175,18 @@ def _export_dsh_official(manager, spec) -> dict:
     }
 
 
+def _export_dsh_npm(manager, spec) -> dict:
+    from voice_terminal.dsh.distribution import inspect_runtime
+    target = manager._spec_target(spec)
+    runtime = inspect_runtime(manager.program, target, full=True)
+    record = json.loads((target / "manifest.json").read_text("utf-8-sig"))
+    paths = [row["path"] for row in record["files"]] + ["manifest.json"]
+    return {"resource_id": "dsh", "kind": "dsh", "version": runtime["version"], "destination": spec.destination,
+            "origin": "npm_runtime", "trust_level": "verified_installed_manifest",
+            "files": [{"path": rel, "package_path": f"resources/dsh/{rel}", "size_bytes": (target / rel).stat().st_size,
+                       "sha256": _hash(target / rel)} for rel in paths]}
+
+
 def _resource_entries(manager, requested: list[str] | None) -> list[tuple[dict, list[tuple[str, Path]]]]:
     if requested:
         specs = [manager.catalog.get(resource_id) for resource_id in requested]
@@ -189,7 +202,7 @@ def _resource_entries(manager, requested: list[str] | None) -> list[tuple[dict, 
                 continue
             if requested and state["state"] != "installed":
                 raise ValueError("当前 DSH 兼容运行目录尚未安装或不完整。")
-            entry = (_export_dsh_official(manager, spec) if state.get("origin") == "official_runtime"
+            entry = (_export_dsh_npm(manager, spec) if state.get("origin") == "npm_package" else _export_dsh_official(manager, spec) if state.get("origin") == "official_runtime"
                      else _export_dsh_legacy(manager, spec))
             target = manager._spec_target(spec)
             files = [(record["package_path"], target.joinpath(*record["path"].split("/"))) for record in entry["files"]]

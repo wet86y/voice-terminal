@@ -155,9 +155,14 @@ class ResourceCatalog:
             files.append(ResourceFile(path, size, digest, optional, asset, source_path))
         if kind == "model" and not any(not item.optional for item in files):
             raise ResourceError("catalog_invalid", "模型资源缺少必需文件。")
-        if kind == "dsh" and raw.get("origin") != "official_installer":
+        if kind == "dsh" and raw.get("origin") not in {"official_installer", "npm_package"}:
             raise ResourceError("catalog_invalid", "DSH 资源只能声明固定官方安装器来源。")
-        if kind == "dsh":
+        if kind == "dsh" and raw.get("origin") == "npm_package":
+            from .dsh.distribution import target_spec
+            target = target_spec(self.program)
+            version = target["version"]
+            source = {**source, "distribution": target}
+        if kind == "dsh" and raw.get("origin") == "official_installer":
             artifact = source.get("transfer", {}).get("artifact", {})
             if (not isinstance(artifact, dict) or not isinstance(artifact.get("size_bytes"), int)
                     or artifact["size_bytes"] <= 0 or not isinstance(artifact.get("sha512_base64"), str)
@@ -214,6 +219,8 @@ def _bundle_stage_dir(task_dir: Path, stage_kind: str, resource_id: str | None =
         return task_dir / "b" / "m" / resource_id
     if stage_kind == "legacy_dsh":
         return task_dir / "b" / "d"
+    if stage_kind in {"npm_dsh", "npm_dsh_bundle"}:
+        return task_dir / "b" / ("n" if stage_kind == "npm_dsh" else "q")
     if stage_kind == "official_dsh":
         return task_dir / "b" / "o"
     raise ValueError("unknown bundle staging kind（未知批量资源暂存类型）")
@@ -548,6 +555,8 @@ class ResourceManager:
         }
 
     def _dsh_state(self, spec: ResourceSpec) -> dict[str, Any]:
+        if "distribution" in spec.source:
+            return self._npm_dsh_state(spec)
         target = self._spec_target(spec)
         version = None
         state = "missing"
@@ -618,6 +627,80 @@ class ResourceManager:
             "official_installer_available": True,
             "available_actions": ["download", "import", "open_source"],
         }
+
+    def _npm_dsh_state(self, spec: ResourceSpec) -> dict[str, Any]:
+        from .dsh.distribution import inspect_runtime, is_current, discover_node, check_binding
+        target = self._spec_target(spec)
+        state, metadata, error = "missing", {}, None
+        runtime_ready = False
+        update = False
+        if target.exists():
+            try:
+                metadata = self._read_runtime_metadata(target)
+                if metadata.get("source_kind") == "npm_package":
+                    metadata = inspect_runtime(self.program, target)
+                    check_binding(target)
+                    state = "installed"
+                    update = not is_current(metadata, spec.source["distribution"])
+                else:
+                    # legacy（旧来源）：保留识别入口，不能满足新分发目标。
+                    if metadata.get("source_kind") == OFFICIAL_SOURCE_KIND:
+                        self._inspect_official_dsh_tree(target)
+                    else:
+                        self._validate_dsh_tree(target, self.root / "tmp" / "legacy-inspect", create_candidate=False, verify_hashes=False)
+                    state = "installed"
+                    update = True
+            except (OSError, ValueError, KeyError, TypeError, ResourceError) as exc:
+                state, error = "incomplete", str(exc)
+                update = bool(metadata) and not is_current(metadata, spec.source["distribution"])
+        try:
+            discover_node(spec.source["distribution"])
+            runtime_ready = True
+        except ValueError as exc:
+            error = error or str(exc)
+        if update:
+            error = error or "DSH（代理宿主）版本或分发方式需要更新，请点击更新。"
+        return {"resource_id": spec.resource_id, "kind": "dsh", "title": spec.title,
+                "version": spec.version, "state": state, "installation_state": state,
+                "installed_version": metadata.get("version"), "origin": metadata.get("source_kind"),
+                "update_available": update, "files_installed": state == "installed",
+                "runtime_ready": runtime_ready, "can_start": state == "installed" and runtime_ready and not update,
+                "error": error, "manifest_sha256": _hash_file(target / "manifest.json") if (target / "manifest.json").is_file() else None,
+                "source_sha512": metadata.get("source_sha512"), "installed_path": str(target),
+                "source": spec.source, "verification_level": "installed_manifest", "official_installer_available": False,
+                "available_actions": ["download", "import", "open_source"] + (["update"] if update else [])}
+
+    def _stage_npm_dsh_tree(self, source: Path, task_dir: Path) -> Path:
+        from .dsh.distribution import inspect_runtime
+        inspect_runtime(self.program, source, full=True)
+        candidate = _bundle_stage_dir(task_dir, "npm_dsh")
+        shutil.copytree(source, candidate, dirs_exist_ok=True)
+        inspect_runtime(self.program, candidate, full=True)
+        return candidate
+
+    def _stage_npm_dsh_bundle(self, bundle, by_name, entry, task_dir):
+        records = entry.get("files")
+        if (entry.get("trust_level") != "verified_installed_manifest" or entry.get("destination") != self.dsh_relative
+                or not isinstance(records, list) or not records or len(records) > _MAX_BUNDLE_FILES):
+            raise ResourceError("bundle_invalid", "npm（包管理器）宿主资源包缺少完整文件记录。")
+        stage = _bundle_stage_dir(task_dir, "npm_dsh_bundle")
+        seen = set()
+        for record in records:
+            if not isinstance(record, dict):
+                raise ResourceError("bundle_invalid", "DSH（代理宿主）资源包文件记录无效。")
+            relative = _safe_relative(record.get("path")).as_posix()
+            package_path = _safe_relative(record.get("package_path")).as_posix()
+            info = by_name.get(package_path)
+            size, sha = record.get("size_bytes"), record.get("sha256")
+            if (relative.casefold() in seen or package_path != f"resources/dsh/{relative}"
+                    or type(size) is not int or size < 0 or not isinstance(sha, str) or not _SHA256.fullmatch(sha)
+                    or info is None or info.is_dir() or info.file_size != size):
+                raise ResourceError("bundle_invalid", "DSH（代理宿主）资源包文件或路径不符。")
+            seen.add(relative.casefold())
+            destination = _under(stage, relative)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            self._copy_zip_member(bundle, info, destination, size, sha)
+        return self._stage_npm_dsh_tree(stage, task_dir)
 
     def _official_dsh_release_binding(self, manifest: dict[str, Any], manifest_sha256: str,
                                      metadata: dict[str, Any], artifact: Any) -> None:
@@ -692,7 +775,7 @@ class ResourceManager:
                 "resource_id": "资源稳定编号", "state": "安装状态：missing（缺失）、incomplete（不完整）、installed（已安装）",
                 "kind": "资源类别", "title": "资源显示名称", "version": "资源锁定版本",
                 "installed_version": "已安装版本；旧模型未登记版本时为空", "origin": "当前资源来源类型",
-                "update_available": "模型必须更新到随包目标版本，更新完成前阻止启动语音服务",
+                "update_available": "模型或宿主须同步至随包目标组合，完成前阻止整体服务启动",
                 "files_installed": "随包目标模型的必需文件已校验", "can_start": "模型符合当前版本且无待更新内容",
                 "source_sha512": "固定官方安装器 SHA-512（摘要）", "manifest_sha256": "本机程序签发并绑定的运行清单 SHA-256（摘要）",
                 "required_files_present": "已通过清单核验的必需文件数", "required_files_total": "必需文件总数",
@@ -708,6 +791,14 @@ class ResourceManager:
         task = self._task_dir(task_id)
         transport = spec.source.get("transfer", {})
         files: list[dict[str, Any]] = []
+        if spec.kind == "dsh" and "distribution" in spec.source:
+            return {"resource_id": spec.resource_id, "task_id": task_id, "version": spec.version,
+                    "kind": "dsh", "transport": "npm_package", "install_strategy": "npm_package",
+                    "stage_directory": str(task / "download"), "install_path": str(self._spec_target(spec)),
+                    "files": [], "generated_files": [], "source": spec.source,
+                    "fields": {"resource_id": "组件编号", "task_id": "任务编号", "version": "目标宿主版本",
+                               "kind": "组件类型", "transport": "安装适配器", "install_strategy": "事务安装策略",
+                               "stage_directory": "安装暂存目录", "install_path": "安装目录", "files": "由 npm（包管理器）解析下载", "generated_files": "随包资源", "source": "宿主适配声明"}}
         if spec.kind == "dsh":
             artifact = transport.get("artifact", {})
             if not isinstance(artifact, dict) or not isinstance(artifact.get("url"), str):
@@ -946,6 +1037,12 @@ class ResourceManager:
                 manifest_bytes = manifest_path.read_bytes()
                 release_rel, release_bytes = self._release_after_swap("dsh", manifest, manifest_bytes)
                 metadata = [(release_rel, release_bytes)]
+                runtime = self._read_runtime_metadata(candidate)
+                if runtime.get("source_kind") == "npm_package":
+                    binding = {key: runtime[key] for key in ("source_kind", "adapter", "version")}
+                    binding["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+                    binding["fields"] = {"source_kind": "组件来源", "adapter": "运行适配器", "version": "安装版本", "manifest_sha256": "已验证运行清单摘要"}
+                    metadata.append(("data/state/native-dsh-binding.json", _json_bytes(binding)))
             transaction_rel = f"tmp/resource-transactions/{task_id}/{spec.resource_id}"
             tx_dir = _under(self.root, transaction_rel)
             if tx_dir.exists():
@@ -977,6 +1074,8 @@ class ResourceManager:
                 for relative, content in metadata:
                     _atomic_write(_under(self.root, relative), content)
                 self.transaction_marker.unlink(missing_ok=True)
+                if spec.kind == "dsh":
+                    (self.root / "cache/component-validation/dsh.json").unlink(missing_ok=True)
                 shutil.rmtree(tx_dir, ignore_errors=True)
             except ResourceError:
                 self.recover_pending_transaction()
@@ -1028,8 +1127,10 @@ class ResourceManager:
 
     def _validate_dsh_tree(self, source: Path, task_dir: Path, *,
                            prevalidated_archive_records: dict[str, tuple[int, str]] | None = None,
-                           create_candidate: bool = True) -> Path:
+                           create_candidate: bool = True, verify_hashes: bool = True) -> Path:
         """Validate a legacy DSH tree（校验旧版 DSH 目录）and optionally materialize a candidate（构建候选目录）."""
+        if create_candidate and not verify_hashes:
+            raise ValueError("候选 DSH（代理宿主）必须执行完整摘要校验。")
         if (not source.is_dir() or source.is_symlink()
                 or getattr(source, "is_junction", lambda: False)()):
             raise ResourceError("legacy_dsh_invalid", "DSH 兼容导入需要普通运行目录。")
@@ -1047,6 +1148,9 @@ class ResourceManager:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
             runtime = json.loads(runtime_path.read_text(encoding="utf-8-sig"))
             lock = json.loads((self.program / "config" / "dsh" / "runtime.lock.json").read_text(encoding="utf-8-sig"))
+            compatibility = self.catalog.get("dsh").source.get("official_compatibility")
+            if compatibility:
+                lock = compatibility
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ResourceError("legacy_dsh_invalid", "DSH 兼容资源缺少有效运行元数据。") from exc
         if (not isinstance(manifest, dict) or not isinstance(runtime, dict) or not isinstance(lock, dict)
@@ -1083,8 +1187,10 @@ class ResourceManager:
             total += size
         if total > _MAX_BUNDLE_BYTES:
             raise ResourceError("legacy_dsh_invalid", "DSH 兼容资源超过本地导入大小限制。")
+        if set(actual[0] for actual in actual_files.values()) != {*entries, "manifest.json"}:
+            raise ResourceError("legacy_dsh_invalid", "DSH 兼容运行文件集合不匹配固定清单。")
 
-        if prevalidated_archive_records is None:
+        if prevalidated_archive_records is None and verify_hashes:
             def verify_entry(item: tuple[str, dict[str, Any], Path]) -> None:
                 name, entry, path = item
                 if _hash_file(path) != entry["sha256"]:
@@ -1094,7 +1200,7 @@ class ResourceManager:
                 for _ in workers.map(verify_entry, ((name, entry, actual_for_entry[name][1])
                                                     for name, entry in entries.items())):
                     pass
-        else:
+        elif prevalidated_archive_records is not None:
             archive_files = {name: digest for name, digest in prevalidated_archive_records.items()
                              if name != "manifest.json"}
             expected_files = {name: (entry["size"], entry["sha256"]) for name, entry in entries.items()}
@@ -1176,7 +1282,7 @@ class ResourceManager:
                 if resource_id in seen:
                     raise ResourceError("bundle_invalid", "资源压缩包包含重复资源。")
                 seen.add(resource_id)
-                if resource_id == "dsh" and entry.get("origin") in {"legacy_runtime", "official_runtime"}:
+                if resource_id == "dsh" and entry.get("origin") in {"legacy_runtime", "official_runtime", "npm_runtime"}:
                     dsh_records = entry.get("files")
                     if not isinstance(dsh_records, list) or len(dsh_records) > _MAX_BUNDLE_FILES:
                         raise ResourceError("bundle_invalid", "DSH 兼容资源文件清单格式不正确。")
@@ -1184,7 +1290,9 @@ class ResourceManager:
                         if not isinstance(record, dict) or not isinstance(record.get("package_path"), str):
                             raise ResourceError("bundle_invalid", "DSH 兼容资源文件记录格式不正确。")
                         referenced_members.add(_safe_relative(record["package_path"]).as_posix())
-                    if entry.get("origin") == "official_runtime":
+                    if entry.get("origin") == "npm_runtime":
+                        dsh = self._stage_npm_dsh_bundle(bundle, by_name, entry, task_dir)
+                    elif entry.get("origin") == "official_runtime":
                         dsh = self._stage_official_dsh_bundle(bundle, by_name, entry, task_dir)
                     else:
                         dsh = self._stage_dsh_bundle(bundle, by_name, entry, task_dir)
@@ -1342,7 +1450,9 @@ class ResourceManager:
                 if not source.is_dir():
                     raise ResourceError("legacy_dsh_invalid", "官方 DSH 安装器应由固定安装器处理。")
                 runtime_value = self._read_runtime_metadata(source)
-                if runtime_value.get("source_kind") == OFFICIAL_SOURCE_KIND:
+                if runtime_value.get("source_kind") == "npm_package":
+                    self._stage_npm_dsh_tree(source, task_dir)
+                elif runtime_value.get("source_kind") == OFFICIAL_SOURCE_KIND:
                     self._stage_official_dsh_tree(source, task_dir)
                 else:
                     self._validate_dsh_tree(source, task_dir, create_candidate=False)
@@ -1493,7 +1603,10 @@ class ResourceManager:
             if not source.is_dir():
                 raise ResourceError("legacy_dsh_invalid", "官方 DSH 安装器必须交由原生安装器处理；此入口只接收已验证运行目录。")
             runtime_value = self._read_runtime_metadata(source)
-            if runtime_value.get("source_kind") == OFFICIAL_SOURCE_KIND:
+            if runtime_value.get("source_kind") == "npm_package":
+                candidate = self._stage_npm_dsh_tree(source, task_dir)
+                origin = "npm_runtime"
+            elif runtime_value.get("source_kind") == OFFICIAL_SOURCE_KIND:
                 candidate = self._stage_official_dsh_tree(source, task_dir)
                 origin = "official_runtime"
             else:

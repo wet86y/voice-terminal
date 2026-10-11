@@ -436,17 +436,18 @@
     {
       "resource_id": "dsh",
       "kind": "dsh",
-      "title": "DeepSeek Harness 官方桌面客户端",
+      "title": "DeepSeek Harness（代理执行宿主）",
       "destination": "runtimes/dsh",
       "version": "0.2.0-rc.2",
       "required": true,
-      "origin": "official_installer",
+      "origin": "npm_package",
       "source": {
         "platform": "deepseek_official",
         "repo_id": "deepseek-ai/deepseek-harness",
         "revision": "dsh-v0.2.0-rc.2",
-        "page_url": "https://github.com/deepseek-ai/deepseek-harness/releases/expanded_assets/dsh-v0.2.0-rc.2",
-        "transfer": {
+        "page_url": "https://www.npmjs.com/package/@deepseek-ai/dsh",
+        "license_url": "https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/LICENSE",
+        "official_transfer": {
           "kind": "native_official_installer",
           "artifact": {
             "url": "https://download.deepseek.com/dsh-desk/bin/win-x64/deepseek-harness-0.2.0-rc.2-win-x64.exe",
@@ -455,7 +456,15 @@
             "sha512_base64": "raIlxMQd9ESXgktmViW7QwVLcjBR5JIsrNOu+SpelY8kskdSr2H51/f+ey1EqFI/eIIrKQCuRANMeb5SptRZcg=="
           }
         },
-        "license_url": "https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/LICENSE"
+        "transfer": {
+          "kind": "npm_package"
+        },
+        "official_compatibility": {
+          "version": "0.2.0-rc.2",
+          "commit": "639ed015397290b3745d163aafe02ffee4aa3f84",
+          "tag": "dsh-v0.2.0-rc.2",
+          "repository": "https://github.com/deepseek-ai/deepseek-harness.git"
+        }
       },
       "files": [],
       "legacy_export": {
@@ -463,7 +472,8 @@
         "trust_level": "legacy_compatibility_only",
         "version_source": "runtime.json",
         "manifest_sha256": "885416e87b45264649da50b8b79d3f31b07a0b8ffab90e2b01c25c7cfa4cb960"
-      }
+      },
+      "version_from": "config/dsh/runtime.lock.json"
     }
   ],
   "fields": {
@@ -500,6 +510,9 @@
     "trust_level": "资源来源可信等级",
     "repository": "旧运行目录对应的源码仓库",
     "tag": "对应的源码版本标签",
-    "commit": "对应的源码提交号"
+    "commit": "对应的源码提交号",
+    "version_from": "目标版本的权威配置来源",
+    "official_transfer": "旧官方安装器兼容接口，不用于新组件下载",
+    "official_compatibility": "旧官方桌面来源的独立兼容记录，不随新目标版本改变"
   }
 }

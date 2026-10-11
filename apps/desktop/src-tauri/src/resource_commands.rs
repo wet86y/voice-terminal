@@ -291,6 +291,12 @@ impl ResourceManager {
         if !valid_resource_id(resource_id) {
             return Err("资源编号格式无效。".into());
         }
+        if resource_id=="dsh"{
+            let spec=voice_desktop_common::resources::spec(&self.context,resource_id)?;
+            if spec["origin"]=="npm_package"&&voice_desktop_common::dsh::discover(&voice_desktop_common::dsh::target(&self.context.installed_program())?,true).is_err(){
+                #[cfg(windows)] return voice_desktop_common::windows::open_url("https://nodejs.org/en/download");
+            }
+        }
         let catalog_path = self.context.program.join("config/resources/catalog.json");
         let bytes = fs::read(catalog_path).map_err(|_| "资源来源清单不可用。")?;
         let catalog: Value = serde_json::from_slice(&bytes).map_err(|_| "资源来源清单格式无效。")?;
@@ -383,7 +389,7 @@ impl ResourceManager {
         let cancel=self.cancel_signal(job_id)?;
         let mut progress=|phase:&str,done:u64,total:u64|{
             if phase.starts_with("启用")||phase.starts_with("正在启用"){let _=self.begin_non_cancellable_phase(job_id,phase,done,Some(total));}
-            else{self.set_phase(job_id,phase,true,done,Some(total));}
+            else{self.set_phase(job_id,phase,true,done,if total==0{None}else{Some(total)});}
         };
         // dependency_group（依赖组）模型先校验并配置完整运行环境，再下载自身模型文件。
         let mut installed=self.configure_resource_dependencies(job_id,resource_id,cancel.clone(),&mut progress)
@@ -399,7 +405,7 @@ impl ResourceManager {
         let mut installed=vec![];
         let mut progress=|phase:&str,done:u64,total:u64|{
             if phase.starts_with("正在启用")||phase.starts_with("启用"){let _=self.begin_non_cancellable_phase(job_id,phase,done,Some(total));}
-            else{self.set_phase(job_id,phase,true,done,Some(total));}
+            else{self.set_phase(job_id,phase,true,done,if total==0{None}else{Some(total)});}
         };
         if let Some(id)=resource_id.as_deref(){
             let dependencies=self.configure_resource_dependencies(job_id,id,self.cancel_signal(job_id)?,&mut progress)

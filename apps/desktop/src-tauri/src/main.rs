@@ -894,6 +894,15 @@ fn run() -> Result<(), String> {
     };
     std::env::remove_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER");
     if voice_desktop_common::webview::version().is_none(){voice_desktop_common::webview::guide("未检测到系统 WebView2（网页运行引擎）。");return Ok(());}
+    if let Some(context)=context.as_ref(){
+        let target=voice_desktop_common::dsh::target(&context.installed_program())?;
+        loop {
+            match voice_desktop_common::dsh::discover(&target, false) {
+                Ok(_) => break,
+                Err(error) => { if !voice_desktop_common::dsh::guide(&error) { break; } }
+            }
+        }
+    }
     let locator=context.as_ref().map(|value|Locator::local(&value.install));
     let instance_identifier=instance_identifier(mode,if preview{Some(program.as_path())}else{context.as_ref().map(|value|value.install.as_path())});
     let development=preview||context.as_ref().is_some_and(|value|value.dev);

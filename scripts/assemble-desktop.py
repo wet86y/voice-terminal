@@ -136,65 +136,23 @@ def collect_frontend(source: Path, target: Path) -> None:
 
 
 def collect_desktop_crt(program: Path) -> None:
-    """从锁定并验过的 DSH（代理宿主）基线收集桌面 EXE（可执行文件）所需的 MSVC CRT（微软 C++ 运行库）。"""
-    runtime = ROOT / ".local/runtimes/dsh"
-    metadata_path = runtime / "runtime.json"
-    manifest_path = runtime / "manifest.json"
-    if not metadata_path.is_file() or not manifest_path.is_file():
-        raise FileNotFoundError("缺少已锁定的 DSH（代理宿主）运行基线，无法收集桌面 C++ 运行库。")
-
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
-    runtime_record = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-    # 此包只收集 C++ 运行库。逐个核对下方双重清单与实际文件，
-    # 不为组装固定本体重复扫描未随包交付的数万代理依赖。
-    if runtime_record.get("schema") != 1 or runtime_record.get("kind") != "dsh":
-        raise ValueError("DSH（代理宿主）运行基线清单格式无效。")
-    lock = json.loads((ROOT / "config/dsh/runtime.lock.json").read_text(encoding="utf-8-sig"))
-    if (metadata.get("schema") != 1
-            or metadata.get("version") != lock.get("version")
-            or metadata.get("commit") != lock.get("commit")):
-        raise ValueError("DSH（代理宿主）运行基线与项目锁版不一致，拒绝收集桌面 C++ 运行库。")
-
-    crt = metadata.get("office_vc_runtime")
-    rows = crt.get("files") if isinstance(crt, dict) else None
-    if (not isinstance(crt, dict) or crt.get("source") != "Microsoft.VC145.CRT"
-            or not isinstance(crt.get("version"), str) or not crt["version"]
-            or not isinstance(rows, list) or not rows):
-        raise ValueError("锁定的 DSH（代理宿主）基线缺少 Microsoft.VC145.CRT（C++ 运行库）文件清单。")
-
-    bin_relative = "node_modules/@deepseek-ai/libreoffice-kit-win32-x64/bin"
-    bin_root = safe_path(runtime, bin_relative)
-    runtime_files = {row.get("path"): row for row in runtime_record.get("files", []) if isinstance(row, dict)}
-    names: set[str] = set()
+    """从独立可信 CRT（C++ 运行库）缓存收集，不依赖 DSH（代理宿主）版本。"""
+    source = ROOT / ".local/build/tools/desktop-crt"
+    record_path = source / "manifest.json"
+    if not record_path.is_file():
+        raise FileNotFoundError("缺少独立桌面 C++（编译语言）运行库，请运行 scripts/prepare-desktop-crt.py（运行库准备）。")
+    record = json.loads(record_path.read_text("utf-8-sig"))
+    if record.get("kind") != "desktop-crt":
+        raise ValueError("桌面 C++（编译语言）运行库清单类型无效")
+    verify(source, record)
     required = {"msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"}
-    for row in rows:
-        name, size, sha256 = row.get("file"), row.get("size"), row.get("sha256")
-        if (not isinstance(name, str) or Path(name).name != name or Path(name).suffix.lower() != ".dll"
-                or name.casefold() in names or not isinstance(size, int) or size <= 0
-                or not isinstance(sha256, str) or len(sha256) != 64
-                or any(char not in "0123456789abcdef" for char in sha256.lower())):
-            raise ValueError("Microsoft.VC145.CRT（C++ 运行库）文件清单包含无效记录。")
-        names.add(name.casefold())
-        relative = f"{bin_relative}/{name}"
-        source = safe_path(runtime, relative)
-        manifest_row = runtime_files.get(relative)
-        if (manifest_row is None or manifest_row.get("size") != size or manifest_row.get("sha256") != sha256
-                or not source.is_file() or source.stat().st_size != size or digest(source) != sha256):
-            raise ValueError(f"Microsoft.VC145.CRT（C++ 运行库）文件未通过锁定清单校验：{name}")
-        shutil.copy2(source, program / name)
-
-    if not required.issubset(names):
-        raise ValueError("Microsoft.VC145.CRT（C++ 运行库）缺少桌面程序所需的核心 DLL（动态链接库）。")
-    if (bin_root.is_dir()
-            and {path.name.casefold() for path in bin_root.glob("*.dll")} != names):
-        raise ValueError("Microsoft.VC145.CRT（C++ 运行库）实际 DLL（动态链接库）集合与锁定清单不一致。")
-    notice = bin_root / "VC-Runtime-Notice.txt"
-    if notice.is_file():
-        expected_notice = runtime_files.get(f"{bin_relative}/VC-Runtime-Notice.txt")
-        if (expected_notice is None or notice.stat().st_size != expected_notice.get("size")
-                or digest(notice) != expected_notice.get("sha256")):
-            raise ValueError("C++ 运行库再分发说明未通过 DSH（代理宿主）锁定清单校验。")
-        shutil.copy2(notice, program / notice.name)
+    if not required.issubset({row["path"] for row in record["files"]}):
+        raise ValueError("桌面 C++（编译语言）运行库缺少必要文件")
+    for row in record["files"]:
+        name = row["path"]
+        if Path(name).name != name:
+            raise ValueError("桌面运行库不允许嵌套路径")
+        shutil.copy2(source / name, program / name)
 
 
 def collect_program(program: Path, desktop: Path, *, include_desktop: bool = True) -> None:
@@ -217,7 +175,7 @@ def collect_program(program: Path, desktop: Path, *, include_desktop: bool = Tru
         copy_tree(ROOT / relative, program / relative)
     (program / "scripts").mkdir()
     for name in ("backend-entry.py", "managed-node.cjs", "check-desktop-environment.py", "prepare-webview2.ps1", "local-context.ps1",
-                 "manage-resources.py", "package-resources.py", "install-official-dsh.py", "relocate-workspace.py", "voice-environment-worker.py"):
+                 "manage-resources.py", "package-resources.py", "install-official-dsh.py", "dsh-npm.mjs", "relocate-workspace.py", "voice-environment-worker.py"):
         shutil.copy2(ROOT / "scripts" / name, program / "scripts" / name)
     seven_source = ROOT / ".local/build/tools/7zip"
     if seven_source.is_dir():
@@ -235,6 +193,8 @@ def collect_program(program: Path, desktop: Path, *, include_desktop: bool = Tru
     (program / "config/default.yaml").write_text("\n".join(config)+"\n", encoding="utf-8")
     shutil.copy2(ROOT / "config/runtime-resources.json", program / "config/runtime-resources.json")
     build_profile(ROOT, ROOT / ".local/build/dsh/bundles", program / "config/dsh/profile")
+    from voice_terminal.dsh.distribution import target_spec, check_plugin
+    check_plugin(program, target_spec(program))
 
 
 def root_files(output: Path, desktop: Path) -> list[dict]:
@@ -308,11 +268,25 @@ def refresh_program(output: Path, desktop: Path, build: str, dsh_runtime=None, p
                     raise ValueError('运行组件清单类型不符')
                 if kind == 'dsh':
                     metadata = json.loads((source / 'runtime.json').read_text(encoding='utf-8-sig'))
-                    if metadata.get('source_kind') == OFFICIAL_SOURCE_KIND:
+                    if metadata.get('source_kind') == 'npm_package':
+                        from voice_terminal.dsh.distribution import inspect_runtime, is_current, target_spec
+                        inspect_runtime(program, source, full=True)
+                        if sources[kind] and not is_current(metadata, target_spec(program)):
+                            raise ValueError('DSH（代理宿主）候选与新程序适配要求不符')
+                    elif metadata.get('source_kind') == OFFICIAL_SOURCE_KIND:
                         artifact = load_official_artifact(program)
                         validate_official_runtime(source, artifact)
+                    elif lock.get('distribution', {}).get('source_kind') == 'npm_package':
+                        catalog = json.loads((program / 'config/resources/catalog.json').read_text(encoding='utf-8-sig'))
+                        resource = next(row for row in catalog['resources'] if row['kind'] == 'dsh')
+                        historical = resource['source'].get('official_compatibility', lock)
+                        if (metadata.get('version') != historical['version'] or metadata.get('commit') != historical['commit']
+                                or digest(source / 'manifest.json') != resource.get('legacy_export', {}).get('manifest_sha256')):
+                            raise ValueError('旧代理宿主与保留的兼容记录不一致')
                     elif metadata.get('version') != lock['version'] or metadata.get('commit') != lock['commit']:
-                        raise ValueError('代理宿主版本与程序锁版不一致')
+                        raise ValueError('代理宿主版本与程序兼容配置不一致')
+                    if sources[kind] and metadata.get('source_kind') != 'npm_package' and lock.get('distribution', {}).get('source_kind') == 'npm_package':
+                        raise ValueError('新分发目标不接受旧 DSH（代理宿主）候选；现用旧组件可保留并在组件页迁移')
                 current = output / relative
                 same = current.is_dir() and (current / 'manifest.json').read_bytes() == (source / 'manifest.json').read_bytes()
                 if same:
