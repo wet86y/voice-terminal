@@ -229,7 +229,8 @@ speaker:
   min_speech_ms: 700
   min_window_speech_ratio: 0.40
   # min_turn_speech_ms（整轮最低不重复人声时长）：按 VAD 区间并集计数，
-  # 不累加重叠滑窗中重复的语音；低于门槛时状态为 "unknown"（未知）并直通。
+  # 不累加重叠滑窗中重复的语音；低于门槛时状态为 "unknown"（未知）。
+  # observe（仅标记）放行未知，filter（拦截）仍要求本轮主人已确认。
   # 2 s 的有效人声通常需要约 2.5-3 s 实际录音。提高该值会减少可判定的短语句，
   # 但可降低误接受风险；
   min_turn_speech_ms: 2000

@@ -308,6 +308,43 @@
       ]
     },
     {
+      "resource_id": "campplus-zh-cn-common",
+      "kind": "model",
+      "title": "CAM++ 中文通用声纹模型（可选）",
+      "destination": "speaker/campplus-zh-cn-common",
+      "version": "v1.0.0",
+      "required": false,
+      "source": {
+        "platform": "modelscope",
+        "repo_id": "iic/speech_campplus_sv_zh-cn_16k-common",
+        "revision": "v1.0.0",
+        "page_url": "https://www.modelscope.cn/models/iic/speech_campplus_sv_zh-cn_16k-common",
+        "transfer": {
+          "kind": "modelscope_sdk"
+        },
+        "license_url": "https://www.modelscope.cn/models/iic/speech_campplus_sv_zh-cn_16k-common"
+      },
+      "files": [
+        {
+          "path": "campplus_cn_common.bin",
+          "size_bytes": 28036335,
+          "sha256": "3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8"
+        }
+      ],
+      "generated_assets": [
+        {
+          "path": "campplus.onnx",
+          "generator": "scripts/prepare_campplus.py（CAM++ 模型准备脚本）",
+          "description": "从固定 ModelScope（模型仓库）revision（修订版）导出，80 维 FBank（梅尔滤波器组）输入、192 维嵌入向量输出、动态帧轴；默认 CPU（中央处理器）用途。"
+        },
+        {
+          "path": "manifest.json",
+          "generator": "scripts/prepare_campplus.py（CAM++ 模型准备脚本）",
+          "description": "记录权重摘要、固定来源版本、导出定义与 PyTorch（张量框架）/ONNX（模型交换格式）数值一致性结果。"
+        }
+      ]
+    },
+    {
       "resource_id": "smart-turn",
       "kind": "model",
       "title": "SmartTurn 语音结束判断模型",

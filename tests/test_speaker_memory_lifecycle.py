@@ -19,6 +19,7 @@ def runtime_stub():
     runtime = SessionRuntime.__new__(SessionRuntime)
     runtime.config = SimpleNamespace(
         speaker_model_path=Path("test-model.onnx"),
+        speaker=SimpleNamespace(model_id="wespeaker-cnceleb-resnet34"),
         audio=SimpleNamespace(sample_rate=16000),
         compute=SimpleNamespace(devices={"wespeaker": "cpu"}, fallback_devices={}),
     )
@@ -84,7 +85,8 @@ def test_cache_release_keeps_inflight_native_call_alive_until_completion():
             assert engine.session is not None
             return (1.0, 0.0)
 
-        with patch("voice_terminal.server.speaker_runtime.WeSpeakerOnnxEngine", Engine):
+        with patch("voice_terminal.server.speaker_runtime.create_speaker_engine",
+                   side_effect=lambda _model_id, model_path, **kwargs: Engine(model_path, **kwargs)):
             task = asyncio.create_task(asyncio.to_thread(native_call))
             try:
                 assert await asyncio.to_thread(started.wait, 5)

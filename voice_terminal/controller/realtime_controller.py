@@ -697,7 +697,9 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
 
     async def _new_turn(self, frame: AudioFrame) -> None:
         turn_id = self.turns.begin()
-        self._speaker_turn_start_sample = self._speech_start_sample or frame.start_sample
+        self._speaker_turn_start_sample = (
+            self._speech_start_sample if self._speech_start_sample is not None else frame.start_sample
+        )
         self.state.clear_current()
         self.conversation.begin_turn(turn_id)
         self.workspace = ws = TurnWorkspace(
@@ -707,6 +709,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         )
         if self.speaker_router is not None:
             self.speaker_router.reset(turn_id=turn_id, generation=ws.generation)
+        self._prime_speaker_turn_audio(ws, frame)
         ws.timings["turn_started"] = ws.started_at
         self._turn_timings[turn_id] = ws.timings
         if len(self._turn_timings) > 64:
@@ -736,6 +739,28 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         await self._detail("turn.started")
         await self._state_event(TerminalState.LISTENING, listening=True, turn_id=turn_id)
 
+    def _prime_speaker_turn_audio(self, ws: TurnWorkspace, frame: AudioFrame) -> None:
+        """补送 VAD（语音活动检测）回溯起点后的音频，当前帧由正常路径发送。"""
+        client = getattr(self, "speaker_client", None)
+        start = self._speaker_turn_start_sample
+        if client is None or start is None or ws.speaker_mode == SpeakerMode.OFF:
+            return
+        # 仅补送候选起点到当前帧之前的有界缓存；禁止引入上一位说话人的前缀。
+        # speech（人声活动标记）依据检测器已报告的回溯起点，补齐事件延迟期间的语音。
+        for previous in self._recent:
+            left = max(start, previous.start_sample)
+            right = min(frame.start_sample, previous.end_sample)
+            if right <= left:
+                continue
+            pcm = previous.pcm[(left - previous.start_sample) * 2:(right - previous.start_sample) * 2]
+            submitted = client.submit_frame(
+                turn_id=ws.turn_id, generation=ws.generation, pcm=pcm,
+                start_sample=left, end_sample=right, speech=True,
+            )
+            if not submitted and client.degraded:
+                self.state.set_service("speaker", "DEGRADED")
+                break
+
     def _new_sub(self, pcm: bytes) -> None:
         self._sub_sequence += 1
         self._sub_id = f"{self.workspace.turn_id}/asr/{self._sub_sequence}"
@@ -757,7 +782,9 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
 
     async def _resume(self, frame: AudioFrame) -> None:
         ws = self.workspace
-        self._speaker_turn_start_sample = self._speech_start_sample or frame.start_sample
+        self._speaker_turn_start_sample = (
+            self._speech_start_sample if self._speech_start_sample is not None else frame.start_sample
+        )
         # A same-turn continuation used to clear the frozen answer here even
         # when the Episode output had already atomically held it before the
         # first real PCM callback. That discarded a valid text/TTS candidate
@@ -778,6 +805,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             # generation must therefore be rejected just like a stale ASR or
             # refinement callback.
             self.speaker_router.reset(turn_id=ws.turn_id, generation=ws.generation)
+        self._prime_speaker_turn_audio(ws, frame)
         stopped = self._stop_generation()
         if stopped:
             await asyncio.gather(*stopped, return_exceptions=True)

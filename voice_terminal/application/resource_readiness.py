@@ -26,7 +26,8 @@ def required_model_resources(config: Any) -> dict[str, list[str]]:
     if analysis:
         requirements["analysis"] = analysis
     if config.speaker.mode != "off" or config.speaker.owner_only_barge_in:
-        requirements["speaker"] = ["wespeaker-cnceleb-resnet34"]
+        # model_id（声纹模型标识）：可选模型也必须检查自身资源，不能固定检查默认权重。
+        requirements["speaker"] = [getattr(config.speaker, "model_id", "wespeaker-cnceleb-resnet34")]
     return requirements
 
 
