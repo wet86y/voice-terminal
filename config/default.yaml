@@ -75,13 +75,12 @@ dsh:
   restart_limit: 2
   restart_delay_ms: 1000
 
-# Episode-scoped Markdown context. Files are read when a new Agent episode
-# starts and remain frozen for that episode.
+# persona（人格资料）：首次激活读取，显式保存后更新后续请求快照。
 persona:
   directory: config/persona
   personality_file: personality.md
   user_file: user.md
-  instructions_file: instructions.md
+  instructions_file: instructions.md  # instructions_file（历史兼容字段）：不加载；自定义指令在产品设置中配置。
 
 audio:
   # input_device（麦克风）、output_device（扬声器）始终跟随系统默认设备。

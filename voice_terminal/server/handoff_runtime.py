@@ -146,7 +146,7 @@ class HandoffRuntimeMixin:
             export_id = str(uuid4())
             while True:
                 response = await session.client.call("session.export", session._envelope(
-                    request_id=str(uuid4()), export_id=export_id, offset=offset, limit=100, total=total))
+                    request_id=str(uuid4()), export_id=export_id, offset=offset, limit=500, total=total))
                 if response.get("result") != "accepted" or not isinstance(response.get("records"), list):
                     raise RuntimeError("DSH（后台代理）完整会话导出失败，保留原会话。")
                 rows.extend(response["records"])
@@ -220,19 +220,17 @@ class HandoffRuntimeMixin:
             base_url=provider_cfg.base_url, model=provider_cfg.model, api_key=key,
             timeout_ms=provider_cfg.timeout_ms)
         archive_ids = tuple(self._archive_backlog)
-        voice, dsh = list(archive.voice_records), list(archive.dsh_records)
+        archives = []  # archives（按归档顺序读取的完整快照）。
         for archive_id in archive_ids:
             if archive_id == archive.archive_id:
                 continue
             directory = self.paired_archives.root / archive_id
             self.paired_archives.require_complete(directory)
             raw = json.loads((directory / "source.json").read_text(encoding="utf-8"))
-            reference = {"archive_id": archive_id, "manifest_path": str(directory / "manifest.json"),
-                         "voice_path": str(directory / "voice.md"), "dsh_path": str(directory / "dsh.md")}
-            voice.extend({"archive": reference, "record": item} for item in raw["voice"])
-            dsh.extend({"archive": reference, "record": item}
-                       for item in self.paired_archives.filter_dsh(raw["dsh"]))
-        material = PairedArchive(archive.archive_id, archive.directory, voice, dsh)
+            archives.append(PairedArchive(archive_id, directory, raw["voice"],
+                                          self.paired_archives.filter_dsh(raw["dsh"])))
+        archives.append(archive)
+        material = self.paired_archives.organizer_material(archives)
         try:
             try:
                 # organize_timeout_ms（整理整体期限）不继承后台任务的无期限策略。

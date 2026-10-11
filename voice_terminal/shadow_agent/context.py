@@ -11,9 +11,10 @@ from ..custom_instructions import shadow_projection
 class ShadowContextProjector:
     """Expose semantic session facts without the voice runtime prompt/tail.
 
-    The environment frame is frozen when the session projector is created so
-    it cannot disturb the cache prefix on later wakes.  The ledger owns the
-    monotonic input revision and deliberately excludes Shadow-origin events.
+    The environment frame stays stable between explicit product-setting or
+    handoff updates; those updates also publish a revision for connected
+    backends.  The ledger owns the monotonic input revision and deliberately
+    excludes Shadow-origin events.
     """
 
     def __init__(self, ledger: Any, *, user_profile: str = "", continuity_document: str = "",

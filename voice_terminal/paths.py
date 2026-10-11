@@ -151,8 +151,9 @@ class AppPaths:
         persona_templates = self.program_root / "config/templates/persona"
         if not persona_templates.is_dir():
             persona_templates = self.program_root / "config/persona"
+        # instructions.md（历史指令文档）不再加载；新工作区只补有效资料模板。
         templates += [(persona_templates / name, self.persona / name)
-                      for name in ("personality.md", "user.md", "instructions.md")]
+                      for name in ("personality.md", "user.md")]
         for source, target in templates:
             if source.is_file() and not target.exists():
                 shutil.copyfile(source, target)

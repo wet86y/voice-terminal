@@ -520,7 +520,7 @@ class PersonaConfig:
     directory: Path = Path("config/persona")
     personality_file: str = "personality.md"
     user_file: str = "user.md"
-    instructions_file: str = "instructions.md"
+    instructions_file: str = "instructions.md"  # instructions_file（历史兼容字段）：不参与模型上下文。
 
 
 @dataclass(frozen=True)
