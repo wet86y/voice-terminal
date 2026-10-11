@@ -47,7 +47,6 @@ class EpisodeController(RealtimeController):
         self._refinement_agent_events: set[str] = set()
         self._committed_workspaces: dict[str, object] = {}
         self._settled_turns: set[str] = set()
-        self._speaker_vetoed_turns: set[str] = set()
         self._owner_barge_candidate_id: str | None = None
         self._owner_barge_start_sample: int | None = None
         self._owner_barge_started_at: float | None = None
@@ -160,10 +159,20 @@ class EpisodeController(RealtimeController):
         return runtime
 
     def _speaker_admit_turn(self, turn_id: str) -> bool:
-        if turn_id in self._speaker_vetoed_turns:
-            return False
+        ws = self.workspace
+        if ws is not None and ws.turn_id == turn_id and ws.speaker_routing_finalized:
+            if ws.speaker_mode != "filter":
+                return True
+            decision = ws.speaker_decision or {}
+            return bool(
+                not ws.speaker_blocked
+                and decision.get("turn_id") == ws.turn_id
+                and decision.get("generation") == ws.generation
+                and decision.get("state") == "owner_confirmed"
+                and decision.get("route") == "main"
+                and not decision.get("degraded", False)
+            )
         if self.speaker_vetoes_turn(turn_id):
-            self._speaker_vetoed_turns.add(turn_id)
             late = getattr(self.episode, "active_request_source_turn_id", None) == turn_id
             logger.info("speaker.request_veto turn_id=%s reason=rolling_non_owner late=%s",
                         turn_id, late)
@@ -171,13 +180,14 @@ class EpisodeController(RealtimeController):
         return True
 
     def _speaker_defer_turn(self, turn_id: str) -> bool:
-        """filter（拦截模式）等本段最终身份，禁止用尚未结算的转写唤起主模型。"""
+        """filter（拦截模式）下将本轮全部未结算身份暂缓至最终路由。"""
         ws = self.workspace
         if (ws is None or ws.turn_id != turn_id or ws.speaker_mode != "filter"
-                or ws.speaker_routing_finalized or turn_id in self._speaker_vetoed_turns):
+                or ws.speaker_routing_finalized):
             return False
-        if self.speaker_vetoes_turn(turn_id):
-            return False
+        # rolling（滚动）和 router（路由器）状态都可能在后续窗口中变化。
+        # 临时 NON_OWNER（非主人）若直接进入 admit（准入）否决，会让 Agent
+        # 删除尚未最终结算的输入，之后即使本轮聚合确认主人也无法恢复该待办。
         return True
 
     def _speaker_heartbeat_pulse(self, pulse) -> None:
@@ -787,28 +797,25 @@ class EpisodeController(RealtimeController):
         if ws.token != token or self.workspace is not ws:
             return True
         ws.speaker_routing_finalized = True
-        rolling_veto = (ws.turn_id in getattr(self, "_speaker_vetoed_turns", set())
-                        or self.speaker_vetoes_turn(ws.turn_id))
         mode = str(getattr(ws, "speaker_mode", getattr(self, "speaker_mode", "off")))
-        final_veto = mode == "filter" and (
-            speaker_decision is None or speaker_decision.route != "main"
-            or speaker_decision.state != SpeakerState.OWNER_CONFIRMED
+        final_owner_confirmed = bool(
+            speaker_decision is not None
+            and speaker_decision.turn_id == ws.turn_id
+            and speaker_decision.generation == ws.generation
+            and speaker_decision.state == SpeakerState.OWNER_CONFIRMED
+            and speaker_decision.route == "main"
+            and not speaker_decision.degraded
         )
-        if mode == "filter" and (rolling_veto or final_veto) and ws.final_text:
-            self._speaker_vetoed_turns.add(ws.turn_id)
+        final_veto = mode == "filter" and not final_owner_confirmed
+        if mode == "filter" and final_veto and ws.final_text:
             decision_payload = (speaker_decision.to_payload() if speaker_decision is not None else {})
-            if rolling_veto:
-                decision_payload = dict(decision_payload)
-                decision_payload.update({"route": "ambient", "reason": "rolling_non_owner",
-                                         "state": "non_owner_confirmed"})
-                ws.speaker_decision = decision_payload
             if self.ambient_store is not None:
                 self.ambient_store.append({
                     "turn_id": ws.turn_id,
                     "text": ws.final_text,
-                    "speaker_state": decision_payload.get("state", "non_owner_confirmed"),
+                    "speaker_state": decision_payload.get("state", "unknown"),
                     "similarity": decision_payload.get("similarity"),
-                    "reason": decision_payload.get("reason", "rolling_non_owner"),
+                    "reason": decision_payload.get("reason", "speaker_insufficient_evidence"),
                     "refined_text": ws.refined_text,
                 })
             ws.speaker_blocked = True
@@ -822,7 +829,6 @@ class EpisodeController(RealtimeController):
             # never retain or emit that output resource.
             await self._cancel_tts_prewarm(ws.turn_id)
             await self._retire_committed_input(ws)
-            self._speaker_vetoed_turns.discard(ws.turn_id)
             # A filtered transcript is an ambient-only record, not the active
             # user input shown in the ordinary conversation projection.
             self.state.current.update(final_text="", partial_text="")
@@ -1323,7 +1329,6 @@ class EpisodeController(RealtimeController):
         await self._stop_speaker_sensor()
         self._clear_owner_barge_candidate()
         self._owner_barge_expired = False
-        self._speaker_vetoed_turns.clear()
         self.state.clear_current()
         self.state.agent = {}
         if self.wake_always_on and self.state.listening:

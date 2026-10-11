@@ -15,9 +15,11 @@ from typing import Any
 if __package__ in (None, ""):
     sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())))
 
-from .engine import InsufficientAudioError, WeSpeakerOnnxEngine
+from .engine import InsufficientAudioError
+from .factory import create_speaker_engine
 from .quality import base_window_quality
 from .protocol import decode_pcm
+from .windows import speaker_window_ranges
 from ..config import load_config
 from ..paths import AppPaths
 from ..core.events import utc_now_iso
@@ -36,10 +38,11 @@ class SpeakerWorkerEngine:
                  window_ms: int = 2000, step_ms: int = 500,
                  min_speech_ms: int = 700,
                  min_window_speech_ratio: float = 0.40,
+                 model_id: str = "wespeaker-cnceleb-resnet34",
                  device: str = "cpu", fallback_device: str = "cpu") -> None:
         self.model_path = model_path
-        self.model = WeSpeakerOnnxEngine(
-            model_path, sample_rate=sample_rate,
+        self.model = create_speaker_engine(
+            model_id, model_path, sample_rate=sample_rate,
             device=device, fallback_device=fallback_device,
         )
         self.sample_rate = sample_rate
@@ -139,8 +142,8 @@ class SpeakerWorkerEngine:
         if vad_supplied:
             speech_samples = sum(range_end - range_start for range_start, range_end in speech_ranges)
             speech_ms = int(speech_samples * 1000 / self.sample_rate)
-            window_ms = max(1, self.window_samples * 1000 // self.sample_rate)
-            speech_ratio: float | None = round(min(1.0, speech_ms / window_ms), 4)
+            window_samples = max(1, end - start)
+            speech_ratio: float | None = round(min(1.0, speech_samples / window_samples), 4)
             if quality == "ready" and speech_ratio < self.min_window_speech_ratio:
                 # A window made mostly of noise or another source must not
                 # produce an embedding, otherwise background audio would be
@@ -299,21 +302,27 @@ class SpeakerWorkerEngine:
         # ``insufficient_audio`` and can never become a non-owner decision.
         if buffer:
             sample_count = len(buffer) // 2
-            if sample_count >= self.window_samples and self.starts[key] + sample_count > self.last_emitted[key]:
+            final_range = speaker_window_ranges(
+                sample_count, self.window_samples, self.step_samples,
+            )[-1]
+            final_start, final_end = final_range
+            if (sample_count >= self.window_samples
+                    and self.starts[key] + final_end > self.last_emitted[key]):
                 # Flush the newest full window even when the turn ended
-                # between the regular step points.
-                end = self.starts[key] + sample_count
-                start = end - self.window_samples
+                # between regular step points, as in the shared test-window rule.
+                end = self.starts[key] + final_end
+                start = self.starts[key] + final_start
                 result.append(self._observation(
                     turn_id=turn_id, generation=generation,
                     start=start, end=end,
-                    pcm=bytes(buffer[-self.window_samples * 2:]),
+                    pcm=bytes(buffer[final_start * 2:final_end * 2]),
                 ))
             elif sample_count < self.window_samples:
-                start = self.starts[key]
+                start = self.starts[key] + final_start
                 result.append(self._observation(
                     turn_id=turn_id, generation=generation,
-                    start=start, end=start + sample_count, pcm=bytes(buffer),
+                    start=start, end=self.starts[key] + final_end,
+                    pcm=bytes(buffer[final_start * 2:final_end * 2]),
                 ))
         self.buffers.pop((turn_id, generation), None)
         self.starts.pop((turn_id, generation), None)
@@ -343,6 +352,7 @@ async def run(config_path: Path | None = None) -> None:
         window_ms=config.speaker.window_ms, step_ms=config.speaker.step_ms,
         min_speech_ms=config.speaker.min_speech_ms,
         min_window_speech_ratio=config.speaker.min_window_speech_ratio,
+        model_id=config.speaker.model_id,
         device=config.compute.devices.get("wespeaker", "cpu"),
         fallback_device=config.compute.fallback_devices.get("wespeaker", "cpu"),
     )

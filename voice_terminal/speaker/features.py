@@ -40,6 +40,12 @@ import numpy as np
 #: :meth:`voice_terminal.speaker.registry.SpeakerProfileStore.load`.
 FRONTEND_VERSION = "kaldi-fbank-hamming-cmn-v2"
 
+# CAM++ uses 3D-Speaker's torchaudio Kaldi FBank defaults (Povey window) and
+# utterance-level mean normalization. Keep its identity separate from the
+# existing WeSpeaker Hamming frontend so enrolled profiles are not reused
+# across incompatible embeddings.
+CAMPLUS_FRONTEND_VERSION = "3d-speaker-kaldi-fbank-povey-cmn-v1"
+
 _EPS32 = float(np.finfo(np.float32).eps)
 
 # WeSpeaker's ONNX graph reduces with an unbiased variance over the pooled time
@@ -169,6 +175,57 @@ def pcm_to_fbank(pcm: bytes, *, sample_rate: int = 16000, num_mels: int = 80,
     if cmn:
         features = features - features.mean(axis=0, keepdims=True)
     return features
+
+
+def pcm_to_campplus_fbank(pcm: bytes, *, sample_rate: int = 16000) -> np.ndarray:
+    """Return CAM++'s official 3D-Speaker ``FBank(80, mean_nor=True)`` input.
+
+    输入为小端序 int16 PCM（16位脉冲编码调制音频）；先转换为与
+    ``torchaudio.load``（torchaudio音频读取函数）相同的归一化浮点波形，再计算
+    Kaldi FBank（Kaldi梅尔滤波器组）。其默认参数包括 Povey window（Povey窗）、
+    25 ms（毫秒）窗长、10 ms（毫秒）帧移、snip_edges（边缘截断）和 dither（抖动）为0，
+    共80个梅尔滤波器。最后只执行按时间均值归一化，与官方推理处理器一致。
+
+    This is intentionally a separate function: the existing WeSpeaker model
+    was trained with a Hamming window and must keep its existing output.
+    """
+    if sample_rate != 16000:
+        raise ValueError("CAM++ 中文通用模型只接收16000 Hz（赫兹）采样率音频")
+    if len(pcm) % 2:
+        raise ValueError("PCM（脉冲编码调制音频）必须包含完整的 int16（16位）样本")
+    if not pcm:
+        raise InsufficientAudioError("音频为空")
+
+    from ..audio.allocation import pcm_samples
+
+    samples = pcm_samples(pcm, sample_rate=sample_rate, precision="float32", amplitude="normalized")
+    if samples.size < int(sample_rate * 0.025):
+        raise InsufficientAudioError("CAM++ FBank（梅尔滤波器组）至少需要25 ms（毫秒）音频")
+    try:
+        import torch  # type: ignore
+        import torchaudio.compliance.kaldi as kaldi  # type: ignore
+    except ImportError as exc:  # pragma: no cover - deployment dependency failure
+        raise RuntimeError("CAM++ 前端（输入特征提取）需要 PyTorch（张量框架）与 torchaudio（音频特征库）") from exc
+
+    waveform = torch.from_numpy(np.ascontiguousarray(samples)).unsqueeze(0)
+    with torch.no_grad():
+        features = kaldi.fbank(
+            waveform,
+            num_mel_bins=80,
+            sample_frequency=sample_rate,
+            dither=0.0,
+        )
+        features = features - features.mean(dim=0, keepdim=True)
+    # The first TDNN layer halves the time axis with ceil padding; at least two
+    # pooled samples are needed for the model's unbiased statistics variance.
+    if int(features.shape[0]) < 3:
+        raise InsufficientAudioError(
+            f"CAM++ 无偏统计池化需要至少3帧 FBank（梅尔特征帧）；当前为 {features.shape[0]} 帧"
+        )
+    result = features.cpu().numpy().astype(np.float32, copy=False)
+    if result.ndim != 2 or result.shape[1] != 80 or not np.isfinite(result).all():
+        raise ValueError("CAM++ 前端（输入特征提取）返回了无效的80维特征")
+    return result
 
 
 def probe_pcm(sample_rate: int = 16000, seconds: float = 2.0) -> bytes:

@@ -10,7 +10,14 @@ try:
 except ImportError:  # pragma: no cover
     np = None  # type: ignore[assignment]
 
-from .features import FRONTEND_VERSION, InsufficientAudioError, pcm_to_fbank, probe_pcm
+from .features import (
+    CAMPLUS_FRONTEND_VERSION,
+    FRONTEND_VERSION,
+    InsufficientAudioError,
+    pcm_to_campplus_fbank,
+    pcm_to_fbank,
+    probe_pcm,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +25,7 @@ __all__ = [
     "FRONTEND_VERSION",
     "InsufficientAudioError",
     "SpeakerModelError",
+    "CamPlusPlusOnnxEngine",
     "WeSpeakerOnnxEngine",
     "pcm_to_fbank",
 ]
@@ -29,6 +37,9 @@ class SpeakerModelError(RuntimeError):
 
 class WeSpeakerOnnxEngine:
     """Optional ONNX embedding engine; importing it never makes the runtime mandatory."""
+
+    backend_name = "WeSpeaker"  # backend_name（后端名称）：用于报告加载异常。
+    device_model_key = "wespeaker"  # device_model_key（计算设备配置键）：各声纹后端共用既有配置。
 
     def __init__(self, model_path: Path, *, sample_rate: int = 16000, model_version: str = "",
                  device: str = "cpu", fallback_device: str = "cpu") -> None:
@@ -70,7 +81,7 @@ class WeSpeakerOnnxEngine:
             from ..compute import device_candidates
             last_error: Exception | None = None
             session = None
-            for candidate in device_candidates(self.requested_device, "wespeaker", self.fallback_device):
+            for candidate in device_candidates(self.requested_device, self.device_model_key, self.fallback_device):
                 try:
                     if candidate == "cuda":
                         ort.preload_dlls()  # preload_dlls（预加载显卡运行库）：独立声纹进程也必须执行。
@@ -130,7 +141,7 @@ class WeSpeakerOnnxEngine:
             raise
         except Exception as exc:
             self.session = None
-            self.error = f"WeSpeaker load failed: {type(exc).__name__}: {exc}"
+            self.error = f"{self.backend_name} load failed: {type(exc).__name__}: {exc}"
             raise SpeakerModelError(self.error) from exc
 
     def _run(self, features: Any) -> tuple[float, ...]:
@@ -156,10 +167,14 @@ class WeSpeakerOnnxEngine:
         with registry.lease("speaker_native_pcm", pcm, release_on="native_complete"), conversion_scope(pcm, self.sample_rate, enabled=self._managed_audio):
             return self._embed_owned_pcm(pcm)
 
+    def _features_for_pcm(self, pcm: bytes) -> Any:
+        """将 PCM（脉冲编码调制音频）转为当前模型训练时使用的声学特征格式。"""
+        return pcm_to_fbank(pcm, sample_rate=self.sample_rate)
+
     def _embed_owned_pcm(self, pcm: bytes) -> tuple[float, ...]:
         if not self.loaded:
             raise SpeakerModelError(self.error or "model not loaded")
-        features = pcm_to_fbank(pcm, sample_rate=self.sample_rate)
+        features = self._features_for_pcm(pcm)
         if features.shape[0] < 1:
             raise InsufficientAudioError("audio produced no feature frames")
         return self._run(features)
@@ -172,8 +187,7 @@ class WeSpeakerOnnxEngine:
         the parameter list identical.
         """
         if self._probe is None:
-            self._probe = self._run(pcm_to_fbank(probe_pcm(self.sample_rate),
-                                                 sample_rate=self.sample_rate))
+            self._probe = self._run(self._features_for_pcm(probe_pcm(self.sample_rate)))
         return self._probe
 
     @staticmethod
@@ -193,3 +207,22 @@ class WeSpeakerOnnxEngine:
         # Do not shift this raw score into [0, 1], which would make the 0.50
         # product baseline equivalent to accepting every non-negative pair.
         return max(-1.0, min(1.0, cosine))
+
+
+class CamPlusPlusOnnxEngine(WeSpeakerOnnxEngine):
+    """CAM++ ONNX（开放神经网络交换格式）声纹引擎，共享归一化嵌入接口。
+
+    It overrides the frontend identity and extraction only. ModelScope's
+    200k-speaker checkpoint（20万说话人训练模型）uses the 3D-Speaker Kaldi
+    FBank（梅尔滤波器组）Povey window（Povey窗）frontend（前端特征提取）；the
+    existing WeSpeaker backend keeps its Hamming window（汉明窗）frontend.
+    """
+
+    backend_name = "CAM++"
+
+    @property
+    def frontend_version(self) -> str:
+        return CAMPLUS_FRONTEND_VERSION
+
+    def _features_for_pcm(self, pcm: bytes) -> Any:
+        return pcm_to_campplus_fbank(pcm, sample_rate=self.sample_rate)

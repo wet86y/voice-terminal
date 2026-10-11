@@ -19,11 +19,12 @@ from ..speaker.client import SpeakerWorkerClient, SpeakerWorkerError
 from ..speaker.contracts import SpeakerObservation
 from ..speaker.enrollment import ENROLLMENT_REQUIRED_SEGMENTS, EnrollmentRejectedError, centroid_of, check_segments, enrollment_prompts
 from ..speaker.enrollment_capture import MAX_SEGMENT_SECONDS, MIN_SEGMENT_SECONDS, CaptureControl, EnrollmentCaptureError, capture_segment, speech_ms_for_pcm, voiced_ranges_for_windows
-from ..speaker.features import FRONTEND_VERSION
 from ..speaker.quality import base_window_quality
 from ..speaker.registry import ENROLLMENT_MAX_CLIPPED_RATIO
 from ..speaker.engine import WeSpeakerOnnxEngine
+from ..speaker.factory import create_speaker_engine
 from ..speaker.recording import decode_audio_bytes
+from ..speaker.windows import speaker_window_ranges
 
 logger = logging.getLogger(__name__)
 
@@ -591,8 +592,8 @@ class SpeakerRuntimeMixin:
         with getattr(self, "_speaker_engine_lock", nullcontext()):
             engine = self._speaker_engine
             if engine is None or engine.model_path != self.config.speaker_model_path:
-                engine = WeSpeakerOnnxEngine(
-                    self.config.speaker_model_path,
+                engine = create_speaker_engine(
+                    self.config.speaker.model_id, self.config.speaker_model_path,
                     sample_rate=self.config.audio.sample_rate,
                     device=self.config.compute.devices.get("wespeaker", "cpu"),
                     fallback_device=self.config.compute.fallback_devices.get("wespeaker", "cpu"),
@@ -623,7 +624,8 @@ class SpeakerRuntimeMixin:
     def _speaker_runtime_fingerprint(self) -> dict[str, Any]:
         probe = self._speaker_runtime_probe()
         return {
-            "frontend_version": FRONTEND_VERSION,
+            # frontend_version（特征前端版本）必须来自实际引擎，避免跨模型沿用默认指纹。
+            "frontend_version": self._speaker_engine.frontend_version if self._speaker_engine else "",
             "model_id": str(self.config.speaker.model_id),
             "embedding_dim": len(probe) if probe else 0,
         }
@@ -771,11 +773,9 @@ class SpeakerRuntimeMixin:
         step = max(1, self.config.speaker.step_ms * sample_rate // 1000)
         total_samples = len(pcm) // 2
         sampled = [
-            (start, pcm[start * 2:(start + window) * 2])
-            for start in range(0, max(0, total_samples - window) + 1, step)
+            (start, pcm[start * 2:end * 2])
+            for start, end in speaker_window_ranges(total_samples, window, step)
         ]
-        if not sampled and total_samples:
-            sampled = [(0, pcm)]
         engine = self._get_speaker_engine()
         # The same upstream VAD（语音活动检测） frames are intersected with
         # each window, exactly as the live Worker does. The whole-clip duration
@@ -796,11 +796,16 @@ class SpeakerRuntimeMixin:
             window_voiced_ranges, window_speech_measured = [], False
         if not window_speech_measured:
             window_speech_values = [self._speaker_speech_ms(chunk)[0] for _, chunk in sampled]
+            window_speech_sample_values: list[int | None] = [None for _ in sampled]
             window_voiced_ranges = [None for _ in sampled]
         else:
-            window_speech_values = [
-                int(sum(end - start for start, end in ranges) * 1000 // sample_rate)
+            window_speech_sample_values = [
+                int(sum(end - start for start, end in ranges))
                 for ranges in window_voiced_ranges
+            ]
+            window_speech_values = [
+                int(samples * 1000 // sample_rate)
+                for samples in window_speech_sample_values
             ]
 
         minimum_window_speech_ms = self.speaker_router.state_config.min_speech_ms
@@ -813,8 +818,8 @@ class SpeakerRuntimeMixin:
         eligible_window_count = 0
         quality_counts: dict[str, int] = {}
         first_embedding_error: str | None = None
-        for index, ((start, chunk), window_speech_ms, _voiced_ranges) in enumerate(
-                zip(sampled, window_speech_values, window_voiced_ranges), start=1):
+        for index, ((start, chunk), window_speech_ms, window_speech_samples) in enumerate(
+                zip(sampled, window_speech_values, window_speech_sample_values), start=1):
             quality, fallback_speech_ms = base_window_quality(
                 chunk,
                 sample_rate=sample_rate,
@@ -827,7 +832,7 @@ class SpeakerRuntimeMixin:
             if not window_speech_measured:
                 window_speech_ms = fallback_speech_ms
             speech_ratio = (
-                round(min(1.0, window_speech_ms / configured_window_ms), 4)
+                round(min(1.0, int(window_speech_samples or 0) / max(1, len(chunk) // 2)), 4)
                 if window_speech_measured else None
             )
             if quality == "ready":
@@ -886,7 +891,7 @@ class SpeakerRuntimeMixin:
                 "minimum_window_speech_ms": minimum_window_speech_ms,
                 "minimum_window_speech_ratio": minimum_window_speech_ratio,
                 "minimum_turn_speech_ms": self.speaker_router.state_config.min_turn_speech_ms,
-                "frontend_version": FRONTEND_VERSION,
+                "frontend_version": engine.frontend_version,
                 "reason": reason,
                 "anti_spoofing": "unavailable",
             }
@@ -933,7 +938,7 @@ class SpeakerRuntimeMixin:
             "minimum_window_speech_ms": minimum_window_speech_ms,
             "minimum_window_speech_ratio": minimum_window_speech_ratio,
             "minimum_turn_speech_ms": self.speaker_router.state_config.min_turn_speech_ms,
-            "frontend_version": FRONTEND_VERSION,
+            "frontend_version": engine.frontend_version,
             "reason": reason,
             "anti_spoofing": "unavailable",
         }

@@ -100,6 +100,19 @@ class StartupResourceReadinessTests(unittest.TestCase):
         self.assertEqual(requirements["analysis"], ["smart-turn", "sensevoice-small", "fsmn-vad"])
         self.assertEqual(requirements["speaker"], ["wespeaker-cnceleb-resnet34"])
 
+    def test_speaker_readiness_uses_selected_optional_model(self) -> None:
+        config = SimpleNamespace(
+            wake=SimpleNamespace(enabled=False),
+            smart_turn=SimpleNamespace(smart_turn=False, sensevoice=False),
+            speaker=SimpleNamespace(mode="observe", owner_only_barge_in=False,
+                                    model_id="campplus-zh-cn-common"),
+        )
+        self.assertEqual(required_model_resources(config)["speaker"], ["campplus-zh-cn-common"])
+        config.speaker.mode = "off"
+        self.assertNotIn("speaker", required_model_resources(config))
+        config.speaker.owner_only_barge_in = True
+        self.assertEqual(required_model_resources(config)["speaker"], ["campplus-zh-cn-common"])
+
     def test_dsh_readiness_requires_runtime_metadata_and_fixed_entries(self) -> None:
         runtime = self.root / "假程序 中文" / "runtimes" / "dsh"
         missing = inspect_dsh_runtime(

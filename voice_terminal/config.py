@@ -577,7 +577,12 @@ class AppConfig:
 
     @property
     def speaker_model_path(self) -> Path:
-        return self.model_dir / "speaker" / self.speaker.model_id / "cnceleb_resnet34.onnx"
+        # model_id（模型编号）映射到各自导出文件；WeSpeaker 的既有路径保持不变。
+        model_file = {
+            "wespeaker-cnceleb-resnet34": "cnceleb_resnet34.onnx",
+            "campplus-zh-cn-common": "campplus.onnx",
+        }.get(self.speaker.model_id, "model.onnx")
+        return self.model_dir / "speaker" / self.speaker.model_id / model_file
 
     @property
     def speaker_worker_url(self) -> str:
