@@ -337,6 +337,8 @@ impl LaunchContext {
             }
         }
         command.envs(self.environment());
+        // PYTHONDONTWRITEBYTECODE（禁止写入字节码缓存）同时覆盖解释器派生的模型子进程。
+        command.env("PYTHONDONTWRITEBYTECODE", "1");
     }
 
     #[cfg(windows)]

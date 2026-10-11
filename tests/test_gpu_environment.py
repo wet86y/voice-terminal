@@ -83,6 +83,33 @@ def test_refresh_replaces_host_snapshot_through_an_isolated_probe(monkeypatch):
         assert compute.hardware_status()['models']['smart_turn']['gpu_available'] is False
 
 
+@pytest.mark.parametrize('profile,compatible_gpu,current_lock,explicit_registration,expected', [
+    ('cu128', False, False, False, True),
+    ('compatible-private', True, True, False, True),
+    ('compatible-private', True, False, False, False),
+    ('compatible-private', False, True, False, False),
+    ('cpu-private', False, True, False, False),
+    ('compatible-private', True, True, True, False),
+])
+def test_migrated_private_gpu_preserves_backend_capabilities_with_current_lock(
+        tmp_path, monkeypatch, profile, compatible_gpu, current_lock, explicit_registration, expected):
+    import hashlib
+    program=tmp_path/'app';lock=program/'config/runtime/voice-runtime.lock.json'
+    lock.parent.mkdir(parents=True);lock.write_bytes(b'current dependency lock')
+    runtime=tmp_path/'runtimes/python/runtime.json';runtime.parent.mkdir(parents=True)
+    runtime.write_text(json.dumps({'schema':2,'profile':profile,'compatible_gpu':compatible_gpu,
+        'lock_sha256':hashlib.sha256(lock.read_bytes()).hexdigest() if current_lock else 'old'}),encoding='utf-8')
+    if explicit_registration:
+        registration=tmp_path/'data/config/gpu-environment.json';registration.parent.mkdir(parents=True)
+        registration.write_text('{}',encoding='utf-8')
+    monkeypatch.setenv('VOICE_INSTALL_ROOT',str(tmp_path));monkeypatch.setenv('VOICE_DATA_DIR',str(tmp_path/'data'))
+    monkeypatch.setenv('VOICE_PROGRAM_ROOT',str(program));monkeypatch.setenv('VOICE_LAUNCH_CHANNEL','product')
+    monkeypatch.delenv('VOICE_GPU_PROBE',raising=False);monkeypatch.delenv('VOICE_GPU_FALLBACK',raising=False)
+    monkeypatch.setattr(compute,'_capabilities',{'models':{'smart_turn':{'gpu_available':True,'reason':None}}})
+    with patch.object(compute,'_backend_hardware_status',side_effect=AssertionError('复用已有后端检查结果')):
+        assert compute.hardware_status()['models']['smart_turn']['gpu_available'] is expected
+
+
 @pytest.mark.parametrize('provider', ['CPUExecutionProvider', 'CUDAExecutionProvider'])
 def test_actual_model_requires_cuda_nodes_even_if_session_advertises_gpu(monkeypatch, provider, tmp_path):
     class Session:

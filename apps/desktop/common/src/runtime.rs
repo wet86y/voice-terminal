@@ -187,7 +187,9 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
         let result=crate::workspace::verify_tree_with_progress(&old,"manifest.json",&cancel,&mut|phase,done,total|
             progress(&format!("校验现有语音环境：{phase}"),done,total));
         // 取消不能被当成完整性失败并继续下载，也不能把显卡环境改装成处理器环境。
-        resources::check_cancel(&cancel)?;result.is_ok()
+        resources::check_cancel(&cancel)?;
+        if compatible_gpu{if let Err(error)=&result{return Err(format!("现用显卡运行环境完整性校验未通过：{error} 原环境保持不变；请修复或导入当前完整显卡环境后重试。"));}}
+        result.is_ok()
     }else{false};
     if compatible_gpu&&!reusable_environment{return Err("现用显卡运行环境完整性校验未通过，原环境保持不变；请修复或导入当前完整显卡环境后重试。".into());}
     let mut check_args=vec!["--names".into(),serde_json::to_string(&requested).unwrap(),"--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned()];
@@ -203,7 +205,12 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
     let maximum=lock["wheels"].as_array().ok_or("依赖锁无效")?.iter().filter(|item|requested.iter().any(|name|item["name"]==*name)).map(|item|item["size"].as_u64().unwrap_or(0)).sum::<u64>()+lock["python"]["size"].as_u64().unwrap_or(0);
     if crate::workspace::available_space(&context.install)?<maximum.saturating_mul(3){return Err("下载、展开和事务备份空间不足".into());}
     if reusable_environment{
-        progress("复用已校验私有环境",0,0);resources::copy_verified(&old,&stage,&cancel,progress)?;
+        progress("复用已校验私有环境",0,0);
+        // 只复制已经核验的发布文件；开发命令产生的清单外字节码不进入候选环境。
+        let manifest=resources::load(&old.join("manifest.json"))?;
+        let mut files=manifest["files"].as_array().ok_or("组件清单缺少文件集合")?.iter()
+            .map(|file|safe_path(&old,file["path"].as_str().ok_or("清单路径无效")?)).collect::<Result<Vec<_>,String>>()?;
+        files.push(old.join("manifest.json"));resources::copy_selected_verified(&old,&stage,files,&cancel,progress)?;
         prepare_search_paths(&stage)?;
         let inventory=worker(context,&stage.join("python.exe"),"inventory",&check_args,&cancel)?;
         if compatible_gpu{ensure_gpu_core_reuse(&inventory)?;}
