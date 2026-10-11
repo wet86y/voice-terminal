@@ -80,11 +80,11 @@ async function toggleRecording() {
         >注册主人声纹且
         Worker（工作进程）就绪后才能启用拦截。</small
       ><small v-else
-        >拦截会等待本段身份判定；只有确认的主人输入进入对话，未知、非主人及服务不可用时的输入进入环境记录。短句可能因人声证据不足被拦截。</small
+        >拦截会等待本段身份判定；只有确认的主人输入进入对话，其余输入按非主人进入环境记录。短句可能因人声证据不足被拦截。</small
       ></label
     >
     <label class="switch-row"
-      ><div><strong>仅主人可打断</strong><span>身份未知时保留当前播放；确认是主人后停止，最多等待约 2.5 秒。关闭声纹模式时也可单独启用。</span></div><input
+      ><div><strong>仅主人可打断</strong><span>确认是主人后停止播放，其余情况保留播放；身份判断最多等待约 2.5 秒。关闭声纹模式时也可单独启用。</span></div><input
         v-model="speakerForm.owner_only_barge_in"
         type="checkbox"
         role="switch"
@@ -128,28 +128,28 @@ async function toggleRecording() {
             min="0.01"
             max="1"
             step="0.01"
-          /><small>达到此分数且证据充足才确认是主人。</small></label
+          /><small>达到阈值判主人，低于阈值判非主人；证据不足或模型异常也判非主人。</small></label
         ><label class="form-field"
           ><span
-            >非主人确认界限
+            >连续主人放宽量
             <b>{{
-              Number(speakerForm.continuity_threshold).toFixed(2)
+              Number(speakerForm.continuity_relaxation).toFixed(2)
             }}</b></span
           ><input
-            v-model.number="speakerForm.continuity_threshold"
+            v-model.number="speakerForm.continuity_relaxation"
             type="range"
             min="0"
-            max="0.99"
+            max="0.20"
             step="0.01"
           /><small
-            >低于此分数且证据充足才确认是非主人；两阈值之间保持未知。必须低于主人确认阈值。</small
+            >向右增大放宽量，降低连续窗口阈值。当前连续阈值：{{ Math.max(0, Number(speakerForm.confirm_threshold) - Number(speakerForm.continuity_relaxation)).toFixed(2) }}。</small
           ></label
         ><button
           class="ghost-action"
           type="button"
           @click="restoreSpeakerDefaults"
         >
-          恢复默认阈值（0.60 / 0.50）
+          恢复默认（主人阈值 0.60 / 连续放宽 0.10）
         </button>
       </div>
       <p class="instruction-hint">{{ String(speakerStatus.model_id || 'WeSpeaker') }}（声纹模型）使用独立 CPU（中央处理器）工作进程。声纹只在本地旁路观察和路由，不阻塞 VAD（语音活动检测）及 ASR（自动语音识别）；普通请求在未注册、超时或出错时保守放行，主人打断需要确认。</p>
@@ -254,9 +254,7 @@ async function toggleRecording() {
       class="save-button"
       type="button"
       :disabled="
-        saving ||
-        Number(speakerForm.continuity_threshold) >=
-          Number(speakerForm.confirm_threshold)
+        saving
       "
       @click="saveSpeaker"
     >

@@ -35,10 +35,12 @@ const emit = defineEmits<{
   mode: [value: ReasoningMode]; // mode（切换运行模式）。
   settings: []; // settings（打开设置页面）。
   console: []; // console（打开代理控制台）。
+  approval: [approvalId: string, runSeq: number, approved: boolean]; // approval（同意或拒绝本次权限请求）。
 }>();
 const conversation = ref<HTMLElement | null>(null);
 const conversationStream = ref<HTMLElement | null>(null); // conversationStream（气泡内容容器）：观察内容高度而非只观察视口。
 const trace = ref<HTMLElement | null>(null);
+const pendingApproval = computed(() => props.model.shadow.trace.find(item => item.approvalPending && item.approvalId)); // pendingApproval（优先展示的待决权限）。
 const voiceColumn = ref<HTMLElement | null>(null);
 const sessionActive = computed(() => props.model.sessionActive ?? ['listening', 'thinking', 'speaking'].includes(props.model.state));
 const runtimeLabels: Record<string, string> = { // runtimeLabels（运行状态的中文名称）。
@@ -128,7 +130,7 @@ watch(
 );
 watch(
   () => props.model.shadow.trace,
-  () => scheduleScroll("trace"),
+  () => { if (!pendingApproval.value) scheduleScroll("trace"); },
   { deep: true, flush: "post" },
 );
 onMounted(() => {
@@ -181,16 +183,21 @@ onBeforeUnmount(() => {
           <p v-if="!model.shadow.trace.length" class="shadow-region-placeholder">
             {{ model.shadow.status === "运行中" ? "等待 DSH 动作输出" : "等待 DSH 运行" }}
           </p>
-          <div v-else class="trace-current-activity">
-            <header class="trace-current-heading">
-              <i class="trace-current-mark" aria-hidden="true"></i>
-              <strong>{{ model.shadow.trace[0]?.title }}</strong>
-              <small>{{ model.shadow.trace[0]?.status }}</small>
-            </header>
-            <p v-if="model.shadow.trace[0]?.text" class="trace-current-text">
-              {{ model.shadow.trace[0]?.text }}
-            </p>
+          <div v-else-if="pendingApproval" class="trace-permission-content" role="alert">
+            <strong>需要授权</strong>
+            <p class="trace-current-text">{{ pendingApproval.text }}</p>
           </div>
+          <div v-else class="trace-activity-list">
+            <details v-for="(item, index) in model.shadow.trace" :key="item.key" class="trace-activity" :open="index === model.shadow.trace.length - 1">
+              <summary class="trace-current-heading"><i class="trace-current-mark" aria-hidden="true"></i><strong>{{ item.title }}</strong><small>{{ item.status }}</small></summary>
+              <p v-if="item.text" class="trace-current-text">{{ item.text }}</p>
+              <small class="trace-activity-time">{{ item.time }}</small>
+            </details>
+          </div>
+        </div>
+        <div v-if="pendingApproval" class="trace-permission-actions">
+          <button class="save-button" type="button" :disabled="!!model.shadow.approvalBusy" @click="emit('approval', pendingApproval.approvalId!, pendingApproval.runSeq!, true)">{{ model.shadow.approvalBusy ? '提交中…' : '同意' }}</button>
+          <button class="outline-button" type="button" :disabled="!!model.shadow.approvalBusy" @click="emit('approval', pendingApproval.approvalId!, pendingApproval.runSeq!, false)">拒绝</button>
         </div>
       </section>
       <section class="shadow-event shadow-region">

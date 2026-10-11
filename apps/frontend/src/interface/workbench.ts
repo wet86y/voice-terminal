@@ -46,7 +46,11 @@ export interface WorkbenchModel {
       text?: string;
       status: string;
       time: string;
+      approvalId?: string; // approvalId（待决权限标识）。
+      runSeq?: number; // runSeq（所属运行序号）。
+      approvalPending?: boolean; // approvalPending（权限是否仍待决定）。
     }>;
+    approvalBusy?: string; // approvalBusy（正在提交决定的请求）。
     event?: string;
   };
 }

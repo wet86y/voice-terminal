@@ -13,6 +13,7 @@ from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.agent.persona import PersonaDocuments
 from voice_terminal.agent.scheduler import AgentDecisionScheduler
 from voice_terminal.config import AppConfig, PersonaConfig
+from voice_terminal.dsh.bridge import DshShadowAgentSession
 from voice_terminal.controller.episode_controller import EpisodeController
 from voice_terminal.server.product import ProductSettingsStore
 from voice_terminal.server.websocket import SessionRuntime, create_app
@@ -51,6 +52,32 @@ def live_controller(runtime):
     )
     runtime.controller = controller
     return controller
+
+
+def test_dsh_approval_requires_host_auth_and_rejects_stale_requests(runtime, monkeypatch):
+    async def run():
+        monkeypatch.setenv("VOICE_APP_INTERNAL_TOKEN", "approval-test-token")
+        session = object.__new__(DshShadowAgentSession)
+        session.decide_approval = AsyncMock(return_value={"result": "accepted"})
+        runtime.shadow_session = session
+        app = create_app(runtime, product_settings=runtime.product_settings)
+        payload = {"approval_id": "request-demo", "run_seq": 2, "decision": "rejected"}
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            endpoint = "/internal/application/dsh-approval"
+            response = await client.post(endpoint, json=payload)
+            assert response.status_code == 403
+            session.decide_approval.assert_not_awaited()
+            headers = {"Authorization": "Bearer approval-test-token"}
+            response = await client.post(endpoint, json={**payload, "run_seq": True}, headers=headers)
+            assert response.status_code == 422
+            response = await client.post(endpoint, json=payload, headers=headers)
+            assert response.status_code == 200
+            session.decide_approval.assert_awaited_once_with("request-demo", "rejected", 2)
+            session.decide_approval.return_value = {"result": "stale"}
+            response = await client.post(endpoint, json=payload, headers=headers)
+            assert response.status_code == 409
+    asyncio.run(run())
 
 
 def test_wake_save_replaces_worker_while_listening_without_a_new_session(runtime):
@@ -219,7 +246,7 @@ def test_loading_settings_apply_at_session_initialization_without_listening(runt
             assert runtime._pending_product_settings is None
             assert runtime.config.agent.final_silence_ms == 45_000
             assert runtime.config.speaker.confirm_threshold == .65
-            assert runtime.speaker_router.state_config.continuity_threshold == .35
+            assert runtime.speaker_router.state_config.continuity_threshold == .45
             assert not runtime.state.listening
             if runtime._quiet_clock_task is not None:
                 runtime._quiet_clock_task.cancel()

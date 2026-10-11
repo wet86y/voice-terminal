@@ -89,6 +89,49 @@ afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
+  it('声纹阈值只保存页面草稿，越过旧界限后保存按钮仍可用并提交放宽量', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
+    allowBusinessReady(value)
+    const save = vi.spyOn(productApi, 'saveSpeaker').mockImplementation(async submitted => ({ settings: { speaker: submitted } } as never))
+    await flushPromises()
+    const sliders = wrapper.findAll('.speaker-thresholds input[type="range"]')
+    await sliders[0]!.setValue('0.30')
+    await sliders[1]!.setValue('0.20')
+    await flushPromises()
+    expect(save).not.toHaveBeenCalled()
+    expect(button(wrapper, '保存声纹阈值').attributes('disabled')).toBeUndefined()
+    await button(wrapper, '保存声纹阈值').trigger('click')
+    await flushPromises()
+    expect(save).toHaveBeenCalledOnce()
+    expect(save.mock.calls[0]![0]).toMatchObject({ confirm_threshold: 0.30, continuity_relaxation: 0.20 })
+    expect((save.mock.calls[0]![0] as { continuity_threshold: number }).continuity_threshold).toBeCloseTo(0.10)
+    expect(value.settings.speaker.confirm_threshold).toBe(0.30)
+    expect(value.speakerForm.continuity_relaxation).toBe(0.20)
+  })
+
+  it('DSH（代理执行宿主）轨迹保留所有当前工具和输出，授权按钮携带原请求与运行序号', async () => {
+    const { value } = liveControls()
+    value.voice.connection.value = 'connected'
+    value.voice.shadowProduct.value.backend = 'dsh'
+    value.voice.shadowProduct.value.activities = [
+      { run_seq: 3, item_id: 'tool-a', stream: 'tool', phase: 'completed', timestamp: '', tool_name: 'bash', text: 'echo demo' },
+      { run_seq: 3, item_id: 'job-a', stream: 'output', phase: 'delta', timestamp: '', tool_name: '命令输出', text: 'demo\n' },
+      { run_seq: 3, item_id: 'approval-a', stream: 'approval', phase: 'started', timestamp: '', approval_id: 'request-a', text: '需要执行目录写入', tool_name: 'bash' },
+    ]
+    const decide = vi.spyOn(productApi, 'decideDshApproval').mockResolvedValue({ result: 'accepted' })
+    const wrapper = render(Workbench, { props: { model: value.workbenchModel.value }, attrs: {
+      onApproval: (id: string, runSeq: number, approved: boolean) => value.decideDshApproval(id, runSeq, approved),
+    } })
+    expect(value.workbenchModel.value.shadow.trace).toHaveLength(3)
+    expect(wrapper.get('.trace-permission-content').text()).toContain('需要执行目录写入')
+    await button(wrapper, '同意').trigger('click')
+    await flushPromises()
+    expect(decide).toHaveBeenCalledWith({ approval_id: 'request-a', run_seq: 3, decision: 'allowed-once' })
+    await value.decideDshApproval('old-request', 2, false)
+    expect(decide).toHaveBeenCalledOnce()
+  })
+
   it('主人打断开关直接保存，待机时显示已启用并保留未保存的阈值', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })

@@ -34,7 +34,7 @@ import type {
 import { TERMINAL_STATES } from '../types'
 import { ConversationLog, readConversationEntry } from '../conversation-log'
 import { isRecord } from '../record'
-import { MAX_SHADOW_ACTIVITIES, isNonNegativeInteger, isAgentTrace, isSpeechOutput, isTerminalState, readString, readDelivery, createEmptyCurrentTurn, createEmptyLatency, createOfflineStatuses, createEmptyShadowProduct, readShadowActivity, readShadowProduct, parseServerMessage, copyLatencyValues } from './voiceTerminalProjection'
+import { MAX_SHADOW_ACTIVITIES, trimShadowActivities, isNonNegativeInteger, isAgentTrace, isSpeechOutput, isTerminalState, readString, readDelivery, createEmptyCurrentTurn, createEmptyLatency, createOfflineStatuses, createEmptyShadowProduct, readShadowActivity, readShadowProduct, parseServerMessage, copyLatencyValues } from './voiceTerminalProjection'
 
 const OPEN_READY_STATE = 1
 const MAX_RECENT_TURNS = 10
@@ -512,21 +512,21 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         && incoming.phase !== current.phase) return
       const merged: ShadowActivity = { ...current, ...incoming }
       if (incoming.phase === 'delta') {
-        if (incoming.delta) merged.text = `${current.text || ''}${incoming.delta}`.slice(-4000)
+        if (incoming.delta) merged.text = `${current.text || ''}${incoming.delta}`.slice(-12000)
         delete merged.delta
       }
       activities[index] = merged
     } else {
       const item = { ...incoming }
       if (item.phase === 'delta' && item.delta) {
-        item.text = item.delta.slice(-4000)
+        item.text = item.delta.slice(-12000)
         delete item.delta
       }
       activities.push(item)
     }
     shadowProduct.value = {
       ...shadowProduct.value,
-      activities: activities.slice(-MAX_SHADOW_ACTIVITIES),
+      activities: trimShadowActivities(activities),
       last_activity_at: incoming.timestamp,
     }
   }

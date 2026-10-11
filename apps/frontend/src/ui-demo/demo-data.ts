@@ -279,7 +279,7 @@ export const demoSettings = {
   /** quietEnd（静默结束时间）。 */ quietEnd: '07:00',
   /** speakerMode（声纹运行模式）。 */ speakerMode: 'observe',
   /** confirmThreshold（主人确认阈值）。 */ confirmThreshold: 0.60,
-  /** continuityThreshold（非主人确认界限）。 */ continuityThreshold: 0.50,
+  /** continuityThreshold（连续主人放宽量）。 */ continuityThreshold: 0.10,
   /** ownerOnly（仅主人可打断）。 */ ownerOnly: false,
   /** experimentalContextGateEnabled（实验性上下文门禁，仅展示引导时机开关）。 */ experimentalContextGateEnabled: true,
   /** providerName（服务商名称）。 */ providerName: '我的模型连接',

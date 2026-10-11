@@ -19,6 +19,8 @@ export interface WorkspaceChoice {
 
 /** ResourceStatus（独立资源状态）：与运行进程及内存采样分开。 */
 export interface ResourceStatus {
+  /** required（必需组件）：false（否）时缺失、损坏或待更新均不阻塞整体启动。 */
+  required?: boolean
   /** files_installed（资源文件完整）、runtime_ready（运行依赖就绪）、can_start（可启动）。 */
   files_installed?: boolean
   runtime_ready?: boolean

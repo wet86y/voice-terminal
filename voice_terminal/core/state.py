@@ -109,8 +109,6 @@ class RuntimeState:
                 or (name == "kws" and self.services.get(name) == "DISABLED")
                 or (name == "kws" and self.wake_always_on
                     and self.services.get(name) == "ERROR")
-                or (name == "asr" and self.wake_always_on
-                    and self.services.get(name) == "ERROR")
                 for name in required
             )
         )

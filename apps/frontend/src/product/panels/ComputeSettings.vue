@@ -41,6 +41,7 @@ function managedResource(resourceId: string): ManagedResourceRow | undefined {
     state: resource.installation_state,
     status: resource.installation_state === 'installed' ? '已安装' : resource.installation_state === 'incomplete' ? '不完整' : '缺失',
     updateAvailable: resource.update_available === true,
+    required: resource.required !== false,
     installedVersion: resource.installed_version,
     targetVersion: resource.resource_id === 'voice-server' || resource.resource_id === 'dsh' ? undefined : resource.version,
     error: resource.error || jobs.find(job => job.state === 'failed')?.error || undefined,

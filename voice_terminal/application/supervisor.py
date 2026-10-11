@@ -415,6 +415,20 @@ class ApplicationHost:
             future.cancel()
             raise RuntimeError("创建结果尚未确认，请先刷新任务列表，避免重复提交。")
 
+    def decide_dsh_approval(self, payload: dict) -> dict:
+        """decide_dsh_approval（转发权限决定）：网页已验证当前桌面会话。"""
+        snapshot = self.state.snapshot()
+        if self.loop is None or snapshot.get("stopping") or not snapshot.get("voice_api_url"):
+            raise RuntimeError("语音业务尚未就绪，不能处理权限请求。")
+        future = asyncio.run_coroutine_threadsafe(self.http(
+            snapshot["voice_api_url"] + "/internal/application/dsh-approval",
+            payload=payload, timeout=15), self.loop)
+        try:
+            return future.result(timeout=17)
+        except TimeoutError:
+            future.cancel()
+            raise RuntimeError("权限决定尚未确认，请等待请求状态刷新。")
+
     async def probe(self, key):
         if key == "asr":
             import websockets

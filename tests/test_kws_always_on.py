@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from voice_terminal.controller.episode_controller import EpisodeController
 from voice_terminal.controller.realtime_controller import RealtimeController
@@ -79,15 +80,15 @@ def test_enabling_wake_always_enters_standby(monkeypatch):
     assert config.wake.always_on is True
 
 
-def test_always_on_can_start_protected_kws_while_asr_is_unavailable():
+def test_manual_start_requires_asr_even_when_wake_is_enabled():
     state = RuntimeState(state=TerminalState.IDLE, wake_always_on=True)
     state.services.update(
         audio="READY", kws="READY", asr="ERROR", llm="READY", tts="READY",
     )
-    assert state.can_start is True
+    assert state.can_start is False
 
 
-def test_always_on_start_does_not_open_unready_asr_input():
+def test_manual_start_opens_asr_directly_and_recovers_disconnected_asr():
     async def scenario(asr_status):
         class Controller(InputController):
             async def _on_asr_result(self, _message):
@@ -115,10 +116,13 @@ def test_always_on_start_does_not_open_unready_asr_input():
 
             async def connect(self):
                 self.connect_calls += 1
-                raise AssertionError("ASR must not be opened before KWS activation")
+                self.connected = True
+
+            async def health(self):
+                return {"status": "READY"}
 
             async def close(self):
-                return None
+                self.connected = False
 
         class Vad:
             def reset(self):
@@ -141,18 +145,18 @@ def test_always_on_start_does_not_open_unready_asr_input():
 
         await controller.start_listening()
         assert state.listening is True
-        assert state.input_owner == "kws"
-        assert state.services["asr"] == asr_status
-        assert asr.connect_calls == 0
+        assert state.input_owner == "asr"
+        assert state.services["asr"] == "RUNNING"
+        assert asr.connect_calls == 1
         await controller.stop_listening()
         # ASR（语音识别）会话正常关闭后，连续重启 KWS（关键词唤醒）监听
         # 仍应保持就绪；真实 ASR 故障已在上面的 ERROR（错误）分支保留。
-        for _ in range(2):
+        for index in range(2):
             await controller.start_listening()
             assert state.listening is True
-            assert state.input_owner == "kws"
-            assert state.services["asr"] == "READY"
-            assert asr.connect_calls == 0
+            assert state.input_owner == "asr"
+            assert state.services["asr"] == "RUNNING"
+            assert asr.connect_calls == index + 2
             await controller.stop_listening()
 
     for asr_status in ("ERROR", "READY"):
@@ -356,6 +360,27 @@ def test_model_initiated_speech_arms_the_same_silence_window():
         await controller._on_model_speech_accepted()
         assert armed == [True], "没有发生所有权轮换时不得重复挂梯子"
 
+    asyncio.run(scenario())
+
+
+def test_manual_start_arms_silence_once_before_any_user_speech():
+    async def scenario():
+        controller = object.__new__(EpisodeController)
+        controller.state = RuntimeState()
+        controller.wake_always_on = True
+        controller.quiet_policy = None
+        controller.llm = SimpleNamespace()
+        controller.episode = SimpleNamespace(closed=False, arm_silence_window=AsyncMock())
+
+        async def started(_controller):
+            _controller.state.listening = True
+            _controller.state.input_owner = "asr"
+
+        with patch.object(RealtimeController, "start_listening", started):
+            await controller.start_listening()
+            await controller.start_listening()
+        controller.episode.arm_silence_window.assert_awaited_once()
+        assert controller.episode.arm_silence_window.await_args.kwargs["anchor_source"] == "manual_start"
     asyncio.run(scenario())
 
 

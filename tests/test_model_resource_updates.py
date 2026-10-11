@@ -131,6 +131,18 @@ def test_updates_to_inactive_models_block_every_startup_role(workspace):
     assert all("更新验收模型" in message and "组件有更新" in message for message in issues.values())
 
 
+def test_optional_inactive_model_updates_do_not_block_other_roles(workspace):
+    program, root, _ = workspace
+    _catalog(program, "v2", {"model.pt": b"new-weight", "config.yaml": b"config"})
+    catalog_path = program / "config/resources/catalog.json"
+    value = json.loads(catalog_path.read_text("utf-8"))
+    value["resources"][0]["required"] = False
+    _json(catalog_path, value)
+    issues = inspect_model_resources(program, root / "models", {"voice": [], "speaker": ["test-model"]})
+    assert set(issues) == {"speaker"}
+    assert "组件有更新" in issues["speaker"]
+
+
 def test_old_runtime_receipt_does_not_bypass_current_dependency_gate(workspace):
     """Runtime update gate（运行依赖更新门禁）：旧格式及缺少第六依赖组均阻止启动。"""
     program, root, _ = workspace

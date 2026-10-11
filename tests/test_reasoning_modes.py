@@ -207,6 +207,7 @@ def test_pause_switch_resume_updates_provider_effort_without_replacing_live_work
         controller._cancel_tts_prewarm = AsyncMock()
         controller.episode = episode
         controller.reasoning_mode = initial_mode
+        controller.wake_always_on = False  # 本用例验证模式切换，关闭静默回到唤醒的流程。
         session.controller = controller
         identity = episode.episode_id
         session.history.commit_input("turn-a", "你好")

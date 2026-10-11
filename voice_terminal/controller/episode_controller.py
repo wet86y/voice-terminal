@@ -469,6 +469,7 @@ class EpisodeController(RealtimeController):
         # reset, and close) all dispose the prewarm explicitly.
 
     async def start_listening(self):
+        was_listening = self.state.listening  # was_listening（重复开始保护）：不重置现有静默期限。
         if self.episode.closed:
             self.episode = self._make_episode()
         else:
@@ -491,6 +492,10 @@ class EpisodeController(RealtimeController):
             except Exception as exc:
                 await self.episode.log("LLM_PREWARM_FALLBACK", reason=str(exc)[:200])
         await super().start_listening()
+        if not was_listening and self.state.listening and self.wake_always_on:
+            if self.quiet_policy is not None:
+                self.quiet_policy.user_interaction = True
+            await self.episode.arm_silence_window(f"manual-start-{uuid4().hex}", anchor_source="manual_start")
 
     async def accept_shadow_events(self, events) -> None:
         for item in events:
@@ -667,7 +672,7 @@ class EpisodeController(RealtimeController):
             self.barge_in_gate.reset()
             return None
         snapshot = self._speaker_snapshot
-        if snapshot is not None and snapshot.identity == RollingSpeakerIdentity.NON_OWNER and (
+        if snapshot is not None and snapshot.identity == RollingSpeakerIdentity.NON_OWNER and snapshot.quality == "ready" and (
             snapshot.candidate_start_sample == self._owner_barge_start_sample
             and snapshot.is_fresh()
         ):

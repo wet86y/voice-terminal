@@ -37,7 +37,7 @@ ws://127.0.0.1:8765/ws
 | 命令 | payload | 作用 |
 | --- | --- | --- |
 | `subscribe` | 对象，可为空 | 获取 runtime、conversation、Shadow 和指标快照，并开始接收事件。 |
-| `session.start` | 对象，可为空 | 启动输入作用域；KWS 开启时先进入 KWS standby。 |
+| `session.start` | 对象，可为空 | 用户手动开始会话后直接连接 ASR（自动语音识别）；静默最终检查完成后仍按现有流程交回 KWS（关键词唤醒）待机。 |
 | `session.stop` | 对象，可为空 | 停止新的麦克风输入，不自动取消已经进入 Agent/TTS 队列的输出。 |
 | `session.reset` | 对象，可为空 | 清理当前会话临时状态、Shadow trace、TTS 事务和 conversation epoch。 |
 | `session.reasoning_mode`（设置运行模式） | `{"mode":"fast\|deep"}`，`mode`（运行模式） | 修改后续主 Agent（主代理）请求模式：`fast`（快速，关闭思考）或 `deep`（深度，低强度思考），默认深度。用户仍可选择快速；暂停后切换并恢复无需重置会话，已经派发的请求保留原推理强度。 |
@@ -145,7 +145,11 @@ Shadow UI 使用：
 - `shadow.activity`：当前运行中的 lifecycle、thinking、tool 和公开事件增量。DSH status observer
   摘要通过 Voice 侧 `status` 投影更新 summary，不作为 event 输出区域中的终态事件。
 
-活动 item（活动项）使用 `run_seq + item_id`（运行序号与条目标识）标识，状态为 `started`、`delta`、`completed` 或 `failed`（开始、增量、完成或失败），并且必须带有服务端生成的 `timestamp`（时间戳）。绑定 DSH 根 Agent（后台代理主智能体）的插件可将运行时 `reasoning-delta`（思考增量）和 `tool/call`、`tool/result`（工具开始与结果状态）投影到 `shadow.activity`，仅供“运行轨迹”固定单槽即时显示；同一思考项累加增量，新思考块或工具动作覆盖当前项。该界面投影只保存在有界的运行时活动快照中，不追加 Voice 对话或产品长期活动历史，也不新增 DSH 归档写入；DSH runtime（运行时）原有会话存档行为保持不变，Bridge（桥接层）不会额外复制该单槽正文。`action_seq`（动作序号）在每次激活内递增，Voice 侧只接收当前会话、代次、激活及序号有效的动作。工具活动只包含工具名称与状态，不包含参数或结果正文。DSH 根 Agent（后台代理主智能体）空闲或运行结束后，单槽清空；重连先应用 `shadow.product`（产品快照）恢复最新运行项，再按 WebSocket `seq`（消息序号）应用增量；旧 `run_seq`（运行序号）的迟到事件直接丢弃。除该单槽专用增量外，provider request（供应商请求）、trace ID（追踪标识）、其他私有 reasoning（思考内容）、凭据和内部工具参数不得进入公共协议。浏览器在应用快照前冲刷同一帧内的增量，不能让旧 activity（活动）覆盖新 summary（摘要）。
+活动项使用 `run_seq + item_id`（运行序号与条目标识）标识，状态为 `started`、`delta`、`completed` 或 `failed`（开始、增量、完成或失败），并带有服务端生成的 `timestamp`（时间戳）。绑定 DSH（代理执行宿主）根 Agent（根代理）的插件将根代理思考和工具事件，以及同一运行所属子代理的思考、回复与工具事件，投影到 `shadow.activity`（运行轨迹增量）。终端工具与后台作业显示参数、结果、进度和标准输出／错误输出；待决权限请求显示请求内容与专用 `approval_id`（权限请求标识），用户决定通过受保护的产品接口转回原始请求。思考、输出与同一工具的增量按条目标识合并，完成项保留供展开查看。
+
+活动流类型为 `lifecycle`（生命周期）、`thinking`（思考）、`tool`（工具）、`output`（执行输出）、`event`（结构化结果）和 `approval`（权限请求）；公开正文限于 `text`（展开正文）、`delta`（增量）、`tool_name`（工具或作业名称）、`tool_status`（执行状态）、`approval_id`（权限请求标识）及 `event_kind`（事件类别）。每个快照最多保留 96 项，单项正文最多 12,000 字符；增量最多 2,000 字符，裁剪时保留未决定的权限请求。服务端只接收受支持字段并限制长度，插件在发送前净化可识别凭据。
+
+这些界面活动只进入有界运行时活动快照，不追加 Voice 对话或产品长期活动历史，也不改变 DSH（代理运行时）本来的会话存档。`action_seq`（动作序号）在每次激活内递增；Voice 侧只接受当前会话、代次、激活及序号有效的动作。运行结束或切换后不再接收旧活动，重连先应用 `shadow.product`（产品快照）恢复最近活动，再按 WebSocket `seq`（消息序号）应用增量。provider request（供应商请求）、trace ID（追踪标识）、模型内部推理、凭据及未净化的工具参数不得进入公共协议。浏览器在应用快照前冲刷同一帧内的增量，避免旧活动覆盖新摘要。
 
 插件内部回调的 `action_seq`（动作序号）同时约束思考、工具和空闲状态，统一串行发送；乱序空闲状态不能清空新动作。该序号在桥接接收端校验，前端继续使用 WebSocket `seq`（消息序号）及 `run_seq + item_id`（运行序号与活动标识）应用活动。完整输入字段、错误回执及取消规则见 [Bridge 2.0（桥接协议）](bridge-2.0-protocol.md)。
 

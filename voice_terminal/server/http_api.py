@@ -52,6 +52,12 @@ def _valid_command(message: Any) -> tuple[str, dict[str, Any]] | None:
     return command, payload
 
 
+def _speaker_relaxation(config: Any) -> float:
+    """continuity_relaxation（连续主人放宽量）：保留草稿值，仅旧配置由绝对阈值推导。"""
+    value = config.continuity_relaxation
+    return float(value) if value is not None else min(0.20, max(0.0, config.confirm_threshold - config.continuity_threshold))
+
+
 def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                model_registry: ModelRegistryService | None = None,
                product_settings: ProductSettingsStore | None = None) -> Any:
@@ -177,6 +183,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "mode": runtime.config.speaker.mode,
                 "confirm_threshold": runtime.config.speaker.confirm_threshold,
                 "continuity_threshold": runtime.config.speaker.continuity_threshold,
+                "continuity_relaxation": _speaker_relaxation(runtime.config.speaker),
                 "owner_only_barge_in": runtime.config.speaker.owner_only_barge_in,
             },
             "compute": {
@@ -437,6 +444,28 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             "target": "shadow_agent", "reference": "", "creation_source": "manual",
         })
 
+    @app.post("/internal/application/dsh-approval")
+    async def decide_dsh_approval(request: Request) -> dict[str, Any]:
+        """权限决定仅经本次桌面宿主认证转发，内部凭据不传到页面。"""
+        authorize_application(request)
+        body = await request.json()
+        if (not isinstance(body, dict) or set(body) != {"approval_id", "decision", "run_seq"}
+                or not isinstance(body.get("approval_id"), str) or not 1 <= len(body["approval_id"]) <= 160
+                or body.get("decision") not in {"allowed-once", "rejected"}
+                or type(body.get("run_seq")) is not int or body["run_seq"] < 0):
+            raise HTTPException(status_code=422, detail="权限决定需要有效的请求标识、运行序号以及同意或拒绝。")
+        async with runtime._session_lock:
+            session = runtime.shadow_session
+            if not isinstance(session, DshShadowAgentSession):
+                raise HTTPException(status_code=409, detail="当前没有 DSH（代理执行宿主）权限请求。")
+            try:
+                result = await session.decide_approval(body["approval_id"], body["decision"], body["run_seq"])
+            except DshBridgeError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if result.get("result") not in {"accepted", "duplicate"}:
+            raise HTTPException(status_code=409, detail="权限请求已失效或已处理，请等待状态刷新。")
+        return result
+
     @app.post("/api/internal/wake-tasks")
     async def create_wake_task_from_dsh(request: Request) -> dict[str, Any]:
         authorize_dsh_plugin(request)
@@ -670,6 +699,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "mode": "off",
                 "confirm_threshold": runtime.config.speaker.confirm_threshold,
                 "continuity_threshold": runtime.config.speaker.continuity_threshold,
+                "continuity_relaxation": _speaker_relaxation(runtime.config.speaker),
                 "owner_only_barge_in": runtime.config.speaker.owner_only_barge_in,
             })
             if body.get("mode") == "filter" or body.get("owner_only_barge_in") is True:
@@ -806,6 +836,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 thresholds = {
                     "confirm_threshold": runtime.config.speaker.confirm_threshold,
                     "continuity_threshold": runtime.config.speaker.continuity_threshold,
+                    "continuity_relaxation": _speaker_relaxation(runtime.config.speaker),
                 }
                 next_settings = {
                     "mode": "off" if current_speaker_settings.get("mode", runtime.config.speaker.mode) == "filter" else current_speaker_settings.get("mode", runtime.config.speaker.mode),

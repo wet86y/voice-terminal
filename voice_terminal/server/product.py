@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from ..shadow_agent.contracts import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 9
+PRODUCT_SETTINGS_SCHEMA_VERSION = 10
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -110,6 +110,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
             "mode": str(getattr(config.speaker, "mode", "off")),
             "confirm_threshold": float(getattr(config.speaker, "confirm_threshold", 0.50)),
             "continuity_threshold": float(getattr(config.speaker, "continuity_threshold", 0.40)),
+            "continuity_relaxation": round(min(0.20, max(0.0, config.speaker.confirm_threshold - config.speaker.continuity_threshold)), 4),  # 连续主人放宽量。
             "owner_only_barge_in": bool(getattr(config.speaker, "owner_only_barge_in", False)),
         },
         # compute（计算设备）首版沿用旧运行方式：Paraformer 自动选择，其余模型保持 CPU。
@@ -225,6 +226,12 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     # 旧设置可能记录了 cosyvoice；合并后统一锁定 MiniMax API（在线语音接口）。
     result["tts"]["backend"] = "minimax"
     speaker = result["speaker"]
+    raw_speaker = value.get("speaker", {})
+    if isinstance(raw_speaker, Mapping) and "continuity_relaxation" not in raw_speaker:
+        try:
+            speaker["continuity_relaxation"] = min(0.20, max(0.0, float(speaker["confirm_threshold"]) - float(speaker["continuity_threshold"])))
+        except (TypeError, ValueError):
+            speaker["continuity_relaxation"] = 0.10
     if speaker.get("mode") not in {"off", "observe", "filter"}:
         speaker["mode"] = defaults["speaker"]["mode"]
     if type(speaker.get("owner_only_barge_in")) is not bool:
@@ -232,6 +239,7 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     if legacy_speaker_scale:
         speaker["confirm_threshold"] = defaults["speaker"]["confirm_threshold"]
         speaker["continuity_threshold"] = defaults["speaker"]["continuity_threshold"]
+        speaker["continuity_relaxation"] = defaults["speaker"]["continuity_relaxation"]
         if speaker["mode"] == "filter":
             # Never resume strict filtering against templates and thresholds
             # that belong to the previous frontend.
@@ -239,15 +247,16 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
         return result
     try:
         confirm = float(speaker.get("confirm_threshold"))
-        continuity = float(speaker.get("continuity_threshold"))
+        relaxation = float(speaker.get("continuity_relaxation", 0.10))
     except (TypeError, ValueError):
         confirm = defaults["speaker"]["confirm_threshold"]
-        continuity = defaults["speaker"]["continuity_threshold"]
-    if not MIN_SPEAKER_THRESHOLD <= continuity < confirm <= MAX_SPEAKER_THRESHOLD:
+        relaxation = defaults["speaker"]["continuity_relaxation"]
+    if not MIN_SPEAKER_THRESHOLD <= confirm <= MAX_SPEAKER_THRESHOLD or not 0 <= relaxation <= 0.20:
         confirm = defaults["speaker"]["confirm_threshold"]
-        continuity = defaults["speaker"]["continuity_threshold"]
+        relaxation = defaults["speaker"]["continuity_relaxation"]
     speaker["confirm_threshold"] = round(confirm, 4)
-    speaker["continuity_threshold"] = round(continuity, 4)
+    speaker["continuity_relaxation"] = round(relaxation, 4)
+    speaker["continuity_threshold"] = round(max(0.0, confirm - relaxation), 4)
     return result
 
 
@@ -266,7 +275,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     schema_version = value.get("schema_version")
     if schema_version is not None and (
         type(schema_version) is not int
-        or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, PRODUCT_SETTINGS_SCHEMA_VERSION}
+        or schema_version not in set(range(1, PRODUCT_SETTINGS_SCHEMA_VERSION + 1))
     ):
         invalid = True
     for section_name, fields in (
@@ -274,7 +283,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
         ("silence", ("seconds",)),
         ("shadow", ("experimental_context_gate_enabled",)),
         ("tts", ("backend",)),
-        ("speaker", ("mode", "confirm_threshold", "continuity_threshold", "owner_only_barge_in")),
+        ("speaker", ("mode", "confirm_threshold", "continuity_threshold", "continuity_relaxation", "owner_only_barge_in")),
     ):
         section = value.get(section_name)
         if section is None:
@@ -312,12 +321,14 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
                 invalid = invalid or type(candidate) is not bool
             elif section_name == "speaker" and field in {"confirm_threshold", "continuity_threshold"}:
                 invalid = invalid or not isinstance(candidate, (int, float)) or isinstance(candidate, bool) or not 0 <= float(candidate) <= 1
+            elif section_name == "speaker" and field == "continuity_relaxation":
+                invalid = invalid or type(candidate) not in {int, float} or not 0 <= float(candidate) <= 0.20
     speaker_section = value.get("speaker")
     if isinstance(speaker_section, Mapping):
         try:
             confirm_value = float(speaker_section.get("confirm_threshold"))
             continuity_value = float(speaker_section.get("continuity_threshold"))
-            invalid = invalid or not 0 <= continuity_value < confirm_value <= 1
+            invalid = invalid or not 0 <= continuity_value <= confirm_value <= 1
         except (TypeError, ValueError):
             # The field-level checks above already mark non-numeric values;
             # keep this branch quiet and let the normal merge fallback apply.
@@ -443,19 +454,23 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     try:
         confirm_threshold = float(speaker.get("confirm_threshold", getattr(config.speaker, "confirm_threshold", 0.50)))
         continuity_threshold = float(speaker.get("continuity_threshold", getattr(config.speaker, "continuity_threshold", 0.40)))
+        relaxation = float(speaker.get("continuity_relaxation", min(0.20, max(0.0, confirm_threshold - continuity_threshold))))
     except (TypeError, ValueError):
         confirm_threshold = getattr(config.speaker, "confirm_threshold", 0.50)
         continuity_threshold = getattr(config.speaker, "continuity_threshold", 0.40)
-    if mode not in {"off", "observe", "filter"} or not 0 <= continuity_threshold < confirm_threshold <= 1:
+        relaxation = 0.10
+    if mode not in {"off", "observe", "filter"} or not 0 <= confirm_threshold <= 1 or not 0 <= relaxation <= 0.20:
         mode = "off"
         confirm_threshold = 0.50
         continuity_threshold = 0.40
+        relaxation = 0.10
     next_speaker = replace(
         config.speaker,
         mode=mode,
         owner_only_barge_in=bool(speaker.get("owner_only_barge_in", getattr(config.speaker, "owner_only_barge_in", False))),
         confirm_threshold=confirm_threshold,
         continuity_threshold=continuity_threshold,
+        continuity_relaxation=relaxation,
     )
     next_tts = replace(config.tts, backend="minimax", provider="minimax")
     next_compute = ComputeConfig(
@@ -822,8 +837,9 @@ class ProductSettingsStore:
 
     def save_speaker(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {"mode", "confirm_threshold", "continuity_threshold", "owner_only_barge_in"}
-        if set(payload) != allowed:
-            raise ProductSettingsError("声纹设置字段必须是 mode（声纹模式）、confirm_threshold（主人确认阈值）、continuity_threshold（非主人确认界限／旧整轮连续保持阈值）、owner_only_barge_in（主人打断开关）。")
+        new_allowed = (allowed - {"continuity_threshold"}) | {"continuity_relaxation"}
+        if set(payload) not in (allowed, new_allowed, allowed | new_allowed):
+            raise ProductSettingsError("声纹设置需要 mode（模式）、confirm_threshold（主人阈值）、continuity_relaxation（连续放宽量）、owner_only_barge_in（主人打断开关）。")
         mode = payload.get("mode")
         if mode not in {"off", "observe", "filter"}:
             raise ProductSettingsError("声纹模式必须是 off、observe 或 filter。")
@@ -831,18 +847,24 @@ class ProductSettingsStore:
         if type(owner_only_barge_in) is not bool:
             raise ProductSettingsError("owner_only_barge_in（主人打断开关）必须是布尔值。")
         confirm = payload.get("confirm_threshold")
-        continuity = payload.get("continuity_threshold")
+        continuity = payload.get("continuity_threshold", 0.0)
+        relaxation = payload.get("continuity_relaxation")
         if (isinstance(confirm, bool) or not isinstance(confirm, (int, float))
                 or isinstance(continuity, bool) or not isinstance(continuity, (int, float))):
             raise ProductSettingsError("声纹阈值必须是数字。")
         confirm = float(confirm)
         continuity = float(continuity)
-        if not 0 <= continuity < confirm <= 1:
-            raise ProductSettingsError("声纹阈值必须满足 0 ≤ 连续保持阈值 < 普通确认阈值 ≤ 1。")
+        if relaxation is None:
+            if not 0 <= continuity <= confirm <= 1:
+                raise ProductSettingsError("旧连续阈值必须在 0 和主人阈值之间。")
+            relaxation = min(0.20, max(0.0, confirm - continuity))
+        if type(relaxation) not in {float, int} or not 0 <= float(relaxation) <= 0.20 or not 0 <= confirm <= 1:
+            raise ProductSettingsError("主人阈值必须在 0 至 1 之间；continuity_relaxation（连续放宽量）必须在 0 至 0.20 之间。")
         self._settings["speaker"] = {
             "mode": mode,
             "confirm_threshold": round(confirm, 4),
-            "continuity_threshold": round(continuity, 4),
+            "continuity_threshold": round(max(0.0, confirm - float(relaxation)), 4),
+            "continuity_relaxation": round(float(relaxation), 4),
             "owner_only_barge_in": owner_only_barge_in,
         }
         self._save_settings()
@@ -1018,7 +1040,7 @@ class ShadowProductProjection:
 
     def update_activities(self, activities: list[Mapping[str, Any]]) -> None:
         """Merge ordered UI-only activities without changing Shadow state."""
-        valid_streams = {"lifecycle", "thinking", "tool", "event"}
+        valid_streams = {"lifecycle", "thinking", "tool", "event", "output", "approval"}
         valid_phases = {"started", "delta", "completed", "failed"}
         valid_event_kinds = {"progress", "information", "input_required", "result", "no_action", "failed"}
         for raw in activities:
@@ -1051,10 +1073,10 @@ class ShadowProductProjection:
                 "phase": phase,
                 "timestamp": timestamp if isinstance(timestamp, str) and timestamp else utc_now_iso(),
             }
-            for key, limit in (("text", 4000), ("delta", 2000), ("tool_name", 160), ("tool_status", 120)):
+            for key, limit in (("text", 12000), ("delta", 2000), ("tool_name", 160), ("tool_status", 120), ("approval_id", 160)):
                 value = raw.get(key)
                 if isinstance(value, str):
-                    item[key] = _safe_display_text(value, limit=limit) if key != "delta" else value[:limit]
+                    item[key] = value.replace("\x00", "")[:limit] if key in {"text", "delta"} else _safe_display_text(value, limit=limit)
             event_kind = raw.get("event_kind")
             if event_kind in valid_event_kinds:
                 item["event_kind"] = event_kind
@@ -1075,7 +1097,7 @@ class ShadowProductProjection:
             if phase == "delta":
                 delta = item.get("delta")
                 if isinstance(delta, str) and delta:
-                    merged["text"] = f"{current.get('text', '')}{delta}"[-4000:]
+                    merged["text"] = f"{current.get('text', '')}{delta}"[-12000:]
                 merged.pop("delta", None)
             elif "text" not in item and "text" in current:
                 merged["text"] = current["text"]
@@ -1084,6 +1106,12 @@ class ShadowProductProjection:
                 values[current_index] = merged
                 self.activities = deque(values, maxlen=96)
             else:
+                if len(self.activities) == self.activities.maxlen:
+                    # 待决权限不能被后续输出挤出，否则页面会失去答复入口。
+                    evict = next((index for index, value in enumerate(self.activities)
+                                  if value.get("stream") != "approval" or value.get("phase") != "started"), None)
+                    if evict is not None:
+                        del self.activities[evict]
                 self.activities.append(merged)
             self._apply_activity_state(merged)
             self.last_activity_at = str(merged.get("timestamp") or self.last_activity_at)
@@ -1112,10 +1140,17 @@ class ShadowProductProjection:
                 self.active = True
                 self.phase = "working"
             return
-        if stream in {"thinking", "tool"} and phase in {"started", "delta"}:
-            self.user_input_required = False
-            self.active = True
-            self.phase = "working"
+        if stream == "approval":
+            self.user_input_required = phase == "started"
+            self.active = phase != "started"
+            self.phase = "waiting" if phase == "started" else "working"
+            return
+        if stream in {"thinking", "tool", "output"} and phase in {"started", "delta"}:
+            waiting = any(item.get("stream") == "approval" and item.get("phase") == "started"
+                          for item in self.activities)
+            self.user_input_required = waiting
+            self.active = not waiting
+            self.phase = "waiting" if waiting else "working"
             return
         if stream != "lifecycle" or not item_id.startswith("run-"):
             return

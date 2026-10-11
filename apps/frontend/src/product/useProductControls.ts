@@ -13,6 +13,7 @@ import {
 } from "./useProductAdapter";
 import type { WorkbenchModel } from "../interface/workbench";
 import { userMessageKey } from "./conversation-identity";
+import { productApi } from './api';
 
 /** useProductControls（页面控件组合逻辑）：复用业务适配器并集中保留表单和录音生命周期。 */
 export function useProductControls() {
@@ -626,14 +627,21 @@ export function useProductControls() {
     );
     if (latestRun === null) return [];
     const currentRun = shadowActivities.value.filter((item) => item.run_seq === latestRun);
-    const lifecycle = [...currentRun].reverse().find((item) => item.stream === "lifecycle");
-    if (!lifecycle || lifecycle.phase === "completed" || lifecycle.phase === "failed") return [];
-    const currentAction = currentRun.filter(
-      (item) => (item.stream === "thinking" || item.stream === "tool")
+    return currentRun.filter(
+      (item) => ['thinking', 'tool', 'output', 'approval'].includes(item.stream)
         && !item.item_id.startsWith("observer-"),
-    ).at(-1);
-    return currentAction ? [currentAction] : [];
+    );
   });
+  const approvalBusy = ref(''); // approvalBusy（决定提交中的权限）：防止重复点击。
+  async function decideDshApproval(approvalId: string, runSeq: number, approved: boolean) {
+    if (approvalBusy.value) return;
+    const pending = shadowRunningTrace.value.find(item => item.approval_id === approvalId && item.run_seq === runSeq && item.phase === 'started');
+    if (!pending) return;
+    approvalBusy.value = approvalId;
+    try { await productApi.decideDshApproval({ approval_id: approvalId, run_seq: runSeq, decision: approved ? 'allowed-once' : 'rejected' }); }
+    catch (error) { lastError.value = error instanceof Error ? error.message : String(error); }
+    finally { approvalBusy.value = ''; }
+  }
   const shadowEventActivities = computed(() => {
     const values = shadowActivities.value.filter(
       (item) => item.stream === "event",
@@ -645,7 +653,8 @@ export function useProductControls() {
     return values.length ? values[values.length - 1] : null;
   });
   function shadowActivityPhaseLabel(activity: ShadowActivity) {
-    if (activity.stream === "tool") {
+    if (activity.stream === 'approval') return activity.phase === 'started' ? '等待授权' : activity.phase === 'failed' ? '已拒绝或取消' : '已同意';
+    if (activity.stream === "tool" || activity.stream === 'output') {
       const labels: Record<string, string> = {
         preparing: "准备调用",
         running: "执行中",
@@ -1133,6 +1142,7 @@ export function useProductControls() {
     // threshold calibrated before that change.
     speakerForm.confirm_threshold = 0.6;
     speakerForm.continuity_threshold = 0.5;
+    speakerForm.continuity_relaxation = 0.1;
     setNotice("声纹阈值已恢复默认值（0.60 / 0.50），点击保存后应用。");
   }
   function mergeFloat32(chunks: Float32Array[]) {
@@ -1599,13 +1609,18 @@ export function useProductControls() {
             : Math.round(shadowCacheHitRatio.value * 100) + "%",
         trace: shadowRunningTrace.value.map((item) => ({
           key: item.run_seq + "-" + item.item_id,
-          title: item.stream === "tool"
+          title: item.stream === 'approval' ? '需要授权'
+            : item.stream === 'output' ? (item.tool_name || '运行输出') : item.stream === "tool"
             ? (item.tool_name ? `工具 · ${item.tool_name}` : "工具调用")
             : "DSH 思考",
-          text: item.stream === "thinking" ? item.text || "" : "",
+          text: item.text || "",
           status: shadowActivityPhaseLabel(item),
           time: formatTime(item.timestamp),
+          approvalId: item.approval_id,
+          runSeq: item.run_seq,
+          approvalPending: item.stream === 'approval' && item.phase === 'started',
         })),
+        approvalBusy: approvalBusy.value,
         event: shadowLatestEventActivity.value
           ? shadowActivityText(shadowLatestEventActivity.value)
           : "",
@@ -1614,6 +1629,7 @@ export function useProductControls() {
   });
 
   return {
+    decideDshApproval,
     applicationSnapshot,
     showApplicationSystem,
     voice,

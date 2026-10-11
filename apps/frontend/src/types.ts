@@ -250,7 +250,7 @@ export interface ShadowTimelineItem {
   timestamp: string
 }
 
-export type ShadowActivityStream = 'lifecycle' | 'thinking' | 'tool' | 'event'
+export type ShadowActivityStream = 'lifecycle' | 'thinking' | 'tool' | 'event' | 'output' | 'approval'
 export type ShadowActivityPhase = 'started' | 'delta' | 'completed' | 'failed'
 /** 影子活动事件类型：progress 仅显示界面，information 是可替换 Voice 信息，其余为终态。 */
 export type ShadowActivityEventKind = 'progress' | 'information' | 'input_required' | 'result' | 'no_action' | 'failed'
@@ -272,6 +272,8 @@ export interface ShadowActivity {
   tool_name?: string
   /** 工具状态：工具执行阶段说明。 */
   tool_status?: string
+  /** approval_id（本次权限请求标识）：仅待决卡片显示按钮。 */
+  approval_id?: string
   /** 事件类型：Bridge 2.0 判别联合的产品界面投影。 */
   event_kind?: ShadowActivityEventKind
   /** 发生时间：活动事件的 ISO 8601 时间戳。 */

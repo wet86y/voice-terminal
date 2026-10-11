@@ -24,7 +24,7 @@ class SpeakerStateConfig:
     continuity_max_ms: int = 10000
 
     def __post_init__(self) -> None:
-        if not 0.0 <= self.continuity_threshold < self.confirm_threshold <= 1.0:
+        if not 0.0 <= self.continuity_threshold <= self.confirm_threshold <= 1.0:
             raise ValueError("continuity_threshold must be below confirm_threshold in [0, 1]")
         if self.min_speech_ms < 1:
             raise ValueError("speaker window speech duration must be positive")
@@ -81,7 +81,7 @@ class SpeakerStateMachine:
     def reset(self, *, turn_id: str | None = None, generation: int = 0) -> None:
         self.turn_id = turn_id or ""
         self.generation = generation
-        self.state = SpeakerState.UNKNOWN
+        self.state = SpeakerState.NON_OWNER_CONFIRMED
         self.observations: list[SpeakerObservation] = []
         self._unavailable_reason: str | None = None
         self._aggregate: TurnAggregate | None = None
@@ -92,20 +92,26 @@ class SpeakerStateMachine:
         # unreachable.
         if not isinstance(getattr(self, "_last_owner_confirmed_at", None), float):
             self._last_owner_confirmed_at: float | None = None
+        self._last_confirmed_evidence: tuple[str, int, int] | None = None  # 已确认的音频证据标识。
+        self._evidence_sequence = 0  # 合格身份证据序号，不受观察列表裁剪影响。
 
     def clear_continuity(self) -> None:
         """Drop session-scoped owner trust (session reset / profile change)."""
         self._last_owner_confirmed_at = None
+        self._last_confirmed_evidence = None
 
     def mark_unavailable(self, reason: str = "speaker_unavailable") -> None:
         self.state = SpeakerState.UNAVAILABLE
         self._unavailable_reason = str(reason or "speaker_unavailable")[:240]
+        self.clear_continuity()
 
     # ------------------------------------------------------------------ input
     def _accept_observation(self, observation: SpeakerObservation) -> bool:
         if observation.turn_id != self.turn_id or observation.generation != self.generation:
             return False
         self.observations.append(observation)
+        if self._is_eligible(observation):
+            self._evidence_sequence += 1
         if len(self.observations) > 64:
             self.observations.pop(0)
         return True
@@ -117,29 +123,27 @@ class SpeakerStateMachine:
         except (TypeError, ValueError, OverflowError):
             return 0
 
+    def _is_eligible(self, observation: SpeakerObservation) -> bool:
+        """ready（质量就绪）、有效分数且有足够人声时，才构成新的身份证据。"""
+        if not isinstance(observation.quality, str) or observation.quality.strip().lower() != "ready":
+            return False
+        try:
+            return (observation.similarity is not None
+                    and math.isfinite(float(observation.similarity))
+                    and self._speech_ms(observation) >= self.config.min_speech_ms)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
     def _eligible(self) -> list[SpeakerObservation]:
         """Windows that may carry identity evidence.
 
         Only a window the worker explicitly marked ``ready`` counts; a missing
-        or unknown quality marker must fail open rather than promote the owner.
+        or unknown quality marker cannot authorise owner privileges.
         """
         result: list[SpeakerObservation] = []
         for observation in self.observations:
-            quality = observation.quality.strip().lower() if isinstance(observation.quality, str) else "unknown"
-            if quality != "ready":
-                continue
-            score = observation.similarity
-            if score is None:
-                continue
-            try:
-                score = float(score)
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if not math.isfinite(score):
-                continue
-            if self._speech_ms(observation) < self.config.min_speech_ms:
-                continue
-            result.append(observation)
+            if self._is_eligible(observation):
+                result.append(observation)
         return result
 
     def _build_aggregate(self, eligible: list[SpeakerObservation]) -> TurnAggregate | None:
@@ -219,38 +223,38 @@ class SpeakerStateMachine:
     # ----------------------------------------------------------------- decide
     def _resolve(self, aggregate: TurnAggregate | None) -> SpeakerState:
         if aggregate is None or aggregate.total_speech_ms < self.config.min_turn_speech_ms:
-            # Not enough usable speech to judge identity: stay neutral so the
-            # caller keeps the fail-open passthrough route.
-            return SpeakerState.UNKNOWN
+            # 尚未形成足够证据也按非主人输出，不授权主人权限。
+            return SpeakerState.NON_OWNER_CONFIRMED
         now = time.monotonic()
         score = self._turn_score(aggregate)
         if score >= self.config.confirm_threshold:
-            self._last_owner_confirmed_at = now
+            evidence = (self.turn_id, self.generation, self._evidence_sequence)
+            if evidence != self._last_confirmed_evidence:
+                self._last_owner_confirmed_at = now
+                self._last_confirmed_evidence = evidence
             return SpeakerState.OWNER_CONFIRMED
-        if score < self.config.continuity_threshold:
-            self._last_owner_confirmed_at = None
-            return SpeakerState.NON_OWNER_CONFIRMED
-        # Ambiguous band: only an owner confirmation from an immediately
-        # preceding turn may keep an ongoing conversation alive, and only for
-        # a bounded time.  This never lowers the bar for a fresh identity.
-        if self._last_owner_confirmed_at is None:
-            return SpeakerState.UNKNOWN
-        age_ms = (now - self._last_owner_confirmed_at) * 1000
-        limit = self.config.continuity_max_ms if self.state == SpeakerState.OWNER_CONTINUITY \
-            else self.config.continuity_window_ms
-        if age_ms <= limit:
-            return SpeakerState.OWNER_CONTINUITY
-        return SpeakerState.UNKNOWN
+        # 有效分数二分：连续主人只在现有时限内使用放宽后的单一阈值。
+        if self._last_owner_confirmed_at is not None:
+            age_ms = (now - self._last_owner_confirmed_at) * 1000
+            limit = self.config.continuity_max_ms if self.state == SpeakerState.OWNER_CONTINUITY \
+                else self.config.continuity_window_ms
+            if age_ms <= limit and score >= self.config.continuity_threshold:
+                return SpeakerState.OWNER_CONTINUITY
+        self._last_owner_confirmed_at = None
+        return SpeakerState.NON_OWNER_CONFIRMED
 
     def decision(self, *, route: str | None = None, degraded: bool = False,
                  reason: str | None = None,
                  similarity: float | None = None) -> SpeakerDecision:
         self._aggregate = self.aggregate()
-        state = self._resolve(self._aggregate)
-        if self.state != SpeakerState.UNAVAILABLE:
+        state = SpeakerState.UNAVAILABLE if self.state == SpeakerState.UNAVAILABLE else self._resolve(self._aggregate)
+        if state != SpeakerState.UNAVAILABLE:
             self.state = state
-        else:
-            state = SpeakerState.UNAVAILABLE
+        # 模型异常及证据不足也按非主人输出，原因与 degraded（降级标记）继续保留。
+        if state in {SpeakerState.UNKNOWN, SpeakerState.UNAVAILABLE}:
+            degraded = degraded or state == SpeakerState.UNAVAILABLE
+            reason = reason or self._unavailable_reason or "insufficient_speaker_evidence"
+            state = SpeakerState.NON_OWNER_CONFIRMED
         if state == SpeakerState.OWNER_CONFIRMED:
             final_route = "main"
             final_reason = reason or "owner_confirmed"
@@ -259,7 +263,7 @@ class SpeakerStateMachine:
             final_reason = reason or "owner_continuity"
         elif state == SpeakerState.NON_OWNER_CONFIRMED:
             final_route = "ambient"
-            final_reason = reason or "non_owner_confirmed"
+            final_reason = reason or ("insufficient_speaker_evidence" if self._aggregate is None else "non_owner_confirmed")
         elif state == SpeakerState.UNAVAILABLE:
             final_route = "passthrough"
             final_reason = reason or self._unavailable_reason or "speaker_unavailable"

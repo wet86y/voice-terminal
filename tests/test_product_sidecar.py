@@ -36,6 +36,37 @@ class ProductSidecarTests(unittest.TestCase):
     def store(self) -> ProductSettingsStore:
         return ProductSettingsStore(path=self.settings_path, config=self.config)
 
+    def test_speaker_relaxation_persists_even_below_legacy_continuity_threshold(self) -> None:
+        store = self.store()
+        store.save_speaker({"mode": "off", "owner_only_barge_in": False,
+                            "confirm_threshold": 0.30, "continuity_relaxation": 0.20})
+        saved = self.store().snapshot()["speaker"]
+        self.assertEqual(saved["confirm_threshold"], 0.30)
+        self.assertEqual(saved["continuity_relaxation"], 0.20)
+        self.assertAlmostEqual(saved["continuity_threshold"], 0.10)
+        store.save_speaker({"mode": "off", "owner_only_barge_in": False,
+                            "confirm_threshold": 0.10, "continuity_relaxation": 0.0})
+        self.assertEqual(self.store().snapshot()["speaker"]["continuity_threshold"], 0.10)
+
+    def test_speaker_relaxation_rejects_out_of_range_values(self) -> None:
+        for value in (-0.01, 0.21, float("nan")):
+            with self.assertRaises(ProductSettingsError):
+                self.store().save_speaker({"mode": "off", "owner_only_barge_in": False,
+                                          "confirm_threshold": 0.60, "continuity_relaxation": value})
+
+    def test_pending_approval_survives_output_history_and_preserves_command_lines(self) -> None:
+        projection = ShadowProductProjection()
+        projection.update_activities([{"run_seq": 1, "item_id": "approval", "stream": "approval", "phase": "started",
+                                       "approval_id": "request", "text": "第一行\n第二行"}])
+        for index in range(120):
+            projection.update_activities([{"run_seq": 1, "item_id": f"output-{index}", "stream": "output",
+                                           "phase": "delta", "delta": "执行输出\n"}])
+        approvals = [item for item in projection.activities if item["stream"] == "approval"]
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["text"], "第一行\n第二行")
+        self.assertTrue(projection.user_input_required)
+        self.assertEqual(projection.phase, "waiting")
+
     def test_compute_settings_migrate_default_and_restore_after_gpu_failure(self) -> None:
         legacy = ProductSettingsStore(
             path=self.settings_path,

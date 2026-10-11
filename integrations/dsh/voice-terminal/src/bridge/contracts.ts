@@ -38,17 +38,20 @@ export interface PendingContext {
 export interface PendingReminder { messageId: string }
 
 /**
- * RuntimeActivity（实时活动）：仅供运行轨迹单槽使用，不包含工具参数或结果正文。
- * stream（活动流）区分 thinking（思考）和 tool（工具）；phase（阶段）与 tool_status（工具状态）必须对应。
+ * RuntimeActivity（实时活动）：投影当前运行中可展开的思考、工具详情、作业输出及授权请求。
+ * stream（活动流）、phase（阶段）与 tool_status（工具状态）共同描述条目生命周期；正文经凭据脱敏。
  */
 export type RuntimeActivity =
   | { stream: 'thinking'; phase: 'delta'; /** item_id（思考块标识）。 */ item_id: string; /** delta（思考文本增量）：保留空白，最多 2000 字符。 */ delta: string }
   | { stream: 'thinking'; phase: 'completed'; /** item_id（已结束思考块标识）。 */ item_id: string }
-  | { stream: 'tool'; phase: 'started'; /** item_id（工具调用标识）。 */ item_id: string; /** tool_name（工具名称）。 */ tool_name: string; tool_status: 'running' }
-  | { stream: 'tool'; phase: 'completed'; /** item_id（工具调用标识）。 */ item_id: string; /** tool_name（工具名称）。 */ tool_name: string; tool_status: 'completed' }
-  | { stream: 'tool'; phase: 'failed'; /** item_id（工具调用标识）。 */ item_id: string; /** tool_name（工具名称）。 */ tool_name: string; tool_status: 'failed' }
+  | { stream: 'tool' | 'output'; phase: 'started' | 'delta' | 'completed' | 'failed'; /** item_id（调用或作业标识）。 */ item_id: string; /** tool_name（工具或作业名称）。 */ tool_name: string; /** tool_status（执行状态）。 */ tool_status: 'running' | 'completed' | 'failed'; /** text（参数、结果或作业详情）。 */ text?: string; /** delta（输出增量）。 */ delta?: string }
+  | { stream: 'approval'; phase: 'started' | 'completed' | 'failed'; /** item_id（权限卡片标识）。 */ item_id: string; /** approval_id（待决权限标识）。 */ approval_id: string; /** tool_name（待授权工具）。 */ tool_name: string; /** text（请求内容）。 */ text: string }
 
 export interface Binding {
+  /** toolArguments（参数缓存）：仅用于权限卡片显示，不改变工具行为。 */
+  toolArguments?: Map<string, string>
+  /** pendingApprovals（待决权限）：取消或切换运行时必须结算。 */
+  pendingApprovals?: Map<string, { activationId: string; settle: (outcome: 'allowed-once' | 'rejected' | 'cancelled') => void }>
   voiceSessionId: string
   dshSessionId: string
   epoch: number

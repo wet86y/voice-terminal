@@ -323,6 +323,8 @@ class SpeakerConfig:
     owner_only_barge_in: bool = False
     confirm_threshold: float = 0.60
     continuity_threshold: float = 0.50
+    # continuity_relaxation（连续主人阈值放宽量）：旧绝对阈值仅用于兼容配置。
+    continuity_relaxation: float | None = None
     window_ms: int = 2000
     step_ms: int = 500
     min_speech_ms: int = 700
@@ -336,8 +338,12 @@ class SpeakerConfig:
             raise ValueError("speaker.mode must be off, observe, or filter")
         if type(self.owner_only_barge_in) is not bool:
             raise ValueError("speaker.owner_only_barge_in must be boolean")
-        if not 0.0 <= self.continuity_threshold < self.confirm_threshold <= 1.0:
-            raise ValueError("speaker thresholds must satisfy 0 <= continuity < confirm <= 1")
+        if self.continuity_relaxation is not None:
+            if not 0 <= self.continuity_relaxation <= 0.20:
+                raise ValueError("continuity_relaxation（连续主人放宽量）必须在 0 至 0.20 之间")
+            object.__setattr__(self, "continuity_threshold", max(0.0, self.confirm_threshold - self.continuity_relaxation))
+        if not 0.0 <= self.continuity_threshold <= self.confirm_threshold <= 1.0:
+            raise ValueError("声纹阈值必须满足 0 ≤ 连续阈值 ≤ 主人阈值 ≤ 1")
         if self.window_ms < 500 or self.step_ms < 100 or self.step_ms > self.window_ms:
             raise ValueError("speaker window settings are invalid")
         if self.min_speech_ms < 100 or self.min_speech_ms > self.window_ms:
@@ -977,6 +983,7 @@ class AppConfig:
                 owner_only_barge_in=speaker.get("owner_only_barge_in", False),
                 confirm_threshold=float(_number(speaker.get("confirm_threshold"), 0.60)),
                 continuity_threshold=float(_number(speaker.get("continuity_threshold"), 0.50)),
+                continuity_relaxation=(float(speaker["continuity_relaxation"]) if "continuity_relaxation" in speaker else None),
                 window_ms=int(_number(speaker.get("window_ms"), 2000)),
                 step_ms=int(_number(speaker.get("step_ms"), 500)),
                 min_speech_ms=int(_number(speaker.get("min_speech_ms"), 700)),

@@ -1290,7 +1290,17 @@ class DshShadowAgentSession:
                 self._update_telemetry(payload)
             matched = await self._callback_matches_or_reconcile(payload)
             terminal_match = self._matches_pending_terminal_callback(payload)
-            if not matched and not terminal_match:
+            # 后台作业可跨越根代理结算；只接受最近结束的同一运行，下一激活会重置序号。
+            detail_terminal_match = (self.activation_id is None and not self._retired
+                and payload.get("protocol_version") == BRIDGE_PROTOCOL_VERSION
+                and payload.get("voice_session_id") == self.voice_session_id
+                and payload.get("dsh_session_id") == self._last_terminal_dsh_session_id == self.dsh_session_id
+                and payload.get("epoch") == self.epoch
+                and payload.get("activation_id") == self._last_terminal_activation_id
+                and payload.get("context_revision") == self.last_applied_revision
+                and isinstance(payload.get("activity"), Mapping)
+                and payload["activity"].get("stream") == "output")
+            if not matched and not terminal_match and not detail_terminal_match:
                 return "stale"
             raw_activity = payload.get("activity")
             normalized = None
@@ -1301,8 +1311,8 @@ class DshShadowAgentSession:
                 if normalized is None:
                     return "conflict"
                 if self.activation_id is None and (
-                        not terminal_match or normalized["stream"] != "tool"
-                        or normalized["phase"] not in {"completed", "failed"}):
+                        not detail_terminal_match and (not terminal_match or normalized["stream"] != "tool"
+                        or normalized["phase"] not in {"completed", "failed"})):
                     return "stale"
             # action_seq（动作序号）也约束空闲状态，避免旧状态清空新动作。
             if "action_seq" in payload or normalized is not None:
@@ -1387,8 +1397,14 @@ class DshShadowAgentSession:
                     return None
                 return {"item_id": item_id.strip(), "stream": stream, "phase": phase}
             return None
-        if stream == "tool" and phase in {"started", "completed", "failed"}:
-            if set(raw) != {"stream", "phase", "item_id", "tool_name", "tool_status"}:
+        if stream == "approval" and phase in {"started", "completed", "failed"}:
+            if set(raw) != {"stream", "phase", "item_id", "approval_id", "tool_name", "text"}:
+                return None
+            if any(not isinstance(raw.get(key), str) or not raw[key].strip() or len(raw[key]) > limit for key, limit in (("approval_id", 160), ("tool_name", 160), ("text", 12000))):
+                return None
+            return {"stream": stream, "phase": phase, "item_id": item_id, "approval_id": raw["approval_id"], "tool_name": _safe_activity_text(raw["tool_name"], limit=160), "text": _safe_activity_text(raw["text"], limit=12000)}
+        if stream in {"tool", "output"} and phase in {"started", "delta", "completed", "failed"}:
+            if set(raw) - {"stream", "phase", "item_id", "tool_name", "tool_status", "text", "delta"}:
                 return None
             raw_name = raw.get("tool_name")
             if not isinstance(raw_name, str) or not raw_name.strip() or len(raw_name) > 160:
@@ -1398,13 +1414,27 @@ class DshShadowAgentSession:
             if (not tool_name or not isinstance(tool_status, str)
                     or tool_status not in {"running", "completed", "failed"}):
                 return None
-            if tool_status != phase and not (phase == "started" and tool_status == "running"):
+            if tool_status != phase and not (phase in {"started", "delta"} and tool_status == "running"):
                 return None
-            return {
+            normalized = {
                 "item_id": item_id.strip(), "stream": stream, "phase": phase,
                 "tool_name": tool_name, "tool_status": tool_status,
             }
+            for key, limit in (("text", 12000), ("delta", 2000)):
+                if key in raw:
+                    if not isinstance(raw[key], str) or len(raw[key]) > limit:
+                        return None
+                    normalized[key] = _safe_activity_text(raw[key], limit=limit)
+            return normalized
         return None
+
+    async def decide_approval(self, approval_id: str, decision: str, run_seq: int) -> dict[str, Any]:
+        """decide_approval（权限决定）：限定当前运行，一次允许或拒绝；不改变持久权限策略。"""
+        async with self._event_lock:
+            if self._retired or not self.activation_id or run_seq != self._run_seq:
+                raise DshBridgeError("权限请求所属运行已结束或更换")
+            return await self.client.call("approval.decide", self._envelope(
+                activation_id=self.activation_id, approval_id=approval_id, decision=decision))
 
     def _update_telemetry(self, payload: dict[str, Any]) -> None:
         """telemetry（插件用量）只允许有限的非负计数及缓存比例。"""

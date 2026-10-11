@@ -131,7 +131,7 @@ function invalidDevice(row: LocalComponentRow) {
                 <div v-if="row.vram !== undefined" data-metric="vram"><dt>显存</dt><dd>{{ row.vram }}</dd></div>
               </div>
             </dl>
-            <p v-if="!job && needsResource(row) && row.resource" class="local-error" role="status">{{ row.resource.error || (row.resource.updateAvailable ? '此组件需更新并通过校验后才能启动。' : '请下载或导入此组件。') }}</p>
+            <p v-if="!job && needsResource(row) && row.resource" class="local-error" role="status">{{ row.resource.error || (row.resource.required === false ? '可选组件，缺失或待更新不阻塞启动。' : row.resource.updateAvailable ? '此组件需更新并通过校验后才能启动。' : '请下载或导入此组件。') }}</p>
             <p v-else-if="!job && row.error && !row.busy" class="local-error">{{ row.error }}</p>
           </div>
           <button v-if="job && jobIsActive(job)" class="outline-button local-resource-cancel" type="button" :disabled="!job.canCancel" :aria-label="`${row.name}：取消任务`" @click="emit('cancelResource', job.id)">{{ job.canCancel ? '取消任务' : '处理中…' }}</button>

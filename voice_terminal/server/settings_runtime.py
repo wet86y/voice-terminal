@@ -50,6 +50,7 @@ class ProductSettingsRuntimeMixin:
                     "mode": next_config.speaker.mode,
                     "confirm_threshold": next_config.speaker.confirm_threshold,
                     "continuity_threshold": next_config.speaker.continuity_threshold,
+                    "continuity_relaxation": next_config.speaker.continuity_relaxation,
                     "owner_only_barge_in": next_config.speaker.owner_only_barge_in,
                 })
             self.config = next_config

@@ -107,6 +107,16 @@ def test_confirmed_non_owner_survives_final_acknowledgement_timeout():
     asyncio.run(scenario())
 
 
+def test_recent_owner_continuity_uses_the_relaxed_threshold_for_filtering():
+    async def scenario():
+        controller, ws = make_controller(0.55)
+        controller.speaker_router.machine._last_owner_confirmed_at = time.monotonic()
+        decision = await controller._speaker_decision(ws)
+        assert decision.state == SpeakerState.OWNER_CONTINUITY
+        assert decision.route == "main"
+    asyncio.run(scenario())
+
+
 def _observe_embedding(router, ws, *, score, start, turn_speech_ms):
     router.observe(SpeakerObservation(
         turn_id=ws.turn_id, generation=ws.generation,
@@ -322,7 +332,8 @@ def test_filter_without_router_cannot_bypass_identity_gate():
         controller.speaker_router = None
         await controller._input_committed(ws, ws.token)
         controller.episode.observe.assert_not_awaited()
-        assert controller.ambient_store.records[0]["speaker_state"] == "unavailable"
+        assert controller.ambient_store.records[0]["speaker_state"] == "non_owner_confirmed"
+        assert controller.ambient_store.records[0]["reason"] == "speaker_router_unavailable"
     asyncio.run(scenario())
 
 

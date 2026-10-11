@@ -139,6 +139,6 @@ def test_settings_short_window_is_eligible_but_turn_gate_stays_two_seconds():
     assert result["window_diagnostics"][0]["quality"] == "ready"
     assert result["window_count"] == 1
     assert result["speech_ms"] == 750
-    assert result["state"] == "unknown"
+    assert result["state"] == "non_owner_confirmed"
     assert result["reason"] == "speaker_test_insufficient_turn_speech"
     assert len(model.inputs) == 1

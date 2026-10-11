@@ -198,7 +198,7 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
     let runtime=crate::runtime::status(context)?;let groups=runtime["groups"].clone();
     let ready=runtime["full_ready"]==true;
     let mut rows=vec![json!({"resource_id":"voice-server","label":"Voice Server（语音服务）","installation_state":if runtime["interpreter_ready"]==true{"installed"}else{"missing"},
-        "files_installed":runtime["interpreter_ready"],"runtime_ready":ready,"can_start":ready,"runtime_group":"all","python":runtime["python"],"version":runtime["version"],
+        "required":true,"files_installed":runtime["interpreter_ready"],"runtime_ready":ready,"can_start":ready,"runtime_group":"all","python":runtime["python"],"version":runtime["version"],
         "update_available":runtime["update_available"],"source_url":"https://www.python.org/downloads/release/python-31210/","error":if ready{Value::Null}else if runtime["update_available"]==true{json!("语音运行依赖有更新，请更新完整运行环境后再启动。")}else{json!("请下载或导入完整 Python（后端运行环境），程序将一次检测并补齐全部语音依赖。")},
         "fields":{"files_installed":"私有解释器已安装","runtime_ready":"全部语音依赖已按当前锁定版本就绪","can_start":"具备启动条件且没有待更新组件","runtime_group":"完整语音依赖","python":"私有解释器路径","version":"解释器版本","update_available":"运行环境依赖锁版本可更新"}})];
     for item in specs(context)? {
@@ -234,14 +234,14 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
         let can_start=result.is_ok()&&dependencies&&!update_available;
         let error=result.as_ref().err().cloned().or_else(||node_status.err()).or_else(||if update_available{Some("该组件的版本或适配要求有更新，请先完成更新。".into())}else{None});
         rows.push(json!({"resource_id":item["resource_id"],"label":item["title"],"installation_state":if result.is_ok(){"installed"}else if root.exists(){"incomplete"}else{"missing"},
-            "files_installed":result.is_ok(),"runtime_ready":dependencies,"can_start":can_start,
+            "required":item["required"]!=false,"files_installed":result.is_ok(),"runtime_ready":dependencies,"can_start":can_start,
             "source_url":if item["kind"]=="dsh"&&!dependencies{json!("https://nodejs.org/en/download")}else{item["source"]["page_url"].clone()},"error":error,"runtime_group":group,
             "version":item["version"],"installed_version":installed_version,"update_available":update_available,
-            "fields":{"files_installed":"模型或组件文件已安装","runtime_ready":"共享运行依赖已就绪","can_start":"具备启动条件","runtime_group":"启动所需共享依赖组",
+            "fields":{"required":"是否为阻塞启动的必需组件","files_installed":"模型或组件文件已安装","runtime_ready":"共享运行依赖已就绪","can_start":"具备启动条件","runtime_group":"启动所需共享依赖组",
                 "version":"随程序提供的目标模型或组件版本","installed_version":"实际安装的模型或组件版本；旧清单未知时为空","update_available":"目标模型或组件内容、版本可更新"}}));
     }
-    let updates_pending=rows.iter().any(|row|row["update_available"]==true);
-    let other_components_ready=rows.iter().skip(1).all(|row|row["can_start"]==true);
+    let updates_pending=rows.iter().any(|row|row["required"]!=false&&row["update_available"]==true);
+    let other_components_ready=rows.iter().skip(1).filter(|row|row["required"]!=false).all(|row|row["can_start"]==true);
     if let Some(server)=rows.first_mut(){
         server["can_start"]=json!(ready&&!updates_pending&&other_components_ready);
         server["updates_pending"]=json!(updates_pending);
@@ -264,7 +264,7 @@ pub fn startup_readiness_with_progress(context:&LaunchContext,cancel:&AtomicBool
     check_cancel(cancel)?;
     // 已有缺失、待更新或依赖未就绪时直接进入管理页，不反复读取不能运行的旧组件。
     // 语音环境启动时快速核对文件集合和大小；模型完整摘要复核，代理复用未变化的近期核验结果。
-    if rows.iter().any(|row|row["can_start"]!=true){return Ok(readiness_from_inventory(&rows));}
+    if rows.iter().any(|row|row["required"]!=false&&row["can_start"]!=true){return Ok(readiness_from_inventory(&rows));}
     validate_inventory_hashes(context,&mut rows,cancel,progress)?;
     Ok(readiness_from_inventory(&rows))
 }
@@ -284,7 +284,7 @@ fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&At
     let mut plans=Vec::new();
     for index in 1..rows.len(){
         let row=&rows[index];
-        if row["files_installed"]!=true{continue;}
+        if row["required"]==false||row["files_installed"]!=true{continue;}
         let Some(id)=row["resource_id"].as_str()else{continue;};
         let label=row["label"].as_str().unwrap_or(id).to_owned();
         let budget:Result<u64,String>=(||{
@@ -341,13 +341,13 @@ fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&At
         completed=completed.saturating_add(component_total).min(total);
     }
     if total>0{progress("组件校验完成",total,total);}
-    if rows.iter().skip(1).any(|row|row["can_start"]!=true){
+    if rows.iter().skip(1).any(|row|row["required"]!=false&&row["can_start"]!=true){
         if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);server["error"]=json!("有组件文件损坏、尚未就绪或需要更新，请完成修复后再启动。");}
     }
     Ok(())
 }
 fn readiness_from_inventory(rows:&[Value])->Value{
-    let missing=rows.iter().filter(|row|row["can_start"]!=true).map(|row|json!({
+    let missing=rows.iter().filter(|row|row["required"]!=false&&row["can_start"]!=true).map(|row|json!({
         "resource_id":row["resource_id"],"label":row["label"],
         "reason":row["error"].as_str().unwrap_or(if row["update_available"]==true{"组件有更新，需先完成更新"}else{"组件文件或共享运行依赖尚未完备"})
     })).collect::<Vec<_>>();
@@ -834,6 +834,16 @@ mod download_tests {
         assert_eq!(update_readiness["missing"][0]["reason"],"组件有更新，需先完成更新");
         assert_eq!(readiness_from_inventory(&[complete])["ready"],true);
         assert_eq!(readiness_from_inventory(&[])["ready"],false);
+    }
+
+    #[test]
+    fn optional_missing_or_outdated_components_do_not_block_startup() {
+        let server=json!({"resource_id":"voice-server","required":true,"can_start":true});
+        for optional in [json!({"resource_id":"campplus-zh-cn-common","required":false,"can_start":false,"files_installed":false}),
+            json!({"resource_id":"campplus-zh-cn-common","required":false,"can_start":false,"update_available":true})] {
+            let readiness=readiness_from_inventory(&[server.clone(),optional]);
+            assert_eq!(readiness["ready"],true);assert_eq!(readiness["missing"],json!([]));
+        }
     }
 
     #[test]
