@@ -875,12 +875,13 @@ pub fn verify_tree_with_progress(root:&Path,manifest_name:&str,cancel:&AtomicBoo
     if metadata_reparse(&fs::symlink_metadata(root).map_err(|e|e.to_string())?){return Err("组件目录不能是链接。".into());}
     let value=load(&safe_path(root,manifest_name)?)?;
     let records=value["files"].as_array().ok_or("组件清单缺少文件集合")?;
-    verify_records_with_progress(root,records,true,cancel,progress)
+    let files=prepare_validation_files(root,records,true,value["kind"]=="python",cancel,progress)?;
+    hash_validation_files(&files,cancel,progress).map(|_|())
 }
 
 /// verify_records_with_progress（固定文件内容校验）：模型允许清单外辅助文件，运行环境要求完整文件集合。
 pub fn verify_records_with_progress(root:&Path,records:&[Value],exact:bool,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
-    let files=prepare_validation_files(root,records,exact,cancel,progress)?;
+    let files=prepare_validation_files(root,records,exact,false,cancel,progress)?;
     hash_validation_files(&files,cancel,progress).map(|_|())
 }
 
@@ -894,10 +895,58 @@ pub fn verify_tree_sizes_with_progress(root:&Path,manifest_name:&str,cancel:&Ato
     if metadata_reparse(&fs::symlink_metadata(root).map_err(|e|e.to_string())?){return Err("组件目录不能是链接。".into());}
     progress("核对组件文件清单",0,0);validation_cancel(cancel)?;
     let value=load(&safe_path(root,manifest_name)?)?;
-    prepare_validation_files(root,value["files"].as_array().ok_or("组件清单缺少文件集合")?,true,cancel,progress).map(|_|())
+    prepare_validation_files(root,value["files"].as_array().ok_or("组件清单缺少文件集合")?,true,value["kind"]=="python",cancel,progress).map(|_|())
+}
+/// verify_cached_tree_with_progress（复用近期内容复核）：每次盘点文件，内容结果最多复用七天。
+pub fn verify_cached_tree_with_progress(root:&Path,manifest_name:&str,cache:&Path,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
+    verify_tree_sizes_with_progress(root,manifest_name,cancel,&mut|_,_,_|progress("核对组件文件清单",0,0))?;
+    validation_cancel(cancel)?;
+    let manifest=safe_path(root,manifest_name)?;let manifest_sha256=file_hash(&manifest)?;
+    let files_fingerprint=startup_content_fingerprint(root,cancel)?;validation_cancel(cancel)?;
+    let now=SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e|e.to_string())?.as_secs();
+    let record=load(cache).unwrap_or(Value::Null);
+    let fresh=record["verified_at"].as_u64().is_some_and(|time|time<=now&&now-time<7*24*60*60);
+    if record["schema"]==1&&record["root"]==root.to_string_lossy().as_ref()&&record["manifest_sha256"]==manifest_sha256&&record["files_fingerprint"]==files_fingerprint&&fresh{
+        let value=load(&manifest)?;
+        let total=value["files"].as_array().ok_or("组件清单缺少文件集合")?.iter()
+            .try_fold(0u64,|sum,file|sum.checked_add(file["size"].as_u64().ok_or("清单大小无效")?).ok_or("组件校验大小溢出"))?;
+        progress("复用近期组件内容复核",total,total);validation_cancel(cancel)?;return Ok(());
+    }
+    verify_tree_with_progress(root,manifest_name,cancel,progress)?;validation_cancel(cancel)?;
+    // 只有完整核验期间文件与清单都未变化，才签发下次启动可复用的结果。
+    if file_hash(&manifest)?!=manifest_sha256||startup_content_fingerprint(root,cancel)?!=files_fingerprint{
+        return Err("组件在内容校验期间发生变化，请重新校验。".into());
+    }
+    validation_cancel(cancel)?;
+    // 缓存不可写时本次完整校验仍然有效，下次启动会继续完整核验。
+    let _=atomic_json(cache,&json!({"schema":1,"root":root,"manifest_sha256":manifest_sha256,"files_fingerprint":files_fingerprint,"verified_at":now,
+        "fields":{"schema":"启动内容复核缓存格式","root":"已经完整复核的组件绝对目录","manifest_sha256":"完整文件清单摘要","files_fingerprint":"文件路径、大小、创建及修改时间指纹","verified_at":"完整内容校验开始时的 Unix（统一时间）秒数，最多复用七天"}}));
+    Ok(())
 }
 
-fn prepare_validation_files(root:&Path,records:&[Value],exact:bool,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<Vec<ValidationFile>,String>{
+fn startup_content_fingerprint(root:&Path,cancel:&AtomicBool)->Result<String,String>{
+    let mut digest=Sha256::new();
+    for path in crate::resources::walk(root)?{
+        validation_cancel(cancel)?;let metadata=path.metadata().map_err(|e|e.to_string())?;
+        let modified=metadata.modified().map_err(|e|e.to_string())?.duration_since(UNIX_EPOCH).map_err(|e|e.to_string())?.as_nanos();
+        let created=metadata.created().ok().and_then(|time|time.duration_since(UNIX_EPOCH).ok()).map(|time|time.as_nanos()).unwrap_or(0);
+        let relative=path.strip_prefix(root).map_err(|e|e.to_string())?.to_string_lossy().replace('\\',"/");
+        digest.update(format!("{relative}:{}:{created}:{modified}\n",metadata.len()).as_bytes());
+    }Ok(format!("{:x}",digest.finalize()))
+}
+
+
+/// python_bytecode_source（缓存对应源码）：只识别 Python 3.12（后端解释器）的标准缓存命名。
+fn python_bytecode_source(relative:&str)->Option<String>{
+    let path=Path::new(relative);let parent=path.parent()?;
+    if parent.file_name()?.to_str()? != "__pycache__" {return None;}
+    let filename=path.file_name()?.to_str()?.strip_suffix(".pyc")?;
+    let (module,optimization)=filename.rsplit_once(".cpython-312")?;
+    if module.is_empty()||!["",".opt-1",".opt-2"].contains(&optimization){return None;}
+    Some(parent.parent()?.join(format!("{module}.py")).to_string_lossy().replace('\\',"/"))
+}
+
+fn prepare_validation_files(root:&Path,records:&[Value],exact:bool,allow_python_bytecode:bool,cancel:&AtomicBool,progress:&mut dyn FnMut(&str,u64,u64))->Result<Vec<ValidationFile>,String>{
     validation_cancel(cancel)?;
     if metadata_reparse(&fs::symlink_metadata(root).map_err(|e|e.to_string())?){return Err("组件目录不能是链接。".into());}
     let mut expected=std::collections::HashSet::new();
@@ -909,7 +958,14 @@ fn prepare_validation_files(root:&Path,records:&[Value],exact:bool,cancel:&Atomi
     let mut present=std::collections::HashMap::new();let mut last_report=Instant::now();
     progress("核对组件文件清单",0,0);
     collect_validation_files(root,root,&mut present,cancel,records.len(),&mut last_report,progress)?;
-    if (exact&&expected.len()!=present.len())||!expected.iter().all(|path|present.contains_key(path)){return Err("组件文件集合与发布清单不一致。".into());}
+    // 仅解释器组件允许清单外的标准字节码缓存，且对应源码必须已列入清单。
+    // 已列入清单的缓存仍核验摘要；目录链接、动态库及其它新增文件继续拒绝。
+    if allow_python_bytecode{present.retain(|name,_|expected.contains(name)||!python_bytecode_source(name).is_some_and(|source|expected.contains(&source)));}
+    if (exact&&expected.len()!=present.len())||!expected.iter().all(|path|present.contains_key(path)){
+        let mut missing=expected.iter().filter(|name|!present.contains_key(*name)).cloned().collect::<Vec<_>>();missing.sort();
+        let mut extra=present.keys().filter(|name|!expected.contains(*name)).cloned().collect::<Vec<_>>();extra.sort();
+        return Err(format!("组件文件集合与发布清单不一致。缺失 {} 个（{}）；新增 {} 个（{}）。",missing.len(),missing.into_iter().take(3).collect::<Vec<_>>().join("、"),extra.len(),extra.into_iter().take(3).collect::<Vec<_>>().join("、")));
+    }
     let mut files=Vec::with_capacity(records.len());
     for item in records{
         validation_cancel(cancel)?;
@@ -1029,6 +1085,59 @@ mod component_validation_tests {
         fs::write(&target,vec![4;4096]).unwrap();fs::write(root.join("extra.bin"),b"extra").unwrap();
         assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("文件集合"));fs::remove_file(root.join("extra.bin")).unwrap();
         fs::remove_file(&target).unwrap();assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("文件集合"));fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn python_generated_bytecode_does_not_block_verified_runtime(){
+        let root=fixture();fs::create_dir_all(root.join("Lib/site-packages/demo")).unwrap();
+        fs::write(root.join("Lib/site-packages/demo/__init__.py"),b"value = 1\n").unwrap();
+        atomic_json(&root.join("manifest.json"),&crate::resources::manifest(&root,"python","1").unwrap()).unwrap();
+        let cache=root.join("Lib/site-packages/demo/__pycache__");fs::create_dir_all(&cache).unwrap();
+        let cached=cache.join("__init__.cpython-312.pyc");fs::write(&cached,b"generated cache").unwrap();
+        verify_tree(&root,"manifest.json").unwrap();verify_tree_sizes(&root,"manifest.json").unwrap();
+        assert!(cached.is_file());
+        let unknown=cache.join("missing.cpython-312.pyc");fs::write(&unknown,b"no packaged source").unwrap();
+        let error=verify_tree(&root,"manifest.json").unwrap_err();assert!(error.contains("missing.cpython-312.pyc"));fs::remove_file(unknown).unwrap();
+        let injected=cache.join("unknown.dll");fs::write(&injected,b"not bytecode").unwrap();
+        assert!(verify_tree_sizes(&root,"manifest.json").unwrap_err().contains("unknown.dll"));fs::remove_file(injected).unwrap();
+        fs::write(root.join("Lib/site-packages/demo/__init__.py"),b"value = 2\n").unwrap();
+        assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("校验失败"));fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn packaged_bytecode_is_hashed_and_other_components_reject_extra_cache(){
+        let root=fixture();fs::write(root.join("module.py"),b"value = 1\n").unwrap();
+        fs::create_dir_all(root.join("__pycache__")).unwrap();let cached=root.join("__pycache__/module.cpython-312.pyc");
+        fs::write(&cached,b"packaged bytecode").unwrap();
+        atomic_json(&root.join("manifest.json"),&crate::resources::manifest(&root,"python","1").unwrap()).unwrap();
+        fs::write(&cached,b"modified bytecode").unwrap();assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("校验失败"));
+        fs::remove_file(&cached).unwrap();atomic_json(&root.join("manifest.json"),&crate::resources::manifest(&root,"dsh","1").unwrap()).unwrap();
+        fs::write(&cached,b"generated cache").unwrap();assert!(verify_tree_sizes(&root,"manifest.json").unwrap_err().contains("文件集合"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn startup_cache_reuses_only_complete_unchanged_content_and_detects_corruption(){
+        let root=fixture();let cache=root.with_extension("validation.json");let cancel=AtomicBool::new(false);
+        let mut phases=vec![];verify_cached_tree_with_progress(&root,"manifest.json",&cache,&cancel,&mut|phase,_,_|phases.push(phase.to_owned())).unwrap();
+        assert!(phases.iter().any(|phase|phase=="校验组件文件内容"));assert!(cache.is_file());phases.clear();
+        verify_cached_tree_with_progress(&root,"manifest.json",&cache,&cancel,&mut|phase,_,_|phases.push(phase.to_owned())).unwrap();
+        assert!(phases.iter().any(|phase|phase=="复用近期组件内容复核"));assert!(!phases.iter().any(|phase|phase=="校验组件文件内容"));
+        fs::write(root.join("中文 目录/nested/004.bin"),vec![99;4096]).unwrap();
+        assert!(verify_cached_tree_with_progress(&root,"manifest.json",&cache,&cancel,&mut|_,_,_|{}).unwrap_err().contains("校验失败"));
+        fs::remove_file(cache).unwrap();fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn stale_missing_or_invalid_cache_requires_full_validation_and_cancel_never_seeds_cache(){
+        let root=fixture();let cache=root.with_extension("validation.json");let cancel=AtomicBool::new(false);
+        verify_cached_tree_with_progress(&root,"manifest.json",&cache,&cancel,&mut|_,_,_|{}).unwrap();
+        let initial=load(&cache).unwrap();
+        for mode in ["expired","future","invalid","missing"]{
+            let mut record=initial.clone();
+            match mode{"expired"=>record["verified_at"]=json!(0),"future"=>record["verified_at"]=json!(u64::MAX),"invalid"=>record["manifest_sha256"]=json!("wrong"),_=>{}}
+            if mode=="missing"{fs::remove_file(&cache).unwrap();}else{atomic_json(&cache,&record).unwrap();}
+            let mut hashed=false;verify_cached_tree_with_progress(&root,"manifest.json",&cache,&cancel,&mut|phase,_,_|hashed|=phase=="校验组件文件内容").unwrap();assert!(hashed);
+        }
+        fs::remove_file(&cache).unwrap();
+        assert!(verify_cached_tree_with_progress(&root,"manifest.json",&cache,&cancel,&mut|phase,_,_|{if phase=="校验组件文件内容"{cancel.store(true,Ordering::Release);}}).unwrap_err().contains("取消"));
+        assert!(!cache.exists());fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn rejects_duplicates_traversal_and_reserved_names(){

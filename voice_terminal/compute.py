@@ -243,9 +243,19 @@ def hardware_status(*, refresh: bool = False) -> dict[str, Any]:
             if isinstance(registration.get("gpu_hardware"),dict):result["gpu"]=registration["gpu_hardware"]
             result["registered_environment"] = registration["path"]  # registered_environment（已验证的显卡解释器目录）。
         elif os.environ.get("VOICE_LAUNCH_CHANNEL") in {"product", "distribution"}:
-            try: legacy=json.loads((install/'runtimes/python/runtime.json').read_text('utf-8')).get('profile')=='cu128'
-            except (OSError,ValueError): legacy=False
-            if not legacy or (data/'config/gpu-environment.json').is_file():
+            try:
+                runtime_record=json.loads((install/'runtimes/python/runtime.json').read_text('utf-8'))
+                compatible=runtime_record.get('profile')=='cu128'
+                if (runtime_record.get('schema')==2 and runtime_record.get('profile')=='compatible-private'
+                        and runtime_record.get('compatible_gpu') is True):
+                    # compatible-private（已验证的兼容显卡环境）是旧 cu128（显卡运行组合）更新后的登记。
+                    # 依赖锁必须仍匹配；实际后端与逐模型加载检查继续决定显卡能力。
+                    import hashlib
+                    program=Path(os.environ.get('VOICE_PROGRAM_ROOT',str(install/'app')))
+                    lock_digest=hashlib.sha256((program/'config/runtime/voice-runtime.lock.json').read_bytes()).hexdigest()
+                    compatible=runtime_record.get('lock_sha256')==lock_digest
+            except (OSError,ValueError,AttributeError): compatible=False
+            if not compatible or (data/'config/gpu-environment.json').is_file():
                 for capability in result.get('models',{}).values():
                     capability.update(gpu_available=False,reason='显卡环境未登记或版本已变化，请在组件页面重新检测。')
     if os.environ.get("VOICE_GPU_FALLBACK"):

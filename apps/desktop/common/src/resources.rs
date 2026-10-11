@@ -26,7 +26,23 @@ pub fn load(path:&Path)->Result<Value,String>{
     serde_json::from_slice(bytes.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(&bytes)).map_err(|e|e.to_string())
 }
 pub fn specs(context:&LaunchContext)->Result<Vec<Value>,String>{
-    Ok(load(&context.installed_program().join("config/resources/catalog.json"))?["resources"].as_array().ok_or("资源目录格式无效")?.clone())
+    let mut items=load(&context.installed_program().join("config/resources/catalog.json"))?["resources"].as_array().ok_or("资源目录格式无效")?.clone();
+    let settings=load(&context.data.join("config/product-settings.json")).unwrap_or(Value::Null);
+    let runtime=load(&context.install.join("runtimes/python/runtime.json")).unwrap_or(Value::Null);
+    let registration=load(&context.data.join("config/gpu-environment.json")).unwrap_or(Value::Null);
+    let device=settings["compute"]["devices"]["smart_turn"].as_str().unwrap_or("auto");
+    let gpu_environment=runtime["compatible_gpu"]==true||runtime["profile"]=="cu128"||registration["models"]["smart_turn"]["gpu_available"]==true;
+    for item in &mut items{
+        if item["kind"]!="model"{continue;}
+        let installed=destination(context,item)?;let smart_turn=item["resource_id"]=="smart-turn";
+        if let Some(files)=item["files"].as_array_mut(){for file in files{
+            if file["optional"]!=true{continue;}
+            let path=file["path"].as_str().ok_or("模型文件名称缺失")?;
+            // 已有可选权重必须随更新保留；明确显卡选择或兼容显卡环境需要对应的显卡权重。
+            let gpu_selected=smart_turn&&path.ends_with("-gpu.onnx")&&(device=="cuda"||(device!="cpu"&&gpu_environment));
+            if gpu_selected||safe_path(&installed,path)?.is_file(){file["optional"]=json!(false);}
+        }}
+    }Ok(items)
 }
 pub fn spec(context:&LaunchContext,id:&str)->Result<Value,String>{specs(context)?.into_iter().find(|v|v["resource_id"]==id).ok_or("不支持的资源编号".into())}
 fn destination(context:&LaunchContext,spec:&Value)->Result<PathBuf,String>{
@@ -233,13 +249,13 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
 pub fn startup_readiness(context:&LaunchContext)->Result<Value,String>{
     startup_readiness_with_progress(context,&AtomicBool::new(false),&mut|_,_,_|{})
 }
-/// startup_readiness_with_progress（启动校验进度）：语音环境核对清单和大小，其余已安装组件完整摘要复核。
+/// startup_readiness_with_progress（启动校验进度）：模型完整摘要复核，代理复用近期内容复核，语音环境快速盘点。
 pub fn startup_readiness_with_progress(context:&LaunchContext,cancel:&AtomicBool,progress:&mut Progress)->Result<Value,String>{
     check_cancel(cancel)?;progress("正在校验：Voice Server（语音服务）",0,0);
     let mut rows=inventory(context)?;
     check_cancel(cancel)?;
     // 已有缺失、待更新或依赖未就绪时直接进入管理页，不反复读取不能运行的旧组件。
-    // 语音环境启动时快速核对文件集合和大小；模型与代理组件仍逐文件复核 SHA-256（文件摘要）。
+    // 语音环境启动时快速核对文件集合和大小；模型完整摘要复核，代理复用未变化的近期核验结果。
     if rows.iter().any(|row|row["can_start"]!=true){return Ok(readiness_from_inventory(&rows));}
     validate_inventory_hashes(context,&mut rows,cancel,progress)?;
     Ok(readiness_from_inventory(&rows))
@@ -304,7 +320,10 @@ fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&At
                 let installed=inspect_installed_model(context,&item,false)?;
                 let files=installed.files.into_iter().filter(|file|file["optional"]!=true||root.join(file["path"].as_str().unwrap()).is_file()).collect::<Vec<_>>();
                 crate::workspace::verify_records_with_progress(&root,&files,false,cancel,&mut report)
-            }else{crate::workspace::verify_tree_with_progress(&root,"manifest.json",cancel,&mut report)}
+            }else{
+                let cache=safe_path(&context.install,"cache/component-validation/dsh.json")?;
+                crate::workspace::verify_cached_tree_with_progress(&root,"manifest.json",&cache,cancel,&mut report)
+            }
         })();
         check_cancel(cancel)?;
         if let Err(error)=result{
@@ -834,6 +853,33 @@ mod download_tests {
         fs::write(root.join("runtimes/python/python.exe"),b"different-size").unwrap();
         let readiness=startup_readiness(&context).unwrap();
         assert_eq!(readiness["ready"],false);assert!(readiness["missing"][0]["reason"].as_str().unwrap().contains("文件清单或大小"));crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+    #[test]
+    fn gpu_choice_installs_missing_optional_weights_and_later_updates_preserve_them(){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();let root=owner.join(format!("voice-gpu-model-update-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();ready_test_runtime(&root);
+        fs::create_dir_all(root.join("app/config/resources")).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();fs::write(root.join("app/scripts/backend-entry.py"),b"# not executed").unwrap();
+        let source=root.join("tmp/source");fs::create_dir_all(&source).unwrap();fs::write(source.join("cpu.onnx"),b"cpu model").unwrap();
+        let cached=root.join("tmp/resource-downloads/smart-turn");fs::create_dir_all(&cached).unwrap();let gpu=cached.join("smart-turn-gpu.onnx");fs::write(&gpu,b"gpu model").unwrap();
+        let mut item=json!({"resource_id":"smart-turn","title":"结束判断模型","kind":"model","version":"1","destination":"analysis/smart-turn",
+            "source":{"platform":"huggingface","repo_id":"unused","revision":"fixed"},"files":[
+                {"path":"cpu.onnx","size_bytes":9,"sha256":file_hash(&source.join("cpu.onnx")).unwrap()},
+                {"path":"smart-turn-gpu.onnx","size_bytes":9,"sha256":file_hash(&gpu).unwrap(),"optional":true}]});
+        let catalog=root.join("app/config/resources/catalog.json");atomic_json(&catalog,&json!({"resources":[item.clone()]})).unwrap();
+        let context=LaunchContext::portable(&root).unwrap();let cancel=Arc::new(AtomicBool::new(false));
+        assert_eq!(spec(&context,"smart-turn").unwrap()["files"][1]["optional"],true);
+        import_review(&context,&source,Some("smart-turn"),cancel.clone(),&mut|_,_,_|{},&mut|_|Ok(())).unwrap();
+        let settings=context.data.join("config/product-settings.json");atomic_json(&settings,&json!({"compute":{"devices":{"smart_turn":"cuda"}}})).unwrap();
+        assert_eq!(spec(&context,"smart-turn").unwrap()["files"][1]["optional"],false);
+        let rows=inventory(&context).unwrap();assert_eq!(rows[1]["update_available"],true);assert_eq!(rows[1]["can_start"],false);
+        // 所需文件都在固定缓存或旧收据中；此路径必须完整启用候选，不访问网络。
+        assert_eq!(download_resource(&context,"smart-turn",cancel.clone(),&mut|_,_,_|{}).unwrap(),vec!["smart-turn"]);
+        let installed=root.join("models/analysis/smart-turn/smart-turn-gpu.onnx");assert_eq!(fs::read(&installed).unwrap(),b"gpu model");assert_eq!(inventory(&context).unwrap()[1]["can_start"],true);
+        atomic_json(&settings,&json!({"compute":{"devices":{"smart_turn":"cpu"}}})).unwrap();item["version"]=json!("2");atomic_json(&catalog,&json!({"resources":[item]})).unwrap();
+        assert_eq!(spec(&context,"smart-turn").unwrap()["files"][1]["optional"],false);
+        download_resource(&context,"smart-turn",cancel,&mut|_,_,_|{}).unwrap();assert_eq!(fs::read(&installed).unwrap(),b"gpu model");
+        assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 
     #[test]
