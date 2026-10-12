@@ -1253,6 +1253,7 @@ class DshShadowAgentSession:
                 self._pending_terminal_state = state
                 self._notify_runtime_state()
                 await self._save_mapping(state=state)
+                await self._activity(state)
                 if self._deferred_revision > 0:
                     self._schedule_handoff()
             else:
@@ -1298,6 +1299,9 @@ class DshShadowAgentSession:
 
     async def accept_activity(self, payload: dict[str, Any]) -> BridgeResult:
         async with self._event_lock:
+            if payload.get("run_origin") == "schedule":
+                if not await self._adopt_scheduled_activation(payload):
+                    return "stale"
             # 用量属于绑定会话；终态工具结算后仍接收最终供应商计数，不改变激活状态。
             if (payload.get("protocol_version") == BRIDGE_PROTOCOL_VERSION
                     and payload.get("voice_session_id") == self.voice_session_id
@@ -1339,6 +1343,8 @@ class DshShadowAgentSession:
                         or not 1 <= action_seq <= 2**53 - 1):
                     return "conflict"
                 if action_seq <= self._last_action_seq:
+                    if payload.get("run_origin") == "schedule" and action_seq == 1:
+                        return "duplicate"  # 首个确认回执丢失时，重放不能创建第二次运行。
                     return "stale"
                 self._last_action_seq = action_seq
             if normalized is not None:
@@ -1348,6 +1354,7 @@ class DshShadowAgentSession:
                         self.approvals.pending[approval_id] = PendingApproval(
                             approval_id, str(self.activation_id), self._run_seq,
                             normalized["text"], self.approvals.input_provider()[0],
+                            item_id=normalized["item_id"], tool_name=normalized["tool_name"],
                         )
                     else:
                         self.approvals.pending.pop(approval_id, None)
@@ -1388,6 +1395,44 @@ class DshShadowAgentSession:
                     self._observer_committed_steps = committed_steps
                     self._schedule_observer()
             return "accepted"
+
+    async def _adopt_scheduled_activation(self, payload: dict[str, Any]) -> bool:
+        """领取定时任务的根代理可建立新运行；通过宿主权威状态核对，拒绝旧激活复活。"""
+        activation = payload.get("activation_id")
+        if (self._retired or (self.activation_id is not None and self.activation_id != activation)
+                or payload.get("protocol_version") != BRIDGE_PROTOCOL_VERSION
+                or payload.get("voice_session_id") != self.voice_session_id
+                or not self.dsh_session_id or payload.get("dsh_session_id") != self.dsh_session_id
+                or type(payload.get("epoch")) is not int
+                or payload.get("epoch") != self.epoch
+                or self.epoch != int(self.context_source.shadow_context_epoch)
+                or type(payload.get("context_revision")) is not int
+                or payload.get("context_revision") != self.last_applied_revision
+                or not isinstance(activation, str) or not activation.strip() or len(activation) > 160
+                or activation == self._last_terminal_activation_id
+                or type(payload.get("action_seq")) is not int or payload["action_seq"] != 1
+                or payload.get("state") != "running" or "activity" in payload):
+            return False
+        try:
+            state = await self._session_state()
+        except DshBridgeError:
+            return False
+        if (state.get("activation_id") != activation or state.get("activation_origin") != "schedule"
+                or state.get("state") != "active"
+                or state.get("context_revision") != self.last_applied_revision):
+            return False
+        if self.activation_id == activation:
+            return True
+        self.activation_id = activation
+        self._run_seq += 1
+        self._last_action_seq = 0
+        self._pending_terminal_state = None
+        self._waiting_user = False
+        self._visible_status = ""
+        self.approvals.pending.clear()
+        self._notified_approval_id = ""
+        await self._save_mapping(state="active")
+        return True
 
     def _matches_pending_terminal_callback(self, payload: Mapping[str, Any]) -> bool:
         """Accept only late results from this run's terminal tool（只接收本次终态工具的迟到结果）。"""
@@ -1484,7 +1529,17 @@ class DshShadowAgentSession:
                 activation_id=self.activation_id, approval_id=approval_id,
                 decision="allowed-once" if continuous else decision))
             if reply.get("result") in {"accepted", "duplicate"}:
-                self.approvals.pending.pop(approval_id, None)
+                settled = self.approvals.pending.pop(approval_id, None)
+                # 宿主已确认决定；立即结算原卡片，不依赖随后可能延迟的插件回调。
+                if settled is not None and self.activity_sink is not None:
+                    await self.activity_sink([{
+                        "backend": "dsh", "state": "running", "run_seq": settled.run_seq,
+                        "timestamp": utc_now_iso(), "stream": "approval",
+                        "phase": "failed" if decision == "rejected" else "completed",
+                        "item_id": settled.item_id, "approval_id": approval_id,
+                        "tool_name": settled.tool_name,
+                        "text": (settled.text + ("\n\n已拒绝本次操作" if decision == "rejected" else "\n\n已同意本次操作"))[-12000:],
+                    }])
                 if decision == "rejected":
                     self.approvals.revoke()
                 elif continuous and window == self.approvals.window_provider():
@@ -1780,7 +1835,8 @@ class DshShadowAgentSession:
             "available": self.available,
             "active": self.activation_id is not None and not self._waiting_user,
             "continuous_approval": self.approvals.continuous_active,
-            "user_input_required": self._waiting_user,
+            "user_input_required": self._waiting_user or bool(self.approvals.pending),
+            "pending_approval_ids": list(self.approvals.pending),  # pending_approval_ids（权威待决审批集合）。
             "voice_session_id": self.voice_session_id,
             "dsh_session_id": self.dsh_session_id,
             "epoch": self.epoch,

@@ -8,7 +8,7 @@ import type { Json } from '../shared/protocol.js'
 import { MAX_OBSERVER_RECORDS } from '../shared/identity.js'
 import { bindingCallback } from './callbacks.js'
 import { clearActivationIfCurrent, createBridgeUserMessage } from './messages.js'
-import { reassertContextAfterCompaction, stopRuntimeReminder } from './context.js'
+import { armRuntimeReminder, reassertContextAfterCompaction, stopRuntimeReminder } from './context.js'
 import { observerData, readSessionTelemetry } from './observer.js'
 import type { Binding, RuntimeActivity } from './contracts.js'
 
@@ -22,11 +22,23 @@ function queueCallback(
   activationId?: string,
 ): Promise<Record<string, Json>> {
   const request = binding.actionQueue.catch(() => undefined)
-    .then(() => {
+    .then(async () => {
       if (binding.state !== 'active' || binding.callbacks?.signal.aborted) return {} as Record<string, Json>
       if (activationId && binding.activationId !== activationId
         && binding.terminalActivationId !== activationId) return {} as Record<string, Json>
-      return bindingCallback(binding, path, payload, AbortSignal.timeout(10000))
+      const attempts = payload.run_origin === 'schedule' ? 3 : 1
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          const response = await bindingCallback(binding, path, payload, AbortSignal.timeout(10000))
+          if (payload.run_origin === 'schedule' && !isDelivered(response)) throw new Error('scheduled activation rejected（定时激活未获确认）')
+          return response
+        } catch (error) {
+          if (attempt + 1 === attempts || binding.callbacks?.signal.aborted
+            || binding.state !== 'active' || binding.activationId !== activationId) throw error
+          await new Promise(resolve => setTimeout(resolve, 250))
+        }
+      }
+      throw new Error('scheduled activation unavailable（定时激活不可用）')
     })
   binding.actionQueue = request.then(() => undefined, () => undefined)
   return request
@@ -233,8 +245,26 @@ export function registerSessionEvents(ctx: Context, bindings: Map<string, Bindin
 
   ctx.on('agent/inbox/claimed', ({ agent, message }) => {
     const binding = bindings.get(String(agent?.id ?? ''))
+    if (!binding || binding.state !== 'active' || binding.handle?.agent !== agent) return
+    // 官方定时任务和项目提醒在空闲根代理领取后建立独立运行，沿用当前会话身份。
+    if (!binding.activationId && message.source?.kind === 'schedule') {
+      stopRuntimeActivity(binding)
+      binding.activationId = randomUUID()
+      binding.activationOrigin = 'schedule'
+      binding.terminalActivationId = undefined
+      binding.actionSeq = 0
+      binding.pendingTools.clear()
+      binding.pendingToolActivations.clear()
+      binding.protocolRecoveryAttempted = false
+      binding.protocolRecoveryPending = false
+      armRuntimeReminder(binding)
+      binding.activationReady = queueActivityCallback(binding, binding.activationId, {
+        run_origin: 'schedule', state: 'running',
+      })
+      void binding.activationReady.catch(() => undefined) // 拒绝结果保留给控制工具读取。
+    }
     const revision = binding?.queuedMessages?.get(String(message?.id ?? ''))
-    if (!binding || binding.state !== 'active' || binding.handle?.agent !== agent || revision === undefined) return
+    if (revision === undefined) return
     binding.queuedMessages?.delete(String(message.id))
     binding.claimedRevision = Math.max(binding.claimedRevision ?? 0, revision)
     if (binding.gateObserved) console.info('[voice-shadow-bridge] context gate', {

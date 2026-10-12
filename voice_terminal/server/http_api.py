@@ -307,7 +307,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             await runtime.publish_shadow_product()
         return JSONResponse(
             {"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": code},
-            status_code=200 if code == "accepted" else 409,
+            status_code=200 if code in {"accepted", "duplicate"} else 409,
             headers={"Cache-Control": "no-store"},
         )
 

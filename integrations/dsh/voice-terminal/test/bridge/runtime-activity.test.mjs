@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { registerSessionEvents, stopRuntimeActivity } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/events.js'
+import { stopRuntimeReminder } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/context.js'
 import { clearActivationIfCurrent } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/messages.js'
 
 function fixture(t) {
@@ -21,7 +22,7 @@ function fixture(t) {
     } },
   }
   registerSessionEvents({ on(name, listener) { listeners.set(name, listener) }, get() {} }, new Map([[agent.id, binding]]))
-  t.after(async () => { stopRuntimeActivity(binding); controller.abort(); await binding.actionQueue })
+  t.after(async () => { stopRuntimeActivity(binding); stopRuntimeReminder(binding, true); controller.abort(); await binding.actionQueue })
   let revision = 0
   const frame = (attemptId, value, owner = agent) => listeners.get('agent/assistant-stream')({ agent: owner, frame: { attemptId, revision: ++revision, ...value } })
   const start = (id = 'attempt-a') => frame(id, { type: 'start', turn: 1, step: 0 })
@@ -30,8 +31,64 @@ function fixture(t) {
   const event = (type, data, owner = session) => listeners.get('session/event')(owner, { type, data })
   const status = value => listeners.get('agent/status')({ agent, status: value })
   const callbacks = () => received.filter(value => value.path.endsWith('/shadow.activity')).map(value => value.payload)
-  return { binding, received, frame, start, delta, end, event, status, callbacks, agent, controller }
+  const claim = (source, owner = agent) => listeners.get('agent/inbox/claimed')({ agent: owner, message: { id: 'task-input', source: { kind: source } } })
+  return { binding, received, frame, start, delta, end, event, status, callbacks, agent, controller, claim }
 }
+
+test('空闲根代理领取定时任务后登记新激活，再按顺序回传思考、工具及终态', async t => {
+  const f = fixture(t)
+  delete f.binding.activationId
+  f.binding.terminalActivationId = 'old-activation'
+  f.binding.reminderIntervalMs = 60_000
+  f.binding.nextReminderMs = 60_000
+  f.claim('unrelated')
+  assert.equal(f.binding.activationId, undefined)
+  f.claim('schedule')
+  const activation = f.binding.activationId
+  assert.ok(activation && activation !== 'old-activation')
+  f.claim('schedule')
+  assert.equal(f.binding.activationId, activation)
+  f.start(); f.delta('定时任务处理中'); f.end()
+  f.event('tool/call', { callId: 'task-tool', name: 'read_file' })
+  f.event('tool/result', { message: { source: { callId: 'task-tool' } } })
+  await f.binding.actionQueue
+  clearActivationIfCurrent(f.binding, activation)
+  f.status('idle')
+  await f.binding.actionQueue
+  const rows = f.callbacks()
+  assert.equal(rows[0].run_origin, 'schedule')
+  assert.equal(rows[0].action_seq, 1)
+  assert.ok(rows.every(row => row.activation_id === activation))
+  assert.deepEqual(rows.map(row => row.action_seq), [1, 2, 3, 4, 5, 6])
+  assert.equal(rows.at(-1).state, 'idle')
+})
+
+test('定时起始回传临时失败后复用同一请求重试，后续动作等待确认', async t => {
+  const f = fixture(t)
+  delete f.binding.activationId
+  f.binding.reminderIntervalMs = 60_000
+  f.binding.nextReminderMs = 60_000
+  const send = f.binding.callbacks.send
+  let attempts = 0
+  f.binding.callbacks.send = async (path, payload) => {
+    const result = await send(path, payload)
+    if (payload.run_origin === 'schedule') {
+      attempts += 1
+      if (attempts <= 2) throw new Error('confirmation temporarily unavailable（确认回执暂不可用）')
+      return { result: 'duplicate' } // 第一次可能已被服务端处理，只是回执丢失。
+    }
+    return result
+  }
+  f.claim('schedule')
+  f.event('tool/call', { callId: 'task-tool', name: 'read_file' })
+  assert.equal((await f.binding.activationReady).result, 'duplicate')
+  await f.binding.actionQueue
+  const rows = f.callbacks()
+  assert.equal(attempts, 3)
+  assert.deepEqual(rows.map(row => row.action_seq), [1, 1, 1, 2])
+  assert.equal(new Set(rows.slice(0, 3).map(row => row.request_id)).size, 1)
+  assert.equal(rows[3].activity.item_id, 'tool-task-tool')
+})
 
 test('根代理思考保留空白并累加，新块与工具按同一动作序号发送', async t => {
   const f = fixture(t)

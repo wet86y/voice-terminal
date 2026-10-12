@@ -67,6 +67,36 @@ class ProductSidecarTests(unittest.TestCase):
         self.assertTrue(projection.user_input_required)
         self.assertEqual(projection.phase, "waiting")
 
+    def test_runtime_snapshot_clears_stale_approvals_and_tracks_live_jobs(self) -> None:
+        projection = ShadowProductProjection()
+        projection.update_activities([
+            {"run_seq": 1, "item_id": "approval-old", "stream": "approval", "phase": "started", "approval_id": "old"},
+            {"run_seq": 1, "item_id": "approval-live", "stream": "approval", "phase": "started", "approval_id": "live"},
+            {"run_seq": 1, "item_id": "job-timer", "stream": "output", "phase": "started"},
+        ])
+        runtime = {"available": True, "active": False, "user_input_required": True, "pending_approval_ids": ["live"]}
+        snapshot = projection.snapshot(runtime)
+        self.assertEqual(snapshot["activities"][0]["phase"], "failed")
+        self.assertEqual(snapshot["activities"][1]["phase"], "started")
+        self.assertEqual(snapshot["phase"], "waiting")
+        runtime.update(user_input_required=False, pending_approval_ids=[])
+        self.assertEqual(projection.snapshot(runtime)["phase"], "working")
+        projection.update_activities([{"run_seq": 1, "item_id": "job-timer", "stream": "output", "phase": "completed"}])
+        snapshot = projection.snapshot(runtime)
+        self.assertFalse(snapshot["active"])
+        self.assertFalse(snapshot["user_input_required"])
+        self.assertNotEqual(snapshot["phase"], "working")
+
+    def test_cancelled_run_does_not_leave_background_job_permanently_active(self) -> None:
+        projection = ShadowProductProjection()
+        projection.update_activities([{"run_seq": 1, "item_id": "job-running", "stream": "output", "phase": "started"}])
+        runtime = {"available": True, "active": False, "user_input_required": False}
+        self.assertTrue(projection.snapshot(runtime)["active"])
+        projection.update_activities([{"run_seq": 1, "item_id": "run-1", "stream": "lifecycle",
+                                      "phase": "completed", "state": "cancelled"}])
+        self.assertFalse(projection.snapshot(runtime)["active"])
+        self.assertEqual(projection.activities[0]["phase"], "failed")
+
     def test_approval_preferences_persist_without_a_continuous_grant(self) -> None:
         store = self.store()
         self.assertEqual(store.settings_only()["approvals"], {"voice_confirmation_enabled": False, "continuous_enabled": False})

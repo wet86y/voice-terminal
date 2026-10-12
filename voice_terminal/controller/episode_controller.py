@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from dataclasses import replace
 from uuid import uuid4
 
 from .realtime_controller import RealtimeController

@@ -90,6 +90,33 @@ afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
+  it('任务页保持打开时刷新到期状态，离开页面与卸载后停止轮询', async () => {
+    const { value, wrapper } = liveAdapter()
+    allowBusinessReady(value)
+    vi.spyOn(productApi, 'dshStatus').mockResolvedValue({ state: 'ready' } as never)
+    application.snapshot.value = { components: [{ id: 'dsh', state: 'ready' }] } as never
+    await flushPromises()
+    const tasks = vi.mocked(productApi.wakeTasks)
+    tasks.mockClear()
+    tasks.mockResolvedValue({ tasks: [{ task_id: 'timer', status: 'pending', text: '定时检查' }] } as never)
+    value.page.value = 'settings'; value.settingsTab.value = 'wakes'
+    await flushPromises()
+    expect(tasks).toHaveBeenCalledTimes(1)
+    expect(value.wakeTasks.value[0]?.status).toBe('pending')
+    tasks.mockResolvedValue({ tasks: [{ task_id: 'timer', status: 'archived', text: '定时检查' }] } as never)
+    await vi.advanceTimersByTimeAsync(3000); await flushPromises()
+    expect(value.wakeTasks.value[0]?.status).toBe('archived')
+    value.page.value = 'home'; await flushPromises()
+    const afterLeave = tasks.mock.calls.length
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(tasks).toHaveBeenCalledTimes(afterLeave)
+    value.page.value = 'settings'; await flushPromises()
+    wrapper.unmount()
+    const afterUnmount = tasks.mock.calls.length
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(tasks).toHaveBeenCalledTimes(afterUnmount)
+  })
+
   it('所有高级声纹控件可编辑并随同一次保存提交', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })

@@ -40,6 +40,10 @@ export function installRootTools(agentCtx: Context, binding: Binding): void {
   }
   const post = async (exec: ToolRunContext, event: ShadowEventBody, terminal = false): Promise<Record<string, Json>> => {
     const activationId = ensure(exec)
+    // 定时激活登记与工具开始必须先到达 Voice，终态不能越过动作队列。
+    await binding.activationReady
+    if (terminal) await binding.actionQueue
+    if (ensure(exec) !== activationId) throw new Error('Voice Bridge activation changed（桥接运行已更换）')
     const response = await bindingCallback(binding, '/api/internal/dsh-bridge/shadow.event', {
       request_id: stableBridgeToolId('request', binding.dshSessionId, exec.callId),
       event_id: stableBridgeToolId('event', binding.dshSessionId, exec.callId),

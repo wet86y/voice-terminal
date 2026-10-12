@@ -289,6 +289,42 @@ def test_inflight_speaker_result_does_not_mark_replaced_input_turn():
     asyncio.run(scenario())
 
 
+def test_repeated_heartbeat_persists_identity_and_score_in_snapshot():
+    from voice_terminal.config import SpeakerConfig
+    from voice_terminal.speaker.session import SessionSpeakerPolicy
+
+    async def scenario():
+        controller = object.__new__(EpisodeController)
+        controller.workspace = SimpleNamespace(turn_id="speaker-turn", generation=1)
+        controller.speaker_config = SpeakerConfig()
+        controller.speaker_policy = SessionSpeakerPolicy(controller.speaker_config, lambda _: 0.8)
+        controller.speaker_policy.activate("manual")
+        controller._speaker_turn_start_sample = 0
+        controller._owner_barge_start_sample = None
+        controller._owner_barge_candidate_id = None
+        controller._speaker_snapshot = None
+        controller.speaker_mode = "observe"
+        controller.state = RuntimeState()
+        controller._publish = AsyncMock()
+        controller._flush_speaker_admissions = AsyncMock()
+        for sequence in range(1, 4):
+            raw = replace(_snapshot(RollingSpeakerIdentity.UNKNOWN, end=sequence * 6400),
+                          score=None, embedding=(1.0, 0.0), new_speech_ms=400)
+            controller.speaker_sensor = SimpleNamespace(latest_sample=sequence * 6400,
+                                                       analyze=AsyncMock(return_value=raw))
+            await controller._analyze_speaker_snapshot(sequence)
+            saved = controller._speaker_snapshot
+            assert saved.identity == RollingSpeakerIdentity.OWNER
+            assert saved.score == controller.speaker_policy.last_scores["combined_score"]
+            assert saved.reason in {"owner_confirmed", "owner_continuity"}
+            assert controller.state.current["speaker_rolling"]["state"] == "owner"
+            assert controller.state.current["speaker_rolling"]["score"] == saved.score
+            assert controller._publish.await_args.args[0].payload["state"]["score"] == saved.score
+            assert raw.identity == RollingSpeakerIdentity.UNKNOWN  # 原始不可变快照保留。
+        assert controller._publish.await_count == 3
+    asyncio.run(scenario())
+
+
 def test_agent_veto_consumes_pending_user_input_before_dispatch():
     async def scenario():
         agent = object.__new__(AgentEpisodeRuntime)
