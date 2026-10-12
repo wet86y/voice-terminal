@@ -25,6 +25,7 @@ class AsrInferenceResult:
     text: str
     emitted: bool
     latency: dict[str, float | int] | None = None  # latency（本次识别分段耗时，毫秒）。
+    segments: list[dict] | None = None # 新增识别正文及来源采样范围。
 
 
 class AsrWorkerEngine:
@@ -68,6 +69,9 @@ class AsrWorkerEngine:
         self._load_lock = threading.RLock()
         self._timing = threading.local()  # timing（线程内计时）：不把线程排队算进模型调用。
         self._call_latency: dict[str, float | int] = {}
+        self._span_positions: dict[str, int] = {}
+        self._span_revisions: dict[str, int] = {}
+        self._current_spans: list[dict] = []
         self.model_warmed = False  # model_warmed（已完成真实推理预热）。
         self.startup_timings_ms = {}  # startup_timings_ms（各启动阶段耗时，毫秒）。
         registry.observe(self, "asr_pending_pcm", lambda value: sum(len(p) for p in value._pending_audio_by_turn.values()))
@@ -246,6 +250,8 @@ class AsrWorkerEngine:
         self._byte_count_by_turn.pop(turn_id, None)
         self._model_call_count_by_turn.pop(turn_id, None)
         self._last_log_at_by_turn.pop(turn_id, None)
+        self._span_positions.pop(turn_id, None)
+        self._span_revisions.pop(turn_id, None)
 
     async def _infer_window(self, turn_id: str, pcm: bytes, is_final: bool) -> str:
         """Run one model window and return the text emitted by that window."""
@@ -262,6 +268,16 @@ class AsrWorkerEngine:
 
         future = asyncio.get_running_loop().run_in_executor(self._executor, run)
         text, executor_wait_ms, native_ms, model_ms = await self._await_native(future)
+        start_sample = self._span_positions.get(turn_id, 0)
+        end_sample = start_sample + len(pcm) // 2
+        self._span_positions[turn_id] = end_sample
+        if text:
+            revision = self._span_revisions.get(turn_id, 0) + 1
+            self._span_revisions[turn_id] = revision
+            self._current_spans.append({"revision": revision, "text_delta": text,
+                "audio_start_sample": start_sample if end_sample > start_sample else max(0, end_sample-self.chunk_stride_samples),
+                "audio_end_sample": end_sample})
+
         for key, value in (("executor_wait_ms", executor_wait_ms), ("native_ms", native_ms), ("model_ms", model_ms)):
             self._call_latency[key] = self._call_latency.get(key, 0.0) + value
         self._call_latency["model_calls"] = self._call_latency.get("model_calls", 0) + 1
@@ -285,6 +301,7 @@ class AsrWorkerEngine:
 
     async def _infer_serial(self, turn_id: str, pcm: bytes, is_final: bool) -> AsrInferenceResult:
         started = time.perf_counter()
+        self._current_spans = []
         self._chunk_count_by_turn[turn_id] = self._chunk_count_by_turn.get(turn_id, 0) + 1
         self._byte_count_by_turn[turn_id] = self._byte_count_by_turn.get(turn_id, 0) + len(pcm)
 
@@ -351,7 +368,7 @@ class AsrWorkerEngine:
             # Return the final cumulative text before releasing per-turn
             # model cache and aggregation state.
             self._clear_turn(turn_id)
-        return AsrInferenceResult(text=text, emitted=bool(emitted_text), latency=dict(self._call_latency))
+        return AsrInferenceResult(text=text, emitted=bool(emitted_text), segments=list(self._current_spans), latency=dict(self._call_latency))
 
 
 async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None:
@@ -452,6 +469,8 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                 if inference.emitted or chunk.is_final:
                     result_type = "asr.final" if chunk.is_final else "asr.partial"
                     response = asr_result(result_type, chunk.turn_id, inference.text)
+                    if inference.segments:
+                        response["segments"] = inference.segments
                     if latency is not None:
                         response["latency"] = latency  # latency（分段耗时）：旧接收端可以忽略。
                     await websocket.send(

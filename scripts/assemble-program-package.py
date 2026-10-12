@@ -18,6 +18,27 @@ from voice_terminal import __version__
 from voice_terminal.distribution import digest, files, manifest, verify
 from voice_terminal.paths import atomic_json
 
+def bundle_speaker_seed(program: Path) -> dict:
+    """CAM++升级种子：官方摘要校验后随本体交付，安装时离线装入外置模型目录。"""
+    from voice_terminal.resource_distribution import ResourceCatalog
+    model = ResourceCatalog(ROOT).specs['campplus-zh-cn-common']
+    source = ROOT / '.local/models' / model.destination
+    target = program / 'resources/model-seeds/campplus-zh-cn-common'
+    target.mkdir(parents=True)
+    for row in model.required_files:
+        weight = source / row.path
+        if not weight.is_file() or weight.stat().st_size != row.size_bytes or digest(weight) != row.sha256:
+            raise ValueError('CAM++官方升级权重缺失或摘要不匹配，请先修复模型资源')
+        destination = target / row.path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(weight, destination)
+        if digest(destination) != row.sha256:
+            raise ValueError('CAM++升级种子复制后摘要不匹配')
+    return {'revision': 1, 'from_model': 'wespeaker-cnceleb-resnet34', 'to_model': model.resource_id,
+            'delete_legacy_profiles': True,
+            'fields': {'revision': '声纹升级规则版本', 'from_model': '要卸载的旧声纹模型',
+                       'to_model': '升级目标模型', 'delete_legacy_profiles': '升级成功后删除旧声纹档案'}}
+
 def assemble(desktop: Path, build: str = '') -> Path:
     cache = ROOT / '.local/build/program-package'
     cache.mkdir(parents=True, exist_ok=True)
@@ -28,8 +49,9 @@ def assemble(desktop: Path, build: str = '') -> Path:
         shutil.rmtree(stage)
     stage.mkdir()
     assembler.collect_program(stage / 'app', desktop)
+    speaker_migration = bundle_speaker_seed(stage / 'app')
     guide = stage / 'app/docs/模型运行环境配置指南.md'
-    guide.parent.mkdir()
+    guide.parent.mkdir(exist_ok=True)
     shutil.copy2(ROOT / 'docs/模型运行环境配置指南.md', guide)
     lock = json.loads((stage / 'app/config/runtime/voice-runtime.lock.json').read_text('utf-8'))
     for row in lock['wheels']:
@@ -44,6 +66,7 @@ def assemble(desktop: Path, build: str = '') -> Path:
     build = build or 'product-' + hashlib.sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest()[:16]
     release = manifest(stage / 'app', kind='app', build=build)
     release.update(display_version=__version__, role='product', required_components=[], optional_components=['python', 'models', 'dsh', 'webview2'], components=[], root_files=roots,
+                   speaker_migration=speaker_migration,
                    compatibility={'desktop_protocol': 1, 'data_format': 1},
                    fields={'build': '构建编号，产品版本保持原值', 'role': 'product（统一正式程序）', 'display_version': '产品显示版本', 'files': '本体固定文件', 'path': '相对路径', 'size': '字节数', 'sha256': 'SHA-256（文件摘要）', 'components': '外置组件登记；整体语音服务启动时逐项校验', 'root_files': '正式入口及固定支持文件', 'required_components': '管理页启动所需组件，独立于整体语音服务就绪门槛', 'optional_components': '由管理页安装的外置组件；整体语音服务运行必需', 'compatibility': '接口及数据格式兼容版本'})
     atomic_json(stage / 'app/release.json', release)

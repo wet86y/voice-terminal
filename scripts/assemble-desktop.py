@@ -22,7 +22,7 @@ from voice_terminal.dsh.profile import build_profile
 from voice_terminal.dsh.official import OFFICIAL_SOURCE_KIND, load_official_artifact, validate_official_runtime
 from voice_terminal.paths import atomic_json
 
-CORE_MODELS = ("kws/sherpa-onnx-kws-zipformer-zh-en-3M", "funasr/paraformer-zh-streaming", "funasr/fsmn-vad", "analysis/smart-turn", "analysis/sensevoice", "speaker/wespeaker-cnceleb-resnet34")
+CORE_MODELS = ("kws/sherpa-onnx-kws-zipformer-zh-en-3M", "funasr/paraformer-zh-streaming", "funasr/fsmn-vad", "analysis/smart-turn", "analysis/sensevoice", "speaker/campplus-zh-cn-common")
 
 
 def copy_tree(source: Path, target: Path, *, excludes=()) -> None:
@@ -205,7 +205,7 @@ def root_files(output: Path, desktop: Path) -> list[dict]:
 
 双击 VoiceTerminal.exe（正式入口）启动。正式入口从自身位置解析工作区，使用 app（已发布本体）内的业务与静态界面，无须源码仓库。系统 WebView2（网页运行引擎）由安装器引导安装。关闭窗口隐藏到托盘；请通过应用或托盘的退出操作回收服务。
 
-首次安装和保留数据的重装使用 VoiceTerminalSetup.exe（分发安装器）。安装器只展开程序本体，不下载语音环境、模型或代理宿主。进入正式程序的组件管理页面完成下载、导入与配置。重装保留 data（用户数据）、工作区编号、models（模型）、runtimes（运行环境）及其登记。Verify-Package.ps1（本体校验）不依赖后端环境。
+首次安装和重装使用 VoiceTerminalSetup.exe（分发安装器）。安装器展开本体，并用随包官方种子权重离线安装CAM++（声纹嵌入模型），卸载旧WeSpeaker（旧声纹模型）资源及旧注册档案。既有CAM++档案、其他用户数据、工作区编号、其他模型和运行环境保留，模型总清单及组件登记同步更新；失败或未提交中断恢复旧内容。其他组件进入正式程序的组件管理页面完成下载、导入与配置。Verify-Package.ps1（本体校验）不依赖后端环境。新模型需重新录制主人声纹，既有筛选及主人打断设置偏好保留。
 
 portable.json（工作区布局）使用 schema=2（第二版）：app（程序本体）、runtimes/python（后端环境）、runtimes/dsh（代理宿主）、models（模型）、data（用户数据）、cache（缓存）、tmp（临时区）、backups（备份）。请整体移动工作区；移动后可直接双击正式入口，不使用系统用户目录定位记录。应用提供工作区切换与整体迁移。
 

@@ -257,9 +257,9 @@ def test_loading_settings_apply_at_session_initialization_without_listening(runt
 def test_other_settings_do_not_apply_pending_compute_choices_before_restart(runtime):
     async def run():
         original = runtime.config.compute
-        runtime.product_settings._settings["compute"]["devices"]["wespeaker"] = "cuda"
+        runtime.product_settings._settings["compute"]["devices"]["campplus"] = "cuda"
         response = await request(runtime, "silence", {"seconds": 90})
         assert response.json()["pending"] is False
         assert runtime.config.compute is original
-        assert runtime.config.compute.devices["wespeaker"] == "cpu"
+        assert runtime.config.compute.devices["campplus"] == "cpu"
     asyncio.run(run())

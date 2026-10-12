@@ -691,7 +691,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         try:
             store = product_store_or_404()
             if getattr(runtime, "application_initializing", False) is True:
-                if (body.get("mode") == "filter" or body.get("owner_only_barge_in") is True) and not runtime.speaker_profile.available:
+                saved = store.settings_only().get("speaker", {})
+                enabling = (body.get("mode") == "filter" and saved.get("mode") != "filter") or (body.get("owner_only_barge_in") is True and not saved.get("owner_only_barge_in"))
+                if enabling and not runtime.speaker_profile.available:
                     raise HTTPException(status_code=422, detail="未注册主人声纹前不能启用拦截或主人打断")
                 value = await asyncio.to_thread(store.save_speaker, body)
                 return {"settings": {"speaker": value}, **await apply_saved_product_settings(store, "声纹设置")}
@@ -702,7 +704,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 "continuity_relaxation": _speaker_relaxation(runtime.config.speaker),
                 "owner_only_barge_in": runtime.config.speaker.owner_only_barge_in,
             })
-            if body.get("mode") == "filter" or body.get("owner_only_barge_in") is True:
+            enabling = (body.get("mode") == "filter" and previous_speaker.get("mode") != "filter") or (body.get("owner_only_barge_in") is True and not previous_speaker.get("owner_only_barge_in"))
+            if enabling:
                 if not runtime.speaker_profile.available:
                     raise HTTPException(status_code=422, detail="未注册主人声纹前不能启用拦截或主人打断")
                 if not await runtime.ensure_speaker_worker():
@@ -721,9 +724,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 raise
             return {
                 "settings": {"speaker": value},
-                "effective_from": "next_speech_segment",
+                "effective_from": "next_heartbeat",
                 "pending": False,
-                "message": "声纹阈值立即用于后续窗口；模式和主人打断设置立即生效。",
+                "message": "判断参数从下一心跳生效；初始采集参数从下一次激活生效，已放行正文保持有效。",
                 "runtime": applied,
             }
         except Exception as exc:

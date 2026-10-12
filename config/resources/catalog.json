@@ -283,37 +283,12 @@
       ]
     },
     {
-      "resource_id": "wespeaker-cnceleb-resnet34",
-      "kind": "model",
-      "title": "WeSpeaker 中文声纹模型",
-      "destination": "speaker/wespeaker-cnceleb-resnet34",
-      "version": "c2c6282460dd5958d8eec16785f035d92e4a2d77",
-      "required": true,
-      "source": {
-        "platform": "huggingface",
-        "repo_id": "Wespeaker/wespeaker-cnceleb-resnet34",
-        "revision": "c2c6282460dd5958d8eec16785f035d92e4a2d77",
-        "page_url": "https://huggingface.co/Wespeaker/wespeaker-cnceleb-resnet34",
-        "transfer": {
-          "kind": "fixed_resolve_http"
-        },
-        "license_url": "https://huggingface.co/Wespeaker/wespeaker-cnceleb-resnet34"
-      },
-      "files": [
-        {
-          "path": "cnceleb_resnet34.onnx",
-          "size_bytes": 26534127,
-          "sha256": "78817ca21a9707ad886d50745162231027a09c997fbf2ecf741c5d8ff4db1bf8"
-        }
-      ]
-    },
-    {
       "resource_id": "campplus-zh-cn-common",
       "kind": "model",
-      "title": "CAM++ 中文通用声纹模型（可选）",
+      "title": "CAM++ 中文通用声纹模型",
       "destination": "speaker/campplus-zh-cn-common",
       "version": "v1.0.0",
-      "required": false,
+      "required": true,
       "source": {
         "platform": "modelscope",
         "repo_id": "iic/speech_campplus_sv_zh-cn_16k-common",
@@ -329,18 +304,6 @@
           "path": "campplus_cn_common.bin",
           "size_bytes": 28036335,
           "sha256": "3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8"
-        }
-      ],
-      "generated_assets": [
-        {
-          "path": "campplus.onnx",
-          "generator": "scripts/prepare_campplus.py（CAM++ 模型准备脚本）",
-          "description": "从固定 ModelScope（模型仓库）revision（修订版）导出，80 维 FBank（梅尔滤波器组）输入、192 维嵌入向量输出、动态帧轴；默认 CPU（中央处理器）用途。"
-        },
-        {
-          "path": "manifest.json",
-          "generator": "scripts/prepare_campplus.py（CAM++ 模型准备脚本）",
-          "description": "记录权重摘要、固定来源版本、导出定义与 PyTorch（张量框架）/ONNX（模型交换格式）数值一致性结果。"
         }
       ]
     },

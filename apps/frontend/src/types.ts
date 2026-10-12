@@ -81,6 +81,8 @@ export interface PlaybackDiagnostics {
 }
 
 export interface CurrentTurnSnapshot {
+  speaker_session?: Record<string, unknown> // 激活会话声纹诊断，不含原始向量。
+
   turn_id?: string | null
   input_runtime?: boolean
   output_generation?: number

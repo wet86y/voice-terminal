@@ -223,7 +223,7 @@ class SpeakerRuntimeMixin:
         )
         try:
             await client.connect()
-            await client.health(timeout_s=5.0)
+            health = await client.health(timeout_s=5.0)
             await self._sync_speaker_fingerprint(client)
         except BaseException as exc:
             try:
@@ -235,6 +235,7 @@ class SpeakerRuntimeMixin:
             return False, f"{type(exc).__name__}: {str(exc)[:200]}"
 
         self.speaker = client
+        self._speaker_worker_health = health
         self._speaker_worker_active_url = worker_url or self.config.speaker_worker_url
         self.state.set_service("speaker", "READY")
         controller = getattr(self, "controller", None)
@@ -318,6 +319,8 @@ class SpeakerRuntimeMixin:
 
     def speaker_status(self) -> dict[str, Any]:
         profile = self.speaker_profile.snapshot()
+        if not profile.get("available") and getattr(self.speaker_profile, "root", None) is not None and (self.speaker_profile.root.parent / "registry.json").is_file():
+            profile.update(needs_reenrollment=True, stale_reason="speaker_model_changed", warning="已切换CAM++，旧声纹已停用；新版安装器会移除旧档案，请重新录制主人声纹")
         service = self.state.services.get("speaker", "DISABLED")
         # 通信或推理故障必须同步至状态接口；仅模型仍加载不能证明声纹功能可用。
         if ((self.config.speaker.mode != "off" or self.config.speaker.owner_only_barge_in)
@@ -359,9 +362,14 @@ class SpeakerRuntimeMixin:
         rolling = getattr(controller, "_speaker_snapshot", None)
         return {
             "mode": self.config.speaker.mode,
+            "effective_mode": getattr(controller, "speaker_mode", self.config.speaker.mode),
+            "session": controller.speaker_policy.snapshot() if controller is not None and hasattr(controller, "speaker_policy") else {},
             "service": service,
             "worker_connected": bool(self.speaker is not None and self.speaker.connected),
             "model_id": self.config.speaker.model_id,
+            "runtime": getattr(self,"_speaker_worker_health",{}).get("runtime", "FunASR / PyTorch（原生语音模型运行时）"),
+            "device": getattr(self,"_speaker_worker_health",{}).get("device"),
+            "needs_registration": not bool(profile.get("available")),
             "model_path": str(self.config.speaker_model_path),
             "model_present": self.config.speaker_model_path.is_file(),
             "registered": bool(profile.get("available")),
@@ -567,7 +575,7 @@ class SpeakerRuntimeMixin:
                                         measured=measured)
         if quality["rms_dbfs"] < -50.0 or speech_ms < 1000:
             raise ValueError("录音音量过低或有效人声不足，请在安静环境中重录")
-        if quality["clipped_ratio"] > ENROLLMENT_MAX_CLIPPED_RATIO:
+        if quality["clipped_ratio"] > self.config.speaker.enrollment_max_clipped_ratio:
             raise ValueError("录音存在明显削波，请降低麦克风音量后重录")
         session["segments"][index] = {
             "label": str(label or self._prompt_label(index))[:80],
@@ -605,7 +613,7 @@ class SpeakerRuntimeMixin:
                 speech_ms, measured = self._speaker_speech_ms(captured.pcm)
             if captured.rms_dbfs < -50.0:
                 raise ValueError("录音音量过低，请靠近麦克风或在安静环境中重录")
-            if captured.clipped_ratio > ENROLLMENT_MAX_CLIPPED_RATIO:
+            if captured.clipped_ratio > self.config.speaker.enrollment_max_clipped_ratio:
                 raise ValueError("录音存在明显削波，请降低麦克风音量后重录")
             quality = self._segment_quality(captured.pcm, speech_ms, source="enrollment_capture",
                                             measured=measured)
@@ -626,8 +634,8 @@ class SpeakerRuntimeMixin:
                 engine = create_speaker_engine(
                     self.config.speaker.model_id, self.config.speaker_model_path,
                     sample_rate=self.config.audio.sample_rate,
-                    device=self.config.compute.devices.get("wespeaker", "cpu"),
-                    fallback_device=self.config.compute.fallback_devices.get("wespeaker", "cpu"),
+                    device=self.config.compute.devices.get("campplus", "cpu"),
+                    fallback_device=self.config.compute.fallback_devices.get("campplus", "cpu"),
                 )
                 self._speaker_engine = engine
             if not engine.loaded:
@@ -724,7 +732,7 @@ class SpeakerRuntimeMixin:
             # Refuse an enrollment whose own segments disagree about the
             # speaker.  Storing a template that already fails this check is
             # how a profile ends up silently useless.
-            detail = check_segments(quality, embeddings)
+            detail = check_segments(quality, embeddings, config=self.config.speaker)
             for index, item in enumerate(quality):
                 item["cosine_to_centroid"] = round(
                     WeSpeakerOnnxEngine.similarity(embeddings[index], centroid_of(embeddings)), 4

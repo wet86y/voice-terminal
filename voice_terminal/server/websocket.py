@@ -174,7 +174,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         self.controller: EpisodeController | None = None
         profile_root = self.paths.speaker if self.paths.separated else config.persona.directory.resolve().parent / "speaker"
         self.ambient_store = AmbientTranscriptStore()
-        self.speaker_profile = SpeakerProfileStore(profile_root, model_id=config.speaker.model_id)
+        self.speaker_profile = SpeakerProfileStore(profile_root / config.speaker.model_id, model_id=config.speaker.model_id)
         self.speaker_router = SpeakerRouter(
             self.speaker_profile,
             confirm_threshold=config.speaker.confirm_threshold,
@@ -588,8 +588,9 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             conversation=self.conversation,
             speaker_client=self.speaker,
             speaker_router=self.speaker_router,
-            speaker_mode=self.config.speaker.mode,
-            owner_only_barge_in=self.config.speaker.owner_only_barge_in,
+            speaker_mode=(self.config.speaker.mode if self.speaker_profile.available else "observe" if self.config.speaker.mode != "off" else "off"),
+            speaker_config=self.config.speaker,
+            owner_only_barge_in=self.config.speaker.owner_only_barge_in and self.speaker_profile.available,
             speaker_wait_ms=self.config.speaker.wait_ms,
             speaker_window_ms=self.config.speaker.window_ms,
             speaker_min_speech_ms=self.config.speaker.min_speech_ms,
@@ -1385,6 +1386,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         confirm = float(settings.get("confirm_threshold", self.config.speaker.confirm_threshold))
         continuity = float(settings.get("continuity_threshold", self.config.speaker.continuity_threshold))
         relaxation = float(settings.get("continuity_relaxation", min(0.20, max(0.0, confirm - continuity))))
+        from ..speaker.settings import validate_tuning
         next_speaker = replace(
             self.config.speaker,
             mode=mode,
@@ -1392,10 +1394,11 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             confirm_threshold=confirm,
             continuity_threshold=continuity,
             continuity_relaxation=relaxation,
+            **validate_tuning({**vars(self.config.speaker), **settings}, continuity=max(0.0, confirm-relaxation)),
         )
-        if mode == "filter":
-            if not self.speaker_profile.available:
-                raise ValueError("未注册声纹前不能启用筛选模式")
+        if mode == "filter" and previous_mode != "filter" and not self.speaker_profile.available:
+            raise ValueError("未注册声纹前不能启用筛选模式")
+        if mode == "filter" and self.speaker_profile.available:
             if not await self.ensure_speaker_worker():
                 raise ValueError("Speaker Worker 不可用，暂时不能启用筛选模式")
         elif owner_only and self.speaker_profile.available:
@@ -1409,8 +1412,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 continuity_threshold=next_speaker.continuity_threshold,
             )
         if self.controller is not None:
-            self.controller.speaker_mode = mode
-            self.controller.owner_only_barge_in = owner_only
+            self.controller.speaker_mode = mode if self.speaker_profile.available else "observe" if mode != "off" else "off"
+            self.controller.owner_only_barge_in = owner_only and self.speaker_profile.available
             if previous_mode != mode:
                 self.controller._speaker_snapshot = None
                 self.controller._speaker_snapshot_turn_id = None
@@ -1444,6 +1447,9 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             if self.controller is not None:
                 self.controller.speaker_client = self.speaker
         if self.controller is not None:
+            if hasattr(self.controller, "speaker_policy"):
+                self.controller.speaker_policy.tune(next_speaker)
+            self.controller.speaker_config = next_speaker
             self.controller.configure_speaker_runtime()
         await self.bus.publish(self.snapshot())
         status = self.speaker_status()
@@ -1606,7 +1612,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 "gpu_available": bool(hardware["models"].get(name, {}).get("gpu_available")),
                 "gpu_unavailable_reason": hardware["models"].get(name, {}).get("reason"),
             }
-            for name in ("paraformer", "sensevoice", "voice_vad", "kws", "smart_turn", "wespeaker")
+            for name in ("paraformer", "sensevoice", "voice_vad", "kws", "smart_turn", "campplus")
         }
 
         models["kws"].update(self._compute_models.get("kws", {}))
@@ -1674,11 +1680,11 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                     resource_rows.append(status["resource_status"])
                 else:
                     missing_resource_roles.add("speaker")
-                models["wespeaker"].update({
+                models["campplus"].update({
                     "resource_status": status.get("resource_status"),
                     "runtime": status.get("runtime"),
                     "device": status.get("device"),
-                    "requested_device": status.get("requested_device", requests.get("wespeaker", "cpu")),
+                    "requested_device": status.get("requested_device", requests.get("campplus", "cpu")),
                     "service": "ERROR" if speaker_runtime["service"] == "DEGRADED" else speaker_runtime["service"],
                     "load_error": status.get("load_error"),
                     "runtime_error": speaker_runtime["last_error"] if speaker_runtime["service"] == "DEGRADED" else None,
@@ -1686,10 +1692,10 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 })
             except Exception as exc:
                 missing_resource_roles.add("speaker")
-                models["wespeaker"].update({"service": "ERROR", "runtime_error": str(exc)[:300] or f"声纹健康检查失败：{type(exc).__name__}"})
+                models["campplus"].update({"service": "ERROR", "runtime_error": str(exc)[:300] or f"声纹健康检查失败：{type(exc).__name__}"})
         else:
             speaker_runtime = self.speaker_status()
-            models["wespeaker"].update({
+            models["campplus"].update({
                 "service": "ERROR" if speaker_runtime["service"] == "DEGRADED" else speaker_runtime["service"],
                 "runtime_error": speaker_runtime["last_error"] if speaker_runtime["service"] == "DEGRADED" else None,
             })

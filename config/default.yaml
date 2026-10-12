@@ -210,29 +210,28 @@ asr_worker:
   port: 8766
 
 speaker:
-  # Optional sidecar.  off | observe | filter
-  mode: off
-  owner_only_barge_in: false # 主人专属打断开关；与声纹模式独立
-  # confirm_threshold（主人确认阈值）使用
-  # 注册质心上的原始余弦分数。最终分数是整轮聚合向量与质心的余弦值；
-  # 现场测试使用相同口径。参考语料同人 p05≈0.86、异人 p95≈0.19，
-  # 但该语料不能替代真实用户校准。
-  confirm_threshold: 0.60
-  continuity_relaxation: 0.10 # 连续主人阈值放宽量：0–0.20，实际阈值不低于 0。
-  # min_speech_ms（单窗最低人声时长）和 min_window_speech_ratio（单窗最低人声占比）
-  # 同时门控；必须满足后才会提取 embedding（说话人向量）。
-  window_ms: 2000 # 分析窗长度（毫秒）
-  step_ms: 500 # 相邻分析窗步进（毫秒）
-  min_speech_ms: 700
-  min_window_speech_ratio: 0.40
-  # min_turn_speech_ms（整轮最低不重复人声时长）：按 VAD 区间并集计数，
-  # 不累加重叠滑窗中重复的语音；低于门槛时判非主人。
-  # observe（仅标记）保留输入，filter（拦截）要求本轮主人已确认。
-  # 2 s 的有效人声通常需要约 2.5-3 s 实际录音。提高该值会减少可判定的短语句，
-  # 但可降低误接受风险；
-  min_turn_speech_ms: 2000
-  wait_ms: 150
-  model_id: wespeaker-cnceleb-resnet34 # 声纹嵌入模型标识
+  mode: off # 关闭、仅标记或主人筛选。
+  owner_only_barge_in: false # 主人专属打断。
+  confirm_threshold: 0.60 # 主人确认原始余弦分数。
+  continuity_relaxation: 0.10 # 连续主人放宽量。
+  model_id: campplus-zh-cn-common # CAM++ 官方中文通用模型。
+  continuity_window_ms: 5000 # continuity_window_ms（连续主人进入时限（毫秒））。
+  continuity_max_ms: 10000 # continuity_max_ms（连续主人最长宽容时间（毫秒））。
+  non_owner_threshold: 0.35 # non_owner_threshold（持续非主人阈值（余弦分数））。
+  non_owner_ticks: 3 # non_owner_ticks（非主人连续有效心跳次数）。
+  context_max_ms: 3200 # context_max_ms（增长式分析上下文上限（毫秒））。
+  recovery_max_distance: 0.25 # recovery_max_distance（跨轮恢复最大余弦距离（0–2））。
+  pending_ttl_ms: 30000 # pending_ttl_ms（待确认正文保留时间（毫秒））。
+  pending_max_turns: 8 # pending_max_turns（待确认轮数上限）。
+  calibration_speech_ms: 3200 # calibration_speech_ms（临时校准目标有效人声（毫秒））。
+  calibration_max_ms: 10000 # calibration_max_ms（激活后最长无条件放行时间（毫秒））。
+  calibration_similarity: 0.65 # calibration_similarity（临时样本与候选质心最低余弦相似度）。
+  session_weight: 0.6 # session_weight（临时会话声纹权重（0–1））。
+  enrollment_min_segment_speech_ms: 3000 # enrollment_min_segment_speech_ms（永久注册每段最低人声（毫秒））。
+  enrollment_min_total_speech_ms: 15000 # enrollment_min_total_speech_ms（永久注册最低总人声（毫秒））。
+  enrollment_min_speech_ratio: 0.5 # enrollment_min_speech_ratio（永久注册最低人声比例（0–1））。
+  enrollment_self_similarity_min: 0.7 # enrollment_self_similarity_min（永久注册样本最低余弦相似度）。
+  enrollment_max_clipped_ratio: 0.005 # enrollment_max_clipped_ratio（永久注册最大削波比例（0–1））。
 
 speaker_worker:
   host: 127.0.0.1

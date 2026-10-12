@@ -249,7 +249,7 @@ export const demoComputeModels = [
   { id: 'voice_vad', name: 'FSMN-VAD（语音活动检测）', device: 'cpu', memory: '58 MB', gpu: false },
   { id: 'kws', name: 'KWS（关键词唤醒）', device: 'cpu', memory: '96 MB', gpu: false },
   { id: 'smart_turn', name: 'SmartTurn（语音结束判断）', device: 'cpu', memory: '180 MB', gpu: false },
-  { id: 'wespeaker', name: 'WeSpeaker（声纹识别）', device: 'cpu', memory: '110 MB', gpu: false },
+  { id: 'campplus', name: 'CAM++（声纹识别）', device: 'cpu', memory: '110 MB', gpu: false },
 ]
 /** id（标识）、name（组件名称）、phase（阶段）、pid（进程号）、memory（常驻内存）、commit（提交内存）、cpu（处理器占用）。 */
 export const demoSystemComponents = [

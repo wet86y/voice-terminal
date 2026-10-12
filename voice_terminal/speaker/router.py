@@ -19,8 +19,8 @@ class SpeakerRouter:
     """
 
     def __init__(self, profile: SpeakerProfileStore, *, confirm_threshold: float = 0.60,
-                 continuity_threshold: float = 0.50, min_speech_ms: int = 700,
-                 min_turn_speech_ms: int = 1500) -> None:
+                 continuity_threshold: float = 0.50, min_speech_ms: int = 45,
+                 min_turn_speech_ms: int = 45) -> None:
         self.profile = profile
         self.state_config = SpeakerStateConfig(
             confirm_threshold=confirm_threshold,

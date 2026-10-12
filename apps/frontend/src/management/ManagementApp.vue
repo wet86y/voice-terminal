@@ -25,7 +25,7 @@ const componentBlockMessage = computed(() => updatesRequired.value
   : '启动前组件校验未通过，请先下载或导入缺失组件。')
 const tasksBusy = computed(() => resources.startingResources.value.size > 0
   || resources.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state)))
-const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'fsmn-vad', 'wespeaker-cnceleb-resnet34', 'smart-turn', 'sensevoice-small'])
+const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'fsmn-vad', 'wespeaker-cnceleb-resnet34', 'campplus-zh-cn-common', 'smart-turn', 'sensevoice-small'])
 function resourceJobsFor(resourceId: string) { return resources.resourceJobs.value.filter(job => job.resource_id === resourceId) }
 function resourceIsBusy(resourceId: string) {
   return resources.startingResources.value.has(resourceId)

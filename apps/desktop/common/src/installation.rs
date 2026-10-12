@@ -1,9 +1,15 @@
 //! installation（正式本体安装）：统一程序包、可恢复事务与首次窗口交接。
 use std::{collections::HashSet,fs,io::{Cursor,Read,Write},path::Path,process::Command,sync::{Arc,atomic::{AtomicBool,Ordering}},time::{Duration,Instant}};
-use serde_json::json;
+use serde_json::{json,Value};
 use sha2::{Digest,Sha256};
 use crate::{canonical_path,workspace::{self,atomic_json,safe_path,remove_owned,file_hash}};
 pub const ITEMS:&[&str]=&["app","VoiceTerminal.exe","Verify-Package.ps1","使用与环境说明.md"];
+pub(crate) const RETIRED_PROFILE_PATHS:&[&str]=&[
+    "data/speaker/wespeaker-cnceleb-resnet34", // 旧模型专属档案。
+    "data/speaker/registry.json", "data/speaker/templates", "data/speaker/probe.npy", // 已确认属于WeSpeaker的旧根档案。
+];
+const LEGACY_MODEL:&str="models/speaker/wespeaker-cnceleb-resnet34"; // 旧声纹模型资源。
+const CURRENT_MODEL:&str="models/speaker/campplus-zh-cn-common"; // 新声纹模型资源。
 pub type Progress<'a>=dyn FnMut(&str,u64,u64)+'a; // Progress（阶段及字节进度回调）。
 
 // WorkspaceGuard（工作区互斥句柄）：产品运行与本体替换共用，避免检查后再次启动。
@@ -94,23 +100,95 @@ fn verify_package(stage:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result
     let release=crate::resources::load(&stage.join("app/release.json"))?;
     if release["build"]!=record["build"]{return Err("正式程序包的构建编号不一致。".into());}Ok(())
 }
+fn prepare_speaker_migration(root:&Path,stage:&Path,release:&mut Value,progress:&mut Progress)->Result<Vec<Value>,String>{
+    let migration=&release["speaker_migration"];
+    if migration.is_null(){return Ok(vec![]);}
+    if migration["revision"]!=1||migration["from_model"]!="wespeaker-cnceleb-resnet34"||migration["to_model"]!="campplus-zh-cn-common"||migration["delete_legacy_profiles"]!=true{
+        return Err("声纹升级规则不受支持，原组件与档案保持不变。".into());
+    }
+    let catalog=crate::resources::load(&stage.join("app/config/resources/catalog.json"))?;
+    let spec=catalog["resources"].as_array().and_then(|rows|rows.iter().find(|row|row["resource_id"]=="campplus-zh-cn-common")).ok_or("升级包缺少CAM++资源描述")?;
+    if spec["version"]!="v1.0.0"||spec["destination"]!="speaker/campplus-zh-cn-common"{return Err("CAM++升级目标不匹配。".into());}
+    let candidate=safe_path(root,&format!("tmp/publish/new/{CURRENT_MODEL}"))?;
+    fs::create_dir_all(&candidate).map_err(|e|e.to_string())?;
+    let mut receipt_files=vec![];
+    for row in spec["files"].as_array().ok_or("CAM++升级文件清单无效")?{
+        if row["optional"]==true{continue;}
+        let name=row["path"].as_str().ok_or("升级权重名称缺失")?;
+        let source=safe_path(stage,&format!("app/resources/model-seeds/campplus-zh-cn-common/{name}"))?;
+        let destination=safe_path(&candidate,name)?;
+        let size=row["size_bytes"].as_u64().ok_or("升级权重大小缺失")?;
+        let sha=row["sha256"].as_str().ok_or("升级权重摘要缺失")?;
+        if fs::metadata(&source).map_err(|e|e.to_string())?.len()!=size||file_hash(&source)?!=sha{return Err("CAM++升级种子权重校验失败，旧组件保持不变。".into());}
+        fs::create_dir_all(destination.parent().unwrap()).map_err(|e|e.to_string())?;
+        fs::copy(&source,&destination).map_err(|e|e.to_string())?;
+        if file_hash(&destination)?!=sha{return Err("CAM++候选权重读回校验失败。".into());}
+        receipt_files.push(json!({"path":name,"size":size,"sha256":sha,"optional":false}));
+    }
+    if receipt_files.is_empty(){return Err("CAM++升级种子没有有效权重。".into());}
+    crate::resources::write_model_receipt(&candidate,spec,receipt_files)?;
+    let mut rows=vec![json!({"path":CURRENT_MODEL,"original":safe_path(root,CURRENT_MODEL)?.exists()})];
+    let old=safe_path(root,LEGACY_MODEL)?;
+    if old.exists(){rows.push(json!({"path":LEGACY_MODEL,"original":true,"delete_only":true}));}
+    let legacy_registry=safe_path(root,"data/speaker/registry.json")?;
+    let legacy_flat=legacy_registry.is_file()&&crate::resources::load(&legacy_registry).is_ok_and(|value|value["model_id"]=="wespeaker-cnceleb-resnet34");
+    for relative in RETIRED_PROFILE_PATHS{
+        let path=safe_path(root,relative)?;
+        if path.exists()&&(*relative==RETIRED_PROFILE_PATHS[0]||legacy_flat){rows.push(json!({"path":relative,"original":true,"delete_only":true}));}
+    }
+    // models（模型目录）的总清单和本体组件登记一并换入，不能留下旧模型摘要记录。
+    let old_manifest=crate::resources::load(&root.join("models/manifest.json")).unwrap_or(Value::Null);
+    let known=old_manifest["files"].as_array().cloned().unwrap_or_default();
+    let mut files=vec![];
+    if root.join("models").is_dir(){for path in crate::resources::walk(&root.join("models"))?{
+        let relative=path.strip_prefix(root).unwrap().to_string_lossy().replace('\\',"/");
+        if relative=="models/manifest.json"||relative.starts_with(&format!("{LEGACY_MODEL}/"))||relative.starts_with(&format!("{CURRENT_MODEL}/")){continue;}
+        let name=relative.strip_prefix("models/").unwrap();let size=path.metadata().map_err(|e|e.to_string())?.len();
+        let sha=file_hash(&path)?;
+        if known.iter().any(|row|row["path"]==name&&(row["size"].as_u64()!=Some(size)||row["sha256"]!=sha)){
+            return Err(format!("保留模型文件校验失败，旧声纹与档案保持不变：{name}"));
+        }
+        files.push(json!({"path":name,"size":size,"sha256":sha}));
+    }}
+    for path in crate::resources::walk(&candidate)?{files.push(json!({"path":format!("speaker/campplus-zh-cn-common/{}",path.strip_prefix(&candidate).unwrap().to_string_lossy().replace('\\',"/")),"size":path.metadata().map_err(|e|e.to_string())?.len(),"sha256":file_hash(&path)?}));}
+    files.sort_by(|a,b|a["path"].as_str().cmp(&b["path"].as_str()));
+    let build=format!("models-{:x}",Sha256::digest(serde_json::to_vec(&files).map_err(|e|e.to_string())?));
+    let manifest=safe_path(root,"tmp/publish/new/models/manifest.json")?;
+    atomic_json(&manifest,&json!({"schema":1,"kind":"models","build":build,"files":files,
+        "fields":{"schema":"模型清单版本","kind":"模型资源类别","build":"模型集合摘要编号","files":"安装文件记录","path":"相对路径","size":"字节数","sha256":"文件摘要"}}))?;
+    if !release["components"].is_array(){release["components"]=json!([]);}
+    let components=release["components"].as_array_mut().unwrap();components.retain(|row|row["kind"]!="models");
+    components.push(json!({"kind":"models","path":"models","build":build,"manifest_sha256":file_hash(&manifest)?,"optional":true}));
+    rows.push(json!({"path":"models/manifest.json","original":root.join("models/manifest.json").exists()}));
+    progress("CAM++候选权重已校验，准备卸载旧声纹组件及档案",1,1);
+    Ok(rows)
+}
 fn activate(root:&Path,stage:&Path,progress:&mut Progress)->Result<(),String>{
     // components（组件登记）属于工作区状态；固定本体仍来自同一程序包。
     let incoming=stage.join("app/release.json");let mut release=crate::resources::load(&incoming)?;
     if let Ok(old)=crate::resources::load(&root.join("app/release.json")){
         if let Some(rows)=old["components"].as_array(){release["components"]=json!(rows.iter().filter(|row|matches!((row["kind"].as_str(),row["path"].as_str()),(Some("python"),Some("runtimes/python"))|(Some("models"),Some("models"))|(Some("dsh"),Some("runtimes/dsh"))|(Some("webview2"),Some("runtimes/webview2")))).collect::<Vec<_>>());atomic_json(&incoming,&release)?;}
     }
+    let migration_rows=prepare_speaker_migration(root,stage,&mut release,progress)?;
+    atomic_json(&incoming,&release)?;
     let journal=root.join("tmp/update-transaction.json");
-    let rows=ITEMS.iter().map(|name|json!({"path":name,"original":root.join(name).exists()})).collect::<Vec<_>>();
+    let mut rows=ITEMS.iter().map(|name|json!({"path":name,"original":root.join(name).exists()})).collect::<Vec<_>>();
+    rows.extend(migration_rows);
     let mut record=json!({"schema":1,"state":"prepared","items":rows,"fields":{"schema":"本体替换事务格式","state":"准备或提交阶段","items":"固定受管文件","path":"相对路径","original":"是否存在原文件"}});
     atomic_json(&journal,&record)?;
     progress("启用程序本体",1,1); // 从这里开始禁止取消；失败按日志恢复原本体。
     let result:Result<(),String>=(||{
-        for name in ITEMS{
+        for row in record["items"].as_array().unwrap(){
+            let name=row["path"].as_str().unwrap();
             let target=safe_path(root,name)?;let old=safe_path(root,&format!("tmp/publish/old/{name}"))?;
             fs::create_dir_all(old.parent().unwrap()).map_err(|e|e.to_string())?;
             if target.exists(){fs::rename(&target,&old).map_err(|e|format!("目标文件被占用，无法启用：{e}"))?;}
-            fs::rename(stage.join(name),target).map_err(|e|e.to_string())?;
+            if row["delete_only"]!=true{
+                // Fresh workspaces have `models/` but not the nested `models/speaker/` directory.
+                // Create every target parent before moving a seeded model into the live workspace.
+                fs::create_dir_all(target.parent().unwrap()).map_err(|e|e.to_string())?;
+                fs::rename(stage.join(name),target).map_err(|e|e.to_string())?;
+            }
         }
         workspace::normalize_layout(root)?;
         record["state"]=json!("committed");atomic_json(&journal,&record)?;Ok(())
@@ -195,10 +273,22 @@ pub fn launch(root:&Path)->Result<u32,String>{
     use std::path::PathBuf;
     fn fixture()->PathBuf{let root=std::env::temp_dir().join(format!("voice-install-中文 空格-{}",workspace::new_id()));fs::create_dir_all(&root).unwrap();root}
     fn package(build:&str,corrupt:bool)->Vec<u8>{
+        package_options(build,corrupt,None)
+    }
+    fn package_options(build:&str,corrupt:bool,speaker:Option<bool>)->Vec<u8>{
         let mut payload=Cursor::new(Vec::new());
         let app_bytes=build.as_bytes();let hash=format!("{:x}",Sha256::digest(app_bytes));
-        let app=json!({"schema":1,"kind":"app","build":build,"files":[{"path":"business.py","size":app_bytes.len(),"sha256":hash}],"components":[],"required_components":[],"optional_components":["python","models","dsh","webview2"]});
-        let entries=vec![("app/business.py",app_bytes.to_vec()),("app/release.json",serde_json::to_vec(&app).unwrap()),("VoiceTerminal.exe",b"formal-entry".to_vec()),("Verify-Package.ps1",b"verify".to_vec()),("使用与环境说明.md",b"instructions".to_vec())];
+        let mut app=json!({"schema":1,"kind":"app","build":build,"files":[{"path":"business.py","size":app_bytes.len(),"sha256":hash}],"components":[],"required_components":[],"optional_components":["python","models","dsh","webview2"]});
+        let mut entries=vec![("app/business.py",app_bytes.to_vec())];
+        if let Some(invalid)=speaker{
+            let mut weight=b"native-model-fixture".to_vec();let expected=format!("{:x}",Sha256::digest(&weight));if invalid{weight[0]^=1;}
+            app["speaker_migration"]=json!({"revision":1,"from_model":"wespeaker-cnceleb-resnet34","to_model":"campplus-zh-cn-common","delete_legacy_profiles":true});
+            let catalog=json!({"resources":[{"resource_id":"campplus-zh-cn-common","version":"v1.0.0","destination":"speaker/campplus-zh-cn-common","files":[{"path":"campplus_cn_common.bin","size_bytes":weight.len(),"sha256":expected}]}]});
+            entries.push(("app/config/resources/catalog.json",serde_json::to_vec(&catalog).unwrap()));
+            entries.push(("app/resources/model-seeds/campplus-zh-cn-common/campplus_cn_common.bin",weight));
+            app["files"]=json!(entries.iter().map(|(name,data)|json!({"path":name.strip_prefix("app/").unwrap(),"size":data.len(),"sha256":format!("{:x}",Sha256::digest(data))})).collect::<Vec<_>>());
+        }
+        entries.extend([("app/release.json",serde_json::to_vec(&app).unwrap()),("VoiceTerminal.exe",b"formal-entry".to_vec()),("Verify-Package.ps1",b"verify".to_vec()),("使用与环境说明.md",b"instructions".to_vec())]);
         let rows=entries.iter().map(|(path,data)|json!({"path":path,"size":data.len(),"sha256":if corrupt&&*path=="app/business.py"{"0".repeat(64)}else{format!("{:x}",Sha256::digest(data))}})).collect::<Vec<_>>();
         {let mut zip=zip::ZipWriter::new(&mut payload);let options=zip::write::SimpleFileOptions::default();for (name,data) in entries{zip.start_file(name,options).unwrap();zip.write_all(&data).unwrap();}zip.start_file("program-package.json",options).unwrap();zip.write_all(&serde_json::to_vec(&json!({"schema":1,"role":"product","build":build,"files":rows})).unwrap()).unwrap();zip.finish().unwrap();}payload.into_inner()
     }
@@ -221,4 +311,65 @@ pub fn launch(root:&Path)->Result<u32,String>{
         let held=fs::OpenOptions::new().read(true).share_mode(0).open(root.join("VoiceTerminal.exe")).unwrap();assert!(run(&package("second",false),&root).is_err());drop(held);assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"first");assert_eq!(fs::read(root.join("VoiceTerminal.exe")).unwrap(),b"formal-entry");assert!(!root.join("tmp/update-transaction.json").exists());fs::remove_dir_all(root).unwrap();
     }
     #[test]fn interrupted_activation_restores_previous_body(){let root=fixture();run(&package("first",false),&root).unwrap();fs::create_dir_all(root.join("tmp/publish/old")).unwrap();fs::rename(root.join("app"),root.join("tmp/publish/old/app")).unwrap();fs::create_dir_all(root.join("app")).unwrap();fs::write(root.join("app/partial"),b"partial").unwrap();atomic_json(&root.join("tmp/update-transaction.json"),&json!({"schema":1,"state":"prepared","items":[{"path":"app","original":true}]})).unwrap();workspace::recover_install(&root).unwrap();assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"first");assert!(!root.join("app/partial").exists());fs::remove_dir_all(root).unwrap();}
+    fn legacy_speaker(root:&Path){
+        fs::create_dir_all(root.join(LEGACY_MODEL)).unwrap();fs::write(root.join(LEGACY_MODEL).join("cnceleb_resnet34.onnx"),b"legacy-weight").unwrap();
+        fs::create_dir_all(root.join("data/speaker/templates")).unwrap();fs::write(root.join("data/speaker/templates/old.npy"),b"legacy-vector").unwrap();
+        fs::write(root.join("data/speaker/probe.npy"),b"legacy-probe").unwrap();atomic_json(&root.join("data/speaker/registry.json"),&json!({"model_id":"wespeaker-cnceleb-resnet34","schema_version":2})).unwrap();
+    }
+    #[test]fn fresh_install_creates_model_parent_and_seeds_campplus(){
+        let root=fixture();assert!(!root.join("models/speaker").exists());
+        run(&package_options("fresh",false,Some(false)),&root).unwrap();
+        assert_eq!(fs::read(root.join(CURRENT_MODEL).join("campplus_cn_common.bin")).unwrap(),b"native-model-fixture");
+        let manifest=crate::resources::load(&root.join("models/manifest.json")).unwrap();
+        assert!(manifest["files"].as_array().unwrap().iter().any(|row|row["path"]=="speaker/campplus-zh-cn-common/campplus_cn_common.bin"));
+        let release=crate::resources::load(&root.join("app/release.json")).unwrap();
+        let binding=release["components"].as_array().unwrap().iter().find(|row|row["kind"]=="models").unwrap();
+        assert_eq!(binding["manifest_sha256"],file_hash(&root.join("models/manifest.json")).unwrap());
+        workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn speaker_upgrade_deletes_legacy_assets_and_keeps_current_profiles_and_preferences(){
+        let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);
+        fs::create_dir_all(root.join("data/speaker/campplus-zh-cn-common")).unwrap();fs::write(root.join("data/speaker/campplus-zh-cn-common/registry.json"),b"current-registration").unwrap();
+        fs::write(root.join("data/preferences.json"),b"saved-filter-thresholds").unwrap();fs::write(root.join("models/other.bin"),b"other-model").unwrap();
+        run(&package_options("new",false,Some(false)),&root).unwrap();
+        assert!(!root.join(LEGACY_MODEL).exists());for path in RETIRED_PROFILE_PATHS{assert!(!root.join(path).exists());}
+        assert_eq!(fs::read(root.join(CURRENT_MODEL).join("campplus_cn_common.bin")).unwrap(),b"native-model-fixture");
+        assert_eq!(fs::read(root.join("data/speaker/campplus-zh-cn-common/registry.json")).unwrap(),b"current-registration");assert_eq!(fs::read(root.join("data/preferences.json")).unwrap(),b"saved-filter-thresholds");
+        let manifest=crate::resources::load(&root.join("models/manifest.json")).unwrap();assert!(!manifest["files"].as_array().unwrap().iter().any(|row|row["path"].as_str().unwrap().contains("wespeaker")));
+        let release=crate::resources::load(&root.join("app/release.json")).unwrap();let binding=release["components"].as_array().unwrap().iter().find(|row|row["kind"]=="models").unwrap();assert_eq!(binding["manifest_sha256"],file_hash(&root.join("models/manifest.json")).unwrap());
+        workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();
+        run(&package_options("new",false,Some(false)),&root).unwrap();assert_eq!(fs::read(root.join("data/speaker/campplus-zh-cn-common/registry.json")).unwrap(),b"current-registration");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn invalid_seed_leaves_old_body_model_and_profile_untouched(){
+        let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);
+        assert!(run(&package_options("new",false,Some(true)),&root).is_err());
+        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"old");assert_eq!(fs::read(root.join("data/speaker/templates/old.npy")).unwrap(),b"legacy-vector");assert!(root.join(LEGACY_MODEL).is_dir());assert!(!root.join(CURRENT_MODEL).exists());fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn same_size_corruption_in_retained_model_aborts_before_legacy_deletion(){
+        let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);
+        fs::write(root.join("models/other.bin"),b"valid").unwrap();let sha=file_hash(&root.join("models/other.bin")).unwrap();
+        atomic_json(&root.join("models/manifest.json"),&json!({"files":[{"path":"other.bin","size":5,"sha256":sha}]})).unwrap();fs::write(root.join("models/other.bin"),b"wrong").unwrap();
+        assert!(run(&package_options("new",false,Some(false)),&root).unwrap_err().contains("保留模型文件校验失败"));
+        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"old");assert!(root.join(LEGACY_MODEL).is_dir());assert!(root.join("data/speaker/registry.json").is_file());fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn unidentified_flat_profile_is_preserved_without_blocking_update(){
+        let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);fs::write(root.join("data/speaker/registry.json"),b"unidentified-profile").unwrap();
+        run(&package_options("new",false,Some(false)),&root).unwrap();assert_eq!(fs::read(root.join("data/speaker/registry.json")).unwrap(),b"unidentified-profile");assert!(!root.join(LEGACY_MODEL).exists());assert!(root.join(CURRENT_MODEL).is_dir());fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn interrupted_speaker_deletion_is_restored_and_unknown_profile_path_is_refused(){
+        let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);
+        let relative="data/speaker/registry.json";let backup=root.join("tmp/publish/old").join(relative);fs::create_dir_all(backup.parent().unwrap()).unwrap();fs::rename(root.join(relative),&backup).unwrap();
+        let journal=root.join("tmp/update-transaction.json");atomic_json(&journal,&json!({"schema":1,"state":"prepared","items":[{"path":relative,"original":true,"delete_only":true},{"path":"data/speaker/campplus-zh-cn-common","original":true,"delete_only":true}]})).unwrap();
+        assert!(workspace::recover_install(&root).is_err());assert!(backup.is_file());
+        atomic_json(&journal,&json!({"schema":1,"state":"prepared","items":[{"path":relative,"original":true,"delete_only":true}]})).unwrap();workspace::recover_install(&root).unwrap();assert!(root.join(relative).is_file());assert!(!journal.exists());fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(windows)]#[test]fn failed_speaker_activation_restores_model_and_legacy_profile(){
+        use std::os::windows::fs::OpenOptionsExt;
+        let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);
+        let held=fs::OpenOptions::new().read(true).share_mode(0).open(root.join("data/speaker/probe.npy")).unwrap();
+        assert!(run(&package_options("new",false,Some(false)),&root).is_err());drop(held);
+        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"old");assert!(root.join(LEGACY_MODEL).is_dir());assert_eq!(fs::read(root.join("data/speaker/templates/old.npy")).unwrap(),b"legacy-vector");assert!(!root.join(CURRENT_MODEL).exists());assert!(!root.join("tmp/update-transaction.json").exists());fs::remove_dir_all(root).unwrap();
+    }
 }

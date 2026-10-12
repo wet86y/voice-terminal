@@ -16,6 +16,7 @@ import ComputeSettings from './panels/ComputeSettings.vue'
 import ModelSettings from './panels/ModelSettings.vue'
 import WakeTasksSettings from './panels/WakeTasksSettings.vue'
 import SpeakerSettings from './panels/SpeakerSettings.vue'
+import { SPEAKER_DEFAULTS, SPEAKER_FIELDS } from './speaker-policy'
 import { provideProductContext } from './product-context'
 import { useWorkspaceResources } from './useWorkspaceResources'
 import type { WorkbenchModel } from '../interface/workbench'
@@ -89,6 +90,20 @@ afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks()
 })
 describe('正式界面的真实控件交互', () => {
+  it('所有高级声纹控件可编辑并随同一次保存提交', async () => {
+    let value!: ReturnType<typeof useProductControls>
+    const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
+    allowBusinessReady(value)
+    const save = vi.spyOn(productApi, 'saveSpeaker').mockResolvedValue({ settings: { speaker: DEFAULT_SETTINGS.speaker } } as never)
+    await flushPromises()
+    const changed: Record<string,number> = {}
+    for (const field of SPEAKER_FIELDS) {
+      changed[field.key] = SPEAKER_DEFAULTS[field.key] + field.step
+      await wrapper.get(`input[aria-label="${field.label}"]`).setValue(changed[field.key])
+    }
+    await button(wrapper, '保存声纹阈值').trigger('click')
+    expect(save).toHaveBeenCalledWith(expect.objectContaining(changed))
+  })
   it('声纹阈值只保存页面草稿，越过旧界限后保存按钮仍可用并提交放宽量', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(SpeakerSettings) } })
@@ -430,7 +445,7 @@ describe('正式界面的真实控件交互', () => {
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
     value.computeStatus.value = { hardware: { system_memory: {}, gpu: { total_bytes: 8 * 1024 ** 3 } }, models: {
       paraformer: { service: 'READY', device: 'cuda', requested_device: 'cuda', gpu_available: true, runtime: 'PyTorch（推理框架）', resource_status: { gpu_dedicated_bytes: 512 * 1024 ** 2 } },
-      wespeaker: { service: 'READY', device: 'cpu', requested_device: 'cpu', gpu_available: false, gpu_unavailable_reason: '显卡运行库缺失' },
+      campplus: { service: 'READY', device: 'cpu', requested_device: 'cpu', gpu_available: false, gpu_unavailable_reason: '显卡运行库缺失' },
     } } as never
     application.snapshot.value = { total_gpu_dedicated_bytes: 768 * 1024 ** 2, components: [
       { id: 'setup', name: '环境与配置检查', state: 'ready', memory_rss_bytes: null, memory_private_commit_bytes: null },
@@ -443,11 +458,11 @@ describe('正式界面的真实控件交互', () => {
     expect(system.find('[data-metric="memory"]').exists()).toBe(false)
     await system.get('.local-component-action').trigger('click')
     expect(system.text()).toContain('环境与配置检查已通过')
-    const row = wrapper.get('[data-component="wespeaker"]')
+    const row = wrapper.get('[data-component="campplus"]')
     await row.get('button.local-component-action').trigger('click')
     expect(row.findAll('option').map(option => option.attributes('value'))).toEqual(['auto', 'cpu'])
     expect(row.text()).toContain('显卡运行库缺失')
-    value.settings.compute.devices.wespeaker = 'cuda'
+    value.settings.compute.devices.campplus = 'cuda'
     await flushPromises()
     expect(row.get('option[value="cuda"]').attributes('disabled')).toBeDefined()
     expect(row.get('.save-button').attributes('disabled')).toBeDefined()
@@ -461,7 +476,7 @@ describe('正式界面的真实控件交互', () => {
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
     const mb = 1024 ** 2
     value.computeStatus.value = { hardware: { system_memory: {}, gpu: {} }, models: Object.fromEntries(
-      ['paraformer', 'sensevoice', 'voice_vad', 'kws', 'smart_turn', 'wespeaker'].map(id => [id, {
+      ['paraformer', 'sensevoice', 'voice_vad', 'kws', 'smart_turn', 'campplus'].map(id => [id, {
         service: 'READY', device: 'cpu', requested_device: 'cpu', gpu_available: false,
         resource_status: { rss_bytes: 999 * mb, private_commit_bytes: 9999 * mb },
       }])) } as never
@@ -488,10 +503,10 @@ describe('正式界面的真实控件交互', () => {
   it.each(['failed', 'blocked', 'stopped'] as const)('所属进程为 %s（不可用）时，旧模型就绪采样不能继续显示运行中', async state => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
-    value.computeStatus.value = { models: { wespeaker: { service: 'READY', device: 'cpu', requested_device: 'cpu', runtime: 'ONNX Runtime（推理运行时）', gpu_available: false } } } as never
+    value.computeStatus.value = { models: { campplus: { service: 'READY', device: 'cpu', requested_device: 'cpu', runtime: 'ONNX Runtime（推理运行时）', gpu_available: false } } } as never
     application.snapshot.value = { core_available: true, components: [{ id: 'speaker', state, retry_allowed: state !== 'stopped', error: '' }] } as unknown as ApplicationSnapshot
     await flushPromises()
-    const row = wrapper.get('[data-component="wespeaker"]')
+    const row = wrapper.get('[data-component="campplus"]')
     expect(row.get('.local-component-identity > .local-state').text()).toBe('不可用')
     expect(row.classes()).toContain('failed')
     expect(row.get('.local-error').text()).not.toBe('')
@@ -504,10 +519,10 @@ describe('正式界面的真实控件交互', () => {
   it('模型就绪采样与组件故障冲突时显示宿主原因，恢复期间和完成后同步更新文案与按钮', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
-    value.computeStatus.value = { models: { wespeaker: { service: 'READY', device: 'cpu', requested_device: 'cpu', gpu_available: false } } } as never
+    value.computeStatus.value = { models: { campplus: { service: 'READY', device: 'cpu', requested_device: 'cpu', gpu_available: false } } } as never
     application.snapshot.value = { core_available: true, components: [{ id: 'speaker', state: 'failed', retry_allowed: true, error: '声纹连接已断开' }] } as unknown as ApplicationSnapshot
     await flushPromises()
-    const row = wrapper.get('[data-component="wespeaker"]')
+    const row = wrapper.get('[data-component="campplus"]')
     expect(row.get('.local-error').text()).toBe('声纹连接已断开')
     application.snapshot.value!.components[0]!.state = 'starting'
     await flushPromises()
@@ -616,10 +631,10 @@ describe('正式界面的真实控件交互', () => {
   it('模型运行故障单独显示原因，加载回退诊断不覆盖运行异常', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
-    value.computeStatus.value = { models: { wespeaker: { service: 'ERROR', device: 'cpu', requested_device: 'cpu', gpu_available: false, runtime_error: '声纹推理请求超时（2500 毫秒）', load_error: 'CUDA（图形处理器）加载失败，已回退' } } } as never
+    value.computeStatus.value = { models: { campplus: { service: 'ERROR', device: 'cpu', requested_device: 'cpu', gpu_available: false, runtime_error: '声纹推理请求超时（2500 毫秒）', load_error: 'CUDA（图形处理器）加载失败，已回退' } } } as never
     application.snapshot.value = { core_available: true, components: [{ id: 'speaker', state: 'ready' }] } as unknown as ApplicationSnapshot
     await flushPromises()
-    const row = wrapper.get('[data-component="wespeaker"]')
+    const row = wrapper.get('[data-component="campplus"]')
     expect(row.get('.local-state').text()).toBe('运行异常')
     expect(row.get('.local-error').text()).toBe('声纹推理请求超时（2500 毫秒）')
     expect(row.text()).not.toContain('运行中')
@@ -632,7 +647,7 @@ describe('正式界面的真实控件交互', () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
     value.computeStatus.value = { models: Object.fromEntries(
-      ['paraformer', 'sensevoice', 'voice_vad', 'kws', 'smart_turn', 'wespeaker'].map((id, index) => [id, {
+      ['paraformer', 'sensevoice', 'voice_vad', 'kws', 'smart_turn', 'campplus'].map((id, index) => [id, {
         service: ['ERROR', 'UNAVAILABLE', 'DISABLED', 'UNKNOWN'][index % 4], load_error: '组件尚未就绪', runtime_error: '旧采样错误',
       }])) } as never
     application.snapshot.value = { state: 'starting', startup_complete: false, components: [
@@ -654,11 +669,11 @@ describe('正式界面的真实控件交互', () => {
       expect(row.get('.local-component-phase').text()).toBe('正在加载组件')
     }
   })
-  it.each(['wespeaker', 'dsh', 'voice-system'])('%s（本地组件）点击重试立即进入加载状态，后台接管后持续加载并保留真正失败结果', async id => {
-    const owner = id === 'wespeaker' ? 'speaker' : id === 'voice-system' ? 'voice' : 'dsh'
+  it.each(['campplus', 'dsh', 'voice-system'])('%s（本地组件）点击重试立即进入加载状态，后台接管后持续加载并保留真正失败结果', async id => {
+    const owner = id === 'campplus' ? 'speaker' : id === 'voice-system' ? 'voice' : 'dsh'
     let value!: ReturnType<typeof useProductControls>
     const wrapper = render({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
-    value.computeStatus.value = { models: { wespeaker: { service: 'READY', device: 'cpu' } } } as never
+    value.computeStatus.value = { models: { campplus: { service: 'READY', device: 'cpu' } } } as never
     application.snapshot.value = { startup_complete: true, components: [
       { id: owner, name: owner, state: 'failed', phase: '旧启动失败', retry_allowed: true, error: '旧错误' },
     ] } as unknown as ApplicationSnapshot
@@ -694,7 +709,7 @@ describe('正式界面的真实控件交互', () => {
     value.computeStatus.value = { models: {
       paraformer: { service: 'ERROR', load_error: '旧未就绪错误' },
       sensevoice: { service: 'UNAVAILABLE', load_error: '尚未连接' },
-      wespeaker: { service: 'DISABLED' },
+      campplus: { service: 'DISABLED' },
     } } as never
     application.snapshot.value = { startup_complete: false, components: [
       { id: 'asr', state: 'ready', phase: '健康检查通过' },
@@ -705,7 +720,7 @@ describe('正式界面的真实控件交互', () => {
     expect(wrapper.get('[data-component="paraformer"] .local-state').text()).toBe('启动中')
     expect(wrapper.find('[data-component="paraformer"] .local-error').exists()).toBe(false)
     expect(wrapper.get('[data-component="sensevoice"] .local-error').text()).toBe('分析模型缺失')
-    expect(wrapper.get('[data-component="wespeaker"] .local-state').text()).toBe('已停用')
+    expect(wrapper.get('[data-component="campplus"] .local-state').text()).toBe('已停用')
     application.snapshot.value!.startup_complete = true
     await flushPromises()
     expect(wrapper.get('[data-component="paraformer"] .local-error').text()).toBe('旧未就绪错误')

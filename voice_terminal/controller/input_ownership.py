@@ -71,6 +71,8 @@ class InputOwnershipMixin:
             await asyncio.to_thread(self.vad.reset)
 
     async def _fail_kws_closed(self, message: str) -> None:
+        policy = getattr(self, "speaker_policy", None)
+        if policy is not None: policy.clear()
         self._activation_generation += 1
         self.state.input_owner = "none"
         self.state.listening = False
@@ -152,6 +154,8 @@ class InputOwnershipMixin:
         if self.kws is not None:
             self.kws.reset()
         await self._reset_owner_boundary()
+        policy = getattr(self, "speaker_policy", None)
+        if policy is not None: policy.activate("system")
         self.state.input_owner = "asr"
         self.state.set_service("kws", "READY")
         self.state.set_service("asr", "RUNNING")
@@ -169,6 +173,12 @@ class InputOwnershipMixin:
                 self.kws.error if self.kws is not None and self.kws.error else "KWS worker unavailable"
             )
             return False
+        policy = getattr(self, "speaker_policy", None)
+        if policy is not None: policy.clear()
+        published = getattr(self, "_speaker_published", None)
+        if published is not None: published.clear()
+        pending = getattr(self, "_speaker_pending_audio", None)
+        if pending is not None: pending.clear()
         self.state.input_owner = "none"
         self._activation_generation += 1
         transition_generation = self._activation_generation

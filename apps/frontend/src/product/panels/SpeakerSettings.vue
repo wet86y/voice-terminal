@@ -2,8 +2,10 @@
 import { useProductContext } from "../product-context";
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue';
 import SpeakerRecordingFlow from '../../interface/SpeakerRecordingFlow.vue';
-import { ref, watch } from 'vue';
+import { SPEAKER_FIELDS } from '../speaker-policy';
+import { computed, ref, watch } from 'vue';
 const {
+  current,
   settings,
   saving,
   speakerForm,
@@ -43,6 +45,10 @@ const {
   stopSpeakerRecording,
   cancelActiveSpeakerCapture,
 } = useProductContext();
+const sessionMetrics = computed(() => {
+  const value = current.value.speaker_session ?? speakerStatus.value.session;
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+});
 const recordingExpanded = ref(false); // recordingExpanded（录制面板）：收起时保留已完成片段。
 watch(speakerEnrollment, value => { if (!value) recordingExpanded.value = false; });
 async function toggleRecording() {
@@ -59,11 +65,11 @@ async function toggleRecording() {
   <div v-if="speakerNeedsReenrollment" class="info-callout">
     <span>!</span>
     <p>
-      <strong>需要重新注册声纹。</strong
+      <strong>需要注册CAM++声纹。</strong
       >{{
         speakerStaleReason
       }}
-      特征管线更换后，旧模板已停止参与身份判断。拦截模式会暂停放行输入，请重新录制三段。
+      此版本使用CAM++，升级会移除旧WeSpeaker模型与档案。缺少有效CAM++档案时以观察状态运行，录制三段后恢复已保存的筛选及主人打断偏好。
     </p>
   </div>
 
@@ -80,7 +86,7 @@ async function toggleRecording() {
         >注册主人声纹且
         Worker（工作进程）就绪后才能启用拦截。</small
       ><small v-else
-        >拦截会等待本段身份判定；只有确认的主人输入进入对话，其余输入按非主人进入环境记录。短句可能因人声证据不足被拦截。</small
+        >待确认正文暂存在内存，后续主人证据匹配时补入上下文；已放行正文保持有效。人工开始或唤醒成功后的初始阶段无条件放行并采集会话声纹。</small
       ></label
     >
     <label class="switch-row"
@@ -115,8 +121,21 @@ async function toggleRecording() {
       }}</small>
     </div>
   </div>
+  <div class="info-callout" v-if="sessionMetrics.activation_id">
+    <p>会话临时声纹：{{ sessionMetrics.calibration_status === 'ready' ? '已固定，本会话有效' : sessionMetrics.calibration_status === 'collecting' ? '初始放行，正在采集' : '未启用' }}。
+      已采集人声 {{ sessionMetrics.calibration_speech_ms }} 毫秒；待确认增量 {{ sessionMetrics.pending_count }}；恢复 {{ sessionMetrics.recovered_count }}；超时 {{ sessionMetrics.timeout_count }}。
+      永久分数 {{ sessionMetrics.permanent_score ?? '—' }}，会话分数 {{ sessionMetrics.session_score ?? '—' }}，组合分数 {{ sessionMetrics.combined_score ?? '—' }}，实际阈值 {{ sessionMetrics.threshold_used ?? '—' }}。</p>
+  </div>
   <details class="speaker-advanced">
       <summary>高级设置 · 阈值基线</summary>
+      <p class="instruction-hint">手动开始和唤醒词激活均先放行并校准。临时质心固定到停止录制或进入静默；采集参数下次激活生效，判断参数下个心跳生效。</p>
+      <div class="speaker-thresholds">
+        <label v-for="field in SPEAKER_FIELDS" :key="field.key" class="form-field">
+          <span>{{ field.label }}</span>
+          <input v-model.number="speakerForm[field.key]" type="number" :min="field.min" :max="field.max" :step="field.step" :aria-label="field.label" />
+        </label>
+      </div>
+
       <div class="speaker-thresholds">
         <label class="form-field"
           ><span
@@ -128,7 +147,7 @@ async function toggleRecording() {
             min="0.01"
             max="1"
             step="0.01"
-          /><small>达到阈值判主人，低于阈值判非主人；证据不足或模型异常也判非主人。</small></label
+          /><small>达到主人阈值可确认身份；灰区暂存，持续低于非主人阈值才拦截。句内普通抖动不撤销放行。</small></label
         ><label class="form-field"
           ><span
             >连续主人放宽量
@@ -152,7 +171,7 @@ async function toggleRecording() {
           恢复默认（主人阈值 0.60 / 连续放宽 0.10）
         </button>
       </div>
-      <p class="instruction-hint">{{ String(speakerStatus.model_id || 'WeSpeaker') }}（声纹模型）使用独立 CPU（中央处理器）工作进程。声纹只在本地旁路观察和路由，不阻塞 VAD（语音活动检测）及 ASR（自动语音识别）；普通请求在未注册、超时或出错时保守放行，主人打断需要确认。</p>
+      <p class="instruction-hint">{{ String(speakerStatus.model_id || 'CAM++') }}（声纹模型）通过 {{ String(speakerStatus.runtime || 'FunASR / PyTorch（原生运行时）') }} 加载，实际设备 {{ String(speakerStatus.device || '尚未加载') }}。声纹在独立进程计算，超时沿用已有身份；待确认正文继续暂存，主人打断需要有效身份或初始临时授权。</p>
       <p class="instruction-hint">阈值是当前测试基线，不代表安全等级；不提供 anti-spoofing（防伪与变声检测），不用于付款、删除或门锁等高风险操作的身份认证。</p>
   </details>
 
@@ -177,8 +196,7 @@ async function toggleRecording() {
       }}</small
       ><small>{{ speakerTestWindowSummary(speakerTestResult) }}</small
       ><small
-        >与运行时同一口径（2 秒滑窗 +
-        整段聚合），本次测试不会改变运行模式。</small
+        >现场测试采用可调上下文与永久模板评分；实时会话还会叠加临时声纹和句内迟滞，本次测试不会改变运行模式。</small
       >
     </div>
     <SpeakerRecordingFlow v-if="recordingExpanded && speakerEnrollment" :completed="speakerEnrollment.segments.length" :total="3">

@@ -50,7 +50,8 @@ def test_onnx_probe_never_attempts_to_import_torch_or_sherpa(monkeypatch):
     monkeypatch.setattr(compute.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="GPU, 4096, 8192"))
     result = compute._backend_hardware_status(onnx_only=True)
     assert not attempted
-    assert result["models"]["wespeaker"]["gpu_available"]
+    assert result["models"]["smart_turn"]["gpu_available"]
+    assert not result["models"]["campplus"]["gpu_available"]
     assert not result["backends"]["pytorch_cuda"]
 
 

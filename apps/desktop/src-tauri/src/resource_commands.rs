@@ -184,12 +184,12 @@ impl ResourceManager {
             let lock=voice_desktop_common::runtime::lock(context).map_err(|message|JobError::Failed{message,installed:vec![]})?;
             for (index,(model,groups)) in [("paraformer",vec!["voice-core","torch-cpu"]),("voice_vad",vec!["voice-core","torch-cpu","onnx-cpu","sherpa-cpu"]),
                 ("sensevoice",vec!["voice-core","torch-cpu","onnx-cpu"]),("smart_turn",vec!["voice-core","torch-cpu","onnx-cpu"]),
-                ("wespeaker",vec!["voice-core","torch-cpu","onnx-cpu","sherpa-cpu"]),("kws",vec!["voice-core","torch-cpu","onnx-cpu","sherpa-cpu"])].into_iter().enumerate(){
+                ("campplus",vec!["voice-core","torch-cpu"]),("kws",vec!["voice-core","torch-cpu","onnx-cpu","sherpa-cpu"])].into_iter().enumerate(){
                 if cancel.load(Ordering::Acquire){return Err(JobError::Cancelled);}
                 manager.set_phase(&id,&format!("实际推理检测：{model}（模型）"),true,index as u64,Some(6));
                 let names:std::collections::BTreeSet<String>=groups.iter().flat_map(|group|lock["groups"][group].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned)).collect();
                 let args=vec!["--names".into(),serde_json::to_string(&names).unwrap(),"--model".into(),model.into(),"--program".into(),context.program.to_string_lossy().into_owned(),"--install-root".into(),context.install.to_string_lossy().into_owned()];
-                let resource=match model {"paraformer"=>"paraformer-streaming","voice_vad"=>"fsmn-vad","sensevoice"=>"sensevoice-small","smart_turn"=>"smart-turn", "wespeaker"=>"wespeaker-cnceleb-resnet34",_=>"kws-sherpa-onnx"};
+                let resource=match model {"paraformer"=>"paraformer-streaming","voice_vad"=>"fsmn-vad","sensevoice"=>"sensevoice-small","smart_turn"=>"smart-turn", "campplus"=>"campplus-zh-cn-common",_=>"kws-sherpa-onnx"};
                 let result=(||{
                     let spec=voice_desktop_common::resources::spec(context,resource)?;
                     let model_root=voice_desktop_common::workspace::safe_path(&context.install,&format!("models/{}",spec["destination"].as_str().ok_or("模型目录缺失")?))?;

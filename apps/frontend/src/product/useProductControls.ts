@@ -1,3 +1,4 @@
+import { SPEAKER_DEFAULTS } from "./speaker-policy";
 import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { onMounted } from "vue";
 import { useApplicationHost } from "./application-host";
@@ -181,9 +182,9 @@ export function useProductControls() {
       detail: "ONNX Runtime（推理引擎）语音轮次结束分类。",
     },
     {
-      id: "wespeaker",
-      title: "WeSpeaker（声纹识别）",
-      detail: "本地 ONNX（推理引擎）声纹向量提取。",
+      id: "campplus",
+      title: "CAM++（声纹识别）",
+      detail: "FunASR / PyTorch（原生语音运行时）声纹向量提取。",
     },
   ] as const;
   function formatComputeBytes(value: number | null | undefined) {
@@ -999,6 +1000,7 @@ export function useProductControls() {
     return typeof value === "object" && value !== null && !Array.isArray(value);
   }
   const speakerNeedsReenrollment = computed(() => {
+    if (speakerStatus.value.needs_registration === true) return true;
     const profile = speakerProfile.value;
     if (!isRecord(profile)) return false;
     if (profile.stale === true || profile.needs_reenrollment === true)
@@ -1140,6 +1142,7 @@ export function useProductControls() {
     // Mirrors config/default.yaml.  Changing the feature frontend moved the raw
     // cosine operating point, so these numbers are not comparable with any
     // threshold calibrated before that change.
+    Object.assign(speakerForm, SPEAKER_DEFAULTS);
     speakerForm.confirm_threshold = 0.6;
     speakerForm.continuity_threshold = 0.5;
     speakerForm.continuity_relaxation = 0.1;
@@ -1629,6 +1632,7 @@ export function useProductControls() {
   });
 
   return {
+    current,
     decideDshApproval,
     applicationSnapshot,
     showApplicationSystem,

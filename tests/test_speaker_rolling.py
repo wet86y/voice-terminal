@@ -39,15 +39,14 @@ class RollingSpeakerSensorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sensor.buffered_samples, 400)
         self.assertEqual(self.sensor._chunks[0].start_sample, 500)
 
-    async def test_owner_requires_full_decision_speech_gate(self) -> None:
-        # A 700 ms quality-eligible part of the 2 s model window is not enough
-        # to authorize an identity decision.
+    async def test_short_input_does_not_wait_for_whole_turn_gate(self) -> None:
+        # 已有输入即可推理，不等待缓冲填满或整轮最低人声。
         self.sensor.submit_frame(pcm(SR), start_sample=0, speech=True)
         self.sensor.submit_frame(pcm(SR), start_sample=SR, speech=False)
         snapshot = await self.sensor.analyze()
-        self.assertEqual(snapshot.identity, RollingSpeakerIdentity.NON_OWNER)
-        self.assertEqual(snapshot.reason, "insufficient_decision_speech")
-        self.assertEqual(self.calls, [])
+        self.assertEqual(snapshot.identity, RollingSpeakerIdentity.OWNER)
+        self.assertEqual(snapshot.reason, "embedding_ready")
+        self.assertEqual(len(self.calls), 1)
 
     async def test_continuous_candidate_can_be_owner_and_has_no_audio_or_embedding(self) -> None:
         self.sensor.submit_frame(pcm(SR * 2), start_sample=100, speech=True)
@@ -60,7 +59,8 @@ class RollingSpeakerSensorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.analysis_end_sample, 100 + SR * 2)
         self.assertTrue(snapshot.covers_candidate(100, 100 + SR * 2))
         self.assertFalse(hasattr(snapshot, "pcm"))
-        self.assertFalse(hasattr(snapshot, "embedding"))
+        self.assertEqual(snapshot.embedding, (1.0,))
+        self.assertNotIn("embedding=", repr(snapshot))
         self.assertEqual(len(self.calls), 1)
 
     async def test_candidate_window_never_uses_audio_before_candidate_start(self) -> None:
@@ -68,9 +68,9 @@ class RollingSpeakerSensorTests(unittest.IsolatedAsyncioTestCase):
         result = await self.sensor.analyze(
             candidate_start_sample=SR, candidate_end_sample=SR * 2,
         )
-        self.assertEqual(result.identity, RollingSpeakerIdentity.NON_OWNER)
-        self.assertEqual(result.reason, "window_unavailable")
-        self.assertEqual(self.calls, [])
+        self.assertEqual(result.identity, RollingSpeakerIdentity.OWNER)
+        self.assertEqual(result.analysis_start_sample, SR)
+        self.assertEqual(self.calls, [pcm(SR)])
 
     async def test_candidate_can_use_its_recent_two_seconds_without_neighbor_audio(self) -> None:
         self.sensor.submit_frame(pcm(SR), start_sample=0, speech=False)
@@ -79,12 +79,11 @@ class RollingSpeakerSensorTests(unittest.IsolatedAsyncioTestCase):
             candidate_start_sample=SR, candidate_end_sample=SR * 4,
         )
         self.assertEqual(result.identity, RollingSpeakerIdentity.OWNER)
-        self.assertEqual((result.analysis_start_sample, result.analysis_end_sample), (SR * 2, SR * 4))
+        self.assertEqual((result.analysis_start_sample, result.analysis_end_sample), (SR, SR * 4))
         self.assertTrue(result.covers_candidate(SR, SR * 4))
 
     async def test_decision_speech_accumulates_across_candidate_clipped_history(self) -> None:
-        # Candidate spans 2.5 s with a 500 ms pause. The 2 s model window
-        # contains 1.5 s speech, while the candidate history contains 2 s.
+        # 候选含短暂停顿，增长上下文保留当前已有音频。
         self.sensor.submit_frame(pcm(SR), start_sample=0, speech=True)
         self.sensor.submit_frame(pcm(SR // 2), start_sample=SR, speech=False)
         self.sensor.submit_frame(pcm(SR), start_sample=SR + SR // 2, speech=True)
@@ -93,16 +92,16 @@ class RollingSpeakerSensorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.identity, RollingSpeakerIdentity.OWNER)
         self.assertEqual((result.analysis_start_sample, result.analysis_end_sample),
-                         (SR // 2, SR * 2 + SR // 2))
+                         (0, SR * 2 + SR // 2))
 
-    async def test_scores_below_owner_threshold_are_non_owner_without_continuity(self) -> None:
+    async def test_scores_below_owner_threshold_stay_unknown_for_session_policy(self) -> None:
         self.sensor.submit_frame(pcm(SR * 2), start_sample=0, speech=True)
         self.sensor.score_embedding = lambda _vector: 0.49
-        self.assertEqual((await self.sensor.analyze()).identity, RollingSpeakerIdentity.NON_OWNER)
+        self.assertEqual((await self.sensor.analyze()).identity, RollingSpeakerIdentity.UNKNOWN)
         self.sensor.score_embedding = lambda _vector: 0.55
-        self.assertEqual((await self.sensor.analyze()).identity, RollingSpeakerIdentity.NON_OWNER)
+        self.assertEqual((await self.sensor.analyze()).identity, RollingSpeakerIdentity.UNKNOWN)
 
-    async def test_inference_failure_is_non_owner_and_snapshot_expires(self) -> None:
+    async def test_inference_failure_is_unknown_and_snapshot_expires(self) -> None:
         async def fail(_payload: bytes) -> tuple[float, ...]:
             raise RuntimeError("private exception details")
 
@@ -112,7 +111,7 @@ class RollingSpeakerSensorTests(unittest.IsolatedAsyncioTestCase):
             result = await self.sensor.analyze(completed_at=10.0)
         self.assertIn("RuntimeError: private exception details", "\n".join(logs.output))
         self.assertIn("start_sample=0 end_sample=32000", "\n".join(logs.output))
-        self.assertEqual(result.identity, RollingSpeakerIdentity.NON_OWNER)
+        self.assertEqual(result.identity, RollingSpeakerIdentity.UNKNOWN)
         self.assertEqual(result.reason, "inference_failed")
         self.assertFalse(result.is_fresh(now=11.0, max_age_ms=800))
 
@@ -124,14 +123,14 @@ class RollingSpeakerSensorTests(unittest.IsolatedAsyncioTestCase):
         self.sensor.embed_pcm = reject
         self.sensor.submit_frame(pcm(SR * 2), start_sample=0, speech=True)
         result = await self.sensor.analyze()
-        self.assertEqual(result.identity, RollingSpeakerIdentity.NON_OWNER)
+        self.assertEqual(result.identity, RollingSpeakerIdentity.UNKNOWN)
         self.assertEqual(result.quality, "too_quiet")
         self.assertEqual(result.reason, "audio_quality_rejected")
 
     async def test_missing_vad_does_not_authorize_identity(self) -> None:
         self.sensor.submit_frame(pcm(SR * 2), start_sample=0, speech=None)
         result = await self.sensor.analyze()
-        self.assertEqual(result.identity, RollingSpeakerIdentity.NON_OWNER)
+        self.assertEqual(result.identity, RollingSpeakerIdentity.UNKNOWN)
         self.assertEqual(result.reason, "vad_unavailable")
         self.assertEqual(self.calls, [])
 

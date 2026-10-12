@@ -15,12 +15,12 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
     { id: 'sensevoice', label: 'SenseVoiceSmall（语音识别与分析）', state: 'incomplete', status: '安装不完整', error: '缺少配置文件，可重新下载或导入。' },
     { id: 'kws', label: 'KWS（关键字唤醒）', state: 'installed', status: '已安装' },
     { id: 'smart_turn', label: 'SmartTurn（语音结束判断）', state: 'missing', status: '未安装' },
-    { id: 'wespeaker', label: 'WeSpeaker（声纹识别）', state: 'installed', status: '已安装' },
+    { id: 'campplus', label: 'CAM++（声纹识别）', state: 'installed', status: '已安装' },
     { id: 'dsh', label: 'DSH（代理执行宿主）', state: 'missing', status: '未安装' },
   ]
   const runtimes: Record<string, string> = {
     paraformer: 'PyTorch（推理框架）', sensevoice: 'PyTorch（推理框架）', voice_vad: 'PyTorch（推理框架）',
-    kws: 'Sherpa-ONNX（唤醒引擎）', smart_turn: 'ONNX（推理引擎）', wespeaker: 'ONNX（推理引擎）',
+    kws: 'Sherpa-ONNX（唤醒引擎）', smart_turn: 'ONNX（推理引擎）', campplus: 'ONNX（推理引擎）',
     dsh: 'Node.js（执行环境）', voice: 'Python（语音进程）', web: 'WebView2（桌面引擎）',
   }
   const sourceRows = [

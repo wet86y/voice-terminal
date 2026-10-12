@@ -6,8 +6,8 @@ import os
 from pathlib import Path
 
 MODEL_RESOURCES={'paraformer':'paraformer-streaming','voice_vad':'fsmn-vad','sensevoice':'sensevoice-small',
-                 'smart_turn':'smart-turn','wespeaker':'wespeaker-cnceleb-resnet34','kws':'kws-sherpa-onnx'}
-ROLES={'asr':('paraformer',),'analysis':('sensevoice','smart_turn'),'voice':('voice_vad','kws','wespeaker')}
+                 'smart_turn':'smart-turn','campplus':'campplus-zh-cn-common','kws':'kws-sherpa-onnx'}
+ROLES={'asr':('paraformer',),'analysis':('sensevoice','smart_turn'),'voice':('voice_vad','kws','campplus')}
 
 def fingerprint(root:Path)->str:
     digest=hashlib.sha256()
@@ -67,11 +67,13 @@ def probe_model(name:str,program:Path,install:Path)->dict:
         model=SmartTurn(models/'analysis/smart-turn',device='cuda')
         model(pcm)
         if model.device!='cuda':raise RuntimeError(model.load_error or '模型自动回退')
-    elif name=='wespeaker':
-        from .speaker.engine import WeSpeakerOnnxEngine
-        model=WeSpeakerOnnxEngine(models/'speaker/wespeaker-cnceleb-resnet34/cnceleb_resnet34.onnx',device='cuda')
-        model.embed_pcm(pcm)
-        if model.device!='cuda':raise RuntimeError(model.load_error or '模型自动回退')
+    elif name=='campplus':
+        from .speaker.native import CamPlusPlusFunAsrEngine
+        from .speaker.features import probe_pcm
+        model=CamPlusPlusFunAsrEngine(models/'speaker/campplus-zh-cn-common/campplus_cn_common.bin',device='cuda')
+        model.load()
+        model.embed_pcm(probe_pcm())
+        if model.device!='cuda':raise RuntimeError(model.load_error or '模型回退到中央处理器')
     elif name=='kws':
         from .kws.detector import KwsDetector
         from .kws.keywords import generate_keywords_for

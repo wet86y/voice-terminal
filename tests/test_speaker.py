@@ -46,13 +46,13 @@ class SpeakerStateTests(unittest.TestCase):
         self.machine.reset(turn_id="turn", generation=1)
 
     def test_binary_boundaries_and_unavailable_never_authorize_owner(self) -> None:
-        self.assertEqual(self.machine.decision().state, SpeakerState.NON_OWNER_CONFIRMED)
+        self.assertEqual(self.machine.decision().state, SpeakerState.UNKNOWN)
         self.machine.observe(observation(0.60))
         self.assertEqual(self.machine.decision().state, SpeakerState.OWNER_CONFIRMED)
         self.machine.mark_unavailable("model_failure")
         decision = self.machine.decision()
-        self.assertEqual(decision.state, SpeakerState.NON_OWNER_CONFIRMED)
-        self.assertEqual(decision.route, "ambient")
+        self.assertEqual(decision.state, SpeakerState.UNAVAILABLE)
+        self.assertEqual(decision.route, "pending")
         self.assertTrue(decision.degraded)
         self.assertEqual(decision.reason, "model_failure")
         self.assertIsNone(self.machine._last_owner_confirmed_at)
@@ -116,20 +116,20 @@ class SpeakerStateTests(unittest.TestCase):
         self.assertEqual(self.machine.observe(observation(0.55, turn_id="turn-3", generation=3)),
                          SpeakerState.NON_OWNER_CONFIRMED)
 
-    def test_minimum_turn_speech_gates_every_decision(self) -> None:
-        # A perfect score over too little speech must not authorise the owner.
-        self.assertEqual(self.machine.observe(observation(0.99, speech_ms=400)), SpeakerState.NON_OWNER_CONFIRMED)
+    def test_short_input_can_confirm_without_whole_turn_wait(self) -> None:
+        # 有效短音频直接计算，取消旧整轮人声门槛。
+        self.assertEqual(self.machine.observe(observation(0.99, speech_ms=400)), SpeakerState.OWNER_CONFIRMED)
         decision = self.machine.decision()
-        self.assertEqual(decision.state, SpeakerState.NON_OWNER_CONFIRMED)
-        self.assertEqual(decision.route, "ambient")
-        self.assertEqual(decision.aggregated_windows, 0)
+        self.assertEqual(decision.state, SpeakerState.OWNER_CONFIRMED)
+        self.assertEqual(decision.route, "main")
+        self.assertEqual(decision.aggregated_windows, 1)
 
     def test_short_or_stale_observations_never_confirm(self) -> None:
         machine = SpeakerStateMachine()
         machine.reset(turn_id="turn", generation=3)
         self.assertEqual(machine.observe(observation(0.99, generation=3, quality="not_speech")),
-                         SpeakerState.NON_OWNER_CONFIRMED)
-        self.assertEqual(machine.observe(observation(0.99, generation=2)), SpeakerState.NON_OWNER_CONFIRMED)
+                         SpeakerState.UNKNOWN)
+        self.assertEqual(machine.observe(observation(0.99, generation=2)), SpeakerState.UNKNOWN)
         self.assertEqual(machine.decision().observation_count, 1)
 
     def test_speech_weighted_aggregate_prefers_the_longer_window(self) -> None:

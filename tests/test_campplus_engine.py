@@ -18,13 +18,13 @@ def _tone_pcm(seconds: float, sample_rate: int = 16000) -> bytes:
 
 
 def test_speaker_model_path_selects_each_export_filename(tmp_path: Path) -> None:
-    wespeaker = AppConfig(model_dir=tmp_path).speaker_model_path
+    wespeaker = AppConfig(model_dir=tmp_path, speaker=SpeakerConfig(model_id="wespeaker-cnceleb-resnet34")).speaker_model_path
     campplus = AppConfig(
         model_dir=tmp_path,
         speaker=SpeakerConfig(model_id=CAMPPLUS_MODEL_ID),
     ).speaker_model_path
     assert wespeaker == tmp_path / "speaker" / "wespeaker-cnceleb-resnet34" / "cnceleb_resnet34.onnx"
-    assert campplus == tmp_path / "speaker" / CAMPPLUS_MODEL_ID / "campplus.onnx"
+    assert campplus == tmp_path / "speaker" / CAMPPLUS_MODEL_ID / "campplus_cn_common.bin"
 
 
 def test_factory_rejects_unknown_speaker_model_id(tmp_path: Path) -> None:
@@ -32,19 +32,20 @@ def test_factory_rejects_unknown_speaker_model_id(tmp_path: Path) -> None:
         create_speaker_engine("unknown-speaker-model", tmp_path / "model.onnx")
 
 
-@pytest.mark.parametrize("seconds", [0.75, 1.0, 2.0, 3.0])
+@pytest.mark.parametrize("seconds", [0.045, 0.4, 0.8, 3.2])
 def test_campplus_cpu_embedding_is_finite_192d_unit_vector(seconds: float) -> None:
-    pytest.importorskip("onnxruntime")
+    pytest.importorskip("funasr")
     pytest.importorskip("torchaudio")
-    model_path = Path(__file__).resolve().parents[1] / ".local" / "models" / "speaker" / CAMPPLUS_MODEL_ID / "campplus.onnx"
+    model_path = Path(__file__).resolve().parents[1] / ".local" / "models" / "speaker" / CAMPPLUS_MODEL_ID / "campplus_cn_common.bin"
     if not model_path.is_file():
-        pytest.skip("optional CAM++ ONNX asset has not been prepared")
+        pytest.skip("CAM++ 官方原生权重尚未安装")
 
     engine = create_speaker_engine(CAMPPLUS_MODEL_ID, model_path, device="cpu")
     engine.load()
     embedding = np.asarray(engine.embed_pcm(_tone_pcm(seconds)), dtype=np.float32)
 
     assert engine.device == "cpu"
+    assert len(engine.session.model.state_dict()) == 937
     assert embedding.shape == (192,)
     assert np.isfinite(embedding).all()
     assert np.linalg.norm(embedding) == pytest.approx(1.0, abs=1e-5)
@@ -56,7 +57,7 @@ def test_real_worker_loads_campplus_and_emits_short_and_off_grid_windows() -> No
     from voice_terminal.speaker.protocol import encode_pcm
     from voice_terminal.speaker.worker import SpeakerWorkerEngine
 
-    model_path = Path(__file__).resolve().parents[1] / ".local" / "models" / "speaker" / CAMPPLUS_MODEL_ID / "campplus.onnx"
+    model_path = Path(__file__).resolve().parents[1] / ".local" / "models" / "speaker" / CAMPPLUS_MODEL_ID / "campplus_cn_common.bin"
     if not model_path.is_file():
         pytest.skip("optional CAM++ ONNX asset has not been prepared")
 

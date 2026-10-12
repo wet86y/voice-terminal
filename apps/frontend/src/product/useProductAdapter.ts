@@ -1,3 +1,4 @@
+import { SPEAKER_DEFAULTS } from "./speaker-policy"
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useVoiceTerminal } from '../composables/useVoiceTerminal'
 import { useApplicationHost } from './application-host'
@@ -139,7 +140,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const quietHoursForm = reactive({ enabled: false, start: '23:00', end: '07:00' })
   const modelScanState = ref<'idle' | 'scanning' | 'complete'>('idle')
   const providerStep = ref<'idle' | 'discovering' | 'select-model' | 'custom-id' | 'verified'>('idle')
-  const speakerForm = reactive({ mode: 'off', confirm_threshold: 0.6, continuity_threshold: 0.5, continuity_relaxation: 0.1, owner_only_barge_in: false })
+  const speakerForm = reactive({ ...SPEAKER_DEFAULTS, mode: 'off', confirm_threshold: 0.6, continuity_threshold: 0.5, continuity_relaxation: 0.1, owner_only_barge_in: false })
   const speakerStatus = ref<Record<string, unknown>>({})
   const speakerProfile = ref<Record<string, unknown>>({})
   const speakerTestResult = ref<Record<string, unknown> | null>(null)

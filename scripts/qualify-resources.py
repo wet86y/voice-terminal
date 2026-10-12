@@ -32,7 +32,7 @@ RESOURCE_IDS = (
     "kws-sherpa-onnx",
     "paraformer-streaming",
     "fsmn-vad",
-    "wespeaker-cnceleb-resnet34",
+    "campplus-zh-cn-common",
     "smart-turn",
     "sensevoice-small",
     "dsh",

@@ -121,16 +121,22 @@ def main():
     count = 0
     for row in load(payload / 'program-package.json')['files']:
         relative = row['path']
-        assert digest(root / relative) == row['sha256'], relative
-        if relative != 'app/release.json': assert digest(ROOT / '.local' / relative) == row['sha256'], '本地发布差异：' + relative
+        if relative != 'app/release.json':
+            assert digest(root / relative) == row['sha256'], relative
+            assert digest(ROOT / '.local' / relative) == row['sha256'], '本地发布差异：' + relative
         count += 1
     results['checks'].append(f'安装器释放的 {count} 个固定文件与统一程序包一致；本地正式本体逐文件一致，组件登记单独核验')
     stop(root, pid)
     workspace_id = load(root / 'portable.json')['workspace_id']
-    preserved = ['data/settings/用户设置.json', 'data/history/会话.txt', 'models/已安装模型.bin', 'runtimes/python/已安装环境.bin', 'runtimes/dsh/已安装代理.bin']
+    preserved = ['data/settings/用户设置.json', 'data/history/会话.txt', 'models/已安装模型.bin', 'runtimes/python/已安装环境.bin', 'runtimes/dsh/已安装代理.bin', 'data/speaker/campplus-zh-cn-common/保留新档案.txt']
     for relative in preserved:
         path = root / relative;path.parent.mkdir(parents=True, exist_ok=True);path.write_text('保留内容：' + relative, 'utf-8')
     hashes = {relative: digest(root / relative) for relative in preserved}
+    legacy_weights=root/'models/speaker/wespeaker-cnceleb-resnet34';legacy_weights.mkdir(parents=True)
+    (legacy_weights/'cnceleb_resnet34.onnx').write_bytes(b'legacy-model-fixture')
+    legacy_profile=root/'data/speaker';(legacy_profile/'templates').mkdir()
+    write(legacy_profile/'registry.json',{'model_id':'wespeaker-cnceleb-resnet34','schema_version':2})
+    (legacy_profile/'templates/legacy.npy').write_bytes(b'legacy-profile-fixture');(legacy_profile/'probe.npy').write_bytes(b'legacy-probe-fixture')
     release = load(root / 'app/release.json')
     bindings = [{'kind':'python','path':'runtimes/python','build':'preserved','manifest_sha256':'qualification'}]
     release['components'] = bindings;write(root / 'app/release.json', release)
@@ -149,10 +155,17 @@ def main():
     pid = install()
     assert digest(root / 'app/config/default.yaml') == digest(payload / 'app/config/default.yaml')
     assert load(root / 'portable.json')['workspace_id'] == workspace_id
-    assert load(root / 'app/release.json')['components'] == bindings
+    installed_bindings=load(root / 'app/release.json')['components']
+    assert [row for row in installed_bindings if row['kind']!='models'] == bindings
+    model_binding=next(row for row in installed_bindings if row['kind']=='models')
+    assert model_binding['manifest_sha256']==digest(root/'models/manifest.json')
+    assert not legacy_weights.exists() and not (legacy_profile/'registry.json').exists() and not (legacy_profile/'templates').exists() and not (legacy_profile/'probe.npy').exists()
+    weight=root/'models/speaker/campplus-zh-cn-common/campplus_cn_common.bin'
+    assert digest(weight)=='3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8'
     for relative, expected in hashes.items(): assert digest(root / relative) == expected, relative
     assert digest(abandoned_marker) == abandoned_hash and not abandoned_target.exists()
     results['checks'].append('同版本损坏修复保留工作区编号、用户设置、会话、模型、运行环境和组件登记')
+    results['checks'].append('重装离线安装官方CAM++并删除旧WeSpeaker模型与根档案，保留新模型档案并同步模型清单及组件登记')
     results['checks'].append('退出迁移后目标事务已移除，原目录可重装和启动，旧引用及用户数据保留且不重建旧目标')
     stop(root, pid)
     # 从另一个启动工作目录再次启动正式入口。
@@ -165,7 +178,7 @@ def main():
     # 空工作区初始化与已有工作区切换均调用正式入口的辅助事务。
     empty = sandbox/'新的 空工作区'
     pid = native_task(root, empty, 'link', environment)
-    assert load(empty/'app/release.json')['components']==[]
+    assert all(row['kind']=='models' for row in load(empty/'app/release.json')['components'])
     assert not (empty/'data/settings/用户设置.json').exists() and not (empty/'models/已安装模型.bin').exists()
     stop(empty, pid)
     pid = native_task(empty, root, 'link', environment)

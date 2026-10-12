@@ -944,6 +944,10 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self._system_check_output_turn_ids.add(system_check_id)
 
     def _wake(self, kind, *, turn_id=None):
+        if getattr(self, "_speaker_batch_release", False):
+            self.pending.add(kind)
+            if self._pending_since is None: self._pending_since = time.monotonic()
+            return
         if self.context_limited:
             return
         if not self.scheduler.accepts(kind):
@@ -1608,6 +1612,21 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         )
 
     async def observe(self, kind, *, turn_id=None, text=None, **payload):
+        if kind == "USER_INPUT_RELEASED_BATCH":
+            if self.closed: return
+            entries = payload.get("entries", [])
+            self._speaker_batch_release = True
+            try:
+                for item in entries:
+                    if isinstance(item, dict) and item.get("text"):
+                        await self.observe("USER_SEGMENT_UPDATED", turn_id=item["turn_id"], text=item["text"],
+                                           output_generation=item.get("generation", 0), source="speaker_recovery",
+                                           occurred_at=item.get("occurred_at", time.time()))
+            finally:
+                self._speaker_batch_release = False
+            if entries: self._wake("USER_SEGMENT_UPDATED", turn_id=entries[-1]["turn_id"])
+            await self.log("USER_INPUT_RELEASED_BATCH", count=len(entries), activation_id=payload.get("activation_id"))
+            return
         if self.closed:
             return
         if kind in {"USER_INPUT_FINALIZED", "USER_INPUT_REFINED"}:

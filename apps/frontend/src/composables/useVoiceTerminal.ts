@@ -723,9 +723,11 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (Array.isArray(snapshot.audio_cues)) current.audio_cues = snapshot.audio_cues as NonNullable<CurrentTurnSnapshot['audio_cues']>
     if (isRecord(snapshot.analysis)) current.analysis = snapshot.analysis as NonNullable<CurrentTurnSnapshot['analysis']>
     if (isRecord(snapshot.speaker_decision)) current.speaker_decision = snapshot.speaker_decision as NonNullable<CurrentTurnSnapshot['speaker_decision']>
+    if (isRecord(snapshot.speaker_session)) current.speaker_session = snapshot.speaker_session
   }
 
   function applySpeakerDecision(payload: Record<string, unknown>, turnId: string | null) {
+    if (isRecord(payload.speaker_session)) current.speaker_session = payload.speaker_session
     const candidate = isRecord(payload.decision)
       ? payload.decision
       : isRecord(payload.state) ? payload.state : payload

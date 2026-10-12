@@ -1,95 +1,59 @@
-"""声纹回溯起点补送：保持真实窗口、采样边界和轮次代次。"""
+"""声纹增长上下文与采集范围：不等待旧窗口，不重复发送音频。"""
 import asyncio
 from collections import deque
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
-
 from voice_terminal.controller.realtime_controller import RealtimeController
 from voice_terminal.controller.turn_workspace import AudioFrame, TurnWorkspace
-from voice_terminal.speaker.protocol import encode_pcm
-from voice_terminal.speaker.worker import SpeakerWorkerEngine
+from voice_terminal.speaker.rolling import RollingSpeakerSensor, RollingSpeakerIdentity
 
 
-def make_frame(start, samples=320):
-    """生成 20ms PCM（脉冲编码音频）帧；不用于验证模型准确率。"""
-    return AudioFrame(b"\xe8\x03" * samples, start, 1.0)
+def make_frame(start,samples=320):
+    return AudioFrame(b"\xe8\x03"*samples,start,1.0)
 
 
-def test_backdated_onset_reaches_worker_as_one_complete_window():
-    worker = SpeakerWorkerEngine(Path("unused.onnx"))
-    worker.model = SimpleNamespace(model_version="test", embed_pcm=lambda _: (1.0, 0.0))
-    observations = []
-
-    def submit_frame(**kwargs):
-        payload = {key: value for key, value in kwargs.items() if key != "pcm"}
-        payload["pcm_base64"] = encode_pcm(kwargs["pcm"])
-        observations.extend(worker.feed(payload))
-        return True
-
-    controller = object.__new__(RealtimeController)
-    controller.speaker_client = SimpleNamespace(submit_frame=submit_frame, degraded=False)
-    controller.state = SimpleNamespace(set_service=Mock())
-    controller._speaker_turn_start_sample = 3200
-    controller._recent = deque(make_frame(start) for start in range(0, 35200, 320))
-    current = controller._recent[-1]
-    ws = TurnWorkspace("onset", generation=2, speaker_mode="filter")
-
-    controller._prime_speaker_turn_audio(ws, current)
-    submit_frame(turn_id=ws.turn_id, generation=ws.generation, pcm=current.pcm,
-                 start_sample=current.start_sample, end_sample=current.end_sample, speech=True)
-
-    assert len(observations) == 1
-    observation = observations[0]
-    assert observation["window_started_sample"] == 3200
-    assert observation["window_ended_sample"] == 35200
-    assert observation["speech_ms"] == observation["turn_speech_ms"] == 2000
-    assert observation["quality"] == "ready"
+def test_45ms_input_at_sample_zero_can_be_analyzed():
+    async def run():
+        embed=AsyncMock(return_value=(1.,0.))
+        sensor=RollingSpeakerSensor(embed,lambda _:0.8)
+        sensor.submit_frame(b"\xe8\x03"*720,start_sample=0,speech=True)
+        result=await sensor.analyze(candidate_start_sample=0,candidate_end_sample=720)
+        assert result.identity==RollingSpeakerIdentity.OWNER
+        assert (result.analysis_start_sample,result.analysis_end_sample)==(0,720)
+        assert result.speech_ms==45
+        assert (await sensor.analyze()).reason=="no_new_audio"
+        assert embed.await_count==1
+    asyncio.run(run())
 
 
-def test_preroll_clips_previous_speaker_and_excludes_current_frame():
-    submit = Mock(return_value=True)
-    controller = object.__new__(RealtimeController)
-    controller.speaker_client = SimpleNamespace(submit_frame=submit, degraded=False)
-    controller._speaker_turn_start_sample = 480
-    controller._recent = deque(make_frame(start) for start in (0, 320, 640, 960))
-    ws = TurnWorkspace("resumed", generation=4, speaker_mode="observe")
-
-    controller._prime_speaker_turn_audio(ws, controller._recent[-1])
-
-    sent = [call.kwargs for call in submit.call_args_list]
-    assert [(item["start_sample"], item["end_sample"]) for item in sent] == [(480, 640), (640, 960)]
-    assert len(sent[0]["pcm"]) == 160 * 2
-    assert all(item["turn_id"] == "resumed" and item["generation"] == 4 for item in sent)
+def test_candidate_range_excludes_previous_speaker_audio():
+    async def run():
+        embed=AsyncMock(return_value=(1.,0.))
+        sensor=RollingSpeakerSensor(embed,lambda _:0.8)
+        sensor.submit_frame(b"\x00\x10"*3200,start_sample=0,speech=True)
+        current=b"\xe8\x03"*1600
+        sensor.submit_frame(current,start_sample=3200,speech=True)
+        result=await sensor.analyze(candidate_start_sample=3200,candidate_end_sample=4800)
+        assert result.analysis_start_sample==3200
+        assert embed.await_args.args[0]==current
+    asyncio.run(run())
 
 
-def test_preroll_accepts_sample_zero_and_preserves_off_mode():
-    submit = Mock(return_value=True)
-    controller = object.__new__(RealtimeController)
-    controller.speaker_client = SimpleNamespace(submit_frame=submit, degraded=False)
-    controller._speaker_turn_start_sample = 0
-    controller._recent = deque((make_frame(0), make_frame(320)))
-    current = controller._recent[-1]
-    ws = TurnWorkspace("zero", speaker_mode="filter")
-    controller._prime_speaker_turn_audio(ws, current)
-    assert submit.call_args.kwargs["start_sample"] == 0
-    submit.reset_mock()
-    ws.speaker_mode = "off"
-    controller._prime_speaker_turn_audio(ws, current)
-    submit.assert_not_called()
+def test_duplicate_frames_do_not_add_evidence_and_gap_resets_context():
+    sensor=RollingSpeakerSensor(AsyncMock(),lambda _:0.8)
+    pcm=b"\xe8\x03"*720
+    assert sensor.submit_frame(pcm,start_sample=0,speech=True)
+    assert not sensor.submit_frame(pcm,start_sample=0,speech=True)
+    assert sensor.buffered_samples==720
+    assert sensor.submit_frame(pcm,start_sample=1600,speech=True)
+    assert sensor.buffered_samples==720
 
 
-def test_preroll_overflow_downgrades_service_and_stops_replay():
-    submit = Mock(return_value=False)
-    controller = object.__new__(RealtimeController)
-    controller.speaker_client = SimpleNamespace(submit_frame=submit, degraded=True)
-    controller.state = SimpleNamespace(set_service=Mock())
-    controller._speaker_turn_start_sample = 0
-    controller._recent = deque(make_frame(start) for start in (0, 320, 640))
-    ws = TurnWorkspace("overflow", speaker_mode="filter")
-    controller._prime_speaker_turn_audio(ws, controller._recent[-1])
-    submit.assert_called_once()
-    controller.state.set_service.assert_called_once_with("speaker", "DEGRADED")
+def test_turn_priming_does_not_start_duplicate_worker_stream():
+    c=object.__new__(RealtimeController)
+    c.speaker_client=SimpleNamespace(submit_frame=Mock())
+    c._prime_speaker_turn_audio(TurnWorkspace("a"),make_frame(0))
+    c.speaker_client.submit_frame.assert_not_called()
 
 
 def test_resume_increments_generation_before_router_reset_and_preroll():
@@ -126,10 +90,5 @@ def test_resume_increments_generation_before_router_reset_and_preroll():
     assert ws.generation == 4
     assert ws.speaker_mode == "filter"
     router_reset.assert_called_once_with(turn_id="resume", generation=4)
-    submit.assert_called_once()
-    submitted = submit.call_args.kwargs
-    assert (submitted["start_sample"], submitted["end_sample"]) == (320, 640)
-    assert submitted["turn_id"] == "resume"
-    assert submitted["generation"] == 4
-    assert submitted["speech"] is True
+    submit.assert_not_called() # 不再产生第二条固定窗口声纹流。
     controller._detail.assert_awaited_once_with("turn.resumed")
