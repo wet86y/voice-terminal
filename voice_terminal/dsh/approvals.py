@@ -20,6 +20,8 @@ class PendingApproval:
     text: str  # text（请求理由与实际操作）。
     input_at_request: str  # input_at_request（请求到达前已有的用户轮次）。
     dialogue_revision: int = 0  # dialogue_revision（通知授权前已经传达的助手消息水位）。
+    item_id: str = ""  # item_id（原权限卡片标识）。
+    tool_name: str = ""  # tool_name（待授权工具名称）。
 
 
 class DshApprovalPolicy:

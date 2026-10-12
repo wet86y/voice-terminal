@@ -58,6 +58,10 @@ export interface Binding {
   revision: number
   state: 'active' | 'retired'
   activationId?: string | undefined
+  /** activationOrigin（激活来源）：区分语音请求与已领取的定时任务。 */
+  activationOrigin?: 'voice' | 'schedule' | undefined
+  /** activationReady（定时激活确认）：控制工具必须先取得可靠的启动回执。 */
+  activationReady?: Promise<Record<string, Json>> | undefined
   protocolRecoveryAttempted: boolean
   protocolRecoveryPending: boolean
   contextDigest?: string | undefined

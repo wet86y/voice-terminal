@@ -202,6 +202,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   let dshStatusTimer: number | undefined
   let computeStatusTimer: number | undefined
   let speakerStatusTimer: number | undefined
+  let wakeTasksTimer: number | undefined // wakeTasksTimer（任务页可见期间的状态刷新定时器）。
+  let wakeTasksRequest: Promise<void> | null = null // wakeTasksRequest（任务状态读取）：合并并发刷新。
   let noticeDisplayTimer: ReturnType<typeof setTimeout> | undefined
   let noticeFadeTimer: ReturnType<typeof setTimeout> | undefined
   let mutationQueue: Promise<unknown> = Promise.resolve()
@@ -379,14 +381,18 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   async function refreshWakeTasks() {
+    if (wakeTasksRequest) return wakeTasksRequest
     if (!application.businessReady.value) return
     // 唤醒任务由 DSH（代理执行宿主）提供；缺失资源或正在启动时先等待组件就绪。
     const dsh = application.snapshot.value?.components.find(component => component.id === 'dsh')
     if (!dsh || !['ready', 'external'].includes(dsh.state)) return
-    try {
-      const result = await productApi.wakeTasks()
-      wakeTasks.value = Array.isArray(result.tasks) ? result.tasks : []
-    } catch (error) { setError(error) }
+    wakeTasksRequest = (async () => {
+      try {
+        const result = await productApi.wakeTasks()
+        if (!adapterDisposed) wakeTasks.value = Array.isArray(result.tasks) ? result.tasks : []
+      } catch (error) { if (!adapterDisposed) setError(error) }
+    })()
+    try { await wakeTasksRequest } finally { wakeTasksRequest = null }
   }
 
   function editWakeTask(task: WakeTask) {
@@ -488,8 +494,13 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     finally { saving.value = false }
   }
 
-  watch(settingsTab, value => {
-    if (value === 'wakes') void refreshWakeTasks()
+  watch([page, settingsTab, application.businessReady], ([currentPage, tab, ready]) => {
+    if (wakeTasksTimer !== undefined) window.clearInterval(wakeTasksTimer)
+    wakeTasksTimer = undefined
+    if (currentPage === 'settings' && tab === 'wakes' && ready) {
+      void refreshWakeTasks()
+      wakeTasksTimer = window.setInterval(() => void refreshWakeTasks(), 3000)
+    }
   })
 
   async function openDshConsole() {
@@ -1454,6 +1465,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     if (dshStatusTimer !== undefined) window.clearInterval(dshStatusTimer)
     if (computeStatusTimer !== undefined) window.clearInterval(computeStatusTimer)
     if (speakerStatusTimer !== undefined) window.clearInterval(speakerStatusTimer)
+    if (wakeTasksTimer !== undefined) window.clearInterval(wakeTasksTimer)
     clearNoticeTimers()
     voice.dispose()
   })

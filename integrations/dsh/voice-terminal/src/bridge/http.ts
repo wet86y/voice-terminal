@@ -154,6 +154,8 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           if (revision !== existing.revision) response = revision < existing.revision ? result('stale') : result('resync_required')
           else {
             existing.activationId = String(body.activation_id ?? '')
+            existing.activationOrigin = 'voice'
+            existing.activationReady = undefined
             existing.actionSeq = 0
             existing.terminalActivationId = undefined
             existing.pendingTools.clear()
@@ -218,6 +220,7 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
             state: existing.state,
             context_revision: existing.revision,
             activation_id: existing.activationId ?? '',
+            activation_origin: existing.activationOrigin ?? 'voice',
             terminal: !existing.activationId,
             agent_state: existing.handle!.agent.status,
             ready_for_handoff: !existing.activationId && existing.handle!.agent.status === 'idle',

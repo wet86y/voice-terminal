@@ -7,6 +7,7 @@ import pytest
 from tests.test_dsh_bridge import FakeClient, FakeContext
 from voice_terminal.dsh.bridge import DshBridgeError, DshMappingStore, DshShadowAgentSession
 from voice_terminal.shadow_agent.provider import ShadowProviderResponse
+from voice_terminal.server.product import ShadowProductProjection
 
 
 def setup_session(tmp_path, *, voice=False, continuous=False):
@@ -48,6 +49,123 @@ class DecisionProvider:
         self.calls.append(kwargs)
         return ShadowProviderResponse(output=({"type": "message", "content": [{"type": "output_text",
             "text": json.dumps({"decision": self.decision})}]},), usage={})
+
+
+@pytest.mark.parametrize("decision", ["allowed-once", "allowed-until-silence", "rejected", "voice", "auto"])
+def test_accepted_approval_settles_frontend_without_plugin_completion_callback(tmp_path, decision):
+    async def run():
+        session, _, state, _ = setup_session(tmp_path, voice=True, continuous=True)
+        projection = ShadowProductProjection()
+        snapshots = []
+
+        async def sink(values):
+            projection.update_activities(values)
+            snapshots.append(projection.snapshot(session.snapshot()))
+
+        session.activity_sink = sink
+        await pending(session, "first", 1)
+        assert snapshots[-1]["activities"][0]["phase"] == "started"
+        assert snapshots[-1]["user_input_required"]
+        if decision == "voice":
+            session.gate_provider = DecisionProvider("approve")
+            state["input"] = ("new-turn", "同意创建这个目录")
+            assert await session.respond_to_voice_approval(*state["input"])
+        elif decision == "auto":
+            session.approvals.grant_continuous()
+            await session._auto_approve()
+        else:
+            await session.decide_approval("first", decision, 1)
+        final = snapshots[-1]
+        row = next(item for item in final["activities"] if item["item_id"] == "approval-first")
+        assert row["phase"] == ("failed" if decision == "rejected" else "completed")
+        assert not final["user_input_required"]
+        assert session.snapshot()["pending_approval_ids"] == []
+        await pending(session, "first", 1)  # 旧序号不能重新显示审批按钮。
+        assert snapshots[-1]["activities"][0]["phase"] != "started"
+        await session.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("invalid", [None, "foreign_session", "old_activation", "wrong_origin", "wrong_sequence", "already_active"])
+def test_scheduled_activation_requires_authoritative_binding_and_updates_product(tmp_path, invalid):
+    async def run():
+        session, _, _, _ = setup_session(tmp_path)
+        session.dsh_session_id = "dsh-a"
+        session.activation_id = None
+        session._last_terminal_activation_id = "old-a"
+        state = {"protocol_version": "2.0", "result": "accepted", "state": "active",
+                 "activation_id": "scheduled-a", "activation_origin": "schedule", "context_revision": 2}
+
+        class ScheduledClient(FakeClient):
+            async def call(self, operation, payload):
+                self.calls.append((operation, payload))
+                return dict(state) if operation == "session.state" else {"result": "accepted"}
+
+        session.client = ScheduledClient()
+        projection = ShadowProductProjection()
+        snapshots = []
+
+        async def sink(values):
+            projection.update_activities(values)
+            snapshots.append(projection.snapshot(session.snapshot()))
+
+        session.activity_sink = sink
+        start = {**session._envelope(), "activation_id": "scheduled-a", "run_origin": "schedule",
+                 "protocol_version": "2.0", "context_revision": 2, "request_id": "request-schedule",
+                 "action_seq": 1, "state": "running"}
+        if invalid == "foreign_session": start["dsh_session_id"] = "foreign"
+        if invalid == "old_activation": start["activation_id"] = state["activation_id"] = "old-a"
+        if invalid == "wrong_origin": state["activation_origin"] = "voice"
+        if invalid == "wrong_sequence": start["action_seq"] = 2
+        if invalid == "already_active": session.activation_id = "running-a"
+        assert await session.accept_activity(start) == ("stale" if invalid else "accepted")
+        if invalid:
+            assert snapshots == []
+        else:
+            assert session._run_seq == 2
+            assert snapshots[-1]["active"] and snapshots[-1]["phase"] == "working"
+            assert await session.accept_activity(start) == "duplicate"
+            assert session._run_seq == 2
+            assert len(snapshots) == 1
+            base = {key: value for key, value in start.items() if key not in {"run_origin", "state", "action_seq"}}
+            assert await session.accept_activity({**base, "action_seq": 2, "activity": {
+                "stream": "output", "phase": "started", "item_id": "job-timer", "tool_name": "定时任务输出", "tool_status": "running", "text": "运行中",
+            }}) == "accepted"
+            assert await session.accept_event({**base, "request_id": "request-result", "event_id": "result-a", "event": {"type": "result", "text": "定时任务结果"}}) == "accepted"
+            assert await session.accept_activity({**base, "action_seq": 3, "state": "idle"}) == "accepted"
+            assert snapshots[-1]["active"]  # 根代理结束后，所属后台作业继续实时更新。
+            assert await session.accept_activity({**base, "action_seq": 4, "activity": {
+                "stream": "output", "phase": "completed", "item_id": "job-timer", "tool_name": "定时任务输出", "tool_status": "completed", "text": "已结束",
+            }}) == "accepted"
+            assert not snapshots[-1]["active"]
+        await session.close()
+    asyncio.run(run())
+
+
+def test_scheduled_activation_recovers_after_temporary_state_failure(tmp_path):
+    async def run():
+        session, _, _, _ = setup_session(tmp_path)
+        session.dsh_session_id = "dsh-a"
+        session.activation_id = None
+
+        class RecoveringClient(FakeClient):
+            async def call(self, operation, payload):
+                if operation == "session.state" and not self.calls:
+                    self.calls.append((operation, payload))
+                    raise DshBridgeError("暂时无法读取宿主状态")
+                return {"result": "accepted", "state": "active", "activation_origin": "schedule",
+                        "activation_id": "scheduled-a", "context_revision": 2}
+
+        session.client = RecoveringClient()
+        start = {**session._envelope(), "protocol_version": "2.0", "context_revision": 2,
+                 "activation_id": "scheduled-a", "run_origin": "schedule", "action_seq": 1, "state": "running"}
+        assert await session.accept_activity(start) == "stale"
+        assert session.activation_id is None
+        assert await session.accept_activity(start) == "accepted"
+        assert await session.accept_activity(start) == "duplicate"
+        assert session._run_seq == 2
+        await session.close()
+    asyncio.run(run())
 
 
 def test_continuous_button_maps_each_original_request_and_expires_at_window_boundary(tmp_path):

@@ -1012,8 +1012,20 @@ class ShadowProductProjection:
     def update_runtime(self, value: Mapping[str, Any] | None) -> None:
         if not isinstance(value, Mapping):
             return
+        pending_ids = value.get("pending_approval_ids")
+        if isinstance(pending_ids, list) and all(isinstance(item, str) for item in pending_ids):
+            # 重连和终态快照也清理已失效的审批入口，不能从历史卡片恢复授权。
+            for item in self.activities:
+                if (item.get("stream") == "approval" and item.get("phase") == "started"
+                        and item.get("approval_id") not in pending_ids):
+                    item["phase"] = "failed"
+                    item["text"] = (str(item.get("text") or "") + "\n\n权限请求已结束")[-12000:]
         self.available = bool(value.get("available", self.available))
-        self.active = bool(value.get("active", self.active))
+        pending_jobs = any(item.get("run_seq") == self._activity_run_seq
+                           and item.get("stream") == "output"
+                           and str(item.get("item_id", "")).startswith("job-")
+                           and item.get("phase") in {"started", "delta"} for item in self.activities)
+        self.active = bool(value.get("active", self.active)) or pending_jobs
         self.user_input_required = bool(value.get("user_input_required", self.user_input_required))
         # status（状态观察器摘要）仅供模型使用，禁止从运行快照重新映射到前台。
         if not self.available:
@@ -1087,6 +1099,14 @@ class ShadowProductProjection:
                 ][-32:]
                 self.activities = deque(completed_tail, maxlen=96)
                 self._activity_run_seq = run_seq
+            if stream == "lifecycle" and raw.get("state") in {"cancelled", "failed"}:
+                # 取消和失败关闭所属作业，避免迟到回传被拒后仍显示永久运行中。
+                for existing in self.activities:
+                    if (existing.get("run_seq") == run_seq and existing.get("stream") == "output"
+                            and str(existing.get("item_id", "")).startswith("job-")
+                            and existing.get("phase") in {"started", "delta"}):
+                        existing["phase"] = "failed"
+                        existing["tool_status"] = "failed"
             timestamp = raw.get("timestamp")
             item: dict[str, Any] = {
                 "run_seq": run_seq,
