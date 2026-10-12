@@ -247,8 +247,37 @@ pub fn acknowledge(root:&Path,args:&[String])->Result<(),String>{
         let request=crate::resources::load(&path)?;
         if request["token"]!=*token||request["state"]!="waiting"{return Err("启动交接已过期。".into());}
         let pid=std::process::id();let (created,executable)=workspace::process_identity(pid)?.ok_or("桌面进程身份不可用")?;
-        atomic_json(&path,&json!({"token":token,"state":"window-ready","pid":pid,"create_time":created,"executable":executable,"fields":{"token":"一次性启动凭据","state":"首个受控窗口已显示","pid":"正式桌面进程编号","create_time":"进程创建时间","executable":"正式宿主位置"}}))?;
+        let record=json!({"token":token,"state":"window-ready","pid":pid,"create_time":created,"executable":executable,"fields":{"token":"一次性启动凭据","state":"首个受控窗口已显示","pid":"正式桌面进程编号","create_time":"进程创建时间","executable":"正式宿主位置"}});
+        write_acknowledgement(&path,&record)?;
     }Ok(())
+}
+// write_acknowledgement（交接确认写入）：轮询读取或安全扫描可能短暂阻止 Windows 原子替换。
+fn write_acknowledgement(path:&Path,record:&Value)->Result<(),String>{
+    let deadline=Instant::now()+Duration::from_secs(3);
+    loop {
+        match atomic_json(path,record){
+            Ok(())=>return Ok(()),
+            Err(error)=>{
+                if Instant::now()>=deadline{
+                    let _=fs::remove_file(path.with_extension(format!("{}.tmp",std::process::id())));
+                    if let Some(root)=path.parent().and_then(Path::parent){
+                        let logs=root.join("cache/logs");let _=fs::create_dir_all(&logs);
+                        let _=fs::write(logs.join("startup-handoff-error.json"),serde_json::to_vec_pretty(&json!({"error":error,"pid":std::process::id(),"fields":{"error":"交接确认写入失败原因","pid":"正式桌面进程编号"}})).unwrap_or_default());
+                    }
+                    return Err(format!("正式窗口已打开，但交接确认写入失败：{error}"));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+}
+// read_acknowledgement（交接确认读取）：允许写入方原子替换，避免轮询占用确认文件。
+fn read_acknowledgement(path:&Path)->Result<Value,String>{
+    let mut options=fs::OpenOptions::new();options.read(true);
+    #[cfg(windows)] {use std::os::windows::fs::OpenOptionsExt;options.share_mode(1|2|4);}
+    let mut file=options.open(path).map_err(|e|e.to_string())?;let mut bytes=Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e|e.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|e|e.to_string())
 }
 pub fn launch(root:&Path)->Result<u32,String>{
     let expected=canonical_path(&root.join("app/VoiceTerminalDesktop.exe"))?;
@@ -260,7 +289,7 @@ pub fn launch(root:&Path)->Result<u32,String>{
     command.spawn().map_err(|e|format!("正式程序启动失败：{e}"))?;
     let deadline=Instant::now()+Duration::from_secs(45);
     while Instant::now()<deadline{
-        if let Ok(record)=crate::resources::load(&path){if record["token"]==token&&record["state"]=="window-ready"{
+        if let Ok(record)=read_acknowledgement(&path){if record["token"]==token&&record["state"]=="window-ready"{
             let pid=record["pid"].as_u64().ok_or("交接进程编号无效")? as u32;
             if let Some((created,exe))=workspace::process_identity(pid)?{if record["create_time"].as_u64()==Some(created)&&exe.to_string_lossy().eq_ignore_ascii_case(&expected.to_string_lossy()){let _=fs::remove_file(path);return Ok(pid);}}
         }}std::thread::sleep(Duration::from_millis(100));
@@ -270,6 +299,40 @@ pub fn launch(root:&Path)->Result<u32,String>{
 
 #[cfg(test)] mod tests{
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    #[ignore="实际正式程序交接验证；VOICE_HANDOFF_TEST_ROOT（本轮验证工作区）须指向已安装且未运行的工作区"]
+    fn installed_product_handoff(){
+        let root=PathBuf::from(std::env::var_os("VOICE_HANDOFF_TEST_ROOT").expect("须设置本轮验证工作区"));
+        for _ in 0..3{
+            let pid=launch(&root).expect("正式程序须确认窗口交接");
+            assert!(workspace::process_identity(pid).unwrap().is_some());
+            Command::new(root.join("VoiceTerminal.exe")).arg("--exit").status().unwrap();
+            let deadline=Instant::now()+Duration::from_secs(30);
+            while workspace::process_identity(pid).unwrap().is_some(){
+                assert!(Instant::now()<deadline,"本轮验证正式程序须正常退出");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn acknowledgement_retries_while_reader_blocks_replacement(){
+        use std::os::windows::fs::OpenOptionsExt;
+        let root=fixture();let path=root.join("handoff-test.json");
+        atomic_json(&path,&json!({"state":"waiting"})).unwrap();
+        // share_mode（文件共享模式）仅允许读取，模拟轮询持有的禁止删除句柄。
+        let reader=fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        let target=path.clone();
+        let writer=std::thread::spawn(move||write_acknowledgement(&target,&json!({"state":"window-ready"})));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(crate::resources::load(&path).unwrap()["state"],"waiting");
+        assert!(!writer.is_finished());drop(reader);
+        writer.join().unwrap().unwrap();
+        assert_eq!(crate::resources::load(&path).unwrap()["state"],"window-ready");
+        assert!(!path.with_extension(format!("{}.tmp",std::process::id())).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
     use std::path::PathBuf;
     fn fixture()->PathBuf{let root=std::env::temp_dir().join(format!("voice-install-中文 空格-{}",workspace::new_id()));fs::create_dir_all(&root).unwrap();root}
     fn package(build:&str,corrupt:bool)->Vec<u8>{
