@@ -124,6 +124,7 @@ export function useProductControls() {
     quietStatus,
     saveQuietHours,
     saveShadowGate,
+    saveApprovalSettings,
     savePersona,
     saveCustomInstructions,
     scanModels,
@@ -497,12 +498,6 @@ export function useProductControls() {
       ? ratio
       : null;
   });
-  const shadowFocusText = computed(() => {
-    const focus = (shadow.value.focus || "").trim();
-    const summary = (shadow.value.summary || "").trim();
-    if (!focus || focus === summary) return "";
-    return focus;
-  });
   const conversationContext = computed(() => {
     const episode = voice.agentEpisode.value;
     if (
@@ -634,12 +629,12 @@ export function useProductControls() {
     );
   });
   const approvalBusy = ref(''); // approvalBusy（决定提交中的权限）：防止重复点击。
-  async function decideDshApproval(approvalId: string, runSeq: number, approved: boolean) {
+  async function decideDshApproval(approvalId: string, runSeq: number, decision: 'allowed-once' | 'allowed-until-silence' | 'rejected') {
     if (approvalBusy.value) return;
     const pending = shadowRunningTrace.value.find(item => item.approval_id === approvalId && item.run_seq === runSeq && item.phase === 'started');
     if (!pending) return;
     approvalBusy.value = approvalId;
-    try { await productApi.decideDshApproval({ approval_id: approvalId, run_seq: runSeq, decision: approved ? 'allowed-once' : 'rejected' }); }
+    try { await productApi.decideDshApproval({ approval_id: approvalId, run_seq: runSeq, decision }); }
     catch (error) { lastError.value = error instanceof Error ? error.message : String(error); }
     finally { approvalBusy.value = ''; }
   }
@@ -650,6 +645,8 @@ export function useProductControls() {
     return values.length ? values : legacyShadowEvents();
   });
   const shadowLatestEventActivity = computed<ShadowActivity | null>(() => {
+    const latest = shadow.value.latest_event;
+    if (latest) return { run_seq: 0, item_id: 'latest-event', stream: 'event', phase: 'completed', ...latest };
     const values = shadowEventActivities.value;
     return values.length ? values[values.length - 1] : null;
   });
@@ -1596,11 +1593,7 @@ export function useProductControls() {
           ? "—"
           : Math.round(conversationCacheHitRatio.value * 100) + "%",
       shadow: {
-        title:
-          shadow.value.summary ||
-          (shadow.value.available ? "等待本轮协作摘要" : "后台协作暂不可用"),
         status: shadowDisplayStatus.value,
-        focus: shadowFocusText.value,
         context: shadowContext.value
           ? formatTokens(shadowContext.value.used_tokens) +
             " / " +
@@ -1624,6 +1617,8 @@ export function useProductControls() {
           approvalPending: item.stream === 'approval' && item.phase === 'started',
         })),
         approvalBusy: approvalBusy.value,
+        continuousApproval: shadow.value.continuous_approval === true,
+        approvalWindowActive: listening.value && !waitingForWake.value,
         event: shadowLatestEventActivity.value
           ? shadowActivityText(shadowLatestEventActivity.value)
           : "",
@@ -1693,6 +1688,7 @@ export function useProductControls() {
     quietStatus,
     saveQuietHours,
     saveShadowGate,
+    saveApprovalSettings,
     savePersona,
     scanModels,
     discoverProvider,

@@ -189,6 +189,7 @@ export function readShadowProduct(value: unknown): ShadowProductSnapshot | null 
     active: value.active,
     phase: value.phase,
     user_input_required: value.user_input_required,
+    continuous_approval: value.continuous_approval === true,
     focus: value.focus.slice(0, 400),
     summary: value.summary.slice(0, 400),
     timeline,
@@ -200,6 +201,12 @@ export function readShadowProduct(value: unknown): ShadowProductSnapshot | null 
     result.model_management = value.model_management
   }
   if (activities !== undefined) result.activities = activities
+  if (isRecord(value.latest_event) && typeof value.latest_event.text === 'string'
+    && typeof value.latest_event.timestamp === 'string'
+    && ['progress', 'information', 'input_required', 'result', 'no_action', 'failed'].includes(String(value.latest_event.event_kind))) {
+    result.latest_event = { text: value.latest_event.text.slice(0, 8000),
+      event_kind: value.latest_event.event_kind as ShadowActivity['event_kind'], timestamp: value.latest_event.timestamp }
+  } else result.latest_event = null
   if (value.last_activity_at === null || typeof value.last_activity_at === 'string') {
     result.last_activity_at = value.last_activity_at
   }

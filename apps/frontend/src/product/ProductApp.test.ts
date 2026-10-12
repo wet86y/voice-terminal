@@ -136,15 +136,56 @@ describe('正式界面的真实控件交互', () => {
     ]
     const decide = vi.spyOn(productApi, 'decideDshApproval').mockResolvedValue({ result: 'accepted' })
     const wrapper = render(Workbench, { props: { model: value.workbenchModel.value }, attrs: {
-      onApproval: (id: string, runSeq: number, approved: boolean) => value.decideDshApproval(id, runSeq, approved),
+      onApproval: (id: string, runSeq: number, decision: 'allowed-once' | 'allowed-until-silence' | 'rejected') => value.decideDshApproval(id, runSeq, decision),
     } })
     expect(value.workbenchModel.value.shadow.trace).toHaveLength(3)
     expect(wrapper.get('.trace-permission-content').text()).toContain('需要执行目录写入')
     await button(wrapper, '同意').trigger('click')
     await flushPromises()
     expect(decide).toHaveBeenCalledWith({ approval_id: 'request-a', run_seq: 3, decision: 'allowed-once' })
-    await value.decideDshApproval('old-request', 2, false)
+    await value.decideDshApproval('old-request', 2, 'rejected')
     expect(decide).toHaveBeenCalledOnce()
+  })
+
+  it('连续同意位于中间，只在录音窗口可用，摘要不再进入工作台模型', async () => {
+    const { value } = liveControls()
+    value.voice.connection.value = 'connected'
+    value.voice.shadowProduct.value.backend = 'dsh'
+    value.voice.shadowProduct.value.summary = '后台观察器摘要'
+    value.voice.shadowProduct.value.activities = [{ run_seq: 2, item_id: 'approval', stream: 'approval', phase: 'started', timestamp: '', approval_id: 'request', text: '创建目录' }]
+    const decide = vi.spyOn(productApi, 'decideDshApproval').mockResolvedValue({ result: 'accepted' })
+    const wrapper = render(Workbench, { props: { model: value.workbenchModel.value }, attrs: {
+      onApproval: (id: string, seq: number, decision: 'allowed-once' | 'allowed-until-silence' | 'rejected') => value.decideDshApproval(id, seq, decision),
+    } })
+    expect(wrapper.findAll('.trace-permission-actions button').map(item => item.text())).toEqual(['同意', '连续同意', '拒绝'])
+    expect(button(wrapper, '连续同意').attributes('disabled')).toBeDefined()
+    expect(wrapper.find('.shadow-summary-card').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('后台观察器摘要')
+    expect(value.workbenchModel.value.shadow).not.toHaveProperty('title')
+    value.voice.listening.value = true
+    await wrapper.setProps({ model: value.workbenchModel.value })
+    await button(wrapper, '连续同意').trigger('click')
+    await flushPromises()
+    expect(decide).toHaveBeenCalledWith({ approval_id: 'request', run_seq: 2, decision: 'allowed-until-silence' })
+    value.voice.shadowProduct.value.continuous_approval = true
+    await wrapper.setProps({ model: value.workbenchModel.value })
+    expect(wrapper.get('.shadow-status').text()).toBe('连续授权中')
+  })
+
+  it('最新进展保留 DSH（代理执行宿主）向模型投递的完整正文，审批设置保存失败回退', async () => {
+    const { value } = liveControls()
+    value.voice.connection.value = 'connected'
+    const text = '已确认的任务结果。'.repeat(100)
+    value.voice.shadowProduct.value.latest_event = { text, event_kind: 'result', timestamp: '' }
+    expect(value.workbenchModel.value.shadow.event).toBe(text)
+    const save = vi.spyOn(productApi, 'saveApprovals').mockResolvedValue({ settings: { approvals: { voice_confirmation_enabled: true, continuous_enabled: true } } } as never)
+    value.settings.approvals = { voice_confirmation_enabled: true, continuous_enabled: true }
+    await value.saveApprovalSettings()
+    expect(save).toHaveBeenCalledWith({ voice_confirmation_enabled: true, continuous_enabled: true })
+    save.mockRejectedValueOnce(new Error('保存失败'))
+    value.settings.approvals.voice_confirmation_enabled = false
+    await value.saveApprovalSettings()
+    expect(value.settings.approvals.voice_confirmation_enabled).toBe(true)
   })
 
   it('主人打断开关直接保存，待机时显示已启用并保留未保存的阈值', async () => {
@@ -1173,7 +1214,7 @@ describe('共享呈现与展示隔离', () => {
     expect(request).not.toHaveBeenCalled()
   })
   it('工作台保留会话顺序与播放变色，隐藏完成标记和重复交付文本', async () => {
-    const model: WorkbenchModel = { state:'offline',title:'离线',description:'等待连接',action:'重试',mode:'fast',modeDisabled:true,latency:'—',voiceModel:'语音模型',shadowModel:'协作模型',ttsModel:'合成模型',conversationHint:'等待',conversation:[{key:'server-2',role:'assistant',text:'第二条',status:'已打断',time:'现在',delivered:'已听到前半句'},{key:'server-3',role:'user',text:'第三条',status:'已完成',time:'现在'}],shadow:{title:'待机',status:'待机',context:'—',cache:'—',trace:[]} }
+    const model: WorkbenchModel = { state:'offline',title:'离线',description:'等待连接',action:'重试',mode:'fast',modeDisabled:true,latency:'—',voiceModel:'语音模型',shadowModel:'协作模型',ttsModel:'合成模型',conversationHint:'等待',conversation:[{key:'server-2',role:'assistant',text:'第二条',status:'已打断',time:'现在',delivered:'已听到前半句'},{key:'server-3',role:'user',text:'第三条',status:'已完成',time:'现在'}],shadow:{status:'待机',context:'—',cache:'—',trace:[]} }
     const wrapper = render(Workbench, {props:{model}})
     expect(wrapper.findAll('.message').map(item=>item.text())).toEqual([expect.stringContaining('第二条'),expect.stringContaining('第三条')])
     expect(wrapper.text()).not.toContain('已听到前半句')

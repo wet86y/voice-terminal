@@ -93,6 +93,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   const settingsTab = ref<ProductSettingsTab>('wake')
   const snapshot = ref<ProductSnapshot | null>(null)
   const settings = reactive<ProductSettingsSnapshot>(structuredClone(DEFAULT_SETTINGS))
+  let savedApprovalSettings = { ...DEFAULT_SETTINGS.approvals } // savedApprovalSettings（最后一次确认已保存的授权设置）。
   const computeStatus = ref<ProductComputeStatus | null>(null)
   let computeStatusRevision = 0 // computeStatusRevision（组件状态代次）：旧进程的采样不能覆盖新状态。
   let computeStatusRequest = 0 // computeStatusRequest（采样请求代次）：并发请求只接纳最新结果。
@@ -280,6 +281,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     settings.quiet_hours = nextSettings.quiet_hours
     if (!quietDirty) Object.assign(quietHoursForm, nextSettings.quiet_hours)
     Object.assign(settings.shadow, nextSettings.shadow)
+    Object.assign(settings.approvals, nextSettings.approvals)
+    savedApprovalSettings = { ...nextSettings.approvals }
     Object.assign(settings.speaker, nextSettings.speaker)
     if (!computeDirty) Object.assign(settings.compute.devices, nextSettings.compute.devices)
     Object.assign(settings.compute.fallback_devices || {}, nextSettings.compute.fallback_devices || {})
@@ -1058,6 +1061,24 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     })
   }
 
+  async function saveApprovalSettings() {
+    const desired = { ...settings.approvals } // desired（当前希望保存的授权确认设置）。
+    await enqueue(async () => {
+      saving.value = true
+      try {
+        const result = await productApi.saveApprovals(desired)
+        updateSettingsFromResponse(settings, result)
+        savedApprovalSettings = { ...settings.approvals }
+        setNotice(result.message || '授权确认设置已即时生效。')
+      } catch (error) {
+        Object.assign(settings.approvals, savedApprovalSettings)
+        setError(error)
+      } finally {
+        saving.value = false
+      }
+    })
+  }
+
   async function saveShadowGate() {
     const desired = settings.shadow.experimental_context_gate_enabled
     await enqueue(async () => {
@@ -1521,6 +1542,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     quietStatus,
     saveQuietHours,
     saveShadowGate,
+    saveApprovalSettings,
     savePersona,
     saveCustomInstructions,
     saveSpeaker,

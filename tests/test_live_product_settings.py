@@ -80,6 +80,42 @@ def test_dsh_approval_requires_host_auth_and_rejects_stale_requests(runtime, mon
     asyncio.run(run())
 
 
+def test_voice_approval_preferences_apply_without_rotating_the_episode(runtime, tmp_path):
+    from tests.test_dsh_bridge import FakeClient, FakeContext
+    from voice_terminal.dsh.bridge import DshMappingStore
+
+    async def run():
+        session = DshShadowAgentSession(client=FakeClient(), mapping_store=DshMappingStore(tmp_path / "map.json"),
+                                        context_source=FakeContext(), voice_session_id="voice-a", workspace=tmp_path)
+        runtime.shadow_session = session
+        original_conversation = runtime.conversation.conversation_id
+        preferences = {"voice_confirmation_enabled": True, "continuous_enabled": True}
+        response = await request(runtime, "approvals", preferences)
+        assert response.status_code == 200
+        assert response.json()["settings"]["approvals"] == preferences
+        assert session.approvals.voice_confirmation and session.approvals.continuous_voice
+        assert not session.approvals.continuous_active
+        assert runtime.conversation.conversation_id == original_conversation
+        invalid = await request(runtime, "approvals", {**preferences, "continuous_enabled": "true"})
+        assert invalid.status_code == 422
+        assert runtime.product_settings.settings_only()["approvals"] == preferences
+        await session.close()
+    asyncio.run(run())
+
+
+def test_voice_approval_context_must_precede_user_answer_in_actual_conversation(runtime):
+    entries = runtime.history.conversation.entries
+    entries.extend([
+        {"seq": 1, "kind": "user_turn", "turn_id": "task", "text": "创建目录"},
+        {"seq": 2, "kind": "assistant_speech", "turn_id": "task", "text": "同意创建目录吗？", "delivery": {"status": "full"}},
+        {"seq": 3, "kind": "user_turn", "turn_id": "reply", "text": "可以"},
+        {"seq": 4, "kind": "assistant_speech", "turn_id": "reply", "text": "同意提权吗？", "delivery": {"status": "full"}},
+    ])
+    assert runtime._approval_spoken_context("reply") == (2, "同意创建目录吗？")
+    assert runtime._approval_spoken_context("unknown") == (0, "")
+    assert runtime._approval_spoken_context() == (4, "同意提权吗？")
+
+
 def test_wake_save_replaces_worker_while_listening_without_a_new_session(runtime):
     async def run():
         runtime.state.listening = True

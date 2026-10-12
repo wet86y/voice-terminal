@@ -468,6 +468,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                     self.shadow_session.set_context_gate_enabled(
                         shadow_cfg.experimental_context_gate_enabled,
                     )
+                    self.configure_dsh_approvals()
                     self.dsh.bridge_hub.register(self.shadow_session)
                     if not self._handoff_marker.exists() and not os.environ.get("VOICE_APP_ORIGIN"):
                         await self.shadow_session.resume_pending_gate()
@@ -599,6 +600,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             ambient_store=self.ambient_store,
         )
         self.controller.set_reasoning_mode(self.reasoning_mode)
+        self.configure_dsh_approvals()
         application_report("voice", "建立唯一会话调度器")
         await self.controller.initialize()
         if self._handoff_marker.exists():
@@ -775,6 +777,9 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
 
     async def _on_shadow_activity(self, activities: list[dict[str, Any]]) -> None:
         """Publish transient Shadow activities beside the authoritative event relay."""
+        activities = [item for item in activities if not str(item.get("state", "")).startswith("observer_status")]
+        if not activities:
+            return  # 状态摘要及其过期提示均不进入前台活动映射。
         if (
             isinstance(getattr(self, "shadow_session", None), DshShadowAgentSession)
             and any(str(item.get("state") or "") != "failed" for item in activities)
@@ -1178,6 +1183,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                     ))
                     await self.bus.publish(self.snapshot())
                     return
+            if not self.state.listening:
+                self._approval_listen_generation = getattr(self, "_approval_listen_generation", 0) + 1
             await self.controller.start_listening()
             pending_buffer = getattr(self, "_shadow_pending", None)
             pending = pending_buffer.drain() if pending_buffer is not None else []
@@ -1187,6 +1194,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
 
     async def stop_listening(self) -> None:
         async with self._session_lock:
+            if isinstance(self.shadow_session, DshShadowAgentSession):
+                self.shadow_session.approvals.revoke()
             if self.controller is not None:
                 await self.controller.stop_listening()
 
@@ -1336,10 +1345,14 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         if not await asyncio.to_thread(self.history.close_storage):
             logger.error("会话记录尚未完整落盘，保留待写材料：%s", self.history.journal.error)
 
-    async def _wake_shadow(self) -> str:
+    async def _wake_shadow(self, *, turn_id: str | None = None) -> str:
         if self.shadow_session is None or not self.shadow_session.available:
             return "unavailable"
         try:
+            if isinstance(self.shadow_session, DshShadowAgentSession):
+                current_turn, user_text = self._approval_user_input()
+                if turn_id and turn_id == current_turn:
+                    await self.shadow_session.respond_to_voice_approval(turn_id, user_text)
             return await self.shadow_session.request_wake()
         except DshBridgeError as exc:
             revision = int(getattr(self.shadow_context, "shadow_input_revision", 0))
@@ -1352,6 +1365,67 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             )])
             self.state.set_service("shadow_agent", "ERROR")
             return "unavailable"
+
+    def _approval_user_input(self) -> tuple[str, str]:
+        """只取主模型权威用户轮次；旧回合、草稿和旁路转写不能代替授权答复。"""
+        episode = getattr(self.controller, "episode", None)
+        turn_id = str(getattr(episode, "last_turn_id", "") or "")
+        current = getattr(episode, "inputs", {}).get(turn_id, {})
+        return turn_id, (str(current.get("refined_text") or current.get("text") or "") if current.get("final") else "")
+
+    def _approval_window(self) -> tuple | None:
+        """approval window（授权窗口）：停止、关键词回归或会话旋转后身份立即失效。"""
+        controller = self.controller
+        if controller is None or not self.state.listening or self.state.input_owner != "asr":
+            return None
+        return (self.conversation.conversation_id, id(getattr(controller, "episode", None)),
+                getattr(controller, "_activation_generation", 0),
+                getattr(self, "_approval_listen_generation", 0))
+
+    def _approval_spoken_context(self, turn_id: str | None = None) -> tuple[int, str]:
+        # 只允许已在当前用户作答前入账的播报；同轮刚生成的问句不能反向授权。
+        entries = self.history.conversation.entries
+        before_seq = next((int(item["seq"]) for item in entries
+                           if item.get("kind") == "user_turn" and item.get("turn_id") == turn_id), None) if turn_id else None
+        if turn_id and before_seq is None:
+            return 0, ""
+        for item in reversed(entries):
+            if item.get("kind") != "assistant_speech":
+                continue
+            if turn_id and (int(item["seq"]) >= before_seq or item.get("turn_id") == turn_id):
+                continue
+            delivery = item.get("delivery") or {}
+            text = str(delivery.get("heard_text") or "")
+            if not text and delivery.get("status") == "full":
+                text = str(item.get("text") or "")
+            if text:
+                return int(item["seq"]), text[-2000:]
+        return 0, ""
+
+    def configure_dsh_approvals(self) -> None:
+        session = self.shadow_session
+        if not isinstance(session, DshShadowAgentSession):
+            return
+        preferences = self.product_settings.settings_only().get("approvals", {}) if self.product_settings is not None else {}
+        session.approvals.window_provider = self._approval_window
+        session.approvals.input_provider = self._approval_user_input
+        session.approvals.dialogue_provider = self._approval_spoken_context
+        session.approvals.configure(preferences.get("voice_confirmation_enabled") is True,
+                                    preferences.get("continuous_enabled") is True)
+        if self.controller is not None:
+            self.controller.approval_scope_changed = self._approval_scope_changed
+
+    async def _approval_scope_changed(self) -> None:
+        session = self.shadow_session
+        if not isinstance(session, DshShadowAgentSession):
+            return
+        window = self._approval_window()
+        if window == getattr(session, "_observed_approval_window", None):
+            return
+        session._observed_approval_window = window
+        session.approvals.continuous_active  # 读取权威边界并立即撤销过期窗口。
+        await session.notify_voice_approval()
+        await self.publish_shadow_product()
 
     async def set_shadow_context_gate_enabled(self, enabled: bool) -> bool:
         """Apply the experimental timing gate without restarting the session."""
@@ -1523,7 +1597,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         controller = self.controller
         if controller is None or not self.state.listening or controller.episode.closed:
             for item in model_events:
-                if item.kind != "progress":
+                if item.kind != "progress" or item.source == "observer":
                     self._shadow_pending.publish(item)
             return
         await controller.accept_shadow_events(model_events)

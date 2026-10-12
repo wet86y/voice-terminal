@@ -174,6 +174,11 @@ export interface ProductSettingsSnapshot {
   compute: ProductComputeSettings
   /** custom_instructions（用户自定义指令条目）。 */
   custom_instructions: CustomInstruction[]
+  /** approvals（授权确认偏好）：只保存开关，不保存连续授权窗口。 */
+  approvals: {
+    voice_confirmation_enabled: boolean // voice_confirmation_enabled（语音确认开关）。
+    continuous_enabled: boolean // continuous_enabled（首次语音确认后连续提权开关）。
+  }
   persona: Record<'personality' | 'user', string>
   warnings: string[]
 }

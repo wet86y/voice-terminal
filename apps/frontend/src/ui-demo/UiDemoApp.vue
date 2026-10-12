@@ -235,13 +235,7 @@ const workbenchModel = computed<WorkbenchModel>(() => ({
   voiceContext: replayMode.value ? voiceShadowReplayDemo.context : "42K / 128K",
   voiceCache: replayMode.value ? voiceShadowReplayDemo.cache : "82%",
   shadow: {
-    title: replayMode.value ? '影子协作日志回放' : scene.value === "empty"
-        ? "等待新的任务"
-        : scene.value === "error"
-          ? "后台协作暂时不可用"
-          : "整理下午安排并保留专注时间",
     status: replayMode.value ? '日志回放 · 只读' : scene.value === "loading" ? "处理中" : "随时可协作",
-    focus: replayMode.value ? '根据本地记录查看对话与影子活动，不会连接真实服务。' : scene.value === "long" ? longText : "正在整理待确认事项与依赖关系。",
     context: replayMode.value ? voiceShadowReplayDemo.context : "86K / 256K",
     cache: replayMode.value ? voiceShadowReplayDemo.cache : "76%",
     trace: traceModel.value,

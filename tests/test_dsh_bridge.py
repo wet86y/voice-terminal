@@ -1025,7 +1025,7 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已提交", session.snapshot()["status"])
         self.assertEqual(session.snapshot()["trace_revision"], 3)
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].kind, "information")
+        self.assertEqual(events[0].kind, "progress")
         self.assertEqual(events[0].source, "observer")
         self.assertEqual(events[0].activation_id, "activation-1")
 

@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 from contextlib import aclosing
 import json
+import inspect
 import logging
 import time
 import unicodedata
@@ -2926,7 +2927,12 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                         turn_id, str(current.get("text") or ""),
                         str(current.get("refined_text") or ""),
                     )
-                result = self.shadow_waker()
+                # turn_id（用户轮次）只在内部传递，固定 request_shadow（后台请求）参数不变。
+                try:
+                    accepts_turn = "turn_id" in inspect.signature(self.shadow_waker).parameters
+                except (TypeError, ValueError):
+                    accepts_turn = False
+                result = self.shadow_waker(turn_id=turn_id) if accepts_turn else self.shadow_waker()
                 if asyncio.iscoroutine(result):
                     result = await result
                 await self.log(

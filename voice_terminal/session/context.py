@@ -265,7 +265,7 @@ class LLMContextProjector:
             progress = shadow.get("progress")
             if isinstance(progress, list):
                 values = [
-                    {"text": str(item["text"])[:512], "source": item["source"]}
+                    {"text": str(item["text"])[:2000 if item.get("source") == "observer" else 512], "source": item["source"]}
                     for item in progress if isinstance(item, dict)
                     and str(item.get("text") or "").strip()
                     and item.get("source") in {"agent", "observer"}

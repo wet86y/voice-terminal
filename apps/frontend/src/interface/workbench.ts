@@ -35,9 +35,7 @@ export interface WorkbenchModel {
   voiceContext?: string;
   voiceCache?: string;
   shadow: {
-    title: string;
     status: string;
-    focus?: string;
     context: string;
     cache: string;
     trace: Array<{
@@ -51,6 +49,8 @@ export interface WorkbenchModel {
       approvalPending?: boolean; // approvalPending（权限是否仍待决定）。
     }>;
     approvalBusy?: string; // approvalBusy（正在提交决定的请求）。
+    continuousApproval?: boolean; // continuousApproval（当前语音窗口已启用连续授权）。
+    approvalWindowActive?: boolean; // approvalWindowActive（当前录音窗口可开启连续授权）。
     event?: string;
   };
 }

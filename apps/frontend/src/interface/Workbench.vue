@@ -35,7 +35,7 @@ const emit = defineEmits<{
   mode: [value: ReasoningMode]; // mode（切换运行模式）。
   settings: []; // settings（打开设置页面）。
   console: []; // console（打开代理控制台）。
-  approval: [approvalId: string, runSeq: number, approved: boolean]; // approval（同意或拒绝本次权限请求）。
+  approval: [approvalId: string, runSeq: number, decision: 'allowed-once' | 'allowed-until-silence' | 'rejected']; // approval（本次同意、连续同意或拒绝）。
 }>();
 const conversation = ref<HTMLElement | null>(null);
 const conversationStream = ref<HTMLElement | null>(null); // conversationStream（气泡内容容器）：观察内容高度而非只观察视口。
@@ -162,15 +162,9 @@ onBeforeUnmount(() => {
     <aside class="shadow-column panel" aria-labelledby="shadow-panel-title">
       <header class="column-heading">
         <h2 id="shadow-panel-title" class="panel-kicker">后台协作</h2>
+        <span class="shadow-status" :class="{ 'is-continuous': model.shadow.continuousApproval }" role="status">{{ model.shadow.continuousApproval ? '连续授权中' : model.shadow.status }}</span>
       </header>
       <div class="shadow-regions">
-      <section class="shadow-summary-card shadow-region" aria-label="当前协作状态">
-        <header class="shadow-region-heading"><span>当前协作</span><small>{{ model.shadow.status }}</small></header>
-        <div class="shadow-summary-content">
-        <p>{{ model.shadow.title }}</p>
-        <p v-if="model.shadow.focus">{{ model.shadow.focus }}</p>
-        </div>
-      </section>
       <section class="trace-section shadow-region">
         <header class="shadow-region-heading">
           <span>运行轨迹</span>
@@ -181,7 +175,7 @@ onBeforeUnmount(() => {
           @scroll="followTrace = atTail(trace)"
         >
           <p v-if="!model.shadow.trace.length" class="shadow-region-placeholder">
-            {{ model.shadow.status === "运行中" ? "等待 DSH 动作输出" : "等待 DSH 运行" }}
+            {{ model.shadow.status === "运行中" ? "等待后台执行输出" : "后台运行后，执行过程会显示在这里" }}
           </p>
           <div v-else-if="pendingApproval" class="trace-permission-content" role="alert">
             <strong>需要授权</strong>
@@ -196,13 +190,14 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div v-if="pendingApproval" class="trace-permission-actions">
-          <button class="save-button" type="button" :disabled="!!model.shadow.approvalBusy" @click="emit('approval', pendingApproval.approvalId!, pendingApproval.runSeq!, true)">{{ model.shadow.approvalBusy ? '提交中…' : '同意' }}</button>
-          <button class="outline-button" type="button" :disabled="!!model.shadow.approvalBusy" @click="emit('approval', pendingApproval.approvalId!, pendingApproval.runSeq!, false)">拒绝</button>
+          <button class="save-button" type="button" :disabled="!!model.shadow.approvalBusy" @click="emit('approval', pendingApproval.approvalId!, pendingApproval.runSeq!, 'allowed-once')">{{ model.shadow.approvalBusy ? '提交中…' : '同意' }}</button>
+          <button class="outline-button continuous-approval-button" type="button" :disabled="!!model.shadow.approvalBusy || !model.shadow.approvalWindowActive" title="同意本次及后续授权，进入关键词静默或停止录音时结束" @click="emit('approval', pendingApproval.approvalId!, pendingApproval.runSeq!, 'allowed-until-silence')">连续同意</button>
+          <button class="outline-button" type="button" :disabled="!!model.shadow.approvalBusy" @click="emit('approval', pendingApproval.approvalId!, pendingApproval.runSeq!, 'rejected')">拒绝</button>
         </div>
       </section>
       <section class="shadow-event shadow-region">
         <header class="shadow-region-heading"><span>最新进展</span></header>
-        <div class="shadow-event-content"><p>{{ model.shadow.event || "等待新的进展" }}</p></div>
+        <div class="shadow-event-content" tabindex="0" aria-label="最新进展正文"><p>{{ model.shadow.event || "等待新的进展" }}</p></div>
       </section>
       </div>
       <footer class="shadow-panel-footer">

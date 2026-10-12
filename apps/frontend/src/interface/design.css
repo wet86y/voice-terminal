@@ -823,12 +823,12 @@ time {
 }
 .shadow-regions {
   display: grid;
-  grid-template-rows: repeat(3, minmax(0, 1fr));
+  /* 最新进展最多占约三行正文，其余空间均交给运行轨迹。 */
+  grid-template-rows: minmax(0, 1fr) minmax(82px, min(118px, 18dvh));
   gap: var(--panel-gap);
   flex: 1;
   min-height: 0;
 }
-.shadow-summary-card,
 .trace-section,
 .shadow-event {
   display: flex;
@@ -840,12 +840,13 @@ time {
   background: #ffffff03;
   overflow: hidden;
 }
-.shadow-summary-content,
 .shadow-event-content { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.shadow-status { color: var(--subtle); font-size: var(--font-caption); }
+.shadow-status.is-continuous { color: var(--mint); }
+.shadow-event-content p { white-space: pre-wrap; }
 .shadow-region-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex: none; margin-bottom: 8px; font-size: var(--font-caption); color: var(--subtle); }
 .shadow-region-heading small { font-size: inherit; }
 .shadow-region p { font-size: var(--font-caption); line-height: 1.5; overflow-wrap: anywhere; }
-.shadow-summary-content p + p { margin-top: 6px; color: var(--muted); }
 .shadow-region-placeholder { color: var(--muted); }
 .trace-section {
   display: flex;
@@ -859,6 +860,7 @@ time {
 .shadow-trace-box {
   display: flex;
   overflow: auto;
+  overflow-x: hidden;
   flex: 1;
   min-height: 0;
   overscroll-behavior: contain;
@@ -915,7 +917,8 @@ time {
 .trace-permission-content { width: 100%; min-width: 0; }
 .trace-permission-content .trace-current-text { margin-top: 10px; }
 .trace-permission-actions { display: flex; flex: none; gap: 8px; padding-top: 10px; }
-.trace-permission-actions button { flex: 1; min-height: 34px; margin: 0; padding: 6px 12px; }
+.trace-permission-actions button { flex: 1; min-width: 0; min-height: 34px; margin: 0; padding: 6px; }
+.trace-permission-actions .continuous-approval-button { border-color: #b2baff55; color: var(--accent); }
 .panel-resource-footer {
   display: flex;
   align-items: center;
@@ -3408,9 +3411,6 @@ time {
   }
   .voice-controls {
     gap: 4px;
-  }
-  .shadow-summary-card h3 {
-    margin-top: 5px;
   }
 }
 @media (prefers-reduced-motion: reduce) {

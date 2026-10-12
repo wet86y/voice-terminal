@@ -283,6 +283,9 @@ export interface ShadowActivity {
 }
 
 export interface ShadowProductSnapshot {
+  continuous_approval?: boolean // continuous_approval（当前录音窗口的连续授权状态）。
+  /** latest_event（最新进展）：保留后台向语音模型投递的完整事件正文，排除观察器摘要。 */
+  latest_event?: { text: string; event_kind: ShadowActivity['event_kind']; timestamp: string } | null
   /** backend（后台活动来源）：区分 DSH 实时轨迹与原生代理状态。 */
   backend?: 'native' | 'dsh'
   /** model_management（模型管理来源）：说明当前模型配置由哪个运行端管理。 */
