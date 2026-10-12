@@ -67,6 +67,17 @@ class ProductSidecarTests(unittest.TestCase):
         self.assertTrue(projection.user_input_required)
         self.assertEqual(projection.phase, "waiting")
 
+    def test_approval_preferences_persist_without_a_continuous_grant(self) -> None:
+        store = self.store()
+        self.assertEqual(store.settings_only()["approvals"], {"voice_confirmation_enabled": False, "continuous_enabled": False})
+        preferences = {"voice_confirmation_enabled": True, "continuous_enabled": True}
+        store.save_approvals(preferences)
+        self.assertEqual(self.store().settings_only()["approvals"], preferences)
+        with self.assertRaises(ProductSettingsError):
+            store.save_approvals({**preferences, "continuous_enabled": "true"})
+        with self.assertRaises(ProductSettingsError):
+            store.save_approvals({**preferences, "lease": True})
+
     def test_compute_settings_migrate_default_and_restore_after_gpu_failure(self) -> None:
         legacy = ProductSettingsStore(
             path=self.settings_path,

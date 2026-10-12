@@ -282,6 +282,8 @@ export const demoSettings = {
   /** continuityThreshold（连续主人放宽量）。 */ continuityThreshold: 0.10,
   /** ownerOnly（仅主人可打断）。 */ ownerOnly: false,
   /** experimentalContextGateEnabled（实验性上下文门禁，仅展示引导时机开关）。 */ experimentalContextGateEnabled: true,
+  voiceConfirmationEnabled: false, // voiceConfirmationEnabled（语音确认展示开关）。
+  continuousApprovalEnabled: false, // continuousApprovalEnabled（首次确认后连续提权展示开关）。
   /** providerName（服务商名称）。 */ providerName: '我的模型连接',
   /** providerUrl（虚构服务地址）。 */ providerUrl: 'https://api.example.com/v1',
   /** providerProtocol（展示协议名称）。 */ providerProtocol: 'DeepSeek',

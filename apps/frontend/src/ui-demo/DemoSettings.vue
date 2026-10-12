@@ -170,6 +170,11 @@ function cancelTask(item: DemoWakeTask) {
         <div v-if="!instructionRows.length" class="pool-empty">还没有自定义指令。</div>
         <InstructionEditorRow v-for="item in instructionRows" :key="item.id" :row="item" :disabled="loading" />
       </section>
+      <section class="preview-section approval-settings-section" aria-label="授权确认">
+        <div class="section-row"><h3>授权确认</h3></div>
+        <label class="switch-row"><div><strong>语音确认</strong><span>后台需要授权时，我会说明操作并询问你；明确同意后才执行。</span></div><input v-model="form.voiceConfirmationEnabled" type="checkbox" role="switch" :disabled="loading" @change="feedback('语音确认设置已保存')"><i></i></label>
+        <label class="switch-row"><div><strong>连续提权</strong><span>先语音确认第一条授权，再自动同意后续请求。进入关键词静默或手动停止录音后结束。</span></div><input v-model="form.continuousApprovalEnabled" type="checkbox" role="switch" :disabled="loading || !form.voiceConfirmationEnabled" @change="feedback('连续提权设置已保存')"><i></i></label>
+      </section>
       <label class="switch-row context-gate-row"><div><strong>实验性 Shadow 上下文门禁</strong><span>Shadow（影子代理）的侧载模型只判断运行中 DSH（代理执行宿主）的新引导应进入当前步骤还是下一回合；权威上下文仍完整同步。关闭后恢复直接注入。</span></div><input v-model="form.experimentalContextGateEnabled" type="checkbox" role="switch"><i></i></label>
       <footer><button class="save-button" type="button" :disabled="loading" @click="feedback('人格与指令已保存')">{{ loading ? '正在保存…' : '保存人格与指令' }}</button></footer>
     </template>

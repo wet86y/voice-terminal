@@ -141,9 +141,8 @@ Product UI 的“用户说完 → AI 开口”由浏览器单调时钟测量：
 
 Shadow UI 使用：
 
-- `shadow.product`：当前可用性、active/phase/focus、summary、最近活动和资源指标的有界权威快照；
-- `shadow.activity`：当前运行中的 lifecycle、thinking、tool 和公开事件增量。DSH status observer
-  摘要通过 Voice 侧 `status` 投影更新 summary，不作为 event 输出区域中的终态事件。
+- `shadow.product`（后台产品快照）：当前可用性、运行状态、最近活动和资源指标。`latest_event`（最新进展）保留向语音模型投递的完整事件正文，最多 8000 字符；`continuous_approval`（连续授权状态）表示本录音窗口是否已放行后续审批。兼容字段 `summary`（旧摘要字段）不再从运行时 `status`（状态观察器摘要）映射，工作台不显示摘要卡。
+- `shadow.activity`（后台活动增量）：当前运行中的生命周期、思考、工具、输出和公开事件增量。DSH（代理执行宿主）观察器摘要仅进入二等信箱，排除前台活动和最新进展映射。
 
 活动项使用 `run_seq + item_id`（运行序号与条目标识）标识，状态为 `started`、`delta`、`completed` 或 `failed`（开始、增量、完成或失败），并带有服务端生成的 `timestamp`（时间戳）。绑定 DSH（代理执行宿主）根 Agent（根代理）的插件将根代理思考和工具事件，以及同一运行所属子代理的思考、回复与工具事件，投影到 `shadow.activity`（运行轨迹增量）。终端工具与后台作业显示参数、结果、进度和标准输出／错误输出；待决权限请求显示请求内容与专用 `approval_id`（权限请求标识），用户决定通过受保护的产品接口转回原始请求。思考、输出与同一工具的增量按条目标识合并，完成项保留供展开查看。
 

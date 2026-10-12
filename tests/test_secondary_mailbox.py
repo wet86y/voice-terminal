@@ -541,6 +541,28 @@ def test_live_server_bridge_delivers_progress_to_secondary_and_information_to_no
         assert runtime.active_dispatch_context is None
         assert shadow_state(provider.messages[-1])["information"]["text"] == "立即普通信息"
         await _finish_blocking_request(runtime, provider)
+        # observer（观察器）完整摘要走二等信箱，既不唤醒普通入口，也不覆盖前台进展。
+        summary = "已核实的后台摘要。" * 100
+        before_product = session._shadow_product_snapshot()
+        bridge._visible_status = summary
+        await bridge._publish_observer_status(summary, 3)
+        assert session._shadow_product_snapshot() == before_product
+        assert runtime.pending == set()
+        assert runtime._secondary_snapshot()["observer"]["text"] == summary
+        await runtime._on_heartbeat(8.0)
+        await wait_for_calls(provider, 3)
+        assert shadow_state(provider.messages[-1])["progress"] == [{"text": summary, "source": "observer"}]
+        assert runtime._secondary_snapshot() == {}
+        await _finish_blocking_request(runtime, provider)
+        session.state.listening = False
+        deferred_summary = "停听期间的最新已确认摘要"
+        await bridge._publish_observer_status(deferred_summary, 4)
+        assert runtime._secondary_snapshot() == {}
+        queued = session._shadow_pending.drain()
+        assert len(queued) == 1 and queued[0].source == "observer"
+        session.state.listening = True
+        await accept(queued)
+        assert runtime._secondary_snapshot()["observer"]["text"] == deferred_summary
         assert runtime.max_request_concurrency == 1
         await bridge.cancel()
         assert session.history.shadow_progress_snapshot() == {}

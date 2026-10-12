@@ -451,7 +451,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         body = await request.json()
         if (not isinstance(body, dict) or set(body) != {"approval_id", "decision", "run_seq"}
                 or not isinstance(body.get("approval_id"), str) or not 1 <= len(body["approval_id"]) <= 160
-                or body.get("decision") not in {"allowed-once", "rejected"}
+                or body.get("decision") not in {"allowed-once", "allowed-until-silence", "rejected"}
                 or type(body.get("run_seq")) is not int or body["run_seq"] < 0):
             raise HTTPException(status_code=422, detail="权限决定需要有效的请求标识、运行序号以及同意或拒绝。")
         async with runtime._session_lock:
@@ -612,6 +612,29 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         except Exception as exc:
             if isinstance(exc, HTTPException):
                 raise
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
+    @app.put("/api/v1/product/settings/approvals")
+    async def update_product_approvals(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            store = product_store_or_404()
+            previous = store.settings_only()["approvals"]
+            value = await asyncio.to_thread(store.save_approvals, body)
+            try:
+                async with runtime._session_lock:
+                    runtime.configure_dsh_approvals()
+                    session = runtime.shadow_session
+                    if isinstance(session, DshShadowAgentSession):
+                        await session.notify_voice_approval()
+                    await runtime.bus.publish(runtime.snapshot())
+            except Exception:
+                await asyncio.to_thread(store.save_approvals, previous)
+                runtime.configure_dsh_approvals()
+                raise
+            return {"settings": {"approvals": value}, "effective_from": "immediate", "pending": False,
+                    "message": "授权确认设置已保存，连续提权仍需先明确同意本窗口的第一条请求。"}
+        except Exception as exc:
             registry_error(exc)
             raise AssertionError("unreachable")
 

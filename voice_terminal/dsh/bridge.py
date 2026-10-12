@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 import urllib.request
 import uuid
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
@@ -30,6 +30,7 @@ from ..shadow_agent.manager import ShadowContextSource
 from ..shadow_agent.manager import ShadowStatusObserver
 from ..shadow_agent.provider import ShadowProvider, ShadowProviderError, ShadowProviderResponse
 from ..shadow_agent.projection import _text_from_output
+from .approvals import DshApprovalPolicy, PendingApproval
 
 
 BRIDGE_PROTOCOL_VERSION = "2.0"
@@ -483,6 +484,10 @@ class DshShadowAgentSession:
         self._observer_force = False
         self._visible_status = ""
         self._run_seq = 0
+        self.approvals = DshApprovalPolicy()  # approvals（临时审批策略）：授权仅保存在本进程内。
+        self._approval_auto_task: asyncio.Task[None] | None = None
+        self._notified_approval_id = ""  # _notified_approval_id（已通知语音模型的当前请求）。
+        self._notified_approval_window: Any | None = None  # _notified_approval_window（通知时的录音窗口）。
         self._last_action_seq = 0  # action_seq（动作序号）：当前激活内已接收的实时动作水位。
         self._pending_terminal_state: str | None = None  # terminal state（终态状态）：等待 DSH 根 Agent 真正空闲后清槽。
         self._observer_committed_steps = 0
@@ -642,6 +647,8 @@ class DshShadowAgentSession:
                         return "already_current"
                     raise DshBridgeError(f"DSH wake rejected: {code}")
                 self.activation_id = activation
+                self.approvals.pending.clear()
+                self._notified_approval_id = ""
                 self._last_action_seq = 0
                 self._pending_terminal_state = None
                 if deferred_handoff:
@@ -1066,6 +1073,8 @@ class DshShadowAgentSession:
             await asyncio.gather(task, return_exceptions=True)
 
     async def reset(self, *, strict: bool = False) -> None:
+        self.approvals.revoke()
+        self.approvals.pending.clear()
         await self._stop_handoff()
         await self._stop_context_resync()
         await self._stop_observer()
@@ -1112,6 +1121,8 @@ class DshShadowAgentSession:
             self._visible_status = ""
 
     async def cancel(self, *, strict: bool = False) -> None:
+        self.approvals.revoke()
+        self.approvals.pending.clear()
         await self._stop_handoff()
         await self._stop_context_resync()
         async with self._event_lock:
@@ -1134,6 +1145,11 @@ class DshShadowAgentSession:
         await self._activity("cancelled")
 
     async def close(self) -> None:
+        self.approvals.revoke()
+        self.approvals.pending.clear()
+        if self._approval_auto_task is not None:
+            self._approval_auto_task.cancel()
+            await asyncio.gather(self._approval_auto_task, return_exceptions=True)
         await self._stop_handoff()
         await self._stop_context_resync()
         await self._stop_observer()
@@ -1228,6 +1244,8 @@ class DshShadowAgentSession:
                 self._last_terminal_event_id = event_id
                 self._last_terminal_event_digest = digest
                 self._waiting_user = event_type == "input_required"
+                self.approvals.pending.clear()
+                self._notified_approval_id = ""
                 self.activation_id = None
                 state = "waiting_user" if self._waiting_user else (
                     "failed" if event_type == "failed" else "idle"
@@ -1324,6 +1342,19 @@ class DshShadowAgentSession:
                     return "stale"
                 self._last_action_seq = action_seq
             if normalized is not None:
+                if normalized["stream"] == "approval":
+                    approval_id = normalized["approval_id"]
+                    if normalized["phase"] == "started":
+                        self.approvals.pending[approval_id] = PendingApproval(
+                            approval_id, str(self.activation_id), self._run_seq,
+                            normalized["text"], self.approvals.input_provider()[0],
+                        )
+                    else:
+                        self.approvals.pending.pop(approval_id, None)
+                    if self.approvals.continuous_active:
+                        self._schedule_auto_approvals()
+                    else:
+                        await self.notify_voice_approval()
                 if self.activity_sink is not None:
                     await self.activity_sink([{
                         "backend": "dsh", "state": "running",
@@ -1428,13 +1459,116 @@ class DshShadowAgentSession:
             return normalized
         return None
 
-    async def decide_approval(self, approval_id: str, decision: str, run_seq: int) -> dict[str, Any]:
-        """decide_approval（权限决定）：限定当前运行，一次允许或拒绝；不改变持久权限策略。"""
+    async def decide_approval(self, approval_id: str, decision: str, run_seq: int,
+                              *, voice_guard: tuple | None = None, require_continuous: bool = False) -> dict[str, Any]:
+        """decide_approval（权限决定）：连续授权仍逐条映射到原运行的单次同意。"""
         async with self._event_lock:
             if self._retired or not self.activation_id or run_seq != self._run_seq:
                 raise DshBridgeError("权限请求所属运行已结束或更换")
-            return await self.client.call("approval.decide", self._envelope(
-                activation_id=self.activation_id, approval_id=approval_id, decision=decision))
+            if require_continuous and not self.approvals.continuous_active:
+                return {"result": "stale"}
+            if voice_guard is not None:
+                pending, captured_window, captured_input = voice_guard
+                if (not self.approvals.voice_confirmation
+                        or captured_window != self.approvals.window_provider()
+                        or self.approvals.pending.get(approval_id) != pending
+                        or self.approvals.input_provider() != captured_input):
+                    return {"result": "stale"}
+            if decision not in {"allowed-once", "allowed-until-silence", "rejected"}:
+                raise DshBridgeError("审批决定无效")
+            continuous = decision == "allowed-until-silence"
+            window = self.approvals.window_provider()
+            if continuous and window is None:
+                raise DshBridgeError("请先唤醒语音会话或开始录音，再开启连续同意")
+            reply = await self.client.call("approval.decide", self._envelope(
+                activation_id=self.activation_id, approval_id=approval_id,
+                decision="allowed-once" if continuous else decision))
+            if reply.get("result") in {"accepted", "duplicate"}:
+                self.approvals.pending.pop(approval_id, None)
+                if decision == "rejected":
+                    self.approvals.revoke()
+                elif continuous and window == self.approvals.window_provider():
+                    self.approvals.grant_continuous()
+                elif (voice_guard is not None and self.approvals.voice_confirmation
+                      and self.approvals.continuous_voice and window == self.approvals.window_provider()):
+                    self.approvals.grant_continuous(from_voice=True)
+                self._schedule_auto_approvals()
+                await self.notify_voice_approval()
+                await self._activity("approval_policy")
+            return reply
+
+    async def notify_voice_approval(self) -> None:
+        """待决审批进入普通信息槽，立即提供给语音模型；不把它当成执行终态。"""
+        pending = next((item for item in self.approvals.pending.values()
+                        if item.activation_id == self.activation_id and item.run_seq == self._run_seq), None)
+        window = self.approvals.window_provider()
+        if pending is None:
+            self._notified_approval_id = ""
+            return
+        if (not self.approvals.voice_confirmation or self.approvals.continuous_active
+                or window is None or self.production_sink is None
+                or (self._notified_approval_id == pending.approval_id and self._notified_approval_window == window)):
+            return
+        pending = replace(pending, input_at_request=self.approvals.input_provider()[0],
+                          dialogue_revision=self.approvals.dialogue_provider()[0])
+        self.approvals.pending[pending.approval_id] = pending
+        self._notified_approval_id = pending.approval_id
+        self._notified_approval_window = window
+        try:
+            await self.production_sink([ShadowEvent(
+                event_id=uuid.uuid4().hex, kind="information", source="agent",
+                text=("当前后台操作暂停等待授权，尚未获准执行。已开启语音确认，等待用户明确同意或拒绝。"
+                      "待决操作数据：\n" + pending.text[:1700]),
+                based_on_context_revision=self.last_applied_revision,
+                activation_id=pending.activation_id,
+            )])
+        except Exception:
+            self._notified_approval_id = ""
+            raise
+
+    def _schedule_auto_approvals(self) -> None:
+        if not self.approvals.continuous_active or not self.approvals.pending:
+            return
+        if self._approval_auto_task is None or self._approval_auto_task.done():
+            self._approval_auto_task = asyncio.create_task(self._auto_approve(), name="dsh-continuous-approval")
+
+    async def _auto_approve(self) -> None:
+        try:
+            while self.approvals.pending:
+                pending = next(iter(self.approvals.pending.values()))
+                if (not self.approvals.continuous_active or self._retired
+                        or pending.activation_id != self.activation_id or pending.run_seq != self._run_seq):
+                    return
+                reply = await self.decide_approval(pending.approval_id, "allowed-once", pending.run_seq, require_continuous=True)
+                if reply.get("result") not in {"accepted", "duplicate"}:
+                    return
+        except DshBridgeError:
+            log.warning("dsh.auto_approval_failed", exc_info=True)
+
+    async def respond_to_voice_approval(self, turn_id: str, user_text: str) -> bool:
+        """主模型再次请求后台后，独立验证新用户答复；任意新任务不能映射成授权。"""
+        pending = next((item for item in self.approvals.pending.values()
+                        if item.activation_id == self.activation_id and item.run_seq == self._run_seq), None)
+        window = self.approvals.window_provider()
+        if (not self.approvals.voice_confirmation or pending is None or window is None
+                or self._notified_approval_id != pending.approval_id or not turn_id or not user_text.strip()
+                or self._notified_approval_window != window
+                or turn_id == pending.input_at_request):
+            return False
+        decision = await self.approvals.classify(self.gate_provider, pending, user_text)
+        async with self._event_lock:
+            # 判定期间停止、静默、新原话或审批变更，一律不把旧结果映射为通过。
+            if (not self.approvals.voice_confirmation or window != self.approvals.window_provider()
+                    or self.approvals.pending.get(pending.approval_id) != pending
+                    or (turn_id, user_text) != self.approvals.input_provider()
+                    or pending.activation_id != self.activation_id or pending.run_seq != self._run_seq):
+                return False
+        if decision not in {"approve", "reject"}:
+            return False
+        reply = await self.decide_approval(pending.approval_id,
+                                          "allowed-once" if decision == "approve" else "rejected", pending.run_seq,
+                                          voice_guard=(pending, window, (turn_id, user_text)))
+        return reply.get("result") in {"accepted", "duplicate"}
 
     def _update_telemetry(self, payload: dict[str, Any]) -> None:
         """telemetry（插件用量）只允许有限的非负计数及缓存比例。"""
@@ -1597,13 +1731,7 @@ class DshShadowAgentSession:
                 return
 
     async def _publish_observer_status(self, text: str, trace_revision: int) -> None:
-        """Expose a replaceable status summary to the Voice model plane.
-
-        This mirrors the native Shadow observer: ``status`` is not appended as
-        durable semantic history, but ``SessionLedger`` stores it as
-        ``ShadowVisibleStatus`` and schedules one ordinary Voice evaluation.
-        progress（影子进度）另由二等信箱按 4 秒检查点评估，不走普通信息唤醒。
-        """
+        """观察器摘要仅进入二等信箱，随普通请求或四秒检查点供语音模型评估。"""
 
         if self.production_sink is None:
             return
@@ -1620,7 +1748,7 @@ class DshShadowAgentSession:
                 return
             await self.production_sink([ShadowEvent(
                 event_id=uuid.uuid4().hex,
-                kind="information",
+                kind="progress",
                 text=normalized,
                 based_on_context_revision=self.last_applied_revision,
                 activation_id=activation_id,
@@ -1651,6 +1779,7 @@ class DshShadowAgentSession:
             "backend": "dsh",
             "available": self.available,
             "active": self.activation_id is not None and not self._waiting_user,
+            "continuous_approval": self.approvals.continuous_active,
             "user_input_required": self._waiting_user,
             "voice_session_id": self.voice_session_id,
             "dsh_session_id": self.dsh_session_id,
@@ -1807,6 +1936,9 @@ class DshShadowAgentSession:
     async def _activity(self, state: str, **extra: Any) -> None:
         self._notify_runtime_state()
         if self.activity_sink is not None:
+            if state == "approval_policy":
+                await self.activity_sink([{"backend": "dsh", "state": state, "run_seq": self._run_seq}])
+                return  # 只刷新审批状态，不伪造执行轨迹条目。
             if state == "running":
                 stream, phase, item_id = "lifecycle", "started", f"run-{self._run_seq}"
             elif state in {"idle", "cancelled", "waiting_user"}:

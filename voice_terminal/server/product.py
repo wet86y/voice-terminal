@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from ..shadow_agent.contracts import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 11
+PRODUCT_SETTINGS_SCHEMA_VERSION = 12
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -105,6 +105,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
             ),
         },
         "custom_instructions": [],
+        "approvals": {"voice_confirmation_enabled": False, "continuous_enabled": False},  # approvals（审批确认偏好）。
         # TTS（语音合成）固定走在线 API（程序接口）；backend（运行后端）不再是产品设置。
         "tts": {"backend": "minimax"},
         "speaker": {
@@ -153,7 +154,7 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     result = deepcopy(defaults)
     if not isinstance(value, Mapping):
         return result
-    for section in ("wake", "silence", "shadow", "speaker", "tts", "quiet_hours"):
+    for section in ("wake", "silence", "shadow", "speaker", "tts", "quiet_hours", "approvals"):
         raw = value.get(section)
         if isinstance(raw, Mapping):
             result[section].update({key: raw[key] for key in result[section] if key in raw})
@@ -220,6 +221,9 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     silence["seconds"] = max(MIN_SILENCE_SECONDS, min(MAX_SILENCE_SECONDS, seconds))
     silence["smart_turn_hard_silence_ms"] = int(defaults["silence"]["smart_turn_hard_silence_ms"])
     shadow = result["shadow"]
+    for field in ("voice_confirmation_enabled", "continuous_enabled"):
+        if type(result["approvals"].get(field)) is not bool:
+            result["approvals"][field] = False
     if type(shadow.get("experimental_context_gate_enabled")) is not bool:
         shadow["experimental_context_gate_enabled"] = defaults["shadow"]["experimental_context_gate_enabled"]
     # 旧设置可能记录了 cosyvoice；合并后统一锁定 MiniMax API（在线语音接口）。
@@ -277,6 +281,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
         ("wake", ("enabled", "keyword", "keyword_label", "keywords", "sensitivity")),
         ("silence", ("seconds",)),
         ("shadow", ("experimental_context_gate_enabled",)),
+        ("approvals", ("voice_confirmation_enabled", "continuous_enabled")),
         ("tts", ("backend",)),
         ("speaker", ("mode", "confirm_threshold", "continuity_threshold", "continuity_relaxation", "owner_only_barge_in")),
     ):
@@ -290,7 +295,9 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
             if field not in section:
                 continue
             candidate = section[field]
-            if section_name == "wake" and field == "enabled":
+            if section_name == "approvals":
+                invalid = invalid or type(candidate) is not bool
+            elif section_name == "wake" and field == "enabled":
                 invalid = invalid or type(candidate) is not bool
             elif section_name == "wake" and field == "keyword":
                 invalid = invalid or not isinstance(candidate, str) or not candidate.strip()
@@ -817,6 +824,20 @@ class ProductSettingsStore:
             raise
         return self.snapshot()
 
+    def save_approvals(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """save_approvals（保存审批确认偏好）：不保存已授予的连续授权。"""
+        fields = {"voice_confirmation_enabled", "continuous_enabled"}
+        if set(payload) != fields or any(type(payload[key]) is not bool for key in fields):
+            raise ProductSettingsError("审批设置需包含 voice_confirmation_enabled（语音确认开关）和 continuous_enabled（首次确认后连续提权开关），均须为布尔值。")
+        previous = self._settings["approvals"]
+        self._settings["approvals"] = dict(payload)
+        try:
+            self._save_settings()
+        except BaseException:
+            self._settings["approvals"] = previous
+            raise
+        return deepcopy(self._settings["approvals"])
+
     def save_shadow(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if set(payload) != {"experimental_context_gate_enabled"}:
             raise ProductSettingsError(
@@ -968,6 +989,7 @@ class ShadowProductProjection:
         self.phase = "unavailable"
         self.focus = ""
         self.summary = ""
+        self.latest_event: dict[str, str] | None = None  # latest_event（实际投递语音模型的最新事件正文）。
         self.timeline: deque[dict[str, Any]] = deque(maxlen=5)
         self.activities: deque[dict[str, Any]] = deque(maxlen=96)
         self._activity_run_seq: int | None = None
@@ -981,6 +1003,7 @@ class ShadowProductProjection:
         self.phase = "idle" if self.available else "unavailable"
         self.focus = ""
         self.summary = ""
+        self.latest_event = None
         self.timeline.clear()
         self.activities.clear()
         self._activity_run_seq = None
@@ -992,9 +1015,7 @@ class ShadowProductProjection:
         self.available = bool(value.get("available", self.available))
         self.active = bool(value.get("active", self.active))
         self.user_input_required = bool(value.get("user_input_required", self.user_input_required))
-        status = _safe_display_text(value.get("status"), limit=320)
-        if status:
-            self.summary = status
+        # status（状态观察器摘要）仅供模型使用，禁止从运行快照重新映射到前台。
         if not self.available:
             self.phase = "unavailable"
         elif self.user_input_required:
@@ -1006,10 +1027,14 @@ class ShadowProductProjection:
 
     def update_events(self, events: list[ShadowEvent]) -> None:
         for item in events:
+            if item.source == "observer":
+                continue  # observer（观察器）摘要仅供模型二等信箱使用，不映射到产品界面。
             kind = str(item.kind)
             if kind not in self._KIND_LABELS:
                 continue
             text = _safe_display_text(item.text, limit=320)
+            self.latest_event = {"text": _safe_display_text(item.text, limit=8000), "event_kind": kind,
+                                 "timestamp": getattr(item, "timestamp", "") or utc_now_iso()}
             if kind in {"progress", "information"} and text:
                 self.focus = text
                 self.summary = text
@@ -1196,11 +1221,13 @@ class ShadowProductProjection:
             provider = {key: value for key, value in provider_values.items() if value is not None}
         return {
             "available": self.available,
+            "continuous_approval": bool(runtime.get("continuous_approval")) if isinstance(runtime, Mapping) else False,
             "active": self.active,
             "phase": self.phase,
             "user_input_required": self.user_input_required,
             "focus": self.focus,
             "summary": self.summary,
+            "latest_event": dict(self.latest_event) if self.latest_event is not None else None,
             "timeline": [dict(item) for item in self.timeline],
             "activities": [dict(item) for item in self.activities],
             "last_activity_at": self.last_activity_at or None,

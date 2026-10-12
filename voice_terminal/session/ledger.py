@@ -659,7 +659,9 @@ class SessionLedger:
                 "activation_id": event.activation_id,
                 "scope_generation": self._shadow_progress_generation,
             }
-            if not text or len(text) > 512 or not self._valid_progress_scope(state):
+            # observer（观察器）摘要保留完整两千字符；agent（执行代理）进度仍限五百一十二字符。
+            maximum = 2000 if event.source == "observer" else 512
+            if not text or len(text) > maximum or not self._valid_progress_scope(state):
                 return True
             key = self._progress_text_key(text)
             if self._shadow_progress_seen.get(event.source) == key:

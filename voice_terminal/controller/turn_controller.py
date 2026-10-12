@@ -74,6 +74,9 @@ class InputController:
     async def _state_event(self, state: TerminalState, *, listening: bool | None = None,
                            turn_id: str | None = None) -> None:
         self.state.set_state(state, listening=listening)
+        approval_scope_changed = getattr(self, "approval_scope_changed", None)
+        if approval_scope_changed is not None:
+            await approval_scope_changed()
         await self._publish(event("session.state", turn_id, state=state.value,
                                   listening=self.state.listening, can_start=self.state.can_start,
                                   audio_generation=self.state.audio_generation))

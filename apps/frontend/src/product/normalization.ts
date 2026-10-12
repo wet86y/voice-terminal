@@ -8,7 +8,7 @@ const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 export const MAX_WAKE_KEYWORDS = 5
 
 export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 11,
+  schema_version: 12,
   tts: { backend: 'minimax' },
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
@@ -26,6 +26,7 @@ export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
     },
   },
   custom_instructions: [],
+  approvals: { voice_confirmation_enabled: false, continuous_enabled: false },
   persona: { personality: '', user: '' },
   warnings: [],
 }
@@ -62,6 +63,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   const silence = isRecord(value.silence) ? value.silence : {}
   const quiet = isRecord(value.quiet_hours) ? value.quiet_hours : {}
   const shadow = isRecord(value.shadow) ? value.shadow : {}
+  const approvals = isRecord(value.approvals) ? value.approvals : {}
   const tts = isRecord(value.tts) ? value.tts : {}
   const speaker = isRecord(value.speaker) ? value.speaker : {}
   const compute = isRecord(value.compute) ? value.compute : {}
@@ -101,6 +103,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
       experimental_context_gate_enabled: shadow.experimental_context_gate_enabled === true,
     },
     custom_instructions: customInstructions.map(item => ({ ...item })),
+    approvals: { voice_confirmation_enabled: approvals.voice_confirmation_enabled === true, continuous_enabled: approvals.continuous_enabled === true },
     speaker: {
       ...Object.fromEntries(Object.entries(SPEAKER_DEFAULTS).map(([key, fallback]) => [key, typeof speaker[key] === "number" && Number.isFinite(speaker[key]) ? speaker[key] : fallback])),
       mode: typeof speaker.mode === 'string' && ['off', 'observe', 'filter'].includes(speaker.mode)
@@ -167,6 +170,7 @@ export function updateSettingsFromResponse(settings: ProductSettingsSnapshot, re
   if (isRecord(candidate.silence)) Object.assign(settings.silence, candidate.silence)
   if (isRecord(candidate.quiet_hours)) settings.quiet_hours = { ...settings.quiet_hours, ...candidate.quiet_hours } as ProductSettingsSnapshot['quiet_hours']
   if (isRecord(candidate.shadow)) Object.assign(settings.shadow, candidate.shadow)
+  if (isRecord(candidate.approvals)) Object.assign(settings.approvals, candidate.approvals)
   if (isRecord(candidate.speaker)) Object.assign(settings.speaker, candidate.speaker)
   if (isRecord(candidate.compute)) {
     if (isRecord(candidate.compute.devices)) Object.assign(settings.compute.devices, candidate.compute.devices)

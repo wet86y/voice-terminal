@@ -72,8 +72,8 @@ function jsonBody(value: unknown): RequestInit {
 }
 
 export const productApi = {
-  /** decideDshApproval（权限答复）：经桌面同源宿主转发，仅允许本次操作。 */
-  decideDshApproval: async (value: { approval_id: string; decision: 'allowed-once' | 'rejected'; run_seq: number }) => {
+  /** decideDshApproval（权限答复）：经桌面同源宿主转发，连续授权只限当前语音窗口。 */
+  decideDshApproval: async (value: { approval_id: string; decision: 'allowed-once' | 'allowed-until-silence' | 'rejected'; run_seq: number }) => {
     const response = await fetch('/api/v1/application/dsh-approval', { method: 'POST', credentials: 'same-origin', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
     if (!response.ok) throw await readError(response)
     return await response.json() as { result: string }
@@ -97,6 +97,7 @@ export const productApi = {
   saveSilence: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/silence', jsonBody(value)),
   saveQuietHours: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/quiet-hours', jsonBody(value)),
   saveShadow: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/shadow', jsonBody(value)),
+  saveApprovals: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/approvals', jsonBody(value)), // saveApprovals（保存授权确认偏好）。
   savePersona: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/persona', jsonBody(value)),
   saveCustomInstructions: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/custom-instructions', jsonBody(value)),
   saveSpeaker: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/speaker', jsonBody(value)),
