@@ -20,6 +20,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
+from ..speaker.settings import TUNING_DEFAULTS, validate_tuning
 from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig
 from ..custom_instructions import validate_entries
 from ..quiet_hours import QuietHoursConfig
@@ -30,7 +31,7 @@ if TYPE_CHECKING:
     from ..shadow_agent.contracts import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 10
+PRODUCT_SETTINGS_SCHEMA_VERSION = 11
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -107,6 +108,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
         # TTS（语音合成）固定走在线 API（程序接口）；backend（运行后端）不再是产品设置。
         "tts": {"backend": "minimax"},
         "speaker": {
+            **{key: getattr(config.speaker, key, value) for key, value in TUNING_DEFAULTS.items()},
             "mode": str(getattr(config.speaker, "mode", "off")),
             "confirm_threshold": float(getattr(config.speaker, "confirm_threshold", 0.50)),
             "continuity_threshold": float(getattr(config.speaker, "continuity_threshold", 0.40)),
@@ -124,11 +126,8 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
 def _legacy_speaker_scale(value: Mapping[str, Any]) -> bool:
     """True when the stored file carries speaker thresholds from the old scale.
 
-    The speaker frontend was replaced, which moved the raw-cosine operating
-    point (genuine ~0.86, impostor ~0.02 instead of everything landing between
-    0.4 and 0.65).  Thresholds saved against the old scale — including ones a
-    user raised by hand to fight false accepts — cannot be carried over.  A file
-    with no speaker section has nothing to migrate and stays warning-free.
+    旧分数尺度只产生重新校准提示；CAM++迁移保留用户阈值与运行模式偏好。
+    没有声纹设置的文件不产生迁移提示。
     """
     marker = value.get("schema_version")
     if not isinstance(marker, int) or isinstance(marker, bool):
@@ -172,7 +171,7 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
             entries = raw_compute.get(field)
             if isinstance(entries, Mapping):
                 for name in COMPUTE_MODEL_IDS:
-                    mode = entries.get(name)
+                    mode = entries.get(name, entries.get("wespeaker") if name == "campplus" else None)
                     if isinstance(mode, str) and mode in allowed:
                         result["compute"][field][name] = mode
     wake = result["wake"]
@@ -236,15 +235,6 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
         speaker["mode"] = defaults["speaker"]["mode"]
     if type(speaker.get("owner_only_barge_in")) is not bool:
         speaker["owner_only_barge_in"] = False
-    if legacy_speaker_scale:
-        speaker["confirm_threshold"] = defaults["speaker"]["confirm_threshold"]
-        speaker["continuity_threshold"] = defaults["speaker"]["continuity_threshold"]
-        speaker["continuity_relaxation"] = defaults["speaker"]["continuity_relaxation"]
-        if speaker["mode"] == "filter":
-            # Never resume strict filtering against templates and thresholds
-            # that belong to the previous frontend.
-            speaker["mode"] = "observe"
-        return result
     try:
         confirm = float(speaker.get("confirm_threshold"))
         relaxation = float(speaker.get("continuity_relaxation", 0.10))
@@ -257,6 +247,11 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     speaker["confirm_threshold"] = round(confirm, 4)
     speaker["continuity_relaxation"] = round(relaxation, 4)
     speaker["continuity_threshold"] = round(max(0.0, confirm - relaxation), 4)
+    try:
+        speaker.update(validate_tuning(speaker, continuity=speaker["continuity_threshold"]))
+    except ValueError:
+        speaker.update(TUNING_DEFAULTS)
+        speaker["non_owner_threshold"] = min(0.35, speaker["continuity_threshold"] - 0.01)
     return result
 
 
@@ -350,7 +345,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
                         invalid = True
                     else:
                         invalid = invalid or any(
-                            key not in COMPUTE_MODEL_IDS
+                            key not in (*COMPUTE_MODEL_IDS, "wespeaker")
                             or not isinstance(candidate, str)
                             or candidate not in allowed
                             for key, candidate in entries.items()
@@ -471,6 +466,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         confirm_threshold=confirm_threshold,
         continuity_threshold=continuity_threshold,
         continuity_relaxation=relaxation,
+        **validate_tuning(speaker, continuity=max(0.0, confirm_threshold-relaxation)),
     )
     next_tts = replace(config.tts, backend="minimax", provider="minimax")
     next_compute = ComputeConfig(
@@ -522,7 +518,7 @@ class ProductSettingsStore:
         if legacy:
             self.warnings.append(
                 "product_settings: 声纹特征管线已更换，旧阈值是在另一套分数尺度上标定的，"
-                "已重置为新默认值并切回测试模式；请重新注册声纹后再校准。"
+                "已保留设置偏好；缺少CAM++注册档案时运行于观察状态，请重新注册后校准。"
             )
         merged = _merge_settings(defaults, value, legacy_speaker_scale=legacy)
         stored_tts = value.get("tts")
@@ -836,39 +832,40 @@ class ProductSettingsStore:
         return deepcopy(self._settings["shadow"])
 
     def save_speaker(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        allowed = {"mode", "confirm_threshold", "continuity_threshold", "owner_only_barge_in"}
-        new_allowed = (allowed - {"continuity_threshold"}) | {"continuity_relaxation"}
-        if set(payload) not in (allowed, new_allowed, allowed | new_allowed):
-            raise ProductSettingsError("声纹设置需要 mode（模式）、confirm_threshold（主人阈值）、continuity_relaxation（连续放宽量）、owner_only_barge_in（主人打断开关）。")
-        mode = payload.get("mode")
-        if mode not in {"off", "observe", "filter"}:
-            raise ProductSettingsError("声纹模式必须是 off、observe 或 filter。")
-        owner_only_barge_in = payload.get("owner_only_barge_in")
-        if type(owner_only_barge_in) is not bool:
-            raise ProductSettingsError("owner_only_barge_in（主人打断开关）必须是布尔值。")
-        confirm = payload.get("confirm_threshold")
-        continuity = payload.get("continuity_threshold", 0.0)
-        relaxation = payload.get("continuity_relaxation")
-        if (isinstance(confirm, bool) or not isinstance(confirm, (int, float))
-                or isinstance(continuity, bool) or not isinstance(continuity, (int, float))):
-            raise ProductSettingsError("声纹阈值必须是数字。")
-        confirm = float(confirm)
-        continuity = float(continuity)
-        if relaxation is None:
-            if not 0 <= continuity <= confirm <= 1:
-                raise ProductSettingsError("旧连续阈值必须在 0 和主人阈值之间。")
-            relaxation = min(0.20, max(0.0, confirm - continuity))
-        if type(relaxation) not in {float, int} or not 0 <= float(relaxation) <= 0.20 or not 0 <= confirm <= 1:
-            raise ProductSettingsError("主人阈值必须在 0 至 1 之间；continuity_relaxation（连续放宽量）必须在 0 至 0.20 之间。")
-        self._settings["speaker"] = {
-            "mode": mode,
-            "confirm_threshold": round(confirm, 4),
-            "continuity_threshold": round(max(0.0, confirm - float(relaxation)), 4),
-            "continuity_relaxation": round(float(relaxation), 4),
-            "owner_only_barge_in": owner_only_barge_in,
-        }
+        """原子保存声纹策略；兼容旧四字段请求，不清除新增参数。"""
+        base = {"mode", "confirm_threshold", "continuity_threshold", "continuity_relaxation", "owner_only_barge_in"}
+        if set(payload) - (base | set(TUNING_DEFAULTS)) or not {"mode", "confirm_threshold", "owner_only_barge_in"} <= set(payload):
+            raise ProductSettingsError("声纹设置字段无效或缺少模式、主人阈值、主人打断开关")
+        candidate = {**self._settings["speaker"], **payload}
+        if candidate["mode"] not in {"off", "observe", "filter"} or type(candidate["owner_only_barge_in"]) is not bool:
+            raise ProductSettingsError("声纹模式或主人打断开关无效")
+        try:
+            confirm = candidate["confirm_threshold"]
+            if "continuity_relaxation" in payload:
+                relaxation = payload["continuity_relaxation"]
+            elif "continuity_threshold" in payload:
+                continuity_legacy = payload["continuity_threshold"]
+                if type(continuity_legacy) not in {int, float} or not 0 <= continuity_legacy <= confirm:
+                    raise ValueError("旧连续阈值必须在0与主人阈值之间")
+                relaxation = min(0.20, confirm - continuity_legacy)
+            else:
+                relaxation = candidate.get("continuity_relaxation", 0.10)
+            import math
+            if type(confirm) not in {int, float} or type(relaxation) not in {int, float} or not math.isfinite(confirm) or not math.isfinite(relaxation) or not 0 <= confirm <= 1 or not 0 <= relaxation <= 0.20:
+                raise ValueError("主人阈值必须在0至1之间，连续放宽量必须在0至0.20之间")
+            continuity = max(0.0, confirm - relaxation)
+            # 旧客户端未传反证参数时，将新增默认值约束到旧阈值下方。
+            if "non_owner_threshold" not in payload and candidate["non_owner_threshold"] >= continuity:
+                candidate["non_owner_threshold"] = continuity - 0.01
+            tuning = validate_tuning(candidate, continuity=continuity)
+        except (TypeError, ValueError) as exc:
+            raise ProductSettingsError(str(exc)) from exc
+        saved = {"mode": candidate["mode"], "owner_only_barge_in": candidate["owner_only_barge_in"],
+                 "confirm_threshold": round(confirm, 4), "continuity_relaxation": round(relaxation, 4),
+                 "continuity_threshold": round(continuity, 4), **tuning}
+        self._settings["speaker"] = saved
         self._save_settings()
-        return deepcopy(self._settings["speaker"])
+        return deepcopy(saved)
 
     def save_compute(self, payload: Mapping[str, Any], *,
                      active_devices: Mapping[str, str] | None = None) -> dict[str, Any]:

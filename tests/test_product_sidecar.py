@@ -148,8 +148,8 @@ class ProductSidecarTests(unittest.TestCase):
         self.assertFalse(upgraded.snapshot()["shadow"]["experimental_context_gate_enabled"])
         self.assertFalse(upgraded.warnings)
 
-    def test_legacy_speaker_thresholds_are_reset_to_the_new_scale(self) -> None:
-        """Old raw-cosine thresholds cannot survive the frontend replacement."""
+    def test_legacy_speaker_preferences_survive_native_model_migration(self) -> None:
+        """保留阈值和筛选偏好；有效观察模式由运行时档案状态决定。"""
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         self.settings_path.write_text(json.dumps({
             "schema_version": 3,
@@ -157,10 +157,9 @@ class ProductSidecarTests(unittest.TestCase):
         }), encoding="utf-8")
         migrated = self.store()
         speaker = migrated.snapshot()["speaker"]
-        self.assertEqual(speaker["confirm_threshold"], 0.60)
-        self.assertEqual(speaker["continuity_threshold"], 0.50)
-        # Strict filtering must not resume against a stale scale.
-        self.assertEqual(speaker["mode"], "observe")
+        self.assertEqual(speaker["confirm_threshold"], 0.81)
+        self.assertEqual(speaker["continuity_threshold"], 0.72)
+        self.assertEqual(speaker["mode"], "filter")
         self.assertTrue(any("声纹特征管线" in item for item in migrated.warnings))
         # A v1 file with no speaker section has nothing to migrate.
         self.settings_path.write_text(json.dumps({

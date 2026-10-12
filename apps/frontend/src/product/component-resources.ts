@@ -3,7 +3,7 @@ import type { ProductLocalModelId } from './types'
 
 /** modelComponentOwners（模型所属进程）：状态、资源和重试使用同一所有者。 */
 export const modelComponentOwners: Record<ProductLocalModelId, string> = {
-  paraformer: 'asr', sensevoice: 'analysis', voice_vad: 'voice', kws: 'voice', smart_turn: 'analysis', wespeaker: 'speaker',
+  paraformer: 'asr', sensevoice: 'analysis', voice_vad: 'voice', kws: 'voice', smart_turn: 'analysis', campplus: 'speaker',
 }
 
 /** ComponentResources（组件资源分组）：与宿主总量共用同一采样，按进程身份只计一次。 */

@@ -177,7 +177,7 @@ class ComputeHealthTests(unittest.IsolatedAsyncioTestCase):
                 }))
                 with (patch("voice_terminal.server.websocket.hardware_status", return_value=hardware),
                       patch("voice_terminal.server.websocket.AnalysisClient", return_value=analysis)):
-                    result = (await runtime.compute_status())["models"]["wespeaker"]
+                    result = (await runtime.compute_status())["models"]["campplus"]
                 self.assertEqual(result["service"], "READY" if client_state == "ready" else "ERROR")
                 if client_state == "ready":
                     self.assertIsNone(result["runtime_error"])

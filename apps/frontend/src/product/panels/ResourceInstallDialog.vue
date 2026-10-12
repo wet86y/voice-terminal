@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources> }>()
-const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'fsmn-vad', 'wespeaker-cnceleb-resnet34', 'smart-turn', 'sensevoice-small'])
+const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'fsmn-vad', 'wespeaker-cnceleb-resnet34', 'campplus-zh-cn-common', 'smart-turn', 'sensevoice-small'])
 const updatePending = computed(() => {
   const plan = props.controller.pendingDownloadPlan.value
   if (!plan) return false

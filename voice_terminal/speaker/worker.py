@@ -39,10 +39,10 @@ if __name__ == "__main__":
 
 class SpeakerWorkerEngine:
     def __init__(self, model_path: Path, *, sample_rate: int = 16000,
-                 window_ms: int = 2000, step_ms: int = 500,
-                 min_speech_ms: int = 700,
+                 window_ms: int = 3200, step_ms: int = 400,
+                 min_speech_ms: int = 45,
                  min_window_speech_ratio: float = 0.40,
-                 model_id: str = "wespeaker-cnceleb-resnet34",
+                 model_id: str = "campplus-zh-cn-common",
                  device: str = "cpu", fallback_device: str = "cpu") -> None:
         self.model_path = model_path
         self.model = create_speaker_engine(
@@ -357,8 +357,8 @@ async def run(config_path: Path | None = None) -> None:
         min_speech_ms=config.speaker.min_speech_ms,
         min_window_speech_ratio=config.speaker.min_window_speech_ratio,
         model_id=config.speaker.model_id,
-        device=config.compute.devices.get("wespeaker", "cpu"),
-        fallback_device=config.compute.fallback_devices.get("wespeaker", "cpu"),
+        device=config.compute.devices.get("campplus", "cpu"),
+        fallback_device=config.compute.fallback_devices.get("campplus", "cpu"),
     )
     try:
         with startup_stage("加载声纹模型"):
@@ -380,11 +380,13 @@ async def run(config_path: Path | None = None) -> None:
                     await websocket.send(json.dumps({
                         "type": "health", "request_id": message.get("request_id"),
                         "status": "READY", "model_loaded": True,
+                        "model_id": engine.model.model_version.split(":")[0],
+                        "embedding_dim": engine.model.embedding_dim,
                         "model_version": engine.model_version,
                         "frontend_version": engine.model.frontend_version,
                         "device": engine.model.device,
                         "requested_device": engine.model.requested_device,
-                        "runtime": "ONNX Runtime（推理运行时）",  # runtime（实际加载引擎）。
+                        "runtime": getattr(engine.model, "runtime", "ONNX Runtime（推理运行时）"),  # runtime（实际加载引擎）。
                         "load_error": engine.model.load_error,
                         "process_memory_rss_bytes": process_memory_bytes(),
                         "resource_status": process_resource_status(),  # resource_status（资源状态）。
@@ -423,7 +425,7 @@ async def run(config_path: Path | None = None) -> None:
                             if "pcm_base64" in message:
                                 raise ValueError("共享引用不能同时带音频正文")
                             try:
-                                reader = SharedAudioReader(message["audio_ref"], request_id, 10 * 16000 * 2)
+                                reader = SharedAudioReader(message["audio_ref"], request_id, 16 * 16000 * 2)
                             except Exception as exc:
                                 await websocket.send(json.dumps({"type": "error", "request_id": request_id,
                                     "code": "AUDIO_REF_REJECTED", "message": str(exc)[:300]}, ensure_ascii=False))
@@ -431,7 +433,8 @@ async def run(config_path: Path | None = None) -> None:
                             pcm = reader.view
                         else:
                             pcm = decode_pcm(message.get("pcm_base64"))
-                        quality, speech_ms, _ = engine._quality(pcm)
+                        quality, speech_ms = base_window_quality(pcm, sample_rate=engine.sample_rate, min_speech_ms=0, vad_measured=True)
+                        if len(pcm) < 1440: quality = "insufficient_audio"
                         embedding = list(await native_audio_call(engine.model.embed_pcm, pcm, reader)) if quality == "ready" else []
                     finally:
                         if reader is not None and not reader.in_use:

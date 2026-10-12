@@ -41,6 +41,7 @@ _COMPONENTS = {
     "sensevoice_encoder": ("SenseVoiceEncoderSmall", "encoder_classes", "funasr.models.sense_voice.model"),
     "fsmn_vad_model": ("FsmnVADStreaming", "model_classes", "funasr.models.fsmn_vad_streaming.model"),
     "fsmn_encoder": ("FSMN", "encoder_classes", "funasr.models.fsmn_vad_streaming.encoder"),
+    "campplus_model": ("CAMPPlus", "model_classes", "funasr.models.campplus.model"),
 }
 _MODEL_CONFIGS = {
     "paraformer": (
@@ -344,14 +345,14 @@ def _compile_codes(root: Path, *, selective: bool, load_mode: str):
     return codes, load_source, sources
 
 
-def auto_model_class(model_dir: Path, *, additional_model_dirs=()):
+def auto_model_class(model_dir: Path, *, additional_model_dirs=(), family: str | None = None):
     """返回原 AutoModel；可为多个已知配置增量注册，并独立选择权重加载模式。"""
     import_mode = os.environ.get("VOICE_ASR_IMPORT_MODE", "selective").strip().lower()
     if import_mode not in {"selective", "full"}:
         log.warning("VOICE_ASR_IMPORT_MODE（识别导入模式）未知值 %r，使用 full（完整导入）", import_mode)
         import_mode = "full"
     model_dirs = (Path(model_dir), *(Path(item) for item in additional_model_dirs))
-    components = None if import_mode == "full" else _requested_components(model_dirs)
+    components = None if import_mode == "full" else (("campplus_model",) if family == "campplus" else _requested_components(model_dirs))
     load_mode = _load_mode()
     with _lock:
         root = _verified_root()

@@ -195,7 +195,7 @@ def _backend_hardware_status(*, onnx_only: bool = False) -> dict[str, Any]:
         "voice_vad": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "PyTorch（张量框架）显卡后端缺失或实际计算检查未通过。"},
         "kws": {"gpu_available": sherpa_cuda, "reason": None if sherpa_cuda else "Sherpa-ONNX（语音模型运行时）显卡后端或可用显卡缺失。"},
         "smart_turn": {"gpu_available": onnx_cuda, "reason": None if onnx_cuda else "ONNX Runtime（模型推理运行时）显卡后端缺失或实际计算检查未通过。"},
-        "wespeaker": {"gpu_available": onnx_cuda, "reason": None if onnx_cuda else "ONNX Runtime（模型推理运行时）显卡后端缺失或实际计算检查未通过。"},
+        "campplus": {"gpu_available": torch_cuda, "reason": None if torch_cuda else "PyTorch（张量框架）显卡后端缺失或实际计算检查未通过。"},
     }
     return {
         "system_memory": memory,
@@ -291,7 +291,7 @@ def model_hardware_status(hardware: dict[str, Any], config: Any, *, verify: bool
         "sensevoice": config.model_dir / "analysis/sensevoice/model.pt",
         "voice_vad": config.vad_model_dir / "model.pt",
         "smart_turn": config.model_dir / "analysis/smart-turn/smart-turn-v3.2-gpu.onnx",
-        "wespeaker": config.speaker_model_path,
+        "campplus": config.speaker_model_path,
     }
     for name, path in required.items():
         status = result.get("models", {}).get(name)
@@ -306,7 +306,7 @@ def model_hardware_status(hardware: dict[str, Any], config: Any, *, verify: bool
         if smart_turn and smart_turn.get("gpu_available") and not (required["smart_turn"].parent / "preprocessor_config.json").is_file():
             smart_turn.update(gpu_available=False, reason="语音结束判断模型的音频特征配置缺失。")
         # 单个矩阵运算能通过，不代表卷积、模型算子或相应动态库可以执行。
-        for name in ("smart_turn", "wespeaker"):
+        for name in ("smart_turn", "campplus"):
             status = result.get("models", {}).get(name)
             if status and status.get("gpu_available"):
                 verified = _isolated_onnx_model_probe(name, required[name], hardware.get("capabilities_sampled_at"))
@@ -350,6 +350,15 @@ def _isolated_onnx_model_probe(name: str, path: Path, capability_time: Any) -> d
 def onnx_model_cuda_probe(name: str, path: Path) -> dict:
     """检查实际模型的显卡算子，包括所需卷积库；静默中央处理器回退无效。"""
     import tempfile
+    if name == "campplus":
+        try:
+            from .speaker.native import CamPlusPlusFunAsrEngine
+            engine = CamPlusPlusFunAsrEngine(path, device="cuda")
+            engine.load()
+            if engine.device != "cuda": raise RuntimeError(engine.load_error or "显卡模型回退")
+            return {"ready": True, "reason": None}
+        except Exception as exc:
+            return {"ready": False, "reason": f"CAM++ 实际显卡推理失败（{type(exc).__name__}）"}
     try:
         import numpy as np
         import onnxruntime as ort
@@ -417,7 +426,7 @@ _GPU_MINIMUM_FREE_BYTES = {
     "voice_vad": 384 * 1024 * 1024,
     "kws": 256 * 1024 * 1024,
     "smart_turn": 256 * 1024 * 1024,
-    "wespeaker": 256 * 1024 * 1024,
+    "campplus": 256 * 1024 * 1024,
 }
 
 

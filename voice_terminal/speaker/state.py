@@ -18,8 +18,8 @@ except ImportError:  # pragma: no cover
 class SpeakerStateConfig:
     confirm_threshold: float = 0.60
     continuity_threshold: float = 0.50
-    min_speech_ms: int = 700
-    min_turn_speech_ms: int = 1500
+    min_speech_ms: int = 45  # 最短有效计算输入。
+    min_turn_speech_ms: int = 45  # 无整轮等待门槛。
     continuity_window_ms: int = 5000
     continuity_max_ms: int = 10000
 
@@ -81,7 +81,7 @@ class SpeakerStateMachine:
     def reset(self, *, turn_id: str | None = None, generation: int = 0) -> None:
         self.turn_id = turn_id or ""
         self.generation = generation
-        self.state = SpeakerState.NON_OWNER_CONFIRMED
+        self.state = SpeakerState.UNKNOWN
         self.observations: list[SpeakerObservation] = []
         self._unavailable_reason: str | None = None
         self._aggregate: TurnAggregate | None = None
@@ -223,8 +223,7 @@ class SpeakerStateMachine:
     # ----------------------------------------------------------------- decide
     def _resolve(self, aggregate: TurnAggregate | None) -> SpeakerState:
         if aggregate is None or aggregate.total_speech_ms < self.config.min_turn_speech_ms:
-            # 尚未形成足够证据也按非主人输出，不授权主人权限。
-            return SpeakerState.NON_OWNER_CONFIRMED
+            return SpeakerState.UNKNOWN
         now = time.monotonic()
         score = self._turn_score(aggregate)
         if score >= self.config.confirm_threshold:
@@ -250,11 +249,6 @@ class SpeakerStateMachine:
         state = SpeakerState.UNAVAILABLE if self.state == SpeakerState.UNAVAILABLE else self._resolve(self._aggregate)
         if state != SpeakerState.UNAVAILABLE:
             self.state = state
-        # 模型异常及证据不足也按非主人输出，原因与 degraded（降级标记）继续保留。
-        if state in {SpeakerState.UNKNOWN, SpeakerState.UNAVAILABLE}:
-            degraded = degraded or state == SpeakerState.UNAVAILABLE
-            reason = reason or self._unavailable_reason or "insufficient_speaker_evidence"
-            state = SpeakerState.NON_OWNER_CONFIRMED
         if state == SpeakerState.OWNER_CONFIRMED:
             final_route = "main"
             final_reason = reason or "owner_confirmed"
@@ -265,11 +259,11 @@ class SpeakerStateMachine:
             final_route = "ambient"
             final_reason = reason or ("insufficient_speaker_evidence" if self._aggregate is None else "non_owner_confirmed")
         elif state == SpeakerState.UNAVAILABLE:
-            final_route = "passthrough"
+            final_route = "pending"
             final_reason = reason or self._unavailable_reason or "speaker_unavailable"
             degraded = True
         else:
-            final_route = "passthrough"
+            final_route = "pending"
             final_reason = reason or "speaker_unknown"
         if route is not None:
             final_route = route

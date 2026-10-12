@@ -22,6 +22,8 @@ from ..kws.service import KwsAudioFrame
 from ..speaker.client import SpeakerWorkerClient
 from ..speaker.contracts import SpeakerDecision, SpeakerObservation, SpeakerMode, SpeakerState
 from ..speaker.router import SpeakerRouter
+from ..speaker.session import SessionSpeakerPolicy
+from ..config import SpeakerConfig
 from ..speaker.rolling import RollingSpeakerIdentity, RollingSpeakerSensor, RollingSpeakerSnapshot
 from ..session.ambient import AmbientTranscriptStore
 
@@ -37,6 +39,13 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self.speaker_client: SpeakerWorkerClient | None = kwargs.pop("speaker_client", None)
         self.speaker_router: SpeakerRouter | None = kwargs.pop("speaker_router", None)
         self.speaker_mode = str(kwargs.pop("speaker_mode", "off"))
+        self.speaker_config = kwargs.pop("speaker_config", SpeakerConfig())
+        self.speaker_policy = SessionSpeakerPolicy(self.speaker_config, lambda vector: self.speaker_router.score_embedding(vector) if self.speaker_router else None)
+        self._speaker_published: dict[str, str] = {}
+        self._speaker_pending_audio: dict[tuple[str, int], tuple] = {}
+        self._sub_origins: dict[str, int] = {}
+        self._sub_sequences: dict[str, int] = {}
+        self._sub_generations: dict[str,int] = {} # 识别流所属输入代次。
         self.owner_only_barge_in = bool(kwargs.pop("owner_only_barge_in", False))
         self.speaker_wait_ms = int(kwargs.pop("speaker_wait_ms", 150))
         self.speaker_window_ms = int(kwargs.pop("speaker_window_ms", 2000))
@@ -88,8 +97,26 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self._speaker_timer_handle: asyncio.TimerHandle | None = None
         self.configure_speaker_runtime()
 
+    def _ensure_speaker_policy(self):
+        """兼容恢复时分阶段构造的控制器，不重建已有激活会话。"""
+        for name in ("_sub_origins", "_sub_sequences", "_sub_generations", "_speaker_pending_audio"):
+            if not hasattr(self, name):
+                setattr(self, name, {})
+        if not hasattr(self, "speaker_config"):
+            thresholds = getattr(getattr(self, "speaker_router", None), "state_config", None)
+            self.speaker_config = SpeakerConfig(
+                confirm_threshold=getattr(thresholds, "confirm_threshold", 0.60),
+                continuity_threshold=getattr(thresholds, "continuity_threshold", 0.50))
+        if not hasattr(self, "speaker_policy"):
+            self.speaker_policy = SessionSpeakerPolicy(self.speaker_config,
+                lambda v: self.speaker_router.score_embedding(v) if getattr(self, "speaker_router", None) else None)
+        if not hasattr(self, "_speaker_published"):
+            self._speaker_published = {}
+        return self.speaker_policy
+
     def configure_speaker_runtime(self) -> None:
         """Apply mode and worker changes without another periodic scheduler."""
+        self._ensure_speaker_policy()
         enabled = self.speaker_mode != "off" or self.owner_only_barge_in
         client = self.speaker_client
         router = getattr(self, "speaker_router", None)
@@ -97,30 +124,31 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             self.speaker_sensor = None
             self._speaker_snapshot = None
             return
+        thresholds = router.state_config
+        config = self.speaker_config
+        if config.confirm_threshold != thresholds.confirm_threshold or config.continuity_threshold != thresholds.continuity_threshold:
+            self.speaker_config = replace(config, confirm_threshold=thresholds.confirm_threshold,
+                continuity_threshold=thresholds.continuity_threshold, continuity_relaxation=None)
+            self.speaker_policy.tune(self.speaker_config)
         current = self.speaker_sensor
         if current is not None and current.embed_pcm == client.embed_pcm:
-            thresholds_changed = (
-                current.confirm_threshold != router.state_config.confirm_threshold
-                or current.non_owner_threshold != router.state_config.continuity_threshold
-            )
-            current.confirm_threshold = router.state_config.confirm_threshold
-            current.non_owner_threshold = router.state_config.continuity_threshold
-            if thresholds_changed:
-                # A decision made with the previous policy must not authorize
-                # a request or playback interruption after a hot update.
+            if current.confirm_threshold != self.speaker_config.confirm_threshold or current.non_owner_threshold != self.speaker_config.non_owner_threshold:
                 self._speaker_snapshot = None
                 self._speaker_snapshot_turn_id = None
                 self._speaker_snapshot_generation = None
                 self._speaker_snapshot_barge_id = None
+            current.confirm_threshold = self.speaker_config.confirm_threshold
+            current.non_owner_threshold = self.speaker_config.non_owner_threshold
+            current.window_samples = self.speaker_config.context_max_ms * 16
+            current.buffer_samples = max(4000, self.speaker_config.context_max_ms) * 16
             return
         self.speaker_sensor = RollingSpeakerSensor(
             client.embed_pcm, router.score_embedding,
-            window_ms=self.speaker_window_ms,
-            min_voiced_ms=self.speaker_min_speech_ms,
-            min_decision_voiced_ms=self.speaker_min_turn_speech_ms,
-            min_window_speech_ratio=self.speaker_min_window_speech_ratio,
-            confirm_threshold=router.state_config.confirm_threshold,
-            non_owner_threshold=router.state_config.continuity_threshold,
+            window_ms=self.speaker_config.context_max_ms,
+            buffer_ms=max(4000, self.speaker_config.context_max_ms),
+            min_voiced_ms=45, min_decision_voiced_ms=45,
+            confirm_threshold=self.speaker_config.confirm_threshold,
+            non_owner_threshold=self.speaker_config.non_owner_threshold,
         )
         self._speaker_snapshot = None
         self._speaker_snapshot_turn_id = None
@@ -132,23 +160,12 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         mode = getattr(ws, "speaker_mode", getattr(self, "speaker_mode", "off"))
         if mode != "filter":
             return False
-        snapshot = self._speaker_snapshot
-        rolling_veto = bool(
-            ws is not None and ws.turn_id == turn_id
-            and snapshot is not None and snapshot.identity == RollingSpeakerIdentity.NON_OWNER
-            and snapshot.is_fresh()
-            and snapshot.candidate_start_sample == self._speaker_turn_start_sample
-            and self._speaker_snapshot_turn_id == turn_id
-            and self._speaker_snapshot_generation == ws.generation
-        )
-        if rolling_veto:
-            return True
-        router = getattr(self, "speaker_router", None)
-        if ws is None or ws.turn_id != turn_id or router is None:
+        self._ensure_speaker_policy()
+        if self.speaker_policy.grace():
             return False
-        decision = router.decision()
-        return bool(decision.turn_id == turn_id and decision.generation == ws.generation
-                    and decision.state == SpeakerState.NON_OWNER_CONFIRMED)
+        ws = self.workspace
+        return bool(ws and ws.turn_id == turn_id and not self.speaker_policy.admitted_text(turn_id)
+                    and self.speaker_policy.state(turn_id, ws.generation) == SpeakerState.NON_OWNER_CONFIRMED)
 
     async def _stop_speaker_sensor(self) -> None:
         timer = getattr(self, "_speaker_timer_handle", None)
@@ -197,89 +214,22 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                                       observation=enriched.to_payload(include_embedding=False)))
 
     async def _speaker_decision(self, ws: TurnWorkspace) -> SpeakerDecision | None:
-        token = ws.token  # token（开始判定时冻结的输入轮次与代次）。
-        mode = str(getattr(ws, "speaker_mode", getattr(self, "speaker_mode", "off")))
-        speaker_router = getattr(self, "speaker_router", None)
-        if mode == SpeakerMode.OFF:
+        mode = str(getattr(ws, "speaker_mode", self.speaker_mode))
+        if mode == "off":
             return None
-        router = speaker_router
-        speaker_client = getattr(self, "speaker_client", None)
-        if router is None:
-            decision = SpeakerDecision(
-                turn_id=ws.turn_id, generation=ws.generation, user_id=None,
-                state=SpeakerState.NON_OWNER_CONFIRMED, similarity=None, threshold_used=None,
-                speech_ms=0, observation_count=0, continuity_source=None,
-                route="main" if mode == SpeakerMode.OBSERVE else "ambient",
-                reason="speaker_router_unavailable", degraded=True,
-            )
-        elif speaker_client is None or not speaker_client.connected:
-            router.mark_unavailable("speaker_worker_unavailable")
-            decision = router.decision(
-                route="main" if mode == SpeakerMode.OBSERVE else "passthrough",
-                degraded=True,
-            )
-        else:
-            finished = await speaker_client.finish_turn(
-                ws.turn_id, ws.generation,
-                timeout_ms=getattr(self, "speaker_wait_ms", 150),
-            )
-            if ws.token != token or self.workspace is not ws:
-                return None
-            if not finished or speaker_client.degraded:
-                reason = "speaker_queue_overflow" if speaker_client.degraded else "speaker_timeout"
-                # 最终回执超时将服务标记为 DEGRADED（降级），后续健康检查可恢复。
-                # filter（拦截模式）在下方统一拒绝所有降级身份，观察模式保持放行。
-                self.state.set_service("speaker", "DEGRADED")
-                evidence = router.decision()
-                # speaker_timeout（最终回执超时）不撤销此前已经收到的有效本轮证据。
-                # 保留已有非主人状态，避免最终刷新慢一步就丢失拦截原因。
-                confirmed_non_owner = (
-                    evidence.turn_id == ws.turn_id and evidence.generation == ws.generation
-                    and evidence.state == SpeakerState.NON_OWNER_CONFIRMED
-                )
-                decision = router.decision(
-                    route=("ambient" if mode == SpeakerMode.FILTER and confirmed_non_owner
-                           else "main" if mode == SpeakerMode.OBSERVE else "passthrough"),
-                    degraded=True, reason=reason,
-                )
-            else:
-                decision = router.decision()
-                if decision.state == SpeakerState.NON_OWNER_CONFIRMED:
-                    route = "ambient" if mode == SpeakerMode.FILTER else "main"
-                    decision = router.decision(route=route)
-                elif mode == SpeakerMode.OBSERVE:
-                    decision = router.decision(route="main")
-                elif decision.state in {SpeakerState.UNKNOWN, SpeakerState.UNAVAILABLE}:
-                    decision = router.decision(
-                        route="main" if mode == SpeakerMode.OBSERVE else "passthrough",
-                        degraded=True,
-                        reason=("speaker_unavailable" if decision.state == SpeakerState.UNAVAILABLE
-                                else "speaker_insufficient_evidence"),
-                    )
-                else:
-                    decision = router.decision(route="main")
-        if mode == SpeakerMode.FILTER:
-            # filter（拦截模式）允许本轮主人及有效连续主人；降级身份不授权。
-            owner_confirmed = (
-                decision.turn_id == ws.turn_id and decision.generation == ws.generation
-                and decision.state in {SpeakerState.OWNER_CONFIRMED, SpeakerState.OWNER_CONTINUITY}
-                and not decision.degraded
-            )
-            decision = replace(decision, route="main" if owner_confirmed else "ambient")
+        state = self.speaker_policy.state(ws.turn_id, ws.generation)
+        admitted = self.speaker_policy.admitted_text(ws.turn_id)
+        scores = self.speaker_policy.last_scores
+        decision = SpeakerDecision(turn_id=ws.turn_id, generation=ws.generation,
+            user_id="owner" if state in {SpeakerState.OWNER_CONFIRMED, SpeakerState.OWNER_CONTINUITY} else None,
+            state=state, similarity=scores.get("combined_score"), threshold_used=scores.get("threshold_used"),
+            speech_ms=0, observation_count=len(self.speaker_policy.evidence), continuity_source=None,
+            route="main" if mode != "filter" or admitted else "pending",
+            reason="streaming_admission" if admitted else "awaiting_speaker_evidence")
         ws.speaker_decision = decision.to_payload()
-        ws.speaker_state = decision.state.value
-        ws.speaker_degraded_reason = decision.reason if decision.degraded else ""
-        self.state.current.update(speaker_decision=decision.to_payload())
-        await self._publish(event("speaker.decision", ws.turn_id,
-                                  output_generation=ws.generation,
-                                  decision=decision.to_payload()))
-        logger.info(
-            "speaker.turn_route turn_id=%s generation=%s mode=%s state=%s route=%s "
-            "reason=%s similarity=%s speech_ms=%s observations=%s degraded=%s",
-            ws.turn_id, ws.generation, mode, decision.state.value, decision.route,
-            decision.reason, decision.similarity, decision.speech_ms,
-            decision.observation_count, decision.degraded,
-        )
+        ws.speaker_state = state.value
+        self.state.current.update(speaker_decision=decision.to_payload(), speaker_session=self.speaker_policy.snapshot())
+        await self._publish(event("speaker.decision", ws.turn_id, decision=decision.to_payload()))
         return decision
 
     def _track(self, task: asyncio.Task | None) -> None:
@@ -514,8 +464,15 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         if generation != self._vad_generation:
             return  # Turn was cancelled while native VAD was running.
         if getattr(self, "speaker_sensor", None) is not None:
+            output = getattr(self,"output",None)
+            handle = getattr(output,"handle",None)
+            playing = bool(getattr(getattr(handle,"workspace",None),"playback_started",False)
+                           and getattr(output,"active",False))
+            speech = bool(activity.is_speech)
+            if playing:
+                speech = speech and self._barge_in_protected_available() and self._near_voice_activity() is True
             self.speaker_sensor.submit_frame(
-                frame.pcm, start_sample=frame.start_sample, speech=bool(activity.is_speech),
+                frame.pcm, start_sample=frame.start_sample, speech=speech,
             )
         if activity.speech_started:
             self._speech_start_sample = self._vad_origin + (activity.speech_start_sample or 0)
@@ -573,25 +530,6 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             if self._active_input:
                 self._queue_asr(AudioChunk(self._sub_id, frame.pcm))
 
-        speaker_client = getattr(self, "speaker_client", None)
-        if (speaker_client is not None and ws is not None
-                and str(getattr(ws, "speaker_mode", self.speaker_mode)) != SpeakerMode.OFF):
-            submitted = speaker_client.submit_frame(
-                turn_id=ws.turn_id,
-                generation=ws.generation,
-                pcm=frame.pcm,
-                start_sample=frame.start_sample,
-                end_sample=frame.end_sample,
-                # Hand the VAD verdict to the sidecar so its windows are gated
-                # on real speech rather than a fixed amplitude threshold that
-                # drifts with microphone gain.
-                speech=bool(activity.is_speech),
-            )
-            if not submitted and speaker_client.degraded:
-                # Queue overflow never backpressures this audio callback; it
-                # only downgrades the optional service so the final gate will
-                # pass the turn through.
-                self.state.set_service("speaker", "DEGRADED")
 
         if not self._active_input:
             if activity.speech_started:
@@ -696,6 +634,9 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             self._track(self._endpoint_task)
 
     async def _new_turn(self, frame: AudioFrame) -> None:
+        self._ensure_speaker_policy()
+        if not self.speaker_policy.activation_id:
+            self.speaker_policy.activate("system") # 恢复或重置后的输入不重新授予初始放行。
         turn_id = self.turns.begin()
         self._speaker_turn_start_sample = (
             self._speech_start_sample if self._speech_start_sample is not None else frame.start_sample
@@ -725,6 +666,9 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self.barge_in_gate.reset()
         self._turn_cancel = asyncio.Event()
         self._sub_parts.clear()
+        self._sub_origins.clear()
+        self._sub_sequences.clear()
+        self._sub_generations.clear()
         self._sub_finals.clear()
         self._new_sub(bytes(ws.audio.pcm))
         for name, details in self.analysis_health.items():
@@ -740,32 +684,19 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         await self._state_event(TerminalState.LISTENING, listening=True, turn_id=turn_id)
 
     def _prime_speaker_turn_audio(self, ws: TurnWorkspace, frame: AudioFrame) -> None:
-        """补送 VAD（语音活动检测）回溯起点后的音频，当前帧由正常路径发送。"""
-        client = getattr(self, "speaker_client", None)
-        start = self._speaker_turn_start_sample
-        if client is None or start is None or ws.speaker_mode == SpeakerMode.OFF:
-            return
-        # 仅补送候选起点到当前帧之前的有界缓存；禁止引入上一位说话人的前缀。
-        # speech（人声活动标记）依据检测器已报告的回溯起点，补齐事件延迟期间的语音。
-        for previous in self._recent:
-            left = max(start, previous.start_sample)
-            right = min(frame.start_sample, previous.end_sample)
-            if right <= left:
-                continue
-            pcm = previous.pcm[(left - previous.start_sample) * 2:(right - previous.start_sample) * 2]
-            submitted = client.submit_frame(
-                turn_id=ws.turn_id, generation=ws.generation, pcm=pcm,
-                start_sample=left, end_sample=right, speech=True,
-            )
-            if not submitted and client.degraded:
-                self.state.set_service("speaker", "DEGRADED")
-                break
+        """声纹仅由心跳单次推理，不再发送第二条固定窗口流。"""
+        return
 
     def _new_sub(self, pcm: bytes) -> None:
+        self._ensure_speaker_policy()
         self._sub_sequence += 1
         self._sub_id = f"{self.workspace.turn_id}/asr/{self._sub_sequence}"
         self._sub_parts[self._sub_id] = ""
         self._sub_finals[self._sub_id] = asyncio.Event()
+        end = self._last_frame.end_sample if self._last_frame else len(pcm) // 2
+        self._sub_origins[self._sub_id] = max(0, end - len(pcm) // 2)
+        self._sub_sequences[self._sub_id] = self._sub_sequence
+        self._sub_generations[self._sub_id] = self.workspace.generation
         self._queue_asr(AudioChunk(self._sub_id, pcm))
 
     def _stop_generation(self) -> list[asyncio.Task]:
@@ -898,6 +829,8 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             result = dict(reply["result"])
             if not result.get("complete") or not isinstance(result.get("text"), str):
                 raise ValueError("incomplete refinement")
+            if ws.speaker_mode == "filter" and not self.speaker_policy.fully_admitted(ws.turn_id):
+                return {"complete": True, "text": self.speaker_policy.admitted_text(ws.turn_id), "segments": []}
             refined_text = result["text"].strip()
             if self.wake_enabled:
                 refined_text = strip_wake_prefix(refined_text, self.wake_keywords)
@@ -1002,6 +935,28 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             return
         if sub_id not in self._sub_parts or not isinstance(text, str) or self.workspace is None:
             return
+        ws = self.workspace
+        spans = message.get("segments")
+        self._ensure_speaker_policy()
+        if self._sub_generations.get(sub_id,ws.generation) != ws.generation:
+            if message.get("type") == "asr.final":
+                self._sub_finals[sub_id].set()
+            return  # 跨输入代次的迟到正文不能增加当前身份证据或文本授权。
+        if not isinstance(spans, list):
+            old = self._sub_parts[sub_id]
+            delta = text[len(old):] if text.startswith(old) else ""
+            spans = [{"revision": len(text), "text_delta": delta, "audio_start_sample": 0,
+                      "audio_end_sample": max(0, (self._last_frame.end_sample if self._last_frame else 0)-self._sub_origins.get(sub_id, 0))}]
+        origin = self._sub_origins.get(sub_id, 0)
+        for span in spans:
+            if not isinstance(span, dict): continue
+            self.speaker_policy.ingest(turn_id=ws.turn_id, generation=ws.generation,
+                revision=int(span.get("revision", 0)) + self._sub_sequences.get(sub_id, 0) * 1000000,
+                start=origin+int(span.get("audio_start_sample", 0)),
+                end=origin+int(span.get("audio_end_sample", 0)),
+                text=str(span.get("text_delta", "")), bypass=ws.speaker_mode != "filter")
+        flush = getattr(self, "_flush_speaker_admissions", None)
+        if callable(flush): await flush()
         self._sub_parts[sub_id] = text or self._sub_parts[sub_id]
         ws = self.workspace
         if text and text.strip():
@@ -1026,6 +981,9 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         result = self.segmenter.feed(text, pause=pause)
         if result is None or ws is None:
             return
+        if ws.speaker_mode == "filter":
+            admitted = self.speaker_policy.admitted_text(ws.turn_id)
+            result = {"segments": [admitted] if admitted else [], "sentences": [{"text": admitted}] if admitted else [], "changed_ids": []}
         ws.segments = list(result.get("sentences") or [{"text": s} for s in result["segments"]])
         ws.timings.setdefault("first_segment", time.monotonic())
         await self._detail("transcript.segment", **result)
@@ -1158,6 +1116,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         snapshot=None,
         record: bool = True,
     ) -> None:
+        self._ensure_speaker_policy()
         ws = self.workspace
         if record and ws is not None and reason != "interrupted" and ws.turn_id not in self._interrupted_turns:
             if snapshot is None and self.player:
@@ -1220,6 +1179,9 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             except asyncio.QueueFull:
                 pass
         self._sub_parts.clear()
+        self._sub_origins.clear()
+        self._sub_sequences.clear()
+        self._sub_generations.clear()
         self._sub_finals.clear()
         self._resume_started = None
         self._speech_samples = 0

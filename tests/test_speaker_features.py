@@ -159,7 +159,7 @@ class FrontendEmbeddingTests(unittest.TestCase):
     def setUp(self) -> None:
         from pathlib import Path
 
-        from voice_terminal.config import load_config
+        from voice_terminal.config import load_config, SpeakerConfig
 
         try:
             import onnxruntime  # noqa: F401
@@ -167,6 +167,7 @@ class FrontendEmbeddingTests(unittest.TestCase):
             raise unittest.SkipTest("onnxruntime unavailable")
         root = Path(__file__).resolve().parents[1]
         config = load_config(root / "config" / "default.yaml", root / "config" / "local.yaml")
+        config = __import__("dataclasses").replace(config, speaker=SpeakerConfig(model_id="wespeaker-cnceleb-resnet34"))
         if not config.speaker_model_path.is_file():
             raise unittest.SkipTest("speaker model not installed")
         from voice_terminal.speaker.engine import WeSpeakerOnnxEngine

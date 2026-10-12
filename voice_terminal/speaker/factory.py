@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Any
 
 from .engine import CamPlusPlusOnnxEngine, SpeakerModelError, WeSpeakerOnnxEngine
+from .native import CamPlusPlusFunAsrEngine, SpeakerEngine
 
 # WESPEAKER_MODEL_ID（WeSpeaker模型编号）：保持既有声纹模型身份。
 WESPEAKER_MODEL_ID = "wespeaker-cnceleb-resnet34"
-# CAMPPLUS_MODEL_ID（CAM++模型编号）：可选的ModelScope中文通用模型身份。
+# CAMPPLUS_MODEL_ID（CAM++模型编号）：正式声纹模型的固定中文通用模型身份。
 CAMPPLUS_MODEL_ID = "campplus-zh-cn-common"
 
 
@@ -21,15 +22,15 @@ def create_speaker_engine(
     model_version: str = "",
     device: str = "cpu",
     fallback_device: str = "cpu",
-) -> WeSpeakerOnnxEngine | CamPlusPlusOnnxEngine:
-    """按配置的模型编号与 ONNX（开放神经网络交换格式）路径创建声纹引擎。
+) -> SpeakerEngine:
+    """按模型编号与本地权重路径创建声纹引擎；旧后端仅供历史接口兼容。
 
     Both implementations expose the same ``load``/``embed_pcm``/``probe_embedding``
     contract（接口约定：加载、提取嵌入、计算探测向量）。
 
     参数：
         model_id（模型编号）：稳定的配置和声纹档案身份。
-        model_path（模型文件路径）：ONNX 模型文件位置。
+        model_path（模型文件路径）：CAM++原生权重或历史ONNX（模型交换格式）位置。
         sample_rate（采样率）：输入 PCM（脉冲编码调制）音频采样率。
         model_version（模型版本）：用于区分模型导出版本的标识。
         device（计算设备）：期望的 CPU（中央处理器）或 CUDA（显卡计算）后端。
@@ -47,7 +48,7 @@ def create_speaker_engine(
     if model_id == WESPEAKER_MODEL_ID:
         return WeSpeakerOnnxEngine(**common)
     if model_id == CAMPPLUS_MODEL_ID:
-        return CamPlusPlusOnnxEngine(**common)
+        return CamPlusPlusFunAsrEngine(**common)
     raise SpeakerModelError(f"unsupported speaker model_id（声纹模型编号）: {model_id}")
 
 

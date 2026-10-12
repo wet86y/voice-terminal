@@ -128,7 +128,7 @@ fn receipt_digest(resource_id:&str,files:&[Value])->Result<String,String>{
     use sha2::Sha256;let mut hash=Sha256::new();hash.update(encoded);Ok(format!("{:x}",hash.finalize()))
 }
 
-fn write_model_receipt(stage:&Path,spec:&Value,mut files:Vec<Value>)->Result<(),String>{
+pub(crate) fn write_model_receipt(stage:&Path,spec:&Value,mut files:Vec<Value>)->Result<(),String>{
     let resource_id=spec["resource_id"].as_str().ok_or("模型编号缺失")?;
     let version=spec["version"].as_str().ok_or("模型版本缺失")?;
     // 文件记录来自复制时的源摘要及目标读回复核，不再为签发收据重读全部权重。

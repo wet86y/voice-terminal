@@ -73,7 +73,7 @@ def main() -> None:
              tuple(name for name, selected in (("smart_turn", config.smart_turn.smart_turn),
                                                ("sensevoice", config.smart_turn.sensevoice)) if selected)),
             ("voice", True, ("voice_vad", "kws") +
-             (("wespeaker",) if config.speaker.mode != "off" or config.speaker.owner_only_barge_in else ())),
+             (("campplus",) if config.speaker.mode != "off" or config.speaker.owner_only_barge_in else ())),
         ) if enabled and any(config.compute.devices.get(name, "auto") != "cpu" for name in models)],
         # startup_gpu_roles（启动时可能使用显卡的组件）：仅用于并行资源预留，不更改模型设备选择。
         "worker_timeout_seconds": 240 if paths.separated else 180,  # worker_timeout_seconds（模型进程启动预算）：首次解压的导入与缓存初始化较慢。

@@ -61,7 +61,7 @@ def test_installed_framework_does_not_enable_gpu_without_model_assets(tmp_path):
     gpu_model.touch()
     result = compute.model_hardware_status(backend, config)
     assert result['models']['smart_turn']['gpu_available'] is True
-    assert result['models']['wespeaker']['gpu_available'] is False
+    assert result['models']['campplus']['gpu_available'] is False
     assert all(row['gpu_available'] for row in backend['models'].values()), '不能篡改缓存的框架探测结果'
 
 
@@ -135,15 +135,15 @@ def test_model_checks_are_isolated_cached_by_file_and_refreshed_with_backend_sna
     model.write_bytes(b'first')
     monkeypatch.setattr(compute, '_model_probe_cache', {})
     with patch.object(compute.subprocess, 'run', return_value=SimpleNamespace(stdout='{"ready":false,"reason":"卷积库缺失"}')) as probe:
-        assert not compute._isolated_onnx_model_probe('wespeaker', model, 1)['ready']
-        assert not compute._isolated_onnx_model_probe('wespeaker', model, 1)['ready']
+        assert not compute._isolated_onnx_model_probe('campplus', model, 1)['ready']
+        assert not compute._isolated_onnx_model_probe('campplus', model, 1)['ready']
         assert probe.call_count == 1
         assert probe.call_args.kwargs['env']['PYTHONDONTWRITEBYTECODE'] == '1'
         assert any(argument.endswith('backend-entry.py') for argument in probe.call_args.args[0])
-        compute._isolated_onnx_model_probe('wespeaker', model, 2)
+        compute._isolated_onnx_model_probe('campplus', model, 2)
         assert probe.call_count == 2
         model.write_bytes(b'changed-size')
-        compute._isolated_onnx_model_probe('wespeaker', model, 2)
+        compute._isolated_onnx_model_probe('campplus', model, 2)
         assert probe.call_count == 3
 
 
@@ -151,8 +151,8 @@ def test_present_model_file_and_framework_do_not_override_failed_actual_model_pr
     config = AppConfig(model_dir=tmp_path)
     config.speaker_model_path.parent.mkdir(parents=True)
     config.speaker_model_path.touch()
-    hardware = {'models': {'wespeaker': {'gpu_available': True, 'reason': None}}}
+    hardware = {'models': {'campplus': {'gpu_available': True, 'reason': None}}}
     with patch.object(compute, '_isolated_onnx_model_probe', return_value={'ready': False, 'reason': '模型算子无法执行'}):
-        status = compute.model_hardware_status(hardware, config, verify=True)['models']['wespeaker']
+        status = compute.model_hardware_status(hardware, config, verify=True)['models']['campplus']
     assert not status['gpu_available']
     assert status['reason'] == '模型算子无法执行'

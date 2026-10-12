@@ -1,3 +1,4 @@
+import type { SpeakerTuning } from "./speaker-policy"
 import type {
   ConversationEntry,
   CurrentTurnSnapshot,
@@ -15,7 +16,7 @@ export type ProductModelOrigin = 'runtime_config' | 'local_scan' | 'product_mana
 /** 本地模型 device mode（设备模式）：自动、仅 CPU（中央处理器）或 CUDA（NVIDIA GPU）。 */
 export type ComputeDeviceMode = 'auto' | 'cpu' | 'cuda'
 /** 可调度的非 TTS 本地模型标识。 */
-export type ProductLocalModelId = 'paraformer' | 'sensevoice' | 'voice_vad' | 'kws' | 'smart_turn' | 'wespeaker'
+export type ProductLocalModelId = 'paraformer' | 'sensevoice' | 'voice_vad' | 'kws' | 'smart_turn' | 'campplus'
 
 export interface ProductComputeSettings {
   /** devices（设备选项）：每个本地模型选择自动、仅 CPU 或 GPU。 */
@@ -161,7 +162,7 @@ export interface ProductSettingsSnapshot {
   shadow: {
     experimental_context_gate_enabled: boolean
   }
-  speaker: {
+  speaker: SpeakerTuning & {
     mode: 'off' | 'observe' | 'filter' | string
     confirm_threshold: number // confirm_threshold（主人判断阈值）。
     continuity_threshold: number // continuity_threshold（兼容旧配置的连续绝对阈值）。

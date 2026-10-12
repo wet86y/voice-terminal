@@ -218,25 +218,21 @@ def test_worker_retry_validates_cached_readiness_before_accepting_it():
     asyncio.run(scenario())
 
 
-def test_request_veto_requires_matching_fresh_candidate_and_filter_mode():
+def test_single_negative_snapshot_does_not_veto_until_sustained_evidence():
+    from voice_terminal.speaker.session import SessionSpeakerPolicy
+    from voice_terminal.config import SpeakerConfig
     controller = object.__new__(RealtimeController)
     controller.speaker_mode = "filter"
     controller.workspace = SimpleNamespace(turn_id="t", generation=3)
-    controller._speaker_turn_start_sample = 100
-    controller._speaker_snapshot = _snapshot(RollingSpeakerIdentity.NON_OWNER, start=100, end=32_100)
-    controller._speaker_snapshot_turn_id = "t"
-    controller._speaker_snapshot_generation = 3
+    controller.speaker_config = SpeakerConfig()
+    controller.speaker_policy = SessionSpeakerPolicy(controller.speaker_config, lambda _: 0.2)
+    controller._speaker_snapshot = _snapshot(RollingSpeakerIdentity.NON_OWNER)
+    assert not controller.speaker_vetoes_turn("t")
+    for index in range(3):
+        controller.speaker_policy.observe((1.0, 0.0), turn_id="t", generation=3,
+            start=index*6400, end=(index+1)*6400, speech_ms=400)
     assert controller.speaker_vetoes_turn("t")
     controller.speaker_mode = "observe"
-    assert not controller.speaker_vetoes_turn("t")
-    controller.speaker_mode = "filter"
-    controller._speaker_turn_start_sample = 101
-    assert not controller.speaker_vetoes_turn("t")
-    controller._speaker_turn_start_sample = 100
-    controller._speaker_snapshot = _snapshot(
-        RollingSpeakerIdentity.NON_OWNER, start=100, end=32_100,
-        completed_at=time.monotonic() - 2,
-    )
     assert not controller.speaker_vetoes_turn("t")
 
 

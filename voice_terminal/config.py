@@ -146,7 +146,7 @@ COMPUTE_MODEL_IDS = (
     "voice_vad",
     "kws",
     "smart_turn",
-    "wespeaker",
+    "campplus",
 )
 COMPUTE_DEVICE_MODES = {"auto", "cpu", "cuda"}
 
@@ -162,7 +162,7 @@ class ComputeConfig:
         "voice_vad": "cpu",
         "kws": "cpu",
         "smart_turn": "cpu",
-        "wespeaker": "cpu",
+        "campplus": "cpu",
     })
     # fallback_devices（回退设备）：显式 GPU 加载失败时使用的上次成功设备。
     fallback_devices: Mapping[str, str] = field(default_factory=lambda: {
@@ -171,10 +171,16 @@ class ComputeConfig:
         "voice_vad": "cpu",
         "kws": "cpu",
         "smart_turn": "cpu",
-        "wespeaker": "cpu",
+        "campplus": "cpu",
     })
 
     def __post_init__(self) -> None:
+        for attr in ("devices", "fallback_devices"):
+            values = dict(getattr(self, attr))
+            if "wespeaker" in values and "campplus" not in values:
+                values["campplus"] = values["wespeaker"]
+            values.pop("wespeaker", None)
+            object.__setattr__(self, attr, values)
         for name in COMPUTE_MODEL_IDS:
             device = self.devices.get(name, "cpu")
             fallback = self.fallback_devices.get(name, "cpu")
@@ -325,13 +331,31 @@ class SpeakerConfig:
     continuity_threshold: float = 0.50
     # continuity_relaxation（连续主人阈值放宽量）：旧绝对阈值仅用于兼容配置。
     continuity_relaxation: float | None = None
-    window_ms: int = 2000
-    step_ms: int = 500
-    min_speech_ms: int = 700
+    window_ms: int = 3200
+    step_ms: int = 400
+    min_speech_ms: int = 45
     min_window_speech_ratio: float = 0.40
-    min_turn_speech_ms: int = 1500
+    min_turn_speech_ms: int = 45
     wait_ms: int = 150
-    model_id: str = "wespeaker-cnceleb-resnet34"
+    model_id: str = "campplus-zh-cn-common"
+    continuity_window_ms: int = 5000
+    continuity_max_ms: int = 10000
+    non_owner_threshold: float = 0.35
+    non_owner_ticks: int = 3
+    context_max_ms: int = 3200
+    recovery_max_distance: float = 0.25
+    pending_ttl_ms: int = 30000
+    pending_max_turns: int = 8
+    calibration_speech_ms: int = 3200
+    calibration_max_ms: int = 10000
+    calibration_similarity: float = 0.65
+    session_weight: float = 0.6
+    enrollment_min_segment_speech_ms: int = 3000
+    enrollment_min_total_speech_ms: int = 15000
+    enrollment_min_speech_ratio: float = 0.5
+    enrollment_self_similarity_min: float = 0.7
+    enrollment_max_clipped_ratio: float = 0.005
+
 
     def __post_init__(self) -> None:
         if self.mode not in {"off", "observe", "filter"}:
@@ -344,16 +368,11 @@ class SpeakerConfig:
             object.__setattr__(self, "continuity_threshold", max(0.0, self.confirm_threshold - self.continuity_relaxation))
         if not 0.0 <= self.continuity_threshold <= self.confirm_threshold <= 1.0:
             raise ValueError("声纹阈值必须满足 0 ≤ 连续阈值 ≤ 主人阈值 ≤ 1")
-        if self.window_ms < 500 or self.step_ms < 100 or self.step_ms > self.window_ms:
-            raise ValueError("speaker window settings are invalid")
-        if self.min_speech_ms < 100 or self.min_speech_ms > self.window_ms:
-            raise ValueError("speaker.min_speech_ms is invalid")
-        if not 0.0 < float(self.min_window_speech_ratio) <= 1.0:
-            raise ValueError("speaker.min_window_speech_ratio must be in (0, 1]")
-        if self.min_turn_speech_ms < self.min_speech_ms:
-            raise ValueError("speaker.min_turn_speech_ms must be at least min_speech_ms")
-        if not 0 <= self.wait_ms <= 150:
-            raise ValueError("speaker.wait_ms must be between 0 and 150")
+        from .speaker.settings import validate_tuning
+        validate_tuning(vars(self), continuity=self.continuity_threshold)
+        if self.window_ms < 45 or self.step_ms < 1 or self.min_speech_ms < 1:
+            raise ValueError("声纹音频时长参数无效")
+
 
 
 @dataclass(frozen=True)
@@ -593,7 +612,7 @@ class AppConfig:
         # model_id（模型编号）映射到各自导出文件；WeSpeaker 的既有路径保持不变。
         model_file = {
             "wespeaker-cnceleb-resnet34": "cnceleb_resnet34.onnx",
-            "campplus-zh-cn-common": "campplus.onnx",
+            "campplus-zh-cn-common": "campplus_cn_common.bin",
         }.get(self.speaker.model_id, "model.onnx")
         return self.model_dir / "speaker" / self.speaker.model_id / model_file
 
@@ -984,13 +1003,31 @@ class AppConfig:
                 confirm_threshold=float(_number(speaker.get("confirm_threshold"), 0.60)),
                 continuity_threshold=float(_number(speaker.get("continuity_threshold"), 0.50)),
                 continuity_relaxation=(float(speaker["continuity_relaxation"]) if "continuity_relaxation" in speaker else None),
-                window_ms=int(_number(speaker.get("window_ms"), 2000)),
-                step_ms=int(_number(speaker.get("step_ms"), 500)),
-                min_speech_ms=int(_number(speaker.get("min_speech_ms"), 700)),
+                window_ms=int(_number(speaker.get("context_max_ms"), 3200)),
+                step_ms=400,
+                min_speech_ms=45,
                 min_window_speech_ratio=float(_number(speaker.get("min_window_speech_ratio"), 0.40)),
-                min_turn_speech_ms=int(_number(speaker.get("min_turn_speech_ms"), 1500)),
+                min_turn_speech_ms=45,
                 wait_ms=int(_number(speaker.get("wait_ms"), 150)),
-                model_id=_string(speaker.get("model_id"), "wespeaker-cnceleb-resnet34"),
+                model_id="campplus-zh-cn-common",
+                continuity_window_ms=int(_number(speaker.get("continuity_window_ms"), 5000)),
+                continuity_max_ms=int(_number(speaker.get("continuity_max_ms"), 10000)),
+                non_owner_threshold=float(_number(speaker.get("non_owner_threshold"), 0.35)),
+                non_owner_ticks=int(_number(speaker.get("non_owner_ticks"), 3)),
+                context_max_ms=int(_number(speaker.get("context_max_ms"), 3200)),
+                recovery_max_distance=float(_number(speaker.get("recovery_max_distance"), 0.25)),
+                pending_ttl_ms=int(_number(speaker.get("pending_ttl_ms"), 30000)),
+                pending_max_turns=int(_number(speaker.get("pending_max_turns"), 8)),
+                calibration_speech_ms=int(_number(speaker.get("calibration_speech_ms"), 3200)),
+                calibration_max_ms=int(_number(speaker.get("calibration_max_ms"), 10000)),
+                calibration_similarity=float(_number(speaker.get("calibration_similarity"), 0.65)),
+                session_weight=float(_number(speaker.get("session_weight"), 0.6)),
+                enrollment_min_segment_speech_ms=int(_number(speaker.get("enrollment_min_segment_speech_ms"), 3000)),
+                enrollment_min_total_speech_ms=int(_number(speaker.get("enrollment_min_total_speech_ms"), 15000)),
+                enrollment_min_speech_ratio=float(_number(speaker.get("enrollment_min_speech_ratio"), 0.5)),
+                enrollment_self_similarity_min=float(_number(speaker.get("enrollment_self_similarity_min"), 0.7)),
+                enrollment_max_clipped_ratio=float(_number(speaker.get("enrollment_max_clipped_ratio"), 0.005)),
+
             ),
             speaker_worker=SpeakerWorkerConfig(
                 host=speaker_worker_host,

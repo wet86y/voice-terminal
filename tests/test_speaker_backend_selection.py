@@ -6,7 +6,8 @@ import pytest
 
 from voice_terminal.config import AppConfig, SpeakerConfig
 from voice_terminal.server.speaker_runtime import SpeakerRuntimeMixin
-from voice_terminal.speaker.engine import CamPlusPlusOnnxEngine, WeSpeakerOnnxEngine
+from voice_terminal.speaker.engine import WeSpeakerOnnxEngine
+from voice_terminal.speaker.native import CamPlusPlusFunAsrEngine
 from voice_terminal.speaker.features import CAMPLUS_FRONTEND_VERSION, FRONTEND_VERSION
 from voice_terminal.speaker.registry import SpeakerProfileStore
 from voice_terminal.speaker.worker import SpeakerWorkerEngine
@@ -14,7 +15,7 @@ from voice_terminal.speaker.worker import SpeakerWorkerEngine
 
 @pytest.mark.parametrize("model_id,engine_type,frontend", [
     ("wespeaker-cnceleb-resnet34", WeSpeakerOnnxEngine, FRONTEND_VERSION),
-    ("campplus-zh-cn-common", CamPlusPlusOnnxEngine, CAMPLUS_FRONTEND_VERSION),
+    ("campplus-zh-cn-common", CamPlusPlusFunAsrEngine, CAMPLUS_FRONTEND_VERSION),
 ])
 def test_worker_selects_configured_backend(model_id, engine_type, frontend):
     worker = SpeakerWorkerEngine(Path("unused.onnx"), model_id=model_id)
@@ -24,7 +25,7 @@ def test_worker_selects_configured_backend(model_id, engine_type, frontend):
 
 @pytest.mark.parametrize("model_id,engine_type,frontend,dimension", [
     ("wespeaker-cnceleb-resnet34", WeSpeakerOnnxEngine, FRONTEND_VERSION, 256),
-    ("campplus-zh-cn-common", CamPlusPlusOnnxEngine, CAMPLUS_FRONTEND_VERSION, 192),
+    ("campplus-zh-cn-common", CamPlusPlusFunAsrEngine, CAMPLUS_FRONTEND_VERSION, 192),
 ])
 def test_local_fallback_fingerprint_comes_from_selected_engine(
         tmp_path, monkeypatch, model_id, engine_type, frontend, dimension):

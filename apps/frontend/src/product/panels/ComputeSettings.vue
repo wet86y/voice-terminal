@@ -19,7 +19,7 @@ const modelResourceIds: Record<ProductLocalModelId, string> = {
   kws: 'kws-sherpa-onnx',
   paraformer: 'paraformer-streaming',
   voice_vad: 'fsmn-vad',
-  wespeaker: 'wespeaker-cnceleb-resnet34',
+  campplus: 'wespeaker-cnceleb-resnet34',
   smart_turn: 'smart-turn',
   sensevoice: 'sensevoice-small',
 }
@@ -62,7 +62,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     const owner = componentFor(owners[item.id])
     const resource = status?.resource_status
     const managed = managedResource(modelResourceIds[item.id])
-    const countedHere = ['paraformer', 'sensevoice', 'wespeaker'].includes(item.id)
+    const countedHere = ['paraformer', 'sensevoice', 'campplus'].includes(item.id)
     const metrics = resources.value.get(owners[item.id])
     const legacyResource = application.snapshot.value?.resource_processes === undefined ? resource : undefined
     const busy = Boolean(owner?.retrying || retrying.value.has(owners[item.id]))

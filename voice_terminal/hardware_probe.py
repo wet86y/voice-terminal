@@ -6,7 +6,7 @@ from .compute import _backend_hardware_status, onnx_model_cuda_probe
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=("smart_turn", "wespeaker"))
+    parser.add_argument("--model", choices=("smart_turn", "campplus"))
     parser.add_argument("--model-path", type=Path)
     args = parser.parse_args()
     if args.model and not args.model_path:

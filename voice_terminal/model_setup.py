@@ -142,6 +142,24 @@ def _install_modelscope(model_dir: Path, model_id: str, target: Path, name: str,
     }
 
 
+def _is_campplus_model_complete(path: Path) -> bool:
+    from .speaker.native import WEIGHT_SHA256
+    model = path / "campplus_cn_common.bin"
+    return model.is_file() and model.stat().st_size == 28036335 and _sha256(model) == WEIGHT_SHA256
+
+
+def _install_campplus(model_dir: Path) -> dict[str, Any]:
+    target = model_dir / "speaker" / "campplus-zh-cn-common"
+    if not _is_campplus_model_complete(target):
+        from modelscope.hub.snapshot_download import snapshot_download
+        snapshot_download("iic/speech_campplus_sv_zh-cn_16k-common", revision="v1.0.0",
+                          local_dir=str(target), allow_patterns=["campplus_cn_common.bin"])
+    if not _is_campplus_model_complete(target):
+        raise RuntimeError("CAM++ 官方权重下载或摘要校验失败")
+    return {"name": "campplus-zh-cn-common", "kind": "speaker_embedding",
+            "source": "ModelScope（模型仓库）官方 v1.0.0", "path": str(target), "files": _file_manifest(target)}
+
+
 def _is_wespeaker_model_complete(path: Path) -> bool:
     model = path / "cnceleb_resnet34.onnx"
     return model.is_file() and model.stat().st_size > 1_000_000
@@ -204,10 +222,10 @@ def validate_models(
         errors.append(f"Paraformer 模型不完整：{model_dir / 'funasr' / 'paraformer-zh-streaming'}")
     if not _is_funasr_model_complete(model_dir / "funasr" / "fsmn-vad"):
         errors.append(f"FSMN-VAD 模型不完整：{model_dir / 'funasr' / 'fsmn-vad'}")
-    if require_speaker and not _is_wespeaker_model_complete(model_dir / "speaker" / "wespeaker-cnceleb-resnet34"):
+    if require_speaker and not _is_campplus_model_complete(model_dir / "speaker" / "campplus-zh-cn-common"):
         errors.append(
-            "WeSpeaker 模型不完整："
-            f"{model_dir / 'speaker' / 'wespeaker-cnceleb-resnet34'}"
+            "CAM++ 模型不完整："
+            f"{model_dir / 'speaker' / 'campplus-zh-cn-common'}"
         )
     keywords = kws / "keywords.txt"
     if not keywords.is_file():
@@ -272,7 +290,7 @@ def main() -> int:
             "fsmn-vad",
             "vad",
         ),
-        _install_wespeaker(model_dir),
+        _install_campplus(model_dir),
     ]
     errors = validate_models(model_dir)
     if errors:

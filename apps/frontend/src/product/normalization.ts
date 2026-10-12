@@ -1,3 +1,4 @@
+import { SPEAKER_DEFAULTS } from "./speaker-policy"
 import type { ShadowProductSnapshot } from '../types'
 import type { CustomInstruction, DshRuntimeStatus, ProductAssignments, ProductLocalModelId, ProductModelRegistry, ProductMutationResult, ProductRuntimeState, ProductSettingsSnapshot } from './types'
 import { isRecord } from '../record'
@@ -7,21 +8,21 @@ const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 export const MAX_WAKE_KEYWORDS = 5
 
 export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 10,
+  schema_version: 11,
   tts: { backend: 'minimax' },
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
   quiet_hours: { enabled: false, start: '23:00', end: '07:00' },
   shadow: { experimental_context_gate_enabled: false },
-  speaker: { mode: 'off', confirm_threshold: 0.6, continuity_threshold: 0.5, continuity_relaxation: 0.1, owner_only_barge_in: false },
+  speaker: { ...SPEAKER_DEFAULTS, mode: 'off', confirm_threshold: 0.6, continuity_threshold: 0.5, continuity_relaxation: 0.1, owner_only_barge_in: false },
   compute: {
     devices: {
       paraformer: 'auto', sensevoice: 'cpu', voice_vad: 'cpu',
-      kws: 'cpu', smart_turn: 'cpu', wespeaker: 'cpu',
+      kws: 'cpu', smart_turn: 'cpu', campplus: 'cpu',
     },
     fallback_devices: {
       paraformer: 'cpu', sensevoice: 'cpu', voice_vad: 'cpu',
-      kws: 'cpu', smart_turn: 'cpu', wespeaker: 'cpu',
+      kws: 'cpu', smart_turn: 'cpu', campplus: 'cpu',
     },
   },
   custom_instructions: [],
@@ -101,6 +102,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
     },
     custom_instructions: customInstructions.map(item => ({ ...item })),
     speaker: {
+      ...Object.fromEntries(Object.entries(SPEAKER_DEFAULTS).map(([key, fallback]) => [key, typeof speaker[key] === "number" && Number.isFinite(speaker[key]) ? speaker[key] : fallback])),
       mode: typeof speaker.mode === 'string' && ['off', 'observe', 'filter'].includes(speaker.mode)
         ? speaker.mode as ProductSettingsSnapshot['speaker']['mode'] : 'off',
       confirm_threshold: typeof speaker.confirm_threshold === 'number' ? speaker.confirm_threshold : 0.6,
@@ -111,7 +113,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
     compute: {
       devices: Object.fromEntries(
         Object.keys(DEFAULT_SETTINGS.compute.devices).map(key => {
-          const candidate = computeDevices[key]
+          const candidate = computeDevices[key] ?? (key === "campplus" ? computeDevices.wespeaker : undefined)
           const fallback = DEFAULT_SETTINGS.compute.devices[key as ProductLocalModelId]
           return [key, ['auto', 'cpu', 'cuda'].includes(String(candidate)) ? candidate : fallback]
         }),
@@ -119,7 +121,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
       fallback_devices: Object.fromEntries(
         Object.keys(DEFAULT_SETTINGS.compute.fallback_devices || {}).map(key => [
           key,
-          fallbackDevices[key] === 'cuda' ? 'cuda' : 'cpu',
+          (fallbackDevices[key] ?? (key === 'campplus' ? fallbackDevices.wespeaker : undefined)) === 'cuda' ? 'cuda' : 'cpu',
         ]),
       ) as NonNullable<ProductSettingsSnapshot['compute']['fallback_devices']>,
     },

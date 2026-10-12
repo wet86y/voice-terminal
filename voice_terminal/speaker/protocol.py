@@ -8,7 +8,7 @@ def encode_pcm(pcm: bytes) -> str:
     return base64.b64encode(pcm).decode("ascii")
 
 
-def decode_pcm(value: Any, *, max_bytes: int = 10 * 16000 * 2) -> bytes:
+def decode_pcm(value: Any, *, max_bytes: int = 16 * 16000 * 2) -> bytes:
     if not isinstance(value, str):
         raise ValueError("speaker PCM must be base64 text")
     if len(value) > max(128, int(max_bytes) * 2):

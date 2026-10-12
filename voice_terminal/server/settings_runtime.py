@@ -46,13 +46,7 @@ class ProductSettingsRuntimeMixin:
                 if not await self.controller._ensure_asr_ready(preserve_listening=True):
                     raise ValueError("语音识别尚未就绪，无法从关键词待机切换为直接监听。")
             if next_config.speaker != previous.speaker:
-                await self.set_speaker_settings({
-                    "mode": next_config.speaker.mode,
-                    "confirm_threshold": next_config.speaker.confirm_threshold,
-                    "continuity_threshold": next_config.speaker.continuity_threshold,
-                    "continuity_relaxation": next_config.speaker.continuity_relaxation,
-                    "owner_only_barge_in": next_config.speaker.owner_only_barge_in,
-                })
+                await self.set_speaker_settings(vars(next_config.speaker))
             self.config = next_config
             self.quiet_policy.config = next_config.quiet_hours
             self.state.wake_always_on = bool(next_config.wake.enabled)

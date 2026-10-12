@@ -21,7 +21,7 @@ def runtime_stub():
         speaker_model_path=Path("test-model.onnx"),
         speaker=SimpleNamespace(model_id="wespeaker-cnceleb-resnet34"),
         audio=SimpleNamespace(sample_rate=16000),
-        compute=SimpleNamespace(devices={"wespeaker": "cpu"}, fallback_devices={}),
+        compute=SimpleNamespace(devices={"campplus": "cpu"}, fallback_devices={}),
     )
     runtime._speaker_engine = None
     runtime._speaker_engine_lock = threading.RLock()
