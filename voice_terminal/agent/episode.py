@@ -816,11 +816,14 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         return self.episode_id
 
     async def schedule_system_check(self, prompt_kind: str, source_id: str,
-                                    arm_silence: bool = False, **context) -> int | None:
+                                    arm_silence: bool = False, immediate_dispatch: bool = False,
+                                    **context) -> int | None:
         """Queue one system-owned check without fabricating a user input."""
 
         if prompt_kind != "kws_wake" or not isinstance(source_id, str) or not source_id:
             raise ValueError("unsupported system check")
+        if source_id in getattr(self, "_invalid_kws_wakes", ()):
+            return None
         if await self.ensure_episode() is None:
             return None
         generation = self.scheduler.generation
@@ -837,13 +840,54 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             "silence_elapsed_ms": 0,
             "window_index": 0,
             "generation": generation,
+            "immediate_dispatch": immediate_dispatch,  # 是否无需等待心跳派发。
             **context,
         }
         current = self._immediate_system_check
         if current is None or int(current.get("generation") or 0) <= generation:
             self._immediate_system_check = candidate
         self._ensure_runner()
+        if immediate_dispatch:
+            try:
+                self.queue.put_nowait(True)
+            except asyncio.QueueFull:
+                pass  # 唤醒信号合并；候选仍保留在串行调度器中。
         return generation
+
+    async def _dispatch_immediate_system_check(self) -> bool:
+        """在原串行循环中派发即时唤醒候选，不推进普通心跳窗口。"""
+        self._discard_obsolete_kws_candidate()
+        candidate = self._immediate_system_check
+        if candidate is None or not candidate.get("immediate_dispatch"):
+            return False
+        if int(candidate.get("generation") or 0) != self.scheduler.generation:
+            self._immediate_system_check = None
+            return False
+        if self.active_request is not None or not self._dispatch_allowed():
+            return False
+        if await self._start_dispatch({"SYSTEM_CHECK"}, candidate=candidate):
+            if self._immediate_system_check is candidate:
+                self._immediate_system_check = None
+            return True
+        return False
+
+    def _discard_obsolete_kws_candidate(self) -> None:
+        candidate = self._immediate_system_check
+        if candidate is not None and candidate.get("prompt_kind") == "kws_wake" and (
+            self.user_speaking is True or self._meaningful_pending()
+            or candidate.get("source_id") in getattr(self, "_invalid_kws_wakes", ())
+        ):
+            self._immediate_system_check = None  # 新的用户输入优先，避免确认候选阻塞普通请求。
+
+    def invalidate_kws_wake(self, source_id: str) -> None:
+        """使失败唤醒的候选和晚到结果失效；不取消其他请求或输出。"""
+        invalid = getattr(self, "_invalid_kws_wakes", None)
+        if invalid is None:
+            invalid = self._invalid_kws_wakes = deque(maxlen=64)
+        invalid.append(source_id)
+        candidate = self._immediate_system_check
+        if candidate is not None and candidate.get("source_id") == source_id:
+            self._immediate_system_check = None
 
     async def arm_silence_window(self, turn_id: str | None = None, *,
                                  anchor_source: str = "model_speech") -> int | None:
@@ -908,6 +952,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
     def _system_check_stale_reason(self, context) -> str | None:
         if not self._is_system_check_context(context):
             return None
+        if context.get("speech_turn_id") in getattr(self, "_invalid_kws_wakes", ()):
+            return "wake_preparation_failed"  # 本次唤醒的输入准备失败。
         if int(context.get("generation") or 0) != self.scheduler.generation:
             return "scheduler_generation_changed"
         # 最终静默及关键词唤醒检查可在讲话时结算；二等检查派发前须确认用户未讲话。
@@ -2116,6 +2162,10 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self.active_recovery = recovery_signal
         self.active_dispatch_context = dispatch_context
         self.scheduler_last_dispatch_at = time.monotonic()
+        controller = getattr(self.output, "controller", None)
+        source_timings = getattr(controller, "_turn_timings", {}).get(source_turn_id)
+        if isinstance(source_timings, dict):
+            source_timings.setdefault("llm_request", self.scheduler_last_dispatch_at)
         pending_wait_ms = (
             round(max(0.0, self.scheduler_last_dispatch_at - self._pending_since) * 1000, 3)
             if self._pending_since is not None and candidate is None and not recovery else None
@@ -2331,6 +2381,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                            window_index=self.scheduler.FINAL_WINDOW,
                            reason="final_window_crossed",
                            scheduler_generation=self.scheduler.generation)
+        self._discard_obsolete_kws_candidate()
         immediate = self._immediate_system_check
         if immediate is not None:
             if int(immediate.get("generation") or 0) != self.scheduler.generation:
@@ -2670,6 +2721,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 if self.active_request is not None and self.active_request.done():
                     await self._finish_active_request(self.active_request)
 
+                await self._dispatch_immediate_system_check()
                 if heartbeat_pulse is not None:
                     if heartbeat_pulse.episode_generation != self._heartbeat_episode_generation:
                         await self.log(

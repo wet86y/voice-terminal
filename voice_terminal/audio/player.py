@@ -91,6 +91,8 @@ class PcmPlayer:
         self._held_key: str | None = None
         self._paused_key: str | None = None
         self._gated = False
+        from .wake_cue import make_wake_cue
+        self._wake_cue_pcm = make_wake_cue(self.sample_rate, self.channels)  # 缓存唤醒音频。
         self._last_callback_at: float | None = None
         self._last_device_output_time: float | None = None
         self._render_points: deque[tuple[float, int]] = deque(maxlen=256)
@@ -468,6 +470,18 @@ class PcmPlayer:
             self._stream = None
             logger.exception("audio.player_start_failed")
             raise AudioPlayerError(f"扬声器播放启动失败：{exc}") from exc
+
+    def play_wake_cue(self, key: str) -> None:
+        """播放本地提示音；调用方负责代次校验和正式播报的衔接。"""
+        self.start()
+        with self._queue_lock:
+            if self._enqueued_bytes > self._output_estimated_bytes_unlocked(self._played_bytes):
+                raise AudioPlayerError("唤醒提示音不能覆盖正在播放的音频或设备尾音。")
+            self._render_points.clear()
+            self._clear_unlocked()
+            self._gated = True
+            self._allowed_key = key
+        self.enqueue(key, self._wake_cue_pcm)
 
     def enqueue(self, turn_id: str, pcm: bytes) -> None:
         if not pcm:
