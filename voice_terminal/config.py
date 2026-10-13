@@ -135,7 +135,7 @@ class AsrConfig:
     model: str = "paraformer-zh-streaming"
     device: str = "auto"
     worker_url: str = "ws://127.0.0.1:8766/asr"
-    chunk_size: tuple[int, int, int] = (0, 10, 5)
+    chunk_size: tuple[int, int, int] = (0, 8, 4)  # chunk_size（分块配置）：480 毫秒输入、240 毫秒前瞻。
     encoder_chunk_look_back: int = 4
     decoder_chunk_look_back: int = 1
 
@@ -731,11 +731,11 @@ class AppConfig:
             path = Path(value)
             return path if path.is_absolute() else root / path
 
-        chunk_value = asr.get("chunk_size", [0, 10, 5])
+        chunk_value = asr.get("chunk_size", [0, 8, 4])
         if isinstance(chunk_value, (list, tuple)) and len(chunk_value) == 3 and all(isinstance(item, int) for item in chunk_value):
             chunk_size = tuple(chunk_value)
         else:
-            chunk_size = (0, 10, 5)
+            chunk_size = (0, 8, 4)
 
         smart_turn_data = dict(_section(data, "smart_turn"))
         smart_turn_data["enabled"] = True

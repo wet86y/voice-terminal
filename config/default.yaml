@@ -139,7 +139,7 @@ asr:
   model: paraformer-zh-streaming
   device: auto
   worker_url: ws://127.0.0.1:8766/asr
-  chunk_size: [0, 10, 5]
+  chunk_size: [0, 8, 4] # chunk_size（分块配置）：480 毫秒输入窗口、240 毫秒前瞻。
   encoder_chunk_look_back: 4
   decoder_chunk_look_back: 1
 
