@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-floating-model"
+description = "Enables the get_floating_model command without any pre-configured scope."
+commands.allow = ["get_floating_model"]
+
+[[permission]]
+identifier = "deny-get-floating-model"
+description = "Denies the get_floating_model command without any pre-configured scope."
+commands.deny = ["get_floating_model"]

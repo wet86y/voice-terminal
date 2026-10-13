@@ -256,6 +256,8 @@ def frontend_build(path):
     (path / 'index.html').write_text('<script src="/assets/main.js"></script>', encoding='utf-8')
     (path / 'management.html').write_text('<script src="/assets/management.js"></script>', encoding='utf-8')
     (path / 'assets/management.js').write_text('management()', encoding='utf-8')
+    (path / 'floating.html').write_text('<script src="/assets/floating.js"></script>', encoding='utf-8')
+    (path / 'assets/floating.js').write_text('floating()', encoding='utf-8')
     for name in ('startup.html', 'startup.css', 'app-icon.svg'):
         (path / name).write_text('fixture', encoding='utf-8')
     (path / 'assets/main.js').write_text('import("./product.js")', encoding='utf-8')
@@ -264,6 +266,7 @@ def frontend_build(path):
     atomic_json(path / 'desktop-manifest.json', {
         'index.html': {'isEntry': True, 'file': 'assets/main.js', 'dynamicImports': ['product']},
         'management.html': {'isEntry': True, 'file': 'assets/management.js'},
+        'floating.html': {'isEntry': True, 'file': 'assets/floating.js'},
         'product': {'file': 'assets/product.js', 'css': ['assets/product.css']},
     })
 
@@ -274,7 +277,8 @@ def test_frontend_collection_only_copies_product_dependency_closure(tmp_path):
     script('assemble-desktop').collect_frontend(source, target)
     assert {path.relative_to(target).as_posix() for path in target.rglob('*') if path.is_file()} == {
         'index.html', 'desktop-manifest.json', 'assets/main.js', 'assets/product.js', 'assets/product.css',
-        'management.html', 'assets/management.js', 'startup.html', 'startup.css', 'app-icon.svg',
+        'management.html', 'assets/management.js', 'floating.html', 'assets/floating.js',
+        'startup.html', 'startup.css', 'app-icon.svg',
     }
 
 
@@ -294,7 +298,7 @@ def test_frontend_collection_rejects_additional_entry_and_preview_dependency(tmp
     records = json.loads((source / 'desktop-manifest.json').read_text())
     records['ui-demo.html'] = {'isEntry': True, 'file': 'assets/product.js'}
     atomic_json(source / 'desktop-manifest.json', records)
-    with pytest.raises(ValueError, match='只有产品入口'):
+    with pytest.raises(ValueError, match='入口集合'):
         script('assemble-desktop').collect_frontend(source, tmp_path / '发布')
     records.pop('ui-demo.html')
     records['index.html']['dynamicImports'] = ['src/ui-demo/main.ts']

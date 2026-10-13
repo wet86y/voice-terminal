@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::PageLoadEvent,
     Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
@@ -49,12 +49,13 @@ enum DesktopCommand {
     OpenConsole, // open console（打开产品控制台）。
     Exit,        // exit（退出当前桌面实例）。
     FocusMain,   // focus main（聚焦产品主窗口）。
+    PublishFloatingModel, // publish floating model（发布悬浮窗只读状态）。
 }
 
 fn command_allowed(mode: FrontendMode, command: DesktopCommand) -> bool {
     match command {
         DesktopCommand::Status | DesktopCommand::SkipStartup | DesktopCommand::Exit => true,
-        DesktopCommand::OpenLogs | DesktopCommand::OpenConsole | DesktopCommand::FocusMain => {
+        DesktopCommand::OpenLogs | DesktopCommand::OpenConsole | DesktopCommand::FocusMain | DesktopCommand::PublishFloatingModel => {
             mode == FrontendMode::Product
         }
     }
@@ -71,6 +72,7 @@ fn require_command(mode: FrontendMode, command: DesktopCommand) -> Result<(), St
         DesktopCommand::OpenConsole => "产品控制台",
         DesktopCommand::Exit => "退出应用",
         DesktopCommand::FocusMain => "产品主窗口",
+        DesktopCommand::PublishFloatingModel => "悬浮窗状态",
     };
     Err(format!("桌面样例不支持{name}命令。"))
 }
@@ -91,6 +93,16 @@ fn frontend_capability(mode: FrontendMode, normalized_origin: &str, epoch: u64) 
     } else {
         serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","core:event:allow-listen","core:event:allow-unlisten"]})
     }
+}
+
+/// floating_capability（悬浮窗权限）：仅授权本实例悬浮窗读取状态、订阅更新和切回主界面。
+fn floating_capability(normalized_origin: &str, epoch: u64) -> serde_json::Value {
+    serde_json::json!({"identifier":format!("owned-floating-{epoch}"), "description":"当前实例悬浮窗的只读动效与窗口切换权限", "local":false,"windows":["floating"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-get-floating-model","allow-return-to-workbench","allow-start-floating-drag","core:event:allow-listen","core:event:allow-unlisten"]})
+}
+
+/// floating_publisher_capability（悬浮窗状态发布权限）：主窗口只能更新浮窗展示快照。
+fn floating_publisher_capability(normalized_origin: &str, epoch: u64) -> serde_json::Value {
+    serde_json::json!({"identifier":format!("owned-floating-publisher-{epoch}"), "description":"当前实例主工作台的悬浮窗动效发布权限", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-publish-floating-model"]})
 }
 
 struct Desktop {
@@ -119,6 +131,12 @@ struct Desktop {
     stopping: AtomicBool,
     stopped: AtomicBool,
     tray: AtomicBool,
+    floating_mode: AtomicBool, // floating_mode（是否正在以悬浮窗呈现）。
+    floating_ready: AtomicBool, // floating_ready（悬浮窗页面是否已加载）。
+    floating_transition: Mutex<()>, // floating_transition（模式切换互斥锁）。
+    floating_revision: AtomicU64, // floating_revision（快照递增版本）。
+    floating_model: Mutex<serde_json::Value>, // floating_model（最近一次语音动效快照）。
+    floating_menu: Mutex<Option<CheckMenuItem<tauri::Wry>>>, // floating_menu（托盘悬浮窗勾选项）。
 }
 
 impl Desktop {
@@ -154,6 +172,13 @@ impl Desktop {
         }
     }
 
+    fn allows_floating_url(&self, url: &tauri::Url) -> bool {
+        self.mode == FrontendMode::Product
+            && self.origin.lock().unwrap().as_deref()
+                == Some(url.origin().ascii_serialization().as_str())
+            && floating_page_url_allowed(url)
+    }
+
     fn is_settled_frontend_url(&self, url: &tauri::Url) -> bool {
         match self.mode {
             FrontendMode::Product => product_page_url_allowed(url),
@@ -173,6 +198,10 @@ impl Desktop {
     fn shutdown(self: &Arc<Self>, app: &tauri::AppHandle) {
         if self.stopping.swap(true, Ordering::SeqCst) {
             return;
+        }
+        self.floating_mode.store(false, Ordering::Release);
+        if let Some(floating) = app.get_webview_window("floating") {
+            let _ = floating.hide();
         }
         // exit motion（退出动画）：所有原生退出入口通知同一页面，后台回收同时进行。
         let motion_started = Instant::now(); // motion_started（一秒过渡的起始时刻）。
@@ -236,6 +265,174 @@ fn trusted(window: &WebviewWindow, state: &Desktop) -> Result<(), String> {
     } else {
         Err("页面地址不属于当前应用实例。".into())
     }
+}
+
+fn trusted_floating(window: &WebviewWindow, state: &Desktop) -> Result<(), String> {
+    if state.mode != FrontendMode::Product || window.label() != "floating" {
+        return Err("此窗口没有悬浮窗权限。".into());
+    }
+    let url = window.url().map_err(|error| error.to_string())?;
+    if !state.stopping.load(Ordering::Acquire) && state.allows_floating_url(&url)
+    {
+        Ok(())
+    } else {
+        Err("悬浮窗页面不属于当前应用实例。".into())
+    }
+}
+
+fn set_floating_menu_checked(state: &Desktop, checked: bool) {
+    if let Some(item) = state.floating_menu.lock().unwrap().as_ref() {
+        let _ = item.set_checked(checked);
+    }
+}
+
+fn emit_floating_model(app: &tauri::AppHandle, state: &Desktop) {
+    if app.get_webview_window("floating").is_none() {
+        return;
+    }
+    let model = state.floating_model.lock().unwrap().clone();
+    let _ = app.emit_to("floating", "voice-terminal:floating-model", model);
+}
+
+fn set_floating_mode(app: &tauri::AppHandle, state: &Desktop, enabled: bool) -> Result<(), String> {
+    let _transition = state.floating_transition.lock().map_err(|error| error.to_string())?;
+    if state.stopping.load(Ordering::Acquire) {
+        return Err("应用正在退出。".into());
+    }
+    if !enabled {
+        state.floating_mode.store(false, Ordering::Release);
+        set_floating_menu_checked(state, false);
+        if let Some(floating) = app.get_webview_window("floating") {
+            let _ = floating.hide();
+        }
+        if let Some(main) = app.get_webview_window("main").or_else(|| app.get_webview_window("startup")) {
+            let _ = main.show();
+            let _ = main.unminimize();
+            let _ = main.set_focus();
+        }
+        return Ok(());
+    }
+
+    if state.mode != FrontendMode::Product || state.origin.lock().unwrap().is_none() {
+        return Err("工作台尚未就绪，暂时无法打开悬浮窗。".into());
+    }
+    let main = app.get_webview_window("main").ok_or("主工作台窗口尚未建立。")?;
+    let floating = match app.get_webview_window("floating") {
+        Some(window) => window,
+        None => create_floating_window(app, state)?,
+    };
+    state.floating_mode.store(true, Ordering::Release);
+    set_floating_menu_checked(state, true);
+    if state.floating_ready.load(Ordering::Acquire) {
+        if let Err(error) = floating.show() {
+            state.floating_mode.store(false, Ordering::Release);
+            set_floating_menu_checked(state, false);
+            return Err(error.to_string());
+        }
+        if let Err(error) = main.hide() {
+            let _ = floating.hide();
+            state.floating_mode.store(false, Ordering::Release);
+            set_floating_menu_checked(state, false);
+            return Err(error.to_string());
+        }
+        emit_floating_model(app, state);
+    }
+    Ok(())
+}
+
+fn create_floating_window(app: &tauri::AppHandle, state: &Desktop) -> Result<WebviewWindow, String> {
+    let origin = state.origin.lock().map_err(|error| error.to_string())?.clone()
+        .ok_or("工作台尚未建立受控界面来源。")?;
+    let url = format!("{origin}/floating.html").parse::<tauri::Url>().map_err(|error| error.to_string())?;
+    let navigation_state = app.state::<Arc<Desktop>>().inner().clone();
+    let page_state = navigation_state.clone();
+    let window = WebviewWindowBuilder::new(app, "floating", WebviewUrl::External(url))
+        .title("Voice Terminal · 悬浮窗")
+        .inner_size(300., 282.)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .visible(false)
+        .data_directory(state.context().map(|context| context.install.join("cache/webview2")).unwrap_or_else(|| state.data.clone()))
+        .on_navigation(move |url| {
+            navigation_state.allows_floating_url(url)
+        })
+        .on_page_load(move |window, payload| {
+            if payload.event() != PageLoadEvent::Finished
+                || payload.url().path() != "/floating.html"
+                || !page_state.allows_floating_url(payload.url())
+            {
+                return;
+            }
+            page_state.floating_ready.store(true, Ordering::Release);
+            if page_state.floating_mode.load(Ordering::Acquire) && !page_state.stopping.load(Ordering::Acquire) {
+                if window.show().is_ok() {
+                    if let Some(main) = window.app_handle().get_webview_window("main") {
+                        let _ = main.hide();
+                    }
+                    emit_floating_model(window.app_handle(), &page_state);
+                } else {
+                    let _ = set_floating_mode(window.app_handle(), &page_state, false);
+                }
+            }
+        })
+        .build()
+        .map_err(|error| error.to_string())?;
+    Ok(window)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn publish_floating_model(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<Arc<Desktop>>,
+    model: serde_json::Value,
+) -> Result<(), String> {
+    require_command(state.mode, DesktopCommand::PublishFloatingModel)?;
+    trusted(&window, &state)?;
+    if window.label() != "main" {
+        return Err("只有主工作台可以发布悬浮窗状态。".into());
+    }
+    let status = model.get("state").and_then(serde_json::Value::as_str)
+        .filter(|value| ["standby", "listening", "thinking", "speaking", "offline", "error"].contains(value))
+        .ok_or("悬浮窗运行状态无效。")?;
+    let session_active = model.get("sessionActive").and_then(serde_json::Value::as_bool)
+        .ok_or("悬浮窗会话状态无效。")?;
+    let levels = model.get("audioLevels").and_then(serde_json::Value::as_array)
+        .filter(|levels| levels.len() == 5).ok_or("悬浮窗音量数据无效。")?;
+    let normalized_levels = levels.iter().map(|level| {
+        level.as_f64().filter(|value| value.is_finite())
+            .map(|value| value.clamp(0.0, 1.0)).ok_or("悬浮窗音量数据无效。")
+    }).collect::<Result<Vec<_>, _>>()?;
+    let revision = state.floating_revision.fetch_add(1, Ordering::AcqRel) + 1;
+    let projection = serde_json::json!({
+        "revision": revision,
+        "state": status,
+        "sessionActive": session_active,
+        "audioLevels": normalized_levels,
+    });
+    *state.floating_model.lock().map_err(|error| error.to_string())? = projection.clone();
+    let _ = app.emit_to("floating", "voice-terminal:floating-model", projection);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_floating_model(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<serde_json::Value, String> {
+    trusted_floating(&window, &state)?;
+    Ok(state.floating_model.lock().map_err(|error| error.to_string())?.clone())
+}
+
+#[tauri::command]
+fn return_to_workbench(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<(), String> {
+    trusted_floating(&window, &state)?;
+    set_floating_mode(&window.app_handle(), &state, false)
+}
+
+#[tauri::command]
+fn start_floating_drag(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<(), String> {
+    trusted_floating(&window, &state)?;
+    window.start_dragging().map_err(|error| error.to_string())
 }
 #[tauri::command]
 fn desktop_status(
@@ -398,6 +595,9 @@ async fn workspace_link(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>
 async fn workspace_migrate(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>,app:tauri::AppHandle,target_root:String)->Result<serde_json::Value,String>{workspace_operation(window,state.inner().clone(),app,target_root,"migrate").await}
 
 fn show(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<Arc<Desktop>>() {
+        let _ = set_floating_mode(app, state.inner(), false);
+    }
     if let Some(window) = app.get_webview_window("main").or_else(||app.get_webview_window("startup")) {
         let _ = window.show();
         let _ = window.unminimize();
@@ -448,6 +648,10 @@ fn product_entry_url_allowed(url: &tauri::Url, token: Option<&str>) -> bool {
 fn product_page_url_allowed(url: &tauri::Url) -> bool {
     page_url_allowed(url, "/", &["page", "settings"])
         || page_url_allowed(url, "/index.html", &["page", "settings"])
+}
+
+fn floating_page_url_allowed(url: &tauri::Url) -> bool {
+    page_url_allowed(url, "/floating.html", &[])
 }
 
 fn preview_entry_url_allowed(url: &tauri::Url, token: Option<&str>) -> bool {
@@ -752,6 +956,18 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
                             Some(format!("页面权限配置失败：{error}"));
                         break;
                     }
+                    if read_state.mode == FrontendMode::Product {
+                        if let Err(error) = read_app.add_capability(floating_capability(&normalized_origin, epoch).to_string()) {
+                            *read_state.error.lock().unwrap() =
+                                Some(format!("悬浮窗权限配置失败：{error}"));
+                            break;
+                        }
+                        if let Err(error) = read_app.add_capability(floating_publisher_capability(&normalized_origin, epoch).to_string()) {
+                            *read_state.error.lock().unwrap() =
+                                Some(format!("悬浮窗状态发布权限配置失败：{error}"));
+                            break;
+                        }
+                    }
                     *read_state.launch_token.lock().unwrap() = Some(token.into());
                     *read_state.origin.lock().unwrap() = Some(normalized_origin);
                     if let Some(window) = read_app.get_webview_window("main") {
@@ -932,6 +1148,12 @@ fn run() -> Result<(), String> {
         stopping: AtomicBool::new(false),
         stopped: AtomicBool::new(false),
         tray: AtomicBool::new(false),
+        floating_mode: AtomicBool::new(false),
+        floating_ready: AtomicBool::new(false),
+        floating_transition: Mutex::new(()),
+        floating_revision: AtomicU64::new(0),
+        floating_model: Mutex::new(serde_json::json!({"revision":0,"state":"standby","sessionActive":false,"audioLevels":[0,0,0,0,0]})),
+        floating_menu: Mutex::new(None),
     });
     // qualification-exit（验收正常退出）只接受独立验收配置，沿用实例自己的退出流程。
     let qualification_control = cfg!(feature = "qualification")
@@ -957,6 +1179,7 @@ fn run() -> Result<(), String> {
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
             desktop_status,desktop_page_ready,
+            publish_floating_model,get_floating_model,return_to_workbench,start_floating_drag,
             skip_startup,
             open_logs,
             open_console,
@@ -980,16 +1203,28 @@ fn run() -> Result<(), String> {
             create_window(app.handle(),build_state.clone(),false).map_err(std::io::Error::other)?;
             if build_state.mode == FrontendMode::Product {
                 let show_item = MenuItem::with_id(app, "show", "打开工作台", true, None::<&str>)?;
+                let floating_item = CheckMenuItem::with_id(app, "floating", "悬浮窗模式", true, false, None::<&str>)?;
                 let exit_item = MenuItem::with_id(app, "exit", "退出应用", true, None::<&str>)?;
-                let menu = Menu::with_items(app, &[&show_item, &exit_item])?;
+                let menu = Menu::with_items(app, &[&show_item, &floating_item, &exit_item])?;
+                *build_state.floating_menu.lock().unwrap() = Some(floating_item);
                 let icon = app_icon::tray();
                 let exit_state = build_state.clone();
+                let floating_state = build_state.clone();
                 let tray = TrayIconBuilder::with_id("voice-terminal")
                     .icon(icon)
                     .tooltip("Voice Terminal · 语音终端")
                     .menu(&menu)
                     .on_menu_event(move |app, event| match event.id.as_ref() {
                         "show" => show(app),
+                        "floating" => {
+                            let enabled = !floating_state.floating_mode.load(Ordering::Acquire);
+                            if let Err(error) = set_floating_mode(app, &floating_state, enabled) {
+                                set_floating_menu_checked(&floating_state, false);
+                                if enabled {
+                                    let _ = app.emit_to("main", "voice-terminal:floating-error", error);
+                                }
+                            }
+                        }
                         "exit" => exit_state.shutdown(app),
                         _ => {}
                     })
@@ -1030,6 +1265,12 @@ fn run() -> Result<(), String> {
                         } else {
                             state.inner().shutdown(window.app_handle());
                         }
+                    }
+                } else if window.label() == "floating" {
+                    let state = window.state::<Arc<Desktop>>();
+                    if !state.stopped.load(Ordering::SeqCst) && !state.stopping.load(Ordering::SeqCst) {
+                        api.prevent_close();
+                        let _ = set_floating_mode(window.app_handle(), state.inner(), false);
                     }
                 }
             }
@@ -1072,6 +1313,7 @@ fn main() {
 mod tests {
     use super::{
         command_allowed, console_url, frontend_capability, frontend_entry_url, instance_identifier,
+        floating_capability, floating_page_url_allowed, floating_publisher_capability,
         preview_entry_url_allowed, preview_page_url_allowed, product_entry_url_allowed,
         product_page_url_allowed, request_service_start, require_command, ui_preview_context,
         valid_instance_id, valid_launch_token, DesktopCommand, FrontendMode,
@@ -1109,6 +1351,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn floating_window_commands_are_scoped_to_their_owned_windows_and_origin() {
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let authority = context.runtime_authority_mut();
+        let origin_text = "http://127.0.0.1:45001";
+        let origin = tauri::ipc::Origin::Remote {
+            url: tauri::Url::parse("http://127.0.0.1:45001/floating.html").unwrap(),
+        };
+        authority.add_capability(floating_capability(origin_text, 9).to_string()).unwrap();
+        authority.add_capability(floating_publisher_capability(origin_text, 9).to_string()).unwrap();
+
+        for command in ["get_floating_model", "return_to_workbench", "start_floating_drag"] {
+            assert!(authority.resolve_access(command, "floating", "floating", &origin).is_some(), "悬浮窗缺少受限权限：{command}");
+            assert!(authority.resolve_access(command, "main", "main", &origin).is_none(), "主窗口不应拥有悬浮窗专属权限：{command}");
+            let foreign = tauri::ipc::Origin::Remote { url: tauri::Url::parse("http://127.0.0.1:45002/floating.html").unwrap() };
+            assert!(authority.resolve_access(command, "floating", "floating", &foreign).is_none(), "其他来源不应拥有悬浮窗权限：{command}");
+        }
+        assert!(authority.resolve_access("publish_floating_model", "main", "main", &origin).is_some());
+        assert!(authority.resolve_access("publish_floating_model", "floating", "floating", &origin).is_none());
+        assert!(authority.resolve_access("exit_application", "floating", "floating", &origin).is_none());
     }
 
     #[test]
@@ -1250,6 +1514,9 @@ mod tests {
                 &tauri::Url::parse(address).unwrap()
             ));
         }
+        let floating_page = tauri::Url::parse("http://127.0.0.1:5173/floating.html").unwrap();
+        assert!(floating_page_url_allowed(&floating_page));
+        assert!(!product_page_url_allowed(&floating_page));
         for address in [
             "http://127.0.0.1:5173/other",
             "http://127.0.0.1:5173/?token=secret",

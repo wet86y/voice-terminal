@@ -1,5 +1,7 @@
 import { locateNativeInvoker } from '../runtime/desktop-preflight'
 import type { FixedModelCredentials } from './types'
+import type { FloatingWindowModel } from './floating-window'
+import type { VoiceOrbModel } from '../interface/voice-orb'
 
 /** WorkspaceInfo（工作区信息）：由原生启动器返回的当前数据归属。 */
 export interface WorkspaceInfo {
@@ -104,6 +106,16 @@ export interface DesktopPort {
   openConsole(url: string): Promise<void>
   /** exit（退出）：由桌面宿主关闭应用。 */
   exit(): Promise<void>;
+  /** publishFloatingModel（发布悬浮窗视图）：仅向本实例的浮窗发送限量动效数据。 */
+  publishFloatingModel?(model: VoiceOrbModel): Promise<void>
+  /** getFloatingModel（读取悬浮窗视图）：返回原生宿主保存的最新动效快照。 */
+  getFloatingModel?(): Promise<FloatingWindowModel>
+  /** returnToWorkbench（切回工作台）：仅悬浮窗可调用。 */
+  returnToWorkbench?(): Promise<void>
+  /** startFloatingDrag（拖动悬浮窗）：仅悬浮窗可调用。 */
+  startFloatingDrag?(): Promise<void>
+  /** listen（订阅桌面事件）：仅接收当前原生窗口获准的事件。 */
+  listen?<T>(eventName: string, handler: (event: DesktopEvent<T>) => void): Promise<() => void>
 }
 
 /** DesktopWorkspacePort（桌面工作区扩展）：资源准备阶段直接由原生入口提供。 */
@@ -202,6 +214,10 @@ export function desktopPort(): DesktopPort {
     openLogs: () => call('open_logs'),
     openConsole: url => call('open_console', { url }),
     exit: () => call('exit_application'),
+    publishFloatingModel: model => call('publish_floating_model', { model }),
+    getFloatingModel: () => call<FloatingWindowModel>('get_floating_model'),
+    returnToWorkbench: () => call('return_to_workbench'),
+    startFloatingDrag: () => call('start_floating_drag'),
     workspaceInfo: () => call<WorkspaceInfo>('workspace_info'),
     chooseWorkspace: () => call<WorkspaceChoice | null>('workspace_choose'),
     linkWorkspace: targetRoot => call<{ job_id: string }>('workspace_link', { target_root: targetRoot }),

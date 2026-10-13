@@ -1069,6 +1069,10 @@ time {
   --orb-size: 146px;
   --wave-height: 42px;
 }
+.orb-stage.session-active {
+  --orb-size: 146px;
+  --wave-height: 42px;
+}
 .orb-ring,
 .voice-orb {
   /* 三层共用角度、圆角和音量缩放，始终围绕同一中心变化。 */

@@ -29,6 +29,7 @@ export default defineConfig({
       input: {
         index: resolve(__dirname, 'index.html'),
         management: resolve(__dirname, 'management.html'), // management（无后端的本地组件管理入口）。
+        floating: resolve(__dirname, 'floating.html'), // floating（桌面悬浮窗的只读呈现入口）。
       },
     },
   },

@@ -4,6 +4,7 @@ import type { WorkbenchModel } from "./workbench";
 import type { ReasoningMode } from "../types";
 import UiButton from "./UiButton.vue";
 import ConversationMessage from "./ConversationMessage.vue";
+import VoiceOrb from "./VoiceOrb.vue";
 const props = defineProps<{
   model: WorkbenchModel; // model（工作台呈现数据）。
   consoleEnabled?: boolean; // consoleEnabled（代理控制台是否可用）。
@@ -47,12 +48,6 @@ const runtimeLabels: Record<string, string> = { // runtimeLabels（运行状态�
   standby: '等待中', listening: '聆听中', thinking: '思考中', speaking: '说话中', offline: '已关闭', error: '需检查',
 };
 const runtimeLabel = computed(() => runtimeLabels[props.model.state] || '等待中');
-const waveformLevels = computed(() => Array.from({ length: 5 }, (_, index) => {
-  const level = props.model.audioLevels?.[index];
-  return sessionActive.value && ['listening', 'speaking'].includes(props.model.state) && typeof level === 'number' && Number.isFinite(level)
-    ? Math.max(0, Math.min(1, level)) : 0;
-}));
-const voiceEnergy = computed(() => waveformLevels.value.reduce((total, level) => total + level, 0) / 5);
 const latencyLabel = computed(() => props.model.latency.replace(/\bms\b/g, '毫秒'));
 const layoutAnimations = new Set<Animation>(); // layoutAnimations（当前启动或停止的布局动画）。
 let motionGeneration = 0; // motionGeneration（动效代次）：快速连续点击时取消过期动画。
@@ -247,15 +242,7 @@ onBeforeUnmount(() => {
       </header>
       <div class="voice-focus">
         <div class="voice-presentation">
-          <div class="orb-stage" :class="`orb-${model.state}`" :style="{ '--voice-energy': voiceEnergy }" aria-hidden="true">
-            <span class="orb-ring"></span><span class="orb-ring second"></span>
-            <!-- data-home-logo（主页图标定位标记）：启动动画读取中央主体的实际位置。 -->
-            <div class="voice-orb" data-home-logo>
-              <span class="voice-waveform">
-                <i v-for="(level, index) in waveformLevels" :key="index" :style="{ '--voice-level': level }"></i>
-              </span>
-            </div>
-          </div>
+          <VoiceOrb :model="{ state: model.state, sessionActive, audioLevels: model.audioLevels ?? [0, 0, 0, 0, 0] }" />
           <div class="voice-runtime-state" :class="`voice-state-${model.state}`" role="status" aria-live="polite" aria-atomic="true">
             <i></i><span>{{ runtimeLabel }}</span>
           </div>

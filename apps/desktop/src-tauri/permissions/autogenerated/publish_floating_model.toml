@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-publish-floating-model"
+description = "Enables the publish_floating_model command without any pre-configured scope."
+commands.allow = ["publish_floating_model"]
+
+[[permission]]
+identifier = "deny-publish-floating-model"
+description = "Denies the publish_floating_model command without any pre-configured scope."
+commands.deny = ["publish_floating_model"]

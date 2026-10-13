@@ -1,0 +1,32 @@
+html,
+body,
+#app {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+body {
+  background: #171a22;
+}
+
+.floating-window-shell {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: #171a22;
+  cursor: move;
+}
+
+.floating-window-shell > .orb-stage {
+  width: 100%;
+  height: 100%;
+  --orb-size: 140px;
+  --wave-height: 42px;
+}
+
+.floating-window-shell > .orb-stage.session-active {
+  --orb-size: 140px;
+}
