@@ -269,6 +269,9 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
 
     async def _wait_for_playback_permission(self, ws, token):
         """Wait while user speech owns the pre-playback output boundary."""
+        wait_wake = getattr(self.controller, "_wait_for_wake_output", None)
+        if callable(wait_wake):
+            await wait_wake(ws.turn_id)
         if getattr(self.runtime, "should_defer_speech", lambda: False)():
             raise PassiveQuietSuppressed()
         while self._valid(token):
@@ -1016,6 +1019,12 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
                 getattr(getattr(self.controller, "state", None), "latency", {}).get("values") or {}
             )
             settled_latency.update({
+                "wake_to_cue_first_pcm_ms": elapsed("wake_detected", "wake_cue_first_pcm"),  # 命中到提示音首帧。
+                "wake_to_llm_request_ms": elapsed("wake_detected", "llm_request"),  # 命中到模型请求。
+                "wake_to_asr_ready_ms": elapsed("wake_detected", "wake_asr_ready"),  # 命中到识别服务就绪。
+                "wake_to_buffer_drained_ms": elapsed("wake_detected", "wake_buffer_drained"),  # 命中到缓存回放完成。
+                "wake_to_tts_prewarm_ms": elapsed("wake_detected", "tts_prewarm_requested"),  # 命中到合成预热请求。
+                "wake_to_confirmation_first_pcm_ms": elapsed("wake_detected", "first_pcm_submitted"),  # 命中到确认语首帧。
                 "llm_first_token_ms": elapsed("llm_request", "first_token"),
                 "llm_request_to_first_tts_text_ms": elapsed("llm_request", "first_tts_text"),
                 "tts_text_to_first_audio_ms": elapsed("first_tts_text", "first_audio"),

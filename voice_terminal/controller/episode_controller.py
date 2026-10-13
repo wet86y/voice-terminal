@@ -356,6 +356,12 @@ class EpisodeController(RealtimeController):
                                       speaker_session=self.speaker_policy.snapshot()))
 
     async def _on_kws_activated(self, source_id: str, generation: int) -> bool:
+        wake = getattr(self, "_wake_preparation", None)
+        if (generation != self._activation_generation or not self.state.listening
+                or source_id in getattr(self.episode, "_invalid_kws_wakes", ())):
+            return False
+        if wake is not None and (wake.source_id != source_id or not self._wake_preparation_valid(wake)):
+            return False
         self._ensure_speaker_policy()
         self.speaker_policy.activate("kws")
         quiet = getattr(self, "quiet_policy", None)
@@ -364,6 +370,7 @@ class EpisodeController(RealtimeController):
         try:
             await self.episode.schedule_system_check(
                 "kws_wake", source_id, arm_silence=True,
+                immediate_dispatch=True,
                 controller_generation=generation,
             )
         except Exception as exc:
@@ -1345,6 +1352,12 @@ class EpisodeController(RealtimeController):
         self._reset_vad_pending = True
 
     def _on_playback_started(self, key):
+        wake = getattr(self, "_wake_preparation", None)
+        if wake is not None and key == f"cue-{wake.source_id}":
+            wake.workspace.timings.setdefault("wake_cue_first_pcm", time.monotonic())
+            logger.info("controller.wake_cue_started source_id=%s delay_ms=%.3f",
+                        wake.source_id, (time.monotonic() - wake.workspace.timings["wake_detected"]) * 1000)
+            return
         self.output.playback_started(key)
 
     async def _handle_asr_disconnect(self):
@@ -1354,6 +1367,7 @@ class EpisodeController(RealtimeController):
 
     async def _error(self, code, message, *, recoverable, turn_id=None):
         if not recoverable or code == "AUDIO_PIPELINE_FAILED":
+            await self._cancel_wake_preparation()
             if self.workspace is not None:
                 await self._cancel_turn(reason="failed", record=True)
             await self.episode.end("fatal_error")
@@ -1394,7 +1408,17 @@ class EpisodeController(RealtimeController):
 
     async def reset_session(self):
         """End the active Agent task while keeping microphone listening alive."""
+        self._input_resetting = True  # 重置期间暂停音频准入，采集循环仍继续消耗帧。
+        try:
+            await self._reset_session_state()
+        finally:
+            self._input_resetting = False
+
+    async def _reset_session_state(self):
+        """在音频准入暂停期间完成会话及输入边界清理。"""
         self._ensure_speaker_policy()
+        self._activation_generation = getattr(self, "_activation_generation", 0) + 1
+        await self._cancel_wake_preparation()
         await self._cancel_early_silence()
         if self.workspace is not None:
             await self._cancel_turn(reason="reset", record=True)
@@ -1430,7 +1454,10 @@ class EpisodeController(RealtimeController):
         await self._state_event(TerminalState.IDLE, listening=self.state.listening)
 
     async def close(self):
+        self._input_resetting = True  # 关闭期间不允许建立新的用户输入。
         self._ensure_speaker_policy()
+        self._activation_generation = getattr(self, "_activation_generation", 0) + 1
+        await self._cancel_wake_preparation()
         if self.workspace is not None:
             await self._cancel_turn(reason="stopped", record=True)
         self.speaker_policy.clear()

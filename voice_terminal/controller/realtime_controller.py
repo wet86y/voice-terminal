@@ -390,9 +390,22 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         return meta
 
 
-    async def handle_frame(self, frame: AudioFrame) -> None:
+    async def handle_frame(self, frame: AudioFrame, *, _wake_replay: bool = False) -> None:
+        if getattr(self, "_input_resetting", False):
+            return
         if not hasattr(self, "_vad_generation"):
             self._vad_generation = 0
+        processed = (
+            await asyncio.to_thread(self._process_audio, frame.pcm)
+            if not _wake_replay and self.audio_processor is not None and self.audio_processor.enabled
+            else frame.pcm
+        )
+        if processed != frame.pcm:
+            frame = AudioFrame(processed, frame.start_sample, frame.captured_at)
+        if getattr(self, "_input_resetting", False):
+            return  # 原生音频处理等待期间可能开始重置。
+        if not _wake_replay and await self._buffer_wake_frame(frame):
+            return
         expected_start_sample = self._last_frame.end_sample if self._last_frame else None
         if self._asr_queue_overflow:
             await self._recover_input_continuity(
@@ -408,16 +421,19 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                 expected_start_sample=expected_start_sample,
             )
             return
-        processed = (
-            await asyncio.to_thread(self._process_audio, frame.pcm)
-            if self.audio_processor is not None and self.audio_processor.enabled
-            else frame.pcm
-        )
-        if processed != frame.pcm:
-            frame = AudioFrame(processed, frame.start_sample, frame.captured_at)
         always_on = bool(getattr(self, "wake_always_on", False))
         if always_on:
             if self.state.input_owner == "kws":
+                recent = getattr(self, "_kws_recent", None)
+                if recent is None:
+                    recent = self._kws_recent = deque()  # 保留检测线程落后期间的连续音频。
+                if recent and recent[-1].end_sample != frame.start_sample:
+                    self.kws.reset()
+                    recent.clear()
+                    logger.warning("controller.kws_capture_gap start_sample=%s", frame.start_sample)
+                recent.append(frame)
+                while recent and frame.end_sample - recent[0].start_sample > 16000 * 8:
+                    recent.popleft()
                 if getattr(self, "speaker_sensor", None) is not None:
                     self.speaker_sensor.submit_frame(
                         frame.pcm, start_sample=frame.start_sample, speech=None,
@@ -433,8 +449,9 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                     end_sample=frame.end_sample,
                     captured_at=frame.captured_at,
                 ))
-                if self.kws.poll() is not None:
-                    await self._activate_kws_detection()
+                detection = self.kws.poll()
+                if detection is not None:
+                    await self._activate_kws_detection(detection)
                 return
             if self.state.input_owner != "asr":
                 return
@@ -461,7 +478,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             self._reset_vad_pending = False
         generation = self._vad_generation
         activity = await asyncio.to_thread(self.vad.feed, frame.pcm)
-        if generation != self._vad_generation:
+        if generation != self._vad_generation or getattr(self, "_input_resetting", False):
             return  # Turn was cancelled while native VAD was running.
         if getattr(self, "speaker_sensor", None) is not None:
             output = getattr(self,"output",None)
@@ -502,7 +519,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
                 self._queue_asr(AudioChunk(self._sub_id, frame.pcm))
 
         activity = await self._observe_activity(activity, frame)
-        if activity is None:
+        if activity is None or getattr(self, "_input_resetting", False):
             return
         ws = self.workspace
         if ws is None:
@@ -678,6 +695,8 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         # 均表示输出仍拥有许可与音频队列；只有明确取消或打断才停止该输出。
         output = getattr(self, "output", None)
         owns_playback = bool(getattr(output, "busy", False) or getattr(output, "playback_hold_active", False))
+        wake = getattr(self, "_wake_preparation", None)
+        owns_playback = owns_playback or bool(wake is not None and not wake.cue_done.is_set())
         if self.player and not owns_playback:
             self.player.block()
         await self._detail("turn.started")
@@ -960,6 +979,12 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self._sub_parts[sub_id] = text or self._sub_parts[sub_id]
         ws = self.workspace
         if text and text.strip():
+            wake = getattr(self, "_wake_preparation", None)
+            if wake is not None and not wake.prewarm_released and wake.source_id != ws.turn_id:
+                wake.prewarm_released = True
+                await self._cancel_tts_prewarm(wake.source_id)
+                if self.workspace is not ws:
+                    return  # 预热清理期间发生输入取消，不为旧回合重启任务。
             ws.timings.setdefault("asr_first_text", time.monotonic())
             # The first non-empty local ASR result is the earliest reliable
             # signal that this turn may need an answer.  Start the Bidi
@@ -1191,6 +1216,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self._reset_vad_pending = True
 
     async def stop_listening(self) -> None:
+        await self._cancel_wake_preparation()
         self._activation_generation += 1
         recovery = self._asr_recovery_task
         if recovery is not None and recovery is not asyncio.current_task() and not recovery.done():
