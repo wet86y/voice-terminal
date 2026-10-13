@@ -21,6 +21,7 @@ from voice_terminal.config import AppConfig, PersonaConfig
 from voice_terminal.core.state import RuntimeState
 from voice_terminal.speaker.client import SpeakerWorkerError
 from voice_terminal.server.websocket import SessionRuntime
+from voice_terminal.vad.barge_in import BargeInGate
 
 
 def _snapshot(identity, *, start=0, end=32_000, completed_at=None):
@@ -430,6 +431,9 @@ def test_owner_barge_requires_current_candidate_owner_before_stop():
         # from that candidate may authorize the next interruption.
         controller._owner_barge_expired = False
         controller._speaker_snapshot = None
+        controller.barge_in_gate = BargeInGate()
+        controller.barge_in_gate.prime(1.0)
+        decision = controller.barge_in_gate.feed(activity, now=1.0, near_voice=True)
         await controller._observe_owner_barge(
             activity, SimpleNamespace(start_sample=0, end_sample=16_000, captured_at=1.0),
             handle, progress, decision,
@@ -437,8 +441,25 @@ def test_owner_barge_requires_current_candidate_owner_before_stop():
         candidate = controller._owner_barge_candidate_id
         controller._speaker_snapshot = _snapshot(RollingSpeakerIdentity.OWNER)
         controller._speaker_snapshot_barge_id = candidate
+        decision = controller.barge_in_gate.feed(activity, now=1.25, near_voice=True)
         await controller._observe_owner_barge(
-            activity, SimpleNamespace(start_sample=16_000, end_sample=32_000, captured_at=2.0),
+            activity, SimpleNamespace(start_sample=16_000, end_sample=32_000, captured_at=1.25),
+            handle, progress, decision,
+        )
+        assert "stop" not in calls  # 主人已确认，但未达到 500 毫秒不能打断。
+        owner_snapshot = controller._speaker_snapshot
+        controller._speaker_snapshot = None
+        decision = controller.barge_in_gate.feed(activity, now=1.5, near_voice=True)
+        await controller._observe_owner_barge(
+            activity, SimpleNamespace(start_sample=16_000, end_sample=32_000, captured_at=1.5),
+            handle, progress, decision,
+        )
+        assert decision.confirmed
+        assert "stop" not in calls  # 满 500 毫秒后仍须等待当前候选的主人确认。
+        controller._speaker_snapshot = owner_snapshot
+        decision = controller.barge_in_gate.feed(activity, now=1.75, near_voice=True)
+        await controller._observe_owner_barge(
+            activity, SimpleNamespace(start_sample=16_000, end_sample=32_000, captured_at=1.75),
             handle, progress, decision,
         )
         assert calls.index("stop") < calls.index("speech")

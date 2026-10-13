@@ -585,7 +585,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             bridge_breaks=self.config.text_bridge.preferred_breaks,
             audio_processor=self.audio_processor,
             aec_failure_policy=self.config.audio.aec_failure_policy,
-            barge_in_gate=BargeInGate(min_speech_ms=max(250, self.config.vad.min_speech_ms), enabled=True),
+            barge_in_gate=BargeInGate(enabled=True),
             conversation=self.conversation,
             speaker_client=self.speaker,
             speaker_router=self.speaker_router,

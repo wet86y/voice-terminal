@@ -40,7 +40,7 @@ class InputController:
         self.llm, self.tts, self.player = llm, tts, player
         self.audio_processor = audio_processor
         self.aec_failure_policy = aec_failure_policy
-        self.barge_in_gate = barge_in_gate or BargeInGate(min_speech_ms=max(250, vad_min_speech_ms), enabled=True)
+        self.barge_in_gate = barge_in_gate or BargeInGate(enabled=True)
         self.wake_enabled, self.wake_keyword, self.wake_preroll_ms = wake_enabled, wake_keyword, wake_preroll_ms
         # Every configured spelling is stripped from a transcript; ``wake_keyword``
         # stays the primary phrase for older fixtures and display.
