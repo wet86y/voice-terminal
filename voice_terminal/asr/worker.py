@@ -35,7 +35,7 @@ class AsrWorkerEngine:
         model_dir: Path,
         device: str,
         sample_rate: int = 16000,
-        chunk_size: tuple[int, int, int] = (0, 10, 5),
+        chunk_size: tuple[int, int, int] = (0, 8, 4),  # chunk_size（分块配置）：480 毫秒输入、240 毫秒前瞻。
         encoder_chunk_look_back: int = 4,
         decoder_chunk_look_back: int = 1,
         fallback_device: str = "cpu",
@@ -78,14 +78,13 @@ class AsrWorkerEngine:
 
     @property
     def chunk_stride_samples(self) -> int:
-        """Return FunASR's streaming input window in samples.
+        """chunk_stride_samples（模型输入窗口采样数）。
 
-        FunASR documents ``chunk_size[1] * 960`` as the input stride for
-        paraformer-zh-streaming.  With the default ``[0, 10, 5]`` config at
-        16 kHz this is 9,600 samples, or 600 ms of mono PCM.
+        Paraformer（流式识别模型）在 16 千赫兹时使用 chunk_size[1] * 960
+        作为输入步长；默认 [0, 8, 4] 对应 7,680 个采样点，即 480 毫秒。
         """
 
-        middle_chunks = self.chunk_size[1] if len(self.chunk_size) > 1 else 10
+        middle_chunks = self.chunk_size[1] if len(self.chunk_size) > 1 else 8
         return max(1, int(self.sample_rate * middle_chunks * 60 / 1000))
 
     @property
@@ -326,7 +325,7 @@ class AsrWorkerEngine:
         else:
             # Microphone callbacks arrive every 20 ms, while FunASR's
             # paraformer streaming API expects a much larger model window
-            # (600 ms with the default [0, 10, 5] setting).
+            # chunk_size（分块配置）默认 [0, 8, 4]，对应 480 毫秒输入窗口。
             while len(pending) >= self.chunk_stride_bytes:
                 window = bytes(pending[: self.chunk_stride_bytes])
                 del pending[: self.chunk_stride_bytes]
