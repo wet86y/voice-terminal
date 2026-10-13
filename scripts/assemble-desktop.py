@@ -92,7 +92,7 @@ def archive(root: Path, destination: Path, *, exclude_roots=(), include_roots=()
 
 
 def collect_frontend(source: Path, target: Path) -> None:
-    """只收集单个产品入口的构建闭包，拒绝样例、陈旧文件及开发资源。"""
+    """只收集正式主界面、管理页和悬浮窗的构建闭包，拒绝样例及陈旧文件。"""
     manifest_path = source / "desktop-manifest.json"
     if not manifest_path.is_file():
         raise ValueError("缺少界面产物清单，请执行 npm run frontend:build（静态界面构建）。")
@@ -100,9 +100,9 @@ def collect_frontend(source: Path, target: Path) -> None:
     if not isinstance(records, dict) or not records:
         raise ValueError("界面产物清单无效。")
     entries = [key for key, row in records.items() if isinstance(row, dict) and row.get("isEntry")]
-    if set(entries) != {"index.html", "management.html"}:
-        raise ValueError("正式界面必须只有产品入口，不能包含样例页面。")
-    allowed = {"index.html", "management.html", "startup.html", "startup.css", "app-icon.svg", "desktop-manifest.json"}
+    if set(entries) != {"index.html", "management.html", "floating.html"}:
+        raise ValueError("正式界面入口集合必须是产品、管理和悬浮窗页面，不能包含样例页面。")
+    allowed = {"index.html", "management.html", "floating.html", "startup.html", "startup.css", "app-icon.svg", "desktop-manifest.json"}
     visited = set()
 
     def visit(key):
@@ -125,6 +125,7 @@ def collect_frontend(source: Path, target: Path) -> None:
 
     visit("index.html")
     visit("management.html")
+    visit("floating.html")
     actual = {path.relative_to(source).as_posix() for path in files(source)}
     if actual != allowed:
         raise ValueError("界面产物存在缺失、样例或陈旧文件，请重新构建。")

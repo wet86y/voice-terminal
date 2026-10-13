@@ -13,6 +13,7 @@ fn main() {
             "open_console",
             "exit_application",
             "focus_main",
+            "publish_floating_model", "get_floating_model", "return_to_workbench", "start_floating_drag",
             "workspace_info", "workspace_choose", "workspace_link", "workspace_migrate",
             "resource_inventory", "resource_jobs", "resource_download", "resource_import", "resource_import_confirm", "resource_open_source", "resource_cancel",
         ]),

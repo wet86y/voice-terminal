@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onBeforeUnmount, watch } from 'vue';
 import { useProductControls } from "./useProductControls";
 import ApplicationStartup from "./ApplicationStartup.vue";
 import ApplicationMotion from './ApplicationMotion.vue';
@@ -18,6 +18,8 @@ import WorkspaceSettings from "./panels/WorkspaceSettings.vue";
 import ModelSettings from "./panels/ModelSettings.vue";
 import { provideProductContext } from "./product-context";
 import { useWorkspaceResources } from './useWorkspaceResources'
+import type { VoiceOrbModel } from '../interface/voice-orb'
+import { FLOATING_WINDOW_ERROR_EVENT } from './floating-window'
 
 const controls = useProductControls();
 const application = useApplicationHost();
@@ -44,6 +46,53 @@ const {
   decideDshApproval,
 } = controls;
 const desktop = desktopPort();
+let floatingErrorUnlisten: (() => void) | undefined;
+if (desktop.available && desktop.listen) {
+  void desktop.listen<string>(FLOATING_WINDOW_ERROR_EVENT, event => {
+    lastError.value = event.payload;
+  }).then(unlisten => { floatingErrorUnlisten = unlisten; }).catch(() => undefined);
+  onBeforeUnmount(() => floatingErrorUnlisten?.());
+}
+// floatingModel（悬浮窗投影）：主页面持有语音状态；悬浮窗只接收五频带动效快照。
+let floatingLatestModel: VoiceOrbModel | null = null;
+let floatingPublishTimer: ReturnType<typeof setTimeout> | undefined;
+let floatingPublishFailed = false;
+let firstFloatingModel = true;
+const floatingWatchSources = [
+  () => workbenchModel.value.state,
+  () => workbenchModel.value.sessionActive ?? ['listening', 'thinking', 'speaking'].includes(workbenchModel.value.state),
+  ...Array.from({ length: 5 }, (_, index) => () => workbenchModel.value.audioLevels?.[index] ?? 0),
+];
+function publishFloatingModel() {
+  if (!floatingLatestModel || !desktop.publishFloatingModel || floatingPublishFailed) return;
+  void desktop.publishFloatingModel(floatingLatestModel).catch((error: unknown) => {
+    floatingPublishFailed = true;
+    lastError.value = error instanceof Error ? error.message : '悬浮窗状态同步失败。';
+  });
+}
+if (desktop.available && desktop.publishFloatingModel) {
+  watch(floatingWatchSources, () => {
+    const state = workbenchModel.value.state;
+    floatingLatestModel = {
+      state,
+      sessionActive: workbenchModel.value.sessionActive ?? ['listening', 'thinking', 'speaking'].includes(state),
+      audioLevels: Array.from({ length: 5 }, (_, index) => workbenchModel.value.audioLevels?.[index] ?? 0),
+    };
+    if (firstFloatingModel) {
+      firstFloatingModel = false;
+      publishFloatingModel();
+      return;
+    }
+    if (floatingPublishTimer !== undefined) return;
+    floatingPublishTimer = setTimeout(() => {
+      floatingPublishTimer = undefined;
+      publishFloatingModel();
+    }, 34); // 34 毫秒（约 29.4 次/秒），确保不超过每秒 30 次。
+  }, { immediate: true, flush: 'post' });
+  onBeforeUnmount(() => {
+    if (floatingPublishTimer !== undefined) clearTimeout(floatingPublishTimer);
+  });
+}
 // resourceMaintenance（资源维护）：服务停机不等于应用退出，组件操作和下载进度继续可用。
 const resourceMaintenance = computed(() => workspaceResources.startingResources.value.size > 0
   || workspaceResources.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state)));

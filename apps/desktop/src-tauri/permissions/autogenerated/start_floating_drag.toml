@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-floating-drag"
+description = "Enables the start_floating_drag command without any pre-configured scope."
+commands.allow = ["start_floating_drag"]
+
+[[permission]]
+identifier = "deny-start-floating-drag"
+description = "Denies the start_floating_drag command without any pre-configured scope."
+commands.deny = ["start_floating_drag"]
