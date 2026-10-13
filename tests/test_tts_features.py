@@ -276,6 +276,31 @@ class TextAndDeliveryTests(unittest.TestCase):
 
 
 class BargeInTests(unittest.TestCase):
+    def test_playback_gate_is_independent_of_normal_input_minimum(self) -> None:
+        for input_minimum_ms in (250, 900):
+            controller = InputController(
+                state=SimpleNamespace(), bus=None, history=None, capture=None,
+                kws=None, vad=None, asr=None, llm=None, tts=None, player=None,
+                wake_enabled=False, wake_keyword="", wake_preroll_ms=1200,
+                vad_min_speech_ms=input_minimum_ms, vad_end_silence_ms=200,
+                max_turn_ms=15000, bridge_min_chars=1, bridge_max_chars=100,
+                bridge_max_wait_ms=1000, bridge_breaks="。",
+            )
+            self.assertEqual(controller.vad_min_speech_ms, input_minimum_ms)
+            self.assertEqual(controller.barge_in_gate.min_speech_ms, 500)
+
+    def test_default_gate_requires_500_ms_and_clears_short_candidate(self) -> None:
+        gate = BargeInGate()
+        gate.prime(0.0)
+        self.assertFalse(gate.feed(VadActivity(True, False, False), now=0.25, near_voice=True).confirmed)
+        self.assertFalse(gate.feed(VadActivity(True, False, False), now=0.49, near_voice=True).confirmed)
+        self.assertFalse(gate.feed(VadActivity(False, False, True), now=0.50, near_voice=True).candidate)
+        gate.prime(1.0)
+        self.assertFalse(gate.feed(VadActivity(True, False, False), now=1.25, near_voice=True).confirmed)
+        decision = gate.feed(VadActivity(True, False, False), now=1.50, near_voice=True)
+        self.assertTrue(decision.confirmed)
+        self.assertEqual(decision.duration_ms, 500)
+
     def test_gate_requires_sustained_processed_voice_and_protection(self) -> None:
         gate = BargeInGate(min_speech_ms=250)
         activity = VadActivity(True, True, False)

@@ -16,10 +16,10 @@ class BargeInDecision:
 class BargeInGate:
     """Confirm sustained near-end speech before interrupting playback."""
 
-    def __init__(self, *, min_speech_ms: int = 250, enabled: bool = True) -> None:
+    def __init__(self, *, min_speech_ms: int = 500, enabled: bool = True) -> None:
         if min_speech_ms <= 0:
             raise ValueError("min_speech_ms must be positive")
-        self.min_speech_ms = min_speech_ms
+        self.min_speech_ms = min_speech_ms  # min_speech_ms（播放打断最短有效人声毫秒数）：独立于普通输入门槛。
         self.enabled = enabled
         self._started_at: float | None = None
         self._last_at: float | None = None
@@ -93,8 +93,8 @@ class BargeInGate:
         # ``now`` is supplied by the capture loop, so elapsed wall time can
         # include a short VAD gap.  Count only intervals for which both the
         # current sample and the preceding observation were still speech;
-        # otherwise a noise pulse plus silence could satisfy the 250 ms wall
-        # clock without 200 ms of valid near-end voice.
+        # otherwise a noise pulse plus silence could satisfy the wall-clock
+        # threshold without enough valid near-end voice.
         if self._last_at is None:
             self._last_at = current
         elif is_speech and self._last_was_speech:
