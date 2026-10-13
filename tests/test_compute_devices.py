@@ -36,6 +36,8 @@ class ComputeDeviceTests(unittest.TestCase):
     def test_asr_gpu_warmup_failure_falls_back_before_becoming_ready(self) -> None:
         """权重加载成功但 CUDA（图形处理器加速）真实推理失败时回退。"""
         from voice_terminal.asr.worker import AsrWorkerEngine
+        engine = AsrWorkerEngine(model_dir=Path("."), device="cuda")
+        expected_warmup_samples = engine.chunk_stride_samples
         calls = []
         def factory(**options):
             device = options["device"]
@@ -43,10 +45,9 @@ class ComputeDeviceTests(unittest.TestCase):
             def generate(**kwargs):
                 if device == "cuda":
                     raise RuntimeError("CUDA kernel unavailable")
-                self.assertEqual(len(kwargs["input"]), 0 if kwargs["is_final"] else 9600)
+                self.assertEqual(len(kwargs["input"]), 0 if kwargs["is_final"] else expected_warmup_samples)
                 return []
             return SimpleNamespace(kwargs={"device": device}, generate=generate)
-        engine = AsrWorkerEngine(model_dir=Path("."), device="cuda")
         try:
             with (patch("voice_terminal.compute.startup_device", return_value="cuda"),
                   patch("funasr.AutoModel", side_effect=factory), patch("torch.cuda.empty_cache")):
