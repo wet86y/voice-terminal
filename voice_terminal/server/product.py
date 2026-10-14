@@ -23,18 +23,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 from ..speaker.settings import TUNING_DEFAULTS, validate_tuning
-from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig
+from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig, validate_tts_inference_steps
 from ..custom_instructions import validate_entries
 from ..asr.hotwords import DEFAULT_HOTWORDS, validate_hotwords
 from ..quiet_hours import QuietHoursConfig
 from ..core.events import utc_now_iso
+from ..tts.voices import safe_voice_diagnostic
 from ..kws.keywords import MAX_WAKE_KEYWORDS
 if TYPE_CHECKING:
     # ShadowEvent（代理事件）只用于类型标注；配置读取不加载整个代理运行环境。
     from ..shadow_agent.contracts import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 13
+PRODUCT_SETTINGS_SCHEMA_VERSION = 14
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -112,7 +113,10 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
         "hotwords": deepcopy(DEFAULT_HOTWORDS),  # hotwords（识别后热词设置）。
         "approvals": {"voice_confirmation_enabled": False, "continuous_enabled": False},  # approvals（审批确认偏好）。
         # TTS（语音合成）固定走在线 API（程序接口）；backend（运行后端）不再是产品设置。
-        "tts": {"backend": "minimax"},
+        "tts": {"backend": config.tts.backend, "local_model": config.tts.local_model,
+                "local_optimization": True, "acoustic_continuation": config.tts.acoustic_continuation,
+                "inference_steps_by_model": dict(config.tts.inference_steps_by_model),
+                "active_voice_by_model": {"voxcpm1": None, "voxcpm2": None}},
         "speaker": {
             **{key: getattr(config.speaker, key, value) for key, value in TUNING_DEFAULTS.items()},
             "mode": str(getattr(config.speaker, "mode", "off")),
@@ -168,6 +172,33 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
         raw = value.get(section)
         if isinstance(raw, Mapping):
             result[section].update({key: raw[key] for key in result[section] if key in raw})
+    for field in ("local_optimization", "acoustic_continuation"):
+        if not isinstance(result["tts"].get(field), bool):
+            result["tts"][field] = defaults["tts"][field]
+    try:
+        result["tts"]["inference_steps_by_model"] = validate_tts_inference_steps(
+            result["tts"]["inference_steps_by_model"], defaults["tts"]["inference_steps_by_model"],
+        )
+    except ValueError:
+        result["tts"]["inference_steps_by_model"] = dict(defaults["tts"]["inference_steps_by_model"])
+    if (not isinstance(result["tts"].get("local_model"), str)
+            or result["tts"].get("local_model") not in {"voxcpm1", "voxcpm2"}):
+        result["tts"]["local_model"] = defaults["tts"]["local_model"]
+    active_voices = result["tts"].get("active_voice_by_model")
+    normalized_active: dict[str, dict[str, Any] | None] = {"voxcpm1": None, "voxcpm2": None}
+    if isinstance(active_voices, Mapping):
+        for model in normalized_active:
+            selected = active_voices.get(model)
+            if (isinstance(selected, Mapping)
+                    and isinstance(selected.get("voice_id"), str)
+                    and selected.get("voice_id")
+                    and isinstance(selected.get("revision"), int)
+                    and not isinstance(selected.get("revision"), bool)
+                    and selected.get("revision") > 0):
+                normalized_active[model] = {
+                    "voice_id": selected["voice_id"], "revision": selected["revision"],
+                }
+    result["tts"]["active_voice_by_model"] = normalized_active
     try:
         result["custom_instructions"] = validate_entries(value.get("custom_instructions", []))
     except ValueError:
@@ -241,7 +272,9 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     if type(shadow.get("experimental_context_gate_enabled")) is not bool:
         shadow["experimental_context_gate_enabled"] = defaults["shadow"]["experimental_context_gate_enabled"]
     # 旧设置可能记录了 cosyvoice；合并后统一锁定 MiniMax API（在线语音接口）。
-    result["tts"]["backend"] = "minimax"
+    if result["tts"].get("backend") not in {"minimax", "voxcpm1"}:
+        result["tts"]["backend"] = defaults["tts"]["backend"]
+    result["tts"]["local_optimization"] = True
     speaker = result["speaker"]
     raw_speaker = value.get("speaker", {})
     if isinstance(raw_speaker, Mapping) and "continuity_relaxation" not in raw_speaker:
@@ -301,7 +334,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
         ("silence", ("seconds",)),
         ("shadow", ("experimental_context_gate_enabled",)),
         ("approvals", ("voice_confirmation_enabled", "continuous_enabled")),
-        ("tts", ("backend",)),
+        ("tts", ("backend", "local_model", "local_optimization", "acoustic_continuation", "inference_steps_by_model", "active_voice_by_model")),
         ("speaker", ("mode", "confirm_threshold", "continuity_threshold", "continuity_relaxation", "owner_only_barge_in")),
     ):
         section = value.get(section_name)
@@ -330,12 +363,31 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
                 )
             elif section_name == "wake" and field == "sensitivity":
                 invalid = invalid or type(candidate) is not int or not MIN_KWS_SENSITIVITY <= candidate <= MAX_KWS_SENSITIVITY
+            elif section_name == "tts" and field == "local_model":
+                invalid = invalid or not isinstance(candidate, str) or candidate not in {"voxcpm1", "voxcpm2"}
+            elif section_name == "tts" and field == "inference_steps_by_model":
+                try:
+                    validate_tts_inference_steps(candidate)
+                except ValueError:
+                    invalid = True
             elif section_name == "silence" and field == "seconds":
                 invalid = invalid or type(candidate) is not int or not MIN_SILENCE_SECONDS <= candidate <= MAX_SILENCE_SECONDS
             elif section_name == "shadow" and field == "experimental_context_gate_enabled":
                 invalid = invalid or type(candidate) is not bool
             elif section_name == "tts" and field == "backend":
-                invalid = invalid or candidate not in {"minimax", "cosyvoice"}
+                invalid = invalid or not isinstance(candidate, str) or candidate not in {"minimax", "voxcpm1", "cosyvoice"}
+            elif section_name == "tts" and field == "active_voice_by_model":
+                invalid = invalid or not isinstance(candidate, Mapping) or any(
+                    model not in {"voxcpm1", "voxcpm2"}
+                    or selected is not None and (
+                        not isinstance(selected, Mapping)
+                        or not isinstance(selected.get("voice_id"), str)
+                        or not selected.get("voice_id")
+                        or type(selected.get("revision")) is not int
+                        or selected.get("revision", 0) < 1
+                    )
+                    for model, selected in candidate.items()
+                )
             elif section_name == "speaker" and field == "mode":
                 invalid = invalid or candidate not in {"off", "observe", "filter"}
             elif section_name == "speaker" and field == "owner_only_barge_in":
@@ -494,7 +546,24 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
         continuity_relaxation=relaxation,
         **validate_tuning(speaker, continuity=max(0.0, confirm_threshold-relaxation)),
     )
-    next_tts = replace(config.tts, backend="minimax", provider="minimax")
+    tts = settings.get("tts") if isinstance(settings.get("tts"), Mapping) else {}
+    backend = tts.get("backend", config.tts.backend)
+    if not isinstance(backend, str) or backend not in {"minimax", "voxcpm1"}:
+        backend = config.tts.backend
+    local_model = tts.get("local_model", config.tts.local_model)
+    if not isinstance(local_model, str) or local_model not in {"voxcpm1", "voxcpm2"}:
+        local_model = config.tts.local_model
+    next_tts = replace(
+        config.tts,
+        backend=backend,
+        sample_rate=16000 if backend == "voxcpm1" else config.tts.sample_rate,
+        provider="minimax",
+        local_model=str(local_model),
+        local_optimization=tts.get("local_optimization", config.tts.local_optimization),
+        acoustic_continuation=tts.get("acoustic_continuation", config.tts.acoustic_continuation),
+        inference_steps_by_model=tts.get("inference_steps_by_model", config.tts.inference_steps_by_model),
+
+    )
     next_compute = ComputeConfig(
         devices={**ComputeConfig().devices,
                  **(compute.get("devices") if isinstance(compute.get("devices"), Mapping) else {})},
@@ -564,7 +633,7 @@ class ProductSettingsStore:
         return merged
 
     def snapshot(self) -> dict[str, Any]:
-        value = deepcopy(self._settings)
+        value = self.settings_only()
         if self._malformed_schema_marker:
             value["schema_version"] = 2
         value["persona"] = self.read_persona()
@@ -572,7 +641,11 @@ class ProductSettingsStore:
         return value
 
     def settings_only(self) -> dict[str, Any]:
-        return deepcopy(self._settings)
+        result = deepcopy(self._settings)
+        selections = getattr(self, "_tts_voice_selections", None)
+        if selections:
+            result["tts"]["active_voice_by_model"] = selections()
+        return result
 
     def save_hotwords(self, payload: dict) -> dict:
         """save_hotwords（保存热词）：写入失败不改变内存配置。"""
@@ -588,6 +661,64 @@ class ProductSettingsStore:
             self._settings = previous
             raise
         return deepcopy(value)
+
+    def save_tts_local_model(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """在运行切换成功后保存 backend（语音后端）及 local_model（本地模型）。"""
+        if not payload or set(payload) - {"backend", "local_model", "local_optimization", "acoustic_continuation", "inference_steps_by_model"}:
+            raise ProductSettingsError(
+                "TTS 设置仅接受 backend（语音后端）和 local_model（本地语音合成模型）。"
+            )
+        model = payload.get("local_model", self._settings["tts"]["local_model"])
+        if not isinstance(model, str) or model not in {"voxcpm1", "voxcpm2"}:
+            raise ProductSettingsError(
+                "local_model（本地语音合成模型）必须为 voxcpm1 或 voxcpm2。"
+            )
+        for field in ("local_optimization", "acoustic_continuation"):
+            if field in payload and not isinstance(payload[field], bool):
+                raise ProductSettingsError(f"{field}（本地优化开关）必须为布尔值。")
+        previous = deepcopy(self._settings["tts"])
+        try:
+            steps = validate_tts_inference_steps(
+                payload.get("inference_steps_by_model", {}), previous["inference_steps_by_model"],
+            )
+        except ValueError as exc:
+            raise ProductSettingsError(str(exc)) from exc
+        backend = payload.get("backend", previous["backend"])
+        if not isinstance(backend, str) or backend not in {"minimax", "voxcpm1"}:
+            raise ProductSettingsError("backend（语音后端）必须为 minimax 或 voxcpm1。")
+        previous_version = self._settings["schema_version"]
+        self._settings["tts"] = {**previous, **dict(payload), "local_optimization": True, "local_model": model, "backend": backend,
+                                 "inference_steps_by_model": steps}
+        self._settings["schema_version"] = PRODUCT_SETTINGS_SCHEMA_VERSION
+        try:
+            self._save_settings()
+        except Exception:
+            self._settings["tts"] = previous
+            self._settings["schema_version"] = previous_version
+            raise
+        return deepcopy(self._settings["tts"])
+
+    def save_tts_voice_selection(self, model: str, selection: Mapping[str, Any]) -> dict[str, Any]:
+        """原子保存 model（本地模型）的 voice_id（音色标识）和 revision（音色版本）。"""
+        if model not in {"voxcpm1", "voxcpm2"}:
+            raise ProductSettingsError("model（本地模型）必须为 voxcpm1 或 voxcpm2。")
+        voice_id, revision = selection.get("voice_id"), selection.get("revision")
+        if (not isinstance(voice_id, str) or not voice_id or len(voice_id) > 80
+                or type(revision) is not int or revision < 1):
+            raise ProductSettingsError("音色选择必须包含有效的 voice_id（音色标识）和 revision（音色版本）。")
+        previous = deepcopy(self._settings["tts"])
+        previous_version = self._settings["schema_version"]
+        active = deepcopy(previous.get("active_voice_by_model") or {"voxcpm1": None, "voxcpm2": None})
+        active[model] = {"voice_id": voice_id, "revision": revision}
+        self._settings["tts"] = {**previous, "active_voice_by_model": active}
+        self._settings["schema_version"] = PRODUCT_SETTINGS_SCHEMA_VERSION
+        try:
+            self._save_settings()
+        except Exception:
+            self._settings["tts"] = previous
+            self._settings["schema_version"] = previous_version
+            raise
+        return deepcopy(active)
 
     def read_persona(self) -> dict[str, str]:
         directory = self.persona_directory.resolve()
@@ -615,7 +746,10 @@ class ProductSettingsStore:
         return apply_settings_to_config(self.config, self._settings)
 
     def _save_settings(self) -> None:
-        _atomic_write_json(self.path, self._settings)
+        saved = deepcopy(self._settings)
+        if getattr(self, "_tts_voice_selections", None):
+            saved["tts"].pop("active_voice_by_model", None)
+        _atomic_write_json(self.path, saved)
         # A successful explicit save repairs a previously unreadable settings
         # artifact.  Keep the warning until that point, but do not continue
         # advertising a stale recovery warning after the file is valid.
@@ -1385,3 +1519,65 @@ def sanitize_runtime_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
             },
         },
     }
+    raw_local_tts = value.get("local_tts") if isinstance(value.get("local_tts"), Mapping) else None
+    if raw_local_tts is not None:
+        local_model = raw_local_tts.get("local_model")
+        loaded_model = raw_local_tts.get("loaded_model")
+        models = raw_local_tts.get("models") if isinstance(raw_local_tts.get("models"), list) else []
+        active_voices = (raw_local_tts.get("active_voice_by_model")
+                         if isinstance(raw_local_tts.get("active_voice_by_model"), Mapping) else {})
+        voice_state = raw_local_tts.get("voice_state")
+        result["local_tts"] = {
+            "backend": raw_local_tts.get("backend") if isinstance(raw_local_tts.get("backend"), str) and raw_local_tts.get("backend") in {"minimax", "voxcpm1"} else "minimax",
+            "local_model": local_model if isinstance(local_model, str) and local_model in {"voxcpm1", "voxcpm2"} else "voxcpm1",
+            "loaded_model": loaded_model if isinstance(loaded_model, str) and loaded_model in {"voxcpm1", "voxcpm2"} else None,
+            "load_state": _safe_display_text(raw_local_tts.get("load_state"), limit=32),
+            "pending_selection": ({"backend": pending.get("backend"), "local_model": pending.get("local_model")}
+                                  if isinstance(pending := raw_local_tts.get("pending_selection"), Mapping)
+                                  and pending.get("backend") in {"minimax", "voxcpm1"}
+                                  and pending.get("local_model") in {"voxcpm1", "voxcpm2"} else None),
+            "error": (safe_voice_diagnostic(raw_local_tts.get("error"), "")
+                      if raw_local_tts.get("error") else None),
+            "active_voice": ({
+                "voice_id": raw_local_tts.get("active_voice", {}).get("voice_id"),
+                "revision": raw_local_tts.get("active_voice", {}).get("revision"),
+                "name": _safe_display_text(raw_local_tts.get("active_voice", {}).get("name"), limit=80),
+            } if isinstance(raw_local_tts.get("active_voice"), Mapping) else None),
+            "voice_state": voice_state if isinstance(voice_state, str) and voice_state in {
+                "ready", "unconfigured", "asset_missing", "reference_text_missing", "invalid",
+            } else "unconfigured",
+            "voice_error": (safe_voice_diagnostic(raw_local_tts.get("voice_error"), "")
+                            if raw_local_tts.get("voice_error") else None),
+            "active_voice_by_model": {
+                model: ({"voice_id": item.get("voice_id"), "revision": item.get("revision")}
+                        if isinstance(item, Mapping) and isinstance(item.get("voice_id"), str)
+                        and type(item.get("revision")) is int and item.get("revision") > 0 else None)
+                for model, item in active_voices.items()
+                if model in {"voxcpm1", "voxcpm2"}
+            },
+            "voice_capabilities": {
+                key: raw_local_tts.get("voice_capabilities", {}).get(key) is True
+                for key in ("voice_clone", "voice_design", "style_control", "emotion_control",
+                            "requires_reference_text")
+            } if isinstance(raw_local_tts.get("voice_capabilities"), Mapping) else {},
+            "emotion_diagnostic": _safe_display_text(raw_local_tts.get("emotion_diagnostic"), limit=240),
+            "operation": ({
+                "operation_id": raw_local_tts.get("operation", {}).get("operation_id"),
+                "kind": raw_local_tts.get("operation", {}).get("kind"),
+                "state": raw_local_tts.get("operation", {}).get("state"),
+                "recorded_ms": raw_local_tts.get("operation", {}).get("recorded_ms"),
+            } if isinstance(raw_local_tts.get("operation"), Mapping) else None),
+            "models": [
+                {
+                    "id": item.get("id") if isinstance(item.get("id"), str) and item.get("id") in {"voxcpm1", "voxcpm2"} else "voxcpm1",
+                    "name": _safe_display_text(item.get("name"), limit=80),
+                    "native_sample_rate": item.get("native_sample_rate")
+                    if isinstance(item.get("native_sample_rate"), int) and not isinstance(item.get("native_sample_rate"), bool)
+                    else 16000,
+                    "available": item.get("available") is True,
+                    "loaded": item.get("loaded") is True,
+                }
+                for item in models if isinstance(item, Mapping)
+            ],
+        }
+    return result

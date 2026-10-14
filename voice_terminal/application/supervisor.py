@@ -38,6 +38,7 @@ class ApplicationHost:
         self.state = ApplicationState()
         self.internal_token = secrets.token_urlsafe(48)
         self.processes: dict[str, ManagedProcess] = {}
+        self.local_tts_pid: int | None = None  # local_tts_pid（本地 TTS 子进程编号）：单独计入语音合成组件。
         self.generations: dict[str, str] = {}
         self.manifest = {}
         self.resource_issues: dict[str, str] = {}  # resource_issues（各组件缺失本地资源的说明）。
@@ -577,6 +578,13 @@ class ApplicationHost:
 
     async def delegated_status(self, *, timeout=3):
         data = await self.http(self.state.value["voice_api_url"] + "/internal/application/status", timeout=timeout)
+        local_tts = data.get("local_tts")
+        local_tts_pid = local_tts.get("pid") if isinstance(local_tts, dict) else None
+        self.local_tts_pid = (
+            local_tts_pid
+            if isinstance(local_tts_pid, int) and not isinstance(local_tts_pid, bool) and local_tts_pid > 0
+            else None
+        )
         for key in ("speaker", "dsh"):
             item = data[key]
             row = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
@@ -845,6 +853,15 @@ class ApplicationHost:
         process_owners = {}  # process_owners（资源进程所属组件）。
         direct_owners = {row["pid"]: row["id"] for row in reversed(snapshot["components"])
                          if row["pid"] and not row["external"]}
+        local_tts_process_ids = set()
+        if self.local_tts_pid:
+            direct_owners[self.local_tts_pid] = "local-tts"
+            try:
+                local_tts_process = psutil.Process(self.local_tts_pid)
+                local_tts_process_ids.add(self.local_tts_pid)
+                local_tts_process_ids.update(child.pid for child in local_tts_process.children(recursive=True))
+            except psutil.Error:
+                pass
         sampled = {}
         complete = True  # complete（受管进程采样覆盖完整）。
         from ..gpu_memory import process_vram_bytes, process_vram_snapshot
@@ -893,7 +910,9 @@ class ApplicationHost:
                             child_identity = (child.pid, child.create_time())
                             child_memory, child_commit, _ = sample_process(child, child_identity)
                             unique[child_identity] = (child_memory, child_commit)
-                            process_owners.setdefault(child_identity, direct_owners.get(child.pid, row["id"]))
+                            owner = ("local-tts" if child.pid in local_tts_process_ids
+                                     else direct_owners.get(child.pid, row["id"]))
+                            process_owners.setdefault(child_identity, owner)
                         except psutil.Error:
                             complete = False
             except psutil.Error:

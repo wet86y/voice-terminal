@@ -22,6 +22,7 @@ class SpeechInferenceBoundary:
         self.output = output  # output（唯一语音事务所有者）。
         self.buffer_ms = buffer_ms  # buffer_ms（请求前剩余音频目标，毫秒）。
         self.prefill_timeout = prefill_timeout  # prefill_timeout（补块等待上限，秒）。
+        self._new_speech = {}  # 请求票据绑定明确受理的新播报标识。
         self._requests = set()  # _requests（尚未释放的独立请求票据）。
         self._mutex = asyncio.Lock()  # _mutex（发送及字符结算互斥锁）。
         self._changed = asyncio.Event()  # _changed（闸门状态变化通知）。
@@ -37,8 +38,18 @@ class SpeechInferenceBoundary:
         return (self._prefill is not None and self._prefill[1] is handle
                 and len(self._requests) == 1)
 
+    def authorize_new(self, handle):
+        """仅本次请求新建的播报拥有生产例外，旧事务保持冻结。"""
+        for ticket, (identity, ids) in self._new_speech.items():
+            if identity == handle.identity:
+                ids.add(handle.speech_id)
+        self._changed.set()
+
     def _allowed(self, handle):
-        return not self.frozen or self.prefilling(handle)
+        own = bool(handle and self._requests and all(
+            handle.speech_id in self._new_speech.get(ticket, (None, set()))[1]
+            for ticket in self._requests))
+        return not self.frozen or self.prefilling(handle) or own
 
     async def wait_ready(self, handle, valid):
         """wait_ready（等待提交许可）：取消事务无需等模型完成。"""
@@ -103,7 +114,8 @@ class SpeechInferenceBoundary:
                 or getattr(self.output, "playback_hold_active", False)):
             return False
         state = handle.admission
-        if state is None or not state.rewritable or state.sent_chars >= len(handle.text):
+        if (state is None or not state.rewritable or state.sent_chars >= len(handle.text)
+                or not handle.production_ready.is_set()):
             return False
         if state.sentence_window and self.output.player is not None:
             player = self.output.player
@@ -125,6 +137,7 @@ class SpeechInferenceBoundary:
         before_ms = 0  # before_ms（准备开始时的剩余音频）。
         prefill_status = "not_needed"  # prefill_status（补块结果）。
         self._requests.add(ticket)
+        self._new_speech[ticket] = (identity, set())
         self._changed.set()
         try:
             # 先关闸，再等待已经开始的 send_text（文本发送）结算。
@@ -166,6 +179,7 @@ class SpeechInferenceBoundary:
             if completed is not None and not completed.done():
                 completed.cancel()
             self._requests.discard(ticket)
+            self._new_speech.pop(ticket, None)
             self._changed.set()
             logger.info("speech.inference_released conversation_id=%s request_id=%s held=%s",
                         identity[0], identity[1], self.frozen)

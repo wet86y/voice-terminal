@@ -4,7 +4,7 @@ import type {
   ProductComputeStatus,
   ProductMutationResult,
   ProductSnapshot,
-  WakeTask,
+  WakeTask, ProductTtsSettings, ProductLocalTtsModelId, ProductLocalTtsStatus, ProductTtsVoice, ProductTtsAsset, ProductTtsOperation,
 } from './types'
 
 export class ProductApiError extends Error implements ProductApiErrorShape {
@@ -111,7 +111,19 @@ export const productApi = {
   /** 保存本地模型设备偏好；返回值会标明需要重启应用。 */
   saveCompute: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/compute', jsonBody(value)),
   /** 读取 TTS（语音合成）固定在线 API（程序接口）的只读状态。 */
-  ttsStatus: () => request<{ backend: 'minimax'; worker: { state: 'stopped' } }>('/api/v1/tts/status'),
+  saveTts: (value: Partial<ProductTtsSettings>) => request<ProductMutationResult>('/api/v1/product/settings/tts', jsonBody(value)),
+  ttsVoices: (model: ProductLocalTtsModelId) => request<{ voices: ProductTtsVoice[] }>(`/api/v1/tts/voices/${model}`),
+  createTtsVoice: (model: ProductLocalTtsModelId, voice: Partial<ProductTtsVoice>) => request<{ voice: ProductTtsVoice }>(`/api/v1/tts/voices/${model}`, { ...jsonBody(voice), method: 'POST' }),
+  updateTtsVoice: (model: ProductLocalTtsModelId, id: string, voice: Partial<ProductTtsVoice>, revision: number) => request<{ voice: ProductTtsVoice }>(`/api/v1/tts/voices/${model}/${id}`, jsonBody({ ...voice, expected_revision: revision })),
+  deleteTtsVoice: (model: ProductLocalTtsModelId, id: string) => request(`/api/v1/tts/voices/${model}/${id}`, { method: 'DELETE' }),
+  selectTtsVoice: (model: ProductLocalTtsModelId, selection: { voice_id: string; revision: number } | null) => request(`/api/v1/tts/voices/${model}/selection`, jsonBody({ selection })),
+  uploadTtsAsset: (model: ProductLocalTtsModelId, file: File) => request<{ asset: ProductTtsAsset }>(`/api/v1/tts/assets/${model}/import?filename=${encodeURIComponent(file.name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file }),
+  startTtsPreview: (model: ProductLocalTtsModelId, voice: Partial<ProductTtsVoice>, text: string) => request<ProductTtsOperation>('/api/v1/tts/operations/preview', { ...jsonBody({ model, voice, text }), method: 'POST' }),
+  startTtsPlay: (model: ProductLocalTtsModelId, asset_id: string) => request<ProductTtsOperation>('/api/v1/tts/operations/play', { ...jsonBody({ model, asset_id }), method: 'POST' }),
+  startTtsTranscribe: (model: ProductLocalTtsModelId, asset_id: string) => request<ProductTtsOperation>('/api/v1/tts/operations/transcribe', { ...jsonBody({ model, asset_id }), method: 'POST' }),
+  getTtsOperation: (id: string) => request<ProductTtsOperation>(`/api/v1/tts/operations/${id}`),
+  cancelTtsOperation: (id: string) => request<ProductTtsOperation>(`/api/v1/tts/operations/${id}/cancel`, { method: 'POST' }),
+  ttsStatus: () => request<ProductLocalTtsStatus>('/api/v1/tts/status'),
   speakerStatus: () => request<Record<string, unknown>>('/api/v1/speaker/status'),
   speakerProfile: () => request<Record<string, unknown>>('/api/v1/speaker/profile'),
   startSpeakerEnrollment: () => request<Record<string, unknown>>('/api/v1/speaker/enrollment/start', { method: 'POST' }),

@@ -449,13 +449,16 @@ def test_recording_a_delivery_accumulates_the_frontier_within_one_turn():
     })
     assert output.delivered == {"turn_id": "turn-a", "text": SPOKEN_FIRST}
 
-    # A replaced transaction contributes only the part the provider received.
+    # 提前合成但未听到的事务不能推进送达前缀。
     output.record_delivery({
         "turn_id": "turn-a", "status": "replaced", "text": SPOKEN_SUFFIX + "号。",
         "tts_text_chars": len(SPOKEN_SUFFIX),
         "delivery": {"status": "none", "termination": "replaced", "heard_text": ""},
     })
-    assert output.delivered["text"] == SPOKEN_FIRST + SPOKEN_SUFFIX
+    assert output.delivered["text"] == SPOKEN_FIRST
+    output.record_delivery({"turn_id": "turn-a", "status": "interrupted", "text": SPOKEN_SUFFIX,
+                            "delivery": {"status": "partial", "heard_text": SPOKEN_SUFFIX[:3]}})
+    assert output.delivered["text"] == SPOKEN_FIRST + SPOKEN_SUFFIX[:3]
 
     # A new turn starts a new frontier instead of extending the old one.
     output.record_delivery({

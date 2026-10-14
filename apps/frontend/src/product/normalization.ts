@@ -8,9 +8,9 @@ const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 export const MAX_WAKE_KEYWORDS = 5
 
 export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 13,
+  schema_version: 14,
   screen_capture: { enabled: true, crop_width: 960, crop_height: 640, global_max_edge: 1920, app_overrides: [] },
-  tts: { backend: 'minimax' },
+  tts: { backend: 'minimax', local_model: 'voxcpm2', inference_steps_by_model: { voxcpm1: 10, voxcpm2: 20 } },
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
   quiet_hours: { enabled: false, start: '23:00', end: '07:00' },
@@ -86,7 +86,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
   return {
     schema_version: typeof value.schema_version === 'number' ? value.schema_version : DEFAULT_SETTINGS.schema_version,
     quiet_hours: { enabled: quiet.enabled === true, start: text(quiet.start) || '23:00', end: text(quiet.end) || '07:00' },
-    tts: { backend: 'minimax' },
+    tts: { backend: tts.backend === 'voxcpm1' ? 'voxcpm1' : 'minimax', local_model: tts.local_model === 'voxcpm1' ? 'voxcpm1' : 'voxcpm2', inference_steps_by_model: { voxcpm1: 10, voxcpm2: 20, ...(isRecord(tts.inference_steps_by_model) ? tts.inference_steps_by_model : {}) } },
     wake: {
       enabled: wake.enabled === true,
       keyword: primaryKeyword,

@@ -317,6 +317,7 @@ def _sentence_output_harness(*, min_effective_chars=10):
     )
     output.loop = asyncio.get_running_loop()
     handle = SpeechHandle(output, ("episode", "request"), "turn", 0, "calm")
+    handle.playback_ready.set()  # 测试夹具默认已授予设备播放许可。
     handle.task = asyncio.current_task()
     output.handle = handle
     output._handles_by_token[handle.workspace.token] = handle

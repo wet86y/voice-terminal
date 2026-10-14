@@ -12,8 +12,10 @@ export function useStartupCredentials(port: DesktopCredentialsPort) {
   const error = ref('') // error（可向用户展示的错误）。
   const notice = ref('') // notice（保存结果）。
   const disabled = computed(() => loading.value || saving.value)
-  const ready = computed(() => !disabled.value && configured.value.deepseek && configured.value.minimax)
+  const localTts = ref(false) // localTts（本地语音选中时在线密钥可选）。
+  const ready = computed(() => !disabled.value && configured.value.deepseek && (localTts.value || configured.value.minimax))
   function update(result: FixedModelCredentials) {
+    localTts.value = result.tts_backend === 'voxcpm1'
     configured.value = { deepseek: result.providers.deepseek.configured, minimax: result.providers.minimax.configured }
   }
   onMounted(async () => {
@@ -31,5 +33,5 @@ export function useStartupCredentials(port: DesktopCredentialsPort) {
     } catch (failure) { error.value = String(failure) }
     finally { saving.value = false }
   }
-  return { deepseek, minimax, configured, loading, saving, disabled, ready, error, notice, save }
+  return { deepseek, minimax, configured, loading, saving, disabled, ready, localTts, error, notice, save }
 }

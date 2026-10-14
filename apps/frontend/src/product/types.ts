@@ -1,3 +1,5 @@
+import type { ProductTtsSettings } from '../interface/tts-voice-types'
+export * from '../interface/tts-voice-types'
 import type { SpeakerTuning } from "./speaker-policy"
 import type {
   ConversationEntry,
@@ -154,7 +156,7 @@ export interface ProductSettingsSnapshot {
   quiet_hours?: { enabled: boolean; start: string; end: string }
   schema_version: number
   /** TTS backend（语音后端）固定为 MiniMax API（在线语音接口）。 */
-  tts: { backend: 'minimax' }
+  tts: ProductTtsSettings
   wake: {
     enabled: boolean
     /** Primary phrase; mirrors `keywords[0]` for older consumers. */
@@ -208,6 +210,7 @@ export interface ProductProvider {
 
 /** FixedModelCredentials（固定供应商密钥状态）：前端只接收是否已配置。 */
 export interface FixedModelCredentials {
+  tts_backend?: 'minimax' | 'voxcpm1' // tts_backend（启动时语音后端）。
   providers: { deepseek: { configured: boolean }; minimax: { configured: boolean } }; // providers（两家固定服务的配置状态）。
   vault_available: boolean; // vault_available（本机凭据存储是否可用）。
   message?: string; // message（保存结果说明）。

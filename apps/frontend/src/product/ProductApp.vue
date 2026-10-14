@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import TtsSettings from "./panels/TtsSettings.vue";
+import { provideTtsVoiceState } from "../interface/useTtsVoiceState";
+provideTtsVoiceState();
 import { computed, onBeforeUnmount, watch } from 'vue';
 import { useProductControls } from "./useProductControls";
 import ApplicationStartup from "./ApplicationStartup.vue";
@@ -153,6 +156,7 @@ function nativeAction(action: () => Promise<void>) {
         <WakeSettings v-if="activeSettingsTab === 'wake'" />
         <HotwordSettings v-if="activeSettingsTab === 'hotwords'" />
         <PersonaSettings v-if="activeSettingsTab === 'persona'" />
+        <TtsSettings v-if="activeSettingsTab === 'tts'" />
         <SpeakerSettings v-if="activeSettingsTab === 'speaker'" />
         <WakeTasksSettings v-if="activeSettingsTab === 'wakes'" />
         <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" :resource-controller="workspaceResources" />

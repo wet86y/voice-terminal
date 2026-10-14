@@ -78,6 +78,16 @@ class ApplicationRuntimeMixin:
         if dsh_state == "ready" and binding_error:
             dsh_state = "failed"
         speaker_process = self._speaker_worker_process
+        local_tts = getattr(self.tts, "local", None) if self.tts is not None else None
+        local_tts_server = getattr(local_tts, "server", None)
+        local_tts_process = getattr(local_tts_server, "_process", None)
+        local_tts_pid = None
+        if local_tts_process is not None:
+            try:
+                if local_tts_process.poll() is None:
+                    local_tts_pid = local_tts_process.pid
+            except (AttributeError, OSError):
+                pass
         speaker_enabled = self.config.speaker.mode != "off" or self.config.speaker.owner_only_barge_in
         speaker_service = self.speaker_status()
         service = speaker_service.get("service", "DISABLED")
@@ -92,6 +102,7 @@ class ApplicationRuntimeMixin:
                 "phase": "声纹连接已就绪" if speaker_state == "ready" else "按配置停用" if speaker_state == "disabled" else "加载声纹工作进程" if speaker_state == "starting" else "声纹工作进程不可用",
                 "error": str(speaker_service.get("last_error") or "") if speaker_state == "failed" else "",
                 "pid": speaker_process.pid if speaker_process and speaker_process.returncode is None else None},
+            "local_tts": {"pid": local_tts_pid},  # local_tts（本地语音合成子进程），供宿主独立统计资源。
         }
 
     def _apply_managed_endpoints(self, endpoint_table: dict | None) -> None:

@@ -240,11 +240,28 @@ class LlmConfig:
             raise ValueError("llm.transport_retry_limit cannot be negative")
 
 
+LOCAL_TTS_DEFAULT_STEPS = {"voxcpm1": 10, "voxcpm2": 20}  # 各本地模型默认推理步数。
+
+
+def validate_tts_inference_steps(value: Any, defaults: Mapping[str, int] | None = None) -> dict[str, int]:
+    """inference_steps_by_model（逐模型推理步数）：允许部分更新，范围 1–30。"""
+    if not isinstance(value, Mapping) or set(value) - set(LOCAL_TTS_DEFAULT_STEPS):
+        raise ValueError("inference_steps_by_model（逐模型推理步数）仅接受 voxcpm1、voxcpm2。")
+    result = {**LOCAL_TTS_DEFAULT_STEPS, **(defaults or {}), **value}
+    if any(type(step) is not int or not 1 <= step <= 30 for step in result.values()):
+        raise ValueError("本地推理步数必须为 1–30 的整数。")
+    return result
+
+
 @dataclass(frozen=True)
 class TtsConfig:
     provider: str = "minimax"
-    # Product selection; ``provider`` remains the legacy MiniMax model metadata.
+    # backend（语音运行后端）；provider（模型元数据供应商）保留 MiniMax 兼容值。
     backend: str = "minimax"
+    local_model: str = "voxcpm2"  # local_model（本地 TTS 模型）：audio.cpp（原生音频推理框架）中的 VoxCPM 选择。
+    local_optimization: bool = True  # local_optimization（通用本地提前合成优化）。
+    acoustic_continuation: bool = True  # acoustic_continuation（声学续接独立开关）。
+    inference_steps_by_model: dict[str, int] = field(default_factory=lambda: dict(LOCAL_TTS_DEFAULT_STEPS))  # 逐模型推理步数。
     base_url: str = "https://api.minimaxi.com"
     websocket_path: str = "/ws/v1/t2a_v2"
     transport: str = "websocket"
@@ -274,8 +291,11 @@ class TtsConfig:
     first_clause_timeout_ms: int = 400
 
     def __post_init__(self) -> None:
-        if self.backend not in {"minimax", "cosyvoice"}:
-            raise ValueError("tts.backend 必须为 minimax 或 cosyvoice")
+        object.__setattr__(self, "inference_steps_by_model", validate_tts_inference_steps(self.inference_steps_by_model))
+        if self.backend not in {"minimax", "voxcpm1"}:
+            raise ValueError("tts.backend（语音运行后端）必须为 minimax 或 voxcpm1")
+        if self.local_model not in {"voxcpm1", "voxcpm2"}:
+            raise ValueError("tts.local_model（本地语音合成模型）必须为 voxcpm1 或 voxcpm2")
         if self.transport not in {"websocket", "websocket_bidi"}:
             raise ValueError("tts.transport must be websocket or websocket_bidi")
         if self.scheduling not in {"auto", "direct", "playback_window", "sentence_window"}:
@@ -664,6 +684,9 @@ class AppConfig:
         asr = _section(data, "asr")
         llm = _section(data, "llm")
         tts = _section(data, "tts")
+        configured_tts_backend = _string(tts.get("backend"), "minimax").strip().lower()
+        if configured_tts_backend == "cosyvoice":
+            configured_tts_backend = "minimax"
         bridge = _section(data, "text_bridge")
         screen_capture = ScreenCaptureConfig(**_section(data, "screen_capture"))
         server = _section(data, "server")
@@ -975,8 +998,8 @@ class AppConfig:
             ),
             tts=TtsConfig(
                 provider="minimax",
-                # 历史 YAML 可能仍含 cosyvoice；产品配置加载固定使用在线 API。
-                backend="minimax",
+                backend=configured_tts_backend,
+                local_model=_string(tts.get("local_model"), "voxcpm2").strip().lower(),
                 base_url=os.environ.get("MINIMAX_API_HOST", "").strip() or _string(tts.get("base_url"), "https://api.minimaxi.com"),
                 websocket_path=_string(tts.get("websocket_path"), "/ws/v1/t2a_v2"),
                 transport=_string(tts.get("transport"), "websocket"),
@@ -984,7 +1007,10 @@ class AppConfig:
                 model=_string(tts.get("model"), "speech-2.8-hd"),
                 api_key_env=_string(tts.get("api_key_env"), "MINIMAX_API_KEY"),
                 output_format=_string(tts.get("output_format"), "pcm"),
-                sample_rate=int(_number(tts.get("sample_rate"), 32000)),
+                sample_rate=int(_number(
+                    tts.get("sample_rate"),
+                    16000 if configured_tts_backend == "voxcpm1" else 32000,
+                )),
                 voice_id=_string(tts.get("voice_id"), "female-shaonv"),
                 timeout_ms=int(_number(tts.get("timeout_ms"), 15000)),
                 subtitle_enable=_bool(tts.get("subtitle_enable"), False),
@@ -1001,6 +1027,9 @@ class AppConfig:
                 sentence_tick_ms=int(_number(tts.get("sentence_tick_ms"), 50)),
                 sentence_min_effective_chars=int(_number(tts.get("sentence_min_effective_chars"), 10)),
                 first_clause_timeout_ms=int(_number(tts.get("first_clause_timeout_ms"), 400)),
+                local_optimization=_bool(tts.get("local_optimization"), True),
+                acoustic_continuation=_bool(tts.get("acoustic_continuation"), True),
+                inference_steps_by_model=validate_tts_inference_steps(tts.get("inference_steps_by_model", {})),
             ),
             text_bridge=TextBridgeConfig(
                 min_chars=int(_number(bridge.get("min_chars"), 8)),

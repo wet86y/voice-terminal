@@ -311,9 +311,10 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             return
         ws.tts_prewarm_started = True
         ws.timings.setdefault("tts_prewarm_requested", time.monotonic())
-        if self.tts is None or getattr(self.tts, "transport", None) not in {
-            "websocket", "websocket_bidi"
-        }:
+        supports_prewarm = getattr(self.tts, "supports_prewarm", None) if self.tts is not None else False
+        if supports_prewarm is None:
+            supports_prewarm = getattr(self.tts, "transport", None) in {"websocket", "websocket_bidi"}
+        if self.tts is None or not supports_prewarm:
             ws.tts_prewarm_status = "DISABLED"
             ws.timings["tts_prewarm_status"] = ws.tts_prewarm_status
             return
@@ -1262,12 +1263,14 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self._last_frame = None
 
     async def close(self) -> None:
-        await super().close()
-        self.registry.close()
-        for task in list(self._background):
-            task.cancel()
-        if self._background:
-            await asyncio.wait(self._background, timeout=1)
+        try:
+            await super().close()
+        finally:
+            self.registry.close()
+            for task in list(self._background):
+                task.cancel()
+            if self._background:
+                await asyncio.wait(self._background, timeout=1)
 
     async def _observe_activity(self, activity, frame):
         return activity
