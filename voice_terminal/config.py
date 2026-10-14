@@ -261,6 +261,9 @@ class TtsConfig:
     local_model: str = "voxcpm2"  # local_model（本地 TTS 模型）：audio.cpp（原生音频推理框架）中的 VoxCPM 选择。
     local_optimization: bool = True  # local_optimization（通用本地提前合成优化）。
     acoustic_continuation: bool = True  # acoustic_continuation（声学续接独立开关）。
+    # gpu_max_performance（本地合成期间请求显卡优先最大性能）：免管理员权限、按进程生效，
+    # 等价于 NVIDIA 控制面板的电源管理模式；进程退出即自动还原。
+    gpu_max_performance: bool = True
     inference_steps_by_model: dict[str, int] = field(default_factory=lambda: dict(LOCAL_TTS_DEFAULT_STEPS))  # 逐模型推理步数。
     base_url: str = "https://api.minimaxi.com"
     websocket_path: str = "/ws/v1/t2a_v2"
@@ -1029,6 +1032,7 @@ class AppConfig:
                 first_clause_timeout_ms=int(_number(tts.get("first_clause_timeout_ms"), 400)),
                 local_optimization=_bool(tts.get("local_optimization"), True),
                 acoustic_continuation=_bool(tts.get("acoustic_continuation"), True),
+                gpu_max_performance=_bool(tts.get("gpu_max_performance"), True),
                 inference_steps_by_model=validate_tts_inference_steps(tts.get("inference_steps_by_model", {})),
             ),
             text_bridge=TextBridgeConfig(

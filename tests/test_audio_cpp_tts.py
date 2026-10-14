@@ -54,7 +54,8 @@ def _fake_client(handler, *, native_sample_rate: int = 16000) -> AudioCppTtsClie
         ensure_ready=AsyncMock(),
         close=AsyncMock(),
     )
-    client = AudioCppTtsClient(server, http_transport=httpx.MockTransport(handler))
+    client = AudioCppTtsClient(server, http_transport=httpx.MockTransport(handler),
+                               gpu_max_performance=False)
     # Tests must explicitly supply the per-request reference snapshot; production no longer
     # falls back to a server-wide default voice.
     client.resolve_voice = lambda emotion, preview=False: ResolvedLocalTtsVoice(

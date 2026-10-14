@@ -1126,6 +1126,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 first_clause_timeout_ms=self.config.tts.first_clause_timeout_ms,
                 local_optimization=self.config.tts.local_optimization,
                 acoustic_continuation=self.config.tts.acoustic_continuation,
+                gpu_max_performance=self.config.tts.gpu_max_performance,
                 voice_library=self.voice_library,
                 active_voice_provider=self._active_voice_selection,
                 emotion_mode="off",

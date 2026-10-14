@@ -20,6 +20,7 @@ import httpx
 from ..tts.scheduling import TtsSegmentReceipt
 from ..tts.capabilities import TtsCapabilities
 from ..tts.voices import ResolvedLocalTtsVoice, VoiceLibrary
+from ..gpu_performance import GpuPerformanceMode
 
 logger = logging.getLogger(__name__)
 
@@ -531,6 +532,7 @@ class AudioCppTtsClient:
                  first_clause_timeout_ms: int = 400,
                 http_transport: httpx.AsyncBaseTransport | None = None,
                 local_optimization: bool = True, acoustic_continuation: bool = True,
+                gpu_max_performance: bool = True,
                 voice_library: VoiceLibrary | None = None,
                 active_voice_provider: Callable[[str], Mapping[str, Any] | None] | None = None,
                 emotion_mode: str = "off",
@@ -551,6 +553,9 @@ class AudioCppTtsClient:
         self._warmed = False
         self.local_optimization = local_optimization
         self.acoustic_continuation = acoustic_continuation
+        # gpu_max_performance（本地合成期间请求显卡优先最大性能）：免管理员权限、按进程生效，
+        # 进程退出即自动还原；不可用时全部降级为无操作，不影响合成。
+        self.gpu_performance = GpuPerformanceMode(enabled=gpu_max_performance)
         self.voice_library = voice_library
         self.active_voice_provider = active_voice_provider
         self.emotion_mode = "off"  # LLM（大语言模型）不再控制播报情绪；旧构造参数保留兼容。
@@ -586,7 +591,10 @@ class AudioCppTtsClient:
         return int(getattr(self.server, "native_sample_rate", self.sample_rate))
 
     def model_status(self) -> dict[str, Any]:
-        return self.server.status_snapshot()
+        status = self.server.status_snapshot()
+        # gpu_performance（显卡性能模式请求状态）：只用于诊断展示，不参与合成决策。
+        status["gpu_performance"] = self.gpu_performance.status()
+        return status
 
     async def switch_model(self, local_model: str) -> None:
         await self.server.switch_model(local_model)
@@ -649,6 +657,8 @@ class AudioCppTtsClient:
         await self.server.ensure_ready()
         native = getattr(self.server, "capabilities", {})
         self._native_continuation = bool(native.get("acoustic_continuation", False))
+        # 本地服务就绪后请求显卡优先最大性能；失败只记录，不阻断合成。
+        self.gpu_performance.apply()
 
     def _request_client(self) -> httpx.AsyncClient:
         if self._http_client is None or self._http_client.is_closed:
@@ -705,6 +715,8 @@ class AudioCppTtsClient:
 
     async def close(self) -> None:
         self._warmed = False
+        # 还原显卡性能模式；进程退出时驱动本来也会自动还原，这里显式收尾便于在线切换。
+        self.gpu_performance.restore()
         if self._warm_task is not None and self._warm_task is not asyncio.current_task():
             self._warm_task.cancel()
             await asyncio.gather(self._warm_task, return_exceptions=True)
