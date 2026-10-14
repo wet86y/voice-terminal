@@ -101,6 +101,13 @@ class PcmPlayer:
         self._last_callback_status: str | None = None
         self._first_rendered_at: float | None = None
         self._first_rendered_key: str | None = None
+        self._stream_buffer_key: str | None = None
+        self._stream_start_bytes = 0  # 首次播放前的连续音频储备。
+        self._stream_resume_bytes = 0  # 欠载后恢复播放所需的连续音频储备。
+        self._stream_waiting = False
+        self._stream_complete = False
+        self._underrun_callbacks = 0  # underrun_callbacks（已起播后的欠载回调数）。
+        self._underrun_ms = 0.0  # underrun_ms（已起播后因欠载静音的总毫秒）。
         from ..resources import registry
         registry.observe(self, "playback_pcm", lambda value: value._buffered_bytes)
 
@@ -122,6 +129,8 @@ class PcmPlayer:
                 "first_rendered_at": self._first_rendered_at,
                 "callback_status": self._last_callback_status,
                 "buffered_ms": buffered_ms,
+                "underrun_callbacks": self._underrun_callbacks,
+                "underrun_ms": round(self._underrun_ms, 1),
             }
 
     def allow(self, key: str) -> None:
@@ -151,6 +160,26 @@ class PcmPlayer:
             self._allowed_key = key
             self._held_key = key
             return True
+
+    def configure_stream_buffer(self, key: str, *, startup_ms: int, resume_ms: int) -> None:
+        """configure_stream_buffer（流式播放储备）：合成抖动不直接变成逐块断音。"""
+        with self._queue_lock:
+            if self._allowed_key != key:
+                return
+            if self._active_turn is None:
+                self._active_turn = key
+            self._stream_buffer_key = key
+            bytes_per_ms = self.sample_rate * self.channels * 2 / 1000
+            self._stream_start_bytes = int(max(0, startup_ms) * bytes_per_ms)
+            self._stream_resume_bytes = int(max(0, resume_ms) * bytes_per_ms)
+            self._stream_waiting = True
+            self._stream_complete = False
+
+    def finish_stream(self, key: str) -> None:
+        """finish_stream（输入音频结束）：不足储备的短回答及末尾也必须完整播放。"""
+        with self._queue_lock:
+            if self._stream_buffer_key == key:
+                self._stream_complete = True
 
     def resume(self, key: str) -> bool:
         """Release a held playback generation without resetting its queue."""
@@ -382,8 +411,21 @@ class PcmPlayer:
             device_time = getattr(_time, "outputBufferDacTime", None)
             if isinstance(device_time, (int, float)):
                 self._last_device_output_time = float(device_time)
-            if (self._held_key != self._active_turn and self._paused_key != self._active_turn
-                    and self._policy_blocked_key != self._active_turn):
+            can_play = (self._held_key != self._active_turn and self._paused_key != self._active_turn
+                        and self._policy_blocked_key != self._active_turn)
+            if can_play and self._stream_buffer_key == self._active_turn and not self._stream_complete:
+                started = self._started_for_turn == self._active_turn and self._active_turn is not None
+                if self._buffered_bytes < len(target):
+                    self._stream_waiting = True
+                threshold = self._stream_resume_bytes if started else self._stream_start_bytes
+                if self._stream_waiting and self._buffered_bytes < threshold:
+                    can_play = False
+                    if started:
+                        self._underrun_callbacks += 1
+                        self._underrun_ms += frames * 1000 / self.sample_rate
+                else:
+                    self._stream_waiting = False
+            if can_play:
                 while remaining > 0 and self._chunks:
                     chunk = self._chunks.popleft()
                     take = min(remaining, len(chunk))
@@ -517,6 +559,11 @@ class PcmPlayer:
 
     def _clear_unlocked(self) -> None:
         self._chunks.clear()
+        self._stream_buffer_key = None
+        self._stream_waiting = False
+        self._stream_complete = False
+        self._underrun_callbacks = 0
+        self._underrun_ms = 0.0
         self._buffered_bytes = 0
         self._enqueued_bytes = 0
         self._played_bytes = 0

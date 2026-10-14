@@ -27,7 +27,7 @@ const modelResourceIds: Record<ProductLocalModelId, string> = {
 // READY（就绪）、RUNNING（运行中）、STREAMING（流式传输）、CONNECTED（已连接）；DEGRADED（降级）沿用原有可用规则。
 const availableModelServices = new Set(['READY', 'RUNNING', 'STREAMING', 'CONNECTED', 'DEGRADED'])
 function componentFor(id: string) { return application.snapshot.value?.components?.find(row => row.id === id) }
-const resources = computed(() => componentResources(application.snapshot.value))
+const resources = computed(() => componentResources(application.snapshot.value, computeStatus.value))
 const systemComponents = computed(() => (application.snapshot.value?.components ?? []).filter(row => !['asr', 'analysis', 'speaker', 'dsh'].includes(row.id)))
 function managedResource(resourceId: string): ManagedResourceRow | undefined {
   const resource = props.resourceController?.resources.value.find(row => row.resource_id === resourceId)
@@ -62,8 +62,9 @@ const rows = computed<LocalComponentRow[]>(() => {
     const owner = componentFor(owners[item.id])
     const resource = status?.resource_status
     const managed = managedResource(modelResourceIds[item.id])
-    const countedHere = ['paraformer', 'sensevoice', 'campplus'].includes(item.id)
-    const metrics = resources.value.get(owners[item.id])
+    const sharedEstimate = ['kws', 'voice_vad', 'smart_turn'].includes(item.id)
+    const countedHere = !sharedEstimate || resources.value.has(item.id)
+    const metrics = resources.value.get(sharedEstimate ? item.id : owners[item.id])
     const legacyResource = application.snapshot.value?.resource_processes === undefined ? resource : undefined
     const busy = Boolean(owner?.retrying || retrying.value.has(owners[item.id]))
     // ownerUnavailable（所属进程不可用）：停止、阻塞或无进程编号的失败会使旧模型快照失效；
@@ -91,7 +92,7 @@ const rows = computed<LocalComponentRow[]>(() => {
       privateMemory: countedHere ? formatComponentMemory(metrics?.memory_private_commit_bytes ?? legacyResource?.private_commit_bytes) : undefined,
       vram: countedHere && status?.device?.startsWith('cuda') ? formatComponentMemory(metrics?.gpu_dedicated_bytes ?? legacyResource?.gpu_dedicated_bytes) : undefined,
       description: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : loading ? busy && !owner?.retrying ? '正在重新启动组件' : owner?.phase || '等待组件启动' : item.detail, error: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : !available && !loading && !disabled ? ownerError || status?.runtime_error || status?.load_error || owner?.error : undefined,
-      note: countedHere ? '资源来自宿主同次采样，包含该进程及其子进程。' : item.id === 'smart_turn' ? '与 SenseVoice（语音识别与分析）共享进程，资源计入该条目。' : '与 Voice Server（语音服务）共享进程，资源计入语音服务条目。',
+      note: sharedEstimate ? countedHere ? '加载与预热的内存增量估算，已从所属进程扣除；共享运行库与后续缓存仍计入进程余量。' : '尚无加载增量采样，资源暂计入所属进程。' : '所属进程当前余量；已扣除单列模型的加载增量估算，显存仍按进程计量。',
       facts: [
         ...(resource?.pid == null ? [] : [{ label: '进程标识', value: String(resource.pid) }]),
         ...(resource?.pid === owner?.pid && owner?.cpu_percent != null ? [{ label: '处理器占用', value: owner.cpu_percent.toFixed(1) + '%' }] : []),
@@ -110,6 +111,32 @@ const rows = computed<LocalComponentRow[]>(() => {
       },
     }
   })
+  for (const [id, name, ownerId] of [
+    ['hotwords', '热词修订（音素匹配）', 'voice'],
+    ['punctuation', 'CTTransformerStreaming（流式标点）', 'asr'],
+  ] as const) {
+    const status = computeStatus.value?.auxiliary?.[id]
+    const owner = componentFor(ownerId)
+    const metrics = resources.value.get(id)
+    const ownerStopped = owner && ['stopped', 'blocked', 'failed'].includes(owner.state) && !owner.pid
+    const ownerLoading = Boolean(owner?.retrying || retrying.value.has(ownerId) || ['waiting', 'starting', 'stopping'].includes(owner?.state ?? ''))
+    const disabled = !ownerLoading && (owner?.state === 'disabled' || status?.service === 'DISABLED')
+    const loading = !ownerStopped && !disabled && (ownerLoading || !status && application.snapshot.value?.startup_complete !== true)
+    const available = !ownerStopped && !loading && !disabled && Boolean(status && availableModelServices.has(status.service))
+    models.push({
+      id, name, state: disabled ? 'disabled' : available ? 'ready' : loading ? 'loading' : 'failed',
+      status: disabled ? '已停用或词表为空' : loading ? '启动中' : available ? serviceLabel(status?.service) : !status ? '未提供状态' : '不可用',
+      available, retryable: !available && !loading && !disabled && Boolean(owner?.retry_allowed), busy: loading,
+      runtime: status?.runtime || '未提供', location: deviceLabel(status?.device),
+      residentMemory: formatComponentMemory(metrics?.memory_rss_bytes),
+      privateMemory: formatComponentMemory(metrics?.memory_private_commit_bytes),
+      description: loading ? owner?.phase || '等待组件启动' : id === 'hotwords' ? '在实时及整句识别之后修订热词；复用语音主服务。' : '对新增识别文字添加实时标点；复用识别工作进程。',
+      error: loading ? undefined : ownerStopped ? owner?.error : status?.load_error || undefined,
+      resource: id === 'punctuation' ? managedResource('streaming-punctuation') : undefined,
+      note: metrics ? '加载及预热的增量估算，已从所属进程扣除；不代表独立进程精确用量。' : '尚无有效加载采样，内存暂计入所属进程。',
+      facts: status?.resource_status?.pid ? [{ label: '所属进程', value: String(status.resource_status.pid) }] : [],
+    })
+  }
   const components = (application.snapshot.value?.components ?? []).filter(row => row.id === 'dsh').map<LocalComponentRow>(component => {
     const metrics = resources.value.get(component.id)
     const busy = component.retrying || retrying.value.has(component.id)
@@ -153,7 +180,7 @@ const rows = computed<LocalComponentRow[]>(() => {
         ...(environment?.version ? [{ label: '解释器版本', value: environment.version }] : []),
         ...system.map(row => ({ label: row.name, value: ['ready', 'external'].includes(row.state) ? row.id === 'setup' ? '已通过' : '运行中' : row.phase })),
       ],
-      note: '包含系统进程及其子进程；模型工作进程和代理执行宿主单独计量，共享进程只计一次。',
+      note: '系统进程余量已扣除单列模型的加载增量估算；应用总量仍取真实进程采样，共享进程只计一次。',
     })
   }
   const localMetrics = resources.value.get('local-tts')
@@ -223,7 +250,7 @@ async function retry(id: string) {
     if (component) await retry(component.id)
     return
   }
-  const owner = owners[id as ProductLocalModelId] ?? id
+  const owner = id === 'hotwords' ? 'voice' : id === 'punctuation' ? 'asr' : owners[id as ProductLocalModelId] ?? id
   if (retrying.value.has(owner)) return
   retrying.value.add(owner)
   try { await application.retry(owner); await refreshComputeStatus() }

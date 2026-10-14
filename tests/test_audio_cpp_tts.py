@@ -178,7 +178,8 @@ def test_voxcpm2_pcm_is_continuously_downsampled_across_sse_chunks():
         import numpy as np, soxr
         expected = soxr.resample(np.array(native, dtype=np.int16), 48000, 16000, quality="HQ").tobytes()
         assert len(output) == len(expected)
-        assert np.max(np.abs(np.frombuffer(output, dtype=np.int16).astype(int) - np.frombuffer(expected, dtype=np.int16))) <= 1
+        # 两次独立整数转换的取整/抖动差值最多为两个最低有效位。
+        assert np.max(np.abs(np.frombuffer(output, dtype=np.int16).astype(int) - np.frombuffer(expected, dtype=np.int16))) <= 2
         assert session.request_metrics[0]["native_pcm_bytes"] == 12
         assert session.request_metrics[0]["pcm_bytes"] == 4
 
@@ -565,10 +566,11 @@ def test_runtime_server_config_registers_both_models_with_one_resident_slot():
         assert [model["id"] for model in config["models"]] == ["voxcpm1-stream", "voxcpm2-stream"]
         assert all(model["lazy"] for model in config["models"])
         assert all("default_voice_preset" not in model for model in config["models"])
-        assert config["models"][1]["session_options"] == {
-            "voxcpm2.mem_saver": False,
-            "voxcpm2.prompt_cache_slots": 1,
-        }
+        options = config["models"][1]["session_options"]
+        assert options["voxcpm2.mem_saver"] is False
+        assert options["voxcpm2.prompt_cache_slots"] == 1
+        contexts = {name: size for name, size in options.items() if name.endswith("_context_mb")}
+        assert len(contexts) == 9 and all(size == 128 for size in contexts.values())
 
         server = AudioCppTtsServer(root, config_path, local_model="voxcpm2")
         assert server.model_id == "voxcpm2-stream"

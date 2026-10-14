@@ -91,25 +91,44 @@ def test_queued_selection_keeps_last_target_and_respects_explicit_stop(tmp_path)
     asyncio.run(scenario())
 
 
-def test_rate_change_propagates_lock_ownership_and_closes_old_runtime(tmp_path):
+def test_backend_switch_preserves_player_clock_and_other_components(tmp_path):
     async def scenario():
         runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "data")
-        runtime.tts = SimpleNamespace()
-        closed = []
-        async def close(**kwargs):
-            closed.append(kwargs)
-        async def initialize(*, _session_lock_held=False):
-            assert _session_lock_held and runtime._session_lock.locked()
-            runtime.state.set_service("tts", "READY")
-        runtime.close = close
-        runtime.initialize = initialize
+        old = runtime.tts = SimpleNamespace(shutdown=AsyncMock())
+        player = runtime.player = SimpleNamespace(buffered_ms=0)
+        vad = runtime.vad = object()
+        runtime.close = AsyncMock()
+        runtime.initialize = AsyncMock()
+        local = SimpleNamespace(ensure_ready=AsyncMock(), prewarm=AsyncMock(return_value={"status": "READY"}), close=AsyncMock())
+        remote = SimpleNamespace(ensure_ready=AsyncMock(), prewarm=AsyncMock(return_value={"status": "READY"}), close=AsyncMock())
+        runtime._build_tts_clients = lambda: (remote, local)
+        runtime._active_voice_snapshot = lambda model: object()
         async with runtime._session_lock:
             await asyncio.wait_for(runtime.switch_tts_selection("voxcpm1", "voxcpm2"), 1)
-        assert closed == [{"preserve_tts_updates": True}]
-        assert runtime.config.tts.sample_rate == 16000
+        old.shutdown.assert_awaited_once()
+        assert runtime.config.tts.sample_rate == 32000
+        assert runtime.player is player and runtime.vad is vad
         async with runtime._session_lock:
             await runtime.switch_tts_selection("minimax", "voxcpm2")
         assert runtime.config.tts.sample_rate == 32000
+        runtime.close.assert_not_awaited()
+        runtime.initialize.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def test_switch_barrier_includes_remote_output_task_and_queued_audio(tmp_path):
+    async def scenario():
+        runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "data")
+        runtime.tts = TtsBackendRouter(remote=SimpleNamespace())
+        runtime.player = SimpleNamespace(buffered_ms=0)
+        task = asyncio.create_task(asyncio.Event().wait())
+        runtime.controller = SimpleNamespace(output=SimpleNamespace(handle=SimpleNamespace(task=task)))
+        assert runtime.tts_switch_busy()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert not runtime.tts_switch_busy()
+        runtime.player.buffered_ms = 100
+        assert runtime.tts_switch_busy()
     asyncio.run(scenario())
 
 

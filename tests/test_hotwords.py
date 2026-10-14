@@ -176,6 +176,33 @@ def test_persistence_and_failed_save_keep_previous_settings(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_reset_keeps_busy_native_lane_until_worker_really_exits():
+    service = HotwordService()
+    release = threading.Event()
+    calls = []
+    class SlowMatcher:
+        def correct(self, text):
+            calls.append(text)
+            release.wait(2)
+            return SimpleNamespace(text=text, matches=[])
+    service.bank.matchers = {"stream": SlowMatcher()}
+    executor = service.executors["stream"]
+    try:
+        first = await service.correct("重置前输入。", "old")
+        assert first["status"] == "timeout"
+        service.clear()
+        second = await service.correct("重置后输入。", "new")
+        assert second["status"] == "busy" and calls == ["重置前输入"]
+        assert service.executors["stream"] is executor
+        release.set()
+        await asyncio.shield(service.pending["stream"])
+        assert (await service.correct("可运行输入。", "next"))["status"] == "unchanged"
+    finally:
+        release.set()
+        service.close()
+
+
+@pytest.mark.asyncio
 async def test_late_refinement_keeps_both_raw_sources_and_corrects_agent_input():
     from unittest.mock import AsyncMock
     from voice_terminal.controller.episode_controller import EpisodeController

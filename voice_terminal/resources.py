@@ -11,11 +11,31 @@ import weakref
 from dataclasses import dataclass
 from typing import Callable
 from collections import Counter
+from contextlib import contextmanager
 from .paths import AppPaths
 
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
 THREAD_ENV = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
 ROLES = {"bootstrap", "asr", "analysis", "voice", "speaker"}
+
+
+@contextmanager
+def model_load_footprint():
+    """model_load_footprint（加载增量估算）：共享进程内不能精确拆分原生分配器。"""
+    import psutil
+    process = psutil.Process()
+    before = process.memory_info()
+    result = {"pid": process.pid, "created_at": process.create_time(),
+              "basis": "load_delta",  # basis（归属依据）：包含首次导入与预热的加载增量。
+              "rss_bytes": 0, "private_commit_bytes": None}
+    try:
+        yield result
+    finally:
+        after = process.memory_info()
+        result["rss_bytes"] = max(0, after.rss - before.rss)
+        old_private, new_private = getattr(before, "private", None), getattr(after, "private", None)
+        if old_private is not None and new_private is not None:
+            result["private_commit_bytes"] = max(0, new_private - old_private)
 
 
 @dataclass(frozen=True)

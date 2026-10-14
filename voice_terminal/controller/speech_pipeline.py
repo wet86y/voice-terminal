@@ -168,6 +168,11 @@ class SpeechPipeline:
             return ""
         if self.player:
             self.player.allow(playback_key)
+            configure_buffer = getattr(self.player, "configure_stream_buffer", None)
+            if callable(configure_buffer) and getattr(tts_client, "playback_startup_buffer_ms", 0):
+                configure_buffer(playback_key,
+                    startup_ms=min(self.options.tts_local_buffer_ms, tts_client.playback_startup_buffer_ms),
+                    resume_ms=min(self.options.tts_local_buffer_ms, tts_client.playback_resume_buffer_ms))
             if handle is not None and getattr(handle, "playback_ready", None) is not None and not handle.playback_ready.is_set():
                 hold = getattr(self.player, "hold", None)
                 if callable(hold):
@@ -322,6 +327,9 @@ class SpeechPipeline:
                     await emit_progress(status="STREAMING", trigger="audio_received")
                     await self._latency(ws)
             finally:
+                finish_stream = getattr(self.player, "finish_stream", None)
+                if callable(finish_stream):
+                    finish_stream(playback_key)
                 close = getattr(audio_iterator, "aclose", None) if audio_iterator is not None else None
                 if close is not None:
                     await close()
@@ -735,12 +743,14 @@ class SpeechPipeline:
                         )
                         prefetch_miss_boundary_ms = None
                         if miss_boundary_ms is not None:
-                            output_ms = int(playback_progress()["output_estimated_ms"])
-                            if output_ms > miss_boundary_ms:
-                                miss_ms = output_ms - miss_boundary_ms
+                            diagnostics = getattr(self.player, "diagnostics", {})
+                            # 音频播放位置不含静音墙钟时间；不能用“新句已播放时长”冒充句间延迟。
+                            miss_ms = int(diagnostics.get("underrun_ms", 0)) if isinstance(diagnostics, dict) else 0
+                            if miss_ms > int(ws.timings.get("prefetch_miss_ms", 0)):
                                 ws.timings["prefetch_miss_ms"] = max(
                                     int(ws.timings.get("prefetch_miss_ms", 0)), miss_ms
                                 )
+                                ws.timings["playback_underrun_ms"] = miss_ms
                                 logger.warning(
                                     "controller.tts_prefetch_miss turn_id=%s miss_ms=%d block=%d",
                                     ws.turn_id, miss_ms, receipt.index,

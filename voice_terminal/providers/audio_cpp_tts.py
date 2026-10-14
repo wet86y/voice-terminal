@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 _QUEUE_END = object()
 _PREWARM_TEXT = "你好，准备开始语音播报。"
+_CONTEXT_KEYS = (  # _CONTEXT_KEYS（原生元数据内存池）：不包含模型张量/权重精度设置。
+    "weight_context_mb", "text_embedding_graph_context_mb", "lm_step_graph_context_mb",
+    "projection_graph_context_mb", "local_encoder_graph_context_mb", "dit_graph_context_mb",
+    "audiovae_weight_context_mb", "audiovae_graph_context_mb", "audiovae_encoder_graph_context_mb",
+)
 _MODEL_CATALOG = {
     # model_id（服务模型标识）、family（原生模型家族）、native_sample_rate（模型原生采样率）。
     "voxcpm1": {
@@ -105,6 +110,9 @@ class AudioCppTtsServer:
                 "session_options": {
                     f"{key}.mem_saver": False,
                     f"{key}.prompt_cache_slots": 1,
+                    # 默认容量按GiB预留主机提交，ggml no_alloc（不分配张量数据）上下文只需元数据。
+                    # 两模型15步真实逐句对照验证128MiB容量，完整PCM逐字节一致。
+                    **{f"{key}.{name}": 128 for name in _CONTEXT_KEYS},
                 },
             })
         payload = {
@@ -514,6 +522,8 @@ class AudioCppTtsClient:
     sentence_tick_ms = 50
     first_clause_timeout_ms = 400
     supports_prewarm = True
+    playback_startup_buffer_ms = 800  # playback_startup_buffer_ms（本地流式首次连续音频储备）。
+    playback_resume_buffer_ms = 400  # playback_resume_buffer_ms（欠载后连续音频储备）。
 
     def __init__(self, server: AudioCppTtsServer, *, timeout_seconds: float = 300.0,
                  sample_rate: int = 16000, sentence_min_effective_chars: int = 10,
@@ -528,7 +538,7 @@ class AudioCppTtsClient:
         self.server = server
         self.base_url = server.base_url
         self.timeout_seconds = timeout_seconds
-        # sample_rate（播放器采样率）始终与现有本地播放器的 16 kHz 契约一致。
+        # sample_rate（播放器采样率）沿用当前输出设备时钟，模式热切换不重载输入模型。
         self.sample_rate = int(sample_rate)
         self.sentence_min_effective_chars = int(sentence_min_effective_chars)
         self.sentence_prefetch_ms = int(sentence_prefetch_ms)
@@ -749,11 +759,8 @@ class AudioCppTtsSession:
         self._segment_receipts: list[TtsSegmentReceipt] = []
         self._error: Exception | None = None
         # 重采样器在一个文本请求内跨 SSE 分块保存相位与尾部采样。
-        self._resampler = (
-            _Pcm16Decimator3()
-            if self.client.native_sample_rate == 48000 and self.client.sample_rate == 16000
-            else None
-        )
+        self._resampler = (_Pcm16Resampler(self.client.native_sample_rate, self.client.sample_rate)
+                           if self.client.native_sample_rate != self.client.sample_rate else None)
 
     async def start(self) -> None:
         await self.client.ensure_ready()
@@ -1097,14 +1104,13 @@ class AudioCppTtsSession:
         return f"({'；'.join(instructions)}){text}"
 
 
-class _Pcm16Decimator3:
+class _Pcm16Resampler:
     """soxr（高质量重采样）流：跨分块保存滤波状态与采样尾部。"""
 
-    def __init__(self) -> None:
+    def __init__(self, source_rate: int = 48000, target_rate: int = 16000) -> None:
         import soxr
-        self._stream = soxr.ResampleStream(48000, 16000, 1, dtype="int16", quality="HQ")
+        self._stream = soxr.ResampleStream(source_rate, target_rate, 1, dtype="int16", quality="HQ")
         self._byte_carry = b""  # byte_carry（半个 PCM16 采样的字节尾数）。
-        self._sample_carry: list[int] = []  # sample_carry（不足三个原生采样的连续尾数）。
 
     def push(self, pcm: bytes) -> bytes:
         import numpy as np
@@ -1123,5 +1129,4 @@ class _Pcm16Decimator3:
 
     def reset(self) -> None:
         self._byte_carry = b""
-        self._sample_carry.clear()
         self._stream.clear()

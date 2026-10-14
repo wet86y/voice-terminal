@@ -39,7 +39,7 @@ class ProductSettingsRuntimeMixin:
         try:
             # 旧工作线程在新模型成功加载前继续服务；原生构造在后台执行。
             if wake_changed:
-                candidate = (await self._load_native(self._build_kws_worker, next_config)
+                candidate = (await self._load_measured_model("kws", self._build_kws_worker, next_config)
                              if next_config.wake.enabled else None)
             if (wake_changed and not next_config.wake.enabled and self.controller is not None
                     and self.state.listening and self.state.input_owner == "kws"):

@@ -881,6 +881,26 @@ def test_same_text_asr_final_is_a_visible_same_turn_update_and_wakes_scheduler()
     asyncio.run(scenario())
 
 
+def test_same_text_refinement_keeps_audio_cues_and_wakes_semantic_decision():
+    class Registry:
+        def begin_turn(self, _): pass
+        def action_definitions(self): return []
+    async def emit(*_): pass
+    runtime = AgentEpisodeRuntime(None, Registry(), SimpleNamespace(active=False, status="IDLE"), emit,
+        conversation=ConversationRuntime(), ledger=SessionLedger())
+    runtime.episode_id = "conversation-refinement"
+    runtime.inputs = {"current": {"text": "哼，挺有意思的。", "final": True, "transcript_updates": []}}
+    runtime.last_turn_id = "current"
+    wakes = []
+    runtime._wake = lambda kind: wakes.append(kind)
+    asyncio.run(runtime.observe("USER_INPUT_REFINED", turn_id="current", text="哼，挺有意思的。",
+        source="sensevoice", source_revision=1, audio_cues=[{"emotion": "HAPPY"}]))
+    assert wakes == ["USER_INPUT_REFINED"]
+    assert runtime._pending_transcript_turn_id == "current"
+    assert runtime.inputs["current"]["refined_text"] == "哼，挺有意思的。"
+    assert runtime.inputs["current"]["transcript_updates"][-1]["audio_cues"] == [{"emotion": "HAPPY"}]
+
+
 def test_same_source_revision_is_idempotent_without_semantic_comparison():
     async def scenario():
         class Registry:

@@ -39,6 +39,7 @@ class StreamingPunctuation:
         self.rule_finalizations = 0  # rule_finalizations（无模型句末预测时规则补句号次数）。
         self._turns: dict[str, _Turn] = {}  # turns（各识别子轮次状态）。
         self._load_attempted = False  # load_attempted（已尝试加载；失败后重启再试）。
+        self.resource_footprint = None  # resource_footprint（加载及预热的内存增量估算）。
 
     def load(self) -> None:
         if self._load_attempted:
@@ -156,4 +157,5 @@ class StreamingPunctuation:
             "last_error": self.last_error,  # last_error（最近推理回退原因）。
             "rule_finalizations": self.rule_finalizations,  # rule_finalizations（规则补句号次数）。
             "startup_timings_ms": dict(self.timings_ms),  # startup_timings_ms（启动耗时）。
+            "resource_footprint": self.resource_footprint,  # resource_footprint（共享进程加载增量估算）。
         }

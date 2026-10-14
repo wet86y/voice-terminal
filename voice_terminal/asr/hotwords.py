@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from ..resources import model_load_footprint
 import logging
 import math
 import re
@@ -103,6 +104,7 @@ class HotwordService:
         self.executors = {lane: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"hotword-{lane}") for lane in ("stream", "final")}
         self.pending = {}  # pending（仍在执行的任务；超时后也禁止堆积）。
         self.last_status = "empty"  # last_status（最近一次处理状态）。
+        self.resource_footprint = None  # resource_footprint（索引首次加载增量，含音素词典）。
 
     @staticmethod
     def prepare(value: object) -> HotwordBank:
@@ -118,11 +120,19 @@ class HotwordService:
                 bank.matchers[lane] = matcher
         return bank
 
+    def prepare_measured(self, value: object) -> HotwordBank:
+        """prepare_measured（索引准备及归属估算）：供启动和热更新共用。"""
+        with model_load_footprint() as footprint:
+            bank = self.prepare(value)
+        if self.resource_footprint is None and bank.matchers:
+            self.resource_footprint = footprint
+        return bank
+
     async def configure(self, value: object):
         async with self.update_lock:
             settings = validate_hotwords(value() if callable(value) else value)  # 在锁内读取，避免启动旧快照覆盖刚保存的设置。
             if settings != self.bank.settings:
-                self.bank = await asyncio.to_thread(self.prepare, settings)
+                self.bank = await asyncio.to_thread(self.prepare_measured, settings)
 
     def _turn(self, key):
         key = key[0] if isinstance(key, tuple) else key  # 同一发言续段变更代次，词表仍固定。
@@ -247,11 +257,9 @@ class HotwordService:
         return limit
 
     def clear(self):
+        """清除轮次投影；原生线程未结束时保留通道占用，避免重建线程池绕过限流。"""
         self.turns.clear()
-        self.pending.clear()
-        for executor in self.executors.values():
-            executor.shutdown(wait=False, cancel_futures=True)
-        self.executors = {lane: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"hotword-{lane}") for lane in ("stream", "final")}
+        self.pending = {lane: task for lane, task in self.pending.items() if not task.done()}
 
     def close(self):
         self.clear()
