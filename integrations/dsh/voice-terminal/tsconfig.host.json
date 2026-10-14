@@ -17,6 +17,8 @@
     "src/client/**"
   ],
   "references": [
+    { "path": "../../../.local/build/dsh/source/packages/session/session-projection" },
+    { "path": "../../../.local/build/dsh/source/packages/attachment/attachment" },
     {
       "path": "../../../.local/build/dsh/source/vendor/cordis"
     },

@@ -297,10 +297,20 @@ class ShadowRuntime(ShadowToolLoopMixin):
             })
 
     def _append_context(self, label: str, payload: dict[str, Any]) -> None:
+        frames = payload.get("frames", [])
+        multimodal = any(frame.get("kind") == "observation" for frame in frames)
         self._append({
             "role": "system",
-            "content": label + "\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            "content": label + "\n" + json.dumps({**payload, "frames": []} if multimodal else payload,
+                                                ensure_ascii=False, separators=(",", ":")),
         })
+        if multimodal:
+            for frame in frames:
+                if frame.get("kind") == "observation":
+                    self._append({"role": "user", "content": frame["content"]["parts"],
+                                  "observation": frame["content"]})  # observation（附件引用）：归档不复制编码。
+                else:
+                    self._append({"role": "system", "content": json.dumps(frame, ensure_ascii=False, separators=(",", ":"))})
         self._append({"role": "system", "content": INTENT_REASSESSMENT_PROMPT})
 
     def _apply_pending_context(self) -> bool:
@@ -362,6 +372,16 @@ class ShadowRuntime(ShadowToolLoopMixin):
         retry: bool = True, activity_mode: str | None = None,
         activity_item_id: str | None = None,
     ) -> ShadowProviderResponse:
+        from ..session.multimodal import resolve_content, responses_content
+        projected = []
+        for item in input_items:
+            material = item.get("observation")
+            if material is not None:
+                ledger = getattr(self.context_source, "ledger", self.context_source)
+                projected.append({"role": "user", "content": responses_content(resolve_content(material, ledger.screen_attachment))})
+            else:
+                projected.append(item)
+        input_items = projected
         normalized_effort = "off" if reasoning_effort == "none" else reasoning_effort
         if normalized_effort not in self.allowed_reasoning:
             raise ShadowProviderError(
@@ -619,15 +639,16 @@ class ShadowRuntime(ShadowToolLoopMixin):
 
 
     def _estimate_tokens(self) -> int:
-        raw = json.dumps(self.working_trace, ensure_ascii=False, separators=(",", ":"))
-        ascii_count = sum(ord(char) < 128 for char in raw)
-        return max(1, (ascii_count + 3) // 4 + len(raw) - ascii_count)
+        return self._estimate_items_tokens(self.working_trace)
 
     @staticmethod
     def _estimate_items_tokens(items: Sequence[dict[str, Any]]) -> int:
-        raw = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+        from ..screen_capture import image_summary
+        raw = json.dumps(image_summary(items), ensure_ascii=False, separators=(",", ":"))
         ascii_count = sum(ord(char) < 128 for char in raw)
-        return max(1, (ascii_count + 3) // 4 + len(raw) - ascii_count)
+        images = sum(part.get("type") in {"image", "input_image"} for item in items
+                     if isinstance(item.get("content"), list) for part in item["content"] if isinstance(part, dict))
+        return max(1, (ascii_count + 3) // 4 + len(raw) - ascii_count) + images * 1024
 
     def _status_trace_prefix(
         self, trace: Sequence[dict[str, Any]], *, budget: int | None = None,

@@ -3,6 +3,7 @@ import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { Volatile } from '@deepseek-ai/cordis'
 import type { Json } from '../shared/protocol.js'
 import type { CallbackScope } from '../shared/callback.js'
+import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 export interface Config {
   /** HTTP route prefix（HTTP 路由前缀）. */
   readonly routePrefix: string
@@ -48,6 +49,16 @@ export type RuntimeActivity =
   | { stream: 'approval'; phase: 'started' | 'completed' | 'failed'; /** item_id（权限卡片标识）。 */ item_id: string; /** approval_id（待决权限标识）。 */ approval_id: string; /** tool_name（待授权工具）。 */ tool_name: string; /** text（请求内容）。 */ text: string }
 
 export interface Binding {
+  /** attachments（官方附件服务）：沿用默认持久存储。 */
+  attachments?: AttachmentStore | undefined
+  /** imageAttachments（已收纳图片）：语音附件标识到原生引用的映射。 */
+  imageAttachments?: Map<string, { hash: string; ref: ImageAttachmentRef }> | undefined
+  /** contextFrames（共享消息接收身份）：来源标记随 DSH 历史保存并恢复。 */
+  contextFrames?: Map<string, string> | undefined
+  /** restoreContextFrames（持久身份恢复）：读取完整日志投影，不依赖当前压缩后的模型表面。 */
+  restoreContextFrames?: (() => Map<string, string>) | undefined
+  /** contextOperation（上下文提交锁）：附件解析期间同一绑定串行更新。 */
+  contextOperation?: Promise<void> | undefined
   /** toolArguments（参数缓存）：仅用于权限卡片显示，不改变工具行为。 */
   toolArguments?: Map<string, string>
   /** pendingApprovals（待决权限）：取消或切换运行时必须结算。 */

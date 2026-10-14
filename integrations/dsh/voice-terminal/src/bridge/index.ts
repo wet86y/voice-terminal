@@ -8,16 +8,20 @@ import { registerSessionEvents, stopRuntimeActivity } from './events.js'
 import { createBridgeRoute } from './http.js'
 import { stopRuntimeReminder } from './context.js'
 import { registerExtendedActivity } from './runtime-details.js'
+import { registerVoiceContextProjection } from './image-history.js'
+import { registerVoiceImageSummaryGuard } from './images.js'
 import type { Binding, Config } from './contracts.js'
 export type { Config } from './contracts.js'
 export const name = BRIDGE_NAME
-export const inject = ['webServer', 'agents', 'sessions', 'agentPresets', 'agentDefaultModel', 'llm', 'sessionTitle', 'settings', 'workspaceRegistry', 'loader', 'approval', 'jobs']
+export const inject = ['webServer', 'agents', 'sessions', 'sessionProjections', 'agentPresets', 'agentDefaultModel', 'llm', 'attachments', 'sessionTitle', 'settings', 'workspaceRegistry', 'loader', 'approval', 'jobs']
 
 export function apply(ctx: Context, config: Config): void {
   if (!TOKEN) throw new Error('VOICE_DSH_BRIDGE_TOKEN is required')
   if (!CALLBACK_ORIGIN.startsWith('http://127.0.0.1:')) throw new Error('VOICE_DSH_CALLBACK_ORIGIN must be loopback HTTP')
   if (!config.routePrefix.startsWith('/') || config.routePrefix.endsWith('/')) throw new Error('invalid routePrefix')
   const bindings = new Map<string, Binding>()
+  registerVoiceContextProjection(ctx)
+  registerVoiceImageSummaryGuard(ctx, bindings)
   let startupError: unknown
   const settingsReady = initializeVoiceTerminalSettings(ctx, config).catch((error) => {
     startupError = error

@@ -8,6 +8,7 @@ from html import escape
 from typing import Any
 from pathlib import Path
 from .storage import SessionJournal, StoredSequence, StoredSet
+from ..screen_capture import ScreenCaptureService
 
 from .contracts import DeliveryReport, ToolExchange
 from .context_frames import ContextFrame, ContextLane
@@ -60,6 +61,9 @@ class SessionLedger:
         # It is owned here because the ledger is the durable conversation of
         # record: the controller appends the terminal states it publishes.
         self.conversation = ConversationLog()
+        self.screen_capture = ScreenCaptureService()
+        self.image_records = []  # image_records（编码附件独立序列，不注入语义历史）。
+        self.image_cache_dir = None  # image_cache_dir（可重建临时文件目录）。
         self._committed_delivery_ids: set[str] = set()
         # The relay has at-least-once delivery semantics.  Keep a bounded
         # idempotency window so a sink exception after partial acceptance
@@ -118,6 +122,8 @@ class SessionLedger:
                 prepared[name] = StoredSequence(journal, name, decode, restored=namespaces.get(name))
             for name in ("_committed_delivery_ids", "_shadow_current_turn_keys"):
                 prepared[name] = StoredSet(journal, name, restored=namespaces.get(name))
+            prepared["image_records"] = StoredSequence(journal, "screen_images", lambda value: value,
+                restored=(state or {}).get("image_sequence"))
             if state:
                 frames = prepared["_shadow_frames"]
                 restored_revision = max(state["shadow_input_revision"], frames[-1].revision if frames else 0)
@@ -136,6 +142,7 @@ class SessionLedger:
             journal.close(export_document=False)
             raise
         self.journal = journal
+        self.image_cache_dir = directory / "screen-images"
         for name, sequence in prepared.items():
             setattr(self, name, sequence)
         if state:
@@ -151,6 +158,7 @@ class SessionLedger:
             getattr(self, name).on_change = self.persist_state
         for name in ("_committed_delivery_ids", "_shadow_current_turn_keys"):
             getattr(self, name).values.on_change = self.persist_state
+        self.image_records.on_change = self.persist_state
         self.conversation.on_change = self.persist_state
         self._storage_restoring = False
         self.persist_state()
@@ -164,6 +172,7 @@ class SessionLedger:
         sequences.update({name: getattr(self, name).values.checkpoint()
                           for name in ("_committed_delivery_ids", "_shadow_current_turn_keys")})
         self.journal.write(self.journal.STATE_KEY, {
+            "image_sequence": self.image_records.checkpoint() if isinstance(self.image_records, StoredSequence) else None,
             "schema_version": 1, "sequences": sequences,  # 结构版本、正文序列命名空间。
             "shadow_context_epoch": self._shadow_context_epoch,  # 后台上下文代次。
             "shadow_input_revision": self._shadow_input_revision,  # 后台上下文修订号。
@@ -180,11 +189,74 @@ class SessionLedger:
         field = "turn_id" if kind == "input" else "speech_id"
         return next((item for item in reversed(self.entries) if item.kind == kind and item.metadata.get(field) == identity), None)
 
+    def store_screen_capture(self, packet, conversation_id, turn_id):
+        """store_screen_capture（保存双图）：编码仅独立记录一次，聊天快照只含描述。"""
+        import base64
+        packet = {**packet, "conversation_id": conversation_id, "turn_id": turn_id}
+        self.image_records.append(packet)
+        if self.image_cache_dir is not None:
+            self.image_cache_dir.mkdir(parents=True, exist_ok=True)
+            for item in packet["attachments"]:
+                (self.image_cache_dir / item["attachment_id"]).write_bytes(base64.b64decode(item["base64"]))
+        self.update_screen_status(packet, "待发送")
+        return packet
+
+    def update_screen_status(self, packet, status):
+        from datetime import datetime, timezone
+        self.conversation.append("screen_capture", conversation_id=packet["conversation_id"],
+            turn_id=packet.get("turn_id", ""), speech_id=packet["capture_id"], text="屏幕截图",
+            at=datetime.fromtimestamp(packet["captured_at"], timezone.utc).isoformat(),
+            status=status, attachments=[{"conversation_id": packet["conversation_id"], **{k: v for k, v in a.items() if k != "base64"}} for a in packet["attachments"]])
+
+    def commit_screen_capture(self, packet):
+        """commit_screen_capture（提交观察事实）：与文本同属追加历史，重试只提交一次。"""
+        if self._find_entry("observation", packet["capture_id"]) is not None:
+            return False
+        from .multimodal import observation
+        content = observation(packet)
+        restoring = self._storage_restoring
+        self._storage_restoring = True
+        try:
+            self.entries.append(SessionLedgerEntry("observation", content, {
+                "speech_id": packet["capture_id"], "source": "screen_capture"}))
+            self._commit_shadow_input("external_system", "observation", content)
+        finally:
+            self._storage_restoring = restoring
+        self.persist_state()
+        return True
+
+    def screen_attachment(self, conversation_id, attachment_id):
+        import base64
+        for packet in reversed(self.image_records):
+            if packet["conversation_id"] == conversation_id:
+                for item in packet["attachments"]:
+                    if item["attachment_id"] == attachment_id:
+                        if self.image_cache_dir is not None:
+                            self.image_cache_dir.mkdir(parents=True, exist_ok=True)
+                            path = self.image_cache_dir / attachment_id
+                            if not path.is_file():
+                                path.write_bytes(base64.b64decode(item["base64"]))
+                        return item
+        return None
+
+    def clear_screen_files(self):
+        if self.image_cache_dir is not None and self.image_cache_dir.is_dir():
+            for path in self.image_cache_dir.iterdir():
+                if path.is_file():
+                    path.unlink()
+
     def close_storage(self) -> bool:
-        return self.journal.close() if self.journal is not None else True
+        self.screen_capture.close()
+        saved = self.journal.close() if self.journal is not None else True
+        if saved:
+            self.clear_screen_files()
+        return saved
 
     def reset(self) -> None:
         self._storage_restoring = True
+        self.screen_capture.invalidate()
+        self.clear_screen_files()
+        self.image_records.clear()
         self.entries.clear()
         self.records.clear()
         self.delivery_records.clear()
@@ -720,7 +792,11 @@ class SessionLedger:
         # conversation facts and externally sourced material.
         messages: list[dict[str, Any]] = []
         for entry in self.entries:
-            if entry.kind == "input":
+            if entry.kind == "observation":
+                from .multimodal import resolve_content
+                messages.append(ContextFrame.make(ContextLane.HISTORY, "user",
+                    resolve_content(entry.content, self.screen_attachment), context_kind="observation"))
+            elif entry.kind == "input":
                 messages.append(ContextFrame.make(
                     ContextLane.HISTORY, "user", self._render_input(entry),
                 ))

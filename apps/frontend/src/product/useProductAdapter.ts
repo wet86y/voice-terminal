@@ -25,7 +25,7 @@ import { speechMessageKey, userMessageKey } from './conversation-identity'
 import { DEFAULT_SETTINGS, DEFAULT_REGISTRY, DEFAULT_DSH, MAX_WAKE_KEYWORDS, defaultCurrent, defaultShadow, normalizeSettings, normalizeRegistry, normalizeRuntimeState, updateSettingsFromResponse } from './normalization'
 export { MAX_WAKE_KEYWORDS } from './normalization'
 
-export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models' | 'compute' | 'system' | 'workspace'
+export type ProductSettingsTab = 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models' | 'compute' | 'system' | 'workspace' | 'screen'
 export type ProductPage = 'home' | 'settings'
 export type AssignmentSlot = 'voice' | 'shadow' | 'status'
 
@@ -55,7 +55,8 @@ export interface ProviderFormState {
 /** ConversationRow（会话显示条目）：保持服务端顺序，消息身份不包含结算阶段。 */
 export interface ConversationRow {
   key: string // key（贯穿显示阶段的气泡身份）。
-  role: 'user' | 'assistant' // role（消息发送方）。
+  role: 'user' | 'assistant' | 'tool' // role（消息发送方）。
+  attachments?: import('../types').ImageAttachment[] // attachments（图片附件）。
   kind: ConversationEntryKind // kind（用户、助手或系统播报类型）。
   text: string // text（最新完整正文）。
   at: string // at（服务端记录时间）。
@@ -278,6 +279,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     }
     const nextSettings = normalizeSettings(value.settings)
     computeSavedDevices.value = { ...nextSettings.compute.devices }
+    settings.screen_capture = nextSettings.screen_capture
     Object.assign(settings.wake, nextSettings.wake)
     Object.assign(settings.silence, nextSettings.silence)
     settings.quiet_hours = nextSettings.quiet_hours
@@ -841,7 +843,8 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
         key: entry.kind === 'user_turn'
           ? userMessageKey(entry.turn_id || `${entry.conversation_id}:${entry.seq}`)
           : speechMessageKey(entry.conversation_id, entry.speech_id || String(entry.seq)),
-        role: entry.kind === 'user_turn' ? 'user' as const : 'assistant' as const,
+        role: entry.kind === 'screen_capture' ? 'tool' as const : entry.kind === 'user_turn' ? 'user' as const : 'assistant' as const,
+        attachments: entry.attachments?.map(a => ({ ...a, conversation_id: entry.conversation_id })),
         kind: entry.kind,
         text: entry.text,
         at: entry.at,
@@ -1016,6 +1019,19 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     // One phrase is mandatory: the wake word must always exist.
     if (wakeForm.keywords.length <= 1) return
     wakeForm.keywords.splice(index, 1)
+  }
+
+  async function saveScreenCapture(value: import('./types').ScreenCaptureSettings) {
+    await enqueue(async () => {
+      saving.value = true
+      try {
+        const result = await productApi.saveScreenCapture(value)
+        updateSettingsFromResponse(settings, result)
+        setNotice(result.message || '屏幕图像设置已保存。')
+        await loadSnapshot()
+      } catch (error) { setError(error) }
+      finally { saving.value = false }
+    })
   }
 
   async function saveWake() {
@@ -1549,6 +1565,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     setReasoningMode,
     toggleProviderReasoning,
     saveWake,
+    saveScreenCapture,
     saveSilence,
     quietHoursForm,
     quietStatus,

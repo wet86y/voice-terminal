@@ -195,6 +195,7 @@ onBeforeUnmount(() => { cancelSessionOperation(); window.removeEventListener("ke
 const conversationModel = computed<WorkbenchModel['conversation']>(() => messages.value.map((item) => ({
   key: item.id,
   role: item.role,
+  attachments: item.attachments,
   text: item.text,
   time: item.time,
   status: item.role === "assistant" ? replayMode.value ? '固定日志回放' : "已完成播报" : "已完成识别",

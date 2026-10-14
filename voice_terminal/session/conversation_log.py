@@ -91,6 +91,7 @@ class ConversationLog:
         delivery: dict[str, Any] | None = None,
         termination: str = "",
         at: str | None = None,
+        attachments: list[dict] | None = None,  # attachments（图像描述，不携带编码）。
     ) -> dict[str, Any]:
         """Record one line and publish it.
 
@@ -126,6 +127,8 @@ class ConversationLog:
                 entry["delivery"] = dict(delivery)
             if conversation_id:
                 entry["conversation_id"] = conversation_id
+        if attachments is not None:
+            entry["attachments"] = [dict(item) for item in attachments]
         published = dict(entry)
         published["delivery"] = dict(entry.get("delivery") or {})
         if self.on_change is not None:

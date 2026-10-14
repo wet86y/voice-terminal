@@ -113,3 +113,7 @@ uvicorn==0.34.0
 watchfiles==1.2.0
 webrtcvad-wheels==2.0.14
 websockets==15.0.1
+
+# 屏幕抓屏及系统组件接口依赖。
+dxcam==0.3.0
+comtypes==1.4.17

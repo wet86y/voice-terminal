@@ -1,3 +1,4 @@
+import { configureImageChannel, clearImageChannel, acceptImageChunk, suspendImageChannel, resumeImageChannel } from '../interface/image-channel'
 import { computed, reactive, ref, shallowRef, watch } from 'vue'
 import type {
   AgentEpisodeSnapshot,
@@ -891,6 +892,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     if (lastSequence.value !== null && message.seq <= lastSequence.value) return
     lastSequence.value = message.seq
     const payload = isRecord(message.payload) ? message.payload : {}
+    if (message.type === 'conversation.image') { void acceptImageChunk(payload); return }
     if (message.type === 'audio.levels') {
       // source（来源）、levels（音量值）、generation（轮代）必须与实际状态一致。
       const eligible = listening.value && (
@@ -905,6 +907,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     }
     lastServerTimestamp.value = message.timestamp
     if (message.type === 'conversation.snapshot') {
+      if (conversationEntries.value.length && Array.isArray(payload.entries) && payload.entries.length && payload.entries[0]?.conversation_id !== conversationEntries.value[0]?.conversation_id) clearImageChannel()
       conversationLog.applySnapshot(payload as ConversationSnapshotPayload)
       syncConversation()
       return
@@ -1197,6 +1200,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         if (socket.value !== nextSocket) return
         connection.value = 'connected'
         sendCommand('subscribe', { client: 'voice-terminal-web', version: '0.1.0' })
+        resumeImageChannel()
       }
       nextSocket.onmessage = (event) => {
         if (socket.value === nextSocket) handleMessage(event.data)
@@ -1207,6 +1211,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         canStart.value = false
       }
       nextSocket.onclose = () => {
+        suspendImageChannel()
         if (socket.value !== nextSocket) return
         clearSessionOperation()
         socket.value = null
@@ -1257,7 +1262,10 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     return sendCommand('session.reasoning_mode', { mode })
   }
 
+  configureImageChannel((conversationId, attachmentId) => sendCommand('conversation.image.read', { conversation_id: conversationId, attachment_id: attachmentId }))
+
   function disconnect() {
+    suspendImageChannel()
     clearSessionOperation()
     const activeSocket = socket.value
     socket.value = null
@@ -1271,7 +1279,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     Object.assign(services, createOfflineStatuses())
   }
 
-  function dispose() { disconnect() }
+  function dispose() { disconnect(); clearImageChannel(); configureImageChannel(undefined) }
 
   return {
     connection,

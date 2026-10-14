@@ -9,6 +9,8 @@ import { BRIDGE_NAME as name, MAX_OBSERVER_RECORDS } from '../shared/identity.js
 import { bindingCallback } from './callbacks.js'
 import { createBridgeUserMessage } from './messages.js'
 import type { Binding, PendingContext } from './contracts.js'
+import { frameKey, freshFrames, imageContent, rememberFrames, prepareContextImages } from './images.js'
+import { digest } from '../shared/protocol.js'
 function publicContextMessage(body: Envelope, update: 'snapshot' | 'delta'): string {
   const frames = Array.isArray(body.frames) ? body.frames : []
   return [
@@ -33,7 +35,8 @@ function contextMessage(binding: Binding, pending: PendingContext): UserMessage 
     `VOICE GATE DEFERRED CONTEXT: revisions through ${pending.deferredThrough ?? pending.revision} were delayed to this next turn.`,
     '',
   ].join('\n') : ''
-  return createBridgeUserMessage([{
+  const mixed = pending.frames.some(frame => record(frame).kind === 'observation')
+  const message = createBridgeUserMessage([{
     type: 'text',
     text: prefix + publicContextMessage({
       protocol_version: BRIDGE_PROTOCOL_VERSION,
@@ -43,9 +46,12 @@ function contextMessage(binding: Binding, pending: PendingContext): UserMessage 
       epoch: binding.epoch,
       context_revision: pending.revision,
       from_revision: pending.fromRevision,
-      frames: pending.frames,
+      frames: mixed ? [] : pending.frames,
     }, pending.update),
-  }], pending.messageId)
+  }, ...(mixed ? imageContent(binding, pending.frames) : [])], pending.messageId)
+  const keys: Record<string, string> = {}  // 仅本批身份；完整追加日志投影负责恢复，避免逐条复制累计索引。
+  for (const frame of pending.frames) keys[frameKey(binding, frame)] = digest(frame)
+  return { ...message, source: { kind: 'plugin:voice-terminal-shadow-bridge', voice_context: { epoch: binding.epoch, voice_session_id: binding.voiceSessionId, frames: keys } } }
 }
 
 export function enqueueAuthoritativeContext(
@@ -56,7 +62,8 @@ export function enqueueAuthoritativeContext(
 ): 'inserted' | 'replaced' | 'already_claimed' {
   const revision = Number(body.context_revision)
   const fromRevision = update === 'snapshot' ? 0 : Number(body.from_revision)
-  const frames = (Array.isArray(body.frames) ? body.frames : []) as Json[]
+  const rawFrames = (Array.isArray(body.frames) ? body.frames : []) as Json[]
+  const frames = freshFrames(binding, rawFrames, true)
   const prior = binding.pendingContext
   if (prior) {
     const merged: PendingContext = update === 'snapshot'
@@ -67,11 +74,12 @@ export function enqueueAuthoritativeContext(
           update: prior.update,
           fromRevision: prior.fromRevision,
           revision,
-          frames: [...prior.frames, ...frames],
+          frames: [...new Map([...prior.frames, ...frames].map(frame => [frameKey(binding, frame), frame])).values()],
           activationId: prior.activationId,
           deferredThrough: prior.deferredThrough,
         }
     if (binding.handle!.agent.inbox.replace(MessageId(prior.messageId), contextMessage(binding, merged))) {
+      rememberFrames(binding, merged.frames)
       binding.pendingContext = merged
       binding.queuedRevision = revision
       binding.queuedMessages?.set(merged.messageId, revision)
@@ -84,13 +92,16 @@ export function enqueueAuthoritativeContext(
       return 'replaced'
     }
   }
+  const remaining = freshFrames(binding, rawFrames)
+  if (!remaining.length) return 'already_claimed'
   const pending: PendingContext = {
-    messageId: preferredMessageId ?? randomUUID(), update, fromRevision, revision, frames,
+    messageId: preferredMessageId ?? randomUUID(), update, fromRevision, revision, frames: remaining,
   }
   binding.pendingContext = pending
   binding.queuedRevision = revision
   binding.queuedMessages?.set(pending.messageId, revision)
   binding.handle!.agent.inject(contextMessage(binding, pending))
+  rememberFrames(binding, pending.frames)
   const action = prior ? 'already_claimed' : 'inserted'
   console.info('[voice-shadow-bridge] context merge', {
     action, from_revision: fromRevision, context_revision: revision,
@@ -102,11 +113,11 @@ export function enqueueAuthoritativeContext(
 export function holdAuthoritativeContext(binding: Binding, body: Envelope, update: 'snapshot' | 'delta'): void {
   binding.gateObserved = true
   const revision = Number(body.context_revision)
-  const frames = (Array.isArray(body.frames) ? body.frames : []) as Json[]
+  const frames = freshFrames(binding, (Array.isArray(body.frames) ? body.frames : []) as Json[])
   const prior = binding.heldContext
   binding.heldContext = update === 'snapshot' || !prior
     ? { messageId: prior?.messageId ?? randomUUID(), update, fromRevision: update === 'snapshot' ? 0 : Number(body.from_revision), revision, frames }
-    : { ...prior, revision, frames: [...prior.frames, ...frames] }
+    : { ...prior, revision, frames: [...new Map([...prior.frames, ...frames].map(frame => [frameKey(binding, frame), frame])).values()] }
   console.info('[voice-shadow-bridge] context gate', {
     action: 'held', activation_id: binding.activationId ?? '',
     from_revision: binding.heldContext.fromRevision, context_revision: revision,
@@ -294,9 +305,11 @@ export function reassertContextAfterCompaction(binding: Binding): void {
     request_id: randomUUID(), voice_session_id: binding.voiceSessionId,
     dsh_session_id: binding.dshSessionId, epoch: binding.epoch,
     since_revision: 0,
-  }).then(value => {
+  }).then(async value => {
     if (binding.state !== 'active' || binding.callbacks?.signal.aborted) return
     if (value?.result !== 'accepted' || !Array.isArray(value.frames)) return
+    await prepareContextImages(binding, value.frames as Json[])
+    if (binding.state !== 'active' || binding.callbacks?.signal.aborted) return
     if (!binding.gateObserved) {
       enqueueAuthoritativeContext(binding, {
         protocol_version: BRIDGE_PROTOCOL_VERSION,
@@ -311,9 +324,10 @@ export function reassertContextAfterCompaction(binding: Binding): void {
     const pending: PendingContext = {
       messageId: randomUUID(), update: 'snapshot',
       fromRevision: 0, revision: guided,
-      frames: value.frames.filter(frame => Number(record(frame).revision ?? 0) <= guided),
+      frames: freshFrames(binding, value.frames.filter(frame => Number(record(frame).revision ?? 0) <= guided)),
     }
     binding.handle!.agent.inject(contextMessage(binding, pending))
+    rememberFrames(binding, pending.frames)
     console.info('[voice-shadow-bridge] context merge', {
       action: 'compaction_reassert', activation_id: binding.activationId ?? '',
       context_revision: guided, message_id: pending.messageId,

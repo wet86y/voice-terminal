@@ -157,9 +157,13 @@ class AgentContextMixin:
         ]
         if len(current_users) > 1:
             raise RuntimeError("request tail may contain at most one current user input")
-        details = tail[len(current_users):-3]
+        image_frames = [f for f in tail if ContextFrame.kind_of(f) == "screen_capture"]
+        if len(image_frames) > 1 or any(f.get("role") != "user" or not isinstance(f.get("content"), list) for f in image_frames):
+            raise RuntimeError("截屏上下文形状无效")
+        details = tail[len(current_users) + len(image_frames):-3]
         if (
             tail[:len(current_users)] != current_users
+            or tail[len(current_users):len(current_users) + len(image_frames)] != image_frames
             or any(frame.get("role") != "system"
                    or ContextFrame.kind_of(frame) not in REQUEST_SYSTEM_CONTEXT_KINDS
                    for frame in details)
@@ -386,6 +390,10 @@ class AgentContextMixin:
                 ContextLane.REQUEST_TAIL, "system", KWS_WAKE_PROMPT,
                 context_kind=prompt_kind,
             ))
+        error = getattr(self, "_screen_error", "")
+        if error:
+            messages.append(ContextFrame.make(ContextLane.REQUEST_TAIL, "system", error, context_kind="system_context"))
+            self._screen_error = ""
         messages = consolidate_request_tail(messages)
         self._guard_context_contract(messages)
         self._update_context_metrics(messages)

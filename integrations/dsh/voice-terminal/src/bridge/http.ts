@@ -1,5 +1,6 @@
 import { record } from '../shared/json-record.js'
 import { SessionId } from '@deepseek-ai/dsh-session'
+import { restoreVoiceContextFrames } from './image-history.js'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { Context } from '../shared/services.js'
 /** HTTP component（本机接口组件）：现有 Bridge 2.0 路由与会话操作。 */
@@ -17,6 +18,7 @@ import { enqueueAuthoritativeContext, holdAuthoritativeContext, releaseHeldConte
 import { exportSessionPage, readSessionTelemetry } from './observer.js'
 import type { Binding, Config } from './contracts.js'
 import { stopRuntimeActivity } from './events.js'
+import { prepareContextImages, installImageCapabilityGuard } from './images.js'
 
 export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<string, Binding>, settingsReady: ReturnType<typeof import('./settings.js').initializeVoiceTerminalSettings>, startupError: () => unknown) {
   return {
@@ -29,6 +31,7 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
         json(res, 200, { protocol_version: BRIDGE_PROTOCOL_VERSION, status: 'ok', bundle_version: BUNDLE_VERSION }); return
       }
       if (req.method !== 'POST') { json(res, 404, result('not_found')); return }
+      let releaseContext: (() => void) | undefined
       try {
         const body = await readBody(req, config.maxBodyBytes)
         assertEnvelope(body)
@@ -44,7 +47,7 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map(), pendingToolActivations: new Map(), actionSeq: 0, actionQueue: Promise.resolve(), assistantStreamRevision: 0, pendingThinkingDelta: '', queuedMessages: new Map(), reminderIntervalMs, nextReminderMs: reminderIntervalMs, queuedRevision: 0, claimedRevision: 0 }
           const preset = await ctx.agentPresets.resolve('shadow-agent')
           const modelSelection = ctx.agentDefaultModel.currentSelection()
-          const setup = async (agentCtx: Context) => { await ctx.agentPresets.mount(agentCtx, preset.id); installRootTools(agentCtx, binding) }
+          const setup = async (agentCtx: Context) => { await ctx.agentPresets.mount(agentCtx, preset.id); installRootTools(agentCtx, binding); installImageCapabilityGuard(agentCtx, binding) }
           let handle: AgentHandle
           if (path === 'session.resume') {
             // A resumed voice session keeps its persisted Session settings; plugin defaults
@@ -74,6 +77,8 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
             }
           }
           binding.handle = handle
+          binding.restoreContextFrames = () => restoreVoiceContextFrames(ctx, binding)
+          binding.attachments = ctx.get('attachments')
           binding.callbacks = new CallbackScope()
           // archive_only（仅恢复归档）：不注入提示或启动推理，保留原始持久记录。
           if (path === 'session.resume' && body.archive_only !== true) discardResumedAuthoritativeContext(binding)
@@ -92,6 +97,14 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           json(res, 200, result('duplicate')); return
         }
         if (existing.epoch !== body.epoch || existing.state === 'retired') { json(res, 409, result('stale')); return }
+        if (path.startsWith('context.') || path === 'wake') {
+          const previous = existing.contextOperation ?? Promise.resolve()
+          existing.contextOperation = new Promise<void>(resolve => { releaseContext = resolve })
+          await previous
+          const replay = existing.requests.get(body.request_id)
+          if (replay) { json(res, 200, replay.digest === bodyDigest ? result('duplicate', { original: replay.response }) : result('conflict')); return }
+          if (record(existing).state === 'retired' || existing.epoch !== body.epoch) { json(res, 409, result('stale')); return }
+        }
         let response: Json
         if (path === 'approval.decide') {
           const pending = existing.pendingApprovals?.get(String(body.approval_id ?? ''))
@@ -115,6 +128,8 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           }
           else if (!isSnapshot && revision === existing.revision) response = result('conflict')
           else {
+            await prepareContextImages(existing, (Array.isArray(body.frames) ? body.frames : []) as Json[])
+            if (record(existing).state === 'retired' || existing.epoch !== body.epoch) { json(res, 409, result('stale')); return }
             if (body.guidance_delivery === 'hold') holdAuthoritativeContext(existing, body, isSnapshot ? 'snapshot' : 'delta')
             else {
               if (!existing.heldContext) existing.gateObserved = false
@@ -273,6 +288,8 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
         json(res, response && record(response).result === 'not_found' ? 404 : 200, response)
       } catch (error) {
         json(res, 400, result('conflict', { message: String(error instanceof Error ? error.message : error).slice(0, 160) }))
+      } finally {
+        releaseContext?.()
       }
     },
   }

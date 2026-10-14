@@ -139,7 +139,10 @@ def semantic_text(text: str) -> str:
 
 
 
-class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
+from .screen_input import ScreenInputMixin
+
+
+class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMixin):
     # Tool adapters already bound the provider response, but a search can
     # still contain several thousand characters of snippets and links.  Keep
     # the model-facing protocol bounded without changing the cached result or
@@ -163,6 +166,11 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         self._deferred_seen = set()
         self.options = options or AgentOptions()
         self.tools_enabled = tools_enabled
+        self._screen_pending = None  # 待认领的双图包。
+        self._screen_context_packet = None  # 当前请求的双图附件。
+        self._screen_requests = {}  # 原请求及重试引用。
+        self._screen_error = ""
+        self._screen_task = None
         if reasoning_mode not in {"fast", "deep"}:
             raise ValueError("reasoning_mode（运行模式）必须是 fast（快速）或 deep（深度）")
         self.reasoning_mode = reasoning_mode  # reasoning_mode（运行模式）：后续请求使用的快速或深度选择。
@@ -644,11 +652,13 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         return _fallback_token_estimate(serialized)
 
     def _update_context_metrics(self, messages, schemas=None) -> str:
-        request_shape = {"messages": messages, "tools": schemas or [], "thinking": {"type": "enabled"},
+        from ..screen_capture import image_summary
+        image_tokens = sum(1024 for m in messages if isinstance(m.get("content"), list) for p in m["content"] if p.get("type") in {"input_image", "image"})
+        request_shape = {"messages": image_summary(messages), "tools": schemas or [], "thinking": {"type": "enabled"},
                          "reasoning_effort": "low"}
         serialized = json.dumps(request_shape, ensure_ascii=False)
         self.context_chars = len(serialized)
-        self.context_token_estimate = self._estimate_tokens(serialized)
+        self.context_token_estimate = self._estimate_tokens(serialized) + image_tokens
         self.context_usage_percent = (
             self.context_token_estimate * 100 / self.options.max_context_tokens
             if self.options.max_context_tokens else 0.0
@@ -1319,6 +1329,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         scheduled revisit must not produce speech after the user stopped.
         """
 
+        self.invalidate_screen_capture()
         self.input_scope_closed = True
         self.ledger.clear_shadow_progress(reset_seen=True)
         self._retry_secondary_by_turn.clear()
@@ -2633,6 +2644,7 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             if "LLM_RETRY" not in self.pending and not any(
                 signal.source_turn_id == source_turn_id for signal in self.recovery_queue
             ):
+                self._settle_screen_context(source_turn_id or "", step_outcome)
                 self._retry_secondary_by_turn.pop(source_turn_id or "", None)
                 if self._retry_system_check and self._retry_system_check.get("system_check_id") == system_check_id:
                     self._retry_system_check = None
@@ -3019,9 +3031,16 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             )
             return
         shadow_actions = tuple(action for action in actions if action.name == "request_shadow")
-        invalid = tuple(action for action in actions if action.name != "request_shadow")
+        screen_actions = tuple(a for a in actions if a.name == "capture_screen")
+        invalid = tuple(action for action in actions if action.name not in {"request_shadow", "capture_screen"})
         if invalid:
             raise ProtocolError("unsupported action: " + ", ".join(action.name for action in invalid))
+        if screen_actions:
+            if any(a.arguments != {"request": True} or type(a.arguments.get("request")) is not bool for a in screen_actions):
+                raise ProtocolError("截屏请求参数无效")
+            if self._screen_task is None or self._screen_task.done():
+                self._screen_task = asyncio.create_task(self._capture_screen_action(identity, turn_id), name="screen-capture")
+                self._track_background_tool(self._screen_task)
         if shadow_actions:
             self._track_background_tool(asyncio.create_task(
                 self._submit_shadow_actions(identity, turn_id, shadow_actions),
@@ -3182,6 +3201,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             shadow_information = dict(self._retry_shadow_information_by_turn[retry_key])
         else:
             shadow_information = self.ledger.shadow_information_snapshot()
+        self._prepare_screen_context(retry_key, kinds, recovery)
+        self._claim_screen_context(retry_key)
         messages = self.messages(
             kinds,
             recovery_signal=recovery_signal,
@@ -3197,6 +3218,19 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
         if self.closed or not self.episode_id:
             return
         messages, compacted = self._fit_context(messages, [])
+        prepare_messages = getattr(self.provider, "prepare_messages", None)
+        input_scope_was_closed = self.input_scope_closed
+        if callable(prepare_messages):
+            restore_images = getattr(self.provider, "restore_image_transport", None)
+            if callable(restore_images):
+                restore_images(self.ledger.session_state.get("image_transport"))
+            messages = await prepare_messages(messages)
+            save_images = getattr(self.provider, "image_transport_snapshot", None)
+            if callable(save_images):
+                self.ledger.session_state["image_transport"] = save_images()
+                self.ledger.persist_state()
+        if self.closed or (self.input_scope_closed and not input_scope_was_closed):
+            return "input_scope_closed"
         # Cache history is intentionally never summarized, dropped or
         # rewritten.  ``over_budget_base`` is an observation, not a
         # compaction, so the UI must not claim otherwise.
@@ -3306,7 +3340,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             heard_chars=len(heard_text),
             active_same_turn=bool(speak_context.get("owner_scope") == "current_turn"),
         )
-        await self.emit("llm.context", {"messages": messages, "message_count": len(messages),
+        from ..screen_capture import image_summary
+        await self.emit("llm.context", {"messages": image_summary(messages), "message_count": len(messages),
                                          "context_chars": self.context_chars,
                                          "context_limit_tokens": self.options.max_context_tokens,
                                          "context_token_estimate": self.context_token_estimate,
@@ -3395,6 +3430,8 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
                 async for item in stream:
                     if self.closed or not self.episode_id:
                         return
+                    if item["type"] == "accepted":
+                        self._screen_accepted()
                     if item["type"] == "finish":
                         finished = True
                         metrics = item.get("stream_metrics")
@@ -3901,6 +3938,9 @@ class AgentEpisodeRuntime(DeferredSpeechMixin, AgentContextMixin):
             await self._settle_final_system_check(system_check_id)
 
     async def end(self, reason):
+        self.invalidate_screen_capture()
+        self._screen_requests.clear()
+        self._screen_context_packet = None
         old = self.episode_id
         self.scheduler.disarm()
         self.ledger.clear_shadow_progress(reset_seen=True)

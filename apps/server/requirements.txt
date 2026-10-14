@@ -22,3 +22,7 @@ aec-audio-processing==1.0.1
 # The AEC wheel's bundled has_voice() VAD is not initialized on Windows;
 # use the maintained WebRTC VAD binding on processed 10 ms frames.
 webrtcvad-wheels==2.0.14
+
+# 屏幕抓屏及系统组件接口依赖。
+dxcam==0.3.0
+comtypes==1.4.17

@@ -26,9 +26,7 @@ function run(args) {
 }
 
 // 所有调用入口（包括 setup）先进行类型检查，避免仅转译掩盖错误。
-for (const config of ['tsconfig.host.json', 'tsconfig.client.json']) {
-  run([resolve(sourceRoot, 'node_modules/typescript/bin/tsc'), '-p', resolve(here, config)])
-}
+run([resolve(here, 'typecheck.mjs')])
 run([resolve(here, 'check.mjs')])
 
 // 仅清理已验证的项目产物 lib（编译目录）；不触及宿主或用户存储。
@@ -87,7 +85,8 @@ if (process.argv.includes('--test')) {
   for (const name of Object.keys({ ...manifest.dependencies, ...manifest.peerDependencies })) {
     const alias = paths[name]?.[0]
     const packageRoot = alias ? dirname(alias.endsWith('/src') ? alias : dirname(alias)) : undefined
-    const resolver = packageRoot ? createRequire(resolve(sourceRoot, packageRoot, 'package.json')) : require
+    const resolver = packageRoot ? createRequire(resolve(sourceRoot, packageRoot, 'package.json'))
+      : manifest.dependencies[name] ? createRequire(resolve(here, 'package.json')) : require
     const entry = resolver.resolve(`${name}/package.json`)
     const target = resolve(outputRoot, 'node_modules', name)
     if (!existsSync(target)) {

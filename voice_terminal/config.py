@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .screen_capture import ScreenCaptureConfig
+
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -572,6 +574,7 @@ class AppConfig:
     quiet_hours: QuietHoursConfig = field(default_factory=QuietHoursConfig)  # quiet_hours（被动静默时间）。
     continuity: ContinuityConfig = field(default_factory=ContinuityConfig)  # continuity（交接整理配置）。
     smart_turn: InputOptions = field(default_factory=InputOptions)
+    screen_capture: ScreenCaptureConfig = field(default_factory=ScreenCaptureConfig)  # screen_capture（屏幕输入设置）。
     agent: AgentOptions = field(default_factory=AgentOptions)
     shadow_agent: ShadowAgentConfig = field(default_factory=ShadowAgentConfig)
     dsh: DshConfig = field(default_factory=DshConfig)
@@ -662,6 +665,7 @@ class AppConfig:
         llm = _section(data, "llm")
         tts = _section(data, "tts")
         bridge = _section(data, "text_bridge")
+        screen_capture = ScreenCaptureConfig(**_section(data, "screen_capture"))
         server = _section(data, "server")
         worker = _section(data, "asr_worker")
         speaker = _section(data, "speaker")
@@ -789,6 +793,7 @@ class AppConfig:
                              if _section(_section(data, "continuity"), "provider") else None),
             }),
             smart_turn=InputOptions.from_mapping(smart_turn_data, root),
+            screen_capture=screen_capture,
             agent=AgentOptions.from_mapping(_section(data, "agent")),
             shadow_agent=ShadowAgentConfig(
                 enabled=_bool(shadow.get("enabled"), True),

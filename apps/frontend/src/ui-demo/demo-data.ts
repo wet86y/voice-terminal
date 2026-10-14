@@ -155,7 +155,7 @@ export type PreviewScene = 'normal' | 'empty' | 'long' | 'loading' | 'error'
 /** PreviewOverlay（浮层展示）：启动、确认、成功和失败画面。 */
 export type PreviewOverlay = 'none' | 'startup' | 'confirm' | 'success' | 'failure'
 /** SettingsTab（展示设置页签）：本地模型设备与系统状态合并到组件页。 */
-export type SettingsTab = 'wake' | 'persona' | 'speaker' | 'wakes' | 'models' | 'compute' | 'workspace'
+export type SettingsTab = 'screen' | 'wake' | 'persona' | 'speaker' | 'wakes' | 'models' | 'compute' | 'workspace'
 /** PreviewPage（展示页面）：工作台或某个设置页。 */
 export type PreviewPage = 'home' | SettingsTab
 
@@ -194,11 +194,17 @@ export const longIdentifier = 'preview-only-very-long-model-and-component-identi
 
 export interface DemoMessage {
   /** id（消息标识）。 */ id: string
-  /** role（发言角色）。 */ role: 'user' | 'assistant'
+  /** role（发言角色）。 */ role: 'user' | 'assistant' | 'tool'
+  /** attachments（演示图片）。 */ attachments?: import('../types').ImageAttachment[]
   /** text（展示正文）。 */ text: string
   /** time（固定展示时间）。 */ time: string
 }
+const demoImageUrl = (title: string) => 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="960" height="640"><rect width="960" height="640" fill="#172033"/><rect x="40" y="40" width="880" height="560" rx="24" fill="#24334b"/><text x="80" y="130" fill="#eef3ff" font-size="40">${title}</text><rect x="80" y="190" width="480" height="26" rx="13" fill="#8098c9"/><rect x="80" y="250" width="700" height="20" rx="10" fill="#4f638a"/><rect x="80" y="300" width="620" height="20" rx="10" fill="#4f638a"/><circle cx="480" cy="400" r="40" fill="none" stroke="#bcd1ff" stroke-width="3"/></svg>`)
 export const demoConversation: DemoMessage[] = [
+  { id: 'screen-demo', role: 'tool', text: '屏幕截图', time: '14:19', attachments: ['global', 'local'].map(role => ({
+    attachment_id: 'demo-' + role, conversation_id: 'demo', role: role as 'global' | 'local', mime_type: 'image/png',
+    width: 960, height: 640, bytes: 1, sha256: '', preview_url: demoImageUrl(role === 'global' ? '全局画面' : '局部区域')
+  })) },
   { id: 'user-1', role: 'user', text: '帮我把下午的安排理一理，留出一段专注写方案的时间。', time: '14:20' },
   { id: 'assistant-1', role: 'assistant', text: '可以。建议把 14:30 到 16:00 留作方案专注时间，之后集中处理待确认事项。', time: '14:20' },
   { id: 'user-2', role: 'user', text: '三点之后尽量不要安排会议，先帮我列出待确认的事项。', time: '14:21' },

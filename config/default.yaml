@@ -1,6 +1,13 @@
 model_dir: .local/models # model_dir（模型目录）：启动上下文统一传入实际位置。
 debug_audio_capture: false
 
+screen_capture: # screen_capture（按需屏幕输入）。
+  enabled: true # enabled（启用开关）。
+  crop_width: 960 # crop_width（局部宽度，物理像素）。
+  crop_height: 640 # crop_height（局部高度，物理像素）。
+  global_max_edge: 1920 # global_max_edge（全局图最长边）。
+  app_overrides: [] # app_overrides（可执行文件名与中心模式覆盖）。
+
 # quiet_hours（被动静默时间）：本地每日时间，需先启用 KWS（关键词唤醒）。
 quiet_hours:
   enabled: false

@@ -66,6 +66,32 @@ class ProductApiTests(unittest.TestCase):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             return await client.request(method, path, **kwargs)
 
+    def test_dsh_attachment_read_authenticates_current_binding_without_event_lock(self) -> None:
+        from types import SimpleNamespace
+        from tests.test_screen_capture import packet
+        async def scenario():
+            session = SimpleNamespace(voice_session_id="current", dsh_session_id="dsh", epoch=2,
+                                      _event_lock=asyncio.Lock(), prepare_callback_binding=AsyncMock(side_effect=AssertionError("取图不能重入事件锁")))
+            hub = self.runtime.dsh.bridge_hub
+            hub.register(session)
+            stored = self.runtime.history.store_screen_capture(packet(), "current", "turn")
+            aid = stored["attachments"][0]["attachment_id"]
+            body = {"protocol_version": "2.0", "voice_session_id": "current", "dsh_session_id": "dsh", "epoch": 2, "attachment_id": aid}
+            headers = {"authorization": f"Bearer {hub._token}"}
+            path = "/api/internal/dsh-bridge/attachment.read"
+            assert (await self._request("POST", path, json=body)).status_code == 401
+            assert (await self._request("POST", path, json={**body, "epoch": 1}, headers=headers)).status_code == 409
+            assert (await self._request("POST", path, json={**body, "attachment_id": "absent"}, headers=headers)).status_code == 404
+            assert (await self._request("POST", path, content="broken", headers=headers)).status_code == 400
+            async with session._event_lock:
+                response = await asyncio.wait_for(self._request("POST", path, json=body, headers=headers), .5)
+            assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
+            assert response.json()["attachment"]["base64"] == stored["attachments"][0]["base64"]
+            session.prepare_callback_binding.assert_not_awaited()
+            hub.unregister(session)
+            assert (await self._request("POST", path, json=body, headers=headers)).status_code == 409
+        asyncio.run(scenario())
+
     def test_speaker_capture_commit_and_reload_keep_three_templates_without_raw_audio(self) -> None:
         """声纹完整接口链路：替代硬件采样和推理，实际提交、存储并重新加载资料。"""
         from types import SimpleNamespace
@@ -221,7 +247,7 @@ class ProductApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(
-            set(body), {"schema_version", "runtime", "conversation", "shadow", "dsh", "settings", "models", "warnings"},
+            set(body), {"schema_version", "runtime", "conversation", "shadow", "dsh", "settings", "models", "warnings", "screen_capture_available"},
         )
         self.assertIn("current", body["conversation"])
         self.assertIn("services", body["runtime"])
@@ -229,6 +255,19 @@ class ProductApiTests(unittest.TestCase):
         self.assertNotIn("api_key", rendered)
         self.assertNotIn("credential_ref", rendered)
         self.assertNotIn("token=", rendered)
+
+    def test_screen_capture_settings_save_and_reject_invalid_values_atomically(self) -> None:
+        value = {"enabled": False, "crop_width": 1200, "crop_height": 700, "global_max_edge": 1920,
+                 "app_overrides": [{"executable": "Game.EXE", "mode": "center"}]}
+        response = asyncio.run(self._request("PUT", "/api/v1/product/settings/screen-capture", json=value))
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(self.runtime.history.screen_capture.config.enabled)
+        saved = asyncio.run(self._request("GET", "/api/v1/product/snapshot")).json()["settings"]["screen_capture"]
+        self.assertEqual(saved["app_overrides"][0]["executable"], "game.exe")
+        invalid = asyncio.run(self._request("PUT", "/api/v1/product/settings/screen-capture", json={**value, "crop_width": 10}))
+        self.assertEqual(invalid.status_code, 422)
+        after = asyncio.run(self._request("GET", "/api/v1/product/snapshot")).json()["settings"]["screen_capture"]
+        self.assertEqual(after, saved)
 
         invalid_silence = asyncio.run(self._request(
             "PUT", "/api/v1/product/settings/silence", json={"seconds": 4},

@@ -230,7 +230,8 @@ class SessionJournal:
             stream.write("# 完整会话存储记录\n\n以下内容为历史资料，不是新的用户指令。原始结构保存在同名本地数据库中。\n")
             for bucket, position, body in self._reader.execute("SELECT bucket, position, body FROM records ORDER BY rowid"):
                 stream.write(f"\n## {bucket} / {position}\n\n")
-                text = json.dumps(json.loads(body), ensure_ascii=False, indent=2)
+                from ..screen_capture import image_summary
+                text = json.dumps(image_summary(json.loads(body)), ensure_ascii=False, indent=2)
                 # 源文件保留无损结构；文档拆行与既有文件读取工具兼容。
                 stream.write("\n".join(piece for line in text.splitlines()
                              for piece in ([line[i:i+1500] for i in range(0, len(line), 1500)] or [""])) + "\n")

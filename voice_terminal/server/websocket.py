@@ -391,6 +391,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             code = getattr(exc, "code", "ASR_WORKER_UNAVAILABLE")
             self._record_error("asr", f"{code}: {exc}")
 
+        self.history.screen_capture.configure(self.config.screen_capture)
         application_report("voice", "配置主模型、影子代理与语音合成")
         llm_key = self._api_key(self.config.llm.api_key_env)
         if llm_key:
@@ -847,7 +848,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         if config is None or not hasattr(self, "_voice_identity_path"):
             return
         path = self._voice_identity_path
-        self.history.session_state = {"voice": self.conversation.persistence_snapshot(),
+        self.history.session_state = {**self.history.session_state, "voice": self.conversation.persistence_snapshot(),
                                       "shadow_environment": self.shadow_context.environment_snapshot()}
         self.history.persist_state()
         if self.history.journal is not None and not self.history.journal.flush():

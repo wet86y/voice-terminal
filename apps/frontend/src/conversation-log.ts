@@ -132,7 +132,7 @@ function numberOr(value: unknown, fallback: number): number {
 function isUsable(value: unknown): value is ConversationEntry {
   if (!value || typeof value !== 'object') return false
   const candidate = value as Partial<ConversationEntry>
-  if (candidate.kind !== 'user_turn' && candidate.kind !== 'assistant_speech' && candidate.kind !== 'system_speech') {
+  if (candidate.kind !== 'user_turn' && candidate.kind !== 'assistant_speech' && candidate.kind !== 'system_speech' && candidate.kind !== 'screen_capture') {
     return false
   }
   return typeof candidate.seq === 'number' && Number.isFinite(candidate.seq)
@@ -154,6 +154,11 @@ export function readConversationEntry(payload: unknown, envelopeTurnId?: string 
   return {
     seq,
     kind,
+    ...(Array.isArray(value.attachments) ? { attachments: value.attachments.filter(a => a && typeof a.attachment_id === 'string'
+      && ['global', 'local'].includes(a.role) && ['image/jpeg', 'image/png'].includes(a.mime_type)
+      && Number.isInteger(a.width) && a.width > 0 && Number.isInteger(a.height) && a.height > 0
+      && Number.isInteger(a.bytes) && a.bytes > 0 && typeof a.sha256 === 'string')
+      .map(a => ({ ...a, conversation_id: readString(value, 'conversation_id') ?? '' })) } : {}),
     conversation_id: readString(value, 'conversation_id') ?? '',
     turn_id: readString(value, 'turn_id') ?? readString({ turn_id: envelopeTurnId }, 'turn_id') ?? '',
     speech_id: readString(value, 'speech_id') ?? '',

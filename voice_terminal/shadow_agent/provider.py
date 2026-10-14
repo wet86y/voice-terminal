@@ -68,6 +68,8 @@ class DeepSeekResponsesShadowProvider:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        from urllib.parse import urlsplit
+        self.supports_images = model == "deepseek-flash" and urlsplit(self.base_url).hostname == "api.deepseek.com"  # supports_images（已验证视觉能力）。
         self.timeout_ms = timeout_ms
         # OpenCode Go routes Responses requests by this header.  It is kept
         # optional so direct DeepSeek remains byte-for-byte unchanged.

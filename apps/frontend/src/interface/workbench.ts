@@ -19,8 +19,9 @@ export interface WorkbenchModel {
   shadowModel: string;
   ttsModel?: string; // ttsModel（当前语音合成模型）。
   conversation: Array<{
+    attachments?: import('../types').ImageAttachment[]; // attachments（双图描述）。
     key: string; // key（贯穿流式与结算阶段的气泡标识）。
-    role: "user" | "assistant"; // role（消息发送方）。
+    role: "user" | "assistant" | "tool"; // role（消息发送方）。
     text: string; // text（最新完整正文）。
     time: string; // time（消息显示时间）。
     status: string; // status（识别或播报状态文案）。

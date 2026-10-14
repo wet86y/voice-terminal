@@ -58,7 +58,8 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         self.analysis = analysis or AnalysisClient(options.analysis_url)
         self.analysis_health: dict = {}
         self.shadow_waker = shadow_waker
-        self.registry = VoiceShadowRegistry(available=shadow_available)
+        self.registry = VoiceShadowRegistry(available=shadow_available,
+            capture_service=self.history.screen_capture, supports_images=bool(getattr(self.llm, "supports_images", False)))
         self.workspace: TurnWorkspace | None = None
         self.segmenter = TranscriptSegmenter(options.min_segment_chars, options.max_segment_chars)
         self._endpoint_task: asyncio.Task | None = None

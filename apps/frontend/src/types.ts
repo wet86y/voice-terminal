@@ -174,7 +174,7 @@ export interface TurnLatencyValues extends LatencyValues {
   prewarm_used?: boolean
 }
 
-export type ConversationEntryKind = 'user_turn' | 'assistant_speech' | 'system_speech'
+export type ConversationEntryKind = 'user_turn' | 'assistant_speech' | 'system_speech' | 'screen_capture'
 
 /**
  * One line of the server-ordered conversation log.
@@ -184,7 +184,20 @@ export type ConversationEntryKind = 'user_turn' | 'assistant_speech' | 'system_s
  * queue on the client, so a system-owned line (the KWS wake acknowledgement)
  * keeps the place it really happened in.
  */
+/** ImageAttachment（图像描述）：编码由当前会话连接按需读取。 */
+export interface ImageAttachment {
+  attachment_id: string // attachment_id（稳定附件标识）。
+  conversation_id: string // conversation_id（所属会话）。
+  role: 'global' | 'local' // role（全局画面或局部区域）。
+  mime_type: 'image/jpeg' | 'image/png' // mime_type（图像媒体类型）。
+  width: number // width（成品宽度）。
+  height: number // height（成品高度）。
+  bytes: number // bytes（解码字节数）。
+  sha256: string // sha256（内容摘要）。
+  preview_url?: string // preview_url（仅内部演示图片地址）。
+}
 export interface ConversationEntry {
+  attachments?: ImageAttachment[] // attachments（图片描述）。
   seq: number
   kind: ConversationEntryKind
   conversation_id: string
@@ -377,7 +390,7 @@ export type ServerMessageType =
 export type ReasoningMode = 'fast' | 'deep'
 /** SessionOperation（会话操作）：重置整理上下文，清除归档并开启全新会话。 */
 export type SessionOperation = 'reset' | 'clear'
-export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset' | 'session.clear' | 'session.reasoning_mode'
+export type CommandName = 'subscribe' | 'session.start' | 'session.stop' | 'session.reset' | 'session.clear' | 'session.reasoning_mode' | 'conversation.image.read'
 
 export interface MessageEnvelope<TType extends string = string, TPayload = unknown> {
   type: TType
