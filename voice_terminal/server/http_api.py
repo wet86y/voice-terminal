@@ -552,7 +552,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         service = runtime.hotwords
         try:
             async with service.update_lock:
-                bank = await asyncio.to_thread(service.prepare, body)
+                bank = await asyncio.to_thread(service.prepare_measured, body)
                 value = await asyncio.to_thread(product_store_or_404().save_hotwords, bank.settings)
                 service.bank = bank  # 持久化成功后原子换入；已有轮次仍用原词表。
             return {"settings": value, "effective_from": "next_turn", "pending": False,
@@ -824,7 +824,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                         "message": "合成设置已热更新，下一回答使用新参数。", "tts": runtime.local_tts_status_payload()}
         if not after_drain and (runtime.application_initializing or runtime.state.listening
                 or runtime.state.state.value not in {"IDLE", "ERROR"}
-                or (runtime.tts and runtime.tts.active_local_sessions)
+                or runtime.tts_switch_busy()
                 or (getattr(runtime, "tts_voice_operations", None) and runtime.tts_voice_operations.busy)
                 or (getattr(runtime, "_tts_update_task", None) and not runtime._tts_update_task.done())):
             if runtime.tts is not None:
@@ -850,7 +850,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 raise HTTPException(status_code=409, detail="当前对话事务尚未结束，请等它结束后再切换本地 TTS 模型。")
             if runtime.tts is None:
                 raise HTTPException(status_code=409, detail="TTS（语音合成）组件尚未初始化。")
-            if runtime.tts.active_local_sessions:
+            if runtime.tts_switch_busy():
                 raise HTTPException(status_code=409, detail="仍有本地 TTS 会话正在处理或播报，请结束后再切换。")
             previous_model = runtime.config.tts.local_model
             previous_backend = runtime.config.tts.backend
@@ -873,6 +873,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 }
 
             runtime.state.set_service("tts", "STARTING")
+            logger.info("tts.selection_started backend=%s local_model=%s previous_backend=%s previous_model=%s",
+                        backend, local_model, previous_backend, previous_model)
             await runtime.bus.publish(runtime.snapshot())
             try:
                 # 新后端构造及预热均读取这份参数；从在线切到本地时也使用新步数。
@@ -896,6 +898,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 runtime._local_tts_load_state = "ready" if backend == "voxcpm1" else "disabled"
                 runtime._local_tts_error = None
             except Exception as exc:
+                logger.exception("tts.selection_failed backend=%s local_model=%s", backend, local_model)
                 try:
                     runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, **previous_options))
                     local_client = getattr(runtime.tts, "local", None)
@@ -933,7 +936,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             await asyncio.sleep(0.1)
             if runtime.application_initializing or runtime.state.state.value not in {"IDLE", "ERROR", "LISTENING"}:
                 continue
-            if (runtime.tts and runtime.tts.active_local_sessions) or (getattr(runtime, "tts_voice_operations", None) and runtime.tts_voice_operations.busy):
+            if runtime.tts_switch_busy() or (getattr(runtime, "tts_voice_operations", None) and runtime.tts_voice_operations.busy):
                 continue
             if getattr(runtime.controller, "_active_input", False):
                 continue  # 等用户当前输入结算，热切换不丢弃正在识别的问题。
@@ -941,7 +944,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             resume_listening = resume_listening or previous_listening
             previous_selection = {"backend": runtime.config.tts.backend, "local_model": runtime.config.tts.local_model}
             async with runtime._session_lock:
-                if runtime.state.state.value not in {"IDLE", "ERROR", "LISTENING"} or (runtime.tts and runtime.tts.active_local_sessions) or getattr(runtime.controller, "_active_input", False):
+                if runtime.state.state.value not in {"IDLE", "ERROR", "LISTENING"} or runtime.tts_switch_busy() or getattr(runtime.controller, "_active_input", False):
                     continue
                 if previous_listening and runtime.controller is not None:
                     try:

@@ -13,7 +13,7 @@ from typing import Any
 
 from .protocol import asr_result, decode_audio_chunk
 from ..compute import process_memory_bytes, hardware_status
-from ..resources import model_thread_budget, process_resource_status, registry
+from ..resources import model_thread_budget, process_resource_status, registry, model_load_footprint
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +108,10 @@ class AsrWorkerEngine:
         with self._load_lock:
             self._load_model()
             if self.punctuation is not None:
-                self.punctuation.load()
+                if not getattr(self.punctuation, "_load_attempted", False):
+                    with model_load_footprint() as footprint:
+                        self.punctuation.load()
+                    self.punctuation.resource_footprint = footprint
 
     def _load_model(self) -> None:
         if self._model is not None:

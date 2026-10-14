@@ -315,6 +315,19 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             raise asyncio.CancelledError
         return result
 
+    async def _load_measured_model(self, name, factory, *args, **kwargs):
+        """加载共享进程模型并记录归属估算，不将进程总量重复分给每个模型。"""
+        from ..resources import model_load_footprint
+        footprint = None
+        def load():
+            nonlocal footprint
+            with model_load_footprint() as footprint:
+                result = factory(*args, **kwargs)
+            return result
+        result = await self._load_native(load)
+        self._compute_models.setdefault(name, {})["resource_footprint"] = footprint
+        return result
+
     async def initialize_local(self) -> None:
         """initialize_local（本地模型初始化）：无需识别或分析进程已就绪。"""
         from ..audio.levels import AudioLevelMeter
@@ -366,7 +379,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
 
         if self.config.wake.enabled:
             try:
-                self.kws = await self._load_native(self._build_kws_worker)
+                self.kws = await self._load_measured_model("kws", self._build_kws_worker)
                 self.state.set_service("kws", "READY")
             except Exception as exc:
                 self._record_error("kws", str(exc))
@@ -382,7 +395,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
 
         try:
             vad_requested = self.config.compute.devices.get("voice_vad", "cpu")
-            self.vad = await self._load_native(FsmnVadDetector,
+            self.vad = await self._load_measured_model("voice_vad", FsmnVadDetector,
                 model_dir=self.config.vad_model_dir,
                 device=vad_requested,
                 fallback_device=self.config.compute.fallback_devices.get("voice_vad", "cpu"),
@@ -390,6 +403,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 end_silence_ms=self.config.vad.end_silence_ms,
             )
             self._compute_models["voice_vad"] = {
+                "resource_footprint": self._compute_models.get("voice_vad", {}).get("resource_footprint"),
                 "runtime": "ONNX Runtime（推理运行时）" if self.vad.backend == "onnx" else "PyTorch（推理框架）",
                 "requested_device": vad_requested,
                 "device": self.vad.device,
@@ -538,8 +552,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             if self.config.tts.output_format.lower() != "pcm":
                 raise RuntimeError("TTS 播放器需要 PCM 输出。")
             if self.config.tts.backend == "voxcpm1":
-                if self.config.tts.sample_rate != 16000:
-                    raise RuntimeError("VoxCPM 播放器 sample_rate（采样率）必须为 16000 Hz")
+                if self.config.tts.sample_rate not in {16000, 24000, 32000, 48000}:
+                    raise RuntimeError("VoxCPM 播放器 sample_rate（采样率）不受支持")
                 self._local_tts_load_state = "loading"
                 await self.tts.ensure_ready()
                 # 音色尚未配置时模型仍保持就绪，设置页可以继续导入或设计音色。
@@ -910,28 +924,11 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 await self.tts.prewarm()
             return
         previous_config, previous_router = self.config, self.tts
-        if previous_config.tts.backend == "minimax":
-            self._online_tts_sample_rate = previous_config.tts.sample_rate
         next_config = replace(previous_config, tts=replace(
             previous_config.tts, backend=backend, local_model=local_model,
-            sample_rate=16000 if backend == "voxcpm1" else getattr(self, "_online_tts_sample_rate", 32000),
+            # 适配器将原生音频连续重采样到现有设备时钟，仅替换语音后端。
+            sample_rate=previous_config.tts.sample_rate,
         ))
-        # 采样率变化时沿用完整重建路径，同步播放器与回声处理的采样率契约。
-        if next_config.tts.sample_rate != previous_config.tts.sample_rate:
-            try:
-                await self.close(preserve_tts_updates=True)
-                self._prepare_for_reinitialize()
-                self.config = next_config
-                await self.initialize(_session_lock_held=True)
-                if self.state.services.get("tts") != "READY":
-                    raise RuntimeError("新语音后端初始化失败。")
-            except Exception:
-                await self.close(preserve_tts_updates=True)
-                self._prepare_for_reinitialize()
-                self.config = previous_config
-                await self.initialize(_session_lock_held=True)
-                raise
-            return
         candidate = None
         self.config = next_config
         try:
@@ -968,6 +965,17 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             await previous_router.shutdown()
         except Exception:
             logger.exception("tts.previous_backend_cleanup_failed")
+
+    def tts_switch_busy(self) -> bool:
+        """tts_switch_busy（切换屏障）：输入状态不能代表独立播报事务已结算。"""
+        if self.tts is not None and self.tts.active_local_sessions:
+            return True
+        output = getattr(self.controller, "output", None)
+        handle = getattr(output, "handle", None)
+        task = getattr(handle, "task", None)
+        if task is not None and not task.done():
+            return True
+        return bool(self.player is not None and self.player.buffered_ms > 0)
 
     def _publish_conversation_entry(self, entry: dict[str, Any]) -> None:
         """Publish one conversation line from a synchronous commit path."""
@@ -2037,6 +2045,12 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             models[name]["resource_status"] = resource_rows[0]  # resource_status（同一统计进程快照）。
             models[name]["process_memory_rss_bytes"] = resource_rows[0]["rss_bytes"]
         models["kws"]["service"] = self.state.services.get("kws", models["kws"].get("service", "UNKNOWN"))
+        hotwords = getattr(self, "hotwords", None)
+        auxiliary = {"hotwords": {  # auxiliary（共享进程的辅助组件）。
+            "service": "READY" if hotwords is not None and hotwords.bank.matchers else "DISABLED",
+            "runtime": "音素词典与快速模糊匹配", "device": "cpu",
+            "resource_status": resource_rows[0], "resource_footprint": getattr(hotwords, "resource_footprint", None),
+        }}
         if self.asr is not None:
             try:
                 status = await self._asr_compute_health()
@@ -2044,6 +2058,16 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                     resource_rows.append(status["resource_status"])
                 else:
                     missing_resource_roles.add("asr")
+                punctuation = status.get("punctuation", {})
+                if not isinstance(punctuation, Mapping):
+                    punctuation = {}
+                auxiliary["punctuation"] = {
+                    "service": punctuation.get("status", "UNKNOWN"),
+                    "runtime": "PyTorch（实时标点）", "device": punctuation.get("device"),
+                    "resource_status": status.get("resource_status"),
+                    "resource_footprint": punctuation.get("resource_footprint"),
+                    "load_error": punctuation.get("load_error") or punctuation.get("last_error"),
+                }
                 models["paraformer"].update({
                     "resource_status": status.get("resource_status"),
                     "runtime": status.get("runtime"),
@@ -2073,6 +2097,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                         missing_resource_roles.add("analysis")
                     models[model_name].update({
                         "resource_status": lane.get("resource_status"),
+                        "resource_footprint": lane.get("resource_footprint"),
                         "runtime": lane.get("runtime"),
                         "device": lane.get("device"),
                         "requested_device": lane.get("requested_device", requests.get(model_name, "cpu")),
@@ -2119,7 +2144,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         for name, status in models.items():
             status["gpu_available"] = bool(hardware["models"].get(name, {}).get("gpu_available"))
             status["gpu_unavailable_reason"] = hardware["models"].get(name, {}).get("reason")
-        return {"hardware": hardware, "models": models,
+        return {"hardware": hardware, "models": models, "auxiliary": auxiliary,
                 "resource_status": aggregate_resource_status(resource_rows, missing_roles=missing_resource_roles)}  # resource_status（资源状态）。
 
 

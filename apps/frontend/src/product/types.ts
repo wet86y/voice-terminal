@@ -28,6 +28,8 @@ export interface ProductComputeSettings {
 }
 
 export interface ProductComputeModelStatus {
+  /** resource_footprint（加载增量估算）：共享运行库和分配器不能按模型精确拆分。 */
+  resource_footprint?: ModelLoadFootprint | null
   /** requested_device（本次加载请求设备）：与保存但待重启的偏好分别呈现。 */
   requested_device: ComputeDeviceMode
   /** device（实际设备）：当前模型报告的运行设备。 */
@@ -50,6 +52,18 @@ export interface ProductComputeModelStatus {
   gpu_unavailable_reason?: string | null
   /** internal_vad_device（内部 VAD 设备）：SenseVoiceSmall 内部 FSMN-VAD 的实际设备。 */
   internal_vad_device?: string | null
+}
+
+/** ModelLoadFootprint（同一进程内模型加载及预热的归属估算）。 */
+export interface ModelLoadFootprint {
+  /** pid（进程编号）、created_at（进程创建时间），用于拒绝旧进程采样。 */
+  pid: number
+  created_at: number
+  /** basis（计量依据）：load_delta（加载前后增量）。 */
+  basis: 'load_delta'
+  /** rss_bytes（常驻增量）与 private_commit_bytes（私有提交增量）。 */
+  rss_bytes: number
+  private_commit_bytes: number | null
 }
 
 export interface ResourceProcessStatus {
@@ -109,6 +123,9 @@ export interface ProductComputeStatus {
   }
   /** models（模型采样）：所属进程切换状态时，暂时移除旧采样，等待重新读取。 */
   models: Partial<Record<ProductLocalModelId, ProductComputeModelStatus>>
+  /** auxiliary（辅助组件）：热词修订及流式标点，共用已有工作进程。 */
+  auxiliary?: Partial<Record<'hotwords' | 'punctuation', Pick<ProductComputeModelStatus,
+    'service' | 'device' | 'runtime' | 'resource_status' | 'resource_footprint' | 'load_error'>>>
 }
 
 export interface ProductRuntimeSnapshot {

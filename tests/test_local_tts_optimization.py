@@ -12,6 +12,49 @@ from tests.test_audio_cpp_tts import _fake_client, _response, _audio_event, _eve
 from tests.test_sentence_scheduling import _sentence_output_harness
 
 
+def test_stream_buffer_avoids_fragmented_playback_and_drains_short_tail():
+    player = PcmPlayer(sample_rate=1000, channels=1, output_device=None)
+    player.allow("local")
+    player.configure_stream_buffer("local", startup_ms=100, resume_ms=60)
+    player.enqueue("local", b"\x01\x00" * 40)
+    block = bytearray(40)
+    player._callback(block, 20, None, None)
+    assert block == bytes(40) and player.buffered_ms == 40
+    player.enqueue("local", b"\x02\x00" * 60)
+    player._callback(block, 20, None, None)
+    assert block == b"\x01\x00" * 20
+    for _ in range(4):
+        player._callback(block, 20, None, None)
+    player._callback(block, 20, None, None)
+    assert block == bytes(40)
+    player.enqueue("local", b"\x03\x00" * 20)
+    player._callback(block, 20, None, None)
+    assert block == bytes(40) and player.buffered_ms == 20
+    player.finish_stream("local")
+    player._callback(block, 20, None, None)
+    assert block == b"\x03\x00" * 20 and player.buffered_ms == 0
+    assert player.diagnostics["underrun_ms"] == 40
+    player.allow("next")
+    player.enqueue("next", b"\x04\x00" * 20)
+    player._callback(block, 20, None, None)
+    assert block == b"\x04\x00" * 20
+
+
+def test_local_resampling_keeps_existing_player_clock():
+    import numpy as np
+    import soxr
+    from voice_terminal.providers.audio_cpp_tts import _Pcm16Resampler
+    source = (np.sin(np.arange(4800) * .1) * 10000).astype("int16")
+    resampler = _Pcm16Resampler(48000, 32000)
+    actual = resampler.push(source[:1800].tobytes()) + resampler.push(source[1800:].tobytes()) + resampler.finish()
+    expected = soxr.resample(source, 48000, 32000, quality="HQ").tobytes()
+    # 两次独立int16（16位整数）转换各有取整/抖动，差值最多两个最低有效位。
+    assert len(actual) == len(expected) == 6400
+    difference = np.frombuffer(actual, dtype="<i2").astype(np.int32) - np.frombuffer(expected, dtype="<i2")
+    assert np.abs(difference).max() <= 2
+    assert np.sqrt(np.mean(difference.astype(float) ** 2)) < 1
+
+
 def test_short_clause_preserves_normal_lock_window():
     state = AdmissionState(lead_ms=0, sentence_window=True)
     state.push("好的，")

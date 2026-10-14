@@ -174,7 +174,7 @@ class TtsVoiceOperationManager:
         async def collect() -> None:
             async for pcm in session.audio_chunks():
                 output.extend(pcm)
-                if len(output) > 16_000 * 2 * 15 + 64_000:
+                if len(output) > int(getattr(client, "sample_rate", 16000)) * 2 * 17:
                     raise TtsVoiceOperationError("生成音频超过 15 秒，请缩短正文后重新生成。")
 
         reader = asyncio.create_task(collect(), name=f"tts-voice-reader-{operation.id[:8]}")
@@ -183,6 +183,13 @@ class TtsVoiceOperationManager:
             await session.send_text(text)
             await session.finish()
             await reader
+            rate = int(getattr(client, "sample_rate", 16000))
+            if rate != 16000:
+                import numpy as np
+                import soxr
+                # 音色库固定保存16千赫素材；播放时按当前设备时钟转换。
+                samples = np.frombuffer(output, dtype="<i2")
+                return soxr.resample(samples, rate, 16000, quality="HQ").astype("<i2", copy=False).tobytes()
             return bytes(output)
         except BaseException:
             reader.cancel()

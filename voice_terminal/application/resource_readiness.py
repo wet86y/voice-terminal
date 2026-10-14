@@ -16,6 +16,8 @@ def required_model_resources(config: Any) -> dict[str, list[str]]:
         # Voice（语音服务）的活动检测器始终初始化，KWS（关键词唤醒）按配置选择。
         "voice": ["fsmn-vad"],
     }
+    if getattr(getattr(config, "asr", None), "punctuation_enabled", False):
+        requirements["asr"].append("streaming-punctuation")
     if config.wake.enabled:
         requirements["voice"].append("kws-sherpa-onnx")
     analysis: list[str] = []

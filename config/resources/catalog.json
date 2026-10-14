@@ -283,6 +283,28 @@
       ]
     },
     {
+      "resource_id": "streaming-punctuation",
+      "kind": "model",
+      "title": "CTTransformerStreaming（流式中文标点）",
+      "destination": "funasr/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727",
+      "version": "v2.0.4",
+      "required": true,
+      "source": {
+        "platform": "modelscope",
+        "repo_id": "iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727",
+        "revision": "v2.0.4",
+        "page_url": "https://modelscope.cn/models/iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727",
+        "transfer": { "kind": "modelscope_sdk" },
+        "license_url": "https://modelscope.cn/models/iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727"
+      },
+      "files": [
+        { "path": "config.yaml", "size_bytes": 822, "sha256": "4b57cf5d7a3310937ac2d73aa0ea89770e022d62c99dcf3e247f7dbeb0b0260d" },
+        { "path": "configuration.json", "size_bytes": 377, "sha256": "e8dd1de5c3b86ccef2b4630be8f1e942f909019c50bd801c28bd083982fd8a2a" },
+        { "path": "model.pt", "size_bytes": 288802610, "sha256": "e9aa7185e9b0fce3ee148a736aa63a932faf85fd73107756748be424d5ef8940" },
+        { "path": "tokens.json", "size_bytes": 4207480, "sha256": "c960ab87bccea4aa15cf49a59f71973c2c330b46668048cd8da253749ec71ee3" }
+      ]
+    },
+    {
       "resource_id": "campplus-zh-cn-common",
       "kind": "model",
       "title": "CAM++ 中文通用声纹模型",

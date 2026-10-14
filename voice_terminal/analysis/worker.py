@@ -7,7 +7,7 @@ import time
 from typing import Callable
 
 from .protocol import decode_request, open_request_audio
-from ..resources import process_resource_status, registry, ResourcePolicy
+from ..resources import process_resource_status, registry, ResourcePolicy, model_load_footprint
 from ..compute import process_memory_bytes
 
 
@@ -26,15 +26,18 @@ class AnalysisLane:
         self.active: asyncio.Future | None = None
         self.active_request_id: str | None = None
         self.active_run_options = None
+        self.resource_footprint = None  # resource_footprint（加载及预热的内存增量估算）。
         self._managed_audio = ResourcePolicy.load().shared_audio
 
     def prepare(self, factory: Callable) -> None:
         """prepare（准备）：在独立推理线程加载、预热，完成后才报告服务就绪。"""
         def load():
-            model = factory()
-            warmup = getattr(model, "warmup", None)
-            if callable(warmup):
-                warmup()
+            with model_load_footprint() as footprint:
+                model = factory()
+                warmup = getattr(model, "warmup", None)
+                if callable(warmup):
+                    warmup()
+            self.resource_footprint = footprint
             return model
         self.model = self.executor.submit(load).result()
         self.model_name = getattr(self.model, "model_file", self.model_name)
@@ -55,6 +58,7 @@ class AnalysisLane:
             "load_error": getattr(model, "load_error", None),  # load_error（加载或回退原因）。
             "process_memory_rss_bytes": process_memory_bytes(),
             "resource_status": process_resource_status(),  # resource_status（资源状态）。
+            "resource_footprint": self.resource_footprint,  # resource_footprint（同进程内加载增量估算）。
             "error": self.error,
         }
 
