@@ -42,8 +42,14 @@ _COMPONENTS = {
     "fsmn_vad_model": ("FsmnVADStreaming", "model_classes", "funasr.models.fsmn_vad_streaming.model"),
     "fsmn_encoder": ("FSMN", "encoder_classes", "funasr.models.fsmn_vad_streaming.encoder"),
     "campplus_model": ("CAMPPlus", "model_classes", "funasr.models.campplus.model"),
+    "streaming_punc_model": ("CTTransformerStreaming", "model_classes", "funasr.models.ct_transformer_streaming.model"),
+    "streaming_punc_encoder": ("SANMVadEncoder", "encoder_classes", "funasr.models.ct_transformer_streaming.encoder"),
 }
 _MODEL_CONFIGS = {
+    "streaming_punc": (
+        {"model": "CTTransformerStreaming", "encoder": "SANMVadEncoder", "tokenizer": "CharTokenizer"},
+        ("streaming_punc_model", "streaming_punc_encoder", "char_tokenizer"),
+    ),
     "paraformer": (
         {"model": "ParaformerStreaming", "encoder": "SANMEncoderChunkOpt",
          "decoder": "ParaformerSANMDecoder", "predictor": "CifPredictorV2",

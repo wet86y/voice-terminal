@@ -12,6 +12,16 @@ import pytest
 from voice_terminal.asr import model_loader
 
 
+def test_realtime_punctuation_config_uses_selective_components(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        "model: CTTransformerStreaming\nencoder: SANMVadEncoder\ntokenizer: CharTokenizer\n",
+        encoding="utf-8",
+    )
+    assert model_loader._config_components(tmp_path) == (
+        "streaming_punc_model", "streaming_punc_encoder", "char_tokenizer",
+    )
+
+
 def test_package_keeps_lazy_exports_without_eager_scan():
     source = '''
 events = []

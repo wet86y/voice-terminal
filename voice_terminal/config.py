@@ -138,6 +138,12 @@ class AsrConfig:
     chunk_size: tuple[int, int, int] = (0, 8, 4)  # chunk_size（分块配置）：480 毫秒输入、240 毫秒前瞻。
     encoder_chunk_look_back: int = 4
     decoder_chunk_look_back: int = 1
+    punctuation_enabled: bool = True  # punctuation_enabled（实时标点开关）。
+    punctuation_device: str = "cpu"  # punctuation_device（标点设备；短文本默认中央处理器）。
+
+    def __post_init__(self) -> None:
+        if self.punctuation_device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("asr.punctuation_device（实时标点设备）必须是 auto（自动）、cpu（中央处理器）或 cuda（图形处理器）")
 
 
 COMPUTE_MODEL_IDS = (
@@ -604,6 +610,12 @@ class AppConfig:
         return self.model_dir / "funasr" / "paraformer-zh-streaming"
 
     @property
+    def punctuation_model_dir(self) -> Path:
+        """punctuation_model_dir（固定实时标点路径），不选用旧离线模型。"""
+        from .asr.punctuation import REALTIME_PUNC_MODEL
+        return self.model_dir / "funasr" / REALTIME_PUNC_MODEL
+
+    @property
     def vad_model_dir(self) -> Path:
         return self.model_dir / "funasr" / "fsmn-vad"
 
@@ -921,6 +933,8 @@ class AppConfig:
                 chunk_size=chunk_size,
                 encoder_chunk_look_back=int(_number(asr.get("encoder_chunk_look_back"), 4)),
                 decoder_chunk_look_back=int(_number(asr.get("decoder_chunk_look_back"), 1)),
+                punctuation_enabled=_bool(asr.get("punctuation_enabled"), True),
+                punctuation_device=_string(asr.get("punctuation_device"), "cpu"),
             ),
             compute=ComputeConfig(
                 devices={
