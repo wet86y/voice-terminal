@@ -142,6 +142,8 @@ asr:
   chunk_size: [0, 8, 4] # chunk_size（分块配置）：480 毫秒输入窗口、240 毫秒前瞻。
   encoder_chunk_look_back: 4
   decoder_chunk_look_back: 1
+  punctuation_enabled: true # punctuation_enabled（实时中文标点开关），失败时原文回退。
+  punctuation_device: cpu # punctuation_device（标点设备）：短块默认 cpu（中央处理器）；可选 auto（自动）/cuda（图形处理器）。
 
 llm:
   provider: deepseek

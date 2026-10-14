@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class AsrInferenceResult:
-    """Cumulative transcript plus whether this call emitted new model text."""
+    """累计转写以及本次是否输出新增文字或结束标点。"""
 
     text: str
     emitted: bool
@@ -39,6 +39,8 @@ class AsrWorkerEngine:
         encoder_chunk_look_back: int = 4,
         decoder_chunk_look_back: int = 1,
         fallback_device: str = "cpu",
+        punctuation_model_dir: Path | None = None,  # punctuation_model_dir（实时标点目录；空值关闭）。
+        punctuation_device: str = "cpu",  # punctuation_device（标点推理设备）。
     ) -> None:
         self.model_dir = model_dir
         # device（请求设备）：auto/cpu/cuda；self.device（实际设备）由加载结果决定。
@@ -51,6 +53,10 @@ class AsrWorkerEngine:
         self.encoder_chunk_look_back = encoder_chunk_look_back
         self.decoder_chunk_look_back = decoder_chunk_look_back
         self._model: Any = None
+        self.punctuation = None  # punctuation（与识别共用专用线程的实时标点通道）。
+        if punctuation_model_dir is not None:
+            from .punctuation import StreamingPunctuation
+            self.punctuation = StreamingPunctuation(punctuation_model_dir, punctuation_device)
         self._np: Any = None
         self._cache_by_turn: dict[str, dict[str, Any]] = {}
         # paraformer-zh-streaming emits text for the current streaming
@@ -101,6 +107,8 @@ class AsrWorkerEngine:
     def load(self) -> None:
         with self._load_lock:
             self._load_model()
+            if self.punctuation is not None:
+                self.punctuation.load()
 
     def _load_model(self) -> None:
         if self._model is not None:
@@ -192,6 +200,8 @@ class AsrWorkerEngine:
     def close(self) -> None:
         """close（关闭）：工作进程结束时回收专用通道。"""
         self._executor.shutdown(wait=True, cancel_futures=True)
+        if self.punctuation is not None:
+            self.punctuation.close()
 
     @staticmethod
     async def _await_native(future: asyncio.Future) -> Any:
@@ -242,6 +252,8 @@ class AsrWorkerEngine:
         return text
 
     def _clear_turn(self, turn_id: str) -> None:
+        if self.punctuation is not None:
+            self.punctuation.clear_turn(turn_id)
         self._cache_by_turn.pop(turn_id, None)
         self._transcript_by_turn.pop(turn_id, None)
         self._pending_audio_by_turn.pop(turn_id, None)
@@ -253,20 +265,26 @@ class AsrWorkerEngine:
         self._span_revisions.pop(turn_id, None)
 
     async def _infer_window(self, turn_id: str, pcm: bytes, is_final: bool) -> str:
-        """Run one model window and return the text emitted by that window."""
+        """在同一专用线程执行识别窗口与实时标点，返回可追加的文本增量。"""
 
         self._model_call_count_by_turn[turn_id] = self._model_call_count_by_turn.get(turn_id, 0) + 1
         submitted = time.perf_counter_ns()
 
-        def run() -> tuple[str, float, float, float]:
+        def run() -> tuple[str, float, float, float, float]:
             started = time.perf_counter_ns()
             self._timing.model_ms = 0.0
             text = self._infer_sync(turn_id, pcm, is_final)
+            model_ms = self._timing.model_ms
+            punctuation_ms = 0.0  # punctuation_ms（本窗标点处理耗时，独立于识别推理）。
+            if self.punctuation is not None:
+                punc_started = time.perf_counter_ns()
+                text = self.punctuation.process(turn_id, text, final=is_final)
+                punctuation_ms = (time.perf_counter_ns() - punc_started) / 1_000_000
             return (text, (started - submitted) / 1_000_000,
-                    (time.perf_counter_ns() - started) / 1_000_000, self._timing.model_ms)
+                    (time.perf_counter_ns() - started) / 1_000_000, model_ms, punctuation_ms)
 
         future = asyncio.get_running_loop().run_in_executor(self._executor, run)
-        text, executor_wait_ms, native_ms, model_ms = await self._await_native(future)
+        text, executor_wait_ms, native_ms, model_ms, punctuation_ms = await self._await_native(future)
         start_sample = self._span_positions.get(turn_id, 0)
         end_sample = start_sample + len(pcm) // 2
         self._span_positions[turn_id] = end_sample
@@ -277,7 +295,8 @@ class AsrWorkerEngine:
                 "audio_start_sample": start_sample if end_sample > start_sample else max(0, end_sample-self.chunk_stride_samples),
                 "audio_end_sample": end_sample})
 
-        for key, value in (("executor_wait_ms", executor_wait_ms), ("native_ms", native_ms), ("model_ms", model_ms)):
+        for key, value in (("executor_wait_ms", executor_wait_ms), ("native_ms", native_ms),
+                           ("model_ms", model_ms), ("punctuation_ms", punctuation_ms)):
             self._call_latency[key] = self._call_latency.get(key, 0.0) + value
         self._call_latency["model_calls"] = self._call_latency.get("model_calls", 0) + 1
         logger.info(
@@ -291,7 +310,8 @@ class AsrWorkerEngine:
         submitted = time.perf_counter_ns()
         async with self._inference_lock:
             self._call_latency = {"lane_wait_ms": (time.perf_counter_ns() - submitted) / 1_000_000,
-                                  "executor_wait_ms": 0.0, "native_ms": 0.0, "model_ms": 0.0, "model_calls": 0}
+                                  "executor_wait_ms": 0.0, "native_ms": 0.0, "model_ms": 0.0,
+                                  "punctuation_ms": 0.0, "model_calls": 0}
             try:
                 return await self._infer_serial(turn_id, pcm, is_final)
             except BaseException:
@@ -400,6 +420,7 @@ async def handle_asr_connection(websocket: Any, engine: AsrWorkerEngine) -> None
                             "device": getattr(engine, "device", None),
                             "requested_device": getattr(engine, "requested_device", None),
                             "load_error": getattr(engine, "load_error", None),
+                            "punctuation": engine.punctuation.status() if getattr(engine, "punctuation", None) is not None else {"status": "DISABLED"},  # punctuation（标点通道健康状态）。
                             "process_memory_rss_bytes": process_memory_bytes(),
                             "resource_status": process_resource_status(),  # resource_status（资源状态）。
                         }

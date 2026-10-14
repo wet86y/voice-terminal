@@ -56,6 +56,8 @@ async def run(config_path: Path | None = None) -> None:
         chunk_size=config.asr.chunk_size,
         encoder_chunk_look_back=config.asr.encoder_chunk_look_back,
         decoder_chunk_look_back=config.asr.decoder_chunk_look_back,
+        punctuation_model_dir=config.punctuation_model_dir if config.asr.punctuation_enabled else None,
+        punctuation_device=config.asr.punctuation_device,
     )
     # Bind the listener before loading so the host can publish the selected port;
     # health readiness still waits for the fully loaded model below.
@@ -67,7 +69,7 @@ async def run(config_path: Path | None = None) -> None:
         await handle_asr_connection(websocket, engine)
 
     try:
-        with startup_stage("加载并预热语音识别模型"):
+        with startup_stage("加载并预热语音识别及实时标点模型"):
             await engine.prepare()
         async with websockets.serve(handler, sock=listener):
             logging.getLogger(__name__).info(
