@@ -8,7 +8,7 @@ import sys
 import zipfile
 
 import pytest
-from voice_terminal.distribution import digest, manifest, verify_install
+from voice_terminal.distribution import digest, manifest, verify, verify_install
 from voice_terminal.paths import atomic_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,6 +94,23 @@ def test_component_update_replaces_whole_file_set(publisher, tmp_path):
     assert not (root / 'runtimes/python/content.bin').exists()
     assert (root / 'runtimes/python/new.bin').is_file()
     verify_install(root)
+
+
+def test_python_runtime_verifier_ignores_only_manifested_pytest_bytecode(tmp_path):
+    runtime = tmp_path / "python"
+    source = runtime / "Lib/site-packages/anyio/__init__.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("value = 1\n", encoding="utf-8")
+    record = manifest(runtime, kind="python", build="fixture")
+    atomic_json(runtime / "manifest.json", record)
+    cache = source.parent / "__pycache__"
+    cache.mkdir()
+    (cache / "__init__.cpython-312-pytest-8.3.4.pyc").write_bytes(b"generated test cache")
+    verify(runtime, record)
+
+    (cache / "missing.cpython-312-pytest-8.3.4.pyc").write_bytes(b"unregistered source")
+    with pytest.raises(ValueError, match="文件集合"):
+        verify(runtime, record)
 
 
 def test_project_candidate_moves_without_retaining_a_second_copy(publisher):

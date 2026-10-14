@@ -328,6 +328,8 @@ mod tests {
     fn complete_environment_includes_all_model_and_download_dependencies() {
         let lock:Value=serde_json::from_str(include_str!("../../../../config/runtime/voice-runtime.lock.json")).unwrap();
         let names=requested(&lock,"all").unwrap();
+        let wheels=lock["wheels"].as_array().unwrap().iter().filter_map(|item|item["name"].as_str()).collect::<std::collections::BTreeSet<_>>();
+        for name in &names{assert!(wheels.contains(name.as_str()),"完整运行环境声明了 {name}（依赖），但没有固定下载包");}
         for name in ["fastapi","torch","torchaudio","funasr","onnxruntime","sherpa-onnx","modelscope","funasr-onnx"] {
             assert!(names.iter().any(|item|item==name),"完整环境缺少 {name}（依赖）");
         }
