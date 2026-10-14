@@ -29,8 +29,9 @@ class SentenceStore:
     ASR regression never renumbers preceding sentences; uncertain refinements
     are represented separately by the scheduler instead of rewriting history.
     """
-    def __init__(self, min_chars: int = 6, max_chars: int = 20) -> None:
+    def __init__(self, min_chars: int = 6, max_chars: int = 20, *, boundary_adjuster=None) -> None:
         self.min_chars, self.max_chars = min_chars, max_chars
+        self.boundary_adjuster = boundary_adjuster  # boundary_adjuster（仅长度强制切分时的热词边界保护）。
         self.previous = ""
         self.emitted = ""
         self._next_id = 1
@@ -64,7 +65,7 @@ class SentenceStore:
                       if c in _BREAKS and i + 1 >= self.min_chars]
             length = breaks[0] if breaks else 0
             if not length and len(remaining) >= self.max_chars:
-                length = limit
+                length = self.boundary_adjuster(remaining, limit) if self.boundary_adjuster else limit
             if not length and (pause or final) and len(remaining) >= self.min_chars:
                 length = len(remaining)
             if not length:

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 from ..speaker.settings import TUNING_DEFAULTS, validate_tuning
 from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig
 from ..custom_instructions import validate_entries
+from ..asr.hotwords import DEFAULT_HOTWORDS, validate_hotwords
 from ..quiet_hours import QuietHoursConfig
 from ..core.events import utc_now_iso
 from ..kws.keywords import MAX_WAKE_KEYWORDS
@@ -108,6 +109,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
             ),
         },
         "custom_instructions": [],
+        "hotwords": deepcopy(DEFAULT_HOTWORDS),  # hotwords（识别后热词设置）。
         "approvals": {"voice_confirmation_enabled": False, "continuous_enabled": False},  # approvals（审批确认偏好）。
         # TTS（语音合成）固定走在线 API（程序接口）；backend（运行后端）不再是产品设置。
         "tts": {"backend": "minimax"},
@@ -157,6 +159,11 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     result = deepcopy(defaults)
     if not isinstance(value, Mapping):
         return result
+    if "hotwords" in value:
+        try:
+            result["hotwords"] = validate_hotwords(value["hotwords"])
+        except ValueError:
+            result["hotwords"] = deepcopy(DEFAULT_HOTWORDS)
     for section in ("wake", "silence", "shadow", "speaker", "tts", "quiet_hours", "approvals"):
         raw = value.get(section)
         if isinstance(raw, Mapping):
@@ -270,6 +277,11 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
     """Report malformed persisted fields without exposing their contents."""
 
     invalid = False
+    if "hotwords" in value:
+        try:
+            validate_hotwords(value["hotwords"])
+        except ValueError:
+            invalid = True
     quiet = value.get("quiet_hours")
     if quiet is not None:
         try:
@@ -561,6 +573,21 @@ class ProductSettingsStore:
 
     def settings_only(self) -> dict[str, Any]:
         return deepcopy(self._settings)
+
+    def save_hotwords(self, payload: dict) -> dict:
+        """save_hotwords（保存热词）：写入失败不改变内存配置。"""
+        try:
+            value = validate_hotwords(payload)
+        except ValueError as exc:
+            raise ProductSettingsError(str(exc)) from exc
+        previous = self._settings
+        self._settings = {**previous, "hotwords": value}
+        try:
+            self._save_settings()
+        except Exception:
+            self._settings = previous
+            raise
+        return deepcopy(value)
 
     def read_persona(self) -> dict[str, str]:
         directory = self.persona_directory.resolve()

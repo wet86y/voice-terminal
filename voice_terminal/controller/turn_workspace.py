@@ -83,6 +83,9 @@ class TurnWorkspace:
     refinement_available: bool = False
     transcript_updates: list[dict] = field(default_factory=list)
     final_text: str = ""
+    raw_final_text: str = ""  # raw_final_text（最终稿热词替换前原文）。
+    raw_refined_text: str = ""  # raw_refined_text（精修稿热词替换前原文）。
+    hotword_final: dict = field(default_factory=dict)  # hotword_final（最终稿替换及耗时记录）。
     staged_response: str = ""
     audio_cues: list[dict] = field(default_factory=list)
     audio: CurrentTurnAudioBuffer = field(default_factory=CurrentTurnAudioBuffer)
@@ -129,6 +132,9 @@ class TurnWorkspace:
         self.committed = False
         self.staged_response = ""
         self.final_text = ""
+        self.raw_final_text = ""
+        self.raw_refined_text = ""
+        self.hotword_final.clear()
         self.paraformer_final = ""
         self.refined_text = ""
         self.refinement_available = False

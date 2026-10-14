@@ -36,6 +36,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
     def __init__(self, *, options: InputOptions, analysis=None,
                  shadow_waker=None, shadow_available: bool = False, **kwargs) -> None:
         self.conversation = kwargs.pop("conversation")
+        self.hotwords = kwargs.pop("hotwords", None)  # hotwords（原文旁路的短句纠正服务）。
         self.speaker_client: SpeakerWorkerClient | None = kwargs.pop("speaker_client", None)
         self.speaker_router: SpeakerRouter | None = kwargs.pop("speaker_router", None)
         self.speaker_mode = str(kwargs.pop("speaker_mode", "off"))
@@ -680,6 +681,9 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         if self._speech_start_sample is not None:
             ws.started_at = frame.captured_at - max(0, frame.end_sample - self._speech_start_sample) / 16000
         self.segmenter = TranscriptSegmenter(self.options.min_segment_chars, self.options.max_segment_chars)
+        if getattr(self, "hotwords", None) is not None:
+            self.hotwords._turn(ws.token)  # 发言开始固定词表，不受中途保存影响。
+            self.segmenter.store.boundary_adjuster = lambda text, limit: self.hotwords.protect_boundary(text, limit, ws.token, self.options.min_segment_chars)
         self._active_input = True
         self.barge_in_gate.reset()
         self._turn_cancel = asyncio.Event()
@@ -855,6 +859,7 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             if self.wake_enabled:
                 refined_text = strip_wake_prefix(refined_text, self.wake_keywords)
             result["text"] = refined_text
+            ws.raw_refined_text = refined_text  # raw_refined_text（未经热词替换的精修原文）。
             # SenseVoice is a supplemental result.  Keep it attached to the
             # same workspace even after the fast Paraformer commit has
             # retired that workspace from the live input controller.
@@ -892,6 +897,16 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             ws.final_text = ws.paraformer_final
             if self.wake_enabled:
                 ws.final_text = strip_wake_prefix(ws.final_text, self.wake_keywords)
+            if getattr(self, "hotwords", None) is not None and ws.speaker_mode != "filter":
+                ws.raw_final_text = ws.final_text
+                final_sentences = self.segmenter.store.feed(ws.paraformer_final, final=True)
+                raw_rows = final_sentences["sentences"] if final_sentences else [row.snapshot() for row in self.segmenter.store.sentences]
+                correction = await self.hotwords.finalized(ws.final_text, ws.token)
+                if not self._valid(token):
+                    return
+                ws.segments = self.hotwords.final_sentences(raw_rows, ws.paraformer_final, correction, ws.token)
+                ws.final_text = correction["text"]
+                ws.hotword_final = correction
             # If SenseVoice happened to finish first, retain its supplemental
             # fields; otherwise these remain the empty defaults until the
             # background refinement task completes.
@@ -1010,6 +1025,15 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
         if ws.speaker_mode == "filter":
             admitted = self.speaker_policy.admitted_text(ws.turn_id)
             result = {"segments": [admitted] if admitted else [], "sentences": [{"text": admitted}] if admitted else [], "changed_ids": []}
+        if getattr(self, "hotwords", None) is not None:
+            token = ws.token
+            result["sentences"] = await self.hotwords.sentences(list(result["sentences"]), token)
+            if self.workspace is not ws or ws.token != token:
+                return
+            result["segments"] = [row["text"] for row in result["sentences"]]
+            result["raw_text"] = result["text"]
+            result["text"] = "".join(result["segments"])
+            result["new_segment"] = "".join(row["text"] for row in result["sentences"] if row.get("sentence_id") in result["changed_ids"])
         ws.segments = list(result.get("sentences") or [{"text": s} for s in result["segments"]])
         ws.timings.setdefault("first_segment", time.monotonic())
         await self._detail("transcript.segment", **result)

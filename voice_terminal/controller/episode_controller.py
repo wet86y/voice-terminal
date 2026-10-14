@@ -171,9 +171,18 @@ class EpisodeController(RealtimeController):
         if self.speaker_mode != "filter": return
         if self.workspace is not None and not self.speaker_policy.admitted_text(self.workspace.turn_id): return
         changes = []
+        activation_id = self.speaker_policy.activation_id  # activation_id（准入恢复所属录音窗口）。
         for item in self.speaker_policy.admitted_turns():
             if self._speaker_published.get(item["turn_id"]) == item["text"]: continue
-            self._speaker_published[item["turn_id"]] = item["text"]
+            raw_text = item["text"]
+            if getattr(self, "hotwords", None) is not None:
+                correction = await self.hotwords.finalized(item["text"], (item["turn_id"], item.get("generation", 0)))
+                item = {**item, "text": correction["text"], "raw_text": correction["raw_text"], "hotword_matches": correction["matches"]}
+                if activation_id != self.speaker_policy.activation_id:
+                    return  # 纠正等待期间录音窗口改变，不提交旧准入正文。
+                if self.speaker_policy.admitted_text(item["turn_id"]) != raw_text:
+                    continue
+            self._speaker_published[item["turn_id"]] = raw_text
             changes.append(item)
         if len(self._speaker_published) > 64:
             self._speaker_published = dict(list(self._speaker_published.items())[-64:])
@@ -911,19 +920,32 @@ class EpisodeController(RealtimeController):
                 ws.transcript_updates = []
             self.state.current.update(final_text=ws.final_text, partial_text="")
             await self._flush_speaker_admissions()
+        if mode == "filter" and getattr(self, "hotwords", None) is not None:
+            ws.raw_final_text = ws.final_text
+            correction = await self.hotwords.finalized(ws.final_text, ws.token)
+            if ws.token != token or self.workspace is not ws:
+                return True
+            ws.final_text = correction["text"]
+            ws.hotword_final = correction
+            ws.segments = [{"text": ws.final_text, "raw_text": ws.raw_final_text, "hotword_matches": correction["matches"]}] if ws.final_text else []
+            self.state.current.update(final_text=ws.final_text)
+            await self._detail("transcript.final", text=ws.final_text, raw_text=ws.raw_final_text, source="paraformer")
         ws.speaker_blocked = not bool(ws.final_text)
         if ws.final_text:
             if not any(item.get("kind") == "asr_final" for item in ws.transcript_updates):
                 ws.transcript_updates.append({
                     "kind": "asr_final", "source": "paraformer",
-                    "text": ws.paraformer_final or ws.final_text, "revision": 1,
+                    "text": ws.final_text, "raw_text": ws.raw_final_text or ws.paraformer_final or ws.final_text, "revision": 1,
                 })
             await self.episode.observe("USER_INPUT_FINALIZED", turn_id=ws.turn_id,
-                                       text=ws.paraformer_final or ws.final_text,
+                                       text=ws.final_text,
                                        source="paraformer", source_revision=ws.generation,
                                        provisional_transcript=ws.paraformer_final, audio_cues=list(ws.audio_cues),
                                        analysis=dict(ws.analysis), speaker_decision=dict(ws.speaker_decision),
                                        output_generation=ws.generation,
+                                       raw_text=getattr(ws, "raw_final_text", "") or ws.final_text,
+                                       hotword_matches=getattr(ws, "hotword_final", {}).get("matches", []),
+                                       sentences=list(ws.segments),
                                        input_finished_at=ws.timings.get("commit"))
             ws.episode_id = self.episode.episode_id
             if ws.episode_id:
@@ -952,8 +974,10 @@ class EpisodeController(RealtimeController):
         if ws.turn_id in self._input_history_committed:
             return next((item for item in self.history.records if item.turn_id == ws.turn_id), None)
         self.history.commit_input(ws.turn_id, ws.final_text, details={
+            "raw_text": getattr(ws, "raw_final_text", "") or ws.final_text, "hotwords": dict(getattr(ws, "hotword_final", {})),
             "segments": list(ws.segments), "audio_cues": list(ws.audio_cues),
             "analysis": dict(ws.analysis), "refined_text": ws.refined_text,
+            "raw_refined_text": getattr(ws, "raw_refined_text", ""),
             "refinement_available": ws.refinement_available,
             "speaker_decision": dict(ws.speaker_decision),
             "transcript_updates": [dict(item) for item in ws.transcript_updates],
@@ -963,8 +987,10 @@ class EpisodeController(RealtimeController):
             "delivery": {"status": "pending", "termination": "pending"},
             "conversation_id": ws.episode_id,
             "details": {"segments": list(ws.segments), "provisional_transcript": ws.paraformer_final,
+                        "raw_text": getattr(ws, "raw_final_text", "") or ws.final_text, "hotwords": dict(getattr(ws, "hotword_final", {})),
                         "audio_cues": list(ws.audio_cues), "analysis": dict(ws.analysis),
                         "refined_text": ws.refined_text,
+                        "raw_refined_text": getattr(ws, "raw_refined_text", ""),
                         "refinement_available": ws.refinement_available,
                         "speaker_decision": dict(ws.speaker_decision),
                         "transcript_updates": [dict(item) for item in ws.transcript_updates]},
@@ -1132,6 +1158,14 @@ class EpisodeController(RealtimeController):
         if self.wake_enabled:
             from ..kws.keywords import strip_wake_prefix
             text = strip_wake_prefix(text, self.wake_keywords)
+        raw_text = getattr(ws, "raw_refined_text", "") if text == ws.refined_text and getattr(ws, "raw_refined_text", "") else text
+        if getattr(self, "hotwords", None) is not None:
+            token = ws.token
+            correction = await self.hotwords.correct(raw_text, token, lane="final", cache_key="refinement")
+            if ws.token != token:
+                return
+            text = correction["text"]
+        ws.raw_refined_text = raw_text
         ws.refined_text = text
         ws.refinement_available = True
         prior_refinement = next(
@@ -1145,7 +1179,8 @@ class EpisodeController(RealtimeController):
                  if isinstance(item, dict)] or [0]
             )
             ws.transcript_updates.append({
-                "kind": "refinement", "source": "sensevoice", "text": text,
+                    "kind": "refinement", "source": "sensevoice", "text": text,
+                "raw_text": raw_text,
                 "revision": max(2, existing_revision + 1),
             })
         segments = list(result.get("segments") or [])
@@ -1190,7 +1225,7 @@ class EpisodeController(RealtimeController):
         self._refinement_agent_events.add(ws.turn_id)
         updater = getattr(self.history, "update_input_refinement", None)
         if callable(updater):
-            updater(ws.turn_id, text, details={"audio_cues": segments, "analysis": dict(ws.analysis)})
+            updater(ws.turn_id, text, details={"audio_cues": segments, "analysis": dict(ws.analysis), "raw_refined_text": raw_text})
         if self.episode.closed or self.episode.episode_id is None:
             return
         # A late refinement remains an ordinary scheduler event even when a
@@ -1219,6 +1254,9 @@ class EpisodeController(RealtimeController):
                 ws.audio_cues = []
                 ws.analysis = {}
         if text.strip():
+            if getattr(self, "hotwords", None) is not None and not getattr(ws, "hotword_final", {}):
+                correction = await self.hotwords.finalized(text, ws.token)
+                text = correction["text"]
             await self.episode.ensure_episode(turn_id=ws.turn_id, text=text,
                                                audio_cues=list(ws.audio_cues),
                                                analysis=dict(ws.analysis))
@@ -1430,6 +1468,8 @@ class EpisodeController(RealtimeController):
             await self.episode.end("reset")
         await self.output.close()
         await self._cancel_tts_prewarm()
+        if getattr(self, "hotwords", None) is not None:
+            self.hotwords.clear()
         close_tts = getattr(self.tts, "close", None)
         if callable(close_tts):
             await close_tts()

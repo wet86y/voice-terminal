@@ -1,0 +1,13 @@
+{
+  "source": "https://github.com/HaujetZhao/asr-hotword",
+  "snapshot_date": "2026-10-14",
+  "files_sha256": {
+    "__init__.py": "edf0a67bd866283fa0b4bb9a5e1be33c00242e6f4f2f279340cc32b6b6c25246",
+    "algo_calc.py": "120d9028cea06039a5245ba3a7ab6c9aeadfac35fe01f2b0f6b4f891d6a56405",
+    "algo_phoneme.py": "4e2a529a4fb2927c0cf5d5e5dafe162f137d2a6027067288efd2d91367a397ba",
+    "hot_phoneme.py": "4270eacc99531d8021148a6e625603d06980339f7b87358baafa39a23dcf4b64",
+    "rag_accu.py": "b5d2f6ad7d9d0f6cd14dc32b261bc27e6499052e2e3fe2d08afe2202b4dfc990",
+    "rag_fast.py": "6de3bfe6fc7da6ecc2a8bdba1497decd62cc710081ebc3679c9d088d744b23b4",
+    "rag_fast_batch.py": "644082db25bad57ad91a93fb3b40eca3136875bfb159a796753b080db11ca99c"
+  }
+}

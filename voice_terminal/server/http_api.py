@@ -536,6 +536,51 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             raise HTTPException(status_code=404, detail="产品设置服务尚未启用。")
         return product_settings
 
+    @app.get("/api/v1/product/settings/hotwords")
+    async def get_hotwords() -> dict:
+        from ..asr.hotwords import DEFAULT_HOTWORDS
+        store = product_store_or_404()
+        return {"settings": store.settings_only().get("hotwords", DEFAULT_HOTWORDS),
+                "status": runtime.hotwords.last_status}
+
+    @app.put("/api/v1/product/settings/hotwords")
+    async def save_hotwords(body: dict[str, Any]) -> dict:
+        service = runtime.hotwords
+        try:
+            async with service.update_lock:
+                bank = await asyncio.to_thread(service.prepare, body)
+                value = await asyncio.to_thread(product_store_or_404().save_hotwords, bank.settings)
+                service.bank = bank  # 持久化成功后原子换入；已有轮次仍用原词表。
+            return {"settings": value, "effective_from": "next_turn", "pending": False,
+                    "message": "热词已保存，从下一轮发言生效，无需重启。"}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/product/hotwords/import")
+    async def import_hotwords(body: dict[str, Any]) -> dict:
+        from ..asr.hotwords import parse_hotword_text
+        product_store_or_404()
+        try:
+            return {"entries": parse_hotword_text(body.get("text"))}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/product/hotwords/preview")
+    async def preview_hotwords(body: dict[str, Any]) -> dict:
+        product_store_or_404()
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 500:
+            raise HTTPException(status_code=422, detail="试测文本须为 1～500 个字符。")
+        from ..asr.hotwords import HotwordService
+        service = HotwordService()
+        try:
+            await service.configure(body.get("settings"))
+            return await service.correct(text, "preview", lane="final")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            service.close()
+
     @app.get("/api/v1/product/compute-status")
     async def get_product_compute_status(refresh: bool = False) -> dict[str, Any]:
         return await runtime.compute_status(refresh_capabilities=True) if refresh else await runtime.compute_status()

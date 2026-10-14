@@ -85,6 +85,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             callback_origin=f"http://127.0.0.1:{config.server.port}",
         )
         self.product_settings = product_settings
+        from ..asr.hotwords import HotwordService
+        self.hotwords = HotwordService()  # hotwords（共享依赖、分通道的热词服务）。
         self._instruction_snapshot = (
             product_settings.settings_only().get("custom_instructions", [])
             if product_settings is not None else []
@@ -550,7 +552,10 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
 
         if self.config.audio.sample_rate != 16000 or self.config.audio.channels != 1 or self.config.audio.sample_format != "int16":
             raise ValueError("session runtime requires 16 kHz mono int16 capture")
+        if self.product_settings is not None:
+            await self.hotwords.configure(lambda: self.product_settings.settings_only().get("hotwords", self.hotwords.bank.settings))
         self.controller = EpisodeController(
+            hotwords=self.hotwords,
             options=self.config.smart_turn, agent_options=self.config.agent,
             persona_config=self.config.persona,
             custom_instructions_provider=lambda: self._instruction_snapshot,
@@ -1294,6 +1299,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             await self.audio_meter.close()
         if self.controller is not None:
             await self.controller.close()
+        self.hotwords.clear()
         speaker = getattr(self, "speaker", None)
         if speaker is not None:
             await speaker.close()
@@ -1335,6 +1341,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
 
     async def close_background_services(self) -> None:
         """Stop project-owned timers when the Voice Server process exits."""
+
+        self.hotwords.close()
 
         if self._quiet_clock_task is not None:
             self._quiet_clock_task.cancel()

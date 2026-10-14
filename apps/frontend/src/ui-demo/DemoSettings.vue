@@ -164,6 +164,14 @@ function cancelTask(item: DemoWakeTask) {
       </div>
     </template>
 
+    <template v-else-if="tab === 'hotwords'">
+      <SettingsPageHeader section="hotwords" />
+      <label class="switch-row"><div><strong>启用热词替换</strong><span>纠正流式短句和整句精修中的专有名称。</span></div><input type="checkbox" role="switch" checked :disabled="loading" /><i></i></label>
+      <label class="form-field"><span>目标词</span><input value="Claude" :disabled="loading" /></label>
+      <label class="form-field"><span>读音或别名（可选）</span><input value="克劳德 | 克劳得" :disabled="loading" /></label>
+      <footer><button class="save-button" :disabled="loading" @click="feedback('热词设置演示已保存，正式页面支持词表导入与试测')">保存热词设置</button></footer>
+    </template>
+
     <template v-else-if="tab === 'persona'">
       <SettingsPageHeader section="persona" />
       <div class="persona-layout">
