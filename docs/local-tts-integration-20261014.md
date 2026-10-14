@@ -76,6 +76,10 @@
 
 宽屏与 620 像素窄屏在浏览器检查共享呈现组件：宽屏双栏、窄屏上下排列，附件和底部按钮可见，文档宽度与视口宽度均为 620 像素，没有横向溢出。截图保存在验证报告目录，演示页使用模拟数据，正式入口的桌面所有权门禁保持有效。
 
-## 提交与构建
+## 提交与发布
 
-验证通过后提交功能，再执行 `npm run desktop:build`（桌面正式构建），用 `scripts/assemble-program-package.py`（统一程序包组装）生成并校验程序包。交付位置为 `.local/build/desktop/product/release`（正式构建目录）和 `.local/build/program-package/program.zip`（统一正式程序包）；程序包摘要位于同目录 `package-info.json`（程序包校验记录）。本次没有执行正式安装目录覆盖。
+代码已提交至当前主线，提交编号 `d286945`（双音色库与通用提前合成）。随后重新执行 `npm run desktop:publish`（构建并事务更新本机正式程序），本机固定本体逐项校验通过，原有数据、模型、运行环境及组件登记保留。再执行 `scripts/distribute-desktop.ps1 -SkipProductBuild`（复用同一正式程序包构建普通分发安装器），安装器构建戳、交付记录、本机 `app/release.json`（本体清单）和程序包 `package-info.json`（程序包记录）均指向构建 `product-62905eda849c4359`（正式构建编号）。
+
+产品版本 `0.9.0`（产品版本）。正式程序包 `.local/build/program-package/program.zip`（统一程序包）共 330 个文件、58,433,929 字节，SHA-256（文件摘要）为 `7cc0fcab32f9f05f7fea6c0b9a5b6660224c74c09f310cd9a8a20a77b7a9d0a8`。本机正式入口 `.local/VoiceTerminal.exe`（本机程序入口）为 9,601,024 字节，SHA-256 为 `53dd215d9a8e0b0521ed9c2206cb5d180411e537d5c07d767426aa58b4f046c0`；`.local/Verify-Package.ps1`（本机本体逐文件校验）通过。
+
+正式安装器 `.local/releases/installer/VoiceTerminalSetup.exe`（分发安装器）为 67,603,968 字节，SHA-256 为 `3b3143739a1b731be1b3ed7be57b8660f62c80b838d909b710614b77930d7c48`。安装器 `build-stamp.json`（构建戳）中的 `program_package_sha256`（内嵌程序包摘要）及 `delivery.json`（交付记录）均与本机发布包摘要一致，`qualification`（隔离验收开关）为 `false`（关闭）。程序包压缩校验及记录的逐文件 SHA-256 已核对；本轮未在其他设备执行安装。
