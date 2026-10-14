@@ -133,6 +133,13 @@ function cancelTask(item: DemoWakeTask) {
 
 <template>
   <article class="settings-panel panel" :class="`settings-panel-${tab}`">
+    <template v-if="tab === 'screen'">
+      <SettingsPageHeader section="screen" /><section class="preference-card settings-stack">
+        <h3>屏幕图像</h3><p>按需获取前台屏幕的全局图与局部图。局部区域为960×640物理像素，全局图长边最多1920像素。</p>
+        <label class="switch-row"><div><strong>允许按需观察屏幕</strong><span>演示界面不会实际截屏。</span></div><input type="checkbox" checked role="switch" /><i></i></label>
+        <button class="save-button" @click="feedback('屏幕图像设置已保存（演示）')">保存屏幕图像设置</button>
+      </section>
+    </template>
     <template v-if="tab === 'wake'">
       <SettingsPageHeader section="wake" />
       <div class="wake-silence-layout">

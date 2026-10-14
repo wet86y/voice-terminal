@@ -8,7 +8,8 @@ const SHADOW_REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'max']
 export const MAX_WAKE_KEYWORDS = 5
 
 export const DEFAULT_SETTINGS: ProductSettingsSnapshot = {
-  schema_version: 12,
+  schema_version: 13,
+  screen_capture: { enabled: true, crop_width: 960, crop_height: 640, global_max_edge: 1920, app_overrides: [] },
   tts: { backend: 'minimax' },
   wake: { enabled: false, keyword: 'hei claw', keyword_label: '', keywords: ['hei claw'], sensitivity: 75 },
   silence: { seconds: 30, smart_turn_hard_silence_ms: 1400 },
@@ -94,6 +95,7 @@ export function normalizeSettings(value: unknown): ProductSettingsSnapshot {
       keywords: wakeKeywords.length ? wakeKeywords : [primaryKeyword],
       sensitivity: typeof wake.sensitivity === 'number' ? wake.sensitivity : DEFAULT_SETTINGS.wake.sensitivity,
     },
+    screen_capture: isRecord(value.screen_capture) ? value.screen_capture as unknown as ProductSettingsSnapshot["screen_capture"] : DEFAULT_SETTINGS.screen_capture,
     silence: {
       seconds: typeof silence.seconds === 'number' ? silence.seconds : 30,
       smart_turn_hard_silence_ms: typeof silence.smart_turn_hard_silence_ms === 'number'
@@ -166,6 +168,7 @@ export function normalizeRuntimeState(value: string | undefined, connected: bool
 export function updateSettingsFromResponse(settings: ProductSettingsSnapshot, result: ProductMutationResult) {
   const candidate: unknown = result.settings
   if (!isRecord(candidate)) return
+  if (isRecord(candidate.screen_capture)) settings.screen_capture = candidate.screen_capture as unknown as ProductSettingsSnapshot["screen_capture"]
   if (isRecord(candidate.wake)) Object.assign(settings.wake, candidate.wake)
   if (isRecord(candidate.silence)) Object.assign(settings.silence, candidate.silence)
   if (isRecord(candidate.quiet_hours)) settings.quiet_hours = { ...settings.quiet_hours, ...candidate.quiet_hours } as ProductSettingsSnapshot['quiet_hours']

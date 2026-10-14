@@ -78,6 +78,9 @@ def build_context_snapshot(
             "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         })
     wire_serialized = _canonical(wire_payload)
+    from ..screen_capture import image_summary
+    safe_messages = image_summary(frozen_messages)
+    safe_wire = image_summary(wire_payload)
     return {
         "record_type": "request_context",
         "version": 3,
@@ -96,9 +99,9 @@ def build_context_snapshot(
         "owner_scope": owner_scope,
         "transport": transport,
         "reasoning_effort": reasoning_effort,
-        "messages": frozen_messages,
+        "messages": safe_messages,
         "schema": dict(schema),
-        "wire_payload": wire_payload,
+        "wire_payload": safe_wire,
         "wire_sha256": _digest(wire_payload),
         "wire_bytes": len(wire_serialized.encode("utf-8")),
         "schema_sha256": _digest(schema),

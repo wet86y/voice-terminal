@@ -210,6 +210,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         return {
             "schema_version": 1,
             "runtime": runtime_payload,
+            "screen_capture_available": bool(runtime.history.screen_capture.available and getattr(runtime.llm, "supports_images", False)),
             "conversation": conversation,
             "shadow": runtime._shadow_product_snapshot(),
             "dsh": runtime.dsh.status_payload(),
@@ -280,6 +281,30 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             status_code=200 if code in {"accepted", "duplicate"} else 409,
             headers={"Cache-Control": "no-store"},
         )
+
+    @app.post("/api/internal/dsh-bridge/attachment.read")
+    async def dsh_attachment_read(request: Request) -> JSONResponse:
+        """attachment.read（程序内部取图）：验证绑定，不触发模型工具或历史浏览。"""
+        remote = request.client.host if request.client is not None else None
+        if not runtime.dsh.bridge_hub.authorize(request.headers.get("authorization"), remote):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        try:
+            payload = await request.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="图片读取请求不是有效 JSON（结构化数据）") from exc
+        if not isinstance(payload, dict) or payload.get("protocol_version") != BRIDGE_PROTOCOL_VERSION:
+            raise HTTPException(status_code=409, detail="protocol mismatch")
+        session = runtime.dsh.bridge_hub.resolve(payload)
+        if session is None or payload.get("epoch") != session.epoch or payload.get("dsh_session_id") != session.dsh_session_id:
+            raise HTTPException(status_code=409, detail="stale binding")
+        aid = payload.get("attachment_id")
+        if not isinstance(aid, str):
+            raise HTTPException(status_code=400, detail="附件标识无效")
+        item = runtime.history.screen_attachment(session.voice_session_id, aid)
+        if item is None:
+            raise HTTPException(status_code=404, detail="当前会话附件不存在")
+        return JSONResponse({"protocol_version": BRIDGE_PROTOCOL_VERSION, "result": "accepted", "attachment": item},
+                            headers={"Cache-Control": "no-store"})
 
     @app.post("/api/internal/dsh-bridge/input.early-silence")
     async def dsh_early_silence(request: Request) -> JSONResponse:
@@ -565,6 +590,23 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                         f"{label}已保存，组件加载完成后自动生效。" if loading else
                         f"{label}已保存，但即时应用失败，请检查组件状态后重新保存。"),
         }
+
+    @app.put("/api/v1/product/settings/screen-capture")
+    async def save_screen_capture(payload: dict) -> dict:
+        from ..screen_capture import ScreenCaptureConfig
+        store = product_store_or_404()
+        try:
+            value = ScreenCaptureConfig(**payload).snapshot()
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        previous = dict(store._settings)
+        try:
+            store._settings = {**store._settings, "screen_capture": value, "schema_version": 13}
+            store._save_settings()
+        except Exception:
+            store._settings = previous
+            raise
+        return {"settings": {"screen_capture": value}, **await apply_saved_product_settings(store, "屏幕图像设置")}
 
     @app.put("/api/v1/product/settings/wake")
     async def update_product_wake(body: dict[str, Any]) -> dict[str, Any]:
@@ -1057,6 +1099,22 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     continue
                 if command == "subscribe":
                     await websocket.send_json(sequencer.envelope(runtime.snapshot()))
+                elif command == "conversation.image.read":
+                    cid = _payload.get("conversation_id")
+                    aid = _payload.get("attachment_id")
+                    item = runtime.history.screen_attachment(cid, aid) if cid == runtime.conversation.conversation_id and isinstance(aid, str) else None
+                    if item is None:
+                        await websocket.send_json(sequencer.envelope(event("conversation.image", request_id=message["request_id"],
+                            conversation_id=cid, attachment_id=aid, error="图片不属于当前会话或已失效")))
+                    else:
+                        encoded = item["base64"]
+                        chunk_size = 64 * 1024
+                        total = (len(encoded) + chunk_size - 1) // chunk_size
+                        for index in range(total):
+                            await websocket.send_json(sequencer.envelope(event("conversation.image", request_id=message["request_id"],
+                                conversation_id=cid, attachment_id=aid, index=index, total=total,
+                                mime_type=item["mime_type"], data=encoded[index * chunk_size:(index + 1) * chunk_size])))
+                            await asyncio.sleep(0)
                 elif command == "session.start":
                     await runtime.start_listening()
                 elif command == "session.stop":

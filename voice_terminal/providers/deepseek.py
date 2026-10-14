@@ -9,6 +9,16 @@ from ..session.context_frames import ContextFrame, ContextLane
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_error_body(body: str) -> str:
+    """safe_error_body（错误正文脱敏）：接口回显图片时也不记录编码。"""
+    from ..screen_capture import image_summary
+    import re
+    try:
+        return json.dumps(image_summary(json.loads(body)), ensure_ascii=False)
+    except (ValueError, TypeError):
+        return re.sub(r"data:image/[^;\s]+;base64,[A-Za-z0-9+/=]+", "[图片编码]", body)
+
 REASONING_EFFORTS = frozenset({"off", "low", "medium", "high", "max"})
 
 
@@ -43,8 +53,16 @@ class DeepSeekHttpError(DeepSeekError):
         self.error_code = "RATE_LIMITED" if self.status_code == 429 else (
             "PROVIDER_5XX" if 500 <= self.status_code < 600 else "HTTP_ERROR"
         )
-        self.body_preview = str(body)[:500]
+        self.body_preview = _safe_error_body(str(body))[:500]
         super().__init__(f"DeepSeek HTTP {self.status_code}: {self.body_preview}")
+
+
+class DeepSeekImageReferenceError(DeepSeekHttpError):
+    """ImageReferenceError（图片引用失效）：保留逻辑历史，仅允许有界传输恢复。"""
+    def __init__(self, status_code: int):
+        super().__init__(status_code, "已上传的图片引用失效，将重建传输引用")
+        self.retryable = True
+        self.error_code = "IMAGE_REFERENCE_INVALID"
 
 
 class DeepSeekTransportError(DeepSeekError):
@@ -132,6 +150,8 @@ class DeepSeekClient:
         self.protocol_recovery_limit = max(0, protocol_recovery_limit)
         self.transport_retry_limit = max(0, transport_retry_limit)
         self.supports_decision_schema = True
+        from urllib.parse import urlsplit
+        self.supports_images = self.model == "deepseek-flash" and urlsplit(self.base_url).hostname == "api.deepseek.com"  # supports_images（已验证图像协议）。
         self._client = None
 
     def set_session_id(self, session_id: str | None) -> None:
@@ -170,6 +190,92 @@ class DeepSeekClient:
             await self._client.aclose()
             self._client = None
 
+    async def prepare_messages(self, messages):
+        """prepare_messages（冻结视觉传输）：同一图片上传一次，后续历史复用文件引用。"""
+        import asyncio
+        import base64
+        import copy
+        import hashlib
+        import time
+        if not self.supports_images:
+            return messages
+        if not hasattr(self, "_image_sources"):
+            self._image_sources = {}  # 图片摘要到稳定传输来源；不进入聊天编码存储。
+            self._image_locks = {}
+        if not hasattr(self, "_image_upload_limit"):
+            self._image_upload_limit = asyncio.Semaphore(2)  # 最多双路上传，历史恢复不并发冲击文件接口。
+        prepared = copy.deepcopy(messages)
+        async def resolve(part):
+            if part.get("type") != "image" or "data" not in part:
+                return
+            raw = base64.b64decode(part["data"], validate=True)
+            key = hashlib.sha256(raw).hexdigest()
+            lock = self._image_locks.setdefault(key, asyncio.Lock())
+            async with lock:
+                if self._image_sources.get(key, {}).get("expires_at", float("inf")) <= time.time():
+                    self._image_sources.pop(key)
+                if key not in self._image_sources:
+                    try:
+                        client = await self._http_client()
+                        async with self._image_upload_limit:
+                            response = await client.post(f"{self.base_url}/files", headers=self._request_headers(),
+                                data={"purpose": "user_data", "expires_after[anchor]": "created_at", "expires_after[seconds]": "604800"},
+                                files={"file": (f"{key}.{'png' if part['mime_type'] == 'image/png' else 'jpg'}", raw, part["mime_type"])})
+                        response.raise_for_status()
+                        metadata = response.json()
+                        identifier = metadata.get("id")
+                        if not isinstance(identifier, str) or not identifier.startswith("file-api-"):
+                            raise ValueError("文件接口未返回有效图片标识")
+                        expires = metadata.get("expires_at")
+                        if isinstance(expires, bool) or not isinstance(expires, (int, float)) or expires <= time.time():
+                            expires = time.time() + 604800
+                        self._image_sources[key] = {"file_id": identifier, "expires_at": expires}
+                    except Exception as exc:
+                        # 首次上传不可用则固定使用内联，不在以后每轮反复切换来源破坏前缀。
+                        logger.warning("deepseek.image_inline_fallback reason=%s", type(exc).__name__)
+                        self._image_sources[key] = {}
+            if self._image_sources[key]:
+                part["file_id"] = self._image_sources[key]["file_id"]
+                part.pop("data", None)
+        images = [part for frame in prepared if isinstance(frame.get("content"), list)
+                  for part in frame["content"] if part.get("type") == "image"]
+        await asyncio.gather(*(resolve(part) for part in images))
+        return prepared
+
+    def image_transport_snapshot(self):
+        """image_transport_snapshot（图片传输检查点）：保存引用和有效期，不保存凭据或编码。"""
+        import hashlib
+        return {"scope": hashlib.sha256(f"{self.base_url}\0{self.api_key}".encode()).hexdigest(),
+                "sources": {key: dict(value) for key, value in getattr(self, "_image_sources", {}).items()}}
+
+    def restore_image_transport(self, snapshot):
+        if hasattr(self, "_image_sources") or not isinstance(snapshot, dict):
+            return
+        if snapshot.get("scope") != self.image_transport_snapshot()["scope"]:
+            return
+        rows = snapshot.get("sources")
+        if not isinstance(rows, dict):
+            return
+        self._image_sources = {key: dict(value) for key, value in rows.items()
+            if isinstance(key, str) and len(key) == 64 and isinstance(value, dict)
+            and (not value or (isinstance(value.get("file_id"), str) and value["file_id"].startswith("file-api-")
+                 and isinstance(value.get("expires_at"), (float, int))))}
+        self._image_locks = {}
+
+    def _check_image_reference_error(self, messages, status, body):
+        """图片被删除或失效时，重建所涉引用；逻辑消息及成品字节保持不变。"""
+        text = body.casefold()
+        if status not in {400, 404} or "file" not in text or not any(word in text for word in ("expired", "deleted", "not found", "not_found", "not exist", "invalid file")):
+            return
+        used = {part["file_id"] for message in messages if isinstance(message.get("content"), list)
+                for part in message["content"] if isinstance(part, dict) and isinstance(part.get("file_id"), str)}
+        if not used:
+            return
+        rejected = {identifier for identifier in used if identifier.casefold() in text} or used
+        self._image_sources = {key: source for key, source in getattr(self, "_image_sources", {}).items() if source.get("file_id") not in rejected}
+        logger.warning("deepseek.image_reference_invalid count=%s cache_rebuild=true", len(rejected))
+        raise DeepSeekImageReferenceError(status)
+
     async def prewarm(self) -> None:
         """Warm DNS/TCP/TLS/auth transport only; never starts inference."""
         if not self.api_key:
@@ -182,14 +288,14 @@ class DeepSeekClient:
 
     def _request_payload(
         self,
-        messages: Sequence[Mapping[str, str]],
+        messages: Sequence[Mapping[str, Any]],
         *,
         reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
-                {"role": str(message.get("role") or "user"), "content": str(message.get("content") or "")}
+                {"role": str(message.get("role") or "user"), "content": self._chat_content(message.get("content"))}
                 for message in messages
             ],
             "stream": True,
@@ -210,6 +316,22 @@ class DeepSeekClient:
         if thinking_enabled:
             payload["reasoning_effort"] = effective_effort
         return payload
+
+    @staticmethod
+    def _chat_content(content):
+        """_chat_content（旧聊天接口图片格式）。"""
+        if not isinstance(content, list):
+            return str(content or "")
+        from ..session.multimodal import responses_content
+        result = []
+        for part in responses_content(content):
+            if part["type"] in {"input_text", "output_text"}:
+                result.append({"type": "text", "text": part["text"]})
+            elif "file_id" in part:
+                result.append({"type": "file", "file_id": part["file_id"]})
+            else:
+                result.append({"type": "image_url", "image_url": {"url": part["image_url"], "detail": part.get("detail", "high")}})
+        return result
 
     @staticmethod
     def _normalize_usage(usage: Mapping[str, Any]) -> dict[str, Any]:
@@ -235,14 +357,15 @@ class DeepSeekClient:
 
     @staticmethod
     def _responses_payload(
-        messages: Sequence[Mapping[str, str]], *, model: str, schema: Mapping[str, Any],
+        messages: Sequence[Mapping[str, Any]], *, model: str, schema: Mapping[str, Any],
         schema_name: str, reasoning_effort: str, max_output_tokens: int,
     ) -> dict[str, Any]:
+        from ..session.multimodal import responses_content
         instructions: list[str] = []
         input_items: list[dict[str, Any]] = []
         for message in messages:
             role = str(message.get("role") or "user")
-            content = str(message.get("content") or "")
+            content = message.get("content") or ""
             lane = ContextFrame.lane_of(dict(message))
             if lane == ContextLane.STATIC_INSTRUCTIONS:
                 if role != "system":
@@ -253,7 +376,8 @@ class DeepSeekClient:
                 raise ValueError("unsupported model context lane")
             input_items.append({
                 "role": role,
-                "content": [{"type": "input_text", "text": content}],
+                "content": responses_content(content)
+                if isinstance(content, list) else [{"type": "input_text", "text": content}],
             })
         compatibility = (
             "Provider schema compatibility: every declared property is required. "
@@ -286,7 +410,7 @@ class DeepSeekClient:
 
     async def stream_events(
         self,
-        messages: Sequence[Mapping[str, str]],
+        messages: Sequence[Mapping[str, Any]],
         *,
         cancel_event: Any = None,
         json_mode: bool = False,
@@ -350,11 +474,14 @@ class DeepSeekClient:
                 logger.info("deepseek.response_status status=%d", response.status_code)
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", errors="replace")
-                    logger.error("deepseek.http_error status=%d body=%r", response.status_code, body[:500])
+                    self._check_image_reference_error(messages, response.status_code, body)
+                    logger.error("deepseek.http_error status=%d body=%r", response.status_code, _safe_error_body(body)[:500])
                     raise DeepSeekHttpError(
                         response.status_code, body,
                         retry_after=getattr(response, "headers", {}).get("Retry-After"),
                     )
+                if any(isinstance(m.get("content"), list) and any(p.get("type") in {"input_image", "image_url", "file"} for p in m["content"]) for m in payload.get("input", payload.get("messages", []))):
+                    yield {"type": "accepted"}  # accepted（模型HTTP接口已接受）。
                 async for line in response.aiter_lines():
                         if cancel_event is not None and cancel_event.is_set():
                             return
@@ -499,10 +626,13 @@ class DeepSeekClient:
                 )
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", errors="replace")
+                    self._check_image_reference_error(messages, response.status_code, body)
                     raise DeepSeekHttpError(
                         response.status_code, body,
                         retry_after=getattr(response, "headers", {}).get("Retry-After"),
                     )
+                if any(isinstance(m.get("content"), list) and any(p.get("type") in {"input_image", "image_url"} for p in m["content"]) for m in payload.get("input", payload.get("messages", []))):
+                    yield {"type": "accepted"}  # accepted（模型HTTP接口已接受）。
                 async for line in response.aiter_lines():
                     if cancel_event is not None and cancel_event.is_set():
                         return

@@ -319,6 +319,7 @@ onBeforeUnmount(() => {
             :key="entry.key"
             :role="entry.role"
             :text="entry.text"
+            :attachments="entry.attachments"
             :time="entry.time"
             :animate-on-mount="!initialMessageKeys.has(entry.key)"
             :status="entry.status"

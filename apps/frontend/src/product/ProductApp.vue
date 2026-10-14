@@ -9,6 +9,7 @@ import SettingsFrame from "../interface/SettingsFrame.vue";
 import Workbench from "../interface/Workbench.vue";
 import { desktopPort } from "./desktop-port";
 import "./application.css";
+import ScreenSettings from "./panels/ScreenSettings.vue";
 import WakeSettings from "./panels/WakeSettings.vue";
 import PersonaSettings from "./panels/PersonaSettings.vue";
 import SpeakerSettings from "./panels/SpeakerSettings.vue";
@@ -147,6 +148,7 @@ function nativeAction(action: () => Promise<void>) {
         </div></template
       >
       <article class="settings-panel panel" :class="`settings-panel-${activeSettingsTab}`">
+        <ScreenSettings v-if="activeSettingsTab === 'screen'" />
         <WakeSettings v-if="activeSettingsTab === 'wake'" />
         <PersonaSettings v-if="activeSettingsTab === 'persona'" />
         <SpeakerSettings v-if="activeSettingsTab === 'speaker'" />

@@ -9,6 +9,8 @@ the internal Agent/Shadow trace.
 
 from __future__ import annotations
 
+from ..screen_capture import ScreenCaptureConfig
+
 import asyncio
 import json
 import os
@@ -31,7 +33,7 @@ if TYPE_CHECKING:
     from ..shadow_agent.contracts import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 12
+PRODUCT_SETTINGS_SCHEMA_VERSION = 13
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -87,6 +89,7 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
     compute_devices["paraformer"] = paraformer_mode
     return {
         "schema_version": PRODUCT_SETTINGS_SCHEMA_VERSION,
+        "screen_capture": config.screen_capture.snapshot(),
         "quiet_hours": config.quiet_hours.snapshot(),
         "wake": {
             "enabled": bool(config.wake.enabled),
@@ -165,6 +168,10 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     # Product settings are intentionally versioned independently from the
     # model registry.  Unknown fields are discarded rather than echoed to the
     # browser, which keeps this file a narrow, non-secret state boundary.
+    try:
+        result["screen_capture"] = ScreenCaptureConfig(**value.get("screen_capture", defaults["screen_capture"])).snapshot()
+    except (ValueError, TypeError):
+        result["screen_capture"] = defaults["screen_capture"]
     result["schema_version"] = PRODUCT_SETTINGS_SCHEMA_VERSION
     raw_compute = value.get("compute")
     if isinstance(raw_compute, Mapping):
@@ -485,7 +492,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     quiet = QuietHoursConfig(**dict(settings.get("quiet_hours", config.quiet_hours.snapshot())))
     if quiet.enabled and not next_wake.enabled:
         raise ProductSettingsError("被动静默要求开启 KWS（关键词唤醒）。")
-    return replace(config, quiet_hours=quiet, wake=next_wake, agent=next_agent, shadow_agent=next_shadow,
+    return replace(config, screen_capture=ScreenCaptureConfig(**settings.get("screen_capture", config.screen_capture.snapshot())), quiet_hours=quiet, wake=next_wake, agent=next_agent, shadow_agent=next_shadow,
                    speaker=next_speaker, tts=next_tts, compute=next_compute)
 
 

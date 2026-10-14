@@ -16,6 +16,8 @@
       "cffi",
       "click",
       "colorama",
+      "comtypes",
+      "dxcam",
       "fastapi",
       "h11",
       "httpcore",
@@ -27,6 +29,7 @@
       "keyring",
       "more-itertools",
       "numpy",
+      "pillow",
       "psutil",
       "pycparser",
       "pydantic",
@@ -429,6 +432,17 @@
       ]
     },
     {
+      "name": "comtypes",
+      "version": "1.4.17",
+      "groups": [
+        "voice-core"
+      ],
+      "file": "comtypes-1.4.17-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/89/9c/d0bc1fb69ad22a04bdc01dd9b5613a2ebc4d02ba1ec24b02127dc93791ba/comtypes-1.4.17-py3-none-any.whl",
+      "size": 298743,
+      "sha256": "4e0a221dde2c589b82977bed802efd71cd5eb67a380347b732e02735e597f586"
+    },
+    {
       "file": "crcmod-1.7-cp312-cp312-win_amd64.whl",
       "url": "",
       "size": 25138,
@@ -465,6 +479,17 @@
         "onnx-cpu",
         "onnx-vad"
       ]
+    },
+    {
+      "name": "dxcam",
+      "version": "0.3.0",
+      "groups": [
+        "voice-core"
+      ],
+      "file": "dxcam-0.3.0-cp312-cp312-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/32/3c/6aca1d8a906ccb5d7b5993b99822dbd60ac18470e88eee845afd927d678f/dxcam-0.3.0-cp312-cp312-win_amd64.whl",
+      "size": 339445,
+      "sha256": "ab75b16529b8bd7337dfcb663525c338233a24b4c5b76193ced82a70e16edf49"
     },
     {
       "file": "fastapi-0.115.6-py3-none-any.whl",

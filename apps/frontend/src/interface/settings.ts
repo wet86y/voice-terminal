@@ -1,5 +1,6 @@
 /** settingsSections（设置分区）：label（页面名称）、hint（导航说明）与 description（页面副标题）由正式窗口与独立展示共用。 */
 export const settingsSections = [
+  { id: "screen", label: "屏幕图像", hint: "截屏与局部中心", description: "按需观察屏幕与图像尺寸", icon: "▧" },
   { id: "wake", label: "唤醒与静默", hint: "待机、唤醒词与时间", description: "唤醒短语与静默时段", icon: "◌" },
   { id: "persona", label: "人格与指令", hint: "偏好与协作方式", description: "人格风格与协作指令", icon: "✦" },
   { id: "speaker", label: "声纹识别", hint: "身份与打断策略", description: "身份识别与打断策略", icon: "♬" },

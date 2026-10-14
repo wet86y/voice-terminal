@@ -22,13 +22,18 @@ class ContextFrame:
 
     @classmethod
     def make(
-        cls, lane: ContextLane, role: str, content: str, *, context_kind: str | None = None,
-    ) -> dict[str, str]:
+        cls, lane: ContextLane, role: str, content: str | list[dict[str, Any]], *, context_kind: str | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(lane, ContextLane):
             raise ValueError("model context frame requires a ContextLane")
         if role not in {"system", "user", "assistant"}:
             raise ValueError("model context frame role must be system, user, or assistant")
-        if not isinstance(content, str):
+        if isinstance(content, list):
+            if role != "user" or lane == ContextLane.STATIC_INSTRUCTIONS:
+                raise ValueError("多模态材料必须位于用户角色历史或请求内容")
+            if not content or any(not isinstance(p, dict) or p.get("type") not in {"text", "image", "input_text", "input_image"} for p in content):
+                raise ValueError("图片内容块无效")
+        elif not isinstance(content, str):
             raise ValueError("model context frame content must be text")
         if context_kind is not None and (not isinstance(context_kind, str) or not context_kind):
             raise ValueError("model context frame kind must be a non-empty string")

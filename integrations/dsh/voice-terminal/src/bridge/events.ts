@@ -266,6 +266,7 @@ export function registerSessionEvents(ctx: Context, bindings: Map<string, Bindin
     const revision = binding?.queuedMessages?.get(String(message?.id ?? ''))
     if (revision === undefined) return
     binding.queuedMessages?.delete(String(message.id))
+    if (binding.pendingContext?.messageId === String(message.id)) delete binding.pendingContext
     binding.claimedRevision = Math.max(binding.claimedRevision ?? 0, revision)
     if (binding.gateObserved) console.info('[voice-shadow-bridge] context gate', {
       action: 'claimed', activation_id: binding.activationId ?? '',

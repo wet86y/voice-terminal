@@ -140,7 +140,16 @@ export interface CustomInstruction {
   enabled: boolean
 }
 
+/** ScreenCaptureSettings（屏幕输入设置）。 */
+export interface ScreenCaptureSettings {
+  enabled: boolean // enabled（按需截屏开关）。
+  crop_width: number // crop_width（局部宽度，物理像素）。
+  crop_height: number // crop_height（局部高度，物理像素）。
+  global_max_edge: number // global_max_edge（全局图最长边）。
+  app_overrides: Array<{ executable: string; mode: 'auto' | 'cursor' | 'center' }> // app_overrides（文件名与中心模式规则）。
+}
 export interface ProductSettingsSnapshot {
+  screen_capture?: ScreenCaptureSettings // screen_capture（兼容旧版本可省略）。
   /** quiet_hours（每日被动静默）：enabled（启用）、start（开始时间）、end（结束时间）。 */
   quiet_hours?: { enabled: boolean; start: string; end: string }
   schema_version: number
@@ -307,6 +316,7 @@ export interface WakeTask {
 }
 
 export interface ProductSnapshot {
+  screen_capture_available?: boolean // screen_capture_available（实际可用状态）。
   schema_version: number
   runtime: ProductRuntimeSnapshot
   conversation: ProductConversationSnapshot

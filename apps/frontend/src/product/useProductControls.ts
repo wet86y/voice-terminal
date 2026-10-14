@@ -119,6 +119,7 @@ export function useProductControls() {
     setReasoningMode,
     toggleProviderReasoning,
     saveWake,
+    saveScreenCapture,
     saveSilence,
     quietHoursForm,
     quietStatus,
@@ -1499,13 +1500,14 @@ export function useProductControls() {
       conversationEntries.value.map((entry) => ({
         key: entry.key,
         role: entry.role,
+        attachments: entry.attachments,
         // 同轮继续输入时，最终稿先于正式记录到达也不短暂退回旧正文。
         text: (entry.role === "user" && latestUserFinal.value
           && entry.key === userMessageKey(latestUserFinal.value.turnId)
           ? latestUserFinal.value.text : entry.text) || "（没有可显示的转写）",
         time: formatTime(entry.at),
         status:
-          entry.role === "user"
+          entry.role === "tool" ? entry.status : entry.role === "user"
             ? turnStatusLabel(entry)
             : speechStatusLabel(entry),
         speaking: entry.speaking,
@@ -1683,6 +1685,7 @@ export function useProductControls() {
     clearSession,
     setReasoningMode,
     saveWake,
+    saveScreenCapture,
     saveSilence,
     quietHoursForm,
     quietStatus,
@@ -1781,5 +1784,6 @@ export function useProductControls() {
     stopSpeakerRecording,
     cancelActiveSpeakerCapture,
     workbenchModel,
+    screenCaptureAvailable: computed(() => adapter.snapshot.value?.screen_capture_available ?? false),
   };
 }

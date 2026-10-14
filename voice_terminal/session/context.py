@@ -66,12 +66,13 @@ def wrap_current_user_input(content: str) -> str:
     })
 
 
-def consolidate_request_tail(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+def consolidate_request_tail(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Separate request facts, then place the native snapshot beside the task."""
 
     prefix: list[dict[str, str]] = []
     current_users: list[dict[str, Any]] = []
     system_frames: list[dict[str, str]] = []
+    image_frames = []  # image_frames（独立截屏结果）。
     snapshot: dict[str, Any] | None = None
     tail_started = False
     for raw in messages:
@@ -86,6 +87,9 @@ def consolidate_request_tail(messages: list[dict[str, Any]]) -> list[dict[str, s
         role = str(frame.get("role") or "")
         kind = ContextFrame.kind_of(frame)
         content = str(frame.get("content") or "")
+        if role == "user" and kind == "screen_capture":
+            image_frames.append(frame)
+            continue
         if role == "user":
             if system_frames or snapshot is not None:
                 raise RuntimeError("current user input must precede request system context")
@@ -122,6 +126,7 @@ def consolidate_request_tail(messages: list[dict[str, Any]]) -> list[dict[str, s
             wrap_current_user_input(str(current.get("content") or "")),
             context_kind=CURRENT_USER_INPUT_TYPE,
         ))
+    result.extend(image_frames)
     result.extend(system_frames)
     result.append(ContextFrame.make(
         ContextLane.REQUEST_TAIL,

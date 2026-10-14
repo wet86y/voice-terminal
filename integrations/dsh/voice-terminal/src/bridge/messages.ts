@@ -4,7 +4,7 @@ import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     /** Bridge source（桥接来源）：与历史消息标识一致。 */
-    'plugin:voice-terminal-shadow-bridge': { kind: 'plugin:voice-terminal-shadow-bridge' }
+    'plugin:voice-terminal-shadow-bridge': { kind: 'plugin:voice-terminal-shadow-bridge'; voice_context?: { epoch: number; voice_session_id: string; frames: Record<string, string> } }
     /** Schedule source（任务来源）：公开调度日志的来源类型。 */
     schedule: { kind: 'schedule' } & ContextFormed
   }

@@ -17,7 +17,7 @@ OUT = ROOT / 'config/runtime/voice-runtime.lock.json'
 CACHE = ROOT / '.local/build/runtime-lock'
 GROUPS = {
     'voice-core': ['fastapi', 'uvicorn', 'httpx', 'pyyaml', 'numpy', 'psutil', 'websockets', 'keyring',
-                   'sounddevice', 'soundfile', 'webrtcvad-wheels', 'aec-audio-processing', 'pypinyin'],
+                   'sounddevice', 'soundfile', 'webrtcvad-wheels', 'aec-audio-processing', 'pypinyin', 'dxcam', 'comtypes', 'pillow'],
     'torch-cpu': ['torch', 'torchaudio', 'funasr'],
     'onnx-cpu': ['onnxruntime', 'transformers', 'librosa', 'kaldi-native-fbank'],
     'onnx-vad': ['funasr-onnx'],

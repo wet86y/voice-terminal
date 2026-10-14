@@ -178,10 +178,14 @@ class HandoffRuntimeMixin:
             records = snapshot + [{"kind": entry.kind, "content": entry.content,
                                    "metadata": entry.metadata} for entry in self.history.entries]
             records.extend(self.history.delivery_records)
+        records = RecordView((records, lambda row: row),
+            (self.history.image_records, lambda packet: {"kind": "screen_capture", **packet}))
         archive = self.paired_archives.save(
             voice_session_id=self.conversation.conversation_id, dsh_session_id=dsh_id, cwd=cwd,
             voice_records=records, dsh_records=rows,
             captures=self.pending_transfer.captures(self.conversation.conversation_id))
+        self.paired_archives.require_complete(archive.directory)
+        self.history.clear_screen_files()
         if archive.archive_id not in self._archive_backlog:
             backlog = [*self._archive_backlog, archive.archive_id]
             atomic_json(self._archive_backlog_path, {"pending": backlog, "consumed": self._archive_consumed})

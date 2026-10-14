@@ -30,7 +30,7 @@ class ProductSettingsRuntimeMixin:
             return True
         previous = self.config
         # compute（模型运行设备）有独立的应用重启契约，不能被其他设置顺带加载。
-        live_sections = {key: pending[key] for key in ("wake", "silence", "quiet_hours", "speaker") if key in pending}
+        live_sections = {key: pending[key] for key in ("wake", "silence", "quiet_hours", "speaker", "screen_capture") if key in pending}
         next_config = replace(apply_settings_to_config(previous, live_sections), compute=previous.compute)
         wake_changed = next_config.wake != previous.wake
         old_worker = self.kws
@@ -47,6 +47,11 @@ class ProductSettingsRuntimeMixin:
                     raise ValueError("语音识别尚未就绪，无法从关键词待机切换为直接监听。")
             if next_config.speaker != previous.speaker:
                 await self.set_speaker_settings(vars(next_config.speaker))
+            self.history.screen_capture.configure(next_config.screen_capture)
+            if not next_config.screen_capture.enabled and self.controller is not None:
+                episode = getattr(self.controller, "episode", None)
+                if episode is not None:
+                    episode.invalidate_screen_capture()
             self.config = next_config
             self.quiet_policy.config = next_config.quiet_hours
             self.state.wake_always_on = bool(next_config.wake.enabled)
@@ -72,6 +77,7 @@ class ProductSettingsRuntimeMixin:
             return True
         except Exception as exc:
             logger.exception("product.settings_apply_failed")
+            self.history.screen_capture.configure(previous.screen_capture)
             if candidate is not None and candidate is not old_worker:
                 await asyncio.to_thread(candidate.close)
             self.config = previous

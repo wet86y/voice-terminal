@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import CaptureImages from './CaptureImages.vue';
 import { computed } from "vue";
 import { useProgressiveText } from './progressive-text';
 const props = withDefaults(defineProps<{
-  role: "user" | "assistant"; // role（消息发送方）：用户或语音助手。
+  attachments?: import('../types').ImageAttachment[]; // attachments（图片附件）。
+  role: "user" | "assistant" | "tool"; // role（消息发送方）：用户或语音助手。
   text: string; // text（消息正文）。
   time?: string; // time（消息时间）。
   status?: string; // status（识别或播报状态）。
@@ -30,7 +32,7 @@ const visibleStatus = computed(() => {
       `${role}-message`,
       { speaking, 'live-asr': partial, 'assistant-pending': pending },
     ]"
-    :aria-label="role === 'user' ? '你的消息' : '语音助手的消息'"
+    :aria-label="role === 'tool' ? '屏幕截图' : role === 'user' ? '你的消息' : '语音助手的消息'"
   >
     <div class="message-author">
       <span class="avatar" aria-hidden="true">
@@ -38,6 +40,7 @@ const visibleStatus = computed(() => {
           <circle cx="12" cy="8" r="3.5" />
           <path d="M5.5 20v-1.5a6.5 6.5 0 0 1 13 0V20" />
         </svg>
+        <svg v-else-if="role === 'tool'" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="13" rx="2" /><path d="M8 21h8M12 18v3M7 14l3-3 3 2 3-4 3 5" /></svg>
         <svg v-else viewBox="0 0 24 24">
           <path d="M5 10v4M9.5 6v12M14 4v16M18.5 8v8" />
         </svg>
@@ -50,11 +53,12 @@ const visibleStatus = computed(() => {
           <span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>
           <span>{{ text }}</span>
         </div>
-        <p v-else class="message-text">
+        <p v-else class="message-text" v-show="text || !attachments?.length">
           <span v-if="displayedText !== text" class="message-text-measure" aria-hidden="true">{{ text }}</span>
           <span class="message-text-visible" aria-hidden="true">{{ displayedText }}</span>
           <span class="message-text-source">{{ text }}</span>
         </p>
+        <CaptureImages v-if="attachments?.length" :attachments="attachments" />
       </div>
       <small v-if="visibleStatus" class="message-status">
         <span v-if="partial" class="live-dot" aria-hidden="true"></span>
