@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import shutil
 import stat
 import tempfile
@@ -83,6 +84,23 @@ def safe_path(root: Path, relative: str) -> Path:
     return resolved
 
 
+def python_bytecode_source(relative: str) -> str | None:
+    """Map a Python 3.12 cache（解释器缓存）to its packaged source path."""
+    path = PurePosixPath(relative)
+    if len(path.parts) < 3 or path.parent.name != "__pycache__" or path.suffix != ".pyc":
+        return None
+    stem = path.name[:-4]
+    module, separator, tag = stem.rpartition(".cpython-312")
+    if not separator or not module:
+        return None
+    if tag not in {"", ".opt-1", ".opt-2"}:
+        pytest_version = tag.removeprefix("-pytest-") if tag.startswith("-pytest-") else ""
+        parts = pytest_version.split(".")
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            return None
+    return PurePosixPath(*path.parts[:-2], f"{module}.py").as_posix()
+
+
 def manifest(root: Path, *, kind: str, build: str) -> dict:
     candidates = [path for path in files(root) if path.relative_to(root).as_posix() not in {"manifest.json", "release.json"}]
     def describe(path):
@@ -108,6 +126,10 @@ def verify(root: Path, record: dict, *, exact=True) -> None:
         # 先遍历并拒绝所有重解析点，再按已枚举的物理文件核对；避免每项重复规范化根路径。
         actual_paths = {p.relative_to(root).as_posix().casefold(): p for p in files(root)
                         if p.relative_to(root).as_posix().casefold() not in {'manifest.json', 'release.json'}}
+        if record.get("kind") == "python":
+            actual_paths = {name: path for name, path in actual_paths.items()
+                            if name in expected or not (source := python_bytecode_source(name))
+                            or source.casefold() not in expected}
         if set(actual_paths) != expected:
             raise ValueError('组件文件集合与发布清单不一致')
     def validate_file(item):

@@ -1047,13 +1047,19 @@ pub(crate) fn seed_verified_tree_cache(root:&Path,cache:&Path,proof:&Value,cance
     let mut record=proof.clone();record["root"]=json!(root);atomic_json(cache,&record)?;Ok(true)
 }
 
-/// python_bytecode_source（缓存对应源码）：只识别 Python 3.12（后端解释器）的标准缓存命名。
+/// python_bytecode_source（缓存对应源码）：识别 Python 3.12（后端解释器）和 pytest（测试框架）缓存命名。
+/// pytest_cache_version（pytest 缓存版本号）：只接受三段纯数字，拒绝任意附加标签。
+fn pytest_cache_version(tag:&str)->bool{
+    let Some(version)=tag.strip_prefix("-pytest-")else{return false;};
+    let parts:Vec<_>=version.split('.').collect();
+    parts.len()==3&&parts.iter().all(|part|!part.is_empty()&&part.bytes().all(|byte|byte.is_ascii_digit()))
+}
 fn python_bytecode_source(relative:&str)->Option<String>{
     let path=Path::new(relative);let parent=path.parent()?;
     if parent.file_name()?.to_str()? != "__pycache__" {return None;}
     let filename=path.file_name()?.to_str()?.strip_suffix(".pyc")?;
     let (module,optimization)=filename.rsplit_once(".cpython-312")?;
-    if module.is_empty()||!["",".opt-1",".opt-2"].contains(&optimization){return None;}
+    if module.is_empty()||(!["",".opt-1",".opt-2"].contains(&optimization)&&!pytest_cache_version(optimization)){return None;}
     Some(parent.parent()?.join(format!("{module}.py")).to_string_lossy().replace('\\',"/"))
 }
 
@@ -1069,7 +1075,7 @@ fn prepare_validation_files(root:&Path,records:&[Value],exact:bool,allow_python_
     let mut present=std::collections::HashMap::new();let mut last_report=Instant::now();
     progress("核对组件文件清单",0,0);
     collect_validation_files(root,root,&mut present,cancel,records.len(),&mut last_report,progress)?;
-    // 仅解释器组件允许清单外的标准字节码缓存，且对应源码必须已列入清单。
+    // 仅解释器组件允许清单外的标准及 pytest 重写字节码缓存，且对应源码必须已列入清单。
     // 已列入清单的缓存仍核验摘要；目录链接、动态库及其它新增文件继续拒绝。
     if allow_python_bytecode{present.retain(|name,_|expected.contains(name)||!python_bytecode_source(name).is_some_and(|source|expected.contains(&source)));}
     if (exact&&expected.len()!=present.len())||!expected.iter().all(|path|present.contains_key(path)){
@@ -1225,10 +1231,15 @@ mod component_validation_tests {
         atomic_json(&root.join("manifest.json"),&crate::resources::manifest(&root,"python","1").unwrap()).unwrap();
         let cache=root.join("Lib/site-packages/demo/__pycache__");fs::create_dir_all(&cache).unwrap();
         let cached=cache.join("__init__.cpython-312.pyc");fs::write(&cached,b"generated cache").unwrap();
+        let pytest_cached=cache.join("__init__.cpython-312-pytest-8.3.4.pyc");fs::write(&pytest_cached,b"pytest rewritten cache").unwrap();
         verify_tree(&root,"manifest.json").unwrap();verify_tree_sizes(&root,"manifest.json").unwrap();
-        assert!(cached.is_file());
+        assert!(cached.is_file()&&pytest_cached.is_file());
         let unknown=cache.join("missing.cpython-312.pyc");fs::write(&unknown,b"no packaged source").unwrap();
         let error=verify_tree(&root,"manifest.json").unwrap_err();assert!(error.contains("missing.cpython-312.pyc"));fs::remove_file(unknown).unwrap();
+        let unknown_pytest=cache.join("missing.cpython-312-pytest-8.3.4.pyc");fs::write(&unknown_pytest,b"no packaged source").unwrap();
+        let error=verify_tree(&root,"manifest.json").unwrap_err();assert!(error.contains("missing.cpython-312-pytest-8.3.4.pyc"));fs::remove_file(unknown_pytest).unwrap();
+        let malformed=cache.join("__init__.cpython-312-pytest-8.x.4.pyc");fs::write(&malformed,b"unrecognized cache tag").unwrap();
+        assert!(verify_tree(&root,"manifest.json").unwrap_err().contains("pytest-8.x.4"));fs::remove_file(malformed).unwrap();
         let injected=cache.join("unknown.dll");fs::write(&injected,b"not bytecode").unwrap();
         assert!(verify_tree_sizes(&root,"manifest.json").unwrap_err().contains("unknown.dll"));fs::remove_file(injected).unwrap();
         fs::write(root.join("Lib/site-packages/demo/__init__.py"),b"value = 2\n").unwrap();

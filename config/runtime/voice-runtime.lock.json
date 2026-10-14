@@ -1025,6 +1025,17 @@
       ]
     },
     {
+      "file": "pillow-12.3.0-cp312-cp312-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/45/89/da2f7971a317f83d807fdd4065c0af40208e59e692cc43d315a71a0e96d1/pillow-12.3.0-cp312-cp312-win_amd64.whl",
+      "size": 7227137,
+      "sha256": "a2b55dd6b2a4c4b7d87ffa56bdb33fdc5fdb9a462173861a7bc097f17d91cb09",
+      "name": "pillow",
+      "version": "12.3.0",
+      "groups": [
+        "voice-core"
+      ]
+    },
+    {
       "file": "platformdirs-4.11.7-py3-none-any.whl",
       "url": "https://files.pythonhosted.org/packages/27/6e/80993e10a0482f630cef528635789233224f36b1ffd11592aa15d13ff9ce/platformdirs-4.11.7-py3-none-any.whl",
       "size": 23938,
