@@ -945,26 +945,22 @@ def test_changed_asr_final_keeps_full_text_without_local_relation_classification
     asyncio.run(scenario())
 
 
-def test_held_text_and_suspend_do_not_start_tts_before_release():
+def test_explicit_suspend_is_not_released_by_endpoint():
     async def scenario():
-        async def emit(*_): pass
-        runtime = SimpleNamespace(gate=lambda _: None, emit=emit, user_speaking=True)
-        controller = SimpleNamespace(tts=None, player=None, options=SimpleNamespace(), bridge_options=SimpleNamespace())
-        output = EpisodeSpeechOutput(controller); output.runtime = runtime
-        ran = asyncio.Event()
-        async def fake_run(handle):
-            ran.set()
-            async for _ in handle.stream(): pass
-        output._run = fake_run
-        handle = await output.begin(("episode", "request"), "turn")
-        await handle.feed("只保存文本"); await handle.finish()
-        assert output.speak_snapshot["queue_status"] == "queued"
-        output.suspend_pending(); output.release_held()
-        await asyncio.sleep(0)
-        assert not ran.is_set() and output.speak_snapshot["queue_status"] == "suspended"
-        handle.state = "HELD"; output.release_held()
-        await handle.task
-        assert ran.is_set()
+        from tests.test_sentence_scheduling import _sentence_output_harness
+        output, handle, _, _ = _sentence_output_harness()
+        handle.task = asyncio.create_task(asyncio.Event().wait())
+        try:
+            output.suspend_pending()
+            assert not handle.production_ready.is_set()
+            output.release_held()
+            assert handle.state == "SUSPENDED"
+            assert not handle.playback_ready.is_set()
+            assert output.resume_pending() == handle.speech_id
+            assert handle.production_ready.is_set() and handle.playback_ready.is_set()
+        finally:
+            handle.task.cancel()
+            await asyncio.gather(handle.task, return_exceptions=True)
     asyncio.run(scenario())
 
 
@@ -1009,6 +1005,7 @@ def test_user_speech_hold_preserves_unplayed_handle_and_releases_it_after_end():
 
         async def fake_run(handle):
             started.set()
+            await handle.playback_ready.wait()
             async for _ in handle.stream():
                 pass
 
@@ -1019,7 +1016,8 @@ def test_user_speech_hold_preserves_unplayed_handle_and_releases_it_after_end():
         await handle.feed("暂缓播放")
         await handle.finish()
         await asyncio.sleep(0)
-        assert not started.is_set()
+        assert started.is_set()
+        assert not handle.playback_ready.is_set()
 
         output.release_held()
         await handle.task
@@ -1038,6 +1036,9 @@ def test_lifecycle_cancel_clears_preplayback_hold_and_player_key():
             def __init__(self):
                 self.held = []
                 self.resumed = []
+
+            def stop_and_snapshot(self, key):
+                return {"started": False}
 
             def hold(self, key):
                 self.held.append(key)
@@ -1069,6 +1070,9 @@ def test_lifecycle_cancel_clears_preplayback_hold_and_player_key():
         )
         output = EpisodeSpeechOutput(controller)
         output.runtime = runtime
+        async def fake_run(handle):
+            await handle.playback_ready.wait()
+        output._run = fake_run
         handle = await output.begin(("episode", "request"), "turn")
         assert output.hold_unplayed() == handle.speech_id
         assert output.playback_hold_active
@@ -1198,8 +1202,10 @@ def test_tts_session_started_before_first_pcm_waits_for_user_release():
         assert output.hold_unplayed() == handle.speech_id
         tts.session_instance.start_release.set()
         await asyncio.sleep(0)
-        assert tts.session_instance.sent == []
+        await asyncio.sleep(.02)
+        assert tts.session_instance.sent == ["测试"]
         assert not tts.session_instance.audio_requested.is_set()
+        assert player.enqueued == []
 
         runtime.user_speaking = False
         output.release_held()

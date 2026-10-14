@@ -226,7 +226,7 @@ def test_pcm_exit_suppresses_queue_without_losing_heard_prefix():
     assert player.progress("new")["played_ms"] == 200
 
 
-def test_tts_gate_blocks_before_provider_submission():
+def test_quiet_gate_blocks_sound_even_when_provider_prepares():
     from tests.test_speech_admission import _output_harness
     async def scenario():
         output, handle, tts, player = _output_harness("playback_window", 500)
@@ -236,7 +236,7 @@ def test_tts_gate_blocks_before_provider_submission():
         with pytest.raises(PassiveQuietSuppressed):
             await output._play_stream(handle.workspace, handle.workspace.token, deltas(),
                                      speech_id=handle.speech_id, handle=handle)
-        assert not tts.session_instance.sent
+        assert tts.session_instance.sent == ["静默内容"]
         assert not player.enqueued
     asyncio.run(scenario())
 

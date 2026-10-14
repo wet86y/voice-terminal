@@ -159,7 +159,7 @@ def test_lost_player_permission_cancels_instead_of_reporting_successful_release(
         assert output.release_held() is None
         assert handle.reason == "playback_resume_failed"
         assert handle.task.cancelled()
-        assert not handle.playback_ready.is_set()
+        assert handle.playback_ready.is_set()  # 取消唤醒等待者，身份校验阻止输出。
         assert "playback_hold_released" not in handle.workspace.timings
         assert events == ["TTS_HELD", "TTS_RESUME_FAILED"]
         controller.player.enqueue(handle.workspace.playback_key, b"\x01\x00" * 320)

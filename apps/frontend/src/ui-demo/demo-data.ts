@@ -155,7 +155,7 @@ export type PreviewScene = 'normal' | 'empty' | 'long' | 'loading' | 'error'
 /** PreviewOverlay（浮层展示）：启动、确认、成功和失败画面。 */
 export type PreviewOverlay = 'none' | 'startup' | 'confirm' | 'success' | 'failure'
 /** SettingsTab（展示设置页签）：本地模型设备与系统状态合并到组件页。 */
-export type SettingsTab = 'screen' | 'wake' | 'persona' | 'speaker' | 'wakes' | 'models' | 'compute' | 'workspace' | 'hotwords'
+export type SettingsTab = 'tts' | 'screen' | 'wake' | 'persona' | 'speaker' | 'wakes' | 'models' | 'compute' | 'workspace' | 'hotwords'
 /** PreviewPage（展示页面）：工作台或某个设置页。 */
 export type PreviewPage = 'home' | SettingsTab
 
@@ -165,6 +165,7 @@ export const settingsTabs: Array<{
   /** hint（辅助说明）。 */ hint: string
   /** icon（装饰符号）。 */ icon: string
 }> = [
+  { id: 'tts', label: '语音与音色', hint: '播放目标与本地音色', icon: '♫' },
   { id: 'wake', label: '唤醒与静默', hint: '唤醒词、等待与每日静默', icon: '◌' },
   { id: 'persona', label: '人格与指令', hint: '风格与协作方式', icon: '✦' },
   { id: 'speaker', label: '声纹设置', hint: '主人识别与模板', icon: '◎' },

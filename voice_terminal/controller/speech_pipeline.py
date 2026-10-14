@@ -58,12 +58,21 @@ class SpeechPipeline:
 
     async def _play_stream(self, ws, token, deltas, *, speech_id: str | None = None,
                            handle=None) -> str:
-        await self._wait_for_playback_permission(ws, token)
         tts_client = handle.tts_client if handle is not None else self.tts
         if tts_client is None and not hasattr(self.tts, "bind"):
             tts_client = self.tts
         tts_backend = handle.tts_backend if handle is not None else "minimax"
         transport = getattr(tts_client, "transport", "websocket") if tts_client is not None else "websocket"
+
+        async def synthesis_permission():
+            # synthesis_permission（合成许可）与设备播放许可独立。
+            production = getattr(handle, "production_ready", None)
+            if production is not None:
+                await production.wait()
+            if not self._valid(token):
+                raise asyncio.CancelledError
+
+        await synthesis_permission()
         session = None
         reader = None
         sender_task = None
@@ -154,11 +163,15 @@ class SpeechPipeline:
             self.player.sample_rate * self.player.channels * 2
             if self.player is not None else 32000 * 2
         )
-        await self._wait_for_playback_permission(ws, token)
+        await synthesis_permission()
         if not self._valid(token) or not ws.committed:
             return ""
         if self.player:
             self.player.allow(playback_key)
+            if handle is not None and getattr(handle, "playback_ready", None) is not None and not handle.playback_ready.is_set():
+                hold = getattr(self.player, "hold", None)
+                if callable(hold):
+                    handle.player_held = hold(playback_key) is not False
 
         def playback_progress() -> dict[str, int | bool | str | None]:
             # The provider may have received far more than the player has
@@ -404,7 +417,7 @@ class SpeechPipeline:
                         "tts.admission_overrun",
                         staged_chars=state.staged_chars, limit=state.char_limit,
                     )
-                return
+                raise RuntimeError("播报文本暂存超过预算，已停止本次合成。")
             await scheduling_policy.wait_before_send(
                 lambda: PlaybackProgress.from_mapping(playback_progress()),
                 lambda: self._valid(token) and not tts_disabled,
@@ -486,7 +499,7 @@ class SpeechPipeline:
                         # of the next unsent frame.  A frame that is merely
                         # staged can still be replaced by a later decision;
                         # one already popped cannot.
-                        await self._wait_for_playback_permission(ws, token)
+                        await synthesis_permission()
                         if not self._valid(token) or not ws.committed:
                             return
                         if sentence_window_enabled:
@@ -501,16 +514,18 @@ class SpeechPipeline:
                     epoch = state.epoch
                     if not self._valid(token):
                         return
-                    await self._wait_for_playback_permission(ws, token)
+                    await synthesis_permission()
                     if not self._valid(token) or not ws.committed:
                         return
                     if session is None:
                         await self._await_tts_cancel_barrier()
-                        await self._wait_for_playback_permission(ws, token)
+                        await synthesis_permission()
                         if not self._valid(token) or not ws.committed:
                             return
                         sync_turn_timings()
                         session = self._new_tts_session(ws)
+                        if hasattr(session, "first_audio_callback"):
+                            session.first_audio_callback = lambda: ws.timings.setdefault("synthesis_first_audio", time.monotonic())
                         self._bind_tts_session(ws, session)
                         checkout = getattr(tts_client, "checkout_prewarm", None)
                         if callable(checkout):
@@ -527,7 +542,7 @@ class SpeechPipeline:
                         warm_connection_id = getattr(session, "connection_id", None) if warm else None
                         ws.timings.setdefault("tts_session_start", time.monotonic())
                         try:
-                            await self._wait_for_playback_permission(ws, token)
+                            await synthesis_permission()
                             if not self._valid(token) or not ws.committed:
                                 return
                             session = await start_tts_session(session)
@@ -557,13 +572,13 @@ class SpeechPipeline:
                                 # waiting for it.  Fall back to a fresh cold
                                 # session rather than sending text to a dead
                                 # socket.
-                                await self._wait_for_playback_permission(ws, token)
+                                await synthesis_permission()
                                 if not self._valid(token) or not ws.committed:
                                     return
                                 session = self._new_tts_session(ws, fresh=True)
                                 self._bind_tts_session(ws, session)
                                 ws.timings["tts_session_start"] = time.monotonic()
-                                await self._wait_for_playback_permission(ws, token)
+                                await synthesis_permission()
                                 if not self._valid(token) or not ws.committed:
                                     return
                                 session = await start_tts_session(session)
@@ -609,31 +624,31 @@ class SpeechPipeline:
                             if not getattr(exc, "emotion_unsupported", False) or not self._valid(token):
                                 raise
                             await self._detail("tts.emotion_unsupported", status="FALLBACK_CALM")
-                            await self._wait_for_playback_permission(ws, token)
+                            await synthesis_permission()
                             if not self._valid(token) or not ws.committed:
                                 return
                             session = self._new_tts_session(ws, fresh=True)
                             self._bind_tts_session(ws, session)
                             ws.timings["tts_session_start"] = time.monotonic()
-                            await self._wait_for_playback_permission(ws, token)
+                            await synthesis_permission()
                             if not self._valid(token) or not ws.committed:
                                 return
                             session = await start_tts_session(session)
                             self._bind_tts_session(ws, session)
                             ws.timings["tts_session_ready"] = time.monotonic()
                             sync_turn_timings()
-                        await self._wait_for_playback_permission(ws, token)
+                        await synthesis_permission()
                         if not self._valid(token) or not ws.committed:
                             return
                         reader = asyncio.create_task(read_audio(session), name=f"tts-audio-{ws.turn_id}")
                         progress_task = asyncio.create_task(monitor_progress(), name=f"tts-progress-{ws.turn_id}")
                     if sent_any:
-                        await self._wait_for_playback_permission(ws, token)
+                        await synthesis_permission()
                         if not self._valid(token) or not ws.committed:
                             return
                     if not self._valid(token):
                         return
-                    await self._wait_for_playback_permission(ws, token)
+                    await synthesis_permission()
                     if not self._valid(token) or not ws.committed:
                         return
                     receiver_error = await reader_exception()
@@ -643,7 +658,7 @@ class SpeechPipeline:
                         # A replacement invalidated this frame while we held
                         # it.  It was never sent, so drop it silently.
                         continue
-                    await self._wait_for_playback_permission(ws, token)
+                    await synthesis_permission()
                     if not self._valid(token):
                         return
                     if state.epoch != epoch:
@@ -654,6 +669,13 @@ class SpeechPipeline:
                     async with submission as allowed:
                         if not allowed:
                             return
+                        production = getattr(handle, "production_ready", None)
+                        if production is not None and not production.is_set():
+                            # 暂停与提交原子检查：释放推理锁，保留尚未发送的块，恢复后重试。
+                            if state.epoch == epoch:
+                                state.staged.appendleft(segment)
+                                state.staged_chars += len(segment)
+                            continue
                         if state.epoch != epoch:
                             # 推理期间已改写：丢弃手中尚未发送的旧块。
                             continue
@@ -663,6 +685,7 @@ class SpeechPipeline:
                         ws.timings.setdefault("first_task_continue", time.monotonic())
                         self.state.current["tts_text"] = segment
                         state.sending = True  # sending（提交中，禁止修订）。
+                        ws.timings.setdefault("synthesis_submitted", time.monotonic())
                         resolver.add_text(segment, int(playback_progress()["returned_ms"]))
                         try:
                             await session.send_text(segment)

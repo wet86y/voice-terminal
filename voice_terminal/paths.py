@@ -83,6 +83,11 @@ class AppPaths:
         return (self.data_root or self.install_root / 'data') / 'history'
 
     @property
+    def tts_voices(self) -> Path:
+        """tts_voices（本地语音音色库目录），独立于评估缓存和导入源文件。"""
+        return (self.data_root or self.install_root / 'data') / 'tts' / 'voices'
+
+    @property
     def logs(self) -> Path:
         return self.cache / 'logs'
 

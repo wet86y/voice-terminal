@@ -1508,6 +1508,8 @@ class EpisodeController(RealtimeController):
             await self.episode.stop()
         await self._cancel_tts_prewarm()
         close_tts = getattr(self.tts, "close", None)
-        if callable(close_tts):
-            await close_tts()
-        await super().close()
+        try:
+            if callable(close_tts):
+                await close_tts()
+        finally:
+            await super().close()

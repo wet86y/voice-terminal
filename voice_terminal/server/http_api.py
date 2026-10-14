@@ -1,5 +1,6 @@
 """HTTP and WebSocket routes for the session runtime."""
 from __future__ import annotations
+from dataclasses import replace
 
 import asyncio
 import json
@@ -161,7 +162,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         runtime_payload["tts_worker"] = {"state": "stopped"}
         conversation = runtime_payload.pop("conversation", {"recent": [], "current": {}})
         settings = product_settings.snapshot() if product_settings is not None else {
-            "schema_version": 8,
+            "schema_version": 12,
             "wake": {
                 "enabled": runtime.config.wake.enabled,
                 "keyword": runtime.config.wake.keyword,
@@ -178,7 +179,10 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     runtime.config.shadow_agent.experimental_context_gate_enabled
                 ),
             },
-            "tts": {"backend": runtime.config.tts.backend},
+            "tts": {
+                "backend": runtime.config.tts.backend,
+                "local_model": runtime.config.tts.local_model,
+            },
             "speaker": {
                 "mode": runtime.config.speaker.mode,
                 "confirm_threshold": runtime.config.speaker.confirm_threshold,
@@ -622,7 +626,379 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
 
     @app.get("/api/v1/tts/status")
     async def get_tts_status() -> dict[str, Any]:
-        return {"backend": "minimax", "worker": {"state": "stopped"}}
+        client = getattr(runtime.tts, "local", None) if runtime.tts is not None else None
+        server = getattr(client, "server", None)
+        refresh_status = getattr(server, "refresh_status", None)
+        if callable(refresh_status):
+            await refresh_status()
+        return {
+            **runtime.local_tts_status_payload(),
+            "worker": {"state": "stopped"},  # worker（旧式本地工作进程）兼容字段。
+        }
+
+    def tts_voice_library_or_503(model=None):
+        libraries = getattr(runtime, "voice_library", None)
+        if libraries is None:
+            raise HTTPException(status_code=503, detail="音色库不可用。")
+        try:
+            return libraries.for_model(model) if model else libraries
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def tts_voice_operations_or_503():
+        operations = getattr(runtime, "tts_voice_operations", None)
+        if operations is None:
+            raise HTTPException(status_code=503, detail="音色操作服务未就绪。")
+        return operations
+
+    async def start_tts_voice_operation(callback):
+        if runtime.application_initializing:
+            raise HTTPException(status_code=409, detail="应用正在初始化，请稍后操作。")
+        async with runtime._session_lock:
+            if runtime.state.listening or runtime.state.state.value not in {"IDLE", "ERROR"}:
+                raise HTTPException(status_code=409, detail="请先结束监听与当前播报，再操作音色。")
+            if runtime.tts is not None and runtime.tts.active_local_sessions:
+                raise HTTPException(status_code=409, detail="本地合成仍在进行，请稍后重试。")
+            try:
+                return JSONResponse(callback(), status_code=202)
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/tts/voices/{model}")
+    async def get_tts_voices(model: str):
+        library = tts_voice_library_or_503(model)
+        return {"voices": library.list_voices({model: library.active_selection}),
+                "active_voice": library.active_selection, "model": model}
+
+    @app.post("/api/v1/tts/voices/{model}")
+    async def create_tts_voice(model: str, body: dict[str, Any]):
+        try:
+            validate_tts_candidate_steps(model, body)
+            voice = await asyncio.to_thread(tts_voice_library_or_503(model).create_voice, body)
+            return {"voice": voice}
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.put("/api/v1/tts/voices/{model}/selection")
+    async def select_tts_voice(model: str, body: dict[str, Any]):
+        if set(body) != {"selection"}:
+            raise HTTPException(status_code=422, detail="仅接受 selection（音色选择），为空时回默认项。")
+        async with runtime._session_lock:
+            try:
+                selected = tts_voice_library_or_503(model).activate(body["selection"])
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            client = getattr(runtime.tts, "local", None)
+            if client:
+                client._warmed = False
+            await runtime.bus.publish(runtime.snapshot())
+            return {"selection": selected, "effective_from": "next_answer"}
+
+    @app.put("/api/v1/tts/voices/{model}/{voice_id}")
+    async def update_tts_voice(model: str, voice_id: str, body: dict[str, Any]):
+        try:
+            validate_tts_candidate_steps(model, body)
+            expected = body.pop("expected_revision", None)
+            voice = await asyncio.to_thread(tts_voice_library_or_503(model).update_voice, voice_id, expected, body)
+            client = getattr(runtime.tts, "local", None)
+            if client:
+                client._warmed = False
+            await runtime.bus.publish(runtime.snapshot())
+            return {"voice": voice, "effective_from": "next_answer"}
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def validate_tts_candidate_steps(model, body):
+        """保存设计时核对当前推理参数，不能通过旧草稿绕过候选失效。"""
+        if body.get("source") == "design" and body.get("inference_steps", 20) != runtime.config.tts.inference_steps_by_model.get(model):
+            raise ValueError("推理步数已变化，请以当前参数重新试音后保存设计音色。")
+
+    @app.delete("/api/v1/tts/voices/{model}/{voice_id}")
+    async def delete_tts_voice(model: str, voice_id: str):
+        try:
+            await asyncio.to_thread(tts_voice_library_or_503(model).delete_voice, voice_id)
+            await runtime.bus.publish(runtime.snapshot())
+            return {"deleted": True}
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/tts/assets/{model}/import")
+    async def import_tts_asset(model: str, request: Request, filename: str = ""):
+        library = tts_voice_library_or_503(model)
+        data = bytearray()
+        async for chunk in request.stream():
+            data.extend(chunk)
+            if len(data) > 20 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="参考音频超过 20 MiB（二进制兆字节）。")
+        try:
+            asset = await asyncio.to_thread(library.put_import, bytes(data), filename)
+            return {"asset": asset}
+        except (ValueError, OverflowError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/tts/assets/{model}/{asset_id}/audio")
+    async def get_tts_asset_audio(model: str, asset_id: str):
+        try:
+            data = await asyncio.to_thread(tts_voice_library_or_503(model).asset_bytes, asset_id)
+            return Response(content=data, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/tts/operations/preview")
+    async def start_tts_preview(body: dict[str, Any]):
+        manager = tts_voice_operations_or_503()
+        return await start_tts_voice_operation(lambda: manager.start_preview(body.get("model"), body.get("voice"), body.get("text")))
+
+    @app.post("/api/v1/tts/operations/play")
+    async def start_tts_play(body: dict[str, Any]):
+        return await start_tts_voice_operation(lambda: tts_voice_operations_or_503().start_play(body.get("model"), body.get("asset_id")))
+
+    @app.post("/api/v1/tts/operations/transcribe")
+    async def start_tts_transcribe(body: dict[str, Any]):
+        # 独立精修请求允许附件先保存；忙碌失败仍保留附件供手填。
+        try:
+            payload = tts_voice_operations_or_503().start_transcribe(body.get("model"), body.get("asset_id"))
+            return JSONResponse(payload, status_code=202)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/tts/operations/{operation_id}")
+    async def get_tts_operation(operation_id: str):
+        try:
+            return tts_voice_operations_or_503().get(operation_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="音色操作不存在或已过期。") from exc
+
+    @app.post("/api/v1/tts/operations/{operation_id}/cancel")
+    async def cancel_tts_operation(operation_id: str):
+        try:
+            return tts_voice_operations_or_503().cancel(operation_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="音色操作不存在或已过期。") from exc
+
+    @app.put("/api/v1/product/settings/tts")
+    async def update_product_tts(body: dict[str, Any]) -> dict[str, Any]:
+        return await apply_product_tts(body)
+
+    async def apply_product_tts(body: dict[str, Any], *, after_drain: bool = False) -> dict[str, Any]:
+        store = product_store_or_404()
+        if not body or set(body) - {"backend", "local_model", "local_optimization", "acoustic_continuation", "inference_steps_by_model"}:
+            raise HTTPException(
+                status_code=422,
+                detail="TTS 设置仅接受 backend（语音后端）和 local_model（本地语音合成模型）。",
+            )
+        optimization = {field: body.get(field, getattr(runtime.config.tts, field))
+                        for field in ("local_optimization", "acoustic_continuation")}
+        if any(not isinstance(value, bool) for value in optimization.values()):
+            raise HTTPException(status_code=422, detail="本地优化与声学续接开关必须为布尔值。")
+        from ..config import validate_tts_inference_steps
+        try:
+            optimization["inference_steps_by_model"] = validate_tts_inference_steps(
+                body.get("inference_steps_by_model", {}), runtime.config.tts.inference_steps_by_model,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        optimization["local_optimization"] = True  # 旧字段不再选择通用提前合成调度。
+        local_model = body.get("local_model", runtime.config.tts.local_model)
+        backend = body.get("backend", "voxcpm1" if "local_model" in body else runtime.config.tts.backend)
+        if not isinstance(backend, str) or backend not in {"minimax", "voxcpm1"}:
+            raise HTTPException(status_code=422, detail="backend（语音后端）必须为 minimax 或 voxcpm1。")
+        if not isinstance(local_model, str) or local_model not in {"voxcpm1", "voxcpm2"}:
+            raise HTTPException(
+                status_code=422,
+                detail="local_model（本地语音合成模型）必须为 voxcpm1 或 voxcpm2。",
+            )
+        if not (set(body) & {"backend", "local_model"}):
+            async with runtime._session_lock:
+                saved = store.save_tts_local_model(optimization)
+                if getattr(runtime, "_pending_tts_update", None) is not None:
+                    runtime._pending_tts_update.update(optimization)
+                runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, **optimization))
+                local_client = getattr(runtime.tts, "local", None)
+                if local_client is not None:
+                    for key, value in optimization.items():
+                        setattr(local_client, key, value)
+                    local_client._warmed = False
+                await runtime.bus.publish(runtime.snapshot())
+                return {"settings": {"tts": saved}, "effective_from": "next_answer", "pending": False,
+                        "message": "合成设置已热更新，下一回答使用新参数。", "tts": runtime.local_tts_status_payload()}
+        if not after_drain and (runtime.application_initializing or runtime.state.listening
+                or runtime.state.state.value not in {"IDLE", "ERROR"}
+                or (runtime.tts and runtime.tts.active_local_sessions)
+                or (getattr(runtime, "tts_voice_operations", None) and runtime.tts_voice_operations.busy)
+                or (getattr(runtime, "_tts_update_task", None) and not runtime._tts_update_task.done())):
+            if runtime.tts is not None:
+                server = getattr(getattr(runtime.tts, "local", None), "server", None)
+                if backend == "voxcpm1" and callable(getattr(server, "model_available", None)) and not server.model_available(local_model):
+                    raise HTTPException(status_code=422, detail="所选本地模型文件缺失。")
+            pending_body = {"backend": backend, "local_model": local_model, **optimization}
+            saved = store.save_tts_local_model(pending_body)
+            runtime._pending_tts_update = pending_body  # 多次热切换保留最新一次选择。
+            if not getattr(runtime, "_tts_update_task", None) or runtime._tts_update_task.done():
+                runtime._tts_update_task = asyncio.create_task(drain_tts_updates(), name="tts-hot-update")
+            return {"settings": {"tts": saved}, "effective_from": "after_current_answer", "pending": True,
+                    "message": "选择已保存，当前音频事务结束后切换；主动停止监听后保持停止。",
+                    "tts": runtime.local_tts_status_payload()}
+        if runtime.application_initializing:
+            raise HTTPException(status_code=409, detail="应用组件仍在初始化，请等待初始化结束后再切换本地 TTS 模型。")
+        async with runtime._session_lock:
+            if getattr(runtime, "tts_voice_operations", None) and runtime.tts_voice_operations.busy:
+                raise HTTPException(status_code=409, detail="音色录音、生成或试听正在进行，请结束后再切换语音模型。")
+            if runtime.state.listening:
+                raise HTTPException(status_code=409, detail="请先停止监听，再切换本地 TTS 模型。")
+            if runtime.state.state.value not in {"IDLE", "ERROR"}:
+                raise HTTPException(status_code=409, detail="当前对话事务尚未结束，请等它结束后再切换本地 TTS 模型。")
+            if runtime.tts is None:
+                raise HTTPException(status_code=409, detail="TTS（语音合成）组件尚未初始化。")
+            if runtime.tts.active_local_sessions:
+                raise HTTPException(status_code=409, detail="仍有本地 TTS 会话正在处理或播报，请结束后再切换。")
+            previous_model = runtime.config.tts.local_model
+            previous_backend = runtime.config.tts.backend
+            previous_options = {key: getattr(runtime.config.tts, key) for key in optimization}
+            server = getattr(getattr(runtime.tts, "local", None), "server", None)
+            refresh_status = getattr(server, "refresh_status", None)
+            if callable(refresh_status):
+                await refresh_status()
+            current_status = runtime.local_tts_status_payload()
+            if (all(getattr(runtime.config.tts, key) == value for key, value in optimization.items())
+                    and backend == previous_backend and local_model == previous_model
+                    and runtime.state.services.get("tts") == "READY"
+                    and (backend == "minimax" or current_status.get("loaded_model") == local_model)):
+                return {
+                    "settings": {"tts": store.settings_only().get("tts", {})},
+                    "effective_from": "immediate",
+                    "pending": False,
+                    "message": "所选 TTS（语音合成）已经就绪；监听保持停止。",
+                    "tts": current_status,
+                }
+
+            runtime.state.set_service("tts", "STARTING")
+            await runtime.bus.publish(runtime.snapshot())
+            try:
+                # 新后端构造及预热均读取这份参数；从在线切到本地时也使用新步数。
+                runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, **optimization))
+                local_client = getattr(runtime.tts, "local", None)
+                if local_client is not None:
+                    for key, value in optimization.items():
+                        setattr(local_client, key, value)
+                    if optimization["inference_steps_by_model"] != previous_options["inference_steps_by_model"]:
+                        local_client._warmed = False
+                await runtime.switch_tts_selection(backend, local_model)
+                if after_drain and getattr(runtime, "_pending_tts_update", None) is not None:
+                    saved = store.settings_only()["tts"]  # 后来的选择已保存，不被中间切换覆盖。
+                else:
+                    saved = store.save_tts_local_model({"backend": backend, "local_model": local_model, **optimization})
+                runtime.config = replace(
+                    runtime.config,
+                    tts=replace(runtime.config.tts, backend=backend, local_model=local_model, **optimization),
+                )
+                runtime.state.set_service("tts", "READY")
+                runtime._local_tts_load_state = "ready" if backend == "voxcpm1" else "disabled"
+                runtime._local_tts_error = None
+            except Exception as exc:
+                try:
+                    runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, **previous_options))
+                    local_client = getattr(runtime.tts, "local", None)
+                    if local_client is not None:
+                        for key, value in previous_options.items():
+                            setattr(local_client, key, value)
+                        local_client._warmed = False
+                    await runtime.switch_tts_selection(previous_backend, previous_model)
+                    runtime.config = replace(runtime.config, tts=replace(
+                        runtime.config.tts, backend=previous_backend, local_model=previous_model,
+                    ))
+                    restored = True
+                except Exception:
+                    restored = False
+                    logger.exception("tts.selection_rollback_failed")
+                runtime.state.set_service("tts", "READY" if restored else "ERROR")
+                from ..tts.voices import safe_voice_diagnostic
+                runtime._local_tts_error = safe_voice_diagnostic(exc)
+                await runtime.bus.publish(runtime.snapshot())
+                raise HTTPException(status_code=503, detail=safe_voice_diagnostic(exc)) from exc
+            await runtime.bus.publish(runtime.snapshot())
+            return {
+                "settings": {"tts": saved},
+                "effective_from": "immediate",
+                "pending": False,
+                "message": "TTS（语音合成）已切换并保存；监听保持停止，请手动恢复。",
+                "tts": runtime.local_tts_status_payload(),
+            }
+
+    async def drain_tts_updates() -> None:
+        """等待完整播报结算，再短暂停止输入完成模型热切换，不取消当前回答。"""
+        store = product_store_or_404()
+        resume_listening = False
+        while getattr(runtime, "_pending_tts_update", None) is not None:
+            await asyncio.sleep(0.1)
+            if runtime.application_initializing or runtime.state.state.value not in {"IDLE", "ERROR", "LISTENING"}:
+                continue
+            if (runtime.tts and runtime.tts.active_local_sessions) or (getattr(runtime, "tts_voice_operations", None) and runtime.tts_voice_operations.busy):
+                continue
+            if getattr(runtime.controller, "_active_input", False):
+                continue  # 等用户当前输入结算，热切换不丢弃正在识别的问题。
+            previous_listening = runtime.state.listening
+            resume_listening = resume_listening or previous_listening
+            previous_selection = {"backend": runtime.config.tts.backend, "local_model": runtime.config.tts.local_model}
+            async with runtime._session_lock:
+                if runtime.state.state.value not in {"IDLE", "ERROR", "LISTENING"} or (runtime.tts and runtime.tts.active_local_sessions) or getattr(runtime.controller, "_active_input", False):
+                    continue
+                if previous_listening and runtime.controller is not None:
+                    try:
+                        await runtime.controller.stop_listening()
+                    except Exception as exc:
+                        runtime._pending_tts_update = None
+                        store.save_tts_local_model(previous_selection)
+                        latest_options = {key: store.settings_only()["tts"][key] for key in (
+                            "local_optimization", "acoustic_continuation", "inference_steps_by_model",
+                        )}
+                        runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, **latest_options))
+                        local_client = getattr(runtime.tts, "local", None)
+                        if local_client is not None:
+                            for key, value in latest_options.items():
+                                setattr(local_client, key, value)
+                            local_client._warmed = False
+                        from ..tts.voices import safe_voice_diagnostic
+                        await runtime.bus.publish(event("error", code="TTS_HOT_UPDATE_FAILED", message="暂停监听失败，已保留原模型，请重新开始监听。" + safe_voice_diagnostic(exc), recoverable=True))
+                        await runtime.bus.publish(runtime.snapshot())
+                        return
+            pending_body = runtime._pending_tts_update
+            # 等待期间修改步数/优化开关时，使用最近已保存值，防止旧排队请求覆盖热更新。
+            pending_body.update({key: store.settings_only()["tts"][key] for key in (
+                "local_optimization", "acoustic_continuation", "inference_steps_by_model",
+            )})
+            runtime._applying_tts_selection = pending_body
+            runtime._pending_tts_update = None
+            try:
+                await apply_product_tts(pending_body, after_drain=True)
+            except asyncio.CancelledError:
+                resume_listening = False  # 应用关闭不重新启动监听。
+                runtime._tts_resume_requested = False
+                runtime._pending_tts_update = None
+                raise
+            except Exception as exc:
+                if runtime._pending_tts_update is None:
+                    store.save_tts_local_model(previous_selection)
+                # 模型失败不撤销已授权的步数/提前合成更新；使运行值与保存值一致。
+                latest_options = {key: store.settings_only()["tts"][key] for key in (
+                    "local_optimization", "acoustic_continuation", "inference_steps_by_model",
+                )}
+                runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, **latest_options))
+                local_client = getattr(runtime.tts, "local", None)
+                if local_client is not None:
+                    for key, value in latest_options.items():
+                        setattr(local_client, key, value)
+                    local_client._warmed = False
+                from ..tts.voices import safe_voice_diagnostic
+                await runtime.bus.publish(event("error", code="TTS_HOT_UPDATE_FAILED", message=safe_voice_diagnostic(exc), recoverable=True))
+            finally:
+                runtime._applying_tts_selection = None
+                if (resume_listening or getattr(runtime, "_tts_resume_requested", False)) and runtime._pending_tts_update is None and getattr(runtime, "_tts_resume_requested", None) is not False:
+                    await runtime.start_listening()
+                    resume_listening = False
+                if runtime._pending_tts_update is None:
+                    runtime._tts_resume_requested = None
+                await runtime.bus.publish(runtime.snapshot())
 
     async def apply_saved_product_settings(store, label: str) -> dict[str, Any]:
         """保存接口统一报告实际应用结果，加载期自动补应用而不等待对话。"""

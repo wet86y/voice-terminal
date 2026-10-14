@@ -152,6 +152,7 @@ def _output_harness(scheduling, admission_lead_ms):
     output.runtime = runtime
     output.loop = asyncio.get_running_loop()
     handle = SpeechHandle(output, ("episode", "request"), "turn", 0, "calm")
+    handle.playback_ready.set()  # 此夹具表示已获端点播放授权。
     handle.task = asyncio.current_task()
     output.handle = handle
     output._handles_by_token[handle.workspace.token] = handle
@@ -334,10 +335,10 @@ def test_rewrite_unsent_replaces_the_tail_without_comparing_prefixes():
 def test_rewrite_unsent_requires_an_open_unfinished_transaction():
     async def scenario():
         output, handle, _tts, _player = _output_harness("playback_window", 500)
-        # No admission state bound yet: the whole text counts as irreversible.
+        # 尚未进入管线，没有已提交正文；缺少可改队列时也不能执行尾巴修订。
         handle.finished = True
         handle.text = "旧内容"
-        assert handle.sent_chars == len("旧内容")
+        assert handle.sent_chars == 0
         assert await output.rewrite_unsent(
             ("episode", "request"), "turn", speech_id=handle.speech_id,
             expected_generation=handle.workspace.generation,

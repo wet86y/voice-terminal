@@ -8,7 +8,7 @@ export const modelComponentOwners: Record<ProductLocalModelId, string> = {
 
 /** ComponentResources（组件资源分组）：与宿主总量共用同一采样，按进程身份只计一次。 */
 export type ComponentResources = Pick<ApplicationComponent, 'memory_rss_bytes' | 'memory_private_commit_bytes' | 'gpu_dedicated_bytes'>
-const separateOwners = new Set(['asr', 'analysis', 'speaker', 'dsh'])
+const separateOwners = new Set(['asr', 'analysis', 'speaker', 'dsh', 'local-tts'])
 /** resourceGroup（展示分组）：其余进程统一计入语音系统。 */
 export function resourceGroup(owner: string) { return separateOwners.has(owner) ? owner : 'voice-system' }
 

@@ -84,7 +84,44 @@ fn snapshot(value: &Value, env: &BTreeMap<String,String>, vault: &impl Vault) ->
 }
 
 pub fn ready(status: &Value) -> bool {
-    PROVIDERS.iter().all(|(provider, _)| status["providers"][provider]["configured"] == true)
+    status["providers"]["deepseek"]["configured"] == true
+        && (status["tts_backend"].as_str().unwrap_or("minimax") == "voxcpm1"
+            || status["providers"]["minimax"]["configured"] == true)
+}
+
+fn configured_tts_backend(data: &Path) -> &'static str {
+    if let Ok(bytes) = fs::read(data.join("config/product-settings.json")) {
+        if let Ok(settings) = serde_json::from_slice::<Value>(&bytes) {
+            if settings["schema_version"].as_u64().is_some_and(|version| version >= 11) {
+                match settings["tts"]["backend"].as_str() {
+                    Some("voxcpm1") => return "voxcpm1",
+                    Some("minimax") => return "minimax",
+                    _ => (),
+                }
+            }
+        }
+    }
+    let Ok(config) = fs::read_to_string(data.join("config/local.yaml")) else { return "minimax"; };
+    let mut in_tts = false;
+    for raw in config.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        let indentation = raw.chars().take_while(|character| character.is_whitespace()).count();
+        let body = trimmed.split('#').next().unwrap_or("").trim();
+        if indentation == 0 {
+            in_tts = body == "tts:";
+            continue;
+        }
+        if !in_tts { continue; }
+        if indentation < 2 { in_tts = false; continue; }
+        if indentation == 2 {
+            let Some((key, value)) = body.split_once(':') else { continue; };
+            if key.trim() != "backend" { continue; }
+            let value = value.trim().trim_matches(|character| character == '\'' || character == '"');
+            return if value == "voxcpm1" { "voxcpm1" } else { "minimax" };
+        }
+    }
+    "minimax"
 }
 
 fn native_environment(data: &Path) -> Result<BTreeMap<String,String>,String> {
@@ -92,7 +129,10 @@ fn native_environment(data: &Path) -> Result<BTreeMap<String,String>,String> {
 }
 
 pub fn status(data: &Path) -> Result<Value,String> {
-    snapshot(&registry(&data.join("config/model-registry.json"))?, &native_environment(data)?, &SystemVault)
+    let mut result = snapshot(&registry(&data.join("config/model-registry.json"))?, &native_environment(data)?, &SystemVault)?;
+    result["tts_backend"] = json!(configured_tts_backend(data));
+    result["fields"]["tts_backend"] = json!("TTS（语音合成）实际运行后端；voxcpm1 无需 MiniMax 接口密钥");
+    Ok(result)
 }
 
 fn contains_reference(value: &Value, reference: &str) -> bool {
@@ -249,6 +289,28 @@ mod tests {
             "providers":[{"id":"language-provider","protocol":"deepseek","credential_ref":"language-reference"},{"id":"speech-provider","protocol":"minimax","credential_ref":"speech-reference"}]});
         let vault=MemoryVault::default();vault.put("language-reference","test-language").unwrap();vault.put("speech-reference","test-speech").unwrap();
         assert!(ready(&snapshot(&value,&BTreeMap::new(),&vault).unwrap()));
+    }
+    #[test] fn local_voxcpm1_backend_does_not_require_minimax_credentials() {
+        let root=std::env::temp_dir().join(format!("voice-credentials-{}",crate::workspace::new_id()));
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(root.join("config/local.yaml"),"tts:\n  backend: voxcpm1 # local backend\nllm:\n  provider: deepseek\n").unwrap();
+        let status=json!({"tts_backend":configured_tts_backend(&root),"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        assert!(ready(&status));
+        fs::write(root.join("config/local.yaml"),"tts:\n  backend: minimax\n").unwrap();
+        let status=json!({"tts_backend":configured_tts_backend(&root),"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        assert!(!ready(&status));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test] fn product_tts_choice_has_priority_over_legacy_yaml() {
+        let root=std::env::temp_dir().join(format!("voice-tts-choice-{}",crate::workspace::new_id()));
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(root.join("config/local.yaml"),"tts:\n  backend: minimax\n").unwrap();
+        crate::workspace::atomic_json(&root.join("config/product-settings.json"),&json!({"schema_version":14,"tts":{"backend":"voxcpm1","local_model":"voxcpm2"}})).unwrap();
+        assert_eq!(configured_tts_backend(&root),"voxcpm1");
+        crate::workspace::atomic_json(&root.join("config/product-settings.json"),&json!({"schema_version":14,"tts":{"backend":"minimax"}})).unwrap();
+        assert_eq!(configured_tts_backend(&root),"minimax");
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     #[cfg(windows)]

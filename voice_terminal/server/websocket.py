@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from contextlib import asynccontextmanager
 import json
 import logging
@@ -35,8 +36,11 @@ from ..core.state import RuntimeState, TerminalState
 from ..kws.detector import KwsDetector, KwsError
 from ..kws.service import KwsWorker
 from ..providers.deepseek import DeepSeekClient
+from ..providers.audio_cpp_tts import AudioCppTtsClient, AudioCppTtsServer
+from ..tts.voices import ModelVoiceLibraries, VoiceLibraryError, safe_voice_diagnostic
 from ..providers.minimax_search import MiniMaxSearchClient
 from ..providers.minimax_tts import MiniMaxTtsClient
+from ..tts.router import TtsBackendRouter
 from ..agent.tool_registry import FileTools, WebSearchTools
 from ..shadow_agent import DurableVoiceEvent, ShadowAgentComponent, ShadowContextProjector, ShadowEvent
 from ..shadow_agent.component import ShadowAgentSession
@@ -78,7 +82,6 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                  speaker_worker_config_path: Path | None = None,
                  runtime_data_dir: Path | None = None) -> None:
         # Retired local TTS settings are normalized to the supported API.
-        config = replace(config, tts=replace(config.tts, backend="minimax", provider="minimax"))
         self.config = config
         self.dsh = DshRuntimeManager(
             config.dsh,
@@ -116,6 +119,22 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         project_root = runtime_data_dir.resolve().parent if runtime_data_dir else next(p for p in Path(__file__).resolve().parents if (p / 'pyproject.toml').is_file())
         self._project_root = project_root
         self.paths = config.paths if config.paths and config.paths.separated else AppPaths(project_root, project_root)
+        if runtime_data_dir is not None:
+            self._runtime_local_root = Path(runtime_data_dir).resolve().parent
+        elif self.paths.separated:
+            self._runtime_local_root = self.paths.install_root
+        else:
+            self._runtime_local_root = project_root / ".local"
+        self._tts_voice_root = (Path(runtime_data_dir).resolve() / "tts"
+                                if runtime_data_dir is not None and not self.paths.separated
+                                else self.paths.tts_voices.parent)
+        try:
+            self.voice_library = ModelVoiceLibraries(self._tts_voice_root)
+            self._local_tts_voice_error: str | None = None
+        except VoiceLibraryError as exc:
+            self.voice_library = None
+            self._local_tts_voice_error = str(exc)
+            self.startup_errors.append(f"tts_voice_library: {exc}")
         from ..resources import ResourcePolicy
         resource_policy = ResourcePolicy.load()
         self._history_cache_bytes = resource_policy.history_cache_bytes
@@ -130,7 +149,9 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         # Process handle（进程句柄） and lock（互斥锁） keep startup single-owner and race-safe.
         self._speaker_worker_process: asyncio.subprocess.Process | None = None
         self._speaker_worker_lock = asyncio.Lock()
-        self.tts: MiniMaxTtsClient | None = None
+        self.tts: TtsBackendRouter | None = None
+        self._local_tts_load_state = "unloaded"  # local_tts_load_state（本地模型加载状态）。
+        self._local_tts_error: str | None = None  # local_tts_error（最近一次加载错误）。
         self.shadow_search_tools: WebSearchTools | None = None
         self.shadow_component: ShadowAgentComponent | None = None
         self.shadow_session: ShadowAgentSession | DshShadowAgentSession | None = None
@@ -196,6 +217,11 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             else config.dsh.home_dir.parent / "active-voice-session.json"
         )
         self._session_lock = asyncio.Lock()
+        from .tts_voice_runtime import TtsVoiceOperationManager
+        self.tts_voice_operations = TtsVoiceOperationManager(self)
+        self._migrate_legacy_default_voice()
+        if self.product_settings is not None:
+            self.product_settings._tts_voice_selections = self._active_voices_by_model
         self.build_info: dict[str, Any] = {}
         self.reasoning_mode = config.llm.reasoning_mode
         self._credential_overrides: dict[str, str] = {}
@@ -262,10 +288,13 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         self.startup_errors.append(f"web_search: disabled: {safe_reason or '搜索服务不可用'}")
         logger.warning("%s", self.startup_errors[-1])
 
-    async def initialize(self) -> None:
+    async def initialize(self, *, _session_lock_held: bool = False) -> None:
         """initialize（完整初始化）：独立服务与恢复操作继续使用同一完整路径。"""
         await self.initialize_local()
-        await self.initialize_session()
+        if _session_lock_held:
+            await self.initialize_session(_session_lock_held=True)
+        else:
+            await self.initialize_session()
 
     async def _load_native(self, factory, *args, **kwargs):
         """_load_native（后台原生加载）：保持接口响应，取消时等加载结束后回收结果。"""
@@ -380,7 +409,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         await self._initialize_speaker()
         self._application_local_ready = True
 
-    async def initialize_session(self) -> None:
+    async def initialize_session(self, *, _session_lock_held: bool = False) -> None:
         """initialize_session（会话依赖汇合）：只在模型分支结束后连接并建立调度器。"""
         application_report("voice", "连接语音识别与分析服务")
         self.asr = AsrWorkerClient(self.config.asr.worker_url)
@@ -495,36 +524,12 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             self.state.set_service("shadow_agent", "DISABLED")
             self.state.set_service("web_search", "DISABLED")
 
-        minimax_key = self._api_key(self.config.tts.api_key_env)
-        remote_tts = None
-        if minimax_key:
-            remote_tts = MiniMaxTtsClient(
-                base_url=self.config.tts.base_url,
-                websocket_path=self.config.tts.websocket_path,
-                model=self.config.tts.model,
-                api_key=minimax_key,
-                output_format=self.config.tts.output_format,
-                sample_rate=self.config.tts.sample_rate,
-                voice_id=self.config.tts.voice_id,
-                timeout_ms=self.config.tts.timeout_ms,
-                transport=self.config.tts.transport,
-                scheduling=self.config.tts.scheduling,
-                subtitle_enable=self.config.tts.subtitle_enable,
-                subtitle_type=self.config.tts.subtitle_type,
-                audio_cache_max_bytes=self.config.tts.audio_cache_max_bytes,
-                cancel_timeout_ms=self.config.tts.cancel_timeout_ms,
-                keepalive_seconds=self.config.tts.keepalive_seconds,
-                emotion_mode=self.config.tts.emotion_mode,
-                default_emotion=self.config.tts.default_emotion,
-                emotion_transport=self.config.tts.emotion_transport,
-                session_reuse=self.config.tts.session_reuse,
-                admission_lead_ms=self.config.tts.admission_lead_ms,
-                sentence_prefetch_ms=self.config.tts.sentence_prefetch_ms,
-                sentence_tick_ms=self.config.tts.sentence_tick_ms,
-                sentence_min_effective_chars=self.config.tts.sentence_min_effective_chars,
-                first_clause_timeout_ms=self.config.tts.first_clause_timeout_ms,
-            )
-        self.tts = remote_tts
+        remote_tts, local_tts = self._build_tts_clients()
+        self.tts = TtsBackendRouter(
+            remote=remote_tts,
+            local=local_tts,
+            backend=self.config.tts.backend,
+        )
         self.state.current.update(
             tts_transport=getattr(self.tts, "transport", "websocket"),
             tts_scheduling=getattr(self.tts, "effective_scheduling", "auto"),
@@ -532,6 +537,19 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         try:
             if self.config.tts.output_format.lower() != "pcm":
                 raise RuntimeError("TTS 播放器需要 PCM 输出。")
+            if self.config.tts.backend == "voxcpm1":
+                if self.config.tts.sample_rate != 16000:
+                    raise RuntimeError("VoxCPM 播放器 sample_rate（采样率）必须为 16000 Hz")
+                self._local_tts_load_state = "loading"
+                await self.tts.ensure_ready()
+                # 音色尚未配置时模型仍保持就绪，设置页可以继续导入或设计音色。
+                if self._active_voice_snapshot(self.config.tts.local_model) is not None:
+                    # 初始化完成前丢弃一次预热音频，避免首笔对话承担冷态计算。
+                    await self.tts.prewarm()
+                self._local_tts_load_state = "ready"
+                self._local_tts_error = None
+            else:
+                self._local_tts_load_state = "disabled"
             self.player = PcmPlayer(
                 playback_permission=lambda: not self.quiet_policy.passive(),
                 on_policy_blocked=self._on_passive_playback_blocked,
@@ -544,10 +562,13 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             )
             self.player.start()
             self.state.current["playback_diagnostics"] = self.player.diagnostics
-            if remote_tts is None:
+            if self.config.tts.backend == "minimax" and remote_tts is None:
                 raise RuntimeError(f"未配置 {self.config.tts.api_key_env}")
             self.state.set_service("tts", "READY")
         except Exception as exc:
+            if self.config.tts.backend == "voxcpm1":
+                self._local_tts_load_state = "error"
+                self._local_tts_error = str(exc)[:500]
             self._record_error("tts", str(exc))
 
         if self.config.audio.sample_rate != 16000 or self.config.audio.channels != 1 or self.config.audio.sample_format != "int16":
@@ -610,7 +631,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         application_report("voice", "建立唯一会话调度器")
         await self.controller.initialize()
         if self._handoff_marker.exists():
-            async with self._session_lock:
+            async with (_no_session_lock() if _session_lock_held else self._session_lock):
                 await self._resume_handoff()
         if self._quiet_clock_task is None or self._quiet_clock_task.done():
             self._quiet_clock_task = asyncio.create_task(self._quiet_clock(), name="quiet-hours-policy")
@@ -693,8 +714,16 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
 
     def snapshot(self) -> VoiceEvent:
         value = snapshot_event(self.state)
+        local_tts_status = self.local_tts_status_payload()
+        value.payload["local_tts"] = local_tts_status  # local_tts（本地模型选择与加载状态）。
         value.payload["session_operation"] = getattr(self, "_session_operation", None)  # session_operation（手动会话操作）。
         if value.payload["session_operation"]:
+            value.payload["can_start"] = False
+        tts_config = getattr(getattr(self, "config", None), "tts", None)
+        operations = getattr(self, "tts_voice_operations", None)
+        if ((tts_config is not None and tts_config.backend == "voxcpm1"
+             and local_tts_status.get("voice_state") != "ready")
+                or (operations is not None and operations.busy)):
             value.payload["can_start"] = False
         if hasattr(self, "quiet_policy"):
             value.payload["quiet_hours"] = self.quiet_policy.snapshot()
@@ -720,6 +749,225 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         value.payload["reasoning_mode"] = self.reasoning_mode
         value.payload["shadow"] = self._shadow_product_snapshot()
         return value
+
+    def local_tts_status_payload(self) -> dict[str, Any]:
+        """返回本地模型状态，不向客户端暴露任何本机文件路径。"""
+        client = getattr(getattr(self, "tts", None), "local", None)
+        tts_config = getattr(getattr(self, "config", None), "tts", None)
+        configured = getattr(tts_config, "local_model", "voxcpm1")
+        runtime_root = getattr(self, "_runtime_local_root", None)
+        status = client.model_status() if callable(getattr(client, "model_status", None)) else (
+            AudioCppTtsServer.catalog_snapshot(runtime_root, local_model=configured) if runtime_root else {}
+        )
+        status_local_model = status.get("local_model") if isinstance(status, Mapping) else None
+        loaded_model = status.get("loaded_model") if isinstance(status, Mapping) else None
+        model_rows = status.get("models") if isinstance(status, Mapping) else None
+        if not isinstance(model_rows, list):
+            model_rows = [
+                {"id": "voxcpm1", "name": "VoxCPM1", "native_sample_rate": 16000,
+                 "available": False, "loaded": False},
+                {"id": "voxcpm2", "name": "VoxCPM2", "native_sample_rate": 48000,
+                 "available": False, "loaded": False},
+            ]
+        voice_selection = self._active_voice_selection(configured)
+        libraries = getattr(self, "voice_library", None)
+        library = libraries.for_model(configured) if libraries else None
+        active_voice = None
+        voice_state = "unconfigured"
+        voice_error = getattr(self, "_local_tts_voice_error", None)
+        if library is None:
+            voice_state = "invalid"
+        if voice_selection is not None and library is not None:
+            try:
+                voice = library.get_voice(
+                    str(voice_selection.get("voice_id") or ""), voice_selection.get("revision"),
+                )
+                library.asset_path(voice["reference_asset_id"])
+                if configured == "voxcpm1" and not voice.get("reference_text", "").strip():
+                    voice_state = "reference_text_missing"
+                    voice_error = "VoxCPM1（第一代本地语音模型）需要参考音频对应的转写文本。"
+                else:
+                    voice_state = "ready"
+                    voice_error = None
+                active_voice = {"voice_id": voice["id"], "revision": voice["revision"],
+                                "name": voice["name"]}
+            except FileNotFoundError as exc:
+                voice_state = "asset_missing"
+                voice_error = str(exc)
+            except VoiceLibraryError as exc:
+                voice_state = "invalid"
+                voice_error = str(exc)
+        elif voice_selection is not None:
+            voice_state = "invalid"
+        caps = {
+            "voice_clone": True,
+            "voice_design": configured == "voxcpm2",
+            "style_control": configured == "voxcpm2",
+            "emotion_control": False,  # emotion_control（动态情绪控制）已停用。
+            "requires_reference_text": configured == "voxcpm1",
+        }
+        emotion_diagnostic = (
+            "VoxCPM1 不支持文字情绪控制；情绪标签不会发送给本地模型。"
+            if configured == "voxcpm1" else
+            "VoxCPM2 可用参考音频、文字设计或两者共同生成目标样音；播报沿用样音，同一回答内续接上一完整分段。"
+        )
+        return {
+            "backend": getattr(tts_config, "backend", "minimax"),  # backend（当前语音合成后端）。
+            "local_model": status_local_model if status_local_model in {"voxcpm1", "voxcpm2"} else configured,
+            "loaded_model": loaded_model if loaded_model in {"voxcpm1", "voxcpm2"} else None,
+            "load_state": getattr(self, "_local_tts_load_state", "unloaded"),  # load_state（本地模型加载状态）。
+            "error": (safe_voice_diagnostic(getattr(self, "_local_tts_error", None), "")
+                      if getattr(self, "_local_tts_error", None) else None),  # error（最近一次本地模型错误）。
+            "models": model_rows,
+            "active_voice": active_voice,
+            "voice_state": voice_state,
+            "voice_error": safe_voice_diagnostic(voice_error, "") if voice_error else None,
+            "voice_capabilities": caps,
+            "emotion_diagnostic": emotion_diagnostic,
+            "pending_selection": ({"backend": pending["backend"], "local_model": pending["local_model"]}
+                                  if isinstance(pending := (getattr(self, "_pending_tts_update", None) or getattr(self, "_applying_tts_selection", None)), Mapping) else None),  # 等待事务结束或正在应用的模型选择。
+            "active_voice_by_model": self._active_voices_by_model(),
+            "operation": self.tts_voice_operations.current_payload() if getattr(self, "tts_voice_operations", None) else None,
+        }
+
+    def _active_voices_by_model(self) -> dict[str, Any]:
+        libraries = getattr(self, "voice_library", None)
+        return libraries.selections() if libraries else {"voxcpm1": None, "voxcpm2": None}
+
+    def _active_voice_selection(self, model: str) -> Mapping[str, Any] | None:
+        libraries = getattr(self, "voice_library", None)
+        selected = libraries.for_model(model).active_selection if libraries else None
+        return selected if isinstance(selected, Mapping) else None
+
+    def _active_voice_snapshot(self, model: str, *, emotion: str | None = "calm"):
+        if self.voice_library is None:
+            return None
+        selection = self._active_voice_selection(model)
+        if selection is None:
+            return None
+        try:
+            return self.voice_library.resolve(
+                model, selection,
+                emotion=None,
+            )
+        except (VoiceLibraryError, FileNotFoundError):
+            return None
+
+    def _migrate_legacy_default_voice(self) -> None:
+        """从已校验的本机种子分别注册两款模型默认项，不复制其他配置。"""
+        if self.voice_library is None:
+            return
+        seed = self._runtime_local_root / "models" / "audiocpp" / "voice-seed"
+        audio, text = seed / "default.wav", seed / "default.json"
+        if not audio.is_file() or not text.is_file():
+            # 兼容实验安装的默认样音；读取旧配置先于重新生成运行配置。
+            legacy_config = self._runtime_local_root / "config" / "audiocpp" / "server-tts-evaluation.json"
+            try:
+                previous = json.loads(legacy_config.read_text(encoding="utf-8"))
+                preset = next((item.get("default_voice_preset") for item in previous.get("models", [])
+                               if isinstance(item.get("default_voice_preset"), dict)), None)
+                if preset and preset.get("voice_ref") and preset.get("reference_text"):
+                    legacy_audio = Path(preset["voice_ref"])
+                    if legacy_audio.is_file():
+                        for library in self.voice_library.libraries.values():
+                            library.register_default(legacy_audio.read_bytes(), preset["reference_text"])
+                        return
+            except (OSError, ValueError, KeyError) as exc:
+                self._local_tts_voice_error = safe_voice_diagnostic(exc)
+        if audio.is_file() and text.is_file():
+            try:
+                transcript = json.loads(text.read_text(encoding="utf-8"))["reference_text"]
+                for library in self.voice_library.libraries.values():
+                    library.register_default(audio.read_bytes(), transcript)
+            except (OSError, ValueError, KeyError) as exc:
+                self._local_tts_voice_error = safe_voice_diagnostic(exc)
+
+    async def switch_local_tts_model(self, local_model: str) -> None:
+        """调用本地 TTS 适配层切换模型并更新加载诊断。"""
+        if self.tts is None:
+            raise RuntimeError("TTS（语音合成）组件尚未初始化。")
+        self._local_tts_load_state = "loading"
+        self._local_tts_error = None
+        try:
+            await self.tts.switch_local_model(local_model)
+        except Exception as exc:
+            client = getattr(self.tts, "local", None)
+            status = client.model_status() if callable(getattr(client, "model_status", None)) else {}
+            loaded_model = status.get("loaded_model") if isinstance(status, Mapping) else None
+            self._local_tts_load_state = "ready" if loaded_model == self.config.tts.local_model else "error"
+            self._local_tts_error = str(exc)[:500]
+            raise
+        self._local_tts_load_state = "ready"
+        self._local_tts_error = None
+
+    async def switch_tts_selection(self, backend: str, local_model: str) -> None:
+        """在停止监听时准备语音后端，失败保留原配置；调用方持有会话锁。"""
+        if self.tts is None:
+            raise RuntimeError("TTS（语音合成）组件尚未初始化。")
+        if backend == self.config.tts.backend == "voxcpm1":
+            await self.switch_local_tts_model(local_model)
+            if self._active_voice_snapshot(local_model) is not None:
+                await self.tts.prewarm()
+            return
+        previous_config, previous_router = self.config, self.tts
+        if previous_config.tts.backend == "minimax":
+            self._online_tts_sample_rate = previous_config.tts.sample_rate
+        next_config = replace(previous_config, tts=replace(
+            previous_config.tts, backend=backend, local_model=local_model,
+            sample_rate=16000 if backend == "voxcpm1" else getattr(self, "_online_tts_sample_rate", 32000),
+        ))
+        # 采样率变化时沿用完整重建路径，同步播放器与回声处理的采样率契约。
+        if next_config.tts.sample_rate != previous_config.tts.sample_rate:
+            try:
+                await self.close(preserve_tts_updates=True)
+                self._prepare_for_reinitialize()
+                self.config = next_config
+                await self.initialize(_session_lock_held=True)
+                if self.state.services.get("tts") != "READY":
+                    raise RuntimeError("新语音后端初始化失败。")
+            except Exception:
+                await self.close(preserve_tts_updates=True)
+                self._prepare_for_reinitialize()
+                self.config = previous_config
+                await self.initialize(_session_lock_held=True)
+                raise
+            return
+        candidate = None
+        self.config = next_config
+        try:
+            remote, local = self._build_tts_clients()
+            if backend == "minimax" and remote is None:
+                raise RuntimeError("在线 MiniMax TTS（文本转语音）凭据尚未配置，已保留原语音选择。")
+            candidate = TtsBackendRouter(remote=remote, local=local, backend=backend)
+            await candidate.ensure_ready()
+            warmup = (await candidate.prewarm()
+                      if backend == "minimax" or self._active_voice_snapshot(local_model) is not None
+                      else {"status": "READY", "reason": "voice_not_configured"})
+            if backend == "minimax" and warmup.get("reason") == "emotion_unsupported":
+                warmup = await candidate.prewarm()
+            if warmup.get("status") == "FALLBACK":
+                raise RuntimeError(f"新语音后端连接未就绪：{warmup.get('reason') or '预热失败'}")
+        except BaseException:
+            self.config = previous_config
+            if candidate is not None:
+                await candidate.shutdown()
+            raise
+        self.tts = candidate
+        if self.controller is not None:
+            self.controller.tts = candidate
+            # output（发声事务执行器）保存独立路由引用，下一笔播报必须同步切换。
+            output = getattr(self.controller, "output", None)
+            if output is not None:
+                output.tts = candidate
+        self.state.current.update(
+            tts_transport=candidate.transport, tts_scheduling=candidate.effective_scheduling,
+        )
+        self._local_tts_load_state = "ready" if backend == "voxcpm1" else "disabled"
+        self._local_tts_error = None
+        try:
+            await previous_router.shutdown()
+        except Exception:
+            logger.exception("tts.previous_backend_cleanup_failed")
 
     def _publish_conversation_entry(self, entry: dict[str, Any]) -> None:
         """Publish one conversation line from a synchronous commit path."""
@@ -819,6 +1067,63 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
     def _api_key(self, environment_name: str) -> str:
         """Read a process credential or a short-lived vault-backed override."""
         return self._credential_overrides.get(environment_name) or self.config.api_key(environment_name)
+
+    def _build_tts_clients(self):
+        """按本机 backend（语音运行后端）配置创建 TTS provider（语音合成供应方）。"""
+        remote_tts = None
+        local_tts = None
+        if self.config.tts.backend == "minimax":
+            minimax_key = self._api_key(self.config.tts.api_key_env)
+            if minimax_key:
+                remote_tts = MiniMaxTtsClient(
+                    base_url=self.config.tts.base_url,
+                    websocket_path=self.config.tts.websocket_path,
+                    model=self.config.tts.model,
+                    api_key=minimax_key,
+                    output_format=self.config.tts.output_format,
+                    sample_rate=self.config.tts.sample_rate,
+                    voice_id=self.config.tts.voice_id,
+                    timeout_ms=self.config.tts.timeout_ms,
+                    transport=self.config.tts.transport,
+                    scheduling=self.config.tts.scheduling,
+                    subtitle_enable=self.config.tts.subtitle_enable,
+                    subtitle_type=self.config.tts.subtitle_type,
+                    audio_cache_max_bytes=self.config.tts.audio_cache_max_bytes,
+                    cancel_timeout_ms=self.config.tts.cancel_timeout_ms,
+                    keepalive_seconds=self.config.tts.keepalive_seconds,
+                    emotion_mode=self.config.tts.emotion_mode,
+                    default_emotion=self.config.tts.default_emotion,
+                    emotion_transport=self.config.tts.emotion_transport,
+                    session_reuse=self.config.tts.session_reuse,
+                    admission_lead_ms=self.config.tts.admission_lead_ms,
+                    sentence_prefetch_ms=self.config.tts.sentence_prefetch_ms,
+                    sentence_tick_ms=self.config.tts.sentence_tick_ms,
+                    sentence_min_effective_chars=self.config.tts.sentence_min_effective_chars,
+                    first_clause_timeout_ms=self.config.tts.first_clause_timeout_ms,
+                )
+        elif self.config.tts.backend == "voxcpm1":
+            local_config = self._runtime_local_root / "config" / "audiocpp" / "server-tts-evaluation.json"
+            self._migrate_legacy_default_voice()
+            AudioCppTtsServer.write_runtime_config(self._runtime_local_root, local_config)
+            local_tts = AudioCppTtsClient(
+                AudioCppTtsServer(
+                    self._runtime_local_root,
+                    local_config,
+                    local_model=self.config.tts.local_model,
+                ),
+                sample_rate=self.config.tts.sample_rate,
+                sentence_min_effective_chars=self.config.tts.sentence_min_effective_chars,
+                sentence_prefetch_ms=self.config.tts.sentence_prefetch_ms,
+                sentence_tick_ms=self.config.tts.sentence_tick_ms,
+                first_clause_timeout_ms=self.config.tts.first_clause_timeout_ms,
+                local_optimization=self.config.tts.local_optimization,
+                acoustic_continuation=self.config.tts.acoustic_continuation,
+                voice_library=self.voice_library,
+                active_voice_provider=self._active_voice_selection,
+                emotion_mode="off",
+                inference_steps_by_model=self.config.tts.inference_steps_by_model,
+            )
+        return remote_tts, local_tts
 
     def _continuity_document_changed(self, document: str) -> None:
         projector = getattr(self, "shadow_context", None)
@@ -1151,10 +1456,20 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         self.state.set_state(TerminalState.STARTING, listening=False)
 
     async def start_listening(self) -> None:
+        if getattr(self, "_pending_tts_update", None) or getattr(self, "_applying_tts_selection", None):
+            self._tts_resume_requested = True  # 用户主动请求切换后继续监听。
+            await self.bus.publish(event("status", code="TTS_SWITCH_PENDING", message="语音模型切换完成后开始监听。"))
+            return
         if self.application_initializing:
             await self.bus.publish(event("error", code="RUNTIME_STARTING", message="组件仍在加载，请等待启动完成。", recoverable=True))
             return
+        self._tts_resume_requested = None  # 新的主动启动撤销更早的停止意图。
         async with self._session_lock:
+            voice_operations = getattr(self, "tts_voice_operations", None)
+            operation = voice_operations.current_payload() if voice_operations is not None else None
+            if operation and operation.get("kind") in {"preview", "play"}:
+                await self.bus.publish(event("error", code="TTS_VOICE_BUSY", message="请等待音色试音结束或取消后，再开始监听。", recoverable=True))
+                return
             if getattr(self, "_speaker_captures", {}):
                 await self.bus.publish(event("error", code="SPEAKER_INPUT_BUSY", message="请结束声纹采集后再开始语音会话。", recoverable=True))
                 return
@@ -1199,6 +1514,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             await self._deliver_voice_mailbox()
 
     async def stop_listening(self) -> None:
+        self._tts_resume_requested = False  # 用户主动停止优先于后台切换的恢复意图。
         async with self._session_lock:
             if isinstance(self.shadow_session, DshShadowAgentSession):
                 self.shadow_session.approvals.revoke()
@@ -1291,34 +1607,51 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             if bus is not None:
                 await bus.publish(self.snapshot())
 
-    async def close(self) -> None:
+    async def close(self, *, preserve_tts_updates: bool = False) -> None:
+        update_task = getattr(self, "_tts_update_task", None)
+        if not preserve_tts_updates and update_task is not None and update_task is not asyncio.current_task() and not update_task.done():
+            update_task.cancel()
+            await asyncio.gather(update_task, return_exceptions=True)
+        if not preserve_tts_updates:
+            self._pending_tts_update = None
+            self._tts_resume_requested = False
         self._application_session_ready = False
         self._application_local_ready = False
-        await self.close_speaker_captures()
+        async def cleanup(label, action):
+            """单项关闭失败记入日志，继续清理其余资源和运行时引用。"""
+            try:
+                result = action()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception("runtime.cleanup_failed component=%s", label)
+        await cleanup("声纹采集", self.close_speaker_captures)
         if getattr(self, "audio_meter", None) is not None:
-            await self.audio_meter.close()
+            await cleanup("音频电平", self.audio_meter.close)
         if self.controller is not None:
-            await self.controller.close()
-        self.hotwords.clear()
+            await cleanup("会话调度器", self.controller.close)
+        await cleanup("热词", self.hotwords.clear)
         speaker = getattr(self, "speaker", None)
         if speaker is not None:
-            await speaker.close()
-        await self._stop_managed_speaker_worker()
+            await cleanup("声纹", speaker.close)
+        await cleanup("声纹工作进程", self._stop_managed_speaker_worker)
         if self.kws is not None:
-            self.kws.close()
+            await cleanup("唤醒", self.kws.close)
         shadow_component = getattr(self, "shadow_component", None)
         if shadow_component is not None:
-            await shadow_component.close()
+            await cleanup("影子代理", shadow_component.close)
         shadow_session = getattr(self, "shadow_session", None)
         if shadow_component is None and isinstance(shadow_session, DshShadowAgentSession):
             self.dsh.bridge_hub.unregister(shadow_session)
-            await shadow_session.close()
+            await cleanup("影子会话", shadow_session.close)
+        await cleanup("音色操作", self.tts_voice_operations.close)
         if self.tts is not None:
-            await self.tts.close()
+            shutdown = getattr(self.tts, "shutdown", self.tts.close)
+            await cleanup("语音合成", shutdown)
         if self.llm is not None:
-            await self.llm.close()
+            await cleanup("语言模型", self.llm.close)
         if self.audio_processor is not None:
-            self.audio_processor.close()
+            await cleanup("音频处理", self.audio_processor.close)
         # A model apply deliberately calls close() followed by initialize().
         # Do not let a disabled replacement accidentally reuse closed LLM,
         # TTS, KWS, Shadow or audio objects through the next controller.

@@ -165,7 +165,7 @@ describe('桌面样例回放交互', () => {
     const wrapper = renderDemo('?page=system')
     expect(wrapper.get('.settings-tabs button.active').text()).toContain('本地组件')
     const tabs = wrapper.findAll('.settings-tabs button')
-    expect(tabs).toHaveLength(9)
+    expect(tabs).toHaveLength(10)
     expect(tabs.map(tab => tab.attributes('aria-label'))).toContain('热词替换')
     expect(tabs.map(tab => tab.attributes('aria-label'))).toContain('关于与工作区')
     expect(wrapper.get('#local-components-title').text()).toBe('本地组件')

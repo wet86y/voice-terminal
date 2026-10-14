@@ -156,6 +156,17 @@ const rows = computed<LocalComponentRow[]>(() => {
       note: '包含系统进程及其子进程；模型工作进程和代理执行宿主单独计量，共享进程只计一次。',
     })
   }
+  const localMetrics = resources.value.get('local-tts')
+  if (localMetrics) components.push({
+    id: 'local-tts', name: 'VoxCPM（本地语音合成）', state: 'ready', status: '运行中', available: true,
+    runtime: 'audio.cpp（原生音频推理框架）',
+    residentMemory: formatComponentMemory(localMetrics.memory_rss_bytes),
+    privateMemory: formatComponentMemory(localMetrics.memory_private_commit_bytes),
+    vram: formatComponentMemory(localMetrics.gpu_dedicated_bytes),
+    description: '本地语音合成运行程序；模型与音色在语音与音色页选择。',
+    facts: [],
+    note: '独立计量；不重复计入语音服务资源。',
+  })
   return [...models, ...components]
 })
 const model = computed<LocalComponentsModel>(() => {

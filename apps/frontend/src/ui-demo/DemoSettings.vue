@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import TtsSettings from "./DemoTtsSettings.vue";
+import { provideTtsVoiceState } from "../interface/useTtsVoiceState";
+provideTtsVoiceState();
 import { computed, reactive, ref, toRef, watch } from 'vue'
 import SilenceTimeoutControl from '../interface/SilenceTimeoutControl.vue'
 import LocalComponents from '../interface/LocalComponents.vue'
@@ -133,6 +136,7 @@ function cancelTask(item: DemoWakeTask) {
 
 <template>
   <article class="settings-panel panel" :class="`settings-panel-${tab}`">
+    <TtsSettings v-if="tab === 'tts'" />
     <template v-if="tab === 'screen'">
       <SettingsPageHeader section="screen" /><section class="preference-card settings-stack">
         <h3>屏幕图像</h3><p>按需获取前台屏幕的全局图与局部图。局部区域为960×640物理像素，全局图长边最多1920像素。</p>

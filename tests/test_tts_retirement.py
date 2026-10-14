@@ -40,12 +40,14 @@ def test_status_exposes_only_active_online_backend():
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
                 status = await client.get("/api/v1/tts/status")
                 assert status.status_code == 200
-                assert status.json() == {"backend": "minimax", "worker": {"state": "stopped"}}
+                assert status.json()["backend"] == "minimax"
+                assert status.json()["worker"] == {"state": "stopped"}
+                assert {row["id"] for row in status.json()["models"]} == {"voxcpm1", "voxcpm2"}
                 snapshot = await client.get("/api/v1/product/snapshot")
                 assert snapshot.status_code == 200
                 assert snapshot.json()["runtime"]["tts_worker"] == {"state": "stopped"}
                 switch = await client.put("/api/v1/product/settings/tts", json={"backend": "cosyvoice"})
-                assert switch.status_code == 404
+                assert switch.status_code == 404  # 此测试运行时未配置产品设置存储。
     asyncio.run(scenario())
 
 
@@ -55,11 +57,11 @@ def test_compatibility_router_pins_each_transaction_until_release():
         local = SimpleNamespace(transport="worker", ensure_ready=AsyncMock(), close=AsyncMock())
         router = TtsBackendRouter(remote=remote, local=local)
         first_backend, first_client = router.bind()
-        await router.switch("cosyvoice")
+        await router.switch("voxcpm1")
         second_backend, second_client = router.bind()
         await router.switch("minimax")
         assert (first_backend, first_client) == ("minimax", remote)
-        assert (second_backend, second_client) == ("cosyvoice", local)
+        assert (second_backend, second_client) == ("voxcpm1", local)
         local.close.assert_not_awaited()
         router.release(second_backend)
         await asyncio.sleep(0)
