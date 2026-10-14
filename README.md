@@ -1,5 +1,7 @@
 # Voice Terminal
 
+识别后热词替换与前端词表编辑见[热词替换](docs/asr-hotwords.md)。
+
 Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tauri（桌面框架）窗口是主产品唯一的运行、开发和界面验收入口，负责托盘、单实例及服务管理进程；应用宿主负责业务组件的启动、监督和退出。Voice Server（语音服务）负责音频采集、KWS（关键词唤醒）、VAD（语音活动检测）、ASR（自动语音识别）、主 Agent（智能体）、Shadow（影子代理）、TTS（语音合成）和播放。DSH（代理执行宿主）作为内部组件受管，其独立管理控制台继续由系统默认浏览器打开。
 
 当前代码包版本为 `0.9.0`。默认 LLM（大语言模型）路径是 DeepSeek Responses（响应接口）与 strict `json_schema`（严格结构化输出）；`voice_decision_v06`（语音决策协议兼容标识）保持冻结，不是发布版本号。

@@ -3,6 +3,7 @@
 numpy>=1.26,<3
 funasr>=1.4.0,<1.5
 pypinyin>=0.50,<1
+rapidfuzz>=3,<4 # RapidFuzz（热词音素模糊匹配）；与 FunASR（语音框架）共用。
 modelscope>=1.20,<2
 sherpa-onnx==1.13.7
 onnxruntime==1.24.3

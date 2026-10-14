@@ -1679,6 +1679,8 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                     if isinstance(item, dict) and item.get("text"):
                         await self.observe("USER_SEGMENT_UPDATED", turn_id=item["turn_id"], text=item["text"],
                                            output_generation=item.get("generation", 0), source="speaker_recovery",
+                                           raw_text=item.get("raw_text", item["text"]),
+                                           hotword_matches=item.get("hotword_matches", []),
                                            occurred_at=item.get("occurred_at", time.time()))
             finally:
                 self._speaker_batch_release = False

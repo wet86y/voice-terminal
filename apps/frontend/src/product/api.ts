@@ -72,6 +72,10 @@ function jsonBody(value: unknown): RequestInit {
 }
 
 export const productApi = {
+  hotwords: () => request<{ settings: import('./hotwords').HotwordSettings; status: string }>('/api/v1/product/settings/hotwords'), // hotwords（读取热词）。
+  saveHotwords: (value: import('./hotwords').HotwordSettings) => request<{ settings: import('./hotwords').HotwordSettings; message: string }>('/api/v1/product/settings/hotwords', jsonBody(value)), // saveHotwords（保存词表并预建索引）。
+  importHotwords: (text: string) => request<{ entries: import('./hotwords').HotwordEntry[] }>('/api/v1/product/hotwords/import', { method: 'POST', body: JSON.stringify({ text }) }), // importHotwords（解析导入，不自动保存）。
+  previewHotwords: (settings: import('./hotwords').HotwordSettings, text: string) => request<import('./hotwords').HotwordPreview>('/api/v1/product/hotwords/preview', { method: 'POST', body: JSON.stringify({ settings, text }) }), // previewHotwords（试测当前草稿）。
   /** decideDshApproval（权限答复）：经桌面同源宿主转发，连续授权只限当前语音窗口。 */
   decideDshApproval: async (value: { approval_id: string; decision: 'allowed-once' | 'allowed-until-silence' | 'rejected'; run_seq: number }) => {
     const response = await fetch('/api/v1/application/dsh-approval', { method: 'POST', credentials: 'same-origin', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(value) })

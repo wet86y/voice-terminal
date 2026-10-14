@@ -15,10 +15,12 @@ import {
 import type { WorkbenchModel } from "../interface/workbench";
 import { userMessageKey } from "./conversation-identity";
 import { productApi } from './api';
+import { useHotwordSettings } from './useHotwordSettings';
 
 /** useProductControls（页面控件组合逻辑）：复用业务适配器并集中保留表单和录音生命周期。 */
 export function useProductControls() {
   const adapter = useProductAdapter();
+  const hotwordControls = useHotwordSettings(message => adapter.setNotice(message));
   const applicationHost = useApplicationHost();
   const { snapshot: applicationSnapshot } = applicationHost;
   onMounted(() => {
@@ -41,6 +43,9 @@ export function useProductControls() {
     if (['workspace', 'about'].includes(query.get('settings') ?? query.get('page') ?? '')) {
       adapter.page.value = 'settings'
       adapter.settingsTab.value = 'workspace'
+    }
+    if ((query.get('settings') ?? query.get('page')) === 'hotwords') {
+      adapter.page.value = 'settings'; adapter.settingsTab.value = 'hotwords'
     }
   });
   onBeforeUnmount(applicationHost.stop);
@@ -1629,6 +1634,7 @@ export function useProductControls() {
   });
 
   return {
+    ...hotwordControls,
     current,
     decideDshApproval,
     applicationSnapshot,

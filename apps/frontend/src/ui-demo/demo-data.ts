@@ -155,7 +155,7 @@ export type PreviewScene = 'normal' | 'empty' | 'long' | 'loading' | 'error'
 /** PreviewOverlay（浮层展示）：启动、确认、成功和失败画面。 */
 export type PreviewOverlay = 'none' | 'startup' | 'confirm' | 'success' | 'failure'
 /** SettingsTab（展示设置页签）：本地模型设备与系统状态合并到组件页。 */
-export type SettingsTab = 'screen' | 'wake' | 'persona' | 'speaker' | 'wakes' | 'models' | 'compute' | 'workspace'
+export type SettingsTab = 'screen' | 'wake' | 'persona' | 'speaker' | 'wakes' | 'models' | 'compute' | 'workspace' | 'hotwords'
 /** PreviewPage（展示页面）：工作台或某个设置页。 */
 export type PreviewPage = 'home' | SettingsTab
 

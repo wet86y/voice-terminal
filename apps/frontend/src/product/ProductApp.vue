@@ -11,6 +11,7 @@ import { desktopPort } from "./desktop-port";
 import "./application.css";
 import ScreenSettings from "./panels/ScreenSettings.vue";
 import WakeSettings from "./panels/WakeSettings.vue";
+import HotwordSettings from "./panels/HotwordSettings.vue";
 import PersonaSettings from "./panels/PersonaSettings.vue";
 import SpeakerSettings from "./panels/SpeakerSettings.vue";
 import WakeTasksSettings from "./panels/WakeTasksSettings.vue";
@@ -150,6 +151,7 @@ function nativeAction(action: () => Promise<void>) {
       <article class="settings-panel panel" :class="`settings-panel-${activeSettingsTab}`">
         <ScreenSettings v-if="activeSettingsTab === 'screen'" />
         <WakeSettings v-if="activeSettingsTab === 'wake'" />
+        <HotwordSettings v-if="activeSettingsTab === 'hotwords'" />
         <PersonaSettings v-if="activeSettingsTab === 'persona'" />
         <SpeakerSettings v-if="activeSettingsTab === 'speaker'" />
         <WakeTasksSettings v-if="activeSettingsTab === 'wakes'" />
