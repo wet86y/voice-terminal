@@ -15,6 +15,18 @@
 
 模型能力参考 [VoxCPM 官方说明](https://github.com/OpenBMB/VoxCPM#-controllable-voice-cloning)。原生二代混合请求使用源参考音频和描述，源转写是编辑资料；正式请求没有逐段设计前缀。
 
+## 显卡性能模式
+
+本地 TTS 服务就绪时，语音服务进程通过 NVML（英伟达管理库）把**本进程**的 PowerMizer（性能模式）设为 `prefer-maximum-performance`（优先最大性能），效果等价于 NVIDIA 控制面板的“电源管理模式 = 优先最大性能”。`tts.gpu_max_performance`（默认开启）是唯一开关，不覆盖其它用户设置。
+
+- 该接口**不需要管理员权限**（实测 `nvmlDeviceSetPowerMizerMode_v1` 返回成功）；锁定频率的 `nvmlDeviceSetGpuLockedClocks` 需要管理员权限，程序不调用它。
+- 实测设置值按进程记录（另一个进程读到的仍是原值），但**整卡生效**：旁路进程加持期间，整卡空闲频率由 210 兆赫升到 2370 兆赫，进程退出后回到 210 兆赫。因此不需要常驻计算负载，也不会给用户机器留下持久改动。
+- 本地语音客户端关闭时（含在线／本地后端切换）显式还原加持前的模式；进程退出时驱动本身也会还原。
+- 没有 NVIDIA 驱动、接口缺失、设备不支持或权限不足时全部降级为无操作，只写日志，不影响合成。
+- 状态通过 `/api/v1/tts/status`（语音状态接口）的 `gpu_performance` 字段展示：`enabled`、`available`、`applied`、`mode`、`previous_mode`、`supported_modes`、`last_error`；加持成功时 `audio_cpp_tts`（本地语音适配）日志记录 `gpu_performance.applied`，含当时的模式、支持位掩码与频率／功耗／利用率采样。
+
+背景与测量依据见 [本地语音实时因子对比复核](local-tts-rtf-branch-comparison-20261014.md)。
+
 ## 通用提前合成与取消
 
 所有语音后端使用同一播报事务管理器。提前合成为内部调度行为，没有用户开关，也没有后端能力标志选择分支。历史 `local_optimization`（本地优化字段）不能关闭这项调度；声学续接单独管理。
