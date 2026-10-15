@@ -207,8 +207,9 @@ npm run test --workspace @voice-terminal/frontend -- src/product/useProductAdapt
 - 当前 dispatch 的原始用户输入进入 Shadow snapshot；后续 delta 无损且按 revision 连续；
 - 活跃期重复 `request_shadow` 不创建第二个 activation；下一个安全点前 inbox 只有一条合并上下文输入，
   且保留窗口内所有 frames；消息被 claim 后才开启下一合并窗口；
-- `shadow_agent.runtime_reminder_interval_ms` 默认 20000 ms；长推理在 20、40、60 秒等阈值注入软性
-  收敛提醒，提醒只走 `inject` 的 next-step 安全边界，不唤醒 idle、不打断工具，终态后不再注入；
+- `shadow_agent.runtime_reminder_interval_ms` 默认 `0`（关闭）；收敛要求由首条受管系统提示词一次性承载，
+  不按固定间隔重复注入。启用（设为正数毫秒值）后，长推理在对应阈值注入软性收敛提醒，提醒只走 `inject`
+  的 next-step 安全边界，不唤醒 idle、不打断工具，终态后不再注入；
 - 活跃期 context/wake 响应丢失时通过 `session.state` 和原 request ID 幂等恢复，不因已生效的请求发布
   假 `failed`；只有首次启动、明确拒绝或状态核对失败才记一次基础设施失败；
 - stale 工具不执行，stale final 不发布；

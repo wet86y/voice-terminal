@@ -13,7 +13,7 @@ from voice_terminal.agent.decision_envelope import Action, DecisionEnvelope, Spe
 from voice_terminal.agent.episode import AgentEpisodeRuntime
 from voice_terminal.agent.tool_registry import FileTools
 from voice_terminal.agent.shadow_registry import VoiceShadowRegistry
-from voice_terminal.config import AppConfig, load_config
+from voice_terminal.config import AppConfig, ShadowAgentConfig, load_config
 from voice_terminal.session.contracts import DeliveryReport
 from voice_terminal.session.context import CurrentInput, LLMContextProjector
 from voice_terminal.session.ledger import SessionLedger
@@ -123,7 +123,7 @@ def test_configuration_exposes_shadow_soft_yield_and_reminder_defaults():
     assert cfg.status_observer.timeout_ms is None
     assert cfg.status_observer.every_committed_steps == 5
     assert cfg.status_observer.reasoning_effort == "none"
-    assert cfg.runtime_reminder_interval_ms == 20000
+    assert cfg.runtime_reminder_interval_ms == 0
     assert cfg.reasoning_effort == "high"
 
     loaded = load_config(Path(__file__).parents[1] / "config" / "default.yaml").shadow_agent
@@ -132,6 +132,13 @@ def test_configuration_exposes_shadow_soft_yield_and_reminder_defaults():
     assert loaded.tools.soft_yield_ms == 8000
     assert loaded.tools.web_search.timeout_ms == 15000
     assert loaded.status_observer.timeout_ms is None
+
+
+def test_runtime_reminder_interval_rejects_negative_and_accepts_zero():
+    assert ShadowAgentConfig(runtime_reminder_interval_ms=0).runtime_reminder_interval_ms == 0
+    assert ShadowAgentConfig(runtime_reminder_interval_ms=12345).runtime_reminder_interval_ms == 12345
+    with pytest.raises(ValueError):
+        ShadowAgentConfig(runtime_reminder_interval_ms=-1)
 
 
 def test_shadow_runtime_has_no_provider_deadline_or_retry_count_ceiling(monkeypatch, tmp_path: Path):

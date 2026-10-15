@@ -46,7 +46,9 @@ shadow_agent:
   debug_websocket_enabled: false
   max_context_tokens: 524288
   compaction_threshold_ratio: 0.80
-  runtime_reminder_interval_ms: 20000
+  # 0 disables the periodic advisory; the managed system prompt carries the
+  # one-time convergence rule. Set a positive millisecond value to re-enable.
+  runtime_reminder_interval_ms: 0
   provider:
     timeout_ms: 15000
     transport_retry_limit: 2

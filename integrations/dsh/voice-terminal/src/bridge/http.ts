@@ -42,8 +42,11 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
         if (path === 'session.open' || path === 'session.resume') {
           if (existing) { json(res, 409, result('conflict')); return }
           const requestedReminderMs = Number(body.runtime_reminder_interval_ms)
+          // Runtime reminder interval（运行提醒间隔）: 0 or less = disabled (no periodic advisory; the
+          // managed one-time system prompt carries the only time-budget guidance), > 0 = advisory
+          // every N ms. A missing or non-integral value keeps the disabled default.
           const reminderIntervalMs = Number.isSafeInteger(requestedReminderMs) && requestedReminderMs > 0
-            ? requestedReminderMs : 20000
+            ? requestedReminderMs : 0
           const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map(), pendingToolActivations: new Map(), actionSeq: 0, actionQueue: Promise.resolve(), assistantStreamRevision: 0, pendingThinkingDelta: '', queuedMessages: new Map(), reminderIntervalMs, nextReminderMs: reminderIntervalMs, queuedRevision: 0, claimedRevision: 0 }
           const preset = await ctx.agentPresets.resolve('shadow-agent')
           const modelSelection = ctx.agentDefaultModel.currentSelection()
