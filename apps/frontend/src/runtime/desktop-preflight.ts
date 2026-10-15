@@ -1,4 +1,5 @@
 import { startupIcon } from './startup-screen'
+import './context-menu'
 
 /** DesktopFrontendMode（桌面前端模式）：桌面宿主允许加载的受控入口。 */
 export type DesktopFrontendMode = 'product' | 'ui-preview'

@@ -28,6 +28,20 @@ function openTerminal(now?: () => number) {
 }
 
 describe('V0.6 session protocol', () => {
+  it('悬浮窗明确停止输入保留当前播报，再次开始沿用原会话命令', () => {
+    const { terminal, socket } = openTerminal()
+    terminal.listening.value = true
+    terminal.playbackQueue.value = [{ conversation_id: 'conversation_a', speech_id: 's1', turn_id: 't1', text: '继续播报', state: 'playing' }]
+    expect(terminal.setListening(false)).toBe(true)
+    expect(JSON.parse(socket.sent.at(-1)!).command).toBe('session.stop')
+    expect(terminal.playbackQueue.value[0]?.state).toBe('playing')
+    terminal.listening.value = false
+    terminal.canStart.value = true
+    expect(terminal.setListening(false)).toBe(false)
+    expect(terminal.setListening(true)).toBe(true)
+    expect(JSON.parse(socket.sent.at(-1)!).command).toBe('session.start')
+    terminal.dispose()
+  })
   it('持续输出裁剪旧轨迹时保留待决授权', () => {
     const items: ShadowActivity[] = [{ run_seq: 1, item_id: 'approval', stream: 'approval', phase: 'started', approval_id: 'request', timestamp: '' }]
     for (let index = 0; index < 120; index++) items.push({ run_seq: 1, item_id: `output-${index}`, stream: 'output', phase: 'completed', timestamp: '' })

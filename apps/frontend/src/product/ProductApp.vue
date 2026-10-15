@@ -23,8 +23,8 @@ import WorkspaceSettings from "./panels/WorkspaceSettings.vue";
 import ModelSettings from "./panels/ModelSettings.vue";
 import { provideProductContext } from "./product-context";
 import { useWorkspaceResources } from './useWorkspaceResources'
-import type { VoiceOrbModel } from '../interface/voice-orb'
-import { FLOATING_WINDOW_ERROR_EVENT } from './floating-window'
+import { FLOATING_WINDOW_CONTROL_EVENT, FLOATING_WINDOW_ERROR_EVENT, FLOATING_WINDOW_WORKBENCH_EVENT,
+  type FloatingSessionAction, type FloatingWindowProjection } from './floating-window'
 
 const controls = useProductControls();
 const application = useApplicationHost();
@@ -49,24 +49,34 @@ const {
   setNotice,
   workbenchModel,
   decideDshApproval,
+  floatingModel,
+  floatingSessionAction,
 } = controls;
 const desktop = desktopPort();
-let floatingErrorUnlisten: (() => void) | undefined;
-if (desktop.available && desktop.listen) {
-  void desktop.listen<string>(FLOATING_WINDOW_ERROR_EVENT, event => {
-    lastError.value = event.payload;
-  }).then(unlisten => { floatingErrorUnlisten = unlisten; }).catch(() => undefined);
-  onBeforeUnmount(() => floatingErrorUnlisten?.());
+const floatingUnlisteners: Array<() => void> = [];
+let disposed = false;
+function subscribeFloating<T>(name: string, handler: (payload: T) => void) {
+  void desktop.listen?.<T>(name, event => { if (!disposed) handler(event.payload); })
+    .then(unlisten => { if (disposed) unlisten(); else floatingUnlisteners.push(unlisten); }).catch(() => undefined);
 }
-// floatingModel（悬浮窗投影）：主页面持有语音状态；悬浮窗只接收五频带动效快照。
-let floatingLatestModel: VoiceOrbModel | null = null;
+if (desktop.available && desktop.listen) {
+  subscribeFloating<string>(FLOATING_WINDOW_ERROR_EVENT, value => { lastError.value = value; });
+  subscribeFloating<FloatingSessionAction>(FLOATING_WINDOW_CONTROL_EVENT, action => {
+    if (action === 'silence' || action === 'start') floatingSessionAction(action);
+  });
+  subscribeFloating(FLOATING_WINDOW_WORKBENCH_EVENT, () => { activePage.value = 'home'; });
+}
+onBeforeUnmount(() => { disposed = true; floatingUnlisteners.forEach(unlisten => unlisten()); });
+// floatingModel（悬浮窗投影）：语音快照包含字幕，仍由主页面独占真实会话。
+let floatingLatestModel: FloatingWindowProjection | null = null;
 let floatingPublishTimer: ReturnType<typeof setTimeout> | undefined;
 let floatingPublishFailed = false;
 let firstFloatingModel = true;
 const floatingWatchSources = [
-  () => workbenchModel.value.state,
-  () => workbenchModel.value.sessionActive ?? ['listening', 'thinking', 'speaking'].includes(workbenchModel.value.state),
-  ...Array.from({ length: 5 }, (_, index) => () => workbenchModel.value.audioLevels?.[index] ?? 0),
+  () => floatingModel.value.state, () => floatingModel.value.sessionActive,
+  () => floatingModel.value.silenced, () => floatingModel.value.canControl,
+  () => floatingModel.value.caption,
+  ...Array.from({ length: 5 }, (_, index) => () => floatingModel.value.audioLevels[index] ?? 0),
 ];
 function publishFloatingModel() {
   if (!floatingLatestModel || !desktop.publishFloatingModel || floatingPublishFailed) return;
@@ -77,12 +87,7 @@ function publishFloatingModel() {
 }
 if (desktop.available && desktop.publishFloatingModel) {
   watch(floatingWatchSources, () => {
-    const state = workbenchModel.value.state;
-    floatingLatestModel = {
-      state,
-      sessionActive: workbenchModel.value.sessionActive ?? ['listening', 'thinking', 'speaking'].includes(state),
-      audioLevels: Array.from({ length: 5 }, (_, index) => workbenchModel.value.audioLevels?.[index] ?? 0),
-    };
+    floatingLatestModel = { ...floatingModel.value, audioLevels: [...floatingModel.value.audioLevels] };
     if (firstFloatingModel) {
       firstFloatingModel = false;
       publishFloatingModel();

@@ -413,6 +413,64 @@ class DeliveryResolver:
             rendered.setdefault(kind, []).append(value)
         return rendered
 
+    def caption_progress(
+        self,
+        snapshot: PlaybackSnapshot | Mapping[str, Any],
+        generated_text: str,
+    ) -> dict[str, Any] | None:
+        """caption_progress（实时字幕位置）：按真实输出位置选词或句，不按全文长度猜测。"""
+        if isinstance(snapshot, PlaybackSnapshot):
+            played_ms, started = snapshot.output_estimated_ms, snapshot.started
+        else:
+            played_ms = int(snapshot.get("output_estimated_ms", snapshot.get("played_ms", 0)) or 0)
+            started = bool(snapshot.get("started", False))
+        if not started or played_ms <= 0 or not generated_text.strip():
+            return None
+
+        def locate(spans: list[SpeechAlignment]) -> tuple[dict[str, Any] | None, bool]:
+            cursor = 0  # cursor（原始文本字符下标）：保留空白与标点。
+            previous = None
+            for span in spans:
+                # 只比较当前片段，不反复归一化剩余全文，避免长播报产生平方级扫描。
+                expected = _normalise_for_match(span.text)
+                end, matched = cursor, 0
+                while end < len(generated_text) and matched < len(expected):
+                    char = generated_text[end]
+                    end += 1
+                    if char.isspace():
+                        continue
+                    folded = char.casefold()
+                    if expected[matched:matched + len(folded)] != folded:
+                        return previous, False
+                    matched += len(folded)
+                if not expected or matched != len(expected):
+                    return previous, False
+                start, cursor = cursor, end
+                if not span.valid:
+                    continue
+                if span.start_ms > played_ms or (span.source == "local" and span.end_ms is None and span.start_ms == played_ms):
+                    break
+                previous = {
+                    "text": generated_text,  # text（纯语音原文）。
+                    "start": start,  # start（当前片段起点）：按 Unicode（统一字符编码）字符计数。
+                    "end": cursor,  # end（当前片段终点）：浏览器需转换编码单元下标。
+                    "precision": "word" if span.granularity == "word" else "sentence",  # precision（词或句精度）。
+                }
+                if span.end_ms is None or played_ms < span.end_ms:
+                    return previous, True
+            return previous, False
+
+        provider, provider_active = locate(list(self._provider_spans))
+        if provider_active:
+            return provider
+        # 尚未返回完整音频的当前本地句段也可展示；不越过未知的句段终点。
+        local_spans = list(self._local_spans) + [
+            SpeechAlignment(item["text"], item["start_ms"], None, "sentence", "local", "sentence")
+            for item in self._pending_text if item["end_ms"] is None
+        ]
+        local, local_active = locate(local_spans)
+        return local if local_active else provider or local
+
     def resolve(
         self,
         snapshot: PlaybackSnapshot | Mapping[str, Any],

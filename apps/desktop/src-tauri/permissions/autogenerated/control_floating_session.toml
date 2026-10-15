@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-control-floating-session"
+description = "Enables the control_floating_session command without any pre-configured scope."
+commands.allow = ["control_floating_session"]
+
+[[permission]]
+identifier = "deny-control-floating-session"
+description = "Denies the control_floating_session command without any pre-configured scope."
+commands.deny = ["control_floating_session"]

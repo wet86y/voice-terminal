@@ -1230,11 +1230,17 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     }
   }
 
-  function toggleListening() {
+  /** setListening（设置麦克风输入目标）：停止输入保留播报，开始复用原有识别链路。 */
+  function setListening(enabled: boolean) {
     if (connection.value !== 'connected' || sessionOperation.value) return false
-    if (listening.value) return sendCommand('session.stop')
+    if (listening.value === enabled) return false
+    if (!enabled) return sendCommand('session.stop')
     if (!canStart.value) return false
     return sendCommand('session.start')
+  }
+
+  function toggleListening() {
+    return setListening(!listening.value)
   }
 
   function performSessionOperation(operation: SessionOperation) {
@@ -1322,6 +1328,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     disconnect,
     injectReplay,
     toggleListening,
+    setListening,
     resetSession,
     clearSession,
     setReasoningMode,
