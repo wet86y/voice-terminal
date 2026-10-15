@@ -1,8 +1,8 @@
 # TTS（语音合成）运行模式
 
-Voice Server（语音服务）当前固定使用 MiniMax API（在线语音接口）合成已提交的文本块，并负责文本分段、调度、播放、中断结算和历史记录。当前产品模型配置继续使用 `speech-2.8-hd`（语音模型）和 `female-shaonv`（音色）。设置页不提供服务商切换，模型分配也不能更改当前 TTS profile（语音配置）。
+Voice Server（语音服务）把已提交的文本块交给当前 `tts.backend`（语音运行后端）合成，并负责文本分段、调度、播放、中断结算和历史记录。后端有两种：`minimax`（MiniMax API 在线语音接口，默认）和 `voxcpm1`（本地 VoxCPM 的兼容路由名，实际模型由 `tts.local_model` 在第一代 `voxcpm1` 与第二代 `voxcpm2` 之间选择）。设置页可在“语音与音色”页切换后端与本地模型，切换在运行中事务化执行，失败时回滚到原选择。当前默认配置仍使用 `speech-2.8-hd`（在线语音模型）和 `female-shaonv`（在线音色）；模型分配不能更改当前 TTS profile（语音配置）。本地后端的模型、音色库、优化开关与实测数据见[本地 TTS 集成](local-tts-integration-20261014.md)。
 
-TTS API（在线语音接口）未配置或不可用时，服务会报告错误。
+所选后端的依赖未配置或不可用时，服务会报告错误：`minimax` 需要可用的 MiniMax API（在线语音接口），`voxcpm1` 需要本地模型权重与 `.local/runtimes/audiocpp`（原生推理服务）就绪。两者互相独立，一端不可用不影响另一端。
 
 连接或 `task_started`（任务已启动）确认前发生临时网络故障，或 MiniMax 返回可重试的 `408`、`425`、`429`、`5xx` 状态码时，客户端会丢弃失效连接并新建连接重试一次。文本提交后不会自动重发，避免网络中断时重复播报；认证、参数等明确拒绝不会重试。只有错误明确指向不支持的音色情绪字段时，才会去掉该可选字段后重新建连。
 
@@ -40,8 +40,8 @@ TTS API（在线语音接口）未配置或不可用时，服务会报告错误�
 
 ## 只读状态
 
-`GET /api/v1/tts/status` 返回固定的 `backend: "minimax"`（当前语音后端）和 `worker: {"state": "stopped"}`（兼容旧客户端的已停止状态）。产品快照中的 `tts_worker`（本地语音工作进程状态）也固定为已停止。历史 CosyVoice（本地语音合成）实现已归档，当前运行时不创建本地合成工作进程。
+`GET /api/v1/tts/status` 返回当前生效的 `backend`（`minimax` 或 `voxcpm1`）、`local_model`（本地模型选择）、`loaded_model`（已驻留的本地模型，未驻留时为 `null`）、`models`（两款本地模型各自的可用与已加载状态）、`load_state` 以及当前音色状态；响应不包含任何本机文件路径。响应仍保留 `worker: {"state": "stopped"}`（旧式本地工作进程兼容字段），产品快照中的 `tts_worker`（本地语音工作进程状态）同样固定为已停止：本地合成由 `runtimes/audiocpp`（原生音频推理框架）服务承载，不再创建 Python 侧的本地合成工作进程。历史 CosyVoice（本地语音合成）实现已归档，旧设置的 `cosyvoice` 后端继续归一化为 `minimax`。
 
-`TtsBackendRouter`（语音后端兼容路由）与 `EpisodeSpeechOutput`（语音事务输出）的 `bind/release`（绑定／释放）接口仍保留，供本地 TTS 调试完成后接入。当前产品启动和设置接口不会启用该路由的本地分支。
+`TtsBackendRouter`（语音后端兼容路由）与 `EpisodeSpeechOutput`（语音事务输出）的 `bind/release`（绑定／释放）接口在 `backend: "voxcpm1"` 时启用本地分支并管理本地租约（租约清零后才释放本地客户端）；`minimax` 时继续使用在线客户端。后端与本地模型的运行中切换通过 `PUT /api/v1/product/settings/tts` 执行，成功后事务保存并同步运行配置；本地音色库操作使用 `/api/v1/tts/voices/{model}` 系列接口。
 
 模型分配接口保留 `tts_profile_id`（当前 TTS 语音配置 ID）用于读取和恢复现有配置。请求可以省略该字段以沿用已保存的配置；尝试更换时会被拒绝。
