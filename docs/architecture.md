@@ -230,4 +230,4 @@ none → kws standby → asr active → kws standby → none
 | Shadow | `ShadowRuntime` 是单一运行实例；`projection.py` 共享只读上下文与状态观察投影，`tool_loop.py` 实现工具调用、结果入账与事件发布，供原生 Shadow 和 DSH 桥接使用。 |
 | 前端 | `voiceTerminalProjection.ts` 负责服务端消息解析和快照投影，`normalization.ts` 负责产品设置与模型列表归一化；两处重复的 `isRecord`（对象类型收窄函数）已统一到 `record.ts`。语音与 Shadow 的上下文投影语义不同，不能合并。 |
 | DSH | `protocol.ts` 负责桥接协议校验、鉴权和响应；`index.ts` 继续负责会话绑定、观察者和工具注册。 |
-| 本地 TTS | CosyVoice（本地语音合成）实现与脚本归档到 Git（版本控制）的已退休本地语音历史，当前产品仅实例化 MiniMax 在线客户端；`tts/router.py` 保留未来接入本地后端的事务兼容层。历史本地设置继续归一化为在线模式，旧 `tts_worker` 状态字段固定报告 `stopped`（已停止）。 |
+| 本地 TTS | 两种后端并存：MiniMax 在线客户端（默认）与 `providers/audio_cpp_tts.py` 承载的本地 VoxCPM（`voxcpm1` 兼容路由名，`local_model` 选择第一代或第二代）。`tts/router.py` 的兼容路由在本地后端下绑定本地客户端并在租约清零后释放，`tts/voices.py` 按模型维护独立音色库。CosyVoice（本地语音合成）实现与脚本归档到 Git（版本控制）的已退休历史，旧 `cosyvoice` 设置归一化为在线模式，旧 `tts_worker` 状态字段固定报告 `stopped`（已停止）；本地合成由 audio.cpp（原生音频推理框架）服务承担，不创建 Python 侧工作进程。 |

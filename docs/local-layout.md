@@ -22,12 +22,19 @@
    ├─ models/                          当前必要模型集合
    ├─ data/                            真实持久数据
    ├─ backups/user-data/               最多一份滚动持久数据备份
-   ├─ build/desktop/、frontend/、dsh/   唯一受控构建缓存
+   ├─ build/desktop/product/           唯一原生依赖编译缓存，正式程序与安装器共用
+   ├─ build/desktop/installer/         安装器构建戳与产物
+   ├─ build/desktop/installer-qualification/ 隔离验收安装器构建戳与产物
+   ├─ build/desktop/debug/             演示调试宿主
+   ├─ build/program-package/           统一正式程序包
+   ├─ build/dsh/、frontend/、tools/     代理宿主、界面与工具构建缓存
    ├─ tools/rust/、testing/            原生工具链及轻量测试工具
    ├─ cache/                           日志、渲染配置及可回收缓存
    ├─ tmp/                             更新与测试暂存
    └─ releases/                        明确导出的最新交付包
 ```
+
+原生构建只有一个受控目标目录 `.local/build/desktop/product`：正式程序与安装器复用同一份依赖编译缓存，构建戳按入口职责分别写入同级的 `installer/` 与 `installer-qualification/`。旧渠道架构的 `development`、`distribution`、`distribution-qualification` 目录，以及源码树内的 `apps/desktop/target`，均已清退且不再创建；源码目录下不应出现第二套原生编译输出。
 
 `schema=2`（第二版格式）的路径字段固定如下。构建编号和 SHA-256（内容摘要）只进入清单；它们不参与目录命名。
 

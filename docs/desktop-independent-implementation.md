@@ -106,11 +106,11 @@ npm run desktop:dist         # 正式分发单 EXE（程序入口）
 npm run desktop:dist -- -Qualification # 独立验收单 EXE（程序入口）
 ```
 
-`desktop:dist`（分发构建）准备工具、界面及内嵌本体，静态链接必要 C++（原生代码）运行库，最后校验渠道与本体摘要。`-SourceBase`（后续发布来源）保留为将来更新参数；首次展开不使用。`-SkipDesktopBuild`（复用已编译宿主）要求当前本体摘要与构建戳一致。
+`desktop:dist`（分发构建）准备工具、界面及内嵌本体，静态链接必要 C++（原生代码）运行库，最后校验渠道与本体摘要。`-SourceBase`（后续发布来源）与 `-SkipDesktopBuild`（复用已编译宿主）是该轮当时的 `desktop:dist` 参数，渠道改造后已从 `scripts/distribute-desktop.ps1` 移除；当前开关为 `-Qualification`、`-SkipProductBuild` 与 `-SkipInstallerBuild`，见[统一正式程序与分发安装器](unified-product-installer.md)。
 
 构建依赖当前已验证的开发基线、锁定下载组件和压缩工具。少量随包依赖及私有解释器动态库从该基线准备；从干净源码设备复现构建前需要准备这些开发资源。本轮未执行干净构建机验收。
 
-| 产物 | 当前仓库中的位置 |
+| 产物 | 该轮验收时的位置（历史记录，不代表当前布局） |
 | --- | --- |
 | 开发桌面与根入口 | `.local/build/desktop/development/release` |
 | 正式分发入口 | `.local/releases/distribution-single-exe/VoiceTerminal.exe` |
