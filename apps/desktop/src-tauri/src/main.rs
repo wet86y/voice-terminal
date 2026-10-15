@@ -95,9 +95,9 @@ fn frontend_capability(mode: FrontendMode, normalized_origin: &str, epoch: u64) 
     }
 }
 
-/// floating_capability（悬浮窗权限）：仅授权本实例悬浮窗读取状态、订阅更新和切回主界面。
+/// floating_capability（悬浮窗权限）：仅授权本实例悬浮窗展示、输入启停及窗口交互。
 fn floating_capability(normalized_origin: &str, epoch: u64) -> serde_json::Value {
-    serde_json::json!({"identifier":format!("owned-floating-{epoch}"), "description":"当前实例悬浮窗的只读动效与窗口切换权限", "local":false,"windows":["floating"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-get-floating-model","allow-return-to-workbench","allow-start-floating-drag","core:event:allow-listen","core:event:allow-unlisten"]})
+    serde_json::json!({"identifier":format!("owned-floating-{epoch}"), "description":"当前实例悬浮窗的展示、语音输入与窗口切换权限", "local":false,"windows":["floating"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-get-floating-model","allow-return-to-workbench","allow-start-floating-drag","allow-control-floating-session","core:event:allow-listen","core:event:allow-unlisten"]})
 }
 
 /// floating_publisher_capability（悬浮窗状态发布权限）：主窗口只能更新浮窗展示快照。
@@ -348,9 +348,14 @@ fn create_floating_window(app: &tauri::AppHandle, state: &Desktop) -> Result<Web
     let page_state = navigation_state.clone();
     let window = WebviewWindowBuilder::new(app, "floating", WebviewUrl::External(url))
         .title("Voice Terminal · 悬浮窗")
-        .inner_size(300., 282.)
+        // 主体占位由 300×282 缩为 150×141，底部另留 39 像素单行字幕空间。
+        .inner_size(150., 180.)
         .resizable(false)
         .decorations(false)
+        .transparent(true)
+        .background_color(tauri::window::Color(0, 0, 0, 0))
+        .shadow(false)
+        .initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU)
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false)
@@ -382,6 +387,25 @@ fn create_floating_window(app: &tauri::AppHandle, state: &Desktop) -> Result<Web
     Ok(window)
 }
 
+/// floating_caption_projection（纯语音字幕边界）：未知消息或截图附件不进入悬浮窗。
+fn floating_caption_projection(value: Option<&serde_json::Value>) -> serde_json::Value {
+    (|| {
+        let item = value?.as_object()?;
+        if item.contains_key("attachments") || item.contains_key("images") { return None; }
+        let role = item.get("role")?.as_str()?;
+        if !["user", "assistant"].contains(&role) { return None; }
+        let key = item.get("key")?.as_str()?;
+        let text = item.get("text")?.as_str()?;
+        let length = text.encode_utf16().count() as u64;
+        if text.trim().is_empty() || length > 32000 || key.len() > 512 { return None; }
+        let start = item.get("focusStart")?.as_u64()?;
+        let end = item.get("focusEnd")?.as_u64()?;
+        if start > end || end > length { return None; }
+        Some(serde_json::json!({"key":key,"role":role,"text":text,"focusStart":start,"focusEnd":end,
+            "active":item.get("active").and_then(serde_json::Value::as_bool).unwrap_or(false)}))
+    })().unwrap_or(serde_json::Value::Null)
+}
+
 #[tauri::command(rename_all = "snake_case")]
 fn publish_floating_model(
     window: WebviewWindow,
@@ -408,9 +432,14 @@ fn publish_floating_model(
     let revision = state.floating_revision.fetch_add(1, Ordering::AcqRel) + 1;
     let projection = serde_json::json!({
         "revision": revision,
+        // doubleClickMs（系统双击间隔）：尊重慢速双击设置，不提前执行首击。
+        "doubleClickMs": floating_double_click_ms(),
         "state": status,
         "sessionActive": session_active,
         "audioLevels": normalized_levels,
+        "silenced": model.get("silenced").and_then(serde_json::Value::as_bool).unwrap_or(!session_active),
+        "canControl": model.get("canControl").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        "caption": floating_caption_projection(model.get("caption")),
     });
     *state.floating_model.lock().map_err(|error| error.to_string())? = projection.clone();
     let _ = app.emit_to("floating", "voice-terminal:floating-model", projection);
@@ -423,10 +452,26 @@ fn get_floating_model(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) 
     Ok(state.floating_model.lock().map_err(|error| error.to_string())?.clone())
 }
 
+fn floating_double_click_ms() -> u32 {
+    #[cfg(windows)]
+    { unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime().clamp(500, 5000) } }
+    #[cfg(not(windows))]
+    { 500 }
+}
+
 #[tauri::command]
 fn return_to_workbench(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<(), String> {
     trusted_floating(&window, &state)?;
+    window.app_handle().emit_to("main", "voice-terminal:floating-workbench", ()).map_err(|error| error.to_string())?;
     set_floating_mode(&window.app_handle(), &state, false)
+}
+
+#[tauri::command]
+fn control_floating_session(window: WebviewWindow, state: tauri::State<Arc<Desktop>>, action: String) -> Result<(), String> {
+    trusted_floating(&window, &state)?;
+    if !["silence", "start"].contains(&action.as_str()) { return Err("悬浮窗语音操作无效。".into()); }
+    if !state.floating_mode.load(Ordering::Acquire) { return Err("悬浮窗尚未启用。".into()); }
+    window.app_handle().emit_to("main", "voice-terminal:floating-control", action).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1032,6 +1077,7 @@ fn create_window(app:&tauri::AppHandle,build_state:Arc<Desktop>,management:bool)
             let page_state = build_state.clone();
             let main_window =
                 WebviewWindowBuilder::new(app, if pending {"startup"}else{"main"}, WebviewUrl::App(if management {"management.html".into()}else{"startup.html".into()}))
+                    .initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU)
                     .title(if build_state.mode == FrontendMode::UiPreview {
                         "Voice Terminal · 前端演示（无业务后端）"
                     } else {
@@ -1152,7 +1198,7 @@ fn run() -> Result<(), String> {
         floating_ready: AtomicBool::new(false),
         floating_transition: Mutex::new(()),
         floating_revision: AtomicU64::new(0),
-        floating_model: Mutex::new(serde_json::json!({"revision":0,"state":"standby","sessionActive":false,"audioLevels":[0,0,0,0,0]})),
+        floating_model: Mutex::new(serde_json::json!({"revision":0,"doubleClickMs":floating_double_click_ms(),"state":"standby","sessionActive":false,"audioLevels":[0,0,0,0,0],"silenced":true,"canControl":false,"caption":null})),
         floating_menu: Mutex::new(None),
     });
     // qualification-exit（验收正常退出）只接受独立验收配置，沿用实例自己的退出流程。
@@ -1179,7 +1225,7 @@ fn run() -> Result<(), String> {
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
             desktop_status,desktop_page_ready,
-            publish_floating_model,get_floating_model,return_to_workbench,start_floating_drag,
+            publish_floating_model,get_floating_model,return_to_workbench,start_floating_drag,control_floating_session,
             skip_startup,
             open_logs,
             open_console,
@@ -1364,7 +1410,7 @@ mod tests {
         authority.add_capability(floating_capability(origin_text, 9).to_string()).unwrap();
         authority.add_capability(floating_publisher_capability(origin_text, 9).to_string()).unwrap();
 
-        for command in ["get_floating_model", "return_to_workbench", "start_floating_drag"] {
+        for command in ["get_floating_model", "return_to_workbench", "start_floating_drag", "control_floating_session"] {
             assert!(authority.resolve_access(command, "floating", "floating", &origin).is_some(), "悬浮窗缺少受限权限：{command}");
             assert!(authority.resolve_access(command, "main", "main", &origin).is_none(), "主窗口不应拥有悬浮窗专属权限：{command}");
             let foreign = tauri::ipc::Origin::Remote { url: tauri::Url::parse("http://127.0.0.1:45002/floating.html").unwrap() };
@@ -1373,6 +1419,19 @@ mod tests {
         assert!(authority.resolve_access("publish_floating_model", "main", "main", &origin).is_some());
         assert!(authority.resolve_access("publish_floating_model", "floating", "floating", &origin).is_none());
         assert!(authority.resolve_access("exit_application", "floating", "floating", &origin).is_none());
+    }
+
+    #[test]
+    fn floating_captions_reject_images_and_invalid_text_boundaries() {
+        let valid = serde_json::json!({"key":"speech:1","role":"assistant","text":"你😊好","focusStart":1,"focusEnd":3,"active":true});
+        assert_eq!(super::floating_caption_projection(Some(&valid)), valid);
+        for invalid in [
+            serde_json::json!({"key":"image:1","role":"tool","text":"截图","focusStart":0,"focusEnd":2}),
+            serde_json::json!({"key":"speech:1","role":"assistant","text":"截图","focusStart":0,"focusEnd":2,"attachments":[]}),
+            serde_json::json!({"key":"speech:1","role":"assistant","text":"你好","focusStart":0,"focusEnd":3}),
+            serde_json::json!({"key":"speech:1","role":"assistant","text":" ","focusStart":0,"focusEnd":1}),
+        ] { assert!(super::floating_caption_projection(Some(&invalid)).is_null()); }
+        assert!(super::floating_caption_projection(None).is_null());
     }
 
     #[test]

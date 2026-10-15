@@ -4,29 +4,103 @@ body,
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-}
-
-body {
-  background: #171a22;
+  background: transparent;
 }
 
 .floating-window-shell {
   width: 100%;
   height: 100%;
   display: grid;
-  place-items: center;
-  overflow: hidden;
-  background: #171a22;
-  cursor: move;
+  grid-template-rows: 141px 39px;
+  justify-items: center;
+  align-content: start;
+  background: transparent;
+  user-select: none;
 }
 
-.floating-window-shell > .orb-stage {
+.floating-orb-control {
   width: 100%;
-  height: 100%;
-  --orb-size: 140px;
-  --wave-height: 42px;
+  height: 141px;
+  border: 0;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  touch-action: none;
+  cursor: pointer;
+}
+.floating-orb-control.dragging { cursor: grabbing; }
+.floating-orb-control:focus-visible { outline-offset: -5px; border-radius: 14px; }
+.floating-orb-control > .orb-stage {
+  /* scale（整体缩放）：共享主页组件的全部颜色、波纹、跳动和状态尺寸，不另写一套动效。 */
+  width: 200%;
+  height: 200%;
+  transform: scale(0.5);
+  transform-origin: top left;
 }
 
-.floating-window-shell > .orb-stage.session-active {
-  --orb-size: 140px;
+.floating-caption {
+  /* caption-fill（气泡底色）、caption-line（气泡边线）：与主页配色协调。 */
+  --caption-fill: var(--panel-soft);
+  --caption-line: var(--line);
+  display: flex;
+  width: fit-content;
+  max-width: calc(100% - 24px);
+  min-width: 0;
+  align-self: start;
+  margin-top: -8px; /* 气泡整体上移，靠近悬浮主体。 */
+}
+.floating-caption-user {
+  --caption-fill: #2c334c;
+  --caption-line: #b2baff30;
+}
+.floating-caption-bubble {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  min-width: 32px;
+  padding: 6px 9px;
+  border: 1px solid var(--caption-line);
+  border-radius: 9px;
+  background: var(--caption-fill);
+  box-shadow: 0 3px 10px #00000024;
+}
+.floating-caption-tail {
+  /* 助手尾巴固定在气泡左上端，尾尖和两侧均用圆弧过渡。 */
+  position: absolute;
+  top: -15px;
+  left: 2px;
+  width: 24px;
+  height: 16px;
+  fill: var(--caption-fill);
+  stroke: var(--caption-line);
+  stroke-width: 1;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  overflow: visible;
+  pointer-events: none;
+}
+.floating-caption-user .floating-caption-tail {
+  /* 用户尾巴固定在气泡右上端，正文增长或滚动均不改变端部锚点。 */
+  left: auto;
+  right: 2px;
+  transform: scaleX(-1);
+}
+.floating-caption-viewport {
+  max-width: 100%;
+  overflow: hidden;
+  white-space: pre;
+  font-size: 12px;
+  line-height: 18px;
+  scrollbar-width: none;
+}
+.floating-caption-viewport::-webkit-scrollbar { display: none; }
+.floating-caption-track { display: inline-block; position: relative; white-space: pre; }
+.floating-caption-focus { display: inline-block; color: var(--text); }
+.floating-caption-enter-active,
+.floating-caption-leave-active { transition: opacity 140ms, transform 140ms; }
+.floating-caption-enter-from,
+.floating-caption-leave-to { opacity: 0; transform: translateY(4px); }
+@media (prefers-reduced-motion: reduce) {
+  .floating-caption-enter-active,
+  .floating-caption-leave-active { transition: none; }
 }

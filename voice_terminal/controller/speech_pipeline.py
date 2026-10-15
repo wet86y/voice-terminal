@@ -258,6 +258,10 @@ class SpeechPipeline:
                     audio_played_ms=int(snapshot["played_ms"]),
                     audio_output_estimated_ms=int(snapshot["output_estimated_ms"]),
                     audio_remaining_ms=int(snapshot["remaining_ms"]),
+                    # playback_caption（实时语音字幕）：不包含聊天工具消息和截图附件。
+                    playback_caption=resolver.caption_progress(
+                        snapshot, handle.text if handle is not None else "".join(parts)
+                    ),
                     pacing_enabled=lead_window_enabled,
                     segment_waits_enabled=segment_waits_enabled,
                     sentence_window_enabled=sentence_window_enabled,

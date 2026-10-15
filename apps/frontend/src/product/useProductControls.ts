@@ -16,6 +16,8 @@ import type { WorkbenchModel } from "../interface/workbench";
 import { userMessageKey } from "./conversation-identity";
 import { productApi } from './api';
 import { useHotwordSettings } from './useHotwordSettings';
+import { useFloatingWindowProjection } from './useFloatingWindowProjection';
+import type { FloatingSessionAction } from './floating-window';
 
 /** useProductControls（页面控件组合逻辑）：复用业务适配器并集中保留表单和录音生命周期。 */
 export function useProductControls() {
@@ -1515,6 +1517,12 @@ export function useProductControls() {
     if (coreStarting.value) return false;
     return performRuntimeAction();
   }
+  function floatingSessionAction(action: FloatingSessionAction) {
+    if (action === 'silence') return voice.setListening(false);
+    if (action !== 'start' || voice.listening.value || coreUnavailable.value || coreStarting.value
+      || !applicationHost.businessReady.value || applicationSnapshot.value?.startup_complete === false) return false;
+    return voice.setListening(true);
+  }
   // workbenchConversation（消息呈现缓存）：实时音量更新不重新映射聊天条目。
   const workbenchConversation = computed(() => {
     const conversation: WorkbenchModel["conversation"] =
@@ -1651,8 +1659,11 @@ export function useProductControls() {
     };
   });
 
+  const floatingModel = useFloatingWindowProjection(voice, workbenchModel);
   return {
     ...hotwordControls,
+    floatingModel,
+    floatingSessionAction,
     current,
     decideDshApproval,
     applicationSnapshot,

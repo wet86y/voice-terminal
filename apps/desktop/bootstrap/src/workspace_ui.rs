@@ -121,6 +121,7 @@ pub fn run(task: PathBuf, locator: Locator) -> Result<(), String> {
         .setup(move |app| {
             let handle = app.handle().clone();
             let window = WebviewWindowBuilder::new(app, "startup", WebviewUrl::App("index.html".into()))
+                .initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU)
                 .title("Voice Terminal · 程序迁移中").inner_size(1000., 640.).min_inner_size(400., 480.)
                 .incognito(true).data_directory(window_cache)
                 .on_navigation(|url| ["/", "/index.html"].contains(&url.path())

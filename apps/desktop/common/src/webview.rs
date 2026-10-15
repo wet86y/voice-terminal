@@ -2,6 +2,9 @@
 pub const ONLINE: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
 pub const OFFLINE: &str = "https://developer.microsoft.com/microsoft-edge/webview2/#download-section";
 
+/// DISABLE_CONTEXT_MENU（禁用网页右键菜单）：在页面脚本运行前覆盖所有程序窗口。
+pub const DISABLE_CONTEXT_MENU: &str = "document.addEventListener('contextmenu', event => event.preventDefault(), { capture: true });";
+
 pub fn version() -> Option<String> {
     #[cfg(windows)] unsafe {
         use windows_sys::Win32::System::Registry::*;
