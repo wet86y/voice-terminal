@@ -20,7 +20,13 @@ from uuid import uuid4
 
 MAX_IMPORT_BYTES = 20 * 1024 * 1024
 MAX_REFERENCE_SECONDS = 15.0
-MIN_REFERENCE_SECONDS = 3.0
+# MIN_REFERENCE_SECONDS（参考音频下限）：官方「5 秒规则」要求至少 5 秒，
+# 并给出 5–30 秒的实用区间；低于 5 秒的音色质量官方不背书。
+# 上限 15 秒不是模型限制：audio.cpp 的 AudioVAE 编码器预留容量
+# `encoder_sample_capacity = 240000`（16 kHz × 15 秒）是硬上限，超出即抛错；
+# 可用会话选项 `voxcpm2.audiovae_encoder_sample_capacity` 提高（实测 960000
+# 可处理 30 秒参考音频），但会增大编码器图与显存占用，故默认保持 15 秒。
+MIN_REFERENCE_SECONDS = 5.0
 ALLOWED_IMPORT_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg"}
 VOICE_MODELS = {"voxcpm1", "voxcpm2"}
 _ID_RE = re.compile(r"^[a-f0-9]{32}$")
@@ -74,8 +80,8 @@ def _collapse_description(value: Any, field: str, limit: int) -> str:
     result = " ".join(value.strip().split())
     if len(result) > limit:
         raise VoiceLibraryError(f"{field}（描述）最多为 {limit} 个字符。")
-    if "(" in result or ")" in result:
-        raise VoiceLibraryError(f"{field}（描述）不能包含 ASCII 圆括号。")
+    if any(char in result for char in "()（）"):
+        raise VoiceLibraryError(f"{field}（描述）不能包含圆括号（半角 () 或全角（））。")
     return result
 
 
@@ -168,7 +174,7 @@ class VoiceLibrary:
             raise VoiceLibraryError("音频采样数据无效。")
         duration = samples.shape[0] / float(source_rate)
         if not MIN_REFERENCE_SECONDS <= duration <= MAX_REFERENCE_SECONDS:
-            raise VoiceLibraryError("导入音频长度必须为 3–15 秒。")
+            raise VoiceLibraryError("导入音频长度必须为 5–15 秒（官方建议至少 5 秒）。")
         mono = samples.mean(axis=1, dtype=np.float32)
         if source_rate != 16000:
             ratio = Fraction(16000, int(source_rate))
@@ -189,8 +195,11 @@ class VoiceLibrary:
         if not isinstance(pcm, bytes) or len(pcm) < 2 or len(pcm) % 2:
             raise VoiceLibraryError("PCM（脉冲编码音频）素材无效。")
         duration = len(pcm) / 2 / sample_rate
-        if not MIN_REFERENCE_SECONDS <= duration <= MAX_REFERENCE_SECONDS:
-            raise VoiceLibraryError("候选音频长度必须为 3–15 秒。")
+        # 生成候选不受官方"参考音频至少 5 秒"约束：试音正文本身就短，
+        # 样音只要求非空且不超过上限。它随后作为正式克隆的参考素材使用，
+        # 而编码器对短参考按零填充处理，长度不足不影响可用性。
+        if not 0.0 < duration <= MAX_REFERENCE_SECONDS:
+            raise VoiceLibraryError("候选音频长度必须大于 0 且不超过 15 秒。")
         try:
             import numpy as np
 
@@ -248,6 +257,64 @@ class VoiceLibrary:
                 destination.unlink(missing_ok=True)
                 raise
         return {"asset_id": asset_id, **updated["assets"][asset_id]}
+
+    def high_fidelity_path(self, asset_id: str) -> Path | None:
+        """high_fidelity_path（高保真素材路径）：原生采样率的旁路副本，可能不存在。
+
+        编码器固定按 16 kHz 读取，所以主素材必须是 16 kHz；但 48 kHz 原生样音
+        保留了 8 kHz 以上的带宽（VoxCPM2 实测 8–16 kHz 占 1.1%–14.4%），供后续
+        音色处理使用。缺失时返回 None，调用方回退到主素材。
+        """
+        with self._lock:
+            metadata = self._index["assets"].get(asset_id)
+            if not isinstance(metadata, dict) or not metadata.get("high_fidelity"):
+                return None
+        path = self._high_fidelity_path(asset_id)
+        return path if path.is_file() else None
+
+    def _high_fidelity_path(self, asset_id: str) -> Path:
+        return self._asset_path(asset_id).with_suffix(".hifi.wav")
+
+    def put_high_fidelity_pcm(self, asset_id: str, pcm: bytes, *, sample_rate: int,
+                              channels: int = 1) -> dict[str, Any]:
+        """保存原生采样率旁路副本；只登记元数据，主素材与索引引用不变。"""
+        if not isinstance(pcm, bytes) or len(pcm) < 2 or len(pcm) % 2:
+            raise VoiceLibraryError("PCM（脉冲编码音频）素材无效。")
+        if int(sample_rate) <= 16000 or int(channels) != 1:
+            # 16 kHz 及以下与主素材等价，单声道以外的原生样音不做旁路。
+            return {}
+        try:
+            import numpy as np
+            import soundfile as sf
+            samples = np.frombuffer(pcm, dtype="<i2")
+            output = io.BytesIO()
+            sf.write(output, samples, int(sample_rate), format="WAV", subtype="PCM_16")
+            payload = output.getvalue()
+        except Exception as exc:
+            raise VoiceLibraryError("无法写入高保真 WAV 音频素材。") from exc
+        destination = self._high_fidelity_path(asset_id)
+        temporary = self.assets_dir / f".{asset_id}.hifi.wav.tmp"
+        with self._lock:
+            if asset_id not in self._index["assets"]:
+                raise FileNotFoundError("音频素材不存在。")
+            try:
+                with temporary.open("wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, destination)
+                updated = json.loads(json.dumps(self._index))
+                updated["assets"][asset_id]["high_fidelity"] = {
+                    "sample_rate": int(sample_rate), "channels": int(channels),
+                    "duration_ms": round(len(pcm) / 2 / int(sample_rate) * 1000),
+                    "format": "wav",
+                }
+                self._save_index(updated)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                destination.unlink(missing_ok=True)
+                raise
+        return dict(updated["assets"][asset_id]["high_fidelity"])
 
     def asset_path(self, asset_id: str) -> Path:
         with self._lock:

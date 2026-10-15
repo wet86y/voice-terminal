@@ -16,7 +16,7 @@ from voice_terminal.tts.voices import (
 )
 
 
-def _wav_bytes(*, seconds: float = 4.0, sample_rate: int = 44100, channels: int = 2) -> bytes:
+def _wav_bytes(*, seconds: float = 5.0, sample_rate: int = 44100, channels: int = 2) -> bytes:
     count = round(seconds * sample_rate)
     time = np.arange(count, dtype=np.float32) / sample_rate
     sample = (0.15 * np.sin(2 * np.pi * 220 * time)).astype(np.float32)
@@ -100,14 +100,14 @@ def test_import_normalizes_stereo_rate_and_format_and_rejects_bad_sources(tmp_pa
     assert info.samplerate == 16000
     assert info.channels == 1
     assert info.subtype == "PCM_16"
-    assert 3900 <= asset["duration_ms"] <= 4100
+    assert 4900 <= asset["duration_ms"] <= 5100
     assert library.asset_bytes(asset["asset_id"]).startswith(b"RIFF")
 
     with pytest.raises(VoiceLibraryError, match="仅支持"):
         library.put_import(_wav_bytes(), "sample.aac")
     with pytest.raises(VoiceLibraryError, match="严格解码"):
         library.put_import(b"not an audio file", "sample.wav")
-    with pytest.raises(VoiceLibraryError, match="3–15"):
+    with pytest.raises(VoiceLibraryError, match="5–15"):
         library.put_import(_wav_bytes(seconds=2.5), "short.wav")
     with pytest.raises(OverflowError, match="20 MiB"):
         library.put_import(b"x" * (20 * 1024 * 1024 + 1), "large.wav")

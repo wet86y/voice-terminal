@@ -9,6 +9,12 @@ from ..tts.voices import VoiceLibraryError, ResolvedLocalTtsVoice, safe_voice_di
 
 DESIGN_SAMPLE_TEXT = "你好，很高兴认识你。现在开始测试这个音色，我会用自然的语气清楚地说话。"
 
+
+def _collapsed_text(value: Any) -> str:
+    """去掉转写首尾空白并压缩内部空白，与保存校验使用的规范化一致。"""
+    return " ".join(str(value or "").split())
+
+
 class TtsVoiceOperationError(ValueError):
     """音色后台操作无法执行。"""
 
@@ -139,23 +145,39 @@ class TtsVoiceOperationManager:
         voice = dict(operation.request["voice"])
         description = " ".join(str(voice.get("design_description") or "").split())
         source = voice.get("source_reference_asset_id") or (voice.get("reference_asset_id") if not description else None)
+        # 参考音频转写决定克隆保真度：官方把"参考音频 + 精确转写"列为最高相似度配方，
+        # 只给音频不给转写会退化为 isolated 参考通道。两种创建方式都要带上。
+        source_text = _collapsed_text(voice.get("source_reference_text") or voice.get("reference_text", ""))
         if description:
             if model != "voxcpm2":
                 raise TtsVoiceOperationError("VoxCPM1（第一代模型）不支持音色设计。")
             snapshot = library.resolve_design(description, is_preview=True)
             if source:
-                snapshot = replace(snapshot, reference_path=library.asset_path(source), reference_mode="voice")
+                snapshot = replace(snapshot, reference_path=library.asset_path(source),
+                                   reference_mode="voice", reference_text=source_text)
         else:
             snapshot = library.resolve_draft(model, {"name": voice.get("name") or "新音色", "source": "import",
-                "reference_asset_id": source, "reference_text": voice.get("source_reference_text") or voice.get("reference_text", "")})
+                "reference_asset_id": source, "reference_text": source_text})
         steps = client.inference_steps_by_model[model]  # 本次候选固定步数。
-        pcm = await self._collect_speech(operation, client, snapshot, operation.request["text"])
+        pcm, high_fidelity = await self._collect_speech(operation, client, snapshot, operation.request["text"])
         asset = await asyncio.to_thread(library.put_pcm, pcm, sample_rate=16000)
+        if high_fidelity is not None:
+            native_pcm, native_rate = high_fidelity
+            try:
+                stored = await asyncio.to_thread(
+                    library.put_high_fidelity_pcm, asset["asset_id"], native_pcm, sample_rate=native_rate)
+                if stored:
+                    asset["high_fidelity"] = stored
+            except Exception as exc:  # noqa: BLE001 - 高保真副本失败不能作废候选样音。
+                import logging
+                logging.getLogger(__name__).warning(
+                    "tts_voice.high_fidelity_store_failed asset=%s error_type=%s error=%s",
+                    asset["asset_id"], type(exc).__name__, str(exc)[:200])
         payload = {"name": voice.get("name") or "新音色", "source": "design" if description else "import",
             "reference_asset_id": asset["asset_id"] if description else source,
             "reference_text": operation.request["text"] if description else snapshot.reference_text,
             "source_reference_asset_id": source if description else None,
-            "source_reference_text": voice.get("source_reference_text", ""),
+            "source_reference_text": source_text,
             "design_description": description, "design_text": operation.request["text"],
             "design_model": "voxcpm2", "inference_steps": steps}
         if description:
@@ -166,7 +188,12 @@ class TtsVoiceOperationManager:
         return operation.result
 
     async def _collect_speech(self, operation: VoiceOperation, client, snapshot: ResolvedLocalTtsVoice,
-                              text: str) -> bytes:
+                              text: str) -> tuple[bytes, tuple[bytes, int] | None]:
+        """返回 (16 kHz 编码器素材, 原生率高保真副本或 None)。
+
+        编码器固定读 16 kHz，所以主素材必须是 16 kHz；原生 48 kHz 样音另存
+        一份，保留 8 kHz 以上带宽供后续音色处理。
+        """
         session = client.session(voice_snapshot=snapshot, preview=True)
         operation.session = session
         output = bytearray()
@@ -184,13 +211,15 @@ class TtsVoiceOperationManager:
             await session.finish()
             await reader
             rate = int(getattr(client, "sample_rate", 16000))
+            native = bytes(output)
             if rate != 16000:
                 import numpy as np
                 import soxr
-                # 音色库固定保存16千赫素材；播放时按当前设备时钟转换。
-                samples = np.frombuffer(output, dtype="<i2")
-                return soxr.resample(samples, rate, 16000, quality="HQ").astype("<i2", copy=False).tobytes()
-            return bytes(output)
+                # 音色库主素材固定 16 kHz；播放时按当前设备时钟转换。
+                samples = np.frombuffer(native, dtype="<i2")
+                converted = soxr.resample(samples, rate, 16000, quality="HQ").astype("<i2", copy=False).tobytes()
+                return converted, (native, rate)
+            return native, None
         except BaseException:
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)

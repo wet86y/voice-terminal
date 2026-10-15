@@ -30,7 +30,8 @@ def test_preview_modes_can_save_and_reload_with_optional_source_and_transcript(t
         async def synthesize(operation, local_client, snapshot, text):
             snapshots.append(snapshot)
             assert local_client is client and text == "目标样音正文。"
-            return b"\x00\x01" * (16000 * 4)
+            # 返回 (16 kHz 编码器素材, 原生率高保真副本或 None)。
+            return b"\x00\x01" * (16000 * 4), None
 
         async def play(operation):
             return {"asset_id": operation.request["asset_id"]}

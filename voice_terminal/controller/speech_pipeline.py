@@ -169,10 +169,22 @@ class SpeechPipeline:
         if self.player:
             self.player.allow(playback_key)
             configure_buffer = getattr(self.player, "configure_stream_buffer", None)
-            if callable(configure_buffer) and getattr(tts_client, "playback_startup_buffer_ms", 0):
-                configure_buffer(playback_key,
-                    startup_ms=min(self.options.tts_local_buffer_ms, tts_client.playback_startup_buffer_ms),
-                    resume_ms=min(self.options.tts_local_buffer_ms, tts_client.playback_resume_buffer_ms))
+            startup_ms = int(getattr(tts_client, "playback_startup_buffer_ms", 0) or 0)
+            if callable(configure_buffer) and startup_ms > 0:
+                resume_ms = int(getattr(tts_client, "playback_resume_buffer_ms", 0) or 0)
+                armed_startup = min(self.options.tts_local_buffer_ms, startup_ms)
+                armed_resume = min(self.options.tts_local_buffer_ms, resume_ms) if resume_ms > 0 else 0
+                configure_buffer(playback_key, startup_ms=armed_startup, resume_ms=armed_resume)
+                # 装配必须留痕：此前守卫取到 0 时静默跳过，现场只能看到
+                # "152 毫秒就起播"这个结果，无法反查原因。
+                logger.info("audio.player_stream_buffer_armed key=%s startup_ms=%d resume_ms=%d "
+                            "client=%s", playback_key, armed_startup, armed_resume,
+                            type(tts_client).__name__)
+            else:
+                # 在线后端按服务端节奏起播，本地下行才需要储备闸门。
+                logger.debug("audio.player_stream_buffer_skipped key=%s startup_ms=%d callable=%s "
+                             "client=%s", playback_key, startup_ms, callable(configure_buffer),
+                             type(tts_client).__name__)
             if handle is not None and getattr(handle, "playback_ready", None) is not None and not handle.playback_ready.is_set():
                 hold = getattr(self.player, "hold", None)
                 if callable(hold):
