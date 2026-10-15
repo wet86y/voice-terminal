@@ -15,7 +15,7 @@ pub async fn model_credentials_status(window:WebviewWindow,desktop:State<'_,Arc<
     tauri::async_runtime::spawn_blocking(move||{
         let _guard=desktop.credentials_guard.lock().map_err(|_|"接口配置锁不可用。")?;
         let context=desktop.context().ok_or("请先选择工作区。")?;
-        credentials::status(&context.data)
+        credentials::status_for_context(&context)
     }).await.map_err(|_|"接口配置状态读取失败。".to_string())?
 }
 #[tauri::command]
@@ -27,6 +27,7 @@ pub async fn model_credentials_save(window:WebviewWindow,desktop:State<'_,Arc<De
         if desktop.service.lock().map_err(|_|"服务状态锁不可用。")?.is_some(){return Err("程序已经启动，请在程序的模型管理页更新接口密钥。".into());}
         if desktop.workspace_busy.load(std::sync::atomic::Ordering::Acquire){return Err("正在切换工作区，请稍后保存接口密钥。".into());}
         let context=desktop.context().ok_or("请先选择工作区。")?;
-        credentials::save(&context.data,request)
+        credentials::save(&context.data,request)?;
+        credentials::status_for_context(&context)
     }).await.map_err(|_|"接口密钥保存失败。".to_string())?
 }

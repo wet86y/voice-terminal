@@ -214,3 +214,46 @@ def test_combined_design_keeps_source_and_target_assets_across_reload_and_cleanu
     assert restored.list_voices()[0]['source_reference_duration_ms'] == source['duration_ms']
     with pytest.raises(FileNotFoundError, match='克隆源'):
         restored.create_voice({**saved, 'source_reference_asset_id': 'f' * 32})
+
+
+def test_default_seed_repairs_missing_asset_without_changing_voice_selection(tmp_path):
+    library = VoiceLibrary(tmp_path / "voices", model="voxcpm1")
+    voice = library.register_default(_wav_bytes(), "默认素材准确转写。")
+    selected = library.active_selection
+    asset = library.asset_path(voice["reference_asset_id"])
+    original = asset.read_bytes()
+    asset.unlink()
+    restored = VoiceLibrary(tmp_path / "voices", model="voxcpm1")
+    restored.register_default(_wav_bytes(), "默认素材准确转写。")
+    assert restored.active_selection == selected
+    assert len(restored.list_voices()) == 1
+    assert restored.resolve("voxcpm1", selected).reference_path.read_bytes() == original
+
+
+def test_default_repair_preserves_custom_active_voice(tmp_path):
+    library = VoiceLibrary(tmp_path / "voices", model="voxcpm2")
+    default = library.register_default(_wav_bytes(), "默认素材准确转写。")
+    _, custom = _create_voice(library)
+    selected = {"voice_id": custom["id"], "revision": custom["revision"]}
+    library.activate(selected)
+    library.asset_path(default["reference_asset_id"]).unlink()
+    library.register_default(_wav_bytes(), "默认素材准确转写。")
+    assert library.active_selection == selected
+
+
+def test_missing_modified_default_is_not_replaced_with_unrelated_seed(tmp_path):
+    library = VoiceLibrary(tmp_path / "voices", model="voxcpm1")
+    voice = library.register_default(_wav_bytes(), "原素材转写。")
+    library.asset_path(voice["reference_asset_id"]).unlink()
+    with pytest.raises(VoiceLibraryError, match="重新导入原参考音频"):
+        library.register_default(_wav_bytes(), "不同素材转写。")
+
+
+def test_default_repair_does_not_replace_a_user_reference_with_the_same_transcript(tmp_path):
+    library = VoiceLibrary(tmp_path / "voices", model="voxcpm1")
+    voice = library.register_default(_wav_bytes(), "相同转写。")
+    imported = library.put_import(_wav_bytes(seconds=5), "custom.wav")
+    library.update_voice(voice["id"], 1, {**voice, "reference_asset_id": imported["asset_id"]})
+    library.asset_path(imported["asset_id"]).unlink()
+    with pytest.raises(VoiceLibraryError, match="重新导入原参考音频"):
+        library.register_default(_wav_bytes(), "相同转写。")

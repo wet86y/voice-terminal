@@ -110,6 +110,7 @@ pub struct ResourceManager {
     reviews: Mutex<HashMap<String,bool>>, // reviews（用户对导入内容的选择）。
     activation: Mutex<()>, // activation（仅串行化资源启用；下载、解包与校验不占锁）。
     environment: Mutex<()>, // environment（串行化完整语音环境的复制、组装与导入；模型下载仍可并行）。
+    tts_runtime: Mutex<()>, // tts_runtime（串行化两款模型共用原生运行包的下载、补丁及启用）。
     resume_pending: Mutex<bool>, // resume_pending（先前运行服务的延迟恢复意图；全部资源更新完成后才恢复）。
     validation_failures:Mutex<HashMap<String,String>>, // validation_failures（本次启动的完整校验失败）：管理页不能以字节数盘点掩盖同长度损坏。
     prepared_environment:Mutex<Option<PreparedEnvironment>>, // prepared_environment（本次任务已验证的共享环境）：启动仍做全量摘要复核。
@@ -137,6 +138,7 @@ impl ResourceManager {
             jobs_path,
             activation: Mutex::new(()),
             environment: Mutex::new(()),
+            tts_runtime: Mutex::new(()),
             reviews: Mutex::new(HashMap::new()),
             resume_pending: Mutex::new(false),
             validation_failures:Mutex::new(HashMap::new()),
@@ -153,12 +155,13 @@ impl ResourceManager {
         for row in &mut rows{if let Some(reason)=row["resource_id"].as_str().and_then(|id|failures.get(id)){
             row["can_start"]=json!(false);row["files_installed"]=json!(false);row["installation_state"]=json!("incomplete");row["error"]=json!(reason);
         }}
+        voice_desktop_common::resources::update_tts_readiness(&self.context,&mut rows)?;
         if rows.iter().skip(1).any(|row|row["required"]!=false&&row["can_start"]!=true){if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);}}
         Ok(rows)
     }
     pub fn record_validation(&self,readiness:&Value){
         if let Ok(mut failures)=self.validation_failures.lock(){failures.clear();
-            for row in readiness["missing"].as_array().into_iter().flatten(){
+            for row in readiness["missing"].as_array().into_iter().flatten().chain(readiness["invalid_resources"].as_array().into_iter().flatten()){
                 if let (Some(id),Some(reason))=(row["resource_id"].as_str(),row["reason"].as_str()){
                     if reason.contains("完整摘要复核失败"){failures.insert(id.to_owned(),reason.to_owned());}
                 }
@@ -394,6 +397,18 @@ impl ResourceManager {
         // dependency_group（依赖组）模型先校验并配置完整运行环境，再下载自身模型文件。
         let mut installed=self.configure_resource_dependencies(job_id,resource_id,cancel.clone(),&mut progress)
             .map_err(|message|JobError::Failed{message,installed:vec![]})?;
+        let item=voice_desktop_common::resources::spec(&self.context,resource_id)
+            .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+        if let Some(shared)=item["runtime_resource"].as_str(){
+            let _shared=acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress)
+                .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+            let result=voice_desktop_common::resources::download_resource_with_activation(&self.context,shared,cancel.clone(),&mut progress,
+                &mut|stage,relative|self.activate_resource(job_id,stage,relative))
+                .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+            installed.extend(result);
+        }
+        let _shared=if resource_id=="tts-audiocpp-runtime"{Some(acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress)
+            .map_err(|message|JobError::Failed{message,installed:installed.clone()})?)}else{None};
         let result=voice_desktop_common::resources::download_resource_with_activation(&self.context,resource_id,cancel,&mut progress,&mut|stage,relative|self.activate_resource(job_id,stage,relative))
             .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
         installed.extend(result);Ok(installed)

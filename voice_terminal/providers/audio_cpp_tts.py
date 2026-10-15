@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -56,6 +57,62 @@ class AudioCppTtsError(RuntimeError):
 
 class AudioCppTtsServer:
     """启动和管理本机 audio.cpp（原生音频推理框架）TTS 服务。"""
+
+    @classmethod
+    def runtime_directory(cls, runtime_root: Path) -> Path:
+        """runtime_directory（原生运行目录）：优先使用组件安装目录，兼容此前迁入的资源。"""
+        root = Path(runtime_root).resolve()
+        managed = root / "models/audiocpp/runtime"
+        return managed if (managed / "cuda/audiocpp_server.exe").is_file() else root / "runtimes/audiocpp"
+
+    @classmethod
+    def available_models(cls, runtime_root: Path, *, program_root: Path | None = None) -> list[str]:
+        """available_models（完整本地候选）：权重、原生程序和模型规格均存在才算可启动。"""
+        root = Path(runtime_root).resolve()
+        runtime = cls.runtime_directory(root)
+        specs = runtime / "model_specs"
+        if not specs.is_dir():
+            specs = root / "sources/audio.cpp/model_specs"
+        if not (runtime / "cuda/audiocpp_server.exe").is_file():
+            return []
+        # 正式安装具有收据：启动选路时复核内容，避免损坏的可选模型抢占仍可用的另一后端。
+        from ..model_installation import inspect_installed_model
+        if (runtime / "resource-install.json").is_file() and inspect_installed_model(
+                root / "models", "audiocpp/runtime", "tts-audiocpp-runtime", verify_hashes=True).error:
+            return []
+        result: list[str] = []
+        catalog = None
+        for key in ("voxcpm2", "voxcpm1"):
+            relative = Path("audiocpp/tts") / _MODEL_CATALOG[key]["relative_path"].parent
+            folder = root / "models" / relative
+            if not (folder / _MODEL_CATALOG[key]["relative_path"].name).is_file() or not (specs / f"{key}.json").is_file():
+                continue
+            if (folder / "resource-install.json").is_file():
+                if inspect_installed_model(root / "models", relative.as_posix(), f"tts-{key}", verify_hashes=True).error:
+                    continue
+            else:
+                # 旧迁入目录没有收据时，同样按随包清单验证，不能让损坏但仍存在的权重抢占可用后端。
+                from ..resource_distribution import ResourceCatalog, ResourceError
+                try:
+                    if catalog is None:
+                        catalog = ResourceCatalog(program_root or Path(__file__).resolve().parents[2])
+                    resource = catalog.get(f"tts-{key}")
+                    valid = True
+                    for item in resource.required_files:
+                        path = folder / item.path
+                        if not path.is_file() or path.stat().st_size != item.size_bytes:
+                            valid = False
+                            break
+                        with path.open("rb") as stream:
+                            if hashlib.file_digest(stream, "sha256").hexdigest() != item.sha256:
+                                valid = False
+                                break
+                    if not valid:
+                        continue
+                except (OSError, ResourceError):
+                    continue
+            result.append(key)
+        return result
 
     def __init__(self, runtime_root: Path, config_path: Path, *,
                  local_model: str = "voxcpm1",
@@ -127,7 +184,9 @@ class AudioCppTtsServer:
             "ui": False,  # 原生服务实际读取的界面开关；无界面管理仍支持本地模型切换。
             "ui_management": True,
             "log_request_body": False,
-            "model_spec_override": str((root / "sources" / "audio.cpp" / "model_specs").resolve()),
+            "model_spec_override": str((cls.runtime_directory(root) / "model_specs"
+                                        if (cls.runtime_directory(root) / "model_specs").is_dir()
+                                        else root / "sources/audio.cpp/model_specs").resolve()),
             "models": model_entries,
         }
         destination = Path(config_path).resolve()
@@ -314,7 +373,7 @@ class AudioCppTtsServer:
             return False
 
     def _server_binary(self) -> Path:
-        root = self.runtime_root / "runtimes" / "audiocpp" / "cuda"
+        root = self.runtime_directory(self.runtime_root) / "cuda"
         candidates = [path for path in root.rglob("audiocpp_server.exe") if path.is_file()]
         if len(candidates) != 1:
             raise AudioCppTtsError(f"需要唯一的 CUDA audio.cpp 服务程序，找到 {len(candidates)} 个：{root}")
@@ -322,7 +381,9 @@ class AudioCppTtsServer:
 
     def _start_process(self, *, log_path: Path | None = None, trace_path: Path | None = None) -> None:
         binary = self._server_binary()
-        source_root = self.runtime_root / "sources" / "audio.cpp"
+        source_root = self.runtime_directory(self.runtime_root)
+        if not (source_root / "model_specs").is_dir():
+            source_root = self.runtime_root / "sources" / "audio.cpp"
         if not source_root.is_dir():
             raise AudioCppTtsError(f"找不到 audio.cpp 源码运行目录：{source_root}")
         self._validate_model_assets(self.local_model)

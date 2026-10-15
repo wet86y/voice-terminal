@@ -27,6 +27,13 @@ def test_scoped_voice_api_and_settings_projection(tmp_path):
             default = one["active_voice"]["voice_id"]
             assert (await client.delete(f"/api/v1/tts/voices/voxcpm1/{default}")).status_code == 409
             asset = (await client.post("/api/v1/tts/assets/voxcpm1/import?filename=test.wav", content=_wav_bytes())).json()["asset"]
+            audio_url = f"/api/v1/tts/assets/voxcpm1/{asset['asset_id']}/audio"
+            audio = await client.get(audio_url)
+            assert audio.status_code == 200
+            assert audio.headers["content-type"] == "audio/wav"
+            assert audio.content == runtime.voice_library.for_model("voxcpm1").asset_bytes(asset["asset_id"])
+            missing = await client.get("/api/v1/tts/assets/voxcpm1/nonexistent/audio")
+            assert missing.status_code == 404
             payload = {"name": "自定义", "source": "import", "reference_asset_id": asset["asset_id"], "reference_text": "准确转写。"}
             foreign = await client.post("/api/v1/tts/voices/voxcpm2", json={**payload, "model": "voxcpm1"})
             assert foreign.status_code == 422
@@ -50,6 +57,18 @@ def test_scoped_voice_api_and_settings_projection(tmp_path):
                      "reference_text": "生成正文。", "design_text": "生成正文。", "design_description": "温柔女声", "inference_steps": 20}
             runtime.voice_library.for_model("voxcpm2").mark_design(target["asset_id"], stale)
             assert (await client.post("/api/v1/tts/voices/voxcpm2", json=stale)).status_code == 422
+    asyncio.run(scenario())
+
+
+def test_asset_file_missing_returns_not_found(tmp_path):
+    async def scenario():
+        runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "data")
+        library = runtime.voice_library.for_model("voxcpm2")
+        asset = library.put_import(_wav_bytes(), "reference.wav")
+        library.asset_path(asset["asset_id"]).unlink()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime)), base_url="http://test") as client:
+            response = await client.get(f"/api/v1/tts/assets/voxcpm2/{asset['asset_id']}/audio")
+            assert response.status_code == 404
     asyncio.run(scenario())
 
 

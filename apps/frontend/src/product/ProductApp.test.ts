@@ -602,7 +602,9 @@ describe('正式界面的真实控件交互', () => {
     } as unknown as ApplicationSnapshot
     await flushPromises()
     expect(wrapper.find('.voice-environment').exists()).toBe(false)
-    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(10)
+    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(11)
+    expect(wrapper.findAll('[data-component="tts"]')).toHaveLength(1)
+    expect(wrapper.find('[data-component="local-tts"]').exists()).toBe(false)
     expect(wrapper.find('[data-component="hotwords"]').exists()).toBe(true)
     expect(wrapper.find('[data-component="punctuation"]').exists()).toBe(true)
     expect(wrapper.findAll('[data-metric="memory"]')).toHaveLength(5)
@@ -771,12 +773,16 @@ describe('正式界面的真实控件交互', () => {
     ] } as unknown as ApplicationSnapshot
     await flushPromises()
     expect(wrapper.find('.voice-environment').exists()).toBe(false)
-    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(10)
+    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(11)
+    expect(wrapper.findAll('[data-component="tts"]')).toHaveLength(1)
+    expect(wrapper.find('[data-component="local-tts"]').exists()).toBe(false)
     expect(wrapper.get('.local-overview .local-state').text()).toBe('组件启动中')
     // 模型启动状态与独立原生环境管理卡片的接口错误分别核对。
     expect(wrapper.find('.local-component-list .local-error').exists()).toBe(false)
     expect(wrapper.find('.retry-action').exists()).toBe(false)
-    for (const row of wrapper.findAll('.local-component-card[data-component]')) {
+    expect(wrapper.get('[data-component="tts"] .local-component-action').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-component="tts"] .local-component-action').text()).toBe('详情')
+    for (const row of wrapper.findAll('.local-component-card[data-component]').filter(row => row.attributes('data-component') !== 'tts')) {
       expect(row.classes()).toContain('loading')
       expect(row.get('.local-state').text()).toBe('启动中')
       expect(row.get('.local-component-action').text()).toBe('启动中')

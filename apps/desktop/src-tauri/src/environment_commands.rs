@@ -10,11 +10,16 @@ pub async fn resource_install_plan(window:WebviewWindow,desktop:State<'_,Arc<Des
     tauri::async_runtime::spawn_blocking(move||{
         if resource_id=="voice-server"{return Ok(json!({"resource_id":resource_id,"title":"Voice Server（语音服务）运行环境","model_bytes":0,"environment":runtime::plan(&context,"all")?,
             "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型文件下载字节数","environment":"完整语音运行环境安装计划"}}));}
-        let spec=resources::spec(&context,&resource_id)?;let artifact=&spec["source"]["transfer"]["artifact"];
-        let model_bytes=artifact["size_bytes"].as_u64().unwrap_or_else(||spec["files"].as_array().into_iter().flatten().filter(|v|v["optional"]!=true&&!v["asset"].is_string()).map(|v|v["size_bytes"].as_u64().unwrap_or(0)).sum());
+        let spec=resources::spec(&context,&resource_id)?;
+        let model_bytes=resources::download_bytes(&spec);
+        let mut shared_resources=vec![];
+        if let Some(shared)=spec["runtime_resource"].as_str(){
+            let ready=resources::inventory(&context)?.iter().any(|row|row["resource_id"]==shared&&row["can_start"]==true);
+            if !ready{let item=resources::spec(&context,shared)?;shared_resources.push(json!({"resource_id":shared,"title":item["title"],"download_bytes":resources::download_bytes(&item)}));}
+        }
         let environment=if spec["dependency_group"].as_str().is_some(){runtime::plan(&context,"all")?}else{Value::Null};
-        Ok(json!({"resource_id":resource_id,"title":spec["title"],"model_bytes":model_bytes,"environment":environment,
-            "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型或组件最大下载字节数","environment":"组件专用依赖组对应的完整共享运行环境更新计划；空值表示无需单独更新依赖"}}))
+        Ok(json!({"resource_id":resource_id,"title":spec["title"],"model_bytes":model_bytes,"environment":environment,"shared_resources":shared_resources,
+            "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型或组件最大下载字节数","shared_resources":"需要先安装的共用原生运行程序","download_bytes":"共用组件最大远端下载字节数","environment":"组件专用依赖组对应的完整共享运行环境更新计划；空值表示无需单独更新依赖"}}))
     }).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]

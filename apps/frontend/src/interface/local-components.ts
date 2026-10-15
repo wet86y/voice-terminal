@@ -25,6 +25,9 @@ export interface LocalComponentRow {
   note?: string
   /** resource（固定资源状态）：安装操作独立于组件健康状态。 */
   resource?: ManagedResourceRow
+  /** resourceChoices（可选下载模型）与 sharedResource（共用运行程序）：均在详情中管理。 */
+  resourceChoices?: ManagedResourceRow[]
+  sharedResource?: ManagedResourceRow
   /** location（当前运行位置）：没有可调整设备选项时显示。 */
   location?: string
   /** facts（补充指标）：label（名称）与 value（数值）。 */
