@@ -25,8 +25,10 @@ import { DEFAULT_REGISTRY, DEFAULT_SETTINGS } from './normalization'
 import { APPLICATION_EXIT_EVENT } from '../runtime/application-motion'
 const application = {
   managed: ref(false), snapshot: ref<ApplicationSnapshot | null>(null), businessReady: ref(false), overlay: ref(false),
+  corePhase: ref('starting'), runtimeFailure: ref(false),
   error: ref(''), now: ref(0), retryingAll: ref(false), connected: ref(false), inspecting: ref(false),
-  start: vi.fn(), stop: vi.fn(), inspect: vi.fn(), refresh: vi.fn(), exit: vi.fn(), retry: vi.fn(), retryFailed: vi.fn(),
+  start: vi.fn(), stop: vi.fn(), inspect: vi.fn(), refresh: vi.fn(), exit: vi.fn(), retry: vi.fn(),
+  retryCapability: vi.fn(), retryFailed: vi.fn(),
 }
 
 vi.mock('./application-host', () => ({
@@ -385,6 +387,49 @@ describe('正式界面的真实控件交互', () => {
     application.snapshot.value = { ...application.snapshot.value, startup_complete: true, state: 'ready' }
     await flushPromises()
     expect(value.workbenchModel.value.action).toBe('开始语音会话')
+  })
+  it('运行期组件加载中只显示启动中，不进入报错状态，也不弹出启动画面', async () => {
+    const { value } = liveControls()
+    allowBusinessReady(value)
+    application.snapshot.value = { state: 'starting', startup_complete: true, core_available: false,
+      core_phase: 'starting',
+      unavailable_capabilities: [{ id: 'tts', label: 'TTS（语音合成）', state: 'STARTING', blocking: true,
+        phase: '语音合成路由与播放器', error: '', retry: 'tts' }],
+      components: [{ id: 'voice', name: '语音服务', state: 'starting', pid: 12 }] } as unknown as ApplicationSnapshot
+    await flushPromises()
+    expect(value.workbenchModel.value.action).toBe('组件启动中')
+    expect(value.workbenchModel.value.disabled).toBe(true)
+    expect(value.runtimeState.value).toBe('standby')
+    expect(value.workbenchModel.value.title).toBe('组件启动中')
+    expect(value.workbenchModel.value.description).toContain('TTS（语音合成）')
+    // 运行期加载中不显示故障横幅（全屏启动画面的判定由 application-host.test.ts 覆盖）。
+    const wrapper = render(ProductApp)
+    await flushPromises()
+    expect(wrapper.find('.application-degraded').exists()).toBe(false)
+    // 已就绪后恢复正常入口。
+    application.snapshot.value = { ...application.snapshot.value, state: 'ready', core_available: true, core_phase: 'ready' }
+    await flushPromises()
+    expect(value.workbenchModel.value.action).toBe('开始语音会话')
+  })
+  it('运行期核心能力失败只显示横幅与查看入口', async () => {
+    const { value } = liveControls()
+    allowBusinessReady(value)
+    application.snapshot.value = { state: 'failed', startup_complete: true, core_available: false,
+      core_phase: 'failed',
+      unavailable_capabilities: [{ id: 'tts', label: 'TTS（语音合成）', state: 'ERROR', blocking: true,
+        phase: '语音合成路由与播放器', error: '模型文件缺失', retry: 'tts' }],
+      components: [{ id: 'voice', name: '语音服务', state: 'failed', pid: 12, error: '核心能力未就绪：TTS（语音合成）' }] } as unknown as ApplicationSnapshot
+    application.runtimeFailure.value = true
+    await flushPromises()
+    expect(value.workbenchModel.value.action).toBe('查看本地组件')
+    const wrapper = render(ProductApp)
+    await flushPromises()
+    expect(wrapper.get('.application-degraded').text()).toContain('TTS（语音合成）')
+    // 横幅入口把用户带到本地组件页，而不是只给一个无法自愈的重试按钮。
+    await wrapper.get('.application-degraded button').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.settings-page').attributes('style') ?? '').not.toContain('display: none')
+    application.runtimeFailure.value = false
   })
   it('固定供应商密钥只提交输入字段，失败保留草稿，成功清空输入', async () => {
     vi.spyOn(productApi, 'fixedCredentials').mockResolvedValue({ providers: { deepseek: { configured: true }, minimax: { configured: true } }, vault_available: true })

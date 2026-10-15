@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { acceptApplicationSnapshot, applicationStateLabel, applicationApiReady, type ApplicationSnapshot } from './application-host'
+import {
+  acceptApplicationSnapshot, applicationApiReady, applicationCorePhase, applicationOverlay,
+  applicationRuntimeFailure, applicationStateLabel, type ApplicationSnapshot,
+} from './application-host'
 
 describe('独立应用状态投影', () => {
   const snapshot = (instance_id: string, revision: number) => ({ instance_id, revision } as ApplicationSnapshot)
@@ -32,5 +35,30 @@ describe('独立应用状态投影', () => {
     expect(applicationApiReady({ ...value, components: [{ ...value.components[0], pid: null }] })).toBe(false)
     expect(value.startup_complete).toBe(false)
     expect(value.core_available).toBe(false)
+  })
+  it('运行期的组件故障不再弹出全屏启动画面', () => {
+    const running = { startup_complete: true, state: 'failed', core_available: false, stopping: false,
+      components: [] } as unknown as ApplicationSnapshot
+    expect(applicationOverlay(running)).toBe(false)
+    expect(applicationOverlay(running, { inspecting: true })).toBe(false)
+    // 启动尚未完成、正在退出与会话失效仍然全屏。
+    expect(applicationOverlay({ ...running, startup_complete: false })).toBe(true)
+    expect(applicationOverlay({ ...running, startup_complete: false }, { inspecting: true })).toBe(false)
+    expect(applicationOverlay({ ...running, state: 'stopping' })).toBe(true)
+    expect(applicationOverlay({ ...running, state: 'stopped' })).toBe(true)
+    expect(applicationOverlay(running, { sessionInvalid: true })).toBe(true)
+    expect(applicationOverlay(null)).toBe(true)
+  })
+  it('核心能力阶段区分加载中与已失败，运行期失败才显示横幅', () => {
+    const base = { startup_complete: true, components: [] } as unknown as ApplicationSnapshot
+    expect(applicationCorePhase({ ...base, core_phase: 'starting', core_available: false })).toBe('starting')
+    expect(applicationCorePhase({ ...base, core_phase: 'failed', core_available: false })).toBe('failed')
+    expect(applicationCorePhase({ ...base, core_phase: 'ready', core_available: true })).toBe('ready')
+    // 旧宿主缺少 core_phase 时按 core_available 回落。
+    expect(applicationCorePhase({ ...base, core_available: true })).toBe('ready')
+    expect(applicationCorePhase({ ...base, core_available: false })).toBe('failed')
+    expect(applicationRuntimeFailure({ ...base, core_phase: 'starting', core_available: false })).toBe(false)
+    expect(applicationRuntimeFailure({ ...base, core_phase: 'failed', core_available: false })).toBe(true)
+    expect(applicationRuntimeFailure({ ...base, core_phase: 'failed', core_available: false, startup_complete: false })).toBe(false)
   })
 })

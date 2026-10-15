@@ -107,6 +107,22 @@ class WebTests(unittest.TestCase):
         self.app.outer_job.close()
         self.directory.cleanup()
 
+    def test_capability_retry_route_is_available_to_the_page(self):
+        """组件页的能力行通过独立端点恢复，不落到组件级整进程重试。"""
+        self.client.open(self.web.origin + "/desktop-entry?token=" + self.web.issue_launch_token()).close()
+        with patch.object(self.app, "request_capability_retry", return_value=True) as retry:
+            request = urllib.request.Request(self.web.origin + "/api/v1/application/capabilities/tts/retry",
+                b"{}", {"Content-Type": "application/json", "Origin": self.web.origin})
+            with self.client.open(request) as response:
+                self.assertEqual(response.status, 202)
+            retry.assert_called_once_with("tts")
+        with patch.object(self.app, "request_capability_retry", return_value=False):
+            request = urllib.request.Request(self.web.origin + "/api/v1/application/capabilities/tts/retry",
+                b"{}", {"Content-Type": "application/json", "Origin": self.web.origin})
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.client.open(request)
+            self.assertEqual(error.exception.code, 409)
+
     def test_unclaimed_root_is_static_information_and_business_resources_are_denied(self):
         with self.client.open(self.web.origin) as response:
             self.assertIn("请通过桌面程序打开", response.read().decode())
@@ -455,6 +471,129 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         finally:
             app.outer_job.close()
 
+    async def test_loading_capability_reports_starting_instead_of_failure(self):
+        """加载中的能力是瞬态：组件显示启动中，整体状态不是启动失败。"""
+        app = ApplicationHost(Path.cwd())
+        try:
+            for row in app.state.snapshot()["components"]:
+                app.state.component(row["id"], state="ready")
+            app.state.component("voice", pid=123)
+            app.state.update(startup_complete=True)
+            services = dict(audio="READY", asr="READY", llm="READY", tts="STARTING", kws="READY")
+            with patch.object(app, "http", AsyncMock(return_value={"wake_enabled": True, "services": dict(services)})):
+                self.assertTrue(await app.probe("voice"))
+            app.state.finish()
+            snapshot = app.state.snapshot()
+            voice = next(c for c in snapshot["components"] if c["id"] == "voice")
+            self.assertFalse(snapshot["core_available"])
+            self.assertEqual(snapshot["core_phase"], "starting")
+            self.assertEqual(snapshot["state"], "starting")
+            self.assertEqual(voice["state"], "starting")
+            self.assertEqual(voice["error"], "")
+            self.assertFalse(voice["retry_allowed"])
+            self.assertIn("TTS（语音合成）", voice["phase"])
+        finally:
+            app.outer_job.close()
+
+    async def test_single_probe_failure_does_not_condemn_the_component(self):
+        """单次健康检查抖动不能把语音服务判死，连续超过阈值与宽限期才进入故障。"""
+        app = ApplicationHost(Path.cwd())
+        try:
+            for row in app.state.snapshot()["components"]:
+                app.state.component(row["id"], state="ready")
+            app.state.component("voice", pid=os.getpid())
+            app.state.update(startup_complete=True, core_available=True, core_phase="ready")
+            app.probe_grace_seconds = 0.0
+            self.assertFalse(app._note_probe_failure("voice", OSError("状态查询超时")))
+            self.assertFalse(app._note_probe_failure("voice", OSError("状态查询超时")))
+            self.assertTrue(app._note_probe_failure("voice", OSError("状态查询超时")))
+            row = next(c for c in app.state.snapshot()["components"] if c["id"] == "voice")
+            self.assertEqual(row["state"], "starting")
+            self.assertIn("健康检查重试中", row["phase"])
+            app._reset_probe_failure("voice")
+            self.assertIsNone(app._probe_failures.get("voice"))
+        finally:
+            app.outer_job.close()
+
+    async def test_probe_grace_period_blocks_premature_failure(self):
+        """达到次数但未过宽限期仍然不算失败，避免启动或加载瞬间被误判。"""
+        app = ApplicationHost(Path.cwd())
+        try:
+            app.state.update(startup_complete=True)
+            app.probe_failure_threshold = 1
+            app.probe_grace_seconds = 60.0
+            self.assertFalse(app._note_probe_failure("voice", OSError("第一次失败")))
+            row = next(c for c in app.state.snapshot()["components"] if c["id"] == "voice")
+            self.assertEqual(row["state"], "starting")
+        finally:
+            app.outer_job.close()
+
+    async def test_capability_retry_does_not_restart_the_voice_process(self):
+        """进程存活时优先做能力级恢复，不能重启整个语音服务。"""
+        app = ApplicationHost(Path.cwd())
+        try:
+            alive = Mock()
+            alive.poll.return_value = None
+            app.processes["voice"] = alive
+            app.capability_rows = [
+                {"id": "tts", "label": "TTS（语音合成）", "state": "ERROR", "blocking": True,
+                 "phase": "语音合成路由与播放器", "error": "模型文件缺失", "retry": "tts"},
+            ]
+            app.state.update(startup_complete=True)
+            app.state.component("voice", state="ready", pid=os.getpid())
+            self.assertTrue(app.request_capability_retry("tts"))
+            app.state.component("voice", state="ready", pid=os.getpid())
+            with patch.object(app, "voice_control", AsyncMock(return_value={"ok": True})) as control, \
+                 patch.object(app, "probe", AsyncMock(return_value=True)):
+                await app.retry_capability("tts")
+            control.assert_awaited_once()
+            self.assertEqual(control.await_args.args[0], "capability-retry")
+            self.assertEqual(control.await_args.kwargs["payload"], {"capability": "tts"})
+            alive.request_stop.assert_not_called()
+            alive.kill.assert_not_called()
+        finally:
+            app.outer_job.close()
+
+    async def test_capability_retry_falls_back_to_process_restart_when_process_died(self):
+        """语音进程已经退出时，能力级恢复回落到整进程重建。"""
+        app = ApplicationHost(Path.cwd())
+        try:
+            dead = Mock()
+            dead.poll.return_value = 1
+            app.processes["voice"] = dead
+            app.capability_rows = [
+                {"id": "tts", "label": "TTS（语音合成）", "state": "ERROR", "blocking": True,
+                 "phase": "语音合成路由与播放器", "error": "", "retry": "tts"},
+            ]
+            app.state.update(startup_complete=True)
+            with patch.object(app, "retry", AsyncMock()) as restart:
+                await app.retry_capability("tts")
+            restart.assert_awaited_once_with("voice")
+        finally:
+            app.outer_job.close()
+
+    async def test_capability_retry_rejects_unknown_capability(self):
+        app = ApplicationHost(Path.cwd())
+        try:
+            app.state.update(startup_complete=True)
+            self.assertFalse(app.request_capability_retry("nope"))
+        finally:
+            app.outer_job.close()
+
+    async def test_request_stop_records_the_reason(self):
+        """退出与重试必须能从事后日志区分：停止请求要记录组件与原因。"""
+        process = ManagedProcess(["cmd", "/c", "exit"], cwd=Path.cwd(), env={},
+            output=Path(tempfile.gettempdir()) / "managed-stop-test.log",
+            outer_job=Job(), event_name="Local\\VoiceTerminal-Test-Stop", key="voice")
+        try:
+            with patch("voice_terminal.application.windows.log.info") as logged:
+                process.request_stop("component-retry:voice")
+            self.assertIn("组件", logged.call_args.args[0])
+            self.assertEqual(logged.call_args.args[1], "voice")
+            self.assertEqual(logged.call_args.args[2], "component-retry:voice")
+        finally:
+            process.close()
+
     async def test_failed_capability_with_live_process_retains_real_metrics(self):
         app = ApplicationHost(Path.cwd())
         try:
@@ -665,6 +804,27 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         app.state.update(stopping=True)
         self.assertFalse(app.request_retry("voice"))
         app.outer_job.close()
+
+    async def test_duplicate_capability_retry_is_rejected(self):
+        """同一能力恢复期间拒绝重复请求，退出后不再接受恢复。"""
+        app = ApplicationHost(Path.cwd())
+        try:
+            alive = Mock()
+            alive.poll.return_value = None
+            app.processes["voice"] = alive
+            app.capability_rows = [
+                {"id": "tts", "label": "TTS（语音合成）", "state": "ERROR", "blocking": True,
+                 "phase": "语音合成路由与播放器", "error": "模型文件缺失", "retry": "tts"},
+            ]
+            app.state.update(startup_complete=True)
+            app.state.component("voice", state="ready", pid=123)
+            with patch.object(app, "enqueue", side_effect=lambda coroutine: coroutine.close()):
+                self.assertTrue(app.request_capability_retry("tts"))
+                self.assertFalse(app.request_capability_retry("tts"))
+            app.state.update(stopping=True)
+            self.assertFalse(app.request_capability_retry("tts"))
+        finally:
+            app.outer_job.close()
 
     async def test_late_generation_report_cannot_overwrite_current_startup(self):
         app = ApplicationHost(Path.cwd())

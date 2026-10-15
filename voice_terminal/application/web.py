@@ -362,6 +362,12 @@ class HostWeb:
                         self.data({"ok": True}, 202)
                     else:
                         self.data({"error": "组件当前不能重试"}, 409)
+                elif path.startswith("/api/v1/application/capabilities/") and path.endswith("/retry"):
+                    capability = path.split("/")[-2]
+                    if owner.application.request_capability_retry(capability):
+                        self.data({"ok": True}, 202)
+                    else:
+                        self.data({"error": "该能力当前不能单独恢复"}, 409)
                 else:
                     self.data({"error": "接口不存在"}, 404)
 

@@ -18,12 +18,17 @@ import uuid
 from .state import ApplicationState
 from .environment import resolve_python
 from .windows import Job, ManagedProcess
-from ..core.state import SERVICE_READY_STATES
+from ..core.state import SERVICE_LABELS, SERVICE_LOADING_STATES, SERVICE_READY_STATES
 from ..resources import ResourcePolicy
 from .resource_readiness import inspect_model_resources, inspect_dsh_runtime
 from .ports import validate_endpoint_report
 
 log = logging.getLogger(__name__)
+
+# PROBE_FAILURE_THRESHOLD / PROBE_GRACE_SECONDS（探测失败阈值与宽限时间）：单次健康检查抖动
+# 不能判定核心能力失败；连续多次且持续超过宽限期才进入故障状态。
+PROBE_FAILURE_THRESHOLD = 3
+PROBE_GRACE_SECONDS = 6.0
 
 
 class ApplicationHost:
@@ -65,6 +70,12 @@ class ApplicationHost:
         self.gpu_fallback_roles: set[str] = set()  # gpu_fallback_roles（显卡进程启动失败后使用中央处理器的组件）。
         self.exit_callback = None  # exit_callback（桌面外壳的退出协调回调）。
         self.shutdown_deadline = None  # shutdown_deadline（统一退出的单调时钟截止时间）。
+        # 探测失败去抖：连续次数与首次失败时刻，成功即清零。
+        self.probe_failure_threshold = PROBE_FAILURE_THRESHOLD
+        self.probe_grace_seconds = PROBE_GRACE_SECONDS
+        self._probe_failures: dict[str, int] = {}
+        self._probe_failure_since: dict[str, float] = {}
+        self.capability_rows: list[dict] = []  # capability_rows（语音服务上报的分能力状态）。
 
     def enqueue(self, coroutine):
         if self.loop is None:
@@ -82,6 +93,66 @@ class ApplicationHost:
             return
         if self.loop:
             self.loop.call_soon_threadsafe(self.exit_event.set)
+
+    def request_capability_retry(self, capability: str) -> bool:
+        """request_capability_retry（请求能力级恢复）：只重建一个能力，不重启语音进程。"""
+        row = self._capability_row(capability)
+        if row is None or not row.get("retry"):
+            return False
+        voice = self.processes.get("voice")
+        if voice is None or voice.poll() is not None:
+            # 语音进程已退出：能力级恢复无从谈起，交给整进程恢复。
+            return self.request_retry("voice")
+        with self.state.condition:
+            snapshot = self.state.snapshot()
+            if snapshot["stopping"]:
+                return False
+            voice_row = next((c for c in snapshot["components"] if c["id"] == "voice"), None)
+            if voice_row is None or voice_row["retrying"]:
+                # 同一能力（或整进程）恢复期间拒绝重复请求，与组件级重试的门禁一致。
+                return False
+            self.state.component("voice", retrying=True, phase=f"恢复{row.get('label') or capability}")
+        self.enqueue(self._retry_capability_locked(capability))
+        return True
+
+    def _capability_row(self, capability: str) -> dict | None:
+        name = str(capability or "")
+        return next((row for row in self.capability_rows if row.get("id") == name), None)
+
+    def _pending_capability_row(self) -> dict | None:
+        """_pending_capability_row（待恢复能力）：优先阻塞能力，其次可选能力。"""
+        rows = [row for row in self.capability_rows if row.get("retry")]
+        return next((row for row in rows if row.get("blocking")), rows[0] if rows else None)
+
+    async def _retry_capability_locked(self, capability: str) -> None:
+        async with self.operation_lock:
+            await self.retry_capability(capability)
+
+    async def retry_capability(self, capability: str) -> None:
+        """retry_capability（能力级恢复）：进程存活时只重建该能力，调用方持有 operation_lock。"""
+        if self.state.value["stopping"]:
+            return
+        label = (self._capability_row(capability) or {}).get("label") or capability
+        voice = self.processes.get("voice")
+        try:
+            if voice is None or voice.poll() is not None:
+                log.info("能力恢复回落到整进程重建：组件=voice，能力=%s", capability)
+                await self.retry("voice")
+                return
+            log.info("开始能力级恢复：能力=%s", capability)
+            response = await self.voice_control(
+                "capability-retry", payload={"capability": capability},
+                timeout=self.manifest.get("worker_timeout_seconds", 180) + 10)
+            if not response.get("ok"):
+                raise RuntimeError(response.get("message") or "组件恢复失败")
+            await self.probe("voice")
+            self._reset_probe_failure("voice")
+        except Exception as exc:
+            log.exception("能力级恢复失败：能力=%s", capability)
+            self.state.component("voice", error=f"{label}恢复失败：{str(exc)[:160]}")
+        finally:
+            self.state.component("voice", retrying=False)
+            self.state.finish()
 
     def request_retry(self, key: str) -> bool:
         with self.state.condition:
@@ -216,7 +287,7 @@ class ApplicationHost:
         started = time.perf_counter()
         log.info("创建工作进程：组件=%s，解释器=%s，日志=%s", key, command[0], output)
         process = ManagedProcess(command, cwd=self.root, env=env,
-            output=output, outer_job=self.outer_job,
+            output=output, outer_job=self.outer_job, key=key,
             event_name=f"Local\\VoiceTerminal-{self.state.value['instance_id']}-{key}-{generation}")
         self.processes[key] = process
         log.info("工作进程已创建：组件=%s，进程编号=%s，创建耗时毫秒=%.1f",
@@ -229,6 +300,7 @@ class ApplicationHost:
     def stop_group(self, key):
         old = self.processes.pop(key, None)
         if old:
+            log.info("回收工作进程：组件=%s，进程编号=%s", key, getattr(old, "pid", None))
             old.kill()
             old.close()
 
@@ -371,6 +443,8 @@ class ApplicationHost:
                     endpoints = self.state.snapshot().get("endpoints", {})
                     body["endpoints"] = {key: row.get("url") or row.get("preferred_url")
                         for key, row in endpoints.items() if key in {"asr", "analysis", "speaker"}}
+                if payload:
+                    body.update(payload)  # payload（附加字段）：能力级恢复等操作需要额外参数。
                 data = json.dumps(body).encode()
                 headers["Content-Type"] = "application/json"
             req = urllib.request.Request(url, data=data, headers=headers)
@@ -399,8 +473,9 @@ class ApplicationHost:
         threading.Thread(target=run_request, name="application-http", daemon=True).start()
         return await future
 
-    async def voice_control(self, action, *, timeout=190):
-        return await self.http(self.state.value["voice_api_url"] + "/internal/application/control", action=action, timeout=timeout)
+    async def voice_control(self, action, *, payload=None, timeout=190):
+        return await self.http(self.state.value["voice_api_url"] + "/internal/application/control",
+                               action=action, payload=payload, timeout=timeout)
 
     def create_wake_task(self, payload: dict) -> dict:
         """create_wake_task（手动创建任务）：仅由已校验桌面会话的网页线程调用。"""
@@ -448,19 +523,31 @@ class ApplicationHost:
             data = await self.http(self.state.value["voice_api_url"] + "/health")
             # HTTP readiness（接口就绪）与 core availability（核心能力可用）分别记录。
             services = data.get("services", {})
-            names = {"audio": "音频设备", "asr": "ASR（语音识别）", "llm": "LLM（大语言模型）", "tts": "TTS（语音合成）"}
+            names = {"audio": SERVICE_LABELS["audio"], "asr": SERVICE_LABELS["asr"],
+                     "llm": SERVICE_LABELS["llm"], "tts": SERVICE_LABELS["tts"]}
             if data.get("wake_enabled"):
-                names["kws"] = "KWS（关键词唤醒）"
+                names["kws"] = SERVICE_LABELS["kws"]
             # 使用语音运行时的就绪契约；开始监听后的 RUNNING（运行中）以及
             # 语音合成中的 STREAMING（流式传输中）都属于正常工作状态。
-            unavailable = [label for name, label in names.items() if services.get(name) not in SERVICE_READY_STATES]
-            ready = not unavailable
-            self.state.update(core_available=ready, capabilities=services, voice_api_ready=True)
+            # loading（加载中）是瞬态：显示“启动中”并暂时拦截主监听，不判核心能力失败。
+            loading = [label for name, label in names.items()
+                       if services.get(name) in SERVICE_LOADING_STATES]
+            unavailable = [label for name, label in names.items()
+                           if services.get(name) not in SERVICE_READY_STATES
+                           and services.get(name) not in SERVICE_LOADING_STATES]
+            ready = not unavailable and not loading
             error = "核心能力未就绪：" + "、".join(unavailable) if unavailable else ""
+            self.state.update(core_available=ready,
+                core_phase="failed" if unavailable else "starting" if loading else "ready",
+                capabilities=services, voice_api_ready=True)
             self.state.component("voice", error=error)
             if self.state.value["startup_complete"]:
-                self.state.component("voice", state="ready" if ready else "failed",
-                    phase="核心能力已就绪" if ready else "核心能力不可用", error=error)
+                self.state.component("voice",
+                    state="ready" if ready else "failed" if unavailable else "starting",
+                    phase=("核心能力已就绪" if ready
+                           else "核心能力不可用" if unavailable
+                           else "核心能力加载中：" + "、".join(loading)),
+                    error=error)
             return True
         return False
 
@@ -806,9 +893,16 @@ class ApplicationHost:
                 else:
                     if key in {"asr", "analysis"} and "voice" in self.processes and self.processes["voice"].poll() is None:
                         await self.voice_control("pause")
+                    if key == "voice":
+                        alive = self.processes.get("voice")
+                        pending = self._pending_capability_row()
+                        if alive is not None and alive.poll() is None and pending is not None:
+                            # 进程仍在运行：先做能力级恢复，避免整进程重启拖垮其他能力。
+                            log.info("语音进程存活，改用能力级恢复：能力=%s", pending.get("id"))
+                            return await self.retry_capability(str(pending.get("id")))
                     old = self.processes.get(key)
                     if old:
-                        old.request_stop()
+                        old.request_stop(f"component-retry:{key}")
                         deadline = time.monotonic() + 5
                         while old.poll() is None and time.monotonic() < deadline:
                             await asyncio.sleep(.1)
@@ -934,6 +1028,31 @@ class ApplicationHost:
             total_memory_private_commit_bytes=sum(commits) if complete and commits and all(value is not None for value in commits) else None)
         self.cpu_samples = {identity: value for identity, value in self.cpu_samples.items() if identity in unique}
 
+    def _note_probe_failure(self, key: str, exc: Exception | None) -> bool:
+        """_note_probe_failure（探测失败去抖）：返回本次是否已构成终态失败。
+
+        单次健康检查抖动（事件循环繁忙、模型加载中的短暂无响应）不应把组件判死，
+        否则运行期会被误报为启动失败。连续达到阈值且持续超过宽限期才返回 True。
+        """
+        now = time.monotonic()
+        count = self._probe_failures.get(key, 0) + 1
+        self._probe_failures[key] = count
+        since = self._probe_failure_since.setdefault(key, now)
+        elapsed = now - since
+        detail = "" if exc is None else f"，错误={type(exc).__name__}: {str(exc)[:200]}"
+        log.warning("组件健康检查失败：组件=%s，连续=%d次，持续=%.1f秒%s", key, count, elapsed, detail)
+        if count < self.probe_failure_threshold or elapsed < self.probe_grace_seconds:
+            row = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
+            if row["state"] not in {"failed", "blocked"}:
+                self.state.component(key, state="starting", phase=f"健康检查重试中（第{count}次）", error="")
+            return False
+        return True
+
+    def _reset_probe_failure(self, key: str) -> None:
+        """_reset_probe_failure（探测恢复）：健康检查成功即清零去抖计数。"""
+        self._probe_failures.pop(key, None)
+        self._probe_failure_since.pop(key, None)
+
     async def monitor(self):
         while not self.state.value["stopping"]:
             if self.state.value["startup_complete"] and not self.operation_lock.locked():
@@ -956,22 +1075,32 @@ class ApplicationHost:
                 if "voice" in self.processes:
                     try:
                         await self.probe("voice")
+                        self._reset_probe_failure("voice")
+                    except Exception as exc:
+                        if self._note_probe_failure("voice", exc):
+                            self.state.update(core_available=False, core_phase="failed", voice_api_ready=False)
+                            self.state.component("voice", state="failed", phase="语音接口不可用",
+                                                 error="语音服务健康检查失败，请查看组件日志")
+                    try:
                         await self.delegated_status()
-                    except Exception:
-                        self.state.update(core_available=False, voice_api_ready=False)
-                        self.state.component("voice", state="failed", phase="语音接口不可用", error="语音服务健康检查失败，请查看组件日志")
+                    except Exception as exc:
+                        # 状态查询是次要调用：失败只保留上一次能力行，不能反过来判核心不可用。
+                        log.info("组件状态查询失败：组件=voice，错误=%s: %s", type(exc).__name__, str(exc)[:200])
                 for key in ("asr", "analysis"):
                     row = next(c for c in self.state.snapshot()["components"] if c["id"] == key)
                     if row["state"] not in {"ready", "external"}:
                         continue
+                    failure: Exception | None = None
                     try:
                         healthy = await self.probe(key)
-                    except Exception:
-                        healthy = False
-                    if not healthy:
+                    except Exception as exc:
+                        healthy, failure = False, exc
+                    if healthy:
+                        self._reset_probe_failure(key)
+                    elif self._note_probe_failure(key, failure):
                         self.state.component(key, state="failed", phase="应用层探测失败", error="组件连接或模型状态不可用，请重试")
                         if key == "asr":
-                            self.state.update(core_available=False)
+                            self.state.update(core_available=False, core_phase="failed")
                 self.state.finish()
             try:
                 self.sample_metrics()
@@ -989,11 +1118,11 @@ class ApplicationHost:
         # 先结束 Voice（语音服务）及受委托组件，再结束模型工作进程。
         voice = self.processes.get("voice")
         if voice:
-            voice.request_stop()
+            voice.request_stop("app-exit")
             while voice.poll() is None and time.monotonic() < deadline - 3:
                 await asyncio.sleep(.1)
         for process in self.processes.values():
-            process.request_stop()
+            process.request_stop("app-exit")
         while any(p.poll() is None for p in self.processes.values()) and time.monotonic() < deadline:
             await asyncio.sleep(.1)
         for key in tuple(self.processes):

@@ -194,6 +194,25 @@ const rows = computed<LocalComponentRow[]>(() => {
     facts: [],
     note: '独立计量；不重复计入语音服务资源。',
   })
+  // 能力行：模型行未覆盖的能力（音频、合成、主模型等）单独呈现，并可只恢复该能力。
+  const coveredCapabilities = new Set(['asr', 'kws', 'speaker'])
+  for (const capability of application.snapshot.value?.unavailable_capabilities ?? []) {
+    if (coveredCapabilities.has(capability.id)) continue
+    const loading = ['STARTING', 'LOADING', 'WAITING', 'CONNECTING', 'RETRYING'].includes(capability.state)
+    const ready = ['READY', 'RUNNING', 'STREAMING', 'CONNECTED'].includes(capability.state)
+    const disabled = capability.state === 'DISABLED'
+    components.push({
+      id: `capability:${capability.id}`, name: capability.label,
+      state: disabled ? 'disabled' : ready ? 'ready' : loading ? 'loading' : 'failed',
+      status: disabled ? '已停用' : ready ? serviceLabel(capability.state) : loading ? '启动中' : '不可用',
+      available: ready, retryable: !loading && !ready && !disabled && Boolean(capability.retry),
+      busy: loading, runtime: '语音主服务内', location: '本机',
+      description: loading ? `${capability.phase}，完成后可开始语音会话。` : capability.phase,
+      error: !ready && !loading && !disabled ? capability.error || '能力不可用，可单独恢复。' : undefined,
+      facts: capability.blocking ? [{ label: '语音门禁', value: '未就绪时暂不能开始会话' }] : [],
+      note: '能力级恢复只重建该能力，不重启语音服务进程。',
+    })
+  }
   return [...models, ...components]
 })
 const model = computed<LocalComponentsModel>(() => {
@@ -248,6 +267,12 @@ async function retry(id: string) {
   if (id === 'voice-system') {
     const component = ['setup', 'web', 'voice', 'desktop'].map(componentFor).find(row => row?.retry_allowed)
     if (component) await retry(component.id)
+    return
+  }
+  // 能力行只恢复该能力，不重启语音服务进程；其余行沿用所属进程的恢复路径。
+  if (id.startsWith('capability:')) {
+    await application.retryCapability(id.slice('capability:'.length))
+    await Promise.allSettled([application.refresh(), refreshComputeStatus(true)])
     return
   }
   const owner = id === 'hotwords' ? 'voice' : id === 'punctuation' ? 'asr' : owners[id as ProductLocalModelId] ?? id

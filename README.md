@@ -169,6 +169,7 @@ git diff --check
 - [前端界面阶段性交接](docs/frontend-ui-handoff.md)：已确认的界面修订、产品接入差异及正式迁移顺序。
 - [真实业务验收与统一发布](docs/desktop-acceptance.md)：已发布界面的验收证据、双模式归档、固定服务密钥与最新正式组件。
 - [独立应用启动与系统管理](docs/application-lifecycle.md)
+- [能力就绪与能力级恢复](docs/capability-readiness-and-recovery.md)：运行期区分加载中与失败、只恢复单个能力、主监听门禁与横幅口径。
 - [启动调度梳理与资源预算](docs/startup-optimization-plan.md)：当前三路模型调度、代理独立启动及历史串行路径。
 - [运行资源管理与内存优化](docs/runtime-resource-management.md)：当前策略、CPU（中央处理器）/GPU（图形处理器）资源口径及内存优化验收边界。
 - [本地模型运行设备](docs/local-model-compute.md)：模型实际设备、显存计量及已验证 GPU 环境规则。

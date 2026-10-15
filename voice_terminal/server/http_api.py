@@ -115,10 +115,16 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         authorize_application(request)
         payload = await request.json()
         if not isinstance(payload, dict) or payload.get("action") not in {
-            "pause", "dsh-start", "dsh-retry", "dsh-wait", "speaker-retry", "reinitialize",
-            "initialize-local", "initialize-session"
+            "pause", "dsh-start", "dsh-retry", "dsh-wait", "speaker-retry", "capability-retry",
+            "reinitialize", "initialize-local", "initialize-session"
         }:
             raise HTTPException(status_code=422, detail="受管操作无效。")
+        capability = payload.get("capability")
+        if payload["action"] == "capability-retry":
+            if not isinstance(capability, str) or capability not in {
+                "audio", "asr", "llm", "tts", "kws", "speaker",
+            }:
+                raise HTTPException(status_code=422, detail="组件能力标识无效。")
         if payload["action"] in {"reinitialize", "initialize-session"}:
             fields = (("asr_available", "VOICE_APP_ASR_AVAILABLE"),
                       ("analysis_available", "VOICE_APP_ANALYSIS_AVAILABLE"))
@@ -140,7 +146,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                     endpoint_table[component] = str(validate_endpoint_url(component, value)["url"])
                 except ValueError as exc:
                     raise HTTPException(status_code=422, detail="受管端点表包含无效地址。") from exc
-        return await runtime.application_control(payload["action"], endpoint_table=endpoint_table)
+        return await runtime.application_control(payload["action"], endpoint_table=endpoint_table,
+                                                 capability=capability)
 
     def registry_or_404() -> ModelRegistryService:
         if model_registry is None:

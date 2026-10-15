@@ -31,6 +31,7 @@ git diff --check
 | 区域 | 测试入口 |
 | --- | --- |
 | 独立应用宿主、进程树、状态接口与退出 | `tests/test_application_host.py`、`tests/test_dsh_runtime.py`、`apps/frontend/src/product/application-host.test.ts` |
+| 能力就绪分档、探测去抖与能力级恢复 | `tests/test_state.py`、`tests/test_application_host.py`、`tests/test_capability_recovery.py`、`tests/test_listening_capability_gate.py`、`apps/frontend/src/product/application-host.test.ts`、`apps/frontend/src/product/ProductApp.test.ts` |
 | 便携路径、旧数据导入、组件校验与安全归档 | `tests/test_portable_paths.py`、`tests/test_desktop_packaging.py` |
 | 桌面原生路径与启用组合 | `cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common`（原生公共模块测试） |
 | 资源下载、复制、完整摘要与首次安装后的启动 | `apps/frontend/src/management/ManagementApp.test.ts`（刷新竞态、计时、终态补查和启动动画）；`cargo test --manifest-path apps/desktop/Cargo.toml -p voice-desktop-common -p voice-terminal-desktop --locked`（资源与宿主回归）；公共模块增加 `--features qualification`（隔离下载验收）时验证本机测试服务器、缓存、断点及全局并发。正式构建不开放该测试来源。 |
@@ -152,7 +153,7 @@ KWS 和尚未就绪的 ASR 提交新帧；服务就绪后按采样位置顺序�
 在仓库根目录执行定向回归：
 
 ```powershell
-.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q tests/test_application_host.py tests/test_dsh_runtime.py tests/test_product_api.py tests/test_speaker_production.py tests/test_dsh_bridge.py tests/test_handoff.py tests/test_asr_worker.py tests/test_analysis_cancellation.py
+.\.local\runtimes\python\python.exe -B -X utf8 scripts/test-backend.py -q tests/test_application_host.py tests/test_state.py tests/test_capability_recovery.py tests/test_listening_capability_gate.py tests/test_dsh_runtime.py tests/test_product_api.py tests/test_speaker_production.py tests/test_dsh_bridge.py tests/test_handoff.py tests/test_asr_worker.py tests/test_analysis_cancellation.py
 npm test
 npm run typecheck
 npm run build
@@ -167,7 +168,8 @@ git diff --check
 | 缺环境、缺网页和端口冲突 | 有可见诊断，核心失败保留宿主入口；网页端口冲突使用空闲端口，业务端口冲突拒绝接管未知进程。 |
 | 单实例 | 重复启动打开既有入口，不创建第二套业务组件；退出后可以再次启动。 |
 | 系统运行页 | 状态和指标来自受管进程，创建时间与进程对应；共享进程不重复计入总量，进程退出后清除指标。能力失败而进程仍存活时仍展示实际占用。 |
-| 手动恢复 | 分别注入语音识别、分析、声纹、语音服务故障；重试去重、恢复业务连接与能力，保持待机，不重播语音或重复执行模型动作。 |
+| 手动恢复 | 分别注入语音识别、分析、声纹、语音服务故障；重试去重、恢复业务连接与能力，保持待机，不重播语音或重复执行模型动作。语音进程仍在运行时，恢复只重建出问题的能力，ASR、声纹与代理会话保持不断；只有进程退出才重建整个语音服务。 |
+| 加载中与故障区分 | 切换本地合成模型等加载窗口内，组件显示“启动中”、主页按钮显示“组件启动中”并拦截开始会话，不出现全屏启动失败页；加载中点击开始会话会在加载完成后自动开始，用户主动停止则撤销该意图。单次健康检查抖动不判故障。 |
 | DSH（代理执行宿主）恢复 | 有限自动重启和手动恢复按既有上限工作，桥接与关联会话重新绑定；手动恢复重置自动重启计数。 |
 | 统一退出 | 正常运行、模型加载、恢复操作和自动重启等待期间均可退出；总退出预算 15 秒内回收组件并释放端口，强制结束宿主后也无受管子进程残留。 |
 | 窗口与页面生命周期 | 关闭主窗口隐藏到托盘，托盘恢复和重复启动唤回已有窗口；托盘创建失败时保留窗口。页面重载先读快照再接收实时更新；源码调试沿用产品窗口隐藏规则，样例关闭则回收其开发服务。 |

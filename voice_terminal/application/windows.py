@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes as W
+import logging
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+
+log = logging.getLogger(__name__)
 
 if os.name == "nt":
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -133,8 +136,9 @@ class Job:
 class ManagedProcess:
     """Process handle（进程句柄）保留真实所有权，避免通过端口或 PID 猜测回收。"""
     def __init__(self, command: list[str], *, cwd: Path, env: dict[str, str],
-                 output: Path, outer_job: Job, event_name: str) -> None:
+                 output: Path, outer_job: Job, event_name: str, key: str = "") -> None:
         self.command = command
+        self.key = key  # key（组件标识）：停止请求必须能写清是哪个组件、什么原因。
         self.created_at = time.time()
         self.event = ShutdownEvent(event_name)
         self.group = Job()
@@ -203,7 +207,9 @@ class ManagedProcess:
             checked(get_exit(self.handle, ctypes.byref(code)))
         return int(code.value)
 
-    def request_stop(self) -> None:
+    def request_stop(self, reason: str = "") -> None:
+        """request_stop（请求受管退出）：记录原因，便于事后区分退出、重试与回收。"""
+        log.info("请求停止工作进程：组件=%s，原因=%s，进程编号=%s", self.key or "unknown", reason or "未说明", self.pid)
         self.event.signal()
         if self.process and self.process.poll() is None:
             self.process.terminate()
