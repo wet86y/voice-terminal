@@ -519,9 +519,12 @@ class VoiceLibrary:
 
     @staticmethod
     def design_signature(payload: Mapping[str, Any]) -> dict[str, Any]:
-        """design_signature（候选来源）：与样音有关的输入必须完全一致。"""
-        return {key: payload.get(key) for key in (
+        """design_signature（候选来源）：按保存规则规范化源转写，再绑定样音输入。"""
+        signature = {key: payload.get(key) for key in (
             "design_description", "design_text", "source_reference_asset_id", "source_reference_text", "inference_steps")}
+        # source_reference_text（克隆源转写）：试音打标与保存校验统一去除首尾空白。
+        signature["source_reference_text"] = _safe_text(payload.get("source_reference_text", ""), "source_reference_text", 2000)
+        return signature
 
     def mark_design(self, asset_id: str, payload: Mapping[str, Any]) -> None:
         with self._lock:

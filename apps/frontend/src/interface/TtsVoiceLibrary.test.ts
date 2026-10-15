@@ -4,7 +4,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import TtsVoiceLibrary from './TtsVoiceLibrary.vue'
 import { provideTtsVoiceState, type TtsVoiceState } from './useTtsVoiceState'
-import type { TtsVoicePort, ProductLocalTtsModelId, ProductTtsOperation } from './tts-voice-types'
+import type { TtsVoicePort, ProductLocalTtsModelId, ProductTtsOperation, ProductTtsVoice } from './tts-voice-types'
 
 beforeEach(() => { vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {}) })
 afterEach(() => vi.restoreAllMocks())
@@ -59,6 +59,82 @@ describe('本地音色卡片', () => {
     await button(card as unknown as ReturnType<typeof mount>, '试音').trigger('click')
     await card.findAll('textarea').at(-1)!.setValue('新的生成正文')
     expect(button(card as unknown as ReturnType<typeof mount>, '保存').attributes('disabled')).toBeDefined()
+    view.wrapper.unmount()
+  })
+
+  // label（场景）、description（设计描述）、hasSource（是否含参考音频）、name（预期默认名称）。
+  it.each([
+    { label: '纯音色设计', description: '空灵、特殊的声音', hasSource: false, name: '设计音色' },
+    { label: '混合设计', description: '温和清晰的女声', hasSource: true, name: '混合音色' },
+    { label: '纯音色克隆', description: '', hasSource: true, name: '克隆音色' },
+  ])('$label 支持空名称保存，并在重新加载后保留对应素材', async ({ description, hasSource, name }) => {
+    let voices: ProductTtsVoice[] = [] // voices（模拟持久音色库）。
+    const port = {
+      ttsVoices: vi.fn(async () => ({ voices })),
+      uploadTtsAsset: vi.fn().mockResolvedValue({ asset: { asset_id: 'source', duration_ms: 5680 } }),
+      ttsAssetAudioUrl: vi.fn().mockReturnValue('http://localhost/reference.wav'),
+      startTtsTranscribe: vi.fn().mockResolvedValue({ operation_id: 'transcribe', state: 'succeeded', result: { text: '' } }),
+      startTtsPreview: vi.fn(async (_model, voice, text) => ({
+        operation_id: 'preview', state: 'succeeded', result: { voice: {
+          ...voice, source: 'design', reference_asset_id: 'target', reference_text: text,
+          design_text: text, inference_steps: 20,
+        } },
+      })),
+      createTtsVoice: vi.fn(async (_model, payload) => {
+        const voice = { ...payload, id: 'saved', revision: 1, model: 'voxcpm2', enabled: false, is_default: false } as ProductTtsVoice
+        voices = [voice]
+        return { voice }
+      }),
+    } as unknown as TtsVoicePort
+    const view = harness(port); await flushPromises()
+    await button(view.wrapper, '＋ 添加音色').trigger('click')
+    if (hasSource) {
+      await view.wrapper.find('.reference-input').trigger('drop', { dataTransfer: { files: [new File(['audio'], 'sample.wav')] } })
+      await flushPromises()
+    }
+    await view.wrapper.find('input[aria-label="音色名称"]').setValue('   ')
+    await view.wrapper.find('textarea').setValue(description)
+    if (description) {
+      expect(button(view.wrapper, '保存').attributes('disabled')).toBeDefined()
+      await button(view.wrapper, '试音').trigger('click'); await flushPromises()
+      expect(port.startTtsPreview).toHaveBeenCalledWith('voxcpm2', expect.objectContaining({
+        name, design_description: description, source_reference_asset_id: hasSource ? 'source' : undefined,
+      }), expect.any(String))
+    }
+    expect(button(view.wrapper, '保存').attributes('disabled')).toBeUndefined()
+    expect(view.wrapper.text()).not.toContain('需要以当前参数完成一次试音')
+    await button(view.wrapper, '保存').trigger('click'); await flushPromises()
+    expect(port.createTtsVoice).toHaveBeenCalledWith('voxcpm2', expect.objectContaining({
+      name, source: description ? 'design' : 'import', reference_asset_id: description ? 'target' : 'source',
+    }))
+    expect(port.startTtsPreview).toHaveBeenCalledTimes(description ? 1 : 0)
+    expect(view.wrapper.find('.voice-name strong').text()).toBe(name)
+    view.wrapper.unmount()
+
+    const restored = harness(port); await flushPromises()
+    const draft = restored.state.models.voxcpm2.drafts.saved
+    expect(draft.name).toBe(name)
+    expect(draft.description).toBe(description)
+    expect(draft.source?.asset_id).toBe(hasSource ? 'source' : undefined)
+    expect(restored.state.models.voxcpm2.voices[0].reference_asset_id).toBe(description ? 'target' : 'source')
+    restored.wrapper.unmount()
+  })
+
+  it('一代克隆缺少准确转写时说明原因，填入后可直接保存', async () => {
+    const view = harness()
+    await view.wrapper.setProps({ model: 'voxcpm1', steps: 10 }); await flushPromises()
+    await button(view.wrapper, '＋ 添加音色').trigger('click')
+    const draft = Object.values(view.state.models.voxcpm1.drafts).find(item => !item.id)!
+    draft.source = { asset_id: 'source', duration_ms: 5680, filename: 'sample.wav' }
+    await flushPromises()
+    expect(button(view.wrapper, '保存').attributes('disabled')).toBeDefined()
+    expect(view.wrapper.text()).toContain('请填写参考音频的准确转写文本后保存克隆音色。')
+    await view.wrapper.find('textarea').setValue('参考音频的准确转写。')
+    expect(button(view.wrapper, '保存').attributes('disabled')).toBeUndefined()
+    await button(view.wrapper, '保存').trigger('click'); await flushPromises()
+    expect(view.state.models.voxcpm1.voices.at(-1)).toMatchObject({
+      name: '克隆音色', source: 'import', reference_asset_id: 'source', reference_text: '参考音频的准确转写。',
+    })
     view.wrapper.unmount()
   })
 

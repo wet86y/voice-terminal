@@ -60,6 +60,16 @@ onMounted(() => refresh())
 watch(() => props.model, model => { void refresh(model) })
 function add() { const draft = voiceDraft(); draft.expanded = true; bucket.value.drafts[draft.key] = draft }
 function stored(draft: VoiceDraft) { return bucket.value.voices.find(voice => voice.id === draft.id) }
+/** voiceMode（音色创建方式）：design（纯设计）、mixed（混合设计）、clone（纯克隆）。 */
+function voiceMode(draft: VoiceDraft): 'design' | 'mixed' | 'clone' {
+  if (props.model === 'voxcpm2' && draft.description.trim()) return draft.source ? 'mixed' : 'design'
+  return 'clone'
+}
+/** voiceName（保存名称）：空名称按当前创建方式补全，已有音色保留原名。 */
+function voiceName(draft: VoiceDraft) {
+  const defaults = { design: '设计音色', mixed: '混合音色', clone: '克隆音色' } // defaults（未命名音色的默认名称）。
+  return draft.name.trim() || stored(draft)?.name || defaults[voiceMode(draft)]
+}
 async function monitor(draft: VoiceDraft, start: () => Promise<ProductTtsOperation>, generation: number) {
   let operation = await start()
   if (draft.generation !== generation) { await productApi.cancelTtsOperation(operation.operation_id); return operation }
@@ -112,7 +122,7 @@ function removeSource(draft: VoiceDraft) { releaseLocalAudio(draft); invalidate(
 async function preview(draft: VoiceDraft) {
   const model = props.model; const prepared = signature(draft, model)
   await run(draft, async generation => {
-    const voice = { name: draft.name || '新音色', design_description: draft.description, source_reference_asset_id: draft.source?.asset_id, source_reference_text: draft.transcript }
+    const voice = { name: voiceName(draft), design_description: voiceMode(draft) === 'clone' ? '' : draft.description, source_reference_asset_id: draft.source?.asset_id, source_reference_text: draft.transcript }
     if (props.demo) {
       draft.candidate = { ...voice, source: draft.description.trim() ? 'design' : 'import', reference_asset_id: 'demo-target', reference_text: draft.text, design_text: draft.text, inference_steps: props.steps }
       draft.signature = prepared; draft.notice = '试音演示完成。'; return
@@ -131,11 +141,19 @@ async function play(draft: VoiceDraft) {
     await monitor(draft, () => productApi.startTtsPlay(model, voice.reference_asset_id), generation)
   })
 }
-function saveable(draft: VoiceDraft) {
-  return !!draft.name.trim() && (unchangedContent(draft) || (props.model === 'voxcpm2' && draft.description.trim()
-    ? !!draft.candidate && draft.signature === signature(draft)
-    : !!draft.source && (props.model === 'voxcpm2' || !!draft.transcript.trim())))
+/** saveBlockReason（保存阻碍说明）：按钮与提示使用相同的内容校验，名称可自动补全。 */
+function saveBlockReason(draft: VoiceDraft) {
+  if (unchangedContent(draft)) return ''
+  const mode = voiceMode(draft) // mode（当前音色创建方式）。
+  if (mode !== 'clone') {
+    if (draft.candidate && draft.signature === signature(draft)) return ''
+    return `${mode === 'mixed' ? '混合设计' : '纯音色设计'}需要以当前参数完成一次试音，再保存生成的目标样音。`
+  }
+  if (!draft.source) return props.model === 'voxcpm2' ? '请填写音色设计描述，或添加参考音频进行克隆；也可以组合使用。' : '请添加参考音频进行音色克隆。'
+  if (props.model === 'voxcpm1' && !draft.transcript.trim()) return '请填写参考音频的准确转写文本后保存克隆音色。'
+  return ''
 }
+function saveable(draft: VoiceDraft) { return !saveBlockReason(draft) }
 function unchangedContent(draft: VoiceDraft) {
   const voice = stored(draft)
   if (!voice) return false
@@ -144,10 +162,10 @@ function unchangedContent(draft: VoiceDraft) {
 }
 async function save(draft: VoiceDraft) {
   if (!saveable(draft)) return
-  const model = props.model
+  const model = props.model; const name = voiceName(draft)
   await run(draft, async () => {
-    const payload = unchangedContent(draft) ? { ...stored(draft)!, name: draft.name.trim() } : draft.description.trim() ? { ...draft.candidate, name: draft.name.trim() } : {
-      name: draft.name.trim(), source: 'import', reference_asset_id: draft.source!.asset_id,
+    const payload = unchangedContent(draft) ? { ...stored(draft)!, name } : voiceMode(draft) !== 'clone' ? { ...draft.candidate, name } : {
+      name, source: 'import', reference_asset_id: draft.source!.asset_id,
       reference_text: draft.transcript, source_reference_text: draft.transcript,
     }
     if (props.demo) {
@@ -161,7 +179,7 @@ async function save(draft: VoiceDraft) {
       delete state.models[model].drafts[draft.key]; draft.key = response.voice.id; state.models[model].drafts[draft.key] = draft
       await refresh(model)
     }
-    draft.name = draft.name.trim(); draft.expanded = false
+    draft.name = name; draft.expanded = false
     draft.notice = '音色已保存；已启用音色从下一次回答生效。'; emit('changed')
   })
 }
@@ -193,7 +211,7 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
     <header class="library-heading"><div><h3>音色库</h3><p>为当前模型保存独立音色，启用后用于下一次回答。</p></div><button type="button" class="outline-button" @click="add">＋ 添加音色</button></header>
     <p v-if="!drafts.length" class="instruction-hint">尚无音色。可以添加参考音频，或使用二代模型设计音色。</p>
     <article v-for="draft in drafts" :key="draft.key" class="voice-card" :class="{ enabled: stored(draft)?.enabled }">
-      <header class="voice-heading"><div class="voice-name"><input v-if="draft.expanded" :id="`voice-name-${draft.key}`" v-model="draft.name" class="voice-name-input" aria-label="音色名称" maxlength="80" placeholder="给这个音色起个名字" :disabled="draft.busy"><strong v-else>{{ stored(draft)?.name || draft.name || '新音色' }}</strong><span v-if="stored(draft)?.is_default" class="voice-badge">默认</span><small v-if="stored(draft)?.enabled">正在使用</small></div>
+      <header class="voice-heading"><div class="voice-name"><input v-if="draft.expanded" :id="`voice-name-${draft.key}`" v-model="draft.name" class="voice-name-input" aria-label="音色名称" maxlength="80" placeholder="音色名称（可选）" :disabled="draft.busy"><strong v-else>{{ stored(draft)?.name || draft.name || '新音色' }}</strong><span v-if="stored(draft)?.is_default" class="voice-badge">默认</span><small v-if="stored(draft)?.enabled">正在使用</small></div>
         <div class="voice-actions"><button type="button" :disabled="!draft.id || unavailable || globalBusy" @click="play(draft)">试听</button><button type="button" :aria-expanded="draft.expanded" :aria-controls="`voice-editor-${draft.key}`" @click="edit(draft)">{{ draft.expanded ? '收起' : '编辑' }}</button>
           <label class="voice-toggle"><input type="checkbox" role="switch" :aria-label="`启用 ${draft.name || '音色'}`" :checked="stored(draft)?.enabled" :disabled="!draft.id || globalBusy || (stored(draft)?.is_default && stored(draft)?.enabled)" @change="toggle(draft, ($event.target as HTMLInputElement).checked)"><span aria-hidden="true"></span></label>
         </div></header>
@@ -214,7 +232,8 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
           <small class="reference-hint">支持 3–15 秒音频，最大 20 MiB（二进制兆字节）。</small>
         </div>
         <div class="voice-footer"><label class="form-field"><span>试音正文</span><textarea v-model="draft.text" class="compact-textarea" rows="1" maxlength="1000" @input="invalidate(draft)"></textarea></label><div class="voice-footer-actions"><button type="button" :disabled="unavailable || globalBusy || (!draft.description.trim() && !draft.source)" @click="preview(draft)">试音</button><button type="button" class="save-button" :disabled="globalBusy || !saveable(draft)" @click="save(draft)">保存</button><button type="button" class="danger-action" :disabled="globalBusy || stored(draft)?.is_default" @click="remove(draft)">{{ draft.id ? '删除' : '取消添加' }}</button></div></div>
-        <p v-if="draft.description.trim() && !saveable(draft)" class="instruction-hint">设计或混合音色需要以当前参数完成一次试音，再保存生成的目标样音。</p>
+        <p v-if="saveBlockReason(draft)" class="instruction-hint">{{ saveBlockReason(draft) }}</p>
+        <p v-if="!draft.name.trim()" class="instruction-hint">未填写名称时，将保存为“{{ voiceName(draft) }}”。</p>
       </div>
       <div v-if="draft.busy" class="voice-task" role="status"><span>正在处理音色…</span><button type="button" @click="cancel(draft)">取消任务</button></div>
       <p v-if="draft.error" class="instruction-error" role="alert">{{ draft.error }}</p><p v-if="draft.notice" class="instruction-hint" role="status">{{ draft.notice }}</p>
