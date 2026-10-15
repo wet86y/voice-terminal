@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 import logging
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,12 @@ class SpeechInferenceBoundary:
         self._mutex = asyncio.Lock()  # _mutex（发送及字符结算互斥锁）。
         self._changed = asyncio.Event()  # _changed（闸门状态变化通知）。
         self._prefill = None  # _prefill（票据、获准补块事务、完成通知）。
+        self._ticket = ContextVar("speech_inference_ticket", default=None)  # _ticket（当前请求独立票据）。
+
+    @property
+    def current_ticket(self):
+        """current_ticket（当前异步请求票据）：不同请求不能借用对方的续写资格。"""
+        return self._ticket.get()
 
     @property
     def frozen(self):
@@ -136,6 +143,8 @@ class SpeechInferenceBoundary:
         completed = None  # completed（补块已被语音服务接受的通知）。
         before_ms = 0  # before_ms（准备开始时的剩余音频）。
         prefill_status = "not_needed"  # prefill_status（补块结果）。
+        retained = None  # retained（本次推理获得的续写窗口锚）。
+        ticket_context = self._ticket.set(ticket)  # ticket_context（进入请求前的上下文令牌）。
         self._requests.add(ticket)
         self._new_speech[ticket] = (identity, set())
         self._changed.set()
@@ -166,6 +175,9 @@ class SpeechInferenceBoundary:
                 handle = self.output.handle
                 sent_chars = handle.sent_chars if handle is not None else 0
                 speech_id = handle.speech_id if handle is not None else None
+                retain = getattr(self.output, "_retain_revision_window", None)
+                if callable(retain):
+                    retained = retain(ticket)
             logger.info(
                 "speech.inference_frozen conversation_id=%s request_id=%s speech_id=%s "
                 "sent_chars=%s remaining_ms=%d target_ms=%d prefill=%s",
@@ -174,6 +186,9 @@ class SpeechInferenceBoundary:
             )
             yield
         finally:
+            release = getattr(self.output, "_release_revision_window", None)
+            if callable(release):
+                release(ticket, retained)
             if self._prefill is not None and self._prefill[0] is ticket:
                 self._prefill = None
             if completed is not None and not completed.done():
@@ -181,5 +196,6 @@ class SpeechInferenceBoundary:
             self._requests.discard(ticket)
             self._new_speech.pop(ticket, None)
             self._changed.set()
+            self._ticket.reset(ticket_context)
             logger.info("speech.inference_released conversation_id=%s request_id=%s held=%s",
                         identity[0], identity[1], self.frozen)

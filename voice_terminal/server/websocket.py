@@ -1055,6 +1055,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         if self.tts is not None and self.tts.active_local_sessions:
             return True
         output = getattr(self.controller, "output", None)
+        if getattr(output, "continuation_active", False):
+            return True
         handle = getattr(output, "handle", None)
         task = getattr(handle, "task", None)
         if task is not None and not task.done():

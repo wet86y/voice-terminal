@@ -312,8 +312,9 @@ def test_snapshot_keeps_the_frontier_when_a_successor_becomes_the_head():
     assert snapshot["sent_chars"] == len(SPOKEN_FIRST) + len(SPOKEN_SUFFIX)
     parts = snapshot["_model_text_parts"]
     assert "".join(parts.values()) == snapshot["text"]
-    assert parts["committed_prefix"] == SPOKEN_FIRST
-    assert parts["revisable_tail"] == SPOKEN_SUFFIX
+    # 后继也已全部提交，不能仅因前一段更长就把已锁定后继误报为可改尾巴。
+    assert parts["committed_prefix"] == SPOKEN_FIRST + SPOKEN_SUFFIX
+    assert parts["revisable_tail"] == ""
     assert snapshot["_model_text_parts_valid"] is True
 
 

@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { createHash, webcrypto } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, flushPromises, type VueWrapper } from '@vue/test-utils'
 import { h, nextTick, ref } from 'vue'
@@ -127,6 +128,63 @@ function speech(text: string, speechId = 'speech-a', turnId = 'input-a') {
 }
 
 describe('会话气泡跨流式与结算阶段的连续显示', () => {
+  it('实时截图通过会话连接加载双图，发送状态更新保留同一气泡和图片', async () => {
+    const createObjectURL = vi.fn().mockReturnValueOnce('blob:global').mockReturnValueOnce('blob:local') // createObjectURL（图片资源地址）。
+    const revokeObjectURL = vi.fn() // revokeObjectURL（图片资源释放）。
+    vi.stubGlobal('URL', class extends URL {
+      static createObjectURL = createObjectURL
+      static revokeObjectURL = revokeObjectURL
+    })
+    vi.stubGlobal('crypto', webcrypto)
+    const encoded = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC' // encoded（单像素图片编码）。
+    const bytes = Buffer.from(encoded, 'base64') // bytes（原始图片字节）。
+    const attachments = (['global', 'local'] as const).map(role => ({
+      attachment_id: `capture-a-${role}`, // attachment_id（图片附件标识）。
+      role, // role（全局画面或局部区域）。
+      mime_type: 'image/png', // mime_type（图片媒体类型）。
+      width: 1, height: 1, // width、height（图片宽高）。
+      bytes: bytes.length, // bytes（图片字节数）。
+      sha256: createHash('sha256').update(bytes).digest('hex'), // sha256（图片校验摘要）。
+    }))
+    const capture = { // capture（服务端实时截图条目）：图片经会话连接读取。
+      seq: 2, // seq（服务端会话顺序）。
+      kind: 'screen_capture', // kind（屏幕截图类型）。
+      conversation_id: 'episode-a', // conversation_id（截图所属会话）。
+      turn_id: 'input-a', // turn_id（触发截图的输入轮次）。
+      speech_id: 'capture-a', // speech_id（截图稳定标识）。
+      text: '屏幕截图', // text（气泡正文）。
+      at: '2026-10-15T11:05:11Z', // at（捕获时间）。
+      status: '待发送', // status（图片发送状态）。
+      attachments, // attachments（双图描述）。
+    }
+    const { wrapper } = await renderConversation()
+    await socket.push('conversation.append', userEntry('看一下现在的屏幕'))
+    await socket.push('conversation.append', capture)
+    const message = wrapper.get('.tool-message').element // message（截图气泡节点）。
+    expect(wrapper.get('.tool-message .message-status').text()).toBe('待发送')
+    const imageRequests = () => socket.sent.map(raw => JSON.parse(raw)).filter(command => command.command === 'conversation.image.read') // imageRequests（实际取图命令）；command（命令名称）。
+    expect(imageRequests().map(command => command.payload)).toEqual(attachments.map(attachment => ({
+      conversation_id: 'episode-a', attachment_id: attachment.attachment_id,
+    })))
+    for (const attachment of attachments) {
+      await socket.push('conversation.image', {
+        conversation_id: 'episode-a', attachment_id: attachment.attachment_id,
+        index: 0, total: 1, // index、total（分块序号及总块数）。
+        mime_type: attachment.mime_type, data: encoded, // data（图片分块编码）。
+      })
+    }
+    await vi.waitFor(() => expect(wrapper.findAll('.capture-thumbnail')).toHaveLength(2))
+    expect(wrapper.findAll('.capture-thumbnail img').map(image => image.attributes('alt'))).toEqual(['全局画面', '局部区域'])
+    expect(wrapper.findAll('.capture-thumbnail img').map(image => image.attributes('src')).sort()).toEqual(['blob:global', 'blob:local'])
+    await socket.push('conversation.append', { ...capture, status: '已发送' })
+    expect(wrapper.findAll('.tool-message')).toHaveLength(1)
+    expect(wrapper.get('.tool-message').element).toBe(message)
+    expect(wrapper.get('.tool-message .message-status').text()).toBe('已发送')
+    expect(wrapper.findAll('.message').map(item => item.attributes('aria-label'))).toEqual(['你的消息', '屏幕截图'])
+    expect(imageRequests()).toHaveLength(2)
+    expect(createObjectURL).toHaveBeenCalledTimes(2)
+    expect(revokeObjectURL).not.toHaveBeenCalled()
+  })
   it('识别中、最终稿与正式记录复用同一节点和逐字进度', async () => {
     const { wrapper } = await renderConversation()
     await socket.push('input.updated', { text: '请帮我检查这段代码' })
