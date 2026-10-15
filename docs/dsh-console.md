@@ -217,11 +217,16 @@ DSH `result`（结果终态）回执得到 `duplicate`（重复确认），没�
 真实队列和 DSH 激活交接，不能说明分类器会在实际场景中选择暂缓。新激活领取速度约为 8 毫秒，未能稳定覆盖
 领取前的 `inbox.replace`（收件箱原位替换）时序；`input_required`（等待用户输入）终态、麦克风输入也未进行真实运行验证。
 
-每个 activation 从 `wake` 被接受时开始按 `shadow_agent.runtime_reminder_interval_ms` 计时，默认每
-20 秒向最近的 next-step 安全边界注入一次软性收敛提醒（20、40、60 秒……）。提醒使用 `inject`，不
+周期性运行提醒默认关闭：`shadow_agent.runtime_reminder_interval_ms` 默认 `0`。收敛要求已由首条受管
+系统提示词一次性给出，不再按固定间隔重复注入，避免运行中反复提醒把模型注意力拉离当前任务。
+需要重新启用时把该项设为正数毫秒值：每个 activation 从 `wake` 被接受时开始计时，按该间隔向最近的
+next-step 安全边界注入一次软性收敛提醒（例如 20000 对应 20、40、60 秒）。提醒使用 `inject`，不
 唤醒 idle Agent、不恢复工具前硬阻断，也不重置 activation 计时；上一条提醒尚未 claim 时原位替换，
 因此安全点前最多保留一条待处理提醒。terminal、cancel、retire 或插件释放会清理计时器，不为提醒额外
-开启模型步骤。
+开启模型步骤。语音侧把该项作为 `runtime_reminder_interval_ms` 传给插件，`0` 或负值即表示禁用。
+关闭状态下 activation 不启动任何提醒定时器：`0` 毫秒间隔会让定时器回调反复自我重排而空转，因此
+禁用判定同时作用于注入点和 `armRuntimeReminder`（挂表）——仅拦截注入不足以避免这种空转，两侧
+都有回归覆盖。正值路径不受影响，按原间隔正常注入。
 普通 DSH assistant 正文永远不进入 Voice 邮箱。Bridge 2.0（桥接协议 2.0）回传只允许以下八个根 Agent 控制工具：
 
 - `get_latest_context`（仅同步补救）；

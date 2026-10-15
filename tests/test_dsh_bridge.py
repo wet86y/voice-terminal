@@ -390,7 +390,7 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
             "session.open", "context.snapshot", "wake",
         ])
         opened = self.client.calls[0][1]
-        self.assertEqual(opened["runtime_reminder_interval_ms"], 20000)
+        self.assertEqual(opened["runtime_reminder_interval_ms"], 0)
         wake = self.client.calls[-1][1]
         self.assertNotIn("text", wake)
         self.assertNotIn("frames", wake)
@@ -651,6 +651,17 @@ class DshBridgeSessionTests(unittest.IsolatedAsyncioTestCase):
 
         opened = next(payload for name, payload in self.client.calls if name == "session.open")
         self.assertEqual(opened["runtime_reminder_interval_ms"], 12345)
+
+    async def test_negative_runtime_reminder_interval_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            DshShadowAgentSession(
+                client=self.client,  # type: ignore[arg-type]
+                mapping_store=DshMappingStore(Path(self.temp.name) / "negative-reminder-mappings.json"),
+                context_source=FakeContext(),
+                voice_session_id="negative-reminder-session",
+                workspace=Path(self.temp.name),
+                runtime_reminder_interval_ms=-1,
+            )
 
     async def test_active_wake_syncs_new_revision_without_second_activation(self) -> None:
         context = MutableContext()

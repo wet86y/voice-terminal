@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { clearActivationIfCurrent, stableBridgeToolId } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/messages.js'
 import { exportSessionPage, readSessionTelemetry } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/observer.js'
-import { deliverRuntimeReminder, enqueueAuthoritativeContext, enqueueDeferredActivation, holdAuthoritativeContext, releaseHeldContext, stopRuntimeReminder } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/context.js'
+import { armRuntimeReminder, deliverRuntimeReminder, enqueueAuthoritativeContext, enqueueDeferredActivation, holdAuthoritativeContext, releaseHeldContext, stopRuntimeReminder } from '../../../../../.local/build/dsh/bundles/voice-terminal-test/lib/bridge/context.js'
 import { assertV4MessageSources } from '../../../../../.local/build/dsh/source/packages/session/session-format-v3-to-v4/src/message-sources.ts'
 
 function fixture() {
@@ -243,6 +243,35 @@ test('settled activations never enqueue a runtime reminder', () => {
 
   assert.equal(deliverRuntimeReminder(binding, 1100), false)
   assert.equal(nextStep.length, 0)
+})
+
+test('a disabled reminder interval never enqueues, records or advances an advisory', () => {
+  for (const reminderIntervalMs of [0, -20000, undefined]) {
+    const { binding, nextStep } = reminderFixture()
+    binding.reminderIntervalMs = reminderIntervalMs
+    binding.nextReminderMs = reminderIntervalMs
+
+    assert.equal(deliverRuntimeReminder(binding, 60_000_000), false, `interval ${reminderIntervalMs}`)
+    assert.equal(nextStep.length, 0, `interval ${reminderIntervalMs}`)
+    assert.equal(binding.pendingReminder, undefined, `interval ${reminderIntervalMs}`)
+    assert.equal(binding.nextReminderMs, reminderIntervalMs, `interval ${reminderIntervalMs}`)
+    assert.deepEqual(binding.records, [], `interval ${reminderIntervalMs}`)
+    assert.equal(binding.traceRevision, 0, `interval ${reminderIntervalMs}`)
+  }
+})
+
+test('a disabled interval arms no timer when the activation starts', async () => {
+  const { binding, nextStep } = reminderFixture()
+  binding.reminderIntervalMs = 0
+  binding.nextReminderMs = 0
+
+  armRuntimeReminder(binding)
+  await new Promise(resolve => setTimeout(resolve, 25))
+
+  assert.equal(binding.reminderTimer, undefined)
+  assert.equal(binding.activationStartedAt, undefined)
+  assert.equal(nextStep.length, 0)
+  assert.deepEqual(binding.records, [])
 })
 
 test('a late terminal callback cannot clear a newer activation', () => {

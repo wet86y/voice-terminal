@@ -61,10 +61,10 @@ class ShadowRuntime(ShadowToolLoopMixin):
         observer_max_context_tokens: int = 32768,
         reasoning_effort: str = "high",
         allowed_reasoning: Sequence[str] | None = None,
-        runtime_reminder_interval_ms: int = 20000,
+        runtime_reminder_interval_ms: int = 0,
         on_metric: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
-        if (provider_timeout_ms is not None and provider_timeout_ms <= 0) or (transport_retry_limit is not None and transport_retry_limit < 0) or observer_every_steps < 1 or reasoning_effort not in {"off", "low", "medium", "high", "max"} or runtime_reminder_interval_ms <= 0:
+        if (provider_timeout_ms is not None and provider_timeout_ms <= 0) or (transport_retry_limit is not None and transport_retry_limit < 0) or observer_every_steps < 1 or reasoning_effort not in {"off", "low", "medium", "high", "max"} or runtime_reminder_interval_ms < 0:
             raise ValueError("invalid Shadow runtime retry/observer configuration")
         if max_context_tokens < 1024 or observer_max_context_tokens < 1024 or not 0 < compaction_threshold_ratio < 1:
             raise ValueError("invalid Shadow context budget")
@@ -144,7 +144,7 @@ class ShadowRuntime(ShadowToolLoopMixin):
         self._provider_attempt_started_at: float | None = None
         self._last_reasoning_delta_at: float | None = None
         self._activation_started_at: float | None = None
-        self._next_runtime_reminder_ms = runtime_reminder_interval_ms
+        self._next_runtime_reminder_ms = max(0, runtime_reminder_interval_ms)
         self._pending_tool_jobs: dict[str, dict[str, Any]] = {}
         self._completed_tool_jobs: deque[dict[str, Any]] = deque()
 
@@ -1022,7 +1022,9 @@ class ShadowRuntime(ShadowToolLoopMixin):
     async def _run_activation(self, serial: int) -> None:
         started = time.monotonic()
         self._activation_started_at = started
-        self._next_runtime_reminder_ms = self.runtime_reminder_interval_ms
+        # 0 keeps the reminder disabled for the whole activation; only read after
+        # a positive-interval check in _maybe_append_runtime_reminder.
+        self._next_runtime_reminder_ms = max(0, self.runtime_reminder_interval_ms)
         context_activity_id = f"context-{serial}"
         try:
             self._activity(

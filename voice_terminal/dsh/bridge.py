@@ -431,10 +431,10 @@ class DshShadowAgentSession:
         observer_max_output_tokens: int = 512,
         observer_timeout_ms: int | None = None,
         availability_waiter: AvailabilityWaiter | None = None,
-        runtime_reminder_interval_ms: int = 20000,
+        runtime_reminder_interval_ms: int = 0,
     ) -> None:
-        if runtime_reminder_interval_ms <= 0:
-            raise ValueError("runtime_reminder_interval_ms must be positive")
+        if runtime_reminder_interval_ms < 0:
+            raise ValueError("runtime_reminder_interval_ms must not be negative")
         self.client = client
         self.mapping_store = mapping_store
         self.context_source = context_source

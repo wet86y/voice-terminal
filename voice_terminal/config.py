@@ -500,7 +500,10 @@ class ShadowAgentConfig:
     reasoning_effort: str = "high"
     allowed_reasoning: tuple[str, ...] = REASONING_EFFORTS
     compaction_threshold_ratio: float = 0.80
-    runtime_reminder_interval_ms: int = 20000
+    # 0 disables the periodic runtime reminder entirely (default: the one-time
+    # convergence rule in the first system prompt is the only time guidance).
+    # A value > 0 injects the advisory reminder every N milliseconds.
+    runtime_reminder_interval_ms: int = 0
     status_observer: ShadowStatusObserverConfig = field(default_factory=ShadowStatusObserverConfig)
 
     def __post_init__(self) -> None:
@@ -516,8 +519,8 @@ class ShadowAgentConfig:
         object.__setattr__(self, "reasoning_effort", "high")
         if not 0 < self.compaction_threshold_ratio < 1:
             raise ValueError("shadow_agent.compaction_threshold_ratio must be between 0 and 1")
-        if self.runtime_reminder_interval_ms <= 0:
-            raise ValueError("shadow_agent.runtime_reminder_interval_ms must be positive")
+        if self.runtime_reminder_interval_ms < 0:
+            raise ValueError("shadow_agent.runtime_reminder_interval_ms must not be negative")
 
 
 def _dsh_default(key: str) -> str:
@@ -856,7 +859,7 @@ class AppConfig:
                 ),
                 compaction_threshold_ratio=float(_number(shadow.get("compaction_threshold_ratio"), 0.80)),
                 runtime_reminder_interval_ms=int(_number(
-                    shadow.get("runtime_reminder_interval_ms"), 20000,
+                    shadow.get("runtime_reminder_interval_ms"), 0,
                 )),
                 status_observer=ShadowStatusObserverConfig(
                     enabled=_bool(shadow_observer.get("enabled"), True),

@@ -203,6 +203,10 @@ export function deliverRuntimeReminder(
   binding: Binding,
   nowMs = Date.now(),
 ): false | 'inserted' | 'replaced' | 'already_claimed' {
+  // Runtime reminder interval（运行提醒间隔）: 0 or less = disabled (no periodic advisory; the managed
+  // one-time system prompt carries the only time-budget guidance), > 0 = advisory every N ms.
+  // Guarding here also protects the crossedIntervals division from a zero interval.
+  if (!(binding.reminderIntervalMs > 0)) return false
   if (
     binding.state !== 'active' || !binding.activationId
     || binding.activationStartedAt === undefined
@@ -279,6 +283,8 @@ function scheduleRuntimeReminder(binding: Binding, activationId: string): void {
 
 export function armRuntimeReminder(binding: Binding): void {
   stopRuntimeReminder(binding, true)
+  // A disabled interval must never arm a timer: a 0 ms interval would reschedule itself on every tick.
+  if (!(binding.reminderIntervalMs > 0)) return
   binding.activationStartedAt = Date.now()
   binding.nextReminderMs = binding.reminderIntervalMs
   scheduleRuntimeReminder(binding, String(binding.activationId ?? ''))

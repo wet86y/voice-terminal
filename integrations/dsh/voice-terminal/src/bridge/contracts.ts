@@ -118,6 +118,7 @@ export interface Binding {
   claimedRevision?: number | undefined
   /** 本激活已暂缓的最新版本。 */
   deferredRevision?: number | undefined
+  /** Runtime reminder interval（运行提醒间隔），ms: 0 or less = disabled (no periodic advisory; the managed one-time system prompt carries the only time-budget guidance), > 0 = advisory every N ms. */
   reminderIntervalMs: number
   activationStartedAt?: number | undefined
   nextReminderMs: number

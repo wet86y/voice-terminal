@@ -156,6 +156,10 @@ class ShadowToolLoopMixin:
         return True
 
     def _maybe_append_runtime_reminder(self, serial: int) -> bool:
+        # 0 (or any value <= 0) disables the periodic reminder: no state change,
+        # no injection and no metric.
+        if self.runtime_reminder_interval_ms <= 0:
+            return False
         if serial != self._activation_serial or self._activation_started_at is None:
             return False
         elapsed_ms = round((time.monotonic() - self._activation_started_at) * 1000)

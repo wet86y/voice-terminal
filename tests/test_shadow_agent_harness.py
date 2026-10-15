@@ -305,6 +305,39 @@ def test_runtime_reminder_is_injected_at_next_safe_boundary_only(tmp_path: Path)
     asyncio.run(scenario())
 
 
+def test_runtime_reminder_is_disabled_by_default(tmp_path: Path):
+    class Provider:
+        def __init__(self): self.requests = []
+        async def complete(self, **kwargs):
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                await asyncio.sleep(0.02)
+                return ShadowProviderResponse((call(1),), {})
+            return ShadowProviderResponse((message("已收敛完成"),), {})
+
+    async def scenario():
+        provider, ledger, events, metrics = Provider(), SessionLedger(), [], []
+        ledger.commit_input("u", "请快速处理")
+        runtime = ShadowRuntime(
+            provider, ShadowToolExecutor(FileTools((tmp_path,))), ledger,
+            instructions_loader=lambda: "fixed", on_event=events.append,
+            observer_enabled=False, on_metric=lambda name, payload: metrics.append(name),
+        )
+        assert runtime.runtime_reminder_interval_ms == 0
+        runtime.wake()
+        await wait_idle(runtime)
+        assert len(provider.requests) == 2
+        # The slow first step crossed the (disabled) interval window, yet no
+        # advisory may be appended and no metric may be recorded.
+        for request in provider.requests:
+            assert "运行时限提醒" not in json.dumps(request["input_items"], ensure_ascii=False)
+        assert "runtime.reminder_injected" not in metrics
+        assert events[-1].text == "已收敛完成"
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
 def test_terminal_response_does_not_add_a_reminder_round(tmp_path: Path):
     class Provider:
         def __init__(self): self.requests = []
