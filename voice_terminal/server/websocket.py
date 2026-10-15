@@ -19,7 +19,7 @@ from .application_runtime import ApplicationRuntimeMixin
 from ..audio.player import PcmPlayer
 from ..audio.processing import AudioPreprocessor
 from ..asr.client import AsrWorkerClient
-from ..config import AppConfig
+from ..config import AppConfig, LOCAL_TTS_PLAYER_RATES, local_tts_native_rate
 from ..paths import AppPaths
 from ..custom_instructions import shadow_projection
 from ..controller.episode_controller import EpisodeController
@@ -200,6 +200,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         self.shadow_product = ShadowProductProjection()
         self._shadow_debug_sinks: dict[str, Any] = {}
         self.player: PcmPlayer | None = None
+        self._pending_local_tts_rate: tuple[str, int] | None = None
         self.audio_processor: AudioPreprocessor | None = None
         self.controller: EpisodeController | None = None
         profile_root = self.paths.speaker if self.paths.separated else config.persona.directory.resolve().parent / "speaker"
@@ -601,7 +602,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             if self.config.tts.output_format.lower() != "pcm":
                 raise RuntimeError("TTS 播放器需要 PCM 输出。")
             if self.config.tts.backend == "voxcpm1":
-                if self.config.tts.sample_rate not in {16000, 24000, 32000, 48000}:
+                if self.config.tts.sample_rate not in LOCAL_TTS_PLAYER_RATES:
                     raise RuntimeError("VoxCPM 播放器 sample_rate（采样率）不受支持")
                 self._local_tts_load_state = "loading"
                 self.state.set_service("tts", "STARTING")
@@ -632,7 +633,32 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
 
         会话控制器持有播放器引用并挂载播放回调；能力级恢复不能替换实例，
         否则回调与设备时钟会脱离，只有首次初始化才新建。
+
+        例外：本地下行采样率跟随所选本地模型的原生率（VoxCPM1 16 kHz、
+        VoxCPM2 48 kHz）。此时必须重建播放器，否则设备仍按旧时钟解释 PCM，
+        播报会变速且丢掉 8 kHz 以上带宽。重建只在没有排队音频时进行。
         """
+        desired = int(self.config.tts.sample_rate)
+        pending = self._pending_local_tts_rate
+        if pending and pending[1] != desired and self._player_is_idle():
+            # 延迟换时钟在此落地：只改配置，播放器由下面的通用分支重建。
+            self._pending_local_tts_rate = None
+            previous_rate = desired
+            desired = pending[1]
+            self.config = replace(self.config, tts=replace(self.config.tts, sample_rate=desired))
+            local = getattr(self.tts, "local", None)
+            if local is not None and hasattr(local, "sample_rate"):
+                local.sample_rate = desired
+            logger.info("tts.local_sample_rate_changed local_model=%s previous_rate=%d sample_rate=%d deferred=True",
+                        pending[0], previous_rate, desired)
+        if self.player is not None and self.player.sample_rate != desired and self._player_is_idle():
+            previous, self.player = self.player, None
+            logger.info("audio.player_clock_changed previous_rate=%d sample_rate=%d",
+                        previous.sample_rate, desired)
+            try:
+                previous.stop()
+            except Exception:  # noqa: BLE001 - 停机失败不能阻断新时钟建立。
+                logger.warning("audio.player_clock_change_stop_failed", exc_info=True)
         if self.player is None:
             self.player = PcmPlayer(
                 playback_permission=lambda: not self.quiet_policy.passive(),
@@ -647,6 +673,15 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         if not self.player.running:
             self.player.start()
         self.state.current["playback_diagnostics"] = self.player.diagnostics
+
+    def _player_is_idle(self) -> bool:
+        """_player_is_idle（播放器空闲）：仍有排队或未播完音频时不允许换时钟。"""
+        if self.player is None:
+            return True
+        try:
+            return int(self.player.buffered_ms) <= 0
+        except Exception:  # noqa: BLE001 - 取不到进度时按"不空闲"处理，避免切坏在播音频。
+            return False
 
     async def _retry_tts(self) -> None:
         """_retry_tts（语音合成恢复）：只重建合成路由，播放器与设备时钟保持不变。"""
@@ -997,6 +1032,33 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             raise
         self._local_tts_load_state = "ready"
         self._local_tts_error = None
+        # 模型热切换同样改变原生率（16 kHz ↔ 48 kHz），下行率必须一起跟上。
+        await self._sync_local_tts_sample_rate(local_model)
+
+    async def _sync_local_tts_sample_rate(self, local_model: str) -> None:
+        """_sync_local_tts_sample_rate（同步下行率）：把本地下行率对齐到模型原生率。
+
+        没有排队音频时立即重建播放器换时钟；正在播报时先记下来，由
+        `_ensure_player` 在空闲后落地，避免打断已排队的音频。
+        """
+        desired = local_tts_native_rate(local_model)
+        current = int(self.config.tts.sample_rate)
+        if current == desired:
+            self._pending_local_tts_rate = None
+            return
+        if not self._player_is_idle():
+            self._pending_local_tts_rate = (local_model, desired)
+            logger.info("tts.local_sample_rate_deferred local_model=%s previous_rate=%d sample_rate=%d "
+                        "reason=player_busy", local_model, current, desired)
+            return
+        self._pending_local_tts_rate = None
+        self.config = replace(self.config, tts=replace(self.config.tts, sample_rate=desired))
+        local = getattr(self.tts, "local", None)
+        if local is not None and hasattr(local, "sample_rate"):
+            local.sample_rate = desired
+        self._ensure_player()
+        logger.info("tts.local_sample_rate_changed local_model=%s previous_rate=%d sample_rate=%d",
+                    local_model, current, desired)
 
     async def switch_tts_selection(self, backend: str, local_model: str) -> None:
         """在停止监听时准备语音后端，失败保留原配置；调用方持有会话锁。"""
@@ -1787,6 +1849,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         self.llm = None
         self.tts = None
         self.player = None
+        self._pending_local_tts_rate = None
         self.audio_processor = None
         self.speaker = None
         self._speaker_engine = None

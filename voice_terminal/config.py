@@ -242,6 +242,29 @@ class LlmConfig:
 
 LOCAL_TTS_DEFAULT_STEPS = {"voxcpm1": 10, "voxcpm2": 20}  # 各本地模型默认推理步数。
 
+# LOCAL_TTS_NATIVE_RATE（本地模型原生输出采样率）：播放器必须按它取时钟。
+# 此前本地后端的下行率固定 16000，VoxCPM2 的 48 kHz 原生输出被砍到 8 kHz 带宽，
+# 齿音、气声和音色细节全部丢失（现场日志 32 kHz→16 kHz 阶跃即此）。
+LOCAL_TTS_NATIVE_RATE = {"voxcpm1": 16000, "voxcpm2": 48000}
+LOCAL_TTS_PLAYER_RATES = frozenset({16000, 24000, 32000, 48000})
+
+
+def local_tts_native_rate(local_model: str) -> int:
+    """local_tts_native_rate（本地模型原生率）：未知模型按最保守的 16 kHz 处理。"""
+    return LOCAL_TTS_NATIVE_RATE.get(str(local_model or "").strip().lower(), 16000)
+
+
+def resolve_tts_sample_rate(backend: str, local_model: str, configured: Any) -> int:
+    """解析本地下行采样率：本地后端必须使用模型原生率，不接受更低的下行率。
+
+    本地原生的重采样是"只降不升"的带宽损失：48 kHz 原生降到 16 kHz 会丢掉
+    8 kHz 以上全部能量（实测原生 8–16 kHz 占 1.1%–14.4%）。因此本地下行率
+    由模型决定；只有在线后端才沿用可配置值。
+    """
+    if backend == "voxcpm1":
+        return local_tts_native_rate(local_model)
+    return int(configured)
+
 
 def validate_tts_inference_steps(value: Any, defaults: Mapping[str, int] | None = None) -> dict[str, int]:
     """inference_steps_by_model（逐模型推理步数）：允许部分更新，范围 1–30。"""
@@ -1013,10 +1036,11 @@ class AppConfig:
                 model=_string(tts.get("model"), "speech-2.8-hd"),
                 api_key_env=_string(tts.get("api_key_env"), "MINIMAX_API_KEY"),
                 output_format=_string(tts.get("output_format"), "pcm"),
-                sample_rate=int(_number(
-                    tts.get("sample_rate"),
-                    16000 if configured_tts_backend == "voxcpm1" else 32000,
-                )),
+                sample_rate=resolve_tts_sample_rate(
+                    configured_tts_backend,
+                    _string(tts.get("local_model"), "voxcpm2").strip().lower(),
+                    _number(tts.get("sample_rate"), 32000),
+                ),
                 voice_id=_string(tts.get("voice_id"), "female-shaonv"),
                 timeout_ms=int(_number(tts.get("timeout_ms"), 15000)),
                 subtitle_enable=_bool(tts.get("subtitle_enable"), False),

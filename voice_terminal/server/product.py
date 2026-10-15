@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 from ..speaker.settings import TUNING_DEFAULTS, validate_tuning
-from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig, validate_tts_inference_steps
+from ..config import AppConfig, COMPUTE_DEVICE_MODES, COMPUTE_MODEL_IDS, ComputeConfig, resolve_tts_sample_rate, validate_tts_inference_steps
 from ..custom_instructions import validate_entries
 from ..asr.hotwords import DEFAULT_HOTWORDS, validate_hotwords
 from ..quiet_hours import QuietHoursConfig
@@ -556,7 +556,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     next_tts = replace(
         config.tts,
         backend=backend,
-        sample_rate=16000 if backend == "voxcpm1" else config.tts.sample_rate,
+        sample_rate=resolve_tts_sample_rate(backend, str(local_model), config.tts.sample_rate),
         provider="minimax",
         local_model=str(local_model),
         local_optimization=tts.get("local_optimization", config.tts.local_optimization),

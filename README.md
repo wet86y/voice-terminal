@@ -123,7 +123,7 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 - `.local/data/config/product-settings.json`（本机产品设置）：包含 KWS（关键词唤醒）、静默、Shadow（影子代理）、自定义指令和声纹设置等非密钥内容。
 - `.local/data/speaker/`（当前声纹资料）：保存注册资料、模板和特征指纹；详见 [声纹增强](docs/speaker-enhancement.md)。
 
-诊断日志集中在工作区 `cache/logs`（运行日志目录），属于可回收缓存。该目录保留 **100 MiB** 总预算（`VOICE_LOG_BUDGET_MB`，设为 `0` 关闭），超出后按最旧优先逐步剔除轮转文件；被存活进程打开的文件在 Windows（操作系统）上无法回收，会保留并在日志中说明。本地 TTS（语音合成）日志的关联键、失败路径与四个诊断开关（`VOICE_TTS_NATIVE_TRACE`、`VOICE_TTS_LOG_TEXT`、`VOICE_TTS_NATIVE_LOG_PUMP`、`VOICE_LOG_LEVEL`）见[本地 TTS 可观测性](docs/local-tts-observability-20261015.md)。
+诊断日志集中在工作区 `cache/logs`（运行日志目录），属于可回收缓存。该目录保留 **100 MiB** 总预算（`VOICE_LOG_BUDGET_MB`，设为 `0` 关闭），超出后按最旧优先逐步剔除轮转文件；被存活进程打开的文件在 Windows（操作系统）上无法回收，会保留并在日志中说明。本地 TTS（语音合成）日志的关联键、失败路径与四个诊断开关（`VOICE_TTS_NATIVE_TRACE`、`VOICE_TTS_LOG_TEXT`、`VOICE_TTS_NATIVE_LOG_PUMP`、`VOICE_LOG_LEVEL`）见[本地 TTS 可观测性](docs/local-tts-observability-20261015.md)。本地音色的还原度结论（混合模式通道竞争、参考转写、下行带宽、参考音频时长上限）与修复见[本地 TTS 音色还原度与下行带宽修复](docs/local-tts-voice-fidelity-20261015.md)；现场「怪音与后期失真」取证见[本地 TTS 怪音与后期失真诊断](docs/local-tts-glitch-and-distortion-20261015.md)。
 
 配置模板随代码更新，已有用户设置由数据目录保存。普通覆盖发布复用模型与运行环境，不覆盖 `.local/data/`（真实用户数据）；重要数据的唯一滚动备份和显式交付导出命令见[本地目录与覆盖发布](docs/local-layout.md)。
 
@@ -189,6 +189,8 @@ git diff --check
 - [LLM 上下文缓存契约](docs/llm-context-cache-contract.md)
 - [LLM JSON Schema 迁移与回滚 Runbook](docs/llm-json-schema-migration.md)
 - [可选声纹增强](docs/speaker-enhancement.md)
+- [本地 TTS 音色还原度与下行带宽修复](docs/local-tts-voice-fidelity-20261015.md)：混合模式通道竞争、参考转写配方、48 kHz 下行、参考音频时长上限与高保真音色存档。
+- [本地 TTS「怪音」与「后期失真」诊断](docs/local-tts-glitch-and-distortion-20261015.md)：跑飞样本取证与待办判废链。
 - [环境声、严格声纹拦截与重置修复](docs/voice-reliability-fixes-20261010.md)：输出许可、整理材料构造及当前验证边界。
 - [项目隔离 DSH 控制台](docs/dsh-console.md)
 - [运行与质量门槛](docs/operations-and-quality.md)

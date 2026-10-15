@@ -727,7 +727,7 @@ class AudioCppTtsClient:
     playback_resume_buffer_ms = 400  # playback_resume_buffer_ms（欠载后连续音频储备）。
 
     def __init__(self, server: AudioCppTtsServer, *, timeout_seconds: float = 300.0,
-                 sample_rate: int = 16000, sentence_min_effective_chars: int = 10,
+                 sample_rate: int | None = None, sentence_min_effective_chars: int = 10,
                  sentence_prefetch_ms: int = 3000, sentence_tick_ms: int = 50,
                  first_clause_timeout_ms: int = 400,
                 http_transport: httpx.AsyncBaseTransport | None = None,
@@ -741,7 +741,12 @@ class AudioCppTtsClient:
         self.base_url = server.base_url
         self.timeout_seconds = timeout_seconds
         # sample_rate（播放器采样率）沿用当前输出设备时钟，模式热切换不重载输入模型。
-        self.sample_rate = int(sample_rate)
+        # sample_rate（播放器采样率）沿用当前输出设备时钟，模式热切换不重载输入模型。
+        # 未显式指定时取所选模型的原生率：VoxCPM2 原生 48 kHz 降到 16 kHz 会丢掉
+        # 8 kHz 以上全部带宽（实测占 1.1%–14.4%），默认值不能是 16 kHz。
+        self._sample_rate_locked = sample_rate is not None
+        self.sample_rate = int(sample_rate) if sample_rate else int(
+            getattr(server, "native_sample_rate", 16000))
         self.sentence_min_effective_chars = int(sentence_min_effective_chars)
         self.sentence_prefetch_ms = int(sentence_prefetch_ms)
         self.sentence_tick_ms = int(sentence_tick_ms)
@@ -797,8 +802,22 @@ class AudioCppTtsClient:
         return status
 
     async def switch_model(self, local_model: str) -> None:
+        """切换本地模型并同步下行率。
+
+        VoxCPM1 与 VoxCPM2 的原生率不同（16 kHz / 48 kHz），下行率必须跟着模型走。
+        此前切换只改服务端模型，客户端仍按旧率重采样——VoxCPM2 会被一直砍到 8 kHz
+        带宽，且播放器时钟与真实 PCM 不一致。调用方显式锁定的下行率优先保留。
+        """
+        previous = self.sample_rate
         await self.server.switch_model(local_model)
         self._warmed = False
+        if self._sample_rate_locked:
+            return
+        desired = self.native_sample_rate
+        if desired != previous:
+            self.sample_rate = desired
+            logger.info("audio_cpp_tts.client_rate_followed_model local_model=%s previous_rate=%d sample_rate=%d",
+                        local_model, previous, desired)
 
     @staticmethod
     def normalize_emotion(emotion: str | None) -> str:
@@ -1086,6 +1105,12 @@ class AudioCppTtsSession:
             if not voice.reference_path:
                 raise self._reject("voice", "VoxCPM2（第二代本地语音模型）参考音频不可用。")
             body["voice_ref"] = str(voice.reference_path.resolve())
+            # reference_text（参考转写）：原生把它解析成 prompt_text，与参考音频一起
+            # 构成官方最高相似度的 reference+continuation 配方。此前二代从不发送它，
+            # 正式播报只走 isolated 参考通道（实测相似度 0.6381，带转写 0.8557）。
+            # 转写必须与参考音频内容一致，不匹配会引入额外内容甚至拉长输出。
+            if voice.reference_text.strip():
+                body["reference_text"] = voice.reference_text
         self._request_had_audio = False
         if self._continuation_enabled:
             body["continuation_id"] = self._continuation_id

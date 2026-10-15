@@ -44,7 +44,8 @@ def _response(*events: str) -> httpx.Response:
     )
 
 
-def _fake_client(handler, *, native_sample_rate: int = 16000) -> AudioCppTtsClient:
+def _fake_client(handler, *, native_sample_rate: int = 16000,
+                 sample_rate: int | None = None) -> AudioCppTtsClient:
     local_model = "voxcpm1" if native_sample_rate == 16000 else "voxcpm2"
     server = SimpleNamespace(
         base_url="http://127.0.0.1:18881",
@@ -55,7 +56,7 @@ def _fake_client(handler, *, native_sample_rate: int = 16000) -> AudioCppTtsClie
         close=AsyncMock(),
     )
     client = AudioCppTtsClient(server, http_transport=httpx.MockTransport(handler),
-                               gpu_max_performance=False)
+                               gpu_max_performance=False, sample_rate=sample_rate)
     # Tests must explicitly supply the per-request reference snapshot; production no longer
     # falls back to a server-wide default voice.
     client.resolve_voice = lambda emotion, preview=False: ResolvedLocalTtsVoice(
@@ -159,6 +160,7 @@ def test_consecutive_text_blocks_are_submitted_in_order():
 
 
 def test_voxcpm2_pcm_is_continuously_downsampled_across_sse_chunks():
+    """下行率被显式压到 16 kHz 时，重采样必须跨 SSE 分块连续。"""
     async def scenario():
         native = [3, 6, 9, 12, 15, 18]
         first = struct.pack("<hh", *native[:2])
@@ -170,7 +172,7 @@ def test_voxcpm2_pcm_is_continuously_downsampled_across_sse_chunks():
                 _event("speech.audio.done"), "data: [DONE]\n\n",
             )
 
-        client = _fake_client(handler, native_sample_rate=48000)
+        client = _fake_client(handler, native_sample_rate=48000, sample_rate=16000)
         session = client.session()
         await session.start()
         await session.send_text("验证 VoxCPM2 的连续重采样输出")
@@ -183,6 +185,41 @@ def test_voxcpm2_pcm_is_continuously_downsampled_across_sse_chunks():
         assert np.max(np.abs(np.frombuffer(output, dtype=np.int16).astype(int) - np.frombuffer(expected, dtype=np.int16))) <= 2
         assert session.request_metrics[0]["native_pcm_bytes"] == 12
         assert session.request_metrics[0]["pcm_bytes"] == 4
+
+    asyncio.run(scenario())
+
+
+def test_voxcpm2_delivers_native_rate_without_downsampling_by_default():
+    """缺省下行率取模型原生率：48 kHz 原生输出必须原样送出。
+
+    此前缺省 16000，VoxCPM2 的 48 kHz 被砍到 8 kHz 带宽；实测原生 8–16 kHz
+    占 1.1%–14.4% 能量，这部分全部丢失。
+    """
+    async def scenario():
+        native = [3, 6, 9, 12, 15, 18]
+        payload = struct.pack("<hhhhhh", *native)
+
+        async def handler(_request):
+            return _response(
+                _audio_event(payload[:4]), _audio_event(payload[4:]),
+                _event("speech.audio.done"), "data: [DONE]\n\n",
+            )
+
+        client = _fake_client(handler, native_sample_rate=48000)
+        assert client.sample_rate == 48000
+        session = client.session()
+        assert session._resampler is None, "原生率下行不应创建重采样器"
+        await session.start()
+        await session.send_text("验证 VoxCPM2 原生率直通输出")
+        await session.finish()
+        output = b"".join([chunk async for chunk in session.audio_chunks()])
+        assert output == payload
+        assert session.request_metrics[0]["native_pcm_bytes"] == 12
+        assert session.request_metrics[0]["pcm_bytes"] == 12
+
+        # VoxCPM1 的原生率本来就是 16 kHz。
+        client_v1 = _fake_client(handler, native_sample_rate=16000)
+        assert client_v1.sample_rate == 16000
 
     asyncio.run(scenario())
 
@@ -391,7 +428,9 @@ def test_combined_design_sends_source_audio_and_description_without_continuation
         await session.close()
         assert bodies[0]['input'] == '(温暖清楚)生成可控克隆的目标样音。'
         assert bodies[0]['voice_ref'] == str(voice.reference_path)
-        assert 'continuation_id' not in bodies[0] and 'reference_text' not in bodies[0]
+        # 描述在独立文本通道，不引入续接上下文；参考转写随参考音频一起发。
+        assert 'continuation_id' not in bodies[0]
+        assert bodies[0]['reference_text'] == voice.reference_text
         await client.close()
     asyncio.run(scenario())
 
@@ -754,7 +793,7 @@ def test_session_runtime_builds_local_backend_without_reading_minimax_key():
             }],
         }), encoding="utf-8")
         config = AppConfig.from_mapping(
-            {"tts": {"backend": "voxcpm1", "sample_rate": 16000}},
+            {"tts": {"backend": "voxcpm1", "local_model": "voxcpm1", "sample_rate": 16000}},
             base_dir=root,
         )
         product = ProductSettingsStore(path=local_root / "config" / "product-settings.json", config=config)
@@ -824,8 +863,8 @@ def test_runtime_migrates_legacy_default_voice_before_rewriting_native_config():
         data_root = local_root / "data"
         legacy_voice = local_root / "cache" / "reports" / "audio-cpp-tts-evaluation" / "reference.wav"
         legacy_voice.parent.mkdir(parents=True)
-        samples = struct.pack("<" + "h" * (16000 * 4), *[
-            int(4000 * ((index % 80) - 40) / 40) for index in range(16000 * 4)
+        samples = struct.pack("<" + "h" * (16000 * 5), *[
+            int(4000 * ((index % 80) - 40) / 40) for index in range(16000 * 5)
         ])
         stream = io.BytesIO()
         with wave.open(stream, "wb") as handle:
@@ -871,6 +910,46 @@ def test_runtime_migrates_legacy_default_voice_before_rewriting_native_config():
             runtime.tts = None
 
 
+def test_voxcpm2_formal_clone_sends_reference_transcript():
+    """二代正式克隆必须带上参考转写：原生用它走官方最高相似度配方。
+
+    只发 voice_ref 时走 isolated 参考通道（实测相似度 0.6381）；带上与参考音频
+    内容一致的 reference_text 后升到 0.8557。没有转写时不能凭空编一个。
+    """
+    async def scenario():
+        bodies = []
+
+        async def handler(request):
+            bodies.append(json.loads(request.content))
+            return _response(_audio_event(b"\x01\x00" * 9), _event("speech.audio.done"), "data: [DONE]\n\n")
+
+        client = _fake_client(handler, native_sample_rate=48000)
+        voice = client.resolve_voice(None)
+        assert voice.reference_text, "夹具参考音色应带转写"
+
+        session = client.session(voice_snapshot=voice)
+        await session.start()
+        await session.send_text("第一句完整正文。")
+        await session.finish()
+        _ = [chunk async for chunk in session.audio_chunks()]
+        await session.close()
+        assert bodies[0]["voice_ref"] == str(voice.reference_path.resolve())
+        assert bodies[0]["reference_text"] == voice.reference_text
+
+        # 没有转写的参考音色不能带上空字段，也不该报错。
+        blank = replace(voice, reference_text="   ")
+        session = client.session(voice_snapshot=blank)
+        await session.start()
+        await session.send_text("第二句完整正文。")
+        await session.finish()
+        _ = [chunk async for chunk in session.audio_chunks()]
+        await session.close()
+        assert "reference_text" not in bodies[1]
+        await client.close()
+
+    asyncio.run(scenario())
+
+
 def test_router_close_keeps_local_service_until_runtime_shutdown():
     async def scenario():
         remote = SimpleNamespace(close=AsyncMock())
@@ -882,3 +961,53 @@ def test_router_close_keeps_local_service_until_runtime_shutdown():
         local.close.assert_awaited_once()
 
     asyncio.run(scenario())
+
+
+def test_local_tts_player_rate_follows_model_native_output():
+    """本地下行率必须等于模型原生率：48 kHz 原生降到 16 kHz 会丢掉 8 kHz 以上全部带宽。"""
+    from voice_terminal.config import LOCAL_TTS_NATIVE_RATE, local_tts_native_rate, resolve_tts_sample_rate
+
+    assert LOCAL_TTS_NATIVE_RATE == {"voxcpm1": 16000, "voxcpm2": 48000}
+    assert local_tts_native_rate("voxcpm2") == 48000
+    assert local_tts_native_rate("voxcpm1") == 16000
+    # 未知模型取最保守值，不能凭配置漂移到更低带宽。
+    assert local_tts_native_rate("unknown") == 16000
+
+    # 本地后端忽略配置值，在线后端沿用配置值。
+    assert resolve_tts_sample_rate("voxcpm1", "voxcpm2", 16000) == 48000
+    assert resolve_tts_sample_rate("voxcpm1", "voxcpm1", 48000) == 16000
+    assert resolve_tts_sample_rate("minimax", "voxcpm2", 32000) == 32000
+
+
+def test_local_tts_config_defaults_to_native_rate_per_model():
+    """启动配置：本地 VoxCPM2 缺省 48 kHz，VoxCPM1 缺省 16 kHz，在线缺省 32 kHz。"""
+    config = AppConfig.from_mapping({"tts": {"backend": "voxcpm1"}}, base_dir=Path("."))
+    assert config.tts.sample_rate == 48000  # local_model 缺省 voxcpm2。
+
+    config = AppConfig.from_mapping(
+        {"tts": {"backend": "voxcpm1", "local_model": "voxcpm1"}}, base_dir=Path("."))
+    assert config.tts.sample_rate == 16000
+
+    config = AppConfig.from_mapping({"tts": {"backend": "minimax"}}, base_dir=Path("."))
+    assert config.tts.sample_rate == 32000
+
+    # 本地后端即使显式写低下行率，也不能把 48 kHz 原生砍掉。
+    config = AppConfig.from_mapping(
+        {"tts": {"backend": "voxcpm1", "local_model": "voxcpm2", "sample_rate": 16000}},
+        base_dir=Path("."))
+    assert config.tts.sample_rate == 48000
+
+
+def test_router_exposes_playback_reserve_from_active_client():
+    """路由层必须代理播放储备属性，否则控制器守卫静默取到 0、不装配储备闸门。"""
+    local = SimpleNamespace(playback_startup_buffer_ms=800, playback_resume_buffer_ms=400)
+    remote = SimpleNamespace()
+    router = TtsBackendRouter(remote=remote, local=local, backend="voxcpm1")
+    assert router.playback_startup_buffer_ms == 800
+    assert router.playback_resume_buffer_ms == 400
+    # 守卫表达式必须为真，才能进入 configure_stream_buffer。
+    assert getattr(router, "playback_startup_buffer_ms", 0)
+
+    router.backend = "minimax"
+    assert router.playback_startup_buffer_ms == 0
+    assert not getattr(router, "playback_startup_buffer_ms", 0)

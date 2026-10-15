@@ -217,7 +217,7 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
         </div></header>
       <div v-if="draft.expanded" :id="`voice-editor-${draft.key}`" class="voice-editor">
         <div class="voice-inputs" :class="{ single: model === 'voxcpm1' }">
-          <label v-if="model === 'voxcpm2'" class="form-field voice-design"><span>音色设计 <small>可选</small></span><textarea v-model="draft.description" class="compact-textarea" rows="1" maxlength="500" placeholder="例如：温和自然的女声，清晰、平稳，略带微笑。" @input="invalidate(draft)"></textarea><small>描述声音特征，可单独设计或结合参考音频。</small></label>
+          <label v-if="model === 'voxcpm2'" class="form-field voice-design"><span>音色设计 <small>可选</small></span><textarea v-model="draft.description" class="compact-textarea" rows="1" maxlength="500" placeholder="例如：语速稍慢，语气平稳自然。" @input="invalidate(draft)"></textarea><small v-if="draft.source">已添加参考音频：描述只控制语速、语气等风格；音色由参考音频决定。不要再写性别、年龄、音质等音色特征，那会覆盖参考音频的音色。</small><small v-else>描述声音特征（性别、年龄、音色、语速），仅用描述即可从零设计音色。</small></label>
           <label class="form-field"><span>音频转写 <small>{{ model === 'voxcpm1' ? '准确转写必填' : '可校对' }}</small></span><textarea v-model="draft.transcript" class="compact-textarea" rows="1" placeholder="添加音频后自动识别，也可手动输入并校对。" @input="invalidate(draft)"></textarea></label>
         </div>
         <div class="voice-reference">
@@ -229,7 +229,7 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
               <span class="upload-caption"><strong>添加参考音频</strong><small>点击选择或拖入文件</small></span>
             </label>
           </div>
-          <small class="reference-hint">支持 3–15 秒音频，最大 20 MiB（二进制兆字节）。</small>
+          <small class="reference-hint">支持 5–15 秒音频（官方建议至少 5 秒，5–12 秒最佳），最大 20 MiB（二进制兆字节）。</small>
         </div>
         <div class="voice-footer"><label class="form-field"><span>试音正文</span><textarea v-model="draft.text" class="compact-textarea" rows="1" maxlength="1000" @input="invalidate(draft)"></textarea></label><div class="voice-footer-actions"><button type="button" :disabled="unavailable || globalBusy || (!draft.description.trim() && !draft.source)" @click="preview(draft)">试音</button><button type="button" class="save-button" :disabled="globalBusy || !saveable(draft)" @click="save(draft)">保存</button><button type="button" class="danger-action" :disabled="globalBusy || stored(draft)?.is_default" @click="remove(draft)">{{ draft.id ? '删除' : '取消添加' }}</button></div></div>
         <p v-if="saveBlockReason(draft)" class="instruction-hint">{{ saveBlockReason(draft) }}</p>

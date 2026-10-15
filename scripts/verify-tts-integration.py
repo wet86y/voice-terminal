@@ -155,7 +155,9 @@ async def voice_design_case(client):
     source = library.register_default((seed / "default.wav").read_bytes(), transcript)
     original = client.voice_library
     client.voice_library = libraries
-    player = PcmPlayer(sample_rate=16000, channels=1, output_device=None)
+    # 播放器采样率跟随客户端的下行率：VoxCPM2 原生 48 kHz，写死 16 kHz 会让
+    # 每回调帧数与真实字节数不匹配，播放推进量会算错。
+    player = PcmPlayer(sample_rate=client.sample_rate, channels=1, output_device=None)
     runtime = SimpleNamespace(voice_library=libraries, tts=SimpleNamespace(local=client), player=player,
                               config=SimpleNamespace(tts=SimpleNamespace(backend="voxcpm1", local_model="voxcpm2")))
     manager = TtsVoiceOperationManager(runtime)
@@ -167,9 +169,10 @@ async def voice_design_case(client):
                 draft.update(source_reference_asset_id=source["reference_asset_id"], source_reference_text=transcript)
             operation = manager.start_preview("voxcpm2", draft, DESIGN_SAMPLE_TEXT)
             task = manager._items[operation["operation_id"]].task
+            frame = max(1, player.sample_rate // 50)
             async with asyncio.timeout(120):
                 while not task.done():
-                    player._callback(bytearray(640), 320, None, None)
+                    player._callback(bytearray(frame * 2), frame, None, None)
                     await asyncio.sleep(.005)
             await task
             completed = manager.get(operation["operation_id"])
@@ -191,9 +194,21 @@ async def voice_design_case(client):
                 assert formal_bytes > 0 and not clone._control_instructions()
             finally:
                 await clone.close()
+            # 高保真旁路：原生率样音另存一份，主素材仍是 16 kHz 供编码器使用。
+            asset_id = candidate["reference_asset_id"]
+            hifi = library.high_fidelity_path(asset_id)
+            asset_meta = library._index["assets"][asset_id]
+            assert asset_meta["sample_rate"] == 16000
+            assert hifi is not None and hifi.is_file(), (
+                f"高保真副本缺失 mixed={mixed} client_rate={client.sample_rate} "
+                f"native={client.native_sample_rate} meta={asset_meta}")
+            assert asset_meta["high_fidelity"]["sample_rate"] == client.native_sample_rate
+            assert hifi.stat().st_size > library.asset_path(asset_id).stat().st_size
             results.append({"mixed": mixed, "duration_ms": completed["result"]["duration_ms"],
-                            "target_asset_id": candidate["reference_asset_id"], "formal_uses_target_sample": True,
-                            "formal_pcm_bytes": formal_bytes})
+                            "target_asset_id": asset_id, "formal_uses_target_sample": True,
+                            "formal_pcm_bytes": formal_bytes,
+                            "high_fidelity_rate": asset_meta["high_fidelity"]["sample_rate"],
+                            "high_fidelity_bytes": hifi.stat().st_size})
         return results
     finally:
         await manager.close()
@@ -264,7 +279,8 @@ async def main(args):
     report["fields"].update(held_pcm_bytes="播放许可关闭时缓存字节", locked_chars_before_release="授权前锁定字数",
                             silent_before_release="授权前回调静音", audio_after_release="授权后回调顺序读取音频")
     report["fields"].update(mixed="是否混合设计", duration_ms="样音时长毫秒", target_asset_id="生成目标样音标识",
-                            formal_uses_target_sample="正式克隆使用已保存目标样音", formal_pcm_bytes="正式目标样音克隆返回的完整音频字节")
+                            formal_uses_target_sample="正式克隆使用已保存目标样音", formal_pcm_bytes="正式目标样音克隆返回的完整音频字节",
+                            high_fidelity_rate="高保真旁路副本的原生采样率", high_fidelity_bytes="高保真旁路副本字节数")
     try:
         if args.local:
             await local(report)
