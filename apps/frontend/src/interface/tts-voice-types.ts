@@ -47,6 +47,8 @@ export interface TtsVoicePort {
   deleteTtsVoice(model: ProductLocalTtsModelId, id: string): Promise<unknown>
   selectTtsVoice(model: ProductLocalTtsModelId, selection: ProductTtsVoiceSelection | null): Promise<unknown>
   uploadTtsAsset(model: ProductLocalTtsModelId, file: File): Promise<{ asset: ProductTtsAsset }>
+  /** ttsAssetAudioUrl（参考音频地址）：供原生播放器读取音频并定位播放进度。 */
+  ttsAssetAudioUrl(model: ProductLocalTtsModelId, asset_id: string): string
   startTtsTranscribe(model: ProductLocalTtsModelId, asset_id: string): Promise<ProductTtsOperation>
   startTtsPreview(model: ProductLocalTtsModelId, voice: Partial<ProductTtsVoice>, text: string): Promise<ProductTtsOperation>
   startTtsPlay(model: ProductLocalTtsModelId, asset_id: string): Promise<ProductTtsOperation>

@@ -2154,7 +2154,14 @@ time {
   min-height: 42px;
   font-size: var(--font-body);
 }
+.compact-textarea,
 .instruction-target-field textarea {
+  /* compact-textarea（紧凑文本域）：复用指令字段尺寸，手动拉伸且溢出滚动。 */
+  display: block;
+  height: 42px;
+  min-height: 42px;
+  font-size: var(--font-body);
+  resize: vertical;
   overflow-y: auto;
 }
 @container (max-width: 560px) {

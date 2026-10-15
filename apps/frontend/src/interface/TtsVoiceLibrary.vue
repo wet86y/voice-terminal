@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import ReferenceAudioPlayer from './ReferenceAudioPlayer.vue'
 import { useTtsVoiceState, voiceDraft, TTS_SAMPLE_TEXT, type VoiceDraft } from './useTtsVoiceState'
 import type { ProductLocalTtsModelId, ProductTtsVoice, ProductTtsOperation, TtsVoicePort } from './tts-voice-types'
 
@@ -7,6 +8,26 @@ const props = withDefaults(defineProps<{ model: ProductLocalTtsModelId; steps: n
 const productApi = props.port! // port（业务接口）：演示模式仅使用模拟数据。
 const emit = defineEmits<{ changed: [] }>()
 const state = useTtsVoiceState()
+const activeReferenceKey = ref('') // activeReferenceKey（当前播放附件所属草稿）。
+const transcribingKey = ref('') // transcribingKey（正在识别的草稿）。
+const localAudioUrls = ref<Record<string, string>>({}) // localAudioUrls（演示附件的临时播放地址）。
+function releaseLocalAudio(draft: VoiceDraft) {
+  const assetId = draft.source?.asset_id
+  if (assetId && localAudioUrls.value[assetId]) { URL.revokeObjectURL(localAudioUrls.value[assetId]); delete localAudioUrls.value[assetId] }
+}
+onBeforeUnmount(() => { for (const url of Object.values(localAudioUrls.value)) URL.revokeObjectURL(url) })
+function referenceUrl(draft: VoiceDraft) {
+  if (!draft.source) return undefined
+  return props.demo ? localAudioUrls.value[draft.source.asset_id] : productApi.ttsAssetAudioUrl(props.model, draft.source.asset_id)
+}
+async function edit(draft: VoiceDraft) {
+  draft.expanded = !draft.expanded
+  if (draft.expanded) {
+    await nextTick()
+    const input = document.getElementById(`voice-name-${draft.key}`) as HTMLInputElement | null
+    input?.focus(); input?.select()
+  }
+}
 watch(() => [props.model, props.steps] as const, ([model, steps]) => { state.inferenceSteps[model] = steps }, { immediate: true })
 const bucket = computed(() => state.models[props.model])
 const drafts = computed(() => Object.values(bucket.value.drafts))
@@ -61,12 +82,15 @@ async function run(draft: VoiceDraft, action: (generation: number) => Promise<vo
 }
 async function transcribe(draft: VoiceDraft) {
   const model = props.model; const asset = draft.source; const initialText = draft.transcript
-  if (!asset) return
-  await run(draft, async generation => {
-    if (props.demo) { draft.transcript = '这是一段参考音频的演示转写，可以在这里校对。'; return }
-    const result = await monitor(draft, () => productApi.startTtsTranscribe(model, asset.asset_id), generation)
-    if (draft.generation === generation && draft.source?.asset_id === asset.asset_id && draft.transcript === initialText && result.result?.text) draft.transcript = result.result.text
-  })
+  if (!asset || globalBusy.value) return
+  transcribingKey.value = draft.key
+  try {
+    await run(draft, async generation => {
+      if (props.demo) { draft.transcript = '这是一段参考音频的演示转写，可以在这里校对。'; return }
+      const result = await monitor(draft, () => productApi.startTtsTranscribe(model, asset.asset_id), generation)
+      if (draft.generation === generation && draft.source?.asset_id === asset.asset_id && draft.transcript === initialText && result.result?.text) draft.transcript = result.result.text
+    })
+  } finally { transcribingKey.value = '' }
 }
 async function upload(draft: VoiceDraft, files: FileList | File[]) {
   if (files.length !== 1) { draft.error = '请一次选择一条参考音频。'; return }
@@ -75,14 +99,16 @@ async function upload(draft: VoiceDraft, files: FileList | File[]) {
   try {
     const asset = props.demo ? { asset_id: crypto.randomUUID(), duration_ms: 5680 } : (await productApi.uploadTtsAsset(model, file)).asset
     if (draft.generation !== generation) return
+    releaseLocalAudio(draft)
+    if (props.demo) localAudioUrls.value[asset.asset_id] = URL.createObjectURL(file)
     draft.source = { ...asset, filename: file.name }; draft.transcript = ''; draft.name ||= file.name.replace(/\.[^.]+$/, '')
   } catch (error) { if (draft.generation === generation) draft.error = error instanceof Error ? error.message : '上传失败，原附件已保留。' }
   finally { draft.busy = false }
   if (draft.generation === generation && draft.source?.filename === file.name) await transcribe(draft)
 }
 function fileChange(draft: VoiceDraft, event: Event) { const input = event.target as HTMLInputElement; if (input.files?.length) void upload(draft, input.files); input.value = '' }
-function drop(draft: VoiceDraft, event: DragEvent) { if (!draft.busy && event.dataTransfer?.files.length) void upload(draft, event.dataTransfer.files) }
-function removeSource(draft: VoiceDraft) { invalidate(draft); draft.source = null; draft.transcript = '' }
+function drop(draft: VoiceDraft, event: DragEvent) { if (!globalBusy.value && event.dataTransfer?.files.length) void upload(draft, event.dataTransfer.files) }
+function removeSource(draft: VoiceDraft) { releaseLocalAudio(draft); invalidate(draft); draft.source = null; draft.transcript = '' }
 async function preview(draft: VoiceDraft) {
   const model = props.model; const prepared = signature(draft, model)
   await run(draft, async generation => {
@@ -106,15 +132,21 @@ async function play(draft: VoiceDraft) {
   })
 }
 function saveable(draft: VoiceDraft) {
-  return !!draft.name.trim() && (props.model === 'voxcpm2' && draft.description.trim()
+  return !!draft.name.trim() && (unchangedContent(draft) || (props.model === 'voxcpm2' && draft.description.trim()
     ? !!draft.candidate && draft.signature === signature(draft)
-    : !!draft.source && (props.model === 'voxcpm2' || !!draft.transcript.trim()))
+    : !!draft.source && (props.model === 'voxcpm2' || !!draft.transcript.trim())))
+}
+function unchangedContent(draft: VoiceDraft) {
+  const voice = stored(draft)
+  if (!voice) return false
+  const original = voiceDraft(voice)
+  return draft.description === original.description && draft.transcript === original.transcript && draft.text === original.text && draft.source?.asset_id === original.source?.asset_id
 }
 async function save(draft: VoiceDraft) {
   if (!saveable(draft)) return
   const model = props.model
   await run(draft, async () => {
-    const payload = draft.description.trim() ? { ...draft.candidate, name: draft.name.trim() } : {
+    const payload = unchangedContent(draft) ? { ...stored(draft)!, name: draft.name.trim() } : draft.description.trim() ? { ...draft.candidate, name: draft.name.trim() } : {
       name: draft.name.trim(), source: 'import', reference_asset_id: draft.source!.asset_id,
       reference_text: draft.transcript, source_reference_text: draft.transcript,
     }
@@ -129,6 +161,7 @@ async function save(draft: VoiceDraft) {
       delete state.models[model].drafts[draft.key]; draft.key = response.voice.id; state.models[model].drafts[draft.key] = draft
       await refresh(model)
     }
+    draft.name = draft.name.trim(); draft.expanded = false
     draft.notice = '音色已保存；已启用音色从下一次回答生效。'; emit('changed')
   })
 }
@@ -145,6 +178,7 @@ async function remove(draft: VoiceDraft) {
   const model = props.model
   await run(draft, async () => {
     if (draft.id && !props.demo) await productApi.deleteTtsVoice(model, draft.id)
+    releaseLocalAudio(draft)
     delete state.models[model].drafts[draft.key]
     state.models[model].voices = state.models[model].voices.filter(item => item.id !== draft.id)
     if (!props.demo) await refresh(model)
@@ -159,24 +193,27 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
     <header class="library-heading"><div><h3>音色库</h3><p>为当前模型保存独立音色，启用后用于下一次回答。</p></div><button type="button" class="outline-button" @click="add">＋ 添加音色</button></header>
     <p v-if="!drafts.length" class="instruction-hint">尚无音色。可以添加参考音频，或使用二代模型设计音色。</p>
     <article v-for="draft in drafts" :key="draft.key" class="voice-card" :class="{ enabled: stored(draft)?.enabled }">
-      <header class="voice-heading"><div class="voice-name"><strong>{{ stored(draft)?.name || draft.name || '新音色' }}</strong><span v-if="stored(draft)?.is_default" class="voice-badge">默认</span><small v-if="stored(draft)?.enabled">正在使用</small></div>
-        <div class="voice-actions"><button type="button" :disabled="!draft.id || unavailable || globalBusy" @click="play(draft)">试听</button><button type="button" :aria-expanded="draft.expanded" @click="draft.expanded = !draft.expanded">{{ draft.expanded ? '收起' : '编辑' }}</button>
+      <header class="voice-heading"><div class="voice-name"><input v-if="draft.expanded" :id="`voice-name-${draft.key}`" v-model="draft.name" class="voice-name-input" aria-label="音色名称" maxlength="80" placeholder="给这个音色起个名字" :disabled="draft.busy"><strong v-else>{{ stored(draft)?.name || draft.name || '新音色' }}</strong><span v-if="stored(draft)?.is_default" class="voice-badge">默认</span><small v-if="stored(draft)?.enabled">正在使用</small></div>
+        <div class="voice-actions"><button type="button" :disabled="!draft.id || unavailable || globalBusy" @click="play(draft)">试听</button><button type="button" :aria-expanded="draft.expanded" :aria-controls="`voice-editor-${draft.key}`" @click="edit(draft)">{{ draft.expanded ? '收起' : '编辑' }}</button>
           <label class="voice-toggle"><input type="checkbox" role="switch" :aria-label="`启用 ${draft.name || '音色'}`" :checked="stored(draft)?.enabled" :disabled="!draft.id || globalBusy || (stored(draft)?.is_default && stored(draft)?.enabled)" @change="toggle(draft, ($event.target as HTMLInputElement).checked)"><span aria-hidden="true"></span></label>
         </div></header>
-      <div v-if="draft.expanded" class="voice-editor">
-        <label class="form-field voice-title"><span>音色名称</span><input v-model="draft.name" maxlength="80" placeholder="给这个音色起个名字" :disabled="draft.busy"></label>
+      <div v-if="draft.expanded" :id="`voice-editor-${draft.key}`" class="voice-editor">
         <div class="voice-inputs" :class="{ single: model === 'voxcpm1' }">
-          <label v-if="model === 'voxcpm2'" class="form-field"><span>音色设计 <small>可选</small></span><textarea v-model="draft.description" rows="6" maxlength="500" placeholder="例如：温和自然的女声，清晰、平稳，略带微笑。可以单独设计，也可以结合右侧参考音频。" @input="invalidate(draft)"></textarea></label>
-          <div class="form-field"><span>克隆参考与文本校对 <small>{{ model === 'voxcpm1' ? '准确转写必填' : '可选' }}</small></span>
-            <div class="reference-input" @dragover.prevent @drop.prevent="drop(draft, $event)">
-              <textarea v-model="draft.transcript" rows="5" placeholder="拖入一条参考音频。系统使用当前精修模型识别，你可以在这里校对。" @input="invalidate(draft)"></textarea>
-              <div v-if="draft.source" class="audio-attachment"><span class="audio-icon" aria-hidden="true">♫</span><div><strong>{{ draft.source.filename }}</strong><small>{{ (draft.source.duration_ms / 1000).toFixed(2) }} 秒</small></div><button type="button" aria-label="移除参考音频" :disabled="draft.busy" @click="removeSource(draft)">×</button></div>
-              <label class="attachment-upload"><input type="file" accept=".wav,.mp3,.flac,.ogg" :disabled="draft.busy" @change="fileChange(draft, $event)"><span>{{ draft.source ? '替换音频' : '＋ 选择音频' }}</span></label>
-            </div><small>支持 3–15 秒的音频，最大 20 MiB（二进制兆字节）。</small>
-            <button v-if="draft.source" type="button" class="transcribe-action" :disabled="globalBusy" @click="transcribe(draft)">重新识别校对文本</button>
-          </div>
+          <label v-if="model === 'voxcpm2'" class="form-field voice-design"><span>音色设计 <small>可选</small></span><textarea v-model="draft.description" class="compact-textarea" rows="1" maxlength="500" placeholder="例如：温和自然的女声，清晰、平稳，略带微笑。" @input="invalidate(draft)"></textarea><small>描述声音特征，可单独设计或结合参考音频。</small></label>
+          <label class="form-field"><span>音频转写 <small>{{ model === 'voxcpm1' ? '准确转写必填' : '可校对' }}</small></span><textarea v-model="draft.transcript" class="compact-textarea" rows="1" placeholder="添加音频后自动识别，也可手动输入并校对。" @input="invalidate(draft)"></textarea></label>
         </div>
-        <div class="voice-footer"><label class="form-field"><span>试音正文</span><textarea v-model="draft.text" rows="2" maxlength="1000" @input="invalidate(draft)"></textarea></label><div class="voice-footer-actions"><button type="button" :disabled="unavailable || globalBusy || (!draft.description.trim() && !draft.source)" @click="preview(draft)">试音</button><button type="button" class="save-button" :disabled="globalBusy || !saveable(draft)" @click="save(draft)">保存</button><button type="button" class="danger-action" :disabled="globalBusy || stored(draft)?.is_default" @click="remove(draft)">{{ draft.id ? '删除' : '取消添加' }}</button></div></div>
+        <div class="voice-reference">
+          <div class="reference-input" @dragover.prevent @drop.prevent="drop(draft, $event)">
+            <ReferenceAudioPlayer v-if="draft.source" :key="`${model}:${draft.source.asset_id}`" :src="referenceUrl(draft)" :filename="draft.source.filename" :duration-ms="draft.source.duration_ms" :busy="globalBusy" :transcribing="transcribingKey === draft.key" :active="activeReferenceKey === draft.key" @play="activeReferenceKey = draft.key" @transcribe="transcribe(draft)" @remove="removeSource(draft)" @error="draft.error = $event" />
+            <label v-else class="attachment-upload" :class="{ disabled: globalBusy }">
+              <input type="file" aria-label="添加参考音频" accept=".wav,.mp3,.flac,.ogg" :disabled="globalBusy" @change="fileChange(draft, $event)">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M5 15v5h14v-5" /></svg>
+              <span class="upload-caption"><strong>添加参考音频</strong><small>点击选择或拖入文件</small></span>
+            </label>
+          </div>
+          <small class="reference-hint">支持 3–15 秒音频，最大 20 MiB（二进制兆字节）。</small>
+        </div>
+        <div class="voice-footer"><label class="form-field"><span>试音正文</span><textarea v-model="draft.text" class="compact-textarea" rows="1" maxlength="1000" @input="invalidate(draft)"></textarea></label><div class="voice-footer-actions"><button type="button" :disabled="unavailable || globalBusy || (!draft.description.trim() && !draft.source)" @click="preview(draft)">试音</button><button type="button" class="save-button" :disabled="globalBusy || !saveable(draft)" @click="save(draft)">保存</button><button type="button" class="danger-action" :disabled="globalBusy || stored(draft)?.is_default" @click="remove(draft)">{{ draft.id ? '删除' : '取消添加' }}</button></div></div>
         <p v-if="draft.description.trim() && !saveable(draft)" class="instruction-hint">设计或混合音色需要以当前参数完成一次试音，再保存生成的目标样音。</p>
       </div>
       <div v-if="draft.busy" class="voice-task" role="status"><span>正在处理音色…</span><button type="button" @click="cancel(draft)">取消任务</button></div>
@@ -186,24 +223,33 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
 </template>
 
 <style scoped>
-.voice-library { display: grid; gap: 14px; }
+.voice-library { display: grid; gap: 14px; container: voice-library / inline-size; }
 .library-heading,.voice-heading,.voice-actions,.voice-footer-actions,.voice-name,.voice-task { display: flex; align-items: center; gap: 10px; }
 .library-heading,.voice-heading { justify-content: space-between; }
+.library-heading > div { min-width: 0; }.library-heading > button { flex-shrink: 0; white-space: nowrap; }
 .library-heading p { color: var(--muted); margin-top: 5px; }
 .voice-card { background: var(--panel); border: 1px solid var(--line-strong); border-radius: 18px; padding: 18px 20px; display: grid; gap: 16px; }
 .voice-card.enabled { border-color: color-mix(in srgb, var(--mint) 42%, transparent); }
-.voice-name { min-width: 0; flex-wrap: wrap; }.voice-name strong { overflow-wrap: anywhere; }.voice-name small { color: var(--mint); }
+.voice-name { min-width: 0; flex: 1; flex-wrap: wrap; }.voice-name strong { overflow-wrap: anywhere; }.voice-name small { color: var(--mint); }
+.voice-name .voice-name-input { width: 180px; max-width: 100%; min-height: 32px; height: 32px; padding: 5px 9px; font-weight: 570; }
 .voice-badge { border-radius: 7px; background: var(--panel-soft); color: var(--muted); padding: 3px 7px; font-size: .7rem; }
 .voice-actions { flex-shrink: 0; }.voice-actions button { padding: 6px 11px; }
 .voice-toggle { display: inline-flex; position: relative; padding: 8px; cursor: pointer; }.voice-toggle input { position: absolute; width: 36px; height: 20px; opacity: 0; }
 .voice-toggle span { width: 36px; height: 20px; border-radius: 20px; background: var(--line-strong); }.voice-toggle span::after { content: ''; display: block; width: 14px; height: 14px; margin: 3px; border-radius: 50%; background: var(--muted); transition: transform 160ms; }
 .voice-toggle input:checked + span { background: var(--mint); }.voice-toggle input:checked + span::after { transform: translateX(16px); background: var(--bg); }.voice-toggle input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 3px; }.voice-toggle input:disabled + span { opacity: .5; }
-.voice-editor { display: grid; gap: 17px; border-top: 1px solid var(--line); padding-top: 18px; }.voice-title { max-width: 420px; }
-.voice-inputs { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 18px; }.voice-inputs.single { grid-template-columns: 1fr; }.voice-inputs textarea { resize: vertical; min-height: 170px; }
-.reference-input { border: 1px solid var(--line-strong); background: #10141d; border-radius: 10px; overflow: hidden; display: grid; gap: 8px; padding-bottom: 10px; }.reference-input:focus-within { border-color: var(--accent); }.reference-input textarea { border: 0; background: transparent; min-height: 115px; }
-.audio-attachment { display: flex; align-items: center; gap: 10px; margin: 0 10px; padding: 10px; background: var(--panel-soft); border: 1px solid var(--line); border-radius: 9px; }.audio-attachment div { flex: 1; min-width: 0; }.audio-attachment strong { display: block; overflow-wrap: anywhere; font-size: .75rem; }.audio-attachment button { padding: 2px 7px; }.audio-icon { color: var(--accent); font-size: 1.3rem; }
-.attachment-upload { margin-left: 12px; color: var(--accent); cursor: pointer; font-size: .75rem; }.attachment-upload input { display: none; }.transcribe-action { justify-self: start; font-size: .7rem; padding: 5px 9px; }
-.voice-footer { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: end; gap: 16px; }.voice-footer textarea { resize: vertical; }.voice-footer-actions { padding-bottom: 2px; }.voice-task { color: var(--muted); justify-content: space-between; }
-@media (max-width: 800px) { .voice-inputs,.voice-footer { grid-template-columns: 1fr; }.voice-heading { align-items: flex-start; }.voice-footer-actions { justify-content: flex-end; }.voice-card { padding: 16px; } }
-@media (max-width: 480px) { .voice-heading { flex-wrap: wrap; }.voice-actions { margin-left: auto; } }
+.voice-editor { display: grid; gap: 18px; border-top: 1px solid var(--line); padding-top: 18px; }
+.voice-inputs { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 18px; align-items: start; }.voice-inputs.single { grid-template-columns: 1fr; }
+.voice-inputs .form-field { min-width: 0; }
+.voice-reference { display: grid; gap: 8px; min-width: 0; }.reference-input { min-width: 0; }
+.attachment-upload { position: relative; display: flex; align-items: center; justify-content: center; gap: 12px; min-height: 72px; padding: 12px; border: 1px dashed var(--line-strong); background: #10141d; border-radius: 10px; cursor: pointer; }
+.attachment-upload:hover:not(.disabled),.attachment-upload:focus-within { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 5%, #10141d); }
+.attachment-upload:focus-within { outline: 2px solid var(--accent); outline-offset: 3px; }
+.attachment-upload.disabled { opacity: .45; cursor: not-allowed; }.attachment-upload input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: inherit; }
+.attachment-upload svg { width: 22px; height: 22px; fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.upload-caption { display: grid; gap: 3px; }.attachment-upload strong { font-size: .75rem; }.attachment-upload small,.reference-hint { font-size: .625rem; line-height: 1.5; }
+.voice-footer { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: end; gap: 12px; }
+.voice-footer-actions { gap: 8px; }.voice-footer-actions button { height: 42px; padding: 8px 12px; white-space: nowrap; }
+.voice-task { color: var(--muted); justify-content: space-between; }
+@container voice-library (max-width: 600px) { .voice-inputs { grid-template-columns: 1fr; }.voice-card { padding: 16px; }.voice-name .voice-name-input { width: 140px; } }
+@container voice-library (max-width: 480px) { .voice-heading { flex-wrap: wrap; }.voice-actions { margin-left: auto; }.voice-footer { grid-template-columns: 1fr; }.voice-footer-actions { justify-content: flex-end; } }
 </style>
