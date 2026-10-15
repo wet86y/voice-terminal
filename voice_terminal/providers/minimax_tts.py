@@ -1123,7 +1123,10 @@ class MiniMaxTtsClient:
     def applied_emotion(self) -> str:
         return self._active_emotion if self.emotion_enabled else self.default_emotion
 
-    def session(self, *, fresh: bool = False, turn_id: str | None = None) -> MiniMaxTtsSession:
+    def session(self, *, fresh: bool = False, turn_id: str | None = None,
+                speech_id: str | None = None) -> MiniMaxTtsSession:
+        # speech_id（语音事务标识）由本地后端用于日志关联；在线路径暂无对应记录口径。
+        del speech_id
         if not self.api_key:
             raise MiniMaxTtsError("未配置 MINIMAX_API_KEY")
         if self.output_format.lower() != "pcm":

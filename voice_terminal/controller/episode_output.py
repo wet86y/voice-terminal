@@ -377,11 +377,15 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             client = self.tts
         if client is None:
             raise RuntimeError("所选 TTS provider 不可用。")
+        # turn_id / speech_id（轮次与语音事务标识）随会话进入 provider，供日志串联。
+        correlation = {"turn_id": ws.turn_id, "speech_id": getattr(h, "speech_id", None)}
         try:
             if h is not None and getattr(h, "tts_voice_snapshot", None) is not None:
-                session = client.session(voice_snapshot=h.tts_voice_snapshot, inference_steps=h.tts_inference_steps)
+                session = client.session(voice_snapshot=h.tts_voice_snapshot,
+                                         inference_steps=h.tts_inference_steps, **correlation)
             else:
-                session = client.session(fresh=fresh, turn_id=ws.turn_id, emotion=h.emotion_applied if h else "calm")
+                session = client.session(fresh=fresh, emotion=h.emotion_applied if h else "calm",
+                                         **correlation)
         except TypeError:  # Non-MiniMax/test providers retain the old API.
             try:
                 session = client.session(fresh=fresh, turn_id=ws.turn_id)

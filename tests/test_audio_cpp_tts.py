@@ -696,6 +696,8 @@ def test_server_close_terminates_only_owned_audio_cpp_process():
         server._process.wait.return_value = 0
         server._owns_process = True
         server._log_file = None
+        server._log_pump_thread = None
+        server._log_pump_done = None
         server._management_http = SimpleNamespace(aclose=AsyncMock())
         management = server._management_http
         process = server._process
@@ -717,6 +719,8 @@ def test_server_close_terminates_only_owned_audio_cpp_process():
         server._process.poll.return_value = None
         server._owns_process = False
         server._log_file = None
+        server._log_pump_thread = None
+        server._log_pump_done = None
         server._management_http = None
 
         process = server._process

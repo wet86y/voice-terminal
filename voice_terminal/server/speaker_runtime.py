@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from ..compute import device_candidates
+from ..log_budget import enforce_log_budget, rotate_oversized_log
 from ..speaker.client import SpeakerWorkerClient, SpeakerWorkerError
 from ..speaker.probe import probe as probe_speaker_worker
 from ..speaker.contracts import SpeakerObservation
@@ -258,6 +259,9 @@ class SpeakerRuntimeMixin:
         log_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = log_dir / "speaker-worker.out.log"
         stderr_path = log_dir / "speaker-worker.err.log"
+        for stream_path in (stdout_path, stderr_path):
+            rotate_oversized_log(stream_path, max_bytes=2 * 1024 * 1024, backups=1)
+        enforce_log_budget(log_dir)
         from ..paths import python_command
         command = python_command(sys.executable, "voice_terminal.speaker.worker",
                                  "--config", str(self._speaker_worker_config_path), root=self._project_root)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+import json
 import logging
 import time
 from dataclasses import replace
@@ -1085,6 +1086,12 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             "replacement_count": int(t.get("replacement_count", 0) or 0),
         }
         self.state.latency = {"complete": complete, "values": values}
+        # 这些值原本只随 WebSocket 事件发往界面；落一行 INFO 才能事后从日志复盘本地 TTS 时序。
+        logger.info(
+            "controller.turn_latency turn_id=%s complete=%s values=%s",
+            ws.turn_id, complete,
+            json.dumps(values, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        )
         await self._detail("latency.snapshot", complete=complete, values=values)
 
     async def _finish_v2(self, ws, response):
