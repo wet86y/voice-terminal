@@ -101,6 +101,12 @@ if (desktop.available && desktop.publishFloatingModel) {
 // resourceMaintenance（资源维护）：服务停机不等于应用退出，组件操作和下载进度继续可用。
 const resourceMaintenance = computed(() => workspaceResources.startingResources.value.size > 0
   || workspaceResources.resourceJobs.value.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state)));
+// unavailableCapabilityLabel（不可用能力文案）：运行期故障用横幅提示，并用组件页单独恢复。
+const unavailableCapabilityLabel = computed(() => {
+  const rows = (applicationSnapshot.value?.unavailable_capabilities ?? [])
+    .filter(row => !['READY', 'RUNNING', 'STREAMING', 'CONNECTED', 'DISABLED'].includes(row.state));
+  return rows.length ? `：${rows.map(row => row.label).join('、')}` : '';
+});
 function nativeAction(action: () => Promise<void>) {
   void action().catch((error) => {
     lastError.value = String(error);
@@ -115,11 +121,15 @@ function nativeAction(action: () => Promise<void>) {
   >
     <template #banner
       ><div
-        v-if="applicationSnapshot?.state === 'degraded'"
+        v-if="applicationSnapshot?.state === 'degraded' || application.runtimeFailure.value"
         class="application-degraded"
         role="status"
       >
-        <span>部分组件暂不可用，核心语音功能仍可使用。</span
+        <span>{{
+          application.runtimeFailure.value
+            ? `语音能力暂不可用${unavailableCapabilityLabel}，可在本地组件页单独恢复。`
+            : "部分组件暂不可用，核心语音功能仍可使用。"
+        }}</span
         ><button @click="showApplicationSystem">查看本地组件</button>
       </div></template
     >

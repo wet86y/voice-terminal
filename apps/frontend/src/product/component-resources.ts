@@ -25,7 +25,7 @@ export function componentResources(snapshot: ApplicationSnapshot | null, compute
     const residual = { ...row }
     // 归属增量按当前进程身份校验，并以进程当前余量为限；各条目合计始终不超过宿主总量。
     const candidates = [
-      ...(['kws', 'voice_vad', 'smart_turn'] as const).map(id => ({ id, status: compute?.models[id] })),
+      ...(['kws', 'voice_vad', 'smart_turn'] as const).map(id => ({ id, status: compute?.models?.[id] })),
       ...(['hotwords', 'punctuation'] as const).map(id => ({ id, status: compute?.auxiliary?.[id] })),
     ]
     for (const { id, status } of candidates) {

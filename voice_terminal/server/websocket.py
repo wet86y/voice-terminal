@@ -32,7 +32,10 @@ from ..dsh import (
 from ..vad.barge_in import BargeInGate
 from ..core.event_bus import EventBus
 from ..core.events import VoiceEvent, event
-from ..core.state import RuntimeState, TerminalState
+from ..core.state import (
+    BLOCKING_SERVICES, SERVICE_LABELS, SERVICE_LOADING_STATES, SERVICE_READY_STATES,
+    RuntimeState, TerminalState,
+)
 from ..kws.detector import KwsDetector, KwsError
 from ..kws.service import KwsWorker
 from ..providers.deepseek import DeepSeekClient
@@ -104,10 +107,14 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         # runtime owns the publication that follows every append.
         self.history.conversation.set_sink(self._publish_conversation_entry)
         self.startup_errors: list[str] = []
+        # _service_errors（能力错误快照）：按能力记录最近一次失败原因，供能力行与恢复清除。
+        self._service_errors: dict[str, str] = {}
         # phased_startup（分阶段启动）：轻量接口先监听，本地模型和会话分别由宿主放行。
         self._application_phased_startup = os.environ.get("VOICE_APP_PHASED_STARTUP") == "1"
         self._application_local_ready = False
         self._application_session_ready = False
+        # _listen_resume_requested（挂起的开始监听意图）：能力加载中被拦截的用户意图，就绪后自动执行。
+        self._listen_resume_requested: bool | None = None
         self._application_startup_lock = asyncio.Lock()
         # compute_status（计算状态）记录 Voice Server 内 KWS 与 FSMN-VAD 的实际设备。
         self._compute_models: dict[str, dict[str, Any]] = {}
@@ -280,7 +287,15 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         # makes the ASR chain unavailable but is not an ASR model failure).
         self.state.set_service(status_service or service, "ERROR")
         self.startup_errors.append(f"{service}: {message}")
+        self._service_errors[service] = str(message)
         logger.error("%s", self.startup_errors[-1])
+
+    def _clear_service_error(self, service: str) -> None:
+        """_clear_service_error（清除能力错误）：只在能力恢复成功后移除旧原因。"""
+        for name in self._CAPABILITY_ERROR_ALIASES.get(service, (service,)):
+            self._service_errors.pop(name, None)
+            prefix = f"{name}: "
+            self.startup_errors = [item for item in self.startup_errors if not item.startswith(prefix)]
 
     def _disable_optional_search(self, reason: str) -> None:
         safe_reason = " ".join(str(reason or "搜索服务不可用").split())[:240]
@@ -337,8 +352,17 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         self.audio_meter.start()
         application_report("voice", "初始化音频设备与输入处理")
         self._restore_or_persist_voice_identity()
-        loop = asyncio.get_running_loop()
         self.shadow_product.reset(available=False)
+        self._initialize_audio()
+        await self._initialize_kws()
+        await self._initialize_vad()
+        application_report("voice", "初始化声纹工作进程")
+        await self._initialize_speaker()
+        self._application_local_ready = True
+
+    def _initialize_audio(self) -> None:
+        """_initialize_audio（音频采集与输入处理）：能力级恢复可单独重建。"""
+        loop = asyncio.get_running_loop()
         try:
             self.capture = AudioCapture(
                 loop=loop,
@@ -350,6 +374,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 on_audio_frame=lambda pcm: self.audio_meter.feed("input", pcm, self.config.audio.sample_rate, self.config.audio.channels),
             )
             self.state.set_service("audio", "READY")
+            self._clear_service_error("audio")
         except Exception as exc:
             self._record_error("audio", str(exc))
 
@@ -370,6 +395,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 audio_processing_status=self.audio_processor.status,
                 audio_processing_error=self.audio_processor.error or "",
             )
+            self._clear_service_error("audio_processing")
         except Exception as exc:
             self._record_error("audio_processing", str(exc), status_service="audio")
             self.state.current.update(
@@ -377,10 +403,13 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 audio_processing_error=str(exc),
             )
 
+    async def _initialize_kws(self) -> None:
+        """_initialize_kws（关键词唤醒）：能力级恢复可单独重建；停用时保持既有诊断口径。"""
         if self.config.wake.enabled:
             try:
                 self.kws = await self._load_measured_model("kws", self._build_kws_worker)
                 self.state.set_service("kws", "READY")
+                self._clear_service_error("kws")
             except Exception as exc:
                 self._record_error("kws", str(exc))
         else:
@@ -393,6 +422,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             }
             logger.info("wake word disabled; session.start enters the voice turn directly")
 
+    async def _initialize_vad(self) -> None:
+        """_initialize_vad（语音活动检测）：归识别链路，失败记为 asr 不可用。"""
         try:
             vad_requested = self.config.compute.devices.get("voice_vad", "cpu")
             self.vad = await self._load_measured_model("voice_vad", FsmnVadDetector,
@@ -410,6 +441,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 "service": "READY",
                 "load_error": self.vad.load_error,
             }
+            self._clear_service_error("vad")
         except Exception as exc:
             self._compute_models["voice_vad"] = {
                 "requested_device": self.config.compute.devices.get("voice_vad", "cpu"),
@@ -419,24 +451,34 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             }
             self._record_error("vad", str(exc), status_service="asr")
 
-        application_report("voice", "初始化声纹工作进程")
-        await self._initialize_speaker()
-        self._application_local_ready = True
-
     async def initialize_session(self, *, _session_lock_held: bool = False) -> None:
         """initialize_session（会话依赖汇合）：只在模型分支结束后连接并建立调度器。"""
+        await self._initialize_asr()
+        self.history.screen_capture.configure(self.config.screen_capture)
+        await self._initialize_llm()
+        await self._initialize_shadow()
+        await self._initialize_tts()
+        await self._initialize_controller(_session_lock_held=_session_lock_held)
+
+    async def _initialize_asr(self) -> None:
+        """_initialize_asr（识别工作进程连接）：能力级恢复可单独重建。"""
         application_report("voice", "连接语音识别与分析服务")
         self.asr = AsrWorkerClient(self.config.asr.worker_url)
         try:
             await self.asr.connect()
             await self.asr.health()
-            if self.vad is not None:
-                self.state.set_service("asr", "READY")
+            if self.vad is None:
+                # 语音活动检测缺失时识别链路不可用：显式失败，不能停留在“加载中”。
+                self._record_error("asr", "语音活动检测未加载，识别链路不可用")
+                return
+            self.state.set_service("asr", "READY")
+            self._clear_service_error("asr")
         except Exception as exc:
             code = getattr(exc, "code", "ASR_WORKER_UNAVAILABLE")
             self._record_error("asr", f"{code}: {exc}")
 
-        self.history.screen_capture.configure(self.config.screen_capture)
+    async def _initialize_llm(self) -> None:
+        """_initialize_llm（主模型客户端）：能力级恢复可单独重建。"""
         application_report("voice", "配置主模型、影子代理与语音合成")
         llm_key = self._api_key(self.config.llm.api_key_env)
         if llm_key:
@@ -457,9 +499,12 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 transport_retry_limit=self.config.llm.transport_retry_limit,
             )
             self.state.set_service("llm", "READY")
+            self._clear_service_error("llm")
         else:
             self._record_error("llm", f"未配置 {self.config.llm.api_key_env}")
 
+    async def _initialize_shadow(self) -> None:
+        """_initialize_shadow（影子代理）：能力级恢复可单独重建。"""
         shadow_cfg = self.config.shadow_agent
         if shadow_cfg.enabled:
             if shadow_cfg.backend == "dsh":
@@ -538,6 +583,12 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             self.state.set_service("shadow_agent", "DISABLED")
             self.state.set_service("web_search", "DISABLED")
 
+    async def _initialize_tts(self) -> bool:
+        """_initialize_tts（语音合成路由与播放器）：能力级恢复可单独重建。
+
+        返回本次是否就绪；失败必须落到明确的 ERROR（而不是留下 OFFLINE/STARTING），
+        否则宿主与界面无法区分"仍在加载"和"已经失败"，重试页也不会自愈。
+        """
         remote_tts, local_tts = self._build_tts_clients()
         self.tts = TtsBackendRouter(
             remote=remote_tts,
@@ -555,6 +606,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 if self.config.tts.sample_rate not in {16000, 24000, 32000, 48000}:
                     raise RuntimeError("VoxCPM 播放器 sample_rate（采样率）不受支持")
                 self._local_tts_load_state = "loading"
+                self.state.set_service("tts", "STARTING")
                 await self.tts.ensure_ready()
                 # 音色尚未配置时模型仍保持就绪，设置页可以继续导入或设计音色。
                 if self._active_voice_snapshot(self.config.tts.local_model) is not None:
@@ -564,6 +616,26 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 self._local_tts_error = None
             else:
                 self._local_tts_load_state = "disabled"
+            self._ensure_player()
+            if self.config.tts.backend == "minimax" and remote_tts is None:
+                raise RuntimeError(f"未配置 {self.config.tts.api_key_env}")
+            self.state.set_service("tts", "READY")
+            self._clear_service_error("tts")
+            return True
+        except Exception as exc:
+            if self.config.tts.backend == "voxcpm1":
+                self._local_tts_load_state = "error"
+                self._local_tts_error = str(exc)[:500]
+            self._record_error("tts", str(exc))
+            return False
+
+    def _ensure_player(self) -> None:
+        """_ensure_player（播放器复用）：播放器与设备时钟跨能力恢复保持同一实例。
+
+        会话控制器持有播放器引用并挂载播放回调；能力级恢复不能替换实例，
+        否则回调与设备时钟会脱离，只有首次初始化才新建。
+        """
+        if self.player is None:
             self.player = PcmPlayer(
                 playback_permission=lambda: not self.quiet_policy.passive(),
                 on_policy_blocked=self._on_passive_playback_blocked,
@@ -574,17 +646,27 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 on_audio_rendered=(self.audio_processor.push_reverse if self.audio_processor else None),
                 on_audio_frame=lambda pcm: self.audio_meter.feed("playback", pcm, self.config.tts.sample_rate),
             )
+        if not self.player.running:
             self.player.start()
-            self.state.current["playback_diagnostics"] = self.player.diagnostics
-            if self.config.tts.backend == "minimax" and remote_tts is None:
-                raise RuntimeError(f"未配置 {self.config.tts.api_key_env}")
-            self.state.set_service("tts", "READY")
-        except Exception as exc:
-            if self.config.tts.backend == "voxcpm1":
-                self._local_tts_load_state = "error"
-                self._local_tts_error = str(exc)[:500]
-            self._record_error("tts", str(exc))
+        self.state.current["playback_diagnostics"] = self.player.diagnostics
 
+    async def _retry_tts(self) -> None:
+        """_retry_tts（语音合成恢复）：只重建合成路由，播放器与设备时钟保持不变。"""
+        await self._initialize_tts()
+        if self.state.services.get("tts") not in SERVICE_READY_STATES:
+            return
+        # 恢复后重放当前选择：本地模型可能已卸载，需要重新准备并沿用既有音色。
+        local = getattr(self.tts, "local", None)
+        if local is not None:
+            try:
+                await local.ensure_ready()
+                if self._active_voice_snapshot(self.config.tts.local_model) is not None:
+                    await self.tts.prewarm()
+            except Exception as exc:
+                self._record_error("tts", f"恢复后重新准备失败：{type(exc).__name__}: {exc}")
+
+    async def _initialize_controller(self, *, _session_lock_held: bool = False) -> None:
+        """_initialize_controller（唯一会话调度器）：依赖上游能力全部汇合。"""
         if self.config.audio.sample_rate != 16000 or self.config.audio.channels != 1 or self.config.audio.sample_format != "int16":
             raise ValueError("session runtime requires 16 kHz mono int16 capture")
         if self.product_settings is not None:
@@ -1472,6 +1554,14 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         if self.application_initializing:
             await self.bus.publish(event("error", code="RUNTIME_STARTING", message="组件仍在加载，请等待启动完成。", recoverable=True))
             return
+        reason = self.state.can_start_reason
+        if reason is not None and reason["code"] == "CAPABILITY_LOADING":
+            # 能力加载中：暂时拦截主监听并记住意图，加载完成后自动开始，不进入报错页面。
+            self._listen_resume_requested = True
+            await self.bus.publish(event("status", code="CAPABILITY_LOADING",
+                message=f"组件加载中：{reason['message']}。加载完成后将自动开始监听。"))
+            return
+        self._listen_resume_requested = None  # 成功进入启动路径后撤销更早的挂起意图。
         self._tts_resume_requested = None  # 新的主动启动撤销更早的停止意图。
         async with self._session_lock:
             voice_operations = getattr(self, "tts_voice_operations", None)
@@ -1524,6 +1614,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
 
     async def stop_listening(self) -> None:
         self._tts_resume_requested = False  # 用户主动停止优先于后台切换的恢复意图。
+        self._listen_resume_requested = False  # 用户主动停止也撤销能力加载中的挂起意图。
         async with self._session_lock:
             if isinstance(self.shadow_session, DshShadowAgentSession):
                 self.shadow_session.approvals.revoke()
@@ -1978,12 +2069,96 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
     async def close_shadow_debug(self, connection_id: str) -> None:
         self._shadow_debug_sinks.pop(connection_id, None)
 
+    # _CAPABILITY_ROWS（能力行定义）：id（标识）、label（名称）与 phase（阶段说明）。
+    _CAPABILITY_ROWS = (
+        ("audio", "音频设备", "音频采集与输入处理"),
+        ("asr", "ASR（语音识别）", "识别工作进程连接"),
+        ("llm", "LLM（大语言模型）", "主模型客户端"),
+        ("tts", "TTS（语音合成）", "语音合成路由与播放器"),
+        ("kws", "KWS（关键词唤醒）", "关键词唤醒"),
+        ("speaker", "声纹工作进程", "声纹工作进程"),
+    )
+    # _CAPABILITY_RECOVERY（能力恢复方法）：只重建一个能力，不重启语音服务进程。
+    _CAPABILITY_RECOVERY = {
+        "audio": "_initialize_audio", "asr": "_initialize_asr", "llm": "_initialize_llm",
+        "tts": "_retry_tts", "kws": "_initialize_kws", "speaker": "_initialize_speaker",
+    }
+    # _CAPABILITY_ERROR_ALIASES（错误归属别名）：子环节失败记录在自己的键上，但归属同一能力。
+    _CAPABILITY_ERROR_ALIASES = {"audio": ("audio", "audio_processing"), "asr": ("asr", "vad")}
+
+    def _capability_error(self, capability: str) -> str:
+        for name in self._CAPABILITY_ERROR_ALIASES.get(capability, (capability,)):
+            message = self._service_errors.get(name)
+            if message:
+                return message
+        return ""
+
+    def capability_rows(self) -> list[dict[str, Any]]:
+        """capability_rows（分能力状态）：宿主与界面据此显示“启动中/不可用”并单独恢复。"""
+        rows: list[dict[str, Any]] = []
+        for capability, label, phase in self._CAPABILITY_ROWS:
+            disabled = ((capability == "kws" and not self.config.wake.enabled)
+                        or (capability == "speaker" and self.config.speaker.mode == "off"
+                            and not self.config.speaker.owner_only_barge_in))
+            if disabled:
+                rows.append({"id": capability, "label": label, "state": "DISABLED", "blocking": False,
+                             "phase": "按配置停用", "error": "", "retry": None})
+                continue
+            status = self.state.services.get(capability, "OFFLINE")
+            ready = status in SERVICE_READY_STATES
+            rows.append({
+                "id": capability, "label": label, "state": status,
+                "blocking": capability in BLOCKING_SERVICES, "phase": phase,
+                "error": "" if ready else self._capability_error(capability),
+                "retry": capability if not ready and status in (SERVICE_LOADING_STATES | {"ERROR", "OFFLINE"}) else None,
+            })
+        return rows
+
+    async def retry_capability(self, capability: str) -> dict[str, Any]:
+        """retry_capability（能力级恢复）：只重建一个能力，不重启语音服务进程。"""
+        name = str(capability or "")
+        method = self._CAPABILITY_RECOVERY.get(name)
+        if method is None:
+            return {"ok": False, "message": "未知组件能力。"}
+        if getattr(self, "_application_stopping", False):
+            return {"ok": False, "message": "应用正在退出，不能恢复组件。"}
+        if self.application_initializing:
+            return {"ok": False, "message": "组件仍在加载，请等待本轮启动结束后再恢复。"}
+        async with self._session_lock:
+            logger.info("capability.retry_started capability=%s", name)
+            self._clear_service_error(name)
+            self.state.set_service(name, "STARTING")
+            await self.bus.publish(self.snapshot())
+            try:
+                result = getattr(self, method)()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                logger.exception("capability.retry_failed capability=%s", name)
+                self._record_error(name, f"恢复失败：{type(exc).__name__}: {exc}")
+                await self.bus.publish(self.snapshot())
+                return {"ok": False, "message": f"组件恢复失败：{type(exc).__name__}"}
+            ready = self.state.services.get(name) in SERVICE_READY_STATES
+            if ready:
+                self._clear_service_error(name)
+            await self.bus.publish(self.snapshot())
+            logger.info("capability.retry_finished capability=%s ready=%s", name, ready)
+            message = "" if ready else "组件仍未就绪，请查看组件日志。"
+        if (self._listen_resume_requested and not self.state.listening
+                and self.state.can_start_reason is None):
+            # 用户在加载期间点过开始：能力恢复完成后自动开始监听（与 TTS 切换的挂起意图同构）。
+            self._listen_resume_requested = None
+            await self.start_listening()
+        return {"ok": ready, "message": message}
+
     def health_payload(self) -> dict[str, Any]:
         payload = {
             "state": self.state.state.value,
             "listening": self.state.listening,
             "can_start": self.state.can_start,
+            "can_start_reason": self.state.can_start_reason,
             "services": dict(self.state.services),
+            "capabilities": self.capability_rows(),
             "startup_errors": list(self.startup_errors),
             "wake_enabled": self.config.wake.enabled,
             "wake_always_on": self.state.wake_always_on,

@@ -64,6 +64,7 @@ export function useProductControls() {
     connected,
     runtimeState,
     coreUnavailable,
+    coreStarting,
     current,
     conversationRows,
     pendingSpeechRows,
@@ -410,14 +411,27 @@ export function useProductControls() {
       chip: "STARTING（启动中）",
       timestamp: "本地组件准备中",
     };
+    if (coreStarting.value) {
+      // 运行期能力加载中：只显示“启动中”，不写成需要检查，也不弹启动失败页面。
+      const pending = (applicationSnapshot.value?.unavailable_capabilities ?? [])
+        .filter(row => !['READY', 'RUNNING', 'STREAMING', 'CONNECTED', 'DISABLED'].includes(row.state))
+        .map(row => row.label);
+      return {
+        label: "组件启动中",
+        description: pending.length
+          ? `正在加载${pending.join("、")}，完成后即可开始语音会话。`
+          : "本地组件正在加载，完成后即可开始语音会话。",
+        chip: "STARTING（启动中）",
+        timestamp: "本地组件加载中",
+      };
+    }
     if (coreUnavailable.value) return {
       label: "需要检查",
       description: applicationSnapshot.value?.components.find(component => component.id === 'voice')?.error || "语音能力尚未就绪，可以先配置模型或查看本地组件。",
       chip: "ERROR（不可用）",
       timestamp: "本机接口已连接",
     };
-    const labels = {
-      offline: ["离线", "后端连接已断开，页面仍保留，可重试连接。", "OFF"],
+    const labels = {      offline: ["离线", "后端连接已断开，页面仍保留，可重试连接。", "OFF"],
       standby: [
         "待机",
         "语音服务已准备好，点击即可开始语音会话。",
@@ -1497,6 +1511,8 @@ export function useProductControls() {
       showApplicationSystem();
       return false;
     }
+    // 能力加载中：主按钮已显示“组件启动中”并禁用，这里再兜一层，避免跳转到组件页。
+    if (coreStarting.value) return false;
     return performRuntimeAction();
   }
   // workbenchConversation（消息呈现缓存）：实时音量更新不重新映射聊天条目。
@@ -1557,7 +1573,7 @@ export function useProductControls() {
       sessionOperation: voice.sessionOperation.value,
       title: runtimeMeta.value.label,
       description: runtimeMeta.value.description,
-      action: applicationSnapshot.value?.startup_complete === false
+      action: applicationSnapshot.value?.startup_complete === false || coreStarting.value
         ? "组件启动中"
         : coreUnavailable.value
         ? "查看本地组件"
@@ -1566,8 +1582,10 @@ export function useProductControls() {
             ? "停止当前会话"
             : "开始语音会话"
           : "重试连接",
-      disabled: loading.value || Boolean(voice.sessionOperation.value) || applicationSnapshot.value?.startup_complete === false,
-      modeDisabled: !connected.value || Boolean(voice.sessionOperation.value) || applicationSnapshot.value?.startup_complete === false,
+      disabled: loading.value || Boolean(voice.sessionOperation.value) || coreStarting.value
+        || applicationSnapshot.value?.startup_complete === false,
+      modeDisabled: !connected.value || Boolean(voice.sessionOperation.value) || coreStarting.value
+        || applicationSnapshot.value?.startup_complete === false,
       canReset: connected.value && !listening.value && applicationSnapshot.value?.startup_complete !== false,
       mode: reasoningMode.value,
       latency: formatResponseLatency(latencyMs.value),

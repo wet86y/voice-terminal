@@ -41,6 +41,19 @@ export interface ApplicationComponent {
   external: boolean
 }
 
+export interface ApplicationCapability {
+  /** id（能力标识）、label（显示名称）与 state（服务状态）。 */
+  id: string
+  label: string
+  state: string
+  /** blocking（阻塞能力）：未就绪时不能开始语音会话。 */
+  blocking: boolean
+  /** phase（阶段说明）、error（失败原因）与 retry（可单独恢复时的能力标识）。 */
+  phase: string
+  error: string
+  retry: string | null
+}
+
 export interface ApplicationSnapshot {
   /** resource_processes（同次采样的去重进程）：component_id（所属组件），其余为进程资源指标。 */
   resource_processes?: Array<Pick<ApplicationComponent, 'pid' | 'created_at' | 'memory_rss_bytes' | 'memory_private_commit_bytes' | 'gpu_dedicated_bytes'> & { component_id: string }>
@@ -52,6 +65,10 @@ export interface ApplicationSnapshot {
   endpoint_revision?: number
   /** state（应用整体状态）。 */
   state: string
+  /** core_phase（核心能力阶段）：ready（就绪）、starting（加载中）或 failed（失败）；旧宿主可能不提供。 */
+  core_phase?: string
+  /** unavailable_capabilities（分能力行）：界面据此显示“启动中/不可用”并单独恢复。 */
+  unavailable_capabilities?: ApplicationCapability[]
   /** phase（当前启动或运行阶段）。 */
   phase: string
   /** started_at（应用启动时间，秒）。 */
@@ -103,6 +120,32 @@ export function applicationApiReady(value: ApplicationSnapshot | null): boolean 
   if (!value || value.stopping || !value.voice_api_url) return false
   const voice = value.components.find(component => component.id === 'voice')
   return Boolean(voice?.pid && (value.voice_api_ready === true || ['ready', 'failed', 'external'].includes(voice.state)))
+}
+
+/** applicationCorePhase（核心能力阶段）：以宿主发布的 core_phase 为准，旧宿主按 core_available 回落。 */
+export function applicationCorePhase(value: ApplicationSnapshot | null): 'ready' | 'starting' | 'failed' {
+  if (value?.core_phase === 'ready' || value?.core_phase === 'starting' || value?.core_phase === 'failed') {
+    return value.core_phase
+  }
+  return value?.core_available ? 'ready' : 'failed'
+}
+
+/**
+ * applicationOverlay（全屏启动画面）：只在尚未完成启动或正在退出时出现。
+ * 运行期的组件故障改用页面横幅与“本地组件”入口，不能用启动失败遮住整个界面。
+ */
+export function applicationOverlay(value: ApplicationSnapshot | null, options: {
+  sessionInvalid?: boolean; inspecting?: boolean; managed?: boolean
+} = {}): boolean {
+  if (options.sessionInvalid) return true
+  if (options.managed === false) return false
+  if (['stopping', 'stopped'].includes(value?.state ?? '')) return true
+  return !value?.startup_complete && !options.inspecting
+}
+
+/** applicationRuntimeFailure（运行期故障）：启动完成后核心能力才失败，据此显示横幅。 */
+export function applicationRuntimeFailure(value: ApplicationSnapshot | null): boolean {
+  return Boolean(value?.startup_complete) && applicationCorePhase(value) === 'failed'
 }
 
 // product/main（产品入口）只会在 Host 配置通过预检后加载，因此产品永远由宿主管理。
@@ -269,6 +312,12 @@ async function retry(id: string) {
   catch (reason) { error.value = reason instanceof Error ? reason.message : '组件恢复失败' }
 }
 
+async function retryCapability(id: string) {
+  if (sessionInvalid.value) return
+  try { await post(`/api/v1/application/capabilities/${id}/retry`) }
+  catch (reason) { error.value = reason instanceof Error ? reason.message : '组件恢复失败' }
+}
+
 async function retryFailed() {
   if (sessionInvalid.value || retryingAll.value) return
   retryingAll.value = true
@@ -325,10 +374,15 @@ function stop() {
 
 export function useApplicationHost() {
   const businessReady = computed(() => applicationApiReady(snapshot.value))
-  const overlay = computed(() => sessionInvalid.value || managed.value && (
-    ['stopping', 'stopped'].includes(snapshot.value?.state ?? '')
-    || ((!snapshot.value || !snapshot.value.startup_complete || snapshot.value.state === 'failed') && !inspecting.value)))
+  // corePhase（核心能力阶段）：旧宿主没有该字段时按 core_available 回落，保持原有语义。
+  const corePhase = computed(() => applicationCorePhase(snapshot.value))
+  // overlay（全屏启动画面）：只在尚未完成启动或正在退出时出现。
+  // 运行期的组件故障改用页面横幅与“本地组件”入口，不再用启动失败遮住整个界面。
+  const overlay = computed(() => applicationOverlay(snapshot.value, {
+    sessionInvalid: sessionInvalid.value, inspecting: inspecting.value, managed: managed.value }))
+  // runtimeFailure（运行期故障）：启动完成后核心能力才失败，据此显示横幅。
+  const runtimeFailure = computed(() => applicationRuntimeFailure(snapshot.value))
   return { managed, snapshot, error, inspecting, connected, now, retryingAll, sessionInvalid,
-    businessReady, overlay, start, stop, retry, retryFailed, exit,
+    businessReady, overlay, corePhase, runtimeFailure, start, stop, retry, retryCapability, retryFailed, exit,
     inspect: () => { inspecting.value = true; rememberStartupSkip() }, refresh }
 }

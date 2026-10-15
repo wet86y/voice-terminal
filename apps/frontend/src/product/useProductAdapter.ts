@@ -802,9 +802,17 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
   }
 
   const connected = computed(() => voice.connection.value === 'connected')
-  const coreUnavailable = computed(() => application.managed.value && application.businessReady.value && !application.snapshot.value?.core_available)
+  // corePhase（核心能力阶段）：以宿主发布的 core_phase 为准；旧宿主缺少该字段时按 core_available 回落。
+  const corePhase = computed(() => application.snapshot.value?.core_phase
+    ?? (application.snapshot.value?.core_available ? 'ready' : 'failed'))
+  const coreUnavailable = computed(() => application.managed.value && application.businessReady.value
+    && corePhase.value === 'failed')
+  // coreStarting（核心能力加载中）：界面显示“启动中”并暂时拦截主监听，不进入报错状态。
+  const coreStarting = computed(() => application.managed.value && application.businessReady.value
+    && corePhase.value === 'starting')
   // 输入与输出独立运行；实际播放可早于输入结束判定完成。打断及错误仍优先呈现。
   const runtimeState = computed<ProductRuntimeState>(() => coreUnavailable.value && connected.value ? 'error'
+    : coreStarting.value && connected.value && !voice.listening.value ? 'standby'
     : connected.value && voice.listening.value && !['ERROR', 'INTERRUPTING'].includes(voice.state.value)
       && voice.activeSpeech.value?.state === 'playing' ? 'speaking'
       : normalizeRuntimeState(voice.state.value, connected.value))
@@ -1508,6 +1516,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     connected,
     runtimeState,
     coreUnavailable,
+    coreStarting,
     current,
     conversation,
     conversationRows,

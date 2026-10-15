@@ -9,6 +9,8 @@ import uuid
 from .ports import validate_endpoint_url
 
 TERMINAL = {"ready", "disabled", "failed", "blocked", "external", "stopped"}
+# LOADING_STATES（加载中组件状态）：瞬态，整体状态按“启动中”呈现而不是启动失败。
+LOADING_STATES = {"waiting", "starting"}
 LABELS = {
     "host": "应用宿主", "web": "界面服务", "setup": "环境与配置检查",
     "asr": "ASR（语音识别）", "analysis": "分析工作进程",
@@ -24,7 +26,10 @@ class ApplicationState:
             "instance_id": uuid.uuid4().hex,  # instance_id（应用实例标识）。
             "revision": 0,  # revision（状态版本）。
             "state": "starting", "phase": "建立应用入口", "started_at": time.time(),
-            "startup_complete": False, "startup_skipped": False, "core_available": False, "stopping": False,
+            "startup_complete": False, "startup_skipped": False, "core_available": False,
+            "core_phase": "starting",  # core_phase（核心能力阶段）：ready（就绪）、starting（加载中）或 failed（失败）。
+            "unavailable_capabilities": [],  # unavailable_capabilities（能力行）：来自语音服务的分能力状态。
+            "stopping": False,
             "voice_api_url": "", "voice_ws_url": "", "capabilities": {},
             "endpoints": {},  # endpoints（端点表）：url（实际地址）、preferred_url（首选地址）、scheme（协议）、host（主机）、port（端口）、path（路径）、generation（代次）、pid（进程编号）、created_at（创建时间）。
             "endpoint_revision": 0,  # endpoint_revision（端点版本）：每次地址或代次变化时递增。
@@ -140,8 +145,21 @@ class ApplicationState:
         if snapshot["stopping"]:
             return
         failed_core = any(c["required"] and c["state"] in {"failed", "blocked"} for c in snapshot["components"])
+        loading_core = any(c["required"] and c["state"] in LOADING_STATES for c in snapshot["components"])
         failure = any(c["state"] in {"failed", "blocked"} for c in snapshot["components"])
         core = not failed_core and bool(snapshot["core_available"])
-        self.update(startup_complete=True, core_available=core,
-            state="failed" if not core else "degraded" if failure else "ready",
-            phase="核心能力不可用，请查看诊断" if not core else "部分组件不可用" if failure else "启动完成")
+        # core_phase（核心能力阶段）把“仍在加载”与“已经失败”分开：加载中是瞬态，不能写成启动失败。
+        # probe_failed（探测已判失败）由宿主探测写入，恢复确认前保持，避免加载中被误报为故障。
+        probe_failed = snapshot.get("core_phase") == "failed"
+        core_phase = ("failed" if failed_core or (probe_failed and not loading_core)
+                      else "ready" if core
+                      else "starting")
+        self.update(startup_complete=True, core_available=core, core_phase=core_phase,
+            state=("failed" if core_phase == "failed"
+                   else "degraded" if failure
+                   else "ready" if core
+                   else "starting"),
+            phase=("核心能力不可用，请查看诊断" if core_phase == "failed"
+                   else "核心能力加载中" if core_phase == "starting"
+                   else "部分组件不可用" if failure
+                   else "启动完成"))

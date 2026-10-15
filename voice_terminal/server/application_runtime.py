@@ -103,6 +103,8 @@ class ApplicationRuntimeMixin:
                 "error": str(speaker_service.get("last_error") or "") if speaker_state == "failed" else "",
                 "pid": speaker_process.pid if speaker_process and speaker_process.returncode is None else None},
             "local_tts": {"pid": local_tts_pid},  # local_tts（本地语音合成子进程），供宿主独立统计资源。
+            # capabilities（分能力行）：宿主与界面据此显示“启动中/不可用”并单独恢复。
+            "capabilities": self.capability_rows(),
         }
 
     def _apply_managed_endpoints(self, endpoint_table: dict | None) -> None:
@@ -125,9 +127,13 @@ class ApplicationRuntimeMixin:
             config = replace(config, speaker_worker=replace(config.speaker_worker, worker_url=speaker_url))
         self.config = config
 
-    async def application_control(self, action: str, endpoint_table: dict | None = None) -> dict:
+    async def application_control(self, action: str, endpoint_table: dict | None = None,
+                                  capability: str | None = None) -> dict:
         if getattr(self, "_application_stopping", False):
             return {"ok": False, "message": "应用正在退出，不能启动或恢复组件。"}
+        if action == "capability-retry":
+            # 能力级恢复：只重建一个能力，不重启语音服务进程，也不中断其他能力。
+            return await self.retry_capability(str(capability or ""))
         if action in {"initialize-local", "initialize-session"}:
             if not self._application_phased_startup:
                 return {"ok": False, "message": "当前进程未启用分阶段启动。"}
