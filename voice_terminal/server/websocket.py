@@ -589,17 +589,15 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         返回本次是否就绪；失败必须落到明确的 ERROR（而不是留下 OFFLINE/STARTING），
         否则宿主与界面无法区分"仍在加载"和"已经失败"，重试页也不会自愈。
         """
-        remote_tts, local_tts = self._build_tts_clients()
-        self.tts = TtsBackendRouter(
-            remote=remote_tts,
-            local=local_tts,
-            backend=self.config.tts.backend,
-        )
-        self.state.current.update(
-            tts_transport=getattr(self.tts, "transport", "websocket"),
-            tts_scheduling=getattr(self.tts, "effective_scheduling", "auto"),
-        )
         try:
+            self.state.set_service("tts", "STARTING")
+            await asyncio.to_thread(self._select_available_tts)
+            remote_tts, local_tts = self._build_tts_clients()
+            self.tts = TtsBackendRouter(remote=remote_tts, local=local_tts, backend=self.config.tts.backend)
+            self.state.current.update(
+                tts_transport=getattr(self.tts, "transport", "websocket"),
+                tts_scheduling=getattr(self.tts, "effective_scheduling", "auto"),
+            )
             if self.config.tts.output_format.lower() != "pcm":
                 raise RuntimeError("TTS 播放器需要 PCM 输出。")
             if self.config.tts.backend == "voxcpm1":
@@ -956,6 +954,9 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         seed = self._runtime_local_root / "models" / "audiocpp" / "voice-seed"
         audio, text = seed / "default.wav", seed / "default.json"
         if not audio.is_file() or not text.is_file():
+            seed = self.paths.program_root / "config/resources/assets/tts"
+            audio, text = seed / "default.wav", seed / "default.json"
+        if not audio.is_file() or not text.is_file():
             # 兼容实验安装的默认样音；读取旧配置先于重新生成运行配置。
             legacy_config = self._runtime_local_root / "config" / "audiocpp" / "server-tts-evaluation.json"
             try:
@@ -975,6 +976,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 transcript = json.loads(text.read_text(encoding="utf-8"))["reference_text"]
                 for library in self.voice_library.libraries.values():
                     library.register_default(audio.read_bytes(), transcript)
+                self._local_tts_voice_error = None
             except (OSError, ValueError, KeyError) as exc:
                 self._local_tts_voice_error = safe_voice_diagnostic(exc)
 
@@ -1157,6 +1159,26 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
     def _api_key(self, environment_name: str) -> str:
         """Read a process credential or a short-lived vault-backed override."""
         return self._credential_overrides.get(environment_name) or self.config.api_key(environment_name)
+
+    def _select_available_tts(self) -> None:
+        """启动时优先沿用选择；其资源缺失时从已安装模型或已配置在线接口中选可用项。"""
+        current = self.config.tts
+        if current.backend == "minimax" and self._api_key(current.api_key_env):
+            return
+        available = AudioCppTtsServer.available_models(self._runtime_local_root)
+        if current.backend == "voxcpm1" and current.local_model in available:
+            return
+        online = bool(self._api_key(current.api_key_env)) if current.backend == "minimax" or not available else False
+        if current.backend == "minimax" and online:
+            return
+        if available:
+            model = current.local_model if current.local_model in available else available[0]
+            self.config = replace(self.config, tts=replace(current, backend="voxcpm1", local_model=model))
+        elif online:
+            self.config = replace(self.config, tts=replace(current, backend="minimax"))
+        else:
+            raise RuntimeError("TTS（语音合成）未就绪：请安装任一本地模型及运行程序，或配置在线 API（接口）密钥。")
+        logger.info("tts.startup_selection backend=%s local_model=%s", self.config.tts.backend, self.config.tts.local_model)
 
     def _build_tts_clients(self):
         """按本机 backend（语音运行后端）配置创建 TTS provider（语音合成供应方）。"""

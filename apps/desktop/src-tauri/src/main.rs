@@ -787,7 +787,7 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
             "fields":{"phase":"启动阶段","components_ready":"所有组件具备启动条件","missing_components":"待手动补齐的组件","can_cancel":"当前阶段是否可取消"}
         });
         if readiness["ready"]!=true{initialization::manage(&app,&state)?;return Ok(());}
-        let credentials=match voice_desktop_common::credentials::status(&context.data){
+        let credentials=match voice_desktop_common::credentials::status_for_context(&context){
             Ok(value)=>value,
             Err(error)=>{
                 *state.initialization.lock().unwrap()=serde_json::json!({"phase":"接口密钥配置需要处理，请进入模型管理页","components_ready":true,"credentials_ready":false,"credentials_error":error,"can_cancel":false,

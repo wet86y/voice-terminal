@@ -70,3 +70,24 @@ def test_compatibility_router_pins_each_transaction_until_release():
         await router.shutdown()
         remote.close.assert_awaited_once()
     asyncio.run(scenario())
+
+
+def test_queued_local_switch_rechecks_backend_inside_lock():
+    async def scenario():
+        local = SimpleNamespace(switch_model=AsyncMock(), ensure_ready=AsyncMock(), close=AsyncMock())
+        router = TtsBackendRouter(remote=SimpleNamespace(close=AsyncMock()), local=local, backend="voxcpm1")
+        await router._switch_lock.acquire()
+        online = asyncio.create_task(router.switch("minimax"))
+        await asyncio.sleep(0)
+        model = asyncio.create_task(router.switch_local_model("voxcpm2"))
+        await asyncio.sleep(0)
+        router._switch_lock.release()
+        await online
+        try:
+            await model
+        except RuntimeError as exc:
+            assert "在线接口" in str(exc)
+        else:
+            raise AssertionError("排队中的本地切换必须重新检查当前后端")
+        local.switch_model.assert_not_awaited()
+    asyncio.run(scenario())

@@ -22,7 +22,7 @@ from voice_terminal.dsh.profile import build_profile
 from voice_terminal.dsh.official import OFFICIAL_SOURCE_KIND, load_official_artifact, validate_official_runtime
 from voice_terminal.paths import atomic_json
 
-CORE_MODELS = ("kws/sherpa-onnx-kws-zipformer-zh-en-3M", "funasr/paraformer-zh-streaming", "funasr/fsmn-vad", "analysis/smart-turn", "analysis/sensevoice", "speaker/campplus-zh-cn-common")
+CORE_MODELS = ("kws/sherpa-onnx-kws-zipformer-zh-en-3M", "funasr/paraformer-zh-streaming", "funasr/fsmn-vad", "funasr/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727", "analysis/smart-turn", "analysis/sensevoice", "speaker/campplus-zh-cn-common")
 
 
 def copy_tree(source: Path, target: Path, *, excludes=()) -> None:

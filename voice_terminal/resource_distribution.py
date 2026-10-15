@@ -816,6 +816,13 @@ class ResourceManager:
             files = [{"path": item.path, "size_bytes": item.size_bytes, "sha256": item.sha256,
                       "source_path": item.source_path or item.path, "optional": item.optional}
                      for item in spec.files if item.asset is None]
+        elif transport.get("kind") == "official_audiocpp_patch":
+            # 客户机由原生宿主下载官方归档并应用随包补丁；Python（后端）只投影锁定计划。
+            transport_kind = "native_official_audiocpp_patch"
+            files = [{"role": "official_archive", "url": item["url"], "size_bytes": item["size_bytes"],
+                      "destination_path": str(task / "download" / item["filename"]),
+                      "hash_algorithm": "sha256", "hash_encoding": "hex", "hash_value": item["sha256"],
+                      "restartable": True} for item in transport["artifacts"]]
         elif transport.get("kind") == "archive_http":
             artifact = transport.get("artifact", {})
             files.append({
@@ -848,6 +855,8 @@ class ResourceManager:
                 })
         generated = [{"path": item.path, "asset": item.asset, "size_bytes": item.size_bytes,
                       "sha256": item.sha256} for item in spec.files if item.asset is not None]
+        if transport.get("kind") == "official_audiocpp_patch":
+            generated.append({**transport["patch"], "role": "bundled_patch"})
         return {
             "resource_id": spec.resource_id,
             "task_id": task_id,

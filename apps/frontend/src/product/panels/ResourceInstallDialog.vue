@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources> }>()
-const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'fsmn-vad', 'wespeaker-cnceleb-resnet34', 'campplus-zh-cn-common', 'smart-turn', 'sensevoice-small'])
+const modelResourceIds = new Set(['kws-sherpa-onnx', 'paraformer-streaming', 'fsmn-vad', 'streaming-punctuation', 'wespeaker-cnceleb-resnet34', 'campplus-zh-cn-common', 'smart-turn', 'sensevoice-small', 'tts-voxcpm1', 'tts-voxcpm2'])
 const updatePending = computed(() => {
   const plan = props.controller.pendingDownloadPlan.value
   if (!plan) return false
@@ -27,7 +27,9 @@ const lightweightVadPlan = computed(() =>
       <h2 id="install-plan-title">{{ updatePending ? '准备更新' : '准备下载' }} {{ controller.pendingDownloadPlan.value.title }}</h2>
       <p v-if="controller.pendingDownloadPlan.value.model_bytes">固定资源最多 {{ (controller.pendingDownloadPlan.value.model_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。完整且匹配的资源会跳过。</p>
       <p v-if="targetModelVersion">{{ updatePending ? '本次更新将安装目标模型版本' : '本次下载将安装当前目标模型版本' }}：{{ targetModelVersion }}。</p>
-      <p v-if="!controller.pendingDownloadPlan.value.environment">{{ voiceServerUpdatePending ? '本次将更新语音运行环境依赖。' : agentResourcePlan ? `本次将${updatePending ? '更新' : '下载'}代理执行组件文件。` : `本次仅${updatePending ? '更新' : '下载'}模型文件。运行依赖请在 Voice Server（语音服务）中配置。` }}</p>
+      <p v-for="shared in controller.pendingDownloadPlan.value.shared_resources" :key="shared.resource_id">先准备 {{ shared.title }}，最多 {{ (shared.download_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。从固定官方归档下载并应用随包补丁；另一款模型可复用。</p>
+      <p v-if="controller.pendingDownloadPlan.value.resource_id.startsWith('tts-')">本地语音运行程序独立安装，默认参考音频由本体提供；下载完成后可在语音与音色页选择播放后端。</p>
+      <p v-if="!controller.pendingDownloadPlan.value.environment && !controller.pendingDownloadPlan.value.resource_id.startsWith('tts-')">{{ voiceServerUpdatePending ? '本次将更新语音运行环境依赖。' : agentResourcePlan ? `本次将${updatePending ? '更新' : '下载'}代理执行组件文件。` : `本次仅${updatePending ? '更新' : '下载'}模型文件。运行依赖请在 Voice Server（语音服务）中配置。` }}</p>
       <template v-if="controller.pendingDownloadPlan.value.environment">
         <p v-if="controller.pendingDownloadPlan.value.environment.already_ready">
           {{ lightweightVadPlan ? '轻量语音检测所需运行依赖已就绪，将检查并复用本地依赖。' : voiceServerUpdatePending ? '语音运行环境依赖已就绪，将按当前随包版本重新检查并复用本地依赖。' : '现用完整运行环境已就绪，将检测并复用已安装依赖。' }}

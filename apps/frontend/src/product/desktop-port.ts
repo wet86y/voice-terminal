@@ -150,6 +150,7 @@ export interface ResourceInstallPlan {
   resource_id: string // resource_id（资源编号）。
   title: string // title（资源名称）。
   model_bytes: number // model_bytes（模型或组件最大下载字节数）。
+  shared_resources?: Array<{ resource_id: string; title: string; download_bytes: number }> // shared_resources（共用组件）：编号、名称与最大下载字节数。
   environment?: EnvironmentPlan | null // environment（解释器与共享依赖安装内容）。
 }
 

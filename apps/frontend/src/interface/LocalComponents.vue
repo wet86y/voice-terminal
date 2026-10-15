@@ -29,6 +29,7 @@ const emit = defineEmits<{
   save: [id: string]
 }>()
 const expanded = ref(new Set<string>())
+const resourceSelections = ref<Record<string, string>>({}) // resourceSelections（各组件的下载选择）；空值不安装本地模型。
 // latestJobs（各资源的最近任务）：运行中的任务优先，旧失败记录不覆盖新下载。
 const latestJobs = computed(() => {
   const jobs = new Map<string, ManagedResourceJob>()
@@ -66,7 +67,7 @@ function needsResource(row: LocalComponentRow) {
   return Boolean(row.resource && (row.resource.state !== 'installed' || row.resource.updateAvailable))
 }
 function canExpand(row: LocalComponentRow) {
-  return row.available && !needsResource(row)
+  return Boolean(row.resourceChoices) || row.available && !needsResource(row)
 }
 function activate(row: LocalComponentRow) {
   if (!canExpand(row)) {
@@ -76,7 +77,7 @@ function activate(row: LocalComponentRow) {
   if (expanded.value.has(row.id)) expanded.value.delete(row.id)
   else {
     expanded.value.add(row.id)
-    if (row.resource && props.model.resourceActionsAvailable) emit('resourceRefresh')
+    if ((row.resource || row.resourceChoices) && props.model.resourceActionsAvailable) emit('resourceRefresh')
   }
 }
 function changeDevice(id: string, event: Event) {
@@ -86,6 +87,11 @@ function changeDevice(id: string, event: Event) {
 }
 function invalidDevice(row: LocalComponentRow) {
   return row.device?.options.find(option => option.value === row.device?.value)?.disabled
+}
+function selectedResources(row: LocalComponentRow) {
+  const selected = row.resourceChoices?.find(resource => resource.id === (resourceSelections.value[row.id] ?? ''))
+  const shared = selected || row.sharedResource?.state === 'installed' ? row.sharedResource : undefined
+  return [shared, selected].filter((resource): resource is NonNullable<typeof resource> => Boolean(resource))
 }
 </script>
 
@@ -140,8 +146,8 @@ function invalidDevice(row: LocalComponentRow) {
             <button class="outline-button" type="button" :disabled="row.resource.busy || model.resourceLoading" :aria-label="`${row.name}：导入`" @click="emit('resourceImport', row.resource.id)">{{ row.resource.busy ? '处理中…' : row.resource.updateAvailable ? '导入' : row.resource.retryable || job?.state === 'failed' ? '重试导入' : '导入' }}</button>
             <button class="outline-button" type="button" :disabled="model.resourceLoading" :aria-label="`${row.name}：跳转官方来源`" title="打开官方来源页面" @click="emit('openResourceSource', row.resource.id)">跳转</button>
           </div>
-          <button v-else-if="!needsResource(row)" class="local-component-action" :class="{ 'retry-action': row.state === 'failed' }" type="button" :disabled="row.busy || row.state === 'loading' || (!canExpand(row) && !row.retryable)" :aria-label="`${row.name}：${row.state === 'loading' ? row.status : canExpand(row) ? expanded.has(row.id) ? '收起详情' : '详情' : row.state === 'disabled' ? '已停用' : '重试'}`" :aria-expanded="canExpand(row) ? expanded.has(row.id) : undefined" :aria-controls="canExpand(row) ? `local-detail-${row.id}` : undefined" @click="activate(row)">
-            {{ row.state === 'loading' ? row.status : canExpand(row) ? expanded.has(row.id) ? '收起' : '详情' : row.state === 'disabled' ? '已停用' : '重试' }}
+          <button v-else-if="!needsResource(row)" class="local-component-action" :class="{ 'retry-action': row.state === 'failed' }" type="button" :disabled="!row.resourceChoices && (row.busy || row.state === 'loading' || (!canExpand(row) && !row.retryable))" :aria-label="`${row.name}：${row.state === 'loading' && !row.resourceChoices ? row.status : canExpand(row) ? expanded.has(row.id) ? '收起详情' : '详情' : row.state === 'disabled' ? '已停用' : '重试'}`" :aria-expanded="canExpand(row) ? expanded.has(row.id) : undefined" :aria-controls="canExpand(row) ? `local-detail-${row.id}` : undefined" @click="activate(row)">
+            {{ row.state === 'loading' && !row.resourceChoices ? row.status : canExpand(row) ? expanded.has(row.id) ? '收起' : '详情' : row.state === 'disabled' ? '已停用' : '重试' }}
             <svg v-if="canExpand(row)" viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expanded.has(row.id) }"><path d="m6 9 6 6 6-6" /></svg>
           </button>
         </div>
@@ -153,6 +159,21 @@ function invalidDevice(row: LocalComponentRow) {
         </section>
         <div v-if="canExpand(row) && expanded.has(row.id)" :id="`local-detail-${row.id}`" class="local-component-detail">
           <p>{{ row.description }}</p>
+          <div v-if="row.resourceChoices" class="local-tts-downloads">
+            <label class="form-field"><span>本地 TTS（语音合成）模型下载</span><select :value="resourceSelections[row.id] ?? ''" @change="resourceSelections[row.id] = ($event.target as HTMLSelectElement).value" :aria-label="`${row.name}：选择下载模型`"><option value="">不下载本地模型</option><option v-for="resource in row.resourceChoices" :key="resource.id" :value="resource.id">{{ resource.label }} · {{ resource.status }}</option></select></label>
+            <small>可按需安装一款或两款模型；下载不改变当前播放后端。两款模型共用原生运行程序。</small>
+            <section v-for="resource in selectedResources(row)" :key="resource.id" :data-resource="resource.id" class="local-download-choice">
+              <div class="local-managed-resource-heading"><span>{{ resource.label }}</span><span>{{ resource.updateAvailable ? '需更新' : resource.status }}</span></div>
+              <p v-if="resource.error" class="local-error">{{ resource.error }}</p>
+              <div v-if="model.resourceActionsAvailable" class="managed-resource-actions">
+                <button type="button" class="outline-button" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceDownload', resource.id)">{{ resource.busy ? '处理中…' : resource.updateAvailable ? '更新' : resource.state === 'installed' ? '校验并补齐' : '下载' }}</button>
+                <button type="button" class="outline-button" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceImport', resource.id)">导入</button>
+                <button type="button" class="outline-button" @click="emit('openResourceSource', resource.id)">来源说明</button>
+              </div>
+              <ManagedResourceProgress v-if="visibleJob(latestJobs.get(resource.id))" :job="visibleJob(latestJobs.get(resource.id))!" :label="resource.label" />
+            </section>
+            <button v-if="row.retryable" class="outline-button" type="button" :disabled="row.busy" @click="emit('retry', row.id)">重新启动语音合成</button>
+          </div>
           <dl v-if="row.facts.length" class="local-detail-facts"><div v-for="fact in row.facts" :key="fact.label"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div></dl>
           <div v-if="row.device" class="local-device-editor">
             <label :for="`local-device-${row.id}`"><span>运行位置</span><select :id="`local-device-${row.id}`" :value="row.device.value" :disabled="saving || row.device.locked" @change="changeDevice(row.id, $event)"><option v-for="option in row.device.options" :key="option.value" :value="option.value" :disabled="option.disabled">{{ option.label }}</option></select></label>
@@ -168,6 +189,7 @@ function invalidDevice(row: LocalComponentRow) {
 </template>
 
 <style scoped>
+.local-tts-downloads{display:grid;gap:12px;width:100%;min-width:0}.local-download-choice{display:grid;gap:8px;padding:12px;border:1px solid var(--line);border-radius:12px}.local-tts-downloads select{max-width:100%}
 .local-component-phase{margin:6px 0 0;color:var(--muted);font-size:var(--font-caption);line-height:1.6}
 .local-components{display:flex;flex-direction:column;gap:20px;min-width:0;container-type:inline-size}
 .local-managed-heading>div{display:grid;gap:4px;min-width:0}

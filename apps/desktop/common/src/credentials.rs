@@ -85,8 +85,16 @@ fn snapshot(value: &Value, env: &BTreeMap<String,String>, vault: &impl Vault) ->
 
 pub fn ready(status: &Value) -> bool {
     status["providers"]["deepseek"]["configured"] == true
-        && (status["tts_backend"].as_str().unwrap_or("minimax") == "voxcpm1"
-            || status["providers"]["minimax"]["configured"] == true)
+        && (status["local_tts_ready"] == true || status["providers"]["minimax"]["configured"] == true)
+}
+
+/// status_for_context（工作区凭据状态）：本地模型可用时在线合成密钥可选。
+pub fn status_for_context(context:&crate::LaunchContext)->Result<Value,String>{
+    let mut result=status(&context.data)?;
+    let inventory=crate::resources::inventory(context)?;
+    result["local_tts_ready"]=json!(inventory.iter().any(|row|row["resource_id"]=="tts"&&row["local_ready"]==true));
+    result["fields"]["local_tts_ready"]=json!("任一本地语音模型及共用运行程序已就绪；无需在线合成密钥");
+    Ok(result)
 }
 
 fn configured_tts_backend(data: &Path) -> &'static str {
@@ -294,7 +302,9 @@ mod tests {
         let root=std::env::temp_dir().join(format!("voice-credentials-{}",crate::workspace::new_id()));
         fs::create_dir_all(root.join("config")).unwrap();
         fs::write(root.join("config/local.yaml"),"tts:\n  backend: voxcpm1 # local backend\nllm:\n  provider: deepseek\n").unwrap();
-        let status=json!({"tts_backend":configured_tts_backend(&root),"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        let mut status=json!({"tts_backend":configured_tts_backend(&root),"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});
+        assert!(!ready(&status)); // 仅选择本地后端不能绕过文件就绪校验。
+        status["local_tts_ready"]=json!(true);
         assert!(ready(&status));
         fs::write(root.join("config/local.yaml"),"tts:\n  backend: minimax\n").unwrap();
         let status=json!({"tts_backend":configured_tts_backend(&root),"providers":{"deepseek":{"configured":true},"minimax":{"configured":false}}});

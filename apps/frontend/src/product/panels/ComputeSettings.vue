@@ -8,10 +8,12 @@ import { useProductContext } from '../product-context'
 import type { ComputeDeviceMode, ProductLocalModelId } from '../types'
 import { componentResources, modelComponentOwners as owners } from '../component-resources'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
+import { useLocalTtsStatus } from '../useLocalTtsStatus'
 
 const props = defineProps<{ resourceController?: ReturnType<typeof useWorkspaceResources> }>()
 const { settings, saving, computeStatus, computeSavedDevices, refreshComputeStatus, saveComputeSettings, computeModelRows, deviceLabel, serviceLabel } = useProductContext()
 const application = useApplicationHost()
+const tts = useLocalTtsStatus(() => application.snapshot.value?.startup_complete === true)
 const refreshing = ref(false)
 const retrying = ref(new Set<string>())
 // modelResourceIds（模型资源编号映射）：与 catalog.resource_id（资源清单编号）一致。
@@ -184,18 +186,30 @@ const rows = computed<LocalComponentRow[]>(() => {
     })
   }
   const localMetrics = resources.value.get('local-tts')
-  if (localMetrics) components.push({
-    id: 'local-tts', name: 'VoxCPM（本地语音合成）', state: 'ready', status: '运行中', available: true,
-    runtime: 'audio.cpp（原生音频推理框架）',
-    residentMemory: formatComponentMemory(localMetrics.memory_rss_bytes),
-    privateMemory: formatComponentMemory(localMetrics.memory_private_commit_bytes),
-    vram: formatComponentMemory(localMetrics.gpu_dedicated_bytes),
-    description: '本地语音合成运行程序；模型与音色在语音与音色页选择。',
-    facts: [],
-    note: '独立计量；不重复计入语音服务资源。',
+  const ttsResource = props.resourceController?.resources.value.find(row => row.resource_id === 'tts')
+  const capability = application.snapshot.value?.unavailable_capabilities?.find(row => row.id === 'tts')
+  const ttsLoading = Boolean(tts.status.value?.pending_selection || tts.status.value?.load_state === 'loading'
+    || application.snapshot.value?.startup_complete === false && !application.snapshot.value?.startup_skipped
+    || capability && ['STARTING', 'LOADING', 'WAITING', 'CONNECTING', 'RETRYING'].includes(capability.state))
+  const ttsFailed = !ttsLoading && (Boolean(capability) || ttsResource?.can_start === false || tts.status.value?.load_state === 'error')
+  const localBackend = (tts.status.value?.backend ?? settings.tts.backend) === 'voxcpm1'
+  components.push({
+    id: 'tts', name: 'TTS（语音合成）',
+    state: ttsLoading ? 'loading' : ttsFailed ? 'failed' : 'ready',
+    status: ttsLoading ? tts.status.value?.pending_selection ? '切换中' : '启动中' : ttsFailed ? '待配置或恢复' : application.snapshot.value?.startup_complete ? '运行中' : '已配置',
+    available: true, busy: ttsLoading, retryable: !ttsLoading && Boolean(capability?.retry),
+    runtime: localBackend ? 'audio.cpp（原生音频推理框架）' : '在线 API（语音接口）',
+    residentMemory: formatComponentMemory(localMetrics?.memory_rss_bytes),
+    privateMemory: formatComponentMemory(localMetrics?.memory_private_commit_bytes),
+    vram: formatComponentMemory(localMetrics?.gpu_dedicated_bytes),
+    description: '安装任一本地模型及共用运行程序，或配置在线语音接口，即可满足语音合成组件的启动条件。播放后端与音色在语音与音色页选择。',
+    error: ttsLoading ? undefined : capability?.error || ttsResource?.error || tts.status.value?.error || undefined,
+    resourceChoices: ['tts-voxcpm2', 'tts-voxcpm1'].map(managedResource).filter((row): row is ManagedResourceRow => Boolean(row)),
+    sharedResource: managedResource('tts-audiocpp-runtime'), facts: [],
+    note: '本地运行程序独立计量；下载不会自动热切换当前模型。',
   })
   // 能力行：模型行未覆盖的能力（音频、合成、主模型等）单独呈现，并可只恢复该能力。
-  const coveredCapabilities = new Set(['asr', 'kws', 'speaker'])
+  const coveredCapabilities = new Set(['asr', 'kws', 'speaker', 'tts'])
   for (const capability of application.snapshot.value?.unavailable_capabilities ?? []) {
     if (coveredCapabilities.has(capability.id)) continue
     const loading = ['STARTING', 'LOADING', 'WAITING', 'CONNECTING', 'RETRYING'].includes(capability.state)
@@ -260,10 +274,11 @@ const model = computed<LocalComponentsModel>(() => {
 async function refresh() {
   if (refreshing.value) return
   refreshing.value = true
-  try { await Promise.allSettled([application.refresh(), refreshComputeStatus(true), props.resourceController?.refresh()]) }
+  try { await Promise.allSettled([application.refresh(), refreshComputeStatus(true), props.resourceController?.refresh(), tts.refresh()]) }
   finally { refreshing.value = false }
 }
 async function retry(id: string) {
+  if (id === 'tts') { await application.retryCapability('tts'); await tts.refresh(true); return }
   if (id === 'voice-system') {
     const component = ['setup', 'web', 'voice', 'desktop'].map(componentFor).find(row => row?.retry_allowed)
     if (component) await retry(component.id)

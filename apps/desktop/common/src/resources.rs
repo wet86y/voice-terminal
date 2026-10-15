@@ -46,6 +46,13 @@ pub fn specs(context:&LaunchContext)->Result<Vec<Value>,String>{
     }Ok(items)
 }
 pub fn spec(context:&LaunchContext,id:&str)->Result<Value,String>{specs(context)?.into_iter().find(|v|v["resource_id"]==id).ok_or("不支持的资源编号".into())}
+/// download_bytes（最大远端下载字节）：随包补丁不算网络流量。
+pub fn download_bytes(item:&Value)->u64{
+    let transfer=&item["source"]["transfer"];
+    if let Some(artifacts)=transfer["artifacts"].as_array(){return artifacts.iter().filter_map(|row|row["size_bytes"].as_u64()).sum();}
+    transfer["artifact"]["size_bytes"].as_u64().unwrap_or_else(||item["files"].as_array().into_iter().flatten()
+        .filter(|row|row["optional"]!=true&&!row["asset"].is_string()).filter_map(|row|row["size_bytes"].as_u64()).sum())
+}
 fn destination(context:&LaunchContext,spec:&Value)->Result<PathBuf,String>{
     let relative=spec["destination"].as_str().ok_or("资源缺少固定目录")?;
     safe_path(&context.install,&if spec["kind"]=="model"{format!("models/{relative}")}else{relative.into()})
@@ -161,6 +168,12 @@ fn inspect_installed_model(context:&LaunchContext,spec:&Value,verify_hashes:bool
                 rows.push(json!({"path":relative,"size":row["size"],"sha256":row["sha256"],"optional":false}));
             }}
         }
+        // legacy TTS（旧本地语音模型）迁入时没有更新总清单；只接受锁定目标记录，不信任未登记大小。
+        if rows.is_empty()&&(resource_id=="tts-voxcpm1"||resource_id=="tts-voxcpm2"){
+            for row in spec["files"].as_array().ok_or("本地语音文件清单缺失")?{
+                rows.push(json!({"path":row["path"],"size":row["size_bytes"],"sha256":row["sha256"],"optional":row["optional"]==true}));
+            }
+        }
         (None,rows)
     };
     if files.is_empty(){return Err("模型安装清单没有该组件的文件记录".into());}
@@ -201,7 +214,8 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
         "required":true,"files_installed":runtime["interpreter_ready"],"runtime_ready":ready,"can_start":ready,"runtime_group":"all","python":runtime["python"],"version":runtime["version"],
         "update_available":runtime["update_available"],"source_url":"https://www.python.org/downloads/release/python-31210/","error":if ready{Value::Null}else if runtime["update_available"]==true{json!("语音运行依赖有更新，请更新完整运行环境后再启动。")}else{json!("请下载或导入完整 Python（后端运行环境），程序将一次检测并补齐全部语音依赖。")},
         "fields":{"files_installed":"私有解释器已安装","runtime_ready":"全部语音依赖已按当前锁定版本就绪","can_start":"具备启动条件且没有待更新组件","runtime_group":"完整语音依赖","python":"私有解释器路径","version":"解释器版本","update_available":"运行环境依赖锁版本可更新"}})];
-    for item in specs(context)? {
+    let catalog=specs(context)?;
+    for item in &catalog {
         let root=destination(context,&item)?;
         // 先以收据/旧总清单的字节数快检；只有目标文件记录变化时才复核旧文件 SHA-256（摘要）。
         let (result,installed_version,update_available)=if item["kind"]=="model"{
@@ -230,7 +244,8 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
         };
         let group=item["dependency_group"].as_str().unwrap_or_else(||crate::runtime::model_group(item["resource_id"].as_str().unwrap_or("")));
         let node_status=if item["kind"]=="dsh"&&item["origin"]=="npm_package"{crate::dsh::discover(&crate::dsh::target(&context.installed_program())?,false).map(|_|())}else{Ok(())};
-        let dependencies=if item["kind"]=="dsh"{node_status.is_ok()}else{groups[group]["ready"]==true};
+        let native_tts=item["resource_id"].as_str().is_some_and(|id|id.starts_with("tts-"));
+        let dependencies=if native_tts{true}else if item["kind"]=="dsh"{node_status.is_ok()}else{groups[group]["ready"]==true};
         let can_start=result.is_ok()&&dependencies&&!update_available;
         let error=result.as_ref().err().cloned().or_else(||node_status.err()).or_else(||if update_available{Some("该组件的版本或适配要求有更新，请先完成更新。".into())}else{None});
         rows.push(json!({"resource_id":item["resource_id"],"label":item["title"],"installation_state":if result.is_ok(){"installed"}else if root.exists(){"incomplete"}else{"missing"},
@@ -239,6 +254,10 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
             "version":item["version"],"installed_version":installed_version,"update_available":update_available,
             "fields":{"required":"是否为阻塞启动的必需组件","files_installed":"模型或组件文件已安装","runtime_ready":"共享运行依赖已就绪","can_start":"具备启动条件","runtime_group":"启动所需共享依赖组",
                 "version":"随程序提供的目标模型或组件版本","installed_version":"实际安装的模型或组件版本；旧清单未知时为空","update_available":"目标模型或组件内容、版本可更新"}}));
+    }
+    if catalog.iter().any(|item|item["runtime_resource"]=="tts-audiocpp-runtime"){
+        rows.push(json!({"resource_id":"tts","label":"TTS（语音合成）","required":true}));
+        update_tts_readiness(context,&mut rows)?;
     }
     let updates_pending=rows.iter().any(|row|row["required"]!=false&&row["update_available"]==true);
     let other_components_ready=rows.iter().skip(1).filter(|row|row["required"]!=false).all(|row|row["can_start"]==true);
@@ -252,6 +271,40 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
         server["fields"]["updates_pending"]=json!("是否仍有需要完成的组件更新");
     }
     Ok(rows)
+}
+/// update_tts_readiness（语音合成任选条件）：共用运行程序加任一本地模型，或在线密钥。
+pub fn update_tts_readiness(context:&LaunchContext,rows:&mut [Value])->Result<(),String>{
+    if !rows.iter().any(|row|row["resource_id"]=="tts"){return Ok(());}
+    let runtime=rows.iter().any(|row|row["resource_id"]=="tts-audiocpp-runtime"&&row["can_start"]==true)
+        || legacy_tts_runtime_ready(context)?;
+    let local=runtime&&rows.iter().any(|row|(row["resource_id"]=="tts-voxcpm1"||row["resource_id"]=="tts-voxcpm2")&&row["can_start"]==true);
+    let credentials=crate::credentials::status(&context.data)?;
+    let online=credentials["providers"]["minimax"]["configured"]==true;
+    let ready=local||online;
+    if let Some(row)=rows.iter_mut().find(|row|row["resource_id"]=="tts"){
+        *row=json!({"resource_id":"tts","label":"TTS（语音合成）","required":true,"installation_state":if ready{"installed"}else{"missing"},
+            "files_installed":local,"runtime_ready":ready,"can_start":ready,"local_ready":local,"online_ready":online,
+            "error":if ready{Value::Null}else{json!("请安装 VoxCPM1 或 VoxCPM2（本地语音合成模型）及共用运行程序，或配置在线 API（接口）密钥。")},
+            "fields":{"resource_id":"固定组件编号","label":"组件名称","required":"是否参与整体启动门槛","installation_state":"任选条件是否已满足",
+                "files_installed":"本地运行程序及至少一款模型完整","runtime_ready":"存在可用语音后端","can_start":"语音合成组件可以启动",
+                "local_ready":"至少一款本地模型及共用运行程序可用","online_ready":"在线语音接口密钥已配置","error":"尚未满足任选条件的原因"}});
+    }Ok(())
+}
+/// legacy_tts_runtime_ready（旧原生安装兼容）：仅认可随包补丁对应的程序与模型规格摘要。
+fn legacy_tts_runtime_ready(context:&LaunchContext)->Result<bool,String>{
+    if context.install.join("models/audiocpp/runtime/cuda/audiocpp_server.exe").is_file(){return Ok(false);}
+    let Ok(item)=spec(context,"tts-audiocpp-runtime")else{return Ok(false)};
+    if item["files"].as_array().is_none_or(|rows|rows.iter().filter(|row|row["archive_id"]=="patch").count()<3){return Ok(false);}
+    for row in item["files"].as_array().into_iter().flatten().filter(|row|row["archive_id"]=="patch"){
+        let Some(name)=row["path"].as_str()else{return Ok(false)};
+        let path=if name=="cuda/audiocpp_server.exe"{context.install.join("runtimes/audiocpp").join(name)}
+            else{context.install.join("sources/audio.cpp").join(name)};
+        if !path.is_file()||path.metadata().map_err(|e|e.to_string())?.len()!=row["size_bytes"].as_u64().unwrap_or(0)
+            ||file_hash(&path)?!=row["sha256"].as_str().unwrap_or(""){return Ok(false);}
+    }
+    // 旧自编译程序静态链接 CUDA runtime（计算运行时），其必需运行库与官方归档的动态布局不同。
+    Ok(["ggml.dll","ggml-base.dll","ggml-cuda.dll","cublas64_13.dll","cublasLt64_13.dll"].iter()
+        .all(|name|context.install.join("runtimes/audiocpp/cuda").join(name).is_file()))
 }
 /// startup_readiness（启动组件检查）：只读取本地清单与文件，不启动解释器、服务或下载。
 pub fn startup_readiness(context:&LaunchContext)->Result<Value,String>{
@@ -284,7 +337,8 @@ fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&At
     let mut plans=Vec::new();
     for index in 1..rows.len(){
         let row=&rows[index];
-        if row["required"]==false||row["files_installed"]!=true{continue;}
+        let local_tts=row["resource_id"].as_str().is_some_and(|id|id.starts_with("tts-"));
+        if (row["required"]==false&&!local_tts)||row["files_installed"]!=true||row["resource_id"]=="tts"{continue;}
         let Some(id)=row["resource_id"].as_str()else{continue;};
         let label=row["label"].as_str().unwrap_or(id).to_owned();
         let budget:Result<u64,String>=(||{
@@ -341,6 +395,7 @@ fn validate_inventory_hashes(context:&LaunchContext,rows:&mut [Value],cancel:&At
         completed=completed.saturating_add(component_total).min(total);
     }
     if total>0{progress("组件校验完成",total,total);}
+    update_tts_readiness(context,rows)?;
     if rows.iter().skip(1).any(|row|row["required"]!=false&&row["can_start"]!=true){
         if let Some(server)=rows.first_mut(){server["can_start"]=json!(false);server["error"]=json!("有组件文件损坏、尚未就绪或需要更新，请完成修复后再启动。");}
     }
@@ -351,8 +406,10 @@ fn readiness_from_inventory(rows:&[Value])->Value{
         "resource_id":row["resource_id"],"label":row["label"],
         "reason":row["error"].as_str().unwrap_or(if row["update_available"]==true{"组件有更新，需先完成更新"}else{"组件文件或共享运行依赖尚未完备"})
     })).collect::<Vec<_>>();
-    json!({"ready":!rows.is_empty()&&missing.is_empty(),"missing":missing,"checked_components":rows.len(),
-        "fields":{"ready":"全部组件具备启动条件","missing":"待用户手动补齐的组件","checked_components":"已检查组件数量","resource_id":"组件编号","label":"组件名称","reason":"缺失原因"}})
+    let invalid=rows.iter().filter(|row|row["error"].as_str().is_some_and(|error|error.contains("完整摘要复核失败")))
+        .map(|row|json!({"resource_id":row["resource_id"],"reason":row["error"]})).collect::<Vec<_>>();
+    json!({"ready":!rows.is_empty()&&missing.is_empty(),"missing":missing,"invalid_resources":invalid,"checked_components":rows.len(),
+        "fields":{"ready":"全部组件具备启动条件","missing":"待用户手动补齐的组件","invalid_resources":"含可选资源在内的完整摘要失败记录","checked_components":"已检查组件数量","resource_id":"组件编号","label":"组件名称","reason":"缺失原因"}})
 }
 pub fn unpack_zip(source:&Path,target:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
     let mut archive=zip::ZipArchive::new(fs::File::open(source).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
@@ -626,6 +683,9 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
             !model_update_available(&item,&current)&&validate_model_files_with_progress(context,&item,&installed,false,&cancel,progress).is_ok())};
     check_cancel(&cancel)?;
     if current {progress("复用已校验资源",1,1);return Ok(vec![id.into()]);}
+    if item["source"]["transfer"]["kind"]=="official_audiocpp_patch"{
+        return download_patched_audiocpp(context,&item,cancel,progress,enable);
+    }
     if id=="dsh"&&item["origin"]=="npm_package"{
         let root=safe_path(&context.install,"tmp/resource-downloads/dsh")?;fs::create_dir_all(&root).map_err(|e|e.to_string())?;
         let candidate=root.join(crate::dsh::candidate_name(&crate::dsh::target(&context.installed_program())?)?);
@@ -663,11 +723,53 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
     crate::download::download_batch(&downloads,cancel.clone(),&mut|phase,done,total|progress(&format!("模型文件：{phase}"),done,total))?;
     import_review_with_activation(context,&root,Some(id),cancel,progress,&mut|_|Ok(()),enable)
 }
+/// download_patched_audiocpp（官方原生包加随包补丁）：逐层校验后才原子启用，无客户机编译。
+fn download_patched_audiocpp(context:&LaunchContext,item:&Value,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut Activation)->Result<Vec<String>,String>{
+    let transfer=&item["source"]["transfer"];
+    let task=safe_path(&context.install,"tmp/resource-downloads/tts-audiocpp-runtime")?;
+    fs::create_dir_all(&task).map_err(|e|e.to_string())?;
+    let patch=&transfer["patch"];
+    let patch_file=resource_asset(context,patch["asset"].as_str().ok_or("原生覆盖补丁缺失，请修复本体安装。")?)?;
+    if patch_file.metadata().map_err(|e|e.to_string())?.len()!=patch["size_bytes"].as_u64().ok_or("补丁大小缺失")?
+        ||crate::workspace::file_hash_with_progress(&patch_file,&cancel,progress)?!=patch["sha256"].as_str().ok_or("补丁摘要缺失")?{
+        return Err("audio.cpp（原生语音框架）随包补丁损坏，请修复本体安装。".into());
+    }
+    let archives=transfer["artifacts"].as_array().ok_or("官方原生归档清单缺失")?;
+    for artifact in archives{
+        check_cancel(&cancel)?;
+        let file=file_spec(artifact,artifact["url"].as_str().ok_or("官方原生包地址缺失")?.into())?;
+        let path=safe_path(&task,&file.path)?;
+        crate::download::download_with_progress(&file,&path,cancel.clone(),&mut|phase,done,total|progress(&format!("官方原生运行包：{phase}"),done,total),0)?;
+        let archive_id=artifact["id"].as_str().ok_or("官方归档编号缺失")?;
+        let out=safe_path(&task,&format!("unpacked/{archive_id}"))?;
+        unpack_zip(&path,&out,&cancel,progress)?;
+    }
+    progress("正在应用本地语音补丁",0,0);
+    unpack_zip(&patch_file,&task.join("unpacked/patch"),&cancel,progress)?;
+    let candidate=task.join("candidate");
+    if candidate.exists(){remove_owned(&candidate,&context.install)?;}
+    fs::create_dir_all(&candidate).map_err(|e|e.to_string())?;
+    let mut verified=vec![];let mut buffer=vec![0;1024*1024];
+    for row in item["files"].as_array().ok_or("原生最终文件清单缺失")?{
+        let archive_id=row["archive_id"].as_str().ok_or("原生文件来源编号缺失")?;
+        if archive_id!="patch"&&!archives.iter().any(|entry|entry["id"]==archive_id){return Err("原生文件引用未锁定归档。".into());}
+        let source=safe_path(&task,&format!("unpacked/{archive_id}/{}",row["source_path"].as_str().ok_or("原生文件来源路径缺失")?))?;
+        let name=row["path"].as_str().ok_or("原生文件安装路径缺失")?;
+        let target=safe_path(&candidate,name)?;
+        if source.metadata().map_err(|e|e.to_string())?.len()!=row["size_bytes"].as_u64().ok_or("原生文件大小缺失")?{return Err(format!("原生补丁安装文件大小不符：{name}"));}
+        let hash=copy_file_buffered(&source,&target,&cancel,&AtomicBool::new(false),Some(row["sha256"].as_str().ok_or("原生文件摘要缺失")?),&mut buffer,progress)?;
+        verified.push(json!({"path":name,"size":row["size_bytes"],"sha256":hash,"optional":false}));
+    }
+    write_model_receipt(&candidate,item,verified)?;
+    check_cancel(&cancel)?;progress("正在启用本地语音运行程序",1,1);
+    enable(&candidate,"models/audiocpp/runtime")?;
+    Ok(vec!["tts-audiocpp-runtime".into()])
+}
 /// model_file_url（模型文件来源）：直接访问固定版本，下载过程不调用 Python（运行环境）。
 fn model_file_url(item:&Value,row:&Value)->Result<String,String>{
     let repo=item["source"]["repo_id"].as_str().ok_or("仓库缺失")?;
     let revision=item["source"]["revision"].as_str().ok_or("版本缺失")?;
-    let path=row["path"].as_str().ok_or("文件名缺失")?;
+    let path=row["source_path"].as_str().or(row["path"].as_str()).ok_or("文件名缺失")?;
     let encode=|text:&str,slash:bool|text.bytes().map(|byte|{
         if byte.is_ascii_alphanumeric()||b"-._~".contains(&byte)||(slash&&byte==b'/'){(byte as char).to_string()}else{format!("%{byte:02X}")}
     }).collect::<String>();
@@ -778,6 +880,66 @@ pub fn bind_component(context:&LaunchContext,kind:&str,relative:&str,root:&Path)
 #[cfg(test)]
 mod download_tests {
     use super::*;
+
+    #[test]
+    #[ignore="手动验收：仅使用已下载官方归档，在独立报告目录安装及复核原生补丁，不修改正式工作区"]
+    fn install_official_audiocpp_patch_in_isolated_workspace(){
+        let root=PathBuf::from(std::env::var_os("VOICE_TTS_TEST_ROOT").expect("需要 VOICE_TTS_TEST_ROOT（独立原生测试目录）"));
+        let program=PathBuf::from(std::env::var_os("VOICE_TTS_SOURCE_ROOT").expect("需要 VOICE_TTS_SOURCE_ROOT（源码目录）"));
+        let cache=PathBuf::from(std::env::var_os("VOICE_TTS_ARCHIVE_CACHE").expect("需要 VOICE_TTS_ARCHIVE_CACHE（已校验官方归档缓存）"));
+        assert!(root.starts_with(program.join(".local/cache/reports/tts-distribution")));
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        crate::workspace::initialize(&root).unwrap();
+        fs::create_dir_all(root.join("app/config/resources/assets/audiocpp")).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();fs::write(root.join("app/scripts/backend-entry.py"),b"# fixture").unwrap();
+        let catalog=load(&program.join("config/resources/catalog.json")).unwrap();
+        let entry=catalog["resources"].as_array().unwrap().iter().find(|row|row["resource_id"]=="tts-audiocpp-runtime").unwrap();
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[entry]})).unwrap();
+        fs::copy(program.join("config/resources/assets/audiocpp/voxcpm-patch.zip"),root.join("app/config/resources/assets/audiocpp/voxcpm-patch.zip")).unwrap();
+        let context=LaunchContext::portable(&root).unwrap();
+        let item=spec(&context,"tts-audiocpp-runtime").unwrap();let task=root.join("tmp/resource-downloads/tts-audiocpp-runtime");
+        fs::create_dir_all(&task).unwrap();
+        for artifact in item["source"]["transfer"]["artifacts"].as_array().unwrap(){
+            let filename=artifact["filename"].as_str().unwrap();let verified=cache.join(filename.replace(".zip",".verified.zip"));
+            let source=if verified.is_file(){verified}else{cache.join(filename)};
+            let target=task.join(filename);if !target.is_file(){fs::copy(source,&target).unwrap();}
+        }
+        let result=download_resource(&context,"tts-audiocpp-runtime",Arc::new(AtomicBool::new(false)),&mut|_,_,_|{}).unwrap();
+        assert_eq!(result,vec!["tts-audiocpp-runtime"]);
+        let target=destination(&context,&item).unwrap();model_validate(&context,&item,&target).unwrap();
+        let before=file_hash(&target.join(MODEL_RECEIPT)).unwrap();
+        download_resource(&context,"tts-audiocpp-runtime",Arc::new(AtomicBool::new(false)),&mut|_,_,_|{}).unwrap();
+        assert_eq!(file_hash(&target.join(MODEL_RECEIPT)).unwrap(),before);
+        println!("已通过官方归档、随包补丁、最终文件及重试复用校验：{}",target.display());
+    }
+
+    #[test]
+    fn tts_any_installed_model_survives_other_optional_model_corruption(){
+        let root=std::env::temp_dir().join(format!("voice-tts-options-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();ready_test_runtime(&root);
+        fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();
+        fs::write(root.join("app/scripts/backend-entry.py"),b"# fixture").unwrap();
+        let mut entries=vec![];
+        for id in ["tts-audiocpp-runtime","tts-voxcpm1","tts-voxcpm2"]{
+            let relative=format!("audiocpp/{id}");let folder=root.join("models").join(&relative);
+            fs::create_dir_all(&folder).unwrap();fs::write(folder.join("model.bin"),b"good").unwrap();
+            let mut item=json!({"resource_id":id,"kind":"model","title":id,"destination":relative,"version":"1","required":false,
+                "files":[{"path":"model.bin","size_bytes":4,"sha256":file_hash(&folder.join("model.bin")).unwrap()}]});
+            if id!="tts-audiocpp-runtime"{item["runtime_resource"]=json!("tts-audiocpp-runtime");}
+            write_model_receipt(&folder,&item,vec![json!({"path":"model.bin","size":4,"sha256":item["files"][0]["sha256"],"optional":false})]).unwrap();
+            entries.push(item);
+        }
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":entries})).unwrap();
+        let context=LaunchContext::portable(&root).unwrap();
+        let rows=inventory(&context).unwrap();assert_eq!(rows.iter().find(|row|row["resource_id"]=="tts").unwrap()["local_ready"],true);
+        fs::write(root.join("models/audiocpp/tts-voxcpm2/model.bin"),b"bad!").unwrap();
+        let state=startup_readiness(&context).unwrap();assert_eq!(state["ready"],true);
+        fs::remove_file(root.join("models/audiocpp/tts-voxcpm1/model.bin")).unwrap();
+        let mut rows=inventory(&context).unwrap();validate_inventory_hashes(&context,&mut rows,&AtomicBool::new(false),&mut|_,_,_|{}).unwrap();
+        assert_eq!(rows.iter().find(|row|row["resource_id"]=="tts").unwrap()["local_ready"],false);
+        crate::workspace::remove_owned(&root,&std::env::temp_dir()).unwrap();
+    }
 
     #[test]
     #[ignore="手动验收：只读真实环境并在指定缓存中复制样本、对照旧流程和优化流程"]
@@ -1159,6 +1321,12 @@ mod download_tests {
     fn all_pinned_model_files_have_native_download_sources() {
         let catalog:Value=serde_json::from_str(include_str!("../../../../config/resources/catalog.json")).unwrap();
         for model in catalog["resources"].as_array().unwrap().iter().filter(|item|item["kind"]=="model"&&!item["source"]["transfer"]["artifact"].is_object()) {
+            if model["source"]["transfer"]["kind"]=="official_audiocpp_patch"{
+                for artifact in model["source"]["transfer"]["artifacts"].as_array().unwrap(){
+                    assert!(artifact["url"].as_str().unwrap().starts_with("https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/"));
+                    assert!(valid_sha256(artifact["sha256"].as_str().unwrap()));
+                }continue;
+            }
             for row in model["files"].as_array().unwrap().iter().filter(|row|row["optional"]!=true&&!row["asset"].is_string()) {
                 let file=file_spec(row,model_file_url(model,row).unwrap()).unwrap();
                 assert!(file.size>0);assert_eq!(file.sha256.len(),64);assert!(file.url.starts_with("https://"));

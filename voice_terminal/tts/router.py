@@ -136,6 +136,8 @@ class TtsBackendRouter:
         if local_model not in {"voxcpm1", "voxcpm2"}:
             raise ValueError("local_model（本地语音合成模型）必须为 voxcpm1 或 voxcpm2。")
         async with self._switch_lock:
+            if self.backend != "voxcpm1":
+                raise RuntimeError("当前 TTS（语音合成）后端已切换为在线接口，无法切换本地模型。")
             if self._local_leases:
                 raise RuntimeError("当前仍有 TTS（语音合成）会话，请等播报事务结束后再切换模型。")
             if self._local_switching:

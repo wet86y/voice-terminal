@@ -16,6 +16,32 @@ function model(): LocalComponentsModel {
 }
 
 describe('LocalComponents（本地组件）运行环境与导入入口', () => {
+  it('语音合成始终可展开详情，按选择下载模型，不选时不提交下载', async () => {
+    const value = model()
+    value.rows = [{ id: 'tts', name: 'TTS（语音合成）', state: 'failed', status: '待配置', available: true,
+      runtime: '在线或本地', description: '任一本地模型或在线接口可用即可启动。', facts: [],
+      resourceChoices: [
+        { id: 'tts-voxcpm2', label: 'VoxCPM2（第二代模型）', state: 'missing', status: '缺失', required: false },
+        { id: 'tts-voxcpm1', label: 'VoxCPM1（第一代模型）', state: 'missing', status: '缺失', required: false },
+      ],
+      sharedResource: { id: 'tts-audiocpp-runtime', label: 'audio.cpp（共用运行程序）', state: 'missing', status: '缺失', required: false },
+    }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    await wrapper.get('.local-component-action').trigger('click')
+    const select = wrapper.get('select')
+    expect((select.element as HTMLSelectElement).value).toBe('')
+    expect(wrapper.find('[data-resource="tts-voxcpm2"]').exists()).toBe(false)
+    expect(wrapper.find('[data-resource="tts-audiocpp-runtime"]').exists()).toBe(false)
+    await select.setValue('tts-voxcpm2')
+    await wrapper.get('[data-resource="tts-voxcpm2"] button').trigger('click')
+    expect(wrapper.emitted('resourceDownload')).toEqual([['tts-voxcpm2']])
+    await select.setValue('tts-voxcpm1')
+    expect(wrapper.find('[data-resource="tts-voxcpm2"]').exists()).toBe(false)
+    expect(wrapper.find('[data-resource="tts-voxcpm1"]').exists()).toBe(true)
+    await select.setValue('')
+    expect(wrapper.emitted('resourceDownload')).toHaveLength(1)
+    wrapper.unmount()
+  })
   it('全部安装就绪后隐藏批量导入，并保持语音服务详情入口', async () => {
     const wrapper = mount(LocalComponents, { props: { model: model() } })
     expect(wrapper.find('.resource-batch-import').exists()).toBe(false)

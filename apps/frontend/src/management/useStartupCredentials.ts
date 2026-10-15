@@ -15,7 +15,7 @@ export function useStartupCredentials(port: DesktopCredentialsPort) {
   const localTts = ref(false) // localTts（本地语音选中时在线密钥可选）。
   const ready = computed(() => !disabled.value && configured.value.deepseek && (localTts.value || configured.value.minimax))
   function update(result: FixedModelCredentials) {
-    localTts.value = result.tts_backend === 'voxcpm1'
+    localTts.value = result.local_tts_ready === true
     configured.value = { deepseek: result.providers.deepseek.configured, minimax: result.providers.minimax.configured }
   }
   onMounted(async () => {

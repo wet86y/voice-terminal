@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect  # type: ignore
-    from fastapi.responses import JSONResponse  # type: ignore
+    from fastapi.responses import JSONResponse, Response  # type: ignore
 except ImportError:  # pragma: no cover - optional during doctor/setup
     FastAPI = None  # type: ignore[assignment]
     WebSocket = Any  # type: ignore[assignment,misc]
@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - optional during doctor/setup
     HTTPException = RuntimeError  # type: ignore[assignment,misc]
     Request = Any  # type: ignore[assignment,misc]
     JSONResponse = Any  # type: ignore[assignment,misc]
+    Response = Any  # type: ignore[assignment,misc]
 
 
 def _valid_command(message: Any) -> tuple[str, dict[str, Any]] | None:

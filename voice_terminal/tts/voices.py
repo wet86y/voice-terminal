@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from fractions import Fraction
 import io
+import hashlib
 import json
 import math
 import os
@@ -548,13 +549,45 @@ class VoiceLibrary:
         """register_default（登记默认项）：完整素材就绪后才写入启用选择。"""
         with self._lock:
             if self._index.get("default_voice"):
-                return self.get_voice(self._index["default_voice"]["voice_id"])
+                voice = self.get_voice(self._index["default_voice"]["voice_id"])
+                try:
+                    self.asset_path(voice["reference_asset_id"])
+                except FileNotFoundError:
+                    # 只能原位恢复同一默认素材；用户更换过默认样音时保留原引用并明确报错。
+                    normalized, duration_ms = self._normalize_audio(data, "default.wav")
+                    seed = self._index["migrations"].get("default_seed", {})
+                    matches_seed = (seed.get("asset_id") == voice["reference_asset_id"]
+                                    and seed.get("sha256") == hashlib.sha256(normalized).hexdigest()) if seed else (
+                                        voice.get("source") == "legacy" and voice.get("revision") == 1)
+                    if voice.get("reference_text") != transcript or not matches_seed:
+                        raise VoiceLibraryError("默认音色参考音频缺失，请重新导入原参考音频。")
+                    asset_id = voice["reference_asset_id"]
+                    destination = self._asset_path(asset_id)
+                    temporary = destination.with_name(f".{asset_id}-{uuid4().hex}.tmp")
+                    try:
+                        with temporary.open("wb") as handle:
+                            handle.write(normalized)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        os.replace(temporary, destination)
+                        updated = json.loads(json.dumps(self._index))
+                        updated["assets"].setdefault(asset_id, {
+                            "created_at": _utc_now(), "duration_ms": duration_ms,
+                            "sample_rate": 16000, "channels": 1, "format": "wav",
+                        })
+                        self._save_index(updated)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                return voice
             asset = self.put_import(data, "default.wav")
             voice = self.create_voice({"name": "默认音色", "source": "legacy", "reference_asset_id": asset["asset_id"], "reference_text": transcript})
             updated = json.loads(json.dumps(self._index))
             selection = {"voice_id": voice["id"], "revision": voice["revision"]}
             updated["default_voice"] = selection
             updated.setdefault("active_voice", selection)
+            # default_seed（默认种子来源）：asset_id（原素材编号）及 sha256（规范化音频摘要）。
+            updated["migrations"]["default_seed"] = {"asset_id": asset["asset_id"],
+                "sha256": hashlib.sha256(self.asset_bytes(asset["asset_id"])).hexdigest()}
             self._save_index(updated)
             return voice
 

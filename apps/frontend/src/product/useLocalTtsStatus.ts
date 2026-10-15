@@ -1,4 +1,4 @@
-import { onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { productApi } from './api'
 import { useApplicationHost } from './application-host'
 import type { ProductLocalTtsStatus } from './types'
@@ -57,6 +57,7 @@ export function useLocalTtsStatus(localBackendEnabled: () => boolean) {
   }
 
   onMounted(() => { if (localBackendEnabled()) void refresh() })
+  watch(localBackendEnabled, enabled => { if (enabled && !disposed) { pollCount = 0; void refresh() } })
   onUnmounted(() => {
     disposed = true
     if (timer !== undefined) window.clearTimeout(timer)

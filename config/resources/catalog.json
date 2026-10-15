@@ -294,14 +294,32 @@
         "repo_id": "iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727",
         "revision": "v2.0.4",
         "page_url": "https://modelscope.cn/models/iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727",
-        "transfer": { "kind": "modelscope_sdk" },
+        "transfer": {
+          "kind": "modelscope_sdk"
+        },
         "license_url": "https://modelscope.cn/models/iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727"
       },
       "files": [
-        { "path": "config.yaml", "size_bytes": 822, "sha256": "4b57cf5d7a3310937ac2d73aa0ea89770e022d62c99dcf3e247f7dbeb0b0260d" },
-        { "path": "configuration.json", "size_bytes": 377, "sha256": "e8dd1de5c3b86ccef2b4630be8f1e942f909019c50bd801c28bd083982fd8a2a" },
-        { "path": "model.pt", "size_bytes": 288802610, "sha256": "e9aa7185e9b0fce3ee148a736aa63a932faf85fd73107756748be424d5ef8940" },
-        { "path": "tokens.json", "size_bytes": 4207480, "sha256": "c960ab87bccea4aa15cf49a59f71973c2c330b46668048cd8da253749ec71ee3" }
+        {
+          "path": "config.yaml",
+          "size_bytes": 822,
+          "sha256": "4b57cf5d7a3310937ac2d73aa0ea89770e022d62c99dcf3e247f7dbeb0b0260d"
+        },
+        {
+          "path": "configuration.json",
+          "size_bytes": 377,
+          "sha256": "e8dd1de5c3b86ccef2b4630be8f1e942f909019c50bd801c28bd083982fd8a2a"
+        },
+        {
+          "path": "model.pt",
+          "size_bytes": 288802610,
+          "sha256": "e9aa7185e9b0fce3ee148a736aa63a932faf85fd73107756748be424d5ef8940"
+        },
+        {
+          "path": "tokens.json",
+          "size_bytes": 4207480,
+          "sha256": "c960ab87bccea4aa15cf49a59f71973c2c330b46668048cd8da253749ec71ee3"
+        }
       ]
     },
     {
@@ -419,6 +437,298 @@
       ]
     },
     {
+      "resource_id": "tts-voxcpm2",
+      "kind": "model",
+      "title": "VoxCPM2（本地语音合成模型）",
+      "destination": "audiocpp/tts/VoxCPM2-GGUF",
+      "version": "1b5981b2b89a1af578ebba5c8cf34226810e1f55",
+      "required": false,
+      "runtime_resource": "tts-audiocpp-runtime",
+      "source": {
+        "platform": "huggingface",
+        "repo_id": "audio-cpp/audio.cpp-gguf",
+        "revision": "1b5981b2b89a1af578ebba5c8cf34226810e1f55",
+        "page_url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/tree/1b5981b2b89a1af578ebba5c8cf34226810e1f55/VoxCPM2-GGUF",
+        "transfer": {
+          "kind": "fixed_resolve_http"
+        },
+        "license_url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/tree/1b5981b2b89a1af578ebba5c8cf34226810e1f55"
+      },
+      "files": [
+        {
+          "path": "voxcpm2-q8_0.gguf",
+          "source_path": "VoxCPM2-GGUF/voxcpm2-q8_0.gguf",
+          "size_bytes": 2955000480,
+          "sha256": "c8e01ab4416011e12a28f24ede298a1aa5ce64b43f8e8aaad53b1e2fe7c96432"
+        }
+      ]
+    },
+    {
+      "resource_id": "tts-voxcpm1",
+      "kind": "model",
+      "title": "VoxCPM1（本地语音合成模型）",
+      "destination": "audiocpp/tts/VoxCPM1-GGUF",
+      "version": "1b5981b2b89a1af578ebba5c8cf34226810e1f55",
+      "required": false,
+      "runtime_resource": "tts-audiocpp-runtime",
+      "source": {
+        "platform": "huggingface",
+        "repo_id": "audio-cpp/audio.cpp-gguf",
+        "revision": "1b5981b2b89a1af578ebba5c8cf34226810e1f55",
+        "page_url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/tree/1b5981b2b89a1af578ebba5c8cf34226810e1f55/VoxCPM1-GGUF",
+        "transfer": {
+          "kind": "fixed_resolve_http"
+        },
+        "license_url": "https://huggingface.co/audio-cpp/audio.cpp-gguf/tree/1b5981b2b89a1af578ebba5c8cf34226810e1f55"
+      },
+      "files": [
+        {
+          "path": "voxcpm-0.5b-q8_0-audiovae-f16.gguf",
+          "source_path": "VoxCPM1-GGUF/voxcpm-0.5b-q8_0-audiovae-f16.gguf",
+          "size_bytes": 847888032,
+          "sha256": "01210319c5ce617613c9d1c38e34649f7479e98a60d51b719f7df82970658241"
+        }
+      ]
+    },
+    {
+      "resource_id": "tts-audiocpp-runtime",
+      "kind": "model",
+      "title": "audio.cpp（本地语音共用运行程序）",
+      "destination": "audiocpp/runtime",
+      "version": "v0.9.1-d0978e7994b4",
+      "required": false,
+      "source": {
+        "platform": "github",
+        "repo_id": "0xShug0/audio.cpp",
+        "revision": "v0.9.1",
+        "page_url": "https://github.com/0xShug0/audio.cpp/releases/tag/v0.9.1",
+        "license_url": "https://github.com/0xShug0/audio.cpp/blob/v0.9.1/LICENSE",
+        "native_revision": "d0978e7994b442da75d50b0614715b977a9b8acd",
+        "transfer": {
+          "kind": "official_audiocpp_patch",
+          "artifacts": [
+            {
+              "id": "binary",
+              "filename": "audio-v0.9.1-bin-windows-x64-cuda13.3.zip",
+              "size_bytes": 273940483,
+              "sha256": "dd04894fae8bb0d1365b4f62407fb51550558a6478f1ef719cad7aefc00720de",
+              "url": "https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/audio-v0.9.1-bin-windows-x64-cuda13.3.zip"
+            },
+            {
+              "id": "cudart",
+              "filename": "audio-v0.9.1-cudart-windows-x64-cuda13.3.zip",
+              "size_bytes": 575457454,
+              "sha256": "fa0fb817540c578bad085c7befb9d25b5a7634548e47955bff7b732b04b8a84b",
+              "url": "https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/audio-v0.9.1-cudart-windows-x64-cuda13.3.zip"
+            }
+          ],
+          "patch": {
+            "asset": "assets/audiocpp/voxcpm-patch.zip",
+            "size_bytes": 42668026,
+            "sha256": "c40ae3834df4d63e2c44b5208b5410ba93de3341f216edfd4f867dc1d673b615"
+          }
+        }
+      },
+      "files": [
+        {
+          "path": "cuda/LICENSE",
+          "source_path": "LICENSE",
+          "archive_id": "binary",
+          "size_bytes": 10466,
+          "sha256": "7e125adced85b7f84c04371179d15d51fbd702cefd060a37043fe38d6eb1722e"
+        },
+        {
+          "path": "cuda/audiocpp_server.exe",
+          "source_path": "cuda/audiocpp_server.exe",
+          "archive_id": "patch",
+          "size_bytes": 58553856,
+          "sha256": "140d0df3c66610f754707a6d5103ddde757fcc1a9576810d10f34d3d3a11ffc4"
+        },
+        {
+          "path": "cuda/cublas64_13.dll",
+          "source_path": "cublas64_13.dll",
+          "archive_id": "cudart",
+          "size_bytes": 51870320,
+          "sha256": "f1d500d0cd892f5b8c6b6cdbffd82d0c55d5f5427215668e7ceb55aeeccc1b63"
+        },
+        {
+          "path": "cuda/cublasLt64_13.dll",
+          "source_path": "cublasLt64_13.dll",
+          "archive_id": "cudart",
+          "size_bytes": 460301424,
+          "sha256": "b592cd016d7673e9cb97716a22b27c4010ee635377a3ba28f37070a9bdb76a68"
+        },
+        {
+          "path": "cuda/cudart64_13.dll",
+          "source_path": "cudart64_13.dll",
+          "archive_id": "cudart",
+          "size_bytes": 551024,
+          "sha256": "b00ca6f53699120da815bf3e06e2e4285fae2f201235b883dcbb50eec51e2a2a"
+        },
+        {
+          "path": "cuda/cufft64_12.dll",
+          "source_path": "cufft64_12.dll",
+          "archive_id": "cudart",
+          "size_bytes": 256092784,
+          "sha256": "35e531c8b4796b1a073948447dba618069fc839ded3da625416dfc7de496c1a1"
+        },
+        {
+          "path": "cuda/ggml-base.dll",
+          "source_path": "ggml-base.dll",
+          "archive_id": "binary",
+          "size_bytes": 646656,
+          "sha256": "85dbe491a1f53280b3e5d8730924e33f1c8ef289f673c76fa6cd023589429c6d"
+        },
+        {
+          "path": "cuda/ggml-cpu-alderlake.dll",
+          "source_path": "ggml-cpu-alderlake.dll",
+          "archive_id": "binary",
+          "size_bytes": 922112,
+          "sha256": "669bf7674c9c8bfde89efafbc5f544777be285568afa984351c0eba840dcaf60"
+        },
+        {
+          "path": "cuda/ggml-cpu-cannonlake.dll",
+          "source_path": "ggml-cpu-cannonlake.dll",
+          "archive_id": "binary",
+          "size_bytes": 1026048,
+          "sha256": "d9bae2ad9727aee8817b5136b909eea86c64b26980df10c86c51139a12c9b3b3"
+        },
+        {
+          "path": "cuda/ggml-cpu-cascadelake.dll",
+          "source_path": "ggml-cpu-cascadelake.dll",
+          "archive_id": "binary",
+          "size_bytes": 1025024,
+          "sha256": "39cbcebf774d2cba417eb3a9525ffd3cbce30a15d426e4f9ab6fea98dd2131a2"
+        },
+        {
+          "path": "cuda/ggml-cpu-haswell.dll",
+          "source_path": "ggml-cpu-haswell.dll",
+          "archive_id": "binary",
+          "size_bytes": 923648,
+          "sha256": "aafbd3b7e9e7da3ddff394b4156bbe5b706a0498c5778f230e45aa8d643bf8a0"
+        },
+        {
+          "path": "cuda/ggml-cpu-icelake.dll",
+          "source_path": "ggml-cpu-icelake.dll",
+          "archive_id": "binary",
+          "size_bytes": 1025024,
+          "sha256": "dd45232ad4ff523210ead1a882b80e3fa2c294be8f6d72707b821dcd852553d8"
+        },
+        {
+          "path": "cuda/ggml-cpu-sandybridge.dll",
+          "source_path": "ggml-cpu-sandybridge.dll",
+          "archive_id": "binary",
+          "size_bytes": 864768,
+          "sha256": "3a2ccf8cad32a0c95996dac3a900d8ac69b20109ad3b63b5d9e450019d0359ef"
+        },
+        {
+          "path": "cuda/ggml-cpu-skylakex.dll",
+          "source_path": "ggml-cpu-skylakex.dll",
+          "archive_id": "binary",
+          "size_bytes": 1026048,
+          "sha256": "cf33204b55e0cb9e7bb30b95e3efbaec2346f79e153188ae443b35a682688ed2"
+        },
+        {
+          "path": "cuda/ggml-cpu-sse42.dll",
+          "source_path": "ggml-cpu-sse42.dll",
+          "archive_id": "binary",
+          "size_bytes": 785408,
+          "sha256": "ed2c303336acdd89355008f864036dfad7d5a53ba39926afc7965ae4ea52712b"
+        },
+        {
+          "path": "cuda/ggml-cpu-x64.dll",
+          "source_path": "ggml-cpu-x64.dll",
+          "archive_id": "binary",
+          "size_bytes": 786944,
+          "sha256": "7ef31f3814028704fbef9aa47177e6968fdf3bead0634b900172acec9cb9c07d"
+        },
+        {
+          "path": "cuda/ggml-cuda.dll",
+          "source_path": "ggml-cuda.dll",
+          "archive_id": "binary",
+          "size_bytes": 257997312,
+          "sha256": "66df3bce1a32dcb0179cc493dd6a54dea5f78849fbe21e08b1252cd64ff70e6a"
+        },
+        {
+          "path": "cuda/ggml.dll",
+          "source_path": "ggml.dll",
+          "archive_id": "binary",
+          "size_bytes": 66560,
+          "sha256": "fe9982637aaabc4513b4c5e9d690eb6e38b3dd798109fc92ff384b74b92e8a9b"
+        },
+        {
+          "path": "cuda/msvcp140.dll",
+          "source_path": "msvcp140.dll",
+          "archive_id": "binary",
+          "size_bytes": 557728,
+          "sha256": "0f885b509a685d2bbfa652fed26b5fb31d88fbdab0a978c641d1c7b8aa460aa9"
+        },
+        {
+          "path": "cuda/msvcp140_1.dll",
+          "source_path": "msvcp140_1.dll",
+          "archive_id": "binary",
+          "size_bytes": 35952,
+          "sha256": "bfad5aef4c63a669e3c140655cdfdf395b6c979b400a447bd5dcb65ed8826c3d"
+        },
+        {
+          "path": "cuda/msvcp140_2.dll",
+          "source_path": "msvcp140_2.dll",
+          "archive_id": "binary",
+          "size_bytes": 280200,
+          "sha256": "3ea06f0ee098b4823cb79599df3780e7f23cce52c19aac31d2a0d47efe33a5e9"
+        },
+        {
+          "path": "cuda/msvcp140_atomic_wait.dll",
+          "source_path": "msvcp140_atomic_wait.dll",
+          "archive_id": "binary",
+          "size_bytes": 50304,
+          "sha256": "640b2aefced484d0368eea5bdd06addd0658a3a70a49256e560d6923b404a479"
+        },
+        {
+          "path": "cuda/msvcp140_codecvt_ids.dll",
+          "source_path": "msvcp140_codecvt_ids.dll",
+          "archive_id": "binary",
+          "size_bytes": 31872,
+          "sha256": "f2069a52880ec885ee7f0511186100eb7fada0411a2b4948fafea7735b878a18"
+        },
+        {
+          "path": "cuda/vcruntime140.dll",
+          "source_path": "vcruntime140.dll",
+          "archive_id": "binary",
+          "size_bytes": 124544,
+          "sha256": "d5e4d9a3e835fa679450145d6a7d94e36573a509317111904d9b3712c30d9066"
+        },
+        {
+          "path": "cuda/vcruntime140_1.dll",
+          "source_path": "vcruntime140_1.dll",
+          "archive_id": "binary",
+          "size_bytes": 49792,
+          "sha256": "1f2d41c4aa5db0bc33ebf7b66d72943a817d7ce6cbe880502a9403823633093f"
+        },
+        {
+          "path": "cuda/vcruntime140_threads.dll",
+          "source_path": "vcruntime140_threads.dll",
+          "archive_id": "binary",
+          "size_bytes": 38528,
+          "sha256": "219915cf20822f34d5e7c1fdd4e21ae7f3396881096c51036225fb8f84b47afa"
+        },
+        {
+          "path": "model_specs/voxcpm1.json",
+          "source_path": "model_specs/voxcpm1.json",
+          "archive_id": "patch",
+          "size_bytes": 8160,
+          "sha256": "164c020faa5d074f382ba18765be04c4ea51eaa0ac78dd27ed067cab702ed43b"
+        },
+        {
+          "path": "model_specs/voxcpm2.json",
+          "source_path": "model_specs/voxcpm2.json",
+          "archive_id": "patch",
+          "size_bytes": 10878,
+          "sha256": "8e6cb8b44d5d5937c6234ce0975f0c9eebb89438e1a540d708b8044e9d86d5fa"
+        }
+      ]
+    },
+    {
       "resource_id": "dsh",
       "kind": "dsh",
       "title": "DeepSeek Harness（代理执行宿主）",
@@ -498,6 +808,13 @@
     "commit": "对应的源码提交号",
     "version_from": "目标版本的权威配置来源",
     "official_transfer": "旧官方安装器兼容接口，不用于新组件下载",
-    "official_compatibility": "旧官方桌面来源的独立兼容记录，不随新目标版本改变"
+    "official_compatibility": "旧官方桌面来源的独立兼容记录，不随新目标版本改变",
+    "runtime_resource": "该模型共用的独立原生运行组件编号",
+    "source_path": "文件在固定上游仓库中的相对路径",
+    "artifacts": "锁定的官方基础归档及配套计算运行库",
+    "id": "归档编号",
+    "archive_id": "文件所属官方归档或随包补丁编号",
+    "patch": "随本体提供的覆盖补丁及其完整摘要",
+    "native_revision": "覆盖补丁对应的原生源码修订；源码差异保存在补丁包 source.patch（源码补丁）"
   }
 }
