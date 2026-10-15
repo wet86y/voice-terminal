@@ -98,7 +98,7 @@ async def case(model, steps, bounded, report_dir):
         server._start_process(log_path=report_dir / (label + ".log"))
         await client.ensure_ready()
         sample()
-        session = client.session()
+        session = client.session(turn_id=f"selftest-{label}", speech_id=f"selftest-{label}")
         session._request_options = {"seed": 1234}
         await session.start()
         chunks = []

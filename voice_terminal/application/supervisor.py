@@ -19,6 +19,7 @@ from .state import ApplicationState
 from .environment import resolve_python
 from .windows import Job, ManagedProcess
 from ..core.state import SERVICE_LABELS, SERVICE_LOADING_STATES, SERVICE_READY_STATES
+from ..log_budget import enforce_log_budget
 from ..resources import ResourcePolicy
 from .resource_readiness import inspect_model_resources, inspect_dsh_runtime
 from .ports import validate_endpoint_report
@@ -275,7 +276,7 @@ class ApplicationHost:
             if self.manifest.get("hardware_capabilities"):
                 env["VOICE_HARDWARE_CAPABILITIES"] = json.dumps(self.manifest["hardware_capabilities"])
         output = self.paths.logs / f"application-{key}.log"
-        if output.is_file() and output.stat().st_size > 5 * 1024 * 1024:
+        if output.is_file() and output.stat().st_size > 4 * 1024 * 1024:
             for index in (3, 2, 1):
                 old = output.with_name(output.name + f".{index}")
                 if old.is_file():
@@ -284,6 +285,7 @@ class ApplicationHost:
                     else:
                         old.replace(output.with_name(output.name + f".{index + 1}"))
             output.replace(output.with_name(output.name + ".1"))
+        enforce_log_budget(self.paths.logs)
         started = time.perf_counter()
         log.info("创建工作进程：组件=%s，解释器=%s，日志=%s", key, command[0], output)
         process = ManagedProcess(command, cwd=self.root, env=env,

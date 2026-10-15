@@ -9,15 +9,23 @@ import hashlib
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import time
 from uuid import uuid4
 from typing import Any, AsyncIterator, Callable, Mapping
 
 import httpx
 
+from ..log_budget import (
+    enforce_log_budget,
+    protect_log_files,
+    rotate_oversized_log,
+    unprotect_log_files,
+)
 from ..tts.scheduling import TtsSegmentReceipt
 from ..tts.capabilities import TtsCapabilities
 from ..tts.voices import ResolvedLocalTtsVoice, VoiceLibrary
@@ -27,6 +35,49 @@ logger = logging.getLogger(__name__)
 
 _QUEUE_END = object()
 _PREWARM_TEXT = "你好，准备开始语音播报。"
+_NATIVE_LOG_LIMIT = 4 * 1024 * 1024  # _NATIVE_LOG_LIMIT（原生 stdout 单文件上限）。
+_TEXT_PREVIEW_CHARS = 120  # 与在线后端保持一致的可选文本预览长度。
+
+
+def _enabled(name: str, default: str = "") -> bool:
+    raw = os.environ.get(name, default).strip().casefold()
+    return raw not in {"", "0", "false", "no", "off"}
+
+
+def _native_trace_enabled() -> bool:
+    """原生分阶段计时日志：默认关闭，开启后逐行刷新会扰动绝对耗时。"""
+    return _enabled("VOICE_TTS_NATIVE_TRACE")
+
+
+def _native_log_pump_enabled() -> bool:
+    """原生 stdout 时间戳转发：默认开启，置 0 回退为直接重定向。"""
+    return _enabled("VOICE_TTS_NATIVE_LOG_PUMP", "1")
+
+
+def _text_logging_enabled() -> bool:
+    """合成文本预览：默认关闭，只有显式开启时才写入日志。"""
+    return _enabled("VOICE_TTS_LOG_TEXT")
+
+
+def text_digest(text: str) -> str:
+    """text_digest（文本摘要）：不落内容也能把同一文本块与日志行对上。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def text_preview_suffix(text: str) -> str:
+    """可选文本预览后缀；未开启时返回空串，保证默认日志不含会话内容。"""
+    if not _text_logging_enabled():
+        return ""
+    return f" text={text[:_TEXT_PREVIEW_CHARS]!r}"
+
+
+def _write_native_line(stream, line: bytes) -> None:
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    text = line.decode("utf-8", "replace").rstrip("\r")
+    with contextlib.suppress(OSError, ValueError):
+        stream.write(f"{stamp} {text}\n".encode("utf-8"))
+
+
 _CONTEXT_KEYS = (  # _CONTEXT_KEYS（原生元数据内存池）：不包含模型张量/权重精度设置。
     "weight_context_mb", "text_embedding_graph_context_mb", "lm_step_graph_context_mb",
     "projection_graph_context_mb", "local_encoder_graph_context_mb", "dit_graph_context_mb",
@@ -123,6 +174,9 @@ class AudioCppTtsServer:
             raise AudioCppTtsError("local_model（本地语音合成模型）必须为 voxcpm1 或 voxcpm2")
         self._process: subprocess.Popen | None = None
         self._log_file = None
+        self._log_pump_thread: threading.Thread | None = None
+        self._log_pump_done: threading.Event | None = None
+        self._log_path: Path | None = None
         self._owns_process = False
         self._ready = False
         self._http_transport = http_transport
@@ -391,7 +445,15 @@ class AudioCppTtsServer:
         # log_path（日志路径）允许隔离性能测量日志，正式服务仍采用默认位置。
         log_path = log_path or self.runtime_root / "cache" / "logs" / "audio-cpp-tts.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log_file = log_path.open("ab", buffering=0)
+        if trace_path is None and _native_trace_enabled():
+            # 原生分阶段计时：仅在显式开启时写入独立文件，避免污染正式 stdout 日志。
+            trace_path = log_path.with_name("audiocpp-trace.log")
+        rotate_oversized_log(log_path, max_bytes=_NATIVE_LOG_LIMIT, backups=1)
+        if trace_path is not None:
+            rotate_oversized_log(trace_path, max_bytes=_NATIVE_LOG_LIMIT, backups=1)
+        if log_path.parent == self.runtime_root / "cache" / "logs":
+            # 隔离测量目录由调用方管理，不纳入产品日志预算。
+            enforce_log_budget(log_path.parent)
         environment = os.environ.copy()
         torch_lib = self.runtime_root / "runtimes" / "python" / "Lib" / "site-packages" / "torch" / "lib"
         library_paths = [str(binary.parent)]
@@ -404,17 +466,62 @@ class AudioCppTtsServer:
         command = [str(binary), "--config", str(self.config_path)]
         if trace_path is not None:
             command += ["--log", "--log-file", str(trace_path)]  # 原生阶段计时诊断，不默认启用。
+        pump_stdout = _native_log_pump_enabled()
+        self._log_file = log_path.open("ab", buffering=0)
+        self._log_path = log_path
+        # 本进程持有该句柄；显式登记后，预算剔除不会再尝试删除它（Windows 上必然失败）。
+        protect_log_files(log_path)
         self._process = subprocess.Popen(
             command,
             cwd=source_root,
             env=environment,
             stdin=subprocess.DEVNULL,
-            stdout=self._log_file,
+            stdout=subprocess.PIPE if pump_stdout else self._log_file,
             stderr=subprocess.STDOUT,
             creationflags=flags,
         )
         self._owns_process = True
-        logger.info("audio_cpp_tts.server_started pid=%s config=%s", self._process.pid, self.config_path)
+        if pump_stdout and self._process.stdout is not None:
+            self._start_log_pump(self._process.stdout)
+        logger.info(
+            "audio_cpp_tts.server_started pid=%s local_model=%s config=%s log=%s trace=%s",
+            self._process.pid, self.local_model, self.config_path, log_path, trace_path,
+        )
+
+    def _start_log_pump(self, stream) -> None:
+        """把原生 stdout 逐行加时间戳写入日志；读取永不中断，避免子进程管道写满阻塞。"""
+
+        target = self._log_file
+        finished = threading.Event()
+
+        def pump() -> None:
+            pending = b""
+            try:
+                while True:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        break
+                    pending += chunk
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        _write_native_line(target, line)
+                if pending:
+                    _write_native_line(target, pending)
+            except Exception:
+                logger.warning("audio_cpp_tts.native_log_pump_failed action=drain_only", exc_info=True)
+                # 降级后继续排空管道：绝不因为日志线程故障让原生进程写阻塞。
+                with contextlib.suppress(Exception):
+                    while stream.read(65536):
+                        pass
+            finally:
+                with contextlib.suppress(Exception):
+                    stream.close()
+                finished.set()
+
+        thread = threading.Thread(target=pump, name="audio-cpp-tts-log", daemon=True)
+        self._log_pump_thread = thread
+        self._log_pump_done = finished
+        thread.start()
 
     async def _ensure_ready_locked(self, *, timeout_seconds: float) -> None:
         self._validate_model_assets(self.local_model)
@@ -476,18 +583,39 @@ class AudioCppTtsServer:
             "task": "tts",
             "mode": "streaming",
         }
-        await self._post_model_action("/v1/models/load", body, timeout_seconds=300.0)
-        loaded_entries = await self._read_model_entries()
-        if loaded_entries.get(model_id, {}).get("loaded") is not True:
-            raise AudioCppTtsError(f"{_MODEL_CATALOG[local_model]['name']} 加载请求完成，但服务未确认模型已驻留。")
+        started = time.perf_counter()
+        try:
+            await self._post_model_action("/v1/models/load", body, timeout_seconds=300.0)
+            loaded_entries = await self._read_model_entries()
+            if loaded_entries.get(model_id, {}).get("loaded") is not True:
+                raise AudioCppTtsError(f"{_MODEL_CATALOG[local_model]['name']} 加载请求完成，但服务未确认模型已驻留。")
+        except BaseException as exc:
+            logger.warning(
+                "audio_cpp_tts.model_load_failed model_id=%s local_model=%s error_type=%s error=%s elapsed_ms=%.1f",
+                model_id, local_model, type(exc).__name__, str(exc)[:300],
+                (time.perf_counter() - started) * 1000,
+            )
+            raise
         self._loaded_model = local_model
+        logger.info("audio_cpp_tts.model_loaded model_id=%s local_model=%s elapsed_ms=%.1f",
+                    model_id, local_model, (time.perf_counter() - started) * 1000)
 
     async def _unload_model_locked(self, model_id: str) -> None:
-        await self._post_model_action("/v1/models/unload", {"id": model_id})
-        entries = await self._read_model_entries()
-        if entries.get(model_id, {}).get("loaded") is True:
-            raise AudioCppTtsError(f"audio.cpp 服务未确认旧模型已卸载：{model_id}")
+        started = time.perf_counter()
+        try:
+            await self._post_model_action("/v1/models/unload", {"id": model_id})
+            entries = await self._read_model_entries()
+            if entries.get(model_id, {}).get("loaded") is True:
+                raise AudioCppTtsError(f"audio.cpp 服务未确认旧模型已卸载：{model_id}")
+        except BaseException as exc:
+            logger.warning(
+                "audio_cpp_tts.model_unload_failed model_id=%s error_type=%s error=%s elapsed_ms=%.1f",
+                model_id, type(exc).__name__, str(exc)[:300], (time.perf_counter() - started) * 1000,
+            )
+            raise
         self._loaded_model = None
+        logger.info("audio_cpp_tts.model_unloaded model_id=%s elapsed_ms=%.1f",
+                    model_id, (time.perf_counter() - started) * 1000)
 
     async def _post_model_action(self, path: str, payload: dict[str, Any], *,
                                  timeout_seconds: float = 10.0) -> None:
@@ -568,9 +696,20 @@ class AudioCppTtsServer:
                 logger.info("audio_cpp_tts.server_stopped pid=%s", process.pid)
             self._process = None
             self._owns_process = False
+            thread, self._log_pump_thread = self._log_pump_thread, None
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=5.0)
+                if thread.is_alive():
+                    logger.warning("audio_cpp_tts.native_log_pump_timeout pid=%s",
+                                   process.pid if process is not None else None)
+            self._log_pump_done = None
+            # 关闭路径必须容错：对象可能未完整初始化就已进入收尾。
+            log_path, self._log_path = getattr(self, "_log_path", None), None
             if self._log_file is not None:
                 self._log_file.close()
                 self._log_file = None
+            if log_path is not None:
+                unprotect_log_files(log_path)
 
 
 class AudioCppTtsClient:
@@ -699,9 +838,10 @@ class AudioCppTtsClient:
         )
 
     def session(self, *, fresh: bool = False, turn_id: str | None = None,
+                speech_id: str | None = None,
                 emotion: str | None = None, voice_snapshot: ResolvedLocalTtsVoice | None = None,
                 preview: bool = False, inference_steps: int | None = None) -> "AudioCppTtsSession":
-        del fresh, turn_id
+        del fresh
         if inference_steps is not None and (type(inference_steps) is not int or not 1 <= inference_steps <= 30):
             raise AudioCppTtsError("inference_steps（固定推理步数）必须为 1–30 的整数。")
         owner = self.voice_library
@@ -709,7 +849,12 @@ class AudioCppTtsClient:
             owner = owner.for_model(voice_snapshot.model if voice_snapshot else self.local_model)
         guard = owner.snapshot_guard() if callable(getattr(owner, "snapshot_guard", None)) else contextlib.nullcontext()
         with guard:
-            session = AudioCppTtsSession(self, voice_snapshot=voice_snapshot or self.resolve_voice(emotion, preview=preview))
+            session = AudioCppTtsSession(
+                self,
+                voice_snapshot=voice_snapshot or self.resolve_voice(emotion, preview=preview),
+                turn_id=turn_id,
+                speech_id=speech_id,
+            )
             if inference_steps is not None:
                 session._inference_steps = inference_steps
             return session
@@ -733,14 +878,13 @@ class AudioCppTtsClient:
 
     async def prewarm(self, *, turn_id: str | None = None,
                       voice_snapshot: ResolvedLocalTtsVoice | None = None) -> dict[str, Any]:
-        del turn_id
         await self.ensure_ready()
         async with self._prewarm_lock:
             if self._real_waiters:
                 return {"status": "READY", "reason": "real_request_priority"}
             if self._warmed and (not self.local_optimization or time.monotonic() - self._last_success_at < 60):
                 return {"status": "READY", "reason": "already_warmed"}
-            session = self.session(emotion="calm", voice_snapshot=voice_snapshot)
+            session = self.session(emotion="calm", voice_snapshot=voice_snapshot, turn_id=turn_id)
             if session.voice_snapshot is None:
                 raise AudioCppTtsError("尚未配置可用音色，无法执行预热。")
             session._is_prewarm = True
@@ -765,7 +909,12 @@ class AudioCppTtsClient:
                 self.last_prewarm_metrics = list(session.request_metrics)
                 logger.info("audio_cpp_tts.prewarm_ready audio_bytes=%d", audio_bytes)
                 return {"status": "READY", "audio_bytes": audio_bytes}
-            except BaseException:
+            except BaseException as exc:
+                if not isinstance(exc, asyncio.CancelledError):
+                    logger.warning(
+                        "audio_cpp_tts.prewarm_failed turn=%s session=%s error_type=%s error=%s",
+                        turn_id, session.session_tag, type(exc).__name__, str(exc)[:300],
+                    )
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
                 await session.cancel()
@@ -797,9 +946,13 @@ class AudioCppTtsSession:
     reusable = False
 
     def __init__(self, client: AudioCppTtsClient,
-                 voice_snapshot: ResolvedLocalTtsVoice | None = None) -> None:
+                 voice_snapshot: ResolvedLocalTtsVoice | None = None, *,
+                 turn_id: str | None = None, speech_id: str | None = None) -> None:
         self.client = client
         self.voice_snapshot = voice_snapshot
+        # turn_id / speech_id（轮次与语音事务标识）：只用于日志关联，不参与合成决策。
+        self.turn_id = turn_id
+        self.speech_id = speech_id
         self.model_id = voice_snapshot.native_model_id if voice_snapshot else client.model_id
         self._audio: asyncio.Queue[bytes | BaseException | object] = asyncio.Queue()
         self._started = False
@@ -847,12 +1000,31 @@ class AudioCppTtsSession:
         )
         voice = self.voice_snapshot
         logger.info(
-            "audio_cpp_tts.session_policy model_id=%s voice_id=%s voice_revision=%s "
-            "continuation_enabled=%s control_prefix=%s prewarm=%s preview=%s",
-            self.model_id, voice.voice_id if voice else None, voice.revision if voice else None,
+            "audio_cpp_tts.session_policy turn=%s speech=%s session=%s model_id=%s voice_id=%s "
+            "voice_revision=%s continuation_enabled=%s control_prefix=%s prewarm=%s preview=%s "
+            "inference_steps=%s sample_rate=%d native_sample_rate=%d",
+            self.turn_id, self.speech_id, self.session_tag, self.model_id,
+            voice.voice_id if voice else None, voice.revision if voice else None,
             self._continuation_enabled, controlled, self._is_prewarm, self._is_preview,
+            self._inference_steps, self.client.sample_rate, self.client.native_sample_rate,
         )
         self._started = True
+
+    @property
+    def session_tag(self) -> str:
+        """session_tag（会话标识）：同一语音事务内多段合成共用，便于日志串联。"""
+        return self._continuation_id[:8]
+
+    def _tts_fields(self) -> tuple:
+        return self.turn_id, self.speech_id, self.session_tag
+
+    def _reject(self, stage: str, reason: str) -> AudioCppTtsError:
+        """前置校验失败：先落 WARNING 再抛，避免只抛异常、日志无痕。"""
+        logger.warning(
+            "audio_cpp_tts.request_rejected turn=%s speech=%s session=%s stage=%s reason=%s",
+            *self._tts_fields(), stage, reason,
+        )
+        return AudioCppTtsError(reason)
 
     async def send_text(self, text: str) -> None:
         if self._is_prewarm:
@@ -874,7 +1046,10 @@ class AudioCppTtsSession:
         except Exception as exc:
             if not self._allow_retry or self._request_had_audio:
                 raise
-            logger.warning("audio_cpp_tts.continuation_fallback reason=%s", str(exc)[:180])
+            logger.warning(
+                "audio_cpp_tts.continuation_fallback turn=%s speech=%s session=%s segment=%d reason=%s",
+                *self._tts_fields(), self.completed_segments, str(exc)[:180],
+            )
             await self._release_context()
             self._allow_retry = False
             # 再建立新上下文；缺失前文时原生使用正式参考独立合成。
@@ -882,9 +1057,9 @@ class AudioCppTtsSession:
 
     async def _send_text_once(self, text: str) -> None:
         if not self._started:
-            raise AudioCppTtsError("VoxCPM 会话尚未启动")
+            raise self._reject("state", "VoxCPM 会话尚未启动")
         if self._finished or self._cancelled:
-            raise AudioCppTtsError("VoxCPM 会话已结束")
+            raise self._reject("state", "VoxCPM 会话已结束")
         if not text.strip():
             return
         self._send_task = asyncio.current_task()
@@ -901,15 +1076,15 @@ class AudioCppTtsSession:
         body["options"]["num_inference_steps"] = self._inference_steps
         voice = self.voice_snapshot
         if voice is None:
-            raise AudioCppTtsError("尚未配置可用音色，请先导入或创建音色并启用。")
+            raise self._reject("voice", "尚未配置可用音色，请先导入或创建音色并启用。")
         if voice.model == "voxcpm1":
             if not voice.reference_path or not voice.reference_text.strip():
-                raise AudioCppTtsError("VoxCPM1（第一代本地语音模型）需要参考音频和对应转写文本。")
+                raise self._reject("voice", "VoxCPM1（第一代本地语音模型）需要参考音频和对应转写文本。")
             body["voice_ref"] = str(voice.reference_path.resolve())
             body["reference_text"] = voice.reference_text
         elif voice.reference_mode == "voice":
             if not voice.reference_path:
-                raise AudioCppTtsError("VoxCPM2（第二代本地语音模型）参考音频不可用。")
+                raise self._reject("voice", "VoxCPM2（第二代本地语音模型）参考音频不可用。")
             body["voice_ref"] = str(voice.reference_path.resolve())
         self._request_had_audio = False
         if self._continuation_enabled:
@@ -919,11 +1094,20 @@ class AudioCppTtsSession:
         output_for_request = 0
         saw_audio_done = False
         saw_done = False
+        stage = "submit"
+        logger.info(
+            "audio_cpp_tts.request_start turn=%s speech=%s session=%s segment=%d chars=%d "
+            "continuation=%s steps=%s text_digest=%s%s",
+            *self._tts_fields(), self.completed_segments, len(text),
+            self._continuation_enabled, self._inference_steps, text_digest(text),
+            text_preview_suffix(text),
+        )
         try:
             async with self.client._request_lock:
                 request_sent_at = time.perf_counter()
                 http = self.client._request_client()
                 self._native_request_submitted = True
+                stage = "stream"
                 async with http.stream(
                     "POST",
                     f"{self.client.base_url}/v1/audio/speech",
@@ -975,6 +1159,7 @@ class AudioCppTtsSession:
                             detail = event.get("message") or event.get("error") or event
                             raise AudioCppTtsError(f"VoxCPM 合成失败：{str(detail)[:300]}")
                     self._active_response = None
+            stage = "finalize"
             if self._cancelled:
                 return
             if received_for_request <= 0:
@@ -1027,16 +1212,22 @@ class AudioCppTtsSession:
             self.request_metrics.append(metrics)
             self.client._last_success_at = time.monotonic()
             logger.info(
-                "audio_cpp_tts.request_complete local_model=%s model_id=%s chars=%d "
+                "audio_cpp_tts.request_complete turn=%s speech=%s session=%s local_model=%s model_id=%s chars=%d "
                 "pcm_bytes=%d native_pcm_bytes=%d ttfb_ms=%.1f request_lock_wait_ms=%.1f "
                 "http_first_audio_ms=%.1f total_ms=%.1f audio_ms=%.1f rtf=%.3f "
-                "continuation_enabled=%s segment_index=%d num_inference_steps=%s",
-                self.client.local_model, self.client.model_id, len(text), output_for_request,
-                received_for_request, ttfb_ms or 0.0, metrics["request_lock_wait_ms"],
+                "continuation_enabled=%s segment_index=%d num_inference_steps=%s text_digest=%s%s",
+                *self._tts_fields(), self.client.local_model, self.client.model_id, len(text),
+                output_for_request, received_for_request, ttfb_ms or 0.0, metrics["request_lock_wait_ms"],
                 metrics["http_first_audio_ms"] or 0.0, total_ms, audio_ms, rtf or 0.0,
                 self._continuation_enabled, self.completed_segments - 1, metrics["num_inference_steps"],
+                text_digest(text), text_preview_suffix(text),
             )
         except asyncio.CancelledError:
+            logger.debug(
+                "audio_cpp_tts.request_cancelled turn=%s speech=%s session=%s segment=%d stage=%s elapsed_ms=%.1f",
+                *self._tts_fields(), self.completed_segments, stage,
+                (time.perf_counter() - request_started_at) * 1000,
+            )
             if not self._cancelled:
                 error = AudioCppTtsError("VoxCPM 音频请求被取消")
                 self._error = error
@@ -1044,7 +1235,17 @@ class AudioCppTtsSession:
                 await self._audio.put(error)
             raise
         except BaseException as exc:
-            if not self._cancelled and not (self._allow_retry and not self._request_had_audio):
+            # 失败原因必须落盘：此前只把异常塞进内部队列，日志里没有任何痕迹。
+            retry_pending = bool(self._allow_retry and not self._request_had_audio)
+            logger.log(
+                logging.INFO if retry_pending else logging.WARNING,
+                "audio_cpp_tts.request_failed turn=%s speech=%s session=%s segment=%d chars=%d stage=%s "
+                "error_type=%s error=%s retry=%s had_audio=%s elapsed_ms=%.1f",
+                *self._tts_fields(), self.completed_segments, len(text), stage,
+                type(exc).__name__, str(exc)[:300], retry_pending, self._request_had_audio,
+                (time.perf_counter() - request_started_at) * 1000,
+            )
+            if not self._cancelled and not retry_pending:
                 error = exc if isinstance(exc, Exception) else AudioCppTtsError(str(exc))
                 self._error = error
                 self._segment_available.set()
@@ -1072,18 +1273,32 @@ class AudioCppTtsSession:
             if self._error is not None:
                 raise self._error
             if self._cancelled or self._finished:
-                raise AudioCppTtsError("VoxCPM 未确认当前文本分段完成")
+                raise self._segment_wait_failure("session_closed", previous_count)
             self._segment_available.clear()
             try:
                 await asyncio.wait_for(
                     self._segment_available.wait(), self.client.timeout_seconds,
                 )
             except TimeoutError as exc:
+                self._log_segment_wait("timeout", previous_count)
                 raise AudioCppTtsError("等待 VoxCPM 文本分段回执超时") from exc
         try:
             return self._segment_receipts[previous_count]
         except IndexError as exc:
+            self._log_segment_wait("missing_receipt", previous_count)
             raise AudioCppTtsError("VoxCPM 文本分段回执缺失") from exc
+
+    def _log_segment_wait(self, reason: str, previous_count: int) -> None:
+        logger.warning(
+            "audio_cpp_tts.segment_wait_failed turn=%s speech=%s session=%s reason=%s segment=%d "
+            "completed_segments=%d timeout_seconds=%.1f",
+            *self._tts_fields(), reason, previous_count, self.completed_segments,
+            self.client.timeout_seconds,
+        )
+
+    def _segment_wait_failure(self, reason: str, previous_count: int) -> AudioCppTtsError:
+        self._log_segment_wait(reason, previous_count)
+        return AudioCppTtsError("VoxCPM 未确认当前文本分段完成")
 
     async def cancel(self, *, timeout_seconds: float | None = None) -> bool:
         del timeout_seconds
@@ -1128,6 +1343,10 @@ class AudioCppTtsSession:
         if callable(callback):
             callback()  # first_audio_callback（原生音频就绪，独立于允许播放时刻）。
         if self._buffered_bytes + len(pcm) > 32 * 1024 * 1024:
+            logger.warning(
+                "audio_cpp_tts.buffer_overflow turn=%s speech=%s session=%s buffered_bytes=%d chunk_bytes=%d",
+                *self._tts_fields(), self._buffered_bytes, len(pcm),
+            )
             raise AudioCppTtsError("提前合成音频暂存超过 32 MiB（二进制兆字节）")
         self._buffered_bytes += len(pcm)
         await self._audio.put(pcm)
@@ -1149,7 +1368,10 @@ class AudioCppTtsSession:
                 self._native_request_submitted = False
         except (httpx.HTTPError, OSError) as exc:
             self.context_release_confirmed = False
-            logger.warning("audio_cpp_tts.context_release_failed reason=%s", str(exc)[:160])
+            logger.warning(
+                "audio_cpp_tts.context_release_failed turn=%s speech=%s session=%s reason=%s",
+                *self._tts_fields(), str(exc)[:160],
+            )
 
     async def close(self) -> None:
         if not self._finished and not self._cancelled:

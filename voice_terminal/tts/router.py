@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class TtsBackendRouter:
@@ -90,21 +93,32 @@ class TtsBackendRouter:
                     and self.local is not None and self._local_ready):
                 await self.local.close()
                 self._local_ready = False
+                logger.info("tts.local_drained_stop backend=%s local_model=%s",
+                            self.backend, self.local_model)
 
     async def switch(self, backend: str) -> None:
         if backend not in {"minimax", "voxcpm1"}:
             raise ValueError("tts.backend（语音运行后端）仅接受 minimax 或 voxcpm1。")
         async with self._switch_lock:
-            if backend == "voxcpm1":
-                if self.local is None:
-                    raise ValueError("本地 TTS 后端尚未接入。")
-                await self.local.ensure_ready()
-                self._local_ready = True
+            previous = self.backend
+            try:
+                if backend == "voxcpm1":
+                    if self.local is None:
+                        raise ValueError("本地 TTS 后端尚未接入。")
+                    await self.local.ensure_ready()
+                    self._local_ready = True
+            except Exception as exc:
+                logger.warning("tts.router_switch_failed target=%s previous=%s error_type=%s error=%s",
+                               backend, previous, type(exc).__name__, str(exc)[:300])
+                raise
             self.backend = backend
             if (backend == "minimax" and self.local is not None
                     and self._local_leases == 0 and self._local_ready):
                 await self.local.close()
                 self._local_ready = False
+            if previous != backend:
+                logger.info("tts.router_switch previous=%s backend=%s local_model=%s",
+                            previous, backend, self.local_model)
 
     async def prewarm(self, *, turn_id: str | None = None) -> dict[str, Any]:
         client = self.current_client()
@@ -148,11 +162,17 @@ class TtsBackendRouter:
             if not callable(switch_model):
                 raise RuntimeError("当前本地 TTS 客户端不支持模型热切换。")
             self._local_switching = True
+            logger.info("tts.local_model_switch_started local_model=%s", local_model)
             try:
                 await switch_model(local_model)
                 self._local_ready = True
+            except Exception as exc:
+                logger.warning("tts.local_model_switch_failed local_model=%s error_type=%s error=%s",
+                               local_model, type(exc).__name__, str(exc)[:300])
+                raise
             finally:
                 self._local_switching = False
+            logger.info("tts.local_model_switch_finished local_model=%s", local_model)
 
     async def discard_prewarm(self, *, turn_id: str | None = None) -> None:
         if self.remote is not None:

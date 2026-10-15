@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import shutil
@@ -16,6 +15,12 @@ import urllib.request
 
 from .supervisor import ApplicationHost
 from .web import HostWeb
+from ..log_budget import (
+    BudgetedRotatingFileHandler,
+    enforce_log_budget,
+    protect_log_files,
+    start_log_budget_watchdog,
+)
 from ..paths import AppPaths, atomic_json
 
 
@@ -280,8 +285,11 @@ def main():
         args.config = str(paths.config / "local.yaml")
     logdir = paths.logs
     logdir.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(logdir / "application.log", maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
+    handler = BudgetedRotatingFileHandler(logdir / "application.log", maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
     logging.basicConfig(level=logging.INFO, handlers=[handler], format="%(asctime)s %(levelname)s %(message)s", force=True)
+    protect_log_files(handler.baseFilename)
+    enforce_log_budget(logdir, protect=[handler.baseFilename])
+    start_log_budget_watchdog(logdir, protect=[handler.baseFilename])
     try:
         asyncio.run(run(args, root))
     except KeyboardInterrupt:

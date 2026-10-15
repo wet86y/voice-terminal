@@ -913,6 +913,14 @@ class SpeechPipeline:
                 )
             if tts_failed is not None and self._valid(token):
                 self.state.current["tts_status"] = "DEGRADED"
+                # 结算态失败原因同样落盘：之前该明细只发往界面，服务端日志里没有痕迹。
+                logger.warning(
+                    "controller.tts_status turn_id=%s provider=%s status=DEGRADED "
+                    "audio_buffer_ms=%s error_type=%s error=%s",
+                    ws.turn_id, tts_backend,
+                    self.player.buffered_ms if self.player else 0,
+                    type(tts_failed).__name__, str(tts_failed)[:300],
+                )
                 await self._detail(
                     "tts.status",
                     provider=tts_backend,

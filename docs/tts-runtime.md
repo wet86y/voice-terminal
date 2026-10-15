@@ -61,3 +61,7 @@ Voice Server（语音服务）把已提交的文本块交给当前 `tts.backend`
 `TtsBackendRouter`（语音后端兼容路由）与 `EpisodeSpeechOutput`（语音事务输出）的 `bind/release`（绑定／释放）接口在 `backend: "voxcpm1"` 时启用本地分支并管理本地租约（租约清零后才释放本地客户端）；`minimax` 时继续使用在线客户端。后端与本地模型的运行中切换通过 `PUT /api/v1/product/settings/tts` 执行，成功后事务保存并同步运行配置；本地音色库操作使用 `/api/v1/tts/voices/{model}` 系列接口。
 
 模型分配接口保留 `tts_profile_id`（当前 TTS 语音配置 ID）用于读取和恢复现有配置。请求可以省略该字段以沿用已保存的配置；尝试更换时会被拒绝。
+
+## 本地合成日志
+
+本地后端的每次合成按 `turn=`（轮次）、`speech=`（语音事务）和 `session=`（事务内唯一，取原生上下文标识前八位）关联，`segment=` 在同一会话内递增。`agent.trace kind=TTS_STARTED/TTS_COMPLETED/...` 给出轮次状态机，`controller.turn_latency` 给出该轮的 TTS 时序（`tts_text_to_first_audio_ms`、`tts_checkout_ms`、`speech_end_to_first_pcm_ms` 等）。字段清单、失败事件与开关见[本地 TTS 可观测性](local-tts-observability-20261015.md)。

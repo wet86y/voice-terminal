@@ -111,6 +111,8 @@ DSH 保留现有有限自动重启，其他组件手动重试。恢复语音识�
 
 正式与源码业务的桌面诊断日志统一位于 `.local/cache/logs/`（运行日志目录），包括 `application.log`（宿主日志）、`application-bootstrap.log`（启动检查日志）和 `application-组件标识.log`（组件进程日志）。前端演示的日志位于 `.local/cache/ui-demo`（演示缓存与日志目录）；日志均属于可回收缓存，不进入用户数据备份。
 
+该目录保留 100 MiB 总预算（`VOICE_LOG_BUDGET_MB`，`0` 关闭）：所有 `*.log`／`*.jsonl` 及其轮转备份共享一个上限，超出后按最旧优先逐个剔除已经安静下来的文件（`VOICE_LOG_MIN_AGE_SECONDS`，默认 60 秒），由进程启动、每次轮转和周期巡检（`VOICE_LOG_SWEEP_SECONDS`，默认 300 秒）触发。被存活进程打开的文件在 Windows（操作系统）上无法回收，会跳过并在日志中记录原因。明细见[本地 TTS 可观测性与日志容量](local-tts-observability-20261015.md)。
+
 ## 诊断操作
 
 | 表现 | 处理方式 |
