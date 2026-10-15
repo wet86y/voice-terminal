@@ -58,9 +58,11 @@ class TtsBackendRouter:
         """active_local_sessions（当前占用本地 TTS 的会话数）。"""
         return self._local_leases
 
-    def bind(self) -> tuple[str, Any | None]:
-        backend = self.backend
-        client = self.current_client()
+    def bind(self, *, backend: str | None = None) -> tuple[str, Any | None]:
+        backend = self.backend if backend is None else backend  # backend（续写沿用原回应的合成后端）。
+        if backend not in {"minimax", "voxcpm1"}:
+            raise ValueError("tts.backend（语音运行后端）仅接受 minimax 或 voxcpm1。")
+        client = self.local if backend == "voxcpm1" else self.remote
         if backend == "voxcpm1":
             if self._local_switching:
                 raise RuntimeError("本地 TTS 模型正在切换，请等待切换完成后再发起播报。")

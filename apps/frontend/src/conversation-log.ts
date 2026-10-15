@@ -148,7 +148,7 @@ export function readConversationEntry(payload: unknown, envelopeTurnId?: string 
   if (!payload || typeof payload !== 'object') return null
   const value = payload as Record<string, unknown>
   const kind = value.kind
-  if (kind !== 'user_turn' && kind !== 'assistant_speech' && kind !== 'system_speech') return null
+  if (kind !== 'user_turn' && kind !== 'assistant_speech' && kind !== 'system_speech' && kind !== 'screen_capture') return null
   const seq = typeof value.seq === 'number' && Number.isFinite(value.seq) ? value.seq : null
   if (seq === null) return null
   return {

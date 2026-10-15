@@ -8,6 +8,9 @@ class SpeechFrontierMixin:
         h = (self.handle if self.handle and not self.handle.reason and not self.handle.task.done() else None)
         h = h or next((item for item in self._pending if not item.reason and not item.task.done()), None)
         if h is None:
+            continuation = self._continuation_snapshot()
+            if continuation is not None:
+                return continuation
             value = {"queue_status": "empty", "text_only_queue": True}
             self._add_delivered_frontier(value)
             return value
@@ -18,6 +21,7 @@ class SpeechFrontierMixin:
         else:
             status = "queued"
         text, locked_chars = self._accumulated_text(h)
+        tail = getattr(h, "continuation_tail", "")  # tail（发送结束后接受的待接播尾巴）。
         value = {"queue_status": status, "text_only_queue": True, "text": text,
                  "speech_id": h.speech_id, "output_generation": h.workspace.generation,
                  "conversation_id": h.identity[0], "turn_id": h.turn_id,
@@ -32,6 +36,10 @@ class SpeechFrontierMixin:
                  "rewritable": bool(getattr(h, "rewritable", False))}
         self._add_playback_frontiers(value, h)
         self._add_model_text_parts(value, h, locked_chars=locked_chars)
+        if tail:
+            value["text"] += tail
+            value["_model_text_parts"]["revisable_tail"] += tail
+            value["_model_text_parts_valid"] = "".join(value["_model_text_parts"].values()) == value["text"]
         return value
 
     def _add_delivered_frontier(self, value):
@@ -86,25 +94,29 @@ class SpeechFrontierMixin:
 
         ``text`` is the accepted response with the turn's already-delivered
         frontier restored in front of the active handle, and ``locked_chars``
-        is how much of it is irreversible.  A successor handle starts *after*
+        is the length restored before the handle's own text. A successor starts *after*
         the frontier, so the two halves are concatenated rather than compared;
         a handle that already carries the cumulative text is left alone.
         """
 
         handle_text = str(getattr(h, "text", "") or "")
+        fixed_prefix = getattr(h, "delivered_prefix", None)
+        if isinstance(fixed_prefix, str):
+            # 接播只接收本段正文，前序已结算文字固定保存，不能按内容猜重。
+            return fixed_prefix + handle_text, len(fixed_prefix)
         frontier = getattr(self, "delivered", None)
         frontier = frontier if isinstance(frontier, dict) else {}
         prefix = str(frontier.get("text") or "")
         if not prefix or not h.turn_id or frontier.get("turn_id") != h.turn_id:
             return handle_text, 0
-        if not handle_text or handle_text == prefix:
+        if not handle_text:
             return prefix, len(prefix)
         if handle_text.startswith(prefix):
             # The handle already carries the whole cumulative text.
-            return handle_text, len(prefix)
+            return handle_text, 0
         overlap = self._frontier_overlap(prefix, handle_text)
         if overlap is not None:
-            return prefix + handle_text[overlap:], len(prefix)
+            return prefix + handle_text[overlap:], len(prefix) - overlap
         # A successor handle normally begins exactly where the frontier ends.
         return prefix + handle_text, len(prefix)
 
@@ -151,22 +163,7 @@ class SpeechFrontierMixin:
         """
 
         text = str(value.get("text") or "")
-        handle_text = str(getattr(h, "text", "") or "")
         state = getattr(h, "admission", None)
-        if locked_chars > 0 and locked_chars > len(handle_text):
-            # The locked frontier spans earlier transactions of this turn.  The
-            # active handle only owns what comes after it, so the clause split
-            # has nothing left to describe: everything already sent stays in
-            # ``committed_prefix`` and the whole handle text is revisable.
-            prefix = text[:locked_chars]
-            value["_model_text_parts"] = {
-                "committed_prefix": prefix,
-                "current_clause": "",
-                "prefetched_clause": "",
-                "revisable_tail": text[len(prefix):],
-            }
-            value["_model_text_parts_valid"] = True
-            return
         if state is None:
             value["_model_text_parts"] = {
                 "committed_prefix": text,
@@ -211,8 +208,8 @@ class SpeechFrontierMixin:
         expected_text（期望原计划文本）、expected_text_revision（期望文本修订版本）
         都来自模型生成请求时的本地快照，不能用落地时的新边界代替。
         """
-        h = self.handle
-        if (h is None or h.speech_id != speech_id or h.reason or h.task.done()
+        h = self.handle or self._continuation_handle
+        if (h is None or h.speech_id != speech_id or h.reason
                 or h.identity[0] != identity[0] or h.turn_id != turn_id):
             return None
         state = h.admission
@@ -225,21 +222,31 @@ class SpeechFrontierMixin:
                 or getattr(h, "text_revision", 0) != expected_text_revision):
             return None
         baseline = h.text[:state.sent_chars]
-        dropped = state.replace_unsent(text)
-        if dropped < 0:
-            return None
-        h.text = baseline + text
+        if state.closed:
+            if not self._can_continue(h):
+                return None
+            dropped = len(h.continuation_tail)
+            h.continuation_tail = text
+            h.continuation_identity = identity
+            h.continuation_signal.set()
+        else:
+            dropped = state.replace_unsent(text)
+            if dropped < 0:
+                return None
+            h.text = baseline + text
         h.text_revision = getattr(h, "text_revision", 0) + 1
         # 分段器已结束，权威文本同时用于事务结算及本地状态快照。
-        h.workspace.staged_response = h.text.strip()
-        self.state.current["assistant_text"] = h.text
+        accepted = h.text + h.continuation_tail
+        if not state.closed:
+            h.workspace.staged_response = h.text.strip()
+        self.state.current["assistant_text"] = accepted
         await self.runtime.emit("speech.tail_rewritten", {
             "speech_id": h.speech_id, "conversation_id": h.identity[0],
             "turn_id": h.turn_id, "output_generation": h.workspace.generation,
             "text_revision": h.text_revision,  # text_revision（单事务文本版本）。
-            "text": h.text,  # text（该播报事务修订后的完整权威文本）。
+            "text": accepted,  # text（本事务正文及待接播尾巴，不重复前序事务文字）。
             "sent_chars": state.sent_chars,
             "dropped_chars": dropped, "staged_chars": len(text),
-            "cumulative_chars": len(h.text), "provider": h.tts_backend,
+            "cumulative_chars": len(accepted), "provider": h.tts_backend,
         })
         return h

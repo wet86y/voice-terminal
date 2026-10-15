@@ -87,7 +87,7 @@ HTTP API 和 WebSocket 事件都应尽量保留结构化错误码：
 - `speech.delta`：追加正式输出文本；
 - `speech.started`：播放器第一次实际消费该事务 PCM；
 - `speech.progress`（播报进度）：缓冲、播放、替换和结算诊断；`trigger=playback_finished`（触发原因为物理播放结束）表示物理播放结束。可选 `playback_caption`（实时语音字幕片段）包含 `text`（纯语音原文）、`start`／`end`（当前片段的字符起止下标）和 `precision`（对齐精度，`word` 为词级、`sentence` 为句级）。下标按 Unicode（统一字符编码）字符计数，浏览器须转换为自身字符串下标。片段来自真实设备输出位置估算与已有音频对齐；音频尚未开始、原文不匹配或没有可信片段时为空，不按提交字符数推算。该字段不包含截图、聊天附件及工具消息；
-- `speech.tail_rewritten`（尾巴修订事件）：只改写同一事务的未发送尾巴，`speech_id`（播报标识）和播放键不变。`text`（该事务修订后的完整权威文本）直接替换展示；`text_revision`（单事务递增修订版本）及 `output_generation`（输出代数）用于拒绝过期事件；已结束或其他会话的事务不被恢复；
+- `speech.tail_rewritten`（尾巴修订事件）：改写本轮事务的完整未发送尾巴，全部锁定时也可接受新尾巴。`text`（本事务正文与待接播尾巴）直接替换展示，不包含前序事务文字；`text_revision`（单事务递增修订版本）及 `output_generation`（输出代数）用于拒绝过期事件。原发送管线仍在时使用同一 `speech_id`（播报标识）和播放键；发送已经关闭时由后继播放段通过自己的 `speech.queued`（语音入队）、`speech.delta`（正文增量）等事件接播，旧事务送达结算只含自身正文，前端不恢复已结束事务；
 - `speech.completed`：delivery 和最终事务状态结算完成。
 
 物理播放结束和服务端结算不是同一边界：
@@ -95,6 +95,8 @@ HTTP API 和 WebSocket 事件都应尽量保留结构化错误码：
 - `speech.started` 用于产品“用户说完 → AI 开口”计时的结束；
 - `playback_finished` 用于播放面板更新；
 - `speech.completed` 用于 ledger、历史和 delivery 最终结算。
+
+设备实际播放结束后的 1 秒续写资格属于模型请求边界：`speech.state=continuation`（续写窗口）仍使用 `revision`（尾巴修订）动作，原播放段按时结算，不额外延后 `speech.completed`（语音完成事件）。窗口内已获权限的模型请求可以跨截止返回；新尾巴准备好后立即按后继段事件接播。
 
 ## Conversation 顺序
 

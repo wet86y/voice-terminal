@@ -146,6 +146,9 @@ def test_switch_barrier_includes_remote_output_task_and_queued_audio(tmp_path):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         assert not runtime.tts_switch_busy()
+        runtime.controller.output.continuation_active = True
+        assert runtime.tts_switch_busy()
+        runtime.controller.output.continuation_active = False
         runtime.player.buffered_ms = 100
         assert runtime.tts_switch_busy()
     asyncio.run(scenario())

@@ -1,6 +1,7 @@
 """连续语音交接：使用真实播放器队列，控制音频消费与历史结算边界。"""
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 from voice_terminal.agent.decision_envelope import DecisionEnvelope, SpeechDecision
@@ -153,9 +154,11 @@ class ContinuationHarness:
         await self.wait_for_drain(handle)
         return handle
 
-    async def wait_for_drain(self, handle, timeout=READY_TIMEOUT_SECONDS):
+    async def wait_for_drain(self, handle=None, timeout=READY_TIMEOUT_SECONDS):
         key = await asyncio.wait_for(self.player.drain_started.get(), timeout)
+        handle = handle or self.output.handle
         assert key == handle.workspace.playback_key
+        return handle
 
     def render(self, frames=80):
         pcm = bytearray(frames * 2)
@@ -196,11 +199,10 @@ def test_new_speak_is_rejected_until_actual_pcm_playback_completes():
             assert harness.render() == b"\x01\x00" * 80
             await asyncio.wait_for(asyncio.shield(first.task), HANDOFF_TIMEOUT_SECONDS)
             assert not harness.output.busy
-            # 同轮次的新请求仍携带已交付前缀；准入时只提交新增尾巴。
-            decision = DecisionEnvelope(SpeechDecision("speak", "calm", FIRST_TEXT + SUFFIX_TEXT), ())
+            # 播放完成后的一秒仍使用 revision（尾巴修订），只提交新增正文。
+            decision = DecisionEnvelope(SpeechDecision("revision", "calm", SUFFIX_TEXT), ())
             await runtime._apply_decision_v06(harness.identity, harness.turn_id, decision)
-            second = harness.output.handle
-            await harness.wait_for_drain(second)
+            second = await harness.wait_for_drain()
             assert harness.tts.sessions[1].sent == [SUFFIX_TEXT]
             harness.render()
             await asyncio.wait_for(asyncio.shield(second.task), HANDOFF_TIMEOUT_SECONDS)
@@ -238,7 +240,7 @@ def test_settlement_stays_busy_and_rejected_request_is_never_replayed():
             harness.render()
             await asyncio.wait_for(harness.settlement_started.wait(), HANDOFF_TIMEOUT_SECONDS)
             assert harness.output.busy
-            assert harness.output.speak_snapshot["queue_status"] == "empty"
+            assert harness.output.speak_snapshot["queue_status"] == "continuation"
             state = StreamedSpeechAdmissionState(
                 harness.identity, harness.turn_id, dict(harness.output.speak_snapshot),
                 0, None, False, None)
@@ -307,6 +309,9 @@ def test_late_same_turn_decision_uses_settled_prefix_without_replaying_it():
             first = await harness.first()
             harness.render()
             await asyncio.wait_for(asyncio.shield(first.task), HANDOFF_TIMEOUT_SECONDS)
+            # 窗口结束后才恢复普通新播报；缩短截止时间避免测试真实等待一秒。
+            first.continuation_deadline = time.monotonic() - 1
+            first.continuation_signal.set()
             assert harness.output.speak_snapshot["queue_status"] == "empty"
             assert harness.output.speak_snapshot["delivered_text"] == FIRST_TEXT
 

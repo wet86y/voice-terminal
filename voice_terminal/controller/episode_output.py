@@ -9,6 +9,7 @@ from uuid import uuid4
 from .speech_pipeline import SpeechPipeline
 from .speech_frontier import SpeechFrontierMixin
 from .speech_inference import SpeechInferenceBoundary
+from .speech_continuation import SpeechContinuationMixin
 from .turn_workspace import TurnWorkspace
 from ..core.state import RuntimeState
 from ..tts.alignment import DeliveryResolver
@@ -48,6 +49,7 @@ class SpeechHandle:
         self.reason = None
         self.snapshot = None
         self.text = ""
+        self.delivered_prefix = None  # delivered_prefix（接播段已结算的固定前缀；普通替换沿用动态前沿）。
         self.task = None
         self.finished = False
         self.envelope_validated = False  # envelope_validated（完整决策已通过协议校验）。
@@ -75,6 +77,13 @@ class SpeechHandle:
         # owns the boundary between text the provider already received and
         # text this transaction can still replace.
         self.admission = None
+        self.continuation_tail = ""  # continuation_tail（发送结束后等待接播的新尾巴）。
+        self.continuation_identity = None  # continuation_identity（最近一次有效修订请求）。
+        self.continuation_base = ""  # continuation_base（本次窗口已实际播放的完整前缀）。
+        self.continuation_deadline = None  # continuation_deadline（实际播放完成后的窗口截止时间）。
+        self.continuation_tickets = set()  # continuation_tickets（已获得续写权限的推理票据）。
+        self.continuation_signal = asyncio.Event()  # continuation_signal（尾巴或推理状态变化通知）。
+        self.resources_released = False  # resources_released（音色与模型租约已释放）。
 
     @property
     def sent_chars(self):
@@ -91,7 +100,9 @@ class SpeechHandle:
         """Whether a later decision may still replace this tail in place."""
 
         state = self.admission
-        return bool(state is not None and state.rewritable and state.producer_done and self.finished)
+        return bool(state is not None and not getattr(state, "sending", False)
+                    and getattr(state, "producer_done", False) and self.finished
+                    and (state.rewritable or self.owner._can_continue(self)))
 
     async def _put(self, value):
         if self.reason or self.task.done():
@@ -132,7 +143,7 @@ class SpeechHandle:
             yield value
 
 
-class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
+class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPipeline):
     """Generation-owned output transactions sharing the audio pipeline.
 
     A superseded transaction is locally stopped synchronously, while its
@@ -174,6 +185,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         # shrink behind what the listener already has.
         self.delivered = {"turn_id": None, "text": ""}
         self.inference_boundary = SpeechInferenceBoundary(self)  # inference_boundary（模型推理提交边界）。
+        self._init_continuation()
 
     @property
     def active(self):
@@ -474,11 +486,15 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
                 self.loop.call_soon_threadsafe(lambda: self.controller._track(asyncio.create_task(publish())))
 
     async def begin(self, identity, turn_id, *, emotion="calm", kind="formal",
-                    _generation_advanced=False, _fresh_session=False):
+                    _generation_advanced=False, _fresh_session=False, _continuation_parent=None):
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during cleanup")
         # speak（新播报）只有空闲时可创建；显式 cancel（取消）替换由专用入口授权。
         if not _generation_advanced and self.busy:
+            return None
+        if _continuation_parent is None:
+            self._invalidate_revision_window()
+        elif not self._continuation_current(_continuation_parent):
             return None
         on_model_speech = getattr(self.controller, "_on_model_speech_accepted", None)
         if callable(on_model_speech) and not getattr(self.runtime, "should_defer_speech", lambda: False)():
@@ -486,17 +502,30 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         # 异步准备后再次确认；检查与注册之间没有让出事件循环。
         if self.runtime.gate(identity):
             raise ValueError("speech authorization expired during preparation")
+        if _continuation_parent is not None and not self._continuation_current(_continuation_parent):
+            return None
         if not _generation_advanced and self.busy:
             return None
         if not _generation_advanced:
             self.generation += 1
         self.loop = asyncio.get_running_loop()
+        if _continuation_parent is not None:
+            identity = _continuation_parent.continuation_identity or identity
         h = SpeechHandle(self, identity, turn_id, self.generation, emotion, kind=kind)
+        if _continuation_parent is not None:
+            # 接播严格晚于旧段结算；普通替换的旧段可能还在异步结算，不能提前冻结。
+            h.delivered_prefix = _continuation_parent.continuation_base
         h.envelope_validated = getattr(self.runtime, "_validated_envelope_identity", None) == identity
         if hasattr(self.tts, "bind"):
-            h.tts_backend, h.tts_client = self.tts.bind()
+            if _continuation_parent is None:
+                h.tts_backend, h.tts_client = self.tts.bind()
+            else:
+                h.tts_backend, h.tts_client = self.tts.bind(backend=_continuation_parent.tts_backend)
         else:
             h.tts_backend, h.tts_client = "minimax", self.tts
+        if _continuation_parent is not None:
+            # 后继已注册才移交窗口；异步准备期间保留旧锚，取消仍能撤销接播。
+            self._continuation_handle = None
         h.force_fresh_tts_session = _fresh_session
         self._handles_by_token[h.workspace.token] = h
         register = getattr(self.runtime, "_register_speech_transaction", None)
@@ -517,18 +546,22 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         self.tasks.add(h.task)
         def forget_finished(task, handle=h):
             self.tasks.discard(task)
-            if handle.tts_voice_release is not None:
-                handle.tts_voice_release()
-                handle.tts_voice_release = None
+            if not self._continuation_alive(handle):
+                self._release_speech_resources(handle)
             if not handle.run_started and handle.tts_session is not None:
                 # 未进入执行管线的会话也必须释放音色素材租约。
                 cleanup = asyncio.create_task(handle.tts_session.close(), name=f"speech-unused-{handle.speech_id}")
                 self.tasks.add(cleanup)
                 cleanup.add_done_callback(self.tasks.discard)
-            if hasattr(self.tts, "release"):
-                self.tts.release(handle.tts_backend)
             # A held/superseded task can be cancelled before it ever enters
             # _run() (and therefore before _run's final cleanup executes).
+            if not handle.run_started:
+                if self.handle is handle:
+                    self.handle = None
+                try:
+                    self._pending.remove(handle)
+                except ValueError:
+                    pass
             if self.handle is not handle:
                 self._handles_by_token.pop(handle.workspace.token, None)
         h.task.add_done_callback(forget_finished)
@@ -539,7 +572,11 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         self.inference_boundary.authorize_new(h)
         if getattr(h.tts_client, "resolve_voice", None) is not None:
             try:
-                h.tts_session = h.tts_client.session()
+                if _continuation_parent is not None and _continuation_parent.tts_voice_snapshot is not None:
+                    h.tts_session = h.tts_client.session(voice_snapshot=_continuation_parent.tts_voice_snapshot,
+                                                        inference_steps=_continuation_parent.tts_inference_steps)
+                else:
+                    h.tts_session = h.tts_client.session()
                 h.tts_session_prepared = True
                 h.tts_voice_snapshot = getattr(h.tts_session, "voice_snapshot", None)
                 h.tts_inference_steps = getattr(h.tts_session, "_inference_steps", None)
@@ -551,12 +588,17 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
                 h.task.cancel()  # 冻结音色失败时同样释放路由租约与待启动任务。
                 raise
         self._pending.append(h)
-        await self._activate(h)  # 先合成，设备输出仍等待播放许可。
-        await self.runtime.emit("speech.queued", {"speech_id": h.speech_id, "conversation_id": h.identity[0],
-                                 "turn_id": turn_id, "output_generation": h.workspace.generation,
-                                 "kind": kind, "text": h.text, "status": h.state,
-                                 "provider": h.tts_backend})
-        await asyncio.sleep(0)
+        try:
+            await self._activate(h)  # 先合成，设备输出仍等待播放许可。
+            await self.runtime.emit("speech.queued", {"speech_id": h.speech_id, "conversation_id": h.identity[0],
+                                     "turn_id": turn_id, "output_generation": h.workspace.generation,
+                                     "kind": kind, "text": h.text, "status": h.state,
+                                     "provider": h.tts_backend})
+            await asyncio.sleep(0)
+        except BaseException:
+            # 音色准备或事件发布时取消，已登记的后继也必须撤销，不能留下空事务。
+            self.cancel(h.speech_id)
+            raise
         return h
 
     async def replace_current(self, identity, turn_id, *, emotion="calm"):
@@ -744,6 +786,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         lifecycle_cancel = reason in {
             "input_unavailable", "stopped", "reset", "failed", "fatal_error", "scope_closed",
         }
+        self._invalidate_revision_window()
         if lifecycle_cancel:
             self._playback_hold = False
             self._playback_release.set()
@@ -761,6 +804,9 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         for h in items:
             if not h or h.task.done() or h.reason:
                 continue
+            h.continuation_tail = ""
+            h.continuation_tickets.clear()
+            h.continuation_signal.set()
             if reason == "passive_quiet" and h.finished and h.envelope_validated and not h.run_started:
                 self.runtime.defer_speech(h.speech_id, h.text)
             h.reason = reason
@@ -794,10 +840,18 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
         """
         if not isinstance(speech_id, str) or not speech_id:
             return False
+        window = self._continuation_handle
+        if window is not None and window.speech_id == speech_id:
+            self._invalidate_revision_window()
+            if window.task.done():
+                return True
         items = ([self.handle] if self.handle else []) + list(self._pending)
         for h in items:
             if h is None or h.speech_id != speech_id or h.task.done() or h.reason:
                 continue
+            h.continuation_tail = ""
+            h.continuation_tickets.clear()
+            h.continuation_signal.set()
             h.reason = reason
             h.production_ready.set()
             h.playback_ready.set()
@@ -815,24 +869,40 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
             return True
         return False
 
+    @staticmethod
+    def _playback_completed_fact(h, snapshot):
+        """窗口、调度通知和最终送达共用同一设备输出完成事实。"""
+        read = snapshot.get if isinstance(snapshot, dict) else lambda key: getattr(snapshot, key, None)
+        return bool(
+            not h.reason
+            and h.text
+            and h.workspace.timings.get("tts_text_sent")
+            and int(h.workspace.timings.get("tts_audio_bytes") or 0) > 0
+            and h.workspace.timings.get("playback_output_complete") is True
+            and bool(read("started"))
+            and int(read("buffered_ms") or 0) == 0
+            and int(read("enqueued_ms") or 0) > 0
+            and int(read("output_estimated_ms") or 0) >= int(read("enqueued_ms") or 0)
+        )
+
     async def _notify_playback_completed(self, h):
         """在播放器输出完成时通知 Agent（代理），先于历史结算。"""
 
         if h.reason or h.workspace.timings.get("playback_completion_notified"):
             return
-        timings = h.workspace.timings
-        if not (
-            h.text
-            and timings.get("tts_text_sent")
-            and int(timings.get("tts_audio_bytes") or 0) > 0
-            and timings.get("playback_output_complete") is True
-        ):
+        snapshot = h.snapshot
+        progress = getattr(self.player, "progress", None)
+        if snapshot is None and callable(progress):
+            snapshot = progress(h.workspace.playback_key)
+        if not self._playback_completed_fact(h, snapshot):
             return
+        timings = h.workspace.timings
         completed_at = timings.get("playback_output_completed_at")
         if not isinstance(completed_at, (int, float)) or completed_at <= 0:
             completed_at = time.monotonic()
             timings["playback_output_completed_at"] = completed_at
         timings["playback_completion_notified"] = completed_at
+        self._open_revision_window(h, completed_at)
         callback = getattr(self.runtime, "playback_completed", None)
         if not callable(callback):
             return
@@ -967,19 +1037,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
             if h.snapshot:
                 self.controller._add_playback_delivery_fields(delivery, h.snapshot)
             snapshot = h.snapshot
-            playback_complete = bool(
-                not h.reason
-                and h.text
-                and h.workspace.timings.get("tts_text_sent")
-                and int(h.workspace.timings.get("tts_audio_bytes") or 0) > 0
-                and h.workspace.timings.get("playback_output_complete") is True
-                and snapshot is not None
-                and bool(getattr(snapshot, "started", False))
-                and int(getattr(snapshot, "buffered_ms", 0) or 0) == 0
-                and int(getattr(snapshot, "enqueued_ms", 0) or 0) > 0
-                and int(getattr(snapshot, "output_estimated_ms", 0) or 0)
-                    >= int(getattr(snapshot, "enqueued_ms", 0) or 0)
-            )
+            playback_complete = self._playback_completed_fact(h, snapshot)
             if playback_complete:
                 provider_status = str(delivery.get("status") or "none")
                 delivery.update({
@@ -1189,6 +1247,7 @@ class EpisodeSpeechOutput(SpeechFrontierMixin, SpeechPipeline):
             # audible PCM from the preceding response.
             if was_active and not h.reason and not self._playback_hold:
                 self.release_held()
+            self._schedule_continuation(h)
 
     async def close(self):
         self._playback_hold = False
