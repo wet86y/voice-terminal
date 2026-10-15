@@ -118,6 +118,8 @@ export const productApi = {
   deleteTtsVoice: (model: ProductLocalTtsModelId, id: string) => request(`/api/v1/tts/voices/${model}/${id}`, { method: 'DELETE' }),
   selectTtsVoice: (model: ProductLocalTtsModelId, selection: { voice_id: string; revision: number } | null) => request(`/api/v1/tts/voices/${model}/selection`, jsonBody({ selection })),
   uploadTtsAsset: (model: ProductLocalTtsModelId, file: File) => request<{ asset: ProductTtsAsset }>(`/api/v1/tts/assets/${model}/import?filename=${encodeURIComponent(file.name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file }),
+  /** ttsAssetAudioUrl（参考音频地址）：沿用桌面宿主提供的语音服务地址。 */
+  ttsAssetAudioUrl: (model: ProductLocalTtsModelId, asset_id: string) => `${apiBaseUrl()}/api/v1/tts/assets/${model}/${encodeURIComponent(asset_id)}/audio`,
   startTtsPreview: (model: ProductLocalTtsModelId, voice: Partial<ProductTtsVoice>, text: string) => request<ProductTtsOperation>('/api/v1/tts/operations/preview', { ...jsonBody({ model, voice, text }), method: 'POST' }),
   startTtsPlay: (model: ProductLocalTtsModelId, asset_id: string) => request<ProductTtsOperation>('/api/v1/tts/operations/play', { ...jsonBody({ model, asset_id }), method: 'POST' }),
   startTtsTranscribe: (model: ProductLocalTtsModelId, asset_id: string) => request<ProductTtsOperation>('/api/v1/tts/operations/transcribe', { ...jsonBody({ model, asset_id }), method: 'POST' }),

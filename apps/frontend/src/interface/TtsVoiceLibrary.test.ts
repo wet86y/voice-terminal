@@ -1,10 +1,13 @@
 // @vitest-environment jsdom
 import { defineComponent, h } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
-import { describe, it, expect, vi } from 'vitest'
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import TtsVoiceLibrary from './TtsVoiceLibrary.vue'
 import { provideTtsVoiceState, type TtsVoiceState } from './useTtsVoiceState'
 import type { TtsVoicePort, ProductLocalTtsModelId, ProductTtsOperation } from './tts-voice-types'
+
+beforeEach(() => { vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {}) })
+afterEach(() => vi.restoreAllMocks())
 
 function harness(port?: TtsVoicePort) {
   let state!: TtsVoiceState // state（应用根层草稿状态）。
@@ -36,7 +39,7 @@ describe('本地音色卡片', () => {
     expect(view.wrapper.findAll('textarea')).toHaveLength(2)
     await view.wrapper.setProps({ model: 'voxcpm2', steps: 20 })
     await flushPromises()
-    expect(view.wrapper.text()).toContain('二代草稿')
+    expect(view.wrapper.find<HTMLInputElement>('input[aria-label="音色名称"]').element.value).toBe('二代草稿')
     expect(view.wrapper.find('textarea').element.value).toBe('自然女声')
     view.wrapper.unmount()
   })
@@ -64,6 +67,7 @@ describe('本地音色卡片', () => {
     const port = {
       ttsVoices: vi.fn().mockResolvedValue({ voices: [] }),
       uploadTtsAsset: vi.fn().mockResolvedValue({ asset: { asset_id: 'source', duration_ms: 5680 } }),
+      ttsAssetAudioUrl: vi.fn().mockReturnValue('http://localhost/reference.wav'),
       startTtsTranscribe: vi.fn(() => new Promise<ProductTtsOperation>(done => { resolve = done })),
       cancelTtsOperation: vi.fn().mockResolvedValue({}),
     } as unknown as TtsVoicePort
@@ -79,6 +83,59 @@ describe('本地音色卡片', () => {
     expect(draft.transcript).toBe('人工校对后的正文')
     expect(draft.source?.asset_id).toBe('source')
     expect(port.cancelTtsOperation).toHaveBeenCalledWith('late')
+    view.wrapper.unmount()
+  })
+
+  it('名称在标题原位编辑，保存后收起并保留已有设计素材', async () => {
+    const voice = {
+      id: 'designed', revision: 3, name: '原音色', source: 'design', model: 'voxcpm2', enabled: true, is_default: false,
+      reference_asset_id: 'target', reference_text: '原始目标样音', design_text: '原始试音正文', design_description: '温和女声', inference_steps: 10,
+    }
+    const port = {
+      ttsVoices: vi.fn().mockResolvedValue({ voices: [voice] }),
+      updateTtsVoice: vi.fn().mockImplementation((_model, _id, payload) => {
+        const saved = { ...voice, ...payload, revision: 4 }
+        port.ttsVoices.mockResolvedValue({ voices: [saved] })
+        return Promise.resolve({ voice: saved })
+      }),
+    } as unknown as TtsVoicePort & { ttsVoices: ReturnType<typeof vi.fn> }
+    const view = harness(port); await flushPromises()
+    await button(view.wrapper, '编辑').trigger('click')
+    const card = view.wrapper.find('article')
+    expect(card.findAll('input[maxlength="80"]')).toHaveLength(1)
+    expect(card.find('.voice-heading input[aria-label="音色名称"]').exists()).toBe(true)
+    expect(card.find('.voice-editor input[maxlength="80"]').exists()).toBe(false)
+    await card.find('input[aria-label="音色名称"]').setValue('新音色')
+    await button(view.wrapper, '保存').trigger('click'); await flushPromises()
+    expect(port.updateTtsVoice).toHaveBeenCalledWith('voxcpm2', 'designed', expect.objectContaining({ name: '新音色', source: 'design', reference_asset_id: 'target', inference_steps: 10 }), 3)
+    expect(card.find('.voice-editor').exists()).toBe(false)
+    expect(card.find('.voice-name strong').text()).toBe('新音色')
+    view.wrapper.unmount()
+  })
+
+  it('整行上传区与播放器互斥切换，删除附件恢复上传并清空校对文本', async () => {
+    const port = {
+      ttsVoices: vi.fn().mockResolvedValue({ voices: [] }),
+      uploadTtsAsset: vi.fn().mockResolvedValue({ asset: { asset_id: 'source', duration_ms: 5680 } }),
+      ttsAssetAudioUrl: vi.fn().mockReturnValue('http://localhost/reference.wav'),
+      startTtsTranscribe: vi.fn().mockResolvedValue({ operation_id: 'recognized', state: 'succeeded', result: { text: '识别正文' } }),
+    } as unknown as TtsVoicePort
+    const view = harness(port); await flushPromises()
+    await button(view.wrapper, '＋ 添加音色').trigger('click')
+    expect(view.wrapper.findAll('input[type="file"]')).toHaveLength(1)
+    expect(view.wrapper.find('.voice-inputs input[type="file"]').exists()).toBe(false)
+    expect(view.wrapper.find('.voice-reference .attachment-upload').exists()).toBe(true)
+    expect(view.wrapper.findAll('textarea[rows="1"].compact-textarea')).toHaveLength(3)
+    await view.wrapper.find('.reference-input').trigger('drop', { dataTransfer: { files: [new File(['audio'], 'sample.wav')] } })
+    await flushPromises()
+    expect(view.wrapper.find('.voice-reference audio').attributes('src')).toBe('http://localhost/reference.wav')
+    expect(view.wrapper.find('input[type="file"]').exists()).toBe(false)
+    await button(view.wrapper, '开始校对文本').trigger('click'); await flushPromises()
+    expect(port.startTtsTranscribe).toHaveBeenCalledTimes(2)
+    await view.wrapper.find('button[aria-label="移除参考音频"]').trigger('click')
+    expect(view.wrapper.find('.audio-attachment').exists()).toBe(false)
+    expect(view.wrapper.find('.voice-reference input[type="file"]').exists()).toBe(true)
+    expect(view.wrapper.findAll('textarea')[1].element.value).toBe('')
     view.wrapper.unmount()
   })
 })
