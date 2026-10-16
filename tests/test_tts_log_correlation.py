@@ -88,6 +88,11 @@ def test_session_and_request_logs_carry_turn_speech_and_session_ids(caplog):
     # 既有口径不破坏：合成指标仍在同一行上。
     assert "rtf=" in completes[0] and "ttfb_ms=" in completes[0]
     assert "inference_steps=" in policy[0]
+    # 参考配方必须落盘：现场取不到该字段时无法判断高保真克隆通道是否生效
+    # （本地 TTS 变慢排查中曾因缺此字段只能推断，见 local-tts 诊断）。
+    for line in completes:
+        assert "reference_recipe=" in line
+        assert "reference_recipe=None" not in line
 
 
 def test_text_content_stays_out_of_logs_by_default(caplog):
