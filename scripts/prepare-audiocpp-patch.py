@@ -9,8 +9,8 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-NATIVE_REVISION = "d0978e7994b442da75d50b0614715b977a9b8acd"
-SERVER_SHA256 = "140d0df3c66610f754707a6d5103ddde757fcc1a9576810d10f34d3d3a11ffc4"
+NATIVE_REVISION = "b4459b3bfa8d6cf4c579cc264dd3f4dfb57dd8ec"
+SERVER_SHA256 = "4082389c40c0208dbafe4468370c30e0be5057e729b7188c82a784a2d97c2fcb"
 OFFICIAL = {
     "binary": ("audio-v0.9.1-bin-windows-x64-cuda13.3.zip", "dd04894fae8bb0d1365b4f62407fb51550558a6478f1ef719cad7aefc00720de"),
     "cudart": ("audio-v0.9.1-cudart-windows-x64-cuda13.3.zip", "fa0fb817540c578bad085c7befb9d25b5a7634548e47955bff7b732b04b8a84b"),
@@ -37,18 +37,20 @@ def prepare(runtime: Path, cache: Path, source_repo: Path) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
     patch_path = directory / "voxcpm-patch.zip"
     candidate = patch_path.with_suffix(".pending.zip")
-    patch_files = {"cuda/audiocpp_server.exe": binary,
-                   **{f"model_specs/{name}.json": runtime / f"sources/audio.cpp/model_specs/{name}.json"
-                      for name in ("voxcpm1", "voxcpm2")}}
+    # model_specs（模型规格）来自固定源码提交，避免打包另一个实验中已变动的本机副本。
+    patch_files = {"cuda/audiocpp_server.exe": binary.read_bytes(),
+                   **{f"model_specs/{name}.json": subprocess.run(
+                       ["git", "-C", str(source_repo), "show", f"{revision}:model_specs/{name}.json"],
+                       check=True, capture_output=True).stdout for name in ("voxcpm1", "voxcpm2")}}
     records = []
     with zipfile.ZipFile(candidate, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-        for relative, source in patch_files.items():
+        for relative, content in patch_files.items():
             # 固定时间戳使同一输入的补丁压缩包可复现。
             info = zipfile.ZipInfo(relative, date_time=(2026, 10, 14, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
-            archive.writestr(info, source.read_bytes())
+            archive.writestr(info, content)
             records.append({"path": relative, "source_path": relative, "archive_id": "patch",
-                            "size_bytes": source.stat().st_size, "sha256": digest(source)})
+                            "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()})
         info = zipfile.ZipInfo("source.patch", date_time=(2026, 10, 14, 0, 0, 0))
         info.compress_type = zipfile.ZIP_DEFLATED
         archive.writestr(info, source_patch)

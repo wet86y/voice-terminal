@@ -121,6 +121,39 @@ def test_official_runtime_plan_includes_archives_and_bundled_patch(tmp_path):
         assert "source.patch" in archive.namelist()
         assert "cuda/audiocpp_server.exe" in archive.namelist()
         assert "model_specs/voxcpm2.json" in archive.namelist()
+        assert "model_specs/voxcpm1.json" in archive.namelist()
+        voxcpm2 = json.loads(archive.read("model_specs/voxcpm2.json"))
+        assert any(option["name"] == "voxcpm2.full_decode" for option in voxcpm2["options"]["request"])
+        records = next(item for item in json.loads((root / "config/resources/catalog.json").read_text("utf-8"))["resources"]
+                       if item["resource_id"] == "tts-audiocpp-runtime")["files"]
+        for item in records:
+            if item.get("archive_id") == "patch":
+                assert hashlib.sha256(archive.read(item["source_path"])).hexdigest() == item["sha256"]
+        native = next(row for row in json.loads((root / "config/resources/catalog.json").read_text("utf-8"))["resources"]
+                      if row["resource_id"] == "tts-audiocpp-runtime")
+        for item in native["files"]:
+            if item.get("archive_id") == "patch":
+                content = archive.read(item["source_path"])
+                assert len(content) == item["size_bytes"]
+                assert hashlib.sha256(content).hexdigest() == item["sha256"]
+
+
+@pytest.mark.parametrize("script,hash_field", [
+    ("prepare-audiocpp-patch.py", "SERVER_SHA256"),
+    ("migrate-local-tts.py", "CUDA_SERVER_SHA256"),
+])
+def test_native_build_and_migration_pins_match_distributed_runtime(script, hash_field):
+    """构建准备、旧资源迁入和客户机分发必须绑定同一份已验证原生程序。"""
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    native = ResourceCatalog(root).get("tts-audiocpp-runtime")
+    server = next(item for item in native.required_files if item.path == "cuda/audiocpp_server.exe")
+    module_spec = importlib.util.spec_from_file_location("native_resource_pin", root / "scripts" / script)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    assert module.NATIVE_REVISION == native.source["native_revision"]
+    assert getattr(module, hash_field) == server.sha256
 
 
 def test_same_size_corrupt_installed_model_is_not_a_startup_candidate(tmp_path):

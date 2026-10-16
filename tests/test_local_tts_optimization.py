@@ -336,7 +336,7 @@ def test_idle_prewarm_is_bounded_context_free_and_real_request_preempts():
         await asyncio.wait_for(session.send_text("真实请求优先。"), 1)
         assert warm.cancelled()
         assert "continuation_id" not in requests[0]
-        assert "max_tokens" not in requests[1]["options"]
+        assert requests[1]["options"]["max_tokens"] > 8, "正式回答使用独立预算，不能沿用预热的八令牌上限"
         assert client._real_waiters == 0
         assert client._warm_task is None
         assert (await client.prewarm())["reason"] == "already_warmed"

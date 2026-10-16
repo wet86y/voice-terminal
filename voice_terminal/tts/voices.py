@@ -20,6 +20,8 @@ from uuid import uuid4
 
 MAX_IMPORT_BYTES = 20 * 1024 * 1024
 MAX_REFERENCE_SECONDS = 15.0
+DESIGN_INFERENCE_STEPS = 30  # DESIGN_INFERENCE_STEPS（样音制作步数）：独立于正式播报设置。
+DESIGN_GENERATION_RECIPE = "voxcpm2-full-decode-v2"  # DESIGN_GENERATION_RECIPE（样音生成配方版本）：混合创作不叠加续写提示。
 # MIN_REFERENCE_SECONDS（参考音频下限）：官方「5 秒规则」要求至少 5 秒，
 # 并给出 5–30 秒的实用区间；低于 5 秒的音色质量官方不背书。
 # 上限 15 秒不是模型限制：audio.cpp 的 AudioVAE 编码器预留容量
@@ -362,8 +364,8 @@ class VoiceLibrary:
             if model != "voxcpm2":
                 raise VoiceLibraryError("design_model（音色设计模型）必须为 voxcpm2。")
             design_text = _safe_text(payload.get("design_text", reference_text), "design_text", 2000, required=True)
-            if self.model and reference_text != design_text:
-                raise VoiceLibraryError("正式样音转写必须与生成正文一致，请重新试音。")
+            if self.model and not reference_text:
+                raise VoiceLibraryError("请填写目标样音实际发音的准确转写。")
             steps = payload.get("inference_steps", 20)
             if type(steps) is not int or not 1 <= steps <= 30:
                 raise VoiceLibraryError("inference_steps（推理步数）必须为 1–30 的整数。")
@@ -373,6 +375,8 @@ class VoiceLibrary:
                 "design_description": description, "design_model": "voxcpm2", "design_text": design_text,
                 "inference_steps": payload.get("inference_steps", 20),
             })
+            if "generation_recipe" in payload:
+                normalized["generation_recipe"] = _safe_text(payload["generation_recipe"], "generation_recipe", 100, required=True)
             if self.model:
                 provenance = self._index["assets"].get(reference_asset_id, {}).get("design_provenance")
                 expected = self.design_signature(normalized)
@@ -457,8 +461,8 @@ class VoiceLibrary:
                     "compatibility": {
                         "voxcpm1": {"supported": True, "requires_reference_text": True,
                                     "ready": bool(record.get("reference_text"))},
-                        "voxcpm2": {"supported": True, "requires_reference_text": False,
-                                    "ready": True},
+                        "voxcpm2": {"supported": True, "requires_reference_text": True,
+                                    "ready": bool(record.get("reference_text", "").strip())},
                     },
                 })
             return result
@@ -473,8 +477,8 @@ class VoiceLibrary:
             raise VoiceLibraryError("尚未配置可用音色，请先导入或创建音色并启用。")
         voice = self.get_voice(str(selection.get("voice_id") or ""), selection.get("revision"))
         path = self.asset_path(voice["reference_asset_id"])
-        if model == "voxcpm1" and not voice.get("reference_text", "").strip():
-            raise VoiceLibraryError("VoxCPM1（第一代本地语音模型）需要先填写参考音频转写文本。")
+        if not voice.get("reference_text", "").strip():
+            raise VoiceLibraryError("请先填写参考音频的准确转写，再启用或使用克隆音色。")
         native_id = "voxcpm1-stream" if model == "voxcpm1" else "voxcpm2-stream"
         return ResolvedLocalTtsVoice(
             model=model, native_model_id=native_id, voice_id=voice["id"], revision=voice["revision"],
@@ -573,10 +577,18 @@ class VoiceLibrary:
                     age = 0
                 if asset_id not in referenced and not self._leases.get(asset_id) and age > max_age_seconds:
                     self._asset_path(asset_id).unlink(missing_ok=True)
+                    self._high_fidelity_path(asset_id).unlink(missing_ok=True)
                     del updated["assets"][asset_id]
                     changed = True
             if changed:
                 self._save_index(updated)
+            # 兼容旧版本只移除主素材和索引时留下的无主高保真副本。
+            for path in self.assets_dir.glob("*.hifi.wav"):
+                asset_id = path.name.removesuffix(".hifi.wav")
+                if (_ID_RE.fullmatch(asset_id) and asset_id not in updated["assets"]
+                        and not self._leases.get(asset_id)
+                        and now - path.stat().st_mtime > max_age_seconds):
+                    path.unlink(missing_ok=True)
             for temporary in self.root.glob(".index-*.json.tmp"):
                 try:
                     if now - temporary.stat().st_mtime > max_age_seconds:
@@ -591,6 +603,8 @@ class VoiceLibrary:
             "design_description", "design_text", "source_reference_asset_id", "source_reference_text", "inference_steps")}
         # source_reference_text（克隆源转写）：试音打标与保存校验统一去除首尾空白。
         signature["source_reference_text"] = _safe_text(payload.get("source_reference_text", ""), "source_reference_text", 2000)
+        if "generation_recipe" in payload:
+            signature["generation_recipe"] = payload["generation_recipe"]  # generation_recipe（实际生成配方）。
         return signature
 
     def mark_design(self, asset_id: str, payload: Mapping[str, Any]) -> None:

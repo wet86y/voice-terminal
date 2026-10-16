@@ -30,6 +30,7 @@ export interface ProductTtsVoice {
   duration_ms?: number; source_reference_duration_ms?: number // 目标和源素材时长（毫秒）。
   source_reference_asset_id?: string | null; source_reference_text?: string // 原始克隆素材及校对文本。
   design_description?: string; design_text?: string; inference_steps?: number // 设计描述、生成正文、推理步数。
+  generation_recipe?: string // generation_recipe（样音生成配方版本）。
 }
 /** ProductTtsAsset（音频附件）：标识与毫秒时长。 */
 export interface ProductTtsAsset { asset_id: string; duration_ms: number }

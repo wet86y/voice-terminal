@@ -651,6 +651,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             logger.info("tts.local_sample_rate_changed local_model=%s previous_rate=%d sample_rate=%d deferred=True",
                         pending[0], previous_rate, desired)
         if self.player is None:
+            if self.audio_processor is not None:
+                self.audio_processor.reclock_reverse(desired)
             self.player = PcmPlayer(
                 playback_permission=lambda: not self.quiet_policy.passive(),
                 on_policy_blocked=self._on_passive_playback_blocked,
@@ -662,7 +664,10 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 on_audio_frame=lambda pcm: self.audio_meter.feed("playback", pcm, self.config.tts.sample_rate),
             )
         elif self.player.sample_rate != desired and self._player_is_idle():
-            self.player.reclock(desired)
+            self.player.reclock(
+                desired,
+                on_rate_changed=(self.audio_processor.reclock_reverse if self.audio_processor else None),
+            )
         if not self.player.running:
             self.player.start()
         self.state.current["playback_diagnostics"] = self.player.diagnostics
@@ -1012,11 +1017,33 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         """调用本地 TTS 适配层切换模型并更新加载诊断。"""
         if self.tts is None:
             raise RuntimeError("TTS（语音合成）组件尚未初始化。")
+        if not self._player_is_idle():
+            raise RuntimeError("播放器音频尚未排空，请等待当前播报结束后切换本地模型。")
+        previous_config = self.config
+        model_switched = False
         self._local_tts_load_state = "loading"
         self._local_tts_error = None
         try:
             await self.tts.switch_local_model(local_model)
-        except Exception as exc:
+            model_switched = True
+            # 模型与设备时钟属于同一切换事务，设备拒绝新率也必须回滚原生模型。
+            await self._sync_local_tts_sample_rate(local_model)
+        except BaseException as exc:
+            if model_switched:
+                self.config = previous_config
+                try:
+                    await self.tts.switch_local_model(previous_config.tts.local_model)
+                    local = getattr(self.tts, "local", None)
+                    if local is not None:
+                        local.sample_rate = previous_config.tts.sample_rate
+                    self._pending_local_tts_rate = None
+                    self._ensure_player()
+                    self._local_tts_load_state = "ready"
+                except Exception:
+                    self._local_tts_load_state = "error"
+                    logger.exception("tts.local_model_clock_rollback_failed")
+                self._local_tts_error = str(exc)[:500]
+                raise
             client = getattr(self.tts, "local", None)
             status = client.model_status() if callable(getattr(client, "model_status", None)) else {}
             loaded_model = status.get("loaded_model") if isinstance(status, Mapping) else None
@@ -1025,8 +1052,6 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             raise
         self._local_tts_load_state = "ready"
         self._local_tts_error = None
-        # 模型热切换同样改变原生率（16 kHz ↔ 48 kHz），下行率必须一起跟上。
-        await self._sync_local_tts_sample_rate(local_model)
 
     async def _sync_local_tts_sample_rate(self, local_model: str) -> None:
         """_sync_local_tts_sample_rate（同步下行率）：把本地下行率对齐到模型原生率。
@@ -1057,6 +1082,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         """在停止监听时准备语音后端，失败保留原配置；调用方持有会话锁。"""
         if self.tts is None:
             raise RuntimeError("TTS（语音合成）组件尚未初始化。")
+        if not self._player_is_idle():
+            raise RuntimeError("播放器音频尚未排空，请等待当前播报结束后切换语音后端。")
         if backend == self.config.tts.backend == "voxcpm1":
             await self.switch_local_tts_model(local_model)
             if self._active_voice_snapshot(local_model) is not None:
@@ -1065,8 +1092,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         previous_config, previous_router = self.config, self.tts
         next_config = replace(previous_config, tts=replace(
             previous_config.tts, backend=backend, local_model=local_model,
-            # 适配器将原生音频连续重采样到现有设备时钟，仅替换语音后端。
-            sample_rate=previous_config.tts.sample_rate,
+            sample_rate=(local_tts_native_rate(local_model) if backend == "voxcpm1"
+                         else previous_config.tts.sample_rate),
         ))
         candidate = None
         self.config = next_config
@@ -1083,8 +1110,14 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 warmup = await candidate.prewarm()
             if warmup.get("status") == "FALLBACK":
                 raise RuntimeError(f"新语音后端连接未就绪：{warmup.get('reason') or '预热失败'}")
+            self._ensure_player()
         except BaseException:
             self.config = previous_config
+            if self.player is not None and self.player.sample_rate != previous_config.tts.sample_rate:
+                try:
+                    self._ensure_player()
+                except Exception:
+                    logger.exception("tts.player_clock_rollback_failed")
             if candidate is not None:
                 await candidate.shutdown()
             raise
@@ -1224,13 +1257,16 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             return
         available = AudioCppTtsServer.available_models(self._runtime_local_root)
         if current.backend == "voxcpm1" and current.local_model in available:
+            self.config = replace(self.config, tts=replace(
+                current, sample_rate=local_tts_native_rate(current.local_model)))
             return
         online = bool(self._api_key(current.api_key_env)) if current.backend == "minimax" or not available else False
         if current.backend == "minimax" and online:
             return
         if available:
             model = current.local_model if current.local_model in available else available[0]
-            self.config = replace(self.config, tts=replace(current, backend="voxcpm1", local_model=model))
+            self.config = replace(self.config, tts=replace(
+                current, backend="voxcpm1", local_model=model, sample_rate=local_tts_native_rate(model)))
         elif online:
             self.config = replace(self.config, tts=replace(current, backend="minimax"))
         else:

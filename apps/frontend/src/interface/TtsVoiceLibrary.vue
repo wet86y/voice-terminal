@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import ReferenceAudioPlayer from './ReferenceAudioPlayer.vue'
-import { useTtsVoiceState, voiceDraft, TTS_SAMPLE_TEXT, type VoiceDraft } from './useTtsVoiceState'
+import { useTtsVoiceState, voiceDraft, TTS_SAMPLE_TEXT, TTS_DESIGN_STEPS, TTS_DESIGN_RECIPE, type VoiceDraft } from './useTtsVoiceState'
 import type { ProductLocalTtsModelId, ProductTtsVoice, ProductTtsOperation, TtsVoicePort } from './tts-voice-types'
 
 const props = withDefaults(defineProps<{ model: ProductLocalTtsModelId; steps: number; unavailable?: boolean; demo?: boolean; port?: TtsVoicePort }>(), { unavailable: false, demo: false })
@@ -33,7 +33,7 @@ const bucket = computed(() => state.models[props.model])
 const drafts = computed(() => Object.values(bucket.value.drafts))
 const globalBusy = computed(() => Object.values(state.models).some(model => Object.values(model.drafts).some(draft => draft.busy)))
 function signature(draft: VoiceDraft, model = props.model) {
-  return JSON.stringify([model, draft.description.trim(), draft.source?.asset_id, draft.transcript, draft.text, state.inferenceSteps[model]])
+  return JSON.stringify([model, draft.description.trim(), draft.source?.asset_id, draft.transcript, draft.text, TTS_DESIGN_STEPS, TTS_DESIGN_RECIPE])
 }
 function invalidate(draft: VoiceDraft) {
   draft.generation++; draft.candidate = null; draft.signature = ''; draft.notice = ''
@@ -47,7 +47,8 @@ async function refresh(model = props.model) {
     for (const voice of state.models[model].voices) {
       if (!state.models[model].drafts[voice.id]) {
         const draft = voiceDraft(voice)
-        draft.signature = voice.source !== 'design' || voice.inference_steps === state.inferenceSteps[model] ? signature(draft, model) : ''
+        // 已保存样音保留原制作配方，允许改名或校对转写；改变生成输入仍会使候选失效。
+        draft.signature = signature(draft, model)
         state.models[model].drafts[voice.id] = draft
       }
     }
@@ -124,12 +125,13 @@ async function preview(draft: VoiceDraft) {
   await run(draft, async generation => {
     const voice = { name: voiceName(draft), design_description: voiceMode(draft) === 'clone' ? '' : draft.description, source_reference_asset_id: draft.source?.asset_id, source_reference_text: draft.transcript }
     if (props.demo) {
-      draft.candidate = { ...voice, source: draft.description.trim() ? 'design' : 'import', reference_asset_id: 'demo-target', reference_text: draft.text, design_text: draft.text, inference_steps: props.steps }
+      draft.candidate = { ...voice, source: draft.description.trim() ? 'design' : 'import', reference_asset_id: 'demo-target', reference_text: draft.text, design_text: draft.text, inference_steps: TTS_DESIGN_STEPS, generation_recipe: TTS_DESIGN_RECIPE }
+      draft.targetTranscript = draft.text
       draft.signature = prepared; draft.notice = '试音演示完成。'; return
     }
     const result = await monitor(draft, () => productApi.startTtsPreview(model, voice, draft.text), generation)
     if (draft.generation === generation && signature(draft, model) === prepared && result.result?.voice) {
-      draft.candidate = result.result.voice; draft.signature = prepared; draft.notice = '试音完成，可以保存音色。'
+      draft.candidate = result.result.voice; draft.targetTranscript = result.result.voice.reference_text || ''; draft.signature = prepared; draft.notice = '试音完成，请核对目标样音转写后保存。'
     }
   })
 }
@@ -146,11 +148,12 @@ function saveBlockReason(draft: VoiceDraft) {
   if (unchangedContent(draft)) return ''
   const mode = voiceMode(draft) // mode（当前音色创建方式）。
   if (mode !== 'clone') {
+    if (draft.candidate && !draft.targetTranscript.trim()) return '请填写目标样音实际发音的准确转写。'
     if (draft.candidate && draft.signature === signature(draft)) return ''
     return `${mode === 'mixed' ? '混合设计' : '纯音色设计'}需要以当前参数完成一次试音，再保存生成的目标样音。`
   }
   if (!draft.source) return props.model === 'voxcpm2' ? '请填写音色设计描述，或添加参考音频进行克隆；也可以组合使用。' : '请添加参考音频进行音色克隆。'
-  if (props.model === 'voxcpm1' && !draft.transcript.trim()) return '请填写参考音频的准确转写文本后保存克隆音色。'
+  if (!draft.transcript.trim()) return '请填写参考音频的准确转写文本后保存克隆音色。'
   return ''
 }
 function saveable(draft: VoiceDraft) { return !saveBlockReason(draft) }
@@ -158,13 +161,13 @@ function unchangedContent(draft: VoiceDraft) {
   const voice = stored(draft)
   if (!voice) return false
   const original = voiceDraft(voice)
-  return draft.description === original.description && draft.transcript === original.transcript && draft.text === original.text && draft.source?.asset_id === original.source?.asset_id
+  return draft.description === original.description && draft.transcript === original.transcript && draft.text === original.text && draft.targetTranscript === original.targetTranscript && draft.source?.asset_id === original.source?.asset_id
 }
 async function save(draft: VoiceDraft) {
   if (!saveable(draft)) return
   const model = props.model; const name = voiceName(draft)
   await run(draft, async () => {
-    const payload = unchangedContent(draft) ? { ...stored(draft)!, name } : voiceMode(draft) !== 'clone' ? { ...draft.candidate, name } : {
+    const payload = unchangedContent(draft) ? { ...stored(draft)!, name } : voiceMode(draft) !== 'clone' ? { ...draft.candidate, name, reference_text: draft.targetTranscript.trim() } : {
       name, source: 'import', reference_asset_id: draft.source!.asset_id,
       reference_text: draft.transcript, source_reference_text: draft.transcript,
     }
@@ -232,6 +235,8 @@ async function cancel(draft: VoiceDraft) { invalidate(draft); draft.notice = '�
           <small class="reference-hint">支持 5–15 秒音频（官方建议至少 5 秒，5–12 秒最佳），最大 20 MiB（二进制兆字节）。</small>
         </div>
         <div class="voice-footer"><label class="form-field"><span>试音正文</span><textarea v-model="draft.text" class="compact-textarea" rows="1" maxlength="1000" @input="invalidate(draft)"></textarea></label><div class="voice-footer-actions"><button type="button" :disabled="unavailable || globalBusy || (!draft.description.trim() && !draft.source)" @click="preview(draft)">试音</button><button type="button" class="save-button" :disabled="globalBusy || !saveable(draft)" @click="save(draft)">保存</button><button type="button" class="danger-action" :disabled="globalBusy || stored(draft)?.is_default" @click="remove(draft)">{{ draft.id ? '删除' : '取消添加' }}</button></div></div>
+        <label v-if="voiceMode(draft) !== 'clone' && draft.candidate" class="form-field"><span>目标样音转写</span><textarea v-model="draft.targetTranscript" aria-label="目标样音转写" class="compact-textarea" rows="1" maxlength="2000" :disabled="globalBusy"></textarea><small>请按样音实际发音校对；保存后以这段样音和转写克隆播报。</small></label>
+        <p v-if="model === 'voxcpm2' && voiceMode(draft) !== 'clone'" class="instruction-hint">设计与混合样音固定使用 30 步完整解码；正式播报沿用合成质量设置中的步数。</p>
         <p v-if="saveBlockReason(draft)" class="instruction-hint">{{ saveBlockReason(draft) }}</p>
         <p v-if="!draft.name.trim()" class="instruction-hint">未填写名称时，将保存为“{{ voiceName(draft) }}”。</p>
       </div>

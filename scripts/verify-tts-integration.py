@@ -143,6 +143,48 @@ async def cancellation_case(client, *, before_audio):
             "next_server_boundary_events": receipts if getattr(fresh, "bidi", False) else None}
 
 
+async def repeated_generation_case(client):
+    """固定种子下重复相同正文，捕获预填充图复用造成的短输出与噪声化。"""
+    import hashlib
+    import numpy as np
+
+    if client.local_model != "voxcpm2" or client.sample_rate != 48000:
+        raise AssertionError("重复合成回归必须使用二代模型的 48 kHz（千赫兹）原生音频。")
+    rows = []
+    for steps in (10, 15):
+        for text in ("我是七三，你的语音助手。", "好，那这事就这么定了。"):
+            baseline = None
+            for repeat in range(3):
+                session = client.session(fresh=True, inference_steps=steps)
+                session._request_options["seed"] = 1234  # seed（随机种子）：固定其他生成条件。
+                try:
+                    await session.start()
+                    await session.send_text(text)
+                    await session.finish()
+                    pcm = b"".join([chunk async for chunk in session.audio_chunks()])
+                    assert pcm and session.completed_segments == 1, "重复生成没有完整正文回执"
+                finally:
+                    await session.close()
+                samples = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+                if baseline is None:
+                    baseline = samples
+                assert samples.size == baseline.size, "同种子、同正文复用计算图后音频长度改变"
+                reference_rms = float(np.sqrt(np.mean(baseline**2)))
+                assert reference_rms > 0, "首次生成是全静音，无法建立有效的音频对照"
+                relative_error = float(np.sqrt(np.mean((samples - baseline)**2))) / reference_rms
+                # 允许显卡预热带来的微小浮点差异；1% 波形均方根误差远小于本次失真。
+                assert relative_error < .01, "复用计算图后波形与首次生成严重不一致"
+                rows.append({"text": text, "inference_steps": steps, "repeat": repeat + 1,
+                             "audio_ms": samples.size * 1000 / client.sample_rate,
+                             "relative_rms_error": relative_error,
+                             "pcm_sha256": hashlib.sha256(pcm).hexdigest()})
+    return {"requests": rows, "sample_rate": client.sample_rate,
+            "fields": {"requests": "相同正文连续三次合成的逐请求记录", "text": "合成正文",
+                       "inference_steps": "固定推理步数", "repeat": "重复次数序号",
+                       "audio_ms": "原生音频毫秒数", "relative_rms_error": "相对首次音频的均方根误差比例",
+                       "pcm_sha256": "原生音频样本校验摘要", "sample_rate": "实际下行采样率"}}
+
+
 async def voice_design_case(client):
     """二代纯设计与混合设计走正式候选管线，保存目标样音并验证正式克隆快照。"""
     from voice_terminal.server.tts_voice_runtime import TtsVoiceOperationManager, DESIGN_SAMPLE_TEXT
@@ -162,11 +204,20 @@ async def voice_design_case(client):
                               config=SimpleNamespace(tts=SimpleNamespace(backend="voxcpm1", local_model="voxcpm2")))
     manager = TtsVoiceOperationManager(runtime)
     results = []
+    requests = []  # requests（实际发给原生服务的合成入口）。
+    request_bodies = []  # request_bodies（实际请求参数，用于核对正式与样音步数隔离）。
+    async def record_request(request):
+        if request.method == "POST" and request.url.path in {"/v1/tasks/run", "/v1/audio/speech"}:
+            requests.append(request.url.path)
+            request_bodies.append(json.loads(request.content))
+    http = client._request_client()
+    http.event_hooks["request"].append(record_request)
     try:
         for mixed in (False, True):
             draft = {"name": "混合样音" if mixed else "设计样音", "design_description": "温柔自然的年轻女声，吐字清晰，语速平稳。"}
             if mixed:
                 draft.update(source_reference_asset_id=source["reference_asset_id"], source_reference_text=transcript)
+            request_offset = len(requests)
             operation = manager.start_preview("voxcpm2", draft, DESIGN_SAMPLE_TEXT)
             task = manager._items[operation["operation_id"]].task
             frame = max(1, player.sample_rate // 50)
@@ -177,7 +228,15 @@ async def voice_design_case(client):
             await task
             completed = manager.get(operation["operation_id"])
             assert completed["state"] == "succeeded", completed["error"]
+            preview_endpoint = requests[request_offset]
+            assert preview_endpoint == "/v1/tasks/run", "样音没有使用完整任务接口"
+            preview_body = request_bodies[request_offset]["request"]
+            assert preview_body["options"]["num_inference_steps"] == "30"
+            assert preview_body["options"]["voxcpm2.full_decode"] == "true"
+            assert "audio_base64" not in preview_body and "reference_text" not in preview_body
             candidate = completed["result"]["voice"]
+            assert candidate["inference_steps"] == 30
+            assert candidate["generation_recipe"] == "voxcpm2-full-decode-v2"
             saved = library.create_voice(candidate)
             formal = library.resolve("voxcpm2", {"voice_id": saved["id"], "revision": 1})
             assert formal.reference_path == library.asset_path(candidate["reference_asset_id"])
@@ -192,6 +251,11 @@ async def voice_design_case(client):
                 await clone.finish()
                 formal_bytes = sum([len(chunk) async for chunk in clone.audio_chunks()])
                 assert formal_bytes > 0 and not clone._control_instructions()
+                formal_body = request_bodies[-1]
+                assert requests[-1] == "/v1/audio/speech"
+                assert formal_body["options"]["num_inference_steps"] == client.inference_steps_by_model["voxcpm2"]
+                assert formal_body["prompt_audio"] == formal_body["voice_ref"] == str(formal.reference_path.resolve())
+                assert formal_body["reference_text"] == candidate["reference_text"]
             finally:
                 await clone.close()
             # 高保真旁路：原生率样音另存一份，主素材仍是 16 kHz 供编码器使用。
@@ -205,14 +269,59 @@ async def voice_design_case(client):
             assert asset_meta["high_fidelity"]["sample_rate"] == client.native_sample_rate
             assert hifi.stat().st_size > library.asset_path(asset_id).stat().st_size
             results.append({"mixed": mixed, "duration_ms": completed["result"]["duration_ms"],
+                            "preview_endpoint": preview_endpoint,
                             "target_asset_id": asset_id, "formal_uses_target_sample": True,
                             "formal_pcm_bytes": formal_bytes,
+                            "sample_steps": candidate["inference_steps"],
+                            "formal_steps": formal_body["options"]["num_inference_steps"],
                             "high_fidelity_rate": asset_meta["high_fidelity"]["sample_rate"],
                             "high_fidelity_bytes": hifi.stat().st_size})
+            results[-1]["sample_path"] = str(hifi)
         return results
     finally:
+        http.event_hooks["request"].remove(record_request)
         await manager.close()
         client.voice_library = original
+
+
+async def sample_cancellation_case(client):
+    """完整样音取消后丢弃迟到音频，确认原生执行锁释放后再交接。"""
+    from voice_terminal.server.tts_voice_runtime import DESIGN_SAMPLE_TEXT
+    library = client.voice_library.for_model("voxcpm2")
+    old = client.session(voice_snapshot=library.resolve_design("自然温和的声音", is_preview=True),
+                         preview=True, inference_steps=30)
+    await old.start()
+    sender = asyncio.create_task(old.send_text(DESIGN_SAMPLE_TEXT))
+    try:
+        async with asyncio.timeout(30):
+            while not old._native_request_submitted:
+                assert not sender.done()
+                await asyncio.sleep(.001)
+        await asyncio.sleep(.1)
+        assert old.received_bytes == 0
+        started = time.perf_counter()
+        await old.cancel()
+        cancel_ms = (time.perf_counter() - started) * 1000
+        await old.close()
+        release_ms = (time.perf_counter() - started) * 1000
+        assert old.context_release_confirmed is True
+        assert [pcm async for pcm in old.audio_chunks()] == []
+        following = client.session()
+        try:
+            await following.start()
+            await following.send_text("取消后的正式播报正常。")
+            await following.finish()
+            pcm_bytes = sum([len(chunk) async for chunk in following.audio_chunks()])
+            assert pcm_bytes > 0 and following.completed_segments == 1
+        finally:
+            await following.close()
+        return {"cancel_ms": round(cancel_ms, 2), "native_release_confirmed": True,
+                "old_session_close_ms": round(release_ms, 2),
+                "next_pcm_bytes": pcm_bytes, "late_audio_discarded": True}
+    finally:
+        await asyncio.gather(sender, return_exceptions=True)
+        await old.close()
+        client._warmed = False
 
 
 async def local(report, *, design_only=False):
@@ -228,7 +337,8 @@ async def local(report, *, design_only=False):
     libraries = ModelVoiceLibraries(runtime / "data/tts")
     server = AudioCppTtsServer(runtime, config_path, local_model="voxcpm1")
     client = AudioCppTtsClient(server, voice_library=libraries,
-                              active_voice_provider=lambda model: libraries.for_model(model).active_selection)
+                              active_voice_provider=lambda model: libraries.for_model(model).active_selection,
+                              inference_steps_by_model={"voxcpm1": 10, "voxcpm2": 10})
     try:
         for model in (("voxcpm2",) if design_only else ("voxcpm1", "voxcpm2")):
             await client.switch_model(model)
@@ -239,7 +349,10 @@ async def local(report, *, design_only=False):
                     result.append(await cancellation_case(client, before_audio=before_audio))
                 report[model] = {"cancellation": result, "playback_gate": await playback_gate_case(client)}
             if model == "voxcpm2":
+                if not design_only:
+                    report[model]["repeated_generation"] = await repeated_generation_case(client)
                 report.setdefault(model, {})["voice_design"] = await voice_design_case(client)
+                report[model]["sample_cancellation"] = await sample_cancellation_case(client)
             print(json.dumps({model: report[model]}, ensure_ascii=False), flush=True)
     finally:
         await client.close()
@@ -279,6 +392,10 @@ async def main(args):
     report["fields"].update(held_pcm_bytes="播放许可关闭时缓存字节", locked_chars_before_release="授权前锁定字数",
                             silent_before_release="授权前回调静音", audio_after_release="授权后回调顺序读取音频")
     report["fields"].update(mixed="是否混合设计", duration_ms="样音时长毫秒", target_asset_id="生成目标样音标识",
+                            sample_cancellation="完整样音取消与后续正式请求交接", late_audio_discarded="迟到样音未进入播放队列",
+                            sample_steps="样音实际制作步数", formal_steps="正式播报实际设置步数",
+                            sample_path="用于本机内容核对的原生样音路径，仅诊断报告包含",
+                            preview_endpoint="试音实际调用的原生接口",
                             formal_uses_target_sample="正式克隆使用已保存目标样音", formal_pcm_bytes="正式目标样音克隆返回的完整音频字节",
                             high_fidelity_rate="高保真旁路副本的原生采样率", high_fidelity_bytes="高保真旁路副本字节数")
     try:

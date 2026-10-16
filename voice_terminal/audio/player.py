@@ -613,7 +613,7 @@ class PcmPlayer:
                 stream.close()
         logger.info("audio.player_stopped")
 
-    def reclock(self, sample_rate: int) -> bool:
+    def reclock(self, sample_rate: int, *, on_rate_changed: Callable[[int], None] | None = None) -> bool:
         """reclock（原位置换设备时钟）：改变下行采样率但保留播放器实例。
 
         会话控制器、事务输出与语音管线在初始化时各自持有播放器引用，替换实例
@@ -631,7 +631,13 @@ class PcmPlayer:
         was_running = self._stream is not None
         if was_running:
             self.stop()
+        else:
+            self.clear()
         self.sample_rate = rate
+        from .wake_cue import make_wake_cue
+        self._wake_cue_pcm = make_wake_cue(rate, self.channels)
+        if on_rate_changed is not None:
+            on_rate_changed(rate)  # 在新设备回调开始前同步回声参考时钟。
         logger.info("audio.player_reclocked sample_rate=%d was_running=%s", rate, was_running)
         if was_running:
             self.start()

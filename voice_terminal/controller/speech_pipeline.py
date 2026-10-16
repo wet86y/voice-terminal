@@ -163,6 +163,11 @@ class SpeechPipeline:
             self.player.sample_rate * self.player.channels * 2
             if self.player is not None else 32000 * 2
         )
+
+        def reject_audio() -> None:
+            """异常生成立即停止待播队列，已经听到的正文不自动重播。"""
+            if self.player is not None:
+                self.player.stop_and_snapshot(playback_key)
         await synthesis_permission()
         if not self._valid(token) or not ws.committed:
             return ""
@@ -311,15 +316,21 @@ class SpeechPipeline:
                     ws.timings.setdefault("first_audio", time.monotonic())
                     ws.timings.setdefault("first_pcm", time.monotonic())
                     if self.player:
+                        if getattr(active_session, "audio_rejected", False):
+                            return
                         # Keep the native player bounded.  Audio held by the
                         # provider spool is included in audio_remaining_ms
                         # through the session's network receive counter.
                         while self.player.buffered_ms > max(1, self.options.tts_local_buffer_ms):
                             await asyncio.sleep(.02)
+                            if getattr(active_session, "audio_rejected", False):
+                                return
                             if not self._valid(token):
                                 return
                         await self._wait_for_playback_permission(ws, token)
                         if not self._valid(token):
+                            return
+                        if getattr(active_session, "audio_rejected", False):
                             return
                         self.player.enqueue(playback_key, pcm)
                     # Bidi sentence/request boundaries do not include the
@@ -548,6 +559,8 @@ class SpeechPipeline:
                             return
                         sync_turn_timings()
                         session = self._new_tts_session(ws)
+                        if hasattr(session, "audio_rejected_callback"):
+                            session.audio_rejected_callback = reject_audio
                         if hasattr(session, "first_audio_callback"):
                             session.first_audio_callback = lambda: ws.timings.setdefault("synthesis_first_audio", time.monotonic())
                         self._bind_tts_session(ws, session)
@@ -784,6 +797,11 @@ class SpeechPipeline:
                 tts_disabled = True
                 state.close()
                 progress_stop.set()
+                if getattr(exc, "discard_audio", False):
+                    reject_audio()
+                    self.state.current["tts_status"] = "DEGRADED"
+                    await self._detail("tts.status", provider=tts_backend, status="DEGRADED",
+                                       waiting_text="", audio_buffer_ms=0, error=str(exc))
                 logger.warning("controller.tts_degraded turn_id=%s error=%s", ws.turn_id, exc)
 
         async def send(segments):

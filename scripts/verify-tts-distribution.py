@@ -37,12 +37,16 @@ async def verify(install: Path, resources: Path) -> dict:
     for library in libraries.libraries.values():
         library.register_default((seed / "default.wav").read_bytes(), transcript)
     server = AudioCppTtsServer(install, config_path, local_model="voxcpm1")
-    client = AudioCppTtsClient(server, sample_rate=16000, voice_library=libraries,
+    client = AudioCppTtsClient(server, voice_library=libraries,
                               active_voice_provider=lambda model: libraries.for_model(model).active_selection,
                               gpu_max_performance=False)
     report = {"models": [], "fields": {"models": "按顺序实际加载和合成的模型记录", "model": "本地模型",
+              "repeated_generation": "二代模型相同正文复用计算图的真实回归",
               "pcm_bytes": "完整原始音频字节数", "completed_segments": "完整正文块回执数", "elapsed_ms": "加载与合成总毫秒",
               "cancel_handoff": "实际取消并确认原生执行锁释放后发起新请求的记录"}}
+    spec = importlib.util.spec_from_file_location("tts_verification", ROOT / "scripts/verify-tts-integration.py")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
     try:
         for index, model in enumerate(("voxcpm1", "voxcpm2", "voxcpm1")):
             started = time.perf_counter()
@@ -60,16 +64,15 @@ async def verify(install: Path, resources: Path) -> dict:
                 with wave.open(str(install / f"sample-{index}-{model}.wav"), "wb") as output:
                     output.setnchannels(1)
                     output.setsampwidth(2)
-                    output.setframerate(16000)
+                    output.setframerate(client.sample_rate)
                     output.writeframes(pcm)
                 report["models"].append({"model": model, "pcm_bytes": len(pcm), "completed_segments": session.completed_segments,
                                          "elapsed_ms": round((time.perf_counter() - started) * 1000, 2)})
                 print(json.dumps(report["models"][-1], ensure_ascii=False), flush=True)
             finally:
                 await session.close()
-        spec = importlib.util.spec_from_file_location("tts_verification", ROOT / "scripts/verify-tts-integration.py")
-        helper = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(helper)
+            if model == "voxcpm2":
+                report["repeated_generation"] = await helper.repeated_generation_case(client)
         report["cancel_handoff"] = await helper.cancellation_case(client, before_audio=False)
         print(json.dumps(report["cancel_handoff"], ensure_ascii=False), flush=True)
         return report

@@ -5,6 +5,7 @@ import pytest
 from tests.test_tts_voices import _wav_bytes
 from voice_terminal.tts.voices import ModelVoiceLibraries
 from voice_terminal.server.tts_voice_runtime import TtsVoiceOperationManager
+from unittest.mock import AsyncMock
 
 
 @pytest.mark.parametrize("description,has_source", [
@@ -45,14 +46,20 @@ def test_preview_modes_can_save_and_reload_with_optional_source_and_transcript(t
         }, " \n目标样音正文。  ")
         await manager._items[operation["operation_id"]].task
         result = manager.get(operation["operation_id"])
+        if not description and not transcript.strip():
+            assert result["state"] == "failed" and "准确转写" in result["error"]
+            assert not snapshots
+            return
         assert result["state"] == "succeeded", result["error"]
         candidate = result["result"]["voice"]  # candidate（试音后可保存的音色候选）。
+        assert candidate["inference_steps"] == 30
         saved = library.create_voice(candidate)
         restored = ModelVoiceLibraries(tmp_path).for_model("voxcpm2")
         voice = restored.get_voice(saved["id"])
         snapshot = restored.resolve("voxcpm2", {"voice_id": saved["id"], "revision": 1})
         assert snapshots[0].reference_path == (library.asset_path(source["asset_id"]) if source else None)
         assert snapshots[0].style_description == description
+        assert snapshots[0].reference_text == ("" if description else transcript.strip())
         assert voice["source"] == ("design" if description else "import")
         assert voice["source_reference_text"] == transcript.strip()
         assert voice["reference_text"] == ("目标样音正文。" if description else transcript.strip())
@@ -111,4 +118,29 @@ def test_cancelled_voice_operation_cannot_publish_late_result(tmp_path):
         result = manager.get(operation["operation_id"])
         assert result["state"] == "cancelled" and result["result"] is None
         assert not manager.busy
+    asyncio.run(scenario())
+
+
+def test_sample_collection_fixes_30_steps_without_changing_formal_settings(tmp_path):
+    async def scenario():
+        library = ModelVoiceLibraries(tmp_path)
+        snapshot = library.for_model("voxcpm2").resolve_design("自然温和")
+        captured = []
+        class Session:
+            start = AsyncMock()
+            send_text = AsyncMock()
+            finish = AsyncMock()
+            close = AsyncMock()
+            cancel = AsyncMock()
+            async def audio_chunks(self):
+                yield b"\x01\x00" * 16000
+        def session(**kwargs):
+            captured.append(kwargs)
+            return Session()
+        client = SimpleNamespace(session=session, sample_rate=16000,
+                                 inference_steps_by_model={"voxcpm2": 17})
+        manager = TtsVoiceOperationManager(SimpleNamespace(voice_library=library))
+        pcm, _ = await manager._collect_speech(SimpleNamespace(id="sample-test", session=None), client, snapshot, "测试正文。")
+        assert pcm and captured[0]["inference_steps"] == 30 and captured[0]["preview"] is True
+        assert client.inference_steps_by_model["voxcpm2"] == 17
     asyncio.run(scenario())

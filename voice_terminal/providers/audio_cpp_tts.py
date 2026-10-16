@@ -106,6 +106,18 @@ class AudioCppTtsError(RuntimeError):
     """本地 audio.cpp（原生音频推理框架）TTS（文本转语音）错误。"""
 
 
+class AudioCppDegenerateError(AudioCppTtsError):
+    """AudioCppDegenerateError（异常生成）：停止剩余播放，禁止整句自动重播。"""
+
+    discard_audio = True  # discard_audio（丢弃本事务尚未播放的音频）。
+
+
+def _generation_budget_ms(text: str) -> int:
+    """生成时长预算：保留短句停顿余量，按实际正文限制异常长输出。"""
+    units = sum(char.isalnum() for char in text)
+    return max(4000, units * 500 + 1000)
+
+
 class AudioCppTtsServer:
     """启动和管理本机 audio.cpp（原生音频推理框架）TTS 服务。"""
 
@@ -200,6 +212,16 @@ class AudioCppTtsServer:
     def native_sample_rate(self) -> int:
         """native_sample_rate（所选模型输出的原生采样率）。"""
         return int(_MODEL_CATALOG[self.local_model]["native_sample_rate"])
+
+    @property
+    def supports_reference_prompt(self) -> bool:
+        """supports_reference_prompt（参考音频与转写克隆能力）：由实际运行程序声明。"""
+        return bool(getattr(self, "capabilities", {}).get("reference_prompt", False))
+
+    @property
+    def supports_full_decode(self) -> bool:
+        """supports_full_decode（完整解码能力）：防止旧运行程序静默忽略样音配方。"""
+        return bool(getattr(self, "capabilities", {}).get("full_decode", False))
 
     @classmethod
     def write_runtime_config(cls, runtime_root: Path, config_path: Path) -> None:
@@ -992,6 +1014,8 @@ class AudioCppTtsSession:
         self._allow_retry = False
         self._buffered_bytes = 0  # _buffered_bytes（尚未由播放器读取的音频字节）。
         self.first_audio_callback = None  # first_audio_callback（合成首音就绪通知钩子）。
+        self.audio_rejected_callback = None  # audio_rejected_callback（异常音频立即停播钩子）。
+        self.audio_rejected = False  # audio_rejected（本事务已经判废，不再接收后续正文）。
         self.request_metrics: list[dict[str, float | int | str | bool | None]] = []
         self.received_bytes = 0
         self.completed_segments = 0
@@ -1054,6 +1078,8 @@ class AudioCppTtsSession:
             self.client._real_waiters -= 1
 
     async def _send_with_fallback(self, text: str) -> None:
+        if self._error is not None:
+            raise self._error
         warm = self.client._warm_task
         if not self._is_prewarm and warm is not None and warm is not asyncio.current_task():
             warm.cancel()
@@ -1062,6 +1088,9 @@ class AudioCppTtsSession:
         try:
             await self._send_text_once(text)
         except Exception as exc:
+            if isinstance(exc, AudioCppDegenerateError):
+                await self._release_context()
+                raise
             if not self._allow_retry or self._request_had_audio:
                 raise
             logger.warning(
@@ -1092,6 +1121,13 @@ class AudioCppTtsSession:
             "options": {"retry_badcase": False, **self._request_options},
         }
         body["options"]["num_inference_steps"] = self._inference_steps
+        budget_ms = _generation_budget_ms(text)
+        # max_tokens（原生生成预算）先限制计算量；时长判废独立按实际 PCM 检查，
+        # 不假设不同代模型的令牌一定对应同样的音频时长。
+        body["options"].setdefault("max_tokens", min(
+            4096 if self.client.local_model == "voxcpm2" else 1024,
+            max(32, sum(char.isalnum() for char in text) * 16 + 32),
+        ))
         voice = self.voice_snapshot
         if voice is None:
             raise self._reject("voice", "尚未配置可用音色，请先导入或创建音色并启用。")
@@ -1104,12 +1140,15 @@ class AudioCppTtsSession:
             if not voice.reference_path:
                 raise self._reject("voice", "VoxCPM2（第二代本地语音模型）参考音频不可用。")
             body["voice_ref"] = str(voice.reference_path.resolve())
-            # reference_text（参考转写）：原生把它解析成 prompt_text，与参考音频一起
-            # 构成官方最高相似度的 reference+continuation 配方。此前二代从不发送它，
-            # 正式播报只走 isolated 参考通道（实测相似度 0.6381，带转写 0.8557）。
-            # 转写必须与参考音频内容一致，不匹配会引入额外内容甚至拉长输出。
+            if not self._is_preview and not voice.reference_text.strip():
+                raise self._reject("voice", "请先校对并保存参考音频的准确转写，再使用高保真克隆播报。")
+            # prompt_audio（续写提示音频）与 voice_ref（隔离音色参考）同时使用相同素材。
             if voice.reference_text.strip():
                 body["reference_text"] = voice.reference_text
+                if not self._is_preview:
+                    if not getattr(self.client.server, "supports_reference_prompt", True):
+                        raise self._reject("runtime", "本地语音运行程序尚不支持高保真流式克隆，请更新本地语音运行组件后重试。")
+                    body["prompt_audio"] = body["voice_ref"]
         self._request_had_audio = False
         if self._continuation_enabled:
             body["continuation_id"] = self._continuation_id
@@ -1119,6 +1158,9 @@ class AudioCppTtsSession:
         saw_audio_done = False
         saw_done = False
         stage = "submit"
+        preview_recipe = self._is_preview and voice.model == "voxcpm2"
+        if preview_recipe and not getattr(self.client.server, "supports_full_decode", True):
+            raise self._reject("runtime", "本地语音运行程序尚不支持样音完整解码，请更新本地语音运行组件后重试。")
         logger.info(
             "audio_cpp_tts.request_start turn=%s speech=%s session=%s segment=%d chars=%d "
             "continuation=%s steps=%s text_digest=%s%s",
@@ -1132,15 +1174,37 @@ class AudioCppTtsSession:
                 http = self.client._request_client()
                 self._native_request_submitted = True
                 stage = "stream"
+                request_body = body
+                path = "/v1/audio/speech"
+                if preview_recipe:
+                    path = "/v1/tasks/run"
+                    options = {**body["options"], "voxcpm2.full_decode": True}
+                    request_body = {
+                        "model": self.model_id, "name": "tts",
+                        "request": {
+                            "text": body["input"],
+                            "options": {key: (str(value).lower() if isinstance(value, bool) else str(value))
+                                        for key, value in options.items()},
+                        },
+                    }
+                    if voice.reference_path is not None:
+                        request_body["request"]["voice_ref"] = str(voice.reference_path.resolve())
+                        # 带设计描述的混合创作使用隔离音色通道，不能叠加续写提示。
+                        if voice.reference_text.strip() and not voice.style_description.strip():
+                            request_body["request"].update(
+                                reference_text=voice.reference_text,
+                                audio_base64=base64.b64encode(
+                                    await asyncio.to_thread(voice.reference_path.read_bytes)).decode("ascii"))
                 async with http.stream(
                     "POST",
-                    f"{self.client.base_url}/v1/audio/speech",
-                    json=body,
+                    f"{self.client.base_url}{path}",
+                    json=request_body,
                     headers={"Accept": "text/event-stream"},
                 ) as response:
                     self._active_response = response
                     response.raise_for_status()
-                    async for line in response.aiter_lines():
+                    lines = self._preview_lines(response) if preview_recipe else response.aiter_lines()
+                    async for line in lines:
                         if self._cancelled:
                             break
                         if not line.startswith("data:"):
@@ -1171,6 +1235,10 @@ class AudioCppTtsSession:
                                 if first_audio_at is None:
                                     first_audio_at = time.perf_counter()
                                 received_for_request += len(pcm)
+                                audio_ms = received_for_request * 1000 / (self.client.native_sample_rate * 2)
+                                if not self._is_prewarm and audio_ms > budget_ms:
+                                    raise AudioCppDegenerateError(
+                                        f"本地语音生成异常：音频超过正文时长预算（{budget_ms} 毫秒），已停止播报。")
                                 output_pcm = self._resampler.push(pcm) if self._resampler is not None else pcm
                                 if output_pcm:
                                     output_for_request += len(output_pcm)
@@ -1232,6 +1300,16 @@ class AudioCppTtsSession:
                 "request_lock_wait_ms": (request_sent_at - request_started_at) * 1000,  # 请求互斥锁等待毫秒。
                 "http_first_audio_ms": ((first_audio_at - request_sent_at) * 1000
                                         if first_audio_at is not None else None),  # 网络提交至首个音频块毫秒。
+                "sample_rate": self.client.sample_rate,  # 下行采样率。
+                "native_sample_rate": self.client.native_sample_rate,  # 原生采样率。
+                "voice_id": voice.voice_id,  # 音色标识。
+                "continuation_id": self._continuation_id if self._context_requested else None,  # 续接标识。
+                "generation_budget_ms": budget_ms,  # 生成时长预算。
+                "endpoint": path,  # 本次实际合成入口。
+                "reference_recipe": ("reference_prompt" if voice.reference_path and voice.reference_text.strip()
+                                     else "reference_only" if voice.reference_path else "voice_design"),  # 实际参考配方。
+                "full_decode": preview_recipe,  # 是否在生成结束后完整解码样音。
+                "engine_audio_duration_ms": response.headers.get("X-AudioCPP-Audio-Duration-Ms"),  # 原生声明时长。
             }
             self.request_metrics.append(metrics)
             self.client._last_success_at = time.monotonic()
@@ -1239,11 +1317,15 @@ class AudioCppTtsSession:
                 "audio_cpp_tts.request_complete turn=%s speech=%s session=%s local_model=%s model_id=%s chars=%d "
                 "pcm_bytes=%d native_pcm_bytes=%d ttfb_ms=%.1f request_lock_wait_ms=%.1f "
                 "http_first_audio_ms=%.1f total_ms=%.1f audio_ms=%.1f rtf=%.3f "
-                "continuation_enabled=%s segment_index=%d num_inference_steps=%s text_digest=%s%s",
+                "continuation_enabled=%s segment_index=%d num_inference_steps=%s sample_rate=%d "
+                "native_sample_rate=%d voice_id=%s continuation_id=%s endpoint=%s budget_ms=%d "
+                "engine_audio_duration_ms=%s text_digest=%s%s",
                 *self._tts_fields(), self.client.local_model, self.client.model_id, len(text),
                 output_for_request, received_for_request, ttfb_ms or 0.0, metrics["request_lock_wait_ms"],
                 metrics["http_first_audio_ms"] or 0.0, total_ms, audio_ms, rtf or 0.0,
                 self._continuation_enabled, self.completed_segments - 1, metrics["num_inference_steps"],
+                self.client.sample_rate, self.client.native_sample_rate, voice.voice_id,
+                metrics["continuation_id"], path, budget_ms, metrics["engine_audio_duration_ms"],
                 text_digest(text), text_preview_suffix(text),
             )
         except asyncio.CancelledError:
@@ -1259,8 +1341,29 @@ class AudioCppTtsSession:
                 await self._audio.put(error)
             raise
         except BaseException as exc:
+            if isinstance(exc, AudioCppDegenerateError):
+                self.audio_rejected = True
+                self._error = exc
+                self.client._warmed = False
+                # 丢弃提前合成但尚未交给播放器的数据，不能把错误排在坏音频后面。
+                while not self._audio.empty():
+                    self._audio.get_nowait()
+                self._buffered_bytes = 0
+                self._segment_available.set()
+                callback = self.audio_rejected_callback
+                if callable(callback):
+                    try:
+                        callback()
+                    except Exception:
+                        logger.exception("audio_cpp_tts.reject_playback_failed")
+                logger.warning(
+                    "audio_cpp_tts.degenerate_segment turn=%s speech=%s session=%s chars=%d "
+                    "native_pcm_bytes=%d budget_ms=%d sample_rate=%d",
+                    *self._tts_fields(), len(text), received_for_request, budget_ms, self.client.native_sample_rate,
+                )
             # 失败原因必须落盘：此前只把异常塞进内部队列，日志里没有任何痕迹。
-            retry_pending = bool(self._allow_retry and not self._request_had_audio)
+            retry_pending = bool(self._allow_retry and not self._request_had_audio
+                                 and not self.audio_rejected)
             logger.log(
                 logging.INFO if retry_pending else logging.WARNING,
                 "audio_cpp_tts.request_failed turn=%s speech=%s session=%s segment=%d chars=%d stage=%s "
@@ -1278,6 +1381,45 @@ class AudioCppTtsSession:
         finally:
             self._active_response = None
             self._send_task = None
+
+    async def _preview_lines(self, response: httpx.Response) -> AsyncIterator[str]:
+        """把任务接口的完整 WAV（波形音频）接入既有回执、取消与音频收集流程。"""
+        import io
+        import soundfile as sf
+
+        payload = bytearray()
+        async for chunk in response.aiter_bytes():
+            payload.extend(chunk)
+            if len(payload) > 32 * 1024 * 1024:
+                raise AudioCppTtsError("试音响应超过 32 MiB（二进制兆字节）。")
+        result = json.loads(payload)
+        encoded = None
+        if isinstance(result, dict):
+            candidates = [result.get(key) for key in ("audio", "audio_base64", "audio_output")]
+            named = result.get("named_audio_outputs", [])
+            if isinstance(named, list):
+                candidates.extend(named)
+            for candidate in candidates:
+                if isinstance(candidate, dict):
+                    candidate = next((candidate[key] for key in ("data", "base64", "audio")
+                                      if isinstance(candidate.get(key), str)), None)
+                if isinstance(candidate, str) and candidate:
+                    encoded = candidate
+                    break
+        if encoded is None:
+            raise AudioCppTtsError("原生试音任务没有返回 WAV（波形音频）数据。")
+        try:
+            wav = base64.b64decode(encoded, validate=True)
+            samples, rate = sf.read(io.BytesIO(wav), dtype="int16", always_2d=True)
+        except (ValueError, TypeError, sf.LibsndfileError) as exc:
+            raise AudioCppTtsError("原生试音任务返回的音频无效。") from exc
+        if rate != self.client.native_sample_rate or samples.shape[1] != 1:
+            raise AudioCppTtsError("原生试音音频必须使用模型原生采样率和单声道。")
+        pcm = samples[:, 0].astype("<i2", copy=False).tobytes()
+        # 完整任务结果已经在手，判废必须早于向收集器交付任何样音。
+        yield "data: " + json.dumps({"type": "speech.audio.delta", "audio": base64.b64encode(pcm).decode("ascii")})
+        yield 'data: {"type": "speech.audio.done"}'
+        yield "data: [DONE]"
 
     async def finish(self) -> None:
         if self._finished:
@@ -1376,15 +1518,27 @@ class AudioCppTtsSession:
         await self._audio.put(pcm)
 
     async def _release_context(self) -> None:
-        needs_handoff = (self._cancelled and self._native_request_submitted
+        needs_handoff = ((self._cancelled or self.audio_rejected) and self._native_request_submitted
                          and isinstance(self.client.server, AudioCppTtsServer))
         if not self._context_requested and not needs_handoff:
             return
         try:
-            response = await self.client._request_client().post(
-                f"{self.client.base_url}/v1/audio/speech/contexts/release",
-                json={"model": self.model_id, "continuation_id": self._continuation_id}, timeout=2.0,
-            )
+            deadline = time.monotonic() + self.client.timeout_seconds
+            while True:
+                response = await self.client._request_client().post(
+                    f"{self.client.base_url}/v1/audio/speech/contexts/release",
+                    json={"model": self.model_id, "continuation_id": self._continuation_id},
+                    timeout=3.0 if self._is_preview else 2.0,
+                )
+                # 非流式样音仍计算时，原生释放接口等锁两秒后返回 server_busy（服务忙）。
+                # 保留音色任务占用并重试交接，不把该响应当作已经释放。
+                busy = False
+                if response.status_code == 503:
+                    with contextlib.suppress(ValueError, AttributeError):
+                        busy = response.json().get("error", {}).get("type") == "server_busy"
+                if not (self._is_preview and busy and time.monotonic() < deadline):
+                    break
+                await asyncio.sleep(.1)
             response.raise_for_status()
             self.context_release_confirmed = response.json().get("released") is True
             if self.context_release_confirmed:

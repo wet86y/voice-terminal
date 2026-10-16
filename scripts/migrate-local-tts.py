@@ -9,8 +9,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from voice_terminal.tts.voices import ModelVoiceLibraries
-NATIVE_REVISION = "d0978e7994b442da75d50b0614715b977a9b8acd"  # 已验证原生框架修订。
-CUDA_SERVER_SHA256 = "140d0df3c66610f754707a6d5103ddde757fcc1a9576810d10f34d3d3a11ffc4"  # 已验证的取消与续接运行程序摘要。
+NATIVE_REVISION = "b4459b3bfa8d6cf4c579cc264dd3f4dfb57dd8ec"  # 已验证原生框架修订。
+CUDA_SERVER_SHA256 = "4082389c40c0208dbafe4468370c30e0be5057e729b7188c82a784a2d97c2fcb"  # 取消、续接及高保真完整配方的运行程序摘要。
 
 
 def digest(path):

@@ -44,7 +44,7 @@ describe('本地音色卡片', () => {
     view.wrapper.unmount()
   })
 
-  it('设计必须试音后保存，修改正文或步数使候选失效', async () => {
+  it('设计样音固定30步，正式步数不使候选失效，修改制作正文仍须重新生成', async () => {
     const view = harness(); await flushPromises()
     await button(view.wrapper, '＋ 添加音色').trigger('click')
     const card = view.wrapper.findAll('article').at(-1)!
@@ -55,9 +55,12 @@ describe('本地音色卡片', () => {
     await flushPromises()
     expect(button(card as unknown as ReturnType<typeof mount>, '保存').attributes('disabled')).toBeUndefined()
     await view.wrapper.setProps({ steps: 21 })
-    expect(button(card as unknown as ReturnType<typeof mount>, '保存').attributes('disabled')).toBeDefined()
-    await button(card as unknown as ReturnType<typeof mount>, '试音').trigger('click')
-    await card.findAll('textarea').at(-1)!.setValue('新的生成正文')
+    expect(button(card as unknown as ReturnType<typeof mount>, '保存').attributes('disabled')).toBeUndefined()
+    const draft = Object.values(view.state.models.voxcpm2.drafts).find(item => !item.id)!
+    expect(draft.candidate?.inference_steps).toBe(30)
+    await card.find('textarea[aria-label="目标样音转写"]').setValue('按实际发音校对的转写。')
+    expect(button(card as unknown as ReturnType<typeof mount>, '保存').attributes('disabled')).toBeUndefined()
+    await card.find('.voice-footer textarea').setValue('新的生成正文')
     expect(button(card as unknown as ReturnType<typeof mount>, '保存').attributes('disabled')).toBeDefined()
     view.wrapper.unmount()
   })
@@ -73,11 +76,11 @@ describe('本地音色卡片', () => {
       ttsVoices: vi.fn(async () => ({ voices })),
       uploadTtsAsset: vi.fn().mockResolvedValue({ asset: { asset_id: 'source', duration_ms: 5680 } }),
       ttsAssetAudioUrl: vi.fn().mockReturnValue('http://localhost/reference.wav'),
-      startTtsTranscribe: vi.fn().mockResolvedValue({ operation_id: 'transcribe', state: 'succeeded', result: { text: '' } }),
+      startTtsTranscribe: vi.fn().mockResolvedValue({ operation_id: 'transcribe', state: 'succeeded', result: { text: '参考音频的准确转写。' } }),
       startTtsPreview: vi.fn(async (_model, voice, text) => ({
         operation_id: 'preview', state: 'succeeded', result: { voice: {
           ...voice, source: 'design', reference_asset_id: 'target', reference_text: text,
-          design_text: text, inference_steps: 20,
+          design_text: text, inference_steps: 30, generation_recipe: 'voxcpm2-full-decode-v2',
         } },
       })),
       createTtsVoice: vi.fn(async (_model, payload) => {

@@ -160,10 +160,11 @@ def test_copy_can_share_an_immutable_asset_and_keeps_it_after_source_delete(tmp_
 def test_model_compatibility_and_design_snapshot_have_no_reference_audio(tmp_path: Path):
     library = VoiceLibrary(tmp_path / "voices")
     asset, voice = _create_voice(library, text="")
-    assert library.resolve("voxcpm2", {"voice_id": voice["id"], "revision": 1}).reference_path
-    with pytest.raises(VoiceLibraryError, match="需要先填写参考音频转写"):
-        library.resolve("voxcpm1", {"voice_id": voice["id"], "revision": 1})
+    for model in ("voxcpm1", "voxcpm2"):
+        with pytest.raises(VoiceLibraryError, match="准确转写"):
+            library.resolve(model, {"voice_id": voice["id"], "revision": 1})
     assert library.list_voices()[0]["compatibility"]["voxcpm1"]["ready"] is False
+    assert library.list_voices()[0]["compatibility"]["voxcpm2"]["ready"] is False
 
     designed = library.resolve_design("温暖、自然，语速适中")
     assert designed.model == "voxcpm2"
