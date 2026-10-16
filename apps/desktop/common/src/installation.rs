@@ -139,17 +139,26 @@ fn prepare_speaker_migration(root:&Path,stage:&Path,release:&mut Value,progress:
     // models（模型目录）的总清单和本体组件登记一并换入，不能留下旧模型摘要记录。
     let old_manifest=crate::resources::load(&root.join("models/manifest.json")).unwrap_or(Value::Null);
     let known=old_manifest["files"].as_array().cloned().unwrap_or_default();
-    let mut files=vec![];
+    // 保留模型文件先按内容重算；旧总清单只是上次签发的快照，组件的安装收据才是权威记录。
+    // 变化必须能被所属组件的收据确认，才按实际内容重新登记；没有收据的文件仍按旧清单拒绝。
+    let mut retained:Vec<(String,u64,String)>=vec![];
     if root.join("models").is_dir(){for path in crate::resources::walk(&root.join("models"))?{
         let relative=path.strip_prefix(root).unwrap().to_string_lossy().replace('\\',"/");
         if relative=="models/manifest.json"||relative.starts_with(&format!("{LEGACY_MODEL}/"))||relative.starts_with(&format!("{CURRENT_MODEL}/")){continue;}
-        let name=relative.strip_prefix("models/").unwrap();let size=path.metadata().map_err(|e|e.to_string())?.len();
+        let name=relative.strip_prefix("models/").unwrap().to_owned();
+        let size=path.metadata().map_err(|e|e.to_string())?.len();
         let sha=file_hash(&path)?;
-        if known.iter().any(|row|row["path"]==name&&(row["size"].as_u64()!=Some(size)||row["sha256"]!=sha)){
-            return Err(format!("保留模型文件校验失败，旧声纹与档案保持不变：{name}"));
-        }
-        files.push(json!({"path":name,"size":size,"sha256":sha}));
+        retained.push((name,size,sha));
     }}
+    let actual:std::collections::HashMap<&str,(u64,&str)>=retained.iter().map(|(name,size,sha)|(name.as_str(),(*size,sha.as_str()))).collect();
+    let mut confirmed=HashSet::new();
+    for (name,size,sha) in &retained{
+        let changed=known.iter().any(|row|row["path"]==name.as_str()&&(row["size"].as_u64()!=Some(*size)||row["sha256"].as_str()!=Some(sha.as_str())));
+        if !changed{continue;}
+        let component=retained_component(&root,name).ok_or_else(||format!("保留模型文件校验失败，旧声纹与档案保持不变：{name}"))?;
+        if confirmed.insert(component.clone()){verify_component_receipt(&root,&component,&actual)?;progress(&format!("保留模型文件按安装收据重新核验：{component}"),1,1);}
+    }
+    let mut files=retained.into_iter().map(|(name,size,sha)|json!({"path":name,"size":size,"sha256":sha})).collect::<Vec<_>>();
     for path in crate::resources::walk(&candidate)?{files.push(json!({"path":format!("speaker/campplus-zh-cn-common/{}",path.strip_prefix(&candidate).unwrap().to_string_lossy().replace('\\',"/")),"size":path.metadata().map_err(|e|e.to_string())?.len(),"sha256":file_hash(&path)?}));}
     files.sort_by(|a,b|a["path"].as_str().cmp(&b["path"].as_str()));
     let build=format!("models-{:x}",Sha256::digest(serde_json::to_vec(&files).map_err(|e|e.to_string())?));
@@ -163,6 +172,34 @@ fn prepare_speaker_migration(root:&Path,stage:&Path,release:&mut Value,progress:
     progress("CAM++候选权重已校验，准备卸载旧声纹组件及档案",1,1);
     Ok(rows)
 }
+// retained_component（保留文件的所属组件）：从最深的目录向上找到带安装收据的组件目录。
+fn retained_component(root:&Path,name:&str)->Option<String>{
+    let parts:Vec<&str>=name.split('/').collect();
+    for index in (1..parts.len()).rev(){
+        let directory=parts[..index].join("/");
+        if root.join("models").join(directory.split('/').collect::<std::path::PathBuf>()).join("resource-install.json").is_file(){return Some(directory);}
+    }
+    None
+}
+// verify_component_receipt（按收据核验组件）：收据格式、内容摘要有效，且登记文件与磁盘内容一致。
+// 只有这样的组件才接受总清单之外的摘要变化；旧总清单摘要失效属于可修复的登记差异，不是文件损坏。
+fn verify_component_receipt(root:&Path,component:&str,actual:&std::collections::HashMap<&str,(u64,&str)>)->Result<(),String>{
+    let folder=root.join("models").join(component.split('/').collect::<std::path::PathBuf>());
+    let (_,_,records)=crate::resources::read_model_receipt(&folder).map_err(|error|format!("保留模型文件校验失败，旧声纹与档案保持不变：{component}（{error}）"))?;
+    for row in records{
+        let relative=row["path"].as_str().ok_or("安装收据记录缺少路径")?;
+        let full=format!("{component}/{relative}");
+        match actual.get(full.as_str()){
+            None if row["optional"]==true=>continue,
+            None=>return Err(format!("保留模型文件校验失败，旧声纹与档案保持不变：{full}（安装收据登记的文件缺失）")),
+            Some((size,sha))=>if *size!=row["size"].as_u64().unwrap_or(u64::MAX)||*sha!=row["sha256"].as_str().unwrap_or(""){
+                return Err(format!("保留模型文件校验失败，旧声纹与档案保持不变：{full}（与安装收据不符，需要重装该组件）"));
+            },
+        }
+    }
+    Ok(())
+}
+
 fn activate(root:&Path,stage:&Path,progress:&mut Progress)->Result<(),String>{
     // components（组件登记）属于工作区状态；固定本体仍来自同一程序包。
     let incoming=stage.join("app/release.json");let mut release=crate::resources::load(&incoming)?;
@@ -434,5 +471,40 @@ pub fn launch(root:&Path)->Result<u32,String>{
         let held=fs::OpenOptions::new().read(true).share_mode(0).open(root.join("data/speaker/probe.npy")).unwrap();
         assert!(run(&package_options("new",false,Some(false)),&root).is_err());drop(held);
         assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"old");assert!(root.join(LEGACY_MODEL).is_dir());assert_eq!(fs::read(root.join("data/speaker/templates/old.npy")).unwrap(),b"legacy-vector");assert!(!root.join(CURRENT_MODEL).exists());assert!(!root.join("tmp/update-transaction.json").exists());fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn retained_model_change_confirmed_by_component_receipt_is_reissued(){
+        let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);
+        let folder=root.join("models/audiocpp/runtime");fs::create_dir_all(&folder).unwrap();fs::write(folder.join("model.bin"),b"bbbb").unwrap();
+        let item=json!({"resource_id":"tts-audiocpp-runtime","version":"v1","destination":"audiocpp/runtime",
+            "files":[{"path":"model.bin","size_bytes":4,"sha256":file_hash(&folder.join("model.bin")).unwrap()}]});
+        crate::resources::write_model_receipt(&folder,&item,vec![json!({"path":"model.bin","size":4,"sha256":item["files"][0]["sha256"],"optional":false})]).unwrap();
+        // 旧总清单记录的是换版前的收据与权重摘要；收据登记的文件与磁盘一致，属于可修复的登记差异。
+        atomic_json(&root.join("models/manifest.json"),&json!({"files":[
+            {"path":"audiocpp/runtime/model.bin","size":4,"sha256":"0".repeat(64)},
+            {"path":"audiocpp/runtime/resource-install.json","size":1,"sha256":"1".repeat(64)}]})).unwrap();
+        run(&package_options("new",false,Some(false)),&root).unwrap();
+        assert!(!root.join(LEGACY_MODEL).exists());
+        let manifest=crate::resources::load(&root.join("models/manifest.json")).unwrap();
+        for path in ["audiocpp/runtime/model.bin","audiocpp/runtime/resource-install.json"]{
+            let record=manifest["files"].as_array().unwrap().iter().find(|row|row["path"]==path).unwrap();
+            assert_eq!(record["sha256"],json!(file_hash(&root.join("models").join(path)).unwrap()));
+        }
+        workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn retained_model_change_without_matching_receipt_still_aborts(){
+        let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);
+        let folder=root.join("models/audiocpp/runtime");fs::create_dir_all(&folder).unwrap();fs::write(folder.join("model.bin"),b"bbbb").unwrap();
+        let changed=file_hash(&folder.join("model.bin")).unwrap();
+        // 收据登记的是同长度但不同的内容：同尺寸损坏仍必须中止，不能按实际内容洗白。
+        let item=json!({"resource_id":"tts-audiocpp-runtime","version":"v1","destination":"audiocpp/runtime",
+            "files":[{"path":"model.bin","size_bytes":4,"sha256":"a".repeat(64)}]});
+        crate::resources::write_model_receipt(&folder,&item,vec![json!({"path":"model.bin","size":4,"sha256":"a".repeat(64),"optional":false})]).unwrap();
+        atomic_json(&root.join("models/manifest.json"),&json!({"files":[{"path":"audiocpp/runtime/model.bin","size":4,"sha256":"a".repeat(64)}]})).unwrap();
+        let error=run(&package_options("new",false,Some(false)),&root).unwrap_err();
+        assert!(error.contains("保留模型文件校验失败"),"{error}");
+        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"old");assert!(root.join(LEGACY_MODEL).is_dir());
+        assert_eq!(file_hash(&folder.join("model.bin")).unwrap(),changed);
+        fs::remove_dir_all(root).unwrap();
     }
 }

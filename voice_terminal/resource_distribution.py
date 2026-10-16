@@ -977,6 +977,11 @@ class ResourceManager:
     def _model_manifest_after_swap(self, spec: ResourceSpec, candidate: Path) -> dict[str, Any]:
         _, old_records = self._read_models_manifest()
         target_relative = f"{spec.destination}/"
+        # 上次签发清单的时间：在此之后被改写的内容不能沿用旧摘要（同长度改写也必须重算）。
+        try:
+            manifest_time = (self.models_root / "manifest.json").stat().st_mtime_ns
+        except OSError:
+            manifest_time = None
         records: list[dict[str, Any]] = []
         for file in sorted(path for path in self.models_root.rglob("*")
                            if path.is_file() and path != self.models_root / "manifest.json"):
@@ -986,11 +991,14 @@ class ResourceManager:
             if rel.startswith(target_relative):
                 continue
             prior = old_records.get(rel)
-            if isinstance(prior, dict) and prior.get("size") == file.stat().st_size and _SHA256.fullmatch(str(prior.get("sha256", ""))):
+            metadata = file.stat()
+            if (isinstance(prior, dict) and prior.get("size") == metadata.st_size
+                    and _SHA256.fullmatch(str(prior.get("sha256", "")))
+                    and manifest_time is not None and metadata.st_mtime_ns <= manifest_time):
                 digest = prior["sha256"]
             else:
                 digest = _hash_file(file)
-            records.append({"path": rel, "size": file.stat().st_size, "sha256": digest})
+            records.append({"path": rel, "size": metadata.st_size, "sha256": digest})
         for file in sorted(path for path in candidate.rglob("*") if path.is_file()):
             rel = f"{spec.destination}/{file.relative_to(candidate).as_posix()}"
             records.append({"path": rel, "size": file.stat().st_size, "sha256": _hash_file(file)})
