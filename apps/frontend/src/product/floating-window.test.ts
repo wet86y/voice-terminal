@@ -75,12 +75,12 @@ describe('悬浮窗动效扩展接口', () => {
     expect(wrapper.emitted('toggleSilence')).toHaveLength(1)
   })
 
-  it('悬浮主体长按四百毫秒才拖动，松手不触发静默', async () => {
+  it('悬浮主体越过移动阈值立即拖动，松手不触发静默', async () => {
     const wrapper = shell()
-    await fire(wrapper.get('.voice-orb').element, 'pointerdown', { button: 0, pointerId: 1 })
-    await vi.advanceTimersByTimeAsync(399)
+    await fire(wrapper.get('.voice-orb').element, 'pointerdown', { button: 0, pointerId: 1, clientX: 20, clientY: 20 })
+    await fire(wrapper.get('.voice-orb').element, 'pointermove', { pointerId: 1, clientX: 26, clientY: 20 })
     expect(wrapper.emitted('drag')).toBeUndefined()
-    await vi.advanceTimersByTimeAsync(1)
+    await fire(wrapper.get('.voice-orb').element, 'pointermove', { pointerId: 1, clientX: 27, clientY: 20 })
     expect(wrapper.emitted('drag')).toHaveLength(1)
     await fire(wrapper.get('button').element, 'pointerup', { button: 0, pointerId: 1 })
     await fire(wrapper.get('button').element, 'click', { button: 0, detail: 1 })
