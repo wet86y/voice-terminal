@@ -2,6 +2,20 @@
 
 产品版本沿用 `0.9.0`，以 `build`（构建编号）区分产物。开发和用户日常使用同一套正式程序；分发入口改为只负责展开及重装的独立安装器。架构与恢复规则见[统一正式程序与分发安装器](unified-product-installer.md)；此前统一安装验收见[统一程序验收记录](unified-product-acceptance.md)，本轮结果见下文及所链接报告。
 
+## 2026-10-16 最新代码更新本机程序与普通分发安装器
+
+基于主线最新应用代码构建并发布本机正式程序，随后复用同一统一程序包构建普通分发安装器。构建编号为 `product-fb8fa575811439f1`（正式程序构建编号），产品版本为 `0.9.0`（产品版本）。
+
+| 产物及中文说明 | 大小 | SHA-256（完整文件摘要） |
+| --- | ---: | --- |
+| [VoiceTerminal.exe（本机正式入口）](../.local/VoiceTerminal.exe) | 9,603,584 字节 | `a7f1779198740a30bbb97c7887dcb3e29ef36dece0f08934eea0d8f2599dcd2c` |
+| [program.zip（统一正式程序包）](../.local/build/program-package/program.zip)，337 个固定文件 | 101,190,785 字节 | `c896c1ecf19da4ce6eaf7b92659a6efa0802b1d5f810a808f200ceeee53ed130` |
+| [VoiceTerminalSetup.exe（普通分发安装器）](../.local/releases/installer/VoiceTerminalSetup.exe) | 110,362,624 字节 | `e4fe5483047da9f7e3ab6dcb2234d3a3219380ce57322bae6d2da87149872334` |
+
+本机正式入口的固定文件校验通过。程序包压缩校验通过，清单内 337 个文件逐项大小与摘要匹配；安装器 `build-stamp.json`（构建戳）和 `delivery.json`（交付记录）均绑定同一程序包摘要与构建编号，`qualification=false`（未开启隔离验收开关）。本次执行 `npm run desktop:publish`（构建并事务更新本机程序）及 `scripts/distribute-desktop.ps1 -SkipProductBuild`（复用刚发布的程序包构建安装器）。本机程序更新沿用既有事务流程，保留用户数据、模型、运行环境及组件登记。
+
+前端类型检查和生产界面构建、正式桌面宿主及入口的优化构建均随发布流程完成；本次没有重跑完整后端测试或真实语音会话。此前 TTS（语音合成）根因、修复和模型集成验收见[诊断与修复会话回顾](local-tts-session-review-20261016.md)。
+
 ## 2026-10-15 双图截图实时显示与尾巴续写
 
 实时 `conversation.append`（会话追加事件）现能识别 `screen_capture`（屏幕截图类型），与初始会话快照使用相同的消息解码；截图到达即显示全局与局部图片，后续发送状态更新原气泡。
