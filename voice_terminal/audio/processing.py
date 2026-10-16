@@ -49,7 +49,8 @@ class AudioPreprocessor:
         self._near_end_vad: Any = None
         self._input_remainder = bytearray()
         self._reverse_remainder = bytearray()
-        self._reverse_queue: queue.Queue[bytes | None] | None = None
+        self._reverse_format = (0, reverse_sample_rate)  # 反向流的代次与来源采样率。
+        self._reverse_queue: queue.Queue[tuple[tuple[int, int], bytes] | None] | None = None
         self._reverse_thread: threading.Thread | None = None
         self._reverse_stop = threading.Event()
         self._processor_lock = threading.RLock()
@@ -173,7 +174,7 @@ class AudioPreprocessor:
             return
         self._last_reverse_at = time.monotonic()
         try:
-            self._reverse_queue.put_nowait(bytes(pcm))
+            self._reverse_queue.put_nowait((self._reverse_format, bytes(pcm)))
         except queue.Full:
             self._degrade(RuntimeError("AEC reverse reference queue is full"))
 
@@ -181,14 +182,42 @@ class AudioPreprocessor:
         assert self._reverse_queue is not None
         while not self._reverse_stop.is_set():
             try:
-                pcm = self._reverse_queue.get(timeout=.1)
+                item = self._reverse_queue.get(timeout=.1)
             except queue.Empty:
                 continue
-            if pcm is None:
+            if item is None:
                 return
-            if self.reverse_sample_rate != self.sample_rate:
-                pcm = self._downsample_pcm(pcm, self.reverse_sample_rate, self.sample_rate)
-            self._process_reverse_frames(pcm)
+            format_stamp, pcm = item
+            with self._processor_lock:
+                # 已经出队、尚未处理的旧数据同样必须丢弃，不能按新采样率解释。
+                if format_stamp != self._reverse_format:
+                    continue
+                if format_stamp[1] != self.sample_rate:
+                    pcm = self._downsample_pcm(pcm, format_stamp[1], self.sample_rate)
+                self._process_reverse_frames(pcm)
+
+    def reclock_reverse(self, sample_rate: int) -> None:
+        """reclock_reverse（重设回声参考时钟）：在播放器停流期间清除旧代次。"""
+        rate = int(sample_rate)
+        if rate <= 0:
+            raise ValueError("回声参考采样率必须大于零。")
+        with self._processor_lock:
+            if rate == self.reverse_sample_rate:
+                return
+            self.reverse_sample_rate = rate
+            self._reverse_format = (self._reverse_format[0] + 1, rate)
+            self._reverse_remainder.clear()
+            self._last_reverse_at = None
+            if self._reverse_queue is not None:
+                while True:
+                    try:
+                        self._reverse_queue.get_nowait()
+                    except queue.Empty:
+                        break
+            reset = getattr(self._processor, "reset", None)
+            if callable(reset):
+                reset()
+        logger.info("audio.reverse_reclocked sample_rate=%d", rate)
 
     def _process_reverse_frames(self, pcm: bytes) -> None:
         with self._processor_lock:

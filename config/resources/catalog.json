@@ -495,7 +495,7 @@
       "kind": "model",
       "title": "audio.cpp（本地语音共用运行程序）",
       "destination": "audiocpp/runtime",
-      "version": "v0.9.1-d0978e7994b4",
+      "version": "v0.9.1-b4459b3bfa8d",
       "required": false,
       "source": {
         "platform": "github",
@@ -503,7 +503,7 @@
         "revision": "v0.9.1",
         "page_url": "https://github.com/0xShug0/audio.cpp/releases/tag/v0.9.1",
         "license_url": "https://github.com/0xShug0/audio.cpp/blob/v0.9.1/LICENSE",
-        "native_revision": "d0978e7994b442da75d50b0614715b977a9b8acd",
+        "native_revision": "b4459b3bfa8d6cf4c579cc264dd3f4dfb57dd8ec",
         "transfer": {
           "kind": "official_audiocpp_patch",
           "artifacts": [
@@ -524,8 +524,8 @@
           ],
           "patch": {
             "asset": "assets/audiocpp/voxcpm-patch.zip",
-            "size_bytes": 42668026,
-            "sha256": "c40ae3834df4d63e2c44b5208b5410ba93de3341f216edfd4f867dc1d673b615"
+            "size_bytes": 42681758,
+            "sha256": "1a3eee2ca98bce9b26293adabeafab83ba0d1653c85d13c5b7dc39407034730c"
           }
         }
       },
@@ -541,8 +541,8 @@
           "path": "cuda/audiocpp_server.exe",
           "source_path": "cuda/audiocpp_server.exe",
           "archive_id": "patch",
-          "size_bytes": 58553856,
-          "sha256": "140d0df3c66610f754707a6d5103ddde757fcc1a9576810d10f34d3d3a11ffc4"
+          "size_bytes": 58567680,
+          "sha256": "4082389c40c0208dbafe4468370c30e0be5057e729b7188c82a784a2d97c2fcb"
         },
         {
           "path": "cuda/cublas64_13.dll",
@@ -716,15 +716,15 @@
           "path": "model_specs/voxcpm1.json",
           "source_path": "model_specs/voxcpm1.json",
           "archive_id": "patch",
-          "size_bytes": 8160,
-          "sha256": "164c020faa5d074f382ba18765be04c4ea51eaa0ac78dd27ed067cab702ed43b"
+          "size_bytes": 7857,
+          "sha256": "f5c99693911c3e95f0778eb5dbe2bc24259b455b49167bfa8cc46e765653e602"
         },
         {
           "path": "model_specs/voxcpm2.json",
           "source_path": "model_specs/voxcpm2.json",
           "archive_id": "patch",
-          "size_bytes": 10878,
-          "sha256": "8e6cb8b44d5d5937c6234ce0975f0c9eebb89438e1a540d708b8044e9d86d5fa"
+          "size_bytes": 10692,
+          "sha256": "0b7536f0dfbdd9c634273c83fcb879c36fe2954e6f22da0f271b21828444e572"
         }
       ]
     },

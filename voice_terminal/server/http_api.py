@@ -705,7 +705,8 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
     @app.put("/api/v1/tts/voices/{model}/{voice_id}")
     async def update_tts_voice(model: str, voice_id: str, body: dict[str, Any]):
         try:
-            validate_tts_candidate_steps(model, body)
+            previous = tts_voice_library_or_503(model).get_voice(voice_id)
+            validate_tts_candidate_steps(model, body, previous=previous)
             expected = body.pop("expected_revision", None)
             voice = await asyncio.to_thread(tts_voice_library_or_503(model).update_voice, voice_id, expected, body)
             client = getattr(runtime.tts, "local", None)
@@ -716,10 +717,22 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    def validate_tts_candidate_steps(model, body):
-        """保存设计时核对当前推理参数，不能通过旧草稿绕过候选失效。"""
-        if body.get("source") == "design" and body.get("inference_steps", 20) != runtime.config.tts.inference_steps_by_model.get(model):
-            raise ValueError("推理步数已变化，请以当前参数重新试音后保存设计音色。")
+    def validate_tts_candidate_steps(model, body, *, previous=None):
+        """新样音绑定独立制作配方；旧存档允许改名、校对转写，正式步数不影响存档。"""
+        from ..tts.voices import VoiceLibrary, DESIGN_INFERENCE_STEPS, DESIGN_GENERATION_RECIPE
+        same_asset = previous is not None and body.get("reference_asset_id") == previous.get("reference_asset_id")
+        if body.get("source") != "design":
+            if not str(body.get("reference_text") or "").strip() and not (
+                same_asset and not previous.get("reference_text")
+            ):
+                raise ValueError("请填写参考音频的准确转写后保存克隆音色。")
+            return
+        if (same_asset and previous.get("source") == "design"
+                and VoiceLibrary.design_signature(body) == VoiceLibrary.design_signature(previous)):
+            return
+        if (body.get("inference_steps") != DESIGN_INFERENCE_STEPS
+                or body.get("generation_recipe") != DESIGN_GENERATION_RECIPE):
+            raise ValueError("请使用 30 步完整解码重新生成目标样音后保存。")
 
     @app.delete("/api/v1/tts/voices/{model}/{voice_id}")
     async def delete_tts_voice(model: str, voice_id: str):

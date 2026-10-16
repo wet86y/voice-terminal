@@ -1,0 +1,149 @@
+diff --git a/app/server/parallel_runtime.cpp b/app/server/parallel_runtime.cpp
+index 182f27c..eab192d 100644
+--- a/app/server/parallel_runtime.cpp
++++ b/app/server/parallel_runtime.cpp
+@@ -2336,6 +2336,20 @@ engine::runtime::TaskRequest ParallelServerState::build_speech_request(const Loa
+     if (const auto * value = body.find("reference_text")) {
+         request.options["reference_text"] = value->as_string();
+     }
++    // prompt_audio（续写提示音频）与 voice_ref（隔离音色参考）是两个独立通道。
++    if (const auto * value = body.find("prompt_audio")) {
++        const auto & path = value->as_string();
++        if (path.empty()) {
++            throw std::runtime_error("prompt_audio（续写提示音频路径）不能为空");
++        }
++        const auto * reference = body.find("voice_ref");
++        if (reference != nullptr && reference->is_string() &&
++            reference->as_string() == path && voice.speaker.has_value()) {
++            request.audio_input = voice.speaker->audio;
++        } else {
++            request.audio_input = minitts::cli::read_audio_buffer(resolve_path(request_base_, path));
++        }
++    }
+     const auto * speed = body.find("speed");
+     if (speed == nullptr) {
+         speed = body.find("speaking_rate");
+@@ -3921,6 +3935,10 @@ std::string ParallelServerState::models_json(bool include_session_options, bool
+             << ",\"max_parallel_slots\":" << (parallel_capacity ? std::to_string(parallel_capacity) : "null")
+             << ",\"loaded\":" << (model.loaded.load() ? "true" : "false")
+             << ",\"path\":" << json_quote(model.config.path.string());
++        // reference_prompt（提示音频克隆）、full_decode（完整解码）的接口能力。
++        out << ",\"capabilities\":{\"reference_prompt\":"
++            << (model.config.family == "voxcpm2" ? "true" : "false")
++            << ",\"full_decode\":" << (model.config.family == "voxcpm2" ? "true" : "false") << "}";
+         if (include_session_options) {
+             out << ",\"session_options\":" << options_json(model.config.session_options);
+         }
+diff --git a/app/server/runtime.cpp b/app/server/runtime.cpp
+index a7fdbb4..2be5171 100644
+--- a/app/server/runtime.cpp
++++ b/app/server/runtime.cpp
+@@ -2234,6 +2234,20 @@ engine::runtime::TaskRequest ServerState::build_speech_request(const LoadedModel
+     if (const auto * value = body.find("reference_text")) {
+         request.options["reference_text"] = value->as_string();
+     }
++    // prompt_audio（续写提示音频）与 voice_ref（隔离音色参考）是两个独立通道。
++    if (const auto * value = body.find("prompt_audio")) {
++        const auto & path = value->as_string();
++        if (path.empty()) {
++            throw std::runtime_error("prompt_audio（续写提示音频路径）不能为空");
++        }
++        const auto * reference = body.find("voice_ref");
++        if (reference != nullptr && reference->is_string() &&
++            reference->as_string() == path && voice.speaker.has_value()) {
++            request.audio_input = voice.speaker->audio;
++        } else {
++            request.audio_input = minitts::cli::read_audio_buffer(resolve_path(request_base_, path));
++        }
++    }
+     const auto * speed = body.find("speed");
+     if (speed == nullptr) {
+         speed = body.find("speaking_rate");
+@@ -3761,7 +3775,9 @@ std::string ServerState::models_json(bool include_session_options, bool include_
+             << ",\"loaded\":" << (model.loaded.load() ? "true" : "false")
+             << ",\"path\":" << json_quote(model.config.path.string());
+         out << ",\"capabilities\":{\"acoustic_continuation\":"
+-            << (model.acoustic_continuation.load() ? "true" : "false") << "}";
++            << (model.acoustic_continuation.load() ? "true" : "false")
++            << ",\"reference_prompt\":" << (model.config.family == "voxcpm2" ? "true" : "false")
++            << ",\"full_decode\":" << (model.config.family == "voxcpm2" ? "true" : "false") << "}";
+         if (include_session_options) {
+             out << ",\"session_options\":" << options_json(model.config.session_options);
+         }
+diff --git a/model_specs/voxcpm2.json b/model_specs/voxcpm2.json
+index 0ae3870..a0fbfb8 100644
+--- a/model_specs/voxcpm2.json
++++ b/model_specs/voxcpm2.json
+@@ -129,6 +129,13 @@
+         "description": "Transcript for continuation prompt audio, distinct from the base voice reference.",
+         "required": false
+       },
++      {
++        "name": "voxcpm2.full_decode",
++        "type": "bool",
++        "description": "完整解码：生成结束后统一解码音频，用于非流式高质量样音。",
++        "required": false,
++        "default": false
++      },
+       {
+         "name": "chunk_strategy",
+         "type": "enum",
+diff --git a/src/models/voxcpm2/minicpm.cpp b/src/models/voxcpm2/minicpm.cpp
+index fbd2a8a..cd8475c 100644
+--- a/src/models/voxcpm2/minicpm.cpp
++++ b/src/models/voxcpm2/minicpm.cpp
+@@ -611,6 +611,14 @@ public:
+                             input.text_mask.size() * sizeof(float));
+     ggml_backend_tensor_set(audio_mask_, input.audio_mask.data(), 0,
+                             input.audio_mask.size() * sizeof(float));
++    // positions（位置序号）的图内存可在最后一次使用后被后继节点覆盖；
++    // 即使形状不变并复用计算图，每次执行前也必须刷新它。
++    std::vector<int32_t> position_ids(static_cast<size_t>(input.steps));
++    for (int64_t i = 0; i < input.steps; ++i) {
++      position_ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
++    }
++    ggml_backend_tensor_set(positions_, position_ids.data(), 0,
++                            position_ids.size() * sizeof(int32_t));
+     engine::core::set_backend_threads(weights_->backend(), weights_->threads());
+     const ggml_status status =
+         engine::core::compute_backend_graph(weights_->backend(), graph_);
+@@ -844,12 +852,6 @@ private:
+       throw std::runtime_error(
+           "failed to allocate VoxCPM2 prompt prefill graph");
+     }
+-    std::vector<int32_t> position_ids(static_cast<size_t>(steps), 0);
+-    for (int64_t i = 0; i < steps; ++i) {
+-      position_ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+-    }
+-    ggml_backend_tensor_set(positions_, position_ids.data(), 0,
+-                            position_ids.size() * sizeof(int32_t));
+     sequence_steps_ = steps;
+   }
+ 
+diff --git a/src/models/voxcpm2/session.cpp b/src/models/voxcpm2/session.cpp
+index f4f0087..4ca4d6f 100644
+--- a/src/models/voxcpm2/session.cpp
++++ b/src/models/voxcpm2/session.cpp
+@@ -323,7 +323,9 @@ void VoxCPM2SessionBase::prepare_impl(
+ 
+ runtime::TaskResult VoxCPM2SessionBase::run_offline_request(const runtime::TaskRequest &request) {
+   require_prepared("VoxCPM2 run");
+-  if (task_.mode != runtime::RunMode::Offline) {
++  const auto full_decode = runtime::find_option(request.options, {"voxcpm2.full_decode"});
++  if (task_.mode != runtime::RunMode::Offline &&
++      !(full_decode && runtime::parse_bool_option(*full_decode, "voxcpm2.full_decode"))) {
+     throw std::runtime_error("VoxCPM2 run requires an offline session");
+   }
+   validate_request(request);
+@@ -429,6 +431,11 @@ VoxCPM2SessionBase::run_streaming_request(
+     throw std::runtime_error(
+         "VoxCPM2 run_streaming requires a streaming session");
+   }
++  // full_decode（完整解码）仅用于离线样音：生成结束后统一解码，不复用段间续接。
++  if (const auto value = runtime::find_option(request.options, {"voxcpm2.full_decode"});
++      value && runtime::parse_bool_option(*value, "voxcpm2.full_decode")) {
++    return run_offline_request(request);
++  }
+   validate_request(request);
+   auto release_runtime_memory = [this](VoxCPM2SessionBase *self) {
+     if (self != nullptr) {

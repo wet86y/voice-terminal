@@ -11,6 +11,7 @@ from voice_terminal.server.websocket import SessionRuntime, create_app
 from tests.test_tts_voices import _wav_bytes
 from voice_terminal.core.state import TerminalState
 from voice_terminal.tts.router import TtsBackendRouter
+from voice_terminal.audio.player import PcmPlayer
 
 
 def test_scoped_voice_api_and_settings_projection(tmp_path):
@@ -57,6 +58,20 @@ def test_scoped_voice_api_and_settings_projection(tmp_path):
                      "reference_text": "生成正文。", "design_text": "生成正文。", "design_description": "温柔女声", "inference_steps": 20}
             runtime.voice_library.for_model("voxcpm2").mark_design(target["asset_id"], stale)
             assert (await client.post("/api/v1/tts/voices/voxcpm2", json=stale)).status_code == 422
+            # 样音独立使用30步，调整正式步数仍可保存并单独校对目标转写。
+            candidate = {**stale, "name": "独立样音", "inference_steps": 30,
+                         "generation_recipe": "voxcpm2-full-decode-v2"}
+            runtime.voice_library.for_model("voxcpm2").mark_design(target["asset_id"], candidate)
+            assert (await client.put("/api/v1/product/settings/tts", json={"inference_steps_by_model": {"voxcpm2": 13}})).status_code == 200
+            created = await client.post("/api/v1/tts/voices/voxcpm2", json=candidate)
+            assert created.status_code == 200, created.text
+            saved = created.json()["voice"]
+            correction = {**saved, "reference_text": "生成时实际说出的正文。", "expected_revision": 1}
+            updated = await client.put("/api/v1/tts/voices/voxcpm2/" + saved["id"], json=correction)
+            assert updated.status_code == 200, updated.text
+            assert updated.json()["voice"]["reference_asset_id"] == target["asset_id"]
+            assert updated.json()["voice"]["reference_text"] == "生成时实际说出的正文。"
+            assert runtime.config.tts.inference_steps_by_model["voxcpm2"] == 13
     asyncio.run(scenario())
 
 
@@ -69,6 +84,29 @@ def test_asset_file_missing_returns_not_found(tmp_path):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime)), base_url="http://test") as client:
             response = await client.get(f"/api/v1/tts/assets/voxcpm2/{asset['asset_id']}/audio")
             assert response.status_code == 404
+    asyncio.run(scenario())
+
+
+def test_legacy_empty_transcript_can_be_corrected_without_replacing_clone_audio(tmp_path):
+    async def scenario():
+        runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "data")
+        library = runtime.voice_library.for_model("voxcpm2")
+        library.register_default(_wav_bytes(), "默认参考转写。")
+        asset = library.put_import(_wav_bytes(), "legacy.wav")
+        legacy = library.create_voice({"name": "旧音色", "source": "import", "reference_asset_id": asset["asset_id"], "reference_text": ""})
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(runtime)), base_url="http://test") as client:
+            path = "/api/v1/tts/voices/voxcpm2/" + legacy["id"]
+            renamed = await client.put(path, json={**legacy, "name": "旧音色改名", "expected_revision": 1})
+            assert renamed.status_code == 200
+            selection = {"voice_id": legacy["id"], "revision": 2}
+            assert (await client.put("/api/v1/tts/voices/voxcpm2/selection", json={"selection": selection})).status_code == 422
+            corrected = await client.put(path, json={**renamed.json()["voice"], "reference_text": "人工校对后的准确转写。", "expected_revision": 2})
+            assert corrected.status_code == 200
+            voice = corrected.json()["voice"]
+            assert voice["reference_asset_id"] == asset["asset_id"]
+            selection["revision"] = 3
+            assert (await client.put("/api/v1/tts/voices/voxcpm2/selection", json={"selection": selection})).status_code == 200
+            assert library.resolve("voxcpm2", selection).reference_text == "人工校对后的准确转写。"
     asyncio.run(scenario())
 
 
@@ -110,11 +148,12 @@ def test_queued_selection_keeps_last_target_and_respects_explicit_stop(tmp_path)
     asyncio.run(scenario())
 
 
-def test_backend_switch_preserves_player_clock_and_other_components(tmp_path):
+def test_backend_switch_preserves_player_instance_and_other_components(tmp_path):
     async def scenario():
         runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "data")
         old = runtime.tts = SimpleNamespace(shutdown=AsyncMock())
-        player = runtime.player = SimpleNamespace(buffered_ms=0)
+        player = runtime.player = PcmPlayer(sample_rate=32000, channels=1, output_device=None)
+        player.start = lambda: None
         vad = runtime.vad = object()
         runtime.close = AsyncMock()
         runtime.initialize = AsyncMock()
@@ -125,11 +164,11 @@ def test_backend_switch_preserves_player_clock_and_other_components(tmp_path):
         async with runtime._session_lock:
             await asyncio.wait_for(runtime.switch_tts_selection("voxcpm1", "voxcpm2"), 1)
         old.shutdown.assert_awaited_once()
-        assert runtime.config.tts.sample_rate == 32000
+        assert runtime.config.tts.sample_rate == player.sample_rate == 48000
         assert runtime.player is player and runtime.vad is vad
         async with runtime._session_lock:
             await runtime.switch_tts_selection("minimax", "voxcpm2")
-        assert runtime.config.tts.sample_rate == 32000
+        assert runtime.config.tts.sample_rate == player.sample_rate == 48000
         runtime.close.assert_not_awaited()
         runtime.initialize.assert_not_awaited()
     asyncio.run(scenario())

@@ -44,6 +44,17 @@ def _response(*events: str) -> httpx.Response:
     )
 
 
+def _wav_response(pcm: bytes) -> httpx.Response:
+    """_wav_response（完整样音响应）：模拟任务接口的原生率 WAV（波形音频）。"""
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(48000)
+        wav.writeframes(pcm)
+    return httpx.Response(200, json={"audio": base64.b64encode(output.getvalue()).decode("ascii")})
+
+
 def _fake_client(handler, *, native_sample_rate: int = 16000,
                  sample_rate: int | None = None) -> AudioCppTtsClient:
     local_model = "voxcpm1" if native_sample_rate == 16000 else "voxcpm2"
@@ -107,7 +118,7 @@ def test_sse_pcm_chunks_are_decoded_and_request_uses_streaming_endpoint():
             "reference_text": "测试参考音频对应文本",
             "response_format": "pcm",
             "stream_format": "sse",
-            "options": {"retry_badcase": False, "num_inference_steps": 10},
+            "options": {"retry_badcase": False, "num_inference_steps": 10, "max_tokens": 336},
         }
 
     asyncio.run(scenario())
@@ -244,7 +255,7 @@ def test_voxcpm2_ignores_legacy_emotions_and_formal_style_fields(emotion, instru
         client = _fake_client(handler, native_sample_rate=48000)
         client.resolve_voice = lambda selected, preview=False: ResolvedLocalTtsVoice(
             model="voxcpm2", native_model_id="voxcpm2-stream", voice_id="voice-id",
-            revision=3, reference_path=Path("voice2.wav").resolve(), reference_text="",
+            revision=3, reference_path=Path("voice2.wav").resolve(), reference_text="准确的参考转写。",
             style_description="语速适中", emotion=selected, is_preview=preview,
         )
         session = client.session(emotion=emotion)
@@ -258,7 +269,8 @@ def test_voxcpm2_ignores_legacy_emotions_and_formal_style_fields(emotion, instru
         assert payload["input"] == original
         assert payload["options"]["num_inference_steps"] == 20
         assert payload["voice_ref"] == str(Path("voice2.wav").resolve())
-        assert "reference_text" not in payload
+        assert payload["reference_text"] == "准确的参考转写。"
+        assert payload["prompt_audio"] == payload["voice_ref"]
         assert "voice" not in payload and "style" not in payload
         assert receipt.text_chars == len(original)
 
@@ -271,8 +283,7 @@ def test_voxcpm2_design_candidate_has_no_reference_and_preview_does_not_mark_for
 
         async def handler(request):
             requests.append(request)
-            return _response(_audio_event(b"\x02\x00" * 8),
-                             _event("speech.audio.done"), "data: [DONE]\n\n")
+            return _wav_response(b"\x02\x00" * 8)
 
         client = _fake_client(handler, native_sample_rate=48000)
         design = ResolvedLocalTtsVoice(
@@ -280,14 +291,16 @@ def test_voxcpm2_design_candidate_has_no_reference_and_preview_does_not_mark_for
             reference_path=None, reference_text="", style_description="沉稳自然",
             emotion=None, reference_mode="design", is_preview=True,
         )
-        session = client.session(voice_snapshot=design, preview=True)
+        session = client.session(voice_snapshot=design, preview=True, inference_steps=30)
         await session.start()
         await session.send_text("你好，这是没有参考音频的文字设计候选。")
         await session.finish()
         _ = [chunk async for chunk in session.audio_chunks()]
-        payload = json.loads(requests[0].content)
-        assert payload["input"] == "(沉稳自然)你好，这是没有参考音频的文字设计候选。"
-        assert payload["options"]["num_inference_steps"] == 20
+        assert requests[0].url.path == "/v1/tasks/run"
+        payload = json.loads(requests[0].content)["request"]
+        assert payload["text"] == "(沉稳自然)你好，这是没有参考音频的文字设计候选。"
+        assert payload["options"]["num_inference_steps"] == "30"
+        assert payload["options"]["voxcpm2.full_decode"] == "true"
         assert "continuation_id" not in payload
         assert "voice_ref" not in payload
         assert "reference_text" not in payload
@@ -310,7 +323,7 @@ def test_emotion_off_omits_dynamic_voxcpm2_instruction_and_invalid_labels_defaul
         client.emotion_mode = emotion_mode
         client.resolve_voice = lambda selected, preview=False: ResolvedLocalTtsVoice(
             model="voxcpm2", native_model_id="voxcpm2-stream", voice_id="voice-id",
-            revision=1, reference_path=Path("voice2.wav").resolve(), reference_text="",
+            revision=1, reference_path=Path("voice2.wav").resolve(), reference_text="准确的参考转写。",
             style_description="温暖自然", emotion=client.normalize_emotion(selected), is_preview=preview,
         )
         session = client.session(emotion=emotion)
@@ -406,31 +419,89 @@ def test_steps_hot_update_is_frozen_per_answer_and_new_answer_has_new_context():
         _ = [chunk async for chunk in second.audio_chunks()]
         await second.close()
         assert [body['options']['num_inference_steps'] for body in bodies] == [20, 20, 24]
+        assert all(body['prompt_audio'] == body['voice_ref'] for body in bodies)
+        assert all('voxcpm2.full_decode' not in body['options'] for body in bodies)
         assert bodies[0]['continuation_id'] == bodies[1]['continuation_id'] != bodies[2]['continuation_id']
         await client.close()
     asyncio.run(scenario())
 
 
-def test_combined_design_sends_source_audio_and_description_without_continuation():
+def test_old_native_runtime_cannot_silently_ignore_high_fidelity_recipe():
+    async def scenario():
+        bodies = []
+        async def handler(request):
+            bodies.append(request)
+            return _response()
+        client = _fake_client(handler, native_sample_rate=48000)
+        client.server.supports_reference_prompt = False
+        session = client.session()
+        await session.start()
+        with pytest.raises(AudioCppTtsError, match="更新本地语音运行组件"):
+            await session.send_text("必须使用准确参考转写。")
+        assert not bodies
+        await session.close()
+        await client.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("preview,error_type,expected_requests,confirmed", [
+    (True, "server_busy", 3, True), (False, "server_busy", 1, False),
+    (True, "insufficient_memory", 1, False),
+])
+def test_preview_waits_for_native_release_without_retrying_unrelated_errors(preview, error_type, expected_requests, confirmed):
+    async def scenario():
+        calls = []
+        async def handler(request):
+            calls.append(request.url.path)
+            if len(calls) < 3:
+                return httpx.Response(503, json={"error": {"type": error_type, "message": "测试忙碌"}})
+            return httpx.Response(200, json={"released": True})
+        client = _fake_client(handler, native_sample_rate=48000)
+        session = client.session(preview=preview)
+        session._context_requested = True
+        await session.cancel()
+        await session.close()
+        assert len(calls) == expected_requests
+        assert session.context_release_confirmed is confirmed
+        await client.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("description", ["温暖清楚", ""])
+def test_preview_separates_creative_reference_from_transcript_cloning(tmp_path, description):
     async def scenario():
         bodies = []
         async def handler(request):
             bodies.append(json.loads(request.content))
-            return _response(_audio_event(b'\x01\x00' * 9), _event('speech.audio.done'), 'data: [DONE]\n\n')
+            wav = io.BytesIO()
+            with wave.open(wav, "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(48000)
+                output.writeframes(b'\x01\x00' * 9)
+            return httpx.Response(200, json={"audio": base64.b64encode(wav.getvalue()).decode("ascii")})
         client = _fake_client(handler, native_sample_rate=48000)
         client.server.capabilities = {"acoustic_continuation": True}
-        voice = replace(client.resolve_voice(None), style_description='温暖清楚', is_preview=True)
+        reference = tmp_path / "reference.wav"
+        reference.write_bytes(b"reference-audio")
+        voice = replace(client.resolve_voice(None), reference_path=reference,
+                        style_description=description, is_preview=True)
         session = client.session(voice_snapshot=voice, preview=True)
         await session.start()
         await session.send_text('生成可控克隆的目标样音。')
         await session.finish()
         _ = [chunk async for chunk in session.audio_chunks()]
         await session.close()
-        assert bodies[0]['input'] == '(温暖清楚)生成可控克隆的目标样音。'
-        assert bodies[0]['voice_ref'] == str(voice.reference_path)
-        # 描述在独立文本通道，不引入续接上下文；参考转写随参考音频一起发。
-        assert 'continuation_id' not in bodies[0]
-        assert bodies[0]['reference_text'] == voice.reference_text
+        request = bodies[0]['request']
+        assert request['text'] == (f'({description})' if description else '') + '生成可控克隆的目标样音。'
+        assert request['voice_ref'] == str(voice.reference_path)
+        # 创作描述与音频续写提示互斥；纯克隆试音仍使用完整参考配方。
+        assert 'continuation_id' not in request
+        if description:
+            assert 'reference_text' not in request and 'audio_base64' not in request
+        else:
+            assert request['reference_text'] == voice.reference_text
+            assert base64.b64decode(request['audio_base64']) == reference.read_bytes()
         await client.close()
     asyncio.run(scenario())
 
@@ -936,15 +1007,15 @@ def test_voxcpm2_formal_clone_sends_reference_transcript():
         assert bodies[0]["voice_ref"] == str(voice.reference_path.resolve())
         assert bodies[0]["reference_text"] == voice.reference_text
 
-        # 没有转写的参考音色不能带上空字段，也不该报错。
+        assert bodies[0]["prompt_audio"] == bodies[0]["voice_ref"]
+        # 旧的空转写音色保留存档，但不能静默退回低保真播报。
         blank = replace(voice, reference_text="   ")
         session = client.session(voice_snapshot=blank)
         await session.start()
-        await session.send_text("第二句完整正文。")
-        await session.finish()
-        _ = [chunk async for chunk in session.audio_chunks()]
+        with pytest.raises(AudioCppTtsError, match="准确转写"):
+            await session.send_text("第二句完整正文。")
         await session.close()
-        assert "reference_text" not in bodies[1]
+        assert len(bodies) == 1
         await client.close()
 
     asyncio.run(scenario())
