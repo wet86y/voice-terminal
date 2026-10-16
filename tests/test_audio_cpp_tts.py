@@ -1011,3 +1011,49 @@ def test_router_exposes_playback_reserve_from_active_client():
     router.backend = "minimax"
     assert router.playback_startup_buffer_ms == 0
     assert not getattr(router, "playback_startup_buffer_ms", 0)
+
+
+def test_native_rate_multi_segment_streaming_keeps_transport_and_receipts():
+    """48 kHz 下行不得破坏流式 TTS：SSE 入口、分块投递、分段回执与续接全部保留。"""
+    async def scenario():
+        paths, bodies = [], []
+
+        async def handler(request):
+            if request.url.path.endswith("/contexts/release"):
+                return httpx.Response(200, json={"released": True})
+            body = request.content
+            if not body:
+                # 会话 start 会先探活原生服务（同样复用本 handler）。
+                return httpx.Response(200, json={"status": "ok", "data": []})
+            paths.append(request.url.path)
+            bodies.append(json.loads(body))
+            return _response(_audio_event(b"\x01\x00" * 6),
+                             _event("speech.audio.done"), "data: [DONE]\n\n")
+
+        client = _fake_client(handler, native_sample_rate=48000)
+        client.server.capabilities = {"acoustic_continuation": True}
+        assert client.sample_rate == 48000
+        session = client.session(voice_snapshot=client.resolve_voice(None))
+        assert session._resampler is None, "原生率下行不重采样"
+        await session.start()
+        # 多段：流式仍然逐段提交、逐段收音频、逐段落回执。
+        for text in ("第一句完整正文。", "第二句完整正文。", "第三句完整正文。"):
+            await session.send_text(text)
+        await session.finish()
+        chunks = [chunk async for chunk in session.audio_chunks()]
+        await session.close()
+
+        assert len(chunks) == 3, "每个文本分段各收一份音频"
+        assert all(path.endswith("/v1/audio/speech") for path in paths), "流式仍走 SSE 入口"
+        assert [body["input"] for body in bodies] == [
+            "第一句完整正文。", "第二句完整正文。", "第三句完整正文。"]
+        # 音色参考保持不变；续接仅在同一事务内共享上下文。
+        assert len({body["voice_ref"] for body in bodies}) == 1
+        assert len({body["continuation_id"] for body in bodies}) == 1
+        assert [metric["segment_index"] for metric in session.request_metrics] == [0, 1, 2]
+        assert all(metric["native_pcm_bytes"] == metric["pcm_bytes"]
+                   for metric in session.request_metrics), "48 kHz 直通：原生字节等于下行字节"
+        assert session.completed_segments == 3
+        await client.close()
+
+    asyncio.run(scenario())

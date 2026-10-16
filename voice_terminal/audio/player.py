@@ -612,3 +612,27 @@ class PcmPlayer:
             finally:
                 stream.close()
         logger.info("audio.player_stopped")
+
+    def reclock(self, sample_rate: int) -> bool:
+        """reclock（原位置换设备时钟）：改变下行采样率但保留播放器实例。
+
+        会话控制器、事务输出与语音管线在初始化时各自持有播放器引用，替换实例
+        会让它们指向已停止的旧对象（音频入旧队列、进度读旧计数）。本方法只重开
+        设备流，实例身份不变，因此不需要重新接线。
+
+        队列里的字节按旧时钟采集，换时钟后无法继续按正确速度播放，因此会清空；
+        调用方须先确认播放器空闲。未运行中的播放器只更新采样率，下次 start 生效。
+        """
+        rate = int(sample_rate)
+        if rate <= 0:
+            return False
+        if rate == self.sample_rate:
+            return False
+        was_running = self._stream is not None
+        if was_running:
+            self.stop()
+        self.sample_rate = rate
+        logger.info("audio.player_reclocked sample_rate=%d was_running=%s", rate, was_running)
+        if was_running:
+            self.start()
+        return True

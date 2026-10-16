@@ -634,14 +634,13 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         会话控制器持有播放器引用并挂载播放回调；能力级恢复不能替换实例，
         否则回调与设备时钟会脱离，只有首次初始化才新建。
 
-        例外：本地下行采样率跟随所选本地模型的原生率（VoxCPM1 16 kHz、
-        VoxCPM2 48 kHz）。此时必须重建播放器，否则设备仍按旧时钟解释 PCM，
-        播报会变速且丢掉 8 kHz 以上带宽。重建只在没有排队音频时进行。
+        本地下行采样率跟随所选本地模型的原生率（VoxCPM1 16 kHz、VoxCPM2 48 kHz）。
+        这时**原地**置换设备时钟（`PcmPlayer.reclock`），同样不替换实例——控制器、
+        事务输出与语音管线都缓存了这个引用。只在播放器空闲时置换。
         """
         desired = int(self.config.tts.sample_rate)
         pending = self._pending_local_tts_rate
         if pending and pending[1] != desired and self._player_is_idle():
-            # 延迟换时钟在此落地：只改配置，播放器由下面的通用分支重建。
             self._pending_local_tts_rate = None
             previous_rate = desired
             desired = pending[1]
@@ -651,14 +650,6 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 local.sample_rate = desired
             logger.info("tts.local_sample_rate_changed local_model=%s previous_rate=%d sample_rate=%d deferred=True",
                         pending[0], previous_rate, desired)
-        if self.player is not None and self.player.sample_rate != desired and self._player_is_idle():
-            previous, self.player = self.player, None
-            logger.info("audio.player_clock_changed previous_rate=%d sample_rate=%d",
-                        previous.sample_rate, desired)
-            try:
-                previous.stop()
-            except Exception:  # noqa: BLE001 - 停机失败不能阻断新时钟建立。
-                logger.warning("audio.player_clock_change_stop_failed", exc_info=True)
         if self.player is None:
             self.player = PcmPlayer(
                 playback_permission=lambda: not self.quiet_policy.passive(),
@@ -670,6 +661,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 on_audio_rendered=(self.audio_processor.push_reverse if self.audio_processor else None),
                 on_audio_frame=lambda pcm: self.audio_meter.feed("playback", pcm, self.config.tts.sample_rate),
             )
+        elif self.player.sample_rate != desired and self._player_is_idle():
+            self.player.reclock(desired)
         if not self.player.running:
             self.player.start()
         self.state.current["playback_diagnostics"] = self.player.diagnostics
