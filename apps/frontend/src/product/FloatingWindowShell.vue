@@ -13,13 +13,12 @@ const emit = defineEmits<{
   toggleSilence: [] // toggleSilence（切换静默与语音识别）。
 }>()
 
-const LONG_PRESS_MS = 400 // LONG_PRESS_MS（长按拖动等待毫秒数）。
+const DRAG_THRESHOLD_PX = 6 // DRAG_THRESHOLD_PX（拖动判定位移阈值）：越过后立即交给原生窗口拖动。
 const control = ref<HTMLButtonElement | null>(null)
 const caption = ref<Caption | null>(null)
 const dragging = ref(false)
 const actionLabel = computed(() => props.model.silenced ? '恢复语音识别' : '进入静默')
 let press: { id: number; x: number; y: number; moved: boolean } | null = null
-let holdTimer: ReturnType<typeof setTimeout> | undefined
 let clickTimer: ReturnType<typeof setTimeout> | undefined
 let captionTimer: ReturnType<typeof setTimeout> | undefined
 let suppressClick = false
@@ -29,8 +28,6 @@ function clearClick() {
   clickTimer = undefined
 }
 function endPress() {
-  if (holdTimer !== undefined) clearTimeout(holdTimer)
-  holdTimer = undefined
   if (press && control.value?.hasPointerCapture?.(press.id)) control.value.releasePointerCapture(press.id)
   press = null
   dragging.value = false
@@ -42,19 +39,17 @@ function beginPress(event: PointerEvent) {
   suppressClick = false
   press = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: false }
   control.value?.setPointerCapture?.(event.pointerId)
-  holdTimer = setTimeout(() => {
-    if (!press) return
-    suppressClick = true
-    dragging.value = true
-    clearClick()
-    // 释放网页指针捕获后交给原生拖动循环，鼠标仍处于按住状态。
-    if (control.value?.hasPointerCapture?.(press.id)) control.value.releasePointerCapture(press.id)
-    emit('drag')
-  }, LONG_PRESS_MS)
 }
 function movePress(event: PointerEvent) {
   if (!press || event.pointerId !== press.id) return
-  if (Math.hypot(event.clientX - press.x, event.clientY - press.y) > 6) press.moved = true
+  if (press.moved || Math.hypot(event.clientX - press.x, event.clientY - press.y) <= DRAG_THRESHOLD_PX) return
+  press.moved = true
+  suppressClick = true
+  dragging.value = true
+  clearClick()
+  // 越过系统拖动阈值后立即释放网页捕获，让原生窗口接管仍按住的鼠标。
+  if (control.value?.hasPointerCapture?.(press.id)) control.value.releasePointerCapture(press.id)
+  emit('drag')
 }
 function finishPress() {
   suppressClick ||= Boolean(press?.moved || dragging.value)
@@ -115,7 +110,7 @@ defineSlots<{
   >
     <button ref="control" type="button" class="floating-orb-control" :class="{ dragging }"
       :aria-label="actionLabel" :aria-pressed="model.silenced"
-      :title="`${actionLabel} · 双击打开工作台 · 长按拖动`"
+      :title="`${actionLabel} · 双击打开工作台 · 按住拖动`"
       @pointerdown="beginPress" @pointermove="movePress" @pointerup="finishPress"
       @pointercancel="cancelPress" @click="click" @dblclick="doubleClick">
       <slot name="content" :model="model" />
