@@ -9,8 +9,8 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-NATIVE_REVISION = "b4459b3bfa8d6cf4c579cc264dd3f4dfb57dd8ec"
-SERVER_SHA256 = "4082389c40c0208dbafe4468370c30e0be5057e729b7188c82a784a2d97c2fcb"
+NATIVE_REVISION = "1895381df44bc95f6ee5c186871a161385adb5a4"
+SERVER_SHA256 = "cf691668249763a922108e572355ee0a436160c42c6606b37872aa2b2a19efcf"
 OFFICIAL = {
     "binary": ("audio-v0.9.1-bin-windows-x64-cuda13.3.zip", "dd04894fae8bb0d1365b4f62407fb51550558a6478f1ef719cad7aefc00720de"),
     "cudart": ("audio-v0.9.1-cudart-windows-x64-cuda13.3.zip", "fa0fb817540c578bad085c7befb9d25b5a7634548e47955bff7b732b04b8a84b"),
