@@ -9,7 +9,8 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 CHANGED = ("app/server/runtime.cpp", "app/server/parallel_runtime.cpp",
-           "src/models/voxcpm2/session.cpp", "src/models/voxcpm2/minicpm.cpp")
+           "src/models/voxcpm2/session.cpp", "src/models/voxcpm2/minicpm.cpp",
+           "src/models/voxcpm2/audiovae.cpp")
 
 
 def build(source: Path, output: Path, build_dir: Path | None = None):
@@ -47,7 +48,8 @@ def build(source: Path, output: Path, build_dir: Path | None = None):
             snapshot.write_bytes((source / relative).read_bytes())
             obj = output / (relative.replace("/", "-") + ".obj")
             definitions = values["DEFINES"].replace('\\"', '"').split()
-            includes = ["-I" + part.rstrip() for part in values["INCLUDES"].split("-I")[1:]]
+            includes = ["-I" + str(source / "include")]
+            includes += ["-I" + part.rstrip() for part in values["INCLUDES"].split("-I")[1:]]
             args = [str(vc / "bin/Hostx64/x64/cl.exe"), "/nologo", "/TP", "/utf-8", "/EHsc", "/O2", "/Ob2", "/DNDEBUG", "-std:c++17", "-MD", "/permissive-", "/openmp:experimental"]
             args += definitions + includes + ["-I" + str((source / relative).parent), "/Fo" + str(obj), "/Fd" + str(output / "compile.pdb"), "/c", str(snapshot)]
             commands.append(args)

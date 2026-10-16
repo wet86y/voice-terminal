@@ -495,7 +495,7 @@
       "kind": "model",
       "title": "audio.cpp（本地语音共用运行程序）",
       "destination": "audiocpp/runtime",
-      "version": "v0.9.1-b4459b3bfa8d",
+      "version": "v0.9.1-1895381df44b",
       "required": false,
       "source": {
         "platform": "github",
@@ -503,7 +503,7 @@
         "revision": "v0.9.1",
         "page_url": "https://github.com/0xShug0/audio.cpp/releases/tag/v0.9.1",
         "license_url": "https://github.com/0xShug0/audio.cpp/blob/v0.9.1/LICENSE",
-        "native_revision": "b4459b3bfa8d6cf4c579cc264dd3f4dfb57dd8ec",
+        "native_revision": "1895381df44bc95f6ee5c186871a161385adb5a4",
         "transfer": {
           "kind": "official_audiocpp_patch",
           "artifacts": [
@@ -524,8 +524,8 @@
           ],
           "patch": {
             "asset": "assets/audiocpp/voxcpm-patch.zip",
-            "size_bytes": 42681758,
-            "sha256": "1a3eee2ca98bce9b26293adabeafab83ba0d1653c85d13c5b7dc39407034730c"
+            "size_bytes": 42682431,
+            "sha256": "ff6ef48a3bd0bf570730afd1a352cca8bef7e6e0827ae0f3a25d24e1b11a2a4b"
           }
         }
       },
@@ -542,7 +542,7 @@
           "source_path": "cuda/audiocpp_server.exe",
           "archive_id": "patch",
           "size_bytes": 58567680,
-          "sha256": "4082389c40c0208dbafe4468370c30e0be5057e729b7188c82a784a2d97c2fcb"
+          "sha256": "cf691668249763a922108e572355ee0a436160c42c6606b37872aa2b2a19efcf"
         },
         {
           "path": "cuda/cublas64_13.dll",
