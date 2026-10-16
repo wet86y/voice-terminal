@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -218,3 +219,33 @@ def test_metadata_commit_failure_restores_old_receipt_model_and_release(workspac
     assert injected
     assert all(path.read_bytes() == content for path, content in before.items())
     assert not manager.transaction_marker.exists()
+
+def _model_manifest_record(root: Path, relative: str) -> dict:
+    manifest = json.loads((root / "models/manifest.json").read_text("utf-8"))
+    return next(row for row in manifest["files"] if row["path"] == relative)
+
+
+def test_refreshed_manifest_rehashes_retained_files_changed_after_signing(workspace, tmp_path):
+    """Retained file changed after signing（签发后被改写的保留文件）：总清单必须重新读取内容。"""
+    program, root, _ = workspace
+    retained = root / "models/other/keep.bin"
+    retained.parent.mkdir(parents=True, exist_ok=True)
+    retained.write_bytes(b"first-content")
+    _catalog(program, "v2", {"model.pt": b"new-weight", "config.yaml": b"config"})
+    ResourceManager(program, root).import_source(
+        _source(tmp_path / "second-source", {"model.pt": b"new-weight", "config.yaml": b"config"}),
+        resource_id="test-model", task_id="second")
+    assert _model_manifest_record(root, "other/keep.bin")["sha256"] == hashlib.sha256(b"first-content").hexdigest()
+    # 同长度改写保留文件，并保证改写时间晚于清单签发时间。
+    retained.write_bytes(b"other-content")
+    signed_at = (root / "models/manifest.json").stat().st_mtime_ns
+    if retained.stat().st_mtime_ns <= signed_at:
+        os.utime(retained, ns=(signed_at + 1_000_000, signed_at + 1_000_000))
+    assert retained.stat().st_mtime_ns > signed_at
+    _catalog(program, "v3", {"model.pt": b"third-weight", "config.yaml": b"config"})
+    ResourceManager(program, root).import_source(
+        _source(tmp_path / "third-source", {"model.pt": b"third-weight", "config.yaml": b"config"}),
+        resource_id="test-model", task_id="third")
+    record = _model_manifest_record(root, "other/keep.bin")
+    assert record["size"] == len(b"other-content")
+    assert record["sha256"] == hashlib.sha256(b"other-content").hexdigest()

@@ -147,16 +147,36 @@ pub(crate) fn write_model_receipt(stage:&Path,spec:&Value,mut files:Vec<Value>)-
             "size":"文件字节数","sha256":"文件 SHA-256（摘要）","optional":"是否为可选文件","fields":"字段中文说明"}}))
 }
 
+/// read_model_receipt（读取安装收据）：格式、资源编号、内容摘要与文件记录均校验。
+/// 组件收据是该组件已安装文件的权威记录；总清单只是某次签发时的快照，两者不一致时以收据为准。
+pub(crate) fn read_model_receipt(component:&Path)->Result<(String,Option<String>,Vec<Value>),String>{
+    let receipt=safe_path(component,MODEL_RECEIPT)?;
+    if !receipt.is_file(){return Err("模型安装收据不存在。".into());}
+    let value=load(&receipt)?;
+    let resource_id=value["resource_id"].as_str().filter(|id|!id.is_empty()).ok_or("模型安装收据格式无效。")?.to_owned();
+    if value["schema"]!=1||value["version"].as_str().is_none()||!value["files"].is_array(){return Err("模型安装收据格式无效。".into());}
+    let files=value["files"].as_array().unwrap().clone();
+    if value["content_sha256"].as_str()!=Some(receipt_digest(&resource_id,&files)?.as_str()){return Err("模型安装收据内容摘要不匹配。".into());}
+    let mut seen=std::collections::HashSet::new();
+    for row in &files{
+        let relative=row["path"].as_str().ok_or("模型安装文件记录缺少路径")?;
+        if relative==MODEL_RECEIPT||!seen.insert(relative.to_lowercase())||row["size"].as_u64().is_none()||
+            !row["sha256"].as_str().is_some_and(valid_sha256)||(row.get("optional").is_some()&&row["optional"].as_bool().is_none()){
+            return Err("模型安装文件记录无效或重复".into());
+        }
+        safe_path(component,relative)?;
+    }
+    Ok((resource_id,value["version"].as_str().map(str::to_owned),files))
+}
+
 fn inspect_installed_model(context:&LaunchContext,spec:&Value,verify_hashes:bool)->Result<InstalledModel,String>{
     let resource_id=spec["resource_id"].as_str().ok_or("模型编号缺失")?;
     let root=destination(context,spec)?;if !root.is_dir(){return Err("模型目录不存在".into());}
     let receipt=safe_path(&root,MODEL_RECEIPT)?;
     let (version,files)=if receipt.is_file(){
-        let value=load(&receipt)?;
-        if value["schema"]!=1||value["resource_id"]!=resource_id||value["version"].as_str().is_none()||!value["files"].is_array(){return Err("模型安装收据格式无效".into());}
-        let files=value["files"].as_array().unwrap().clone();
-        if value["content_sha256"].as_str()!=Some(receipt_digest(resource_id,&files)?.as_str()){return Err("模型安装收据内容摘要不匹配".into());}
-        (value["version"].as_str().map(str::to_owned),files)
+        let (installed_id,version,files)=read_model_receipt(&root)?;
+        if installed_id!=resource_id{return Err("模型安装收据格式无效。".into());}
+        (version,files)
     }else{
         let manifest=load(&context.install.join("models/manifest.json"))?;
         if manifest["schema"]!=1||manifest["kind"]!="models"||!manifest["files"].is_array(){return Err("模型安装清单格式无效".into());}
@@ -498,7 +518,7 @@ pub(crate) fn copy_selected_verified(source:&Path,target:&Path,files:Vec<PathBuf
     progress("复制与摘要复核完成",total,total);check_cancel(cancel)?;Ok(())
 }
 fn refresh_target_binding(context:&LaunchContext,relative:&str,target:&Path)->Result<(),String>{
-    if relative.starts_with("models/"){refresh_models(context)}
+    if relative.starts_with("models/"){refresh_models(context,Some(relative))}
     else if relative=="runtimes/dsh"{bind_dsh(context)}
     else if relative=="runtimes/python"{bind_component(context,"python","runtimes/python",target)}
     else{Err("安装记录目标不在受管资源范围".into())}
@@ -645,24 +665,38 @@ pub fn import_review_with_activation(context:&LaunchContext,source:&Path,id:Opti
     }
     remove_owned(&task,&context.install)?;Ok(installed)
 }
-fn refresh_models(context:&LaunchContext)->Result<(),String>{
-    let root=context.install.join("models");let mut known=std::collections::HashMap::<String,Value>::new();
+fn refresh_models(context:&LaunchContext,activated:Option<&str>)->Result<(),String>{
+    let root=context.install.join("models");let manifest_path=root.join("manifest.json");
+    let mut known=std::collections::HashMap::<String,Value>::new();
     // 启用时复用已签发清单与新组件的复制校验结果；正式启动始终再次核验全部文件内容。
-    if let Ok(record)=load(&root.join("manifest.json")){for row in record["files"].as_array().into_iter().flatten(){
+    if let Ok(record)=load(&manifest_path){for row in record["files"].as_array().into_iter().flatten(){
         if let Some(path)=row["path"].as_str(){if row["sha256"].as_str().is_some_and(valid_sha256){known.insert(path.to_owned(),row.clone());}}
     }}
+    // activated_prefix（本次换入的组件前缀）：该组件的文件以新收据为准，不能沿用旧总清单摘要。
+    let activated_prefix=activated.and_then(|relative|relative.strip_prefix("models/")).map(|relative|format!("{}/",relative.trim_end_matches('/')));
+    let mut verified=std::collections::HashSet::new();
     for resource in specs(context)?.iter().filter(|item|item["kind"]=="model"){
         if let Ok(installed)=inspect_installed_model(context,resource,false){let prefix=resource["destination"].as_str().ok_or("模型目录缺失")?;
-            for row in installed.files{let path=format!("{prefix}/{}",row["path"].as_str().unwrap());known.insert(path.clone(),json!({"path":path,"size":row["size"],"sha256":row["sha256"]}));}
+            for row in installed.files{let path=format!("{prefix}/{}",row["path"].as_str().unwrap());
+                if activated_prefix.as_deref().is_some_and(|activated|path.starts_with(activated)){verified.insert(path.clone());}
+                known.insert(path.clone(),json!({"path":path,"size":row["size"],"sha256":row["sha256"]}));}
         }
     }
+    // manifest_time（上次签发清单时间）：在此之后被改写的内容不能沿用旧摘要。
+    let manifest_time=fs::metadata(&manifest_path).and_then(|metadata|metadata.modified()).ok();
     let mut files=vec![];
-    for path in walk(&root)?{if path==root.join("manifest.json"){continue;}
+    for path in walk(&root)?{if path==manifest_path{continue;}
         let relative=path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\',"/");let size=path.metadata().map_err(|e|e.to_string())?.len();
-        let digest=match known.get(&relative){Some(row)if row["size"].as_u64()==Some(size)=>row["sha256"].clone(),_=>json!(file_hash(&path)?)};
+        let digest=if let Some(row)=known.get(&relative){
+            let same_size=row["size"].as_u64()==Some(size);
+            let in_activated=activated_prefix.as_deref().is_some_and(|activated|relative.starts_with(activated));
+            // 刚换入组件里未被新收据登记的文件（安装收据本身）必须重新读取内容。
+            let rewritten=path.metadata().ok().and_then(|metadata|metadata.modified().ok()).is_some_and(|modified|manifest_time.is_some_and(|time|modified>time));
+            if same_size&&!verified.contains(&relative)&&(in_activated||rewritten){json!(file_hash(&path)?)}else if same_size{row["sha256"].clone()}else{json!(file_hash(&path)?)}
+        }else{json!(file_hash(&path)?)};
         files.push(json!({"path":relative,"size":size,"sha256":digest}));
     }
-    atomic_json(&root.join("manifest.json"),&json!({"schema":1,"kind":"models","build":crate::workspace::new_id(),"files":files,
+    atomic_json(&manifest_path,&json!({"schema":1,"kind":"models","build":crate::workspace::new_id(),"files":files,
         "fields":{"schema":"清单格式","kind":"资源类别","build":"启用登记编号","files":"已校验的安装文件记录","path":"相对路径","size":"字节数","sha256":"文件摘要；启动前再次完整核验"}}))?;
     bind_component(context,"models","models",&root)
 }
@@ -1348,5 +1382,36 @@ mod download_tests {
         model_validate(&context,&spec(&context,"fsmn-vad").unwrap(),&destination(&context,&spec(&context,"fsmn-vad").unwrap()).unwrap()).unwrap();
         assert_eq!(runtime_before,crate::runtime::fingerprint(&root.join("runtimes")).unwrap());
         assert!(!context.python.exists());println!("模型下载与校验通过，未调用或修改 Python（运行环境）");
+    }
+    #[test]
+    fn same_size_component_update_reissues_receipt_digest_into_models_manifest(){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();
+        let root=owner.join(format!("voice-refresh-receipt-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();
+        let folder=root.join("models/audiocpp/runtime");fs::create_dir_all(&folder).unwrap();fs::write(folder.join("model.bin"),b"aaaa").unwrap();
+        let mut item=json!({"resource_id":"tts-audiocpp-runtime","kind":"model","title":"音频运行程序","destination":"audiocpp/runtime",
+            "version":"v0.9.1-aaaaaaaaaaaa","files":[{"path":"model.bin","size_bytes":4,"sha256":file_hash(&folder.join("model.bin")).unwrap()}]});
+        atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[item.clone()]})).unwrap();
+        write_model_receipt(&folder,&item,vec![json!({"path":"model.bin","size":4,"sha256":item["files"][0]["sha256"],"optional":false})]).unwrap();
+        fs::create_dir_all(root.join("app/scripts")).unwrap();fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();fs::write(root.join("app/scripts/backend-entry.py"),b"# fixture").unwrap();
+        let context=LaunchContext::portable(&root).unwrap();
+        refresh_models(&context,None).unwrap();
+        let old_receipt=file_hash(&folder.join(MODEL_RECEIPT)).unwrap();
+        // 同尺寸换版：文件集合、每个文件的字节数位数与版本串长度都不变，只有内容摘要变化。
+        let candidate=root.join("tmp/resource-downloads/candidate");fs::create_dir_all(&candidate).unwrap();fs::write(candidate.join("model.bin"),b"bbbb").unwrap();
+        item["files"][0]["sha256"]=json!(file_hash(&candidate.join("model.bin")).unwrap());
+        write_model_receipt(&candidate,&item,vec![json!({"path":"model.bin","size":4,"sha256":item["files"][0]["sha256"],"optional":false})]).unwrap();
+        assert_eq!(fs::metadata(folder.join(MODEL_RECEIPT)).unwrap().len(),fs::metadata(candidate.join(MODEL_RECEIPT)).unwrap().len());
+        assert_ne!(old_receipt,file_hash(&candidate.join(MODEL_RECEIPT)).unwrap());
+        let mut transaction=begin_activation(&context,&candidate,"models/audiocpp/runtime").unwrap();
+        commit_activation(&context,&mut transaction).unwrap();
+        // 收据不在自己的文件清单里：总清单必须以磁盘内容为准重新登记，不能沿用换版前的摘要。
+        let manifest=load(&root.join("models/manifest.json")).unwrap();
+        let path="audiocpp/runtime/resource-install.json";
+        let record=manifest["files"].as_array().unwrap().iter().find(|row|row["path"]==path).unwrap();
+        assert_eq!(record["sha256"],json!(file_hash(&root.join("models").join(path)).unwrap()));
+        assert_ne!(record["sha256"],json!(old_receipt));
+        crate::workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();
+        crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 }
