@@ -741,7 +741,6 @@ class AudioCppTtsClient:
         self.base_url = server.base_url
         self.timeout_seconds = timeout_seconds
         # sample_rate（播放器采样率）沿用当前输出设备时钟，模式热切换不重载输入模型。
-        # sample_rate（播放器采样率）沿用当前输出设备时钟，模式热切换不重载输入模型。
         # 未显式指定时取所选模型的原生率：VoxCPM2 原生 48 kHz 降到 16 kHz 会丢掉
         # 8 kHz 以上全部带宽（实测占 1.1%–14.4%），默认值不能是 16 kHz。
         self._sample_rate_locked = sample_rate is not None

@@ -12,6 +12,38 @@ from tests.test_audio_cpp_tts import _fake_client, _response, _audio_event, _eve
 from tests.test_sentence_scheduling import _sentence_output_harness
 
 
+def test_player_reclock_changes_rate_without_replacing_instance():
+    """换下行采样率必须原地置换：控制器/事务输出/语音管线都缓存了播放器引用。
+
+    替换实例会让它们继续指向已停止的旧对象（音频入旧队列、进度读旧计数），
+    所以 reclock 只重开设备流，实例身份保持不变。
+    """
+    player = PcmPlayer(sample_rate=16000, channels=1, output_device=None)
+    marker = player  # 模拟被控制器缓存的引用。
+    assert player.running is False, "无设备环境下播放器不应已启动"
+    assert player.reclock(48000) is True
+    assert player is marker, "实例不能被替换，否则缓存引用全部失效"
+    assert player.sample_rate == 48000
+    assert player.running is False or player.sample_rate == 48000
+    # 同率重复置换是空操作，非法率被拒绝且不改变状态。
+    assert player.reclock(48000) is False
+    assert player.reclock(0) is False
+    assert player.sample_rate == 48000
+
+
+def test_player_reclock_drops_stale_bytes_when_stream_running(monkeypatch):
+    """运行中的播放器换时钟：先清空按旧时钟采集的队列，再重开设备流。"""
+    player = PcmPlayer(sample_rate=16000, channels=1, output_device=None)
+    marker = player
+    calls: list[str] = []
+    monkeypatch.setattr(player, "stop", lambda: calls.append("stop"))
+    monkeypatch.setattr(player, "start", lambda: calls.append("start"))
+    player._stream = object()  # 模拟已启动的设备流。
+    assert player.reclock(48000) is True
+    assert calls == ["stop", "start"], "必须按 stop → start 顺序重开设备流"
+    assert player is marker and player.sample_rate == 48000
+
+
 def test_stream_buffer_avoids_fragmented_playback_and_drains_short_tail():
     player = PcmPlayer(sample_rate=1000, channels=1, output_device=None)
     player.allow("local")
