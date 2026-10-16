@@ -9,6 +9,7 @@ from ..tts.scheduling import DirectStreamingPolicy, PlaybackProgress, PlaybackWi
 from ..tts.sentence_segmenter import PunctuationSentenceSegmenter, split_complete_text
 from ..tts.text_merger import BidiTextMerger
 from ..quiet_hours import PassiveQuietSuppressed
+from ..gpu_performance import GpuSnapshot
 from .speech_admission import ADMISSION_STAGING_CHARS, AdmissionState, SubmittedClause
 from .stream_buffer import FLUSH_DUE, buffered_stream
 
@@ -19,6 +20,91 @@ logger = logging.getLogger(__name__)
 # before the lead window is evaluated again.  Bounded so a slow provider keeps
 # the previous direct behaviour instead of stalling the transaction.
 ADMISSION_CATCH_UP_SECONDS = 0.5
+
+# 起播／恢复储备与两道队列门槛之间的安全间隔。两道门槛都会让"攒够储备"变成
+# 不可能事件，从而把整轮播报挂死（详见 safe_stream_reserve_ms）：
+#   * read_audio 在队列高于 tts_local_buffer_ms 时暂停入队；
+#   * wait_for_sentence_window 只在"当前块未播内容 ≤ sentence_prefetch_ms"时提交下一块。
+# 留出该间隔吸收回调粒度（20 毫秒）、设备尾音与边界取整。
+STREAM_RESERVE_MARGIN_MS = 500
+# R≥1 时自适应抬高的恢复门槛上限；实际值还要受队列上限与句窗门约束。
+ADAPTIVE_RESUME_MAX_MS = 2000
+# 恢复门槛必须严格小于入队上限，否则攒够门槛的音频会被 read_audio 的 cap 卡住。
+ADAPTIVE_RESUME_CAP_MARGIN_MS = 200
+
+
+def safe_stream_reserve_ms(*, requested_ms: int, cap_ms: int, prefetch_ms: int,
+                           cap_margin_ms: int = 0,
+                           prefetch_margin_ms: int = STREAM_RESERVE_MARGIN_MS) -> int:
+    """safe_stream_reserve_ms（流式储备安全上界）：把储备夹在两道队列门槛之下。
+
+    起播储备与恢复储备都必须**可达**，否则播放永远不开始：
+
+    * ``cap_ms``：``read_audio`` 在播放器队列高于该值时就停止入队
+      （``speech_pipeline.py`` 的 read_audio），储备超过它永远攒不够；
+    * ``prefetch_ms − margin``：句窗门提交下一块的条件（``wait_for_sentence_window``）。
+      储备若超过它，首块音频用尽后播放仍不起播，而发送方正卡在句窗门上等播放推进，
+      于是既不合成也不再入队 —— 整轮活锁（实测 startup=4000／prefetch=3000 时
+      120 秒内播放 0 毫秒）。
+    """
+
+    ceiling = min(
+        max(0, int(cap_ms) - max(0, int(cap_margin_ms))),
+        max(0, int(prefetch_ms) - max(0, int(prefetch_margin_ms))),
+    )
+    return max(0, min(int(requested_ms), ceiling))
+
+
+def stream_reserve_clamp_reason(*, requested_ms: int, cap_ms: int, prefetch_ms: int,
+                                cap_margin_ms: int = 0) -> str:
+    """说明储备被夹低的原因：queue_cap / sentence_prefetch，两者可同时成立。"""
+
+    reasons = []
+    if int(requested_ms) > max(0, int(cap_ms) - max(0, int(cap_margin_ms))):
+        reasons.append("queue_cap")
+    if int(requested_ms) > max(0, int(prefetch_ms) - STREAM_RESERVE_MARGIN_MS):
+        reasons.append("sentence_prefetch")
+    return "+".join(reasons) if reasons else "none"
+
+
+def gpu_snapshot_fields(client) -> dict:
+    """读取显卡取证字段，供"合成慢于实时"现场定位使用。
+
+    优先用 ``AudioCppTtsClient.gpu_performance`` 的 ``contention()``：它在既有
+    NVML 绑定（频率/功耗/利用率）之上补了两项现场必需证据——**外部显卡进程**
+    与 **Windows 硬件加速 GPU 调度（HAGS）状态**。这两项正是"是外部程序在抢
+    显卡，还是原生推理本身变慢"的判别依据；只靠原来那个快照无法区分。
+
+    采样失败一律降级为全空字段，绝不抛出、绝不阻塞播报。调用点只在判定降级时
+    执行一次，正常运行路径不会触发任何 NVML 进程枚举。
+    """
+
+    provider = getattr(client, "gpu_performance", None)
+    take = getattr(provider, "contention", None)
+    if callable(take):
+        try:
+            reading = take()
+        except Exception:
+            logger.debug("controller.gpu_contention_failed", exc_info=True)
+        else:
+            if isinstance(reading, dict) and reading:
+                return reading
+    # 退路：只能拿到频率/功耗/利用率，至少保持字段完整。
+    snapshot = getattr(provider, "snapshot", None)
+    if not callable(snapshot):
+        return GpuSnapshot().as_dict()
+    try:
+        taken = snapshot()
+    except Exception:
+        logger.debug("controller.gpu_snapshot_failed", exc_info=True)
+        return GpuSnapshot().as_dict()
+    as_dict = getattr(taken, "as_dict", None)
+    if callable(as_dict):
+        try:
+            return as_dict()
+        except Exception:
+            logger.debug("controller.gpu_snapshot_failed", exc_info=True)
+    return GpuSnapshot().as_dict()
 
 
 class SpeechPipeline:
@@ -171,20 +257,52 @@ class SpeechPipeline:
         await synthesis_permission()
         if not self._valid(token) or not ws.committed:
             return ""
+        armed_startup_ms = 0
+        armed_resume = 0
         if self.player:
             self.player.allow(playback_key)
             configure_buffer = getattr(self.player, "configure_stream_buffer", None)
             startup_ms = int(getattr(tts_client, "playback_startup_buffer_ms", 0) or 0)
             if callable(configure_buffer) and startup_ms > 0:
                 resume_ms = int(getattr(tts_client, "playback_resume_buffer_ms", 0) or 0)
-                armed_startup = min(self.options.tts_local_buffer_ms, startup_ms)
-                armed_resume = min(self.options.tts_local_buffer_ms, resume_ms) if resume_ms > 0 else 0
+                # 起播储备必须能在句窗门放行之前达成（safe_stream_reserve_ms）。
+                # 这里的夹紧不是限流，而是把"隐式安全余量"变成显式不变量：此前只有
+                # min(tts_local_buffer_ms, startup_ms) 一道，句窗门那条约束完全没有保护。
+                armed_startup = safe_stream_reserve_ms(
+                    requested_ms=startup_ms,
+                    cap_ms=self.options.tts_local_buffer_ms,
+                    prefetch_ms=sentence_prefetch_ms,
+                )
+                armed_resume = (
+                    safe_stream_reserve_ms(
+                        requested_ms=resume_ms,
+                        cap_ms=self.options.tts_local_buffer_ms,
+                        prefetch_ms=sentence_prefetch_ms,
+                    )
+                    if resume_ms > 0 else 0
+                )
+                armed_startup_ms = armed_startup
                 configure_buffer(playback_key, startup_ms=armed_startup, resume_ms=armed_resume)
                 # 装配必须留痕：此前守卫取到 0 时静默跳过，现场只能看到
                 # "152 毫秒就起播"这个结果，无法反查原因。
                 logger.info("audio.player_stream_buffer_armed key=%s startup_ms=%d resume_ms=%d "
                             "client=%s", playback_key, armed_startup, armed_resume,
                             type(tts_client).__name__)
+                if armed_startup < startup_ms or (resume_ms > 0 and armed_resume < resume_ms):
+                    # 夹紧必须说明原因与数值，否则又回到"静默失效"那类缺陷。
+                    logger.warning(
+                        "controller.tts_stream_reserve_clamped key=%s requested_startup_ms=%d "
+                        "armed_startup_ms=%d requested_resume_ms=%d armed_resume_ms=%d "
+                        "cap_ms=%d prefetch_ms=%d reason=%s client=%s",
+                        playback_key, startup_ms, armed_startup, resume_ms, armed_resume,
+                        self.options.tts_local_buffer_ms, sentence_prefetch_ms,
+                        stream_reserve_clamp_reason(
+                            requested_ms=max(startup_ms, resume_ms),
+                            cap_ms=self.options.tts_local_buffer_ms,
+                            prefetch_ms=sentence_prefetch_ms,
+                        ),
+                        type(tts_client).__name__,
+                    )
             else:
                 # 在线后端按服务端节奏起播，本地下行才需要储备闸门。
                 logger.debug("audio.player_stream_buffer_skipped key=%s startup_ms=%d callable=%s "
@@ -224,6 +342,162 @@ class SpeechPipeline:
                 "queued_ms": queued_ms,
                 "started": started,
             }
+
+        # 每轮降级信号（F3）与本轮自适应储备（F2）共用的事实收集。
+        # ``gpu`` 在**首次**判定降级时采样：那时合成仍在进行，显卡争用才看得见；
+        # 若整轮只在收尾时才判出降级，则退回收尾时刻采样。
+        degradation = {
+            "active": False,   # 本轮是否出现过 underrun 或 rtf ≥ 1。
+            "max_rtf": 0.0,    # 本轮观测到的最大实时因子。
+            "resume_ms": 0,    # 已抬高的恢复门槛（0 表示仍用装配值）。
+            "gpu": None,       # 首次判定降级时的显卡快照字段。
+            "reported": False,  # 是否已经输出过降级 WARNING。
+        }
+        adaptive_resume_ms = safe_stream_reserve_ms(
+            requested_ms=ADAPTIVE_RESUME_MAX_MS,
+            cap_ms=self.options.tts_local_buffer_ms,
+            prefetch_ms=sentence_prefetch_ms,
+            cap_margin_ms=ADAPTIVE_RESUME_CAP_MARGIN_MS,
+        )
+
+        def degradation_facts() -> tuple[int, float]:
+            diagnostics = getattr(self.player, "diagnostics", None)
+            underrun_ms = 0
+            if isinstance(diagnostics, dict):
+                try:
+                    underrun_ms = int(diagnostics.get("underrun_ms", 0) or 0)
+                except (TypeError, ValueError):
+                    underrun_ms = 0
+            rtf = 0.0
+            metrics = getattr(session, "request_metrics", None) if session is not None else None
+            if isinstance(metrics, (list, tuple)) and metrics:
+                last = metrics[-1]
+                if isinstance(last, dict):
+                    try:
+                        rtf = float(last.get("rtf") or 0.0)
+                    except (TypeError, ValueError):
+                        rtf = 0.0
+            return underrun_ms, rtf
+
+        def apply_adaptive_reserve() -> None:
+            """F2：实测慢于实时或已发生欠载时抬高恢复门槛。
+
+            R>1 时静音占比恒为 1−1/R，应用侧改不了；能改的是**碎裂粒度**：
+            400 毫秒门槛下每约 2.1 秒断一次，抬高后变成句级停顿。R<1 时既不会
+            有 ``underrun_ms`` 也不会有 ``rtf ≥ 1``，本函数直接返回，**零代价**。
+            """
+
+            nonlocal armed_resume
+            underrun_ms, rtf = degradation_facts()
+            if rtf > degradation["max_rtf"]:
+                degradation["max_rtf"] = rtf
+            if underrun_ms <= 0 and rtf < 1.0:
+                return
+            if not degradation["active"]:
+                degradation["active"] = True
+                degradation["gpu"] = gpu_snapshot_fields(tts_client)
+            setter = getattr(self.player, "set_stream_reserve", None)
+            if not callable(setter) or adaptive_resume_ms <= 0:
+                return
+            current = int(armed_resume or 0)
+            if current >= adaptive_resume_ms:
+                return
+            try:
+                applied = setter(playback_key, resume_ms=adaptive_resume_ms) is not False
+            except Exception:
+                logger.debug("controller.tts_resume_adapt_failed", exc_info=True)
+                return
+            if applied:
+                armed_resume = adaptive_resume_ms
+                degradation["resume_ms"] = adaptive_resume_ms
+
+        def playback_degradation_fields() -> dict[str, object]:
+            diagnostics = getattr(self.player, "diagnostics", None)
+            underrun_ms = 0
+            if isinstance(diagnostics, dict):
+                try:
+                    underrun_ms = int(diagnostics.get("underrun_ms", 0) or 0)
+                except (TypeError, ValueError):
+                    underrun_ms = 0
+            played_ms = 0
+            try:
+                played_ms = int(self.player.progress(playback_key).get("played_ms", 0) or 0)
+            except Exception:
+                played_ms = 0
+            audible_ms = underrun_ms + played_ms
+            resume_ms = int(degradation["resume_ms"] or armed_resume or 0)
+            reserve = getattr(self.player, "stream_reserve_ms", None)
+            if callable(reserve):
+                try:
+                    reading = reserve(playback_key) or {}
+                    if reading.get("armed"):
+                        resume_ms = int(reading.get("resume_ms", resume_ms) or 0)
+                except Exception:
+                    logger.debug("controller.tts_reserve_read_failed", exc_info=True)
+            return {
+                "turn_id": ws.turn_id,
+                "max_rtf": round(float(degradation["max_rtf"]), 3),
+                "underrun_ms": underrun_ms,
+                "played_ms": played_ms,
+                "silence_ratio": round(underrun_ms / audible_ms, 4) if audible_ms > 0 else 0.0,
+                "resume_ms": resume_ms,
+                "startup_ms": int(armed_startup_ms or 0),
+                "gpu": degradation["gpu"] or gpu_snapshot_fields(tts_client),
+            }
+
+        async def report_playback_degradation() -> None:
+            """F3：本轮若慢于实时或出现过静音，输出一条可判定的降级信号。"""
+
+            if degradation["reported"]:
+                return
+            underrun_ms = 0
+            diagnostics = getattr(self.player, "diagnostics", None)
+            if isinstance(diagnostics, dict):
+                try:
+                    underrun_ms = int(diagnostics.get("underrun_ms", 0) or 0)
+                except (TypeError, ValueError):
+                    underrun_ms = 0
+            if underrun_ms <= 0 and float(degradation["max_rtf"]) < 1.0:
+                return
+            degradation["reported"] = True
+            fields = playback_degradation_fields()
+            gpu = fields.get("gpu") or {}
+            # 把判别结论摊平成一行可直接读的字段：gpu_external 非 0 即说明有别的
+            # 程序在用显卡（合成被 WDDM 分时抢占，是历史记录的 RTF 劣化机制）；
+            # 为 0 才说明"只有本程序在跑"，此时变慢应归因于原生推理或驱动状态。
+            external = gpu.get("external_processes") if isinstance(gpu, dict) else None
+            own = gpu.get("own_processes") if isinstance(gpu, dict) else None
+            scheduling = gpu.get("scheduling") if isinstance(gpu, dict) else None
+            logger.warning(
+                "controller.tts_playback_degraded turn_id=%s max_rtf=%.3f underrun_ms=%d "
+                "played_ms=%d silence_ratio=%.4f resume_ms=%d startup_ms=%d "
+                "gpu_external=%d gpu_own=%d gpu_hags=%s gpu_clock_mhz=%s gpu_power_w=%s "
+                "gpu_util_pct=%s gpu_external_detail=%s gpu_unavailable=%s gpu=%s",
+                fields["turn_id"], fields["max_rtf"], fields["underrun_ms"],
+                fields["played_ms"], fields["silence_ratio"], fields["resume_ms"],
+                fields["startup_ms"],
+                len(external) if isinstance(external, list) else -1,
+                len(own) if isinstance(own, list) else -1,
+                (scheduling or {}).get("hwschmode") if isinstance(scheduling, dict) else None,
+                gpu.get("clock_mhz") if isinstance(gpu, dict) else None,
+                gpu.get("power_w") if isinstance(gpu, dict) else None,
+                gpu.get("utilization_percent") if isinstance(gpu, dict) else None,
+                external if isinstance(external, list) else None,
+                gpu.get("reason") if isinstance(gpu, dict) else None,
+                gpu,
+            )
+            ws.timings["playback_degraded"] = True
+            ws.timings["playback_max_rtf"] = fields["max_rtf"]
+            ws.timings["playback_underrun_ms"] = fields["underrun_ms"]
+            ws.timings["playback_silence_ratio"] = fields["silence_ratio"]
+            ws.timings["playback_resume_ms"] = fields["resume_ms"]
+            ws.timings["playback_startup_ms"] = fields["startup_ms"]
+            ws.timings["playback_gpu_external"] = (
+                len(external) if isinstance(external, list) else None)
+            try:
+                await self._detail("tts.playback_degraded", **fields)
+            except Exception:
+                logger.debug("controller.tts_playback_degraded_detail_failed", exc_info=True)
 
         async def emit_progress(*, status: str | None = None, waiting_text: str | None = None,
                                 trigger: str | None = None, force: bool = False) -> None:
@@ -771,6 +1045,9 @@ class SpeechPipeline:
                             else prefetch_miss_boundary_ms
                         )
                         prefetch_miss_boundary_ms = None
+                        # F2 自适应恢复门槛：每块回执后按实测事实决定是否抬高 resume，
+                        # 不依赖"块边界被跨过"这一次采样（该警告只在特定边界打印）。
+                        apply_adaptive_reserve()
                         if miss_boundary_ms is not None:
                             diagnostics = getattr(self.player, "diagnostics", {})
                             # 音频播放位置不含静音墙钟时间；不能用“新句已播放时长”冒充句间延迟。
@@ -931,6 +1208,9 @@ class SpeechPipeline:
                     tts_failed = tts_failed or exc
                     tts_disabled = True
                     logger.warning("controller.playback_degraded turn_id=%s error=%s", ws.turn_id, exc)
+                # F3 每轮降级信号：一行的 underrun/RTF/静音占比/实际 resume 与显卡快照，
+                # 下次现场再出现时可直接判定是否为外部显卡争用。未降级则一条都不打。
+                await report_playback_degradation()
             if session:
                 if tts_failed is not None and self._valid(token):
                     self.state.current["tts_status"] = "DEGRADED"

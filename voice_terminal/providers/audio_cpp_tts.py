@@ -1318,15 +1318,15 @@ class AudioCppTtsSession:
                 "pcm_bytes=%d native_pcm_bytes=%d ttfb_ms=%.1f request_lock_wait_ms=%.1f "
                 "http_first_audio_ms=%.1f total_ms=%.1f audio_ms=%.1f rtf=%.3f "
                 "continuation_enabled=%s segment_index=%d num_inference_steps=%s sample_rate=%d "
-                "native_sample_rate=%d voice_id=%s continuation_id=%s endpoint=%s budget_ms=%d "
-                "engine_audio_duration_ms=%s text_digest=%s%s",
+                "native_sample_rate=%d voice_id=%s continuation_id=%s endpoint=%s reference_recipe=%s "
+                "budget_ms=%d engine_audio_duration_ms=%s text_digest=%s%s",
                 *self._tts_fields(), self.client.local_model, self.client.model_id, len(text),
                 output_for_request, received_for_request, ttfb_ms or 0.0, metrics["request_lock_wait_ms"],
                 metrics["http_first_audio_ms"] or 0.0, total_ms, audio_ms, rtf or 0.0,
                 self._continuation_enabled, self.completed_segments - 1, metrics["num_inference_steps"],
                 self.client.sample_rate, self.client.native_sample_rate, voice.voice_id,
-                metrics["continuation_id"], path, budget_ms, metrics["engine_audio_duration_ms"],
-                text_digest(text), text_preview_suffix(text),
+                metrics["continuation_id"], path, metrics["reference_recipe"], budget_ms,
+                metrics["engine_audio_duration_ms"], text_digest(text), text_preview_suffix(text),
             )
         except asyncio.CancelledError:
             logger.debug(

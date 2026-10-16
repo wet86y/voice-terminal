@@ -81,6 +81,67 @@ class _Utilization(ctypes.Structure):
     _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
 
 
+class _ProcessInfo(ctypes.Structure):
+    """nvmlProcessInfo_t（显卡进程结构）：pid/computeInstance/usedGpuMemory。
+
+    Windows 的 WDDM 模式下 NVML 通常不填充 ``name``，且 ``usedGpuMemory`` 对多数
+    进程返回 0（或 UINT64_MAX 表示不可用），因此**只以 pid 为准**；进程名由调用方
+    用 ``psutil`` 反查。顺序必须与 NVML 头文件一致，不能调整。
+    """
+
+    _fields_ = [
+        ("pid", ctypes.c_uint),
+        ("name", ctypes.c_char * 64),
+        ("usedGpuMemory", ctypes.c_ulonglong),
+    ]
+
+
+# 显卡进程枚举接口：优先 v3（含 computeInstance），逐级回退。
+_COMPUTE_PROCESS_APIS = (
+    "nvmlDeviceGetComputeRunningProcesses_v3",
+    "nvmlDeviceGetComputeRunningProcesses_v2",
+    "nvmlDeviceGetComputeRunningProcesses",
+)
+_GRAPHICS_PROCESS_APIS = (
+    "nvmlDeviceGetGraphicsRunningProcesses_v3",
+    "nvmlDeviceGetGraphicsRunningProcesses_v2",
+    "nvmlDeviceGetGraphicsRunningProcesses",
+)
+
+# 本程序自身的进程名片段：出现在显卡进程表里属正常，不算外部竞争。
+# 注意这里**不**列 "python"：本应用自己就是 Python 程序，按名字匹配会把
+# 外部 Python 进程（例如另一份模型脚本、notebook）误判成自己人。自建进程一律
+# 通过进程树祖先关系判定，见 ``GpuPerformanceMode._own_pids``。
+OWN_PROCESS_MARKERS = (
+    "audiocpp_server", "voice-server", "llama-server",
+    "voice-terminal", "electron", "dsh",
+)
+
+_HAGS_KEY = r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+
+
+def gpu_scheduling_mode() -> dict[str, Any]:
+    """读取 Windows 硬件加速 GPU 调度（HAGS）状态。
+
+    ``HwSchMode``：1＝禁用（由驱动传统方式调度）、2＝启用（WDDM 硬件调度）。
+    两种模式下多进程争用行为不同，排查合成变慢时必须一并记录。
+    非 Windows 或读取失败时返回空值，绝不抛出。
+    """
+
+    try:
+        import winreg  # type: ignore
+    except ImportError:
+        return {"hwschmode": None, "enabled": None, "note": "registry-unavailable"}
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _HAGS_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, "HwSchMode")
+        mode = int(value)
+    except (OSError, ValueError, TypeError):
+        return {"hwschmode": None, "enabled": None, "note": "unset"}
+    return {"hwschmode": mode, "enabled": mode == 2,
+            "note": "2=hardware-scheduling" if mode == 2 else "1=driver-scheduling"}
+
+
 @dataclass(frozen=True)
 class GpuSnapshot:
     """一次只读采样；字段为 None 表示该接口不可用。"""
@@ -122,7 +183,7 @@ class GpuPerformanceMode:
 
     def _bind(self, library: Any) -> None:
         """给真实 NVML 动态库声明签名；测试用的替身对象跳过。"""
-        for name, argtypes in (
+        signatures = [
             ("nvmlInit_v2", []),
             ("nvmlDeviceGetHandleByIndex_v2", [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]),
             ("nvmlDeviceGetPowerMizerMode_v1", [ctypes.c_void_p, ctypes.POINTER(_PowerMizerModes)]),
@@ -130,7 +191,13 @@ class GpuPerformanceMode:
             ("nvmlDeviceGetClockInfo", [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]),
             ("nvmlDeviceGetPowerUsage", [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]),
             ("nvmlDeviceGetUtilizationRates", [ctypes.c_void_p, ctypes.POINTER(_Utilization)]),
-        ):
+        ]
+        # 显卡进程枚举：签名统一为 (device, count*, infos*)，逐级回退的版本都声明。
+        for process_api in (*_COMPUTE_PROCESS_APIS, *_GRAPHICS_PROCESS_APIS):
+            signatures.append((process_api, [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(_ProcessInfo),
+            ]))
+        for name, argtypes in signatures:
             function = getattr(library, name, None)
             if function is None:
                 continue
@@ -248,6 +315,127 @@ class GpuPerformanceMode:
                 utilization = int(value.gpu)
         return GpuSnapshot(clock_mhz=clock, sm_clock_mhz=sm_clock, power_w=power,
                            utilization_percent=utilization)
+
+    def _running_processes(self, apis: tuple[str, ...]) -> list[int]:
+        """枚举某类显卡进程的 pid 列表；接口缺失或不支持时返回空。
+
+        NVML 的两段式协议：先以空数组取数量，再按数量取详情。实测该接口即使传了
+        非空数组也常返回 7（``insufficient-size``）——进程在两次调用之间增长，或
+        单个条目比驱动预期的更长。因此这里按“扩量重试”处理，并把重试次数限制在
+        2 次，避免在实时播报路径上长时间阻塞。
+        """
+
+        library = self._library
+        caller = next((getattr(library, name) for name in apis
+                       if getattr(library, name, None) is not None), None)
+        if caller is None:
+            return []
+        count = ctypes.c_uint(0)
+        # 注意顺序：必须先把计数调用做完，再看 count。写成
+        # ``if int(caller(...)) != 0 or count.value <= 0`` 会因为短路在调用前
+        # 就读到 count=0 而永远提前返回。该接口通常返回 7（insufficient-size），
+        # 但它同时回填了真实数量，所以返回值不能作为失败判据。
+        caller(self._handle, ctypes.byref(count), None)
+        if count.value <= 0:
+            return []
+        wanted = int(count.value)
+        for _ in range(2):
+            buffer = (_ProcessInfo * wanted)()
+            count = ctypes.c_uint(wanted)
+            code = int(caller(self._handle, ctypes.byref(count), buffer))
+            if code == 0:
+                return [int(buffer[index].pid)
+                        for index in range(min(wanted, len(buffer))) if int(buffer[index].pid) > 0]
+            # 7 = insufficient-size：进程变多了，按驱动回填的数量再试一次。
+            wanted = max(wanted + 4, int(count.value) + 4)
+        return []
+
+    @staticmethod
+    def _process_name(pid: int) -> str:
+        """用 psutil 反查进程名；WDDM 下 NVML 不填 name，只能靠这一步。"""
+
+        try:
+            import psutil  # type: ignore
+        except ImportError:
+            return ""
+        try:
+            return str(psutil.Process(pid).name())
+        except Exception:  # noqa: BLE001 - 进程可能已退出或权限不足。
+            return ""
+
+    @staticmethod
+    def _own_pids() -> set[int]:
+        """返回本程序自己的进程号集合：当前进程、其祖先链与全部后代。
+
+        应用是 Python 程序，各工作进程（语音服务、识别、分析、原生合成）都由它
+        派生，因此用进程树判定比按名字猜测可靠；同时天然覆盖 ``audiocpp_server``
+        这类由本进程直接拉起的原生子进程。
+        """
+
+        try:
+            import psutil  # type: ignore
+        except ImportError:
+            return set()
+        try:
+            me = psutil.Process()
+        except Exception:  # noqa: BLE001
+            return set()
+        pids: set[int] = set()
+        try:
+            pids.update(parent.pid for parent in me.parents())
+            pids.update(child.pid for child in me.children(recursive=True))
+        except Exception:  # noqa: BLE001 - 权限受限时退化为仅当前进程。
+            pass
+        pids.add(me.pid)
+        return pids
+
+    def contention(self, *, own_pids: set[int] | None = None) -> dict[str, Any]:
+        """采样显卡争用证据：外部进程、HAGS 模式，以及频率/功耗/利用率。
+
+        这是给“合成慢于实时”现场取证用的**只读**接口，任何一步失败都降级为
+        空字段，绝不抛出、绝不阻塞播报。字段含义：
+
+        * ``external_processes``：非本程序的显卡进程（含图形与计算两类），
+          逐项给出 pid/name/kind。非空即说明存在外部显卡消费者。
+        * ``own_processes``：本程序自身的显卡进程，用于区分“只有自己在跑”。
+        * ``scheduling``：Windows 硬件加速 GPU 调度状态。
+
+        ``own_pids`` 仅供测试注入“自建进程集合”，正式调用不要传。
+        """
+
+        result: dict[str, Any] = {
+            "clock_mhz": None, "sm_clock_mhz": None, "power_w": None,
+            "utilization_percent": None, "external_processes": [],
+            "own_processes": [], "scheduling": gpu_scheduling_mode(), "reason": None,
+        }
+        if not self._ensure_handle():
+            result["reason"] = self._last_error or "nvml-unavailable"
+            return result
+        snapshot = self.snapshot()
+        result.update({key: value for key, value in snapshot.as_dict().items()})
+
+        seen: dict[int, str] = {}
+        for kind, apis in (("compute", _COMPUTE_PROCESS_APIS),
+                           ("graphics", _GRAPHICS_PROCESS_APIS)):
+            for pid in self._running_processes(apis):
+                if pid <= 0 or pid in seen:
+                    continue
+                seen[pid] = kind
+        own: list[dict[str, Any]] = []
+        external: list[dict[str, Any]] = []
+        own_pids = self._own_pids() if own_pids is None else own_pids
+        for pid, kind in seen.items():
+            name = self._process_name(pid)
+            lowered = name.lower()
+            entry = {"pid": pid, "name": name, "kind": kind}
+            # 自建进程按进程树判定；名字白名单只作为进程树不可用时的兜底。
+            if pid in own_pids or any(marker in lowered for marker in OWN_PROCESS_MARKERS):
+                own.append(entry)
+            else:
+                external.append(entry)
+        result["own_processes"] = own
+        result["external_processes"] = external
+        return result
 
     def apply(self) -> dict[str, Any]:
         """请求优先最大性能；已生效或不可用时只读一次状态。幂等，可重复调用。"""

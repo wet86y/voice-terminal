@@ -108,6 +108,8 @@ class PcmPlayer:
         self._stream_complete = False
         self._underrun_callbacks = 0  # underrun_callbacks（已起播后的欠载回调数）。
         self._underrun_ms = 0.0  # underrun_ms（已起播后因欠载静音的总毫秒）。
+        self._underrun_episodes = 0  # underrun_episodes（欠载片段数：连续静音回调算一次）。
+        self._underrun_active = False  # underrun_active（当前是否正处在一次欠载片段内）。
         from ..resources import registry
         registry.observe(self, "playback_pcm", lambda value: value._buffered_bytes)
 
@@ -131,6 +133,7 @@ class PcmPlayer:
                 "buffered_ms": buffered_ms,
                 "underrun_callbacks": self._underrun_callbacks,
                 "underrun_ms": round(self._underrun_ms, 1),
+                "underrun_episodes": self._underrun_episodes,
             }
 
     def allow(self, key: str) -> None:
@@ -180,6 +183,44 @@ class PcmPlayer:
         with self._queue_lock:
             if self._stream_buffer_key == key:
                 self._stream_complete = True
+
+    def set_stream_reserve(self, key: str, *, startup_ms: int | None = None,
+                           resume_ms: int | None = None) -> bool:
+        """set_stream_reserve（自适应播放储备）：只改门槛，不动队列与闸门状态。
+
+        与 ``configure_stream_buffer`` 的区别是本方法**不**置 ``_stream_waiting``／
+        ``_stream_complete``：那会重新武装闸门，把已经起播的代次打回“等待起播”，
+        等于用一次诊断动作制造卡顿。它只更新 ``_stream_start_bytes``／
+        ``_stream_resume_bytes``，且仅在闸门确实为 ``key`` 武装过时生效（在线后端
+        从不为本地下行装配闸门，因此该调用对在线路径是空操作）。
+
+        返回 True 表示该 key 的储备已更新（含数值未变的情况），False 表示本 key
+        没有装配流式储备闸门、调用被忽略。
+        """
+        if not key:
+            return False
+        with self._queue_lock:
+            if self._stream_buffer_key != key:
+                return False
+            bytes_per_ms = self.sample_rate * self.channels * 2 / 1000
+            if startup_ms is not None:
+                self._stream_start_bytes = int(max(0, startup_ms) * bytes_per_ms)
+            if resume_ms is not None:
+                self._stream_resume_bytes = int(max(0, resume_ms) * bytes_per_ms)
+            return True
+
+    def stream_reserve_ms(self, key: str) -> dict[str, int | bool]:
+        """stream_reserve_ms（当前生效的储备门槛）：供降级日志记录实际值。"""
+
+        bytes_per_ms = self.sample_rate * self.channels * 2 / 1000
+        with self._queue_lock:
+            if not key or self._stream_buffer_key != key or bytes_per_ms <= 0:
+                return {"armed": False, "startup_ms": 0, "resume_ms": 0}
+            return {
+                "armed": True,
+                "startup_ms": int(self._stream_start_bytes / bytes_per_ms),
+                "resume_ms": int(self._stream_resume_bytes / bytes_per_ms),
+            }
 
     def resume(self, key: str) -> bool:
         """Release a held playback generation without resetting its queue."""
@@ -421,10 +462,15 @@ class PcmPlayer:
                 if self._stream_waiting and self._buffered_bytes < threshold:
                     can_play = False
                     if started:
+                        if not self._underrun_active:
+                            # 一次欠载片段 = 连续静音回调；片段数用于衡量“碎裂粒度”。
+                            self._underrun_active = True
+                            self._underrun_episodes += 1
                         self._underrun_callbacks += 1
                         self._underrun_ms += frames * 1000 / self.sample_rate
                 else:
                     self._stream_waiting = False
+                    self._underrun_active = False
             if can_play:
                 while remaining > 0 and self._chunks:
                     chunk = self._chunks.popleft()
@@ -564,6 +610,8 @@ class PcmPlayer:
         self._stream_complete = False
         self._underrun_callbacks = 0
         self._underrun_ms = 0.0
+        self._underrun_episodes = 0
+        self._underrun_active = False
         self._buffered_bytes = 0
         self._enqueued_bytes = 0
         self._played_bytes = 0
