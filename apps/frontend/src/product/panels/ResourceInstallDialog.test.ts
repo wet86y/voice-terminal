@@ -70,7 +70,7 @@ describe('ResourceInstallDialog（资源安装确认）模型与共享依赖入�
   it('不完整的代理组件带有更新标记时仍显示更新说明和更新按钮', () => {
     const agent = controller({ resource_id: 'dsh', title: 'DeepSeek Harness 官方桌面客户端', model_bytes: 289313640, environment: null }, [
       { resource_id: 'dsh', label: 'DeepSeek Harness 官方桌面客户端', installation_state: 'incomplete',
-        update_available: true, installed_version: '0.2.0-rc.1', version: '0.2.0-rc.2' },
+        update_available: true, installed_version: '0.2.0-rc.2', version: '0.2.1-rc.2' },
     ])
     const wrapper = mount(ResourceInstallDialog, { props: { controller: agent } })
     expect(wrapper.get('#install-plan-title').text()).toContain('准备更新 DeepSeek Harness')

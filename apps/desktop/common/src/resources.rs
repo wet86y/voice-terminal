@@ -614,6 +614,19 @@ pub fn activate(context:&LaunchContext,stage:&Path,relative:&str)->Result<(),Str
     }
     Ok(())
 }
+fn install_and_activate_dsh(
+    candidate:&Path,
+    cancel:&AtomicBool,
+    progress:&mut Progress,
+    installer:&mut dyn FnMut(&Path,&AtomicBool,&mut Progress)->Result<(),String>,
+    enable:&mut Activation,
+)->Result<Vec<String>,String>{
+    installer(candidate,cancel,progress)?;
+    check_cancel(cancel)?;
+    progress("正在启用 DSH（代理宿主）组件",1,1);
+    enable(candidate,"runtimes/dsh")?;
+    Ok(vec!["dsh".into()])
+}
 pub fn import(context:&LaunchContext,source:&Path,id:Option<&str>,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<Vec<String>,String>{
     import_review(context,source,id,cancel,progress,&mut|_|Ok(()))
 }
@@ -737,7 +750,8 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
     if id=="dsh"&&item["origin"]=="npm_package"{
         let root=safe_path(&context.install,"tmp/resource-downloads/dsh")?;fs::create_dir_all(&root).map_err(|e|e.to_string())?;
         let candidate=root.join(crate::dsh::candidate_name(&crate::dsh::target(&context.installed_program())?)?);
-        let result=(||{crate::dsh::install(context,&candidate,&cancel,progress)?;check_cancel(&cancel)?;progress("正在启用 DSH（代理宿主）组件",1,1);enable(&candidate,"runtimes/dsh")?;Ok(vec![id.into()])})();
+        let mut installer=|candidate:&Path,cancel:&AtomicBool,progress:&mut Progress|crate::dsh::install(context,candidate,cancel,progress);
+        let result=install_and_activate_dsh(&candidate,&cancel,progress,&mut installer,enable);
         // retry candidate（重试候选）：中断或失败保留候选及归档缓存，重试仍核对相同目标。
         return result;
     }
@@ -869,6 +883,25 @@ fn extract_dsh(context:&LaunchContext,source:&Path,target:&Path,cancel:&AtomicBo
 }
 fn inspect_dsh_installed(context:&LaunchContext,source:&Path,full:bool)->Result<Value,String>{
     inspect_dsh_with_progress(context,source,full,&AtomicBool::new(false),&mut|_,_,_|{})
+}
+/// validate_dsh_activation（DSH 启用后验收）：在旧目录事务提交前复核实际版本、兼容记录、完整摘要和启动状态。
+pub fn validate_dsh_activation(context:&LaunchContext)->Result<(),String>{
+    let program=context.installed_program();
+    let target=crate::dsh::target(&program)?;
+    let root=context.install.join("runtimes/dsh");
+    let metadata=inspect_dsh_installed(context,&root,true)?;
+    if !crate::dsh::current(&metadata,&target){return Err("已启用的 DSH（代理宿主）未达到程序锁定目标版本。".into());}
+    crate::dsh::check_plugin(&program,&target)?;
+    let rows=inventory(context)?;
+    let row=rows.iter().find(|row|row["resource_id"]=="dsh").ok_or("DSH（代理宿主）组件状态缺失")?;
+    validate_dsh_activation_state(row,target["version"].as_str().ok_or("DSH 目标版本缺失")?)
+}
+fn validate_dsh_activation_state(row:&Value,target_version:&str)->Result<(),String>{
+    if row["installed_version"].as_str()!=Some(target_version)
+        || row["update_available"]!=json!(false)
+        || row["can_start"]!=json!(true)
+    {return Err("DSH（代理宿主）启用后状态未就绪；版本、更新标记或启动条件未通过。".into());}
+    Ok(())
 }
 fn inspect_dsh_with_progress(context:&LaunchContext,source:&Path,full:bool,cancel:&AtomicBool,progress:&mut Progress)->Result<Value,String>{
     check_cancel(cancel)?;
@@ -1044,6 +1077,17 @@ mod download_tests {
         assert_eq!(update_readiness["missing"][0]["reason"],"组件有更新，需先完成更新");
         assert_eq!(readiness_from_inventory(&[complete])["ready"],true);
         assert_eq!(readiness_from_inventory(&[])["ready"],false);
+    }
+
+    #[test]
+    fn dsh_activation_requires_exact_version_clear_update_flag_and_start_readiness(){
+        let ready=json!({"installed_version":"0.2.1-rc.2","update_available":false,"can_start":true});
+        assert!(validate_dsh_activation_state(&ready,"0.2.1-rc.2").is_ok());
+        for changed in [
+            json!({"installed_version":"0.2.0-rc.2","update_available":false,"can_start":true}),
+            json!({"installed_version":"0.2.1-rc.2","update_available":true,"can_start":true}),
+            json!({"installed_version":"0.2.1-rc.2","update_available":false,"can_start":false}),
+        ] {assert!(validate_dsh_activation_state(&changed,"0.2.1-rc.2").is_err());}
     }
 
     #[test]
@@ -1263,13 +1307,13 @@ mod download_tests {
         atomic_json(&installed.join("manifest.json"),&manifest(&installed,"dsh","legacy").unwrap()).unwrap();
         let digest=file_hash(&installed.join("manifest.json")).unwrap();
         atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":[{
-            "resource_id":"dsh","title":"代理宿主","kind":"dsh","version":"0.2.0-rc.2","destination":"runtimes/dsh",
+            "resource_id":"dsh","title":"代理宿主","kind":"dsh","version":"0.2.1-rc.2","destination":"runtimes/dsh",
             "source":{"transfer":{"artifact":{"sha512_base64":base64::engine::general_purpose::STANDARD.encode([0u8;64])}}},
             "legacy_export":{"supported":true,"manifest_sha256":digest},"files":[]
         }]})).unwrap();
         let context=LaunchContext::portable(&root).unwrap();let rows=inventory(&context).unwrap();let row=rows.iter().find(|row|row["resource_id"]=="dsh").unwrap();
         assert_eq!(row["installation_state"],"installed");assert_eq!(row["files_installed"],true);
-        assert_eq!(row["installed_version"],"0.1.0");assert_eq!(row["version"],"0.2.0-rc.2");
+        assert_eq!(row["installed_version"],"0.1.0");assert_eq!(row["version"],"0.2.1-rc.2");
         assert_eq!(row["update_available"],true);assert_eq!(row["can_start"],false);
         assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
     }
@@ -1426,6 +1470,54 @@ mod download_tests {
         assert_eq!(record["sha256"],json!(file_hash(&root.join("models").join(path)).unwrap()));
         assert_ne!(record["sha256"],json!(old_receipt));
         crate::workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();
+        crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
+    fn dsh_install_failures_and_cancellation_never_reach_activation(){
+        let root=std::env::temp_dir().join(format!("voice-dsh-candidate-{}",crate::workspace::new_id()));
+        fs::create_dir_all(&root).unwrap();
+        let marker=root.join("candidate-marker");fs::write(&marker,b"candidate").unwrap();
+        let cancel=AtomicBool::new(false);let mut progress=|_:&str,_:u64,_:u64|{};let activations=std::cell::Cell::new(0);
+        let mut failed_download=|_:&Path,_:&AtomicBool,_:&mut Progress|Err("模拟下载失败".to_owned());
+        let mut enable=|_:&Path,_:&str|{activations.set(activations.get()+1);Ok(())};
+        assert!(install_and_activate_dsh(&root,&cancel,&mut progress,&mut failed_download,&mut enable).unwrap_err().contains("下载失败"));
+        assert_eq!(activations.get(),0);assert_eq!(fs::read(&marker).unwrap(),b"candidate");
+
+        let mut interrupted_install=|_:&Path,cancel:&AtomicBool,_:&mut Progress|{cancel.store(true,Ordering::Release);Ok(())};
+        assert!(install_and_activate_dsh(&root,&cancel,&mut progress,&mut interrupted_install,&mut enable).unwrap_err().contains("取消"));
+        assert_eq!(activations.get(),0);assert_eq!(fs::read(&marker).unwrap(),b"candidate");
+
+        cancel.store(false,Ordering::Release);
+        let mut completed_install=|_:&Path,_:&AtomicBool,_:&mut Progress|Ok(());
+        let failed_activation_calls=std::cell::Cell::new(0);
+        let mut failed_activation=|_:&Path,_:&str|{failed_activation_calls.set(failed_activation_calls.get()+1);Err("模拟替换失败".to_owned())};
+        assert!(install_and_activate_dsh(&root,&cancel,&mut progress,&mut completed_install,&mut failed_activation).unwrap_err().contains("替换失败"));
+        assert_eq!(activations.get(),0);assert_eq!(failed_activation_calls.get(),1);assert_eq!(fs::read(&marker).unwrap(),b"candidate");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_dsh_directory_replacement_restores_the_previous_component(){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();
+        let root=owner.join(format!("voice-dsh-swap-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();
+        fs::create_dir_all(root.join("app/config")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();
+        fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/scripts/backend-entry.py"),b"# fixture").unwrap();
+        let installed=root.join("runtimes/dsh");fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join("runtime.bin"),b"old runtime").unwrap();
+        atomic_json(&installed.join("runtime.json"),&json!({"schema":1,"source_kind":"legacy_export","version":"0.2.0-rc.2"})).unwrap();
+        atomic_json(&installed.join("manifest.json"),&manifest(&installed,"dsh","old-runtime").unwrap()).unwrap();
+        let old_manifest=file_hash(&installed.join("manifest.json")).unwrap();
+        let context=LaunchContext::portable(&root).unwrap();
+        let missing=root.join("tmp/failed-dsh-candidate");
+        assert!(begin_activation(&context,&missing,"runtimes/dsh").is_err());
+        assert_eq!(file_hash(&installed.join("manifest.json")).unwrap(),old_manifest);
+        assert_eq!(fs::read(installed.join("runtime.bin")).unwrap(),b"old runtime");
+        assert!(!root.join("tmp/native-old").exists());
+        assert!(!root.join("tmp/native-install.json").exists());
         crate::workspace::remove_owned(&root,&owner).unwrap();
     }
 }

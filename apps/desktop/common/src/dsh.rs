@@ -60,15 +60,55 @@ pub fn current(metadata: &Value, spec: &Value) -> bool {
     .all(|key| metadata[*key] == spec[*key])
 }
 pub fn check_plugin(program: &Path, spec: &Value) -> Result<(), String> {
-    let record = load(&safe_path(
+    let record_path = safe_path(
         program,
         spec["plugin_record"].as_str().ok_or("插件适配记录缺失")?,
-    )?)?;
+    )?;
+    let record = load(&record_path)?;
+    let package_dir = record_path.parent().ok_or("插件适配目录缺失")?;
+    let package = load(&package_dir.join("package.json"))?;
+    let target_version = spec["version"].as_str().ok_or("DSH 目标版本缺失")?;
     if record["dsh_version"] != spec["version"]
         || record["bridge_protocol"] != spec["bridge_protocol"]
         || record["adapter"] != spec["adapter"]
+        || record["schema"] != 2
+        || record["package_name"] != package["name"]
+        || record["plugin_version"] != package["version"]
+        || package["engines"]["dsh"] != target_version
+        || record["peer_dependencies"] != package["peerDependencies"]
     {
-        return Err("项目插件尚未适配目标 DSH（代理宿主）版本，请更新程序。".into());
+        return Err("项目插件适配记录、包版本或 DSH（代理宿主）兼容声明与目标不一致，请更新程序。".into());
+    }
+    let peer_dependencies = package["peerDependencies"].as_object().ok_or("插件同宿主依赖声明无效")?;
+    if peer_dependencies
+        .iter()
+        .any(|(name, version)| name.starts_with("@deepseek-ai/dsh-") && version.as_str() != Some(target_version))
+        || peer_dependencies.get("@deepseek-ai/cordis").and_then(Value::as_str) != Some("~4.0.5")
+    {
+        return Err("项目插件的宿主依赖版本与 DSH（代理宿主）目标不一致。".into());
+    }
+
+    let package_relative = package_dir
+        .strip_prefix(program)
+        .map_err(|_| "插件适配目录不在程序范围内")?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let exports = package["exports"].as_object().ok_or("插件入口导出声明缺失")?;
+    for (subpath, record_key) in [
+        (".", "bridge"),
+        ("./wake-tasks", "wake_tasks"),
+        ("./wake-tasks/locale/en.json", "wake_tasks_locale_en"),
+        ("./wake-tasks/locale/zh-CN.json", "wake_tasks_locale_zh_cn"),
+    ] {
+        let export = exports[subpath].as_str().ok_or("插件入口必须显式导出文件路径")?;
+        if record["package_exports"][record_key] != export {
+            return Err("项目插件入口与适配记录不一致。".into());
+        }
+        let target = export.strip_prefix("./").ok_or("插件入口必须位于功能包内")?;
+        let relative = format!("{package_relative}/{target}");
+        if !safe_path(program, &relative)?.is_file() {
+            return Err(format!("项目插件的运行入口缺失：{subpath}"));
+        }
     }
     Ok(())
 }
@@ -457,10 +497,52 @@ mod tests {
         atomic_json(&root.join("config/dsh/runtime.lock.json"), &lock).unwrap();
         let spec = target(&root).unwrap();
         let record = safe_path(&root, spec["plugin_record"].as_str().unwrap()).unwrap();
-        atomic_json(&record,&json!({"dsh_version":"unadapted","bridge_protocol":spec["bridge_protocol"],"adapter":spec["adapter"]})).unwrap();
+        let package_dir=record.parent().unwrap();
+        let package_exports=json!({
+            "bridge":"./lib/bridge/plugin.js",
+            "wake_tasks":"./lib/wake-tasks/plugin.js",
+            "wake_tasks_locale_en":"./lib/wake-tasks/locale/en.json",
+            "wake_tasks_locale_zh_cn":"./lib/wake-tasks/locale/zh-CN.json"
+        });
+        let peer_dependencies=json!({
+            "@deepseek-ai/cordis":"~4.0.5",
+            "@deepseek-ai/dsh-tools":spec["version"],
+            "@deepseek-ai/dsh-schedule":spec["version"]
+        });
+        let package_manifest=json!({
+            "name":"@voice-terminal/dsh-plugin",
+            "version":"0.2.1",
+            "engines":{"dsh":spec["version"]},
+            "peerDependencies":peer_dependencies,
+            "exports":{
+                ".":package_exports["bridge"],
+                "./wake-tasks":package_exports["wake_tasks"],
+                "./wake-tasks/locale/en.json":package_exports["wake_tasks_locale_en"],
+                "./wake-tasks/locale/zh-CN.json":package_exports["wake_tasks_locale_zh_cn"]
+            }
+        });
+        fs::create_dir_all(package_dir.join("lib/bridge")).unwrap();
+        fs::create_dir_all(package_dir.join("lib/wake-tasks/locale")).unwrap();
+        for relative in ["lib/bridge/plugin.js","lib/wake-tasks/plugin.js","lib/wake-tasks/locale/en.json","lib/wake-tasks/locale/zh-CN.json"] {
+            fs::write(package_dir.join(relative),b"fixture").unwrap();
+        }
+        atomic_json(&package_dir.join("package.json"),&package_manifest).unwrap();
+        atomic_json(&record,&json!({"schema":1,"dsh_version":"unadapted","bridge_protocol":spec["bridge_protocol"],"adapter":spec["adapter"]})).unwrap();
         assert!(check_plugin(&root, &spec).is_err());
-        atomic_json(&record,&json!({"dsh_version":spec["version"],"bridge_protocol":spec["bridge_protocol"],"adapter":spec["adapter"]})).unwrap();
+        atomic_json(&record,&json!({
+            "schema":2,
+            "dsh_version":spec["version"],
+            "bridge_protocol":spec["bridge_protocol"],
+            "adapter":spec["adapter"],
+            "package_name":package_manifest["name"],
+            "plugin_version":package_manifest["version"],
+            "package_exports":package_exports,
+            "peer_dependencies":peer_dependencies
+        })).unwrap();
         assert!(check_plugin(&root, &spec).is_ok());
+        let mut broken=package_manifest.clone();broken["exports"]["./wake-tasks"]=json!("./lib/wake-tasks/missing.js");
+        atomic_json(&package_dir.join("package.json"),&broken).unwrap();
+        assert!(check_plugin(&root, &spec).is_err());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

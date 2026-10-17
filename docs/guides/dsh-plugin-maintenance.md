@@ -1,6 +1,6 @@
 # 项目内 DSH 插件维护手册
 
-本手册维护项目内 DeepSeek Harness（DSH，代理执行宿主）集成。唯一安装包为 `@voice-terminal/dsh-plugin`（语音终端功能包），项目插件版本为 `0.2.0`，桥接协议版本为 `2.0`。上游宿主锁定 `dsh-v0.2.0-rc.2`（候选版），提交号 `639ed015397290b3745d163aafe02ffee4aa3f84`；三种版本分别管理，不以插件版本推断宿主或协议版本。
+本手册维护项目内 DeepSeek Harness（DSH，代理执行宿主）集成。唯一安装包为 `@voice-terminal/dsh-plugin`（语音终端功能包），项目插件版本为 `0.2.1`，桥接协议版本为 `2.0`。上游宿主锁定预发布版 `dsh-v0.2.1-rc.2`，提交号 `687f282e8625c6b8d11ff58211a90524be2e4317`；三种版本分别管理，不以插件版本推断宿主或协议版本。
 
 源码唯一入口是 [`integrations/dsh/voice-terminal/`](../../integrations/dsh/voice-terminal/README.md)。运行源码、产物和数据分别位于项目 `.local/build/dsh/source`（官方源码）、`.local/build/dsh/bundles/voice-terminal`（统一插件产物）及 `.local/data/dsh`（项目数据目录）。本流程不安装或维护用户级 DSH，不变更语音端的后端选择，也不发布桌面程序。
 
@@ -57,12 +57,12 @@ graph LR
 
 ## 依赖与官方规范
 
-规范以锁定提交的官方源码为准，不照搬其他版本的例子。主要依据是 [官方开发约定](https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/AGENTS.md)、[包维护约定](https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/packages/AGENTS.md)、[插件发布文档](https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/docs/user/develop/basic/publish.md)、[工具添加指南](https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/docs/cookbook/adding-a-tool.md)、[防御模式](https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/docs/defensive-patterns.md)、[浏览器维护约定](https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/packages/client/AGENTS.md)和[界面插槽规范](https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/docs/subsystems/slots.md)。
+规范以锁定提交的官方源码为准，不照搬其他版本的例子。主要依据是 [官方开发约定](https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/AGENTS.md)、[包维护约定](https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/AGENTS.md)、[插件发布文档](https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/docs/user/develop/basic/publish.md)、[工具添加指南](https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/docs/cookbook/adding-a-tool.md)、[防御模式](https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/docs/defensive-patterns.md)、[浏览器维护约定](https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/packages/client/AGENTS.md)和[界面插槽规范](https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/docs/subsystems/slots.md)。
 
 | 依赖类别 | 当前配置 | 维护原则 |
 | --- | --- | --- |
-| `dependencies`（普通运行依赖） | `@deepseek-ai/schemastery`（配置模式库）`~3.18.4` | 纯配置构建依赖；不要夹带第二套宿主服务 |
-| `peerDependencies`（同宿主运行依赖） | Cordis（插件框架）`~4.0.4`，DSH 工具、调度、模型、会话和工作区包 `0.2.0-rc.2` | 使用宿主提供的包实例与公开导出；开发版本必须与同宿主版本一致 |
+| `dependencies`（普通运行依赖） | `@deepseek-ai/schemastery`（配置模式库）`~3.18.5` | 纯配置构建依赖；不要夹带第二套宿主服务 |
+| `peerDependencies`（同宿主运行依赖） | Cordis（插件框架）`~4.0.5`，DSH 工具、调度、模型、会话和工作区包 `0.2.1-rc.2` | 使用宿主提供的包实例与公开导出；开发版本必须与同宿主版本一致 |
 | `devDependencies`（开发依赖） | 上述同宿主包、公开服务类型、浏览器包、React（界面库）、TypeScript（静态类型语言） | 类型专用导入使用 `import type`（仅类型导入）；不能靠开发依赖掩盖实际运行导入 |
 | `dsh.client.inject`（浏览器注入依赖） | 8 个官方会话、工作区、语言、基础控件、渲染、设置、会话消息及聊天包 | 只声明实际使用服务，不用跨界面包的值导入获取其他组件 |
 

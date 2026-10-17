@@ -31,7 +31,7 @@ pwsh -NoProfile -File .\scripts\setup-dsh.ps1 -ValidateOnly
 宿主补丁、两套类型配置及 `scripts/build-dsh-client.mjs`（浏览器构建脚本）。文档和测试不参与启动检查。
 产物 hash（哈希值）覆盖实际加载的包清单、Cordis patch（配置补丁）、组件声明和完整编译目录，包括 source map（源码映射）。
 
-DSH 0.2.0-rc.2 的 Agent 预设只从 Cordis Bundle（Cordis 功能包）中的 `@deepseek-ai/dsh-agent-preset`
+DSH 0.2.1-rc.2 的 Agent 预设只从 Cordis Bundle（Cordis 功能包）中的 `@deepseek-ai/dsh-agent-preset`
 声明加载，不再扫描 DSH_HOME 的 `.agent-presets/<id>/` 目录。安装脚本从
 `integrations/dsh/voice-terminal/preset/shadow-agent/` 生成统一功能包中的预设声明，并将正式预设注册到 Web
 profile；profile patch（配置补丁）使用 `agent-preset-registry`（Agent 预设注册器）的 `default`（默认预设字段）。
@@ -51,13 +51,13 @@ DSH Web Host（网页服务）固定监听 `127.0.0.1:3081`；直接访问该端
 pwsh -NoProfile -File .\scripts\setup-dsh.ps1 -ValidateOnly
 ```
 
-该命令确认 Node Bundle（Node.js 插件运行包）和浏览器插件页与锁定版本一致。v0.2.0-rc.2 使用
+该命令确认 Node Bundle（Node.js 插件运行包）和浏览器插件页与锁定版本一致。v0.2.1-rc.2 使用
 `configForms`（设置表单服务）；旧版 `settingsScope`（设置作用域接口）已移除。Bridge（插件桥接层）通过 `configForms.whileServed(...)`
 （仅在设置服务可用时注册页面）延迟注册设置页，因此不应把 `settingsScope` 当作回退接口。
 
 若设置侧栏已出现 `Voice Terminal`，但右侧内容为空，并且浏览器控制台报告 React error #130
 （React 渲染错误：组件类型未定义），请检查 Bridge 使用的 UI icon export（界面图标导出）是否属于锁定 DSH 版本。
-v0.2.0-rc.2 的图标名称已更新；当前页面使用 `IconChevronDownOutlineRegular` 和
+v0.2.1-rc.2 的图标名称已更新；当前页面使用 `IconChevronDownOutlineRegular` 和
 `IconFolderCloseRegular`。修改客户端后需重新运行 `setup-dsh.ps1` 重建插件，并从 Voice Terminal 工作台的“代理控制台”入口重新打开
 DSH，以载入新产物和新的 launch token（临时访问令牌）。
 

@@ -39,7 +39,7 @@ try {
   const installed = join(profile, 'node_modules/@voice-terminal/dsh-plugin')
   await cp(built, installed, { recursive: true, filter: path => path !== join(built, 'node_modules') })
   await writeFile(join(profile, 'package.json'), JSON.stringify({
-    name: 'test-profile', private: true, dependencies: { '@voice-terminal/dsh-plugin': '0.2.0' },
+    name: 'test-profile', private: true, dependencies: { '@voice-terminal/dsh-plugin': '0.2.1' },
     dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', '@voice-terminal/dsh-plugin'], patchReload: 'live' } },
   }))
   await writeFile(join(profile, 'cordis.patch.yml'), [
@@ -88,7 +88,7 @@ try {
     return value
   }
   const prefix = '/api/voice-terminal-shadow/v1/'
-  assert.equal((await api(prefix + 'health')).bundle_version, '0.2.0')
+  assert.equal((await api(prefix + 'health')).bundle_version, '0.2.1')
   const envelope = () => ({ protocol_version: '2.0', request_id: randomUUID(), voice_session_id: 'voice-test', dsh_session_id: 'dsh-loader-test', epoch: 1 })
   assert.equal((await api(prefix + 'session.open', envelope())).result, 'accepted')
   const agent = ctx.agents.list().find(value => value.id === 'dsh-loader-test')
