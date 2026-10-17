@@ -239,7 +239,7 @@ const rows = computed<LocalComponentRow[]>(() => {
   const selectedLocalModel = ttsBackend === 'voxcpm1' ? `tts-${tts.status.value?.local_model ?? settings.tts.local_model ?? 'voxcpm1'}` : undefined
   const localRuntime = managedResource('tts-audiocpp-runtime')
   const localRuntimeReady = localRuntime?.state === 'installed' && !localRuntime.updateAvailable
-  const localModelResources = ['tts-voxcpm1', 'tts-voxcpm2']
+  const localModelResources = ['tts-voxcpm2', 'tts-voxcpm1']
     .map(id => managedResource(id)).filter((resource): resource is ManagedResourceRow => Boolean(resource))
     .map(resource => ({
       ...resource,
@@ -247,38 +247,39 @@ const rows = computed<LocalComponentRow[]>(() => {
         : resource.state === 'installed' ? localRuntimeReady ? '已就绪' : '已安装，运行环境待配置'
           : resource.state === 'incomplete' ? '不完整' : '待安装',
     }))
-  const readyLocalModels = localModelResources.filter(resource => resource.state === 'installed'
-    && !resource.updateAvailable && localRuntimeReady)
-  const selectedLocalResource = localModelResources.find(resource => resource.id === selectedLocalModel)
-  const selectedLocalReady = Boolean(selectedLocalResource?.state === 'installed'
-    && !selectedLocalResource.updateAvailable && localRuntimeReady)
-  const localBusy = Boolean(selectedLocalModel && ttsLoading)
-  const localFailed = Boolean(selectedLocalModel && ttsFailed)
-  const localState = localBusy ? 'loading' : localFailed ? 'failed'
-    : selectedLocalModel ? selectedLocalReady ? 'ready'
-      : selectedLocalResource?.updateAvailable || localRuntime?.updateAvailable ? 'failed' : 'disabled'
-      : readyLocalModels.length ? 'ready'
-        : localModelResources.some(resource => resource.updateAvailable) || localRuntime?.updateAvailable ? 'failed' : 'disabled'
-  const localStatus = localBusy ? tts.status.value?.pending_selection ? '切换中' : '启动中'
-    : localFailed ? '待配置或恢复'
-      : selectedLocalModel && selectedLocalReady ? application.snapshot.value?.startup_complete ? '运行中' : '已就绪'
-        : readyLocalModels.length ? `${readyLocalModels.length}/${localModelResources.length} 个模型已就绪`
-          : localModelResources.some(resource => resource.state === 'installed') ? '已安装，运行环境待配置'
-            : localModelResources.some(resource => resource.updateAvailable) || localRuntime?.updateAvailable ? '需更新' : '待安装'
-  components.push({
-    id: 'voxcpm', name: 'VoxCPM（本地语音合成）', category: 'tts',
-    state: localState, status: localStatus, available: readyLocalModels.length > 0,
-    busy: localBusy, retryable: localFailed && Boolean(capability?.retry),
-    runtime: 'audio.cpp（原生音频推理框架）',
-    residentMemory: selectedLocalModel ? formatComponentMemory(localMetrics?.memory_rss_bytes) : undefined,
-    privateMemory: selectedLocalModel ? formatComponentMemory(localMetrics?.memory_private_commit_bytes) : undefined,
-    vram: selectedLocalModel ? formatComponentMemory(localMetrics?.gpu_dedicated_bytes) : undefined,
-    resourceBytes: selectedLocalModel ? { resident: localMetrics?.memory_rss_bytes ?? undefined, privateCommit: localMetrics?.memory_private_commit_bytes ?? undefined, vram: localMetrics?.gpu_dedicated_bytes ?? undefined } : undefined,
-    description: 'VoxCPM1 与 VoxCPM2 在此统一查看并管理；本地模型和共用运行程序就绪后可在语音与音色页选择。',
-    error: localFailed ? capability?.error || ttsResource?.error || tts.status.value?.error || undefined : undefined,
-    facts: [], resourceChoices: localModelResources, sharedResource: localRuntime,
-    note: '本地运行程序由两个模型共用；下载不会自动切换当前播放后端。',
-  })
+  components.push(...localModelResources.map((resource): LocalComponentRow => {
+    const selected = resource.id === selectedLocalModel
+    const ready = resource.state === 'installed' && !resource.updateAvailable && localRuntimeReady
+    const busy = selected && ttsLoading
+    const failed = selected && ttsFailed
+    const state = busy ? 'loading' : failed ? 'failed'
+      : resource.updateAvailable ? 'failed' : ready ? 'ready' : 'disabled'
+    const status = busy ? tts.status.value?.pending_selection ? '切换中' : '启动中'
+      : failed ? '待配置或恢复'
+        : resource.updateAvailable ? '需更新' : ready ? selected && application.snapshot.value?.startup_complete ? '运行中' : '已就绪'
+          : resource.state === 'installed' ? '已安装，运行环境待配置' : resource.state === 'incomplete' ? '不完整' : '待安装'
+    return {
+      id: resource.id,
+      name: resource.label,
+      category: 'tts',
+      state,
+      status,
+      available: ready && !busy && !failed,
+      busy,
+      retryable: failed && Boolean(capability?.retry),
+      runtime: selected ? 'audio.cpp（原生音频推理程序）' : '',
+      residentMemory: selected ? formatComponentMemory(localMetrics?.memory_rss_bytes) : undefined,
+      privateMemory: selected ? formatComponentMemory(localMetrics?.memory_private_commit_bytes) : undefined,
+      vram: selected ? formatComponentMemory(localMetrics?.gpu_dedicated_bytes) : undefined,
+      resourceBytes: selected ? { resident: localMetrics?.memory_rss_bytes ?? undefined, privateCommit: localMetrics?.memory_private_commit_bytes ?? undefined, vram: localMetrics?.gpu_dedicated_bytes ?? undefined } : undefined,
+      description: `${resource.label} 本地语音模型；与另一款 VoxCPM 共用 audio.cpp 运行程序。`,
+      error: failed ? capability?.error || ttsResource?.error || tts.status.value?.error || undefined : undefined,
+      facts: [],
+      resource,
+      sharedResource: localRuntime,
+      note: 'VoxCPM1 与 VoxCPM2 共用 audio.cpp；下载不会自动切换当前播放后端。',
+    }
+  }))
   const minimaxConfigured = providerConfigured.value.minimax
   const minimaxSelected = ttsBackend === 'minimax'
   components.push({
@@ -287,7 +288,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     status: minimaxSelected && ttsLoading ? '启动中' : minimaxSelected && ttsFailed ? '待配置或恢复' : minimaxConfigured ? '已配置' : '待配置',
     available: minimaxConfigured && !(minimaxSelected && (ttsLoading || ttsFailed)), busy: minimaxSelected && ttsLoading,
     retryable: minimaxSelected && !ttsLoading && ttsFailed && Boolean(capability?.retry),
-    runtime: '在线 API（语音接口）', description: 'MiniMax 在线语音服务。API 密钥在详情中配置；支持的账户用量会显示在组件摘要。',
+    runtime: '', description: 'MiniMax 在线语音服务。API 密钥在详情中配置；支持的账户用量会显示在组件摘要。',
     error: minimaxSelected && ttsFailed ? capability?.error || tts.status.value?.error || undefined : undefined,
     facts: [], provider: providerSettings('minimax'),
   })
@@ -297,7 +298,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     state: startupLoading || providerLoading.value ? 'loading' : providerConfigured.value.deepseek ? 'ready' : 'failed',
     status: startupLoading ? '启动中' : providerLoading.value ? '读取配置中' : providerConfigured.value.deepseek ? '已配置' : '待配置',
     available: providerConfigured.value.deepseek, busy: startupLoading || providerLoading.value,
-    runtime: '在线 API（推理接口）',
+    runtime: '',
     description: startupLoading ? '正在加载组件' : '配置 DeepSeek 接口密钥并查询账户余额。密钥由服务端安全保存，不会返回页面。',
     facts: [], provider: providerSettings('deepseek'),
   })

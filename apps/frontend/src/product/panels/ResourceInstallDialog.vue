@@ -69,7 +69,7 @@ function confirmBundle() {
       <p v-if="controller.pendingDownloadPlan.value.model_bytes">固定资源最多 {{ (controller.pendingDownloadPlan.value.model_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。完整且匹配的资源会跳过。</p>
       <p v-if="targetModelVersion">{{ updatePending ? '本次更新将安装目标模型版本' : '本次下载将安装当前目标模型版本' }}：{{ targetModelVersion }}。</p>
       <p v-for="shared in controller.pendingDownloadPlan.value.shared_resources" :key="shared.resource_id">先准备 {{ shared.title }}，最多 {{ (shared.download_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。从固定官方归档下载并应用随包补丁；另一款模型可复用。</p>
-      <p v-if="controller.pendingDownloadPlan.value.resource_id.startsWith('tts-')">本地语音运行程序独立安装，默认参考音频由本体提供；下载完成后可在语音与音色页选择播放后端。</p>
+      <p v-if="['tts-voxcpm1', 'tts-voxcpm2'].includes(controller.pendingDownloadPlan.value.resource_id)">本地模型依赖 Voice Server（语音服务）中的共享 audio.cpp（本地语音合成引擎）；此计划会先检查并准备运行依赖，再安装模型文件。默认参考音频由模型本体提供。</p>
       <p v-if="!controller.pendingDownloadPlan.value.environment && !controller.pendingDownloadPlan.value.resource_id.startsWith('tts-')">{{ voiceServerUpdatePending ? '本次将更新语音运行环境依赖。' : agentResourcePlan ? `本次将${updatePending ? '更新' : '下载'}代理执行组件文件。` : `本次仅${updatePending ? '更新' : '下载'}模型文件。运行依赖请在 Voice Server（语音服务）中配置。` }}</p>
       <template v-if="controller.pendingDownloadPlan.value.environment">
         <p v-if="gpuDependencyPlan">这是可选显卡运行依赖。将为现用语音环境安装配套的 PyTorch（张量框架）与 torchaudio（音频扩展）显卡版，继续复用已有模型；未安装时可继续使用 CPU（中央处理器）。安装后仍需通过本机显卡检查。</p>
