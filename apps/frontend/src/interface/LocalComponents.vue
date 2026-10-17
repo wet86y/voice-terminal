@@ -100,7 +100,7 @@ function selectedResources(row: LocalComponentRow) {
     <SettingsPageHeader section="compute" title-id="local-components-title">
       <template #actions>
         <button class="outline-button local-refresh" type="button" :disabled="model.refreshing" @click="emit('refresh')">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7A7 7 0 0 1 18 5l2 2M4 17l2 2a7 7 0 0 0 11.9-2" /></svg>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 9a8 8 0 1 0 0 6" /><path d="M20 4.5V9h-4.5" /></svg>
           {{ model.refreshing ? '刷新中' : '刷新' }}
         </button>
       </template>
@@ -208,7 +208,8 @@ function selectedResources(row: LocalComponentRow) {
 .managed-batch-progress{flex-basis:100%}
 .local-resource-progress{padding:0 16px 14px}
 .local-resource-cancel{min-height:var(--compact-control-height);padding:5px 10px;font-size:var(--font-caption);white-space:nowrap}
-.local-refresh{display:inline-flex;align-items:center;gap:6px;flex-shrink:0;min-height:var(--compact-control-height);padding:6px 10px;font-size:var(--font-body)}
+.local-refresh{display:inline-flex;align-items:center;gap:7px;flex-shrink:0;min-height:var(--compact-control-height);padding:6px 10px;font-size:var(--font-body)}
+.local-refresh svg{width:16px;height:16px;stroke-width:1.9}
 svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
 .local-overview{display:grid;gap:12px}
 .local-overview-line,.local-list-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
