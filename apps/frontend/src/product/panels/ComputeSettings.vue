@@ -342,7 +342,7 @@ const model = computed<LocalComponentsModel>(() => {
   const usableTts = rows.value.some(row => row.category === 'tts' && row.state === 'ready' && row.available)
   const failed = rows.value.some(row => row.state === 'failed' && (row.category === 'tts' ? !usableTts
     : row.id.startsWith('capability:') ? row.facts.some(fact => fact.label === '语音门禁')
-      : row.resource?.required !== false))
+      : row.resource?.required === true))
   const loading = rows.value.some(row => row.state === 'loading')
   // 总显存取自受管进程的去重计数，不把整卡占用当作应用占用。
   const gpu = hardware?.gpu
