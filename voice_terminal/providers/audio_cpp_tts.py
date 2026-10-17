@@ -780,7 +780,14 @@ class AudioCppTtsClient:
         self._prewarm_lock = asyncio.Lock()
         self._warmed = False
         self.local_optimization = local_optimization
-        self.acoustic_continuation = acoustic_continuation
+        # acoustic_continuation（跨段声学续接）经长文本实测产生不可接受的时延和 RTF；
+        # 保留构造参数兼容旧配置，但当前本地 VoxCPM 请求固定不使用该能力。
+        self.acoustic_continuation = False
+        if acoustic_continuation:
+            logger.info(
+                "audio_cpp_tts.continuation_disabled（声学续接已固定关闭） configured=%s effective=%s",
+                acoustic_continuation, self.acoustic_continuation,
+            )
         # gpu_max_performance（本地合成期间请求显卡优先最大性能）：免管理员权限、按进程生效，
         # 进程退出即自动还原；不可用时全部降级为无操作，不影响合成。
         self.gpu_performance = GpuPerformanceMode(enabled=gpu_max_performance)
@@ -1057,10 +1064,9 @@ class AudioCppTtsSession:
         # continuation（前文续接）会拼接 prompt_text（前文转写），
         # 每句的括号控制词由此落入正文中间，可能被朗读。
         controlled = bool(self._control_instructions())
-        self._continuation_enabled = (
-            self.client.capabilities.acoustic_continuation
-            and not self._is_prewarm and not self._is_preview and not controlled
-        )
+        # 声学续接及其 continuation_id（续接状态标识）已按性能实验固定关闭。
+        # controlled（带控制词）和预热/样音请求同样不创建跨句段声学状态。
+        self._continuation_enabled = False
         voice = self.voice_snapshot
         self._continuation_reanchor_enabled = bool(
             self._continuation_enabled
@@ -1225,17 +1231,15 @@ class AudioCppTtsSession:
             body["voice_ref"] = str(voice.reference_path.resolve())
             if not self._is_preview and not voice.reference_text.strip():
                 raise self._reject("voice", "请先校对并保存参考音频的准确转写，再使用高保真克隆播报。")
-            # prompt_audio（续写提示音频）与 voice_ref（隔离音色参考）同时使用相同素材。
+            # voice_ref（音色克隆参考）和 reference_text（参考音频转写）保留；
+            # prompt_audio（续接提示音频）实测造成不可接受的时延和 RTF，因此不提交。
             if voice.reference_text.strip():
                 body["reference_text"] = voice.reference_text
                 if not self._is_preview:
                     if not getattr(self.client.server, "supports_reference_prompt", True):
                         raise self._reject("runtime", "本地语音运行程序尚不支持高保真流式克隆，请更新本地语音运行组件后重试。")
-                    body["prompt_audio"] = body["voice_ref"]
         self._request_had_audio = False
-        if self._continuation_enabled:
-            body["continuation_id"] = self._continuation_id
-            self._context_requested = True
+        # 不向 /v1/audio/speech（流式语音接口）提交 continuation_id（续接状态标识）。
         received_for_request = 0
         output_for_request = 0
         saw_audio_done = False
@@ -1387,6 +1391,8 @@ class AudioCppTtsSession:
                 "native_sample_rate": self.client.native_sample_rate,  # 原生采样率。
                 "voice_id": voice.voice_id,  # 音色标识。
                 "continuation_id": self._continuation_id if self._context_requested else None,  # 续接标识。
+                "prompt_audio_sent": "prompt_audio" in body,  # prompt_audio_sent（是否提交续接提示音频）。
+                "continuation_id_sent": "continuation_id" in body,  # continuation_id_sent（是否提交续接状态标识）。
                 "generation_budget_ms": budget_ms,  # 生成时长预算。
                 "endpoint": path,  # 本次实际合成入口。
                 "reference_recipe": ("reference_prompt" if voice.reference_path and voice.reference_text.strip()
@@ -1400,13 +1406,15 @@ class AudioCppTtsSession:
                 "audio_cpp_tts.request_complete turn=%s speech=%s session=%s local_model=%s model_id=%s chars=%d "
                 "pcm_bytes=%d native_pcm_bytes=%d ttfb_ms=%.1f request_lock_wait_ms=%.1f "
                 "http_first_audio_ms=%.1f total_ms=%.1f audio_ms=%.1f rtf=%.3f "
-                "continuation_enabled=%s segment_index=%d num_inference_steps=%s sample_rate=%d "
+                "continuation_enabled=%s prompt_audio_sent（是否提交续接提示音频）=%s "
+                "continuation_id_sent（是否提交续接状态标识）=%s segment_index=%d num_inference_steps=%s sample_rate=%d "
                 "native_sample_rate=%d voice_id=%s continuation_id=%s endpoint=%s reference_recipe=%s "
                 "budget_ms=%d engine_audio_duration_ms=%s text_digest=%s%s",
                 *self._tts_fields(), self.client.local_model, self.client.model_id, len(text),
                 output_for_request, received_for_request, ttfb_ms or 0.0, metrics["request_lock_wait_ms"],
                 metrics["http_first_audio_ms"] or 0.0, total_ms, audio_ms, rtf or 0.0,
-                self._continuation_enabled, self.completed_segments - 1, metrics["num_inference_steps"],
+                self._continuation_enabled, metrics["prompt_audio_sent"], metrics["continuation_id_sent"],
+                self.completed_segments - 1, metrics["num_inference_steps"],
                 self.client.sample_rate, self.client.native_sample_rate, voice.voice_id,
                 metrics["continuation_id"], path, metrics["reference_recipe"], budget_ms,
                 metrics["engine_audio_duration_ms"], text_digest(text), text_preview_suffix(text),
