@@ -54,6 +54,7 @@
 - [桌面现场验收](testing/desktop-acceptance.md)
 - [CAM++（声纹模型）流式验收](testing/campplus-streaming-acceptance-20261012.md)
 - [下载与首次启动修复验收](testing/download-startup-flow-20261010.md)
+- [DSH 0.2.1-rc.2 升级与分发验收](testing/dsh-rc2-upgrade-20261017.md)
 - [本地模型计算基准](testing/local-model-compute-benchmark.md)
 - [VoxCPM2 停用续接提示的性能复核](testing/local-tts-reference-only-20261017.md)
 - [本地 TTS 续写锚点回归](testing/local-tts-continuation-reanchor-20261017.md)

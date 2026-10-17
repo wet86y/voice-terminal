@@ -24,7 +24,9 @@ export function npmArguments(target, spec, npmVersion = '0.0.0') {
   const [major, minor] = npmVersion.trim().split('.').map(Number)
   // npm（包管理器）新版本默认拦截未列入策略的生命周期脚本；按上游声明安装，不另维护依赖版本策略。
   const scripts = major > 11 || major === 11 && minor >= 17 ? ['--dangerously-allow-all-scripts'] : []
-  return ['install', '--prefix', target, '--package-lock=false', '--omit=dev', '--no-audit', '--no-fund', '--no-update-notifier', '--prefer-offline', '--loglevel=info', '--ignore-scripts=false', ...scripts, '--registry', spec.registry_url]
+  // Exact target releases may be published after an older packument entered npm's cache.
+  // Refresh registry metadata while npm still reuses immutable package archives from cache.
+  return ['install', '--prefix', target, '--package-lock=false', '--omit=dev', '--no-audit', '--no-fund', '--no-update-notifier', '--prefer-online', '--loglevel=info', '--ignore-scripts=false', ...scripts, '--registry', spec.registry_url]
 }
 export async function readJson(path) { return JSON.parse((await readFile(path, 'utf8')).replace(/^\uFEFF/u, '')) }
 export function isCurrent(metadata, spec) {
@@ -67,7 +69,7 @@ export async function install(program, target, npmCli, workspace) {
   delete env.NODE_OPTIONS
   delete env.ELECTRON_RUN_AS_NODE
   const npmVersion = await run([npmCli, '--version'], target, env, true)
-  process.stdout.write('VOICE_DSH_PHASE 正在解析依赖，优先使用 npm（包管理器）缓存\n')
+  process.stdout.write('VOICE_DSH_PHASE 在线刷新版本元数据并复用已下载的 npm（包管理器）归档缓存\n')
   await run([npmCli, ...npmArguments(target, spec, npmVersion)], target, env)
   process.stdout.write('VOICE_DSH_PHASE 核对 DSH（代理宿主）版本、资源及启动入口\n')
   const pkg = await readJson(safePath(target, `${spec.modules}/${spec.package_name}/package.json`))

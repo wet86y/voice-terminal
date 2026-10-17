@@ -37,7 +37,7 @@ try {
   }
   await writeFile(resolve(stageRoot, 'tsdown.config.ts'), [
     "import { clientBundle } from '../tsdown.client.ts'",
-    `export default clientBundle(${JSON.stringify(manifest.name)}, ['src/bridge/plugin.ts'], { hostPhase: true })`,
+    "export default clientBundle(import.meta.dirname, ['src/bridge/plugin.ts'], { hostPhase: true })",
     '',
   ].join('\n'), 'utf8')
 

@@ -733,15 +733,15 @@
       "kind": "dsh",
       "title": "DeepSeek Harness（代理执行宿主）",
       "destination": "runtimes/dsh",
-      "version": "0.2.0-rc.2",
+      "version": "0.2.1-rc.2",
       "required": true,
       "origin": "npm_package",
       "source": {
         "platform": "deepseek_official",
         "repo_id": "deepseek-ai/deepseek-harness",
-        "revision": "dsh-v0.2.0-rc.2",
+        "revision": "dsh-v0.2.1-rc.2",
         "page_url": "https://www.npmjs.com/package/@deepseek-ai/dsh",
-        "license_url": "https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/LICENSE",
+        "license_url": "https://github.com/deepseek-ai/deepseek-harness/blob/687f282e8625c6b8d11ff58211a90524be2e4317/LICENSE",
         "official_transfer": {
           "kind": "native_official_installer",
           "artifact": {

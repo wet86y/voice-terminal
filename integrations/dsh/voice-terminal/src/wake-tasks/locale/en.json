@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Voice Terminal Wake Tasks",
+    "description": "Project wake tasks with persistent storage, triggers, and event publishing."
+  }
+}

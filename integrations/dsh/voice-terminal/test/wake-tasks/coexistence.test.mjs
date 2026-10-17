@@ -9,6 +9,7 @@ import test from 'node:test'
 const repo = resolve(fileURLToPath(new URL('../../../../../', import.meta.url)))
 const dshSource = join(repo, '.local/build/dsh/source')
 const scheduleDir = join(dshSource, 'packages/schedule/schedule')
+const scheduleToolsDir = join(dshSource, 'packages/schedule/tool-schedule')
 const scheduleRequire = createRequire(join(scheduleDir, 'package.json'))
 const toolsRequire = createRequire(join(dshSource, 'packages/core/tools/package.json'))
 
@@ -77,13 +78,15 @@ test('官方 schedule_*（会话任务工具）与项目 wake_task_*（语音链
     const toolRuntimeModule = await import(pathToFileURL(toolsRequire.resolve('@deepseek-ai/dsh-tools')).href)
     const scopeModule = await import(pathToFileURL(toolsRequire.resolve('@deepseek-ai/dsh-scope')).href)
     const scheduleModule = await import(pathToFileURL(join(scheduleDir, 'lib/index.js')).href)
+    const scheduleToolsModule = await import(pathToFileURL(join(scheduleToolsDir, 'lib/index.js')).href)
     const builtPlugin = await import(pathToFileURL(join(bundleDir, 'lib/wake-tasks/plugin.js')).href)
 
     const { Context } = cordis
     const SystemPrompt = systemPromptModule.default
     const ToolRuntime = toolRuntimeModule.default
     const { createScope } = scopeModule
-    const { ScheduleService, registerScheduleTools } = scheduleModule
+    const { ScheduleService } = scheduleModule
+    const ToolSchedule = scheduleToolsModule
 
     async function mountHarness() {
       const ctx = new Context()
@@ -91,6 +94,7 @@ test('官方 schedule_*（会话任务工具）与项目 wake_task_*（语音链
       const agents = {
         roots: () => rootAgents,
         list: () => rootAgents,
+        get: id => rootAgents.find(agent => agent.session.id === id),
         withoutInitiator: operation => operation(),
       }
       const table = {
@@ -120,7 +124,11 @@ test('官方 schedule_*（会话任务工具）与项目 wake_task_*（语音链
       await ctx.plugin(SystemPrompt, {})
       await ctx.plugin(ToolRuntime)
 
-      const agent = { id: 'root-agent', session: { id: 'session-coexistence', snapshotEvents: () => [] } }
+      const agent = {
+        id: 'root-agent',
+        session: { id: 'session-coexistence', header: { delegationDepth: 0 }, snapshotEvents: () => [] },
+        options: {},
+      }
       let scope
       const scopePlugin = Object.assign(function coexistenceRootAgentScope(inner) {
         scope = createScope(inner, agent)
@@ -129,10 +137,10 @@ test('官方 schedule_*（会话任务工具）与项目 wake_task_*（语音链
       const scopeFiber = await ctx.plugin(scopePlugin)
       const scheduleFiber = await ctx.plugin(ScheduleService)
       rootAgents = [agent]
-      const releaseNativeTools = registerScheduleTools(ctx, agent.ctx, agent)
+      const nativeToolsFiber = await agent.ctx.plugin(ToolSchedule)
 
       const harness = {
-        ctx, agent, webServer, scheduleFiber, scopeFiber, releaseNativeTools,
+        ctx, agent, webServer, scheduleFiber, scopeFiber, nativeToolsFiber,
         projectFiber: undefined,
         async mountProjectPlugin() {
           const projectPlugin = Object.assign(function builtWakeTasksPlugin(inner) {
@@ -150,7 +158,7 @@ test('官方 schedule_*（会话任务工具）与项目 wake_task_*（语音链
         },
         async dispose() {
           await this.disposeProjectPlugin()
-          releaseNativeTools()
+          await nativeToolsFiber.dispose()
           await ctx.fiber.dispose()
         },
       }

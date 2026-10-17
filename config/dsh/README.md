@@ -1,10 +1,10 @@
 # 项目 DSH 基线
 
 Voice Terminal 选定的 DeepSeek Harness（DSH，代理执行宿主）目标版本为预发布版
-`dsh-v0.2.0-rc.2`，提交号为
-`639ed015397290b3745d163aafe02ffee4aa3f84`。这不是稳定版；升级必须显式更新锁定文件、许可证快照和回归检查，
+`dsh-v0.2.1-rc.2`，提交号为
+`687f282e8625c6b8d11ff58211a90524be2e4317`。这不是稳定版；升级必须显式更新锁定文件、许可证快照和回归检查，
 不追踪浮动版本。当前源码将 Bridge（桥接）、Wake Tasks（项目唤醒任务）和 Shadow preset（影子代理预设）合并为
-`@voice-terminal/dsh-plugin`（统一功能包）0.2.0，Bridge protocol（桥接协议）仍为 2.0。组件职责、兼容契约和维护门槛见
+`@voice-terminal/dsh-plugin`（统一功能包）0.2.1，Bridge protocol（桥接协议）仍为 2.0。组件职责、兼容契约和维护门槛见
 [DSH 插件维护手册](../../docs/guides/dsh-plugin-maintenance.md)。2026-10-07 已完成项目内统一包安装迁移，
 构建记录格式为 6，117 个原有数据文件摘要核对一致；完整结果见[本轮安装与验证](../../docs/guides/dsh-plugin-maintenance.md)。
 桌面发行目录仍按独立发布流程管理，本轮没有重新发布便携程序。
@@ -28,20 +28,20 @@ Bridge（桥接插件）22 passed（通过）；Wake Tasks（唤醒任务插件�
 正式 `shadow-agent`（影子执行代理）由 `integrations/dsh/voice-terminal/preset/shadow-agent/` 维护。
 插件构建将该配置合入统一 Bundle（功能包）的组合补丁，安装到 Web
 profile（网页配置），并通过 `agent-preset-registry`（Agent 预设注册器）的 `default`（部署默认预设字段）
-设为默认项。DSH 0.2.0-rc.2 不再读取 DSH_HOME（数据目录）中旧版 `.agent-presets/` 目录；该目录即使为回退保留，也不会注册预设。
+设为默认项。DSH 0.2.1-rc.2 不再读取 DSH_HOME（数据目录）中旧版 `.agent-presets/` 目录；该目录即使为回退保留，也不会注册预设。
 
 项目 DSH Web Host（DSH 网页服务）仅监听 `127.0.0.1:3081`，由 Voice Server（语音服务）管理。
 从桌面程序打开 Voice Terminal，再使用工作台“后台协作”面板底部的“代理控制台”入口取得一次性访问地址；
 直接访问 3081 不带 launch token（临时访问令牌）时不能完成网页授权。不要收藏、记录或分享带
 `?token=` 的完整地址。
 
-`voice-terminal-shadow-bridge`（保留的桥接加载行与设置命名空间）使用 DSH v0.2.0-rc.2 的公开插件接口。
+`voice-terminal-shadow-bridge`（保留的桥接加载行与设置命名空间）使用 DSH v0.2.1-rc.2 的公开插件接口。
 设置页面继续使用 `configForms`（设置表单服务）；旧的 `settingsScope` 接口已移除。页面注册受服务
 生命周期控制，避免服务尚未就绪时插件启动失败。
 
 ## 目标版本配套升级说明
 
-DSH v0.2.0-rc.2 将原生 Schedule（会话定时任务服务）移入可选 Automation Bundle（自动化功能包）
+DSH v0.2.1-rc.2 保留原生 Schedule（会话定时任务服务）位于可选 Automation Bundle（自动化功能包）
 `@deepseek-ai/dsh-experimental-schedule-bundle`。该 Bundle 随官方 CLI（命令行程序）安装但默认关闭；
 用户可通过 Web（网页）侧栏的 Plugins（插件）页面启用。启用后，原生 `schedule_create/list/update/delete`
 （创建、列出、更新、删除会话任务工具）按 DSH Session（会话）存储并投递到所属会话，原生任务页也随之启用。
@@ -51,6 +51,8 @@ DSH v0.2.0-rc.2 将原生 Schedule（会话定时任务服务）移入可选 Aut
 `schedule_wake`（创建简易唤醒任务）使用项目自己的任务目录，触发后投递到当前 Voice（语音）主线关联的
 DSH 会话。两套工具名、存储和投递目标分开；启用官方 Bundle（功能包）不会将原生 DSH 任务导入 Voice
 任务，也不会关闭项目唤醒任务。
+
+rc.2 另加入 DeepSeek-V4.1-Flash-1017 模型选项和 Search/Fetch API（搜索与抓取接口）。rc.1 起的兼容检查会读取插件 `engines.dsh`（宿主版本范围）和同宿主依赖；项目功能包因此锁定 Cordis `~4.0.5`、Schemastery `~3.18.5`、Loader `~1.0.6`，并为 `./wake-tasks`（唤醒任务子路径）导出英文与简体中文元数据。rc.1 的会话格式已迁移至 V4；附件读取与导出也按新接口回归验证。
 
 升级 profile（配置档案）时，旧的根级 `schedule`（原生调度服务）或 `ui-schedule`（原生任务页）禁用补丁
 可能指向未挂载的条目并产生 `patch: entry <id> not found`（补丁目标不存在）警告；若出现，应移除这类过时

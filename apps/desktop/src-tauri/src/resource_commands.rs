@@ -651,6 +651,11 @@ impl ResourceManager {
         let mut transaction=match voice_desktop_common::resources::begin_activation(&self.context,stage,relative){
             Ok(value)=>value,Err(error)=>return Err(self.settle_before_activation(&mut lease,&error)),
         };
+        if relative=="runtimes/dsh" {
+            if let Err(error)=voice_desktop_common::resources::validate_dsh_activation(&self.context){
+                return Err(self.rollback_failed_activation(&mut lease,&mut transaction,&error));
+            }
+        }
         let pending=match self.pending_service_resume(){Ok(value)=>value,Err(error)=>return Err(self.rollback_failed_activation(&mut lease,&mut transaction,&error))};
         let resumed=if pending {
             match self.maybe_resume_service(&mut lease){
