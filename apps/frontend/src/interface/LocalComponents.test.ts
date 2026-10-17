@@ -29,6 +29,29 @@ async function expandComponent(wrapper: ReturnType<typeof mount>, category: stri
 }
 
 describe('LocalComponents（本地组件）运行环境与导入入口', () => {
+  it('分类摘要会跟随子组件显示启动中、运行中和错误状态', async () => {
+    const value = model()
+    value.rows = [{
+      id: 'fsmn-vad', name: 'FSMN-VAD（语音活动检测）', category: 'extensions',
+      state: 'loading', status: '启动中', available: false, runtime: 'ONNX Runtime',
+      description: '正在加载语音检测组件。', facts: [],
+    }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    const summary = wrapper.get('[data-category="extensions"] .local-category-observability .local-state')
+    expect(summary.text()).toBe('启动中')
+    expect(summary.classes()).toContain('loading')
+
+    await wrapper.setProps({ model: { ...value, rows: [{ ...value.rows[0]!, state: 'ready', status: '运行中', available: true }] } })
+    expect(summary.text()).toBe('运行中')
+    expect(summary.classes()).toContain('ready')
+
+    await wrapper.setProps({ model: { ...value, rows: [{ ...value.rows[0]!, state: 'failed', status: '不可用', available: false,
+      error: '组件启动失败', facts: [{ label: '语音门禁', value: '未就绪时暂不能开始会话' }] }] } })
+    expect(summary.text()).toBe('错误')
+    expect(summary.classes()).toContain('failed')
+    wrapper.unmount()
+  })
+
   it('语音服务展开三个依赖卡片，可选项不影响父级就绪且分类下载标记为可选', async () => {
     const value = model()
     value.rows[0]!.runtimeDependencies = [
