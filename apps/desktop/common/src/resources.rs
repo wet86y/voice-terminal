@@ -227,13 +227,27 @@ fn model_update_available(spec:&Value,installed:&InstalledModel)->bool{
     !installed_model_content_matches(spec,installed)
 }
 
+/// native_runtime_status（可选原生运行依赖卡片）：只核对收据，不引入新的启动门槛。
+pub fn native_runtime_status(context:&LaunchContext)->Result<Value,String>{
+    let item=spec(context,"tts-audiocpp-runtime").ok();
+    let inspected=item.as_ref().map(|item|inspect_installed_model(context,item,false));
+    let installed=inspected.as_ref().is_some_and(|value|value.is_ok());
+    let update=item.as_ref().zip(inspected.as_ref()).is_some_and(|(item,value)|value.as_ref().is_ok_and(|value|model_update_available(item,value)));
+    let present=context.install.join("models/audiocpp/runtime").exists();
+    Ok(json!({"resource_id":"tts-audiocpp-runtime","parent_resource_id":"voice-server","label":"audio.cpp（语音合成引擎）运行依赖","required":false,
+        "installation_state":if installed{"installed"}else if present{"incomplete"}else{"missing"},"files_installed":installed,"runtime_ready":installed&&!update,"can_start":installed&&!update,
+        "update_available":update,"version":item.as_ref().map(|value|value["version"].clone()),
+        "error":inspected.and_then(Result::err),
+        "fields":{"resource_id":"原生运行包资源编号","parent_resource_id":"所属语音服务组件","label":"依赖名称","required":"可选依赖，不独立阻止整体启动","installation_state":"运行包安装状态","files_installed":"运行包文件完整","runtime_ready":"运行包满足当前清单","can_start":"运行依赖已就绪","update_available":"运行包需要更新","version":"目标版本","error":"未就绪原因"}}))
+}
+
 pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
     let runtime=crate::runtime::status(context)?;let groups=runtime["groups"].clone();
     let ready=runtime["full_ready"]==true;
     let mut rows=vec![json!({"resource_id":"voice-server","label":"Voice Server（语音服务）","installation_state":if runtime["interpreter_ready"]==true{"installed"}else{"missing"},
         "required":true,"files_installed":runtime["interpreter_ready"],"runtime_ready":ready,"can_start":ready,"runtime_group":"all","python":runtime["python"],"version":runtime["version"],
-        "update_available":runtime["update_available"],"source_url":"https://www.python.org/downloads/release/python-31210/","error":if ready{Value::Null}else if runtime["update_available"]==true{json!("语音运行依赖有更新，请更新完整运行环境后再启动。")}else{json!("请下载或导入完整 Python（后端运行环境），程序将一次检测并补齐全部语音依赖。")},
-        "fields":{"files_installed":"私有解释器已安装","runtime_ready":"全部语音依赖已按当前锁定版本就绪","can_start":"具备启动条件且没有待更新组件","runtime_group":"完整语音依赖","python":"私有解释器路径","version":"解释器版本","update_available":"运行环境依赖锁版本可更新"}})];
+        "runtime_components":runtime["components"],"update_available":runtime["update_available"],"source_url":"https://www.python.org/downloads/release/python-31210/","error":if ready{Value::Null}else if runtime["update_available"]==true{json!("语音运行依赖有更新，请更新完整运行环境后再启动。")}else{json!("请下载或导入完整 Python（后端运行环境），程序将一次检测并补齐全部语音依赖。")},
+        "fields":{"files_installed":"私有解释器已安装","runtime_ready":"全部必需语音依赖已按当前锁定版本就绪","can_start":"具备启动条件且没有待更新必需组件","runtime_components":"语音服务下的中央处理器、原生语音与显卡运行依赖卡片","runtime_group":"完整语音依赖","python":"私有解释器路径","version":"解释器版本","update_available":"运行环境依赖锁版本可更新"}})];
     let catalog=specs(context)?;
     for item in &catalog {
         let root=destination(context,&item)?;

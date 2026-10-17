@@ -175,7 +175,17 @@ impl ResourceManager {
         self.start_job(job_id.clone(),"gpu-environment".into(),"检测登记显卡环境".into(),true,move|manager,id|{
             let context=&manager.context;
             let path=context.data.join("config/gpu-environment.json");
-            let mut registration=voice_desktop_common::resources::load(&path).map_err(|message|JobError::Failed{message,installed:vec![]})?;
+            let mut registration=voice_desktop_common::resources::load(&path).unwrap_or(Value::Null);
+            let state=voice_desktop_common::runtime::status(context).map_err(|message|JobError::Failed{message,installed:vec![]})?;
+            let managed=state["components"].as_array().is_some_and(|rows|rows.iter().any(|row|row["resource_id"]==voice_desktop_common::runtime::GPU_RESOURCE&&row["can_start"]==true));
+            if managed&&registration["path"]!="runtimes/python"{registration=Value::Null;}
+            // 显卡卡片安装后可直接检测现用环境，无需用户再手动登记第二份解释器。
+            if registration.is_null(){
+                if !managed{
+                    return Err(JobError::Failed{message:"请先安装 GPU（图形处理器）运行依赖。".into(),installed:vec![]});
+                }
+                registration=json!({"schema":1,"path":"runtimes/python","models":{},"fields":{"schema":"显卡登记格式","path":"现用工作区解释器目录","models":"逐模型实际推理检测结果","environment_fingerprint":"运行环境文件指纹","models_fingerprint":"共享模型文件指纹","gpu_hardware":"显卡硬件信息"}});
+            }
             let relative=registration["path"].as_str().unwrap_or("");
             if !["runtimes/python-gpu","runtimes/python"].contains(&relative){return Err(JobError::Failed{message:"登记环境路径无效".into(),installed:vec![]});}
             let python=voice_desktop_common::workspace::safe_path(&context.install,&format!("{relative}/python.exe")).map_err(|message|JobError::Failed{message,installed:vec![]})?;
@@ -224,8 +234,10 @@ impl ResourceManager {
     pub fn snapshots(&self)->Vec<Value>{let mut rows=self.jobs.lock().unwrap().values().map(|job|event_value(&job.snapshot)).collect::<Vec<_>>();rows.sort_by_key(|row|row["created_at"].as_u64().unwrap_or(0));rows}
     pub fn has_active_jobs(&self)->bool{self.jobs.lock().map(|jobs|jobs.values().any(|job|!terminal(&job.snapshot.state))).unwrap_or(true)}
     pub fn configure_runtime(self:&Arc<Self>,group:String)->Result<Value,String>{
+        if matches!(group.as_str(),"audiocpp"|"tts-audiocpp-runtime"){return self.download("tts-audiocpp-runtime".into());}
         let job_id=format!("env-{group}");
-        self.start_job(job_id.clone(),"voice-server".into(),"正在配置语音环境".into(),true,move|manager,id|{
+        let resource_id=if voice_desktop_common::runtime::gpu_requested(&group){voice_desktop_common::runtime::GPU_RESOURCE}else{"voice-server"};
+        self.start_job(job_id.clone(),resource_id.into(),"正在配置语音环境".into(),true,move|manager,id|{
             let cancel=manager.cancel_signal(&id)?;
             let mut progress=|phase:&str,done:u64,total:u64|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total));
             let _environment=acquire_environment_lock(&manager.environment,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:vec![]})?;
@@ -234,21 +246,26 @@ impl ResourceManager {
         })?;Ok(json!({"job_id":job_id}))
     }
     pub fn import_runtime(self:&Arc<Self>)->Result<Value,String>{
+        self.import_runtime_profile("all".into())
+    }
+    fn import_runtime_profile(self:&Arc<Self>,group:String)->Result<Value,String>{
         let job_id=new_job_id("env-import");
-        self.start_job(job_id.clone(),"voice-server".into(),"选择语音环境目录".into(),true,move|manager,id|{
+        let resource_id=if voice_desktop_common::runtime::gpu_requested(&group){voice_desktop_common::runtime::GPU_RESOURCE}else{"voice-server"};
+        self.start_job(job_id.clone(),resource_id.into(),"选择语音环境目录".into(),true,move|manager,id|{
             let source=voice_desktop_common::native_ui::choose_folder("选择已准备的程序私有 Python（后端环境）目录")
                 .map_err(|message|JobError::Failed{message,installed:vec![]})?.ok_or(JobError::Cancelled)?;
             let cancel=manager.cancel_signal(&id)?;
             let mut progress=|phase:&str,done:u64,total:u64|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total));
             let _environment=acquire_environment_lock(&manager.environment,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:vec![]})?;
-            let result=voice_desktop_common::runtime::import_with_activation(&manager.context,&source,cancel,&mut progress,&mut|stage,relative|manager.activate_resource(&id,stage,relative));
+            let result=voice_desktop_common::runtime::import_profile_with_activation(&manager.context,&source,&group,cancel,&mut progress,&mut|stage,relative|manager.activate_resource(&id,stage,relative));
             result.map_err(|message|JobError::Failed{message,installed:vec![]})
         })?;Ok(json!({"job_id":job_id}))
     }
 
     /// Download（下载）：run a fixed plan, retaining a stable task ID for resuming files.
     pub fn download(self: &Arc<Self>, resource_id: String) -> Result<Value, String> {
-        if resource_id=="voice-server"{return self.configure_runtime("all".into());}
+        if matches!(resource_id.as_str(),"voice-server"|voice_desktop_common::runtime::CPU_RESOURCE){return self.configure_runtime("cpu".into());}
+        if resource_id==voice_desktop_common::runtime::GPU_RESOURCE{return self.configure_runtime("gpu".into());}
         if !valid_resource_id(&resource_id) {
             return Err("资源编号格式无效。".into());
         }
@@ -266,6 +283,8 @@ impl ResourceManager {
     /// Import（导入）：open the native picker on a worker thread and install selected sources.
     pub fn import(self: &Arc<Self>, resource_id: Option<String>) -> Result<Value, String> {
         if resource_id.as_deref()==Some("voice-server"){return self.import_runtime();}
+        if resource_id.as_deref()==Some(voice_desktop_common::runtime::CPU_RESOURCE){return self.import_runtime_profile("cpu".into());}
+        if resource_id.as_deref()==Some(voice_desktop_common::runtime::GPU_RESOURCE){return self.import_runtime_profile("gpu".into());}
         if let Some(id) = &resource_id {
             if !valid_resource_id(id) {
                 return Err("资源编号格式无效。".into());
@@ -285,7 +304,13 @@ impl ResourceManager {
 
     /// OpenSource（打开来源）：read only the locally pinned URL from the packaged catalog.
     pub fn open_source(&self, resource_id: &str) -> Result<(), String> {
-        if resource_id=="voice-server"{
+        if resource_id==voice_desktop_common::runtime::GPU_RESOURCE{
+            #[cfg(windows)]
+            return voice_desktop_common::windows::open_url("https://pytorch.org/get-started/locally/").map_err(|_|"无法打开 PyTorch（张量框架）官方来源。".into());
+            #[cfg(not(windows))]
+            return Err("打开资源来源仅支持 Windows（操作系统）。".into());
+        }
+        if matches!(resource_id,"voice-server"|voice_desktop_common::runtime::CPU_RESOURCE){
             #[cfg(windows)]
             return voice_desktop_common::windows::open_url("https://www.python.org/downloads/release/python-31210/").map_err(|_|"无法打开 Python（后端解释器）官方来源。".into());
             #[cfg(not(windows))]
@@ -664,7 +689,9 @@ impl ResourceManager {
     }
     fn prepare_environment(&self,job_id:&str,group:&str,cancel:Arc<AtomicBool>,progress:&mut voice_desktop_common::resources::Progress<'_>)->Result<Vec<String>,String>{
         voice_desktop_common::resources::check_cancel(&cancel)?;
-        let ready=voice_desktop_common::runtime::status(&self.context)?["full_ready"]==true;
+        let state=voice_desktop_common::runtime::status(&self.context)?;
+        let gpu_ready=state["components"].as_array().is_some_and(|rows|rows.iter().any(|row|row["resource_id"]==voice_desktop_common::runtime::GPU_RESOURCE&&row["can_start"]==true));
+        let ready=state["full_ready"]==true&&(!voice_desktop_common::runtime::gpu_requested(group)||gpu_ready);
         let verified=self.prepared_environment.lock().map_err(|_|"环境复用状态不可用。")?.clone();
         if ready&&verified.is_some(){
             progress("核对本次已验证共享环境是否变化",0,0);

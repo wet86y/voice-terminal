@@ -31,8 +31,8 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
   async function expandComponent(id: string, category: string) {
     await expandCategory(category)
     const card = wrapper!.get(`[data-component="${id}"]`)
-    const toggle = card.get('.local-component-action')
-    if (toggle.attributes('aria-expanded') !== 'true') await toggle.trigger('click')
+    const toggle = card.find('.local-component-action')
+    if (toggle.exists() && toggle.attributes('aria-expanded') !== 'true') await toggle.trigger('click')
     return card
   }
 
@@ -95,6 +95,34 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(start).toHaveBeenCalledTimes(1)
   })
 
+  it('语音运行依赖分为三个子卡片，可选依赖默认不勾选且不阻塞启动', async () => {
+    inventory = inventory.map(item => ({ ...item, installation_state: 'installed', files_installed: true, runtime_ready: true, can_start: true }))
+    inventory[0]!.runtime_components = [
+      { ...row('voice-runtime-cpu', 'CPU（中央处理器）运行依赖', true), required: true },
+      { ...row('tts-audiocpp-runtime', 'audio.cpp（语音合成引擎）运行依赖'), required: false },
+      { ...row('voice-runtime-gpu', 'GPU（图形处理器）运行依赖'), required: false },
+    ]
+    wrapper = mount(ManagementApp)
+    await flushPromises()
+    expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
+    const voice = await expandComponent('voice-system', 'voice-server')
+    expect(voice.findAll('[data-runtime-dependency]')).toHaveLength(3)
+    await wrapper.get('[data-category="voice-server"] .category-download').trigger('click')
+    await flushPromises()
+    const options = wrapper.findAll('.install-bundle-choice input')
+    expect(options).toHaveLength(2)
+    expect(options.every(option => !(option.element as HTMLInputElement).checked)).toBe(true)
+    expect(wrapper.get('.install-plan-actions button').attributes('disabled')).toBeDefined()
+    const gpu = wrapper.get('.install-bundle-choice input').element as HTMLInputElement
+    // 先选择任一可选依赖，再按其资源编号启动现有安装任务。
+    await options[1]!.setValue(true)
+    await wrapper.get('.install-plan-actions button').trigger('click')
+    await flushPromises()
+    expect(download).toHaveBeenCalledWith('voice-runtime-gpu')
+    expect(download).not.toHaveBeenCalledWith('voice-runtime-cpu')
+    expect(gpu.type).toBe('checkbox')
+  })
+
   it('可选 CAM++（声纹模型）缺失或待更新不禁用启动按钮', async () => {
     inventory = inventory.map(item => ({ ...item, installation_state: 'installed', files_installed: true, runtime_ready: true, can_start: true }))
     inventory.push({ ...row('campplus-zh-cn-common', 'CAM++（可选声纹模型）'), required: false, update_available: true })
@@ -102,7 +130,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     await flushPromises()
     expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
     const campplus = await expandComponent('campplus', 'extensions')
-    expect(campplus.get('.local-component-detail').text()).toContain('可选组件，缺失或待更新不阻塞启动')
+    expect(campplus.get('.local-state').text()).toBe('需更新')
     await wrapper.get('.start-program').trigger('click')
     expect(start).toHaveBeenCalledOnce()
   })
@@ -270,7 +298,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(card.get('.local-state').text()).toBe('需更新')
     expect(card.get('button[aria-label="SenseVoice（精修模型）：更新"]').text()).toBe('更新')
     expect(card.get('button[aria-label="SenseVoice（精修模型）：导入"]').text()).toBe('导入')
-    expect(card.get('button[aria-label="SenseVoice（精修模型）：跳转官方来源"]').text()).toBe('来源说明')
+    expect(card.get('button[aria-label="SenseVoice（精修模型）：跳转官方来源"]').text()).toBe('跳转来源')
     await card.get('button[aria-label="SenseVoice（精修模型）：更新"]').trigger('click')
     await flushPromises()
     expect(wrapper.get('#install-plan-title').text()).toContain('准备更新 SenseVoice')
@@ -329,7 +357,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(wrapper.get('.management-start').text()).toContain('有组件需更新并通过校验后才能启动语音服务')
     const card = await expandComponent('sensevoice', 'speech')
     expect(card.get('.local-state').text()).toBe('需更新')
-    expect(card.get('button[aria-label="SenseVoice（精修模型）：更新"]').text()).toBe('重试更新')
+    expect(card.get('button[aria-label="SenseVoice（精修模型）：重试更新"]').text()).toBe('重试更新')
     expect(start).not.toHaveBeenCalled()
     wrapper.unmount()
     wrapper = undefined
@@ -349,7 +377,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(card.get('.local-state').text()).toBe('需更新')
     expect(card.get('button[aria-label="Voice Server（语音服务）：更新"]').text()).toBe('更新')
     expect(card.get('button[aria-label="Voice Server（语音服务）：导入"]').text()).toBe('导入')
-    expect(card.get('button[aria-label="Voice Server（语音服务）：跳转官方来源"]').text()).toBe('来源说明')
+    expect(card.get('button[aria-label="Voice Server（语音服务）：跳转官方来源"]').text()).toBe('跳转来源')
     await card.get('button[aria-label="Voice Server（语音服务）：更新"]').trigger('click')
     await flushPromises()
     expect(wrapper.get('#install-plan-title').text()).toBe('准备更新 Voice Server（语音服务）')
@@ -443,7 +471,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     await flushPromises()
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
     await wrapper.get('[data-category="tts"] .local-category-toggle').trigger('click')
-    await wrapper.get('[data-component="tts"] .local-component-action').trigger('click')
+    await wrapper.get('[data-component="minimax"] .local-component-action').trigger('click')
     const minimax = wrapper.get<HTMLInputElement>('[data-provider="minimax"] .provider-key-settings input')
     await minimax.setValue('test-speech-key')
     await wrapper.get('[data-provider="minimax"] .save-button').trigger('click')

@@ -87,12 +87,20 @@ function resourceStateLabel(state: string) {
 }
 function needsResource(row: LocalComponentRow) {
   return Boolean((row.resource && (row.resource.state !== 'installed' || row.resource.updateAvailable))
+    || row.runtimeDependencies?.some(resource => resource.required !== false && (resource.state !== 'installed' || resource.updateAvailable))
     || row.resourceChoices?.some(resource => resource.state !== 'installed' || resource.updateAvailable)
     || row.sharedResource && (row.sharedResource.state !== 'installed' || row.sharedResource.updateAvailable))
 }
 function resourceRetryable(resource: ManagedResourceRow) {
-  return Boolean(resource.retryable || latestJobs.value.get(resource.id)?.state === 'failed')
+  return Boolean(resource.retryable || resourceJob(resource.id)?.state === 'failed')
 }
+function resourceJob(id: string) { return latestJobs.value.get(id) ?? (id === 'voice-runtime-cpu' ? latestJobs.value.get('voice-server') : undefined) }
+function runtimeDescription(id: string) {
+  if (id === 'voice-runtime-cpu') return '必需依赖，提供基础语音运行能力。更新会保留已安装的显卡能力。'
+  if (id === 'voice-runtime-gpu') return '可选依赖，为流式识别、整句精修和声纹提供显卡运行能力；复用现有模型。安装后刷新环境检查，再选择模型运行位置。'
+  return '可选依赖，由本地 VoxCPM 语音合成模型共用；使用在线语音合成时无需安装。'
+}
+function runtimeNeedsAction(resource: ManagedResourceRow) { return resource.state !== 'installed' || resource.updateAvailable || resourceRetryable(resource) }
 function rowCategory(row: LocalComponentRow): LocalComponentCategory {
   if (row.category) return row.category
   if (row.id === 'voice-system' || row.id === 'voice-server') return 'voice-server'
@@ -105,6 +113,9 @@ function rowResource(row: LocalComponentRow, fallback: ManagedResourceRow): Mana
   return props.model.downloadResources?.find(resource => resource.id === fallback.id) ?? fallback
 }
 function downloadEntries(row: LocalComponentRow): LocalDownloadItem[] {
+  if (row.runtimeDependencies?.length) return row.runtimeDependencies.map(resource => ({
+    ...resource, optional: resource.required === false, note: runtimeDescription(resource.id),
+  }))
   const entries: LocalDownloadItem[] = []
   const sharedRuntimeMissing = Boolean(row.sharedResource && (row.sharedResource.state !== 'installed' || row.sharedResource.updateAvailable))
   if (row.resource) entries.push({ ...rowResource(row, row.resource), optional: false, forcePlan: sharedRuntimeMissing })
@@ -188,19 +199,20 @@ function selectedResources(row: LocalComponentRow) {
   return row.resourceChoices ?? []
 }
 function rowResources(row: LocalComponentRow) {
-  return [row.resource, ...(row.resourceChoices ?? []), row.sharedResource]
+  return [row.resource, ...(row.resourceChoices ?? []), row.sharedResource, ...(row.runtimeDependencies ?? [])]
     .filter((resource): resource is ManagedResourceRow => Boolean(resource))
 }
 function rowResourceIds(row: LocalComponentRow) {
-  return [row.resource?.id, ...(row.resourceChoices ?? []).map(resource => resource.id), row.sharedResource?.id]
+  return [row.resource?.id, ...(row.resourceChoices ?? []).map(resource => resource.id), row.sharedResource?.id, ...(row.runtimeDependencies ?? []).map(resource => resource.id)]
     .filter((id): id is string => Boolean(id))
 }
 function rowJobs(row: LocalComponentRow) {
-  return [...new Set(rowResourceIds(row))]
-    .map(id => visibleJob(latestJobs.value.get(id)))
-    .filter((job): job is ManagedResourceJob => Boolean(job))
+  return [...new Map([...new Set(rowResourceIds(row))]
+    .map(id => visibleJob(resourceJob(id)))
+    .filter((job): job is ManagedResourceJob => Boolean(job)).map(job => [job.id, job])).values()]
 }
 function rowActionResources(row: LocalComponentRow) {
+  if (row.runtimeDependencies?.length) return []
   const resources = [row.resource, ...(row.resourceChoices ?? [])].filter((resource): resource is ManagedResourceRow => Boolean(resource))
   const sharedNeedsWork = Boolean(row.sharedResource && (row.sharedResource.state !== 'installed' || row.sharedResource.updateAvailable))
   return resources.filter(resource => resource.state !== 'installed' || resource.updateAvailable || sharedNeedsWork)
@@ -241,10 +253,10 @@ function categoryObservation(rows: LocalComponentRow[]) {
 }
 function categoryProgress(category: LocalComponentCategory, rows: LocalComponentRow[]): ManagedResourceJob | undefined {
   const ids = new Set(rows.flatMap(rowResourceIds))
-  const jobs = [...ids].flatMap(id => {
-    const job = latestJobs.value.get(id)
+  const jobs = [...new Map([...ids].flatMap(id => {
+    const job = resourceJob(id)
     return job && (jobIsActive(job) || ['complete', 'completed', 'failed'].includes(job.state)) ? [job] : []
-  })
+  }).map(job => [job.id, job])).values()]
   const active = jobs.filter(jobIsActive)
   const failed = jobs.filter(job => job.state === 'failed')
   if (!active.length && !failed.length) return undefined
@@ -350,19 +362,36 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                     <button class="outline-button" type="button" :aria-label="`${resource.label}：跳转官方来源`" :disabled="model.resourceLoading" @click="emit('openResourceSource', resource.id)">跳转来源</button>
                   </div>
                 </div>
-                <button v-if="expandedComponents.has(row.id) || !rowHasActiveJob(row) && (!rowActionResources(row).length || !model.resourceActionsAvailable)" class="local-component-action" type="button" :aria-label="`${row.name}：${expandedComponents.has(row.id) ? '收起详情' : '展开详情'}`" :aria-expanded="expandedComponents.has(row.id)" :aria-controls="`local-detail-${row.id}`" @click="toggleComponent(row)">
+                <button v-if="row.runtimeDependencies?.length || expandedComponents.has(row.id) || !rowHasActiveJob(row) && (!rowActionResources(row).length || !model.resourceActionsAvailable)" class="local-component-action" type="button" :aria-label="`${row.name}：${expandedComponents.has(row.id) ? '收起详情' : '展开详情'}`" :aria-expanded="expandedComponents.has(row.id)" :aria-controls="`local-detail-${row.id}`" @click="toggleComponent(row)">
                   {{ expandedComponents.has(row.id) ? '收起' : '展开' }}
                   <svg viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expandedComponents.has(row.id) }"><path d="m6 9 6 6 6-6" /></svg>
                 </button>
                 </div>
               </div>
-              <div v-for="resourceJob in rowJobs(row)" :key="resourceJob.id" class="local-component-inline-progress">
+              <div v-for="resourceJob in row.runtimeDependencies?.length && expandedComponents.has(row.id) ? [] : rowJobs(row)" :key="resourceJob.id" class="local-component-inline-progress">
                 <ManagedResourceProgress :job="resourceJob" :label="resourceJob.label || row.name" />
                 <button v-if="jobIsActive(resourceJob)" class="outline-button local-resource-cancel" type="button" :aria-label="`${row.name}：取消任务`" :disabled="!resourceJob.canCancel" @click="emit('cancelResource', resourceJob.id)">取消任务</button>
               </div>
               <div v-if="expandedComponents.has(row.id)" :id="`local-detail-${row.id}`" class="local-component-detail">
                 <p>{{ row.description }}</p>
-                <section v-if="row.resource" class="local-managed-resource" :data-resource="row.resource.id" :aria-label="`${row.resource.label}安装状态`">
+                <section v-if="row.runtimeDependencies?.length" class="local-runtime-dependencies" aria-label="语音运行依赖">
+                  <article v-for="dependency in row.runtimeDependencies" :key="dependency.id" class="local-download-choice" :data-runtime-dependency="dependency.id">
+                    <div class="local-managed-resource-heading"><strong>{{ dependency.label }}</strong><span class="resource-install-state" :class="dependency.state">{{ dependency.updateAvailable ? '需更新' : dependency.status || resourceStateLabel(dependency.state) }}</span></div>
+                    <small class="local-detail-note">{{ runtimeDescription(dependency.id) }}</small>
+                    <dl v-if="dependency.installedVersion || dependency.targetVersion" class="local-resource-versions"><div v-if="dependency.installedVersion"><dt>已安装版本</dt><dd>{{ dependency.installedVersion }}</dd></div><div v-if="dependency.targetVersion"><dt>目标版本</dt><dd>{{ dependency.targetVersion }}</dd></div></dl>
+                    <ManagedResourceProgress v-if="visibleJob(resourceJob(dependency.id))" :job="visibleJob(resourceJob(dependency.id))!" :label="dependency.label" />
+                    <div v-if="model.resourceActionsAvailable" class="managed-resource-actions">
+                      <button v-if="jobIsActive(resourceJob(dependency.id))" class="outline-button" type="button" :disabled="!resourceJob(dependency.id)?.canCancel" @click="emit('cancelResource', resourceJob(dependency.id)!.id)">取消任务</button>
+                      <template v-else-if="runtimeNeedsAction(dependency)">
+                        <button class="outline-button" type="button" :aria-label="`${dependency.label}：${resourceActionLabel(row, dependency)}`" :disabled="dependency.busy || model.resourceLoading || rowHasActiveJob(row)" @click="emit('resourceDownload', dependency.id)">{{ dependency.busy ? '处理中…' : resourceActionLabel(row, dependency) }}</button>
+                        <button class="outline-button" type="button" :aria-label="`${dependency.label}：导入`" :disabled="dependency.busy || model.resourceLoading || rowHasActiveJob(row)" @click="emit('resourceImport', dependency.id)">导入</button>
+                        <button class="outline-button" type="button" :aria-label="`${dependency.label}：跳转官方来源`" :disabled="model.resourceLoading" @click="emit('openResourceSource', dependency.id)">跳转来源</button>
+                      </template>
+                    </div>
+                    <p v-if="dependency.error && !jobIsActive(resourceJob(dependency.id))" class="local-error" role="status">{{ dependency.error }}</p>
+                  </article>
+                </section>
+                <section v-else-if="row.resource" class="local-managed-resource" :data-resource="row.resource.id" :aria-label="`${row.resource.label}安装状态`">
                   <div class="local-managed-resource-heading"><span>{{ row.resource.label }}</span><span class="resource-install-state" :class="row.resource.state">{{ row.resource.status || resourceStateLabel(row.resource.state) }}</span></div>
                   <dl v-if="row.resource.installedVersion || row.resource.targetVersion" class="local-resource-versions"><div v-if="row.resource.installedVersion"><dt>已安装版本</dt><dd>{{ row.resource.installedVersion }}</dd></div><div v-if="row.resource.targetVersion"><dt>目标版本</dt><dd>{{ row.resource.targetVersion }}</dd></div></dl>
                   <p v-if="row.resource.error && row.state !== 'loading' && !jobIsActive(latestJobs.get(row.resource.id))" class="local-error" role="status">{{ row.resource.error }}</p>
@@ -403,6 +432,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
 </template>
 
 <style scoped>
+.local-runtime-dependencies{display:grid;gap:12px;width:100%;min-width:0}.local-runtime-dependencies .local-managed-resource-heading{color:var(--text);flex-wrap:wrap}.local-runtime-dependencies .managed-resource-actions{margin-top:0}
 .local-tts-downloads{display:grid;gap:12px;width:100%;min-width:0}.local-tts-downloads h5{font-size:var(--font-body)}.local-download-choice{display:grid;gap:8px;padding:12px;border:1px solid var(--line);border-radius:12px}
 .local-component-phase{margin:6px 0 0;color:var(--muted);font-size:var(--font-caption);line-height:1.6}
 .local-components{display:flex;flex-direction:column;gap:20px;min-width:0;container-type:inline-size}

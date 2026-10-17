@@ -156,3 +156,59 @@ def test_present_model_file_and_framework_do_not_override_failed_actual_model_pr
         status = compute.model_hardware_status(hardware, config, verify=True)['models']['campplus']
     assert not status['gpu_available']
     assert status['reason'] == '模型算子无法执行'
+
+
+@pytest.mark.parametrize('base_current,gpu_current,stale_registration,expected', [
+    (True, True, False, True), (True, True, True, True),
+    (True, False, False, False), (True, False, True, False), (False, True, False, False),
+])
+def test_managed_gpu_uses_shared_interpreter_and_independent_current_locks(
+        tmp_path, monkeypatch, base_current, gpu_current, stale_registration, expected):
+    """Managed GPU（卡片安装显卡依赖）无需手动登记，失效登记也不能覆盖当前锁验证。"""
+    import hashlib
+    program = tmp_path / 'app'
+    locks = program / 'config/runtime'
+    locks.mkdir(parents=True)
+    (locks / 'voice-runtime.lock.json').write_bytes(b'cpu-lock')
+    (locks / 'voice-gpu.lock.json').write_bytes(b'gpu-lock')
+    runtime = tmp_path / 'runtimes/python'
+    runtime.mkdir(parents=True)
+    (runtime / 'runtime.json').write_text(json.dumps({
+        'schema': 2, 'profile': 'gpu-private', 'gpu_profile': 'cu128',
+        'lock_sha256': hashlib.sha256(b'cpu-lock').hexdigest() if base_current else 'old',
+        'gpu_lock_sha256': hashlib.sha256(b'gpu-lock').hexdigest() if gpu_current else 'old',
+    }), encoding='utf-8')
+    if stale_registration:
+        registration = tmp_path / 'data/config/gpu-environment.json'
+        registration.parent.mkdir(parents=True)
+        registration.write_text('{}', encoding='utf-8')
+    monkeypatch.setenv('VOICE_INSTALL_ROOT', str(tmp_path))
+    monkeypatch.setenv('VOICE_PROGRAM_ROOT', str(program))
+    monkeypatch.setenv('VOICE_DATA_DIR', str(tmp_path / 'data'))
+    monkeypatch.setenv('VOICE_LAUNCH_CHANNEL', 'product')
+    monkeypatch.delenv('VOICE_GPU_PROBE', raising=False)
+    monkeypatch.delenv('VOICE_GPU_FALLBACK', raising=False)
+    monkeypatch.setattr(compute, '_capabilities', {'models': {'paraformer': {'gpu_available': True, 'reason': None}}})
+    assert compute.hardware_status()['models']['paraformer']['gpu_available'] is expected
+
+
+def test_managed_shared_runtime_takes_priority_over_legacy_independent_gpu(tmp_path, monkeypatch):
+    """Shared runtime（现用解释器）安装显卡能力后，不再被历史独立环境登记覆盖。"""
+    from voice_terminal import gpu_environment
+    runtime = tmp_path / 'runtimes/python-gpu'
+    runtime.mkdir(parents=True)
+    (runtime / 'python.exe').write_bytes(b'legacy')
+    models = tmp_path / 'models'
+    models.mkdir()
+    data = tmp_path / 'data'
+    registration = data / 'config/gpu-environment.json'
+    registration.parent.mkdir(parents=True)
+    registration.write_text(json.dumps({'path': 'runtimes/python-gpu',
+        'environment_fingerprint': gpu_environment.fingerprint(runtime),
+        'models_fingerprint': gpu_environment.fingerprint(models),
+        'models': {'paraformer': {'gpu_available': True}},
+    }), encoding='utf-8')
+    monkeypatch.setattr(gpu_environment, 'managed_runtime', lambda *_: False)
+    assert gpu_environment.worker_python(tmp_path, data, 'asr', 'shared-python', {'paraformer': 'cuda'}) == str(runtime / 'python.exe')
+    monkeypatch.setattr(gpu_environment, 'managed_runtime', lambda *_: True)
+    assert gpu_environment.worker_python(tmp_path, data, 'asr', 'shared-python', {'paraformer': 'cuda'}) == 'shared-python'

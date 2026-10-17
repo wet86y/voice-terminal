@@ -27,8 +27,8 @@ async function expandComponent(wrapper: VueWrapper, id: string, category: string
   const categoryToggle = wrapper.get(`[data-category="${category}"] .local-category-toggle`)
   if (categoryToggle.attributes('aria-expanded') !== 'true') await categoryToggle.trigger('click')
   const card = wrapper.get(`[data-component="${id}"]`)
-  const detailToggle = card.get('.local-component-action')
-  if (detailToggle.attributes('aria-expanded') !== 'true') await detailToggle.trigger('click')
+  const detailToggle = card.find('.local-component-action')
+  if (detailToggle.exists() && detailToggle.attributes('aria-expanded') !== 'true') await detailToggle.trigger('click')
   return card
 }
 
@@ -204,7 +204,7 @@ describe('桌面样例回放交互', () => {
     const returnedRow = await expandComponent(wrapper, 'paraformer', 'speech')
     expect((returnedRow.get('select').element as HTMLSelectElement).value).toBe('cuda')
     const dsh = await expandComponent(wrapper, 'dsh', 'inference')
-    expect(dsh.get('.local-location').text()).toContain('本机')
+    expect(dsh.get('.local-inline-resource-actions').text()).toContain('下载')
     expect(request).not.toHaveBeenCalled()
     request.mockRestore()
   })

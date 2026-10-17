@@ -9,6 +9,18 @@ MODEL_RESOURCES={'paraformer':'paraformer-streaming','voice_vad':'fsmn-vad','sen
                  'smart_turn':'smart-turn','campplus':'campplus-zh-cn-common','kws':'kws-sherpa-onnx'}
 ROLES={'asr':('paraformer',),'analysis':('sensevoice','smart_turn'),'voice':('voice_vad','kws','campplus')}
 
+
+def managed_runtime(install: Path, program: Path) -> bool:
+    """managed_runtime（显卡卡片环境）：基础与可选依赖锁分别验证，模型继续共享。"""
+    try:
+        record = json.loads((install / 'runtimes/python/runtime.json').read_text('utf-8'))
+        return (record.get('schema') == 2 and record.get('gpu_profile') == 'cu128'
+                and all(record.get(field) == hashlib.sha256((program / 'config/runtime' / filename).read_bytes()).hexdigest()
+                        for field, filename in (('lock_sha256', 'voice-runtime.lock.json'),
+                                                ('gpu_lock_sha256', 'voice-gpu.lock.json'))))
+    except (OSError, ValueError, AttributeError):
+        return False
+
 def fingerprint(root:Path)->str:
     digest=hashlib.sha256()
     for path in sorted(root.rglob('*'),key=lambda p:p.relative_to(root).as_posix()):
@@ -22,13 +34,21 @@ def registered(install:Path,data:Path)->dict|None:
         value=json.loads((data/'config/gpu-environment.json').read_text('utf-8'))
         relative=Path(value['path'])
         if relative.is_absolute() or relative.as_posix() not in {'runtimes/python-gpu','runtimes/python'}: return None
+        program = Path(os.environ.get('VOICE_PROGRAM_ROOT', str(install / 'app')))
+        # 卡片已升级现用解释器后，历史独立环境登记不再决定新工作进程的解释器。
+        if relative.as_posix() == 'runtimes/python-gpu' and managed_runtime(install, program):
+            return None
         root=install/relative
         if not root.resolve().is_relative_to(install.resolve()) or not (root/'python.exe').is_file():return None
+        if relative.as_posix() == 'runtimes/python':
+            runtime = json.loads((root / 'runtime.json').read_text('utf-8')) if (root / 'runtime.json').is_file() else {}
+            if runtime.get('gpu_profile') and not managed_runtime(install, program):
+                return None
         if value.get('environment_fingerprint')!=fingerprint(root):return None
         # 模型文件变更后也必须重新检测。
         if value.get('models_fingerprint')!=fingerprint(install/'models'):return None
         return value
-    except (OSError,ValueError,KeyError):return None
+    except (OSError,ValueError,KeyError,TypeError,AttributeError):return None
 
 def worker_python(install:Path,data:Path,role:str,cpu_python:str,devices:dict)->str:
     value=registered(install,data)
@@ -61,6 +81,8 @@ def probe_model(name:str,program:Path,install:Path)->dict:
         from .analysis.sensevoice import SenseVoice
         model=SenseVoice(models/'analysis/sensevoice',models/'funasr/fsmn-vad',device='cuda')
         model(pcm)
+        # 静音可能被内部 VAD（语音活动检测）过滤；仍需实际调用精修网络来验证显卡算子。
+        model.model.generate(input=np.zeros(32000,dtype=np.float32),cache={},language='auto',use_itn=True)
         if model.device!='cuda' or model.internal_vad_device!='cuda':raise RuntimeError('精修或内部活动检测回退到中央处理器')
     elif name=='smart_turn':
         from .analysis.smart_turn import SmartTurn

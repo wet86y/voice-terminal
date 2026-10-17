@@ -63,6 +63,8 @@ export interface LocalComponentRow {
   /** resourceChoices（可选模型）与 sharedResource（共用运行程序）：摘要显示状态，详情显示安装信息。 */
   resourceChoices?: ManagedResourceRow[]
   sharedResource?: ManagedResourceRow
+  /** runtimeDependencies（语音服务运行依赖）：中央处理器必需，原生语音与显卡可选。 */
+  runtimeDependencies?: ManagedResourceRow[]
   /** provider（在线服务配置）：用于在该组件详情中安全配置密钥与查询用量。 */
   provider?: LocalProviderSettings
   /** location（当前运行位置）：没有可调整设备选项时显示。 */
