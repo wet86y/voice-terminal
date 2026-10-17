@@ -1,4 +1,4 @@
-param([switch]$SkipBuild)
+﻿param([switch]$SkipBuild)
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'local-context.ps1')
 $Repo=Get-ProjectRoot
