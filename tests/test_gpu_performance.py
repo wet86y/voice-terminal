@@ -1,6 +1,8 @@
 """显卡性能模式请求（NVML PowerMizer）测试：免提权加持、幂等、可还原、缺库降级。"""
 
 import asyncio
+import ctypes
+import struct
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,6 +14,54 @@ from voice_terminal.gpu_performance import (
     GpuPerformanceMode,
 )
 from voice_terminal.providers.audio_cpp_tts import AudioCppTtsClient
+
+
+def test_process_query_reads_native_layout_and_returned_count():
+    """驱动按真实24字节结构写数组，收缩后的实际数量必须覆盖申请容量。"""
+    class NativeNvml(FakeNvml):
+        def nvmlDeviceGetComputeRunningProcesses_v3(self, handle, count, rows):
+            if rows is None:
+                count._obj.value = 5
+                return 7
+            # 显存和实例号的全1是WDDM（Windows显示驱动模型）不可用标记，不是进程号。
+            data = b"".join(struct.pack("<I4xQII", pid, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+                            for pid in (1300, 25180, 26404, 33333, 44444))
+            ctypes.memmove(ctypes.addressof(rows), data, len(data))
+            count._obj.value = 3
+            return 0
+
+        nvmlDeviceGetGraphicsRunningProcesses_v3 = nvmlDeviceGetComputeRunningProcesses_v3
+
+    mode = GpuPerformanceMode(library=NativeNvml())
+    mode._process_name = lambda pid: {1300: "dwm.exe", 25180: "audiocpp_server.exe", 26404: "msedge.exe"}.get(pid, "")
+    result = mode.contention(own_pids={25180})
+    assert [row["pid"] for row in result["external_processes"]] == [1300, 26404]
+    assert [row["pid"] for row in result["own_processes"]] == [25180]
+    assert result["process_query_available"] == {"compute": True, "graphics": True}
+
+
+def test_process_query_falls_back_to_legacy_layout_and_reports_unavailable():
+    """新版接口不支持时回退到16字节旧接口；不可用不能伪装成空进程表。"""
+    class LegacyNvml(FakeNvml):
+        def nvmlDeviceGetComputeRunningProcesses_v3(self, *_args):
+            return 3
+
+        def nvmlDeviceGetComputeRunningProcesses(self, handle, count, rows):
+            if rows is None:
+                count._obj.value = 2
+                return 7
+            data = struct.pack("<I4xQ", 25180, 0xFFFFFFFFFFFFFFFF) + struct.pack("<I4xQ", 26404, 123)
+            ctypes.memmove(ctypes.addressof(rows), data, len(data))
+            count._obj.value = 2
+            return 0
+
+    mode = GpuPerformanceMode(library=LegacyNvml())
+    mode._process_name = lambda pid: ""
+    result = mode.contention(own_pids={25180})
+    assert [row["pid"] for row in result["own_processes"]] == [25180]
+    assert [row["pid"] for row in result["external_processes"]] == [26404]
+    assert result["process_query_available"] == {"compute": True, "graphics": False}
+    assert result["reason"] == "process-query-partially-unavailable"
 
 
 class FakeNvml:

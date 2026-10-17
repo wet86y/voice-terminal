@@ -101,6 +101,7 @@ class PcmPlayer:
         self._last_callback_status: str | None = None
         self._first_rendered_at: float | None = None
         self._first_rendered_key: str | None = None
+        self._first_enqueued_at: float | None = None  # 首块入队单调时钟。
         self._stream_buffer_key: str | None = None
         self._stream_start_bytes = 0  # 首次播放前的连续音频储备。
         self._stream_resume_bytes = 0  # 欠载后恢复播放所需的连续音频储备。
@@ -434,6 +435,7 @@ class PcmPlayer:
         offset = 0
         playback_turn: str | None = None
         first_rendered_turn: str | None = None
+        queue_to_submit_ms = 0.0  # 首块入队到设备提交毫秒。
         blocked_key: str | None = None
         permitted = self.playback_permission is None or self.playback_permission()
 
@@ -492,6 +494,8 @@ class PcmPlayer:
                 self._first_rendered_key = self._active_turn
                 self._first_rendered_at = callback_at
                 first_rendered_turn = self._active_turn
+                if self._first_enqueued_at is not None:
+                    queue_to_submit_ms = max(0.0, (callback_at - self._first_enqueued_at) * 1000)
             if offset > 0:
                 # Keep the wall-clock anchor at the last non-silent buffer
                 # submitted to the device.  PortAudio continues invoking the
@@ -523,11 +527,13 @@ class PcmPlayer:
             self.on_playback_started(playback_turn)
         if first_rendered_turn:
             logger.info(
-                "audio.player_first_pcm_submitted key=%s resolved_device=%s sample_rate=%d channels=%d",
+                "audio.player_first_pcm_submitted key=%s resolved_device=%s sample_rate=%d channels=%d "
+                "queue_to_submit_ms（首块入队至设备提交毫秒）=%.1f",
                 first_rendered_turn,
                 self._resolved_device,
                 self.sample_rate,
                 self.channels,
+                queue_to_submit_ms,
             )
 
     def start(self) -> None:
@@ -591,6 +597,8 @@ class PcmPlayer:
                 # before the callback runs; mapping that onset to the first
                 # non-zero render point would overstate the heard prefix.
                 self._render_points.append((time.monotonic(), self._played_bytes))
+            if self._enqueued_bytes == 0:
+                self._first_enqueued_at = time.monotonic()
             self._chunks.append(bytes(pcm))
             self._buffered_bytes += len(pcm)
             self._enqueued_bytes += len(pcm)
@@ -605,6 +613,7 @@ class PcmPlayer:
 
     def _clear_unlocked(self) -> None:
         self._chunks.clear()
+        self._first_enqueued_at = None
         self._stream_buffer_key = None
         self._stream_waiting = False
         self._stream_complete = False

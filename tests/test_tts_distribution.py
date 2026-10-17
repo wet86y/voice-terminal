@@ -158,6 +158,7 @@ def test_native_build_and_migration_pins_match_distributed_runtime(script, hash_
 
 def test_same_size_corrupt_installed_model_is_not_a_startup_candidate(tmp_path):
     from voice_terminal.model_installation import model_receipt
+    program = _legacy_model_catalog(tmp_path / "program", b"good")
     weight = tmp_path / "models/audiocpp/tts/VoxCPM1-GGUF/voxcpm-0.5b-q8_0-audiovae-f16.gguf"
     weight.parent.mkdir(parents=True)
     weight.write_bytes(b"good")
@@ -168,9 +169,58 @@ def test_same_size_corrupt_installed_model_is_not_a_startup_candidate(tmp_path):
     (runtime / "cuda/audiocpp_server.exe").write_bytes(b"binary")
     (runtime / "model_specs").mkdir()
     (runtime / "model_specs/voxcpm1.json").write_text("{}")
-    assert AudioCppTtsServer.available_models(tmp_path) == ["voxcpm1"]
+    assert AudioCppTtsServer.available_models(tmp_path, program_root=program) == ["voxcpm1"]
     weight.write_bytes(b"bad!")
-    assert AudioCppTtsServer.available_models(tmp_path) == []
+    assert AudioCppTtsServer.available_models(tmp_path, program_root=program) == []
+
+
+@pytest.mark.parametrize("receipt_version,content,corrupt_file", [
+    ("old", b"old-native", None), ("current", b"old-native", None), (None, b"old-native", None), ("current", b"new-native", None),
+    ("current", b"new-native", "cuda/audiocpp_server.exe"), ("current", b"new-native", "model_specs/voxcpm1.json"), ("current", b"new-native", "cuda/base.dll"),
+])
+def test_local_tts_rejects_self_consistent_but_outdated_native_runtime(tmp_path, receipt_version, content, corrupt_file, caplog):
+    """旧收据与旧程序互相一致时仍禁止启动，覆盖现场新版应用搭配旧组件的回归。"""
+    from voice_terminal.model_installation import model_receipt
+    program = _legacy_model_catalog(tmp_path / "program", b"weight")
+    catalog_path = program / "config/resources/catalog.json"
+    catalog = json.loads(catalog_path.read_text("utf-8"))
+    files = {"cuda/audiocpp_server.exe": b"new-native", "model_specs/voxcpm1.json": b"{}", "cuda/base.dll": b"base"}
+    catalog["resources"].append({"resource_id": "tts-audiocpp-runtime", "kind": "model", "title": "语音运行程序", "destination": "audiocpp/runtime",
+                                 "version": "current", "files": [{"path": name, "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in files.items()]})
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    native = tmp_path / "models/audiocpp/runtime"
+    files["cuda/audiocpp_server.exe"] = content
+    for name, data in files.items():
+        path = native / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    if receipt_version:
+        receipt = model_receipt("tts-audiocpp-runtime", receipt_version, [{"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()} for name, data in files.items()])
+        (native / "resource-install.json").write_text(json.dumps(receipt), encoding="utf-8")
+    if corrupt_file:
+        path = native / corrupt_file
+        data = path.read_bytes()
+        path.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+    weight = tmp_path / "models/audiocpp/tts/VoxCPM1-GGUF/voxcpm-0.5b-q8_0-audiovae-f16.gguf"
+    weight.parent.mkdir(parents=True)
+    weight.write_bytes(b"weight")
+    expected = ["voxcpm1"] if content == b"new-native" and not corrupt_file else []
+    assert AudioCppTtsServer.available_models(tmp_path, program_root=program) == expected
+    if not expected:
+        assert "runtime_update_required" in caplog.text
+
+
+def test_native_process_gate_uses_installed_program_context_before_spawning(tmp_path, monkeypatch):
+    from voice_terminal.providers.audio_cpp_tts import AudioCppTtsError
+    program = _legacy_model_catalog(tmp_path / "program", b"weight")
+    monkeypatch.setenv("VOICE_PROGRAM_ROOT", str(program))
+    assert AudioCppTtsServer._catalog_program() == program
+    server = AudioCppTtsServer.__new__(AudioCppTtsServer)
+    server.runtime_root = tmp_path
+    monkeypatch.setattr(AudioCppTtsServer, "_runtime_update_error", classmethod(lambda cls, root, **kwargs: "原生组件需要更新"))
+    monkeypatch.setattr("voice_terminal.providers.audio_cpp_tts.subprocess.Popen", lambda *args, **kwargs: pytest.fail("过期组件不得启动"))
+    with pytest.raises(AudioCppTtsError, match="原生组件需要更新"):
+        server._start_process()
 
 
 def test_bundled_seed_initializes_both_libraries(tmp_path):

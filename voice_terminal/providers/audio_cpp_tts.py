@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 from datetime import datetime
 from pathlib import Path
@@ -130,6 +131,45 @@ class AudioCppTtsServer:
         managed = root / "models/audiocpp/runtime"
         return managed if (managed / "cuda/audiocpp_server.exe").is_file() else root / "runtimes/audiocpp"
 
+    @staticmethod
+    def _catalog_program(program_root: Path | None = None) -> Path:
+        """_catalog_program（随包清单目录）：正式压缩模块使用宿主传入的程序位置。"""
+        return Path(program_root or os.environ.get("VOICE_PROGRAM_ROOT") or Path(__file__).resolve().parents[2])
+
+    @classmethod
+    def _runtime_update_error(cls, runtime_root: Path, *, program_root: Path | None = None,
+                              verify_hashes: bool = True) -> str | None:
+        """_runtime_update_error（原生版本门禁）：自有收据有效也必须达到当前随包目标。"""
+        from ..model_installation import inspect_installed_model, model_update_available
+        from ..resource_distribution import ResourceCatalog, ResourceError
+        try:
+            target = ResourceCatalog(cls._catalog_program(program_root)).specs.get("tts-audiocpp-runtime")
+            root = Path(runtime_root).resolve()
+            runtime = cls.runtime_directory(root)
+            if (runtime / "resource-install.json").is_file() and runtime == root / "models/audiocpp/runtime":
+                installed = inspect_installed_model(root / "models", "audiocpp/runtime", "tts-audiocpp-runtime",
+                                                    verify_hashes=verify_hashes and target is None)
+                if installed.error:
+                    return f"本地语音运行组件校验失败：{installed.error} 请在组件管理中更新本地语音共用运行程序。"
+                if target is not None and model_update_available(target, installed):
+                    return (f"本地语音运行组件需要更新：installed_version（已装版本）={installed.version}，"
+                            f"target_version（目标版本）={target.version}。请在组件管理中更新本地语音共用运行程序。")
+            if target is None:  # 明确不声明原生组件的独立工具清单，不施加产品版本约束。
+                return None
+            # 无收据的旧迁入目录也核验目标内容；启动前至少复核原生程序和模型规格的实际摘要。
+            for item in target.required_files:
+                if not verify_hashes and item.path != "cuda/audiocpp_server.exe" and not item.path.startswith("model_specs/"):
+                    continue
+                path = runtime / item.path
+                if not path.is_file() or path.stat().st_size != item.size_bytes:
+                    return f"本地语音运行组件不符合当前版本：{item.path}。请在组件管理中更新本地语音共用运行程序。"
+                with path.open("rb") as stream:
+                    if hashlib.file_digest(stream, "sha256").hexdigest() != item.sha256:
+                        return f"本地语音运行组件摘要不符合当前版本：{item.path}。请在组件管理中更新本地语音共用运行程序。"
+        except (OSError, ResourceError) as exc:
+            return f"无法核验本地语音运行组件：{exc}。请修复程序或在组件管理中更新语音运行程序。"
+        return None
+
     @classmethod
     def available_models(cls, runtime_root: Path, *, program_root: Path | None = None) -> list[str]:
         """available_models（完整本地候选）：权重、原生程序和模型规格均存在才算可启动。"""
@@ -140,11 +180,11 @@ class AudioCppTtsServer:
             specs = root / "sources/audio.cpp/model_specs"
         if not (runtime / "cuda/audiocpp_server.exe").is_file():
             return []
-        # 正式安装具有收据：启动选路时复核内容，避免损坏的可选模型抢占仍可用的另一后端。
-        from ..model_installation import inspect_installed_model
-        if (runtime / "resource-install.json").is_file() and inspect_installed_model(
-                root / "models", "audiocpp/runtime", "tts-audiocpp-runtime", verify_hashes=True).error:
+        if error := cls._runtime_update_error(root, program_root=program_root):
+            logger.warning("audio_cpp_tts.runtime_update_required（原生组件需要更新） %s", error)
             return []
+        # 原生组件已同时按安装收据和当前目标核验；权重继续独立复核。
+        from ..model_installation import inspect_installed_model
         result: list[str] = []
         catalog = None
         for key in ("voxcpm2", "voxcpm1"):
@@ -160,7 +200,7 @@ class AudioCppTtsServer:
                 from ..resource_distribution import ResourceCatalog, ResourceError
                 try:
                     if catalog is None:
-                        catalog = ResourceCatalog(program_root or Path(__file__).resolve().parents[2])
+                        catalog = ResourceCatalog(cls._catalog_program(program_root))
                     resource = catalog.get(f"tts-{key}")
                     valid = True
                     for item in resource.required_files:
@@ -458,6 +498,9 @@ class AudioCppTtsServer:
         return candidates[0].resolve()
 
     def _start_process(self, *, log_path: Path | None = None, trace_path: Path | None = None) -> None:
+        if error := self._runtime_update_error(self.runtime_root, verify_hashes=False):
+            logger.error("audio_cpp_tts.runtime_update_required（原生组件需要更新） %s", error)
+            raise AudioCppTtsError(error)
         binary = self._server_binary()
         source_root = self.runtime_directory(self.runtime_root)
         if not (source_root / "model_specs").is_dir():
@@ -511,6 +554,41 @@ class AudioCppTtsServer:
             "audio_cpp_tts.server_started pid=%s local_model=%s config=%s log=%s trace=%s",
             self._process.pid, self.local_model, self.config_path, log_path, trace_path,
         )
+        try:
+            with binary.open("rb") as handle:
+                binary_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
+            receipt_path = binary.parent.parent / "resource-install.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8-sig")) if receipt_path.is_file() else {}
+            receipt_digest = next((row.get("sha256") for row in receipt.get("files", [])
+                                   if row.get("path", "").replace("\\", "/") == "cuda/audiocpp_server.exe"), None)
+            release_path = self._catalog_program() / "release.json"
+            release = json.loads(release_path.read_text(encoding="utf-8-sig")) if release_path.is_file() else {}
+            from ..resource_distribution import ResourceCatalog
+            target = ResourceCatalog(self._catalog_program()).specs.get("tts-audiocpp-runtime")
+            target_digest = next((item.sha256 for item in target.files if item.path == "cuda/audiocpp_server.exe"), None) if target else None
+            logger.info(
+                "audio_cpp_tts.runtime_identity pid=%s binary_path（实际程序路径）=%s "
+                "binary_sha256（程序完整摘要）=%s installed_version（安装版本）=%s "
+                "receipt_path（安装收据）=%s binary_matches_receipt（程序与收据一致）=%s "
+                "app_build（程序构建）=%s target_version（目标原生版本）=%s "
+                "binary_matches_target（程序与当前目标一致）=%s native_trace（原生追踪）=%s",
+                self._process.pid, binary, binary_sha256, receipt.get("version"), receipt_path,
+                binary_sha256 == receipt_digest if receipt_digest else None, release.get("build"),
+                target.version if target else None, binary_sha256 == target_digest if target_digest else None, trace_path,
+            )
+            config = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
+            selected = next((item for item in config.get("models", []) if item.get("id") == self.model_id), {})
+            options = selected.get("session_options", {})
+            logger.info(
+                "audio_cpp_tts.runtime_config pid=%s model=%s backend（计算后端）=%s device（设备编号）=%s "
+                "threads（推理线程数）=%s session_options（会话计算图及缓存参数）=%s",
+                self._process.pid, self.model_id, config.get("backend"), config.get("device"), config.get("threads"),
+                {key: value for key, value in options.items()
+                 if key.endswith((".mem_saver", ".prompt_cache_slots", *tuple("." + name for name in _CONTEXT_KEYS)))},
+            )
+        except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
+            logger.warning("audio_cpp_tts.runtime_identity_unavailable pid=%s error_type（错误类型）=%s",
+                           self._process.pid, type(exc).__name__)
 
     def _start_log_pump(self, stream) -> None:
         """把原生 stdout 逐行加时间戳写入日志；读取永不中断，避免子进程管道写满阻塞。"""
@@ -520,9 +598,10 @@ class AudioCppTtsServer:
 
         def pump() -> None:
             pending = b""
+            read = getattr(stream, "read1", stream.read)  # read1（读取可用数据）不等满4096字节。
             try:
                 while True:
-                    chunk = stream.read(4096)
+                    chunk = read(4096)
                     if not chunk:
                         break
                     pending += chunk
@@ -535,7 +614,7 @@ class AudioCppTtsServer:
                 logger.warning("audio_cpp_tts.native_log_pump_failed action=drain_only", exc_info=True)
                 # 降级后继续排空管道：绝不因为日志线程故障让原生进程写阻塞。
                 with contextlib.suppress(Exception):
-                    while stream.read(65536):
+                    while read(65536):
                         pass
             finally:
                 with contextlib.suppress(Exception):
@@ -558,6 +637,8 @@ class AudioCppTtsServer:
         if await self._service_ready():
             self._ready = True
             logger.info("audio_cpp_tts.server_reused model=%s", self.model_id)
+            logger.info("audio_cpp_tts.runtime_identity_unavailable model=%s reason（原因）=existing_service_not_spawned（复用服务非本次启动）",
+                        self.model_id)
             await self._load_model_locked(self.local_model)
             return
         if self._process is None:
@@ -747,7 +828,7 @@ class AudioCppTtsClient:
     sentence_tick_ms = 50
     first_clause_timeout_ms = 400
     supports_prewarm = True
-    playback_startup_buffer_ms = 800  # playback_startup_buffer_ms（本地流式首次连续音频储备）。
+    playback_startup_buffer_ms = 0  # playback_startup_buffer_ms（起播储备）：首块音频立即交给设备回调。
     playback_resume_buffer_ms = 400  # playback_resume_buffer_ms（欠载后连续音频储备）。
 
     def __init__(self, server: AudioCppTtsServer, *, timeout_seconds: float = 300.0,
@@ -971,7 +1052,8 @@ class AudioCppTtsClient:
                     raise AudioCppTtsError("VoxCPM 预热请求没有返回 PCM 音频")
                 self._warmed = True
                 self.last_prewarm_metrics = list(session.request_metrics)
-                logger.info("audio_cpp_tts.prewarm_ready audio_bytes=%d", audio_bytes)
+                logger.info("audio_cpp_tts.prewarm_ready turn=%s speech=None session=%s audio_bytes=%d",
+                            turn_id, session.session_tag, audio_bytes)
                 return {"status": "READY", "audio_bytes": audio_bytes}
             except BaseException as exc:
                 if not isinstance(exc, asyncio.CancelledError):
@@ -1042,6 +1124,7 @@ class AudioCppTtsSession:
         self._allow_retry = False
         self._buffered_bytes = 0  # _buffered_bytes（尚未由播放器读取的音频字节）。
         self.first_audio_callback = None  # first_audio_callback（合成首音就绪通知钩子）。
+        self.first_audio_ready_at: float | None = None  # 首音就绪的单调时钟，关联播放许可等待。
         self.audio_rejected_callback = None  # audio_rejected_callback（异常音频立即停播钩子）。
         self.audio_rejected = False  # audio_rejected（本事务已经判废，不再接收后续正文）。
         self.request_metrics: list[dict[str, float | int | str | bool | None]] = []
@@ -1171,8 +1254,11 @@ class AudioCppTtsSession:
             raise self._error
         warm = self.client._warm_task
         if not self._is_prewarm and warm is not None and warm is not asyncio.current_task():
+            cancel_started = time.perf_counter()
             warm.cancel()
             await asyncio.gather(warm, return_exceptions=True)
+            logger.info("audio_cpp_tts.prewarm_cancel_wait turn=%s speech=%s session=%s elapsed_ms（预热取消等待毫秒）=%.1f",
+                        *self._tts_fields(), (time.perf_counter() - cancel_started) * 1000)
         self._allow_retry = self._continuation_enabled
         try:
             await self._send_text_once(text)
@@ -1202,6 +1288,11 @@ class AudioCppTtsSession:
         request_started_at = time.perf_counter()
         request_sent_at = request_started_at
         first_audio_at: float | None = None
+        headers_at: float | None = None
+        last_audio_at: float | None = None
+        chunk_count = 0
+        max_chunk_gap_ms = 0.0
+        native_timing: dict[str, float] = {}  # 原生完成事件中的有限数值计时。
         body = {
             "model": self.model_id,
             "input": self._request_text(text),
@@ -1288,6 +1379,7 @@ class AudioCppTtsSession:
                     json=request_body,
                     headers={"Accept": "text/event-stream"},
                 ) as response:
+                    headers_at = time.perf_counter()
                     self._active_response = response
                     response.raise_for_status()
                     lines = self._preview_lines(response) if preview_recipe else response.aiter_lines()
@@ -1317,10 +1409,22 @@ class AudioCppTtsSession:
                             except (ValueError, TypeError) as exc:
                                 raise AudioCppTtsError("VoxCPM 音频事件不是有效 Base64") from exc
                             if pcm:
+                                chunk_at = time.perf_counter()
+                                chunk_count += 1
+                                if last_audio_at is not None:
+                                    max_chunk_gap_ms = max(max_chunk_gap_ms, (chunk_at - last_audio_at) * 1000)
+                                last_audio_at = chunk_at
                                 if len(pcm) % 2:
                                     raise AudioCppTtsError("VoxCPM 返回的 PCM 音频未对齐 int16 采样边界")
                                 if first_audio_at is None:
-                                    first_audio_at = time.perf_counter()
+                                    first_audio_at = chunk_at
+                                    logger.info(
+                                        "audio_cpp_tts.first_audio_ready turn=%s speech=%s session=%s segment=%d "
+                                        "elapsed_ms（请求至首块毫秒）=%.1f chunk_audio_ms（首块音频毫秒）=%.1f",
+                                        *self._tts_fields(), self.completed_segments,
+                                        (chunk_at - request_started_at) * 1000,
+                                        len(pcm) * 1000 / (self.client.native_sample_rate * 2),
+                                    )
                                 received_for_request += len(pcm)
                                 audio_ms = received_for_request * 1000 / (self.client.native_sample_rate * 2)
                                 if not self._is_prewarm and audio_ms > budget_ms:
@@ -1332,6 +1436,11 @@ class AudioCppTtsSession:
                                     self.received_bytes += len(output_pcm)
                                     await self._queue_pcm(output_pcm)
                         elif event_type == "speech.audio.done":
+                            timing = event.get("timing")
+                            if isinstance(timing, dict):
+                                native_timing = {key: float(value) for key, value in timing.items()
+                                                 if key in {"ttft_ms", "wall_ms", "audio_duration_ms", "rtf"}
+                                                 and type(value) in (int, float) and math.isfinite(value)}
                             saw_audio_done = True
                             self.generation_finished = True
                         elif event_type == "error":
@@ -1381,6 +1490,12 @@ class AudioCppTtsSession:
                 "total_ms": total_ms,
                 "audio_ms": audio_ms,
                 "rtf": rtf,
+                "http_headers_ms": (headers_at - request_sent_at) * 1000 if headers_at else None,  # 请求至响应头毫秒。
+                "chunk_count": chunk_count,  # 音频分块数量。
+                "max_chunk_gap_ms": max_chunk_gap_ms,  # 相邻非空音频块最大抵达间隔毫秒。
+                "engine_ttft_ms": native_timing.get("ttft_ms"),  # 原生首音等待毫秒。
+                "engine_wall_ms": native_timing.get("wall_ms"),  # 原生完整任务耗时毫秒。
+                "engine_rtf": native_timing.get("rtf"),  # 原生完整任务实时因子。
                 "continuation_enabled": self._continuation_enabled,  # 实际是否提交声学续接。
                 "segment_index": self.completed_segments - 1,  # 当前事务分段序号。
                 "num_inference_steps": body["options"].get("num_inference_steps"),  # 显式请求推理步数，空值沿用服务默认。
@@ -1398,7 +1513,7 @@ class AudioCppTtsSession:
                 "reference_recipe": ("reference_prompt" if voice.reference_path and voice.reference_text.strip()
                                      else "reference_only" if voice.reference_path else "voice_design"),  # 实际参考配方。
                 "full_decode": preview_recipe,  # 是否在生成结束后完整解码样音。
-                "engine_audio_duration_ms": response.headers.get("X-AudioCPP-Audio-Duration-Ms"),  # 原生声明时长。
+                "engine_audio_duration_ms": native_timing.get("audio_duration_ms", response.headers.get("X-AudioCPP-Audio-Duration-Ms")),  # 原生声明时长。
             }
             self.request_metrics.append(metrics)
             self.client._last_success_at = time.monotonic()
@@ -1409,7 +1524,11 @@ class AudioCppTtsSession:
                 "continuation_enabled=%s prompt_audio_sent（是否提交续接提示音频）=%s "
                 "continuation_id_sent（是否提交续接状态标识）=%s segment_index=%d num_inference_steps=%s sample_rate=%d "
                 "native_sample_rate=%d voice_id=%s continuation_id=%s endpoint=%s reference_recipe=%s "
-                "budget_ms=%d engine_audio_duration_ms=%s text_digest=%s%s",
+                "budget_ms=%d engine_audio_duration_ms=%s "
+                "http_headers_ms（响应头等待毫秒）=%.1f chunk_count（音频分块数）=%d "
+                "max_chunk_gap_ms（最大块间隔毫秒）=%.1f full_decode（完整解码）=%s "
+                "engine_ttft_ms（原生首音毫秒）=%s engine_wall_ms（原生完整任务毫秒）=%s "
+                "engine_rtf（原生实时因子）=%s text_digest=%s%s",
                 *self._tts_fields(), self.client.local_model, self.client.model_id, len(text),
                 output_for_request, received_for_request, ttfb_ms or 0.0, metrics["request_lock_wait_ms"],
                 metrics["http_first_audio_ms"] or 0.0, total_ms, audio_ms, rtf or 0.0,
@@ -1417,7 +1536,9 @@ class AudioCppTtsSession:
                 self.completed_segments - 1, metrics["num_inference_steps"],
                 self.client.sample_rate, self.client.native_sample_rate, voice.voice_id,
                 metrics["continuation_id"], path, metrics["reference_recipe"], budget_ms,
-                metrics["engine_audio_duration_ms"], text_digest(text), text_preview_suffix(text),
+                metrics["engine_audio_duration_ms"], metrics["http_headers_ms"] or 0.0,
+                chunk_count, max_chunk_gap_ms, preview_recipe, metrics["engine_ttft_ms"],
+                metrics["engine_wall_ms"], metrics["engine_rtf"], text_digest(text), text_preview_suffix(text),
             )
         except asyncio.CancelledError:
             logger.debug(
@@ -1509,7 +1630,7 @@ class AudioCppTtsSession:
         pcm = samples[:, 0].astype("<i2", copy=False).tobytes()
         # 完整任务结果已经在手，判废必须早于向收集器交付任何样音。
         yield "data: " + json.dumps({"type": "speech.audio.delta", "audio": base64.b64encode(pcm).decode("ascii")})
-        yield 'data: {"type": "speech.audio.done"}'
+        yield "data: " + json.dumps({"type": "speech.audio.done", "timing": result.get("timing")})
         yield "data: [DONE]"
 
     async def finish(self) -> None:
@@ -1596,6 +1717,8 @@ class AudioCppTtsSession:
                 yield item
 
     async def _queue_pcm(self, pcm: bytes) -> None:
+        if self.first_audio_ready_at is None:
+            self.first_audio_ready_at = time.monotonic()
         callback = getattr(self, "first_audio_callback", None)
         if callable(callback):
             callback()  # first_audio_callback（原生音频就绪，独立于允许播放时刻）。

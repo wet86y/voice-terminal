@@ -57,7 +57,7 @@ def _records(caplog, event: str) -> list[str]:
 
 
 def _ok_handler(request: httpx.Request) -> httpx.Response:
-    return _response(_audio_event(b"\x01\x00" * 8), _event("speech.audio.done"), "data: [DONE]\n\n")
+    return _response(_audio_event(b"\x01\x00" * 8), _event("speech.audio.done", timing={"ttft_ms": 23.5}), "data: [DONE]\n\n")
 
 
 def test_session_and_request_logs_carry_turn_speech_and_session_ids(caplog):
@@ -93,6 +93,14 @@ def test_session_and_request_logs_carry_turn_speech_and_session_ids(caplog):
     for line in completes:
         assert "reference_recipe=" in line
         assert "reference_recipe=None" not in line
+        assert "chunk_count（音频分块数）=1" in line
+        assert "max_chunk_gap_ms（最大块间隔毫秒）=" in line
+        assert "http_headers_ms（响应头等待毫秒）=" in line
+    firsts = _records(caplog, "first_audio_ready")
+    assert len(firsts) == 2
+    assert all("turn=turn-7 speech=speech-9" in line for line in firsts)
+    assert session.first_audio_ready_at is not None
+    assert session.request_metrics[0]["engine_ttft_ms"] == 23.5
 
 
 def test_text_content_stays_out_of_logs_by_default(caplog):

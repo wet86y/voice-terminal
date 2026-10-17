@@ -578,9 +578,10 @@ class EpisodeSpeechOutput(SpeechContinuationMixin, SpeechFrontierMixin, SpeechPi
             try:
                 if _continuation_parent is not None and _continuation_parent.tts_voice_snapshot is not None:
                     h.tts_session = h.tts_client.session(voice_snapshot=_continuation_parent.tts_voice_snapshot,
-                                                        inference_steps=_continuation_parent.tts_inference_steps)
+                                                        inference_steps=_continuation_parent.tts_inference_steps,
+                                                        turn_id=turn_id, speech_id=h.speech_id)
                 else:
-                    h.tts_session = h.tts_client.session()
+                    h.tts_session = h.tts_client.session(turn_id=turn_id, speech_id=h.speech_id)
                 h.tts_session_prepared = True
                 h.tts_voice_snapshot = getattr(h.tts_session, "voice_snapshot", None)
                 h.tts_inference_steps = getattr(h.tts_session, "_inference_steps", None)

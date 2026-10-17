@@ -1709,7 +1709,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             # trace, but do not let even a malformed/overloaded TTS payload
             # create an Episode, mutate last_turn_id, arm the silence ladder,
             # or wake the scheduler mailbox.
-            await self.log(kind, **({"text": text} if text is not None else {}), **payload)
+            await self.log(kind, turn_id=turn_id, **({"text": text} if text is not None else {}), **payload)
             return
         if self.episode_id is None:
             if kind in {"USER_SEGMENT_UPDATED", "USER_INPUT_FINALIZED"} and (not text or not text.strip()):
@@ -1724,7 +1724,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             # Keep the over-budget input in the turn history owned by the
             # controller, but do not grow the Agent context indefinitely.
             self.last_turn_id = turn_id
-            await self.log(kind, **({"text": text} if text is not None else {}), **payload)
+            await self.log(kind, turn_id=turn_id, **({"text": text} if text is not None else {}), **payload)
             return
         late_refinement = bool(
             turn_id and self.last_turn_id and turn_id != self.last_turn_id
@@ -1926,7 +1926,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
                     ))
             except RuntimeError:
                 pass
-        await self.log(kind, **({"text": text} if text is not None else {}), **payload)
+        await self.log(kind, turn_id=turn_id, **({"text": text} if text is not None else {}), **payload)
         if transcript_update is not None:
             scheduler_action = "coalesced" if self.pending else "enqueued"
             await self.log(

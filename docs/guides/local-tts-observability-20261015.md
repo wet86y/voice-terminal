@@ -4,7 +4,7 @@
 
 ## 日志关联与隐私边界
 
-本地合成事件用 `turn=`（用户轮次）、`speech=`（播报事务）和 `session=`（原生上下文）关联；失败、预热、分段回执、缓存溢出、模型切换与服务生命周期均有对应事件。`controller.turn_latency`（本轮时延）、`controller.tts_status`（合成状态）及播放器事件可与合成日志按轮次对齐。
+正式本地播报事件用 `turn=`（用户轮次）、`speech=`（播报事务）和 `session=`（原生上下文）关联，事务预建会话也携带这些标识。预热会话没有正式播报事务，`speech=None`（无正式播报事务）属于预期，按已有轮次与会话号关联。服务生命周期按 `pid`（原生进程编号）关联。用户输入定稿事件使用当前输入轮次，避免沿用上一输出所有者。
 
 普通日志默认不含会话文本，只记录字符数与文本摘要。只有显式设置 `VOICE_TTS_LOG_TEXT=1`（允许记录有限文本预览）才追加预览；`VOICE_TTS_NATIVE_TRACE=1`（启用原生分阶段跟踪）将原生追踪写入独立日志。原生输出由父进程逐行添加时间戳，便于和语音服务时间线对照。
 
@@ -15,6 +15,7 @@
 ```text
 audio_cpp_tts.session_policy      模型、音色版本、续接、预热/试听、推理步数、采样率
 audio_cpp_tts.request_start       分段序号、字符数、续接、步数、文本摘要
+audio_cpp_tts.first_audio_ready   每段第一个非空音频块抵达、等待时长和首块音频长度
 audio_cpp_tts.request_complete    首包、锁等待、网络首音频、总耗时、音频时长、实时因子、PCM 字节
 audio_cpp_tts.request_failed      阶段、异常类型、错误文本、是否重试、是否已有音频、耗时
 audio_cpp_tts.request_rejected    前置校验拒绝（音色缺失、参考音频缺失、会话状态）
@@ -27,12 +28,44 @@ audio_cpp_tts.continuation_reanchored       设计音色在完整句末成功重
 audio_cpp_tts.continuation_reanchor_skipped 上下文释放未确认，重锚定跳过
 audio_cpp_tts.model_loaded/model_unloaded/model_load_failed  模型装载与卸载（含 `elapsed_ms`）
 audio_cpp_tts.server_started/server_ready/model_switched/server_stopped  原生服务生命周期
+audio_cpp_tts.runtime_identity    程序构建、实际原生程序路径与摘要、安装版本、收据匹配状态
+audio_cpp_tts.runtime_config      原生计算后端、设备编号、线程数与计算图/缓存参数
 gpu_performance.applied/restored  本地合成期间的显卡性能模式
 ```
 
 轮次侧补充 `controller.turn_latency`（该轮全部时延口径）、`controller.tts_status`（结算态降级原因）、`controller.tts_prefetch_miss`（句间欠载）、`audio.player_first_pcm_submitted`／`audio.player_enqueue`／`audio.player_drained`（播放位置与字节数）、`tts.router_switch`／`tts.local_model_switch_*`（后端与模型选择）。
 
 排查入口：先用 `turn=` 串起 `session_policy → request_start → request_complete`，再用同一行的 `rtf`／`ttfb_ms` 与 `controller.tts_prefetch_miss` 对齐句间停顿；失败时直接看 `request_failed` 的 `stage`／`error_type`。
+
+### 默认首音时间线与阶段口径
+
+新增记录默认随普通 INFO（信息级）日志输出，每段只增加一次首块事件，首音入队与提交每个播报事务各记录一次。
+
+| 事件或字段 | 中文说明 |
+| --- | --- |
+| `audio_cpp_tts.first_audio_ready` | 每段首个原生音频块已抵达并完成解码；包含轮次、事务、会话和分段号 |
+| `controller.tts_first_pcm_enqueued` | 本轮首块音频已进入播放器，`key`（播放键）连接设备提交事件 |
+| `ready_to_enqueue_ms` | 合成首音就绪至首次入队的毫秒数，包含播放许可等上游门槛等待 |
+| `audio.player_first_pcm_submitted` | 设备回调首次消费该播放键的音频，尚需考虑硬件实际出声延迟 |
+| `queue_to_submit_ms` | 首块入队至设备回调首次提交的毫秒数 |
+| `http_headers_ms` | 提交网络请求至响应头抵达的毫秒数，不等同于纯原生计算耗时 |
+| `chunk_count`、`max_chunk_gap_ms` | 本段非空音频块数量、相邻块在应用侧抵达时间的最大间隔毫秒数；它表示音频供应节奏，不表示播放间隙 |
+| `full_decode` | 该请求是否使用完整解码试听路径 |
+| `engine_ttft_ms` | 原生流式完成事件报告的首音等待毫秒数；未提供时为空 |
+| `engine_wall_ms`、`engine_rtf`、`engine_audio_duration_ms` | 原生完整任务报告的耗时、实时因子和音频时长；未提供时为空 |
+| `controller.tts_sentence_window_wait` | 句窗实际等待超过50毫秒时，记录等待时长与前后剩余音频量 |
+| `audio_cpp_tts.prewarm_cancel_wait` | 正式请求取消尚未完成的预热时，记录取消等待毫秒数 |
+| `app_build`、`binary_path`、`binary_sha256` | 当前程序构建、实际启动的原生程序路径与完整摘要 |
+| `installed_version`、`receipt_path`、`binary_matches_receipt` | 对应目录收据的安装版本、路径、实际程序与收据摘要是否一致 |
+| `target_version`、`binary_matches_target` | 当前随包清单要求的原生版本、实际运行程序是否与该目标摘要一致；用于发现新版应用仍使用旧组件 |
+
+先比较原生首包、首音至入队、入队至设备提交三个阶段，再对照整段实时因子和最大块抵达间隔。`max_chunk_gap_ms`（最大音频块抵达间隔）按音频块到达应用的时间计算；85 毫秒只说明两块到达时刻相差最多 85 毫秒，不能据此判断播放是否停顿。判断播放器因队列耗尽而断流，应看 `underrun_ms`（播放器欠载静音毫秒数）：它累计设备回调因队列为空而输出静音的时长。`controller.tts_prefetch_miss.miss_ms`（预取事件欠载毫秒数）是整轮累计欠载，不能逐条相加。复用已有原生服务时，若本次没有创建进程，日志明确记录 `runtime_identity_unavailable`（无法证明被复用进程身份），不会把候选文件当成运行映像。
+
+显卡进程查询按接口版本使用真实结构布局和驱动返回的实际数量；查询失败通过 `process_query_available`（计算/图形进程表可用状态）与 `reason`（不可用原因）标明。`gpu_sample_ms`（显卡取证耗时毫秒）记录后台线程的采样耗时。进程表只能证明观察到哪些显卡进程，不能单凭数量推断算力抢占或根因。
+
+原生日志转发读取当前可用数据，不再等待凑满4096字节；前缀时间仍是父进程收到输出的时刻，不能替代原生内部事件时钟。
+
+上述轻量汇总不包含预填充、解码器计算图容量等内部阶段。更细原生追踪继续由下面的诊断开关显式启用，单独分析其对耗时的扰动。
 
 ### 诊断开关
 

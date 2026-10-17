@@ -215,13 +215,16 @@ fn verify_component_receipt(root:&Path,component:&str,actual:&std::collections::
     Ok(())
 }
 
-fn activate(root:&Path,stage:&Path,progress:&mut Progress)->Result<(),String>{
+fn activate(root:&Path,stage:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
     // components（组件登记）属于工作区状态；固定本体仍来自同一程序包。
     let incoming=stage.join("app/release.json");let mut release=crate::resources::load(&incoming)?;
     if let Ok(old)=crate::resources::load(&root.join("app/release.json")){
         if let Some(rows)=old["components"].as_array(){release["components"]=json!(rows.iter().filter(|row|matches!((row["kind"].as_str(),row["path"].as_str()),(Some("python"),Some("runtimes/python"))|(Some("models"),Some("models"))|(Some("dsh"),Some("runtimes/dsh"))|(Some("webview2"),Some("runtimes/webview2")))).collect::<Vec<_>>());atomic_json(&incoming,&release)?;}
     }
-    let migration_rows=prepare_speaker_migration(root,stage,&mut release,progress)?;
+    let mut migration_rows=prepare_speaker_migration(root,stage,&mut release,progress)?;
+    migration_rows.extend(crate::tts_upgrade::prepare(root,stage,&mut release,cancel,progress)?);
+    let mut seen=HashSet::new();migration_rows.retain(|row|seen.insert(row["path"].as_str().unwrap_or("").to_lowercase()));
+    cancelled(cancel)?;
     atomic_json(&incoming,&release)?;
     let journal=root.join("tmp/update-transaction.json");
     let mut rows=ITEMS.iter().map(|name|json!({"path":name,"original":root.join(name).exists()})).collect::<Vec<_>>();
@@ -272,7 +275,7 @@ pub fn install(payload:&[u8],root:&Path,cancel:Arc<AtomicBool>,progress:&mut Pro
             loop{cancelled(&cancel)?;let count=entry.read(&mut buffer).map_err(|e|e.to_string())?;if count==0{break;}outgoing.write_all(&buffer[..count]).map_err(|e|e.to_string())?;done+=count as u64;progress("正在展开程序本体",done,total);}
             outgoing.sync_all().map_err(|e|e.to_string())?;
         }
-        verify_package(&stage,&cancel,progress)?;cancelled(&cancel)?;activate(&root,&stage,progress)
+        verify_package(&stage,&cancel,progress)?;cancelled(&cancel)?;activate(&root,&stage,&cancel,progress)
     })();
     if !root.join("tmp/update-transaction.json").exists(){let _=remove_owned(&root.join("tmp/publish"),&root);}result
 }
@@ -408,6 +411,96 @@ pub fn launch(root:&Path)->Result<u32,String>{
         {let mut zip=zip::ZipWriter::new(&mut payload);let options=zip::write::SimpleFileOptions::default();for (name,data) in entries{zip.start_file(name,options).unwrap();zip.write_all(&data).unwrap();}zip.start_file("program-package.json",options).unwrap();zip.write_all(&serde_json::to_vec(&json!({"schema":1,"role":"product","build":build,"files":rows})).unwrap()).unwrap();zip.finish().unwrap();}payload.into_inner()
     }
     fn run(payload:&[u8],root:&Path)->Result<(),String>{install(payload,root,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{})}
+    fn package_with_tts(build:&str,speaker:bool,invalid_patch:bool)->Vec<u8>{
+        // 微型原生组件覆盖真实安装事务，无网络、无需完整模型或显卡。
+        let bytes=package_options(build,false,if speaker{Some(false)}else{None});
+        let mut archive=zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut entries=std::collections::BTreeMap::<String,Vec<u8>>::new();
+        for index in 0..archive.len(){let mut entry=archive.by_index(index).unwrap();let mut bytes=vec![];entry.read_to_end(&mut bytes).unwrap();entries.insert(entry.name().into(),bytes);}
+        let mut catalog=entries.get("app/config/resources/catalog.json").map(|bytes|serde_json::from_slice::<Value>(bytes).unwrap()).unwrap_or(json!({"resources":[]}));
+        let mut patch=Cursor::new(vec![]);let mut files=vec![];
+        {let mut zip=zip::ZipWriter::new(&mut patch);for (name,data) in [("cuda/audiocpp_server.exe",b"new-native".as_slice()),("model_specs/voxcpm2.json",b"{}".as_slice())]{
+            zip.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(data).unwrap();
+            files.push(json!({"path":name,"source_path":name,"archive_id":"patch","size_bytes":data.len(),"sha256":format!("{:x}",Sha256::digest(data))}));
+        }zip.finish().unwrap();}
+        files.push(json!({"path":"cuda/base.dll","archive_id":"binary","size_bytes":4,"sha256":format!("{:x}",Sha256::digest(b"base"))}));
+        catalog["resources"].as_array_mut().unwrap().push(json!({"resource_id":"tts-audiocpp-runtime","destination":"audiocpp/runtime","version":"fixed",
+            "files":files,"source":{"transfer":{"kind":"official_audiocpp_patch","patch":{"asset":"assets/audiocpp/voxcpm-patch.zip","size_bytes":patch.get_ref().len(),"sha256":if invalid_patch{"0".repeat(64)}else{format!("{:x}",Sha256::digest(patch.get_ref()))}}}}}));
+        entries.insert("app/config/resources/catalog.json".into(),serde_json::to_vec(&catalog).unwrap());
+        entries.insert("app/config/resources/assets/audiocpp/voxcpm-patch.zip".into(),patch.into_inner());
+        let mut release:Value=serde_json::from_slice(&entries.remove("app/release.json").unwrap()).unwrap();
+        entries.remove("program-package.json");
+        release["files"]=json!(entries.iter().filter_map(|(name,data)|name.strip_prefix("app/").map(|relative|json!({"path":relative,"size":data.len(),"sha256":format!("{:x}",Sha256::digest(data))}))).collect::<Vec<_>>());
+        entries.insert("app/release.json".into(),serde_json::to_vec(&release).unwrap());
+        let rows=entries.iter().map(|(name,data)|json!({"path":name,"size":data.len(),"sha256":format!("{:x}",Sha256::digest(data))})).collect::<Vec<_>>();
+        entries.insert("program-package.json".into(),serde_json::to_vec(&json!({"schema":1,"role":"product","build":build,"files":rows})).unwrap());
+        let mut output=Cursor::new(vec![]);{let mut zip=zip::ZipWriter::new(&mut output);for (name,data) in entries{zip.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(&data).unwrap();}zip.finish().unwrap();}output.into_inner()
+    }
+    fn old_tts(root:&Path,legacy:bool){
+        let folder=root.join(if legacy{"runtimes/audiocpp"}else{"models/audiocpp/runtime"});
+        fs::create_dir_all(folder.join("cuda")).unwrap();fs::create_dir_all(folder.join("model_specs")).unwrap();
+        fs::write(folder.join("cuda/audiocpp_server.exe"),b"old-native").unwrap();fs::write(folder.join("cuda/base.dll"),b"base").unwrap();fs::write(folder.join("model_specs/voxcpm2.json"),b"{}").unwrap();
+        let records=crate::resources::walk(&folder).unwrap().iter().map(|path|json!({"path":path.strip_prefix(&folder).unwrap().to_string_lossy().replace('\\',"/"),"size":path.metadata().unwrap().len(),"sha256":file_hash(path).unwrap(),"optional":false})).collect();
+        crate::resources::write_model_receipt(&folder,&json!({"resource_id":"tts-audiocpp-runtime","version":"old"}),records).unwrap();
+        for (name,data) in [("models/audiocpp/tts/model.gguf",b"preserved-weight".as_slice()),("data/tts/voices/voice.json",b"preserved-voice".as_slice())]{let path=root.join(name);fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,data).unwrap();}
+        atomic_json(&root.join("models/manifest.json"),&crate::resources::manifest(&root.join("models"),"models","old").unwrap()).unwrap();
+    }
+    #[test]fn bundled_tts_upgrade_is_offline_preserves_weights_and_combines_speaker_transaction(){
+        for legacy in [false,true]{for speaker in [false,true]{
+            let root=fixture();run(&package("old",false),&root).unwrap();old_tts(&root,legacy);
+            if speaker{legacy_speaker(&root);}
+            let payload=package_with_tts("new",speaker,false);
+            for _ in 0..2{
+                run(&payload,&root).unwrap();
+                assert_eq!(fs::read(root.join("models/audiocpp/runtime/cuda/audiocpp_server.exe")).unwrap(),b"new-native");
+                assert_eq!(fs::read(root.join("models/audiocpp/runtime/cuda/base.dll")).unwrap(),b"base");
+                assert_eq!(crate::resources::read_model_receipt(&root.join("models/audiocpp/runtime")).unwrap().1.as_deref(),Some("fixed"));
+                assert_eq!(fs::read(root.join("models/audiocpp/tts/model.gguf")).unwrap(),b"preserved-weight");
+                assert_eq!(fs::read(root.join("data/tts/voices/voice.json")).unwrap(),b"preserved-voice");
+                assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"new");
+                workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();
+                let release=crate::resources::load(&root.join("app/release.json")).unwrap();
+                let binding=release["components"].as_array().unwrap().iter().find(|row|row["kind"]=="models").unwrap();
+                assert_eq!(binding["manifest_sha256"],file_hash(&root.join("models/manifest.json")).unwrap());
+                assert!(!root.join("tmp/update-transaction.json").exists());
+                if speaker{assert!(root.join(CURRENT_MODEL).is_dir());assert!(!root.join(LEGACY_MODEL).exists());}
+            }
+            if legacy{assert_eq!(fs::read(root.join("runtimes/audiocpp/cuda/audiocpp_server.exe")).unwrap(),b"old-native");}
+            fs::remove_dir_all(root).unwrap();
+        }}
+    }
+    #[test]fn tts_upgrade_repairs_bad_receipt_using_verified_base_and_skips_fresh_workspace(){
+        let root=fixture();run(&package_with_tts("fresh",false,false),&root).unwrap();assert!(!root.join("models/audiocpp/runtime").exists());
+        old_tts(&root,false);fs::write(root.join("models/audiocpp/runtime/resource-install.json"),b"invalid").unwrap();
+        run(&package_with_tts("new",false,false),&root).unwrap();
+        assert_eq!(crate::resources::read_model_receipt(&root.join("models/audiocpp/runtime")).unwrap().1.as_deref(),Some("fixed"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn incompatible_tts_base_defers_component_but_allows_program_repair(){
+        let root=fixture();run(&package("old",false),&root).unwrap();old_tts(&root,false);
+        fs::write(root.join("models/audiocpp/runtime/cuda/base.dll"),b"bad!").unwrap();let before=fs::read(root.join("models/manifest.json")).unwrap();
+        run(&package_with_tts("new",false,false),&root).unwrap();
+        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"new");assert_eq!(fs::read(root.join("models/audiocpp/runtime/cuda/audiocpp_server.exe")).unwrap(),b"old-native");
+        assert_eq!(fs::read(root.join("models/manifest.json")).unwrap(),before);
+        assert!(crate::resources::load(&root.join("app/release.json")).unwrap()["deferred_migrations"]["tts_audiocpp"]["reason"].as_str().unwrap().contains("base.dll"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn invalid_bundled_tts_patch_preserves_old_program_and_runtime(){
+        let root=fixture();run(&package("old",false),&root).unwrap();old_tts(&root,false);
+        assert!(run(&package_with_tts("new",false,true),&root).unwrap_err().contains("补丁校验失败"));
+        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"old");assert_eq!(fs::read(root.join("models/audiocpp/runtime/cuda/audiocpp_server.exe")).unwrap(),b"old-native");
+        workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(windows)]#[test]fn failed_manifest_activation_rolls_back_program_and_new_tts_together(){
+        use std::os::windows::fs::OpenOptionsExt;
+        let root=fixture();run(&package("old",false),&root).unwrap();old_tts(&root,false);
+        let before=fs::read(root.join("models/manifest.json")).unwrap();
+        let held=fs::OpenOptions::new().read(true).share_mode(1).open(root.join("models/manifest.json")).unwrap();
+        assert!(run(&package_with_tts("new",false,false),&root).is_err());drop(held);
+        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"old");assert_eq!(fs::read(root.join("models/audiocpp/runtime/cuda/audiocpp_server.exe")).unwrap(),b"old-native");
+        assert_eq!(fs::read(root.join("models/manifest.json")).unwrap(),before);
+        assert!(!root.join("tmp/update-transaction.json").exists());workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn october_11_workspaces_upgrade_without_new_receipts_or_current_components(){
         // 2026-10-11（周日）发行使用第二版固定目录；较早包可能没有工作区编号，

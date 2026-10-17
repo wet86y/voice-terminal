@@ -3,8 +3,10 @@
 import asyncio
 import io
 import logging
+import os
 import re
 import threading
+import time
 
 from voice_terminal.providers.audio_cpp_tts import AudioCppTtsServer
 
@@ -112,6 +114,7 @@ def _start_process_fixture(tmp_path, monkeypatch) -> tuple[AudioCppTtsServer, di
                         classmethod(lambda cls, root: tmp_path))
     monkeypatch.setattr(AudioCppTtsServer, "_server_binary", lambda self: tmp_path / "audiocpp_server.exe")
     monkeypatch.setattr(AudioCppTtsServer, "_validate_model_assets", lambda self, model: {"id": model})
+    monkeypatch.setattr(AudioCppTtsServer, "_runtime_update_error", classmethod(lambda cls, root, **kwargs: None))
     monkeypatch.setattr(AudioCppTtsServer, "_start_log_pump", lambda self, stream: None)
     return server, captured
 
@@ -127,6 +130,52 @@ def test_native_trace_switch_adds_native_stage_flags(tmp_path, monkeypatch):
     command = captured["command"]
     assert "--log" in command and "--log-file" in command
     assert str(tmp_path / "cache" / "logs" / "audiocpp-trace.log") in command
+
+
+def test_native_log_pump_writes_small_line_before_pipe_closes(tmp_path):
+    """真实活管道中一行不足4096字节，也必须在子进程退出之前落盘。"""
+    log_path = tmp_path / "native.log"
+    server = _detached_server(log_path)
+    read_fd, write_fd = os.pipe()
+    stream = io.BufferedReader(os.fdopen(read_fd, "rb", buffering=0))
+    writer = os.fdopen(write_fd, "wb", buffering=0)
+    try:
+        server._start_log_pump(stream)
+        writer.write(b"warmup complete\n")
+        deadline = time.monotonic() + 2
+        while log_path.stat().st_size == 0 and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert "warmup complete" in log_path.read_text("utf-8")
+        assert server._log_pump_thread.is_alive(), "测试期间写端仍打开，不能依赖进程退出刷新"
+    finally:
+        writer.close()
+        server._log_pump_thread.join(2)
+        server._log_file.close()
+
+
+def test_started_runtime_identity_hashes_actual_binary(tmp_path, monkeypatch, caplog):
+    """启动日志记录实际程序字节摘要和对应目录收据，不使用程序内嵌旧版本串。"""
+    import hashlib
+    import json
+    server, _ = _start_process_fixture(tmp_path, monkeypatch)
+    binary = tmp_path / "cuda/audiocpp_server.exe"
+    binary.parent.mkdir()
+    binary.write_bytes(b"actual-native-binary")
+    (tmp_path / "resource-install.json").write_text(json.dumps({"version": "fixed-runtime", "files": [
+        {"path": "cuda/audiocpp_server.exe", "sha256": hashlib.sha256(binary.read_bytes()).hexdigest()},
+    ]}), "utf-8")
+    monkeypatch.setattr(AudioCppTtsServer, "_server_binary", lambda self: binary)
+    try:
+        with caplog.at_level(logging.INFO, logger="voice_terminal.providers.audio_cpp_tts"):
+            server._start_process()
+    finally:
+        server._log_file.close()
+    assert f"binary_path（实际程序路径）={binary}" in caplog.text
+    assert hashlib.sha256(binary.read_bytes()).hexdigest() in caplog.text
+    assert "installed_version（安装版本）=fixed-runtime" in caplog.text
+    assert "binary_matches_receipt（程序与收据一致）=True" in caplog.text
+    assert "target_version（目标原生版本）=" in caplog.text
+    assert "binary_matches_target（程序与当前目标一致）=False" in caplog.text
 
 
 def test_native_trace_is_off_by_default(tmp_path, monkeypatch):

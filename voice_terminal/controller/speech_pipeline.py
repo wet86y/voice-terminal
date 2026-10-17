@@ -263,8 +263,9 @@ class SpeechPipeline:
             self.player.allow(playback_key)
             configure_buffer = getattr(self.player, "configure_stream_buffer", None)
             startup_ms = int(getattr(tts_client, "playback_startup_buffer_ms", 0) or 0)
-            if callable(configure_buffer) and startup_ms > 0:
-                resume_ms = int(getattr(tts_client, "playback_resume_buffer_ms", 0) or 0)
+            resume_ms = int(getattr(tts_client, "playback_resume_buffer_ms", 0) or 0)
+            if callable(configure_buffer) and (startup_ms > 0 or resume_ms > 0):
+                # startup_ms=0（无起播储备）仍须单独装配欠载恢复门槛。
                 # 起播储备必须能在句窗门放行之前达成（safe_stream_reserve_ms）。
                 # 这里的夹紧不是限流，而是把"隐式安全余量"变成显式不变量：此前只有
                 # min(tts_local_buffer_ms, startup_ms) 一道，句窗门那条约束完全没有保护。
@@ -283,8 +284,7 @@ class SpeechPipeline:
                 )
                 armed_startup_ms = armed_startup
                 configure_buffer(playback_key, startup_ms=armed_startup, resume_ms=armed_resume)
-                # 装配必须留痕：此前守卫取到 0 时静默跳过，现场只能看到
-                # "152 毫秒就起播"这个结果，无法反查原因。
+                # 装配必须留痕：startup_ms=0（无起播储备）是明确策略，不能静默跳过恢复闸门。
                 logger.info("audio.player_stream_buffer_armed key=%s startup_ms=%d resume_ms=%d "
                             "client=%s", playback_key, armed_startup, armed_resume,
                             type(tts_client).__name__)
@@ -304,9 +304,9 @@ class SpeechPipeline:
                         type(tts_client).__name__,
                     )
             else:
-                # 在线后端按服务端节奏起播，本地下行才需要储备闸门。
-                logger.debug("audio.player_stream_buffer_skipped key=%s startup_ms=%d callable=%s "
-                             "client=%s", playback_key, startup_ms, callable(configure_buffer),
+                # 没有声明起播或恢复储备的后端按到达节奏直接播放。
+                logger.debug("audio.player_stream_buffer_skipped key=%s startup_ms=%d resume_ms=%d callable=%s "
+                             "client=%s", playback_key, startup_ms, resume_ms, callable(configure_buffer),
                              type(tts_client).__name__)
             if handle is not None and getattr(handle, "playback_ready", None) is not None and not handle.playback_ready.is_set():
                 hold = getattr(self.player, "hold", None)
@@ -351,6 +351,7 @@ class SpeechPipeline:
             "max_rtf": 0.0,    # 本轮观测到的最大实时因子。
             "resume_ms": 0,    # 已抬高的恢复门槛（0 表示仍用装配值）。
             "gpu": None,       # 首次判定降级时的显卡快照字段。
+            "gpu_task": None,  # 显卡取证在线程池执行，避免阻塞后续分段。
             "reported": False,  # 是否已经输出过降级 WARNING。
         }
         adaptive_resume_ms = safe_stream_reserve_ms(
@@ -359,6 +360,16 @@ class SpeechPipeline:
             prefetch_ms=sentence_prefetch_ms,
             cap_margin_ms=ADAPTIVE_RESUME_CAP_MARGIN_MS,
         )
+
+        async def capture_gpu() -> None:
+            started_at = time.perf_counter()
+            snapshot = await asyncio.to_thread(gpu_snapshot_fields, tts_client)
+            snapshot["sample_elapsed_ms"] = round((time.perf_counter() - started_at) * 1000, 1)
+            degradation["gpu"] = snapshot
+
+        def start_gpu_capture() -> None:
+            if degradation["gpu_task"] is None:
+                degradation["gpu_task"] = asyncio.create_task(capture_gpu(), name="tts-gpu-diagnostics")
 
         def degradation_facts() -> tuple[int, float]:
             diagnostics = getattr(self.player, "diagnostics", None)
@@ -395,7 +406,7 @@ class SpeechPipeline:
                 return
             if not degradation["active"]:
                 degradation["active"] = True
-                degradation["gpu"] = gpu_snapshot_fields(tts_client)
+                start_gpu_capture()
             setter = getattr(self.player, "set_stream_reserve", None)
             if not callable(setter) or adaptive_resume_ms <= 0:
                 return
@@ -442,7 +453,7 @@ class SpeechPipeline:
                 "silence_ratio": round(underrun_ms / audible_ms, 4) if audible_ms > 0 else 0.0,
                 "resume_ms": resume_ms,
                 "startup_ms": int(armed_startup_ms or 0),
-                "gpu": degradation["gpu"] or gpu_snapshot_fields(tts_client),
+                "gpu": degradation["gpu"] or {"reason": "snapshot-unavailable"},
             }
 
         async def report_playback_degradation() -> None:
@@ -460,11 +471,14 @@ class SpeechPipeline:
             if underrun_ms <= 0 and float(degradation["max_rtf"]) < 1.0:
                 return
             degradation["reported"] = True
+            start_gpu_capture()
+            try:
+                await asyncio.wait_for(degradation["gpu_task"], timeout=0.25)
+            except Exception as exc:
+                degradation["gpu"] = {"reason": f"snapshot-{type(exc).__name__}"}
             fields = playback_degradation_fields()
             gpu = fields.get("gpu") or {}
-            # 把判别结论摊平成一行可直接读的字段：gpu_external 非 0 即说明有别的
-            # 程序在用显卡（合成被 WDDM 分时抢占，是历史记录的 RTF 劣化机制）；
-            # 为 0 才说明"只有本程序在跑"，此时变慢应归因于原生推理或驱动状态。
+            # 进程表只证明进程存在，不证明它占用了多少算力；查询失败也不能视为无竞争。
             external = gpu.get("external_processes") if isinstance(gpu, dict) else None
             own = gpu.get("own_processes") if isinstance(gpu, dict) else None
             scheduling = gpu.get("scheduling") if isinstance(gpu, dict) else None
@@ -472,7 +486,8 @@ class SpeechPipeline:
                 "controller.tts_playback_degraded turn_id=%s max_rtf=%.3f underrun_ms=%d "
                 "played_ms=%d silence_ratio=%.4f resume_ms=%d startup_ms=%d "
                 "gpu_external=%d gpu_own=%d gpu_hags=%s gpu_clock_mhz=%s gpu_power_w=%s "
-                "gpu_util_pct=%s gpu_external_detail=%s gpu_unavailable=%s gpu=%s",
+                "gpu_util_pct=%s gpu_external_detail=%s gpu_unavailable=%s "
+                "gpu_sample_ms（显卡采样耗时毫秒）=%s gpu_query_available（进程表可用状态）=%s gpu=%s",
                 fields["turn_id"], fields["max_rtf"], fields["underrun_ms"],
                 fields["played_ms"], fields["silence_ratio"], fields["resume_ms"],
                 fields["startup_ms"],
@@ -484,6 +499,8 @@ class SpeechPipeline:
                 gpu.get("utilization_percent") if isinstance(gpu, dict) else None,
                 external if isinstance(external, list) else None,
                 gpu.get("reason") if isinstance(gpu, dict) else None,
+                gpu.get("sample_elapsed_ms") if isinstance(gpu, dict) else None,
+                gpu.get("process_query_available") if isinstance(gpu, dict) else None,
                 gpu,
             )
             ws.timings["playback_degraded"] = True
@@ -566,6 +583,7 @@ class SpeechPipeline:
             nonlocal audio_returned_bytes, completed_markers, alignment_cursor
 
             audio_iterator = None
+            first_enqueued = False
             try:
                 audio_iterator = active_session.audio_chunks().__aiter__()
                 while True:
@@ -607,6 +625,15 @@ class SpeechPipeline:
                         if getattr(active_session, "audio_rejected", False):
                             return
                         self.player.enqueue(playback_key, pcm)
+                        if not first_enqueued:
+                            first_enqueued = True
+                            ready_at = getattr(active_session, "first_audio_ready_at", None)
+                            logger.info(
+                                "controller.tts_first_pcm_enqueued turn=%s speech=%s session=%s key=%s "
+                                "chunk_bytes（首块字节数）=%d ready_to_enqueue_ms（合成首音至入队毫秒）=%.1f",
+                                ws.turn_id, speech_id, getattr(active_session, "session_tag", None), playback_key,
+                                len(pcm), (time.monotonic() - ready_at) * 1000 if ready_at is not None else -1.0,
+                            )
                     # Bidi sentence/request boundaries do not include the
                     # sentence text, so they cannot safely close a local
                     # client chunk.  Do not equate a task_continue frame with
@@ -734,6 +761,22 @@ class SpeechPipeline:
             )
 
         async def wait_for_sentence_window() -> None:
+            if not sentence_window_enabled or self.player is None:
+                return
+            started_at = time.perf_counter()
+            before = playback_progress()
+            await wait_for_sentence_window_inner()
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            if elapsed_ms >= 50:
+                logger.info(
+                    "controller.tts_sentence_window_wait turn=%s speech=%s key=%s "
+                    "elapsed_ms（句窗等待毫秒）=%.1f remaining_before_ms（等待前剩余音频毫秒）=%d "
+                    "remaining_after_ms（等待后剩余音频毫秒）=%d",
+                    ws.turn_id, speech_id, playback_key, elapsed_ms,
+                    int(before["remaining_ms"]), int(playback_progress()["remaining_ms"]),
+                )
+
+        async def wait_for_sentence_window_inner() -> None:
             """Admit one more complete clause from local staging.
 
             Receipts are cumulative PCM boundaries.  Keeping at most two of
@@ -1209,7 +1252,7 @@ class SpeechPipeline:
                     tts_disabled = True
                     logger.warning("controller.playback_degraded turn_id=%s error=%s", ws.turn_id, exc)
                 # F3 每轮降级信号：一行的 underrun/RTF/静音占比/实际 resume 与显卡快照，
-                # 下次现场再出现时可直接判定是否为外部显卡争用。未降级则一条都不打。
+                # 进程表和采样耗时用于后续对照，不把进程存在直接判作算力争用。
                 await report_playback_degradation()
             if session:
                 if tts_failed is not None and self._valid(token):
@@ -1253,6 +1296,10 @@ class SpeechPipeline:
                 if not reader.done():
                     reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
+            gpu_task = degradation["gpu_task"]
+            if gpu_task is not None and not gpu_task.done():
+                gpu_task.cancel()
+                await asyncio.gather(gpu_task, return_exceptions=True)
             # Isolated replacement sessions are valid for their one active
             # transaction, but never become an implicit reusable session.
             retain_session = bool(
