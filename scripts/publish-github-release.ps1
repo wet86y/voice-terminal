@@ -60,8 +60,9 @@ try {
   $NotesPath=Join-Path $Repo "docs/releases/$Tag.md"
   if (-not (Test-Path -LiteralPath $NotesPath -PathType Leaf)) { throw "缺少发行说明：$NotesPath" }
   $Notes=Get-Content -LiteralPath $NotesPath -Raw -Encoding UTF8
+  $UpdateNotes=$Notes -replace '(?m)^#{1,6}\s*','' -replace '(?m)^-\s*','• '
   $Update=[ordered]@{
-    version=$Version;tag=$Tag;asset='VoiceTerminalSetup.exe';size=$InstallerSize;sha256=$InstallerHash;releaseNotes=$Notes.Trim()
+    version=$Version;tag=$Tag;asset='VoiceTerminalSetup.exe';size=$InstallerSize;sha256=$InstallerHash;releaseNotes=$UpdateNotes.Trim()
     fields=[ordered]@{version='产品版本';tag='GitHub 发行标签';asset='分发安装器名称';size='安装器字节数';sha256='安装器 SHA-256（文件摘要）';releaseNotes='中文发行说明'}
   }
   $UpdatePath=Join-Path $Output 'update.json'
@@ -79,6 +80,8 @@ try {
   $Assets=@($Installer,$DeliveryPath,$UpdatePath,$ChecksumPath)
   if ($ReleaseExists) {
     & gh release upload $Tag @Assets --clobber
+    if ($LASTEXITCODE) { throw "GitHub Release $Tag 资产上传失败。" }
+    & gh release edit $Tag --title "Voice Terminal $Tag" --notes-file $NotesPath
   } else {
     & gh release create $Tag @Assets --title "Voice Terminal $Tag" --notes-file $NotesPath --target main
   }
