@@ -25,7 +25,7 @@ import { speechMessageKey, userMessageKey } from './conversation-identity'
 import { DEFAULT_SETTINGS, DEFAULT_REGISTRY, DEFAULT_DSH, MAX_WAKE_KEYWORDS, defaultCurrent, defaultShadow, normalizeSettings, normalizeRegistry, normalizeRuntimeState, updateSettingsFromResponse } from './normalization'
 export { MAX_WAKE_KEYWORDS } from './normalization'
 
-export type ProductSettingsTab = 'tts' | 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models' | 'compute' | 'system' | 'workspace' | 'hotwords'
+export type ProductSettingsTab = 'tts' | 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'compute' | 'system' | 'workspace' | 'hotwords'
 export type ProductPage = 'home' | 'settings'
 export type AssignmentSlot = 'voice' | 'shadow' | 'status'
 

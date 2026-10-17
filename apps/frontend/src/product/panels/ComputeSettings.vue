@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import ResourceInstallDialog from './ResourceInstallDialog.vue';
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import LocalComponents from '../../interface/LocalComponents.vue'
-import { formatComponentMemory, type LocalComponentRow, type LocalComponentsModel, type ManagedResourceRow } from '../../interface/local-components'
+import { formatComponentMemory, type FixedProviderId, type LocalComponentCategory, type LocalComponentRow, type LocalComponentsModel, type LocalDownloadItem, type LocalProviderSettings, type ManagedResourceRow } from '../../interface/local-components'
 import { useApplicationHost, type ApplicationComponent } from '../application-host'
 import { useProductContext } from '../product-context'
+import { productApi } from '../api'
 import type { ComputeDeviceMode, ProductLocalModelId } from '../types'
 import { componentResources, modelComponentOwners as owners } from '../component-resources'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
@@ -16,12 +17,15 @@ const application = useApplicationHost()
 const tts = useLocalTtsStatus(() => application.snapshot.value?.startup_complete === true)
 const refreshing = ref(false)
 const retrying = ref(new Set<string>())
+const providerLoading = ref(true) // providerLoading（正在读取在线服务配置状态）。
+const providerSaving = ref(false) // providerSaving（正在保存在线服务密钥）。
+const providerConfigured = ref({ deepseek: false, minimax: false }) // providerConfigured（只含配置状态，不含密钥正文）。
 // modelResourceIds（模型资源编号映射）：与 catalog.resource_id（资源清单编号）一致。
 const modelResourceIds: Record<ProductLocalModelId, string> = {
   kws: 'kws-sherpa-onnx',
   paraformer: 'paraformer-streaming',
   voice_vad: 'fsmn-vad',
-  campplus: 'wespeaker-cnceleb-resnet34',
+  campplus: 'campplus-zh-cn-common',
   smart_turn: 'smart-turn',
   sensevoice: 'sensevoice-small',
 }
@@ -29,6 +33,32 @@ const modelResourceIds: Record<ProductLocalModelId, string> = {
 // READY（就绪）、RUNNING（运行中）、STREAMING（流式传输）、CONNECTED（已连接）；DEGRADED（降级）沿用原有可用规则。
 const availableModelServices = new Set(['READY', 'RUNNING', 'STREAMING', 'CONNECTED', 'DEGRADED'])
 function componentFor(id: string) { return application.snapshot.value?.components?.find(row => row.id === id) }
+async function readProviderConfiguration() {
+  try {
+    const response = await productApi.fixedCredentials()
+    providerConfigured.value = { deepseek: response.providers.deepseek.configured, minimax: response.providers.minimax.configured }
+  } catch { /* 组件详情仍允许填写；保存时会显示明确错误。 */ }
+  finally { providerLoading.value = false }
+}
+function providerSettings(provider: FixedProviderId): LocalProviderSettings {
+  return {
+    provider,
+    configured: providerConfigured.value[provider],
+    disabled: providerLoading.value || providerSaving.value,
+    save: async apiKey => {
+      providerSaving.value = true
+      try {
+        const request = provider === 'deepseek' ? { deepseek_api_key: apiKey } : { minimax_api_key: apiKey }
+        const response = await productApi.saveFixedCredentials(request)
+        providerConfigured.value = { deepseek: response.providers.deepseek.configured, minimax: response.providers.minimax.configured }
+        if (provider === 'minimax') await props.resourceController?.refreshInventory()
+        return { configured: response.providers[provider].configured, message: response.message }
+      } finally { providerSaving.value = false }
+    },
+    usage: async () => (await productApi.fixedProviderUsage(provider)).data,
+  }
+}
+onMounted(() => { void readProviderConfiguration() })
 const resources = computed(() => componentResources(application.snapshot.value, computeStatus.value))
 const systemComponents = computed(() => (application.snapshot.value?.components ?? []).filter(row => !['asr', 'analysis', 'speaker', 'dsh'].includes(row.id)))
 function managedResource(resourceId: string): ManagedResourceRow | undefined {
@@ -84,8 +114,9 @@ const rows = computed<LocalComponentRow[]>(() => {
     const available = !updateRequired && !loading && !ownerUnavailable && !disabled && (status ? availableModelServices.has(status.service) : ['ready', 'external'].includes(owner?.state ?? ''))
     const ownerError = ownerUnavailable ? owner?.error || status?.runtime_error || (owner?.state === 'blocked' ? '组件依赖不可用，请检查所属进程。' : owner?.state === 'stopped' ? '组件进程已退出。' : '组件运行异常，请查看日志并重试。') : undefined
     const gpuAvailable = available && !refreshing.value && status?.gpu_available === true
+    const category: LocalComponentCategory = ['paraformer', 'sensevoice', 'smart_turn'].includes(item.id) ? 'speech' : 'extensions'
     return {
-      id: item.id, name: item.title,
+      id: item.id, name: item.title, category,
       state: updateRequired ? 'failed' : available ? 'ready' : disabled ? 'disabled' : loading ? 'loading' : 'failed',
       status: updateRequired ? '需更新' : loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : ownerUnavailable ? '不可用' : disabled ? '已停用' : !status && available ? '运行中' : serviceLabel(status?.service),
       available, retryable: !updateRequired && !available && !loading && !disabled && Boolean(owner?.retry_allowed), busy: loading,
@@ -126,7 +157,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     const loading = !ownerStopped && !disabled && (ownerLoading || !status && application.snapshot.value?.startup_complete !== true)
     const available = !ownerStopped && !loading && !disabled && Boolean(status && availableModelServices.has(status.service))
     models.push({
-      id, name, state: disabled ? 'disabled' : available ? 'ready' : loading ? 'loading' : 'failed',
+      id, name, category: id === 'punctuation' ? 'speech' : 'extensions', state: disabled ? 'disabled' : available ? 'ready' : loading ? 'loading' : 'failed',
       status: disabled ? '已停用或词表为空' : loading ? '启动中' : available ? serviceLabel(status?.service) : !status ? '未提供状态' : '不可用',
       available, retryable: !available && !loading && !disabled && Boolean(owner?.retry_allowed), busy: loading,
       runtime: status?.runtime || '未提供', location: deviceLabel(status?.device),
@@ -145,7 +176,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     const loading = busy || ['starting', 'waiting', 'stopping'].includes(component.state)
     const available = !loading && ['ready', 'external'].includes(component.state)
     return {
-      id: component.id, name: component.name,
+      id: component.id, name: component.name, category: 'inference',
       state: loading ? 'loading' : available ? 'ready' : component.state === 'disabled' ? 'disabled' : 'failed',
       status: loading ? component.state === 'stopping' ? '退出中' : '启动中' : available ? '运行中' : component.state === 'disabled' ? '已停用' : '不可用',
       available, retryable: !loading && component.retry_allowed, busy: loading,
@@ -160,14 +191,14 @@ const rows = computed<LocalComponentRow[]>(() => {
   })
   const system = systemComponents.value
   const environment = props.resourceController?.resources.value.find(row => row.resource_id === 'voice-server')
-  if (system.length || environment) {
+  {
     const metrics = resources.value.get('voice-system')
     const failure = system.find(row => !row.retrying && !retrying.value.has(row.id) && ['failed', 'blocked', 'stopped'].includes(row.state))
     const busy = system.some(row => row.retrying || retrying.value.has(row.id))
     const loading = busy || system.some(row => ['waiting', 'starting', 'stopping'].includes(row.state))
     const active = system.find(row => row.retrying || retrying.value.has(row.id) || ['waiting', 'starting', 'stopping'].includes(row.state))
     components.push({
-      id: 'voice-system', name: 'Voice Server（语音服务）',
+      id: 'voice-system', name: 'Voice Server（语音服务）', category: 'voice-server',
       state: failure ? 'failed' : loading ? 'loading' : !system.length && !environment?.can_start ? 'disabled' : 'ready',
       status: failure ? '部分不可用' : loading ? '启动中' : system.length ? '运行中' : environment?.can_start ? '已配置' : '待配置',
       available: !failure && !loading && Boolean(system.length || environment?.can_start), retryable: !loading && system.some(row => row.retry_allowed), busy: loading && !failure,
@@ -194,19 +225,29 @@ const rows = computed<LocalComponentRow[]>(() => {
   const ttsFailed = !ttsLoading && (Boolean(capability) || ttsResource?.can_start === false || tts.status.value?.load_state === 'error')
   const localBackend = (tts.status.value?.backend ?? settings.tts.backend) === 'voxcpm1'
   components.push({
-    id: 'tts', name: 'TTS（语音合成）',
+    id: 'tts', name: 'TTS（语音合成）', category: 'tts',
     state: ttsLoading ? 'loading' : ttsFailed ? 'failed' : 'ready',
     status: ttsLoading ? tts.status.value?.pending_selection ? '切换中' : '启动中' : ttsFailed ? '待配置或恢复' : application.snapshot.value?.startup_complete ? '运行中' : '已配置',
-    available: true, busy: ttsLoading, retryable: !ttsLoading && Boolean(capability?.retry),
+    available: !ttsLoading && !ttsFailed, busy: ttsLoading, retryable: !ttsLoading && ttsFailed && Boolean(capability?.retry),
     runtime: localBackend ? 'audio.cpp（原生音频推理框架）' : '在线 API（语音接口）',
     residentMemory: formatComponentMemory(localMetrics?.memory_rss_bytes),
     privateMemory: formatComponentMemory(localMetrics?.memory_private_commit_bytes),
     vram: formatComponentMemory(localMetrics?.gpu_dedicated_bytes),
-    description: '安装任一本地模型及共用运行程序，或配置在线语音接口，即可满足语音合成组件的启动条件。播放后端与音色在语音与音色页选择。',
+    description: 'VoxCPM1 或 VoxCPM2 与共用运行程序就绪，或配置 MiniMax 在线 API，任一方式均可满足语音合成组件校验。播放后端与音色在语音与音色页选择。',
     error: ttsLoading ? undefined : capability?.error || ttsResource?.error || tts.status.value?.error || undefined,
-    resourceChoices: ['tts-voxcpm2', 'tts-voxcpm1'].map(managedResource).filter((row): row is ManagedResourceRow => Boolean(row)),
+    resourceChoices: ['tts-voxcpm1', 'tts-voxcpm2'].map(managedResource).filter((row): row is ManagedResourceRow => Boolean(row)),
+    provider: providerSettings('minimax'),
     sharedResource: managedResource('tts-audiocpp-runtime'), facts: [],
     note: '本地运行程序独立计量；下载不会自动热切换当前模型。',
+  })
+  components.push({
+    id: 'deepseek', name: 'DeepSeek 在线 API（推理接口）', category: 'inference',
+    state: providerLoading.value ? 'loading' : providerConfigured.value.deepseek ? 'ready' : 'failed',
+    status: providerLoading.value ? '读取配置中' : providerConfigured.value.deepseek ? '已配置' : '待配置',
+    available: providerConfigured.value.deepseek, busy: providerLoading.value,
+    runtime: '在线 API（推理接口）',
+    description: '配置 DeepSeek 接口密钥并查询账户余额。密钥由服务端安全保存，不会返回页面。',
+    facts: [], provider: providerSettings('deepseek'),
   })
   // 能力行：模型行未覆盖的能力（音频、合成、主模型等）单独呈现，并可只恢复该能力。
   const coveredCapabilities = new Set(['asr', 'kws', 'speaker', 'tts'])
@@ -261,8 +302,11 @@ const model = computed<LocalComponentsModel>(() => {
       }
     }),
     resourceActionsAvailable: props.resourceController?.resourcesCanManage.value ?? false,
+    downloadResources: (props.resourceController?.resources.value ?? [])
+      .map(resource => managedResource(resource.resource_id))
+      .filter((resource): resource is ManagedResourceRow => Boolean(resource)),
     resourceLoading: Boolean(props.resourceController?.loading.value || props.resourceController?.refreshing.value
-      || props.resourceController?.inventoryRefreshing.value),
+      || props.resourceController?.inventoryRefreshing.value || props.resourceController?.preparingDownloadBundle.value),
     resourceError: props.resourceController?.resourceError.value || undefined,
     resourceEventError: props.resourceController?.eventError.value || undefined,
     resourceTasksBusy: Boolean(props.resourceController?.startingResources.value.size
@@ -304,6 +348,9 @@ function device(id: string, value: string) {
   }
 }
 function resourceDownload(id: string) { void props.resourceController?.downloadResource(id) }
+function resourceBundleDownload(request: { title: string; entries: LocalDownloadItem[] }) {
+  void props.resourceController?.prepareDownloadBundle(request.entries, request.title)
+}
 function resourceRefresh() { void props.resourceController?.refreshInventory() }
 function resourceImport(id: string) { void props.resourceController?.importResource(id) }
 function resourceImportAll() { void props.resourceController?.importResource() }
@@ -312,5 +359,5 @@ function cancelResource(id: string) { void props.resourceController?.cancelJob(i
 </script>
 <template>
   <ResourceInstallDialog v-if="resourceController" :controller="resourceController" />
-  <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" />
+  <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" />
 </template>

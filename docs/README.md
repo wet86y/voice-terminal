@@ -22,6 +22,7 @@
 
 ## 说明
 
+- [组件设置与分类下载](guides/component-settings.md)
 - [模型运行环境配置指南](guides/模型运行环境配置指南.md)
 - [应用生命周期](guides/application-lifecycle.md)
 - [ASR（自动语音识别）热词](guides/asr-hotwords.md)

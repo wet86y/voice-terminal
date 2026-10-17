@@ -13,7 +13,6 @@ import { useProductAdapter } from './useProductAdapter'
 import { useProductControls } from './useProductControls'
 import * as desktopBridge from './desktop-port'
 import ComputeSettings from './panels/ComputeSettings.vue'
-import ModelSettings from './panels/ModelSettings.vue'
 import WakeTasksSettings from './panels/WakeTasksSettings.vue'
 import SpeakerSettings from './panels/SpeakerSettings.vue'
 import { SPEAKER_DEFAULTS, SPEAKER_FIELDS } from './speaker-policy'
@@ -430,22 +429,6 @@ describe('正式界面的真实控件交互', () => {
     await flushPromises()
     expect(wrapper.get('.settings-page').attributes('style') ?? '').not.toContain('display: none')
     application.runtimeFailure.value = false
-  })
-  it('固定供应商密钥只提交输入字段，失败保留草稿，成功清空输入', async () => {
-    vi.spyOn(productApi, 'fixedCredentials').mockResolvedValue({ providers: { deepseek: { configured: true }, minimax: { configured: true } }, vault_available: true })
-    const save = vi.spyOn(productApi, 'saveFixedCredentials').mockRejectedValueOnce(new Error('保存失败'))
-    const wrapper = render({ setup() { const value = useProductControls(); provideProductContext(value); return () => h(ModelSettings) } })
-    await flushPromises()
-    expect(wrapper.findAll('select')).toHaveLength(0)
-    expect(wrapper.findAll('input')).toHaveLength(2)
-    expect(wrapper.text()).not.toContain('模型池')
-    await wrapper.get('input').setValue('test-deepseek-key')
-    await wrapper.get('form').trigger('submit'); await flushPromises()
-    expect(wrapper.get('input').element).toHaveProperty('value', 'test-deepseek-key')
-    save.mockResolvedValue({ providers: { deepseek: { configured: true }, minimax: { configured: true } }, vault_available: true })
-    await wrapper.get('form').trigger('submit'); await flushPromises()
-    expect(save).toHaveBeenLastCalledWith({ deepseek_api_key: 'test-deepseek-key', minimax_api_key: '' })
-    expect(wrapper.get('input').element).toHaveProperty('value', '')
   })
   it('唤醒任务按分类切换，归档与取消记录均可删除且不混入待执行列表', async () => {
     let value!: ReturnType<typeof useProductControls>

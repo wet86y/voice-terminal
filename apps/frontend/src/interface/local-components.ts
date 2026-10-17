@@ -1,11 +1,35 @@
 /** LocalComponentState（本地组件状态）：用于状态颜色与操作可用性。 */
 export type LocalComponentState = 'ready' | 'loading' | 'failed' | 'disabled'
 
+/** LocalComponentCategory（组件用途分类）：界面按稳定分类编号分组。 */
+export type LocalComponentCategory = 'speech' | 'tts' | 'inference' | 'extensions' | 'voice-server'
+
+/** FixedProviderId（固定在线服务编号）：密钥只通过后端或原生凭据接口保存。 */
+export type FixedProviderId = 'deepseek' | 'minimax'
+
+/** LocalProviderSettings（在线服务设置模型）：由主应用或启动管理器提供保存与用量回调。 */
+export interface LocalProviderSettings {
+  /** provider（服务商编号）：对应 DeepSeek（推理服务）或 MiniMax（语音合成服务）。 */
+  provider: FixedProviderId
+  /** configured（本机是否已有已保存密钥）。 */
+  configured: boolean
+  /** disabled（读取或保存时是否暂时禁用操作）。 */
+  disabled?: boolean
+  /** usageHint（用量查询说明）：在当前宿主不能查询时解释原因。 */
+  usageHint?: string
+  /** save（保存单个服务商密钥）：返回是否已配置及用户可见说明。 */
+  save: (apiKey: string) => Promise<{ configured: boolean; message?: string }>
+  /** usage（查询账户余额或订阅余量）：没有后端查询能力时省略。 */
+  usage?: () => Promise<Record<string, unknown>>
+}
+
 /** LocalComponentRow（组件条目）：展示层只接收指标与选项，不直接调用业务。 */
 export interface LocalComponentRow {
   /** id（稳定标识）与 name（组件名称）。 */
   id: string
   name: string
+  /** category（用途分类）：缺省时由组件编号推导。 */
+  category?: LocalComponentCategory
   /** state（状态类别）、status（状态文案）与 available（详情是否可用）。 */
   state: LocalComponentState
   status: string
@@ -23,11 +47,15 @@ export interface LocalComponentRow {
   description: string
   error?: string
   note?: string
+  /** settingsSection（关联设置分区）：组件需要专门编辑页时提供跳转目标。 */
+  settingsSection?: string
   /** resource（固定资源状态）：安装操作独立于组件健康状态。 */
   resource?: ManagedResourceRow
   /** resourceChoices（可选下载模型）与 sharedResource（共用运行程序）：均在详情中管理。 */
   resourceChoices?: ManagedResourceRow[]
   sharedResource?: ManagedResourceRow
+  /** provider（在线服务配置）：用于在该组件详情中安全配置密钥与查询用量。 */
+  provider?: LocalProviderSettings
   /** location（当前运行位置）：没有可调整设备选项时显示。 */
   location?: string
   /** facts（补充指标）：label（名称）与 value（数值）。 */
@@ -65,6 +93,25 @@ export interface ManagedResourceRow {
   retryable?: boolean
   /** busy（该资源正被任务处理）。 */
   busy?: boolean
+}
+
+/** LocalDownloadItem（分类下载项）：展示该分类包含的本机资源与安装状态。 */
+export interface LocalDownloadItem {
+  /** id（固定资源编号）：纯配置或内置组件没有独立资源编号。 */
+  id?: string
+  /** label（中文名称）。 */
+  label: string
+  /** state（安装状态）和 updateAvailable（是否需要更新）。 */
+  state?: ManagedResourceRow['state']
+  status?: string
+  updateAvailable?: boolean
+  busy?: boolean
+  /** optional（用户可选项）：用于 VoxCPM1／VoxCPM2 等可选本地模型。 */
+  optional?: boolean
+  /** forcePlan（依赖待修复时强制读取安装计划）：本地语音模型文件已在，但共享运行程序尚未就绪。 */
+  forcePlan?: boolean
+  /** note（为何跳过或是否另行配置）。 */
+  note?: string
 }
 
 /** ManagedResourceJob（资源任务进度）：前端从桌面事件投影出的展示信息。 */
@@ -106,6 +153,8 @@ export interface LocalComponentsModel {
   resourceTasksBusy?: boolean
   /** resourceBatchRetry（最近一次批量导入失败）。 */
   resourceBatchRetry?: boolean
+  /** downloadResources（固定资源安装状态）：供分类下载卡片显示内容及状态。 */
+  downloadResources?: ManagedResourceRow[]
   /** rows（组件列表）、error（页面异常）与 refreshing（正在刷新）。 */
   rows: LocalComponentRow[]
   error?: string

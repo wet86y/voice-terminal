@@ -2,7 +2,8 @@
 import { computed, ref } from 'vue'
 import SettingsPageHeader from './SettingsPageHeader.vue'
 import ManagedResourceProgress from './ManagedResourceProgress.vue'
-import type { LocalComponentRow, LocalComponentsModel, ManagedResourceJob } from './local-components'
+import FixedProviderSettings from '../product/panels/FixedProviderSettings.vue'
+import type { LocalComponentCategory, LocalComponentRow, LocalComponentsModel, LocalDownloadItem, ManagedResourceJob, ManagedResourceRow } from './local-components'
 
 const props = defineProps<{
   /** model（页面状态与指标）与 saving（保存中）。 */
@@ -18,6 +19,8 @@ const emit = defineEmits<{
   retry: [id: string]
   /** resourceDownload/resourceImport（下载或导入资源）、openResourceSource（打开上游）、cancelResource（取消任务）。 */
   resourceDownload: [id: string]
+  /** resourceBundleDownload（分类批量下载）：先读取清单，确认后并行启动适用资源。 */
+  resourceBundleDownload: [request: { title: string; entries: LocalDownloadItem[] }]
   /** resourceRefresh（展开资源详情后刷新一次资源清单）。 */
   resourceRefresh: []
   resourceImport: [id: string]
@@ -28,8 +31,15 @@ const emit = defineEmits<{
   device: [id: string, value: string]
   save: [id: string]
 }>()
-const expanded = ref(new Set<string>())
-const resourceSelections = ref<Record<string, string>>({}) // resourceSelections（各组件的下载选择）；空值不安装本地模型。
+const expandedCategories = ref(new Set<LocalComponentCategory>()) // expandedCategories（已展开用途分类）。
+const expandedComponents = ref(new Set<string>()) // expandedComponents（已展开组件详情）。
+const categoryDefinitions: Array<{ id: LocalComponentCategory; title: string; description: string }> = [
+  { id: 'speech', title: '语音识别', description: '语音转写、语音轮次判断与流式标点' },
+  { id: 'tts', title: '语音合成', description: '本地 VoxCPM 模型或 MiniMax 在线 API（程序接口）' },
+  { id: 'inference', title: '推理执行', description: 'DeepSeek 在线推理服务与 DSH 执行组件' },
+  { id: 'extensions', title: '拓展组件', description: '唤醒词、声纹、语音检测与热词修订' },
+  { id: 'voice-server', title: 'Voice Server（语音服务）', description: '独立管理桌面语音运行环境' },
+]
 // latestJobs（各资源的最近任务）：运行中的任务优先，旧失败记录不覆盖新下载。
 const latestJobs = computed(() => {
   const jobs = new Map<string, ManagedResourceJob>()
@@ -42,9 +52,15 @@ const latestJobs = computed(() => {
 const componentCards = computed(() => props.model.rows.map(row => {
   const job = visibleJob(latestJobs.value.get(row.resource?.id ?? row.id))
   // 没有独立安装资源的进程条目仅展示活动任务，历史下载错误不覆盖进程重启状态。
-  return { row, job: row.resource || (job && jobIsActive(job)) ? job : undefined }
+  return { row, job: row.resource || (job && jobIsActive(job)) ? job : undefined, category: rowCategory(row) }
 }))
 const batchJob = computed(() => visibleJob(latestJobs.value.get('batch')))
+const categories = computed(() => categoryDefinitions.map(definition => {
+  const rows = componentCards.value.filter(card => card.category === definition.id)
+  const entries = rows.flatMap(({ row }) => downloadEntries(row))
+  const pendingCount = entries.filter(entryNeedsDownload).length
+  return { ...definition, rows, entries, pendingCount }
+}))
 function visibleJob(job: ManagedResourceJob | undefined) {
   return job && !['complete', 'completed'].includes(job.state) ? job : undefined
 }
@@ -64,21 +80,80 @@ function resourceStateLabel(state: string) {
   return state === 'installed' ? '已安装' : state === 'incomplete' ? '不完整' : '缺失'
 }
 function needsResource(row: LocalComponentRow) {
-  return Boolean(row.resource && (row.resource.state !== 'installed' || row.resource.updateAvailable))
+  return Boolean((row.resource && (row.resource.state !== 'installed' || row.resource.updateAvailable))
+    || row.resourceChoices?.some(resource => resource.state !== 'installed' || resource.updateAvailable))
 }
-function canExpand(row: LocalComponentRow) {
-  return Boolean(row.resourceChoices) || row.available && !needsResource(row)
+function rowCategory(row: LocalComponentRow): LocalComponentCategory {
+  if (row.category) return row.category
+  if (row.id === 'voice-system' || row.id === 'voice-server') return 'voice-server'
+  if (row.id === 'tts') return 'tts'
+  if (row.id === 'dsh' || row.id === 'deepseek') return 'inference'
+  if (['paraformer', 'sensevoice', 'smart_turn', 'punctuation', 'streaming-punctuation', 'paraformer-streaming', 'sensevoice-small'].includes(row.id)) return 'speech'
+  return 'extensions'
 }
-function activate(row: LocalComponentRow) {
-  if (!canExpand(row)) {
-    if (row.retryable && !row.busy) emit('retry', row.id)
-    return
+function rowResource(row: LocalComponentRow, fallback: ManagedResourceRow): ManagedResourceRow {
+  return props.model.downloadResources?.find(resource => resource.id === fallback.id) ?? fallback
+}
+function downloadEntries(row: LocalComponentRow): LocalDownloadItem[] {
+  const entries: LocalDownloadItem[] = []
+  if (row.resource) entries.push({ ...rowResource(row, row.resource), optional: false })
+  const sharedRuntimeMissing = Boolean(row.sharedResource && (row.sharedResource.state !== 'installed' || row.sharedResource.updateAvailable))
+  for (const resource of row.resourceChoices ?? []) entries.push({ ...rowResource(row, resource), optional: true, forcePlan: sharedRuntimeMissing })
+  if (row.sharedResource) {
+    const shared = rowResource(row, row.sharedResource)
+    entries.push({
+      label: `${shared.label}（共享依赖）`,
+      state: shared.state,
+      status: shared.updateAvailable ? '需更新' : shared.state === 'installed' ? '已就绪' : '选择本地模型后准备',
+      updateAvailable: shared.updateAvailable,
+      busy: shared.busy,
+      note: '会随所选 VoxCPM 本地模型统一检查、安装并复用。',
+    })
   }
-  if (expanded.value.has(row.id)) expanded.value.delete(row.id)
+  if (row.provider) {
+    const label = row.provider.provider === 'deepseek' ? 'DeepSeek 在线 API（推理接口）' : 'MiniMax 在线 API（语音接口）'
+    entries.push({
+      label,
+      status: row.provider.configured ? '已配置' : '待配置',
+      note: '在线配置项，不产生下载文件。',
+    })
+  } else if (!row.resource && !row.resourceChoices?.length) {
+    entries.push({ label: row.name, status: '内置能力', note: '随语音服务提供，无独立下载文件。' })
+  }
+  return entries
+}
+function entryNeedsDownload(entry: LocalDownloadItem) {
+  return Boolean(entry.id && !entry.busy && (entry.forcePlan || entry.state !== 'installed' || entry.updateAvailable))
+}
+function toggleCategory(category: LocalComponentCategory) {
+  const next = new Set(expandedCategories.value)
+  if (next.has(category)) next.delete(category)
   else {
-    expanded.value.add(row.id)
+    next.add(category)
+    if (props.model.resourceActionsAvailable) emit('resourceRefresh')
+  }
+  expandedCategories.value = next
+}
+function toggleComponent(row: LocalComponentRow) {
+  const next = new Set(expandedComponents.value)
+  if (next.has(row.id)) next.delete(row.id)
+  else {
+    next.add(row.id)
     if ((row.resource || row.resourceChoices) && props.model.resourceActionsAvailable) emit('resourceRefresh')
   }
+  expandedComponents.value = next
+}
+function downloadCategory(category: { title: string; entries: LocalDownloadItem[]; pendingCount: number }) {
+  if (!category.entries.length || !props.model.resourceActionsAvailable || props.model.resourceLoading) return
+  emit('resourceBundleDownload', { title: category.title, entries: category.entries })
+}
+function rowState(row: LocalComponentRow) {
+  if (row.resource && needsResource(row)) return row.resource.updateAvailable ? 'failed' : 'disabled'
+  return row.state
+}
+function rowStatus(row: LocalComponentRow) {
+  if (row.resource && needsResource(row)) return row.resource.updateAvailable ? '需更新' : resourceStateLabel(row.resource.state)
+  return row.status
 }
 function changeDevice(id: string, event: Event) {
   const value = (event.target as HTMLSelectElement).value
@@ -89,9 +164,7 @@ function invalidDevice(row: LocalComponentRow) {
   return row.device?.options.find(option => option.value === row.device?.value)?.disabled
 }
 function selectedResources(row: LocalComponentRow) {
-  const selected = row.resourceChoices?.find(resource => resource.id === (resourceSelections.value[row.id] ?? ''))
-  const shared = selected || row.sharedResource?.state === 'installed' ? row.sharedResource : undefined
-  return [shared, selected].filter((resource): resource is NonNullable<typeof resource> => Boolean(resource))
+  return row.resourceChoices ?? []
 }
 </script>
 
@@ -117,85 +190,103 @@ function selectedResources(row: LocalComponentRow) {
     <p v-if="model.resourceError" class="local-error" role="alert">{{ model.resourceError }}</p>
     <p v-if="model.resourceEventError" class="local-error" role="status">{{ model.resourceEventError }}</p>
     <div class="local-list-heading local-managed-heading">
-      <div><h3>模型与组件</h3><small>{{ model.rows.length }} 项；安装状态独立于语音服务健康状态</small></div>
+      <div><h3>按用途分类</h3><small>{{ model.rows.length }} 个组件；展开分类查看组件，再展开详情配置</small></div>
       <button v-if="batchJob && jobIsActive(batchJob)" class="outline-button resource-batch-import" type="button" :disabled="!batchJob.canCancel" @click="emit('cancelResource', batchJob.id)">{{ batchJob.canCancel ? '取消批量导入' : '正在完成导入…' }}</button>
       <button v-else-if="batchImportAvailable" class="outline-button resource-batch-import" type="button" :disabled="model.resourceTasksBusy || model.resourceLoading" @click="emit('resourceImportAll')">{{ model.resourceTasksBusy ? '资源任务处理中…' : model.resourceBatchRetry || batchJob?.state === 'failed' ? '重试批量导入' : '批量导入资源包' }}</button>
       <ManagedResourceProgress v-if="batchJob" class="managed-batch-progress" :job="batchJob" label="批量资源导入" />
     </div>
     <div v-if="model.resourceLoading && !model.rows.some(row => row.resource)" class="resource-empty" role="status">正在读取固定资源状态…</div>
-    <div v-if="!model.rows.length" class="pool-empty">暂无本地组件信息。</div>
-    <div v-else class="local-component-list">
-      <article v-for="{ row, job } in componentCards" :key="row.id" class="local-component-card" :class="job ? jobState(job) : row.state" :data-component="row.id">
-        <div class="local-component-summary" :class="{ 'resource-needed': needsResource(row) }">
-          <div class="local-component-body">
-            <div class="local-component-identity"><h4 :title="row.name">{{ row.name }}</h4><span class="local-state" :class="job ? jobState(job) : needsResource(row) ? 'failed' : row.state"><i aria-hidden="true"></i>{{ job?.state === 'failed' && row.resource?.updateAvailable ? '需更新' : job ? jobStateLabel(job) : needsResource(row) && row.resource ? row.resource.updateAvailable ? '需更新' : resourceStateLabel(row.resource.state) : row.status }}</span></div>
-            <p v-if="row.state === 'loading' && !needsResource(row)" class="local-component-phase" aria-live="polite">{{ row.description }}</p>
-            <dl class="local-component-metrics">
-              <div v-if="row.runtime && row.runtime !== '未提供'" class="local-runtime-metric" data-metric="runtime"><dt>运行时</dt><dd>{{ row.runtime }}</dd></div>
-              <div class="local-resource-metrics">
-                <div v-if="row.residentMemory !== undefined || row.privateMemory !== undefined" data-metric="memory"><dt>{{ row.residentMemory !== undefined && row.privateMemory !== undefined ? '常驻内存／提交内存' : row.residentMemory !== undefined ? '常驻内存' : '提交内存' }}</dt><dd>{{ [row.residentMemory, row.privateMemory].filter(value => value !== undefined).join(' / ') }}</dd></div>
-                <div v-if="row.vram !== undefined" data-metric="vram"><dt>显存</dt><dd>{{ row.vram }}</dd></div>
-              </div>
-            </dl>
-            <p v-if="!job && needsResource(row) && row.resource" class="local-error" role="status">{{ row.resource.error || (row.resource.required === false ? '可选组件，缺失或待更新不阻塞启动。' : row.resource.updateAvailable ? '此组件需更新并通过校验后才能启动。' : '请下载或导入此组件。') }}</p>
-            <p v-else-if="!job && row.error && !row.busy" class="local-error">{{ row.error }}</p>
-          </div>
-          <button v-if="job && jobIsActive(job)" class="outline-button local-resource-cancel" type="button" :disabled="!job.canCancel" :aria-label="`${row.name}：取消任务`" @click="emit('cancelResource', job.id)">{{ job.canCancel ? '取消任务' : '处理中…' }}</button>
-          <div v-else-if="row.resource && needsResource(row) && model.resourceActionsAvailable" class="managed-resource-actions local-install-actions" :data-resource="row.resource.id" :aria-label="`${row.name}资源操作`">
-            <button class="outline-button" type="button" :disabled="row.resource.busy || model.resourceLoading" :aria-label="`${row.name}：${row.resource.updateAvailable ? '更新' : '下载'}`" @click="emit('resourceDownload', row.resource.id)">{{ row.resource.busy ? '处理中…' : row.resource.updateAvailable ? row.resource.retryable || job?.state === 'failed' ? '重试更新' : '更新' : row.resource.retryable || job?.state === 'failed' ? '重试下载' : '下载' }}</button>
-            <button class="outline-button" type="button" :disabled="row.resource.busy || model.resourceLoading" :aria-label="`${row.name}：导入`" @click="emit('resourceImport', row.resource.id)">{{ row.resource.busy ? '处理中…' : row.resource.updateAvailable ? '导入' : row.resource.retryable || job?.state === 'failed' ? '重试导入' : '导入' }}</button>
-            <button class="outline-button" type="button" :disabled="model.resourceLoading" :aria-label="`${row.name}：跳转官方来源`" title="打开官方来源页面" @click="emit('openResourceSource', row.resource.id)">跳转</button>
-          </div>
-          <button v-else-if="!needsResource(row)" class="local-component-action" :class="{ 'retry-action': row.state === 'failed' }" type="button" :disabled="!row.resourceChoices && (row.busy || row.state === 'loading' || (!canExpand(row) && !row.retryable))" :aria-label="`${row.name}：${row.state === 'loading' && !row.resourceChoices ? row.status : canExpand(row) ? expanded.has(row.id) ? '收起详情' : '详情' : row.state === 'disabled' ? '已停用' : '重试'}`" :aria-expanded="canExpand(row) ? expanded.has(row.id) : undefined" :aria-controls="canExpand(row) ? `local-detail-${row.id}` : undefined" @click="activate(row)">
-            {{ row.state === 'loading' && !row.resourceChoices ? row.status : canExpand(row) ? expanded.has(row.id) ? '收起' : '详情' : row.state === 'disabled' ? '已停用' : '重试' }}
-            <svg v-if="canExpand(row)" viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expanded.has(row.id) }"><path d="m6 9 6 6 6-6" /></svg>
+    <div class="local-category-list">
+      <section v-for="category in categories" :key="category.id" class="local-category-card" :class="{ expanded: expandedCategories.has(category.id) }" :data-category="category.id">
+        <header class="local-category-heading">
+          <button class="local-category-toggle" type="button" :aria-expanded="expandedCategories.has(category.id)" :aria-controls="`local-category-${category.id}`" @click="toggleCategory(category.id)">
+            <span><strong>{{ category.title }}</strong><small>{{ category.description }} · {{ category.rows.length }} 个组件</small></span>
+            <svg viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expandedCategories.has(category.id) }"><path d="m6 9 6 6 6-6" /></svg>
           </button>
-        </div>
-        <ManagedResourceProgress v-if="job" class="local-resource-progress" :job="job" :label="row.name" />
-        <section v-if="row.resource && !needsResource(row) && expanded.has(row.id)" class="local-managed-resource" :data-resource="row.resource.id" :aria-label="`${row.resource.label}安装状态`">
-          <div class="local-managed-resource-heading"><span>{{ row.resource.label }}</span><span class="resource-install-state" :class="row.resource.state">{{ row.resource.state === 'installed' ? '✓' : '!' }} {{ row.resource.status || resourceStateLabel(row.resource.state) }}</span></div>
-          <dl v-if="row.resource.installedVersion || row.resource.targetVersion" class="local-resource-versions"><div v-if="row.resource.installedVersion"><dt>已安装版本</dt><dd>{{ row.resource.installedVersion }}</dd></div><div v-if="row.resource.targetVersion"><dt>目标版本</dt><dd>{{ row.resource.targetVersion }}</dd></div></dl>
-          <p v-if="row.resource.error" class="local-error" role="status">{{ row.resource.error }}</p>
-        </section>
-        <div v-if="canExpand(row) && expanded.has(row.id)" :id="`local-detail-${row.id}`" class="local-component-detail">
-          <p>{{ row.description }}</p>
-          <div v-if="row.resourceChoices" class="local-tts-downloads">
-            <label class="form-field"><span>本地 TTS（语音合成）模型下载</span><select :value="resourceSelections[row.id] ?? ''" @change="resourceSelections[row.id] = ($event.target as HTMLSelectElement).value" :aria-label="`${row.name}：选择下载模型`"><option value="">不下载本地模型</option><option v-for="resource in row.resourceChoices" :key="resource.id" :value="resource.id">{{ resource.label }} · {{ resource.status }}</option></select></label>
-            <small>可按需安装一款或两款模型；下载不改变当前播放后端。两款模型共用原生运行程序。</small>
-            <section v-for="resource in selectedResources(row)" :key="resource.id" :data-resource="resource.id" class="local-download-choice">
-              <div class="local-managed-resource-heading"><span>{{ resource.label }}</span><span>{{ resource.updateAvailable ? '需更新' : resource.status }}</span></div>
-              <p v-if="resource.error" class="local-error">{{ resource.error }}</p>
-              <div v-if="model.resourceActionsAvailable" class="managed-resource-actions">
-                <button type="button" class="outline-button" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceDownload', resource.id)">{{ resource.busy ? '处理中…' : resource.updateAvailable ? '更新' : resource.state === 'installed' ? '校验并补齐' : '下载' }}</button>
-                <button type="button" class="outline-button" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceImport', resource.id)">导入</button>
-                <button type="button" class="outline-button" @click="emit('openResourceSource', resource.id)">来源说明</button>
+          <button v-if="model.resourceActionsAvailable" class="outline-button category-download" type="button" :disabled="model.resourceLoading" @click="downloadCategory(category)">
+            {{ category.pendingCount ? category.id === 'voice-server' ? '配置环境' : category.id === 'tts' ? `选择本地模型（${category.pendingCount}）` : `下载组件（${category.pendingCount}）` : '查看下载清单' }}
+          </button>
+        </header>
+        <div v-if="expandedCategories.has(category.id)" :id="`local-category-${category.id}`" class="local-category-content">
+          <p v-if="!category.rows.length" class="resource-empty">暂无该分类的组件状态。</p>
+          <div v-else class="local-component-list">
+            <article v-for="{ row, job } in category.rows" :key="row.id" class="local-component-card" :class="job ? jobState(job) : rowState(row)" :data-component="row.id">
+              <div class="local-component-summary">
+                <div class="local-component-body">
+                  <div class="local-component-identity"><h4 :title="row.name">{{ row.name }}</h4><span class="local-state" :class="job ? jobState(job) : rowState(row)"><i aria-hidden="true"></i>{{ job ? jobStateLabel(job) : rowStatus(row) }}</span></div>
+                  <p v-if="row.state === 'loading'" class="local-component-phase" aria-live="polite">{{ row.description }}</p>
+                </div>
+                <button class="local-component-action" type="button" :aria-expanded="expandedComponents.has(row.id)" :aria-controls="`local-detail-${row.id}`" @click="toggleComponent(row)">
+                  {{ expandedComponents.has(row.id) ? '收起详情' : '详情' }}
+                  <svg viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expandedComponents.has(row.id) }"><path d="m6 9 6 6 6-6" /></svg>
+                </button>
               </div>
-              <ManagedResourceProgress v-if="visibleJob(latestJobs.get(resource.id))" :job="visibleJob(latestJobs.get(resource.id))!" :label="resource.label" />
-            </section>
-            <button v-if="row.retryable" class="outline-button" type="button" :disabled="row.busy" @click="emit('retry', row.id)">重新启动语音合成</button>
+              <div v-if="expandedComponents.has(row.id)" :id="`local-detail-${row.id}`" class="local-component-detail">
+                <p>{{ row.description }}</p>
+                <section v-if="row.resource" class="local-managed-resource" :data-resource="row.resource.id" :aria-label="`${row.resource.label}安装状态`">
+                  <div class="local-managed-resource-heading"><span>{{ row.resource.label }}</span><span class="resource-install-state" :class="row.resource.state">{{ row.resource.status || resourceStateLabel(row.resource.state) }}</span></div>
+                  <dl v-if="row.resource.installedVersion || row.resource.targetVersion" class="local-resource-versions"><div v-if="row.resource.installedVersion"><dt>已安装版本</dt><dd>{{ row.resource.installedVersion }}</dd></div><div v-if="row.resource.targetVersion"><dt>目标版本</dt><dd>{{ row.resource.targetVersion }}</dd></div></dl>
+                  <p v-if="row.resource.error" class="local-error" role="status">{{ row.resource.error }}</p>
+                  <ManagedResourceProgress v-if="visibleJob(latestJobs.get(row.resource.id))" :job="visibleJob(latestJobs.get(row.resource.id))!" :label="row.resource.label" />
+                  <button v-if="visibleJob(latestJobs.get(row.resource.id)) && jobIsActive(latestJobs.get(row.resource.id))" class="outline-button local-resource-cancel" type="button" :disabled="!visibleJob(latestJobs.get(row.resource.id))?.canCancel" @click="emit('cancelResource', visibleJob(latestJobs.get(row.resource.id))!.id)">取消任务</button>
+                  <div v-else-if="needsResource(row) && model.resourceActionsAvailable" class="managed-resource-actions">
+                    <button class="outline-button" type="button" :disabled="row.resource.busy || model.resourceLoading" @click="emit('resourceDownload', row.resource.id)">{{ row.resource.busy ? '处理中…' : row.resource.updateAvailable ? '更新' : row.resource.retryable ? '重试下载' : '下载' }}</button>
+                    <button class="outline-button" type="button" :disabled="row.resource.busy || model.resourceLoading" @click="emit('resourceImport', row.resource.id)">导入</button>
+                    <button class="outline-button" type="button" :disabled="model.resourceLoading" @click="emit('openResourceSource', row.resource.id)">来源说明</button>
+                  </div>
+                </section>
+                <section v-if="row.resourceChoices?.length" class="local-tts-downloads">
+                  <h5>本地 TTS（语音合成）模型</h5>
+                  <small>在分类下载清单中可选择 VoxCPM1、VoxCPM2 或两者；所选模型会自动准备共用运行程序。下载不会改变当前播放后端。</small>
+                  <article v-for="resource in selectedResources(row)" :key="resource.id" :data-resource="resource.id" class="local-download-choice">
+                    <div class="local-managed-resource-heading"><span>{{ resource.label }}</span><span class="resource-install-state" :class="resource.state">{{ resource.updateAvailable ? '需更新' : resource.status || resourceStateLabel(resource.state) }}</span></div>
+                    <dl v-if="resource.installedVersion || resource.targetVersion" class="local-resource-versions"><div v-if="resource.installedVersion"><dt>已安装版本</dt><dd>{{ resource.installedVersion }}</dd></div><div v-if="resource.targetVersion"><dt>目标版本</dt><dd>{{ resource.targetVersion }}</dd></div></dl>
+                    <p v-if="resource.error" class="local-error">{{ resource.error }}</p>
+                    <ManagedResourceProgress v-if="visibleJob(latestJobs.get(resource.id))" :job="visibleJob(latestJobs.get(resource.id))!" :label="resource.label" />
+                    <button v-if="visibleJob(latestJobs.get(resource.id)) && jobIsActive(latestJobs.get(resource.id))" class="outline-button local-resource-cancel" type="button" :disabled="!visibleJob(latestJobs.get(resource.id))?.canCancel" @click="emit('cancelResource', visibleJob(latestJobs.get(resource.id))!.id)">取消任务</button>
+                    <div v-else-if="model.resourceActionsAvailable" class="managed-resource-actions">
+                      <button type="button" class="outline-button" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceDownload', resource.id)">{{ resource.busy ? '处理中…' : resource.updateAvailable ? '更新' : resource.state === 'installed' ? '校验并补齐' : '下载' }}</button>
+                      <button type="button" class="outline-button" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceImport', resource.id)">导入</button>
+                      <button type="button" class="outline-button" @click="emit('openResourceSource', resource.id)">来源说明</button>
+                    </div>
+                  </article>
+                  <div v-if="row.sharedResource" class="local-managed-resource-heading"><span>{{ row.sharedResource.label }}（共享运行程序）</span><span class="resource-install-state" :class="row.sharedResource.state">{{ row.sharedResource.status }}</span></div>
+                </section>
+                <FixedProviderSettings v-if="row.provider" :model="row.provider" />
+                <p v-if="!job && row.resource && needsResource(row) && !row.resource.error" class="local-resource-hint" role="status">{{ row.resource.required === false ? '可选组件；缺失或待更新不阻塞启动。' : '资源缺失或需要更新，可通过本分类下载清单统一处理。' }}</p>
+                <p v-if="row.error && !row.busy" class="local-error" role="alert">{{ row.error }}</p>
+                <button v-if="row.retryable && !row.busy" class="outline-button retry-action" type="button" @click="emit('retry', row.id)">重试组件</button>
+                <dl v-if="row.facts.length" class="local-detail-facts"><div v-for="fact in row.facts" :key="fact.label"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div></dl>
+                <dl v-if="row.runtime && row.runtime !== '未提供' || row.residentMemory !== undefined || row.privateMemory !== undefined || row.vram !== undefined" class="local-component-metrics local-detail-metrics">
+                  <div v-if="row.runtime && row.runtime !== '未提供'" class="local-runtime-metric" data-metric="runtime"><dt>运行时</dt><dd>{{ row.runtime }}</dd></div>
+                  <div v-if="row.residentMemory !== undefined || row.privateMemory !== undefined" class="local-runtime-metric" data-metric="memory"><dt>{{ row.residentMemory !== undefined && row.privateMemory !== undefined ? '常驻内存／提交内存' : row.residentMemory !== undefined ? '常驻内存' : '提交内存' }}</dt><dd>{{ [row.residentMemory, row.privateMemory].filter(value => value !== undefined).join(' / ') }}</dd></div>
+                  <div v-if="row.vram !== undefined" class="local-runtime-metric" data-metric="vram"><dt>显存</dt><dd>{{ row.vram }}</dd></div>
+                </dl>
+                <div v-if="row.device" class="local-device-editor">
+                  <label :for="`local-device-${row.id}`"><span>运行位置</span><select :id="`local-device-${row.id}`" :value="row.device.value" :disabled="saving || row.device.locked" @change="changeDevice(row.id, $event)"><option v-for="option in row.device.options" :key="option.value" :value="option.value" :disabled="option.disabled">{{ option.label }}</option></select></label>
+                  <button class="save-button" type="button" :disabled="saving || row.device.locked || invalidDevice(row)" @click="emit('save', row.id)">{{ saving ? '保存中' : '保存' }}</button>
+                  <small>实际运行：{{ row.device.current }}<span v-if="row.device.draft"> · 草稿尚未保存</span><span v-if="row.device.pending"> · 已保存配置下次启动生效</span></small>
+                </div>
+                <div v-else class="local-location"><span>运行位置</span><strong>{{ row.location || '本机' }}</strong></div>
+                <small v-if="row.device?.hint || row.note" class="local-detail-note">{{ [row.device?.hint, row.note].filter(Boolean).join(' ') }}</small>
+              </div>
+            </article>
           </div>
-          <dl v-if="row.facts.length" class="local-detail-facts"><div v-for="fact in row.facts" :key="fact.label"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div></dl>
-          <div v-if="row.device" class="local-device-editor">
-            <label :for="`local-device-${row.id}`"><span>运行位置</span><select :id="`local-device-${row.id}`" :value="row.device.value" :disabled="saving || row.device.locked" @change="changeDevice(row.id, $event)"><option v-for="option in row.device.options" :key="option.value" :value="option.value" :disabled="option.disabled">{{ option.label }}</option></select></label>
-            <button class="save-button" type="button" :disabled="saving || row.device.locked || invalidDevice(row)" @click="emit('save', row.id)">{{ saving ? '保存中' : '保存' }}</button>
-            <small>实际运行：{{ row.device.current }}<span v-if="row.device.draft"> · 草稿尚未保存</span><span v-if="row.device.pending"> · 已保存配置下次启动生效</span></small>
-          </div>
-          <div v-else class="local-location"><span>运行位置</span><strong>{{ row.location || '本机' }}</strong></div>
-          <small v-if="row.device?.hint || row.note" class="local-detail-note">{{ [row.device?.hint, row.note].filter(Boolean).join(' ') }}</small>
         </div>
-      </article>
+      </section>
     </div>
   </section>
 </template>
 
 <style scoped>
-.local-tts-downloads{display:grid;gap:12px;width:100%;min-width:0}.local-download-choice{display:grid;gap:8px;padding:12px;border:1px solid var(--line);border-radius:12px}.local-tts-downloads select{max-width:100%}
+.local-tts-downloads{display:grid;gap:12px;width:100%;min-width:0}.local-tts-downloads h5{font-size:var(--font-body)}.local-download-choice{display:grid;gap:8px;padding:12px;border:1px solid var(--line);border-radius:12px}
 .local-component-phase{margin:6px 0 0;color:var(--muted);font-size:var(--font-caption);line-height:1.6}
 .local-components{display:flex;flex-direction:column;gap:20px;min-width:0;container-type:inline-size}
 .local-managed-heading>div{display:grid;gap:4px;min-width:0}
 .local-managed-heading>div>small{color:var(--muted)}
 .resource-batch-import{white-space:nowrap}
 .resource-empty{padding:14px 16px;border:1px dashed var(--line-strong);border-radius:12px;color:var(--muted);font-size:var(--font-body)}
+.local-category-list{display:grid;gap:12px}.local-category-card{min-width:0;border:1px solid var(--line-strong);border-radius:16px;background:#ffffff02;overflow:hidden}.local-category-card.expanded{background:#ffffff04}.local-category-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:12px 16px}.local-category-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding:3px 0;text-align:left;background:transparent;border:0;cursor:pointer}.local-category-toggle>span{display:grid;gap:4px;min-width:0}.local-category-toggle strong{font-size:var(--font-section);line-height:1.4}.local-category-toggle small{color:var(--muted);line-height:1.5}.local-category-toggle svg{flex:none;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;transition:transform 180ms}.local-category-toggle svg.expanded{transform:rotate(180deg)}.category-download{white-space:nowrap;min-height:var(--compact-control-height);padding:6px 11px;font-size:var(--font-caption)}.local-category-content{display:grid;gap:10px;padding:0 14px 14px}.local-category-content>.resource-empty{margin-top:2px}
 .local-managed-resource{display:grid;gap:8px;padding:10px 16px;border-top:1px solid var(--line);background:#00000008}
 .local-managed-resource-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0;font-size:var(--font-caption);color:var(--muted)}
 .local-managed-resource-heading>span:first-child{min-width:0;overflow-wrap:anywhere}
@@ -226,12 +317,11 @@ small,dt{font-size:var(--font-caption)}
 .local-resource-value strong{font-size:18px;line-height:1.3;white-space:nowrap}
 .local-resource-total{font-size:var(--font-body);color:var(--muted);white-space:nowrap}
 .local-list-heading h3{font-size:var(--font-section)}
-.local-component-list{display:grid;gap:10px}
+.local-component-list{display:grid;gap:8px}
 .local-component-card{min-width:0;border:1px solid var(--line);border-radius:12px;background:#ffffff02;overflow:hidden}
 .local-component-card.failed{border-color:color-mix(in srgb,var(--danger) 28%,transparent)}
 /* action column（操作列）：按钮文案或箭头变化不挤动名称与状态列。 */
-.local-component-summary{--local-action-width:64px;display:grid;grid-template-columns:minmax(0,1fr) var(--local-action-width);gap:12px;align-items:center;padding:12px 16px}
-.local-component-summary.resource-needed{grid-template-columns:minmax(0,1fr) auto}
+.local-component-summary{display:grid;grid-template-columns:minmax(0,1fr) 84px;gap:12px;align-items:center;padding:11px 14px}
 .local-install-actions{margin-top:0;max-width:240px;justify-content:flex-end}
 .local-component-body{min-width:0}
 /* name column（名称列）：统一预留宽度，使状态不随名称长度移动。 */
@@ -256,6 +346,7 @@ dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:an
 .local-component-detail{display:grid;gap:14px;padding:16px;border-top:1px solid var(--line);background:#0000000b}
 .local-component-detail>p{color:var(--muted);font-size:var(--font-body);overflow-wrap:anywhere}
 .local-detail-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px}
+.local-detail-metrics{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));padding-top:4px}.local-detail-metrics .local-runtime-metric{display:flex;flex-direction:column;gap:3px;min-width:0}.local-resource-hint{font-size:var(--font-caption);color:var(--muted);line-height:1.6}
 .local-device-editor{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 12px;align-items:end;max-width:420px}
 .local-device-editor label{display:grid;gap:6px;min-width:0}
 .local-device-editor label>span,.local-location>span{font-size:var(--font-caption);color:var(--muted)}
@@ -264,9 +355,9 @@ dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:an
 .local-device-editor>small{grid-column:1/-1}
 .local-detail-note{overflow-wrap:anywhere}
 .local-location{display:flex;gap:12px;align-items:center;font-size:var(--font-body)}
-@container (max-width:440px){.local-memory-summary{grid-template-columns:1fr;gap:8px}.local-memory-summary article{flex-direction:row;align-items:center;justify-content:space-between;padding:12px;gap:8px}.local-component-summary{--local-action-width:58px;padding:12px;gap:8px}.local-component-metrics{gap:6px}.local-component-detail{padding:12px}.local-component-action{padding-inline:8px}.local-resource-progress{padding:0 12px 12px}.local-managed-resource{padding:10px 12px}.managed-resource-actions{gap:6px}}
+@container (max-width:440px){.local-memory-summary{grid-template-columns:1fr;gap:8px}.local-memory-summary article{flex-direction:row;align-items:center;justify-content:space-between;padding:12px;gap:8px}.local-component-summary{grid-template-columns:minmax(0,1fr) 72px;padding:10px;gap:8px}.local-category-heading{grid-template-columns:minmax(0,1fr);padding:11px 12px}.category-download{justify-self:stretch}.local-category-content{padding:0 10px 10px}.local-component-metrics{gap:6px}.local-component-detail{padding:12px}.local-component-action{padding-inline:8px}.local-resource-progress{padding:0 12px 12px}.local-managed-resource{padding:10px 12px}.managed-resource-actions{gap:6px}}
 @container (max-width:560px){.local-managed-heading{align-items:flex-start}.resource-batch-import{white-space:normal;max-width:100%}}
 @container (max-width:520px){.local-component-metrics{grid-template-columns:1fr}.local-resource-metrics{gap:12px}.local-resource-metrics dt,.local-resource-metrics dd{font-size:var(--font-caption)}}
 @media (prefers-reduced-motion:reduce){.local-component-action svg{transition:none}}
-@container (max-width:440px){.local-component-summary.resource-needed{grid-template-columns:minmax(0,1fr)}.local-install-actions{justify-content:flex-start;max-width:100%;gap:6px}}
+@media (prefers-reduced-motion:reduce){.local-category-toggle svg{transition:none}}
 </style>

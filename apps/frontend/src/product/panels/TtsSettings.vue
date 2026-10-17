@@ -72,7 +72,7 @@ async function saveSteps() {
   <div class="tts-settings">
     <section class="tts-target preference-card"><label class="form-field"><span>语音播放目标</span><select v-model="selected" @change="choose"><option value="minimax">{{ names.minimax }}</option><option value="voxcpm1">{{ names.voxcpm1 }}{{ status?.models.find(item => item.id === 'voxcpm1')?.available === false ? ' · 资源缺失' : '' }}</option><option value="voxcpm2">{{ names.voxcpm2 }}{{ status?.models.find(item => item.id === 'voxcpm2')?.available === false ? ' · 资源缺失' : '' }}</option></select></label>
       <p class="instruction-hint" role="status">当前生效：{{ names[effective] }} · {{ saving ? '正在切换…' : states[status?.load_state || 'unloaded'] || '等待状态' }}<template v-if="status?.pending_selection"> · 等待当前事务结束后切换</template></p>
-      <p v-if="selected === 'minimax'" class="instruction-hint">使用模型管理中已配置的 MiniMax（在线语音服务）模型、音色与接口密钥。</p>
+      <p v-if="selected === 'minimax'" class="instruction-hint">在线接口密钥与账号用量可在“组件设置 → 语音合成”中管理。</p>
       <p v-if="error || status?.error || live.error.value" class="instruction-error" role="alert">{{ error || status?.error || live.error.value }}</p>
     </section>
     <template v-if="selected !== 'minimax'">

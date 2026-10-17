@@ -28,6 +28,10 @@ export function useProductControls() {
   onMounted(() => {
     void applicationHost.start();
     const query = new URLSearchParams(window.location.search);
+    if ((query.get('settings') ?? query.get('page')) === 'models') {
+      adapter.page.value = 'settings';
+      adapter.settingsTab.value = 'compute';
+    }
     if (
       query.get("page") === "silence" ||
       query.get("settings") === "silence"

@@ -155,7 +155,7 @@ export type PreviewScene = 'normal' | 'empty' | 'long' | 'loading' | 'error'
 /** PreviewOverlay（浮层展示）：启动、确认、成功和失败画面。 */
 export type PreviewOverlay = 'none' | 'startup' | 'confirm' | 'success' | 'failure'
 /** SettingsTab（展示设置页签）：本地模型设备与系统状态合并到组件页。 */
-export type SettingsTab = 'tts' | 'wake' | 'persona' | 'speaker' | 'wakes' | 'models' | 'compute' | 'workspace' | 'hotwords'
+export type SettingsTab = 'tts' | 'wake' | 'persona' | 'speaker' | 'wakes' | 'compute' | 'workspace' | 'hotwords'
 /** PreviewPage（展示页面）：工作台或某个设置页。 */
 export type PreviewPage = 'home' | SettingsTab
 
@@ -170,8 +170,7 @@ export const settingsTabs: Array<{
   { id: 'persona', label: '人格与指令', hint: '风格与协作方式', icon: '✦' },
   { id: 'speaker', label: '声纹设置', hint: '主人识别与模板', icon: '◎' },
   { id: 'wakes', label: '定时唤醒', hint: '任务与触发规则', icon: '◴' },
-  { id: 'models', label: '模型管理', hint: '连接、分配与模型池', icon: '◇' },
-  { id: 'compute', label: '本地组件', hint: '运行状态与资源', icon: '▤' },
+  { id: 'compute', label: '组件设置', hint: '分类配置与运行状态', icon: '▤' },
   { id: 'workspace', label: '工作区与更新', hint: '位置与版本', icon: '⌂' },
 ]
 export const sceneChoices: Array<{
