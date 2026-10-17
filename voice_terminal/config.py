@@ -295,7 +295,7 @@ class TtsConfig:
     model: str = "speech-2.8-hd"
     api_key_env: str = "MINIMAX_API_KEY"
     output_format: str = "pcm"
-    sample_rate: int = 32000
+    sample_rate: int = 32000  # sample_rate（当前播放器/合成输出采样率）。
     voice_id: str = "female-shaonv"
     timeout_ms: int = 15000
     subtitle_enable: bool = False
@@ -315,8 +315,11 @@ class TtsConfig:
     sentence_tick_ms: int = 50
     sentence_min_effective_chars: int = 10  # sentence_min_effective_chars（锁定文本块最少有效字符）。
     first_clause_timeout_ms: int = 400
+    online_sample_rate: int | None = None  # online_sample_rate（在线合成采样率）：未单独指定时沿用 sample_rate。
 
     def __post_init__(self) -> None:
+        if self.online_sample_rate is None:
+            object.__setattr__(self, "online_sample_rate", int(self.sample_rate))
         object.__setattr__(self, "inference_steps_by_model", validate_tts_inference_steps(self.inference_steps_by_model))
         if self.backend not in {"minimax", "voxcpm1"}:
             raise ValueError("tts.backend（语音运行后端）必须为 minimax 或 voxcpm1")
@@ -716,6 +719,7 @@ class AppConfig:
         configured_tts_backend = _string(tts.get("backend"), "minimax").strip().lower()
         if configured_tts_backend == "cosyvoice":
             configured_tts_backend = "minimax"
+        configured_online_tts_sample_rate = int(_number(tts.get("sample_rate"), 32000))  # configured_online_tts_sample_rate（配置文件中的在线采样率）。
         bridge = _section(data, "text_bridge")
         screen_capture = ScreenCaptureConfig(**_section(data, "screen_capture"))
         server = _section(data, "server")
@@ -1039,8 +1043,9 @@ class AppConfig:
                 sample_rate=resolve_tts_sample_rate(
                     configured_tts_backend,
                     _string(tts.get("local_model"), "voxcpm2").strip().lower(),
-                    _number(tts.get("sample_rate"), 32000),
+                    configured_online_tts_sample_rate,
                 ),
+                online_sample_rate=configured_online_tts_sample_rate,
                 voice_id=_string(tts.get("voice_id"), "female-shaonv"),
                 timeout_ms=int(_number(tts.get("timeout_ms"), 15000)),
                 subtitle_enable=_bool(tts.get("subtitle_enable"), False),

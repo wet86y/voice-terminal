@@ -1054,6 +1054,7 @@ def test_local_tts_config_defaults_to_native_rate_per_model():
     """启动配置：本地 VoxCPM2 缺省 48 kHz，VoxCPM1 缺省 16 kHz，在线缺省 32 kHz。"""
     config = AppConfig.from_mapping({"tts": {"backend": "voxcpm1"}}, base_dir=Path("."))
     assert config.tts.sample_rate == 48000  # local_model 缺省 voxcpm2。
+    assert config.tts.online_sample_rate == 32000
 
     config = AppConfig.from_mapping(
         {"tts": {"backend": "voxcpm1", "local_model": "voxcpm1"}}, base_dir=Path("."))
@@ -1067,6 +1068,7 @@ def test_local_tts_config_defaults_to_native_rate_per_model():
         {"tts": {"backend": "voxcpm1", "local_model": "voxcpm2", "sample_rate": 16000}},
         base_dir=Path("."))
     assert config.tts.sample_rate == 48000
+    assert config.tts.online_sample_rate == 16000
 
 
 def test_router_exposes_playback_reserve_from_active_client():

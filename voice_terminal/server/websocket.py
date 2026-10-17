@@ -640,6 +640,10 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         """
         desired = int(self.config.tts.sample_rate)
         pending = self._pending_local_tts_rate
+        if pending and self.config.tts.backend != "voxcpm1":
+            # 本地下行的延迟换率不能覆盖在线 API 的独立采样率。
+            self._pending_local_tts_rate = None
+            pending = None
         if pending and pending[1] != desired and self._player_is_idle():
             self._pending_local_tts_rate = None
             previous_rate = desired
@@ -1093,7 +1097,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         next_config = replace(previous_config, tts=replace(
             previous_config.tts, backend=backend, local_model=local_model,
             sample_rate=(local_tts_native_rate(local_model) if backend == "voxcpm1"
-                         else previous_config.tts.sample_rate),
+                         else previous_config.tts.online_sample_rate),
         ))
         candidate = None
         self.config = next_config
@@ -1268,7 +1272,9 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
             self.config = replace(self.config, tts=replace(
                 current, backend="voxcpm1", local_model=model, sample_rate=local_tts_native_rate(model)))
         elif online:
-            self.config = replace(self.config, tts=replace(current, backend="minimax"))
+            self.config = replace(self.config, tts=replace(
+                current, backend="minimax", sample_rate=current.online_sample_rate,
+            ))
         else:
             raise RuntimeError("TTS（语音合成）未就绪：请安装任一本地模型及运行程序，或配置在线 API（接口）密钥。")
         logger.info("tts.startup_selection backend=%s local_model=%s", self.config.tts.backend, self.config.tts.local_model)
@@ -1463,6 +1469,7 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         profile = tts.get("profile") if isinstance(tts.get("profile"), Mapping) else {}
         if str(profile.get("output_format") or "pcm").lower() != "pcm":
             raise ValueError("当前原生播放器仅支持 PCM TTS 输出。")
+        online_sample_rate = int(profile.get("sample_rate") or self.config.tts.online_sample_rate)  # online_sample_rate（当前 TTS profile 的在线采样率）。
 
         previous_config = self.config
         voice_env = "VOICE_PRODUCT_VOICE_LLM_KEY"
@@ -1571,7 +1578,8 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
                 emotion_mode=str(profile.get("emotion_mode") or previous_config.tts.emotion_mode),
                 default_emotion=str(profile.get("default_emotion") or previous_config.tts.default_emotion),
                 output_format="pcm",
-                sample_rate=int(profile.get("sample_rate") or previous_config.tts.sample_rate),
+                sample_rate=online_sample_rate,
+                online_sample_rate=online_sample_rate,
                 transport=str(profile.get("transport") or previous_config.tts.transport),
                 scheduling=str(profile.get("scheduling") or previous_config.tts.scheduling),
                 subtitle_enable=bool(profile.get("subtitle_enable", previous_config.tts.subtitle_enable)),
