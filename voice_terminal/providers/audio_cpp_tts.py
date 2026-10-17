@@ -904,7 +904,22 @@ class AudioCppTtsClient:
     async def ensure_ready(self) -> None:
         await self.server.ensure_ready()
         native = getattr(self.server, "capabilities", {})
-        self._native_continuation = bool(native.get("acoustic_continuation", False))
+        native_continuation = bool(native.get("acoustic_continuation", False))
+        # acoustic_continuation（声学续接能力）在当前原生服务中首次推理后才更新；
+        # 模型加载时用稳定的同版能力标记补足首次播报前的协商。
+        # reference_prompt（参考提示能力）与 full_decode（完整解码能力）由包含
+        # VoxCPM2 续接存储及释放接口的运行组件同时声明。
+        if (not native_continuation and self.local_model == "voxcpm2"
+                and native.get("reference_prompt") is True
+                and native.get("full_decode") is True):
+            native_continuation = True
+            if not self._native_continuation:
+                logger.info(
+                    "audio_cpp_tts.continuation_capability_inferred（续接能力推断） "
+                    "model=%s reference_prompt（参考提示能力）=%s full_decode（完整解码能力）=%s",
+                    self.local_model, native.get("reference_prompt"), native.get("full_decode"),
+                )
+        self._native_continuation = native_continuation
         # 本地服务就绪后请求显卡优先最大性能；失败只记录，不阻断合成。
         self.gpu_performance.apply()
 

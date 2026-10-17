@@ -88,7 +88,7 @@ def main():
               "## 尚未达到的启用门槛", "",
               "完整应用在固定设备、相同音频、固定云端响应下的交错启动、并发识别、精修、声纹、首字、端点、首音、播放打断以及60分钟长会话对照仍需完成；完整应用停止、重置、崩溃和存储故障组合现场回归也未被单模型测试替代。用户开启监听后完成麦克风现场验收。", "",
               "因此4线程、轻量检测、音频复用与共享、完整历史落盘均未成为默认配置，原有效上下文和模型热态继续保留。本报告不声称已经降低正在运行的应用内存。", "",
-              "策略及回退方法见 `docs/runtime-resource-management.md`（资源管理说明）与 `config/runtime-resources.json`（默认资源策略）。原始证据为本目录中以 `resource-`（资源验证）开头的结构化结果及日志；`private_commit_bytes`（私有提交字节）、`rss_bytes`（常驻字节）、`latency_ms`（延迟毫秒）、`results`（原始模型结果）、`soak`（持续回放结果）分别保存对应原始指标。"]
+              "策略及回退方法见 `docs/guides/runtime-resource-management.md`（资源管理说明）与 `config/runtime-resources.json`（默认资源策略）。原始证据为本目录中以 `resource-`（资源验证）开头的结构化结果及日志；`private_commit_bytes`（私有提交字节）、`rss_bytes`（常驻字节）、`latency_ms`（延迟毫秒）、`results`（原始模型结果）、`soak`（持续回放结果）分别保存对应原始指标。"]
     target = REPORTS / "运行资源优化实施与验收-20261003.md"
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(target)
