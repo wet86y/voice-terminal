@@ -836,9 +836,10 @@ describe('正式界面的真实控件交互', () => {
     expect(row.get('.local-error').text()).toContain('本次启动失败')
     expect(row.get('.retry-action').text()).toBe('重试组件')
   })
-  it('所属进程已就绪但完整启动尚未结束时，旧的未就绪采样不能显示错误；明确失败和停用仍正常显示', async () => {
+  it('所属进程已就绪但完整启动尚未结束时，旧的未就绪采样不能显示错误；启动完成后立即更新状态', async () => {
     let value!: ReturnType<typeof useProductControls>
     const wrapper = await renderComponentSettings({ setup() { value = useProductControls(); provideProductContext(value); return () => h(ComputeSettings) } })
+    allowBusinessReady(value)
     value.computeStatus.value = { models: {
       paraformer: { service: 'ERROR', load_error: '旧未就绪错误' },
       sensevoice: { service: 'UNAVAILABLE', load_error: '尚未连接' },
@@ -859,18 +860,20 @@ describe('正式界面的真实控件交互', () => {
     expect(campplus.get('.local-state').text()).toBe('已停用')
     application.snapshot.value!.startup_complete = true
     await flushPromises()
-    expect(paraformer.get('.local-error').text()).toBe('旧未就绪错误')
+    expect(vi.mocked(productApi.computeStatus)).toHaveBeenCalled()
+    expect(paraformer.get('.local-state').text()).toBe('运行中')
+    expect(paraformer.find('.local-error').exists()).toBe(false)
   })
-  it('组件完成启动立即重新采样，启动前的迟到错误响应不能覆盖新的就绪结果', async () => {
+  it('完整启动结束立即重新采样，启动前的迟到错误响应不能覆盖新的就绪结果', async () => {
     const { value } = liveControls()
     allowBusinessReady(value)
-    application.snapshot.value = { startup_complete: false, components: [{ id: 'asr', state: 'starting', pid: 12 }] } as unknown as ApplicationSnapshot
+    application.snapshot.value = { startup_complete: false, components: [{ id: 'asr', state: 'ready', pid: 12 }] } as unknown as ApplicationSnapshot
     await flushPromises()
     const pending = deferred<Awaited<ReturnType<typeof productApi.computeStatus>>>()
     const probe = vi.mocked(productApi.computeStatus)
     probe.mockReturnValueOnce(pending.promise).mockResolvedValue({ models: { paraformer: { service: 'READY', device: 'cpu' } } } as never)
     const stale = value.refreshComputeStatus()
-    application.snapshot.value = { startup_complete: true, components: [{ id: 'asr', state: 'ready', pid: 12 }] } as unknown as ApplicationSnapshot
+    application.snapshot.value = { ...application.snapshot.value!, startup_complete: true }
     await flushPromises()
     expect(value.computeStatus.value?.models.paraformer?.service).toBe('READY')
     pending.resolve({ models: { paraformer: { service: 'ERROR', load_error: '启动时尚未就绪' } } } as never)

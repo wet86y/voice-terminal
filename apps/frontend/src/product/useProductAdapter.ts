@@ -186,7 +186,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     computeStatusTimer = undefined
     if (speakerStatusTimer !== undefined) window.clearInterval(speakerStatusTimer)
     speakerStatusTimer = undefined
-    if (currentPage === 'settings' && tab === 'compute') {
+    if (currentPage === 'settings' && (tab === 'compute' || tab === 'system')) {
       void refreshComputeStatus()
       computeStatusTimer = window.setInterval(() => void refreshComputeStatus(), 5000)
     }
@@ -194,6 +194,13 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       void refreshSpeakerStatus()
       speakerStatusTimer = window.setInterval(() => void refreshSpeakerStatus(), 3000)
     }
+  })
+
+  watch(() => application.snapshot.value?.startup_complete, (complete, previous) => {
+    if (complete !== true || previous === true) return
+    // 完整启动结束后丢弃启动期间的临时健康采样，并立即读取正式状态。
+    computeStatusRevision++
+    void refreshComputeStatus()
   })
 
   let snapshotRequest: Promise<void> | null = null
