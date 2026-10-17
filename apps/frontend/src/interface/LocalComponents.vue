@@ -338,17 +338,19 @@ function categoryObservation(rows: LocalComponentRow[]) {
     : rows
   const blocking = (row: LocalComponentRow) => row.facts.some(fact => fact.label === '语音门禁')
     || row.category === 'voice-server' && row.resource?.required !== false
-  const blockingFailure = healthRows.some(row => blocking(row) && ['failed', 'disabled'].includes(row.state))
-  const blockingLoading = healthRows.some(row => blocking(row) && row.state === 'loading')
+  const blockingFailure = healthRows.some(row => blocking(row) && row.state === 'failed')
   const blockingMissing = healthRows.some(row => blocking(row) && needsResource(row))
-  const hasReadyComponent = rows.some(row => row.state === 'ready' && row.available)
+  // 分类摘要要反映子卡当前的启动过程；可选依赖不参与 Voice Server（语音服务）的汇总状态。
+  const componentLoading = rows.some(row => rowState(row) === 'loading'
+    && (row.category !== 'voice-server' || row.resource?.required !== false))
+  const hasReadyComponent = rows.some(row => rowState(row) === 'ready' && row.available)
   const hasFailedComponent = rows.some(row => row.state === 'failed')
   const missing = healthRows.some(needsResource)
   const label = activeResource ? '下载中'
-    : blockingFailure ? '部分异常'
-      : blockingLoading ? '启动中'
+    : blockingFailure ? '错误'
+      : componentLoading ? '启动中'
         : blockingMissing ? '待下载或更新'
-          : hasReadyComponent ? '运行正常'
+          : hasReadyComponent ? '运行中'
             : missing ? '待下载或更新'
               : hasFailedComponent ? '待检查'
                 : rows.length ? '待配置或已停用' : '暂无组件'
@@ -359,7 +361,7 @@ function categoryObservation(rows: LocalComponentRow[]) {
     })
     return bytes.length ? formatComponentMemory(bytes.reduce((total, value) => total + value, 0)) : undefined
   }
-  const state = activeResource || blockingLoading ? 'loading' : blockingFailure ? 'failed'
+  const state = activeResource || componentLoading ? 'loading' : blockingFailure ? 'failed'
     : hasReadyComponent ? 'ready' : 'disabled'
   return { state, label,
     residentMemory: sum('resident'), privateMemory: sum('privateCommit'), vram: sum('vram') }
