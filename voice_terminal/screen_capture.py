@@ -91,10 +91,13 @@ def choose_center(state, config):
 
 
 # capture_id（截图标识）、captured_at（捕获时间）、monitor_bounds（物理屏幕边界）、
-# executable（前台应用文件名）、center_point（中心坐标）、crop_rect（桌面物理裁剪矩形）、
-# valid_region（有效画面区域）、fullscreen（全屏覆盖）、exclusive（独占信号，未知为空）、
-# lock_inferred（推测锁鼠）、center_source（中心来源）、attachments（编码附件）。
-# 附件字段：attachment_id（附件标识）、role（全局或局部）、mime_type（媒体类型）、
+# executable（前台应用文件名）、center_point（局部中心桌面坐标）、crop_rect（桌面物理裁剪矩形）、
+# valid_region（有效画面区域）、center_source（局部中心来源）、fullscreen（全屏覆盖）、
+# exclusive（独占信号，未知为空）、lock_inferred（推测锁鼠）、cursor_visible（鼠标是否可见）、
+# cursor_in_monitor（鼠标是否位于目标屏幕）、capture_detected（是否检测到系统捕获）、
+# clip_bounds（系统限制的鼠标范围，未知为空）、notification_state（系统通知状态，未知为空）、
+# elapsed_ms（捕获与编码耗时，由服务填入）。
+# attachments（编码附件）：attachment_id（附件标识）、role（全局或局部）、mime_type（媒体类型）、
 # width/height（宽高）、bytes（字节数）、sha256（内容摘要）、base64（图片编码）。
 def encode_pair(frame, state, config):
     """encode_pair（同帧双图编码）：先裁局部，再缩小全局；边缘补黑。"""

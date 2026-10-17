@@ -13,8 +13,8 @@ watch(() => JSON.stringify(settings.screen_capture), () => {
 <template>
   <SettingsPageHeader section="screen" />
   <section class="preference-card settings-stack">
-    <label class="switch-row"><div><strong>允许按需观察屏幕</strong><span>模型依据你的需求获取前台屏幕的全局图与局部图；截图随聊天记录以编码保存。</span></div><input v-model="form.enabled" type="checkbox" role="switch" /><i></i></label>
-    <p role="status">{{ screenCaptureAvailable ? '屏幕捕获可用' : '当前不可用：检查启用开关、模型图像能力与捕获组件' }}</p>
+    <label class="switch-row"><div><strong>允许按需观察屏幕</strong><span>语音模型或 DSH（后台执行宿主）依据当前任务获取前台屏幕的全局图与局部图；截图随对应会话以编码保存。</span></div><input v-model="form.enabled" type="checkbox" role="switch" /><i></i></label>
+    <p role="status">{{ screenCaptureAvailable ? '语音链路截图动作可用' : '语音链路暂不可用：检查启用开关、语音模型图像能力与捕获组件；DSH 可用性还取决于所选模型' }}</p>
     <label class="form-field"><span>局部宽度（物理像素）</span><input v-model.number="form.crop_width" type="number" min="256" max="2048" /></label>
     <label class="form-field"><span>局部高度（物理像素）</span><input v-model.number="form.crop_height" type="number" min="256" max="2048" /></label>
     <label class="form-field"><span>全局图最长边（像素）</span><input v-model.number="form.global_max_edge" type="number" min="1280" max="4096" /></label>

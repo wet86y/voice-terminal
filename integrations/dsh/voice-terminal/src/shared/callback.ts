@@ -19,10 +19,12 @@ export async function callback(path: string, payload: Record<string, Json>, sign
   })
   const value: unknown = await response.json()
   if (!response.ok || value === null || typeof value !== 'object' || Array.isArray(value)) {
-    const status = value && typeof value === 'object' && !Array.isArray(value)
-      && typeof (value as Record<string, unknown>).status === 'string'
-      ? `: ${(value as Record<string, unknown>).status}` : ''
-    throw new Error(`callback rejected (${response.status})${status}`)
+    const details = value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown> : undefined
+    const message = typeof details?.detail === 'string' ? details.detail
+      : typeof details?.status === 'string' ? details.status : ''
+    const suffix = message ? `: ${message.slice(0, 320)}` : ''
+    throw new Error(`callback rejected (${response.status})${suffix}`)
   }
   return value as Record<string, Json>
 }
