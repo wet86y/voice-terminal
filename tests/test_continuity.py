@@ -185,7 +185,10 @@ def test_kws_silence_anchor_callback_uses_playback_completion_wall_time():
         runtime.episode_id = runtime.conversation.conversation_id
         runtime.last_turn_id = "turn-a"
         runtime.inputs["turn-a"] = {"text": "你好", "final": False}
+        runtime._identity_turns[runtime.identity()] = "previous-output-turn"
         await runtime.observe("USER_INPUT_FINALIZED", turn_id="turn-a", text="你好")
+        finalized = [row for row in runtime.trace if row["kind"] == "USER_INPUT_FINALIZED"]
+        assert finalized[-1]["turn_id"] == "turn-a", "定稿日志必须使用当前输入轮次，不能沿用旧输出所有者"
         pending = runtime._pending_silence_anchor
         assert pending is not None
         pending["request_id"] = "request-a"

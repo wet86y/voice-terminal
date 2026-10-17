@@ -48,19 +48,13 @@ class TtsBackendRouter:
 
     @property
     def playback_startup_buffer_ms(self) -> int:
-        """播放起播储备：必须代理到当前客户端，否则控制器守卫静默取到 0。
-
-        `speech_pipeline._play_stream` 用 `getattr(tts_client, "playback_startup_buffer_ms", 0)`
-        决定是否装配储备闸门。路由层缺这个属性时守卫为假、不装配、也不留日志——
-        合成本身慢于实时（VoxCPM2 实测 RTF 中位 1.2）时，播放器每 20 毫秒回调
-        就会补一次零，实测 12–28% 的播放时间是静音，听感随播报变长而累积成断续。
-        """
+        """playback_startup_buffer_ms（起播储备）：代理当前客户端，0 表示首块直接播放。"""
         client = self.current_client()
         return int(getattr(client, "playback_startup_buffer_ms", 0) or 0)
 
     @property
     def playback_resume_buffer_ms(self) -> int:
-        """欠载恢复储备：与起播储备同源代理。"""
+        """playback_resume_buffer_ms（欠载恢复储备）：独立于起播储备装配。"""
         client = self.current_client()
         return int(getattr(client, "playback_resume_buffer_ms", 0) or 0)
 

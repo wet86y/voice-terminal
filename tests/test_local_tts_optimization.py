@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from types import SimpleNamespace
 
 import httpx
@@ -77,6 +78,28 @@ def test_stream_buffer_avoids_fragmented_playback_and_drains_short_tail():
     player.enqueue("next", b"\x04\x00" * 20)
     player._callback(block, 20, None, None)
     assert block == b"\x04\x00" * 20
+
+
+def test_zero_startup_reserve_plays_partial_first_callback_and_keeps_recovery():
+    """首块不足一个设备回调也立即播放，后续欠载仍使用独立恢复门槛。"""
+    player = PcmPlayer(sample_rate=1000, channels=1, output_device=None)
+    player.allow("local")
+    player.configure_stream_buffer("local", startup_ms=0, resume_ms=60)
+    player.enqueue("local", b"\x01\x00" * 10)
+    block = bytearray(40)
+    player._callback(block, 20, None, None)
+    assert player.has_started("local")
+    assert block == b"\x01\x00" * 10 + bytes(20)
+    assert player.buffered_ms == 0
+
+    player._callback(block, 20, None, None)  # 空回调确认已进入欠载恢复等待。
+    player.enqueue("local", b"\x02\x00" * 20)
+    player._callback(block, 20, None, None)
+    assert block == bytes(40)
+    assert player.buffered_ms == 20
+    player.enqueue("local", b"\x03\x00" * 40)
+    player._callback(block, 20, None, None)
+    assert block == b"\x02\x00" * 20
 
 
 def test_local_resampling_keeps_existing_player_clock():
@@ -219,10 +242,12 @@ def test_formal_local_retry_freezes_voice_steps_and_transaction_lease(tmp_path):
         output._run = run
         handle = await output.begin(("episode", "frozen"), "frozen-turn")
         original = output._new_tts_session(handle.workspace)
+        assert original.turn_id == "frozen-turn" and original.speech_id == handle.speech_id
         library.update_voice(voice["id"], 1, {**voice, "name": "热更新名称"})
         client.inference_steps_by_model["voxcpm1"] = 15
         await original.close()
         retried = output._new_tts_session(handle.workspace, fresh=True)
+        assert retried.turn_id == "frozen-turn" and retried.speech_id == handle.speech_id
         assert retried.voice_snapshot.revision == 1
         assert retried._inference_steps == 10
         await retried.close()
@@ -413,6 +438,58 @@ async def _pump_callbacks(player, *, frames, until, timeout=3.0):
         await asyncio.sleep(0.001)
 
 
+def test_pipeline_plays_first_pcm_before_segment_completes_with_zero_startup(caplog):
+    """真实播放管线在首段仍生成时直接播放首块，并保留恢复闸门。"""
+    from voice_terminal.providers.audio_cpp_tts import AudioCppTtsClient
+
+    async def scenario():
+        output, handle, session, _ = _sentence_output_harness(min_effective_chars=1)
+        _arm_local_stream_gate(
+            output, startup_ms=AudioCppTtsClient.playback_startup_buffer_ms,
+            resume_ms=AudioCppTtsClient.playback_resume_buffer_ms,
+            cap_ms=2000, prefetch_ms=3000,
+        )
+        player = output.player = PcmPlayer(sample_rate=1000, channels=1, output_device=None)
+        release_segment = asyncio.Event()
+        key = handle.workspace.playback_key
+
+        async def send_text(text):
+            session.sent.append(text)
+            pcm = b"\x01\x00" * 10
+            session.received_bytes += len(pcm)
+            await session.audio.put(pcm)
+            await release_segment.wait()
+
+        session.send_text = send_text
+
+        async def deltas():
+            yield "第一句。"
+            yield None
+
+        running = asyncio.create_task(output._play_stream(
+            handle.workspace, handle.workspace.token, deltas(),
+            speech_id=handle.speech_id, handle=handle,
+        ))
+        try:
+            assert await _wait_until(lambda: player.buffered_ms == 10)
+            assert player.stream_reserve_ms(key) == {"armed": True, "startup_ms": 0, "resume_ms": 400}
+            assert session.completed_segments == 0 and not release_segment.is_set()
+            block = bytearray(40)
+            player._callback(block, 20, None, None)
+            assert player.has_started(key)
+            assert block == b"\x01\x00" * 10 + bytes(20)
+            assert not running.done(), "首块播放不能等整句生成结束"
+            assert "controller.tts_first_pcm_enqueued turn=turn speech=" in caplog.text
+            assert "queue_to_submit_ms（首块入队至设备提交毫秒）=" in caplog.text
+            assert caplog.text.index("controller.tts_first_pcm_enqueued") < caplog.text.index("audio.player_first_pcm_submitted")
+        finally:
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(scenario())
+
+
 def test_startup_reserve_is_clamped_below_cap_and_sentence_prefetch() -> None:
     """C：起播储备必须夹在入队上限与句窗门之下，否则播放永不开始。"""
 
@@ -420,7 +497,7 @@ def test_startup_reserve_is_clamped_below_cap_and_sentence_prefetch() -> None:
     assert safe_stream_reserve_ms(requested_ms=8000, cap_ms=8000, prefetch_ms=2000) == 1500
     # 队列上限更紧时以队列上限为准（现场默认 2000）。
     assert safe_stream_reserve_ms(requested_ms=8000, cap_ms=2000, prefetch_ms=3000) == 2000
-    # 现场默认 800/2000/3000 一个字都不变：夹紧不改变正常路径。
+    # 请求储备本来低于两道上界时，夹紧不改变请求值。
     assert safe_stream_reserve_ms(requested_ms=800, cap_ms=2000, prefetch_ms=3000) == 800
     # 恢复门槛要留出队列上限间隔，且同样受句窗门约束。
     assert safe_stream_reserve_ms(
@@ -443,7 +520,7 @@ def test_startup_reserve_is_clamped_below_cap_and_sentence_prefetch() -> None:
 def test_local_startup_reserve_cannot_livelock_sentence_window() -> None:
     """C：startup > 句窗门限的危险配置下，首块音频仍必须能起播。
 
-    现场默认 800 毫秒 < 首块约 2 秒，安全余量是隐式的。这里把 startup 提到 8000、
+    这里把 startup（起播储备）提到 8000 毫秒、
     句窗门限压到 2000，复现审计仿真 F 的活锁条件（120 秒内播放 0 毫秒）：
     首块 3000 毫秒入队后句窗门关闭，若起播门槛仍是 8000，播放永不开始。
     """
@@ -526,9 +603,9 @@ def test_set_stream_reserve_changes_recovery_without_rearming_gate() -> None:
 def test_adaptive_resume_only_raises_after_measured_rtf_or_underrun(caplog) -> None:
     """D：R≥1 时抬高恢复门槛；R<1 时一个字节都不改（零代价）。"""
 
-    async def scenario(rtf, expected_resume):
+    async def scenario(startup_ms, rtf, expected_resume):
         output, handle, session, _ = _sentence_output_harness(min_effective_chars=1)
-        _arm_local_stream_gate(output, startup_ms=100, resume_ms=400, cap_ms=2000, prefetch_ms=3000)
+        _arm_local_stream_gate(output, startup_ms=startup_ms, resume_ms=400, cap_ms=2000, prefetch_ms=3000)
         session.request_metrics = [{"rtf": rtf}]
         player = output.player = PcmPlayer(sample_rate=1000, channels=1, output_device=None)
         key = handle.workspace.playback_key
@@ -548,6 +625,7 @@ def test_adaptive_resume_only_raises_after_measured_rtf_or_underrun(caplog) -> N
             assert await _wait_until(
                 lambda: player.stream_reserve_ms(key)["resume_ms"] == expected_resume
             ), player.stream_reserve_ms(key)
+            assert player.stream_reserve_ms(key)["startup_ms"] == startup_ms
             assert player.diagnostics["underrun_ms"] == 0
         finally:
             release.set()
@@ -555,10 +633,10 @@ def test_adaptive_resume_only_raises_after_measured_rtf_or_underrun(caplog) -> N
                 running.cancel()
             await asyncio.gather(running, return_exceptions=True)
 
-    for rtf, expected_resume in ((1.40, 1800), (0.62, 400)):
+    for startup_ms, rtf, expected_resume in ((0, 1.40, 1800), (0, 0.62, 400), (100, 1.40, 1800), (100, 0.62, 400)):
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="voice_terminal.controller.speech_pipeline"):
-            asyncio.run(scenario(rtf, expected_resume))
+            asyncio.run(scenario(startup_ms, rtf, expected_resume))
         degraded = [r.getMessage() for r in caplog.records
                     if "controller.tts_playback_degraded" in r.getMessage()]
         if rtf >= 1:
@@ -576,6 +654,7 @@ def test_degraded_turn_emits_single_warning_with_gpu_snapshot(caplog) -> None:
             output, startup_ms=100, resume_ms=60, cap_ms=2000, prefetch_ms=3000
         )
         session.request_metrics = [{"rtf": 1.6}]
+        event_loop_thread = threading.get_ident()
 
         class Gpu:
             def snapshot(self):
@@ -583,6 +662,7 @@ def test_degraded_turn_emits_single_warning_with_gpu_snapshot(caplog) -> None:
                                    power_w=36.4, utilization_percent=41)
 
             def contention(self):
+                assert threading.get_ident() != event_loop_thread, "显卡取证不能阻塞音频事件循环"
                 # 现场取证口径：外部显卡进程 + HAGS 状态必须一并落盘，
                 # 否则无法区分“外部程序抢显卡”与“原生推理本身变慢”。
                 return {

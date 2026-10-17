@@ -56,6 +56,7 @@
 - [本地模型计算基准](testing/local-model-compute-benchmark.md)
 - [VoxCPM2 停用续接提示的性能复核](testing/local-tts-reference-only-20261017.md)
 - [本地 TTS 续写锚点回归](testing/local-tts-continuation-reanchor-20261017.md)
+- [试听后合成变慢与原生组件覆盖升级](testing/tts-preview-upgrade-20261017.md)
 - [本地 TTS 怪音与失真诊断](testing/local-tts-glitch-and-distortion-20261015.md)
 - [本地 TTS 音质验证流程](testing/local-tts-quality-pipeline-20261016.md)
 - [本地 TTS 根因调查](testing/local-tts-root-cause-20261016.md)

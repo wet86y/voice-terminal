@@ -81,18 +81,18 @@ class _Utilization(ctypes.Structure):
     _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
 
 
-class _ProcessInfo(ctypes.Structure):
-    """nvmlProcessInfo_t（显卡进程结构）：pid/computeInstance/usedGpuMemory。
+class _ProcessInfoV1(ctypes.Structure):
+    """nvmlProcessInfo_v1_t（旧版进程结构）：进程号、显存字节数。"""
 
-    Windows 的 WDDM 模式下 NVML 通常不填充 ``name``，且 ``usedGpuMemory`` 对多数
-    进程返回 0（或 UINT64_MAX 表示不可用），因此**只以 pid 为准**；进程名由调用方
-    用 ``psutil`` 反查。顺序必须与 NVML 头文件一致，不能调整。
-    """
+    _fields_ = [("pid", ctypes.c_uint), ("usedGpuMemory", ctypes.c_ulonglong)]
+
+
+class _ProcessInfo(ctypes.Structure):
+    """nvmlProcessInfo_t（新版进程结构）：进程号、显存、显卡与计算实例号。"""
 
     _fields_ = [
-        ("pid", ctypes.c_uint),
-        ("name", ctypes.c_char * 64),
-        ("usedGpuMemory", ctypes.c_ulonglong),
+        ("pid", ctypes.c_uint), ("usedGpuMemory", ctypes.c_ulonglong),
+        ("gpuInstanceId", ctypes.c_uint), ("computeInstanceId", ctypes.c_uint),
     ]
 
 
@@ -195,7 +195,8 @@ class GpuPerformanceMode:
         # 显卡进程枚举：签名统一为 (device, count*, infos*)，逐级回退的版本都声明。
         for process_api in (*_COMPUTE_PROCESS_APIS, *_GRAPHICS_PROCESS_APIS):
             signatures.append((process_api, [
-                ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(_ProcessInfo),
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint),
+                ctypes.POINTER(_ProcessInfo if process_api.endswith(("_v2", "_v3")) else _ProcessInfoV1),
             ]))
         for name, argtypes in signatures:
             function = getattr(library, name, None)
@@ -316,7 +317,7 @@ class GpuPerformanceMode:
         return GpuSnapshot(clock_mhz=clock, sm_clock_mhz=sm_clock, power_w=power,
                            utilization_percent=utilization)
 
-    def _running_processes(self, apis: tuple[str, ...]) -> list[int]:
+    def _running_processes(self, apis: tuple[str, ...]) -> list[int] | None:
         """枚举某类显卡进程的 pid 列表；接口缺失或不支持时返回空。
 
         NVML 的两段式协议：先以空数组取数量，再按数量取详情。实测该接口即使传了
@@ -325,30 +326,31 @@ class GpuPerformanceMode:
         2 次，避免在实时播报路径上长时间阻塞。
         """
 
-        library = self._library
-        caller = next((getattr(library, name) for name in apis
-                       if getattr(library, name, None) is not None), None)
-        if caller is None:
-            return []
-        count = ctypes.c_uint(0)
-        # 注意顺序：必须先把计数调用做完，再看 count。写成
-        # ``if int(caller(...)) != 0 or count.value <= 0`` 会因为短路在调用前
-        # 就读到 count=0 而永远提前返回。该接口通常返回 7（insufficient-size），
-        # 但它同时回填了真实数量，所以返回值不能作为失败判据。
-        caller(self._handle, ctypes.byref(count), None)
-        if count.value <= 0:
-            return []
-        wanted = int(count.value)
-        for _ in range(2):
-            buffer = (_ProcessInfo * wanted)()
-            count = ctypes.c_uint(wanted)
-            code = int(caller(self._handle, ctypes.byref(count), buffer))
-            if code == 0:
-                return [int(buffer[index].pid)
-                        for index in range(min(wanted, len(buffer))) if int(buffer[index].pid) > 0]
-            # 7 = insufficient-size：进程变多了，按驱动回填的数量再试一次。
-            wanted = max(wanted + 4, int(count.value) + 4)
-        return []
+        for name in apis:
+            caller = getattr(self._library, name, None)
+            if caller is None:
+                continue
+            count = ctypes.c_uint(0)
+            code = int(caller(self._handle, ctypes.byref(count), None))
+            if code not in (0, 7):  # 7（数组容量不足）仍携带所需数量。
+                continue
+            if count.value == 0:
+                if code == 0:
+                    return []
+                continue
+            wanted = int(count.value)
+            row_type = _ProcessInfo if name.endswith(("_v2", "_v3")) else _ProcessInfoV1
+            for _ in range(2):
+                buffer = (row_type * wanted)()
+                count = ctypes.c_uint(wanted)
+                code = int(caller(self._handle, ctypes.byref(count), buffer))
+                if code == 0:
+                    return [int(buffer[index].pid) for index in range(min(count.value, wanted))
+                            if 0 < int(buffer[index].pid) < 0xFFFFFFFF]
+                if code != 7:
+                    break
+                wanted = max(wanted + 4, int(count.value) + 4)
+        return None  # None（无法枚举）不能伪装成已确认没有其他进程。
 
     @staticmethod
     def _process_name(pid: int) -> str:
@@ -415,9 +417,12 @@ class GpuPerformanceMode:
         result.update({key: value for key, value in snapshot.as_dict().items()})
 
         seen: dict[int, str] = {}
+        query_available = {}
         for kind, apis in (("compute", _COMPUTE_PROCESS_APIS),
                            ("graphics", _GRAPHICS_PROCESS_APIS)):
-            for pid in self._running_processes(apis):
+            pids = self._running_processes(apis)
+            query_available[kind] = pids is not None
+            for pid in pids or ():
                 if pid <= 0 or pid in seen:
                     continue
                 seen[pid] = kind
@@ -429,12 +434,15 @@ class GpuPerformanceMode:
             lowered = name.lower()
             entry = {"pid": pid, "name": name, "kind": kind}
             # 自建进程按进程树判定；名字白名单只作为进程树不可用时的兜底。
-            if pid in own_pids or any(marker in lowered for marker in OWN_PROCESS_MARKERS):
+            if pid in own_pids or (not own_pids and any(marker in lowered for marker in OWN_PROCESS_MARKERS)):
                 own.append(entry)
             else:
                 external.append(entry)
         result["own_processes"] = own
         result["external_processes"] = external
+        result["process_query_available"] = query_available  # 两类进程表是否成功读取。
+        if not all(query_available.values()):
+            result["reason"] = "process-query-partially-unavailable"
         return result
 
     def apply(self) -> dict[str, Any]:

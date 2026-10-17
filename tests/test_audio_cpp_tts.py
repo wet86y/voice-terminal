@@ -302,7 +302,10 @@ def test_voxcpm2_design_candidate_has_no_reference_and_preview_does_not_mark_for
 
         async def handler(request):
             requests.append(request)
-            return _wav_response(b"\x02\x00" * 8)
+            response = _wav_response(b"\x02\x00" * 8)
+            return httpx.Response(200, json={**response.json(), "timing": {
+                "wall_ms": 1234.5, "audio_duration_ms": 1600.0, "rtf": 0.7715625,
+            }})
 
         client = _fake_client(handler, native_sample_rate=48000)
         design = ResolvedLocalTtsVoice(
@@ -325,6 +328,9 @@ def test_voxcpm2_design_candidate_has_no_reference_and_preview_does_not_mark_for
         assert "reference_text" not in payload
         assert "voice" not in payload and "style" not in payload
         assert client._warmed is False
+        assert session.request_metrics[0]["engine_wall_ms"] == 1234.5
+        assert session.request_metrics[0]["engine_audio_duration_ms"] == 1600.0
+        assert session.request_metrics[0]["engine_rtf"] == 0.7715625
 
     asyncio.run(scenario())
 
@@ -1091,18 +1097,19 @@ def test_local_tts_config_defaults_to_native_rate_per_model():
 
 
 def test_router_exposes_playback_reserve_from_active_client():
-    """路由层必须代理播放储备属性，否则控制器守卫静默取到 0、不装配储备闸门。"""
-    local = SimpleNamespace(playback_startup_buffer_ms=800, playback_resume_buffer_ms=400)
+    """本地起播储备为零时，路由仍必须保留独立的欠载恢复策略。"""
+    local = SimpleNamespace(
+        playback_startup_buffer_ms=AudioCppTtsClient.playback_startup_buffer_ms,
+        playback_resume_buffer_ms=AudioCppTtsClient.playback_resume_buffer_ms,
+    )
     remote = SimpleNamespace()
     router = TtsBackendRouter(remote=remote, local=local, backend="voxcpm1")
-    assert router.playback_startup_buffer_ms == 800
+    assert router.playback_startup_buffer_ms == 0
     assert router.playback_resume_buffer_ms == 400
-    # 守卫表达式必须为真，才能进入 configure_stream_buffer。
-    assert getattr(router, "playback_startup_buffer_ms", 0)
 
     router.backend = "minimax"
     assert router.playback_startup_buffer_ms == 0
-    assert not getattr(router, "playback_startup_buffer_ms", 0)
+    assert router.playback_resume_buffer_ms == 0
 
 
 def test_native_rate_multi_segment_streaming_keeps_transport_and_receipts():
