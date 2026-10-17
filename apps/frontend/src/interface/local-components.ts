@@ -65,6 +65,15 @@ export interface LocalComponentRow {
   sharedResource?: ManagedResourceRow
   /** runtimeDependencies（语音服务运行依赖）：中央处理器必需，原生语音与显卡可选。 */
   runtimeDependencies?: ManagedResourceRow[]
+  /** runtimeDependencyMetrics（依赖进程指标）：按依赖编号提供独占进程采样，避免把共享进程重复记到模型卡。 */
+  runtimeDependencyMetrics?: Record<string, {
+    /** resident（常驻内存）：该运行依赖独占进程的物理内存采样，单位为字节。 */
+    resident?: number
+    /** privateCommit（私有提交内存）：该运行依赖独占进程的提交内存采样，单位为字节。 */
+    privateCommit?: number
+    /** vram（显存）：该运行依赖独占进程的专用显存采样，单位为字节。 */
+    vram?: number
+  }>
   /** provider（在线服务配置）：用于在该组件详情中安全配置密钥与查询用量。 */
   provider?: LocalProviderSettings
   /** location（当前运行位置）：没有可调整设备选项时显示。 */

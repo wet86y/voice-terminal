@@ -200,6 +200,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     }
   })
   const system = systemComponents.value
+  const localMetrics = resources.value.get('local-tts')
   const environment = props.resourceController?.resources.value.find(row => row.resource_id === 'voice-server')
   {
     const metrics = resources.value.get('voice-system')
@@ -223,6 +224,13 @@ const rows = computed<LocalComponentRow[]>(() => {
         const managed = managedResource(resource.resource_id)
         return managed ? [{ ...managed, label: resource.label }] : []
       }),
+      runtimeDependencyMetrics: localMetrics ? {
+        'tts-audiocpp-runtime': {
+          resident: localMetrics.memory_rss_bytes ?? undefined,
+          privateCommit: localMetrics.memory_private_commit_bytes ?? undefined,
+          vram: localMetrics.gpu_dedicated_bytes != null && localMetrics.gpu_dedicated_bytes > 0 ? localMetrics.gpu_dedicated_bytes : undefined,
+        },
+      } : undefined,
       facts: [
         ...(environment?.python ? [{ label: 'Python（后端解释器）', value: environment.python }] : []),
         ...(environment?.version ? [{ label: '解释器版本', value: environment.version }] : []),
@@ -231,7 +239,6 @@ const rows = computed<LocalComponentRow[]>(() => {
       note: '系统进程余量已扣除单列模型的加载增量估算；应用总量仍取真实进程采样，共享进程只计一次。',
     })
   }
-  const localMetrics = resources.value.get('local-tts')
   const ttsResource = props.resourceController?.resources.value.find(row => row.resource_id === 'tts')
   const capability = application.snapshot.value?.unavailable_capabilities?.find(row => row.id === 'tts')
   const ttsLoading = Boolean(tts.status.value?.pending_selection || tts.status.value?.load_state === 'loading'
@@ -270,11 +277,11 @@ const rows = computed<LocalComponentRow[]>(() => {
       available: ready && !busy && !failed,
       busy,
       retryable: failed && Boolean(capability?.retry),
-      runtime: selected ? 'audio.cpp（原生音频推理程序）' : '',
-      residentMemory: selected ? formatComponentMemory(localMetrics?.memory_rss_bytes) : undefined,
-      privateMemory: selected ? formatComponentMemory(localMetrics?.memory_private_commit_bytes) : undefined,
-      vram: selected ? formatComponentMemory(localMetrics?.gpu_dedicated_bytes) : undefined,
-      resourceBytes: selected ? { resident: localMetrics?.memory_rss_bytes ?? undefined, privateCommit: localMetrics?.memory_private_commit_bytes ?? undefined, vram: localMetrics?.gpu_dedicated_bytes ?? undefined } : undefined,
+      runtime: '',
+      residentMemory: undefined,
+      privateMemory: undefined,
+      vram: undefined,
+      resourceBytes: undefined,
       description: `${resource.label} 本地语音模型；与另一款 VoxCPM 共用 audio.cpp 运行程序。`,
       error: failed ? capability?.error || ttsResource?.error || tts.status.value?.error || undefined : undefined,
       facts: [],
