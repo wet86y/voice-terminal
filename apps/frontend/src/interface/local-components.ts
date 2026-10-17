@@ -146,6 +146,11 @@ export interface ManagedResourceJob {
   /** completedBytes（已处理字节）与 totalBytes（总字节）。 */
   completedBytes?: number | null
   totalBytes?: number | null
+  /** download*（下载进度）；verification*（本地摘要校验进度）。 */
+  downloadCompletedBytes?: number | null
+  downloadTotalBytes?: number | null
+  verificationCompletedBytes?: number | null
+  verificationTotalBytes?: number | null
   /** error（失败原因）与 canCancel（当前是否允许取消）。 */
   error?: string
   canCancel: boolean

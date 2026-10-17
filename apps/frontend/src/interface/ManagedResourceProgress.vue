@@ -8,17 +8,22 @@ const props = defineProps<{
   label: string
 }>()
 const active = computed(() => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(props.job.state))
+function progressPercent(done: number | null | undefined, total: number | null | undefined) {
+  if (typeof total !== 'number' || !Number.isFinite(total) || total <= 0
+    || typeof done !== 'number' || !Number.isFinite(done)) return undefined
+  return Math.max(0, Math.min(100, Math.round(done / total * 100)))
+}
 const percent = computed(() => {
-  const { totalBytes, completedBytes } = props.job
-  if (typeof totalBytes !== 'number' || !Number.isFinite(totalBytes) || totalBytes <= 0
-    || typeof completedBytes !== 'number' || !Number.isFinite(completedBytes)) return undefined
-  return Math.max(0, Math.min(100, Math.round(completedBytes / totalBytes * 100)))
+  return progressPercent(props.job.completedBytes, props.job.totalBytes)
 })
+const downloadPercent = computed(() => progressPercent(props.job.downloadCompletedBytes, props.job.downloadTotalBytes))
+const verificationPercent = computed(() => progressPercent(props.job.verificationCompletedBytes, props.job.verificationTotalBytes))
+const hasBatchProgress = computed(() => downloadPercent.value !== undefined && verificationPercent.value !== undefined)
 function formatBytes(value: number | null | undefined) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return ''
-  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`
-  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB`
-  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GiB`
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MiB`
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KiB`
   return `${Math.round(value)} B`
 }
 </script>
@@ -26,7 +31,17 @@ function formatBytes(value: number | null | undefined) {
 <template>
   <section class="managed-resource-progress" :data-job="job.id" :aria-label="`${label}任务进度`">
     <p class="managed-job-phase" role="status">{{ job.phase }}</p>
-    <div v-if="active || percent !== undefined" class="managed-job-progress-wrap">
+    <div v-if="hasBatchProgress" class="managed-job-progresses">
+      <div class="managed-job-progress-wrap">
+        <div class="managed-job-progress" role="progressbar" :aria-label="`${label}下载进度`" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="downloadPercent"><span :style="{ width: `${downloadPercent}%` }"></span></div>
+        <small>下载：{{ formatBytes(job.downloadCompletedBytes) }} / {{ formatBytes(job.downloadTotalBytes) }} · {{ downloadPercent }}%</small>
+      </div>
+      <div class="managed-job-progress-wrap">
+        <div class="managed-job-progress" role="progressbar" :aria-label="`${label}摘要校验进度`" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="verificationPercent"><span :style="{ width: `${verificationPercent}%` }"></span></div>
+        <small>摘要校验：{{ formatBytes(job.verificationCompletedBytes) }} / {{ formatBytes(job.verificationTotalBytes) }} · {{ verificationPercent }}%</small>
+      </div>
+    </div>
+    <div v-else-if="active || percent !== undefined" class="managed-job-progress-wrap">
       <div class="managed-job-progress" :class="{ indeterminate: percent === undefined }" role="progressbar" :aria-label="`${label}进度`" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="percent">
         <span :style="percent !== undefined ? { width: `${percent}%` } : undefined"></span>
       </div>
@@ -41,6 +56,7 @@ function formatBytes(value: number | null | undefined) {
 .managed-resource-progress{display:grid;gap:8px;min-width:0}
 .managed-job-phase,.managed-job-error{margin:0;font-size:var(--font-caption);color:var(--muted);overflow-wrap:anywhere;white-space:pre-wrap}
 .managed-job-error{color:var(--danger)}
+.managed-job-progresses{display:grid;gap:7px;min-width:0}
 .managed-job-progress-wrap{display:grid;grid-template-columns:minmax(60px,1fr) auto;align-items:center;gap:10px}
 .managed-job-progress-wrap small{white-space:nowrap;font-size:var(--font-caption);font-variant-numeric:tabular-nums;color:var(--muted)}
 .managed-job-progress{height:7px;border-radius:999px;background:var(--line-strong);overflow:hidden}
