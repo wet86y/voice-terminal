@@ -29,6 +29,8 @@ const modelResourceIds: Record<ProductLocalModelId, string> = {
   smart_turn: 'smart-turn',
   sensevoice: 'sensevoice-small',
 }
+// deviceSelectableModelIds（可切换 CPU／GPU 的模型）：只有 Paraformer、SenseVoice（精修模型）与 CAM++ 支持此设置。
+const deviceSelectableModelIds = new Set<ProductLocalModelId>(['paraformer', 'sensevoice', 'campplus'])
 // availableModelServices（可用模型状态）：与后端就绪契约一致，工作中的状态同样可用。
 // READY（就绪）、RUNNING（运行中）、STREAMING（流式传输）、CONNECTED（已连接）；DEGRADED（降级）沿用原有可用规则。
 const availableModelServices = new Set(['READY', 'RUNNING', 'STREAMING', 'CONNECTED', 'DEGRADED'])
@@ -121,6 +123,7 @@ const rows = computed<LocalComponentRow[]>(() => {
       status: updateRequired ? '需更新' : loading ? owner?.state === 'stopping' ? '退出中' : '启动中' : ownerUnavailable ? '不可用' : disabled ? '已停用' : !status && available ? '运行中' : serviceLabel(status?.service),
       available, retryable: !updateRequired && !available && !loading && !disabled && Boolean(owner?.retry_allowed), busy: loading,
       runtime: status?.runtime || '未提供',
+      location: deviceLabel(status?.device),
       residentMemory: countedHere ? formatComponentMemory(metrics?.memory_rss_bytes ?? legacyResource?.rss_bytes) : undefined,
       privateMemory: countedHere ? formatComponentMemory(metrics?.memory_private_commit_bytes ?? legacyResource?.private_commit_bytes) : undefined,
       vram: countedHere && status?.device?.startsWith('cuda') ? formatComponentMemory(metrics?.gpu_dedicated_bytes ?? legacyResource?.gpu_dedicated_bytes) : undefined,
@@ -136,7 +139,7 @@ const rows = computed<LocalComponentRow[]>(() => {
         ...(resource?.pid === owner?.pid && owner?.cpu_percent != null ? [{ label: '处理器占用', value: owner.cpu_percent.toFixed(1) + '%' }] : []),
       ],
       resource: managed,
-      device: {
+      ...(deviceSelectableModelIds.has(item.id) ? { device: {
         value: settings.compute.devices[item.id], current: deviceLabel(status?.device),
         locked: updateRequired || !available || !status || refreshing.value,
         draft: settings.compute.devices[item.id] !== computeSavedDevices.value[item.id],
@@ -146,7 +149,7 @@ const rows = computed<LocalComponentRow[]>(() => {
           ...(gpuAvailable ? [{ value: 'cuda', label: 'GPU（图形处理器）' }] : settings.compute.devices[item.id] === 'cuda' ? [{ value: 'cuda', label: 'GPU（当前不可用）', disabled: true }] : []),
         ],
         hint: updateRequired ? '此模型需更新并通过校验后才能启动语音服务。' : status?.load_error && available ? status.load_error : !gpuAvailable ? status?.gpu_unavailable_reason || '当前推理环境不支持显卡运行。' : undefined,
-      },
+      } } : {}),
     }
   })
   for (const [id, name, ownerId] of [
@@ -326,7 +329,10 @@ const rows = computed<LocalComponentRow[]>(() => {
 const model = computed<LocalComponentsModel>(() => {
   const snapshot = application.snapshot.value
   const hardware = computeStatus.value?.hardware
-  const failed = rows.value.some(row => row.state === 'failed')
+  const usableTts = rows.value.some(row => row.category === 'tts' && row.state === 'ready' && row.available)
+  const failed = rows.value.some(row => row.state === 'failed' && (row.category === 'tts' ? !usableTts
+    : row.id.startsWith('capability:') ? row.facts.some(fact => fact.label === '语音门禁')
+      : row.resource?.required !== false))
   const loading = rows.value.some(row => row.state === 'loading')
   // 总显存取自受管进程的去重计数，不把整卡占用当作应用占用。
   const gpu = hardware?.gpu

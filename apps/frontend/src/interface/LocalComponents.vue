@@ -60,7 +60,12 @@ const batchJob = computed(() => visibleJob(latestJobs.value.get('batch')))
 const categories = computed(() => categoryDefinitions.map(definition => {
   const rows = componentCards.value.filter(card => card.category === definition.id)
   const entries = rows.flatMap(({ row }) => downloadEntries(row))
-  const pendingCount = entries.filter(entryNeedsDownload).length
+  const pendingEntries = entries.filter(entryNeedsDownload)
+  // Voice Server（语音服务）分类顶层操作只针对阻塞启动的 CPU（中央处理器）依赖；
+  // audio.cpp（本地语音合成引擎）和 GPU（图形处理器）依赖仍留在各自子卡片操作。
+  const pendingCount = (definition.id === 'voice-server'
+    ? pendingEntries.filter(entry => entry.optional !== true)
+    : pendingEntries).length
   return {
     ...definition, rows, entries, pendingCount,
     observation: categoryObservation(rows.map(card => card.row)),
@@ -217,18 +222,52 @@ function toggleComponent(row: LocalComponentRow) {
   expandedComponents.value = next
 }
 function refreshProviderUsage() { providerUsageRevision.value += 1 }
-function downloadCategory(category: { title: string; entries: LocalDownloadItem[]; pendingCount: number }) {
+function downloadCategory(category: { id: LocalComponentCategory; title: string; entries: LocalDownloadItem[]; pendingCount: number }) {
   if (!category.entries.length || !props.model.resourceActionsAvailable || props.model.resourceLoading) return
-  emit('resourceBundleDownload', { title: category.title, entries: category.entries })
+  const entries = category.id === 'voice-server'
+    ? category.entries.filter(entry => entry.optional !== true && entryNeedsDownload(entry))
+    : category.entries
+  if (!entries.length) return
+  emit('resourceBundleDownload', { title: category.title, entries })
+}
+function hasReadyTtsAlternative(row: LocalComponentRow) {
+  return row.category === 'tts' && props.model.rows.some(candidate => candidate.id !== row.id
+    && candidate.category === 'tts' && candidate.state === 'ready' && candidate.available)
+}
+function resourceVersionText(resource?: ManagedResourceRow) {
+  if (!resource) return ''
+  const installed = resource.installedVersion?.trim()
+  const target = resource.targetVersion?.trim()
+  if (installed && target && installed === target) return `当前版本 ${installed}`
+  if (installed && target) return `已安装版本 ${installed} · 目标版本 ${target}`
+  if (installed) return `当前版本 ${installed}`
+  if (target) return `目标版本 ${target}`
+  return ''
+}
+function resourceRuntimeInfo(resource?: ManagedResourceRow, row?: LocalComponentRow) {
+  const parts = [resourceVersionText(resource), ...(row?.facts ?? [])
+    .filter(fact => fact.label === '进程标识')
+    .map(fact => `进程标识 ${fact.value}`)].filter(Boolean)
+  return parts.join(' · ')
+}
+function detailFacts(row: LocalComponentRow) {
+  return row.facts.filter(fact => fact.label !== '进程标识')
 }
 function rowState(row: LocalComponentRow) {
-  if (rowResources(row).some(resource => resource.updateAvailable)) return 'failed'
+  const readyAlternative = hasReadyTtsAlternative(row)
+  if (readyAlternative && row.state !== 'ready' && row.state !== 'loading') return 'disabled'
+  if (row.category === 'voice-server' && row.resource?.required === false && row.state === 'failed') return 'disabled'
+  if (rowResources(row).some(resource => resource.updateAvailable
+    && (resource.required !== false || row.category === 'tts' && !readyAlternative))) return 'failed'
   if (row.state === 'loading' || row.state === 'failed' && (row.error || row.retryable)) return row.state
   if (row.resource && resourceNeedsInstall(row.resource)) return 'disabled'
   if (row.sharedResource && (row.sharedResource.state !== 'installed' || row.sharedResource.updateAvailable)) return 'disabled'
   return row.state
 }
 function rowStatus(row: LocalComponentRow) {
+  if (hasReadyTtsAlternative(row) && row.state !== 'ready' && row.state !== 'loading') {
+    return row.resource?.updateAvailable ? '需更新' : row.status
+  }
   if (row.resource?.updateAvailable) return '需更新'
   if (row.resource && row.resource.state !== 'installed') return resourceStateLabel(row.resource.state)
   if (rowResources(row).some(resource => resource.updateAvailable)) return '需更新'
@@ -392,7 +431,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
             <article v-for="{ row, job } in category.rows" :key="row.id" class="local-component-card" :class="job ? jobState(job) : rowState(row)" :data-component="row.id">
               <div class="local-component-summary">
                 <div class="local-component-body">
-                  <div class="local-component-identity">
+                  <div class="local-component-identity" :class="{ 'has-provider-usage': Boolean(row.provider) }">
                     <div class="local-component-name"><h4 :title="row.name">{{ row.name }}</h4><small v-if="row.category === 'voice-server' && row.resource?.required === false">可选运行依赖，不阻塞基础语音服务</small></div>
                     <div class="local-component-state-group">
                       <FixedProviderUsage v-if="row.provider" class="local-component-provider-usage" :model="row.provider" :refresh-key="providerUsageRevision" />
@@ -435,12 +474,12 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                 <button v-if="jobIsActive(resourceJob)" class="outline-button local-resource-cancel" type="button" :aria-label="`${row.name}：取消任务`" :disabled="!resourceJob.canCancel" @click="emit('cancelResource', resourceJob.id)">取消任务</button>
               </div>
               <div v-if="expandedComponents.has(row.id)" :id="`local-detail-${row.id}`" class="local-component-detail">
-                <p>{{ row.description }}</p>
+                <p v-if="!row.resource && !row.provider && row.description">{{ row.description }}</p>
                 <section v-if="row.runtimeDependencies?.length" class="local-runtime-dependencies" aria-label="语音运行依赖">
                   <article v-for="dependency in row.runtimeDependencies" :key="dependency.id" class="local-download-choice" :data-runtime-dependency="dependency.id">
                     <div class="local-managed-resource-heading"><strong>{{ dependency.label }}</strong><span class="resource-install-state" :class="dependency.state">{{ dependency.updateAvailable ? '需更新' : dependency.status || resourceStateLabel(dependency.state) }}</span></div>
                     <small class="local-detail-note">{{ runtimeDescription(dependency.id) }}</small>
-                    <dl v-if="dependency.installedVersion || dependency.targetVersion" class="local-resource-versions"><div v-if="dependency.installedVersion"><dt>已安装版本</dt><dd>{{ dependency.installedVersion }}</dd></div><div v-if="dependency.targetVersion"><dt>目标版本</dt><dd>{{ dependency.targetVersion }}</dd></div></dl>
+                    <dl v-if="resourceRuntimeInfo(dependency, row)" class="local-resource-versions"><div><dt>运行信息</dt><dd>{{ resourceRuntimeInfo(dependency, row) }}</dd></div></dl>
                     <ManagedResourceProgress v-if="visibleJob(resourceJob(dependency.id))" :job="visibleJob(resourceJob(dependency.id))!" :label="dependency.label" />
                     <div v-if="model.resourceActionsAvailable" class="managed-resource-actions">
                       <button v-if="jobIsActive(resourceJob(dependency.id))" class="outline-button" type="button" :disabled="!resourceJob(dependency.id)?.canCancel" @click="emit('cancelResource', resourceJob(dependency.id)!.id)">取消任务</button>
@@ -454,8 +493,8 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                   </article>
                 </section>
                 <section v-else-if="row.resource" class="local-managed-resource" :data-resource="row.resource.id" :aria-label="`${row.resource.label}安装状态`">
-                  <div class="local-managed-resource-heading"><span>{{ row.resource.label }}</span><span class="resource-install-state" :class="row.resource.state">{{ row.resource.status || resourceStateLabel(row.resource.state) }}</span></div>
-                  <dl v-if="row.resource.installedVersion || row.resource.targetVersion" class="local-resource-versions"><div v-if="row.resource.installedVersion"><dt>已安装版本</dt><dd>{{ row.resource.installedVersion }}</dd></div><div v-if="row.resource.targetVersion"><dt>目标版本</dt><dd>{{ row.resource.targetVersion }}</dd></div></dl>
+                  <div v-if="row.resource.updateAvailable || row.resource.state !== 'installed' || !resourceRuntimeInfo(row.resource, row)" class="local-managed-resource-heading"><span>{{ row.resource.label }}</span><span class="resource-install-state" :class="row.resource.state">{{ row.resource.status || resourceStateLabel(row.resource.state) }}</span></div>
+                  <dl v-if="resourceRuntimeInfo(row.resource, row)" class="local-resource-versions"><div><dt>运行信息</dt><dd>{{ resourceRuntimeInfo(row.resource, row) }}</dd></div></dl>
                   <p v-if="row.resource.error && row.state !== 'loading' && !jobIsActive(latestJobs.get(row.resource.id))" class="local-error" role="status">{{ row.resource.error }}</p>
                 </section>
                 <section v-if="row.resourceChoices?.length" class="local-tts-downloads">
@@ -463,20 +502,20 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                   <small>在组件卡片中分别管理 VoxCPM1、VoxCPM2；选择本地模型时会自动准备共用运行程序。下载不会改变当前播放后端。</small>
                   <article v-for="resource in selectedResources(row)" :key="resource.id" :data-resource="resource.id" class="local-download-choice">
                     <div class="local-managed-resource-heading"><span>{{ resource.label }}</span><span class="resource-install-state" :class="resource.state">{{ resource.updateAvailable ? '需更新' : resource.status || resourceStateLabel(resource.state) }}</span></div>
-                    <dl v-if="resource.installedVersion || resource.targetVersion" class="local-resource-versions"><div v-if="resource.installedVersion"><dt>已安装版本</dt><dd>{{ resource.installedVersion }}</dd></div><div v-if="resource.targetVersion"><dt>目标版本</dt><dd>{{ resource.targetVersion }}</dd></div></dl>
+                    <dl v-if="resourceRuntimeInfo(resource)" class="local-resource-versions"><div><dt>版本</dt><dd>{{ resourceRuntimeInfo(resource) }}</dd></div></dl>
                     <p v-if="resource.error && row.state !== 'loading' && !jobIsActive(latestJobs.get(resource.id))" class="local-error">{{ resource.error }}</p>
                   </article>
                 </section>
                 <section v-if="row.sharedResource" class="local-managed-resource" :data-resource="row.sharedResource.id" :aria-label="`${row.sharedResource.label}安装状态`">
                   <div class="local-managed-resource-heading"><span>{{ row.sharedResource.label }}（共享运行程序）</span><span class="resource-install-state" :class="row.sharedResource.state">{{ row.sharedResource.status || resourceStateLabel(row.sharedResource.state) }}</span></div>
-                  <dl v-if="row.sharedResource.installedVersion || row.sharedResource.targetVersion" class="local-resource-versions"><div v-if="row.sharedResource.installedVersion"><dt>已安装版本</dt><dd>{{ row.sharedResource.installedVersion }}</dd></div><div v-if="row.sharedResource.targetVersion"><dt>目标版本</dt><dd>{{ row.sharedResource.targetVersion }}</dd></div></dl>
+                  <dl v-if="resourceRuntimeInfo(row.sharedResource)" class="local-resource-versions"><div><dt>版本</dt><dd>{{ resourceRuntimeInfo(row.sharedResource) }}</dd></div></dl>
                   <p v-if="row.sharedResource.error && !rowHasActiveJob(row)" class="local-error" role="status">{{ row.sharedResource.error }}</p>
                 </section>
                 <FixedProviderSettings v-if="row.provider" :model="row.provider" @saved="refreshProviderUsage" />
                 <p v-if="!job && row.resource && needsResource(row) && !row.resource.error" class="local-resource-hint" role="status">{{ row.resource.required === false ? '可选组件；缺失或待更新不阻塞启动。' : '资源缺失或需要更新，可通过分类卡片中的下载操作处理。' }}</p>
                 <p v-if="row.error && !row.busy" class="local-error" role="alert">{{ row.error }}</p>
                 <button v-if="row.retryable && !row.busy" class="outline-button retry-action" type="button" @click="emit('retry', row.id)">重试组件</button>
-                <dl v-if="row.facts.length" class="local-detail-facts"><div v-for="fact in row.facts" :key="fact.label"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div></dl>
+                <dl v-if="detailFacts(row).length" class="local-detail-facts"><div v-for="fact in detailFacts(row)" :key="fact.label"><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div></dl>
                 <div v-if="row.device" class="local-device-editor">
                   <label :for="`local-device-${row.id}`"><span>运行位置</span><select :id="`local-device-${row.id}`" :value="row.device.value" :disabled="saving || row.device.locked" @change="changeDevice(row.id, $event)"><option v-for="option in row.device.options" :key="option.value" :value="option.value" :disabled="option.disabled">{{ option.label }}</option></select></label>
                   <button class="save-button" type="button" :disabled="saving || row.device.locked || invalidDevice(row)" @click="emit('save', row.id)">{{ saving ? '保存中' : '保存' }}</button>
@@ -502,7 +541,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
 .local-managed-heading>div>small{color:var(--muted)}
 .resource-batch-import{white-space:nowrap}
 .resource-empty{padding:14px 16px;border:1px dashed var(--line-strong);border-radius:12px;color:var(--muted);font-size:var(--font-body)}
-.local-category-list{display:grid;gap:12px}.local-category-card{min-width:0;border:1px solid var(--line-strong);border-radius:16px;background:#ffffff02;overflow:hidden}.local-category-card.expanded{background:#ffffff04}.local-category-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:14px;padding:12px 16px}.local-category-main{display:grid;gap:9px;min-width:0}.local-category-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding:3px 0;text-align:left;background:transparent;border:0;cursor:pointer}.local-category-toggle>span{display:grid;gap:4px;min-width:0}.local-category-toggle strong{font-size:var(--font-section);line-height:1.4}.local-category-toggle small{color:var(--muted);line-height:1.5}.local-category-toggle svg{flex:none;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;transition:transform 180ms}.local-category-toggle svg.expanded{transform:rotate(180deg)}.local-category-observability{display:grid;gap:8px;min-width:0}.local-category-metrics{grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:8px 14px}.local-category-progress{max-width:620px}.local-category-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.category-download,.category-import{white-space:nowrap;min-height:var(--compact-control-height);padding:6px 11px;font-size:var(--font-caption)}.local-category-content{display:grid;gap:10px;padding:0 14px 14px}.local-category-content>.resource-empty{margin-top:2px}
+.local-category-list{display:grid;gap:12px}.local-category-card{min-width:0;border:1px solid var(--line-strong);border-radius:16px;background:#ffffff02;overflow:hidden}.local-category-card.expanded{background:#ffffff04}.local-category-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:14px;padding:12px 16px}.local-category-main{display:grid;gap:9px;min-width:0}.local-category-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding:3px 0;text-align:left;background:transparent;border:0;cursor:pointer}.local-category-toggle>span{display:grid;gap:4px;min-width:0}.local-category-toggle strong{font-size:var(--font-section);line-height:1.4}.local-category-toggle small{color:var(--muted);line-height:1.5}.local-category-toggle svg{flex:none;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;transition:transform 180ms}.local-category-toggle svg.expanded{transform:rotate(180deg)}.local-category-observability{display:grid;gap:8px;min-width:0}.local-category-metrics{grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:8px 14px}.local-category-progress{max-width:620px}.local-category-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.category-download,.category-import{white-space:nowrap;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:6px 11px;font-size:var(--font-caption)}.local-category-content{display:grid;gap:10px;padding:0 14px 14px}.local-category-content>.resource-empty{margin-top:2px}
 .local-managed-resource{display:grid;gap:8px;padding:10px 16px;border-top:1px solid var(--line);background:#00000008}
 .local-category-heading{align-items:center}
 .local-category-main{gap:0}
@@ -512,11 +551,11 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
 .local-category-observability{display:flex;align-items:center;justify-content:flex-end;gap:14px;min-width:0}
 .local-category-metrics{display:flex;align-items:center;gap:8px 14px;margin:0}
 .local-category-metrics .local-runtime-metric{min-width:84px}
-.local-category-disclosure{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-height:var(--compact-control-height);padding:5px 8px;border:1px solid var(--line-strong);border-radius:9px;background:#ffffff03;color:inherit;font:inherit;font-size:var(--font-caption);white-space:nowrap;cursor:pointer}
+.local-category-disclosure{display:inline-flex;align-items:center;justify-content:center;gap:5px;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:5px 8px;border:1px solid var(--line-strong);border-radius:9px;background:#ffffff03;color:inherit;font:inherit;font-size:var(--font-caption);white-space:nowrap;cursor:pointer}
 .local-category-disclosure svg{width:14px;height:14px}
 .local-category-progress{max-width:620px;margin:8px 0 0 2px}
 .local-component-provider-usage{margin:0;align-self:center}
-@container (max-width:760px){.local-category-row{grid-template-columns:minmax(0,1fr) auto;gap:8px}.local-category-observability{grid-column:1/-1;grid-row:2;justify-content:flex-start;flex-wrap:wrap}.local-category-metrics{flex-wrap:wrap}}
+@container (max-width:760px){.local-category-row{grid-template-columns:minmax(0,1fr) auto auto;gap:8px}.local-category-observability{justify-content:flex-end;gap:6px;flex-wrap:wrap}.local-category-metrics{justify-content:flex-end;flex-wrap:wrap;gap:6px 10px}}
 .local-managed-resource-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0;font-size:var(--font-caption);color:var(--muted)}
 .local-managed-resource-heading>span:first-child{min-width:0;overflow-wrap:anywhere}
 .local-resource-versions{display:flex;gap:18px;flex-wrap:wrap}.local-resource-versions>div{display:flex;gap:6px;align-items:baseline}.local-resource-versions dd{font-size:var(--font-caption)}
@@ -556,6 +595,7 @@ small,dt{font-size:var(--font-caption)}
 .local-component-controls{display:grid;justify-items:end;align-content:center;gap:8px;min-width:0}
 /* name column（名称列）：统一预留宽度，使状态不随名称长度移动。 */
 .local-component-identity{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2fr);gap:12px;align-items:center;margin-bottom:8px}
+.local-component-identity.has-provider-usage{margin-bottom:0}
 .local-component-name{display:grid;gap:2px;min-width:0}
 .local-component-name>small{font-size:var(--font-caption);line-height:1.4;color:var(--muted)}
 .local-component-identity h4{font-size:var(--font-body);line-height:1.5;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
@@ -568,7 +608,7 @@ small,dt{font-size:var(--font-caption)}
 .local-inline-resource-action button{min-height:var(--compact-control-height);padding:5px 8px;font-size:var(--font-caption);white-space:nowrap}
 .local-component-inline-progress{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;padding:0 14px 12px}
 .local-component-state-group{display:flex;align-items:center;justify-content:flex-end;gap:8px 14px;min-width:0;flex-wrap:wrap}
-.local-component-identity .local-component-provider-usage{margin:0;align-self:center}
+.local-component-identity .local-component-provider-usage{flex:1 1 0;margin:0;min-width:0;align-self:center}
 dl,dd{margin:0}
 .local-component-metrics{display:grid;grid-template-columns:minmax(100px,1fr) auto;align-items:start;gap:8px 16px}
 .local-runtime-metric,.local-resource-metrics>div{min-width:0;display:flex;flex-direction:column;gap:3px}
@@ -578,7 +618,7 @@ dl,dd{margin:0}
 .local-detail-facts>div{min-width:0;display:flex;flex-direction:column;gap:4px}
 dt{color:var(--subtle)}
 dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:anywhere;line-height:1.5}
-.local-component-action{display:inline-flex;align-self:center;align-items:center;justify-content:center;gap:4px;min-height:var(--compact-control-height);min-width:88px;padding:6px 10px;font-size:var(--font-body);white-space:nowrap;background:#ffffff03}
+.local-component-action{display:inline-flex;align-self:center;align-items:center;justify-content:center;gap:4px;height:var(--compact-control-height);min-height:var(--compact-control-height);min-width:88px;padding:6px 10px;font-size:var(--font-body);white-space:nowrap;background:#ffffff03}
 .local-component-action svg{transition:transform 180ms}
 .local-component-action svg.expanded{transform:rotate(180deg)}
 .retry-action{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 30%,transparent)}
@@ -596,7 +636,7 @@ dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:an
 .local-device-editor>small{grid-column:1/-1}
 .local-detail-note{overflow-wrap:anywhere}
 .local-location{display:flex;gap:12px;align-items:center;font-size:var(--font-body)}
-@container (max-width:560px){.local-component-identity{grid-template-columns:minmax(0,1fr);gap:8px}.local-component-state-group{justify-content:flex-start}}
+@container (max-width:560px){.local-component-identity{grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:8px}.local-component-state-group{justify-content:flex-end;flex-wrap:nowrap}.local-component-state-group>.local-state{white-space:nowrap}.local-component-identity .local-component-provider-usage{flex:1 1 0;min-width:0}}
 @container (max-width:440px){.local-memory-summary{grid-template-columns:1fr;gap:8px}.local-memory-summary article{flex-direction:row;align-items:center;justify-content:space-between;padding:12px;gap:8px}.local-component-summary{grid-template-columns:minmax(0,1fr);padding:10px;gap:9px}.local-component-controls{justify-items:stretch}.local-category-heading{grid-template-columns:minmax(0,1fr);padding:11px 12px}.local-category-actions{justify-content:stretch}.category-download,.category-import{flex:1}.local-category-content{padding:0 10px 10px}.local-component-metrics{gap:6px}.local-component-detail{padding:12px}.local-component-action{justify-self:stretch;width:100%;padding-inline:8px}.local-inline-resource-actions{max-width:none;justify-items:stretch}.local-inline-resource-action{justify-content:stretch}.local-inline-resource-action button{flex:1}.local-component-inline-progress{grid-template-columns:1fr;padding:0 10px 10px}.local-resource-progress{padding:0 12px 12px}.local-managed-resource{padding:10px 12px}.managed-resource-actions{gap:6px}}
 @container (max-width:560px){.local-managed-heading{align-items:flex-start}.resource-batch-import{white-space:normal;max-width:100%}}
 @container (max-width:520px){.local-component-metrics{grid-template-columns:1fr}.local-resource-metrics{gap:12px}.local-resource-metrics dt,.local-resource-metrics dd{font-size:var(--font-caption)}}
