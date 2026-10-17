@@ -448,6 +448,17 @@ class ModelRegistryService:
         if not secret:
             label = "DeepSeek" if provider == "deepseek" else "MiniMax"
             raise ModelRegistryError(f"请先配置 {label}（在线服务）接口密钥。")
+        # billing_mode（计费方式）：MiniMax 官方区分 sk-cp 订阅密钥与普通按量 API 密钥。
+        # 普通按量密钥目前没有公开的密钥查询余额接口，避免对未确认的私有端点发请求。
+        if provider == "minimax" and not secret.casefold().startswith("sk-cp"):
+            return {
+                "provider": provider,
+                "data": {
+                    "billing_mode": "pay_as_you_go",  # billing_mode（计费方式）：普通按量计费。
+                    "usage_supported": False,  # usage_supported（是否支持查询）：普通密钥余额尚无公开 API 查询接口。
+                    "usage_note": "已识别为普通按量计费 API Key（接口密钥）。MiniMax 当前公开文档未提供通过 API Key 查询余额或账单的接口，请在 MiniMax 开放平台控制台查看。",
+                },
+            }
 
         def request_usage() -> dict[str, Any]:
             request = urllib.request.Request(
@@ -492,7 +503,15 @@ class ModelRegistryService:
                 if isinstance(value, str) and secret in value:
                     return value.replace(secret, "[已隐藏]")
                 return value
-            return sanitize(result)
+            payload = sanitize(result)
+            if provider == "minimax":
+                return {
+                    **payload,
+                    "billing_mode": "token_plan",  # billing_mode（计费方式）：Token Plan（令牌订阅套餐）。
+                    "usage_supported": True,  # usage_supported（是否支持查询）：此密钥可查询套餐用量。
+                    "usage_note": "已识别为 Token Plan（订阅套餐）密钥；只显示服务商实际返回的套餐与窗口额度。",
+                }
+            return payload
 
         return {
             "provider": provider,  # provider（服务商编号）：用于识别余额或套餐来源。

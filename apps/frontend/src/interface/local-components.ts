@@ -43,6 +43,15 @@ export interface LocalComponentRow {
   privateMemory?: string
   /** vram（进程专用显存占用）：没有有效测量时省略。 */
   vram?: string
+  /** resourceBytes（组件计量原始字节）：供用途分类汇总，避免先格式化再相加。 */
+  resourceBytes?: {
+    /** resident（常驻内存字节数）。 */
+    resident?: number
+    /** privateCommit（提交内存字节数）。 */
+    privateCommit?: number
+    /** vram（显存字节数）。 */
+    vram?: number
+  }
   /** description（详情说明）、error（异常原因）与 note（指标说明）。 */
   description: string
   error?: string
@@ -51,7 +60,7 @@ export interface LocalComponentRow {
   settingsSection?: string
   /** resource（固定资源状态）：安装操作独立于组件健康状态。 */
   resource?: ManagedResourceRow
-  /** resourceChoices（可选下载模型）与 sharedResource（共用运行程序）：均在详情中管理。 */
+  /** resourceChoices（可选模型）与 sharedResource（共用运行程序）：摘要显示状态，详情显示安装信息。 */
   resourceChoices?: ManagedResourceRow[]
   sharedResource?: ManagedResourceRow
   /** provider（在线服务配置）：用于在该组件详情中安全配置密钥与查询用量。 */
