@@ -2,7 +2,7 @@
  * List every stored `turn/end` whose `reason` is `null` or missing.
  *
  * The DSH web client reads `turn/end.data.reason.kind` on its normal render path
- * (see `docs/dsh-plugin-audit-20260927.md`). One such row is enough to make the
+ * (see `docs/guides/dsh-plugin-maintenance.md`). One such row is enough to make the
  * conversation pane blank for every session, so this is the first check to run
  * when the 对话 pane is empty.
  *

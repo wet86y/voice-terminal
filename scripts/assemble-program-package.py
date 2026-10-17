@@ -52,7 +52,7 @@ def assemble(desktop: Path, build: str = '') -> Path:
     speaker_migration = bundle_speaker_seed(stage / 'app')
     guide = stage / 'app/docs/模型运行环境配置指南.md'
     guide.parent.mkdir(exist_ok=True)
-    shutil.copy2(ROOT / 'docs/模型运行环境配置指南.md', guide)
+    shutil.copy2(ROOT / 'docs/guides/模型运行环境配置指南.md', guide)
     lock = json.loads((stage / 'app/config/runtime/voice-runtime.lock.json').read_text('utf-8'))
     for row in lock['wheels']:
         if row.get('bundled'):

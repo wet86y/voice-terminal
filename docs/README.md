@@ -1,0 +1,77 @@
+# 文档索引
+
+文档按职责分为四类：
+
+- **架构**：系统结构、组件边界、协议和长期行为契约。
+- **说明**：安装、配置、操作和开发维护指南。
+- **测试**：测试入口、回归与基准报告、现场验收清单及当前问题。
+- **交付**：当前正式构建与交付记录。
+
+测试结果与操作规则分别放入测试和说明目录；协议、架构与产品操作说明各自归类，避免同一索引混排。
+
+## 架构
+
+- [系统架构与生命周期](architecture/architecture.md)
+- [Bridge 2.0（第二版桥接协议）](architecture/bridge-2.0-protocol.md)
+- [能力就绪与能力级恢复](architecture/capability-readiness-and-recovery.md)
+- [上下文与工具契约](architecture/context-and-tools.md)
+- [连续性底座：上下文衔接与定时唤醒](architecture/continuity-foundation.md)
+- [LLM（大语言模型）上下文缓存契约](architecture/llm-context-cache-contract.md)
+- [WebSocket（实时双向通信）协议](architecture/websocket-protocol.md)
+- [语音队列决策与后台问答策略](architecture/语音队列决策与后台问答策略.md)
+
+## 说明
+
+- [模型运行环境配置指南](guides/模型运行环境配置指南.md)
+- [应用生命周期](guides/application-lifecycle.md)
+- [ASR（自动语音识别）热词](guides/asr-hotwords.md)
+- [ASR 延迟与 CUDA（显卡计算平台）配置](guides/asr-latency-and-cuda.md)
+- [桌面应用开发与分发](guides/desktop-application.md)
+- [DSH（代理执行宿主）控制台](guides/dsh-console.md)
+- [DSH npm（包管理器）分发与安装](guides/dsh-npm-distribution.md)
+- [DSH 插件维护](guides/dsh-plugin-maintenance.md)
+- [本地目录与覆盖发布](guides/local-layout.md)
+- [本地模型运行设备](guides/local-model-compute.md)
+- [本地 TTS（语音合成）接入](guides/local-tts-integration-20261014.md)
+- [本地 TTS 日志与可观测性](guides/local-tts-observability-20261015.md)
+- [LLM JSON Schema（结构化数据约束）迁移](guides/llm-json-schema-migration.md)
+- [模型资源更新](guides/model-resource-updates.md)
+- [运行资源管理](guides/runtime-resource-management.md)
+- [屏幕双图输入](guides/screen-input.md)
+- [可选声纹增强](guides/speaker-enhancement.md)
+- [启动与退出图标动画](guides/startup-logo-animation.md)
+- [流式标点补全](guides/streaming-punctuation.md)
+- [TTS 组件分发](guides/tts-component-distribution-20261015.md)
+- [TTS 运行说明](guides/tts-runtime.md)
+- [统一正式程序与分发安装器](guides/unified-product-installer.md)
+
+## 测试
+
+- [测试、启动与现场验收入口](testing/operations-and-quality.md)
+- [当前已知问题](testing/known-issues.md)
+- [桌面现场验收](testing/desktop-acceptance.md)
+- [CAM++（声纹模型）流式验收](testing/campplus-streaming-acceptance-20261012.md)
+- [下载与首次启动修复验收](testing/download-startup-flow-20261010.md)
+- [本地模型计算基准](testing/local-model-compute-benchmark.md)
+- [本地 TTS 续写锚点回归](testing/local-tts-continuation-reanchor-20261017.md)
+- [本地 TTS 怪音与失真诊断](testing/local-tts-glitch-and-distortion-20261015.md)
+- [本地 TTS 音质验证流程](testing/local-tts-quality-pipeline-20261016.md)
+- [本地 TTS 根因调查](testing/local-tts-root-cause-20261016.md)
+- [本地 TTS 实时因子分支比较](testing/local-tts-rtf-branch-comparison-20261014.md)
+- [本地 TTS 实时因子调查](testing/local-tts-rtf-investigation-20261014.md)
+- [本地 TTS 诊断与修复会话回顾](testing/local-tts-session-review-20261016.md)
+- [本地 TTS 音色还原度与下行带宽](testing/local-tts-voice-fidelity-20261015.md)
+- [内存优化验收](testing/memory-optimization-20261010.md)
+- [最近代码审阅与开放风险](testing/recent-code-review-20261016.md)
+- [运行环境验证](testing/runtime-validation-20261010.md)
+- [并行启动验收](testing/startup-parallel-acceptance.md)
+- [TTS 运行时修复验收](testing/tts-runtime-fixes-20261014.md)
+- [旧程序升级兼容性验收](testing/upgrade-compatibility-20261016.md)
+- [语音可靠性修复验收](testing/voice-reliability-fixes-20261010.md)
+- [VoxCPM2（第二代本地语音模型）解码图生命周期回归](testing/voxcpm2-decoder-graph-lifecycle-20261016.md)
+- [LLM 协议基线 JSON（结构化数据文件）](testing/llm-protocol-baseline.json)
+
+## 交付
+
+- [当前正式程序与分发安装器](releases/current-release.md)
+- [CAM++（声纹模型）分发与升级](releases/campplus-distribution-upgrade-20261012.md)

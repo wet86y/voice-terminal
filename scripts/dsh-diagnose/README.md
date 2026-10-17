@@ -2,7 +2,7 @@
 
 这些脚本用于排查「项目 DSH 控制台」的安装一致性、会话日志完整性与渲染故障。它们都是只读
 检查，除 `purge-poisoned-sessions.mjs` 外都不写盘。背景与结论见
-[`docs/dsh-plugin-audit-20260927.md`](../../docs/dsh-plugin-audit-20260927.md)。
+[`docs/guides/dsh-plugin-maintenance.md`](../../docs/guides/dsh-plugin-maintenance.md)。
 
 脚本默认从自身位置推导仓库根目录，可在任意工作目录下用 `node` / `python` 直接运行。
 `verify-console-state.mjs` 与 `capture-boot-errors.mjs` 需要 DSH 控制台处于打开状态，并通过

@@ -25,13 +25,16 @@ def anchors(path):
 def main():
     tracked = subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '*.md'], text=True, encoding='utf-8').splitlines()
     files = {ROOT / p for p in tracked if (ROOT / p).is_file()}
-    files.update((ROOT / 'docs').glob('*.md'))
-    files.discard(ROOT / 'docs/download-distribution-plan.md')  # 用户草稿原样保留，检查不改动。
+    files.update((ROOT / 'docs').rglob('*.md'))
     failures = []
     checked = 0
     for path in sorted(files):
         for value in re.findall(r'\]\(([^)\s]+)(?:\s+"[^"]*")?\)', path.read_text(encoding='utf-8')):
             address = urlsplit(value.strip('<>'))
+            if re.match(r'^[A-Za-z]:[\\/]', value.strip('<>')):
+                checked += 1
+                failures.append({'source': path.relative_to(ROOT).as_posix(), 'target': value})
+                continue
             if address.scheme or value.startswith('/') or '<' in value or '$' in value:
                 continue
             target = (path.parent / unquote(address.path)).resolve() if address.path else path

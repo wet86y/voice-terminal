@@ -4,7 +4,7 @@
  * Prints the console errors raised during boot, the sidebar sessions, and the
  * character count of the conversation pane for a few sessions. This is the
  * acceptance check for the blank-对话 failure described in
- * `docs/dsh-plugin-audit-20260927.md`.
+ * `docs/guides/dsh-plugin-maintenance.md`.
  *
  * Requires the console to be open in the ego-browser window.
  *

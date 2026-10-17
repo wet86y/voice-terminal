@@ -5,14 +5,14 @@ Voice Terminal 选定的 DeepSeek Harness（DSH，代理执行宿主）目标版
 `639ed015397290b3745d163aafe02ffee4aa3f84`。这不是稳定版；升级必须显式更新锁定文件、许可证快照和回归检查，
 不追踪浮动版本。当前源码将 Bridge（桥接）、Wake Tasks（项目唤醒任务）和 Shadow preset（影子代理预设）合并为
 `@voice-terminal/dsh-plugin`（统一功能包）0.2.0，Bridge protocol（桥接协议）仍为 2.0。组件职责、兼容契约和维护门槛见
-[DSH 插件维护手册](../../docs/dsh-plugin-maintenance.md)。2026-10-07 已完成项目内统一包安装迁移，
-构建记录格式为 6，117 个原有数据文件摘要核对一致；完整结果见[本轮安装与验证](../../docs/dsh-plugin-maintenance.md#2026-10-07-插件合并与项目安装验收历史记录)。
+[DSH 插件维护手册](../../docs/guides/dsh-plugin-maintenance.md)。2026-10-07 已完成项目内统一包安装迁移，
+构建记录格式为 6，117 个原有数据文件摘要核对一致；完整结果见[本轮安装与验证](../../docs/guides/dsh-plugin-maintenance.md)。
 桌面发行目录仍按独立发布流程管理，本轮没有重新发布便携程序。
 
 该宿主版本于 2026-10-05 完成首次源码及便携桌面部署，并完成共存修复部署；当时三个项目功能包均为 0.1.1。
 当次便携应用位于 `apps/20261005-dsh-task-coexist`；首次部署目录为 `apps/20261005-dsh020rc2`。DSH component（DSH 组件）标识为
-`639ed015-e7dd1315c977`；构建编号仅保留在清单；当前运行目录固定，重要用户数据最多保留一份滚动备份。首次部署的验收范围、任务与会话数据核验见[本机部署验收记录](../../docs/local-layout.md)；共存修复已完成部署并通过[本机验收](../../docs/local-layout.md)。
-共存修订细节见[DSH 会话任务与语音链路任务修订文档](../../docs/dsh-task-coexistence.md)。
+`639ed015-e7dd1315c977`；构建编号仅保留在清单；当前运行目录固定，重要用户数据最多保留一份滚动备份。首次部署的验收范围、任务与会话数据核验见[本机部署验收记录](../../docs/guides/local-layout.md)；共存修复已完成部署并通过[本机验收](../../docs/guides/local-layout.md)。
+工具选择和投递目标见[连续性底座](../../docs/architecture/continuity-foundation.md)与[DSH 插件维护手册](../../docs/guides/dsh-plugin-maintenance.md)。
 
 首次部署、共存修复前的测试结果：backend（后端）666 passed（通过）、17 skipped（跳过）；frontend（前端）64 passed（通过）；
 Bridge（桥接插件）22 passed（通过）；Wake Tasks（唤醒任务插件）3 passed（通过）；official DSH tests
@@ -23,7 +23,7 @@ Bridge（桥接插件）22 passed（通过）；Wake Tasks（唤醒任务插件�
 分别位于 Git（版本控制）忽略的 `.local/build/dsh/source/`（唯一上游源码缓存）和 `.local/data/dsh/`（唯一代理持久数据）。
 实际业务只使用 `.local/runtimes/dsh/`（生产宿主），不在源码缓存内保留第二套代理状态。
 项目插件随 `.local/app/`（当前程序）更新；运行组件升级先构建候选，经覆盖发布换入固定位置，成功后回收事务旧组件。
-升级不制作源码、模型或环境备份；重要用户数据只保留一份滚动备份，规则见[本地目录与覆盖发布](../../docs/local-layout.md)。
+升级不制作源码、模型或环境备份；重要用户数据只保留一份滚动备份，规则见[本地目录与覆盖发布](../../docs/guides/local-layout.md)。
 
 正式 `shadow-agent`（影子执行代理）由 `integrations/dsh/voice-terminal/preset/shadow-agent/` 维护。
 插件构建将该配置合入统一 Bundle（功能包）的组合补丁，安装到 Web
@@ -58,5 +58,5 @@ DSH 会话。两套工具名、存储和投递目标分开；启用官方 Bundle
 Wake Tasks 仅迁移旧 Voice `wake-tasks.json`（旧语音任务文件）；不读取或导入 DSH 原生 Schedule（调度）
 任务，已存在的项目任务继续留在 `storages/voice-terminal-wake-tasks.json`（项目任务文件）中。
 
-完整的安装、设置、运行和故障说明见 [`docs/dsh-console.md`](../../docs/dsh-console.md)。许可证快照位于
+完整的安装、设置、运行和故障说明见 [`docs/guides/dsh-console.md`](../../docs/guides/dsh-console.md)。许可证快照位于
 `licenses/`。
