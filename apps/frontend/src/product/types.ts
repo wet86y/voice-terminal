@@ -234,6 +234,22 @@ export interface FixedModelCredentials {
   message?: string; // message（保存结果说明）。
 }
 
+/** FixedModelCredentialUpdate（固定服务密钥更新）：只允许提交当前编辑的密钥字段。 */
+export interface FixedModelCredentialUpdate {
+  /** deepseek_api_key（DeepSeek 推理服务接口密钥）：留空或省略时保留已有密钥。 */
+  deepseek_api_key?: string
+  /** minimax_api_key（MiniMax 语音合成服务接口密钥）：留空或省略时保留已有密钥。 */
+  minimax_api_key?: string
+}
+
+/** FixedProviderUsageResponse（在线服务用量响应）：只包含公开账户统计，不包含密钥。 */
+export interface FixedProviderUsageResponse {
+  /** provider（服务商编号）：DeepSeek（推理服务）或 MiniMax（语音合成服务）。 */
+  provider: 'deepseek' | 'minimax'
+  /** data（账户数据）：DeepSeek 余额明细或 MiniMax Token Plan（令牌套餐）余量。 */
+  data: Record<string, unknown>
+}
+
 export interface ProductModel {
   id: string
   name: string

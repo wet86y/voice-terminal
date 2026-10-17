@@ -1476,6 +1476,14 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             registry_error(exc)
             raise AssertionError("unreachable")
 
+    @app.get("/api/v1/models/credentials/{provider}/usage")
+    async def get_fixed_provider_usage(provider: str) -> dict[str, Any]:
+        try:
+            return await registry_or_404().fixed_provider_usage(provider)
+        except Exception as exc:
+            registry_error(exc)
+            raise AssertionError("unreachable")
+
     @app.put("/api/v1/models/credentials")
     async def save_fixed_model_credentials(body: dict[str, Any]) -> dict[str, Any]:
         try:

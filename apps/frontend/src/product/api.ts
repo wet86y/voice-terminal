@@ -142,7 +142,9 @@ export const productApi = {
   clearAmbientContext: () => request<Record<string, unknown>>('/api/v1/ambient-context', { method: 'DELETE' }),
   registry: () => request<ProductSnapshot['models']>('/api/v1/models/registry'),
   fixedCredentials: () => request<import('./types').FixedModelCredentials>('/api/v1/models/credentials'),
-  saveFixedCredentials: (value: { deepseek_api_key: string; minimax_api_key: string }) => request<import('./types').FixedModelCredentials>('/api/v1/models/credentials', { method: 'PUT', body: JSON.stringify(value) }),
+  /** fixedProviderUsage（服务商账户用量）：密钥留在后端，只返回余额或订阅余量。 */
+  fixedProviderUsage: (provider: 'deepseek' | 'minimax') => request<import('./types').FixedProviderUsageResponse>(`/api/v1/models/credentials/${provider}/usage`),
+  saveFixedCredentials: (value: import('./types').FixedModelCredentialUpdate) => request<import('./types').FixedModelCredentials>('/api/v1/models/credentials', { method: 'PUT', body: JSON.stringify(value) }),
   scanModels: () => request<ProductSnapshot['models']>('/api/v1/models/scan', { method: 'POST' }),
   validateProvider: (value: unknown) => request<Record<string, unknown>>('/api/v1/models/validate', { method: 'POST', body: JSON.stringify(value) }),
   addProvider: (value: unknown) => request<ProductSnapshot['models']>('/api/v1/models/providers', { method: 'POST', body: JSON.stringify(value) }),

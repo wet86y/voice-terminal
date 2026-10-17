@@ -8,7 +8,7 @@ import ResourceInstallDialog from './ResourceInstallDialog.vue'
 
 function controller(plan: ResourceInstallPlan, resources: ResourceStatus[] = []) {
   return {
-    pendingDownloadPlan: ref(plan), pendingImport: ref(null), resources: ref(resources), confirmDownload: vi.fn(), confirmImport: vi.fn(),
+    pendingDownloadPlan: ref(plan), pendingDownloadBundlePlan: ref(null), pendingImport: ref(null), resources: ref(resources), confirmDownload: vi.fn(), confirmDownloadBundle: vi.fn(), confirmImport: vi.fn(),
   } as unknown as ReturnType<typeof useWorkspaceResources>
 }
 

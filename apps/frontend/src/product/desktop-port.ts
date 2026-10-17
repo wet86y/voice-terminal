@@ -1,5 +1,5 @@
 import { locateNativeInvoker } from '../runtime/desktop-preflight'
-import type { FixedModelCredentials } from './types'
+import type { FixedModelCredentialUpdate, FixedModelCredentials } from './types'
 import type { FloatingSessionAction, FloatingWindowModel, FloatingWindowProjection } from './floating-window'
 
 /** WorkspaceInfo（工作区信息）：由原生启动器返回的当前数据归属。 */
@@ -198,7 +198,7 @@ export interface DesktopCredentialsPort {
   /** fixedCredentials（读取配置状态）：只返回是否已配置，不返回密钥正文。 */
   fixedCredentials(): Promise<FixedModelCredentials>
   /** saveFixedCredentials（保存固定服务密钥）：空白保留已有值，系统凭据库保存正文。 */
-  saveFixedCredentials(request: { deepseek_api_key: string; minimax_api_key: string }): Promise<FixedModelCredentials>
+  saveFixedCredentials(request: FixedModelCredentialUpdate): Promise<FixedModelCredentials>
 }
 
 export function desktopPort(): DesktopPort {

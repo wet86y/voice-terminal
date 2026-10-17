@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import tempfile
+import urllib.error
+import urllib.request
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -426,6 +428,76 @@ class ModelRegistryService:
                 if secret:
                     credentials[environment] = secret
             return credentials
+
+    async def fixed_provider_usage(self, provider: str) -> dict[str, Any]:
+        """fixed_provider_usage（固定服务用量）：在本机读取凭据并代理查询服务商账户。"""
+        endpoints = {
+            "deepseek": ("DEEPSEEK_API_KEY", "https://api.deepseek.com/user/balance"),
+            # MiniMax 的 Token Plan 余量接口只报告订阅套餐额度，不代表普通按量付费账户余额。
+            "minimax": ("MINIMAX_API_KEY", "https://www.minimaxi.com/v1/token_plan/remains"),
+        }
+        if provider not in endpoints:
+            raise ModelRegistryError("不支持查询该服务商的账户用量。")
+        environment, endpoint = endpoints[provider]
+        async with self._lock:
+            registry = self._load()
+            try:
+                secret = self._fixed_secret(registry, provider) or self.config.api_key(environment)
+            except (CredentialVaultUnavailable, ModelRegistryError) as exc:
+                raise ModelRegistryError(str(exc)) from exc
+        if not secret:
+            label = "DeepSeek" if provider == "deepseek" else "MiniMax"
+            raise ModelRegistryError(f"请先配置 {label}（在线服务）接口密钥。")
+
+        def request_usage() -> dict[str, Any]:
+            request = urllib.request.Request(
+                endpoint,
+                headers={"Accept": "application/json", "Authorization": f"Bearer {secret}"},
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    payload = response.read(1024 * 1024 + 1)
+            except urllib.error.HTTPError as exc:
+                raise ModelRegistryError(
+                    f"账户用量查询失败（HTTP {exc.code}），请检查接口密钥和服务商账号类型。"
+                ) from None
+            except (urllib.error.URLError, TimeoutError, OSError):
+                raise ModelRegistryError("暂时无法连接服务商，请稍后重试。") from None
+            if len(payload) > 1024 * 1024:
+                raise ModelRegistryError("服务商返回的数据超过大小限制。")
+            try:
+                result = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ModelRegistryError("服务商返回的账户用量格式无法读取。") from None
+            if not isinstance(result, dict):
+                raise ModelRegistryError("服务商返回的账户用量格式无法读取。")
+            if provider == "minimax":
+                response_status = result.get("base_resp")
+                if isinstance(response_status, dict) and response_status.get("status_code") not in (None, 0):
+                    message = response_status.get("status_msg")
+                    if isinstance(message, str) and secret in message:
+                        message = message.replace(secret, "[已隐藏]")
+                    raise ModelRegistryError(
+                        str(message)[:240] if isinstance(message, str) and message.strip()
+                        else "MiniMax 未返回有效的 Token Plan 用量。"
+                    )
+            # sanitize（敏感字段清理）：即使服务商意外回显凭据，也不把密钥送回前端。
+            secret_fields = {"api_key", "apikey", "api-key", "api_token", "token", "authorization", "access_token", "access-token", "access-key", "secret", "secret_key"}
+            def sanitize(value: Any) -> Any:
+                if isinstance(value, dict):
+                    return {key: sanitize(item) for key, item in value.items() if str(key).casefold() not in secret_fields}
+                if isinstance(value, list):
+                    return [sanitize(item) for item in value]
+                if isinstance(value, str) and secret in value:
+                    return value.replace(secret, "[已隐藏]")
+                return value
+            return sanitize(result)
+
+        return {
+            "provider": provider,  # provider（服务商编号）：用于识别余额或套餐来源。
+            "data": await asyncio.to_thread(request_usage),  # data（账户数据）：服务商返回的用量，不包含接口密钥。
+        }
 
     async def save_fixed_credentials(self, request: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {"deepseek_api_key", "minimax_api_key"}  # allowed（唯一可写字段）：两家固定服务的接口密钥。

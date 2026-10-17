@@ -12,11 +12,21 @@ import {
   type WorkspaceInfo,
   type WorkspaceJob,
 } from './desktop-port'
+import type { LocalDownloadItem } from '../interface/local-components'
 
 const MAX_VISIBLE_JOBS = 8
 const TERMINAL_JOB_STATES = new Set(['complete', 'completed', 'failed', 'cancelled', 'canceled'])
 const ACTIVE_REFRESH_MS = 2000 // ACTIVE_REFRESH_MS（活动任务补查间隔）：事件之外每两秒确认状态。
 const IDLE_REFRESH_MS = 10000 // IDLE_REFRESH_MS（空闲清单刷新间隔）。
+
+/** ResourceDownloadBundlePlan（分类下载计划）：确认前并列展示该分类涉及的固定资源。 */
+export interface ResourceDownloadBundlePlan {
+  /** title（用途分类名称）与 plans（逐资源安装计划）。 */
+  title: string
+  plans: ResourceInstallPlan[]
+  /** entries（确认清单）：含已就绪、正在处理及无需独立下载的条目。 */
+  entries: LocalDownloadItem[]
+}
 
 /** useWorkspaceResources（工作区与资源控制器）：原生操作不依赖 Voice（语音服务）接口。 */
 export function useWorkspaceResources() {
@@ -36,6 +46,8 @@ export function useWorkspaceResources() {
   const workspaceOperationStarting = ref(false)
   const pendingImport = computed(() => resourceJobs.value.find(job => job.import_preview?.length && !TERMINAL_JOB_STATES.has(job.state)) ?? null)
   const pendingDownloadPlan = ref<ResourceInstallPlan | null>(null)
+  const pendingDownloadBundlePlan = ref<ResourceDownloadBundlePlan | null>(null) // pendingDownloadBundlePlan（分类下载确认草稿）。
+  const preparingDownloadBundle = ref(false) // preparingDownloadBundle（正在并行读取分类资源计划）。
   let mounted = false
   let unlistenResource: (() => void) | undefined
   let unlistenWorkspace: (() => void) | undefined
@@ -303,6 +315,44 @@ export function useWorkspaceResources() {
     await startResourceJob(plan.resource_id, 'download')
   }
 
+  async function prepareDownloadBundle(entries: LocalDownloadItem[], title: string) {
+    if (!resourcesCanManage.value || pendingDownloadPlan.value || pendingDownloadBundlePlan.value || preparingDownloadBundle.value) return
+    preparingDownloadBundle.value = true
+    const ids = [...new Set(entries.flatMap(item => item.id ? [item.id] : []))].filter(id => {
+      const resource = resources.value.find(item => item.resource_id === id)
+      const alreadyInstalled = resource?.installation_state === 'installed' && resource.update_available !== true
+      const repairSharedRuntime = entries.some(item => item.id === id && item.forcePlan)
+      const alreadyRunning = startingResources.value.has(id)
+        || resourceJobs.value.some(job => job.resource_id === id && !TERMINAL_JOB_STATES.has(job.state))
+      return (!alreadyInstalled || repairSharedRuntime) && !alreadyRunning
+    })
+    const loadingKeys = ids.map(id => `plan:${id}`)
+    startingResources.value = new Set([...startingResources.value, ...loadingKeys])
+    resourceError.value = ''
+    try {
+      const plans = await Promise.all(ids.map(id => port.resourceInstallPlan(id)))
+      pendingDownloadBundlePlan.value = { title, plans, entries }
+    } catch (error) {
+      resourceError.value = error instanceof Error ? error.message : '无法读取分类下载计划。'
+    } finally {
+      const next = new Set(startingResources.value)
+      loadingKeys.forEach(id => next.delete(id))
+      startingResources.value = next
+      preparingDownloadBundle.value = false
+    }
+  }
+
+  async function confirmDownloadBundle(resourceIds?: string[]) {
+    const bundle = pendingDownloadBundlePlan.value
+    if (!bundle) return
+    pendingDownloadBundlePlan.value = null
+    // 各资源任务并行启动；原生资源管理器负责共享依赖、环境启用和重复文件协调。
+    const selected = resourceIds ? new Set(resourceIds) : new Set(bundle.plans.map(plan => plan.resource_id))
+    await Promise.all(bundle.plans
+      .filter(plan => selected.has(plan.resource_id))
+      .map(plan => startResourceJob(plan.resource_id, 'download')))
+  }
+
   async function importResource(resourceId?: string) {
     await startResourceJob(resourceId ?? 'batch', 'import', resourceId)
   }
@@ -392,6 +442,10 @@ export function useWorkspaceResources() {
     downloadResource,
     pendingDownloadPlan,
     confirmDownload,
+    pendingDownloadBundlePlan,
+    preparingDownloadBundle,
+    prepareDownloadBundle,
+    confirmDownloadBundle,
     importResource,
     openResourceSource,
     cancelJob,

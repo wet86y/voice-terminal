@@ -41,9 +41,9 @@ function validChoice<T extends string>(
 ): T {
   return values.includes(value as T) ? (value as T) : fallback;
 }
-// 旧 silence（静默页）与 system（系统页）地址继续打开对应合并页。
+// 旧 silence（静默页）、system（系统页）与 models（模型管理页）地址继续打开合并页。
 const requestedPage =
-  query.get("page") === "silence" ? "wake" : query.get("page") === "system" ? "compute" : query.get("page");
+  query.get("page") === "silence" ? "wake" : ["system", "models"].includes(query.get("page") ?? "") ? "compute" : query.get("page");
 const page = ref<PreviewPage>(
   validChoice(
     requestedPage,

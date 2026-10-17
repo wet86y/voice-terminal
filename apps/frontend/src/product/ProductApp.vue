@@ -19,7 +19,6 @@ import SpeakerSettings from "./panels/SpeakerSettings.vue";
 import WakeTasksSettings from "./panels/WakeTasksSettings.vue";
 import ComputeSettings from "./panels/ComputeSettings.vue";
 import WorkspaceSettings from "./panels/WorkspaceSettings.vue";
-import ModelSettings from "./panels/ModelSettings.vue";
 import { provideProductContext } from "./product-context";
 import { useWorkspaceResources } from './useWorkspaceResources'
 import { FLOATING_WINDOW_CONTROL_EVENT, FLOATING_WINDOW_ERROR_EVENT, FLOATING_WINDOW_WORKBENCH_EVENT,
@@ -173,7 +172,6 @@ function nativeAction(action: () => Promise<void>) {
         <SpeakerSettings v-if="activeSettingsTab === 'speaker'" />
         <WakeTasksSettings v-if="activeSettingsTab === 'wakes'" />
         <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" :resource-controller="workspaceResources" />
-        <ModelSettings v-if="activeSettingsTab === 'models'" />
         <WorkspaceSettings v-if="activeSettingsTab === 'workspace'" :controller="workspaceResources" /></article
     ></SettingsFrame>
     <template #overlays>

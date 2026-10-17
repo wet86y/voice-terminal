@@ -11,7 +11,7 @@ import WakeTaskSchedule from '../interface/WakeTaskSchedule.vue'
 import InstructionEditorRow from '../interface/InstructionEditorRow.vue'
 import SpeakerRecordingFlow from '../interface/SpeakerRecordingFlow.vue'
 import WakeTaskTabs from '../interface/WakeTaskTabs.vue'
-import FixedModelCredentials from '../interface/FixedModelCredentials.vue'
+import type { LocalDownloadItem } from '../interface/local-components'
 import { useLocalComponentsDemo } from './useLocalComponentsDemo'
 import {
   demoAmbientRecords, demoInstructions,
@@ -39,8 +39,8 @@ const speakerRecording = ref<number | null>(null) // speakerRecording（当前�
 const speakerCanSubmit = computed(() => speakerSegments.value.length === demoSpeakerPrompts.length && speakerRecording.value === null && !loading.value) // speakerCanSubmit（录制完成后允许保存）。
 const editingTask = ref('')
 const addingTask = ref(false) // addingTask（添加表单是否展开）。
-const deepseekKey = ref('') // deepseekKey（演示语言服务密钥草稿）。
-const minimaxKey = ref('') // minimaxKey（演示语音合成密钥草稿）。
+const pendingDemoBundle = ref<{ title: string; entries: LocalDownloadItem[] } | null>(null) // pendingDemoBundle（演示下载清单）。
+const selectedDemoResources = ref(new Set<string>()) // selectedDemoResources（演示中确认的本地资源编号）。
 const taskView = ref<'pending' | 'archived'>('pending') // taskView（当前演示任务分类）。
 const tasks = ref(previewRows(demoWakeTasks, props.scene))
 const templates = computed(() => previewRows(demoSpeakerTemplates, props.scene))
@@ -71,6 +71,23 @@ function saveSpeakerRecording() {
   if (!speakerCanSubmit.value) return
   recordingPreview.value = false
   feedback('声纹资料已保存')
+}
+function openDemoBundle(bundle: { title: string; entries: LocalDownloadItem[] }) {
+  pendingDemoBundle.value = bundle
+  selectedDemoResources.value = new Set(bundle.entries
+    .filter(entry => entry.id && !entry.optional && !entry.busy && (entry.state !== 'installed' || entry.updateAvailable))
+    .map(entry => entry.id!))
+}
+function selectDemoResource(id: string, checked: boolean) {
+  const next = new Set(selectedDemoResources.value)
+  if (checked) next.add(id)
+  else next.delete(id)
+  selectedDemoResources.value = next
+}
+function confirmDemoBundle() {
+  const count = selectedDemoResources.value.size
+  feedback(`演示已确认 ${count} 项组件下载`)
+  pendingDemoBundle.value = null
 }
 const localComponents = useLocalComponentsDemo(toRef(props, 'scene'), feedback)
 watch(() => props.scene, scene => { tasks.value = previewRows(demoWakeTasks, scene); editingTask.value = ''; addingTask.value = false; cancelSpeakerRecording() })
@@ -122,10 +139,6 @@ function saveTask() {
 function deleteTask(item: DemoWakeTask) {
   tasks.value = tasks.value.filter(task => task.id !== item.id)
   feedback('归档任务已删除')
-}
-function saveKeys() {
-  deepseekKey.value = ''; minimaxKey.value = ''
-  feedback('接口密钥已保存，重启应用后生效。')
 }
 function cancelTask(item: DemoWakeTask) {
   item.status = '已取消'
@@ -249,13 +262,8 @@ function cancelTask(item: DemoWakeTask) {
       <div v-else-if="!addingTask" class="pool-empty">{{ taskView === 'pending' ? '还没有待执行任务。' : '还没有已归档任务。' }}</div>
     </template>
 
-    <template v-else-if="tab === 'models'">
-      <SettingsPageHeader section="models" />
-      <FixedModelCredentials v-model:deepseek="deepseekKey" v-model:minimax="minimaxKey" :configured="{ deepseek: props.scene !== 'empty', minimax: props.scene !== 'empty' }" :disabled="loading" :saving="loading" @save="saveKeys" />
-    </template>
-
     <template v-else-if="tab === 'compute'">
-      <LocalComponents :model="localComponents.model.value" @refresh="localComponents.refresh" @retry="localComponents.retry" @device="localComponents.device" @save="localComponents.save" @resource-download="feedback('模拟资源下载任务已开始')" @resource-import="feedback('模拟资源导入任务已开始')" @resource-import-all="feedback('模拟批量导入任务已开始')" @open-resource-source="feedback('样例不会打开外部来源页面')" @cancel-resource="feedback('模拟资源任务已取消')" />
+      <LocalComponents :model="localComponents.model.value" @refresh="localComponents.refresh" @retry="localComponents.retry" @device="localComponents.device" @save="localComponents.save" @resource-download="feedback('模拟资源下载任务已开始')" @resource-bundle-download="openDemoBundle" @resource-import="feedback('模拟资源导入任务已开始')" @resource-import-all="feedback('模拟批量导入任务已开始')" @open-resource-source="feedback('样例不会打开外部来源页面')" @cancel-resource="feedback('模拟资源任务已取消')" />
     </template>
 
     <template v-else-if="tab === 'workspace'">
@@ -269,5 +277,22 @@ function cancelTask(item: DemoWakeTask) {
         <button class="outline-button" type="button" disabled>检查更新</button>
       </section>
     </template>
+    <div v-if="pendingDemoBundle" class="demo-bundle-backdrop">
+      <section role="dialog" aria-modal="true" aria-labelledby="demo-bundle-title" class="demo-bundle-dialog">
+        <h3 id="demo-bundle-title">准备下载 {{ pendingDemoBundle.title }}</h3>
+        <p>清单列出本分类组件与共享依赖；已就绪的资源会跳过。演示不会执行真实下载。</p>
+        <ul><li v-for="entry in pendingDemoBundle.entries" :key="entry.id || entry.label">
+          <label v-if="entry.optional && entry.id && (entry.state !== 'installed' || entry.updateAvailable)" class="demo-bundle-choice"><input type="checkbox" :checked="selectedDemoResources.has(entry.id)" @change="selectDemoResource(entry.id, ($event.target as HTMLInputElement).checked)"><strong>{{ entry.label }}</strong></label>
+          <strong v-else>{{ entry.label }}</strong>
+          <span>{{ entry.busy ? '任务处理中' : entry.updateAvailable ? '需更新' : entry.state === 'installed' ? '已就绪，跳过' : entry.status || '待下载' }}</span>
+          <small v-if="entry.note">{{ entry.note }}</small>
+        </li></ul>
+        <div class="demo-bundle-actions"><button class="outline-button" type="button" @click="confirmDemoBundle">确认清单</button><button class="outline-button" type="button" @click="pendingDemoBundle = null">返回</button></div>
+      </section>
+    </div>
   </article>
 </template>
+
+<style scoped>
+.demo-bundle-backdrop{position:fixed;inset:0;z-index:100;background:#000a;display:grid;place-items:center;padding:24px}.demo-bundle-dialog{width:min(640px,100%);max-height:80vh;overflow:auto;padding:24px;border:1px solid var(--line-strong);border-radius:18px;background:var(--panel)}.demo-bundle-dialog>p,.demo-bundle-dialog li{font-size:var(--font-caption);line-height:1.7;color:var(--muted)}.demo-bundle-dialog ul{display:grid;gap:8px;padding:0;list-style:none}.demo-bundle-dialog li{display:grid;gap:4px;padding:10px 12px;border:1px solid var(--line);border-radius:10px}.demo-bundle-dialog li strong{color:var(--text)}.demo-bundle-choice{display:flex;gap:8px;align-items:center}.demo-bundle-choice input{accent-color:var(--accent)}.demo-bundle-actions{display:flex;gap:8px;justify-content:flex-end}
+</style>
