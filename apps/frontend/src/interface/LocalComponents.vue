@@ -250,13 +250,21 @@ function resourceVersionText(resource?: ManagedResourceRow) {
   return ''
 }
 function resourceRuntimeInfo(resource?: ManagedResourceRow, row?: LocalComponentRow) {
-  const parts = [resourceVersionText(resource), ...(row?.facts ?? [])
-    .filter(fact => fact.label === '进程标识')
-    .map(fact => `进程标识 ${fact.value}`)].filter(Boolean)
+  const parts = [
+    resourceVersionText(resource),
+    ...(row?.runtime && row.runtime !== '未提供' ? [`运行时 ${row.runtime}`] : []),
+    ...((row?.device?.current || !row?.device && row?.location) ? [`运行位置 ${row.device?.current || row.location}`] : []),
+    ...(row?.facts ?? [])
+      .filter(fact => fact.label === '进程标识' || fact.label === '处理器占用')
+      .map(fact => `${fact.label} ${fact.value}`),
+    ...(row?.vram ? [`显存 ${row.vram}`] : []),
+  ].filter(Boolean)
   return parts.join(' · ')
 }
 function detailFacts(row: LocalComponentRow) {
-  return row.facts.filter(fact => fact.label !== '进程标识')
+  const mergedIntoRuntimeLine = Boolean(row.resource || row.runtimeDependencies?.length)
+  return row.facts.filter(fact => !mergedIntoRuntimeLine
+    || fact.label !== '进程标识' && fact.label !== '处理器占用')
 }
 function rowState(row: LocalComponentRow) {
   const readyAlternative = hasReadyTtsAlternative(row)
@@ -422,12 +430,11 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
               <div class="local-category-observability">
                 <span class="local-state" :class="category.observation.state"><i aria-hidden="true"></i>{{ category.observation.label }}</span>
                 <dl v-if="category.observation.residentMemory || category.observation.privateMemory || category.observation.vram" class="local-category-metrics">
-                  <div class="local-category-metric-labels">
-                    <dt v-if="category.observation.residentMemory">常驻内存合计</dt><dt v-if="category.observation.privateMemory">提交内存合计</dt><dt v-if="category.observation.vram">显存合计</dt>
+                  <div v-if="category.observation.residentMemory || category.observation.privateMemory">
+                    <dt>{{ category.observation.residentMemory && category.observation.privateMemory ? '常驻内存／提交内存' : category.observation.residentMemory ? '常驻内存' : '提交内存' }}</dt>
+                    <dd>{{ [category.observation.residentMemory, category.observation.privateMemory].filter(Boolean).join(' / ') }}</dd>
                   </div>
-                  <div class="local-category-metric-values">
-                    <dd v-if="category.observation.residentMemory">{{ category.observation.residentMemory }}</dd><dd v-if="category.observation.privateMemory">{{ category.observation.privateMemory }}</dd><dd v-if="category.observation.vram">{{ category.observation.vram }}</dd>
-                  </div>
+                  <div v-if="category.observation.vram"><dt>显存</dt><dd>{{ category.observation.vram }}</dd></div>
                 </dl>
               </div>
               <button class="local-category-disclosure" type="button" :aria-expanded="expandedCategories.has(category.id)" :aria-controls="`local-category-${category.id}`" @click="toggleCategory(category.id)"><span>{{ expandedCategories.has(category.id) ? '收起' : '展开' }}</span><svg viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expandedCategories.has(category.id) }"><path d="m6 9 6 6 6-6" /></svg></button>
@@ -533,9 +540,9 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                 <div v-if="row.device" class="local-device-editor">
                   <label :for="`local-device-${row.id}`"><span>运行位置</span><select :id="`local-device-${row.id}`" :value="row.device.value" :disabled="saving || row.device.locked" @change="changeDevice(row.id, $event)"><option v-for="option in row.device.options" :key="option.value" :value="option.value" :disabled="option.disabled">{{ option.label }}</option></select></label>
                   <button class="save-button" type="button" :disabled="saving || row.device.locked || invalidDevice(row)" @click="emit('save', row.id)">{{ saving ? '保存中' : '保存' }}</button>
-                  <small>实际运行：{{ row.device.current }}<span v-if="row.device.draft"> · 草稿尚未保存</span><span v-if="row.device.pending"> · 已保存配置下次启动生效</span></small>
+                  <small v-if="row.device.draft || row.device.pending"><span v-if="row.device.draft">运行位置草稿尚未保存</span><span v-if="row.device.draft && row.device.pending"> · </span><span v-if="row.device.pending">已保存配置下次启动生效</span></small>
                 </div>
-                <div v-else class="local-location"><span>运行位置</span><strong>{{ row.location || '本机' }}</strong></div>
+                <div v-else-if="!row.resource || !resourceRuntimeInfo(row.resource, row)" class="local-location"><span>运行位置</span><strong>{{ row.location || '本机' }}</strong></div>
                 <small v-if="row.device?.hint || row.note" class="local-detail-note">{{ [row.device?.hint, row.note].filter(Boolean).join(' ') }}</small>
               </div>
             </article>
@@ -563,15 +570,15 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
 .local-category-toggle{display:block;width:100%;min-width:0;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer}
 .local-category-title{display:grid;gap:4px;min-width:0}
 .local-category-observability{display:grid;justify-items:end;align-content:center;gap:3px;min-width:0;min-height:54px}
-.local-category-metrics{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:repeat(2,auto);gap:2px;min-width:0;margin:0;text-align:right;font-variant-numeric:tabular-nums}
-.local-category-metric-labels,.local-category-metric-values{display:flex;justify-content:flex-end;gap:4px 12px;min-width:0;white-space:nowrap}
-.local-category-metric-labels dt{font-size:var(--font-caption);color:var(--subtle)}
-.local-category-metric-values dd{font-size:var(--font-body);font-weight:650;line-height:1.25}
+.local-category-metrics{display:flex;justify-content:flex-end;gap:3px 14px;min-width:0;margin:0;text-align:right;font-variant-numeric:tabular-nums}
+.local-category-metrics>div{display:grid;gap:2px;min-width:0}
+.local-category-metrics dt{font-size:var(--font-caption);color:var(--subtle);white-space:nowrap}
+.local-category-metrics dd{font-size:var(--font-body);font-weight:650;line-height:1.25;white-space:nowrap}
 .local-category-disclosure{display:inline-flex;align-items:center;justify-content:center;gap:5px;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:5px 10px;border:1px solid var(--line-strong);border-radius:9px;background:#ffffff03;color:inherit;font:inherit;font-size:var(--font-body);font-weight:600;white-space:nowrap;cursor:pointer}
 .local-category-disclosure svg{width:14px;height:14px}
 .local-category-progress{max-width:620px;margin:8px 0 0 2px}
 .local-component-provider-usage{margin:0;align-self:center}
-@container (max-width:760px){.local-category-row{grid-template-columns:minmax(0,1fr) auto auto;gap:8px}.local-category-observability{min-height:54px}.local-category-metric-labels,.local-category-metric-values{gap:3px 8px}}
+@container (max-width:760px){.local-category-row{grid-template-columns:minmax(0,1fr) auto auto;gap:8px}.local-category-observability{min-height:54px}.local-category-metrics{gap:3px 8px}}
 .local-managed-resource-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0;font-size:var(--font-caption);color:var(--muted)}
 .local-managed-resource-heading>span:first-child{min-width:0;overflow-wrap:anywhere}
 .local-runtime-dependencies .local-managed-resource-heading>strong{flex:1 1 auto;min-width:0;white-space:nowrap;overflow-wrap:normal}

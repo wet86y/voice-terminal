@@ -140,7 +140,10 @@ const minimaxUsage = computed<MiniMaxQuotaRow[]>(() => {
   const source = Array.isArray(payload.model_remains)
     ? payload.model_remains.filter(record)
     : [payload]
-  const rows = source.flatMap<MiniMaxQuotaRow>((item, index) => {
+  // model_name（模型名称）为 general（通用模型）时才是语音额度；同一响应的 video（视频）额度不用于语音合成。
+  const speechModel = source.find(item => textValue(firstValue(item, ['model_name', 'model', 'name']))?.toLowerCase() === 'general')
+    ?? source.find(item => textValue(firstValue(item, ['model_name', 'model', 'name']))?.toLowerCase() !== 'video')
+  const rows = (speechModel ? [speechModel] : []).flatMap<MiniMaxQuotaRow>((item, index) => {
     const name = textValue(firstValue(item, ['model_name', 'model', 'name'])) || `套餐 ${index + 1}`
     const interval = usageWindow(item, 'interval')
     const weekly = usageWindow(item, 'weekly')
@@ -149,7 +152,7 @@ const minimaxUsage = computed<MiniMaxQuotaRow[]>(() => {
     return remainingTokens === undefined ? [] : [{ label: name, fallback: `${remainingTokens} Token（词元）` }]
   })
 
-  if (!rows.length) {
+  if (!rows.length && !Array.isArray(payload.model_remains)) {
     const remainingTokens = displayNumber(firstValue(payload, ['tokens_remains', 'token_remains']))
     if (remainingTokens !== undefined) return [{ label: '套餐', fallback: `${remainingTokens} Token（词元）` }]
   }
@@ -222,7 +225,7 @@ watch(() => props.refreshKey, () => {
     </div>
     <div v-else-if="model.provider === 'minimax' && minimaxPlanValues.length" class="provider-usage-copy" :title="minimaxSummaryTitle">
       <div class="provider-usage-heading">{{ minimaxPlanHeading }}</div>
-      <div class="provider-usage-values"><span v-for="(row, index) in minimaxPlanValues" :key="`${row.label}-${index}`"><small>{{ row.label }}</small><strong>{{ row.value }}</strong></span></div>
+      <div class="provider-usage-values"><span v-for="(row, index) in minimaxPlanValues" :key="`${row.label}-${index}`"><small v-if="minimaxPlanValues.length > 1">{{ row.label }}</small><strong>{{ row.value }}</strong></span></div>
     </div>
     <span v-else-if="notice" class="provider-usage-note" :class="{ error: error }" :title="notice" role="status">{{ notice }}</span>
     <button v-if="model.usage" class="outline-button provider-usage-refresh" type="button" :disabled="!configured || checking || model.disabled" @click="checkUsage">
