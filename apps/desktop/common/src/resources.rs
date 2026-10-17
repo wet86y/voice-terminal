@@ -782,7 +782,7 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
         }
         downloads.push((file,path));
     }
-    crate::download::download_batch(&downloads,cancel.clone(),&mut|phase,done,total|progress(&format!("模型文件：{phase}"),done,total))?;
+    crate::download::download_batch(&downloads,cancel.clone(),&mut|phase,done,total|progress(phase,done,total))?;
     import_review_with_activation(context,&root,Some(id),cancel,progress,&mut|_|Ok(()),enable)
 }
 /// download_patched_audiocpp（官方原生包加随包补丁）：逐层校验后才原子启用，无客户机编译。

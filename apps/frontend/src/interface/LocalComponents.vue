@@ -376,7 +376,11 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
   const failed = jobs.filter(job => job.state === 'failed')
   if (!active.length && !failed.length) return undefined
   const tracked = jobs.filter(job => jobIsActive(job) || ['complete', 'completed', 'failed'].includes(job.state))
-  const measurable = tracked.length > 0 && tracked.every(job => typeof job.completedBytes === 'number'
+  const separateProgress = tracked.length > 0 && tracked.every(job => typeof job.downloadCompletedBytes === 'number'
+    && Number.isFinite(job.downloadCompletedBytes) && typeof job.downloadTotalBytes === 'number' && job.downloadTotalBytes > 0
+    && typeof job.verificationCompletedBytes === 'number' && Number.isFinite(job.verificationCompletedBytes)
+    && typeof job.verificationTotalBytes === 'number' && job.verificationTotalBytes > 0)
+  const measurable = !separateProgress && tracked.length > 0 && tracked.every(job => typeof job.completedBytes === 'number'
     && Number.isFinite(job.completedBytes) && typeof job.totalBytes === 'number' && Number.isFinite(job.totalBytes) && job.totalBytes > 0)
   const phase = active.length
     ? `正在处理 ${active.length} 项资源：${[...new Set(active.map(job => job.phase).filter(Boolean))].join(' · ')}`
@@ -384,6 +388,12 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
   return {
     id: `category-${category}`, resourceId: category, label: categoryDefinitions.find(item => item.id === category)?.title ?? category,
     state: active.length ? 'running' : 'failed', phase,
+    ...(separateProgress ? {
+      downloadCompletedBytes: tracked.reduce((total, job) => total + (job.downloadCompletedBytes ?? 0), 0),
+      downloadTotalBytes: tracked.reduce((total, job) => total + (job.downloadTotalBytes ?? 0), 0),
+      verificationCompletedBytes: tracked.reduce((total, job) => total + (job.verificationCompletedBytes ?? 0), 0),
+      verificationTotalBytes: tracked.reduce((total, job) => total + (job.verificationTotalBytes ?? 0), 0),
+    } : {}),
     ...(measurable ? {
       completedBytes: tracked.reduce((total, job) => total + (job.completedBytes ?? 0), 0),
       totalBytes: tracked.reduce((total, job) => total + (job.totalBytes ?? 0), 0),

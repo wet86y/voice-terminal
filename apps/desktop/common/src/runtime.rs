@@ -303,7 +303,7 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
     let interpreter=stage.join("python.exe");
     totals.report(progress,"核验私有解释器",0);worker(context,&interpreter,"interpreter",&[],&cancel)?;
     let transfers=wheels.iter().filter_map(|item|item.file.clone().map(|file|(file,item.target.clone()))).collect::<Vec<_>>();
-    crate::download::download_batch(&transfers,cancel.clone(),&mut|phase,done,total|progress(&format!("语音运行依赖：{phase}"),done,total))?;
+    crate::download::download_batch(&transfers,cancel.clone(),&mut|phase,done,total|progress(phase,done,total))?;
     totals.completed_bytes=totals.total_bytes;totals.current_bytes=0;
     let mut downloaded=vec![];
     for item in wheels {

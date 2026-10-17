@@ -33,6 +33,10 @@ struct JobSnapshot {
     phase: String, // phase（任务阶段说明）。
     completed_bytes: u64, // completed_bytes（已处理字节数）。
     total_bytes: Option<u64>, // total_bytes（总字节数）。
+    download_completed_bytes: Option<u64>, // download_completed_bytes（资源下载已完成字节）。
+    download_total_bytes: Option<u64>, // download_total_bytes（资源下载总字节）。
+    verification_completed_bytes: Option<u64>, // verification_completed_bytes（摘要校验已处理字节）。
+    verification_total_bytes: Option<u64>, // verification_total_bytes（摘要校验总字节）。
     error: Option<String>, // error（安全错误说明）。
     can_cancel: bool, // can_cancel（当前是否可取消）。
     installed_resources: Vec<String>, // installed_resources（本次安装资源编号）。
@@ -724,7 +728,8 @@ impl ResourceManager {
             }
             let created_at=unix_millis().max(jobs.get(&job_id).map(|job|job.snapshot.created_at.saturating_add(1)).unwrap_or(0));
             let snapshot = JobSnapshot { job_id: job_id.clone(), resource_id, state: "queued".into(), phase,
-                completed_bytes: 0, total_bytes: None, error: None, can_cancel, installed_resources: vec![],
+                completed_bytes: 0, total_bytes: None, download_completed_bytes:None,download_total_bytes:None,
+                verification_completed_bytes:None,verification_total_bytes:None,error: None, can_cancel, installed_resources: vec![],
                 import_preview: None, created_at, revision: 1 };
             jobs.insert(job_id.clone(), JobControl { snapshot: snapshot.clone(), cancel: Arc::new(AtomicBool::new(false)), child: None,
                 last_event:Instant::now(),last_persist:Instant::now() });
@@ -768,7 +773,17 @@ impl ResourceManager {
             if snapshot.state == "cancelling" { return; }
             if !terminal(&snapshot.state) { snapshot.state = "running".into(); }
             snapshot.phase = phase.into(); snapshot.can_cancel = can_cancel;
-            snapshot.completed_bytes = done; snapshot.total_bytes = total;
+            if phase.starts_with(voice_desktop_common::download::BATCH_DOWNLOAD_PROGRESS_PREFIX) {
+                snapshot.download_completed_bytes=Some(done);snapshot.download_total_bytes=total;
+                if snapshot.verification_total_bytes.is_none(){snapshot.verification_completed_bytes=Some(0);snapshot.verification_total_bytes=total;}
+            }else if phase.starts_with(voice_desktop_common::download::BATCH_VERIFY_PROGRESS_PREFIX){
+                snapshot.verification_completed_bytes=Some(done);snapshot.verification_total_bytes=total;
+                if snapshot.download_total_bytes.is_none(){snapshot.download_completed_bytes=Some(0);snapshot.download_total_bytes=total;}
+            }else{
+                snapshot.download_completed_bytes=None;snapshot.download_total_bytes=None;
+                snapshot.verification_completed_bytes=None;snapshot.verification_total_bytes=None;
+                snapshot.completed_bytes = done; snapshot.total_bytes = total;
+            }
         });
     }
 
@@ -784,6 +799,8 @@ impl ResourceManager {
             job.snapshot.can_cancel = false;
             job.snapshot.completed_bytes = done;
             job.snapshot.total_bytes = total;
+            job.snapshot.download_completed_bytes=None;job.snapshot.download_total_bytes=None;
+            job.snapshot.verification_completed_bytes=None;job.snapshot.verification_total_bytes=None;
             job.snapshot.revision = job.snapshot.revision.saturating_add(1);
             job.last_event=Instant::now();job.last_persist=Instant::now();
             let event = event_value(&job.snapshot);
@@ -845,6 +862,8 @@ impl ResourceManager {
             let installed_resources = value["installed_resources"].as_array().map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
             let snapshot = JobSnapshot { job_id: job_id.into(), resource_id: resource_id.into(), state, phase,
                 completed_bytes: value["completed_bytes"].as_u64().unwrap_or(0), total_bytes: value["total_bytes"].as_u64(),
+                download_completed_bytes:value["download_completed_bytes"].as_u64(),download_total_bytes:value["download_total_bytes"].as_u64(),
+                verification_completed_bytes:value["verification_completed_bytes"].as_u64(),verification_total_bytes:value["verification_total_bytes"].as_u64(),
                 error, can_cancel, installed_resources, import_preview: None, created_at: value["created_at"].as_u64().unwrap_or(0),revision:value["revision"].as_u64().unwrap_or(0).saturating_add(1) };
             jobs.insert(snapshot.job_id.clone(), JobControl { snapshot, cancel: Arc::new(AtomicBool::new(false)), child: None,
                 last_event:Instant::now(),last_persist:Instant::now() });
@@ -963,13 +982,17 @@ fn event_value(snapshot: &JobSnapshot) -> Value {
         "phase": snapshot.phase,
         "completed_bytes": snapshot.completed_bytes,
         "total_bytes": snapshot.total_bytes,
+        "download_completed_bytes":snapshot.download_completed_bytes,
+        "download_total_bytes":snapshot.download_total_bytes,
+        "verification_completed_bytes":snapshot.verification_completed_bytes,
+        "verification_total_bytes":snapshot.verification_total_bytes,
         "error": snapshot.error,
         "can_cancel": snapshot.can_cancel,
         "installed_resources": snapshot.installed_resources,
         "created_at": snapshot.created_at,
         "revision": snapshot.revision,
         "import_preview": snapshot.import_preview,
-        "fields":{"created_at":"本次任务创建时间，Unix 毫秒","revision":"状态修订号，拒绝迟到事件","job_id":"任务编号","resource_id":"组件编号","state":"任务状态","phase":"当前阶段","completed_bytes":"已处理字节数","total_bytes":"总字节数","error":"失败说明","can_cancel":"是否允许取消","installed_resources":"本次启用的组件编号","import_preview":"导入确认内容"},
+        "fields":{"created_at":"本次任务创建时间，Unix 毫秒","revision":"状态修订号，拒绝迟到事件","job_id":"任务编号","resource_id":"组件编号","state":"任务状态","phase":"当前阶段","completed_bytes":"其他阶段已处理字节数","total_bytes":"其他阶段总字节数","download_completed_bytes":"资源下载已完成字节数","download_total_bytes":"资源下载总字节数","verification_completed_bytes":"本地摘要校验已处理字节数","verification_total_bytes":"本地摘要校验总字节数","error":"失败说明","can_cancel":"是否允许取消","installed_resources":"本次启用的组件编号","import_preview":"导入确认内容"},
     })
 }
 

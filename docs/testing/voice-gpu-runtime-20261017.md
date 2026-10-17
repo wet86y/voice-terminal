@@ -4,7 +4,7 @@
 
 ## 安装与更新行为
 
-- 基础 CPU 依赖仍使用 `config/runtime/voice-runtime.lock.json`（基础依赖锁），可选 GPU 依赖使用 `config/runtime/voice-gpu.lock.json`（显卡依赖锁）。GPU 锁只替换 `torch` 与 `torchaudio`，单独记录版本、官方来源、文件大小和 SHA-256（安全散列摘要）。PyTorch 包约 2.75 GB（十进制），torchaudio 包约 1.67 MB；首次启用 GPU 模式需下载这两个固定包。
+- 基础 CPU 依赖仍使用 `config/runtime/voice-runtime.lock.json`（基础依赖锁），可选 GPU 依赖使用 `config/runtime/voice-gpu.lock.json`（显卡依赖锁）。GPU 锁只替换 `torch` 与 `torchaudio`，单独记录版本、官方来源、文件大小和 SHA-256（安全散列摘要）。PyTorch 包约 2.75 GB（十进制），torchaudio 包约 1.67 MB；缺失的固定包才会下载，符合摘要的缓存和已安装依赖会复用。
 - CPU 更新会保留已安装 GPU 组合；纯 CPU 环境导入不能覆盖当前 GPU 环境。候选环境内只清除旧版 PyTorch 与 torchaudio 登记文件后再安装新轮子，沿用当前下载、校验、启用与失败回滚事务。
 - Paraformer（流式识别）、SenseVoice（语音精修）和 CAM++（声纹识别）复用原模型目录与文件。依赖安装不复制权重，也不自动更改模型设备偏好。
 - ONNX Runtime（模型推理运行时）和 Sherpa-ONNX（关键词语音推理运行时）继续使用 CPU 依赖；已经验证的旧 GPU 推理环境按原兼容逻辑保留。

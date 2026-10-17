@@ -63,6 +63,11 @@ export interface ResourceJob {
   /** completed_bytes（已处理字节）及 total_bytes（总字节）；未知时为空。 */
   completed_bytes?: number | null
   total_bytes?: number | null
+  /** download_*（下载进度）；verification_*（本地摘要校验进度）。 */
+  download_completed_bytes?: number | null
+  download_total_bytes?: number | null
+  verification_completed_bytes?: number | null
+  verification_total_bytes?: number | null
   /** error（失败原因）、can_cancel（当前能否取消）。 */
   error?: string | null
   can_cancel?: boolean

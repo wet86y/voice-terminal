@@ -172,7 +172,9 @@ const model = computed<LocalComponentsModel>(() => {
           : resource?.installation_state === 'installed' && resource.update_available ? `更新 ${resource.label}`
             : resource?.label || '资源任务',
         state: job.state, phase: job.phase, completedBytes: job.completed_bytes,
-        totalBytes: job.total_bytes, error: job.error || undefined, canCancel: job.can_cancel === true,
+        totalBytes: job.total_bytes, downloadCompletedBytes: job.download_completed_bytes,
+        downloadTotalBytes: job.download_total_bytes, verificationCompletedBytes: job.verification_completed_bytes,
+        verificationTotalBytes: job.verification_total_bytes, error: job.error || undefined, canCancel: job.can_cancel === true,
       }
     }),
     rows,
