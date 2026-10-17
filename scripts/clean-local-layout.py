@@ -19,7 +19,7 @@ LEGACY = ['.runtime', 'archive', '.pytest_cache', 'logs', 'reports', 'workspace'
           '.local/tmp/layout-migration.json', '.local/tmp/native-tests']
 PROTECTED = ['.git', '.local/app', '.local/runtimes', '.local/models', '.local/data/config', '.local/data/persona',
              '.local/data/speaker', '.local/data/history', '.local/data/dsh', '.local/data/workspace', '.local/data/imports',
-             '.local/backups/user-data', '.local/build', '.local/tools', 'node_modules', 'docs/download-distribution-plan.md']
+             '.local/backups/user-data', '.local/build', '.local/tools', 'node_modules']
 
 
 def protect_source_data(local: Path):

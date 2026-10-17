@@ -101,10 +101,9 @@ console.log(JSON.stringify({sessions,records,original_records:before.length,appe
     previous_path = data / 'state/layout-data-acceptance.json'
     previous = json.loads(previous_path.read_text(encoding='utf-8')) if previous_path.exists() else {}
     report = {'schema': 1, 'files': verified, 'sessions': sessions, 'first_sessions': previous.get('first_sessions', previous.get('sessions', sessions)), 'restored_files': len(saved['files']),
-              'draft_sha256': digest(ROOT / 'docs/download-distribution-plan.md'),
               'fields': {'schema': '验收格式', 'files': '原持久文件逐项摘要', 'path': '相对数据路径', 'before': '迁移前摘要', 'after': '现用摘要',
                          'reason': '变化说明', 'sessions': '代理会话读取结果', 'first_sessions': '首次迁移验收会话记录证明', 'records': '读取记录数量', 'original_records': '原会话保留记录', 'appended_records': '正常恢复追加记录',
-                         'restored_files': '隔离目录恢复并验证数量', 'draft_sha256': '保留且不提交的用户草稿摘要'}}
+                         'restored_files': '隔离目录恢复并验证数量'}}
     atomic_json(data / 'state/layout-data-acceptance.json', report)
     print(f'原持久文件核对通过：{len(verified)}；代理会话：{sessions["sessions"]}；隔离恢复验证：{len(saved["files"])} 个文件。')
 
