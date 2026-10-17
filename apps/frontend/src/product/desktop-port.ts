@@ -95,6 +95,21 @@ export interface DesktopEvent<T> {
 
 export const RESOURCE_PROGRESS_EVENT = 'desktop://resource-progress'
 export const WORKSPACE_PROGRESS_EVENT = 'desktop://workspace-progress'
+export const APP_UPDATE_EVENT = 'desktop://app-update-progress'
+
+/** AppUpdateStatus（应用更新状态）：检查结果、发行说明和安装器下载进度。 */
+export interface AppUpdateStatus {
+  state: 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'handing_off' | 'cancelled' | 'failed'
+  current_version: string
+  target_version?: string | null
+  release_notes?: string | null
+  completed_bytes?: number | null
+  total_bytes?: number | null
+  phase?: string | null
+  error?: string | null
+  can_cancel?: boolean
+  fields: Record<string, string>
+}
 
 /** DesktopPort（桌面交互接口）：正式产品入口通过桌面预检后才调用原生命令。 */
 export interface DesktopPort {
@@ -149,6 +164,13 @@ export interface DesktopWorkspacePort {
   cancelResource(jobId: string): Promise<void>
   /** listen（订阅桌面事件）：组件卸载时调用返回的 unlisten（取消订阅）函数。 */
   listen<T>(eventName: string, handler: (event: DesktopEvent<T>) => void): Promise<() => void>
+}
+
+/** DesktopUpdatePort（应用更新接口）：下载后由分发安装器接管现有工作区。 */
+export interface DesktopUpdatePort {
+  checkAppUpdate(): Promise<AppUpdateStatus>
+  downloadAppUpdate(): Promise<AppUpdateStatus>
+  cancelAppUpdate(): Promise<void>
 }
 export interface ResourceInstallPlan {
   resource_id: string // resource_id（资源编号）。
@@ -215,7 +237,7 @@ export function desktopPort(): DesktopPort {
         throw error instanceof Error ? error : new Error(typeof error === 'string' ? error : '原生命令执行失败。')
       })
       : Promise.reject(new Error('此操作需要桌面窗口。'))
-  const port: DesktopPort & DesktopWorkspacePort & DesktopEnvironmentPort & DesktopCredentialsPort = {
+  const port: DesktopPort & DesktopWorkspacePort & DesktopEnvironmentPort & DesktopCredentialsPort & DesktopUpdatePort = {
     available: Boolean(native),
     focus: () => call('focus_main'),
     openLogs: () => call('open_logs'),
@@ -249,6 +271,9 @@ export function desktopPort(): DesktopPort {
     showManagement: () => call('desktop_manage'),
     fixedCredentials: () => call('model_credentials_status'),
     saveFixedCredentials: request => call('model_credentials_save', { request }),
+    checkAppUpdate: () => call<AppUpdateStatus>('app_update_check'),
+    downloadAppUpdate: () => call<AppUpdateStatus>('app_update_download'),
+    cancelAppUpdate: () => call('app_update_cancel'),
     listen: async <T>(eventName: string, handler: (event: DesktopEvent<T>) => void) => {
       const eventWindow = typeof window === 'undefined' ? undefined : window as NativeEventWindow
       const eventRuntime = eventWindow?.__TAURI_INTERNALS__

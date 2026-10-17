@@ -1,11 +1,14 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   desktopPort,
+  APP_UPDATE_EVENT,
   RESOURCE_PROGRESS_EVENT,
   WORKSPACE_PROGRESS_EVENT,
   type DesktopPort,
   type DesktopWorkspacePort,
   type DesktopEnvironmentPort,
+  type DesktopUpdatePort,
+  type AppUpdateStatus,
   type ResourceJob,
   type ResourceStatus,
   type ResourceInstallPlan,
@@ -30,7 +33,7 @@ export interface ResourceDownloadBundlePlan {
 
 /** useWorkspaceResources（工作区与资源控制器）：原生操作不依赖 Voice（语音服务）接口。 */
 export function useWorkspaceResources() {
-  const port = desktopPort() as DesktopPort & DesktopWorkspacePort & DesktopEnvironmentPort
+  const port = desktopPort() as DesktopPort & DesktopWorkspacePort & DesktopEnvironmentPort & DesktopUpdatePort
   const workspace = ref<WorkspaceInfo | null>(null)
   const resources = ref<ResourceStatus[]>([])
   const resourceJobs = ref<ResourceJob[]>([])
@@ -42,6 +45,13 @@ export function useWorkspaceResources() {
   const resourceError = ref('')
   const workspaceError = ref('')
   const eventError = ref('')
+  const appUpdate = ref<AppUpdateStatus>({
+    state: 'idle', current_version: '', fields: {
+      state: '更新阶段', current_version: '当前程序版本', target_version: '目标程序版本',
+      release_notes: '发行说明', phase: '当前处理阶段', completed_bytes: '已下载字节数', total_bytes: '安装器总字节数',
+      error: '更新错误', can_cancel: '当前是否允许取消',
+    },
+  })
   const startingResources = ref(new Set<string>())
   const workspaceOperationStarting = ref(false)
   const pendingImport = computed(() => resourceJobs.value.find(job => job.import_preview?.length && !TERMINAL_JOB_STATES.has(job.state)) ?? null)
@@ -51,6 +61,7 @@ export function useWorkspaceResources() {
   let mounted = false
   let unlistenResource: (() => void) | undefined
   let unlistenWorkspace: (() => void) | undefined
+  let unlistenAppUpdate: (() => void) | undefined
   let unlistenRequests: Promise<void>[] = []
   let refreshRequest: Promise<void> | null = null
   let inventoryRefreshRequest: Promise<void> | null = null
@@ -148,6 +159,7 @@ export function useWorkspaceResources() {
     if (!port.available) return
     try {
       workspace.value = await port.workspaceInfo()
+      if (!appUpdate.value.current_version) appUpdate.value.current_version = workspace.value.version
       workspaceError.value = ''
     } catch (error) {
       workspaceError.value = error instanceof Error ? error.message : '无法读取工作区信息。'
@@ -204,6 +216,7 @@ export function useWorkspaceResources() {
     if (!port.available) return
     let resourceUnlisten: (() => void) | undefined
     let workspaceUnlisten: (() => void) | undefined
+    let updateUnlisten: (() => void) | undefined
     try {
       resourceUnlisten = await port.listen<ResourceJob>(
         RESOURCE_PROGRESS_EVENT,
@@ -218,16 +231,23 @@ export function useWorkspaceResources() {
         WORKSPACE_PROGRESS_EVENT,
         event => upsertWorkspaceJob(event.payload),
       )
+      updateUnlisten = await port.listen<AppUpdateStatus>(
+        APP_UPDATE_EVENT,
+        event => { if (mounted) appUpdate.value = event.payload },
+      )
       if (!mounted) {
         resourceUnlisten()
         workspaceUnlisten()
+        updateUnlisten()
         return
       }
       unlistenResource = resourceUnlisten
       unlistenWorkspace = workspaceUnlisten
+      unlistenAppUpdate = updateUnlisten
     } catch (error) {
       resourceUnlisten?.()
       workspaceUnlisten?.()
+      updateUnlisten?.()
       eventError.value = error instanceof Error ? error.message : '无法订阅桌面任务进度。'
     }
   }
@@ -249,9 +269,36 @@ export function useWorkspaceResources() {
     window.removeEventListener('focus', refreshOnFocus)
     unlistenResource?.()
     unlistenWorkspace?.()
+    unlistenAppUpdate?.()
     unlistenResource = undefined
     unlistenWorkspace = undefined
+    unlistenAppUpdate = undefined
   })
+
+  async function checkAppUpdate() {
+    if (!port.available || workspaceOperationStarting.value || activeWorkspaceJob.value) return
+    appUpdate.value = { ...appUpdate.value, state: 'checking', error: null }
+    try { appUpdate.value = await port.checkAppUpdate() }
+    catch (error) {
+      appUpdate.value = { ...appUpdate.value, state: 'failed', error: error instanceof Error ? error.message : '检查更新失败。' }
+    }
+  }
+
+  async function downloadAppUpdate() {
+    if (!port.available || workspaceOperationStarting.value || activeWorkspaceJob.value) return
+    try { appUpdate.value = await port.downloadAppUpdate() }
+    catch (error) {
+      appUpdate.value = { ...appUpdate.value, state: 'failed', error: error instanceof Error ? error.message : '无法开始下载更新。' }
+    }
+  }
+
+  async function cancelAppUpdate() {
+    if (!appUpdate.value.can_cancel) return
+    try { await port.cancelAppUpdate() }
+    catch (error) {
+      appUpdate.value = { ...appUpdate.value, error: error instanceof Error ? error.message : '取消更新失败。' }
+    }
+  }
 
   async function chooseWorkspace() {
     if (!canManage.value || workspaceOperationStarting.value || activeWorkspaceJob.value) return null
@@ -434,6 +481,10 @@ export function useWorkspaceResources() {
     resourceError,
     workspaceError,
     eventError,
+    appUpdate,
+    checkAppUpdate,
+    downloadAppUpdate,
+    cancelAppUpdate,
     startingResources,
     workspaceOperationStarting,
     refresh,

@@ -7,6 +7,7 @@ use std::{
 };
 
 pub mod download;
+pub mod app_update; // app_update（应用更新）：读取 GitHub 发行清单并校验分发安装器元数据。
 pub mod native_ui;
 pub mod workspace;
 pub mod runtime; // runtime（私有语音环境）：安装计划、校验及事务启用。

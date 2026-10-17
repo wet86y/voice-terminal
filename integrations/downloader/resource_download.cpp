@@ -160,3 +160,31 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
         return -1;
     }
 }
+
+// vt_fetch_manifest（读取应用更新清单）：固定 HTTPS（加密传输）地址、响应大小和超时。
+extern "C" int vt_fetch_manifest(const char* url, unsigned char* output, std::size_t output_size,
+    char* error, std::size_t error_size) noexcept {
+    try {
+        if (!url || !*url || !output || output_size < 2) throw std::runtime_error("更新清单请求参数无效");
+        desktop_update_kit::HttpRequest request{std::string(url)};
+        request.connect_timeout = std::chrono::seconds(12);
+        request.idle_timeout = std::chrono::seconds(20);
+        request.max_body_bytes = output_size - 1;
+        auto transport = desktop_update_kit::make_winhttp_transport(L"VoiceTerminal-Updates/0.9");
+        std::size_t written{};
+        const auto response = transport->get(request, [&](std::span<const std::byte> chunk) {
+            if (chunk.size() > output_size - 1 - written) throw std::runtime_error("更新清单超出允许大小");
+            std::memcpy(output + written, chunk.data(), chunk.size());
+            written += chunk.size();
+        });
+        if (response.status != 200) throw std::runtime_error("GitHub 发行清单请求失败（HTTP 状态 " + std::to_string(response.status) + "）");
+        output[written] = 0;
+        return static_cast<int>(written);
+    } catch (const std::exception& exc) {
+        if (error && error_size) { std::strncpy(error, exc.what(), error_size - 1); error[error_size - 1] = 0; }
+        return -1;
+    } catch (...) {
+        if (error && error_size) { std::strncpy(error, "读取 GitHub 发行清单失败", error_size - 1); error[error_size - 1] = 0; }
+        return -1;
+    }
+}
