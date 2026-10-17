@@ -15,8 +15,21 @@ function model(): LocalComponentsModel {
   }
 }
 
+async function expandCategory(wrapper: ReturnType<typeof mount>, category: string) {
+  const toggle = wrapper.get(`[data-category="${category}"] .local-category-toggle`)
+  if (toggle.attributes('aria-expanded') !== 'true') await toggle.trigger('click')
+}
+
+async function expandComponent(wrapper: ReturnType<typeof mount>, category: string, id: string) {
+  await expandCategory(wrapper, category)
+  const card = wrapper.get(`[data-component="${id}"]`)
+  const toggle = card.get('.local-component-action')
+  if (toggle.attributes('aria-expanded') !== 'true') await toggle.trigger('click')
+  return card
+}
+
 describe('LocalComponents（本地组件）运行环境与导入入口', () => {
-  it('语音合成始终可展开详情，按选择下载模型，不选时不提交下载', async () => {
+  it('语音合成在分类详情中列出模型，分类下载清单包含可选本地资源', async () => {
     const value = model()
     value.rows = [{ id: 'tts', name: 'TTS（语音合成）', state: 'failed', status: '待配置', available: true,
       runtime: '在线或本地', description: '任一本地模型或在线接口可用即可启动。', facts: [],
@@ -27,28 +40,25 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
       sharedResource: { id: 'tts-audiocpp-runtime', label: 'audio.cpp（共用运行程序）', state: 'missing', status: '缺失', required: false },
     }]
     const wrapper = mount(LocalComponents, { props: { model: value } })
-    await wrapper.get('.local-component-action').trigger('click')
-    const select = wrapper.get('select')
-    expect((select.element as HTMLSelectElement).value).toBe('')
-    expect(wrapper.find('[data-resource="tts-voxcpm2"]').exists()).toBe(false)
-    expect(wrapper.find('[data-resource="tts-audiocpp-runtime"]').exists()).toBe(false)
-    await select.setValue('tts-voxcpm2')
-    await wrapper.get('[data-resource="tts-voxcpm2"] button').trigger('click')
+    const card = await expandComponent(wrapper, 'tts', 'tts')
+    expect(card.find('select').exists()).toBe(false)
+    expect(card.find('[data-resource="tts-voxcpm2"]').exists()).toBe(true)
+    expect(card.find('[data-resource="tts-voxcpm1"]').exists()).toBe(true)
+    await card.get('[data-resource="tts-voxcpm2"] .managed-resource-actions button').trigger('click')
     expect(wrapper.emitted('resourceDownload')).toEqual([['tts-voxcpm2']])
-    await select.setValue('tts-voxcpm1')
-    expect(wrapper.find('[data-resource="tts-voxcpm2"]').exists()).toBe(false)
-    expect(wrapper.find('[data-resource="tts-voxcpm1"]').exists()).toBe(true)
-    await select.setValue('')
-    expect(wrapper.emitted('resourceDownload')).toHaveLength(1)
+    await wrapper.get('[data-category="tts"] .category-download').trigger('click')
+    const bundle = wrapper.emitted('resourceBundleDownload')?.[0]?.[0] as { entries: Array<{ id?: string; optional?: boolean }> }
+    expect(bundle.entries.filter(entry => entry.id).map(entry => entry.id)).toEqual(['tts-voxcpm2', 'tts-voxcpm1'])
+    expect(bundle.entries.filter(entry => entry.id).every(entry => entry.optional)).toBe(true)
     wrapper.unmount()
   })
   it('全部安装就绪后隐藏批量导入，并保持语音服务详情入口', async () => {
     const wrapper = mount(LocalComponents, { props: { model: model() } })
     expect(wrapper.find('.resource-batch-import').exists()).toBe(false)
     expect(wrapper.find('.local-install-actions').exists()).toBe(false)
-    await wrapper.get('[data-component="voice-system"] .local-component-action').trigger('click')
-    expect(wrapper.get('.local-managed-resource').text()).toContain('已配置')
-    expect(wrapper.emitted('resourceRefresh')).toEqual([[]])
+    const card = await expandComponent(wrapper, 'voice-server', 'voice-system')
+    expect(card.get('.local-managed-resource').text()).toContain('已配置')
+    expect(wrapper.emitted('resourceRefresh')).toEqual([[], []])
     wrapper.unmount()
   })
 
@@ -57,8 +67,9 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     value.rows[0].resource!.state = 'incomplete'
     const wrapper = mount(LocalComponents, { props: { model: value } })
     expect(wrapper.find('.resource-batch-import').exists()).toBe(true)
-    await wrapper.get('button[aria-label="Voice Server（语音服务）：下载"]').trigger('click')
-    await wrapper.get('button[aria-label="Voice Server（语音服务）：导入"]').trigger('click')
+    const card = await expandComponent(wrapper, 'voice-server', 'voice-system')
+    await card.get('button[aria-label="Voice Server（语音服务）：下载"]').trigger('click')
+    await card.get('button[aria-label="Voice Server（语音服务）：导入"]').trigger('click')
     expect(wrapper.emitted('resourceDownload')).toEqual([['voice-server']])
     expect(wrapper.emitted('resourceImport')).toEqual([['voice-server']])
     const complete = model()
@@ -85,7 +96,7 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     value.rows[0].resource!.error = '旧安装错误'
     value.managedResourceJobs = [{ id: 'env-all', resourceId: 'voice-server', label: '语音环境', state: 'running', phase: '计算本次依赖总下载量', canCancel: true }]
     const wrapper = mount(LocalComponents, { props: { model: value } })
-    const card = wrapper.get('[data-component="voice-system"]')
+    const card = await expandComponent(wrapper, 'voice-server', 'voice-system')
     expect(card.get('[data-job="env-all"]').text()).toContain('计算本次依赖总下载量')
     expect(card.get('[role="progressbar"]').attributes('aria-valuenow')).toBeUndefined()
     expect(card.text()).not.toContain('旧安装错误')
@@ -105,14 +116,14 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     const active = { id: 'env-new', resourceId: 'voice-server', label: '语音环境', state: 'running', phase: '正在下载语音运行依赖', completedBytes: 50, totalBytes: 100, canCancel: true }
     value.managedResourceJobs = [active, { ...active, id: 'env-old', state: 'failed', error: '旧失败' }]
     const wrapper = mount(LocalComponents, { props: { model: value } })
+    const card = await expandComponent(wrapper, 'voice-server', 'voice-system')
     expect(wrapper.findAll('[data-job]')).toHaveLength(1)
     expect(wrapper.get('[data-job]').attributes('data-job')).toBe('env-new')
     expect(wrapper.text()).not.toContain('旧失败')
     await wrapper.setProps({ model: { ...model(), managedResourceJobs: [{ ...active, state: 'complete', canCancel: false }] } })
     expect(wrapper.find('[data-job]').exists()).toBe(false)
     expect(wrapper.find('.local-install-actions').exists()).toBe(false)
-    await wrapper.get('.local-component-action').trigger('click')
-    expect(wrapper.get('.local-component-detail').text()).toContain('完整语音运行环境')
+    expect(card.get('.local-component-detail').text()).toContain('完整语音运行环境')
     wrapper.unmount()
   })
 
@@ -121,7 +132,7 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     value.rows[0].resource!.state = 'missing'
     value.managedResourceJobs = [{ id: 'env-all', resourceId: 'voice-server', label: '语音环境', state: 'failed', phase: '资源处理失败', error: '_socket（网络基础扩展）无法加载', canCancel: false }]
     const wrapper = mount(LocalComponents, { props: { model: value } })
-    const card = wrapper.get('[data-component="voice-system"]')
+    const card = await expandComponent(wrapper, 'voice-server', 'voice-system')
     expect(card.get('[role="alert"]').text()).toContain('_socket（网络基础扩展）无法加载')
     expect(card.get('button[aria-label="Voice Server（语音服务）：下载"]').text()).toBe('重试下载')
     await card.get('button[aria-label="Voice Server（语音服务）：下载"]').trigger('click')
@@ -147,13 +158,13 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
       resource: { id: 'paraformer-streaming', label: 'Paraformer（流式识别）', state: 'installed', status: '已安装',
         updateAvailable: true, installedVersion: '1.0.0', targetVersion: '1.1.0' } })
     const wrapper = mount(LocalComponents, { props: { model: value } })
-    const card = wrapper.get('[data-component="paraformer"]')
+    const card = await expandComponent(wrapper, 'speech', 'paraformer')
     expect(wrapper.find('.resource-batch-import').exists()).toBe(true)
     expect(card.get('.local-state').text()).toBe('需更新')
     expect(card.get('button[aria-label="Paraformer（流式识别）：更新"]').text()).toBe('更新')
     expect(card.get('button[aria-label="Paraformer（流式识别）：导入"]').text()).toBe('导入')
-    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').text()).toBe('跳转')
-    expect(card.find('.local-component-action').exists()).toBe(false)
+    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').text()).toBe('来源说明')
+    expect(card.get('.local-component-action').text()).toContain('收起详情')
     expect(card.text()).not.toContain('可更新')
     await card.get('button[aria-label="Paraformer（流式识别）：更新"]').trigger('click')
     await card.get('button[aria-label="Paraformer（流式识别）：导入"]').trigger('click')
@@ -170,7 +181,7 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
       status: '已安装', updateAvailable: true, installedVersion: '1.0.0', targetVersion: '1.1.0' }
     value.rows.push({ ...value.rows[0]!, id: 'paraformer', name: 'Paraformer（流式识别）', resource })
     const wrapper = mount(LocalComponents, { props: { model: value } })
-    const card = wrapper.get('[data-component="paraformer"]')
+    const card = await expandComponent(wrapper, 'speech', 'paraformer')
     await card.get('button[aria-label="Paraformer（流式识别）：更新"]').trigger('click')
     await wrapper.setProps({ model: { ...value, managedResourceJobs: [{ id: 'update-1', resourceId: resource.id,
       label: '更新 Paraformer', state: 'running', phase: '正在安装新模型', completedBytes: 50, totalBytes: 100, canCancel: true }],
@@ -191,11 +202,11 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     value.managedResourceJobs = [{ id: 'update-failed', resourceId: 'paraformer-streaming', label: '更新 Paraformer',
       state: 'failed', phase: '更新失败', error: '更新校验失败', canCancel: false }]
     const wrapper = mount(LocalComponents, { props: { model: value } })
-    const card = wrapper.get('[data-component="paraformer"]')
+    const card = await expandComponent(wrapper, 'speech', 'paraformer')
     expect(card.get('.local-state').text()).toBe('需更新')
     expect(card.get('button[aria-label="Paraformer（流式识别）：更新"]').text()).toBe('重试更新')
     expect(card.get('button[aria-label="Paraformer（流式识别）：导入"]').text()).toBe('导入')
-    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').text()).toBe('跳转')
+    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').text()).toBe('来源说明')
     expect(card.text()).toContain('更新校验失败')
     wrapper.unmount()
   })
@@ -209,12 +220,13 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     value.managedResourceJobs = [{ id: 'env-all', resourceId: 'voice-server', label: '语音环境',
       state: 'running', phase: '正在下载语音运行依赖', canCancel: true }]
     const wrapper = mount(LocalComponents, { props: { model: value } })
-    const button = wrapper.get('button[aria-label="Paraformer（流式语音识别）：下载"]')
+    const card = await expandComponent(wrapper, 'speech', 'paraformer')
+    const button = card.get('button[aria-label="流式识别模型：下载"]')
     expect(button.attributes('disabled')).toBeUndefined()
     expect(button.text()).toBe('下载')
     await button.trigger('click')
     expect(wrapper.emitted('resourceDownload')).toEqual([['paraformer-streaming']])
-    expect(wrapper.get('[data-component="voice-system"]').find('.local-install-actions').exists()).toBe(false)
+    expect(wrapper.find('[data-category="voice-server"] .local-install-actions').exists()).toBe(false)
     wrapper.unmount()
   })
 })

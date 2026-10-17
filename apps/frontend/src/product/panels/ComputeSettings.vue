@@ -240,13 +240,14 @@ const rows = computed<LocalComponentRow[]>(() => {
     sharedResource: managedResource('tts-audiocpp-runtime'), facts: [],
     note: '本地运行程序独立计量；下载不会自动热切换当前模型。',
   })
+  const startupLoading = application.snapshot.value?.startup_complete === false
   components.push({
     id: 'deepseek', name: 'DeepSeek 在线 API（推理接口）', category: 'inference',
-    state: providerLoading.value ? 'loading' : providerConfigured.value.deepseek ? 'ready' : 'failed',
-    status: providerLoading.value ? '读取配置中' : providerConfigured.value.deepseek ? '已配置' : '待配置',
-    available: providerConfigured.value.deepseek, busy: providerLoading.value,
+    state: startupLoading || providerLoading.value ? 'loading' : providerConfigured.value.deepseek ? 'ready' : 'failed',
+    status: startupLoading ? '启动中' : providerLoading.value ? '读取配置中' : providerConfigured.value.deepseek ? '已配置' : '待配置',
+    available: providerConfigured.value.deepseek, busy: startupLoading || providerLoading.value,
     runtime: '在线 API（推理接口）',
-    description: '配置 DeepSeek 接口密钥并查询账户余额。密钥由服务端安全保存，不会返回页面。',
+    description: startupLoading ? '正在加载组件' : '配置 DeepSeek 接口密钥并查询账户余额。密钥由服务端安全保存，不会返回页面。',
     facts: [], provider: providerSettings('deepseek'),
   })
   // 能力行：模型行未覆盖的能力（音频、合成、主模型等）单独呈现，并可只恢复该能力。

@@ -23,12 +23,25 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
   const environment = vi.fn()
   const saveCredentials = vi.fn()
 
+  async function expandCategory(category: string) {
+    const toggle = wrapper!.get(`[data-category="${category}"] .local-category-toggle`)
+    if (toggle.attributes('aria-expanded') !== 'true') await toggle.trigger('click')
+  }
+
+  async function expandComponent(id: string, category: string) {
+    await expandCategory(category)
+    const card = wrapper!.get(`[data-component="${id}"]`)
+    const toggle = card.get('.local-component-action')
+    if (toggle.attributes('aria-expanded') !== 'true') await toggle.trigger('click')
+    return card
+  }
+
   beforeEach(() => {
     inventory = [row('voice-server', 'Voice Server（语音服务）'), row('paraformer-streaming', 'Paraformer（流式识别）'), row('sensevoice-small', 'SenseVoice（精修模型）')]
     jobs = []
     configured = { deepseek: true, minimax: true }
     saveCredentials.mockReset().mockImplementation(async (request: { deepseek_api_key: string; minimax_api_key: string }) => {
-      configured = { deepseek: configured.deepseek || Boolean(request.deepseek_api_key.trim()), minimax: configured.minimax || Boolean(request.minimax_api_key.trim()) }
+      configured = { deepseek: configured.deepseek || Boolean(request.deepseek_api_key?.trim()), minimax: configured.minimax || Boolean(request.minimax_api_key?.trim()) }
       return { providers: { deepseek: { configured: configured.deepseek }, minimax: { configured: configured.minimax } }, vault_available: true }
     })
     start.mockReset().mockResolvedValue(undefined)
@@ -88,7 +101,8 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     wrapper = mount(ManagementApp)
     await flushPromises()
     expect(wrapper.get('.start-program').attributes('disabled')).toBeUndefined()
-    expect(wrapper.text()).toContain('可选组件，缺失或待更新不阻塞启动')
+    const campplus = await expandComponent('campplus', 'extensions')
+    expect(campplus.get('.local-component-detail').text()).toContain('可选组件，缺失或待更新不阻塞启动')
     await wrapper.get('.start-program').trigger('click')
     expect(start).toHaveBeenCalledOnce()
   })
@@ -149,6 +163,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     resourceEvent?.({ payload: { job_id: 'shared-install', resource_id: 'paraformer-streaming', state: 'running', phase: '下载模型文件', created_at: 100, revision: 3, installed_resources: ['voice-server'] } })
     await flushPromises()
     expect(inventoryRead).toHaveBeenCalledTimes(2)
+    await expandCategory('voice-server')
     expect(wrapper.get('[data-component="voice-system"] .local-state').text()).toBe('已就绪')
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
   })
@@ -167,7 +182,8 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     send('running', 200, 1)
     send('complete', 100, 10)
     await flushPromises()
-    expect(wrapper.get('[data-job="same-download"]').text()).toContain('下载中')
+    const voice = await expandComponent('voice-system', 'voice-server')
+    expect(voice.get('[data-job="same-download"]').text()).toContain('下载中')
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
     send('complete', 200, 2)
     await flushPromises()
@@ -208,7 +224,10 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     await flushPromises()
     expect(snapshots).toHaveBeenCalledTimes(2)
     expect(wrapper.find('[data-job="environment"]').exists()).toBe(false)
-    expect(wrapper.find('[data-job="model"]').exists()).toBe(true)
+    const voice = await expandComponent('voice-system', 'voice-server')
+    const model = await expandComponent('paraformer', 'speech')
+    expect(voice.find('[data-job="environment"]').exists()).toBe(false)
+    expect(model.find('[data-job="model"]').exists()).toBe(true)
   })
 
   it('磁盘清单读取超过两秒时，持续进度不叠加补查或不断丢弃当前结果', async () => {
@@ -232,6 +251,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     finishRead(inventory)
     await flushPromises()
     expect(inventoryRead).toHaveBeenCalledTimes(2)
+    await expandCategory('voice-server')
     expect(wrapper.get('[data-component="voice-system"] .local-state').text()).toBe('已就绪')
   })
 
@@ -246,11 +266,11 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     await flushPromises()
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
     expect(wrapper.get('.management-start').text()).toContain('有组件需更新并通过校验后才能启动语音服务')
-    const card = wrapper.get('[data-component="sensevoice-small"]')
+    const card = await expandComponent('sensevoice', 'speech')
     expect(card.get('.local-state').text()).toBe('需更新')
     expect(card.get('button[aria-label="SenseVoice（精修模型）：更新"]').text()).toBe('更新')
     expect(card.get('button[aria-label="SenseVoice（精修模型）：导入"]').text()).toBe('导入')
-    expect(card.get('button[aria-label="SenseVoice（精修模型）：跳转官方来源"]').text()).toBe('跳转')
+    expect(card.get('button[aria-label="SenseVoice（精修模型）：跳转官方来源"]').text()).toBe('来源说明')
     await card.get('button[aria-label="SenseVoice（精修模型）：更新"]').trigger('click')
     await flushPromises()
     expect(wrapper.get('#install-plan-title').text()).toContain('准备更新 SenseVoice')
@@ -280,7 +300,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
       row('sensevoice-small', 'SenseVoice（精修模型）', true)]
     wrapper = mount(ManagementApp)
     await flushPromises()
-    const card = wrapper.get('[data-component="paraformer-streaming"]')
+    const card = await expandComponent('paraformer', 'speech')
     const button = card.get('button[aria-label="Paraformer（流式识别）：下载"]')
     expect(button.text()).toBe('下载')
     await button.trigger('click')
@@ -307,7 +327,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     await flushPromises()
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
     expect(wrapper.get('.management-start').text()).toContain('有组件需更新并通过校验后才能启动语音服务')
-    const card = wrapper.get('[data-component="sensevoice-small"]')
+    const card = await expandComponent('sensevoice', 'speech')
     expect(card.get('.local-state').text()).toBe('需更新')
     expect(card.get('button[aria-label="SenseVoice（精修模型）：更新"]').text()).toBe('重试更新')
     expect(start).not.toHaveBeenCalled()
@@ -325,11 +345,11 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     wrapper = mount(ManagementApp)
     await flushPromises()
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
-    const card = wrapper.get('[data-component="voice-system"]')
+    const card = await expandComponent('voice-system', 'voice-server')
     expect(card.get('.local-state').text()).toBe('需更新')
     expect(card.get('button[aria-label="Voice Server（语音服务）：更新"]').text()).toBe('更新')
     expect(card.get('button[aria-label="Voice Server（语音服务）：导入"]').text()).toBe('导入')
-    expect(card.get('button[aria-label="Voice Server（语音服务）：跳转官方来源"]').text()).toBe('跳转')
+    expect(card.get('button[aria-label="Voice Server（语音服务）：跳转官方来源"]').text()).toBe('来源说明')
     await card.get('button[aria-label="Voice Server（语音服务）：更新"]').trigger('click')
     await flushPromises()
     expect(wrapper.get('#install-plan-title').text()).toBe('准备更新 Voice Server（语音服务）')
@@ -351,10 +371,13 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
       { job_id: 'old-failure', resource_id: 'sensevoice-small', state: 'failed', phase: '失败', error: '旧下载失败' }]
     wrapper = mount(ManagementApp)
     await flushPromises()
-    expect(wrapper.get('[data-job="environment-all"]').text()).toContain('50%')
+    const voice = await expandComponent('voice-system', 'voice-server')
+    expect(voice.get('[data-job="environment-all"]').text()).toContain('50%')
     expect(wrapper.text()).not.toContain('旧下载失败')
     for (const name of ['Paraformer（流式识别）', 'SenseVoice（精修模型）']) {
-      const button = wrapper.get(`button[aria-label="${name}：下载"]`)
+      const id = name.startsWith('Paraformer') ? 'paraformer' : 'sensevoice'
+      const card = await expandComponent(id, 'speech')
+      const button = card.get(`button[aria-label="${name}：下载"]`)
       expect(button.attributes('disabled')).toBeUndefined()
       await button.trigger('click')
       await flushPromises()
@@ -399,7 +422,8 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
     expect(wrapper.find('[data-provider="deepseek"] .provider-key-state').text()).toBe('已配置')
     expect(wrapper.get('.start-program').attributes('disabled')).toBeDefined()
     expect(start).not.toHaveBeenCalled()
-    expect(wrapper.get('[data-job="model-download"]').text()).toContain('40%')
+    const model = await expandComponent('paraformer', 'speech')
+    expect(model.get('[data-job="model-download"]').text()).toContain('40%')
   })
 
   it('组件完备但缺少密钥时可在 DeepSeek 与 MiniMax 详情配置后启动', async () => {
