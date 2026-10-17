@@ -127,7 +127,6 @@ export function useProductControls() {
     setReasoningMode,
     toggleProviderReasoning,
     saveWake,
-    saveScreenCapture,
     saveSilence,
     quietHoursForm,
     quietStatus,
@@ -1720,7 +1719,6 @@ export function useProductControls() {
     clearSession,
     setReasoningMode,
     saveWake,
-    saveScreenCapture,
     saveSilence,
     quietHoursForm,
     quietStatus,
@@ -1819,6 +1817,5 @@ export function useProductControls() {
     stopSpeakerRecording,
     cancelActiveSpeakerCapture,
     workbenchModel,
-    screenCaptureAvailable: computed(() => adapter.snapshot.value?.screen_capture_available ?? false),
   };
 }

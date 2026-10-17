@@ -25,7 +25,7 @@ import { speechMessageKey, userMessageKey } from './conversation-identity'
 import { DEFAULT_SETTINGS, DEFAULT_REGISTRY, DEFAULT_DSH, MAX_WAKE_KEYWORDS, defaultCurrent, defaultShadow, normalizeSettings, normalizeRegistry, normalizeRuntimeState, updateSettingsFromResponse } from './normalization'
 export { MAX_WAKE_KEYWORDS } from './normalization'
 
-export type ProductSettingsTab = 'tts' | 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models' | 'compute' | 'system' | 'workspace' | 'screen' | 'hotwords'
+export type ProductSettingsTab = 'tts' | 'wake' | 'persona' | 'silence' | 'speaker' | 'wakes' | 'models' | 'compute' | 'system' | 'workspace' | 'hotwords'
 export type ProductPage = 'home' | 'settings'
 export type AssignmentSlot = 'voice' | 'shadow' | 'status'
 
@@ -1029,19 +1029,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     wakeForm.keywords.splice(index, 1)
   }
 
-  async function saveScreenCapture(value: import('./types').ScreenCaptureSettings) {
-    await enqueue(async () => {
-      saving.value = true
-      try {
-        const result = await productApi.saveScreenCapture(value)
-        updateSettingsFromResponse(settings, result)
-        setNotice(result.message || '屏幕图像设置已保存。')
-        await loadSnapshot()
-      } catch (error) { setError(error) }
-      finally { saving.value = false }
-    })
-  }
-
   async function saveWake() {
     await enqueue(async () => {
       saving.value = true
@@ -1574,7 +1561,6 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
     setReasoningMode,
     toggleProviderReasoning,
     saveWake,
-    saveScreenCapture,
     saveSilence,
     quietHoursForm,
     quietStatus,

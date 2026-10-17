@@ -102,7 +102,6 @@ export const productApi = {
   saveQuietHours: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/quiet-hours', jsonBody(value)),
   saveShadow: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/shadow', jsonBody(value)),
   saveApprovals: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/approvals', jsonBody(value)), // saveApprovals（保存授权确认偏好）。
-  saveScreenCapture: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/screen-capture', jsonBody(value)),
   savePersona: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/persona', jsonBody(value)),
   saveCustomInstructions: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/custom-instructions', jsonBody(value)),
   saveSpeaker: (value: unknown) => request<ProductMutationResult>('/api/v1/product/settings/speaker', jsonBody(value)),
