@@ -54,6 +54,13 @@ function displayNumber(value: unknown): string | undefined {
   return number.toLocaleString('zh-CN', { maximumFractionDigits: 6 })
 }
 
+function currencyValue(value: unknown, currency?: string) {
+  const amount = displayNumber(value)
+  if (amount === undefined) return undefined
+  if (currency && ['CNY', 'RMB', '￥', '¥'].includes(currency.toUpperCase())) return `¥${amount}`
+  return currency ? `${amount} ${currency}` : amount
+}
+
 function isZero(value: unknown) {
   const text = textValue(value)
   return text !== undefined && Number.isFinite(Number(text)) && Number(text) === 0
@@ -71,14 +78,13 @@ const deepseekBalances = computed<UsageRow[]>(() => {
   ]) !== undefined)
   if (!item) return []
   const currency = textValue(item.currency)
-  const suffix = currency ? ` · ${currency}` : ''
   const rows: UsageRow[] = []
   const balance = firstValue(item, ['available_balance', 'total_balance', 'balance', 'remain_balance'])
   const bonus = firstValue(item, ['granted_balance', 'bonus_balance', 'gift_balance'])
-  const balanceText = displayNumber(balance)
-  const bonusText = displayNumber(bonus)
-  if (balanceText !== undefined) rows.push({ label: `余额${suffix}`, value: balanceText })
-  if (bonusText !== undefined && !isZero(bonus)) rows.push({ label: `赠金余额${suffix}`, value: bonusText })
+  const balanceText = currencyValue(balance, currency)
+  const bonusText = currencyValue(bonus, currency)
+  if (balanceText !== undefined) rows.push({ label: '余额', value: balanceText })
+  if (bonusText !== undefined && !isZero(bonus)) rows.push({ label: '赠金', value: bonusText })
   return rows
 })
 
@@ -115,46 +121,59 @@ function accountBalance(source: UsageRecord | null) {
     'available_balance', 'total_balance', 'balance', 'remain_balance',
   ]) !== undefined)
   if (!item) return undefined
-  const balance = displayNumber(firstValue(item, [
+  const balance = currencyValue(firstValue(item, [
     'available_balance', 'total_balance', 'balance', 'remain_balance',
-  ]))
+  ]), textValue(item.currency))
   if (balance === undefined) return undefined
-  const currency = textValue(item.currency)
-  return currency ? `${balance} ${currency}` : balance
+  return balance
 }
 
-const minimaxUsage = computed<UsageRow[]>(() => {
+type MiniMaxQuotaRow = {
+  label: string // label（额度模型或套餐名称）。
+  interval?: string // interval（五小时额度余量或限额）。
+  weekly?: string // weekly（周额度余量或限额）。
+  fallback?: string // fallback（接口未返回时间窗口时的 Token 余量）。
+}
+const minimaxUsage = computed<MiniMaxQuotaRow[]>(() => {
   const payload = usagePayload.value
   if (!payload) return []
   const source = Array.isArray(payload.model_remains)
     ? payload.model_remains.filter(record)
     : [payload]
-  const rows = source.flatMap((item, index) => {
+  const rows = source.flatMap<MiniMaxQuotaRow>((item, index) => {
     const name = textValue(firstValue(item, ['model_name', 'model', 'name'])) || `套餐 ${index + 1}`
-    const periods = [
-      ['五小时', usageWindow(item, 'interval')],
-      ['周', usageWindow(item, 'weekly')],
-    ].filter((entry): entry is [string, string] => Boolean(entry[1]))
-    if (!periods.length) {
-      const remainingTokens = displayNumber(firstValue(item, ['tokens_remains', 'token_remains']))
-      return remainingTokens === undefined ? [] : [{ label: name, value: `${remainingTokens} Token（词元）` }]
-    }
-    return [{ label: name, value: periods.map(([label, value]) => `${label} ${value}`).join(' · ') }]
+    const interval = usageWindow(item, 'interval')
+    const weekly = usageWindow(item, 'weekly')
+    if (interval || weekly) return [{ label: name, interval, weekly }]
+    const remainingTokens = displayNumber(firstValue(item, ['tokens_remains', 'token_remains']))
+    return remainingTokens === undefined ? [] : [{ label: name, fallback: `${remainingTokens} Token（词元）` }]
   })
 
   if (!rows.length) {
     const remainingTokens = displayNumber(firstValue(payload, ['tokens_remains', 'token_remains']))
-    if (remainingTokens !== undefined) return [{ label: '套餐', value: `${remainingTokens} Token（词元）` }]
+    if (remainingTokens !== undefined) return [{ label: '套餐', fallback: `${remainingTokens} Token（词元）` }]
   }
   return rows
 })
 
 const minimaxBalance = computed(() => billingMode.value === 'pay_as_you_go' ? accountBalance(usagePayload.value) : undefined)
+const minimaxHasInterval = computed(() => minimaxUsage.value.some(row => row.interval))
+const minimaxHasWeekly = computed(() => minimaxUsage.value.some(row => row.weekly))
+const minimaxPlanHeading = computed(() => {
+  if (minimaxHasInterval.value && minimaxHasWeekly.value) return '用量：5h/周额度'
+  if (minimaxHasInterval.value) return '用量：5h限额'
+  if (minimaxHasWeekly.value) return '用量：周额度'
+  return '用量：Token 限额'
+})
+const minimaxPlanValues = computed(() => minimaxUsage.value.map(row => {
+  const value = [row.interval, row.weekly].filter((item): item is string => Boolean(item)).join('/') || row.fallback
+  return value ? { label: row.label, value } : undefined
+}).filter((row): row is { label: string; value: string } => Boolean(row)))
 const minimaxSummary = computed(() => billingMode.value === 'pay_as_you_go'
   ? minimaxBalance.value
-  : minimaxUsage.value.map(row => `${row.label}：${row.value}`).join(' · '))
-const minimaxSummaryLabel = computed(() => billingMode.value === 'pay_as_you_go' ? '余额' : '限额')
+  : minimaxPlanValues.value.map(row => `${row.label} ${row.value}`).join(' · '))
 const minimaxSummaryTitle = computed(() => [billingLabel.value, minimaxSummary.value].filter(Boolean).join(' · '))
+const deepseekSummaryTitle = computed(() => deepseekBalances.value.map(row => `${row.label} ${row.value}`).join(' / '))
 
 const notice = computed(() => {
   if (!configured.value) return '配置 API Key（接口密钥）后显示用量。'
@@ -193,13 +212,19 @@ watch(() => props.refreshKey, () => {
 
 <template>
   <section class="provider-usage-summary" :data-provider="model.provider" :aria-label="`${model.provider === 'deepseek' ? 'DeepSeek 余额' : 'MiniMax 套餐用量'}`">
-    <dl v-if="model.provider === 'deepseek' && deepseekBalances.length" class="provider-usage-values">
-      <div v-for="(row, index) in deepseekBalances" :key="`${row.label}-${index}`"><dt>{{ row.label }}</dt><dd>{{ row.value }}</dd></div>
-    </dl>
-    <dl v-else-if="model.provider === 'minimax' && minimaxSummary" class="provider-usage-values provider-minimax-summary" :title="minimaxSummaryTitle">
-      <div><dt>{{ minimaxSummaryLabel }}</dt><dd>{{ minimaxSummary }}</dd></div>
-    </dl>
-    <span v-if="notice" class="provider-usage-note" :class="{ error: error }" :title="notice" role="status">{{ notice }}</span>
+    <div v-if="model.provider === 'deepseek' && deepseekBalances.length" class="provider-usage-copy" :title="deepseekSummaryTitle">
+      <div class="provider-usage-heading">{{ deepseekBalances.map(row => row.label).join(' / ') }}</div>
+      <div class="provider-usage-values provider-deepseek-values"><strong v-for="(row, index) in deepseekBalances" :key="`${row.label}-${index}`">{{ row.value }}</strong></div>
+    </div>
+    <div v-else-if="model.provider === 'minimax' && billingMode === 'pay_as_you_go' && minimaxBalance" class="provider-usage-copy" :title="minimaxSummaryTitle">
+      <div class="provider-usage-heading">余额</div>
+      <div class="provider-usage-values"><strong>{{ minimaxBalance }}</strong></div>
+    </div>
+    <div v-else-if="model.provider === 'minimax' && minimaxPlanValues.length" class="provider-usage-copy" :title="minimaxSummaryTitle">
+      <div class="provider-usage-heading">{{ minimaxPlanHeading }}</div>
+      <div class="provider-usage-values"><span v-for="(row, index) in minimaxPlanValues" :key="`${row.label}-${index}`"><small>{{ row.label }}</small><strong>{{ row.value }}</strong></span></div>
+    </div>
+    <span v-else-if="notice" class="provider-usage-note" :class="{ error: error }" :title="notice" role="status">{{ notice }}</span>
     <button v-if="model.usage" class="outline-button provider-usage-refresh" type="button" :disabled="!configured || checking || model.disabled" @click="checkUsage">
       {{ checking ? '查询中…' : result ? '刷新' : '查询' }}
     </button>
@@ -207,13 +232,14 @@ watch(() => props.refreshKey, () => {
 </template>
 
 <style scoped>
-.provider-usage-summary{display:flex;align-items:center;justify-content:flex-end;gap:5px 8px;min-width:0;max-width:100%;flex-wrap:nowrap;overflow:hidden;white-space:nowrap}
-.provider-billing-mode,.provider-usage-note{min-width:0;font-size:var(--font-caption);line-height:1.45;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.provider-usage-summary{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-rows:repeat(2,minmax(16px,auto));align-items:center;gap:1px 8px;flex:1 1 0;min-width:0;max-width:100%;min-height:38px;overflow:hidden}
+.provider-usage-copy{display:contents;min-width:0}
+.provider-usage-heading,.provider-usage-note{grid-column:1;grid-row:1;min-width:0;font-size:var(--font-caption);line-height:1.35;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.provider-usage-values{grid-column:1;grid-row:2;display:flex;align-items:center;gap:3px 10px;min-width:0;max-width:100%;overflow:hidden;white-space:nowrap}
+.provider-usage-values>span{display:inline-flex;align-items:baseline;gap:4px;min-width:0;overflow:hidden;white-space:nowrap}
+.provider-usage-values small{color:var(--muted);font-size:var(--font-caption);overflow:hidden;text-overflow:ellipsis}
+.provider-usage-values strong{min-width:0;font-size:var(--font-body);font-weight:700;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.provider-deepseek-values strong+strong:before{content:"/";margin-right:10px;color:var(--muted);font-weight:400}
 .provider-usage-note.error{color:var(--danger)}
-.provider-usage-values{display:flex;align-items:center;gap:5px 12px;flex:1 1 auto;min-width:0;margin:0;overflow:hidden;white-space:nowrap}
-.provider-usage-values>div{display:inline-flex;align-items:baseline;gap:5px;min-width:0;font-size:var(--font-caption);white-space:nowrap;overflow:hidden}
-.provider-usage-values dt{flex:none;max-width:45%;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.provider-usage-values dd{min-width:0;font-size:var(--font-caption);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.provider-minimax-summary>div{flex:1 1 auto}
-.provider-usage-refresh{flex:none;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:3px 8px;font-size:var(--font-caption)}
+.provider-usage-refresh{grid-column:2;grid-row:1/3;align-self:center;flex:none;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:3px 8px;font-size:var(--font-caption)}
 </style>

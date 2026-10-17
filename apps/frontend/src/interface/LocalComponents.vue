@@ -101,6 +101,7 @@ function expandRuntimeDependencies(row: LocalComponentRow): LocalComponentRow[] 
     return (aIndex < 0 ? order.length : aIndex) - (bIndex < 0 ? order.length : bIndex)
   }).map((dependency, index): LocalComponentRow => {
     const isCpu = dependency.id === 'voice-runtime-cpu' || dependency.required !== false && index === 0
+    const dependencyMetrics = row.runtimeDependencyMetrics?.[dependency.id]
     const installed = dependency.state === 'installed' && !dependency.updateAvailable
     const serviceBusy = isCpu && row.state === 'loading'
     const serviceFailed = isCpu && row.state === 'failed'
@@ -117,10 +118,14 @@ function expandRuntimeDependencies(row: LocalComponentRow): LocalComponentRow[] 
       busy: serviceBusy,
       retryable: isCpu && row.retryable || dependency.retryable,
       runtime: '',
-      residentMemory: isCpu ? row.residentMemory : undefined,
-      privateMemory: isCpu ? row.privateMemory : undefined,
-      vram: isCpu ? row.vram : undefined,
-      resourceBytes: isCpu ? row.resourceBytes : undefined,
+      residentMemory: isCpu ? row.residentMemory : formatComponentMemory(dependencyMetrics?.resident),
+      privateMemory: isCpu ? row.privateMemory : formatComponentMemory(dependencyMetrics?.privateCommit),
+      vram: isCpu ? row.vram : formatComponentMemory(dependencyMetrics?.vram),
+      resourceBytes: isCpu ? row.resourceBytes : dependencyMetrics ? {
+        resident: dependencyMetrics.resident,
+        privateCommit: dependencyMetrics.privateCommit,
+        vram: dependencyMetrics.vram,
+      } : undefined,
       description: runtimeDescription(dependency.id),
       error: dependency.error || (serviceFailed ? row.error : undefined),
       resource: dependency,
@@ -320,21 +325,25 @@ function resourceActionLabel(row: LocalComponentRow, resource: ManagedResourceRo
 }
 function categoryObservation(rows: LocalComponentRow[]) {
   const activeResource = rows.some(row => rowJobs(row).some(jobIsActive))
-  const statePriority = ['failed', 'loading', 'disabled', 'ready'] as const
   const healthRows = rows[0]?.category === 'voice-server'
     ? rows.filter(row => row.resource?.required !== false)
     : rows
-  const state = activeResource ? 'loading' : statePriority.find(candidate => healthRows.some(row => row.state === candidate)) ?? 'disabled'
+  const blocking = (row: LocalComponentRow) => row.facts.some(fact => fact.label === '语音门禁')
+    || row.category === 'voice-server' && row.resource?.required !== false
+  const blockingFailure = healthRows.some(row => blocking(row) && ['failed', 'disabled'].includes(row.state))
+  const blockingLoading = healthRows.some(row => blocking(row) && row.state === 'loading')
+  const blockingMissing = healthRows.some(row => blocking(row) && needsResource(row))
+  const hasReadyComponent = rows.some(row => row.state === 'ready' && row.available)
+  const hasFailedComponent = rows.some(row => row.state === 'failed')
   const missing = healthRows.some(needsResource)
-  // TTS（语音合成）存在互为替代的本地与在线方式：任一方式就绪即可视为分类可用。
-  const usableWithOptionalResources = rows.some(row => row.category === 'tts' && row.state === 'ready')
   const label = activeResource ? '下载中'
-    : usableWithOptionalResources ? '运行正常'
-      : missing ? '待下载或更新'
-      : state === 'failed' ? '部分异常'
-        : state === 'loading' ? '启动中'
-          : state === 'disabled' ? '已停用或待配置'
-            : rows.length ? '运行正常' : '暂无组件'
+    : blockingFailure ? '部分异常'
+      : blockingLoading ? '启动中'
+        : blockingMissing ? '待下载或更新'
+          : hasReadyComponent ? '运行正常'
+            : missing ? '待下载或更新'
+              : hasFailedComponent ? '待检查'
+                : rows.length ? '待配置或已停用' : '暂无组件'
   const sum = (key: 'resident' | 'privateCommit' | 'vram') => {
     const bytes = rows.flatMap(row => {
       const value = row.resourceBytes?.[key]
@@ -342,7 +351,9 @@ function categoryObservation(rows: LocalComponentRow[]) {
     })
     return bytes.length ? formatComponentMemory(bytes.reduce((total, value) => total + value, 0)) : undefined
   }
-  return { state: activeResource ? 'loading' : usableWithOptionalResources ? 'ready' : missing ? 'disabled' : state, label,
+  const state = activeResource || blockingLoading ? 'loading' : blockingFailure ? 'failed'
+    : hasReadyComponent ? 'ready' : 'disabled'
+  return { state, label,
     residentMemory: sum('resident'), privateMemory: sum('privateCommit'), vram: sum('vram') }
 }
 function categoryProgress(category: LocalComponentCategory, rows: LocalComponentRow[]): ManagedResourceJob | undefined {
@@ -410,10 +421,13 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
               </button>
               <div class="local-category-observability">
                 <span class="local-state" :class="category.observation.state"><i aria-hidden="true"></i>{{ category.observation.label }}</span>
-                <dl v-if="category.observation.residentMemory || category.observation.privateMemory || category.observation.vram" class="local-component-metrics local-category-metrics">
-                  <div v-if="category.observation.residentMemory" class="local-runtime-metric" data-metric="memory"><dt>常驻内存合计</dt><dd>{{ category.observation.residentMemory }}</dd></div>
-                  <div v-if="category.observation.privateMemory" class="local-runtime-metric" data-metric="commit"><dt>提交内存合计</dt><dd>{{ category.observation.privateMemory }}</dd></div>
-                  <div v-if="category.observation.vram" class="local-runtime-metric" data-metric="vram"><dt>显存合计</dt><dd>{{ category.observation.vram }}</dd></div>
+                <dl v-if="category.observation.residentMemory || category.observation.privateMemory || category.observation.vram" class="local-category-metrics">
+                  <div class="local-category-metric-labels">
+                    <dt v-if="category.observation.residentMemory">常驻内存合计</dt><dt v-if="category.observation.privateMemory">提交内存合计</dt><dt v-if="category.observation.vram">显存合计</dt>
+                  </div>
+                  <div class="local-category-metric-values">
+                    <dd v-if="category.observation.residentMemory">{{ category.observation.residentMemory }}</dd><dd v-if="category.observation.privateMemory">{{ category.observation.privateMemory }}</dd><dd v-if="category.observation.vram">{{ category.observation.vram }}</dd>
+                  </div>
                 </dl>
               </div>
               <button class="local-category-disclosure" type="button" :aria-expanded="expandedCategories.has(category.id)" :aria-controls="`local-category-${category.id}`" @click="toggleCategory(category.id)"><span>{{ expandedCategories.has(category.id) ? '收起' : '展开' }}</span><svg viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expandedCategories.has(category.id) }"><path d="m6 9 6 6 6-6" /></svg></button>
@@ -452,7 +466,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                     <template v-if="rowActionResources(row).some(actionResource => actionResource.id === resource.id)">
                       <button class="outline-button" type="button" :aria-label="`${resource.label}：${resourceActionLabel(row, resource)}`" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceDownload', resource.id)">{{ resource.busy ? '处理中…' : resourceActionLabel(row, resource) }}</button>
                       <button class="outline-button" type="button" :aria-label="`${resource.label}：导入`" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceImport', resource.id)">导入</button>
-                      <button class="outline-button" type="button" :aria-label="`${resource.label}：跳转官方来源`" :disabled="model.resourceLoading" @click="emit('openResourceSource', resource.id)">跳转来源</button>
+                      <button class="outline-button" type="button" :aria-label="`${resource.label}：跳转`" :disabled="model.resourceLoading" @click="emit('openResourceSource', resource.id)">跳转</button>
                     </template>
                   </div>
                 </div>
@@ -460,11 +474,11 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                   <div v-for="resource in rowActionResources(row)" :key="resource.id" class="local-inline-resource-action">
                     <button class="outline-button" type="button" :aria-label="`${resource.label}：${resourceActionLabel(row, resource)}`" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceDownload', resource.id)">{{ resource.busy ? '处理中…' : resourceActionLabel(row, resource) }}</button>
                     <button class="outline-button" type="button" :aria-label="`${resource.label}：导入`" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceImport', resource.id)">导入</button>
-                    <button class="outline-button" type="button" :aria-label="`${resource.label}：跳转官方来源`" :disabled="model.resourceLoading" @click="emit('openResourceSource', resource.id)">跳转来源</button>
+                    <button class="outline-button" type="button" :aria-label="`${resource.label}：跳转`" :disabled="model.resourceLoading" @click="emit('openResourceSource', resource.id)">跳转</button>
                   </div>
                 </div>
-                <button v-if="row.runtimeDependencies?.length || expandedComponents.has(row.id) || !rowHasActiveJob(row) && (!rowActionResources(row).length || !model.resourceActionsAvailable)" class="local-component-action" type="button" :aria-label="`${row.name}：${expandedComponents.has(row.id) ? '收起详情' : '展开详情'}`" :aria-expanded="expandedComponents.has(row.id)" :aria-controls="`local-detail-${row.id}`" @click="toggleComponent(row)">
-                  {{ expandedComponents.has(row.id) ? '收起' : '展开' }}
+                <button v-if="row.runtimeDependencies?.length || expandedComponents.has(row.id) || !rowHasActiveJob(row) && (!rowActionResources(row).length || !model.resourceActionsAvailable)" class="local-component-action" type="button" :aria-label="`${row.name}：${expandedComponents.has(row.id) ? '收起详情' : '详情'}`" :aria-expanded="expandedComponents.has(row.id)" :aria-controls="`local-detail-${row.id}`" @click="toggleComponent(row)">
+                  {{ expandedComponents.has(row.id) ? '收起' : '详情' }}
                   <svg viewBox="0 0 24 24" aria-hidden="true" :class="{ expanded: expandedComponents.has(row.id) }"><path d="m6 9 6 6 6-6" /></svg>
                 </button>
                 </div>
@@ -486,7 +500,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                       <template v-else-if="runtimeNeedsAction(dependency)">
                         <button class="outline-button" type="button" :aria-label="`${dependency.label}：${resourceActionLabel(row, dependency)}`" :disabled="dependency.busy || model.resourceLoading || rowHasActiveJob(row)" @click="emit('resourceDownload', dependency.id)">{{ dependency.busy ? '处理中…' : resourceActionLabel(row, dependency) }}</button>
                         <button class="outline-button" type="button" :aria-label="`${dependency.label}：导入`" :disabled="dependency.busy || model.resourceLoading || rowHasActiveJob(row)" @click="emit('resourceImport', dependency.id)">导入</button>
-                        <button class="outline-button" type="button" :aria-label="`${dependency.label}：跳转官方来源`" :disabled="model.resourceLoading" @click="emit('openResourceSource', dependency.id)">跳转来源</button>
+                        <button class="outline-button" type="button" :aria-label="`${dependency.label}：跳转`" :disabled="model.resourceLoading" @click="emit('openResourceSource', dependency.id)">跳转</button>
                       </template>
                     </div>
                     <p v-if="dependency.error && !jobIsActive(resourceJob(dependency.id))" class="local-error" role="status">{{ dependency.error }}</p>
@@ -548,16 +562,19 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
 .local-category-row{display:grid;grid-template-columns:minmax(150px,1fr) auto auto;align-items:center;gap:16px;width:100%;padding:3px 0}
 .local-category-toggle{display:block;width:100%;min-width:0;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer}
 .local-category-title{display:grid;gap:4px;min-width:0}
-.local-category-observability{display:flex;align-items:center;justify-content:flex-end;gap:14px;min-width:0}
-.local-category-metrics{display:flex;align-items:center;gap:8px 14px;margin:0}
-.local-category-metrics .local-runtime-metric{min-width:84px}
-.local-category-disclosure{display:inline-flex;align-items:center;justify-content:center;gap:5px;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:5px 8px;border:1px solid var(--line-strong);border-radius:9px;background:#ffffff03;color:inherit;font:inherit;font-size:var(--font-caption);white-space:nowrap;cursor:pointer}
+.local-category-observability{display:grid;justify-items:end;align-content:center;gap:3px;min-width:0;min-height:54px}
+.local-category-metrics{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:repeat(2,auto);gap:2px;min-width:0;margin:0;text-align:right;font-variant-numeric:tabular-nums}
+.local-category-metric-labels,.local-category-metric-values{display:flex;justify-content:flex-end;gap:4px 12px;min-width:0;white-space:nowrap}
+.local-category-metric-labels dt{font-size:var(--font-caption);color:var(--subtle)}
+.local-category-metric-values dd{font-size:var(--font-body);font-weight:650;line-height:1.25}
+.local-category-disclosure{display:inline-flex;align-items:center;justify-content:center;gap:5px;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:5px 10px;border:1px solid var(--line-strong);border-radius:9px;background:#ffffff03;color:inherit;font:inherit;font-size:var(--font-body);font-weight:600;white-space:nowrap;cursor:pointer}
 .local-category-disclosure svg{width:14px;height:14px}
 .local-category-progress{max-width:620px;margin:8px 0 0 2px}
 .local-component-provider-usage{margin:0;align-self:center}
-@container (max-width:760px){.local-category-row{grid-template-columns:minmax(0,1fr) auto auto;gap:8px}.local-category-observability{justify-content:flex-end;gap:6px;flex-wrap:wrap}.local-category-metrics{justify-content:flex-end;flex-wrap:wrap;gap:6px 10px}}
+@container (max-width:760px){.local-category-row{grid-template-columns:minmax(0,1fr) auto auto;gap:8px}.local-category-observability{min-height:54px}.local-category-metric-labels,.local-category-metric-values{gap:3px 8px}}
 .local-managed-resource-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0;font-size:var(--font-caption);color:var(--muted)}
 .local-managed-resource-heading>span:first-child{min-width:0;overflow-wrap:anywhere}
+.local-runtime-dependencies .local-managed-resource-heading>strong{flex:1 1 auto;min-width:0;white-space:nowrap;overflow-wrap:normal}
 .local-resource-versions{display:flex;gap:18px;flex-wrap:wrap}.local-resource-versions>div{display:flex;gap:6px;align-items:baseline}.local-resource-versions dd{font-size:var(--font-caption)}
 .resource-install-state{flex:none;display:inline-flex;align-items:center;gap:4px;font-size:var(--font-caption);color:var(--muted);white-space:nowrap}
 .resource-install-state.installed{color:var(--mint)}
@@ -589,7 +606,7 @@ small,dt{font-size:var(--font-caption)}
 .local-component-card{min-width:0;border:1px solid var(--line);border-radius:12px;background:#ffffff02;overflow:hidden}
 .local-component-card.failed{border-color:color-mix(in srgb,var(--danger) 28%,transparent)}
 /* action column（操作列）：按钮文案或箭头变化不挤动名称与状态列。 */
-.local-component-summary{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:center;padding:11px 14px}
+.local-component-summary{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:center;min-height:72px;padding:11px 14px}
 .local-install-actions{margin-top:0;max-width:240px;justify-content:flex-end}
 .local-component-body{min-width:0}
 .local-component-controls{display:grid;justify-items:end;align-content:center;gap:8px;min-width:0}
@@ -618,7 +635,7 @@ dl,dd{margin:0}
 .local-detail-facts>div{min-width:0;display:flex;flex-direction:column;gap:4px}
 dt{color:var(--subtle)}
 dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:anywhere;line-height:1.5}
-.local-component-action{display:inline-flex;align-self:center;align-items:center;justify-content:center;gap:4px;height:var(--compact-control-height);min-height:var(--compact-control-height);min-width:88px;padding:6px 10px;font-size:var(--font-body);white-space:nowrap;background:#ffffff03}
+.local-component-action{display:inline-flex;align-self:center;align-items:center;justify-content:center;gap:4px;height:var(--compact-control-height);min-height:var(--compact-control-height);min-width:68px;padding:6px 8px;font-size:var(--font-caption);white-space:nowrap;background:#ffffff03}
 .local-component-action svg{transition:transform 180ms}
 .local-component-action svg.expanded{transform:rotate(180deg)}
 .retry-action{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 30%,transparent)}
@@ -640,6 +657,10 @@ dd{font-size:var(--font-body);font-variant-numeric:tabular-nums;overflow-wrap:an
 @container (max-width:440px){.local-memory-summary{grid-template-columns:1fr;gap:8px}.local-memory-summary article{flex-direction:row;align-items:center;justify-content:space-between;padding:12px;gap:8px}.local-component-summary{grid-template-columns:minmax(0,1fr);padding:10px;gap:9px}.local-component-controls{justify-items:stretch}.local-category-heading{grid-template-columns:minmax(0,1fr);padding:11px 12px}.local-category-actions{justify-content:stretch}.category-download,.category-import{flex:1}.local-category-content{padding:0 10px 10px}.local-component-metrics{gap:6px}.local-component-detail{padding:12px}.local-component-action{justify-self:stretch;width:100%;padding-inline:8px}.local-inline-resource-actions{max-width:none;justify-items:stretch}.local-inline-resource-action{justify-content:stretch}.local-inline-resource-action button{flex:1}.local-component-inline-progress{grid-template-columns:1fr;padding:0 10px 10px}.local-resource-progress{padding:0 12px 12px}.local-managed-resource{padding:10px 12px}.managed-resource-actions{gap:6px}}
 @container (max-width:560px){.local-managed-heading{align-items:flex-start}.resource-batch-import{white-space:normal;max-width:100%}}
 @container (max-width:520px){.local-component-metrics{grid-template-columns:1fr}.local-resource-metrics{gap:12px}.local-resource-metrics dt,.local-resource-metrics dd{font-size:var(--font-caption)}}
+.local-component-card[data-component="tts-audiocpp-runtime"] .local-component-identity{grid-template-columns:minmax(260px,1.2fr) minmax(0,1fr)}
+.local-component-card[data-component="tts-audiocpp-runtime"] .local-component-identity h4{display:block;white-space:nowrap;word-break:normal;overflow-wrap:normal;overflow:hidden;text-overflow:clip}
+@container (max-width:560px){.local-component-card[data-component="tts-audiocpp-runtime"] .local-component-identity{grid-template-columns:minmax(220px,1.2fr) minmax(0,1fr)}}
+@container (max-width:440px){.local-component-card[data-component="tts-audiocpp-runtime"] .local-component-identity{grid-template-columns:minmax(0,1fr)}}
 @media (prefers-reduced-motion:reduce){.local-component-action svg{transition:none}}
 @media (prefers-reduced-motion:reduce){.local-category-toggle svg{transition:none}}
 </style>
