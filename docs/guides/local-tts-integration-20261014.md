@@ -19,7 +19,7 @@
 
 本地 TTS（语音合成）服务就绪时，Voice Server（语音服务）可通过 NVML（英伟达管理库）把自身的 PowerMizer（显卡性能模式）设为 `prefer-maximum-performance`（优先最大性能）。唯一开关为 `tts.gpu_max_performance`（显卡性能模式开关，默认开启）；不调用需要管理员权限的锁频接口。
 
-支持时按进程记录并在本地服务关闭或后端切换时恢复先前模式；驱动、接口或设备不支持时降级为空操作并写日志，不影响合成。状态接口 `gpu_performance`（显卡性能模式状态）包含 `enabled`（开关状态）、`available`（接口可用性）、`applied`（是否已应用）、`mode`（当前模式）、`previous_mode`（恢复目标模式）、`supported_modes`（支持模式）及 `last_error`（最近错误）。本机显卡测量和边界见[本地语音实时因子对比复核](../testing/local-tts-rtf-branch-comparison-20261014.md)。
+支持时按进程记录并在本地服务关闭或后端切换时恢复先前模式；驱动、接口或设备不支持时降级为空操作并写日志，不影响合成。状态接口 `gpu_performance`（显卡性能模式状态）包含 `enabled`（开关状态）、`available`（接口可用性）、`applied`（是否已应用）、`mode`（当前模式）、`previous_mode`（恢复目标模式）、`supported_modes`（支持模式）及 `last_error`（最近错误）。实际效果取决于显卡、驱动和 NVML（英伟达管理库）接口支持情况。
 
 ## 通用提前合成与取消
 

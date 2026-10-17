@@ -29,6 +29,9 @@ config/speaker/
 /reports/
 /.runtime/
 /data/
+# Local TTS diagnostics may contain private paths, hardware details, or audio evidence.
+/docs/testing/local-tts-*.md
+/docs/local-tts-root-cause-20261016.md
 /apps/desktop/target/
 /apps/desktop/src-tauri/gen/schemas/
 /apps/desktop/installer/gen/schemas/
