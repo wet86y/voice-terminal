@@ -70,6 +70,7 @@ class ResolvedLocalTtsVoice:
     emotion: str | None = None
     reference_mode: str = "voice"  # reference_mode（参考模式）：voice 或 design。
     is_preview: bool = False
+    voice_source: str = "legacy"  # voice_source（音色来源）：design、import、recording 或 legacy。
 
 
 def _utc_now() -> str:
@@ -485,6 +486,7 @@ class VoiceLibrary:
             reference_path=path, reference_text=voice.get("reference_text", ""),
             style_description="", emotion=None,  # 已确认样音承载固定音色与语气，不再逐句注入描述。
             reference_mode="voice", is_preview=is_preview,
+            voice_source=str(voice.get("source") or "legacy"),
         )
 
     def resolve_design(self, description: str, *, emotion: str | None = None,
@@ -495,7 +497,7 @@ class VoiceLibrary:
         return ResolvedLocalTtsVoice(
             model="voxcpm2", native_model_id="voxcpm2-stream", voice_id=None, revision=None,
             reference_path=None, reference_text="", style_description=description,
-            emotion=emotion, reference_mode="design", is_preview=is_preview,
+            emotion=emotion, reference_mode="design", is_preview=is_preview, voice_source="design",
         )
 
     def resolve_draft(self, model: str, payload: Mapping[str, Any], *, emotion: str | None = None,
@@ -524,6 +526,7 @@ class VoiceLibrary:
             voice_id=None, revision=None, reference_path=path,
             reference_text=voice["reference_text"], style_description="",
             emotion=None, reference_mode="voice", is_preview=is_preview,
+            voice_source=str(voice.get("source") or "import"),
         )
 
     def delete_voice(self, voice_id: str, active_by_model: Mapping[str, Any] | None = None) -> None:
