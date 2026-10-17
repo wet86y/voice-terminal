@@ -72,8 +72,10 @@ try {
   $Checksums=@("$InstallerHash  VoiceTerminalSetup.exe","$DeliveryHash  delivery.json","$UpdateHash  update.json") -join "`n"
   [IO.File]::WriteAllText($ChecksumPath,$Checksums+"`n",[Text.UTF8Encoding]::new($false))
 
-  $ReleaseView=(& gh release view $Tag --json tagName 2>$null)
-  $ReleaseExists=($LASTEXITCODE -eq 0)
+  $ReleaseList=(& gh release list --limit 100 --json tagName)
+  if ($LASTEXITCODE) { throw '无法读取 GitHub Release（GitHub 发行版）列表。' }
+  $ExistingTags=@(($ReleaseList | ConvertFrom-Json) | ForEach-Object tagName)
+  $ReleaseExists=$Tag -in $ExistingTags
   $Assets=@($Installer,$DeliveryPath,$UpdatePath,$ChecksumPath)
   if ($ReleaseExists) {
     & gh release upload $Tag @Assets --clobber
