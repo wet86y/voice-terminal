@@ -224,13 +224,6 @@ const rows = computed<LocalComponentRow[]>(() => {
         const managed = managedResource(resource.resource_id)
         return managed ? [{ ...managed, label: resource.label }] : []
       }),
-      runtimeDependencyMetrics: localMetrics ? {
-        'tts-audiocpp-runtime': {
-          resident: localMetrics.memory_rss_bytes ?? undefined,
-          privateCommit: localMetrics.memory_private_commit_bytes ?? undefined,
-          vram: localMetrics.gpu_dedicated_bytes != null && localMetrics.gpu_dedicated_bytes > 0 ? localMetrics.gpu_dedicated_bytes : undefined,
-        },
-      } : undefined,
       facts: [
         ...(environment?.python ? [{ label: 'Python（后端解释器）', value: environment.python }] : []),
         ...(environment?.version ? [{ label: '解释器版本', value: environment.version }] : []),
@@ -257,8 +250,12 @@ const rows = computed<LocalComponentRow[]>(() => {
         : resource.state === 'installed' ? localRuntimeReady ? '已就绪' : '已安装，运行环境待配置'
           : resource.state === 'incomplete' ? '不完整' : '待安装',
     }))
+  const loadedLocalModelId = ttsBackend === 'voxcpm1' && tts.status.value?.load_state === 'ready'
+    && tts.status.value.loaded_model ? `tts-${tts.status.value.loaded_model}` : undefined
   components.push(...localModelResources.map((resource): LocalComponentRow => {
     const selected = resource.id === selectedLocalModel
+    // local-tts（本地语音进程）的整进程采样只归当前已加载的 VoxCPM 模型，避免与 audio.cpp 依赖卡重复累计。
+    const localModelMetrics = resource.id === loadedLocalModelId ? localMetrics : undefined
     const ready = resource.state === 'installed' && !resource.updateAvailable && localRuntimeReady
     const busy = selected && ttsLoading
     const failed = selected && ttsFailed
@@ -278,10 +275,16 @@ const rows = computed<LocalComponentRow[]>(() => {
       busy,
       retryable: failed && Boolean(capability?.retry),
       runtime: '',
-      residentMemory: undefined,
-      privateMemory: undefined,
-      vram: undefined,
-      resourceBytes: undefined,
+      residentMemory: formatComponentMemory(localModelMetrics?.memory_rss_bytes),
+      privateMemory: formatComponentMemory(localModelMetrics?.memory_private_commit_bytes),
+      vram: localModelMetrics?.gpu_dedicated_bytes != null && localModelMetrics.gpu_dedicated_bytes > 0
+        ? formatComponentMemory(localModelMetrics.gpu_dedicated_bytes) : undefined,
+      resourceBytes: localModelMetrics ? {
+        resident: localModelMetrics.memory_rss_bytes ?? undefined,
+        privateCommit: localModelMetrics.memory_private_commit_bytes ?? undefined,
+        vram: localModelMetrics.gpu_dedicated_bytes != null && localModelMetrics.gpu_dedicated_bytes > 0
+          ? localModelMetrics.gpu_dedicated_bytes : undefined,
+      } : undefined,
       description: `${resource.label} 本地语音模型；与另一款 VoxCPM 共用 audio.cpp 运行程序。`,
       error: failed ? capability?.error || ttsResource?.error || tts.status.value?.error || undefined : undefined,
       facts: [],
@@ -298,7 +301,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     status: minimaxSelected && ttsLoading ? '启动中' : minimaxSelected && ttsFailed ? '待配置或恢复' : minimaxConfigured ? '已配置' : '待配置',
     available: minimaxConfigured && !(minimaxSelected && (ttsLoading || ttsFailed)), busy: minimaxSelected && ttsLoading,
     retryable: minimaxSelected && !ttsLoading && ttsFailed && Boolean(capability?.retry),
-    runtime: '', description: 'MiniMax 在线语音服务。API 密钥在详情中配置；支持的账户用量会显示在组件摘要。',
+    runtime: '', location: '在线服务', description: 'MiniMax 在线语音服务。API 密钥在详情中配置；支持的账户用量会显示在组件摘要。',
     error: minimaxSelected && ttsFailed ? capability?.error || tts.status.value?.error || undefined : undefined,
     facts: [], provider: providerSettings('minimax'),
   })
@@ -308,7 +311,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     state: startupLoading || providerLoading.value ? 'loading' : providerConfigured.value.deepseek ? 'ready' : 'failed',
     status: startupLoading ? '启动中' : providerLoading.value ? '读取配置中' : providerConfigured.value.deepseek ? '已配置' : '待配置',
     available: providerConfigured.value.deepseek, busy: startupLoading || providerLoading.value,
-    runtime: '',
+    runtime: '', location: '在线服务',
     description: startupLoading ? '正在加载组件' : '配置 DeepSeek 接口密钥并查询账户余额。密钥由服务端安全保存，不会返回页面。',
     facts: [], provider: providerSettings('deepseek'),
   })

@@ -36,8 +36,11 @@ async function save() {
         <div><h4>{{ name }}（在线服务）</h4><p>密钥保存在本机系统凭据库，不会返回到页面。</p></div>
         <span class="provider-key-state" :class="configured ? 'configured' : 'missing'">{{ model.disabled ? '正在读取' : configured ? '已配置' : '未配置' }}</span>
       </div>
-      <label class="form-field"><span>{{ name }} API Key（接口密钥）</span><input v-model="draft" type="password" autocomplete="new-password" spellcheck="false" :disabled="model.disabled || saving" :placeholder="configured ? '已配置，填写可更新' : '填写接口密钥'" /></label>
-      <div class="provider-settings-actions"><small>留空保留已有密钥；{{ model.provider === 'deepseek' ? '保存后供推理服务使用。' : '保存后可作为语音合成的在线方式。' }}</small><button class="save-button" type="button" :disabled="model.disabled || saving || !draft.trim()" @click="save">{{ saving ? '正在保存…' : '保存密钥' }}</button></div>
+      <div class="provider-key-entry">
+        <label class="form-field"><span>{{ name }} API Key（接口密钥）</span><input v-model="draft" type="password" autocomplete="new-password" spellcheck="false" :disabled="model.disabled || saving" :placeholder="configured ? '已配置，填写可更新' : '填写接口密钥'" /></label>
+        <button class="save-button" type="button" :disabled="model.disabled || saving || !draft.trim()" @click="save">{{ saving ? '正在保存…' : '保存密钥' }}</button>
+      </div>
+      <small class="provider-settings-hint">留空保留已有密钥；{{ model.provider === 'deepseek' ? '保存后供推理服务使用。' : '保存后可作为语音合成的在线方式。' }}</small>
       <p v-if="notice" class="provider-settings-message notice" role="status">{{ notice }}</p>
       <p v-if="saveError" class="provider-settings-message error" role="alert">{{ saveError }}</p>
     </div>
@@ -45,5 +48,5 @@ async function save() {
 </template>
 
 <style scoped>
-.provider-settings-detail{display:grid;gap:18px;width:100%;min-width:0}.provider-key-settings{display:grid;gap:12px;padding:16px;border:1px solid var(--line);border-radius:14px;background:#ffffff03}.provider-settings-heading,.provider-settings-actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}.provider-settings-heading>div{display:grid;gap:4px;min-width:0}.provider-settings-heading h4{font-size:var(--font-body)}.provider-settings-heading p,.provider-settings-actions small{font-size:var(--font-caption);line-height:1.6;color:var(--muted)}.provider-key-state{font-size:var(--font-caption);color:var(--muted)}.provider-key-state.configured{color:var(--mint)}.provider-key-state.missing{color:var(--accent)}.provider-key-settings>.form-field{max-width:520px}.provider-settings-actions .save-button{min-height:var(--compact-control-height);padding:5px 12px;font-size:var(--font-body)}.provider-settings-message{font-size:var(--font-caption);line-height:1.6}.provider-settings-message.error{color:var(--danger)}.provider-settings-message.notice{color:var(--mint)}
+.provider-settings-detail{display:grid;gap:18px;width:100%;min-width:0}.provider-key-settings{display:grid;gap:12px;padding:16px;border:1px solid var(--line);border-radius:14px;background:#ffffff03}.provider-settings-heading{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}.provider-settings-heading>div{display:grid;gap:4px;min-width:0}.provider-settings-heading h4{font-size:var(--font-body)}.provider-settings-heading p,.provider-settings-hint{font-size:var(--font-caption);line-height:1.6;color:var(--muted)}.provider-key-state{font-size:var(--font-caption);color:var(--muted)}.provider-key-state.configured{color:var(--mint)}.provider-key-state.missing{color:var(--accent)}.provider-key-entry{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;min-width:0}.provider-key-entry>.form-field{flex:0 1 420px;max-width:420px;min-width:min(100%,260px)}.provider-key-entry input{width:100%;height:42px;min-height:42px}.provider-key-entry .save-button{height:42px;min-height:42px;padding:7px 14px;font-size:var(--font-body);white-space:nowrap}.provider-settings-hint{display:block}.provider-settings-message{font-size:var(--font-caption);line-height:1.6}.provider-settings-message.error{color:var(--danger)}.provider-settings-message.notice{color:var(--mint)}
 </style>
