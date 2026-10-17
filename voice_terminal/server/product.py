@@ -556,7 +556,7 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     next_tts = replace(
         config.tts,
         backend=backend,
-        sample_rate=resolve_tts_sample_rate(backend, str(local_model), config.tts.sample_rate),
+        sample_rate=resolve_tts_sample_rate(backend, str(local_model), config.tts.online_sample_rate),
         provider="minimax",
         local_model=str(local_model),
         local_optimization=tts.get("local_optimization", config.tts.local_optimization),

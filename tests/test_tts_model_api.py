@@ -148,7 +148,7 @@ def test_queued_selection_keeps_last_target_and_respects_explicit_stop(tmp_path)
     asyncio.run(scenario())
 
 
-def test_backend_switch_preserves_player_instance_and_other_components(tmp_path):
+def test_backend_switch_restores_online_clock_and_preserves_player_instance(tmp_path):
     async def scenario():
         runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "data")
         old = runtime.tts = SimpleNamespace(shutdown=AsyncMock())
@@ -159,7 +159,11 @@ def test_backend_switch_preserves_player_instance_and_other_components(tmp_path)
         runtime.initialize = AsyncMock()
         local = SimpleNamespace(ensure_ready=AsyncMock(), prewarm=AsyncMock(return_value={"status": "READY"}), close=AsyncMock())
         remote = SimpleNamespace(ensure_ready=AsyncMock(), prewarm=AsyncMock(return_value={"status": "READY"}), close=AsyncMock())
-        runtime._build_tts_clients = lambda: (remote, local)
+        configured_rates = []
+        def build_tts_clients():
+            configured_rates.append(runtime.config.tts.sample_rate)
+            return remote, local
+        runtime._build_tts_clients = build_tts_clients
         runtime._active_voice_snapshot = lambda model: object()
         async with runtime._session_lock:
             await asyncio.wait_for(runtime.switch_tts_selection("voxcpm1", "voxcpm2"), 1)
@@ -168,7 +172,8 @@ def test_backend_switch_preserves_player_instance_and_other_components(tmp_path)
         assert runtime.player is player and runtime.vad is vad
         async with runtime._session_lock:
             await runtime.switch_tts_selection("minimax", "voxcpm2")
-        assert runtime.config.tts.sample_rate == player.sample_rate == 48000
+        assert runtime.config.tts.sample_rate == player.sample_rate == 32000
+        assert configured_rates == [48000, 32000]
         runtime.close.assert_not_awaited()
         runtime.initialize.assert_not_awaited()
     asyncio.run(scenario())

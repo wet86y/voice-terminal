@@ -186,7 +186,7 @@ async def _online_checks(config) -> list[Check]:
             model=config.tts.model,
             api_key=config.api_key(config.tts.api_key_env),
             output_format=config.tts.output_format,
-            sample_rate=config.tts.sample_rate,
+            sample_rate=config.tts.online_sample_rate,
             voice_id=config.tts.voice_id,
             timeout_ms=config.tts.timeout_ms,
             transport=config.tts.transport,
