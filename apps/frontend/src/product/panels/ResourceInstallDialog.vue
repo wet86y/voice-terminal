@@ -11,7 +11,8 @@ const updatePending = computed(() => {
   return resource?.update_available === true
 })
 const voiceServerUpdatePending = computed(() => updatePending.value
-  && props.controller.pendingDownloadPlan.value?.resource_id === 'voice-server')
+  && ['voice-server', 'voice-runtime-cpu'].includes(props.controller.pendingDownloadPlan.value?.resource_id ?? ''))
+const gpuDependencyPlan = computed(() => props.controller.pendingDownloadPlan.value?.resource_id === 'voice-runtime-gpu') // gpuDependencyPlan（可选显卡依赖安装）。
 const agentResourcePlan = computed(() => props.controller.pendingDownloadPlan.value?.resource_id === 'dsh')
 const targetModelVersion = computed(() => {
   const plan = props.controller.pendingDownloadPlan.value
@@ -31,7 +32,8 @@ watch(() => props.controller.pendingDownloadBundlePlan.value, bundle => {
 const selectedBundlePlans = computed(() => bundlePlans.value.filter(plan => selectedBundleIds.value.has(plan.resource_id)))
 const hasOptionalBundlePlans = computed(() => bundlePlans.value.some(plan => bundleEntries.value.find(entry => entry.id === plan.resource_id)?.optional))
 const bundleOnlyBusy = computed(() => !bundlePlans.value.length && bundleEntries.value.some(entry => entry.busy))
-const bundleEnvironment = computed(() => selectedBundlePlans.value.find(plan => plan.environment)?.environment ?? null)
+const bundleEnvironment = computed(() => selectedBundlePlans.value.find(plan => plan.environment?.profile === 'cu128')?.environment
+  ?? selectedBundlePlans.value.find(plan => plan.environment)?.environment ?? null)
 const bundleSharedResources = computed(() => {
   const resources = new Map<string, { resource_id: string; title: string; download_bytes: number }>()
   for (const plan of selectedBundlePlans.value) {
@@ -70,6 +72,7 @@ function confirmBundle() {
       <p v-if="controller.pendingDownloadPlan.value.resource_id.startsWith('tts-')">本地语音运行程序独立安装，默认参考音频由本体提供；下载完成后可在语音与音色页选择播放后端。</p>
       <p v-if="!controller.pendingDownloadPlan.value.environment && !controller.pendingDownloadPlan.value.resource_id.startsWith('tts-')">{{ voiceServerUpdatePending ? '本次将更新语音运行环境依赖。' : agentResourcePlan ? `本次将${updatePending ? '更新' : '下载'}代理执行组件文件。` : `本次仅${updatePending ? '更新' : '下载'}模型文件。运行依赖请在 Voice Server（语音服务）中配置。` }}</p>
       <template v-if="controller.pendingDownloadPlan.value.environment">
+        <p v-if="gpuDependencyPlan">这是可选显卡运行依赖。将为现用语音环境安装配套的 PyTorch（张量框架）与 torchaudio（音频扩展）显卡版，继续复用已有模型；未安装时可继续使用 CPU（中央处理器）。安装后仍需通过本机显卡检查。</p>
         <p v-if="controller.pendingDownloadPlan.value.environment.already_ready">
           {{ lightweightVadPlan ? '轻量语音检测所需运行依赖已就绪，将检查并复用本地依赖。' : voiceServerUpdatePending ? '语音运行环境依赖已就绪，将按当前随包版本重新检查并复用本地依赖。' : '现用完整运行环境已就绪，将检测并复用已安装依赖。' }}
         </p>
@@ -125,7 +128,7 @@ function confirmBundle() {
         </template>
       </template>
       <div class="install-plan-actions">
-        <button class="outline-button" :disabled="!selectedBundlePlans.length" @click="confirmBundle">{{ selectedBundlePlans.length ? `开始下载 ${selectedBundlePlans.length} 项` : bundlePlans.length ? hasOptionalBundlePlans ? '请选择本地模型' : '暂无可下载资源' : bundleOnlyBusy ? '已有任务处理中' : '资源已就绪，无需下载' }}</button>
+        <button class="outline-button" :disabled="!selectedBundlePlans.length" @click="confirmBundle">{{ selectedBundlePlans.length ? `开始下载 ${selectedBundlePlans.length} 项` : bundlePlans.length ? hasOptionalBundlePlans ? '请选择可选组件' : '暂无可下载资源' : bundleOnlyBusy ? '已有任务处理中' : '资源已就绪，无需下载' }}</button>
         <button class="outline-button" @click="controller.pendingDownloadBundlePlan.value = null">返回</button>
       </div>
     </section>

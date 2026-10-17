@@ -9,6 +9,33 @@ pub fn model_group(id:&str)->&'static str {match id {
     "kws-sherpa-onnx"=>"sherpa-cpu",_=>"onnx-cpu"
 }}
 pub fn lock(context:&LaunchContext)->Result<Value,String>{resources::load(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))}
+pub const CPU_RESOURCE: &str = "voice-runtime-cpu"; // CPU_RESOURCE（必需中央处理器依赖卡片编号）。
+pub const GPU_RESOURCE: &str = "voice-runtime-gpu"; // GPU_RESOURCE（可选显卡依赖卡片编号）。
+pub fn gpu_requested(group:&str)->bool{matches!(group,"gpu"|GPU_RESOURCE)}
+fn managed_gpu(record:&Value)->bool{record["gpu_profile"]=="cu128"}
+fn has_gpu(record:&Value)->bool{managed_gpu(record)||record["compatible_gpu"]==true||record["profile"]=="cu128"}
+fn gpu_lock_path(context:&LaunchContext)->PathBuf{context.installed_program().join("config/runtime/voice-gpu.lock.json")}
+fn effective_lock(context:&LaunchContext,gpu:bool)->Result<Value,String>{
+    let mut value=lock(context)?;
+    if gpu{
+        let overlay=resources::load(&gpu_lock_path(context))?;
+        let rows=overlay["wheels"].as_array().ok_or("显卡依赖锁缺少包集合")?;
+        let names=rows.iter().filter_map(|row|row["name"].as_str()).collect::<std::collections::BTreeSet<_>>();
+        if overlay["schema"]!=1||overlay["profile"]!="cu128"||rows.len()!=2||names!=std::collections::BTreeSet::from(["torch","torchaudio"]){return Err("可选显卡依赖锁格式或包集合无效".into());}
+        let mut replaced=0;
+        for row in value["wheels"].as_array_mut().ok_or("基础依赖锁缺少包集合")?{
+            if let Some(replacement)=rows.iter().find(|item|item["name"]==row["name"]){
+                let version=row["version"].as_str().ok_or("基础依赖版本缺失")?.split('+').next().unwrap();
+                if replacement["version"]!=format!("{version}+cu128"){return Err("显卡依赖与基础依赖版本不匹配".into());}
+                let groups=row["groups"].clone();*row=replacement.clone();row["groups"]=groups;replaced+=1;
+            }
+        }
+        if replaced!=2{return Err("基础依赖锁缺少配套张量依赖".into());}
+    }Ok(value)
+}
+fn gpu_current(context:&LaunchContext,record:&Value)->bool{
+    managed_gpu(record)&&effective_lock(context,true).is_ok()&&file_hash(&gpu_lock_path(context)).is_ok_and(|digest|record["gpu_lock_sha256"]==digest)
+}
 pub fn fingerprint(root:&Path)->Result<String,String>{
     use sha2::{Sha256,Digest};
     let mut rows=vec![];
@@ -53,8 +80,16 @@ pub fn status(context:&LaunchContext)->Result<Value,String>{
     }
     let full_ready=ENVIRONMENT_GROUPS.iter().all(|key|groups[*key]["ready"]==true);
     let update_available=installed&&current_digest.is_some()&&!full_ready;
-    Ok(json!({"interpreter_ready":installed,"service_ready":groups["voice-core"]["ready"],"full_ready":full_ready,"python":context.python,"version":record["python"],"update_available":update_available,"groups":groups,
-        "fields":{"interpreter_ready":"私有解释器存在","service_ready":"基础语音依赖已验证","full_ready":"六个完整语音依赖组均与当前锁定清单一致","python":"私有解释器路径","version":"解释器版本","update_available":"安装环境的依赖锁版本可更新","groups":"内部共享依赖组","ready":"该组就绪","reason":"未就绪原因"}}))
+    let gpu_installed=installed&&has_gpu(&record);
+    let gpu_ready=full_ready&&gpu_current(context,&record);
+    let component=|id:&str,label:&str,required:bool,present:bool,ready:bool,update:bool|json!({
+        "resource_id":id,"parent_resource_id":"voice-server","label":label,"required":required,
+        "installation_state":if present{"installed"}else{"missing"},"files_installed":present,"runtime_ready":ready,"can_start":ready,"update_available":update,
+        "fields":{"resource_id":"运行依赖卡片编号","parent_resource_id":"所属语音服务组件","label":"卡片名称","required":"是否参与整体启动门槛","installation_state":"安装状态","files_installed":"依赖已登记安装","runtime_ready":"依赖与当前锁定版本匹配；显卡实际可用性另行检测","can_start":"该组运行依赖已就绪","update_available":"已安装依赖需要更新"}});
+    let components=vec![component(CPU_RESOURCE,"CPU（中央处理器）运行依赖",true,installed,full_ready,update_available),
+        resources::native_runtime_status(context)?,component(GPU_RESOURCE,"GPU（图形处理器）运行依赖",false,gpu_installed,gpu_ready,gpu_installed&&!gpu_ready)];
+    Ok(json!({"interpreter_ready":installed,"service_ready":groups["voice-core"]["ready"],"full_ready":full_ready,"python":context.python,"version":record["python"],"update_available":update_available,"groups":groups,"components":components,
+        "fields":{"interpreter_ready":"私有解释器存在","service_ready":"基础语音依赖已验证","full_ready":"六个必需语音依赖组与基础锁定清单一致，不要求安装可选显卡或原生语音依赖","python":"私有解释器路径","version":"解释器版本","update_available":"必需运行环境的依赖锁版本可更新","groups":"内部共享依赖组","components":"语音服务下三个运行依赖卡片","ready":"该组就绪","reason":"未就绪原因"}}))
 }
 pub fn system_candidates()->Vec<PathBuf>{
     // qualification（隔离验收）允许检查纯下载路线，正式构建不接受此开关。
@@ -109,16 +144,19 @@ fn worker_result(bytes:&[u8],diagnostic:&[u8],status:ExitStatus,operation:&str)-
     Err(format!("Python（运行环境）检查失败，步骤 {operation}（工作进程操作），退出码 {}：{detail}",status.code().map(|code|format!("{code} / 0x{:08X}",code as u32)).unwrap_or_else(||"未知".into())))
 }
 pub fn plan(context:&LaunchContext,group:&str)->Result<Value,String>{
-    let lock=lock(context)?;let names=requested(&lock,"all")?;let state=status(context)?;let mut candidates=vec![];
+    let existing=resources::load(&context.install.join("runtimes/python/runtime.json")).unwrap_or(Value::Null);
+    let gpu=gpu_requested(group)||managed_gpu(&existing);
+    let lock=effective_lock(context,gpu)?;let names=requested(&lock,"all")?;let state=status(context)?;let mut candidates=vec![];
     let cancel=AtomicBool::new(false);
     for path in system_candidates(){
         let result=worker(context,&path,"interpreter",&[],&cancel);
         candidates.push(json!({"path":path,"accepted":result.as_ref().is_ok_and(|v|v["official"]==true),"result":result.unwrap_or_else(|e|json!({"reason":e}))}));
     }
     let wheels:Vec<_>=lock["wheels"].as_array().ok_or("缺少依赖锁")?.iter().filter(|v|names.iter().any(|n|v["name"]==*n)).cloned().collect();
-    Ok(json!({"group":group,"already_ready":state["full_ready"].clone(),"python":lock["python"],"wheels":wheels,"system_candidates":candidates,
+    let ready=state["full_ready"]==true&&(!gpu_requested(group)||gpu_current(context,&existing));
+    Ok(json!({"group":group,"resource_id":if gpu_requested(group){GPU_RESOURCE}else{CPU_RESOURCE},"required":!gpu_requested(group),"profile":if gpu{"cu128"}else{"cpu"},"already_ready":ready,"python":lock["python"],"wheels":wheels,"system_candidates":candidates,
         "total_bytes":wheels.iter().map(|v|v["size"].as_u64().unwrap_or(0)).sum::<u64>()+lock["python"]["size"].as_u64().unwrap_or(0),
-        "fields":{"group":"安装依赖组","already_ready":"完整匹配可跳过","system_candidates":"可复用的官方解释器候选","accepted":"筛选通过","wheels":"固定依赖包","total_bytes":"未扣除复用的最大下载大小"}}))
+        "fields":{"group":"安装依赖组","resource_id":"运行依赖卡片编号","required":"是否为必需依赖","profile":"本次安装计算组合；处理器依赖更新保留已安装显卡组合","already_ready":"完整匹配可跳过","system_candidates":"可复用的官方解释器候选","accepted":"筛选通过","wheels":"本次完整环境的固定依赖包；含显卡时只替换张量框架与音频扩展","total_bytes":"未扣除复用的最大下载大小"}}))
 }
 fn spec(value:&Value)->Result<DownloadFile,String>{Ok(DownloadFile{url:value["url"].as_str().ok_or("依赖来源缺失")?.into(),size:value["size"].as_u64().ok_or("大小缺失")?,sha256:value["sha256"].as_str().ok_or("摘要缺失")?.into(),sha512:String::new(),path:value["file"].as_str().unwrap_or("python.zip").into()})}
 fn valid_cached_with_progress(path:&Path,item:&Value,cancel:&AtomicBool,progress:&mut Progress)->Result<bool,String>{
@@ -173,15 +211,17 @@ pub fn configure(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progre
     configure_with_activation(context,group,cancel,progress,&mut|stage,relative|resources::activate(context,stage,relative))
 }
 pub fn configure_with_activation(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut resources::Activation)->Result<Vec<String>,String>{
-    let _=group; // group（兼容接口参数）：更新运行环境始终原子替换完整依赖集合。
-    configure_inner(context,"all",cancel,progress,true,enable)
+    if !matches!(group,"all"|"base"|"cpu"|CPU_RESOURCE|"gpu"|GPU_RESOURCE)&&!ENVIRONMENT_GROUPS.contains(&group){return Err("未知的语音运行依赖卡片".into());}
+    // group（安装请求）：显卡卡片升级现用完整环境，其余入口更新必需依赖并保留已装显卡能力。
+    configure_inner(context,group,cancel,progress,true,enable)
 }
 fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,allow_reuse:bool,enable:&mut resources::Activation)->Result<Vec<String>,String>{
     resources::check_cancel(&cancel)?;progress("检查现有语音环境登记",0,0);
-    let lock=lock(context)?;let requested=requested(&lock,group)?;
     let state=status(context)?;
     let old=context.install.join("runtimes/python");
     let existing=resources::load(&old.join("runtime.json")).unwrap_or(Value::Null);
+    let gpu=gpu_requested(group)||managed_gpu(&existing);
+    let lock=effective_lock(context,gpu)?;let requested=requested(&lock,"all")?;
     let compatible_gpu=allow_reuse&&(existing["compatible_gpu"]==true||(existing["schema"]==1&&existing["profile"]=="cu128")||registered_gpu_environment(context,&old));
     let reusable_environment=if allow_reuse&&context.python.is_file(){
         let result=crate::workspace::verify_tree_with_progress(&old,"manifest.json",&cancel,&mut|phase,done,total|
@@ -193,10 +233,11 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
     }else{false};
     if compatible_gpu&&!reusable_environment{return Err("现用显卡运行环境完整性校验未通过，原环境保持不变；请修复或导入当前完整显卡环境后重试。".into());}
     let mut check_args=vec!["--names".into(),serde_json::to_string(&requested).unwrap(),"--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned()];
+    if gpu{check_args.extend(["--gpu-lock".into(),gpu_lock_path(context).to_string_lossy().into_owned()]);}
     if compatible_gpu{check_args.push("--compatible-gpu".into());}
-    if state["full_ready"]==true&&reusable_environment{
+    if state["full_ready"]==true&&reusable_environment&&(!gpu||gpu_current(context,&existing)){
         progress("检测完整语音依赖",0,0);
-        if worker(context,&context.python,"check",&check_args,&cancel)?["ready"]==true{progress("复用已校验完整环境",1,1);return Ok(vec!["voice-server".into()]);}
+        if worker(context,&context.python,"check",&check_args,&cancel)?["ready"]==true{progress("复用已校验完整环境",1,1);return Ok(installed_resources(gpu));}
     }
     let stage=safe_path(&context.install,"tmp/voice-environment/stage")?;remove_owned(&stage,&context.install)?;fs::create_dir_all(&stage).map_err(|e|e.to_string())?;
     let site=stage.join("Lib/site-packages");fs::create_dir_all(&site).map_err(|e|e.to_string())?;
@@ -213,15 +254,20 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
         files.push(old.join("manifest.json"));resources::copy_selected_verified(&old,&stage,files,&cancel,progress)?;
         prepare_search_paths(&stage)?;
         let inventory=worker(context,&stage.join("python.exe"),"inventory",&check_args,&cancel)?;
-        if compatible_gpu{ensure_gpu_core_reuse(&inventory)?;}
+        if compatible_gpu&&!gpu{ensure_gpu_core_reuse(&inventory)?;}
         reused.extend(inventory["reused"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned));
+        if gpu{
+            // 旧 CPU（中央处理器）包及元数据必须先从候选移除，避免同名双版本与旧动态库残留。
+            let replacements=["torch","torchaudio"].into_iter().filter(|name|!reused.iter().any(|item|item==name)).collect::<Vec<_>>();
+            if !replacements.is_empty(){worker(context,&stage.join("python.exe"),"prune",&["--target".into(),site.to_string_lossy().into_owned(),"--names".into(),serde_json::to_string(&replacements).unwrap()],&cancel)?;}
+        }
     }else{
         for path in if allow_reuse{system_candidates()}else{vec![]}{if worker(context,&path,"interpreter",&[],&cancel).is_ok_and(|v|v["official"]==true){official=Some(path);break;}}
         if let Some(path)=&official{
             progress("复用官方系统解释器",0,0);copy_interpreter(path,&stage,&cancel,progress)?;
         }else {embedded=true;}
     }
-    if let Some(path)=official{progress("核验本机依赖复用条件",0,0);let response=worker(context,&path,"reuse",&["--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned(),"--names".into(),serde_json::to_string(&requested).unwrap(),"--target".into(),site.to_string_lossy().into_owned()],&cancel)?;
+    if let Some(path)=official{progress("核验本机依赖复用条件",0,0);let mut reuse_args=check_args.clone();reuse_args.extend(["--target".into(),site.to_string_lossy().into_owned()]);let response=worker(context,&path,"reuse",&reuse_args,&cancel)?;
         reused.extend(response["reused"].as_array().unwrap_or(&vec![]).iter().filter_map(Value::as_str).map(str::to_owned));
     }
     progress("计算本次依赖总下载量",0,0);
@@ -278,27 +324,37 @@ fn configure_inner(context:&LaunchContext,group:&str,cancel:Arc<AtomicBool>,prog
     if checked["ready"]!=true{return Err(format!("运行依赖加载失败：{}",checked["errors"]));}
     resources::check_cancel(&cancel)?;
     let mut packages:std::collections::BTreeSet<String>=reused.into_iter().collect();packages.extend(requested);
-    atomic_json(&stage.join("runtime.json"),&json!({"schema":2,"python":"3.12.10","profile":if compatible_gpu{"compatible-private"}else{"cpu-private"},"compatible_gpu":compatible_gpu,"groups":groups,"packages":packages,"lock_sha256":file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))?,
-        "fields":{"schema":"运行环境记录格式","python":"解释器版本","profile":"私有环境组合","compatible_gpu":"按现有受支持策略复用兼容显卡依赖","groups":"已完成检查的完整依赖组","packages":"已安装依赖名称","lock_sha256":"固定运行依赖清单摘要"}}))?;
+    atomic_json(&stage.join("runtime.json"),&json!({"schema":2,"python":"3.12.10","profile":if gpu{"gpu-private"}else if compatible_gpu{"compatible-private"}else{"cpu-private"},"compatible_gpu":compatible_gpu,"groups":groups,"packages":packages,"lock_sha256":file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))?,
+        "gpu_profile":if gpu{Some("cu128")}else{None},"gpu_lock_sha256":if gpu{Some(file_hash(&gpu_lock_path(context))?)}else{None},
+        "fields":{"schema":"运行环境记录格式","python":"解释器版本","profile":"私有环境组合","compatible_gpu":"保留已验证的历史显卡依赖组合","gpu_profile":"可选显卡张量依赖组合；空值表示未通过显卡卡片安装","gpu_lock_sha256":"可选显卡依赖锁摘要；与基础依赖锁独立","groups":"已完成检查的完整依赖组","packages":"已安装依赖名称","lock_sha256":"必需运行依赖清单摘要"}}))?;
     totals.report(progress,"校验语音环境文件清单",0);
     atomic_json(&stage.join("manifest.json"),&crate::workspace::manifest_with_progress(&stage,"python",&crate::workspace::new_id(),&cancel,&mut|phase,done,total|
         progress(&format!("生成语音环境清单：{phase}"),done,total))?)?;
     totals.report(progress,"启用私有语音环境",0);resources::check_cancel(&cancel)?;enable(&stage,"runtimes/python")?;
-    Ok(vec!["voice-server".into()])
+    Ok(installed_resources(gpu))
 }
+fn installed_resources(gpu:bool)->Vec<String>{if gpu{vec!["voice-server".into(),CPU_RESOURCE.into(),GPU_RESOURCE.into()]}else{vec!["voice-server".into(),CPU_RESOURCE.into()]}}
 pub fn import(context:&LaunchContext,source:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress)->Result<Vec<String>,String>{
     resources::recover(context)?;
     import_with_activation(context,source,cancel,progress,&mut|stage,relative|resources::activate(context,stage,relative))
 }
 pub fn import_with_activation(context:&LaunchContext,source:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut resources::Activation)->Result<Vec<String>,String>{
+    import_profile_with_activation(context,source,"all",cancel,progress,enable)
+}
+pub fn import_profile_with_activation(context:&LaunchContext,source:&Path,group:&str,cancel:Arc<AtomicBool>,progress:&mut Progress,enable:&mut resources::Activation)->Result<Vec<String>,String>{
     let candidate=safe_path(&context.install,"tmp/voice-import")?;remove_owned(&candidate,&context.install)?;
     if source.is_file(){resources::unpack_zip(source,&candidate,&cancel,progress)?;}else{resources::copy_verified(source,&candidate,&cancel,progress)?;}
     crate::workspace::verify_tree_with_progress(&candidate,"manifest.json",&cancel,&mut|phase,done,total|
         progress(&format!("校验导入的语音环境：{phase}"),done,total))?;
+    let mut record=resources::load(&candidate.join("runtime.json"))?;
+    let existing=resources::load(&context.install.join("runtimes/python/runtime.json")).unwrap_or(Value::Null);
+    if has_gpu(&existing)&&!has_gpu(&record){return Err("现用环境已安装显卡依赖，不能用纯中央处理器环境覆盖；请导入包含显卡依赖的完整环境。".into());}
+    let gpu=managed_gpu(&record);
+    if gpu_requested(group)&&!gpu{return Err("所选环境未包含当前显卡依赖卡片，请使用下载入口配置，或导入当前显卡运行环境。".into());}
+    if gpu&&!gpu_current(context,&record){return Err("导入环境的显卡依赖锁已过期，请重新配置显卡运行依赖。".into());}
     let identity=worker(context,&candidate.join("python.exe"),"interpreter",&[],&cancel)?;
     if identity["version"]!="3.12.10"||identity["official"]!=true{return Err("解释器版本或架构不匹配".into());}
-    let mut record=resources::load(&candidate.join("runtime.json"))?;
-    let current_lock=lock(context)?;
+    let current_lock=effective_lock(context,gpu)?;
     let lock_sha256=file_hash(&context.installed_program().join("config/runtime/voice-runtime.lock.json"))?;
     let names=requested(&current_lock,"all")?;
     if !matches!(record["schema"].as_u64(),Some(1|2)){return Err("导入环境记录格式不受支持".into());}
@@ -306,6 +362,7 @@ pub fn import_with_activation(context:&LaunchContext,source:&Path,cancel:Arc<Ato
         return Err("导入环境的依赖锁版本已过期，请重新配置完整语音环境".into());
     }
     let mut check_args=vec!["--lock".into(),context.installed_program().join("config/runtime/voice-runtime.lock.json").to_string_lossy().into_owned()];
+    if gpu{check_args.extend(["--gpu-lock".into(),gpu_lock_path(context).to_string_lossy().into_owned()]);}
     if record["schema"]==1||record["compatible_gpu"]==true{check_args.push("--compatible-gpu".into());}
     check_args.extend(["--names".into(),serde_json::to_string(&names).unwrap()]);
     if worker(context,&candidate.join("python.exe"),"check",&check_args,&cancel)?["ready"]!=true{return Err("导入环境的完整语音依赖无法加载".into());}
@@ -317,12 +374,85 @@ pub fn import_with_activation(context:&LaunchContext,source:&Path,cancel:Arc<Ato
     record["fields"]["groups"]=json!("已完成检查的完整依赖组");record["fields"]["packages"]=json!("已安装依赖名称");record["fields"]["lock_sha256"]=json!("固定运行依赖清单摘要");
     atomic_json(&candidate.join("runtime.json"),&record)?;
     atomic_json(&candidate.join("manifest.json"),&crate::workspace::manifest_with_progress(&candidate,"python",&crate::workspace::new_id(),&cancel,progress)?)?;
-    resources::check_cancel(&cancel)?;progress("启用导入的语音环境",1,1);resources::check_cancel(&cancel)?;enable(&candidate,"runtimes/python")?;Ok(vec!["voice-server".into()])
+    resources::check_cancel(&cancel)?;progress("启用导入的语音环境",1,1);resources::check_cancel(&cancel)?;enable(&candidate,"runtimes/python")?;Ok(installed_resources(gpu))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_workspace()->(PathBuf,PathBuf,LaunchContext){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();
+        let root=owner.join(format!("voice-runtime-cards-{}",crate::workspace::new_id()));
+        crate::workspace::initialize(&root).unwrap();
+        fs::create_dir_all(root.join("app/config/runtime")).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();
+        fs::write(root.join("app/scripts/backend-entry.py"),"# 测试上下文").unwrap();
+        fs::write(root.join("app/scripts/voice-environment-worker.py"),"# 不执行安装").unwrap();
+        fs::write(root.join("app/config/runtime/voice-runtime.lock.json"),include_bytes!("../../../../config/runtime/voice-runtime.lock.json")).unwrap();
+        fs::write(root.join("app/config/runtime/voice-gpu.lock.json"),include_bytes!("../../../../config/runtime/voice-gpu.lock.json")).unwrap();
+        let runtime=root.join("runtimes/python");fs::create_dir_all(&runtime).unwrap();fs::write(runtime.join("python.exe"),b"fixture").unwrap();
+        atomic_json(&runtime.join("runtime.json"),&json!({"schema":2,"profile":"cpu-private","python":"3.12.10","groups":ENVIRONMENT_GROUPS,
+            "lock_sha256":file_hash(&root.join("app/config/runtime/voice-runtime.lock.json")).unwrap()})).unwrap();
+        let context=LaunchContext::portable(&root).unwrap();(owner,root,context)
+    }
+
+    #[test]
+    fn dependency_cards_require_only_cpu_and_missing_optional_locks_do_not_block_cpu(){
+        let (owner,root,context)=runtime_workspace();
+        fs::remove_file(gpu_lock_path(&context)).unwrap();
+        let state=status(&context).unwrap();let rows=state["components"].as_array().unwrap();
+        assert_eq!(state["full_ready"],true);assert_eq!(rows.len(),3);
+        assert_eq!(rows[0]["resource_id"],CPU_RESOURCE);assert_eq!(rows[0]["required"],true);assert_eq!(rows[0]["can_start"],true);
+        assert_eq!(rows[1]["resource_id"],"tts-audiocpp-runtime");assert_eq!(rows[1]["required"],false);
+        assert_eq!(rows[2]["resource_id"],GPU_RESOURCE);assert_eq!(rows[2]["required"],false);assert_eq!(rows[2]["can_start"],false);
+        assert!(effective_lock(&context,false).is_ok());assert!(effective_lock(&context,true).is_err());
+        assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
+    fn gpu_overlay_replaces_only_matching_tensor_wheels_and_keeps_one_interpreter(){
+        let (owner,root,context)=runtime_workspace();
+        let base=effective_lock(&context,false).unwrap();let gpu=effective_lock(&context,true).unwrap();
+        for row in base["wheels"].as_array().unwrap(){
+            let other=gpu["wheels"].as_array().unwrap().iter().find(|item|item["name"]==row["name"]).unwrap();
+            if ["torch","torchaudio"].iter().any(|name|row["name"]==*name){
+                assert_eq!(other["version"],"2.11.0+cu128");assert!(other["url"].as_str().unwrap().starts_with("https://download.pytorch.org/whl/cu128/"));
+                assert_eq!(other["groups"],row["groups"]);
+            }else{assert_eq!(row,other);}
+        }
+        assert_eq!(gpu["python"],base["python"]);assert!(!root.join("runtimes/python-gpu").exists());
+        let mut overlay=resources::load(&gpu_lock_path(&context)).unwrap();overlay["wheels"][0]["version"]=json!("2.10.0+cu128");
+        atomic_json(&gpu_lock_path(&context),&overlay).unwrap();assert!(effective_lock(&context,true).unwrap_err().contains("版本不匹配"));
+        assert_eq!(lock(&context).unwrap(),base);
+        assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
+    fn cpu_update_plan_preserves_gpu_and_optional_gpu_updates_keep_cpu_ready(){
+        let (owner,root,context)=runtime_workspace();let path=root.join("runtimes/python/runtime.json");
+        let mut record=resources::load(&path).unwrap();record["profile"]=json!("gpu-private");record["gpu_profile"]=json!("cu128");
+        record["gpu_lock_sha256"]=json!(file_hash(&gpu_lock_path(&context)).unwrap());atomic_json(&path,&record).unwrap();
+        let plan=plan(&context,"cpu").unwrap();assert_eq!(plan["profile"],"cu128");assert_eq!(plan["resource_id"],CPU_RESOURCE);
+        assert_eq!(status(&context).unwrap()["components"][2]["can_start"],true);
+        fs::write(gpu_lock_path(&context),b"{}").unwrap();let state=status(&context).unwrap();
+        assert_eq!(state["full_ready"],true);assert_eq!(state["update_available"],false);
+        assert_eq!(state["components"][2]["can_start"],false);assert_eq!(state["components"][2]["update_available"],true);
+        assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
+
+    #[test]
+    fn cpu_import_cannot_overwrite_installed_gpu_before_activation(){
+        let (owner,root,context)=runtime_workspace();let current=root.join("runtimes/python/runtime.json");
+        let mut record=resources::load(&current).unwrap();record["gpu_profile"]=json!("cu128");atomic_json(&current,&record).unwrap();
+        let source=root.join("tmp/import-cpu-source");fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("python.exe"),b"fixture").unwrap();atomic_json(&source.join("runtime.json"),&json!({"schema":2,"profile":"cpu-private"})).unwrap();
+        atomic_json(&source.join("manifest.json"),&resources::manifest(&source,"python","cpu-import").unwrap()).unwrap();
+        let before=file_hash(&current).unwrap();let mut activated=false;
+        let error=import_profile_with_activation(&context,&source,"cpu",Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},&mut|_,_|{activated=true;Ok(())}).unwrap_err();
+        assert!(error.contains("不能用纯中央处理器环境覆盖"));assert!(!activated);assert_eq!(file_hash(&current).unwrap(),before);
+        assert_eq!(root.parent(),Some(owner.as_path()));crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
 
     #[test]
     fn complete_environment_includes_all_model_and_download_dependencies() {

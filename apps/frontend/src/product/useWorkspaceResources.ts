@@ -168,7 +168,9 @@ export function useWorkspaceResources() {
           if (!mounted) return
           // 请求途中组件完成启用时，丢弃旧结果并在同一等待链中重新读取。
           if (checkedRevision === inventoryRevision) {
-            resources.value = inventory
+            // runtime_components（运行依赖子卡片）保留父子结构，并进入统一资源查找与任务刷新链路。
+            const children = inventory.flatMap(resource => resource.runtime_components ?? [])
+            resources.value = [...inventory, ...children.filter(child => !inventory.some(resource => resource.resource_id === child.resource_id))]
             inventoryUpdatedAt.value = Date.now()
             resourceError.value = ''
           }

@@ -245,9 +245,11 @@ def hardware_status(*, refresh: bool = False, onnx_only: bool = False) -> dict[s
             cached = _capabilities
     result = copy.deepcopy(cached)
     if not os.environ.get("VOICE_GPU_PROBE") and not os.environ.get("VOICE_GPU_FALLBACK"):
-        from .gpu_environment import registered
+        from .gpu_environment import registered, managed_runtime
         install = Path(os.environ.get("VOICE_INSTALL_ROOT", ".local"))
         data = Path(os.environ.get("VOICE_DATA_DIR", str(install / "data")))
+        program = Path(os.environ.get('VOICE_PROGRAM_ROOT', str(install / 'app')))
+        managed = managed_runtime(install, program)
         registration = registered(install, data)
         if registration:
             result["models"] = registration.get("models", {})
@@ -266,7 +268,7 @@ def hardware_status(*, refresh: bool = False, onnx_only: bool = False) -> dict[s
                     lock_digest=hashlib.sha256((program/'config/runtime/voice-runtime.lock.json').read_bytes()).hexdigest()
                     compatible=runtime_record.get('lock_sha256')==lock_digest
             except (OSError,ValueError,AttributeError): compatible=False
-            if not compatible or (data/'config/gpu-environment.json').is_file():
+            if not managed and (not compatible or (data/'config/gpu-environment.json').is_file()):
                 for capability in result.get('models',{}).values():
                     capability.update(gpu_available=False,reason='显卡环境未登记或版本已变化，请在组件页面重新检测。')
     if os.environ.get("VOICE_GPU_FALLBACK"):

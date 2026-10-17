@@ -64,7 +64,7 @@ const systemComponents = computed(() => (application.snapshot.value?.components 
 function managedResource(resourceId: string): ManagedResourceRow | undefined {
   const resource = props.resourceController?.resources.value.find(row => row.resource_id === resourceId)
   if (!resource) return undefined
-  const jobs = props.resourceController?.resourceJobs.value.filter(job => job.resource_id === resourceId) ?? []
+  const jobs = props.resourceController?.resourceJobs.value.filter(job => job.resource_id === resourceId || resourceId === 'voice-runtime-cpu' && job.resource_id === 'voice-server') ?? []
   const active = jobs.some(job => !['complete', 'completed', 'failed', 'cancelled', 'canceled'].includes(job.state))
   const failed = jobs.some(job => job.state === 'failed')
   return {
@@ -216,6 +216,10 @@ const rows = computed<LocalComponentRow[]>(() => {
       description: loading && !failure ? active && retrying.value.has(active.id) && !active.retrying ? '正在重新启动组件' : active?.phase || '等待系统服务启动' : '统一管理桌面窗口、界面服务、应用宿主、环境检查与语音服务。',
       error: failure ? `${failure.name}：${failure.error || failure.phase}` : undefined,
       resource: managedResource('voice-server'),
+      runtimeDependencies: environment?.runtime_components?.flatMap(resource => {
+        const managed = managedResource(resource.resource_id)
+        return managed ? [{ ...managed, label: resource.label }] : []
+      }),
       facts: [
         ...(environment?.python ? [{ label: 'Python（后端解释器）', value: environment.python }] : []),
         ...(environment?.version ? [{ label: '解释器版本', value: environment.version }] : []),
@@ -232,7 +236,7 @@ const rows = computed<LocalComponentRow[]>(() => {
     || capability && ['STARTING', 'LOADING', 'WAITING', 'CONNECTING', 'RETRYING'].includes(capability.state))
   const ttsFailed = !ttsLoading && (Boolean(capability) || ttsResource?.can_start === false || tts.status.value?.load_state === 'error')
   const ttsBackend = tts.status.value?.backend ?? settings.tts.backend
-  const selectedLocalModel = ttsBackend === 'voxcpm1' || ttsBackend === 'voxcpm2' ? `tts-${ttsBackend}` : undefined
+  const selectedLocalModel = ttsBackend === 'voxcpm1' ? `tts-${tts.status.value?.local_model ?? settings.tts.local_model ?? 'voxcpm1'}` : undefined
   const localRuntime = managedResource('tts-audiocpp-runtime')
   const localRuntimeReady = localRuntime?.state === 'installed' && !localRuntime.updateAvailable
   const localModelResources = ['tts-voxcpm1', 'tts-voxcpm2']

@@ -96,6 +96,61 @@ def install(wheels,site):
             records.append(path.name)
     return {'installed':records}
 
+
+def runtime_lock(path, gpu_path=None):
+    """runtime_lock（有效依赖锁）：可选显卡锁仅替换两个配套张量依赖。"""
+    value = json.loads(Path(path).read_text('utf-8'))
+    if gpu_path:
+        gpu = json.loads(Path(gpu_path).read_text('utf-8'))
+        rows = gpu.get('wheels', [])
+        if (gpu.get('schema') != 1 or gpu.get('profile') != 'cu128' or len(rows) != 2
+                or {row.get('name') for row in rows} != {'torch', 'torchaudio'}):
+            raise ValueError('可选显卡依赖锁格式或包集合无效')
+        replacements = {row['name']: row for row in rows}
+        replaced = 0
+        for row in value['wheels']:
+            replacement = replacements.get(row['name'])
+            if replacement:
+                if replacement['version'] != row['version'].split('+')[0] + '+cu128':
+                    raise ValueError('显卡依赖与基础依赖版本不匹配')
+                row.update(replacement)
+                replaced += 1
+        if replaced != 2:
+            raise ValueError('基础依赖锁缺少配套张量依赖')
+    return value
+
+
+def prune(site, names):
+    """prune（清理候选旧包）：仅删除暂存环境内的记录文件，源环境保持完整。"""
+    site = Path(site).resolve()
+    # RECORD（安装文件记录）可能包含环境外脚本；这些入口没有复制/解包到候选中，不删除它们。
+    selected = set(names)
+    if not selected.issubset({'torch', 'torchaudio'}):
+        raise ValueError('仅允许替换配套张量依赖')
+    paths = set()
+    for distribution in metadata.distributions(path=[str(site)]):
+        if distribution.metadata['Name'].lower().replace('_', '-') not in selected:
+            continue
+        if not distribution.files:
+            raise ValueError('候选旧依赖缺少完整安装文件记录')
+        for relative in distribution.files:
+            if '..' in Path(str(relative)).parts or Path(str(relative)).is_absolute():
+                continue
+            source = safe(site, str(relative))
+            if source.is_file():
+                paths.add(source)
+    # 所有路径先验证，再执行删除，防止遇到链接时留下半清理的候选。
+    parents = set()
+    for path in paths:
+        path.unlink()
+        parents.update(parent for parent in path.parents if parent != site and parent.is_relative_to(site))
+    for parent in sorted(parents, key=lambda path: len(path.parts), reverse=True):
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
+    return {'removed_files': len(paths)}  # removed_files（已清理的候选文件数）。
+
 def defender_injected_module(path):
     """Defender module（系统防护注入模块）：核验固定系统位置和微软有效签名。"""
     program_data=os.environ.get('ProgramData')
@@ -169,7 +224,10 @@ def check(names, lock=None, compatible_gpu=False):
     for name in names:
         try:
             installed_version(name,lock,compatible_gpu)
-            if name in modules: importlib.import_module(modules[name])
+            if name in modules:
+                module = importlib.import_module(modules[name])
+                if name == 'torch' and module.tensor([1., 2.], device='cpu').sum().item() != 3.:
+                    raise ValueError('张量运行库的 CPU（中央处理器）计算验证失败')
         except Exception as error: errors[name]=f'{type(error).__name__}: {error}'[:300]
     if lock and not errors:
         try: dynamic_library_closure()
@@ -177,14 +235,16 @@ def check(names, lock=None, compatible_gpu=False):
     return {'ready':not errors,'errors':errors}
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['interpreter','reuse','inventory','install','check','gpu'])
+    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['interpreter','reuse','inventory','install','prune','check','gpu'])
     parser.add_argument('--compatible-gpu',action='store_true') # compatible_gpu（允许复用项目已验证的显卡组合）。
+    parser.add_argument('--gpu-lock')  # gpu_lock（可选显卡依赖锁文件）。
     parser.add_argument('--lock');parser.add_argument('--names',default='[]');parser.add_argument('--target');parser.add_argument('--wheels',default='[]');parser.add_argument('--model');parser.add_argument('--program');parser.add_argument('--install-root');args=parser.parse_args()
     names=json.loads(args.names)
     if args.operation=='interpreter': result=interpreter()
-    elif args.operation=='reuse': result=reuse(json.loads(Path(args.lock).read_text('utf-8')),names,Path(args.target))
-    elif args.operation=='inventory': result=inventory(names,json.loads(Path(args.lock).read_text('utf-8')),args.compatible_gpu)
+    elif args.operation=='reuse': result=reuse(runtime_lock(args.lock,args.gpu_lock),names,Path(args.target))
+    elif args.operation=='inventory': result=inventory(names,runtime_lock(args.lock,args.gpu_lock),args.compatible_gpu)
     elif args.operation=='install': result=install([Path(path) for path in json.loads(args.wheels)],Path(args.target))
+    elif args.operation=='prune': result=prune(Path(args.target),names)
     elif args.operation=='gpu':
         sys.path.insert(0,args.program)
         os.environ['VOICE_GPU_PROBE']='1'
@@ -196,7 +256,7 @@ def main():
             except Exception as error: result.update(gpu_available=False,reason=f'{type(error).__name__}: {error}'[:400])
         else:result.update(gpu_available=False,reason='共享工作进程所需依赖缺失：'+str(result['errors']))
         result.update(environment_fingerprint=fingerprint(Path(sys.executable).parent),models_fingerprint=fingerprint(root/'models'))
-    else: result=check(names,json.loads(Path(args.lock).read_text('utf-8')) if args.lock else None,args.compatible_gpu)
+    else: result=check(names,runtime_lock(args.lock,args.gpu_lock) if args.lock else None,args.compatible_gpu)
     emit({'ok':True,'result':result})
 
 if __name__=='__main__':

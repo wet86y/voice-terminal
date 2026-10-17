@@ -51,8 +51,8 @@ async function expandComponent(wrapper: ReturnType<typeof mount>, id: string, ca
   const categoryToggle = wrapper.get(`[data-category="${category}"] .local-category-toggle`)
   if (categoryToggle.attributes('aria-expanded') !== 'true') await categoryToggle.trigger('click')
   const card = wrapper.get(`[data-component="${id}"]`)
-  const detailToggle = card.get('.local-component-action')
-  if (detailToggle.attributes('aria-expanded') !== 'true') await detailToggle.trigger('click')
+  const detailToggle = card.find('.local-component-action')
+  if (detailToggle.exists() && detailToggle.attributes('aria-expanded') !== 'true') await detailToggle.trigger('click')
   return card
 }
 function button(wrapper: ReturnType<typeof mount>, label: string) {
@@ -546,8 +546,8 @@ describe('正式界面的真实控件交互', () => {
     expect(card.get('.local-state').text()).toBe('需更新')
     expect(card.get('button[aria-label="Paraformer（流式识别）：更新"]').text()).toBe('更新')
     expect(card.get('button[aria-label="Paraformer（流式识别）：导入"]').text()).toBe('导入')
-    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').text()).toBe('来源说明')
-    expect(card.get('.local-component-action').text()).toBe('收起详情')
+    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').text()).toBe('跳转来源')
+    expect(card.find('.local-component-action').exists()).toBe(false)
     await card.get('button[aria-label="Paraformer（流式识别）：更新"]').trigger('click')
     await flushPromises()
     expect(wrapper.get('#install-plan-title').text()).toContain('准备更新 Paraformer')
@@ -605,8 +605,9 @@ describe('正式界面的真实控件交互', () => {
     } as unknown as ApplicationSnapshot
     await flushPromises()
     expect(wrapper.find('.voice-environment').exists()).toBe(false)
-    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(12)
-    expect(wrapper.findAll('[data-component="tts"]')).toHaveLength(1)
+    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(13)
+    expect(wrapper.findAll('[data-component="voxcpm"]')).toHaveLength(1)
+    expect(wrapper.findAll('[data-component="minimax"]')).toHaveLength(1)
     expect(wrapper.find('[data-component="local-tts"]').exists()).toBe(false)
     expect(wrapper.find('[data-component="hotwords"]').exists()).toBe(true)
     expect(wrapper.find('[data-component="punctuation"]').exists()).toBe(true)
@@ -615,7 +616,7 @@ describe('正式界面的真实控件交互', () => {
     await expandComponent(wrapper, 'campplus', 'extensions')
     await expandComponent(wrapper, 'dsh', 'inference')
     await expandComponent(wrapper, 'voice-system', 'voice-server')
-    expect(wrapper.findAll('[data-metric="memory"]')).toHaveLength(5)
+    expect(wrapper.findAll('.local-component-card [data-metric="memory"]')).toHaveLength(5)
     expect(wrapper.get('[data-component="paraformer"] [data-metric="memory"]').text()).toContain('100 MB / 1000 MB')
     expect(wrapper.get('[data-component="sensevoice"] [data-metric="memory"]').text()).toContain('200 MB')
     expect(wrapper.get('[data-component="voice-system"] [data-metric="memory"]').text()).toContain('440 MB')
@@ -782,19 +783,20 @@ describe('正式界面的真实控件交互', () => {
     ] } as unknown as ApplicationSnapshot
     await flushPromises()
     expect(wrapper.find('.voice-environment').exists()).toBe(false)
-    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(12)
-    expect(wrapper.findAll('[data-component="tts"]')).toHaveLength(1)
+    expect(wrapper.findAll('.local-component-card[data-component]')).toHaveLength(13)
+    expect(wrapper.findAll('[data-component="voxcpm"]')).toHaveLength(1)
+    expect(wrapper.findAll('[data-component="minimax"]')).toHaveLength(1)
     expect(wrapper.find('[data-component="local-tts"]').exists()).toBe(false)
     expect(wrapper.get('.local-overview .local-state').text()).toBe('组件启动中')
     // 模型启动状态与独立原生环境管理卡片的接口错误分别核对。
     expect(wrapper.find('.local-component-list .local-error').exists()).toBe(false)
     expect(wrapper.find('.retry-action').exists()).toBe(false)
-    expect(wrapper.get('[data-component="tts"] .local-component-action').attributes('disabled')).toBeUndefined()
-    expect(wrapper.get('[data-component="tts"] .local-component-action').text()).toBe('详情')
-    for (const row of wrapper.findAll('.local-component-card[data-component]').filter(row => row.attributes('data-component') !== 'tts')) {
+    expect(wrapper.get('[data-component="minimax"] .local-component-action').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-component="minimax"] .local-component-action').text()).toBe('展开')
+    for (const row of wrapper.findAll('.local-component-card[data-component]').filter(row => !['voxcpm', 'minimax'].includes(row.attributes('data-component') ?? ''))) {
       expect(row.classes()).toContain('loading')
       expect(row.get('.local-state').text()).toBe('启动中')
-      expect(row.get('.local-component-action').text()).toBe('详情')
+      expect(row.get('.local-component-action').text()).toBe('展开')
       expect(row.get('.local-component-action').attributes('disabled')).toBeUndefined()
       expect(row.get('.local-component-phase').text()).toBe('正在加载组件')
     }

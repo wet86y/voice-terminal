@@ -39,7 +39,7 @@ const componentIdByResource: Record<string, string> = {
   'campplus-zh-cn-common': 'campplus', dsh: 'dsh', 'voice-server': 'voice-system',
 }
 
-function resourceJobsFor(resourceId: string) { return resources.resourceJobs.value.filter(job => job.resource_id === resourceId) }
+function resourceJobsFor(resourceId: string) { return resources.resourceJobs.value.filter(job => job.resource_id === resourceId || resourceId === 'voice-runtime-cpu' && job.resource_id === 'voice-server') }
 function resourceIsBusy(resourceId: string) {
   return resources.startingResources.value.has(resourceId)
     || resources.pendingDownloadPlan.value?.resource_id === resourceId
@@ -85,6 +85,7 @@ function resourceRow(item: ResourceStatus, category: LocalComponentCategory): Lo
       ...(item.resource_id === 'voice-server' && item.version ? [{ label: '解释器版本', value: item.version }] : []),
     ],
     resource: managed,
+    runtimeDependencies: item.runtime_components?.map(toManagedResource),
   }
 }
 const model = computed<LocalComponentsModel>(() => {

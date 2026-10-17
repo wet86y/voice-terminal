@@ -20,6 +20,9 @@ export interface WorkspaceChoice {
 
 /** ResourceStatus（独立资源状态）：与运行进程及内存采样分开。 */
 export interface ResourceStatus {
+  /** runtime_components（语音服务下的三个运行依赖卡片），parent_resource_id（所属组件编号）。 */
+  runtime_components?: ResourceStatus[]
+  parent_resource_id?: string
   /** required（必需组件）：false（否）时缺失、损坏或待更新均不阻塞整体启动。 */
   required?: boolean
   /** files_installed（资源文件完整）、runtime_ready（运行依赖就绪）、can_start（可启动）。 */
@@ -164,6 +167,7 @@ export interface ModelCapability {
 }
 /** VoiceEnvironmentStatus（语音环境状态）：文件、依赖、服务分别呈现。 */
 export interface VoiceEnvironmentStatus {
+  components?: ResourceStatus[] // components（中央处理器、原生语音、显卡三个运行依赖卡片）。
   interpreter_ready: boolean // interpreter_ready（解释器存在）。
   service_ready: boolean // service_ready（基础依赖就绪）。
   python: string // python（私有解释器位置）。
@@ -174,6 +178,7 @@ export interface VoiceEnvironmentStatus {
 }
 /** EnvironmentPlan（安装内容）：锁定来源，安装前展示。 */
 export interface EnvironmentPlan {
+  profile?: 'cpu' | 'cu128' // profile（处理器或兼容显卡计算组合）。
   group: string // group（依赖组）。
   already_ready: boolean // already_ready（已有环境完整匹配）。
   total_bytes: number // total_bytes（最大下载字节数，复用后减少）。

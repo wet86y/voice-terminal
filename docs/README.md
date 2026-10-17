@@ -38,6 +38,7 @@
 - [LLM JSON Schema（结构化数据约束）迁移](guides/llm-json-schema-migration.md)
 - [模型资源更新](guides/model-resource-updates.md)
 - [运行资源管理](guides/runtime-resource-management.md)
+- [语音服务运行依赖卡片](guides/runtime-dependency-components.md)
 - [屏幕双图输入](guides/screen-input.md)
 - [可选声纹增强](guides/speaker-enhancement.md)
 - [启动与退出图标动画](guides/startup-logo-animation.md)
@@ -71,6 +72,7 @@
 - [TTS 运行时修复验收](testing/tts-runtime-fixes-20261014.md)
 - [旧程序升级兼容性验收](testing/upgrade-compatibility-20261016.md)
 - [语音可靠性修复验收](testing/voice-reliability-fixes-20261010.md)
+- [Voice Server GPU（语音服务显卡）运行依赖实现与验证](testing/voice-gpu-runtime-20261017.md)
 - [VoxCPM2（第二代本地语音模型）解码图生命周期回归](testing/voxcpm2-decoder-graph-lifecycle-20261016.md)
 - [LLM 协议基线 JSON（结构化数据文件）](testing/llm-protocol-baseline.json)
 

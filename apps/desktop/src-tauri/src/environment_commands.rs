@@ -4,11 +4,19 @@ use serde_json::{Value,json};use tauri::{State,WebviewWindow};
 use voice_desktop_common::{runtime,workspace::{atomic_json,safe_path},resources};
 use super::{Desktop,ResourceManager};
 fn allowed(window:&WebviewWindow,desktop:&Desktop)->Result<(),String>{super::trusted(window,desktop)?;super::require_command(desktop.mode,super::DesktopCommand::FocusMain)}
+fn dependency_plan(context:&voice_desktop_common::LaunchContext,group:&str)->Result<Value,String>{
+    if matches!(group,"audiocpp"|"tts-audiocpp-runtime"){
+        let item=resources::spec(context,"tts-audiocpp-runtime")?;
+        return Ok(json!({"resource_id":"tts-audiocpp-runtime","group":"audiocpp","required":false,"already_ready":resources::native_runtime_status(context)?["can_start"],"wheels":[],"system_candidates":[],"total_bytes":resources::download_bytes(&item),"source":item["source"],
+            "fields":{"resource_id":"可选原生语音运行依赖编号","group":"依赖卡片类型","required":"不独立阻塞整体启动","already_ready":"当前原生运行依赖已就绪","wheels":"此依赖不使用解释器预编译包","system_candidates":"此依赖不复用系统解释器","total_bytes":"原生运行依赖最大下载字节数","source":"固定官方来源及随包补丁"}}));
+    }
+    runtime::plan(context,group)
+}
 #[tauri::command(rename_all="snake_case")]
 pub async fn resource_install_plan(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,manager:State<'_,Arc<ResourceManager>>,resource_id:String)->Result<Value,String>{
     allowed(&window,&desktop)?;let context=manager.context();
     tauri::async_runtime::spawn_blocking(move||{
-        if resource_id=="voice-server"{return Ok(json!({"resource_id":resource_id,"title":"Voice Server（语音服务）运行环境","model_bytes":0,"environment":runtime::plan(&context,"all")?,
+        if matches!(resource_id.as_str(),"voice-server"|runtime::CPU_RESOURCE|runtime::GPU_RESOURCE){return Ok(json!({"resource_id":resource_id,"title":if resource_id==runtime::GPU_RESOURCE{"GPU（图形处理器）运行依赖"}else if resource_id==runtime::CPU_RESOURCE{"CPU（中央处理器）运行依赖"}else{"Voice Server（语音服务）运行环境"},"model_bytes":0,"environment":runtime::plan(&context,if resource_id==runtime::GPU_RESOURCE{"gpu"}else{"cpu"})?,
             "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型文件下载字节数","environment":"完整语音运行环境安装计划"}}));}
         let spec=resources::spec(&context,&resource_id)?;
         let model_bytes=resources::download_bytes(&spec);
@@ -39,7 +47,7 @@ pub async fn voice_environment_status(window:WebviewWindow,desktop:State<'_,Arc<
 }
 #[tauri::command(rename_all="snake_case")]
 pub async fn voice_environment_plan(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,manager:State<'_,Arc<ResourceManager>>,group:String)->Result<Value,String>{
-    allowed(&window,&desktop)?;let _=group;let context=manager.context();tauri::async_runtime::spawn_blocking(move||runtime::plan(&context,"all")).await.map_err(|e|e.to_string())?
+    allowed(&window,&desktop)?;let context=manager.context();tauri::async_runtime::spawn_blocking(move||dependency_plan(&context,&group)).await.map_err(|e|e.to_string())?
 }
 #[tauri::command(rename_all="snake_case")]
 pub fn voice_environment_configure(window:WebviewWindow,desktop:State<Arc<Desktop>>,manager:State<Arc<ResourceManager>>,group:String)->Result<Value,String>{allowed(&window,&desktop)?;manager.inner().configure_runtime(group)}

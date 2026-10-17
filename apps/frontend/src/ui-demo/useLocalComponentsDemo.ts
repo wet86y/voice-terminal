@@ -23,11 +23,13 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
     { id: 'tts-voxcpm2', label: 'VoxCPM2（本地语音合成模型）', state: 'installed', status: '已安装', required: false },
     { id: 'tts-audiocpp-runtime', label: 'audio.cpp（语音合成共享运行程序）', state: 'installed', status: '已安装', required: false },
     { id: 'dsh', label: 'DSH（代理执行宿主）', state: 'missing', status: '未安装' },
-    { id: 'voice-server', label: 'Voice Server（语音服务）', state: 'missing', status: '未安装' },
+    { id: 'voice-server', label: 'Voice Server（语音服务）', state: 'installed', status: '已安装' },
+    { id: 'voice-runtime-cpu', label: 'CPU（中央处理器）运行依赖', state: 'installed', status: '已安装', required: true },
+    { id: 'voice-runtime-gpu', label: 'GPU（图形处理器）运行依赖', state: 'missing', status: '未安装', required: false },
   ]
   const runtimes: Record<string, string> = {
     paraformer: 'PyTorch（推理框架）', sensevoice: 'PyTorch（推理框架）', voice_vad: 'PyTorch（推理框架）',
-    kws: 'Sherpa-ONNX（唤醒引擎）', smart_turn: 'ONNX（推理引擎）', campplus: 'ONNX（推理引擎）',
+    kws: 'Sherpa-ONNX（唤醒引擎）', smart_turn: 'ONNX（推理引擎）', campplus: 'PyTorch（推理框架）',
     dsh: 'Node.js（执行环境）', voice: 'Python（语音进程）', web: 'WebView2（桌面引擎）',
   }
   const sourceRows = [
@@ -75,7 +77,10 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
         { label: '进程标识', value: available ? item.pid : '未运行' },
         { label: '处理器占用', value: available ? item.cpu : '—' },
       ],
-      resource,
+      resource: resource && scene.value === 'error' && ['sensevoice', 'dsh'].includes(baseId)
+        ? { ...resource, state: 'installed', status: '已安装', error: undefined } : resource,
+      runtimeDependencies: baseId === 'voice' ? ['voice-runtime-cpu', 'tts-audiocpp-runtime', 'voice-runtime-gpu']
+        .flatMap(id => resourceSamples.find(resource => resource.id === id) ?? []) : undefined,
       device: model ? {
         value: selectedDevices[item.id] ?? savedDevices[item.id] ?? model.device,
         locked: !available,
