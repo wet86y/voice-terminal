@@ -140,7 +140,8 @@ fn prepare_speaker_migration(root:&Path,stage:&Path,release:&mut Value,progress:
     let old_manifest=crate::resources::load(&root.join("models/manifest.json")).unwrap_or(Value::Null);
     let known=old_manifest["files"].as_array().cloned().unwrap_or_default();
     // 保留模型文件先按内容重算；旧总清单只是上次签发的快照，组件的安装收据才是权威记录。
-    // 变化必须能被所属组件的收据确认，才按实际内容重新登记；没有收据的文件仍按旧清单拒绝。
+    // 变化必须能被所属组件的收据确认，才按实际内容重新登记；否则保留原模型及声纹，
+    // 延后整个声纹迁移，但不阻止本体更新，让新版组件管理页仍可修复旧组件。
     let mut retained:Vec<(String,u64,String)>=vec![];
     if root.join("models").is_dir(){for path in crate::resources::walk(&root.join("models"))?{
         let relative=path.strip_prefix(root).unwrap().to_string_lossy().replace('\\',"/");
@@ -155,8 +156,22 @@ fn prepare_speaker_migration(root:&Path,stage:&Path,release:&mut Value,progress:
     for (name,size,sha) in &retained{
         let changed=known.iter().any(|row|row["path"]==name.as_str()&&(row["size"].as_u64()!=Some(*size)||row["sha256"].as_str()!=Some(sha.as_str())));
         if !changed{continue;}
-        let component=retained_component(&root,name).ok_or_else(||format!("保留模型文件校验失败，旧声纹与档案保持不变：{name}"))?;
-        if confirmed.insert(component.clone()){verify_component_receipt(&root,&component,&actual)?;progress(&format!("保留模型文件按安装收据重新核验：{component}"),1,1);}
+        let validation=(||{
+            let component=retained_component(root,name).ok_or_else(||format!("保留模型文件校验失败，旧声纹与档案保持不变：{name}"))?;
+            if confirmed.insert(component.clone()){
+                verify_component_receipt(root,&component,&actual)?;
+                progress(&format!("保留模型文件按安装收据重新核验：{component}"),1,1);
+            }
+            Ok::<(),String>(())
+        })();
+        if let Err(reason)=validation{
+            if !release["fields"].is_object(){release["fields"]=json!({});}
+            release["fields"]["deferred_migrations"]=json!("旧组件需修复，暂缓迁移但允许本体升级的记录");
+            release["deferred_migrations"]=json!({"speaker":{"reason":reason,"action":"在新版组件管理中修复模型后重新运行安装器完成声纹迁移"},
+                "fields":{"speaker":"暂缓的声纹迁移","reason":"旧模型无法确认完整性的原因","action":"修复和继续迁移的方法"}});
+            progress("旧模型需要修复：保留模型与声纹资料，先更新程序本体",1,1);
+            return Ok(vec![]);
+        }
     }
     let mut files=retained.into_iter().map(|(name,size,sha)|json!({"path":name,"size":size,"sha256":sha})).collect::<Vec<_>>();
     for path in crate::resources::walk(&candidate)?{files.push(json!({"path":format!("speaker/campplus-zh-cn-common/{}",path.strip_prefix(&candidate).unwrap().to_string_lossy().replace('\\',"/")),"size":path.metadata().map_err(|e|e.to_string())?.len(),"sha256":file_hash(&path)?}));}
@@ -393,6 +408,59 @@ pub fn launch(root:&Path)->Result<u32,String>{
         {let mut zip=zip::ZipWriter::new(&mut payload);let options=zip::write::SimpleFileOptions::default();for (name,data) in entries{zip.start_file(name,options).unwrap();zip.write_all(&data).unwrap();}zip.start_file("program-package.json",options).unwrap();zip.write_all(&serde_json::to_vec(&json!({"schema":1,"role":"product","build":build,"files":rows})).unwrap()).unwrap();zip.finish().unwrap();}payload.into_inner()
     }
     fn run(payload:&[u8],root:&Path)->Result<(),String>{install(payload,root,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{})}
+    #[test]
+    fn october_11_workspaces_upgrade_without_new_receipts_or_current_components(){
+        // 2026-10-11（周日）发行使用第二版固定目录；较早包可能没有工作区编号，
+        // webview2（网页引擎）字段也可能仍指向旧私有目录。组件版本不应阻止本体更新。
+        for private_webview in [false,true]{for has_identity in [false,true]{for has_model_manifest in [false,true]{
+            let root=fixture();
+            let mut portable=json!({"schema":2,"app":"app","data_dir":"data","python":"runtimes/python/python.exe",
+                "models":"models","dsh":"runtimes/dsh","webview2":if private_webview{json!("runtimes/webview2")}else{Value::Null}});
+            if has_identity{portable["workspace_id"]=json!("sunday-workspace");}
+            atomic_json(&root.join("portable.json"),&portable).unwrap();
+            let old_components=json!([
+                {"kind":"python","path":"runtimes/python","build":"old-python","manifest_sha256":"old-python-manifest"},
+                {"kind":"dsh","path":"runtimes/dsh","build":"old-dsh","manifest_sha256":"old-dsh-manifest"},
+                {"kind":"webview2","path":"runtimes/webview2","build":"old-webview","manifest_sha256":"old-webview-manifest"},
+                {"kind":"models","path":"models","build":"old-models","manifest_sha256":"old-model-manifest"}]);
+            atomic_json(&root.join("app/release.json"),&json!({"schema":1,"kind":"app","build":"product-5b9ebe8be7c9b254",
+                "components":old_components,"files":[]})).unwrap();
+            // 仅模拟旧内容，不执行解释器或宿主；本体升级不得检查旧依赖是否达到新版本。
+            let preserved=[
+                ("data/config/local.yaml",b"saved-input-and-output-settings".as_slice()),
+                ("data/config/product.json",b"saved-model-choice-and-credentials-reference".as_slice()),
+                ("data/persona/user.md",b"saved-persona".as_slice()),
+                ("data/history/conversation.jsonl",b"saved-conversation".as_slice()),
+                ("data/dsh/session.json",b"saved-background-session".as_slice()),
+                ("data/speaker/campplus-zh-cn-common/registry.json",b"existing-current-profile".as_slice()),
+                ("runtimes/python/python.exe",b"old-python-binary".as_slice()),
+                ("runtimes/python/runtime.json",br#"{"schema":1,"profile":"cu128"}"#.as_slice()),
+                ("runtimes/dsh/runtime.json",br#"{"schema":1,"source_kind":"legacy_export","version":"0.2.0-rc.2"}"#.as_slice()),
+                ("runtimes/dsh/legacy.exe",b"old-background-host".as_slice()),
+                ("runtimes/webview2/msedgewebview2.exe",b"old-private-webview".as_slice()),
+                ("models/asr/old-model/model.bin",b"installed-old-model-without-receipt".as_slice()),
+            ];
+            for (relative,bytes) in &preserved{let path=root.join(relative);fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,bytes).unwrap();}
+            legacy_speaker(&root);
+            if has_model_manifest{atomic_json(&root.join("models/manifest.json"),&crate::resources::manifest(&root.join("models"),"models","sunday").unwrap()).unwrap();}
+            assert!(!root.join("models/asr/old-model/resource-install.json").exists());
+            run(&package_options("current",false,Some(false)),&root).unwrap();
+            for (relative,bytes) in &preserved{assert_eq!(fs::read(root.join(relative)).unwrap(),*bytes,"保留文件：{relative}");}
+            assert!(!root.join(LEGACY_MODEL).exists());assert!(root.join(CURRENT_MODEL).is_dir());
+            let upgraded=crate::resources::load(&root.join("portable.json")).unwrap();
+            assert!(upgraded["webview2"].is_null());
+            let identity=upgraded["workspace_id"].as_str().filter(|id|!id.is_empty()).unwrap().to_owned();
+            if has_identity{assert_eq!(identity,"sunday-workspace");}
+            let release=crate::resources::load(&root.join("app/release.json")).unwrap();assert_eq!(release["build"],"current");
+            for index in 0..3{assert_eq!(release["components"][index],old_components[index]);}
+            workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();
+            // 再次安装同一包时保持新补齐的工作区编号、已有CAM++档案及旧组件。
+            run(&package_options("current",false,Some(false)),&root).unwrap();
+            assert_eq!(crate::resources::load(&root.join("portable.json")).unwrap()["workspace_id"],identity);
+            for (relative,bytes) in &preserved{assert_eq!(fs::read(root.join(relative)).unwrap(),*bytes,"重复升级保留文件：{relative}");}
+            fs::remove_dir_all(root).unwrap();
+        }}}
+    }
     #[test]fn reinstall_same_or_new_build_preserves_data_identity_and_components(){
         let root=fixture();run(&package("first",false),&root).unwrap();let id=crate::resources::load(&root.join("portable.json")).unwrap()["workspace_id"].clone();
         fs::write(root.join("data/settings.json"),b"user-settings").unwrap();fs::create_dir_all(root.join("runtimes/python")).unwrap();fs::write(root.join("runtimes/python/content.bin"),b"installed-python").unwrap();fs::write(root.join("models/model.bin"),b"installed-model").unwrap();
@@ -447,12 +515,23 @@ pub fn launch(root:&Path)->Result<u32,String>{
         assert!(run(&package_options("new",false,Some(true)),&root).is_err());
         assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"old");assert_eq!(fs::read(root.join("data/speaker/templates/old.npy")).unwrap(),b"legacy-vector");assert!(root.join(LEGACY_MODEL).is_dir());assert!(!root.join(CURRENT_MODEL).exists());fs::remove_dir_all(root).unwrap();
     }
-    #[test]fn same_size_corruption_in_retained_model_aborts_before_legacy_deletion(){
+    #[test]fn stale_unreceipted_model_defers_speaker_migration_without_blocking_program_upgrade(){
         let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);
         fs::write(root.join("models/other.bin"),b"valid").unwrap();let sha=file_hash(&root.join("models/other.bin")).unwrap();
         atomic_json(&root.join("models/manifest.json"),&json!({"files":[{"path":"other.bin","size":5,"sha256":sha}]})).unwrap();fs::write(root.join("models/other.bin"),b"wrong").unwrap();
-        assert!(run(&package_options("new",false,Some(false)),&root).unwrap_err().contains("保留模型文件校验失败"));
-        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"old");assert!(root.join(LEGACY_MODEL).is_dir());assert!(root.join("data/speaker/registry.json").is_file());fs::remove_dir_all(root).unwrap();
+        let old_manifest=fs::read(root.join("models/manifest.json")).unwrap();
+        run(&package_options("new",false,Some(false)),&root).unwrap();
+        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"new");assert!(root.join(LEGACY_MODEL).is_dir());assert!(root.join("data/speaker/registry.json").is_file());
+        assert_eq!(fs::read(root.join("models/other.bin")).unwrap(),b"wrong");
+        assert_eq!(fs::read(root.join("models/manifest.json")).unwrap(),old_manifest);assert!(!root.join(CURRENT_MODEL).exists());
+        let release=crate::resources::load(&root.join("app/release.json")).unwrap();
+        assert!(release["deferred_migrations"]["speaker"]["reason"].as_str().unwrap().contains("保留模型文件校验失败"));
+        // 修复旧组件后重装，迁移继续执行；旧声纹资料只在候选校验通过后清退。
+        fs::write(root.join("models/other.bin"),b"valid").unwrap();
+        run(&package_options("new",false,Some(false)),&root).unwrap();
+        assert!(!root.join(LEGACY_MODEL).exists());assert!(root.join(CURRENT_MODEL).is_dir());
+        assert!(crate::resources::load(&root.join("app/release.json")).unwrap()["deferred_migrations"].is_null());
+        workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();fs::remove_dir_all(root).unwrap();
     }
     #[test]fn unidentified_flat_profile_is_preserved_without_blocking_update(){
         let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);fs::write(root.join("data/speaker/registry.json"),b"unidentified-profile").unwrap();
@@ -492,18 +571,22 @@ pub fn launch(root:&Path)->Result<u32,String>{
         workspace::verify_tree(&root.join("models"),"manifest.json").unwrap();
         fs::remove_dir_all(root).unwrap();
     }
-    #[test]fn retained_model_change_without_matching_receipt_still_aborts(){
+    #[test]fn mismatched_receipt_defers_migration_and_keeps_existing_model_registration(){
         let root=fixture();run(&package("old",false),&root).unwrap();legacy_speaker(&root);
         let folder=root.join("models/audiocpp/runtime");fs::create_dir_all(&folder).unwrap();fs::write(folder.join("model.bin"),b"bbbb").unwrap();
         let changed=file_hash(&folder.join("model.bin")).unwrap();
-        // 收据登记的是同长度但不同的内容：同尺寸损坏仍必须中止，不能按实际内容洗白。
+        // 收据登记的是同长度但不同的内容：暂缓声纹迁移，不能按实际内容重新登记。
         let item=json!({"resource_id":"tts-audiocpp-runtime","version":"v1","destination":"audiocpp/runtime",
             "files":[{"path":"model.bin","size_bytes":4,"sha256":"a".repeat(64)}]});
         crate::resources::write_model_receipt(&folder,&item,vec![json!({"path":"model.bin","size":4,"sha256":"a".repeat(64),"optional":false})]).unwrap();
         atomic_json(&root.join("models/manifest.json"),&json!({"files":[{"path":"audiocpp/runtime/model.bin","size":4,"sha256":"a".repeat(64)}]})).unwrap();
-        let error=run(&package_options("new",false,Some(false)),&root).unwrap_err();
-        assert!(error.contains("保留模型文件校验失败"),"{error}");
-        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"old");assert!(root.join(LEGACY_MODEL).is_dir());
+        let old_manifest=fs::read(root.join("models/manifest.json")).unwrap();
+        let old_receipt=fs::read(folder.join("resource-install.json")).unwrap();
+        run(&package_options("new",false,Some(false)),&root).unwrap();
+        assert_eq!(fs::read(root.join("app/business.py")).unwrap(),b"new");assert!(root.join(LEGACY_MODEL).is_dir());assert!(!root.join(CURRENT_MODEL).exists());
+        assert_eq!(fs::read(root.join("models/manifest.json")).unwrap(),old_manifest);
+        assert_eq!(fs::read(folder.join("resource-install.json")).unwrap(),old_receipt);
+        assert!(crate::resources::load(&root.join("app/release.json")).unwrap()["deferred_migrations"]["speaker"]["reason"].as_str().unwrap().contains("与安装收据不符"));
         assert_eq!(file_hash(&folder.join("model.bin")).unwrap(),changed);
         fs::remove_dir_all(root).unwrap();
     }

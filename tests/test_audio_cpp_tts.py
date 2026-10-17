@@ -79,6 +79,25 @@ def _fake_client(handler, *, native_sample_rate: int = 16000,
     return client
 
 
+@pytest.mark.parametrize(("native_sample_rate", "capabilities", "expected"), [
+    (48000, {"reference_prompt": True, "full_decode": True}, True),
+    (48000, {"reference_prompt": True}, False),
+    (16000, {"reference_prompt": True, "full_decode": True}, False),
+    (48000, {"acoustic_continuation": True}, True),
+])
+def test_voxcpm2_continuation_is_inferred_only_from_stable_capabilities(
+    native_sample_rate, capabilities, expected,
+):
+    async def scenario():
+        client = _fake_client(lambda _request: _response(), native_sample_rate=native_sample_rate)
+        client.server.capabilities = capabilities
+        await client.ensure_ready()
+        assert client._native_continuation is expected
+        await client.close()
+
+    asyncio.run(scenario())
+
+
 def test_sse_pcm_chunks_are_decoded_and_request_uses_streaming_endpoint():
     async def scenario():
         first = b"\x01\x00" * 4

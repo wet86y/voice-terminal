@@ -1,7 +1,7 @@
 """NVIDIA（英伟达）PowerMizer（性能模式）请求：本地合成期间让显卡优先最大性能。
 
 部分机器上会出现“合成期间核心频率停在低频、驱动把降频原因标成 GPU Idle（空闲）”的状态，
-实时因子因此退化到 1 以上（详见 docs/local-tts-rtf-branch-comparison-20261014.md）。这里用官方
+实时因子因此退化到 1 以上（详见 docs/testing/local-tts-rtf-branch-comparison-20261014.md）。这里用官方
 NVML（英伟达管理库）接口把**本进程**的 PowerMizer 模式设为 PREFER_MAXIMUM_PERFORMANCE
 （优先最大性能），效果等价于 NVIDIA 控制面板的“电源管理模式 = 优先最大性能”。
 
