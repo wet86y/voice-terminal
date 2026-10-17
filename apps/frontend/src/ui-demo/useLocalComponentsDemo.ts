@@ -44,7 +44,7 @@ export function useLocalComponentsDemo(scene: Ref<PreviewScene>, feedback: (mess
   onBeforeUnmount(cancelRetries)
 
   const rows = computed<LocalComponentRow[]>(() => {
-    const componentRows = previewRows(sourceRows, scene.value).map(item => {
+    const componentRows: LocalComponentRow[] = previewRows(sourceRows, scene.value).map(item => {
     const baseId = item.id.replace(/-\d+$/, '')
     const busy = retrying.has(item.id)
     const loading = scene.value === 'loading' || busy

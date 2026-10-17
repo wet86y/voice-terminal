@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import type { LocalProviderSettings } from '../../interface/local-components'
+import type { LocalProviderSettings } from './local-components'
 
 const props = defineProps<{ model: LocalProviderSettings }>()
 const configured = ref(props.model.configured) // configured（本机是否已有密钥）。

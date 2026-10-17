@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import SettingsPageHeader from './SettingsPageHeader.vue'
 import ManagedResourceProgress from './ManagedResourceProgress.vue'
-import FixedProviderSettings from '../product/panels/FixedProviderSettings.vue'
+import FixedProviderSettings from './FixedProviderSettings.vue'
 import type { LocalComponentCategory, LocalComponentRow, LocalComponentsModel, LocalDownloadItem, ManagedResourceJob, ManagedResourceRow } from './local-components'
 
 const props = defineProps<{
@@ -52,7 +52,7 @@ const latestJobs = computed(() => {
 const componentCards = computed(() => props.model.rows.map(row => {
   const job = visibleJob(latestJobs.value.get(row.resource?.id ?? row.id))
   // 没有独立安装资源的进程条目仅展示活动任务，历史下载错误不覆盖进程重启状态。
-  return { row, job: row.resource || (job && jobIsActive(job)) ? job : undefined, category: rowCategory(row) }
+  return { row, job: job && jobIsActive(job) ? job : undefined, category: rowCategory(row) }
 }))
 const batchJob = computed(() => visibleJob(latestJobs.value.get('batch')))
 const categories = computed(() => categoryDefinitions.map(definition => {
@@ -82,6 +82,9 @@ function resourceStateLabel(state: string) {
 function needsResource(row: LocalComponentRow) {
   return Boolean((row.resource && (row.resource.state !== 'installed' || row.resource.updateAvailable))
     || row.resourceChoices?.some(resource => resource.state !== 'installed' || resource.updateAvailable))
+}
+function resourceRetryable(resource: ManagedResourceRow) {
+  return Boolean(resource.retryable || latestJobs.value.get(resource.id)?.state === 'failed')
 }
 function rowCategory(row: LocalComponentRow): LocalComponentCategory {
   if (row.category) return row.category
@@ -148,11 +151,15 @@ function downloadCategory(category: { title: string; entries: LocalDownloadItem[
   emit('resourceBundleDownload', { title: category.title, entries: category.entries })
 }
 function rowState(row: LocalComponentRow) {
-  if (row.resource && needsResource(row)) return row.resource.updateAvailable ? 'failed' : 'disabled'
+  if (row.resource?.updateAvailable && needsResource(row)) return 'failed'
+  if (row.state === 'loading' || row.state === 'failed' && (row.error || row.retryable)) return row.state
+  if (row.resource && needsResource(row)) return 'disabled'
   return row.state
 }
 function rowStatus(row: LocalComponentRow) {
-  if (row.resource && needsResource(row)) return row.resource.updateAvailable ? '需更新' : resourceStateLabel(row.resource.state)
+  if (row.resource?.updateAvailable && needsResource(row)) return '需更新'
+  if (row.state === 'loading' || row.state === 'failed' && (row.error || row.retryable)) return row.status
+  if (row.resource && needsResource(row)) return resourceStateLabel(row.resource.state)
   return row.status
 }
 function changeDevice(id: string, event: Event) {
@@ -226,13 +233,13 @@ function selectedResources(row: LocalComponentRow) {
                 <section v-if="row.resource" class="local-managed-resource" :data-resource="row.resource.id" :aria-label="`${row.resource.label}安装状态`">
                   <div class="local-managed-resource-heading"><span>{{ row.resource.label }}</span><span class="resource-install-state" :class="row.resource.state">{{ row.resource.status || resourceStateLabel(row.resource.state) }}</span></div>
                   <dl v-if="row.resource.installedVersion || row.resource.targetVersion" class="local-resource-versions"><div v-if="row.resource.installedVersion"><dt>已安装版本</dt><dd>{{ row.resource.installedVersion }}</dd></div><div v-if="row.resource.targetVersion"><dt>目标版本</dt><dd>{{ row.resource.targetVersion }}</dd></div></dl>
-                  <p v-if="row.resource.error" class="local-error" role="status">{{ row.resource.error }}</p>
+                  <p v-if="row.resource.error && row.state !== 'loading' && !jobIsActive(latestJobs.get(row.resource.id))" class="local-error" role="status">{{ row.resource.error }}</p>
                   <ManagedResourceProgress v-if="visibleJob(latestJobs.get(row.resource.id))" :job="visibleJob(latestJobs.get(row.resource.id))!" :label="row.resource.label" />
-                  <button v-if="visibleJob(latestJobs.get(row.resource.id)) && jobIsActive(latestJobs.get(row.resource.id))" class="outline-button local-resource-cancel" type="button" :disabled="!visibleJob(latestJobs.get(row.resource.id))?.canCancel" @click="emit('cancelResource', visibleJob(latestJobs.get(row.resource.id))!.id)">取消任务</button>
+                  <button v-if="visibleJob(latestJobs.get(row.resource.id)) && jobIsActive(latestJobs.get(row.resource.id))" class="outline-button local-resource-cancel" type="button" :aria-label="`${row.resource.label}：取消任务`" :disabled="!visibleJob(latestJobs.get(row.resource.id))?.canCancel" @click="emit('cancelResource', visibleJob(latestJobs.get(row.resource.id))!.id)">取消任务</button>
                   <div v-else-if="needsResource(row) && model.resourceActionsAvailable" class="managed-resource-actions">
-                    <button class="outline-button" type="button" :disabled="row.resource.busy || model.resourceLoading" @click="emit('resourceDownload', row.resource.id)">{{ row.resource.busy ? '处理中…' : row.resource.updateAvailable ? '更新' : row.resource.retryable ? '重试下载' : '下载' }}</button>
-                    <button class="outline-button" type="button" :disabled="row.resource.busy || model.resourceLoading" @click="emit('resourceImport', row.resource.id)">导入</button>
-                    <button class="outline-button" type="button" :disabled="model.resourceLoading" @click="emit('openResourceSource', row.resource.id)">来源说明</button>
+                      <button class="outline-button" type="button" :aria-label="`${row.resource.label}：${row.resource.updateAvailable ? '更新' : '下载'}`" :disabled="row.resource.busy || model.resourceLoading" @click="emit('resourceDownload', row.resource.id)">{{ row.resource.busy ? '处理中…' : row.resource.updateAvailable ? resourceRetryable(row.resource) ? '重试更新' : '更新' : resourceRetryable(row.resource) ? '重试下载' : '下载' }}</button>
+                      <button class="outline-button" type="button" :aria-label="`${row.resource.label}：导入`" :disabled="row.resource.busy || model.resourceLoading" @click="emit('resourceImport', row.resource.id)">导入</button>
+                      <button class="outline-button" type="button" :aria-label="`${row.resource.label}：跳转官方来源`" :disabled="model.resourceLoading" @click="emit('openResourceSource', row.resource.id)">来源说明</button>
                   </div>
                 </section>
                 <section v-if="row.resourceChoices?.length" class="local-tts-downloads">
@@ -241,11 +248,11 @@ function selectedResources(row: LocalComponentRow) {
                   <article v-for="resource in selectedResources(row)" :key="resource.id" :data-resource="resource.id" class="local-download-choice">
                     <div class="local-managed-resource-heading"><span>{{ resource.label }}</span><span class="resource-install-state" :class="resource.state">{{ resource.updateAvailable ? '需更新' : resource.status || resourceStateLabel(resource.state) }}</span></div>
                     <dl v-if="resource.installedVersion || resource.targetVersion" class="local-resource-versions"><div v-if="resource.installedVersion"><dt>已安装版本</dt><dd>{{ resource.installedVersion }}</dd></div><div v-if="resource.targetVersion"><dt>目标版本</dt><dd>{{ resource.targetVersion }}</dd></div></dl>
-                    <p v-if="resource.error" class="local-error">{{ resource.error }}</p>
+                    <p v-if="resource.error && row.state !== 'loading' && !jobIsActive(latestJobs.get(resource.id))" class="local-error">{{ resource.error }}</p>
                     <ManagedResourceProgress v-if="visibleJob(latestJobs.get(resource.id))" :job="visibleJob(latestJobs.get(resource.id))!" :label="resource.label" />
                     <button v-if="visibleJob(latestJobs.get(resource.id)) && jobIsActive(latestJobs.get(resource.id))" class="outline-button local-resource-cancel" type="button" :disabled="!visibleJob(latestJobs.get(resource.id))?.canCancel" @click="emit('cancelResource', visibleJob(latestJobs.get(resource.id))!.id)">取消任务</button>
                     <div v-else-if="model.resourceActionsAvailable" class="managed-resource-actions">
-                      <button type="button" class="outline-button" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceDownload', resource.id)">{{ resource.busy ? '处理中…' : resource.updateAvailable ? '更新' : resource.state === 'installed' ? '校验并补齐' : '下载' }}</button>
+                      <button type="button" class="outline-button" :aria-label="`${resource.label}：${resource.updateAvailable ? '更新' : '下载'}`" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceDownload', resource.id)">{{ resource.busy ? '处理中…' : resource.updateAvailable ? resourceRetryable(resource) ? '重试更新' : '更新' : resourceRetryable(resource) ? '重试下载' : resource.state === 'installed' ? '校验并补齐' : '下载' }}</button>
                       <button type="button" class="outline-button" :disabled="resource.busy || model.resourceLoading" @click="emit('resourceImport', resource.id)">导入</button>
                       <button type="button" class="outline-button" @click="emit('openResourceSource', resource.id)">来源说明</button>
                     </div>

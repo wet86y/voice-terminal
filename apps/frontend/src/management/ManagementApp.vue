@@ -16,7 +16,7 @@ const resources = useWorkspaceResources()
 const port = desktopPort() as DesktopPort & DesktopEnvironmentPort & DesktopCredentialsPort
 const credentials = useStartupCredentials(port, () => resources.refreshInventory())
 watch(() => resources.resources.value.find(item => item.resource_id === 'tts'), item => {
-  credentials.setLocalTtsReady(item ? item.can_start && item.update_available !== true : null)
+  credentials.setLocalTtsReady(item ? item.can_start === true && item.update_available !== true : null)
 }, { immediate: true })
 const starting = ref(false) // starting（已请求启动）：原生导航完成前防止重复点击。
 const updatesRequired = computed(() => resources.resources.value.some(item => item.required !== false && item.update_available === true))
