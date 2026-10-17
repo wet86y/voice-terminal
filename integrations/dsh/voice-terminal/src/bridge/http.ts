@@ -12,7 +12,7 @@ import { BUNDLE_VERSION } from '../shared/version.js'
 import { CallbackScope } from '../shared/callback.js'
 import { BRIDGE_NAME as name, MAX_OBSERVER_RECORDS } from '../shared/identity.js'
 import { createAttachedVoiceSession } from './settings.js'
-import { installRootTools } from './tools.js'
+import { installRootTools, installScreenCaptureTool } from './tools.js'
 import { createUserMessage, createBridgeUserMessage } from './messages.js'
 import { enqueueAuthoritativeContext, holdAuthoritativeContext, releaseHeldContext, enqueueDeferredActivation, armRuntimeReminder, stopRuntimeReminder, discardResumedAuthoritativeContext } from './context.js'
 import { exportSessionPage, readSessionTelemetry } from './observer.js'
@@ -50,7 +50,7 @@ export function createBridgeRoute(ctx: Context, config: Config, bindings: Map<st
           const binding: Binding = { voiceSessionId: body.voice_session_id, dshSessionId: body.dsh_session_id, epoch: body.epoch, revision: 0, state: 'active', protocolRecoveryAttempted: false, protocolRecoveryPending: false, handle: undefined, requests: new Map(), records: [], traceRevision: 0, agentState: 'idle', committedSteps: 0, pendingTools: new Map(), pendingToolActivations: new Map(), actionSeq: 0, actionQueue: Promise.resolve(), assistantStreamRevision: 0, pendingThinkingDelta: '', queuedMessages: new Map(), reminderIntervalMs, nextReminderMs: reminderIntervalMs, queuedRevision: 0, claimedRevision: 0 }
           const preset = await ctx.agentPresets.resolve('shadow-agent')
           const modelSelection = ctx.agentDefaultModel.currentSelection()
-          const setup = async (agentCtx: Context) => { await ctx.agentPresets.mount(agentCtx, preset.id); installRootTools(agentCtx, binding); installImageCapabilityGuard(agentCtx, binding) }
+          const setup = async (agentCtx: Context) => { await ctx.agentPresets.mount(agentCtx, preset.id); installRootTools(agentCtx, binding); installScreenCaptureTool(agentCtx, binding); installImageCapabilityGuard(agentCtx, binding) }
           let handle: AgentHandle
           if (path === 'session.resume') {
             // A resumed voice session keeps its persisted Session settings; plugin defaults
