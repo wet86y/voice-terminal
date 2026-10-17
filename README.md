@@ -125,7 +125,7 @@ Product UI 只有工作台和设置两个一级页面。页面切换应保留组
 - `.local/data/config/product-settings.json`（本机产品设置）：包含 KWS（关键词唤醒）、静默、Shadow（影子代理）、自定义指令和声纹设置等非密钥内容。
 - `.local/data/speaker/`（当前声纹资料）：保存注册资料、模板和特征指纹；详见 [声纹增强](docs/guides/speaker-enhancement.md)。
 
-诊断日志集中在工作区 `cache/logs`（运行日志目录），属于可回收缓存。该目录保留 **100 MiB** 总预算（`VOICE_LOG_BUDGET_MB`，设为 `0` 关闭），超出后按最旧优先逐步剔除轮转文件；被存活进程打开的文件在 Windows（操作系统）上无法回收，会保留并在日志中说明。本地 TTS（语音合成）日志的关联键、失败路径与四个诊断开关（`VOICE_TTS_NATIVE_TRACE`、`VOICE_TTS_LOG_TEXT`、`VOICE_TTS_NATIVE_LOG_PUMP`、`VOICE_LOG_LEVEL`）见[本地 TTS 可观测性](docs/guides/local-tts-observability-20261015.md)。本地音色的还原度结论（混合模式通道竞争、参考转写、下行带宽、参考音频时长上限）与修复见[本地 TTS 音色还原度与下行带宽修复](docs/testing/local-tts-voice-fidelity-20261015.md)；现场「怪音与后期失真」取证见[本地 TTS 怪音与后期失真诊断](docs/testing/local-tts-glitch-and-distortion-20261015.md)。
+诊断日志集中在工作区 `cache/logs`（运行日志目录），属于可回收缓存。该目录保留 **100 MiB** 总预算（`VOICE_LOG_BUDGET_MB`，设为 `0` 关闭），超出后按最旧优先逐步剔除轮转文件；被存活进程打开的文件在 Windows（操作系统）上无法回收，会保留并在日志中说明。本地 TTS（语音合成）日志的关联键、失败路径与四个诊断开关（`VOICE_TTS_NATIVE_TRACE`、`VOICE_TTS_LOG_TEXT`、`VOICE_TTS_NATIVE_LOG_PUMP`、`VOICE_LOG_LEVEL`）见[本地 TTS 可观测性](docs/guides/local-tts-observability-20261015.md)。维护者的本机 TTS 诊断记录可能包含本机路径、硬件信息或音频证据，仅保存在本机，不纳入源码仓库。
 
 配置模板随代码更新，已有用户设置由数据目录保存。普通覆盖发布复用模型与运行环境，不覆盖 `.local/data/`（真实用户数据）；重要数据的唯一滚动备份和显式交付导出命令见[本地目录与覆盖发布](docs/guides/local-layout.md)。
 

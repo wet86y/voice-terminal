@@ -92,4 +92,4 @@ Voice Server（语音服务）把已提交的文本块交给当前 `tts.backend`
 
 本地后端的每次合成按 `turn=`（轮次）、`speech=`（语音事务）和 `session=`（随机生成的事务内日志标识，不作为原生续接状态）关联，`segment=`（句段编号）在同一会话内递增。`agent.trace kind=TTS_STARTED/TTS_COMPLETED/...` 给出轮次状态机，`controller.turn_latency` 给出该轮的 TTS 时序（`tts_text_to_first_audio_ms`、`tts_checkout_ms`、`speech_end_to_first_pcm_ms` 等）。字段清单、失败事件与开关见[本地 TTS 可观测性](local-tts-observability-20261015.md)。
 
-VoxCPM2 当前正式流式合成固定关闭跨段声学续接：每段保留 `voice_ref`（音色克隆参考音频）及其 `reference_text`（参考音频转写），不提交 `prompt_audio`（续接提示音频）或 `continuation_id`（续接状态标识）。旧配置中的 `acoustic_continuation`（跨段声学续接开关）保留兼容，但本地客户端实际能力为关闭。原因及同文本性能数据见[停用续接提示的性能复核](../testing/local-tts-reference-only-20261017.md)；此前按标点重锚定的测试记录见[句末重锚定方案 B](../testing/local-tts-continuation-reanchor-20261017.md)。
+VoxCPM2 当前正式流式合成固定关闭跨段声学续接：每段保留 `voice_ref`（音色克隆参考音频）及其 `reference_text`（参考音频转写），不提交 `prompt_audio`（续接提示音频）或 `continuation_id`（续接状态标识）。旧配置中的 `acoustic_continuation`（跨段声学续接开关）保留兼容，但本地客户端实际能力为关闭。
