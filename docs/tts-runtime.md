@@ -65,3 +65,5 @@ Voice Server（语音服务）把已提交的文本块交给当前 `tts.backend`
 ## 本地合成日志
 
 本地后端的每次合成按 `turn=`（轮次）、`speech=`（语音事务）和 `session=`（事务内唯一，取原生上下文标识前八位）关联，`segment=` 在同一会话内递增。`agent.trace kind=TTS_STARTED/TTS_COMPLETED/...` 给出轮次状态机，`controller.turn_latency` 给出该轮的 TTS 时序（`tts_text_to_first_audio_ms`、`tts_checkout_ms`、`speech_end_to_first_pcm_ms` 等）。字段清单、失败事件与开关见[本地 TTS 可观测性](local-tts-observability-20261015.md)。
+
+VoxCPM2 已保存设计音色（包括混合音色）的长文本声学续接按完整句末重锚定：至少续接三段后，在下一段之前尝试释放原生上下文，确认释放后更换续接标识并继续使用当前固定音色参考。旧默认音色与导入音色不启用此策略。漂移问题、用户对 A/B/C 的试听结论、精确触发条件及当前验收边界见[句末重锚定方案 B](local-tts-continuation-reanchor-20261017.md)。

@@ -37,6 +37,8 @@ _QUEUE_END = object()
 _PREWARM_TEXT = "你好，准备开始语音播报。"
 _NATIVE_LOG_LIMIT = 4 * 1024 * 1024  # _NATIVE_LOG_LIMIT（原生 stdout 单文件上限）。
 _TEXT_PREVIEW_CHARS = 120  # 与在线后端保持一致的可选文本预览长度。
+_CONTINUATION_REANCHOR_MIN_SEGMENTS = 3  # 声学续接至少累计三段后，才允许在句末重锚定。
+_SENTENCE_END_PUNCTUATION = ("。", "！", "？", "!", "?")  # 句末重锚定的完整句终止符。
 
 
 def _enabled(name: str, default: str = "") -> bool:
@@ -1002,6 +1004,10 @@ class AudioCppTtsSession:
         self._send_task: asyncio.Task | None = None
         self._continuation_id = uuid4().hex  # _continuation_id（唯一事务声学上下文）。
         self._continuation_enabled = False  # _continuation_enabled（本事务实际使用声学续接）。
+        self._continuation_reanchor_enabled = False  # 是否对设计音色启用句末重锚定。
+        self._continuation_group_start_segment = 0  # 当前续接组开始时已完成的句段数。
+        self._continuation_reanchor_count = 0  # 本事务已经完成的句末重锚定次数。
+        self._last_completed_text: str | None = None  # 最近一个成功合成句段的原文。
         self._context_requested = False  # _context_requested（是否向原生申请过上下文）。
         self._native_request_submitted = False  # 原生请求已进入网络发送路径。
         self.context_release_confirmed = None  # 原生执行锁取得且上下文释放的明确确认。
@@ -1041,13 +1047,26 @@ class AudioCppTtsSession:
             and not self._is_prewarm and not self._is_preview and not controlled
         )
         voice = self.voice_snapshot
+        self._continuation_reanchor_enabled = bool(
+            self._continuation_enabled
+            and voice is not None
+            and voice.model == "voxcpm2"
+            and voice.reference_mode == "voice"
+            and getattr(voice, "voice_source", "legacy") == "design"
+        )
         logger.info(
             "audio_cpp_tts.session_policy turn=%s speech=%s session=%s model_id=%s voice_id=%s "
+            "voice_source（音色来源）=%s "
             "voice_revision=%s continuation_enabled=%s control_prefix=%s prewarm=%s preview=%s "
+            "continuation_reanchor_enabled（设计音色句末重锚定）=%s "
+            "continuation_reanchor_min_segments（重锚定最少句段数）=%d "
             "inference_steps=%s sample_rate=%d native_sample_rate=%d",
             self.turn_id, self.speech_id, self.session_tag, self.model_id,
-            voice.voice_id if voice else None, voice.revision if voice else None,
+            voice.voice_id if voice else None,
+            getattr(voice, "voice_source", "legacy") if voice else None,
+            voice.revision if voice else None,
             self._continuation_enabled, controlled, self._is_prewarm, self._is_preview,
+            self._continuation_reanchor_enabled, _CONTINUATION_REANCHOR_MIN_SEGMENTS,
             self._inference_steps, self.client.sample_rate, self.client.native_sample_rate,
         )
         self._started = True
@@ -1072,10 +1091,59 @@ class AudioCppTtsSession:
         if self._is_prewarm:
             return await self._send_with_fallback(text)
         self.client._real_waiters += 1
+        completed_before = self.completed_segments
         try:
+            await self._maybe_reanchor_before_text(text)
             await self._send_with_fallback(text)
+            if self.completed_segments > completed_before and text.strip():
+                self._last_completed_text = text
         finally:
             self.client._real_waiters -= 1
+
+    async def _maybe_reanchor_before_text(self, text: str) -> None:
+        """在合格句末释放续接上下文，再从同一固定音色参考开始新组。"""
+        previous_text = self._last_completed_text
+        if (
+            not self._continuation_reanchor_enabled
+            or not text.strip()
+            or not previous_text
+            or not previous_text.rstrip().endswith(_SENTENCE_END_PUNCTUATION)
+        ):
+            return
+
+        group_segments = self.completed_segments - self._continuation_group_start_segment
+        if group_segments < _CONTINUATION_REANCHOR_MIN_SEGMENTS:
+            return
+
+        previous_id = self._continuation_id
+        await self._release_context()
+        if self.context_release_confirmed is not True:
+            # 释放未确认时继续沿用当前上下文，避免静默制造未受控的新上下文。
+            logger.warning(
+                "audio_cpp_tts.continuation_reanchor_skipped turn=%s speech=%s session=%s "
+                "after_segments（已完成句段数）=%d group_segments（本组句段数）=%d "
+                "reason（原因）=context_release_unconfirmed（上下文未确认释放）",
+                self.turn_id, self.speech_id, self.session_tag,
+                self.completed_segments, group_segments,
+            )
+            return
+        if self._cancelled or self._finished:
+            return
+
+        next_id = uuid4().hex
+        self._continuation_id = next_id
+        self._continuation_group_start_segment = self.completed_segments
+        self._continuation_reanchor_count += 1
+        logger.info(
+            "audio_cpp_tts.continuation_reanchored turn=%s speech=%s "
+            "previous_session（旧续接组）=%s next_session（新续接组）=%s "
+            "reanchor_count（重锚定次数）=%d after_segments（已完成句段数）=%d "
+            "group_segments（本组句段数）=%d boundary（重锚定边界）=sentence_end（完整句末） "
+            "voice_id（音色编号）=%s",
+            self.turn_id, self.speech_id, previous_id[:8], next_id[:8],
+            self._continuation_reanchor_count, self.completed_segments, group_segments,
+            self.voice_snapshot.voice_id if self.voice_snapshot else None,
+        )
 
     async def _send_with_fallback(self, text: str) -> None:
         if self._error is not None:

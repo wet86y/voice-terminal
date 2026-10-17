@@ -35,6 +35,8 @@ audio_cpp_tts.buffer_overflow     提前合成暂存超过 32 MiB
 audio_cpp_tts.prewarm_ready       预热返回音频字节数
 audio_cpp_tts.prewarm_failed      预热失败原因
 audio_cpp_tts.continuation_fallback 声学续接失败后回退独立合成
+audio_cpp_tts.continuation_reanchored       设计音色在完整句末成功重锚定
+audio_cpp_tts.continuation_reanchor_skipped 上下文释放未确认，重锚定跳过
 audio_cpp_tts.model_loaded/model_unloaded/model_load_failed  模型装载与卸载（含 `elapsed_ms`）
 audio_cpp_tts.server_started/server_ready/model_switched/server_stopped  原生服务生命周期
 gpu_performance.applied/restored  本地合成期间的显卡性能模式
