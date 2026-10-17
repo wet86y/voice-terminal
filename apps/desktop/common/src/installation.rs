@@ -61,6 +61,17 @@ pub fn validate_target(root:&Path)->Result<(),String>{
 }
 fn cancelled(cancel:&AtomicBool)->Result<(),String>{if cancel.load(Ordering::Acquire){Err("本体展开已取消，可重新尝试。".into())}else{Ok(())}}
 
+/// package_version（读取统一程序包版本）：用于绑定一次性更新配置与内嵌程序包。
+pub fn package_version(payload:&[u8])->Result<String,String>{
+    let mut archive=zip::ZipArchive::new(Cursor::new(payload)).map_err(|error|error.to_string())?;
+    let mut file=archive.by_name("program-package.json").map_err(|_|"正式程序包缺少版本记录。")?;
+    let mut bytes=Vec::new();file.read_to_end(&mut bytes).map_err(|error|error.to_string())?;
+    let record:Value=serde_json::from_slice(&bytes).map_err(|error|error.to_string())?;
+    if record["schema"]!=1||record["role"]!="product"{return Err("正式程序包记录无效。".into());}
+    let version=record["version"].as_str().ok_or("正式程序包缺少产品版本。")?.to_owned();
+    semver::Version::parse(&version).map_err(|_|"正式程序包版本无效。")?;Ok(version)
+}
+
 pub fn verify_installed(root:&Path)->Result<(),String>{
     workspace::verify_tree(&root.join("app"),"release.json")?;
     let release=crate::resources::load(&root.join("app/release.json"))?;

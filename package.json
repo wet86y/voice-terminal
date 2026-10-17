@@ -1,6 +1,7 @@
 {
   "name": "voice-terminal",
   "version": "0.9.0",
+  "license": "Apache-2.0",
   "private": true,
   "description": "本地模块化实时语音终端 v0.8",
   "type": "module",
@@ -17,6 +18,7 @@
     "desktop:icons": "node scripts/generate-app-icons.mjs",
     "desktop:publish": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-desktop.ps1",
     "desktop:dist": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/distribute-desktop.ps1",
+    "github:release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-github-release.ps1",
     "build": "npm run desktop:build",
     "frontend:build": "npm run build --workspace @voice-terminal/frontend",
     "typecheck": "npm run typecheck --workspace @voice-terminal/frontend",

@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions),windows_subsystem="windows")]
 #[allow(dead_code)] // 安装器复用窗口图标，不使用共享模块的托盘函数。
 #[path="../../src-tauri/src/app_icon.rs"] mod app_icon;
-use std::{fs,path::PathBuf,sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};
+use std::{fs,io::Write,path::{Path,PathBuf},sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},time::{Duration,Instant}};
 use serde_json::{Value,json};
 use tauri::{Manager,WebviewWindow,WebviewWindowBuilder,WebviewUrl};
 use voice_desktop_common::{installation,native_ui,workspace,shortcuts};
 const PACKAGE:&[u8]=include_bytes!(concat!(env!("OUT_DIR"),"/program.zip"));
+#[derive(Clone)]
+struct UpdateParent{pid:u32,create_time:u64,executable:PathBuf} // UpdateParent（待退出的旧程序进程身份）。
 struct Installer{
     target:Mutex<Option<PathBuf>>, // target（所选工作区根目录）。
     status:Mutex<Value>, // status（共享启动页阶段、进度和错误）。
@@ -15,6 +17,7 @@ struct Installer{
     exiting:AtomicBool, // exiting（取消后退出请求）。
     shortcut:bool, // shortcut（隔离验收可关闭桌面快捷方式）。
     report:Option<PathBuf>, // report（隔离验收结果位置）。
+    update_parent:Option<UpdateParent>, // update_parent（应用更新需正常退出的旧程序）。
 }
 fn trusted(window:&WebviewWindow)->Result<(),String>{let url=window.url().map_err(|e|e.to_string())?;if window.label()=="startup"&&["/","/index.html"].contains(&url.path())&&((url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")&&url.port().is_none())){Ok(())}else{Err("此页面没有安装权限。".into())}}
 #[tauri::command]fn desktop_status(window:WebviewWindow,state:tauri::State<Arc<Installer>>)->Result<Value,String>{trusted(&window)?;let status=state.status.lock().unwrap().clone();Ok(json!({"role":"installer","frontend_mode":"installer","development":false,"ready":false,"workspace_ready":false,"workspace_busy":state.busy.load(Ordering::Acquire),"initialization_failed":status["error"].is_string(),"error":status["error"],"initialization":status,"fields":{"role":"入口职责：installer（安装器）","development":"安装器不启用源码调试","initialization":"本体安装阶段"}}))}
@@ -27,6 +30,7 @@ fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result
         if state.target.lock().unwrap().as_ref()!=Some(&root){state.installed.store(false,Ordering::Release);}
         *state.target.lock().unwrap()=Some(root.clone());
         let mut progress=|phase:&str,done:u64,total:u64|{*state.status.lock().unwrap()=json!({"phase":phase,"completed_bytes":done,"total_bytes":total,"can_cancel":phase.starts_with("正在展开")||phase.starts_with("正在校验"),"error":null,"fields":{"phase":"安装阶段","completed_bytes":"已处理字节","total_bytes":"总字节数","can_cancel":"启用前允许取消","error":"失败原因"}});};
+        if let Some(parent)=&state.update_parent{progress("正在等待旧程序退出并释放工作区",0,0);wait_for_update_parent(&root,parent,&mut progress)?;}
         if !state.installed.load(Ordering::Acquire){progress("正在检查工作区",0,0);installation::install(PACKAGE,&root,state.cancel.clone(),&mut progress)?;state.installed.store(true,Ordering::Release);}
         progress("创建桌面快捷方式",0,0);
         if state.shortcut{shortcuts::create(&root,None)?;}
@@ -43,23 +47,103 @@ fn run_install(app:&tauri::AppHandle,state:Arc<Installer>,reselect:bool)->Result
 #[tauri::command]fn desktop_cancel_init(window:WebviewWindow,state:tauri::State<Arc<Installer>>)->Result<(),String>{trusted(&window)?;if state.status.lock().unwrap()["can_cancel"]!=true{return Err("当前阶段需要完成启用及交接，请稍候。".into());}state.cancel.store(true,Ordering::Release);Ok(())}
 fn exit(app:&tauri::AppHandle,state:&Installer){if state.busy.load(Ordering::Acquire){if state.status.lock().unwrap()["can_cancel"]==true{state.exiting.store(true,Ordering::Release);state.cancel.store(true,Ordering::Release);}}else{state.exiting.store(true,Ordering::Release);app.exit(0);}}
 #[tauri::command]fn exit_application(window:WebviewWindow,app:tauri::AppHandle,state:tauri::State<Arc<Installer>>)->Result<(),String>{trusted(&window)?;if state.busy.load(Ordering::Acquire)&&state.status.lock().unwrap()["can_cancel"]!=true{return Err("启用及启动交接阶段暂不能退出。".into());}exit(&app,&state);Ok(())}
+
+fn has_chinese(value:&str)->bool{value.chars().any(|ch|('\u{4e00}'..='\u{9fff}').contains(&ch))}
+fn consume_update_config(path:&Path)->Result<(PathBuf,UpdateParent),String>{
+    let supplied=voice_desktop_common::canonical_path(path)?;
+    let config=voice_desktop_common::resources::load(&supplied)?;
+    if config["schema"]!=1{return Err("应用更新配置格式无效。".into());}
+    let allowed=["schema","nonce","target_root","workspace_id","parent_pid","parent_create_time","parent_executable","version","tag","installer_size","installer_sha256","fields"];
+    if !config.as_object().is_some_and(|object|object.keys().all(|key|allowed.contains(&key.as_str()))){return Err("应用更新配置含有未识别字段。".into());}
+    let nonce=config["nonce"].as_str().ok_or("应用更新配置缺少单次编号")?;
+    if nonce.len()!=36||!nonce.bytes().all(|byte|byte.is_ascii_hexdigit()||byte==b'-'){return Err("应用更新单次编号无效。".into());}
+    for key in ["schema","nonce","target_root","workspace_id","parent_pid","parent_create_time","parent_executable","version","tag","installer_size","installer_sha256"]{
+        if !config["fields"][key].as_str().is_some_and(has_chinese){return Err(format!("应用更新配置字段 {key} 缺少中文说明。"));}
+    }
+    let root=voice_desktop_common::canonical_path(Path::new(config["target_root"].as_str().ok_or("应用更新配置缺少工作区")?))?;
+    installation::validate_target(&root)?;
+    let config_name=format!("app-update-{nonce}.json");
+    let expected=voice_desktop_common::workspace::safe_path(&root,&format!("tmp/{config_name}"))?;
+    if supplied!=voice_desktop_common::canonical_path(&expected)?||supplied.parent()!=Some(root.join("tmp").as_path()){
+        return Err("应用更新配置必须位于目标工作区的临时目录。".into());
+    }
+    let portable=voice_desktop_common::resources::load(&voice_desktop_common::workspace::safe_path(&root,"portable.json")?)?;
+    let workspace_id=portable["workspace_id"].as_str().filter(|value|!value.is_empty()).ok_or("目标目录不是有效工作区")?;
+    if config["workspace_id"].as_str()!=Some(workspace_id){return Err("工作区身份不匹配，已拒绝更新。".into());}
+    let version=config["version"].as_str().ok_or("更新配置缺少目标版本")?;
+    semver::Version::parse(version).map_err(|_|"更新配置版本无效。")?;
+    if config["tag"].as_str()!=Some(&format!("v{version}"))||installation::package_version(PACKAGE)?!=version{
+        return Err("发行标签、更新配置与内嵌程序版本不匹配。".into());
+    }
+    let installer_size=config["installer_size"].as_u64().filter(|size|*size>0).ok_or("更新配置缺少安装器字节数")?;
+    let installer_sha256=config["installer_sha256"].as_str().filter(|hash|hash.len()==64&&hash.bytes().all(|byte|byte.is_ascii_hexdigit())).ok_or("更新配置缺少安装器摘要")?;
+    let self_path=voice_desktop_common::canonical_path(&std::env::current_exe().map_err(|error|error.to_string())?)?;
+    if fs::metadata(&self_path).map_err(|error|error.to_string())?.len()!=installer_size||!workspace::file_hash(&self_path)?.eq_ignore_ascii_case(installer_sha256){
+        return Err("当前分发器与更新配置声明的已校验安装器不匹配。".into());
+    }
+    let pid=config["parent_pid"].as_u64().and_then(|value|u32::try_from(value).ok()).filter(|value|*value!=0).ok_or("旧程序进程编号无效")?;
+    if pid==std::process::id(){return Err("旧程序进程身份无效。".into());}
+    let create_time=config["parent_create_time"].as_u64().ok_or("更新配置缺少旧程序创建时间")?;
+    let executable=voice_desktop_common::canonical_path(Path::new(config["parent_executable"].as_str().ok_or("更新配置缺少旧程序位置")?))?;
+    let expected_executable=voice_desktop_common::canonical_path(&root.join("app/VoiceTerminalDesktop.exe"))?;
+    if executable!=expected_executable{return Err("旧程序不属于目标工作区，已拒绝更新。".into());}
+    let Some((actual_time,actual_executable))=workspace::process_identity(pid)? else{return Err("启动更新的旧程序已退出或不存在。".into());};
+    if actual_time!=create_time||!actual_executable.to_string_lossy().eq_ignore_ascii_case(&executable.to_string_lossy()){
+        return Err("旧程序进程身份已变化，已拒绝更新。".into());
+    }
+    let consumed=supplied.with_extension("json.consumed");
+    let mut marker=fs::OpenOptions::new().write(true).create_new(true).open(&consumed).map_err(|_|"此应用更新配置已使用或正在处理。")?;
+    marker.write_all(nonce.as_bytes()).map_err(|error|error.to_string())?;marker.sync_all().map_err(|error|error.to_string())?;drop(marker);
+    fs::remove_file(&supplied).map_err(|error|format!("无法消费一次性更新配置：{error}"))?;
+    Ok((root,UpdateParent{pid,create_time,executable}))
+}
+
+fn wait_for_update_parent(root:&Path,parent:&UpdateParent,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
+    let deadline=Instant::now()+Duration::from_secs(120);
+    loop{
+        let still_running=workspace::process_identity(parent.pid)?.is_some_and(|(created,path)|created==parent.create_time&&path.to_string_lossy().eq_ignore_ascii_case(&parent.executable.to_string_lossy()));
+        if !still_running{break;}
+        if Instant::now()>=deadline{return Err("旧程序未能在两分钟内退出；原工作区未变更。".into());}
+        progress("正在等待旧程序正常退出",0,0);std::thread::sleep(Duration::from_millis(200));
+    }
+    let deadline=Instant::now()+Duration::from_secs(30);
+    loop{
+        installation::ensure_idle(root)?;
+        match installation::WorkspaceGuard::acquire(root){
+            Ok(guard)=>{drop(guard);return Ok(());}
+            Err(error) if Instant::now()<deadline=>{progress("正在等待工作区锁释放",0,0);let _=error;std::thread::sleep(Duration::from_millis(200));}
+            Err(error)=>return Err(format!("无法取得工作区更新锁：{error}")),
+        }
+    }
+}
 fn run()->Result<(),String>{
     if PACKAGE.is_empty(){return Err("安装器未内嵌正式程序包，请重新构建。".into());}
-    let args=std::env::args().skip(1).collect::<Vec<_>>();let mut target=None;let mut report=None;let mut shortcut=true;let mut auto=false;
+    let args=std::env::args().skip(1).collect::<Vec<_>>();let mut target=None;let mut report=None;let mut shortcut=true;let mut auto=false;let mut update_parent=None;
     if !args.is_empty(){
-        if !cfg!(feature="qualification")||args.len()!=2||args[0]!="--qualification-config"{return Err("安装器不接受路径或产品运行参数。".into());}
-        let config=voice_desktop_common::resources::load(std::path::Path::new(&args[1]))?;
-        let root=PathBuf::from(config["target_root"].as_str().ok_or("验收配置缺少工作区")?);
-        let config_path=voice_desktop_common::canonical_path(std::path::Path::new(&args[1]))?;
-        let sandbox=config_path.parent().ok_or("验收目录无效")?;
-        workspace::Locator::local(&root).validate_target(&root)?;
-        if !root.starts_with(sandbox)||root==sandbox{return Err("自动验收目标须位于配置目录的独立子目录内。".into());}
-        target=Some(root);report=Some(sandbox.join("installer-result.json"));shortcut=config["shortcut"]!=false;auto=true;
+        if args.len()!=2{return Err("安装器参数数量无效。".into());}
+        match args[0].as_str(){
+            "--qualification-config"=>{
+                if !cfg!(feature="qualification"){return Err("正式安装器不接受验收参数。".into());}
+                let config=voice_desktop_common::resources::load(Path::new(&args[1]))?;
+                let root=PathBuf::from(config["target_root"].as_str().ok_or("验收配置缺少工作区")?);
+                let config_path=voice_desktop_common::canonical_path(Path::new(&args[1]))?;
+                let sandbox=config_path.parent().ok_or("验收目录无效")?;
+                workspace::Locator::local(&root).validate_target(&root)?;
+                if !root.starts_with(sandbox)||root==sandbox{return Err("自动验收目标须位于配置目录的独立子目录内。".into());}
+                target=Some(root);report=Some(sandbox.join("installer-result.json"));shortcut=config["shortcut"]!=false;auto=true;
+            }
+            "--app-update-config"=>{
+                let (root,parent)=consume_update_config(Path::new(&args[1]))?;
+                target=Some(root);update_parent=Some(parent);shortcut=false;auto=true;
+            }
+            _=>return Err("安装器不接受路径或产品运行参数。".into()),
+        }
     }
     std::env::remove_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER");
     if voice_desktop_common::webview::version().is_none(){voice_desktop_common::webview::guide("未检测到系统 WebView2（网页运行引擎）。安装后重新运行安装器。");return Ok(());}
     let cache=std::env::temp_dir().join(format!("voice-initialization-installer-{}",std::process::id()));fs::create_dir_all(&cache).map_err(|e|e.to_string())?;
-    let state=Arc::new(Installer{target:Mutex::new(target),status:Mutex::new(json!({"phase":"请选择文件夹作为整个工作区","error":null,"can_cancel":false})),busy:AtomicBool::new(false),cancel:Arc::new(AtomicBool::new(false)),installed:AtomicBool::new(false),exiting:AtomicBool::new(false),shortcut,report});
+    let initial_phase=if update_parent.is_some(){"正在准备应用更新"}else{"请选择文件夹作为整个工作区"};
+    let state=Arc::new(Installer{target:Mutex::new(target),status:Mutex::new(json!({"phase":initial_phase,"error":null,"can_cancel":false})),busy:AtomicBool::new(false),cancel:Arc::new(AtomicBool::new(false)),installed:AtomicBool::new(false),exiting:AtomicBool::new(false),shortcut,report,update_parent});
     let setup_state=state.clone();let cache_window=cache.clone();
     let app=tauri::Builder::default().manage(state.clone()).invoke_handler(tauri::generate_handler![desktop_status,desktop_initialize,desktop_cancel_init,exit_application])
         .setup(move|app|{let window=WebviewWindowBuilder::new(app,"startup",WebviewUrl::App("index.html".into())).initialization_script(voice_desktop_common::webview::DISABLE_CONTEXT_MENU).title("Voice Terminal · 安装语音终端").inner_size(1000.,640.).min_inner_size(400.,480.).incognito(true).data_directory(cache_window.clone()).on_navigation(|url| (url.scheme()=="tauri"&&url.host_str()==Some("localhost"))||(url.scheme()=="http"&&url.host_str()==Some("tauri.localhost")&&url.port().is_none())).build()?;app_icon::apply(window.hwnd()?.0).map_err(std::io::Error::other)?;

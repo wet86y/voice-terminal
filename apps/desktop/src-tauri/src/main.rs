@@ -29,6 +29,17 @@ use tauri::{
 use voice_desktop_common::{windows::Job, LaunchContext, workspace::{self, Locator}};
 use resource_commands::{ResourceManager,resource_import_confirm,resource_inventory,resource_jobs,resource_download,resource_import,resource_open_source,resource_cancel};
 
+const APP_UPDATE_PROGRESS_EVENT:&str="desktop://app-update-progress";
+struct AppUpdateManager{
+    status:Mutex<serde_json::Value>, // status（界面展示的更新阶段与进度）。
+    manifest:Mutex<Option<voice_desktop_common::app_update::AppUpdateManifest>>, // manifest（已校验的发行清单）。
+    busy:AtomicBool, // busy（更新任务互斥标记）。
+    cancel:Arc<AtomicBool>, // cancel（安装器下载取消信号）。
+}
+impl AppUpdateManager{
+    fn new()->Self{Self{status:Mutex::new(serde_json::Value::Null),manifest:Mutex::new(None),busy:AtomicBool::new(false),cancel:Arc::new(AtomicBool::new(false))}}
+}
+
 struct Service {
     child: Child,
     input: ChildStdin,
@@ -91,7 +102,7 @@ fn frontend_capability(mode: FrontendMode, normalized_origin: &str, epoch: u64) 
     if mode == FrontendMode::UiPreview {
         serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
     } else {
-        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","core:event:allow-listen","core:event:allow-unlisten"]})
+        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","core:event:allow-listen","core:event:allow-unlisten"]})
     }
 }
 
@@ -121,6 +132,7 @@ struct Desktop {
     locator: Option<Locator>, // locator（当前工作区本地身份，不读写系统定位）。
     workspace_guard: Mutex<Option<voice_desktop_common::installation::WorkspaceGuard>>, // workspace_guard（程序运行期间的本体互斥锁）。
     workspace_busy: AtomicBool, // workspace_busy（防止并行切换或迁移）。
+    app_update:AppUpdateManager, // app_update（应用发行检查、下载及安装交接）。
     service_requested: AtomicBool, // service_requested（主窗口已请求启动服务，刷新不重复启动）。
     service_starting: AtomicBool, // service_starting（本次启动正在校验或建立入口）：拒绝重复启动。
     startup_skipped: AtomicBool,   // startup_skipped（当前窗口跳过加载画面的选择）。
@@ -638,6 +650,97 @@ async fn workspace_operation(window:WebviewWindow,state:Arc<Desktop>,app:tauri::
 async fn workspace_link(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>,app:tauri::AppHandle,target_root:String)->Result<serde_json::Value,String>{workspace_operation(window,state.inner().clone(),app,target_root,"link").await}
 #[tauri::command(rename_all = "snake_case")]
 async fn workspace_migrate(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>,app:tauri::AppHandle,target_root:String)->Result<serde_json::Value,String>{workspace_operation(window,state.inner().clone(),app,target_root,"migrate").await}
+
+fn app_update_payload(state_name:&str,manifest:Option<&voice_desktop_common::app_update::AppUpdateManifest>,done:u64,total:u64,phase:Option<&str>,error:Option<&str>,can_cancel:bool)->serde_json::Value{
+    serde_json::json!({"state":state_name,"current_version":env!("CARGO_PKG_VERSION"),"target_version":manifest.map(|value|value.version.as_str()),
+        "release_notes":manifest.map(|value|value.release_notes.as_str()),"completed_bytes":done,"total_bytes":total,"phase":phase,"error":error,"can_cancel":can_cancel,
+        "fields":{"state":"更新阶段","current_version":"当前程序版本","target_version":"目标程序版本","release_notes":"发行说明","phase":"当前处理阶段",
+            "completed_bytes":"已下载字节数","total_bytes":"安装器总字节数","error":"更新错误","can_cancel":"当前是否允许取消"}})
+}
+fn emit_app_update(state:&Desktop,app:&tauri::AppHandle,payload:serde_json::Value){
+    *state.app_update.status.lock().unwrap()=payload.clone();let _=app.emit(APP_UPDATE_PROGRESS_EVENT,payload);
+}
+#[tauri::command]
+async fn app_update_check(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>,app:tauri::AppHandle)->Result<serde_json::Value,String>{
+    require_workspace(&window,&state)?;
+    if state.app_update.busy.load(Ordering::Acquire){return Ok(state.app_update.status.lock().unwrap().clone());}
+    *state.app_update.manifest.lock().unwrap()=None;
+    emit_app_update(&state,&app,app_update_payload("checking",None,0,0,Some("正在读取最新发行清单"),None,false));
+    let checked=tauri::async_runtime::spawn_blocking(move||voice_desktop_common::app_update::check_latest(env!("CARGO_PKG_VERSION"))).await.map_err(|error|error.to_string())?;
+    let payload=match checked{
+        Ok(Some(manifest))=>{
+            *state.app_update.manifest.lock().unwrap()=Some(manifest.clone());
+            app_update_payload("available",Some(&manifest),0,manifest.size,None,None,false)
+        }
+        Ok(None)=>app_update_payload("current",None,0,0,None,None,false),
+        Err(error)=>app_update_payload("failed",None,0,0,None,Some(&error),false),
+    };
+    emit_app_update(&state,&app,payload.clone());Ok(payload)
+}
+#[tauri::command]
+async fn app_update_download(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>,app:tauri::AppHandle)->Result<serde_json::Value,String>{
+    require_workspace(&window,&state)?;
+    if state.workspace_busy.load(Ordering::Acquire){return Err("工作区正在切换或迁移，完成后再更新。".into());}
+    let manifest=state.app_update.manifest.lock().unwrap().clone().ok_or("请先检查更新并确认有可用版本。")?;
+    if !manifest.is_newer_than(env!("CARGO_PKG_VERSION"))?{return Err("当前没有可安装的新版本。".into());}
+    if state.app_update.busy.swap(true,Ordering::SeqCst){return Err("更新下载已经开始。".into());}
+    state.app_update.cancel.store(false,Ordering::Release);
+    let payload=app_update_payload("downloading",Some(&manifest),0,manifest.size,Some("正在连接 GitHub 并校验安装器"),None,true);
+    emit_app_update(&state,&app,payload.clone());
+    let desktop=state.inner().clone();let handle=app.clone();
+    std::thread::spawn(move||download_and_handoff_update(desktop,handle,manifest));
+    Ok(payload)
+}
+#[tauri::command]
+fn app_update_cancel(window:WebviewWindow,state:tauri::State<Arc<Desktop>>)->Result<(),String>{
+    require_workspace(&window,&state)?;
+    if !state.app_update.busy.load(Ordering::Acquire)||state.app_update.status.lock().unwrap()["can_cancel"]!=true{return Err("当前更新阶段不允许取消。".into());}
+    state.app_update.cancel.store(true,Ordering::Release);Ok(())
+}
+fn download_and_handoff_update(state:Arc<Desktop>,app:tauri::AppHandle,manifest:voice_desktop_common::app_update::AppUpdateManifest){
+    let result=(||{
+        let context=state.context().ok_or("缺少当前工作区上下文")?;
+        if state.workspace_busy.load(Ordering::Acquire){return Err("工作区正在切换或迁移，更新已停止。".into());}
+        let installer=workspace::safe_path(&context.install,"tmp/app-update/VoiceTerminalSetup.exe")?;
+        let source=manifest.asset_url();
+        let file=voice_desktop_common::download::DownloadFile{url:source,size:manifest.size,sha256:manifest.sha256.clone(),sha512:String::new(),path:manifest.asset.clone()};
+        voice_desktop_common::download::download_with_progress(&file,&installer,state.app_update.cancel.clone(),&mut|phase,done,total|{
+            let payload=app_update_payload("downloading",Some(&manifest),done,total,Some(phase),None,true);emit_app_update(&state,&app,payload);
+        },0)?;
+        if state.app_update.cancel.load(Ordering::Acquire){return Err("更新下载已取消。".into());}
+        if fs::metadata(&installer).map_err(|error|error.to_string())?.len()!=manifest.size||workspace::file_hash(&installer)?!=manifest.sha256.to_lowercase(){
+            let _=fs::remove_file(&installer);return Err("分发安装器大小或 SHA-256 摘要校验失败。".into());
+        }
+        if let Some(manager)=app.try_state::<Arc<ResourceManager>>(){manager.pause_and_wait()?;}
+        let pid=std::process::id();let (parent_create_time,parent_executable)=workspace::process_identity(pid)?.ok_or("当前程序进程身份不可用。")?;
+        let expected=voice_desktop_common::canonical_path(&context.install.join("app/VoiceTerminalDesktop.exe"))?;
+        if !parent_executable.to_string_lossy().eq_ignore_ascii_case(&expected.to_string_lossy()){
+            return Err("当前程序身份与工作区不匹配，拒绝启动更新安装器。".into());
+        }
+        let nonce=workspace::new_id();let config_path=workspace::safe_path(&context.install,&format!("tmp/app-update-{nonce}.json"))?;
+        let consumed_path=config_path.with_extension("json.consumed");
+        if config_path.exists()||consumed_path.exists(){return Err("更新配置编号重复，拒绝继续。".into());}
+        let config=serde_json::json!({"schema":1,"nonce":nonce,"target_root":context.install,"workspace_id":context.workspace_id,
+            "parent_pid":pid,"parent_create_time":parent_create_time,"parent_executable":parent_executable,
+            "version":manifest.version,"tag":manifest.tag,"installer_size":manifest.size,"installer_sha256":manifest.sha256,
+            "fields":{"schema":"一次性应用更新配置格式","nonce":"单次使用随机编号","target_root":"当前有效工作区根目录",
+                "workspace_id":"必须保持不变的工作区身份编号","parent_pid":"当前主程序进程编号","parent_create_time":"当前主程序创建时间",
+                "parent_executable":"当前主程序可执行文件位置","version":"待安装产品版本","tag":"对应 GitHub 发行标签",
+                "installer_size":"已校验分发安装器字节数","installer_sha256":"已校验分发安装器 SHA-256 摘要"}});
+        workspace::atomic_json(&config_path,&config)?;
+        let mut command=Command::new(&installer);command.arg("--app-update-config").arg(&config_path).current_dir(&context.install)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x08000000);
+        if let Err(error)=command.spawn(){let _=fs::remove_file(&config_path);return Err(format!("无法启动更新分发器：{error}"));}
+        emit_app_update(&state,&app,app_update_payload("handing_off",Some(&manifest),manifest.size,manifest.size,Some("正在关闭旧程序并启动安装器"),None,false));
+        state.shutdown(&app);Ok::<(),String>(())
+    })();
+    state.app_update.busy.store(false,Ordering::Release);
+    if let Err(error)=result{
+        let cancelled=state.app_update.cancel.load(Ordering::Acquire)||error.contains("已取消");
+        let payload=app_update_payload(if cancelled{"cancelled"}else{"failed"},Some(&manifest),0,manifest.size,None,Some(&error),false);
+        emit_app_update(&state,&app,payload);
+    }
+}
 
 fn show(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<Arc<Desktop>>() {
@@ -1184,6 +1287,7 @@ fn run() -> Result<(), String> {
         locator,
         workspace_guard:Mutex::new(None),
         workspace_busy: AtomicBool::new(false),
+        app_update:AppUpdateManager::new(),
         service_requested: AtomicBool::new(false),
         service_starting: AtomicBool::new(false),
         startup_skipped: AtomicBool::new(false),
@@ -1234,7 +1338,7 @@ fn run() -> Result<(), String> {
             desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init,
             model_credentials_status,model_credentials_save,
             resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
-            workspace_info,workspace_choose,workspace_link,workspace_migrate,
+            workspace_info,workspace_choose,workspace_link,workspace_migrate,app_update_check,app_update_download,app_update_cancel,
             resource_inventory,resource_jobs,resource_download,resource_import,resource_import_confirm,resource_open_source,resource_cancel
         ])
         .setup(move |app| {

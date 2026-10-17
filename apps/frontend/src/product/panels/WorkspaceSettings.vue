@@ -21,6 +21,28 @@ const progress = computed(() => {
   return Math.max(0, Math.min(100, Math.round(job.completed_bytes / job.total_bytes * 100)))
 })
 const controlsBusy = computed(() => pickerBusy.value || props.controller.workspaceOperationStarting.value || Boolean(activeJob.value))
+const updateStatus = computed(() => props.controller.appUpdate.value)
+const updateBusy = computed(() => ['checking', 'downloading', 'handing_off'].includes(updateStatus.value.state))
+const updateProgress = computed(() => {
+  const { completed_bytes: done, total_bytes: total } = updateStatus.value
+  if (!total || total <= 0 || done == null) return undefined
+  return Math.max(0, Math.min(100, Math.round(done / total * 100)))
+})
+const updateActionLabel = computed(() => {
+  if (updateStatus.value.state === 'checking') return '正在检查…'
+  if (updateStatus.value.state === 'downloading') return '取消下载'
+  if (updateStatus.value.state === 'handing_off') return '正在启动安装器…'
+  if (updateStatus.value.target_version && ['available', 'failed', 'cancelled'].includes(updateStatus.value.state)) {
+    return updateStatus.value.state === 'available' ? '下载并安装' : '重新下载并安装'
+  }
+  return updateStatus.value.state === 'current' ? '重新检查' : '检查更新'
+})
+
+function runUpdateAction() {
+  if (updateStatus.value.state === 'downloading') void props.controller.cancelAppUpdate()
+  else if (updateStatus.value.target_version && ['available', 'failed', 'cancelled'].includes(updateStatus.value.state)) void props.controller.downloadAppUpdate()
+  else void props.controller.checkAppUpdate()
+}
 
 async function chooseTarget() {
   if (controlsBusy.value || !canManage.value) return
@@ -94,8 +116,23 @@ function formatBytes(value: number | null | undefined) {
     </section>
 
     <section class="workspace-update-card" aria-labelledby="workspace-update-title">
-      <div><p class="section-label">UPDATE（更新）</p><h3 id="workspace-update-title">应用更新</h3><p>在线更新尚未启用。当前版本 {{ workspace?.version || '—' }}。</p></div>
-      <button class="outline-button" type="button" disabled>检查更新</button>
+      <div class="workspace-update-content">
+        <p class="section-label">UPDATE（更新）</p><h3 id="workspace-update-title">应用更新</h3>
+        <p>当前版本 {{ workspace?.version || updateStatus.current_version || '—' }}<template v-if="updateStatus.target_version"> · 发现新版 {{ updateStatus.target_version }}</template></p>
+        <p v-if="updateStatus.state === 'checking'" role="status">正在检查 GitHub 发行版…</p>
+        <p v-else-if="updateStatus.state === 'current'" role="status">当前已是最新版本。</p>
+        <p v-else-if="updateStatus.state === 'downloading'" role="status">正在下载并校验分发安装器…</p>
+        <p v-else-if="updateStatus.state === 'handing_off'" role="status">安装器已校验，正在关闭当前程序并启动更新。</p>
+        <p v-else-if="updateStatus.state === 'cancelled'" role="status">下载已取消，可以重新开始。</p>
+        <p v-if="updateStatus.phase && updateStatus.state === 'downloading'" role="status">{{ updateStatus.phase }}</p>
+        <p v-if="updateStatus.release_notes" class="workspace-release-notes">{{ updateStatus.release_notes }}</p>
+        <div v-if="updateStatus.state === 'downloading' && updateProgress !== undefined" class="workspace-progress-wrap">
+          <div class="workspace-progress" role="progressbar" aria-label="安装器下载进度" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="updateProgress"><span :style="{ width: `${updateProgress}%` }"></span></div>
+          <small>{{ formatBytes(updateStatus.completed_bytes) }} / {{ formatBytes(updateStatus.total_bytes) }} · {{ updateProgress }}%</small>
+        </div>
+        <p v-if="updateStatus.error" class="workspace-error" role="alert">{{ updateStatus.error }}</p>
+      </div>
+      <button class="outline-button" type="button" :disabled="updateBusy || controlsBusy || !canManage" @click="runUpdateAction">{{ updateActionLabel }}</button>
     </section>
 
     <section v-if="latestJob" class="workspace-job-card" :class="{ failed: latestJob.state === 'failed' }" aria-live="polite">
@@ -134,6 +171,7 @@ function formatBytes(value: number | null | undefined) {
 .workspace-target-actions{display:flex;gap:8px;flex-wrap:wrap}
 .workspace-migrate-action{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 32%,transparent)}
 .workspace-update-card>div>p:last-child{font-size:var(--font-caption);color:var(--muted);line-height:1.55}
+.workspace-release-notes{white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto}
 .workspace-empty{padding:16px;border:1px dashed var(--line-strong);border-radius:12px;color:var(--muted)}
 .workspace-error{margin:0;color:var(--danger);font-size:var(--font-caption);overflow-wrap:anywhere;white-space:pre-wrap}
 .workspace-job-card{display:grid;gap:8px}
