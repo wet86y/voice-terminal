@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "prefixes": [
+    {"origin_prefix": "https://www.python.org/ftp/python/", "mirror_prefix": "https://mirrors.huaweicloud.com/python/"},
+    {"origin_prefix": "https://files.pythonhosted.org/", "mirror_prefix": "https://pypi.tuna.tsinghua.edu.cn/"},
+    {"origin_prefix": "https://download.pytorch.org/whl/", "mirror_prefix": "https://mirror.sjtu.edu.cn/pytorch-wheels/"},
+    {"origin_prefix": "https://github.com/", "mirror_prefix": "https://gh-proxy.org/https://github.com/"},
+    {"origin_prefix": "https://raw.githubusercontent.com/", "mirror_prefix": "https://gh-proxy.org/https://raw.githubusercontent.com/"},
+    {"origin_prefix": "https://registry.npmjs.org/", "mirror_prefix": "https://registry.npmmirror.com/"}
+  ],
+  "models": [
+    {"origin_prefix": "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/f766f81d3cfdf7737ac64aad813d91bbfd56bf93/", "repo_id": "pipecat-ai/smart-turn-v3", "revision": "dd6b4b37fa45d30a8d0d56735a1727c96c11711e"},
+    {"origin_prefix": "https://huggingface.co/FunAudioLLM/SenseVoiceSmall/resolve/3847d57b6bdf2dd8875cb1508d2af43d80a16bf7/", "repo_id": "iic/SenseVoiceSmall", "revision": "7bf452403abd7353a300cd760f7adae7701c92c1"},
+    {"origin_prefix": "https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/1b5981b2b89a1af578ebba5c8cf34226810e1f55/", "repo_id": "HereIsMark/audio.cpp-gguf", "revision": "710b2d85fa66ecd0e9cc4eee6413b9595171f502"}
+  ],
+  "npm_registries": ["https://registry.npmmirror.com", "https://registry.npmjs.org"],
+  "pypi_indexes": ["https://pypi.tuna.tsinghua.edu.cn/simple", "https://pypi.org/simple"],
+  "pytorch_indexes": ["https://mirror.sjtu.edu.cn/pytorch-wheels", "https://download.pytorch.org/whl"],
+  "node_dist": "https://npmmirror.com/mirrors/node",
+  "node_dist_official": "https://nodejs.org/download/release",
+  "node_download_page": "https://npmmirror.com/mirrors/node/",
+  "rust_dist": "https://rsproxy.cn",
+  "rust_update": "https://rsproxy.cn/rustup",
+  "rust_index": "sparse+https://rsproxy.cn/index/",
+  "tokenizer": {
+    "url": "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
+    "asset": "config/resources/assets/tokenizers/o200k_base.tiktoken",
+    "sha256": "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
+  },
+  "fields": {
+    "schema": "下载来源配置格式；不参与组件内容身份计算",
+    "prefixes": "固定原始地址到公共镜像的前缀映射，原站始终作为最后候选",
+    "origin_prefix": "原始来源前缀，包含固定版本时仅适用该版本",
+    "mirror_prefix": "镜像地址前缀",
+    "models": "内容摘要已核实的魔搭模型副本，不改变原资源版本",
+    "repo_id": "镜像模型仓库编号",
+    "revision": "镜像仓库的固定提交号",
+    "npm_registries": "公开脚本包注册表，按顺序回退；私有注册表不参与",
+    "pypi_indexes": "构建时使用的 Python（后端语言）包索引，按顺序回退",
+    "pytorch_indexes": "张量框架安装包索引根地址，后接计算组合",
+    "node_dist": "脚本运行环境头文件的国内镜像根地址",
+    "node_dist_official": "脚本运行环境头文件的原站备用根地址",
+    "node_download_page": "缺少脚本运行环境时的国内下载页面",
+    "rust_dist": "Rust（原生编程语言）工具链镜像",
+    "rust_update": "Rust（原生编程语言）工具链管理器更新镜像",
+    "rust_index": "Rust（原生编程语言）包管理器的稀疏镜像索引",
+    "tokenizer": "随包交付的分词器词表，避免首次使用时访问海外存储",
+    "url": "词表的原始公开来源",
+    "asset": "词表在程序包内的相对路径",
+    "sha256": "固定词表的 SHA-256（文件摘要）",
+    "fields": "配置字段的中文说明"
+  }
+}

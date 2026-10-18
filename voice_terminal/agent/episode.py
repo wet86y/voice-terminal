@@ -64,6 +64,8 @@ def _load_o200k_encoding() -> None:
     global _O200K_ENCODING, _O200K_STATE
     try:
         import tiktoken  # type: ignore
+        from ..download_sources import seed_tokenizer_cache
+        seed_tokenizer_cache()
         encoding = tiktoken.get_encoding("o200k_base")
     except Exception as exc:
         logger.warning("agent.tokenizer_prewarm_failed error=%s", str(exc)[:200])

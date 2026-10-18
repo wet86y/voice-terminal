@@ -14,7 +14,7 @@ fn dependency_plan(context:&voice_desktop_common::LaunchContext,group:&str)->Res
 }
 #[tauri::command(rename_all="snake_case")]
 pub async fn resource_install_plan(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,manager:State<'_,Arc<ResourceManager>>,resource_id:String)->Result<Value,String>{
-    allowed(&window,&desktop)?;let context=manager.context();
+    allowed(&window,&desktop)?;let context=manager.context();let source_id=resource_id.clone();
     tauri::async_runtime::spawn_blocking(move||{
         if matches!(resource_id.as_str(),"voice-server"|runtime::CPU_RESOURCE|runtime::GPU_RESOURCE){return Ok(json!({"resource_id":resource_id,"title":if resource_id==runtime::GPU_RESOURCE{"GPU（图形处理器）运行依赖"}else if resource_id==runtime::CPU_RESOURCE{"CPU（中央处理器）运行依赖"}else{"Voice Server（语音服务）运行环境"},"model_bytes":0,"environment":runtime::plan(&context,if resource_id==runtime::GPU_RESOURCE{"gpu"}else{"cpu"})?,
             "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型文件下载字节数","environment":"完整语音运行环境安装计划"}}));}
@@ -28,7 +28,16 @@ pub async fn resource_install_plan(window:WebviewWindow,desktop:State<'_,Arc<Des
         let environment=if spec["dependency_group"].as_str().is_some(){runtime::plan(&context,"all")?}else{Value::Null};
         Ok(json!({"resource_id":resource_id,"title":spec["title"],"model_bytes":model_bytes,"environment":environment,"shared_resources":shared_resources,
             "fields":{"resource_id":"固定资源编号","title":"资源名称","model_bytes":"模型或组件最大下载字节数","shared_resources":"需要先安装的共用原生运行程序","download_bytes":"共用组件最大远端下载字节数","environment":"组件专用依赖组对应的完整共享运行环境更新计划；空值表示无需单独更新依赖"}}))
-    }).await.map_err(|e|e.to_string())?
+    }).await.map_err(|e|e.to_string()).and_then(|result|result.map(|mut plan:Value|{
+        let sources=if matches!(source_id.as_str(),"voice-server"|runtime::CPU_RESOURCE|runtime::GPU_RESOURCE){
+            let mut hosts=vec![];
+            for url in std::iter::once(&plan["environment"]["python"]["url"]).chain(plan["environment"]["wheels"].as_array().into_iter().flatten().map(|row|&row["url"])){
+                if let Some(url)=url.as_str().filter(|url|!url.is_empty()){for candidate in voice_desktop_common::download_sources::candidates(url){let host=voice_desktop_common::download_sources::host(&candidate).to_owned();if !hosts.contains(&host){hosts.push(host);}}}
+            }hosts
+        }else{resources::spec(&manager.context(),&source_id).map(|spec|voice_desktop_common::download_sources::plan_sources(&spec)).unwrap_or_default()};
+        plan["download_sources"]=json!(sources);
+        plan["fields"]["download_sources"]=json!("各类资源使用的镜像和原站域名，下载失败时按资源切换备用来源");plan
+    }))
 }
 #[tauri::command]
 pub async fn voice_environment_status(window:WebviewWindow,desktop:State<'_,Arc<Desktop>>,manager:State<'_,Arc<ResourceManager>>)->Result<Value,String>{

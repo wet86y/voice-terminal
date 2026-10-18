@@ -23,6 +23,7 @@
 ## 说明
 
 - [组件设置与分类下载](guides/component-settings.md)
+- [国内镜像与原站回退](guides/download-sources.md)
 - [模型运行环境配置指南](guides/模型运行环境配置指南.md)
 - [应用生命周期](guides/application-lifecycle.md)
 - [ASR（自动语音识别）热词](guides/asr-hotwords.md)
@@ -54,6 +55,7 @@
 - [桌面现场验收](testing/desktop-acceptance.md)
 - [CAM++（声纹模型）流式验收](testing/campplus-streaming-acceptance-20261012.md)
 - [下载与首次启动修复验收](testing/download-startup-flow-20261010.md)
+- [国内镜像与原站回退验证](testing/download-sources-20261018.md)
 - [DSH 0.2.1-rc.2 升级与分发验收](testing/dsh-rc2-upgrade-20261017.md)
 - [本地模型计算基准](testing/local-model-compute-benchmark.md)
 - [试听后合成变慢与原生组件覆盖升级](testing/tts-preview-upgrade-20261017.md)

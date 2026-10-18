@@ -24,8 +24,30 @@ from voice_terminal.local_files import remove_tree
 def run(*arguments, cwd=None, env=None) -> str:
     process = subprocess.run([str(v) for v in arguments], cwd=cwd, env=env, text=True, encoding="utf-8", capture_output=True)
     if process.returncode:
-        raise RuntimeError(f"构建命令失败：{process.stdout[-1600:]}\n{process.stderr[-1600:]}")
+        error = RuntimeError(f"构建命令失败：{process.stdout[-1600:]}\n{process.stderr[-1600:]}")
+        error.returncode = process.returncode
+        raise error
     return process.stdout.strip()
+
+
+def run_registry(*arguments, cwd=None, env=None) -> str:
+    """run_registry（构建依赖来源回退）：私有注册表只访问自身。"""
+    from voice_terminal.download_sources import policy, npm_registry
+    environment = dict(env or os.environ)
+    registry = npm_registry(environment, Path(cwd) if cwd else None)
+    sources = policy()["npm_registries"] if registry.rstrip("/") in policy()["npm_registries"] else [registry]
+    for source in sources:
+        environment["npm_config_registry"] = source
+        if source in policy()["npm_registries"]:
+            environment["npm_config_disturl"] = policy()["node_dist"] if source == policy()["npm_registries"][0] else policy()["node_dist_official"]
+        from urllib.parse import urlsplit
+        print(f"构建依赖来源：{urlsplit(source).hostname}", flush=True)
+        try:
+            return run(*arguments, "--registry", source, cwd=cwd, env=environment)
+        except RuntimeError as error:
+            if getattr(error, "returncode", 0) in {130, 3221225786, -2} or source == sources[-1]:
+                raise
+    raise RuntimeError("构建依赖来源集合为空")
 
 
 def materialize(source: Path, target: Path, *, omit_nested_modules=False, ancestors=()) -> None:
@@ -70,13 +92,13 @@ def collect_office_engine(output: Path, cache: Path) -> None:
     if (target / "prebuilds.json").is_file():
         return
     cache.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(f"https://registry.npmjs.org/{package}/{version}", timeout=60) as response:
-        metadata = json.load(response)
+    from voice_terminal.download_sources import fetch, download
+    metadata = fetch(f"https://registry.npmjs.org/{package}/{version}", decode_json=True)
     archive = cache / f"libreoffice-kit-win32-x64-{version}.tgz"
     if not archive.is_file():
         print("下载文档预览的 Windows（操作系统）原生转换组件……", flush=True)
-        with urllib.request.urlopen(metadata["dist"]["tarball"], timeout=120) as incoming, archive.open("xb") as outgoing:
-            shutil.copyfileobj(incoming, outgoing)
+        expected_hex = base64.b64decode(metadata["dist"]["integrity"].split("-", 1)[1]).hex()
+        download(metadata["dist"]["tarball"].replace("https://registry.npmmirror.com/", "https://registry.npmjs.org/"), archive, sha512=expected_hex)
     algorithm, expected = metadata["dist"]["integrity"].split("-", 1)
     hasher = hashlib.new(algorithm)
     with archive.open("rb") as stream:
@@ -128,6 +150,8 @@ def main():
         pnpm = entry
     env = {**os.environ, "PATH": str(node.parent) + os.pathsep + os.environ.get("PATH", "")}
     env.update(npm_config_store_dir=str(ROOT / '.local/cache/pnpm'), npm_config_cache=str(ROOT / '.local/cache/npm'))
+    from voice_terminal.download_sources import npm_environment
+    env = npm_environment(env, cwd=source)
     if run(node, pnpm, "--version", cwd=source, env=env) != lock["package_manager"].split("@")[1]:
         raise ValueError("构建机包管理器版本与宿主锁定记录不一致。")
     print(run(node, pnpm, "run", "verify-runtime-closure", cwd=source, env=env), flush=True)
@@ -155,7 +179,7 @@ def main():
         # 生产收集不执行源码仓库的开发钩子；Windows（操作系统）依赖使用已发布的预编译文件。
         options = ("--config.allow-unused-patches=true", "--config.ignore-scripts=true", "--config.node-linker=hoisted",
                    f"--config.auto-install-peers={str(peer_setting).lower()}", "--config.link-workspace-packages=true")
-        run(node, pnpm, "install", "--prod", "--frozen-lockfile", "--ignore-scripts", *options, cwd=workspace, env=env)
+        run_registry(node, pnpm, "install", "--prod", "--frozen-lockfile", "--ignore-scripts", *options, cwd=workspace, env=env)
         print("收集生产依赖闭包……", flush=True)
         run(node, pnpm, "--filter", "dsh-python-runtime-closure", "deploy", "--legacy", "--prod", *options, deploy, cwd=workspace, env=env)
         materialize(deploy / "runtime-bootstrap.mjs", output / "runtime-bootstrap.mjs")

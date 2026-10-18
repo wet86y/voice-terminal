@@ -1,6 +1,7 @@
 ﻿param([switch]$Offline, [switch]$SkipInstall, [switch]$ValidateOnly)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'local-context.ps1')
+. (Join-Path $PSScriptRoot 'download-sources.ps1')
 $RepoRoot = Get-ProjectRoot
 $Context = Get-LocalContext
 Set-LocalEnvironment $Context $RepoRoot
@@ -9,15 +10,14 @@ $Lock = Get-Content -LiteralPath (Join-Path $RepoRoot 'config/dsh/runtime.lock.j
 # Source（受控源码缓存）：单个 Git（版本控制）检出，依赖版本由锁文件固定。
 if (-not (Test-Path -LiteralPath (Join-Path $Source '.git'))) {
   if ($Offline -or $SkipInstall -or $ValidateOnly) { throw '缺少受控宿主构建缓存。' }
-  & git clone --single-branch --branch $Lock.tag $Lock.repository $Source
-  if ($LASTEXITCODE) { throw '宿主源码缓存建立失败。' }
+  Invoke-SourceGitClone -Repository $Lock.repository -Destination $Source -Options @('--single-branch','--branch',$Lock.tag)
 }
 $Head = (& git -C $Source rev-parse HEAD).Trim()
 if ($Head -ne $Lock.commit) {
   if ($ValidateOnly -or $SkipInstall) { throw '宿主构建缓存与当前锁定版本不符。' }
   $Dirty = & git -C $Source status --porcelain
   if ($Dirty) { throw '宿主源码缓存有本机修改，不能自动覆盖。' }
-  if (-not $Offline) { & git -C $Source fetch origin $Lock.tag; if ($LASTEXITCODE) { throw '宿主源码获取失败。' } }
+  if (-not $Offline) { Invoke-SourceGitFetch -Repository $Lock.repository -Directory $Source -Ref $Lock.tag }
   & git -C $Source checkout --detach $Lock.commit
   if ($LASTEXITCODE) { throw '宿主锁定版本检出失败。' }
 }
@@ -33,13 +33,12 @@ if (-not $ValidateOnly) {
       $PnpmVersion = if (Test-Path -LiteralPath $PnpmEntry) { & $Context.Node $PnpmEntry --version } else { '' }
       if ($PnpmVersion -ne $Pnpm) {
         if ($Offline) { throw '离线构建缺少当前锁定版本的项目内包管理器。' }
-        & npm install --prefix $PnpmHome --no-save --package-lock=false "pnpm@$Pnpm"
-        if ($LASTEXITCODE) { throw '项目内包管理器准备失败。' }
+        Invoke-SourceNpm -Arguments @('install','--prefix',$PnpmHome,'--no-save','--package-lock=false',"pnpm@$Pnpm")
       }
       $InstallArgs = @('install', '--frozen-lockfile', '--store-dir', (Join-Path $Context.Root 'cache/pnpm'))
       if ($Offline) { $InstallArgs += '--offline' }
-      & $Context.Node $PnpmEntry @InstallArgs
-      if ($LASTEXITCODE) { throw '宿主开发依赖安装失败。' }
+      if ($Offline) { & $Context.Node $PnpmEntry @InstallArgs; if ($LASTEXITCODE) { throw '离线缓存缺少宿主依赖。' } }
+      else { Invoke-SourceNpm -Executable $Context.Node -Arguments (@($PnpmEntry) + $InstallArgs) }
       & $Context.Node $PnpmEntry run build
       if ($LASTEXITCODE) { throw '宿主源码构建失败。' }
     } finally { Pop-Location }

@@ -326,7 +326,7 @@ impl ResourceManager {
         if resource_id=="dsh"{
             let spec=voice_desktop_common::resources::spec(&self.context,resource_id)?;
             if spec["origin"]=="npm_package"&&voice_desktop_common::dsh::discover(&voice_desktop_common::dsh::target(&self.context.installed_program())?,true).is_err(){
-                #[cfg(windows)] return voice_desktop_common::windows::open_url("https://nodejs.org/en/download");
+                #[cfg(windows)] return voice_desktop_common::windows::open_url(voice_desktop_common::download_sources::policy()["node_download_page"].as_str().unwrap());
             }
         }
         let catalog_path = self.context.program.join("config/resources/catalog.json");

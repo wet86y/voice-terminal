@@ -74,13 +74,16 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
         std::stop_source network_stop;std::jthread network_watch;
         // fetch（受控请求）：无响应或读取停滞时也能主动中断句柄，等待线程在返回前收集。
         auto fetch = [&](const HttpRequest& request, const HttpTransport::ChunkSink& sink) {
+            auto bounded = request; // bounded（单次网络等待）：允许无整文件时限的大模型续传。
+            bounded.connect_timeout = std::chrono::seconds(12);
+            bounded.idle_timeout = std::chrono::seconds(20);
             if (!network_watch.joinable() && cancel_check) network_watch = std::jthread([&](std::stop_token token) {
                 while (!token.stop_requested()) {
                     if (cancel_check(cancel_context)) {network_stop.request_stop();transport->abort_active();}
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             });
-            return transport->get(request, sink, network_stop.get_token());
+            return transport->get(bounded, sink, network_stop.get_token());
         };
         if (probe_limit) {
             HttpRequest request{std::string(url)};

@@ -284,7 +284,7 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
         let error=result.as_ref().err().cloned().or_else(||node_status.err()).or_else(||if update_available{Some("该组件的版本或适配要求有更新，请先完成更新。".into())}else{None});
         rows.push(json!({"resource_id":item["resource_id"],"label":item["title"],"installation_state":if result.is_ok(){"installed"}else if root.exists(){"incomplete"}else{"missing"},
             "required":item["required"]!=false,"files_installed":result.is_ok(),"runtime_ready":dependencies,"can_start":can_start,
-            "source_url":if item["kind"]=="dsh"&&!dependencies{json!("https://nodejs.org/en/download")}else{item["source"]["page_url"].clone()},"error":error,"runtime_group":group,
+            "source_url":if item["kind"]=="dsh"&&!dependencies{crate::download_sources::policy()["node_download_page"].clone()}else{item["source"]["page_url"].clone()},"error":error,"runtime_group":group,
             "version":item["version"],"installed_version":installed_version,"update_available":update_available,
             "fields":{"required":"是否为阻塞启动的必需组件","files_installed":"模型或组件文件已安装","runtime_ready":"共享运行依赖已就绪","can_start":"具备启动条件","runtime_group":"启动所需共享依赖组",
                 "version":"随程序提供的目标模型或组件版本","installed_version":"实际安装的模型或组件版本；旧清单未知时为空","update_available":"目标模型或组件内容、版本可更新"}}));

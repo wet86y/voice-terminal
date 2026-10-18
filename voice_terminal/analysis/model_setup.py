@@ -36,7 +36,8 @@ def validate(root: Path, *, smart_turn_gpu: bool = False) -> list[str]:
 
 
 def install(root: Path, *, smart_turn_gpu: bool = False) -> None:
-    from huggingface_hub import hf_hub_download
+    from ..download_sources import download
+    catalog = json.loads((Path(__file__).resolve().parents[2] / "config/resources/catalog.json").read_text("utf-8"))
     from transformers import WhisperFeatureExtractor
     for name, (repo, revision, files) in MODELS.items():
         folder = root / "analysis" / name
@@ -45,11 +46,12 @@ def install(root: Path, *, smart_turn_gpu: bool = False) -> None:
         selected = [*files, SMART_TURN_GPU] if name == "smart-turn" and (smart_turn_gpu or (folder / SMART_TURN_GPU).is_file()) else files
         for filename in selected:
             print(f"Downloading {name}/{filename} revision={revision}", flush=True)
-            cached = hf_hub_download(repo, filename, revision=revision, cache_dir=str(root / "cache/huggingface"))
             destination = folder / filename
-            staging = destination.with_suffix(destination.suffix + ".part")
-            shutil.copyfile(cached, staging)
-            staging.replace(destination)
+            resource = next(item for item in catalog["resources"] if item["resource_id"] == ("smart-turn" if name == "smart-turn" else "sensevoice-small"))
+            record = next(item for item in resource["files"] if item["path"] == filename)
+            if not destination.is_file() or _sha256(destination) != record["sha256"]:
+                download(f"https://huggingface.co/{repo}/resolve/{revision}/{filename}", destination,
+                         size=record["size_bytes"], sha256=record["sha256"])
             checksums[filename] = _sha256(destination)
         if name == "smart-turn":
             WhisperFeatureExtractor(chunk_length=8).save_pretrained(folder)

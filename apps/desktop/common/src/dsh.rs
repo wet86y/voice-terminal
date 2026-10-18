@@ -246,7 +246,7 @@ pub fn guide(reason: &str) -> bool {
             MB_YESNOCANCEL | MB_ICONINFORMATION,
         ) {
             IDYES => {
-                let _ = crate::windows::open_url("https://nodejs.org/en/download");
+                let _ = crate::windows::open_url(crate::download_sources::policy()["node_download_page"].as_str().unwrap());
                 true
             }
             IDNO => true,

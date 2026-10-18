@@ -7,6 +7,7 @@ use std::{
 };
 
 pub mod download;
+pub mod download_sources; // download_sources（统一国内镜像与原站候选策略）。
 pub mod app_update; // app_update（应用更新）：读取 GitHub 发行清单并校验分发安装器元数据。
 pub mod native_ui;
 pub mod workspace;

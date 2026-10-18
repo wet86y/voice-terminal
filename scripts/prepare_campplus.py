@@ -49,6 +49,8 @@ def sha256_file(path: Path) -> str:
 
 
 def _download_official_sources(root: Path) -> Path:
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
     source_root = root / ".local" / "cache" / f"3d-speaker-campplus-{THREE_D_SPEAKER_COMMIT}"
     package_dirs = (
         source_root / "speakerlab",
@@ -66,8 +68,8 @@ def _download_official_sources(root: Path) -> Path:
             continue
         url = f"https://raw.githubusercontent.com/modelscope/3D-Speaker/{THREE_D_SPEAKER_COMMIT}/{relative}"
         request = Request(url, headers={"User-Agent": "voice-terminal-campplus-preparer"})
-        with urlopen(request, timeout=60) as response:
-            content = response.read()
+        from voice_terminal.download_sources import fetch
+        content = fetch(url)
         if b"Copyright 3D-Speaker" not in content or b"Apache License, Version 2.0" not in content:
             raise RuntimeError(f"upstream source header/license check failed: {relative}")
         target.write_bytes(content)
@@ -75,8 +77,8 @@ def _download_official_sources(root: Path) -> Path:
     if not license_path.exists():
         url = f"https://raw.githubusercontent.com/modelscope/3D-Speaker/{THREE_D_SPEAKER_COMMIT}/LICENSE"
         request = Request(url, headers={"User-Agent": "voice-terminal-campplus-preparer"})
-        with urlopen(request, timeout=60) as response:
-            license_path.write_bytes(response.read())
+        from voice_terminal.download_sources import fetch
+        license_path.write_bytes(fetch(url))
     return source_root
 
 

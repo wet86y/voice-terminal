@@ -4,8 +4,65 @@ import { readFile, mkdtemp, writeFile, mkdir, access } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { targetSpec, isCurrent, safePath, npmArguments, checkPlugin, install } from '../scripts/dsh-npm.mjs'
+import { registryCandidates, registryEnvironment, canRetryRegistry, selectedRegistry } from '../scripts/download-sources.mjs'
 const lock = JSON.parse(await readFile(new URL('../config/dsh/runtime.lock.json', import.meta.url), 'utf8'))
 const contract = JSON.parse(await readFile(new URL('./fixtures/dsh-adapter-cases.json', import.meta.url), 'utf8'))
+
+test('环境、项目和用户配置中的私有默认注册表不被公共镜像覆盖', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'private-npm-config-'))
+  const home = join(root, 'home'), project = join(root, 'project')
+  await mkdir(home); await mkdir(project)
+  await writeFile(join(home, '.npmrc'), 'registry = "https://private.example/"\n')
+  assert.deepEqual(registryCandidates(selectedRegistry('https://registry.npmjs.org', { HOME: home }, project)), ['https://private.example/'])
+  await writeFile(join(project, '.npmrc'), 'registry=https://project.example\n')
+  assert.equal(selectedRegistry('https://registry.npmjs.org', { HOME: home }, project), 'https://project.example')
+  assert.equal(selectedRegistry('https://registry.npmjs.org', { npm_config_registry: 'https://env.example' }, project), 'https://env.example')
+})
+
+test('公开注册表有序回退，私有注册表独立，取消与构建错误不重试', () => {
+  assert.deepEqual(registryCandidates('https://registry.npmjs.org/'), ['https://registry.npmmirror.com', 'https://registry.npmjs.org'])
+  assert.deepEqual(registryCandidates('https://private.example/'), ['https://private.example/'])
+  const privateEnv = registryEnvironment({ npm_config_disturl: 'https://private.example/node' }, 'https://private.example')
+  assert.equal(privateEnv.npm_config_disturl, 'https://private.example/node')
+  const env = registryEnvironment({ NPM_CONFIG_REGISTRY: 'old', NPM_CONFIG_DISTURL: 'old' }, 'https://registry.npmmirror.com')
+  assert.equal(env.NPM_CONFIG_REGISTRY, undefined)
+  assert.equal(env.npm_config_registry, 'https://registry.npmmirror.com')
+  assert.equal(env.npm_config_disturl, 'https://npmmirror.com/mirrors/node')
+  assert.equal(canRetryRegistry({ installLog: 'npm error code ETARGET' }), true)
+  assert.equal(canRetryRegistry({ installLog: 'npm error code E404', cancelled: true }), false)
+  assert.equal(canRetryRegistry({ installLog: 'C++ compile error' }), false)
+})
+
+test('镜像缺失后切回原站，子进程继承对应来源，不改变安装身份', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-source-fallback-'))
+  const program = join(root, 'app'), target = join(root, 'candidate'), spec = targetSpec(lock)
+  await mkdir(join(program, 'config/dsh'), { recursive: true })
+  await writeFile(join(program, 'config/dsh/runtime.lock.json'), JSON.stringify(lock))
+  const record = safePath(program, spec.plugin_record)
+  await mkdir(join(record, '..'), { recursive: true })
+  await writeFile(record, JSON.stringify({ dsh_version: spec.version, bridge_protocol: spec.bridge_protocol, adapter: spec.adapter }))
+  const npm = join(root, 'npm.mjs')
+  await writeFile(npm, `import {mkdirSync,writeFileSync,appendFileSync} from 'node:fs';import {join,dirname} from 'node:path';
+    if(process.argv[2]==='--version'){console.log('11.17.0');process.exit(0)}
+    const target=process.argv[process.argv.indexOf('--prefix')+1];
+    const registry=process.argv[process.argv.indexOf('--registry')+1];
+    appendFileSync(join(target,'sources.jsonl'),JSON.stringify({registry,env:process.env.npm_config_registry,dist:process.env.npm_config_disturl})+'\\n');
+    if(registry.includes('npmmirror')){console.error('npm error code E404');process.exit(1)}
+    const spec=${JSON.stringify(spec)};
+    for(const path of [spec.cli_entry,spec.schedule,...spec.required_files]){const file=join(target,path);mkdirSync(dirname(file),{recursive:true});writeFileSync(file,'')}
+    writeFileSync(join(target,spec.modules,spec.package_name,'package.json'),JSON.stringify({name:spec.package_name,version:spec.version,type:'module'}));
+    writeFileSync(join(target,spec.modules,'pnpm/package.json'),JSON.stringify({name:'pnpm',version:spec.package_manager.slice(5)}));
+    writeFileSync(join(target,spec.cli_entry),'export async function runCli(){console.log('+JSON.stringify(spec.version)+')}');`)
+  await install(program, target, npm, root)
+  const calls = (await readFile(join(target, 'sources.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse)
+  assert.deepEqual(calls.map(call => call.registry), ['https://registry.npmmirror.com', 'https://registry.npmjs.org'])
+  assert.ok(calls.every(call => call.registry === call.env))
+  assert.equal(calls[1].dist, 'https://nodejs.org/download/release')
+  const metadata = JSON.parse(await readFile(join(target, 'runtime.json'), 'utf8'))
+  assert.ok(isCurrent(metadata, spec))
+  assert.equal(metadata.registry_url, lock.distribution.registry_url)
+  assert.equal(metadata.download_source, 'https://registry.npmjs.org')
+})
 test('与原生端和后端共用兼容判定场景', () => {
   const base = targetSpec(lock)
   for (const scenario of contract.cases) assert.equal(isCurrent({ ...base, ...scenario.installed }, { ...base, ...scenario.target }), scenario.matches, scenario.name)

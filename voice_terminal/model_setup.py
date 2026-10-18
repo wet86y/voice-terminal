@@ -36,19 +36,13 @@ def _sha256(path: Path) -> str:
 
 
 def _download_atomic(url: str, destination: Path) -> str:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(destination.name + ".part")
-    if temporary.exists():
-        temporary.unlink()
-    request = urllib.request.Request(url, headers={"User-Agent": "voice-terminal/0.1"})
-    with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as output:
-        while True:
-            block = response.read(1024 * 1024)
-            if not block:
-                break
-            output.write(block)
-    temporary.replace(destination)
-    return _sha256(destination)
+    from .download_sources import download
+    catalog = json.loads((Path(__file__).resolve().parents[1] / "config/resources/catalog.json").read_text("utf-8"))
+    for spec in catalog["resources"]:
+        artifact = spec["source"].get("transfer", {}).get("artifact", {})
+        if artifact.get("url") == url:
+            return download(url, destination, sha256=artifact["sha256"], size=artifact["size_bytes"])
+    return download(url, destination)
 
 
 def _safe_extract(archive: Path, destination: Path) -> None:

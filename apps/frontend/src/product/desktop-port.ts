@@ -178,6 +178,7 @@ export interface DesktopUpdatePort {
   cancelAppUpdate(): Promise<void>
 }
 export interface ResourceInstallPlan {
+  download_sources?: string[] // download_sources（镜像与原站域名）：按资源选择来源，失败时回退。
   resource_id: string // resource_id（资源编号）。
   title: string // title（资源名称）。
   model_bytes: number // model_bytes（模型或组件最大下载字节数）。
