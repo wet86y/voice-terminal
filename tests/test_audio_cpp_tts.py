@@ -470,10 +470,11 @@ def test_old_native_runtime_cannot_silently_ignore_high_fidelity_recipe():
 
 
 @pytest.mark.parametrize("preview,error_type,expected_requests,confirmed", [
-    (True, "server_busy", 3, True), (False, "server_busy", 1, False),
+    (True, "server_busy", 3, True), (False, "server_busy", 3, True),
     (True, "insufficient_memory", 1, False),
+    (False, "insufficient_memory", 1, False),
 ])
-def test_preview_waits_for_native_release_without_retrying_unrelated_errors(preview, error_type, expected_requests, confirmed):
+def test_cancel_waits_for_native_release_without_retrying_unrelated_errors(preview, error_type, expected_requests, confirmed):
     async def scenario():
         calls = []
         async def handler(request):
@@ -488,6 +489,57 @@ def test_preview_waits_for_native_release_without_retrying_unrelated_errors(prev
         await session.close()
         assert len(calls) == expected_requests
         assert session.context_release_confirmed is confirmed
+        await client.close()
+    asyncio.run(scenario())
+
+
+def test_native_release_busy_deadline_keeps_handoff_unconfirmed():
+    """释放期限耗尽时保留未确认状态，不无限等待，也不重新提交正文。"""
+    async def scenario():
+        calls = []
+        async def handler(request):
+            calls.append(request.url.path)
+            return httpx.Response(503, json={"error": {"type": "server_busy"}})
+        client = _fake_client(handler)
+        client.timeout_seconds = 0
+        session = client.session()
+        session._context_requested = True
+        await session.cancel()
+        await session.close()
+        assert calls == []
+        assert session.context_release_confirmed is False
+        assert session._context_requested is True
+        await client.close()
+    asyncio.run(scenario())
+
+
+def test_formal_handoff_has_short_budget_shared_by_repeated_close(monkeypatch):
+    """正式原生请求无需续接标记也会交接；默认合成超时不扩大释放预算。"""
+    import voice_terminal.providers.audio_cpp_tts as provider
+    async def scenario():
+        calls = []
+        clock = [100.0]
+        async def handler(request):
+            calls.append(request.extensions["timeout"]["read"])
+            clock[0] += 2.9
+            return httpx.Response(503, json={"error": {"type": "server_busy"}})
+        client = _fake_client(handler)
+        server = object.__new__(AudioCppTtsServer)
+        server.__dict__.update(client.server.__dict__)
+        client.server = server
+        session = client.session()
+        session._native_request_submitted = True
+        assert not session._context_requested and client.timeout_seconds == 300
+        monkeypatch.setattr(provider, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        await session.cancel()
+        await session.close()
+        assert len(calls) == 4
+        assert calls[:3] == [3.0] * 3 and 0 < calls[-1] < 1.31
+        assert session._context_release_deadline == 110.0
+        assert session.context_release_confirmed is False
+        assert session._native_request_submitted
+        await session.close()
+        assert len(calls) == 4
         await client.close()
     asyncio.run(scenario())
 

@@ -1115,6 +1115,7 @@ class AudioCppTtsSession:
         self._context_requested = False  # _context_requested（是否向原生申请过上下文）。
         self._native_request_submitted = False  # 原生请求已进入网络发送路径。
         self.context_release_confirmed = None  # 原生执行锁取得且上下文释放的明确确认。
+        self._context_release_deadline: float | None = None  # 释放截止时间跨重复关闭保留。
         self._is_prewarm = False
         self._is_preview = bool(voice_snapshot and voice_snapshot.is_preview)
         self._request_options = {}
@@ -1737,27 +1738,41 @@ class AudioCppTtsSession:
         if not self._context_requested and not needs_handoff:
             return
         try:
-            deadline = time.monotonic() + self.client.timeout_seconds
+            if self._context_release_deadline is None:
+                # 正式中止不沿用默认五分钟合成超时；试听仍可等待长样音计算结束。
+                budget = self.client.timeout_seconds if self._is_preview else min(10.0, self.client.timeout_seconds)
+                self._context_release_deadline = time.monotonic() + max(0.0, budget)
+            deadline = self._context_release_deadline
             while True:
-                response = await self.client._request_client().post(
-                    f"{self.client.base_url}/v1/audio/speech/contexts/release",
-                    json={"model": self.model_id, "continuation_id": self._continuation_id},
-                    timeout=3.0 if self._is_preview else 2.0,
-                )
-                # 非流式样音仍计算时，原生释放接口等锁两秒后返回 server_busy（服务忙）。
-                # 保留音色任务占用并重试交接，不把该响应当作已经释放。
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.context_release_confirmed = False
+                    logger.warning("audio_cpp_tts.context_release_timeout turn=%s speech=%s session=%s",
+                                   *self._tts_fields())
+                    return
+                # HTTPX（网络客户端）的分阶段超时不等于整个请求的墙钟期限。
+                async with asyncio.timeout(remaining):
+                    response = await self.client._request_client().post(
+                        f"{self.client.base_url}/v1/audio/speech/contexts/release",
+                        json={"model": self.model_id, "continuation_id": self._continuation_id},
+                        # 原生取得执行锁最多等待两秒，响应读取需留出传输余量。
+                        timeout=min(3.0, remaining),
+                    )
+                # 样音取消或正式流式判废后，原生计算可能尚未退出。
+                # server_busy（服务忙）仅重试交接，不重新提交已播放的正文。
                 busy = False
                 if response.status_code == 503:
                     with contextlib.suppress(ValueError, AttributeError):
                         busy = response.json().get("error", {}).get("type") == "server_busy"
-                if not (self._is_preview and busy and time.monotonic() < deadline):
+                if not (busy and time.monotonic() < deadline):
                     break
-                await asyncio.sleep(.1)
+                await asyncio.sleep(min(.1, max(0.0, deadline - time.monotonic())))
             response.raise_for_status()
             self.context_release_confirmed = response.json().get("released") is True
             if self.context_release_confirmed:
                 self._context_requested = False
                 self._native_request_submitted = False
+                self._context_release_deadline = None
         except (httpx.HTTPError, OSError) as exc:
             self.context_release_confirmed = False
             logger.warning(

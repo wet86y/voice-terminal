@@ -140,6 +140,35 @@ async def test_controller_projects_short_sentences_without_changing_source():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", ["请让克劳得检查一下。", ""])
+async def test_speaker_filtered_segment_keeps_hotword_text_contract(admitted):
+    """声纹过滤与热词同时开启：仅处理准入正文，停顿分段也保留文本字段。"""
+    from unittest.mock import AsyncMock
+    from voice_terminal.controller.realtime_controller import RealtimeController
+    from voice_terminal.controller.transcript_segmenter import TranscriptSegmenter
+    from voice_terminal.controller.turn_workspace import TurnWorkspace
+
+    service = HotwordService()
+    try:
+        await service.configure(settings())
+        ws = TurnWorkspace("input", generation=1, speaker_mode="filter")
+        controller = SimpleNamespace(
+            workspace=ws, segmenter=TranscriptSegmenter(), hotwords=service,
+            speaker_policy=SimpleNamespace(admitted_text=lambda _turn: admitted),
+            _detail=AsyncMock(),
+        )
+        await RealtimeController._segment(controller, "未准入内容。请让克劳得检查一下。", pause=True)
+        payload = controller._detail.call_args.kwargs
+        assert payload["raw_text"] == admitted
+        assert payload["text"] == admitted.replace("克劳得", "Claude")
+        assert "未准入" not in str(payload)
+        assert [row["text"] for row in ws.segments] == ([payload["text"]] if admitted else [])
+        assert payload["changed_ids"] == []
+    finally:
+        service.close()
+
+
+@pytest.mark.asyncio
 async def test_timeout_does_not_queue_or_apply_late_result():
     service = HotwordService()
     started, release = threading.Event(), threading.Event()
