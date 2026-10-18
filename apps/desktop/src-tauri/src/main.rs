@@ -16,7 +16,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -46,6 +46,16 @@ struct Service {
     job: Job,
 }
 
+struct LogFlushState {
+    completed_request: u64, // completed_request（已完成刷新请求编号）。
+    failed_request: u64, // failed_request（刷新失败请求编号）。
+}
+
+struct ResetFlag<'a>(&'a AtomicBool);
+impl Drop for ResetFlag<'_> {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FrontendMode {
     Product,   // Product（正式产品界面）。
@@ -56,7 +66,7 @@ enum FrontendMode {
 enum DesktopCommand {
     Status,      // status（桌面状态读取）。
     SkipStartup, // skip startup（跳过加载画面，服务继续启动）。
-    OpenLogs,    // open logs（打开产品日志）。
+    ExportLogs,  // export logs（打包并导出产品日志）。
     OpenConsole, // open console（打开产品控制台）。
     Exit,        // exit（退出当前桌面实例）。
     FocusMain,   // focus main（聚焦产品主窗口）。
@@ -66,7 +76,7 @@ enum DesktopCommand {
 fn command_allowed(mode: FrontendMode, command: DesktopCommand) -> bool {
     match command {
         DesktopCommand::Status | DesktopCommand::SkipStartup | DesktopCommand::Exit => true,
-        DesktopCommand::OpenLogs | DesktopCommand::OpenConsole | DesktopCommand::FocusMain | DesktopCommand::PublishFloatingModel => {
+        DesktopCommand::ExportLogs | DesktopCommand::OpenConsole | DesktopCommand::FocusMain | DesktopCommand::PublishFloatingModel => {
             mode == FrontendMode::Product
         }
     }
@@ -79,7 +89,7 @@ fn require_command(mode: FrontendMode, command: DesktopCommand) -> Result<(), St
     let name = match command {
         DesktopCommand::Status => "状态读取",
         DesktopCommand::SkipStartup => "跳过加载画面",
-        DesktopCommand::OpenLogs => "产品日志",
+        DesktopCommand::ExportLogs => "导出产品日志",
         DesktopCommand::OpenConsole => "产品控制台",
         DesktopCommand::Exit => "退出应用",
         DesktopCommand::FocusMain => "产品主窗口",
@@ -102,7 +112,7 @@ fn frontend_capability(mode: FrontendMode, normalized_origin: &str, epoch: u64) 
     if mode == FrontendMode::UiPreview {
         serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
     } else {
-        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-open-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","core:event:allow-listen","core:event:allow-unlisten"]})
+        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-export-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","core:event:allow-listen","core:event:allow-unlisten"]})
     }
 }
 
@@ -132,6 +142,10 @@ struct Desktop {
     locator: Option<Locator>, // locator（当前工作区本地身份，不读写系统定位）。
     workspace_guard: Mutex<Option<voice_desktop_common::installation::WorkspaceGuard>>, // workspace_guard（程序运行期间的本体互斥锁）。
     workspace_busy: AtomicBool, // workspace_busy（防止并行切换或迁移）。
+    log_export_busy: AtomicBool, // log_export_busy（防止重复打包日志）。
+    log_flush_sequence: AtomicU64, // log_flush_sequence（刷新请求递增编号）。
+    log_flush_state: Mutex<LogFlushState>, // log_flush_state（最新刷新请求结果）。
+    log_flush_changed: Condvar, // log_flush_changed（唤醒等待刷新结果的导出任务）。
     app_update:AppUpdateManager, // app_update（应用发行检查、下载及安装交接）。
     service_requested: AtomicBool, // service_requested（主窗口已请求启动服务，刷新不重复启动）。
     service_starting: AtomicBool, // service_starting（本次启动正在校验或建立入口）：拒绝重复启动。
@@ -153,6 +167,32 @@ struct Desktop {
 
 impl Desktop {
     fn context(&self) -> Option<LaunchContext> { self.context.lock().unwrap().clone() }
+
+    fn flush_service_logs(&self) -> Result<(), String> {
+        if self.service.lock().map_err(|error| error.to_string())?.is_none() {
+            return Ok(());
+        }
+        let request_id = self.log_flush_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        self.send(serde_json::json!({"protocol":1,"kind":"flush_logs","request_id":request_id}))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut result = self.log_flush_state.lock().map_err(|error| error.to_string())?;
+        while result.completed_request < request_id {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("日志刷新超时，请重试打包。".into());
+            }
+            let (next, timeout) = self.log_flush_changed.wait_timeout(result, remaining)
+                .map_err(|error| error.to_string())?;
+            result = next;
+            if timeout.timed_out() && result.completed_request < request_id {
+                return Err("日志刷新超时，请重试打包。".into());
+            }
+        }
+        if result.failed_request == request_id {
+            return Err("无法将最新日志刷新到磁盘，请重试打包。".into());
+        }
+        Ok(())
+    }
 
     fn stop_service(&self) -> Result<(),String> {
         self.service_epoch.fetch_add(1,Ordering::SeqCst);
@@ -540,11 +580,24 @@ fn skip_startup(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Res
     Ok(())
 }
 #[tauri::command]
-fn open_logs(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<(), String> {
-    require_command(state.mode, DesktopCommand::OpenLogs)?;
+async fn export_logs(window: WebviewWindow, state: tauri::State<'_, Arc<Desktop>>) -> Result<Option<String>, String> {
+    require_command(state.mode, DesktopCommand::ExportLogs)?;
     trusted(&window, &state)?;
-    let context = state.context().ok_or("桌面样例没有产品日志目录。")?;
-    voice_desktop_common::windows::open(&context.install.join("cache/logs"))
+    if state.stopping.load(Ordering::Acquire) { return Err("应用正在退出。".into()); }
+    if state.workspace_busy.load(Ordering::Acquire) { return Err("工作区正在切换，请稍后打包日志。".into()); }
+    if state.log_export_busy.swap(true, Ordering::AcqRel) { return Err("日志正在打包，请稍候。".into()); }
+    let _reset = ResetFlag(&state.log_export_busy);
+    let operation = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // service fallback（服务回退）：后端已退出时仍继续同步并导出磁盘上的日志。
+        let _ = operation.flush_service_logs();
+        let Some(destination) = voice_desktop_common::native_ui::choose_folder("选择日志压缩包保存文件夹")? else {
+            return Ok(None);
+        };
+        let context = operation.context().ok_or("缺少产品工作区")?;
+        let archive = voice_desktop_common::logs::archive_logs(&context.install.join("cache/logs"), &destination)?;
+        Ok(Some(archive.to_string_lossy().into_owned()))
+    }).await.map_err(|error| error.to_string())?
 }
 #[tauri::command]
 fn focus_main(window: WebviewWindow, state: tauri::State<Arc<Desktop>>) -> Result<(), String> {
@@ -1125,6 +1178,17 @@ fn start_service(app: tauri::AppHandle, state: Arc<Desktop>) -> Result<(), Strin
                     }
                 }
                 Some("exit_requested") => read_state.shutdown(&read_app),
+                Some("logs_flushed") | Some("logs_flush_failed") => {
+                    // request_id（刷新请求编号）绑定桌面宿主的落盘确认。
+                    if let Some(request_id) = message["request_id"].as_u64() {
+                        let mut result = read_state.log_flush_state.lock().unwrap();
+                        if message["kind"] == "logs_flush_failed" {
+                            result.failed_request = request_id;
+                        }
+                        result.completed_request = result.completed_request.max(request_id);
+                        read_state.log_flush_changed.notify_all();
+                    }
+                }
                 Some("endpoints")=>{
                     let origin=message["endpoints"]["dsh"]["url"].as_str().and_then(|value|value.parse::<tauri::Url>().ok()).filter(|url|url.scheme()=="http"&&url.host_str()==Some("127.0.0.1")&&url.port().filter(|v|*v>0).is_some()&&url.query().is_none()&&url.username().is_empty()&&url.password().is_none()).map(|url|url.origin().ascii_serialization());
                     *read_state.dsh_origin.lock().unwrap()=origin;
@@ -1287,6 +1351,10 @@ fn run() -> Result<(), String> {
         locator,
         workspace_guard:Mutex::new(None),
         workspace_busy: AtomicBool::new(false),
+        log_export_busy: AtomicBool::new(false),
+        log_flush_sequence: AtomicU64::new(0),
+        log_flush_state: Mutex::new(LogFlushState { completed_request: 0, failed_request: 0 }),
+        log_flush_changed: Condvar::new(),
         app_update:AppUpdateManager::new(),
         service_requested: AtomicBool::new(false),
         service_starting: AtomicBool::new(false),
@@ -1331,7 +1399,7 @@ fn run() -> Result<(), String> {
             desktop_status,desktop_page_ready,
             publish_floating_model,get_floating_model,return_to_workbench,start_floating_drag,control_floating_session,
             skip_startup,
-            open_logs,
+            export_logs,
             open_console,
             exit_application,
             focus_main,
@@ -1767,7 +1835,7 @@ mod tests {
             assert!(command_allowed(FrontendMode::Product, command));
         }
         for command in [
-            DesktopCommand::OpenLogs,
+            DesktopCommand::ExportLogs,
             DesktopCommand::OpenConsole,
             DesktopCommand::FocusMain,
         ] {

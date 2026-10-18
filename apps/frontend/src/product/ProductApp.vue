@@ -115,6 +115,13 @@ function nativeAction(action: () => Promise<void>) {
     lastError.value = String(error);
   });
 }
+function exportLogs() {
+  void desktop.exportLogs().then(path => {
+    if (path) setNotice('日志压缩包已保存到所选文件夹。');
+  }).catch(error => {
+    lastError.value = String(error);
+  });
+}
 </script>
 <template>
   <!-- 桌面应用退出只接受原生退出事件，后台服务停止不能触发不可恢复的退出动画。 -->
@@ -154,7 +161,7 @@ function nativeAction(action: () => Promise<void>) {
       :section="activeSettingsTab"
       :desktop="desktop.available"
       @back="activePage = 'home'"
-      @logs="nativeAction(desktop.openLogs)"
+      @logs="exportLogs"
       @exit="nativeAction(desktop.exit)"
       @section="activeSettingsTab = $event"
     >

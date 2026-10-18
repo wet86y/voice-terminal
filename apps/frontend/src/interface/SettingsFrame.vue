@@ -52,7 +52,7 @@ const emit = defineEmits<{
           </button>
         </nav>
         <footer v-if="desktop" class="settings-sidebar-actions">
-          <button type="button" title="打开日志目录" aria-label="打开日志目录" @click="emit('logs')">日志</button>
+          <button type="button" title="打包并导出日志" aria-label="打包并导出日志" @click="emit('logs')">日志</button>
           <button type="button" title="退出应用" @click="emit('exit')">退出</button>
         </footer>
       </aside>

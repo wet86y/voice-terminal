@@ -23,7 +23,7 @@
     "allow-gpu-environment-register",
     "allow-gpu-environment-probe",
     "allow-environment-guide",
-    "allow-open-logs",
+    "allow-export-logs",
     "allow-focus-main",
     "allow-workspace-info",
     "allow-workspace-choose",

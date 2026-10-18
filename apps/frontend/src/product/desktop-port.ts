@@ -110,8 +110,8 @@ export interface DesktopPort {
   available: boolean
   /** focus（聚焦）：显示桌面主窗口。 */
   focus(): Promise<void>;
-  /** openLogs（打开日志）：显示本机应用日志目录。 */
-  openLogs(): Promise<void>;
+  /** exportLogs（导出日志）：刷新并打包本机应用日志，打开保存位置选择器。 */
+  exportLogs(): Promise<string | null>;
   /** openConsole（打开控制台）：由 Host（应用宿主）校验并在默认浏览器打开 DSH（代理执行宿主）；url（短期令牌地址）。 */
   openConsole(url: string): Promise<void>
   /** exit（退出）：由桌面宿主关闭应用。 */
@@ -234,7 +234,7 @@ export function desktopPort(): DesktopPort {
   const port: DesktopPort & DesktopWorkspacePort & DesktopEnvironmentPort & DesktopCredentialsPort & DesktopUpdatePort = {
     available: Boolean(native),
     focus: () => call('focus_main'),
-    openLogs: () => call('open_logs'),
+    exportLogs: () => call('export_logs'),
     openConsole: url => call('open_console', { url }),
     exit: () => call('exit_application'),
     publishFloatingModel: model => call('publish_floating_model', { model }),

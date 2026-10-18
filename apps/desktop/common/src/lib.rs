@@ -10,6 +10,7 @@ pub mod download;
 pub mod download_sources; // download_sources（统一国内镜像与原站候选策略）。
 pub mod app_update; // app_update（应用更新）：读取 GitHub 发行清单并校验分发安装器元数据。
 pub mod native_ui;
+pub mod logs; // logs（日志归档）：落盘并打包当前工作区日志。
 pub mod workspace;
 pub mod runtime; // runtime（私有语音环境）：安装计划、校验及事务启用。
 pub mod resources; // resources（原生资源管理）：不依赖业务后端。

@@ -9,7 +9,7 @@ fn main() {
             // model_credentials（模型接口凭据）：业务服务与组件未就绪时也要生成读写权限。
             "model_credentials_status", "model_credentials_save",
             "skip_startup",
-            "open_logs",
+            "export_logs",
             "open_console",
             "exit_application",
             "focus_main",
