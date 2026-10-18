@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import UiDialog from '../../interface/UiDialog.vue'
 import SettingsPageHeader from '../../interface/SettingsPageHeader.vue'
+import AppUpdateCard from '../../interface/AppUpdateCard.vue'
 import type { useWorkspaceResources } from '../useWorkspaceResources'
 
 const props = defineProps<{ controller: ReturnType<typeof useWorkspaceResources> }>()
@@ -22,27 +23,6 @@ const progress = computed(() => {
 })
 const controlsBusy = computed(() => pickerBusy.value || props.controller.workspaceOperationStarting.value || Boolean(activeJob.value))
 const updateStatus = computed(() => props.controller.appUpdate.value)
-const updateBusy = computed(() => ['checking', 'downloading', 'handing_off'].includes(updateStatus.value.state))
-const updateProgress = computed(() => {
-  const { completed_bytes: done, total_bytes: total } = updateStatus.value
-  if (!total || total <= 0 || done == null) return undefined
-  return Math.max(0, Math.min(100, Math.round(done / total * 100)))
-})
-const updateActionLabel = computed(() => {
-  if (updateStatus.value.state === 'checking') return '正在检查…'
-  if (updateStatus.value.state === 'downloading') return '取消下载'
-  if (updateStatus.value.state === 'handing_off') return '正在启动安装器…'
-  if (updateStatus.value.target_version && ['available', 'failed', 'cancelled'].includes(updateStatus.value.state)) {
-    return updateStatus.value.state === 'available' ? '下载并安装' : '重新下载并安装'
-  }
-  return updateStatus.value.state === 'current' ? '重新检查' : '检查更新'
-})
-
-function runUpdateAction() {
-  if (updateStatus.value.state === 'downloading') void props.controller.cancelAppUpdate()
-  else if (updateStatus.value.target_version && ['available', 'failed', 'cancelled'].includes(updateStatus.value.state)) void props.controller.downloadAppUpdate()
-  else void props.controller.checkAppUpdate()
-}
 
 async function chooseTarget() {
   if (controlsBusy.value || !canManage.value) return
@@ -115,25 +95,7 @@ function formatBytes(value: number | null | undefined) {
       </template>
     </section>
 
-    <section class="workspace-update-card" aria-labelledby="workspace-update-title">
-      <div class="workspace-update-content">
-        <p class="section-label">UPDATE（更新）</p><h3 id="workspace-update-title">应用更新</h3>
-        <p>当前版本 {{ workspace?.version || updateStatus.current_version || '—' }}<template v-if="updateStatus.target_version"> · 发现新版 {{ updateStatus.target_version }}</template></p>
-        <p v-if="updateStatus.state === 'checking'" role="status">正在检查 GitHub 发行版…</p>
-        <p v-else-if="updateStatus.state === 'current'" role="status">当前已是最新版本。</p>
-        <p v-else-if="updateStatus.state === 'downloading'" role="status">正在下载并校验分发安装器…</p>
-        <p v-else-if="updateStatus.state === 'handing_off'" role="status">安装器已校验，正在关闭当前程序并启动更新。</p>
-        <p v-else-if="updateStatus.state === 'cancelled'" role="status">下载已取消，可以重新开始。</p>
-        <p v-if="updateStatus.phase && updateStatus.state === 'downloading'" role="status">{{ updateStatus.phase }}</p>
-        <p v-if="updateStatus.release_notes" class="workspace-release-notes">{{ updateStatus.release_notes }}</p>
-        <div v-if="updateStatus.state === 'downloading' && updateProgress !== undefined" class="workspace-progress-wrap">
-          <div class="workspace-progress" role="progressbar" aria-label="安装器下载进度" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="updateProgress"><span :style="{ width: `${updateProgress}%` }"></span></div>
-          <small>{{ formatBytes(updateStatus.completed_bytes) }} / {{ formatBytes(updateStatus.total_bytes) }} · {{ updateProgress }}%</small>
-        </div>
-        <p v-if="updateStatus.error" class="workspace-error" role="alert">{{ updateStatus.error }}</p>
-      </div>
-      <button class="outline-button" type="button" :disabled="updateBusy || controlsBusy || !canManage" @click="runUpdateAction">{{ updateActionLabel }}</button>
-    </section>
+    <AppUpdateCard :status="updateStatus" :current-version="workspace?.version" :disabled="controlsBusy || !canManage" @check="controller.checkAppUpdate()" @download="controller.downloadAppUpdate()" @cancel="controller.cancelAppUpdate()" />
 
     <section v-if="latestJob" class="workspace-job-card" :class="{ failed: latestJob.state === 'failed' }" aria-live="polite">
       <div class="workspace-job-heading"><div><strong>{{ isMigration ? '工作区迁移' : '工作区切换' }}</strong><span>{{ latestJob.state === 'failed' ? '失败' : ['complete', 'completed'].includes(latestJob.state) ? '已完成' : ['cancelled', 'canceled'].includes(latestJob.state) ? '已取消' : '处理中' }}</span></div><button v-if="activeJob && latestJob.can_cancel !== false" class="text-action" type="button" @click="cancelJob">取消迁移</button></div>
@@ -153,25 +115,23 @@ function formatBytes(value: number | null | undefined) {
 
 <style scoped>
 .workspace-settings{display:grid;gap:18px;min-width:0}
-.workspace-card,.workspace-update-card,.workspace-job-card{min-width:0;border:1px solid var(--line);border-radius:14px;background:#ffffff02;padding:18px}
+.workspace-card,.workspace-job-card{min-width:0;border:1px solid var(--line);border-radius:14px;background:#ffffff02;padding:18px}
 .workspace-card{display:grid;gap:16px}
-.workspace-card-heading,.workspace-update-card,.workspace-job-heading,.workspace-job-heading>div{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}
-.workspace-card-heading>div,.workspace-update-card>div{display:grid;gap:6px;min-width:0}
-.workspace-card h3,.workspace-update-card h3{font-size:var(--font-section)}
+.workspace-card-heading,.workspace-job-heading,.workspace-job-heading>div{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}
+.workspace-card-heading>div{display:grid;gap:6px;min-width:0}
+.workspace-card h3{font-size:var(--font-section)}
 .workspace-channel{flex:none;padding:5px 9px;border:1px solid var(--line-strong);border-radius:999px;color:var(--muted);font-size:var(--font-caption);white-space:nowrap}
 .workspace-paths,.workspace-confirm-copy dl{display:grid;gap:12px;margin:0}
 .workspace-paths>div,.workspace-confirm-copy dl>div{display:grid;gap:5px;min-width:0}
 .workspace-paths dt,.workspace-confirm-copy dt{color:var(--muted);font-size:var(--font-caption)}
 .workspace-paths dd,.workspace-confirm-copy dd{margin:0;overflow-wrap:anywhere;word-break:break-word;font-size:var(--font-body);line-height:1.55}
 .workspace-version,.workspace-hint{color:var(--muted);font-size:var(--font-caption);line-height:1.6}
-.workspace-actions button,.workspace-target-actions button,.workspace-update-card button{min-height:var(--compact-control-height);padding:7px 12px;font-size:var(--font-body)}
+.workspace-actions button,.workspace-target-actions button{min-height:var(--compact-control-height);padding:7px 12px;font-size:var(--font-body)}
 .workspace-target{display:grid;gap:8px;padding:14px;border:1px solid var(--line-strong);border-radius:12px;background:#0000000b;min-width:0}
 .workspace-target>span{font-size:var(--font-caption);color:var(--muted)}
 .workspace-target>strong{overflow-wrap:anywhere;word-break:break-word;font-size:var(--font-body);line-height:1.55}
 .workspace-target-actions{display:flex;gap:8px;flex-wrap:wrap}
 .workspace-migrate-action{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 32%,transparent)}
-.workspace-update-card>div>p:last-child{font-size:var(--font-caption);color:var(--muted);line-height:1.55}
-.workspace-release-notes{white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto}
 .workspace-empty{padding:16px;border:1px dashed var(--line-strong);border-radius:12px;color:var(--muted)}
 .workspace-error{margin:0;color:var(--danger);font-size:var(--font-caption);overflow-wrap:anywhere;white-space:pre-wrap}
 .workspace-job-card{display:grid;gap:8px}
@@ -187,5 +147,5 @@ function formatBytes(value: number | null | undefined) {
 .workspace-confirm-copy{display:grid;gap:14px;margin:16px 0;color:var(--muted);font-size:var(--font-body);line-height:1.55}
 .workspace-confirm-copy dl{padding:12px;border:1px solid var(--line);border-radius:10px}
 .workspace-confirm-button{min-height:var(--compact-control-height);padding:7px 14px}
-@media(max-width:560px){.workspace-card,.workspace-update-card,.workspace-job-card{padding:14px}.workspace-card-heading,.workspace-update-card,.workspace-job-heading{align-items:flex-start}.workspace-update-card{flex-direction:column}.workspace-update-card button{width:100%}.workspace-target-actions{display:grid;grid-template-columns:1fr}.workspace-progress-wrap{grid-template-columns:1fr;gap:6px}.workspace-progress-wrap small{text-align:right}}
+@media(max-width:560px){.workspace-card,.workspace-job-card{padding:14px}.workspace-card-heading,.workspace-job-heading{align-items:flex-start}.workspace-target-actions{display:grid;grid-template-columns:1fr}.workspace-progress-wrap{grid-template-columns:1fr;gap:6px}.workspace-progress-wrap small{text-align:right}}
 </style>

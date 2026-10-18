@@ -6,6 +6,8 @@ import { computed, reactive, ref, toRef, watch } from 'vue'
 import SilenceTimeoutControl from '../interface/SilenceTimeoutControl.vue'
 import LocalComponents from '../interface/LocalComponents.vue'
 import SettingsPageHeader from '../interface/SettingsPageHeader.vue'
+import AppUpdateCard from '../interface/AppUpdateCard.vue'
+import type { AppUpdateStatus } from '../interface/app-update'
 import TimePicker from '../interface/TimePicker.vue'
 import WakeTaskSchedule from '../interface/WakeTaskSchedule.vue'
 import InstructionEditorRow from '../interface/InstructionEditorRow.vue'
@@ -47,6 +49,21 @@ const templates = computed(() => previewRows(demoSpeakerTemplates, props.scene))
 const ambient = computed(() => previewRows(demoAmbientRecords, props.scene))
 const instructionRows = computed(() => props.scene === 'empty' ? [] : instructions)
 const loading = computed(() => props.scene === 'loading')
+const updatePreview = computed<AppUpdateStatus>(() => ({
+  state: props.scene === 'loading' ? 'downloading' : props.scene === 'error' ? 'failed' : props.scene === 'empty' ? 'current' : 'available',
+  current_version: '0.9.0', target_version: props.scene === 'empty' ? null : '0.9.1',
+  release_notes: props.scene === 'empty' ? null : [
+    'Voice Terminal（语音终端）v0.9.1', '',
+    '下载与安装', '• 改善首次安装组件的下载体验，优先使用国内镜像，失败时自动尝试原站。',
+    '• 保留已有设置、用户数据、模型和运行环境。', '',
+    '更新体验', '• 优化应用更新页面和下载进度展示。', '• 修复旧版程序交给分发器更新时的编号兼容问题。',
+    ...(props.scene === 'long' ? Array.from({ length: 12 }, () => `• ${longText}`) : []),
+  ].join('\n'),
+  completed_bytes: 43 * 1024 ** 2, total_bytes: 107 * 1024 ** 2,
+  phase: '正在下载并校验安装器…', can_cancel: true,
+  error: props.scene === 'error' ? '下载连接中断，请重试。' : null,
+  fields: { state: '更新阶段', current_version: '当前程序版本', target_version: '目标程序版本', release_notes: '发行说明', completed_bytes: '已下载字节数', total_bytes: '安装器总字节数', phase: '当前处理阶段', can_cancel: '是否允许取消', error: '失败原因' },
+}))
 const pendingTasks = computed(() => tasks.value.filter(item => item.status === '待执行'))
 const archivedTasks = computed(() => tasks.value.filter(item => item.status !== '待执行'))
 const visibleTasks = computed(() => taskView.value === 'pending' ? pendingTasks.value : archivedTasks.value)
@@ -272,10 +289,7 @@ function cancelTask(item: DemoWakeTask) {
         <header class="preference-heading"><span class="preference-index" aria-hidden="true">01</span><div><h3 id="workspace-preview-title">开发运行工作区</h3><p>开发模式只显示项目路径，不提供迁移操作。</p></div></header>
         <dl class="workspace-preview-path"><div><dt>项目路径</dt><dd>由桌面启动器提供的项目工作区</dd></div></dl>
       </section>
-      <section class="preference-card workspace-preview-card" aria-labelledby="workspace-update-preview-title">
-        <header class="preference-heading"><span class="preference-index" aria-hidden="true">02</span><div><h3 id="workspace-update-preview-title">应用更新</h3><p>更新检查暂未启用。</p></div></header>
-        <button class="outline-button" type="button" disabled>检查更新</button>
-      </section>
+      <AppUpdateCard :status="updatePreview" @check="feedback('模拟检查应用更新')" @download="feedback('模拟开始下载应用更新')" @cancel="feedback('模拟取消更新下载')" />
     </template>
     <div v-if="pendingDemoBundle" class="demo-bundle-backdrop">
       <section role="dialog" aria-modal="true" aria-labelledby="demo-bundle-title" class="demo-bundle-dialog">
