@@ -6,7 +6,7 @@
 
 Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tauri（桌面框架）窗口是主产品唯一的运行、开发和界面验收入口，负责托盘、单实例及服务管理进程；应用宿主负责业务组件的启动、监督和退出。Voice Server（语音服务）负责音频采集、KWS（关键词唤醒）、VAD（语音活动检测）、ASR（自动语音识别）、主 Agent（智能体）、Shadow（影子代理）、TTS（语音合成）和播放。DSH（代理执行宿主）作为内部组件受管，其独立管理控制台继续由系统默认浏览器打开。
 
-当前代码包版本为 `0.9.1`，变更见 [v0.9.1 发行说明](docs/releases/v0.9.1.md)。默认 LLM（大语言模型）路径是 DeepSeek Responses（响应接口）与 strict `json_schema`（严格结构化输出）；`voice_decision_v06`（语音决策协议兼容标识）保持冻结，不是发布版本号。
+当前代码包版本为 `0.9.2`，变更见 [v0.9.2 发行说明](docs/releases/v0.9.2.md)。默认 LLM（大语言模型）路径是 DeepSeek Responses（响应接口）与 strict `json_schema`（严格结构化输出）；`voice_decision_v06`（语音决策协议兼容标识）保持冻结，不是发布版本号。
 
 > 安全边界：默认服务只绑定 `127.0.0.1`。当前管理 API、WebSocket 和模型探测接口不适合直接暴露到局域网或公网；需要远程部署时，先完成 [当前已知问题](docs/testing/known-issues.md) 中的认证和 SSRF 防护工作。
 

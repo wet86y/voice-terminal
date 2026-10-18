@@ -5,7 +5,7 @@ import AppUpdateCard from './AppUpdateCard.vue'
 import type { AppUpdateStatus } from './app-update'
 
 const status: AppUpdateStatus = {
-  state: 'available', current_version: '0.9.0', target_version: '0.9.1',
+  state: 'available', current_version: '0.9.0', target_version: '0.9.2',
   release_notes: '改进安装与更新体验\n• 保留已有用户设置和组件。', fields: {},
 }
 

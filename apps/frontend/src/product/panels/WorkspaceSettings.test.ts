@@ -15,7 +15,7 @@ function controller(workspace: NonNullable<ReturnType<typeof useWorkspaceResourc
     workspaceError: ref(''),
     eventError: ref(''),
     workspaceOperationStarting: ref(false),
-    appUpdate: ref({ state: 'idle', current_version: '0.9.1' }),
+    appUpdate: ref({ state: 'idle', current_version: '0.9.2' }),
     checkAppUpdate: vi.fn(),
     downloadAppUpdate: vi.fn(),
     cancelAppUpdate: vi.fn(),
