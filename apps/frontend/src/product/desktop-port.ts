@@ -1,4 +1,6 @@
 import { locateNativeInvoker } from '../runtime/desktop-preflight'
+import type { AppUpdateStatus } from '../interface/app-update'
+export type { AppUpdateStatus } from '../interface/app-update'
 import type { FixedModelCredentialUpdate, FixedModelCredentials } from './types'
 import type { FloatingSessionAction, FloatingWindowModel, FloatingWindowProjection } from './floating-window'
 
@@ -101,20 +103,6 @@ export interface DesktopEvent<T> {
 export const RESOURCE_PROGRESS_EVENT = 'desktop://resource-progress'
 export const WORKSPACE_PROGRESS_EVENT = 'desktop://workspace-progress'
 export const APP_UPDATE_EVENT = 'desktop://app-update-progress'
-
-/** AppUpdateStatus（应用更新状态）：检查结果、发行说明和安装器下载进度。 */
-export interface AppUpdateStatus {
-  state: 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'handing_off' | 'cancelled' | 'failed'
-  current_version: string
-  target_version?: string | null
-  release_notes?: string | null
-  completed_bytes?: number | null
-  total_bytes?: number | null
-  phase?: string | null
-  error?: string | null
-  can_cancel?: boolean
-  fields: Record<string, string>
-}
 
 /** DesktopPort（桌面交互接口）：正式产品入口通过桌面预检后才调用原生命令。 */
 export interface DesktopPort {

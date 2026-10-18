@@ -49,6 +49,60 @@ fn exit(app:&tauri::AppHandle,state:&Installer){if state.busy.load(Ordering::Acq
 #[tauri::command]fn exit_application(window:WebviewWindow,app:tauri::AppHandle,state:tauri::State<Arc<Installer>>)->Result<(),String>{trusted(&window)?;if state.busy.load(Ordering::Acquire)&&state.status.lock().unwrap()["can_cancel"]!=true{return Err("启用及启动交接阶段暂不能退出。".into());}exit(&app,&state);Ok(())}
 
 fn has_chinese(value:&str)->bool{value.chars().any(|ch|('\u{4e00}'..='\u{9fff}').contains(&ch))}
+/// validate_update_nonce（校验单次编号）：兼容已发布程序的“十六进制时间戳-进程号”。
+fn validate_update_nonce(nonce:&str,parent_pid:u32)->Result<(),String>{
+    let legacy=nonce.split_once('-').is_some_and(|(time,pid)|{
+        !time.is_empty()&&time.len()<=32&&time.bytes().all(|byte|byte.is_ascii_hexdigit())
+            &&u128::from_str_radix(time,16).is_ok_and(|value|value>0)
+            &&!pid.is_empty()&&pid.len()<=8&&pid.bytes().all(|byte|byte.is_ascii_hexdigit())
+            &&u32::from_str_radix(pid,16)==Ok(parent_pid)&&parent_pid!=0
+    });
+    // UUID（通用唯一标识）采用标准分段，禁止路径字符和任意连字符组合。
+    let uuid=nonce.len()==36&&nonce.bytes().enumerate().all(|(index,byte)|{
+        if [8,13,18,23].contains(&index){byte==b'-'}else{byte.is_ascii_hexdigit()}
+    });
+    if legacy||uuid{Ok(())}else{Err("应用更新单次编号无效。".into())}
+}
+
+/// validate_update_parent（校验旧程序身份）：旧版启动安装器后会立即正常退出。
+fn validate_update_parent(parent:&UpdateParent,actual:Option<(u64,PathBuf)>)->Result<(),String>{
+    if let Some((created,executable))=actual{
+        if created!=parent.create_time||!executable.to_string_lossy().eq_ignore_ascii_case(&parent.executable.to_string_lossy()){
+            return Err("旧程序进程身份已变化，已拒绝更新。".into());
+        }
+    }
+    // 进程已退出时继续使用前面核对的工作区、安装器摘要及配置路径；
+    // 启用前仍由 wait_for_update_parent（等待旧程序）检查占用并取得工作区锁。
+    Ok(())
+}
+
+/// update_parent_identity（严格查询旧程序）：仅明确不存在或已退出的进程可视为已退出。
+fn update_parent_identity(pid:u32)->Result<Option<(u64,PathBuf)>,String>{
+    use windows_sys::Win32::{Foundation::{CloseHandle,FILETIME,GetLastError,ERROR_INVALID_PARAMETER},System::Threading::{OpenProcess,GetProcessTimes,QueryFullProcessImageNameW,GetExitCodeProcess}};
+    unsafe{
+        let handle=OpenProcess(0x1000,0,pid);
+        if handle.is_null(){
+            let error=GetLastError();
+            return if error==ERROR_INVALID_PARAMETER{Ok(None)}else{Err(format!("无法核对旧程序进程身份：{}",std::io::Error::from_raw_os_error(error as i32)))};
+        }
+        let result=(||{
+            let mut code=0;if GetExitCodeProcess(handle,&mut code)==0{return Err(std::io::Error::last_os_error().to_string());}if code!=259{return Ok(None);}
+            let mut created:FILETIME=std::mem::zeroed();let mut exited:FILETIME=std::mem::zeroed();let mut kernel:FILETIME=std::mem::zeroed();let mut user:FILETIME=std::mem::zeroed();
+            if GetProcessTimes(handle,&mut created,&mut exited,&mut kernel,&mut user)==0{return Err(std::io::Error::last_os_error().to_string());}
+            let mut name=vec![0u16;32768];let mut count=name.len() as u32;
+            if QueryFullProcessImageNameW(handle,0,name.as_mut_ptr(),&mut count)==0{return Err(std::io::Error::last_os_error().to_string());}
+            Ok(Some((((created.dwHighDateTime as u64)<<32)|created.dwLowDateTime as u64,PathBuf::from(String::from_utf16_lossy(&name[..count as usize])))))
+        })();CloseHandle(handle);result
+    }
+}
+
+fn mark_update_consumed(path:&Path,nonce:&str)->Result<(),String>{
+    let consumed=path.with_extension("json.consumed");
+    let mut marker=fs::OpenOptions::new().write(true).create_new(true).open(&consumed).map_err(|_|"此应用更新配置已使用或正在处理。")?;
+    marker.write_all(nonce.as_bytes()).map_err(|error|error.to_string())?;marker.sync_all().map_err(|error|error.to_string())?;drop(marker);
+    fs::remove_file(path).map_err(|error|format!("无法消费一次性更新配置：{error}"))
+}
+
 fn consume_update_config(path:&Path)->Result<(PathBuf,UpdateParent),String>{
     let supplied=voice_desktop_common::canonical_path(path)?;
     let config=voice_desktop_common::resources::load(&supplied)?;
@@ -56,7 +110,8 @@ fn consume_update_config(path:&Path)->Result<(PathBuf,UpdateParent),String>{
     let allowed=["schema","nonce","target_root","workspace_id","parent_pid","parent_create_time","parent_executable","version","tag","installer_size","installer_sha256","fields"];
     if !config.as_object().is_some_and(|object|object.keys().all(|key|allowed.contains(&key.as_str()))){return Err("应用更新配置含有未识别字段。".into());}
     let nonce=config["nonce"].as_str().ok_or("应用更新配置缺少单次编号")?;
-    if nonce.len()!=36||!nonce.bytes().all(|byte|byte.is_ascii_hexdigit()||byte==b'-'){return Err("应用更新单次编号无效。".into());}
+    let pid=config["parent_pid"].as_u64().and_then(|value|u32::try_from(value).ok()).filter(|value|*value!=0).ok_or("旧程序进程编号无效")?;
+    validate_update_nonce(nonce,pid)?;
     for key in ["schema","nonce","target_root","workspace_id","parent_pid","parent_create_time","parent_executable","version","tag","installer_size","installer_sha256"]{
         if !config["fields"][key].as_str().is_some_and(has_chinese){return Err(format!("应用更新配置字段 {key} 缺少中文说明。"));}
     }
@@ -81,27 +136,23 @@ fn consume_update_config(path:&Path)->Result<(PathBuf,UpdateParent),String>{
     if fs::metadata(&self_path).map_err(|error|error.to_string())?.len()!=installer_size||!workspace::file_hash(&self_path)?.eq_ignore_ascii_case(installer_sha256){
         return Err("当前分发器与更新配置声明的已校验安装器不匹配。".into());
     }
-    let pid=config["parent_pid"].as_u64().and_then(|value|u32::try_from(value).ok()).filter(|value|*value!=0).ok_or("旧程序进程编号无效")?;
     if pid==std::process::id(){return Err("旧程序进程身份无效。".into());}
     let create_time=config["parent_create_time"].as_u64().ok_or("更新配置缺少旧程序创建时间")?;
     let executable=voice_desktop_common::canonical_path(Path::new(config["parent_executable"].as_str().ok_or("更新配置缺少旧程序位置")?))?;
     let expected_executable=voice_desktop_common::canonical_path(&root.join("app/VoiceTerminalDesktop.exe"))?;
     if executable!=expected_executable{return Err("旧程序不属于目标工作区，已拒绝更新。".into());}
-    let Some((actual_time,actual_executable))=workspace::process_identity(pid)? else{return Err("启动更新的旧程序已退出或不存在。".into());};
-    if actual_time!=create_time||!actual_executable.to_string_lossy().eq_ignore_ascii_case(&executable.to_string_lossy()){
-        return Err("旧程序进程身份已变化，已拒绝更新。".into());
-    }
-    let consumed=supplied.with_extension("json.consumed");
-    let mut marker=fs::OpenOptions::new().write(true).create_new(true).open(&consumed).map_err(|_|"此应用更新配置已使用或正在处理。")?;
-    marker.write_all(nonce.as_bytes()).map_err(|error|error.to_string())?;marker.sync_all().map_err(|error|error.to_string())?;drop(marker);
-    fs::remove_file(&supplied).map_err(|error|format!("无法消费一次性更新配置：{error}"))?;
-    Ok((root,UpdateParent{pid,create_time,executable}))
+    let parent=UpdateParent{pid,create_time,executable};
+    validate_update_parent(&parent,update_parent_identity(pid)?)?;
+    mark_update_consumed(&supplied,nonce)?;
+    Ok((root,parent))
 }
 
 fn wait_for_update_parent(root:&Path,parent:&UpdateParent,progress:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
     let deadline=Instant::now()+Duration::from_secs(120);
     loop{
-        let still_running=workspace::process_identity(parent.pid)?.is_some_and(|(created,path)|created==parent.create_time&&path.to_string_lossy().eq_ignore_ascii_case(&parent.executable.to_string_lossy()));
+        let actual=update_parent_identity(parent.pid)?;
+        validate_update_parent(parent,actual.clone())?;
+        let still_running=actual.is_some();
         if !still_running{break;}
         if Instant::now()>=deadline{return Err("旧程序未能在两分钟内退出；原工作区未变更。".into());}
         progress("正在等待旧程序正常退出",0,0);std::thread::sleep(Duration::from_millis(200));
@@ -154,3 +205,53 @@ fn run()->Result<(),String>{
     for _ in 0..20{if workspace::remove_owned(&cache,cache.parent().unwrap()).is_ok(){break;}std::thread::sleep(std::time::Duration::from_millis(100));}Ok(())
 }
 fn main(){if let Err(error)=run(){voice_desktop_common::windows::error(&error);std::process::exit(1);}}
+
+#[cfg(test)]
+mod tests{
+    use super::*;
+
+    #[test]
+    fn accepts_nonce_generated_by_released_desktop(){
+        assert!(validate_update_nonce(&workspace::new_id(),std::process::id()).is_ok());
+        assert!(validate_update_nonce("18c2c23ff4c00000-2a",42).is_ok());
+        assert!(validate_update_nonce("123e4567-e89b-12d3-a456-426614174000",42).is_ok());
+    }
+
+    #[test]
+    fn rejects_nonce_paths_malformed_values_and_different_parent(){
+        for nonce in ["","-2a","0-2a","xyz-2a","18c2c23ff4c00000-2b","18c2c23ff4c00000-10000002a","../../other-2a","18c2c23ff4c00000-2a/other","------------------------------------"]{
+            assert!(validate_update_nonce(nonce,42).is_err(),"应拒绝单次编号：{nonce}");
+        }
+    }
+
+    #[test]
+    fn accepts_exited_legacy_parent_but_rejects_reused_process_identity(){
+        let parent=UpdateParent{pid:42,create_time:123,executable:PathBuf::from("C:/工作区/app/VoiceTerminalDesktop.exe")};
+        assert!(validate_update_parent(&parent,None).is_ok());
+        assert!(validate_update_parent(&parent,Some((123,parent.executable.clone()))).is_ok());
+        assert!(validate_update_parent(&parent,Some((456,parent.executable.clone()))).is_err());
+        assert!(validate_update_parent(&parent,Some((123,PathBuf::from("C:/其他程序.exe")))).is_err());
+    }
+
+    #[test]
+    fn strict_parent_query_identifies_current_process(){
+        let actual=update_parent_identity(std::process::id()).unwrap().unwrap();
+        assert!(actual.0>0);
+        assert_eq!(voice_desktop_common::canonical_path(&actual.1).unwrap(),voice_desktop_common::canonical_path(&std::env::current_exe().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn consumes_legacy_config_once_and_rejects_replay(){
+        let root=std::env::temp_dir().join(format!("voice-update-consume-{}",workspace::new_id()));
+        fs::create_dir_all(&root).unwrap();
+        let nonce=workspace::new_id();let path=root.join(format!("app-update-{nonce}.json"));
+        fs::write(&path,b"{}").unwrap();
+        mark_update_consumed(&path,&nonce).unwrap();
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(path.with_extension("json.consumed")).unwrap(),nonce);
+        fs::write(&path,b"{}").unwrap();
+        assert!(mark_update_consumed(&path,&nonce).is_err());
+        assert!(path.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+}
