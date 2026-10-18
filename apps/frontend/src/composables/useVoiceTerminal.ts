@@ -131,16 +131,83 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
   const perceptualLatencyMs = ref<number | null>(null)
   const perceptualLatencyRunning = ref(false)
   const now = options.now ?? (() => typeof performance !== 'undefined' ? performance.now() : Date.now())
+  const hasInjectedClock = options.now !== undefined // hasInjectedClock（是否使用外部注入时钟）：测试时不混用服务端墙钟与单调时钟。
   const pendingShadowActivities: unknown[] = []
   let shadowActivityFrame: number | undefined
   let perceptualLatencyTimer: ReturnType<typeof setInterval> | undefined
+  let perceptualLatencyFrame: number | undefined // perceptualLatencyFrame（首音计时动画帧）：同步屏幕刷新，减少前台计时显示抖动。
+  let perceptualLatencyServerStartedAt: number | null = null // perceptualLatencyServerStartedAt（服务端起始时间）：补偿后台恢复后延迟处理的计时边界。
+  let perceptualLatencyListenersAttached = false // perceptualLatencyListenersAttached（计时事件监听状态）：避免重复注册焦点与可见性监听。
   let perceptualLatencyTurnId: string | null = null
   let perceptualLatencyStartedAt: number | null = null
   let perceptualLatencySettled = false
 
+  function parsePerceptualLatencyTimestamp(value: string | null | undefined) {
+    if (hasInjectedClock || !value) return null
+    const timestamp = Date.parse(value)
+    return Number.isFinite(timestamp) ? timestamp : null
+  }
+
+  function cancelPerceptualLatencyFrame() {
+    if (perceptualLatencyFrame === undefined) return
+    if (typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') {
+      window.cancelAnimationFrame(perceptualLatencyFrame)
+    }
+    perceptualLatencyFrame = undefined
+  }
+
+  function schedulePerceptualLatencyUpdate() {
+    if (!perceptualLatencyRunning.value) return
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      if (perceptualLatencyFrame !== undefined) return
+      perceptualLatencyFrame = window.requestAnimationFrame(() => {
+        perceptualLatencyFrame = undefined
+        updatePerceptualLatency()
+        schedulePerceptualLatencyUpdate()
+      })
+      return
+    }
+    // fallbackTimer（回退定时器）：SSR 或无动画帧环境沿用 50 毫秒时钟刷新。
+    if (perceptualLatencyTimer === undefined) {
+      perceptualLatencyTimer = setInterval(updatePerceptualLatency, PERCEPTUAL_LATENCY_TICK_MS)
+    }
+  }
+
+  function onPerceptualLatencyVisibilityChange() {
+    if (!perceptualLatencyRunning.value) return
+    updatePerceptualLatency()
+    if (document.visibilityState === 'hidden') cancelPerceptualLatencyFrame()
+    else schedulePerceptualLatencyUpdate()
+  }
+
+  function onPerceptualLatencyWindowFocusChange() {
+    if (!perceptualLatencyRunning.value) return
+    updatePerceptualLatency()
+    schedulePerceptualLatencyUpdate()
+  }
+
+  function attachPerceptualLatencyListeners() {
+    if (perceptualLatencyListenersAttached || typeof window === 'undefined' || typeof document === 'undefined') return
+    document.addEventListener('visibilitychange', onPerceptualLatencyVisibilityChange)
+    window.addEventListener('focus', onPerceptualLatencyWindowFocusChange)
+    window.addEventListener('blur', onPerceptualLatencyWindowFocusChange)
+    perceptualLatencyListenersAttached = true
+  }
+
+  function detachPerceptualLatencyListeners() {
+    if (!perceptualLatencyListenersAttached || typeof window === 'undefined' || typeof document === 'undefined') return
+    document.removeEventListener('visibilitychange', onPerceptualLatencyVisibilityChange)
+    window.removeEventListener('focus', onPerceptualLatencyWindowFocusChange)
+    window.removeEventListener('blur', onPerceptualLatencyWindowFocusChange)
+    perceptualLatencyListenersAttached = false
+  }
+
   function clearPerceptualLatencyTimer() {
     if (perceptualLatencyTimer !== undefined) clearInterval(perceptualLatencyTimer)
     perceptualLatencyTimer = undefined
+    cancelPerceptualLatencyFrame()
+    detachPerceptualLatencyListeners()
   }
 
   function updatePerceptualLatency() {
@@ -154,6 +221,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     perceptualLatencyRunning.value = false
     perceptualLatencyTurnId = null
     perceptualLatencyStartedAt = null
+    perceptualLatencyServerStartedAt = null
     perceptualLatencySettled = false
   }
 
@@ -170,7 +238,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     cancelShadowActivityFrame()
   }
 
-  function startPerceptualLatency(turnId: string | null) {
+  function startPerceptualLatency(turnId: string | null, timestamp?: string | null) {
     if (!turnId) return
     // A late SenseVoice refinement can arrive after the primary final input;
     // it must not restart a stopwatch that is already measuring this turn.
@@ -179,21 +247,30 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
 
     resetPerceptualLatency()
     perceptualLatencyTurnId = turnId
-    perceptualLatencyStartedAt = now()
-    perceptualLatencyMs.value = 0
+    const startedAt = parsePerceptualLatencyTimestamp(timestamp)
+    const wallNow = startedAt === null ? null : Date.now()
+    const callbackDelay = startedAt === null || wallNow === null ? 0 : Math.max(0, wallNow - startedAt)
+    perceptualLatencyServerStartedAt = startedAt
+    perceptualLatencyStartedAt = now() - callbackDelay
+    perceptualLatencyMs.value = callbackDelay
     perceptualLatencyRunning.value = true
-    perceptualLatencyTimer = setInterval(updatePerceptualLatency, PERCEPTUAL_LATENCY_TICK_MS)
+    attachPerceptualLatencyListeners()
+    schedulePerceptualLatencyUpdate()
   }
 
-  function stopPerceptualLatency(turnId: string | null = null) {
+  function stopPerceptualLatency(turnId: string | null = null, timestamp?: string | null) {
     if (!perceptualLatencyRunning.value || perceptualLatencyStartedAt === null) return
     if (turnId && perceptualLatencyTurnId !== turnId) return
-    // Capture the boundary at event handling time rather than waiting for the
-    // next interval tick.  This is the value users actually perceive.
+    // event timestamp（事件时间戳）可校正后台积压的消息；缺失时使用当前单调时钟。
     updatePerceptualLatency()
+    const stoppedAt = parsePerceptualLatencyTimestamp(timestamp)
+    if (perceptualLatencyServerStartedAt !== null && stoppedAt !== null && stoppedAt >= perceptualLatencyServerStartedAt) {
+      perceptualLatencyMs.value = stoppedAt - perceptualLatencyServerStartedAt
+    }
     clearPerceptualLatencyTimer()
     perceptualLatencyRunning.value = false
     perceptualLatencyStartedAt = null
+    perceptualLatencyServerStartedAt = null
     perceptualLatencySettled = true
   }
 
@@ -808,7 +885,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
     }
   }
 
-  function applySessionState(payload: SessionStatePayload, turnId: string | null) {
+  function applySessionState(payload: SessionStatePayload, turnId: string | null, timestamp?: string | null) {
     syncAudioGeneration(payload)
     if (isTerminalState(payload.state)) state.value = payload.state
     if (typeof payload.listening === 'boolean') listening.value = payload.listening
@@ -818,7 +895,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       // This is the earliest public end-of-input boundary.  The clock is
       // local to the browser, so later backend latency snapshots cannot move
       // or delay the displayed perceptual measurement.
-      startPerceptualLatency(turnId ?? currentTurnId.value)
+      startPerceptualLatency(turnId ?? currentTurnId.value, timestamp)
     }
     if (payload.listening === false && payload.state === 'IDLE') {
       // Stopping the microphone is not an output cancellation boundary. The
@@ -932,7 +1009,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       )) {
         // wait（等待）和纯停止 cancel（取消）是本轮计时终点；替换式 cancel（取消）
         // 继续计时，直到 speech.started（语音开始播放）确认替换音频已起播。
-        stopPerceptualLatency(traceTurnId)
+        stopPerceptualLatency(traceTurnId, message.timestamp)
       }
       return
     }
@@ -959,7 +1036,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
       const item = readPlaybackItem(payload, 'playing')
       if (item && (!agentEpisode.value?.conversation_id || item.conversation_id === agentEpisode.value.conversation_id)) {
         upsertPlaybackItem(item)
-        stopPerceptualLatency(item.turn_id || message.turn_id || readString(payload, 'turn_id'))
+        stopPerceptualLatency(item.turn_id || message.turn_id || readString(payload, 'turn_id'), message.timestamp)
       }
       return
     }
@@ -1053,7 +1130,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
         applyRuntimeSnapshot(payload as unknown as RuntimeSnapshotPayload, message.turn_id ?? null)
         break
       case 'session.state':
-        applySessionState(payload as unknown as SessionStatePayload, message.turn_id ?? null)
+        applySessionState(payload as unknown as SessionStatePayload, message.turn_id ?? null, message.timestamp)
         break
       case 'input.updated':
         if (acceptsCurrentTurn(message.turn_id ?? null)) {
@@ -1070,7 +1147,7 @@ export function useVoiceTerminal(options: UseVoiceTerminalOptions = {}) {
           // FINALIZING normally starts the timer earlier.  Keep this as a
           // compatibility fallback for servers that only send transcript
           // finalization, and make late refinements a no-op for the same turn.
-          startPerceptualLatency(message.turn_id ?? readString(payload, 'turn_id'))
+          startPerceptualLatency(message.turn_id ?? readString(payload, 'turn_id'), message.timestamp)
           const text = readString(payload, 'text')
           if (text !== null) {
             if (readString(payload, 'source') === 'sensevoice') {
