@@ -1026,7 +1026,10 @@ class RealtimeController(InputOwnershipMixin, SpeechPipeline, InputController):
             return
         if ws.speaker_mode == "filter":
             admitted = self.speaker_policy.admitted_text(ws.turn_id)
-            result = {"segments": [admitted] if admitted else [], "sentences": [{"text": admitted}] if admitted else [], "changed_ids": []}
+            # text（过滤后正文）保持分段结果契约，热词修订只能读取已准入内容。
+            result = {"text": admitted, "new_segment": "",
+                      "segments": [admitted] if admitted else [],
+                      "sentences": [{"text": admitted}] if admitted else [], "changed_ids": []}
         if getattr(self, "hotwords", None) is not None:
             token = ws.token
             result["sentences"] = await self.hotwords.sentences(list(result["sentences"]), token)
