@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import threading
@@ -56,6 +57,9 @@ class DesktopControl:
                 if kind == "shutdown":
                     self.stop(int(message.get("budget_ms", 14000)))
                     return
+                if kind == "flush_logs" and type(message.get("request_id")) is int:
+                    # request_id（本次刷新请求编号）用于将刷新结果对应到原生桌面调用。
+                    self._flush_logs(message["request_id"])
                 if kind == "desktop_process" and type(message.get("pid")) is int and message["pid"] > 0:
                     state = self.application.state
                     with state.condition:
@@ -68,3 +72,25 @@ class DesktopControl:
         except (ValueError, TypeError, OSError):
             pass
         self.stop()
+
+    def _flush_logs(self, request_id: int) -> None:
+        # handlers（日志处理器）：逐个刷新进程内文件日志并提交到磁盘。
+        handlers = {id(handler): handler for handler in logging.getLogger().handlers}
+        for logger in logging.Logger.manager.loggerDict.values():
+            if isinstance(logger, logging.Logger):
+                handlers.update({id(handler): handler for handler in logger.handlers})
+        try:
+            for handler in handlers.values():
+                handler.acquire()
+                try:
+                    handler.flush()
+                    if isinstance(handler, logging.FileHandler):
+                        stream = handler.stream
+                        if stream is not None and not stream.closed:
+                            os.fsync(stream.fileno())
+                finally:
+                    handler.release()
+        except Exception:
+            self.send("logs_flush_failed", request_id=request_id)
+        else:
+            self.send("logs_flushed", request_id=request_id)

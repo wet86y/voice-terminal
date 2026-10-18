@@ -1021,7 +1021,7 @@ describe('正式界面的真实控件交互', () => {
     const launch = deferred<{ url: string }>()
     const openConsole = vi.fn().mockResolvedValue(undefined)
     vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({ available: true,
-      focus: vi.fn(), openLogs: vi.fn(), openConsole, exit: vi.fn() })
+      focus: vi.fn(), exportLogs: vi.fn(), openConsole, exit: vi.fn() })
     const openTab = vi.spyOn(window, 'open').mockReturnValue(null)
     vi.spyOn(productApi, 'launchDsh').mockReturnValue(launch.promise)
     const value = await adapter()
@@ -1040,7 +1040,7 @@ describe('正式界面的真实控件交互', () => {
     const openConsole = vi.fn().mockRejectedValueOnce(new Error('无法打开系统默认浏览器。'))
       .mockResolvedValueOnce(undefined)
     vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({ available: true,
-      focus: vi.fn(), openLogs: vi.fn(), openConsole, exit: vi.fn() })
+      focus: vi.fn(), exportLogs: vi.fn(), openConsole, exit: vi.fn() })
     const openTab = vi.spyOn(window, 'open').mockReturnValue(null)
     vi.spyOn(productApi, 'launchDsh').mockResolvedValue({ url: 'http://127.0.0.1:3081/?token=value' })
     const value = await adapter()
@@ -1057,7 +1057,7 @@ describe('正式界面的真实控件交互', () => {
 
   it('原生命令桥不可用时不请求控制台地址或打开浏览器窗口', async () => {
     vi.spyOn(desktopBridge, 'desktopPort').mockReturnValue({ available: false,
-      focus: vi.fn(), openLogs: vi.fn(), openConsole: vi.fn(), exit: vi.fn() })
+      focus: vi.fn(), exportLogs: vi.fn(), openConsole: vi.fn(), exit: vi.fn() })
     const openTab = vi.spyOn(window, 'open').mockReturnValue(null)
     const launch = vi.spyOn(productApi, 'launchDsh')
     const value = await adapter()

@@ -67,7 +67,7 @@ describe('ManagementApp（组件管理）启动校验与并行配置', () => {
         if (name === desktop.RESOURCE_PROGRESS_EVENT) resourceEvent = handler
         return () => undefined
       },
-      openLogs: vi.fn(), exit: vi.fn(),
+      exportLogs: vi.fn(), exit: vi.fn(),
     } as unknown as ReturnType<typeof desktop.desktopPort>)
   })
 

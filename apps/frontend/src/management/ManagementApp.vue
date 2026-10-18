@@ -19,6 +19,8 @@ watch(() => resources.resources.value.find(item => item.resource_id === 'tts'), 
   credentials.setLocalTtsReady(item ? item.can_start === true && item.update_available !== true : null)
 }, { immediate: true })
 const starting = ref(false) // starting（已请求启动）：原生导航完成前防止重复点击。
+const logExportError = ref('') // logExportError（日志打包错误）。
+const logExportSuccess = ref(false) // logExportSuccess（日志包已保存）。
 const updatesRequired = computed(() => resources.resources.value.some(item => item.required !== false && item.update_available === true))
 const componentsReady = computed(() => resources.resources.value.length > 0
   && resources.resources.value.filter(item => item.required !== false).every(item => item.can_start && item.update_available !== true))
@@ -211,25 +213,43 @@ function retry(id: string) {
   const resourceId = row?.resource?.id
   if (resourceId) void resources.downloadResource(resourceId)
 }
+function exportLogs() {
+  logExportError.value = ''
+  logExportSuccess.value = false
+  void port.exportLogs().then(path => {
+    logExportSuccess.value = Boolean(path)
+  }).catch(error => {
+    logExportError.value = String(error)
+  })
+}
 </script>
 
 <template>
   <main v-if="starting" class="startup-screen" role="status" aria-label="应用启动画面">
     <section class="startup-content"><img class="startup-icon" :src="startupIcon" alt="语音终端" width="72" height="72"><h1 class="startup-title">应用启动中</h1><p class="startup-status" aria-live="polite">正在准备启动并校验本地组件</p><div class="startup-progress" data-indeterminate="true" role="progressbar" aria-label="应用启动进度"><span class="startup-progress-fill"></span></div></section>
   </main>
-  <AppFrame runtime="standby"><SettingsFrame :section="section" desktop @section="section = $event" @back="startProgram" @logs="port.openLogs()" @exit="port.exit()">
-    <article class="settings-panel panel">
-      <template v-if="section === 'compute' || section === 'system'">
-        <div class="management-start">
-          <p>{{ componentsReady ? credentials.ready.value ? '组件和接口密钥已完备，可以启动程序。' : '组件已完备，请在分类详情中配置 DeepSeek 与 TTS。' : componentBlockMessage }}</p>
-          <div class="management-actions"><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value || resources.inventoryRefreshing.value || starting" @click="startProgram">启动程序</button></div>
-        </div>
-        <LocalComponents :model="model" @refresh="resources.refresh" @retry="retry" @resource-download="resources.downloadResource" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" />
-      </template>
-      <WorkspaceSettings v-else-if="section === 'workspace'" :controller="resources" />
-      <section v-else class="environment-required"><h2>请先补齐本地组件</h2><p>全部组件和接口密钥准备好后可以启动语音与业务服务。组件下载、导入和关于页可以在设置中使用。</p><button class="outline-button" @click="section = 'compute'">进入组件管理</button></section>
-    </article>
-  </SettingsFrame><ResourceInstallDialog :controller="resources" /></AppFrame>
+  <AppFrame runtime="standby">
+    <SettingsFrame :section="section" desktop @section="section = $event" @back="startProgram" @logs="exportLogs" @exit="port.exit()">
+      <article class="settings-panel panel">
+        <template v-if="section === 'compute' || section === 'system'">
+          <div class="management-start">
+            <p>{{ componentsReady ? credentials.ready.value ? '组件和接口密钥已完备，可以启动程序。' : '组件已完备，请在分类详情中配置 DeepSeek 与 TTS。' : componentBlockMessage }}</p>
+            <div class="management-actions"><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value || resources.inventoryRefreshing.value || starting" @click="startProgram">启动程序</button></div>
+          </div>
+          <LocalComponents :model="model" @refresh="resources.refresh" @retry="retry" @resource-download="resources.downloadResource" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" />
+        </template>
+        <WorkspaceSettings v-else-if="section === 'workspace'" :controller="resources" />
+        <section v-else class="environment-required"><h2>请先补齐本地组件</h2><p>全部组件和接口密钥准备好后可以启动语音与业务服务。组件下载、导入和关于页可以在设置中使用。</p><button class="outline-button" @click="section = 'compute'">进入组件管理</button></section>
+      </article>
+    </SettingsFrame>
+    <ResourceInstallDialog :controller="resources" />
+    <template #overlays>
+      <div v-if="logExportSuccess" class="save-notice" role="status">日志压缩包已保存到所选文件夹。</div>
+      <div v-if="logExportError" class="save-notice error-notice" role="alert">
+        <span>!</span>{{ logExportError }}<button aria-label="关闭错误" @click="logExportError = ''">×</button>
+      </div>
+    </template>
+  </AppFrame>
 </template>
 
 <style scoped>.environment-required{padding:28px}.environment-required p{color:#99a4b7;line-height:1.8}.management-start{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 20px;border-bottom:1px solid var(--line);flex-wrap:wrap}.management-start p{color:var(--muted);font-size:var(--font-body)}.management-start button{white-space:nowrap}.management-actions{display:flex;gap:8px}</style>
