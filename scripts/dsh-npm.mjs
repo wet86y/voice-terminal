@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs'
 import { resolve, dirname, join, isAbsolute } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
+import { registryCandidates, registryEnvironment, canRetryRegistry, selectedRegistry as requestedRegistry } from './download-sources.mjs'
 
 export function safePath(root, relative) {
   if (typeof relative !== 'string' || !relative || isAbsolute(relative) || relative.includes('\\') || relative.split('/').some(p => !p || p === '.' || p === '..')) throw new Error('DSH（代理宿主）入口路径无效')
@@ -38,11 +39,13 @@ export async function checkPlugin(program, spec) {
 }
 function run(args, cwd, env, capture = false) {
   return new Promise((success, failure) => {
-    const child = spawn(process.execPath, args, { cwd, env, windowsHide: true, stdio: capture ? ['ignore', 'pipe', 'inherit'] : 'inherit' })
+    const child = spawn(process.execPath, args, { cwd, env, windowsHide: true, stdio: ['ignore', capture ? 'pipe' : 'inherit', 'pipe'] })
     let output = ''
+    let installLog = '' // installLog（有界错误日志）：用于区分来源故障和组件构建错误。
+    child.stderr.on('data', chunk => { process.stderr.write(chunk); installLog = (installLog + chunk).slice(-65536) })
     if (capture) child.stdout.on('data', chunk => { output += chunk })
     child.on('error', failure)
-    child.on('exit', code => code === 0 ? success(output.trim()) : failure(new Error('npm（包管理器）安装失败，请检查网络及日志后重试')))
+    child.on('exit', (code, signal) => code === 0 ? success(output.trim()) : failure(Object.assign(new Error('npm（包管理器）安装失败，请检查网络及日志后重试'), { installLog, cancelled: signal !== null || code === 130 || code === 3221225786 })))
   })
 }
 export async function install(program, target, npmCli, workspace) {
@@ -70,7 +73,20 @@ export async function install(program, target, npmCli, workspace) {
   delete env.ELECTRON_RUN_AS_NODE
   const npmVersion = await run([npmCli, '--version'], target, env, true)
   process.stdout.write('VOICE_DSH_PHASE 在线刷新版本元数据并复用已下载的 npm（包管理器）归档缓存\n')
-  await run([npmCli, ...npmArguments(target, spec, npmVersion)], target, env)
+  const registries = registryCandidates(requestedRegistry(spec.registry_url, env, target))
+  let selectedRegistry = '' // selectedRegistry（实际传输来源）：不覆盖规范来源与候选身份。
+  for (const [index, registry] of registries.entries()) {
+    process.stdout.write(`VOICE_DSH_PHASE 下载来源：${new URL(registry).host}\n`)
+    try {
+      await run([npmCli, ...npmArguments(target, { ...spec, registry_url: registry }, npmVersion)], target, registryEnvironment(env, registry))
+      selectedRegistry = registry
+      break
+    } catch (error) {
+      if (index === registries.length - 1 || !canRetryRegistry(error)) throw error
+      process.stdout.write(`VOICE_DSH_PHASE 来源 ${new URL(registry).host} 失败，切换备用注册表\n`)
+      await rm(modules, { recursive: true, force: true })
+    }
+  }
   process.stdout.write('VOICE_DSH_PHASE 核对 DSH（代理宿主）版本、资源及启动入口\n')
   const pkg = await readJson(safePath(target, `${spec.modules}/${spec.package_name}/package.json`))
   if (pkg.name !== spec.package_name || pkg.version !== spec.version) throw new Error('已下载 DSH（代理宿主）包名或版本不匹配')
@@ -78,6 +94,8 @@ export async function install(program, target, npmCli, workspace) {
   if (tool.name !== 'pnpm' || `pnpm@${tool.version}` !== spec.package_manager) throw new Error('私有 pnpm（插件包管理器）实际版本不匹配')
   for (const path of [spec.cli_entry, spec.schedule, ...spec.required_files]) if (!existsSync(safePath(target, path))) throw new Error(`DSH（代理宿主）必要资源缺失：${path}`)
   const metadata = { schema: 3, kind: 'dsh', ...spec, fields: { source_kind: 'npm（包管理器）安装来源', adapter: '启动适配器', package_name: '官方宿主包名', version: '实际安装版本', entry: '启动包装入口', cli_entry: '上游命令入口', modules: '运行依赖目录', schedule: '调度入口', bridge_protocol: '桥接协议版本', package_manager: '插件包管理工具', pnpm_entry: '工作区插件包管理入口', registry_url: 'npm（包管理器）注册表来源', node_version_range: 'Node.js（运行环境）支持范围', required_files: '必要资源', plugin_record: '插件适配记录', schema: '运行记录格式', kind: '组件类型' } }
+  metadata.download_source = selectedRegistry
+  metadata.fields.download_source = '本次实际使用的下载注册表，不参与版本兼容判断'
   await writeFile(join(target, 'runtime.json'), JSON.stringify(metadata, null, 2) + '\n')
   // wrapper（启动包装入口）：通过上游 runCli（命令接口）注入工作区工具，避免全局安装。
   await writeFile(safePath(target, spec.entry), `import { readFileSync } from 'node:fs'\nimport { dirname, resolve } from 'node:path'\nimport { fileURLToPath, pathToFileURL } from 'node:url'\nconst root = dirname(fileURLToPath(import.meta.url))\nconst record = JSON.parse(readFileSync(resolve(root, 'runtime.json'), 'utf8'))\nconst { runCli } = await import(pathToFileURL(resolve(root, record.cli_entry)).href)\nawait runCli({ packageManager: { command: process.execPath, args: ['--expose-internals', resolve(root, record.pnpm_entry)] } })\n`)

@@ -857,6 +857,10 @@ class ResourceManager:
                       "sha256": item.sha256} for item in spec.files if item.asset is not None]
         if transport.get("kind") == "official_audiocpp_patch":
             generated.append({**transport["patch"], "role": "bundled_patch"})
+        from .download_sources import candidates
+        for file in files:
+            if file.get("url"):
+                file["download_sources"] = candidates(file["url"])
         return {
             "resource_id": spec.resource_id,
             "task_id": task_id,
@@ -882,6 +886,7 @@ class ResourceManager:
                 "install_path": "资源安装目标目录", "hash_algorithm": "摘要算法名称",
                 "hash_encoding": "摘要编码方式", "hash_value": "摘要预期值", "optional": "可选文件标记",
                 "restartable": "下载进程退出后的续传能力标记",
+                "download_sources": "保持大小和摘要不变的镜像与原站候选地址",
             },
         }
 

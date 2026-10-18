@@ -258,7 +258,10 @@ class DshRuntimeAsyncTests(unittest.IsolatedAsyncioTestCase):
             package = json.loads((profile / "package.json").read_text(encoding="utf-8"))
             self.assertEqual(package["dsh"]["profile"]["bundles"], ["base", "voice-plugin", native, "user-plugin"])
             self.assertEqual(package["dependencies"], {"voice-plugin": "0.1.1", "user-plugin": "1.2.3"})
-            self.assertEqual((profile / "cordis.patch.yml").read_bytes(), user_patch)
+            patch_bytes = (profile / "cordis.patch.yml").read_bytes()
+            self.assertTrue(patch_bytes.startswith(user_patch))
+            self.assertEqual(patch_bytes.count(b"- id: plugin-manager"), 1)
+            self.assertIn(b"fallbackRegistries", patch_bytes)
 
     async def test_release_checks_required_entries_without_development_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

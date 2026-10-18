@@ -1,13 +1,13 @@
 ﻿param()
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'local-context.ps1')
+. (Join-Path $PSScriptRoot 'download-sources.ps1')
 $SevenRoot = Get-ProjectRoot
 $SevenLock = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $SevenRoot 'config/7zip.lock.json') | ConvertFrom-Json
 $SevenSource = Join-Path $SevenRoot '.local/build/7zip'
 $SevenOutput = Join-Path $SevenRoot '.local/build/tools/7zip'
 if (-not (Test-Path -LiteralPath (Join-Path $SevenSource '.git'))) {
-  & git clone --depth 1 --branch $SevenLock.version $SevenLock.repository $SevenSource
-  if ($LASTEXITCODE) { throw '完整 7-Zip（压缩工具）源码获取失败。' }
+  Invoke-SourceGitClone -Repository $SevenLock.repository -Destination $SevenSource -Options @('--depth','1','--branch',$SevenLock.version)
 }
 $SevenCommit = (& git -C $SevenSource rev-parse HEAD).Trim()
 if ($SevenCommit -ne $SevenLock.commit) { throw '压缩工具源码与锁定提交不一致。' }

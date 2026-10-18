@@ -14,10 +14,11 @@ function controller(plan: ResourceInstallPlan, resources: ResourceStatus[] = [])
 
 describe('ResourceInstallDialog（资源安装确认）模型与共享依赖入口', () => {
   it('模型任务只说明模型文件，语音依赖由语音服务入口配置', async () => {
-    const model = controller({ resource_id: 'fsmn-vad', title: 'FSMN-VAD（语音活动检测）', model_bytes: 1730986, environment: null })
+    const model = controller({ resource_id: 'fsmn-vad', title: 'FSMN-VAD（语音活动检测）', model_bytes: 1730986, environment: null, download_sources: ['modelscope.cn'] })
     const wrapper = mount(ResourceInstallDialog, { props: { controller: model } })
     expect(wrapper.text()).toContain('本次仅下载模型文件')
     expect(wrapper.text()).toContain('Voice Server（语音服务）中配置')
+    expect(wrapper.text()).toContain('下载来源：modelscope.cn')
     expect(wrapper.text()).not.toContain('一次检测并配置')
     const button = wrapper.get('.install-plan-actions button')
     expect(button.text()).toBe('开始下载')

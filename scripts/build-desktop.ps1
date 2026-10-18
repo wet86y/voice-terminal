@@ -7,6 +7,7 @@
 )
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'local-context.ps1')
+. (Join-Path $PSScriptRoot 'download-sources.ps1')
 $DesktopRepo=Get-ProjectRoot
 if ($args.Count) { throw '构建脚本不接受产品运行参数。' }
 if ($Debug) { $OptimizationLevel='debug' }
@@ -31,15 +32,15 @@ try {
     $Built=@()
     if ($BuildTarget -eq 'installer') {
       $Features='voice-terminal-installer/custom-protocol';if ($Qualification) {$Features+=',voice-terminal-installer/qualification'}
-      & $CargoCommand build --manifest-path apps/desktop/Cargo.toml -p voice-terminal-installer --features $Features --locked @ProfileArgs
+      Invoke-SourceCargo -Executable $CargoCommand -Arguments (@('build','--manifest-path','apps/desktop/Cargo.toml','-p','voice-terminal-installer','--features',$Features,'--locked') + $ProfileArgs)
       if ($LASTEXITCODE) {throw '独立安装器构建失败。'};$Built=@('installer')
     } else {
       if (-not $BootstrapOnly) {
-        & $CargoCommand build --manifest-path apps/desktop/Cargo.toml -p voice-terminal-desktop --features voice-terminal-desktop/custom-protocol --locked @ProfileArgs
+        Invoke-SourceCargo -Executable $CargoCommand -Arguments (@('build','--manifest-path','apps/desktop/Cargo.toml','-p','voice-terminal-desktop','--features','voice-terminal-desktop/custom-protocol','--locked') + $ProfileArgs)
         if ($LASTEXITCODE) {throw '统一正式宿主构建失败。'};$Built+='desktop'
       }
       if (-not $DesktopOnly) {
-        & $CargoCommand build --manifest-path apps/desktop/Cargo.toml -p voice-terminal-bootstrap --features voice-terminal-bootstrap/custom-protocol --locked @ProfileArgs
+        Invoke-SourceCargo -Executable $CargoCommand -Arguments (@('build','--manifest-path','apps/desktop/Cargo.toml','-p','voice-terminal-bootstrap','--features','voice-terminal-bootstrap/custom-protocol','--locked') + $ProfileArgs)
         if ($LASTEXITCODE) {throw '统一正式入口构建失败。'};$Built+='bootstrap'
       }
       if ($OptimizationLevel -eq 'debug' -and -not $BootstrapOnly) {

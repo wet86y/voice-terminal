@@ -166,6 +166,8 @@ class DshRuntimeManager:
             env.pop("ELECTRON_RUN_AS_NODE", None)
             # 两种 DSH（代理宿主）格式的包管理器与临时数据均进入当前工作区。
             self._prepare_official_environment(env)
+            from ..download_sources import npm_environment
+            env = npm_environment(env)
             if self._official_executable is not None:
                 env["ELECTRON_RUN_AS_NODE"] = "1"
                 command = [str(self._official_executable), "--expose-internals"]
@@ -316,6 +318,16 @@ class DshRuntimeManager:
             raise RuntimeError("DSH（代理执行宿主）的用户配置缺少必要的受管默认项。")
         migrate_plugin_patch(managed_patch)
         migrate_schedule_patch(managed_patch, native_enabled=native_schedule_enabled(profile))
+        # registry fallback（公开源回退）：不改用户选定主源，私有注册表仍由上游独立隔离。
+        from ..download_sources import policy
+        import yaml
+        rows = yaml.safe_load(managed_patch.read_text("utf-8-sig")) or []
+        manager = next((row for row in rows if row.get("id") == "plugin-manager"), None)
+        if manager is None:
+            # 仅追加缺失的受管默认项，原有注释、换行、用户补丁及显式注册表配置逐字保留。
+            original = managed_patch.read_bytes()
+            addition = yaml.safe_dump([{"id": "plugin-manager", "config": {"fallbackRegistries": policy()["npm_registries"]}}], allow_unicode=True, sort_keys=False).encode("utf-8")
+            managed_patch.write_bytes(original + (b"\n" if original and not original.endswith(b"\n") else b"") + addition)
 
     def _prepare_official_environment(self, env: dict[str, str]) -> None:
         """Keep Electron Node caches and temporary files（临时文件）inside DSH_HOME."""

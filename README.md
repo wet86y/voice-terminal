@@ -38,9 +38,11 @@ Voice Terminal 是 Windows（操作系统）本机实时语音会话应用。Tau
 
 ```powershell
 .\scripts\setup.ps1 -SkipInstall -SkipDsh
-npm ci
+.\scripts\install-frontend.ps1
 npm run desktop:start
 ```
+
+组件与构建依赖默认采用国内镜像优先、失败回退原站，版本及内容校验保持不变。来源映射、离线安装及验证边界见[国内镜像与原站回退](docs/guides/download-sources.md)。
 
 普通无参数启动从可执行文件位置确定工作区，读取已发布 `app`（程序本体）内的业务和静态界面；不查找源码祖先，也不读取或更新系统用户目录中的工作区定位记录。`npm run desktop:start`（正式启动）与本地双击完全一致。`npm run dev`（源码热更新）通过同一正式入口显式传入 `--dev`（调试开关）及 `--source-root`（源码目录），沿用正式工作区、组件管理、单实例及退出流程。`npm run desktop:publish`（本地发布）使用统一程序包事务替换本体，保留用户数据与组件。
 

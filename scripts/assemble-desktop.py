@@ -193,6 +193,9 @@ def collect_program(program: Path, desktop: Path, *, include_desktop: bool = Tru
     config[0] = 'model_dir: "models" # 由启动上下文传入实际只读模型目录。'
     (program / "config/default.yaml").write_text("\n".join(config)+"\n", encoding="utf-8")
     shutil.copy2(ROOT / "config/runtime-resources.json", program / "config/runtime-resources.json")
+    shutil.copy2(ROOT / "config/download-sources.json", program / "config/download-sources.json")
+    shutil.copy2(ROOT / "scripts/download-sources.mjs", program / "scripts/download-sources.mjs")
+    shutil.copy2(ROOT / "scripts/download-sources.ps1", program / "scripts/download-sources.ps1")
     build_profile(ROOT, ROOT / ".local/build/dsh/bundles", program / "config/dsh/profile")
     from voice_terminal.dsh.distribution import target_spec, check_plugin
     check_plugin(program, target_spec(program))

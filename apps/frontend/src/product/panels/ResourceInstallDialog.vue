@@ -66,6 +66,7 @@ function confirmBundle() {
   <div v-if="controller.pendingDownloadPlan.value" class="install-plan-backdrop">
     <section role="dialog" aria-modal="true" aria-labelledby="install-plan-title" class="install-plan panel">
       <h2 id="install-plan-title">{{ updatePending ? '准备更新' : '准备下载' }} {{ controller.pendingDownloadPlan.value.title }}</h2>
+      <p v-if="controller.pendingDownloadPlan.value.download_sources?.length">下载来源：{{ controller.pendingDownloadPlan.value.download_sources.join('、') }}。优先使用镜像，不可用时尝试原站；所有文件按固定大小和摘要校验。</p>
       <p v-if="controller.pendingDownloadPlan.value.model_bytes">固定资源最多 {{ (controller.pendingDownloadPlan.value.model_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。完整且匹配的资源会跳过。</p>
       <p v-if="targetModelVersion">{{ updatePending ? '本次更新将安装目标模型版本' : '本次下载将安装当前目标模型版本' }}：{{ targetModelVersion }}。</p>
       <p v-for="shared in controller.pendingDownloadPlan.value.shared_resources" :key="shared.resource_id">先准备 {{ shared.title }}，最多 {{ (shared.download_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）。从固定官方归档下载并应用随包补丁；另一款模型可复用。</p>
@@ -111,6 +112,7 @@ function confirmBundle() {
             <span v-if="entry.forcePlan && entry.state === 'installed' && !entry.updateAvailable">本地模型已就绪，此计划用于补齐缺失的共享运行程序。</span>
             <span v-else-if="planFor(entry)?.model_bytes">组件文件最多 {{ ((planFor(entry)?.model_bytes ?? 0) / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）</span>
             <span v-else>配置语音运行环境</span>
+            <span v-if="planFor(entry)?.download_sources?.length">下载来源：{{ planFor(entry)?.download_sources?.join('、') }}；镜像不可用时尝试原站。</span>
             <span v-for="shared in planFor(entry)?.shared_resources ?? []" :key="shared.resource_id">共用资源：{{ shared.title }}，最多 {{ (shared.download_bytes / 1024 ** 2).toFixed(1) }} MiB（兆二进制字节）</span>
           </template>
           <span v-if="entry.id && entry.busy">当前下载或修复任务会继续运行。</span>

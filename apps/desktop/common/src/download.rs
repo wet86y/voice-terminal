@@ -58,6 +58,28 @@ pub fn download(file: &DownloadFile, target: &Path, cancel: Arc<AtomicBool>,
 /// download_with_progress（分阶段下载）：网络、缓存完整摘要和启用阶段均有进度与取消。
 pub fn download_with_progress(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,callback:&mut dyn FnMut(&str,u64,u64),probe_limit:u64)->Result<u64,String>{
     let _slot=acquire_slot(&cancel,callback)?;
+    download_candidates(file,target,cancel,callback,probe_limit,&crate::download_sources::candidates(&file.url))
+}
+/// download_candidates（有序回退）：大小与摘要决定断点身份，来源失败不改写内容锁。
+fn download_candidates(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,callback:&mut dyn FnMut(&str,u64,u64),probe_limit:u64,sources:&[String])->Result<u64,String>{
+    let mut errors=vec![];
+    for source in sources {
+        if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}
+        let host=crate::download_sources::host(source);
+        callback(&format!("下载来源：{host}"),0,file.size);
+        let mut candidate=file.clone();candidate.url=source.clone();
+        match download_one(&candidate,target,cancel.clone(),callback,probe_limit) {
+            Ok(value)=>return Ok(value),
+            Err(error)=>{
+                if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}
+                callback(&format!("来源 {host} 失败，尝试备用来源：{error}"),0,file.size);
+                errors.push(format!("{host}：{error}"));
+            }
+        }
+    }
+    Err(format!("所有下载来源均失败：{}",errors.join("；")))
+}
+fn download_one(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,callback:&mut dyn FnMut(&str,u64,u64),probe_limit:u64)->Result<u64,String>{
     if !(file.url.starts_with("https://") || (cfg!(feature="qualification") && file.url.starts_with("http://127.0.0.1:"))) {
         return Err("资源来源必须为 HTTPS（加密传输），验收配置允许本机测试源。".into());
     }
@@ -93,17 +115,19 @@ pub fn download_batch(files:&[(DownloadFile,PathBuf)],cancel:Arc<AtomicBool>,cal
     let total=files.iter().try_fold(0u64,|sum,(file,_)|sum.checked_add(file.size).ok_or("下载大小溢出"))?;
     let next=AtomicUsize::new(0);let downloaded=AtomicU64::new(0);let verified=AtomicU64::new(0);let checked=AtomicUsize::new(0);let stop=AtomicBool::new(false);
     let latest_stage=Mutex::new(false); // latest_stage（最近报告阶段）：false 为下载，true 为摘要校验。
+    let source_status=Mutex::new(String::new()); // source_status（实际来源及切换原因）：投影到批量任务阶段。
     let failure=Mutex::new(None::<String>);let (sender,receiver)=mpsc::channel();let count=files.len().min(MAX_DOWNLOADS);
     let transfer_cancel=Arc::new(AtomicBool::new(cancel.load(Ordering::Acquire))); // transfer_cancel（内部取消）：失败时收集其余传输线程，不改写用户取消状态。
     callback(&format!("{BATCH_DOWNLOAD_PROGRESS_PREFIX}准备下载（0 / {} 个文件）",files.len()),0,total);
     std::thread::scope(|scope|{
         let mut workers=vec![];
-        for _ in 0..count{let sender=sender.clone();let next=&next;let downloaded=&downloaded;let verified=&verified;let checked=&checked;let stop=&stop;let failure=&failure;let cancel=cancel.clone();let transfer_cancel=transfer_cancel.clone();let latest_stage=&latest_stage;
+        for _ in 0..count{let sender=sender.clone();let next=&next;let downloaded=&downloaded;let verified=&verified;let checked=&checked;let stop=&stop;let failure=&failure;let cancel=cancel.clone();let transfer_cancel=transfer_cancel.clone();let latest_stage=&latest_stage;let source_status=&source_status;
             workers.push(scope.spawn(move||{
                 let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{
                     loop{if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}if stop.load(Ordering::Acquire){break;}
                         let index=next.fetch_add(1,Ordering::Relaxed);let Some((file,target))=files.get(index)else{break;};let mut downloaded_reported=0;let mut verified_reported=0;
                         download_with_progress(file,target,transfer_cancel.clone(),&mut|phase,current,_|{
+                            if phase.starts_with("下载来源：")||phase.starts_with("来源 "){if let Ok(mut status)=source_status.lock(){*status=phase.to_owned();}return;}
                             let (download_current,verify_current,is_verifying)=match phase{
                                 "校验下载文件"=>(file.size,current.min(file.size),true),
                                 "启用已校验缓存"=>(file.size,file.size,true),
@@ -126,7 +150,7 @@ pub fn download_batch(files:&[(DownloadFile,PathBuf)],cancel:Arc<AtomicBool>,cal
             if cancel.load(Ordering::Acquire)||stop.load(Ordering::Acquire){transfer_cancel.store(true,Ordering::Release);}
             let completed=checked.load(Ordering::Relaxed);let is_verifying=latest_stage.lock().map(|stage|*stage).unwrap_or(false);
             if is_verifying{callback(&format!("{BATCH_VERIFY_PROGRESS_PREFIX}校验下载文件（{} / {} 个文件）",completed,files.len()),verified.load(Ordering::Relaxed).min(total),total);}
-            else{callback(&format!("{BATCH_DOWNLOAD_PROGRESS_PREFIX}下载固定资源（{} / {} 个文件）",completed,files.len()),downloaded.load(Ordering::Relaxed).min(total),total);}}
+            else{let source=source_status.lock().map(|value|value.clone()).unwrap_or_default();callback(&format!("{BATCH_DOWNLOAD_PROGRESS_PREFIX}下载固定资源（{} / {} 个文件） {source}",completed,files.len()),downloaded.load(Ordering::Relaxed).min(total),total);}}
         for worker in workers{if worker.join().is_err(){*failure.lock().unwrap()=Some("下载工作线程异常退出，断点已保留。".into());}}
     });
     if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}
@@ -141,6 +165,26 @@ mod tests {
     use std::{fs, io::{Read, Write}, net::TcpListener};
     use sha2::{Digest, Sha256};
     use std::{os::windows::fs::OpenOptionsExt, time::Duration};
+
+    #[test]
+    fn mirror_bad_digest_falls_back_and_cancel_stops_before_next_source(){
+        let root=std::env::temp_dir().join(format!("voice-mirror-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
+        let body=b"verified resource";let expected=format!("{:x}",Sha256::digest(body));
+        let mut sources=vec![];let mut servers=vec![];
+        for payload in [b"incorrect content".to_vec(),body.to_vec()] {
+            let server=TcpListener::bind("127.0.0.1:0").unwrap();sources.push(format!("http://{}/model.bin",server.local_addr().unwrap()));
+            servers.push(std::thread::spawn(move||{let(mut socket,_)=server.accept().unwrap();let mut request=[0;4096];socket.read(&mut request).unwrap();
+                write!(socket,"HTTP/1.1 206 OK\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",payload.len(),payload.len()-1,payload.len()).unwrap();socket.write_all(&payload).unwrap();}));
+        }
+        let file=DownloadFile{url:sources[1].clone(),size:body.len() as u64,sha256:expected,sha512:String::new(),path:"model.bin".into()};
+        let target=root.join("download.bin");let mut phases=vec![];
+        download_candidates(&file,&target,Arc::new(AtomicBool::new(false)),&mut|phase,_,_|phases.push(phase.to_owned()),0,&sources).unwrap();
+        for server in servers{server.join().unwrap();}
+        assert_eq!(fs::read(&target).unwrap(),body);assert!(phases.iter().any(|phase|phase.contains("尝试备用来源")));
+        let cancelled=Arc::new(AtomicBool::new(true));let mut called=false;
+        assert!(download_candidates(&file,&target,cancelled,&mut|_,_,_|called=true,0,&sources).is_err());assert!(!called);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn cached_hash_reports_progress_and_cancels_without_touching_verified_file(){

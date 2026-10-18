@@ -19,6 +19,7 @@ from voice_terminal.distribution import manifest, verify, digest, unpack, collec
 from voice_terminal.paths import atomic_json
 from voice_terminal.local_files import remove_tree
 from voice_terminal.dependencies import dependency_errors, ONNX_GPU_VERSION
+from voice_terminal.download_sources import download, pip_run
 
 PROBE = """
 import importlib,json,sys
@@ -115,8 +116,8 @@ def wheel_builder(cache: Path) -> Path:
     executable = tools / "Scripts/python.exe"
     if not executable.is_file():
         run(sys.executable, "-m", "venv", tools)
-    run(executable, "-m", "pip", "install", "--disable-pip-version-check", "--timeout", "120",
-        "pip==25.0.1", "setuptools==78.1.0", "wheel==0.45.1")
+    pip_run([executable, "-m", "pip", "install", "--disable-pip-version-check", "--timeout", "20",
+             "pip==25.0.1", "setuptools==78.1.0", "wheel==0.45.1"])
     return executable
 
 
@@ -149,18 +150,18 @@ def main():
     cache = ROOT / ".local/build/runtime/downloads"
     cache.mkdir(parents=True, exist_ok=True)
     archive = cache / "python-3.12.10-embed-amd64.zip"
-    if not archive.is_file():
+    python_record = json.loads((ROOT / "config/runtime/voice-runtime.lock.json").read_text("utf-8"))["python"]
+    if not archive.is_file() or digest(archive) != python_record["sha256"]:
         if args.offline: raise FileNotFoundError("离线构建缺少官方可嵌入解释器压缩包。")
-        urllib.request.urlretrieve("https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip", archive)
+        download(python_record["url"], archive, sha256=python_record["sha256"], size=python_record["size"])
     if not args.offline:
         # 纯 Python（脚本语言）依赖允许在构建机生成 wheel（预编译依赖包），客户机仅消费轮子。
         producer = wheel_builder(cache)
-        run(producer, "-m", "pip", "wheel", "--no-build-isolation", "--prefer-binary", "--timeout", "120", "--find-links", wheels, "--wheel-dir", wheels,
-            "--extra-index-url", f"https://download.pytorch.org/whl/{args.profile}",
-            "-c", args.constraints, "-r", ROOT / "apps/server/requirements-vad-onnx.txt", f"torch==2.11.0+{args.profile}", f"torchaudio==2.11.0+{args.profile}")
+        pip_run([producer, "-m", "pip", "wheel", "--no-build-isolation", "--prefer-binary", "--timeout", "20", "--find-links", wheels, "--wheel-dir", wheels,
+                 "-c", args.constraints, "-r", ROOT / "apps/server/requirements-vad-onnx.txt", f"torch==2.11.0+{args.profile}", f"torchaudio==2.11.0+{args.profile}"], profile=args.profile)
         if onnx_profile == "cuda":
-            run(producer, "-m", "pip", "wheel", "--only-binary=:all:", "--no-deps", "--timeout", "120",
-                "--find-links", wheels, "--wheel-dir", wheels, f"onnxruntime-gpu=={ONNX_GPU_VERSION}")
+            pip_run([producer, "-m", "pip", "wheel", "--only-binary=:all:", "--no-deps", "--timeout", "20",
+                     "--find-links", wheels, "--wheel-dir", wheels, f"onnxruntime-gpu=={ONNX_GPU_VERSION}"])
     lines, artifacts, versions = [], [], {}
     for wheel in sorted(wheels.glob("*.whl")):
         with zipfile.ZipFile(wheel) as source:
