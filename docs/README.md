@@ -56,6 +56,7 @@
 - [CAM++（声纹模型）流式验收](testing/campplus-streaming-acceptance-20261012.md)
 - [下载与首次启动修复验收](testing/download-startup-flow-20261010.md)
 - [国内镜像与原站回退验证](testing/download-sources-20261018.md)
+- [0.9.1 构建、升级与发布验证](testing/release-0.9.1-20261018.md)
 - [DSH 0.2.1-rc.2 升级与分发验收](testing/dsh-rc2-upgrade-20261017.md)
 - [本地模型计算基准](testing/local-model-compute-benchmark.md)
 - [试听后合成变慢与原生组件覆盖升级](testing/tts-preview-upgrade-20261017.md)
@@ -74,4 +75,5 @@
 ## 交付
 
 - [当前正式程序与分发安装器](releases/current-release.md)
+- [v0.9.1 国内镜像与下载改进](releases/v0.9.1.md)
 - [CAM++（声纹模型）分发与升级](releases/campplus-distribution-upgrade-20261012.md)

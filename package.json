@@ -1,9 +1,9 @@
 {
   "name": "voice-terminal",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "license": "Apache-2.0",
   "private": true,
-  "description": "本地模块化实时语音终端 v0.8",
+  "description": "本地模块化实时语音终端",
   "type": "module",
   "workspaces": [
     "apps/frontend"
