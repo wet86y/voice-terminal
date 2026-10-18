@@ -4003,7 +4003,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voice-desktop-common"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "base64 0.22.1",
  "cc",
@@ -4018,7 +4018,7 @@ dependencies = [
 
 [[package]]
 name = "voice-terminal-bootstrap"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "serde_json",
  "tauri",
@@ -4029,7 +4029,7 @@ dependencies = [
 
 [[package]]
 name = "voice-terminal-desktop"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "serde_json",
  "tauri",
@@ -4041,7 +4041,7 @@ dependencies = [
 
 [[package]]
 name = "voice-terminal-installer"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "semver",
  "serde_json",
