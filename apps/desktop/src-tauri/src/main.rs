@@ -123,7 +123,7 @@ fn frontend_capability(mode: FrontendMode, normalized_origin: &str, epoch: u64) 
     if mode == FrontendMode::UiPreview {
         serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
     } else {
-        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-export-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-download", "allow-resource-download-required", "allow-tts-selection-status", "allow-tts-selection-save","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","allow-project-open-repository","core:event:allow-listen","core:event:allow-unlisten"]})
+        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-export-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-download", "allow-resource-download-required", "allow-tts-selection-status", "allow-tts-selection-save","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","allow-project-open-repository","allow-open-minimax-voice-library","core:event:allow-listen","core:event:allow-unlisten"]})
     }
 }
 
@@ -742,6 +742,12 @@ fn emit_app_update(state:&Desktop,app:&tauri::AppHandle,payload:serde_json::Valu
 fn project_open_repository(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>)->Result<(),String>{
     require_workspace(&window,&state)?;
     voice_desktop_common::windows::open_url("https://github.com/wet86y/voice-terminal")
+}
+#[tauri::command]
+fn open_minimax_voice_library(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>)->Result<(),String>{
+    require_workspace(&window,&state)?;
+    voice_desktop_common::windows::open_url("https://solutions.minimaxi.com/voices")
+        .map_err(|_|"无法打开 MiniMax 官方音色库。".into())
 }
 #[tauri::command]
 async fn app_update_check(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>,app:tauri::AppHandle)->Result<serde_json::Value,String>{
@@ -1447,7 +1453,7 @@ fn run() -> Result<(), String> {
             desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init,
             model_credentials_status,model_credentials_save,tts_selection_status,tts_selection_save,
             resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
-            workspace_info,workspace_choose,workspace_link,workspace_migrate,app_update_check,app_update_download,app_update_cancel,project_open_repository,
+            workspace_info,workspace_choose,workspace_link,workspace_migrate,app_update_check,app_update_download,app_update_cancel,project_open_repository,open_minimax_voice_library,
             resource_inventory,resource_jobs,resource_download,resource_download_required,resource_import,resource_import_confirm,resource_open_source,resource_cancel
         ])
         .setup(move |app| {
@@ -1622,7 +1628,7 @@ mod tests {
     fn startup_credentials_are_authorized_only_for_owned_local_windows() {
         let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
         let authority = context.runtime_authority_mut(); // authority（实际编译的桌面权限解析器）。
-        for command in ["model_credentials_status", "model_credentials_save", "tts_selection_status", "tts_selection_save", "resource_download_required", "app_update_check", "app_update_download", "app_update_cancel", "project_open_repository"] {
+        for command in ["model_credentials_status", "model_credentials_save", "tts_selection_status", "tts_selection_save", "resource_download_required", "app_update_check", "app_update_download", "app_update_cancel", "project_open_repository", "open_minimax_voice_library"] {
             for window in ["main", "startup"] {
                 assert!(authority.resolve_access(command, window, window, &tauri::ipc::Origin::Local).is_some(), "启动前密钥命令缺少权限：{command}");
             }
@@ -1638,7 +1644,7 @@ mod tests {
             let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
             let authority = context.runtime_authority_mut();
             authority.add_capability(frontend_capability(mode, "http://127.0.0.1:45001", 7).to_string()).unwrap();
-            for command in ["model_credentials_status", "model_credentials_save", "tts_selection_status", "tts_selection_save", "resource_download_required", "app_update_check", "app_update_download", "app_update_cancel", "project_open_repository"] {
+            for command in ["model_credentials_status", "model_credentials_save", "tts_selection_status", "tts_selection_save", "resource_download_required", "app_update_check", "app_update_download", "app_update_cancel", "project_open_repository", "open_minimax_voice_library"] {
                 let owned = tauri::ipc::Origin::Remote { url: tauri::Url::parse("http://127.0.0.1:45001/").unwrap() }; // owned（当前实例业务页面）。
                 assert_eq!(authority.resolve_access(command, "main", "main", &owned).is_some(), mode == FrontendMode::Product);
                 assert!(authority.resolve_access(command, "startup", "startup", &owned).is_none());

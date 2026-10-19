@@ -4,7 +4,7 @@ import type {
   ProductComputeStatus,
   ProductMutationResult,
   ProductSnapshot,
-  WakeTask, ProductTtsSettings, ProductLocalTtsModelId, ProductLocalTtsStatus, ProductTtsVoice, ProductTtsAsset, ProductTtsOperation,
+  WakeTask, ProductTtsSettings, ProductLocalTtsModelId, ProductOnlineTtsModelId, ProductLocalTtsStatus, ProductTtsVoice, ProductTtsAsset, ProductTtsOperation,
 } from './types'
 
 export class ProductApiError extends Error implements ProductApiErrorShape {
@@ -120,6 +120,8 @@ export const productApi = {
   /** ttsAssetAudioUrl（参考音频地址）：沿用桌面宿主提供的语音服务地址。 */
   ttsAssetAudioUrl: (model: ProductLocalTtsModelId, asset_id: string) => `${apiBaseUrl()}/api/v1/tts/assets/${model}/${encodeURIComponent(asset_id)}/audio`,
   startTtsPreview: (model: ProductLocalTtsModelId, voice: Partial<ProductTtsVoice>, text: string) => request<ProductTtsOperation>('/api/v1/tts/operations/preview', { ...jsonBody({ model, voice, text }), method: 'POST' }),
+  /** startMinimaxTtsPreview（试听 MiniMax 在线音色）：服务端使用固定默认试音文本并通过程序播放器播放。 */
+  startMinimaxTtsPreview: (model: ProductOnlineTtsModelId, voiceId: string) => request<ProductTtsOperation>('/api/v1/tts/operations/minimax-preview', { ...jsonBody({ online_model: model, online_voice_id: voiceId }), method: 'POST' }),
   startTtsPlay: (model: ProductLocalTtsModelId, asset_id: string) => request<ProductTtsOperation>('/api/v1/tts/operations/play', { ...jsonBody({ model, asset_id }), method: 'POST' }),
   startTtsTranscribe: (model: ProductLocalTtsModelId, asset_id: string) => request<ProductTtsOperation>('/api/v1/tts/operations/transcribe', { ...jsonBody({ model, asset_id }), method: 'POST' }),
   getTtsOperation: (id: string) => request<ProductTtsOperation>(`/api/v1/tts/operations/${id}`),

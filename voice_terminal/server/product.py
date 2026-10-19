@@ -35,7 +35,8 @@ if TYPE_CHECKING:
     from ..shadow_agent.contracts import ShadowEvent
 
 
-PRODUCT_SETTINGS_SCHEMA_VERSION = 14
+PRODUCT_SETTINGS_SCHEMA_VERSION = 15
+PRODUCT_MINIMAX_TTS_MODELS = frozenset({"speech-2.8-turbo", "speech-2.8-hd"})  # MiniMax 在线模型标识允许值。
 MIN_SILENCE_SECONDS = 5
 MAX_SILENCE_SECONDS = 1800  # MAX_SILENCE_SECONDS（最长静默秒数）：30 分钟。
 MAX_PERSONA_DOCUMENT_BYTES = 64 * 1024
@@ -114,6 +115,8 @@ def _default_settings(config: AppConfig) -> dict[str, Any]:
         "approvals": {"voice_confirmation_enabled": False, "continuous_enabled": False},  # approvals（审批确认偏好）。
         # TTS（语音合成）固定走在线 API（程序接口）；backend（运行后端）不再是产品设置。
         "tts": {"backend": config.tts.backend, "local_model": config.tts.local_model,
+                "online_model": (config.tts.model if config.tts.model in PRODUCT_MINIMAX_TTS_MODELS else "speech-2.8-hd"),
+                "online_voice_id": config.tts.voice_id,
                 "local_optimization": True, "acoustic_continuation": config.tts.acoustic_continuation,
                 "inference_steps_by_model": dict(config.tts.inference_steps_by_model),
                 "active_voice_by_model": {"voxcpm1": None, "voxcpm2": None}},
@@ -184,6 +187,14 @@ def _merge_settings(defaults: dict[str, Any], value: Any, *,
     if (not isinstance(result["tts"].get("local_model"), str)
             or result["tts"].get("local_model") not in {"voxcpm1", "voxcpm2"}):
         result["tts"]["local_model"] = defaults["tts"]["local_model"]
+    if (not isinstance(result["tts"].get("online_model"), str)
+            or result["tts"].get("online_model") not in PRODUCT_MINIMAX_TTS_MODELS):
+        result["tts"]["online_model"] = defaults["tts"]["online_model"]
+    online_voice_id = result["tts"].get("online_voice_id")
+    if not isinstance(online_voice_id, str) or not online_voice_id.strip():
+        result["tts"]["online_voice_id"] = defaults["tts"]["online_voice_id"]
+    else:
+        result["tts"]["online_voice_id"] = online_voice_id.strip()
     active_voices = result["tts"].get("active_voice_by_model")
     normalized_active: dict[str, dict[str, Any] | None] = {"voxcpm1": None, "voxcpm2": None}
     if isinstance(active_voices, Mapping):
@@ -334,7 +345,7 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
         ("silence", ("seconds",)),
         ("shadow", ("experimental_context_gate_enabled",)),
         ("approvals", ("voice_confirmation_enabled", "continuous_enabled")),
-        ("tts", ("backend", "local_model", "local_optimization", "acoustic_continuation", "inference_steps_by_model", "active_voice_by_model")),
+        ("tts", ("backend", "local_model", "online_model", "online_voice_id", "local_optimization", "acoustic_continuation", "inference_steps_by_model", "active_voice_by_model")),
         ("speaker", ("mode", "confirm_threshold", "continuity_threshold", "continuity_relaxation", "owner_only_barge_in")),
     ):
         section = value.get(section_name)
@@ -365,6 +376,10 @@ def _settings_validation_warning(value: Mapping[str, Any]) -> str | None:
                 invalid = invalid or type(candidate) is not int or not MIN_KWS_SENSITIVITY <= candidate <= MAX_KWS_SENSITIVITY
             elif section_name == "tts" and field == "local_model":
                 invalid = invalid or not isinstance(candidate, str) or candidate not in {"voxcpm1", "voxcpm2"}
+            elif section_name == "tts" and field == "online_model":
+                invalid = invalid or not isinstance(candidate, str) or candidate not in PRODUCT_MINIMAX_TTS_MODELS
+            elif section_name == "tts" and field == "online_voice_id":
+                invalid = invalid or not isinstance(candidate, str) or not candidate.strip()
             elif section_name == "tts" and field == "inference_steps_by_model":
                 try:
                     validate_tts_inference_steps(candidate)
@@ -553,9 +568,17 @@ def apply_settings_to_config(config: AppConfig, settings: Mapping[str, Any]) -> 
     local_model = tts.get("local_model", config.tts.local_model)
     if not isinstance(local_model, str) or local_model not in {"voxcpm1", "voxcpm2"}:
         local_model = config.tts.local_model
+    online_model = tts.get("online_model", config.tts.model)
+    if not isinstance(online_model, str) or online_model not in PRODUCT_MINIMAX_TTS_MODELS:
+        online_model = config.tts.model
+    online_voice_id = tts.get("online_voice_id", config.tts.voice_id)
+    if not isinstance(online_voice_id, str) or not online_voice_id.strip():
+        online_voice_id = config.tts.voice_id
     next_tts = replace(
         config.tts,
         backend=backend,
+        model=online_model,
+        voice_id=online_voice_id.strip(),
         sample_rate=resolve_tts_sample_rate(backend, str(local_model), config.tts.online_sample_rate),
         provider="minimax",
         local_model=str(local_model),
@@ -664,9 +687,13 @@ class ProductSettingsStore:
 
     def save_tts_local_model(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """在运行切换成功后保存 backend（语音后端）及 local_model（本地模型）。"""
-        if not payload or set(payload) - {"backend", "local_model", "local_optimization", "acoustic_continuation", "inference_steps_by_model"}:
+        if not payload or set(payload) - {
+            "backend", "local_model", "online_model", "online_voice_id",
+            "local_optimization", "acoustic_continuation", "inference_steps_by_model",
+        }:
             raise ProductSettingsError(
-                "TTS 设置仅接受 backend（语音后端）和 local_model（本地语音合成模型）。"
+                "TTS 设置字段无效：仅接受 backend（语音后端）、online_model（在线模型）、"
+                "online_voice_id（在线音色标识）、local_model（本地语音合成模型）及本地合成参数。"
             )
         model = payload.get("local_model", self._settings["tts"]["local_model"])
         if not isinstance(model, str) or model not in {"voxcpm1", "voxcpm2"}:
@@ -686,8 +713,17 @@ class ProductSettingsStore:
         backend = payload.get("backend", previous["backend"])
         if not isinstance(backend, str) or backend not in {"minimax", "voxcpm1"}:
             raise ProductSettingsError("backend（语音后端）必须为 minimax 或 voxcpm1。")
+        online_model = payload.get("online_model", previous["online_model"])
+        if not isinstance(online_model, str) or online_model not in PRODUCT_MINIMAX_TTS_MODELS:
+            raise ProductSettingsError("online_model（在线模型）必须为 speech-2.8-turbo 或 speech-2.8-hd。")
+        online_voice_id = payload.get("online_voice_id", previous["online_voice_id"])
+        if not isinstance(online_voice_id, str) or not online_voice_id.strip():
+            raise ProductSettingsError("online_voice_id（在线音色标识）不能为空。")
+        online_voice_id = online_voice_id.strip()
         previous_version = self._settings["schema_version"]
-        self._settings["tts"] = {**previous, **dict(payload), "local_optimization": True, "local_model": model, "backend": backend,
+        self._settings["tts"] = {**previous, **dict(payload), "online_model": online_model,
+                                 "online_voice_id": online_voice_id, "local_optimization": True,
+                                 "local_model": model, "backend": backend,
                                  "inference_steps_by_model": steps}
         self._settings["schema_version"] = PRODUCT_SETTINGS_SCHEMA_VERSION
         try:

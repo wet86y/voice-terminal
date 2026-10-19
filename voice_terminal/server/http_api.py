@@ -21,7 +21,7 @@ from ..speaker.enrollment_capture import EnrollmentCaptureError
 from ..model_registry.service import ModelRegistryError, ModelRegistryService
 from ..model_registry.vault import CredentialVaultUnavailable
 from .product import (
-    ProductSettingsError, ProductSettingsStore,
+    PRODUCT_MINIMAX_TTS_MODELS, ProductSettingsError, ProductSettingsStore,
     _threshold_to_sensitivity, sanitize_runtime_snapshot,
 )
 from .snapshot import ProtocolSequencer, snapshot_event
@@ -58,6 +58,58 @@ def _speaker_relaxation(config: Any) -> float:
     """continuity_relaxation（连续主人放宽量）：保留草稿值，仅旧配置由绝对阈值推导。"""
     value = config.continuity_relaxation
     return float(value) if value is not None else min(0.20, max(0.0, config.confirm_threshold - config.continuity_threshold))
+
+
+def _minimax_voice_ids(payload: Any) -> set[str]:
+    """Collect voice_id（音色标识）values from every category in an API response."""
+    found: set[str] = set()
+    if isinstance(payload, Mapping):
+        voice_id = payload.get("voice_id")
+        if isinstance(voice_id, str) and voice_id.strip():
+            found.add(voice_id.strip())
+        for value in payload.values():
+            found.update(_minimax_voice_ids(value))
+    elif isinstance(payload, (list, tuple)):
+        for value in payload:
+            found.update(_minimax_voice_ids(value))
+    return found
+
+
+async def _validate_minimax_voice_id(runtime: Any, voice_id: str) -> None:
+    """Validate arbitrary official MiniMax voice_id（音色标识），不固定音色目录。"""
+    tts_config = runtime.config.tts
+    api_key = runtime._api_key(tts_config.api_key_env)
+    if not api_key:
+        raise HTTPException(status_code=422, detail=f"未配置 {tts_config.api_key_env}，无法查询 MiniMax 音色。")
+    base_url = str(tts_config.base_url).rstrip("/")
+    endpoint = f"{base_url}/get_voice" if base_url.endswith("/v1") else f"{base_url}/v1/get_voice"
+    try:
+        import httpx  # type: ignore
+        async with httpx.AsyncClient(timeout=12, trust_env=False) as client:
+            response = await client.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"voice_type": "all"},
+            )
+    except Exception as exc:
+        logger.warning("minimax.voice_lookup_failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="无法连接 MiniMax 音色查询接口，请检查网络后重试。") from exc
+    if response.status_code >= 400:
+        logger.warning("minimax.voice_lookup_failed status=%d", response.status_code)
+        raise HTTPException(status_code=502, detail=f"MiniMax 音色查询接口返回 HTTP {response.status_code}。")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="MiniMax 音色查询接口没有返回有效 JSON。") from exc
+    if not isinstance(payload, Mapping):
+        raise HTTPException(status_code=502, detail="MiniMax 音色查询接口返回格式无效。")
+    base_resp = payload.get("base_resp")
+    if isinstance(base_resp, Mapping):
+        status_code = base_resp.get("status_code")
+        if status_code not in (None, 0, "0"):
+            raise HTTPException(status_code=502, detail="MiniMax 音色查询接口返回业务错误。")
+    if voice_id not in _minimax_voice_ids(payload):
+        raise HTTPException(status_code=422, detail="该音色 ID 未出现在 MiniMax 官方音色查询结果中。")
 
 
 def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
@@ -803,6 +855,15 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
         manager = tts_voice_operations_or_503()
         return await start_tts_voice_operation(lambda: manager.start_preview(body.get("model"), body.get("voice"), body.get("text")))
 
+    @app.post("/api/v1/tts/operations/minimax-preview")
+    async def start_minimax_tts_preview(body: dict[str, Any]):
+        if set(body) != {"online_model", "online_voice_id"}:
+            raise HTTPException(status_code=422, detail="试听仅接受 online_model（在线模型）和 online_voice_id（在线音色标识）。")
+        manager = tts_voice_operations_or_503()
+        return await start_tts_voice_operation(
+            lambda: manager.start_minimax_preview(body["online_model"], body["online_voice_id"]),
+        )
+
     @app.post("/api/v1/tts/operations/play")
     async def start_tts_play(body: dict[str, Any]):
         return await start_tts_voice_operation(lambda: tts_voice_operations_or_503().start_play(body.get("model"), body.get("asset_id")))
@@ -836,10 +897,13 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
 
     async def apply_product_tts(body: dict[str, Any], *, after_drain: bool = False) -> dict[str, Any]:
         store = product_store_or_404()
-        if not body or set(body) - {"backend", "local_model", "local_optimization", "acoustic_continuation", "inference_steps_by_model"}:
+        if not body or set(body) - {
+            "backend", "local_model", "online_model", "online_voice_id",
+            "local_optimization", "acoustic_continuation", "inference_steps_by_model",
+        }:
             raise HTTPException(
                 status_code=422,
-                detail="TTS 设置仅接受 backend（语音后端）和 local_model（本地语音合成模型）。",
+                detail="TTS 设置包含不支持的字段。",
             )
         optimization = {field: body.get(field, getattr(runtime.config.tts, field))
                         for field in ("local_optimization", "acoustic_continuation")}
@@ -862,7 +926,24 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 status_code=422,
                 detail="local_model（本地语音合成模型）必须为 voxcpm1 或 voxcpm2。",
             )
-        if not (set(body) & {"backend", "local_model"}):
+        selection_requested = bool(set(body) & {"backend", "local_model"})
+        online_requested = bool(set(body) & {"online_model", "online_voice_id"})
+        online_settings: dict[str, str] = {}
+        online_config: dict[str, str] = {}
+        if online_requested:
+            saved_tts = store.settings_only().get("tts", {})
+            online_model = body.get("online_model", saved_tts.get("online_model", runtime.config.tts.model))
+            online_voice_id = body.get("online_voice_id", saved_tts.get("online_voice_id", runtime.config.tts.voice_id))
+            if not isinstance(online_model, str) or online_model not in PRODUCT_MINIMAX_TTS_MODELS:
+                raise HTTPException(status_code=422, detail="online_model（在线模型）必须为 speech-2.8-turbo 或 speech-2.8-hd。")
+            if not isinstance(online_voice_id, str) or not online_voice_id.strip():
+                raise HTTPException(status_code=422, detail="online_voice_id（在线音色标识）不能为空。")
+            online_voice_id = online_voice_id.strip()
+            if not after_drain:
+                await _validate_minimax_voice_id(runtime, online_voice_id)
+            online_settings = {"online_model": online_model, "online_voice_id": online_voice_id}
+            online_config = {"model": online_model, "voice_id": online_voice_id}
+        if not selection_requested and not online_requested:
             async with runtime._session_lock:
                 saved = store.save_tts_local_model(optimization)
                 if getattr(runtime, "_pending_tts_update", None) is not None:
@@ -885,7 +966,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 server = getattr(getattr(runtime.tts, "local", None), "server", None)
                 if backend == "voxcpm1" and callable(getattr(server, "model_available", None)) and not server.model_available(local_model):
                     raise HTTPException(status_code=422, detail="所选本地模型文件缺失。")
-            pending_body = {"backend": backend, "local_model": local_model, **optimization}
+            pending_body = {"backend": backend, "local_model": local_model, **optimization, **online_settings}
             saved = store.save_tts_local_model(pending_body)
             runtime._pending_tts_update = pending_body  # 多次热切换保留最新一次选择。
             if not getattr(runtime, "_tts_update_task", None) or runtime._tts_update_task.done():
@@ -906,8 +987,9 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 raise HTTPException(status_code=409, detail="TTS（语音合成）组件尚未初始化。")
             if runtime.tts_switch_busy():
                 raise HTTPException(status_code=409, detail="仍有本地 TTS 会话正在处理或播报，请结束后再切换。")
-            previous_model = runtime.config.tts.local_model
-            previous_backend = runtime.config.tts.backend
+            previous_tts_config = runtime.config.tts
+            previous_model = previous_tts_config.local_model
+            previous_backend = previous_tts_config.backend
             previous_options = {key: getattr(runtime.config.tts, key) for key in optimization}
             server = getattr(getattr(runtime.tts, "local", None), "server", None)
             refresh_status = getattr(server, "refresh_status", None)
@@ -915,6 +997,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 await refresh_status()
             current_status = runtime.local_tts_status_payload()
             if (all(getattr(runtime.config.tts, key) == value for key, value in optimization.items())
+                    and all(getattr(runtime.config.tts, key) == value for key, value in online_config.items())
                     and backend == previous_backend and local_model == previous_model
                     and runtime.state.services.get("tts") == "READY"
                     and (backend == "minimax" or current_status.get("loaded_model") == local_model)):
@@ -932,7 +1015,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             await runtime.bus.publish(runtime.snapshot())
             try:
                 # 新后端构造及预热均读取这份参数；从在线切到本地时也使用新步数。
-                runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, **optimization))
+                runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, **optimization, **online_config))
                 local_client = getattr(runtime.tts, "local", None)
                 if local_client is not None:
                     for key, value in optimization.items():
@@ -943,10 +1026,12 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 if after_drain and getattr(runtime, "_pending_tts_update", None) is not None:
                     saved = store.settings_only()["tts"]  # 后来的选择已保存，不被中间切换覆盖。
                 else:
-                    saved = store.save_tts_local_model({"backend": backend, "local_model": local_model, **optimization})
+                    saved = store.save_tts_local_model({"backend": backend, "local_model": local_model,
+                                                        **optimization, **online_settings})
                 runtime.config = replace(
                     runtime.config,
-                    tts=replace(runtime.config.tts, backend=backend, local_model=local_model, **optimization),
+                    tts=replace(runtime.config.tts, backend=backend, local_model=local_model,
+                                **optimization, **online_config),
                 )
                 runtime.state.set_service("tts", "READY")
                 runtime._local_tts_load_state = "ready" if backend == "voxcpm1" else "disabled"
@@ -954,16 +1039,14 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             except Exception as exc:
                 logger.exception("tts.selection_failed backend=%s local_model=%s", backend, local_model)
                 try:
-                    runtime.config = replace(runtime.config, tts=replace(runtime.config.tts, **previous_options))
+                    runtime.config = replace(runtime.config, tts=previous_tts_config)
                     local_client = getattr(runtime.tts, "local", None)
                     if local_client is not None:
                         for key, value in previous_options.items():
                             setattr(local_client, key, value)
                         local_client._warmed = False
                     await runtime.switch_tts_selection(previous_backend, previous_model)
-                    runtime.config = replace(runtime.config, tts=replace(
-                        runtime.config.tts, backend=previous_backend, local_model=previous_model,
-                    ))
+                    runtime.config = replace(runtime.config, tts=previous_tts_config)
                     restored = True
                 except Exception:
                     restored = False
@@ -996,7 +1079,12 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
                 continue  # 等用户当前输入结算，热切换不丢弃正在识别的问题。
             previous_listening = runtime.state.listening
             resume_listening = resume_listening or previous_listening
-            previous_selection = {"backend": runtime.config.tts.backend, "local_model": runtime.config.tts.local_model}
+            previous_selection = {
+                "backend": runtime.config.tts.backend,
+                "local_model": runtime.config.tts.local_model,
+                "online_model": runtime.config.tts.model,
+                "online_voice_id": runtime.config.tts.voice_id,
+            }
             async with runtime._session_lock:
                 if runtime.state.state.value not in {"IDLE", "ERROR", "LISTENING"} or runtime.tts_switch_busy() or getattr(runtime.controller, "_active_input", False):
                     continue
@@ -1023,6 +1111,7 @@ def create_app(runtime: SessionRuntime, *, lifespan: Any = None,
             # 等待期间修改步数/优化开关时，使用最近已保存值，防止旧排队请求覆盖热更新。
             pending_body.update({key: store.settings_only()["tts"][key] for key in (
                 "local_optimization", "acoustic_continuation", "inference_steps_by_model",
+                "online_model", "online_voice_id",
             )})
             runtime._applying_tts_selection = pending_body
             runtime._pending_tts_update = None

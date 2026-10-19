@@ -5,8 +5,10 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 from uuid import uuid4
+from ..providers.minimax_tts import MiniMaxTtsClient
 from ..tts.voices import (VoiceLibraryError, ResolvedLocalTtsVoice, safe_voice_diagnostic,
                          DESIGN_INFERENCE_STEPS, DESIGN_GENERATION_RECIPE)
+from .product import PRODUCT_MINIMAX_TTS_MODELS
 
 DESIGN_SAMPLE_TEXT = "你好，很高兴认识你。现在开始测试这个音色，我会用自然的语气清楚地说话。"
 
@@ -59,11 +61,12 @@ class TtsVoiceOperationManager:
             raise KeyError("音色操作不存在或已过期。")
         return self._items[operation_id].payload()
 
-    def _new(self, kind, request, runner):
+    def _new(self, kind, request, runner, *, require_library=True):
         self._prune()
         if self.busy:
             raise TtsVoiceOperationError("另一个音色任务正在进行，请等待或取消。")
-        self._require_library(request.get("model"))
+        if require_library:
+            self._require_library(request.get("model"))
         item = VoiceOperation(uuid4().hex, kind, dict(request))
         self._items[item.id] = item
         self._active_id = item.id
@@ -104,6 +107,105 @@ class TtsVoiceOperationManager:
         if not isinstance(voice, Mapping) or not isinstance(text, str) or not 1 <= len(text.strip()) <= 1000:
             raise TtsVoiceOperationError("音色草稿或试音正文无效，正文应为 1–1000 字。")
         return self._new("preview", {"model": model, "voice": dict(voice), "text": text.strip()}, self._preview)
+
+    def start_minimax_preview(self, model, voice_id, text=DESIGN_SAMPLE_TEXT):
+        """试听 MiniMax 在线模型和 voice_id（音色标识）的固定示例文本。"""
+        if not isinstance(model, str) or model not in PRODUCT_MINIMAX_TTS_MODELS:
+            raise TtsVoiceOperationError("online_model（在线模型）必须为 speech-2.8-turbo 或 speech-2.8-hd。")
+        if not isinstance(voice_id, str) or not voice_id.strip():
+            raise TtsVoiceOperationError("online_voice_id（在线音色标识）不能为空。")
+        if not isinstance(text, str) or not 1 <= len(text.strip()) <= 1000:
+            raise TtsVoiceOperationError("试音正文无效，正文应为 1–1000 字。")
+        return self._new("minimax_preview", {
+            "model": model, "voice_id": voice_id.strip(), "text": text.strip(),
+        }, self._minimax_preview, require_library=False)
+
+    async def _minimax_preview(self, operation):
+        config = self.runtime.config.tts
+        player = getattr(self.runtime, "player", None)
+        if player is None:
+            raise TtsVoiceOperationError("程序播放器尚未启动，无法播放试听音频。")
+        api_key = self.runtime._api_key(config.api_key_env)
+        if not api_key:
+            raise TtsVoiceOperationError(f"未配置 {config.api_key_env}，无法试听 MiniMax 音色。")
+        online_sample_rate = int(config.online_sample_rate or config.sample_rate)
+        client = MiniMaxTtsClient(
+            base_url=config.base_url,
+            websocket_path=config.websocket_path,
+            model=operation.request["model"],
+            api_key=api_key,
+            output_format="pcm",
+            sample_rate=online_sample_rate,
+            voice_id=operation.request["voice_id"],
+            timeout_ms=config.timeout_ms,
+            transport=config.transport,
+            scheduling=config.scheduling,
+            subtitle_enable=False,
+            subtitle_type=config.subtitle_type,
+            audio_cache_max_bytes=config.audio_cache_max_bytes,
+            cancel_timeout_ms=config.cancel_timeout_ms,
+            keepalive_seconds=config.keepalive_seconds,
+            emotion_mode="off",
+            default_emotion=config.default_emotion,
+            emotion_transport=config.emotion_transport,
+            session_reuse=False,
+            admission_lead_ms=config.admission_lead_ms,
+            sentence_prefetch_ms=config.sentence_prefetch_ms,
+            sentence_tick_ms=config.sentence_tick_ms,
+            sentence_min_effective_chars=config.sentence_min_effective_chars,
+            first_clause_timeout_ms=config.first_clause_timeout_ms,
+        )
+        session = client.session(fresh=True)
+        operation.session = session
+        audio = bytearray()
+
+        async def collect_audio():
+            async for chunk in session.audio_chunks():
+                audio.extend(chunk)
+                if len(audio) > online_sample_rate * 2 * 30:
+                    raise TtsVoiceOperationError("试听音频超过 30 秒，已停止播放。")
+
+        reader = None
+        player_allowed = False
+        try:
+            session = await client.start_session_with_retry(session)
+            operation.session = session
+            reader = asyncio.create_task(collect_audio(), name=f"minimax-voice-preview-reader-{operation.id[:8]}")
+            await session.send_text(operation.request["text"])
+            await session.finish()
+            await reader
+            if not audio:
+                raise TtsVoiceOperationError("MiniMax 没有返回试听音频，请检查音色 ID 后重试。")
+            import numpy as np
+            from fractions import Fraction
+            from scipy.signal import resample_poly
+            mono = np.frombuffer(bytes(audio), dtype="<i2")
+            if online_sample_rate != int(player.sample_rate):
+                ratio = Fraction(int(player.sample_rate), online_sample_rate)
+                mono = np.clip(np.rint(resample_poly(mono.astype(np.float32), ratio.numerator, ratio.denominator)),
+                               -32768, 32767).astype(np.int16)
+            if int(player.channels) == 2:
+                pcm = np.repeat(mono.reshape(-1, 1), 2, axis=1).astype("<i2", copy=False).tobytes()
+            else:
+                pcm = mono.astype("<i2", copy=False).tobytes()
+            duration = len(pcm) / max(1, int(player.sample_rate) * int(player.channels) * 2)
+            player.allow(operation.id)
+            player_allowed = True
+            player.enqueue(operation.id, pcm)
+            await player.wait_until_output_complete(timeout_seconds=max(10.0, duration * 2 + 3.0))
+            if not player.has_started(operation.id):
+                raise TtsVoiceOperationError("试听音频未从当前输出设备播放，请检查静音策略或设备状态。")
+            return {"duration_ms": round(duration * 1000), "voice_id": operation.request["voice_id"]}
+        except BaseException:
+            if reader is not None:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+            if player is not None and player_allowed:
+                player.stop_and_snapshot(operation.id)
+            raise
+        finally:
+            operation.session = None
+            await session.close()
 
     def start_play(self, model, asset_id):
         self._require_library(model).asset_path(asset_id)
