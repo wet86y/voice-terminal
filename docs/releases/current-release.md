@@ -1,20 +1,20 @@
 # 正式程序与分发安装器交付
 
-产品版本 `0.9.2`（产品版本）于 **2026-10-18 20:10:46（香港时间）**发布，使用 `build`（构建编号）区分正式构建。发行标签 [`v0.9.2`](https://github.com/wet86y/voice-terminal/releases/tag/v0.9.2) 指向源码提交 [`702ddae0754ff4bf507a2f7e78b9871387a57596`](https://github.com/wet86y/voice-terminal/commit/702ddae0754ff4bf507a2f7e78b9871387a57596)，当前公开 latest（最新发行）更新入口返回 0.9.2。
+产品版本 `0.9.3`（产品版本）于 **2026-10-19 20:32:57（香港时间）**发布，使用 `build`（构建编号）区分正式构建。发行标签 [`v0.9.3`](https://github.com/wet86y/voice-terminal/releases/tag/v0.9.3) 指向源码提交 [`337b36e9dd10ada6119d2893838c8fb3e14e1423`](https://github.com/wet86y/voice-terminal/commit/337b36e9dd10ada6119d2893838c8fb3e14e1423)，公开 latest（最新发行）更新入口已返回 0.9.3。
 
-| 交付项目 | 0.9.2 已发布值 |
+| 交付项目 | 0.9.3 已发布值 |
 | --- | --- |
-| 程序包构建编号 | `product-0785d0460f659389`，347 个固定文件 |
-| 程序包大小 | 103,345,330 字节 |
-| 程序包 SHA-256（完整文件摘要） | `1c0aae2b2a575ccb4725ff243d8f21a9dcb414c1042ac274904619b2b44173e5` |
-| 分发安装器大小 | 112,715,776 字节 |
-| 安装器 SHA-256（完整文件摘要） | `3f4870ad196d1e519df1935beaa928a05b9b1fb77d195dd8bc109c479c72320d` |
-| delivery.json（交付记录） SHA-256 | `a7db8743f4693b3df11bd90e220752821b0a584d9562d01b564b89fb6531c4c8` |
-| update.json（更新清单） SHA-256 | `cabbecae9e07e4cb2287dc6cd6330f4afdfdde6986864b49fba4316d3572e1fb` |
-| SHA256SUMS.txt（摘要列表） SHA-256 | `9b4166a378b5e6c31ab06ebb3eecbfc55d43ea58af48a06629a736c0753b8e3a` |
+| 程序包构建编号 | `product-4bd00c49aff3e1f3`，347 个固定文件 |
+| 程序包大小 | 103,513,901 字节 |
+| 程序包 SHA-256（完整文件摘要） | `cf7fedc4e9cdf26c560b6b258c35812c5cb9e905f3d1e6feb30dcb68cffedd08` |
+| 分发安装器大小 | 112,884,224 字节 |
+| 安装器 SHA-256（完整文件摘要） | `08fad57bd8ab807fcaa72d9d07f1c3ad763c2e25cba05a883d2659d51c5aea49` |
+| delivery.json（交付记录） SHA-256 | `6fce2c280d27c131bb5d7d143e5997cc5eea4c9c036efefb6f234934a7059d43` |
+| update.json（更新清单） SHA-256 | `506f7e1cdba49059010f997839fc6176813637299e315e7e8e136814db23bc5f` |
+| SHA256SUMS.txt（摘要列表） SHA-256 | `cebae226a3457999674f9cb5fcd1adb191aa6c77c8bcb4a13dbb44cdf7397bf6` |
 | 安装器构建方式 | 优化构建，`qualification=false`（隔离验收开关关闭） |
 
-四项资产均从公开直链回下载并与本机文件逐项核对完整 SHA-256（文件摘要）；GitHub（代码托管平台）记录的大小和摘要、更新清单中的安装器版本与摘要，以及公开 latest 更新入口均已核验。本机正式程序已安装为同一构建编号。构建、安装、测试和公开核验记录见[0.9.2 发布验收](../testing/release-0.9.2-20261018.md)，发行说明见[v0.9.2](v0.9.2.md)。
+本机正式程序和分发安装器共用同一程序包；本机安装显示版本与构建编号均为 `0.9.3` 和 `product-4bd00c49aff3e1f3`。四项资产均从公开发行回下载并与本机文件逐项核对完整 SHA-256（文件摘要）；GitHub（代码托管平台）记录的大小和摘要、更新清单中的安装器版本与摘要，以及公开 latest 更新入口均已核验。构建、安装、专项测试和公开核验记录见[0.9.3 发布验收](../testing/release-0.9.3-20261019.md)，发行说明见[v0.9.3](v0.9.3.md)。上一版交付记录见[0.9.2 发布验收](../testing/release-0.9.2-20261018.md)。
 
 程序和安装器的结构、组件门槛与恢复规则见[统一正式程序与分发安装器](../guides/unified-product-installer.md)。测试命令、重建步骤和用户验收顺序统一放在[测试入口](../testing/operations-and-quality.md)；历史专项证据按主题收录于[测试目录](../README.md#测试)。
 
