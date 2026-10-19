@@ -212,7 +212,7 @@ class LlmConfig:
     # capability set for backwards compatibility.  YAML/product loading
     # supplies the model-specific policy explicitly.
     allowed_reasoning: tuple[str, ...] = REASONING_EFFORTS
-    timeout_ms: int = 15000
+    timeout_ms: int = 30000  # timeout_ms（模型响应读取超时，毫秒）。
     transport: str = "chat_completions"
     max_output_tokens: int = 393216
     protocol_recovery_limit: int = 1
@@ -1023,7 +1023,7 @@ class AppConfig:
                 allowed_reasoning=_reasoning_levels(
                     llm.get("allowed_reasoning"), ("off", "low"),
                 ),
-                timeout_ms=int(_number(llm.get("timeout_ms"), 15000)),
+                timeout_ms=int(_number(llm.get("timeout_ms"), 30000)),  # timeout_ms（模型响应读取超时，毫秒）。
                 transport=_string(llm.get("transport"), "chat_completions"),
                 max_output_tokens=int(_number(llm.get("max_output_tokens"), 393216)),
                 protocol_recovery_limit=max(0, int(_number(llm.get("protocol_recovery_limit"), 1))),

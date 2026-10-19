@@ -93,23 +93,18 @@ class ProductSettingsRuntimeMixin:
             self.startup_errors.append(f"product_settings: {str(exc)[:300]}")
             return False
 
-    async def refresh_prompt_settings(self) -> None:
-        """refresh_prompt_settings（更新人格与指令）：后续模型请求直接读取新快照。"""
+    async def refresh_custom_instruction_settings(self) -> None:
+        """refresh_custom_instruction_settings（刷新自定义指令）：资料文档仅在新会话载入。"""
         store = self.product_settings
         if store is None:
             return
-        documents = await asyncio.to_thread(store.read_persona)
         instructions = store.settings_only().get("custom_instructions", [])
         async with self._session_lock:
             self._instruction_snapshot = [dict(item) for item in instructions]
-            self._shadow_user_profile = documents.get("user", "")
+            # 保留当前会话已冻结的用户资料；人格文档由新会话从磁盘读取。
             self.shadow_context.set_product_context(self._shadow_user_profile, self._instruction_snapshot)
             episode = getattr(self.controller, "episode", None)
             if episode is not None:
-                from ..agent.persona import PersonaDocuments
-                episode.refresh_prompt_settings(
-                    PersonaDocuments(personality=documents.get("personality", ""), user=self._shadow_user_profile),
-                    self._instruction_snapshot,
-                )
+                episode.refresh_custom_instructions(self._instruction_snapshot)
             self._persist_voice_identity()
             await self.bus.publish(self.snapshot())

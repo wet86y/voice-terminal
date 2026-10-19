@@ -736,13 +736,10 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
             result.append(item)
         return result
 
-    def refresh_prompt_settings(self, documents, instructions) -> None:
-        """refresh_prompt_settings（显式刷新）：仅授权保存操作可更新固定指令前缀。"""
-        if (self.persona_documents.personality == documents.personality
-                and self.persona_documents.user == documents.user
-                and self.custom_instructions == instructions):
+    def refresh_custom_instructions(self, instructions) -> None:
+        """refresh_custom_instructions（刷新自定义指令）：人格与资料只在新会话读取。"""
+        if self.custom_instructions == instructions:
             return
-        self.persona_documents = documents
         self.custom_instructions = [dict(item) for item in instructions]
         # 后续请求重新计算前缀摘要；已经派发的请求保留其独立消息副本。
         # 历史前缀与动作目录的稳定性校验继续保留。
@@ -765,7 +762,7 @@ class AgentEpisodeRuntime(ScreenInputMixin, DeferredSpeechMixin, AgentContextMix
         # the scheduler's only activation authority.
         if text is not None and not isinstance(text, str):
             return None
-        # 首次激活加载文档；显式保存通过 refresh_prompt_settings（刷新提示设置）更新快照。
+        # 首次激活加载文档；保存修订只写磁盘，由新会话读取，当前快照保持不变。
         self.persona_documents = (
             self.persona_loader.load()
             if self.persona_loader is not None

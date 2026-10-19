@@ -1131,7 +1131,7 @@ export function useProductAdapter(options: { webSocketUrl?: string } = {}) {
       try {
         const result = await productApi.savePersona({ ...personaDocuments })
         updateSettingsFromResponse(settings, result)
-        setNotice(result.message || '人格与用户资料已保存，后续模型请求立即使用新内容。')
+        setNotice(result.message || '人格与用户资料已保存；新会话开始后生效。')
       } catch (error) {
         setError(error)
       } finally {

@@ -367,8 +367,8 @@ export interface ProductSnapshot {
 
 export interface ProductMutationResult {
   settings?: ProductSettingsSnapshot | Record<string, unknown>
-  effective_from?: 'immediate' | 'components_ready' | 'next_request' | 'retry_required' | 'application_restart' | string // 生效时机：即时、加载结束、后续请求、重试或重启。
-  pending?: boolean
+  effective_from?: 'immediate' | 'components_ready' | 'next_request' | 'next_session' | 'retry_required' | 'application_restart' | string // effective_from（生效时机）：即时、加载结束、后续请求、新会话、重试或重启。
+  pending?: boolean // pending（待生效标记）：设置已保存但尚未作用于当前会话。
   /** restart_required（需要重启）：修改计算设备后必须重启整个应用。 */
   restart_required?: boolean
   message?: string

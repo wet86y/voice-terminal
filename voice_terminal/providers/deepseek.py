@@ -111,7 +111,7 @@ class DeepSeekClient:
         provider: str = "deepseek",
         api_key_env: str = "DEEPSEEK_API_KEY",
         session_id: str | None = None,
-        timeout_ms: int = 15000,
+        timeout_ms: int = 30000,
         thinking: str = "disabled",
         reasoning_effort: str = "low",
         allowed_reasoning: Sequence[str] | None = None,
