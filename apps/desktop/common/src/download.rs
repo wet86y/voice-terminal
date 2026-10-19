@@ -1,5 +1,5 @@
 //! Native download（原生下载）：静态 C ABI（C 调用接口）与固定摘要。
-use std::{ffi::{CString, c_void}, path::{Path,PathBuf}, sync::{mpsc,Arc,Mutex,Condvar, atomic::{AtomicBool,AtomicU64,AtomicUsize, Ordering}},time::Duration};
+use std::{ffi::{CString, c_void}, path::{Path,PathBuf}, sync::{mpsc,Arc,Mutex,Condvar, atomic::{AtomicBool,AtomicUsize, Ordering}},time::Duration};
 use serde::{Serialize, Deserialize};
 use base64::Engine;
 
@@ -18,13 +18,45 @@ unsafe extern "C" fn cancel_check(context:*const c_void)->i32{
     i32::from(unsafe{&*(context as *const AtomicBool)}.load(Ordering::Acquire))
 }
 const MAX_DOWNLOADS:usize=4; // MAX_DOWNLOADS（全局并行传输上限）：所有组件共享四个下载通道。
-pub const BATCH_DOWNLOAD_PROGRESS_PREFIX:&str="批量下载进度："; // BATCH_DOWNLOAD_PROGRESS_PREFIX（批量下载进度标记）：前端展示独立下载进度条。
-pub const BATCH_VERIFY_PROGRESS_PREFIX:&str="批量校验进度："; // BATCH_VERIFY_PROGRESS_PREFIX（批量校验进度标记）：前端展示独立摘要校验进度条。
+std::thread_local!{static RESOURCE_ATTEMPT:std::cell::Cell<Option<u32>>=const{std::cell::Cell::new(None)};}
+/// current_attempt（资源处理轮次）：统一来源回退与任务恢复，避免嵌套重试。
+pub fn current_attempt()->Option<u32>{RESOURCE_ATTEMPT.with(|value|value.get())}
+pub fn with_attempt<T>(attempt:Option<u32>,operation:impl FnOnce()->T)->T{
+    struct Restore(Option<u32>);
+    impl Drop for Restore{fn drop(&mut self){RESOURCE_ATTEMPT.with(|value|value.set(self.0));}}
+    let _restore=Restore(RESOURCE_ATTEMPT.with(|value|value.replace(attempt)));operation()
+}
+pub const BATCH_DOWNLOAD_PROGRESS_PREFIX:&str="批量下载进度："; // BATCH_DOWNLOAD_PROGRESS_PREFIX（批量下载阶段标记）。
+pub const BATCH_VERIFY_PROGRESS_PREFIX:&str="批量校验进度："; // BATCH_VERIFY_PROGRESS_PREFIX（批量校验阶段标记）。
+#[derive(PartialEq)]
+enum DownloadErrorKind { Source, Local, Cancelled, Permanent } // DownloadErrorKind（来源、本地、取消及不可恢复错误）。
+struct DownloadError { kind:DownloadErrorKind,message:String } // DownloadError（分类传输错误）。
+impl From<String> for DownloadError{fn from(message:String)->Self{Self{kind:DownloadErrorKind::Permanent,message}}}
+impl From<&str> for DownloadError{fn from(message:&str)->Self{message.to_owned().into()}}
+
+/// target_lock（目标互斥）：跨进程协调同一路径，等待锁不占网络通道，也不污染模型目录。
+fn target_lock(target:&Path,cancel:&AtomicBool,callback:&mut dyn FnMut(&str,u64,u64))->Result<std::fs::File,String>{
+    use sha2::{Digest,Sha256};
+    let absolute=std::path::absolute(target).map_err(|_|"下载目标路径无效")?;
+    let directory=std::env::temp_dir().join("voice-terminal-download-locks");
+    std::fs::create_dir_all(&directory).map_err(|_|"下载协调目录不可写")?;
+    let key=format!("{:x}",Sha256::digest(absolute.to_string_lossy().replace('\\',"/").to_lowercase().as_bytes()));
+    loop{
+        if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}
+        let mut options=std::fs::OpenOptions::new();options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)] {use std::os::windows::fs::OpenOptionsExt;options.share_mode(0);}
+        match options.open(directory.join(&key)){
+            Ok(file)=>return Ok(file),
+            Err(error) if matches!(error.raw_os_error(),Some(32|33))=>{callback("等待同一下载文件释放",0,0);std::thread::sleep(Duration::from_millis(100));},
+            Err(_)=>return Err("下载协调文件不可写，请检查目录权限。".into()),
+        }
+    }
+}
 static DOWNLOAD_SLOTS:Mutex<usize>=Mutex::new(0);
 static DOWNLOAD_CHANGED:Condvar=Condvar::new();
-struct DownloadSlot; // DownloadSlot（下载通道租约）：失败和取消也归还通道。
+pub(crate) struct DownloadSlot; // DownloadSlot（下载通道租约）：失败和取消也归还通道。
 impl Drop for DownloadSlot{fn drop(&mut self){if let Ok(mut count)=DOWNLOAD_SLOTS.lock(){*count=count.saturating_sub(1);DOWNLOAD_CHANGED.notify_one();}}}
-fn acquire_slot(cancel:&AtomicBool,callback:&mut dyn FnMut(&str,u64,u64))->Result<DownloadSlot,String>{
+pub(crate) fn acquire_slot(cancel:&AtomicBool,callback:&mut dyn FnMut(&str,u64,u64))->Result<DownloadSlot,String>{
     let mut count=DOWNLOAD_SLOTS.lock().map_err(|_|"下载通道状态不可用。")?;
     while *count>=MAX_DOWNLOADS{
         if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}
@@ -47,7 +79,7 @@ struct Progress<'a> {
 }
 unsafe extern "C" fn progress(context: *mut c_void, phase:i32, current: u64, total: u64) -> i32 {
     let state = unsafe { &mut *(context as *mut Progress<'_>) };
-    (state.callback)(match phase{2=>"校验下载文件",3=>"启用已校验缓存",4=>"校验现有下载缓存",_=>"下载固定资源"},current, total);
+    (state.callback)(match phase{2=>"校验下载文件",3=>"提交已校验下载缓存",4=>"校验现有下载缓存",_=>"下载固定资源"},current, total);
     i32::from(state.cancel.load(Ordering::Acquire))
 }
 
@@ -57,13 +89,16 @@ pub fn download(file: &DownloadFile, target: &Path, cancel: Arc<AtomicBool>,
 }
 /// download_with_progress（分阶段下载）：网络、缓存完整摘要和启用阶段均有进度与取消。
 pub fn download_with_progress(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,callback:&mut dyn FnMut(&str,u64,u64),probe_limit:u64)->Result<u64,String>{
+    let _target=target_lock(target,&cancel,callback)?;
     let _slot=acquire_slot(&cancel,callback)?;
     download_candidates(file,target,cancel,callback,probe_limit,&crate::download_sources::candidates(&file.url))
 }
 /// download_candidates（有序回退）：大小与摘要决定断点身份，来源失败不改写内容锁。
 fn download_candidates(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,callback:&mut dyn FnMut(&str,u64,u64),probe_limit:u64,sources:&[String])->Result<u64,String>{
     let mut errors=vec![];
-    for source in sources {
+    let selected=current_attempt().map(|attempt|attempt.saturating_sub(1) as usize%sources.len().max(1));
+    for (index,source) in sources.iter().enumerate() {
+        if selected.is_some_and(|selected|selected!=index){continue;}
         if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}
         let host=crate::download_sources::host(source);
         callback(&format!("下载来源：{host}"),0,file.size);
@@ -72,14 +107,15 @@ fn download_candidates(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,ca
             Ok(value)=>return Ok(value),
             Err(error)=>{
                 if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}
-                callback(&format!("来源 {host} 失败，尝试备用来源：{error}"),0,file.size);
-                errors.push(format!("{host}：{error}"));
+                if error.kind!=DownloadErrorKind::Source{return Err(error.message);}
+                callback(&format!("来源 {host} 失败，{}：{}",if selected.is_some(){"本轮结束，等待任务恢复"}else{"尝试备用来源"},error.message),0,file.size);
+                errors.push(format!("{host}：{}",error.message));
             }
         }
     }
-    Err(format!("所有下载来源均失败：{}",errors.join("；")))
+    Err(format!("{}：{}",if selected.is_some(){"本轮下载来源失败"}else{"所有下载来源均失败"},errors.join("；")))
 }
-fn download_one(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,callback:&mut dyn FnMut(&str,u64,u64),probe_limit:u64)->Result<u64,String>{
+fn download_one(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,callback:&mut dyn FnMut(&str,u64,u64),probe_limit:u64)->Result<u64,DownloadError>{
     if !(file.url.starts_with("https://") || (cfg!(feature="qualification") && file.url.starts_with("http://127.0.0.1:"))) {
         return Err("资源来源必须为 HTTPS（加密传输），验收配置允许本机测试源。".into());
     }
@@ -103,7 +139,7 @@ fn download_one(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,callback:
             probe_limit.min(65536), progress, &mut state as *mut _ as *mut c_void, cancel_check, Arc::as_ptr(&state.cancel) as *const c_void, message.as_mut_ptr(), message.len()) };
         if result < 0 {
             let bytes: Vec<_> = message.iter().take_while(|v| **v != 0).map(|v| *v as u8).collect();
-            return Err(String::from_utf8_lossy(&bytes).to_string());
+            return Err(DownloadError{kind:match result{-2=>DownloadErrorKind::Local,-3=>DownloadErrorKind::Cancelled,-4=>DownloadErrorKind::Permanent,_=>DownloadErrorKind::Source},message:String::from_utf8_lossy(&bytes).to_string()});
         }
         Ok(result as u64)
     }
@@ -112,50 +148,72 @@ fn download_one(file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,callback:
 
 /// download_batch（有界批量下载）：依赖与模型文件共用全局通道，回调只在调用线程执行。
 pub fn download_batch(files:&[(DownloadFile,PathBuf)],cancel:Arc<AtomicBool>,callback:&mut dyn FnMut(&str,u64,u64))->Result<(),String>{
+    let attempt=current_attempt();
     let total=files.iter().try_fold(0u64,|sum,(file,_)|sum.checked_add(file.size).ok_or("下载大小溢出"))?;
-    let next=AtomicUsize::new(0);let downloaded=AtomicU64::new(0);let verified=AtomicU64::new(0);let checked=AtomicUsize::new(0);let stop=AtomicBool::new(false);
-    let latest_stage=Mutex::new(false); // latest_stage（最近报告阶段）：false 为下载，true 为摘要校验。
-    let source_status=Mutex::new(String::new()); // source_status（实际来源及切换原因）：投影到批量任务阶段。
+    #[derive(Clone,Default)]
+    struct FileProgress { downloaded:u64,verified:u64,transferred:bool,cached:bool } // FileProgress（单文件阶段计数）。
+    let next=AtomicUsize::new(0);let checked=AtomicUsize::new(0);let stop=AtomicBool::new(false);
+    let states=Mutex::new(vec![FileProgress::default();files.len()]);
+    let source_status=Mutex::new(String::new()); // source_status（实际来源及切换原因）。
     let failure=Mutex::new(None::<String>);let (sender,receiver)=mpsc::channel();let count=files.len().min(MAX_DOWNLOADS);
-    let transfer_cancel=Arc::new(AtomicBool::new(cancel.load(Ordering::Acquire))); // transfer_cancel（内部取消）：失败时收集其余传输线程，不改写用户取消状态。
-    callback(&format!("{BATCH_DOWNLOAD_PROGRESS_PREFIX}准备下载（0 / {} 个文件）",files.len()),0,total);
+    let transfer_cancel=Arc::new(AtomicBool::new(cancel.load(Ordering::Acquire)));
+    let mut verification_started=false; // verification_started（整体已进入校验）：重下时明确说明重试。
+    callback("准备固定资源下载清单",0,0);
     std::thread::scope(|scope|{
         let mut workers=vec![];
-        for _ in 0..count{let sender=sender.clone();let next=&next;let downloaded=&downloaded;let verified=&verified;let checked=&checked;let stop=&stop;let failure=&failure;let cancel=cancel.clone();let transfer_cancel=transfer_cancel.clone();let latest_stage=&latest_stage;let source_status=&source_status;
+        for _ in 0..count{
+            let sender=sender.clone();let next=&next;let checked=&checked;let stop=&stop;let failure=&failure;
+            let cancel=cancel.clone();let transfer_cancel=transfer_cancel.clone();let states=&states;let source_status=&source_status;
             workers.push(scope.spawn(move||{
-                let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{
-                    loop{if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}if stop.load(Ordering::Acquire){break;}
-                        let index=next.fetch_add(1,Ordering::Relaxed);let Some((file,target))=files.get(index)else{break;};let mut downloaded_reported=0;let mut verified_reported=0;
+                let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||with_attempt(attempt,||{
+                    loop{
+                        if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}
+                        if stop.load(Ordering::Acquire){break;}
+                        let index=next.fetch_add(1,Ordering::Relaxed);let Some((file,target))=files.get(index)else{break;};
                         download_with_progress(file,target,transfer_cancel.clone(),&mut|phase,current,_|{
-                            if phase.starts_with("下载来源：")||phase.starts_with("来源 "){if let Ok(mut status)=source_status.lock(){*status=phase.to_owned();}return;}
-                            let (download_current,verify_current,is_verifying)=match phase{
-                                "校验下载文件"=>(file.size,current.min(file.size),true),
-                                "启用已校验缓存"=>(file.size,file.size,true),
-                                "校验现有下载缓存"=>(file.size,current.min(file.size),true),
-                                _=>(current.min(file.size),0,false),
-                            };
-                            let download_current=download_current.max(downloaded_reported);
-                            downloaded.fetch_add(download_current-downloaded_reported,Ordering::Relaxed);downloaded_reported=download_current;
-                            let verify_current=verify_current.max(verified_reported);
-                            verified.fetch_add(verify_current-verified_reported,Ordering::Relaxed);verified_reported=verify_current;
-                            if let Ok(mut stage)=latest_stage.lock(){*stage=is_verifying;}
-                        },0)?;checked.fetch_add(1,Ordering::Relaxed);
+                            if phase.starts_with("下载来源：")||phase.starts_with("来源 "){
+                                if let Ok(mut status)=source_status.lock(){*status=phase.to_owned();}return;
+                            }
+                            if let Ok(mut rows)=states.lock(){let row=&mut rows[index];match phase{
+                                "校验现有下载缓存"=>{row.cached=true;row.transferred=true;row.verified=current.min(file.size);},
+                                "校验下载文件"=>{row.transferred=true;row.downloaded=file.size;row.verified=current.min(file.size);},
+                                "提交已校验下载缓存"=>{row.transferred=true;row.verified=file.size;},
+                                "下载固定资源"=>{row.cached=false;row.downloaded=current.min(file.size);row.transferred=current>=file.size;row.verified=0;},
+                                _=>{},
+                            }}
+                        },0)?;
+                        if let Ok(mut rows)=states.lock(){rows[index].transferred=true;rows[index].verified=file.size;}
+                        checked.fetch_add(1,Ordering::Relaxed);
                     }Ok::<(),String>(())
-                })).unwrap_or_else(|_|Err("下载工作线程异常退出，断点已保留。".into()));
-                if let Err(error)=result{let mut failure=failure.lock().unwrap();if failure.is_none(){*failure=Some(error);}stop.store(true,Ordering::Release);}let _=sender.send(());
+                }))).unwrap_or_else(|_|Err("下载工作线程异常退出，断点已保留。".into()));
+                if let Err(error)=result{if let Ok(mut failure)=failure.lock(){if failure.is_none(){*failure=Some(error);}}stop.store(true,Ordering::Release);}
+                let _=sender.send(());
             }));
         }
         drop(sender);let mut finished=0;
-        while finished<count{match receiver.recv_timeout(Duration::from_millis(100)){Ok(())=>finished+=1,Err(mpsc::RecvTimeoutError::Timeout)=>{},Err(mpsc::RecvTimeoutError::Disconnected)=>break}
+        while finished<count{
+            match receiver.recv_timeout(Duration::from_millis(100)){Ok(())=>finished+=1,Err(mpsc::RecvTimeoutError::Timeout)=>{},Err(mpsc::RecvTimeoutError::Disconnected)=>break}
             if cancel.load(Ordering::Acquire)||stop.load(Ordering::Acquire){transfer_cancel.store(true,Ordering::Release);}
-            let completed=checked.load(Ordering::Relaxed);let is_verifying=latest_stage.lock().map(|stage|*stage).unwrap_or(false);
-            if is_verifying{callback(&format!("{BATCH_VERIFY_PROGRESS_PREFIX}校验下载文件（{} / {} 个文件）",completed,files.len()),verified.load(Ordering::Relaxed).min(total),total);}
-            else{let source=source_status.lock().map(|value|value.clone()).unwrap_or_default();callback(&format!("{BATCH_DOWNLOAD_PROGRESS_PREFIX}下载固定资源（{} / {} 个文件） {source}",completed,files.len()),downloaded.load(Ordering::Relaxed).min(total),total);}}
+            let completed=checked.load(Ordering::Relaxed);
+            let rows=states.lock().unwrap();
+            if rows.iter().all(|row|row.transferred){
+                if !verification_started{
+                    let network_total=rows.iter().zip(files).filter(|(row,_)|!row.cached).map(|(_, (file,_))|file.size).sum::<u64>();
+                    if network_total>0{callback(&format!("{BATCH_DOWNLOAD_PROGRESS_PREFIX}下载完成"),network_total,network_total);}
+                }
+                verification_started=true;
+                callback(&format!("{BATCH_VERIFY_PROGRESS_PREFIX}校验下载文件（{completed} / {} 个文件）",files.len()),rows.iter().map(|row|row.verified).sum::<u64>().min(total),total);
+            }else{
+                let downloaded=rows.iter().filter(|row|!row.cached).map(|row|row.downloaded).sum();
+                let network_total=rows.iter().zip(files).filter(|(row,_)|!row.cached).map(|(_, (file,_))|file.size).sum();
+                let source=source_status.lock().map(|value|value.clone()).unwrap_or_default();
+                callback(&format!("{BATCH_DOWNLOAD_PROGRESS_PREFIX}{}（{completed} / {} 个文件） {source}",if verification_started{"校验未通过，重新下载"}else{"下载固定资源"},files.len()),downloaded,network_total);
+            }
+        }
         for worker in workers{if worker.join().is_err(){*failure.lock().unwrap()=Some("下载工作线程异常退出，断点已保留。".into());}}
     });
     if cancel.load(Ordering::Acquire){return Err("任务已取消，断点已保留。".into());}
     if let Some(error)=failure.into_inner().map_err(|_|"下载状态不可用。")?{return Err(error);}
-    callback(&format!("{BATCH_DOWNLOAD_PROGRESS_PREFIX}下载完成（{} / {} 个文件）",files.len(),files.len()),total,total);
     callback(&format!("{BATCH_VERIFY_PROGRESS_PREFIX}摘要校验完成（{} / {} 个文件）",files.len(),files.len()),total,total);Ok(())
 }
 
@@ -163,6 +221,52 @@ pub fn download_batch(files:&[(DownloadFile,PathBuf)],cancel:Arc<AtomicBool>,cal
 mod tests {
     use super::*;
     use std::{fs, io::{Read, Write}, net::TcpListener};
+
+    #[test]
+    fn concurrent_same_target_reuses_one_transfer_and_can_cancel_waiter(){
+        let root=std::env::temp_dir().join(format!("voice-download-mutex-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
+        let target=root.join("shared.bin");let held=target_lock(&target,&AtomicBool::new(false),&mut|_,_,_|{}).unwrap();
+        let cancel=AtomicBool::new(false);let mut waited=false;
+        let error=target_lock(&target,&cancel,&mut|phase,_,_|{waited=phase.contains("等待");cancel.store(true,Ordering::Release);}).unwrap_err();
+        assert!(waited&&error.contains("取消"));drop(held);
+        let body=b"one verified shared download";let listener=TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move||{
+            let(mut socket,_)=listener.accept().unwrap();let mut request=[0;4096];socket.read(&mut request).unwrap();
+            write!(socket,"HTTP/1.1 206 OK\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",body.len(),body.len()-1,body.len()).unwrap();socket.write_all(body).unwrap();
+        });
+        let file=DownloadFile{url:format!("http://{address}/shared.bin"),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new(),path:"shared.bin".into()};
+        std::thread::scope(|scope|{let first=scope.spawn(||download_with_progress(&file,&target,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},0));
+            let second=scope.spawn(||download_with_progress(&file,&target,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},0));
+            assert!(first.join().unwrap().is_ok());assert!(second.join().unwrap().is_ok());});
+        server.join().unwrap();assert_eq!(fs::read(&target).unwrap(),body);fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn locked_local_promotion_does_not_retry_other_sources(){
+        let root=std::env::temp_dir().join(format!("voice-download-local-error-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
+        let target=root.join("same.bin");let part=target.with_extension("bin.part");let body=b"verified complete partial";
+        let file=DownloadFile{url:"http://127.0.0.1:1/same.bin".into(),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new(),path:"same.bin".into()};
+        fs::write(&part,body).unwrap();fs::write(target.with_extension("bin.part.identity"),format!("{}:sha256:{}",file.size,file.sha256)).unwrap();
+        let held=fs::OpenOptions::new().read(true).share_mode(3).open(&part).unwrap();let mut sources=0;
+        let error=download_candidates(&file,&target,Arc::new(AtomicBool::new(false)),&mut|phase,_,_|{if phase.starts_with("下载来源："){sources+=1;}},0,&[file.url.clone(),"http://127.0.0.1:2/same.bin".into()]).unwrap_err();
+        assert_eq!(sources,1);assert!(!error.contains("所有下载来源"));assert!(part.exists());drop(held);fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_identity_discards_stale_partial_and_preserves_old_target_until_verified(){
+        let root=std::env::temp_dir().join(format!("voice-download-upgrade-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
+        let target=root.join("upgrade.bin");let body=b"new verified component";let old=b"old working component";
+        fs::write(&target,old).unwrap();fs::write(target.with_extension("bin.part"),b"stale partial from other version").unwrap();
+        fs::write(target.with_extension("bin.part.identity"),"old size and digest").unwrap();
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();
+        let server=std::thread::spawn(move||{let(mut socket,_)=listener.accept().unwrap();let mut request=[0;4096];socket.read(&mut request).unwrap();
+            write!(socket,"HTTP/1.1 206 OK\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",body.len(),body.len()-1,body.len()).unwrap();socket.write_all(body).unwrap();});
+        let file=DownloadFile{url:format!("http://{address}/upgrade.bin"),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new(),path:"upgrade.bin".into()};
+        let mut verified_before_replace=false;
+        download_with_progress(&file,&target,Arc::new(AtomicBool::new(false)),&mut|phase,_,_|{if phase=="校验下载文件"{assert_eq!(fs::read(&target).unwrap(),old);verified_before_replace=true;}},0).unwrap();
+        server.join().unwrap();assert!(verified_before_replace);assert_eq!(fs::read(&target).unwrap(),body);
+        assert!(!target.with_extension("bin.part.identity").exists());fs::remove_dir_all(root).unwrap();
+    }
     use sha2::{Digest, Sha256};
     use std::{os::windows::fs::OpenOptionsExt, time::Duration};
 
@@ -184,6 +288,23 @@ mod tests {
         let cancelled=Arc::new(AtomicBool::new(true));let mut called=false;
         assert!(download_candidates(&file,&target,cancelled,&mut|_,_,_|called=true,0,&sources).is_err());assert!(!called);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_source_recovery_uses_one_source_per_round(){
+        let root=std::env::temp_dir().join(format!("voice-source-round-{}",crate::workspace::new_id()));fs::create_dir_all(&root).unwrap();
+        let body=b"verified recovery";let listener=TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();
+        let called=Arc::new(AtomicBool::new(false));let seen=called.clone();
+        let server=std::thread::spawn(move||{let(mut socket,_)=listener.accept().unwrap();seen.store(true,Ordering::Release);
+            let mut request=[0;4096];socket.read(&mut request).unwrap();
+            write!(socket,"HTTP/1.1 206 OK\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",body.len(),body.len()-1,body.len()).unwrap();socket.write_all(body).unwrap();});
+        let sources=vec!["http://127.0.0.1:1/unavailable".to_owned(),format!("http://{address}/model")];
+        let file=DownloadFile{url:sources[0].clone(),path:"model.bin".into(),size:body.len() as u64,sha256:format!("{:x}",Sha256::digest(body)),sha512:String::new()};
+        let target=root.join("model.bin");
+        let first=with_attempt(Some(1),||download_candidates(&file,&target,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},0,&sources));
+        assert!(first.unwrap_err().contains("本轮下载来源失败"));assert!(!called.load(Ordering::Acquire));assert_eq!(current_attempt(),None);
+        with_attempt(Some(2),||download_candidates(&file,&target,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{},0,&sources)).unwrap();
+        server.join().unwrap();assert_eq!(fs::read(&target).unwrap(),body);fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -255,7 +376,9 @@ mod tests {
         }));}for worker in workers{worker.join().unwrap();}});server.join().unwrap();
         assert!((2..=MAX_DOWNLOADS).contains(&peak.load(Ordering::Acquire)));assert_eq!(active.load(Ordering::Acquire),0);
         // 服务端已关闭，全部文件仍能从完整缓存复用，不需要再次联网。
-        download_batch(&files,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{}).unwrap();fs::remove_dir_all(root).unwrap();
+        download_batch(&files,Arc::new(AtomicBool::new(false)),&mut|_,_,_|{}).unwrap();
+        // AV（防病毒扫描）可能在任务句柄已归还后短暂借用缓存；夹具清理有界等待。
+        for round in 0..20{match fs::remove_dir_all(&root){Ok(())=>break,Err(error) if round<19&&matches!(error.raw_os_error(),Some(32|33))=>std::thread::sleep(Duration::from_millis(50)),Err(error)=>panic!("夹具清理失败：{error}")}}
     }
 
     /// download_with_temporary_lock（短暂占用下载夹具）：覆盖分片和已有缓存的共享冲突。

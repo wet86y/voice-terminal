@@ -235,12 +235,23 @@ def check(names, lock=None, compatible_gpu=False):
     return {'ready':not errors,'errors':errors}
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['interpreter','reuse','inventory','install','prune','check','gpu'])
+    parser=argparse.ArgumentParser();parser.add_argument('operation',choices=['interpreter','reuse','inventory','install','prune','check','gpu','tts-selection'])
+    parser.add_argument('--data') # data（当前工作区数据目录）。
+    parser.add_argument('--selection') # selection（显式选择的语音后端与模型）。
     parser.add_argument('--compatible-gpu',action='store_true') # compatible_gpu（允许复用项目已验证的显卡组合）。
     parser.add_argument('--gpu-lock')  # gpu_lock（可选显卡依赖锁文件）。
     parser.add_argument('--lock');parser.add_argument('--names',default='[]');parser.add_argument('--target');parser.add_argument('--wheels',default='[]');parser.add_argument('--model');parser.add_argument('--program');parser.add_argument('--install-root');args=parser.parse_args()
     names=json.loads(args.names)
-    if args.operation=='interpreter': result=interpreter()
+    if args.operation=='tts-selection':
+        sys.path.insert(0,args.program)
+        from voice_terminal.config import load_config
+        from voice_terminal.server.product import ProductSettingsStore
+        data=Path(args.data)
+        local=data/'config/local.yaml'
+        config=load_config(Path(args.program)/'config/default.yaml',local if local.is_file() else None)
+        store=ProductSettingsStore(path=data/'config/product-settings.json',config=config)
+        result=store.save_tts_local_model(json.loads(args.selection))
+    elif args.operation=='interpreter': result=interpreter()
     elif args.operation=='reuse': result=reuse(runtime_lock(args.lock,args.gpu_lock),names,Path(args.target))
     elif args.operation=='inventory': result=inventory(names,runtime_lock(args.lock,args.gpu_lock),args.compatible_gpu)
     elif args.operation=='install': result=install([Path(path) for path in json.loads(args.wheels)],Path(args.target))

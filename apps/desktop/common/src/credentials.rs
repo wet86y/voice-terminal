@@ -85,52 +85,45 @@ fn snapshot(value: &Value, env: &BTreeMap<String,String>, vault: &impl Vault) ->
 
 pub fn ready(status: &Value) -> bool {
     status["providers"]["deepseek"]["configured"] == true
-        && (status["local_tts_ready"] == true || status["providers"]["minimax"]["configured"] == true)
+        && if status["tts_backend"] == "voxcpm1" {status["local_tts_ready"] == true} else {status["providers"]["minimax"]["configured"] == true}
 }
 
 /// status_for_context（工作区凭据状态）：本地模型可用时在线合成密钥可选。
 pub fn status_for_context(context:&crate::LaunchContext)->Result<Value,String>{
     let mut result=status(&context.data)?;
     let inventory=crate::resources::inventory(context)?;
-    result["local_tts_ready"]=json!(inventory.iter().any(|row|row["resource_id"]=="tts"&&row["local_ready"]==true));
-    result["fields"]["local_tts_ready"]=json!("任一本地语音模型及共用运行程序已就绪；无需在线合成密钥");
+    result["local_tts_ready"]=json!(inventory.iter().any(|row|row["resource_id"]=="tts"&&row["selected_local_ready"]==true));
+    result["fields"]["local_tts_ready"]=json!("所选本地语音模型及共用运行程序已就绪");
     Ok(result)
 }
 
-fn configured_tts_backend(data: &Path) -> &'static str {
-    if let Ok(bytes) = fs::read(data.join("config/product-settings.json")) {
-        if let Ok(settings) = serde_json::from_slice::<Value>(&bytes) {
-            if settings["schema_version"].as_u64().is_some_and(|version| version >= 11) {
-                match settings["tts"]["backend"].as_str() {
-                    Some("voxcpm1") => return "voxcpm1",
-                    Some("minimax") => return "minimax",
-                    _ => (),
-                }
+/// configured_tts_selection（持久化播放目标）：产品设置优先，旧工作区沿用本地配置。
+pub fn configured_tts_selection(data:&Path)->Value{
+    let mut selection=json!({"backend":"minimax","local_model":"voxcpm2","fields":{"backend":"语音后端，minimax（在线接口）或 voxcpm1（本地兼容路由）","local_model":"持久化选择的 VoxCPM（本地语音）模型"}});
+    if let Ok(config)=fs::read_to_string(data.join("config/local.yaml")){
+        let mut in_tts=false;
+        for raw in config.lines(){
+            let body=raw.trim().split('#').next().unwrap_or("").trim();
+            if body.is_empty(){continue;}
+            let indentation=raw.chars().take_while(|c|c.is_whitespace()).count();
+            if indentation==0{in_tts=body=="tts:";continue;}
+            if in_tts&&indentation==2{if let Some((key,value))=body.split_once(':'){
+                let value=value.trim().trim_matches(|c|c=='\''||c=='"');
+                if (key.trim()=="backend"&&matches!(value,"minimax"|"voxcpm1"))||(key.trim()=="local_model"&&matches!(value,"voxcpm1"|"voxcpm2")){selection[key.trim()]=json!(value);}
+            }}
+        }
+    }
+    if let Ok(bytes)=fs::read(data.join("config/product-settings.json")){
+        if let Ok(settings)=serde_json::from_slice::<Value>(bytes.strip_prefix(&[0xef,0xbb,0xbf]).unwrap_or(&bytes)){
+            if settings["schema_version"].as_u64().is_some_and(|version|version>=11){
+                for key in ["backend","local_model"]{if let Some(value)=settings["tts"][key].as_str(){
+                    if (key=="backend"&&matches!(value,"minimax"|"voxcpm1"))||(key=="local_model"&&matches!(value,"voxcpm1"|"voxcpm2")){selection[key]=json!(value);}
+                }}
             }
         }
-    }
-    let Ok(config) = fs::read_to_string(data.join("config/local.yaml")) else { return "minimax"; };
-    let mut in_tts = false;
-    for raw in config.lines() {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
-        let indentation = raw.chars().take_while(|character| character.is_whitespace()).count();
-        let body = trimmed.split('#').next().unwrap_or("").trim();
-        if indentation == 0 {
-            in_tts = body == "tts:";
-            continue;
-        }
-        if !in_tts { continue; }
-        if indentation < 2 { in_tts = false; continue; }
-        if indentation == 2 {
-            let Some((key, value)) = body.split_once(':') else { continue; };
-            if key.trim() != "backend" { continue; }
-            let value = value.trim().trim_matches(|character| character == '\'' || character == '"');
-            return if value == "voxcpm1" { "voxcpm1" } else { "minimax" };
-        }
-    }
-    "minimax"
+    }selection
 }
+fn configured_tts_backend(data:&Path)->&'static str{if configured_tts_selection(data)["backend"]=="voxcpm1"{"voxcpm1"}else{"minimax"}}
 
 fn native_environment(data: &Path) -> Result<BTreeMap<String,String>,String> {
     environment_keys(data, PROVIDERS.iter().filter_map(|(_, name)| std::env::var(name).ok().map(|value| (name.to_string(),value))).collect())
@@ -139,6 +132,8 @@ fn native_environment(data: &Path) -> Result<BTreeMap<String,String>,String> {
 pub fn status(data: &Path) -> Result<Value,String> {
     let mut result = snapshot(&registry(&data.join("config/model-registry.json"))?, &native_environment(data)?, &SystemVault)?;
     result["tts_backend"] = json!(configured_tts_backend(data));
+    result["tts_local_model"] = configured_tts_selection(data)["local_model"].clone();
+    result["fields"]["tts_local_model"] = json!("持久化选择的本地语音模型");
     result["fields"]["tts_backend"] = json!("TTS（语音合成）实际运行后端；voxcpm1 无需 MiniMax 接口密钥");
     Ok(result)
 }

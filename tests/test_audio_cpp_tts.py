@@ -763,7 +763,7 @@ def test_runtime_server_config_registers_both_models_with_one_resident_slot():
         server = AudioCppTtsServer(root, config_path, local_model="voxcpm2")
         assert server.model_id == "voxcpm2-stream"
         assert server.native_sample_rate == 48000
-        assert server.status_snapshot()["models"][1]["available"] is True
+        assert server.status_snapshot()["models"][1]["available"] is False  # 仅有权重，框架未就绪不能选择。
 
 
 def test_server_switch_loads_selected_model_and_restores_old_model_on_failure():
@@ -821,6 +821,7 @@ def test_server_switch_loads_selected_model_and_restores_old_model_on_failure():
 
             server._http_transport = httpx.MockTransport(handler)
             server._ready = True
+            server._owned_loaded_model = "voxcpm1"  # 本用例模拟当前客户端已加载旧模型。
             await server.switch_model("voxcpm2")
             assert server.local_model == "voxcpm2"
             assert server.status_snapshot()["loaded_model"] == "voxcpm2"
@@ -837,6 +838,30 @@ def test_server_switch_loads_selected_model_and_restores_old_model_on_failure():
             assert actions[-3:] == [
                 ("/v1/models/unload", "voxcpm2-stream"),
                 ("/v1/models/load", "voxcpm1-stream"),
+                ("/v1/models/load", "voxcpm2-stream"),
+            ]
+
+            # 加载已执行但确认响应失败，仍须卸载本轮模型后恢复旧选择。
+            fail_model_id = None
+            read_entries = server._read_model_entries
+            confirmation_failed = False
+
+            async def read_with_one_confirmation_failure():
+                nonlocal confirmation_failed
+                entries = await read_entries()
+                if entries["voxcpm1-stream"]["loaded"] and not confirmation_failed:
+                    confirmation_failed = True
+                    raise AudioCppTtsError("模拟模型驻留确认失败")
+                return entries
+
+            server._read_model_entries = read_with_one_confirmation_failure
+            with pytest.raises(AudioCppTtsError, match="已恢复 VoxCPM2"):
+                await server.switch_model("voxcpm1")
+            assert server.local_model == "voxcpm2"
+            assert actions[-4:] == [
+                ("/v1/models/unload", "voxcpm2-stream"),
+                ("/v1/models/load", "voxcpm1-stream"),
+                ("/v1/models/unload", "voxcpm1-stream"),
                 ("/v1/models/load", "voxcpm2-stream"),
             ]
 
@@ -871,6 +896,57 @@ def test_server_missing_model_is_rejected_before_unloading_selected_model():
             server._post_model_action.assert_not_awaited()
 
     asyncio.run(scenario())
+
+
+def test_model_switch_does_not_modify_borrowed_external_models():
+    async def scenario():
+        server = AudioCppTtsServer.__new__(AudioCppTtsServer)
+        server._lock = asyncio.Lock()
+        server.local_model = "voxcpm1"
+        server._loaded_model = "voxcpm1"
+        server._owned_loaded_model = None
+        server._owns_process = False
+        server._ready = True
+        server._validate_model_assets = MagicMock()
+        server._service_ready = AsyncMock(return_value=True)
+        server._read_model_entries = AsyncMock(return_value={
+            "voxcpm1-stream": {"loaded": True}, "voxcpm2-stream": {"loaded": True},
+        })
+        server._unload_model_locked = AsyncMock()
+        server._load_model_locked = AsyncMock()
+        with pytest.raises(AudioCppTtsError, match="外部客户端"):
+            await server.switch_model("voxcpm2")
+        server._unload_model_locked.assert_not_awaited()
+        server._load_model_locked.assert_not_awaited()
+        assert server.local_model == "voxcpm1"
+        assert server._loaded_model == "voxcpm1"
+
+    asyncio.run(scenario())
+
+
+def test_server_close_only_unloads_models_loaded_by_this_client():
+    from unittest.mock import AsyncMock
+
+    async def scenario(owned):
+        server = AudioCppTtsServer.__new__(AudioCppTtsServer)
+        server._lock = asyncio.Lock()
+        server._process = None
+        server._owns_process = False
+        server._loaded_model = "voxcpm2"
+        server._owned_loaded_model = "voxcpm2" if owned else None
+        server._management_http = None
+        server._log_pump_thread = None
+        server._log_file = None
+        server._unload_model_locked = AsyncMock()
+        await server.close()
+        if owned:
+            server._unload_model_locked.assert_awaited_once_with("voxcpm2-stream")
+        else:
+            server._unload_model_locked.assert_not_awaited()
+        assert server._loaded_model is None
+
+    asyncio.run(scenario(False))
+    asyncio.run(scenario(True))
 
 
 def test_server_close_terminates_only_owned_audio_cpp_process():

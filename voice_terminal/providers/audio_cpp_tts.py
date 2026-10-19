@@ -171,7 +171,8 @@ class AudioCppTtsServer:
         return None
 
     @classmethod
-    def available_models(cls, runtime_root: Path, *, program_root: Path | None = None) -> list[str]:
+    def available_models(cls, runtime_root: Path, *, program_root: Path | None = None,
+                         verify_hashes: bool = True, local_model: str | None = None) -> list[str]:
         """available_models（完整本地候选）：权重、原生程序和模型规格均存在才算可启动。"""
         root = Path(runtime_root).resolve()
         runtime = cls.runtime_directory(root)
@@ -180,7 +181,7 @@ class AudioCppTtsServer:
             specs = root / "sources/audio.cpp/model_specs"
         if not (runtime / "cuda/audiocpp_server.exe").is_file():
             return []
-        if error := cls._runtime_update_error(root, program_root=program_root):
+        if error := cls._runtime_update_error(root, program_root=program_root, verify_hashes=verify_hashes):
             logger.warning("audio_cpp_tts.runtime_update_required（原生组件需要更新） %s", error)
             return []
         # 原生组件已同时按安装收据和当前目标核验；权重继续独立复核。
@@ -188,12 +189,24 @@ class AudioCppTtsServer:
         result: list[str] = []
         catalog = None
         for key in ("voxcpm2", "voxcpm1"):
+            if local_model is not None and key != local_model:
+                continue
             relative = Path("audiocpp/tts") / _MODEL_CATALOG[key]["relative_path"].parent
             folder = root / "models" / relative
             if not (folder / _MODEL_CATALOG[key]["relative_path"].name).is_file() or not (specs / f"{key}.json").is_file():
                 continue
             if (folder / "resource-install.json").is_file():
-                if inspect_installed_model(root / "models", relative.as_posix(), f"tts-{key}", verify_hashes=True).error:
+                installed = inspect_installed_model(root / "models", relative.as_posix(), f"tts-{key}", verify_hashes=verify_hashes)
+                if installed.error:
+                    continue
+                from ..resource_distribution import ResourceCatalog, ResourceError
+                from ..model_installation import model_update_available
+                try:
+                    if catalog is None:
+                        catalog = ResourceCatalog(cls._catalog_program(program_root))
+                    if model_update_available(catalog.get(f"tts-{key}"), installed):
+                        continue
+                except ResourceError:
                     continue
             else:
                 # 旧迁入目录没有收据时，同样按随包清单验证，不能让损坏但仍存在的权重抢占可用后端。
@@ -208,6 +221,8 @@ class AudioCppTtsServer:
                         if not path.is_file() or path.stat().st_size != item.size_bytes:
                             valid = False
                             break
+                        if not verify_hashes:
+                            continue
                         with path.open("rb") as stream:
                             if hashlib.file_digest(stream, "sha256").hexdigest() != item.sha256:
                                 valid = False
@@ -239,6 +254,7 @@ class AudioCppTtsServer:
         self._lock = asyncio.Lock()
         self.local_model = local_model
         self._loaded_model: str | None = None
+        self._owned_loaded_model: str | None = None  # owned_loaded_model（由此客户端加载的模型，借用模型不卸载）。
         self._models = self._read_config()
         config = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
         host = str(config.get("host") or "127.0.0.1")
@@ -377,6 +393,7 @@ class AudioCppTtsServer:
                          loaded_model: str | None = None) -> dict[str, Any]:
         """返回本地目录中的模型可用清单，供服务启动前的设置页显示。"""
         root = Path(runtime_root).resolve()
+        ready = set(cls.available_models(root, verify_hashes=False))
         return {
             "local_model": local_model,
             "loaded_model": loaded_model,
@@ -385,7 +402,7 @@ class AudioCppTtsServer:
                     "id": key,
                     "name": str(info["name"]),
                     "native_sample_rate": int(info["native_sample_rate"]),
-                    "available": (root / "models" / "audiocpp" / "tts" / Path(info["relative_path"])).is_file(),
+                    "available": key in ready,  # available（模型与框架达到当前版本，可启动）。
                     "loaded": loaded_model == key,
                 }
                 for key, info in _MODEL_CATALOG.items()
@@ -408,6 +425,7 @@ class AudioCppTtsServer:
         return self._models[local_model]
 
     def status_snapshot(self) -> dict[str, Any]:
+        ready = set(self.available_models(self.runtime_root, verify_hashes=False))
         return {
             "local_model": self.local_model,  # local_model（所选本地模型）。
             "loaded_model": self._loaded_model,  # loaded_model（当前驻留内存的模型）。
@@ -416,7 +434,7 @@ class AudioCppTtsServer:
                     "id": key,  # id（稳定的本地模型选择值）。
                     "name": str(info["name"]),  # name（界面显示名称）。
                     "native_sample_rate": int(info["native_sample_rate"]),  # native_sample_rate（原生采样率）。
-                    "available": self.model_available(key),  # available（权重与参考音频是否齐全）。
+                    "available": key in ready,  # available（当前模型及框架是否可启动）。
                     "loaded": self._loaded_model == key,  # loaded（当前是否已加载）。
                 }
                 for key, info in _MODEL_CATALOG.items()
@@ -679,6 +697,9 @@ class AudioCppTtsServer:
             and any(configured_model["id"] == model_id for configured_model in self._models.values())
         ), None)
         if prior is not None:
+            owned = getattr(self, "_owned_loaded_model", None)
+            if not self._owns_process and (owned is None or _MODEL_CATALOG[owned]["id"] != prior[0]):
+                raise AudioCppTtsError("外部语音服务已有其他客户端加载的模型，不能替换；请先释放该服务。")
             await self._unload_model_locked(prior[0])
         body = {
             **configured["load_payload"],
@@ -690,6 +711,8 @@ class AudioCppTtsServer:
         }
         started = time.perf_counter()
         try:
+            # load intent（加载所有权意图）：请求已送出但确认失败时，回滚仍需释放本次模型。
+            self._owned_loaded_model = local_model
             await self._post_model_action("/v1/models/load", body, timeout_seconds=300.0)
             loaded_entries = await self._read_model_entries()
             if loaded_entries.get(model_id, {}).get("loaded") is not True:
@@ -702,6 +725,7 @@ class AudioCppTtsServer:
             )
             raise
         self._loaded_model = local_model
+        self._owned_loaded_model = local_model
         logger.info("audio_cpp_tts.model_loaded model_id=%s local_model=%s elapsed_ms=%.1f",
                     model_id, local_model, (time.perf_counter() - started) * 1000)
 
@@ -719,6 +743,7 @@ class AudioCppTtsServer:
             )
             raise
         self._loaded_model = None
+        self._owned_loaded_model = None
         logger.info("audio_cpp_tts.model_unloaded model_id=%s elapsed_ms=%.1f",
                     model_id, (time.perf_counter() - started) * 1000)
 
@@ -758,8 +783,12 @@ class AudioCppTtsServer:
                 return
             previous = self.local_model
             previous_id = str(_MODEL_CATALOG[previous]["id"])
+            entries = await self._read_model_entries()
+            if (entries.get(previous_id, {}).get("loaded") is True
+                    and not self._owns_process
+                    and getattr(self, "_owned_loaded_model", None) != previous):
+                raise AudioCppTtsError("当前模型由外部客户端加载，不能替换；请先释放该服务。")
             try:
-                entries = await self._read_model_entries()
                 if entries.get(previous_id, {}).get("loaded") is True:
                     await self._unload_model_locked(previous_id)
                 await self._load_model_locked(local_model)
@@ -767,7 +796,8 @@ class AudioCppTtsServer:
                 try:
                     entries = await self._read_model_entries()
                     target_id = str(_MODEL_CATALOG[local_model]["id"])
-                    if entries.get(target_id, {}).get("loaded") is True:
+                    if (entries.get(target_id, {}).get("loaded") is True
+                            and (self._owns_process or getattr(self, "_owned_loaded_model", None) == local_model)):
                         await self._unload_model_locked(target_id)
                     await self._load_model_locked(previous)
                 except Exception as restore_exc:
@@ -788,6 +818,12 @@ class AudioCppTtsServer:
         async with self._lock:
             process = self._process
             self._ready = False
+            # 外部服务只释放本客户端加载的模型，不终止不属于本程序的进程。
+            if not self._owns_process and getattr(self, "_owned_loaded_model", None) is not None:
+                with contextlib.suppress(Exception):
+                    await self._unload_model_locked(str(_MODEL_CATALOG[self._owned_loaded_model]["id"]))
+            self._loaded_model = None
+            self._owned_loaded_model = None
             management, self._management_http = self._management_http, None
             if management is not None:
                 await management.aclose()

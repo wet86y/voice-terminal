@@ -39,6 +39,12 @@ def diagnose(*, candidate=False, check_dependencies=True) -> dict:
         if line and not line.startswith("#"):
             name, version = line.split("==", 1)
             required[name] = version
+    # 产品私有环境按安装锁诊断；开发、模型导出工具仍使用完整开发约束。
+    runtime_record = Path(sys.executable).parent / "runtime.json"
+    if not candidate and runtime_record.is_file():
+        lock = json.loads((ROOT / "config/runtime/voice-runtime.lock.json").read_text(encoding="utf-8"))
+        required = {row["name"]: row["version"] for row in lock["wheels"]
+                    if row["name"] not in {"torch", "torchaudio"}}
     optional = {"funasr-onnx", "kaldi-native-fbank", "onnx", "ml-dtypes"}
     mismatches = []
     for name, version in required.items():

@@ -182,12 +182,15 @@ struct DownloadTotals {
 }
 impl DownloadTotals {
     fn report(&mut self,progress:&mut Progress,phase:&str,current:u64){
+        if !phase.contains("正在下载") && phase!="本次总下载量已确认"{progress(phase,0,0);return;}
         self.current_bytes=self.current_bytes.max(current);
         progress(phase,self.completed_bytes.saturating_add(self.current_bytes).min(self.total_bytes),self.total_bytes);
     }
     fn transfer(&mut self,file:&DownloadFile,target:&Path,cancel:Arc<AtomicBool>,progress:&mut Progress,phase:&str)->Result<(),String>{
         crate::download::download_with_progress(file,target,cancel,&mut|stage,done,_|{
-            let phase=if stage=="下载固定资源"{phase.to_owned()}else{format!("下载缓存：{stage}")};self.report(progress,&phase,done.min(file.size));
+            if stage=="下载固定资源"{self.report(progress,phase,done.min(file.size));}
+            else if stage.starts_with("校验"){progress(&format!("下载缓存：{stage}"),done,file.size);}
+            else{progress(stage,0,0);}
         },0)?;
         self.completed_bytes=self.completed_bytes.saturating_add(file.size);self.current_bytes=0;
         self.report(progress,phase,0);Ok(())
@@ -540,10 +543,12 @@ mod tests {
     fn dependency_progress_accumulates_across_files_and_does_not_rewind_on_retry() {
         let mut totals=DownloadTotals{total_bytes:300,..Default::default()};let mut samples=vec![];
         let mut progress=|_:&str,done,total|samples.push((done,total));
-        totals.report(&mut progress,"下载第一项",60);totals.report(&mut progress,"重试第一项",20);
+        totals.report(&mut progress,"正在下载第一项",60);totals.report(&mut progress,"正在下载第一项",20);
         totals.completed_bytes=100;totals.current_bytes=0;
-        totals.report(&mut progress,"下载第二项",0);totals.report(&mut progress,"下载第二项",50);totals.report(&mut progress,"下载第二项",200);
-        assert_eq!(samples,vec![(60,300),(60,300),(100,300),(150,300),(300,300)]);
+        totals.report(&mut progress,"正在下载第二项",0);totals.report(&mut progress,"正在下载第二项",50);totals.report(&mut progress,"正在下载第二项",200);
+        totals.report(&mut progress,"组装固定运行依赖",0);
+        assert_eq!(&samples[..5],&[(60,300),(60,300),(100,300),(150,300),(300,300)]);
+        assert_eq!(samples.last(),Some(&(0,0)));
     }
 
     #[test]

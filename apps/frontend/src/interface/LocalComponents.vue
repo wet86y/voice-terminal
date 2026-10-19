@@ -20,6 +20,8 @@ const emit = defineEmits<{
   retry: [id: string]
   /** resourceDownload/resourceImport（下载或导入资源）、openResourceSource（打开上游）、cancelResource（取消任务）。 */
   resourceDownload: [id: string]
+  resourceDownloadRequired: [] // resourceDownloadRequired（一键必要组件）。
+  ttsSelection: [choice: string] // ttsSelection（显式播放目标）。
   /** resourceBundleDownload（分类批量下载）：先读取清单，确认后并行启动适用资源。 */
   resourceBundleDownload: [request: { title: string; entries: LocalDownloadItem[] }]
   /** resourceRefresh（展开资源详情后刷新一次资源清单）。 */
@@ -56,7 +58,7 @@ const componentCards = computed(() => props.model.rows.flatMap(expandRuntimeDepe
   // 没有独立安装资源的进程条目仅展示活动任务，历史下载错误不覆盖进程重启状态。
   return { row, job: job && jobIsActive(job) ? job : undefined, category: rowCategory(row) }
 }))
-const batchJob = computed(() => visibleJob(latestJobs.value.get('batch')))
+const batchJob = computed(() => visibleJob(latestJobs.value.get('required-batch')) ?? visibleJob(latestJobs.value.get('batch')))
 const categories = computed(() => categoryDefinitions.map(definition => {
   const rows = componentCards.value.filter(card => card.category === definition.id)
   const entries = rows.flatMap(({ row }) => downloadEntries(row))
@@ -179,18 +181,17 @@ function downloadEntries(row: LocalComponentRow): LocalDownloadItem[] {
     ...resource, optional: resource.required === false, note: runtimeDescription(resource.id),
   }))
   const entries: LocalDownloadItem[] = []
-  const sharedRuntimeMissing = Boolean(row.sharedResource && (row.sharedResource.state !== 'installed' || row.sharedResource.updateAvailable))
-  if (row.resource) entries.push({ ...rowResource(row, row.resource), optional: row.resource.required === false, forcePlan: sharedRuntimeMissing })
-  for (const resource of row.resourceChoices ?? []) entries.push({ ...rowResource(row, resource), optional: true, forcePlan: sharedRuntimeMissing })
+  if (row.resource) entries.push({ ...rowResource(row, row.resource), optional: row.resource.required === false })
+  for (const resource of row.resourceChoices ?? []) entries.push({ ...rowResource(row, resource), optional: true })
   if (row.sharedResource) {
     const shared = rowResource(row, row.sharedResource)
     entries.push({
       label: `${shared.label}（共享依赖）`,
       state: shared.state,
-      status: shared.updateAvailable ? '需更新' : shared.state === 'installed' ? '已就绪' : '选择本地模型后准备',
+      status: shared.updateAvailable ? '需更新' : shared.state === 'installed' ? '已就绪' : '在语音服务分类单独管理',
       updateAvailable: shared.updateAvailable,
       busy: shared.busy,
-      note: '会随所选 VoxCPM 本地模型统一检查、安装并复用。',
+      note: '运行程序在语音服务分类单独下载；本模型下载只处理自身文件。',
     })
   }
   if (row.provider) {
@@ -307,7 +308,7 @@ function rowResources(row: LocalComponentRow) {
     .filter((resource): resource is ManagedResourceRow => Boolean(resource))
 }
 function rowResourceIds(row: LocalComponentRow) {
-  return [row.resource?.id, ...(row.resourceChoices ?? []).map(resource => resource.id), row.sharedResource?.id, ...(row.runtimeDependencies ?? []).map(resource => resource.id)]
+  return [row.resource?.id, ...(row.resourceChoices ?? []).map(resource => resource.id), ...(row.runtimeDependencies ?? []).map(resource => resource.id)]
     .filter((id): id is string => Boolean(id))
 }
 function rowJobs(row: LocalComponentRow) {
@@ -318,15 +319,12 @@ function rowJobs(row: LocalComponentRow) {
 function rowActionResources(row: LocalComponentRow) {
   if (row.runtimeDependencies?.length) return []
   const resources = [row.resource, ...(row.resourceChoices ?? [])].filter((resource): resource is ManagedResourceRow => Boolean(resource))
-  const sharedNeedsWork = Boolean(row.sharedResource && (row.sharedResource.state !== 'installed' || row.sharedResource.updateAvailable))
-  return resources.filter(resource => resource.state !== 'installed' || resource.updateAvailable || sharedNeedsWork)
+  return resources.filter(resource => resource.state !== 'installed' || resource.updateAvailable)
 }
 function rowHasActiveJob(row: LocalComponentRow) {
   return rowJobs(row).some(job => jobIsActive(job))
 }
 function resourceActionLabel(row: LocalComponentRow, resource: ManagedResourceRow) {
-  if (row.sharedResource && (row.sharedResource.state !== 'installed' || row.sharedResource.updateAvailable)
-    && resource.state === 'installed' && !resource.updateAvailable) return '配置环境'
   return resource.updateAvailable
     ? resourceRetryable(resource) ? '重试更新' : '更新'
     : resourceRetryable(resource) ? '重试下载' : '下载'
@@ -376,27 +374,26 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
   const failed = jobs.filter(job => job.state === 'failed')
   if (!active.length && !failed.length) return undefined
   const tracked = jobs.filter(job => jobIsActive(job) || ['complete', 'completed', 'failed'].includes(job.state))
-  const separateProgress = tracked.length > 0 && tracked.every(job => typeof job.downloadCompletedBytes === 'number'
-    && Number.isFinite(job.downloadCompletedBytes) && typeof job.downloadTotalBytes === 'number' && job.downloadTotalBytes > 0
-    && typeof job.verificationCompletedBytes === 'number' && Number.isFinite(job.verificationCompletedBytes)
-    && typeof job.verificationTotalBytes === 'number' && job.verificationTotalBytes > 0)
-  const measurable = !separateProgress && tracked.length > 0 && tracked.every(job => typeof job.completedBytes === 'number'
-    && Number.isFinite(job.completedBytes) && typeof job.totalBytes === 'number' && Number.isFinite(job.totalBytes) && job.totalBytes > 0)
+  const currentKind = active.some(job => job.progressKind === 'download') ? 'download'
+    : active.some(job => job.progressKind === 'verify') ? 'verify'
+      : active.some(job => job.progressKind) ? 'waiting' : undefined
+  const counters = tracked.map(job => currentKind === 'download'
+    ? [job.downloadCompletedBytes, job.downloadTotalBytes]
+    : currentKind === 'verify' ? [job.verificationCompletedBytes, job.verificationTotalBytes]
+      : [job.completedBytes, job.totalBytes])
+  const measurable = currentKind !== 'waiting' && counters.length > 0
+    && counters.every(([done, total]) => typeof done === 'number' && Number.isFinite(done)
+      && typeof total === 'number' && Number.isFinite(total) && total > 0)
   const phase = active.length
     ? `正在处理 ${active.length} 项资源：${[...new Set(active.map(job => job.phase).filter(Boolean))].join(' · ')}`
     : failed[0]?.phase || '资源任务失败'
   return {
     id: `category-${category}`, resourceId: category, label: categoryDefinitions.find(item => item.id === category)?.title ?? category,
     state: active.length ? 'running' : 'failed', phase,
-    ...(separateProgress ? {
-      downloadCompletedBytes: tracked.reduce((total, job) => total + (job.downloadCompletedBytes ?? 0), 0),
-      downloadTotalBytes: tracked.reduce((total, job) => total + (job.downloadTotalBytes ?? 0), 0),
-      verificationCompletedBytes: tracked.reduce((total, job) => total + (job.verificationCompletedBytes ?? 0), 0),
-      verificationTotalBytes: tracked.reduce((total, job) => total + (job.verificationTotalBytes ?? 0), 0),
-    } : {}),
+    progressKind: currentKind,
     ...(measurable ? {
-      completedBytes: tracked.reduce((total, job) => total + (job.completedBytes ?? 0), 0),
-      totalBytes: tracked.reduce((total, job) => total + (job.totalBytes ?? 0), 0),
+      completedBytes: counters.reduce((sum, [done]) => sum + (done ?? 0), 0),
+      totalBytes: counters.reduce((sum, [, total]) => sum + (total ?? 0), 0),
     } : {}),
     error: failed[0]?.error, canCancel: false,
   }
@@ -425,10 +422,13 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
     <p v-if="model.resourceError" class="local-error" role="alert">{{ model.resourceError }}</p>
     <p v-if="model.resourceEventError" class="local-error" role="status">{{ model.resourceEventError }}</p>
     <div class="local-list-heading local-managed-heading">
-      <div><h3>按用途分类</h3><small>{{ componentCards.length }} 个组件；安装中显示操作与进度，就绪后可展开详情</small></div>
-      <button v-if="batchJob && jobIsActive(batchJob)" class="outline-button resource-batch-import" type="button" :disabled="!batchJob.canCancel" @click="emit('cancelResource', batchJob.id)">{{ batchJob.canCancel ? '取消批量导入' : '正在完成导入…' }}</button>
-      <button v-else-if="batchImportAvailable" class="outline-button resource-batch-import" type="button" :disabled="model.resourceTasksBusy || model.resourceLoading" @click="emit('resourceImportAll')">{{ model.resourceTasksBusy ? '资源任务处理中…' : model.resourceBatchRetry || batchJob?.state === 'failed' ? '重试批量导入' : '批量导入资源包' }}</button>
-      <ManagedResourceProgress v-if="batchJob" class="managed-batch-progress" :job="batchJob" label="批量资源导入" />
+      <div><h3>组件分类</h3></div>
+      <div class="local-heading-actions">
+        <button v-if="model.resourceActionsAvailable" class="outline-button resource-download-required" type="button" :disabled="model.resourceTasksBusy || model.resourceLoading || !!batchJob && jobIsActive(batchJob)" @click="emit('resourceDownloadRequired')">一键下载</button>
+        <button v-if="batchJob && jobIsActive(batchJob)" class="outline-button resource-batch-import" type="button" :disabled="!batchJob.canCancel" @click="emit('cancelResource', batchJob.id)">{{ batchJob.canCancel ? '取消任务' : '正在完成安装…' }}</button>
+        <button v-else-if="model.resourceActionsAvailable" class="outline-button resource-batch-import" type="button" :disabled="model.resourceTasksBusy || model.resourceLoading" @click="emit('resourceImportAll')">资源导入</button>
+      </div>
+      <ManagedResourceProgress v-if="batchJob" class="managed-batch-progress" :job="batchJob" :label="batchJob.resourceId === 'required-batch' ? '一键下载' : '资源导入'" />
     </div>
     <div v-if="model.resourceLoading && !model.rows.some(row => row.resource)" class="resource-empty" role="status">正在读取固定资源状态…</div>
     <div class="local-category-list">
@@ -459,6 +459,14 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
           </div>
         </header>
         <div v-if="expandedCategories.has(category.id)" :id="`local-category-${category.id}`" class="local-category-content">
+          <label v-if="category.id === 'tts' && model.ttsSelection" class="local-tts-selection form-field">
+            <span>语音播放目标</span>
+            <select :value="model.ttsSelection.options.some(option => option.value === model.ttsSelection!.value) ? model.ttsSelection.value : ''" :disabled="model.ttsSelection.saving || model.resourceTasksBusy" @change="emit('ttsSelection', ($event.target as HTMLSelectElement).value)">
+              <option v-if="!model.ttsSelection.options.some(option => option.value === model.ttsSelection!.value)" value="" disabled>当前选择未就绪，请补齐资源或选择其他目标</option>
+              <option v-for="option in model.ttsSelection.options" :key="option.value" :value="option.value">{{ option.label }}</option>
+            </select>
+            <small v-if="model.ttsSelection.error" class="local-error">{{ model.ttsSelection.error }}</small>
+          </label>
           <p v-if="!category.rows.length" class="resource-empty">暂无该分类的组件状态。</p>
           <div v-else class="local-component-list">
             <article v-for="{ row, job } in category.rows" :key="row.id" class="local-component-card" :class="job ? jobState(job) : rowState(row)" :data-component="row.id">
@@ -532,7 +540,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
                 </section>
                 <section v-if="row.resourceChoices?.length" class="local-tts-downloads">
                   <h5>本地 TTS（语音合成）模型</h5>
-                  <small>在组件卡片中分别管理 VoxCPM1、VoxCPM2；选择本地模型时会自动准备共用运行程序。下载不会改变当前播放后端。</small>
+                  <small>在组件卡片中分别管理 VoxCPM1、VoxCPM2；共用运行程序在语音服务分类单独下载。下载不会改变当前播放后端。</small>
                   <article v-for="resource in selectedResources(row)" :key="resource.id" :data-resource="resource.id" class="local-download-choice">
                     <div class="local-managed-resource-heading"><span>{{ resource.label }}</span><span class="resource-install-state" :class="resource.state">{{ resource.updateAvailable ? '需更新' : resource.status || resourceStateLabel(resource.state) }}</span></div>
                     <dl v-if="resourceRuntimeInfo(resource)" class="local-resource-versions"><div><dt>版本</dt><dd>{{ resourceRuntimeInfo(resource) }}</dd></div></dl>
@@ -572,7 +580,7 @@ function categoryProgress(category: LocalComponentCategory, rows: LocalComponent
 .local-components{display:flex;flex-direction:column;gap:20px;min-width:0;container-type:inline-size}
 .local-managed-heading>div{display:grid;gap:4px;min-width:0}
 .local-managed-heading>div>small{color:var(--muted)}
-.resource-batch-import{white-space:nowrap}
+.resource-batch-import{white-space:nowrap}.local-managed-heading .local-heading-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.local-managed-heading h3{font-size:var(--font-section);margin:0}.local-tts-selection{max-width:520px;padding:12px 0}.managed-batch-progress{grid-column:1 / -1}
 .resource-empty{padding:14px 16px;border:1px dashed var(--line-strong);border-radius:12px;color:var(--muted);font-size:var(--font-body)}
 .local-category-list{display:grid;gap:12px}.local-category-card{min-width:0;border:1px solid var(--line-strong);border-radius:16px;background:#ffffff02;overflow:hidden}.local-category-card.expanded{background:#ffffff04}.local-category-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:14px;padding:12px 16px}.local-category-main{display:grid;gap:9px;min-width:0}.local-category-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding:3px 0;text-align:left;background:transparent;border:0;cursor:pointer}.local-category-toggle>span{display:grid;gap:4px;min-width:0}.local-category-toggle strong{font-size:var(--font-section);line-height:1.4}.local-category-toggle small{color:var(--muted);line-height:1.5}.local-category-toggle svg{flex:none;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;transition:transform 180ms}.local-category-toggle svg.expanded{transform:rotate(180deg)}.local-category-observability{display:grid;gap:8px;min-width:0}.local-category-metrics{grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:8px 14px}.local-category-progress{max-width:620px}.local-category-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.category-download,.category-import{white-space:nowrap;height:var(--compact-control-height);min-height:var(--compact-control-height);padding:6px 11px;font-size:var(--font-caption)}.local-category-content{display:grid;gap:10px;padding:0 14px 14px}.local-category-content>.resource-empty{margin-top:2px}
 .local-managed-resource{display:grid;gap:8px;padding:10px 16px;border-top:1px solid var(--line);background:#00000008}

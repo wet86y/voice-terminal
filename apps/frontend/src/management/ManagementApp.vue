@@ -9,15 +9,28 @@ import type { LocalComponentCategory, LocalComponentRow, LocalComponentsModel, M
 import ResourceInstallDialog from '../product/panels/ResourceInstallDialog.vue'
 import WorkspaceSettings from '../product/panels/WorkspaceSettings.vue'
 import { useWorkspaceResources } from '../product/useWorkspaceResources'
-import { desktopPort, type DesktopPort, type DesktopEnvironmentPort, type DesktopCredentialsPort, type ResourceStatus } from '../product/desktop-port'
+import { desktopPort, type DesktopPort, type DesktopEnvironmentPort, type DesktopCredentialsPort, type DesktopWorkspacePort, type ResourceStatus } from '../product/desktop-port'
 
 const section = ref('compute')
 const resources = useWorkspaceResources()
-const port = desktopPort() as DesktopPort & DesktopEnvironmentPort & DesktopCredentialsPort
+const port = desktopPort() as DesktopPort & DesktopEnvironmentPort & DesktopCredentialsPort & DesktopWorkspacePort
 const credentials = useStartupCredentials(port, () => resources.refreshInventory())
 watch(() => resources.resources.value.find(item => item.resource_id === 'tts'), item => {
-  credentials.setLocalTtsReady(item ? item.can_start === true && item.update_available !== true : null)
+  credentials.setLocalTtsReady(item ? item.selected_local_ready === true : null)
 }, { immediate: true })
+const selectionSaving = ref(false) // selectionSaving（正在保存播放目标）。
+const selectionError = ref('') // selectionError（播放目标保存失败原因）。
+async function saveTtsChoice(choice: string) {
+  if (selectionSaving.value || !['minimax', 'voxcpm1', 'voxcpm2'].includes(choice)) return
+  selectionSaving.value = true; selectionError.value = ''
+  try {
+    if (!port.saveTtsSelection) throw new Error('当前宿主不支持启动前选择，请更新程序。')
+    await port.saveTtsSelection({ backend: choice === 'minimax' ? 'minimax' : 'voxcpm1',
+      local_model: choice === 'minimax' ? credentials.ttsLocalModel.value : choice as 'voxcpm1' | 'voxcpm2' })
+    await Promise.all([credentials.refresh(), resources.refreshInventory()])
+  } catch (failure) { selectionError.value = failure instanceof Error ? failure.message : String(failure) }
+  finally { selectionSaving.value = false }
+}
 const starting = ref(false) // starting（已请求启动）：原生导航完成前防止重复点击。
 const logExportError = ref('') // logExportError（日志打包错误）。
 const logExportSuccess = ref(false) // logExportSuccess（日志包已保存）。
@@ -156,6 +169,14 @@ const model = computed<LocalComponentsModel>(() => {
   const failedJobs = resources.resourceJobs.value.filter(job => job.state === 'failed')
   return {
     status: '本地组件管理可用', state: 'ready',
+    ttsSelection: {
+      value: credentials.ttsBackend.value === 'minimax' ? 'minimax' : credentials.ttsLocalModel.value,
+      saving: selectionSaving.value || credentials.loading.value,
+      error: selectionError.value,
+      options: [{ value: 'minimax', label: '在线 API（网络语音接口）' },
+        ...ttsResources.filter(item => item.can_start === true && item.update_available !== true)
+          .map(item => ({ value: item.resource_id.slice(4), label: item.label }))],
+    },
     sampledAt: resources.inventoryUpdatedAt.value ? new Date(resources.inventoryUpdatedAt.value).toLocaleTimeString('zh-CN', { hour12: false }) + ' 更新' : '正在读取组件清单',
     resources: [],
     downloadResources: inventory.map(toManagedResource),
@@ -173,7 +194,7 @@ const model = computed<LocalComponentsModel>(() => {
         label: job.resource_id === 'batch' ? '批量资源导入'
           : resource?.installation_state === 'installed' && resource.update_available ? `更新 ${resource.label}`
             : resource?.label || '资源任务',
-        state: job.state, phase: job.phase, completedBytes: job.completed_bytes,
+        state: job.state, phase: job.phase, progressKind: job.progress_kind, attempt: job.attempt, parentJobId: job.parent_job_id, completedBytes: job.completed_bytes,
         totalBytes: job.total_bytes, downloadCompletedBytes: job.download_completed_bytes,
         downloadTotalBytes: job.download_total_bytes, verificationCompletedBytes: job.verification_completed_bytes,
         verificationTotalBytes: job.verification_total_bytes, error: job.error || undefined, canCancel: job.can_cancel === true,
@@ -236,7 +257,7 @@ function exportLogs() {
             <p>{{ componentsReady ? credentials.ready.value ? '组件和接口密钥已完备，可以启动程序。' : '组件已完备，请在分类详情中配置 DeepSeek 与 TTS。' : componentBlockMessage }}</p>
             <div class="management-actions"><button class="outline-button start-program" :disabled="!componentsReady || !credentials.ready.value || tasksBusy || resources.loading.value || resources.inventoryRefreshing.value || starting" @click="startProgram">启动程序</button></div>
           </div>
-          <LocalComponents :model="model" @refresh="resources.refresh" @retry="retry" @resource-download="resources.downloadResource" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" />
+          <LocalComponents :model="model" @refresh="resources.refresh" @retry="retry" @resource-download="resources.downloadResource" @resource-download-required="resources.downloadRequiredResources" @tts-selection="saveTtsChoice" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resources.refreshInventory" @resource-import="resources.importResource" @resource-import-all="resources.importResource()" @open-resource-source="resources.openResourceSource" @cancel-resource="resources.cancelJob" />
         </template>
         <WorkspaceSettings v-else-if="section === 'workspace'" :controller="resources" />
         <section v-else class="environment-required"><h2>请先补齐本地组件</h2><p>全部组件和接口密钥准备好后可以启动语音与业务服务。组件下载、导入和关于页可以在设置中使用。</p><button class="outline-button" @click="section = 'compute'">进入组件管理</button></section>

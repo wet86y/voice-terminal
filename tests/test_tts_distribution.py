@@ -26,28 +26,32 @@ def _legacy_model_catalog(program: Path, content: bytes) -> Path:
     return program
 
 
-@pytest.mark.parametrize("backend,selected,models,online,expected", [
-    ("minimax", "voxcpm2", ["voxcpm1"], False, ("voxcpm1", "voxcpm1")),
-    ("voxcpm1", "voxcpm2", ["voxcpm1"], False, ("voxcpm1", "voxcpm1")),
-    ("voxcpm1", "voxcpm1", ["voxcpm1", "voxcpm2"], True, ("voxcpm1", "voxcpm1")),
-    ("voxcpm1", "voxcpm2", [], True, ("minimax", "voxcpm2")),
-    ("minimax", "voxcpm2", ["voxcpm1"], True, ("minimax", "voxcpm2")),
+@pytest.mark.parametrize("backend,selected,models,online,ready", [
+    ("minimax", "voxcpm2", ["voxcpm1"], False, False),
+    ("voxcpm1", "voxcpm2", ["voxcpm1"], False, False),
+    ("voxcpm1", "voxcpm1", ["voxcpm1", "voxcpm2"], True, True),
+    ("voxcpm1", "voxcpm2", [], True, False),
+    ("minimax", "voxcpm2", ["voxcpm1"], True, True),
 ])
-def test_startup_uses_configured_or_available_tts(tmp_path, monkeypatch, backend, selected, models, online, expected):
+def test_startup_preserves_explicit_tts_selection(tmp_path, monkeypatch, backend, selected, models, online, ready):
     config = AppConfig()
     config = replace(config, tts=replace(config.tts, backend=backend, local_model=selected))
     runtime = SessionRuntime(config, runtime_data_dir=tmp_path / "data")
-    monkeypatch.setattr(AudioCppTtsServer, "available_models", lambda root: models)
+    monkeypatch.setattr(AudioCppTtsServer, "available_models", lambda root, **kwargs: models)
     runtime._api_key = lambda name: "configured-test-key" if online else ""
-    runtime._select_available_tts()
-    assert (runtime.config.tts.backend, runtime.config.tts.local_model) == expected
+    if ready:
+        runtime._select_available_tts()
+    else:
+        with pytest.raises(RuntimeError, match="所选"):
+            runtime._select_available_tts()
+    assert (runtime.config.tts.backend, runtime.config.tts.local_model) == (backend, selected)
 
 
-def test_startup_without_any_tts_reports_actionable_error(tmp_path, monkeypatch):
+def test_startup_without_selected_online_tts_reports_actionable_error(tmp_path, monkeypatch):
     runtime = SessionRuntime(AppConfig(), runtime_data_dir=tmp_path / "data")
-    monkeypatch.setattr(AudioCppTtsServer, "available_models", lambda root: [])
+    monkeypatch.setattr(AudioCppTtsServer, "available_models", lambda root, **kwargs: ["voxcpm1"])
     runtime._api_key = lambda name: ""
-    with pytest.raises(RuntimeError, match="安装任一本地模型"):
+    with pytest.raises(RuntimeError, match="填写密钥或显式选择"):
         runtime._select_available_tts()
 
 
@@ -68,7 +72,7 @@ def test_model_availability_includes_native_runtime_and_specs(tmp_path):
 
 @pytest.mark.parametrize("other_available", [True, False])
 @pytest.mark.parametrize("bad_content", [b"bad!", b"x"])
-def test_legacy_corrupt_selected_model_falls_back_to_valid_model_or_online(tmp_path, monkeypatch, other_available, bad_content):
+def test_legacy_corrupt_selected_model_keeps_selection_and_reports_error(tmp_path, monkeypatch, other_available, bad_content):
     program = _legacy_model_catalog(tmp_path / "program", b"good")
     native = tmp_path / "models/audiocpp/runtime"
     (native / "cuda").mkdir(parents=True)
@@ -82,14 +86,14 @@ def test_legacy_corrupt_selected_model_falls_back_to_valid_model_or_online(tmp_p
         if name == "voxcpm2" or other_available:
             target.write_bytes(bad_content if name == "voxcpm2" else b"good")
     available = AudioCppTtsServer.available_models
-    monkeypatch.setattr(AudioCppTtsServer, "available_models", lambda root: available(root, program_root=program))
+    monkeypatch.setattr(AudioCppTtsServer, "available_models", lambda root, **kwargs: available(root, program_root=program, **kwargs))
     config = AppConfig()
     runtime = SessionRuntime(replace(config, tts=replace(config.tts, backend="voxcpm1", local_model="voxcpm2")), runtime_data_dir=tmp_path / "data")
     runtime._api_key = lambda name: "configured-test-key"
-    runtime._select_available_tts()
-    assert runtime.config.tts.backend == ("voxcpm1" if other_available else "minimax")
-    if other_available:
-        assert runtime.config.tts.local_model == "voxcpm1"
+    with pytest.raises(RuntimeError, match="所选 voxcpm2"):
+        runtime._select_available_tts()
+    assert runtime.config.tts.backend == "voxcpm1"
+    assert runtime.config.tts.local_model == "voxcpm2"
 
 
 def test_distribution_locks_optional_models_and_bundled_reference():
@@ -102,6 +106,26 @@ def test_distribution_locks_optional_models_and_bundled_reference():
         assert spec.required_files[0].source_path.startswith(f"VoxCPM{'1' if name == 'voxcpm1' else '2'}-GGUF/")
     assert (root / "config/resources/assets/tts/default.wav").is_file()
     assert (root / "config/resources/assets/tts/default.json").is_file()
+
+
+def test_startup_selection_worker_only_saves_and_preserves_model_preferences(tmp_path):
+    import subprocess
+    import sys
+    root = Path(__file__).resolve().parents[1]
+    data = tmp_path / "data"
+    settings = data / "config/product-settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"schema_version": 11, "tts": {"backend": "minimax", "local_model": "voxcpm1",
+        "inference_steps_by_model": {"voxcpm1": 7, "voxcpm2": 11}}}), encoding="utf-8")
+    result = subprocess.run([sys.executable, "-I", "-B", "-X", "utf8", str(root / "scripts/voice-environment-worker.py"),
+        "tts-selection", "--program", str(root), "--data", str(data), "--selection",
+        json.dumps({"backend": "voxcpm1", "local_model": "voxcpm2"})], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    stored = json.loads(settings.read_text(encoding="utf-8"))
+    assert stored["tts"]["backend"] == "voxcpm1"
+    assert stored["tts"]["local_model"] == "voxcpm2"
+    assert stored["tts"]["inference_steps_by_model"] == {"voxcpm1": 7, "voxcpm2": 11}
+    assert not (data / "config/audiocpp").exists()
 
 
 def test_official_runtime_plan_includes_archives_and_bundled_patch(tmp_path):

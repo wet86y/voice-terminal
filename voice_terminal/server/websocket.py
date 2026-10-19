@@ -1255,29 +1255,16 @@ class SessionRuntime(ProductSettingsRuntimeMixin, HandoffRuntimeMixin, SpeakerRu
         return self._credential_overrides.get(environment_name) or self.config.api_key(environment_name)
 
     def _select_available_tts(self) -> None:
-        """启动时优先沿用选择；其资源缺失时从已安装模型或已配置在线接口中选可用项。"""
+        """校验所选后端；安装与资源发现不得隐式修改用户的播放目标。"""
         current = self.config.tts
-        if current.backend == "minimax" and self._api_key(current.api_key_env):
+        if current.backend == "minimax":
+            if not self._api_key(current.api_key_env):
+                raise RuntimeError("所选在线 TTS（文本转语音）接口未配置，请填写密钥或显式选择已就绪的本地模型。")
             return
-        available = AudioCppTtsServer.available_models(self._runtime_local_root)
-        if current.backend == "voxcpm1" and current.local_model in available:
-            self.config = replace(self.config, tts=replace(
-                current, sample_rate=local_tts_native_rate(current.local_model)))
-            return
-        online = bool(self._api_key(current.api_key_env)) if current.backend == "minimax" or not available else False
-        if current.backend == "minimax" and online:
-            return
-        if available:
-            model = current.local_model if current.local_model in available else available[0]
-            self.config = replace(self.config, tts=replace(
-                current, backend="voxcpm1", local_model=model, sample_rate=local_tts_native_rate(model)))
-        elif online:
-            self.config = replace(self.config, tts=replace(
-                current, backend="minimax", sample_rate=current.online_sample_rate,
-            ))
-        else:
-            raise RuntimeError("TTS（语音合成）未就绪：请安装任一本地模型及运行程序，或配置在线 API（接口）密钥。")
-        logger.info("tts.startup_selection backend=%s local_model=%s", self.config.tts.backend, self.config.tts.local_model)
+        available = AudioCppTtsServer.available_models(self._runtime_local_root, local_model=current.local_model)
+        if current.local_model not in available:
+            raise RuntimeError(f"所选 {current.local_model}（本地语音模型）或 audio.cpp（原生语音框架）未就绪，请在组件管理补齐。")
+        self.config = replace(self.config, tts=replace(current, sample_rate=local_tts_native_rate(current.local_model)))
 
     def _build_tts_clients(self):
         """按本机 backend（语音运行后端）配置创建 TTS provider（语音合成供应方）。"""

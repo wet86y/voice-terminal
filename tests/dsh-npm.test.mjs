@@ -3,10 +3,19 @@ import assert from 'node:assert/strict'
 import { readFile, mkdtemp, writeFile, mkdir, access } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { targetSpec, isCurrent, safePath, npmArguments, checkPlugin, install } from '../scripts/dsh-npm.mjs'
+import { targetSpec, isCurrent, safePath, npmArguments, checkPlugin, install, registriesForAttempt } from '../scripts/dsh-npm.mjs'
 import { registryCandidates, registryEnvironment, canRetryRegistry, selectedRegistry } from '../scripts/download-sources.mjs'
 const lock = JSON.parse(await readFile(new URL('../config/dsh/runtime.lock.json', import.meta.url), 'utf8'))
 const contract = JSON.parse(await readFile(new URL('./fixtures/dsh-adapter-cases.json', import.meta.url), 'utf8'))
+
+test('原生任务统一三轮处理，每轮只访问一个有序来源，维护工具保留原有回退', () => {
+  const registries = ['https://registry.npmmirror.com', 'https://registry.npmjs.org']
+  assert.deepEqual(registriesForAttempt(registries, undefined), registries)
+  assert.deepEqual(registriesForAttempt(registries, '1'), [registries[0]])
+  assert.deepEqual(registriesForAttempt(registries, '2'), [registries[1]])
+  assert.deepEqual(registriesForAttempt(registries, '3'), [registries[0]])
+  assert.deepEqual(registriesForAttempt([registries[0]], '2'), [registries[0]])
+})
 
 test('环境、项目和用户配置中的私有默认注册表不被公共镜像覆盖', async () => {
   const root = await mkdtemp(join(tmpdir(), 'private-npm-config-'))

@@ -21,7 +21,7 @@ pub async fn resource_install_plan(window:WebviewWindow,desktop:State<'_,Arc<Des
         let spec=resources::spec(&context,&resource_id)?;
         let model_bytes=resources::download_bytes(&spec);
         let mut shared_resources=vec![];
-        if let Some(shared)=spec["runtime_resource"].as_str(){
+        if let Some(shared)=spec["runtime_resource"].as_str().filter(|_| !matches!(resource_id.as_str(),"tts-voxcpm1"|"tts-voxcpm2")){
             let ready=resources::inventory(&context)?.iter().any(|row|row["resource_id"]==shared&&row["can_start"]==true);
             if !ready{let item=resources::spec(&context,shared)?;shared_resources.push(json!({"resource_id":shared,"title":item["title"],"download_bytes":resources::download_bytes(&item)}));}
         }

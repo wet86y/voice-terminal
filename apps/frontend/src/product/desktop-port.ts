@@ -31,6 +31,7 @@ export interface ResourceStatus {
   files_installed?: boolean
   runtime_ready?: boolean
   can_start?: boolean
+  selected_local_ready?: boolean // selected_local_ready（所选本地模型及框架可用）。
   /** runtime_group（所需共享依赖组）。 */
   runtime_group?: string
   /** python（私有解释器路径）。 */
@@ -62,6 +63,9 @@ export interface ResourceJob {
   /** state（任务状态）与 phase（当前阶段说明）。 */
   state: string
   phase: string
+  progress_kind?: 'download' | 'verify' | 'install' | 'waiting' // progress_kind（当前进度类型）。
+  attempt?: number // attempt（自动恢复轮次）。
+  parent_job_id?: string | null // parent_job_id（所属一键任务）。
   /** completed_bytes（已处理字节）及 total_bytes（总字节）；未知时为空。 */
   completed_bytes?: number | null
   total_bytes?: number | null
@@ -130,6 +134,9 @@ export interface DesktopPort {
   listen?<T>(eventName: string, handler: (event: DesktopEvent<T>) => void): Promise<() => void>
 }
 
+/** TtsSelection（持久化语音目标）：voxcpm1（本地兼容后端），local_model（具体模型）。 */
+export interface TtsSelection { backend: 'minimax' | 'voxcpm1'; local_model: 'voxcpm1' | 'voxcpm2' }
+
 /** DesktopWorkspacePort（桌面工作区扩展）：资源准备阶段直接由原生入口提供。 */
 export interface DesktopWorkspacePort {
   /** resource_install_plan（下载安装内容）：下载前确认模型与共享运行依赖。 */
@@ -149,6 +156,9 @@ export interface DesktopWorkspacePort {
   resourceJobSnapshots?(): Promise<ResourceJob[]>
   /** resource_download（下载资源）：启动固定版本资源下载任务。 */
   downloadResource(resourceId: string): Promise<{ job_id: string }>
+  downloadRequiredResources?(): Promise<{ job_id: string }> // downloadRequiredResources（一键必要资源）。
+  ttsSelectionStatus?(): Promise<TtsSelection> // ttsSelectionStatus（启动前语音目标）。
+  saveTtsSelection?(request: TtsSelection): Promise<TtsSelection> // saveTtsSelection（仅保存，不启动）。
   /** resource_import（导入资源）：带 id 选择单资源；省略 id 时选择批量压缩包。 */
   importResource(resourceId?: string): Promise<{ job_id: string }>
   /** resource_open_source（打开上游）：由原生宿主打开资源来源页面。 */
@@ -251,6 +261,9 @@ export function desktopPort(): DesktopPort {
     confirmImport: (jobId, accepted) => call('resource_import_confirm', { job_id: jobId, accepted }),
     resourceInstallPlan: resourceId => call('resource_install_plan', { resource_id: resourceId }),
     downloadResource: resourceId => call<{ job_id: string }>('resource_download', { resource_id: resourceId }),
+    downloadRequiredResources: () => call<{ job_id: string }>('resource_download_required'),
+    ttsSelectionStatus: () => call<TtsSelection>('tts_selection_status'),
+    saveTtsSelection: request => call<TtsSelection>('tts_selection_save', { request }),
     importResource: resourceId => call<{ job_id: string }>('resource_import', resourceId === undefined ? undefined : { resource_id: resourceId }),
     openResourceSource: resourceId => call('resource_open_source', { resource_id: resourceId }),
     cancelResource: jobId => call('resource_cancel', { job_id: jobId }),
