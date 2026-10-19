@@ -12,6 +12,12 @@ export function safePath(root, relative) {
   if (!path.startsWith(resolve(root) + '/'.replace('/', process.platform === 'win32' ? '\\' : '/'))) throw new Error('DSH（代理宿主）入口路径越界')
   return path
 }
+// registriesForAttempt（本轮来源）：由原生任务统一计数，命令行维护工具保持原有顺序回退。
+export function registriesForAttempt(registries, attempt) {
+  const round = Number(attempt)
+  return Number.isInteger(round) && round >= 1 && round <= 3 && registries.length
+    ? [registries[(round - 1) % registries.length]] : registries
+}
 export function targetSpec(lock) {
   const spec = lock.distribution
   if (!spec || spec.source_kind !== 'npm_package' || spec.adapter !== 'npm_cli_v1') throw new Error('DSH（代理宿主）分发适配器不受支持')
@@ -73,7 +79,7 @@ export async function install(program, target, npmCli, workspace) {
   delete env.ELECTRON_RUN_AS_NODE
   const npmVersion = await run([npmCli, '--version'], target, env, true)
   process.stdout.write('VOICE_DSH_PHASE 在线刷新版本元数据并复用已下载的 npm（包管理器）归档缓存\n')
-  const registries = registryCandidates(requestedRegistry(spec.registry_url, env, target))
+  const registries = registriesForAttempt(registryCandidates(requestedRegistry(spec.registry_url, env, target)), env.VOICE_RESOURCE_ATTEMPT)
   let selectedRegistry = '' // selectedRegistry（实际传输来源）：不覆盖规范来源与候选身份。
   for (const [index, registry] of registries.entries()) {
     process.stdout.write(`VOICE_DSH_PHASE 下载来源：${new URL(registry).host}\n`)

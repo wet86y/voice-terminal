@@ -29,6 +29,37 @@ async function expandComponent(wrapper: ReturnType<typeof mount>, category: stri
 }
 
 describe('LocalComponents（本地组件）运行环境与导入入口', () => {
+  it('资源齐全时保留一键下载与资源导入入口，标题不显示旧说明', async () => {
+    const wrapper = mount(LocalComponents, { props: { model: model() } })
+    const heading = wrapper.get('.local-managed-heading')
+    expect(heading.get('h3').text()).toBe('组件分类')
+    expect(heading.text()).not.toContain('个组件')
+    expect(heading.findAll('button').map(button => button.text())).toEqual(['一键下载', '资源导入'])
+    await heading.get('.resource-download-required').trigger('click')
+    expect(wrapper.emitted('resourceDownloadRequired')).toEqual([[]])
+    wrapper.unmount()
+  })
+
+  it('共享框架任务只属于框架卡片，不激活两款本地模型的进度', async () => {
+    const value = model()
+    value.rows[0]!.runtimeDependencies = [
+      { id: 'voice-runtime-cpu', label: '中央处理器依赖', state: 'installed', status: '已安装', required: true },
+      { id: 'tts-audiocpp-runtime', label: '原生语音框架', state: 'missing', status: '缺失', required: false },
+    ]
+    value.rows.push(...['tts-voxcpm1', 'tts-voxcpm2'].map(id => ({ ...value.rows[0]!, id, name: id,
+      category: 'tts' as const, runtimeDependencies: undefined,
+      resource: { id, label: id, state: 'installed' as const, status: '已安装', required: false },
+      sharedResource: { id: 'tts-audiocpp-runtime', label: '原生语音框架', state: 'missing' as const, status: '缺失', required: false } })))
+    value.managedResourceJobs = [{ id: 'framework', resourceId: 'tts-audiocpp-runtime', label: '框架', state: 'running', phase: '下载固定资源', progressKind: 'download', canCancel: true }]
+    const wrapper = mount(LocalComponents, { props: { model: value } })
+    expect(wrapper.find('[data-category="tts"] [data-job]').exists()).toBe(false)
+    await expandCategory(wrapper, 'tts')
+    expect(wrapper.find('[data-category="tts"] [data-job]').exists()).toBe(false)
+    await expandCategory(wrapper, 'voice-server')
+    expect(wrapper.findAll('[data-job="framework"]')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
   it('分类摘要会跟随子组件显示启动中、运行中和错误状态', async () => {
     const value = model()
     value.rows = [{
@@ -61,16 +92,16 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     ]
     const wrapper = mount(LocalComponents, { props: { model: value } })
     const card = await expandComponent(wrapper, 'voice-server', 'voice-system')
-    expect(card.findAll('[data-runtime-dependency]')).toHaveLength(3)
-    expect(card.get('.local-state').text()).toBe('运行中')
-    expect(wrapper.find('.resource-batch-import').exists()).toBe(false)
-    await card.get('[data-runtime-dependency="voice-runtime-gpu"] button').trigger('click')
+    expect(wrapper.findAll('[data-category="voice-server"] [data-component]')).toHaveLength(3)
+    expect(card.get('.local-state').text()).toBe('已安装')
+    expect(wrapper.find('.resource-batch-import').exists()).toBe(true)
+    await wrapper.get('[data-component="voice-runtime-gpu"] button').trigger('click')
     expect(wrapper.emitted('resourceDownload')).toEqual([['voice-runtime-gpu']])
+    expect(wrapper.find('[data-category="voice-server"] .category-download').exists()).toBe(false)
+    await wrapper.setProps({ model: { ...value, rows: [{ ...value.rows[0]!, runtimeDependencies: value.rows[0]!.runtimeDependencies!.map(item => item.id === 'voice-runtime-cpu' ? { ...item, state: 'missing' as const } : item) }] } })
     await wrapper.get('[data-category="voice-server"] .category-download').trigger('click')
     const bundle = wrapper.emitted('resourceBundleDownload')![0]![0] as { entries: Array<{ id: string; optional: boolean }> }
-    expect(bundle.entries.map(entry => [entry.id, entry.optional])).toEqual([
-      ['voice-runtime-cpu', false], ['tts-audiocpp-runtime', true], ['voice-runtime-gpu', true],
-    ])
+    expect(bundle.entries.map(entry => [entry.id, entry.optional])).toEqual([['voice-runtime-cpu', false]])
     wrapper.unmount()
   })
 
@@ -83,12 +114,12 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     value.managedResourceJobs = [{ id: 'env-cpu', resourceId: 'voice-server', label: '处理器运行依赖', state: 'running', phase: '下载基础依赖', completedBytes: 20, totalBytes: 100, canCancel: true }]
     const wrapper = mount(LocalComponents, { props: { model: value } })
     const card = await expandComponent(wrapper, 'voice-server', 'voice-system')
-    const cpu = card.get('[data-runtime-dependency="voice-runtime-cpu"]')
+    const cpu = wrapper.get('[data-component="voice-system"]')
     expect(cpu.get('[data-job="env-cpu"]').text()).toContain('20%')
     expect(card.findAll('[data-job="env-cpu"]')).toHaveLength(1)
     await cpu.get('button').trigger('click')
     expect(wrapper.emitted('cancelResource')).toEqual([['env-cpu']])
-    expect(card.get('[data-runtime-dependency="voice-runtime-gpu"] button').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-component="voice-runtime-gpu"] button').attributes('disabled')).toBeUndefined()
     wrapper.unmount()
   })
 
@@ -109,18 +140,16 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(card.text()).toContain('VoxCPM1（第一代模型）')
     await card.get('button[aria-label="VoxCPM2（第二代模型）：下载"]').trigger('click')
     expect(wrapper.emitted('resourceDownload')).toEqual([['tts-voxcpm2']])
-    await wrapper.get('[data-category="tts"] .category-download').trigger('click')
-    const bundle = wrapper.emitted('resourceBundleDownload')?.[0]?.[0] as { entries: Array<{ id?: string; optional?: boolean }> }
-    expect(bundle.entries.filter(entry => entry.id).map(entry => entry.id)).toEqual(['tts-voxcpm2', 'tts-voxcpm1'])
-    expect(bundle.entries.filter(entry => entry.id).every(entry => entry.optional)).toBe(true)
+    expect(wrapper.find('[data-category="tts"] .category-download').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('自动准备共用运行程序')
     wrapper.unmount()
   })
   it('全部安装就绪后隐藏批量导入，并保持语音服务详情入口', async () => {
     const wrapper = mount(LocalComponents, { props: { model: model() } })
-    expect(wrapper.find('.resource-batch-import').exists()).toBe(false)
+    expect(wrapper.find('.resource-batch-import').exists()).toBe(true)
     expect(wrapper.find('.local-install-actions').exists()).toBe(false)
     const card = await expandComponent(wrapper, 'voice-server', 'voice-system')
-    expect(card.get('.local-managed-resource').text()).toContain('已配置')
+    expect(card.get('.local-managed-resource').text()).toContain('本地系统服务')
     expect(wrapper.emitted('resourceRefresh')).toEqual([[], []])
     wrapper.unmount()
   })
@@ -137,7 +166,7 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(wrapper.emitted('resourceImport')).toEqual([['voice-server']])
     const complete = model()
     await wrapper.setProps({ model: complete })
-    expect(wrapper.find('.resource-batch-import').exists()).toBe(false)
+    expect(wrapper.find('.resource-batch-import').exists()).toBe(true)
     wrapper.unmount()
   })
 
@@ -149,7 +178,7 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     await wrapper.get('.resource-batch-import').trigger('click')
     expect(wrapper.emitted('resourceImportAll')).toEqual([[]])
     await wrapper.setProps({ model: { ...value, rows: value.rows.map(row => ({ ...row, resource: { ...row.resource!, state: 'installed' } })) } })
-    expect(wrapper.find('.resource-batch-import').exists()).toBe(false)
+    expect(wrapper.find('.resource-batch-import').exists()).toBe(true)
     wrapper.unmount()
   })
 
@@ -187,7 +216,7 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(wrapper.find('[data-job]').exists()).toBe(false)
     expect(wrapper.find('.local-install-actions').exists()).toBe(false)
     await card.get('.local-component-action').trigger('click')
-    expect(card.get('.local-component-detail').text()).toContain('完整语音运行环境')
+    expect(card.get('.local-component-detail').text()).toContain('本地系统服务')
     wrapper.unmount()
   })
 
@@ -227,12 +256,12 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(card.get('.local-state').text()).toBe('需更新')
     expect(card.get('button[aria-label="Paraformer（流式识别）：更新"]').text()).toBe('更新')
     expect(card.get('button[aria-label="Paraformer（流式识别）：导入"]').text()).toBe('导入')
-    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').text()).toBe('跳转来源')
+    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转"]').text()).toBe('跳转')
     expect(card.find('.local-component-action').exists()).toBe(false)
     expect(card.text()).not.toContain('可更新')
     await card.get('button[aria-label="Paraformer（流式识别）：更新"]').trigger('click')
     await card.get('button[aria-label="Paraformer（流式识别）：导入"]').trigger('click')
-    await card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').trigger('click')
+    await card.get('button[aria-label="Paraformer（流式识别）：跳转"]').trigger('click')
     expect(wrapper.emitted('resourceDownload')).toEqual([['paraformer-streaming']])
     expect(wrapper.emitted('resourceImport')).toEqual([['paraformer-streaming']])
     expect(wrapper.emitted('openResourceSource')).toEqual([['paraformer-streaming']])
@@ -270,7 +299,7 @@ describe('LocalComponents（本地组件）运行环境与导入入口', () => {
     expect(card.get('.local-state').text()).toBe('需更新')
     expect(card.get('button[aria-label="Paraformer（流式识别）：重试更新"]').text()).toBe('重试更新')
     expect(card.get('button[aria-label="Paraformer（流式识别）：导入"]').text()).toBe('导入')
-    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转官方来源"]').text()).toBe('跳转来源')
+    expect(card.get('button[aria-label="Paraformer（流式识别）：跳转"]').text()).toBe('跳转')
     expect(card.text()).toContain('更新校验失败')
     wrapper.unmount()
   })

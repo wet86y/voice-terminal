@@ -191,7 +191,7 @@ describe('桌面样例回放交互', () => {
     const row = await expandComponent(wrapper, 'paraformer', 'speech')
     expect(row.find('[data-metric="vram"]').exists()).toBe(false)
     expect(row.get('[data-metric="memory"]').text()).toBe('常驻内存／提交内存420 MB / 525 MB')
-    expect(row.get('.local-component-identity > .local-state').text()).toBe('运行中')
+    expect(row.get('.local-component-identity .local-state').text()).toBe('运行中')
     const sensevoice = await expandComponent(wrapper, 'sensevoice', 'speech')
     expect(sensevoice.get('[data-metric="vram"]').text()).toBe('显存740 MB')
     await row.get('select').setValue('cuda')

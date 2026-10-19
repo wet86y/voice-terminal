@@ -432,5 +432,5 @@ function cancelResource(id: string) { void props.resourceController?.cancelJob(i
 </script>
 <template>
   <ResourceInstallDialog v-if="resourceController" :controller="resourceController" />
-  <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" />
+  <LocalComponents :model="model" :saving="saving" @refresh="refresh" @retry="retry" @device="device" @save="saveComputeSettings" @resource-download="resourceDownload" @resource-download-required="resourceController?.downloadRequiredResources()" @resource-bundle-download="resourceBundleDownload" @resource-refresh="resourceRefresh" @resource-import="resourceImport" @resource-import-all="resourceImportAll" @open-resource-source="openResourceSource" @cancel-resource="cancelResource" />
 </template>

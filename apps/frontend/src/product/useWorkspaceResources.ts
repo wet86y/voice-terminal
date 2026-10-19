@@ -406,13 +406,15 @@ export function useWorkspaceResources() {
     await startResourceJob(resourceId ?? 'batch', 'import', resourceId)
   }
 
-  async function startResourceJob(resourceKey: string, operation: 'download' | 'import', resourceId?: string) {
+  async function startResourceJob(resourceKey: string, operation: 'download' | 'import' | 'required', resourceId?: string) {
     if (!resourcesCanManage.value || startingResources.value.has(resourceKey)
       || resourceJobs.value.some(job => job.resource_id === resourceKey && !TERMINAL_JOB_STATES.has(job.state))) return
     startingResources.value = new Set(startingResources.value).add(resourceKey)
     resourceError.value = ''
     try {
-      const result = operation === 'download'
+      const result = operation === 'required'
+        ? await port.downloadRequiredResources?.() ?? (() => { throw new Error('当前宿主不支持一键下载，请更新程序。') })()
+        : operation === 'download'
         ? await port.downloadResource(resourceKey)
         : await port.importResource(resourceId)
       if (!resourceJobs.value.some(job => job.job_id === result.job_id)) {
@@ -420,7 +422,7 @@ export function useWorkspaceResources() {
           job_id: result.job_id,
           resource_id: resourceKey,
           state: 'queued',
-          phase: operation === 'download' ? '正在准备下载' : resourceId ? '正在准备导入' : '正在准备批量导入',
+          phase: operation === 'required' ? '正在准备必要组件' : operation === 'download' ? '正在准备下载' : resourceId ? '正在准备导入' : '正在准备批量导入',
           can_cancel: true,
         })
       }
@@ -493,6 +495,7 @@ export function useWorkspaceResources() {
     linkWorkspace,
     migrateWorkspace,
     downloadResource,
+    downloadRequiredResources: () => startResourceJob('required-batch', 'required'),
     pendingDownloadPlan,
     confirmDownload,
     pendingDownloadBundlePlan,

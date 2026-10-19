@@ -284,7 +284,7 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
         let error=result.as_ref().err().cloned().or_else(||node_status.err()).or_else(||if update_available{Some("该组件的版本或适配要求有更新，请先完成更新。".into())}else{None});
         rows.push(json!({"resource_id":item["resource_id"],"label":item["title"],"installation_state":if result.is_ok(){"installed"}else if root.exists(){"incomplete"}else{"missing"},
             "required":item["required"]!=false,"files_installed":result.is_ok(),"runtime_ready":dependencies,"can_start":can_start,
-            "source_url":if item["kind"]=="dsh"&&!dependencies{crate::download_sources::policy()["node_download_page"].clone()}else{item["source"]["page_url"].clone()},"error":error,"runtime_group":group,
+            "source_url":if item["kind"]=="dsh"&&!dependencies&&!crate::dsh::node_installed(){crate::download_sources::policy()["node_download_page"].clone()}else{item["source"]["page_url"].clone()},"error":error,"runtime_group":group,
             "version":item["version"],"installed_version":installed_version,"update_available":update_available,
             "fields":{"required":"是否为阻塞启动的必需组件","files_installed":"模型或组件文件已安装","runtime_ready":"共享运行依赖已就绪","can_start":"具备启动条件","runtime_group":"启动所需共享依赖组",
                 "version":"随程序提供的目标模型或组件版本","installed_version":"实际安装的模型或组件版本；旧清单未知时为空","update_available":"目标模型或组件内容、版本可更新"}}));
@@ -306,22 +306,28 @@ pub fn inventory(context:&LaunchContext)->Result<Vec<Value>,String>{
     }
     Ok(rows)
 }
-/// update_tts_readiness（语音合成任选条件）：共用运行程序加任一本地模型，或在线密钥。
+/// update_tts_readiness（语音合成目标门禁）：按已选后端与具体模型检查。
 pub fn update_tts_readiness(context:&LaunchContext,rows:&mut [Value])->Result<(),String>{
     if !rows.iter().any(|row|row["resource_id"]=="tts"){return Ok(());}
     let runtime=rows.iter().any(|row|row["resource_id"]=="tts-audiocpp-runtime"&&row["can_start"]==true)
         || legacy_tts_runtime_ready(context)?;
-    let local=runtime&&rows.iter().any(|row|(row["resource_id"]=="tts-voxcpm1"||row["resource_id"]=="tts-voxcpm2")&&row["can_start"]==true);
+    for row in rows.iter_mut().filter(|row|matches!(row["resource_id"].as_str(),Some("tts-voxcpm1"|"tts-voxcpm2"))){
+        row["runtime_ready"]=json!(runtime);row["can_start"]=json!(runtime&&row["files_installed"]==true&&row["update_available"]!=true);
+    }
+    let local=runtime&&rows.iter().any(|row|matches!(row["resource_id"].as_str(),Some("tts-voxcpm1"|"tts-voxcpm2"))&&row["can_start"]==true);
+    let selection=crate::credentials::configured_tts_selection(&context.data);
+    let selected_id=format!("tts-{}",selection["local_model"].as_str().unwrap_or("voxcpm2"));
+    let selected_local=runtime&&rows.iter().any(|row|row["resource_id"]==selected_id&&row["can_start"]==true);
     let credentials=crate::credentials::status(&context.data)?;
     let online=credentials["providers"]["minimax"]["configured"]==true;
-    let ready=local||online;
+    let ready=if selection["backend"]=="voxcpm1"{selected_local}else{online};
     if let Some(row)=rows.iter_mut().find(|row|row["resource_id"]=="tts"){
         *row=json!({"resource_id":"tts","label":"TTS（语音合成）","required":true,"installation_state":if ready{"installed"}else{"missing"},
-            "files_installed":local,"runtime_ready":ready,"can_start":ready,"local_ready":local,"online_ready":online,
-            "error":if ready{Value::Null}else{json!("请安装 VoxCPM1 或 VoxCPM2（本地语音合成模型）及共用运行程序，或配置在线 API（接口）密钥。")},
+            "files_installed":local,"runtime_ready":ready,"can_start":ready,"local_ready":local,"selected_local_ready":selected_local,"online_ready":online,"selection":selection,
+            "error":if ready{Value::Null}else{json!(if selection["backend"]=="voxcpm1"{"所选本地语音模型及共用运行程序未就绪，请在组件管理补齐。"}else{"所选在线语音接口未配置，请填写密钥或显式选择已就绪的本地模型。"})},
             "fields":{"resource_id":"固定组件编号","label":"组件名称","required":"是否参与整体启动门槛","installation_state":"任选条件是否已满足",
-                "files_installed":"本地运行程序及至少一款模型完整","runtime_ready":"存在可用语音后端","can_start":"语音合成组件可以启动",
-                "local_ready":"至少一款本地模型及共用运行程序可用","online_ready":"在线语音接口密钥已配置","error":"尚未满足任选条件的原因"}});
+                "files_installed":"本地运行程序及至少一款模型完整","runtime_ready":"所选语音后端可用","can_start":"所选语音合成目标可以启动",
+                "selected_local_ready":"所选本地模型及框架可用","selection":"持久化选择的语音后端与本地模型","local_ready":"至少一款本地模型及共用运行程序可用","online_ready":"在线语音接口密钥已配置","error":"所选目标尚未就绪的原因"}});
     }Ok(())
 }
 /// legacy_tts_runtime_ready（旧原生安装兼容）：仅认可随包补丁对应的程序与模型规格摘要。
@@ -636,6 +642,9 @@ pub fn import_review(context:&LaunchContext,source:&Path,id:Option<&str>,cancel:
 pub fn import_review_with_activation(context:&LaunchContext,source:&Path,id:Option<&str>,cancel:Arc<AtomicBool>,progress:&mut Progress,review:&mut dyn FnMut(&[Value])->Result<(),String>,enable:&mut Activation)->Result<Vec<String>,String>{
     // 每个下载或导入任务独立暂存，网络传输、解包和校验可以并行。
     let task=safe_path(&context.install,&format!("tmp/native-resources-{}",crate::workspace::new_id()))?;fs::create_dir_all(&task).map_err(|e|e.to_string())?;
+    struct TaskCleanup<'a>{path:&'a Path,owner:&'a Path} // TaskCleanup（独立候选清理）：失败和取消同样回收。
+    impl Drop for TaskCleanup<'_>{fn drop(&mut self){let _=remove_owned(self.path,self.owner);}}
+    let _cleanup=TaskCleanup{path:&task,owner:&context.install};
     let mut inputs=vec![];
     if source.is_file()&&source.extension().is_some_and(|v|v.eq_ignore_ascii_case("zip")) {
         let unpacked=task.join("bundle");unpack_zip(source,&unpacked,&cancel,progress)?;
@@ -739,6 +748,7 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
         let matches=if item["origin"]=="npm_package"{load(&installed.join("runtime.json")).is_ok_and(|metadata|
             crate::dsh::target(&context.installed_program()).is_ok_and(|target|crate::dsh::current(&metadata,&target)))}else{true};
         matches&&dsh_validate_with_progress(context,&installed,true,&cancel,progress).is_ok()
+            &&(item["origin"]!="npm_package"||crate::dsh::target(&context.installed_program()).is_ok_and(|spec|crate::dsh::discover(&spec,true).is_ok()))
     }
         else{inspect_installed_model(context,&item,false).is_ok_and(|current|
             !model_update_available(&item,&current)&&validate_model_files_with_progress(context,&item,&installed,false,&cancel,progress).is_ok())};
@@ -760,9 +770,9 @@ pub fn download_resource_with_activation(context:&LaunchContext,id:&str,cancel:A
         let value=Value::Object(artifact.clone());let spec=file_spec(&value,value["url"].as_str().ok_or("缺少下载来源")?.into())?;let path=safe_path(&root,&spec.path)?;
         crate::download::download_with_progress(&spec,&path,cancel.clone(),&mut|phase,done,total|progress(&format!("固定附件：{phase}"),done,total),0)?;
         if id=="dsh"{return import_review_with_activation(context,&path,Some(id),cancel,progress,&mut|_|Ok(()),enable);}
-        let seven=context.program.join("tools/7zip/7z.exe");let out=root.join("extracted");run_seven(&seven,&path,&out,&cancel)?;
+        let seven=context.program.join("tools/7zip/7z.exe");let out=root.join("extracted");remove_owned(&out,&context.install)?;run_seven(&seven,&path,&out,&cancel)?;
         let tar=walk(&out)?.into_iter().find(|p|p.extension().is_some_and(|v|v=="tar")).ok_or("模型归档缺少 tar（内层归档）")?;
-        let model=root.join("model");run_seven(&seven,&tar,&model,&cancel)?;
+        let model=root.join("model");remove_owned(&model,&context.install)?;run_seven(&seven,&tar,&model,&cancel)?;
         let folder=walk(&model)?.into_iter().find(|p|p.file_name().is_some_and(|v|v=="tokens.txt")).ok_or("唤醒词归档不完整")?.parent().unwrap().to_path_buf();
         return import_review_with_activation(context,&folder,Some(id),cancel,progress,&mut|_|Ok(()),enable);
     }
@@ -804,9 +814,11 @@ fn download_patched_audiocpp(context:&LaunchContext,item:&Value,cancel:Arc<Atomi
         crate::download::download_with_progress(&file,&path,cancel.clone(),&mut|phase,done,total|progress(&format!("官方原生运行包：{phase}"),done,total),0)?;
         let archive_id=artifact["id"].as_str().ok_or("官方归档编号缺失")?;
         let out=safe_path(&task,&format!("unpacked/{archive_id}"))?;
+        remove_owned(&out,&context.install)?;
         unpack_zip(&path,&out,&cancel,progress)?;
     }
     progress("正在应用本地语音补丁",0,0);
+    remove_owned(&task.join("unpacked/patch"),&context.install)?;
     unpack_zip(&patch_file,&task.join("unpacked/patch"),&cancel,progress)?;
     let candidate=task.join("candidate");
     if candidate.exists(){remove_owned(&candidate,&context.install)?;}
@@ -866,6 +878,7 @@ fn run_seven(exe:&Path,source:&Path,target:&Path,cancel:&AtomicBool)->Result<(),
 }
 fn extract_dsh(context:&LaunchContext,source:&Path,target:&Path,cancel:&AtomicBool,progress:&mut Progress)->Result<(),String>{
     let sha=verify_installer(context,source,cancel,progress)?;let seven=context.program.join("tools/7zip/7z.exe");let staging=target.with_extension("extract");let outer=staging.join("nsis");
+    remove_owned(&staging,&context.install)?;
     progress("正在提取官方安装器",0,0);run_seven(&seven,source,&outer,cancel)?;
     let matches:Vec<_>=walk(&outer)?.into_iter().filter(|p|p.file_name().is_some_and(|n|n=="app-64.7z")).collect();if matches.len()!=1{return Err("官方安装器中无法唯一识别应用负载".into());}
     let inner=staging.join("payload");run_seven(&seven,&matches[0],&inner,cancel)?;
@@ -995,7 +1008,7 @@ mod download_tests {
     }
 
     #[test]
-    fn tts_any_installed_model_survives_other_optional_model_corruption(){
+    fn selected_tts_survives_only_unselected_optional_model_corruption(){
         let root=std::env::temp_dir().join(format!("voice-tts-options-{}",crate::workspace::new_id()));
         crate::workspace::initialize(&root).unwrap();ready_test_runtime(&root);
         fs::create_dir_all(root.join("app/scripts")).unwrap();
@@ -1013,6 +1026,7 @@ mod download_tests {
         }
         atomic_json(&root.join("app/config/resources/catalog.json"),&json!({"resources":entries})).unwrap();
         let context=LaunchContext::portable(&root).unwrap();
+        atomic_json(&context.data.join("config/product-settings.json"),&json!({"schema_version":14,"tts":{"backend":"voxcpm1","local_model":"voxcpm1"}})).unwrap();
         let rows=inventory(&context).unwrap();assert_eq!(rows.iter().find(|row|row["resource_id"]=="tts").unwrap()["local_ready"],true);
         fs::write(root.join("models/audiocpp/tts-voxcpm2/model.bin"),b"bad!").unwrap();
         let state=startup_readiness(&context).unwrap();assert_eq!(state["ready"],true);

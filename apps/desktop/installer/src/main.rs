@@ -209,6 +209,7 @@ fn main(){if let Err(error)=run(){voice_desktop_common::windows::error(&error);s
 #[cfg(test)]
 mod tests{
     use super::*;
+    use std::os::windows::process::CommandExt;
 
     #[test]
     fn accepts_nonce_generated_by_released_desktop(){
@@ -253,5 +254,42 @@ mod tests{
         assert!(mark_update_consumed(&path,&nonce).is_err());
         assert!(path.exists());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    #[ignore="轻量隔离验收：需要已组装的内嵌程序包，核验完整更新配置及真实旧进程、工作区锁释放"]
+    fn complete_update_config_and_parent_release_are_verified_in_isolation(){
+        // parent fixture（旧进程夹具）：同一测试二进制的子进程只等待，不运行安装界面。
+        if std::env::var_os("VOICE_UPDATE_PARENT_FIXTURE").is_some(){std::thread::sleep(Duration::from_secs(120));return;}
+        assert!(!PACKAGE.is_empty(),"需要明确指定已组装的程序包");
+        let owner=voice_desktop_common::canonical_path(&std::env::temp_dir()).unwrap();
+        let root=owner.join(format!("voice-update-handoff-{}",workspace::new_id()));workspace::initialize(&root).unwrap();
+        fs::create_dir_all(root.join("app")).unwrap();let parent_exe=root.join("app/VoiceTerminalDesktop.exe");
+        let current=std::env::current_exe().unwrap();fs::copy(&current,&parent_exe).unwrap();
+        struct OldParent(std::process::Child);
+        impl Drop for OldParent{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+        let mut child=OldParent(std::process::Command::new(&parent_exe).args(["--exact","tests::complete_update_config_and_parent_release_are_verified_in_isolation","--ignored"])
+            .env("VOICE_UPDATE_PARENT_FIXTURE","1").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).creation_flags(0x08000000).spawn().unwrap());
+        let (created,executable)=update_parent_identity(child.0.id()).unwrap().unwrap();
+        let nonce="123e4567-e89b-12d3-a456-426614174000";let path=root.join(format!("tmp/app-update-{nonce}.json"));
+        let version=installation::package_version(PACKAGE).unwrap();let portable=voice_desktop_common::resources::load(&root.join("portable.json")).unwrap();
+        let mut record=json!({"schema":1,"nonce":nonce,"target_root":root,"workspace_id":portable["workspace_id"],"parent_pid":child.0.id(),"parent_create_time":created,"parent_executable":executable,
+            "version":version,"tag":format!("v{version}"),"installer_size":fs::metadata(&current).unwrap().len(),"installer_sha256":workspace::file_hash(&current).unwrap(),"fields":{}});
+        for key in ["schema","nonce","target_root","workspace_id","parent_pid","parent_create_time","parent_executable","version","tag","installer_size","installer_sha256"]{record["fields"][key]=json!("隔离交接验收字段");}
+        for (field,value,reason) in [("workspace_id",json!("wrong-workspace"),"工作区身份"),("version",json!("999.0.0"),"版本不匹配"),
+            ("tag",json!("v999.0.0"),"版本不匹配"),("installer_size",json!(1),"安装器不匹配"),("installer_sha256",json!("0".repeat(64)),"安装器不匹配"),
+            ("parent_create_time",json!(created+1),"进程身份")]{
+            let mut changed=record.clone();changed[field]=value;workspace::atomic_json(&path,&changed).unwrap();
+            assert!(consume_update_config(&path).err().unwrap().contains(reason),"必须拒绝 {field}（被篡改字段）");
+            assert!(path.exists());assert!(!path.with_extension("json.consumed").exists());
+        }
+        workspace::atomic_json(&path,&record).unwrap();let (accepted,parent)=consume_update_config(&path).unwrap();assert_eq!(accepted,root);
+        assert!(!path.exists());assert!(path.with_extension("json.consumed").is_file());
+        workspace::atomic_json(&path,&record).unwrap();assert!(consume_update_config(&path).err().unwrap().contains("已使用"));
+        let held=installation::WorkspaceGuard::acquire(&root).unwrap();
+        let release=std::thread::spawn(move||{std::thread::sleep(Duration::from_millis(200));child.0.kill().unwrap();child.0.wait().unwrap();std::thread::sleep(Duration::from_millis(400));drop(held);});
+        let mut phases=vec![];wait_for_update_parent(&root,&parent,&mut|phase,_,_|phases.push(phase.to_owned())).unwrap();release.join().unwrap();
+        assert!(phases.iter().any(|phase|phase.contains("旧程序正常退出")));assert!(phases.iter().any(|phase|phase.contains("工作区锁释放")));
+        workspace::remove_owned(&root,&owner).unwrap();
     }
 }

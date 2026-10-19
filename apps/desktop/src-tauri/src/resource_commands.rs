@@ -31,6 +31,9 @@ struct JobSnapshot {
     resource_id: String, // resource_id（资源标识）。
     state: String, // state（任务状态）。
     phase: String, // phase（任务阶段说明）。
+    progress_kind: String, // progress_kind（进度类型）：下载、校验、安装或等待。
+    attempt: u32, // attempt（资源处理轮次）：首次加两次自动恢复。
+    parent_job_id: Option<String>, // parent_job_id（所属一键任务编号）。
     completed_bytes: u64, // completed_bytes（已处理字节数）。
     total_bytes: Option<u64>, // total_bytes（总字节数）。
     download_completed_bytes: Option<u64>, // download_completed_bytes（资源下载已完成字节）。
@@ -116,6 +119,8 @@ pub struct ResourceManager {
     environment: Mutex<()>, // environment（串行化完整语音环境的复制、组装与导入；模型下载仍可并行）。
     tts_runtime: Mutex<()>, // tts_runtime（串行化两款模型共用原生运行包的下载、补丁及启用）。
     resume_pending: Mutex<bool>, // resume_pending（先前运行服务的延迟恢复意图；全部资源更新完成后才恢复）。
+    batch_active: AtomicBool, // batch_active（一键维护中）：整批结束后才恢复服务。
+    accepting_jobs: AtomicBool, // accepting_jobs（接受新任务）：迁移排空前原子关闭，防止排空后再写旧工作区。
     validation_failures:Mutex<HashMap<String,String>>, // validation_failures（本次启动的完整校验失败）：管理页不能以字节数盘点掩盖同长度损坏。
     prepared_environment:Mutex<Option<PreparedEnvironment>>, // prepared_environment（本次任务已验证的共享环境）：启动仍做全量摘要复核。
 }
@@ -145,6 +150,8 @@ impl ResourceManager {
             tts_runtime: Mutex::new(()),
             reviews: Mutex::new(HashMap::new()),
             resume_pending: Mutex::new(false),
+            batch_active: AtomicBool::new(false),
+            accepting_jobs: AtomicBool::new(true),
             validation_failures:Mutex::new(HashMap::new()),
             prepared_environment:Mutex::new(None),
         };
@@ -238,15 +245,18 @@ impl ResourceManager {
     pub fn snapshots(&self)->Vec<Value>{let mut rows=self.jobs.lock().unwrap().values().map(|job|event_value(&job.snapshot)).collect::<Vec<_>>();rows.sort_by_key(|row|row["created_at"].as_u64().unwrap_or(0));rows}
     pub fn has_active_jobs(&self)->bool{self.jobs.lock().map(|jobs|jobs.values().any(|job|!terminal(&job.snapshot.state))).unwrap_or(true)}
     pub fn configure_runtime(self:&Arc<Self>,group:String)->Result<Value,String>{
-        if matches!(group.as_str(),"audiocpp"|"tts-audiocpp-runtime"){return self.download("tts-audiocpp-runtime".into());}
+        self.configure_runtime_child(group,None)
+    }
+    fn configure_runtime_child(self:&Arc<Self>,group:String,parent:Option<String>)->Result<Value,String>{
+        if matches!(group.as_str(),"audiocpp"|"tts-audiocpp-runtime"){return self.download_child("tts-audiocpp-runtime".into(),parent);}
         let job_id=format!("env-{group}");
         let resource_id=if voice_desktop_common::runtime::gpu_requested(&group){voice_desktop_common::runtime::GPU_RESOURCE}else{"voice-server"};
-        self.start_job(job_id.clone(),resource_id.into(),"正在配置语音环境".into(),true,move|manager,id|{
+        self.start_child_job(job_id.clone(),resource_id.into(),"正在配置语音环境".into(),true,parent,move|manager,id|{
             let cancel=manager.cancel_signal(&id)?;
             let mut progress=|phase:&str,done:u64,total:u64|manager.set_phase(&id,phase,!phase.starts_with("启用"),done,Some(total));
             let _environment=acquire_environment_lock(&manager.environment,&cancel,&mut progress).map_err(|message|JobError::Failed{message,installed:vec![]})?;
-            let result=manager.prepare_environment(&id,&group,cancel,&mut progress);
-            result.map_err(|message|JobError::Failed{message,installed:vec![]})
+            manager.retry_download(&id,||manager.prepare_environment(&id,&group,cancel.clone(),&mut progress)
+                .map_err(|message|JobError::Failed{message,installed:vec![]}))
         })?;Ok(json!({"job_id":job_id}))
     }
     pub fn import_runtime(self:&Arc<Self>)->Result<Value,String>{
@@ -268,20 +278,109 @@ impl ResourceManager {
 
     /// Download（下载）：run a fixed plan, retaining a stable task ID for resuming files.
     pub fn download(self: &Arc<Self>, resource_id: String) -> Result<Value, String> {
-        if matches!(resource_id.as_str(),"voice-server"|voice_desktop_common::runtime::CPU_RESOURCE){return self.configure_runtime("cpu".into());}
-        if resource_id==voice_desktop_common::runtime::GPU_RESOURCE{return self.configure_runtime("gpu".into());}
+        self.download_child(resource_id,None)
+    }
+    fn download_child(self:&Arc<Self>,resource_id:String,parent:Option<String>)->Result<Value,String>{
+        if matches!(resource_id.as_str(),"voice-server"|voice_desktop_common::runtime::CPU_RESOURCE){return self.configure_runtime_child("cpu".into(),parent);}
+        if resource_id==voice_desktop_common::runtime::GPU_RESOURCE{return self.configure_runtime_child("gpu".into(),parent);}
         if !valid_resource_id(&resource_id) {
             return Err("资源编号格式无效。".into());
         }
         let job_id = format!("dl-{resource_id}"); // Same resource uses the same task ID across retries.
-        self.start_job(
+        self.start_child_job(
             job_id.clone(),
             resource_id.clone(),
             "正在准备资源下载".into(),
             true,
-            move |manager, job_id| manager.run_download(&job_id, &resource_id),
+            parent,
+            move |manager, job_id| manager.retry_download(&job_id,||manager.run_download(&job_id, &resource_id)),
         )?;
         Ok(json!({ "job_id": job_id }))
+    }
+
+    /// download_required（一键下载）：原生端持有依赖顺序与取消状态，页面关闭不影响任务。
+    pub fn download_required(self:&Arc<Self>)->Result<Value,String>{
+        let id="dl-required".to_string();
+        let result=self.start_job(id.clone(),"required-batch".into(),"准备必要组件".into(),true,|manager,parent|{
+            let outcome=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||manager.run_required(&parent)))
+                .unwrap_or_else(|_|Err(JobError::Failed{message:"一键下载异常中断，可重试。".into(),installed:vec![]}));
+            manager.batch_active.store(false,Ordering::Release);
+            if manager.pending_service_resume().unwrap_or(false){
+              let mut lease=manager.pause_service().map_err(|message|JobError::Failed{message,installed:vec![]})?;
+                match manager.maybe_resume_service(&mut lease){Ok(resumed)=>clear_resume_intent_if_resumed(&manager.resume_pending,resumed),Err(message)=>return Err(JobError::Failed{message,installed:vec![]})}
+            }
+            outcome
+        });
+        result?;Ok(json!({"job_id":id}))
+    }
+
+    fn run_required(self:&Arc<Self>,parent:&str)->Result<Vec<String>,JobError>{
+        let mut installed=vec![];
+        let cpu=self.configure_runtime_child("cpu".into(),Some(parent.into())).map_err(|message|JobError::Failed{message,installed:vec![]})?;
+        let cpu_id=cpu["job_id"].as_str().unwrap().to_owned();
+        self.wait_required(parent,&[cpu_id],&mut installed)?;
+        let specs=voice_desktop_common::resources::specs(&self.context).map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
+        let mut children=vec![];let mut errors=vec![];
+        for item in specs.iter().filter(|item|item["required"]!=false){
+            if self.cancelled(parent){break;}
+            let Some(resource)=item["resource_id"].as_str()else{continue;};
+            match self.download_child(resource.into(),Some(parent.into())){
+                Ok(value)=>{let child=value["job_id"].as_str().unwrap().to_owned();children.push(child);},
+                Err(error)=>errors.push(format!("{resource}（组件）：{error}")),
+            }
+        }
+        if let Err(error)=self.wait_required(parent,&children,&mut installed){return Err(error);}
+        if errors.is_empty(){Ok(installed)}else{Err(JobError::Failed{message:errors.join("；"),installed})}
+    }
+
+    fn wait_required(&self,parent:&str,children:&[String],installed:&mut Vec<String>)->Result<(),JobError>{
+        loop{
+            if self.cancelled(parent){for child in children{let _=self.cancel(child);} }
+            let rows={let jobs=self.jobs.lock().map_err(|_|JobError::Failed{message:"资源任务状态不可用。".into(),installed:installed.clone()})?;
+                children.iter().filter_map(|id|jobs.get(id).map(|job|job.snapshot.clone())).collect::<Vec<_>>()};
+            for row in &rows{for id in &row.installed_resources{if !installed.contains(id){installed.push(id.clone());}}}
+            let active=rows.iter().filter(|row|!terminal(&row.state)).collect::<Vec<_>>();
+            if active.is_empty(){
+                if self.cancelled(parent){return Err(JobError::Cancelled);}
+                let errors=rows.iter().filter(|row|row.state!="complete").map(|row|format!("{}（组件）：{}",row.resource_id,row.error.as_deref().unwrap_or("任务已取消，可重试"))).collect::<Vec<_>>();
+                return if errors.is_empty(){Ok(())}else{Err(JobError::Failed{message:errors.join("；"),installed:installed.clone()})};
+            }
+            let phase=format!("一键下载：已完成 {} / {} 项；{}",rows.len()-active.len(),children.len(),active.first().map(|row|row.phase.as_str()).unwrap_or("正在处理资源"));
+            self.set_phase(parent,&phase,true,0,None);
+            self.update_job(parent,|row|row.installed_resources=installed.clone());
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// retry_download（任务内自动恢复）：最多三轮，只清理本任务拥有的错误候选。
+    fn retry_download<F>(&self,id:&str,mut operation:F)->Result<Vec<String>,JobError>
+    where F:FnMut()->Result<Vec<String>,JobError>{
+        let mut installed=vec![];
+        for attempt in 1..=3{
+            if self.cancelled(id){return Err(JobError::Cancelled);}
+            self.update_job(id,|row|{row.attempt=attempt;row.can_cancel=true;row.progress_kind="waiting".into();row.completed_bytes=0;row.total_bytes=None;
+                row.download_completed_bytes=None;row.download_total_bytes=None;row.verification_completed_bytes=None;row.verification_total_bytes=None;});
+            match voice_desktop_common::download::with_attempt(Some(attempt),&mut operation){
+                Ok(mut result)=>{installed.append(&mut result);installed.sort();installed.dedup();return Ok(installed);},
+                Err(JobError::Failed{message,installed:partial})=>{
+                    installed.extend(partial);
+                    if attempt==3||!retryable_failure(&message){return Err(JobError::Failed{message,installed});}
+                    self.set_phase(id,&format!("自动恢复：{message}；准备第 {} / 3 轮",attempt+1),true,0,None);
+                    let resource=self.jobs.lock().ok().and_then(|rows|rows.get(id).map(|row|row.snapshot.resource_id.clone())).unwrap_or_default();
+                    if let Err(error)=self.clear_failed_candidate(&resource){return Err(JobError::Failed{message:format!("{message}；自动清理失败：{error}"),installed});}
+                    for _ in 0..if attempt==1{10}else{30}{if self.cancelled(id){return Err(JobError::Cancelled);}thread::sleep(Duration::from_millis(100));}
+                },
+                Err(error)=>return Err(error),
+            }
+        }unreachable!()
+    }
+
+    fn clear_failed_candidate(&self,resource:&str)->Result<(),String>{
+        let mut relatives=vec![];
+        if resource=="voice-server"||resource==voice_desktop_common::runtime::GPU_RESOURCE{relatives.push("tmp/voice-environment/stage".to_owned());}
+        else if valid_resource_id(resource){for suffix in ["extracted","model","candidate","unpacked"]{relatives.push(format!("tmp/resource-downloads/{resource}/{suffix}"));}}
+        for relative in relatives{let path=voice_desktop_common::workspace::safe_path(&self.context.install,&relative)?;voice_desktop_common::workspace::remove_owned(&path,&self.context.install)?;}
+        Ok(())
     }
 
     /// Import（导入）：open the native picker on a worker thread and install selected sources.
@@ -325,7 +424,7 @@ impl ResourceManager {
         }
         if resource_id=="dsh"{
             let spec=voice_desktop_common::resources::spec(&self.context,resource_id)?;
-            if spec["origin"]=="npm_package"&&voice_desktop_common::dsh::discover(&voice_desktop_common::dsh::target(&self.context.installed_program())?,true).is_err(){
+            if spec["origin"]=="npm_package"&&!voice_desktop_common::dsh::node_installed(){
                 #[cfg(windows)] return voice_desktop_common::windows::open_url(voice_desktop_common::download_sources::policy()["node_download_page"].as_str().unwrap());
             }
         }
@@ -384,6 +483,7 @@ impl ResourceManager {
         let mut events = Vec::new();
         {
             let mut jobs = self.jobs.lock().map_err(|_| "资源任务状态不可用。")?;
+            self.accepting_jobs.store(false,Ordering::Release);
             for job in jobs.values_mut() {
                 if terminal(&job.snapshot.state) || !job.snapshot.can_cancel { continue; }
                 job.cancel.store(true, Ordering::Release);
@@ -413,7 +513,20 @@ impl ResourceManager {
                 return Err("资源仍在原子安装，当前不能切换工作区。".into());
             }
         }
-        Ok(())
+        drop(jobs);
+        // 已排空资源提交后暂停现用服务；意图保留到交接成功或取消后的恢复完成。
+        let mut lease=self.pause_service()?;
+        let remembered=self.remember_service_was_running(lease.was_running());
+        lease.keep_stopped();remembered
+    }
+
+    pub fn resume_accepting_jobs(&self)->Result<(),String>{
+        self.accepting_jobs.store(true,Ordering::Release);
+        if self.pending_service_resume()?{
+            let mut lease=self.pause_service()?;
+            let resumed=self.maybe_resume_service(&mut lease)?;
+            clear_resume_intent_if_resumed(&self.resume_pending,resumed);
+        }Ok(())
     }
 
     fn run_download(self: &Arc<Self>, job_id: &str, resource_id: &str) -> Result<Vec<String>, JobError> {
@@ -428,7 +541,7 @@ impl ResourceManager {
             .map_err(|message|JobError::Failed{message,installed:vec![]})?;
         let item=voice_desktop_common::resources::spec(&self.context,resource_id)
             .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
-        if let Some(shared)=item["runtime_resource"].as_str(){
+        if let Some(shared)=item["runtime_resource"].as_str().filter(|_| !matches!(resource_id,"tts-voxcpm1"|"tts-voxcpm2")){
             let _shared=acquire_environment_lock(&self.tts_runtime,&cancel,&mut progress)
                 .map_err(|message|JobError::Failed{message,installed:installed.clone()})?;
             let result=voice_desktop_common::resources::download_resource_with_activation(&self.context,shared,cancel.clone(),&mut progress,
@@ -610,14 +723,7 @@ impl ResourceManager {
     }
 
     fn maybe_resume_service(&self,lease:&mut ServiceLease<'_>)->Result<bool,String>{
-        if !self.pending_service_resume()?{lease.keep_stopped();return Ok(false);}
-        match self.all_resources_ready(){
-            Ok(false)=>{lease.keep_stopped();return Ok(false);}
-            Err(error)=>{lease.keep_stopped();return Err(format!("无法确认全部组件已就绪，语音服务保持停止：{error}"));}
-            Ok(true)=>{}
-        }
-        lease.resume_service()?;
-        Ok(true)
+        resume_service_if_ready(lease,&self.resume_pending,&self.accepting_jobs,&self.batch_active,||self.all_resources_ready())
     }
 
     fn rollback_failed_activation(&self,lease:&mut ServiceLease<'_>,transaction:&mut voice_desktop_common::resources::PendingActivation,reason:&str)->String{
@@ -718,11 +824,20 @@ impl ResourceManager {
 
     fn start_job<F>(self: &Arc<Self>, job_id: String, resource_id: String, phase: String, can_cancel: bool, worker: F) -> Result<(), String>
     where F: FnOnce(Arc<ResourceManager>, String) -> Result<Vec<String>, JobError> + Send + 'static {
+        self.start_child_job(job_id,resource_id,phase,can_cancel,None,worker)
+    }
+
+    // start_child_job（任务准入）：在同一状态锁内预留批量任务，并只放行所属子任务。
+    fn start_child_job<F>(self:&Arc<Self>,job_id:String,resource_id:String,phase:String,can_cancel:bool,parent:Option<String>,worker:F)->Result<(),String>
+    where F:FnOnce(Arc<ResourceManager>,String)->Result<Vec<String>,JobError>+Send+'static{
         {
             let mut jobs = self.jobs.lock().map_err(|_| "资源任务状态不可用。")?;
+            if !self.accepting_jobs.load(Ordering::Acquire){return Err("工作区正在迁移、更新或退出，不能启动新的资源任务。".into());}
             if jobs.get(&job_id).is_some_and(|job| !terminal(&job.snapshot.state)) {
+                if jobs[&job_id].snapshot.parent_job_id!=parent{return Err("此组件由其他资源任务处理中，请等待完成。".into());}
                 return Ok(());
             }
+            validate_batch_admission(&jobs,&resource_id,parent.as_deref())?;
             if jobs.values().any(|job|job.snapshot.resource_id==resource_id&&!terminal(&job.snapshot.state)){
                 return Err("此组件已有下载或导入任务，请等待该任务完成。".into());
             }
@@ -730,10 +845,11 @@ impl ResourceManager {
             let snapshot = JobSnapshot { job_id: job_id.clone(), resource_id, state: "queued".into(), phase,
                 completed_bytes: 0, total_bytes: None, download_completed_bytes:None,download_total_bytes:None,
                 verification_completed_bytes:None,verification_total_bytes:None,error: None, can_cancel, installed_resources: vec![],
-                import_preview: None, created_at, revision: 1 };
+                import_preview: None, created_at, revision: 1, progress_kind:"waiting".into(),attempt:1,parent_job_id:parent };
             jobs.insert(job_id.clone(), JobControl { snapshot: snapshot.clone(), cancel: Arc::new(AtomicBool::new(false)), child: None,
                 last_event:Instant::now(),last_persist:Instant::now() });
-            self.persist_locked(&jobs)?;
+            if let Err(error)=self.persist_locked(&jobs){jobs.remove(&job_id);return Err(error);}
+            if snapshot.resource_id=="required-batch"{self.batch_active.store(true,Ordering::Release);}
             let _ = self.app.emit(PROGRESS_EVENT, event_value(&snapshot));
         }
         let manager = Arc::clone(self);
@@ -756,6 +872,7 @@ impl ResourceManager {
     }
 
     fn finish_job(&self, job_id: &str, result: Result<Vec<String>, JobError>) {
+        if job_id=="dl-required"{self.batch_active.store(false,Ordering::Release);}
         let (state, phase, error, installed) = match result {
             Ok(installed) => ("complete", "资源处理完成", None, installed),
             Err(JobError::Cancelled) => ("cancelled", "任务已取消；临时下载可供重试", None, vec![]),
@@ -764,7 +881,7 @@ impl ResourceManager {
         if let Ok(mut failures)=self.validation_failures.lock(){for id in &installed{failures.remove(id);}}
         self.update_job(job_id, |snapshot| {
             snapshot.state = state.into(); snapshot.phase = phase.into(); snapshot.error = error;
-            snapshot.can_cancel = false; snapshot.installed_resources = installed;snapshot.import_preview=None;
+            snapshot.can_cancel = false; for id in installed{if !snapshot.installed_resources.contains(&id){snapshot.installed_resources.push(id);}}snapshot.import_preview=None;
         });
     }
 
@@ -773,6 +890,7 @@ impl ResourceManager {
             if snapshot.state == "cancelling" { return; }
             if !terminal(&snapshot.state) { snapshot.state = "running".into(); }
             snapshot.phase = phase.into(); snapshot.can_cancel = can_cancel;
+            snapshot.progress_kind = progress_kind(phase).into();
             if phase.starts_with(voice_desktop_common::download::BATCH_DOWNLOAD_PROGRESS_PREFIX) {
                 snapshot.download_completed_bytes=Some(done);snapshot.download_total_bytes=total;
                 if snapshot.verification_total_bytes.is_none(){snapshot.verification_completed_bytes=Some(0);snapshot.verification_total_bytes=total;}
@@ -797,6 +915,7 @@ impl ResourceManager {
             job.snapshot.state = "running".into();
             job.snapshot.phase = phase.into();
             job.snapshot.can_cancel = false;
+            job.snapshot.progress_kind = "install".into();
             job.snapshot.completed_bytes = done;
             job.snapshot.total_bytes = total;
             job.snapshot.download_completed_bytes=None;job.snapshot.download_total_bytes=None;
@@ -864,7 +983,8 @@ impl ResourceManager {
                 completed_bytes: value["completed_bytes"].as_u64().unwrap_or(0), total_bytes: value["total_bytes"].as_u64(),
                 download_completed_bytes:value["download_completed_bytes"].as_u64(),download_total_bytes:value["download_total_bytes"].as_u64(),
                 verification_completed_bytes:value["verification_completed_bytes"].as_u64(),verification_total_bytes:value["verification_total_bytes"].as_u64(),
-                error, can_cancel, installed_resources, import_preview: None, created_at: value["created_at"].as_u64().unwrap_or(0),revision:value["revision"].as_u64().unwrap_or(0).saturating_add(1) };
+                error, can_cancel, installed_resources, import_preview: None, created_at: value["created_at"].as_u64().unwrap_or(0),revision:value["revision"].as_u64().unwrap_or(0).saturating_add(1),
+                progress_kind:value["progress_kind"].as_str().unwrap_or("waiting").into(),attempt:value["attempt"].as_u64().unwrap_or(1) as u32,parent_job_id:value["parent_job_id"].as_str().map(str::to_owned) };
             jobs.insert(snapshot.job_id.clone(), JobControl { snapshot, cancel: Arc::new(AtomicBool::new(false)), child: None,
                 last_event:Instant::now(),last_persist:Instant::now() });
         }
@@ -903,6 +1023,18 @@ impl ResourceManager {
 
 fn clear_resume_intent_if_resumed(resume_pending:&Mutex<bool>,resumed:bool){
     if resumed{if let Ok(mut pending)=resume_pending.lock(){*pending=false;}}
+}
+
+// resume_service_if_ready（维护后恢复）：暂停准入时保留意图，恢复后只启动原先运行的服务。
+fn resume_service_if_ready(lease:&mut ServiceLease<'_>,pending:&Mutex<bool>,accepting:&AtomicBool,batch:&AtomicBool,ready:impl FnOnce()->Result<bool,String>)->Result<bool,String>{
+    if !accepting.load(Ordering::Acquire)||batch.load(Ordering::Acquire){lease.keep_stopped();return Ok(false);}
+    if !*pending.lock().map_err(|_|"服务恢复意图不可用。")?{lease.keep_stopped();return Ok(false);}
+    match ready(){
+        Ok(false)=>{lease.keep_stopped();return Ok(false);},
+        Err(error)=>{lease.keep_stopped();return Err(format!("无法确认全部组件已就绪，语音服务保持停止：{error}"));},
+        Ok(true)=>{},
+    }
+    lease.resume_service()?;Ok(true)
 }
 
 fn acquire_environment_lock<'a>(environment:&'a Mutex<()>,cancel:&AtomicBool,progress:&mut voice_desktop_common::resources::Progress<'_>)->Result<MutexGuard<'a,()>,String>{
@@ -980,6 +1112,9 @@ fn event_value(snapshot: &JobSnapshot) -> Value {
         "resource_id": snapshot.resource_id,
         "state": snapshot.state,
         "phase": snapshot.phase,
+        "progress_kind": snapshot.progress_kind,
+        "attempt": snapshot.attempt,
+        "parent_job_id": snapshot.parent_job_id,
         "completed_bytes": snapshot.completed_bytes,
         "total_bytes": snapshot.total_bytes,
         "download_completed_bytes":snapshot.download_completed_bytes,
@@ -992,11 +1127,35 @@ fn event_value(snapshot: &JobSnapshot) -> Value {
         "created_at": snapshot.created_at,
         "revision": snapshot.revision,
         "import_preview": snapshot.import_preview,
-        "fields":{"created_at":"本次任务创建时间，Unix 毫秒","revision":"状态修订号，拒绝迟到事件","job_id":"任务编号","resource_id":"组件编号","state":"任务状态","phase":"当前阶段","completed_bytes":"其他阶段已处理字节数","total_bytes":"其他阶段总字节数","download_completed_bytes":"资源下载已完成字节数","download_total_bytes":"资源下载总字节数","verification_completed_bytes":"本地摘要校验已处理字节数","verification_total_bytes":"本地摘要校验总字节数","error":"失败说明","can_cancel":"是否允许取消","installed_resources":"本次启用的组件编号","import_preview":"导入确认内容"},
+        "fields":{"progress_kind":"当前进度类型，下载与校验分别计数","attempt":"当前自动恢复轮次","parent_job_id":"所属一键任务编号","created_at":"本次任务创建时间，Unix 毫秒","revision":"状态修订号，拒绝迟到事件","job_id":"任务编号","resource_id":"组件编号","state":"任务状态","phase":"当前阶段","completed_bytes":"其他阶段已处理字节数","total_bytes":"其他阶段总字节数","download_completed_bytes":"资源下载已完成字节数","download_total_bytes":"资源下载总字节数","verification_completed_bytes":"本地摘要校验已处理字节数","verification_total_bytes":"本地摘要校验总字节数","error":"失败说明","can_cancel":"是否允许取消","installed_resources":"本次启用的组件编号","import_preview":"导入确认内容"},
     })
 }
 
 fn terminal(state: &str) -> bool { matches!(state, "complete" | "completed" | "failed" | "cancelled" | "canceled") }
+
+fn validate_batch_admission(jobs:&HashMap<String,JobControl>,resource:&str,parent:Option<&str>)->Result<(),String>{
+    let batch=jobs.values().find(|job|job.snapshot.resource_id=="required-batch"&&!terminal(&job.snapshot.state));
+    if resource=="required-batch"{
+        if jobs.values().any(|job|!terminal(&job.snapshot.state)){return Err("请等待当前资源任务完成后再一键下载。".into());}
+    }else if let Some(parent)=parent{
+        if !batch.is_some_and(|job|job.snapshot.job_id==parent&&!job.cancel.load(Ordering::Acquire)){
+            return Err("所属一键任务已结束或取消，不再启动新组件。".into());
+        }
+    }else if batch.is_some(){return Err("一键下载正在处理必要组件，请等待完成或取消后再操作。".into());}
+    Ok(())
+}
+
+fn progress_kind(phase:&str)->&'static str{ // progress_kind（阶段投影）：字节只属于当前阶段。
+    if phase.starts_with(voice_desktop_common::download::BATCH_DOWNLOAD_PROGRESS_PREFIX){"download"}
+    else if phase.starts_with(voice_desktop_common::download::BATCH_VERIFY_PROGRESS_PREFIX){"verify"}
+    else if phase.contains("等待")||phase.contains("来源")||phase.starts_with("一键下载：")||phase.starts_with("自动恢复"){"waiting"}
+    else if phase.contains("校验")||phase.contains("核验")||phase.contains("核对"){"verify"}
+    else if phase.contains("下载进度")||phase.contains("下载固定资源")||phase.contains("正在下载"){"download"}
+    else{"install"}
+}
+pub(crate) fn retryable_failure(message:&str)->bool{ // retryable_failure（可自动恢复）：取消、永久配置与权限错误停止重试。
+    !["取消","空间不足","磁盘空间","目录权限","拒绝访问","Permission denied","os error 5","系统仍拒绝","系统错误码：5","缺少可信","清单无效","清单缺失","未锁定","来源必须","兼容显卡环境","无法暂停","恢复旧资源失败","恢复原组件失败","资源回滚留待"].iter().any(|reason|message.contains(reason))
+}
 
 fn valid_resource_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && value.bytes().enumerate().all(|(index, byte)| {
@@ -1059,6 +1218,11 @@ pub async fn resource_download(
     tauri::async_runtime::spawn_blocking(move || manager.download(resource_id)).await.map_err(|_| "资源下载任务无法启动。")?
 }
 
+#[tauri::command]
+pub async fn resource_download_required(window:WebviewWindow,desktop:State<'_,Arc<super::Desktop>>,manager:State<'_,Arc<ResourceManager>>)->Result<Value,String>{
+    command_allowed(&window,&desktop)?;manager.inner().clone().download_required()
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn resource_import(
     window: WebviewWindow,
@@ -1102,6 +1266,28 @@ pub fn resource_import_confirm(window:WebviewWindow,desktop:State<Arc<super::Des
 #[cfg(test)]
 mod service_tests {
     use super::*;
+
+    #[test]
+    fn required_batch_reserves_jobs_and_only_admits_its_own_children(){
+        let root=std::env::temp_dir().join(format!("voice-job-admission-{}",voice_desktop_common::workspace::new_id()));fs::create_dir_all(&root).unwrap();
+        let path=root.join("jobs.json");
+        voice_desktop_common::workspace::atomic_json(&path,&json!({"schema":1,"jobs":[{"job_id":"dl-required","resource_id":"required-batch","state":"complete","phase":"已完成","created_at":100}]})).unwrap();
+        let mut jobs=ResourceManager::load_jobs(&path).unwrap();
+        jobs.get_mut("dl-required").unwrap().snapshot.state="running".into();
+        assert!(validate_batch_admission(&jobs,"model",None).is_err());
+        assert!(validate_batch_admission(&jobs,"required-batch",None).is_err());
+        assert!(validate_batch_admission(&jobs,"model",Some("dl-required")).is_ok());
+        assert!(validate_batch_admission(&jobs,"model",Some("other-batch")).is_err());
+        jobs["dl-required"].cancel.store(true,Ordering::Release);
+        assert!(validate_batch_admission(&jobs,"model",Some("dl-required")).is_err());
+        jobs.get_mut("dl-required").unwrap().snapshot.state="cancelled".into();
+        assert!(validate_batch_admission(&jobs,"model",None).is_ok());
+        assert!(validate_batch_admission(&jobs,"model",Some("dl-required")).is_err());
+        assert!(validate_batch_admission(&jobs,"required-batch",None).is_ok());
+        jobs.get_mut("dl-required").unwrap().snapshot.resource_id="model".into();jobs.get_mut("dl-required").unwrap().snapshot.state="running".into();
+        assert!(validate_batch_admission(&jobs,"required-batch",None).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn prepared_environment_identity_rejects_changed_manifest_and_file_collection(){
@@ -1159,6 +1345,23 @@ mod service_tests {
         let mut lease=ServiceLease::pause(&control,lock.lock().unwrap()).unwrap();
         assert!(lease.was_running());lease.keep_stopped();drop(lease);
         assert_eq!(*calls.lock().unwrap(),vec![false]);
+    }
+
+    #[test]
+    fn cancelled_maintenance_preserves_resume_intent_without_starting_idle_services(){
+        for running in [false,true]{
+            let (control,calls)=control(running);let lock=Mutex::new(());let pending=Mutex::new(running);
+            let accepting=AtomicBool::new(false);let batch=AtomicBool::new(false);
+            let mut paused=ServiceLease::pause(&control,lock.lock().unwrap()).unwrap();
+            assert!(!resume_service_if_ready(&mut paused,&pending,&accepting,&batch,||panic!("维护期间不能启动资源检查或服务")).unwrap());
+            drop(paused);assert_eq!(*pending.lock().unwrap(),running);
+            accepting.store(true,Ordering::Release);
+            let mut recovery=ServiceLease::pause(&control,lock.lock().unwrap()).unwrap();
+            let resumed=resume_service_if_ready(&mut recovery,&pending,&accepting,&batch,||Ok(true)).unwrap();
+            clear_resume_intent_if_resumed(&pending,resumed);drop(recovery);
+            assert_eq!(resumed,running);assert!(!*pending.lock().unwrap());
+            assert_eq!(*calls.lock().unwrap(),if running{vec![false,false,true]}else{vec![false,false]});
+        }
     }
 
     #[test]

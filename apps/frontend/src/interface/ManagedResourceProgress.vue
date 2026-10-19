@@ -13,12 +13,14 @@ function progressPercent(done: number | null | undefined, total: number | null |
     || typeof done !== 'number' || !Number.isFinite(done)) return undefined
   return Math.max(0, Math.min(100, Math.round(done / total * 100)))
 }
-const percent = computed(() => {
-  return progressPercent(props.job.completedBytes, props.job.totalBytes)
-})
-const downloadPercent = computed(() => progressPercent(props.job.downloadCompletedBytes, props.job.downloadTotalBytes))
-const verificationPercent = computed(() => progressPercent(props.job.verificationCompletedBytes, props.job.verificationTotalBytes))
-const hasBatchProgress = computed(() => downloadPercent.value !== undefined && verificationPercent.value !== undefined)
+const kind = computed(() => props.job.progressKind ?? (/校验|核验/.test(props.job.phase) ? 'verify' : /下载/.test(props.job.phase) ? 'download' : undefined))
+const done = computed(() => kind.value === 'download' ? props.job.downloadCompletedBytes ?? props.job.completedBytes
+  : kind.value === 'verify' ? props.job.verificationCompletedBytes ?? props.job.completedBytes : props.job.completedBytes)
+const total = computed(() => kind.value === 'download' ? props.job.downloadTotalBytes ?? props.job.totalBytes
+  : kind.value === 'verify' ? props.job.verificationTotalBytes ?? props.job.totalBytes : props.job.totalBytes)
+const percent = computed(() => props.job.progressKind && ['install', 'waiting'].includes(props.job.progressKind)
+  ? undefined : progressPercent(done.value, total.value))
+const stageLabel = computed(() => kind.value === 'download' ? '下载：' : kind.value === 'verify' ? '校验：' : '')
 function formatBytes(value: number | null | undefined) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return ''
   if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GiB`
@@ -30,22 +32,12 @@ function formatBytes(value: number | null | undefined) {
 
 <template>
   <section class="managed-resource-progress" :data-job="job.id" :aria-label="`${label}任务进度`">
-    <p class="managed-job-phase" role="status">{{ job.phase }}</p>
-    <div v-if="hasBatchProgress" class="managed-job-progresses">
-      <div class="managed-job-progress-wrap">
-        <div class="managed-job-progress" role="progressbar" :aria-label="`${label}下载进度`" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="downloadPercent"><span :style="{ width: `${downloadPercent}%` }"></span></div>
-        <small>下载：{{ formatBytes(job.downloadCompletedBytes) }} / {{ formatBytes(job.downloadTotalBytes) }} · {{ downloadPercent }}%</small>
-      </div>
-      <div class="managed-job-progress-wrap">
-        <div class="managed-job-progress" role="progressbar" :aria-label="`${label}摘要校验进度`" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="verificationPercent"><span :style="{ width: `${verificationPercent}%` }"></span></div>
-        <small>摘要校验：{{ formatBytes(job.verificationCompletedBytes) }} / {{ formatBytes(job.verificationTotalBytes) }} · {{ verificationPercent }}%</small>
-      </div>
-    </div>
-    <div v-else-if="active || percent !== undefined" class="managed-job-progress-wrap">
+    <p class="managed-job-phase" role="status">{{ job.attempt && job.attempt > 1 ? `第 ${job.attempt} / 3 轮 · ` : '' }}{{ job.phase }}</p>
+    <div v-if="active || percent !== undefined" class="managed-job-progress-wrap">
       <div class="managed-job-progress" :class="{ indeterminate: percent === undefined }" role="progressbar" :aria-label="`${label}进度`" :aria-valuemin="0" :aria-valuemax="100" :aria-valuenow="percent">
         <span :style="percent !== undefined ? { width: `${percent}%` } : undefined"></span>
       </div>
-      <small v-if="percent !== undefined">{{ formatBytes(job.completedBytes) }} / {{ formatBytes(job.totalBytes) }} · {{ percent }}%</small>
+      <small v-if="percent !== undefined">{{ stageLabel }}{{ formatBytes(done) }} / {{ formatBytes(total) }} · {{ percent }}%</small>
       <small v-else>请稍候…</small>
     </div>
     <p v-if="job.error" class="managed-job-error" role="alert">{{ job.error }}</p>

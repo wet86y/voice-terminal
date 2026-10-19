@@ -143,6 +143,9 @@ export interface ManagedResourceJob {
   /** state（任务状态）与 phase（当前阶段）。 */
   state: string
   phase: string
+  progressKind?: 'download' | 'verify' | 'install' | 'waiting' // progressKind（当前进度类型）。
+  attempt?: number // attempt（自动恢复轮次）。
+  parentJobId?: string | null // parentJobId（所属一键任务）。
   /** completedBytes（已处理字节）与 totalBytes（总字节）。 */
   completedBytes?: number | null
   totalBytes?: number | null
@@ -158,6 +161,8 @@ export interface ManagedResourceJob {
 
 /** LocalComponentsModel（本地组件页面数据）：统一呈现总量、硬件与组件。 */
 export interface LocalComponentsModel {
+  /** ttsSelection（启动前播放目标）：只提供已就绪的本地选项，value（当前选择）可以尚未就绪。 */
+  ttsSelection?: { value: 'minimax' | 'voxcpm1' | 'voxcpm2'; options: Array<{ value: string; label: string }>; saving: boolean; error?: string }
   /** status（整体状态）、state（状态类别）与 sampledAt（采样时间）。 */
   status: string
   state: LocalComponentState

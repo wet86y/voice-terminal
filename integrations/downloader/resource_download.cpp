@@ -14,6 +14,10 @@
 
 using Progress = int (*)(void*, int, std::uint64_t, std::uint64_t); // Progress（进度回调）：阶段 1 传输、2 摘要、3 启用，非零表示取消。
 using CancelCheck = int (*)(const void*); // CancelCheck（线程安全取消检查）：只读独立原子信号，不调用界面回调。
+struct DownloadFailure : std::runtime_error { // DownloadFailure（分类失败）：-2 本地文件、-3 取消、-4 不可恢复。
+    int kind;
+    DownloadFailure(int code, const std::string& message) : std::runtime_error(message), kind(code) {}
+};
 static std::string hash_file(const std::filesystem::path& path, bool sha512, const std::function<void(std::uint64_t)>& report) {
     BCRYPT_ALG_HANDLE algorithm{}; BCRYPT_HASH_HANDLE hash{};
     DWORD object_size{}, hash_size{}, bytes{};
@@ -26,12 +30,12 @@ static std::string hash_file(const std::filesystem::path& path, bool sha512, con
         BCryptCloseAlgorithmProvider(algorithm, 0); throw std::runtime_error("摘要初始化失败");
     }
     try {
-        std::ifstream stream(path, std::ios::binary); if (!stream) throw std::runtime_error("无法读取校验文件");
+        std::ifstream stream(path, std::ios::binary); if (!stream) throw DownloadFailure(-2, "无法读取校验文件");
         std::vector<char> buffer(1024 * 1024);std::uint64_t completed{};report(0);
         while (stream) { stream.read(buffer.data(), buffer.size()); auto count = stream.gcount();
             if (count && BCryptHashData(hash, reinterpret_cast<PUCHAR>(buffer.data()), static_cast<ULONG>(count), 0) < 0)
                 throw std::runtime_error("文件摘要计算失败");completed += count;report(completed); }
-        if (!stream.eof()) throw std::runtime_error("文件摘要读取失败");
+        if (!stream.eof()) throw DownloadFailure(-2, "文件摘要读取失败");
         if (BCryptFinishHash(hash, digest.data(), hash_size, 0) < 0) throw std::runtime_error("文件摘要计算失败");
     } catch (...) { BCryptDestroyHash(hash); BCryptCloseAlgorithmProvider(algorithm, 0); throw; }
     BCryptDestroyHash(hash); BCryptCloseAlgorithmProvider(algorithm, 0);
@@ -51,9 +55,9 @@ static void promote_download(const std::filesystem::path& part, const std::files
         const DWORD code = GetLastError(); // code（Windows 系统错误码，不包含可能乱码的文件路径）。
         const bool retryable = code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION || code == ERROR_ACCESS_DENIED; // retryable（文件占用或短暂访问拒绝）。
         if (!retryable)
-            throw std::runtime_error("下载文件启用失败（系统错误码：" + std::to_string(code) + "），下载断点已保留。");
+            throw DownloadFailure(-4, "下载文件启用失败（系统错误码：" + std::to_string(code) + "），下载断点已保留。");
         if (std::chrono::steady_clock::now() >= deadline)
-            throw std::runtime_error(std::string(code == ERROR_ACCESS_DENIED ? "系统仍拒绝启用下载文件" : "下载文件仍被其他进程占用") +
+            throw DownloadFailure(code == ERROR_ACCESS_DENIED ? -4 : -2, std::string(code == ERROR_ACCESS_DENIED ? "系统仍拒绝启用下载文件" : "下载文件仍被其他进程占用") +
                 "（系统错误码：" + std::to_string(code) + "），断点已保留，请稍后重试下载。");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -65,8 +69,8 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
     try {
         using namespace desktop_update_kit;
         auto cancelled = [&](std::uint64_t current, int phase = 1) {
-            if (cancel_check && cancel_check(cancel_context)) throw std::runtime_error("任务已取消，断点已保留");
-            if (progress && progress(context, phase, current, size)) throw std::runtime_error("任务已取消，断点已保留");
+            if (cancel_check && cancel_check(cancel_context)) throw DownloadFailure(-3, "任务已取消，断点已保留");
+            if (progress && progress(context, phase, current, size)) throw DownloadFailure(-3, "任务已取消，断点已保留");
         };
         auto verifying = [&](std::uint64_t current) { cancelled(current, 2); };
         cancelled(0);
@@ -106,7 +110,7 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
         }
         std::uint64_t offset = std::filesystem::exists(part) ? std::filesystem::file_size(part) : 0;
         std::ofstream stream(part, std::ios::binary | std::ios::app);
-        if (!stream) throw std::runtime_error("下载暂存文件不可写");
+        if (!stream) throw DownloadFailure(-4, "下载暂存文件不可写，请检查磁盘空间与目录权限");
         cancelled(offset);
         constexpr std::uint64_t range_bytes = 8ull * 1024 * 1024; // range_bytes（单个范围的有界缓冲）：减少大模型的请求次数。
         std::vector<std::byte> buffer;buffer.reserve(static_cast<std::size_t>(std::min(range_bytes, size)));
@@ -126,14 +130,14 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
             if (response.status == 200 && !response.content_range) {
                 // Range（范围请求）不成立：重新完整流式传输，并在每块落盘后保存稳定断点。
                 stream.close(); stream.open(part, std::ios::binary | std::ios::trunc); offset = 0;
-                if (!stream) throw std::runtime_error("完整下载暂存文件不可写");
+                if (!stream) throw DownloadFailure(-4, "完整下载暂存文件不可写，请检查磁盘空间与目录权限");
                 std::uint64_t flushed{}; // flushed（最近落盘断点）：每 4 MiB 或最终完成时刷新。
                 HttpRequest full{std::string(url)}; full.max_body_bytes = size + 1;
                 auto final_response = fetch(full, [&](auto chunk) {
                     if (offset + chunk.size() > size) throw std::runtime_error("下载超过清单声明大小");
                     stream.write(reinterpret_cast<const char*>(chunk.data()), chunk.size());
                     if (offset + chunk.size() - flushed >= 4ull * 1024 * 1024 || offset + chunk.size() == size) {stream.flush();flushed = offset + chunk.size();}
-                    if (!stream) throw std::runtime_error("下载文件写入失败"); offset += chunk.size(); cancelled(offset);
+                    if (!stream) throw DownloadFailure(-4, "下载文件写入失败，请检查磁盘空间与目录权限"); offset += chunk.size(); cancelled(offset);
                 });
                 if (final_response.status != 200 || offset != size) throw std::runtime_error("完整下载响应不匹配");
                 break;
@@ -144,10 +148,10 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
                 response.content_range->last != offset + length - 1 || response.content_range->total != size || buffer.size() != length)
                 throw std::runtime_error("范围响应与固定资源清单不匹配");
             stream.write(reinterpret_cast<const char*>(buffer.data()), buffer.size()); stream.flush();
-            if (!stream) throw std::runtime_error("下载文件写入失败"); offset += length; cancelled(offset);
+            if (!stream) throw DownloadFailure(-4, "下载文件写入失败，请检查磁盘空间与目录权限"); offset += length; cancelled(offset);
         }
         stream.close();
-        if (!stream) throw std::runtime_error("下载暂存文件关闭失败，断点已保留。");
+        if (!stream) throw DownloadFailure(-2, "下载暂存文件关闭失败，断点已保留。");
         if (offset != size || hash_file(part, sha512 != 0, verifying) != expected) {
             std::filesystem::remove(part); throw std::runtime_error("下载文件摘要不符");
         }
@@ -155,6 +159,14 @@ extern "C" int vt_download(const char* url, const wchar_t* target, std::uint64_t
         // cleanup_error（断点清理错误）：已启用完整文件后，辅助记录占用不应使下载变成失败。
         std::error_code cleanup_error; std::filesystem::remove(checkpoint, cleanup_error);
         return 0;
+    } catch (const DownloadFailure& exc) {
+        if (error && error_size) { std::strncpy(error, exc.what(), error_size - 1); error[error_size - 1] = 0; }
+        return exc.kind;
+    } catch (const std::filesystem::filesystem_error& exc) {
+        const auto code = exc.code().value();
+        const auto message = "本地文件操作失败（系统错误码：" + std::to_string(code) + "），断点已保留。";
+        if (error && error_size) { std::strncpy(error, message.c_str(), error_size - 1); error[error_size - 1] = 0; }
+        return code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION ? -2 : -4;
     } catch (const std::exception& exc) {
         if (error && error_size) { std::strncpy(error, exc.what(), error_size - 1); error[error_size - 1] = 0; }
         return -1;

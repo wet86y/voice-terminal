@@ -166,6 +166,16 @@ fn hidden(command: &mut Command) {
         .env_remove("NODE_OPTIONS")
         .env_remove("ELECTRON_RUN_AS_NODE");
 }
+// configure_install_transport（安装传输环境）：必须在工作区环境清理后写入本轮状态。
+fn configure_install_transport(context:&LaunchContext,command:&mut Command){
+    context.configure_command(command);
+    command.env_remove("VOICE_RESOURCE_ATTEMPT");
+    if let Some(attempt)=crate::download::current_attempt(){
+        command.env("VOICE_RESOURCE_ATTEMPT",attempt.to_string()).env_remove("NPM_CONFIG_FETCH_RETRIES").env("npm_config_fetch_retries","0");
+    }
+    // maxsockets（包传输通道）：脚本包下载占用全局四路中的一个，其余供模型使用。
+    command.env_remove("NPM_CONFIG_MAXSOCKETS").env("npm_config_maxsockets","1");
+}
 fn output(command: &mut Command) -> Result<std::process::Output, String> {
     hidden(command);
     command.stdout(Stdio::piped()).stderr(Stdio::null());
@@ -186,6 +196,13 @@ fn output(command: &mut Command) -> Result<std::process::Output, String> {
     }
 }
 pub fn discover(spec: &Value, require_npm: bool) -> Result<(PathBuf, Option<PathBuf>), String> {
+    discover_candidates(spec,require_npm,node_candidates())
+}
+
+/// node_installed（系统脚本环境是否存在）：版本或 npm（包管理器）异常不等于未安装。
+pub fn node_installed()->bool{node_candidates().iter().any(|path|path.is_file())}
+
+fn discover_candidates(spec:&Value,require_npm:bool,candidates:Vec<PathBuf>)->Result<(PathBuf,Option<PathBuf>),String>{
     let range = spec["node_version_range"]
         .as_str()
         .ok_or("Node.js（运行环境）支持范围缺失")?;
@@ -193,7 +210,7 @@ pub fn discover(spec: &Value, require_npm: bool) -> Result<(PathBuf, Option<Path
         .split("||")
         .map(|v| semver::VersionReq::parse(v.trim()).map_err(|_| "Node.js 支持范围无效"))
         .collect::<Result<Vec<_>, _>>()?;
-    for candidate in node_candidates() {
+    for candidate in candidates {
         if !candidate.is_file() {
             continue;
         }
@@ -233,6 +250,7 @@ pub fn discover(spec: &Value, require_npm: bool) -> Result<(PathBuf, Option<Path
     }
     Err(format!("需要 Windows x64（64 位系统）的 Node.js（运行环境）{range}{}，请安装后重新检测或重启程序。",if require_npm{"及 npm（包管理器）"}else{""}))
 }
+
 pub fn guide(reason: &str) -> bool {
     #[cfg(windows)]
     unsafe {
@@ -306,14 +324,16 @@ pub fn install(
     let program = context.installed_program();
     let spec = target(&program)?;
     check_plugin(&program, &spec)?;
-    let (node, npm) = discover(&spec, true)?;
+    let (node,npm)=discover(&spec,true)?;
     check_cancel(cancel)?;
     let proof=root.with_extension("verified.json");
     if root.join("manifest.json").is_file()&&inspect(&program,root).is_ok_and(|metadata|current(&metadata,&spec)){
         progress("检查上次中断后保留的完整候选组件",0,0);
         let reusable=crate::workspace::verify_cached_tree_with_progress(root,"manifest.json",&proof,cancel,progress);
         check_cancel(cancel)?;
-        if reusable.is_ok(){progress("复用已完成并验证的 DSH（代理宿主）候选，无需重新下载或解压",1,1);return Ok(());}
+        if reusable.is_ok(){
+            progress("复用已完成并验证的 DSH（代理宿主）候选，无需重新下载或解压",1,1);return Ok(());
+        }
     }
     // partial candidate（残缺候选）：只清理暂存解压内容，npm（包管理器）归档缓存始终保留。
     if root.exists(){crate::workspace::remove_owned(root,&context.install)?;}
@@ -325,7 +345,7 @@ pub fn install(
     let mut status_progress=InstallProgress::default();let mut last_report=Instant::now();let mut published_phase=String::new();
     let mut command = Command::new(&node);
     hidden(&mut command);
-    context.configure_command(&mut command);
+    configure_install_transport(context,&mut command);
     command
         .env_remove("NODE_OPTIONS")
         .env_remove("ELECTRON_RUN_AS_NODE");
@@ -340,6 +360,7 @@ pub fn install(
         .stdout(Stdio::from(file.try_clone().map_err(|e| e.to_string())?))
         .stderr(Stdio::from(file));
     progress("正在通过 npm（包管理器）安装目标 DSH 与插件管理工具", 0, 0);
+    let _transfer_slot=crate::download::acquire_slot(cancel,progress)?;
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     #[cfg(windows)]
     let job = crate::windows::Job::new()?;
@@ -406,6 +427,24 @@ pub fn bind(context: &LaunchContext, root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn managed_npm_install_keeps_attempt_after_workspace_environment_cleanup(){
+        let owner=crate::canonical_path(&std::env::temp_dir()).unwrap();
+        let root=owner.join(format!("voice-dsh-attempt-{}",crate::workspace::new_id()));crate::workspace::initialize(&root).unwrap();
+        fs::create_dir_all(root.join("app/config")).unwrap();fs::create_dir_all(root.join("app/scripts")).unwrap();
+        fs::write(root.join("app/config/default.yaml"),b"{}").unwrap();fs::write(root.join("app/scripts/backend-entry.py"),b"# fixture").unwrap();
+        let context=LaunchContext::portable(&root).unwrap();
+        let mut command=Command::new("node");command.env("VOICE_RESOURCE_ATTEMPT","999");
+        crate::download::with_attempt(Some(2),||configure_install_transport(&context,&mut command));
+        let values=command.get_envs().map(|(key,value)|(key.to_string_lossy().to_ascii_uppercase(),value.map(|value|value.to_string_lossy().into_owned()))).collect::<std::collections::BTreeMap<_,_>>();
+        assert_eq!(values["VOICE_RESOURCE_ATTEMPT"].as_deref(),Some("2"));
+        assert_eq!(values["NPM_CONFIG_FETCH_RETRIES"].as_deref(),Some("0"));
+        assert_eq!(values["NPM_CONFIG_MAXSOCKETS"].as_deref(),Some("1"));
+        assert_eq!(values["VOICE_INSTALL_ROOT"].as_deref(),root.to_str());
+        let mut ordinary=Command::new("node");ordinary.env("VOICE_RESOURCE_ATTEMPT","999");configure_install_transport(&context,&mut ordinary);
+        assert!(ordinary.get_envs().any(|(key,value)|key=="VOICE_RESOURCE_ATTEMPT"&&value.is_none()));
+        crate::workspace::remove_owned(&root,&owner).unwrap();
+    }
     #[test]
     fn resume_candidates_are_isolated_by_the_entire_target_contract(){
         let lock:Value=serde_json::from_str(include_str!("../../../../config/dsh/runtime.lock.json")).unwrap();
@@ -476,8 +515,10 @@ mod tests {
         for (version, accepted) in [
             ("22.18.0", false),
             ("22.19.0", true),
+            ("22.20.1", true),
             ("23.0.0", false),
             ("24.0.0", true),
+            ("24.9.1", true),
             ("26.0.0", true),
         ] {
             assert_eq!(

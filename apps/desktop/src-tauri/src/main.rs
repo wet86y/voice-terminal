@@ -5,7 +5,7 @@ mod initialization;
 #[cfg(feature="qualification")] mod qualification;
 mod environment_commands;
 mod credential_commands;
-use credential_commands::{model_credentials_status,model_credentials_save};
+use credential_commands::{model_credentials_status,model_credentials_save,tts_selection_status,tts_selection_save};
 use initialization::{desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init};
 use environment_commands::{resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide};
 use std::{
@@ -27,7 +27,7 @@ use tauri::{
     Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 use voice_desktop_common::{windows::Job, LaunchContext, workspace::{self, Locator}};
-use resource_commands::{ResourceManager,resource_import_confirm,resource_inventory,resource_jobs,resource_download,resource_import,resource_open_source,resource_cancel};
+use resource_commands::{ResourceManager,resource_import_confirm,resource_inventory,resource_jobs,resource_download,resource_download_required,resource_import,resource_open_source,resource_cancel};
 
 const APP_UPDATE_PROGRESS_EVENT:&str="desktop://app-update-progress";
 struct AppUpdateManager{
@@ -38,6 +38,17 @@ struct AppUpdateManager{
 }
 impl AppUpdateManager{
     fn new()->Self{Self{status:Mutex::new(serde_json::Value::Null),manifest:Mutex::new(None),busy:AtomicBool::new(false),cancel:Arc::new(AtomicBool::new(false))}}
+    // request_cancel（取消准入）与 begin_handoff（交接门闩）共用状态锁，成功取消不会再启动安装器。
+    fn request_cancel(&self)->Result<(),String>{
+        let status=self.status.lock().map_err(|_|"更新状态不可用。")?;
+        if !self.busy.load(Ordering::Acquire)||status["can_cancel"]!=true{return Err("当前更新阶段不允许取消。".into());}
+        self.cancel.store(true,Ordering::Release);Ok(())
+    }
+    fn begin_handoff(&self,payload:serde_json::Value)->Result<(),String>{
+        let mut status=self.status.lock().map_err(|_|"更新状态不可用。")?;
+        if self.cancel.load(Ordering::Acquire){return Err("更新交接已取消。".into());}
+        *status=payload;Ok(())
+    }
 }
 
 struct Service {
@@ -112,7 +123,7 @@ fn frontend_capability(mode: FrontendMode, normalized_origin: &str, epoch: u64) 
     if mode == FrontendMode::UiPreview {
         serde_json::json!({"identifier":"owned-ui-preview", "description":"桌面样例的状态读取、加载画面和退出操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-skip-startup","allow-exit-application"]})
     } else {
-        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-export-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-download","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","core:event:allow-listen","core:event:allow-unlisten"]})
+        serde_json::json!({"identifier":format!("owned-main-{epoch}"), "description":"当前实例产品页面的受限桌面操作", "local":false,"windows":["main"],"remote":{"urls":[format!("{normalized_origin}/*")]},"permissions":["allow-desktop-status","allow-desktop-page-ready","allow-skip-startup","allow-export-logs","allow-open-console","allow-exit-application","allow-focus-main","allow-workspace-info","allow-workspace-choose","allow-workspace-link","allow-workspace-migrate","allow-resource-inventory","allow-resource-jobs","allow-resource-download", "allow-resource-download-required", "allow-tts-selection-status", "allow-tts-selection-save","allow-resource-import","allow-resource-import-confirm","allow-resource-open-source","allow-resource-cancel","allow-desktop-manage","allow-desktop-start-service","allow-desktop-cancel-init","allow-model-credentials-status","allow-model-credentials-save","allow-voice-environment-status","allow-voice-environment-plan","allow-resource-install-plan","allow-voice-environment-configure","allow-voice-environment-import","allow-gpu-environment-register","allow-gpu-environment-probe","allow-environment-guide","allow-app-update-check","allow-app-update-download","allow-app-update-cancel","core:event:allow-listen","core:event:allow-unlisten"]})
     }
 }
 
@@ -142,6 +153,7 @@ struct Desktop {
     locator: Option<Locator>, // locator（当前工作区本地身份，不读写系统定位）。
     workspace_guard: Mutex<Option<voice_desktop_common::installation::WorkspaceGuard>>, // workspace_guard（程序运行期间的本体互斥锁）。
     workspace_busy: AtomicBool, // workspace_busy（防止并行切换或迁移）。
+    maintenance_gate: Mutex<()>, // maintenance_gate（维护准入锁）：更新与工作区交接互斥。
     log_export_busy: AtomicBool, // log_export_busy（防止重复打包日志）。
     log_flush_sequence: AtomicU64, // log_flush_sequence（刷新请求递增编号）。
     log_flush_state: Mutex<LogFlushState>, // log_flush_state（最新刷新请求结果）。
@@ -676,28 +688,41 @@ async fn workspace_choose(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop
 }
 async fn workspace_operation(window:WebviewWindow,state:Arc<Desktop>,app:tauri::AppHandle,target_root:String,kind:&'static str)->Result<serde_json::Value,String>{
     require_workspace(&window,&state)?;
-    if state.workspace_busy.swap(true,Ordering::SeqCst){return Err("已有工作区操作正在执行。".into());}
+    reserve_maintenance(&state.maintenance_gate,&state.workspace_busy,&state.app_update.busy,false)?;
     let operation_state=state.clone();
+    let recovery_app=app.clone(); // recovery_app（失败时重新开放资源任务）。
     let result=tauri::async_runtime::spawn_blocking(move||{
+        // workspace_busy（迁移门闩）已关闭新保存；等待此前正在写入的接口/语音配置完成。
+        drop(operation_state.credentials_guard.lock().map_err(|_|"配置写入锁不可用。")?);
         let context=operation_state.context().ok_or("缺少工作区上下文")?;
         let locator=operation_state.locator.as_ref().ok_or("缺少本地工作区身份")?;
         let target=PathBuf::from(target_root);locator.validate_target(&target)?;
         if let Some(manager)=app.try_state::<Arc<ResourceManager>>(){manager.pause_and_wait()?;}
-        operation_state.stop_service()?;
         let prepared=workspace::prepare_task(&context.install,&target,kind,std::process::id(),locator);
-        let journal=match prepared{Ok(journal)=>journal,Err(error)=>{let _=start_service(app.clone(),operation_state.clone());return Err(error);}};
+        let journal=prepared?;
         let record:serde_json::Value=serde_json::from_slice(&fs::read(&journal).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
         let job_id=record["job_id"].as_str().ok_or("工作区事务缺少编号")?.to_string();
         let helper=journal.parent().unwrap().join("workspace-helper.exe");
         let mut command=Command::new(helper);context.configure_command(&mut command);
         let spawn=command.arg("--workspace-task").arg(&journal).args(locator.child_args()).creation_flags(0x08000000).current_dir(journal.parent().unwrap()).spawn();
-        if let Err(error)=spawn{let _=start_service(app.clone(),operation_state.clone());return Err(format!("无法启动工作区事务：{error}"));}
+        if let Err(error)=spawn{return Err(format!("无法启动工作区事务：{error}"));}
         let _=app.emit("desktop://workspace-progress",serde_json::json!({"job_id":job_id,"state":"running","phase":"原生迁移窗口已打开，正在退出当前工作区","can_cancel":false,"completed_bytes":0,"total_bytes":0}));
         let exit_state=operation_state.clone();let exit_app=app.clone();
         std::thread::spawn(move||{std::thread::sleep(Duration::from_millis(350));exit_state.shutdown(&exit_app);});
         Ok(serde_json::json!({"job_id":job_id}))
     }).await.map_err(|e|e.to_string()).and_then(|v|v);
-    if result.is_err(){state.workspace_busy.store(false,Ordering::Release);}result
+    if let Err(mut error)=result{
+        if let Some(manager)=recovery_app.try_state::<Arc<ResourceManager>>(){if let Err(recovery)=manager.resume_accepting_jobs(){error=format!("{error}；恢复维护前服务失败：{recovery}");}}
+        state.workspace_busy.store(false,Ordering::Release);return Err(error);
+    }result
+}
+
+// reserve_maintenance（原子预留维护任务）：阻止网络下载期间插入工作区迁移。
+fn reserve_maintenance(gate:&Mutex<()>,workspace:&AtomicBool,update:&AtomicBool,updating:bool)->Result<(),String>{
+    let _guard=gate.lock().map_err(|_|"维护操作锁不可用。")?;
+    if workspace.load(Ordering::Acquire){return Err("工作区正在切换或迁移，请等待完成。".into());}
+    if update.load(Ordering::Acquire){return Err("程序更新正在下载或交接，请等待完成或取消更新。".into());}
+    if updating{update.store(true,Ordering::Release);}else{workspace.store(true,Ordering::Release);}Ok(())
 }
 #[tauri::command(rename_all = "snake_case")]
 async fn workspace_link(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>,app:tauri::AppHandle,target_root:String)->Result<serde_json::Value,String>{workspace_operation(window,state.inner().clone(),app,target_root,"link").await}
@@ -733,10 +758,9 @@ async fn app_update_check(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop
 #[tauri::command]
 async fn app_update_download(window:WebviewWindow,state:tauri::State<'_,Arc<Desktop>>,app:tauri::AppHandle)->Result<serde_json::Value,String>{
     require_workspace(&window,&state)?;
-    if state.workspace_busy.load(Ordering::Acquire){return Err("工作区正在切换或迁移，完成后再更新。".into());}
     let manifest=state.app_update.manifest.lock().unwrap().clone().ok_or("请先检查更新并确认有可用版本。")?;
     if !manifest.is_newer_than(env!("CARGO_PKG_VERSION"))?{return Err("当前没有可安装的新版本。".into());}
-    if state.app_update.busy.swap(true,Ordering::SeqCst){return Err("更新下载已经开始。".into());}
+    reserve_maintenance(&state.maintenance_gate,&state.workspace_busy,&state.app_update.busy,true)?;
     state.app_update.cancel.store(false,Ordering::Release);
     let payload=app_update_payload("downloading",Some(&manifest),0,manifest.size,Some("正在连接 GitHub 并校验安装器"),None,true);
     emit_app_update(&state,&app,payload.clone());
@@ -747,8 +771,7 @@ async fn app_update_download(window:WebviewWindow,state:tauri::State<'_,Arc<Desk
 #[tauri::command]
 fn app_update_cancel(window:WebviewWindow,state:tauri::State<Arc<Desktop>>)->Result<(),String>{
     require_workspace(&window,&state)?;
-    if !state.app_update.busy.load(Ordering::Acquire)||state.app_update.status.lock().unwrap()["can_cancel"]!=true{return Err("当前更新阶段不允许取消。".into());}
-    state.app_update.cancel.store(true,Ordering::Release);Ok(())
+    state.app_update.request_cancel()
 }
 fn download_and_handoff_update(state:Arc<Desktop>,app:tauri::AppHandle,manifest:voice_desktop_common::app_update::AppUpdateManifest){
     let result=(||{
@@ -757,14 +780,30 @@ fn download_and_handoff_update(state:Arc<Desktop>,app:tauri::AppHandle,manifest:
         let installer=workspace::safe_path(&context.install,"tmp/app-update/VoiceTerminalSetup.exe")?;
         let source=manifest.asset_url();
         let file=voice_desktop_common::download::DownloadFile{url:source,size:manifest.size,sha256:manifest.sha256.clone(),sha512:String::new(),path:manifest.asset.clone()};
-        voice_desktop_common::download::download_with_progress(&file,&installer,state.app_update.cancel.clone(),&mut|phase,done,total|{
-            let payload=app_update_payload("downloading",Some(&manifest),done,total,Some(phase),None,true);emit_app_update(&state,&app,payload);
-        },0)?;
+        for attempt in 1..=3{
+            let result=voice_desktop_common::download::with_attempt(Some(attempt),||voice_desktop_common::download::download_with_progress(&file,&installer,state.app_update.cancel.clone(),&mut|phase,done,total|{
+                let phase=format!("第 {attempt} / 3 轮 · {phase}");
+                let payload=app_update_payload("downloading",Some(&manifest),done,total,Some(&phase),None,true);emit_app_update(&state,&app,payload);
+            },0));
+            match result{
+                Ok(_)=>break,
+                Err(error) if attempt<3&&resource_commands::retryable_failure(&error)&&!state.app_update.cancel.load(Ordering::Acquire)=>{
+                    let phase=format!("第 {attempt} / 3 轮失败，等待自动恢复：{error}");
+                    emit_app_update(&state,&app,app_update_payload("downloading",Some(&manifest),0,0,Some(&phase),None,true));
+                    for _ in 0..if attempt==1{10}else{30}{
+                        if state.app_update.cancel.load(Ordering::Acquire){return Err("更新下载已取消。".into());}
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                },
+                Err(error)=>return Err(error),
+            }
+        }
         if state.app_update.cancel.load(Ordering::Acquire){return Err("更新下载已取消。".into());}
         if fs::metadata(&installer).map_err(|error|error.to_string())?.len()!=manifest.size||workspace::file_hash(&installer)?!=manifest.sha256.to_lowercase(){
             let _=fs::remove_file(&installer);return Err("分发安装器大小或 SHA-256 摘要校验失败。".into());
         }
         if let Some(manager)=app.try_state::<Arc<ResourceManager>>(){manager.pause_and_wait()?;}
+        if state.app_update.cancel.load(Ordering::Acquire){return Err("更新交接已取消。".into());}
         let pid=std::process::id();let (parent_create_time,parent_executable)=workspace::process_identity(pid)?.ok_or("当前程序进程身份不可用。")?;
         let expected=voice_desktop_common::canonical_path(&context.install.join("app/VoiceTerminalDesktop.exe"))?;
         if !parent_executable.to_string_lossy().eq_ignore_ascii_case(&expected.to_string_lossy()){
@@ -781,18 +820,22 @@ fn download_and_handoff_update(state:Arc<Desktop>,app:tauri::AppHandle,manifest:
                 "parent_executable":"当前主程序可执行文件位置","version":"待安装产品版本","tag":"对应 GitHub 发行标签",
                 "installer_size":"已校验分发安装器字节数","installer_sha256":"已校验分发安装器 SHA-256 摘要"}});
         workspace::atomic_json(&config_path,&config)?;
+        let handing_off=app_update_payload("handing_off",Some(&manifest),manifest.size,manifest.size,Some("正在交接已校验的更新安装器"),None,false);
+        if let Err(error)=state.app_update.begin_handoff(handing_off.clone()){let _=fs::remove_file(&config_path);return Err(error);}
+        let _=app.emit(APP_UPDATE_PROGRESS_EVENT,handing_off);
         let mut command=Command::new(&installer);command.arg("--app-update-config").arg(&config_path).current_dir(&context.install)
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x08000000);
         if let Err(error)=command.spawn(){let _=fs::remove_file(&config_path);return Err(format!("无法启动更新分发器：{error}"));}
         emit_app_update(&state,&app,app_update_payload("handing_off",Some(&manifest),manifest.size,manifest.size,Some("正在关闭旧程序并启动安装器"),None,false));
         state.shutdown(&app);Ok::<(),String>(())
     })();
-    state.app_update.busy.store(false,Ordering::Release);
-    if let Err(error)=result{
+    if let Err(mut error)=result{
+        if let Some(manager)=app.try_state::<Arc<ResourceManager>>(){if let Err(recovery)=manager.resume_accepting_jobs(){error=format!("{error}；恢复维护前服务失败：{recovery}");}}
         let cancelled=state.app_update.cancel.load(Ordering::Acquire)||error.contains("已取消");
         let payload=app_update_payload(if cancelled{"cancelled"}else{"failed"},Some(&manifest),0,manifest.size,None,Some(&error),false);
         emit_app_update(&state,&app,payload);
     }
+    state.app_update.busy.store(false,Ordering::Release);
 }
 
 fn show(app: &tauri::AppHandle) {
@@ -1323,15 +1366,7 @@ fn run() -> Result<(), String> {
     };
     std::env::remove_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER");
     if voice_desktop_common::webview::version().is_none(){voice_desktop_common::webview::guide("未检测到系统 WebView2（网页运行引擎）。");return Ok(());}
-    if let Some(context)=context.as_ref(){
-        let target=voice_desktop_common::dsh::target(&context.installed_program())?;
-        loop {
-            match voice_desktop_common::dsh::discover(&target, false) {
-                Ok(_) => break,
-                Err(error) => { if !voice_desktop_common::dsh::guide(&error) { break; } }
-            }
-        }
-    }
+    // 管理页无需脚本引擎就绪；运行环境沿用分发器检测，管理页不重复弹安装引导。
     let locator=context.as_ref().map(|value|Locator::local(&value.install));
     let instance_identifier=instance_identifier(mode,if preview{Some(program.as_path())}else{context.as_ref().map(|value|value.install.as_path())});
     let development=preview||context.as_ref().is_some_and(|value|value.dev);
@@ -1351,6 +1386,7 @@ fn run() -> Result<(), String> {
         locator,
         workspace_guard:Mutex::new(None),
         workspace_busy: AtomicBool::new(false),
+        maintenance_gate: Mutex::new(()),
         log_export_busy: AtomicBool::new(false),
         log_flush_sequence: AtomicU64::new(0),
         log_flush_state: Mutex::new(LogFlushState { completed_request: 0, failed_request: 0 }),
@@ -1404,10 +1440,10 @@ fn run() -> Result<(), String> {
             exit_application,
             focus_main,
             desktop_initialize,desktop_manage,desktop_start_service,desktop_cancel_init,
-            model_credentials_status,model_credentials_save,
+            model_credentials_status,model_credentials_save,tts_selection_status,tts_selection_save,
             resource_install_plan,voice_environment_status,voice_environment_plan,voice_environment_configure,voice_environment_import,gpu_environment_register,gpu_environment_probe,environment_guide,
             workspace_info,workspace_choose,workspace_link,workspace_migrate,app_update_check,app_update_download,app_update_cancel,
-            resource_inventory,resource_jobs,resource_download,resource_import,resource_import_confirm,resource_open_source,resource_cancel
+            resource_inventory,resource_jobs,resource_download,resource_download_required,resource_import,resource_import_confirm,resource_open_source,resource_cancel
         ])
         .setup(move |app| {
             if qualification_exit||exit_requested {
@@ -1540,10 +1576,48 @@ mod tests {
     use tauri::webview::PageLoadEvent;
 
     #[test]
+    fn update_and_workspace_handoffs_reserve_a_single_maintenance_slot(){
+        use super::reserve_maintenance;
+        use std::sync::Mutex;
+        let gate=Mutex::new(());let workspace=AtomicBool::new(false);let update=AtomicBool::new(false);
+        let start=std::sync::Barrier::new(2);
+        let outcomes=std::thread::scope(|scope|{
+            let first=scope.spawn(||{start.wait();reserve_maintenance(&gate,&workspace,&update,false).is_ok()});
+            let second=scope.spawn(||{start.wait();reserve_maintenance(&gate,&workspace,&update,true).is_ok()});
+            [first.join().unwrap(),second.join().unwrap()]
+        });
+        assert_eq!(outcomes.iter().filter(|value|**value).count(),1);
+        assert_ne!(workspace.load(Ordering::Acquire),update.load(Ordering::Acquire));
+        workspace.store(false,Ordering::Release);update.store(false,Ordering::Release);
+        reserve_maintenance(&gate,&workspace,&update,true).unwrap();
+        assert!(reserve_maintenance(&gate,&workspace,&update,false).is_err());
+        update.store(false,Ordering::Release);
+        reserve_maintenance(&gate,&workspace,&update,false).unwrap();
+        assert!(reserve_maintenance(&gate,&workspace,&update,true).is_err());
+    }
+
+    #[test]
+    fn accepted_update_cancellation_and_installer_handoff_are_mutually_exclusive(){
+        for _ in 0..64{
+            let manager=super::AppUpdateManager::new();manager.busy.store(true,Ordering::Release);
+            *manager.status.lock().unwrap()=serde_json::json!({"state":"downloading","can_cancel":true});
+            let start=std::sync::Barrier::new(2);
+            let (cancelled,handing_off)=std::thread::scope(|scope|{
+                let cancel=scope.spawn(||{start.wait();manager.request_cancel().is_ok()});
+                let handoff=scope.spawn(||{start.wait();manager.begin_handoff(serde_json::json!({"state":"handing_off","can_cancel":false})).is_ok()});
+                (cancel.join().unwrap(),handoff.join().unwrap())
+            });
+            assert_ne!(cancelled,handing_off);
+            assert_eq!(manager.cancel.load(Ordering::Acquire),cancelled);
+            assert_eq!(manager.status.lock().unwrap()["state"]=="handing_off",handing_off);
+        }
+    }
+
+    #[test]
     fn startup_credentials_are_authorized_only_for_owned_local_windows() {
         let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
         let authority = context.runtime_authority_mut(); // authority（实际编译的桌面权限解析器）。
-        for command in ["model_credentials_status", "model_credentials_save"] {
+        for command in ["model_credentials_status", "model_credentials_save", "tts_selection_status", "tts_selection_save", "resource_download_required", "app_update_check", "app_update_download", "app_update_cancel"] {
             for window in ["main", "startup"] {
                 assert!(authority.resolve_access(command, window, window, &tauri::ipc::Origin::Local).is_some(), "启动前密钥命令缺少权限：{command}");
             }
@@ -1559,7 +1633,7 @@ mod tests {
             let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
             let authority = context.runtime_authority_mut();
             authority.add_capability(frontend_capability(mode, "http://127.0.0.1:45001", 7).to_string()).unwrap();
-            for command in ["model_credentials_status", "model_credentials_save"] {
+            for command in ["model_credentials_status", "model_credentials_save", "tts_selection_status", "tts_selection_save", "resource_download_required", "app_update_check", "app_update_download", "app_update_cancel"] {
                 let owned = tauri::ipc::Origin::Remote { url: tauri::Url::parse("http://127.0.0.1:45001/").unwrap() }; // owned（当前实例业务页面）。
                 assert_eq!(authority.resolve_access(command, "main", "main", &owned).is_some(), mode == FrontendMode::Product);
                 assert!(authority.resolve_access(command, "startup", "startup", &owned).is_none());

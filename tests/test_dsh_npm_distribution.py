@@ -106,7 +106,7 @@ def test_legacy_status_is_fast_but_import_keeps_full_hash_validation(runtime, mo
     (root / 'untracked.txt').write_text('extra', 'utf-8')
     assert manager._dsh_state(manager.catalog.get('dsh'))['state'] == 'incomplete'
 
-@pytest.mark.parametrize('version,allowed', [('22.18.0', False), ('22.19.0', True), ('23.0.0', False), ('24.0.0', True), ('26.0.0', True)])
+@pytest.mark.parametrize('version,allowed', [('22.18.0', False), ('22.19.0', True), ('22.20.1', True), ('23.0.0', False), ('24.0.0', True), ('24.9.1', True), ('26.0.0', True)])
 def test_node_requirements_come_from_configuration(version, allowed):
     assert adapter.node_version_matches(version, '^22.19.0 || >=24.0.0') == allowed
 

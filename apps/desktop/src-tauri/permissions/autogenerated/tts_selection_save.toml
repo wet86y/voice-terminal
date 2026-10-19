@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-tts-selection-save"
+description = "Enables the tts_selection_save command without any pre-configured scope."
+commands.allow = ["tts_selection_save"]
+
+[[permission]]
+identifier = "deny-tts-selection-save"
+description = "Denies the tts_selection_save command without any pre-configured scope."
+commands.deny = ["tts_selection_save"]

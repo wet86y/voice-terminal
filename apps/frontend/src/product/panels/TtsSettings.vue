@@ -20,6 +20,8 @@ const demoStatus = reactive<ProductLocalTtsStatus>({ backend: 'minimax', local_m
   models: [{ id: 'voxcpm1', name: 'VoxCPM1', available: true, loaded: false, native_sample_rate: 16000 }, { id: 'voxcpm2', name: 'VoxCPM2', available: true, loaded: false, native_sample_rate: 48000 }] })
 const live = useLocalTtsStatus(() => !props.demo)
 const status = computed(() => props.demo ? demoStatus : live.status.value)
+const readyModels = computed(() => status.value?.models.filter(item => item.available === true) ?? []) // readyModels（可启动的本地模型）。
+const selectedReady = computed(() => selected.value === 'minimax' || readyModels.value.some(item => item.id === selected.value))
 const model = computed(() => selected.value === 'voxcpm1' ? 'voxcpm1' : 'voxcpm2')
 const steps = reactive({ voxcpm1: 10, voxcpm2: 20, ...settings.tts.inference_steps_by_model })
 const effective = computed(() => status.value?.backend === 'voxcpm1' ? status.value.local_model : 'minimax')
@@ -34,6 +36,12 @@ watch(() => status.value, value => {
 })
 onMounted(() => { if (!props.demo) void live.refresh() })
 function refreshStatus() { if (!props.demo) void live.refresh() }
+function selectTarget(event: Event) {
+  const choice = (event.target as HTMLSelectElement).value as Choice
+  if (choice !== 'minimax' && !readyModels.value.some(item => item.id === choice)) return
+  selected.value = choice
+  void choose()
+}
 async function choose() {
   const choice = selected.value; const generation = ++selectionGeneration; saving.value = true; error.value = ''
   try {
@@ -70,12 +78,12 @@ async function saveSteps() {
 <template>
   <SettingsPageHeader section="tts" />
   <div class="tts-settings">
-    <section class="tts-target preference-card"><label class="form-field"><span>语音播放目标</span><select v-model="selected" @change="choose"><option value="minimax">{{ names.minimax }}</option><option value="voxcpm1">{{ names.voxcpm1 }}{{ status?.models.find(item => item.id === 'voxcpm1')?.available === false ? ' · 资源缺失' : '' }}</option><option value="voxcpm2">{{ names.voxcpm2 }}{{ status?.models.find(item => item.id === 'voxcpm2')?.available === false ? ' · 资源缺失' : '' }}</option></select></label>
+    <section class="tts-target preference-card"><label class="form-field"><span>语音播放目标</span><select :value="selectedReady ? selected : ''" @change="selectTarget"><option value="minimax">{{ names.minimax }}</option><option v-if="!selectedReady" value="" disabled>当前目标未就绪，请在组件设置补齐资源</option><option v-for="item in readyModels" :key="item.id" :value="item.id">{{ names[item.id] }}</option></select></label>
       <p class="instruction-hint" role="status">当前生效：{{ names[effective] }} · {{ saving ? '正在切换…' : states[status?.load_state || 'unloaded'] || '等待状态' }}<template v-if="status?.pending_selection"> · 等待当前事务结束后切换</template></p>
       <p v-if="selected === 'minimax'" class="instruction-hint">在线接口密钥与账号用量可在“组件设置 → 语音合成”中管理。</p>
       <p v-if="error || status?.error || live.error.value" class="instruction-error" role="alert">{{ error || status?.error || live.error.value }}</p>
     </section>
-    <template v-if="selected !== 'minimax'">
+    <template v-if="selected !== 'minimax' && selectedReady">
       <TtsVoiceLibrary :port="productApi" :model="model" :steps="steps[model]" :unavailable="unavailable" :demo="demo" @changed="refreshStatus" />
       <details class="tts-quality"><summary>合成质量</summary><label class="form-field"><span>{{ names[model] }} · 推理步数</span><input v-model.number="steps[model]" type="number" min="1" max="30" step="1" :disabled="saving" @change="saveSteps"><small>默认一代 10 步、二代 20 步。保存后用于下一次回答。</small></label></details>
       <p class="instruction-hint">试音前请先结束监听和当前播报。设计音色保存生成的样音，正式回答使用这段样音克隆。</p>

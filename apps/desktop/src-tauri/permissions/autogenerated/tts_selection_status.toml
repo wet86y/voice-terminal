@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-tts-selection-status"
+description = "Enables the tts_selection_status command without any pre-configured scope."
+commands.allow = ["tts_selection_status"]
+
+[[permission]]
+identifier = "deny-tts-selection-status"
+description = "Denies the tts_selection_status command without any pre-configured scope."
+commands.deny = ["tts_selection_status"]

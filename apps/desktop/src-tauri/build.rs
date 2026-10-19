@@ -8,6 +8,7 @@ fn main() {
             "desktop_status", "desktop_page_ready",
             // model_credentials（模型接口凭据）：业务服务与组件未就绪时也要生成读写权限。
             "model_credentials_status", "model_credentials_save",
+            "tts_selection_status", "tts_selection_save", "resource_download_required",
             "skip_startup",
             "export_logs",
             "open_console",
