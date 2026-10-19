@@ -43,7 +43,7 @@ function validChoice<T extends string>(
 }
 // 旧 silence（静默页）、system（系统页）与 models（模型管理页）地址继续打开合并页。
 const requestedPage =
-  query.get("page") === "silence" ? "wake" : ["system", "models"].includes(query.get("page") ?? "") ? "compute" : query.get("page");
+  query.get("page") === "silence" ? "wake" : query.get("page") === "hotwords" ? "speaker" : ["system", "models"].includes(query.get("page") ?? "") ? "compute" : query.get("page");
 const page = ref<PreviewPage>(
   validChoice(
     requestedPage,

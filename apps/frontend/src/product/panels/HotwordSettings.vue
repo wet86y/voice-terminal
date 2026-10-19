@@ -44,7 +44,8 @@ function add() {
 </script>
 
 <template>
-  <SettingsPageHeader section="hotwords">
+  <section class="hotword-settings-section" aria-label="热词替换设置">
+  <SettingsPageHeader section="speaker" title="热词替换" description="专有名称、别名与识别文本纠正" compact>
     <template #actions>
       <button class="outline-button" :disabled="hotwordBusy || !hotwordLoaded" @click="fileInput?.click()">导入词表</button>
       <button class="outline-button" :disabled="hotwordBusy || !hotwordForm.entries.length" @click="exportFile">导出词表</button>
@@ -86,8 +87,9 @@ function add() {
       </div>
     </section>
   </fieldset>
+  </section>
 </template>
 
 <style scoped>
-.hotword-file-input{display:none}.hotword-fields{border:0;padding:0;margin:0;min-width:0}.hotword-toolbar{display:flex;align-items:flex-end;flex-wrap:wrap;gap:12px;margin-top:20px}.hotword-search{flex:1;min-width:180px}.hotword-count,.hotword-help,.hotword-save span{font-size:var(--font-caption);color:var(--muted)}.hotword-help{line-height:1.7}.hotword-row{display:grid;grid-template-columns:minmax(140px,1fr) minmax(160px,1.5fr) auto;gap:10px 16px;padding:16px 0;border-bottom:1px solid var(--line)}.hotword-remove{align-self:end;min-height:36px}.hotword-exclusions{grid-column:1 / -1}.hotword-exclusions summary,.hotword-advanced summary{cursor:pointer;color:var(--muted);font-size:var(--font-caption);padding:6px 0}.hotword-exclusions .form-field,.hotword-advanced .form-field{margin-top:10px}.hotword-advanced{margin-top:18px}.hotword-advanced input{max-width:140px}.hotword-save,.hotword-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:18px 0}.hotword-pagination{justify-content:center}.hotword-preview textarea{min-height:85px;resize:vertical}.hotword-result{margin-top:16px;padding:16px;border:1px solid var(--line);border-radius:12px;overflow-wrap:anywhere}.hotword-result p{white-space:pre-wrap}.hotword-result small{color:var(--muted)}@media(max-width:640px){.hotword-row{grid-template-columns:minmax(0,1fr) auto}.hotword-row .form-field{grid-column:1}.hotword-remove{grid-column:2;grid-row:1 / 3}.hotword-save .save-button{width:100%}}
+.hotword-settings-section{display:flex;flex-direction:column;gap:20px;min-width:0}.hotword-file-input{display:none}.hotword-fields{border:0;padding:0;margin:0;min-width:0}.hotword-toolbar{display:flex;align-items:flex-end;flex-wrap:wrap;gap:12px;margin-top:20px}.hotword-search{flex:1;min-width:180px}.hotword-count,.hotword-help,.hotword-save span{font-size:var(--font-caption);color:var(--muted)}.hotword-help{line-height:1.7}.hotword-row{display:grid;grid-template-columns:minmax(140px,1fr) minmax(160px,1.5fr) auto;gap:10px 16px;padding:16px 0;border-bottom:1px solid var(--line)}.hotword-remove{align-self:end;min-height:36px}.hotword-exclusions{grid-column:1 / -1}.hotword-exclusions summary,.hotword-advanced summary{cursor:pointer;color:var(--muted);font-size:var(--font-caption);padding:6px 0}.hotword-exclusions .form-field,.hotword-advanced .form-field{margin-top:10px}.hotword-advanced{margin-top:18px}.hotword-advanced input{max-width:140px}.hotword-save,.hotword-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:18px 0}.hotword-pagination{justify-content:center}.hotword-preview textarea{min-height:85px;resize:vertical}.hotword-result{margin-top:16px;padding:16px;border:1px solid var(--line);border-radius:12px;overflow-wrap:anywhere}.hotword-result p{white-space:pre-wrap}.hotword-result small{color:var(--muted)}@media(max-width:640px){.hotword-row{grid-template-columns:minmax(0,1fr) auto}.hotword-row .form-field{grid-column:1}.hotword-remove{grid-column:2;grid-row:1 / 3}.hotword-save .save-button{width:100%}}
 </style>

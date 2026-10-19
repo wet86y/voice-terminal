@@ -51,7 +51,7 @@ export function useProductControls() {
       adapter.settingsTab.value = 'workspace'
     }
     if ((query.get('settings') ?? query.get('page')) === 'hotwords') {
-      adapter.page.value = 'settings'; adapter.settingsTab.value = 'hotwords'
+      adapter.page.value = 'settings'; adapter.settingsTab.value = 'speaker'
     }
   });
   onBeforeUnmount(applicationHost.stop);
