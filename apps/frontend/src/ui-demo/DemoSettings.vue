@@ -192,14 +192,6 @@ function cancelTask(item: DemoWakeTask) {
       </div>
     </template>
 
-    <template v-else-if="tab === 'hotwords'">
-      <SettingsPageHeader section="hotwords" />
-      <label class="switch-row"><div><strong>启用热词替换</strong><span>纠正流式短句和整句精修中的专有名称。</span></div><input type="checkbox" role="switch" checked :disabled="loading" /><i></i></label>
-      <label class="form-field"><span>目标词</span><input value="Claude" :disabled="loading" /></label>
-      <label class="form-field"><span>读音或别名（可选）</span><input value="克劳德 | 克劳得" :disabled="loading" /></label>
-      <footer><button class="save-button" :disabled="loading" @click="feedback('热词设置演示已保存，正式页面支持词表导入与试测')">保存热词设置</button></footer>
-    </template>
-
     <template v-else-if="tab === 'persona'">
       <SettingsPageHeader section="persona" />
       <div class="persona-layout">
@@ -245,6 +237,13 @@ function cancelTask(item: DemoWakeTask) {
       </section>
       <section class="speaker-ambient-card"><div class="speaker-card-heading"><div><p class="section-label">AMBIENT CONTEXT（环境上下文）</p><h3>当前会话环境记录</h3></div><button class="ghost-action" type="button" @click="feedback('环境记录刷新提示')">刷新</button></div><div v-if="ambient.length" class="ambient-record-list"><article v-for="item in ambient" :key="item.id"><time>{{ item.time }}</time><p>{{ props.scene === 'long' ? longText : item.text }}</p><small>{{ item.status }}</small></article></div><div v-else class="pool-empty">暂无环境记录。</div></section>
       <footer><button class="save-button" type="button" :disabled="loading" @click="feedback('声纹设置已保存')">{{ loading ? '正在保存…' : '保存声纹设置' }}</button></footer>
+      <section class="hotword-settings-section">
+        <SettingsPageHeader section="speaker" title="热词替换" description="专有名称、别名与识别文本纠正" compact />
+        <label class="switch-row"><div><strong>启用热词替换</strong><span>纠正流式短句和整句精修中的专有名称。</span></div><input type="checkbox" role="switch" checked :disabled="loading" /><i></i></label>
+        <label class="form-field"><span>目标词</span><input value="Claude" :disabled="loading" /></label>
+        <label class="form-field"><span>读音或别名（可选）</span><input value="克劳德 | 克劳得" :disabled="loading" /></label>
+        <footer><button class="save-button" :disabled="loading" @click="feedback('热词设置演示已保存，正式页面支持词表导入与试测')">保存热词设置</button></footer>
+      </section>
     </template>
 
     <template v-else-if="tab === 'wakes'">
@@ -304,6 +303,10 @@ function cancelTask(item: DemoWakeTask) {
     </div>
   </article>
 </template>
+
+<style scoped>
+.hotword-settings-section{display:flex;flex-direction:column;gap:20px;min-width:0}
+</style>
 
 <style scoped>
 .demo-bundle-backdrop{position:fixed;inset:0;z-index:100;background:#000a;display:grid;place-items:center;padding:24px}.demo-bundle-dialog{width:min(640px,100%);max-height:80vh;overflow:auto;padding:24px;border:1px solid var(--line-strong);border-radius:18px;background:var(--panel)}.demo-bundle-dialog>p,.demo-bundle-dialog li{font-size:var(--font-caption);line-height:1.7;color:var(--muted)}.demo-bundle-dialog ul{display:grid;gap:8px;padding:0;list-style:none}.demo-bundle-dialog li{display:grid;gap:4px;padding:10px 12px;border:1px solid var(--line);border-radius:10px}.demo-bundle-dialog li strong{color:var(--text)}.demo-bundle-choice{display:flex;gap:8px;align-items:center}.demo-bundle-choice input{accent-color:var(--accent)}.demo-bundle-actions{display:flex;gap:8px;justify-content:flex-end}

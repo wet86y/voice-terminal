@@ -173,10 +173,10 @@ function exportLogs() {
       >
       <article class="settings-panel panel" :class="`settings-panel-${activeSettingsTab}`">
         <WakeSettings v-if="activeSettingsTab === 'wake'" />
-        <HotwordSettings v-if="activeSettingsTab === 'hotwords'" />
         <PersonaSettings v-if="activeSettingsTab === 'persona'" />
         <TtsSettings v-if="activeSettingsTab === 'tts'" />
         <SpeakerSettings v-if="activeSettingsTab === 'speaker'" />
+        <HotwordSettings v-if="activeSettingsTab === 'speaker'" />
         <WakeTasksSettings v-if="activeSettingsTab === 'wakes'" />
         <ComputeSettings v-if="activeSettingsTab === 'compute' || activeSettingsTab === 'system'" :resource-controller="workspaceResources" />
         <WorkspaceSettings v-if="activeSettingsTab === 'workspace'" :controller="workspaceResources" /></article
